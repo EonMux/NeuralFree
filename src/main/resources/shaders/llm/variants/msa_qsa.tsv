@@ -1,0 +1,22 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# MSA block scores and block-sparse attention (kernels/llm/sparse/msa.cl), QSA k-pool update and scores over an indexer cache of any KV cache type (kernels/llm/sparse/qsa.cl).
+LLM_MSA_BlockScore	msa.comp	OP=OP_MSA_BLOCK_SCORE	sg
+LLM_MSA_GatherAttn	msa.comp	OP=OP_MSA_GATHER_ATTN	sg
+LLM_QSA_KpoolUpdate_F32	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_F32
+LLM_QSA_KpoolUpdate_F16	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_F16
+LLM_QSA_KpoolUpdate_Q8_0	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_Q8_0
+LLM_QSA_KpoolUpdate_BF16	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_BF16
+LLM_QSA_KpoolUpdate_Q4_0	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_Q4_0
+LLM_QSA_KpoolUpdate_Q4_1	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_Q4_1
+LLM_QSA_KpoolUpdate_IQ4_NL	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_IQ4_NL
+LLM_QSA_KpoolUpdate_Q5_0	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_Q5_0
+LLM_QSA_KpoolUpdate_Q5_1	qsa.comp	OP=OP_QSA_KPOOL_UPDATE KV=NF_KV_Q5_1
+LLM_QSA_KpoolScore_F32	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_F32
+LLM_QSA_KpoolScore_F16	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_F16
+LLM_QSA_KpoolScore_Q8_0	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_Q8_0
+LLM_QSA_KpoolScore_BF16	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_BF16
+LLM_QSA_KpoolScore_Q4_0	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_Q4_0
+LLM_QSA_KpoolScore_Q4_1	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_Q4_1
+LLM_QSA_KpoolScore_IQ4_NL	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_IQ4_NL
+LLM_QSA_KpoolScore_Q5_0	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_Q5_0
+LLM_QSA_KpoolScore_Q5_1	qsa.comp	OP=OP_QSA_KPOOL_SCORE KV=NF_KV_Q5_1

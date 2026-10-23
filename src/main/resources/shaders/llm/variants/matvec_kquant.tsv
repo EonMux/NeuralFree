@@ -1,0 +1,50 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# K-quant weight families (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K) over the matvec_quant.comp and embed.comp templates; decoders in common/quant_k.glsl.
+Q2_K_MatVec	matvec_quant.comp	QTYPE=QT_Q2_K OP=OP_MATVEC	sg
+Q2_K_MatVecAdd	matvec_quant.comp	QTYPE=QT_Q2_K OP=OP_MATVEC_ADD	sg
+Q2_K_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q2_K OP=OP_GATEUP_SILU	sg
+Q2_K_ComputeLogits	matvec_quant.comp	QTYPE=QT_Q2_K OP=OP_LOGITS	sg
+Q2_K_EmbeddingLookup	embed.comp	QTYPE=QT_Q2_K OP=OP_EMBED
+Q2_K_BatchEmbeddingLookup	embed.comp	QTYPE=QT_Q2_K OP=OP_BATCH_EMBED
+Q2_K_BatchMatMul	matvec_quant.comp	QTYPE=QT_Q2_K OP=OP_BATCH	sg
+Q2_K_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_Q2_K OP=OP_BATCH_2D	sg
+Q3_K_MatVec	matvec_quant.comp	QTYPE=QT_Q3_K OP=OP_MATVEC	sg
+Q3_K_MatVecAdd	matvec_quant.comp	QTYPE=QT_Q3_K OP=OP_MATVEC_ADD	sg
+Q3_K_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q3_K OP=OP_GATEUP_SILU	sg
+Q3_K_ComputeLogits	matvec_quant.comp	QTYPE=QT_Q3_K OP=OP_LOGITS	sg
+Q3_K_EmbeddingLookup	embed.comp	QTYPE=QT_Q3_K OP=OP_EMBED
+Q3_K_BatchEmbeddingLookup	embed.comp	QTYPE=QT_Q3_K OP=OP_BATCH_EMBED
+Q3_K_BatchMatMul	matvec_quant.comp	QTYPE=QT_Q3_K OP=OP_BATCH	sg
+Q3_K_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_Q3_K OP=OP_BATCH_2D	sg
+Q4_K_MatVec	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_MATVEC	sg
+Q4_K_MatVecAdd	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_MATVEC_ADD	sg
+Q4_K_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_GATEUP_SILU	sg
+Q4_K_ComputeLogits	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_LOGITS	sg
+Q4_K_EmbeddingLookup	embed.comp	QTYPE=QT_Q4_K OP=OP_EMBED
+Q4_K_BatchEmbeddingLookup	embed.comp	QTYPE=QT_Q4_K OP=OP_BATCH_EMBED
+Q4_K_BatchMatMul	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_BATCH	sg
+Q4_K_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_BATCH_2D	sg
+Q5_K_MatVec	matvec_quant.comp	QTYPE=QT_Q5_K OP=OP_MATVEC	sg
+Q5_K_MatVecAdd	matvec_quant.comp	QTYPE=QT_Q5_K OP=OP_MATVEC_ADD	sg
+Q5_K_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q5_K OP=OP_GATEUP_SILU	sg
+Q5_K_ComputeLogits	matvec_quant.comp	QTYPE=QT_Q5_K OP=OP_LOGITS	sg
+Q5_K_EmbeddingLookup	embed.comp	QTYPE=QT_Q5_K OP=OP_EMBED
+Q5_K_BatchEmbeddingLookup	embed.comp	QTYPE=QT_Q5_K OP=OP_BATCH_EMBED
+Q5_K_BatchMatMul	matvec_quant.comp	QTYPE=QT_Q5_K OP=OP_BATCH	sg
+Q5_K_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_Q5_K OP=OP_BATCH_2D	sg
+Q6_K_MatVec	matvec_quant.comp	QTYPE=QT_Q6_K OP=OP_MATVEC	sg
+Q6_K_MatVecAdd	matvec_quant.comp	QTYPE=QT_Q6_K OP=OP_MATVEC_ADD	sg
+Q6_K_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q6_K OP=OP_GATEUP_SILU	sg
+Q6_K_ComputeLogits	matvec_quant.comp	QTYPE=QT_Q6_K OP=OP_LOGITS	sg
+Q6_K_EmbeddingLookup	embed.comp	QTYPE=QT_Q6_K OP=OP_EMBED
+Q6_K_BatchEmbeddingLookup	embed.comp	QTYPE=QT_Q6_K OP=OP_BATCH_EMBED
+Q6_K_BatchMatMul	matvec_quant.comp	QTYPE=QT_Q6_K OP=OP_BATCH	sg
+Q6_K_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_Q6_K OP=OP_BATCH_2D	sg
+Q8_K_MatVec	matvec_quant.comp	QTYPE=QT_Q8_K OP=OP_MATVEC	sg
+Q8_K_MatVecAdd	matvec_quant.comp	QTYPE=QT_Q8_K OP=OP_MATVEC_ADD	sg
+Q8_K_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q8_K OP=OP_GATEUP_SILU	sg
+Q8_K_ComputeLogits	matvec_quant.comp	QTYPE=QT_Q8_K OP=OP_LOGITS	sg
+Q8_K_EmbeddingLookup	embed.comp	QTYPE=QT_Q8_K OP=OP_EMBED
+Q8_K_BatchEmbeddingLookup	embed.comp	QTYPE=QT_Q8_K OP=OP_BATCH_EMBED
+Q8_K_BatchMatMul	matvec_quant.comp	QTYPE=QT_Q8_K OP=OP_BATCH	sg
+Q8_K_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_Q8_K OP=OP_BATCH_2D	sg

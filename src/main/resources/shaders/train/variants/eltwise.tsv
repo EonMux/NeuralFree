@@ -1,0 +1,12 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Elementwise unary and binary ops, axpby, scale, compare, where, gather, scatter, unary backward and dropout apply (kernels/train/eltwise.cl).
+TR_Unary_F32	eltwise.comp	OP=ELT_UNARY
+TR_Binary_F32	eltwise.comp	OP=ELT_BINARY
+TR_Axpby_F32	eltwise.comp	OP=ELT_AXPBY
+TR_Scale_F32	eltwise.comp	OP=ELT_SCALE
+TR_Compare_F32	eltwise.comp	OP=ELT_COMPARE
+TR_Where_F32	eltwise.comp	OP=ELT_WHERE
+TR_Gather_F32	eltwise.comp	OP=ELT_GATHER
+TR_Scatter_F32	eltwise.comp	OP=ELT_SCATTER
+TR_UnaryBackward_F32	eltwise.comp	OP=ELT_UNARY_BACKWARD
+TR_MaskScale_F32	eltwise.comp	OP=ELT_MASK_SCALE

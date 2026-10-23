@@ -1,0 +1,32 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Tiled prefill GEMM for every weight type (kernels/llm/matmul_tiled.cl via kernels/llm/common/matmul_tiled_family.h) and the sampling partial top-k (kernels/llm/sampling_topk.cl).
+F32_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F32
+F16_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F16
+BF16_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_BF16
+Q4_0_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q4_0
+Q4_1_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q4_1
+Q5_0_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q5_0
+Q5_1_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q5_1
+Q8_0_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q8_0
+IQ4_NL_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ4_NL
+IQ4_XS_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ4_XS
+MXFP4_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_MXFP4
+Q2_K_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q2_K
+Q3_K_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q3_K
+Q4_K_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q4_K
+Q5_K_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q5_K
+Q6_K_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q6_K
+Q8_K_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q8_K
+IQ3_XXS_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ3_XXS
+IQ3_S_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ3_S
+IQ2_XXS_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ2_XXS
+IQ2_XS_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ2_XS
+IQ2_S_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ2_S
+IQ1_S_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ1_S
+IQ1_M_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_IQ1_M
+TQ1_0_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_TQ1_0
+TQ2_0_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_TQ2_0
+NVFP4_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_NVFP4
+Q1_0_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q1_0
+Q2_0_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q2_0
+LLM_TopK_Partial	topk_partial.comp

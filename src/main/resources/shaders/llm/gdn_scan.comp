@@ -1,0 +1,150 @@
+/* gdn_scan.comp - LLM_GDN_Scan, the gated delta rule of gated DeltaNet and KDA layers (GLSL twin of
+ * LLM_GDN_Scan in kernels/llm/recurrent/gdn.cl, which is the semantic reference).
+ * Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i S_k, i S_v, i n_v_heads, i n_k_heads, i n_tokens, i kv_head_mode, i gate_mode, i q_stride, i q_off,
+ *    i k_stride, i k_off, i v_stride, i v_off, i o_stride, i o_off, f scale,
+ *    R q, R k, Rn v, R g, R beta, RWn state, R int state_rows, Wn out)
+ * Per value head h and token t, with the state column of value col stored as s[col*S_k + i]:
+ *   S *= exp(g) (scalar, gate_mode 0) or exp(g[i]) per key dim (gate_mode 1);
+ *   delta = (v[col] - sum_i S[i][col] k[i]) * beta;  S[i][col] += k[i] delta;  out[col] = scale * sum_i S[i][col] q[i]
+ * kv_head_mode 0 tiled (kh = h % n_k_heads), 1 grouped (kh = h / (n_v_heads / n_k_heads)).
+ * out may alias v with the same offset and stride: v is staged in shared memory behind a barrier before
+ * the element is written.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1} with L a multiple of 32 and L <= LLM_DIMX; L/32 value columns per
+ * workgroup with 32 invocations each; global = n_v_heads * ceil(S_v / (L/32)) * L. Requires S_k <= 256.
+ * Folded group counts are recovered by nf_wg_id(); surplus groups exit uniformly.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+
+#define NF_GDN_MAX_SK 256
+#define NF_GDN_LANES 32u
+#define NF_GDN_ROWS_PER_LANE 8
+#define NF_GDN_MAX_COLS (LLM_DIMX / 32)
+
+layout(std430, binding = 0) readonly buffer NfGdnQ     { float q[]; };
+layout(std430, binding = 1) readonly buffer NfGdnK     { float k[]; };
+layout(std430, binding = 2) readonly buffer NfGdnV     { float v[]; };
+layout(std430, binding = 3) readonly buffer NfGdnG     { float g[]; };
+layout(std430, binding = 4) readonly buffer NfGdnBeta  { float beta[]; };
+layout(std430, binding = 5)          buffer NfGdnState { float state[]; };
+layout(std430, binding = 6) readonly buffer NfGdnRows  { int state_rows[]; };
+layout(std430, binding = 7)          buffer NfGdnOut   { float out_v[]; };
+
+layout(push_constant) uniform NfGdnScanParams {
+    int S_k;
+    int S_v;
+    int n_v_heads;
+    int n_k_heads;
+    int n_tokens;
+    int kv_head_mode;
+    int gate_mode;
+    int q_stride;
+    int q_off;
+    int k_stride;
+    int k_off;
+    int v_stride;
+    int v_off;
+    int o_stride;
+    int o_off;
+    float scale;
+} pc;
+
+shared float q_s[NF_GDN_MAX_SK];
+shared float k_s[NF_GDN_MAX_SK];
+shared float e_s[NF_GDN_MAX_SK];
+shared float v_s[NF_GDN_MAX_COLS];
+
+void main() {
+    const int S_k = pc.S_k;
+    const int S_v = pc.S_v;
+    if (S_k > NF_GDN_MAX_SK || S_k <= 0 || S_v <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint wg = gl_WorkGroupSize.x;
+    const uint cols = wg / NF_GDN_LANES;
+    const uint col_blocks = (uint(S_v) + cols - 1u) / cols;
+    const uint grp = nf_wg_id();
+    const uint h = grp / col_blocks;
+    if (h >= uint(pc.n_v_heads)) {
+        return;
+    }
+    const uint col_local = lid / NF_GDN_LANES;
+    const uint lane = lid - col_local * NF_GDN_LANES;
+    const uint col0 = (grp - h * col_blocks) * cols;
+    const uint col = col0 + col_local;
+    const bool col_valid = col < uint(S_v);
+    const uint n_v = uint(pc.n_v_heads);
+    const uint n_k = uint(pc.n_k_heads);
+    const uint kh = pc.kv_head_mode == 1 ? h / (n_v / n_k) : h % n_k;
+
+    const uint head_floats = uint(S_v) * uint(S_k);
+    const uint s_base = uint(state_rows[0]) * n_v * head_floats + h * head_floats + (col_valid ? col : 0u) * uint(S_k);
+
+    float s[NF_GDN_ROWS_PER_LANE];
+    [[unroll]] for (int r = 0; r < NF_GDN_ROWS_PER_LANE; r++) {
+        const uint i = lane + uint(r) * NF_GDN_LANES;
+        s[r] = (col_valid && i < uint(S_k)) ? state[s_base + i] : 0.0;
+    }
+
+    for (int t = 0; t < pc.n_tokens; t++) {
+        const uint qb = uint(pc.q_off + t * pc.q_stride) + kh * uint(S_k);
+        const uint kb = uint(pc.k_off + t * pc.k_stride) + kh * uint(S_k);
+        const uint gb = uint(t) * n_v + h;
+        for (uint i = lid; i < uint(S_k); i += wg) {
+            q_s[i] = q[qb + i];
+            k_s[i] = k[kb + i];
+            e_s[i] = pc.gate_mode == 1 ? exp(g[gb * uint(S_k) + i]) : 0.0;
+        }
+        if (lid < cols) {
+            const uint c = col0 + lid;
+            v_s[lid] = c < uint(S_v) ? v[uint(pc.v_off + t * pc.v_stride) + h * uint(S_v) + c] : 0.0;
+        }
+        barrier();
+
+        const float decay = pc.gate_mode == 1 ? 1.0 : exp(g[gb]);
+        const float b = beta[gb];
+
+        float kv = 0.0;
+        [[unroll]] for (int r = 0; r < NF_GDN_ROWS_PER_LANE; r++) {
+            const uint i = lane + uint(r) * NF_GDN_LANES;
+            if (i < uint(S_k)) {
+                s[r] *= pc.gate_mode == 1 ? e_s[i] : decay;
+                kv += s[r] * k_s[i];
+            }
+        }
+        kv = nf_seg_sum(kv, NF_GDN_LANES);
+
+        const float delta = (v_s[col_local] - kv) * b;
+        float o = 0.0;
+        [[unroll]] for (int r = 0; r < NF_GDN_ROWS_PER_LANE; r++) {
+            const uint i = lane + uint(r) * NF_GDN_LANES;
+            if (i < uint(S_k)) {
+                s[r] += k_s[i] * delta;
+                o += s[r] * q_s[i];
+            }
+        }
+        o = nf_seg_sum(o, NF_GDN_LANES);
+
+        if (col_valid && lane == 0u) {
+            out_v[uint(pc.o_off + t * pc.o_stride) + h * uint(S_v) + col] = o * pc.scale;
+        }
+        barrier();
+    }
+
+    if (col_valid) {
+        [[unroll]] for (int r = 0; r < NF_GDN_ROWS_PER_LANE; r++) {
+            const uint i = lane + uint(r) * NF_GDN_LANES;
+            if (i < uint(S_k)) {
+                state[s_base + i] = s[r];
+            }
+        }
+    }
+}

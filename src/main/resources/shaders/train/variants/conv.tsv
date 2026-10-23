@@ -1,0 +1,7 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Direct and transposed 2-D convolution, the convolution weight gradient and the im2col/col2im column transforms (kernels/train/conv.cl).
+TR_Conv2d_F32	conv.comp	OP=CONV_CONV2D_F32
+TR_ConvTranspose2d_F32	conv.comp	OP=CONV_CONV_TRANSPOSE2D_F32
+TR_Conv2dWeightGrad_F32	conv.comp	OP=CONV_WEIGHT_GRAD
+TR_Im2col_F32	conv.comp	OP=CONV_IM2COL
+TR_Col2im_F32	conv.comp	OP=CONV_COL2IM

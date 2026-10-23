@@ -1,0 +1,116 @@
+/* wkv7.comp - LLM_RWKV_WKV7, the RWKV7 WKV recurrence. GLSL twin of LLM_RWKV_WKV7 in
+ * kernels/llm/recurrent/rwkv.cl. Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i C, i H, R r, R w, R k, R v, R a, R b, RW state, R int state_rows, W y)
+ * Math (ggml-cpu/ops.cpp:11827), per head h, value row i, key column j:
+ *   sa = sum_j a[t,h,j] * s[i][j]
+ *   s[i][j] = s[i][j] * w[t,h,j] + v[t,h,i] * k[t,h,j] + sa * b[t,h,j];   y[t,h,i] = sum_j s[i][j] * r[t,h,j]
+ * State s[state_rows[0] * H*S*S + h*S*S + i*S + j] (i = value, j = key), updated in place.
+ *
+ * Work split as the OpenCL kernel: each invocation owns one value row and NF_RWKV_KPT key columns of
+ * it in registers; the P = nf_rwkv_parts(S) adjacent lanes of one row combine sa and y with
+ * nf_seg_sum. Dispatch: 1-D, local L = min(256, max(32, P * pow2ceil(S))),
+ * global = H * ceil(S / (L / P)) * L.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define NF_RWKV_MAX_S 256
+#define NF_RWKV_KPT   32
+
+layout(std430, binding = 0) readonly buffer NfWkv7R { float r_in[]; };
+layout(std430, binding = 1) readonly buffer NfWkv7W { float w_in[]; };
+layout(std430, binding = 2) readonly buffer NfWkv7K { float k_in[]; };
+layout(std430, binding = 3) readonly buffer NfWkv7V { float v_in[]; };
+layout(std430, binding = 4) readonly buffer NfWkv7A { float a_in[]; };
+layout(std430, binding = 5) readonly buffer NfWkv7B { float b_in[]; };
+layout(std430, binding = 6) buffer NfWkv7State { float state[]; };
+layout(std430, binding = 7) readonly buffer NfWkv7Rows { int state_rows[]; };
+layout(std430, binding = 8) buffer NfWkv7Y { float y_out[]; };
+
+layout(push_constant) uniform NfWkv7Params { int n_tokens; int C; int H; } pc;
+
+#include "common/reduce.glsl"
+
+shared float sr[NF_RWKV_MAX_S];
+shared float sw[NF_RWKV_MAX_S];
+shared float sk[NF_RWKV_MAX_S];
+shared float sa_[NF_RWKV_MAX_S];
+shared float sb[NF_RWKV_MAX_S];
+
+uint nf_rwkv_parts(uint S) {
+    return S <= NF_RWKV_KPT ? 1u : (S <= 2u * NF_RWKV_KPT ? 2u : (S <= 4u * NF_RWKV_KPT ? 4u : 8u));
+}
+
+void main() {
+    const uint C = uint(pc.C);
+    const uint H = uint(pc.H);
+    const uint S = C / H;
+    const uint P = nf_rwkv_parts(S);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint L = gl_WorkGroupSize.x;
+    const uint vpg = L / P;
+    const uint gph = (S + vpg - 1u) / vpg;
+    const uint grp = nf_wg_id();
+    const uint h = grp / gph;
+    if (S > NF_RWKV_MAX_S || h >= H) {
+        return;
+    }
+    const uint val = (grp % gph) * vpg + lid / P;
+    const uint key0 = (lid & (P - 1u)) * NF_RWKV_KPT;
+    const bool live = val < S;
+    const uint span = P * NF_RWKV_KPT;
+    const uint sbase = uint(state_rows[0]) * C * S + h * S * S + val * S;
+
+    float st[NF_RWKV_KPT];
+    [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+        const uint j = key0 + u;
+        st[u] = (live && j < S) ? state[sbase + j] : 0.0;
+    }
+
+    for (uint t = 0u; t < uint(pc.n_tokens); t++) {
+        const uint row = t * C + h * S;
+        barrier();
+        for (uint j = lid; j < span; j += L) {
+            const bool inr = j < S;
+            sr[j] = inr ? r_in[row + j] : 0.0;
+            sw[j] = inr ? w_in[row + j] : 0.0;
+            sk[j] = inr ? k_in[row + j] : 0.0;
+            sa_[j] = inr ? a_in[row + j] : 0.0;
+            sb[j] = inr ? b_in[row + j] : 0.0;
+        }
+        barrier();
+
+        float sa = 0.0;
+        [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+            sa += sa_[key0 + u] * st[u];
+        }
+        if (P > 1u) {
+            sa = nf_seg_sum(sa, P);
+        }
+
+        const float vv = live ? v_in[row + val] : 0.0;
+        float acc = 0.0;
+        [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+            const uint j = key0 + u;
+            st[u] = st[u] * sw[j] + vv * sk[j] + sa * sb[j];
+            acc += st[u] * sr[j];
+        }
+        if (P > 1u) {
+            acc = nf_seg_sum(acc, P);
+        }
+        if (live && key0 == 0u) {
+            y_out[row + val] = acc;
+        }
+    }
+
+    [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+        const uint j = key0 + u;
+        if (live && j < S) {
+            state[sbase + j] = st[u];
+        }
+    }
+}

@@ -1,0 +1,275 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+
+repositories {
+    mavenCentral()
+}
+
+def static getOsString() {
+    String vendor = System.getProperty("java.vendor");
+    if ("The Android Project" == vendor) {
+        return "android";
+    } else {
+        String osName = System.getProperty("os.name");
+        osName = osName.toLowerCase(Locale.ENGLISH);
+        if (osName.startsWith("windows")) {
+            return "windows";
+        } else if (osName.startsWith("mac os")) {
+            return "apple";
+        } else if (osName.startsWith("linux")) {
+            return "linux";
+        } else if (osName.startsWith("sun")) {
+            return "sun"
+        }
+        return "unknown"
+    }
+}
+
+def static getArchString() {
+    String osArch = System.getProperty("os.arch");
+    osArch = osArch.toLowerCase(Locale.ENGLISH);
+    if ("i386" == osArch || "x86" == osArch || "i686" == osArch) {
+        return "x86";
+    } else if (osArch.startsWith("amd64") || osArch.startsWith("x86_64")) {
+        return "x86_64";
+    } else if (osArch.startsWith("arm64")) {
+        return "arm64";
+    } else if (osArch.startsWith("arm")) {
+        return "arm";
+    } else if ("ppc" == osArch || "powerpc" == osArch) {
+        return "ppc";
+    } else if (osArch.startsWith("ppc")) {
+        return "ppc_64";
+    } else if (osArch.startsWith("sparc")) {
+        return "sparc";
+    } else if (osArch.startsWith("mips64")) {
+        return "mips64";
+    } else if (osArch.startsWith("mips")) {
+        return "mips";
+    } else if (osArch.contains("risc")) {
+        return "risc";
+    }
+    return "unknown";
+}
+
+/**
+ * The LWJGL natives classifier of this machine (natives-linux, natives-windows-arm64, ...), or null when LWJGL
+ * publishes none for it.
+ */
+def static lwjglNativesClassifier(String os, String arch) {
+    Map<String, String> classifiers = [
+            'linux-x86_64'  : 'natives-linux',
+            'linux-arm64'   : 'natives-linux-arm64',
+            'linux-arm'     : 'natives-linux-arm32',
+            'linux-ppc_64'  : 'natives-linux-ppc64le',
+            'linux-risc'    : 'natives-linux-riscv64',
+            'windows-x86_64': 'natives-windows',
+            'windows-x86'   : 'natives-windows-x86',
+            'windows-arm64' : 'natives-windows-arm64',
+            'apple-x86_64'  : 'natives-macos',
+            'apple-arm64'   : 'natives-macos-arm64',
+    ]
+    return classifiers[os + '-' + arch]
+}
+
+dependencies {
+    // Abacus Util (float streams): https://github.com/landawn/AbacusUtil
+    implementation 'com.landawn:abacus-util:2.1.5'
+
+    // JUnit 4
+    testImplementation 'junit:junit:4.13.2'
+
+    // Log4j 2: the code logs through the API; the core implementation is a runtime dependency, and the tests
+    // also use it to capture log events
+    project.ext.log4jVersion = '2.26.1'
+    api "org.apache.logging.log4j:log4j-api:$log4jVersion"
+    runtimeOnly "org.apache.logging.log4j:log4j-core:$log4jVersion"
+    testImplementation "org.apache.logging.log4j:log4j-core:$log4jVersion"
+
+    // Brownies collections (GapList, FloatGapList): http://www.magicwerk.org/page-collections-download.html
+    implementation 'org.magicwerk:brownies-collections:0.9.14'
+
+    // JCuda; its natives are published for linux-x86_64 and windows-x86_64 only
+    project.ext.classifier = getOsString() + "-" + getArchString()
+    project.ext.jCudaVersion = "12.6.0"
+
+    implementation(group: 'org.jcuda', name: 'jcuda', version: jCudaVersion) {
+        transitive = false
+    }
+    if (classifier in ['linux-x86_64', 'windows-x86_64']) {
+        runtimeOnly group: 'org.jcuda', name: 'jcuda-natives', classifier: classifier, version: jCudaVersion
+    }
+
+    // JOCL (OpenCL)
+    implementation 'org.jocl:jocl:2.0.6'
+
+    // LWJGL Vulkan
+    project.ext.lwjglVersion = "3.4.1"
+
+    implementation "org.lwjgl:lwjgl:$lwjglVersion"
+    implementation "org.lwjgl:lwjgl-vulkan:$lwjglVersion"
+
+    def lwjglNatives = lwjglNativesClassifier(getOsString(), getArchString())
+    if (lwjglNatives != null) {
+        runtimeOnly "org.lwjgl:lwjgl:$lwjglVersion:$lwjglNatives"
+    }
+}
+
+group = 'com.eonmux'
+version = '1.0.0-SNAPSHOT'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from(components.java)
+            pom {
+                name = 'NeuralFree'
+                description = 'Hardware-accelerated deep learning framework for Java: training and GGUF language model inference on OpenCL, CUDA and Vulkan GPUs or the CPU'
+                url = 'https://github.com/EonMux/NeuralFree'
+                licenses {
+                    license {
+                        name = 'NeuralFree License (Apache License 2.0 with an Additional Commercial Use Condition)'
+                        url = 'https://github.com/EonMux/NeuralFree/blob/main/LICENSE'
+                        distribution = 'repo'
+                    }
+                }
+                organization {
+                    name = 'EONMUX LTD'
+                    url = 'https://github.com/EonMux'
+                }
+                scm {
+                    url = 'https://github.com/EonMux/NeuralFree'
+                    connection = 'scm:git:https://github.com/EonMux/NeuralFree.git'
+                    developerConnection = 'scm:git:git@github.com:EonMux/NeuralFree.git'
+                }
+            }
+        }
+    }
+}
+
+// Test sources compile against the main classes only, so compiling them does not build the GPU kernels
+// that processResources merges; the test runtime classpath still holds every main resource.
+sourceSets {
+    test {
+        compileClasspath = sourceSets.main.output.classesDirs + configurations.testCompileClasspath
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 11
+}
+
+// Every application run forwards neuralfree.* system properties (-D) and project properties (-P) to the JVM, and
+// logs through src/main/config/log4j2.xml (INFO and above to the console).
+tasks.withType(JavaExec).configureEach {
+    systemProperty 'log4j2.configurationFile', layout.projectDirectory.file('src/main/config/log4j2.xml').asFile.absolutePath
+    systemProperties System.properties.findAll { it.key.startsWith('neuralfree.') }
+    project.properties.findAll { it.key.startsWith('neuralfree.') }.each { k, v ->
+        systemProperty k, v
+    }
+}
+
+test {
+    useJUnit()
+
+    testLogging {
+        events = ["passed", "skipped", "failed"]
+        exceptionFormat = "full"
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
+    }
+
+    reports {
+        html.required = true
+        junitXml.required = true
+    }
+
+    ignoreFailures = false
+}
+
+// The run tasks pass --add-opens java.base/java.util so that abacus-util can read java.util.ArrayList internals (its
+// fast path; without the flag abacus-util falls back quietly).
+task runApp(type: JavaExec) {
+    description = 'Runs NeuralFree.main: creates the training backend and checks a buffer round trip'
+    group = 'application'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.eonmux.neuralfree.NeuralFree'
+
+    jvmArgs '-Xmx4096m', '--add-opens=java.base/java.util=ALL-UNNAMED'
+}
+
+task runLLMDemo(type: JavaExec) {
+    description = 'Runs the LLM Demo with GGUF model inference'
+    group = 'application'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.eonmux.neuralfree.demo.LLMDemo'
+
+    def heapMb = project.hasProperty('heap') ? project.property('heap') : '8192'
+    jvmArgs "-Xmx${heapMb}m", '--add-opens=java.base/java.util=ALL-UNNAMED'
+    // Keeps the temporary files of the OpenCL compiler and the CUDA JIT cache under build/tmp.
+    def tmpDir = layout.buildDirectory.dir('tmp').get().asFile
+    jvmArgs "-Djava.io.tmpdir=${tmpDir.absolutePath}"
+    environment 'TMPDIR', tmpDir.absolutePath
+    environment 'CUDA_CACHE_PATH', tmpDir.absolutePath
+    doFirst {
+        tmpDir.mkdirs()
+    }
+
+    if (project.hasProperty('args')) {
+        // Parse args respecting quoted strings (single or double quotes)
+        def parsed = []
+        def matcher = (project.args =~ /(?:"([^"]*)")|(?:'([^']*)')|(\S+)/)
+        while (matcher.find()) {
+            parsed << (matcher.group(1) ?: matcher.group(2) ?: matcher.group(3))
+        }
+        args parsed
+    }
+}
+
+task runDemos(type: JavaExec) {
+    description = 'Runs the NeuralFree demo suite'
+    group = 'application'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.eonmux.neuralfree.demo.DemoRunner'
+
+    jvmArgs '-Xmx4096m', '--add-opens=java.base/java.util=ALL-UNNAMED'
+}
+
+// The jar carries the licence, the notices and the commercial licence summary under META-INF.
+jar {
+    manifest {
+        attributes('Main-Class': 'com.eonmux.neuralfree.NeuralFree')
+    }
+    from(rootDir) {
+        include 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md', 'COMMERCIAL-LICENSE.md'
+        into 'META-INF'
+    }
+}
+
+apply from: 'gradle/gpu-kernels.gradle'
+
+// GPU kernel artifacts are generated under build/generated/gpu and merged here; GLSL sources, shared GLSL
+// includes and the shader variant tables of every kernel library are build inputs only. The OpenCL kernel
+// sources ship, including the shared headers under kernels/common: they are compiled at run time. Each
+// library's kernel inventory kernels/<lib>/inventory.txt is a checked-in resource; inventoryCheck verifies
+// it against the kernel sources before it is packaged.
+tasks.named('processResources', ProcessResources) {
+    from(tasks.named('compileShaders'))
+    from(tasks.named('compileTestShaders'))
+    from(tasks.named('compileCudaKernels'))
+    dependsOn 'inventoryCheck'
+    mustRunAfter 'updateKernelInventory'
+    exclude 'shaders/**/*.comp', '**/*.glsl', 'shaders/*/variants/**'
+}

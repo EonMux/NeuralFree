@@ -1,0 +1,100 @@
+/* argmax.comp - row-wise argmax. GLSL twin of LLM_Argmax in kernels/llm/sampling.cl.
+ * Requires: common/nf_common.glsl.
+ *
+ * Variants row:
+ *     LLM_Argmax	argmax.comp	OP=OP_ARGMAX
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_ARGMAX  (i size, float input, int max_idx, i n_rows)
+ *              max_idx[row] = index of the first maximum of input[row * size .. row * size + size)
+ * Candidates are ordered as in nf_argmax_better (kernels/llm/sampling.cl): a non-NaN value beats NaN, the
+ * larger value wins, equal values go to the lower index. NaN is never selected; a row of only NaN
+ * yields 0, and so does size == 0.
+ *
+ * Dispatch: 1-D, global = n_rows * L, local = {L, 1, 1}; one workgroup per row. Folded group
+ * counts are recovered by nf_wg_id(); surplus groups exit uniformly. Any L is reduced exactly.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_ARGMAX 131
+
+#if !defined(OP) || OP != OP_ARGMAX
+#error "argmax.comp requires OP=OP_ARGMAX"
+#endif
+
+layout(std430, binding = 0) buffer NfAmInput { float x_in[]; };
+layout(std430, binding = 1) buffer NfAmOutput { int max_idx[]; };
+layout(push_constant) uniform NfAmParams { int size; int n_rows; } pc;
+
+/* Index sentinel of a candidate that holds no element. */
+#define NF_ARGMAX_NONE 0x7fffffff
+
+shared float nf_am_v[gl_WorkGroupSize.x];
+shared int nf_am_i[gl_WorkGroupSize.x];
+
+/* NaN test on the bit pattern, independent of the driver's float NaN handling (Vulkan treats
+ * NaN operands of float instructions as undefined unless SignedZeroInfNanPreserve is enabled). */
+bool nf_am_isnan(float v) {
+    return (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u;
+}
+
+/* True when candidate (v, i) beats (bv, bi). */
+bool nf_argmax_better(float v, int i, float bv, int bi) {
+    if (nf_am_isnan(v)) {
+        return nf_am_isnan(bv) && i < bi;
+    }
+    if (nf_am_isnan(bv)) {
+        return true;
+    }
+    return v > bv || (v == bv && i < bi);
+}
+
+/* Smallest power of two >= the local size; the tree folds the upper half with a bounds check. */
+uint nf_am_span() {
+    const uint n = gl_WorkGroupSize.x;
+    return n <= 1u ? 1u : (1u << uint(findMSB(n - 1u) + 1));
+}
+
+void main() {
+    const uint row = nf_wg_id();
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const int size = pc.size;
+    const uint base = row * uint(size);
+
+    float bv = NF_NAN;
+    int bi = NF_ARGMAX_NONE;
+    for (int i = int(lid); i < size; i += int(lsize)) {
+        const float v = x_in[base + uint(i)];
+        if (nf_argmax_better(v, i, bv, bi)) {
+            bv = v;
+            bi = i;
+        }
+    }
+    nf_am_v[lid] = bv;
+    nf_am_i[lid] = bi;
+    barrier();
+
+    for (uint s = nf_am_span() >> 1; s > 0u; s >>= 1) {
+        if (lid < s && lid + s < lsize) {
+            const float ov = nf_am_v[lid + s];
+            const int oi = nf_am_i[lid + s];
+            if (nf_argmax_better(ov, oi, nf_am_v[lid], nf_am_i[lid])) {
+                nf_am_v[lid] = ov;
+                nf_am_i[lid] = oi;
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        const int r = nf_am_i[0];
+        max_idx[row] = (r == NF_ARGMAX_NONE) ? 0 : r;
+    }
+}

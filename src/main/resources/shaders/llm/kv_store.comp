@@ -1,0 +1,84 @@
+/* kv_store.comp - LLM_KV_Store_<KV> (GLSL twin of kernels/llm/kv_cache.cl, the semantic reference).
+ * Requires: common/nf_common.glsl, common/rope_common.glsl, common/kv_types.glsl, common/kv_quant.glsl.
+ *
+ * A variants row selects the cache type with KV=NF_KV_<type> (common/kv_types.glsl).
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i row_elems, i src_row_stride, i src_off, i dst_row_stride, R float src, R int cell_idx, W dst)
+ * ggml_set_rows (llama-kv-cache.cpp:1353): row cell_idx[t] of dst <- elements [0, row_elems) of the src
+ * row at src[src_off + t*src_row_stride]; a negative cell skips the token. dst element e of row r is cache
+ * element r*dst_row_stride + e: F32 as is, F16 / BF16 rounded to nearest even, block types quantized by the
+ * reference quantizer of the type (common/kv_quant.glsl) and written as 16-bit words.
+ *
+ * Dispatch: 1-D; F32/F16/BF16 one invocation per element (g = t*row_elems + e), block types one per 32-element
+ * block (g = t*(row_elems/32) + b); global rounded up to L, local = {L, 1, 1}; folded group counts are recovered
+ * by nf_global_id(). No barriers.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+#include "common/kv_types.glsl"
+#include "common/kv_quant.glsl"
+
+#if !defined(KV)
+#error "kv_store.comp requires KV"
+#endif
+
+layout(std430, binding = 0) readonly buffer NfKvsSrc { float src[]; };
+layout(std430, binding = 1) readonly buffer NfKvsCell { int cell_idx[]; };
+#if KV == NF_KV_F32
+layout(std430, binding = 2) writeonly buffer NfKvsDst { float dst[]; };
+#elif KV == NF_KV_F16 || KV == NF_KV_BF16
+layout(std430, binding = 2) writeonly buffer NfKvsDst { uint16_t dst[]; };
+#elif KV == NF_KV_Q8_0 || KV == NF_KV_Q4_0 || KV == NF_KV_Q4_1 || KV == NF_KV_IQ4_NL || KV == NF_KV_Q5_0 \
+    || KV == NF_KV_Q5_1
+#define NF_KVS_BLOCKS 1
+NF_BUFFER_VIEWS_RW(2, dst)
+NF_KV_STORES(dst)
+#else
+#error "kv_store.comp: KV is not a KV cache type"
+#endif
+
+layout(push_constant) uniform NfKvsParams {
+    int n_tokens;
+    int row_elems;
+    int src_row_stride;
+    int src_off;
+    int dst_row_stride;
+} pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint row_elems = uint(max(pc.row_elems, 0));
+#if defined(NF_KVS_BLOCKS)
+    const uint per_token = row_elems / NF_KV_BLOCK;
+#else
+    const uint per_token = row_elems;
+#endif
+    if (per_token == 0u || gid >= uint(pc.n_tokens) * per_token) {
+        return;
+    }
+    const uint t = gid / per_token;
+    const uint j = gid - t * per_token;
+    const int cell = cell_idx[t];
+    if (cell < 0) {
+        return;
+    }
+    const uint srow = uint(pc.src_off) + t * uint(pc.src_row_stride);
+
+#if KV == NF_KV_F32
+    dst[uint(cell) * uint(pc.dst_row_stride) + j] = src[srow + j];
+#elif KV == NF_KV_F16
+    dst[uint(cell) * uint(pc.dst_row_stride) + j] = uint16_t(nf_rope_f16_bits(src[srow + j]));
+#elif KV == NF_KV_BF16
+    dst[uint(cell) * uint(pc.dst_row_stride) + j] = uint16_t(nf_kv_bf16_bits(src[srow + j]));
+#else
+    const uint xb = srow + j * NF_KV_BLOCK;
+    float x[32];
+    [[unroll]] for (uint k = 0u; k < NF_KV_BLOCK; ++k) {
+        x[k] = src[xb + k];
+    }
+    dst_kv_store_block(uint(cell) * uint(pc.dst_row_stride) + j * NF_KV_BLOCK, x, KV);
+#endif
+}

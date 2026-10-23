@@ -1,0 +1,23 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Flash attention (kernels/llm/flash_decode.cl, kernels/llm/flash_prefill.cl, kernels/llm/flash_combine.cl).
+LLM_FlashDecode_F32	flash_decode.comp	KV=NF_KV_F32	sg
+LLM_FlashDecode_F16	flash_decode.comp	KV=NF_KV_F16	sg
+LLM_FlashDecode_Q8_0	flash_decode.comp	KV=NF_KV_Q8_0	sg
+LLM_FlashDecode_BF16	flash_decode.comp	KV=NF_KV_BF16	sg
+LLM_FlashDecode_Q4_0	flash_decode.comp	KV=NF_KV_Q4_0	sg
+LLM_FlashDecode_Q4_1	flash_decode.comp	KV=NF_KV_Q4_1	sg
+LLM_FlashDecode_IQ4_NL	flash_decode.comp	KV=NF_KV_IQ4_NL	sg
+LLM_FlashDecode_Q5_0	flash_decode.comp	KV=NF_KV_Q5_0	sg
+LLM_FlashDecode_Q5_1	flash_decode.comp	KV=NF_KV_Q5_1	sg
+LLM_FlashDecode_Mixed	flash_decode.comp	KV_MIXED=1	sg
+LLM_FlashAttn_F32	flash_prefill.comp	KV=NF_KV_F32	sg
+LLM_FlashAttn_F16	flash_prefill.comp	KV=NF_KV_F16	sg
+LLM_FlashAttn_Q8_0	flash_prefill.comp	KV=NF_KV_Q8_0	sg
+LLM_FlashAttn_BF16	flash_prefill.comp	KV=NF_KV_BF16	sg
+LLM_FlashAttn_Q4_0	flash_prefill.comp	KV=NF_KV_Q4_0	sg
+LLM_FlashAttn_Q4_1	flash_prefill.comp	KV=NF_KV_Q4_1	sg
+LLM_FlashAttn_IQ4_NL	flash_prefill.comp	KV=NF_KV_IQ4_NL	sg
+LLM_FlashAttn_Q5_0	flash_prefill.comp	KV=NF_KV_Q5_0	sg
+LLM_FlashAttn_Q5_1	flash_prefill.comp	KV=NF_KV_Q5_1	sg
+LLM_FlashAttn_Mixed	flash_prefill.comp	KV_MIXED=1	sg
+LLM_FlashAttn_Combine	flash_combine.comp

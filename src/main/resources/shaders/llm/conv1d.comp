@@ -1,0 +1,100 @@
+/* conv1d.comp - LLM_Conv1dSame and LLM_Conv1dDepthwise, the wavtokenizer-dec convolutions. GLSL twin of
+ * kernels/llm/audio.cl (the semantic reference). Requires: common/nf_common.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_Conv1dSame	conv1d.comp	OP=OP_CONV1D_SAME
+ *
+ * Layout: channel-major F32, element (c, t) at v[v_off + c*len + t]. Stride 1, padding p = K/2,
+ * output length OL = L + 2*(K/2) - dil*(K-1), zero outside [0, L), bias added after the dot product.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_CONV1D_SAME (i L, i IC, i OC, i K, i dil, i x_off, i y_off, R float x, R float w, R float b, W float y)
+ *       y[oc][t] = (sum_{ic asc} sum_{k asc, 0 <= t+k*dil-p < L} w[(oc*IC + ic)*K + k] * x[ic][t+k*dil-p]) + b[oc]
+ *   OP_CONV1D_DW   (i L, i C, i K, i x_off, i y_off, R float x, R float w, R float b, W float y)
+ *       y[c][t] = (sum_{k asc, 0 <= t+k-p < L} w[c*K + k] * x[c][t+k-p]) + b[c]   (dil = 1)
+ *
+ * Dispatch: 1-D, one invocation per output element (index = channel*OL + t), local = {L, 1, 1},
+ * global = channels*OL rounded up to L; folded group counts are recovered by nf_global_id(). Every
+ * binding stays below maxStorageBufferRange, so 32-bit index arithmetic is exact.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_CONV1D_SAME 301
+#define OP_CONV1D_DW   302
+
+#ifndef OP
+#error "conv1d.comp requires OP"
+#endif
+
+layout(std430, binding = 0) restrict readonly buffer NfConvX { float x_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfConvW { float w_in[]; };
+layout(std430, binding = 2) restrict readonly buffer NfConvB { float b_in[]; };
+layout(std430, binding = 3) restrict writeonly buffer NfConvY { float y_out[]; };
+
+#if OP == OP_CONV1D_SAME
+layout(push_constant) uniform NfConvParams {
+    int L;
+    int IC;
+    int OC;
+    int K;
+    int dil;
+    int x_off;
+    int y_off;
+} pc;
+#elif OP == OP_CONV1D_DW
+layout(push_constant) uniform NfConvParams {
+    int L;
+    int C;
+    int K;
+    int x_off;
+    int y_off;
+} pc;
+#else
+#error "conv1d.comp: unknown OP"
+#endif
+
+void main() {
+    const uint idx = nf_global_id();
+    const int pad = pc.K / 2;
+#if OP == OP_CONV1D_SAME
+    const int out_len = pc.L + 2 * pad - pc.dil * (pc.K - 1);
+    if (out_len <= 0 || idx >= uint(pc.OC) * uint(out_len)) {
+        return;
+    }
+    const uint oc = idx / uint(out_len);
+    const int t = int(idx - oc * uint(out_len));
+    const uint w_oc = oc * uint(pc.IC) * uint(pc.K);
+    float acc = 0.0;
+    for (uint ic = 0u; ic < uint(pc.IC); ++ic) {
+        const uint x_row = uint(pc.x_off) + ic * uint(pc.L);
+        const uint w_row = w_oc + ic * uint(pc.K);
+        for (int k = 0; k < pc.K; ++k) {
+            const int src = t + k * pc.dil - pad;
+            if (src >= 0 && src < pc.L) {
+                acc += w_in[w_row + uint(k)] * x_in[x_row + uint(src)];
+            }
+        }
+    }
+    y_out[uint(pc.y_off) + idx] = acc + b_in[oc];
+#elif OP == OP_CONV1D_DW
+    const int out_len = pc.L + 2 * pad - (pc.K - 1);
+    if (out_len <= 0 || idx >= uint(pc.C) * uint(out_len)) {
+        return;
+    }
+    const uint c = idx / uint(out_len);
+    const int t = int(idx - c * uint(out_len));
+    const uint x_row = uint(pc.x_off) + c * uint(pc.L);
+    const uint w_row = c * uint(pc.K);
+    float acc = 0.0;
+    for (int k = 0; k < pc.K; ++k) {
+        const int src = t + k - pad;
+        if (src >= 0 && src < pc.L) {
+            acc += w_in[w_row + uint(k)] * x_in[x_row + uint(src)];
+        }
+    }
+    y_out[uint(pc.y_off) + idx] = acc + b_in[c];
+#endif
+}

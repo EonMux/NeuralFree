@@ -1,0 +1,247 @@
+/* gemma3n.comp - LLM_AltUp_Predict, LLM_AltUp_Correct, LLM_MagnitudeMatch, LLM_GaussianTopK and
+ * LLM_StreamsMean (GLSL twin of kernels/llm/gemma3n.cl, which carries the llama.cpp references).
+ * Requires: common/nf_common.glsl; common/reduce.glsl for the row ops.
+ *
+ * Stream layout: element (stream k, token t, column e) of an AltUp stream buffer is at
+ * base + k*stream_stride + t*n_embd + e (offsets and strides in floats, stream_stride >= n_tokens*n_embd).
+ *
+ * A variants row selects OP:
+ *   OP_ALTUP_PREDICT     (i n_tokens, i n_embd, i n_altup, i stream_stride, i coefs_off, i streams_off,
+ *                         i pred_off, R coefs, Rn streams, Wn pred)
+ *       pred[j][t][e] = sum_k streams[k][t][e] * coefs[t*n_altup^2 + j*n_altup + k] + streams[j][t][e]
+ *   OP_ALTUP_CORRECT     (i n_tokens, i n_embd, i n_altup, i act, i stream_stride, i coefs_off,
+ *                         i activated_off, i pred_off, i out_off, R coefs, R activated, Rn pred, Wn streams_out)
+ *       out[j][t][e] = (activated[t][e] - pred[act][t][e]) * (coefs[t*n_altup + j] + 1) + pred[j][t][e]
+ *   OP_MAGNITUDE_MATCH   (i n_tokens, i n_embd, i n_x, i x_stride, i ref_off, i x_off, R ref, RWn x)
+ *       x row (j, t) at x_off + j*x_stride + t*n_embd:  x = (x * |ref[t]|) / |x|
+ *   OP_GAUSSIAN_TOPK     (i n_tokens, i n, i x_stride, i x_off, f k_std, RWn x)
+ *       row t at x_off + t*x_stride:  x = relu(x - (mean + std_unbiased * k_std))
+ *   OP_STREAMS_MEAN      (i n_tokens, i n_embd, i n_altup, i stream_stride, i streams_off, i out_off,
+ *                         Rn streams, Wn out)
+ *       out[t][e] = (sum_k streams[k][t][e]) * (1 / n_altup), ascending k
+ * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. Operands
+ * that may share memory with an output (Rn, Wn, RWn) carry no memory qualifiers.
+ *
+ * Dispatch: element-wise ops run one invocation per (token, column), 1-D global =
+ * roundUp(n_tokens*n_embd, L); row ops run one workgroup per row, 1-D global = rows*L, local = L a power
+ * of two in [32, LLM_DIMX] (rows = n_x*n_tokens for OP_MAGNITUDE_MATCH, n_tokens for OP_GAUSSIAN_TOPK).
+ * Both use the folding-aware nf_global_id() / nf_wg_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_ALTUP_PREDICT   1
+#define OP_ALTUP_CORRECT   2
+#define OP_MAGNITUDE_MATCH 3
+#define OP_GAUSSIAN_TOPK   4
+#define OP_STREAMS_MEAN    5
+
+#if !defined(OP)
+#error "gemma3n.comp requires OP"
+#endif
+
+/* Largest stream count (NF_G3N_MAX_ALTUP in kernels/llm/gemma3n.cl). */
+#define NF_G3N_MAX_ALTUP 8
+
+#if OP == OP_ALTUP_PREDICT
+layout(std430, binding = 0) readonly buffer NfG3nCoefs { float coefs[]; };
+layout(std430, binding = 1) buffer NfG3nStreams { float streams[]; };
+layout(std430, binding = 2) buffer NfG3nPred { float pred[]; };
+layout(push_constant) uniform NfG3nParams {
+    int n_tokens;
+    int n_embd;
+    int n_altup;
+    int stream_stride;
+    int coefs_off;
+    int streams_off;
+    int pred_off;
+} pc;
+#elif OP == OP_ALTUP_CORRECT
+layout(std430, binding = 0) readonly buffer NfG3nCoefs { float coefs[]; };
+layout(std430, binding = 1) readonly buffer NfG3nActivated { float activated[]; };
+layout(std430, binding = 2) buffer NfG3nPred { float pred[]; };
+layout(std430, binding = 3) buffer NfG3nOut { float streams_out[]; };
+layout(push_constant) uniform NfG3nParams {
+    int n_tokens;
+    int n_embd;
+    int n_altup;
+    int act;
+    int stream_stride;
+    int coefs_off;
+    int activated_off;
+    int pred_off;
+    int out_off;
+} pc;
+#elif OP == OP_MAGNITUDE_MATCH
+#include "common/reduce.glsl"
+layout(std430, binding = 0) readonly buffer NfG3nRef { float ref_in[]; };
+layout(std430, binding = 1) buffer NfG3nX { float x[]; };
+layout(push_constant) uniform NfG3nParams {
+    int n_tokens;
+    int n_embd;
+    int n_x;
+    int x_stride;
+    int ref_off;
+    int x_off;
+} pc;
+#elif OP == OP_GAUSSIAN_TOPK
+#include "common/reduce.glsl"
+layout(std430, binding = 0) buffer NfG3nX { float x[]; };
+layout(push_constant) uniform NfG3nParams {
+    int n_tokens;
+    int n;
+    int x_stride;
+    int x_off;
+    float k_std;
+} pc;
+#elif OP == OP_STREAMS_MEAN
+layout(std430, binding = 0) buffer NfG3nStreams { float streams[]; };
+layout(std430, binding = 1) buffer NfG3nOut { float y_out[]; };
+layout(push_constant) uniform NfG3nParams {
+    int n_tokens;
+    int n_embd;
+    int n_altup;
+    int stream_stride;
+    int streams_off;
+    int out_off;
+} pc;
+#else
+#error "gemma3n.comp: OP is not a Gemma3n op"
+#endif
+
+#if OP == OP_ALTUP_PREDICT
+
+void main() {
+    const uint idx = nf_global_id();
+    const int n_altup = pc.n_altup;
+    if (n_altup < 1 || n_altup > NF_G3N_MAX_ALTUP || idx >= uint(pc.n_tokens) * uint(pc.n_embd)) {
+        return;
+    }
+    const uint t = idx / uint(pc.n_embd);
+    const uint ss = uint(pc.stream_stride);
+    /* Constant trip counts with n_altup guards keep s[] in registers (full unroll). */
+    float s[NF_G3N_MAX_ALTUP];
+    [[unroll]] for (int k = 0; k < NF_G3N_MAX_ALTUP; k++) {
+        s[k] = 0.0;
+        if (k < n_altup) {
+            s[k] = streams[uint(pc.streams_off) + uint(k) * ss + idx];
+        }
+    }
+    const uint c = uint(pc.coefs_off) + t * uint(n_altup * n_altup);
+    [[unroll]] for (int j = 0; j < NF_G3N_MAX_ALTUP; j++) {
+        if (j < n_altup) {
+            float acc = 0.0;
+            [[unroll]] for (int k = 0; k < NF_G3N_MAX_ALTUP; k++) {
+                if (k < n_altup) {
+                    acc += s[k] * coefs[c + uint(j * n_altup + k)];
+                }
+            }
+            pred[uint(pc.pred_off) + uint(j) * ss + idx] = acc + s[j];
+        }
+    }
+}
+
+#elif OP == OP_ALTUP_CORRECT
+
+void main() {
+    const uint idx = nf_global_id();
+    const int n_altup = pc.n_altup;
+    if (n_altup < 1 || pc.act < 0 || pc.act >= n_altup || idx >= uint(pc.n_tokens) * uint(pc.n_embd)) {
+        return;
+    }
+    const uint t = idx / uint(pc.n_embd);
+    const uint ss = uint(pc.stream_stride);
+    const float innov = activated[uint(pc.activated_off) + idx] - pred[uint(pc.pred_off) + uint(pc.act) * ss + idx];
+    const uint c = uint(pc.coefs_off) + t * uint(n_altup);
+    for (int j = 0; j < n_altup; j++) {
+        const float cj = coefs[c + uint(j)] + 1.0;
+        const float p = pred[uint(pc.pred_off) + uint(j) * ss + idx];
+        streams_out[uint(pc.out_off) + uint(j) * ss + idx] = innov * cj + p;
+    }
+}
+
+#elif OP == OP_MAGNITUDE_MATCH
+
+void main() {
+    const uint row = nf_wg_id();
+    if (row >= uint(pc.n_tokens) * uint(pc.n_x)) {
+        return;                                   /* uniform across the workgroup */
+    }
+    const uint j = row / uint(pc.n_tokens);
+    const uint t = row - j * uint(pc.n_tokens);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsz = gl_WorkGroupSize.x;
+    const uint n_embd = uint(pc.n_embd);
+    const uint r = uint(pc.ref_off) + t * n_embd;
+    const uint y = uint(pc.x_off) + j * uint(pc.x_stride) + t * n_embd;
+
+    float sr = 0.0;
+    float sx = 0.0;
+    for (uint i = lid; i < n_embd; i += lsz) {
+        const float a = ref_in[r + i];
+        const float b = x[y + i];
+        sr += a * a;
+        sx += b * b;
+    }
+    sr = nf_wg_sum(sr);
+    sx = nf_wg_sum(sx);
+    const float target = sqrt(sr);
+    const float current = sqrt(sx);
+    for (uint i = lid; i < n_embd; i += lsz) {
+        x[y + i] = (x[y + i] * target) / current;
+    }
+}
+
+#elif OP == OP_GAUSSIAN_TOPK
+
+void main() {
+    const uint t = nf_wg_id();
+    if (t >= uint(pc.n_tokens)) {
+        return;                                   /* uniform across the workgroup */
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsz = gl_WorkGroupSize.x;
+    const uint n = uint(pc.n);
+    const uint y = uint(pc.x_off) + t * uint(pc.x_stride);
+
+    float s = 0.0;
+    for (uint i = lid; i < n; i += lsz) {
+        s += x[y + i];
+    }
+    s = nf_wg_sum(s);
+    const float mean = s / float(pc.n);
+
+    float q = 0.0;
+    for (uint i = lid; i < n; i += lsz) {
+        const float d = x[y + i] - mean;
+        q += d * d;
+    }
+    q = nf_wg_sum(q);
+    const float std_dev = sqrt(q * (1.0 / float(pc.n - 1)));
+    const float cutoff = mean + std_dev * pc.k_std;
+
+    for (uint i = lid; i < n; i += lsz) {
+        const float v = x[y + i] - cutoff;
+        x[y + i] = v > 0.0 ? v : 0.0;
+    }
+}
+
+#elif OP == OP_STREAMS_MEAN
+
+void main() {
+    const uint idx = nf_global_id();
+    const int n_altup = pc.n_altup;
+    if (n_altup < 1 || idx >= uint(pc.n_tokens) * uint(pc.n_embd)) {
+        return;
+    }
+    const uint ss = uint(pc.stream_stride);
+    float acc = streams[uint(pc.streams_off) + idx];
+    for (int k = 1; k < n_altup; k++) {
+        acc += streams[uint(pc.streams_off) + uint(k) * ss + idx];
+    }
+    y_out[uint(pc.out_off) + idx] = acc * (1.0 / float(n_altup));
+}
+
+#endif

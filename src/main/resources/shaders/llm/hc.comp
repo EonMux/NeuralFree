@@ -1,0 +1,378 @@
+/* hc.comp - LLM_HC_PrePostComb, LLM_HC_Pre, LLM_HC_Post, LLM_ResStack_Score and LLM_ResStack_Mix
+ * (GLSL twin of kernels/llm/hc.cl, which is the semantic reference).
+ * Requires: common/nf_common.glsl, common/act.glsl, common/reduce.glsl (OP_RES_SCORE only).
+ *
+ * Layouts (element offsets relative to each buffer's <name>_off scalar): stream X[(t*hc + h)*n_embd + i],
+ * pre/post[t*hc + h], comb[t*hc*hc + dst + hc*src] (dst innermost), checkpoint stack[(c*n_tokens + t)*n_embd + i].
+ * A variants row selects OP; buffers take bindings 0.. in argument order, scalars fill the push block
+ * in argument order:
+ *   OP_HC_PREPOSTCOMB (i n_tokens, i hc, f eps, i iters, i n_out, f post_mag, f post_eps, i mixes_off,
+ *                      i pre_off, i post_off, i comb_off, R mixes, R scale, R base, W pre, W post, W comb)
+ *       pre  = sigmoid(m[h]*scale[0] + base[h]) + eps
+ *       post = post_mag*sigmoid(m[hc+h]*scale[1] + base[hc+h]) + post_eps                (n_out >= 2)
+ *       comb = Sinkhorn(m[2hc + dst + hc*src]*scale[2] + base[...]): softmax over dst per src, + eps,
+ *              norm_cols, then (iters - 1) x (norm_rows, norm_cols)                       (n_out == 3)
+ *       m = mixes[t*n_mix ...], n_mix = (2 + hc)*hc for n_out 3, n_out*hc otherwise.
+ *       One invocation per token; global = roundUp(n_tokens, L).
+ *   OP_HC_PRE         (i n_tokens, i n_embd, i hc, i mode, f gscale, i x_off, i w_off, i out_off,
+ *                      R X, R w_or_gate, W out)
+ *       out[t*n_embd + i] = gscale * sum_h X[...] * w; w = w_or_gate[t*hc + h] (mode 0),
+ *       sigmoid(w_or_gate[(t*hc + h)*n_embd + i]) (mode 1) or 1 (mode 2).
+ *   OP_HC_POST        (i n_tokens, i n_embd, i hc, i has_comb, i post_act, f post_in_scale, f post_mag,
+ *                      i y_off, i x_off, i post_off, i comb_off, i xout_off, R y, Rn X, R post, R comb, Wn Xout)
+ *       Xout[(t*hc+dst)*n_embd + i] = y[t*n_embd + i]*p[dst] + (has_comb ? sum_src X[src]*comb[dst + hc*src]
+ *       : X[dst]); p = post_act ? post_mag*sigmoid(post_in_scale*post) : post. Xout may be X with
+ *       xout_off == x_off.
+ *   OP_RES_SCORE      (i n_tokens, i n_embd, i n_ckpt, f eps, i stack_off, i cur_off, i probs_off,
+ *                      R stack, R cur, R score_w, W probs)
+ *       probs[t*(n_ckpt+1) + c] = softmax_c(sum(x*w) / sqrt(sum(x^2)/n_embd + eps)), x = checkpoint c
+ *       (c < n_ckpt) or cur (c == n_ckpt). One workgroup per token; global = n_tokens * L, L a power of
+ *       two <= LLM_DIMX.
+ *   OP_RES_MIX        (i n_tokens, i n_embd, i n_ckpt, i stack_off, i cur_off, i probs_off, i out_off,
+ *                      R stack, Rn cur, R probs, Wn out)
+ *       out[t*n_embd + i] = sum_c stack[c][t][i]*probs[t][c] + cur[t][i]*probs[t][n_ckpt]; out may be cur with
+ *       out_off == cur_off.
+ * Element-wise ops use one invocation per (token, i): global = roundUp(n_tokens*n_embd, L).
+ * Folded 1-D group counts are recovered by nf_wg_id()/nf_global_id(); surplus invocations exit.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+#define OP_HC_PREPOSTCOMB 1
+#define OP_HC_PRE         2
+#define OP_HC_POST        3
+#define OP_RES_SCORE      4
+#define OP_RES_MIX        5
+
+#if !defined(OP)
+#error "hc.comp requires OP"
+#endif
+
+#define NF_HC_MAX 8
+#define NF_HC_OUT_PRE           1
+#define NF_HC_OUT_PRE_POST      2
+#define NF_HC_OUT_PRE_POST_COMB 3
+#define NF_HC_PRE_WEIGHTS 0
+#define NF_HC_PRE_GATED   1
+#define NF_HC_PRE_MEAN    2
+
+#if OP == OP_HC_PREPOSTCOMB
+
+layout(std430, binding = 0) readonly  buffer NfHcMixes { float mixes[]; };
+layout(std430, binding = 1) readonly  buffer NfHcScale { float scale_v[]; };
+layout(std430, binding = 2) readonly  buffer NfHcBase  { float base_v[]; };
+layout(std430, binding = 3) writeonly buffer NfHcPre   { float pre_v[]; };
+layout(std430, binding = 4) writeonly buffer NfHcPost  { float post_v[]; };
+layout(std430, binding = 5) writeonly buffer NfHcComb  { float comb_v[]; };
+
+layout(push_constant) uniform NfHcParams {
+    int n_tokens;
+    int hc;
+    float eps;
+    int iters;
+    int n_out;
+    float post_mag;
+    float post_eps;
+    int mixes_off;
+    int pre_off;
+    int post_off;
+    int comb_off;
+} pc;
+
+/* Sinkhorn column normalization: divide by eps + sum over src for each dst (ops.cpp:11429-11443). */
+void nf_hc_norm_cols(inout float c[NF_HC_MAX * NF_HC_MAX], int hc, float eps) {
+    for (int dst = 0; dst < hc; dst++) {
+        float sum = eps;
+        for (int src = 0; src < hc; src++) {
+            sum += c[dst + hc * src];
+        }
+        const float inv_sum = 1.0 / sum;
+        for (int src = 0; src < hc; src++) {
+            c[dst + hc * src] *= inv_sum;
+        }
+    }
+}
+
+/* Sinkhorn row normalization: divide by eps + sum over dst for each src (ops.cpp:11445-11459). */
+void nf_hc_norm_rows(inout float c[NF_HC_MAX * NF_HC_MAX], int hc, float eps) {
+    for (int src = 0; src < hc; src++) {
+        float sum = eps;
+        for (int dst = 0; dst < hc; dst++) {
+            sum += c[dst + hc * src];
+        }
+        const float inv_sum = 1.0 / sum;
+        for (int dst = 0; dst < hc; dst++) {
+            c[dst + hc * src] *= inv_sum;
+        }
+    }
+}
+
+void main() {
+    const uint t = nf_global_id();
+    const int hc = pc.hc;
+    const int n_out = pc.n_out;
+    if (t >= uint(pc.n_tokens) || hc < 1 || hc > NF_HC_MAX
+            || n_out < NF_HC_OUT_PRE || n_out > NF_HC_OUT_PRE_POST_COMB) {
+        return;
+    }
+    const uint uhc = uint(hc);
+    const uint n_mix = n_out == NF_HC_OUT_PRE_POST_COMB ? uint((2 + hc) * hc) : uint(n_out * hc);
+    const uint m0 = uint(pc.mixes_off) + t * n_mix;
+
+    const float s_pre = scale_v[0];
+    for (uint h = 0u; h < uhc; h++) {
+        pre_v[uint(pc.pre_off) + t * uhc + h] = nf_sigmoid(mixes[m0 + h] * s_pre + base_v[h]) + pc.eps;
+    }
+    if (n_out < NF_HC_OUT_PRE_POST) {
+        return;
+    }
+    const float s_post = scale_v[1];
+    for (uint h = 0u; h < uhc; h++) {
+        post_v[uint(pc.post_off) + t * uhc + h] = pc.post_mag * nf_sigmoid(mixes[m0 + uhc + h] * s_post + base_v[uhc + h]) + pc.post_eps;
+    }
+    if (n_out < NF_HC_OUT_PRE_POST_COMB) {
+        return;
+    }
+
+    const float s_comb = scale_v[2];
+    const uint off = 2u * uhc;
+    float c[NF_HC_MAX * NF_HC_MAX];
+    for (int src = 0; src < hc; src++) {
+        float mx = -NF_INF;
+        for (int dst = 0; dst < hc; dst++) {
+            const int idx = dst + hc * src;
+            const float v = mixes[m0 + off + uint(idx)] * s_comb + base_v[off + uint(idx)];
+            c[idx] = v;
+            mx = max(mx, v);
+        }
+        float sum = 0.0;
+        for (int dst = 0; dst < hc; dst++) {
+            const int idx = dst + hc * src;
+            const float v = exp(c[idx] - mx);
+            c[idx] = v;
+            sum += v;
+        }
+        const float inv_sum = 1.0 / sum;
+        for (int dst = 0; dst < hc; dst++) {
+            const int idx = dst + hc * src;
+            c[idx] = c[idx] * inv_sum + pc.eps;
+        }
+    }
+    nf_hc_norm_cols(c, hc, pc.eps);
+    for (int i = 1; i < pc.iters; i++) {
+        nf_hc_norm_rows(c, hc, pc.eps);
+        nf_hc_norm_cols(c, hc, pc.eps);
+    }
+    const uint o0 = uint(pc.comb_off) + t * uhc * uhc;
+    for (int idx = 0; idx < hc * hc; idx++) {
+        comb_v[o0 + uint(idx)] = c[idx];
+    }
+}
+
+#elif OP == OP_HC_PRE
+
+layout(std430, binding = 0) readonly  buffer NfHcX    { float x_v[]; };
+layout(std430, binding = 1) readonly  buffer NfHcW    { float w_v[]; };
+layout(std430, binding = 2) writeonly buffer NfHcOut  { float out_v[]; };
+
+layout(push_constant) uniform NfHcParams {
+    int n_tokens;
+    int n_embd;
+    int hc;
+    int mode;
+    float gscale;
+    int x_off;
+    int w_off;
+    int out_off;
+} pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint n_embd = uint(pc.n_embd);
+    if (gid >= uint(pc.n_tokens) * n_embd) {
+        return;
+    }
+    const uint t = gid / n_embd;
+    const uint i = gid - t * n_embd;
+    const uint uhc = uint(max(pc.hc, 0));
+    const uint row0 = t * uhc;
+    float sum = 0.0;
+    for (uint h = 0u; h < uhc; h++) {
+        const uint xi = (row0 + h) * n_embd + i;
+        float wv;
+        if (pc.mode == NF_HC_PRE_WEIGHTS) {
+            wv = w_v[uint(pc.w_off) + row0 + h];
+        } else if (pc.mode == NF_HC_PRE_GATED) {
+            wv = nf_sigmoid(w_v[uint(pc.w_off) + xi]);
+        } else if (pc.mode == NF_HC_PRE_MEAN) {
+            wv = 1.0;
+        } else {
+            wv = NF_NAN;
+        }
+        sum += x_v[uint(pc.x_off) + xi] * wv;
+    }
+    out_v[uint(pc.out_off) + gid] = pc.gscale * sum;
+}
+
+#elif OP == OP_HC_POST
+
+layout(std430, binding = 0) readonly buffer NfHcY    { float y_v[]; };
+layout(std430, binding = 1) readonly buffer NfHcX    { float x_v[]; };
+layout(std430, binding = 2) readonly buffer NfHcPost { float post_v[]; };
+layout(std430, binding = 3) readonly buffer NfHcComb { float comb_v[]; };
+layout(std430, binding = 4)          buffer NfHcXout { float xout_v[]; };
+
+layout(push_constant) uniform NfHcParams {
+    int n_tokens;
+    int n_embd;
+    int hc;
+    int has_comb;
+    int post_act;
+    float post_in_scale;
+    float post_mag;
+    int y_off;
+    int x_off;
+    int post_off;
+    int comb_off;
+    int xout_off;
+} pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint n_embd = uint(pc.n_embd);
+    const int hc = pc.hc;
+    if (gid >= uint(pc.n_tokens) * n_embd || hc < 1 || hc > NF_HC_MAX) {
+        return;
+    }
+    const uint uhc = uint(hc);
+    const uint t = gid / n_embd;
+    const uint i = gid - t * n_embd;
+    const uint row0 = t * uhc;
+    float xs[NF_HC_MAX];
+    for (uint h = 0u; h < uhc; h++) {
+        xs[h] = x_v[uint(pc.x_off) + (row0 + h) * n_embd + i];
+    }
+    const float yv = y_v[uint(pc.y_off) + gid];
+    const uint cb = uint(pc.comb_off) + t * uhc * uhc;
+    for (uint dst = 0u; dst < uhc; dst++) {
+        const float pr = post_v[uint(pc.post_off) + row0 + dst];
+        const float pv = pc.post_act != 0 ? pc.post_mag * nf_sigmoid(pc.post_in_scale * pr) : pr;
+        float sum = yv * pv;
+        if (pc.has_comb != 0) {
+            for (uint src = 0u; src < uhc; src++) {
+                sum += xs[src] * comb_v[cb + dst + uhc * src];
+            }
+        } else {
+            sum += xs[dst];
+        }
+        xout_v[uint(pc.xout_off) + (row0 + dst) * n_embd + i] = sum;
+    }
+}
+
+#elif OP == OP_RES_SCORE
+
+#include "common/reduce.glsl"
+
+layout(std430, binding = 0) readonly  buffer NfResStack  { float stack_v[]; };
+layout(std430, binding = 1) readonly  buffer NfResCur    { float cur_v[]; };
+layout(std430, binding = 2) readonly  buffer NfResScoreW { float score_w[]; };
+layout(std430, binding = 3)           buffer NfResProbs  { float probs_v[]; };
+
+layout(push_constant) uniform NfResParams {
+    int n_tokens;
+    int n_embd;
+    int n_ckpt;
+    float eps;
+    int stack_off;
+    int cur_off;
+    int probs_off;
+} pc;
+
+void main() {
+    const uint t = nf_wg_id();
+    if (t >= uint(pc.n_tokens)) {
+        return; /* whole workgroup: t is uniform */
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint wg = gl_WorkGroupSize.x;
+    const uint n_embd = uint(pc.n_embd);
+    const int n_ckpt = max(pc.n_ckpt, 0);
+    const uint p0 = uint(pc.probs_off) + t * uint(n_ckpt + 1);
+
+    for (int c = 0; c <= n_ckpt; c++) {
+        const bool from_stack = c < n_ckpt;
+        const uint x0 = from_stack ? uint(pc.stack_off) + (uint(c) * uint(pc.n_tokens) + t) * n_embd
+                                   : uint(pc.cur_off) + t * n_embd;
+        float ss = 0.0;
+        float dw = 0.0;
+        for (uint i = lid; i < n_embd; i += wg) {
+            const float v = from_stack ? stack_v[x0 + i] : cur_v[x0 + i];
+            ss += v * v;
+            dw += v * score_w[i];
+        }
+        ss = nf_wg_sum(ss);
+        dw = nf_wg_sum(dw);
+        if (lid == 0u) {
+            probs_v[p0 + uint(c)] = dw * (1.0 / sqrt(ss / float(pc.n_embd) + pc.eps));
+        }
+    }
+
+    /* Invocation 0 wrote every score above, so it alone reads them back for the softmax. */
+    if (lid == 0u) {
+        float mx = -NF_INF;
+        for (int c = 0; c <= n_ckpt; c++) {
+            mx = max(mx, probs_v[p0 + uint(c)]);
+        }
+        float sum = 0.0;
+        for (int c = 0; c <= n_ckpt; c++) {
+            const float e = exp(probs_v[p0 + uint(c)] - mx);
+            probs_v[p0 + uint(c)] = e;
+            sum += e;
+        }
+        const float inv_sum = 1.0 / sum;
+        for (int c = 0; c <= n_ckpt; c++) {
+            probs_v[p0 + uint(c)] *= inv_sum;
+        }
+    }
+}
+
+#elif OP == OP_RES_MIX
+
+layout(std430, binding = 0) readonly buffer NfResStack { float stack_v[]; };
+layout(std430, binding = 1) readonly buffer NfResCur   { float cur_v[]; };
+layout(std430, binding = 2) readonly buffer NfResProbs { float probs_v[]; };
+layout(std430, binding = 3)          buffer NfResOut   { float out_v[]; };
+
+layout(push_constant) uniform NfResParams {
+    int n_tokens;
+    int n_embd;
+    int n_ckpt;
+    int stack_off;
+    int cur_off;
+    int probs_off;
+    int out_off;
+} pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint n_embd = uint(pc.n_embd);
+    if (gid >= uint(pc.n_tokens) * n_embd) {
+        return;
+    }
+    const uint t = gid / n_embd;
+    const uint i = gid - t * n_embd;
+    const int n_ckpt = max(pc.n_ckpt, 0);
+    const uint p0 = uint(pc.probs_off) + t * uint(n_ckpt + 1);
+    float sum = 0.0;
+    for (int c = 0; c < n_ckpt; c++) {
+        sum += stack_v[uint(pc.stack_off) + (uint(c) * uint(pc.n_tokens) + t) * n_embd + i] * probs_v[p0 + uint(c)];
+    }
+    out_v[uint(pc.out_off) + gid] = sum + cur_v[uint(pc.cur_off) + gid] * probs_v[p0 + uint(n_ckpt)];
+}
+
+#else
+#error "hc.comp: unknown OP"
+#endif

@@ -1,0 +1,142 @@
+/* act.comp - FFN activation kernels. GLSL twin of kernels/llm/ffn_act.cl.
+ * Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_SiGLUMul	act.comp	OP=OP_SIGLUMUL
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_SIGLUMUL                 (i size, float gate, float up, float out)          out = silu(gate) * up
+ *   OP_SILU                     (i size, float input, float output)                output = silu(input)
+ *   OP_BATCH_SIGLUMUL           (i size, i seq_len, float gate, float up, float out)
+ *                               OP_SIGLUMUL over seq_len * size elements, 4 per invocation
+ *   OP_SWIGLUOAI                (i size, float gate, float up, float output)
+ *                               swiglu_oai with alpha = 1.702, limit = 7
+ *   OP_GELU                     (i size, float input, float output)                gelu (tanh approximation)
+ *   OP_GELUMUL                  (i size, float gate, float up, float out)          out = gelu(gate) * up
+ *   OP_BATCH_GELU               (i total, float input, float output)               OP_GELU, 4 per invocation
+ *   OP_GELUMULOFFSET            (i size, float gate, float src, i offset, float dst)
+ *                               dst[i] = gelu(gate[i]) * src[offset + i]
+ *   OP_BATCH_GELUMULLAYERTOKEN  (i n_embd, i seq_len, i layer_off, i tok_stride, float gate, float inp_per_layer, float dst)
+ *                               dst[s * n_embd + i] = gelu(gate[s * n_embd + i]) * inp_per_layer[layer_off + s * tok_stride + i]
+ *   OP_BATCH_GELUMUL            (i size, i seq_len, float gate, float up, float out)
+ *                               OP_GELUMUL over seq_len * size elements, 4 per invocation
+ *   OP_SIGMOIDGATEMUL,
+ *   OP_BATCH_SIGMOIDGATEMUL     (i n, float gate, float input, float output)       output = sigmoid(gate) * input
+ * No binding has memory qualifiers because callers run these ops in place; each invocation reads
+ * and writes only its own elements.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n invocations (n = element count, or ceil(n / 4) for
+ * the 4-per-invocation ops), rounded up to L. Folded group counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_SIGLUMUL                 161
+#define OP_SILU                     162
+#define OP_BATCH_SIGLUMUL           163
+#define OP_SWIGLUOAI                164
+#define OP_GELU                     165
+#define OP_GELUMUL                  166
+#define OP_BATCH_GELU               167
+#define OP_GELUMULOFFSET            168
+#define OP_BATCH_GELUMULLAYERTOKEN  169
+#define OP_BATCH_GELUMUL            170
+#define OP_SIGMOIDGATEMUL           171
+#define OP_BATCH_SIGMOIDGATEMUL     172
+
+#ifndef OP
+#error "act.comp requires OP"
+#endif
+
+#if OP == OP_SILU || OP == OP_GELU || OP == OP_BATCH_GELU
+layout(std430, binding = 0) buffer NfActIn { float g_in[]; };
+layout(std430, binding = 1) buffer NfActOut { float y_out[]; };
+layout(push_constant) uniform NfActParams { int n; } pc;
+#elif OP == OP_SIGLUMUL || OP == OP_SWIGLUOAI || OP == OP_GELUMUL || OP == OP_SIGMOIDGATEMUL || OP == OP_BATCH_SIGMOIDGATEMUL
+layout(std430, binding = 0) buffer NfActGate { float g_in[]; };
+layout(std430, binding = 1) buffer NfActUp { float u_in[]; };
+layout(std430, binding = 2) buffer NfActOut { float y_out[]; };
+layout(push_constant) uniform NfActParams { int n; } pc;
+#elif OP == OP_BATCH_SIGLUMUL || OP == OP_BATCH_GELUMUL
+layout(std430, binding = 0) buffer NfActGate { float g_in[]; };
+layout(std430, binding = 1) buffer NfActUp { float u_in[]; };
+layout(std430, binding = 2) buffer NfActOut { float y_out[]; };
+layout(push_constant) uniform NfActParams { int size; int seq_len; } pc;
+#elif OP == OP_GELUMULOFFSET
+layout(std430, binding = 0) buffer NfActGate { float g_in[]; };
+layout(std430, binding = 1) buffer NfActSrc { float u_in[]; };
+layout(std430, binding = 2) buffer NfActOut { float y_out[]; };
+layout(push_constant) uniform NfActParams { int n; int offset; } pc;
+#elif OP == OP_BATCH_GELUMULLAYERTOKEN
+layout(std430, binding = 0) buffer NfActGate { float g_in[]; };
+layout(std430, binding = 1) buffer NfActInp { float u_in[]; };
+layout(std430, binding = 2) buffer NfActOut { float y_out[]; };
+layout(push_constant) uniform NfActParams { int n_embd; int seq_len; int layer_off; int tok_stride; } pc;
+#else
+#error "act.comp: OP is not an activation op"
+#endif
+
+#include "common/act.glsl"
+
+/* Result of the op for element i of the 4-per-invocation batch ops. */
+float nf_ffn_act_batch(uint i) {
+#if OP == OP_BATCH_SIGLUMUL
+    return nf_silu(g_in[i]) * u_in[i];
+#elif OP == OP_BATCH_GELUMUL
+    return nf_gelu_tanh(g_in[i]) * u_in[i];
+#else
+    return nf_gelu_tanh(g_in[i]);
+#endif
+}
+
+void main() {
+    const uint gid = nf_global_id();
+
+#if OP == OP_BATCH_SIGLUMUL || OP == OP_BATCH_GELUMUL || OP == OP_BATCH_GELU
+#if OP == OP_BATCH_GELU
+    const uint total = uint(pc.n);
+#else
+    const uint total = uint(pc.seq_len) * uint(pc.size);
+#endif
+    const uint i0 = gid * 4u;
+    if (i0 >= total) {
+        return;
+    }
+    const uint i1 = min(i0 + 4u, total);
+    for (uint i = i0; i < i1; ++i) {
+        y_out[i] = nf_ffn_act_batch(i);
+    }
+
+#elif OP == OP_BATCH_GELUMULLAYERTOKEN
+    const uint n_embd = uint(pc.n_embd);
+    if (gid >= n_embd * uint(pc.seq_len)) {
+        return;
+    }
+    const uint s = gid / n_embd;
+    const uint i = gid - s * n_embd;
+    y_out[gid] = nf_gelu_tanh(g_in[gid]) * u_in[uint(pc.layer_off) + s * uint(pc.tok_stride) + i];
+
+#else
+    const uint i = gid;
+    if (i >= uint(pc.n)) {
+        return;
+    }
+#if OP == OP_SIGLUMUL
+    y_out[i] = nf_silu(g_in[i]) * u_in[i];
+#elif OP == OP_SILU
+    y_out[i] = nf_silu(g_in[i]);
+#elif OP == OP_SWIGLUOAI
+    y_out[i] = nf_glu(NF_GLU_SWIGLU_OAI, g_in[i], u_in[i], 7.0, 1.702, 0.0, 0.0);
+#elif OP == OP_GELU
+    y_out[i] = nf_gelu_tanh(g_in[i]);
+#elif OP == OP_GELUMUL
+    y_out[i] = nf_gelu_tanh(g_in[i]) * u_in[i];
+#elif OP == OP_GELUMULOFFSET
+    y_out[i] = nf_gelu_tanh(g_in[i]) * u_in[uint(pc.offset) + i];
+#elif OP == OP_SIGMOIDGATEMUL || OP == OP_BATCH_SIGMOIDGATEMUL
+    y_out[i] = nf_sigmoid(g_in[i]) * u_in[i];
+#endif
+#endif
+}

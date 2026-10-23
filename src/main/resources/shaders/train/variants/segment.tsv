@@ -1,0 +1,4 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# CSR segment reductions for graph aggregation and their backward (kernels/train/segment.cl).
+TR_SegmentReduce_F32	segment.comp	OP=SEGMENT_REDUCE_F32
+TR_SegmentReduceBackward_F32	segment.comp	OP=SEG_REDUCE_BWD

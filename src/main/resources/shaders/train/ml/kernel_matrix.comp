@@ -1,0 +1,151 @@
+/* ml/kernel_matrix.comp - SVM and Gaussian-process kernel matrices. GLSL twin of
+ * kernels/train/ml/kernel_matrix.cl (the semantic reference: arguments, formulas and dispatch are documented
+ * there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     ML_SVM_Kernel	ml/kernel_matrix.comp	OP=KMAT_SVM
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * a and b are readonly without restrict, because training binds the same buffer to both. Accumulators and
+ * the formula intermediates are precise, so no implementation contracts or reassociates them; sums
+ * accumulate with an explicit fma, as in kernel_matrix.cl. The integer power is ml_kmat_ipow of
+ * kernel_matrix.cl, never GLSL pow (undefined for a negative base).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+/* Operation ids: the type argument (mirrors kernels/train/ml/kernel_matrix.cl). */
+#define ML_SVM_LINEAR   0
+#define ML_SVM_RBF      1
+#define ML_SVM_POLY     2
+
+#define ML_GP_RBF       0
+#define ML_GP_MATERN32  1
+#define ML_GP_MATERN52  2
+#define ML_GP_LINEAR    3
+
+#define KMAT_SVM  1
+#define KMAT_GP   2
+
+#ifndef OP
+#error "kernel_matrix.comp requires OP"
+#endif
+
+layout(std430, binding = 0) readonly buffer MlKmatA { float a_f[]; };
+layout(std430, binding = 1) readonly buffer MlKmatB { float b_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer MlKmatK { float k_f[]; };
+
+#if OP == KMAT_SVM
+layout(push_constant) uniform MlKmatParams {
+    int m;
+    int n;
+    int f;
+    int type;
+    float gamma;
+    int degree;
+    float coef0;
+    int a_off;
+    int b_off;
+} pc;
+
+#elif OP == KMAT_GP
+layout(push_constant) uniform MlKmatParams {
+    int m;
+    int n;
+    int f;
+    int type;
+    float length_scale;
+    float variance;
+    float noise;
+    int a_off;
+    int b_off;
+    int add_noise_diag;
+} pc;
+
+#else
+#error "kernel_matrix.comp: unknown OP"
+#endif
+
+/* Sum over k < f of (a_f[ai + k] - b_f[bi + k])^2, ascending, fused. */
+float ml_kmat_sqdist(const int ai, const int bi, const int f) {
+    precise float acc = 0.0;
+    for (int k = 0; k < f; ++k) {
+        precise float diff = a_f[ai + k] - b_f[bi + k];
+        acc = fma(diff, diff, acc);
+    }
+    return acc;
+}
+
+/* Sum over k < f of a_f[ai + k] * b_f[bi + k], ascending, fused. */
+float ml_kmat_dot(const int ai, const int bi, const int f) {
+    precise float acc = 0.0;
+    for (int k = 0; k < f; ++k) {
+        acc = fma(a_f[ai + k], b_f[bi + k], acc);
+    }
+    return acc;
+}
+
+/* x^e for an int exponent by binary exponentiation in float (see ml_kmat_ipow in kernel_matrix.cl). */
+float ml_kmat_ipow(const float x, const int e) {
+    uint m = e < 0 ? uint(-(e + 1)) + 1u : uint(e);
+    precise float r = 1.0;
+    precise float p = x;
+    while (m != 0u) {
+        if ((m & 1u) != 0u) {
+            r = r * p;
+        }
+        m >>= 1;
+        if (m != 0u) {
+            p = p * p;
+        }
+    }
+    precise float inv = 1.0 / r;
+    return e < 0 ? inv : r;
+}
+
+void main() {
+    const int t = tr_gid(pc.m * pc.n);
+    if (t < 0) {
+        return;
+    }
+    const int i = t / pc.n;
+    const int j = t - i * pc.n;
+    const int ai = pc.a_off + i * pc.f;
+    const int bj = pc.b_off + j * pc.f;
+#if OP == KMAT_SVM
+    precise float v;
+    if (pc.type == ML_SVM_RBF) {
+        v = exp(-pc.gamma * ml_kmat_sqdist(ai, bj, pc.f));
+    } else if (pc.type == ML_SVM_POLY) {
+        precise float base = pc.gamma * ml_kmat_dot(ai, bj, pc.f) + pc.coef0;
+        v = ml_kmat_ipow(base, pc.degree);
+    } else {
+        v = ml_kmat_dot(ai, bj, pc.f);
+    }
+    k_f[t] = v;
+
+#elif OP == KMAT_GP
+    const float ls = pc.length_scale;
+    precise float v;
+    if (pc.type == ML_GP_LINEAR) {
+        v = pc.variance * ml_kmat_dot(ai, bj, pc.f);
+    } else {
+        const float sq = ml_kmat_sqdist(ai, bj, pc.f);
+        if (pc.type == ML_GP_MATERN32) {
+            precise float s = 1.73205078 * sqrt(sq) / ls;                    /* (float) Math.sqrt(3) */
+            v = pc.variance * (1.0 + s) * exp(-s);
+        } else if (pc.type == ML_GP_MATERN52) {
+            precise float s = 2.23606801 * sqrt(sq) / ls;                    /* (float) Math.sqrt(5) */
+            precise float q = 5.0 * sq / (3.0 * ls * ls);
+            v = pc.variance * (1.0 + s + q) * exp(-s);
+        } else {
+            v = pc.variance * exp(-sq / (2.0 * ls * ls));
+        }
+    }
+    if (pc.add_noise_diag != 0 && pc.m == pc.n && i == j) {
+        v = v + pc.noise;
+    }
+    k_f[t] = v;
+#endif
+}

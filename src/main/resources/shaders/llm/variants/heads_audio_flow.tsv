@@ -1,0 +1,9 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Switched LoRA (kernels/llm/heads.cl), wavtokenizer convolutions (kernels/llm/audio.cl), row gather (kernels/llm/flow.cl).
+# heads.cl
+LLM_SwitchedLoraAdd	lora_switch.comp		sg
+# audio.cl
+LLM_Conv1dSame	conv1d.comp	OP=OP_CONV1D_SAME
+LLM_Conv1dDepthwise	conv1d.comp	OP=OP_CONV1D_DW
+# flow.cl
+LLM_GatherRows	gather_rows.comp

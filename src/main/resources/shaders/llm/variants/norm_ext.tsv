@@ -1,0 +1,8 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Generic row/group norms, residual mixes and row scales (kernels/llm/norm_ext.cl).
+# norm_ext.cl
+LLM_RowNorm	norm_ext.comp	OP=OP_ROW_NORM	sg
+LLM_GroupRms	norm_ext.comp	OP=OP_GROUP_RMS	sg
+LLM_GroupNorm	norm_ext.comp	OP=OP_GROUP_NORM	sg
+LLM_ResidualMix	norm_ext.comp	OP=OP_RESIDUAL_MIX
+LLM_MulRowScale	norm_ext.comp	OP=OP_MUL_ROW_SCALE

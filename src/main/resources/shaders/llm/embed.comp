@@ -1,0 +1,73 @@
+/* embed.comp - embedding-row lookup op templates over a QT_DECODE_ELEM weight decoder.
+ * GLSL twin of IQ_EMBEDLOOKUP / IQ_BATCHEMBED (kernels/llm/common/matvec_family.h) and of the dense,
+ * Q8_0, MXFP4 and IQ4_XS embedding kernels, which share these semantics.
+ * Requires: common/nf_common.glsl, common/quant_blocks.glsl, common/iq_tables.glsl and the
+ * decoder file that serves QTYPE (dense F32/F16/BF16 decoders live in quant_blocks.glsl).
+ *
+ * A variants row selects QTYPE=QT_<T> and OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     Q4_K_EmbeddingLookup	embed.comp	QTYPE=QT_Q4_K OP=OP_EMBED
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_EMBED        (i embed_dim, i token_id, R weight, W float output)
+ *                   output[i] = weight[token_id][i], i in [0, embed_dim)
+ *   OP_BATCH_EMBED  (i embed_dim, i seq_len, R int token_ids, R weight, W float output)
+ *                   output[s * embed_dim + i] = weight[token_ids[s]][i]
+ * A weight row holds embed_dim / QT_BS blocks of QT_BB bytes.
+ *
+ * Dispatch: 1-D, global = embed_dim (OP_EMBED) or seq_len * embed_dim (OP_BATCH_EMBED), any
+ * local = {L, 1, 1}; folded group counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#if !defined(OP) || !defined(QTYPE)
+#error "embed.comp requires OP and QTYPE"
+#endif
+
+#if OP == OP_EMBED
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) writeonly buffer NfEmbOutput { float y_out[]; };
+layout(push_constant) uniform NfEmbParams { int embed_dim; int token_id; } pc;
+#elif OP == OP_BATCH_EMBED
+layout(std430, binding = 0) readonly buffer NfEmbTokens { int token_ids[]; };
+NF_BUFFER_VIEWS(1, w)
+layout(std430, binding = 2) writeonly buffer NfEmbOutput { float y_out[]; };
+layout(push_constant) uniform NfEmbParams { int embed_dim; int seq_len; } pc;
+#else
+#error "embed.comp: OP is not an embedding op"
+#endif
+
+#include "common/quant_blocks.glsl"
+#include "common/iq_tables.glsl"
+#include "common/quant_legacy.glsl"
+#include "common/quant_k.glsl"
+#include "common/quant_iq.glsl"
+#include "common/quant_new.glsl"
+
+#if !defined(QT_DECODE_ELEM) || !defined(QT_BS) || !defined(QT_BB)
+#error "embed.comp: no QT_DECODE_ELEM decoder serves QTYPE"
+#endif
+
+void main() {
+    nf_iq_init_shared();
+
+    const uint embed_dim = uint(pc.embed_dim);
+    const uint row_bytes = (embed_dim / uint(QT_BS)) * uint(QT_BB);
+    const uint gid = nf_global_id();
+
+#if OP == OP_EMBED
+    if (gid >= embed_dim) {
+        return;
+    }
+    y_out[gid] = qt_elem(NF_WS_A, uint(pc.token_id) * row_bytes, gid);
+#else
+    if (gid >= uint(pc.seq_len) * embed_dim) {
+        return;
+    }
+    const uint s = gid / embed_dim;
+    const uint i = gid - s * embed_dim;
+    y_out[gid] = qt_elem(NF_WS_A, uint(token_ids[s]) * row_bytes, i);
+#endif
+}

@@ -1,0 +1,14 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Layer, RMS, batch and group normalization, row index-select, and their backward kernels (kernels/train/norm.cl).
+TR_LayerNormRows_F32	norm.comp	OP=NORM_LAYER_ROWS
+TR_RMSNormRows_F32	norm.comp	OP=NORM_RMS_ROWS
+TR_ChannelStats_F32	norm.comp	OP=NORM_CHANNEL_STATS
+TR_ChannelNormApply_F32	norm.comp	OP=NORM_CHANNEL_APPLY
+TR_IndexSelectRows_F32	norm.comp	OP=NORM_INDEX_SELECT
+TR_LayerNormRowsBackward_F32	norm.comp	OP=NORM_LAYER_ROWS_BWD
+TR_RMSNormRowsBackward_F32	norm.comp	OP=NORM_RMS_ROWS_BWD
+TR_NormAffineGradCols_F32	norm.comp	OP=NORM_AFFINE_COLS
+TR_ChannelGradSums_F32	norm.comp	OP=NORM_CHANNEL_GRAD_SUMS
+TR_GroupGradSums_F32	norm.comp	OP=NORM_GROUP_GRAD_SUMS
+TR_ChannelNormBackwardApply_F32	norm.comp	OP=NORM_CHANNEL_BWD_APPLY
+TR_IndexAddRows_F32	norm.comp	OP=NORM_INDEX_ADD_ROWS

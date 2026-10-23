@@ -1,0 +1,77 @@
+/* eltwise_ext.comp - LLM_Copy2D_F32 and LLM_Axpby_F32 offset-aware generic ops. GLSL twin of
+ * kernels/llm/eltwise_ext.cl (the semantic reference). Requires: common/nf_common.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_Copy2D_F32	eltwise_ext.comp	OP=OP_COPY2D_F32
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_COPY2D_F32 (i rows, i cols, i src_stride, i src_off, i dst_stride, i dst_off, R float src, W float dst)
+ *       dst[dst_off + r*dst_stride + c] = src[src_off + r*src_stride + c], r < rows, c < cols;
+ *       the copied ranges never overlap.
+ *   OP_AXPBY_F32  (i n, f alpha, f beta, i a_off, i b_off, i out_off, R float a, float b, float out)
+ *       out[out_off + i] = (alpha != 0 ? alpha*a[a_off + i] : 0) + (beta != 0 ? beta*b[b_off + i] : 0);
+ *       a zero coefficient skips the read of its operand; out may alias b element for element
+ *       (same buffer, out_off == b_off), so b and out carry no restrict qualifiers.
+ * Offsets and strides are in float elements.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n invocations (Copy2D: n = rows*cols) rounded up to L.
+ * Folded group counts are recovered by nf_global_id(). Element indices stay below 2^31 and every
+ * binding stays below maxStorageBufferRange, so 32-bit index arithmetic is exact.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_COPY2D_F32 201
+#define OP_AXPBY_F32  202
+
+#ifndef OP
+#error "eltwise_ext.comp requires OP"
+#endif
+
+#if OP == OP_COPY2D_F32
+layout(std430, binding = 0) restrict readonly buffer NfExSrc { float src_in[]; };
+layout(std430, binding = 1) restrict writeonly buffer NfExDst { float dst_out[]; };
+layout(push_constant) uniform NfExParams {
+    int rows;
+    int cols;
+    int src_stride;
+    int src_off;
+    int dst_stride;
+    int dst_off;
+} pc;
+#elif OP == OP_AXPBY_F32
+layout(std430, binding = 0) restrict readonly buffer NfExA { float a_in[]; };
+layout(std430, binding = 1) readonly buffer NfExB { float b_in[]; };
+layout(std430, binding = 2) writeonly buffer NfExOut { float y_out[]; };
+layout(push_constant) uniform NfExParams {
+    int n;
+    float alpha;
+    float beta;
+    int a_off;
+    int b_off;
+    int out_off;
+} pc;
+#else
+#error "eltwise_ext.comp: unknown OP"
+#endif
+
+void main() {
+    const uint idx = nf_global_id();
+#if OP == OP_COPY2D_F32
+    if (pc.cols <= 0 || idx >= uint(pc.rows) * uint(pc.cols)) {
+        return;
+    }
+    const uint r = idx / uint(pc.cols);
+    const uint c = idx - r * uint(pc.cols);
+    dst_out[uint(pc.dst_off) + r * uint(pc.dst_stride) + c] = src_in[uint(pc.src_off) + r * uint(pc.src_stride) + c];
+#elif OP == OP_AXPBY_F32
+    if (idx >= uint(pc.n)) {
+        return;
+    }
+    const float av = pc.alpha != 0.0 ? pc.alpha * a_in[uint(pc.a_off) + idx] : 0.0;
+    const float bv = pc.beta != 0.0 ? pc.beta * b_in[uint(pc.b_off) + idx] : 0.0;
+    y_out[uint(pc.out_off) + idx] = av + bv;
+#endif
+}

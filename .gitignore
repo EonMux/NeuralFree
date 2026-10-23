@@ -1,0 +1,48 @@
+# Build output
+build/
+target/
+.gradle/
+out/
+
+# Compiled class files
+*.class
+
+# Package files
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+*.swp
+*~
+.factorypath
+nb-configuration.xml
+
+# Log files
+*.log
+hs_err_pid*.log
+replay_pid*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+
+# Model files
+*.gguf

@@ -1,0 +1,22 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Classical machine learning (kernels/train/ml/{kmeans,kernel_matrix,linear,forecast}.cl).
+# ml/kmeans.cl
+ML_KMeans_Distances	ml/kmeans.comp	OP=KMEANS_DISTANCES
+ML_KMeans_Assign	ml/kmeans.comp	OP=KMEANS_ASSIGN
+ML_KMeans_UpdatePartial	ml/kmeans.comp	OP=KMEANS_UPDATE_PARTIAL
+ML_KMeans_UpdateFinalize	ml/kmeans.comp	OP=KMEANS_UPDATE_FINALIZE
+ML_KMeans_Shift	ml/kmeans.comp	OP=KMEANS_SHIFT
+# ml/kernel_matrix.cl
+ML_SVM_Kernel	ml/kernel_matrix.comp	OP=KMAT_SVM
+ML_GP_Kernel	ml/kernel_matrix.comp	OP=KMAT_GP
+# ml/linear.cl
+ML_Perceptron_Forward	ml/linear.comp	OP=LIN_PERCEPTRON_FORWARD
+ML_Perceptron_Grad	ml/linear.comp	OP=LIN_PERCEPTRON_GRAD
+ML_Perceptron_Update	ml/linear.comp	OP=LIN_PERCEPTRON_UPDATE
+ML_LogReg_Forward	ml/linear.comp	OP=LIN_LOGREG_FORWARD
+ML_LogReg_Grad	ml/linear.comp	OP=LIN_LOGREG_GRAD
+ML_LogReg_Update	ml/linear.comp	OP=LIN_LOGREG_UPDATE
+# ml/forecast.cl
+ML_Forecast_Forward	ml/forecast.comp	OP=FC_FORWARD
+ML_Forecast_Grad	ml/forecast.comp	OP=FC_GRAD
+ML_Forecast_Update	ml/forecast.comp	OP=FC_UPDATE

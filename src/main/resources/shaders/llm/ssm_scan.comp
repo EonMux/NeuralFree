@@ -1,0 +1,118 @@
+/* ssm_scan.comp - LLM_SSM_Scan: Mamba1/Mamba2/PLaMo2 selective scan with the dt bias and softplus folded in.
+ * GLSL twin of LLM_SSM_Scan in kernels/llm/recurrent/ssm_scan.cl (the semantic reference; ggml_ssm_scan,
+ * ggml-cpu/ops.cpp:10092-10308). Requires: common/nf_common.glsl, common/act.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i d_state, i head_dim, i n_head, i n_group, i n_tokens, i a_per_state, i ch_per_wg, i x_stride, i x_off,
+ *    i dt_stride, i dt_off, i b_stride, i c_stride, i b_off, i c_off, i y_stride, i has_dt_bias,
+ *    R float x, R float dt, R float dt_bias, R float A, R float B, R float C, RW float ssm_state,
+ *    R int state_rows, W float y)
+ *   ch = h*head_dim + p, g = h / (n_head / n_group), per token t and state n:
+ *   dt' = softplus(dt[dt_off + t*dt_stride + h] + (has_dt_bias ? dt_bias[h] : 0)), x_dt = x[x_off + t*x_stride + ch] * dt'
+ *   dA  = exp(dt' * (a_per_state ? A[h*d_state + n] : A[h]))
+ *   s[ch][n] = s[ch][n]*dA + B[b_off + t*b_stride + g*d_state + n]*x_dt
+ *   y[t*y_stride + ch] = sum_n s[ch][n]*C[c_off + t*c_stride + g*d_state + n]
+ *   state row state_rows[0] of n_head*head_dim*d_state floats, s[ch][n] at ch*d_state + n.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1} with L = ch_per_wg * lanes, lanes a power of two (the host uses
+ * lanes = min(pow2ceil(d_state), 64), ch_per_wg = max(1, 32 / lanes)); lane l of a channel owns the
+ * states l + k*lanes (k < NF_SSM_SCAN_MAX_SPL); global = ceil(n_head*head_dim / ch_per_wg) * L. The per-token
+ * sum is nf_wg_sum when ch_per_wg == 1 (subgroup arithmetic in the __sg variant, bound only when
+ * L % maxSubgroupSize == 0) and nf_seg_sum over lanes otherwise. Invocations past the last channel take
+ * part in every reduction with 0. Folded group counts are recovered by nf_wg_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+#define NF_SSM_SCAN_MAX_SPL 8
+
+layout(std430, binding = 0) readonly buffer NfScanX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfScanDt { float dt_in[]; };
+layout(std430, binding = 2) readonly buffer NfScanDtBias { float dt_bias[]; };
+layout(std430, binding = 3) readonly buffer NfScanA { float a_in[]; };
+layout(std430, binding = 4) readonly buffer NfScanB { float b_in[]; };
+layout(std430, binding = 5) readonly buffer NfScanC { float c_in[]; };
+layout(std430, binding = 6) buffer NfScanState { float ssm_state[]; };
+layout(std430, binding = 7) readonly buffer NfScanRows { int state_rows[]; };
+layout(std430, binding = 8) writeonly buffer NfScanY { float y_out[]; };
+
+layout(push_constant) uniform NfScanParams {
+    int d_state;
+    int head_dim;
+    int n_head;
+    int n_group;
+    int n_tokens;
+    int a_per_state;
+    int ch_per_wg;
+    int x_stride;
+    int x_off;
+    int dt_stride;
+    int dt_off;
+    int b_stride;
+    int c_stride;
+    int b_off;
+    int c_off;
+    int y_stride;
+    int has_dt_bias;
+} pc;
+
+#include "common/reduce.glsl"
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lanes = gl_WorkGroupSize.x / uint(pc.ch_per_wg);
+    const uint lane = lid & (lanes - 1u);
+    const uint d_state = uint(pc.d_state);
+    const uint n_ch = uint(pc.n_head) * uint(pc.head_dim);
+    const uint ch = nf_wg_id() * uint(pc.ch_per_wg) + lid / lanes;
+    const bool live = ch < n_ch;
+    const uint h = live ? ch / uint(pc.head_dim) : 0u;
+    const uint g = h / (uint(pc.n_head) / uint(pc.n_group));
+    const uint spl = (d_state + lanes - 1u) / lanes;
+    const bool per_state = pc.a_per_state != 0;
+    const uint s_base = uint(state_rows[0]) * n_ch * d_state + ch * d_state;
+    const float bias = (live && pc.has_dt_bias != 0) ? dt_bias[h] : 0.0;
+    const float a_head = (live && !per_state) ? a_in[h] : 0.0;
+
+    float s[NF_SSM_SCAN_MAX_SPL];
+    float a[NF_SSM_SCAN_MAX_SPL];
+    [[unroll]] for (uint k = 0u; k < NF_SSM_SCAN_MAX_SPL; ++k) {
+        const uint n = lane + k * lanes;
+        const bool own = live && k < spl && n < d_state;
+        s[k] = own ? ssm_state[s_base + n] : 0.0;
+        a[k] = (own && per_state) ? a_in[h * d_state + n] : 0.0;
+    }
+
+    for (int t = 0; t < pc.n_tokens; ++t) {
+        float partial = 0.0;
+        if (live) {
+            const float dt_sp = nf_softplus(dt_in[uint(pc.dt_off) + uint(t) * uint(pc.dt_stride) + h] + bias);
+            const float x_dt = x_in[uint(pc.x_off) + uint(t) * uint(pc.x_stride) + ch] * dt_sp;
+            const float dA_head = per_state ? 0.0 : exp(dt_sp * a_head);
+            const uint bt = uint(pc.b_off) + uint(t) * uint(pc.b_stride) + g * d_state;
+            const uint ct = uint(pc.c_off) + uint(t) * uint(pc.c_stride) + g * d_state;
+            [[unroll]] for (uint k = 0u; k < NF_SSM_SCAN_MAX_SPL; ++k) {
+                const uint n = lane + k * lanes;
+                if (k < spl && n < d_state) {
+                    const float dA = per_state ? exp(dt_sp * a[k]) : dA_head;
+                    s[k] = s[k] * dA + b_in[bt + n] * x_dt;
+                    partial += s[k] * c_in[ct + n];
+                }
+            }
+        }
+        const float sum = pc.ch_per_wg == 1 ? nf_wg_sum(partial) : nf_seg_sum(partial, lanes);
+        if (live && lane == 0u) {
+            y_out[uint(t) * uint(pc.y_stride) + ch] = sum;
+        }
+    }
+
+    [[unroll]] for (uint k = 0u; k < NF_SSM_SCAN_MAX_SPL; ++k) {
+        const uint n = lane + k * lanes;
+        if (live && k < spl && n < d_state) {
+            ssm_state[s_base + n] = s[k];
+        }
+    }
+}

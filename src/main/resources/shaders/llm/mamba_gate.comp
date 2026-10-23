@@ -1,0 +1,48 @@
+/* mamba_gate.comp - LLM_MambaGateOut: Mamba D skip and z gate, out = (y + D[h]*x) * silu(z).
+ * GLSL twin of LLM_MambaGateOut in kernels/llm/recurrent/ssm_scan.cl (models/mamba-base.cpp:140-141 / 286-288,
+ * plamo2.cpp:406-410). Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n, i width, i head_dim, i x_stride, i x_off, i y_off, i z_stride, i z_off,
+ *    R float y, R float x, R float D, R float z, W float out)
+ *   i < n = n_tokens*width, t = i / width, c = i % width:
+ *   out[i] = (y[y_off + i] + D[c / head_dim] * x[x_off + t*x_stride + c]) * silu(z[z_off + t*z_stride + c])
+ *   out is a buffer distinct from y, x and z.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = roundUp(n, L). Folded group counts are recovered by
+ * nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+layout(std430, binding = 0) readonly buffer NfGateY { float y_in[]; };
+layout(std430, binding = 1) readonly buffer NfGateX { float x_in[]; };
+layout(std430, binding = 2) readonly buffer NfGateD { float d_in[]; };
+layout(std430, binding = 3) readonly buffer NfGateZ { float z_in[]; };
+layout(std430, binding = 4) writeonly buffer NfGateOut { float y_out[]; };
+
+layout(push_constant) uniform NfGateParams {
+    int n;
+    int width;
+    int head_dim;
+    int x_stride;
+    int x_off;
+    int y_off;
+    int z_stride;
+    int z_off;
+} pc;
+
+void main() {
+    const uint i = nf_global_id();
+    if (i >= uint(pc.n)) {
+        return;
+    }
+    const uint width = uint(pc.width);
+    const uint t = i / width;
+    const uint c = i - t * width;
+    const float v = y_in[uint(pc.y_off) + i] + d_in[c / uint(pc.head_dim)] * x_in[uint(pc.x_off) + t * uint(pc.x_stride) + c];
+    y_out[i] = v * nf_silu(z_in[uint(pc.z_off) + t * uint(pc.z_stride) + c]);
+}

@@ -1,0 +1,107 @@
+/* mla_kv.comp - LLM_MLA_KV_Assemble and LLM_MLA_AbsorbedKVDecomp (GLSL twin of kernels/llm/mla.cl).
+ * Requires: common/nf_common.glsl.
+ *
+ * Per-head K and V of one token for Multi-head Latent Attention. head_dim_k = n_nope + n_rot; each
+ * K head is [k_nope(n_nope) | k_rope(n_rot)], with k_rope = kv_pe[kv_lora .. kv_lora + n_rot)
+ * shared by every head. k_cur is [num_heads][head_dim_k], v_cur is [num_heads][head_dim_v].
+ * Invocation g < num_heads * head_dim_k writes k_cur[g]; the next num_heads * head_dim_v
+ * invocations write v_cur.
+ *
+ * A variants row selects OP:
+ *   OP_MLA_KV_ASSEMBLE       (i num_heads, i n_nope, i n_rot, i head_dim_k, i head_dim_v, i kv_lora,
+ *                             R kv_pe, R kv_decomp, W k_cur, W v_cur)
+ *                            kv_decomp holds [k_nope(n_nope) | v(head_dim_v)] per head.
+ *   OP_MLA_ABSORBEDKVDECOMP  (i num_heads, i n_nope, i n_rot, i head_dim_k, i head_dim_v, i kv_lora,
+ *                             R kv_cmpr, R k_b, R v_b, R kv_pe, W k_cur, W v_cur)
+ *                            k_nope[h][d] = sum_l kv_cmpr[l] * k_b[(h*kv_lora + l)*n_nope + d],
+ *                            v[h][d]      = sum_l kv_cmpr[l] * v_b[(h*head_dim_v + d)*kv_lora + l];
+ *                            kv_cmpr and kv_pe may be bound to the same buffer.
+ * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order.
+ *
+ * Dispatch: 1-D, global = num_heads * (head_dim_k + head_dim_v), any local = {L, 1, 1}; folded
+ * group counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_MLA_KV_ASSEMBLE      1
+#define OP_MLA_ABSORBEDKVDECOMP 2
+
+#if !defined(OP)
+#error "mla_kv.comp requires OP"
+#endif
+
+layout(push_constant) uniform NfMlaParams {
+    int num_heads;
+    int n_nope;
+    int n_rot;
+    int head_dim_k;
+    int head_dim_v;
+    int kv_lora;
+} pc;
+
+#if OP == OP_MLA_KV_ASSEMBLE
+layout(std430, binding = 0) readonly  buffer NfMlaKvPe     { float kv_pe[]; };
+layout(std430, binding = 1) readonly  buffer NfMlaKvDecomp { float kv_decomp[]; };
+layout(std430, binding = 2) writeonly buffer NfMlaKCur     { float k_cur[]; };
+layout(std430, binding = 3) writeonly buffer NfMlaVCur     { float v_cur[]; };
+#elif OP == OP_MLA_ABSORBEDKVDECOMP
+layout(std430, binding = 0) readonly  buffer NfMlaKvCmpr   { float kv_cmpr[]; };
+layout(std430, binding = 1) readonly  buffer NfMlaKB       { float k_b[]; };
+layout(std430, binding = 2) readonly  buffer NfMlaVB       { float v_b[]; };
+layout(std430, binding = 3) readonly  buffer NfMlaKvPe     { float kv_pe[]; };
+layout(std430, binding = 4) writeonly buffer NfMlaKCur     { float k_cur[]; };
+layout(std430, binding = 5) writeonly buffer NfMlaVCur     { float v_cur[]; };
+#else
+#error "mla_kv.comp: OP is not an MLA KV op"
+#endif
+
+void main() {
+    const uint num_heads  = uint(pc.num_heads);
+    const uint n_nope     = uint(pc.n_nope);
+    const uint head_dim_k = uint(pc.head_dim_k);
+    const uint head_dim_v = uint(pc.head_dim_v);
+    const uint kv_lora    = uint(pc.kv_lora);
+    const uint total_k    = num_heads * head_dim_k;
+    const uint total_v    = num_heads * head_dim_v;
+
+    const uint gid = nf_global_id();
+    if (gid >= total_k + total_v) {
+        return;
+    }
+
+    if (gid < total_k) {
+        const uint h = gid / head_dim_k;
+        const uint d = gid - h * head_dim_k;
+        if (d >= n_nope) {
+            k_cur[gid] = kv_pe[kv_lora + (d - n_nope)];
+            return;
+        }
+#if OP == OP_MLA_KV_ASSEMBLE
+        k_cur[gid] = kv_decomp[h * (n_nope + head_dim_v) + d];
+#else
+        const uint kb = h * kv_lora * n_nope + d;
+        float s = 0.0;
+        for (uint l = 0u; l < kv_lora; l++) {
+            s += kv_cmpr[l] * k_b[kb + l * n_nope];
+        }
+        k_cur[gid] = s;
+#endif
+    } else {
+        const uint off = gid - total_k;
+        const uint h   = off / head_dim_v;
+        const uint d   = off - h * head_dim_v;
+#if OP == OP_MLA_KV_ASSEMBLE
+        v_cur[off] = kv_decomp[h * (n_nope + head_dim_v) + n_nope + d];
+#else
+        const uint vb = (h * head_dim_v + d) * kv_lora;
+        float s = 0.0;
+        for (uint l = 0u; l < kv_lora; l++) {
+            s += kv_cmpr[l] * v_b[vb + l];
+        }
+        v_cur[off] = s;
+#endif
+    }
+}

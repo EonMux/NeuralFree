@@ -1,0 +1,8 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Mamba conv / selective scan / output gate and LFM2 short convolutions (kernels/llm/recurrent/ssm_conv.cl, kernels/llm/recurrent/ssm_scan.cl).
+# ssm_conv.cl
+LLM_SSM_Conv	ssm_conv.comp
+LLM_ShortConvCentered	shortconv_centered.comp
+# ssm_scan.cl
+LLM_SSM_Scan	ssm_scan.comp		sg
+LLM_MambaGateOut	mamba_gate.comp

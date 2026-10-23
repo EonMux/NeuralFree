@@ -1,0 +1,156 @@
+/* topk_rows.comp - LLM_TopK_Rows: per-row top-k column selection by radix select.
+ * GLSL twin of kernels/llm/sparse/topk_rows.cl (the semantic reference). Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_rows, i n_cols, i k, R float scores, W int idx_out)
+ * Row r of idx_out (k slots at r*k) receives the columns of the kk = min(k, n_valid) largest scores
+ * greater than -INF (NaN never selected), ties at the k-th value going to the lowest columns, ordered
+ * as: columns above the k-th value in increasing order, then columns equal to it in increasing order;
+ * slots kk .. k-1 receive -1. Equal floats are equal keys (+0 and -0 included).
+ *
+ * Dispatch: 1-D, one workgroup per row, linear group = row (nf_wg_id()); global = n_rows*L,
+ * local = {L, 1, 1} with L a power of two <= LLM_DIMX (256 recommended).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define NF_TOPK_BINS 2048
+
+layout(std430, binding = 0) readonly buffer NfTopkScores { float scores[]; };
+layout(std430, binding = 1) writeonly buffer NfTopkOut { int idx_out[]; };
+layout(push_constant) uniform NfTopkParams {
+    int n_rows;
+    int n_cols;
+    int k;
+} pc;
+
+shared uint nf_topk_hist[NF_TOPK_BINS];
+shared uint nf_topk_part[gl_WorkGroupSize.x];
+shared uint nf_topk_pick[2];
+
+/* Order-preserving key (C nf_topk_key); -0 maps to the key of +0. */
+uint nf_topk_key(float x) {
+    const uint u = (x == 0.0) ? 0u : floatBitsToUint(x);
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+void main() {
+    const uint row = nf_wg_id();
+    /* The row depends only on the workgroup id, so this return is uniform per workgroup. */
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint n_cols = uint(max(pc.n_cols, 0));
+    const uint k = uint(max(pc.k, 0));
+    const uint sbase = row * n_cols;
+    const uint obase = row * k;
+    const uint per = uint(NF_TOPK_BINS) / lsize;
+
+    uint prefix = 0u;
+    uint pmask = 0u;
+    uint kk = 0u;
+    uint remaining = 0u;
+    for (int pass = 0; pass < 3; ++pass) {
+        const uint shift = pass == 0 ? 21u : (pass == 1 ? 10u : 0u);
+        const uint dmask = pass == 2 ? 0x3FFu : 0x7FFu;
+        for (uint b = lid; b < uint(NF_TOPK_BINS); b += lsize) {
+            nf_topk_hist[b] = 0u;
+        }
+        barrier();
+        for (uint c = lid; c < n_cols; c += lsize) {
+            const float x = scores[sbase + c];
+            if (x > -NF_INF) {
+                const uint key = nf_topk_key(x);
+                if ((key & pmask) == prefix) {
+                    atomicAdd(nf_topk_hist[(key >> shift) & dmask], 1u);
+                }
+            }
+        }
+        barrier();
+        uint mine = 0u;
+        for (uint i = 0u; i < per; ++i) {
+            mine += nf_topk_hist[lid * per + i];
+        }
+        nf_topk_part[lid] = mine;
+        barrier();
+        /* Inclusive suffix sums: part[i] = candidates in the bins of invocations i .. L-1. */
+        for (uint off = 1u; off < lsize; off <<= 1) {
+            const uint v = nf_topk_part[lid] + (lid + off < lsize ? nf_topk_part[lid + off] : 0u);
+            barrier();
+            nf_topk_part[lid] = v;
+            barrier();
+        }
+        if (pass == 0) {
+            kk = min(k, nf_topk_part[0]);
+            remaining = kk;
+        }
+        /* kk is uniform: nothing eligible or k == 0 leaves every slot -1. */
+        if (kk == 0u) {
+            break;
+        }
+        uint above = lid + 1u < lsize ? nf_topk_part[lid + 1u] : 0u;
+        if (above < remaining && remaining <= above + mine) {
+            for (int i = int(per) - 1; i >= 0; --i) {
+                const uint h = nf_topk_hist[lid * per + uint(i)];
+                if (above + h >= remaining) {
+                    nf_topk_pick[0] = lid * per + uint(i);
+                    nf_topk_pick[1] = remaining - above;
+                    break;
+                }
+                above += h;
+            }
+        }
+        barrier();
+        prefix |= nf_topk_pick[0] << shift;
+        pmask |= dmask << shift;
+        remaining = nf_topk_pick[1];
+        barrier();
+    }
+
+    if (kk > 0u) {
+        /* prefix is the k-th largest key T; remaining = how many columns equal to T are selected. */
+        const uint n_above = kk - remaining;
+        uint above_written = 0u;
+        uint equal_seen = 0u;
+        for (uint c0 = 0u; c0 < n_cols; c0 += lsize) {
+            const uint c = c0 + lid;
+            uint flag = 0u;
+            if (c < n_cols) {
+                const float x = scores[sbase + c];
+                if (x > -NF_INF) {
+                    const uint key = nf_topk_key(x);
+                    flag = key > prefix ? 1u : (key == prefix ? 0x10000u : 0u);
+                }
+            }
+            nf_topk_part[lid] = flag;
+            barrier();
+            /* Inclusive prefix sums of the packed (above | equal << 16) flags. */
+            for (uint off = 1u; off < lsize; off <<= 1) {
+                const uint v = nf_topk_part[lid] + (lid >= off ? nf_topk_part[lid - off] : 0u);
+                barrier();
+                nf_topk_part[lid] = v;
+                barrier();
+            }
+            const uint excl = nf_topk_part[lid] - flag;
+            const uint tot = nf_topk_part[lsize - 1u];
+            if (flag == 1u) {
+                idx_out[obase + above_written + (excl & 0xFFFFu)] = int(c);
+            } else if (flag == 0x10000u) {
+                const uint e = equal_seen + (excl >> 16);
+                if (e < remaining) {
+                    idx_out[obase + n_above + e] = int(c);
+                }
+            }
+            above_written += tot & 0xFFFFu;
+            equal_seen += tot >> 16;
+            barrier();
+        }
+    }
+    for (uint i = kk + lid; i < k; i += lsize) {
+        idx_out[obase + i] = -1;
+    }
+}

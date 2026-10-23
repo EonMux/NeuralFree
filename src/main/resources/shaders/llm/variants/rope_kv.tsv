@@ -1,0 +1,23 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# RoPE (kernels/llm/rope.cl) and KV cache store / context-shift kernels (kernels/llm/kv_cache.cl).
+# rope.cl
+LLM_RoPE_Ext	rope.comp
+# kv_cache.cl
+LLM_KV_Store_F32	kv_store.comp	KV=NF_KV_F32
+LLM_KV_Store_F16	kv_store.comp	KV=NF_KV_F16
+LLM_KV_Store_Q8_0	kv_store.comp	KV=NF_KV_Q8_0
+LLM_KV_Store_BF16	kv_store.comp	KV=NF_KV_BF16
+LLM_KV_Store_Q4_0	kv_store.comp	KV=NF_KV_Q4_0
+LLM_KV_Store_Q4_1	kv_store.comp	KV=NF_KV_Q4_1
+LLM_KV_Store_IQ4_NL	kv_store.comp	KV=NF_KV_IQ4_NL
+LLM_KV_Store_Q5_0	kv_store.comp	KV=NF_KV_Q5_0
+LLM_KV_Store_Q5_1	kv_store.comp	KV=NF_KV_Q5_1
+LLM_KV_RopeShift_F32	kv_shift.comp	KV=NF_KV_F32
+LLM_KV_RopeShift_F16	kv_shift.comp	KV=NF_KV_F16
+LLM_KV_RopeShift_Q8_0	kv_shift.comp	KV=NF_KV_Q8_0
+LLM_KV_RopeShift_BF16	kv_shift.comp	KV=NF_KV_BF16
+LLM_KV_RopeShift_Q4_0	kv_shift.comp	KV=NF_KV_Q4_0
+LLM_KV_RopeShift_Q4_1	kv_shift.comp	KV=NF_KV_Q4_1
+LLM_KV_RopeShift_IQ4_NL	kv_shift.comp	KV=NF_KV_IQ4_NL
+LLM_KV_RopeShift_Q5_0	kv_shift.comp	KV=NF_KV_Q5_0
+LLM_KV_RopeShift_Q5_1	kv_shift.comp	KV=NF_KV_Q5_1

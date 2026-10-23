@@ -1,0 +1,10 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# RWKV6/RWKV7 WKV, gated linear attention, token-shift lerps, decays, RWKV7 key preparation and r_k bonus (kernels/llm/recurrent/rwkv.cl).
+LLM_RWKV_WKV6	wkv6.comp
+LLM_GLA	gla.comp
+LLM_RWKV_WKV7	wkv7.comp
+LLM_RWKV_TokenShiftLerp	rwkv_mix.comp	OP=OP_RWKV_TOKEN_SHIFT_LERP
+LLM_RWKV_Decay6	rwkv_mix.comp	OP=OP_RWKV_DECAY6
+LLM_RWKV_Decay7	rwkv_mix.comp	OP=OP_RWKV_DECAY7
+LLM_RWKV7_KkPrep	rwkv_mix.comp	OP=OP_RWKV7_KK_PREP	sg
+LLM_RWKV7_Bonus	rwkv_mix.comp	OP=OP_RWKV7_BONUS	sg

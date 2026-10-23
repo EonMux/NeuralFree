@@ -1,0 +1,4 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Strided batched GEMM and row-parallel GEMV (kernels/train/gemm.cl).
+TR_Gemm_F32	gemm.comp	OP=GEMM_F32
+TR_Gemv_F32	gemm.comp	OP=GEMV_F32

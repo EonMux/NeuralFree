@@ -1,0 +1,99 @@
+/* gla.comp - LLM_GLA, gated linear attention (qrwkv). GLSL twin of LLM_GLA in kernels/llm/recurrent/rwkv.cl.
+ * Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i C, i H, i g_mode, f scale, R k, R v, R q, R g, RW state, R int state_rows, W y)
+ * Math (ggml-cpu/ops.cpp:10944), per head h, key i, value j; the state is updated before the readout:
+ *   s[i][j] = s[i][j] * g + v[t,h,j] * k[t,h,i];   y[t,h,j] = sum_i (q[t,h,i] * scale) * s[i][j]
+ * g_mode 0: g[t * C + h * S + i] (per key channel); g_mode 1: g[t * H + h] (per-head scalar).
+ * State s[state_rows[0] * H*S*S + h*S*S + i*S + j] (i = key, j = value), updated in place.
+ *
+ * Work split and dispatch as wkv6.comp: local L = min(256, max(32, P * pow2ceil(S))),
+ * global = H * ceil(S / (L / P)) * L.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define NF_RWKV_MAX_S 256
+#define NF_RWKV_KPT   32
+
+layout(std430, binding = 0) readonly buffer NfGlaK { float k_in[]; };
+layout(std430, binding = 1) readonly buffer NfGlaV { float v_in[]; };
+layout(std430, binding = 2) readonly buffer NfGlaQ { float q_in[]; };
+layout(std430, binding = 3) readonly buffer NfGlaG { float g_in[]; };
+layout(std430, binding = 4) buffer NfGlaState { float state[]; };
+layout(std430, binding = 5) readonly buffer NfGlaRows { int state_rows[]; };
+layout(std430, binding = 6) buffer NfGlaY { float y_out[]; };
+
+layout(push_constant) uniform NfGlaParams { int n_tokens; int C; int H; int g_mode; float scale; } pc;
+
+#include "common/reduce.glsl"
+
+shared float sk[NF_RWKV_MAX_S];
+shared float sq[NF_RWKV_MAX_S];
+shared float sg[NF_RWKV_MAX_S];
+
+uint nf_rwkv_parts(uint S) {
+    return S <= NF_RWKV_KPT ? 1u : (S <= 2u * NF_RWKV_KPT ? 2u : (S <= 4u * NF_RWKV_KPT ? 4u : 8u));
+}
+
+void main() {
+    const uint C = uint(pc.C);
+    const uint H = uint(pc.H);
+    const uint S = C / H;
+    const uint P = nf_rwkv_parts(S);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint L = gl_WorkGroupSize.x;
+    const uint vpg = L / P;
+    const uint gph = (S + vpg - 1u) / vpg;
+    const uint grp = nf_wg_id();
+    const uint h = grp / gph;
+    if (S > NF_RWKV_MAX_S || h >= H) {
+        return;
+    }
+    const uint val = (grp % gph) * vpg + lid / P;
+    const uint key0 = (lid & (P - 1u)) * NF_RWKV_KPT;
+    const bool live = val < S;
+    const uint span = P * NF_RWKV_KPT;
+    const uint sbase = uint(state_rows[0]) * C * S + h * S * S;
+
+    float st[NF_RWKV_KPT];
+    [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+        const uint i = key0 + u;
+        st[u] = (live && i < S) ? state[sbase + i * S + val] : 0.0;
+    }
+
+    for (uint t = 0u; t < uint(pc.n_tokens); t++) {
+        const uint row = t * C + h * S;
+        barrier();
+        for (uint i = lid; i < span; i += L) {
+            const bool inr = i < S;
+            sk[i] = inr ? k_in[row + i] : 0.0;
+            sq[i] = inr ? q_in[row + i] * pc.scale : 0.0;
+            sg[i] = inr ? (pc.g_mode == 0 ? g_in[row + i] : g_in[t * H + h]) : 0.0;
+        }
+        barrier();
+        const float vv = live ? v_in[row + val] : 0.0;
+        float acc = 0.0;
+        [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+            const uint i = key0 + u;
+            st[u] = st[u] * sg[i] + vv * sk[i];
+            acc += st[u] * sq[i];
+        }
+        if (P > 1u) {
+            acc = nf_seg_sum(acc, P);
+        }
+        if (live && key0 == 0u) {
+            y_out[row + val] = acc;
+        }
+    }
+
+    [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+        const uint i = key0 + u;
+        if (live && i < S) {
+            state[sbase + i * S + val] = st[u];
+        }
+    }
+}

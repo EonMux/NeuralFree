@@ -1,0 +1,4 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Row softmax and log-softmax with optional masking, and their backward (kernels/train/softmax.cl).
+TR_SoftmaxRows_F32	softmax.comp	OP=SOFTMAX_ROWS_F32
+TR_SoftmaxRowsBackward_F32	softmax.comp	OP=SOFTMAX_ROWS_BACKWARD_F32

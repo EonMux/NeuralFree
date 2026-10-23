@@ -1,0 +1,636 @@
+/* norm.comp - layer, RMS, batch and group normalization, row index-select, and their backward kernels. GLSL
+ * twin of kernels/train/norm.cl (the semantic reference: arguments, formulas and dispatch are documented there).
+ * Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     TR_LayerNormRows_F32	norm.comp	OP=NORM_LAYER_ROWS
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * TR_IndexSelectRows_F32 moves its rows as uint words, as in norm.cl. Lane partials, the affine step and every
+ * backward intermediate are precise, so no implementation contracts them; squares and products accumulate with
+ * an explicit fma, as in norm.cl. The x operand of every backward variant binds as in_f, so the row-backward
+ * variants recompute their statistics through the forward's own lane helpers.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define NORM_LAYER_ROWS     1
+#define NORM_RMS_ROWS       2
+#define NORM_CHANNEL_STATS  3
+#define NORM_CHANNEL_APPLY  4
+#define NORM_INDEX_SELECT   5
+#define NORM_LAYER_ROWS_BWD     6
+#define NORM_RMS_ROWS_BWD       7
+#define NORM_AFFINE_COLS        8
+#define NORM_CHANNEL_GRAD_SUMS  9
+#define NORM_GROUP_GRAD_SUMS    10
+#define NORM_CHANNEL_BWD_APPLY  11
+#define NORM_INDEX_ADD_ROWS     12
+
+/* TR_IndexSelectRows_F32 and TR_IndexAddRows_F32 oob_mode ids (tensor/gpu/TrainOps). */
+#define TR_IDX_OOB_ERROR 0
+#define TR_IDX_OOB_CLAMP 1
+
+/* TR_NormAffineGradCols_F32 mode ids (tensor/gpu/TrainOps). */
+#define TR_N_AFF_LN  0
+#define TR_N_AFF_RMS 1
+
+/* TR_ChannelNormBackwardApply_F32 mode ids (tensor/gpu/TrainOps). */
+#define TR_N_CB_BATCH 0
+#define TR_N_CB_GROUP 1
+#define TR_N_CB_EVAL  2
+
+#ifndef OP
+#error "norm.comp requires OP"
+#endif
+
+#if OP == NORM_LAYER_ROWS
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormGamma { float gamma_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormBeta { float beta_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrNormOut { float out_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int rows;
+    int cols;
+    float eps;
+    int has_gamma;
+    int has_beta;
+    int in_off;
+    int g_off;
+    int b_off;
+    int out_off;
+} pc;
+
+#elif OP == NORM_RMS_ROWS
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormWeight { float w_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrNormOut { float out_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int rows;
+    int cols;
+    float eps;
+    int has_weight;
+    int in_off;
+    int w_off;
+    int out_off;
+} pc;
+
+#elif OP == NORM_CHANNEL_STATS
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrNormMean { float mean_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrNormVar { float var_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int B;
+    int C;
+    int HW;
+    int in_off;
+} pc;
+
+#elif OP == NORM_CHANNEL_APPLY
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormMean { float mean_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormVar { float var_f[]; };
+layout(std430, binding = 3) restrict readonly buffer TrNormGamma { float gamma_f[]; };
+layout(std430, binding = 4) restrict readonly buffer TrNormBeta { float beta_f[]; };
+layout(std430, binding = 5) restrict writeonly buffer TrNormOut { float out_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int B;
+    int C;
+    int HW;
+    int G;
+    float eps;
+    int has_affine;
+    int in_off;
+    int out_off;
+} pc;
+
+#elif OP == NORM_INDEX_SELECT
+layout(std430, binding = 0) restrict readonly buffer TrNormWeight { uint w_u[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormIdx { int idx_i[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrNormOut { uint out_u[]; };
+layout(std430, binding = 3) restrict buffer TrNormErr { int err_i[]; };
+layout(push_constant) uniform TrNormParams {
+    int n_idx;
+    int dim;
+    int rows;
+    int oob_mode;
+    int w_off;
+    int idx_off;
+    int out_off;
+    int err_slot;
+} pc;
+
+#elif OP == NORM_LAYER_ROWS_BWD
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormGamma { float gamma_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormGy { float gy_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrNormGx { float gx_f[]; };
+layout(std430, binding = 4) restrict writeonly buffer TrNormStats { float stats_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int rows;
+    int cols;
+    float eps;
+    int has_gamma;
+    int x_off;
+    int g_off;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#elif OP == NORM_RMS_ROWS_BWD
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormWeight { float w_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormGy { float gy_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrNormGx { float gx_f[]; };
+layout(std430, binding = 4) restrict writeonly buffer TrNormStats { float stats_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int rows;
+    int cols;
+    float eps;
+    int has_weight;
+    int x_off;
+    int w_off;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#elif OP == NORM_AFFINE_COLS
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormGy { float gy_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormStats { float stats_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrNormOut { float out_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int mode;
+    int rows;
+    int cols;
+    int chunks;
+    int has_beta;
+    int x_off;
+    int gy_off;
+    int out_off;
+} pc;
+
+#elif OP == NORM_CHANNEL_GRAD_SUMS
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormMean { float mean_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormVar { float var_f[]; };
+layout(std430, binding = 3) restrict readonly buffer TrNormGy { float gy_f[]; };
+layout(std430, binding = 4) restrict writeonly buffer TrNormSums { float sums_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int B;
+    int C;
+    int HW;
+    int G;
+    float eps;
+    int x_off;
+    int gy_off;
+    int sums_off;
+} pc;
+
+#elif OP == NORM_GROUP_GRAD_SUMS
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormMean { float mean_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormVar { float var_f[]; };
+layout(std430, binding = 3) restrict readonly buffer TrNormGamma { float gamma_f[]; };
+layout(std430, binding = 4) restrict readonly buffer TrNormGy { float gy_f[]; };
+layout(std430, binding = 5) restrict writeonly buffer TrNormRsums { float rsums_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int B;
+    int C;
+    int HW;
+    int G;
+    float eps;
+    int has_affine;
+    int x_off;
+    int gy_off;
+} pc;
+
+#elif OP == NORM_CHANNEL_BWD_APPLY
+layout(std430, binding = 0) restrict readonly buffer TrNormIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormMean { float mean_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrNormVar { float var_f[]; };
+layout(std430, binding = 3) restrict readonly buffer TrNormGamma { float gamma_f[]; };
+layout(std430, binding = 4) restrict readonly buffer TrNormGy { float gy_f[]; };
+layout(std430, binding = 5) restrict readonly buffer TrNormSums { float sums_f[]; };
+layout(std430, binding = 6) restrict writeonly buffer TrNormGx { float gx_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int mode;
+    int B;
+    int C;
+    int HW;
+    int G;
+    int count;
+    float eps;
+    int has_affine;
+    int x_off;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#elif OP == NORM_INDEX_ADD_ROWS
+layout(std430, binding = 0) restrict readonly buffer TrNormIdx { int idx_i[]; };
+layout(std430, binding = 1) restrict readonly buffer TrNormGy { float gy_f[]; };
+layout(std430, binding = 2) restrict buffer TrNormGw { float gw_f[]; };
+layout(push_constant) uniform TrNormParams {
+    int n_idx;
+    int dim;
+    int rows;
+    int row_blocks;
+    int oob_mode;
+    int skip_row;
+    int gy_off;
+    int idx_off;
+    int gw_off;
+} pc;
+
+#else
+#error "norm.comp: unknown OP"
+#endif
+
+#if OP == NORM_LAYER_ROWS || OP == NORM_RMS_ROWS || OP == NORM_LAYER_ROWS_BWD || OP == NORM_RMS_ROWS_BWD
+/* Lane partial of sum(in_f[base + j]) over j in [0, n): j = lid, lid + TR_LOCAL, ... ascending. */
+float tr_n_lane_sum(const int base, const int n, const int lid) {
+    precise float acc = 0.0;
+    for (int j = lid; j < n; j += TR_LOCAL) {
+        acc = acc + in_f[base + j];
+    }
+    return acc;
+}
+
+/* Lane partial of sum((in_f[base + j] - mean)^2) over j in [0, n). */
+float tr_n_lane_sqdev(const int base, const int n, const float mean, const int lid) {
+    precise float acc = 0.0;
+    for (int j = lid; j < n; j += TR_LOCAL) {
+        precise float d = in_f[base + j] - mean;
+        acc = fma(d, d, acc);
+    }
+    return acc;
+}
+
+/* Lane partial of sum(in_f[base + j]^2) over j in [0, n). */
+float tr_n_lane_sumsq(const int base, const int n, const int lid) {
+    precise float acc = 0.0;
+    for (int j = lid; j < n; j += TR_LOCAL) {
+        const float v = in_f[base + j];
+        acc = fma(v, v, acc);
+    }
+    return acc;
+}
+#endif
+
+void main() {
+#if OP == NORM_LAYER_ROWS
+    const int row = int(nf_wg_id());
+    if (row >= pc.rows) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int src = pc.in_off + row * pc.cols;
+    const int dst = pc.out_off + row * pc.cols;
+
+    precise float mean = tr_wg_sum(tr_n_lane_sum(src, pc.cols, lid)) / float(pc.cols);
+    precise float var = tr_wg_sum(tr_n_lane_sqdev(src, pc.cols, mean, lid)) / float(pc.cols);
+    precise float sdev = sqrt(var + pc.eps);
+
+    for (int j = lid; j < pc.cols; j += TR_LOCAL) {
+        precise float y = (in_f[src + j] - mean) / sdev;
+        if (pc.has_gamma != 0) {
+            y = gamma_f[pc.g_off + j] * y;
+        }
+        if (pc.has_beta != 0) {
+            y = y + beta_f[pc.b_off + j];
+        }
+        out_f[dst + j] = y;
+    }
+
+#elif OP == NORM_RMS_ROWS
+    const int row = int(nf_wg_id());
+    if (row >= pc.rows) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int src = pc.in_off + row * pc.cols;
+    const int dst = pc.out_off + row * pc.cols;
+
+    precise float sumsq = tr_wg_sum(tr_n_lane_sumsq(src, pc.cols, lid));
+    precise float rms = sqrt(sumsq / float(pc.cols) + pc.eps);
+
+    for (int j = lid; j < pc.cols; j += TR_LOCAL) {
+        precise float y = in_f[src + j] / rms;
+        if (pc.has_weight != 0) {
+            y = y * w_f[pc.w_off + j];
+        }
+        out_f[dst + j] = y;
+    }
+
+#elif OP == NORM_CHANNEL_STATS
+    const int c = int(nf_wg_id());
+    if (c >= pc.C) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int count = pc.B * pc.HW;
+
+    precise float acc = 0.0;
+    for (int j = lid; j < count; j += TR_LOCAL) {
+        const int b = j / pc.HW;
+        acc = acc + in_f[pc.in_off + (b * pc.C + c) * pc.HW + (j - b * pc.HW)];
+    }
+    precise float m = tr_wg_sum(acc) / float(count);
+
+    precise float acc2 = 0.0;
+    for (int j = lid; j < count; j += TR_LOCAL) {
+        const int b = j / pc.HW;
+        precise float d = in_f[pc.in_off + (b * pc.C + c) * pc.HW + (j - b * pc.HW)] - m;
+        acc2 = fma(d, d, acc2);
+    }
+    precise float v = tr_wg_sum(acc2) / float(count);
+
+    if (lid == 0) {
+        mean_f[c] = m;
+        var_f[c] = v;
+    }
+
+#elif OP == NORM_CHANNEL_APPLY
+    const int e = tr_gid(pc.B * pc.C * pc.HW);
+    if (e < 0) {
+        return;
+    }
+    const int bc = e / pc.HW;
+    const int c = bc % pc.C;
+    const int k = pc.G == 0 ? c : (bc / pc.C) * pc.G + c / (pc.C / pc.G);
+    precise float sdev = sqrt(var_f[k] + pc.eps);
+    precise float y = (in_f[pc.in_off + e] - mean_f[k]) / sdev;
+    if (pc.has_affine != 0) {
+        y = gamma_f[c] * y + beta_f[c];
+    }
+    out_f[pc.out_off + e] = y;
+
+#elif OP == NORM_INDEX_SELECT
+    const int t = tr_gid(pc.n_idx * pc.dim);
+    if (t < 0) {
+        return;
+    }
+    const int i = t / pc.dim;
+    const int j = t - i * pc.dim;
+    int k = idx_i[pc.idx_off + i];
+    if (pc.oob_mode == TR_IDX_OOB_CLAMP && pc.rows > 0) {
+        k = k < pc.rows - 1 ? k : pc.rows - 1;
+        k = k > 0 ? k : 0;
+    }
+    if (k < 0 || k >= pc.rows) {
+        tr_report_index_error(err_i, pc.err_slot, k, 0, pc.rows);
+        out_u[pc.out_off + t] = 0u;
+        return;
+    }
+    out_u[pc.out_off + t] = w_u[pc.w_off + k * pc.dim + j];
+
+#elif OP == NORM_LAYER_ROWS_BWD
+    const int row = int(nf_wg_id());
+    if (row >= pc.rows) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int src = pc.x_off + row * pc.cols;
+    const int gsrc = pc.gy_off + row * pc.cols;
+    const int dst = pc.gx_off + row * pc.cols;
+
+    precise float mean = tr_wg_sum(tr_n_lane_sum(src, pc.cols, lid)) / float(pc.cols);
+    precise float var = tr_wg_sum(tr_n_lane_sqdev(src, pc.cols, mean, lid)) / float(pc.cols);
+    precise float sdev = sqrt(var + pc.eps);
+
+    precise float acc_d = 0.0;
+    precise float acc_dx = 0.0;
+    for (int j = lid; j < pc.cols; j += TR_LOCAL) {
+        precise float xhat = (in_f[src + j] - mean) / sdev;
+        precise float d = gy_f[gsrc + j];
+        if (pc.has_gamma != 0) {
+            d = d * gamma_f[pc.g_off + j];
+        }
+        acc_d = acc_d + d;
+        acc_dx = fma(d, xhat, acc_dx);
+    }
+    precise float a = tr_wg_sum(acc_d) / float(pc.cols);
+    precise float q = tr_wg_sum(acc_dx) / float(pc.cols);
+
+    for (int j = lid; j < pc.cols; j += TR_LOCAL) {
+        precise float xhat = (in_f[src + j] - mean) / sdev;
+        precise float d = gy_f[gsrc + j];
+        if (pc.has_gamma != 0) {
+            d = d * gamma_f[pc.g_off + j];
+        }
+        precise float gxv = ((d - a) - xhat * q) / sdev;
+        gx_f[dst + j] = gxv;
+    }
+    if (lid == 0) {
+        stats_f[2 * row] = mean;
+        stats_f[2 * row + 1] = sdev;
+    }
+
+#elif OP == NORM_RMS_ROWS_BWD
+    const int row = int(nf_wg_id());
+    if (row >= pc.rows) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int src = pc.x_off + row * pc.cols;
+    const int gsrc = pc.gy_off + row * pc.cols;
+    const int dst = pc.gx_off + row * pc.cols;
+
+    precise float sumsq = tr_wg_sum(tr_n_lane_sumsq(src, pc.cols, lid));
+    precise float rms = sqrt(sumsq / float(pc.cols) + pc.eps);
+
+    precise float acc_dx = 0.0;
+    for (int j = lid; j < pc.cols; j += TR_LOCAL) {
+        precise float xhat = in_f[src + j] / rms;
+        precise float d = gy_f[gsrc + j];
+        if (pc.has_weight != 0) {
+            d = d * w_f[pc.w_off + j];
+        }
+        acc_dx = fma(d, xhat, acc_dx);
+    }
+    precise float q = tr_wg_sum(acc_dx) / float(pc.cols);
+
+    for (int j = lid; j < pc.cols; j += TR_LOCAL) {
+        precise float xhat = in_f[src + j] / rms;
+        precise float d = gy_f[gsrc + j];
+        if (pc.has_weight != 0) {
+            d = d * w_f[pc.w_off + j];
+        }
+        precise float gxv = (d - xhat * q) / rms;
+        gx_f[dst + j] = gxv;
+    }
+    if (lid == 0) {
+        stats_f[row] = rms;
+    }
+
+#elif OP == NORM_AFFINE_COLS
+    const int i = (pc.cols > 0 && pc.chunks > 0) ? tr_gid(pc.chunks * pc.cols) : -1;
+    if (i < 0) {
+        return;
+    }
+    const int chunk = i / pc.cols;
+    const int col = i - chunk * pc.cols;
+    const uint rows = uint(pc.rows);
+    const uint chunks = uint(pc.chunks);
+    const uint rs = rows / chunks + (rows % chunks != 0u ? 1u : 0u);
+    const uint r0 = uint(chunk) * rs;
+    const uint r1 = r0 + rs < rows ? r0 + rs : rows;
+    precise float acc_g = 0.0;
+    precise float acc_b = 0.0;
+    for (uint r = r0; r < r1; ++r) {
+        const int ri = int(r);
+        const int e = ri * pc.cols + col;
+        const float xv = in_f[pc.x_off + e];
+        precise float xhat;
+        if (pc.mode == TR_N_AFF_RMS) {
+            xhat = xv / stats_f[ri];
+        } else {
+            xhat = (xv - stats_f[2 * ri]) / stats_f[2 * ri + 1];
+        }
+        const float g = gy_f[pc.gy_off + e];
+        acc_g = fma(g, xhat, acc_g);
+        acc_b = acc_b + g;
+    }
+    out_f[pc.out_off + i] = acc_g;
+    if (pc.has_beta != 0) {
+        out_f[pc.out_off + pc.chunks * pc.cols + i] = acc_b;
+    }
+
+#elif OP == NORM_CHANNEL_GRAD_SUMS
+    const int c = int(nf_wg_id());
+    if (c >= pc.C) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int count = pc.B * pc.HW;
+
+    precise float acc_b = 0.0;
+    precise float acc_g = 0.0;
+    for (int j = lid; j < count; j += TR_LOCAL) {
+        const int b = j / pc.HW;
+        const int e = (b * pc.C + c) * pc.HW + (j - b * pc.HW);
+        const int k = pc.G == 0 ? c : b * pc.G + c / (pc.C / pc.G);
+        precise float sdev = sqrt(var_f[k] + pc.eps);
+        precise float xhat = (in_f[pc.x_off + e] - mean_f[k]) / sdev;
+        const float g = gy_f[pc.gy_off + e];
+        acc_b = acc_b + g;
+        acc_g = fma(g, xhat, acc_g);
+    }
+    precise float sb = tr_wg_sum(acc_b);
+    precise float sg = tr_wg_sum(acc_g);
+
+    if (lid == 0) {
+        sums_f[pc.sums_off + c] = sb;
+        sums_f[pc.sums_off + pc.C + c] = sg;
+    }
+
+#elif OP == NORM_GROUP_GRAD_SUMS
+    const int r = int(nf_wg_id());
+    if (r >= pc.B * pc.G) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int cpg = pc.C / pc.G;
+    const int m = cpg * pc.HW;
+    const int base = r * m;
+    const int g = r % pc.G;
+    precise float sdev = sqrt(var_f[r] + pc.eps);
+    const float mu = mean_f[r];
+
+    precise float acc_d = 0.0;
+    precise float acc_dx = 0.0;
+    for (int j = lid; j < m; j += TR_LOCAL) {
+        precise float xhat = (in_f[pc.x_off + base + j] - mu) / sdev;
+        precise float d = gy_f[pc.gy_off + base + j];
+        if (pc.has_affine != 0) {
+            d = d * gamma_f[g * cpg + j / pc.HW];
+        }
+        acc_d = acc_d + d;
+        acc_dx = fma(d, xhat, acc_dx);
+    }
+    precise float s1 = tr_wg_sum(acc_d);
+    precise float s2 = tr_wg_sum(acc_dx);
+
+    if (lid == 0) {
+        rsums_f[r] = s1;
+        rsums_f[pc.B * pc.G + r] = s2;
+    }
+
+#elif OP == NORM_CHANNEL_BWD_APPLY
+    const int e = tr_gid(pc.B * pc.C * pc.HW);
+    if (e < 0) {
+        return;
+    }
+    const int bc = e / pc.HW;
+    const int c = bc % pc.C;
+    const float g = gy_f[pc.gy_off + e];
+
+    if (pc.mode == TR_N_CB_EVAL) {
+        precise float sdev = sqrt(var_f[c] + pc.eps);
+        precise float d = g;
+        if (pc.has_affine != 0) {
+            d = d * gamma_f[c];
+        }
+        precise float gxv = d / sdev;
+        gx_f[pc.gx_off + e] = gxv;
+        return;
+    }
+
+    const float n = float(pc.count);
+    if (pc.mode == TR_N_CB_GROUP) {
+        const int k = (bc / pc.C) * pc.G + c / (pc.C / pc.G);
+        const int nk = pc.B * pc.G;
+        precise float sdev = sqrt(var_f[k] + pc.eps);
+        precise float xhat = (in_f[pc.x_off + e] - mean_f[k]) / sdev;
+        precise float d = g;
+        if (pc.has_affine != 0) {
+            d = d * gamma_f[c];
+        }
+        precise float gxv = ((d - sums_f[k] / n) - xhat * (sums_f[nk + k] / n)) / sdev;
+        gx_f[pc.gx_off + e] = gxv;
+        return;
+    }
+
+    precise float sdev = sqrt(var_f[c] + pc.eps);
+    precise float xhat = (in_f[pc.x_off + e] - mean_f[c]) / sdev;
+    precise float t = (g - sums_f[c] / n) - xhat * (sums_f[pc.C + c] / n);
+    if (pc.has_affine != 0) {
+        t = gamma_f[c] * t;
+    }
+    precise float gxv = t / sdev;
+    gx_f[pc.gx_off + e] = gxv;
+
+#elif OP == NORM_INDEX_ADD_ROWS
+    const int t = (pc.dim > 0 && pc.row_blocks > 0) ? tr_gid(pc.dim * pc.row_blocks) : -1;
+    if (t < 0) {
+        return;
+    }
+    const int blk = t / pc.dim;
+    const int j = t - blk * pc.dim;
+    const uint rows = uint(pc.rows);
+    const uint blocks = uint(pc.row_blocks);
+    const uint bs = rows / blocks + (rows % blocks != 0u ? 1u : 0u);
+    const uint r0u = uint(blk) * bs;
+    if (r0u >= rows) {
+        return;
+    }
+    const int r0 = int(r0u);
+    const int r1 = int(r0u + bs < rows ? r0u + bs : rows);
+
+    for (int i = 0; i < pc.n_idx; ++i) {
+        int k = idx_i[pc.idx_off + i];
+        if (pc.oob_mode == TR_IDX_OOB_CLAMP) {
+            k = k < pc.rows - 1 ? k : pc.rows - 1;
+            k = k > 0 ? k : 0;
+        }
+        if (k < r0 || k >= r1 || k == pc.skip_row) {
+            continue;
+        }
+        const int o = pc.gw_off + k * pc.dim + j;
+        precise float s = gw_f[o] + gy_f[pc.gy_off + i * pc.dim + j];
+        gw_f[o] = s;
+    }
+#endif
+}

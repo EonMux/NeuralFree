@@ -1,0 +1,75 @@
+/* rope.comp - LLM_RoPE_Ext rotary position embedding (GLSL twin of kernels/llm/rope.cl, the semantic reference).
+ * Requires: common/nf_common.glsl, common/rope_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_heads, i head_stride, i row_stride, i n_dims, i n_offs, i mode, i pos_stride, i has_ff,
+ *    f theta_scale, f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi,
+ *    i sect0, i sect1, i sect2, i sect3, i x_off, R int pos, R float ff, float x)
+ * In place: head h of token t starts at x[x_off + t*row_stride + h*head_stride]; pair i of a head rotates
+ * the elements of common/rope_common.glsl (relative to n_offs) by the angle of section
+ * nf_rope_section(i) at position pos[t + section*pos_stride] (NORM/NEOX: pos[t]); has_ff != 0 divides the
+ * angle by ff[i]. Other dims are untouched.
+ *
+ * Dispatch: 1-D, one invocation per rotation pair, g = (t*n_heads + h)*n_pairs + i with n_pairs = n_dims/2
+ * (VISION: n_dims); global = n_tokens*n_heads*n_pairs rounded up to L, local = {L, 1, 1}; folded group
+ * counts are recovered by nf_global_id(). No barriers; every pair is owned by one invocation.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfRopePos { int pos[]; };
+layout(std430, binding = 1) readonly buffer NfRopeFf { float ff[]; };
+layout(std430, binding = 2) buffer NfRopeX { float x[]; };
+
+layout(push_constant) uniform NfRopeParams {
+    int n_tokens;
+    int n_heads;
+    int head_stride;
+    int row_stride;
+    int n_dims;
+    int n_offs;
+    int mode;
+    int pos_stride;
+    int has_ff;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+    int sect0;
+    int sect1;
+    int sect2;
+    int sect3;
+    int x_off;
+} pc;
+
+void main() {
+    const int n_pairs = nf_rope_pairs(pc.mode, pc.n_dims);
+    const uint gid = nf_global_id();
+    if (n_pairs <= 0 || gid >= uint(pc.n_tokens) * uint(pc.n_heads) * uint(n_pairs)) {
+        return;
+    }
+    const int i = int(gid % uint(n_pairs));
+    const uint th = gid / uint(n_pairs);
+    const int h = int(th % uint(pc.n_heads));
+    const int t = int(th / uint(pc.n_heads));
+
+    const int sec = nf_rope_section(pc.mode, i, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+    const int e = nf_rope_theta_exp(pc.mode, i, sec, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+    const int p = pos[t + sec * pc.pos_stride];
+    const float f = pc.has_ff != 0 ? ff[i] : 1.0;
+    const vec2 cs = nf_rope_cs(p, e, pc.theta_scale, f, pc.freq_scale, pc.ext_factor, pc.attn_factor,
+                               pc.corr_lo, pc.corr_hi, i);
+
+    const uint a = uint(pc.x_off) + uint(t) * uint(pc.row_stride) + uint(h) * uint(pc.head_stride)
+                   + uint(pc.n_offs) + uint(nf_rope_first(pc.mode, i));
+    const uint b = a + uint(nf_rope_span(pc.mode, pc.n_dims));
+    const float x0 = x[a];
+    const float x1 = x[b];
+    x[a] = x0 * cs.x - x1 * cs.y;
+    x[b] = x0 * cs.y + x1 * cs.x;
+}

@@ -1,0 +1,274 @@
+/* flash_decode.comp - LLM_FlashDecode_<KV> and LLM_FlashDecode_Mixed split-K decode attention (GLSL twin of
+ * kernels/llm/flash_decode.cl; layouts, grid, plan constraints and algorithm are documented there).
+ * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl, common/reduce.glsl.
+ *
+ * Variants rows select the KV element type: KV=NF_KV_<type> (common/kv_types.glsl), or KV_MIXED=1 for
+ * LLM_FlashDecode_Mixed, which reads K and V through the common/kv_types.glsl loaders with the types of its trailing
+ * kv_types scalar (K type in bits 0-7, V type in bits 8-15; kernels/llm/common/attn_common.h); flag sg.
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_head, i n_head_kv, i d_k, i d_v, i g_tile, i n_split, i split_len, i kv_start, i kv_end, i q_pos,
+ *    i k_row_stride, i k_head_stride, i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias,
+ *    i causal, i swa_type, i n_swa, i bias_mode, i n_buckets, i max_distance, i has_sinks, i direct_out,
+ *    i q_off, i out_off,
+ *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial[, i kv_types (KV_MIXED)])
+ * Dispatch: 2-D, global {n_split * 128, n_head_kv * ceil(G / g_tile)}, local {128, 1, 1}.
+ * The __sg variant needs full subgroups; 128 is a multiple of every subgroup size.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+
+#if defined(KV) == defined(KV_MIXED)
+#error "flash_decode.comp requires exactly one of KV and KV_MIXED"
+#endif
+
+layout(std430, binding = 0) readonly buffer NfFdQ { float q_in[]; };
+#if defined(KV_MIXED)
+NF_BUFFER_VIEWS(1, kc)
+NF_KV_LOADERS(kc)
+NF_BUFFER_VIEWS(2, vc)
+NF_KV_LOADERS(vc)
+#else
+NF_ATTN_KV_VIEWS(1, kc)
+NF_ATTN_KV_VIEWS(2, vc)
+#endif
+layout(std430, binding = 3) readonly buffer NfFdKvPos { int kv_pos[]; };
+layout(std430, binding = 4) readonly buffer NfFdSinks { float sinks[]; };
+layout(std430, binding = 5) readonly buffer NfFdRelBias { float rel_bias[]; };
+layout(std430, binding = 6) writeonly buffer NfFdOut { float dst[]; };
+layout(std430, binding = 7) writeonly buffer NfFdPartial { float partial[]; };
+
+layout(push_constant) uniform NfFdParams {
+    int n_head; int n_head_kv; int d_k; int d_v; int g_tile;
+    int n_split; int split_len; int kv_start; int kv_end; int q_pos;
+    int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
+    float scale; float softcap; float max_bias;
+    int causal; int swa_type; int n_swa;
+    int bias_mode; int n_buckets; int max_distance;
+    int has_sinks; int direct_out; int q_off; int out_off;
+#if defined(KV_MIXED)
+    int kv_types;
+#endif
+} pc;
+
+#if defined(KV_MIXED)
+/* K and V reads at the types packed in pc.kv_types (common/attn_common.glsl). */
+bool nf_fd_types_ok() {
+    return nf_attn_kv_type_ok(nf_attn_kv_type_k(pc.kv_types)) && nf_attn_kv_type_ok(nf_attn_kv_type_v(pc.kv_types));
+}
+
+vec4 kc_load4(uint e) { return kc_kv_load4(e, nf_attn_kv_type_k(pc.kv_types)); }
+float vc_load1(uint e) { return vc_kv_load1(e, nf_attn_kv_type_v(pc.kv_types)); }
+#else
+bool nf_fd_types_ok() {
+    return true;
+}
+#endif
+
+#include "common/reduce.glsl"
+
+shared float nf_fa_smem[NF_FA_SMEM_FLOATS];
+shared float nf_fd_stats[3 * NF_FD_MAX_G];   /* m[16] | l[16] | ALiBi slope[16] */
+
+bool nf_fd_plan_ok() {
+    return nf_fd_types_ok()
+        && pc.n_head > 0 && pc.n_head_kv > 0 && pc.n_head % pc.n_head_kv == 0
+        && pc.g_tile >= 1 && pc.g_tile <= NF_FD_MAX_G
+        && pc.d_k > 0 && pc.d_v > 0 && (pc.d_k & 3) == 0 && (pc.d_v & 3) == 0
+        && pc.n_split >= 1 && pc.split_len > 0
+        && pc.g_tile * (pc.d_k + pc.split_len) <= NF_FA_SMEM_FLOATS
+        && pc.g_tile * pc.d_v <= NF_FA_WG * NF_FA_ACC_MAX
+        && (pc.direct_out == 0 || pc.n_split == 1)
+        && gl_WorkGroupSize.x == uint(NF_FA_WG);
+}
+
+/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h); slope = ALiBi slope of h. */
+float nf_fd_bias(int h, int p_q, int p_k, float slope) {
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
+        return slope * (-float(abs(p_q - p_k)));
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_T5_CAUSAL || pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR) {
+        const int bucket = nf_t5_bucket(p_k, p_q, pc.n_buckets, pc.max_distance,
+                                        pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR ? 1 : 0);
+        return rel_bias[bucket * pc.n_head + h];
+    }
+    return 0.0;
+}
+
+/* NaN over the outputs of a call that violates the plan (workgroup (0, 0) only). */
+void nf_fd_poison() {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    if (pc.direct_out != 0) {
+        const uint n = uint(pc.n_head * pc.d_v);
+        for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+            dst[uint(pc.out_off) + i] = NF_NAN;
+        }
+    } else {
+        const uint n = uint(pc.n_head * pc.n_split * (pc.d_v + 2));
+        for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+
+void main() {
+    if (!nf_fd_plan_ok()) {
+        nf_fd_poison();
+        return;   /* uniform across the workgroup: no barrier has been reached */
+    }
+
+    const int lid = int(gl_LocalInvocationID.x);
+    const int split = int(gl_WorkGroupID.x);
+    const int g_tile = pc.g_tile;
+    const int d_k = pc.d_k;
+    const int d_v = pc.d_v;
+    const int split_len = pc.split_len;
+    const int G = pc.n_head / pc.n_head_kv;
+    const int n_gt = (G + g_tile - 1) / g_tile;
+    const int kvh = int(gl_WorkGroupID.y) / n_gt;
+    const int gt = int(gl_WorkGroupID.y) - kvh * n_gt;
+    const int h0 = kvh * G + gt * g_tile;
+    const int g_cnt = min(g_tile, G - gt * g_tile);
+    const int k_begin = pc.kv_start + split * split_len;
+    const int k_stop = split < pc.n_split ? min(k_begin + split_len, pc.kv_end) : k_begin;
+    const int n_keys = max(0, k_stop - k_begin);
+    const int s_base = g_tile * d_k;   /* s_s = nf_fa_smem[s_base ..] */
+
+    /* 1. stage q and the per-head ALiBi slopes */
+    for (int i = lid; i < g_tile * d_k; i += NF_FA_WG) {
+        const int g = i / d_k;
+        nf_fa_smem[i] = g < g_cnt ? q_in[uint(pc.q_off + (h0 + g) * d_k + (i - g * d_k))] : 0.0;
+    }
+    if (lid < g_tile) {
+        nf_fd_stats[2 * NF_FD_MAX_G + lid] = (pc.bias_mode == NF_ATTN_BIAS_ALIBI && lid < g_cnt)
+                                             ? nf_alibi_slope(h0 + lid, pc.n_head, pc.max_bias) : 1.0;
+    }
+    barrier();
+
+    /* 2. pass 1 */
+    float mx[NF_FD_MAX_G];
+    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+        mx[g] = -NF_INF;
+    }
+    const uint k_head = uint(kvh * pc.k_head_stride);
+    for (int j = lid; j < split_len; j += NF_FA_WG) {
+        float acc[NF_FD_MAX_G];
+        [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+            acc[g] = 0.0;
+        }
+        int p_k = -1;
+        int vis = 0;
+        if (j < n_keys) {
+            const int t = k_begin + j;
+            p_k = kv_pos[t];
+            vis = nf_attn_visible(pc.q_pos, p_k, pc.causal, pc.swa_type, pc.n_swa);
+            if (vis != 0) {
+                const uint e0 = uint(t) * uint(pc.k_row_stride) + k_head;
+                for (int d = 0; d < d_k; d += 4) {
+                    const vec4 k4 = kc_load4(e0 + uint(d));
+                    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+                        if (g < g_tile) {
+                            const int qi = g * d_k + d;
+                            acc[g] += dot(vec4(nf_fa_smem[qi], nf_fa_smem[qi + 1], nf_fa_smem[qi + 2],
+                                               nf_fa_smem[qi + 3]), k4);
+                        }
+                    }
+                }
+            }
+        }
+        [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+            if (g < g_tile) {
+                float s = -NF_INF;
+                if (vis != 0 && g < g_cnt) {
+                    s = nf_attn_score(acc[g], pc.scale, pc.softcap)
+                      + nf_fd_bias(h0 + g, pc.q_pos, p_k, nf_fd_stats[2 * NF_FD_MAX_G + g]);
+                }
+                nf_fa_smem[s_base + g * split_len + j] = s;
+                mx[g] = max(mx[g], s);
+            }
+        }
+    }
+
+    /* 3. per-head max, p = e^(s - m) in place, sum */
+    float ls[NF_FD_MAX_G];
+    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+        ls[g] = 0.0;
+        if (g < g_tile) {
+            mx[g] = nf_wg_max(mx[g]);
+        }
+    }
+    for (int j = lid; j < split_len; j += NF_FA_WG) {
+        [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+            if (g < g_tile) {
+                const int si = s_base + g * split_len + j;
+                const float p = nf_attn_rescale(nf_fa_smem[si], mx[g]);
+                nf_fa_smem[si] = p;
+                ls[g] += p;
+            }
+        }
+    }
+    [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
+        if (g < g_tile) {
+            const float l = nf_wg_sum(ls[g]);
+            if (lid == 0) {
+                nf_fd_stats[g] = mx[g];
+                nf_fd_stats[NF_FD_MAX_G + g] = l;
+            }
+        }
+    }
+    barrier();
+
+    /* 4. pass 2 over (g, d) pairs */
+    const int n_pairs = g_tile * d_v;
+    float o[NF_FA_ACC_MAX];
+    int pg[NF_FA_ACC_MAX];
+    int pd[NF_FA_ACC_MAX];
+    [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
+        const int pi = lid + i * NF_FA_WG;
+        const int g = pi < n_pairs ? pi / d_v : 0;
+        o[i] = 0.0;
+        pg[i] = g;
+        pd[i] = pi - g * d_v;
+    }
+    const uint v_head = uint(kvh * pc.v_head_stride);
+    for (int j = 0; j < n_keys; j++) {
+        const uint e0 = uint(k_begin + j) * uint(pc.v_row_stride) + v_head;
+        [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
+            if (lid + i * NF_FA_WG < n_pairs) {
+                const float p = nf_fa_smem[s_base + pg[i] * split_len + j];
+                if (p != 0.0) {
+                    o[i] += p * vc_load1(e0 + uint(pd[i]));
+                }
+            }
+        }
+    }
+
+    /* 5. output */
+    [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
+        const int g = pg[i];
+        const int d = pd[i];
+        if (lid + i * NF_FA_WG < n_pairs && g < g_cnt && split < pc.n_split) {
+            const int h = h0 + g;
+            const float m = nf_fd_stats[g];
+            const float l = nf_fd_stats[NF_FD_MAX_G + g];
+            if (pc.direct_out != 0) {
+                const vec2 fl = pc.has_sinks != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
+                dst[uint(pc.out_off + h * d_v + d)] = fl.y > 0.0 ? o[i] * fl.x / fl.y : 0.0;
+            } else {
+                const uint pb = uint((h * pc.n_split + split) * (d_v + 2));
+                partial[pb + uint(d)] = o[i];
+                if (d == 0) {
+                    partial[pb + uint(d_v)] = m;
+                    partial[pb + uint(d_v + 1)] = l;
+                }
+            }
+        }
+    }
+}

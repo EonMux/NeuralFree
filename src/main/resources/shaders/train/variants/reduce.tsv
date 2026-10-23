@@ -1,0 +1,8 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Row and column reductions, arg-reductions and the max backward (kernels/train/reduce.cl).
+TR_ReduceRows_F32	reduce.comp	OP=REDUCE_ROWS_F32
+TR_ReduceRowsSmall_F32	reduce.comp	OP=REDUCE_ROWS_SMALL_F32
+TR_ReduceRowsPartial_F32	reduce.comp	OP=REDUCE_ROWS_PARTIAL_F32
+TR_ReduceCols_F32	reduce.comp	OP=REDUCE_COLS_F32
+TR_ArgReduceRows_F32	reduce.comp	OP=REDUCE_ARG_ROWS_F32
+TR_MaxBackwardRows_F32	reduce.comp	OP=REDUCE_MAX_BACKWARD_F32

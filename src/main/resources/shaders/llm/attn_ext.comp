@@ -1,0 +1,162 @@
+/* attn_ext.comp - LLM_AttnTempScale and LLM_AttnOutGate (GLSL twin of kernels/llm/attn_ext.cl).
+ * Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * A variants row selects OP:
+ *   OP_ATTN_TEMP_SCALE  (i n_tokens, i n_heads, i head_dim, i row_stride, i q_off, i pow_form,
+ *                        f floor_scale, f temp_scale, f offset, R int pos, float q)
+ *       q[q_off + t*row_stride + h*head_dim + d] *= factor(pos[t]) with
+ *       pow form  exp(temp_scale * log1p((p + offset) / floor_scale))
+ *       log form  log(floor((p + offset) / floor_scale) + 1) * temp_scale + 1   (llama-graph.cpp:213-238)
+ *   OP_ATTN_OUT_GATE    (i n_tokens, i n_head, i head_dim, i attn_stride, i attn_off, i gate_stride,
+ *                        i gate_off, i kind, i has_bias, R float gate, R float bias, float attn)
+ *       attn[attn_off + t*attn_stride + h*head_dim + d] *= act(g + (has_bias ? bias[h] : 0)),
+ *       g = gate[gate_off + t*gate_stride + h*head_dim + d] for the element-wise kinds 0 (sigmoid),
+ *       1 (softplus) and 5 (base-2 softplus softplus(g * ln 2) * (1 / ln 2), models/k2-horizon.cpp:283-288),
+ *       g = gate[gate_off + t*gate_stride + h] for the per-head kinds 2 and 3 (sigmoid) and 4 (softplus);
+ *       kind = gguf.arch.AttnGateKind ordinal minus 2.
+ * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. The
+ * in-place operand (q, attn) carries no memory qualifiers.
+ *
+ * Dispatch: one invocation per element of the [n_tokens][n_heads * head_dim] view over the flattened
+ * index gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x):
+ * 1-D global = roundUp(n_tokens * n_heads * head_dim, L), local = {L, 1, 1}; folded 1-D group counts
+ * map to the same index.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+#define OP_ATTN_TEMP_SCALE 1
+#define OP_ATTN_OUT_GATE   2
+
+#if !defined(OP)
+#error "attn_ext.comp requires OP"
+#endif
+
+#define NF_ATTN_GATE_ELEM_SIGMOID   0
+#define NF_ATTN_GATE_ELEM_SOFTPLUS  1
+#define NF_ATTN_GATE_HEAD_SIGMOID   2
+#define NF_ATTN_GATE_HEAD_SIGMOID_B 3
+#define NF_ATTN_GATE_HEAD_SOFTPLUS  4
+#define NF_ATTN_GATE_SOFTPLUS_BASE2 5
+
+/* k2-horizon's base-2 softplus scales (models/k2-horizon.cpp:283-288): ln 2 before, 1 / ln 2 after. */
+#define NF_ATTN_GATE_LN2     0.6931471805599453
+#define NF_ATTN_GATE_INV_LN2 1.4426950408889634
+
+#if OP == OP_ATTN_TEMP_SCALE
+layout(std430, binding = 0) readonly buffer NfAteQPos { int pos[]; };
+layout(std430, binding = 1) buffer NfAteQ { float q[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int n_heads;
+    int head_dim;
+    int row_stride;
+    int q_off;
+    int pow_form;
+    float floor_scale;
+    float temp_scale;
+    float offset;
+} pc;
+#elif OP == OP_ATTN_OUT_GATE
+layout(std430, binding = 0) readonly buffer NfAteGate { float gate[]; };
+layout(std430, binding = 1) readonly buffer NfAteBias { float bias[]; };
+layout(std430, binding = 2) buffer NfAteAttn { float attn[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int n_head;
+    int head_dim;
+    int attn_stride;
+    int attn_off;
+    int gate_stride;
+    int gate_off;
+    int kind;
+    int has_bias;
+} pc;
+#else
+#error "attn_ext.comp: OP is not an attention-extra op"
+#endif
+
+/* Flattened invocation index of a 1-D (possibly folded) or 2-D dispatch. */
+uint nf_attn_ext_linear_id() {
+    return gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x);
+}
+
+#if OP == OP_ATTN_OUT_GATE
+/* Gate activation of a kind (C nf_attn_ext_gate_act): softplus for kinds 1 and 4, the base-2 softplus for
+ * kind 5, sigmoid otherwise. */
+float nf_attn_ext_gate_act(int kind, float g) {
+    if (kind == NF_ATTN_GATE_ELEM_SOFTPLUS || kind == NF_ATTN_GATE_HEAD_SOFTPLUS) {
+        return nf_softplus(g);
+    }
+    if (kind == NF_ATTN_GATE_SOFTPLUS_BASE2) {
+        return nf_softplus(g * NF_ATTN_GATE_LN2) * NF_ATTN_GATE_INV_LN2;
+    }
+    return nf_sigmoid(g);
+}
+#endif
+
+#if OP == OP_ATTN_TEMP_SCALE
+/* log(1 + x) without the cancellation of log(1 + x) for small x (GLSL has no log1p):
+ * u = 1 + x rounded; log(u) * x / (u - 1) is accurate to a few ulp, and u == 1 means log1p(x) == x
+ * to float precision. {@code precise} keeps the compiler from folding (1 + x) - 1 back to x. */
+float nf_attn_ext_log1p(float x) {
+    precise float u = 1.0 + x;
+    if (u == 1.0) {
+        return x;
+    }
+    precise float d = u - 1.0;
+    return log(u) * (x / d);
+}
+
+/* Temperature factor of query position p (C nf_attn_ext_temperature, including the exact-floor
+ * correction of an approximate device division). */
+float nf_attn_ext_temperature(int p) {
+    const float x = float(p) + pc.offset;
+    if (pc.pow_form != 0) {
+        return exp(pc.temp_scale * nf_attn_ext_log1p(x / pc.floor_scale));
+    }
+    float qf = floor(x / pc.floor_scale);
+    if (qf * pc.floor_scale > x) {
+        qf -= 1.0;
+    } else if ((qf + 1.0) * pc.floor_scale <= x) {
+        qf += 1.0;
+    }
+    return log(qf + 1.0) * pc.temp_scale + 1.0;
+}
+#endif
+
+void main() {
+    const uint idx = nf_attn_ext_linear_id();
+#if OP == OP_ATTN_TEMP_SCALE
+    const uint width = uint(pc.n_heads) * uint(pc.head_dim);
+    if (width == 0u || idx >= uint(pc.n_tokens) * width) {
+        return;
+    }
+    const uint t = idx / width;
+    const uint e = idx - t * width;
+    const float f = nf_attn_ext_temperature(pos[t]);
+    const uint a = uint(pc.q_off) + t * uint(pc.row_stride) + e;
+    q[a] = q[a] * f;
+#else
+    const uint head_dim = uint(pc.head_dim);
+    const uint width = uint(pc.n_head) * head_dim;
+    if (width == 0u || idx >= uint(pc.n_tokens) * width) {
+        return;
+    }
+    const uint t = idx / width;
+    const uint e = idx - t * width;
+    const uint h = e / head_dim;
+    const bool per_head = pc.kind == NF_ATTN_GATE_HEAD_SIGMOID || pc.kind == NF_ATTN_GATE_HEAD_SIGMOID_B
+        || pc.kind == NF_ATTN_GATE_HEAD_SOFTPLUS;
+    float g = gate[uint(pc.gate_off) + t * uint(pc.gate_stride) + (per_head ? h : e)];
+    if (pc.has_bias != 0) {
+        g += bias[h];
+    }
+    const float s = nf_attn_ext_gate_act(pc.kind, g);
+    const uint a = uint(pc.attn_off) + t * uint(pc.attn_stride) + e;
+    attn[a] = attn[a] * s;
+#endif
+}

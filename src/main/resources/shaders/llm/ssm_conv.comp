@@ -1,0 +1,78 @@
+/* ssm_conv.comp - LLM_SSM_Conv: causal depthwise conv1d with in-place conv-state update.
+ * GLSL twin of LLM_SSM_Conv in kernels/llm/recurrent/ssm_conv.cl (the semantic reference; ggml_ssm_conv,
+ * ggml-cpu/ops.cpp:10022-10066). Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_ch, i d_conv, i n_tokens, i flags, i x_stride, i x_off, i out_stride, i out_off, i state_off,
+ *    i state_stride, R float x, R float w, R float b, RW float conv_state, R int state_rows, W float out)
+ *   xs[c] = concat(state[c][0 .. d_conv-2], x[0 .. n_tokens-1][c]);
+ *   out[out_off + t*out_stride + c] = silu?(sum_k xs[c][t + k] * w[c*d_conv + k] (+ b[c]))   flags: 1 bias, 2 silu
+ *   state[c][j] = xs[c][n_tokens + j], state[c][j] at
+ *   conv_state[state_rows[0]*state_stride + (state_off + c)*(d_conv - 1) + j].
+ * One invocation per channel; it alone touches its state row and reads the old values before
+ * overwriting them. x and out are distinct buffers.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = roundUp(n_ch, L). Folded group counts are recovered
+ * by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+layout(std430, binding = 0) readonly buffer NfConvX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfConvW { float w_in[]; };
+layout(std430, binding = 2) readonly buffer NfConvB { float b_in[]; };
+layout(std430, binding = 3) buffer NfConvState { float conv_state[]; };
+layout(std430, binding = 4) readonly buffer NfConvRows { int state_rows[]; };
+layout(std430, binding = 5) writeonly buffer NfConvOut { float y_out[]; };
+
+layout(push_constant) uniform NfConvParams {
+    int n_ch;
+    int d_conv;
+    int n_tokens;
+    int flags;
+    int x_stride;
+    int x_off;
+    int out_stride;
+    int out_off;
+    int state_off;
+    int state_stride;
+} pc;
+
+void main() {
+    const uint c = nf_global_id();
+    if (c >= uint(pc.n_ch)) {
+        return;
+    }
+    const int steps = pc.d_conv - 1;
+    const uint s_base = uint(state_rows[0]) * uint(pc.state_stride) + (uint(pc.state_off) + c) * uint(steps);
+    const uint w_base = c * uint(pc.d_conv);
+    const bool has_bias = (pc.flags & 1) != 0;
+    const bool has_silu = (pc.flags & 2) != 0;
+    const float bias = has_bias ? b_in[c] : 0.0;
+
+    for (int t = 0; t < pc.n_tokens; ++t) {
+        float sum = 0.0;
+        for (int k = 0; k < pc.d_conv; ++k) {
+            const int src = t + k - steps;
+            const float v = src >= 0 ? x_in[uint(pc.x_off) + uint(src) * uint(pc.x_stride) + c]
+                                     : conv_state[s_base + uint(t + k)];
+            sum += v * w_in[w_base + uint(k)];
+        }
+        if (has_bias) {
+            sum += bias;
+        }
+        if (has_silu) {
+            sum = nf_silu(sum);
+        }
+        y_out[uint(pc.out_off) + uint(t) * uint(pc.out_stride) + c] = sum;
+    }
+
+    for (int j = 0; j < steps; ++j) {
+        const int src = pc.n_tokens + j - steps;
+        conv_state[s_base + uint(j)] = src >= 0 ? x_in[uint(pc.x_off) + uint(src) * uint(pc.x_stride) + c]
+                                                : conv_state[s_base + uint(pc.n_tokens + j)];
+    }
+}

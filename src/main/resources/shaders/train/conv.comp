@@ -1,0 +1,315 @@
+/* conv.comp - direct and transposed 2-D convolution, the convolution weight gradient, and the im2col/col2im
+ * column transforms of the GEMM convolution path. GLSL twin of
+ * kernels/train/conv.cl (the semantic reference: arguments, formulas, preconditions and dispatch are
+ * documented there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     TR_Conv2d_F32	conv.comp	OP=CONV_CONV2D_F32
+ * The forward kernels share one ABI: 21 int scalars in the push block, then bindings in, w, bias (read-only)
+ * and out. The weight gradient takes 20 int scalars, then bindings x, gy (read-only) and out; it is a group
+ * kernel that reads its group from nf_wg_id() and returns as a whole group past the last one, so the barriers
+ * of tr_wg_sum stay in uniform control flow. TR_Im2col_F32 takes 16 int scalars, then bindings in (read-only)
+ * and cols; TR_Col2im_F32 takes 18 int scalars, then bindings cols, bias (read-only) and out.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define CONV_CONV2D_F32           1
+#define CONV_CONV_TRANSPOSE2D_F32 2
+#define CONV_WEIGHT_GRAD          3
+#define CONV_IM2COL               4
+#define CONV_COL2IM               5
+
+#ifndef OP
+#error "conv.comp requires OP"
+#endif
+
+#if OP == CONV_CONV2D_F32 || OP == CONV_CONV_TRANSPOSE2D_F32
+layout(std430, binding = 0) restrict readonly buffer TrConvIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrConvW { float w_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrConvBias { float bias_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrConvOut { float out_f[]; };
+layout(push_constant) uniform TrConvParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OC;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int DH;
+    int DW;
+    int groups;
+    int has_bias;
+    int in_off;
+    int w_off;
+    int b_off;
+    int out_off;
+} pc;
+
+#elif OP == CONV_WEIGHT_GRAD
+layout(std430, binding = 0) restrict readonly buffer TrConvX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrConvGy { float gy_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrConvOut { float out_f[]; };
+layout(push_constant) uniform TrConvParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OC;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int DH;
+    int DW;
+    int groups;
+    int chunks;
+    int x_off;
+    int gy_off;
+    int out_off;
+} pc;
+
+#elif OP == CONV_IM2COL
+layout(std430, binding = 0) restrict readonly buffer TrConvIn { float in_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrConvCols { float cols_f[]; };
+layout(push_constant) uniform TrConvParams {
+    int NB;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int DH;
+    int DW;
+    int in_off;
+    int col_off;
+} pc;
+
+#elif OP == CONV_COL2IM
+layout(std430, binding = 0) restrict readonly buffer TrConvCols { float cols_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrConvBias { float bias_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrConvOut { float out_f[]; };
+layout(push_constant) uniform TrConvParams {
+    int NB;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int DH;
+    int DW;
+    int has_bias;
+    int col_off;
+    int b_off;
+    int out_off;
+} pc;
+
+#else
+#error "conv.comp: unknown OP"
+#endif
+
+void main() {
+#if OP == CONV_WEIGHT_GRAD
+    const uint q = nf_wg_id();
+    if (pc.chunks <= 0 || pc.groups <= 0) {
+        return;
+    }
+    const int Cg = pc.C / pc.groups;
+    const uint nW = uint(pc.OC * Cg * pc.KH * pc.KW);
+    const uint chunks = uint(pc.chunks);
+    if (q >= nW * chunks) {
+        return;
+    }
+    const int wi = int(q / chunks);
+    const uint ch = q % chunks;
+    const int kw = wi % pc.KW;
+    const int kh = (wi / pc.KW) % pc.KH;
+    const int ic = (wi / (pc.KW * pc.KH)) % Cg;
+    const int oc = wi / (pc.KW * pc.KH * Cg);
+    const int cin = (oc / (pc.OC / pc.groups)) * Cg + ic;
+    const int dh = kh * pc.DH - pc.PH;
+    const int dw = kw * pc.DW - pc.PW;
+    const uint K = uint(pc.B * pc.OH * pc.OW);
+    const uint span = K / chunks + (K % chunks != 0u ? 1u : 0u);
+    const uint k0 = ch * span;
+    const uint k1 = k0 + span < K ? k0 + span : K;
+    const uint lid = gl_LocalInvocationID.x;
+    precise float acc = 0.0;
+    for (uint k = k0 + lid; k < k1; k += TR_LOCAL) {
+        const int ki = int(k);
+        const int ow = ki % pc.OW;
+        const int oh = (ki / pc.OW) % pc.OH;
+        const int b = ki / (pc.OW * pc.OH);
+        const int ih = oh * pc.SH + dh;
+        const int iw = ow * pc.SW + dw;
+        if (ih < 0 || ih >= pc.H || iw < 0 || iw >= pc.W) {
+            continue;
+        }
+        acc = fma(gy_f[pc.gy_off + ((b * pc.OC + oc) * pc.OH + oh) * pc.OW + ow],
+                  x_f[pc.x_off + ((b * pc.C + cin) * pc.H + ih) * pc.W + iw], acc);
+    }
+    const float r = tr_wg_sum(acc);
+    if (lid == 0u) {
+        out_f[pc.out_off + wi * pc.chunks + int(ch)] = r;
+    }
+
+#elif OP == CONV_IM2COL
+    const int P = pc.OH * pc.OW;
+    const int CK = pc.C * pc.KH * pc.KW;
+    const int i = tr_gid(pc.NB * CK * P);
+    if (i < 0) {
+        return;
+    }
+    const int p = i % P;
+    const int r = (i / P) % CK;
+    const int bl = i / (P * CK);
+    const int ow = p % pc.OW;
+    const int oh = p / pc.OW;
+    const int kw = r % pc.KW;
+    const int kh = (r / pc.KW) % pc.KH;
+    const int c = r / (pc.KW * pc.KH);
+    const int ih = oh * pc.SH + kh * pc.DH - pc.PH;
+    const int iw = ow * pc.SW + kw * pc.DW - pc.PW;
+    float v = 0.0;
+    if (ih >= 0 && ih < pc.H && iw >= 0 && iw < pc.W) {
+        v = in_f[pc.in_off + ((bl * pc.C + c) * pc.H + ih) * pc.W + iw];
+    }
+    cols_f[pc.col_off + i] = v;
+
+#elif OP == CONV_COL2IM
+    const int i = tr_gid(pc.NB * pc.C * pc.H * pc.W);
+    if (i < 0) {
+        return;
+    }
+    const int x = i % pc.W;
+    const int y = (i / pc.W) % pc.H;
+    const int c = (i / (pc.W * pc.H)) % pc.C;
+    const int bl = i / (pc.W * pc.H * pc.C);
+    const int P = pc.OH * pc.OW;
+    const int th0 = y + pc.PH;
+    const int tw0 = x + pc.PW;
+    const int col_c = pc.col_off + (bl * pc.C + c) * pc.KH * pc.KW * P;
+    precise float acc = pc.has_bias != 0 ? bias_f[pc.b_off + c] : 0.0;
+    for (int kh = 0; kh < pc.KH; ++kh) {
+        const int th = th0 - kh * pc.DH;
+        if (th < 0 || th % pc.SH != 0) {
+            continue;
+        }
+        const int oh = th / pc.SH;
+        if (oh >= pc.OH) {
+            continue;
+        }
+        const int row = col_c + kh * pc.KW * P + oh * pc.OW;
+        for (int kw = 0; kw < pc.KW; ++kw) {
+            const int tw = tw0 - kw * pc.DW;
+            if (tw < 0 || tw % pc.SW != 0) {
+                continue;
+            }
+            const int ow = tw / pc.SW;
+            if (ow >= pc.OW) {
+                continue;
+            }
+            acc = acc + cols_f[row + kw * P + ow];
+        }
+    }
+    out_f[pc.out_off + i] = acc;
+
+#else
+    const int i = tr_gid(pc.B * pc.OC * pc.OH * pc.OW);
+    if (i < 0) {
+        return;
+    }
+    const int ow = i % pc.OW;
+    const int oh = (i / pc.OW) % pc.OH;
+    const int oc = (i / (pc.OW * pc.OH)) % pc.OC;
+    const int b = i / (pc.OW * pc.OH * pc.OC);
+    const int Cg = pc.C / pc.groups;
+    const int OCg = pc.OC / pc.groups;
+    const int g = oc / OCg;
+    precise float acc = pc.has_bias != 0 ? bias_f[pc.b_off + oc] : 0.0;
+
+#if OP == CONV_CONV2D_F32
+    const int ih0 = oh * pc.SH - pc.PH;
+    const int iw0 = ow * pc.SW - pc.PW;
+    for (int ic = 0; ic < Cg; ++ic) {
+        const int in_c = pc.in_off + (b * pc.C + g * Cg + ic) * pc.H * pc.W;
+        const int w_c = pc.w_off + (oc * Cg + ic) * pc.KH * pc.KW;
+        for (int kh = 0; kh < pc.KH; ++kh) {
+            const int ih = ih0 + kh * pc.DH;
+            if (ih < 0 || ih >= pc.H) {
+                continue;
+            }
+            const int in_row = in_c + ih * pc.W;
+            const int w_row = w_c + kh * pc.KW;
+            for (int kw = 0; kw < pc.KW; ++kw) {
+                const int iw = iw0 + kw * pc.DW;
+                if (iw < 0 || iw >= pc.W) {
+                    continue;
+                }
+                acc = fma(in_f[in_row + iw], w_f[w_row + kw], acc);
+            }
+        }
+    }
+
+#else
+    const int ocg = oc - g * OCg;
+    const int th0 = oh + pc.PH;
+    const int tw0 = ow + pc.PW;
+    for (int ic = 0; ic < Cg; ++ic) {
+        const int cin = g * Cg + ic;
+        const int in_c = pc.in_off + (b * pc.C + cin) * pc.H * pc.W;
+        const int w_c = pc.w_off + (cin * OCg + ocg) * pc.KH * pc.KW;
+        for (int kh = 0; kh < pc.KH; ++kh) {
+            const int th = th0 - kh * pc.DH;
+            if (th < 0 || th % pc.SH != 0) {
+                continue;
+            }
+            const int ih = th / pc.SH;
+            if (ih >= pc.H) {
+                continue;
+            }
+            const int in_row = in_c + ih * pc.W;
+            const int w_row = w_c + kh * pc.KW;
+            for (int kw = 0; kw < pc.KW; ++kw) {
+                const int tw = tw0 - kw * pc.DW;
+                if (tw < 0 || tw % pc.SW != 0) {
+                    continue;
+                }
+                const int iw = tw / pc.SW;
+                if (iw >= pc.W) {
+                    continue;
+                }
+                acc = fma(in_f[in_row + iw], w_f[w_row + kw], acc);
+            }
+        }
+    }
+#endif
+
+    out_f[pc.out_off + i] = acc;
+#endif
+}

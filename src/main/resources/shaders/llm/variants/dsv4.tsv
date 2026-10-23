@@ -1,0 +1,16 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# DeepSeek-V4 KV compressor, indexer-cache update for every KV cache type, compressor-state persist and raw-window store (kernels/llm/dsv4/compress.cl) and compressed attention with sinks (kernels/llm/dsv4/attn.cl).
+LLM_DSV4_Compress	dsv4_compress.comp	OP=OP_COMPRESS	sg
+LLM_DSV4_LidUpdate_F32	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_F32	sg
+LLM_DSV4_LidUpdate_F16	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_F16	sg
+LLM_DSV4_LidUpdate_Q8_0	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q8_0	sg
+LLM_DSV4_LidUpdate_BF16	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_BF16	sg
+LLM_DSV4_LidUpdate_Q4_0	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q4_0	sg
+LLM_DSV4_LidUpdate_Q4_1	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q4_1	sg
+LLM_DSV4_LidUpdate_IQ4_NL	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_IQ4_NL	sg
+LLM_DSV4_LidUpdate_Q5_0	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q5_0	sg
+LLM_DSV4_LidUpdate_Q5_1	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q5_1	sg
+LLM_DSV4_StateUpdate	dsv4_compress.comp	OP=OP_STATE_UPDATE
+LLM_DSV4_StateSnapshot	dsv4_compress.comp	OP=OP_STATE_SNAPSHOT
+LLM_DSV4_CacheStore	dsv4_compress.comp	OP=OP_CACHE_STORE
+LLM_DSV4_CompressedAttn	dsv4_attn.comp		sg

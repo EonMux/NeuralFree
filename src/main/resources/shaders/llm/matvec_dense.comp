@@ -1,0 +1,216 @@
+/* matvec_dense.comp - one-workgroup-per-row matvec op templates over dense F32 / F16 / BF16 weights.
+ * GLSL twin of kernels/llm/matvec_f32.cl and kernels/llm/matvec_f16_bf16.cl (the .cl files are the semantic reference).
+ * Requires: common/nf_common.glsl, common/reduce.glsl, common/act.glsl.
+ *
+ * A variants row selects WT=WT_<T> and OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     F16_MatVecFusedGateUp	matvec_dense.comp	WT=WT_F16 OP=OP_GATEUP_SILU	sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_MATVEC      (i out_dim, i in_dim, R weight, R float input, W float output)
+ *   OP_MATVEC_ADD  (i out_dim, i in_dim, R weight, R float input, float addend_output)
+ *                  addend_output[row] += dot(weight row, input)
+ *   OP_LOGITS      (i vocab_size, i embed_dim, R weight, R float hidden, W float logits)
+ *   OP_GATEUP_SILU,
+ *   OP_GATEUP_GELU (i out_dim, i in_dim, R gate_weight, R up_weight, R float input, W float output)
+ *                  output[row] = act(dot(gate row, input)) * dot(up row, input),
+ *                  act = SiLU (_SILU) or GELU, tanh approximation (_GELU)
+ *   OP_BATCH       (i out_dim, i in_dim, i seq_len, R weight, R float input, W float output)
+ *                  output[s * out_dim + row] = dot(weight row, input row s), s in [0, seq_len)
+ *   OP_BATCH_2D    same arguments and result, one token per workgroup row
+ * Weight row r holds in_dim consecutive elements starting at element r * in_dim; input row s starts
+ * at element s * in_dim.
+ *
+ * Dispatch: every op except OP_BATCH_2D is 1-D with global = rows * L and local = {L, 1, 1}, one
+ * workgroup per output row (folded group counts are recovered by nf_wg_id()). OP_BATCH_2D uses
+ * global = {out_dim * L, seq_len, 1} and local = {L, 1, 1}. Any L is reduced exactly.
+ *
+ * Loads: when in_dim % 4 == 0 every row starts at a multiple of 4 elements, so rows are read
+ * through 4-element vector views (vec4 for F32, uvec2 holding four 16-bit values for F16/BF16);
+ * otherwise through scalar views. Both views alias one binding. Element indices are 32-bit: a
+ * weight binding never exceeds maxStorageBufferRange (GpuWeight shards keep it below).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+/* Weight element types (values equal ggml_type, like QT_F32 / QT_F16 / QT_BF16). */
+#define WT_F32  0
+#define WT_F16  1
+#define WT_BF16 30
+
+#if !defined(OP) || !defined(WT)
+#error "matvec_dense.comp requires OP and WT"
+#endif
+#if WT != WT_F32 && WT != WT_F16 && WT != WT_BF16
+#error "matvec_dense.comp: WT must be WT_F32, WT_F16 or WT_BF16"
+#endif
+
+/* Scalar (name_s) and 4-element (name_v) read-only views of one weight binding. */
+#if WT == WT_F32
+#define NF_MD_WEIGHT_VIEWS(binding_index, name) \
+    layout(std430, binding = binding_index) readonly buffer NfMdS_##name { float name##_s[]; }; \
+    layout(std430, binding = binding_index) readonly buffer NfMdV_##name { vec4 name##_v[]; };
+#else
+#define NF_MD_WEIGHT_VIEWS(binding_index, name) \
+    layout(std430, binding = binding_index) readonly buffer NfMdS_##name { uint16_t name##_s[]; }; \
+    layout(std430, binding = binding_index) readonly buffer NfMdV_##name { uvec2 name##_v[]; };
+#endif
+
+/* Scalar (x_s) and vec4 (x_v) read-only views of the activation binding. */
+#define NF_MD_INPUT_VIEWS(binding_index) \
+    layout(std430, binding = binding_index) readonly buffer NfMdInS { float x_s[]; }; \
+    layout(std430, binding = binding_index) readonly buffer NfMdInV { vec4 x_v[]; };
+
+#if OP == OP_GATEUP_SILU || OP == OP_GATEUP_GELU
+#define NF_MD_GATEUP 1
+NF_MD_WEIGHT_VIEWS(0, w)
+NF_MD_WEIGHT_VIEWS(1, u)
+NF_MD_INPUT_VIEWS(2)
+layout(std430, binding = 3) writeonly buffer NfMdOutput { float y_out[]; };
+layout(push_constant) uniform NfMdParams { int out_dim; int in_dim; } pc;
+#elif OP == OP_MATVEC || OP == OP_MATVEC_ADD || OP == OP_LOGITS
+NF_MD_WEIGHT_VIEWS(0, w)
+NF_MD_INPUT_VIEWS(1)
+#if OP == OP_MATVEC_ADD
+layout(std430, binding = 2) buffer NfMdOutput { float y_out[]; };
+#else
+layout(std430, binding = 2) writeonly buffer NfMdOutput { float y_out[]; };
+#endif
+layout(push_constant) uniform NfMdParams { int out_dim; int in_dim; } pc;
+#elif OP == OP_BATCH || OP == OP_BATCH_2D
+NF_MD_WEIGHT_VIEWS(0, w)
+NF_MD_INPUT_VIEWS(1)
+layout(std430, binding = 2) writeonly buffer NfMdOutput { float y_out[]; };
+layout(push_constant) uniform NfMdParams { int out_dim; int in_dim; int seq_len; } pc;
+#else
+#error "matvec_dense.comp: OP is not a matvec op"
+#endif
+
+#include "common/reduce.glsl"
+#include "common/act.glsl"
+
+/* Four 16-bit values (little-endian in p) as F16 or BF16 floats, element k from bits 16k. */
+vec4 nf_md_unpack4(uvec2 p) {
+#if WT == WT_F16
+    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+#else
+    return vec4(uintBitsToFloat(p.x << 16), uintBitsToFloat(p.x & 0xFFFF0000u),
+                uintBitsToFloat(p.y << 16), uintBitsToFloat(p.y & 0xFFFF0000u));
+#endif
+}
+
+/* Weight element i (scalar view) and elements 4*i4 .. 4*i4+3 (vector view) of a weight stream. */
+#if WT == WT_F32
+#define NF_MD_LOAD(name, i)    name##_s[i]
+#define NF_MD_LOAD4(name, i4)  name##_v[i4]
+#elif WT == WT_F16
+#define NF_MD_LOAD(name, i)    nf_half(uint(name##_s[i]))
+#define NF_MD_LOAD4(name, i4)  nf_md_unpack4(name##_v[i4])
+#else
+#define NF_MD_LOAD(name, i)    nf_bf16(uint(name##_s[i]))
+#define NF_MD_LOAD4(name, i4)  nf_md_unpack4(name##_v[i4])
+#endif
+
+#ifndef NF_MD_GATEUP
+/* This invocation's share of dot(weight elements wbase .. wbase+n, activations xbase .. xbase+n):
+ * 4-element groups lid, lid + L, ... when n % 4 == 0 (wbase and xbase are then multiples of 4),
+ * single elements lid, lid + L, ... otherwise. The L shares add to the full dot product. */
+float nf_md_row_partial(uint wbase, uint xbase, uint n) {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    float ps = 0.0;
+    if ((n & 3u) == 0u) {
+        const uint w4 = wbase >> 2;
+        const uint x4 = xbase >> 2;
+        const uint n4 = n >> 2;
+        for (uint j = lid; j < n4; j += lsize) {
+            ps += dot(NF_MD_LOAD4(w, w4 + j), x_v[x4 + j]);
+        }
+    } else {
+        for (uint j = lid; j < n; j += lsize) {
+            ps += NF_MD_LOAD(w, wbase + j) * x_s[xbase + j];
+        }
+    }
+    return ps;
+}
+#else
+/* Gate (views w) and up (views u) shares of the rows at wbase with the activations at 0, under
+ * the nf_md_row_partial mapping; adds into gs and us. */
+void nf_md_gateup_partial(uint wbase, uint n, inout float gs, inout float us) {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    if ((n & 3u) == 0u) {
+        const uint w4 = wbase >> 2;
+        const uint n4 = n >> 2;
+        for (uint j = lid; j < n4; j += lsize) {
+            const vec4 xv = x_v[j];
+            gs += dot(NF_MD_LOAD4(w, w4 + j), xv);
+            us += dot(NF_MD_LOAD4(u, w4 + j), xv);
+        }
+    } else {
+        for (uint j = lid; j < n; j += lsize) {
+            const float xv = x_s[j];
+            gs += NF_MD_LOAD(w, wbase + j) * xv;
+            us += NF_MD_LOAD(u, wbase + j) * xv;
+        }
+    }
+}
+#endif
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint out_dim = uint(pc.out_dim);
+    const uint in_dim = uint(pc.in_dim);
+
+#if OP == OP_BATCH_2D
+    /* 2-D dispatch (never folded); with local y == 1 the return is uniform per workgroup. */
+    const uint row = gl_WorkGroupID.x;
+    const uint s = gl_GlobalInvocationID.y;
+    if (row >= out_dim || s >= uint(pc.seq_len)) {
+        return;
+    }
+    const float acc = nf_wg_sum(nf_md_row_partial(row * in_dim, s * in_dim, in_dim));
+    if (lid == 0u) {
+        y_out[s * out_dim + row] = acc;
+    }
+#else
+    /* The row depends only on the workgroup id, so this return is uniform per workgroup. */
+    const uint row = nf_wg_id();
+    if (row >= out_dim) {
+        return;
+    }
+    const uint wbase = row * in_dim;
+#if OP == OP_BATCH
+    const uint seq_len = uint(pc.seq_len);
+    for (uint s = 0u; s < seq_len; ++s) {
+        const float acc = nf_wg_sum(nf_md_row_partial(wbase, s * in_dim, in_dim));
+        if (lid == 0u) {
+            y_out[s * out_dim + row] = acc;
+        }
+    }
+#elif defined(NF_MD_GATEUP)
+    float gs = 0.0;
+    float us = 0.0;
+    nf_md_gateup_partial(wbase, in_dim, gs, us);
+    const float g = nf_wg_sum(gs);
+    const float up = nf_wg_sum(us);
+    if (lid == 0u) {
+#if OP == OP_GATEUP_SILU
+        y_out[row] = nf_silu(g) * up;
+#else
+        y_out[row] = nf_gelu_tanh(g) * up;
+#endif
+    }
+#else
+    const float acc = nf_wg_sum(nf_md_row_partial(wbase, 0u, in_dim));
+    if (lid == 0u) {
+#if OP == OP_MATVEC_ADD
+        y_out[row] += acc;
+#else
+        y_out[row] = acc;
+#endif
+    }
+#endif
+#endif
+}

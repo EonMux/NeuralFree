@@ -1,0 +1,71 @@
+/* attn_aux.comp - LLM_SplitQGate and LLM_Batch_SplitQGate (GLSL twin of kernels/llm/attn_aux.cl).
+ * Requires: common/nf_common.glsl.
+ *
+ * Splits a fused Q+gate projection into a tight-packed Q buffer and a gate buffer of
+ * num_heads * head_dim floats per token. Source layout per token, selected by `interleaved`:
+ *   interleaved != 0  [Q_h0(head_dim) | gate_h0(head_dim) | Q_h1 | gate_h1 | ...]
+ *   interleaved == 0  [Q of all heads | gate of all heads]
+ *
+ * A variants row selects OP:
+ *   OP_SPLITQGATE        (i num_heads, i head_dim, i interleaved, R combined, W q_out, W gate_out)
+ *   OP_BATCH_SPLITQGATE  (i seq_len, i num_heads, i head_dim, i interleaved, R combined, W q_out, W gate_out)
+ * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order.
+ *
+ * Dispatch: 1-D, global = (seq_len *) num_heads * head_dim, any local = {L, 1, 1}; folded group
+ * counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_SPLITQGATE       1
+#define OP_BATCH_SPLITQGATE 2
+
+#if !defined(OP)
+#error "attn_aux.comp requires OP"
+#endif
+
+layout(std430, binding = 0) readonly  buffer NfSqgCombined { float combined[]; };
+layout(std430, binding = 1) writeonly buffer NfSqgQ        { float q_out[]; };
+layout(std430, binding = 2) writeonly buffer NfSqgGate     { float gate_out[]; };
+
+#if OP == OP_SPLITQGATE
+layout(push_constant) uniform NfSqgParams { int num_heads; int head_dim; int interleaved; } pc;
+#elif OP == OP_BATCH_SPLITQGATE
+layout(push_constant) uniform NfSqgParams { int seq_len; int num_heads; int head_dim; int interleaved; } pc;
+#else
+#error "attn_aux.comp: OP is not a SplitQGate op"
+#endif
+
+void main() {
+    const uint head_dim = uint(pc.head_dim);
+    const uint per_token = uint(pc.num_heads) * head_dim;
+#if OP == OP_SPLITQGATE
+    const uint n_tokens = 1u;
+#else
+    const uint n_tokens = uint(pc.seq_len);
+#endif
+    const uint gid = nf_global_id();
+    if (gid >= n_tokens * per_token) {
+        return;
+    }
+
+    const uint token  = gid / per_token;
+    const uint within = gid - token * per_token;
+    const uint base   = token * (per_token * 2u);
+
+    uint src_q;
+    uint src_g;
+    if (pc.interleaved != 0) {
+        const uint head = within / head_dim;
+        const uint dim  = within - head * head_dim;
+        src_q = base + head * (head_dim * 2u) + dim;
+        src_g = src_q + head_dim;
+    } else {
+        src_q = base + within;
+        src_g = base + per_token + within;
+    }
+    q_out[gid]    = combined[src_q];
+    gate_out[gid] = combined[src_g];
+}

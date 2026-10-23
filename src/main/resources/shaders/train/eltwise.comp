@@ -1,0 +1,665 @@
+/* eltwise.comp - elementwise unary and binary ops, axpby, scale, compare, where, gather, scatter, unary backward
+ * and dropout apply. GLSL twin of kernels/train/eltwise.cl (the semantic reference: arguments, formulas and
+ * dispatch are documented there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     TR_Unary_F32	eltwise.comp	OP=ELT_UNARY
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Buffers the .cl declares as uint words are uint words here. The per-element kernels that may run in place
+ * (unary, binary, axpby, scale, unary backward, mask scale) declare no buffer restrict.
+ *
+ * GLSL builtins leave sqrt, log and pow undefined for some inputs and may evaluate exp out of range loosely,
+ * so tr_e_sqrt, tr_e_log, tr_e_exp and tr_e_pow state the Java special cases explicitly and call a builtin only
+ * where it is defined. GLSL has no log1p; tr_e_log1p evaluates it from log on [1, 2] or by its series near 0.
+ * tanh, sin and cos come from common/train.glsl (tr_tanh, tr_sincos), because the builtins may overflow or
+ * have implementation-defined precision. Every arithmetic intermediate is precise, so no implementation
+ * contracts a multiply and an add.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define ELT_UNARY           1
+#define ELT_BINARY          2
+#define ELT_AXPBY           3
+#define ELT_SCALE           4
+#define ELT_COMPARE         5
+#define ELT_WHERE           6
+#define ELT_GATHER          7
+#define ELT_SCATTER         8
+#define ELT_UNARY_BACKWARD  9
+#define ELT_MASK_SCALE     10
+
+/* TR_Unary_F32 op ids (equal to eltwise.cl and tensor/gpu/TrainOps). */
+#define TR_E_NEG          0
+#define TR_E_ABS          1
+#define TR_E_SQRT         2
+#define TR_E_EXP          3
+#define TR_E_LOG          4
+#define TR_E_RELU         5
+#define TR_E_SIGMOID      6
+#define TR_E_TANH         7
+#define TR_E_GELU         8
+#define TR_E_SILU         9
+#define TR_E_LEAKY_RELU  10
+#define TR_E_ELU         11
+#define TR_E_SOFTPLUS    12
+#define TR_E_MISH        13
+#define TR_E_POW         14
+#define TR_E_CLAMP       15
+#define TR_E_ADD_SCALAR  16
+#define TR_E_MUL_SCALAR  17
+#define TR_E_IDENTITY    18
+#define TR_E_ROUND       19
+#define TR_E_FLOOR       20
+#define TR_E_SIN         21
+#define TR_E_COS         22
+
+/* TR_Binary_F32 op ids. */
+#define TR_E_ADD          0
+#define TR_E_SUB          1
+#define TR_E_MUL          2
+#define TR_E_DIV          3
+
+/* TR_Compare_F32 op ids. */
+#define TR_CMP_EQ         0
+#define TR_CMP_GT         1
+#define TR_CMP_LT         2
+
+/* TR_Where_F32 condition kinds. */
+#define TR_WHERE_COND_F32    0
+#define TR_WHERE_COND_BOOL   1
+
+/* TR_Scatter_F32 modes. */
+#define TR_SCATTER_OVERWRITE 0
+#define TR_SCATTER_ADD       1
+
+#ifndef OP
+#error "eltwise.comp requires OP"
+#endif
+
+#if OP == ELT_UNARY
+layout(std430, binding = 0) readonly buffer TrEltIn { float in_f[]; };
+layout(std430, binding = 1) writeonly buffer TrEltOut { float out_f[]; };
+layout(push_constant) uniform TrEltParams {
+    int op; int n; int rank;
+    int d0; int d1; int d2; int d3; int d4; int d5;
+    int s0; int s1; int s2; int s3; int s4; int s5;
+    int in_off; int out_off;
+    float p0; float p1;
+} pc;
+
+#elif OP == ELT_BINARY
+layout(std430, binding = 0) readonly buffer TrEltA { float a_f[]; };
+layout(std430, binding = 1) readonly buffer TrEltB { float b_f[]; };
+layout(std430, binding = 2) writeonly buffer TrEltOut { float out_f[]; };
+layout(push_constant) uniform TrEltParams {
+    int op; int n; int rank;
+    int d0; int d1; int d2; int d3; int d4; int d5;
+    int as0; int as1; int as2; int as3; int as4; int as5;
+    int bs0; int bs1; int bs2; int bs3; int bs4; int bs5;
+    int a_off; int b_off; int out_off;
+} pc;
+
+#elif OP == ELT_AXPBY
+layout(std430, binding = 0) readonly buffer TrEltX { float x_f[]; };
+layout(std430, binding = 1) buffer TrEltY { float y_f[]; };
+layout(push_constant) uniform TrEltParams {
+    int n;
+    float alpha; float beta;
+    int x_off; int y_off;
+} pc;
+
+#elif OP == ELT_SCALE
+layout(std430, binding = 0) buffer TrEltY { float y_f[]; };
+layout(push_constant) uniform TrEltParams {
+    int n;
+    float alpha;
+    int off;
+} pc;
+
+#elif OP == ELT_COMPARE
+layout(std430, binding = 0) restrict readonly buffer TrEltA { float a_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrEltB { float b_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrEltOut { uint out_u[]; };
+layout(push_constant) uniform TrEltParams {
+    int op; int n; int rank;
+    int d0; int d1; int d2; int d3; int d4; int d5;
+    int as0; int as1; int as2; int as3; int as4; int as5;
+    int bs0; int bs1; int bs2; int bs3; int bs4; int bs5;
+    int a_off; int b_off;
+} pc;
+
+#elif OP == ELT_WHERE
+layout(std430, binding = 0) restrict readonly buffer TrEltCond { uint cond_u[]; };
+layout(std430, binding = 1) restrict readonly buffer TrEltA { uint a_u[]; };
+layout(std430, binding = 2) restrict readonly buffer TrEltB { uint b_u[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrEltOut { uint out_u[]; };
+layout(push_constant) uniform TrEltParams {
+    int cond_kind; int n; int rank;
+    int d0; int d1; int d2; int d3; int d4; int d5;
+    int cs0; int cs1; int cs2; int cs3; int cs4; int cs5;
+    int as0; int as1; int as2; int as3; int as4; int as5;
+    int bs0; int bs1; int bs2; int bs3; int bs4; int bs5;
+    int c_off; int a_off; int b_off;
+} pc;
+
+#elif OP == ELT_GATHER
+layout(std430, binding = 0) restrict readonly buffer TrEltIn { uint in_u[]; };
+layout(std430, binding = 1) restrict readonly buffer TrEltIdx { int idx_i[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrEltOut { uint out_u[]; };
+layout(std430, binding = 3) restrict buffer TrEltErr { int err_i[]; };
+layout(push_constant) uniform TrEltParams {
+    int dim; int n; int rank;
+    int d0; int d1; int d2; int d3; int d4; int d5;
+    int id0; int id1; int id2; int id3; int id4; int id5;
+    int in_off; int idx_off; int err_slot; int err_dim;
+} pc;
+
+#elif OP == ELT_SCATTER
+layout(std430, binding = 0) restrict readonly buffer TrEltIdx { int idx_i[]; };
+layout(std430, binding = 1) restrict readonly buffer TrEltSrc { float src_f[]; };
+layout(std430, binding = 2) restrict buffer TrEltOut { float out_f[]; };
+layout(std430, binding = 3) restrict buffer TrEltErr { int err_i[]; };
+layout(push_constant) uniform TrEltParams {
+    int dim; int mode; int fibers; int rank;
+    int d0; int d1; int d2; int d3; int d4; int d5;
+    int od0; int od1; int od2; int od3; int od4; int od5;
+    int idx_off; int src_off; int err_slot; int err_dim;
+} pc;
+
+#elif OP == ELT_UNARY_BACKWARD
+layout(std430, binding = 0) readonly buffer TrEltX { float x_f[]; };
+layout(std430, binding = 1) readonly buffer TrEltY { float y_f[]; };
+layout(std430, binding = 2) readonly buffer TrEltGy { float gy_f[]; };
+layout(std430, binding = 3) writeonly buffer TrEltGx { float gx_f[]; };
+layout(push_constant) uniform TrEltParams {
+    int op; int n;
+    float p0; float p1;
+    int x_off; int y_off; int gy_off; int gx_off;
+} pc;
+
+#elif OP == ELT_MASK_SCALE
+layout(std430, binding = 0) readonly buffer TrEltX { float x_f[]; };
+layout(std430, binding = 1) readonly buffer TrEltM { float m_f[]; };
+layout(std430, binding = 2) writeonly buffer TrEltOut { float out_f[]; };
+layout(push_constant) uniform TrEltParams {
+    int n;
+    float scale;
+    int x_off; int m_off; int out_off;
+} pc;
+
+#else
+#error "eltwise.comp: unknown OP"
+#endif
+
+/* ---- Java float predicates on bit patterns (eltwise.cl) ---- */
+
+bool tr_e_gtz(const float x) {
+    const int i = floatBitsToInt(x);
+    return i > 0 && i <= 0x7f800000;
+}
+
+bool tr_e_ltz(const float x) {
+    return tr_e_gtz(uintBitsToFloat(floatBitsToUint(x) ^ 0x80000000u));
+}
+
+bool tr_e_lt(const float a, const float b) {
+    if (tr_isnan(a) || tr_isnan(b)) {
+        return false;
+    }
+    if (tr_iszero(a) && tr_iszero(b)) {
+        return false;
+    }
+    return tr_order_key(a) < tr_order_key(b);
+}
+
+bool tr_e_eq(const float a, const float b) {
+    if (tr_isnan(a) || tr_isnan(b)) {
+        return false;
+    }
+    return floatBitsToUint(a) == floatBitsToUint(b) || (tr_iszero(a) && tr_iszero(b));
+}
+
+/* ---- scalar functions (eltwise.cl) ---- */
+
+float tr_e_neg(const float x) {
+    return uintBitsToFloat(floatBitsToUint(x) ^ 0x80000000u);
+}
+
+float tr_e_abs(const float x) {
+    return uintBitsToFloat(floatBitsToUint(x) & 0x7fffffffu);
+}
+
+/* Java Math.sqrt: NaN and +-0 pass, negatives give NaN, +inf passes. */
+float tr_e_sqrt(const float x) {
+    if (tr_isnan(x) || tr_iszero(x)) {
+        return x;
+    }
+    if (floatBitsToInt(x) < 0) {
+        return NF_NAN;
+    }
+    if (tr_isinf(x)) {
+        return x;
+    }
+    return sqrt(x);
+}
+
+/* Java Math.log: NaN passes, +-0 gives -inf, negatives give NaN, +inf passes. */
+float tr_e_log(const float x) {
+    if (tr_isnan(x)) {
+        return x;
+    }
+    if (tr_iszero(x)) {
+        return -NF_INF;
+    }
+    if (floatBitsToInt(x) < 0) {
+        return NF_NAN;
+    }
+    if (tr_isinf(x)) {
+        return x;
+    }
+    return log(x);
+}
+
+/* Java Math.exp: NaN passes, -inf gives +0, +inf passes. */
+float tr_e_exp(const float x) {
+    if (tr_isnan(x)) {
+        return x;
+    }
+    if (tr_isinf(x)) {
+        return x > 0.0 ? x : 0.0;
+    }
+    return exp(x);
+}
+
+/* log(1 + u) for u in [0, 1]: the alternating series to u^7 below 1/16 (truncation below 1e-9 relative),
+ * otherwise log of 1 + u in [17/16, 2]. */
+float tr_e_log1p(const float u) {
+    if (u < 0.0625) {
+        precise float r = u * (1.0 + u * (-0.5 + u * (1.0 / 3.0 + u * (-0.25 + u * (0.2 + u * (-1.0 / 6.0
+                        + u * (1.0 / 7.0)))))));
+        return r;
+    }
+    precise float w = 1.0 + u;
+    return log(w);
+}
+
+float tr_e_sigmoid(const float x) {
+    if (tr_isnan(x)) {
+        return x;
+    }
+    if (x >= 0.0) {
+        precise float r = 1.0 / (1.0 + tr_e_exp(-x));
+        return r;
+    }
+    const float e = tr_e_exp(x);
+    precise float r = e / (1.0 + e);
+    return r;
+}
+
+float tr_e_softplus(const float x) {
+    if (tr_isnan(x)) {
+        return x;
+    }
+    if (x >= 709.782715) {
+        return NF_INF;
+    }
+    if (x > 0.0) {
+        precise float r = x + tr_e_log1p(tr_e_exp(-x));
+        return r;
+    }
+    return tr_e_log1p(tr_e_exp(x));
+}
+
+float tr_e_pow(const float x, const float y) {
+    if (tr_iszero(y)) {
+        return 1.0;
+    }
+    if (floatBitsToUint(y) == 0x3f800000u) {
+        return x;
+    }
+    if (tr_isnan(x) || tr_isnan(y)) {
+        return NF_NAN;
+    }
+    const float ax = tr_e_abs(x);
+    const bool ypos = tr_e_gtz(y);
+    if (tr_isinf(y)) {
+        if (ax == 1.0) {
+            return NF_NAN;
+        }
+        return ((ax > 1.0) == ypos) ? NF_INF : 0.0;
+    }
+    const bool yint = tr_e_abs(y) >= 1.0 && floor(y) == y;
+    const bool yodd = yint && tr_e_abs(y) < 16777216.0 && (int(y) & 1) != 0;
+    float mag;
+    if (tr_iszero(ax)) {
+        mag = ypos ? 0.0 : NF_INF;
+    } else if (tr_isinf(ax)) {
+        mag = ypos ? NF_INF : 0.0;
+    } else {
+        mag = pow(ax, y);
+    }
+    if ((floatBitsToUint(x) & 0x80000000u) != 0u) {
+        if (!yint && !tr_iszero(x) && !tr_isinf(x)) {
+            return NF_NAN;
+        }
+        return yodd ? tr_e_neg(mag) : mag;
+    }
+    return mag;
+}
+
+float tr_e_round(const float x) {
+    const float r = floor(x);
+    precise float f = x - r;
+    precise float up = r + 1.0;
+    return (f >= 0.5) ? up : r;
+}
+
+float tr_e_gelu(const float x) {
+    const float s = 0.797884583;
+    const float c = 0.0447149985;
+    precise float inner = s * (x + ((c * x) * x) * x);
+    precise float r = (0.5 * x) * (1.0 + tr_tanh(inner));
+    return r;
+}
+
+/* Java (float)Math.sin(x) (cosine false) or (float)Math.cos(x) (cosine true) by tr_sincos. */
+float tr_e_sincos(const float x, const bool cosine) {
+    float s;
+    float c;
+    tr_sincos(x, s, c);
+    return cosine ? c : s;
+}
+
+float tr_e_unary(const int op, const float x, const float p0, const float p1) {
+    switch (op) {
+        case TR_E_NEG:        return tr_e_neg(x);
+        case TR_E_ABS:        return tr_e_abs(x);
+        case TR_E_SQRT:       return tr_e_sqrt(x);
+        case TR_E_EXP:        return tr_e_exp(x);
+        case TR_E_LOG:        return tr_e_log(x);
+        case TR_E_RELU:       return tr_jmax(0.0, x);
+        case TR_E_SIGMOID:    return tr_e_sigmoid(x);
+        case TR_E_TANH:       return tr_tanh(x);
+        case TR_E_GELU:       return tr_e_gelu(x);
+        case TR_E_SILU: {
+            precise float r = x * tr_e_sigmoid(x);
+            return r;
+        }
+        case TR_E_LEAKY_RELU: {
+            precise float r = p0 * x;
+            return tr_e_gtz(x) ? x : r;
+        }
+        case TR_E_ELU: {
+            precise float r = p0 * (tr_e_exp(x) - 1.0);
+            return tr_e_gtz(x) ? x : r;
+        }
+        case TR_E_SOFTPLUS:   return tr_e_softplus(x);
+        case TR_E_MISH: {
+            precise float r = x * tr_tanh(tr_e_softplus(x));
+            return r;
+        }
+        case TR_E_POW:        return tr_e_pow(x, p0);
+        case TR_E_CLAMP:      return tr_jmax(p0, tr_jmin(p1, x));
+        case TR_E_ADD_SCALAR: {
+            precise float r = x + p0;
+            return r;
+        }
+        case TR_E_MUL_SCALAR: {
+            precise float r = x * p0;
+            return r;
+        }
+        case TR_E_IDENTITY:   return x;
+        case TR_E_ROUND:      return tr_e_round(x);
+        case TR_E_FLOOR:      return floor(x);
+        case TR_E_SIN:        return tr_e_sincos(x, false);
+        case TR_E_COS:        return tr_e_sincos(x, true);
+        default:              return NF_NAN;
+    }
+}
+
+float tr_e_binary(const int op, const float a, const float b) {
+    precise float r;
+    switch (op) {
+        case TR_E_ADD: r = a + b; break;
+        case TR_E_SUB: r = a - b; break;
+        case TR_E_MUL: r = a * b; break;
+        case TR_E_DIV: r = a / b; break;
+        default:       r = NF_NAN; break;
+    }
+    return r;
+}
+
+bool tr_e_compare(const int op, const float a, const float b) {
+    switch (op) {
+        case TR_CMP_EQ: return tr_e_eq(a, b);
+        case TR_CMP_GT: return tr_e_lt(b, a);
+        case TR_CMP_LT: return tr_e_lt(a, b);
+        default:        return false;
+    }
+}
+
+float tr_e_gelu_grad(const float x) {
+    const float s = 0.797884583;
+    const float c = 0.0447149985;
+    const float c3 = 0.134144992;
+    precise float x3 = (x * x) * x;
+    precise float inner = s * (x + c * x3);
+    const float t = tr_tanh(inner);
+    precise float sech2 = 1.0 - t * t;
+    precise float d_inner = s * (1.0 + (c3 * x) * x);
+    precise float r = 0.5 * (1.0 + t) + ((0.5 * x) * sech2) * d_inner;
+    return r;
+}
+
+float tr_e_mish_grad(const float x) {
+    const float t = tr_tanh(tr_e_softplus(x));
+    precise float sech2 = 1.0 - t * t;
+    precise float r = t + (x * sech2) * tr_e_sigmoid(x);
+    return r;
+}
+
+float tr_e_silu_grad(const float x) {
+    const float sg = tr_e_sigmoid(x);
+    precise float r = sg * (1.0 + x * (1.0 - sg));
+    return r;
+}
+
+void main() {
+#if OP == ELT_UNARY
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
+    const int s[TR_MAX_RANK] = int[TR_MAX_RANK](pc.s0, pc.s1, pc.s2, pc.s3, pc.s4, pc.s5);
+    const float x = in_f[pc.in_off + tr_coord_offset(i, pc.rank, d, s)];
+    out_f[pc.out_off + i] = tr_e_unary(pc.op, x, pc.p0, pc.p1);
+
+#elif OP == ELT_BINARY
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
+    const int as_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.as0, pc.as1, pc.as2, pc.as3, pc.as4, pc.as5);
+    const int bs_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.bs0, pc.bs1, pc.bs2, pc.bs3, pc.bs4, pc.bs5);
+    const float va = a_f[pc.a_off + tr_coord_offset(i, pc.rank, d, as_)];
+    const float vb = b_f[pc.b_off + tr_coord_offset(i, pc.rank, d, bs_)];
+    out_f[pc.out_off + i] = tr_e_binary(pc.op, va, vb);
+
+#elif OP == ELT_AXPBY
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise float ax = pc.alpha * x_f[pc.x_off + i];
+    if (tr_iszero(pc.beta)) {
+        y_f[pc.y_off + i] = ax;
+    } else {
+        precise float by = pc.beta * y_f[pc.y_off + i];
+        precise float r = ax + by;
+        y_f[pc.y_off + i] = r;
+    }
+
+#elif OP == ELT_SCALE
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise float r = y_f[pc.off + i] * pc.alpha;
+    y_f[pc.off + i] = r;
+
+#elif OP == ELT_COMPARE
+    const int words = int((uint(pc.n) + 3u) >> 2);
+    const int w = tr_gid(words);
+    if (w < 0) {
+        return;
+    }
+    const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
+    const int as_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.as0, pc.as1, pc.as2, pc.as3, pc.as4, pc.as5);
+    const int bs_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.bs0, pc.bs1, pc.bs2, pc.bs3, pc.bs4, pc.bs5);
+    uint word = 0u;
+    for (int k = 0; k < 4; ++k) {
+        const int e = 4 * w + k;
+        if (e < pc.n) {
+            const float va = a_f[pc.a_off + tr_coord_offset(e, pc.rank, d, as_)];
+            const float vb = b_f[pc.b_off + tr_coord_offset(e, pc.rank, d, bs_)];
+            if (tr_e_compare(pc.op, va, vb)) {
+                word |= 1u << uint(8 * k);
+            }
+        }
+    }
+    out_u[w] = word;
+
+#elif OP == ELT_WHERE
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
+    const int cs_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.cs0, pc.cs1, pc.cs2, pc.cs3, pc.cs4, pc.cs5);
+    const int as_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.as0, pc.as1, pc.as2, pc.as3, pc.as4, pc.as5);
+    const int bs_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.bs0, pc.bs1, pc.bs2, pc.bs3, pc.bs4, pc.bs5);
+    const int cp = pc.c_off + tr_coord_offset(i, pc.rank, d, cs_);
+    bool take;
+    if (pc.cond_kind == TR_WHERE_COND_BOOL) {
+        take = tr_word_byte(cond_u[cp >> 2], cp) != 0u;
+    } else {
+        take = (cond_u[cp] & 0x7fffffffu) != 0u;
+    }
+    out_u[i] = take ? a_u[pc.a_off + tr_coord_offset(i, pc.rank, d, as_)]
+                    : b_u[pc.b_off + tr_coord_offset(i, pc.rank, d, bs_)];
+
+#elif OP == ELT_GATHER
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
+    const int id_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.id0, pc.id1, pc.id2, pc.id3, pc.id4, pc.id5);
+    const int g = idx_i[pc.idx_off + i];
+    if (g < 0 || g >= id_[pc.dim]) {
+        tr_report_index_error(err_i, pc.err_slot, g, pc.err_dim, id_[pc.dim]);
+        out_u[i] = 0u;
+        return;
+    }
+    int rem = i;
+    int src = 0;
+    int stride = 1;
+    for (int k = min(pc.rank, TR_MAX_RANK) - 1; k >= 0; --k) {
+        const int c = rem % d[k];
+        rem = rem / d[k];
+        src += (k == pc.dim ? g : c) * stride;
+        stride *= id_[k];
+    }
+    out_u[i] = in_u[pc.in_off + src];
+
+#elif OP == ELT_SCATTER
+    const int f = tr_gid(pc.fibers);
+    if (f < 0) {
+        return;
+    }
+    const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
+    const int od[TR_MAX_RANK] = int[TR_MAX_RANK](pc.od0, pc.od1, pc.od2, pc.od3, pc.od4, pc.od5);
+    int rem = f;
+    int ibase = 0;
+    int obase = 0;
+    int istride = 1;
+    int ostride = 1;
+    int istep = 0;
+    int ostep = 0;
+    for (int k = min(pc.rank, TR_MAX_RANK) - 1; k >= 0; --k) {
+        if (k == pc.dim) {
+            istep = istride;
+            ostep = ostride;
+        } else {
+            const int c = rem % d[k];
+            rem = rem / d[k];
+            ibase += c * istride;
+            obase += c * ostride;
+        }
+        istride *= d[k];
+        ostride *= od[k];
+    }
+    const int len = d[pc.dim];
+    const int limit = od[pc.dim];
+    for (int j = 0; j < len; ++j) {
+        const int lin = ibase + j * istep;
+        const int v = idx_i[pc.idx_off + lin];
+        if (v < 0 || v >= limit) {
+            tr_report_index_error(err_i, pc.err_slot, v, pc.err_dim, limit);
+            continue;
+        }
+        const int o = obase + v * ostep;
+        if (pc.mode == TR_SCATTER_ADD) {
+            precise float r = out_f[o] + src_f[pc.src_off + lin];
+            out_f[o] = r;
+        } else {
+            out_f[o] = src_f[pc.src_off + lin];
+        }
+    }
+
+#elif OP == ELT_UNARY_BACKWARD
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const float g = gy_f[pc.gy_off + i];
+    precise float r;
+    switch (pc.op) {
+        case TR_E_RELU:       r = tr_e_gtz(x_f[pc.x_off + i]) ? g : 0.0; break;
+        case TR_E_GELU:       r = g * tr_e_gelu_grad(x_f[pc.x_off + i]); break;
+        case TR_E_SILU:       r = g * tr_e_silu_grad(x_f[pc.x_off + i]); break;
+        case TR_E_SIGMOID:    r = (g * y_f[pc.y_off + i]) * (1.0 - y_f[pc.y_off + i]); break;
+        case TR_E_TANH:       r = g * (1.0 - y_f[pc.y_off + i] * y_f[pc.y_off + i]); break;
+        case TR_E_LEAKY_RELU: r = tr_e_gtz(x_f[pc.x_off + i]) ? g : pc.p0 * g; break;
+        case TR_E_ELU:        r = tr_e_gtz(x_f[pc.x_off + i]) ? g : g * (y_f[pc.y_off + i] + pc.p0); break;
+        case TR_E_SOFTPLUS:   r = g * tr_e_sigmoid(x_f[pc.x_off + i]); break;
+        case TR_E_MISH:       r = g * tr_e_mish_grad(x_f[pc.x_off + i]); break;
+        case TR_E_ABS:
+            r = tr_e_gtz(x_f[pc.x_off + i]) ? g : (tr_e_ltz(x_f[pc.x_off + i]) ? tr_e_neg(g) : 0.0);
+            break;
+        case TR_E_CLAMP:
+            r = (tr_e_lt(x_f[pc.x_off + i], pc.p0) || tr_e_lt(pc.p1, x_f[pc.x_off + i])) ? 0.0 : g;
+            break;
+        default:                 r = NF_NAN; break;
+    }
+    gx_f[pc.gx_off + i] = r;
+
+#elif OP == ELT_MASK_SCALE
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const float mv = m_f[pc.m_off + i];
+    if (tr_iszero(mv)) {
+        out_f[pc.out_off + i] = 0.0;
+    } else {
+        precise float r = (x_f[pc.x_off + i] * mv) * pc.scale;
+        out_f[pc.out_off + i] = r;
+    }
+#endif
+}

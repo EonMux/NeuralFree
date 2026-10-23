@@ -1,0 +1,11 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Optimizer steps, gradient-norm clipping and loss-scale unscaling (kernels/train/optim.cl).
+TR_SgdStep_F32	optim.comp	OP=OPTIM_SGD_STEP
+TR_AdamStep_F32	optim.comp	OP=OPTIM_ADAM_STEP
+TR_RmspropStep_F32	optim.comp	OP=OPTIM_RMSPROP_STEP
+TR_AdagradStep_F32	optim.comp	OP=OPTIM_ADAGRAD_STEP
+TR_LambUpdate_F32	optim.comp	OP=OPTIM_LAMB_UPDATE
+TR_LambApply_F32	optim.comp	OP=OPTIM_LAMB_APPLY
+TR_GradNormCoef_F32	optim.comp	OP=OPTIM_GRAD_NORM_COEF
+TR_ScaleByDevice_F32	optim.comp	OP=OPTIM_SCALE_BY_DEVICE
+TR_UnscaleCheck_F32	optim.comp	OP=OPTIM_UNSCALE_CHECK

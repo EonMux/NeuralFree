@@ -1,0 +1,8 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Gemma3n AltUp predict/correct, magnitude matching, Gaussian top-k sparsity and stream mean kernels (kernels/llm/gemma3n.cl).
+# gemma3n.cl
+LLM_AltUp_Predict	gemma3n.comp	OP=OP_ALTUP_PREDICT
+LLM_AltUp_Correct	gemma3n.comp	OP=OP_ALTUP_CORRECT
+LLM_MagnitudeMatch	gemma3n.comp	OP=OP_MAGNITUDE_MATCH	sg
+LLM_GaussianTopK	gemma3n.comp	OP=OP_GAUSSIAN_TOPK	sg
+LLM_StreamsMean	gemma3n.comp	OP=OP_STREAMS_MEAN

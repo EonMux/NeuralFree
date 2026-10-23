@@ -1,0 +1,133 @@
+/* softmax.comp - row softmax and log-softmax with optional masking, and their backward. GLSL twin of
+ * kernels/train/softmax.cl (the semantic reference: arguments, formulas and dispatch are documented there).
+ * Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<kernel>; its kernel name is the OpenCL name, e.g.
+ *     TR_SoftmaxRows_F32	softmax.comp	OP=SOFTMAX_ROWS_F32
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * The row comes from nf_wg_id(); groups past the last row return as a whole, so the workgroup barriers stay
+ * in uniform control flow.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+/* Flags of TR_SoftmaxRows_F32, identical to softmax.cl. */
+#define TR_SM_LOG    1
+#define TR_SM_MASKED 2
+
+#define SOFTMAX_ROWS_F32           1
+#define SOFTMAX_ROWS_BACKWARD_F32  2
+
+#ifndef OP
+#error "softmax.comp requires OP"
+#endif
+
+#if OP == SOFTMAX_ROWS_F32
+layout(std430, binding = 0) restrict readonly buffer TrSmIn { float in_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrSmOut { float out_f[]; };
+layout(push_constant) uniform TrSmParams {
+    int rows;
+    int cols;
+    int flags;
+    int in_off;
+    int out_off;
+} pc;
+
+#elif OP == SOFTMAX_ROWS_BACKWARD_F32
+layout(std430, binding = 0) restrict readonly buffer TrSmY { float y_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrSmGy { float gy_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrSmGx { float gx_f[]; };
+layout(push_constant) uniform TrSmParams {
+    int rows;
+    int cols;
+    int log_mode;
+    int y_off;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#else
+#error "softmax.comp: unknown OP"
+#endif
+
+/* True when x is -inf by bit pattern (the CPU's x == Float.NEGATIVE_INFINITY). */
+bool tr_sm_is_neginf(const float x) {
+    return floatBitsToUint(x) == 0xff800000u;
+}
+
+void main() {
+    const uint wg = nf_wg_id();
+    if (wg >= uint(pc.rows)) {
+        return;
+    }
+    const int row = int(wg);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint cols = uint(pc.cols);
+
+#if OP == SOFTMAX_ROWS_F32
+    const bool masked = (pc.flags & TR_SM_MASKED) != 0;
+    const int ib = pc.in_off + row * pc.cols;
+    const int ob = pc.out_off + row * pc.cols;
+
+    float mx = -NF_INF;
+    for (uint c = lid; c < cols; c += TR_LOCAL) {
+        mx = tr_jmax(mx, in_f[ib + int(c)]);
+    }
+    mx = tr_wg_max(mx);
+
+    precise float s = 0.0;
+    for (uint c = lid; c < cols; c += TR_LOCAL) {
+        const float x = in_f[ib + int(c)];
+        if (!(masked && tr_sm_is_neginf(x))) {
+            s = s + exp(x - mx);
+        }
+    }
+    const float total = tr_wg_sum(s);
+
+    if ((pc.flags & TR_SM_LOG) != 0) {
+        precise float log_sum = mx + log(total);
+        for (uint c = lid; c < cols; c += TR_LOCAL) {
+            const float x = in_f[ib + int(c)];
+            precise float r = x - log_sum;
+            out_f[ob + int(c)] = (masked && tr_sm_is_neginf(x)) ? -NF_INF : r;
+        }
+    } else {
+        for (uint c = lid; c < cols; c += TR_LOCAL) {
+            const float x = in_f[ib + int(c)];
+            precise float r = exp(x - mx) / total;
+            out_f[ob + int(c)] = (masked && tr_sm_is_neginf(x)) ? 0.0 : r;
+        }
+    }
+
+#elif OP == SOFTMAX_ROWS_BACKWARD_F32
+    const int yb = pc.y_off + row * pc.cols;
+    const int gb = pc.gy_off + row * pc.cols;
+    const int ob = pc.gx_off + row * pc.cols;
+
+    precise float acc = 0.0;
+    if (pc.log_mode != 0) {
+        for (uint c = lid; c < cols; c += TR_LOCAL) {
+            acc = acc + gy_f[gb + int(c)];
+        }
+    } else {
+        for (uint c = lid; c < cols; c += TR_LOCAL) {
+            acc = fma(y_f[yb + int(c)], gy_f[gb + int(c)], acc);
+        }
+    }
+    const float s = tr_wg_sum(acc);
+
+    if (pc.log_mode != 0) {
+        for (uint c = lid; c < cols; c += TR_LOCAL) {
+            precise float r = gy_f[gb + int(c)] - exp(y_f[yb + int(c)]) * s;
+            gx_f[ob + int(c)] = r;
+        }
+    } else {
+        for (uint c = lid; c < cols; c += TR_LOCAL) {
+            precise float r = y_f[yb + int(c)] * (gy_f[gb + int(c)] - s);
+            gx_f[ob + int(c)] = r;
+        }
+    }
+#endif
+}

@@ -1,0 +1,107 @@
+/* wkv6.comp - LLM_RWKV_WKV6, the RWKV6 WKV recurrence. GLSL twin of LLM_RWKV_WKV6 in
+ * kernels/llm/recurrent/rwkv.cl. Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i C, i H, R k, R v, R r, R tf, R td, RW state, R int state_rows, W y)
+ * Math (ggml-cpu/ops.cpp:10732), per head h, key i, value j, kv = v[t,h,j] * k[t,h,i]:
+ *   y[t,h,j] = sum_i (kv * tf[h,i] + s[i][j]) * r[t,h,i];   s[i][j] = s[i][j] * td[t,h,i] + kv
+ * State s[state_rows[0] * H*S*S + h*S*S + i*S + j] (i = key, j = value), updated in place.
+ *
+ * Work split as the OpenCL kernel: each invocation owns one value index and the NF_RWKV_KPT keys
+ * [part * NF_RWKV_KPT, +NF_RWKV_KPT) of it in registers; the P = nf_rwkv_parts(S) adjacent lanes of
+ * one value combine their partial sums with nf_seg_sum. Staged key vectors are zero-padded to
+ * P * NF_RWKV_KPT so the inner loop is unguarded.
+ * Dispatch: 1-D, local L = min(256, max(32, P * pow2ceil(S))), global = H * ceil(S / (L / P)) * L.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define NF_RWKV_MAX_S 256
+#define NF_RWKV_KPT   32
+
+layout(std430, binding = 0) readonly buffer NfWkvK { float k_in[]; };
+layout(std430, binding = 1) readonly buffer NfWkvV { float v_in[]; };
+layout(std430, binding = 2) readonly buffer NfWkvR { float r_in[]; };
+layout(std430, binding = 3) readonly buffer NfWkvTf { float tf_in[]; };
+layout(std430, binding = 4) readonly buffer NfWkvTd { float td_in[]; };
+layout(std430, binding = 5) buffer NfWkvState { float state[]; };
+layout(std430, binding = 6) readonly buffer NfWkvRows { int state_rows[]; };
+layout(std430, binding = 7) buffer NfWkvY { float y_out[]; };
+
+layout(push_constant) uniform NfWkv6Params { int n_tokens; int C; int H; } pc;
+
+#include "common/reduce.glsl"
+
+shared float sk[NF_RWKV_MAX_S];
+shared float sr[NF_RWKV_MAX_S];
+shared float stf[NF_RWKV_MAX_S];
+shared float std_[NF_RWKV_MAX_S];
+
+uint nf_rwkv_parts(uint S) {
+    return S <= NF_RWKV_KPT ? 1u : (S <= 2u * NF_RWKV_KPT ? 2u : (S <= 4u * NF_RWKV_KPT ? 4u : 8u));
+}
+
+void main() {
+    const uint C = uint(pc.C);
+    const uint H = uint(pc.H);
+    const uint S = C / H;
+    const uint P = nf_rwkv_parts(S);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint L = gl_WorkGroupSize.x;
+    const uint vpg = L / P;
+    const uint gph = (S + vpg - 1u) / vpg;
+    const uint grp = nf_wg_id();
+    const uint h = grp / gph;
+    if (S > NF_RWKV_MAX_S || h >= H) {
+        return;
+    }
+    const uint val = (grp % gph) * vpg + lid / P;
+    const uint key0 = (lid & (P - 1u)) * NF_RWKV_KPT;
+    const bool live = val < S;
+    const uint span = P * NF_RWKV_KPT;
+    const uint sbase = uint(state_rows[0]) * C * S + h * S * S;
+
+    float st[NF_RWKV_KPT];
+    [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+        const uint i = key0 + u;
+        st[u] = (live && i < S) ? state[sbase + i * S + val] : 0.0;
+    }
+    for (uint i = lid; i < span; i += L) {
+        stf[i] = i < S ? tf_in[h * S + i] : 0.0;
+    }
+
+    for (uint t = 0u; t < uint(pc.n_tokens); t++) {
+        const uint row = t * C + h * S;
+        barrier();
+        for (uint i = lid; i < span; i += L) {
+            const bool inr = i < S;
+            sk[i] = inr ? k_in[row + i] : 0.0;
+            sr[i] = inr ? r_in[row + i] : 0.0;
+            std_[i] = inr ? td_in[row + i] : 0.0;
+        }
+        barrier();
+        const float vv = live ? v_in[row + val] : 0.0;
+        float acc = 0.0;
+        [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+            const uint i = key0 + u;
+            const float kv = vv * sk[i];
+            acc += (kv * stf[i] + st[u]) * sr[i];
+            st[u] = st[u] * std_[i] + kv;
+        }
+        if (P > 1u) {
+            acc = nf_seg_sum(acc, P);
+        }
+        if (live && key0 == 0u) {
+            y_out[row + val] = acc;
+        }
+    }
+
+    [[unroll]] for (uint u = 0u; u < NF_RWKV_KPT; u++) {
+        const uint i = key0 + u;
+        if (live && i < S) {
+            state[sbase + i * S + val] = st[u];
+        }
+    }
+}

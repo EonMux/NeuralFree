@@ -1,0 +1,255 @@
+/* qsa.comp - LLM_QSA_KpoolUpdate_<KV> (OP=OP_QSA_KPOOL_UPDATE) and LLM_QSA_KpoolScore_<KV> (OP=OP_QSA_KPOOL_SCORE):
+ * pooled indexer keys and pool scores of the QSA k-pool indexer (glm5-next, qwen4exp).
+ * GLSL twin of kernels/llm/sparse/qsa.cl (the semantic reference: pools, row layouts, formulas, llama.cpp references
+ * and preconditions are documented there). Requires: common/nf_common.glsl, common/rope_common.glsl,
+ * common/act.glsl, common/kv_types.glsl (the KV element codes and loaders), common/kv_quant.glsl (the KV
+ * stores), common/attn_common.glsl (the compile-time KV row views).
+ *
+ * KV (a variants-row define: an NF_KV_* code of common/kv_types.glsl) selects the element type of the indexer
+ * cache, which follows the context's type_k (llama.cpp src/llama-memory-hybrid-idx.cpp:71).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   LLM_QSA_KpoolUpdate(i n_new, i first_pool, i stage, i mode, i kpool, i idx_dim, i row_width, i gate_off,
+ *                       i pooled_off, i kv_rows, R float ape, RW <KV> idx_cache, RW float pooled)
+ *     1-D, one invocation per (new pool, value): global = roundUp(n_new*idx_dim, L), any L <= LLM_DIMX.
+ *   LLM_QSA_KpoolScore (i n_tokens, i n_pool, i n_idx_heads, i idx_dim, i kpool, i row_width, i pooled_off,
+ *                       i kv_rows, i has_w, f w_scale, i iq_off, i w_off, R float iq, R float w,
+ *                       R <KV> idx_cache, R int q_pos, R int kv_pos, W float scores)
+ *     1-D, one workgroup per (token, block of L pools): group g = t*ceil(n_pool/L) + b, pool i = b*L + lid.
+ * Workgroup and invocation indices are recovered through nf_wg_id() / nf_global_id() (folded group counts).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/kv_quant.glsl"
+#include "common/attn_common.glsl"
+
+#ifndef KV
+#error "qsa.comp needs KV=NF_KV_<type>"
+#endif
+
+#define OP_QSA_KPOOL_UPDATE 1
+#define OP_QSA_KPOOL_SCORE  2
+
+#define NF_QSA_MODE_GATED  0
+#define NF_QSA_MODE_MEAN   1
+#define NF_QSA_STAGE_POOL  0
+#define NF_QSA_STAGE_STORE 1
+
+#define NF_QSA_QSTAGE 2048
+#define NF_QSA_WSTAGE 256
+
+#if OP == OP_QSA_KPOOL_UPDATE
+
+layout(std430, binding = 0) readonly buffer NfQsaApe { float ape[]; };
+NF_BUFFER_VIEWS_RW(1, idx_cache)
+layout(std430, binding = 2) buffer NfQsaPooled { float pooled[]; };
+layout(push_constant) uniform NfQsaUpdateParams {
+    int n_new;
+    int first_pool;
+    int stage;
+    int mode;
+    int kpool;
+    int idx_dim;
+    int row_width;
+    int gate_off;
+    int pooled_off;
+    int kv_rows;
+} pc;
+
+NF_KV_LOADERS(idx_cache)
+NF_KV_STORES(idx_cache)
+
+/* Value e of the indexer cache (C nf_kv_load1). */
+float nf_qsa_h(uint e) {
+    return idx_cache_kv_load1(e, KV);
+}
+
+/* Stores pooled[i] as cache value e (C stage STORE): F32 as is, F16 / BF16 rounded to nearest even, a block type
+ * as the whole block of pooled[i, i + 32) into elements [e, e + 32) by the invocation with d % 32 == 0. */
+void nf_qsa_store(uint e, uint i, uint d) {
+    if (!nf_kv_is_block(KV)) {
+        idx_cache_kv_store1(e, pooled[i], KV);
+        return;
+    }
+    if ((d & 31u) != 0u) {
+        return;
+    }
+    float x[32];
+    for (uint j = 0u; j < 32u; ++j) {
+        x[j] = pooled[i + j];
+    }
+    idx_cache_kv_store_block(e, x, KV);
+}
+
+void main() {
+    const uint i = nf_global_id();
+    if (pc.n_new < 1 || pc.idx_dim < 1 || pc.kpool < 1 || pc.kv_rows < 1 || pc.first_pool < 0
+        || i >= uint(pc.n_new) * uint(pc.idx_dim)) {
+        return;
+    }
+    const uint idx_dim = uint(pc.idx_dim);
+    const uint j = i / idx_dim;
+    const uint d = i - j * idx_dim;
+    const uint kv_rows = uint(pc.kv_rows);
+    const uint row_width = uint(pc.row_width);
+    const uint pos0 = (uint(pc.first_pool) + j) * uint(pc.kpool);
+
+    if (pc.stage == NF_QSA_STAGE_STORE) {
+        const uint rep = (pos0 + uint(pc.kpool) - 1u) % kv_rows;
+        nf_qsa_store(rep * row_width + uint(pc.pooled_off) + d, i, d);
+        return;
+    }
+    if (pc.mode == NF_QSA_MODE_GATED) {
+        const uint gate_off = uint(pc.gate_off);
+        float mx = -NF_INF;
+        for (int k = 0; k < pc.kpool; k++) {
+            const uint r = (pos0 + uint(k)) % kv_rows;
+            const float x = nf_qsa_h(r * row_width + gate_off + d) + ape[uint(k) * idx_dim + d];
+            mx = max(mx, x);
+        }
+        float sum = 0.0;
+        for (int k = 0; k < pc.kpool; k++) {
+            const uint r = (pos0 + uint(k)) % kv_rows;
+            const float x = nf_qsa_h(r * row_width + gate_off + d) + ape[uint(k) * idx_dim + d];
+            sum += exp(x - mx);
+        }
+        const float inv = 1.0 / sum;
+        float acc = 0.0;
+        for (int k = 0; k < pc.kpool; k++) {
+            const uint r = (pos0 + uint(k)) % kv_rows;
+            const float x = nf_qsa_h(r * row_width + gate_off + d) + ape[uint(k) * idx_dim + d];
+            acc += (exp(x - mx) * inv) * nf_qsa_h(r * row_width + d);
+        }
+        pooled[i] = acc;
+    } else {
+        float acc = 0.0;
+        for (int k = 0; k < pc.kpool; k++) {
+            const uint r = (pos0 + uint(k)) % kv_rows;
+            acc += nf_qsa_h(r * row_width + d);
+        }
+        pooled[i] = acc * (1.0 / float(pc.kpool));
+    }
+}
+
+#elif OP == OP_QSA_KPOOL_SCORE
+
+layout(std430, binding = 0) readonly buffer NfQsaIq { float iq[]; };
+layout(std430, binding = 1) readonly buffer NfQsaW { float w_in[]; };
+NF_ATTN_KV_VIEWS(2, idx_cache)
+layout(std430, binding = 3) readonly buffer NfQsaQPos { int q_pos[]; };
+layout(std430, binding = 4) readonly buffer NfQsaKvPos { int kv_pos[]; };
+layout(std430, binding = 5) writeonly buffer NfQsaScores { float scores[]; };
+layout(push_constant) uniform NfQsaScoreParams {
+    int n_tokens;
+    int n_pool;
+    int n_idx_heads;
+    int idx_dim;
+    int kpool;
+    int row_width;
+    int pooled_off;
+    int kv_rows;
+    int has_w;
+    float w_scale;
+    int iq_off;
+    int w_off;
+} pc;
+
+shared float nf_qsa_qs[NF_QSA_QSTAGE];
+shared float nf_qsa_ws[NF_QSA_WSTAGE];
+
+vec4 nf_qsa_q4(uint i) {
+    return vec4(nf_qsa_qs[i], nf_qsa_qs[i + 1u], nf_qsa_qs[i + 2u], nf_qsa_qs[i + 3u]);
+}
+
+void main() {
+    /* Uniform per workgroup: push constants and the workgroup id only, before any barrier. */
+    if (pc.n_pool < 1 || pc.n_idx_heads < 1 || pc.idx_dim < 1 || pc.idx_dim > NF_QSA_QSTAGE || pc.kpool < 1
+        || pc.kv_rows < 1) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint n_pool = uint(pc.n_pool);
+    const uint nblk = (n_pool + lsize - 1u) / lsize;
+    const uint g = nf_wg_id();
+    const uint t = g / nblk;
+    if (t >= uint(pc.n_tokens)) {
+        return;
+    }
+    const uint pool = (g - t * nblk) * lsize + lid;
+    const uint n_heads = uint(pc.n_idx_heads);
+    const uint idx_dim = uint(pc.idx_dim);
+
+    bool vis = false;
+    uint krow = 0u;
+    if (pool < n_pool) {
+        const int e = (int(pool) + 1) * pc.kpool - 1;
+        const int r = e % pc.kv_rows;
+        vis = e <= q_pos[t] && kv_pos[r] == e;
+        krow = uint(r) * uint(pc.row_width) + uint(pc.pooled_off);
+    }
+    const uint kp = vis ? krow : 0u;
+    const uint qbase = uint(pc.iq_off) + t * n_heads * idx_dim;
+    const uint wbase = uint(pc.w_off) + t * n_heads;
+    const uint hs = min(uint(NF_QSA_WSTAGE), uint(NF_QSA_QSTAGE) / idx_dim);
+
+    float score = 0.0;
+    for (uint h0 = 0u; h0 < n_heads; h0 += hs) {
+        const uint nh = min(hs, n_heads - h0);
+        barrier();
+        for (uint i = lid; i < nh * idx_dim; i += lsize) {
+            nf_qsa_qs[i] = iq[qbase + h0 * idx_dim + i];
+        }
+        for (uint i = lid; i < nh; i += lsize) {
+            nf_qsa_ws[i] = (pc.has_w != 0 ? w_in[wbase + h0 + i] : 1.0) * pc.w_scale;
+        }
+        barrier();
+        if (vis) {
+            for (uint hg = 0u; hg < nh; hg += 4u) {
+                /* Heads past nh repeat the last head; their sums are computed and dropped. */
+                const uint q0 = hg * idx_dim;
+                const uint q1 = min(hg + 1u, nh - 1u) * idx_dim;
+                const uint q2 = min(hg + 2u, nh - 1u) * idx_dim;
+                const uint q3 = min(hg + 3u, nh - 1u) * idx_dim;
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                uint d = 0u;
+                for (; d + 4u <= idx_dim; d += 4u) {
+                    const vec4 k4 = idx_cache_load4(kp + d);
+                    a0 += dot(nf_qsa_q4(q0 + d), k4);
+                    a1 += dot(nf_qsa_q4(q1 + d), k4);
+                    a2 += dot(nf_qsa_q4(q2 + d), k4);
+                    a3 += dot(nf_qsa_q4(q3 + d), k4);
+                }
+                for (; d < idx_dim; ++d) {
+                    const float kd = idx_cache_load1(kp + d);
+                    a0 += nf_qsa_qs[q0 + d] * kd;
+                    a1 += nf_qsa_qs[q1 + d] * kd;
+                    a2 += nf_qsa_qs[q2 + d] * kd;
+                    a3 += nf_qsa_qs[q3 + d] * kd;
+                }
+                score += max(a0, 0.0) * nf_qsa_ws[hg];
+                if (hg + 1u < nh) {
+                    score += max(a1, 0.0) * nf_qsa_ws[hg + 1u];
+                }
+                if (hg + 2u < nh) {
+                    score += max(a2, 0.0) * nf_qsa_ws[hg + 2u];
+                }
+                if (hg + 3u < nh) {
+                    score += max(a3, 0.0) * nf_qsa_ws[hg + 3u];
+                }
+            }
+        }
+    }
+    if (pool < n_pool) {
+        scores[t * n_pool + pool] = vis ? score : -NF_INF;
+    }
+}
+
+#else
+#error "qsa.comp: OP must be OP_QSA_KPOOL_UPDATE or OP_QSA_KPOOL_SCORE"
+#endif

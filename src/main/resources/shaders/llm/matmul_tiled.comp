@@ -1,0 +1,142 @@
+/* matmul_tiled.comp - tiled GEMM (prefill projections) over a QT_DECODE_ELEM weight decoder.
+ * GLSL twin of NF_GEMM_TILED (kernels/llm/common/matmul_tiled_family.h, instantiated in kernels/llm/matmul_tiled.cl).
+ * Requires: common/nf_common.glsl, common/quant_blocks.glsl, common/iq_tables.glsl and the decoder
+ * file that serves QTYPE (dense F32/F16/BF16 decoders live in quant_blocks.glsl).
+ *
+ * A variants row selects QTYPE=QT_<T>; its kernel name is the OpenCL name, e.g.
+ *     Q4_K_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_Q4_K
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i M, i K, i N, i x_stride, i x_off, i y_stride, i y_off, R weight, R float x, W float y)
+ *   y[y_off + t*y_stride + r] = sum_{k < K} W[r][k] * x[x_off + t*x_stride + k],  r < M, t < N
+ * A weight row holds K / QT_BS blocks of QT_BB bytes; K is a multiple of QT_BS.
+ *
+ * Tiling equals the C family: a workgroup of 256 invocations computes 64 weight rows x 32 tokens
+ * in 16-deep stages; each stage dequantizes the 64 x 16 weight slice into shared floats through
+ * qt_elem and copies the 32 x 16 activation slice; invocation lid accumulates rows tx + 16*i
+ * (i < 4) and tokens ty + 16*j (j < 2), tx = lid % 16, ty = lid / 16, and loads depth lid % 16 of
+ * rows / tokens lid / 16 + 16*q. Out-of-range rows, tokens and depths load 0.
+ *
+ * Dispatch: 2-D (never folded), global = {ceil(M / 64) * 256, ceil(N / 32), 1}, local = {256, 1, 1}.
+ * Shared memory: 6272 bytes of tiles plus the IQ grid of the selected QTYPE (at most 8 KB).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#ifndef QTYPE
+#error "matmul_tiled.comp requires QTYPE"
+#endif
+
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfMmInput { float x_in[]; };
+layout(std430, binding = 2) writeonly buffer NfMmOutput { float y_out[]; };
+layout(push_constant) uniform NfMmParams {
+    int M; int K; int N; int x_stride; int x_off; int y_stride; int y_off;
+} pc;
+
+#include "common/quant_blocks.glsl"
+#include "common/iq_tables.glsl"
+#include "common/quant_legacy.glsl"
+#include "common/quant_k.glsl"
+#include "common/quant_iq.glsl"
+#include "common/quant_new.glsl"
+
+#if !defined(QT_DECODE_ELEM) || !defined(QT_BS) || !defined(QT_BB)
+#error "matmul_tiled.comp: no QT_DECODE_ELEM decoder serves QTYPE"
+#endif
+
+#define NF_GEMM_TM 64                          /* weight rows per workgroup tile */
+#define NF_GEMM_TN 32                          /* tokens per workgroup tile */
+#define NF_GEMM_TK 16                          /* reduction depth per shared-memory stage */
+#define NF_GEMM_RM 4                           /* rows per invocation */
+#define NF_GEMM_RN 2                           /* tokens per invocation */
+#define NF_GEMM_TX (NF_GEMM_TM / NF_GEMM_RM)   /* 16 row lanes */
+#define NF_GEMM_AS (NF_GEMM_TM + 1)            /* padded depth-row stride of the weight tile */
+#define NF_GEMM_BS (NF_GEMM_TN + 1)            /* padded depth-row stride of the activation tile */
+
+shared float nf_mm_a[NF_GEMM_TK * NF_GEMM_AS];
+shared float nf_mm_b[NF_GEMM_TK * NF_GEMM_BS];
+
+void main() {
+    nf_iq_init_shared();
+
+    const uint lid = gl_LocalInvocationID.x;
+    const int M = pc.M;
+    const int K = pc.K;
+    const int N = pc.N;
+    const int m0 = int(gl_WorkGroupID.x) * NF_GEMM_TM;
+    const int n0 = int(gl_WorkGroupID.y) * NF_GEMM_TN;
+    const uint tx = lid % uint(NF_GEMM_TX);
+    const uint ty = lid / uint(NF_GEMM_TX);
+    const uint lk = lid % uint(NF_GEMM_TK);
+    const uint lr = lid / uint(NF_GEMM_TK);
+    const uint row_bytes = uint(K / QT_BS) * uint(QT_BB);
+
+    uint wrow[NF_GEMM_RM];
+    bool wok[NF_GEMM_RM];
+    [[unroll]] for (int q = 0; q < NF_GEMM_RM; ++q) {
+        const int r = m0 + int(lr) + NF_GEMM_TX * q;
+        wok[q] = r < M;
+        wrow[q] = wok[q] ? uint(r) * row_bytes : 0u;
+    }
+    uint xrow[NF_GEMM_RN];
+    bool xok[NF_GEMM_RN];
+    [[unroll]] for (int q = 0; q < NF_GEMM_RN; ++q) {
+        const int t = n0 + int(lr) + NF_GEMM_TX * q;
+        xok[q] = t < N;
+        xrow[q] = uint(pc.x_off) + (xok[q] ? uint(t) * uint(pc.x_stride) : 0u);
+    }
+
+    float acc[NF_GEMM_RM][NF_GEMM_RN];
+    [[unroll]] for (int i = 0; i < NF_GEMM_RM; ++i) {
+        [[unroll]] for (int j = 0; j < NF_GEMM_RN; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (int k0 = 0; k0 < K; k0 += NF_GEMM_TK) {
+        const int k = k0 + int(lk);
+        const bool kok = k < K;
+        [[unroll]] for (int q = 0; q < NF_GEMM_RM; ++q) {
+            nf_mm_a[lk * uint(NF_GEMM_AS) + lr + uint(NF_GEMM_TX * q)] =
+                (wok[q] && kok) ? qt_elem(NF_WS_A, wrow[q], uint(k)) : 0.0;
+        }
+        [[unroll]] for (int q = 0; q < NF_GEMM_RN; ++q) {
+            nf_mm_b[lk * uint(NF_GEMM_BS) + lr + uint(NF_GEMM_TX * q)] =
+                (xok[q] && kok) ? x_in[xrow[q] + uint(k)] : 0.0;
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0u; kk < uint(NF_GEMM_TK); ++kk) {
+            float a[NF_GEMM_RM];
+            float b[NF_GEMM_RN];
+            [[unroll]] for (int i = 0; i < NF_GEMM_RM; ++i) {
+                a[i] = nf_mm_a[kk * uint(NF_GEMM_AS) + tx + uint(NF_GEMM_TX * i)];
+            }
+            [[unroll]] for (int j = 0; j < NF_GEMM_RN; ++j) {
+                b[j] = nf_mm_b[kk * uint(NF_GEMM_BS) + ty + uint(NF_GEMM_TX * j)];
+            }
+            [[unroll]] for (int i = 0; i < NF_GEMM_RM; ++i) {
+                [[unroll]] for (int j = 0; j < NF_GEMM_RN; ++j) {
+                    acc[i][j] += a[i] * b[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (int j = 0; j < NF_GEMM_RN; ++j) {
+        const int t = n0 + int(ty) + NF_GEMM_TX * j;
+        if (t >= N) {
+            continue;
+        }
+        const uint ybase = uint(pc.y_off) + uint(t) * uint(pc.y_stride);
+        [[unroll]] for (int i = 0; i < NF_GEMM_RM; ++i) {
+            const int r = m0 + int(tx) + NF_GEMM_TX * i;
+            if (r < M) {
+                y_out[ybase + uint(r)] = acc[i][j];
+            }
+        }
+    }
+}

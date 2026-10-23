@@ -1,0 +1,165 @@
+/* ml/forecast.comp - forecast-unit forward, gradient and update. GLSL twin of kernels/train/ml/forecast.cl
+ * (the semantic reference: arguments, formulas and dispatch are documented there). Requires:
+ * common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     ML_Forecast_Forward	ml/forecast.comp	OP=FC_FORWARD
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Accumulators and the update expressions are precise, so no implementation contracts them; multiply-add
+ * accumulations use an explicit fma, as in forecast.cl. The Huber clamp uses tr_jmax/tr_jmin, never GLSL
+ * clamp.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+/* Huber bound of the magnitude head's per-sample error (mirrors kernels/train/ml/forecast.cl). */
+#define FC_HUBER_DELTA 1.0
+
+#define FC_FORWARD  1
+#define FC_GRAD     2
+#define FC_UPDATE   3
+
+#ifndef OP
+#error "forecast.comp requires OP"
+#endif
+
+#if OP == FC_FORWARD
+layout(std430, binding = 0) restrict readonly buffer MlFcX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlFcDirW { float dir_w_f[]; };
+layout(std430, binding = 2) restrict readonly buffer MlFcDirB { float dir_b_f[]; };
+layout(std430, binding = 3) restrict readonly buffer MlFcMoveW { float move_w_f[]; };
+layout(std430, binding = 4) restrict readonly buffer MlFcMoveB { float move_b_f[]; };
+layout(std430, binding = 5) restrict writeonly buffer MlFcPredDir { float pred_dir_f[]; };
+layout(std430, binding = 6) restrict writeonly buffer MlFcPredMove { float pred_move_f[]; };
+layout(push_constant) uniform MlFcParams {
+    int n_samples;
+    int n_features;
+} pc;
+
+/* The stable logistic (see forecast.cl). */
+float ml_fc_sigmoid(const float z) {
+    if (z >= 0.0) {
+        precise float r = 1.0 / (1.0 + exp(-z));
+        return r;
+    }
+    const float e = exp(z);
+    precise float r = e / (1.0 + e);
+    return r;
+}
+
+#elif OP == FC_GRAD
+layout(std430, binding = 0) restrict readonly buffer MlFcX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlFcYDir { float y_dir_f[]; };
+layout(std430, binding = 2) restrict readonly buffer MlFcYMove { float y_move_f[]; };
+layout(std430, binding = 3) restrict readonly buffer MlFcSampleW { float sw_f[]; };
+layout(std430, binding = 4) restrict readonly buffer MlFcPredDir { float pred_dir_f[]; };
+layout(std430, binding = 5) restrict readonly buffer MlFcPredMove { float pred_move_f[]; };
+layout(std430, binding = 6) restrict writeonly buffer MlFcGradDirW { float g_dir_w_f[]; };
+layout(std430, binding = 7) restrict writeonly buffer MlFcGradDirB { float g_dir_b_f[]; };
+layout(std430, binding = 8) restrict writeonly buffer MlFcGradMoveW { float g_move_w_f[]; };
+layout(std430, binding = 9) restrict writeonly buffer MlFcGradMoveB { float g_move_b_f[]; };
+layout(push_constant) uniform MlFcParams {
+    int n_samples;
+    int n_features;
+} pc;
+
+/* Math.max(-FC_HUBER_DELTA, Math.min(FC_HUBER_DELTA, e)). */
+float ml_fc_huber(const float e) {
+    return tr_jmax(-FC_HUBER_DELTA, tr_jmin(FC_HUBER_DELTA, e));
+}
+
+#elif OP == FC_UPDATE
+layout(std430, binding = 0) restrict buffer MlFcDirW { float dir_w_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlFcGradDirW { float g_dir_w_f[]; };
+layout(std430, binding = 2) restrict buffer MlFcDirB { float dir_b_f[]; };
+layout(std430, binding = 3) restrict readonly buffer MlFcGradDirB { float g_dir_b_f[]; };
+layout(std430, binding = 4) restrict buffer MlFcMoveW { float move_w_f[]; };
+layout(std430, binding = 5) restrict readonly buffer MlFcGradMoveW { float g_move_w_f[]; };
+layout(std430, binding = 6) restrict buffer MlFcMoveB { float move_b_f[]; };
+layout(std430, binding = 7) restrict readonly buffer MlFcGradMoveB { float g_move_b_f[]; };
+layout(push_constant) uniform MlFcParams {
+    int n_features;
+    float learning_rate;
+    float l2;
+} pc;
+
+#else
+#error "forecast.comp: unknown OP"
+#endif
+
+void main() {
+#if OP == FC_FORWARD
+    const int i = tr_gid(pc.n_samples);
+    if (i < 0) {
+        return;
+    }
+    const int row = i * pc.n_features;
+    precise float zd = dir_b_f[0];
+    precise float zm = move_b_f[0];
+    for (int j = 0; j < pc.n_features; ++j) {
+        const float xi = x_f[row + j];
+        zd = fma(dir_w_f[j], xi, zd);
+        zm = fma(move_w_f[j], xi, zm);
+    }
+    pred_dir_f[i] = ml_fc_sigmoid(zd);
+    pred_move_f[i] = zm;
+
+#elif OP == FC_GRAD
+    const int j = tr_gid(pc.n_features);
+    if (j < 0) {
+        return;
+    }
+    const float count = float(pc.n_samples);
+    precise float sum_d = 0.0;
+    precise float sum_m = 0.0;
+    for (int i = 0; i < pc.n_samples; ++i) {
+        const float xi = x_f[i * pc.n_features + j];
+        const float sw = sw_f[i];
+        precise float ed = pred_dir_f[i] - y_dir_f[i];
+        precise float em = ml_fc_huber(pred_move_f[i] - y_move_f[i]);
+        precise float wd = sw * ed;
+        precise float wm = sw * em;
+        sum_d = fma(wd, xi, sum_d);
+        sum_m = fma(wm, xi, sum_m);
+    }
+    precise float gd = sum_d / count;
+    precise float gm = sum_m / count;
+    g_dir_w_f[j] = gd;
+    g_move_w_f[j] = gm;
+    if (j == 0) {
+        precise float bd = 0.0;
+        precise float bm = 0.0;
+        for (int i = 0; i < pc.n_samples; ++i) {
+            const float sw = sw_f[i];
+            precise float ed = pred_dir_f[i] - y_dir_f[i];
+            precise float em = ml_fc_huber(pred_move_f[i] - y_move_f[i]);
+            bd = fma(sw, ed, bd);
+            bm = fma(sw, em, bm);
+        }
+        precise float gbd = bd / count;
+        precise float gbm = bm / count;
+        g_dir_b_f[0] = gbd;
+        g_move_b_f[0] = gbm;
+    }
+
+#elif OP == FC_UPDATE
+    const int j = tr_gid(pc.n_features);
+    if (j < 0) {
+        return;
+    }
+    const float wd = dir_w_f[j];
+    const float wm = move_w_f[j];
+    precise float nwd = wd - pc.learning_rate * (g_dir_w_f[j] + pc.l2 * wd);
+    precise float nwm = wm - pc.learning_rate * (g_move_w_f[j] + pc.l2 * wm);
+    dir_w_f[j] = nwd;
+    move_w_f[j] = nwm;
+    if (j == 0) {
+        precise float nbd = dir_b_f[0] - pc.learning_rate * g_dir_b_f[0];
+        precise float nbm = move_b_f[0] - pc.learning_rate * g_move_b_f[0];
+        dir_b_f[0] = nbd;
+        move_b_f[0] = nbm;
+    }
+#endif
+}

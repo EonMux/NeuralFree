@@ -1,0 +1,179 @@
+/* ml/linear.comp - perceptron and logistic-regression forward, gradient and update. GLSL twin of
+ * kernels/train/ml/linear.cl (the semantic reference: arguments, formulas and dispatch are documented there).
+ * Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     ML_Perceptron_Forward	ml/linear.comp	OP=LIN_PERCEPTRON_FORWARD
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Accumulators and the update expressions are precise, so no implementation contracts them; multiply-add
+ * accumulations use an explicit fma, as in linear.cl.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define LIN_PERCEPTRON_FORWARD  1
+#define LIN_PERCEPTRON_GRAD     2
+#define LIN_PERCEPTRON_UPDATE   3
+#define LIN_LOGREG_FORWARD      4
+#define LIN_LOGREG_GRAD         5
+#define LIN_LOGREG_UPDATE       6
+
+#ifndef OP
+#error "linear.comp requires OP"
+#endif
+
+#if OP == LIN_PERCEPTRON_FORWARD || OP == LIN_LOGREG_FORWARD
+layout(std430, binding = 0) restrict readonly buffer MlLinX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlLinWeights { float weights_f[]; };
+layout(std430, binding = 2) restrict readonly buffer MlLinBias { float bias_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer MlLinPred { float pred_f[]; };
+layout(push_constant) uniform MlLinParams {
+    int n_samples;
+    int n_features;
+} pc;
+
+/* The stable logistic of ml/LogisticRegression.java sigmoid. */
+float ml_lin_sigmoid(const float z) {
+    if (z >= 0.0) {
+        precise float r = 1.0 / (1.0 + exp(-z));
+        return r;
+    }
+    const float e = exp(z);
+    precise float r = e / (1.0 + e);
+    return r;
+}
+
+#elif OP == LIN_PERCEPTRON_GRAD
+layout(std430, binding = 0) restrict readonly buffer MlLinX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlLinY { float y_f[]; };
+layout(std430, binding = 2) restrict readonly buffer MlLinSampleW { float sw_f[]; };
+layout(std430, binding = 3) restrict readonly buffer MlLinPred { float pred_f[]; };
+layout(std430, binding = 4) restrict writeonly buffer MlLinGradW { float gw_f[]; };
+layout(std430, binding = 5) restrict writeonly buffer MlLinGradB { float gb_f[]; };
+layout(push_constant) uniform MlLinParams {
+    int n_samples;
+    int n_features;
+} pc;
+
+#elif OP == LIN_LOGREG_GRAD
+layout(std430, binding = 0) restrict readonly buffer MlLinX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlLinY { float y_f[]; };
+layout(std430, binding = 2) restrict readonly buffer MlLinPred { float pred_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer MlLinGradW { float gw_f[]; };
+layout(std430, binding = 4) restrict writeonly buffer MlLinGradB { float gb_f[]; };
+layout(push_constant) uniform MlLinParams {
+    int n_samples;
+    int n_features;
+} pc;
+
+#elif OP == LIN_PERCEPTRON_UPDATE
+layout(std430, binding = 0) restrict buffer MlLinWeights { float weights_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlLinGradW { float gw_f[]; };
+layout(std430, binding = 2) restrict buffer MlLinBias { float bias_f[]; };
+layout(std430, binding = 3) restrict readonly buffer MlLinGradB { float gb_f[]; };
+layout(push_constant) uniform MlLinParams {
+    int n_features;
+    float learning_rate;
+    float l2;
+} pc;
+
+#elif OP == LIN_LOGREG_UPDATE
+layout(std430, binding = 0) restrict buffer MlLinWeights { float weights_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlLinGradW { float gw_f[]; };
+layout(std430, binding = 2) restrict buffer MlLinBias { float bias_f[]; };
+layout(std430, binding = 3) restrict readonly buffer MlLinGradB { float gb_f[]; };
+layout(std430, binding = 4) restrict writeonly buffer MlLinMaxGrad { float max_grad_f[]; };
+layout(push_constant) uniform MlLinParams {
+    int n_features;
+    float learning_rate;
+    float regularization;
+} pc;
+
+/* Java Math.abs(float): clears the sign bit (NaN stays NaN, -0 becomes +0). */
+float ml_lin_abs(const float x) {
+    return uintBitsToFloat(floatBitsToUint(x) & 0x7fffffffu);
+}
+
+#else
+#error "linear.comp: unknown OP"
+#endif
+
+void main() {
+#if OP == LIN_PERCEPTRON_FORWARD || OP == LIN_LOGREG_FORWARD
+    const int i = tr_gid(pc.n_samples);
+    if (i < 0) {
+        return;
+    }
+    const int row = i * pc.n_features;
+    precise float z = bias_f[0];
+    for (int j = 0; j < pc.n_features; ++j) {
+        z = fma(weights_f[j], x_f[row + j], z);
+    }
+    pred_f[i] = ml_lin_sigmoid(z);
+
+#elif OP == LIN_PERCEPTRON_GRAD || OP == LIN_LOGREG_GRAD
+    const int j = tr_gid(pc.n_features);
+    if (j < 0) {
+        return;
+    }
+    const float count = float(pc.n_samples);
+    precise float sum = 0.0;
+    for (int i = 0; i < pc.n_samples; ++i) {
+        precise float e = pred_f[i] - y_f[i];
+#if OP == LIN_PERCEPTRON_GRAD
+        precise float we = sw_f[i] * e;
+        sum = fma(we, x_f[i * pc.n_features + j], sum);
+#else
+        sum = fma(e, x_f[i * pc.n_features + j], sum);
+#endif
+    }
+    precise float gw = sum / count;
+    gw_f[j] = gw;
+    if (j == 0) {
+        precise float b = 0.0;
+        for (int i = 0; i < pc.n_samples; ++i) {
+            precise float e = pred_f[i] - y_f[i];
+#if OP == LIN_PERCEPTRON_GRAD
+            b = fma(sw_f[i], e, b);
+#else
+            b = b + e;
+#endif
+        }
+        precise float gb = b / count;
+        gb_f[0] = gb;
+    }
+
+#elif OP == LIN_PERCEPTRON_UPDATE
+    const int j = tr_gid(pc.n_features);
+    if (j < 0) {
+        return;
+    }
+    const float w = weights_f[j];
+    precise float nw = w - pc.learning_rate * (gw_f[j] + pc.l2 * w);
+    weights_f[j] = nw;
+    if (j == 0) {
+        precise float nb = bias_f[0] - pc.learning_rate * gb_f[0];
+        bias_f[0] = nb;
+    }
+
+#elif OP == LIN_LOGREG_UPDATE
+    const int lid = int(gl_LocalInvocationID.x);
+    float m = 0.0;
+    for (int j = lid; j < pc.n_features; j += TR_LOCAL) {
+        const float g = gw_f[j];
+        m = tr_jmax(m, ml_lin_abs(g));
+        const float w = weights_f[j];
+        precise float nw = w - pc.learning_rate * (g + pc.regularization * w);
+        weights_f[j] = nw;
+    }
+    m = tr_wg_max(m);
+    if (lid == 0) {
+        const float gb = gb_f[0];
+        max_grad_f[0] = tr_jmax(m, ml_lin_abs(gb));
+        precise float nb = bias_f[0] - pc.learning_rate * gb;
+        bias_f[0] = nb;
+    }
+#endif
+}

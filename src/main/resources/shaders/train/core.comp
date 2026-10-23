@@ -1,0 +1,183 @@
+/* core.comp - fill, copy, strided copy and dtype casts of the tensor runtime. GLSL twin of
+ * kernels/train/core.cl (the semantic reference: arguments, formulas and dispatch are documented there).
+ * Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     TR_Fill_F32	core.comp	OP=CORE_FILL_F32
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Buffers that only move or re-encode bits are declared as uint words, as in core.cl.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define CORE_FILL_F32          1
+#define CORE_COPY_F32          2
+#define CORE_COPY_STRIDED_F32  3
+#define CORE_CAST_I32_F32      4
+#define CORE_CAST_F32_I32      5
+#define CORE_CAST_BOOL_F32     6
+#define CORE_CAST_F32_BOOL     7
+#define CORE_CAST_F32_F16      8
+#define CORE_CAST_F16_F32      9
+#define CORE_CAST_F32_BF16    10
+#define CORE_CAST_BF16_F32    11
+#define CORE_CAST_I64_I32     12
+
+#ifndef OP
+#error "core.comp requires OP"
+#endif
+
+#if OP == CORE_FILL_F32
+layout(std430, binding = 0) restrict writeonly buffer TrCoreOut { float out_f[]; };
+layout(push_constant) uniform TrCoreParams {
+    int n;
+    float value;
+    int out_off;
+} pc;
+
+#elif OP == CORE_COPY_STRIDED_F32
+layout(std430, binding = 0) restrict readonly buffer TrCoreIn { uint in_u[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrCoreOut { uint out_u[]; };
+layout(push_constant) uniform TrCoreParams {
+    int n;
+    int rank;
+    int d0; int d1; int d2; int d3; int d4; int d5;
+    int is0; int is1; int is2; int is3; int is4; int is5;
+    int os0; int os1; int os2; int os3; int os4; int os5;
+    int in_off;
+    int out_off;
+} pc;
+
+#else
+/* Every other kernel: (i n, i in_off, i out_off, R in, W out); the offsets' units follow core.cl. */
+#if OP == CORE_COPY_F32 || OP == CORE_CAST_BOOL_F32 || OP == CORE_CAST_F32_BOOL || OP == CORE_CAST_F32_F16 \
+    || OP == CORE_CAST_F16_F32 || OP == CORE_CAST_F32_BF16 || OP == CORE_CAST_BF16_F32 || OP == CORE_CAST_I64_I32
+layout(std430, binding = 0) restrict readonly buffer TrCoreIn { uint in_u[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrCoreOut { uint out_u[]; };
+#elif OP == CORE_CAST_I32_F32
+layout(std430, binding = 0) restrict readonly buffer TrCoreIn { int in_i[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrCoreOut { float out_f[]; };
+#elif OP == CORE_CAST_F32_I32
+layout(std430, binding = 0) restrict readonly buffer TrCoreIn { float in_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrCoreOut { int out_i[]; };
+#else
+#error "core.comp: unknown OP"
+#endif
+layout(push_constant) uniform TrCoreParams {
+    int n;
+    int in_off;
+    int out_off;
+} pc;
+#endif
+
+void main() {
+#if OP == CORE_FILL_F32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    out_f[pc.out_off + i] = pc.value;
+
+#elif OP == CORE_COPY_F32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    out_u[pc.out_off + i] = in_u[pc.in_off + i];
+
+#elif OP == CORE_COPY_STRIDED_F32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int d[TR_MAX_RANK] = int[TR_MAX_RANK](pc.d0, pc.d1, pc.d2, pc.d3, pc.d4, pc.d5);
+    const int is_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.is0, pc.is1, pc.is2, pc.is3, pc.is4, pc.is5);
+    const int os_[TR_MAX_RANK] = int[TR_MAX_RANK](pc.os0, pc.os1, pc.os2, pc.os3, pc.os4, pc.os5);
+    out_u[pc.out_off + tr_coord_offset(i, pc.rank, d, os_)] = in_u[pc.in_off + tr_coord_offset(i, pc.rank, d, is_)];
+
+#elif OP == CORE_CAST_I32_F32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    out_f[pc.out_off + i] = float(in_i[pc.in_off + i]);
+
+#elif OP == CORE_CAST_F32_I32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const float x = in_f[pc.in_off + i];
+    int r;
+    if (tr_isnan(x)) {
+        r = 0;
+    } else if (x >= 2147483648.0) {
+        r = 2147483647;
+    } else if (x <= -2147483648.0) {
+        r = (-2147483647 - 1);
+    } else {
+        r = int(x);
+    }
+    out_i[pc.out_off + i] = r;
+
+#elif OP == CORE_CAST_BOOL_F32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int p = pc.in_off + i;
+    out_u[pc.out_off + i] = tr_word_byte(in_u[p >> 2], p) != 0u ? 0x3f800000u : 0u;   /* 1.0 : +0.0 */
+
+#elif OP == CORE_CAST_F32_BOOL
+    const int words = int((uint(pc.n) + 3u) >> 2);
+    const int w = tr_gid(words);
+    if (w < 0) {
+        return;
+    }
+    uint word = 0u;
+    for (int b = 0; b < 4; ++b) {
+        const int e = 4 * w + b;
+        if (e < pc.n && (in_u[pc.in_off + e] & 0x7fffffffu) != 0u) {
+            word |= 1u << uint(8 * b);
+        }
+    }
+    out_u[(pc.out_off >> 2) + w] = word;
+
+#elif OP == CORE_CAST_F32_F16 || OP == CORE_CAST_F32_BF16
+    const int words = int((uint(pc.n) + 1u) >> 1);
+    const int w = tr_gid(words);
+    if (w < 0) {
+        return;
+    }
+    const int e = 2 * w;
+#if OP == CORE_CAST_F32_F16
+    const uint lo = tr_f32_to_f16_bits(in_u[pc.in_off + e]);
+    const uint hi = e + 1 < pc.n ? tr_f32_to_f16_bits(in_u[pc.in_off + e + 1]) : 0u;
+#else
+    const uint lo = tr_f32_to_bf16_bits(in_u[pc.in_off + e]);
+    const uint hi = e + 1 < pc.n ? tr_f32_to_bf16_bits(in_u[pc.in_off + e + 1]) : 0u;
+#endif
+    out_u[(pc.out_off >> 1) + w] = lo | (hi << 16);
+
+#elif OP == CORE_CAST_F16_F32 || OP == CORE_CAST_BF16_F32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int p = pc.in_off + i;
+#if OP == CORE_CAST_F16_F32
+    out_u[pc.out_off + i] = tr_f16_bits_to_f32(tr_word_half(in_u[p >> 1], p));
+#else
+    out_u[pc.out_off + i] = tr_bf16_bits_to_f32(tr_word_half(in_u[p >> 1], p));
+#endif
+
+#elif OP == CORE_CAST_I64_I32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    out_u[pc.out_off + i] = in_u[2u * uint(pc.in_off + i)];
+#endif
+}

@@ -1,0 +1,195 @@
+/* gemm.comp - strided batched GEMM and GEMV. GLSL twin of kernels/train/gemm.cl (the semantic reference:
+ * arguments, formulas, accumulation order and dispatch are documented there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name:
+ *     TR_Gemm_F32	gemm.comp	OP=GEMM_F32
+ *     TR_Gemv_F32	gemm.comp	OP=GEMV_F32
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * C and y are read (beta != 0) and written, so they are neither readonly nor writeonly.
+ *
+ * TR_Gemm_F32 is the only multi-dimensional train dispatch: global = {ceil(N/64)*16, ceil(M/64)*16, batch},
+ * local = {16, 16, 1}, never folded, with every group count inside the device limits (the host guarantees
+ * it), so it reads gl_WorkGroupID and gl_LocalInvocationID directly. TR_Gemv_F32 is a 1-D rows dispatch and
+ * takes its row from nf_wg_id(), so a folded group count is harmless.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define GEMM_F32 1
+#define GEMV_F32 2
+
+#ifndef OP
+#error "gemm.comp requires OP"
+#endif
+
+#if OP == GEMM_F32
+layout(std430, binding = 0) restrict readonly buffer TrGemmA { float a_buf[]; };
+layout(std430, binding = 1) restrict readonly buffer TrGemmB { float b_buf[]; };
+layout(std430, binding = 2) restrict buffer TrGemmC { float c_buf[]; };
+layout(push_constant) uniform TrGemmParams {
+    int M;
+    int N;
+    int K;
+    int batch;
+    int a_off;
+    int a_rs;
+    int a_cs;
+    int a_bs;
+    int b_off;
+    int b_rs;
+    int b_cs;
+    int b_bs;
+    int c_off;
+    int c_rs;
+    int c_bs;
+    float alpha;
+    float beta;
+} pc;
+
+#define TR_GM_TILE  64                  /* rows and columns of one workgroup tile */
+#define TR_GM_TK    16                  /* reduction depth of one shared-memory stage */
+#define TR_GM_LX    16                  /* invocations per tile dimension (local size {16, 16, 1}) */
+#define TR_GM_RB    4                   /* outputs per invocation in each tile dimension (64 / 16) */
+#define TR_GM_PAD   (TR_GM_TILE + 1)    /* padded stride of one depth row of a staged slice */
+
+shared float tr_gm_a[TR_GM_TK * TR_GM_PAD];    /* tr_gm_a[kk * PAD + mm] = A(b, m0 + mm, k0 + kk) */
+shared float tr_gm_b[TR_GM_TK * TR_GM_PAD];    /* tr_gm_b[kk * PAD + nn] = B(b, k0 + kk, n0 + nn) */
+
+#elif OP == GEMV_F32
+layout(std430, binding = 0) restrict readonly buffer TrGemvA { float a_buf[]; };
+layout(std430, binding = 1) restrict readonly buffer TrGemvX { float x_buf[]; };
+layout(std430, binding = 2) restrict buffer TrGemvY { float y_buf[]; };
+layout(push_constant) uniform TrGemvParams {
+    int M;
+    int K;
+    int a_off;
+    int a_rs;
+    int a_cs;
+    int x_off;
+    int x_s;
+    int y_off;
+    float alpha;
+    float beta;
+} pc;
+
+#else
+#error "gemm.comp: unknown OP"
+#endif
+
+void main() {
+#if OP == GEMM_F32
+    const int bi = int(gl_WorkGroupID.z);
+    if (bi >= pc.batch) {
+        return;                                     /* uniform per group */
+    }
+    const int M = pc.M;
+    const int N = pc.N;
+    const int K = pc.K;
+    const int tx = int(gl_LocalInvocationID.x);
+    const int ty = int(gl_LocalInvocationID.y);
+    const int lid = ty * TR_GM_LX + tx;
+    const int n0 = int(gl_WorkGroupID.x) * TR_GM_TILE;
+    const int m0 = int(gl_WorkGroupID.y) * TR_GM_TILE;
+    const int a_base = pc.a_off + bi * pc.a_bs;
+    const int b_base = pc.b_off + bi * pc.b_bs;
+    const bool a_m_fast = pc.a_cs != 1 && pc.a_rs == 1;
+    const bool b_k_fast = pc.b_cs != 1 && pc.b_rs == 1;
+    const int stages = K > 0 ? (K - 1) / TR_GM_TK + 1 : 0;
+
+    precise float acc[TR_GM_RB * TR_GM_RB];
+    [[unroll]] for (int t = 0; t < TR_GM_RB * TR_GM_RB; ++t) {
+        acc[t] = 0.0;
+    }
+
+    for (int st = 0; st < stages; ++st) {
+        const int k0 = st * TR_GM_TK;
+        [[unroll]] for (int q = 0; q < TR_GM_RB; ++q) {
+            const int e = lid + q * (TR_GM_LX * TR_GM_LX);
+            const int a_mm = a_m_fast ? (e % TR_GM_TILE) : (e / TR_GM_TK);
+            const int a_kk = a_m_fast ? (e / TR_GM_TILE) : (e % TR_GM_TK);
+            const int am = m0 + a_mm;
+            const int ak = k0 + a_kk;
+            float av = 0.0;
+            if (am < M && ak < K) {
+                av = a_buf[a_base + am * pc.a_rs + ak * pc.a_cs];
+            }
+            tr_gm_a[a_kk * TR_GM_PAD + a_mm] = av;
+
+            const int b_nn = b_k_fast ? (e / TR_GM_TK) : (e % TR_GM_TILE);
+            const int b_kk = b_k_fast ? (e % TR_GM_TK) : (e / TR_GM_TILE);
+            const int bn = n0 + b_nn;
+            const int bk = k0 + b_kk;
+            float bv = 0.0;
+            if (bn < N && bk < K) {
+                bv = b_buf[b_base + bk * pc.b_rs + bn * pc.b_cs];
+            }
+            tr_gm_b[b_kk * TR_GM_PAD + b_nn] = bv;
+        }
+        barrier();
+        const int depth = min(K - k0, TR_GM_TK);
+        for (int kk = 0; kk < depth; ++kk) {
+            float a[TR_GM_RB];
+            float b[TR_GM_RB];
+            [[unroll]] for (int i = 0; i < TR_GM_RB; ++i) {
+                a[i] = tr_gm_a[kk * TR_GM_PAD + ty + TR_GM_LX * i];
+            }
+            [[unroll]] for (int j = 0; j < TR_GM_RB; ++j) {
+                b[j] = tr_gm_b[kk * TR_GM_PAD + tx + TR_GM_LX * j];
+            }
+            [[unroll]] for (int i = 0; i < TR_GM_RB; ++i) {
+                [[unroll]] for (int j = 0; j < TR_GM_RB; ++j) {
+                    acc[i * TR_GM_RB + j] = fma(a[i], b[j], acc[i * TR_GM_RB + j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    const int c_base = pc.c_off + bi * pc.c_bs;
+    [[unroll]] for (int i = 0; i < TR_GM_RB; ++i) {
+        const int m = m0 + ty + TR_GM_LX * i;
+        if (m >= M) {
+            continue;
+        }
+        [[unroll]] for (int j = 0; j < TR_GM_RB; ++j) {
+            const int n = n0 + tx + TR_GM_LX * j;
+            if (n >= N) {
+                continue;
+            }
+            const int idx = c_base + m * pc.c_rs + n;
+            precise float r = pc.alpha * acc[i * TR_GM_RB + j];
+            if (pc.beta != 0.0) {
+                precise float bc = pc.beta * c_buf[idx];
+                r = r + bc;
+            }
+            c_buf[idx] = r;
+        }
+    }
+
+#elif OP == GEMV_F32
+    const int row = int(nf_wg_id());
+    if (row >= pc.M) {
+        return;                                     /* uniform per group */
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int a_row = pc.a_off + row * pc.a_rs;
+    precise float s = 0.0;
+    /* uint counter: k + TR_LOCAL cannot overflow for any K <= 2^31-1. */
+    for (uint k = uint(lid); k < uint(pc.K); k += uint(TR_LOCAL)) {
+        const int ki = int(k);
+        s = fma(a_buf[a_row + ki * pc.a_cs], x_buf[pc.x_off + ki * pc.x_s], s);
+    }
+    const float total = tr_wg_sum(s);
+    if (lid == 0) {
+        const int idx = pc.y_off + row;
+        precise float r = pc.alpha * total;
+        if (pc.beta != 0.0) {
+            precise float by = pc.beta * y_buf[idx];
+            r = r + by;
+        }
+        y_buf[idx] = r;
+    }
+#endif
+}

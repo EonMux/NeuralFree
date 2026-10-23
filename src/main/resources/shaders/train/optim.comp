@@ -1,0 +1,354 @@
+/* optim.comp - optimizer steps, gradient-norm clipping and loss-scale unscaling. GLSL twin of
+ * kernels/train/optim.cl (the semantic reference: arguments, formulas, CPU citations and dispatch are
+ * documented there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     TR_AdamStep_F32	optim.comp	OP=OPTIM_ADAM_STEP
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Input-only buffers are readonly. No buffer is restrict: steps run in place, and norms/coef may share one
+ * buffer at disjoint offsets. Every float temporary is precise, so no product is contracted into a fused
+ * multiply-add and each operation rounds once, as in Java.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+/* Operation ids, identical to optim.cl. */
+#define TR_ADAM_MODE_ADAM  0
+#define TR_ADAM_MODE_ADAMW 1
+
+/* Variant selectors (OP define of a variants row). */
+#define OPTIM_SGD_STEP         1
+#define OPTIM_ADAM_STEP        2
+#define OPTIM_RMSPROP_STEP     3
+#define OPTIM_ADAGRAD_STEP     4
+#define OPTIM_LAMB_UPDATE      5
+#define OPTIM_LAMB_APPLY       6
+#define OPTIM_GRAD_NORM_COEF   7
+#define OPTIM_SCALE_BY_DEVICE  8
+#define OPTIM_UNSCALE_CHECK    9
+
+#ifndef OP
+#error "optim.comp requires OP"
+#endif
+
+/* Java Float.isFinite negated, decided on the bit pattern (exponent all ones: NaN or infinity). */
+bool tr_optim_nonfinite(const float x) {
+    return (floatBitsToUint(x) & 0x7f800000u) == 0x7f800000u;
+}
+
+/* Java x > 0f for a value that may be NaN (NaN compares false). */
+bool tr_optim_positive(const float x) {
+    return !tr_isnan(x) && x > 0.0;
+}
+
+#if OP == OPTIM_SGD_STEP
+layout(std430, binding = 0) buffer TrOptimP { float p_[]; };
+layout(std430, binding = 1) readonly buffer TrOptimG { float g_[]; };
+layout(std430, binding = 2) buffer TrOptimV { float v_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    float lr;
+    float momentum;
+    float weight_decay;
+    int nesterov;
+    int has_momentum;
+    int p_off;
+    int g_off;
+    int v_off;
+} pc;
+
+#elif OP == OPTIM_ADAM_STEP
+layout(std430, binding = 0) buffer TrOptimP { float p_[]; };
+layout(std430, binding = 1) readonly buffer TrOptimG { float g_[]; };
+layout(std430, binding = 2) buffer TrOptimM { float m_[]; };
+layout(std430, binding = 3) buffer TrOptimV { float v_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    int mode;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bc1;
+    float bc2;
+    int p_off;
+    int g_off;
+    int m_off;
+    int v_off;
+} pc;
+
+#elif OP == OPTIM_RMSPROP_STEP
+layout(std430, binding = 0) buffer TrOptimP { float p_[]; };
+layout(std430, binding = 1) readonly buffer TrOptimG { float g_[]; };
+layout(std430, binding = 2) buffer TrOptimSq { float sq_[]; };
+layout(std430, binding = 3) buffer TrOptimBuf { float buf_[]; };
+layout(std430, binding = 4) buffer TrOptimGavg { float gavg_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    float lr;
+    float alpha;
+    float eps;
+    float weight_decay;
+    float momentum;
+    int centered;
+    int has_momentum;
+    int p_off;
+    int g_off;
+    int sq_off;
+    int buf_off;
+    int gavg_off;
+} pc;
+
+#elif OP == OPTIM_ADAGRAD_STEP
+layout(std430, binding = 0) buffer TrOptimP { float p_[]; };
+layout(std430, binding = 1) readonly buffer TrOptimG { float g_[]; };
+layout(std430, binding = 2) buffer TrOptimAcc { float acc_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    float clr;
+    float eps;
+    float weight_decay;
+    int p_off;
+    int g_off;
+    int acc_off;
+} pc;
+
+#elif OP == OPTIM_LAMB_UPDATE
+layout(std430, binding = 0) readonly buffer TrOptimP { float p_[]; };
+layout(std430, binding = 1) readonly buffer TrOptimG { float g_[]; };
+layout(std430, binding = 2) buffer TrOptimM { float m_[]; };
+layout(std430, binding = 3) buffer TrOptimV { float v_[]; };
+layout(std430, binding = 4) writeonly buffer TrOptimU { float u_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bc1;
+    float bc2;
+    int p_off;
+    int g_off;
+    int m_off;
+    int v_off;
+    int u_off;
+} pc;
+
+#elif OP == OPTIM_LAMB_APPLY
+layout(std430, binding = 0) buffer TrOptimP { float p_[]; };
+layout(std430, binding = 1) readonly buffer TrOptimU { float u_[]; };
+layout(std430, binding = 2) readonly buffer TrOptimNorms { float norms_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    float lr;
+    float eps;
+    int p_off;
+    int u_off;
+    int norms_off;
+} pc;
+
+#elif OP == OPTIM_GRAD_NORM_COEF
+layout(std430, binding = 0) readonly buffer TrOptimNorms { float norms_[]; };
+layout(std430, binding = 1) writeonly buffer TrOptimCoef { float coef_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int count;
+    float max_norm;
+    int norms_off;
+    int coef_off;
+} pc;
+
+#elif OP == OPTIM_SCALE_BY_DEVICE
+layout(std430, binding = 0) buffer TrOptimX { float x_[]; };
+layout(std430, binding = 1) readonly buffer TrOptimCoef { float coef_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    int x_off;
+    int coef_off;
+} pc;
+
+#elif OP == OPTIM_UNSCALE_CHECK
+layout(std430, binding = 0) buffer TrOptimG { float g_[]; };
+layout(std430, binding = 1) writeonly buffer TrOptimFlag { int flag_[]; };
+layout(push_constant) uniform TrOptimParams {
+    int n;
+    float inv_scale;
+    int g_off;
+    int flag_off;
+} pc;
+
+#else
+#error "optim.comp: unknown OP"
+#endif
+
+void main() {
+#if OP == OPTIM_SGD_STEP
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise const float pi = p_[pc.p_off + i];
+    precise float gi = g_[pc.g_off + i];
+    if (pc.weight_decay != 0.0) {
+        gi = gi + pc.weight_decay * pi;
+    }
+    if (pc.has_momentum != 0) {
+        precise const float vi = pc.momentum * v_[pc.v_off + i] + gi;
+        v_[pc.v_off + i] = vi;
+        if (pc.nesterov != 0) {
+            precise const float r = pi - pc.lr * (pc.momentum * vi + gi);
+            p_[pc.p_off + i] = r;
+        } else {
+            precise const float r = pi - pc.lr * vi;
+            p_[pc.p_off + i] = r;
+        }
+    } else {
+        precise const float r = pi - pc.lr * gi;
+        p_[pc.p_off + i] = r;
+    }
+
+#elif OP == OPTIM_ADAM_STEP
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise float pi = p_[pc.p_off + i];
+    precise float gi = g_[pc.g_off + i];
+    if (pc.weight_decay != 0.0) {
+        if (pc.mode == TR_ADAM_MODE_ADAMW) {
+            pi = pi - pc.lr * pc.weight_decay * pi;
+        } else {
+            gi = gi + pc.weight_decay * pi;
+        }
+    }
+    precise const float mi = pc.beta1 * m_[pc.m_off + i] + (1.0 - pc.beta1) * gi;
+    precise const float vi = pc.beta2 * v_[pc.v_off + i] + (1.0 - pc.beta2) * gi * gi;
+    m_[pc.m_off + i] = mi;
+    v_[pc.v_off + i] = vi;
+    precise const float step_size = pc.lr / pc.bc1;
+    precise const float v_hat = vi / pc.bc2;
+    precise const float r = pi - step_size * mi / (sqrt(v_hat) + pc.eps);
+    p_[pc.p_off + i] = r;
+
+#elif OP == OPTIM_RMSPROP_STEP
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise const float pi = p_[pc.p_off + i];
+    precise float gi = g_[pc.g_off + i];
+    if (pc.weight_decay != 0.0) {
+        gi = gi + pc.weight_decay * pi;
+    }
+    precise float denom_sq;
+    if (pc.centered != 0) {
+        precise const float ai = pc.alpha * gavg_[pc.gavg_off + i] + (1.0 - pc.alpha) * gi;
+        gavg_[pc.gavg_off + i] = ai;
+        precise const float si = pc.alpha * sq_[pc.sq_off + i] + (1.0 - pc.alpha) * gi * gi;
+        sq_[pc.sq_off + i] = si;
+        denom_sq = si - ai * ai;
+    } else {
+        precise const float si = pc.alpha * sq_[pc.sq_off + i] + (1.0 - pc.alpha) * gi * gi;
+        sq_[pc.sq_off + i] = si;
+        denom_sq = si;
+    }
+    precise const float update = gi / (sqrt(denom_sq) + pc.eps);
+    if (pc.has_momentum != 0) {
+        precise const float bi = pc.momentum * buf_[pc.buf_off + i] + update;
+        buf_[pc.buf_off + i] = bi;
+        precise const float r = pi - pc.lr * bi;
+        p_[pc.p_off + i] = r;
+    } else {
+        precise const float r = pi - pc.lr * update;
+        p_[pc.p_off + i] = r;
+    }
+
+#elif OP == OPTIM_ADAGRAD_STEP
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise const float pi = p_[pc.p_off + i];
+    precise float gi = g_[pc.g_off + i];
+    if (pc.weight_decay != 0.0) {
+        gi = gi + pc.weight_decay * pi;
+    }
+    precise const float ai = acc_[pc.acc_off + i] + gi * gi;
+    acc_[pc.acc_off + i] = ai;
+    precise const float r = pi - pc.clr * gi / (sqrt(ai) + pc.eps);
+    p_[pc.p_off + i] = r;
+
+#elif OP == OPTIM_LAMB_UPDATE
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise const float gi = g_[pc.g_off + i];
+    precise const float mi = pc.beta1 * m_[pc.m_off + i] + (1.0 - pc.beta1) * gi;
+    precise const float vi = pc.beta2 * v_[pc.v_off + i] + (1.0 - pc.beta2) * gi * gi;
+    m_[pc.m_off + i] = mi;
+    v_[pc.v_off + i] = vi;
+    precise const float m_hat = mi / pc.bc1;
+    precise const float v_hat = vi / pc.bc2;
+    precise float r = m_hat / (sqrt(v_hat) + pc.eps);
+    if (pc.weight_decay != 0.0) {
+        r = r + pc.weight_decay * p_[pc.p_off + i];
+    }
+    u_[pc.u_off + i] = r;
+
+#elif OP == OPTIM_LAMB_APPLY
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise const float weight_norm = sqrt(norms_[pc.norms_off]);
+    precise const float update_norm = sqrt(norms_[pc.norms_off + 1]);
+    precise float trust = 1.0;
+    if (tr_optim_positive(weight_norm) && tr_optim_positive(update_norm)) {
+        trust = weight_norm / (update_norm + pc.eps);
+    }
+    precise const float r = p_[pc.p_off + i] - pc.lr * trust * u_[pc.u_off + i];
+    p_[pc.p_off + i] = r;
+
+#elif OP == OPTIM_GRAD_NORM_COEF
+    if (tr_gid(1) < 0) {
+        return;
+    }
+    precise float sum = 0.0;
+    for (int k = 0; k < pc.count; ++k) {
+        sum = sum + norms_[pc.norms_off + k];
+    }
+    precise const float total = sqrt(sum);
+    precise float c = 1.0;
+    if (!tr_isnan(total) && total > pc.max_norm) {
+        c = pc.max_norm / (total + 1e-6);
+    }
+    coef_[pc.coef_off] = c;
+    coef_[pc.coef_off + 1] = total;
+
+#elif OP == OPTIM_SCALE_BY_DEVICE
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const float c = coef_[pc.coef_off];
+    if (c == 1.0) {
+        return;
+    }
+    precise const float r = x_[pc.x_off + i] * c;
+    x_[pc.x_off + i] = r;
+
+#elif OP == OPTIM_UNSCALE_CHECK
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    precise const float r = g_[pc.g_off + i] * pc.inv_scale;
+    g_[pc.g_off + i] = r;
+    if (tr_optim_nonfinite(r)) {
+        flag_[pc.flag_off] = 1;
+    }
+#endif
+}
