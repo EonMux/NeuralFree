@@ -1,0 +1,14 @@
+/*
+ * Build logic of the GPU kernel build (gradle/gpu-kernels.gradle): the helper classes of package neuralfree.gpu
+ * under src/main/groovy. They depend only on the Gradle API and Gradle's own Groovy, so this build needs no
+ * repository and works offline.
+ */
+
+plugins {
+    id 'groovy'
+}
+
+dependencies {
+    implementation gradleApi()
+    implementation localGroovy()
+}

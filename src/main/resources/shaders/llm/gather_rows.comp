@@ -1,0 +1,41 @@
+/* gather_rows.comp - LLM_GatherRows row selection. GLSL twin of kernels/llm/flow.cl (the semantic reference).
+ * Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_rows, i row_len, i src_stride, i dst_stride, i src_off, i dst_off, R int rows, R float src, W float dst)
+ *   dst[dst_off + r*dst_stride + c] = rows[r] >= 0 ? src[src_off + rows[r]*src_stride + c] : 0,
+ *   r < n_rows, c < row_len. Offsets and strides are in float elements.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n_rows*row_len invocations rounded up to L; folded group
+ * counts are recovered by nf_global_id(). Every binding stays below maxStorageBufferRange, so 32-bit
+ * index arithmetic is exact.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) restrict readonly buffer NfGatherRows { int rows_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfGatherSrc { float src_in[]; };
+layout(std430, binding = 2) restrict writeonly buffer NfGatherDst { float dst_out[]; };
+
+layout(push_constant) uniform NfGatherParams {
+    int n_rows;
+    int row_len;
+    int src_stride;
+    int dst_stride;
+    int src_off;
+    int dst_off;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (pc.row_len <= 0 || idx >= uint(pc.n_rows) * uint(pc.row_len)) {
+        return;
+    }
+    const uint r = idx / uint(pc.row_len);
+    const uint c = idx - r * uint(pc.row_len);
+    const int s = rows_in[r];
+    dst_out[uint(pc.dst_off) + r * uint(pc.dst_stride) + c] =
+            s >= 0 ? src_in[uint(pc.src_off) + uint(s) * uint(pc.src_stride) + c] : 0.0;
+}

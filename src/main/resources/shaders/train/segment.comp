@@ -1,0 +1,138 @@
+/* segment.comp - CSR segment reductions for graph aggregation and their backward. GLSL twin of
+ * kernels/train/segment.cl (the semantic reference: arguments, formulas and dispatch are documented there).
+ * Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<kernel>; its kernel name is the OpenCL name:
+ *     TR_SegmentReduce_F32	segment.comp	OP=SEGMENT_REDUCE_F32
+ *     TR_SegmentReduceBackward_F32	segment.comp	OP=SEG_REDUCE_BWD
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+/* Segment op ids, identical to segment.cl. */
+#define TR_SEG_SUM  0
+#define TR_SEG_MEAN 1
+#define TR_SEG_MAX  2
+
+#define SEGMENT_REDUCE_F32  1
+#define SEG_REDUCE_BWD      2
+
+#ifndef OP
+#error "segment.comp requires OP"
+#endif
+
+#if OP == SEGMENT_REDUCE_F32
+layout(std430, binding = 0) restrict readonly buffer TrSegPtr { int ptr_i[]; };
+layout(std430, binding = 1) restrict readonly buffer TrSegEid { int eid_i[]; };
+layout(std430, binding = 2) restrict readonly buffer TrSegSrc { float src_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrSegOut { float out_f[]; };
+layout(push_constant) uniform TrSegParams {
+    int op;
+    int nodes;
+    int feat;
+    float empty;
+    int ptr_off;
+    int eid_off;
+    int src_off;
+    int out_off;
+} pc;
+
+#elif OP == SEG_REDUCE_BWD
+layout(std430, binding = 0) restrict readonly buffer TrSegPtr { int ptr_i[]; };
+layout(std430, binding = 1) restrict readonly buffer TrSegEid { int eid_i[]; };
+layout(std430, binding = 2) restrict readonly buffer TrSegSrc { float src_f[]; };
+layout(std430, binding = 3) restrict readonly buffer TrSegOut { float out_f[]; };
+layout(std430, binding = 4) restrict readonly buffer TrSegGy { float gy_f[]; };
+layout(std430, binding = 5) restrict writeonly buffer TrSegGx { float gx_f[]; };
+layout(push_constant) uniform TrSegParams {
+    int op;
+    int nodes;
+    int feat;
+    int ptr_off;
+    int eid_off;
+    int src_off;
+    int out_off;
+    int gy_off;
+    int gx_off;
+} pc;
+
+/* Java a == b for floats: false when either is NaN, true for -0 == +0, otherwise bit equality. */
+bool tr_s_same(const float a, const float b) {
+    if (tr_isnan(a) || tr_isnan(b)) {
+        return false;
+    }
+    if (tr_iszero(a) && tr_iszero(b)) {
+        return true;
+    }
+    return floatBitsToUint(a) == floatBitsToUint(b);
+}
+
+#else
+#error "segment.comp: unknown OP"
+#endif
+
+void main() {
+#if OP == SEG_REDUCE_BWD
+    const int i = pc.feat > 0 ? tr_gid(pc.nodes * pc.feat) : -1;
+    if (i < 0) {
+        return;
+    }
+    const int node = i / pc.feat;
+    const int f = i - node * pc.feat;
+    const int e0 = ptr_i[pc.ptr_off + node];
+    const int e1 = ptr_i[pc.ptr_off + node + 1];
+    if (e1 <= e0) {
+        return;
+    }
+    const float g = gy_f[pc.gy_off + i];
+    if (pc.op == TR_SEG_MAX) {
+        const float m = out_f[pc.out_off + i];
+        for (int e = e0; e < e1; ++e) {
+            const int r = eid_i[pc.eid_off + e] * pc.feat + f;
+            if (tr_s_same(src_f[pc.src_off + r], m)) {
+                gx_f[pc.gx_off + r] = g;
+                break;
+            }
+        }
+    } else {
+        precise float mean = g / float(e1 - e0);
+        const float v = pc.op == TR_SEG_MEAN ? mean : g;
+        for (int e = e0; e < e1; ++e) {
+            gx_f[pc.gx_off + eid_i[pc.eid_off + e] * pc.feat + f] = v;
+        }
+    }
+
+#else
+    const int i = pc.feat > 0 ? tr_gid(pc.nodes * pc.feat) : -1;
+    if (i < 0) {
+        return;
+    }
+    const int node = i / pc.feat;
+    const int f = i - node * pc.feat;
+    const int e0 = ptr_i[pc.ptr_off + node];
+    const int e1 = ptr_i[pc.ptr_off + node + 1];
+    float r;
+    if (pc.op == TR_SEG_MAX) {
+        float acc = -NF_INF;
+        for (int e = e0; e < e1; ++e) {
+            acc = tr_jmax(acc, src_f[pc.src_off + eid_i[pc.eid_off + e] * pc.feat + f]);
+        }
+        r = floatBitsToUint(acc) == 0xff800000u ? pc.empty : acc;
+    } else {
+        precise float acc = 0.0;
+        for (int e = e0; e < e1; ++e) {
+            acc = acc + src_f[pc.src_off + eid_i[pc.eid_off + e] * pc.feat + f];
+        }
+        if (e1 <= e0) {
+            r = pc.empty;
+        } else {
+            precise float mean = acc / float(e1 - e0);
+            r = pc.op == TR_SEG_MEAN ? mean : acc;
+        }
+    }
+    out_f[pc.out_off + i] = r;
+#endif
+}

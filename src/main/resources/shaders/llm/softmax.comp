@@ -1,0 +1,57 @@
+/* softmax.comp - numerically stable softmax of one vector. GLSL twin of LLM_Softmax in
+ * kernels/llm/sampling.cl. Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Variants row:
+ *     LLM_Softmax	softmax.comp	OP=OP_SOFTMAX	sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_SOFTMAX  (i size, float input, float output)
+ *               output[i] = exp(x[i] - max) / sum_j exp(x[j] - max)
+ * input may equal output: the maximum is reduced before any element is written, and each later
+ * pass touches only the invocation's own elements, so neither binding has memory qualifiers.
+ *
+ * Dispatch: global = local = {L, 1, 1} (exactly one workgroup; further groups exit).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_SOFTMAX 121
+
+#if !defined(OP) || OP != OP_SOFTMAX
+#error "softmax.comp requires OP=OP_SOFTMAX"
+#endif
+
+layout(std430, binding = 0) buffer NfSmInput { float x_in[]; };
+layout(std430, binding = 1) buffer NfSmOutput { float y_out[]; };
+layout(push_constant) uniform NfSmParams { int size; } pc;
+
+#include "common/reduce.glsl"
+
+void main() {
+    if (nf_wg_id() != 0u) {
+        return;
+    }
+    const uint size = uint(pc.size);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    float my_max = -NF_INF;
+    for (uint i = lid; i < size; i += lsize) {
+        my_max = max(my_max, x_in[i]);
+    }
+    const float row_max = nf_wg_max(my_max);
+
+    float my_sum = 0.0;
+    for (uint i = lid; i < size; i += lsize) {
+        const float e = exp(x_in[i] - row_max);
+        y_out[i] = e;
+        my_sum += e;
+    }
+    const float inv_sum = 1.0 / nf_wg_sum(my_sum);
+
+    for (uint i = lid; i < size; i += lsize) {
+        y_out[i] *= inv_sum;
+    }
+}

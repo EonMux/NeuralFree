@@ -1,0 +1,291 @@
+/* reduce.comp - row and column reductions, arg-reductions and the max backward. GLSL twin of
+ * kernels/train/reduce.cl (the semantic reference: arguments, formulas, host shape rules and dispatch are
+ * documented there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<kernel>; its kernel name is the OpenCL name, e.g.
+ *     TR_ReduceRows_F32	reduce.comp	OP=REDUCE_ROWS_F32
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Group kernels read their row from nf_wg_id() and return as a whole group past the last row, so the
+ * workgroup barriers stay in uniform control flow.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+/* Row-reduction and arg-reduction op ids, identical to reduce.cl. */
+#define TR_R_SUM    0
+#define TR_R_MAX    1
+#define TR_R_MIN    2
+#define TR_R_SUMSQ  3
+#define TR_R_SQDEV  4
+
+#define TR_R_ARGMAX 0
+#define TR_R_ARGMIN 1
+
+#define REDUCE_ROWS_F32           1
+#define REDUCE_ROWS_SMALL_F32     2
+#define REDUCE_ROWS_PARTIAL_F32   3
+#define REDUCE_COLS_F32           4
+#define REDUCE_ARG_ROWS_F32       5
+#define REDUCE_MAX_BACKWARD_F32   6
+
+#ifndef OP
+#error "reduce.comp requires OP"
+#endif
+
+#if OP == REDUCE_ROWS_F32 || OP == REDUCE_ROWS_SMALL_F32
+layout(std430, binding = 0) restrict readonly buffer TrRedIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrRedMean { float mean_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrRedOut { float out_f[]; };
+layout(push_constant) uniform TrRedParams {
+    int op;
+    int rows;
+    int cols;
+    int in_off;
+    int mean_off;
+    int out_off;
+    float divisor;
+} pc;
+
+#elif OP == REDUCE_ROWS_PARTIAL_F32
+layout(std430, binding = 0) restrict readonly buffer TrRedIn { float in_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrRedMean { float mean_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer TrRedOut { float out_f[]; };
+layout(push_constant) uniform TrRedParams {
+    int op;
+    int rows;
+    int cols;
+    int chunks;
+    int in_off;
+    int mean_off;
+} pc;
+
+#elif OP == REDUCE_COLS_F32
+layout(std430, binding = 0) restrict readonly buffer TrRedIn { float in_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrRedOut { float out_f[]; };
+layout(push_constant) uniform TrRedParams {
+    int rows;
+    int cols;
+    int chunks;
+    int in_off;
+    int out_off;
+} pc;
+
+#elif OP == REDUCE_ARG_ROWS_F32
+layout(std430, binding = 0) restrict readonly buffer TrRedIn { float in_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrRedOut { int out_i[]; };
+layout(push_constant) uniform TrRedParams {
+    int op;
+    int rows;
+    int cols;
+    int in_off;
+    int out_off;
+} pc;
+
+#elif OP == REDUCE_MAX_BACKWARD_F32
+layout(std430, binding = 0) restrict readonly buffer TrRedX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrRedM { float m_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrRedGy { float gy_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrRedGx { float gx_f[]; };
+layout(push_constant) uniform TrRedParams {
+    int rows;
+    int cols;
+    int x_off;
+    int m_off;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#else
+#error "reduce.comp: unknown OP"
+#endif
+
+/* Starting value of a row-reduction accumulator. */
+float tr_r_identity(const int op) {
+    if (op == TR_R_MAX) {
+        return -NF_INF;
+    }
+    if (op == TR_R_MIN) {
+        return NF_INF;
+    }
+    return 0.0;
+}
+
+/* Folds one element into a row-reduction accumulator; m is the row mean (TR_R_SQDEV only). */
+float tr_r_step(const int op, const float acc, const float x, const float m) {
+    if (op == TR_R_MAX) {
+        return tr_jmax(acc, x);
+    }
+    if (op == TR_R_MIN) {
+        return tr_jmin(acc, x);
+    }
+    if (op == TR_R_SUMSQ) {
+        precise float r = fma(x, x, acc);
+        return r;
+    }
+    if (op == TR_R_SQDEV) {
+        precise float d = x - m;
+        precise float r = fma(d, d, acc);
+        return r;
+    }
+    precise float r = acc + x;
+    return r;
+}
+
+/* Combines the lane accumulators of one group (uniform control flow: op is a push constant). */
+float tr_r_group(const int op, const float acc) {
+    if (op == TR_R_MAX) {
+        return tr_wg_max(acc);
+    }
+    if (op == TR_R_MIN) {
+        return tr_wg_min(acc);
+    }
+    return tr_wg_sum(acc);
+}
+
+/* Applies the final division; divisor == 1 returns v unchanged. */
+float tr_r_finish(const float v, const float divisor) {
+    return divisor == 1.0 ? v : v / divisor;
+}
+
+/* Java float comparison key of a non-NaN value: -0 and +0 share key 0, otherwise tr_order_key. */
+int tr_r_key(const float x) {
+    return tr_iszero(x) ? 0 : tr_order_key(x);
+}
+
+/* Java a == b for floats (false when either is NaN, -0 == +0), exact under denormal flushing. */
+bool tr_r_same(const float a, const float b) {
+    return !tr_isnan(a) && !tr_isnan(b) && tr_r_key(a) == tr_r_key(b);
+}
+
+/* Java (is_max ? x > best : x < best) for a non-NaN best; false when x is NaN. */
+bool tr_r_better(const bool is_max, const float x, const float best) {
+    if (tr_isnan(x)) {
+        return false;
+    }
+    return is_max ? tr_r_key(x) > tr_r_key(best) : tr_r_key(x) < tr_r_key(best);
+}
+
+void main() {
+#if OP == REDUCE_ROWS_F32
+    const uint wg = nf_wg_id();
+    if (wg >= uint(pc.rows)) {
+        return;
+    }
+    const int row = int(wg);
+    const uint lid = gl_LocalInvocationID.x;
+    const float m = pc.op == TR_R_SQDEV ? mean_f[pc.mean_off + row] : 0.0;
+    const int base = pc.in_off + row * pc.cols;
+    float acc = tr_r_identity(pc.op);
+    for (uint c = lid; c < uint(pc.cols); c += TR_LOCAL) {
+        acc = tr_r_step(pc.op, acc, in_f[base + int(c)], m);
+    }
+    const float r = tr_r_group(pc.op, acc);
+    if (lid == 0u) {
+        out_f[pc.out_off + row] = tr_r_finish(r, pc.divisor);
+    }
+
+#elif OP == REDUCE_ROWS_SMALL_F32
+    const int row = tr_gid(pc.rows);
+    if (row < 0) {
+        return;
+    }
+    const float m = pc.op == TR_R_SQDEV ? mean_f[pc.mean_off + row] : 0.0;
+    const int base = pc.in_off + row * pc.cols;
+    float acc = tr_r_identity(pc.op);
+    for (int c = 0; c < pc.cols; ++c) {
+        acc = tr_r_step(pc.op, acc, in_f[base + c], m);
+    }
+    out_f[pc.out_off + row] = tr_r_finish(acc, pc.divisor);
+
+#elif OP == REDUCE_ROWS_PARTIAL_F32
+    const uint g = nf_wg_id();
+    if (pc.chunks <= 0 || g >= uint(pc.rows) * uint(pc.chunks)) {
+        return;
+    }
+    const uint chunks = uint(pc.chunks);
+    const uint cols = uint(pc.cols);
+    const int row = int(g / chunks);
+    const uint chunk = g % chunks;
+    const uint cs = cols / chunks + (cols % chunks != 0u ? 1u : 0u);
+    const uint c0 = chunk * cs;
+    const uint c1 = c0 + cs < cols ? c0 + cs : cols;
+    const uint lid = gl_LocalInvocationID.x;
+    const float m = pc.op == TR_R_SQDEV ? mean_f[pc.mean_off + row] : 0.0;
+    const int base = pc.in_off + row * pc.cols;
+    float acc = tr_r_identity(pc.op);
+    for (uint c = c0 + lid; c < c1; c += TR_LOCAL) {
+        acc = tr_r_step(pc.op, acc, in_f[base + int(c)], m);
+    }
+    const float r = tr_r_group(pc.op, acc);
+    if (lid == 0u) {
+        out_f[int(g)] = r;
+    }
+
+#elif OP == REDUCE_COLS_F32
+    const int i = (pc.cols > 0 && pc.chunks > 0) ? tr_gid(pc.chunks * pc.cols) : -1;
+    if (i < 0) {
+        return;
+    }
+    const int chunk = i / pc.cols;
+    const int col = i - chunk * pc.cols;
+    const uint rows = uint(pc.rows);
+    const uint chunks = uint(pc.chunks);
+    const uint rs = rows / chunks + (rows % chunks != 0u ? 1u : 0u);
+    const uint r0 = uint(chunk) * rs;
+    const uint r1 = r0 + rs < rows ? r0 + rs : rows;
+    precise float acc = 0.0;
+    for (uint r = r0; r < r1; ++r) {
+        acc = acc + in_f[pc.in_off + int(r) * pc.cols + col];
+    }
+    out_f[pc.out_off + i] = acc;
+
+#elif OP == REDUCE_ARG_ROWS_F32
+    const uint wg = nf_wg_id();
+    if (wg >= uint(pc.rows)) {
+        return;
+    }
+    const int row = int(wg);
+    const uint lid = gl_LocalInvocationID.x;
+    const bool is_max = pc.op == TR_R_ARGMAX;
+    const int base = pc.in_off + row * pc.cols;
+    float best = is_max ? -NF_INF : NF_INF;
+    int best_idx = pc.cols;
+    for (uint c = lid; c < uint(pc.cols); c += TR_LOCAL) {
+        const float x = in_f[base + int(c)];
+        if (tr_r_better(is_max, x, best)) {
+            best = x;
+            best_idx = int(c);
+        }
+    }
+    const float top = is_max ? tr_wg_max(best) : tr_wg_min(best);
+    const int idx = tr_wg_imin(tr_r_same(best, top) ? best_idx : pc.cols);
+    if (lid == 0u) {
+        out_i[pc.out_off + row] = idx < pc.cols ? idx : 0;
+    }
+
+#elif OP == REDUCE_MAX_BACKWARD_F32
+    const uint wg = nf_wg_id();
+    if (wg >= uint(pc.rows)) {
+        return;
+    }
+    const int row = int(wg);
+    const uint lid = gl_LocalInvocationID.x;
+    const float mv = m_f[pc.m_off + row];
+    const int xb = pc.x_off + row * pc.cols;
+    int first = pc.cols;
+    for (uint c = lid; c < uint(pc.cols); c += TR_LOCAL) {
+        if (tr_r_same(x_f[xb + int(c)], mv)) {
+            first = int(c);
+            break;
+        }
+    }
+    const int idx = tr_wg_imin(first);
+    const float g = gy_f[pc.gy_off + row];
+    const int ob = pc.gx_off + row * pc.cols;
+    for (uint c = lid; c < uint(pc.cols); c += TR_LOCAL) {
+        gx_f[ob + int(c)] = int(c) == idx ? g : 0.0;
+    }
+#endif
+}

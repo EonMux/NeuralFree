@@ -1,0 +1,79 @@
+/* layernorm.comp - layer norm kernels with weight and bias. GLSL twin of LLM_LayerNorm and
+ * LLM_Batch_LayerNorm in kernels/llm/norm.cl. Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_LayerNorm	layernorm.comp	OP=OP_LAYERNORM	sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_LAYERNORM        (i size, f eps, float input, R float weight, R float bias, float output)
+ *   OP_BATCH_LAYERNORM  (i size, i seq_len, f eps, float input, R float weight, R float bias, float output)
+ *                       every row of [seq_len x size]
+ * output[i] = (x[i] - mean) * rsqrt(mean((x - mean)^2) + eps) * weight[i] + bias[i], with mean and
+ * variance by two passes (ggml-cpu/ops.cpp ggml_compute_forward_norm_f32). input and output carry
+ * no memory qualifiers because callers normalize in place; output[i] is written only after both
+ * reductions, by the invocation that reads input[i].
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, one workgroup per row: global = L for OP_LAYERNORM (further
+ * groups exit) or seq_len * L. Folded group counts are recovered by nf_wg_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_LAYERNORM        111
+#define OP_BATCH_LAYERNORM  112
+
+#ifndef OP
+#error "layernorm.comp requires OP"
+#endif
+
+layout(std430, binding = 0) buffer NfLnInput { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfLnWeight { float w_in[]; };
+layout(std430, binding = 2) readonly buffer NfLnBias { float b_in[]; };
+layout(std430, binding = 3) buffer NfLnOutput { float y_out[]; };
+
+#if OP == OP_LAYERNORM
+layout(push_constant) uniform NfLnParams { int size; float eps; } pc;
+#elif OP == OP_BATCH_LAYERNORM
+layout(push_constant) uniform NfLnParams { int size; int seq_len; float eps; } pc;
+#else
+#error "layernorm.comp: OP is not a layer-norm op"
+#endif
+
+#include "common/reduce.glsl"
+
+void main() {
+    const uint wg = nf_wg_id();
+    const uint size = uint(pc.size);
+#if OP == OP_BATCH_LAYERNORM
+    if (wg >= uint(pc.seq_len)) {
+        return;
+    }
+    const uint base = wg * size;
+#else
+    if (wg != 0u) {
+        return;
+    }
+    const uint base = 0u;
+#endif
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    float sum = 0.0;
+    for (uint i = lid; i < size; i += lsize) {
+        sum += x_in[base + i];
+    }
+    const float mean = nf_wg_sum(sum) / float(size);
+
+    float sq = 0.0;
+    for (uint i = lid; i < size; i += lsize) {
+        const float d = x_in[base + i] - mean;
+        sq += d * d;
+    }
+    const float rstd = inversesqrt(nf_wg_sum(sq) / float(size) + pc.eps);
+
+    for (uint i = lid; i < size; i += lsize) {
+        y_out[base + i] = (x_in[base + i] - mean) * rstd * w_in[i] + b_in[i];
+    }
+}

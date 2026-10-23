@@ -1,0 +1,189 @@
+/* ml/kmeans.comp - k-means distances, assignment, centroid update and convergence shift. GLSL twin of
+ * kernels/train/ml/kmeans.cl (the semantic reference: arguments, formulas and dispatch are documented there).
+ * Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     ML_KMeans_Distances	ml/kmeans.comp	OP=KMEANS_DISTANCES
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Accumulators are precise and squared differences accumulate with an explicit fma, as in kmeans.cl.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define KMEANS_DISTANCES        1
+#define KMEANS_ASSIGN           2
+#define KMEANS_UPDATE_PARTIAL   3
+#define KMEANS_UPDATE_FINALIZE  4
+#define KMEANS_SHIFT            5
+
+#ifndef OP
+#error "kmeans.comp requires OP"
+#endif
+
+#if OP == KMEANS_DISTANCES
+layout(std430, binding = 0) restrict readonly buffer MlKmPoints { float points_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlKmCentroids { float centroids_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer MlKmDist { float dist_f[]; };
+layout(push_constant) uniform MlKmParams {
+    int n;
+    int k;
+    int d;
+    int p_off;
+    int c_off;
+} pc;
+
+#elif OP == KMEANS_ASSIGN
+layout(std430, binding = 0) restrict readonly buffer MlKmDist { float dist_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer MlKmAssign { int assign_i[]; };
+layout(push_constant) uniform MlKmParams {
+    int n;
+    int k;
+} pc;
+
+/* Java a < b for floats, decided on bit patterns (see ml_km_less in kmeans.cl). */
+bool ml_km_less(const float a, const float b) {
+    if (tr_isnan(a) || tr_isnan(b)) {
+        return false;
+    }
+    if (tr_iszero(a) && tr_iszero(b)) {
+        return false;
+    }
+    return tr_order_key(a) < tr_order_key(b);
+}
+
+#elif OP == KMEANS_UPDATE_PARTIAL
+layout(std430, binding = 0) restrict readonly buffer MlKmPoints { float points_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlKmAssign { int assign_i[]; };
+layout(std430, binding = 2) restrict writeonly buffer MlKmPsum { float psum_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer MlKmPcount { int pcount_i[]; };
+layout(push_constant) uniform MlKmParams {
+    int n;
+    int k;
+    int d;
+    int chunks;
+    int p_off;
+} pc;
+
+#elif OP == KMEANS_UPDATE_FINALIZE
+layout(std430, binding = 0) restrict readonly buffer MlKmPsum { float psum_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlKmPcount { int pcount_i[]; };
+layout(std430, binding = 2) restrict readonly buffer MlKmOld { float old_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer MlKmNew { float new_f[]; };
+layout(push_constant) uniform MlKmParams {
+    int k;
+    int d;
+    int chunks;
+} pc;
+
+#elif OP == KMEANS_SHIFT
+layout(std430, binding = 0) restrict readonly buffer MlKmOld { float old_f[]; };
+layout(std430, binding = 1) restrict readonly buffer MlKmNew { float new_f[]; };
+layout(std430, binding = 2) restrict writeonly buffer MlKmShift { float shift_f[]; };
+layout(push_constant) uniform MlKmParams {
+    int k;
+    int d;
+} pc;
+
+#else
+#error "kmeans.comp: unknown OP"
+#endif
+
+void main() {
+#if OP == KMEANS_DISTANCES
+    const int t = tr_gid(pc.n * pc.k);
+    if (t < 0) {
+        return;
+    }
+    const int i = t / pc.k;
+    const int c = t - i * pc.k;
+    const int p = pc.p_off + i * pc.d;
+    const int q = pc.c_off + c * pc.d;
+    precise float acc = 0.0;
+    for (int j = 0; j < pc.d; ++j) {
+        precise float diff = points_f[p + j] - centroids_f[q + j];
+        acc = fma(diff, diff, acc);
+    }
+    dist_f[t] = acc;
+
+#elif OP == KMEANS_ASSIGN
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const int row = i * pc.k;
+    float best = uintBitsToFloat(0x7f7fffffu);              /* Float.MAX_VALUE */
+    int best_c = 0;
+    for (int c = 0; c < pc.k; ++c) {
+        const float v = dist_f[row + c];
+        if (ml_km_less(v, best)) {
+            best = v;
+            best_c = c;
+        }
+    }
+    assign_i[i] = best_c;
+
+#elif OP == KMEANS_UPDATE_PARTIAL
+    const int t = tr_gid(pc.chunks * pc.k * pc.d);
+    if (t < 0) {
+        return;
+    }
+    const int cc = t / pc.d;
+    const int j = t - cc * pc.d;
+    const int ch = cc / pc.k;
+    const int c = cc - ch * pc.k;
+    const int cs = pc.n / pc.chunks + (pc.n % pc.chunks != 0 ? 1 : 0);
+    const int begin = ch * cs;
+    const int end = (pc.n - begin > cs) ? begin + cs : pc.n;
+    precise float s = 0.0;
+    int count = 0;
+    for (int i = begin; i < end; ++i) {
+        if (assign_i[i] == c) {
+            s = s + points_f[pc.p_off + i * pc.d + j];
+            count += 1;
+        }
+    }
+    psum_f[t] = s;
+    if (j == 0) {
+        pcount_i[cc] = count;
+    }
+
+#elif OP == KMEANS_UPDATE_FINALIZE
+    const int t = tr_gid(pc.k * pc.d);
+    if (t < 0) {
+        return;
+    }
+    const int c = t / pc.d;
+    const int stride = pc.k * pc.d;
+    precise float s = psum_f[t];
+    int count = pcount_i[c];
+    for (int ch = 1; ch < pc.chunks; ++ch) {
+        s = s + psum_f[ch * stride + t];
+        count += pcount_i[ch * pc.k + c];
+    }
+    if (count > 0) {
+        precise float mean = s / float(count);
+        new_f[t] = mean;
+    } else {
+        new_f[t] = old_f[t];
+    }
+
+#elif OP == KMEANS_SHIFT
+    const int lid = int(gl_LocalInvocationID.x);
+    float m = 0.0;
+    for (int c = lid; c < pc.k; c += TR_LOCAL) {
+        const int row = c * pc.d;
+        precise float s = 0.0;
+        for (int j = 0; j < pc.d; ++j) {
+            precise float diff = new_f[row + j] - old_f[row + j];
+            s = fma(diff, diff, s);
+        }
+        m = tr_jmax(m, sqrt(s));
+    }
+    m = tr_wg_max(m);
+    if (lid == 0) {
+        shift_f[0] = m;
+    }
+#endif
+}

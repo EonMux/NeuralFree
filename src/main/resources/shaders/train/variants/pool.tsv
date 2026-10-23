@@ -1,0 +1,9 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Max, average and adaptive average 2-D pooling and their backward (kernels/train/pool.cl).
+TR_MaxPool2d_F32	pool.comp	OP=POOL_MAX2D_F32
+TR_AvgPool2d_F32	pool.comp	OP=POOL_AVG2D_F32
+TR_AdaptiveAvgPool2d_F32	pool.comp	OP=POOL_ADAPTIVE_AVG2D_F32
+TR_MaxPool2dBackward_F32	pool.comp	OP=POOL_MAX_BWD
+TR_AvgPool2dBackward_F32	pool.comp	OP=POOL_AVG_BWD
+TR_AdaptiveAvgPool2dBackward_F32	pool.comp	OP=POOL_ADAPTIVE_BWD
+TR_MaxPool2dSelect_F32	pool.comp	OP=POOL_MAX_SELECT

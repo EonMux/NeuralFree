@@ -1,0 +1,89 @@
+/* lora_switch.comp - LLM_SwitchedLoraAdd, the graniteswitch per-token switched LoRA delta. GLSL twin of
+ * kernels/llm/heads.cl (the semantic reference). Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i in_dim, i out_dim, i rank, i stage, i n_slots, i x_stride, i x_off,
+ *    i y_stride, i y_off, i tmp_off, R int slots, R float A, R float B, R float x, float tmp, float y)
+ *   s_t = clamp(slots[t], 0, n_slots-1); A[s][r][i] at (s*rank + r)*in_dim + i;
+ *   B[s][o][r] at (s*out_dim + o)*rank + r.
+ *   stage 0: tmp[tmp_off + t*rank + r] = sum_i A[s_t][r][i] * x[x_off + t*x_stride + i]
+ *            one workgroup per (t, r) (linear group g = t*rank + r), reduced with nf_wg_sum;
+ *            global = n_tokens*rank*L invocations, local = {L, 1, 1} with L a power of two in [32, 256].
+ *   stage 1: y[y_off + t*y_stride + o] += sum_r B[s_t][o][r] * tmp[tmp_off + t*rank + r], r ascending;
+ *            one invocation per (t, o), global = n_tokens*out_dim rounded up to L.
+ * Offsets and strides are in float elements. tmp and y carry no restrict qualifier (scratch views).
+ *
+ * The stage branch and the stage-0 range check depend only on push constants and the workgroup id, so
+ * the barriers inside nf_wg_sum are reached in uniform control flow. Folded group counts are recovered
+ * by nf_wg_id()/nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+
+layout(std430, binding = 0) restrict readonly buffer NfLoraSlots { int slots_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfLoraA { float a_in[]; };
+layout(std430, binding = 2) restrict readonly buffer NfLoraB { float b_in[]; };
+layout(std430, binding = 3) restrict readonly buffer NfLoraX { float x_in[]; };
+layout(std430, binding = 4) buffer NfLoraTmp { float tmp_io[]; };
+layout(std430, binding = 5) buffer NfLoraY { float y_io[]; };
+
+layout(push_constant) uniform NfLoraParams {
+    int n_tokens;
+    int in_dim;
+    int out_dim;
+    int rank;
+    int stage;
+    int n_slots;
+    int x_stride;
+    int x_off;
+    int y_stride;
+    int y_off;
+    int tmp_off;
+} pc;
+
+uint lora_slot(uint t) {
+    return uint(clamp(slots_in[t], 0, pc.n_slots - 1));
+}
+
+void main() {
+    if (pc.stage == 0) {
+        const uint g = nf_wg_id();
+        if (g >= uint(pc.n_tokens) * uint(pc.rank)) {
+            return;
+        }
+        const uint rank = uint(pc.rank);
+        const uint t = g / rank;
+        const uint r = g - t * rank;
+        const uint s = lora_slot(t);
+        const uint a_row = (s * rank + r) * uint(pc.in_dim);
+        const uint x_row = uint(pc.x_off) + t * uint(pc.x_stride);
+        float acc = 0.0;
+        for (uint i = gl_LocalInvocationID.x; i < uint(pc.in_dim); i += gl_WorkGroupSize.x) {
+            acc += a_in[a_row + i] * x_in[x_row + i];
+        }
+        const float sum = nf_wg_sum(acc);
+        if (gl_LocalInvocationID.x == 0u) {
+            tmp_io[uint(pc.tmp_off) + t * rank + r] = sum;
+        }
+    } else {
+        const uint idx = nf_global_id();
+        if (idx >= uint(pc.n_tokens) * uint(pc.out_dim)) {
+            return;
+        }
+        const uint rank = uint(pc.rank);
+        const uint t = idx / uint(pc.out_dim);
+        const uint o = idx - t * uint(pc.out_dim);
+        const uint s = lora_slot(t);
+        const uint b_row = (s * uint(pc.out_dim) + o) * rank;
+        const uint t_row = uint(pc.tmp_off) + t * rank;
+        float acc = 0.0;
+        for (uint r = 0u; r < rank; ++r) {
+            acc += b_in[b_row + r] * tmp_io[t_row + r];
+        }
+        const uint yi = uint(pc.y_off) + t * uint(pc.y_stride) + o;
+        y_io[yi] = y_io[yi] + acc;
+    }
+}

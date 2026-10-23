@@ -1,0 +1,342 @@
+/* dense.comp - dense-network bias, activation and activation backward. GLSL twin of kernels/train/dense.cl
+ * (the semantic reference: arguments, activation formulas, constants, aliasing rules and dispatch are
+ * documented there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     TR_DenseBiasAct_F32	dense.comp	OP=DENSE_BIAS_ACT_F32
+ * Buffers take bindings 0.. in .cl parameter order and scalars fill the push block in .cl parameter order.
+ * Buffers that may alias another binding (z and a, gy and gz) are not restrict.
+ *
+ * GLSL differences from the OpenCL C / CUDA text, same results within the transcendental tolerance:
+ *   - tanh is tr_tanh and SINC computes sin and cos with tr_sincos (common/train.glsl), because the builtins
+ *     may overflow to NaN or are bounded only to 2^-11 absolute on [-pi, pi], which exceeds the tolerance;
+ *   - every helper stores its result in a precise variable, so no implementation contracts a product and
+ *     the following add into a fused multiply-add.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define DENSE_BIAS_ACT_F32      1
+#define DENSE_ACT_BACKWARD_F32  2
+
+#ifndef OP
+#error "dense.comp requires OP"
+#endif
+
+#define TR_DENSE_ACT_SIGMOID          0
+#define TR_DENSE_ACT_RELU             1
+#define TR_DENSE_ACT_TANH             2
+#define TR_DENSE_ACT_LEAKY_RELU       3
+#define TR_DENSE_ACT_ELU              4
+#define TR_DENSE_ACT_SOFTPLUS         5
+#define TR_DENSE_ACT_SOFTSIGN         6
+#define TR_DENSE_ACT_ISRU             7
+#define TR_DENSE_ACT_GAUSSIAN         8
+#define TR_DENSE_ACT_SINC             9
+#define TR_DENSE_ACT_SWISH           10
+#define TR_DENSE_ACT_SELU            11
+#define TR_DENSE_ACT_HARD_SIGMOID    12
+#define TR_DENSE_ACT_BENT_IDENTITY   13
+#define TR_DENSE_ACT_PRELU           14
+#define TR_DENSE_ACT_SRELU           15
+#define TR_DENSE_ACT_SOFTEXPONENTIAL 16
+#define TR_DENSE_ACT_IDENTITY        17
+
+#if OP == DENSE_BIAS_ACT_F32
+layout(std430, binding = 0) buffer TrDenseZ { float z_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrDenseBias { float bias_f[]; };
+layout(std430, binding = 2) writeonly buffer TrDenseA { float a_f[]; };
+layout(push_constant) uniform TrDenseParams {
+    int act;
+    int rows;
+    int cols;
+    int z_off;
+    int b_off;
+    int a_off;
+} pc;
+
+#elif OP == DENSE_ACT_BACKWARD_F32
+layout(std430, binding = 0) restrict readonly buffer TrDenseZ { float z_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrDenseA { float a_f[]; };
+layout(std430, binding = 2) readonly buffer TrDenseGy { float gy_f[]; };
+layout(std430, binding = 3) writeonly buffer TrDenseGz { float gz_f[]; };
+layout(push_constant) uniform TrDenseParams {
+    int act;
+    int n;
+    int z_off;
+    int a_off;
+    int gy_off;
+    int gz_off;
+} pc;
+
+#else
+#error "dense.comp: unknown OP"
+#endif
+
+/* 1 / (1 + exp(-x)). */
+float tr_dense_sigmoid(const float x) {
+    precise float r = 1.0 / (1.0 + exp(-x));
+    return r;
+}
+
+/* sqrt(1 + x * x) without overflow: for |x| > 1 it is |x| * sqrt(1 + t * t) with t = 1 / |x|. */
+float tr_dense_sqrt1p_sq(const float x) {
+    const float ax = abs(x);
+    if (!(ax > 1.0)) {
+        precise float s = sqrt(1.0 + x * x);
+        return s;
+    }
+    const float t = 1.0 / ax;
+    precise float r = ax * sqrt(1.0 + t * t);
+    return r;
+}
+
+/*
+ * sinc(x) = sin(pi x) / (pi x) and its derivative, Taylor series for |pi x| < 1 (see dense.cl). A NaN or
+ * infinite u gives NaN, as Java's sin(u) / u.
+ */
+float tr_dense_sinc(const float x) {
+    const float pi = 3.14159265358979323846;
+    precise float u = pi * x;
+    if (abs(u) < 1.0) {
+        precise float u2 = u * u;
+        precise float s = 1.0 - u2 * (0.16666666666666667 - u2 * (0.0083333333333333333
+            - u2 * (1.9841269841269841e-4 - u2 * 2.7557319223985891e-6)));
+        return s;
+    }
+    if (tr_isnan(u) || tr_isinf(u)) {
+        return NF_NAN;
+    }
+    float su;
+    float cu;
+    tr_sincos(u, su, cu);
+    precise float r = su / u;
+    return r;
+}
+
+float tr_dense_sinc_grad(const float x) {
+    const float pi = 3.14159265358979323846;
+    precise float u = pi * x;
+    if (abs(u) < 1.0) {
+        precise float u2 = u * u;
+        precise float s = pi * -(u * (0.33333333333333333 - u2 * (0.033333333333333333 - u2 * (1.1904761904761905e-3
+            - u2 * (2.2045855379188713e-5 - u2 * 2.5052108385441719e-7)))));
+        return s;
+    }
+    if (tr_isnan(u) || tr_isinf(u)) {
+        return NF_NAN;
+    }
+    float su;
+    float cu;
+    tr_sincos(u, su, cu);
+    precise float r = pi * (cu / u - su / (u * u));
+    return r;
+}
+
+/* f_act(x); see kernels/train/dense.cl. */
+float tr_dense_act(const int act, const float x) {
+    precise float r;
+    switch (act) {
+        case TR_DENSE_ACT_SIGMOID:
+            r = tr_dense_sigmoid(x);
+            break;
+        case TR_DENSE_ACT_RELU:
+            r = tr_jmax(0.0, x);
+            break;
+        case TR_DENSE_ACT_TANH:
+            r = tr_tanh(x);
+            break;
+        case TR_DENSE_ACT_LEAKY_RELU: {
+            const float alpha = 0.01;
+            precise float ax = alpha * x;
+            r = tr_jmax(ax, x);
+            break;
+        }
+        case TR_DENSE_ACT_ELU: {
+            const float alpha = 1.0;
+            r = x >= 0.0 ? x : alpha * (exp(x) - 1.0);
+            break;
+        }
+        case TR_DENSE_ACT_SOFTPLUS:
+            r = tr_jmax(x, 0.0) + log(1.0 + exp(-abs(x)));
+            break;
+        case TR_DENSE_ACT_SOFTSIGN:
+            r = x / (1.0 + abs(x));
+            break;
+        case TR_DENSE_ACT_ISRU:
+            r = x / tr_dense_sqrt1p_sq(x);
+            break;
+        case TR_DENSE_ACT_GAUSSIAN:
+            r = exp(-(x * x));
+            break;
+        case TR_DENSE_ACT_SINC:
+            r = tr_dense_sinc(x);
+            break;
+        case TR_DENSE_ACT_SWISH: {
+            const float beta = 1.0;
+            r = x / (1.0 + exp(-(beta * x)));
+            break;
+        }
+        case TR_DENSE_ACT_SELU: {
+            const float alpha = 1.6732632423543772848;
+            const float scale = 1.0507009873554804934;
+            r = x > 0.0 ? scale * x : scale * (alpha * (exp(x) - 1.0));
+            break;
+        }
+        case TR_DENSE_ACT_HARD_SIGMOID: {
+            const float slope = 0.2;
+            precise float y = slope * x + 0.5;
+            r = tr_jmin(tr_jmax(y, 0.0), 1.0);
+            break;
+        }
+        case TR_DENSE_ACT_BENT_IDENTITY:
+            r = (tr_dense_sqrt1p_sq(x) - 1.0) / 2.0 + x;
+            break;
+        case TR_DENSE_ACT_PRELU: {
+            const float alpha = 0.25;
+            r = x >= 0.0 ? x : alpha * x;
+            break;
+        }
+        case TR_DENSE_ACT_SRELU: {
+            const float tl = -0.5;
+            const float al = 0.5;
+            const float tr = 0.5;
+            const float ar = 0.5;
+            if (x <= tl) {
+                r = tl + al * (x - tl);
+            } else if (x >= tr) {
+                r = tr + ar * (x - tr);
+            } else {
+                r = x;
+            }
+            break;
+        }
+        case TR_DENSE_ACT_SOFTEXPONENTIAL: {
+            const float alpha = 1.0;
+            r = (exp(alpha * x) - 1.0) / alpha + alpha;
+            break;
+        }
+        default:
+            r = x;
+            break;
+    }
+    return r;
+}
+
+/* f'_act at pre-activation x with activation output a (used by SIGMOID and TANH only); see dense.cl. */
+float tr_dense_act_grad(const int act, const float x, const float a) {
+    precise float r;
+    switch (act) {
+        case TR_DENSE_ACT_SIGMOID:
+            r = a * (1.0 - a);
+            break;
+        case TR_DENSE_ACT_RELU:
+            r = x > 0.0 ? 1.0 : 0.0;
+            break;
+        case TR_DENSE_ACT_TANH:
+            r = 1.0 - a * a;
+            break;
+        case TR_DENSE_ACT_LEAKY_RELU: {
+            const float alpha = 0.01;
+            r = x > 0.0 ? 1.0 : alpha;
+            break;
+        }
+        case TR_DENSE_ACT_ELU: {
+            const float alpha = 1.0;
+            r = x >= 0.0 ? 1.0 : alpha * exp(x);
+            break;
+        }
+        case TR_DENSE_ACT_SOFTPLUS:
+            r = tr_dense_sigmoid(x);
+            break;
+        case TR_DENSE_ACT_SOFTSIGN: {
+            precise float d = 1.0 + abs(x);
+            r = 1.0 / (d * d);
+            break;
+        }
+        case TR_DENSE_ACT_ISRU: {
+            const float s = tr_dense_sqrt1p_sq(x);
+            r = 1.0 / (s * s * s);
+            break;
+        }
+        case TR_DENSE_ACT_GAUSSIAN:
+            r = -2.0 * x * exp(-(x * x));
+            break;
+        case TR_DENSE_ACT_SINC:
+            r = tr_dense_sinc_grad(x);
+            break;
+        case TR_DENSE_ACT_SWISH: {
+            const float beta = 1.0;
+            precise float s = 1.0 / (1.0 + exp(-(beta * x)));
+            r = s * (1.0 + beta * x * (1.0 - s));
+            break;
+        }
+        case TR_DENSE_ACT_SELU: {
+            const float alpha = 1.6732632423543772848;
+            const float scale = 1.0507009873554804934;
+            r = x > 0.0 ? scale : scale * alpha * exp(x);
+            break;
+        }
+        case TR_DENSE_ACT_HARD_SIGMOID: {
+            const float slope = 0.2;
+            precise float y = slope * x + 0.5;
+            r = (y >= 0.0 && y <= 1.0) ? slope : 0.0;
+            break;
+        }
+        case TR_DENSE_ACT_BENT_IDENTITY:
+            r = x / (2.0 * tr_dense_sqrt1p_sq(x)) + 1.0;
+            break;
+        case TR_DENSE_ACT_PRELU: {
+            const float alpha = 0.25;
+            r = x >= 0.0 ? 1.0 : alpha;
+            break;
+        }
+        case TR_DENSE_ACT_SRELU: {
+            const float tl = -0.5;
+            const float al = 0.5;
+            const float tr = 0.5;
+            const float ar = 0.5;
+            if (x <= tl) {
+                r = al;
+            } else if (x >= tr) {
+                r = ar;
+            } else {
+                r = 1.0;
+            }
+            break;
+        }
+        case TR_DENSE_ACT_SOFTEXPONENTIAL: {
+            const float alpha = 1.0;
+            r = exp(alpha * x);
+            break;
+        }
+        default:
+            r = 1.0;
+            break;
+    }
+    return r;
+}
+
+void main() {
+#if OP == DENSE_BIAS_ACT_F32
+    const int i = tr_gid(pc.rows * pc.cols);
+    if (i < 0) {
+        return;
+    }
+    precise float v = z_f[pc.z_off + i] + bias_f[pc.b_off + i % pc.cols];
+    z_f[pc.z_off + i] = v;
+    a_f[pc.a_off + i] = tr_dense_act(pc.act, v);
+
+#elif OP == DENSE_ACT_BACKWARD_F32
+    const int i = tr_gid(pc.n);
+    if (i < 0) {
+        return;
+    }
+    const float x = z_f[pc.z_off + i];
+    const float av = (pc.act == TR_DENSE_ACT_SIGMOID || pc.act == TR_DENSE_ACT_TANH) ? a_f[pc.a_off + i] : 0.0;
+    precise float g = gy_f[pc.gy_off + i] * tr_dense_act_grad(pc.act, x, av);
+    gz_f[pc.gz_off + i] = g;
+#endif
+}

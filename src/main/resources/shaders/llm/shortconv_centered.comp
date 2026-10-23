@@ -1,0 +1,52 @@
+/* shortconv_centered.comp - LLM_ShortConvCentered: LFM2 non-causal centered depthwise conv, zero-padded
+ * on both sides of the ubatch, without state. GLSL twin of LLM_ShortConvCentered in
+ * kernels/llm/recurrent/ssm_conv.cl (models/lfm2.cpp:349-380). Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_ch, i d_conv, i n_tokens, i x_stride, i x_off, i out_stride, R float x, R float w, W float out)
+ *   p = (d_conv - 1) / 2,
+ *   out[t*out_stride + c] = x[t][c]*w[c*d_conv + p] + sum_{k != p, 0 <= t+k-p < n_tokens} x[t+k-p][c]*w[c*d_conv + k]
+ *   with x[t][c] = x[x_off + t*x_stride + c]; the center tap first, the others in ascending k.
+ * d_conv is odd.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, one invocation per (t, c): global = roundUp(n_tokens * n_ch, L).
+ * Folded group counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfCenX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfCenW { float w_in[]; };
+layout(std430, binding = 2) writeonly buffer NfCenOut { float y_out[]; };
+
+layout(push_constant) uniform NfCenParams {
+    int n_ch;
+    int d_conv;
+    int n_tokens;
+    int x_stride;
+    int x_off;
+    int out_stride;
+} pc;
+
+void main() {
+    const uint i = nf_global_id();
+    const uint n_ch = uint(pc.n_ch);
+    if (i >= uint(pc.n_tokens) * n_ch) {
+        return;
+    }
+    const int t = int(i / n_ch);
+    const uint c = i - uint(t) * n_ch;
+    const int pad = (pc.d_conv - 1) / 2;
+    const uint w_base = c * uint(pc.d_conv);
+
+    float sum = x_in[uint(pc.x_off) + uint(t) * uint(pc.x_stride) + c] * w_in[w_base + uint(pad)];
+    for (int k = 0; k < pc.d_conv; ++k) {
+        const int src = t + k - pad;
+        if (k != pad && src >= 0 && src < pc.n_tokens) {
+            sum += x_in[uint(pc.x_off) + uint(src) * uint(pc.x_stride) + c] * w_in[w_base + uint(k)];
+        }
+    }
+    y_out[uint(t) * uint(pc.out_stride) + c] = sum;
+}

@@ -1,0 +1,43 @@
+/* moe_wsum.comp - LLM_MoE_WeightedSum: router-weighted sum of the k expert outputs per token.
+ * GLSL twin of LLM_MoE_WeightedSum in kernels/llm/moe.cl. Requires: common/nf_common.glsl.
+ *
+ *     LLM_MoE_WeightedSum	moe_wsum.comp
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_embd, i k, i flags, R float expert_out, R float weights, float dst)
+ *   dst[t][c] = sum_j w[t][j] * expert_out[t * k + j][c], j ascending; flags bit 1 (unweighted) takes
+ *   w = 1, bit 0 (accumulate) adds the sum to dst.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n_tokens * n_embd rounded up to L (folding-aware).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define NF_MOE_WS_ACCUMULATE 1
+#define NF_MOE_WS_UNWEIGHTED 2
+
+layout(std430, binding = 0) readonly buffer NfMwExperts { float expert_out[]; };
+layout(std430, binding = 1) readonly buffer NfMwWeights { float weights[]; };
+layout(std430, binding = 2) buffer NfMwDst { float dst[]; };
+layout(push_constant) uniform NfMwParams { int n_tokens; int n_embd; int k; int flags; } pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint n_embd = uint(pc.n_embd);
+    if (gid >= uint(pc.n_tokens) * n_embd) {
+        return;
+    }
+    const uint t = gid / n_embd;
+    const uint c = gid % n_embd;
+    const uint k = uint(pc.k);
+    const bool unweighted = (pc.flags & NF_MOE_WS_UNWEIGHTED) != 0;
+    float acc = 0.0;
+    for (uint j = 0u; j < k; ++j) {
+        const uint p = t * k + j;
+        const float v = expert_out[p * n_embd + c];
+        acc += unweighted ? v : v * weights[p];
+    }
+    dst[gid] = (pc.flags & NF_MOE_WS_ACCUMULATE) != 0 ? acc + dst[gid] : acc;
+}

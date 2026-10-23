@@ -1,0 +1,180 @@
+/* moe_misc.comp - LLM_MoE_HashIds, LLM_AddId, LLM_MoE_Bucketize and LLM_MoE_ScaleInput. GLSL twin
+ * of those kernels in kernels/llm/moe.cl, which is the semantic reference. Requires: common/nf_common.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_AddId	moe_misc.comp	OP=OP_MOE_ADD_ID
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_MOE_HASH_IDS     (i n_tokens, i k, R int tokens, R int tid2eid, W int ids)
+ *                       ids[t * k + j] = tid2eid[tokens[t] * k + j]
+ *   OP_MOE_ADD_ID       (i n_sel, i dim, R int slots, R float bias, float data)
+ *                       data[s * dim + c] += bias[slots[s] * dim + c]
+ *   OP_MOE_BUCKETIZE    (i n_tokens, i k, i n_expert, R int ids, W int counts, W int offsets,
+ *                        W int row_token, W int row_slot)
+ *                       stable counting sort of the pairs by expert (kernels/llm/moe.cl LLM_MoE_Bucketize)
+ *   OP_MOE_SCALE_INPUT  (i n_tokens, i n_embd, i k, R float x, R float weights, W float out)
+ *                       out[(t * k + j) * n_embd + c] = x[t * n_embd + c] * weights[t * k + j]
+ *
+ * Dispatch: OP_MOE_BUCKETIZE is one workgroup, global = local = {L, 1, 1} with L a power of two
+ * <= LLM_DIMX. The others are 1-D element grids, local = {L, 1, 1}, global rounded up to L
+ * (folding-aware nf_global_id()).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_MOE_HASH_IDS    311
+#define OP_MOE_ADD_ID      312
+#define OP_MOE_BUCKETIZE   313
+#define OP_MOE_SCALE_INPUT 314
+
+#ifndef OP
+#error "moe_misc.comp requires OP"
+#endif
+
+#if OP == OP_MOE_HASH_IDS
+layout(std430, binding = 0) readonly buffer NfMmTokens { int tokens[]; };
+layout(std430, binding = 1) readonly buffer NfMmTable { int tid2eid[]; };
+layout(std430, binding = 2) writeonly buffer NfMmIds { int ids[]; };
+layout(push_constant) uniform NfMmParams { int n_tokens; int k; } pc;
+#elif OP == OP_MOE_ADD_ID
+layout(std430, binding = 0) readonly buffer NfMmSlots { int slots[]; };
+layout(std430, binding = 1) readonly buffer NfMmBias { float bias[]; };
+layout(std430, binding = 2) buffer NfMmData { float data[]; };
+layout(push_constant) uniform NfMmParams { int n_sel; int dim; } pc;
+#elif OP == OP_MOE_BUCKETIZE
+#define NF_MOE_MAX_EXPERTS 1024
+layout(std430, binding = 0) readonly buffer NfMmIds { int ids[]; };
+layout(std430, binding = 1) writeonly buffer NfMmCounts { int counts[]; };
+layout(std430, binding = 2) writeonly buffer NfMmOffsets { int offsets[]; };
+layout(std430, binding = 3) writeonly buffer NfMmRowToken { int row_token[]; };
+layout(std430, binding = 4) writeonly buffer NfMmRowSlot { int row_slot[]; };
+layout(push_constant) uniform NfMmParams { int n_tokens; int k; int n_expert; } pc;
+shared int moe_cur[NF_MOE_MAX_EXPERTS + 1];
+shared int moe_chunk[gl_WorkGroupSize.x];
+#elif OP == OP_MOE_SCALE_INPUT
+layout(std430, binding = 0) readonly buffer NfMmX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfMmWeights { float weights[]; };
+layout(std430, binding = 2) writeonly buffer NfMmOut { float y_out[]; };
+layout(push_constant) uniform NfMmParams { int n_tokens; int n_embd; int k; } pc;
+#else
+#error "moe_misc.comp: OP is not a MoE helper op"
+#endif
+
+#if OP == OP_MOE_BUCKETIZE
+/* Bucket of an id: the expert, or n_expert for an id out of range (C nf_moe_bucket). */
+int nf_moe_bucket(int id, int n_expert) {
+    return (id >= 0 && id < n_expert) ? id : n_expert;
+}
+
+/* Rank of this invocation's bucket b among the chunk's earlier entries, and whether it is the last. */
+void nf_moe_rank(int b, out int rank, out bool last) {
+    const uint lid = gl_LocalInvocationID.x;
+    rank = 0;
+    last = true;
+    for (uint l = 0u; l < gl_WorkGroupSize.x; ++l) {
+        if (moe_chunk[l] == b) {
+            if (l < lid) {
+                rank++;
+            } else if (l > lid) {
+                last = false;
+            }
+        }
+    }
+}
+#endif
+
+void main() {
+#if OP == OP_MOE_HASH_IDS
+    const uint gid = nf_global_id();
+    const uint k = uint(pc.k);
+    if (gid >= uint(pc.n_tokens) * k) {
+        return;
+    }
+    ids[gid] = tid2eid[uint(tokens[gid / k]) * k + gid % k];
+#elif OP == OP_MOE_ADD_ID
+    const uint gid = nf_global_id();
+    const uint dim = uint(pc.dim);
+    if (gid >= uint(pc.n_sel) * dim) {
+        return;
+    }
+    data[gid] += bias[uint(slots[gid / dim]) * dim + gid % dim];
+#elif OP == OP_MOE_SCALE_INPUT
+    const uint gid = nf_global_id();
+    const uint n_embd = uint(pc.n_embd);
+    if (gid >= uint(pc.n_tokens) * uint(pc.k) * n_embd) {
+        return;
+    }
+    const uint p = gid / n_embd;
+    const uint c = gid % n_embd;
+    y_out[gid] = x_in[(p / uint(pc.k)) * n_embd + c] * weights[p];
+#elif OP == OP_MOE_BUCKETIZE
+    /* One workgroup; the check is uniform. */
+    if (nf_wg_id() != 0u) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const int n_expert = pc.n_expert;
+    const int n_rows = pc.n_tokens * pc.k;
+    const int nb = n_expert + 1;
+    for (int b = int(lid); b < nb; b += int(lsize)) {
+        moe_cur[b] = 0;
+    }
+    barrier();
+
+    for (int base = 0; base < n_rows; base += int(lsize)) {
+        const int p = base + int(lid);
+        const int b = p < n_rows ? nf_moe_bucket(ids[p], n_expert) : -1;
+        moe_chunk[lid] = b;
+        barrier();
+        if (b >= 0) {
+            int rank;
+            bool last;
+            nf_moe_rank(b, rank, last);
+            if (last) {
+                moe_cur[b] += rank + 1;
+            }
+        }
+        barrier();
+    }
+
+    for (int b = int(lid); b < n_expert; b += int(lsize)) {
+        counts[b] = moe_cur[b];
+    }
+    barrier();
+    if (lid == 0u) {
+        int run = 0;
+        for (int b = 0; b < nb; ++b) {
+            const int c = moe_cur[b];
+            if (b < n_expert) {
+                offsets[b] = run;
+            }
+            moe_cur[b] = run;
+            run += c;
+        }
+    }
+    barrier();
+
+    for (int base = 0; base < n_rows; base += int(lsize)) {
+        const int p = base + int(lid);
+        const int b = p < n_rows ? nf_moe_bucket(ids[p], n_expert) : -1;
+        moe_chunk[lid] = b;
+        barrier();
+        int rank = 0;
+        bool last = true;
+        if (b >= 0) {
+            nf_moe_rank(b, rank, last);
+            const int pos = moe_cur[b] + rank;
+            row_token[pos] = p;
+            row_slot[pos] = b < n_expert ? b : -1;
+        }
+        barrier();
+        if (b >= 0 && last) {
+            moe_cur[b] += rank + 1;
+        }
+        barrier();
+    }
+#endif
+}

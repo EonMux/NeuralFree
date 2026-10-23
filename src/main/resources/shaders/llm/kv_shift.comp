@@ -1,0 +1,201 @@
+/* kv_shift.comp - LLM_KV_RopeShift_<KV> (GLSL twin of kernels/llm/kv_cache.cl, the semantic reference).
+ * Requires: common/nf_common.glsl, common/rope_common.glsl, common/hadamard.glsl, common/kv_types.glsl,
+ * common/kv_quant.glsl.
+ *
+ * A variants row selects the cache type with KV=NF_KV_<type> (common/kv_types.glsl).
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   F32/F16/BF16 (i n_cells, i n_heads, i head_stride, i row_stride, i n_dims, i n_offs, i mode, i has_ff,
+ *                 f theta_scale, f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi,
+ *                 R int delta, R float ff, k_cache)
+ *   block types  the same scalars, then i rot_k; the same buffers
+ * Context shift (llama-kv-cache.cpp:1945-1993): every cell c, delta 0 included (llama-kv-cache.cpp:1545-1556),
+ * rotates dims [n_offs, n_offs + n_dims) of each head (row c at c*row_stride, head h at h*head_stride) by RoPE at
+ * position delta[c]: NORM (mode 0) pairs (2i, 2i+1), every other mode NEOX pairs (i, i + n_dims/2) with exponent i.
+ * has_ff != 0 divides pair i's angle by ff[i]. F32/F16/BF16 rotate in place (F16 and BF16 round to nearest even).
+ * Block types work on the window [w0, w1): the rotated dims widened to multiples of rot_k (rot_k > 0) or of the
+ * 32-element block (nf_kvr_w0 / nf_kvr_w1); the window is dequantized into shared memory, each rot_k chunk is
+ * un-rotated with the normalized Hadamard transform when rot_k > 1, rotated, re-rotated, and each 32-element block
+ * is requantized by the reference quantizer of the type (common/kv_quant.glsl).
+ *
+ * Dispatch: 1-D. F32/F16/BF16: one invocation per pair, g = (c*n_heads + h)*(n_dims/2) + i, global rounded up
+ * to L, local = {L, 1, 1}, no barriers. Block types: one workgroup per (cell, head), linear group
+ * g = c*n_heads + h (nf_wg_id()), global = n_cells*n_heads*L, local = {L, 1, 1}; host preconditions as
+ * kernels/llm/kv_cache.cl.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+#include "common/hadamard.glsl"
+#include "common/kv_types.glsl"
+#include "common/kv_quant.glsl"
+
+#if !defined(KV)
+#error "kv_shift.comp requires KV"
+#endif
+
+layout(std430, binding = 0) readonly buffer NfKvrDelta { int delta[]; };
+layout(std430, binding = 1) readonly buffer NfKvrFf { float ff[]; };
+#if KV == NF_KV_F32
+layout(std430, binding = 2) buffer NfKvrCache { float k_cache[]; };
+#elif KV == NF_KV_F16 || KV == NF_KV_BF16
+layout(std430, binding = 2) buffer NfKvrCache { uint16_t k_cache[]; };
+#elif KV == NF_KV_Q8_0 || KV == NF_KV_Q4_0 || KV == NF_KV_Q4_1 || KV == NF_KV_IQ4_NL || KV == NF_KV_Q5_0 \
+    || KV == NF_KV_Q5_1
+#define NF_KVR_BLOCKS 1
+NF_BUFFER_VIEWS_RW(2, k_cache)
+NF_KV_LOADERS(k_cache)
+NF_KV_STORES(k_cache)
+#else
+#error "kv_shift.comp: KV is not a KV cache type"
+#endif
+
+layout(push_constant) uniform NfKvrParams {
+    int n_cells;
+    int n_heads;
+    int head_stride;
+    int row_stride;
+    int n_dims;
+    int n_offs;
+    int mode;
+    int has_ff;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+#if defined(NF_KVR_BLOCKS)
+    int rot_k;
+#endif
+} pc;
+
+/* Shift pairs use the NORM layout for mode 0 and the NEOX layout otherwise. */
+int nf_kvr_mode() {
+    return pc.mode == NF_ROPE_NORM ? NF_ROPE_NORM : NF_ROPE_NEOX;
+}
+
+/* (cos, sin) of shift pair i at position p. */
+vec2 nf_kvr_cs(int p, int i) {
+    const float f = pc.has_ff != 0 ? ff[i] : 1.0;
+    return nf_rope_cs(p, i, pc.theta_scale, f, pc.freq_scale, pc.ext_factor, pc.attn_factor,
+                      pc.corr_lo, pc.corr_hi, i);
+}
+
+#if defined(NF_KVR_BLOCKS)
+
+shared float nf_kvr_buf[NF_ROPE_SHIFT_MAX_DIMS];
+
+/* Window granule: the Hadamard chunk when the cache is rotated, else the 32-value block (C nf_rope_shift_granule). */
+uint nf_kvr_granule(uint rot_k) {
+    return rot_k > 0u ? rot_k : NF_KV_BLOCK;
+}
+
+/* Window start: n_offs rounded down to the granule (C nf_rope_shift_w0). */
+uint nf_kvr_w0(uint n_offs, uint rot_k) {
+    const uint g = nf_kvr_granule(rot_k);
+    return (n_offs / g) * g;
+}
+
+/* Window end: n_offs + n_dims rounded up to the granule (C nf_rope_shift_w1). */
+uint nf_kvr_w1(uint n_dims, uint n_offs, uint rot_k) {
+    const uint g = nf_kvr_granule(rot_k);
+    return ((n_offs + n_dims + g - 1u) / g) * g;
+}
+
+/* Normalized Sylvester FWHT of each rot_k chunk of nf_kvr_buf (C nf_fwht_local, common/hadamard.glsl). */
+NF_FWHT_SHARED_FN(nf_kvr_fwht, nf_kvr_buf)
+
+void main() {
+    const uint heads = uint(max(pc.n_heads, 1));
+    const uint g = nf_wg_id();
+    const uint c = g / heads;
+    const uint h = g - c * heads;
+    const uint n_dims = uint(max(pc.n_dims, 0));
+    const uint n_offs = uint(max(pc.n_offs, 0));
+    const uint rot_k = uint(max(pc.rot_k, 0));
+    const uint w0 = nf_kvr_w0(n_offs, rot_k);
+    const uint width = nf_kvr_w1(n_dims, n_offs, rot_k) - w0;
+    /* Uniform per workgroup: a dead group leaves before any barrier. */
+    if (c >= uint(pc.n_cells) || n_dims == 0u || width > uint(NF_ROPE_SHIFT_MAX_DIMS)) {
+        return;
+    }
+    const int p = delta[c];
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    /* First element of the window (row, head and w0 are multiples of 32); rotated dims start at buf[r0]. */
+    const uint e0 = c * uint(pc.row_stride) + h * uint(pc.head_stride) + w0;
+    const uint nblk = width / NF_KV_BLOCK;
+    const uint r0 = n_offs - w0;
+
+    for (uint j = lid; j < width; j += lsize) {
+        nf_kvr_buf[j] = k_cache_kv_load1(e0 + j, KV);
+    }
+    barrier();
+
+    if (rot_k > 1u) {
+        nf_kvr_fwht(0u, width, rot_k);
+    }
+
+    const int m = nf_kvr_mode();
+    for (uint i = lid; i < (n_dims >> 1); i += lsize) {
+        const vec2 cs = nf_kvr_cs(p, int(i));
+        const uint a = r0 + uint(nf_rope_first(m, int(i)));
+        const uint b = a + uint(nf_rope_span(m, int(n_dims)));
+        const float x0 = nf_kvr_buf[a];
+        const float x1 = nf_kvr_buf[b];
+        nf_kvr_buf[a] = x0 * cs.x - x1 * cs.y;
+        nf_kvr_buf[b] = x0 * cs.y + x1 * cs.x;
+    }
+    barrier();
+
+    if (rot_k > 1u) {
+        nf_kvr_fwht(0u, width, rot_k);
+    }
+
+    for (uint k = lid; k < nblk; k += lsize) {
+        float x[32];
+        for (uint j = 0u; j < NF_KV_BLOCK; ++j) {
+            x[j] = nf_kvr_buf[k * NF_KV_BLOCK + j];
+        }
+        k_cache_kv_store_block(e0 + k * NF_KV_BLOCK, x, KV);
+    }
+}
+
+#else
+
+void main() {
+    const uint n_pairs = uint(max(pc.n_dims, 0)) >> 1;
+    const uint gid = nf_global_id();
+    if (n_pairs == 0u || gid >= uint(pc.n_cells) * uint(pc.n_heads) * n_pairs) {
+        return;
+    }
+    const int i = int(gid % n_pairs);
+    const uint ch = gid / n_pairs;
+    const uint h = ch % uint(pc.n_heads);
+    const uint c = ch / uint(pc.n_heads);
+    const int p = delta[c];
+    const vec2 cs = nf_kvr_cs(p, i);
+    const int m = nf_kvr_mode();
+    const uint a = c * uint(pc.row_stride) + h * uint(pc.head_stride) + uint(pc.n_offs) + uint(nf_rope_first(m, i));
+    const uint b = a + uint(nf_rope_span(m, pc.n_dims));
+#if KV == NF_KV_F32
+    const float x0 = k_cache[a];
+    const float x1 = k_cache[b];
+    k_cache[a] = x0 * cs.x - x1 * cs.y;
+    k_cache[b] = x0 * cs.y + x1 * cs.x;
+#elif KV == NF_KV_F16
+    const float x0 = nf_half(uint(k_cache[a]));
+    const float x1 = nf_half(uint(k_cache[b]));
+    k_cache[a] = uint16_t(nf_rope_f16_bits(x0 * cs.x - x1 * cs.y));
+    k_cache[b] = uint16_t(nf_rope_f16_bits(x0 * cs.y + x1 * cs.x));
+#else
+    const float x0 = nf_bf16(uint(k_cache[a]));
+    const float x1 = nf_bf16(uint(k_cache[b]));
+    k_cache[a] = uint16_t(nf_kv_bf16_bits(x0 * cs.x - x1 * cs.y));
+    k_cache[b] = uint16_t(nf_kv_bf16_bits(x0 * cs.y + x1 * cs.x));
+#endif
+}
+
+#endif

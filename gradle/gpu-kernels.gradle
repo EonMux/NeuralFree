@@ -1,0 +1,680 @@
+/*
+ * GPU kernel build: CUDA modules, Vulkan SPIR-V with argument signatures, the kernel inventory check and the
+ * OpenCL syntax check of every kernel library. Applied from build.gradle; processResources merges every
+ * generated directory.
+ *
+ * This script holds the configuration and the task wiring. The helper classes live in buildSrc, package
+ * neuralfree.gpu (buildSrc/src/main/groovy/neuralfree/gpu): GpuBuildTools (tool lookup, processes, parallel
+ * jobs, files), GpuKernelSources (manifests, source assembly, kernel-signature scanning), GpuShaderVariants
+ * (variant tables), GpuSpirvSignature (SPIR-V argument signatures), GpuKernelLibrary (one library's roots and
+ * options), GpuInventory (inventory format, reading and coverage) and GpuCudaToolkit (nvcc release and archs).
+ *
+ * Kernel libraries (gpuLibraryDefinitions; KernelLibraries registers the same roots): llm, the GGUF engine
+ * (fast-math CUDA, subgroup variants), and train, tensors, training and classical ML (precise CUDA math, no
+ * subgroup variants). Every task processes every library unless -Pneuralfree.gpu.libraries restricts the run.
+ *
+ * Sources (src/main/resources), per library <lib>:
+ *   kernels/<lib>/manifest.txt    ordered dual-dialect sources, one path per line; "[opencl] " marks OpenCL-only
+ *                                 files; "[shared] " marks a header under kernels/ instead of kernels/<lib>/ (listed
+ *                                 before the library's own entries, so it comes first in every program and CUDA
+ *                                 unit); "#" starts a comment line
+ *   kernels/<lib>/inventory.txt   checked-in, generated: one line per non-OpenCL-only kernel,
+ *                                 kernel_name<TAB>source<TAB>buffers<TAB>scalars<TAB>scalar kinds (i,u,f)
+ *                                 <TAB>parameter layout (one character per parameter in declaration order:
+ *                                 B for a buffer, else the scalar kind; read by KernelSignature.parseInventory);
+ *                                 "#" starts a comment line. updateKernelInventory rewrites it from the kernel
+ *                                 sources; inventoryCheck fails when it is stale. Both preprocess the sources
+ *                                 with clang, or with nvcc when clang is absent; without either, inventoryCheck
+ *                                 checks the file's format and shader-variant coverage only, and the file is
+ *                                 used as checked in.
+ *   shaders/<lib>/variants/*.tsv  kernel_name<TAB>source.comp<TAB>defines (NAME=VALUE ...)<TAB>flags (sg; only
+ *                                 for libraries with subgroup variants)
+ *   kernels/common/               shared dual-dialect headers ([shared] entries, e.g. common/dialect.h)
+ *   shaders/common/               shared GLSL includes (common/nf_base.glsl); library shaders compile with the include
+ *                                 directories [shaders/<lib>, shaders]; no library has its own copy of one
+ *   shaders/test/*.comp           backend test shaders, compiled one to one
+ *   Every other compute shader belongs to a kernel library; compileShaders rejects a .comp file anywhere else.
+ *
+ * Generated (build/generated/gpu/<dir>, each laid out as classpath resources):
+ *   cuda/kernels/<lib>/cuda/      <stem>.fatbin (or <stem>.ptx with ptxOnly), one per non-OpenCL-only .cl that
+ *                                 defines kernels (the non-OpenCL-only headers in manifest order, then the .cl);
+ *                                 index.tsv (kernel_name<TAB>classpath resource of its module); build.properties
+ *                                 (nvcc.version, cuda.toolkit, cuda.driver.min, sass.archs, ptx.archs, kernel.format,
+ *                                 and fa.smem.floats for a library compiled with NF_FA_SMEM_FLOATS)
+ *   spv/shaders/<lib>/            <Kernel>.spv, <Kernel>__sg.spv for rows flagged sg, and index.properties
+ *                                 (<Kernel>.buffers, .ro, .push, .sg; read by KernelSignature.parse)
+ *   spv-test/shaders/test/        backend test shaders
+ *   check/opencl.stamp            written when checkOpenCLKernels passes
+ *   check/inventory.stamp         written when inventoryCheck has compared the inventories with the sources
+ *
+ * Project properties (-P):
+ *   nvcc                     path of nvcc (default: $CUDA_HOME/bin, $CUDA_PATH/bin, /opt/cuda/bin,
+ *                            /usr/local/cuda/bin, PATH)
+ *   nvcc.ccbin               host compiler passed to nvcc as -ccbin
+ *   neuralfree.cuda.archs    comma-separated SM list (default 75,80,86,89,90,100,120), intersected with
+ *                            nvcc --list-gpu-code; SASS for each, PTX for the lowest and the highest
+ *   neuralfree.cuda.ptxOnly  emit PTX for the lowest arch only (nvcc --ptx), for a quick compile check
+ *   neuralfree.glslc         path of glslc (default: $VULKAN_SDK/bin, /usr/bin, /usr/local/bin, PATH;
+ *                            glslangValidator is the fallback compiler)
+ *   neuralfree.clang         path of clang (default: /usr/bin, /usr/local/bin, PATH)
+ *   neuralfree.requireCuda, neuralfree.requireShaders
+ *                            fail instead of warning when nvcc, or the shader compiler and spirv-dis, are missing
+ *   neuralfree.gpu.libraries comma-separated library ids (default: all) the kernel tasks build and check; for
+ *                            developer speed only: the other libraries' artifacts are then missing from the build
+ *
+ * A missing nvcc, shader compiler or spirv-dis makes its compile task warn and produce nothing, so the
+ * matching backend reports the kernel libraries unavailable at run time. A missing clang skips the OpenCL
+ * syntax check and leaves the inventory tasks to nvcc's preprocessor.
+ */
+
+import neuralfree.gpu.GpuBuildTools
+import neuralfree.gpu.GpuCudaToolkit
+import neuralfree.gpu.GpuInventory
+import neuralfree.gpu.GpuKernelLibrary
+import neuralfree.gpu.GpuKernelSources
+import neuralfree.gpu.GpuShaderVariants
+import neuralfree.gpu.GpuSpirvSignature
+import org.gradle.api.GradleException
+
+import java.util.concurrent.Callable
+
+// ---------------------------------------------------------------------------------------------------
+// Configuration
+
+def gpuResources = file('src/main/resources')
+/** Root of the [shared] manifest entries (KernelManifest.SHARED_ROOT). */
+def gpuSharedKernelRoot = new File(gpuResources, 'kernels')
+def gpuShaderRoot = new File(gpuResources, 'shaders')
+def gpuTestShaderDir = new File(gpuShaderRoot, 'test')
+def gpuOut = layout.buildDirectory.dir('generated/gpu')
+def gpuInventoryCommand = (GpuBuildTools.WINDOWS ? 'gradlew.bat' : './gradlew') + ' updateKernelInventory'
+
+def gpuProp = { String name -> findProperty(name)?.toString() }
+def gpuNvccPath = gpuProp('nvcc')
+def gpuNvccCcbin = gpuProp('nvcc.ccbin')
+def gpuCudaArchs = gpuProp('neuralfree.cuda.archs') ?: '75,80,86,89,90,100,120'
+def gpuPtxOnly = GpuBuildTools.flag(gpuProp('neuralfree.cuda.ptxOnly'), 'neuralfree.cuda.ptxOnly')
+def gpuRequireCuda = GpuBuildTools.flag(gpuProp('neuralfree.requireCuda'), 'neuralfree.requireCuda')
+def gpuRequireShaders = GpuBuildTools.flag(gpuProp('neuralfree.requireShaders'), 'neuralfree.requireShaders')
+def gpuGlslcPath = gpuProp('neuralfree.glslc')
+def gpuClangPath = gpuProp('neuralfree.clang')
+/** -DNF_FA_SMEM_FLOATS of the LLM CUDA modules (static shared memory of the flash kernels; FaSmem.MAX_FLOATS). */
+def gpuCudaSmemFloats = 11264
+
+/** Every kernel library, with the roots its KernelLibraries config registers. cudaFlags set the nvcc math mode;
+ *  faSmemFloats adds -DNF_FA_SMEM_FLOATS to the library's CUDA units and records it in build.properties. */
+def gpuLibraryDefinitions = [
+        [id              : 'llm', kernelRoot: 'kernels/llm', cudaDir: 'kernels/llm/cuda', shaderRoot: 'shaders/llm',
+         cudaFlags       : ['-ftz=true', '-prec-div=false', '-prec-sqrt=false', '-fmad=true'], faSmemFloats: gpuCudaSmemFloats,
+         subgroupVariants: true, compareKinds: true],
+        [id              : 'train', kernelRoot: 'kernels/train', cudaDir: 'kernels/train/cuda', shaderRoot: 'shaders/train',
+         cudaFlags       : ['-ftz=false', '-prec-div=true', '-prec-sqrt=true', '-fmad=false'],
+         subgroupVariants: false, compareKinds: true]
+]
+def gpuAllLibraries = gpuLibraryDefinitions.collect { Map spec -> new GpuKernelLibrary(spec, gpuResources, projectDir) }
+['id', 'kernelRootPath', 'cudaDir', 'shaderRootPath'].each { String field ->
+    List<String> values = gpuAllLibraries.collect { it."${field}" as String }
+    if (values.unique(false).size() != values.size()) {
+        throw new GradleException("GPU kernel libraries share a ${field}: ${values}")
+    }
+}
+
+/** The libraries the kernel tasks build and check: all, or the -Pneuralfree.gpu.libraries selection. */
+def gpuLibraries = gpuAllLibraries
+def gpuLibrarySelection = gpuProp('neuralfree.gpu.libraries')
+if (gpuLibrarySelection != null) {
+    List<String> ids = gpuLibrarySelection.split(',').collect { it.trim() }.findAll { !it.isEmpty() }
+    if (ids.isEmpty() || !gpuAllLibraries.collect { it.id }.containsAll(ids)) {
+        throw new GradleException("-Pneuralfree.gpu.libraries must list kernel libraries among ${gpuAllLibraries}, got '${gpuLibrarySelection}'")
+    }
+    gpuLibraries = gpuAllLibraries.findAll { ids.contains(it.id) }
+    if (gpuLibraries.size() < gpuAllLibraries.size()) {
+        logger.warn("WARNING: -Pneuralfree.gpu.libraries=${gpuLibrarySelection}: the GPU kernel tasks build and check only "
+                + "${gpuLibraries}; the artifacts of ${gpuAllLibraries - gpuLibraries} are missing from this build")
+    }
+}
+def gpuLibrariesFingerprint = gpuLibraries.collect { it.fingerprint() }.join(' ')
+/** The shaders/ directories that may hold compute shaders: every library's (selected or not) and the tests. */
+def gpuShaderOwnerDirs = gpuAllLibraries.collect { it.shaderDirName } + ['test']
+
+/** Selected libraries' sources and manifests, inventories, variant tables; rooted at resources for unique paths. */
+def gpuKernelSources = fileTree(dir: gpuResources, includes: gpuLibraries.collect { "${it.kernelRootPath}/**".toString() },
+        excludes: gpuLibraries.collect { "${it.kernelRootPath}/inventory.txt".toString() })
+def gpuInventoryFiles = fileTree(dir: gpuResources, includes: gpuLibraries.collect { "${it.kernelRootPath}/inventory.txt".toString() })
+def gpuVariantTables = fileTree(dir: gpuResources, includes: gpuLibraries.collect { "${it.shaderRootPath}/variants/**".toString() })
+/** The shared headers the selected libraries' manifests list, resolved when a task fingerprints its inputs. */
+def gpuSharedKernelSources = files({ ->
+    gpuLibraries.collectMany { GpuKernelLibrary lib -> lib.manifest(gpuSharedKernelRoot).findAll { it.shared }.collect { (File) it.file } }.unique()
+})
+
+def gpuCudaDirs = { ->
+    [System.getenv('CUDA_HOME'), System.getenv('CUDA_PATH')].findAll { it }.collect { new File(it, 'bin').path } +
+            ['/opt/cuda/bin', '/usr/local/cuda/bin']
+}
+def gpuVulkanDirs = { ->
+    [System.getenv('VULKAN_SDK')].findAll { it }.collect { new File(it, 'bin').path } + ['/usr/bin', '/usr/local/bin']
+}
+def gpuFindNvcc = { -> GpuBuildTools.find(gpuNvccPath, 'nvcc', 'nvcc', gpuCudaDirs()) }
+def gpuFindClang = { -> GpuBuildTools.find(gpuClangPath, 'neuralfree.clang', 'clang', ['/usr/bin', '/usr/local/bin']) }
+
+/** Shader toolchain: [compiler, glslc (true) or glslangValidator, dis, opt, val]; absent tools are null. */
+def gpuShaderTools = { ->
+    File glslc = GpuBuildTools.find(gpuGlslcPath, 'neuralfree.glslc', 'glslc', gpuVulkanDirs())
+    File compiler = glslc ?: GpuBuildTools.find(null, null, 'glslangValidator', gpuVulkanDirs())
+    List<String> near = (compiler == null ? [] : [compiler.parent]) + gpuVulkanDirs()
+    [compiler: compiler, glslc: glslc != null,
+     dis     : GpuBuildTools.find(null, null, 'spirv-dis', near),
+     opt     : GpuBuildTools.find(null, null, 'spirv-opt', near),
+     val     : GpuBuildTools.find(null, null, 'spirv-val', near)]
+}
+def gpuShaderToolsFingerprint = { ->
+    Map t = gpuShaderTools()
+    ['compiler', 'dis', 'opt', 'val'].collect { GpuBuildTools.fingerprint((File) t[it]) }.join(' | ')
+}
+
+/** Compiles one GLSL compute shader for Vulkan 1.2 without optimization. */
+def gpuCompileGlsl = { Map tools, File src, File out, List<File> includes, List<String> defines, String what ->
+    List<Object> cmd = tools.glslc
+            ? [tools.compiler, '--target-env=vulkan1.2', '-fshader-stage=compute']
+            : [tools.compiler, '-V', '--target-env', 'vulkan1.2', '-S', 'comp']
+    includes.each { File dir -> cmd.addAll(tools.glslc ? ['-I', dir.absolutePath] : ['-I' + dir.absolutePath]) }
+    defines.each { String d -> cmd.add('-D' + d) }
+    cmd.addAll([src, '-o', out])
+    out.parentFile.mkdirs()
+    GpuBuildTools.runChecked(cmd, null, "compiling ${what}")
+}
+
+def gpuValidateSpirv = { Map tools, File spv, String what ->
+    if (tools.val != null) {
+        GpuBuildTools.runChecked([tools.val, '--target-env', 'vulkan1.2', spv], null, "spirv-val of ${what}")
+    }
+}
+
+/** Compiles the backend test shaders one to one into <out>/shaders/<path relative to the shader root>.spv. */
+def gpuCompileShaderTree = { Map tools, List<File> sources, File out, String what ->
+    List<Callable<Object>> jobs = sources.collect { File src ->
+        ({ ->
+            String rel = GpuBuildTools.relative(gpuShaderRoot, src)
+            File spv = new File(out, 'shaders/' + rel.substring(0, rel.length() - '.comp'.length()) + '.spv')
+            gpuCompileGlsl(tools, src, spv, [src.parentFile, gpuShaderRoot], [], 'shaders/' + rel)
+            gpuValidateSpirv(tools, spv, 'shaders/' + rel)
+            null
+        }) as Callable<Object>
+    }
+    GpuBuildTools.parallel(jobs, GpuBuildTools.CORES, what)
+}
+
+/**
+ * Builds one library variant (or its __sg twin): compile without -O with the include directories
+ * [shaders/<lib>, shaders], record the signature from the unoptimized module, optimize with bindings and spec
+ * constants preserved, validate.
+ */
+def gpuBuildVariant = { Map tools, GpuKernelLibrary lib, Map row, boolean sg, File tmp, File libOut ->
+    String name = row.name + (sg ? '__sg' : '')
+    String what = "${lib.shaderRootPath}/variants/${row.location} ${name} (${row.source} ${(row.defines + (sg ? ['USE_SUBGROUPS=1'] : [])).join(' ')})"
+    File unoptimized = new File(tmp, name + '.spv')
+    gpuCompileGlsl(tools, new File(lib.shaderRoot, (String) row.source), unoptimized, [lib.shaderRoot, gpuShaderRoot],
+            row.defines + (sg ? ['USE_SUBGROUPS=1'] : []), what)
+    String dis = GpuBuildTools.runChecked([tools.dis, '--raw-id', unoptimized], null, "spirv-dis of ${what}")
+    Map signature = GpuSpirvSignature.parse(dis, what)
+    File spv = new File(libOut, name + '.spv')
+    if (tools.opt != null) {
+        GpuBuildTools.runChecked([tools.opt, '-O', '--preserve-bindings', '--preserve-spec-constants', unoptimized, '-o', spv],
+                null, "spirv-opt of ${what}")
+    } else {
+        GpuBuildTools.copy(unoptimized, spv)
+    }
+    gpuValidateSpirv(tools, spv, what)
+    return signature
+}
+
+/**
+ * Preprocesses one CUDA translation unit per non-OpenCL-only .cl of a library (every non-OpenCL-only manifest
+ * header in manifest order, which puts the shared headers first, then the .cl) with nvcc -E. Returns
+ * [unit, stem, tu, kernels] per unit; a unit may define no kernels. A kernel defined outside its .cl throws.
+ */
+def gpuCudaUnits = { File nvcc, GpuKernelLibrary lib, List<Map> manifest, File tmp ->
+    List<Map> headers = manifest.findAll { !it.openClOnly && ((String) it.path).endsWith('.h') }
+    List<Map> units = manifest.findAll { !it.openClOnly && ((String) it.path).endsWith('.cl') }
+    Set<String> manifestPaths = manifest.collect { (String) it.path } as Set
+    List<Callable<Map>> jobs = units.collect { Map unit ->
+        ({ ->
+            String stem = GpuKernelSources.stem((String) unit.path)
+            File tu = new File(tmp, stem + '.cu')
+            GpuBuildTools.writeText(tu, GpuKernelSources.concatenate(headers + [unit]))
+            File ii = new File(tmp, stem + '.ii')
+            List<Object> cmd = [nvcc, '-E', '-std=c++17'] + lib.cudaDefines()
+            if (gpuNvccCcbin) {
+                cmd.addAll(['-ccbin', gpuNvccCcbin])
+            }
+            cmd.addAll([tu, '-o', ii])
+            GpuBuildTools.runChecked(cmd, tmp, "preprocessing ${lib.kernelRootPath}/${unit.path} for CUDA")
+            List<Map> found = GpuKernelSources.scanKernels(ii.getText('UTF-8')).findAll { manifestPaths.contains(it.file) }
+            List<Map> misplaced = found.findAll { it.file != unit.path }
+            if (!misplaced.isEmpty()) {
+                throw new GradleException("${lib.id}: kernels ${misplaced.collect { it.name + ' (' + it.file + ')' }} are defined outside a .cl file; headers hold only helpers, tables and macros")
+            }
+            [unit: unit.path, stem: stem, tu: tu, kernels: found]
+        }) as Callable<Map>
+    }
+    return GpuBuildTools.parallel(jobs, GpuBuildTools.CORES, "CUDA preprocessing of ${lib.id}")
+}
+
+/**
+ * Generates a library's inventory text from its kernel sources, preprocessed with clang (OpenCL C) or, when
+ * clang is absent, with nvcc (one CUDA unit per untagged .cl), after checking the argument limits and the
+ * shader-variant coverage. Returns [text, kernels, openClOnly, preprocessor], or null when neither
+ * preprocessor is found.
+ */
+def gpuGenerateInventory = { Task task, GpuKernelLibrary lib ->
+    List<Map> manifest = lib.manifest(gpuSharedKernelRoot)
+    Map<String, Boolean> openClOnly = manifest.collectEntries { [(it.path): it.openClOnly] }
+    List<Map> kernels
+    String preprocessor
+    File clang = gpuFindClang()
+    File nvcc = clang == null ? gpuFindNvcc() : null
+    if (clang != null) {
+        File cl = new File(task.temporaryDir, "${lib.id}_kernels.cl")
+        File ii = new File(task.temporaryDir, "${lib.id}_kernels.i")
+        GpuBuildTools.writeText(cl, GpuKernelSources.concatenate(manifest))
+        GpuBuildTools.runChecked([clang, '-x', 'cl', '-cl-std=CL1.2', '-Xclang', '-finclude-default-header', '-E', cl, '-o', ii],
+                task.temporaryDir, "preprocessing the ${lib.id} OpenCL kernel sources")
+        kernels = GpuKernelSources.scanKernels(ii.getText('UTF-8')).findAll { openClOnly.containsKey(it.file) }
+        List<Map> inHeaders = kernels.findAll { ((String) it.file).endsWith('.h') }
+        if (!inHeaders.isEmpty()) {
+            throw new GradleException("${lib.id}: kernels ${inHeaders.collect { it.name + ' (' + it.file + ')' }} are defined in headers; headers hold only helpers, tables and macros")
+        }
+        preprocessor = 'clang'
+    } else if (nvcc != null) {
+        task.logger.warn("WARNING: clang not found: ${lib.id} inventory taken from the CUDA preprocessor; OpenCL-only kernels are not checked")
+        File tmp = new File(task.temporaryDir, "units/${lib.id}")
+        GpuBuildTools.resetDir(tmp)
+        kernels = gpuCudaUnits(nvcc, lib, manifest, tmp).collectMany { (List<Map>) it.kernels }
+        preprocessor = 'nvcc'
+    } else {
+        return null
+    }
+    GpuKernelSources.requireUniqueKernels(lib.id, kernels)
+
+    List<String> problems = []
+    kernels.each { Map k ->
+        GpuKernelSources.violations(k, openClOnly.get(k.file)).each { problems.add("${k.name} (${k.file}): ${it}") }
+    }
+    List<Map> inventory = kernels.findAll { !openClOnly.get(it.file) }.sort { it.name }
+    problems.addAll(GpuInventory.variantCoverageProblems(lib, inventory.collect { (String) it.name } as Set))
+    if (!problems.isEmpty()) {
+        throw new GradleException("${lib.label} kernel inventory check failed:\n  " + problems.join('\n  '))
+    }
+    String text = GpuInventory.text(lib, inventory)
+    return [text: text, kernels: inventory.size(), openClOnly: kernels.size() - inventory.size(), preprocessor: preprocessor]
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Tasks
+
+tasks.register('compileCudaKernels') {
+    group = 'build'
+    description = 'Compiles every kernel library to CUDA modules with index.tsv and build.properties (build/generated/gpu/cuda)'
+    def outDir = gpuOut.map { it.dir('cuda') }
+    inputs.files(gpuKernelSources).withPropertyName('kernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuSharedKernelSources).withPropertyName('sharedKernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('libraries', gpuLibrariesFingerprint)
+    inputs.property('nvcc', providers.provider { GpuBuildTools.fingerprint(gpuFindNvcc()) })
+    inputs.property('ccbin', gpuNvccCcbin ?: '')
+    inputs.property('archs', gpuCudaArchs)
+    inputs.property('ptxOnly', gpuPtxOnly)
+    inputs.property('requireCuda', gpuRequireCuda)
+    outputs.dir(outDir)
+    doLast { task ->
+        File out = outDir.get().asFile
+        GpuBuildTools.resetDir(out)
+        File nvcc = gpuFindNvcc()
+        if (nvcc == null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireCuda, 'neuralfree.requireCuda',
+                    "nvcc not found: CUDA kernels of ${gpuLibraries} not built; the CUDA backend reports those kernel libraries unavailable")
+            return
+        }
+        Map version = GpuCudaToolkit.version(nvcc)
+        Map archs = GpuCudaToolkit.selectArchs(nvcc, gpuCudaArchs)
+        List<Integer> sass = gpuPtxOnly ? [] : (List<Integer>) archs.selected
+        List<Integer> ptx = gpuPtxOnly ? [archs.selected[0]] : [archs.selected[0], archs.selected[-1]].unique()
+        if (!archs.dropped.isEmpty()) {
+            task.logger.warn("WARNING: nvcc ${version.full} does not support CUDA archs ${archs.dropped}; building ${archs.selected}")
+        }
+        String extension = gpuPtxOnly ? '.ptx' : '.fatbin'
+        Closure<List<Object>> compileCommand = { GpuKernelLibrary lib ->
+            List<Object> base = [nvcc, '-std=c++17', '-O3'] + lib.cudaFlags + lib.cudaDefines() + ['-Wno-deprecated-gpu-targets']
+            if (gpuNvccCcbin) {
+                base.addAll(['-ccbin', gpuNvccCcbin])
+            }
+            if (gpuPtxOnly) {
+                return base + ['--ptx', "-arch=compute_${ptx[0]}"]
+            }
+            List<Object> fatbin = base + ['--fatbin', '-Xptxas', '-O3', '--threads', '0']
+            sass.each { fatbin.addAll(['-gencode', "arch=compute_${it},code=sm_${it}"]) }
+            ptx.each { fatbin.addAll(['-gencode', "arch=compute_${it},code=compute_${it}"]) }
+            return fatbin
+        }
+
+        Map<GpuKernelLibrary, List<Map>> unitsByLibrary = new LinkedHashMap<>()
+        List<Callable<Object>> jobs = []
+        gpuLibraries.each { GpuKernelLibrary lib ->
+            File tmp = new File(task.temporaryDir, "units/${lib.id}")
+            GpuBuildTools.resetDir(tmp)
+            List<Map> units = gpuCudaUnits(nvcc, lib, lib.manifest(gpuSharedKernelRoot), tmp)
+            GpuKernelSources.requireUniqueKernels(lib.id, units.collectMany { (List<Map>) it.kernels })
+            unitsByLibrary[lib] = units
+            File cudaOut = new File(out, lib.cudaDir)
+            cudaOut.mkdirs()
+            List<Object> compile = compileCommand(lib)
+            units.each { Map unit ->
+                jobs.add(({ ->
+                    File module = new File(tmp, unit.stem + extension)
+                    String log = GpuBuildTools.runChecked(compile + [unit.tu, '-o', module], tmp, "nvcc ${lib.kernelRootPath}/${unit.unit}")
+                    if (!log.trim().isEmpty()) {
+                        task.logger.info("nvcc ${lib.kernelRootPath}/${unit.unit}:\n${log}")
+                    }
+                    if (!((List) unit.kernels).isEmpty()) {
+                        GpuBuildTools.copy(module, new File(cudaOut, unit.stem + extension))
+                    }
+                    null
+                }) as Callable<Object>)
+            }
+        }
+        int threads = gpuPtxOnly ? GpuBuildTools.CORES : Math.max(1, (int) (GpuBuildTools.CORES / 4))
+        GpuBuildTools.parallel(jobs, threads, 'CUDA kernel compilation')
+
+        List<String> summary = []
+        unitsByLibrary.each { GpuKernelLibrary lib, List<Map> units ->
+            File cudaOut = new File(out, lib.cudaDir)
+            List<String> index = []
+            units.each { Map unit ->
+                String resource = lib.cudaDir + '/' + unit.stem + extension
+                ((List<Map>) unit.kernels).each { index.add(it.name + '\t' + resource) }
+            }
+            GpuBuildTools.writeText(new File(cudaOut, 'index.tsv'), index.sort().collect { it + '\n' }.join(''))
+            List<String> properties = [
+                    "nvcc.version=${version.full}",
+                    "cuda.toolkit=${version.toolkit}",
+                    "cuda.driver.min=${version.driverMin}",
+                    "sass.archs=${sass.join(',')}",
+                    "ptx.archs=${ptx.join(',')}",
+                    "kernel.format=${extension.substring(1)}"
+            ].collect { it.toString() }
+            if (lib.faSmemFloats != null) {
+                properties.add("fa.smem.floats=${lib.faSmemFloats}".toString())
+            }
+            GpuBuildTools.writeText(new File(cudaOut, 'build.properties'), properties.collect { it + '\n' }.join(''))
+            summary.add("${lib.id} ${index.size()} kernels in ${units.count { !((List) it.kernels).isEmpty() }} modules")
+        }
+        task.logger.lifecycle("compileCudaKernels: ${summary.join(', ')} (nvcc ${version.full}; SASS ${sass ?: 'none'}; PTX ${ptx})")
+    }
+}
+
+tasks.register('compileShaders') {
+    group = 'build'
+    description = 'Compiles every kernel library\'s shader variants to SPIR-V (build/generated/gpu/spv)'
+    def outDir = gpuOut.map { it.dir('spv') }
+    inputs.files(fileTree(gpuShaderRoot) { exclude 'test/**' }).withPropertyName('shaderSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('libraries', gpuLibrariesFingerprint)
+    inputs.property('tools', providers.provider { gpuShaderToolsFingerprint() })
+    inputs.property('requireShaders', gpuRequireShaders)
+    outputs.dir(outDir)
+    doLast { task ->
+        File out = outDir.get().asFile
+        GpuBuildTools.resetDir(out)
+        List<String> unowned = GpuBuildTools.listFiles(gpuShaderRoot, '.comp', gpuShaderOwnerDirs)
+                .collect { 'shaders/' + GpuBuildTools.relative(gpuShaderRoot, it) }
+        if (!unowned.isEmpty()) {
+            throw new GradleException("Compute shaders outside every kernel library: ${unowned.join(', ')}. A shader belongs to "
+                    + "a kernel library (${gpuAllLibraries.collect { it.shaderRootPath }.join(', ')}), built from its variants "
+                    + 'tables, or to shaders/test')
+        }
+        Map tools = gpuShaderTools()
+        if (tools.compiler == null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireShaders, 'neuralfree.requireShaders',
+                    'glslc and glslangValidator not found: Vulkan shaders not compiled; the Vulkan backend has no kernels')
+            return
+        }
+        if (tools.val == null) {
+            task.logger.warn('WARNING: spirv-val not found: SPIR-V modules are not validated')
+        }
+        Map<GpuKernelLibrary, List<Map>> rowsByLibrary = gpuLibraries.collectEntries { GpuKernelLibrary lib ->
+            [(lib): GpuShaderVariants.read(lib.variantsDir, lib.shaderRoot, lib.subgroupVariants)]
+        }
+        boolean anyRows = rowsByLibrary.values().any { !it.isEmpty() }
+        if (anyRows && tools.dis == null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireShaders, 'neuralfree.requireShaders',
+                    "spirv-dis not found: kernel-library shader signatures cannot be recorded; Vulkan kernels of ${gpuLibraries} not built")
+            return
+        }
+        if (anyRows && tools.opt == null) {
+            task.logger.warn('WARNING: spirv-opt not found: kernel-library SPIR-V modules are shipped unoptimized')
+        }
+        List<Callable<Map>> jobs = []
+        rowsByLibrary.each { GpuKernelLibrary lib, List<Map> rows ->
+            File libOut = new File(out, lib.shaderRootPath)
+            libOut.mkdirs()
+            File tmp = new File(task.temporaryDir, lib.id)
+            GpuBuildTools.resetDir(tmp)
+            rows.each { Map row ->
+                jobs.add(({ ->
+                    Map signature = gpuBuildVariant(tools, lib, row, false, tmp, libOut)
+                    if (row.sg) {
+                        Map sgSignature = gpuBuildVariant(tools, lib, row, true, tmp, libOut)
+                        if (sgSignature != signature) {
+                            throw new GradleException("${lib.shaderRootPath}/variants/${row.location} ${row.name}: the __sg variant's arguments ${sgSignature} differ from the plain variant's ${signature}")
+                        }
+                    }
+                    [library: lib, name: row.name, sg: row.sg, signature: signature]
+                }) as Callable<Map>)
+            }
+        }
+        List<Map> built = GpuBuildTools.parallel(jobs, GpuBuildTools.CORES, 'kernel-library shader compilation')
+        List<String> summary = []
+        rowsByLibrary.keySet().each { GpuKernelLibrary lib ->
+            List<Map> libBuilt = built.findAll { it.library.is(lib) }.sort { it.name }
+            StringBuilder index = new StringBuilder("# ${lib.label} kernel signatures: buffers, read-only flag per binding, push-constant scalar kinds, __sg variant\n")
+            libBuilt.each { Map b ->
+                index.append("${b.name}.buffers=${b.signature.buffers}\n")
+                index.append("${b.name}.ro=${b.signature.ro}\n")
+                index.append("${b.name}.push=${b.signature.push}\n")
+                index.append("${b.name}.sg=${b.sg ? 1 : 0}\n")
+            }
+            GpuBuildTools.writeText(new File(new File(out, lib.shaderRootPath), 'index.properties'), index.toString())
+            summary.add("${lib.id} ${libBuilt.size()} kernels (${libBuilt.count { it.sg }} with __sg variants)")
+        }
+        task.logger.lifecycle("compileShaders: ${summary.join(', ')}")
+    }
+}
+
+tasks.register('compileTestShaders') {
+    group = 'build'
+    description = 'Compiles the backend test shaders shaders/test/*.comp to SPIR-V (build/generated/gpu/spv-test)'
+    def outDir = gpuOut.map { it.dir('spv-test') }
+    inputs.dir(gpuTestShaderDir).withPropertyName('testShaderSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('tools', providers.provider { gpuShaderToolsFingerprint() })
+    inputs.property('requireShaders', gpuRequireShaders)
+    outputs.dir(outDir)
+    doLast { task ->
+        File out = outDir.get().asFile
+        GpuBuildTools.resetDir(out)
+        Map tools = gpuShaderTools()
+        if (tools.compiler == null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireShaders, 'neuralfree.requireShaders',
+                    'glslc and glslangValidator not found: test shaders not compiled')
+            return
+        }
+        List<File> sources = GpuBuildTools.listFiles(gpuTestShaderDir, '.comp', [])
+        gpuCompileShaderTree(tools, sources, out, 'test shader compilation')
+    }
+}
+
+tasks.register('checkOpenCLKernels') {
+    group = 'verification'
+    description = 'Syntax-checks the assembled OpenCL program of every kernel library with clang, plain and, for libraries with subgroup variants, with USE_SUBGROUPS'
+    def stamp = gpuOut.map { it.file('check/opencl.stamp') }
+    inputs.files(gpuKernelSources).withPropertyName('kernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuSharedKernelSources).withPropertyName('sharedKernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('libraries', gpuLibrariesFingerprint)
+    inputs.property('clang', providers.provider { GpuBuildTools.fingerprint(gpuFindClang()) })
+    outputs.file(stamp)
+    doLast { task ->
+        File stampFile = stamp.get().asFile
+        stampFile.delete()
+        File clang = gpuFindClang()
+        if (clang == null) {
+            task.logger.warn('WARNING: clang not found: OpenCL kernel syntax check skipped')
+            return
+        }
+        List<Object> base = [clang, '-x', 'cl', '-cl-std=CL1.2', '-Xclang', '-finclude-default-header', '-fsyntax-only']
+        List<Callable<Object>> jobs = []
+        List<String> checked = []
+        gpuLibraries.each { GpuKernelLibrary lib ->
+            File cl = new File(task.temporaryDir, "${lib.id}_kernels.cl")
+            GpuBuildTools.writeText(cl, GpuKernelSources.concatenate(lib.manifest(gpuSharedKernelRoot)))
+            List<List<String>> variants = lib.subgroupVariants ? [[], ['-DUSE_SUBGROUPS=1']] : [[]]
+            variants.each { List<String> extra ->
+                jobs.add(({ ->
+                    GpuBuildTools.runChecked(base + extra + [cl], task.temporaryDir,
+                            "clang OpenCL C 1.2 syntax check of ${lib.id} ${extra ? extra.join(' ') : '(plain)'}")
+                    null
+                }) as Callable<Object>)
+            }
+            checked.add("${lib.id} " + variants.collect { it ? it.join(' ') : 'plain' }.join(', '))
+        }
+        GpuBuildTools.parallel(jobs, GpuBuildTools.CORES, 'OpenCL syntax check')
+        GpuBuildTools.writeText(stampFile, "clang OpenCL C 1.2 syntax check passed: ${checked.join('; ')}\n")
+    }
+}
+
+tasks.register('updateKernelInventory') {
+    group = 'build'
+    description = 'Regenerates the checked-in kernels/<lib>/inventory.txt of every kernel library from its kernel sources (needs clang or nvcc)'
+    doLast { task ->
+        Map<GpuKernelLibrary, Map> generated = gpuLibraries.collectEntries { GpuKernelLibrary lib ->
+            Map g = gpuGenerateInventory(task, lib)
+            if (g == null) {
+                throw new GradleException("updateKernelInventory needs a preprocessor: neither clang (-Pneuralfree.clang) nor nvcc (-Pnvcc) was found")
+            }
+            [(lib): g]
+        }
+        generated.each { GpuKernelLibrary lib, Map g ->
+            String current = lib.inventoryFile.isFile() ? lib.inventoryFile.getText('UTF-8').replace('\r\n', '\n') : null
+            if (current == g.text) {
+                task.logger.lifecycle("updateKernelInventory: ${lib.inventoryPath} is up to date (${g.kernels} kernels, ${g.preprocessor})")
+                return
+            }
+            GpuBuildTools.writeText(lib.inventoryFile, (String) g.text)
+            task.logger.lifecycle("updateKernelInventory: wrote ${lib.inventoryPath} (${g.kernels} kernels, ${g.preprocessor})"
+                    + (current == null ? '' : ': ' + GpuInventory.difference(current, (String) g.text)))
+        }
+    }
+}
+
+tasks.register('inventoryCheck') {
+    group = 'verification'
+    description = 'Checks argument limits and shader-variant coverage, and that every kernel library\'s inventory.txt matches its kernel sources'
+    mustRunAfter 'updateKernelInventory'
+    def stamp = gpuOut.map { it.file('check/inventory.stamp') }
+    inputs.files(gpuKernelSources).withPropertyName('kernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuSharedKernelSources).withPropertyName('sharedKernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuInventoryFiles).withPropertyName('inventories').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuVariantTables).withPropertyName('variantTables').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('libraries', gpuLibrariesFingerprint)
+    inputs.property('preprocessor', providers.provider {
+        File clang = gpuFindClang()
+        clang != null ? GpuBuildTools.fingerprint(clang) : GpuBuildTools.fingerprint(gpuFindNvcc())
+    })
+    outputs.file(stamp)
+    // The stamp is written only after a comparison with the sources, so an unchecked run repeats its warning.
+    outputs.upToDateWhen { stamp.get().asFile.isFile() }
+    doLast { task ->
+        File stampFile = stamp.get().asFile
+        stampFile.delete()
+        List<String> checked = []
+        boolean unchecked = false
+        gpuLibraries.each { GpuKernelLibrary lib ->
+            Map<String, Map> checkedIn = GpuInventory.read(lib, gpuInventoryCommand)
+            Map generated = gpuGenerateInventory(task, lib)
+            if (generated == null) {
+                List<String> problems = GpuInventory.coverageProblems(lib, checkedIn, gpuSharedKernelRoot)
+                if (!problems.isEmpty()) {
+                    throw new GradleException("${lib.label} kernel inventory check failed (${lib.inventoryPath} as checked in):\n  " + problems.join('\n  '))
+                }
+                task.logger.warn("WARNING: neither clang nor nvcc found: ${lib.inventoryPath} is used as checked in; "
+                        + 'its freshness against the kernel sources and the argument limits were not checked')
+                unchecked = true
+                return
+            }
+            String current = lib.inventoryFile.getText('UTF-8').replace('\r\n', '\n')
+            if (current != generated.text) {
+                throw new GradleException("${lib.inventoryPath} is stale: it does not match the kernel sources "
+                        + "(${GpuInventory.difference(current, (String) generated.text)}).\nRegenerate it with: ${gpuInventoryCommand}")
+            }
+            checked.add("${lib.inventoryPath} matches the kernel sources (${generated.kernels} kernels, ${generated.preprocessor})")
+            task.logger.lifecycle("inventoryCheck: ${lib.id} ${generated.kernels} kernels, ${generated.openClOnly} OpenCL-only kernels (${generated.preprocessor})")
+        }
+        if (!unchecked) {
+            GpuBuildTools.writeText(stampFile, checked.collect { it + '\n' }.join(''))
+        }
+    }
+}
+
+tasks.register('verifyGpuKernels') {
+    group = 'verification'
+    description = 'Builds every GPU kernel artifact and checks that CUDA and Vulkan cover every kernel library\'s inventory'
+    dependsOn 'checkOpenCLKernels', 'inventoryCheck', 'compileCudaKernels', 'compileShaders', 'compileTestShaders'
+    doLast { task ->
+        File generatedRoot = gpuOut.get().asFile
+        List<String> problems = []
+        List<String> summary = []
+        gpuLibraries.each { GpuKernelLibrary lib ->
+            Map<String, Map> inventory = GpuInventory.read(lib, gpuInventoryCommand)
+            List<String> covered = []
+            Closure coverage = { String what, Set<String> built ->
+                List<String> missing = (inventory.keySet() - built).sort()
+                List<String> extra = (built - inventory.keySet()).sort()
+                if (!missing.isEmpty()) {
+                    problems.add("${lib.id}: ${what} index lacks ${missing.size()} kernels: ${missing.join(', ')}")
+                }
+                if (!extra.isEmpty()) {
+                    problems.add("${lib.id}: ${what} index has ${extra.size()} kernels outside the inventory: ${extra.join(', ')}")
+                }
+                covered.add(what + ' ok')
+            }
+            File cudaIndex = new File(generatedRoot, 'cuda/' + lib.cudaDir + '/index.tsv')
+            if (cudaIndex.isFile()) {
+                coverage('CUDA', cudaIndex.readLines('UTF-8').findAll { !it.isEmpty() }.collect { it.split('\t')[0] } as Set<String>)
+            } else {
+                task.logger.warn("WARNING: ${lib.id} CUDA kernels were not built: CUDA coverage not checked")
+            }
+            File spvIndex = new File(generatedRoot, 'spv/' + lib.shaderRootPath + '/index.properties')
+            if (spvIndex.isFile()) {
+                Properties p = new Properties()
+                spvIndex.withInputStream { p.load(it) }
+                Set<String> spv = p.stringPropertyNames().findAll { it.endsWith('.buffers') }
+                        .collect { it.substring(0, it.length() - '.buffers'.length()) } as Set
+                coverage('SPIR-V', spv)
+                // 'i' and 'u' are both 32-bit integers on the Java side; without compareKinds only the count matters.
+                Closure<String> kindClass = { String kind -> lib.compareKinds ? (kind == 'f' ? 'f' : 'i') : 's' }
+                (inventory.keySet().intersect(spv)).sort().each { String name ->
+                    Map k = inventory[name]
+                    int buffers = Integer.parseInt(p.getProperty(name + '.buffers'))
+                    String push = p.getProperty(name + '.push', '')
+                    List<String> kinds = push.isEmpty() ? [] : push.split(',').toList()
+                    if (buffers != k.buffers || ((List<String>) k.kinds).collect(kindClass) != kinds.collect(kindClass)) {
+                        problems.add("${lib.id}: ${name}: GLSL has ${buffers} buffers and scalars (${push}), the .cl kernel ${k.buffers} buffers and scalars (${((List) k.kinds).join(',')})")
+                    }
+                }
+            } else {
+                task.logger.warn("WARNING: ${lib.id} SPIR-V was not built: Vulkan coverage not checked")
+            }
+            summary.add("${lib.id} ${inventory.size()} kernels covered" + (covered ? ' (' + covered.join(', ') + ')' : ''))
+        }
+        if (!problems.isEmpty()) {
+            throw new GradleException("GPU kernel verification failed:\n  " + problems.join('\n  '))
+        }
+        task.logger.lifecycle("verifyGpuKernels: ${summary.join('; ')}")
+    }
+}

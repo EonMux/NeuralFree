@@ -1,0 +1,337 @@
+/* dsv4_compress.comp - LLM_DSV4_Compress, LLM_DSV4_LidUpdate_<KV>, LLM_DSV4_StateUpdate, LLM_DSV4_StateSnapshot and
+ * LLM_DSV4_CacheStore (GLSL twin of
+ * kernels/llm/dsv4/compress.cl, which documents the math, the compressor-state layout and the llama.cpp references).
+ * Requires: common/nf_common.glsl, common/rope_common.glsl, common/hadamard.glsl, common/kv_types.glsl,
+ * common/kv_quant.glsl (the cache stores), common/dsv4_common.glsl, common/reduce.glsl.
+ *
+ * A variants row selects OP (and, for OP_LID_UPDATE, KV = NF_DSV4_KV_<type>, an NF_KV_* code: the element type of
+ * the indexer cache, which follows the context's type_k); buffers take bindings 0.. in argument order, scalars fill the
+ * push block in argument order:
+ *   OP_COMPRESS      (i pos0, i n_tokens, i ratio, i width, i n_rot, i rope_mode, f eps, f theta_scale, f freq_scale,
+ *                     f ext_factor, f attn_factor, f corr_lo, f corr_hi, i rot_block, i kv_type, i cur_kv_off,
+ *                     i cur_score_off, R state_kv, R state_score, R cur_kv, R cur_score, R ape, R norm_w, W<KV> cache)
+ *   OP_LID_UPDATE    (i pos0, i n_tokens, i width, i n_rot, i rope_mode, f eps, f theta_scale, f freq_scale,
+ *                     f ext_factor, f attn_factor, f corr_lo, f corr_hi, i rot_block, i cur_kv_off, i cur_score_off,
+ *                     R state_kv, R state_score, R cur_kv, R cur_score, R ape, R norm_w, W<KV> cache)
+ *   OP_STATE_UPDATE  (i pos0, i n_tokens, i ratio, i width, i cur_kv_off, i cur_score_off,
+ *                     R cur_kv, R cur_score, R ape, W state_kv, W state_score)
+ *   OP_STATE_SNAPSHOT (i pos0, i n_tokens, i ratio, i width, i n_snap, i cur_kv_off, i cur_score_off,
+ *                     R cur_kv, R cur_score, R ape, RW state_kv, RW state_score)
+ *   OP_CACHE_STORE   (i n_tokens, i width, i kv_type, i rot_block, i src_off, i src_stride,
+ *                     R src, R<int> cell_idx, W<KV> cache)
+ * Dispatch: 1-D. Compress / LidUpdate: one work-group per completed block; CacheStore: one work-group per token
+ * (local = L, a power of two in [32, LLM_DIMX]); StateUpdate: one invocation per plane element, StateSnapshot: one
+ * per snapshot-plane element, any local size.
+ * Folded group counts are recovered by nf_wg_id() / nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+#include "common/hadamard.glsl"
+#include "common/kv_types.glsl"
+#include "common/kv_quant.glsl"
+#include "common/dsv4_common.glsl"
+
+#define OP_COMPRESS     1
+#define OP_LID_UPDATE   2
+#define OP_STATE_UPDATE 3
+#define OP_CACHE_STORE  4
+#define OP_STATE_SNAPSHOT 5
+
+#if !defined(OP)
+#error "dsv4_compress.comp requires OP"
+#endif
+
+#if OP == OP_LID_UPDATE && !defined(KV)
+#error "dsv4_compress.comp OP_LID_UPDATE requires KV=NF_DSV4_KV_<type>"
+#endif
+
+#if OP == OP_COMPRESS || OP == OP_LID_UPDATE
+#include "common/reduce.glsl"
+#endif
+
+#if OP == OP_COMPRESS
+layout(push_constant) uniform NfDsv4CompressParams {
+    int pos0;
+    int n_tokens;
+    int ratio;
+    int width;
+    int n_rot;
+    int rope_mode;
+    float eps;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+    int rot_block;
+    int kv_type;
+    int cur_kv_off;
+    int cur_score_off;
+} pc;
+#elif OP == OP_LID_UPDATE
+layout(push_constant) uniform NfDsv4LidParams {
+    int pos0;
+    int n_tokens;
+    int width;
+    int n_rot;
+    int rope_mode;
+    float eps;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+    int rot_block;
+    int cur_kv_off;
+    int cur_score_off;
+} pc;
+#elif OP == OP_STATE_UPDATE
+layout(push_constant) uniform NfDsv4StateParams {
+    int pos0;
+    int n_tokens;
+    int ratio;
+    int width;
+    int cur_kv_off;
+    int cur_score_off;
+} pc;
+#elif OP == OP_STATE_SNAPSHOT
+layout(push_constant) uniform NfDsv4SnapshotParams {
+    int pos0;
+    int n_tokens;
+    int ratio;
+    int width;
+    int n_snap;
+    int cur_kv_off;
+    int cur_score_off;
+} pc;
+#elif OP == OP_CACHE_STORE
+layout(push_constant) uniform NfDsv4StoreParams {
+    int n_tokens;
+    int width;
+    int kv_type;
+    int rot_block;
+    int src_off;
+    int src_stride;
+} pc;
+#else
+#error "dsv4_compress.comp: OP is not a DSV4 compressor op"
+#endif
+
+#if OP == OP_COMPRESS || OP == OP_LID_UPDATE
+layout(std430, binding = 0) readonly buffer NfDsv4StateKv    { float state_kv[]; };
+layout(std430, binding = 1) readonly buffer NfDsv4StateScore { float state_score[]; };
+layout(std430, binding = 2) readonly buffer NfDsv4CurKv      { float cur_kv[]; };
+layout(std430, binding = 3) readonly buffer NfDsv4CurScore   { float cur_score[]; };
+layout(std430, binding = 4) readonly buffer NfDsv4Ape        { float ape[]; };
+layout(std430, binding = 5) readonly buffer NfDsv4NormW      { float norm_w[]; };
+NF_BUFFER_VIEWS_RW(6, cache)
+#elif OP == OP_STATE_UPDATE
+layout(std430, binding = 0) readonly  buffer NfDsv4CurKv      { float cur_kv[]; };
+layout(std430, binding = 1) readonly  buffer NfDsv4CurScore   { float cur_score[]; };
+layout(std430, binding = 2) readonly  buffer NfDsv4Ape        { float ape[]; };
+layout(std430, binding = 3) writeonly buffer NfDsv4StateKv    { float state_kv[]; };
+layout(std430, binding = 4) writeonly buffer NfDsv4StateScore { float state_score[]; };
+#elif OP == OP_STATE_SNAPSHOT
+layout(std430, binding = 0) readonly buffer NfDsv4CurKv      { float cur_kv[]; };
+layout(std430, binding = 1) readonly buffer NfDsv4CurScore   { float cur_score[]; };
+layout(std430, binding = 2) readonly buffer NfDsv4Ape        { float ape[]; };
+layout(std430, binding = 3)          buffer NfDsv4StateKv    { float state_kv[]; };
+layout(std430, binding = 4)          buffer NfDsv4StateScore { float state_score[]; };
+#else
+layout(std430, binding = 0) readonly buffer NfDsv4Src     { float src[]; };
+layout(std430, binding = 1) readonly buffer NfDsv4CellIdx { int cell_idx[]; };
+NF_BUFFER_VIEWS_RW(2, cache)
+#endif
+
+#if OP != OP_STATE_UPDATE && OP != OP_STATE_SNAPSHOT
+
+shared float row_s[NF_DSV4_MAX_WIDTH];
+
+/* Hadamard transform over row_s (C nf_fwht_local). */
+NF_FWHT_SHARED_FN(dsv4_fwht, row_s)
+
+#endif
+
+#if OP == OP_COMPRESS || OP == OP_LID_UPDATE
+
+/* Partial-RoPE row rotation over row_s (C nf_dsv4_rope_rows). */
+NF_DSV4_ROPE_ROWS_FN(dsv4_rope_rows, row_s)
+
+/* Window source (kv, score) of position p, state column col (C nf_dsv4_src). */
+vec2 dsv4_src(int p, int col, int ratio, int state_rows, int state_width) {
+    if (p < 0) {
+        return vec2(0.0, -NF_INF);
+    }
+    if (p >= pc.pos0) {
+        const int t = (p - pc.pos0) * state_width + col;
+        return vec2(cur_kv[pc.cur_kv_off + t], cur_score[pc.cur_score_off + t] + ape[(p % ratio) * state_width + col]);
+    }
+    const int r = (p % state_rows) * state_width + col;
+    return vec2(state_kv[r], state_score[r]);
+}
+
+/* Pooled, RMS-normalized and rotated row of block b into row_s[0, width) (C nf_dsv4_compress_row). Contains barriers. */
+void dsv4_compress_row(int b, int ratio, int width) {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const bool overlap = ratio == NF_DSV4_CSA_RATIO;
+    const int state_rows = overlap ? 2 * ratio : ratio;
+    const int state_width = overlap ? 2 * width : width;
+    const int n_win = overlap ? 2 * ratio : ratio;
+    const int start = b * ratio;
+
+    float ss = 0.0;
+    for (int c = lid; c < width; c += lsize) {
+        float m = -NF_INF;
+        for (int j = 0; j < n_win; ++j) {
+            const bool hi = overlap && j >= ratio;
+            const int p = overlap ? (hi ? start + j - ratio : start - ratio + j) : start + j;
+            m = max(m, dsv4_src(p, hi ? width + c : c, ratio, state_rows, state_width).y);
+        }
+        float l = 0.0;
+        float acc = 0.0;
+        for (int j = 0; j < n_win; ++j) {
+            const bool hi = overlap && j >= ratio;
+            const int p = overlap ? (hi ? start + j - ratio : start - ratio + j) : start + j;
+            const vec2 s = dsv4_src(p, hi ? width + c : c, ratio, state_rows, state_width);
+            const float e = (s.y == -NF_INF) ? 0.0 : exp(s.y - m);
+            l += e;
+            acc += e * s.x;
+        }
+        const float y = acc * (1.0 / l);
+        row_s[c] = y;
+        ss += y * y;
+    }
+    const float sum = nf_wg_sum(ss);
+    const float scale = 1.0 / sqrt(sum / float(width) + pc.eps);
+    for (int c = lid; c < width; c += lsize) {
+        row_s[c] = row_s[c] * scale * norm_w[c];
+    }
+    barrier();
+    if (pc.n_rot > 0) {
+        dsv4_rope_rows(0, 1, width, pc.n_rot, pc.rope_mode, start, 1.0, pc.theta_scale, pc.freq_scale, pc.ext_factor,
+                       pc.attn_factor, pc.corr_lo, pc.corr_hi);
+        barrier();
+    }
+}
+
+#endif
+
+#if OP != OP_STATE_UPDATE && OP != OP_STATE_SNAPSHOT
+
+NF_KV_STORES(cache)
+
+/* Stores row_s[0, width) as cache row r in element type kv_type (C nf_dsv4_store_row, nf_kv_store_local_row): one
+ * invocation per value for F32 / F16 / BF16, one per 32-value block for the block types. No barrier inside. */
+void dsv4_store_row(uint r, int width, int kv_type) {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const uint e0 = r * uint(width);
+    if (!nf_kv_is_block(kv_type)) {
+        for (int c = lid; c < width; c += lsize) {
+            cache_kv_store1(e0 + uint(c), row_s[c], kv_type);
+        }
+        return;
+    }
+    for (int k = lid; k < (width >> 5); k += lsize) {
+        float x[32];
+        for (int j = 0; j < 32; ++j) {
+            x[j] = row_s[(k << 5) + j];
+        }
+        cache_kv_store_block(e0 + uint(k << 5), x, kv_type);
+    }
+}
+
+#endif
+
+void main() {
+#if OP == OP_COMPRESS
+    const int b0 = pc.pos0 / pc.ratio;
+    const int g = int(nf_wg_id());
+    if (g >= (pc.pos0 + pc.n_tokens) / pc.ratio - b0) {
+        return;
+    }
+    const int b = b0 + g;
+    dsv4_compress_row(b, pc.ratio, pc.width);
+    if (pc.rot_block > 0) {
+        dsv4_fwht(0u, uint(pc.width), uint(pc.rot_block));
+    }
+    dsv4_store_row(uint(b), pc.width, pc.kv_type);
+#elif OP == OP_LID_UPDATE
+    const int b0 = pc.pos0 / NF_DSV4_CSA_RATIO;
+    const int g = int(nf_wg_id());
+    if (g >= (pc.pos0 + pc.n_tokens) / NF_DSV4_CSA_RATIO - b0) {
+        return;
+    }
+    const int b = b0 + g;
+    dsv4_compress_row(b, NF_DSV4_CSA_RATIO, pc.width);
+    dsv4_fwht(0u, uint(pc.width), uint(pc.rot_block));
+    dsv4_store_row(uint(b), pc.width, KV);
+#elif OP == OP_STATE_UPDATE
+    const bool overlap = pc.ratio == NF_DSV4_CSA_RATIO;
+    const int state_rows = overlap ? 2 * pc.ratio : pc.ratio;
+    const int state_width = overlap ? 2 * pc.width : pc.width;
+    const int gid = int(nf_global_id());
+    if (gid >= state_rows * state_width) {
+        return;
+    }
+    const int r = gid / state_width;
+    const int col = gid - r * state_width;
+    const int first = (r - pc.pos0 % state_rows + state_rows) % state_rows;
+    if (first >= pc.n_tokens) {
+        return;
+    }
+    const int t = first + ((pc.n_tokens - 1 - first) / state_rows) * state_rows;
+    const int s = t * state_width + col;
+    state_kv[gid] = cur_kv[pc.cur_kv_off + s];
+    state_score[gid] = cur_score[pc.cur_score_off + s] + ape[((pc.pos0 + t) % pc.ratio) * state_width + col];
+#elif OP == OP_STATE_SNAPSHOT
+    const bool overlap = pc.ratio == NF_DSV4_CSA_RATIO;
+    const int state_rows = overlap ? 2 * pc.ratio : pc.ratio;
+    const int state_width = overlap ? 2 * pc.width : pc.width;
+    const int plane = state_rows * state_width;
+    const int gid = int(nf_global_id());
+    if (gid >= pc.n_snap * plane) {
+        return;
+    }
+    const int d = 1 + gid / plane;
+    const int e = gid - (d - 1) * plane;
+    const int r = e / state_width;
+    const int col = e - r * state_width;
+    const int prefix = pc.n_tokens - d;
+    const int first = (r - pc.pos0 % state_rows + state_rows) % state_rows;
+    const int dst = d * plane + e;
+    if (first < prefix) {
+        const int t = first + ((prefix - 1 - first) / state_rows) * state_rows;
+        const int s = t * state_width + col;
+        state_kv[dst] = cur_kv[pc.cur_kv_off + s];
+        state_score[dst] = cur_score[pc.cur_score_off + s] + ape[((pc.pos0 + t) % pc.ratio) * state_width + col];
+    } else {
+        state_kv[dst] = state_kv[e];
+        state_score[dst] = state_score[e];
+    }
+#else
+    const int t = int(nf_wg_id());
+    if (t >= pc.n_tokens) {
+        return;
+    }
+    const int r = cell_idx[t];
+    if (r < 0) {
+        return;
+    }
+    const int x0 = pc.src_off + t * pc.src_stride;
+    for (int c = int(gl_LocalInvocationID.x); c < pc.width; c += int(gl_WorkGroupSize.x)) {
+        row_s[c] = src[x0 + c];
+    }
+    barrier();
+    if (pc.rot_block > 0) {
+        dsv4_fwht(0u, uint(pc.width), uint(pc.rot_block));
+    }
+    dsv4_store_row(uint(r), pc.width, pc.kv_type);
+#endif
+}

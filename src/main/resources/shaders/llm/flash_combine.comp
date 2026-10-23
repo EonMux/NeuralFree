@@ -1,0 +1,62 @@
+/* flash_combine.comp - LLM_FlashAttn_Combine split-K merge (GLSL twin of kernels/llm/flash_combine.cl; merge
+ * formula, layout and sink handling are documented there). Requires: common/nf_common.glsl,
+ * common/act.glsl, common/attn_common.glsl.
+ *
+ * Variants row: LLM_FlashAttn_Combine	flash_combine.comp	(no defines, no subgroups)
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_rows, i d_v, i n_split, i n_head, i has_sinks, i out_off, R partial, R sinks, W out)
+ * Dispatch: 1-D, global {n_rows * 128}, local {128, 1, 1}; one workgroup per row, folded group counts
+ * are recovered by nf_wg_id(). No barriers, so any local size is valid.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/attn_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfFcPartial { float partial[]; };
+layout(std430, binding = 1) readonly buffer NfFcSinks { float sinks[]; };
+layout(std430, binding = 2) writeonly buffer NfFcOut { float dst[]; };
+
+layout(push_constant) uniform NfFcParams {
+    int n_rows; int d_v; int n_split; int n_head; int has_sinks; int out_off;
+} pc;
+
+void main() {
+    const uint row = nf_wg_id();
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint d_v = uint(pc.d_v);
+    const uint stride = d_v + 2u;
+    const uint n_split = uint(pc.n_split);
+    const uint pr = row * n_split * stride;
+    const uint ob = uint(pc.out_off) + row * d_v;
+
+    const float sink = pc.has_sinks != 0 ? sinks[row % uint(pc.n_head)] : -NF_INF;
+    float m = sink;
+    for (uint s = 0u; s < n_split; s++) {
+        m = max(m, partial[pr + s * stride + d_v]);
+    }
+    if (m == -NF_INF) {
+        for (uint d = lid; d < d_v; d += gl_WorkGroupSize.x) {
+            dst[ob + d] = 0.0;
+        }
+        return;
+    }
+    float l = nf_attn_rescale(sink, m);
+    for (uint s = 0u; s < n_split; s++) {
+        const uint ps = pr + s * stride;
+        l += partial[ps + d_v + 1u] * nf_attn_rescale(partial[ps + d_v], m);
+    }
+    for (uint d = lid; d < d_v; d += gl_WorkGroupSize.x) {
+        float o = 0.0;
+        for (uint s = 0u; s < n_split; s++) {
+            const uint ps = pr + s * stride;
+            o += partial[ps + d] * nf_attn_rescale(partial[ps + d_v], m);
+        }
+        dst[ob + d] = l > 0.0 ? o / l : 0.0;
+    }
+}

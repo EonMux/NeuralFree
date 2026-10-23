@@ -1,0 +1,7 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Hyper-connection and attention-residual kernels (kernels/llm/hc.cl).
+LLM_HC_PrePostComb	hc.comp	OP=OP_HC_PREPOSTCOMB
+LLM_HC_Pre	hc.comp	OP=OP_HC_PRE
+LLM_HC_Post	hc.comp	OP=OP_HC_POST
+LLM_ResStack_Score	hc.comp	OP=OP_RES_SCORE	sg
+LLM_ResStack_Mix	hc.comp	OP=OP_RES_MIX

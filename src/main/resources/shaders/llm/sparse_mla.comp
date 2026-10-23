@@ -1,0 +1,168 @@
+/* sparse_mla.comp - LLM_MLA_SparseDecode_<KV> / LLM_MLA_SparsePrefill_<KV>: absorbed MLA attention over
+ * the cells selected by the DSA indexer. GLSL twin of kernels/llm/sparse/sparse_mla.cl (the semantic reference).
+ * Requires: common/nf_common.glsl, common/reduce.glsl, common/act.glsl, common/kv_types.glsl,
+ * common/attn_common.glsl.
+ *
+ * OP selects the kernel and KV (an NF_KV_* code of common/kv_types.glsl) the latent-cache element type
+ * (variants row defines):
+ *   OP_SPARSE_DECODE  (1) LLM_MLA_SparseDecode_<KV>
+ *     (i n_head, i kv_lora, i rope_dim, i n_sel, f kq_scale, f softcap, i has_sinks, i q_off,
+ *      R float q_abs, R <KV> kv_cache, R int sel_idx, R float sinks, W float out_latent)
+ *     one workgroup per head h: q = q_abs[q_off + h*d_k ..], sel = sel_idx[0 .. n_sel),
+ *     out = out_latent[h*kv_lora ..]; global = n_head*L.
+ *   OP_SPARSE_PREFILL (2) LLM_MLA_SparsePrefill_<KV>
+ *     (i n_tokens, i n_head, i kv_lora, i rope_dim, i n_sel, f kq_scale, f softcap, i has_sinks,
+ *      i q_stride, R float q_abs, R <KV> kv_cache, R int sel_idx, R float sinks, W float out_latent)
+ *     one workgroup per (token t, head h), linear group g = t*n_head + h: q = q_abs[t*q_stride + h*d_k ..],
+ *     sel = sel_idx[t*n_sel ..], out = out_latent[(t*n_head + h)*kv_lora ..]; global = n_tokens*n_head*L.
+ * With d_k = kv_lora + rope_dim and selected rows r_j = sel[j] (r_j < 0 skipped):
+ *     s_j = softcap > 0 ? softcap*tanh(q.k_j*(kq_scale/softcap)) : q.k_j*kq_scale
+ *     m = max(max_j s_j, sink), l = sum_j exp(s_j - m) + exp(sink - m)   (sink only when has_sinks)
+ *     out[d] = (1/l) * sum_j exp(s_j - m) * k_j[d], d < kv_lora; zeros when l == 0.
+ * Preconditions (host): 1 <= n_sel <= NF_SMLA_MAX_SEL, valid rows in sel; for a block type, d_k % 32 == 0.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, L a power of two with 32 <= L <= LLM_DIMX (128 recommended);
+ * folded group counts are recovered by nf_wg_id(). The __sg variant reduces through subgroup
+ * arithmetic and needs L % maxSubgroupSize == 0 (backend rule).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+
+#define OP_SPARSE_DECODE  1
+#define OP_SPARSE_PREFILL 2
+
+#ifndef OP
+#error "sparse_mla.comp needs OP=OP_SPARSE_DECODE or OP=OP_SPARSE_PREFILL"
+#endif
+#ifndef KV
+#error "sparse_mla.comp needs KV=NF_KV_<type>"
+#endif
+
+#define NF_SMLA_MAX_SEL 2048
+
+layout(std430, binding = 0) readonly buffer NfSmlaQ { float q_abs[]; };
+NF_ATTN_KV_VIEWS(1, kv_cache)
+layout(std430, binding = 2) readonly buffer NfSmlaSel { int sel_idx[]; };
+layout(std430, binding = 3) readonly buffer NfSmlaSinks { float sinks[]; };
+layout(std430, binding = 4) writeonly buffer NfSmlaOut { float out_latent[]; };
+
+#if OP == OP_SPARSE_DECODE
+layout(push_constant) uniform NfSmlaParams {
+    int n_head;
+    int kv_lora;
+    int rope_dim;
+    int n_sel;
+    float kq_scale;
+    float softcap;
+    int has_sinks;
+    int q_off;
+} pc;
+#elif OP == OP_SPARSE_PREFILL
+layout(push_constant) uniform NfSmlaParams {
+    int n_tokens;
+    int n_head;
+    int kv_lora;
+    int rope_dim;
+    int n_sel;
+    float kq_scale;
+    float softcap;
+    int has_sinks;
+    int q_stride;
+} pc;
+#else
+#error "unknown OP for sparse_mla.comp"
+#endif
+
+shared float nf_smla_sc[NF_SMLA_MAX_SEL];
+
+void main() {
+    const uint g = nf_wg_id();
+#if OP == OP_SPARSE_DECODE
+    const uint h = g;
+    /* The head depends only on the workgroup id, so this return is uniform per workgroup. */
+    if (h >= uint(pc.n_head)) {
+        return;
+    }
+    const uint d_k = uint(pc.kv_lora + pc.rope_dim);
+    const uint qbase = uint(pc.q_off) + h * d_k;
+    const uint sbase = 0u;
+    const uint obase = h * uint(pc.kv_lora);
+#else
+    const uint n_head = uint(pc.n_head);
+    const uint t = g / n_head;
+    /* The token depends only on the workgroup id, so this return is uniform per workgroup. */
+    if (t >= uint(pc.n_tokens)) {
+        return;
+    }
+    const uint h = g - t * n_head;
+    const uint d_k = uint(pc.kv_lora + pc.rope_dim);
+    const uint qbase = t * uint(pc.q_stride) + h * d_k;
+    const uint sbase = t * uint(pc.n_sel);
+    const uint obase = (t * n_head + h) * uint(pc.kv_lora);
+#endif
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint n_sel = uint(clamp(pc.n_sel, 0, NF_SMLA_MAX_SEL));
+    const uint kv_lora = uint(pc.kv_lora);
+    const bool has_sinks = pc.has_sinks != 0;
+    const float sink = has_sinks ? sinks[h] : 0.0;
+
+    /* Logits: one selected cell per invocation and step. */
+    float m_loc = -NF_INF;
+    for (uint j = lid; j < n_sel; j += lsize) {
+        const int r = sel_idx[sbase + j];
+        float s = -NF_INF;
+        if (r >= 0) {
+            const uint krow = uint(r) * d_k;
+            float acc = 0.0;
+            uint d = 0u;
+            for (; d + 4u <= d_k; d += 4u) {
+                const vec4 q4 = vec4(q_abs[qbase + d], q_abs[qbase + d + 1u], q_abs[qbase + d + 2u], q_abs[qbase + d + 3u]);
+                acc += dot(q4, kv_cache_load4(krow + d));
+            }
+            for (; d < d_k; ++d) {
+                acc += q_abs[qbase + d] * kv_cache_load1(krow + d);
+            }
+            s = nf_attn_score(acc, pc.kq_scale, pc.softcap);
+        }
+        nf_smla_sc[j] = s;
+        m_loc = max(m_loc, s);
+    }
+    float m = nf_wg_max(m_loc);
+    if (has_sinks) {
+        m = max(m, sink);
+    }
+
+    /* Probabilities (unnormalized) replace the logits. */
+    float l_loc = 0.0;
+    for (uint j = lid; j < n_sel; j += lsize) {
+        const float s = nf_smla_sc[j];
+        const float p = s == -NF_INF ? 0.0 : exp(s - m);
+        nf_smla_sc[j] = p;
+        l_loc += p;
+    }
+    float l = nf_wg_sum(l_loc);
+    if (has_sinks && m > -NF_INF) {
+        l += exp(sink - m);
+    }
+    barrier();
+
+    /* Values: one latent dim per invocation and step. */
+    const float inv_l = l > 0.0 ? 1.0 / l : 0.0;
+    for (uint d = lid; d < kv_lora; d += lsize) {
+        float acc = 0.0;
+        for (uint j = 0u; j < n_sel; ++j) {
+            const float p = nf_smla_sc[j];
+            if (p != 0.0) {
+                acc += p * kv_cache_load1(uint(sel_idx[sbase + j]) * d_k + d);
+            }
+        }
+        out_latent[obase + d] = acc * inv_l;
+    }
+}

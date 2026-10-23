@@ -1,0 +1,106 @@
+/* hadamard.comp - LLM_HadamardRotate: Walsh-Hadamard rotation of quantized-KV and PRISM rows.
+ * GLSL twin of kernels/llm/hadamard.cl (the semantic reference). Requires: common/nf_common.glsl, common/hadamard.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_rows, i width, i block, i has_signs, i perm_hd, i perm_nk, i perm_rep, i x_off, i y_off,
+ *    R float signs, float x, float y)
+ * Rows r in [0, n_rows) of width elements start at x_off + r*width (x) and y_off + r*width (y).
+ * Block b of an output row is the normalized Sylvester Hadamard transform (H*H = I) of the
+ * permuted, optionally signed input block:
+ *     y[o] = s_after(o) * (1/sqrt(block)) * sum_j (-1)^popcount(i & j) * s_before(base + j) * x[src(base + j)]
+ * with o = base + i, base = b * block. has_signs: 0 none, 1 signs[o] before the rotation (PRISM
+ * folded-weight input, llama-graph.cpp:1620-1624), 2 signs[o] after it (inverse after the
+ * embedding lookup, llama-graph.cpp:2685-2690). perm_rep > 1 gathers tiled head order
+ * [perm_hd, perm_nk, perm_rep] into grouped order [perm_hd, perm_rep, perm_nk]
+ * (llama-graph.cpp:1610-1618).
+ * x and y carry no memory qualifiers because callers may rotate in place (same buffer, x_off == y_off;
+ * allowed when perm_rep <= 1: each output block then reads only its own input block, before the first
+ * barrier).
+ *
+ * Preconditions (validated on the host): block is a power of two <= NF_HD_MAX_BLOCK,
+ * width % block == 0, perm_hd*perm_nk*perm_rep == width when perm_rep > 1.
+ *
+ * Dispatch: 1-D, one workgroup per (row, block) pair, linear group g = r*(width/block) + b;
+ * global = n_rows*(width/block)*L, local = {L, 1, 1}. Folded group counts are recovered by
+ * nf_wg_id(); invocations stride over the block, so any L serves any block size.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/hadamard.glsl"
+
+#define NF_HD_MAX_BLOCK    1024
+#define NF_HD_SIGNS_BEFORE 1
+#define NF_HD_SIGNS_AFTER  2
+
+layout(std430, binding = 0) readonly buffer NfHdSigns { float signs[]; };
+layout(std430, binding = 1) buffer NfHdX { float x_in[]; };
+layout(std430, binding = 2) buffer NfHdY { float y_out[]; };
+layout(push_constant) uniform NfHdParams {
+    int n_rows;
+    int width;
+    int block;
+    int has_signs;
+    int perm_hd;
+    int perm_nk;
+    int perm_rep;
+    int x_off;
+    int y_off;
+} pc;
+
+shared float nf_hd_buf[NF_HD_MAX_BLOCK];
+
+/* Normalized Sylvester FWHT of nf_hd_buf (C nf_fwht_local, common/hadamard.glsl). */
+NF_FWHT_SHARED_FN(nf_hd_fwht, nf_hd_buf)
+
+/* Input element of grouped position o (C nf_hd_src). */
+uint nf_hd_src(uint o) {
+    if (pc.perm_rep <= 1) {
+        return o;
+    }
+    const uint hd = uint(pc.perm_hd);
+    const uint rep = uint(pc.perm_rep);
+    const uint h = o % hd;
+    const uint t = o / hd;
+    const uint r = t % rep;
+    const uint k = t / rep;
+    return h + hd * (k + uint(pc.perm_nk) * r);
+}
+
+void main() {
+    const uint width = uint(pc.width);
+    const uint block = uint(pc.block);
+    const uint nblk = width / block;
+    const uint g = nf_wg_id();
+    const uint row = g / nblk;
+    /* The row depends only on the workgroup id, so this return is uniform per workgroup. */
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const uint base = (g - row * nblk) * block;
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint xrow = uint(pc.x_off) + row * width;
+    const uint yrow = uint(pc.y_off) + row * width;
+
+    for (uint i = lid; i < block; i += lsize) {
+        const uint o = base + i;
+        float v = x_in[xrow + nf_hd_src(o)];
+        if (pc.has_signs == NF_HD_SIGNS_BEFORE) {
+            v *= signs[o];
+        }
+        nf_hd_buf[i] = v;
+    }
+    barrier();
+
+    nf_hd_fwht(0u, block, block);
+
+    for (uint i = lid; i < block; i += lsize) {
+        float v = nf_hd_buf[i];
+        if (pc.has_signs == NF_HD_SIGNS_AFTER) {
+            v *= signs[base + i];
+        }
+        y_out[yrow + base + i] = v;
+    }
+}

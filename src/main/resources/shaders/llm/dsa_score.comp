@@ -1,0 +1,161 @@
+/* dsa_score.comp - LLM_DSA_IndexerScore_<KV>: DeepSeek sparse-attention lightning-indexer scores.
+ * GLSL twin of kernels/llm/sparse/dsa.cl (the semantic reference). Requires: common/nf_common.glsl,
+ * common/act.glsl, common/kv_types.glsl, common/attn_common.glsl.
+ *
+ * KV (a variants-row define: an NF_KV_* code of common/kv_types.glsl) selects the element type of the
+ * indexer cache, which follows the context's type_k (llama-kv-cache-dsa.cpp:51).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_kv, i n_idx_heads, i idx_dim, i causal, i swa_type, i n_swa,
+ *    R float iq, R float w, R <KV> ik_cache, R int q_pos, R int kv_pos, W float scores)
+ *     scores[t*n_kv + s] = sum_h max(iq[t][h] . ik[s], 0) * w[t][h] when row s is visible to token t,
+ *                        = -INF otherwise
+ * (llama.cpp ggml-cpu/ops.cpp:12531-12614). Visibility: kv_pos[s] >= 0, kv_pos[s] <= q_pos[t] when causal,
+ * and llama_hparams::is_masked_swa false for swa_type / n_swa (llama-hparams.h:506-540).
+ * Preconditions (host): 1 <= idx_dim <= NF_DSA_QSTAGE, n_idx_heads >= 1; for a block type, idx_dim
+ * is a multiple of 32 (whole ggml blocks per row).
+ *
+ * Dispatch: 1-D, one workgroup per (token, block of L rows), linear group g = t*ceil(n_kv/L) + b,
+ * row s = b*L + lid; global = n_tokens*ceil(n_kv/L)*L, local = {L, 1, 1}. Folded group counts are
+ * recovered by nf_wg_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+
+#ifndef KV
+#error "dsa_score.comp needs KV=NF_KV_<type>"
+#endif
+
+#define NF_DSA_QSTAGE 2048
+#define NF_DSA_WSTAGE 256
+
+layout(std430, binding = 0) readonly buffer NfDsaIq { float iq[]; };
+layout(std430, binding = 1) readonly buffer NfDsaW { float w_in[]; };
+NF_ATTN_KV_VIEWS(2, ik_cache)
+layout(std430, binding = 3) readonly buffer NfDsaQPos { int q_pos[]; };
+layout(std430, binding = 4) readonly buffer NfDsaKvPos { int kv_pos[]; };
+layout(std430, binding = 5) writeonly buffer NfDsaScores { float scores[]; };
+layout(push_constant) uniform NfDsaParams {
+    int n_tokens;
+    int n_kv;
+    int n_idx_heads;
+    int idx_dim;
+    int causal;
+    int swa_type;
+    int n_swa;
+} pc;
+
+shared float nf_dsa_qs[NF_DSA_QSTAGE];
+shared float nf_dsa_ws[NF_DSA_WSTAGE];
+
+/* llama.cpp KV-mask visibility (C nf_dsa_visible). */
+bool nf_dsa_visible(int p_kv, int p_q) {
+    if (p_kv < 0) {
+        return false;
+    }
+    if (pc.causal != 0 && p_kv > p_q) {
+        return false;
+    }
+    if (pc.swa_type == 1) {
+        if (p_q - p_kv >= pc.n_swa) {
+            return false;
+        }
+    } else if (pc.swa_type == 2) {
+        if (p_kv < (p_q / pc.n_swa) * pc.n_swa) {
+            return false;
+        }
+    } else if (pc.swa_type == 3) {
+        const int half_n_swa = pc.n_swa / 2;
+        const int diff = p_q - p_kv;
+        if (diff < -half_n_swa || diff > half_n_swa) {
+            return false;
+        }
+    }
+    return true;
+}
+
+vec4 nf_dsa_q4(uint i) {
+    return vec4(nf_dsa_qs[i], nf_dsa_qs[i + 1u], nf_dsa_qs[i + 2u], nf_dsa_qs[i + 3u]);
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint n_kv = uint(pc.n_kv);
+    const uint nblk = (n_kv + lsize - 1u) / lsize;
+    const uint g = nf_wg_id();
+    const uint t = g / nblk;
+    /* The token depends only on the workgroup id, so this return is uniform per workgroup; a launch that
+     * violates the head-size precondition writes nothing. */
+    if (t >= uint(pc.n_tokens) || pc.idx_dim < 1 || pc.idx_dim > NF_DSA_QSTAGE) {
+        return;
+    }
+    const uint s = (g - t * nblk) * lsize + lid;
+    const uint n_heads = uint(pc.n_idx_heads);
+    const uint idx_dim = uint(pc.idx_dim);
+
+    bool vis = false;
+    if (s < n_kv) {
+        vis = nf_dsa_visible(kv_pos[s], q_pos[t]);
+    }
+    const uint krow = (vis ? s : 0u) * idx_dim;
+    const uint qbase = t * n_heads * idx_dim;
+    const uint wbase = t * n_heads;
+    const uint hs = min(uint(NF_DSA_WSTAGE), uint(NF_DSA_QSTAGE) / idx_dim);
+
+    float score = 0.0;
+    for (uint h0 = 0u; h0 < n_heads; h0 += hs) {
+        const uint nh = min(hs, n_heads - h0);
+        barrier();
+        for (uint i = lid; i < nh * idx_dim; i += lsize) {
+            nf_dsa_qs[i] = iq[qbase + h0 * idx_dim + i];
+        }
+        for (uint i = lid; i < nh; i += lsize) {
+            nf_dsa_ws[i] = w_in[wbase + h0 + i];
+        }
+        barrier();
+        if (vis) {
+            for (uint hg = 0u; hg < nh; hg += 4u) {
+                /* Heads past nh repeat the last head; their sums are computed and dropped. */
+                const uint q0 = hg * idx_dim;
+                const uint q1 = min(hg + 1u, nh - 1u) * idx_dim;
+                const uint q2 = min(hg + 2u, nh - 1u) * idx_dim;
+                const uint q3 = min(hg + 3u, nh - 1u) * idx_dim;
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                uint d = 0u;
+                for (; d + 4u <= idx_dim; d += 4u) {
+                    const vec4 k4 = ik_cache_load4(krow + d);
+                    a0 += dot(nf_dsa_q4(q0 + d), k4);
+                    a1 += dot(nf_dsa_q4(q1 + d), k4);
+                    a2 += dot(nf_dsa_q4(q2 + d), k4);
+                    a3 += dot(nf_dsa_q4(q3 + d), k4);
+                }
+                for (; d < idx_dim; ++d) {
+                    const float kd = ik_cache_load1(krow + d);
+                    a0 += nf_dsa_qs[q0 + d] * kd;
+                    a1 += nf_dsa_qs[q1 + d] * kd;
+                    a2 += nf_dsa_qs[q2 + d] * kd;
+                    a3 += nf_dsa_qs[q3 + d] * kd;
+                }
+                score += max(a0, 0.0) * nf_dsa_ws[hg];
+                if (hg + 1u < nh) {
+                    score += max(a1, 0.0) * nf_dsa_ws[hg + 1u];
+                }
+                if (hg + 2u < nh) {
+                    score += max(a2, 0.0) * nf_dsa_ws[hg + 2u];
+                }
+                if (hg + 3u < nh) {
+                    score += max(a3, 0.0) * nf_dsa_ws[hg + 3u];
+                }
+            }
+        }
+    }
+    if (s < n_kv) {
+        scores[t * n_kv + s] = vis ? score : -NF_INF;
+    }
+}

@@ -1,0 +1,5 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Offset-aware generic element-wise ops used by GpuOps (kernels/llm/eltwise_ext.cl).
+# eltwise_ext.cl
+LLM_Copy2D_F32	eltwise_ext.comp	OP=OP_COPY2D_F32
+LLM_Axpby_F32	eltwise_ext.comp	OP=OP_AXPBY_F32

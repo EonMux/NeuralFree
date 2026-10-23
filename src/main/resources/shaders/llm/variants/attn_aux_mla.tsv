@@ -1,0 +1,6 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Q/gate split (kernels/llm/attn_aux.cl) and MLA KV assembly and absorbed KV decompression (kernels/llm/mla.cl).
+LLM_SplitQGate	attn_aux.comp	OP=OP_SPLITQGATE
+LLM_Batch_SplitQGate	attn_aux.comp	OP=OP_BATCH_SPLITQGATE
+LLM_MLA_KV_Assemble	mla_kv.comp	OP=OP_MLA_KV_ASSEMBLE
+LLM_MLA_AbsorbedKVDecomp	mla_kv.comp	OP=OP_MLA_ABSORBEDKVDECOMP

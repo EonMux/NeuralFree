@@ -1,0 +1,298 @@
+/* moe_router.comp - LLM_MoE_Router: per-token MoE gating, group-limited top-k selection and expert
+ * weights. GLSL twin of LLM_MoE_Router in kernels/llm/moe.cl, which is the semantic reference (same order of
+ * selection and of the per-token weight arithmetic). Requires: common/nf_common.glsl,
+ * common/reduce.glsl, common/act.glsl.
+ *
+ *     LLM_MoE_Router	moe_router.comp		sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_expert, i k, i gating, i n_groups, i n_group_used, i norm_w, f w_scale,
+ *    i has_bias, i sel_mode, i id_div, R float logits, R float exp_probs_b, int ids, W float weights)
+ * ids is read (sel_mode 3) and written, so it is not writeonly.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1} with L a power of two, 32 <= L <= LLM_DIMX, global = n_tokens * L;
+ * the token is the folding-aware nf_wg_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfMrLogits { float logits[]; };
+layout(std430, binding = 1) readonly buffer NfMrBias { float exp_probs_b[]; };
+layout(std430, binding = 2) buffer NfMrIds { int ids[]; };
+layout(std430, binding = 3) writeonly buffer NfMrWeights { float weights[]; };
+layout(push_constant) uniform NfMrParams {
+    int n_tokens; int n_expert; int k; int gating; int n_groups; int n_group_used; int norm_w;
+    float w_scale; int has_bias; int sel_mode; int id_div;
+} pc;
+
+#include "common/reduce.glsl"
+#include "common/act.glsl"
+
+#define NF_MOE_MAX_EXPERTS 1024
+#define NF_MOE_MAX_K       32
+#define NF_MOE_MAX_GROUPS  64
+
+#define NF_MOE_GATING_SOFTMAX        0
+#define NF_MOE_GATING_SIGMOID        1
+#define NF_MOE_GATING_SOFTMAX_WEIGHT 2
+#define NF_MOE_GATING_SQRT_SOFTPLUS  3
+
+#define NF_MOE_SEL_PROBS       0
+#define NF_MOE_SEL_RAW_LOGITS  1
+#define NF_MOE_SEL_SIGMOID     2
+#define NF_MOE_SEL_PRESELECTED 3
+
+const float NF_MOE_NORM_MIN = 6.103515625e-5;
+
+shared float moe_probs[NF_MOE_MAX_EXPERTS];
+shared float moe_sel[NF_MOE_MAX_EXPERTS];
+shared float moe_rv[gl_WorkGroupSize.x];
+shared int moe_ri[gl_WorkGroupSize.x];
+shared float moe_gscore[NF_MOE_MAX_GROUPS];
+shared int moe_gkeep[NF_MOE_MAX_GROUPS];
+shared int moe_pick[NF_MOE_MAX_K];
+
+/* NaN ranks as -INF (C nf_moe_key). */
+float nf_moe_key(float v) {
+    return isnan(v) ? -NF_INF : v;
+}
+
+/* Candidate (cv, ci) ranks before (bv, bi): higher key, then lower index (C nf_moe_better). */
+bool nf_moe_better(float cv, int ci, float bv, int bi) {
+    return ci >= 0 && (bi < 0 || cv > bv || (cv == bv && ci < bi));
+}
+
+/* Workgroup arg-max (C nf_moe_wg_argmax); every invocation receives the winning index. */
+int nf_moe_wg_argmax(float v, int i) {
+    const uint lid = gl_LocalInvocationID.x;
+    moe_rv[lid] = v;
+    moe_ri[lid] = i;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x >> 1; s > 0u; s >>= 1) {
+        if (lid < s && nf_moe_better(moe_rv[lid + s], moe_ri[lid + s], moe_rv[lid], moe_ri[lid])) {
+            moe_rv[lid] = moe_rv[lid + s];
+            moe_ri[lid] = moe_ri[lid + s];
+        }
+        barrier();
+    }
+    const int r = moe_ri[0];
+    barrier();
+    return r;
+}
+
+/* (int)((float)id * (1.0 / div)) with the correctly rounded reciprocal (C nf_moe_div_id). */
+int nf_moe_div_id(int id, int div) {
+    const uint g = uint(div);
+    const uint n = uint(findMSB(g));
+    float r;
+    if ((g & (g - 1u)) == 0u) {
+        r = uintBitsToFloat((127u - n) << 23);
+    } else {
+        uint rem = 1u << n;
+        uint q = 0u;
+        for (int b = 0; b < 24; ++b) {
+            rem <<= 1;
+            q <<= 1;
+            if (rem >= g) {
+                rem -= g;
+                q |= 1u;
+            }
+        }
+        if (2u * rem > g || (2u * rem == g && (q & 1u) != 0u)) {
+            q++;
+        }
+        r = q == (1u << 24) ? uintBitsToFloat((127u - n) << 23) : uintBitsToFloat(((126u - n) << 23) | (q & 0x7FFFFFu));
+    }
+    return int(float(id) * r);
+}
+
+/* Probability of one logit (softmax is finished by the caller). */
+float nf_moe_gate(int gating, float x, float m) {
+    switch (gating) {
+        case NF_MOE_GATING_SOFTMAX:        return exp(x - m);
+        case NF_MOE_GATING_SIGMOID:        return nf_sigmoid(x);
+        case NF_MOE_GATING_SOFTMAX_WEIGHT: return x;
+        case NF_MOE_GATING_SQRT_SOFTPLUS:  return sqrt(nf_softplus(x));
+        default:                           return NF_NAN;
+    }
+}
+
+void main() {
+    const uint t = nf_wg_id();
+    /* Depends only on the workgroup id, so the return is uniform per workgroup. */
+    if (t >= uint(pc.n_tokens)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint n_expert = uint(pc.n_expert);
+    const uint k = uint(pc.k);
+    const uint xb = t * n_expert;
+    const uint row = t * k;
+    const int gating = pc.gating;
+    const int sel_mode = pc.sel_mode;
+
+    /* gating probabilities */
+    float m = 0.0;
+    if (gating == NF_MOE_GATING_SOFTMAX) {
+        float lm = -NF_INF;
+        for (uint e = lid; e < n_expert; e += lsize) {
+            lm = max(lm, logits[xb + e]);
+        }
+        m = nf_wg_max(lm);
+    }
+    float ls = 0.0;
+    for (uint e = lid; e < n_expert; e += lsize) {
+        const float p = nf_moe_gate(gating, logits[xb + e], m);
+        moe_probs[e] = p;
+        ls += p;
+    }
+    if (gating == NF_MOE_GATING_SOFTMAX) {
+        const float inv = 1.0 / nf_wg_sum(ls);
+        for (uint e = lid; e < n_expert; e += lsize) {
+            moe_probs[e] *= inv;
+        }
+    }
+
+    /* selection scores */
+    if (sel_mode != NF_MOE_SEL_PRESELECTED) {
+        for (uint e = lid; e < n_expert; e += lsize) {
+            float sv;
+            if (sel_mode == NF_MOE_SEL_RAW_LOGITS) {
+                sv = logits[xb + e];
+            } else if (sel_mode == NF_MOE_SEL_SIGMOID) {
+                sv = nf_sigmoid(logits[xb + e]);
+            } else {
+                sv = pc.has_bias != 0 ? moe_probs[e] + exp_probs_b[e] : moe_probs[e];
+            }
+            moe_sel[e] = sv;
+        }
+    }
+    barrier();
+
+    /* group-limited routing */
+    const uint n_groups = uint(pc.n_groups);
+    if (sel_mode != NF_MOE_SEL_PRESELECTED && n_groups > 1u) {
+        const uint n_per = n_expert / n_groups;
+        for (uint g = lid; g < n_groups; g += lsize) {
+            float a = -NF_INF;
+            float b = -NF_INF;
+            for (uint i = 0u; i < n_per; ++i) {
+                const float v = nf_moe_key(moe_sel[g * n_per + i]);
+                if (v > a) {
+                    b = a;
+                    a = v;
+                } else if (v > b) {
+                    b = v;
+                }
+            }
+            moe_gscore[g] = a + b;
+            moe_gkeep[g] = 0;
+        }
+        barrier();
+        if (lid == 0u) {
+            for (int r = 0; r < pc.n_group_used; ++r) {
+                float bv = -NF_INF;
+                int bi = -1;
+                for (uint g = 0u; g < n_groups; ++g) {
+                    const float v = nf_moe_key(moe_gscore[g]);
+                    if (moe_gkeep[g] == 0 && nf_moe_better(v, int(g), bv, bi)) {
+                        bv = v;
+                        bi = int(g);
+                    }
+                }
+                if (bi >= 0) {
+                    moe_gkeep[bi] = 1;
+                }
+            }
+        }
+        barrier();
+        for (uint e = lid; e < n_expert; e += lsize) {
+            if (moe_gkeep[e / n_per] == 0) {
+                moe_sel[e] = -NF_INF;
+            }
+        }
+        barrier();
+    }
+
+    /* top-k: invocation lid owns experts lid + c * L, bit c of `taken` marking a pick */
+    if (sel_mode != NF_MOE_SEL_PRESELECTED) {
+        uint taken = 0u;
+        for (uint j = 0u; j < k; ++j) {
+            float bv = -NF_INF;
+            int bi = -1;
+            uint c = 0u;
+            for (uint e = lid; e < n_expert; e += lsize, ++c) {
+                if (((taken >> c) & 1u) != 0u) {
+                    continue;
+                }
+                const float v = nf_moe_key(moe_sel[e]);
+                if (nf_moe_better(v, int(e), bv, bi)) {
+                    bv = v;
+                    bi = int(e);
+                }
+            }
+            const int pick = nf_moe_wg_argmax(bv, bi);
+            if (pick >= 0 && uint(pick) % lsize == lid) {
+                taken |= 1u << (uint(pick) / lsize);
+            }
+            if (lid == 0u) {
+                moe_pick[j] = pick;
+            }
+        }
+    } else {
+        for (uint j = lid; j < k; j += lsize) {
+            moe_pick[j] = ids[row + j];
+        }
+    }
+    barrier();
+
+    /* weights, in the sequential order of the C kernel and the Java twin */
+    if (lid == 0u) {
+        float w[NF_MOE_MAX_K];
+        for (uint j = 0u; j < k; ++j) {
+            int id = moe_pick[j];
+            if (sel_mode != NF_MOE_SEL_PRESELECTED && pc.id_div > 0 && id >= 0) {
+                id = nf_moe_div_id(id, pc.id_div);
+            }
+            moe_pick[j] = id;
+            w[j] = (id >= 0 && uint(id) < n_expert) ? moe_probs[id] : 0.0;
+        }
+        if (gating == NF_MOE_GATING_SOFTMAX_WEIGHT) {
+            float wm = -NF_INF;
+            for (uint j = 0u; j < k; ++j) {
+                wm = max(wm, w[j]);
+            }
+            float s = 0.0;
+            for (uint j = 0u; j < k; ++j) {
+                w[j] = exp(w[j] - wm);
+                s += w[j];
+            }
+            const float inv = 1.0 / s;
+            for (uint j = 0u; j < k; ++j) {
+                w[j] *= inv;
+            }
+        }
+        if (pc.norm_w != 0) {
+            float s = 0.0;
+            for (uint j = 0u; j < k; ++j) {
+                s += w[j];
+            }
+            s = nf_clamp_ggml(s, NF_MOE_NORM_MIN, NF_INF);
+            for (uint j = 0u; j < k; ++j) {
+                w[j] = w[j] / s;
+            }
+        }
+        if (pc.w_scale != 0.0 && pc.w_scale != 1.0) {
+            for (uint j = 0u; j < k; ++j) {
+                w[j] *= pc.w_scale;
+            }
+        }
+        for (uint j = 0u; j < k; ++j) {
+            ids[row + j] = moe_pick[j];
+            weights[row + j] = w[j];
+        }
+    }
+}

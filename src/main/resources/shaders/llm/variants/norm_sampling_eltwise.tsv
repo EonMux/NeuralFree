@@ -1,0 +1,43 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Norm and sampling kernels (kernels/llm/norm.cl, kernels/llm/sampling.cl), element-wise and FFN-activation kernels (kernels/llm/eltwise.cl, kernels/llm/ffn_act.cl).
+# norm.cl
+LLM_RMSNorm	norm.comp	OP=OP_RMSNORM	sg
+LLM_RMSNormHeads	norm.comp	OP=OP_RMSNORMHEADS	sg
+LLM_RMSNormGrouped	norm.comp	OP=OP_RMSNORMGROUPED	sg
+LLM_L2NormHeads	norm.comp	OP=OP_L2NORMHEADS	sg
+LLM_Batch_RMSNorm	norm.comp	OP=OP_BATCH_RMSNORM	sg
+LLM_Batch_RMSNormHeads	norm.comp	OP=OP_BATCH_RMSNORMHEADS	sg
+LLM_Batch_L2NormHeads	norm.comp	OP=OP_BATCH_L2NORMHEADS	sg
+LLM_LayerNorm	layernorm.comp	OP=OP_LAYERNORM	sg
+LLM_Batch_LayerNorm	layernorm.comp	OP=OP_BATCH_LAYERNORM	sg
+# sampling.cl
+LLM_Softmax	softmax.comp	OP=OP_SOFTMAX	sg
+LLM_Argmax	argmax.comp	OP=OP_ARGMAX
+# eltwise.cl
+LLM_Add	eltwise.comp	OP=OP_ADD
+LLM_BiasAdd	eltwise.comp	OP=OP_BIASADD
+LLM_BiasAddSlice	eltwise.comp	OP=OP_BIASADDSLICE
+LLM_BiasAddDstOffset	eltwise.comp	OP=OP_BIASADDDSTOFFSET
+LLM_Copy	eltwise.comp	OP=OP_COPY
+LLM_FillZero	eltwise.comp	OP=OP_FILLZERO
+LLM_Batch_Add	eltwise.comp	OP=OP_BATCH_ADD
+LLM_Batch_Copy	eltwise.comp	OP=OP_BATCH_COPY
+LLM_Batch_BiasAdd	eltwise.comp	OP=OP_BATCH_BIASADD
+LLM_ScaleAdd	eltwise.comp	OP=OP_SCALEADD
+LLM_EmbedScale	eltwise.comp	OP=OP_EMBEDSCALE
+LLM_LogitSoftcap	eltwise.comp	OP=OP_LOGITSOFTCAP
+LLM_AddPosEmbed	eltwise.comp	OP=OP_ADDPOSEMBED
+LLM_Add3	eltwise.comp	OP=OP_ADD3
+# ffn_act.cl
+LLM_SiGLUMul	act.comp	OP=OP_SIGLUMUL
+LLM_SiLU	act.comp	OP=OP_SILU
+LLM_Batch_SiGLUMul	act.comp	OP=OP_BATCH_SIGLUMUL
+LLM_SwiGLUOai	act.comp	OP=OP_SWIGLUOAI
+LLM_GELU	act.comp	OP=OP_GELU
+LLM_GELUMul	act.comp	OP=OP_GELUMUL
+LLM_Batch_GELU	act.comp	OP=OP_BATCH_GELU
+LLM_GeluMulOffset	act.comp	OP=OP_GELUMULOFFSET
+LLM_Batch_GeluMulLayerToken	act.comp	OP=OP_BATCH_GELUMULLAYERTOKEN
+LLM_Batch_GELUMul	act.comp	OP=OP_BATCH_GELUMUL
+LLM_SigmoidGateMul	act.comp	OP=OP_SIGMOIDGATEMUL
+LLM_Batch_SigmoidGateMul	act.comp	OP=OP_BATCH_SIGMOIDGATEMUL

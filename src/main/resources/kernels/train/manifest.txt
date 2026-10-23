@@ -1,0 +1,18 @@
+# Train kernel library sources in build order: [shared] headers (resolved against kernels/), library headers, then kernel files.
+[shared] common/dialect.h
+common/train.h
+core.cl
+eltwise.cl
+reduce.cl
+softmax.cl
+segment.cl
+gemm.cl
+conv.cl
+pool.cl
+norm.cl
+optim.cl
+dense.cl
+ml/kmeans.cl
+ml/kernel_matrix.cl
+ml/linear.cl
+ml/forecast.cl

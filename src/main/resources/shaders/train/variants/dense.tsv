@@ -1,0 +1,4 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)
+# Dense-network bias, activation and activation backward (kernels/train/dense.cl).
+TR_DenseBiasAct_F32	dense.comp	OP=DENSE_BIAS_ACT_F32
+TR_DenseActBackward_F32	dense.comp	OP=DENSE_ACT_BACKWARD_F32

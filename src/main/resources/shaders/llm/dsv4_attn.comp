@@ -1,0 +1,215 @@
+/* dsv4_attn.comp - LLM_DSV4_CompressedAttn (GLSL twin of kernels/llm/dsv4/attn.cl, which documents the math, the key
+ * visibility rules and the llama.cpp references). Requires: common/nf_common.glsl, common/reduce.glsl,
+ * common/rope_common.glsl, common/hadamard.glsl, common/kv_types.glsl, common/dsv4_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_head, i head_dim, i g_tile, i q_off, i out_off, i n_raw, i raw_type, i n_swa, i comp_mode,
+ *    i n_comp, i comp_type, i ratio, i sel_stride, i has_sinks, f kq_scale, i rot_block, i n_rot, i rope_mode,
+ *    f theta_scale, f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi,
+ *    R q, R<KV> raw_k, R<int> raw_pos, R<KV> comp_k, R<int> sel, R sinks, R<int> q_pos, W out)
+ * Dispatch: 1-D, local L (power of two in [32, LLM_DIMX]), one work-group per (token, head tile):
+ * groups = n_tokens * ceil(n_head / g_tile), with g_tile * (2 * head_dim + L) <= NF_FA_SMEM_FLOATS.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+#include "common/rope_common.glsl"
+#include "common/hadamard.glsl"
+#include "common/kv_types.glsl"
+#include "common/dsv4_common.glsl"
+
+#define DSV4_ATTN_MAX_G 16
+#define DSV4_COMP_NONE     0
+#define DSV4_COMP_SELECTED 2
+
+layout(push_constant) uniform NfDsv4AttnParams {
+    int n_tokens;
+    int n_head;
+    int head_dim;
+    int g_tile;
+    int q_off;
+    int out_off;
+    int n_raw;
+    int raw_type;
+    int n_swa;
+    int comp_mode;
+    int n_comp;
+    int comp_type;
+    int ratio;
+    int sel_stride;
+    int has_sinks;
+    float kq_scale;
+    int rot_block;
+    int n_rot;
+    int rope_mode;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+} pc;
+
+layout(std430, binding = 0) readonly buffer NfDsv4Q      { float q_in[]; };
+NF_BUFFER_VIEWS(1, raw_k)
+layout(std430, binding = 2) readonly buffer NfDsv4RawPos { int raw_pos[]; };
+NF_BUFFER_VIEWS(3, comp_k)
+layout(std430, binding = 4) readonly buffer NfDsv4Sel    { int sel[]; };
+layout(std430, binding = 5) readonly buffer NfDsv4Sinks  { float sinks[]; };
+layout(std430, binding = 6) readonly buffer NfDsv4QPos   { int q_pos[]; };
+layout(std430, binding = 7) writeonly buffer NfDsv4Out   { float out_v[]; };
+
+shared float smem[NF_FA_SMEM_FLOATS];
+shared int key_code[gl_WorkGroupSize.x];
+
+/* Values of the K-only cache views, decoded by element type (C nf_kv_load1, common/kv_types.h). */
+NF_KV_LOADERS(raw_k)
+NF_KV_LOADERS(comp_k)
+
+/* Value e of the key row code (>= 0 raw row, <= -2 compressed row -(code + 2)), d-th dim. */
+float dsv4_key(int code, int d) {
+    const uint hd = uint(pc.head_dim);
+    return code >= 0 ? raw_k_kv_load1(uint(code) * hd + uint(d), pc.raw_type)
+                     : comp_k_kv_load1(uint(-code - 2) * hd + uint(d), pc.comp_type);
+}
+
+/* Hadamard transform and partial-RoPE row rotation over smem (C nf_fwht_local, nf_dsv4_rope_rows). */
+NF_FWHT_SHARED_FN(dsv4_fwht, smem)
+NF_DSV4_ROPE_ROWS_FN(dsv4_rope_rows, smem)
+
+void main() {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int n_tiles = (pc.n_head + pc.g_tile - 1) / pc.g_tile;
+    const int grp = int(nf_wg_id());
+    const int t = grp / n_tiles;
+    if (t >= pc.n_tokens) {
+        return;
+    }
+    const int h0 = (grp - t * n_tiles) * pc.g_tile;
+    const int G = min(pc.g_tile, pc.n_head - h0);
+    const int hd = pc.head_dim;
+
+    /* smem layout: q tile [G][hd] at 0 | accumulators [G][hd] at acc0 | chunk weights [G][L] at pw0. */
+    const int acc0 = G * hd;
+    const int pw0 = 2 * G * hd;
+
+    const int p = q_pos[t];
+    const int n_vis_c = (pc.comp_mode != DSV4_COMP_NONE) ? (p + 1) / pc.ratio : 0;
+    const int n_keys = pc.n_raw + ((pc.comp_mode != DSV4_COMP_NONE) ? pc.n_comp : 0);
+
+    const int qbase = pc.q_off + (t * pc.n_head + h0) * hd;
+    for (int i = lid; i < G * hd; i += lsize) {
+        smem[i] = q_in[qbase + i];
+        smem[acc0 + i] = 0.0;
+    }
+    barrier();
+    if (pc.rot_block > 0) {
+        dsv4_fwht(0u, uint(G * hd), uint(pc.rot_block));
+    }
+
+    float m_run[DSV4_ATTN_MAX_G];
+    float l_run[DSV4_ATTN_MAX_G];
+    float alpha[DSV4_ATTN_MAX_G];
+    for (int g = 0; g < G; ++g) {
+        m_run[g] = -NF_INF;
+        l_run[g] = 0.0;
+    }
+
+    for (int kb = 0; kb < n_keys; kb += lsize) {
+        const int j = kb + lid;
+        int code = -1;
+        if (j < pc.n_raw) {
+            const int kp = raw_pos[j];
+            if (kp >= 0 && kp <= p && p - kp < pc.n_swa) {
+                code = j;
+            }
+        } else if (j < n_keys) {
+            const int jc = j - pc.n_raw;
+            const int c = (pc.comp_mode == DSV4_COMP_SELECTED) ? sel[t * pc.sel_stride + jc] : jc;
+            if (c >= 0 && c < n_vis_c) {
+                code = -(c + 2);
+            }
+        }
+        key_code[lid] = code;
+
+        float dots[DSV4_ATTN_MAX_G];
+        for (int g = 0; g < G; ++g) {
+            dots[g] = 0.0;
+        }
+        if (code != -1) {
+            for (int d = 0; d < hd; d += 4) {
+                const vec4 k4 = vec4(dsv4_key(code, d), dsv4_key(code, d + 1),
+                                     dsv4_key(code, d + 2), dsv4_key(code, d + 3));
+                for (int g = 0; g < G; ++g) {
+                    const int qi = g * hd + d;
+                    dots[g] += k4.x * smem[qi] + k4.y * smem[qi + 1] + k4.z * smem[qi + 2] + k4.w * smem[qi + 3];
+                }
+            }
+        }
+        for (int g = 0; g < G; ++g) {
+            const float s = (code != -1) ? dots[g] * pc.kq_scale : -NF_INF;
+            const float cm = nf_wg_max(s);
+            const float m_new = max(m_run[g], cm);
+            const float e = (s == -NF_INF) ? 0.0 : exp(s - m_new);
+            alpha[g] = (m_run[g] == -NF_INF) ? 0.0 : exp(m_run[g] - m_new);
+            smem[pw0 + g * lsize + lid] = e;
+            const float cs = nf_wg_sum(e);
+            l_run[g] = l_run[g] * alpha[g] + cs;
+            m_run[g] = m_new;
+        }
+        barrier();
+
+        const int n_chunk = min(lsize, n_keys - kb);
+        for (int d = lid; d < hd; d += lsize) {
+            float a[DSV4_ATTN_MAX_G];
+            for (int g = 0; g < G; ++g) {
+                a[g] = smem[acc0 + g * hd + d] * alpha[g];
+            }
+            for (int jj = 0; jj < n_chunk; ++jj) {
+                const int cj = key_code[jj];
+                if (cj == -1) {
+                    continue;
+                }
+                const float v = dsv4_key(cj, d);
+                for (int g = 0; g < G; ++g) {
+                    a[g] += smem[pw0 + g * lsize + jj] * v;
+                }
+            }
+            for (int g = 0; g < G; ++g) {
+                smem[acc0 + g * hd + d] = a[g];
+            }
+        }
+        barrier();
+    }
+
+    float fac[DSV4_ATTN_MAX_G];
+    for (int g = 0; g < G; ++g) {
+        if (pc.has_sinks != 0) {
+            const float sink = sinks[h0 + g];
+            const float m2 = max(m_run[g], sink);
+            const float a = (m_run[g] == -NF_INF) ? 0.0 : exp(m_run[g] - m2);
+            fac[g] = a / (l_run[g] * a + exp(sink - m2));
+        } else {
+            fac[g] = l_run[g] > 0.0 ? 1.0 / l_run[g] : 0.0;
+        }
+    }
+    for (int i = lid; i < G * hd; i += lsize) {
+        smem[acc0 + i] *= fac[i / hd];
+    }
+    barrier();
+    if (pc.rot_block > 0) {
+        dsv4_fwht(uint(acc0), uint(G * hd), uint(pc.rot_block));
+    }
+    if (pc.n_rot > 0) {
+        dsv4_rope_rows(acc0, G, hd, pc.n_rot, pc.rope_mode, p, -1.0, pc.theta_scale, pc.freq_scale, pc.ext_factor,
+                       pc.attn_factor, pc.corr_lo, pc.corr_hi);
+        barrier();
+    }
+    const int obase = pc.out_off + (t * pc.n_head + h0) * hd;
+    for (int i = lid; i < G * hd; i += lsize) {
+        out_v[obase + i] = smem[acc0 + i];
+    }
+}

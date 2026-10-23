@@ -1,0 +1,30 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# DSA lightning-indexer scores over an indexer cache of any KV cache type (kernels/llm/sparse/dsa.cl), per-row top-k (kernels/llm/sparse/topk_rows.cl) and sparse MLA attention (kernels/llm/sparse/sparse_mla.cl).
+LLM_DSA_IndexerScore_F32	dsa_score.comp	KV=NF_KV_F32
+LLM_DSA_IndexerScore_F16	dsa_score.comp	KV=NF_KV_F16
+LLM_DSA_IndexerScore_Q8_0	dsa_score.comp	KV=NF_KV_Q8_0
+LLM_DSA_IndexerScore_BF16	dsa_score.comp	KV=NF_KV_BF16
+LLM_DSA_IndexerScore_Q4_0	dsa_score.comp	KV=NF_KV_Q4_0
+LLM_DSA_IndexerScore_Q4_1	dsa_score.comp	KV=NF_KV_Q4_1
+LLM_DSA_IndexerScore_IQ4_NL	dsa_score.comp	KV=NF_KV_IQ4_NL
+LLM_DSA_IndexerScore_Q5_0	dsa_score.comp	KV=NF_KV_Q5_0
+LLM_DSA_IndexerScore_Q5_1	dsa_score.comp	KV=NF_KV_Q5_1
+LLM_TopK_Rows	topk_rows.comp
+LLM_MLA_SparseDecode_F32	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_F32	sg
+LLM_MLA_SparseDecode_F16	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_F16	sg
+LLM_MLA_SparseDecode_Q8_0	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q8_0	sg
+LLM_MLA_SparseDecode_BF16	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_BF16	sg
+LLM_MLA_SparseDecode_Q4_0	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q4_0	sg
+LLM_MLA_SparseDecode_Q4_1	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q4_1	sg
+LLM_MLA_SparseDecode_IQ4_NL	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_IQ4_NL	sg
+LLM_MLA_SparseDecode_Q5_0	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q5_0	sg
+LLM_MLA_SparseDecode_Q5_1	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q5_1	sg
+LLM_MLA_SparsePrefill_F32	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_F32	sg
+LLM_MLA_SparsePrefill_F16	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_F16	sg
+LLM_MLA_SparsePrefill_Q8_0	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q8_0	sg
+LLM_MLA_SparsePrefill_BF16	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_BF16	sg
+LLM_MLA_SparsePrefill_Q4_0	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q4_0	sg
+LLM_MLA_SparsePrefill_Q4_1	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q4_1	sg
+LLM_MLA_SparsePrefill_IQ4_NL	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_IQ4_NL	sg
+LLM_MLA_SparsePrefill_Q5_0	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q5_0	sg
+LLM_MLA_SparsePrefill_Q5_1	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q5_1	sg

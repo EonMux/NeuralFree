@@ -1,0 +1,174 @@
+/* matvec_quant.comp - one-workgroup-per-row matvec op templates over a QT_DECODE_* weight decoder.
+ * GLSL twin of the IQ_MATVEC .. IQ_BATCHMATMUL2D family (kernels/llm/common/matvec_family.h) and of the
+ * hand-written Q8_0 / MXFP4 / IQ4_XS matvec kernels, which share these semantics.
+ * Requires: common/nf_common.glsl, common/quant_blocks.glsl, common/iq_tables.glsl,
+ * common/reduce.glsl, common/act.glsl and the decoder file that serves QTYPE.
+ *
+ * A variants row selects QTYPE=QT_<T> and OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     Q4_K_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q4_K OP=OP_GATEUP_SILU	sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_MATVEC      (i out_dim, i in_dim, R weight, R float input, W float output)
+ *   OP_MATVEC_ADD  (i out_dim, i in_dim, R weight, R float input, float addend_output)
+ *                  addend_output[row] += dot(weight row, input)
+ *   OP_LOGITS      (i vocab_size, i embed_dim, R weight, R float hidden, W float logits)
+ *   OP_GATEUP_SILU,
+ *   OP_GATEUP_GELU (i out_dim, i in_dim, R gate_weight, R up_weight, R float input, W float output)
+ *                  output[row] = act(dot(gate row, input)) * dot(up row, input),
+ *                  act = SiLU (_SILU) or GELU, tanh approximation (_GELU)
+ *   OP_BATCH       (i out_dim, i in_dim, i seq_len, R weight, R float input, W float output)
+ *                  output[s * out_dim + row] = dot(weight row, input row s), s in [0, seq_len)
+ *   OP_BATCH_2D    same arguments and result, one token per workgroup row
+ * A weight row holds in_dim / QT_BS blocks of QT_BB bytes; input row s starts at s * in_dim.
+ *
+ * Dispatch: every op except OP_BATCH_2D is 1-D with global = rows * L and local = {L, 1, 1}, one
+ * workgroup per output row (folded group counts are recovered by nf_wg_id()). OP_BATCH_2D uses
+ * global = {out_dim * L, seq_len, 1} and local = {L, 1, 1}. Any L is reduced exactly; the engine
+ * passes multiples of 32, for which the block/invocation mapping equals the OpenCL kernels'.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#if !defined(OP) || !defined(QTYPE)
+#error "matvec_quant.comp requires OP and QTYPE"
+#endif
+
+#if OP == OP_GATEUP_SILU || OP == OP_GATEUP_GELU
+#define NF_MV_GATEUP 1
+#define NF_WEIGHT_STREAMS 2
+NF_BUFFER_VIEWS(0, w)
+NF_BUFFER_VIEWS(1, u)
+layout(std430, binding = 2) readonly buffer NfMvInput { float x_in[]; };
+layout(std430, binding = 3) writeonly buffer NfMvOutput { float y_out[]; };
+layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; } pc;
+#elif OP == OP_MATVEC || OP == OP_MATVEC_ADD || OP == OP_LOGITS
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfMvInput { float x_in[]; };
+#if OP == OP_MATVEC_ADD
+layout(std430, binding = 2) buffer NfMvOutput { float y_out[]; };
+#else
+layout(std430, binding = 2) writeonly buffer NfMvOutput { float y_out[]; };
+#endif
+layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; } pc;
+#elif OP == OP_BATCH || OP == OP_BATCH_2D
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfMvInput { float x_in[]; };
+layout(std430, binding = 2) writeonly buffer NfMvOutput { float y_out[]; };
+layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; int seq_len; } pc;
+#else
+#error "matvec_quant.comp: OP is not a matvec op"
+#endif
+
+#include "common/quant_blocks.glsl"
+#include "common/iq_tables.glsl"
+#include "common/reduce.glsl"
+#include "common/act.glsl"
+#include "common/quant_legacy.glsl"
+#include "common/quant_k.glsl"
+#include "common/quant_iq.glsl"
+#include "common/quant_new.glsl"
+
+#if !defined(QT_DECODE_DOT) || !defined(QT_BS) || !defined(QT_BB) || !defined(QT_TPS)
+#error "matvec_quant.comp: no QT_DECODE_DOT decoder serves QTYPE"
+#endif
+
+float qt_x(uint i) {
+    return x_in[i];
+}
+
+vec4 qt_x4(uint i) {
+    return vec4(x_in[i], x_in[i + 1u], x_in[i + 2u], x_in[i + 3u]);
+}
+
+/* This invocation's share of dot(weight row at rbase in stream ws, activations at xoff): the
+ * (block, ltid) pairs t = lid, lid + L, ... with block = t / QT_TPS and ltid = t % QT_TPS, so the
+ * QT_TPS invocations of one block are adjacent and every pair is visited once for any L. */
+float nf_mv_row_partial(uint ws, uint rbase, uint xoff, uint nblk) {
+    const uint pairs = nblk * uint(QT_TPS);
+    float ps = 0.0;
+    for (uint t = gl_LocalInvocationID.x; t < pairs; t += gl_WorkGroupSize.x) {
+        const uint b = t / uint(QT_TPS);
+        ps += qt_dot(ws, rbase + b * uint(QT_BB), xoff, b, t % uint(QT_TPS));
+    }
+    return ps;
+}
+
+#ifdef NF_MV_GATEUP
+/* Gate (stream A) and up (stream B) shares of one row, with the same pair mapping. */
+void nf_mv_gateup_partial(uint rbase, uint nblk, inout float gs, inout float us) {
+    const uint pairs = nblk * uint(QT_TPS);
+    for (uint t = gl_LocalInvocationID.x; t < pairs; t += gl_WorkGroupSize.x) {
+        const uint b = t / uint(QT_TPS);
+        const uint bp = rbase + b * uint(QT_BB);
+#ifdef QT_DECODE_DUAL
+        qt_dot_dual(bp, bp, 0u, b, t % uint(QT_TPS), gs, us);
+#else
+        gs += qt_dot(NF_WS_A, bp, 0u, b, t % uint(QT_TPS));
+        us += qt_dot(NF_WS_B, bp, 0u, b, t % uint(QT_TPS));
+#endif
+    }
+}
+#endif
+
+void main() {
+    nf_iq_init_shared();
+
+    const uint lid = gl_LocalInvocationID.x;
+    const uint out_dim = uint(pc.out_dim);
+    const uint in_dim = uint(pc.in_dim);
+    const uint nblk = in_dim / uint(QT_BS);
+    const uint row_bytes = nblk * uint(QT_BB);
+
+#if OP == OP_BATCH_2D
+    /* 2-D dispatch (never folded); with local y == 1 the return is uniform per workgroup. */
+    const uint row = gl_WorkGroupID.x;
+    const uint s = gl_GlobalInvocationID.y;
+    if (row >= out_dim || s >= uint(pc.seq_len)) {
+        return;
+    }
+    const float acc = nf_wg_sum(nf_mv_row_partial(NF_WS_A, row * row_bytes, s * in_dim, nblk));
+    if (lid == 0u) {
+        y_out[s * out_dim + row] = acc;
+    }
+#else
+    /* The row depends only on the workgroup id, so this return is uniform per workgroup. */
+    const uint row = nf_wg_id();
+    if (row >= out_dim) {
+        return;
+    }
+    const uint rbase = row * row_bytes;
+#if OP == OP_BATCH
+    const uint seq_len = uint(pc.seq_len);
+    for (uint s = 0u; s < seq_len; ++s) {
+        const float acc = nf_wg_sum(nf_mv_row_partial(NF_WS_A, rbase, s * in_dim, nblk));
+        if (lid == 0u) {
+            y_out[s * out_dim + row] = acc;
+        }
+    }
+#elif defined(NF_MV_GATEUP)
+    float gs = 0.0;
+    float us = 0.0;
+    nf_mv_gateup_partial(rbase, nblk, gs, us);
+    const float g = nf_wg_sum(gs);
+    const float up = nf_wg_sum(us);
+    if (lid == 0u) {
+#if OP == OP_GATEUP_SILU
+        y_out[row] = nf_silu(g) * up;
+#else
+        y_out[row] = nf_gelu_tanh(g) * up;
+#endif
+    }
+#else
+    const float acc = nf_wg_sum(nf_mv_row_partial(NF_WS_A, rbase, 0u, nblk));
+    if (lid == 0u) {
+#if OP == OP_MATVEC_ADD
+        y_out[row] += acc;
+#else
+        y_out[row] = acc;
+#endif
+    }
+#endif
+#endif
+}

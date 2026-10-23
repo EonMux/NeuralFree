@@ -1,0 +1,125 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# MoE expert matvec family (kernels/llm/moe_matvec.cl via common/matvec_id_family.h) and the routing / combine kernels (kernels/llm/moe.cl).
+# F32
+F32_MatVecId	matvec_id.comp	QTYPE=QT_F32 OP=OP_MATVEC_ID	sg
+F32_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_F32 OP=OP_MATVEC_ID_GATEUP	sg
+F32_BatchMatMulId	matvec_id.comp	QTYPE=QT_F32 OP=OP_BATCH_MATMUL_ID	sg
+# F16
+F16_MatVecId	matvec_id.comp	QTYPE=QT_F16 OP=OP_MATVEC_ID	sg
+F16_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_F16 OP=OP_MATVEC_ID_GATEUP	sg
+F16_BatchMatMulId	matvec_id.comp	QTYPE=QT_F16 OP=OP_BATCH_MATMUL_ID	sg
+# BF16
+BF16_MatVecId	matvec_id.comp	QTYPE=QT_BF16 OP=OP_MATVEC_ID	sg
+BF16_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_BF16 OP=OP_MATVEC_ID_GATEUP	sg
+BF16_BatchMatMulId	matvec_id.comp	QTYPE=QT_BF16 OP=OP_BATCH_MATMUL_ID	sg
+# Q4_0
+Q4_0_MatVecId	matvec_id.comp	QTYPE=QT_Q4_0 OP=OP_MATVEC_ID	sg
+Q4_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q4_0 OP=OP_MATVEC_ID_GATEUP	sg
+Q4_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q4_0 OP=OP_BATCH_MATMUL_ID	sg
+# Q4_1
+Q4_1_MatVecId	matvec_id.comp	QTYPE=QT_Q4_1 OP=OP_MATVEC_ID	sg
+Q4_1_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q4_1 OP=OP_MATVEC_ID_GATEUP	sg
+Q4_1_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q4_1 OP=OP_BATCH_MATMUL_ID	sg
+# Q5_0
+Q5_0_MatVecId	matvec_id.comp	QTYPE=QT_Q5_0 OP=OP_MATVEC_ID	sg
+Q5_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q5_0 OP=OP_MATVEC_ID_GATEUP	sg
+Q5_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q5_0 OP=OP_BATCH_MATMUL_ID	sg
+# Q5_1
+Q5_1_MatVecId	matvec_id.comp	QTYPE=QT_Q5_1 OP=OP_MATVEC_ID	sg
+Q5_1_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q5_1 OP=OP_MATVEC_ID_GATEUP	sg
+Q5_1_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q5_1 OP=OP_BATCH_MATMUL_ID	sg
+# Q8_0
+Q8_0_MatVecId	matvec_id.comp	QTYPE=QT_Q8_0 OP=OP_MATVEC_ID	sg
+Q8_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q8_0 OP=OP_MATVEC_ID_GATEUP	sg
+Q8_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q8_0 OP=OP_BATCH_MATMUL_ID	sg
+# IQ4_NL
+IQ4_NL_MatVecId	matvec_id.comp	QTYPE=QT_IQ4_NL OP=OP_MATVEC_ID	sg
+IQ4_NL_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ4_NL OP=OP_MATVEC_ID_GATEUP	sg
+IQ4_NL_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ4_NL OP=OP_BATCH_MATMUL_ID	sg
+# IQ4_XS
+IQ4_XS_MatVecId	matvec_id.comp	QTYPE=QT_IQ4_XS OP=OP_MATVEC_ID	sg
+IQ4_XS_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ4_XS OP=OP_MATVEC_ID_GATEUP	sg
+IQ4_XS_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ4_XS OP=OP_BATCH_MATMUL_ID	sg
+# MXFP4
+MXFP4_MatVecId	matvec_id.comp	QTYPE=QT_MXFP4 OP=OP_MATVEC_ID	sg
+MXFP4_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_MXFP4 OP=OP_MATVEC_ID_GATEUP	sg
+MXFP4_BatchMatMulId	matvec_id.comp	QTYPE=QT_MXFP4 OP=OP_BATCH_MATMUL_ID	sg
+# Q2_K
+Q2_K_MatVecId	matvec_id.comp	QTYPE=QT_Q2_K OP=OP_MATVEC_ID	sg
+Q2_K_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q2_K OP=OP_MATVEC_ID_GATEUP	sg
+Q2_K_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q2_K OP=OP_BATCH_MATMUL_ID	sg
+# Q3_K
+Q3_K_MatVecId	matvec_id.comp	QTYPE=QT_Q3_K OP=OP_MATVEC_ID	sg
+Q3_K_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q3_K OP=OP_MATVEC_ID_GATEUP	sg
+Q3_K_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q3_K OP=OP_BATCH_MATMUL_ID	sg
+# Q4_K
+Q4_K_MatVecId	matvec_id.comp	QTYPE=QT_Q4_K OP=OP_MATVEC_ID	sg
+Q4_K_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q4_K OP=OP_MATVEC_ID_GATEUP	sg
+Q4_K_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q4_K OP=OP_BATCH_MATMUL_ID	sg
+# Q5_K
+Q5_K_MatVecId	matvec_id.comp	QTYPE=QT_Q5_K OP=OP_MATVEC_ID	sg
+Q5_K_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q5_K OP=OP_MATVEC_ID_GATEUP	sg
+Q5_K_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q5_K OP=OP_BATCH_MATMUL_ID	sg
+# Q6_K
+Q6_K_MatVecId	matvec_id.comp	QTYPE=QT_Q6_K OP=OP_MATVEC_ID	sg
+Q6_K_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q6_K OP=OP_MATVEC_ID_GATEUP	sg
+Q6_K_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q6_K OP=OP_BATCH_MATMUL_ID	sg
+# Q8_K
+Q8_K_MatVecId	matvec_id.comp	QTYPE=QT_Q8_K OP=OP_MATVEC_ID	sg
+Q8_K_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q8_K OP=OP_MATVEC_ID_GATEUP	sg
+Q8_K_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q8_K OP=OP_BATCH_MATMUL_ID	sg
+# IQ3_XXS
+IQ3_XXS_MatVecId	matvec_id.comp	QTYPE=QT_IQ3_XXS OP=OP_MATVEC_ID	sg
+IQ3_XXS_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ3_XXS OP=OP_MATVEC_ID_GATEUP	sg
+IQ3_XXS_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ3_XXS OP=OP_BATCH_MATMUL_ID	sg
+# IQ3_S
+IQ3_S_MatVecId	matvec_id.comp	QTYPE=QT_IQ3_S OP=OP_MATVEC_ID	sg
+IQ3_S_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ3_S OP=OP_MATVEC_ID_GATEUP	sg
+IQ3_S_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ3_S OP=OP_BATCH_MATMUL_ID	sg
+# IQ2_XXS
+IQ2_XXS_MatVecId	matvec_id.comp	QTYPE=QT_IQ2_XXS OP=OP_MATVEC_ID	sg
+IQ2_XXS_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ2_XXS OP=OP_MATVEC_ID_GATEUP	sg
+IQ2_XXS_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ2_XXS OP=OP_BATCH_MATMUL_ID	sg
+# IQ2_XS
+IQ2_XS_MatVecId	matvec_id.comp	QTYPE=QT_IQ2_XS OP=OP_MATVEC_ID	sg
+IQ2_XS_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ2_XS OP=OP_MATVEC_ID_GATEUP	sg
+IQ2_XS_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ2_XS OP=OP_BATCH_MATMUL_ID	sg
+# IQ2_S
+IQ2_S_MatVecId	matvec_id.comp	QTYPE=QT_IQ2_S OP=OP_MATVEC_ID	sg
+IQ2_S_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ2_S OP=OP_MATVEC_ID_GATEUP	sg
+IQ2_S_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ2_S OP=OP_BATCH_MATMUL_ID	sg
+# IQ1_S
+IQ1_S_MatVecId	matvec_id.comp	QTYPE=QT_IQ1_S OP=OP_MATVEC_ID	sg
+IQ1_S_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ1_S OP=OP_MATVEC_ID_GATEUP	sg
+IQ1_S_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ1_S OP=OP_BATCH_MATMUL_ID	sg
+# IQ1_M
+IQ1_M_MatVecId	matvec_id.comp	QTYPE=QT_IQ1_M OP=OP_MATVEC_ID	sg
+IQ1_M_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_IQ1_M OP=OP_MATVEC_ID_GATEUP	sg
+IQ1_M_BatchMatMulId	matvec_id.comp	QTYPE=QT_IQ1_M OP=OP_BATCH_MATMUL_ID	sg
+# TQ1_0
+TQ1_0_MatVecId	matvec_id.comp	QTYPE=QT_TQ1_0 OP=OP_MATVEC_ID	sg
+TQ1_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_TQ1_0 OP=OP_MATVEC_ID_GATEUP	sg
+TQ1_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_TQ1_0 OP=OP_BATCH_MATMUL_ID	sg
+# TQ2_0
+TQ2_0_MatVecId	matvec_id.comp	QTYPE=QT_TQ2_0 OP=OP_MATVEC_ID	sg
+TQ2_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_TQ2_0 OP=OP_MATVEC_ID_GATEUP	sg
+TQ2_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_TQ2_0 OP=OP_BATCH_MATMUL_ID	sg
+# NVFP4
+NVFP4_MatVecId	matvec_id.comp	QTYPE=QT_NVFP4 OP=OP_MATVEC_ID	sg
+NVFP4_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_NVFP4 OP=OP_MATVEC_ID_GATEUP	sg
+NVFP4_BatchMatMulId	matvec_id.comp	QTYPE=QT_NVFP4 OP=OP_BATCH_MATMUL_ID	sg
+# Q1_0
+Q1_0_MatVecId	matvec_id.comp	QTYPE=QT_Q1_0 OP=OP_MATVEC_ID	sg
+Q1_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q1_0 OP=OP_MATVEC_ID_GATEUP	sg
+Q1_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q1_0 OP=OP_BATCH_MATMUL_ID	sg
+# Q2_0
+Q2_0_MatVecId	matvec_id.comp	QTYPE=QT_Q2_0 OP=OP_MATVEC_ID	sg
+Q2_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q2_0 OP=OP_MATVEC_ID_GATEUP	sg
+Q2_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q2_0 OP=OP_BATCH_MATMUL_ID	sg
+# moe.cl
+LLM_MoE_Router	moe_router.comp		sg
+LLM_MoE_HashIds	moe_misc.comp	OP=OP_MOE_HASH_IDS
+LLM_MoE_WeightedSum	moe_wsum.comp
+LLM_AddId	moe_misc.comp	OP=OP_MOE_ADD_ID
+LLM_MoE_Bucketize	moe_misc.comp	OP=OP_MOE_BUCKETIZE
+LLM_MoE_ScaleInput	moe_misc.comp	OP=OP_MOE_SCALE_INPUT

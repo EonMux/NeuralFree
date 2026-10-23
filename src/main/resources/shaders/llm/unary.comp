@@ -1,0 +1,41 @@
+/* unary.comp - LLM_Unary: element-wise activation over offset views (GLSL twin of kernels/llm/ffn_glu.cl).
+ * Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n, i op, f p0, f p1, f p2, f p3, i in_off, i out_off, float in, float out)
+ *   out[out_off + i] = nf_act(op, in[in_off + i], p0, p1, p2, p3), i in [0, n)
+ * op is a gguf.arch.ActOp code; an unknown code yields NaN. in and out carry no memory qualifiers
+ * because callers may run the op in place (same buffer, equal offsets); each invocation reads only
+ * the input element of its own output element.
+ *
+ * Dispatch: one invocation per element over the flattened index
+ * gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x):
+ * 1-D global = roundUp(n, L), local = {L, 1, 1}; folded 1-D group counts map to the same index.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+layout(std430, binding = 0) buffer NfUnaryIn  { float x_in[]; };
+layout(std430, binding = 1) buffer NfUnaryOut { float y_out[]; };
+layout(push_constant) uniform NfUnaryParams {
+    int n;
+    int op;
+    float p0;
+    float p1;
+    float p2;
+    float p3;
+    int in_off;
+    int out_off;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x);
+    if (i >= uint(pc.n)) {
+        return;
+    }
+    const float x = x_in[uint(pc.in_off) + i];
+    y_out[uint(pc.out_off) + i] = nf_act(pc.op, x, pc.p0, pc.p1, pc.p2, pc.p3);
+}

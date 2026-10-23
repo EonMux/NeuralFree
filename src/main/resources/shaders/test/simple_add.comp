@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufferA {
+    float a[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferB {
+    float b[];
+};
+
+layout(std430, binding = 2) buffer BufferC {
+    float c[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid < pc.n) {
+        c[gid] = a[gid] + b[gid];
+    }
+}

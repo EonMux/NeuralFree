@@ -1,0 +1,55 @@
+/* glu.comp - LLM_GLU: gated-linear-unit over strided offset views (GLSL twin of kernels/llm/ffn_glu.cl).
+ * Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_cols, i n_rows, i op, f limit, f alpha, f beta, i gate_stride, i gate_off, i up_stride,
+ *    i up_off, i out_stride, i out_off, float gate, float up, float out)
+ *   out[out_off + r*out_stride + c] = nf_glu(op, gate[gate_off + r*gate_stride + c],
+ *                                            up[up_off + r*up_stride + c], limit, alpha, alpha, beta)
+ * op is a gguf.arch.GluOp code; an unknown code yields NaN. limit clamps SWIGLU_OAI / SWIGLU_CLAMP /
+ * SWIGLU_LIMITED; alpha is the SWIGLU_OAI slope or the SITU situ_beta; beta is the SITU
+ * situ_linear_beta. No binding carries memory qualifiers: gate and up may be one fused buffer and out
+ * may alias gate (equal offsets and strides); each invocation reads only the inputs of its own output.
+ *
+ * Dispatch: one invocation per output element over the flattened index
+ * gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x):
+ * 1-D global = roundUp(n_rows * n_cols, L), local = {L, 1, 1}, or 2-D global = {roundUp(n_cols, L),
+ * n_rows}, local = {L, 1, 1}; folded 1-D group counts map to the same index.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+layout(std430, binding = 0) buffer NfGluGate { float g_in[]; };
+layout(std430, binding = 1) buffer NfGluUp   { float u_in[]; };
+layout(std430, binding = 2) buffer NfGluOut  { float y_out[]; };
+layout(push_constant) uniform NfGluParams {
+    int n_cols;
+    int n_rows;
+    int op;
+    float limit;
+    float alpha;
+    float beta;
+    int gate_stride;
+    int gate_off;
+    int up_stride;
+    int up_off;
+    int out_stride;
+    int out_off;
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x);
+    const uint n_cols = uint(pc.n_cols);
+    if (n_cols == 0u || idx >= uint(pc.n_rows) * n_cols) {
+        return;
+    }
+    const uint r = idx / n_cols;
+    const uint c = idx - r * n_cols;
+    const float g = g_in[uint(pc.gate_off) + r * uint(pc.gate_stride) + c];
+    const float u = u_in[uint(pc.up_off) + r * uint(pc.up_stride) + c];
+    /* SITU reads situ_beta from nf_glu's beta and situ_linear_beta from its lambda; SWIGLU_OAI reads alpha. */
+    y_out[uint(pc.out_off) + r * uint(pc.out_stride) + c] = nf_glu(pc.op, g, u, pc.limit, pc.alpha, pc.alpha, pc.beta);
+}

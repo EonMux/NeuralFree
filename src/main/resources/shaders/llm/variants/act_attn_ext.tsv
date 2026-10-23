@@ -1,0 +1,8 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Generic activation and GLU kernels (kernels/llm/ffn_glu.cl) and attention extras (kernels/llm/attn_ext.cl).
+# ffn_glu.cl
+LLM_Unary	unary.comp
+LLM_GLU	glu.comp
+# attn_ext.cl
+LLM_AttnTempScale	attn_ext.comp	OP=OP_ATTN_TEMP_SCALE
+LLM_AttnOutGate	attn_ext.comp	OP=OP_ATTN_OUT_GATE

@@ -1,0 +1,214 @@
+/* matvec_id.comp - expert-indexed matvec templates over a QT_DECODE_* weight decoder. GLSL twin of
+ * the NF_MOE_ID_KERNELS family (kernels/llm/common/matvec_id_family.h, instantiated in kernels/llm/moe_matvec.cl),
+ * which is the semantic reference. Requires: common/nf_common.glsl, common/quant_blocks.glsl,
+ * common/iq_tables.glsl, common/reduce.glsl, common/act.glsl and the decoder file that serves QTYPE.
+ *
+ * A variants row selects QTYPE=QT_<T> and OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     Q4_K_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q4_K OP=OP_MATVEC_ID_GATEUP	sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_MATVEC_ID         (i out_dim, i in_dim, i n_sel, i x_stride, i in_off, i out_off, i has_scale,
+ *                         i expert_base, i expert_count, R int slots, R weight, R float input,
+ *                         R float scales, W float output)
+ *   OP_MATVEC_ID_GATEUP  (i out_dim, i in_dim, i n_sel, i x_stride, i in_off, i glu_op, f limit,
+ *                         f alpha, f beta, i fused, i has_scale, i expert_base, i expert_count,
+ *                         R int slots, R gate_w, R up_w, R float input, R float scales, W float output)
+ *   OP_BATCH_MATMUL_ID   (i out_dim, i in_dim, i n_rows, i x_div, i in_off, i has_scale,
+ *                         i expert_base, i expert_count, R int row_token, R int row_slot, R weight,
+ *                         R float input, R float scales, W float output)
+ * Semantics, slot layout, the expert shard range and the has_scale / fused codes:
+ * kernels/llm/common/matvec_id_family.h. The weight binding holds the experts [expert_base, expert_base +
+ * expert_count) of the tensor; byte offsets are 32-bit, which every shard satisfies because shards
+ * stay below maxStorageBufferRange.
+ *
+ * Dispatch (2-D, never folded): local = {L, 1, 1}; global = {out_dim * L, n_sel, 1} for OP_MATVEC_ID
+ * and OP_MATVEC_ID_GATEUP, {out_dim * L, ceil(n_rows / NF_MOE_BMM_ROWS), 1} for OP_BATCH_MATMUL_ID.
+ * out_dim must not exceed maxComputeWorkGroupCount[0]. Any L is reduced exactly; with multiples of
+ * QT_TPS the block/invocation mapping equals the OpenCL kernels'.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_MATVEC_ID        301
+#define OP_MATVEC_ID_GATEUP 302
+#define OP_BATCH_MATMUL_ID  303
+
+/* Sorted rows per OP_BATCH_MATMUL_ID workgroup, equal to NF_MOE_BMM_ROWS of matvec_id_family.h. */
+#define NF_MOE_BMM_ROWS 8u
+
+#if !defined(OP) || !defined(QTYPE)
+#error "matvec_id.comp requires OP and QTYPE"
+#endif
+
+#if OP == OP_MATVEC_ID
+layout(std430, binding = 0) readonly buffer NfMiSlots { int slots[]; };
+NF_BUFFER_VIEWS(1, w)
+layout(std430, binding = 2) readonly buffer NfMiInput { float x_in[]; };
+layout(std430, binding = 3) readonly buffer NfMiScales { float scales[]; };
+layout(std430, binding = 4) writeonly buffer NfMiOutput { float y_out[]; };
+layout(push_constant) uniform NfMiParams {
+    int out_dim; int in_dim; int n_sel; int x_stride; int in_off; int out_off; int has_scale;
+    int expert_base; int expert_count;
+} pc;
+#elif OP == OP_MATVEC_ID_GATEUP
+#define NF_WEIGHT_STREAMS 2
+layout(std430, binding = 0) readonly buffer NfMiSlots { int slots[]; };
+NF_BUFFER_VIEWS(1, w)
+NF_BUFFER_VIEWS(2, u)
+layout(std430, binding = 3) readonly buffer NfMiInput { float x_in[]; };
+layout(std430, binding = 4) readonly buffer NfMiScales { float scales[]; };
+layout(std430, binding = 5) writeonly buffer NfMiOutput { float y_out[]; };
+layout(push_constant) uniform NfMiParams {
+    int out_dim; int in_dim; int n_sel; int x_stride; int in_off; int glu_op;
+    float limit; float alpha; float beta; int fused; int has_scale;
+    int expert_base; int expert_count;
+} pc;
+#elif OP == OP_BATCH_MATMUL_ID
+layout(std430, binding = 0) readonly buffer NfMiRowToken { int row_token[]; };
+layout(std430, binding = 1) readonly buffer NfMiRowSlot { int row_slot[]; };
+NF_BUFFER_VIEWS(2, w)
+layout(std430, binding = 3) readonly buffer NfMiInput { float x_in[]; };
+layout(std430, binding = 4) readonly buffer NfMiScales { float scales[]; };
+layout(std430, binding = 5) writeonly buffer NfMiOutput { float y_out[]; };
+layout(push_constant) uniform NfMiParams {
+    int out_dim; int in_dim; int n_rows; int x_div; int in_off; int has_scale;
+    int expert_base; int expert_count;
+} pc;
+#else
+#error "matvec_id.comp: OP is not an expert matvec op"
+#endif
+
+#include "common/quant_blocks.glsl"
+#include "common/iq_tables.glsl"
+#include "common/reduce.glsl"
+#include "common/act.glsl"
+#include "common/quant_legacy.glsl"
+#include "common/quant_k.glsl"
+#include "common/quant_iq.glsl"
+#include "common/quant_new.glsl"
+
+#if !defined(QT_DECODE_DOT) || !defined(QT_BS) || !defined(QT_BB) || !defined(QT_TPS)
+#error "matvec_id.comp: no QT_DECODE_DOT decoder serves QTYPE"
+#endif
+
+/* True when expert e lies in the bound shard [expert_base, expert_base + expert_count). */
+bool nf_mi_in_shard(int e) {
+    return e >= pc.expert_base && e - pc.expert_base < pc.expert_count;
+}
+
+float qt_x(uint i) {
+    return x_in[i];
+}
+
+vec4 qt_x4(uint i) {
+    return vec4(x_in[i], x_in[i + 1u], x_in[i + 2u], x_in[i + 3u]);
+}
+
+/* This invocation's share of dot(weight row at rbase in stream ws, activations at xoff), over the
+ * (block, ltid) pairs t = lid, lid + L, ... with block = t / QT_TPS and ltid = t % QT_TPS. */
+float nf_mi_row_partial(uint ws, uint rbase, uint xoff, uint nblk) {
+    const uint pairs = nblk * uint(QT_TPS);
+    float ps = 0.0;
+    for (uint t = gl_LocalInvocationID.x; t < pairs; t += gl_WorkGroupSize.x) {
+        const uint b = t / uint(QT_TPS);
+        ps += qt_dot(ws, rbase + b * uint(QT_BB), xoff, b, t % uint(QT_TPS));
+    }
+    return ps;
+}
+
+#if OP == OP_MATVEC_ID_GATEUP
+/* Gate (stream A, row at gbase) and up (stream B, row at ubase) shares with the same pair mapping. */
+void nf_mi_gateup_partial(uint gbase, uint ubase, uint xoff, uint nblk, inout float gs, inout float us) {
+    const uint pairs = nblk * uint(QT_TPS);
+    for (uint t = gl_LocalInvocationID.x; t < pairs; t += gl_WorkGroupSize.x) {
+        const uint b = t / uint(QT_TPS);
+        const uint ltid = t % uint(QT_TPS);
+#ifdef QT_DECODE_DUAL
+        qt_dot_dual(gbase + b * uint(QT_BB), ubase + b * uint(QT_BB), xoff, b, ltid, gs, us);
+#else
+        gs += qt_dot(NF_WS_A, gbase + b * uint(QT_BB), xoff, b, ltid);
+        us += qt_dot(NF_WS_B, ubase + b * uint(QT_BB), xoff, b, ltid);
+#endif
+    }
+}
+#endif
+
+void main() {
+    nf_iq_init_shared();
+
+    const uint lid = gl_LocalInvocationID.x;
+    const uint out_dim = uint(pc.out_dim);
+    const uint nblk = uint(pc.in_dim) / uint(QT_BS);
+    const uint row_bytes = nblk * uint(QT_BB);
+    const uint row = gl_WorkGroupID.x;
+
+#if OP == OP_BATCH_MATMUL_ID
+    const uint n_rows = uint(pc.n_rows);
+    const uint i0 = gl_WorkGroupID.y * NF_MOE_BMM_ROWS;
+    /* Depends only on the workgroup id, so the return is uniform per workgroup. */
+    if (row >= out_dim || i0 >= n_rows) {
+        return;
+    }
+    const uint i1 = min(i0 + NF_MOE_BMM_ROWS, n_rows);
+    for (uint i = i0; i < i1; ++i) {
+        const uint p = uint(row_token[i]);
+        const int e = row_slot[i];
+        /* e is shared by the workgroup, so skipping a row is uniform. Rows with e < 0 (out-of-range
+         * ids) are written as 0 by the dispatch with expert_base 0 only. */
+        if (e < 0 ? pc.expert_base != 0 : !nf_mi_in_shard(e)) {
+            continue;
+        }
+        float ps = 0.0;
+        if (e >= 0) {
+            const uint xoff = uint(pc.in_off) + (p / uint(pc.x_div)) * uint(pc.in_dim);
+            ps = nf_mi_row_partial(NF_WS_A, (uint(e - pc.expert_base) * out_dim + row) * row_bytes, xoff, nblk);
+        }
+        const float acc = nf_wg_sum(ps);
+        if (lid == 0u) {
+            y_out[p * out_dim + row] = e < 0 ? 0.0 : (pc.has_scale != 0 ? acc * scales[e] : acc);
+        }
+    }
+#else
+    const uint s = gl_WorkGroupID.y;
+    /* Depends only on the workgroup id, so the return is uniform per workgroup. */
+    if (row >= out_dim || s >= uint(pc.n_sel)) {
+        return;
+    }
+    const int e = slots[s];
+    /* The slot is the workgroup's, so the shard-range return is uniform too. */
+    if (!nf_mi_in_shard(e)) {
+        return;
+    }
+    const uint le = uint(e - pc.expert_base);
+    const uint xoff = uint(pc.in_off) + s * uint(pc.x_stride);
+#if OP == OP_MATVEC_ID
+    const float acc = nf_wg_sum(nf_mi_row_partial(NF_WS_A, (le * out_dim + row) * row_bytes, xoff, nblk));
+    if (lid == 0u) {
+        y_out[uint(pc.out_off) + s * out_dim + row] = pc.has_scale != 0 ? acc * scales[e] : acc;
+    }
+#else
+    const uint slot_rows = pc.fused != 0 ? 2u * out_dim : out_dim;
+    const uint gbase = (le * slot_rows + row) * row_bytes;
+    const uint ubase = (le * slot_rows + (pc.fused != 0 ? out_dim : 0u) + row) * row_bytes;
+    float gs = 0.0;
+    float us = 0.0;
+    nf_mi_gateup_partial(gbase, ubase, xoff, nblk, gs, us);
+    const float g = nf_wg_sum(gs);
+    const float up = nf_wg_sum(us);
+    if (lid == 0u) {
+        float sg = 1.0;
+        float su = 1.0;
+        if (pc.has_scale == 1) {
+            sg = scales[e];
+            su = sg;
+        } else if (pc.has_scale == 2) {
+            sg = scales[2 * e];
+            su = scales[2 * e + 1];
+        }
+        y_out[s * out_dim + row] = nf_glu(pc.glu_op, g * sg, up * su, pc.limit, pc.alpha, pc.alpha, pc.beta);
+    }
+#endif
+#endif
+}

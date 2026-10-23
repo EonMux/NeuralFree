@@ -1,0 +1,89 @@
+/* gdn_gate.comp - LLM_GDN_GatePrep, decay gate and update rate of gated DeltaNet and KDA layers (GLSL
+ * twin of LLM_GDN_GatePrep in kernels/llm/recurrent/gdn.cl, which is the semantic reference).
+ * Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_v_heads, i n_k_heads, i layout, i kda_mode, i head_dim, f lb, i a_stride, i a_off,
+ *    i b_stride, i b_off, R a_in, R b_in, R dt_bias, R ssm_a, W g_out, W beta_out)
+ * With x = a + dt_bias and A = ssm_a[h]:
+ *   kda_mode -1 GDN       g[t][h]    = softplus(x) * A                (dt_bias[h])
+ *   kda_mode  0 SOFTPLUS  g[t][h][d] = softplus(x) * A                (dt_bias[h*head_dim + d])
+ *   kda_mode  1 LB_NEG    g[t][h][d] = lb * sigmoid(-(A * x))
+ *   kda_mode  2 LB_POS    g[t][h][d] = lb * sigmoid(A * x)
+ *   beta[t][h] = sigmoid(b)
+ * layout 0 reads a at a_in[a_off + t*a_stride + (h | h*head_dim + d)] and b at b_in[b_off + t*b_stride + h];
+ * layout 1 (fused ssm_ba, GDN) reads, for h = kh*R + r with R = n_v_heads / n_k_heads, b at row index
+ * kh*2R + r and a at kh*2R + R + r.
+ *
+ * Dispatch: 1-D, one invocation per (t, h, d): global = n_tokens * n_v_heads * (kda_mode < 0 ? 1 : head_dim),
+ * any local = {L, 1, 1}; folded group counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+
+layout(std430, binding = 0) readonly  buffer NfGdnGateA    { float a_in[]; };
+layout(std430, binding = 1) readonly  buffer NfGdnGateB    { float b_in[]; };
+layout(std430, binding = 2) readonly  buffer NfGdnGateDt   { float dt_bias[]; };
+layout(std430, binding = 3) readonly  buffer NfGdnGateSsmA { float ssm_a[]; };
+layout(std430, binding = 4) writeonly buffer NfGdnGateG    { float g_out[]; };
+layout(std430, binding = 5) writeonly buffer NfGdnGateBeta { float beta_out[]; };
+
+layout(push_constant) uniform NfGdnGateParams {
+    int n_tokens;
+    int n_v_heads;
+    int n_k_heads;
+    int layout_mode;
+    int kda_mode;
+    int head_dim;
+    float lb;
+    int a_stride;
+    int a_off;
+    int b_stride;
+    int b_off;
+} pc;
+
+void main() {
+    const uint per_head = pc.kda_mode < 0 ? 1u : uint(pc.head_dim);
+    const uint n_v = uint(pc.n_v_heads);
+    const uint gid = nf_global_id();
+    if (gid >= uint(pc.n_tokens) * n_v * per_head) {
+        return;
+    }
+    const uint d = gid % per_head;
+    const uint th = gid / per_head;
+    const uint h = th % n_v;
+    const uint t = th / n_v;
+
+    uint a_idx;
+    uint b_idx;
+    if (pc.layout_mode == 1) {
+        const uint R = n_v / uint(pc.n_k_heads);
+        const uint kh = h / R;
+        const uint r = h - kh * R;
+        b_idx = kh * 2u * R + r;
+        a_idx = b_idx + R;
+    } else {
+        a_idx = pc.kda_mode < 0 ? h : h * uint(pc.head_dim) + d;
+        b_idx = h;
+    }
+    const uint dt_idx = pc.kda_mode < 0 ? h : h * uint(pc.head_dim) + d;
+    const float x = a_in[uint(pc.a_off) + t * uint(pc.a_stride) + a_idx] + dt_bias[dt_idx];
+    const float A = ssm_a[h];
+
+    float gv;
+    if (pc.kda_mode == 1) {
+        gv = pc.lb * nf_sigmoid(-(A * x));
+    } else if (pc.kda_mode == 2) {
+        gv = pc.lb * nf_sigmoid(A * x);
+    } else {
+        gv = nf_softplus(x) * A;
+    }
+    g_out[gid] = gv;
+
+    if (d == 0u) {
+        beta_out[th] = nf_sigmoid(b_in[uint(pc.b_off) + t * uint(pc.b_stride) + b_idx]);
+    }
+}

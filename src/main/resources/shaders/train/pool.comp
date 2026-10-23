@@ -1,0 +1,422 @@
+/* pool.comp - max, average and adaptive average 2-D pooling and their backward. GLSL twin of
+ * kernels/train/pool.cl (the semantic reference: arguments, formulas, preconditions and dispatch are
+ * documented there). Requires: common/train.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     TR_MaxPool2d_F32	pool.comp	OP=POOL_MAX2D_F32
+ * Buffers take bindings 0.. in .cl parameter order (inputs read-only) and the push block holds the .cl
+ * scalars in .cl parameter order.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/train.glsl"
+
+#define POOL_MAX2D_F32          1
+#define POOL_AVG2D_F32          2
+#define POOL_ADAPTIVE_AVG2D_F32 3
+#define POOL_MAX_BWD            4
+#define POOL_AVG_BWD            5
+#define POOL_ADAPTIVE_BWD       6
+#define POOL_MAX_SELECT         7
+
+#ifndef OP
+#error "pool.comp requires OP"
+#endif
+
+#if OP == POOL_MAX2D_F32 || OP == POOL_AVG2D_F32 || OP == POOL_ADAPTIVE_AVG2D_F32
+layout(std430, binding = 0) restrict readonly buffer TrPoolIn { float in_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrPoolOut { float out_f[]; };
+#endif
+
+#if OP == POOL_MAX2D_F32
+layout(push_constant) uniform TrPoolParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int DH;
+    int DW;
+    int in_off;
+    int out_off;
+} pc;
+
+#elif OP == POOL_AVG2D_F32
+layout(push_constant) uniform TrPoolParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int count_include_pad;
+    int in_off;
+    int out_off;
+} pc;
+
+#elif OP == POOL_ADAPTIVE_AVG2D_F32
+layout(push_constant) uniform TrPoolParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int in_off;
+    int out_off;
+} pc;
+
+#elif OP == POOL_MAX_BWD
+layout(std430, binding = 0) restrict readonly buffer TrPoolX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrPoolY { float y_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrPoolGy { float gy_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrPoolGx { float gx_f[]; };
+layout(push_constant) uniform TrPoolParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int DH;
+    int DW;
+    int x_off;
+    int y_off;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#elif OP == POOL_AVG_BWD
+layout(std430, binding = 0) restrict readonly buffer TrPoolGy { float gy_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrPoolGx { float gx_f[]; };
+layout(push_constant) uniform TrPoolParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int count_include_pad;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#elif OP == POOL_ADAPTIVE_BWD
+layout(std430, binding = 0) restrict readonly buffer TrPoolGy { float gy_f[]; };
+layout(std430, binding = 1) restrict writeonly buffer TrPoolGx { float gx_f[]; };
+layout(push_constant) uniform TrPoolParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int gy_off;
+    int gx_off;
+} pc;
+
+#elif OP == POOL_MAX_SELECT
+layout(std430, binding = 0) restrict readonly buffer TrPoolX { float x_f[]; };
+layout(std430, binding = 1) restrict readonly buffer TrPoolY { float y_f[]; };
+layout(std430, binding = 2) restrict readonly buffer TrPoolG { float g_f[]; };
+layout(std430, binding = 3) restrict writeonly buffer TrPoolOut { float out_f[]; };
+layout(push_constant) uniform TrPoolParams {
+    int B;
+    int C;
+    int H;
+    int W;
+    int OH;
+    int OW;
+    int KH;
+    int KW;
+    int SH;
+    int SW;
+    int PH;
+    int PW;
+    int DH;
+    int DW;
+    int x_off;
+    int y_off;
+    int g_off;
+    int out_off;
+} pc;
+
+#else
+#error "pool.comp: unknown OP"
+#endif
+
+#if OP == POOL_AVG2D_F32 || OP == POOL_AVG_BWD
+/* Divisor of the average-pool window with padded-extent bounds [hs, he) x [ws, we) and in-bounds bounds
+ * [h0, h1) x [w0, w1): the padded-extent size when count_include_pad != 0, otherwise the in-bounds count. */
+int tr_p_avg_divisor(const int hs, const int he, const int ws, const int we, const int h0, const int h1,
+                     const int w0, const int w1) {
+    return pc.count_include_pad != 0 ? (he - hs) * (we - ws) : (h1 - h0) * (w1 - w0);
+}
+#endif
+
+#if OP == POOL_MAX_BWD || OP == POOL_MAX_SELECT
+/* Java a == b for floats: false when either is NaN, true for -0 == +0, otherwise bit equality. */
+bool tr_p_same(const float a, const float b) {
+    if (tr_isnan(a) || tr_isnan(b)) {
+        return false;
+    }
+    if (tr_iszero(a) && tr_iszero(b)) {
+        return true;
+    }
+    return floatBitsToUint(a) == floatBitsToUint(b);
+}
+
+/* Tap index kh*KW + kw of the first in-bounds tap, in ascending kh, kw order, of the max window whose top-left
+ * tap is (ih0, iw0) in the plane of x_f starting at element base, whose value is Java == m; -1 when no tap
+ * matches (a NaN m matches nothing). */
+int tr_p_first_max(const int base, const int ih0, const int iw0, const float m) {
+    if (tr_isnan(m)) {
+        return -1;
+    }
+    for (int kh = 0; kh < pc.KH; ++kh) {
+        const int ih = ih0 + kh * pc.DH;
+        if (ih < 0 || ih >= pc.H) {
+            continue;
+        }
+        const int row = base + ih * pc.W;
+        for (int kw = 0; kw < pc.KW; ++kw) {
+            const int iw = iw0 + kw * pc.DW;
+            if (iw < 0 || iw >= pc.W) {
+                continue;
+            }
+            if (tr_p_same(x_f[row + iw], m)) {
+                return kh * pc.KW + kw;
+            }
+        }
+    }
+    return -1;
+}
+#endif
+
+void main() {
+#if OP == POOL_MAX_BWD
+    const int i = tr_gid(pc.B * pc.C * pc.H * pc.W);
+    if (i < 0) {
+        return;
+    }
+    const int iw = i % pc.W;
+    const int ih = (i / pc.W) % pc.H;
+    const int bc = i / (pc.W * pc.H);
+    const int x_c = pc.x_off + bc * pc.H * pc.W;
+    const int o_c = bc * pc.OH * pc.OW;
+    const float v = x_f[pc.x_off + i];
+    precise float acc = 0.0;
+    for (int kh = pc.KH - 1; kh >= 0; --kh) {
+        const int th = ih + pc.PH - kh * pc.DH;
+        if (th < 0 || th % pc.SH != 0) {
+            continue;
+        }
+        const int oh = th / pc.SH;
+        if (oh >= pc.OH) {
+            continue;
+        }
+        for (int kw = pc.KW - 1; kw >= 0; --kw) {
+            const int tw = iw + pc.PW - kw * pc.DW;
+            if (tw < 0 || tw % pc.SW != 0) {
+                continue;
+            }
+            const int ow = tw / pc.SW;
+            if (ow >= pc.OW) {
+                continue;
+            }
+            const int o = o_c + oh * pc.OW + ow;
+            const float m = y_f[pc.y_off + o];
+            if (!tr_p_same(v, m)) {
+                continue;
+            }
+            if (tr_p_first_max(x_c, oh * pc.SH - pc.PH, ow * pc.SW - pc.PW, m) != kh * pc.KW + kw) {
+                continue;
+            }
+            acc = acc + gy_f[pc.gy_off + o];
+        }
+    }
+    gx_f[pc.gx_off + i] = acc;
+
+#elif OP == POOL_AVG_BWD
+    const int i = tr_gid(pc.B * pc.C * pc.H * pc.W);
+    if (i < 0) {
+        return;
+    }
+    const int iw = i % pc.W;
+    const int ih = (i / pc.W) % pc.H;
+    const int bc = i / (pc.W * pc.H);
+    const int o_c = pc.gy_off + bc * pc.OH * pc.OW;
+    precise float acc = 0.0;
+    for (int kh = pc.KH - 1; kh >= 0; --kh) {
+        const int th = ih + pc.PH - kh;
+        if (th < 0 || th % pc.SH != 0) {
+            continue;
+        }
+        const int oh = th / pc.SH;
+        if (oh >= pc.OH) {
+            continue;
+        }
+        const int hs = oh * pc.SH - pc.PH;
+        const int he = hs + pc.KH < pc.H + pc.PH ? hs + pc.KH : pc.H + pc.PH;
+        const int h0 = hs > 0 ? hs : 0;
+        const int h1 = he < pc.H ? he : pc.H;
+        for (int kw = pc.KW - 1; kw >= 0; --kw) {
+            const int tw = iw + pc.PW - kw;
+            if (tw < 0 || tw % pc.SW != 0) {
+                continue;
+            }
+            const int ow = tw / pc.SW;
+            if (ow >= pc.OW) {
+                continue;
+            }
+            const int ws = ow * pc.SW - pc.PW;
+            const int we = ws + pc.KW < pc.W + pc.PW ? ws + pc.KW : pc.W + pc.PW;
+            const int w0 = ws > 0 ? ws : 0;
+            const int w1 = we < pc.W ? we : pc.W;
+            const int divisor = tr_p_avg_divisor(hs, he, ws, we, h0, h1, w0, w1);
+            precise float term = gy_f[o_c + oh * pc.OW + ow] / float(divisor);
+            acc = acc + term;
+        }
+    }
+    gx_f[pc.gx_off + i] = acc;
+
+#elif OP == POOL_ADAPTIVE_BWD
+    const int i = tr_gid(pc.B * pc.C * pc.H * pc.W);
+    if (i < 0) {
+        return;
+    }
+    const int iw = i % pc.W;
+    const int ih = (i / pc.W) % pc.H;
+    const int bc = i / (pc.W * pc.H);
+    const int oh_first = (ih * pc.OH) / pc.H;
+    const int oh_last = ((ih + 1) * pc.OH - 1) / pc.H;
+    const int ow_first = (iw * pc.OW) / pc.W;
+    const int ow_last = ((iw + 1) * pc.OW - 1) / pc.W;
+    const int o_c = pc.gy_off + bc * pc.OH * pc.OW;
+    precise float acc = 0.0;
+    for (int oh = oh_first; oh <= oh_last; ++oh) {
+        const int rows = ((oh + 1) * pc.H + pc.OH - 1) / pc.OH - (oh * pc.H) / pc.OH;
+        for (int ow = ow_first; ow <= ow_last; ++ow) {
+            const int cols = ((ow + 1) * pc.W + pc.OW - 1) / pc.OW - (ow * pc.W) / pc.OW;
+            precise float term = gy_f[o_c + oh * pc.OW + ow] / float(rows * cols);
+            acc = acc + term;
+        }
+    }
+    gx_f[pc.gx_off + i] = acc;
+
+#elif OP == POOL_MAX_SELECT
+    const int i = tr_gid(pc.B * pc.C * pc.OH * pc.OW);
+    if (i < 0) {
+        return;
+    }
+    const int ow = i % pc.OW;
+    const int oh = (i / pc.OW) % pc.OH;
+    const int plane = (i / (pc.OW * pc.OH)) * pc.H * pc.W;
+    const int ih0 = oh * pc.SH - pc.PH;
+    const int iw0 = ow * pc.SW - pc.PW;
+    const int t = tr_p_first_max(pc.x_off + plane, ih0, iw0, y_f[pc.y_off + i]);
+    float r = 0.0;
+    if (t >= 0) {
+        const int kh = t / pc.KW;
+        const int kw = t - kh * pc.KW;
+        r = g_f[pc.g_off + plane + (ih0 + kh * pc.DH) * pc.W + iw0 + kw * pc.DW];
+    }
+    out_f[pc.out_off + i] = r;
+
+#else
+    const int i = tr_gid(pc.B * pc.C * pc.OH * pc.OW);
+    if (i < 0) {
+        return;
+    }
+    const int ow = i % pc.OW;
+    const int oh = (i / pc.OW) % pc.OH;
+    const int bc = i / (pc.OW * pc.OH);
+    const int in_c = pc.in_off + bc * pc.H * pc.W;
+
+#if OP == POOL_MAX2D_F32
+    const int ih0 = oh * pc.SH - pc.PH;
+    const int iw0 = ow * pc.SW - pc.PW;
+    float m = -NF_INF;
+    for (int kh = 0; kh < pc.KH; ++kh) {
+        const int ih = ih0 + kh * pc.DH;
+        if (ih < 0 || ih >= pc.H) {
+            continue;
+        }
+        const int in_row = in_c + ih * pc.W;
+        for (int kw = 0; kw < pc.KW; ++kw) {
+            const int iw = iw0 + kw * pc.DW;
+            if (iw < 0 || iw >= pc.W) {
+                continue;
+            }
+            m = tr_jmax(m, in_f[in_row + iw]);
+        }
+    }
+    out_f[pc.out_off + i] = m;
+
+#elif OP == POOL_AVG2D_F32
+    const int hs = oh * pc.SH - pc.PH;
+    const int ws = ow * pc.SW - pc.PW;
+    const int he = hs + pc.KH < pc.H + pc.PH ? hs + pc.KH : pc.H + pc.PH;
+    const int we = ws + pc.KW < pc.W + pc.PW ? ws + pc.KW : pc.W + pc.PW;
+    const int h0 = hs > 0 ? hs : 0;
+    const int w0 = ws > 0 ? ws : 0;
+    const int h1 = he < pc.H ? he : pc.H;
+    const int w1 = we < pc.W ? we : pc.W;
+    if (h0 >= h1 || w0 >= w1) {
+        out_f[pc.out_off + i] = 0.0;
+        return;
+    }
+    precise float sum = 0.0;
+    for (int ih = h0; ih < h1; ++ih) {
+        const int in_row = in_c + ih * pc.W;
+        for (int iw = w0; iw < w1; ++iw) {
+            sum = sum + in_f[in_row + iw];
+        }
+    }
+    precise float mean = sum / float(tr_p_avg_divisor(hs, he, ws, we, h0, h1, w0, w1));
+    out_f[pc.out_off + i] = mean;
+
+#else
+    const int h0 = (oh * pc.H) / pc.OH;
+    const int h1 = ((oh + 1) * pc.H + pc.OH - 1) / pc.OH;
+    const int w0 = (ow * pc.W) / pc.OW;
+    const int w1 = ((ow + 1) * pc.W + pc.OW - 1) / pc.OW;
+    precise float sum = 0.0;
+    int count = 0;
+    for (int ih = h0; ih < h1; ++ih) {
+        const int in_row = in_c + ih * pc.W;
+        for (int iw = w0; iw < w1; ++iw) {
+            sum = sum + in_f[in_row + iw];
+            count = count + 1;
+        }
+    }
+    out_f[pc.out_off + i] = count > 0 ? sum / float(count) : 0.0;
+#endif
+#endif
+}

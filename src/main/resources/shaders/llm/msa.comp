@@ -1,0 +1,310 @@
+/* msa.comp - LLM_MSA_BlockScore (OP=OP_MSA_BLOCK_SCORE) and LLM_MSA_GatherAttn (OP=OP_MSA_GATHER_ATTN):
+ * block-sparse attention of MiniMax sparse attention and of the QSA k-pool selection.
+ * GLSL twin of kernels/llm/sparse/msa.cl (the semantic reference: formulas, llama.cpp references, preconditions and
+ * launch geometry are documented there). Requires: common/nf_common.glsl, common/reduce.glsl,
+ * common/kv_types.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   LLM_MSA_BlockScore (i n_tokens, i n_pos, i n_kv_heads, i idx_dim, i blk, i local_blocks, i kv_rows,
+ *                       i ik_type, i iq_off, R float iq, R KV ik_cache, R int q_pos, R int kv_pos,
+ *                       W float block_scores)
+ *   LLM_MSA_GatherAttn (i n_tokens, i n_head, i n_kv_heads, i hd, i blk, i K, f kq_scale, i sel_heads, i tail,
+ *                       i kv_rows, i k_row_stride, i v_row_stride, i k_type, i v_type, i q_stride, i q_off,
+ *                       i out_stride, i out_off, R float q, R KV k_cache, R KV v_cache, R int q_pos,
+ *                       R int kv_pos, R int blocks, W float out)
+ * KV bindings are byte-addressed views decoded at run time by the NF_KV_* type code (common/kv_types.glsl).
+ * Both kernels are 1-D dispatches over workgroups recovered by
+ * nf_wg_id(); the local size is a power of two in [32, LLM_DIMX].
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+#include "common/kv_types.glsl"
+
+#define OP_MSA_BLOCK_SCORE 1
+#define OP_MSA_GATHER_ATTN 2
+
+#define NF_MSA_QSTAGE     2048
+#define NF_MSA_LOCAL_BIAS 1e30
+#define NF_MSA_HD_MAX     1024
+#define NF_MSA_ACC        8
+
+#if OP == OP_MSA_BLOCK_SCORE
+
+layout(std430, binding = 0) readonly buffer NfMsaIq { float iq[]; };
+NF_BUFFER_VIEWS(1, ikc)
+layout(std430, binding = 2) readonly buffer NfMsaQPos { int q_pos[]; };
+layout(std430, binding = 3) readonly buffer NfMsaKvPos { int kv_pos[]; };
+layout(std430, binding = 4) writeonly buffer NfMsaScores { float block_scores[]; };
+layout(push_constant) uniform NfMsaScoreParams {
+    int n_tokens;
+    int n_pos;
+    int n_kv_heads;
+    int idx_dim;
+    int blk;
+    int local_blocks;
+    int kv_rows;
+    int ik_type;
+    int iq_off;
+} pc;
+
+NF_KV_LOADERS(ikc)
+
+shared float nf_msa_qs[NF_MSA_QSTAGE];
+
+vec4 nf_msa_q4(int i) {
+    return vec4(nf_msa_qs[i], nf_msa_qs[i + 1], nf_msa_qs[i + 2], nf_msa_qs[i + 3]);
+}
+
+/* C nf_msa_visible */
+bool nf_msa_visible(int p, int p_q) {
+    return p >= 0 && p <= p_q && kv_pos[p % pc.kv_rows] == p;
+}
+
+void main() {
+    /* Every condition depends on push constants, the local size and the workgroup id: the returns are uniform
+     * per workgroup; a launch that violates the preconditions writes nothing. */
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    if (pc.n_pos < 1 || pc.blk < 1 || pc.local_blocks < 0 || pc.kv_rows < 1 || pc.n_kv_heads < 1
+        || pc.idx_dim < 1 || pc.idx_dim > NF_MSA_QSTAGE || lsize > LLM_DIMX) {
+        return;
+    }
+    const int blk = pc.blk;
+    const int idx_dim = pc.idx_dim;
+    const int n_heads = pc.n_kv_heads;
+    const int nblk = (pc.n_pos + blk - 1) / blk;
+    const int g = int(nf_wg_id());
+    const int t = g / nblk;
+    if (t >= pc.n_tokens) {
+        return;
+    }
+    const int b = g - t * nblk;
+    const int p_q = q_pos[t];
+    const int p_begin = b * blk;
+    const int p_end = min(p_begin + blk, pc.n_pos);
+    const int l_blk = p_q / blk;
+    const float bias = (b <= l_blk && b > l_blk - pc.local_blocks) ? NF_MSA_LOCAL_BIAS : 0.0;
+    const int hs = min(n_heads, NF_MSA_QSTAGE / idx_dim);
+    const uint out_row = uint(t) * uint(n_heads);
+
+    for (int h0 = 0; h0 < n_heads; h0 += hs) {
+        const int nh = min(hs, n_heads - h0);
+        barrier();
+        for (int i = lid; i < nh * idx_dim; i += lsize) {
+            nf_msa_qs[i] = iq[uint(pc.iq_off) + (out_row + uint(h0)) * uint(idx_dim) + uint(i)];
+        }
+        barrier();
+        for (int hg = 0; hg < nh; hg += 4) {
+            /* Heads past nh repeat the last head; their maxima are computed and dropped. */
+            const int q0 = hg * idx_dim;
+            const int q1 = min(hg + 1, nh - 1) * idx_dim;
+            const int q2 = min(hg + 2, nh - 1) * idx_dim;
+            const int q3 = min(hg + 3, nh - 1) * idx_dim;
+            float m0 = -NF_INF, m1 = -NF_INF, m2 = -NF_INF, m3 = -NF_INF;
+            for (int p = p_begin + lid; p < p_end; p += lsize) {
+                if (nf_msa_visible(p, p_q)) {
+                    const uint e0 = uint(p % pc.kv_rows) * uint(idx_dim);
+                    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                    int d = 0;
+                    for (; d + 4 <= idx_dim; d += 4) {
+                        const vec4 k4 = ikc_kv_load4(e0 + uint(d), pc.ik_type);
+                        a0 += dot(nf_msa_q4(q0 + d), k4);
+                        a1 += dot(nf_msa_q4(q1 + d), k4);
+                        a2 += dot(nf_msa_q4(q2 + d), k4);
+                        a3 += dot(nf_msa_q4(q3 + d), k4);
+                    }
+                    for (; d < idx_dim; ++d) {
+                        const float kd = ikc_kv_load1(e0 + uint(d), pc.ik_type);
+                        a0 += nf_msa_qs[q0 + d] * kd;
+                        a1 += nf_msa_qs[q1 + d] * kd;
+                        a2 += nf_msa_qs[q2 + d] * kd;
+                        a3 += nf_msa_qs[q3 + d] * kd;
+                    }
+                    m0 = max(m0, a0);
+                    m1 = max(m1, a1);
+                    m2 = max(m2, a2);
+                    m3 = max(m3, a3);
+                }
+            }
+            /* nh and hg are uniform, so every reduction is reached by the whole workgroup. */
+            const float r0 = nf_wg_max(m0);
+            if (lid == 0) {
+                block_scores[(out_row + uint(h0 + hg)) * uint(nblk) + uint(b)] = r0 + bias;
+            }
+            if (hg + 1 < nh) {
+                const float r1 = nf_wg_max(m1);
+                if (lid == 0) {
+                    block_scores[(out_row + uint(h0 + hg + 1)) * uint(nblk) + uint(b)] = r1 + bias;
+                }
+            }
+            if (hg + 2 < nh) {
+                const float r2 = nf_wg_max(m2);
+                if (lid == 0) {
+                    block_scores[(out_row + uint(h0 + hg + 2)) * uint(nblk) + uint(b)] = r2 + bias;
+                }
+            }
+            if (hg + 3 < nh) {
+                const float r3 = nf_wg_max(m3);
+                if (lid == 0) {
+                    block_scores[(out_row + uint(h0 + hg + 3)) * uint(nblk) + uint(b)] = r3 + bias;
+                }
+            }
+        }
+    }
+}
+
+#elif OP == OP_MSA_GATHER_ATTN
+
+layout(std430, binding = 0) readonly buffer NfMsaQ { float q[]; };
+NF_BUFFER_VIEWS(1, kc)
+NF_BUFFER_VIEWS(2, vc)
+layout(std430, binding = 3) readonly buffer NfMsaQPos { int q_pos[]; };
+layout(std430, binding = 4) readonly buffer NfMsaKvPos { int kv_pos[]; };
+layout(std430, binding = 5) readonly buffer NfMsaBlocks { int blocks[]; };
+layout(std430, binding = 6) writeonly buffer NfMsaOut { float out_v[]; };
+layout(push_constant) uniform NfMsaAttnParams {
+    int n_tokens;
+    int n_head;
+    int n_kv_heads;
+    int hd;
+    int blk;
+    int K;
+    float kq_scale;
+    int sel_heads;
+    int tail;
+    int kv_rows;
+    int k_row_stride;
+    int v_row_stride;
+    int k_type;
+    int v_type;
+    int q_stride;
+    int q_off;
+    int out_stride;
+    int out_off;
+} pc;
+
+NF_KV_LOADERS(kc)
+NF_KV_LOADERS(vc)
+
+shared float nf_msa_q[NF_MSA_HD_MAX];
+shared float nf_msa_p[LLM_DIMX];
+shared int nf_msa_r[LLM_DIMX];
+
+/* C nf_msa_visible */
+bool nf_msa_visible(int p, int p_q) {
+    return p >= 0 && p <= p_q && kv_pos[p % pc.kv_rows] == p;
+}
+
+/* C nf_attn_rescale: e^(x - m), exactly 0 when x is -INF. */
+float nf_msa_rescale(float x, float m) {
+    return (x == -NF_INF) ? 0.0 : exp(x - m);
+}
+
+void main() {
+    if (pc.n_head < 1) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int g = int(nf_wg_id());
+    const int t = g / pc.n_head;
+    /* Uniform per workgroup: push constants and the workgroup id only, before any barrier. */
+    if (t >= pc.n_tokens) {
+        return;
+    }
+    const int h = g - t * pc.n_head;
+    const int hd = pc.hd;
+    const uint o_base = uint(pc.out_off) + uint(t) * uint(pc.out_stride) + uint(h) * uint(hd);
+    if (pc.n_kv_heads < 1 || pc.n_head % pc.n_kv_heads != 0 || (pc.sel_heads != 1 && pc.sel_heads != pc.n_kv_heads)
+        || hd < 4 || hd > NF_MSA_HD_MAX || (hd & 3) != 0 || hd > lsize * NF_MSA_ACC || lsize > LLM_DIMX
+        || pc.blk < 1 || pc.K < 0 || pc.kv_rows < 1) {
+        for (int d = lid; d < hd && d < NF_MSA_HD_MAX; d += lsize) {
+            out_v[o_base + uint(d)] = NF_NAN;
+        }
+        return;
+    }
+    const int blk = pc.blk;
+    const int K = pc.K;
+    const int kvh = h / (pc.n_head / pc.n_kv_heads);
+    const int sh = pc.sel_heads == 1 ? 0 : kvh;
+    const int p_q = q_pos[t];
+    const uint sel = (uint(t) * uint(pc.sel_heads) + uint(sh)) * uint(K);
+    const int tail_blk = (pc.tail != 0 && (p_q + 1) % blk != 0) ? p_q / blk : -1;
+    const int n_cells = (K + (pc.tail != 0 ? 1 : 0)) * blk;
+    const uint k_head = uint(kvh) * uint(hd);
+    const uint v_head = uint(kvh) * uint(hd);
+
+    const uint q_base = uint(pc.q_off) + uint(t) * uint(pc.q_stride) + uint(h) * uint(hd);
+    for (int d = lid; d < hd; d += lsize) {
+        nf_msa_q[d] = q[q_base + uint(d)];
+    }
+    barrier();
+
+    float m = -NF_INF;
+    float l = 0.0;
+    float o[NF_MSA_ACC];
+    [[unroll]] for (int i = 0; i < NF_MSA_ACC; i++) {
+        o[i] = 0.0;
+    }
+
+    for (int c0 = 0; c0 < n_cells; c0 += lsize) {
+        const int c = c0 + lid;
+        int row = -1;
+        float s = -NF_INF;
+        if (c < n_cells) {
+            const int slot = c / blk;
+            const int bk = slot < K ? blocks[sel + uint(slot)] : tail_blk;
+            if (bk >= 0) {
+                const int p = bk * blk + (c - slot * blk);
+                if (nf_msa_visible(p, p_q)) {
+                    row = p % pc.kv_rows;
+                    const uint e0 = uint(row) * uint(pc.k_row_stride) + k_head;
+                    float acc = 0.0;
+                    for (int d = 0; d < hd; d += 4) {
+                        const vec4 q4 = vec4(nf_msa_q[d], nf_msa_q[d + 1], nf_msa_q[d + 2], nf_msa_q[d + 3]);
+                        acc += dot(q4, kc_kv_load4(e0 + uint(d), pc.k_type));
+                    }
+                    s = acc * pc.kq_scale;
+                }
+            }
+        }
+        const float m_new = max(m, nf_wg_max(s));
+        const float alpha = nf_msa_rescale(m, m_new);
+        const float pw = nf_msa_rescale(s, m_new);
+        nf_msa_p[lid] = pw;
+        nf_msa_r[lid] = row;
+        l = l * alpha + nf_wg_sum(pw);   /* its barriers also publish nf_msa_p and nf_msa_r */
+        [[unroll]] for (int i = 0; i < NF_MSA_ACC; i++) {
+            o[i] *= alpha;
+        }
+        const int n_here = min(lsize, n_cells - c0);
+        for (int j = 0; j < n_here; j++) {
+            const float pj = nf_msa_p[j];
+            if (pj != 0.0) {
+                const uint ev = uint(nf_msa_r[j]) * uint(pc.v_row_stride) + v_head;
+                [[unroll]] for (int i = 0; i < NF_MSA_ACC; i++) {
+                    const int d = lid + i * lsize;
+                    if (d < hd) {
+                        o[i] += pj * vc_kv_load1(ev + uint(d), pc.v_type);
+                    }
+                }
+            }
+        }
+        m = m_new;
+        barrier();   /* nf_msa_p and nf_msa_r are rewritten by the next tile */
+    }
+
+    [[unroll]] for (int i = 0; i < NF_MSA_ACC; i++) {
+        const int d = lid + i * lsize;
+        if (d < hd) {
+            out_v[o_base + uint(d)] = l > 0.0 ? o[i] / l : 0.0;
+        }
+    }
+}
+
+#else
+#error "msa.comp: OP must be OP_MSA_BLOCK_SCORE or OP_MSA_GATHER_ATTN"
+#endif

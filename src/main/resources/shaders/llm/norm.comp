@@ -1,0 +1,129 @@
+/* norm.comp - RMS and L2 row/head norm kernels. GLSL twin of the RMS/L2 kernels of kernels/llm/norm.cl.
+ * Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_RMSNorm	norm.comp	OP=OP_RMSNORM	sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_RMSNORM               (i size, f eps, float input, R float weight, float output)
+ *                            output[i] = input[i] * rsqrt(mean(input^2) + eps) * weight[i]
+ *   OP_RMSNORMHEADS          (i total_size, i num_heads, i head_dim, f eps, float input, R float weight, float output)
+ *                            per head h: x * rsqrt(mean_h(x^2) + eps) * weight[i]
+ *   OP_RMSNORMGROUPED        same arguments; weight[h * head_dim + i]
+ *   OP_L2NORMHEADS           same arguments; x * rsqrt(sum_h(x^2) + eps) * weight[i]
+ *   OP_BATCH_RMSNORM         (i size, i seq_len, f eps, float input, R float weight, float output)
+ *                            OP_RMSNORM of every row of [seq_len x size]
+ *   OP_BATCH_RMSNORMHEADS,
+ *   OP_BATCH_L2NORMHEADS     (i total_size, i num_heads, i head_dim, i seq_len, f eps, float input, R float weight, float output)
+ *                            the head ops over [seq_len x num_heads x head_dim]
+ * total_size is informational. input and output carry no memory qualifiers because callers
+ * normalize in place; every pass that writes output[i] runs after the reductions over the row
+ * and is done by the invocation that reads input[i].
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, one workgroup per normalized vector: global = L for
+ * OP_RMSNORM (further groups exit), num_heads * L, seq_len * L or seq_len * num_heads * L.
+ * Folded group counts are recovered by nf_wg_id(); surplus groups exit uniformly.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_RMSNORM              101
+#define OP_RMSNORMHEADS         102
+#define OP_RMSNORMGROUPED       103
+#define OP_L2NORMHEADS          104
+#define OP_BATCH_RMSNORM        105
+#define OP_BATCH_RMSNORMHEADS   106
+#define OP_BATCH_L2NORMHEADS    107
+
+#ifndef OP
+#error "norm.comp requires OP"
+#endif
+
+layout(std430, binding = 0) buffer NfNormInput { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfNormWeight { float w_in[]; };
+layout(std430, binding = 2) buffer NfNormOutput { float y_out[]; };
+
+#if OP == OP_RMSNORM
+layout(push_constant) uniform NfNormParams { int size; float eps; } pc;
+#elif OP == OP_RMSNORMHEADS || OP == OP_RMSNORMGROUPED || OP == OP_L2NORMHEADS
+#define NF_NORM_HEADS 1
+layout(push_constant) uniform NfNormParams { int total_size; int num_heads; int head_dim; float eps; } pc;
+#elif OP == OP_BATCH_RMSNORM
+layout(push_constant) uniform NfNormParams { int size; int seq_len; float eps; } pc;
+#elif OP == OP_BATCH_RMSNORMHEADS || OP == OP_BATCH_L2NORMHEADS
+#define NF_NORM_HEADS 1
+layout(push_constant) uniform NfNormParams { int total_size; int num_heads; int head_dim; int seq_len; float eps; } pc;
+#else
+#error "norm.comp: OP is not a norm op"
+#endif
+
+#include "common/reduce.glsl"
+
+/* Sum of x_in[base + i]^2 over i in [0, n), strided over the workgroup. */
+float nf_norm_sumsq(uint base, uint n) {
+    float ss = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
+        const float v = x_in[base + i];
+        ss += v * v;
+    }
+    return ss;
+}
+
+/* y_out[base + i] = x_in[base + i] * scale * w_in[w_base + i] over i in [0, n). */
+void nf_norm_apply(uint base, uint w_base, uint n, float scale) {
+    for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
+        y_out[base + i] = x_in[base + i] * scale * w_in[w_base + i];
+    }
+}
+
+void main() {
+    const uint wg = nf_wg_id();
+
+#if defined(NF_NORM_HEADS)
+    const uint num_heads = uint(pc.num_heads);
+    const uint head_dim = uint(pc.head_dim);
+#if OP == OP_BATCH_RMSNORMHEADS || OP == OP_BATCH_L2NORMHEADS
+    const uint s = wg / num_heads;
+    if (s >= uint(pc.seq_len)) {
+        return;
+    }
+    const uint head = wg - s * num_heads;
+    const uint base = (s * num_heads + head) * head_dim;
+#else
+    if (wg >= num_heads) {
+        return;
+    }
+    const uint base = wg * head_dim;
+#endif
+    const float ss = nf_wg_sum(nf_norm_sumsq(base, head_dim));
+#if OP == OP_L2NORMHEADS || OP == OP_BATCH_L2NORMHEADS
+    const float scale = inversesqrt(ss + pc.eps);
+#else
+    const float scale = inversesqrt(ss / float(head_dim) + pc.eps);
+#endif
+#if OP == OP_RMSNORMGROUPED
+    nf_norm_apply(base, base, head_dim, scale);
+#else
+    nf_norm_apply(base, 0u, head_dim, scale);
+#endif
+
+#else /* whole-row RMS norm */
+    const uint size = uint(pc.size);
+#if OP == OP_BATCH_RMSNORM
+    if (wg >= uint(pc.seq_len)) {
+        return;
+    }
+    const uint base = wg * size;
+#else
+    if (wg != 0u) {
+        return;
+    }
+    const uint base = 0u;
+#endif
+    const float ss = nf_wg_sum(nf_norm_sumsq(base, size));
+    const float scale = inversesqrt(ss / float(size) + pc.eps);
+    nf_norm_apply(base, 0u, size, scale);
+#endif
+}

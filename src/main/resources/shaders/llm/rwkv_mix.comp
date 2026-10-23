@@ -1,0 +1,173 @@
+/* rwkv_mix.comp - RWKV token-shift lerps, decays, RWKV7 key preparation and r_k bonus. GLSL twin of
+ * LLM_RWKV_TokenShiftLerp, LLM_RWKV_Decay6/7, LLM_RWKV7_KkPrep and LLM_RWKV7_Bonus in
+ * kernels/llm/recurrent/rwkv.cl. Requires: common/nf_common.glsl, common/act.glsl, common/reduce.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_RWKV_Decay6	rwkv_mix.comp	OP=OP_RWKV_DECAY6
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_RWKV_TOKEN_SHIFT_LERP (i n_tokens, i n_embd, i n_mix, i mode, i shift_off, i cur_off, R cur,
+ *                             RW shift_state, R lerp_x, R lerp_fused, RW out)
+ *       cur[t][c] = cur[cur_off + t * n_embd + c];
+ *       prev(t) = t == 0 ? shift_state[shift_off + c] : cur[t-1][c]; sx = prev - cur[t][c];
+ *       slot m is out[m * n_tokens * n_embd + t * n_embd + c]:
+ *       mode 0 LERP   out[m] = sx * lerp_fused[m][c] + cur,             m < n_mix
+ *       mode 1 LERP_X out[0] = sx * lerp_x[c] + cur                      (shift state left unchanged)
+ *       mode 2 LORA   out[m] = (out[m] + lerp_fused[m][c]) * sx + cur,  m < n_mix, in place
+ *       mode 3 PAIR   out[0] = sx * lerp_x[c] + cur, out[1 + m] = sx * lerp_fused[m][c] + cur
+ *       every mode but LERP_X also stores cur[n_tokens-1][c] into shift_state[shift_off + c]; the t == 0
+ *       invocation is its only reader and writes it after reading.
+ *       Dispatch: 1-D, one invocation per (t, c), global = roundUp(n_tokens * n_embd, L).
+ *   OP_RWKV_DECAY6           (i n, i n_cols, R w_in, R base, W out): exp(-exp(w_in[i] + base[i % n_cols]))
+ *   OP_RWKV_DECAY7           same arguments: exp(sigmoid(w_in[i] + base[i % n_cols]) * -0.606531)
+ *       Dispatch: 1-D, global = roundUp(n, L).
+ *   OP_RWKV7_KK_PREP         (i n_tokens, i n_head, i S, R k, R k_k, R k_a, R a, W kk_out, W k_out,
+ *                             W aa_out, W bb_out), per token t and head h over c = h * S + d:
+ *       kk = l2_norm(k * k_k) per head (eps 1e-12); ka = k * k_a; k_out = k + (a * ka - ka);
+ *       kk_out = kk; aa_out = -kk; bb_out = kk * a
+ *   OP_RWKV7_BONUS           (i n_tokens, i n_head, i S, R k, R r, R r_k, R v, RW x):
+ *       x[t,c] += v[t,c] * sum_d k[t,c] * r[t,c] * r_k[c]
+ *       Dispatch of both: 1-D, one workgroup per (t, h), global = n_tokens * n_head * L.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_RWKV_TOKEN_SHIFT_LERP 301
+#define OP_RWKV_DECAY6           302
+#define OP_RWKV_DECAY7           303
+#define OP_RWKV7_KK_PREP         304
+#define OP_RWKV7_BONUS           305
+
+#ifndef OP
+#error "rwkv_mix.comp requires OP"
+#endif
+
+/* Token-shift modes (gguf.ops.rwkv.RwkvKernels.SHIFT_MODE_*). */
+#define NF_RWKV_SHIFT_LERP   0
+#define NF_RWKV_SHIFT_LERP_X 1
+#define NF_RWKV_SHIFT_LORA   2
+#define NF_RWKV_SHIFT_PAIR   3
+
+#if OP == OP_RWKV_TOKEN_SHIFT_LERP
+layout(std430, binding = 0) readonly buffer NfShiftCur { float cur[]; };
+layout(std430, binding = 1) buffer NfShiftState { float shift_state[]; };
+layout(std430, binding = 2) readonly buffer NfShiftLerpX { float lerp_x[]; };
+layout(std430, binding = 3) readonly buffer NfShiftLerpFused { float lerp_fused[]; };
+layout(std430, binding = 4) buffer NfShiftOut { float out_v[]; };
+layout(push_constant) uniform NfShiftParams { int n_tokens; int n_embd; int n_mix; int mode; int shift_off; int cur_off; } pc;
+#elif OP == OP_RWKV_DECAY6 || OP == OP_RWKV_DECAY7
+layout(std430, binding = 0) readonly buffer NfDecayIn { float w_in[]; };
+layout(std430, binding = 1) readonly buffer NfDecayBase { float base_in[]; };
+layout(std430, binding = 2) buffer NfDecayOut { float out_v[]; };
+layout(push_constant) uniform NfDecayParams { int n; int n_cols; } pc;
+#elif OP == OP_RWKV7_KK_PREP
+layout(std430, binding = 0) readonly buffer NfKkK { float k_in[]; };
+layout(std430, binding = 1) readonly buffer NfKkKk { float k_k[]; };
+layout(std430, binding = 2) readonly buffer NfKkKa { float k_a[]; };
+layout(std430, binding = 3) readonly buffer NfKkA { float a_in[]; };
+layout(std430, binding = 4) buffer NfKkOutKk { float kk_out[]; };
+layout(std430, binding = 5) buffer NfKkOutK { float k_out[]; };
+layout(std430, binding = 6) buffer NfKkOutAa { float aa_out[]; };
+layout(std430, binding = 7) buffer NfKkOutBb { float bb_out[]; };
+layout(push_constant) uniform NfKkParams { int n_tokens; int n_head; int S; } pc;
+#elif OP == OP_RWKV7_BONUS
+layout(std430, binding = 0) readonly buffer NfBonusK { float k_in[]; };
+layout(std430, binding = 1) readonly buffer NfBonusR { float r_in[]; };
+layout(std430, binding = 2) readonly buffer NfBonusRk { float r_k[]; };
+layout(std430, binding = 3) readonly buffer NfBonusV { float v_in[]; };
+layout(std430, binding = 4) buffer NfBonusX { float x_io[]; };
+layout(push_constant) uniform NfBonusParams { int n_tokens; int n_head; int S; } pc;
+#else
+#error "rwkv_mix.comp: OP is not an RWKV mix op"
+#endif
+
+#include "common/act.glsl"
+#if OP == OP_RWKV7_KK_PREP || OP == OP_RWKV7_BONUS
+#include "common/reduce.glsl"
+#endif
+
+void main() {
+#if OP == OP_RWKV_TOKEN_SHIFT_LERP
+    const uint n_embd = uint(pc.n_embd);
+    const uint plane = uint(pc.n_tokens) * n_embd;
+    const uint idx = nf_global_id();
+    if (idx >= plane) {
+        return;
+    }
+    const uint t = idx / n_embd;
+    const uint c = idx - t * n_embd;
+    const uint co = uint(pc.cur_off);
+    const uint so = uint(pc.shift_off) + c;
+    const int mode = pc.mode;
+    const float x = cur[co + idx];
+    const float prev = t == 0u ? shift_state[so] : cur[co + idx - n_embd];
+    const float sx = prev - x;
+    if (mode == NF_RWKV_SHIFT_LERP_X || mode == NF_RWKV_SHIFT_PAIR) {
+        out_v[idx] = sx * lerp_x[c] + x;
+    }
+    const uint m0 = mode == NF_RWKV_SHIFT_PAIR ? 1u : 0u;
+    const uint nm = mode == NF_RWKV_SHIFT_LERP_X ? 0u : uint(pc.n_mix);
+    for (uint m = 0u; m < nm; m++) {
+        const float lf = lerp_fused[m * n_embd + c];
+        const uint o = (m0 + m) * plane + idx;
+        out_v[o] = mode == NF_RWKV_SHIFT_LORA ? (out_v[o] + lf) * sx + x : sx * lf + x;
+    }
+    if (t == 0u && mode != NF_RWKV_SHIFT_LERP_X) {
+        shift_state[so] = cur[co + plane - n_embd + c];
+    }
+
+#elif OP == OP_RWKV_DECAY6 || OP == OP_RWKV_DECAY7
+    const uint i = nf_global_id();
+    if (i >= uint(pc.n)) {
+        return;
+    }
+    const float x = w_in[i] + base_in[i % uint(pc.n_cols)];
+#if OP == OP_RWKV_DECAY6
+    out_v[i] = exp(-exp(x));
+#else
+    out_v[i] = exp(nf_sigmoid(x) * -0.606531);
+#endif
+
+#else /* OP_RWKV7_KK_PREP, OP_RWKV7_BONUS: one workgroup per (token, head) */
+    const uint grp = nf_wg_id();
+    const uint n_head = uint(pc.n_head);
+    if (grp >= uint(pc.n_tokens) * n_head) {
+        return;
+    }
+    const uint S = uint(pc.S);
+    const uint row = grp * S;
+    const uint wrow = (grp % n_head) * S;
+    const uint lid = gl_LocalInvocationID.x;
+    const uint L = gl_WorkGroupSize.x;
+#if OP == OP_RWKV7_KK_PREP
+    float ss = 0.0;
+    for (uint d = lid; d < S; d += L) {
+        const float x = k_in[row + d] * k_k[wrow + d];
+        ss += x * x;
+    }
+    ss = nf_wg_sum(ss);
+    const float inv = 1.0 / max(sqrt(ss), 1e-12);
+    for (uint d = lid; d < S; d += L) {
+        const float kv = k_in[row + d];
+        const float av = a_in[row + d];
+        const float kk = kv * k_k[wrow + d] * inv;
+        const float ka = kv * k_a[wrow + d];
+        kk_out[row + d] = kk;
+        k_out[row + d] = kv + (av * ka - ka);
+        aa_out[row + d] = -kk;
+        bb_out[row + d] = kk * av;
+    }
+#else
+    float rk = 0.0;
+    for (uint d = lid; d < S; d += L) {
+        rk += k_in[row + d] * r_in[row + d] * r_k[wrow + d];
+    }
+    rk = nf_wg_sum(rk);
+    for (uint d = lid; d < S; d += L) {
+        x_io[row + d] += v_in[row + d] * rk;
+    }
+#endif
+#endif
+}

@@ -1,0 +1,104 @@
+/* topk_partial.comp - per-slice partial top-k of a logits vector. GLSL twin of LLM_TopK_Partial in
+ * kernels/llm/sampling_topk.cl. Requires: common/nf_common.glsl.
+ *
+ * Variants row:
+ *     LLM_TopK_Partial	topk_partial.comp
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n, i k, f inv_temp, R float logits, W float cand_val, W int cand_idx)
+ * Workgroup g of G = gl_NumWorkGroups.x owns logits[g * S, min(n, (g + 1) * S)) with
+ * S = ceil(n / G) and writes its k best elements in rank order: cand_val[g*k + r] =
+ * logits[idx] * inv_temp, cand_idx[g*k + r] = idx. Slots past the slice's non-NaN element count
+ * hold -INF / -1. Rank order: larger value first, equal values by lower index; NaN never ranks.
+ *
+ * Dispatch: 1-D, global = {G * L}, local = {L, 1, 1}, L a power of two <= LLM_DIMX, 1 <= n <= 2^30,
+ * 1 <= k <= 64; the host keeps G far below maxComputeWorkGroupCount[0], so the dispatch is never
+ * folded and gl_NumWorkGroups.x is G.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfTkLogits { float logits[]; };
+layout(std430, binding = 1) writeonly buffer NfTkVal { float cand_val[]; };
+layout(std430, binding = 2) writeonly buffer NfTkIdx { int cand_idx[]; };
+layout(push_constant) uniform NfTkParams { int n; int k; float inv_temp; } pc;
+
+/* Index sentinel of a candidate slot that holds no element. */
+#define NF_TKP_NONE 0x7fffffff
+
+shared float nf_tkp_v[gl_WorkGroupSize.x];
+shared int nf_tkp_i[gl_WorkGroupSize.x];
+
+/* NaN test on the bit pattern, independent of the driver's float NaN handling. */
+bool nf_tkp_isnan(float v) {
+    return (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u;
+}
+
+/* True when (v, i) ranks before (bv, bi): larger value first, then lower index. Non-NaN inputs. */
+bool nf_tkp_before(float v, int i, float bv, int bi) {
+    return v > bv || (v == bv && i < bi);
+}
+
+void main() {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int g = int(gl_WorkGroupID.x);
+    const int n_groups = int(gl_NumWorkGroups.x);
+    const int n = pc.n;
+    const int k = pc.k;
+    const int slice = (n + n_groups - 1) / n_groups;
+    const int s0 = min(n, g * slice);
+    const int s1 = min(n, s0 + slice);
+    const uint out_base = uint(g) * uint(k);
+
+    /* Previous winner; (+INF, -1) ranks before every element, so round 0 sees the whole slice. */
+    float pv = NF_INF;
+    int pi = -1;
+    for (int r = 0; r < k; ++r) {
+        float bv = -NF_INF;
+        int bi = NF_TKP_NONE;
+        for (int i = s0 + lid; i < s1; i += lsize) {
+            const float v = logits[uint(i)];
+            if (nf_tkp_isnan(v)) {
+                continue;
+            }
+            if (nf_tkp_before(pv, pi, v, i) && nf_tkp_before(v, i, bv, bi)) {
+                bv = v;
+                bi = i;
+            }
+        }
+        nf_tkp_v[lid] = bv;
+        nf_tkp_i[lid] = bi;
+        barrier();
+        for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                const float ov = nf_tkp_v[lid + stride];
+                const int oi = nf_tkp_i[lid + stride];
+                if (nf_tkp_before(ov, oi, nf_tkp_v[lid], nf_tkp_i[lid])) {
+                    nf_tkp_v[lid] = ov;
+                    nf_tkp_i[lid] = oi;
+                }
+            }
+            barrier();
+        }
+        const float wv = nf_tkp_v[0];
+        const int wi = nf_tkp_i[0];
+        barrier();
+        if (wi == NF_TKP_NONE) {
+            /* The slice is exhausted (uniform: every invocation read the same winner). */
+            for (int q = r + lid; q < k; q += lsize) {
+                cand_val[out_base + uint(q)] = -NF_INF;
+                cand_idx[out_base + uint(q)] = -1;
+            }
+            break;
+        }
+        if (lid == 0) {
+            cand_val[out_base + uint(r)] = wv * pc.inv_temp;
+            cand_idx[out_base + uint(r)] = wi;
+        }
+        pv = wv;
+        pi = wi;
+    }
+}

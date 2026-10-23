@@ -1,0 +1,113 @@
+/* lightning.comp - LLM_LightningAttn, MiniMax-01 lightning attention recurrence (GLSL twin of
+ * LLM_LightningAttn in kernels/llm/recurrent/lightning.cl, which is the semantic reference).
+ * Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_head, i D, f layer_scale, R slopes, R qkv, RWn state, R int state_rows, W out)
+ * Per head h with decay e^{-s}, s = slopes[h] * layer_scale, and per token t:
+ *   kv[v][k] = e^{-s} kv[v][k] + k_t[k] v_t[v];   out[t][h][v] = sum_k q_t[k] kv[v][k]
+ *   qkv[t*n_head*3D + h*3D + {0, D, 2D} + i] (q | k | v), out[t*n_head*D + h*D + v],
+ *   state[state_rows[0]*n_head*D*D + h*D*D + v*D + k].
+ *
+ * Dispatch: 1-D, local = {L, 1, 1} with L a multiple of 32 and L <= LLM_DIMX; L/32 value columns per
+ * workgroup with 32 invocations each; global = n_head * ceil(D / (L/32)) * L. Requires D <= 256.
+ * Folded group counts are recovered by nf_wg_id(); surplus groups exit uniformly.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+
+#define NF_LA_MAX_D 256
+#define NF_LA_LANES 32u
+#define NF_LA_ROWS_PER_LANE 8
+#define NF_LA_MAX_COLS (LLM_DIMX / 32)
+
+layout(std430, binding = 0) readonly  buffer NfLaSlopes { float slopes[]; };
+layout(std430, binding = 1) readonly  buffer NfLaQkv    { float qkv[]; };
+layout(std430, binding = 2)           buffer NfLaState  { float state[]; };
+layout(std430, binding = 3) readonly  buffer NfLaRows   { int state_rows[]; };
+layout(std430, binding = 4) writeonly buffer NfLaOut    { float out_v[]; };
+
+layout(push_constant) uniform NfLaParams {
+    int n_tokens;
+    int n_head;
+    int D;
+    float layer_scale;
+} pc;
+
+shared float q_s[NF_LA_MAX_D];
+shared float k_s[NF_LA_MAX_D];
+shared float v_s[NF_LA_MAX_COLS];
+
+void main() {
+    const int D = pc.D;
+    if (D > NF_LA_MAX_D || D <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint wg = gl_WorkGroupSize.x;
+    const uint cols = wg / NF_LA_LANES;
+    const uint col_blocks = (uint(D) + cols - 1u) / cols;
+    const uint grp = nf_wg_id();
+    const uint h = grp / col_blocks;
+    const uint n_head = uint(pc.n_head);
+    if (h >= n_head) {
+        return;
+    }
+    const uint col_local = lid / NF_LA_LANES;
+    const uint lane = lid - col_local * NF_LA_LANES;
+    const uint col0 = (grp - h * col_blocks) * cols;
+    const uint col = col0 + col_local;
+    const bool col_valid = col < uint(D);
+
+    const float decay = exp(-(slopes[h] * pc.layer_scale));
+    const uint head_floats = uint(D) * uint(D);
+    const uint s_base = uint(state_rows[0]) * n_head * head_floats + h * head_floats + (col_valid ? col : 0u) * uint(D);
+
+    float s[NF_LA_ROWS_PER_LANE];
+    [[unroll]] for (int r = 0; r < NF_LA_ROWS_PER_LANE; r++) {
+        const uint i = lane + uint(r) * NF_LA_LANES;
+        s[r] = (col_valid && i < uint(D)) ? state[s_base + i] : 0.0;
+    }
+
+    const uint row_floats = n_head * 3u * uint(D);
+    for (int t = 0; t < pc.n_tokens; t++) {
+        const uint base = uint(t) * row_floats + h * 3u * uint(D);
+        for (uint i = lid; i < uint(D); i += wg) {
+            q_s[i] = qkv[base + i];
+            k_s[i] = qkv[base + uint(D) + i];
+        }
+        if (lid < cols) {
+            const uint c = col0 + lid;
+            v_s[lid] = c < uint(D) ? qkv[base + 2u * uint(D) + c] : 0.0;
+        }
+        barrier();
+
+        const float vv = v_s[col_local];
+        float o = 0.0;
+        [[unroll]] for (int r = 0; r < NF_LA_ROWS_PER_LANE; r++) {
+            const uint i = lane + uint(r) * NF_LA_LANES;
+            if (i < uint(D)) {
+                s[r] = s[r] * decay + k_s[i] * vv;
+                o += s[r] * q_s[i];
+            }
+        }
+        o = nf_seg_sum(o, NF_LA_LANES);
+
+        if (col_valid && lane == 0u) {
+            out_v[uint(t) * n_head * uint(D) + h * uint(D) + col] = o;
+        }
+        barrier();
+    }
+
+    if (col_valid) {
+        [[unroll]] for (int r = 0; r < NF_LA_ROWS_PER_LANE; r++) {
+            const uint i = lane + uint(r) * NF_LA_LANES;
+            if (i < uint(D)) {
+                state[s_base + i] = s[r];
+            }
+        }
+    }
+}

@@ -1,0 +1,280 @@
+/* norm_ext.comp - LLM_RowNorm, LLM_GroupRms, LLM_GroupNorm, LLM_ResidualMix and LLM_MulRowScale
+ * (GLSL twin of kernels/llm/norm_ext.cl). Requires: common/nf_common.glsl, common/reduce.glsl (reduction ops).
+ *
+ * A variants row selects OP:
+ *   OP_ROW_NORM        (i n_rows, i row_len, i row_stride, i mode, f eps, i flags, i w_rows, i x_off, i y_off,
+ *                       float x, R float w, R float b, float y)
+ *       row r: x at x_off + r*row_stride, y at y_off + r*row_stride, row_len floats;
+ *       mode 0 RMS x*rsqrt(sum(x^2)/n + eps), 1 LAYER (x - mean)*rsqrt(var + eps),
+ *       2 L2_CLAMP x/max(sqrt(sum(x^2)), eps), 3 L2_GDN x*rsqrt(sum(x^2)/n + eps/n)*rsqrt(n);
+ *       then *w and +b of weight row (r % w_rows) when flags bit 0 / bit 1 is set.
+ *   OP_GROUP_RMS       (i n_tokens, i d_inner, i n_group, f eps, i x_stride, i x_off, float x, R float w, float y)
+ *       y[t*d_inner + g*gs + i] = x[x_off + t*x_stride + g*gs + i] * rsqrt(sum_g(x^2)/gs + eps) * w[g*gs + i],
+ *       gs = d_inner / n_group.
+ *   OP_GROUP_NORM      (i n_ch, i len, i n_groups, f eps, R float x, R float w, R float b, float y)
+ *       channel-major [n_ch][len]; group g covers channels [g*cpg, min(g*cpg + cpg, n_ch)), cpg = ceil(n_ch/n_groups);
+ *       y[c*len + t] = (x - mean_g) * rsqrt(var_g + eps) * w[c] + b[c].
+ *   OP_RESIDUAL_MIX    (i n, i mode, f s, i inp_off, i cur_off, i out_off, i ab_len,
+ *                       R float inp, R float cur, R float alpha, R float beta, float out)
+ *       mode 0 a + c, 1 a + s*c, 2 a*alpha[i % ab_len] + c*beta[i % ab_len], 3 c + s*a.
+ *   OP_MUL_ROW_SCALE   (i n_rows, i row_len, i scale_len, R float scale, float x)
+ *       x[r*row_len + c] *= scale[scale_len == 1 ? 0 : c].
+ * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. Operands that
+ * may alias another binding carry no restrict; every element is read and written by one invocation.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}. Reductions use one workgroup per vector (global = n_rows * L,
+ * n_tokens * n_group * L or n_groups * L; the group index comes from nf_wg_id(), surplus groups exit
+ * uniformly). Element-wise ops use one invocation per element over nf_global_id(): global = roundUp(n, L).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_ROW_NORM       1
+#define OP_GROUP_RMS      2
+#define OP_GROUP_NORM     3
+#define OP_RESIDUAL_MIX   4
+#define OP_MUL_ROW_SCALE  5
+
+#if !defined(OP)
+#error "norm_ext.comp requires OP"
+#endif
+
+#define NF_NORM_EXT_RMS       0
+#define NF_NORM_EXT_LAYER     1
+#define NF_NORM_EXT_L2_CLAMP  2
+#define NF_NORM_EXT_L2_GDN    3
+#define NF_NORM_EXT_HAS_W     1
+#define NF_NORM_EXT_HAS_B     2
+
+#define NF_MIX_ADD                 0
+#define NF_MIX_SCALED              1
+#define NF_MIX_ALPHA_BETA          2
+#define NF_MIX_NORMED_INPUT_SCALED 3
+
+#if OP == OP_ROW_NORM
+layout(std430, binding = 0) readonly buffer NfNxX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfNxW { float w_in[]; };
+layout(std430, binding = 2) readonly buffer NfNxB { float b_in[]; };
+layout(std430, binding = 3) buffer NfNxY { float y_out[]; };
+layout(push_constant) uniform NfNxParams {
+    int n_rows;
+    int row_len;
+    int row_stride;
+    int mode;
+    float eps;
+    int flags;
+    int w_rows;
+    int x_off;
+    int y_off;
+} pc;
+#define NF_NORM_EXT_REDUCE 1
+#elif OP == OP_GROUP_RMS
+layout(std430, binding = 0) readonly buffer NfNxX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfNxW { float w_in[]; };
+layout(std430, binding = 2) buffer NfNxY { float y_out[]; };
+layout(push_constant) uniform NfNxParams {
+    int n_tokens;
+    int d_inner;
+    int n_group;
+    float eps;
+    int x_stride;
+    int x_off;
+} pc;
+#define NF_NORM_EXT_REDUCE 1
+#elif OP == OP_GROUP_NORM
+layout(std430, binding = 0) readonly buffer NfNxX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfNxW { float w_in[]; };
+layout(std430, binding = 2) readonly buffer NfNxB { float b_in[]; };
+layout(std430, binding = 3) writeonly buffer NfNxY { float y_out[]; };
+layout(push_constant) uniform NfNxParams {
+    int n_ch;
+    int len;
+    int n_groups;
+    float eps;
+} pc;
+#define NF_NORM_EXT_REDUCE 1
+#elif OP == OP_RESIDUAL_MIX
+layout(std430, binding = 0) readonly buffer NfNxInp { float inp[]; };
+layout(std430, binding = 1) readonly buffer NfNxCur { float cur[]; };
+layout(std430, binding = 2) readonly buffer NfNxAlpha { float alpha[]; };
+layout(std430, binding = 3) readonly buffer NfNxBeta { float beta[]; };
+layout(std430, binding = 4) buffer NfNxOut { float out_v[]; };
+layout(push_constant) uniform NfNxParams {
+    int n;
+    int mode;
+    float s;
+    int inp_off;
+    int cur_off;
+    int out_off;
+    int ab_len;
+} pc;
+#elif OP == OP_MUL_ROW_SCALE
+layout(std430, binding = 0) readonly buffer NfNxScale { float scale_in[]; };
+layout(std430, binding = 1) buffer NfNxX { float x_io[]; };
+layout(push_constant) uniform NfNxParams {
+    int n_rows;
+    int row_len;
+    int scale_len;
+} pc;
+#else
+#error "norm_ext.comp: OP is not a norm-extension op"
+#endif
+
+#if defined(NF_NORM_EXT_REDUCE)
+#include "common/reduce.glsl"
+
+/* Sum of x_in[base + i] over i in [0, n), strided over the workgroup. */
+float nf_norm_ext_sum(uint base, uint n) {
+    float s = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
+        s += x_in[base + i];
+    }
+    return s;
+}
+
+/* Sum of x_in[base + i]^2 over i in [0, n). */
+float nf_norm_ext_sumsq(uint base, uint n) {
+    float s = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
+        const float v = x_in[base + i];
+        s += v * v;
+    }
+    return s;
+}
+
+/* Sum of (x_in[base + i] - mean)^2 over i in [0, n). */
+float nf_norm_ext_sqdev(uint base, uint n, float mean) {
+    float s = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
+        const float d = x_in[base + i] - mean;
+        s += d * d;
+    }
+    return s;
+}
+#endif
+
+void main() {
+#if OP == OP_ROW_NORM
+    const uint row = nf_wg_id();
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const uint row_len = uint(pc.row_len);
+    const uint xb = uint(pc.x_off) + row * uint(pc.row_stride);
+    const uint yb = uint(pc.y_off) + row * uint(pc.row_stride);
+    const float n = float(pc.row_len);
+
+    float mean = 0.0;
+    float scale;
+    float post = 1.0;
+    if (pc.mode == NF_NORM_EXT_LAYER) {
+        mean = nf_wg_sum(nf_norm_ext_sum(xb, row_len)) / n;
+        const float var = nf_wg_sum(nf_norm_ext_sqdev(xb, row_len, mean)) / n;
+        scale = inversesqrt(var + pc.eps);
+    } else {
+        const float ss = nf_wg_sum(nf_norm_ext_sumsq(xb, row_len));
+        if (pc.mode == NF_NORM_EXT_L2_CLAMP) {
+            scale = 1.0 / max(sqrt(ss), pc.eps);
+        } else if (pc.mode == NF_NORM_EXT_L2_GDN) {
+            scale = inversesqrt(ss / n + pc.eps / n);
+            post = inversesqrt(n);
+        } else {
+            scale = inversesqrt(ss / n + pc.eps);
+        }
+    }
+
+    const bool has_w = (pc.flags & NF_NORM_EXT_HAS_W) != 0;
+    const bool has_b = (pc.flags & NF_NORM_EXT_HAS_B) != 0;
+    const uint wb = (pc.w_rows > 1 ? row % uint(pc.w_rows) : 0u) * row_len;
+    for (uint i = gl_LocalInvocationID.x; i < row_len; i += gl_WorkGroupSize.x) {
+        float v = (x_in[xb + i] - mean) * scale;
+        if (pc.mode == NF_NORM_EXT_L2_GDN) {
+            v *= post;
+        }
+        if (has_w) {
+            v *= w_in[wb + i];
+        }
+        if (has_b) {
+            v += b_in[wb + i];
+        }
+        y_out[yb + i] = v;
+    }
+
+#elif OP == OP_GROUP_RMS
+    const uint wg = nf_wg_id();
+    const uint n_group = uint(pc.n_group);
+    const uint t = wg / n_group;
+    if (t >= uint(pc.n_tokens)) {
+        return;
+    }
+    const uint g = wg - t * n_group;
+    const uint gs = uint(pc.d_inner) / n_group;
+    const uint xb = uint(pc.x_off) + t * uint(pc.x_stride) + g * gs;
+    const uint yb = t * uint(pc.d_inner) + g * gs;
+    const uint wb = g * gs;
+
+    const float ss = nf_wg_sum(nf_norm_ext_sumsq(xb, gs));
+    const float scale = inversesqrt(ss / float(gs) + pc.eps);
+    for (uint i = gl_LocalInvocationID.x; i < gs; i += gl_WorkGroupSize.x) {
+        y_out[yb + i] = x_in[xb + i] * scale * w_in[wb + i];
+    }
+
+#elif OP == OP_GROUP_NORM
+    const uint g = nf_wg_id();
+    if (g >= uint(pc.n_groups)) {
+        return;
+    }
+    const uint n_ch = uint(pc.n_ch);
+    const uint len = uint(pc.len);
+    const uint cpg = (n_ch + uint(pc.n_groups) - 1u) / uint(pc.n_groups);
+    const uint c0 = g * cpg;
+    const uint c1 = min(c0 + cpg, n_ch);
+    if (c1 <= c0) {
+        return;
+    }
+    const uint base = c0 * len;
+    const uint cnt = (c1 - c0) * len;
+    const float mean = nf_wg_sum(nf_norm_ext_sum(base, cnt)) / float(cnt);
+    const float var = nf_wg_sum(nf_norm_ext_sqdev(base, cnt, mean)) / float(cnt);
+    const float scale = inversesqrt(var + pc.eps);
+    for (uint c = c0; c < c1; ++c) {
+        const uint cb = c * len;
+        const float wc = w_in[c];
+        const float bc = b_in[c];
+        for (uint t = gl_LocalInvocationID.x; t < len; t += gl_WorkGroupSize.x) {
+            y_out[cb + t] = (x_in[cb + t] - mean) * scale * wc + bc;
+        }
+    }
+
+#elif OP == OP_RESIDUAL_MIX
+    const uint i = nf_global_id();
+    if (i >= uint(pc.n)) {
+        return;
+    }
+    const float a = inp[uint(pc.inp_off) + i];
+    const float c = cur[uint(pc.cur_off) + i];
+    float r;
+    if (pc.mode == NF_MIX_SCALED) {
+        r = a + pc.s * c;
+    } else if (pc.mode == NF_MIX_ALPHA_BETA) {
+        const uint k = pc.ab_len > 1 ? i % uint(pc.ab_len) : 0u;
+        r = a * alpha[k] + c * beta[k];
+    } else if (pc.mode == NF_MIX_NORMED_INPUT_SCALED) {
+        r = c + pc.s * a;
+    } else {
+        r = a + c;
+    }
+    out_v[uint(pc.out_off) + i] = r;
+
+#elif OP == OP_MUL_ROW_SCALE
+    const uint idx = nf_global_id();
+    const uint row_len = uint(pc.row_len);
+    if (pc.row_len <= 0 || idx >= uint(pc.n_rows) * row_len) {
+        return;
+    }
+    const uint c = idx % row_len;
+    x_io[idx] = x_io[idx] * scale_in[pc.scale_len == 1 ? 0u : c];
+#endif
+}

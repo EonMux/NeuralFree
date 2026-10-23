@@ -1,0 +1,166 @@
+/* eltwise.comp - element-wise add, multiply, scale and copy kernels. GLSL twin of kernels/llm/eltwise.cl.
+ * Requires: common/nf_common.glsl, common/act.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_Add	eltwise.comp	OP=OP_ADD
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_ADD               (i size, float a, float b, float out)          out[i] = a[i] + b[i]
+ *   OP_BIASADD           (i size, R float bias, float dst)              dst[i] += bias[i]
+ *   OP_BIASADDSLICE      (i size, i src_offset, R float bias, float dst) dst[i] += bias[src_offset + i]
+ *   OP_BIASADDDSTOFFSET  (i size, i dst_offset, R float bias, float dst) dst[dst_offset + i] += bias[i]
+ *   OP_COPY              (i size, R float src, W float dst)             dst[i] = src[i]
+ *   OP_FILLZERO          (i size, float buf)                            buf[i] = 0
+ *   OP_BATCH_ADD         (i total, float a, float b, float out)         as OP_ADD, 4 elements per invocation
+ *   OP_BATCH_COPY        (i total, R float src, W float dst)            as OP_COPY, 4 elements per invocation
+ *   OP_BATCH_BIASADD     (i dim, i seq_len, R float bias, float data)   data[s * dim + d] += bias[d], one invocation per d
+ *   OP_SCALEADD          (i size, f weight, float src, float dst)       dst[i] += weight * src[i]
+ *   OP_EMBEDSCALE        (i size, f scale, float data)                  data[i] *= scale
+ *   OP_LOGITSOFTCAP      (i size, f cap, float logits)                  logits[i] = cap * tanh(logits[i] / cap)
+ *   OP_ADDPOSEMBED       (i size, i pos, R float pos_embed, float data) data[i] += pos_embed[pos * size + i]
+ *   OP_ADD3              (i size, float a, float b, float c, float out) out[i] = a[i] + b[i] + c[i]
+ * Activation buffers carry no memory qualifiers because callers run these ops in place; each
+ * invocation reads and writes only its own elements. Model parameters are readonly, and the copy
+ * ops' distinct src/dst are readonly/writeonly.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n invocations (n = element count, or ceil(n / 4) for
+ * OP_BATCH_ADD / OP_BATCH_COPY, or dim for OP_BATCH_BIASADD), rounded up to L. Folded group
+ * counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_ADD               141
+#define OP_BIASADD           142
+#define OP_BIASADDSLICE      143
+#define OP_BIASADDDSTOFFSET  144
+#define OP_COPY              145
+#define OP_FILLZERO          146
+#define OP_BATCH_ADD         147
+#define OP_BATCH_COPY        148
+#define OP_BATCH_BIASADD     149
+#define OP_SCALEADD          150
+#define OP_EMBEDSCALE        151
+#define OP_LOGITSOFTCAP      152
+#define OP_ADDPOSEMBED       153
+#define OP_ADD3              154
+
+#ifndef OP
+#error "eltwise.comp requires OP"
+#endif
+
+#if OP == OP_ADD || OP == OP_BATCH_ADD
+layout(std430, binding = 0) buffer NfEwA { float a_in[]; };
+layout(std430, binding = 1) buffer NfEwB { float b_in[]; };
+layout(std430, binding = 2) buffer NfEwOut { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; } pc;
+#elif OP == OP_ADD3
+layout(std430, binding = 0) buffer NfEwA { float a_in[]; };
+layout(std430, binding = 1) buffer NfEwB { float b_in[]; };
+layout(std430, binding = 2) buffer NfEwC { float c_in[]; };
+layout(std430, binding = 3) buffer NfEwOut { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; } pc;
+#elif OP == OP_BIASADD
+layout(std430, binding = 0) readonly buffer NfEwBias { float p_in[]; };
+layout(std430, binding = 1) buffer NfEwDst { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; } pc;
+#elif OP == OP_BIASADDSLICE
+layout(std430, binding = 0) readonly buffer NfEwBias { float p_in[]; };
+layout(std430, binding = 1) buffer NfEwDst { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; int src_offset; } pc;
+#elif OP == OP_BIASADDDSTOFFSET
+layout(std430, binding = 0) readonly buffer NfEwBias { float p_in[]; };
+layout(std430, binding = 1) buffer NfEwDst { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; int dst_offset; } pc;
+#elif OP == OP_COPY || OP == OP_BATCH_COPY
+layout(std430, binding = 0) readonly buffer NfEwSrc { float a_in[]; };
+layout(std430, binding = 1) writeonly buffer NfEwDst { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; } pc;
+#elif OP == OP_FILLZERO
+layout(std430, binding = 0) buffer NfEwBuf { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; } pc;
+#elif OP == OP_BATCH_BIASADD
+layout(std430, binding = 0) readonly buffer NfEwBias { float p_in[]; };
+layout(std430, binding = 1) buffer NfEwData { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int dim; int seq_len; } pc;
+#elif OP == OP_SCALEADD
+layout(std430, binding = 0) buffer NfEwSrc { float a_in[]; };
+layout(std430, binding = 1) buffer NfEwDst { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; float weight; } pc;
+#elif OP == OP_EMBEDSCALE
+layout(std430, binding = 0) buffer NfEwData { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; float scale; } pc;
+#elif OP == OP_LOGITSOFTCAP
+layout(std430, binding = 0) buffer NfEwLogits { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; float cap; } pc;
+#elif OP == OP_ADDPOSEMBED
+layout(std430, binding = 0) readonly buffer NfEwPos { float p_in[]; };
+layout(std430, binding = 1) buffer NfEwData { float y_out[]; };
+layout(push_constant) uniform NfEwParams { int n; int pos; } pc;
+#else
+#error "eltwise.comp: OP is not an element-wise op"
+#endif
+
+#include "common/act.glsl"
+
+void main() {
+    const uint gid = nf_global_id();
+
+#if OP == OP_BATCH_BIASADD
+    const uint dim = uint(pc.dim);
+    if (gid >= dim) {
+        return;
+    }
+    const float b = p_in[gid];
+    const uint seq_len = uint(pc.seq_len);
+    for (uint s = 0u; s < seq_len; ++s) {
+        y_out[s * dim + gid] += b;
+    }
+
+#elif OP == OP_BATCH_ADD || OP == OP_BATCH_COPY
+    const uint total = uint(pc.n);
+    const uint i0 = gid * 4u;
+    if (i0 >= total) {
+        return;
+    }
+    const uint i1 = min(i0 + 4u, total);
+    for (uint i = i0; i < i1; ++i) {
+#if OP == OP_BATCH_ADD
+        y_out[i] = a_in[i] + b_in[i];
+#else
+        y_out[i] = a_in[i];
+#endif
+    }
+
+#else
+    const uint i = gid;
+    if (i >= uint(pc.n)) {
+        return;
+    }
+#if OP == OP_ADD
+    y_out[i] = a_in[i] + b_in[i];
+#elif OP == OP_ADD3
+    y_out[i] = a_in[i] + b_in[i] + c_in[i];
+#elif OP == OP_BIASADD
+    y_out[i] += p_in[i];
+#elif OP == OP_BIASADDSLICE
+    y_out[i] += p_in[uint(pc.src_offset) + i];
+#elif OP == OP_BIASADDDSTOFFSET
+    y_out[uint(pc.dst_offset) + i] += p_in[i];
+#elif OP == OP_COPY
+    y_out[i] = a_in[i];
+#elif OP == OP_FILLZERO
+    y_out[i] = 0.0;
+#elif OP == OP_SCALEADD
+    y_out[i] += pc.weight * a_in[i];
+#elif OP == OP_EMBEDSCALE
+    y_out[i] *= pc.scale;
+#elif OP == OP_LOGITSOFTCAP
+    y_out[i] = pc.cap * nf_tanh(y_out[i] / pc.cap);
+#elif OP == OP_ADDPOSEMBED
+    y_out[i] += p_in[uint(pc.pos) * uint(pc.n) + i];
+#endif
+#endif
+}

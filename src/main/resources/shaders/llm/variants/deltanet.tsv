@@ -1,0 +1,5 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Gated DeltaNet / KDA (kernels/llm/recurrent/gdn.cl) and lightning attention (kernels/llm/recurrent/lightning.cl).
+LLM_GDN_Scan	gdn_scan.comp
+LLM_GDN_GatePrep	gdn_gate.comp
+LLM_LightningAttn	lightning.comp
