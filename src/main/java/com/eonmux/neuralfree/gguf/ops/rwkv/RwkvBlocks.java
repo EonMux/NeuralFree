@@ -367,6 +367,9 @@ public final class RwkvBlocks {
             if (w.hadamard() != null) {
                 block = block.withHadamard(w.hadamard());
             }
+            if (w.inputTransform() != null) {
+                block = block.withInputTransform(w.inputTransform(), w.inputPerm());
+            }
             return w.hasScale() ? block.withScale(w.scale()) : block;
         }
 

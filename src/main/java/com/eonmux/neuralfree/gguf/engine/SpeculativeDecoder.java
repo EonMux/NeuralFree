@@ -19,6 +19,8 @@ import java.util.function.Consumer;
  *
  * <p>Per {@link #generate} call:
  * <ol>
+ *   <li><b>Model defaults.</b> The request takes the decoder's {@link SamplingDefaults} for every sampler setting
+ *       and the token budget it leaves unset, as in {@link GenerationLoop}.</li>
  *   <li><b>Memory.</b> The target memory and the drafter are reset: the drafter's state follows the target's hidden
  *       rows from the first prompt token, so a reused prefix would leave it without them. A prompt longer than the
  *       context throws {@link ContextFullException}.</li>
@@ -95,6 +97,7 @@ public final class SpeculativeDecoder {
     private final int draftMax;
     private final int draftMin;
     private final Consumer<Stats> statsSink;
+    private final SamplingDefaults samplingDefaults;
 
     private SpeculativeDecoder(Builder b) {
         this.backend = b.backend;
@@ -104,6 +107,7 @@ public final class SpeculativeDecoder {
         this.draftMax = b.draftMax;
         this.draftMin = b.draftMin;
         this.statsSink = b.statsSink;
+        this.samplingDefaults = b.samplingDefaults;
         if (draftMin > draftMax) {
             throw new IllegalArgumentException("draft min " + draftMin + " exceeds draft max " + draftMax);
         }
@@ -119,8 +123,9 @@ public final class SpeculativeDecoder {
 
     /**
      * The decoder of an engine model and its bound drafter: the reasoning parser of the model's chat template (with
-     * its tag tokens) and the draft lengths of {@code config} ({@code neuralfree.draft.max},
-     * {@code neuralfree.draft.min}).
+     * its tag tokens), the draft lengths of {@code config} ({@code neuralfree.draft.max},
+     * {@code neuralfree.draft.min}) and the model's sampling defaults unless {@code config} turns them off
+     * ({@link SamplingDefaults#forModel}).
      *
      * @throws UnsupportedOperationException for models that do not generate autoregressively with a decoder-only
      *                                       memory
@@ -147,12 +152,14 @@ public final class SpeculativeDecoder {
                 .reasoning(rf)
                 .draftMax(config.draftMax())
                 .draftMin(config.draftMin())
+                .samplingDefaults(SamplingDefaults.forModel(model, config))
                 .build();
     }
 
     public ReasoningFilter reasoning() { return reasoning; }
     public int draftMax() { return draftMax; }
     public int draftMin() { return draftMin; }
+    public SamplingDefaults samplingDefaults() { return samplingDefaults; }
 
     /**
      * Generates after {@code prompt}, streaming the content channel to {@code callback}.
@@ -170,7 +177,8 @@ public final class SpeculativeDecoder {
      *                       from the prompt tokens
      * @throws ContextFullException          when the prompt is longer than the context
      * @throws UnsupportedOperationException when the backend has no memory
-     * @throws IllegalArgumentException      for an empty prompt or a negative token id
+     * @throws IllegalArgumentException      for an empty prompt, a negative token id, or a model sampling default
+     *                                       the sampler rejects
      */
     public GenerationResult generate(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
                                      String renderedPrompt) {
@@ -188,8 +196,9 @@ public final class SpeculativeDecoder {
         if (prompt.length > nCtx) {
             throw new ContextFullException(prompt.length, nCtx);
         }
-        StopCriteria stop = StopCriteria.of(request, tokenizer, reasoning);
-        Sampler sampler = Sampler.create(samplerConfig(request.sampler(), nCtx), stop.bannedTokens());
+        GenerationRequest effective = request.withModelDefaults(samplingDefaults);
+        StopCriteria stop = StopCriteria.of(effective, tokenizer, reasoning);
+        Sampler sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens());
         String rendered = renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? renderedPrompt : stop.renderPrompt(prompt);
         StopCriteria.Session session = stop.start(sink, rendered);
@@ -411,7 +420,7 @@ public final class SpeculativeDecoder {
     @Override
     public String toString() {
         return "SpeculativeDecoder{" + drafter + ", draftMax=" + draftMax + ", draftMin=" + draftMin + ", "
-                + reasoning + '}';
+                + reasoning + (samplingDefaults.isEmpty() ? "" : ", " + samplingDefaults) + '}';
     }
 
     public static final class Builder {
@@ -422,6 +431,7 @@ public final class SpeculativeDecoder {
         private int draftMax = 3;
         private int draftMin;
         private Consumer<Stats> statsSink = s -> { };
+        private SamplingDefaults samplingDefaults = SamplingDefaults.NONE;
 
         private Builder(ForwardBackend backend, DraftModel drafter, GGUFTokenizer tokenizer) {
             this.backend = Objects.requireNonNull(backend, "backend");
@@ -452,6 +462,15 @@ public final class SpeculativeDecoder {
 
         /** Receives each generation's {@link Stats} before its result is built (default: discarded). */
         public Builder statsSink(Consumer<Stats> v) { this.statsSink = Objects.requireNonNull(v, "statsSink"); return this; }
+
+        /**
+         * The target model's sampling defaults applied to every request (default {@link SamplingDefaults#NONE};
+         * {@link SamplingDefaults#forModel} gives the target's under an engine configuration).
+         */
+        public Builder samplingDefaults(SamplingDefaults v) {
+            this.samplingDefaults = Objects.requireNonNull(v, "samplingDefaults");
+            return this;
+        }
 
         public SpeculativeDecoder build() {
             return new SpeculativeDecoder(this);

@@ -1,7 +1,10 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 
 /**
  * Token sampling settings, applied in llama.cpp's default chain order (llama.cpp common/common.h
@@ -12,8 +15,19 @@ import java.util.Properties;
  * {@code repeatPenalty == 1}, {@code presencePenalty == 0}, {@code frequencyPenalty == 0},
  * {@code penaltyLastN == 0} (all penalties off). {@code penaltyLastN == -1} penalizes over the whole context.
  * Sampling is greedy when {@link #greedy()} is set or {@code temperature <= 0}.
+ *
+ * <p>Each {@link Setting} is either explicit (given by a property or a {@link Builder} setter) or a fallback (a
+ * default, or a {@link Builder} {@code fallback*} setter). A model's sampling defaults replace only fallbacks
+ * ({@link #withModelDefaults}), as llama.cpp applies {@code general.sampling.*} only to parameters the user did not set
+ * ({@code common_params_sampling::user_sampling_config}, common/common.cpp:1088-1147).
  */
 public final class SamplerConfig {
+
+    /** The settings a model's sampling defaults can supply. */
+    public enum Setting {
+        TEMPERATURE, TOP_K, TOP_P, MIN_P, TYPICAL_P, REPEAT_PENALTY, PENALTY_LAST_N, PRESENCE_PENALTY,
+        FREQUENCY_PENALTY
+    }
 
     /** Seed value meaning "draw a fresh random seed per generation". */
     public static final long RANDOM_SEED = -1L;
@@ -45,6 +59,7 @@ public final class SamplerConfig {
     private final int penaltyLastN;
     private final long seed;
     private final boolean greedy;
+    private final Set<Setting> explicit;
 
     private SamplerConfig(Builder b) {
         this.temperature = b.temperature;
@@ -58,6 +73,7 @@ public final class SamplerConfig {
         this.penaltyLastN = b.penaltyLastN;
         this.seed = b.seed;
         this.greedy = b.greedy;
+        this.explicit = Collections.unmodifiableSet(EnumSet.copyOf(b.explicit));
     }
 
     /** llama.cpp defaults: temperature 0.8, top-k 40, top-p 0.95, min-p 0.05, penalties off, last-n 64, random seed. */
@@ -75,26 +91,50 @@ public final class SamplerConfig {
     }
 
     /**
-     * Settings from a property set; absent keys keep the llama.cpp defaults.
+     * Settings from a property set; absent keys keep the llama.cpp defaults, and every present key makes its
+     * setting explicit.
      *
      * @throws IllegalArgumentException naming the property when a value cannot be parsed or is out of range
      */
     public static SamplerConfig fromProperties(Properties p) {
         Objects.requireNonNull(p, "properties");
-        Builder d = builder();
-        return builder()
-                .temperature(EngineConfig.floatProperty(p, PROP_TEMPERATURE, d.temperature))
-                .topK(EngineConfig.intProperty(p, PROP_TOP_K, d.topK))
-                .topP(EngineConfig.floatProperty(p, PROP_TOP_P, d.topP))
-                .minP(EngineConfig.floatProperty(p, PROP_MIN_P, d.minP))
-                .typicalP(EngineConfig.floatProperty(p, PROP_TYPICAL_P, d.typicalP))
-                .repeatPenalty(EngineConfig.floatProperty(p, PROP_REPEAT_PENALTY, d.repeatPenalty))
-                .presencePenalty(EngineConfig.floatProperty(p, PROP_PRESENCE_PENALTY, d.presencePenalty))
-                .frequencyPenalty(EngineConfig.floatProperty(p, PROP_FREQUENCY_PENALTY, d.frequencyPenalty))
-                .penaltyLastN(EngineConfig.intProperty(p, PROP_PENALTY_LAST_N, d.penaltyLastN))
-                .seed(EngineConfig.longProperty(p, PROP_SEED, d.seed))
-                .greedy(EngineConfig.booleanProperty(p, PROP_GREEDY, d.greedy))
+        Builder b = builder();
+        floatProperty(p, PROP_TEMPERATURE, b::temperature);
+        intProperty(p, PROP_TOP_K, b::topK);
+        floatProperty(p, PROP_TOP_P, b::topP);
+        floatProperty(p, PROP_MIN_P, b::minP);
+        floatProperty(p, PROP_TYPICAL_P, b::typicalP);
+        floatProperty(p, PROP_REPEAT_PENALTY, b::repeatPenalty);
+        floatProperty(p, PROP_PRESENCE_PENALTY, b::presencePenalty);
+        floatProperty(p, PROP_FREQUENCY_PENALTY, b::frequencyPenalty);
+        intProperty(p, PROP_PENALTY_LAST_N, b::penaltyLastN);
+        return b.seed(EngineConfig.longProperty(p, PROP_SEED, b.seed))
+                .greedy(EngineConfig.booleanProperty(p, PROP_GREEDY, b.greedy))
                 .build();
+    }
+
+    /** Receives a float property value. */
+    private interface FloatSetter {
+        void set(float v);
+    }
+
+    /** Receives an int property value. */
+    private interface IntSetter {
+        void set(int v);
+    }
+
+    /** Passes the value of {@code key} to {@code setter} when the property is set (non-blank). */
+    private static void floatProperty(Properties p, String key, FloatSetter setter) {
+        if (EngineConfig.stringProperty(p, key) != null) {
+            setter.set(EngineConfig.floatProperty(p, key, 0f));
+        }
+    }
+
+    /** Passes the value of {@code key} to {@code setter} when the property is set (non-blank). */
+    private static void intProperty(Properties p, String key, IntSetter setter) {
+        if (EngineConfig.stringProperty(p, key) != null) {
+            setter.set(EngineConfig.intProperty(p, key, 0));
+        }
     }
 
     public float temperature() { return temperature; }
@@ -112,6 +152,14 @@ public final class SamplerConfig {
     /** Whether greedy decoding was requested explicitly. */
     public boolean greedy() { return greedy; }
 
+    /** The settings given explicitly (unmodifiable); a model's sampling defaults never replace them. */
+    public Set<Setting> explicit() { return explicit; }
+
+    /** Whether {@code s} was given explicitly. */
+    public boolean isExplicit(Setting s) {
+        return explicit.contains(Objects.requireNonNull(s, "setting"));
+    }
+
     /** True when the chain reduces to argmax: {@link #greedy()} or a temperature {@code <= 0}. */
     public boolean isGreedy() {
         return greedy || temperature <= 0f;
@@ -128,15 +176,69 @@ public final class SamplerConfig {
         return seed != RANDOM_SEED;
     }
 
+    /** A builder holding these values, with the same settings explicit. */
     public Builder toBuilder() {
-        return builder().temperature(temperature).topK(topK).topP(topP).minP(minP).typicalP(typicalP)
-                .repeatPenalty(repeatPenalty).presencePenalty(presencePenalty).frequencyPenalty(frequencyPenalty)
-                .penaltyLastN(penaltyLastN).seed(seed).greedy(greedy);
+        Builder b = builder();
+        b.temperature = temperature;
+        b.topK = topK;
+        b.topP = topP;
+        b.minP = minP;
+        b.typicalP = typicalP;
+        b.repeatPenalty = repeatPenalty;
+        b.presencePenalty = presencePenalty;
+        b.frequencyPenalty = frequencyPenalty;
+        b.penaltyLastN = penaltyLastN;
+        b.seed = seed;
+        b.greedy = greedy;
+        b.explicit.addAll(explicit);
+        return b;
     }
 
     /** Copy with another seed. */
     public SamplerConfig withSeed(long newSeed) {
         return toBuilder().seed(newSeed).build();
+    }
+
+    /**
+     * Copy in which every setting that is not explicit takes the model's default when {@code defaults} has one; the
+     * taken values stay fallbacks. Returns this config when {@code defaults} is empty.
+     *
+     * @throws IllegalArgumentException when a taken value is out of range ({@link Builder#build()})
+     */
+    public SamplerConfig withModelDefaults(SamplingDefaults defaults) {
+        Objects.requireNonNull(defaults, "defaults");
+        if (defaults.isEmpty()) {
+            return this;
+        }
+        Builder b = toBuilder();
+        if (defaults.temp() != null && !explicit.contains(Setting.TEMPERATURE)) {
+            b.fallbackTemperature(defaults.temp());
+        }
+        if (defaults.topK() != null && !explicit.contains(Setting.TOP_K)) {
+            b.fallbackTopK(defaults.topK());
+        }
+        if (defaults.topP() != null && !explicit.contains(Setting.TOP_P)) {
+            b.fallbackTopP(defaults.topP());
+        }
+        if (defaults.minP() != null && !explicit.contains(Setting.MIN_P)) {
+            b.fallbackMinP(defaults.minP());
+        }
+        if (defaults.typicalP() != null && !explicit.contains(Setting.TYPICAL_P)) {
+            b.fallbackTypicalP(defaults.typicalP());
+        }
+        if (defaults.penaltyRepeat() != null && !explicit.contains(Setting.REPEAT_PENALTY)) {
+            b.fallbackRepeatPenalty(defaults.penaltyRepeat());
+        }
+        if (defaults.penaltyLastN() != null && !explicit.contains(Setting.PENALTY_LAST_N)) {
+            b.fallbackPenaltyLastN(defaults.penaltyLastN());
+        }
+        if (defaults.presencePenalty() != null && !explicit.contains(Setting.PRESENCE_PENALTY)) {
+            b.fallbackPresencePenalty(defaults.presencePenalty());
+        }
+        if (defaults.frequencyPenalty() != null && !explicit.contains(Setting.FREQUENCY_PENALTY)) {
+            b.fallbackFrequencyPenalty(defaults.frequencyPenalty());
+        }
+        return b.build();
     }
 
     @Override
@@ -147,6 +249,10 @@ public final class SamplerConfig {
                 + ", seed=" + (seeded() ? String.valueOf(seed) : "random") + '}';
     }
 
+    /**
+     * Each setter makes its setting explicit. Each {@code fallback*} setter sets the value and leaves the setting a
+     * fallback, which a model's sampling defaults replace ({@link SamplerConfig#withModelDefaults}).
+     */
     public static final class Builder {
         private float temperature = 0.8f;
         private int topK = 40;
@@ -159,21 +265,48 @@ public final class SamplerConfig {
         private int penaltyLastN = 64;
         private long seed = RANDOM_SEED;
         private boolean greedy;
+        private final EnumSet<Setting> explicit = EnumSet.noneOf(Setting.class);
 
         private Builder() {
         }
 
-        public Builder temperature(float v) { this.temperature = v; return this; }
-        public Builder topK(int v) { this.topK = v; return this; }
-        public Builder topP(float v) { this.topP = v; return this; }
-        public Builder minP(float v) { this.minP = v; return this; }
-        public Builder typicalP(float v) { this.typicalP = v; return this; }
-        public Builder repeatPenalty(float v) { this.repeatPenalty = v; return this; }
-        public Builder presencePenalty(float v) { this.presencePenalty = v; return this; }
-        public Builder frequencyPenalty(float v) { this.frequencyPenalty = v; return this; }
-        public Builder penaltyLastN(int v) { this.penaltyLastN = v; return this; }
+        public Builder temperature(float v) { this.temperature = v; return mark(Setting.TEMPERATURE); }
+        public Builder topK(int v) { this.topK = v; return mark(Setting.TOP_K); }
+        public Builder topP(float v) { this.topP = v; return mark(Setting.TOP_P); }
+        public Builder minP(float v) { this.minP = v; return mark(Setting.MIN_P); }
+        public Builder typicalP(float v) { this.typicalP = v; return mark(Setting.TYPICAL_P); }
+        public Builder repeatPenalty(float v) { this.repeatPenalty = v; return mark(Setting.REPEAT_PENALTY); }
+        public Builder presencePenalty(float v) { this.presencePenalty = v; return mark(Setting.PRESENCE_PENALTY); }
+        public Builder frequencyPenalty(float v) { this.frequencyPenalty = v; return mark(Setting.FREQUENCY_PENALTY); }
+        public Builder penaltyLastN(int v) { this.penaltyLastN = v; return mark(Setting.PENALTY_LAST_N); }
         public Builder seed(long v) { this.seed = v; return this; }
         public Builder greedy(boolean v) { this.greedy = v; return this; }
+
+        public Builder fallbackTemperature(float v) { this.temperature = v; return unmark(Setting.TEMPERATURE); }
+        public Builder fallbackTopK(int v) { this.topK = v; return unmark(Setting.TOP_K); }
+        public Builder fallbackTopP(float v) { this.topP = v; return unmark(Setting.TOP_P); }
+        public Builder fallbackMinP(float v) { this.minP = v; return unmark(Setting.MIN_P); }
+        public Builder fallbackTypicalP(float v) { this.typicalP = v; return unmark(Setting.TYPICAL_P); }
+        public Builder fallbackRepeatPenalty(float v) { this.repeatPenalty = v; return unmark(Setting.REPEAT_PENALTY); }
+        public Builder fallbackPresencePenalty(float v) {
+            this.presencePenalty = v;
+            return unmark(Setting.PRESENCE_PENALTY);
+        }
+        public Builder fallbackFrequencyPenalty(float v) {
+            this.frequencyPenalty = v;
+            return unmark(Setting.FREQUENCY_PENALTY);
+        }
+        public Builder fallbackPenaltyLastN(int v) { this.penaltyLastN = v; return unmark(Setting.PENALTY_LAST_N); }
+
+        private Builder mark(Setting s) {
+            explicit.add(s);
+            return this;
+        }
+
+        private Builder unmark(Setting s) {
+            explicit.remove(s);
+            return this;
+        }
 
         /** @throws IllegalArgumentException naming the setting when a value is out of range */
         public SamplerConfig build() {

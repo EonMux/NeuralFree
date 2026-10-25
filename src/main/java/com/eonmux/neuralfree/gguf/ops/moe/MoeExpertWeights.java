@@ -327,9 +327,9 @@ final class MoeExpertWeights {
             throw new UnsupportedOperationException(where(layer) + t.name() + " has type " + t.type()
                     + ", which has no expert matvec kernels");
         }
-        if (t.hasScale() || t.hadamard() != null) {
-            throw new IllegalStateException(where(layer) + t.name() + " carries a per-tensor scale or Hadamard"
-                    + " transform; expert tensors are scaled per expert by their {n_expert} scale vectors");
+        if (t.hasScale() || t.hadamard() != null || (t.inputTransform() != null && !t.inputTransform().isIdentity())) {
+            throw new IllegalStateException(where(layer) + t.name() + " carries a per-tensor scale, Hadamard or"
+                    + " input transform; expert tensors are scaled per expert by their {n_expert} scale vectors");
         }
         return t;
     }

@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot.QuantizedActivations;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.quant.InputTransform;
 
 import java.util.Arrays;
 import java.util.Objects;
@@ -17,7 +18,11 @@ import java.util.Objects;
  * Expert products of one MoE step grouped by expert, the CPU twin of {@code ggml_mul_mat_id}
  * (llama.cpp ggml/src/ggml-cpu/ggml-cpu.c:1554-1735):
  * <ol>
- *   <li>every distinct source row is transformed by the weight's PRISM input Hadamard (when it has one) and quantized
+ *   <li>every distinct source row is transformed by the weight's input transform ({@link InputTransform}) when it
+ *       has one, in the §AQ-1 order without its PERMUTE part (a 3-D expert tensor folds its input permutation
+ *       into the weights, TP-1): the HADAMARD rotation runs on the gathered rows once, and the ACT_QUANT
+ *       fake-quantization runs per source row, or, when each expert has its own {@code .input_scale}, per gathered
+ *       row with that expert's parameters; the rows are then quantized
  *       once into the weight type's {@code vec_dot_type} (the {@code from_float} pass, :1609-1644);</li>
  *   <li>the step's (token, slot) pairs are grouped by expert ({@link Groups}, the {@code matrix_row_counts} /
  *       {@code matrix_rows} pass, :1646-1661);</li>
@@ -126,6 +131,11 @@ public final class CpuExpertMatmul {
             return start[a + 1] - start[a];
         }
 
+        /** The group's pair count. */
+        public int pairs() {
+            return pairs;
+        }
+
         @Override
         public String toString() {
             return "Groups{pairs=" + pairs + ", experts=" + Arrays.toString(active) + '}';
@@ -158,6 +168,11 @@ public final class CpuExpertMatmul {
                     + " holds " + nExpert);
         }
         CpuMatVec.Transforms t = transforms.transformsOf(w3d);
+        InputTransform transform = t.transform();
+        if (transform.hasPerm()) {
+            throw new IllegalArgumentException("the input transform of " + w3d + " permutes its input; a 3-D expert"
+                    + " tensor folds its input permutation into the weights (TP-1)");
+        }
         if (t.experts() != 0 && t.experts() != nExpert) {
             throw new IllegalArgumentException("expert count " + nExpert + " contradicts the " + t.experts()
                     + " experts of " + w3d);
@@ -174,7 +189,58 @@ public final class CpuExpertMatmul {
             return;
         }
         CpuVecDot dot = CpuMatVec.vecDot(w3d.type());
-        QuantizedActivations[] acts = quantize(w3d.type(), t.input(), x, xOff, nSrc, cols);
+        HadamardSpec hadamard = transform.hadamard();
+        InputTransform.ActQuant actQuant = transform.actQuant();
+        // The HADAMARD rotation writes this call's scratch; the ACT_QUANT fake-quantization acts in place on it when
+        // every expert shares its parameters (once per source row), and per gathered row (once per pair, with the
+        // expert's .input_scale) when each expert has its own.
+        float[] scratch = null;
+        if (hadamard != null) {
+            scratch = new float[Math.multiplyExact(nSrc, cols)];
+            CpuHadamard.apply(hadamard, x, xOff, scratch, 0, nSrc, cols);
+        }
+        final QuantizedActivations[] rowActs;
+        final QuantizedActivations[] pairActs;
+        if (actQuant != null && actQuant.entries() > 1) {
+            QuantizedActivations[] acts = new QuantizedActivations[g.pairs];
+            int[] pairExpert = pairExperts(g);
+            final float[] buf = new float[Math.multiplyExact(g.pairs, cols)];
+            final float[] rotated = scratch != null ? scratch : x;
+            final int rotOff = scratch != null ? 0 : xOff;
+            final GGMLType wType = w3d.type();
+            final InputTransform.ActQuant q = actQuant;
+            final int[] expertsOfPair = pairExpert;
+            CpuParallel.parallelFor(g.pairs, 1, (from, to) -> {
+                for (int p = from; p < to; p++) {
+                    int bufOff = p * cols;
+                    System.arraycopy(rotated, rotOff + (p / pairsPerRow) * cols, buf, bufOff, cols);
+                    q.apply(buf, bufOff, 1, cols, expertsOfPair[p]);
+                    acts[p] = CpuActivationQuantizer.quantizeFor(wType, buf, bufOff, cols);
+                }
+            });
+            pairActs = acts;
+            rowActs = null;
+        } else {
+            if (actQuant != null) {
+                if (scratch == null) {
+                    scratch = new float[Math.multiplyExact(nSrc, cols)];
+                    for (int r = 0; r < nSrc; r++) {
+                        System.arraycopy(x, xOff + r * cols, scratch, r * cols, cols);
+                    }
+                }
+                actQuant.apply(scratch, 0, nSrc, cols, 0);
+            }
+            QuantizedActivations[] acts = new QuantizedActivations[nSrc];
+            final float[] s = scratch != null ? scratch : x;
+            final int so = scratch != null ? 0 : xOff;
+            CpuParallel.parallelFor(nSrc, 1, (from, to) -> {
+                for (int r = from; r < to; r++) {
+                    acts[r] = CpuActivationQuantizer.quantizeFor(w3d.type(), s, so + r * cols, cols);
+                }
+            });
+            rowActs = acts;
+            pairActs = null;
+        }
         int[] tileStart = tileStarts(g, perExpert);
         int nTiles = tileStart[g.active.length];
         int grain = (int) Math.max(1L, MIN_TASK_WORK / ((long) ROW_TILE * cols));
@@ -196,7 +262,8 @@ public final class CpuExpertMatmul {
                 for (int q = q0; q < q1; q++) {
                     int p = g.order[q];
                     int yBase = yOff + p * perExpert + r0;
-                    dot.dotRows(w3d, wRow, nr, acts[p / pairsPerRow], y, yBase);
+                    QuantizedActivations act = rowActs != null ? rowActs[p / pairsPerRow] : pairActs[p];
+                    dot.dotRows(w3d, wRow, nr, act, y, yBase);
                     if (t.hasScale()) {
                         for (int i = 0; i < nr; i++) {
                             y[yBase + i] *= s;
@@ -242,25 +309,16 @@ public final class CpuExpertMatmul {
         return lo;
     }
 
-    /** Rotates (when {@code hadamard} is set) and quantizes {@code nRows} contiguous rows of {@code cols} values. */
-    private static QuantizedActivations[] quantize(GGMLType type, HadamardSpec hadamard, float[] x, int xOff,
-                                                   int nRows, int cols) {
-        float[] src = x;
-        int srcOff = xOff;
-        if (hadamard != null) {
-            src = new float[Math.multiplyExact(nRows, cols)];
-            CpuHadamard.apply(hadamard, x, xOff, src, 0, nRows, cols);
-            srcOff = 0;
-        }
-        QuantizedActivations[] acts = new QuantizedActivations[nRows];
-        final float[] s = src;
-        final int so = srcOff;
-        CpuParallel.parallelFor(nRows, 1, (from, to) -> {
-            for (int r = from; r < to; r++) {
-                acts[r] = CpuActivationQuantizer.quantizeFor(type, s, so + r * cols, cols);
+    /** The expert of every pair: {@code pairExperts(g)[p]} is {@code g}'s expert slot of pair {@code p}. */
+    private static int[] pairExperts(Groups g) {
+        int[] expert = new int[g.pairs];
+        for (int a = 0; a < g.active.length; a++) {
+            int e = g.active[a];
+            for (int i = g.start[a]; i < g.start[a + 1]; i++) {
+                expert[g.order[i]] = e;
             }
-        });
-        return acts;
+        }
+        return expert;
     }
 
     private static int toInt(long v, CpuTensorRef w) {

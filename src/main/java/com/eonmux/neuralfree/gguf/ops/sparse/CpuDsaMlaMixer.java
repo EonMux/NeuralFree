@@ -337,13 +337,13 @@ public final class CpuDsaMlaMixer implements CpuMixer {
     // ------------------------------------------------------------------ bind helpers
 
     /**
-     * A per-head tensor without a PRISM transform or output scale (see {@code GpuDsaMlaMixer.perHead}), of a type the
-     * CPU vec-dot reads.
+     * A per-head tensor without an input transform (PRISM Hadamard, ACT_QUANT, PERMUTE) or output scale (see
+     * {@code GpuDsaMlaMixer.perHead}), of a type the CPU vec-dot reads.
      */
     private CpuTensorRef perHead(CpuTensorRef w) {
         CpuMatVec.Transforms t = matVec.transformsOf(w);
-        if (t.input() != null || t.hasScale()) {
-            throw new UnsupportedOperationException(layout.where + ": per-head tensor " + w + " carries a PRISM"
+        if (!t.transform().isIdentity() || t.hasScale()) {
+            throw new UnsupportedOperationException(layout.where + ": per-head tensor " + w + " carries an input"
                     + " transform or output scale, which the absorbed MLA products do not apply");
         }
         CpuMatVec.vecDot(w.type());

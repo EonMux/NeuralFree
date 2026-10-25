@@ -1,17 +1,19 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
+import java.util.Collections;
 import java.util.List;
 
 /**
  * llama.cpp {@code llama_vocab_pre_type} (src/llama-vocab.h:10-74): the 63 BPE pre-tokenizer
  * types with their {@code llm_tokenizer_bpe} regex sequence and byte-encoding flag
- * (src/llama-vocab.cpp:280-594). {@link #code()} is the llama.cpp enum value. CHATGLM3, LLAMA4 and
+ * (src/llama-vocab.cpp:280-594), plus the Hugging Face form of the sequences llama.cpp adapted
+ * ({@link #hfRegexes()}). {@link #code()} is the llama.cpp enum value. CHATGLM3, LLAMA4 and
  * PIXTRAL have no case in the llama.cpp constructor and therefore use the default sequence; no
  * {@code tokenizer.ggml.pre} name maps to them.
  */
 public enum PreTokenizerType {
     DEFAULT(0, PreTokenizerPatterns.DEFAULT, true),
-    LLAMA3(1, PreTokenizerPatterns.LLAMA3, true),
+    LLAMA3(1, PreTokenizerPatterns.LLAMA3, PreTokenizerPatterns.LLAMA3_HF, true),
     DEEPSEEK_LLM(2, PreTokenizerPatterns.DEEPSEEK_LLM, true),
     DEEPSEEK_CODER(3, PreTokenizerPatterns.DEEPSEEK_CODER, true),
     FALCON(4, PreTokenizerPatterns.FALCON, true),
@@ -20,8 +22,8 @@ public enum PreTokenizerType {
     GPT2(7, PreTokenizerPatterns.GPT2, true),
     REFACT(8, PreTokenizerPatterns.STARCODER, true),
     COMMAND_R(9, PreTokenizerPatterns.STARCODER, true),
-    STABLELM2(10, PreTokenizerPatterns.QWEN2, true),
-    QWEN2(11, PreTokenizerPatterns.QWEN2, true),
+    STABLELM2(10, PreTokenizerPatterns.QWEN2, PreTokenizerPatterns.QWEN2_HF, true),
+    QWEN2(11, PreTokenizerPatterns.QWEN2, PreTokenizerPatterns.QWEN2_HF, true),
     OLMO(12, PreTokenizerPatterns.GPT2, true),
     DBRX(13, PreTokenizerPatterns.LLAMA3, true),
     SMAUG(14, PreTokenizerPatterns.LLAMA3, true),
@@ -30,7 +32,7 @@ public enum PreTokenizerType {
     CHATGLM4(17, PreTokenizerPatterns.LLAMA3, true),
     VIKING(18, PreTokenizerPatterns.VIKING, true),
     JAIS(19, PreTokenizerPatterns.GPT2, true),
-    TEKKEN(20, PreTokenizerPatterns.TEKKEN, true),
+    TEKKEN(20, PreTokenizerPatterns.TEKKEN, PreTokenizerPatterns.TEKKEN_HF, true),
     SMOLLM(21, PreTokenizerPatterns.STARCODER, true),
     CODESHELL(22, PreTokenizerPatterns.STARCODER, true),
     BLOOM(23, PreTokenizerPatterns.PORO, true),
@@ -39,30 +41,30 @@ public enum PreTokenizerType {
     CHAMELEON(26, PreTokenizerPatterns.CHAMELEON, true),
     MINERVA(27, PreTokenizerPatterns.STARCODER, true),
     DEEPSEEK3_LLM(28, PreTokenizerPatterns.DEEPSEEK3_LLM, true),
-    GPT4O(29, PreTokenizerPatterns.GPT4O, true),
+    GPT4O(29, PreTokenizerPatterns.GPT4O, PreTokenizerPatterns.GPT4O_HF, true),
     SUPERBPE(30, PreTokenizerPatterns.SUPERBPE, true),
     TRILLION(31, PreTokenizerPatterns.GPT2, true),
-    BAILINGMOE(32, PreTokenizerPatterns.BAILINGMOE, true),
+    BAILINGMOE(32, PreTokenizerPatterns.BAILINGMOE, PreTokenizerPatterns.BAILINGMOE_HF, true),
     LLAMA4(33, PreTokenizerPatterns.DEFAULT, true),
     PIXTRAL(34, PreTokenizerPatterns.DEFAULT, true),
-    SEED_CODER(35, PreTokenizerPatterns.SEED_CODER, true),
-    HUNYUAN(36, PreTokenizerPatterns.QWEN2, true),
+    SEED_CODER(35, PreTokenizerPatterns.SEED_CODER, PreTokenizerPatterns.SEED_CODER_HF, true),
+    HUNYUAN(36, PreTokenizerPatterns.QWEN2, PreTokenizerPatterns.QWEN2_HF, true),
     KIMI_K2(37, PreTokenizerPatterns.KIMI_K2, true),
     HUNYUAN_DENSE(38, PreTokenizerPatterns.DEEPSEEK3_LLM, true),
-    GROK_2(39, PreTokenizerPatterns.QWEN2, true),
+    GROK_2(39, PreTokenizerPatterns.QWEN2, PreTokenizerPatterns.QWEN2_HF, true),
     GRANITE_DOCLING(40, PreTokenizerPatterns.GPT2, true),
-    MINIMAX_M2(41, PreTokenizerPatterns.GPT4O, true),
+    MINIMAX_M2(41, PreTokenizerPatterns.GPT4O, PreTokenizerPatterns.GPT4O_HF, true),
     AFMOE(42, PreTokenizerPatterns.AFMOE, true),
-    SOLAR_OPEN(43, PreTokenizerPatterns.QWEN2, true),
+    SOLAR_OPEN(43, PreTokenizerPatterns.QWEN2, PreTokenizerPatterns.QWEN2_HF, true),
     YOUTU(44, PreTokenizerPatterns.YOUTU, true),
-    EXAONE_MOE(45, PreTokenizerPatterns.EXAONE_MOE, true),
-    QWEN35(46, PreTokenizerPatterns.QWEN35, true),
-    TINY_AYA(47, PreTokenizerPatterns.TINY_AYA, true),
+    EXAONE_MOE(45, PreTokenizerPatterns.EXAONE_MOE, PreTokenizerPatterns.EXAONE_MOE_HF, true),
+    QWEN35(46, PreTokenizerPatterns.QWEN35, PreTokenizerPatterns.QWEN35_HF, true),
+    TINY_AYA(47, PreTokenizerPatterns.TINY_AYA, PreTokenizerPatterns.TINY_AYA_HF, true),
     JOYAI_LLM(48, PreTokenizerPatterns.DEEPSEEK3_LLM, true),
-    JAIS2(49, PreTokenizerPatterns.JAIS2, true),
+    JAIS2(49, PreTokenizerPatterns.JAIS2, PreTokenizerPatterns.JAIS2_HF, true),
     GEMMA4(50, PreTokenizerPatterns.NEWLINE_RUNS, false),
     SARVAM_MOE(51, PreTokenizerPatterns.NEWLINE_RUNS, false),
-    MINICPM5(52, PreTokenizerPatterns.MINICPM5, true),
+    MINICPM5(52, PreTokenizerPatterns.MINICPM5, PreTokenizerPatterns.MINICPM5_HF, true),
     WHITESPACE(53, PreTokenizerPatterns.WHITESPACE, false),
     GRANITE_EMB_MULTI(54, PreTokenizerPatterns.GPT4O, true),
     MELLUM2(55, PreTokenizerPatterns.STARCODER, true),
@@ -76,11 +78,17 @@ public enum PreTokenizerType {
 
     private final int code;
     private final List<String> regexes;
+    private final List<String> hfRegexes;
     private final boolean byteEncode;
 
     PreTokenizerType(int code, List<String> regexes, boolean byteEncode) {
+        this(code, regexes, Collections.emptyList(), byteEncode);
+    }
+
+    PreTokenizerType(int code, List<String> regexes, List<String> hfRegexes, boolean byteEncode) {
         this.code = code;
         this.regexes = regexes;
+        this.hfRegexes = hfRegexes;
         this.byteEncode = byteEncode;
     }
 
@@ -89,6 +97,14 @@ public enum PreTokenizerType {
 
     /** The ordered {@code regex_exprs}, as llama.cpp writes them. */
     public List<String> regexes() { return regexes; }
+
+    /**
+     * The same sequence as the Hugging Face tokenizer.json writes it, for the types whose
+     * {@link #regexes()} llama.cpp adapted only in regex dialect (its "original regex from
+     * tokenizer.json" comments); empty for every other type. These strings are
+     * {@link PreTokenizerSpec.Dialect#ONIGURUMA} text.
+     */
+    public List<String> hfRegexes() { return hfRegexes; }
 
     /** GPT-2 byte encoding of the split words; false for SPM-style BPE on raw UTF-8. */
     public boolean byteEncode() { return byteEncode; }

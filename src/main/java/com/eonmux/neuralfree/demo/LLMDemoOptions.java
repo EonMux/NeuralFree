@@ -1,12 +1,18 @@
 package com.eonmux.neuralfree.demo;
 
+import com.eonmux.neuralfree.gguf.GgufWriter;
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.engine.DiffusionConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
+import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
 
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -16,9 +22,14 @@ import java.util.Locale;
  * Command-line options of {@link LLMDemo}: parsing, validation, the usage text and the engine, sampler and diffusion
  * configurations they select. Engine and sampler settings start from the {@code -Dneuralfree.*} system properties
  * ({@link EngineConfig#fromSystemProperties()}, whose sampler defaults are {@link SamplerConfig#fromProperties});
- * the demo's own sampling defaults ({@link #DEFAULT_TEMPERATURE} and the others) apply only where no property is
- * set, and flags override both. Flag names follow llama.cpp where it has an equivalent ({@code common/arg.cpp});
- * no short alias is given a meaning that differs from llama.cpp's. Immutable.
+ * the demo's own sampling defaults ({@link #DEFAULT_TEMPERATURE} and the others, and {@link #DEFAULT_MAX_TOKENS})
+ * apply only where no property is set, and flags override both. The demo's defaults are fallbacks: a model's
+ * sampling defaults ({@code general.sampling.*}, {@code neuralfree.sampling.*}) replace them, never a property or a
+ * flag ({@link EngineConfig#modelSamplingDefaults()}). Flag names follow llama.cpp where it has an equivalent
+ * ({@code common/arg.cpp}); no short alias is given a meaning that differs from llama.cpp's. The Hugging Face
+ * checkpoint flags set the matching {@link ModelSourceOptions} or {@link EngineConfig} fields on the builders, on
+ * top of the {@code -Dneuralfree.*} property defaults, and {@code --export-gguf} exports the model's GGUF view
+ * ({@link GgufWriter}) instead of generating. Immutable.
  */
 final class LLMDemoOptions {
 
@@ -105,6 +116,10 @@ final class LLMDemoOptions {
     /** The request of every autoregressive generation: token budget, sampler, stop strings and ignore-eos. */
     final GenerationRequest generation;
     final DiffusionConfig diffusion;
+    /** The {@code --export-gguf} output file, or null for no export. */
+    final String exportGguf;
+    final GgufWriter.Mode exportMode;
+    final boolean exportOverwrite;
 
     private LLMDemoOptions(Parser p) {
         this.modelPath = p.modelPath;
@@ -132,6 +147,9 @@ final class LLMDemoOptions {
         this.ubatchExplicit = p.ubatchExplicit;
         this.generation = p.generation;
         this.diffusion = p.diffusion;
+        this.exportGguf = p.exportGguf;
+        this.exportMode = p.exportMode;
+        this.exportOverwrite = p.exportOverwrite;
     }
 
     /**
@@ -173,6 +191,7 @@ final class LLMDemoOptions {
         boolean nonInteractive;
         Mode mode = Mode.AUTO;
         int maxTokens = DEFAULT_MAX_TOKENS;
+        boolean maxTokensSet;
         boolean showAllChannels = true;
         boolean benchmark;
         boolean benchStreaming;
@@ -191,12 +210,16 @@ final class LLMDemoOptions {
         boolean ignoreEos;
         GenerationRequest generation;
         DiffusionConfig diffusion;
+        String exportGguf;
+        GgufWriter.Mode exportMode = GgufWriter.Mode.NATIVE;
+        boolean exportOverwrite;
 
         private final EngineConfig.Builder eb;
         private final MemoryConfig.Builder mb;
         private final SamplerConfig.Builder sb;
         private final DiffusionConfig.Builder db = DiffusionConfig.builder();
         private final List<EngineConfig.LoraSpec> loras = new ArrayList<>();
+        private final ModelSourceOptions.Builder hb;
         private boolean diffusionEps;
         private boolean diffusionBlock;
 
@@ -214,32 +237,34 @@ final class LLMDemoOptions {
             this.ubatchExplicit = System.getProperty(MemoryConfig.PROP_UBATCH) != null;
             this.sb = samplerBase(base.samplerDefaults());
             diffusionBase(base.samplerDefaults());
+            this.hb = base.sourceOptions().toBuilder();
         }
 
         /**
-         * The property sampler with the demo defaults in place of every setting no property gives (temperature,
-         * top-k, top-p, min-p, repeat penalty and window); typical-p, presence and frequency penalties, the seed
-         * and greedy keep their property or llama.cpp default values.
+         * The property sampler with the demo defaults, as fallbacks, in place of every setting no property gives
+         * (temperature, top-k, top-p, min-p, repeat penalty and window); typical-p, presence and frequency
+         * penalties, the seed and greedy keep their property or llama.cpp default values. Property values stay
+         * explicit, and flags make their settings explicit.
          */
         private static SamplerConfig.Builder samplerBase(SamplerConfig fromProperties) {
             SamplerConfig.Builder b = fromProperties.toBuilder();
-            if (!propertySet(SamplerConfig.PROP_TEMPERATURE)) {
-                b.temperature(DEFAULT_TEMPERATURE);
+            if (!fromProperties.isExplicit(SamplerConfig.Setting.TEMPERATURE)) {
+                b.fallbackTemperature(DEFAULT_TEMPERATURE);
             }
-            if (!propertySet(SamplerConfig.PROP_TOP_K)) {
-                b.topK(DEFAULT_TOP_K);
+            if (!fromProperties.isExplicit(SamplerConfig.Setting.TOP_K)) {
+                b.fallbackTopK(DEFAULT_TOP_K);
             }
-            if (!propertySet(SamplerConfig.PROP_TOP_P)) {
-                b.topP(DEFAULT_TOP_P);
+            if (!fromProperties.isExplicit(SamplerConfig.Setting.TOP_P)) {
+                b.fallbackTopP(DEFAULT_TOP_P);
             }
-            if (!propertySet(SamplerConfig.PROP_MIN_P)) {
-                b.minP(DEFAULT_MIN_P);
+            if (!fromProperties.isExplicit(SamplerConfig.Setting.MIN_P)) {
+                b.fallbackMinP(DEFAULT_MIN_P);
             }
-            if (!propertySet(SamplerConfig.PROP_REPEAT_PENALTY)) {
-                b.repeatPenalty(DEFAULT_REPEAT_PENALTY);
+            if (!fromProperties.isExplicit(SamplerConfig.Setting.REPEAT_PENALTY)) {
+                b.fallbackRepeatPenalty(DEFAULT_REPEAT_PENALTY);
             }
-            if (!propertySet(SamplerConfig.PROP_PENALTY_LAST_N)) {
-                b.penaltyLastN(DEFAULT_REPEAT_WINDOW);
+            if (!fromProperties.isExplicit(SamplerConfig.Setting.PENALTY_LAST_N)) {
+                b.fallbackPenaltyLastN(DEFAULT_REPEAT_WINDOW);
             }
             return b;
         }
@@ -287,7 +312,7 @@ final class LLMDemoOptions {
                     continue;
                 }
                 if (!general(a) && !backend(a) && !memory(a) && !sampling(a) && !speculative(a) && !diffusion(a)
-                        && !heads(a)) {
+                        && !heads(a) && !huggingFace(a) && !exporting(a)) {
                     throw new UsageException("unknown option " + a + " (see --help)");
                 }
             }
@@ -304,6 +329,7 @@ final class LLMDemoOptions {
                     if (maxTokens == 0) {
                         throw new UsageException(a + " must be positive, or -1 for no limit");
                     }
+                    maxTokensSet = true;
                     return true;
                 case "--mode": mode = Mode.parse(value(a)); return true;
                 case "--embed": mode = Mode.EMBED; return true;
@@ -475,6 +501,79 @@ final class LLMDemoOptions {
             }
         }
 
+        /**
+         * The Hugging Face checkpoint flags: each sets the matching {@link ModelSourceOptions} or
+         * {@link EngineConfig} field on its builder, on top of the {@code -Dneuralfree.*} property base.
+         */
+        private boolean huggingFace(String a) throws UsageException {
+            switch (a) {
+                case "--hf-materialize":
+                    try {
+                        hb.materialize(ModelSourceOptions.Materialize.parse(value(a)));
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                case "--hf-memory-max": hb.memoryBudget(sizeValue(a)); return true;
+                case "--hf-cache-dir": hb.cacheDir(pathValue(a)); return true;
+                case "--hf-outtype":
+                    try {
+                        hb.outType(ModelSourceOptions.OutType.parse(value(a)));
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                case "--quant-online":
+                    try {
+                        hb.onlineQuant(ModelSourceOptions.OnlineQuant.parse(value(a)));
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                case "--hf-quant-exact": hb.exactQuant(true); return true;
+                case "--hf-no-mtp": hb.includeMtp(false); return true;
+                case "--hf-st-dense": hb.stDenseModules(boolValue(a)); return true;
+                case "--hf-overrides":
+                    try {
+                        hb.configOverridesJson(value(a));
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                case "--hf-tokenizer": hb.tokenizerDir(pathValue(a)); return true;
+                case "--lora-base-config": hb.loraBaseConfig(pathValue(a)); return true;
+                case "--hf-base-dir": hb.baseDir(pathValue(a)); return true;
+                case "--act-quant":
+                    try {
+                        eb.activationQuant(ActivationQuant.parse(value(a)));
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                case "--model-sampling-defaults": eb.modelSamplingDefaults(boolValue(a)); return true;
+                default: return false;
+            }
+        }
+
+        /** The {@code --export-gguf} flags; LLMDemo writes the export and exits instead of generating. */
+        private boolean exporting(String a) throws UsageException {
+            switch (a) {
+                case "--export-gguf": exportGguf = value(a); return true;
+                case "--export-mode": {
+                    String v = value(a).trim().toUpperCase(Locale.ROOT).replace('-', '_');
+                    for (GgufWriter.Mode m : GgufWriter.Mode.values()) {
+                        if (m.name().equals(v)) {
+                            exportMode = m;
+                            return true;
+                        }
+                    }
+                    throw new UsageException(a + " is invalid; use native, compat or compat-exact");
+                }
+                case "--export-overwrite": exportOverwrite = true; return true;
+                default: return false;
+            }
+        }
+
         private boolean heads(String a) throws UsageException {
             switch (a) {
                 case "--embed-preview": embedPreview = intValue(a, 0, Integer.MAX_VALUE); return true;
@@ -554,9 +653,14 @@ final class LLMDemoOptions {
                 throw new UsageException("--benchmark and --bench-streaming exclude each other");
             }
             try {
-                this.engine = eb.memory(mb.build()).loras(loras).build();
-                this.generation = GenerationRequest.builder().maxNewTokens(maxTokens).sampler(sb.build())
-                        .stopStrings(stopStrings).ignoreEos(ignoreEos).build();
+                this.engine = eb.memory(mb.build()).sourceOptions(hb.build()).loras(loras).build();
+                GenerationRequest.Builder gb = GenerationRequest.builder();
+                if (maxTokensSet) {
+                    gb.maxNewTokens(maxTokens);
+                } else {
+                    gb.fallbackMaxNewTokens(maxTokens);
+                }
+                this.generation = gb.sampler(sb.build()).stopStrings(stopStrings).ignoreEos(ignoreEos).build();
                 this.diffusion = db.build();
             } catch (IllegalArgumentException e) {
                 throw new UsageException(e.getMessage());
@@ -647,6 +751,59 @@ final class LLMDemoOptions {
             }
         }
 
+        /** A {@code true|false} value; anything else is rejected naming the flag. */
+        private boolean boolValue(String flag) throws UsageException {
+            String v = value(flag).trim().toLowerCase(Locale.ROOT);
+            if (v.equals("true")) {
+                return true;
+            }
+            if (v.equals("false")) {
+                return false;
+            }
+            throw new UsageException(flag + " " + v + " is not a boolean; use true or false");
+        }
+
+        /**
+         * A byte count {@code <n>[K|M|G]} (the {@code neuralfree.hf.materialize.memory.max} form); negative and
+         * overflowing values are rejected naming the flag.
+         */
+        private long sizeValue(String flag) throws UsageException {
+            String v = value(flag);
+            String s = v.trim();
+            long unit = 1L;
+            if (!s.isEmpty()) {
+                char last = Character.toUpperCase(s.charAt(s.length() - 1));
+                int shift = last == 'K' ? 10 : last == 'M' ? 20 : last == 'G' ? 30 : 0;
+                if (shift != 0) {
+                    unit = 1L << shift;
+                    s = s.substring(0, s.length() - 1).trim();
+                }
+            }
+            long n;
+            try {
+                n = Long.parseLong(s);
+            } catch (NumberFormatException e) {
+                throw new UsageException(flag + " " + v + " is not a size; use <n>[K|M|G]");
+            }
+            if (n < 0) {
+                throw new UsageException(flag + " " + v + " must not be negative");
+            }
+            try {
+                return Math.multiplyExact(n, unit);
+            } catch (ArithmeticException e) {
+                throw new UsageException(flag + " " + v + " overflows a 64-bit byte count");
+            }
+        }
+
+        /** A path value; malformed paths are rejected naming the flag. */
+        private Path pathValue(String flag) throws UsageException {
+            try {
+                return Paths.get(value(flag).trim());
+            } catch (InvalidPathException e) {
+                throw new UsageException(flag + " is not a valid path: " + e.getReason());
+            }
+        }
+
         private MemoryConfig.MlaCacheMode mlaCache(String flag) throws UsageException {
             String v = value(flag).trim().toUpperCase(Locale.ROOT);
             for (MemoryConfig.MlaCacheMode m : MemoryConfig.MlaCacheMode.values()) {
@@ -671,7 +828,8 @@ final class LLMDemoOptions {
                 "  --system <text>              System prompt (default: '" + DEFAULT_SYSTEM_PROMPT + "')",
                 "  --raw                        Use the prompt verbatim (no chat template)",
                 "  --thinking                   Enable the chat template's thinking mode",
-                "  --max-tokens, -n <n>         Max new tokens, -1 = until EOS (default: " + DEFAULT_MAX_TOKENS + ")",
+                "  --max-tokens, -n <n>         Max new tokens, -1 = until EOS (default: the model's, else "
+                        + DEFAULT_MAX_TOKENS + ")",
                 "  --non-interactive            Without --prompt, read the prompt from standard input",
                 "  --mode <m>                   generate | embed | classify | rerank | diffusion | audio",
                 "                               (default: from the model's head: decision -> classify, rank ->",
@@ -700,7 +858,29 @@ final class LLMDemoOptions {
                 "  --context-shift              Drop old positions when the context is full",
                 "  --no-kv-rotation             Store quantized KV rows without rotation",
                 "",
-                "Sampling (defaults apply where no -Dneuralfree.* sampler property is set):",
+                "Hugging Face checkpoints (model directories and .safetensors files; GGUF files ignore these):",
+                "  --hf-materialize <m>         Where derived tensors live (default auto): auto | memory | disk |",
+                "                               none",
+                "  --hf-memory-max <n[K|M|G]>   Direct memory auto materialization may use (default 2G)",
+                "  --hf-cache-dir <dir>         Parent of the per-process directories of derived tensors written",
+                "                               to disk (default ~/.cache/neuralfree/hf)",
+                "  --hf-outtype <t>             Type of the view's float tensors (default source): source | auto |",
+                "                               f32 | f16 | bf16 | q8_0",
+                "  --quant-online <t>           Online quantization of float matmul weights (default none): none |",
+                "                               q8_0 | q4_0 | q4_1 | q5_0 | q5_1 | iq4_nl",
+                "  --hf-quant-exact             Prefer bit-exact weight types over close repacks",
+                "  --hf-no-mtp                  Drop MTP / NextN layers",
+                "  --hf-st-dense <b>            Include sentence-transformers dense heads (default true)",
+                "  --hf-overrides <json>        JSON object merged into config.json before conversion",
+                "  --hf-tokenizer <dir|gguf>    Tokenizer directory or GGUF file replacing the model's",
+                "  --act-quant <m>              Activation quantization (default weight-only): weight-only carries",
+                "                               inputs in full precision; checkpoint applies the checkpoint's",
+                "                               scheme before its weight kernels",
+                "  --model-sampling-defaults <b> Apply the model's sampling defaults (default true)",
+                "  --lora-base-config <dir>     Hugging Face configuration of a LoRA adapter's GGUF base",
+                "  --hf-base-dir <dir>          Local base model a decision-LoRA checkpoint merges at load",
+                "",
+                "Sampling (defaults apply where neither a -Dneuralfree.* sampler property nor the model sets one):",
                 "  --temp <f>                   Temperature, 0 = greedy (default " + DEFAULT_TEMPERATURE + ")",
                 "  --top-k <n>                  Top-k, 0 = off (default " + DEFAULT_TOP_K + ")",
                 "  --top-p <f>                  Top-p (default " + DEFAULT_TOP_P + ")",
@@ -731,6 +911,12 @@ final class LLMDemoOptions {
                 "LoRA adapters (repeatable):",
                 "  --lora <gguf>[:scale][,...]  Apply adapters (scale 1 unless given)",
                 "  --lora-scaled <gguf>:<scale>[,...] | --lora-scaled <gguf> <scale>",
+                "",
+                "GGUF export (--export-gguf writes the file, then exits without generating):",
+                "  --export-gguf <out.gguf>     Export the model's GGUF view to <out.gguf>",
+                "  --export-mode <m>            native (extension tensors kept, default) | compat (llama.cpp",
+                "                               types, some rows loose) | compat-exact (lossy rows become F32)",
+                "  --export-overwrite           Replace an existing output file",
                 "",
                 "Diffusion (--mode diffusion):",
                 "  --diffusion-steps <n>        Denoising steps (default 128)",

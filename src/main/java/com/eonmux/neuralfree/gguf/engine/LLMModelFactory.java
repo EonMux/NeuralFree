@@ -1,11 +1,14 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.GGUFModel;
 import com.eonmux.neuralfree.gguf.GGUFModelGPU;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
+import com.eonmux.neuralfree.gguf.ModelSource;
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
+import com.eonmux.neuralfree.gguf.ModelSources;
+import com.eonmux.neuralfree.gguf.StoreUse;
 import com.eonmux.neuralfree.gguf.WeightStore;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.MemoryKind;
@@ -15,7 +18,6 @@ import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeightUploader;
 import com.eonmux.neuralfree.gguf.gpu.weights.WeightPlacement;
-import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
 import com.eonmux.neuralfree.gguf.memory.ContextFitter;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
@@ -28,18 +30,18 @@ import com.eonmux.neuralfree.gguf.ops.flow.MtpHead;
 import com.eonmux.neuralfree.gguf.ops.flow.WeightKernelPrewarm;
 import com.eonmux.neuralfree.gguf.ops.flow.dflash.DflashDrafter;
 import com.eonmux.neuralfree.gguf.ops.flow.dflash.DflashSpec;
-import com.eonmux.neuralfree.gguf.quant.PrismHadamardLoader;
+import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
+import com.eonmux.neuralfree.gguf.quant.InputTransformLoader;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.ScratchWidths;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
-import com.eonmux.neuralfree.gguf.spec.TensorRef;
 import com.eonmux.neuralfree.gguf.spec.resolve.ModelSpecBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -47,7 +49,8 @@ import java.util.Objects;
 import java.util.function.Predicate;
 
 /**
- * Opens GGUF models on the configured compute backend and binds speculative drafters to them.
+ * Opens models on the configured compute backend and binds speculative drafters to them. Model, draft and adapter
+ * files are opened through {@link ModelSources} with the configuration's {@link EngineConfig#sourceOptions()}.
  *
  * <p><b>Backend.</b> With a GPU backend mode ({@link EngineConfig#backend()} other than CPU) the model loads with
  * {@link GGUFModelGPU}, either on a caller-owned backend or on one it creates and owns:
@@ -61,7 +64,8 @@ import java.util.function.Predicate;
  * <p><b>Speculative decoding.</b> {@link #openSpeculative} and {@link #speculate} bind exactly one drafter to a
  * target: the target's own NextN head with {@link EngineConfig#mtp()}, or the drafter of the draft file
  * ({@link #draftRoute}). With {@link EngineConfig.DraftType#AUTO} the drafter is chosen from the file as llama.cpp
- * chooses the speculative type of a draft GGUF when none is given (common/arg.cpp:566-572,
+ * chooses the speculative type of a draft model file or Hugging Face directory when none is given
+ * (common/arg.cpp:566-572,
  * common/speculative.cpp:2398-2433), except that a file with NextN blocks that is not an MTP draft of the target's
  * model ({@link ModelSpecBuilder#isMtpDraftOf}) drafts as a separate draft model; {@code DraftType.MTP}
  * ({@code draft-mtp}) and {@code DraftType.MODEL} ({@code draft-simple}) force one route, as llama.cpp's
@@ -108,7 +112,7 @@ public final class LLMModelFactory {
     /**
      * Opens a model on the backend {@code cfg} selects, falling back to the CPU when the GPU load fails.
      *
-     * @throws FileNotFoundException when {@code path} is not a readable file
+     * @throws FileNotFoundException when {@code path} is not a readable file or directory
      * @throws IOException           when the file cannot be read
      * @throws RuntimeException      when the CPU load fails too (the GPU failure is suppressed in it), or when
      *                               {@code cfg} selects the CPU and the CPU load fails
@@ -123,13 +127,13 @@ public final class LLMModelFactory {
      * no effect on a backend the caller created. A configured draft file is read first to size the compressor
      * rollback snapshots its drafter needs ({@link MemoryConfig#rollbackSnapshots()}).
      *
-     * @throws FileNotFoundException when {@code path} is not a readable file
+     * @throws FileNotFoundException when {@code path} is not a readable file or directory
      * @throws IOException           when the file cannot be read
      */
     public static EngineModel open(String path, EngineConfig cfg, ComputeBackend sharedBackend) throws IOException {
         Objects.requireNonNull(path, "path");
         Objects.requireNonNull(cfg, "cfg");
-        requireReadable(path);
+        ModelSources.requireOpenable(path);
         EngineConfig c = withDraftRollback(path, cfg);
         if (sharedBackend == null && !c.backend().usesGpu()) {
             return new GGUFModel(path, c);
@@ -165,15 +169,18 @@ public final class LLMModelFactory {
             return cfg;
         }
         DraftRoute route = null;
+        Path target = Paths.get(targetPath);
         try {
-            requireReadable(draftPath);
-            GGUFFileParser dp = new GGUFFileParser(draftPath);
+            ModelSources.requireOpenable(draftPath);
+            ModelSource dp = ModelSources.open(draftPath, cfg.sourceOptions(), target, cfg.activationQuant());
             try {
                 Arch arch = draftArch(dp, draftPath);
                 GgufKv kv = GgufKv.of(dp);
                 TensorCatalog tc = TensorCatalog.of(dp);
-                ModelSpec target = ModelSpecBuilder.isNextnDraft(kv, tc) ? inspect(targetPath, cfg.memory()) : null;
-                route = draftRoute(arch, kv, tc, target, cfg.draftType(), draftPath);
+                route = draftRoute(arch, kv, tc,
+                        ModelSpecBuilder.isNextnDraft(kv, tc)
+                                ? inspect(targetPath, cfg.memory(), cfg.sourceOptions()) : null,
+                        cfg.draftType(), draftPath);
             } finally {
                 dp.close();
             }
@@ -206,12 +213,6 @@ public final class LLMModelFactory {
         }
     }
 
-    private static void requireReadable(String path) throws FileNotFoundException {
-        if (!Files.isRegularFile(Paths.get(path)) || !Files.isReadable(Paths.get(path))) {
-            throw new FileNotFoundException("model file not found or not readable: " + path);
-        }
-    }
-
     /** The exception's class and message, with the root cause when it differs. */
     static String describe(Throwable t) {
         StringBuilder sb = new StringBuilder(t.getClass().getSimpleName());
@@ -233,17 +234,30 @@ public final class LLMModelFactory {
     }
 
     /**
-     * The resolved specification of a GGUF file from its metadata and tensor shapes, without loading tensor data;
-     * lets callers choose settings by architecture and support class before {@link #open}.
+     * The resolved specification of a model from its metadata and tensor shapes, without loading tensor data; lets
+     * callers choose settings by architecture and support class before {@link #open}. Checkpoints that are not GGUF
+     * are opened with the source options of the system properties ({@link ModelSourceOptions#fromSystemProperties()}).
      *
-     * @throws FileNotFoundException when {@code path} is not a readable file
+     * @throws FileNotFoundException when {@code path} is not a readable file or directory
      * @throws RuntimeException      when the architecture cannot be resolved
      */
     public static ModelSpec inspect(String path, MemoryConfig memory) throws IOException {
+        return inspect(path, memory, ModelSourceOptions.fromSystemProperties());
+    }
+
+    /**
+     * The resolved specification of a model from its metadata and tensor shapes, without loading tensor data, opened
+     * with {@code options}.
+     *
+     * @throws FileNotFoundException when {@code path} is not a readable file or directory
+     * @throws RuntimeException      when the architecture cannot be resolved
+     */
+    public static ModelSpec inspect(String path, MemoryConfig memory, ModelSourceOptions options) throws IOException {
         Objects.requireNonNull(path, "path");
         Objects.requireNonNull(memory, "memory");
-        requireReadable(path);
-        GGUFFileParser p = new GGUFFileParser(path);
+        Objects.requireNonNull(options, "options");
+        ModelSources.requireOpenable(path);
+        ModelSource p = ModelSources.open(path, options);
         try {
             return ModelSpecBuilder.build(GgufKv.of(p), TensorCatalog.of(p), memory);
         } finally {
@@ -312,9 +326,11 @@ public final class LLMModelFactory {
 
     /**
      * Opens {@code targetPath} with {@link #open(String, EngineConfig)} and binds the drafter of {@code draftPath}
-     * to it; the session owns and closes the target.
+     * to it; the session owns and closes the target. Its generations apply the target's sampling defaults unless
+     * {@code cfg} turns them off ({@link SamplingDefaults#forModel}).
      *
-     * @param draftPath the draft GGUF, or null to use {@code cfg}'s draft model path or its MTP setting
+     * @param draftPath the draft model file or Hugging Face directory, or null to use {@code cfg}'s draft model
+     *                  path or its MTP setting
      * @throws IllegalArgumentException      when no drafter is configured, both a draft file and MTP are, or the
      *                                       drafter is incompatible with the target
      * @throws UnsupportedOperationException when the target cannot be speculated on or the draft architecture has no
@@ -329,7 +345,7 @@ public final class LLMModelFactory {
         requireOneDrafter(c);
         EngineModel target = open(targetPath, c);
         try {
-            return attach(target, c, true);
+            return attach(target, Paths.get(targetPath), c, true);
         } catch (IOException | RuntimeException | Error e) {
             try {
                 target.close();
@@ -343,7 +359,8 @@ public final class LLMModelFactory {
     /**
      * Binds the drafter {@code cfg} configures ({@link EngineConfig#draftModelPath()} or {@link EngineConfig#mtp()})
      * to an open target; the target stays owned by the caller and must not run forward passes outside the session
-     * until the session is closed.
+     * until the session is closed. Its generations apply the target's sampling defaults unless {@code cfg} turns
+     * them off ({@link SamplingDefaults#forModel}).
      *
      * @throws IllegalArgumentException      when no drafter is configured, both a draft file and MTP are, or the
      *                                       drafter is incompatible with the target
@@ -355,7 +372,7 @@ public final class LLMModelFactory {
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(cfg, "cfg");
         requireOneDrafter(cfg);
-        return attach(target, cfg, false);
+        return attach(target, null, cfg, false);
     }
 
     private static void requireOneDrafter(EngineConfig cfg) {
@@ -369,25 +386,27 @@ public final class LLMModelFactory {
         }
     }
 
-    private static SpeculativeSession attach(EngineModel target, EngineConfig cfg, boolean ownsTarget)
-            throws IOException {
+    private static SpeculativeSession attach(EngineModel target, Path targetPath, EngineConfig cfg,
+                                             boolean ownsTarget) throws IOException {
         requireSpeculatable(target);
         ForwardBackend fb = target.forwardBackend();
         HiddenTapSlot.Lease lease = HiddenTapSlot.acquire(fb, "a speculative drafter");
         List<AutoCloseable> resources = new ArrayList<>();
         Drafter built = null;
         try {
-            built = cfg.mtp() ? nextn(target, cfg) : fromFile(target, cfg, resources);
+            built = cfg.mtp() ? nextn(target, cfg) : fromFile(target, targetPath, cfg, resources);
             final DraftModel drafter = built.drafter;
             int draftMax = Math.min(cfg.draftMax(), built.maxDraft);
             int draftMin = Math.min(cfg.draftMin(), draftMax);
             GGUFTokenizer tok = target.tokenizer();
             ReasoningFilter rf = ReasoningFilter.forChatTemplate(tok.chatTemplate()).withTagTokens(tok::getTokenId);
+            SamplingDefaults defaults = SamplingDefaults.forModel(target, cfg);
             SpeculativeSession session = new SpeculativeSession(target, ownsTarget, drafter, built.kind, resources,
                     lease, sink -> SpeculativeDecoder.builder(fb, drafter, tok)
                             .reasoning(rf)
                             .draftMax(draftMax)
                             .draftMin(draftMin)
+                            .samplingDefaults(defaults)
                             .statsSink(sink)
                             .build());
             LOGGER.info("speculative decoding on {}: {} drafter, draft max {} (requested {}), min {}, p_min {}",
@@ -473,13 +492,17 @@ public final class LLMModelFactory {
         return blocks > 1 ? blocks : Integer.MAX_VALUE;
     }
 
-    /** The drafter of {@code cfg.draftModelPath()}; resources the drafter does not own are appended to {@code out}. */
-    private static Drafter fromFile(EngineModel target, EngineConfig cfg, List<AutoCloseable> out)
+    /**
+     * The drafter of {@code cfg.draftModelPath()}, opened with the target {@code targetPath} the draft serves (null
+     * when the target model was opened elsewhere and carries no path, so a Hugging Face draft of a drafter
+     * architecture cannot name its target); resources the drafter does not own are appended to {@code out}.
+     */
+    private static Drafter fromFile(EngineModel target, Path targetPath, EngineConfig cfg, List<AutoCloseable> out)
             throws IOException {
         String path = cfg.draftModelPath();
-        requireReadable(path);
+        ModelSources.requireOpenable(path);
         MemoryConfig draftMemory = draftMemory(target, cfg);
-        GGUFFileParser dp = new GGUFFileParser(path);
+        ModelSource dp = ModelSources.open(path, cfg.sourceOptions(), targetPath, cfg.activationQuant());
         Arch arch;
         DraftRoute route;
         try {
@@ -499,7 +522,8 @@ public final class LLMModelFactory {
         }
         if (route == DraftRoute.DFLASH) {
             DflashDrafter d = DflashDrafter.open(dp, hostWeights(target), DflashDrafter.Options.of(
-                    cfg.draftMin(), cfg.draftPMin(), DFLASH_KV_TYPE, cfg.memory().kvRotation()));
+                    cfg.draftMin(), cfg.draftPMin(), DFLASH_KV_TYPE, cfg.memory().kvRotation())
+                    .withActivationQuant(cfg.activationQuant()));
             try {
                 d.bindTarget(target);
             } catch (RuntimeException e) {
@@ -511,7 +535,7 @@ public final class LLMModelFactory {
         GgufKv kv = GgufKv.of(dp);
         TensorCatalog catalog = TensorCatalog.of(dp);
         ModelSpec spec = ModelSpecBuilder.build(kv, catalog, draftMemory);
-        MtpHead head = draftHead(target, dp, kv, catalog, spec, t -> false, out);
+        MtpHead head = draftHead(target, dp, kv, catalog, spec, cfg.activationQuant(), t -> false, out);
         DraftModel d = DraftModelLoader.fromFile(target, spec, head, draftMemory,
                 DraftModelLoader.Options.of(cfg.draftPMin()));
         return new Drafter(d, arch.ggufName(), Integer.MAX_VALUE);
@@ -601,13 +625,14 @@ public final class LLMModelFactory {
      * reads ({@link ModelSpecBuilder#mtpDraftReads}: never the file's trunk) uploaded to the target's device or mapped
      * ({@link #draftHead}).
      */
-    private static Drafter mtpFileDrafter(EngineModel target, GGUFFileParser dp, EngineConfig cfg,
+    private static Drafter mtpFileDrafter(EngineModel target, ModelSource dp, EngineConfig cfg,
                                           List<AutoCloseable> out) throws IOException {
         GgufKv kv = GgufKv.of(dp);
         TensorCatalog catalog = TensorCatalog.of(dp);
         ModelSpec spec = ModelSpecBuilder.buildMtpDraft(kv, catalog, mtpMemory(target), target.spec());
         Predicate<String> reads = ModelSpecBuilder.mtpDraftReads(spec);
-        MtpHead head = draftHead(target, dp, kv, catalog, spec, t -> !reads.test(t.name()), out);
+        MtpHead head = draftHead(target, dp, kv, catalog, spec, cfg.activationQuant(), t -> !reads.test(t.name()),
+                out);
         DraftModel d = DraftModelLoader.nextn(target, spec, head, DraftModelLoader.Options.of(cfg.draftPMin()));
         return new Drafter(d, "mtp draft file " + spec.arch().ggufName(), mtpDraftMax(spec));
     }
@@ -635,13 +660,13 @@ public final class LLMModelFactory {
     @FunctionalInterface
     public interface DraftWeightBytes {
         /**
-         * @param draft  the draft file
+         * @param draft  the draft model
          * @param placed the tensors of {@code draft} its drafter places on the target's device, for the route the
          *               file drafts with for the target under the configured draft type ({@link #draftRoute},
          *               {@link #deviceTensors})
          * @throws IOException when the drafter's tensor data cannot be mapped
          */
-        long of(GGUFFileParser draft, Predicate<GGUFTensorInfo> placed) throws IOException;
+        long of(ModelSource draft, Predicate<GGUFTensorInfo> placed) throws IOException;
     }
 
     /**
@@ -675,6 +700,21 @@ public final class LLMModelFactory {
     }
 
     /**
+     * The drafter's companion at the plan it is fitted beside, opened with no explicit target path: a GGUF draft
+     * measures as with an explicit target, while a Hugging Face draft of a drafter architecture cannot name its
+     * target and the measurement fails with a logged warning, so the context fits without it.
+     *
+     * @param target      the target's resolved specification
+     * @param hostTarget  true when the target runs on the host, whose budget also holds a drafter's host caches
+     * @param weightBytes the bytes the drafter's weights take where the target runs, given the tensors the drafter's
+     *                    route places on the device
+     */
+    public static ContextFitter.Companion draftCompanion(EngineConfig cfg, ModelSpec target, boolean hostTarget,
+                                                         DraftWeightBytes weightBytes) {
+        return draftCompanion(cfg, target, hostTarget, null, weightBytes);
+    }
+
+    /**
      * The memory of the drafter {@code cfg} names ({@link EngineConfig#draftModelPath()}) that a target fits its
      * context beside, measured at every candidate context as llama.cpp's {@code common_fit_params} measures its extra
      * model (common/common.cpp:1252-1280, common/fit.cpp:203-258):
@@ -702,13 +742,16 @@ public final class LLMModelFactory {
      * When the draft file cannot be measured, a warning names the reason and the target fits alone, as llama.cpp
      * does (common/fit.cpp:225-230); the drafter reports the problem when it binds.
      *
-     * @param target      the target's resolved specification
-     * @param hostTarget  true when the target runs on the host, whose budget also holds a drafter's host caches
+     * @param targetPath the model the draft serves, as the target was opened, for Hugging Face drafts that read it
+     *                   through the draft source; null when the caller gives no target path, which only a Hugging
+     *                   Face draft of a drafter architecture misses (the fit then leaves it out)
+     * @param target     the target's resolved specification
+     * @param hostTarget true when the target runs on the host, whose budget also holds a drafter's host caches
      * @param weightBytes the bytes the drafter's weights take where the target runs, given the tensors the drafter's
      *                    route places on the device
      */
     public static ContextFitter.Companion draftCompanion(EngineConfig cfg, ModelSpec target, boolean hostTarget,
-                                                         DraftWeightBytes weightBytes) {
+                                                         Path targetPath, DraftWeightBytes weightBytes) {
         Objects.requireNonNull(cfg, "cfg");
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(weightBytes, "weightBytes");
@@ -717,11 +760,11 @@ public final class LLMModelFactory {
                 || !hasTokenLoop(target.supportClass())) {
             return ContextFitter.Companion.NONE;
         }
-        GGUFFileParser dp = null;
+        ModelSource dp = null;
         try {
-            requireReadable(path);
-            dp = new GGUFFileParser(path);
-            ContextFitter.Companion c = companionOf(dp, path, cfg, target, hostTarget, weightBytes);
+            ModelSources.requireOpenable(path);
+            dp = ModelSources.open(path, cfg.sourceOptions(), targetPath, cfg.activationQuant());
+            ContextFitter.Companion c = companionOf(dp, path, targetPath, cfg, target, hostTarget, weightBytes);
             if (c != ContextFitter.Companion.NONE) {
                 LOGGER.info("context fit reserves room for the drafter {}: {}", path, c);
             }
@@ -740,9 +783,9 @@ public final class LLMModelFactory {
         }
     }
 
-    private static ContextFitter.Companion companionOf(GGUFFileParser dp, String path, EngineConfig cfg,
-                                                       ModelSpec target, boolean hostTarget,
-                                                       DraftWeightBytes weightBytes) throws IOException {
+    private static ContextFitter.Companion companionOf(ModelSource dp, String path, Path targetPath, EngineConfig cfg,
+                                                        ModelSpec target, boolean hostTarget,
+                                                        DraftWeightBytes weightBytes) throws IOException {
         Arch arch = draftArch(dp, path);
         GgufKv kv = GgufKv.of(dp);
         TensorCatalog catalog = TensorCatalog.of(dp);
@@ -798,7 +841,7 @@ public final class LLMModelFactory {
      * @throws IllegalArgumentException when the file names no architecture
      * @throws UnsupportedOperationException when it is a drafter architecture no drafter here runs
      */
-    private static Arch draftArch(GGUFFileParser dp, String path) {
+    private static Arch draftArch(ModelSource dp, String path) {
         String name = dp.getString("general.architecture");
         if (name == null) {
             throw new IllegalArgumentException("draft model " + path + " has no general.architecture");
@@ -854,24 +897,23 @@ public final class LLMModelFactory {
      * kernels prepared ({@link WeightKernelPrewarm}); on a CPU target the file mapped on the host, where tensors the
      * drafter never reads take no memory. The weights are appended to {@code out}; the head does not own them.
      *
+     * @param actQuant how the draft file's activation quantization is applied (the session's
+     *                 {@link EngineConfig#activationQuant()})
      * @param deferred tensors the drafter never reads, left off the device
      */
-    private static MtpHead draftHead(EngineModel target, GGUFFileParser dp, GgufKv kv, TensorCatalog catalog,
-                                     ModelSpec spec, Predicate<GGUFTensorInfo> deferred, List<AutoCloseable> out)
-            throws IOException {
-        PrismHadamardLoader.Result prism = PrismHadamardLoader.load(kv, n -> {
-            TensorRef r = catalog.get(n);
-            return r != null ? r.ne() : null;
-        }, kv.u32(GgufKeys.SSM_TIME_STEP_RANK, 0), kv.u32(GgufKeys.SSM_GROUP_COUNT, 0));
+    private static MtpHead draftHead(EngineModel target, ModelSource dp, GgufKv kv, TensorCatalog catalog,
+                                     ModelSpec spec, ActivationQuant actQuant, Predicate<GGUFTensorInfo> deferred,
+                                     List<AutoCloseable> out) throws IOException {
+        InputTransformLoader.Result transforms = InputTransformLoader.load(dp, kv, catalog, actQuant);
         if (target instanceof GGUFModelGPU) {
             GGUFModelGPU g = (GGUFModelGPU) target;
             GpuForwardContext ctx = g.forwardContext();
-            WeightStore store = dp.createMappedStore();
+            WeightStore store = dp.createMappedStore(StoreUse.RESIDENT_UPLOAD);
             out.add(store);
             GpuWeightUploader uploader = new GpuWeightUploader(g.backend(), ctx.queue(), dp.getTensors(), store,
                     spec.arch().ggufName(),
                     GpuWeightUploader.config(GpuWeightUploader.TypePolicy.forKernels(ctx.kernels()))
-                            .prism(prism)
+                            .transforms(transforms)
                             .build());
             out.add(uploader);
             uploader.uploadResident(deferred);
@@ -882,7 +924,7 @@ public final class LLMModelFactory {
         }
         if (target instanceof GGUFModel) {
             GGUFModel c = (GGUFModel) target;
-            CpuWeights weights = CpuWeights.open(dp, catalog, prism);
+            CpuWeights weights = CpuWeights.open(dp, catalog, transforms);
             out.add(weights);
             return MtpHead.cpu(c.forwardContext(), c.blockRegistry(), weights);
         }
@@ -901,6 +943,8 @@ public final class LLMModelFactory {
                 .samplerDefaults(cfg.samplerDefaults())
                 .ramCacheMb(cfg.ramCacheMb())
                 .vramDepth(cfg.vramDepth())
+                .sourceOptions(cfg.sourceOptions())
+                .activationQuant(cfg.activationQuant())
                 .build();
         EngineModel draft = backend == null ? new GGUFModel(path, draftCfg) : new GGUFModelGPU(path, backend, draftCfg);
         ModelDrafter d;

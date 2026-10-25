@@ -169,12 +169,15 @@ public final class MoeKernels {
             m.put(t, 1);
         }
         for (GGMLType t : new GGMLType[]{GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0,
-                GGMLType.IQ4_NL, GGMLType.MXFP4}) {
+                GGMLType.IQ4_NL, GGMLType.MXFP4, GGMLType.F8_E4M3, GGMLType.MXFP8}) {
             m.put(t, 4);
         }
-        m.put(GGMLType.NVFP4, 8);
-        m.put(GGMLType.Q2_0, 8);
-        m.put(GGMLType.Q1_0, 16);
+        for (GGMLType t : new GGMLType[]{GGMLType.NVFP4, GGMLType.Q2_0, GGMLType.NF4, GGMLType.FP4_BNB}) {
+            m.put(t, 8);
+        }
+        for (GGMLType t : new GGMLType[]{GGMLType.Q1_0, GGMLType.F8_E4M3_B128, GGMLType.I8_B128}) {
+            m.put(t, 16);
+        }
         for (GGMLType t : new GGMLType[]{GGMLType.IQ4_XS, GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K,
                 GGMLType.Q6_K, GGMLType.Q8_K, GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ2_XXS, GGMLType.IQ2_XS,
                 GGMLType.IQ2_S, GGMLType.IQ1_S, GGMLType.IQ1_M, GGMLType.TQ1_0, GGMLType.TQ2_0}) {
@@ -183,7 +186,7 @@ public final class MoeKernels {
         return Collections.unmodifiableMap(m);
     }
 
-    /** The 29 weight types with id-matvec kernels. */
+    /** The 35 weight types with id-matvec kernels. */
     public static Set<GGMLType> weightTypes() {
         return TPS.keySet();
     }

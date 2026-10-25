@@ -1,4 +1,4 @@
-package com.eonmux.neuralfree.precision;
+package com.eonmux.neuralfree.utils.numeric;
 
 /**
  * The OCP 8-bit floating-point formats, with the semantics of {@code torch.float8_e4m3fn} and
@@ -15,16 +15,20 @@ package com.eonmux.neuralfree.precision;
  * sign, as the scaled FP8 recipes do before casting. NaN encodes to the canonical NaN with the input's sign bit; an
  * infinity encodes to the infinity of the same sign in E5M2 and to NaN with its sign in E4M3FN, which has no
  * infinities. {@link #decode} is exact. Instances are immutable and thread-safe.</p>
+ *
+ * <p>This is the single FP8 codec of the library: the training precision stack (FP8 quantization and fake-quant)
+ * and the LLM weight and activation codecs ({@code gguf.quant.FpBlockDecoders}) both encode and decode through
+ * it.</p>
  */
-final class Fp8Codec {
+public final class Fp8Codec {
     /** E4M3 without infinities ({@code float8_e4m3fn}): bias 7, largest finite 448, smallest subnormal 2^-9. */
-    static final Fp8Codec E4M3FN = new Fp8Codec("E4M3FN", 4, 3, false);
+    public static final Fp8Codec E4M3FN = new Fp8Codec("E4M3FN", 4, 3, false);
 
     /**
      * E5M2 with IEEE infinities and NaNs ({@code float8_e5m2}): bias 15, largest finite 57344, smallest subnormal
      * 2^-16.
      */
-    static final Fp8Codec E5M2 = new Fp8Codec("E5M2", 5, 2, true);
+    public static final Fp8Codec E5M2 = new Fp8Codec("E5M2", 5, 2, true);
 
     private static final int SIGN = 0x80;
     private static final int MAGNITUDE = 0x7F;
@@ -64,32 +68,32 @@ final class Fp8Codec {
     }
 
     /** The largest finite value: 448 for E4M3FN, 57344 for E5M2. */
-    float maxFinite() {
+    public float maxFinite() {
         return maxFinite;
     }
 
     /** The smallest normal value {@code 2^(1 - bias)}: {@code 2^-6} for E4M3FN, {@code 2^-14} for E5M2. */
-    float minNormal() {
+    public float minNormal() {
         return Math.scalb(1.0f, 1 - bias);
     }
 
     /** The width of the mantissa field: 3 for E4M3FN, 2 for E5M2. */
-    int mantissaBits() {
+    public int mantissaBits() {
         return mantissaBits;
     }
 
     /** True when the format encodes the infinities (E5M2); E4M3FN encodes an infinity as NaN. */
-    boolean hasInfinities() {
+    public boolean hasInfinities() {
         return ieeeSpecials;
     }
 
     /** The positive canonical NaN code: {@code 0x7F} for E4M3FN, {@code 0x7E} for E5M2. */
-    int nanCode() {
+    public int nanCode() {
         return nanCode;
     }
 
     /** True when {@code code} encodes NaN. */
-    boolean isNaN(int code) {
+    public boolean isNaN(int code) {
         int magnitude = checkCode(code) & MAGNITUDE;
         if (ieeeSpecials) {
             return (magnitude >>> mantissaBits) == maxExponentField && (magnitude & ((1 << mantissaBits) - 1)) != 0;
@@ -102,12 +106,12 @@ final class Fp8Codec {
      *
      * @throws IllegalArgumentException when {@code code} is outside {@code [0, 255]}
      */
-    float decode(int code) {
+    public float decode(int code) {
         return values[checkCode(code)];
     }
 
     /** The code of {@code value}, rounded to nearest with ties to even and saturated as the class describes. */
-    int encode(float value) {
+    public int encode(float value) {
         int sign = (Float.floatToRawIntBits(value) >>> 24) & SIGN;
         if (Float.isNaN(value)) {
             return sign | nanCode;

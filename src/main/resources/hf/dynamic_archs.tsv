@@ -1,0 +1,17 @@
+# dynamic_archs.tsv - Generated from llama.cpp a37cc4610 by the updateHfTables Gradle task; do not edit. Rows: 15
+# class	source	condition	gguf_arch
+NomicBertModel	bert.py:328	not self.is_moe	nomic-bert
+NomicBertModel	bert.py:328	self.is_moe	nomic-bert-moe
+XLMRobertaModel	bert.py:481	(lora_names := hparams.get('lora_adaptations'))	jina-bert-v3
+DeepseekV2Model	deepseek.py:251	self.origin_hf_arch in ('DeepseekOCRForCausalLM', 'DeepseekOCR2ForCausalLM', 'UnlimitedOCRForCausalLM')	deepseek2-ocr
+GraniteHybridModel	granite.py:468	not self._ssm_layers and has_experts	granitemoe
+GraniteHybridModel	granite.py:468	not self._ssm_layers and not has_experts	granite
+LlamaModel	llama.py:52	'draft_vocab_size' in self.hparams and self.hparams['num_hidden_layers'] == 1	eagle3
+MiniCPMV4_7TextModel	minicpm.py:224	text_config.get('model_type') == 'qwen3_5_moe_text'	qwen35moe
+MiniCPMV4_7TextModel	minicpm.py:226	not (text_config.get('model_type') == 'qwen3_5_moe_text')	qwen35
+MistralModel	mistral.py:36	'llama_4_scaling' not in self.hparams	llama
+Mistral3Model	mistral3.py:23	not (self.hparams.get('model_type') == 'mistral4') and not (self.hf_arch in ('Ministral3Model', 'Mistral3Model'))	mistral3
+Mistral3Model	mistral3.py:35	not (self.hparams.get('model_type') == 'mistral4') and self.hf_arch in ('Ministral3Model', 'Mistral3Model')	mistral3
+Mistral3Model	mistral3.py:47	self.hparams.get('model_type') == 'mistral4'	mistral4
+NemotronHModel	nemotron.py:434	has_moe_params	nemotron_h_moe
+NemotronHPuzzleModel	nemotron.py:758	-	nemotron_h_moe

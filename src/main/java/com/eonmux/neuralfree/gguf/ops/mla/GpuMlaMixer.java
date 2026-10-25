@@ -621,14 +621,14 @@ public final class GpuMlaMixer implements GpuMixer {
 
     /**
      * {@code attn_k_b} / {@code attn_v_b} enter plain {@code ggml_mul_mat} products (deepseek2.cpp:120,
-     * llama-graph.cpp build_attn {@code v_mla}): one binding, no input Hadamard and no tensor scale, which the per-head
-     * {@code {T}_MatVecId} would not apply.
+     * llama-graph.cpp build_attn {@code v_mla}): one binding, no input Hadamard or input transform and no tensor
+     * scale, which the per-head {@code {T}_MatVecId} would not apply.
      */
     private static void requirePlainHeads(GpuWeight w) {
         requireOneBinding(w);
-        if (w.hadamard() != null || w.hasScale()) {
-            throw new UnsupportedOperationException(w.name() + " carries an input Hadamard or a tensor scale; the "
-                    + "per-head MLA products take plain weights");
+        if (w.hadamard() != null || w.hasScale() || (w.inputTransform() != null && !w.inputTransform().isIdentity())) {
+            throw new UnsupportedOperationException(w.name() + " carries an input transform (Hadamard) or a tensor"
+                    + " scale; the per-head MLA products take plain weights");
         }
     }
 

@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.tensor.Shape;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorOps;
 import com.eonmux.neuralfree.tensor.TensorStorage;
+import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
 
 import java.util.*;
 

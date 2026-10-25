@@ -4,7 +4,8 @@ This guide covers:
 - building NeuralFree, including the optional GPU kernel tools and the two kernel libraries;
 - choosing a compute backend for the GGUF engine and for the training framework;
 - how the training framework uses a GPU backend: locking, residency, ordering and numerical tolerances;
-- the complete `LLMDemo` command line and the `neuralfree.*` system properties.
+- the complete `LLMDemo` command line and the `neuralfree.*` system properties;
+- loading Hugging Face checkpoints: the flags and properties, materialization, activation quantization, the supported quantization formats and architectures.
 
 [TRAINING.md](TRAINING.md) is the guide to the training framework's API: tensors, autograd, modules, optimizers, losses, trainers, checkpoints, distributed training, reinforcement learning and quantization. [LLM-INFERENCE.md](LLM-INFERENCE.md) describes the GGUF engine itself. The runnable demos in `src/main/java/com/eonmux/neuralfree/demo/` (`MLPDemo`, `CNNDemo`, `GNNDemo`, `TransformerDemo`, `AutogradDemo`, `InferenceDemo`, `GpuMatmulDemo`, `LLMDemo`) show complete programs.
 
@@ -18,8 +19,16 @@ This guide covers:
 2. [Compute backends](#compute-backends)
 3. [The training framework on a GPU backend](#the-training-framework-on-a-gpu-backend)
 4. [LLMDemo command-line reference](#llmdemo-command-line-reference)
-5. [System properties](#system-properties)
-6. [Troubleshooting](#troubleshooting)
+5. [Hugging Face checkpoints](#hugging-face-checkpoints)
+   - [Flags and properties](#flags-and-properties)
+   - [Materialization of derived tensors](#materialization-of-derived-tensors)
+   - [Activation quantization](#activation-quantization)
+   - [Model sampling defaults](#model-sampling-defaults)
+   - [Supported quantization formats](#supported-quantization-formats)
+   - [Rejected formats](#rejected-formats)
+   - [Supported architectures](#supported-architectures)
+6. [System properties](#system-properties)
+7. [Troubleshooting](#troubleshooting)
 
 ## Build
 
@@ -223,7 +232,7 @@ Every flag below is parsed by `LLMDemoOptions`. `--help` prints the same list.
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--model`, `-m <path>` | GGUF model | see [LLM-INFERENCE.md](LLM-INFERENCE.md#selecting-a-model) |
+| `--model`, `-m <path>` | GGUF file or Hugging Face checkpoint (directory or `.safetensors` file); see [Hugging Face checkpoints](#hugging-face-checkpoints) and [LLM-INFERENCE.md](LLM-INFERENCE.md#selecting-a-model) | see [LLM-INFERENCE.md](LLM-INFERENCE.md#selecting-a-model) |
 | `--prompt`, `-p <text>` | Run one prompt instead of the console chat | console chat |
 | `--system <text>` | System prompt | `You are a helpful assistant.` |
 | `--raw` | Use the prompt verbatim, without the chat template | off |
@@ -276,7 +285,7 @@ Every flag below is parsed by `LLMDemoOptions`. `--help` prints the same list.
 
 ### Sampling
 
-The demo's defaults apply only where no `neuralfree.*` sampler property is set. The engine defaults, which match llama.cpp, are listed under [Sampling](LLM-INFERENCE.md#sampling).
+The demo's defaults apply only where no `neuralfree.*` sampler property is set. The engine defaults, which match llama.cpp, are listed under [Sampling](LLM-INFERENCE.md#sampling). The model's own defaults — the `general.sampling.*` keys of a GGUF, or `generation_config.json` of a Hugging Face checkpoint — are applied next, for every setting the caller did not give ([Model sampling defaults](#model-sampling-defaults)).
 
 | Flag | Meaning | Demo default |
 |---|---|---|
@@ -309,8 +318,10 @@ The demo's defaults apply only where no `neuralfree.*` sampler property is set. 
 
 | Flag | Meaning |
 |---|---|
-| `--lora <gguf>[:scale][,...]` | Apply adapters, scale 1 unless given; repeatable |
+| `--lora <gguf[:scale]|PEFT dir>` | Apply adapters, scale 1 unless given; repeatable. A PEFT directory (`adapter_config.json` plus `adapter_model.safetensors`) attaches to a GGUF or Hugging Face base model |
 | `--lora-scaled <gguf>:<scale>[,...]` or `--lora-scaled <gguf> <scale>` | Apply adapters with explicit scales; repeatable |
+| `--lora-base-config <dir>` | An HF directory whose config the adapter's GGUF base takes its hyperparameters from |
+| `--hf-base-dir <dir>` | Local base model a decision-LoRA checkpoint (PEFT checkpoints trained with llama.cpp's `lev` conversion) merges at load |
 
 Adapters given on the command line replace the `neuralfree.lora` list.
 
@@ -339,6 +350,314 @@ Adapters given on the command line replace the `neuralfree.lora` list.
 
 After each generation, the demo prints timing statistics. With `--stats-file <path>` it also appends the session's statistics (model, backend, memory plan, and the timing, prompt and response of each generation) to `<path>` when the session ends; a relative path is resolved against the working directory, which is the project directory under `runLLMDemo`. Without the flag nothing is written.
 
+## Hugging Face checkpoints
+
+The engine opens a Hugging Face checkpoint wherever it opens a GGUF file. Format detection (`ModelSources.detect`) is content-based:
+
+1. Regular files: a file whose first 4 bytes are `GGUF`, else a file ending in `.safetensors`. An HF source file is a single `*.safetensors` whose parent directory holds `config.json`, `params.json` (Mistral native) or a checkpoint-detector file; only that file's tensors are used. A file the parent index lists as a shard is refused with a message to pass the directory instead.
+2. A directory containing `config.json` plus `*.safetensors` files — or `params.json` plus `consolidated*.safetensors` — is an HF checkpoint. Line endings, dtype names, index files (`*.safetensors.index.json`) and per-shard files are all handled; encoder-decoder, diffusion, embedding, reranker, audio and drafter architectures load like their GGUF counterparts.
+3. A directory without safetensors files that holds exactly one `.gguf` file, or one split set `*-00001-of-NNNNN.gguf`, opens that GGUF (the `gguf` load format vLLM and SGLang use).
+4. A directory with `adapter_config.json` and `adapter_model.safetensors` is a PEFT adapter: it attaches to a base model through `--lora` (`ModelSources.openAdapter`), and as a model it is refused with a message saying so.
+5. Only `pytorch_model*.bin`, `*.pt` or `*.pth` files: refused; pickle checkpoints are untrusted code ([GAPS.md](GAPS.md)).
+
+A parsed HF checkpoint becomes the same `ModelSource` view a GGUF file produces ([LLM-INFERENCE.md](LLM-INFERENCE.md#model-sources)), so `--backend`, `--ctx`, `--kv-type`, `--mtp`, `--lora`, `--draft` and the sampler flags mean the same thing on both paths. On disk it needs nothing beside the checkpoint: the derived tensor cache below points at `~/.cache/neuralfree/hf` and is created only when derivations spill.
+
+### Flags and properties
+
+These flags set the matching `ModelSourceOptions` or `EngineConfig` fields. An enum value is parsed case-insensitively, with `-` and `_` equivalent; an unknown value is rejected naming the property. Property defaults apply when the flag is absent.
+
+| Flag | Property | Default | Meaning |
+|---|---|---|---|
+| `--hf-materialize auto\|memory\|disk\|none` | `neuralfree.hf.materialize` | `auto` | Where derived tensors live ([Materialization](#materialization-of-derived-tensors)) |
+| `--hf-memory-max <n[K\|M\|G]>` | `neuralfree.hf.materialize.memory.max` | `2G` | Largest total of derived bytes `auto` keeps in direct memory |
+| `--hf-cache-dir <dir>` | `neuralfree.hf.cache.dir` | `~/.cache/neuralfree/hf` | Parent of the per-process directories of derived tensors written to disk |
+| `--hf-outtype source\|auto\|f32\|f16\|bf16\|q8_0` | `neuralfree.hf.outtype` | `source` | Type of the view's float tensors. `auto` reproduces the converter's `--outtype auto`; the other values, except `source`, reproduce the converter's fixed outtypes; `q8_0` quantizes through the online quantizer |
+| `--quant-online none\|q8_0\|q4_0\|q4_1\|q5_0\|q5_1\|iq4_nl` | `neuralfree.quant.online` | `none` | Online quantization of float matmul weights with llama-quantize eligibility |
+| `--hf-quant-exact` | `neuralfree.hf.quant.exact` | off | Prefer bit-exact weight types over close repacks ([Supported quantization formats](#supported-quantization-formats)) |
+| `--hf-no-mtp` | `neuralfree.hf.mtp` | true | The flag keeps the model's MTP/NextN layers out (the converter's `no_mtp`); the property set to `true` includes them again |
+| `--hf-st-dense true\|false` | `neuralfree.hf.st.dense` | `true` | Include sentence-transformers `2_Dense`/`3_Dense` heads; `false` reproduces the converter's default off ([LLAMACPP-PARITY.md](LLAMACPP-PARITY.md#hugging-face-checkpoints)) |
+| `--hf-overrides <json>` | `neuralfree.hf.overrides` | none | JSON object merged into `config.json` before conversion (vLLM's `hf_overrides`) |
+| `--hf-tokenizer <dir\|file.gguf>` | `neuralfree.hf.tokenizer` | none | Tokenizer files from another directory, or the `tokenizer.*` keys of a GGUF file, replacing the model's |
+| `--act-quant weight-only\|checkpoint` | `neuralfree.act.quant` | `weight-only` | Activation quantization ([Activation quantization](#activation-quantization)) |
+| `--model-sampling-defaults true\|false` | `neuralfree.sampling.model.defaults` | `true` | Apply the model's sampling defaults ([Model sampling defaults](#model-sampling-defaults)) |
+| `--lora-base-config <dir>` | `neuralfree.lora.base.config` | none | HF config of a LoRA adapter's base when the base is a GGUF file |
+| `--hf-base-dir <dir>` | `neuralfree.hf.base.dir` | none | Local copy of the base model a decision-LoRA checkpoint merges at load; without it, its `base_model_name_or_path` is used when that names an existing local directory |
+| `--export-gguf <out.gguf>` | — | none | Write the model's GGUF view to `<out.gguf>` and exit without generating ([Exporting to GGUF](#exporting-to-gguf)) |
+| `--export-mode native\|compat\|compat-exact` | — | `native` | With `--export-gguf`: keep the extension tensor types; convert them to llama.cpp types; or write every lossy or approximate value as F32 |
+| `--export-overwrite` | — | off | Replace an existing output file |
+
+### Materialization of derived tensors
+
+Some tensors of an HF checkpoint are "derived": the loader transforms the checkpoint's bytes into GGUF names, shapes and layouts (name mapping, `permute`d attention shapes, fused `ffn_gate_up`, MLA `kv_b` splits, `quantize_*` repacks for `--quant-online` and `--hf-outtype q8_0`). A direct tensor — one that only maps safetensors bytes into a GGUF name and shape — is always served straight from the mmapped files and costs nothing.
+
+The mode where the derived bytes go is `--hf-materialize`; `auto` decides per reader and per tensor, and logs each decision once at INFO with byte totals:
+
+| How the loader reads | Row-local producer (e.g. a plain concat or stack) | Non-row-local producer (e.g. a K-major GPTQ repack) |
+|---|---|---|
+| One pass for GPU upload (`RESIDENT_UPLOAD`) | Not materialized: produced on each read | Whole-tensor window: produced once into a buffer kept until the next tensor is read — in memory when it fits `--hf-memory-max`, else to disk |
+| Streamed layer re-reads per token (`STREAMING`) | To disk | To disk |
+| CPU reads that keep the regions open (`openRegions`) | In memory when the total derived bytes fit `--hf-memory-max`, else to disk | Same |
+
+An explicit `memory` or `disk` applies to every derived tensor. An explicit `none` produces on every read, keeps the whole-tensor window for non-row-local producers, and is not valid for `openRegions` (which would keep everything produced). In every mode the bytes read for one tensor are bounded by about 1.1 × that tensor's original source bytes.
+
+The disk mode writes each derived tensor once into a per-process sidecar directory `<cache-dir>/run-<pid>-<random>/`:
+
+- created with `rwx------` where POSIX attributes apply; it holds a lock file held for the life of the source;
+- sidecar files are opened `CREATE_NEW` with `rw-------` and `DELETE_ON_CLOSE`, and the directory is deleted when the source closes; stale `run-*` directories of dead processes are cleaned up when the first sidecar is opened. Nothing is reused across runs.
+- **Free-space requirement.** Before a tensor is written, the process checks the file store's usable space covers it and refuses with `IOException("materializing <tensor> needs <n> bytes in <dir>; free space or pass --hf-cache-dir")` — free space on the device, or point `--hf-cache-dir` at a device that has it.
+
+`memory` keeps produced tensors in direct (off-heap) memory, so it is bounded by `--hf-memory-max` under `auto` and by the JVM heap when set explicitly.
+
+### Activation quantization
+
+`--act-quant` chooses how a checkpoint whose weights carry activation-quantization parameters behaves:
+
+- **`weight-only` (the default).** The weights are used as stored, and the activation-quantization carrier is ignored: plain `W · A16` semantics, as llama.cpp has.
+- **`checkpoint`.** The input of every projection whose checkpoint carries a scheme is *fake-quantized* — quantized and immediately dequantized per the checkpoint's scheme — and the result feeds the unchanged weight kernel (`y = W · x̂`). One kernel per backend serves all weight types and every kernel family.
+
+Under `checkpoint`, numerics agree with vLLM's integer and FP8 GEMMs: the quantizer's codes are reproduced operation for operation (scales, rounding, saturation and the 128-value groups), and the products of the coded weights and codes are f32-exact, so results agree up to f32 accumulation rounding. **No speedup is claimed**: this is an accuracy/reproduction mode, and no int8 or FP8 tensor-core kernels exist (`GAPS.md`).
+
+The checkpoint's scheme for each weight, its static parameters and model-level bound (`neuralfree.act_quant.version`, `.weight_names`, `.schemes`, `.scale_ub`, and sibling `.input_scale` / `.input_zero_point` tensors) are read from the parsed view on both paths. Where the checkpoint quantizes its *output* activations, the load reports it and refuses under `checkpoint` with a named GgufFormatException — the reference's output activation quantization is not emulated; use `weight-only`. It is carried and dropped with one WARN under `weight-only`.
+
+### Model sampling defaults
+
+A model can carry sampling defaults, and the engine applies them to every generation path (completion, speculative decoding and pooled modes) for every setting the caller did not give: llama.cpp does this for the `general.sampling.*` keys and vLLM for `generation_config`:
+
+| Model key | Where it comes from | Defaults it provides |
+|---|---|---|
+| `general.sampling.temp`, `.top_k`, `.top_p`, `.min_p`, `.penalty_repeat`, `.penalty_last_n` | GGUF metadata | `temperature`, `top-k`, `top-p`, `min-p`, `repeat-penalty`, `repeat-last-n` |
+| `neuralfree.sampling.presence_penalty`, `.frequency_penalty` | GGUF metadata | `presence-penalty`, `frequency-penalty` |
+| `neuralfree.sampling.max_new_tokens` | GGUF metadata | `--max-tokens` |
+| `generation_config.json` | Hugging Face checkpoint; `top_k`, `top_p`, `min_p`, `temperature` map like above, `repetition_penalty` → `penalty_repeat` | the same knobs |
+
+Precedence: an explicit caller setting (CLI flag, builder setter or `neuralfree.*` property) wins; otherwise the model's value; otherwise the engine's default. `max_new_tokens` unwritten with no model default stays 512. Keys with no NF sampler stage (`mirostat*`, `xtc_*`, `sequence`) are logged once as ignored. `do_sample` is not carried, as vLLM also ignores it for defaults.
+
+`--model-sampling-defaults false` (or `neuralfree.sampling.model.defaults=false`) turns the feature off: only the caller's settings and the engine defaults apply. It is on by default.
+
+### Supported quantization formats
+
+Quantized checkpoints are repacked at load into matching weight types; nothing on disk changes. Exactness classes:
+
+- **(a)** exact — every weight value survives the repack bit-for-bit at the output of the weight kernel.
+- **(a~)** exact except that an fp32/bf16 scale is rounded to fp16, or an fp16 fallback represents `-z*s` approximately. `--hf-quant-exact` switches every `(a~)` row to its exact alternative.
+- **float fallback** — the checkpoint's own float dtype (the dtype of `weight_scale`/`scales`; else BF16), or F32 under `--hf-quant-exact`. Every fallback logs once per tensor group at WARN with the reason.
+
+| Checkpoint format | Condition | Target | Class | Alternative |
+|---|---|---|---|---|
+| GPTQ / compressed-tensors WNA16 / AutoRound symmetric 4-bit | group % 32 == 0, or channel scales | Q4_0 | a (fp16 scales); CT bf16 scales exact when representable in fp16, else a~ | float fallback |
+| same, symmetric 2-bit | group % 64 == 0 | Q2_0 | a | Q8_0 (exact) |
+| same, symmetric 5-bit (CT) | group % 32 == 0, packing validated | Q5_0 | a | Q8_0 |
+| same, symmetric 3/6/7-bit | group % 32 == 0 | Q8_0 | a | float fallback |
+| same, symmetric 8-bit | group % 32 == 0 | Q8_0 | a | float fallback |
+| asymmetric 4-bit (GPTQ v1 or v2, AWQ, CT `weight_zero_point`, HQQ) | group % 32 == 0 | Q4_1 | a~ | `--hf-quant-exact` → Q8_0 (exact) |
+| asymmetric 5-bit (CT) | group % 32 == 0 | Q5_1 | a~ | `--hf-quant-exact` → Q8_0 |
+| HQQ 8/3/2/1-bit | group % 32 == 0, integer zero point | Q8_0 | a | non-integer zero point: float fallback |
+| GPTQ / CT act-order (`g_idx` not dense) | 2-D weights on scaled bases | permuted target plus a `.input_perm` sibling tensor | a | 3-D experts or other bases: float fallback in original order |
+| MLX 4-bit | group % 32 == 0 | Q4_1 | a (exact) when bf16 scale → fp16 is exact, else a~ | `--hf-quant-exact` → F32 |
+| MLX other bit widths | — | float fallback (`q*scale + bias`) | a~ | `--hf-quant-exact` → F32 |
+| BitNet | — | TQ2_0 with `.scale = 1/weight_scale` | a on scaled bases; a~ elsewhere (scale rounded to fp16) | F32 |
+| W8A8 int8 (CT int-quantized, SGLang `w8a8_int8`, Quark/AutoRound int8, bnb int8, SGLang `blockwise_int8`) | K % 128 == 0 | I8_B128 (per-channel or per-128-block scales carried in the block) | a | K % 32 == 0: Q8_0 (a~); `--hf-quant-exact` → F32 |
+| FP8 E4M3, per-tensor or per-expert scale, on scaled bases | K % 32 == 0 | F8_E4M3 (zero-copy) + `.scale` | a | — |
+| FP8 E4M3, block 128×128 (`weight_scale_inv`), UE8M0 scales, per-channel, or DeepSeek-V4's `.scale` | K % 128 == 0 | F8_E4M3_B128 | a | float fallback |
+| FP8 E5M2, per-tensor scale on scaled bases | — | F16 (code shifted) + `.scale` | a | float fallback |
+| FP8 E4M3FNUZ / E5M2FNUZ | — | F32 | a | — |
+| MXFP8 (CT `W8A8Mxfp8`, ModelOpt, `mxfp8`) | K % 32 == 0 | MXFP8 | a | — |
+| MXFP6 E2M3 / E3M2 (Quark OCP-MX) | every block scale in bf16 range | BF16 | a | larger scales: rejected, naming tensor and block |
+| NVFP4 (CT, ModelOpt, `petit_nvfp4`, `modelopt_fp4`, fp_quant `nvfp4`) | K % 64 == 0 | NVFP4 with UE4M3 sub-scales plus the global `.scale` | a | other bases: float fallback |
+| MXFP4 (CT, Quark, `quark_mxfp4`, gpt-oss `*_blocks`/`*_scales`, DeepSeek-V4 experts, fp_quant `mxfp4`) | K % 32 == 0 | MXFP4 with E8M0 scales; gpt-oss gate/up rows de-interleaved | a | — |
+| bnb NF4 / FP4 (`bitsandbytes`), including double quant | `K % 64 == 0`, blocksize a multiple of 64 | NF4 / FP4_BNB with the absmax replicated per 64-run | a (a~ when the checkpoint's `quant_map` differs from the codebook within 1e-4) | rows-crossing layouts or blocksize 32: float fallback; different `quant_map`: F32 under `--hf-quant-exact` |
+| Hadamard input transforms (CT `transform_config`, fp_quant) | signed Sylvester transform, verified arch | the PRISM input-transform keys (block size, sign mode); carried through to the GPU | a | non-Hadamard type or unverified arch: named error |
+| Unquantized F32/F16/BF16/F64 | — | the outtype chosen by `--hf-outtype` | a | — |
+
+New weight types behind the six extension ids (`F8_E4M3`, `F8_E4M3_B128`, `MXFP8`, `I8_B128`, `NF4`, `FP4_BNB`) run natively on the CPU and the GPU, like the extension type details under [LLM-INFERENCE.md: Weight types](LLM-INFERENCE.md#weight-types).
+
+### Rejected formats
+
+These are refused at load with a named error (`GgufFormatException` for a config value, `IOException` for a container problem), each saying what it is and why:
+
+- `checkpoint_format: marlin` — vLLM's Marlin repacking is a runtime format, not a checkpoint layout;
+- compressed-tensors `sparsity_config` (2:4 and bitmask sparsity) — sparse matmul runtime feature;
+- `quant_method`: `torchao`, `aqlm`, `eetq`, `vptq`, `spqr`, `higgs`, `quanto` — vLLM rejects, deprecates or has removed each; details in [GAPS.md](GAPS.md);
+- Quark two-level weight specs (a `weight` given as a list) — layout only defined by the Quark runtime;
+- compressed-tensors input transforms at `output`, `k_cache` or `q_attn` locations, and non-Hadamard transform types — NF only carries input transforms it can verify as signed Sylvester Hadamard ([Supported quantization formats](#supported-quantization-formats));
+- fp_quant with `transform_init: gsr` — its transform is not a verifiable Hadamard;
+- bnb checkpoints with `bnb_4bit_quant_storage` other than uint8 — a quantized-storage dtype NF cannot decode as written;
+- `quant_method` values not among those the loader recognizes — always with the value named.
+
+### Exporting to GGUF
+
+`--export-gguf <out.gguf> [--export-mode <m>] [--export-overwrite]` writes the current model's GGUF view — the same metadata keys, tensor names, shapes and types the loader produced — and exits without running generation:
+
+| Mode | Behaviour |
+|---|---|
+| `native` | Keep extension weight types and `neuralfree.*` keys, and mark the file `neuralfree.extension_types = true` |
+| `compat` | Convert extension tensors to llama.cpp types through the compatibility converter, drop the extension marker; fails with a named error when a source keeps `.input_perm` or `.input_zero_point` tensors, which only serve NF |
+| `compat-exact` | Like `compat`, but every lossy or approximate converted tensor is written as F32 instead |
+
+The written file is a normal llama.cpp GGUF in the `compat` modes; `native` files are readable by NeuralFree and by anything that ignores unknown keys and types (as llama.cpp does).
+
+### Supported architectures
+
+An HF checkpoint is recognized by its `config.json` `architectures[0]` name. The names below — 295 of them, over 154 concrete GGUF architectures and 8 resolved at load time — are the TEXT rows of `src/main/resources/hf/archs.tsv` (generated from llama.cpp's converter registrations; the llama.cpp commit is recorded in the file header). They are grouped by the GGUF architecture each resolves to. The MMPROJ rows of the same file (the vision and audio tower classes) are not loadable model classes (`GAPS.md`). A name absent below is refused with a message naming it.
+
+| GGUF architecture | Names | `architectures[0]` values |
+|---|---|---|
+| `-` | 8 | `GraniteSpeechForConditionalGeneration`, `GraniteSpeechPlusForConditionalGeneration`, `MiniCPMV4_7ForConditionalGeneration`, `Ministral3ForCausalLM`, `Ministral3Model`, `Mistral3ForConditionalGeneration`, `Mistral3Model`, `NomicBertModel` — resolved (or refused) at load time from the rest of the config; their rows carry no fixed GGUF architecture |
+| `afmoe` | 1 | `AfmoeForCausalLM` |
+| `apertus` | 1 | `ApertusForCausalLM` |
+| `arcee` | 1 | `ArceeForCausalLM` |
+| `arctic` | 1 | `ArcticForCausalLM` |
+| `arwkv7` | 1 | `RwkvHybridForCausalLM` |
+| `baichuan` | 2 | `BaichuanForCausalLM`, `BaiChuanForCausalLM` |
+| `bailingmoe` | 1 | `BailingMoeForCausalLM` |
+| `bailingmoe2` | 3 | `BailingMoeV2ForCausalLM`, `modeling_sarvam_moe.SarvamMoEForCausalLM`, `SarvamMoEForCausalLM` |
+| `bailingmoe3` | 2 | `BailingMoeV3ForCausalLM`, `BailingMoeV3VLForConditionalGeneration` |
+| `beam` | 1 | `BeamForCausalLM` |
+| `bert` | 11 | `BertForMaskedLM`, `BertForSequenceClassification`, `BertModel`, `CamembertModel`, `DistilBertForMaskedLM`, `DistilBertForSequenceClassification`, `DistilBertModel`, `RobertaForSequenceClassification`, `RobertaModel`, `XLMRobertaForSequenceClassification`, `XLMRobertaModel` |
+| `bitnet` | 2 | `BitnetForCausalLM`, `BitNetForCausalLM` |
+| `bloom` | 2 | `BloomForCausalLM`, `BloomModel` |
+| `chameleon` | 2 | `ChameleonForCausalLM`, `ChameleonForConditionalGeneration` |
+| `chatglm` | 3 | `ChatGLMForConditionalGeneration`, `ChatGLMModel`, `GlmForCausalLM` |
+| `clef` | 1 | `ClefModel` |
+| `codeshell` | 1 | `CodeShellForCausalLM` |
+| `cogvlm` | 1 | `CogVLMForCausalLM` |
+| `cohere2` | 1 | `Cohere2ForCausalLM` |
+| `cohere2moe` | 1 | `Cohere2MoeForCausalLM` |
+| `command-r` | 1 | `CohereForCausalLM` |
+| `dbrx` | 1 | `DbrxForCausalLM` |
+| `deci` | 1 | `DeciLMForCausalLM` |
+| `deepseek` | 1 | `DeepseekForCausalLM` |
+| `deepseek2` | 9 | `DeepseekOCRForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `Glm4MoeLiteForCausalLM`, `KimiK25ForConditionalGeneration`, `KimiVLForConditionalGeneration`, `UnlimitedOCRForCausalLM`, `YoutuForCausalLM`, `YoutuVLForConditionalGeneration` |
+| `deepseek32` | 1 | `DeepseekV32ForCausalLM` |
+| `deepseek4` | 1 | `DeepseekV4ForCausalLM` |
+| `dflash` | 11 | `DeepseekV4DSparkModel`, `DFlash2DraftModel`, `DFlashDraftModel`, `DSparkDraftModel`, `DSparkSpeculator`, `Gemma4DSparkModel`, `Lfm2DSparkDraftModel`, `LiLiCorrDraftModel`, `LingDSparkModel`, `MuseGlimmerAssistantModel`, `Qwen3DSparkModel` |
+| `dots1` | 1 | `Dots1ForCausalLM` |
+| `dots3note` | 3 | `Dots3NoteForCausalLM`, `Dots3NoteForConditionalGeneration`, `Dots3NoteTextForCausalLM` |
+| `dream` | 1 | `DreamModel` |
+| `ernie4_5` | 2 | `Ernie4_5_ForCausalLM`, `Ernie4_5ForCausalLM` |
+| `ernie4_5-moe` | 1 | `Ernie4_5_MoeForCausalLM` |
+| `eurobert` | 2 | `EuroBertModel`, `JinaEmbeddingsV5Model` |
+| `exaone` | 1 | `ExaoneForCausalLM` |
+| `exaone4` | 2 | `Exaone4_5_ForConditionalGeneration`, `Exaone4ForCausalLM` |
+| `exaone-moe` | 2 | `ExaoneMoeForCausalLM`, `ExaoneMoEForCausalLM` |
+| `falcon` | 2 | `FalconForCausalLM`, `RWForCausalLM` |
+| `falcon-h1` | 1 | `FalconH1ForCausalLM` |
+| `flint` | 1 | `FlintForCausalLM` |
+| `gemma` | 1 | `GemmaForCausalLM` |
+| `gemma2` | 1 | `Gemma2ForCausalLM` |
+| `gemma3` | 2 | `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` |
+| `gemma3n` | 2 | `Gemma3nForCausalLM`, `Gemma3nForConditionalGeneration` |
+| `gemma4` | 3 | `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` |
+| `gemma4-assistant` | 2 | `Gemma4AssistantForCausalLM`, `Gemma4UnifiedAssistantForCausalLM` |
+| `gemma-embedding` | 1 | `Gemma3TextModel` |
+| `gemma-embedding2` | 1 | `EmbeddingGemma2Model` |
+| `glm4` | 3 | `Glm4ForCausalLM`, `Glm4vForConditionalGeneration`, `GlmOcrForConditionalGeneration` |
+| `glm4moe` | 3 | `Glm4MoeForCausalLM`, `Glm4vMoeForConditionalGeneration`, `SolarOpenForCausalLM` |
+| `glm5-next` | 1 | `Glm5NextForConditionalGeneration` |
+| `glm-dsa` | 1 | `GlmMoeDsaForCausalLM` |
+| `gpt2` | 2 | `GPT2LMHeadModel`, `RuGPT3XLForCausalLM` |
+| `gptneox` | 1 | `GPTNeoXForCausalLM` |
+| `gpt-oss` | 1 | `GptOssForCausalLM` |
+| `granite` | 1 | `GraniteForCausalLM` |
+| `granitehybrid` | 2 | `BambaForCausalLM`, `GraniteMoeHybridForCausalLM` |
+| `granitemoe` | 2 | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
+| `granite_swa` | 2 | `GraniteMoeSWAForCausalLM`, `GraniteSWAForCausalLM` |
+| `graniteswitch` | 1 | `GraniteSwitchForCausalLM` |
+| `grok` | 2 | `Grok1ForCausalLM`, `GrokForCausalLM` |
+| `grovemoe` | 2 | `GroveMoeForCausalLM`, `modeling_grove_moe.GroveMoeForCausalLM` |
+| `hrm_text` | 1 | `HrmTextForCausalLM` |
+| `hunyuan-dense` | 1 | `HunYuanDenseV1ForCausalLM` |
+| `hunyuan-moe` | 1 | `HunYuanMoEV1ForCausalLM` |
+| `hunyuan_vl` | 1 | `HunYuanVLForConditionalGeneration` |
+| `hy_v3` | 1 | `HYV3ForCausalLM` |
+| `hy_v4` | 1 | `HYV4ForCausalLM` |
+| `internlm2` | 1 | `InternLM2ForCausalLM` |
+| `jais` | 1 | `JAISLMHeadModel` |
+| `jais2` | 1 | `Jais2ForCausalLM` |
+| `jamba` | 1 | `JambaForCausalLM` |
+| `jina-bert-v2` | 2 | `JinaBertForMaskedLM`, `JinaBertModel` |
+| `k2-horizon` | 1 | `K2HorizonForCausalLM` |
+| `kimi-k3` | 1 | `KimiK3ForConditionalGeneration` |
+| `kimi-linear` | 2 | `KimiLinearForCausalLM`, `KimiLinearModel` |
+| `kolibri1` | 1 | `Kolibri1ForCausalLM` |
+| `laguna` | 1 | `LagunaForCausalLM` |
+| `lfm2` | 8 | `D1Model`, `D1OmniModel`, `Lfm25AudioTokenizer`, `Lfm2BidirectionalForMaskedLM`, `Lfm2BidirectionalModel`, `Lfm2ForCausalLM`, `LFM2ForCausalLM`, `Lfm2Model` |
+| `lfm2moe` | 1 | `Lfm2MoeForCausalLM` |
+| `llada` | 1 | `LLaDAModelLM` |
+| `llada-moe` | 2 | `LLaDAMoEModel`, `LLaDAMoEModelLM` |
+| `llama` | 17 | `Eagle3DraftModel`, `Eagle3LlamaForCausalLM`, `Eagle3Speculator`, `InternLM3ForCausalLM`, `IQuestCoderForCausalLM`, `JanusForConditionalGeneration`, `LlamaForCausalLM`, `LLaMAForCausalLM`, `LlamaForCausalLMEagle3`, `LlamaModel`, `LlavaForConditionalGeneration`, `MistralForCausalLM`, `MixtralForCausalLM`, `Sarashina2VisionForCausalLM`, `UltravoxModel`, `VLlama3ForCausalLM`, `VoxtralForConditionalGeneration` |
+| `llama4` | 2 | `Llama4ForCausalLM`, `Llama4ForConditionalGeneration` |
+| `llama-embed` | 1 | `LlamaBidirectionalModel` |
+| `maincoder` | 1 | `MaincoderForCausalLM` |
+| `mamba2` | 1 | `Mamba2ForCausalLM` |
+| `mamba` | 3 | `FalconMambaForCausalLM`, `MambaForCausalLM`, `MambaLMHeadModel` |
+| `maple` | 1 | `MapleForCausalLM` |
+| `mellum` | 1 | `MellumForCausalLM` |
+| `mimo2` | 2 | `MiMoV2FlashForCausalLM`, `MiMoV2ForCausalLM` |
+| `minicpm` | 1 | `MiniCPMForCausalLM` |
+| `minicpm3` | 1 | `MiniCPM3ForCausalLM` |
+| `minimax-01` | 2 | `MiniMaxM1ForCausalLM`, `MiniMaxText01ForCausalLM` |
+| `minimax-m2` | 1 | `MiniMaxM2ForCausalLM` |
+| `minimax-m3` | 2 | `MiniMaxM3SparseForCausalLM`, `MiniMaxM3SparseForConditionalGeneration` |
+| `mistral3` | 1 | `VoxtralRealtimeForConditionalGeneration` |
+| `modern-bert` | 4 | `ModernBertDecisionModel`, `ModernBertForMaskedLM`, `ModernBertForSequenceClassification`, `ModernBertModel` |
+| `mpt` | 1 | `MPTForCausalLM` |
+| `muse-glimmer` | 1 | `MuseGlimmerForConditionalGeneration` |
+| `muse-spark` | 1 | `MuseSparkForConditionalGeneration` |
+| `nanbeige` | 1 | `NanbeigeForCausalLM` |
+| `nemotron` | 1 | `NemotronForCausalLM` |
+| `nemotron_h` | 1 | `NemotronHForCausalLM` |
+| `nemotron_h_moe` | 1 | `NemotronHPuzzleForCausalLM` |
+| `neo-bert` | 3 | `NeoBERT`, `NeoBERTForSequenceClassification`, `NeoBERTLMHead` |
+| `olmo2` | 2 | `Olmo2ForCausalLM`, `Olmo3ForCausalLM` |
+| `olmo` | 2 | `OlmoForCausalLM`, `OLMoForCausalLM` |
+| `olmoe` | 1 | `OlmoeForCausalLM` |
+| `openelm` | 1 | `OpenELMForCausalLM` |
+| `orion` | 1 | `OrionForCausalLM` |
+| `paddleocr` | 1 | `PaddleOCRVLForConditionalGeneration` |
+| `pangu-embedded` | 1 | `PanguEmbeddedForCausalLM` |
+| `phi2` | 1 | `PhiForCausalLM` |
+| `phi3` | 2 | `Phi3ForCausalLM`, `Phi4ForCausalLMV` |
+| `phimoe` | 1 | `PhiMoEForCausalLM` |
+| `plamo` | 1 | `PlamoForCausalLM` |
+| `plamo2` | 2 | `Plamo2ForCausalLM`, `PLaMo2ForCausalLM` |
+| `plamo3` | 2 | `Plamo3ForCausalLM`, `PLaMo3ForCausalLM` |
+| `plm` | 1 | `PLMForCausalLM` |
+| `pockettts` | 1 | `PocketTTSModel` |
+| `qwen` | 1 | `QWenLMHeadModel` |
+| `qwen2` | 6 | `AudioFlamingo3ForConditionalGeneration`, `DotsOCRForCausalLM`, `KORMoForCausalLM`, `Qwen2AudioForConditionalGeneration`, `Qwen2ForCausalLM`, `Qwen2Model` |
+| `qwen2moe` | 1 | `Qwen2MoeForCausalLM` |
+| `qwen2vl` | 4 | `Qwen2_5OmniModel`, `Qwen2_5_VLForConditionalGeneration`, `Qwen2VLForConditionalGeneration`, `Qwen2VLModel` |
+| `qwen3` | 3 | `Qwen3ForCausalLM`, `Qwen3Model`, `StepVLForConditionalGeneration` |
+| `qwen35` | 11 | `H2OLightningModel`, `KevModel`, `LevModel`, `MiniCPMV4_6ForConditionalGeneration`, `NimbleModel`, `OpenJevModel`, `PplxDeciderModel`, `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5TextModel`, `VllmD3Model` |
+| `qwen35moe` | 2 | `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration` |
+| `qwen3moe` | 1 | `Qwen3MoeForCausalLM` |
+| `qwen3next` | 1 | `Qwen3NextForCausalLM` |
+| `qwen3tts` | 1 | `Qwen3TTSForConditionalGeneration` |
+| `qwen3vl` | 2 | `Qwen3ASRForConditionalGeneration`, `Qwen3VLForConditionalGeneration` |
+| `qwen3vlmoe` | 2 | `Qwen3OmniMoeForConditionalGeneration`, `Qwen3VLMoeForConditionalGeneration` |
+| `qwen4exp` | 2 | `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` |
+| `refact` | 1 | `GPTRefactForCausalLM` |
+| `rnd1` | 1 | `RND1` |
+| `rwkv6` | 1 | `Rwkv6ForCausalLM` |
+| `rwkv6qwen2` | 1 | `RWKV6Qwen2ForCausalLM` |
+| `rwkv7` | 2 | `Rwkv7ForCausalLM`, `RWKV7ForCausalLM` |
+| `seed_oss` | 1 | `SeedOssForCausalLM` |
+| `sensenova_u1` | 1 | `NEOChatModel` |
+| `smallthinker` | 1 | `SmallThinkerForCausalLM` |
+| `smollm3` | 1 | `SmolLM3ForCausalLM` |
+| `spark2_5` | 1 | `Spark2_5ForCausalLM` |
+| `stablelm` | 3 | `LlavaStableLMEpochForCausalLM`, `StableLMEpochForCausalLM`, `StableLmForCausalLM` |
+| `starcoder` | 1 | `GPTBigCodeForCausalLM` |
+| `starcoder2` | 1 | `Starcoder2ForCausalLM` |
+| `step35` | 2 | `Step3p5ForCausalLM`, `Step3p7ForConditionalGeneration` |
+| `t5` | 5 | `MT5ForConditionalGeneration`, `T5ForConditionalGeneration`, `T5WithLMHeadModel`, `UMT5ForConditionalGeneration`, `UMT5Model` |
+| `t5encoder` | 1 | `T5EncoderModel` |
+| `talkie` | 1 | `TalkieForCausalLM` |
+| `vllm-decision2` | 1 | `VllmDecision2Model` |
+| `wavtokenizer-dec` | 1 | `WavTokenizerDec` |
+| `xverse` | 1 | `XverseForCausalLM` |
+
 ## System properties
 
 Every `neuralfree.*` system property the code reads is listed below. Every Gradle run task (`runApp`, `runDemos`, `runLLMDemo`) forwards `-Pneuralfree.x=y` and `-Dneuralfree.x=y` to the program's JVM; pass them to your own JVM as `-Dneuralfree.x=y`. The build properties are under [Build](#build). The demo's command-line flags take precedence over the engine properties they correspond to.
@@ -358,6 +677,27 @@ Every `neuralfree.*` system property the code reads is listed below. Every Gradl
 | `neuralfree.draft.type` | `auto`, `draft-mtp` or `draft-simple`, as `--spec-type` | `auto` |
 | `neuralfree.mtp` | Self-speculation with the model's NextN/MTP blocks | false |
 | `neuralfree.lora` | Adapters as `path[:scale][,path[:scale]...]` | none |
+
+### Hugging Face checkpoints (`ModelSourceOptions.fromProperties`)
+
+GGUF files ignore these; Hugging Face checkpoints read them at open. The meanings and defaults are the [flags table](#flags-and-properties)'s; each is the matching property of `ModelSourceOptions` or `EngineConfig`.
+
+| Property | Meaning | Default |
+|---|---|---|
+| `neuralfree.hf.materialize` | `auto`, `memory`, `disk` or `none` | `auto` |
+| `neuralfree.hf.materialize.memory.max` | Direct-memory budget of `auto`, as `<n>[K|M|G]` bytes | `2G` |
+| `neuralfree.hf.cache.dir` | Parent of the per-process disk-sidecar directories | `~/.cache/neuralfree/hf` |
+| `neuralfree.hf.outtype` | `source`, `auto`, `f32`, `f16`, `bf16` or `q8_0` | `source` |
+| `neuralfree.quant.online` | `none`, `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1` or `iq4_nl` | `none` |
+| `neuralfree.hf.quant.exact` | Prefer bit-exact weight types over close repacks | false |
+| `neuralfree.hf.mtp` | Keep the model's MTP/NextN layers | true |
+| `neuralfree.hf.st.dense` | Include sentence-transformers dense heads | true |
+| `neuralfree.hf.overrides` | JSON object merged into `config.json` before conversion | none |
+| `neuralfree.hf.tokenizer` | Tokenizer directory, or GGUF file, replacing the model's tokenizer files | none |
+| `neuralfree.lora.base.config` | HF config of a LoRA adapter's GGUF base | none |
+| `neuralfree.hf.base.dir` | Local base model a decision-LoRA checkpoint merges | none |
+| `neuralfree.act.quant` | Activation quantization: `weight-only` or `checkpoint` | `weight-only` |
+| `neuralfree.sampling.model.defaults` | Apply the model's sampling defaults | true |
 
 ### Memory (`MemoryConfig.fromProperties`)
 

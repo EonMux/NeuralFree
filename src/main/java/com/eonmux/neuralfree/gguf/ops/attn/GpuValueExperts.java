@@ -165,9 +165,10 @@ final class GpuValueExperts implements AutoCloseable {
             throw new UnsupportedOperationException("layer " + layer + ": " + exps.name() + " has type "
                     + exps.type() + ", which has no expert matvec kernels");
         }
-        if (exps.hasScale() || exps.hadamard() != null) {
-            throw new IllegalStateException("layer " + layer + ": " + exps.name() + " carries a per-tensor scale or"
-                    + " Hadamard transform, which build_lora_mm_id does not apply to value experts");
+        if (exps.hasScale() || exps.hadamard() != null || (exps.inputTransform() != null
+                && !exps.inputTransform().isIdentity())) {
+            throw new IllegalStateException("layer " + layer + ": " + exps.name() + " carries a per-tensor scale,"
+                    + " Hadamard or input transform, which build_lora_mm_id does not apply to value experts");
         }
     }
 

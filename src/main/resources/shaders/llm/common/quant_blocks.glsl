@@ -68,6 +68,14 @@
 #define QT_Q1_0     41
 #define QT_Q2_0     42
 
+/* ---- NeuralFree extension weight-type ids (GGMLType ids 1000-1005, no ggml_type counterpart) ---- */
+#define QT_F8_E4M3       1000
+#define QT_F8_E4M3_B128  1001
+#define QT_MXFP8         1002
+#define QT_I8_B128       1003
+#define QT_NF4           1004
+#define QT_FP4_BNB       1005
+
 /* ---- Block constants: elements (_BS) and bytes (_BB) per block (llama.cpp ggml-common.h) ---- */
 #define NF_F32_BS      1
 #define NF_F32_BB      4
@@ -127,6 +135,20 @@
 #define NF_TQ1_0_BB    54
 #define NF_TQ2_0_BS    256
 #define NF_TQ2_0_BB    66
+
+/* ---- Extension block constants (layouts: common/quant_ext.glsl; Java GGMLType / BlockLayout) ---- */
+#define NF_F8_E4M3_BS       32
+#define NF_F8_E4M3_BB       32
+#define NF_F8_E4M3_B128_BS  128
+#define NF_F8_E4M3_B128_BB  132
+#define NF_MXFP8_BS         32
+#define NF_MXFP8_BB         33
+#define NF_I8_B128_BS       128
+#define NF_I8_B128_BB       132
+#define NF_NF4_BS           64
+#define NF_NF4_BB           36
+#define NF_FP4_BNB_BS       64
+#define NF_FP4_BNB_BB       36
 
 /* ---- Weight streams and readers ---- */
 #ifndef NF_WEIGHT_STREAMS
@@ -234,6 +256,12 @@ int nf_kvalue_fp4(uint q) {
  * (llama.cpp ggml-impl.h:489 ggml_e8m0_to_fp32_half; C mxfp4_scale). */
 float nf_e8m0_half(uint e) {
     return uintBitsToFloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
+}
+
+/* E8M0 exponent byte to 2^(e - 127) exactly, the OCP MX block scale (Java FpBlockDecoders.e8m0ToFp32;
+ * C e8m0_scale): the subnormal 2^-127 for e = 0. The NaN code 255 gives +inf; repackers reject it. */
+float nf_e8m0(uint e) {
+    return uintBitsToFloat(e == 0u ? 0x00400000u : (e << 23));
 }
 
 /* 6-bit scale (x) and min (y) of sub-block j in [0, 8) of a Q4_K/Q5_K block whose 12 scale

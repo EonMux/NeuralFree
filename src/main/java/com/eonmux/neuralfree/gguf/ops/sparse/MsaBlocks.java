@@ -589,13 +589,14 @@ public final class MsaBlocks {
      * A per-head 3-D weight ({@code ne = {cols, rows, nHead}}) read by the id-matvec kernels, which address it as
      * one binding without transforms.
      *
-     * @throws IllegalStateException when it is sharded, rotated, scaled or of another shape
+     * @throws IllegalStateException when it is sharded, rotated, transformed, scaled or of another shape
      */
     static GpuWeight gpuHeadStack(GpuWeights ws, LayerSpec layer, String base, long cols, long rows, int nHead) {
         GpuWeight w = gpuMatrix(ws, layer, base, cols, rows * nHead);
-        if (!w.isSingleShard() || w.hadamard() != null || w.hasScale()) {
+        if (!w.isSingleShard() || w.hadamard() != null || w.hasScale()
+                || (w.inputTransform() != null && !w.inputTransform().isIdentity())) {
             throw new IllegalStateException("layer " + describe(layer) + ": " + w.name() + " must be one unscaled "
-                    + "buffer without an input rotation for the per-head id-matvec");
+                    + "buffer without an input transform for the per-head id-matvec");
         }
         return w;
     }

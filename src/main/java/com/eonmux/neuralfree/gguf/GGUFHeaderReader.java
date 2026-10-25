@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf;
 
+import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
+
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -18,6 +20,11 @@ import java.util.Map;
  * (gguf.cpp:657-680), and every string length and array count against its maximum and the bytes left in the file
  * before anything is allocated (gguf.cpp:280-296, 348-356).
  *
+ * <p>A tensor of a NeuralFree extension type ({@link GGMLType#isExtension()}, ids 1000-1099, which ggml does not
+ * define) is accepted only when the same file's key/value section sets {@link GgufKeys#NF_EXTENSION_TYPES} to BOOL
+ * true. Every file of a split model that holds such tensors therefore carries the key itself. Ids that map to
+ * {@link GGMLType#UNKNOWN} are left to {@link GGUFTensorInfo#validate}.</p>
+ *
  * <p>Reads are positional channel reads through a private buffer, so the channel position and any file pointer
  * of the underlying file are left untouched. Not thread-safe.</p>
  */
@@ -31,12 +38,6 @@ final class GGUFHeaderReader {
 
     /** Largest array element count ({@code GGUF_MAX_ARRAY_ELEMENTS}, gguf.cpp:21). */
     static final long MAX_ARRAY_ELEMENTS = 1L << 30;
-
-    /** Maximum tensor rank ({@code GGML_MAX_DIMS}). */
-    static final int MAX_DIMS = 4;
-
-    /** Tensor names must be shorter than this many bytes ({@code GGML_MAX_NAME}). */
-    static final int MAX_NAME = 64;
 
     /** Largest tensor or key/value count one Java collection indexes. */
     private static final long MAX_ENTRIES = Integer.MAX_VALUE - 8L;
@@ -70,6 +71,10 @@ final class GGUFHeaderReader {
     private final long fileLength;
     private final ByteBuffer buf;
     private long position;
+    /** Type of this file's {@link GgufKeys#NF_EXTENSION_TYPES} pair; null until (and unless) it is read. */
+    private GGUFValueType extensionMarkerType;
+    /** Value of this file's {@link GgufKeys#NF_EXTENSION_TYPES} pair; null until (and unless) it is read. */
+    private Object extensionMarkerValue;
 
     /** A reader positioned at the start of the file behind {@code channel}; {@code path} names it in messages. */
     GGUFHeaderReader(String path, FileChannel channel) throws IOException {
@@ -115,7 +120,8 @@ final class GGUFHeaderReader {
 
     /**
      * Reads key/value pair {@code index} into {@code values}, recording its type in {@code types} and, for an
-     * array, the element type in {@code elementTypes} (which may be null).
+     * array, the element type in {@code elementTypes} (which may be null). The {@link GgufKeys#NF_EXTENSION_TYPES}
+     * pair is also kept by the reader, which checks the tensor infos that follow against it.
      */
     void readKVPair(long index, Map<String, Object> values, Map<String, GGUFValueType> types,
                     Map<String, GGUFValueType> elementTypes) throws IOException {
@@ -140,28 +146,65 @@ final class GGUFHeaderReader {
             values.put(key, readScalar(type, "key '" + key + "'", -1L));
         }
         types.put(key, type);
+        if (GgufKeys.NF_EXTENSION_TYPES.equals(key)) {
+            extensionMarkerType = type;
+            extensionMarkerValue = values.get(key);
+        }
     }
 
-    /** Reads tensor info {@code index}: name, rank, extents, ggml type and data offset. */
+    /**
+     * Reads tensor info {@code index}: name, rank, extents, ggml type and data offset. Called after every key/value
+     * pair of the file has been read, as the tensor infos follow them.
+     *
+     * @throws IOException when the type is a NeuralFree extension type and the file does not set
+     *                     {@link GgufKeys#NF_EXTENSION_TYPES} to BOOL true
+     */
     GGUFTensorInfo readTensorInfo(long index) throws IOException {
         byte[] nameBytes = readStringBytes("name of tensor " + index, -1L);
-        if (nameBytes.length >= MAX_NAME) {
+        if (nameBytes.length >= GGUFTensorInfo.MAX_NAME_BYTES) {
             throw format("name of tensor " + index + " is " + nameBytes.length + " bytes long, more than the "
-                    + (MAX_NAME - 1) + " allowed");
+                    + (GGUFTensorInfo.MAX_NAME_BYTES - 1) + " allowed");
         }
         String name = new String(nameBytes, StandardCharsets.UTF_8);
         int nDims = u32();
-        if (Integer.compareUnsigned(nDims, MAX_DIMS) > 0) {
+        if (Integer.compareUnsigned(nDims, GGUFTensorInfo.MAX_DIMS) > 0) {
             throw format("tensor '" + name + "' has " + Integer.toUnsignedString(nDims)
-                    + " dimensions, more than the maximum of " + MAX_DIMS);
+                    + " dimensions, more than the maximum of " + GGUFTensorInfo.MAX_DIMS);
         }
         long[] dims = new long[nDims];
         for (int i = 0; i < nDims; i++) {
             dims[i] = u64();
         }
         GGMLType type = GGMLType.fromId(u32());
+        if (type.isExtension()) {
+            requireExtensionTypesDeclared(name, type);
+        }
         long offset = u64();
         return new GGUFTensorInfo(name, dims, type, offset);
+    }
+
+    private void requireExtensionTypesDeclared(String name, GGMLType type) throws IOException {
+        if (extensionMarkerType == GGUFValueType.BOOL && Boolean.TRUE.equals(extensionMarkerValue)) {
+            return;
+        }
+        String uses = "tensor '" + name + "' uses NeuralFree extension type " + type + " but ";
+        if (extensionMarkerType == null) {
+            throw format(uses + "the file lacks " + GgufKeys.NF_EXTENSION_TYPES);
+        }
+        throw format(uses + "the file sets " + GgufKeys.NF_EXTENSION_TYPES + " to " + describeMarker()
+                + ", not BOOL true");
+    }
+
+    /** The stored marker for a message: its type, and its value when that is a bounded scalar. */
+    private String describeMarker() {
+        switch (extensionMarkerType) {
+            case ARRAY:
+                return "an array";
+            case STRING:
+                return "a STRING";
+            default:
+                return extensionMarkerType + " " + extensionMarkerValue;
+        }
     }
 
     // ------------------------------------------------------------------ values

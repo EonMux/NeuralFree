@@ -209,7 +209,7 @@ task runApp(type: JavaExec) {
 }
 
 task runLLMDemo(type: JavaExec) {
-    description = 'Runs the LLM Demo with GGUF model inference'
+    description = 'Runs LLM inference on a GGUF model or Hugging Face checkpoint'
     group = 'application'
 
     classpath = sourceSets.main.runtimeClasspath
@@ -259,6 +259,7 @@ jar {
 }
 
 apply from: 'gradle/gpu-kernels.gradle'
+apply from: 'gradle/hf-tables.gradle'
 
 // GPU kernel artifacts are generated under build/generated/gpu and merged here; GLSL sources, shared GLSL
 // includes and the shader variant tables of every kernel library are build inputs only. The OpenCL kernel

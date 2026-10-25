@@ -11,7 +11,11 @@ import com.eonmux.neuralfree.demo.LLMDemoOptions.UsageException;
 import com.eonmux.neuralfree.gguf.GGUFModel;
 import com.eonmux.neuralfree.gguf.GGUFModelGPU;
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
+import com.eonmux.neuralfree.gguf.GgufWriter;
+import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.LLMModel;
+import com.eonmux.neuralfree.gguf.ModelSource;
+import com.eonmux.neuralfree.gguf.ModelSources;
 import com.eonmux.neuralfree.gguf.TensorReadMode;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.PoolingKind;
@@ -25,6 +29,7 @@ import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
 import com.eonmux.neuralfree.gguf.engine.PocketTtsSession;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
+import com.eonmux.neuralfree.gguf.engine.SamplingDefaults;
 import com.eonmux.neuralfree.gguf.engine.SpeculativeDecoder;
 import com.eonmux.neuralfree.gguf.engine.SpeculativeSession;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
@@ -37,6 +42,7 @@ import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.DataOutputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -45,6 +51,8 @@ import java.io.BufferedOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -87,14 +95,30 @@ public final class LLMDemo {
             return;
         }
         String modelPath = resolveModelPath(opts);
-        if (modelPath == null || !new java.io.File(modelPath).isFile()) {
-            System.err.println(modelPath == null ? "No model specified." : "Model file not found: " + modelPath);
-            System.err.println("Specify a GGUF model with one of:");
-            System.err.println("  --model <path>            (e.g. ./gradlew runLLMDemo -Pargs=\"--model /path/to/model.gguf\")");
-            System.err.println("  export NEURALFREE_MODEL=<path>");
-            System.err.println("  -Dneuralfree.model=<path>");
+        if (modelPath == null) {
+            System.err.println("No model specified.");
+            printModelOptions();
             System.exit(2);
             return;
+        }
+        try {
+            ModelSources.requireOpenable(modelPath);
+        } catch (FileNotFoundException e) {
+            System.err.println("Model not found: " + modelPath);
+            printModelOptions();
+            System.exit(2);
+            return;
+        }
+        if (opts.exportGguf != null) {
+            try {
+                exportGguf(modelPath, opts);
+                return;
+            } catch (Exception e) {
+                System.err.println("Error: " + e.getMessage());
+                e.printStackTrace();
+                System.exit(1);
+                return;
+            }
         }
         if (opts.noMmap) {
             System.setProperty(TensorReadMode.PROP_DISABLE_MMAP, "true");
@@ -145,6 +169,33 @@ public final class LLMDemo {
             path = System.getenv("NEURALFREE_MODEL");
         }
         return path != null && !path.isEmpty() ? path : null;
+    }
+
+    /** How a missing model is reported: a GGUF file, a Hugging Face model directory or a safetensors file. */
+    private static void printModelOptions() {
+        System.err.println("Specify a model (GGUF file, Hugging Face model directory, or .safetensors file) with one of:");
+        System.err.println(
+                "  --model <path>            (e.g. ./gradlew runLLMDemo -Pargs=\"--model /path/to/model.gguf\")");
+        System.err.println("  export NEURALFREE_MODEL=<path>");
+        System.err.println("  -Dneuralfree.model=<path>");
+    }
+
+    // ================================================================== export
+
+    /**
+     * Outputs the model's GGUF view to {@code --export-gguf} ({@link GgufWriter}, with the {@code --export-mode} and
+     * {@code --export-overwrite} options and the Hugging Face flags' {@link ModelSourceOptions}); main exits after the
+     * write, without generating.
+     */
+    private static void exportGguf(String modelPath, LLMDemoOptions opts) throws IOException {
+        System.out.println("=== LLM Demo - GGUF export ===");
+        Path out = Paths.get(opts.exportGguf);
+        GgufWriter.Options options = new GgufWriter.Options(opts.exportMode, opts.exportOverwrite,
+                GGUFFileParser.DEFAULT_ALIGNMENT);
+        try (ModelSource src = ModelSources.open(modelPath, opts.engine.sourceOptions())) {
+            GgufWriter.write(src, out, options);
+            System.out.println("Exported '" + modelPath + "' to '" + out + "'.");
+        }
     }
 
     // ================================================================== session
@@ -392,6 +443,9 @@ public final class LLMDemo {
         GenerationResult generate(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
                                   String renderedPrompt) throws IOException;
 
+        /** The request {@link #generate} runs for {@code request}, with the model's sampling defaults applied. */
+        GenerationRequest effective(GenerationRequest request);
+
         void reset();
     }
 
@@ -400,6 +454,7 @@ public final class LLMDemo {
         try {
             Generator generator;
             if (session != null) {
+                SamplingDefaults defaults = SamplingDefaults.forModel(model, cfg);
                 System.out.println("Speculative decoding: " + session.drafterKind() + " drafter, draft max "
                         + session.draftMax() + ", min " + session.draftMin() + ", p_min " + cfg.draftPMin());
                 logStats("Speculative: " + session.drafterKind() + ", draft max " + session.draftMax());
@@ -408,6 +463,11 @@ public final class LLMDemo {
                     public GenerationResult generate(int[] prompt, GenerationRequest request,
                                                      ReasoningFilter.Sink sink, String rendered) {
                         return session.generate(prompt, request, sink, rendered);
+                    }
+
+                    @Override
+                    public GenerationRequest effective(GenerationRequest request) {
+                        return request.withModelDefaults(defaults);
                     }
 
                     @Override
@@ -446,6 +506,11 @@ public final class LLMDemo {
             }
 
             @Override
+            public GenerationRequest effective(GenerationRequest request) {
+                return request.withModelDefaults(loop.samplingDefaults());
+            }
+
+            @Override
             public void reset() {
                 model.resetKVCache();
             }
@@ -460,6 +525,11 @@ public final class LLMDemo {
                                              String rendered) throws IOException {
                 return model.generate(prompt, request,
                         (id, text) -> sink.accept(ReasoningFilter.Channel.CONTENT, id, text));
+            }
+
+            @Override
+            public GenerationRequest effective(GenerationRequest request) {
+                return request;
             }
 
             @Override
@@ -587,7 +657,8 @@ public final class LLMDemo {
         Scanner scanner = new Scanner(System.in, StandardCharsets.UTF_8.name());
         GGUFTokenizer tokenizer = model.tokenizer();
         List<Map<String, String>> conversationHistory = new ArrayList<>();
-        SamplerConfig sampler = request.sampler();
+        GenerationRequest shown = generator.effective(request);
+        SamplerConfig sampler = shown.sampler();
 
         System.out.println("Chat ready. Type your message (or 'quit' to exit, 'clear' to reset):");
         System.out.println(String.format(Locale.ROOT,
@@ -595,10 +666,10 @@ public final class LLMDemo {
                         + " repeat_penalty=%.2f, presence_penalty=%.2f, frequency_penalty=%.2f, repeat_last_n=%d,"
                         + " seed=%d%s%s",
                 sampler.temperature(), sampler.topP(), sampler.topK(), sampler.minP(), sampler.typicalP(),
-                request.maxNewTokens(), sampler.repeatPenalty(), sampler.presencePenalty(),
+                shown.maxNewTokens(), sampler.repeatPenalty(), sampler.presencePenalty(),
                 sampler.frequencyPenalty(), sampler.penaltyLastN(), sampler.seed(),
-                request.ignoreEos() ? ", ignore_eos" : "",
-                request.stopStrings().isEmpty() ? "" : ", stop=" + request.stopStrings()));
+                shown.ignoreEos() ? ", ignore_eos" : "",
+                shown.stopStrings().isEmpty() ? "" : ", stop=" + shown.stopStrings()));
         System.out.println();
 
         while (true) {

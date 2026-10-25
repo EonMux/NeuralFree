@@ -20,6 +20,7 @@ import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
+import com.eonmux.neuralfree.gguf.engine.SamplingDefaults;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuBlockRegistry;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuFactoryCatalog;
 import com.eonmux.neuralfree.gguf.gpu.diag.GpuDiagnostics;
@@ -35,7 +36,6 @@ import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.weights.LayerWeightSet;
 import com.eonmux.neuralfree.gguf.gpu.weights.StreamingLayerWeightSource;
 import com.eonmux.neuralfree.gguf.gpu.weights.WeightPlacement;
-import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.ContextFitter;
@@ -57,11 +57,10 @@ import com.eonmux.neuralfree.gguf.ops.heads.LoraAttachment;
 import com.eonmux.neuralfree.gguf.ops.heads.PoolingHead;
 import com.eonmux.neuralfree.gguf.ops.heads.SwitchedLoraBackend;
 import com.eonmux.neuralfree.gguf.ops.heads.SwitchedLoraExtra;
-import com.eonmux.neuralfree.gguf.quant.PrismHadamardLoader;
+import com.eonmux.neuralfree.gguf.quant.InputTransformLoader;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
-import com.eonmux.neuralfree.gguf.spec.TensorRef;
 import com.eonmux.neuralfree.gguf.spec.resolve.ModelSpecBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -82,7 +81,8 @@ import java.util.function.Predicate;
 /**
  * A GGUF model on a GPU backend (OpenCL, CUDA or Vulkan), assembled from the spec-driven engine:
  * <ol>
- *   <li>the file ({@link GGUFFileParser}), its metadata ({@link GgufKv}) and the resolved {@link ModelSpec};</li>
+ *   <li>the model's {@link ModelSource} ({@link ModelSources} with the configuration's
+ *       {@link EngineConfig#sourceOptions()}), its metadata ({@link GgufKv}) and the resolved {@link ModelSpec};</li>
  *   <li>the LLM kernels and the weight upload plan ({@link GpuWeightUploader}, PRISM transforms included);</li>
  *   <li>the memory plan ({@link MemoryPlanner} with {@link ContextFitter} against the free VRAM), the device memory
  *       ({@link DeviceModelMemory}) and the weight placement: every weight resident, or the trunk layers streamed
@@ -119,9 +119,10 @@ public final class GGUFModelGPU implements EngineModel {
     static final int MIN_STREAMING_SLOTS = 2;
     private static final double MIB = 1024.0 * 1024.0;
 
-    private final GGUFFileParser parser;
+    private final ModelSource source;
     private final GGUFTokenizer tokenizer;
     private final String modelName;
+    private final SamplingDefaults samplingDefaults;
     private final ObserverSlot observer = new ObserverSlot();
 
     private EngineConfig config;
@@ -135,8 +136,10 @@ public final class GGUFModelGPU implements EngineModel {
     private ComputeQueue queue;
     private LlmKernels kernels;
     private TensorCatalog catalog;
-    private PrismHadamardLoader.Result prism;
+    private InputTransformLoader.Result transforms;
     private WeightStore store;
+    /** The store the streamed trunk is read from, opened for {@link StoreUse#STREAMING} when streaming is chosen. */
+    private WeightStore streamingStore;
     private GpuPlaceholders placeholders;
     private GpuScratch scratch;
     private GpuOps ops;
@@ -208,12 +211,14 @@ public final class GGUFModelGPU implements EngineModel {
             throw new IllegalArgumentException("backend mode " + cfg.backend() + " runs on the CPU; load the model with"
                     + " GGUFModel, or pass a GPU backend");
         }
-        this.parser = new GGUFFileParser(path);
+        this.source = ModelSources.open(path, cfg.sourceOptions(), null, cfg.activationQuant());
         try {
-            this.tokenizer = new GGUFTokenizer(parser);
-            String name = parser.getString("general.name");
-            this.modelName = name != null ? name : parser.getString("general.architecture");
-            load(sharedBackend, cfg);
+            this.tokenizer = new GGUFTokenizer(source);
+            String name = source.getString("general.name");
+            this.modelName = name != null ? name : source.getString("general.architecture");
+            GgufKv kv = GgufKv.of(source);
+            this.samplingDefaults = SamplingDefaults.read(kv);
+            load(sharedBackend, cfg, kv);
         } catch (Throwable failure) {
             releaseAfterFailedLoad(failure);
             throw failure;
@@ -224,19 +229,15 @@ public final class GGUFModelGPU implements EngineModel {
     // Construction
     // ============================================================================================
 
-    private void load(ComputeBackend sharedBackend, EngineConfig cfg) throws IOException {
-        GgufKv kv = GgufKv.of(parser);
-        this.catalog = TensorCatalog.of(parser);
+    private void load(ComputeBackend sharedBackend, EngineConfig cfg, GgufKv kv) throws IOException {
+        this.catalog = TensorCatalog.of(source);
         ModelSpec initial = ModelSpecBuilder.build(kv, catalog, cfg.memory());
         if (initial.supportClass() == SupportClass.DRAFT) {
             throw new UnsupportedOperationException(initial.arch().ggufName() + " is a draft model; load it against"
                     + " its target model through DraftModelLoader");
         }
         GpuFactoryCatalog.checkRouting(initial);
-        this.prism = PrismHadamardLoader.load(kv, n -> {
-            TensorRef r = catalog.get(n);
-            return r != null ? r.ne() : null;
-        }, kv.u32(GgufKeys.SSM_TIME_STEP_RANK, 0), kv.u32(GgufKeys.SSM_GROUP_COUNT, 0));
+        this.transforms = InputTransformLoader.load(source, kv, catalog, cfg.activationQuant());
 
         openBackend(sharedBackend, cfg);
         this.queue = backend.computeQueue();
@@ -247,10 +248,10 @@ public final class GGUFModelGPU implements EngineModel {
         this.drafter = LLMModelFactory.draftCompanion(cfg, initial, false, this::draftDeviceWeightBytes);
         this.placeholders = GpuPlaceholders.allocate(backend, queue);
         this.scratch = GpuScratch.forModel(backend, initial, mem.ubatch());
-        this.store = parser.createMappedStore();
-        this.uploader = new GpuWeightUploader(backend, queue, parser.getTensors(), store, initial.arch().ggufName(),
+        this.store = source.createMappedStore(StoreUse.RESIDENT_UPLOAD);
+        this.uploader = new GpuWeightUploader(backend, queue, source.getTensors(), store, initial.arch().ggufName(),
                 GpuWeightUploader.config(GpuWeightUploader.TypePolicy.forKernels(kernels))
-                        .prism(prism)
+                        .transforms(transforms)
                         .build());
         this.weightPlacement = WeightPlacement.of(initial, loadsNextn(cfg, mem));
         loadLoras(initial, cfg, mem);
@@ -325,8 +326,8 @@ public final class GGUFModelGPU implements EngineModel {
      * file weights {@code LLMModelFactory} uploads). The PRISM transforms of a draft file attach to its device tensors
      * without changing their plans, so the planner needs none. Plans only; nothing is allocated.
      */
-    private long draftDeviceWeightBytes(GGUFFileParser draft, Predicate<GGUFTensorInfo> placed) throws IOException {
-        try (WeightStore draftStore = draft.createMappedStore()) {
+    private long draftDeviceWeightBytes(ModelSource draft, Predicate<GGUFTensorInfo> placed) throws IOException {
+        try (WeightStore draftStore = draft.createMappedStore(StoreUse.RESIDENT_UPLOAD)) {
             GpuWeightUploader planner = new GpuWeightUploader(backend, queue, draft.getTensors(), draftStore,
                     draft.getString("general.architecture"),
                     GpuWeightUploader.config(GpuWeightUploader.TypePolicy.forKernels(kernels)).build());
@@ -411,11 +412,11 @@ public final class GGUFModelGPU implements EngineModel {
                 backend.backendType().name());
     }
 
-    /** Streamed sets of the trunk, with the uploader's device types and the PRISM input transforms. */
+    /** Streamed sets of the trunk, with the uploader's device types and the model's input transforms. */
     private List<LayerWeightSet> trunkSets(ModelSpec s) {
         LayerWeightSet.Options options = LayerWeightSet.Options.builder(t -> uploader.deviceType(t.name()))
                 .maxShardBytes(LayerWeightSet.Options.maxShardBytes(backend.capabilities()))
-                .hadamard(prism.forward())
+                .transforms(transforms)
                 .build();
         return LayerWeightSet.forTrunk(s, options);
     }
@@ -431,9 +432,10 @@ public final class GGUFModelGPU implements EngineModel {
     /**
      * Uploads the resident weights, every tensor placed on the device ({@link #weightPlacement}) but the streamed
      * trunk, then opens the streaming source over the usable VRAM that is left after the drafter memory the context
-     * fit reserved (its depth from {@code neuralfree.vram.depth}, else the largest that fits).
+     * fit reserved (its depth from {@code neuralfree.vram.depth}, else the largest that fits). The streaming source
+     * reads the trunk through a store of its own ({@link StoreUse#STREAMING}), released with it.
      */
-    private void uploadWeights(boolean streamed) {
+    private void uploadWeights(boolean streamed) throws IOException {
         WeightPlacement placed = weightPlacement;
         if (!streamed) {
             uploader.uploadResident(t -> !placed.onDevice(t));
@@ -442,8 +444,9 @@ public final class GGUFModelGPU implements EngineModel {
         List<LayerWeightSet> sets = trunkSets(forwardSpec);
         Set<String> trunk = new HashSet<>(LayerWeightSet.allNames(sets));
         uploader.uploadResident(t -> !placed.onDevice(t) || trunk.contains(t.name()));
-        this.streaming = StreamingLayerWeightSource.open(backend, queue, uploader, store, parser.getTensors(),
-                forwardSpec, sets, config, usableVram());
+        this.streamingStore = source.createMappedStore(StoreUse.STREAMING);
+        this.streaming = StreamingLayerWeightSource.open(backend, queue, uploader, streamingStore,
+                source.getTensors(), forwardSpec, sets, config, usableVram());
         this.streamedSets = sets;
     }
 
@@ -510,7 +513,7 @@ public final class GGUFModelGPU implements EngineModel {
         }
         List<LoraAttachment.Binding> bindings = new ArrayList<>(specs.size());
         for (EngineConfig.LoraSpec s : specs) {
-            bindings.add(LoraAttachment.Binding.load(s.path(), s.scale(), cpuWeights()));
+            bindings.add(LoraAttachment.Binding.load(s.path(), s.scale(), cpuWeights(), cfg.sourceOptions()));
         }
         this.loraBindings = Collections.unmodifiableList(bindings);
         this.pendingDeviceBytes = LoraAttachment.gpuDeviceBytes(bindings, mem.ubatch());
@@ -554,6 +557,12 @@ public final class GGUFModelGPU implements EngineModel {
     @Override
     public ModelSpec spec() {
         return spec;
+    }
+
+    /** The sampling defaults of the model's metadata ({@link SamplingDefaults#read}). */
+    @Override
+    public SamplingDefaults modelSamplingDefaults() {
+        return samplingDefaults;
     }
 
     /**
@@ -637,7 +646,7 @@ public final class GGUFModelGPU implements EngineModel {
     public CpuWeights cpuWeights() throws IOException {
         ensureOpen();
         if (cpuWeights == null) {
-            cpuWeights = CpuWeights.open(parser, catalog, prism);
+            cpuWeights = CpuWeights.open(source, catalog, transforms);
         }
         return cpuWeights;
     }
@@ -1097,7 +1106,7 @@ public final class GGUFModelGPU implements EngineModel {
                     + " slots (" + mib(streaming.deviceBytes()) + " MiB, "
                     + (streaming.asyncTransfers() ? "async transfers" : "transfers on the compute queue") + ")");
         }
-        System.out.println("Tensors: " + parser.getTensorCount());
+        System.out.println("Tensors: " + source.getTensorCount());
     }
 
     // ============================================================================================
@@ -1254,7 +1263,7 @@ public final class GGUFModelGPU implements EngineModel {
      * Releases everything through its owner, in reverse order of acquisition: the audio decoder and the forward
      * backend (blocks and heads), the streaming slots, the memory, the dispatch helpers, scratch and placeholders,
      * the resident weights, then returns a shared CUDA backend's pooled device memory to the driver
-     * ({@link #trimSharedCudaPool}), then the host weights, the mapped file and the parser, and last the backend when
+     * ({@link #trimSharedCudaPool}), then the host weights, the mapped file and the source, and last the backend when
      * the model created it. Idempotent.
      */
     @Override
@@ -1272,6 +1281,7 @@ public final class GGUFModelGPU implements EngineModel {
         first = closeStep(loras, first);
         first = closeStep(rawBackend, first);
         first = closeStep(streaming, first);
+        first = closeStep(streamingStore, first);
         first = closeStep(memory, first);
         first = closeStep(ops, first);
         first = closeStep(scratch, first);
@@ -1280,7 +1290,7 @@ public final class GGUFModelGPU implements EngineModel {
         first = closeStep(this::trimSharedCudaPool, first);
         first = closeStep(cpuWeights, first);
         first = closeStep(store, first);
-        first = closeStep(parser::close, first);
+        first = closeStep(source::close, first);
         if (ownedAcceleration != null) {
             first = closeStep(ownedAcceleration::shutdown, first);
         }

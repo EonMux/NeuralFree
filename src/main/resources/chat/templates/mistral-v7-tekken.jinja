@@ -1,0 +1,12 @@
+{#- llama.cpp mistral-v7-tekken chat template (src/llama-chat.cpp:258-272): no BOS and no generation prompt. -#}
+{%- set sp = '' -%}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- '[SYSTEM_PROMPT]' ~ sp ~ content ~ '[/SYSTEM_PROMPT]' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '[INST]' ~ sp ~ content ~ '[/INST]' -}}
+    {%- else -%}
+        {{- sp ~ content ~ '</s>' -}}
+    {%- endif -%}
+{%- endfor -%}

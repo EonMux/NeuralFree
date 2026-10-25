@@ -416,11 +416,11 @@ public final class CpuDsv4Mixer implements CpuMixer {
 
     // ------------------------------------------------------------------ bind helpers
 
-    /** Twin of {@code GpuDsv4Mixer.perGroup}: the grouped {@code attn_output_a} without PRISM transform or scale. */
+    /** Twin of {@code GpuDsv4Mixer.perGroup}: the grouped {@code attn_output_a} without input transform or scale. */
     private CpuTensorRef perGroup(CpuTensorRef w) {
         CpuMatVec.Transforms t = matVec.transformsOf(w);
-        if (t.input() != null || t.hasScale()) {
-            throw new UnsupportedOperationException(layout.where + ": grouped tensor " + w + " carries a PRISM"
+        if (!t.transform().isIdentity() || t.hasScale()) {
+            throw new UnsupportedOperationException(layout.where + ": grouped tensor " + w + " carries an input"
                     + " transform or output scale, which the grouped output product does not apply");
         }
         return w;

@@ -147,8 +147,9 @@ public final class CpuDenseFfn implements CpuFfnBlock {
                                   CpuMatVec scaled, CpuMatVec unscaled, CpuProjectionDeltas deltas) {
         int rows = (int) w.rows();
         CpuMatVec.Transforms t = scaled.transformsOf(w);
-        String refusal = t.input() != null ? layer.tensorName(TensorNames.weight(base)) + " rotates its input (PRISM"
-                + " Hadamard) inside the matvec; a LoRA delta would need the rotated rows" : null;
+        String refusal = !t.transform().isIdentity() ? layer.tensorName(TensorNames.weight(base))
+                + " transforms its input (PRISM Hadamard or input transform) inside the matvec; a LoRA delta would"
+                + " need the transformed rows" : null;
         CpuProjectionDeltas.Site site = deltas.serve(layer, TensorNames.weight(base), refusal);
         float[] bias = biases ? weights.layerFloatsOrNull(layer, TensorNames.bias(base)) : null;
         if (bias != null) {
@@ -158,9 +159,12 @@ public final class CpuDenseFfn implements CpuFfnBlock {
                 t.hasScale() ? t.scale(0) : 1.0f, site);
     }
 
-    /** The same transforms without the output scale, for projections whose scale follows their bias. */
+    /**
+     * The same transforms without the output scale (the full HADAMARD/ACT_QUANT/PERMUTE input transform kept),
+     * for projections whose scale follows their bias.
+     */
     private static CpuMatVec.Transforms withoutScale(CpuMatVec.Transforms t) {
-        return t.hasScale() ? CpuMatVec.Transforms.of(t.input(), null, t.experts()) : t;
+        return t.hasScale() ? CpuMatVec.Transforms.from(t.transform(), null, t.experts()) : t;
     }
 
     // ------------------------------------------------------------------ step

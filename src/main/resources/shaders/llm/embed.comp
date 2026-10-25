@@ -45,6 +45,7 @@ layout(push_constant) uniform NfEmbParams { int embed_dim; int seq_len; } pc;
 #include "common/quant_k.glsl"
 #include "common/quant_iq.glsl"
 #include "common/quant_new.glsl"
+#include "common/quant_ext.glsl"
 
 #if !defined(QT_DECODE_ELEM) || !defined(QT_BS) || !defined(QT_BB)
 #error "embed.comp: no QT_DECODE_ELEM decoder serves QTYPE"

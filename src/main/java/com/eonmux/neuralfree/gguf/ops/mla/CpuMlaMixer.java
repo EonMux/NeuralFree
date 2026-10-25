@@ -321,7 +321,7 @@ public final class CpuMlaMixer implements CpuMixer {
      */
     private void requirePlainHeads(CpuWeights ws, CpuTensorRef w) {
         CpuMatVec.Transforms t = mv.transformsOf(w);
-        if (t.input() != null || t.hasScale()) {
+        if (!t.transform().isIdentity() || t.hasScale()) {
             throw new UnsupportedOperationException("layer " + il + ": " + name(ws, w) + " carries " + t
                     + "; the per-head MLA products take plain weights");
         }

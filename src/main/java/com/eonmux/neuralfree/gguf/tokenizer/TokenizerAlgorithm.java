@@ -39,11 +39,15 @@ public interface TokenizerAlgorithm {
      */
     byte[] piece(int id);
 
-    /** Shared {@code detokenize} for algorithms whose output is the concatenation of pieces. */
+    /**
+     * Shared {@code detokenize} for algorithms whose output is the concatenation of pieces. The
+     * leading space of the first piece is removed when encoding adds one: {@code add_space_prefix}
+     * set and the prepend scheme not {@code NEVER}.
+     */
     static String detokenize(TokenizerAlgorithm algorithm, TokenizerVocab vocab, SpecialTokens special, int[] ids) {
         int start = 0;
         int end = ids.length;
-        boolean removeSpace = vocab.addSpacePrefix();
+        boolean removeSpace = vocab.addSpacePrefix() && vocab.prependScheme() != PreTokenizerSpec.PrependScheme.NEVER;
         if (vocab.addBos() && end > 0 && ids[0] == special.bos()) {
             removeSpace = false;
             start++;
@@ -106,6 +110,17 @@ public interface TokenizerAlgorithm {
             t[total++] = x;
         }
         return java.util.Arrays.copyOf(t, total);
+    }
+
+    /**
+     * transformers {@code clean_up_tokenization}: removes the space before {@code . ? ! ,}, joins
+     * {@code " ' "} and attaches the English contractions {@code n't 'm 's 've 're}, in
+     * transformers' order.
+     */
+    static String cleanUpTokenizationSpaces(String text) {
+        return text.replace(" .", ".").replace(" ?", "?").replace(" !", "!").replace(" ,", ",").replace(" ' ", "'")
+                .replace(" n't", "n't").replace(" 'm", "'m").replace(" 's", "'s").replace(" 've", "'ve")
+                .replace(" 're", "'re");
     }
 
     /**

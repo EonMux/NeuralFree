@@ -2,8 +2,11 @@ package com.eonmux.neuralfree.gguf.jinja;
 
 import com.eonmux.neuralfree.gguf.jinja.JinjaMethods.Params;
 import com.eonmux.neuralfree.gguf.jinja.JinjaRuntime.TemplateException;
+import com.eonmux.neuralfree.utils.json.Json;
+import com.eonmux.neuralfree.utils.json.JsonException;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -35,6 +38,7 @@ final class JinjaFilters {
 
     private static final Pattern TITLE_SPLIT = Pattern.compile("[-\\s({\\[<]+", Pattern.UNICODE_CHARACTER_CLASS);
     private static final Pattern WORD = Pattern.compile("\\w+", Pattern.UNICODE_CHARACTER_CLASS);
+    private static final Json.Adapter TEMPLATE_JSON = new TemplateJsonAdapter();
 
     private JinjaFilters() {}
 
@@ -62,7 +66,7 @@ final class JinjaFilters {
             case "last": p.only(); return firstOrLast(v, false);
             case "float": return toFloat(v, p.only("default").get("default", 0, 0.0));
             case "format": return format(v, args, kwargs);
-            case "from_json": p.only(); return Json.parse(requireString(v, name));
+            case "from_json": p.only(); return fromJson(requireString(v, name));
             case "indent": return indent(JinjaValue.str(v), p.only("width", "first", "blank"));
             case "int": case "integer": return toInt(v, p.only("default", "base"));
             case "items": p.only(); return items(v);
@@ -489,273 +493,80 @@ final class JinjaFilters {
             itemSep = JinjaValue.str(((List<?>) separators).get(0));
             keySep = JinjaValue.str(((List<?>) separators).get(1));
         }
-        StringBuilder out = new StringBuilder();
-        Json.write(out, v, new Json.Style(ascii, ind, itemSep, keySep, sortKeys), 0);
-        return out.toString();
+        try {
+            return Json.toString(v, new Json.Style(ascii, ind, itemSep, keySep, sortKeys), TEMPLATE_JSON);
+        } catch (JsonException e) {
+            throw new TemplateException(-1, "tojson: " + e.getMessage(), e);
+        }
     }
 
-    // ================================================================= JSON
+    /**
+     * HF transformers {@code from_json} ({@code json.loads}): repeated keys keep the last value. Integers beyond
+     * 64 bits become floats, the template value model having no wider integer.
+     */
+    private static Object fromJson(String text) {
+        Object parsed;
+        try {
+            parsed = Json.parse(text, Json.Limits.PYTHON);
+        } catch (JsonException e) {
+            throw new TemplateException(-1, "from_json: " + e.getMessage(), e);
+        }
+        return templateNumbers(parsed);
+    }
 
-    /** Python-{@code json}-compatible serializer and parser over the template value model. */
-    static final class Json {
-
-        /** Immutable {@code json.dumps} options. */
-        static final class Style {
-            final boolean ensureAscii;
-            final String indent;
-            final String itemSep;
-            final String keySep;
-            final boolean sortKeys;
-
-            Style(boolean ensureAscii, String indent, String itemSep, String keySep, boolean sortKeys) {
-                this.ensureAscii = ensureAscii;
-                this.indent = indent;
-                this.itemSep = itemSep;
-                this.keySep = keySep;
-                this.sortKeys = sortKeys;
+    /** {@code v} with every {@link BigInteger} replaced by its double; containers are copied only where one changes. */
+    private static Object templateNumbers(Object v) {
+        if (v instanceof BigInteger) return ((BigInteger) v).doubleValue();
+        if (v instanceof List) {
+            List<?> in = (List<?>) v;
+            List<Object> out = null;
+            for (int i = 0; i < in.size(); i++) {
+                Object item = in.get(i);
+                Object mapped = templateNumbers(item);
+                if (mapped != item && out == null) out = new ArrayList<>(in);
+                if (out != null) out.set(i, mapped);
             }
+            return out == null ? v : out;
         }
-
-        private Json() {}
-
-        static void write(StringBuilder out, Object v, Style st, int depth) {
-            if (v == null || v == JinjaValue.UNDEFINED) out.append("null");
-            else if (v instanceof Boolean) out.append((Boolean) v ? "true" : "false");
-            else if (v instanceof Long) out.append(v);
-            else if (v instanceof Double) out.append(number((Double) v));
-            else if (v instanceof String) string(out, (String) v, st.ensureAscii);
-            else if (v instanceof List) writeList(out, (List<?>) v, st, depth);
-            else if (v instanceof Map) writeMap(out, (Map<?, ?>) v, st, depth);
-            else throw new TemplateException("Object of type " + JinjaValue.typeName(v) + " is not JSON serializable");
-        }
-
-        private static String number(double d) {
-            if (Double.isNaN(d)) return "NaN";
-            if (Double.isInfinite(d)) return d > 0 ? "Infinity" : "-Infinity";
-            return JinjaValue.floatRepr(d);
-        }
-
-        private static void newline(StringBuilder out, Style st, int depth) {
-            if (st.indent == null) return;
-            out.append('\n');
-            for (int i = 0; i < depth; i++) out.append(st.indent);
-        }
-
-        private static void writeList(StringBuilder out, List<?> list, Style st, int depth) {
-            if (list.isEmpty()) {
-                out.append("[]");
-                return;
+        if (v instanceof Map) {
+            Map<?, ?> in = (Map<?, ?>) v;
+            Map<Object, Object> out = null;
+            for (Map.Entry<?, ?> e : in.entrySet()) {
+                Object mapped = templateNumbers(e.getValue());
+                if (mapped != e.getValue() && out == null) out = new LinkedHashMap<>(in);
+                if (out != null) out.put(e.getKey(), mapped);
             }
-            out.append('[');
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) out.append(st.itemSep);
-                newline(out, st, depth + 1);
-                write(out, list.get(i), st, depth + 1);
+            return out == null ? v : out;
+        }
+        return v;
+    }
+
+    /**
+     * {@code tojson} view of the template value model: Undefined is written as null, keys are coerced as Python
+     * {@code json} does with template type names in errors, and keys sort as the template engine orders them.
+     */
+    private static final class TemplateJsonAdapter implements Json.Adapter {
+        @Override
+        public Object value(Object v) {
+            if (v == JinjaValue.UNDEFINED) return null;
+            if (v == null || v instanceof Boolean || v instanceof Long || v instanceof Double || v instanceof String
+                    || v instanceof List || v instanceof Map) {
+                return v;
             }
-            newline(out, st, depth);
-            out.append(']');
+            throw new TemplateException("Object of type " + JinjaValue.typeName(v) + " is not JSON serializable");
         }
 
-        private static void writeMap(StringBuilder out, Map<?, ?> map, Style st, int depth) {
-            if (map.isEmpty()) {
-                out.append("{}");
-                return;
+        @Override
+        public String key(Object k) {
+            if (k == null || k instanceof String || k instanceof Boolean || k instanceof Long || k instanceof Double) {
+                return Json.keyText(k);
             }
-            List<Map.Entry<?, ?>> entries = new ArrayList<>(map.entrySet());
-            if (st.sortKeys) entries.sort((a, b) -> JinjaValue.compare(a.getKey(), b.getKey()));
-            out.append('{');
-            boolean first = true;
-            for (Map.Entry<?, ?> e : entries) {
-                if (!first) out.append(st.itemSep);
-                first = false;
-                newline(out, st, depth + 1);
-                string(out, key(e.getKey()), st.ensureAscii);
-                out.append(st.keySep);
-                write(out, e.getValue(), st, depth + 1);
-            }
-            newline(out, st, depth);
-            out.append('}');
-        }
-
-        /** Python json key coercion: str as-is, numbers and constants by their JSON text. */
-        private static String key(Object k) {
-            if (k instanceof String) return (String) k;
-            if (k == null) return "null";
-            if (k instanceof Boolean) return (Boolean) k ? "true" : "false";
-            if (k instanceof Long) return k.toString();
-            if (k instanceof Double) return number((Double) k);
             throw new TemplateException("keys must be str, int, float, bool or None, not " + JinjaValue.typeName(k));
         }
 
-        private static void string(StringBuilder out, String s, boolean ascii) {
-            out.append('"');
-            for (int i = 0; i < s.length(); i++) {
-                char c = s.charAt(i);
-                switch (c) {
-                    case '"': out.append("\\\""); break;
-                    case '\\': out.append("\\\\"); break;
-                    case '\n': out.append("\\n"); break;
-                    case '\r': out.append("\\r"); break;
-                    case '\t': out.append("\\t"); break;
-                    case '\b': out.append("\\b"); break;
-                    case '\f': out.append("\\f"); break;
-                    default:
-                        if (c < 0x20 || (ascii && c > 0x7e)) out.append(String.format("\\u%04x", (int) c));
-                        else out.append(c);
-                }
-            }
-            out.append('"');
-        }
-
-        /** Parses JSON text (plus Python's NaN/Infinity) into lists, ordered maps, Long, Double, String, Boolean, null. */
-        static Object parse(String text) {
-            Parser p = new Parser(text);
-            p.ws();
-            Object v = p.value();
-            p.ws();
-            if (p.pos != text.length()) throw p.error("extra data");
-            return v;
-        }
-
-        private static final class Parser {
-            final String s;
-            int pos;
-
-            Parser(String s) { this.s = s; }
-
-            TemplateException error(String msg) {
-                return new TemplateException("from_json: " + msg + " at position " + pos);
-            }
-
-            void ws() {
-                while (pos < s.length() && " \t\r\n".indexOf(s.charAt(pos)) >= 0) pos++;
-            }
-
-            boolean eat(String lit) {
-                if (s.startsWith(lit, pos)) {
-                    pos += lit.length();
-                    return true;
-                }
-                return false;
-            }
-
-            Object value() {
-                if (pos >= s.length()) throw error("unexpected end of input");
-                char c = s.charAt(pos);
-                if (c == '{') return object();
-                if (c == '[') return array();
-                if (c == '"') return str();
-                if (eat("true")) return true;
-                if (eat("false")) return false;
-                if (eat("null")) return null;
-                if (eat("NaN")) return Double.NaN;
-                if (eat("Infinity")) return Double.POSITIVE_INFINITY;
-                if (eat("-Infinity")) return Double.NEGATIVE_INFINITY;
-                if (c == '-' || (c >= '0' && c <= '9')) return number();
-                throw error("unexpected character '" + c + "'");
-            }
-
-            Object object() {
-                Map<Object, Object> m = new LinkedHashMap<>();
-                pos++;
-                ws();
-                if (eat("}")) return m;
-                while (true) {
-                    ws();
-                    if (pos >= s.length() || s.charAt(pos) != '"') throw error("expected property name");
-                    String k = str();
-                    ws();
-                    if (!eat(":")) throw error("expected ':'");
-                    ws();
-                    m.put(k, value());
-                    ws();
-                    if (eat("}")) return m;
-                    if (!eat(",")) throw error("expected ',' or '}'");
-                }
-            }
-
-            Object array() {
-                List<Object> l = new ArrayList<>();
-                pos++;
-                ws();
-                if (eat("]")) return l;
-                while (true) {
-                    ws();
-                    l.add(value());
-                    ws();
-                    if (eat("]")) return l;
-                    if (!eat(",")) throw error("expected ',' or ']'");
-                }
-            }
-
-            String str() {
-                StringBuilder sb = new StringBuilder();
-                pos++;
-                while (true) {
-                    if (pos >= s.length()) throw error("unterminated string");
-                    char c = s.charAt(pos++);
-                    if (c == '"') return sb.toString();
-                    if (c < 0x20) throw error("invalid control character in string");
-                    if (c != '\\') {
-                        sb.append(c);
-                        continue;
-                    }
-                    if (pos >= s.length()) throw error("unterminated escape");
-                    char e = s.charAt(pos++);
-                    switch (e) {
-                        case '"': sb.append('"'); break;
-                        case '\\': sb.append('\\'); break;
-                        case '/': sb.append('/'); break;
-                        case 'b': sb.append('\b'); break;
-                        case 'f': sb.append('\f'); break;
-                        case 'n': sb.append('\n'); break;
-                        case 'r': sb.append('\r'); break;
-                        case 't': sb.append('\t'); break;
-                        case 'u':
-                            if (pos + 4 > s.length()) throw error("truncated \\u escape");
-                            try {
-                                sb.append((char) Integer.parseInt(s.substring(pos, pos + 4), 16));
-                            } catch (NumberFormatException ex) {
-                                throw error("invalid \\u escape");
-                            }
-                            pos += 4;
-                            break;
-                        default: throw error("invalid escape '\\" + e + "'");
-                    }
-                }
-            }
-
-            Object number() {
-                int start = pos;
-                if (s.charAt(pos) == '-') pos++;
-                while (pos < s.length() && Character.isDigit(s.charAt(pos))) pos++;
-                boolean isFloat = false;
-                if (pos < s.length() && s.charAt(pos) == '.') {
-                    isFloat = true;
-                    pos++;
-                    while (pos < s.length() && Character.isDigit(s.charAt(pos))) pos++;
-                }
-                if (pos < s.length() && (s.charAt(pos) == 'e' || s.charAt(pos) == 'E')) {
-                    isFloat = true;
-                    pos++;
-                    if (pos < s.length() && (s.charAt(pos) == '+' || s.charAt(pos) == '-')) pos++;
-                    while (pos < s.length() && Character.isDigit(s.charAt(pos))) pos++;
-                }
-                String t = s.substring(start, pos);
-                try {
-                    if (!isFloat) {
-                        try {
-                            return Long.parseLong(t);
-                        } catch (NumberFormatException overflow) {
-                            return Double.parseDouble(t);
-                        }
-                    }
-                    return Double.parseDouble(t);
-                } catch (NumberFormatException ex) {
-                    pos = start;
-                    throw error("invalid number '" + t + "'");
-                }
-            }
+        @Override
+        public int compareKeys(Object a, Object b) {
+            return JinjaValue.compare(a, b);
         }
     }
 }

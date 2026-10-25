@@ -1,0 +1,149 @@
+/*
+ * llama.cpp converter tables: the data half of llama.cpp's Hugging Face to GGUF converter (architecture
+ * registrations, tensor-name patterns, GGUF keys, hyperparameter aliases, pre-tokenizer hashes, tensor filters),
+ * its bundled chat templates and its built-in vocabularies, as checked-in classpath resources under
+ * src/main/resources/hf. Applied from build.gradle.
+ *
+ * gradle/hfgen/hfgen.py generates the directory from a llama.cpp checkout by parsing its Python sources (standard
+ * library only, llama.cpp is never imported); its module docstring documents every file and column. The helper
+ * class neuralfree.hf.HfTableCheck (buildSrc/src/main/groovy/neuralfree/hf) holds the file set, the table formats
+ * and their validator.
+ *
+ * Tasks:
+ *   updateHfTables   generates the tables from -PllamaCpp into build/hf-tables.tmp, validates them, and replaces
+ *                    src/main/resources/hf with them (the old directory is moved aside and restored on failure).
+ *                    Needs git and Python 3.9 or newer.
+ *   verifyHfTables   validates the checked-in directory without Python: every table's header, row count, column
+ *                    layout and values, and every file's size and sha256 against manifest.tsv.
+ *                    processResources depends on it.
+ *
+ * Project properties (-P):
+ *   llamaCpp             the llama.cpp checkout updateHfTables reads (required by updateHfTables)
+ *   neuralfree.python    path of the Python interpreter (default: python3, then python, from PATH)
+ *   neuralfree.git       path of git (default: PATH)
+ */
+
+import neuralfree.gpu.GpuBuildTools
+import neuralfree.hf.HfTableCheck
+import org.gradle.api.GradleException
+
+import java.nio.file.Files
+
+def hfTablesDir = file('src/main/resources/hf')
+def hfGenerator = file('gradle/hfgen/hfgen.py')
+def hfUpdateCommand = (GpuBuildTools.WINDOWS ? 'gradlew.bat' : './gradlew') + ' updateHfTables -PllamaCpp=<llama.cpp checkout>'
+def hfProp = { String name -> findProperty(name)?.toString() }
+def hfStaging = layout.buildDirectory.dir('hf-tables.tmp')
+def hfBackup = layout.buildDirectory.dir('hf-tables.old')
+/** The llama.cpp paths hfgen.py reads; local changes under them make the tables differ from the recorded commit. */
+def hfSourcePaths = ['conversion', 'gguf-py/gguf', 'models/templates', 'models/ggml-vocab-*.gguf', 'convert_hf_to_gguf_update.py']
+
+/** The interpreter updateHfTables runs hfgen.py with: -Pneuralfree.python, else python3 or python on PATH. */
+def hfFindPython = { ->
+    String explicit = hfProp('neuralfree.python')
+    File python = GpuBuildTools.find(explicit, 'neuralfree.python', 'python3', [])
+            ?: GpuBuildTools.find(null, 'neuralfree.python', 'python', [])
+    if (python == null) {
+        throw new GradleException('updateHfTables needs Python 3.9 or newer: none found on PATH (set -Pneuralfree.python)')
+    }
+    Map probe = GpuBuildTools.run([python, '-I', '-c',
+                                   'import sys; print(sys.version.split()[0]); sys.exit(0 if sys.version_info >= (3, 9) else 1)'], null)
+    if (probe.exit != 0) {
+        throw new GradleException("updateHfTables needs Python 3.9 or newer: ${python} reports "
+                + "'${((String) probe.output).trim()}' (set -Pneuralfree.python)")
+    }
+    return python
+}
+
+/** Replaces target with the directory staged, keeping target intact when a move fails. */
+def hfInstall = { File staged, File target, File backup ->
+    if (backup.exists() && !backup.deleteDir()) {
+        throw new GradleException("cannot delete ${backup}")
+    }
+    boolean hadTarget = target.exists()
+    if (hadTarget) {
+        try {
+            Files.move(target.toPath(), backup.toPath())
+        } catch (IOException e) {
+            throw new GradleException("cannot move ${target} aside to ${backup}: ${e.message}", e)
+        }
+    }
+    try {
+        Files.move(staged.toPath(), target.toPath())
+    } catch (IOException e) {
+        if (hadTarget) {
+            try {
+                Files.move(backup.toPath(), target.toPath())
+            } catch (IOException restore) {
+                e.addSuppressed(restore)
+                throw new GradleException("cannot install ${staged} as ${target}, and restoring the previous tables "
+                        + "failed; they are in ${backup}: ${e.message}", e)
+            }
+        }
+        throw new GradleException("cannot install ${staged} as ${target}; the previous tables are unchanged: ${e.message}", e)
+    }
+    if (hadTarget && !backup.deleteDir()) {
+        throw new GradleException("installed ${target} but cannot delete the previous tables in ${backup}")
+    }
+}
+
+tasks.register('updateHfTables') {
+    group = 'build'
+    description = 'Regenerates the checked-in llama.cpp converter tables (src/main/resources/hf) from a llama.cpp checkout (-PllamaCpp; needs git and Python 3.9+)'
+    doLast { task ->
+        String checkoutPath = hfProp('llamaCpp')
+        if (checkoutPath == null || checkoutPath.trim().isEmpty()) {
+            throw new GradleException("updateHfTables needs the llama.cpp checkout to read: ${hfUpdateCommand}")
+        }
+        File checkout = file(checkoutPath.trim())
+        if (!checkout.isDirectory()) {
+            throw new GradleException("-PllamaCpp=${checkoutPath} is not a directory")
+        }
+        File git = GpuBuildTools.find(hfProp('neuralfree.git'), 'neuralfree.git', 'git', [])
+        if (git == null) {
+            throw new GradleException('updateHfTables needs git to read the llama.cpp commit: none found on PATH (set -Pneuralfree.git)')
+        }
+        String commit = GpuBuildTools.runChecked([git, '-C', checkout, 'rev-parse', '--short', 'HEAD'], null,
+                "reading the commit of ${checkout}").trim()
+        String localChanges = GpuBuildTools.runChecked([git, '-C', checkout, 'status', '--porcelain', '--'] + hfSourcePaths,
+                null, "reading the status of ${checkout}").trim()
+        if (!localChanges.isEmpty()) {
+            task.logger.warn("WARNING: ${checkout} has local changes; the tables record commit ${commit} but are generated "
+                    + "from the working tree:\n${GpuBuildTools.clip(localChanges)}")
+        }
+
+        File staging = hfStaging.get().asFile
+        if (staging.exists() && !staging.deleteDir()) {
+            throw new GradleException("cannot delete ${staging}")
+        }
+        String report = GpuBuildTools.runChecked([hfFindPython(), '-I', hfGenerator, '--llama-cpp', checkout,
+                                                 '--out', staging, '--commit', commit], projectDir,
+                "hfgen.py (generating the converter tables from ${checkout})")
+        HfTableCheck.verify(staging, hfUpdateCommand)
+        String changes = HfTableCheck.difference(hfTablesDir, staging)
+        hfInstall(staging, hfTablesDir, hfBackup.get().asFile)
+        task.logger.lifecycle("updateHfTables: wrote ${projectDir.toPath().relativize(hfTablesDir.toPath())} from llama.cpp "
+                + "${commit} (${changes}):\n  " + report.readLines().join('\n  '))
+    }
+}
+
+tasks.register('verifyHfTables') {
+    group = 'verification'
+    description = 'Checks the format, row counts and manifest checksums of the checked-in llama.cpp converter tables (src/main/resources/hf)'
+    mustRunAfter 'updateHfTables'
+    def stamp = layout.buildDirectory.file('hf-tables/verify.stamp')
+    inputs.files(fileTree(hfTablesDir)).withPropertyName('tables').withPathSensitivity(PathSensitivity.RELATIVE)
+    outputs.file(stamp)
+    doLast { task ->
+        File stampFile = stamp.get().asFile
+        stampFile.delete()
+        List<String> summary = HfTableCheck.verify(hfTablesDir, hfUpdateCommand)
+        GpuBuildTools.writeText(stampFile, summary.collect { it + '\n' }.join(''))
+    }
+}
+
+// The tables ship as resources; verifyHfTables checks them before they are packaged.
+tasks.named('processResources') {
+    dependsOn 'verifyHfTables'
+    mustRunAfter 'updateHfTables'
+}

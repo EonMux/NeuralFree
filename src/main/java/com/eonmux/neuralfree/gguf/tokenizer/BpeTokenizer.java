@@ -14,6 +14,14 @@ import java.util.PriorityQueue;
  * <p>Each raw fragment is optionally whitespace-escaped, split by the pre-tokenizer regex
  * sequence, optionally GPT-2 byte-encoded, and every word is merged lowest rank first (ties:
  * leftmost). Symbols that are not tokens fall back to single-byte tokens.</p>
+ *
+ * <p>The Hugging Face overlays of {@link TokenizerVocab} extend this: fragments are normalized
+ * ({@link TokenizerVocab#normalizer()}) and prefixed with a space
+ * ({@link TokenizerVocab#bpeAddPrefixSpace()}) before escaping, and a vocabulary with
+ * {@link TokenizerVocab#bpeModelOverlay()} merges each word as the Hugging Face BPE model does
+ * (subword prefix, end-of-word suffix, unknown token, {@code <0xXX>} byte fallback as
+ * {@link TokenizerVocab#bpeByteFallback()} sets it). Without overlays every branch is the
+ * llama.cpp one.</p>
  */
 public final class BpeTokenizer implements TokenizerAlgorithm {
 
@@ -43,6 +51,7 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
     private final SpecialTokens special;
     private final PreTokenizerRegistry.PreTokenizer pre;
     private final Mode mode;
+    private final boolean byteFallback;
 
     /** Uses the vocabulary's own pre-tokenizer. */
     public BpeTokenizer(TokenizerVocab vocab, SpecialTokens special) {
@@ -62,22 +71,45 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         this.pre = pre;
         this.mode = "whitespace".equals(vocab.model()) ? Mode.WHITESPACE
                 : "hybriddna".equals(vocab.model()) ? Mode.HYBRIDDNA : Mode.STANDARD;
+        Boolean fallback = vocab.bpeByteFallback();
+        this.byteFallback = fallback != null ? fallback : !pre.byteEncode();
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Text fragments arrive normalized from {@link SpecialTokens#partition(String, boolean, boolean)};
+     * only the first fragment begins the input, which a Metaspace {@code first} prepend scheme of
+     * the pre-tokenizer reads.</p>
+     */
     @Override
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 3));
-        if (addSpecial && vocab.addBos()) out.add(special.requireBos());
-        for (SpecialTokens.Fragment f : special.partition(text, parseSpecial)) {
+        if (addSpecial) addAll(special.leadingIds(), out);
+        List<SpecialTokens.Fragment> fragments = special.partition(text, parseSpecial, true);
+        for (int i = 0; i < fragments.size(); i++) {
+            SpecialTokens.Fragment f = fragments.get(i);
             if (f.isToken()) {
                 out.add(f.token());
             } else {
-                String raw = vocab.escapeWhitespaces() ? TokenizerVocab.escapeWhitespace(f.text()) : f.text();
-                tokenizeFragment(raw, out);
+                tokenizeFragment(prepareFragment(f.text()), i == 0, out);
             }
         }
-        if (addSpecial && vocab.addEos()) out.add(special.requireEos());
+        if (addSpecial) addAll(special.trailingIds(), out);
         return out.toArray();
+    }
+
+    private static void addAll(int[] ids, IdBuffer out) {
+        for (int id : ids) out.add(id);
+    }
+
+    /**
+     * Hugging Face ByteLevel {@code add_prefix_space} (a space before a fragment that does not
+     * start with one), then llama.cpp whitespace escaping.
+     */
+    private String prepareFragment(String text) {
+        String raw = vocab.bpeAddPrefixSpace() && !text.startsWith(" ") ? " " + text : text;
+        return vocab.escapeWhitespaces() ? TokenizerVocab.escapeWhitespace(raw) : raw;
     }
 
     @Override
@@ -103,27 +135,47 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         return EMPTY;
     }
 
-    private void tokenizeFragment(String text, IdBuffer out) {
+    private void tokenizeFragment(String text, boolean inputStart, IdBuffer out) {
         switch (mode) {
             case WHITESPACE: tokenizeWhitespace(text, out); break;
             case HYBRIDDNA: new HybridDna(this).tokenize(text, out); break;
-            default: tokenizeBpe(text, out); break;
+            default: tokenizeBpe(text, inputStart, out); break;
         }
     }
 
-    /** {@code llm_tokenizer_bpe_session::tokenize}: split, merge per word, resolve with byte fallback. */
+    /** {@link #tokenizeBpe(String, boolean, IdBuffer)} for a text that begins the input. */
     void tokenizeBpe(String text, IdBuffer out) {
-        for (String word : words(text)) {
-            for (String symbol : mergeWord(word)) emitSymbol(symbol, out);
+        tokenizeBpe(text, true, out);
+    }
+
+    /**
+     * {@code llm_tokenizer_bpe_session::tokenize}: split, merge per word, resolve with byte
+     * fallback; with {@link TokenizerVocab#bpeModelOverlay()}, each word goes through
+     * {@link #tokenizeModelWord} instead.
+     */
+    private void tokenizeBpe(String text, boolean inputStart, IdBuffer out) {
+        boolean model = vocab.bpeModelOverlay();
+        for (String word : words(text, inputStart)) {
+            if (model) {
+                tokenizeModelWord(word, out);
+            } else {
+                for (String symbol : mergeWord(word)) emitSymbol(symbol, out);
+            }
         }
     }
 
-    /** The pre-tokenized (and, when configured, byte-encoded and metaspace-split) words. */
+    /** The words of a text that begins the input; see {@link #words(String, boolean)}. */
     List<String> words(String text) {
-        List<String> words = pre.split(text);
-        if (pre.byteEncode()) {
-            for (int i = 0; i < words.size(); i++) words.set(i, byteEncode(words.get(i)));
-        }
+        return words(text, true);
+    }
+
+    /**
+     * The pre-tokenized words ({@link PreTokenizerRegistry.PreTokenizer#words}: split and, when
+     * configured, byte-encoded), metaspace-split for mmBERT. {@code inputStart} tells whether the
+     * text begins the whole input.
+     */
+    List<String> words(String text, boolean inputStart) {
+        List<String> words = pre.words(text, inputStart);
         return pre.metaspaceWords() ? metaspaceSplit(words) : words;
     }
 
@@ -147,10 +199,14 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         return out;
     }
 
-    /** Merges one word lowest-rank first and returns the surviving symbols in order. */
+    /**
+     * Merges one word lowest-rank first and returns the surviving symbols in order. The
+     * pre-tokenizer decides only the splitting; {@code ignore_merges} is the vocabulary's
+     * resolved flag ({@link TokenizerVocab#ignoreMerges()}).
+     */
     List<String> mergeWord(String word) {
         List<String> result = new ArrayList<>();
-        boolean whole = (pre.ignoreMerges() && vocab.tokenId(word) >= 0)
+        boolean whole = (vocab.ignoreMerges() && vocab.tokenId(word) >= 0)
                 || (pre.wholeNewlineWords() && isAllNewlines(word) && vocab.tokenId(word) >= 0);
         if (whole) {
             result.add(word);
@@ -201,13 +257,136 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         queue.add(new Bigram(left, right, l + r, rank));
     }
 
-    /** Resolves one merged symbol; a non-token symbol emits the single-byte token of each byte. */
+    /**
+     * Hugging Face {@code BPE::merge_word} and {@code Word::merge_all} for one word: with
+     * {@code ignore_merges} a word that is a token is emitted whole; otherwise each character
+     * becomes a symbol (with {@link TokenizerVocab#bpeContinuingSubwordPrefix()} unless first,
+     * with {@link TokenizerVocab#bpeEndOfWordSuffix()} when last). A symbol that is not a token
+     * becomes its {@code <0xXX>} byte tokens when the pre-tokenizer does not byte-encode and the
+     * vocabulary has all of them; else the unknown token (consecutive ones fused with
+     * {@link TokenizerVocab#bpeUnkFuse()}); else it is dropped. Pairs merge lowest rank first
+     * (ties: leftmost) into {@code left + right} minus the right symbol's subword prefix.
+     */
+    private void tokenizeModelWord(String word, IdBuffer out) {
+        if (vocab.ignoreMerges()) {
+            int id = vocab.tokenId(word);
+            if (id >= 0) {
+                out.add(id);
+                return;
+            }
+        }
+        List<String> texts = new ArrayList<>();
+        IdBuffer ids = new IdBuffer(word.length());
+        seedModelSymbols(word, texts, ids);
+        int n = texts.size();
+        if (n == 0) return;
+        String[] text = texts.toArray(new String[0]);
+        int[] id = ids.toArray();
+        int[] prev = new int[n];
+        int[] next = new int[n];
+        for (int i = 0; i < n; i++) {
+            prev[i] = i - 1;
+            next[i] = i + 1 < n ? i + 1 : -1;
+        }
+        PriorityQueue<Bigram> queue = new PriorityQueue<>();
+        for (int i = 1; i < n; i++) addModelBigram(queue, text, i - 1, i);
+        while (!queue.isEmpty()) {
+            Bigram b = queue.poll();
+            if (text[b.left] == null || text[b.right] == null || next[b.left] != b.right
+                    || !b.text.equals(modelMerge(text[b.left], text[b.right]))) {
+                continue;
+            }
+            text[b.left] = b.text;
+            id[b.left] = vocab.tokenId(b.text);
+            text[b.right] = null;
+            next[b.left] = next[b.right];
+            if (next[b.right] >= 0) prev[next[b.right]] = b.left;
+            addModelBigram(queue, text, prev[b.left], b.left);
+            addModelBigram(queue, text, b.left, next[b.left]);
+        }
+        for (int i = 0; i != -1; i = next[i]) out.add(id[i]);
+    }
+
+    /**
+     * The initial symbols of {@link #tokenizeModelWord}: the id of each symbol and its token text.
+     * Unknown-token and byte-fallback symbols carry their token's text, so they merge exactly when
+     * a merge names their token, as the id pairs of Hugging Face's merge map do.
+     */
+    private void seedModelSymbols(String word, List<String> texts, IdBuffer ids) {
+        String prefix = vocab.bpeContinuingSubwordPrefix();
+        String suffix = vocab.bpeEndOfWordSuffix();
+        int unk = special.unk();
+        boolean unkPending = false;
+        for (int i = 0; i < word.length(); ) {
+            int cp = word.codePointAt(i);
+            int end = i + Character.charCount(cp);
+            String s = (i > 0 ? prefix : "") + word.substring(i, end) + (end == word.length() ? suffix : "");
+            i = end;
+            int id = vocab.tokenId(s);
+            if (id >= 0) {
+                if (unkPending) {
+                    addSymbol(unk, texts, ids);
+                    unkPending = false;
+                }
+                texts.add(s);
+                ids.add(id);
+                continue;
+            }
+            int[] bytes = byteFallback ? byteTokens(s) : null;
+            if (bytes != null) {
+                for (int b : bytes) addSymbol(b, texts, ids);
+                continue;
+            }
+            if (unk == SpecialTokens.NULL) continue;
+            if (unkPending && !vocab.bpeUnkFuse()) addSymbol(unk, texts, ids);
+            unkPending = true;
+        }
+        if (unkPending) addSymbol(unk, texts, ids);
+    }
+
+    /** A symbol of a token found by id: an unknown-token or byte-fallback symbol. */
+    private void addSymbol(int id, List<String> texts, IdBuffer ids) {
+        texts.add(vocab.text(id));
+        ids.add(id);
+    }
+
+    /** The {@code <0xXX>} token of each UTF-8 byte of {@code s}, or null when any is missing. */
+    private int[] byteTokens(String s) {
+        byte[] bytes = TokenizerAlgorithm.utf8(s);
+        int[] out = new int[bytes.length];
+        for (int i = 0; i < bytes.length; i++) {
+            out[i] = vocab.tokenId(HEX_BYTE_TOKENS[bytes[i] & 0xFF]);
+            if (out[i] < 0) return null;
+        }
+        return out;
+    }
+
+    private void addModelBigram(PriorityQueue<Bigram> queue, String[] text, int left, int right) {
+        if (left == -1 || right == -1 || text[left] == null || text[right] == null) return;
+        int rank = vocab.mergeRank(text[left], text[right]);
+        if (rank < 0) return;
+        String merged = modelMerge(text[left], text[right]);
+        if (vocab.tokenId(merged) < 0) return;
+        queue.add(new Bigram(left, right, merged, rank));
+    }
+
+    /** Hugging Face's merged token text: {@code left + right} without the right's subword prefix. */
+    private String modelMerge(String left, String right) {
+        String prefix = vocab.bpeContinuingSubwordPrefix();
+        return left + (right.startsWith(prefix) ? right.substring(prefix.length()) : right);
+    }
+
+    /**
+     * Resolves one merged symbol; a non-token symbol emits the single-byte token of each byte,
+     * or nothing when the pre-tokenizer does not byte-encode and byte fallback is off.
+     */
     private void emitSymbol(String symbol, IdBuffer out) {
         int id = vocab.tokenId(symbol);
         if (id >= 0) {
             out.add(id);
             return;
         }
+        if (!pre.byteEncode() && !byteFallback) return;
         for (byte b : TokenizerAlgorithm.utf8(symbol)) {
             int ub = b & 0xFF;
             int t = pre.byteEncode()
@@ -255,13 +434,18 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         return new String(chars);
     }
 
+    /** The byte GPT-2 {@code bytes_to_unicode} maps to code point {@code cp}, or -1 outside the table. */
+    static int gpt2Byte(int cp) {
+        return cp >= 0 && cp < UNICODE_TO_BYTE.length ? UNICODE_TO_BYTE[cp] : -1;
+    }
+
     /** {@code llama_decode_text}: GPT-2 byte decoding; code points outside the table are marked. */
     static byte[] decodeText(String text) {
         ByteSink out = new ByteSink(text.length());
         for (int i = 0; i < text.length(); ) {
             int cp = text.codePointAt(i);
             i += Character.charCount(cp);
-            int b = cp < UNICODE_TO_BYTE.length ? UNICODE_TO_BYTE[cp] : -1;
+            int b = gpt2Byte(cp);
             if (b >= 0) {
                 out.write(b);
             } else {

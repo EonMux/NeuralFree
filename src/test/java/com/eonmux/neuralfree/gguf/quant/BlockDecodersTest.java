@@ -80,6 +80,12 @@ public class BlockDecodersTest {
             {GGMLType.IQ1_M.ordinal(), BlockLayout.IQ1_M_BYTES, BlockLayout.QK_K},
             {GGMLType.IQ4_NL.ordinal(), BlockLayout.IQ4_NL_BYTES, BlockLayout.QK4_NL},
             {GGMLType.IQ4_XS.ordinal(), BlockLayout.IQ4_XS_BYTES, BlockLayout.QK_K},
+            {GGMLType.F8_E4M3.ordinal(), BlockLayout.F8_E4M3_BYTES, BlockLayout.QK_F8_E4M3},
+            {GGMLType.F8_E4M3_B128.ordinal(), BlockLayout.F8B128_BYTES, BlockLayout.QK_F8B128},
+            {GGMLType.MXFP8.ordinal(), BlockLayout.MXFP8_BYTES, BlockLayout.QK_MXFP8},
+            {GGMLType.I8_B128.ordinal(), BlockLayout.I8B128_BYTES, BlockLayout.QK_I8B128},
+            {GGMLType.NF4.ordinal(), BlockLayout.BNB4_BYTES, BlockLayout.QK_BNB4},
+            {GGMLType.FP4_BNB.ordinal(), BlockLayout.BNB4_BYTES, BlockLayout.QK_BNB4},
         };
         for (int[] e : expected) {
             GGMLType t = GGMLType.values()[e[0]];
@@ -96,7 +102,7 @@ public class BlockDecodersTest {
             assertEquals(t.toString(), !removed, CpuBlockDecoders.supports(t));
             assertEquals(t.toString(), !removed, BlockLayout.isDefined(t));
         }
-        assertEquals(35, CpuBlockDecoders.supportedTypes().size());
+        assertEquals(41, CpuBlockDecoders.supportedTypes().size());
         try {
             CpuBlockDecoders.forType(GGMLType.UNKNOWN);
             fail("UNKNOWN must not have a decoder");

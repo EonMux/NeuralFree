@@ -12,12 +12,16 @@ import java.util.function.BooleanSupplier;
 /**
  * One autoregressive generation: how many tokens, how to sample them and when to stop. Immutable (the cancellation
  * hook is a caller-owned supplier that the generation polls once per token).
+ *
+ * <p>The token budget is explicit when {@link Builder#maxNewTokens} set it; otherwise it is a fallback
+ * ({@link #DEFAULT_MAX_NEW_TOKENS}, or {@link Builder#fallbackMaxNewTokens}) that a model's
+ * {@code max_new_tokens} default replaces ({@link #withModelDefaults}).
  */
 public final class GenerationRequest {
 
     /** {@link #maxNewTokens()} value meaning "until end of generation or a full context" (llama.cpp {@code -n -1}). */
     public static final int UNLIMITED = -1;
-    /** Default new-token budget. */
+    /** Default new-token budget when neither the request nor the model's sampling defaults give one. */
     public static final int DEFAULT_MAX_NEW_TOKENS = 512;
 
     private static final BooleanSupplier NEVER = new BooleanSupplier() {
@@ -33,6 +37,7 @@ public final class GenerationRequest {
     };
 
     private final int maxNewTokens;
+    private final boolean maxNewTokensExplicit;
     private final SamplerConfig sampler;
     private final List<String> stopStrings;
     private final boolean ignoreEos;
@@ -40,13 +45,17 @@ public final class GenerationRequest {
 
     private GenerationRequest(Builder b) {
         this.maxNewTokens = b.maxNewTokens;
+        this.maxNewTokensExplicit = b.maxNewTokensExplicit;
         this.sampler = b.sampler;
         this.stopStrings = Collections.unmodifiableList(new ArrayList<>(b.stopStrings));
         this.ignoreEos = b.ignoreEos;
         this.cancellation = b.cancellation;
     }
 
-    /** {@link #DEFAULT_MAX_NEW_TOKENS} new tokens with {@link SamplerConfig#defaults()}. */
+    /**
+     * {@link #DEFAULT_MAX_NEW_TOKENS} new tokens with {@link SamplerConfig#defaults()}, all fallbacks a model's
+     * sampling defaults replace.
+     */
     public static GenerationRequest defaults() {
         return builder().build();
     }
@@ -58,6 +67,8 @@ public final class GenerationRequest {
     /** New tokens to generate at most, or {@link #UNLIMITED}. */
     public int maxNewTokens() { return maxNewTokens; }
     public boolean unlimited() { return maxNewTokens == UNLIMITED; }
+    /** Whether {@link Builder#maxNewTokens} set the token budget, so a model's default does not replace it. */
+    public boolean maxNewTokensExplicit() { return maxNewTokensExplicit; }
     public SamplerConfig sampler() { return sampler; }
     /** Strings that end generation when they appear in the decoded output; excluded from the result text. */
     public List<String> stopStrings() { return stopStrings; }
@@ -78,9 +89,30 @@ public final class GenerationRequest {
         return new StopStringFilter(stopStrings, downstream);
     }
 
+    /** A builder holding these values; the token budget keeps its explicit or fallback state. */
     public Builder toBuilder() {
-        return builder().maxNewTokens(maxNewTokens).sampler(sampler).stopStrings(stopStrings).ignoreEos(ignoreEos)
-                .cancellation(cancellation);
+        Builder b = builder().sampler(sampler).stopStrings(stopStrings).ignoreEos(ignoreEos).cancellation(cancellation);
+        return maxNewTokensExplicit ? b.maxNewTokens(maxNewTokens) : b.fallbackMaxNewTokens(maxNewTokens);
+    }
+
+    /**
+     * The request a generation runs for a model with {@code defaults}: the sampler takes the model's defaults for
+     * every setting it leaves unset ({@link SamplerConfig#withModelDefaults}), and a token budget that is not
+     * explicit becomes the model's {@code max_new_tokens} when it has one. Returns this request when
+     * {@code defaults} is empty.
+     *
+     * @throws IllegalArgumentException when a taken sampler value is out of range
+     */
+    public GenerationRequest withModelDefaults(SamplingDefaults defaults) {
+        Objects.requireNonNull(defaults, "defaults");
+        if (defaults.isEmpty()) {
+            return this;
+        }
+        Builder b = toBuilder().sampler(sampler.withModelDefaults(defaults));
+        if (!maxNewTokensExplicit && defaults.maxNewTokens() != null) {
+            b.fallbackMaxNewTokens(defaults.maxNewTokens());
+        }
+        return b.build();
     }
 
     @Override
@@ -92,6 +124,7 @@ public final class GenerationRequest {
 
     public static final class Builder {
         private int maxNewTokens = DEFAULT_MAX_NEW_TOKENS;
+        private boolean maxNewTokensExplicit;
         private SamplerConfig sampler = SamplerConfig.defaults();
         private final List<String> stopStrings = new ArrayList<>();
         private boolean ignoreEos;
@@ -100,7 +133,20 @@ public final class GenerationRequest {
         private Builder() {
         }
 
-        public Builder maxNewTokens(int v) { this.maxNewTokens = v; return this; }
+        /** Sets the token budget explicitly: a model's {@code max_new_tokens} default does not replace it. */
+        public Builder maxNewTokens(int v) {
+            this.maxNewTokens = v;
+            this.maxNewTokensExplicit = true;
+            return this;
+        }
+
+        /** Sets the token budget as a fallback, which a model's {@code max_new_tokens} default replaces. */
+        public Builder fallbackMaxNewTokens(int v) {
+            this.maxNewTokens = v;
+            this.maxNewTokensExplicit = false;
+            return this;
+        }
+
         public Builder sampler(SamplerConfig v) { this.sampler = Objects.requireNonNull(v, "sampler"); return this; }
 
         /** Replaces the stop strings. */

@@ -208,8 +208,9 @@ public final class GpuProjectionDeltas {
     }
 
     /**
-     * The live site of {@code layer}'s dense product {@code weight} by {@code w}, with its shape; a weight whose input
-     * the matmul rotates (PRISM Hadamard) refuses deltas, because a delta would need the rotated rows.
+     * The live site of {@code layer}'s dense product {@code weight} by {@code w}, with its shape; a weight whose
+     * input the matmul transforms (PRISM Hadamard, act-quantization or the act-order permutation) refuses deltas,
+     * because a delta would need the transformed rows.
      */
     public Site serve(LayerSpec layer, String weight, GpuWeight w) {
         Objects.requireNonNull(w, "w");
@@ -256,8 +257,10 @@ public final class GpuProjectionDeltas {
     }
 
     private static String prismRefusal(GpuWeight w) {
-        return w.hadamard() != null ? w.name() + " rotates its input (PRISM Hadamard) inside the matmul; a LoRA delta"
-                + " would need the rotated rows" : null;
+        boolean transformed = w.hadamard() != null
+                || (w.inputTransform() != null && !w.inputTransform().isIdentity());
+        return transformed ? w.name() + " transforms its input (PRISM Hadamard or input transform) inside the"
+                + " matmul; a LoRA delta would need the transformed rows" : null;
     }
 
     // ================================================================== registration

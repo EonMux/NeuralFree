@@ -1,0 +1,421 @@
+/* act_quant.comp - LLM_ActFakeQuant, LLM_PermuteCols: activation fake-quantization and input column permutation
+ * of matmul inputs. GLSL twin of kernels/llm/act_quant.cl (the semantic reference).
+ * Requires: common/nf_common.glsl, common/reduce.glsl (OP_ACT_FAKE_QUANT).
+ *
+ * A variants row selects OP. Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_ACT_FAKE_QUANT (i n_runs, i run_len, i scheme, f scale, i zero_point, f global_scale, i x_off, i y_off,
+ *                      float x, float y)
+ *       Run g in [0, n_runs) is the run_len elements at x_off + g*run_len (x) and y_off + g*run_len (y): a token
+ *       row, or a 16/32/128-element group of one (n_runs = rows * row_len / run_len). y = dequant(quant(x)) per
+ *       the gguf.quant.ActQuantScheme code `scheme`; a = max|x| over the run, s the dequant multiplier, `/` the
+ *       correctly rounded quotient, inv(s) = 1/s, rne rounds to nearest even with NaN read as 0, trunc rounds
+ *       toward zero, sat8 clamps to [-128, 127], and every int8 level q is an integer:
+ *         0 INT8_TOKEN        s = a/127; i = a == 0 ? 0 : 127/a; q = sat8(rne(x * i)); y = q * s
+ *         1 INT8_STATIC       s = scale; q = sat8(rne(x/s)); y = q * s
+ *         2 INT8_STATIC_ASYM  s = scale; q = sat8(rne(x * inv(s)) + zero_point); y = (q - zero_point) * s
+ *         3 INT8_GROUP128     s = max(a, 1e-10f)/127; q = trunc(clamp(x/s, -128, 127)); y = q * s
+ *         4 FP8_TOKEN         s = max(min(a, ub)/448, 1/(448*512) as a float) with ub = scale (+inf: none);
+ *                             y = e4m3(x/s) * s
+ *         5 FP8_STATIC        s = scale; y = e4m3(x * inv(s)) * s
+ *         6 FP8_GROUP128      s = max(a, 1e-10f)/448; y = e4m3(x * inv(s)) * s
+ *         7 NVFP4             g = global_scale, s16 = e4m3(a/6/g), d = s16*g;
+ *                             y = e2m1(x/d) * s16 * g (evaluated left to right)
+ *         8 MXFP4             r = bits(a) rounded to a 3-bit mantissa ((bits(a) + 0x200000) & 0x7F800000),
+ *                             e = clamp(floor(log2(r == 0 ? 2^-126 : r)) - 2, -127, 127)
+ *                             (r = inf, from a >= 0x7F600000, gives 127);
+ *                             y = e2m1(x/2^e) * 2^e
+ *         9 MXFP8             e = clamp(ceil(log2(max(a, FLT_MIN)/448)) + 127, 0, 254) - 127;
+ *                             y = e4m3(x/2^e) * 2^e
+ *       e4m3(v) is Fp8Codec.E4M3FN.decode(encode(clamp(v, -448, 448))) (nearest even, the infinities saturating
+ *       to +-448, NaN to NaN) and e2m1(v) is FpBlockDecoders.e2m1ToFp32(fp32ToE2m1(v)) (nearest even, saturating
+ *       at +-6, code 8 to +0). A dequant multiplier of zero (s, or d for NVFP4) gives y = +0. Codes outside 0..9
+ *       copy x. The formulas and their operation order are those of kernels/llm/act_quant.cl and
+ *       gguf.quant.ActFakeQuant.
+ *       Every quotient and reciprocal is the correctly rounded IEEE quotient, computed from the bit patterns
+ *       (nf_aq_div_bits), so it does not depend on the device's division accuracy or denormal mode; max|x| and
+ *       the products are single IEEE operations whose subnormal results follow the device's denormal mode.
+ *       x and y carry no restrict: the transform may run in place (same buffer, x_off == y_off). Element i of
+ *       a run is read and written by invocation i % L only, and every read of the max|x| pass precedes the
+ *       reduction barriers, so in-place use is exact.
+ *   OP_PERMUTE_COLS   (i n_rows, i row_len, i x_off, i y_off, R int perm, float x, float y)
+ *       y[y_off + r*row_len + k] = x[x_off + r*row_len + perm[k]], r < n_rows, k < row_len; out of place
+ *       (y never overlaps x; validated on the host).
+ *
+ * Preconditions (validated on the host): run_len > 0; scale > 0 and finite for the static schemes, scale > 0
+ * (+inf for none) for FP8_TOKEN; global_scale > 0 and finite for NVFP4; perm is a permutation of [0, row_len).
+ * Element indices stay below 2^31, so 32-bit index arithmetic is exact. Results are specified for finite x.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}. OP_ACT_FAKE_QUANT: one workgroup per run, global = n_runs * L (L a power of
+ * two <= LLM_DIMX); the run index comes from nf_wg_id() and surplus groups exit uniformly. OP_PERMUTE_COLS: one
+ * invocation per output element, global = roundUp(n_rows * row_len, L), bounds-checked over nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_ACT_FAKE_QUANT 321
+#define OP_PERMUTE_COLS   322
+
+#ifndef OP
+#error "act_quant.comp requires OP"
+#endif
+
+/* gguf.quant.ActQuantScheme codes. */
+#define NF_AQ_INT8_TOKEN       0
+#define NF_AQ_INT8_STATIC      1
+#define NF_AQ_INT8_STATIC_ASYM 2
+#define NF_AQ_INT8_GROUP128    3
+#define NF_AQ_FP8_TOKEN        4
+#define NF_AQ_FP8_STATIC       5
+#define NF_AQ_FP8_GROUP128     6
+#define NF_AQ_NVFP4            7
+#define NF_AQ_MXFP4            8
+#define NF_AQ_MXFP8            9
+
+#if OP == OP_ACT_FAKE_QUANT
+layout(std430, binding = 0) readonly buffer NfAqX { float x_in[]; };
+layout(std430, binding = 1) writeonly buffer NfAqY { float y_out[]; };
+layout(push_constant) uniform NfAqParams {
+    int n_runs;
+    int run_len;
+    int scheme;
+    float scale;
+    int zero_point;
+    float global_scale;
+    int x_off;
+    int y_off;
+} pc;
+#elif OP == OP_PERMUTE_COLS
+layout(std430, binding = 0) restrict readonly buffer NfAqPerm { int perm[]; };
+layout(std430, binding = 1) readonly buffer NfAqX { float x_in[]; };
+layout(std430, binding = 2) writeonly buffer NfAqY { float y_out[]; };
+layout(push_constant) uniform NfAqParams {
+    int n_rows;
+    int row_len;
+    int x_off;
+    int y_off;
+} pc;
+#else
+#error "act_quant.comp: unknown OP"
+#endif
+
+#if OP == OP_ACT_FAKE_QUANT
+#include "common/reduce.glsl"
+
+#define NF_AQ_SIGN 0x80000000u
+#define NF_AQ_ABS  0x7FFFFFFFu
+#define NF_AQ_INF  0x7F800000u
+/* 1e-10f, the amax floor of the per-group schemes (vLLM's eps). */
+#define NF_AQ_GROUP_EPS_BITS     0x2EDBE6FFu
+/* 1 / (448 * 512) rounded to float, the FP8_TOKEN scale floor (vLLM min_scaling_factor). */
+#define NF_AQ_FP8_MIN_SCALE_BITS 0x36924925u
+
+/* Normalizes the magnitude bits m (finite, non-zero) to a 24-bit significand in [2^23, 2^24) and returns it;
+ * e receives the matching biased exponent (below 1 for subnormal inputs). */
+uint nf_aq_significand(uint m, out int e) {
+    e = int(m >> 23);
+    const uint f = m & 0x7FFFFFu;
+    if (e != 0) {
+        return f | 0x800000u;
+    }
+    const int sh = 23 - findMSB(f);
+    e = 1 - sh;
+    return f << uint(sh);
+}
+
+/* Bits of the IEEE single quotient a / b rounded to nearest even, from the operand bits: integer long
+ * division of the significands, so subnormal operands and results are exact. */
+uint nf_aq_div_bits(uint a, uint b) {
+    const uint sign = (a ^ b) & NF_AQ_SIGN;
+    const uint ma = a & NF_AQ_ABS;
+    const uint mb = b & NF_AQ_ABS;
+    if (ma > NF_AQ_INF || mb > NF_AQ_INF || (ma == mb && (ma == 0u || ma == NF_AQ_INF))) {
+        return 0x7FC00000u;
+    }
+    if (ma == NF_AQ_INF || mb == 0u) {
+        return sign | NF_AQ_INF;
+    }
+    if (ma == 0u || mb == NF_AQ_INF) {
+        return sign;
+    }
+    int ea;
+    int eb;
+    uint na = nf_aq_significand(ma, ea);
+    const uint nb = nf_aq_significand(mb, eb);
+    int e = ea - eb + 127;
+    if (na < nb) {
+        na <<= 1;
+        e -= 1;
+    }
+    /* q = floor(na / nb * 2^23) in [2^23, 2^24); r = twice the remainder. */
+    uint q = 0u;
+    uint r = na;
+    for (int i = 0; i < 24; ++i) {
+        q <<= 1;
+        if (r >= nb) {
+            r -= nb;
+            q |= 1u;
+        }
+        r <<= 1;
+    }
+    if (e >= 255) {
+        return sign | NF_AQ_INF;
+    }
+    if (e >= 1) {
+        const uint up = (r > nb || (r == nb && (q & 1u) != 0u)) ? 1u : 0u;
+        return sign | min((uint(e - 1) << 23) + q + up, NF_AQ_INF);
+    }
+    const int shift = 1 - e;
+    if (shift > 24) {
+        return sign;
+    }
+    const uint lost = q & ((1u << uint(shift)) - 1u);
+    const uint half_ulp = 1u << uint(shift - 1);
+    const uint qs = q >> uint(shift);
+    const bool up = lost > half_ulp || (lost == half_ulp && (r != 0u || (qs & 1u) != 0u));
+    return sign | (qs + (up ? 1u : 0u));
+}
+
+/* a / b, correctly rounded (nf_aq_div_bits). */
+float nf_aq_div(float a, float b) {
+    return uintBitsToFloat(nf_aq_div_bits(floatBitsToUint(a), floatBitsToUint(b)));
+}
+
+/* Fp8Codec.E4M3FN.encode of clamp(v, -448, 448): nearest even, |v| >= 448 (the infinities included) to +-448
+ * (0x7E), NaN to the NaN code 0x7F, all with the sign bit of v. */
+uint nf_aq_e4m3_encode(float v) {
+    const uint bits = floatBitsToUint(v);
+    const uint sign = (bits >> 24) & 0x80u;
+    const uint mag = bits & NF_AQ_ABS;
+    if (mag > NF_AQ_INF) {
+        return sign | 0x7Fu;
+    }
+    const float a = uintBitsToFloat(mag);
+    if (a >= 448.0) {
+        return sign | 0x7Eu;
+    }
+    if (mag == 0u) {
+        return sign;
+    }
+    int exponent = max(int(mag >> 23) - 127, -6);
+    uint units = uint(roundEven(ldexp(a, 3 - exponent)));
+    if (units < 8u) {
+        return sign | units;
+    }
+    if (units == 16u) {
+        units = 8u;
+        exponent += 1;
+    }
+    return sign | min((uint(exponent + 7) << 3) | (units - 8u), 0x7Eu);
+}
+
+/* Fp8Codec.E4M3FN.decode: (e ? 8 + m : m) * 2^(max(e, 1) - 10) with the sign; NaN codes give NaN. */
+float nf_aq_e4m3_decode(uint c) {
+    if ((c & 0x7Fu) == 0x7Fu) {
+        return uintBitsToFloat((c & 0x80u) != 0u ? 0xFFC00000u : 0x7FC00000u);
+    }
+    const uint e = (c >> 3) & 0xFu;
+    const float v = float((c & 7u) | (min(e, 1u) << 3)) * uintBitsToFloat((max(e, 1u) + 117u) << 23);
+    return (c & 0x80u) != 0u ? -v : v;
+}
+
+/* FpBlockDecoders.fp32ToE2m1: nearest even over {0, 0.5, 1, 1.5, 2, 3, 4, 6}, saturating at 6; NaN and the
+ * infinities saturate by their sign bit (bit 3). */
+uint nf_aq_e2m1_encode(float f) {
+    const uint bits = floatBitsToUint(f);
+    const uint sign = (bits >> 28) & 0x8u;
+    const float a = uintBitsToFloat(bits & NF_AQ_ABS);
+    uint m;
+    if ((bits & NF_AQ_ABS) > NF_AQ_INF) {
+        m = 7u;
+    } else if (a <= 0.25) {
+        m = 0u;
+    } else if (a < 0.75) {
+        m = 1u;
+    } else if (a <= 1.25) {
+        m = 2u;
+    } else if (a < 1.75) {
+        m = 3u;
+    } else if (a <= 2.5) {
+        m = 4u;
+    } else if (a < 3.5) {
+        m = 5u;
+    } else if (a <= 5.0) {
+        m = 6u;
+    } else {
+        m = 7u;
+    }
+    return sign | m;
+}
+
+/* FpBlockDecoders.e2m1ToFp32: magnitude code m in [0, 8) to 0, 0.5, 1, 1.5, 2, 3, 4, 6 with the sign; code 8
+ * (negative zero) gives +0. */
+float nf_aq_e2m1_decode(uint c) {
+    const uint m = c & 7u;
+    const float v = m < 4u ? float(m) * 0.5 : (m == 7u ? 6.0 : float(m - 2u));
+    return (c & 8u) != 0u && m != 0u ? -v : v;
+}
+
+/* e4m3(v): the value of the saturating E4M3FN code of v. */
+float nf_aq_e4m3(float v) {
+    return nf_aq_e4m3_decode(nf_aq_e4m3_encode(v));
+}
+
+/* rne(v): v rounded to nearest even, NaN (by bit pattern) read as 0, as vLLM's cvt.rni.sat. */
+float nf_aq_rne(float v) {
+    return (floatBitsToUint(v) & NF_AQ_ABS) > NF_AQ_INF ? 0.0 : roundEven(v);
+}
+
+/* (q - azp) * s for the int8 level q = sat8(level + azp); integer arithmetic, so a zero q - azp gives +0. */
+float nf_aq_int8(float level, int azp, float s) {
+    const int q = int(clamp(level + float(azp), -128.0, 127.0));
+    return float(q - azp) * s;
+}
+
+/* Bits of 2^e for e in [-127, 127] (2^-127 is subnormal). */
+uint nf_aq_pow2_bits(int e) {
+    return e >= -126 ? uint(e + 127) << 23 : 0x00400000u;
+}
+
+/* v * 2^e, one IEEE rounding, for e in [-127, 127] (2^-127 as (v * 0.5) * 2^-126, the first product exact
+ * for the codec values v). */
+float nf_aq_scale_pow2(float v, int e) {
+    return e >= -126 ? v * uintBitsToFloat(nf_aq_pow2_bits(e)) : (v * 0.5) * uintBitsToFloat(0x00800000u);
+}
+
+/* MXFP4 scale exponent of a run with max|x| = amax (vLLM mxfp4_utils.py:270-280); a rounded amax of infinity
+ * has floor(log2) = inf and clamps to 127. */
+int nf_aq_mxfp4_exp(float amax) {
+    const uint r = (floatBitsToUint(amax) + 0x200000u) & NF_AQ_INF;
+    if (r == NF_AQ_INF) {
+        return 127;
+    }
+    const int fl = r == 0u ? -126 : int(r >> 23) - 127;
+    return clamp(fl - 2, -127, 127);
+}
+
+/* MXFP8 scale exponent of a run with max|x| = amax (vLLM mxfp8_utils.py:55-70): ceil(log2(d)) of
+ * d = max(amax, FLT_MIN) / 448 exactly from the bits of d (positive, possibly subnormal or infinite). */
+int nf_aq_mxfp8_exp(float amax) {
+    const uint d = nf_aq_div_bits(floatBitsToUint(max(amax, uintBitsToFloat(0x00800000u))), floatBitsToUint(448.0));
+    const uint ex = d >> 23;
+    const uint m = d & 0x7FFFFFu;
+    int c;
+    if (ex == 0xFFu) {
+        c = 128;
+    } else if (ex == 0u) {
+        c = findMSB(m) - 149 + ((m & (m - 1u)) != 0u ? 1 : 0);
+    } else {
+        c = int(ex) - 127 + (m != 0u ? 1 : 0);
+    }
+    return clamp(c + 127, 0, 254) - 127;
+}
+
+/* True when the scheme derives its scale from max|x| over the run. */
+bool nf_aq_dynamic(int scheme) {
+    return scheme != NF_AQ_INT8_STATIC && scheme != NF_AQ_INT8_STATIC_ASYM && scheme != NF_AQ_FP8_STATIC;
+}
+
+/* True when the float bits of f are +0 or -0 (by bit pattern, independent of denormal flushing). */
+bool nf_aq_is_zero(float f) {
+    return (floatBitsToUint(f) & NF_AQ_ABS) == 0u;
+}
+#endif
+
+void main() {
+#if OP == OP_ACT_FAKE_QUANT
+    const uint run = nf_wg_id();
+    /* The run depends only on the workgroup id, so this return is uniform per workgroup. */
+    if (run >= uint(pc.n_runs)) {
+        return;
+    }
+    const uint run_len = uint(pc.run_len);
+    const uint xb = uint(pc.x_off) + run * run_len;
+    const uint yb = uint(pc.y_off) + run * run_len;
+    const int scheme = pc.scheme;
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+
+    /* scheme is a push constant, so the reduction is reached in uniform control flow. */
+    float amax = 0.0;
+    if (nf_aq_dynamic(scheme)) {
+        float m = 0.0;
+        for (uint i = lid; i < run_len; i += lsize) {
+            m = max(m, abs(x_in[xb + i]));
+        }
+        amax = nf_wg_max(m);
+    }
+
+    /* Per-run parameters: s the int8/fp8 multiplier and inv its reciprocal multiplier; s16 and g (d = s16*g)
+     * for NVFP4; e for MX. */
+    float s = 0.0;
+    float inv = 0.0;
+    float s16 = 0.0;
+    int e = 0;
+    if (scheme == NF_AQ_INT8_TOKEN) {
+        s = nf_aq_div(amax, 127.0);
+        inv = nf_aq_is_zero(amax) ? 0.0 : nf_aq_div(127.0, amax);
+    } else if (scheme == NF_AQ_INT8_GROUP128) {
+        s = nf_aq_div(max(amax, uintBitsToFloat(NF_AQ_GROUP_EPS_BITS)), 127.0);
+    } else if (scheme == NF_AQ_FP8_TOKEN) {
+        s = max(nf_aq_div(min(amax, pc.scale), 448.0), uintBitsToFloat(NF_AQ_FP8_MIN_SCALE_BITS));
+    } else if (scheme == NF_AQ_FP8_GROUP128) {
+        s = nf_aq_div(max(amax, uintBitsToFloat(NF_AQ_GROUP_EPS_BITS)), 448.0);
+        inv = nf_aq_div(1.0, s);
+    } else if (scheme == NF_AQ_INT8_STATIC || scheme == NF_AQ_INT8_STATIC_ASYM || scheme == NF_AQ_FP8_STATIC) {
+        s = pc.scale;
+        inv = nf_aq_div(1.0, s);
+    } else if (scheme == NF_AQ_NVFP4) {
+        s16 = nf_aq_e4m3(nf_aq_div(nf_aq_div(amax, 6.0), pc.global_scale));
+        s = s16 * pc.global_scale;
+    } else if (scheme == NF_AQ_MXFP4) {
+        e = nf_aq_mxfp4_exp(amax);
+    } else if (scheme == NF_AQ_MXFP8) {
+        e = nf_aq_mxfp8_exp(amax);
+    }
+    const uint pow2 = nf_aq_pow2_bits(e);
+    const int zp = scheme == NF_AQ_INT8_STATIC_ASYM ? pc.zero_point : 0;
+    const bool mx = scheme == NF_AQ_MXFP4 || scheme == NF_AQ_MXFP8;
+    const bool known = scheme >= NF_AQ_INT8_TOKEN && scheme <= NF_AQ_MXFP8;
+
+    for (uint i = lid; i < run_len; i += lsize) {
+        const float x = x_in[xb + i];
+        float y;
+        if (!known) {
+            y = x;
+        } else if (!mx && nf_aq_is_zero(s)) {
+            y = 0.0;
+        } else if (scheme == NF_AQ_INT8_TOKEN || scheme == NF_AQ_INT8_STATIC_ASYM) {
+            y = nf_aq_int8(nf_aq_rne(x * inv), zp, s);
+        } else if (scheme == NF_AQ_INT8_STATIC) {
+            y = nf_aq_int8(nf_aq_rne(nf_aq_div(x, s)), 0, s);
+        } else if (scheme == NF_AQ_INT8_GROUP128) {
+            y = float(int(clamp(nf_aq_div(x, s), -128.0, 127.0))) * s;
+        } else if (scheme == NF_AQ_FP8_TOKEN) {
+            y = nf_aq_e4m3(nf_aq_div(x, s)) * s;
+        } else if (scheme == NF_AQ_FP8_STATIC || scheme == NF_AQ_FP8_GROUP128) {
+            y = nf_aq_e4m3(x * inv) * s;
+        } else if (scheme == NF_AQ_NVFP4) {
+            y = nf_aq_e2m1_decode(nf_aq_e2m1_encode(nf_aq_div(x, s))) * s16 * pc.global_scale;
+        } else if (scheme == NF_AQ_MXFP4) {
+            const float v = uintBitsToFloat(nf_aq_div_bits(floatBitsToUint(x), pow2));
+            y = nf_aq_scale_pow2(nf_aq_e2m1_decode(nf_aq_e2m1_encode(v)), e);
+        } else {
+            const float v = uintBitsToFloat(nf_aq_div_bits(floatBitsToUint(x), pow2));
+            y = nf_aq_scale_pow2(nf_aq_e4m3(v), e);
+        }
+        y_out[yb + i] = y;
+    }
+
+#elif OP == OP_PERMUTE_COLS
+    const uint idx = nf_global_id();
+    const uint row_len = uint(pc.row_len);
+    if (row_len == 0u || idx >= uint(pc.n_rows) * row_len) {
+        return;
+    }
+    const uint r = idx / row_len;
+    const uint k = idx - r * row_len;
+    y_out[uint(pc.y_off) + idx] = x_in[uint(pc.x_off) + r * row_len + uint(perm[k])];
+#endif
+}

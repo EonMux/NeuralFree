@@ -1,4 +1,4 @@
-package com.eonmux.neuralfree.precision;
+package com.eonmux.neuralfree.utils.numeric;
 
 import org.junit.Test;
 

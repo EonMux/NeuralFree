@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.jinja;
 
+import com.eonmux.neuralfree.utils.json.Json;
+
 import java.math.BigDecimal;
 import java.util.AbstractList;
 import java.util.ArrayList;
@@ -208,41 +210,9 @@ public final class JinjaValue {
         return sb.append(quote).toString();
     }
 
-    /**
-     * Python {@code repr(float)}: shortest round-tripping digits, fixed notation for decimal exponents
-     * in [-4, 16), otherwise {@code d.ddde±XX} (matches llama.cpp common/jinja/value.cpp {@code float_repr}).
-     */
+    /** Python {@code repr(float)}; see {@link Json#floatRepr(double)}. */
     public static String floatRepr(double d) {
-        if (Double.isNaN(d)) return "nan";
-        if (Double.isInfinite(d)) return d > 0 ? "inf" : "-inf";
-        if (d == 0.0) return (1.0 / d) < 0 ? "-0.0" : "0.0";
-        BigDecimal bd = new BigDecimal(Double.toString(Math.abs(d))).stripTrailingZeros();
-        String digits = bd.unscaledValue().toString();
-        int n = digits.length();
-        int exp10 = n - 1 - bd.scale();
-        StringBuilder out = new StringBuilder(d < 0 ? "-" : "");
-        if (exp10 >= -4 && exp10 < 16) {
-            int point = exp10 + 1;
-            if (point <= 0) {
-                out.append("0.");
-                for (int i = 0; i < -point; i++) out.append('0');
-                out.append(digits);
-            } else if (point >= n) {
-                out.append(digits);
-                for (int i = 0; i < point - n; i++) out.append('0');
-                out.append(".0");
-            } else {
-                out.append(digits, 0, point).append('.').append(digits, point, n);
-            }
-        } else {
-            out.append(digits.charAt(0));
-            if (n > 1) out.append('.').append(digits, 1, n);
-            out.append('e').append(exp10 < 0 ? '-' : '+');
-            int ae = Math.abs(exp10);
-            if (ae < 10) out.append('0');
-            out.append(ae);
-        }
-        return out.toString();
+        return Json.floatRepr(d);
     }
 
     // ------------------------------------------------------------------ numbers

@@ -97,7 +97,7 @@ The Gradle run tasks forward every `neuralfree.*` property given with `-P` or `-
 
 ## 5. Run a GGUF model
 
-`runLLMDemo` runs any GGUF model that llama.cpp runs, for example one downloaded from Hugging Face. It needs no native library. The model path is taken from the first of these that is set:
+`runLLMDemo` runs any GGUF model that llama.cpp runs, for example one downloaded from Hugging Face. It needs no native library. It also runs a Hugging Face checkpoint directory directly, with no conversion step (see [Hugging Face checkpoints](#hugging-face-checkpoints)). The model path is taken from the first of these that is set:
 1. `--model <path>` (or `-m <path>`);
 2. `-Pneuralfree.model=<path>`;
 3. the `NEURALFREE_MODEL` environment variable.
@@ -132,6 +132,45 @@ Without any of them, `runLLMDemo` prints these options and exits with status 2.
 ```
 
 `-Pargs` holds the program arguments; single or double quotes group words. The GGUF engine chooses AUTO among the backends that run the `llm` kernels, and continues on the CPU when no GPU backend can be created. After each generation the demo prints its timing statistics; `--stats-file <path>` also appends the session's statistics to `<path>`. Every flag and `neuralfree.*` property is listed in [USAGE.md](USAGE.md#llmdemo-command-line-reference).
+
+### Hugging Face checkpoints
+
+`runLLMDemo` accepts a Hugging Face checkpoint wherever it accepts a GGUF file. A model directory holds `config.json` and `*.safetensors` files; a Mistral native checkpoint holds `params.json` and `consolidated*.safetensors`. Once the path is set, nothing in the steps above changes: the same `--prompt`, `--cpu`, `--kv-type`, `--mtp` and sampling flags apply, because the loader presents exactly what llama.cpp's `convert_hf_to_gguf.py` would write. A directory holding exactly one `.gguf` file — or one split set — opens that GGUF instead. [USAGE.md](USAGE.md#hugging-face-checkpoints) is the full reference.
+
+- **Load a model directory:**
+
+  ```bash
+  ./gradlew runLLMDemo -Pargs="--model /path/to/Qwen3-4B --prompt 'Explain recursion' --temp 0"
+  ```
+
+- **Quantized checkpoints (GPTQ, AWQ, FP8, MXFP4, NVFP4, bitsandbytes NF4, and the other formats vLLM and SGLang load) are repacked into matching weight types.** `--hf-quant-exact` prefers the bit-exact target where a repack would round a scale:
+
+  ```bash
+  ./gradlew runLLMDemo -Pargs="--model /path/to/Qwen2-7B-int4 --prompt 'Hi' --hf-quant-exact"
+  ```
+
+- **PEFT adapters.** `--lora <dir>` takes a PEFT directory (`adapter_config.json` plus `adapter_model.safetensors`) on a base that is a GGUF file or another HF directory. A decision-LoRA checkpoint merges the local base model named by `--hf-base-dir`, or by its `base_model_name_or_path` when that names an existing directory:
+
+  ```bash
+  ./gradlew runLLMDemo -Pargs="--model /path/to/base.gguf --lora /path/to/adapter"
+  ```
+
+- **Export to GGUF.** `--export-gguf <out.gguf>` writes the equivalent GGUF and exits without generating. `--export-mode native` keeps the extension tensor types; `compat` converts them to llama.cpp types; `compat-exact` writes every lossy or approximate value as F32:
+
+  ```bash
+  ./gradlew runLLMDemo -Pargs="--model /path/to/Qwen3-4B --export-gguf out.gguf --export-mode compat --export-overwrite"
+  ```
+
+- **Training state dicts as safetensors.** The training framework saves a module's state dict as a safetensors file and loads it (or a PyTorch checkpoint with the same tensors) back into a compatible module; `strict` load refuses mismatched entries:
+
+  ```java
+  import com.eonmux.neuralfree.io.SafetensorsStateDict;
+
+  SafetensorsStateDict.save(model, java.nio.file.Path.of("module.safetensors"));   // __metadata__.format = pt
+  SafetensorsStateDict.load(model, java.nio.file.Path.of("module.safetensors"), /*strict*/ true);
+  ```
+
+The HF checkpoints above share these knobs: `--hf-materialize`, `--hf-memory-max` and `--hf-cache-dir` place the tensors a transform produces, `--hf-outtype` chooses the view's float type (`source` keeps the checkpoint's dtype, `auto` reproduces the converter's `--outtype auto`), `--hf-overrides <json>` merges a JSON object into `config.json`, and `--hf-tokenizer` takes the tokenizer from another directory or a GGUF file. [USAGE.md](USAGE.md#hugging-face-checkpoints) lists them all.
 
 ## 6. Use NeuralFree from Java
 

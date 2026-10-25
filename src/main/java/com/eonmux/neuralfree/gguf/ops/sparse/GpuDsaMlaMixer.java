@@ -577,8 +577,8 @@ public final class GpuDsaMlaMixer implements GpuMixer {
 
     /**
      * A per-head tensor ({@code attn_k_b}, {@code attn_v_b}) for the id-matvec: one buffer, a type with id-matvec
-     * kernels, and no PRISM transform or output scale, which llama.cpp's plain {@code ggml_mul_mat} of these tensors
-     * would not apply either (deepseek32.cpp:363, llama-graph.cpp build_attn_mha {@code v_mla}).
+     * kernels, and no PRISM transform, input transform or output scale, which llama.cpp's plain {@code ggml_mul_mat}
+     * of these tensors would not apply either (deepseek32.cpp:363, llama-graph.cpp build_attn_mha {@code v_mla}).
      */
     private GpuWeight perHead(GpuWeight w) {
         if (!MoeKernels.supports(w.type())) {
@@ -589,9 +589,9 @@ public final class GpuDsaMlaMixer implements GpuMixer {
             throw new UnsupportedOperationException(layout.where + ": per-head tensor " + w.name() + " is split into "
                     + w.shardCount() + " row shards; the id-matvec reads every head from one buffer");
         }
-        if (w.hadamard() != null || w.hasScale()) {
+        if (w.hadamard() != null || w.hasScale() || (w.inputTransform() != null && !w.inputTransform().isIdentity())) {
             throw new UnsupportedOperationException(layout.where + ": per-head tensor " + w.name()
-                    + " carries a PRISM transform or output scale, which the absorbed MLA products do not apply");
+                    + " carries an input transform or output scale, which the absorbed MLA products do not apply");
         }
         return w;
     }

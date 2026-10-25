@@ -11,10 +11,10 @@ import java.util.Set;
 /**
  * The single CPU decoding entry point for every ggml storage type: bit-exact ports of the
  * {@code dequantize_row_*} reference functions of llama.cpp ggml/src/ggml-quants.c and the element
- * conversions of llama.cpp ggml/src/ggml.c. Each family lives in its own class
- * ({@link LegacyBlockDecoders}, {@link KQuantBlockDecoders}, {@link IQuantBlockDecoders},
- * {@link TernaryBlockDecoders}, {@link FpBlockDecoders}); this class validates ranges, normalizes byte
- * order and dispatches.
+ * conversions of llama.cpp ggml/src/ggml.c, plus the NeuralFree extension block types. Each family lives in
+ * its own class ({@link LegacyBlockDecoders}, {@link KQuantBlockDecoders}, {@link IQuantBlockDecoders},
+ * {@link TernaryBlockDecoders}, {@link FpBlockDecoders}, {@link ExtBlockDecoders}); this class validates
+ * ranges, normalizes byte order and dispatches.
  * <p>
  * Thread-safe and stateless. Source buffers are read with absolute indexing only; their position,
  * limit and byte order are never modified.
@@ -87,6 +87,13 @@ public final class CpuBlockDecoders {
 
         put(m, GGMLType.TQ1_0, TernaryBlockDecoders::decodeTq1_0);
         put(m, GGMLType.TQ2_0, TernaryBlockDecoders::decodeTq2_0);
+
+        put(m, GGMLType.F8_E4M3, ExtBlockDecoders::decodeF8E4m3);
+        put(m, GGMLType.F8_E4M3_B128, ExtBlockDecoders::decodeF8E4m3B128);
+        put(m, GGMLType.MXFP8, ExtBlockDecoders::decodeMxfp8);
+        put(m, GGMLType.I8_B128, ExtBlockDecoders::decodeI8B128);
+        put(m, GGMLType.NF4, ExtBlockDecoders::decodeNf4);
+        put(m, GGMLType.FP4_BNB, ExtBlockDecoders::decodeFp4Bnb);
         return Collections.unmodifiableMap(m);
     }
 

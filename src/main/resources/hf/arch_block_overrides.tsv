@@ -1,0 +1,26 @@
+# arch_block_overrides.tsv - Generated from llama.cpp a37cc4610 by the updateHfTables Gradle task; do not edit. Rows: 24
+# gguf_arch	tensor	hf_template	seq
+arctic	FFN_NORM	model.layers.{bid}.residual_layernorm	0
+arctic	FFN_NORM_EXP	model.layers.{bid}.post_attention_layernorm	1
+qwen4exp	HC_ATTN_NORM	model.layers.{bid}.attn_hyper_connection.hc_norm	0
+qwen4exp	HC_ATTN_DOWN	model.layers.{bid}.attn_hyper_connection.input_mix_weight_down	1
+qwen4exp	HC_ATTN_UP	model.layers.{bid}.attn_hyper_connection.input_mix_weight_up	2
+qwen4exp	HC_ATTN_INJECT	model.layers.{bid}.attn_hyper_connection.block_inject_weight	3
+qwen4exp	HC_FFN_NORM	model.layers.{bid}.mlp_hyper_connection.hc_norm	4
+qwen4exp	HC_FFN_DOWN	model.layers.{bid}.mlp_hyper_connection.input_mix_weight_down	5
+qwen4exp	HC_FFN_UP	model.layers.{bid}.mlp_hyper_connection.input_mix_weight_up	6
+qwen4exp	HC_FFN_INJECT	model.layers.{bid}.mlp_hyper_connection.block_inject_weight	7
+qwen4exp	HC_HEAD_NORM	model.hyper_connection_mixer.hc_norm	8
+qwen4exp	HC_HEAD_DOWN	model.hyper_connection_mixer.input_mix_weight_down	9
+qwen4exp	HC_HEAD_UP	model.hyper_connection_mixer.input_mix_weight_up	10
+qwen4exp	NEXTN_HC_HEAD_NORM	model.layers.{bid}.nextn_hc_head.hc_norm	11
+qwen4exp	NEXTN_HC_HEAD_DOWN	model.layers.{bid}.nextn_hc_head.input_mix_weight_down	12
+qwen4exp	NEXTN_HC_HEAD_UP	model.layers.{bid}.nextn_hc_head.input_mix_weight_up	13
+qwen4exp	INDEXER_Q_NORM	model.layers.{bid}.self_attn.indexer.q_layernorm	14
+qwen4exp	INDEXER_K_NORM	model.layers.{bid}.self_attn.indexer.k_layernorm	15
+qwen4exp	PLE_KEY	model.layers.{bid}.ple.key_proj	16
+qwen4exp	PLE_VALUE	model.layers.{bid}.ple.value_proj	17
+qwen4exp	PLE_NORM_KEY	model.layers.{bid}.ple.norm_key	18
+qwen4exp	PLE_NORM_QUERY	model.layers.{bid}.ple.norm_query	19
+qwen4exp	PLE_NORM_CONV	model.layers.{bid}.ple.norm_conv	20
+qwen4exp	PLE_CONV1D	model.layers.{bid}.ple.conv1d	21

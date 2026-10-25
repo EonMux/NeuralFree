@@ -248,8 +248,9 @@ public final class CpuProjectionDeltas {
     }
 
     private static String prismRefusal(String name, CpuTensorRef w, CpuMatVec mv) {
-        return mv != null && mv.transformsOf(w).input() != null ? name + " rotates its input (PRISM Hadamard) inside"
-                + " the matvec; a LoRA delta would need the rotated rows" : null;
+        CpuMatVec.Transforms t = mv != null ? mv.transformsOf(w) : null;
+        return t != null && !t.transform().isIdentity() ? name + " transforms its input (PRISM Hadamard or input"
+                + " transform) inside the matvec; a LoRA delta would need the transformed rows" : null;
     }
 
     // ================================================================== registration

@@ -8,6 +8,7 @@ common/quant_decode_legacy.h
 common/quant_decode_k.h
 common/quant_decode_iq.h
 common/quant_decode_new.h
+common/quant_decode_ext.h
 common/matvec_family.h
 common/matvec_id_family.h
 common/matmul_tiled_family.h
@@ -25,7 +26,9 @@ matvec_legacy.cl
 matvec_kquant.cl
 matvec_iquant.cl
 matvec_newquant.cl
+matvec_extquant.cl
 hadamard.cl
+act_quant.cl
 moe_matvec.cl
 matmul_tiled.cl
 norm.cl

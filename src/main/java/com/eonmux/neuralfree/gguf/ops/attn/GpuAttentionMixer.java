@@ -664,10 +664,11 @@ public final class GpuAttentionMixer implements GpuMixer {
         }
     }
 
-    /** The delta site of projection {@code weight}; a matmul that rotates its input (PRISM) refuses deltas. */
+    /** The delta site of projection {@code weight}; a matmul that transforms its input (PRISM) refuses deltas. */
     private GpuProjectionDeltas.Site serveDeltas(String weight, GpuWeight w) {
-        String refusal = w.hadamard() != null ? w.name() + " rotates its input (PRISM Hadamard) inside the matmul;"
-                + " a LoRA delta would need the rotated rows" : null;
+        String refusal = w.hadamard() != null || (w.inputTransform() != null && !w.inputTransform().isIdentity())
+                ? w.name() + " transforms its input (PRISM Hadamard or input transform) inside the matmul; a LoRA"
+                + " delta would need the transformed rows" : null;
         return ctx.projectionDeltas().serve(layer, weight, refusal);
     }
 

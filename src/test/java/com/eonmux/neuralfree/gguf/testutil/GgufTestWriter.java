@@ -1,11 +1,17 @@
 package com.eonmux.neuralfree.gguf.testutil;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.GGUFValueType;
+import com.eonmux.neuralfree.gguf.GgufEncoder;
+import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,6 +41,12 @@ import java.util.SplittableRandom;
  * {@link GGMLType}, so the writer and the parser agree on every block layout. Keys and tensor
  * names stay unique: adding an existing one replaces it in place, keeping its write position.
  *
+ * <p>The bytes all come from {@link GgufEncoder}, the repository's single GGUF encoder: it writes the
+ * header, the KV pairs and the tensor infos, and the writer routes its tensor data through it too, so a
+ * test fixture and a {@code GgufWriter} export of the same model have the same bytes. Everything the
+ * reader must reject that the encoder refuses — a GGUF version other than 3, and a malformed
+ * {@code general.alignment} entry — is produced by editing those bytes around the encoder.</p>
+ *
  * <p>Float encoders exist for F32, F16, BF16 and Q8_0 ({@link #canEncodeFloats(GGMLType)}); other
  * types take raw block bytes or zero blocks, which decode to zero for every ggml format.
  */
@@ -47,32 +59,15 @@ public final class GgufTestWriter {
     public static final int MAX_DIMS = 4;
     public static final int MAX_NAME_BYTES = 63;
 
-    private static final byte[] MAGIC = {'G', 'G', 'U', 'F'};
     private static final int QK8_0 = 32;
-
-    /** GGUF metadata value types with their on-disk ids. */
-    public enum ValueType {
-        UINT8(0), INT8(1), UINT16(2), INT16(3), UINT32(4), INT32(5), FLOAT32(6), BOOL(7), STRING(8),
-        ARRAY(9), UINT64(10), INT64(11), FLOAT64(12);
-
-        private final int id;
-
-        ValueType(int id) {
-            this.id = id;
-        }
-
-        public int id() {
-            return id;
-        }
-    }
 
     /** Scalar value or array payload (defensively copied primitive or String array). */
     private static final class Kv {
-        final ValueType type;
-        final ValueType elementType;
+        final GGUFValueType type;
+        final GGUFValueType elementType;
         final Object value;
 
-        Kv(ValueType type, ValueType elementType, Object value) {
+        Kv(GGUFValueType type, GGUFValueType elementType, Object value) {
             this.type = type;
             this.elementType = elementType;
             this.value = value;
@@ -124,7 +119,7 @@ public final class GgufTestWriter {
     /** {@code "<arch>.<suffix>"} for the architecture set by {@link #architecture(String)}. */
     public String archKey(String suffix) {
         Kv kv = kvs.get(ARCHITECTURE_KEY);
-        if (kv == null || kv.type != ValueType.STRING) {
+        if (kv == null || kv.type != GGUFValueType.STRING) {
             throw new IllegalStateException("general.architecture must be set as a string before archKey(\""
                     + suffix + "\")");
         }
@@ -134,53 +129,53 @@ public final class GgufTestWriter {
     // ================================================================== scalar KV
 
     public GgufTestWriter u8(String key, int v) {
-        return put(key, ValueType.UINT8, null, checkRange(key, v, 0, 0xFF));
+        return put(key, GGUFValueType.UINT8, null, checkRange(key, v, 0, 0xFF));
     }
 
     public GgufTestWriter i8(String key, int v) {
-        return put(key, ValueType.INT8, null, checkRange(key, v, Byte.MIN_VALUE, Byte.MAX_VALUE));
+        return put(key, GGUFValueType.INT8, null, checkRange(key, v, Byte.MIN_VALUE, Byte.MAX_VALUE));
     }
 
     public GgufTestWriter u16(String key, int v) {
-        return put(key, ValueType.UINT16, null, checkRange(key, v, 0, 0xFFFF));
+        return put(key, GGUFValueType.UINT16, null, checkRange(key, v, 0, 0xFFFF));
     }
 
     public GgufTestWriter i16(String key, int v) {
-        return put(key, ValueType.INT16, null, checkRange(key, v, Short.MIN_VALUE, Short.MAX_VALUE));
+        return put(key, GGUFValueType.INT16, null, checkRange(key, v, Short.MIN_VALUE, Short.MAX_VALUE));
     }
 
     /** UINT32; accepts the full unsigned range 0..4294967295. */
     public GgufTestWriter u32(String key, long v) {
-        return put(key, ValueType.UINT32, null, checkRange(key, v, 0, 0xFFFFFFFFL));
+        return put(key, GGUFValueType.UINT32, null, checkRange(key, v, 0, 0xFFFFFFFFL));
     }
 
     public GgufTestWriter i32(String key, int v) {
-        return put(key, ValueType.INT32, null, v);
+        return put(key, GGUFValueType.INT32, null, v);
     }
 
     public GgufTestWriter f32(String key, float v) {
-        return put(key, ValueType.FLOAT32, null, v);
+        return put(key, GGUFValueType.FLOAT32, null, v);
     }
 
     public GgufTestWriter bool(String key, boolean v) {
-        return put(key, ValueType.BOOL, null, v);
+        return put(key, GGUFValueType.BOOL, null, v);
     }
 
     public GgufTestWriter str(String key, String v) {
-        return put(key, ValueType.STRING, null, Objects.requireNonNull(v, "value of " + key));
+        return put(key, GGUFValueType.STRING, null, Objects.requireNonNull(v, "value of " + key));
     }
 
     /** UINT64; the long's bits are written as is, so negative values encode values above 2^63. */
     public GgufTestWriter u64(String key, long v) {
-        return put(key, ValueType.UINT64, null, v);
+        return put(key, GGUFValueType.UINT64, null, v);
     }
 
     public GgufTestWriter i64(String key, long v) {
-        return put(key, ValueType.INT64, null, v);
+        return put(key, GGUFValueType.INT64, null, v);
     }
 
     public GgufTestWriter f64(String key, double v) {
-        return put(key, ValueType.FLOAT64, null, v);
+        return put(key, GGUFValueType.FLOAT64, null, v);
     }
 
     // ================================================================== array KV
@@ -189,54 +184,54 @@ public final class GgufTestWriter {
         for (int x : v) {
             checkRange(key, x, 0, 0xFF);
         }
-        return put(key, ValueType.ARRAY, ValueType.UINT8, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.UINT8, v.clone());
     }
 
     public GgufTestWriter i8Array(String key, int... v) {
         for (int x : v) {
             checkRange(key, x, Byte.MIN_VALUE, Byte.MAX_VALUE);
         }
-        return put(key, ValueType.ARRAY, ValueType.INT8, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.INT8, v.clone());
     }
 
     public GgufTestWriter u16Array(String key, int... v) {
         for (int x : v) {
             checkRange(key, x, 0, 0xFFFF);
         }
-        return put(key, ValueType.ARRAY, ValueType.UINT16, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.UINT16, v.clone());
     }
 
     public GgufTestWriter i16Array(String key, int... v) {
         for (int x : v) {
             checkRange(key, x, Short.MIN_VALUE, Short.MAX_VALUE);
         }
-        return put(key, ValueType.ARRAY, ValueType.INT16, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.INT16, v.clone());
     }
 
     public GgufTestWriter u32Array(String key, long... v) {
         for (long x : v) {
             checkRange(key, x, 0, 0xFFFFFFFFL);
         }
-        return put(key, ValueType.ARRAY, ValueType.UINT32, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.UINT32, v.clone());
     }
 
     public GgufTestWriter i32Array(String key, int... v) {
-        return put(key, ValueType.ARRAY, ValueType.INT32, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.INT32, v.clone());
     }
 
     public GgufTestWriter f32Array(String key, float... v) {
-        return put(key, ValueType.ARRAY, ValueType.FLOAT32, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.FLOAT32, v.clone());
     }
 
     public GgufTestWriter boolArray(String key, boolean... v) {
-        return put(key, ValueType.ARRAY, ValueType.BOOL, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.BOOL, v.clone());
     }
 
     public GgufTestWriter strArray(String key, String... v) {
         for (String s : v) {
             Objects.requireNonNull(s, "element of " + key);
         }
-        return put(key, ValueType.ARRAY, ValueType.STRING, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.STRING, v.clone());
     }
 
     public GgufTestWriter strArray(String key, List<String> v) {
@@ -244,15 +239,15 @@ public final class GgufTestWriter {
     }
 
     public GgufTestWriter u64Array(String key, long... v) {
-        return put(key, ValueType.ARRAY, ValueType.UINT64, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.UINT64, v.clone());
     }
 
     public GgufTestWriter i64Array(String key, long... v) {
-        return put(key, ValueType.ARRAY, ValueType.INT64, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.INT64, v.clone());
     }
 
     public GgufTestWriter f64Array(String key, double... v) {
-        return put(key, ValueType.ARRAY, ValueType.FLOAT64, v.clone());
+        return put(key, GGUFValueType.ARRAY, GGUFValueType.FLOAT64, v.clone());
     }
 
     public GgufTestWriter remove(String key) {
@@ -267,7 +262,7 @@ public final class GgufTestWriter {
     }
 
     /** The value type of {@code key}, or null when absent. */
-    public ValueType typeOf(String key) {
+    public GGUFValueType typeOf(String key) {
         Kv kv = kvs.get(key);
         return kv == null ? null : kv.type;
     }
@@ -372,7 +367,7 @@ public final class GgufTestWriter {
     /** The alignment the layout uses (see the class contract). */
     public int effectiveAlignment() {
         Kv kv = kvs.get(ALIGNMENT_KEY);
-        if (kv != null && kv.type == ValueType.UINT32) {
+        if (kv != null && kv.type == GGUFValueType.UINT32) {
             long a = (Long) kv.value;
             if (a > 0 && a <= Integer.MAX_VALUE) {
                 return (int) a;
@@ -425,14 +420,8 @@ public final class GgufTestWriter {
     }
 
     public void writeTo(OutputStream out) throws IOException {
-        int alignment = effectiveAlignment();
-        byte[] header = headerBytes();
-        out.write(header);
-        writeZeros(out, alignUp(header.length, alignment) - header.length);
-        for (Tensor t : tensors.values()) {
-            out.write(t.data);
-            writeZeros(out, alignUp(t.data.length, alignment) - t.data.length);
-        }
+        byte[] file = fileBytes();
+        out.write(file);
         out.flush();
     }
 
@@ -550,7 +539,7 @@ public final class GgufTestWriter {
 
     // ================================================================== internals
 
-    private GgufTestWriter put(String key, ValueType type, ValueType elementType, Object value) {
+    private GgufTestWriter put(String key, GGUFValueType type, GGUFValueType elementType, Object value) {
         if (key == null || key.isEmpty()) {
             throw new IllegalArgumentException("metadata key must be non-empty");
         }
@@ -624,197 +613,123 @@ public final class GgufTestWriter {
         return (v + alignment - 1) / alignment * alignment;
     }
 
-    private static void writeZeros(OutputStream out, long n) throws IOException {
-        for (long i = 0; i < n; i++) {
-            out.write(0);
+    // ================================================================== encoder output
+
+    /**
+     * The whole file, produced by {@link GgufEncoder} and then patched: a version below {@link #GGUF_VERSION}
+     * overwrites the four version bytes, so a malformed fixture is a raw byte edit around the encoder.
+     */
+    private byte[] fileBytes() throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (WritableByteChannel channel = Channels.newChannel(out)) {
+            GgufEncoder enc = new GgufEncoder(channel, "GGUF test fixture");
+            enc.writeHeader(channel, tensors.size(), kvs.size());
+            for (Map.Entry<String, Kv> e : kvs.entrySet()) {
+                Kv kv = e.getValue();
+                enc.writeKv(e.getKey(), kv.type, kv.elementType, kvValue(kv));
+            }
+            int alignment = effectiveAlignment();
+            long offset = 0;
+            for (Tensor t : tensors.values()) {
+                GGUFTensorInfo info = new GGUFTensorInfo(t.name, t.ne, t.type, offset);
+                enc.writeTensorInfo(info, offset);
+                offset += alignUp(t.data.length, alignment);
+            }
+            enc.align(alignment);
+            for (Tensor t : tensors.values()) {
+                enc.writeData(t.data);
+                enc.align(alignment);
+            }
+            enc.flush();
         }
+        byte[] file = out.toByteArray();
+        if (version != GgufEncoder.GGUF_VERSION) {
+            file[4] = (byte) version;
+            file[5] = (byte) (version >>> 8);
+            file[6] = (byte) (version >>> 16);
+            file[7] = (byte) (version >>> 24);
+        }
+        return file;
     }
 
+    /** The value the encoder takes for a KV entry: a decoded scalar or a list of decoded scalars. */
+    private Object kvValue(Kv kv) {
+        if (kv.type != GGUFValueType.ARRAY) {
+            return scalarValue(kv.type, kv.value);
+        }
+        List<Object> elements = new ArrayList<>();
+        if (kv.elementType == GGUFValueType.UINT8 || kv.elementType == GGUFValueType.INT8
+                || kv.elementType == GGUFValueType.UINT16 || kv.elementType == GGUFValueType.INT16
+                || kv.elementType == GGUFValueType.INT32) {
+            for (int x : (int[]) kv.value) {
+                elements.add(x);
+            }
+        } else if (kv.elementType == GGUFValueType.UINT32) {
+            // UINT32 keeps its bit pattern, so values of 2^31 and above arrive negative
+            for (long x : (long[]) kv.value) {
+                elements.add((int) x);
+            }
+        } else if (kv.elementType == GGUFValueType.UINT64 || kv.elementType == GGUFValueType.INT64) {
+            for (long x : (long[]) kv.value) {
+                elements.add(x);
+            }
+        } else if (kv.elementType == GGUFValueType.FLOAT32) {
+            for (float x : (float[]) kv.value) {
+                elements.add(x);
+            }
+        } else if (kv.elementType == GGUFValueType.FLOAT64) {
+            for (double x : (double[]) kv.value) {
+                elements.add(x);
+            }
+        } else if (kv.elementType == GGUFValueType.BOOL) {
+            for (boolean x : (boolean[]) kv.value) {
+                elements.add(x);
+            }
+        } else {
+            Collections.addAll(elements, (String[]) kv.value);
+        }
+        return elements;
+    }
+
+    /**
+     * A decoded scalar the encoder takes: 8/16/32-bit integers keep their value in an Integer, 64-bit
+     * integers a Long. The writer stores ranges as JVM longs, which the 32-bit types narrow here.
+     */
+    private static Object scalarValue(GGUFValueType type, Object v) {
+        if (v instanceof Long && type.isInteger()
+                && type != GGUFValueType.UINT64 && type != GGUFValueType.INT64) {
+            return ((Long) v).intValue();
+        }
+        return v;
+    }
+
+    /** Unpadded byte length of the header (magic, version, counts, KV pairs and tensor infos). */
     private byte[] headerBytes() {
-        LittleEndianSink s = new LittleEndianSink();
-        s.bytes(MAGIC);
-        s.u32(version);
-        s.u64(tensors.size());
-        s.u64(kvs.size());
-        for (Map.Entry<String, Kv> e : kvs.entrySet()) {
-            s.string(e.getKey());
-            Kv kv = e.getValue();
-            s.u32(kv.type.id());
-            if (kv.type == ValueType.ARRAY) {
-                writeArray(s, kv.elementType, kv.value);
-            } else {
-                writeScalar(s, kv.type, kv.value);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (WritableByteChannel channel = Channels.newChannel(out)) {
+            GgufEncoder enc = new GgufEncoder(channel, "GGUF test fixture header");
+            enc.writeHeader(channel, tensors.size(), kvs.size());
+            for (Map.Entry<String, Kv> e : kvs.entrySet()) {
+                Kv kv = e.getValue();
+                enc.writeKv(e.getKey(), kv.type, kv.elementType, kvValue(kv));
             }
+            long offset = 0;
+            int alignment = effectiveAlignment();
+            for (Tensor t : tensors.values()) {
+                enc.writeTensorInfo(new GGUFTensorInfo(t.name, t.ne, t.type, offset), offset);
+                offset += alignUp(t.data.length, alignment);
+            }
+            enc.flush();
+        } catch (IOException e) {
+            throw new IllegalStateException("in-memory GGUF header serialisation failed", e);
         }
-        int alignment = effectiveAlignment();
-        long offset = 0;
-        for (Tensor t : tensors.values()) {
-            s.string(t.name);
-            s.u32(t.ne.length);
-            for (long d : t.ne) {
-                s.u64(d);
-            }
-            s.u32(t.type.getId());
-            s.u64(offset);
-            offset += alignUp(t.data.length, alignment);
+        byte[] header = out.toByteArray();
+        if (version != GgufEncoder.GGUF_VERSION) {
+            header[4] = (byte) version;
+            header[5] = (byte) (version >>> 8);
+            header[6] = (byte) (version >>> 16);
+            header[7] = (byte) (version >>> 24);
         }
-        return s.toByteArray();
-    }
-
-    private static void writeScalar(LittleEndianSink s, ValueType type, Object v) {
-        switch (type) {
-            case UINT8:
-            case INT8:
-                s.u8(((Long) v).intValue());
-                break;
-            case UINT16:
-            case INT16:
-                s.u16(((Long) v).intValue());
-                break;
-            case UINT32:
-                s.u32(((Long) v).intValue());
-                break;
-            case INT32:
-                s.u32((Integer) v);
-                break;
-            case FLOAT32:
-                s.u32(Float.floatToRawIntBits((Float) v));
-                break;
-            case BOOL:
-                s.u8((Boolean) v ? 1 : 0);
-                break;
-            case STRING:
-                s.string((String) v);
-                break;
-            case UINT64:
-            case INT64:
-                s.u64((Long) v);
-                break;
-            case FLOAT64:
-                s.u64(Double.doubleToRawLongBits((Double) v));
-                break;
-            default:
-                throw new IllegalStateException("not a scalar type: " + type);
-        }
-    }
-
-    private static void writeArray(LittleEndianSink s, ValueType elementType, Object array) {
-        s.u32(elementType.id());
-        switch (elementType) {
-            case UINT8:
-            case INT8: {
-                int[] a = (int[]) array;
-                s.u64(a.length);
-                for (int x : a) {
-                    s.u8(x);
-                }
-                break;
-            }
-            case UINT16:
-            case INT16: {
-                int[] a = (int[]) array;
-                s.u64(a.length);
-                for (int x : a) {
-                    s.u16(x);
-                }
-                break;
-            }
-            case UINT32:
-            case UINT64:
-            case INT64: {
-                long[] a = (long[]) array;
-                s.u64(a.length);
-                for (long x : a) {
-                    if (elementType == ValueType.UINT32) {
-                        s.u32((int) x);
-                    } else {
-                        s.u64(x);
-                    }
-                }
-                break;
-            }
-            case INT32: {
-                int[] a = (int[]) array;
-                s.u64(a.length);
-                for (int x : a) {
-                    s.u32(x);
-                }
-                break;
-            }
-            case FLOAT32: {
-                float[] a = (float[]) array;
-                s.u64(a.length);
-                for (float x : a) {
-                    s.u32(Float.floatToRawIntBits(x));
-                }
-                break;
-            }
-            case BOOL: {
-                boolean[] a = (boolean[]) array;
-                s.u64(a.length);
-                for (boolean x : a) {
-                    s.u8(x ? 1 : 0);
-                }
-                break;
-            }
-            case STRING: {
-                String[] a = (String[]) array;
-                s.u64(a.length);
-                for (String x : a) {
-                    s.string(x);
-                }
-                break;
-            }
-            case FLOAT64: {
-                double[] a = (double[]) array;
-                s.u64(a.length);
-                for (double x : a) {
-                    s.u64(Double.doubleToRawLongBits(x));
-                }
-                break;
-            }
-            default:
-                throw new IllegalStateException("unsupported array element type " + elementType);
-        }
-    }
-
-    /** Growable little-endian byte sink for the header. */
-    private static final class LittleEndianSink {
-        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
-
-        void bytes(byte[] b) {
-            out.write(b, 0, b.length);
-        }
-
-        void u8(int v) {
-            out.write(v & 0xFF);
-        }
-
-        void u16(int v) {
-            out.write(v & 0xFF);
-            out.write((v >>> 8) & 0xFF);
-        }
-
-        void u32(int v) {
-            for (int i = 0; i < 4; i++) {
-                out.write((v >>> (8 * i)) & 0xFF);
-            }
-        }
-
-        void u64(long v) {
-            for (int i = 0; i < 8; i++) {
-                out.write((int) (v >>> (8 * i)) & 0xFF);
-            }
-        }
-
-        void string(String str) {
-            byte[] b = str.getBytes(StandardCharsets.UTF_8);
-            u64(b.length);
-            bytes(b);
-        }
-
-        byte[] toByteArray() {
-            return out.toByteArray();
-        }
+        return header;
     }
 }

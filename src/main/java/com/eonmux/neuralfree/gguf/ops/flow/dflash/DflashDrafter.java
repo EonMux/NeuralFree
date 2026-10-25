@@ -1,7 +1,7 @@
 package com.eonmux.neuralfree.gguf.ops.flow.dflash;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
+import com.eonmux.neuralfree.gguf.ModelSource;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
@@ -14,6 +14,9 @@ import com.eonmux.neuralfree.gguf.hparams.HparamsLoader;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
+import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
+import com.eonmux.neuralfree.gguf.quant.InputTransformLoader;
+import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 
 import java.io.IOException;
@@ -52,26 +55,31 @@ public final class DflashDrafter implements DraftModel {
     static final int INJECT_CHUNK = 512;
 
     /**
-     * Drafting options ({@code common_params_speculative_draft} n_min / p_min), the draft KV type and whether a
+     * Drafting options ({@code common_params_speculative_draft} n_min / p_min), the draft KV type, whether a
      * quantized draft cache uses the Hadamard rotation ({@code neuralfree.kv.rotation}, llama.cpp's
-     * {@code attn_rot}). Immutable.
+     * {@code attn_rot}) and how the draft's activation quantization is applied ({@link ActivationQuant}). Immutable.
      */
     public static final class Options {
-        private static final Options DEFAULTS = new Options(0, 0.0f, KvDType.F16, true);
+        private static final Options DEFAULTS = new Options(0, 0.0f, KvDType.F16, true, ActivationQuant.WEIGHT_ONLY);
 
         private final int nMin;
         private final float pMin;
         private final KvDType kvType;
         private final boolean kvRotation;
+        private final ActivationQuant activationQuant;
 
-        private Options(int nMin, float pMin, KvDType kvType, boolean kvRotation) {
+        private Options(int nMin, float pMin, KvDType kvType, boolean kvRotation, ActivationQuant activationQuant) {
             this.nMin = nMin;
             this.pMin = pMin;
             this.kvType = kvType;
             this.kvRotation = kvRotation;
+            this.activationQuant = activationQuant;
         }
 
-        /** {@code n_min = 0}, {@code p_min = 0}, F16 cache, rotation enabled (llama.cpp defaults). */
+        /**
+         * {@code n_min = 0}, {@code p_min = 0}, F16 cache, rotation enabled (llama.cpp defaults), weight-only
+         * activations.
+         */
         public static Options defaults() {
             return DEFAULTS;
         }
@@ -96,18 +104,28 @@ public final class DflashDrafter implements DraftModel {
             if (!(pMin >= 0.0f && pMin <= 1.0f)) {
                 throw new IllegalArgumentException("draft p_min must be in [0, 1], got " + pMin);
             }
-            return new Options(nMin, pMin, Objects.requireNonNull(kvType, "kvType"), kvRotation);
+            return new Options(nMin, pMin, Objects.requireNonNull(kvType, "kvType"), kvRotation,
+                    ActivationQuant.WEIGHT_ONLY);
+        }
+
+        /** These options with the draft's activation quantization applied as {@code mode}. */
+        public Options withActivationQuant(ActivationQuant mode) {
+            return new Options(nMin, pMin, kvType, kvRotation, Objects.requireNonNull(mode, "mode"));
         }
 
         public int nMin() { return nMin; }
         public float pMin() { return pMin; }
         public KvDType kvType() { return kvType; }
         public boolean kvRotation() { return kvRotation; }
+        /** How the draft's activation quantization is applied ({@link ActivationQuant#WEIGHT_ONLY} by default). */
+        public ActivationQuant activationQuant() { return activationQuant; }
 
         @Override
         public String toString() {
             return "DflashDrafter.Options{nMin=" + nMin + ", pMin=" + pMin + ", kv=" + kvType
-                    + (kvRotation ? "" : ", no rotation") + '}';
+                    + (kvRotation ? "" : ", no rotation")
+                    + (activationQuant == ActivationQuant.WEIGHT_ONLY ? "" : ", actQuant="
+                            + activationQuant.propertyValue()) + '}';
         }
     }
 
@@ -204,18 +222,21 @@ public final class DflashDrafter implements DraftModel {
     }
 
     /**
-     * Opens a draft GGUF; the drafter owns and closes its weights.
+     * Opens a dflash draft model; the drafter owns and closes its weights.
      *
      * @param target the target model's weights for the shared tensors, or null when the draft carries them
      * @throws IOException              when the draft's tensor data cannot be mapped
      * @throws IllegalArgumentException when the file is not a supported dflash draft
      */
-    public static DflashDrafter open(GGUFFileParser draftParser, CpuWeights target, Options options)
+    public static DflashDrafter open(ModelSource draft, CpuWeights target, Options options)
             throws IOException {
-        Objects.requireNonNull(draftParser, "draftParser");
-        GgufKv kv = GgufKv.of(draftParser);
+        Objects.requireNonNull(draft, "draft");
+        Objects.requireNonNull(options, "options");
+        GgufKv kv = GgufKv.of(draft);
         ModelHparams hp = HparamsLoader.load(kv);
-        CpuWeights weights = CpuWeights.open(draftParser);
+        TensorCatalog catalog = TensorCatalog.of(draft);
+        CpuWeights weights = CpuWeights.open(draft, catalog,
+                InputTransformLoader.load(draft, kv, catalog, options.activationQuant()));
         try {
             return new DflashDrafter(hp, kv, weights, true, target, options);
         } catch (RuntimeException e) {
@@ -234,17 +255,17 @@ public final class DflashDrafter implements DraftModel {
     }
 
     /**
-     * The spec of a dflash draft GGUF, read without binding a drafter; the draft's tensors are mapped only while it
+     * The spec of a dflash draft model, read without binding a drafter; the draft's tensors are mapped only while it
      * is read.
      *
      * @throws IOException              when the draft's tensor data cannot be mapped
      * @throws IllegalArgumentException when the file is not a supported dflash draft
      */
-    public static DflashSpec readSpec(GGUFFileParser draftParser) throws IOException {
-        Objects.requireNonNull(draftParser, "draftParser");
-        GgufKv kv = GgufKv.of(draftParser);
+    public static DflashSpec readSpec(ModelSource draft) throws IOException {
+        Objects.requireNonNull(draft, "draft");
+        GgufKv kv = GgufKv.of(draft);
         ModelHparams hp = HparamsLoader.load(kv);
-        try (CpuWeights weights = CpuWeights.open(draftParser)) {
+        try (CpuWeights weights = CpuWeights.open(draft)) {
             return DflashSpec.of(hp, kv, weights);
         }
     }

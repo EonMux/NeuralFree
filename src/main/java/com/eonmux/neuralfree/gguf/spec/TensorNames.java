@@ -380,6 +380,12 @@ public final class TensorNames {
     // ---- stack "lilicorr.layers" tensors (suffix after "lilicorr.layers.N.") ----
     public static final String LILICORR_ATTN_IN_PROJ = "attn.in_proj";
 
+    /**
+     * Hugging Face tensor names that stand for GGUF names. GGUF files written by third-party tools and NeuralFree's
+     * MTP-only files keep these names, so lookups fall back to them (layerAliases, modelAliases). Hugging Face
+     * checkpoints never reach these tables: their names are mapped at load by HfTensorNameMap, and every pair here
+     * agrees with that mapping (TensorNamesAliasConsistencyTest).
+     */
     private static final String[][] LAYER_ALIAS_BASES = {
             {ATTN_Q, "self_attn.q_proj"},
             {ATTN_K, "self_attn.k_proj"},
@@ -394,6 +400,10 @@ public final class TensorNames {
             {FFN_NORM, "post_attention_layernorm"},
     };
 
+    /**
+     * The model-level counterpart of {@link #LAYER_ALIAS_BASES}, for the same files: a GGUF tensor name followed by
+     * the Hugging Face names that stand for it.
+     */
     private static final String[][] MODEL_ALIASES = {
             {TOKEN_EMBD + "." + WEIGHT, "model.embed_tokens.weight", "tok_embeddings.weight"},
             {OUTPUT + "." + WEIGHT, "lm_head.weight"},
@@ -448,14 +458,20 @@ public final class TensorNames {
 
     /**
      * Hugging Face alternates of a {@code blk.N.} suffix such as {@code attn_q.weight}, as suffixes under
-     * {@link #HF_LAYER_PREFIX}; empty when the suffix has none.
+     * {@link #HF_LAYER_PREFIX}; empty when the suffix has none. GGUF files from third-party tools and NeuralFree's
+     * MTP-only files may store layer tensors under these names; models opened from Hugging Face checkpoints never
+     * do, because {@code HfTensorNameMap} maps every checkpoint name at load.
      */
     public static List<String> layerAliases(String suffix) {
         List<String> a = LAYER_ALIASES.get(suffix);
         return a != null ? a : Collections.<String>emptyList();
     }
 
-    /** Alternates of a model-level tensor name such as {@code output.weight}; empty when it has none. */
+    /**
+     * Alternates of a model-level tensor name such as {@code output.weight}; empty when it has none. They serve GGUF
+     * files that keep Hugging Face names (third-party tools, NeuralFree's MTP-only files); models opened from Hugging
+     * Face checkpoints never carry them, because {@code HfTensorNameMap} maps every checkpoint name at load.
+     */
     public static List<String> modelAliases(String name) {
         List<String> a = MODEL_ALIAS_MAP.get(name);
         return a != null ? a : Collections.<String>emptyList();

@@ -47,6 +47,9 @@ Derived material:
   - `src/main/resources/shaders/llm/`
 - **The Vulkan driver priority table** of `ggml/src/ggml-vulkan/ggml-vulkan.cpp` (`driver_priorities`):
   - `src/main/java/com/eonmux/neuralfree/acceleration/vulkan/VkDeviceRanking.java`
+- **The Hugging Face checkpoint loader**, which ports the converter's per-architecture logic — the hyperparameter mappings, tensor transforms and quantization repacks, vocabulary writers and chat template handling — from `conversion/*.py` and `gguf-py/gguf/*`:
+  - `src/main/java/com/eonmux/neuralfree/gguf/hf/`
+- **The generated converter tables** of `src/main/resources/hf/` — the architecture registrations, tensor-name patterns, GGUF writer keys, hyperparameter aliases, pre-tokenizer hashes and tensor filters — together with the converter's bundled templates and built-in vocabularies copied byte for byte from `models/templates` and `models` (per-file provenance in `src/main/resources/hf/manifest.tsv`).
 - **Reference transcriptions in the tests** (for example `quantize_row_q8_0_ref`, `quantize_row_tq1_0_ref`,
   `ggml_ssm_scan` and the gated delta net):
   - `src/test/java/com/eonmux/neuralfree/gguf/`
@@ -55,6 +58,42 @@ Derived material:
 MIT License
 
 Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## bitsandbytes
+
+- **Upstream:** https://github.com/bitsandbytes-foundation/bitsandbytes (`bitsandbytes/functional.py`, `get_4bit_type`)
+- **Licence:** MIT License
+- **Copyright:** Copyright (c) Facebook, Inc. and its affiliates.
+
+The 4-bit lookup tables of `get_4bit_type` — the `NF4` codebook (values scaled to a maximum magnitude of 1.0) and the FP4 value list normalized by its maximum magnitude — are copied value for value as the codebooks of the `NF4` and `FP4_BNB` weight types:
+
+- `src/main/java/com/eonmux/neuralfree/gguf/quant/QuantTables.java`
+- `src/main/resources/kernels/llm/common/quant_blocks.h`
+- `src/main/resources/shaders/llm/common/quant_blocks.glsl`
+
+```text
+MIT License
+
+Copyright (c) Facebook, Inc. and its affiliates.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -232,6 +271,28 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 The fallback harmony prompt follows the template's structure and reproduces its fixed system-header strings:
 
 - `src/main/java/com/eonmux/neuralfree/gguf/chat/HarmonyFallback.java`
+
+The Apache License, Version 2.0 is reproduced in Part B of [LICENSE](LICENSE). The upstream project has no NOTICE
+file.
+
+## vLLM
+
+- **Upstream:** https://github.com/vllm-project/vllm (`model_executor/layers/quantization/*`)
+- **Licence:** Apache License, Version 2.0
+- **Copyright:** the vLLM authors; their LICENSE file carries the Apache License, Version 2.0 text without a
+  separate copyright line
+
+Derived material:
+
+- **The activation quantization schemes** (`ActQuantScheme` and its kernel application in `gguf/quant`): the operation
+  order, scale computation, rounding and saturation of the INT8 and FP8 static, per-token and 128-group schemes, and
+  of the NVFP4/MXFP4/MXFP8 per-group schemes, follow the reference kernels of `quantization/utils/*` and `w8a8/*`
+  statement for statement:
+  - `src/main/java/com/eonmux/neuralfree/gguf/quant/ActQuantScheme.java`
+- **The KV-cache scale remap list** (`KvScaleCollector`): the checkpoint key names of the FP8 attention scales, and
+  how they are renamed into the `blk.N.attn_k.kv_scale`, `blk.N.attn_v.kv_scale`, `blk.N.attn_q.q_scale` and
+  `blk.N.attn_prob_scale` tensors, follow the mapping vLLM applies when it loads FP8 checkpoint attention scales:
+  - `src/main/java/com/eonmux/neuralfree/gguf/hf/KvScaleCollector.java`
 
 The Apache License, Version 2.0 is reproduced in Part B of [LICENSE](LICENSE). The upstream project has no NOTICE
 file.

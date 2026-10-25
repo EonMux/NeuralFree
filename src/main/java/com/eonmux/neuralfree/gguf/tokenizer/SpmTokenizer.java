@@ -16,6 +16,12 @@ import java.util.PriorityQueue;
  * seeded as one symbol per code point, adjacent pairs whose concatenation is a vocabulary token
  * merge highest score first (ties: leftmost), and symbols that are not tokens fall back to
  * {@code <0xXX>} byte tokens.</p>
+ *
+ * <p>The vocabulary's prepend scheme ({@link TokenizerVocab#prependScheme()}) narrows the space
+ * prefix: {@code FIRST} prefixes only a fragment that begins the input and does not already
+ * start with a space (Hugging Face Metaspace {@code prepend_scheme = "first"}, transformers
+ * {@code legacy = false}), {@code NEVER} prefixes none. Post-processor ids replace BOS and EOS
+ * ({@link SpecialTokens#leadingIds()}).</p>
  */
 public final class SpmTokenizer implements TokenizerAlgorithm {
 
@@ -42,23 +48,40 @@ public final class SpmTokenizer implements TokenizerAlgorithm {
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 3));
         boolean isPrevSpecial = true;
-        if (addSpecial && vocab.addBos()) {
-            out.add(special.requireBos());
+        if (addSpecial) {
+            for (int id : special.leadingIds()) out.add(id);
         }
-        for (SpecialTokens.Fragment f : special.partition(text, parseSpecial)) {
+        List<SpecialTokens.Fragment> fragments = special.partition(text, parseSpecial);
+        for (int i = 0; i < fragments.size(); i++) {
+            SpecialTokens.Fragment f = fragments.get(i);
             if (f.isToken()) {
                 out.add(f.token());
                 isPrevSpecial = true;
             } else {
-                String raw = vocab.addSpacePrefix() && isPrevSpecial ? " " + f.text() : f.text();
+                String raw = prependSpace(f.text(), isPrevSpecial, i == 0) ? " " + f.text() : f.text();
                 tokenizeFragment(TokenizerVocab.escapeWhitespace(raw), out);
                 isPrevSpecial = false;
             }
         }
-        if (addSpecial && vocab.addEos()) {
-            out.add(special.requireEos());
+        if (addSpecial) {
+            for (int id : special.trailingIds()) out.add(id);
         }
         return out.toArray();
+    }
+
+    /**
+     * Whether a text fragment gets the {@code add_space_prefix} space: after a special token or
+     * at the start ({@code ALWAYS}, llama.cpp); only at the start of the input and when the text
+     * does not already begin with a space or U+2581 ({@code FIRST}, Hugging Face Metaspace); or
+     * never.
+     */
+    private boolean prependSpace(String text, boolean isPrevSpecial, boolean inputStart) {
+        if (!vocab.addSpacePrefix()) return false;
+        switch (vocab.prependScheme()) {
+            case FIRST: return inputStart && !text.startsWith(" ") && !text.startsWith("▁");
+            case NEVER: return false;
+            default: return isPrevSpecial;
+        }
     }
 
     @Override

@@ -19,6 +19,7 @@ import com.eonmux.neuralfree.gguf.engine.GenerationLoop;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
+import com.eonmux.neuralfree.gguf.engine.SamplingDefaults;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
 import com.eonmux.neuralfree.gguf.memory.ContextFitter;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
@@ -37,6 +38,7 @@ import com.eonmux.neuralfree.gguf.ops.heads.PoolingHead;
 import com.eonmux.neuralfree.gguf.ops.heads.LoraAttachment;
 import com.eonmux.neuralfree.gguf.ops.heads.SwitchedLoraBackend;
 import com.eonmux.neuralfree.gguf.ops.heads.SwitchedLoraExtra;
+import com.eonmux.neuralfree.gguf.quant.InputTransformLoader;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
@@ -54,14 +56,14 @@ import java.util.Objects;
 /**
  * A GGUF model run on the CPU by the spec-driven engine.
  *
- * <p>Construction: parser, tokenizer, {@link GgufKv} and {@link TensorCatalog}, {@link ModelSpecBuilder}; the
- * memory settings the model runs with ({@link MemoryConfig#forModel}: models that evaluate their whole input in one
- * step get a ubatch of their whole context, models without memory at most their context); the {@link CpuWeights}
- * read in place from the mapped file; for models
- * with memory the context {@link ContextFitter} chooses within the Java heap, beside the NextN / MTP draft caches and
- * a configured draft model's host memory ({@link LLMModelFactory#draftCompanion}), its {@link MemoryPlan}
- * ({@link MemoryPlanner}) and the {@link HeapModelMemory}; the {@link CpuScratch} of the plan's ubatch (of the
- * settings' ubatch without memory), the
+ * <p>Construction: the {@link ModelSource} ({@link ModelSources} with the configuration's
+ * {@link EngineConfig#sourceOptions()}), tokenizer, {@link GgufKv} and {@link TensorCatalog},
+ * {@link ModelSpecBuilder}; the memory settings the model runs with ({@link MemoryConfig#forModel}: models that
+ * evaluate their whole input in one step get a ubatch of their whole context, models without memory at most their
+ * context); the {@link CpuWeights} read in place from the mapped file; for models with memory the context
+ * {@link ContextFitter} chooses within the Java heap, beside the NextN / MTP draft caches and a configured draft
+ * model's host memory ({@link LLMModelFactory#draftCompanion}), its {@link MemoryPlan} ({@link MemoryPlanner}) and the
+ * {@link HeapModelMemory}; the {@link CpuScratch} of the plan's ubatch (of the settings' ubatch without memory), the
  * {@link CpuForwardContext}, the {@link CpuBlockRegistry} of {@link CpuFactoryCatalog} and the backend:
  * {@link CpuEncDecBackend} for encoder-decoder models, {@link CpuForwardBackend} otherwise (wrapped for the
  * graniteswitch adapter router and the qwen3tts logits layout), or the {@link CpuWavTokenizer} decoder for
@@ -71,7 +73,7 @@ import java.util.Objects;
  * {@link GenerationRequest}); embeddings, classification and reranking through {@link ForwardBackend#hiddenRows}
  * and the heads; masked diffusion through {@link DiffusionGenerator}; audio codes through the wavtokenizer decoder.
  * The scalar getters describe trunk layer 0. Not thread-safe. {@link #close()} releases the backend, the memory,
- * the weights and the parser.</p>
+ * the weights and the source.</p>
  */
 public final class GGUFModel implements EngineModel {
 
@@ -85,7 +87,7 @@ public final class GGUFModel implements EngineModel {
     /** Smallest heap headroom kept out of the memory budget. */
     private static final long MIN_HEAP_HEADROOM_BYTES = 64L << 20;
 
-    private final GGUFFileParser parser;
+    private final ModelSource source;
     private final GGUFTokenizer tokenizer;
     private final EngineConfig config;
     private final ModelSpec spec;
@@ -97,6 +99,7 @@ public final class GGUFModel implements EngineModel {
     private final ForwardBackend backend;
     private final CpuWavTokenizer wavTokenizer;
     private final LoraAttachment loras;
+    private final SamplingDefaults samplingDefaults;
 
     private GenerationLoop generationLoop;
     private PoolingHead poolingHead;
@@ -119,17 +122,19 @@ public final class GGUFModel implements EngineModel {
     public GGUFModel(String path, EngineConfig config) throws IOException {
         Objects.requireNonNull(path, "path");
         Objects.requireNonNull(config, "config");
-        this.parser = new GGUFFileParser(path);
+        this.source = ModelSources.open(path, config.sourceOptions(), null, config.activationQuant());
         Deque<AutoCloseable> opened = new ArrayDeque<>();
         try {
-            this.tokenizer = new GGUFTokenizer(parser);
-            GgufKv kv = GgufKv.of(parser);
-            TensorCatalog tc = TensorCatalog.of(parser);
+            this.tokenizer = new GGUFTokenizer(source);
+            GgufKv kv = GgufKv.of(source);
+            this.samplingDefaults = SamplingDefaults.read(kv);
+            TensorCatalog tc = TensorCatalog.of(source);
             ModelSpec resolved = ModelSpecBuilder.build(kv, tc, config.memory());
             rejectStandalone(resolved);
             MemoryConfig mc = config.memory().forModel(resolved);
 
-            this.weights = CpuWeights.open(parser);
+            this.weights = CpuWeights.open(source, tc,
+                    InputTransformLoader.load(source, kv, tc, config.activationQuant()));
             opened.push(weights);
             CpuScratch scratch = CpuScratch.forModel(resolved, mc.ubatch());
 
@@ -186,7 +191,7 @@ public final class GGUFModel implements EngineModel {
             }
         } catch (IOException | RuntimeException | Error e) {
             closeAll(opened, e);
-            closeParser(parser, e);
+            closeSource(source, e);
             throw e;
         }
         LOGGER.info("{} loaded on the CPU: {} ({})", spec.arch().ggufName(), spec.supportClass(),
@@ -211,7 +216,7 @@ public final class GGUFModel implements EngineModel {
         }
         List<LoraAttachment.Binding> bindings = new ArrayList<>(specs.size());
         for (EngineConfig.LoraSpec s : specs) {
-            bindings.add(LoraAttachment.Binding.load(s.path(), s.scale(), weights));
+            bindings.add(LoraAttachment.Binding.load(s.path(), s.scale(), weights, config.sourceOptions()));
         }
         LoraAttachment att = LoraAttachment.cpu(bindings, ctx.projectionDeltas());
         LOGGER.info("{}: {} LoRA adapter(s) attached, {} deltas: {}", ctx.spec().arch().ggufName(), bindings.size(),
@@ -271,6 +276,12 @@ public final class GGUFModel implements EngineModel {
     @Override
     public ModelSpec spec() {
         return spec;
+    }
+
+    /** The sampling defaults of the model's metadata ({@link SamplingDefaults#read}). */
+    @Override
+    public SamplingDefaults modelSamplingDefaults() {
+        return samplingDefaults;
     }
 
     /**
@@ -711,13 +722,13 @@ public final class GGUFModel implements EngineModel {
         System.out.println("FFN length: " + feedForwardLength());
         System.out.println("Norm eps: " + rmsNormEps());
         System.out.println("RoPE freq base: " + ropeFreqBase());
-        System.out.println("Tensors: " + parser.getTensorCount());
+        System.out.println("Tensors: " + source.getTensorCount());
         System.out.println("Memory: " + (plan != null ? plan : "none"));
     }
 
     // ------------------------------------------------------------------ lifecycle
 
-    /** Releases the decoder or backend, the memory, the weights and the parser; idempotent. */
+    /** Releases the decoder or backend, the memory, the weights and the source; idempotent. */
     @Override
     public void close() throws IOException {
         if (closed) {
@@ -740,7 +751,7 @@ public final class GGUFModel implements EngineModel {
         }
         IOException failure = new IOException("closing the " + architecture() + " model failed");
         closeAll(owned, failure);
-        closeParser(parser, failure);
+        closeSource(source, failure);
         if (failure.getSuppressed().length > 0) {
             throw failure;
         }
@@ -763,9 +774,9 @@ public final class GGUFModel implements EngineModel {
         }
     }
 
-    private static void closeParser(GGUFFileParser parser, Throwable sink) {
+    private static void closeSource(ModelSource source, Throwable sink) {
         try {
-            parser.close();
+            source.close();
         } catch (IOException | RuntimeException e) {
             sink.addSuppressed(e);
         }

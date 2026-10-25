@@ -12,13 +12,13 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -28,9 +28,11 @@ import java.util.Set;
  *
  * <p>The tensors of all splits share one virtual offset space: the tensors of split {@code s} are at
  * {@link Shard#virtualBase()} plus their offset inside that split's data section. {@link #getShards()} describes
- * each split, and tensor data reads resolve virtual offsets through it.</p>
+ * each split, {@link #dataSegments()} gives their data sections as {@link DataSegment}s, and tensor data reads
+ * resolve virtual offsets through them. A GGUF file is its own {@link ModelSource}: its metadata, tensor table and
+ * bytes are the GGUF contract as stored.</p>
  */
-public final class GGUFFileParser {
+public final class GGUFFileParser implements ModelSource {
     public static final String MAGIC = "GGUF";
     public static final int DEFAULT_ALIGNMENT = 32;
 
@@ -54,6 +56,7 @@ public final class GGUFFileParser {
         private final long dataLength;
         private final int firstTensor;
         private final int tensorCount;
+        private final DataSegment segment;
 
         Shard(int index, String path, long fileDataOffset, long virtualBase, long dataLength, int firstTensor,
               int tensorCount) {
@@ -64,6 +67,7 @@ public final class GGUFFileParser {
             this.dataLength = dataLength;
             this.firstTensor = firstTensor;
             this.tensorCount = tensorCount;
+            this.segment = new DataSegment(path, fileDataOffset, virtualBase, dataLength);
         }
 
         /** Position of the split, 0 for the file the parser was opened with. */
@@ -87,6 +91,9 @@ public final class GGUFFileParser {
         /** Number of tensors the split holds. */
         public int tensorCount() { return tensorCount; }
 
+        /** The split's data section as a {@link DataSegment}. */
+        public DataSegment segment() { return segment; }
+
         /** File offset of the byte at {@code virtualOffset}, which must lie in this split. */
         public long fileOffset(long virtualOffset) {
             return fileDataOffset + (virtualOffset - virtualBase);
@@ -108,13 +115,18 @@ public final class GGUFFileParser {
     private final long dataOffset;
 
     private final Map<String, Object> metadata = new HashMap<>();
+    private final Map<String, Object> metadataView = Collections.unmodifiableMap(metadata);
     private final Map<String, GGUFValueType> valueTypes = new HashMap<>();
     private final Map<String, GGUFValueType> arrayElementTypes = new HashMap<>();
     private final List<GGUFTensorInfo> tensors = new ArrayList<>();
+    private final List<GGUFTensorInfo> tensorsView = Collections.unmodifiableList(tensors);
     private final Map<String, Integer> tensorNameToIndex = new HashMap<>();
 
     /** Every file of the model in split order; one entry for a single-file model. */
     private final List<Shard> shards;
+
+    /** The data section of every split, in split order. */
+    private final List<DataSegment> dataSegments;
 
     /**
      * Lazily-initialized store used only when tensor data is read from a multi-shard GGUF.
@@ -142,7 +154,7 @@ public final class GGUFFileParser {
 
             for (long i = 0; i < tensorCount; i++) {
                 GGUFTensorInfo info = reader.readTensorInfo(i);
-                validateTensorInfo(path, info);
+                GGUFTensorInfo.validate(invalidFilePrefix(path), info);
                 tensors.add(info);
             }
 
@@ -155,6 +167,11 @@ public final class GGUFFileParser {
             }
 
             this.shards = Collections.unmodifiableList(loadShards());
+            List<DataSegment> segments = new ArrayList<>(shards.size());
+            for (Shard shard : shards) {
+                segments.add(shard.segment());
+            }
+            this.dataSegments = Collections.unmodifiableList(segments);
         } catch (Throwable t) {
             try {
                 raf.close();
@@ -259,7 +276,7 @@ public final class GGUFFileParser {
             List<GGUFTensorInfo> result = new ArrayList<>((int) header.tensorCount);
             for (long i = 0; i < header.tensorCount; i++) {
                 GGUFTensorInfo info = reader.readTensorInfo(i);
-                validateTensorInfo(shardPath, info);
+                GGUFTensorInfo.validate(invalidFilePrefix(shardPath), info);
                 result.add(info);
             }
             long shardDataOffset = alignUp(reader.position(), align);
@@ -344,6 +361,7 @@ public final class GGUFFileParser {
 
     public int getVersion() { return version; }
     /** Tensor count in the header of the opened file; {@link #getTensors()} holds the tensors of every split. */
+    @Override
     public long getTensorCount() { return tensorCount; }
     /** Key/value pair count in the header of the opened file. */
     public long getKVCount() { return kvCount; }
@@ -351,8 +369,17 @@ public final class GGUFFileParser {
     public long getAlignment() { return alignment; }
     public long getDataOffset() { return dataOffset; }
 
-    public Map<String, Object> getMetadata() { return metadata; }
-    public List<GGUFTensorInfo> getTensors() { return tensors; }
+    /** {@link ModelFormat#GGUF}. */
+    @Override
+    public ModelFormat format() { return ModelFormat.GGUF; }
+
+    /** The metadata of the opened file (unmodifiable). */
+    @Override
+    public Map<String, Object> getMetadata() { return metadataView; }
+
+    /** The tensors of every split in split order, at virtual offsets (unmodifiable). */
+    @Override
+    public List<GGUFTensorInfo> getTensors() { return tensorsView; }
 
     public int getTensorIndex(String name) {
         Integer idx = tensorNameToIndex.get(name);
@@ -368,6 +395,7 @@ public final class GGUFFileParser {
         return index >= 0 && index < tensors.size() ? tensors.get(index) : null;
     }
 
+    @Override
     public String getString(String key) {
         Object val = metadata.get(key);
         return val instanceof String ? (String) val : null;
@@ -410,11 +438,13 @@ public final class GGUFFileParser {
     }
 
     /** GGUF type of a metadata value, or null when the key is absent. */
+    @Override
     public GGUFValueType getValueType(String key) {
         return valueTypes.get(key);
     }
 
     /** Element type of an array metadata value, or null when the key is absent or not an array. */
+    @Override
     public GGUFValueType getArrayElementType(String key) {
         return arrayElementTypes.get(key);
     }
@@ -562,6 +592,7 @@ public final class GGUFFileParser {
         return dequantize(rawData, tensor.type(), tensor.numElements());
     }
 
+    @Override
     public String getFilePath() { return filePath; }
 
     /**
@@ -577,27 +608,32 @@ public final class GGUFFileParser {
     }
 
     /**
-     * Creates a {@link WeightStore} backed by this file's tensor data region.
-     * Returns a {@link MultiShardMappedWeightStore} for split GGUFs,
-     * or a plain {@link MappedWeightStore} for single-file GGUFs.
+     * Creates a {@link WeightStore} backed by this file's tensor data: a {@link MultiShardMappedWeightStore} over
+     * {@link #dataSegments()} for split GGUFs, or a plain {@link MappedWeightStore} for single-file GGUFs. Every tensor
+     * is stored in the files, so every {@link StoreUse} gets the same store.
      */
-    public WeightStore createMappedStore() throws IOException {
+    @Override
+    public WeightStore createMappedStore(StoreUse use) throws IOException {
+        Objects.requireNonNull(use, "use");
         if (!isMultiShard()) {
             return new MappedWeightStore(filePath, dataOffset, getDataLength());
         }
-        int n = shards.size();
-        String[] paths = new String[n];
-        long[] fileDataOffsets = new long[n];
-        long[] virtualBases = new long[n];
-        long[] dataLengths = new long[n];
-        for (int s = 0; s < n; s++) {
-            Shard shard = shards.get(s);
-            paths[s] = shard.path();
-            fileDataOffsets[s] = shard.fileDataOffset();
-            virtualBases[s] = shard.virtualBase();
-            dataLengths[s] = shard.dataLength();
-        }
-        return new MultiShardMappedWeightStore(paths, fileDataOffsets, virtualBases, dataLengths);
+        return new MultiShardMappedWeightStore(dataSegments);
+    }
+
+    /**
+     * Byte regions of the tensors over {@link #dataSegments()}, one file per split, mapped or read as {@code mode}
+     * selects.
+     */
+    @Override
+    public TensorRegions openRegions(TensorReadMode mode) throws IOException {
+        String description = shards.size() == 1 ? filePath : filePath + " (" + shards.size() + " splits)";
+        return FileTensorRegions.open(dataSegments, mode, description);
+    }
+
+    /** The data section of every split in split order (one entry for a single-file model); unmodifiable. */
+    public List<DataSegment> dataSegments() {
+        return dataSegments;
     }
 
     /** Returns true if this GGUF was loaded as a multi-shard split file. */
@@ -638,6 +674,7 @@ public final class GGUFFileParser {
      * Closes the file and, when one was created, the store that reads split tensor data. Every close is attempted;
      * the first failure is thrown with later ones suppressed.
      */
+    @Override
     public void close() throws IOException {
         IOException failure = null;
         synchronized (this) {
@@ -702,43 +739,9 @@ public final class GGUFFileParser {
         }
     }
 
-    /**
-     * Rejects the tensor infos that llama.cpp rejects (llama.cpp ggml/src/gguf.cpp:686-753): a negative dimension
-     * (a uint64 extent of 2^63 or more), an element count or byte size that overflows a signed 64-bit
-     * value, a type without a storage layout (an id unknown to {@link GGMLType}, or the removed
-     * Q4_2 / Q4_3) and a row length {@code ne[0]} that is not a whole number of blocks.
-     */
-    private static void validateTensorInfo(String path, GGUFTensorInfo tensor) throws IOException {
-        String prefix = "Invalid GGUF file '" + path + "': tensor '" + tensor.name() + "' ";
-        long[] dims = tensor.dims();
-        for (int i = 0; i < dims.length; i++) {
-            if (dims[i] < 0) {
-                throw new IOException(prefix + "dimension " + i + " has " + Long.toUnsignedString(dims[i])
-                        + " elements, more than a signed 64-bit count");
-            }
-        }
-        long elements = dims.length == 0 ? 1 : dims[0];
-        for (int i = 1; i < dims.length; i++) {
-            if (dims[i] > 1 && Long.MAX_VALUE / dims[i] < elements) {
-                throw new IOException(prefix + "has shape " + Arrays.toString(dims)
-                        + ", whose element count overflows a signed 64-bit value");
-            }
-            elements *= dims[i];
-        }
-        GGMLType type = tensor.type();
-        if (!BlockLayout.isDefined(type)) {
-            throw new IOException(prefix + "has ggml type " + type + ", which is unknown or was removed from ggml");
-        }
-        BlockLayout layout = BlockLayout.of(type);
-        long rowElements = tensor.dim(0);
-        if (rowElements % layout.blockElements() != 0) {
-            throw new IOException(prefix + "of type " + type + " has " + rowElements
-                    + " elements per row, not a multiple of the block size " + layout.blockElements());
-        }
-        if (elements / layout.blockElements() > Long.MAX_VALUE / layout.blockBytes()) {
-            throw new IOException(prefix + "of type " + type + " with shape " + Arrays.toString(dims)
-                    + " has a byte size that overflows a signed 64-bit value");
-        }
+    /** The prefix of every container error of the file at {@code path}. */
+    private static String invalidFilePrefix(String path) {
+        return "Invalid GGUF file '" + path + "'";
     }
 
     // -----------------------------------------------------------------------

@@ -33,18 +33,20 @@ public class TiledGemmPlanTest {
 
     @Test
     public void everyWeightTypeOfTheFamilyHasOneTiledKernel() {
-        assertEquals(29, GemmKernels.TILED_TYPES.size());
+        assertEquals(35, GemmKernels.TILED_TYPES.size());
         assertEquals("Q4_K_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.Q4_K));
         assertEquals("BF16_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.BF16));
         assertEquals("Q2_0_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.Q2_0));
+        assertEquals("F8_E4M3_B128_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.F8_E4M3_B128));
+        assertEquals("FP4_BNB_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.FP4_BNB));
         assertFalse(GemmKernels.hasTiled(GGMLType.Q8_1));
         assertFalse(GemmKernels.hasTiled(GGMLType.I32));
         assertFalse(GemmKernels.hasTiled(null));
         List<String> names = GemmKernels.kernelNames();
-        assertEquals(30, names.size());
+        assertEquals(36, names.size());
         assertEquals("F32_MatMul_Tiled", names.get(0));
         assertEquals(GemmKernels.TOPK_PARTIAL, names.get(names.size() - 1));
-        assertEquals(30, new TreeSet<>(names).size());
+        assertEquals(36, new TreeSet<>(names).size());
     }
 
     @Test(expected = IllegalArgumentException.class)

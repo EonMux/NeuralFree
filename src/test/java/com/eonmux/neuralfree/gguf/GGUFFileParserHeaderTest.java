@@ -206,7 +206,7 @@ public class GGUFFileParserHeaderTest {
     @Test
     public void rejectsTensorNameOfSixtyFourBytes() throws IOException {
         StringBuilder name = new StringBuilder();
-        for (int i = 0; i < GGUFHeaderReader.MAX_NAME; i++) {
+        for (int i = 0; i < GGUFTensorInfo.MAX_NAME_BYTES; i++) {
             name.append('t');
         }
         Raw raw = Raw.header(3, 1, 0).str(name.toString()).u32(1).u64(32).u32(GGMLType.F32.getId()).u64(0);

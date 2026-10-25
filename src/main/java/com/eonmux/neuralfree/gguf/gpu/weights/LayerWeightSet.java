@@ -3,8 +3,11 @@ package com.eonmux.neuralfree.gguf.gpu.weights;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.quant.InputTransform;
+import com.eonmux.neuralfree.gguf.quant.InputTransformLoader;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
@@ -24,8 +27,8 @@ import java.util.function.Predicate;
 /**
  * Every tensor of one physical weight layer that is streamed to the device, with heterogeneous types and shapes,
  * planned for upload: per tensor the device type (stored, or F32 when the device cannot consume the stored type), the
- * row shards that keep each buffer within the device's allocation and binding limits, the PRISM input transform and
- * the per-tensor output scale.
+ * row shards that keep each buffer within the device's allocation and binding limits, the input transform
+ * (HADAMARD, ACT_QUANT, PERMUTE over the stored {@code <base>.input_perm} sibling), and the per-tensor output scale.
  *
  * <p>A layer's tensors are the file's {@code <stack>.<weightLayer>.*} tensors (for the main stack also the Hugging Face
  * alias {@code model.layers.<weightLayer>.*}), where stack and weight layer come from the {@link LayerSpec}s of the
@@ -54,13 +57,13 @@ public final class LayerWeightSet {
         private final UploadPolicy policy;
         private final Predicate<TensorRef> filter;
         private final long maxShardBytes;
-        private final Map<String, HadamardSpec> hadamard;
+        private final InputTransformLoader.Result transforms;
 
         private Options(Builder b) {
             this.policy = b.policy;
             this.filter = b.filter;
             this.maxShardBytes = b.maxShardBytes;
-            this.hadamard = Collections.unmodifiableMap(new TreeMap<>(b.hadamard));
+            this.transforms = b.transforms;
         }
 
         /** Options with the given per-tensor device type decision, every layer tensor and no shard limit. */
@@ -87,14 +90,14 @@ public final class LayerWeightSet {
         /** Which layer tensors are streamed (the others are expected among the resident weights). */
         public Predicate<TensorRef> filter() { return filter; }
         public long maxShardBytes() { return maxShardBytes; }
-        /** PRISM input transforms by stored tensor name (unmodifiable). */
-        public Map<String, HadamardSpec> hadamard() { return hadamard; }
+        /** The model's input transforms, or null for none. */
+        public InputTransformLoader.Result transforms() { return transforms; }
 
         public static final class Builder {
             private final UploadPolicy policy;
             private Predicate<TensorRef> filter = t -> true;
             private long maxShardBytes = Long.MAX_VALUE;
-            private Map<String, HadamardSpec> hadamard = Collections.emptyMap();
+            private InputTransformLoader.Result transforms;
 
             private Builder(UploadPolicy policy) {
                 this.policy = Objects.requireNonNull(policy, "policy");
@@ -115,9 +118,14 @@ public final class LayerWeightSet {
                 return this;
             }
 
-            /** PRISM forward transforms ({@code PrismHadamardLoader.Result.forward()}). */
-            public Builder hadamard(Map<String, HadamardSpec> v) {
-                this.hadamard = Objects.requireNonNull(v, "hadamard");
+            /**
+             * The model's input transforms ({@link InputTransformLoader}); null for none. Transforms bind at load,
+             * where a malformed one throws {@link GgufFormatException}; a fit a streamed tensor cannot take throws
+             * from {@link GpuWeight#withInputTransform(InputTransform, GpuBuffer)} when its slot builds the
+             * weights.
+             */
+            public Builder transforms(InputTransformLoader.Result v) {
+                this.transforms = v;
                 return this;
             }
 
@@ -133,16 +141,18 @@ public final class LayerWeightSet {
         private final GGMLType uploadType;
         private final long uploadRowBytes;
         private final long[] shardRows;
-        private final HadamardSpec hadamard;
+        private final InputTransform inputTransform;
+        private final TensorRef inputPerm;
         private final TensorRef scale;
 
-        Entry(TensorRef source, GGMLType uploadType, long uploadRowBytes, long[] shardRows, HadamardSpec hadamard,
-              TensorRef scale) {
+        Entry(TensorRef source, GGMLType uploadType, long uploadRowBytes, long[] shardRows,
+              InputTransform inputTransform, TensorRef inputPerm, TensorRef scale) {
             this.source = source;
             this.uploadType = uploadType;
             this.uploadRowBytes = uploadRowBytes;
             this.shardRows = shardRows;
-            this.hadamard = hadamard;
+            this.inputTransform = inputTransform;
+            this.inputPerm = inputPerm;
             this.scale = scale;
         }
 
@@ -170,8 +180,20 @@ public final class LayerWeightSet {
         public long shardBytes(int i) { return shardRows[i] * uploadRowBytes; }
         /** Row counts of all shards (copy). */
         public long[] shardRowCounts() { return shardRows.clone(); }
-        /** PRISM input transform, or null. */
-        public HadamardSpec hadamard() { return hadamard; }
+        /** Input rotation (the HADAMARD part of the weight's input transform), or null. */
+        public HadamardSpec hadamard() { return inputTransform != null ? inputTransform.hadamard() : null; }
+
+        /**
+         * The full input transform chain of this weight's matmul input (HADAMARD, ACT_QUANT, PERMUTE), or null: what
+         * {@code LayerSlots} attaches with {@link GpuWeight#withInputTransform(InputTransform, GpuBuffer)}.
+         */
+        public InputTransform inputTransform() { return inputTransform; }
+
+        /**
+         * The {@code <base>.input_perm} tensor of a PERMUTE part (read by the streamed upload into a device int
+         * buffer), or null.
+         */
+        public TensorRef inputPerm() { return inputPerm; }
         /**
          * The scalar {@code <base>.scale} tensor holding the output scale {@code w_s} of this {@code <base>.weight}
          * (llama-model.cpp:1724-1790, applied at llama-graph.cpp:1643-1645), or null. Expert
@@ -255,7 +277,7 @@ public final class LayerWeightSet {
             }
             TensorRef ref = catalog.get(name);
             if (options.filter().test(ref)) {
-                entries.add(plan(catalog.archName(), ref, options, scaleOf(catalog, ref)));
+                entries.add(plan(catalog, ref, options, scaleOf(catalog, ref)));
             }
         }
         return new LayerWeightSet(stack, weightLayer, entries);
@@ -283,7 +305,8 @@ public final class LayerWeightSet {
         return WeightShards.isExpert(ref.name(), ref.rank());
     }
 
-    private static Entry plan(String arch, TensorRef ref, Options options, TensorRef scale) {
+    private static Entry plan(TensorCatalog catalog, TensorRef ref, Options options, TensorRef scale) {
+        String arch = catalog.archName();
         GGMLType upload = Objects.requireNonNull(options.policy().uploadType(ref), "upload type of " + ref.name());
         if (upload != ref.type() && upload != GGMLType.F32) {
             throw new IllegalStateException(arch + ": upload policy converts " + ref + " to " + upload
@@ -306,7 +329,25 @@ public final class LayerWeightSet {
                     + limit + " bytes");
         }
         long[] shardRows = WeightShards.shardRows(ref.rows(), unit, unitBytes, limit);
-        return new Entry(ref, upload, rowBytes, shardRows, options.hadamard().get(ref.name()), scale);
+        return new Entry(ref, upload, rowBytes, shardRows, inputTransform(options, ref),
+                permOf(catalog, options, ref), scale);
+    }
+
+    /** The input transform of {@code ref} among the options' input transforms, or null for identity. */
+    private static InputTransform inputTransform(Options options, TensorRef ref) {
+        InputTransformLoader.Result t = options.transforms();
+        InputTransform it = t != null ? t.forward(ref.name()) : null;
+        return it != null && !it.isIdentity() ? it : null;
+    }
+
+    /** The stored {@code <base>.input_perm} tensor of {@code ref}'s transform's PERMUTE part, or null. */
+    private static TensorRef permOf(TensorCatalog catalog, Options options, TensorRef ref) {
+        InputTransform it = inputTransform(options, ref);
+        if (it == null || !it.hasPerm()) {
+            return null;
+        }
+        String permName = GpuWeight.permNameOf(ref.name());
+        return catalog.has(permName) ? catalog.get(permName) : null;
     }
 
     /** Stack prefix of the layer's tensors. */

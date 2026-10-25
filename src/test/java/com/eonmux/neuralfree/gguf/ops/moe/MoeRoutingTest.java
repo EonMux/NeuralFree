@@ -338,13 +338,20 @@ public class MoeRoutingTest {
     /** Every weight type has the three id-matvec kernels, with the family's threads-per-block. */
     @Test
     public void kernelNamesCoverAllWeightTypes() {
-        assertEquals(29, MoeKernels.weightTypes().size());
+        assertEquals(35, MoeKernels.weightTypes().size());
         assertEquals("Q4_K_MatVecIdGateUp", MoeKernels.matVecIdGateUp(GGMLType.Q4_K));
         assertEquals("NVFP4_BatchMatMulId", MoeKernels.batchMatMulId(GGMLType.NVFP4));
         assertEquals("BF16_MatVecId", MoeKernels.matVecId(GGMLType.BF16));
+        assertEquals("F8_E4M3_MatVecId", MoeKernels.matVecId(GGMLType.F8_E4M3));
         assertEquals(16, MoeKernels.threadsPerBlock(GGMLType.Q1_0));
         assertEquals(32, MoeKernels.threadsPerBlock(GGMLType.IQ4_XS));
         assertEquals(4, MoeKernels.threadsPerBlock(GGMLType.MXFP4));
+        assertEquals(4, MoeKernels.threadsPerBlock(GGMLType.F8_E4M3));
+        assertEquals(4, MoeKernels.threadsPerBlock(GGMLType.MXFP8));
+        assertEquals(8, MoeKernels.threadsPerBlock(GGMLType.NF4));
+        assertEquals(8, MoeKernels.threadsPerBlock(GGMLType.FP4_BNB));
+        assertEquals(16, MoeKernels.threadsPerBlock(GGMLType.F8_E4M3_B128));
+        assertEquals(16, MoeKernels.threadsPerBlock(GGMLType.I8_B128));
         MoeKernels.checkIdLocal(GGMLType.Q6_K, 64);
         try {
             MoeKernels.checkIdLocal(GGMLType.Q6_K, 16);

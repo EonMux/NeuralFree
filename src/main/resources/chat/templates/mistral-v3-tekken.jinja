@@ -1,0 +1,19 @@
+{#- llama.cpp mistral-v3-tekken chat template (src/llama-chat.cpp:273-298): no BOS and no generation prompt. -#}
+{%- set leading = '' -%}
+{%- set trailing = '' -%}
+{%- set ns = namespace(inside_turn=false) -%}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if not ns.inside_turn -%}
+        {{- leading ~ '[INST]' ~ trailing -}}
+        {%- set ns.inside_turn = true -%}
+    {%- endif -%}
+    {%- if message['role'] == 'system' -%}
+        {{- content ~ '\n\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- content ~ leading ~ '[/INST]' -}}
+    {%- else -%}
+        {{- trailing ~ content ~ '</s>' -}}
+        {%- set ns.inside_turn = false -%}
+    {%- endif -%}
+{%- endfor -%}

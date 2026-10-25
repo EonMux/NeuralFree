@@ -45,6 +45,8 @@ public final class GpuScratch implements AutoCloseable {
     enum Staging {
         /** Rotated or offset-free matmul input. */
         INPUT("gpuops.stage.input"),
+        /** The PERMUTE gather of an input transform, out of place beside {@link #INPUT}. */
+        PERMUTED("gpuops.stage.permuted"),
         /** Per-shard or offset-free matmul output. */
         OUTPUT("gpuops.stage.output"),
         /** Complete projection before an accumulate or scatter. */

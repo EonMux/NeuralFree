@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.quant;
 
+import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
+
 import java.nio.ByteBuffer;
 
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
@@ -7,10 +9,14 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 /**
  * CPU decoders for the plain element types (F32, F16, BF16, F64, I8, I16, I32, I64), the FP4 block
  * types (MXFP4, NVFP4) and the 1-/2-bit types Q1_0 and Q2_0, plus the scalar format conversions of
- * llama.cpp ggml/src/ggml-impl.h that the decoders and the activation quantizer share.
+ * llama.cpp ggml/src/ggml-impl.h that the decoders and the activation quantizer share, and the element
+ * codecs of the OCP microscaling formats (E8M0 scales, E4M3 / E5M2 through {@link Fp8Codec}, E2M1, and the
+ * MXFP6 elements E2M3 / E3M2) that the extension types, the checkpoint repackers and the activation
+ * fake-quantization share.
  * <p>
  * The per-type {@code decode*} kernels are package-private: they expect a little-endian buffer and a
  * range already validated by {@link CpuBlockDecoders}. The conversion helpers are public and bit-exact.
+ * Element-code arguments are masked to their width, so a signed byte read from a buffer may be passed as is.
  */
 public final class FpBlockDecoders {
 
@@ -111,6 +117,105 @@ public final class FpBlockDecoders {
                 ? Math.scalb((float) man, -9)
                 : Math.scalb(1.0f + (float) man / 8.0f, exp - 7);
         return raw * 0.5f;
+    }
+
+    // ------------------------------------------------------------------ OCP microscaling element codecs
+
+    /**
+     * E8M0 scale byte to its power of two {@code 2^(e-127)} ({@code ggml_e8m0_to_fp32}, llama.cpp
+     * ggml-impl.h:451-485); {@code e == 0} is the subnormal {@code 2^-127}. Unlike ggml, the reserved byte
+     * {@code 0xFF} decodes to NaN, as the OCP MX specification defines it.
+     */
+    public static float e8m0ToFp32(int e) {
+        final int x = e & 0xFF;
+        if (x == 0xFF) {
+            return Float.NaN;
+        }
+        return Float.intBitsToFloat(x == 0 ? 0x00400000 : x << 23);
+    }
+
+    /** Signed E4M3FN code to float, exactly ({@link Fp8Codec#E4M3FN}); codes {@code 0x7F} / {@code 0xFF} are NaN. */
+    public static float e4m3ToFp32(int code) {
+        return Fp8Codec.E4M3FN.decode(code & 0xFF);
+    }
+
+    /** Signed E5M2 code to float, exactly ({@link Fp8Codec#E5M2}), with the IEEE infinities and NaNs. */
+    public static float e5m2ToFp32(int code) {
+        return Fp8Codec.E5M2.decode(code & 0xFF);
+    }
+
+    /**
+     * Float to the signed E4M3FN code, rounding to nearest with ties to even and saturating finite values to
+     * {@code +-448} ({@link Fp8Codec#encode}); NaN and the infinities give the NaN code of their sign.
+     */
+    public static int fp32ToE4m3(float f) {
+        return Fp8Codec.E4M3FN.encode(f);
+    }
+
+    /**
+     * E2M1 code (sign bit 3, exponent bits 2-1 with bias 1, mantissa bit 0) to float: half the doubled ggml
+     * codebook {@link QuantTables#kvalueFp4(int)}, so the values are {@code 0, 0.5, 1, 1.5, 2, 3, 4, 6} and their
+     * negatives. Code 8 (negative zero) decodes to {@code +0}, as in ggml.
+     */
+    public static float e2m1ToFp32(int code) {
+        return QuantTables.kvalueFp4(code & 0x0F) * 0.5f;
+    }
+
+    /**
+     * Float to the E2M1 code, rounding to nearest with ties to the even code and saturating at {@code +-6}. The sign
+     * bit of {@code f} is kept, so a negative value that rounds to zero gives code 8. NaN and the infinities
+     * saturate to {@code +-6} by their sign bit, as the vLLM MXFP4 quantizer's bit arithmetic does
+     * (vllm model_executor/layers/quantization/utils/mxfp4_utils.py:305-337); the thresholds are those of its
+     * reference {@code cast_to_fp4} (nvfp4_emulation_utils.py:695-706).
+     */
+    public static int fp32ToE2m1(float f) {
+        final int sign = (Float.floatToRawIntBits(f) >>> 28) & 0x8;
+        final float a = Math.abs(f);
+        final int magnitude;
+        if (Float.isNaN(a)) {
+            magnitude = 7;
+        } else if (a <= 0.25f) {
+            magnitude = 0;
+        } else if (a < 0.75f) {
+            magnitude = 1;
+        } else if (a <= 1.25f) {
+            magnitude = 2;
+        } else if (a < 1.75f) {
+            magnitude = 3;
+        } else if (a <= 2.5f) {
+            magnitude = 4;
+        } else if (a < 3.5f) {
+            magnitude = 5;
+        } else if (a <= 5.0f) {
+            magnitude = 6;
+        } else {
+            magnitude = 7;
+        }
+        return sign | magnitude;
+    }
+
+    /**
+     * OCP MX FP6 E2M3 code (sign bit 5, exponent bits 4-3 with bias 1, mantissa bits 2-0) to float, exactly. The
+     * format has no infinities or NaNs: the largest magnitude is 7.5 and the smallest subnormal 0.125.
+     */
+    public static float e2m3ToFp32(int code) {
+        final int c = code & 0x3F;
+        final int exp = (c >>> 3) & 0x3;
+        final int man = c & 0x7;
+        final float v = exp == 0 ? Math.scalb((float) man, -3) : Math.scalb((float) (8 + man), exp - 4);
+        return (c & 0x20) != 0 ? -v : v;
+    }
+
+    /**
+     * OCP MX FP6 E3M2 code (sign bit 5, exponent bits 4-2 with bias 3, mantissa bits 1-0) to float, exactly. The
+     * format has no infinities or NaNs: the largest magnitude is 28 and the smallest subnormal 0.0625.
+     */
+    public static float e3m2ToFp32(int code) {
+        final int c = code & 0x3F;
+        final int exp = (c >>> 2) & 0x7;
+        final int man = c & 0x3;
+        final float v = exp == 0 ? Math.scalb((float) man, -4) : Math.scalb((float) (4 + man), exp - 5);
+        return (c & 0x20) != 0 ? -v : v;
     }
 
     // ------------------------------------------------------------------ plain element types

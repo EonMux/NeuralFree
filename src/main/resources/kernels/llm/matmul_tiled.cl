@@ -1,6 +1,6 @@
-/* matmul_tiled.cl - matmul_tiled_family instantiations for every weight type (prefill GEMM). Requires: common/dialect.h, common/config.h, common/quant_blocks.h, common/iq_tables.h, common/quant_decode_legacy.h, common/quant_decode_k.h, common/quant_decode_iq.h, common/quant_decode_new.h, common/matmul_tiled_family.h */
+/* matmul_tiled.cl - matmul_tiled_family instantiations for every weight type (prefill GEMM). Requires: common/dialect.h, common/config.h, common/quant_blocks.h, common/iq_tables.h, common/quant_decode_legacy.h, common/quant_decode_k.h, common/quant_decode_iq.h, common/quant_decode_new.h, common/quant_decode_ext.h, common/matmul_tiled_family.h */
 /*
- * Generates T_MatMul_Tiled for the 29 supported weight types: F32, F16 and BF16 through the
+ * Generates T_MatMul_Tiled for the 35 supported weight types: F32, F16 and BF16 through the
  * dense loaders of common/matmul_tiled_family.h, every quantized type through its T_decode_elem
  * (common/quant_decode_*.h). Arguments, semantics and launch contract: matmul_tiled_family.h.
  * K must be a multiple of the type's block size (32, 64, 128 or 256 elements).
@@ -44,3 +44,11 @@ NF_GEMM_TILED(TQ2_0, TQ2_0_decode_elem, TQ2_0_BLOCK_SIZE, TQ2_0_BLOCK_BYTES)
 NF_GEMM_TILED(NVFP4, NVFP4_decode_elem, NVFP4_BLOCK_SIZE, NVFP4_BLOCK_BYTES)
 NF_GEMM_TILED(Q1_0,  Q1_0_decode_elem,  Q1_0_BLOCK_SIZE,  Q1_0_BLOCK_BYTES)
 NF_GEMM_TILED(Q2_0,  Q2_0_decode_elem,  Q2_0_BLOCK_SIZE,  Q2_0_BLOCK_BYTES)
+
+/* ---- NeuralFree extension types (common/quant_decode_ext.h) ---- */
+NF_GEMM_TILED(F8_E4M3,      F8_E4M3_decode_elem,      F8_E4M3_BLOCK_SIZE,      F8_E4M3_BLOCK_BYTES)
+NF_GEMM_TILED(F8_E4M3_B128, F8_E4M3_B128_decode_elem, F8_E4M3_B128_BLOCK_SIZE, F8_E4M3_B128_BLOCK_BYTES)
+NF_GEMM_TILED(MXFP8,        MXFP8_decode_elem,        MXFP8_BLOCK_SIZE,        MXFP8_BLOCK_BYTES)
+NF_GEMM_TILED(I8_B128,      I8_B128_decode_elem,      I8_B128_BLOCK_SIZE,      I8_B128_BLOCK_BYTES)
+NF_GEMM_TILED(NF4,          NF4_decode_elem,          NF4_BLOCK_SIZE,          NF4_BLOCK_BYTES)
+NF_GEMM_TILED(FP4_BNB,      FP4_BNB_decode_elem,      FP4_BNB_BLOCK_SIZE,      FP4_BNB_BLOCK_BYTES)

@@ -69,6 +69,7 @@ layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; int seq_len;
 #include "common/quant_k.glsl"
 #include "common/quant_iq.glsl"
 #include "common/quant_new.glsl"
+#include "common/quant_ext.glsl"
 
 #if !defined(QT_DECODE_DOT) || !defined(QT_BS) || !defined(QT_BB) || !defined(QT_TPS)
 #error "matvec_quant.comp: no QT_DECODE_DOT decoder serves QTYPE"

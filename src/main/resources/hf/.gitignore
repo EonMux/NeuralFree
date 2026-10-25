@@ -1,0 +1,2 @@
+# The built-in vocabularies are checked-in resources, unlike other GGUF files.
+!/vocab/*.gguf

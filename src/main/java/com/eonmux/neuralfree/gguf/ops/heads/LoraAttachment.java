@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.heads;
 
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
@@ -43,10 +44,12 @@ public final class LoraAttachment implements AutoCloseable {
         /**
          * Loads the adapter at {@code path} against the base model's weights ({@link LoraAdapterLoader#load}).
          *
+         * @param options how a checkpoint that is not GGUF is opened
          * @throws IOException when the file cannot be read
          */
-        public static Binding load(String path, float scale, CpuWeights base) throws IOException {
-            return new Binding(LoraAdapterLoader.load(path, base), scale);
+        public static Binding load(String path, float scale, CpuWeights base, ModelSourceOptions options)
+                throws IOException {
+            return new Binding(LoraAdapterLoader.load(path, base, options), scale);
         }
 
         public LoraAdapter adapter() { return adapter; }

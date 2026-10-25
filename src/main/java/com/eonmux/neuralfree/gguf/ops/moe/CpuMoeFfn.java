@@ -632,7 +632,7 @@ public final class CpuMoeFfn implements CpuFfnBlock {
             this.downSite = deltas.serve(layer, f.downWeight(), down, mv);
             this.unscaled = new CpuMatVec(t -> {
                 CpuMatVec.Transforms tr = mv.transformsOf(t);
-                return tr.hasScale() ? CpuMatVec.Transforms.of(tr.input(), null, tr.experts()) : tr;
+                return tr.hasScale() ? CpuMatVec.Transforms.from(tr.transform(), null, tr.experts()) : tr;
             });
             CpuScratch scratch = ctx.scratch();
             this.g = gate != null || fused ? scratch.temp(T_FFN_GATE, rows(upRows)) : null;

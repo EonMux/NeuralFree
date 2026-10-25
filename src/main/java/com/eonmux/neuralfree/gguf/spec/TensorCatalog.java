@@ -1,7 +1,7 @@
 package com.eonmux.neuralfree.gguf.spec;
 
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
+import com.eonmux.neuralfree.gguf.ModelSource;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -37,14 +37,14 @@ public final class TensorCatalog {
     }
 
     /**
-     * Catalog of a parsed GGUF file; the architecture name comes from {@code general.architecture}.
+     * Catalog of an open model; the architecture name comes from {@code general.architecture}.
      *
-     * @throws IllegalArgumentException when the file lists the same tensor name twice
+     * @throws IllegalArgumentException when the model lists the same tensor name twice
      */
-    public static TensorCatalog of(GGUFFileParser parser) {
-        Objects.requireNonNull(parser, "parser");
-        String arch = parser.getString("general.architecture");
-        return of(arch != null ? arch : "unknown", parser.getTensors());
+    public static TensorCatalog of(ModelSource source) {
+        Objects.requireNonNull(source, "source");
+        String arch = source.getString("general.architecture");
+        return of(arch != null ? arch : "unknown", source.getTensors());
     }
 
     /**

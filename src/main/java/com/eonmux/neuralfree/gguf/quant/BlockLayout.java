@@ -10,8 +10,9 @@ import java.util.Map;
 
 /**
  * Block geometry of every ggml storage type: elements and bytes per block, plus the byte offset of
- * every field inside each block struct of llama.cpp ggml/src/ggml-common.h (lines 178-459). The field
- * offsets are the single source of truth for the CPU decoders and the CPU vec-dot kernels.
+ * every field inside each block struct of llama.cpp ggml/src/ggml-common.h (lines 178-459) and of the
+ * NeuralFree extension blocks ({@link GGMLType#isExtension()}). The field offsets are the single source of
+ * truth for the CPU decoders and the CPU vec-dot kernels.
  * <p>
  * An instance describes one {@link GGMLType}; instances are immutable and cached.
  */
@@ -35,6 +36,16 @@ public final class BlockLayout {
     public static final int QK_NVFP4 = 64;
     /** Elements per NVFP4 UE4M3 scale ({@code QK_NVFP4_SUB}). */
     public static final int QK_NVFP4_SUB = 16;
+    /** Elements per F8_E4M3 block. */
+    public static final int QK_F8_E4M3 = 32;
+    /** Elements per F8_E4M3_B128 block. */
+    public static final int QK_F8B128 = 128;
+    /** Elements per MXFP8 block (one E8M0 scale). */
+    public static final int QK_MXFP8 = 32;
+    /** Elements per I8_B128 block. */
+    public static final int QK_I8B128 = 128;
+    /** Elements per NF4 / FP4_BNB block (one absmax). */
+    public static final int QK_BNB4 = 64;
 
     // block_q1_0 {half d; u8 qs[16]} (llama.cpp ggml-common.h:180-184)
     public static final int Q1_0_D = 0, Q1_0_QS = 2, Q1_0_BYTES = 18;
@@ -97,6 +108,19 @@ public final class BlockLayout {
     // block_iq4_xs {half d; u16 scales_h; u8 scales_l[4]; u8 qs[128]} (llama.cpp ggml-common.h:454-459)
     public static final int IQ4_XS_D = 0, IQ4_XS_SCALES_H = 2, IQ4_XS_SCALES_L = 4, IQ4_XS_QS = 8,
             IQ4_XS_BYTES = 136;
+
+    // NeuralFree extension blocks (GGMLType ids 1000-1005).
+    // F8_E4M3 {u8 qs[32]}: E4M3FN codes, the scale lives in the tensor's .scale sibling
+    public static final int F8_E4M3_QS = 0, F8_E4M3_BYTES = 32;
+    // F8_E4M3_B128 {float d; u8 qs[128]}: E4M3FN codes times d
+    public static final int F8B128_D = 0, F8B128_QS = 4, F8B128_BYTES = 132;
+    // MXFP8 {u8 e; u8 qs[32]}: E4M3FN codes times the E8M0 scale 2^(e-127)
+    public static final int MXFP8_E = 0, MXFP8_QS = 1, MXFP8_BYTES = 33;
+    // I8_B128 {float d; i8 qs[128]}: signed codes times d
+    public static final int I8B128_D = 0, I8B128_QS = 4, I8B128_BYTES = 132;
+    // NF4 and FP4_BNB {float absmax; u8 qs[32]}: byte j holds element j (low nibble) and j + 32 (high nibble),
+    // each a 4-bit index into the type's codebook, times absmax
+    public static final int BNB4_D = 0, BNB4_QS = 4, BNB4_BYTES = 36;
 
     private static final Map<GGMLType, BlockLayout> LAYOUTS = buildLayouts();
 

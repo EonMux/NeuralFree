@@ -20,6 +20,8 @@ import java.util.Objects;
  *
  * <p>Per {@link #generate} call:
  * <ol>
+ *   <li><b>Model defaults.</b> The request takes the loop's {@link SamplingDefaults} for every sampler setting and
+ *       the token budget it leaves unset ({@link GenerationRequest#withModelDefaults}).</li>
  *   <li><b>Memory.</b> Every call starts a sequence. With prefix reuse, the longest common prefix of the
  *       stored tokens and the prompt is kept (at most {@code prompt.length - 1} tokens, so the last prompt token is
  *       evaluated for logits) when the memory can drop the rest ({@link ForwardBackend#canRollback}): full caches
@@ -61,6 +63,7 @@ public final class GenerationLoop {
     private final boolean prefixReuse;
     private final boolean contextShift;
     private final boolean encoderDecoder;
+    private final SamplingDefaults samplingDefaults;
 
     private GenerationLoop(Builder b) {
         this.backend = b.backend;
@@ -69,6 +72,7 @@ public final class GenerationLoop {
         this.prefixReuse = b.prefixReuse;
         this.contextShift = b.contextShift;
         this.encoderDecoder = b.encoderDecoder;
+        this.samplingDefaults = b.samplingDefaults;
     }
 
     public static Builder builder(ForwardBackend backend, GGUFTokenizer tokenizer) {
@@ -77,7 +81,8 @@ public final class GenerationLoop {
 
     /**
      * The loop of an engine model: its backend and tokenizer, the reasoning parser of its chat template (with its
-     * tag tokens), prefix reuse and context shift from {@code config}'s memory settings.
+     * tag tokens), prefix reuse and context shift from {@code config}'s memory settings, and the model's sampling
+     * defaults unless {@code config} turns them off ({@link SamplingDefaults#forModel}).
      *
      * @throws UnsupportedOperationException for models that do not generate autoregressively (embedding,
      *                                       classifier, diffusion and unsupported architectures)
@@ -104,6 +109,7 @@ public final class GenerationLoop {
                 .reasoning(rf)
                 .memoryConfig(config.memory())
                 .encoderDecoder(support == SupportClass.ENC_DEC)
+                .samplingDefaults(SamplingDefaults.forModel(model, config))
                 .build();
     }
 
@@ -111,6 +117,7 @@ public final class GenerationLoop {
     public boolean prefixReuse() { return prefixReuse; }
     public boolean contextShift() { return contextShift; }
     public boolean encoderDecoder() { return encoderDecoder; }
+    public SamplingDefaults samplingDefaults() { return samplingDefaults; }
 
     /**
      * Generates after {@code prompt}, streaming the content channel of the output to {@code callback} (reasoning
@@ -121,7 +128,8 @@ public final class GenerationLoop {
      * @return the generated tokens, the raw output text (cut before a matched stop string), stop reason, timings
      * @throws ContextFullException          when a decoder prompt is longer than the context
      * @throws UnsupportedOperationException when the backend has no memory
-     * @throws IllegalArgumentException      for an empty prompt or a negative token id
+     * @throws IllegalArgumentException      for an empty prompt, a negative token id, or a model sampling default
+     *                                       the sampler rejects
      */
     public GenerationResult generate(int[] prompt, GenerationRequest request, TokenCallback callback) {
         return generate(prompt, request, callback == null ? DISCARD : ReasoningFilter.contentTo(callback), null);
@@ -150,8 +158,9 @@ public final class GenerationLoop {
         if (!encoderDecoder && prompt.length > nCtx) {
             throw new ContextFullException(prompt.length, nCtx);
         }
-        StopCriteria stop = StopCriteria.of(request, tokenizer, reasoning);
-        Sampler sampler = Sampler.create(samplerConfig(request.sampler(), nCtx), stop.bannedTokens());
+        GenerationRequest effective = request.withModelDefaults(samplingDefaults);
+        StopCriteria stop = StopCriteria.of(effective, tokenizer, reasoning);
+        Sampler sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens());
         String rendered = renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? renderedPrompt : stop.renderPrompt(prompt);
         StopCriteria.Session session = stop.start(sink, rendered);
@@ -273,7 +282,8 @@ public final class GenerationLoop {
     @Override
     public String toString() {
         return "GenerationLoop{" + reasoning + ", prefixReuse=" + prefixReuse + ", contextShift=" + contextShift
-                + (encoderDecoder ? ", encoder-decoder" : "") + '}';
+                + (encoderDecoder ? ", encoder-decoder" : "")
+                + (samplingDefaults.isEmpty() ? "" : ", " + samplingDefaults) + '}';
     }
 
     public static final class Builder {
@@ -283,6 +293,7 @@ public final class GenerationLoop {
         private boolean prefixReuse = true;
         private boolean contextShift;
         private boolean encoderDecoder;
+        private SamplingDefaults samplingDefaults = SamplingDefaults.NONE;
 
         private Builder(ForwardBackend backend, GGUFTokenizer tokenizer) {
             this.backend = Objects.requireNonNull(backend, "backend");
@@ -308,6 +319,12 @@ public final class GenerationLoop {
 
         /** The backend is an encoder-decoder (the prompt is the encoder source; memory is reset per call). */
         public Builder encoderDecoder(boolean v) { this.encoderDecoder = v; return this; }
+
+        /** The model's sampling defaults applied to every request (default {@link SamplingDefaults#NONE}). */
+        public Builder samplingDefaults(SamplingDefaults v) {
+            this.samplingDefaults = Objects.requireNonNull(v, "samplingDefaults");
+            return this;
+        }
 
         public GenerationLoop build() {
             return new GenerationLoop(this);

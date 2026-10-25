@@ -12,7 +12,8 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeKernels;
 import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
-import com.eonmux.neuralfree.gguf.quant.PrismHadamardLoader;
+import com.eonmux.neuralfree.gguf.quant.InputTransform;
+import com.eonmux.neuralfree.gguf.quant.InputTransformLoader;
 import com.eonmux.neuralfree.utils.Closeables;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -54,8 +55,10 @@ import java.util.regex.Pattern;
  *
  * <p><b>Per-tensor transforms.</b> A scalar {@code <base>.scale} tensor is the output scale {@code w_s} of
  * {@code <base>.weight} (llama-model.cpp:1724-1790, applied at llama-graph.cpp:1643-1645) and is
- * attached with {@link GpuWeight#withScale}; the scale tensor itself stays resident as F32. PRISM transforms
- * ({@link PrismHadamardLoader.Result}) are attached with {@link GpuWeight#withHadamard} and
+ * attached with {@link GpuWeight#withScale}; the scale tensor itself stays resident as F32. The input transforms of
+ * the model's input transforms ({@link InputTransformLoader.Result}) are attached whole with
+ * {@link GpuWeight#withInputTransform(InputTransform, GpuBuffer)} — HADAMARD, ACT_QUANT and PERMUTE, the
+ * {@code <base>.input_perm} int tensor uploaded once beside its weight — and the PRISM inverse rotations with
  * {@link GpuWeight#withInverseHadamard}.</p>
  *
  * <p>Uploads run on the given queue in order and copy their host data at enqueue; every upload call ends with the
@@ -361,20 +364,48 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
         }
     }
 
+    /**
+     * Attaches the input transforms and inverse rotations of a resident tensor: the weight's full input transform
+     * chain (HADAMARD, ACT_QUANT, PERMUTE) with the device int buffer of its {@code .input_perm} tensor uploaded
+     * once, and the PRISM inverse of a latent embedding table.
+     */
     private GpuWeight withPrism(GpuWeight w) {
-        PrismHadamardLoader.Result prism = config.prism;
-        if (prism == null || prism.isEmpty()) {
+        InputTransformLoader.Result transforms = config.transforms;
+        if (transforms == null || transforms.isEmpty()) {
             return w;
         }
-        HadamardSpec forward = prism.forward().get(w.name());
-        if (forward != null) {
-            w = w.withHadamard(forward);
+        InputTransform t = transforms.forward(w.name());
+        if (!t.isIdentity()) {
+            w = w.withInputTransform(t, t.hasPerm() ? inputPermBuffer(w) : null);
         }
-        HadamardSpec inverse = prism.inverse().get(w.name());
+        HadamardSpec inverse = transforms.inverse().get(w.name());
         if (inverse != null) {
             w = w.withInverseHadamard(inverse);
         }
         return w;
+    }
+
+    /**
+     * The device int buffer of the {@code .input_perm} tensor of a weight with a PERMUTE part, uploading the tensor
+     * now if it is not resident yet. The perm tensor is INTEGER: it uploads as stored, and stays resident so
+     * {@link #uploadResident} skips it in its normal pass.
+     *
+     * @throws IllegalStateException when the model has no {@code .input_perm} tensor for the weight (the loader
+     *                               binds only transforms the file provides, so this cannot happen to a
+     *                               well-formed model)
+     */
+    private GpuBuffer inputPermBuffer(GpuWeight w) {
+        String name = GpuWeight.permNameOf(w.name());
+        GpuWeight perm = resident.get(name);
+        if (perm == null) {
+            TensorPlan p = plans.get(name);
+            if (p == null) {
+                throw new IllegalStateException(archName + " has no tensor " + name + " for the input permutation"
+                        + " of " + w.name());
+            }
+            perm = uploadPlan(p);
+        }
+        return perm.shard(0);
     }
 
     /** Attaches each resident scalar {@code <base>.scale} to its resident non-expert {@code <base>.weight}. */
@@ -567,13 +598,13 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
     /** Immutable uploader configuration. */
     public static final class Config {
         private final TypePolicy policy;
-        private final PrismHadamardLoader.Result prism;
+        private final InputTransformLoader.Result transforms;
         private final int stagingBytes;
         private final long maxBufferBytes;
 
         private Config(Builder b) {
             this.policy = b.policy;
-            this.prism = b.prism;
+            this.transforms = b.transforms;
             this.stagingBytes = b.stagingBytes;
             this.maxBufferBytes = b.maxBufferBytes;
         }
@@ -582,9 +613,9 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
             return policy;
         }
 
-        /** PRISM transforms, or null. */
-        public PrismHadamardLoader.Result prism() {
-            return prism;
+        /** The model's input transforms, or null. */
+        public InputTransformLoader.Result transforms() {
+            return transforms;
         }
 
         public int stagingBytes() {
@@ -599,7 +630,7 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
         /** Builder of {@link Config}. */
         public static final class Builder {
             private final TypePolicy policy;
-            private PrismHadamardLoader.Result prism;
+            private InputTransformLoader.Result transforms;
             private int stagingBytes = DEFAULT_STAGING_BYTES;
             private long maxBufferBytes;
 
@@ -607,9 +638,14 @@ public final class GpuWeightUploader implements GpuWeights, AutoCloseable {
                 this.policy = Objects.requireNonNull(policy, "policy");
             }
 
-            /** PRISM transforms to attach; null or empty for none. */
-            public Builder prism(PrismHadamardLoader.Result v) {
-                this.prism = v;
+            /**
+             * The model's input transforms to attach; null or empty for none. The transforms bind at load
+             * ({@link InputTransformLoader#load}), where a malformed one throws
+             * {@code com.eonmux.neuralfree.gguf.hparams.GgufFormatException}; a malformed fit throws from
+             * {@link GpuWeight#withInputTransform(InputTransform, GpuBuffer)} as the tensor uploads.
+             */
+            public Builder transforms(InputTransformLoader.Result v) {
+                this.transforms = v;
                 return this;
             }
 

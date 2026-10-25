@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.precision;
 import com.eonmux.neuralfree.tensor.DType;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorOps;
+import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
 
 /**
  * FP8 fake quantization as a {@link TensorOps} composition on the tensor's backend: per element the value

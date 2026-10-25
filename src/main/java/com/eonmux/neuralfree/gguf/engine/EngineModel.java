@@ -23,4 +23,13 @@ public interface EngineModel extends LLMModel {
     default SupportClass supportClass() {
         return spec().supportClass();
     }
+
+    /**
+     * The sampling defaults the model carries ({@code general.sampling.*}, {@code neuralfree.sampling.*}), which
+     * generation applies to every setting the caller left unset unless
+     * {@link EngineConfig#modelSamplingDefaults()} is off. This default has none.
+     */
+    default SamplingDefaults modelSamplingDefaults() {
+        return SamplingDefaults.NONE;
+    }
 }

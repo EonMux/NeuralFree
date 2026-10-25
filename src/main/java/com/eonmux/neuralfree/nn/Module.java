@@ -848,6 +848,20 @@ public abstract class Module implements AutoCloseable {
     }
 
     /**
+     * The shape and dtype of every entry of {@link #stateDict()}, under the same dotted paths and in the same order,
+     * read from the tensors without copying their values (unmodifiable). Persistence formats that store each tensor
+     * with its shape and element type pair this with {@link #stateDict()}.
+     */
+    public Map<String, StateInfo> stateInfo() {
+        ensureOpen();
+        Map<String, StateInfo> info = new LinkedHashMap<>();
+        for (StateEntry entry : stateEntries()) {
+            info.put(entry.path, entry.info());
+        }
+        return Collections.unmodifiableMap(info);
+    }
+
+    /**
      * {@link #loadStateDict(Map, boolean)} in non-strict mode: keys missing from {@code stateDict}, keys that name no
      * state of this module tree, and keys whose value is not a {@code float[]} are ignored.
      *
@@ -1114,6 +1128,57 @@ public abstract class Module implements AutoCloseable {
         return sb.toString();
     }
 
+    /**
+     * The shape and dtype of one {@link Module#stateDict()} entry ({@link Module#stateInfo()}), and whether it is a
+     * buffer that {@link Module#to(DType)} keeps at its dtype
+     * ({@link Module#registerBuffer(String, Tensor, boolean, boolean)}). Immutable.
+     */
+    public static final class StateInfo {
+        private final Shape shape;
+        private final DType dtype;
+        private final boolean keepsDtype;
+
+        private StateInfo(Shape shape, DType dtype, boolean keepsDtype) {
+            this.shape = Objects.requireNonNull(shape, "shape");
+            this.dtype = Objects.requireNonNull(dtype, "dtype");
+            this.keepsDtype = keepsDtype;
+        }
+
+        /** The entry's tensor shape. */
+        public Shape shape() {
+            return shape;
+        }
+
+        /** The entry's tensor dtype. */
+        public DType dtype() {
+            return dtype;
+        }
+
+        /** Whether the entry is a buffer registered with {@code keepDtype}, which {@link Module#to(DType)} skips. */
+        public boolean keepsDtype() {
+            return keepsDtype;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof StateInfo)) {
+                return false;
+            }
+            StateInfo other = (StateInfo) o;
+            return shape.equals(other.shape) && dtype == other.dtype && keepsDtype == other.keepsDtype;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(shape, dtype, keepsDtype);
+        }
+
+        @Override
+        public String toString() {
+            return "StateInfo{" + shape + ", " + dtype + (keepsDtype ? ", keepsDtype" : "") + "}";
+        }
+    }
+
     /** One parameter ({@code parameter != null}) or persistent buffer of the state dict, under its dotted path. */
     private static final class StateEntry {
         private final String path;
@@ -1134,6 +1199,11 @@ public abstract class Module implements AutoCloseable {
 
         float[] read() {
             return TensorValues.toFloats(tensor());
+        }
+
+        StateInfo info() {
+            Tensor t = tensor();
+            return new StateInfo(t.shape(), t.dtype(), parameter == null && owner.dtypeKeptBuffers.contains(name));
         }
 
         /**

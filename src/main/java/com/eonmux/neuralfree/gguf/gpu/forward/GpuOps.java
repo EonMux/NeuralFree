@@ -18,7 +18,9 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
+import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.quant.InputTransform;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
@@ -48,7 +50,11 @@ import java.util.Set;
  * offset is first copied to a staging buffer, and an output at a nonzero offset or of a sharded weight is computed into
  * staging and scattered with {@value #COPY2D}. The tiled GEMM takes offsets and strides itself. A PRISM weight
  * ({@link GpuWeight#hadamard()}) first rotates its input into staging with {@value HadamardSpec#KERNEL}
- * (llama-graph.cpp:1598-1626); a weight with an output scale multiplies the result
+ * (llama-graph.cpp:1598-1626); a weight with a full input transform
+ * ({@link InputTransform}) runs its chain HADAMARD &rarr; ACT_QUANT &rarr; PERMUTE into staging &mdash;
+ * HADAMARD with {@value HadamardSpec#KERNEL} (or a copy of the plain input when no later part follows otherwise),
+ * ACT_QUANT fake-quantizing in place with {@value #ACT_FAKE_QUANT}, and PERMUTE gathering out of place with
+ * {@value #PERMUTE_COLS} into a second staging region; a weight with an output scale multiplies the result
  * (llama-graph.cpp:1643-1645).</p>
  *
  * <p><b>Optional projection kernels.</b> The tiled GEMM, the {@code _2D} batch and the in-kernel accumulate
@@ -93,6 +99,10 @@ public final class GpuOps implements AutoCloseable {
     public static final String GLU = ActKernels.GLU;
     /** Row normalization. */
     public static final String ROW_NORM = NormKernels.ROW_NORM;
+    /** Activation fake-quantization of runs of an input transform ({@code kernels/llm/act_quant.cl}). */
+    public static final String ACT_FAKE_QUANT = "LLM_ActFakeQuant";
+    /** Input column gather of a weight stored in permuted input order ({@code kernels/llm/act_quant.cl}). */
+    public static final String PERMUTE_COLS = "LLM_PermuteCols";
 
     /** Work-group size of the tiled GEMM ({@code NF_GEMM_WG}). */
     static final int TILED_WG = 256;
@@ -104,7 +114,8 @@ public final class GpuOps implements AutoCloseable {
     static final int MATVEC_MAX_TPS = 32;
     /** The kernels this class launches itself on a 1-D grid of local size {@code L}, apart from the weight families. */
     static final List<String> HELPER_KERNELS =
-            Collections.unmodifiableList(Arrays.asList(ROW_NORM, UNARY, GLU, COPY2D, AXPBY, HadamardSpec.KERNEL));
+            Collections.unmodifiableList(Arrays.asList(ROW_NORM, UNARY, GLU, COPY2D, AXPBY, HadamardSpec.KERNEL,
+                    ACT_FAKE_QUANT, PERMUTE_COLS));
 
     /** Kernel names of one weight type. */
     static final class WeightKernels {
@@ -152,6 +163,8 @@ public final class GpuOps implements AutoCloseable {
             GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S, GGMLType.IQ1_S,
             GGMLType.IQ1_M,
             GGMLType.TQ1_0, GGMLType.TQ2_0, GGMLType.NVFP4, GGMLType.Q1_0, GGMLType.Q2_0,
+            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4,
+            GGMLType.FP4_BNB,
         };
         for (GGMLType t : standard) {
             m.put(t, WeightKernels.standard(t.name()));
@@ -417,15 +430,40 @@ public final class GpuOps implements AutoCloseable {
         }
     }
 
-    /** The projection input: the caller's view, or its PRISM rotation in staging. */
+    /**
+     * The projection input: the caller's view; or the weight's PRISM rotation in staging; or the full
+     * {@link InputTransform} chain in staging &mdash; the HADAMARD part (or a copy of the input) fills the input
+     * staging, ACT_QUANT fake-quantizes it in place and PERMUTE gathers into a second staging region.
+     */
     private View projectionInput(GpuWeight w, GpuBuffer in, int inOff, int nTokens, int cols) {
+        InputTransform t = w.inputTransform();
+        InputTransform.ActQuant a = t != null ? t.actQuant() : null;
         HadamardSpec h = w.hadamard();
-        if (h == null) {
-            return new View(in, inOff);
+        if (a == null && (t == null || !t.hasPerm())) {
+            if (h == null) {
+                return new View(in, inOff);
+            }
+            ScratchSlot s = scratch.staging(GpuScratch.Staging.INPUT, (long) nTokens * cols);
+            hadamard(h, in, inOff, s.buffer(), s.offset(), nTokens, cols);
+            return new View(s.buffer(), s.offset());
         }
         ScratchSlot s = scratch.staging(GpuScratch.Staging.INPUT, (long) nTokens * cols);
-        hadamard(h, in, inOff, s.buffer(), s.offset(), nTokens, cols);
-        return new View(s.buffer(), s.offset());
+        if (h != null) {
+            hadamard(h, in, inOff, s.buffer(), s.offset(), nTokens, cols);
+        } else {
+            copy2dUnchecked(nTokens, cols, in, inOff, cols, s.buffer(), s.offset(), cols);
+        }
+        GpuBuffer xb = s.buffer();
+        int xo = s.offset();
+        if (a != null) {
+            actFakeQuant(a.scheme(), a.scale(0), a.zeroPoint(0), a.globalScale(0), xb, xo, xb, xo, nTokens, cols);
+        }
+        if (t.hasPerm()) {
+            ScratchSlot p = scratch.staging(GpuScratch.Staging.PERMUTED, (long) nTokens * cols);
+            permuteCols(w.inputPerm(), xb, xo, p.buffer(), p.offset(), nTokens, cols);
+            return new View(p.buffer(), p.offset());
+        }
+        return new View(xb, xo);
     }
 
     /** The input at element 0 of its buffer, copying it to staging when it starts elsewhere. */
@@ -712,6 +750,71 @@ public final class GpuOps implements AutoCloseable {
         signBuffers.put(name, b);
         signsBySpec.put(h, b);
         return b;
+    }
+
+    // ================================================================== input transforms
+
+    /**
+     * Fake-quantizes {@code rows} contiguous rows of {@code cols} elements ({@value #ACT_FAKE_QUANT}): run
+     * {@code g} of {@code scheme.runLength(cols)} consecutive elements covers
+     * {@code x[xOff + g*runLen ...]} and {@code y[yOff + g*runLen ...]}, and
+     * {@code y = dequant(quant(x))} per {@code scheme} (gguf.quant.ActFakeQuant, the host twin). In place
+     * ({@code x == y}, {@code xOff == yOff}); any other overlap is rejected.
+     *
+     * @param scale the {@code scale} argument ({@link ActQuantScheme#isStatic()} schemes' {@code input_scale},
+     *              FP8_TOKEN's amax bound, 0 otherwise)
+     * @param zp    the {@code zero_point} argument ({@link ActQuantScheme#INT8_STATIC_ASYM}'s
+     *              {@code input_zero_point}, 0 otherwise)
+     * @param gs    the {@code global_scale} argument ({@link ActQuantScheme#NVFP4}'s {@code input_scale},
+     *              0 otherwise)
+     * @throws IllegalArgumentException when the range lies outside a buffer, the row does not split into whole runs,
+     *                                  or the views overlap without coinciding
+     */
+    public void actFakeQuant(ActQuantScheme scheme, float scale, int zp, float gs, GpuBuffer x, int xOff, GpuBuffer y,
+                             int yOff, int rows, int cols) {
+        ensureOpen();
+        Objects.requireNonNull(scheme, "scheme");
+        checkTokens(rows);
+        checkPositive(cols, "activation quantization width");
+        int runLen = scheme.runLength(cols);
+        long runs = Math.multiplyExact((long) rows, cols / runLen);
+        checkInt(runs, "activation quantization run count");
+        long n = Math.multiplyExact((long) rows, cols);
+        checkView("activation quantization input", x, xOff, n);
+        checkView("activation quantization output", y, yOff, n);
+        if (x == y && xOff != yOff && overlaps(x, xOff, n, y, yOff, n)) {
+            throw new IllegalArgumentException("activation quantization: input and output views overlap without"
+                    + " coinciding");
+        }
+        launch(ACT_FAKE_QUANT, runs * local, (int) runs, runLen, scheme.code(), scale, zp, gs, xOff, yOff, x, y);
+    }
+
+    /**
+     * Gathers the columns of {@code rows} contiguous rows of {@code cols} elements ({@value #PERMUTE_COLS}):
+     * {@code y[yOff + r*cols + k] = x[xOff + r*cols + perm[k]]}, where {@code perm} holds {@code cols} ints
+     * ({@code perm[k]} is the input column read at position {@code k}; the GPTQ / compressed-tensors act-order
+     * {@code <base>.input_perm}). Out of place: {@code y} shares no element with {@code x}.
+     *
+     * @throws IllegalArgumentException when a view is out of range, {@code perm} is too small, or the views overlap
+     */
+    public void permuteCols(GpuBuffer perm, GpuBuffer x, int xOff, GpuBuffer y, int yOff, int rows, int cols) {
+        ensureOpen();
+        checkTokens(rows);
+        checkPositive(cols, "input permutation width");
+        Objects.requireNonNull(perm, "perm");
+        if ((long) cols * Integer.BYTES > perm.sizeInBytes()) {
+            throw new IllegalArgumentException("input permutation needs " + cols + " ints, its buffer holds "
+                    + perm.sizeInBytes() / Integer.BYTES);
+        }
+        long n = Math.multiplyExact((long) rows, cols);
+        checkInt(n, "permuted projection width");
+        checkView("permuted projection input", x, xOff, n);
+        checkView("permuted projection output", y, yOff, n);
+        if (overlaps(x, xOff, n, y, yOff, n)) {
+            throw new IllegalArgumentException("permuted projection: input and output views overlap; the gather"
+                    + " runs out of place");
+        }
+        launch(PERMUTE_COLS, n, rows, cols, xOff, yOff, perm, x, y);
     }
 
     // ================================================================== norm and activations

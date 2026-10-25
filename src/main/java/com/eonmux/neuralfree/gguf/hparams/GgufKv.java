@@ -1,7 +1,7 @@
 package com.eonmux.neuralfree.gguf.hparams;
 
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.GGUFValueType;
+import com.eonmux.neuralfree.gguf.ModelSource;
 
 import java.lang.reflect.Array;
 import java.util.ArrayList;
@@ -37,14 +37,14 @@ public final class GgufKv {
         this.archName = arch instanceof String ? (String) arch : null;
     }
 
-    /** View over a parsed file, using the value types recorded by the parser. */
-    public static GgufKv of(GGUFFileParser parser) {
-        Map<String, Object> meta = parser.getMetadata();
+    /** View over an open model, using the value types the source reports. */
+    public static GgufKv of(ModelSource source) {
+        Map<String, Object> meta = source.getMetadata();
         Map<String, GGUFValueType> t = new HashMap<>();
         Map<String, GGUFValueType> et = new HashMap<>();
         for (String key : meta.keySet()) {
-            t.put(key, parser.getValueType(key));
-            GGUFValueType e = parser.getArrayElementType(key);
+            t.put(key, source.getValueType(key));
+            GGUFValueType e = source.getArrayElementType(key);
             if (e != null) {
                 et.put(key, e);
             }

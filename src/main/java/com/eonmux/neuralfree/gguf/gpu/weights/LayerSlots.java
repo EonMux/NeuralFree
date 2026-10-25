@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.gguf.WeightDataProvider;
 import com.eonmux.neuralfree.gguf.gpu.weights.LayerWeightSet.Entry;
 import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
+import com.eonmux.neuralfree.utils.Closeables;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -17,6 +18,7 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,7 +32,8 @@ import java.util.Objects;
  * pool of buffers; a set's tensor shards, ordered by size, take the pool's buffers in the same order, and pool
  * buffer {@code j} is as large as the {@code j}-th largest shard of any set assigned to the slot. Every set
  * therefore has its own {@link GpuWeight}s, built once over its slot's buffers, which stay valid for binding
- * whenever the set is resident.</p>
+ * whenever the set is resident. Weights with a PERMUTE input transform also take a read-only buffer of their
+ * {@code <base>.input_perm} tensor, uploaded once at allocation ({@link #uploadPerm}).</p>
  *
  * <p><b>Event chain.</b> {@link #stage} enqueues the set's uploads on the transfer queue; the first upload waits on
  * the compute marker {@link #release} recorded after the last dispatch that read the slot's previous set, and a
@@ -65,6 +68,8 @@ final class LayerSlots implements AutoCloseable {
     private final int[] slotOf;
     private final GpuBuffer[][] pools;
     private final List<Map<String, GpuWeight>> weights;
+    private final List<GpuBuffer> permBuffers;
+    private final long permBytes;
     private final int[] occupant;
     private final GpuEvent[] staged;
     private final GpuEvent[] released;
@@ -98,7 +103,7 @@ final class LayerSlots implements AutoCloseable {
 
     private LayerSlots(ComputeQueue computeQueue, ComputeQueue transferQueue, WeightDataProvider data,
                        List<LayerWeightSet> sets, int[] slotOf,
-                       GpuBuffer[][] pools, Plan plan) {
+                       GpuBuffer[][] pools, Plan plan, Map<String, GpuBuffer> perms, List<GpuBuffer> permBuffers) {
         this.computeQueue = computeQueue;
         this.transferQueue = transferQueue;
         this.sameQueue = transferQueue == computeQueue;
@@ -107,6 +112,12 @@ final class LayerSlots implements AutoCloseable {
         this.slotOf = slotOf;
         this.pools = pools;
         this.deviceBytes = plan.totalBytes();
+        this.permBuffers = Collections.unmodifiableList(new ArrayList<>(permBuffers));
+        long permBytes = 0;
+        for (GpuBuffer b : this.permBuffers) {
+            permBytes = Math.addExact(permBytes, b.sizeInBytes());
+        }
+        this.permBytes = permBytes;
         this.occupant = new int[pools.length];
         Arrays.fill(occupant, -1);
         this.staged = new GpuEvent[pools.length];
@@ -125,7 +136,10 @@ final class LayerSlots implements AutoCloseable {
                     bufs.add(pools[slotOf[i]][plan.bufferOf[i][flat++]]);
                 }
                 GpuWeight w = GpuWeight.sharded(e.name(), e.uploadType(), e.ne(), bufs, e.shardRowCounts());
-                if (e.hadamard() != null) {
+                if (e.inputTransform() != null) {
+                    w = w.withInputTransform(e.inputTransform(), e.inputPerm() == null ? null
+                            : perms.get(i + ":" + e.name()));
+                } else if (e.hadamard() != null) {
                     w = w.withHadamard(e.hadamard());
                 }
                 if (e.scale() != null) {
@@ -185,6 +199,8 @@ final class LayerSlots implements AutoCloseable {
         ComputeQueue transfer = async && tq != null ? tq : computeQueue;
 
         GpuBuffer[][] pools = new GpuBuffer[slotCount][];
+        List<GpuBuffer> permBuffers = new ArrayList<>();
+        Map<String, GpuBuffer> perms = new HashMap<>();
         try {
             for (int s = 0; s < slotCount; s++) {
                 pools[s] = new GpuBuffer[plan.poolBytes[s].length];
@@ -197,12 +213,24 @@ final class LayerSlots implements AutoCloseable {
                 }
             }
             computeQueue.finish();
-            LayerSlots slots = new LayerSlots(computeQueue, transfer, data, setList, slotOf, pools, plan);
+            for (int i = 0; i < setList.size(); i++) {
+                for (Entry e : setList.get(i).entries()) {
+                    if (e.inputTransform() != null && e.inputTransform().hasPerm()) {
+                        GpuBuffer b = uploadPerm(backend, computeQueue, data, e);
+                        perms.put(i + ":" + e.name(), b);
+                        permBuffers.add(b);
+                    }
+                }
+            }
+            computeQueue.finish();
+            LayerSlots slots = new LayerSlots(computeQueue, transfer, data, setList, slotOf, pools, plan, perms,
+                    permBuffers);
             LOGGER.info(
                     "Layer weight streaming: {} layers in {} slots, {} MB on the device, async={}",
                     setList.size(), slotCount, plan.totalBytes() / (1024 * 1024), transfer != computeQueue);
             return slots;
         } catch (RuntimeException e) {
+            Closeables.closeAll(permBuffers, null);
             for (GpuBuffer[] pool : pools) {
                 if (pool == null) {
                     continue;
@@ -313,6 +341,34 @@ final class LayerSlots implements AutoCloseable {
         return v[0];
     }
 
+    /**
+     * The device int buffer of a streamed weight's {@code <base>.input_perm} tensor: the values read whole from the
+     * host tier and written once on the compute queue, which the caller finishes before the weights read them.
+     *
+     * @throws UncheckedIOException when the tensor cannot be read
+     */
+    private static GpuBuffer uploadPerm(ComputeBackend backend, ComputeQueue queue, WeightDataProvider data, Entry e) {
+        String name = e.inputPerm().name();
+        long ints = e.cols();
+        if (ints <= 0 || ints > Integer.MAX_VALUE / Integer.BYTES) {
+            throw new IllegalStateException("input permutation " + name + " covers " + ints
+                    + " input columns, outside the int range");
+        }
+        int bytes = (int) (ints * Integer.BYTES);
+        ByteBuffer buf = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        try {
+            data.readRange(name, 0, bytes, buf);
+        } catch (IOException ex) {
+            throw new UncheckedIOException("cannot read input permutation " + name + ": " + ex.getMessage(), ex);
+        }
+        GpuBuffer b = backend.allocateBuffer(bytes);
+        GpuEvent evt = queue.enqueueWriteBuffer(b, 0, bytes, buf.array());
+        if (evt != null) {
+            evt.close();
+        }
+        return b;
+    }
+
     /** Rows per host chunk of one tensor: at most {@value #CHUNK_BYTES} bytes, at least one row. */
     private static int chunkRows(Entry e) {
         long rowBytes = Math.max(e.storedRowBytes(), e.uploadRowBytes());
@@ -338,8 +394,8 @@ final class LayerSlots implements AutoCloseable {
     public int occupant(int slot) { return occupant[slot]; }
     /** True when set {@code i} is in its slot, possibly with its uploads still in flight. */
     public boolean isResident(int i) { return occupant[slotOf[checkSet(i)]] == i; }
-    /** Bytes of all slot buffers. */
-    public long deviceBytes() { return deviceBytes; }
+    /** Bytes of all slot buffers and input permutation buffers. */
+    public long deviceBytes() { return Math.addExact(deviceBytes, permBytes); }
     /** True when uploads run on their own transfer queue. */
     public boolean asyncTransfers() { return !sameQueue; }
 
@@ -530,7 +586,11 @@ final class LayerSlots implements AutoCloseable {
                 b.close();
             }
         }
+        RuntimeException permFailure = Closeables.closeAll(permBuffers, null);
         data.close();
+        if (failure == null) {
+            failure = permFailure;
+        }
         if (failure != null) {
             throw failure;
         }
@@ -538,6 +598,6 @@ final class LayerSlots implements AutoCloseable {
 
     @Override
     public String toString() {
-        return "LayerSlots{" + sets.size() + " layers, " + pools.length + " slots, " + deviceBytes + " B}";
+        return "LayerSlots{" + sets.size() + " layers, " + pools.length + " slots, " + deviceBytes() + " B}";
     }
 }

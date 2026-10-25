@@ -325,4 +325,59 @@ public class TensorClaimsTest {
         assertEquals(Arrays.asList("cls.bias", "cls.norm.bias", "token_types.weight"),
                 TensorClaims.unclaimed(hp, tc, tensors(Arch.MODERN_BERT)));
     }
+
+    @Test
+    public void zeroPointAndPermutationOfLoadedProjectionsAreClaimed() {
+        List<GGUFTensorInfo> ts = llamaFile(1);
+        ts.add(t("blk.0.attn_q.input_zero_point", 1));
+        ts.add(t("blk.0.ffn_up.input_perm", N_EMBD));
+        ts.add(t("blk.0.ffn_up_exps.input_perm", N_EMBD));
+        TensorCatalog tc = TensorCatalog.of("llama", ts);
+        assertEquals(Collections.singletonList("blk.0.ffn_up_exps.input_perm"),
+                TensorClaims.unclaimed(hparams(Arch.LLAMA, 1, 0), tc, tensors(Arch.LLAMA)));
+    }
+
+    @Test
+    public void kvCacheScalesAreClaimedOnEveryLayerSlot() {
+        List<GGUFTensorInfo> ts = llamaFile(2);
+        for (int il = 0; il < 2; il++) {
+            String p = "blk." + il + ".";
+            ts.add(t(p + "attn_k.kv_scale", 1));
+            ts.add(t(p + "attn_v.kv_scale", 4));
+            ts.add(t(p + "attn_q.q_scale", 8));
+            ts.add(t(p + "attn_prob_scale", 1));
+        }
+        ts.add(t("blk.2.attn_k.kv_scale", 1));
+        TensorCatalog tc = TensorCatalog.of("llama", ts);
+        assertEquals(Collections.singletonList("blk.2.attn_k.kv_scale"),
+                TensorClaims.unclaimed(hparams(Arch.LLAMA, 2, 0), tc, tensors(Arch.LLAMA)));
+    }
+
+    @Test
+    public void nvfp4OutputHeadClaimsEverySibling() {
+        List<GGUFTensorInfo> ts = llamaFile(1);
+        ts.add(new GGUFTensorInfo("output.weight", new long[]{N_EMBD, 32}, GGMLType.NVFP4, 0L));
+        ts.add(t("output.scale", 1));
+        ts.add(t("output.input_scale", 1));
+        ts.add(t("output.input_zero_point", 1));
+        ts.add(t("output.input_perm", N_EMBD));
+        TensorCatalog tc = TensorCatalog.of("llama", ts);
+        assertEquals(Collections.emptyList(),
+                TensorClaims.unclaimed(hparams(Arch.LLAMA, 1, 0), tc, tensors(Arch.LLAMA)));
+    }
+
+    @Test
+    public void scaledBaseNamesTheProjectionsWithSiblingSlots() {
+        assertEquals("blk.3.attn_q", TensorClaims.scaledBase("blk.3.attn_q.weight", GGMLType.Q8_0));
+        assertEquals("blk.0.ffn_down_exps", TensorClaims.scaledBase("blk.0.ffn_down_exps.weight", GGMLType.F16));
+        assertEquals("output", TensorClaims.scaledBase("output.weight", GGMLType.NVFP4));
+        assertEquals(null, TensorClaims.scaledBase("output.weight", GGMLType.Q8_0));
+        assertEquals(null, TensorClaims.scaledBase("blk.0.attn_norm.weight", GGMLType.F32));
+        assertEquals(null, TensorClaims.scaledBase("blk.0.attn_q.bias", GGMLType.F32));
+        assertEquals(null, TensorClaims.scaledBase("blk.x.attn_q.weight", GGMLType.F32));
+        assertEquals(null, TensorClaims.scaledBase("v.blk.0.attn_q.weight", GGMLType.F32));
+        assertTrue(TensorClaims.SCALED_BASES.contains("ffn_gate_exps"));
+        assertEquals("input_zero_point", TensorClaims.INPUT_ZERO_POINT);
+        assertEquals("input_perm", TensorClaims.INPUT_PERM);
+    }
 }

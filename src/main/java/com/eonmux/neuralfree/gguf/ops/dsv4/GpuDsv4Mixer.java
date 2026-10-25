@@ -646,8 +646,8 @@ public final class GpuDsv4Mixer implements GpuMixer {
 
     /**
      * The grouped {@code attn_output_a} for the id-matvec: one buffer, a type with id-matvec kernels, and no PRISM
-     * transform or output scale, which llama.cpp's plain {@code ggml_mul_mat} of it does not apply either
-     * (deepseek4.cpp:1218).
+     * transform, input transform or output scale, which llama.cpp's plain {@code ggml_mul_mat} of it does not apply
+     * either (deepseek4.cpp:1218).
      */
     private GpuWeight perGroup(GpuWeight w) {
         if (!MoeKernels.supports(w.type())) {
@@ -658,9 +658,9 @@ public final class GpuDsv4Mixer implements GpuMixer {
             throw new UnsupportedOperationException(layout.where + ": grouped tensor " + w.name() + " is split into "
                     + w.shardCount() + " row shards; the id-matvec reads every group from one buffer");
         }
-        if (w.hadamard() != null || w.hasScale()) {
+        if (w.hadamard() != null || w.hasScale() || (w.inputTransform() != null && !w.inputTransform().isIdentity())) {
             throw new UnsupportedOperationException(layout.where + ": grouped tensor " + w.name()
-                    + " carries a PRISM transform or output scale, which the grouped output product does not apply");
+                    + " carries an input transform or output scale, which the grouped output product does not apply");
         }
         return w;
     }

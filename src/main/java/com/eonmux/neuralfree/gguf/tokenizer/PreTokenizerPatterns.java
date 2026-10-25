@@ -13,6 +13,11 @@ import java.util.List;
  * by exact text, and because category escapes are rewritten for the collapsed text before
  * matching; {@link UnicodeRegexSplit} applies both rules. Non-ASCII literals are written as
  * Unicode escapes.</p>
+ *
+ * <p>The {@code *_HF} constants hold the Hugging Face tokenizer.json text of the sequences that
+ * llama.cpp adapted only in regex dialect (case-insensitive groups spelled out, possessive
+ * quantifiers made greedy), as recorded in llama.cpp's comments; {@link PreTokenizerType#hfRegexes()}
+ * exposes them per type.</p>
  */
 public final class PreTokenizerPatterns {
 
@@ -230,6 +235,78 @@ public final class PreTokenizerPatterns {
             "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
             "\\p{N}+",
             "[0-9][0-9][0-9]");
+
+    // ---------------------------------------------------------------------------------------------
+    // Hugging Face forms: the tokenizer.json regex text that llama.cpp adapted, from the
+    // "original regex from tokenizer.json" comments beside each case (src/llama-vocab.cpp:280-594)
+    // ---------------------------------------------------------------------------------------------
+
+    /** HF form of {@link #LLAMA3} (src/llama-vocab.cpp:293-294). */
+    public static final List<String> LLAMA3_HF = seq(
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r"
+                + "\\n]+|\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #JAIS2} (src/llama-vocab.cpp:302-303). */
+    public static final List<String> JAIS2_HF = seq(
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r"
+                + "\\n]+|\\s{512}(?!\\S)|\\s{256}(?!\\S)|\\s{128}(?!\\S)|\\s{64}(?!\\S)|\\s{32}(?!\\S)|\\s{16}(?!\\S)|\\s{8}"
+                + "(?!\\S)|\\s{4}(?!\\S)|\\s{1,2}(?!\\S)|\\s{1}");
+
+    /**
+     * HF form of {@link #QWEN2} for QWEN2, STABLELM2, HUNYUAN, SOLAR_OPEN and GROK_2
+     * (src/llama-vocab.cpp:394-395, 506-507).
+     */
+    public static final List<String> QWEN2_HF = seq(
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|"
+                + "\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #QWEN35} (src/llama-vocab.cpp:401-402). */
+    public static final List<String> QWEN35_HF = seq(
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*"
+                + "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #TEKKEN} (src/llama-vocab.cpp:425-426). */
+    public static final List<String> TEKKEN_HF = seq(
+            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}"
+                + "\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r"
+                + "\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #GPT4O} for GPT4O and MINIMAX_M2 (src/llama-vocab.cpp:448-449). */
+    public static final List<String> GPT4O_HF = seq(
+            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'"
+                + "m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s"
+                + "|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #TINY_AYA} (src/llama-vocab.cpp:464-466). */
+    public static final List<String> TINY_AYA_HF = seq(
+            "\\d{1,3}(?=(?:\\d{3})*\\b)",
+            "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'"
+                + "m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s"
+                + "|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #BAILINGMOE}, with its possessive quantifiers (src/llama-vocab.cpp:485-486). */
+    public static final List<String> BAILINGMOE_HF = seq(
+            "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|"
+                + "\\s+(?!\\S)|\\s+");
+
+    /**
+     * HF form of {@link #SEED_CODER} (src/llama-vocab.cpp:493-494); its line-break classes hold
+     * literal CR and LF characters, as in the tokenizer.json text.
+     */
+    public static final List<String> SEED_CODER_HF = seq(
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1}| ?[^\\s\\p{L}\\p{N}\r\n]+|\\s*[\r\n]+|"
+                + "\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #EXAONE_MOE} (src/llama-vocab.cpp:530-531). */
+    public static final List<String> EXAONE_MOE_HF = seq(
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?(?:\\p{L}\\p{M}*(?: \\p{L}\\p{M}*)*)+|\\p{N}| ?[^\\s\\p{L}"
+                + "\\p{N}]+[\\r\\n/]?|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+");
+
+    /** HF form of {@link #MINICPM5} (src/llama-vocab.cpp:562-564). */
+    public static final List<String> MINICPM5_HF = seq(
+            "\\p{N}{1,3}",
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}+| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]"
+                + "+|\\s+(?!\\S)|\\s+");
 
     private static List<String> seq(String... regexes) {
         return Collections.unmodifiableList(Arrays.asList(regexes));

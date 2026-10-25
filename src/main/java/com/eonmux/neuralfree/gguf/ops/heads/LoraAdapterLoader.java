@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf.ops.heads;
 
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
+import com.eonmux.neuralfree.gguf.ModelSource;
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
+import com.eonmux.neuralfree.gguf.ModelSources;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
@@ -28,7 +30,8 @@ import java.util.TreeMap;
  *       an invocation sequence, a per-token mask the forward passes do not carry;</li>
  *   <li>tensors: {@code <base>.lora_a} and {@code <base>.lora_b} pairs; {@code *_norm.weight} entries are skipped and
  *       any other name is an error (:268-298); both halves must exist and the base tensor must exist (under its
- *       canonical name or a catalog alias) and not be a PRISM Hadamard-folded weight (:323-340);</li>
+ *       canonical name or a catalog alias) and not carry an input transform (PRISM Hadamard-folded, or any
+ *       ACT_QUANT/PERMUTE input transform) (:323-340);</li>
  *   <li>shapes (:361-375): a projection {@code W {in, out}} needs {@code A {in, r}} and {@code B {r, out}}; an expert
  *       tensor {@code W {in, out, n_expert}} needs {@code A {in, r, n_expert}} and {@code B {r, out, n_expert}}
  *       (llama.cpp checks {@code ne[0]} / {@code ne[1]} and lets {@code ggml_mul_mat_id} reject an expert-count
@@ -49,19 +52,21 @@ public final class LoraAdapterLoader {
     }
 
     /**
-     * Loads the adapter at {@code path} for the model whose weights are {@code base}.
+     * Loads the adapter at {@code path} for the model whose weights are {@code base}, opened through
+     * {@link ModelSources#openAdapter} with {@code options}.
      *
      * @throws IOException         when the file cannot be read
      * @throws GgufFormatException           when the metadata, the tensor names or the shapes do not form an adapter of
      *                                       the base model
      * @throws UnsupportedOperationException for an activated LoRA
      */
-    public static LoraAdapter load(String path, CpuWeights base) throws IOException {
+    public static LoraAdapter load(String path, CpuWeights base, ModelSourceOptions options) throws IOException {
         Objects.requireNonNull(path, "path");
         Objects.requireNonNull(base, "base");
-        GGUFFileParser parser = new GGUFFileParser(path);
+        Objects.requireNonNull(options, "options");
+        ModelSource source = ModelSources.openAdapter(path, base.origin(), options);
         try {
-            GgufKv kv = GgufKv.of(parser);
+            GgufKv kv = GgufKv.of(source);
             String generalType = kv.str(GgufKeys.GENERAL_TYPE, "");
             if (!GENERAL_TYPE_ADAPTER.equals(generalType)) {
                 throw new GgufFormatException(path + ": expect general.type to be 'adapter', but got: " + generalType);
@@ -92,17 +97,17 @@ public final class LoraAdapterLoader {
             }
             String taskName = kv.str(GgufKeys.ADAPTER_LORA_TASK_NAME, null);
             String promptPrefix = kv.str(GgufKeys.ADAPTER_LORA_PROMPT_PREFIX, null);
-            Map<String, LoraAdapter.Pair> pairs = readPairs(path, parser, base);
-            return new LoraAdapter(path, arch, alpha, taskName, promptPrefix, invocation, pairs, scalars(parser));
+            Map<String, LoraAdapter.Pair> pairs = readPairs(path, source, base);
+            return new LoraAdapter(path, arch, alpha, taskName, promptPrefix, invocation, pairs, scalars(source));
         } finally {
-            parser.close();
+            source.close();
         }
     }
 
     /** Scalar metadata as strings, in key order (array values are left out, as llama.cpp does). */
-    private static Map<String, String> scalars(GGUFFileParser parser) {
+    private static Map<String, String> scalars(ModelSource source) {
         Map<String, String> out = new TreeMap<>();
-        for (Map.Entry<String, Object> e : parser.getMetadata().entrySet()) {
+        for (Map.Entry<String, Object> e : source.getMetadata().entrySet()) {
             Object v = e.getValue();
             if (!(v instanceof List) && !(v != null && v.getClass().isArray())) {
                 out.put(e.getKey(), String.valueOf(v));
@@ -111,10 +116,10 @@ public final class LoraAdapterLoader {
         return out;
     }
 
-    private static Map<String, LoraAdapter.Pair> readPairs(String path, GGUFFileParser parser, CpuWeights base)
+    private static Map<String, LoraAdapter.Pair> readPairs(String path, ModelSource source, CpuWeights base)
             throws IOException {
         Map<String, GGUFTensorInfo[]> halves = new LinkedHashMap<>();
-        for (GGUFTensorInfo info : parser.getTensors()) {
+        for (GGUFTensorInfo info : source.getTensors()) {
             String name = info.name();
             if (name.endsWith(SUFFIX_A)) {
                 halves.computeIfAbsent(strip(name, SUFFIX_A), k -> new GGUFTensorInfo[2])[0] = info;
@@ -125,7 +130,7 @@ public final class LoraAdapterLoader {
             }
         }
         Map<String, LoraAdapter.Pair> pairs = new LinkedHashMap<>();
-        try (CpuWeights adapter = CpuWeights.open(parser, TensorCatalog.of(parser), null)) {
+        try (CpuWeights adapter = CpuWeights.open(source, TensorCatalog.of(source), null)) {
             for (Map.Entry<String, GGUFTensorInfo[]> e : halves.entrySet()) {
                 String target = e.getKey();
                 GGUFTensorInfo a = e.getValue()[0];
@@ -148,9 +153,10 @@ public final class LoraAdapterLoader {
                     + "' does not exist in base model (hint: maybe wrong base model?)");
         }
         CpuTensorRef view = base.get(model);
-        if (base.of(view).input() != null || base.inverseHadamard(view) != null) {
+        if (!base.of(view).transform().isIdentity() || base.inverseHadamard(view) != null) {
             throw new GgufFormatException(path + ": LoRA tensor '" + target
-                    + "' targets a prism.hadamard folded weight, which is not supported");
+                    + "' targets a weight with an input transform (prism.hadamard or an input transform), which is"
+                    + " not supported");
         }
         boolean experts = model.rank() == 3;
         if (model.rank() != 2 && !experts) {

@@ -30,7 +30,11 @@ import java.util.function.Predicate;
  *       {@code create_tensor_gate_up_exps}, never both), every alternative otherwise;</li>
  *   <li>the generic pass that follows every loader creates it (src/llama-model.cpp:1717-1870): the per-tensor
  *       {@code .scale} and {@code .input_scale} of each loaded projection in {@link #SCALED_BASES} on every layer
- *       slot, and {@code output.scale} / {@code output.input_scale} when the output head is NVFP4.</li>
+ *       slot, and {@code output.scale} / {@code output.input_scale} when the output head is NVFP4. The activation
+ *       zero point ({@code .input_zero_point}) and act-order permutation ({@code .input_perm}) of quantized
+ *       checkpoints are claimed with them;</li>
+ *   <li>it is one of the optional KV-cache scales of a layer slot: {@code attn_k.kv_scale},
+ *       {@code attn_v.kv_scale}, {@code attn_q.q_scale} and {@code attn_prob_scale}.</li>
  * </ul>
  * NextN blocks are claimed whether or not a drafter runs them, as llama.cpp creates their tensors with
  * {@code TENSOR_SKIP} when MTP is off (src/llama-model.cpp:3901-3919); on those slots the qkv / gate-up helper entries
@@ -48,7 +52,7 @@ public final class TensorClaims {
      * Projections whose {@code .scale} and {@code .input_scale} the generic pass creates when the projection is
      * loaded (src/llama-model.cpp:1720-1858).
      */
-    static final List<String> SCALED_BASES = Collections.unmodifiableList(Arrays.asList(
+    public static final List<String> SCALED_BASES = Collections.unmodifiableList(Arrays.asList(
             TensorNames.ATTN_Q, TensorNames.ATTN_K, TensorNames.ATTN_V, TensorNames.ATTN_OUT, TensorNames.ATTN_QKV,
             TensorNames.ATTN_GATE, TensorNames.FFN_GATE, TensorNames.FFN_DOWN, TensorNames.FFN_UP,
             TensorNames.FFN_GATE_SHEXP, TensorNames.FFN_DOWN_SHEXP, TensorNames.FFN_UP_SHEXP,
@@ -56,10 +60,64 @@ public final class TensorClaims {
             TensorNames.SSM_IN, TensorNames.SSM_OUT, TensorNames.SSM_ALPHA, TensorNames.SSM_BETA,
             TensorNames.NEXTN_EH_PROJ, TensorNames.NEXTN_SHARED_HEAD_HEAD));
 
+    /** Suffix of the output scale of a projection ({@code <base>.scale}). */
+    public static final String SCALE = TensorNames.SCALE;
+
     /** Suffix of the activation scale the generic pass creates next to {@code .scale}. */
-    static final String INPUT_SCALE = "input_scale";
+    public static final String INPUT_SCALE = "input_scale";
+
+    /** Suffix of the activation zero point of an asymmetric static activation scheme. */
+    public static final String INPUT_ZERO_POINT = "input_zero_point";
+
+    /** Suffix of the act-order input permutation of a projection (I32, one entry per input column). */
+    public static final String INPUT_PERM = "input_perm";
+
+    /** Suffix of the FP8 KV-cache scale of {@code attn_k} and {@code attn_v}. */
+    public static final String KV_SCALE = "kv_scale";
+
+    /** Suffix of the FP8 query scale of {@code attn_q}. */
+    public static final String Q_SCALE = "q_scale";
+
+    /** Name of a layer's FP8 attention-probability scale. */
+    public static final String ATTN_PROB_SCALE = "attn_prob_scale";
+
+    /** The sibling suffixes claimed next to each loaded scaled projection, in claim order. */
+    private static final List<String> SIBLINGS = Collections.unmodifiableList(Arrays.asList(
+            SCALE, INPUT_SCALE, INPUT_ZERO_POINT, INPUT_PERM));
+
+    /** The optional KV-cache scale names of a layer slot, relative to {@code blk.N.}. */
+    private static final List<String> KV_SCALES = Collections.unmodifiableList(Arrays.asList(
+            TensorNames.ATTN_K + "." + KV_SCALE, TensorNames.ATTN_V + "." + KV_SCALE,
+            TensorNames.ATTN_Q + "." + Q_SCALE, ATTN_PROB_SCALE));
 
     private TensorClaims() {
+    }
+
+    /**
+     * The projection base of {@code ggufName} when the generic pass gives it sibling tensors: {@code blk.N.<base>}
+     * for a {@code blk.N.<base>.weight} with {@code base} in {@link #SCALED_BASES}, or {@code output} for an
+     * {@code output.weight} of type NVFP4; null otherwise.
+     */
+    public static String scaledBase(String ggufName, GGMLType type) {
+        Objects.requireNonNull(ggufName, "ggufName");
+        String suffix = ".weight";
+        if (!ggufName.endsWith(suffix)) {
+            return null;
+        }
+        String stem = ggufName.substring(0, ggufName.length() - suffix.length());
+        if (stem.equals(TensorNames.OUTPUT)) {
+            return type == GGMLType.NVFP4 ? stem : null;
+        }
+        String prefix = "blk.";
+        int dot = stem.indexOf('.', prefix.length());
+        if (!stem.startsWith(prefix) || dot < 0) {
+            return null;
+        }
+        String layer = stem.substring(prefix.length(), dot);
+        if (layer.isEmpty() || !layer.chars().allMatch(Character::isDigit)) {
+            return null;
+        }
+        return SCALED_BASES.contains(stem.substring(dot + 1)) ? stem : null;
     }
 
     /**
@@ -165,15 +223,22 @@ public final class TensorClaims {
         return formats;
     }
 
-    /** The generic per-tensor scale pass over every layer slot and the NVFP4 output head. */
+    /**
+     * The generic per-tensor scale pass over every layer slot and the NVFP4 output head, and the optional KV-cache
+     * scales of every layer slot.
+     */
     private static void claimScales(ModelHparams hp, TensorCatalog tc, Set<String> claimed) {
         for (int il = 0; il < hp.nLayerAll(); il++) {
             for (String base : SCALED_BASES) {
                 TensorRef w = tc.layer(il, TensorNames.weight(base));
                 if (w != null && claimed.contains(w.name())) {
-                    claim(tc, TensorNames.layerName(il, TensorNames.scale(base)), claimed);
-                    claim(tc, TensorNames.layerName(il, base + "." + INPUT_SCALE), claimed);
+                    for (String sibling : SIBLINGS) {
+                        claim(tc, TensorNames.layerName(il, base + "." + sibling), claimed);
+                    }
                 }
+            }
+            for (String kvScale : KV_SCALES) {
+                claim(tc, TensorNames.layerName(il, kvScale), claimed);
             }
         }
         TensorRef out = claimedRef(tc, TensorNames.weight(TensorNames.OUTPUT), claimed);
@@ -181,8 +246,9 @@ public final class TensorClaims {
             out = claimedRef(tc, TensorNames.weight(TensorNames.TOKEN_EMBD), claimed);
         }
         if (out != null && out.type() == GGMLType.NVFP4) {
-            claim(tc, TensorNames.scale(TensorNames.OUTPUT), claimed);
-            claim(tc, TensorNames.OUTPUT + "." + INPUT_SCALE, claimed);
+            for (String sibling : SIBLINGS) {
+                claim(tc, TensorNames.OUTPUT + "." + sibling, claimed);
+            }
         }
     }
 

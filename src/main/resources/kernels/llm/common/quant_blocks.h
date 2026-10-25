@@ -1,4 +1,4 @@
-/* common/quant_blocks.h - quant block geometry, scalar block-field helpers and the MXFP4 / IQ4_NL value tables. Requires: common/dialect.h, common/config.h */
+/* common/quant_blocks.h - quant block geometry, scalar block-field helpers and the MXFP4 / IQ4_NL / E4M3FN / bitsandbytes 4-bit value tables. Requires: common/dialect.h, common/config.h */
 /* Portions derived from llama.cpp/ggml (MIT License); see THIRD-PARTY-NOTICES.md. */
 /*
  * Block sizes and byte counts follow the ggml block structs (ggml-common.h static_asserts).
@@ -25,6 +25,34 @@
 #define MXFP4_BLOCK_BYTES 17      /* e(e8m0) qs[16] */
 #define MXFP4_THREADS_PER_BLOCK 4
 #define MXFP4_BYTES_PER_THREAD 4  /* 4 nibble-bytes = 8 elements */
+
+/* ---- NeuralFree extension blocks (GGMLType ids 1000-1005, gguf.quant.BlockLayout), little-endian ---- */
+#define F8_E4M3_BLOCK_SIZE 32
+#define F8_E4M3_BLOCK_BYTES 32        /* qs[32](e4m3fn) */
+#define F8_E4M3_B128_BLOCK_SIZE 128
+#define F8_E4M3_B128_BLOCK_BYTES 132  /* d(f32) qs[128](e4m3fn) */
+#define MXFP8_BLOCK_SIZE 32
+#define MXFP8_BLOCK_BYTES 33          /* e(e8m0) qs[32](e4m3fn) */
+#define I8_B128_BLOCK_SIZE 128
+#define I8_B128_BLOCK_BYTES 132       /* d(f32) qs[128](int8) */
+#define NF4_BLOCK_SIZE 64
+#define NF4_BLOCK_BYTES 36            /* absmax(f32) qs[32]: byte j = element j | element j+32 << 4 */
+#define FP4_BNB_BLOCK_SIZE 64
+#define FP4_BNB_BLOCK_BYTES 36        /* absmax(f32) qs[32]: byte j = element j | element j+32 << 4 */
+
+/* Byte offsets of the extension block fields. */
+#define NF_F8_E4M3_QS      0
+#define NF_F8_E4M3_B128_D  0
+#define NF_F8_E4M3_B128_QS 4
+#define NF_MXFP8_E         0
+#define NF_MXFP8_QS        1
+#define NF_I8_B128_D       0
+#define NF_I8_B128_QS      4
+#define NF_NF4_D           0
+#define NF_NF4_QS          4
+#define NF_FP4_BNB_D       0
+#define NF_FP4_BNB_QS      4
+#define NF_BNB4_HI         32         /* NF4 / FP4_BNB: element of the high nibble of qs byte j is j + 32 */
 
 /* ---- 256-element super-blocks ---- */
 #define Q2_K_BLOCK_SIZE 256
@@ -88,6 +116,58 @@ NF_TABLE(float, IQ4_NL_KVALUES, 16) = {
        1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f
 };
 
+/* E4M3FN code -> value (torch.float8_e4m3fn, utils.numeric.Fp8Codec.E4M3FN): bias 7, subnormal m * 2^-9,
+ * largest finite 0x7E = 448. The NaN codes 0x7F and 0xFF decode to 0 here; repackers reject them. */
+NF_TABLE(float, F8_E4M3_LUT, 256) = {
+    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,
+    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 0.0f,
+    -0.0f, -0.001953125f, -0.00390625f, -0.005859375f, -0.0078125f, -0.009765625f, -0.01171875f, -0.013671875f,
+    -0.015625f, -0.017578125f, -0.01953125f, -0.021484375f, -0.0234375f, -0.025390625f, -0.02734375f, -0.029296875f,
+    -0.03125f, -0.03515625f, -0.0390625f, -0.04296875f, -0.046875f, -0.05078125f, -0.0546875f, -0.05859375f,
+    -0.0625f, -0.0703125f, -0.078125f, -0.0859375f, -0.09375f, -0.1015625f, -0.109375f, -0.1171875f,
+    -0.125f, -0.140625f, -0.15625f, -0.171875f, -0.1875f, -0.203125f, -0.21875f, -0.234375f,
+    -0.25f, -0.28125f, -0.3125f, -0.34375f, -0.375f, -0.40625f, -0.4375f, -0.46875f,
+    -0.5f, -0.5625f, -0.625f, -0.6875f, -0.75f, -0.8125f, -0.875f, -0.9375f,
+    -1.0f, -1.125f, -1.25f, -1.375f, -1.5f, -1.625f, -1.75f, -1.875f,
+    -2.0f, -2.25f, -2.5f, -2.75f, -3.0f, -3.25f, -3.5f, -3.75f,
+    -4.0f, -4.5f, -5.0f, -5.5f, -6.0f, -6.5f, -7.0f, -7.5f,
+    -8.0f, -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f,
+    -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f,
+    -32.0f, -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f,
+    -64.0f, -72.0f, -80.0f, -88.0f, -96.0f, -104.0f, -112.0f, -120.0f,
+    -128.0f, -144.0f, -160.0f, -176.0f, -192.0f, -208.0f, -224.0f, -240.0f,
+    -256.0f, -288.0f, -320.0f, -352.0f, -384.0f, -416.0f, -448.0f, 0.0f
+};
+
+/* bitsandbytes NF4 codebook (get_4bit_type("nf4"), bitsandbytes functional.py:733-750; max magnitude 1). */
+NF_TABLE(float, NF4_CODE, 16) = {
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+    0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+    0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f
+};
+
+/* bitsandbytes FP4 codebook (get_4bit_type("fp4"), functional.py:764 {0, 0.0625, 8, 12, 4, 6, 2, 3, -0,
+ * -0.0625, -8, -12, -4, -6, -2, -3}, each divided by 12 in f32 as functional.py:793-794). */
+NF_TABLE(float, FP4_BNB_CODE, 16) = {
+    0.0f, 0.00520833349f, 0.666666687f, 1.0f, 0.333333343f, 0.5f, 0.166666672f, 0.25f,
+    -0.0f, -0.00520833349f, -0.666666687f, -1.0f, -0.333333343f, -0.5f, -0.166666672f, -0.25f
+};
+
 /* ---- scalar helpers ---- */
 
 /* f16 scale at the start of a Q8_0 block. */
@@ -137,6 +217,13 @@ NF_INLINE float mxfp4_scale(uint e) {
         bits = (e - 1u) << 23;
     }
     return as_float(bits);
+}
+
+/* E8M0 exponent byte -> 2^(e - 127) exactly (FpBlockDecoders.e8m0ToFp32): a normal float for e >= 1, the
+ * subnormal 2^-127 for e = 0 (which acts as 0 where denormals are flushed, as in the CUDA build). The NaN
+ * code 255 gives +inf; repackers reject it. */
+NF_INLINE float e8m0_scale(uint e) {
+    return as_float(e == 0u ? 0x00400000u : e << 23);
 }
 
 /* 6-bit sub-block scale of IQ4_XS sub-block sb (0-7), biased by -32, times d. */

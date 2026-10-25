@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.nn.Parameter;
 import com.eonmux.neuralfree.nn.Sequential;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.gpu.TrainParity;
+import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
 import org.junit.Before;
 import org.junit.Test;
 

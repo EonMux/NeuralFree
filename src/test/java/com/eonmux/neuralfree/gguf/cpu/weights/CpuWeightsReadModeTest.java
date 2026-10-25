@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf.cpu.weights;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
+import com.eonmux.neuralfree.gguf.ModelSource;
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
+import com.eonmux.neuralfree.gguf.ModelSources;
 import com.eonmux.neuralfree.gguf.TensorReadMode;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
@@ -43,12 +45,12 @@ public class CpuWeightsReadModeTest {
     @Test
     public void readModeDecodesLikeMmap() throws IOException {
         Path path = model().writeTempFile();
-        GGUFFileParser parser = null;
+        ModelSource source = null;
         try {
-            parser = new GGUFFileParser(path.toString());
-            TensorCatalog catalog = TensorCatalog.of(parser);
-            try (CpuWeights mapped = CpuWeights.open(parser, catalog, null, TensorReadMode.MMAP);
-                 CpuWeights read = CpuWeights.open(parser, catalog, null, TensorReadMode.READ)) {
+            source = ModelSources.open(path.toString(), ModelSourceOptions.defaults());
+            TensorCatalog catalog = TensorCatalog.of(source);
+            try (CpuWeights mapped = CpuWeights.open(source, catalog, null, TensorReadMode.MMAP);
+                 CpuWeights read = CpuWeights.open(source, catalog, null, TensorReadMode.READ)) {
                 assertEquals(TensorReadMode.MMAP, mapped.readMode());
                 assertEquals(TensorReadMode.READ, read.readMode());
                 for (String name : NAMES) {
@@ -57,8 +59,8 @@ public class CpuWeightsReadModeTest {
             }
         } finally {
             try {
-                if (parser != null) {
-                    parser.close();
+                if (source != null) {
+                    source.close();
                 }
             } finally {
                 Files.deleteIfExists(path);

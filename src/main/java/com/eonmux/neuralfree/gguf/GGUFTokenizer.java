@@ -4,12 +4,14 @@ import com.eonmux.neuralfree.gguf.chat.ChatFormatter;
 import com.eonmux.neuralfree.gguf.chat.ChatTemplateSource;
 import com.eonmux.neuralfree.gguf.tokenizer.BpeTokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.Gemma4Tokenizer;
+import com.eonmux.neuralfree.gguf.tokenizer.IncrementalDetokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.NoVocabTokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.Plamo2Tokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.Plamo3Tokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.RwkvTokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.SpecialTokens;
 import com.eonmux.neuralfree.gguf.tokenizer.SpmTokenizer;
+import com.eonmux.neuralfree.gguf.tokenizer.TokenDecoder;
 import com.eonmux.neuralfree.gguf.tokenizer.TokenizerAlgorithm;
 import com.eonmux.neuralfree.gguf.tokenizer.TokenizerVocab;
 import com.eonmux.neuralfree.gguf.tokenizer.UgmTokenizer;
@@ -33,6 +35,13 @@ import java.util.function.IntFunction;
  * bert to WPM, rwkv to RWKV, plamo2/plamo3 to PLaMo, none/no_vocab to the no-vocabulary
  * tokenizer. {@link #encode(String)} parses special tokens and applies the vocabulary's
  * BOS/EOS policy, as llama.cpp prompt tokenization does.</p>
+ *
+ * <p>{@link #decode(int[])} applies the vocabulary's Hugging Face overlays when present: the
+ * decoder chain ({@link TokenizerVocab#decoder()}) in place of piece concatenation, then
+ * transformers' {@code clean_up_tokenization} ({@link TokenizerVocab#cleanUpTokenizationSpaces()}).
+ * Their text depends on neighbouring tokens, so with either overlay {@link #decode(int)} is the
+ * one-token sequence's text and {@link #createStreamingDecoder()} streams through
+ * {@link IncrementalDetokenizer}; without them both render llama.cpp token pieces.</p>
  */
 public final class GGUFTokenizer {
 
@@ -53,8 +62,9 @@ public final class GGUFTokenizer {
     private final byte[][] visibleBytesCache;
     private final String[] decodedStringCache;
 
-    public GGUFTokenizer(GGUFFileParser parser) {
-        this(TokenizerVocab.fromGguf(parser));
+    /** The tokenizer of an open model, from its {@code tokenizer.*} metadata. */
+    public GGUFTokenizer(ModelSource source) {
+        this(TokenizerVocab.fromSource(source));
     }
 
     public GGUFTokenizer(TokenizerVocab vocab) {
@@ -168,19 +178,48 @@ public final class GGUFTokenizer {
         return decode(arr);
     }
 
-    /** Detokenizes a sequence; hidden tokens (BOS, PAD, end-of-generation, control) produce no text. */
+    /**
+     * Detokenizes a sequence; hidden tokens (BOS, PAD, end-of-generation, control) produce no text.
+     * With a decoder overlay the texts of the visible tokens go through that chain; with the
+     * clean-up overlay set, transformers' clean-up follows. Otherwise this is llama.cpp
+     * {@code detokenize}.
+     */
     public String decode(int[] ids) {
-        return algorithm.decode(ids);
+        if (ids == null) throw new IllegalArgumentException("ids are null");
+        TokenDecoder decoder = vocab.decoder();
+        String text = decoder != null ? decodeWith(decoder, ids) : algorithm.decode(ids);
+        return Boolean.TRUE.equals(vocab.cleanUpTokenizationSpaces())
+                ? TokenizerAlgorithm.cleanUpTokenizationSpaces(text) : text;
     }
 
-    /** Text of a single token as it appears in streamed output; empty for hidden tokens. */
+    /** Hugging Face {@code Tokenizer::decode}: the visible tokens' texts through the decoder chain. */
+    private String decodeWith(TokenDecoder decoder, int[] ids) {
+        List<String> pieces = new ArrayList<>(ids.length);
+        for (int id : ids) {
+            if (!special.isHidden(id)) pieces.add(vocab.text(id));
+        }
+        return decoder.decode(pieces);
+    }
+
+    /**
+     * Text of a single token; empty for hidden tokens. Without decoder or clean-up overlays this
+     * is the token's piece as streamed output renders it; with one, it is
+     * {@link #decode(int[])} of the token alone (Hugging Face {@code decode([id])}), and streamed
+     * text comes from {@link #createStreamingDecoder()}.
+     */
     public String decode(int tokenId) {
         if (tokenId < 0 || tokenId >= decodedStringCache.length) return "";
         String cached = decodedStringCache[tokenId];
         if (cached != null) return cached;
-        cached = new String(visibleBytes(tokenId), StandardCharsets.UTF_8);
+        cached = sequenceDecoding() ? decode(new int[]{tokenId})
+                : new String(visibleBytes(tokenId), StandardCharsets.UTF_8);
         decodedStringCache[tokenId] = cached;
         return cached;
+    }
+
+    /** Whether decoding goes through a context-dependent overlay (decoder chain or clean-up). */
+    private boolean sequenceDecoding() {
+        return vocab.decoder() != null || Boolean.TRUE.equals(vocab.cleanUpTokenizationSpaces());
     }
 
     private byte[] visibleBytes(int tokenId) {
@@ -193,16 +232,41 @@ public final class GGUFTokenizer {
         return cached;
     }
 
-    /** Streaming decoder bound to this tokenizer's output rendering. */
+    /**
+     * Streaming decoder bound to this tokenizer's output rendering: token pieces at UTF-8
+     * boundaries, or, with a decoder or clean-up overlay, the incremental text of
+     * {@link #decode(int[])}.
+     */
     public static final class StreamingDecoder extends com.eonmux.neuralfree.gguf.tokenizer.StreamingDecoder {
-        private StreamingDecoder(IntFunction<byte[]> visibleBytes) {
+        /** The overlay path; null when token pieces are streamed. */
+        private final IncrementalDetokenizer sequence;
+
+        private StreamingDecoder(IntFunction<byte[]> visibleBytes, IncrementalDetokenizer sequence) {
             super(visibleBytes);
+            this.sequence = sequence;
+        }
+
+        @Override
+        public String decodeToken(int tokenId) {
+            return sequence != null ? sequence.next(tokenId) : super.decodeToken(tokenId);
+        }
+
+        @Override
+        public String flush() {
+            return sequence != null ? sequence.flush() : super.flush();
+        }
+
+        @Override
+        public void reset() {
+            if (sequence != null) sequence.reset();
+            else super.reset();
         }
     }
 
     /** Creates a new streaming decoder for one generation. */
     public StreamingDecoder createStreamingDecoder() {
-        return new StreamingDecoder(this::visibleBytes);
+        return new StreamingDecoder(this::visibleBytes,
+                sequenceDecoding() ? new IncrementalDetokenizer(this::decode) : null);
     }
 
     // ---------------------------------------------------------------------------------------------

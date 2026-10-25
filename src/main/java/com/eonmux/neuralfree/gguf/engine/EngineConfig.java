@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.Config;
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
+import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -12,7 +14,8 @@ import java.util.Properties;
 
 /**
  * Everything a caller chooses when opening a model: backend and device, memory, sampling defaults, weight
- * streaming, speculative decoding and LoRA adapters. Immutable; built with {@link #builder()} or read from system
+ * streaming, speculative decoding, LoRA adapters, how checkpoints that are not GGUF are opened and how checkpoint
+ * activation quantization is applied. Immutable; built with {@link #builder()} or read from system
  * properties with {@link #fromSystemProperties()}.
  *
  * <p>Properties read by {@link #fromProperties(Properties)} (absent keys keep their defaults):
@@ -39,6 +42,13 @@ import java.util.Properties;
  *       {@code neuralfree.nextn.memory} is), as llama.cpp loads them only with {@code load_mtp}.</li>
  *   <li>{@code neuralfree.lora}: LoRA adapters as {@code path[:scale][,path[:scale]...]} (llama.cpp {@code --lora} /
  *       {@code --lora-scaled}), scale 1 when omitted, default none; see {@link LoraSpec#parseList}.</li>
+ *   <li>The {@link ModelSourceOptions} keys ({@code neuralfree.hf.*}, {@code neuralfree.quant.online},
+ *       {@code neuralfree.lora.base.config}): how a checkpoint that is not GGUF is turned into its GGUF view.</li>
+ *   <li>{@code neuralfree.act.quant}: weight-only (default) | checkpoint, how a checkpoint's activation quantization
+ *       is applied ({@link ActivationQuant}).</li>
+ *   <li>{@code neuralfree.sampling.model.defaults}: whether a model's sampling defaults
+ *       ({@link EngineModel#modelSamplingDefaults()}) fill the sampler settings and token budget a request leaves
+ *       unset, default true.</li>
  * </ul>
  */
 public final class EngineConfig {
@@ -54,6 +64,8 @@ public final class EngineConfig {
     public static final String PROP_DRAFT_P_MIN = "neuralfree.draft.p.min";
     public static final String PROP_MTP = "neuralfree.mtp";
     public static final String PROP_LORA = "neuralfree.lora";
+    public static final String PROP_ACT_QUANT = ActivationQuant.PROPERTY;
+    public static final String PROP_MODEL_SAMPLING_DEFAULTS = "neuralfree.sampling.model.defaults";
 
     /** {@link #ramCacheMb()} value meaning "half the maximum heap". */
     public static final long RAM_CACHE_AUTO = -1L;
@@ -284,6 +296,9 @@ public final class EngineConfig {
     /** {@link Builder#mtp(boolean)} as set, without the self-speculation {@link DraftType#MTP} implies. */
     private final boolean mtpSet;
     private final List<LoraSpec> loras;
+    private final ModelSourceOptions sourceOptions;
+    private final ActivationQuant activationQuant;
+    private final boolean modelSamplingDefaults;
 
     private EngineConfig(Builder b, MemoryConfig memory) {
         this.backend = b.backend;
@@ -300,11 +315,14 @@ public final class EngineConfig {
         this.mtp = b.mtp || selfMtp(b);
         this.mtpSet = b.mtp;
         this.loras = Collections.unmodifiableList(new ArrayList<>(b.loras));
+        this.sourceOptions = b.sourceOptions;
+        this.activationQuant = b.activationQuant;
+        this.modelSamplingDefaults = b.modelSamplingDefaults;
     }
 
     /**
      * Defaults: AUTO backend, no device filter, default memory and sampling, automatic streaming, no drafting, no
-     * LoRA adapters.
+     * LoRA adapters, default source options, weight-only activations and the model's sampling defaults applied.
      */
     public static EngineConfig defaults() {
         return builder().build();
@@ -339,7 +357,10 @@ public final class EngineConfig {
                 .draftPMin(floatProperty(p, PROP_DRAFT_P_MIN, d.draftPMin))
                 .mtp(booleanProperty(p, PROP_MTP, d.mtp))
                 .deviceFilter(stringProperty(p, PROP_DEVICE))
-                .loras(loraProperty(p));
+                .loras(loraProperty(p))
+                .sourceOptions(ModelSourceOptions.fromProperties(p))
+                .activationQuant(activationQuantProperty(p))
+                .modelSamplingDefaults(booleanProperty(p, PROP_MODEL_SAMPLING_DEFAULTS, d.modelSamplingDefaults));
         String backend = stringProperty(p, PROP_BACKEND);
         if (backend != null) {
             b.backend(BackendMode.parse(backend));
@@ -380,6 +401,16 @@ public final class EngineConfig {
     public boolean mtp() { return mtp; }
     /** The LoRA adapters applied to the model, in load order (unmodifiable, empty for none). */
     public List<LoraSpec> loras() { return loras; }
+    /** How a checkpoint that is not GGUF is turned into its GGUF view (models, drafts and adapters alike). */
+    public ModelSourceOptions sourceOptions() { return sourceOptions; }
+    /** How a checkpoint's activation quantization is applied ({@link ActivationQuant#WEIGHT_ONLY} by default). */
+    public ActivationQuant activationQuant() { return activationQuant; }
+    /**
+     * Whether generation applies the model's sampling defaults ({@link EngineModel#modelSamplingDefaults()}) to the
+     * sampler settings and token budget a request leaves unset (default true; llama.cpp applies
+     * {@code general.sampling.*}, vLLM its {@code generation_config}).
+     */
+    public boolean modelSamplingDefaults() { return modelSamplingDefaults; }
 
     /**
      * The sampler of the legacy {@code LLMModel.generate} parameters, the one mapping every orchestrator uses: the
@@ -388,7 +419,8 @@ public final class EngineConfig {
      * configured. Values pass through unchanged, as llama.cpp's sampler parameters do, except
      * {@code repeatWindow == 0}, which penalizes the whole context ({@link SamplerConfig#PENALTY_WHOLE_CONTEXT},
      * llama.cpp {@code penalty_last_n = -1}); {@code -1} also means the whole context and {@code n > 0} the last
-     * {@code n} tokens. A repetition penalty of 1 disables it.
+     * {@code n} tokens. A repetition penalty of 1 disables it. The given values are explicit
+     * ({@link SamplerConfig#explicit()}), so a model's sampling defaults fill only the other settings.
      *
      * @throws IllegalArgumentException for a value {@link SamplerConfig.Builder#build()} rejects: a non-finite
      *                                  temperature or penalty, top-p or min-p outside [0, 1], a penalty <= 0 or a
@@ -409,7 +441,9 @@ public final class EngineConfig {
     public Builder toBuilder() {
         return builder().backend(backend).deviceFilter(deviceFilter).memory(memory).samplerDefaults(samplerDefaults)
                 .ramCacheMb(ramCacheMb).vramDepth(vramDepth).draftModelPath(draftModelPath).draftType(draftType)
-                .draftMax(draftMax).draftMin(draftMin).draftPMin(draftPMin).mtp(mtpSet).loras(loras);
+                .draftMax(draftMax).draftMin(draftMin).draftPMin(draftPMin).mtp(mtpSet).loras(loras)
+                .sourceOptions(sourceOptions).activationQuant(activationQuant)
+                .modelSamplingDefaults(modelSamplingDefaults);
     }
 
     @Override
@@ -422,6 +456,10 @@ public final class EngineConfig {
                 + (draftType != DraftType.AUTO ? ", draftType=" + draftType.llamaName() : "") + (mtp ? ", mtp" : "")
                 + (speculative() ? ", draftMax=" + draftMax + ", draftMin=" + draftMin + ", draftPMin=" + draftPMin : "")
                 + (loras.isEmpty() ? "" : ", lora=" + loras)
+                + (sourceOptions.equals(ModelSourceOptions.defaults()) ? "" : ", " + sourceOptions)
+                + (activationQuant == ActivationQuant.WEIGHT_ONLY ? "" : ", actQuant="
+                + activationQuant.propertyValue())
+                + (modelSamplingDefaults ? "" : ", modelSamplingDefaults=false")
                 + '}';
     }
 
@@ -444,6 +482,11 @@ public final class EngineConfig {
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException(PROP_DRAFT_TYPE + "=" + v + ": " + e.getMessage(), e);
         }
+    }
+
+    static ActivationQuant activationQuantProperty(Properties p) {
+        String v = stringProperty(p, PROP_ACT_QUANT);
+        return v == null ? ActivationQuant.WEIGHT_ONLY : ActivationQuant.parse(v);
     }
 
     /** {@link DraftType#MTP} without a draft file drafts with the model's own NextN / MTP blocks. */
@@ -524,6 +567,9 @@ public final class EngineConfig {
         private float draftPMin;
         private boolean mtp;
         private final List<LoraSpec> loras = new ArrayList<>();
+        private ModelSourceOptions sourceOptions = ModelSourceOptions.defaults();
+        private ActivationQuant activationQuant = ActivationQuant.WEIGHT_ONLY;
+        private boolean modelSamplingDefaults = true;
 
         private Builder() {
         }
@@ -579,6 +625,21 @@ public final class EngineConfig {
             loras.add(new LoraSpec(path, scale));
             return this;
         }
+
+        /** How a checkpoint that is not GGUF is turned into its GGUF view. */
+        public Builder sourceOptions(ModelSourceOptions v) {
+            this.sourceOptions = Objects.requireNonNull(v, "sourceOptions");
+            return this;
+        }
+
+        /** How a checkpoint's activation quantization is applied. */
+        public Builder activationQuant(ActivationQuant v) {
+            this.activationQuant = Objects.requireNonNull(v, "activationQuant");
+            return this;
+        }
+
+        /** Whether generation applies the model's sampling defaults to the settings a request leaves unset. */
+        public Builder modelSamplingDefaults(boolean v) { this.modelSamplingDefaults = v; return this; }
 
         /**
          * Builds the configuration. The memory settings receive the speculative defaults of the draft model and MTP

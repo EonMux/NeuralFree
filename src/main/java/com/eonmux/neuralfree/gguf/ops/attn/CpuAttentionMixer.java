@@ -552,10 +552,15 @@ public final class CpuAttentionMixer implements CpuMixer {
         }
     }
 
-    /** The delta site of projection {@code weight}; a matvec that rotates its input (PRISM) refuses deltas. */
+    /**
+     * The delta site of projection {@code weight}; a matvec with a non-identity input transform (PRISM Hadamard, or
+     * an ACT_QUANT/PERMUTE input transform) refuses deltas.
+     */
     private CpuProjectionDeltas.Site serveDeltas(String weight, CpuTensorRef w) {
-        String refusal = matVec.transformsOf(w).input() != null ? weight + " of layer " + layer.il() + " rotates its"
-                + " input (PRISM Hadamard) inside the matvec; a LoRA delta would need the rotated rows" : null;
+        CpuMatVec.Transforms t = matVec.transformsOf(w);
+        String refusal = !t.transform().isIdentity() ? weight + " of layer " + layer.il()
+                + " transforms its input (PRISM Hadamard or input transform) inside the matvec; a LoRA delta would"
+                + " need the transformed rows" : null;
         return ctx.projectionDeltas().serve(layer, weight, refusal);
     }
 

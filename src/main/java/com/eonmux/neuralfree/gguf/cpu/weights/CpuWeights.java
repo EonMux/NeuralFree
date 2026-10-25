@@ -1,42 +1,40 @@
 package com.eonmux.neuralfree.gguf.cpu.weights;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
+import com.eonmux.neuralfree.gguf.ModelSource;
+import com.eonmux.neuralfree.gguf.SourceOrigin;
 import com.eonmux.neuralfree.gguf.TensorReadMode;
+import com.eonmux.neuralfree.gguf.TensorRegions;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
-import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
+import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
 import com.eonmux.neuralfree.gguf.quant.BlockLayout;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
-import com.eonmux.neuralfree.gguf.quant.PrismHadamardLoader;
+import com.eonmux.neuralfree.gguf.quant.InputTransform;
+import com.eonmux.neuralfree.gguf.quant.InputTransformLoader;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.spec.TensorRef;
 
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The tensors of one GGUF model for the CPU, read in place from memory-mapped file regions, or, in
- * {@link TensorReadMode#READ} (llama.cpp {@code --no-mmap}), from direct buffers filled by positional file reads.
+ * The tensors of one model for the CPU, read through the {@link TensorRegions} of its {@link ModelSource}: in place
+ * from memory-mapped file regions, or, in {@link TensorReadMode#READ} (llama.cpp {@code --no-mmap}), from direct
+ * buffers filled by positional file reads.
  *
  * <ul>
  *   <li><b>Matrices</b> are {@link CpuTensorRef} views over the tensor bytes in the tensor's own type; nothing is
@@ -44,11 +42,17 @@ import java.util.concurrent.ConcurrentHashMap;
  *       at most {@value #MAX_REGION_BYTES} bytes and cached, so a name always yields the same view.</li>
  *   <li><b>Small vectors</b> (norm weights, biases, relative-position tables, scales) are decoded to F32 once by
  *       the {@code floats} lookups and cached. The returned arrays are shared and must not be modified.</li>
- *   <li><b>Transforms.</b> This class is the {@link CpuMatVec.TransformSource} of its {@link #matVec()}: a weight
- * folded by PRISM gets its input Hadamard (llama.cpp src/llama-graph.cpp:1598-1626), a weight {@code <base>.weight}
+ *   <li><b>Transforms.</b> This class is the {@link CpuMatVec.TransformSource} of its {@link #matVec()}, which
+ *       applies a weight's full input transform before the weight kernel, in the §AQ-1 order HADAMARD →
+ *       ACT_QUANT → PERMUTE ({@link InputTransform}): a weight folded by PRISM or compressed-tensors gets its
+ *       input rotation (llama.cpp src/llama-graph.cpp:1598-1626), a checkpoint's activation fake-quantization and
+ *       act-order input permutation ride along ({@link InputTransformLoader.Result#forward()}), a weight
+ * {@code <base>.weight}
  *       with a sibling {@code <base>.scale} tensor gets that output scale {@code w_s} (one value, or one per expert
  * for a 3-D expert tensor; llama.cpp src/llama-model.cpp:1718-1792, src/llama-graph.cpp:1643-1645, 1722-1729), and a
- * latent lookup table gets its inverse Hadamard for {@link #embedRow} (llama.cpp src/llama-graph.cpp:2683-2690).</li>
+ *       latent lookup table gets its inverse Hadamard for {@link #embedRow} (llama.cpp src/llama-graph.cpp:2683-2690).
+ *       This class loads no transform itself: it only binds the {@link InputTransformLoader.Result} that {@code open}
+ *       receives.</li>
  * </ul>
  *
  * <p>Lookups resolve aliases as {@link TensorCatalog} does. Required lookups throw {@link MissingTensorException}
@@ -76,9 +80,10 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
     }
 
     private final TensorCatalog catalog;
-    private final GgufRegions regions;
-    private final Map<String, HadamardSpec> forward;
-    private final Map<String, HadamardSpec> inverse;
+    private final TensorRegions regions;
+    private final TensorReadMode mode;
+    private final SourceOrigin origin;
+    private final InputTransformLoader.Result transforms;
     private final CpuMatVec matVec;
     private final Map<String, CpuTensorRef> views = new ConcurrentHashMap<>();
     private final Map<CpuTensorRef, Entry> entries = new ConcurrentHashMap<>();
@@ -86,64 +91,85 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
     private final Object loadLock = new Object();
     private volatile boolean closed;
 
-    private CpuWeights(TensorCatalog catalog, GgufRegions regions, PrismHadamardLoader.Result prism) {
+    private CpuWeights(TensorCatalog catalog, TensorRegions regions, TensorReadMode mode, SourceOrigin origin,
+                       InputTransformLoader.Result transforms) {
         this.catalog = catalog;
         this.regions = regions;
-        this.forward = prism != null ? prism.forward() : Collections.<String, HadamardSpec>emptyMap();
-        this.inverse = prism != null ? prism.inverse() : Collections.<String, HadamardSpec>emptyMap();
+        this.mode = mode;
+        this.origin = origin;
+        this.transforms = transforms;
         this.matVec = new CpuMatVec(this);
     }
 
     /**
-     * Weights of a parsed model, with the PRISM transforms its metadata declares, read in the process's
-     * {@link TensorReadMode#current()} mode.
+     * Weights of an open model, with the input transforms its metadata and tensors declare
+     * ({@link InputTransformLoader}, activation quantization ignored as {@link ActivationQuant#WEIGHT_ONLY}), read
+     * in the process's {@link TensorReadMode#current()} mode.
      *
      * @throws IOException         when a tensor file cannot be opened
-     * @throws GgufFormatException when the PRISM metadata is malformed
+     * @throws GgufFormatException when the transform metadata or tensors are malformed
      * @throws IllegalArgumentException when {@value TensorReadMode#PROP_DISABLE_MMAP} is not a boolean
      */
-    public static CpuWeights open(GGUFFileParser parser) throws IOException {
-        Objects.requireNonNull(parser, "parser");
-        TensorCatalog catalog = TensorCatalog.of(parser);
-        GgufKv kv = GgufKv.of(parser);
-        PrismHadamardLoader.Result prism = PrismHadamardLoader.load(kv, name -> {
-            TensorRef r = catalog.get(name);
-            return r != null ? r.ne() : null;
-        }, kv.u32(GgufKeys.SSM_TIME_STEP_RANK, 0), kv.u32(GgufKeys.SSM_GROUP_COUNT, 0));
-        return open(parser, catalog, prism);
+    public static CpuWeights open(ModelSource source) throws IOException {
+        Objects.requireNonNull(source, "source");
+        TensorCatalog catalog = TensorCatalog.of(source);
+        GgufKv kv = GgufKv.of(source);
+        return open(source, catalog, InputTransformLoader.load(source, kv, catalog, ActivationQuant.WEIGHT_ONLY));
     }
 
     /**
-     * Weights of a parsed model over an existing catalog of its tensors, read in the process's
-     * {@link TensorReadMode#current()} mode.
+     * Weights of an open model over an existing catalog of its tensors, read in the process's
+     * {@link TensorReadMode#current()} mode. The full input transform of every weight
+     * ({@link InputTransformLoader.Result#forward()}) is applied by the weights' {@link #matVec()}.
      *
-     * @param prism the model's PRISM transforms, or null when it has none
+     * @param transforms the model's input transforms, or null when it has none
      * @throws IOException         when a tensor file cannot be opened
+     * @throws GgufFormatException when a transform does not fit the tensor it is bound to
      * @throws IllegalArgumentException when {@value TensorReadMode#PROP_DISABLE_MMAP} is not a boolean
      */
-    public static CpuWeights open(GGUFFileParser parser, TensorCatalog catalog, PrismHadamardLoader.Result prism)
+    public static CpuWeights open(ModelSource source, TensorCatalog catalog, InputTransformLoader.Result transforms)
             throws IOException {
-        return open(parser, catalog, prism, TensorReadMode.current());
+        return open(source, catalog, transforms, TensorReadMode.current());
     }
 
     /**
-     * Weights of a parsed model over an existing catalog of its tensors.
+     * Weights of an open model over an existing catalog of its tensors, read through the source's
+     * {@link ModelSource#openRegions(TensorReadMode) regions}, which these weights own and close. The full input
+     * transform of every weight ({@link InputTransformLoader.Result#forward()}) is applied by the weights'
+     * {@link #matVec()}.
      *
-     * @param prism the model's PRISM transforms, or null when it has none
-     * @param mode  whether tensors are memory-mapped or read into direct buffers
+     * @param transforms the model's input transforms, or null when it has none
+     * @param mode       whether tensors are memory-mapped or read into direct buffers
      * @throws IOException         when a tensor file cannot be opened
+     * @throws GgufFormatException when a transform does not fit the tensor it is bound to
      */
-    public static CpuWeights open(GGUFFileParser parser, TensorCatalog catalog, PrismHadamardLoader.Result prism,
+    public static CpuWeights open(ModelSource source, TensorCatalog catalog, InputTransformLoader.Result transforms,
                                   TensorReadMode mode) throws IOException {
-        Objects.requireNonNull(parser, "parser");
+        Objects.requireNonNull(source, "source");
         Objects.requireNonNull(catalog, "catalog");
         Objects.requireNonNull(mode, "mode");
-        return new CpuWeights(catalog, GgufRegions.open(parser, mode), prism);
+        SourceOrigin origin = new SourceOrigin(Paths.get(source.getFilePath()), source.format());
+        TensorRegions regions = source.openRegions(mode);
+        try {
+            return new CpuWeights(catalog, regions, mode, origin, transforms);
+        } catch (RuntimeException | Error e) {
+            try {
+                regions.close();
+            } catch (IOException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
+        }
     }
 
     /** Whether the tensors are memory-mapped or read into direct buffers. */
     public TensorReadMode readMode() {
-        return regions.mode;
+        return mode;
+    }
+
+    /** The checkpoint the weights were opened from. */
+    public SourceOrigin origin() {
+        return origin;
     }
 
     /** The catalog the lookups resolve through. */
@@ -380,14 +406,17 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
             try {
                 view = mapTensor(info, ref);
             } catch (IOException e) {
-                throw new UncheckedIOException("cannot " + (regions.mode == TensorReadMode.MMAP ? "map" : "read")
-                        + " tensor " + info.name() + " of " + regions, e);
+                throw new UncheckedIOException("cannot " + (mode == TensorReadMode.MMAP ? "map" : "read")
+                        + " tensor " + info.name() + " of " + regions.description(), e);
             }
             int experts = ref.rank() >= 3 ? checkedInt(ref.ne(2), ref) : 0;
             float[] scale = outputScale(ref, experts);
-            HadamardSpec in = checkedSpec(forward.get(ref.name()), ref, "input");
-            HadamardSpec inv = checkedSpec(inverse.get(ref.name()), ref, "inverse");
-            entries.put(view, new Entry(ref, CpuMatVec.Transforms.of(in, scale, experts), inv));
+            InputTransform it = transforms != null ? transforms.forward(ref.name()) : InputTransform.IDENTITY;
+            it = checkedInputTransform(it, experts, ref);
+            HadamardSpec in = checkedSpec(it.hadamard(), ref, "input");
+            HadamardSpec inv = checkedSpec(transforms != null ? transforms.inverse().get(ref.name()) : null, ref,
+                    "inverse");
+            entries.put(view, new Entry(ref, CpuMatVec.Transforms.from(it, scale, experts), inv));
             views.put(ref.name(), view);
             return view;
         }
@@ -462,6 +491,37 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
         return spec;
     }
 
+    /**
+     * Validates the input transform {@code it} that {@code transforms} binds to the weight {@code ref}: the row
+     * splits into its transform parts ({@link InputTransform#requireWidth}), a PERMUTE part never serves a 3-D
+     * expert tensor (TP-1 folds it), and the ACT_QUANT parameters of a per-expert scheme match the expert count
+     * ({@link InputTransform.ActQuant}).
+     *
+     * @throws GgufFormatException naming the tensor and the part that does not fit
+     */
+    private static InputTransform checkedInputTransform(InputTransform it, int experts, TensorRef ref) {
+        if (it.isIdentity()) {
+            return it;
+        }
+        if (it.hasPerm() && experts > 0) {
+            throw new GgufFormatException("input permutation of tensor " + ref.name()
+                    + ": a 3-D expert tensor folds its input permutation into the weights (TP-1)");
+        }
+        try {
+            it.requireWidth(checkedInt(ref.cols(), ref));
+        } catch (IllegalArgumentException e) {
+            throw new GgufFormatException("input transform does not fit tensor " + ref.name() + ": "
+                    + e.getMessage(), e);
+        }
+        InputTransform.ActQuant actQuant = it.actQuant();
+        if (actQuant != null && actQuant.entries() > 1 && actQuant.entries() != experts) {
+            throw new GgufFormatException("activation quantization of tensor " + ref.name() + " has "
+                    + actQuant.entries() + " parameter set(s)" + (experts == 0 ? ", but the tensor is not an"
+                            + " expert tensor" : ", but the tensor holds " + experts + " expert(s)"));
+        }
+        return it;
+    }
+
     private static int checkedInt(long v, TensorRef ref) {
         if (v > Integer.MAX_VALUE) {
             throw new GgufFormatException("dimension " + v + " of tensor " + ref.name() + " exceeds the int range");
@@ -471,7 +531,7 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
 
     private void ensureOpen() {
         if (closed) {
-            throw new IllegalStateException("CPU weights of " + regions + " are closed");
+            throw new IllegalStateException("CPU weights of " + regions.description() + " are closed");
         }
     }
 
@@ -495,141 +555,6 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
 
     @Override
     public String toString() {
-        return "CpuWeights{" + archName() + ", " + regions + ", loaded=" + views.size() + "}";
-    }
-
-    // ================================================================== file regions
-
-    /**
-     * The files holding a model's tensor data, as {@link GGUFFileParser#getShards()} describes them. The parser
-     * places every tensor at a virtual offset; a tensor of split {@code s} lives in that split's file at
-     * {@code Shard.fileOffset(info.offset())}. A single-file model is the one-split case. Regions are memory-mapped,
-     * or in {@link TensorReadMode#READ} copied into direct buffers with positional reads.
-     */
-    private static final class GgufRegions implements AutoCloseable {
-
-        private final String description;
-        private final TensorReadMode mode;
-        private final FileChannel[] channels;
-        private final GGUFFileParser.Shard[] shards;
-        private final Map<String, Integer> splitOf;
-
-        private GgufRegions(String description, TensorReadMode mode, FileChannel[] channels,
-                            GGUFFileParser.Shard[] shards, Map<String, Integer> splitOf) {
-            this.description = description;
-            this.mode = mode;
-            this.channels = channels;
-            this.shards = shards;
-            this.splitOf = splitOf;
-        }
-
-        static GgufRegions open(GGUFFileParser parser, TensorReadMode mode) throws IOException {
-            GGUFFileParser.Shard[] shards = parser.getShards().toArray(new GGUFFileParser.Shard[0]);
-            Map<String, Integer> splitOf = shards.length > 1 ? indexSplits(parser, shards) : null;
-            FileChannel[] channels = new FileChannel[shards.length];
-            try {
-                for (int s = 0; s < shards.length; s++) {
-                    channels[s] = FileChannel.open(Paths.get(shards[s].path()), StandardOpenOption.READ);
-                }
-            } catch (IOException | RuntimeException e) {
-                closeAll(channels, e);
-                throw e;
-            }
-            String description = shards.length == 1 ? parser.getFilePath()
-                    : parser.getFilePath() + " (" + shards.length + " splits)";
-            return new GgufRegions(description, mode, channels, shards, splitOf);
-        }
-
-        /** The split of each tensor, by stored name. */
-        private static Map<String, Integer> indexSplits(GGUFFileParser parser, GGUFFileParser.Shard[] shards) {
-            List<GGUFTensorInfo> tensors = parser.getTensors();
-            Map<String, Integer> splitOf = new HashMap<>(tensors.size() * 2);
-            for (GGUFFileParser.Shard shard : shards) {
-                for (int i = shard.firstTensor(); i < shard.firstTensor() + shard.tensorCount(); i++) {
-                    splitOf.put(tensors.get(i).name(), shard.index());
-                }
-            }
-            return Collections.unmodifiableMap(splitOf);
-        }
-
-        /** The {@code length} bytes of a tensor starting {@code byteOff} bytes into it, mapped or read. */
-        ByteBuffer region(GGUFTensorInfo info, long byteOff, long length) throws IOException {
-            int s = 0;
-            if (splitOf != null) {
-                Integer split = splitOf.get(info.name());
-                if (split == null) {
-                    throw new GgufFormatException("tensor " + info.name() + " is in no split of " + description);
-                }
-                s = split;
-            }
-            long start = shards[s].fileOffset(info.offset()) + byteOff;
-            FileChannel ch = channels[s];
-            if (start < 0 || length < 0 || length > Integer.MAX_VALUE || start > ch.size() - length) {
-                throw new GgufFormatException("tensor " + info.name() + " bytes [" + start + ", +" + length
-                        + ") lie outside its file of " + ch.size() + " bytes");
-            }
-            if (mode == TensorReadMode.MMAP) {
-                return ch.map(FileChannel.MapMode.READ_ONLY, start, length);
-            }
-            return read(ch, info, start, (int) length);
-        }
-
-        /** Reads {@code length} bytes at {@code start} into a new direct buffer, positioned at 0. */
-        private ByteBuffer read(FileChannel ch, GGUFTensorInfo info, long start, int length) throws IOException {
-            ByteBuffer buf;
-            try {
-                buf = ByteBuffer.allocateDirect(length);
-            } catch (OutOfMemoryError e) {
-                throw new IOException("cannot allocate " + length + " bytes of direct memory for tensor "
-                        + info.name() + " with " + TensorReadMode.PROP_DISABLE_MMAP
-                        + "=true; raise -XX:MaxDirectMemorySize or use mmap", e);
-            }
-            while (buf.hasRemaining()) {
-                if (ch.read(buf, start + buf.position()) < 0) {
-                    throw new EOFException("tensor " + info.name() + " ends at byte " + (start + buf.position())
-                            + " of " + description + ", before its " + length + " bytes");
-                }
-            }
-            buf.flip();
-            return buf;
-        }
-
-        @Override
-        public void close() throws IOException {
-            IOException first = null;
-            for (FileChannel ch : channels) {
-                try {
-                    if (ch != null) {
-                        ch.close();
-                    }
-                } catch (IOException e) {
-                    if (first == null) {
-                        first = e;
-                    } else {
-                        first.addSuppressed(e);
-                    }
-                }
-            }
-            if (first != null) {
-                throw first;
-            }
-        }
-
-        private static void closeAll(FileChannel[] channels, Exception cause) {
-            for (FileChannel ch : channels) {
-                if (ch != null) {
-                    try {
-                        ch.close();
-                    } catch (IOException e) {
-                        cause.addSuppressed(e);
-                    }
-                }
-            }
-        }
-
-        @Override
-        public String toString() {
-            return description;
-        }
+        return "CpuWeights{" + archName() + ", " + regions.description() + ", loaded=" + views.size() + "}";
     }
 }

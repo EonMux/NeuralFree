@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot.QuantizedActivations;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.quant.InputTransform;
 
 import java.util.Collections;
 import java.util.EnumMap;
@@ -19,19 +20,23 @@ import java.util.Set;
  *
  * <p>Per call, each token's activation row is
  * <ol>
- *   <li>transformed by the weight's PRISM input Hadamard when it has one ({@code build_hadamard_input},
- *       llama-graph.cpp:1598-1626, through {@link CpuHadamard});</li>
+ *   <li>transformed by the weight's input transform ({@link InputTransform}) when it has one, in the §AQ-1 order
+ *       HADAMARD (the PRISM or compressed-tensors rotation, {@code build_hadamard_input},
+ *       llama-graph.cpp:1598-1626, through {@link CpuHadamard}) → ACT_QUANT (the checkpoint's
+ *       fake-quantization, {@link com.eonmux.neuralfree.gguf.quant.ActFakeQuant}) → PERMUTE (the act-order gather
+ *       {@code y[k] = x[perm[k]]});</li>
  *   <li>quantized once into the weight type's {@code vec_dot_type} ({@link CpuActivationQuantizer});</li>
  *   <li>dotted with every requested weight row by the type's {@link CpuVecDot};</li>
  * </ol>
  * and the outputs are multiplied by the weight's output scale {@code w_s} when it has one (per tensor, or per expert
  * for 3-D expert tensors; llama-graph.cpp:1643-1645, 1722-1729). Work is sharded on weight rows over
- * {@link CpuParallel}, so every row is read once per call whatever the token count.</p>
+ * {@link CpuParallel}, so every row is read once per call whatever the token count. The input the caller hands over
+ * is never modified: a transform that acts in place (ACT_QUANT) works on this call's scratch.</p>
  *
  * <p>Transforms are looked up per weight through the {@link TransformSource} the instance was built with
- * ({@code CpuWeights} binds the PRISM and {@code .scale} tensors of the model); {@link #PLAIN} applies none.
- * Instances are immutable and thread-safe. Each call allocates its activation blocks (and the rotated input when a
- * Hadamard applies); weights are never copied.</p>
+ * ({@code CpuWeights} binds the loaded {@link InputTransform} results and the {@code .scale} tensors of the model);
+ * {@link #PLAIN} applies none. Instances are immutable and thread-safe. Each call allocates its activation blocks
+ * (and the scratch of the transform parts); weights are never copied.</p>
  *
  * <p>Layouts are row-major: token {@code t}'s input row starts at {@code x[xOff + t*xStride]} and holds
  * {@code w.cols()} values; its output row starts at {@code y[yOff + t*yStride]}.</p>
@@ -64,26 +69,26 @@ public final class CpuMatVec {
     }
 
     /**
-     * The per-weight transforms of one matmul weight: the PRISM input Hadamard, the output scale {@code w_s}, and the
-     * expert count of a 3-D expert tensor. Immutable.
+     * The per-weight transforms of one matmul weight: its full input transform ({@link InputTransform}), the output
+     * scale {@code w_s}, and the expert count of a 3-D expert tensor. Immutable.
      */
     public static final class Transforms {
 
         /** No input transform, no output scale, not an expert tensor. */
-        public static final Transforms NONE = new Transforms(null, null, 0);
+        public static final Transforms NONE = new Transforms(InputTransform.IDENTITY, null, 0);
 
-        private final HadamardSpec input;
+        private final InputTransform transform;
         private final float[] scale;
         private final int experts;
 
-        private Transforms(HadamardSpec input, float[] scale, int experts) {
-            this.input = input;
+        private Transforms(InputTransform transform, float[] scale, int experts) {
+            this.transform = transform;
             this.scale = scale;
             this.experts = experts;
         }
 
         /**
-         * Transforms of one weight.
+         * Transforms of one weight with a HADAMARD-alone input transform ({@link #from} without it).
          *
          * @param input   PRISM input Hadamard, or null
          * @param scale   output scale {@code w_s}: null, one value for the whole tensor, or one value per expert
@@ -92,6 +97,19 @@ public final class CpuMatVec {
          *                                  scale value
          */
         public static Transforms of(HadamardSpec input, float[] scale, int experts) {
+            return from(InputTransform.of(input, null, null), scale, experts);
+        }
+
+        /**
+         * Transforms of one weight.
+         *
+         * @param transform the full input transform ({@link InputTransform#IDENTITY} or null when the weight has one)
+         * @param scale     output scale {@code w_s}: null, one value for the whole tensor, or one value per expert
+         * @param experts   number of experts of a 3-D expert tensor ({@code ne[2]}), or 0 for a 2-D weight
+         * @throws IllegalArgumentException for a negative expert count, a scale of another length, or a non-finite
+         *                                  scale value
+         */
+        public static Transforms from(InputTransform transform, float[] scale, int experts) {
             if (experts < 0) {
                 throw new IllegalArgumentException("expert count must be non-negative, got " + experts);
             }
@@ -108,15 +126,21 @@ public final class CpuMatVec {
                 }
                 s = scale.clone();
             }
-            if (input == null && s == null && experts == 0) {
+            InputTransform t = transform == null ? InputTransform.IDENTITY : transform;
+            if (t.isIdentity() && s == null && experts == 0) {
                 return NONE;
             }
-            return new Transforms(input, s, experts);
+            return new Transforms(t, s, experts);
         }
 
-        /** PRISM input Hadamard, or null. */
+        /** The full input transform ({@link InputTransform#IDENTITY} when there is none). */
+        public InputTransform transform() {
+            return transform;
+        }
+
+        /** The HADAMARD part of the input transform, or null. */
         public HadamardSpec input() {
-            return input;
+            return transform.hadamard();
         }
 
         /** True when outputs are multiplied by a scale. */
@@ -139,7 +163,8 @@ public final class CpuMatVec {
 
         @Override
         public String toString() {
-            return "Transforms{input=" + input + ", scale=" + (scale == null ? "none" : scale.length + " value(s)")
+            return "Transforms{transform=" + (transform.isIdentity() ? "identity" : transform)
+                    + ", scale=" + (scale == null ? "none" : scale.length + " value(s)")
                     + ", experts=" + experts + "}";
         }
     }
@@ -171,6 +196,9 @@ public final class CpuMatVec {
         }
         for (GGMLType t : Fp16VecDot.supportedTypes()) {
             put(m, t, Fp16VecDot.forType(t));
+        }
+        for (GGMLType t : ExtVecDot.supportedTypes()) {
+            put(m, t, ExtVecDot.forType(t));
         }
         return Collections.unmodifiableMap(m);
     }
@@ -305,8 +333,19 @@ public final class CpuMatVec {
         }
         CpuVecDot dot = vecDot(w.type());
         Transforms t = transformsOf(w);
-        QuantizedActivations[] acts = prepare(w.type(), t.input(), x, xOff, xStride, cols, nTokens);
+        InputTransform transform = t.transform();
         long perExpert = t.experts() > 0 ? w.rows() / t.experts() : 0L;
+        InputTransform.ActQuant actQuant = transform.actQuant();
+        int actExpert = 0;
+        if (perExpert > 0 && actQuant != null && actQuant.entries() > 1) {
+            if (rowCount > perExpert || rowStart / perExpert != (rowStart + rowCount - 1) / perExpert) {
+                throw new IllegalArgumentException("rows [" + rowStart + ", " + (rowStart + rowCount)
+                        + ") span several of the " + t.experts() + " experts of " + w
+                        + "; its activation scheme fake-quantizes the input per expert");
+            }
+            actExpert = (int) (rowStart / perExpert);
+        }
+        QuantizedActivations[] acts = prepare(w.type(), transform, actExpert, x, xOff, xStride, cols, nTokens);
         int grain = (int) Math.max(1L, MIN_TASK_WORK / ((long) cols * nTokens));
         CpuParallel.parallelFor(rowCount, grain, (from, to) -> {
             int n = to - from;
@@ -326,12 +365,19 @@ public final class CpuMatVec {
         });
     }
 
-    /** Applies the input Hadamard (when present) and quantizes each token's row for the weight type. */
-    private static QuantizedActivations[] prepare(GGMLType type, HadamardSpec hadamard, float[] x, int xOff,
-                                                  int xStride, int cols, int nTokens) {
+    /**
+     * Applies the input transform (§AQ-1: HADAMARD → ACT_QUANT → PERMUTE) when it is not
+     * {@link InputTransform#isIdentity() identity} and quantizes each token's row for the weight type. The identity
+     * and HADAMARD-alone paths are today's unchanged code path: a model without the transform tensors and keys runs
+     * exactly the code the PRISM support ran. The ACT_QUANT fake-quantization (per token row, in runs of the
+     * scheme) and the PERMUTE gather of that row both read this call's scratch, never the caller's input.
+     */
+    private static QuantizedActivations[] prepare(GGMLType type, InputTransform transform, int actExpert, float[] x,
+                                                  int xOff, int xStride, int cols, int nTokens) {
         float[] src = x;
         int srcOff = xOff;
         int srcStride = xStride;
+        HadamardSpec hadamard = transform.hadamard();
         if (hadamard != null) {
             float[] rotated = new float[Math.multiplyExact(nTokens, cols)];
             if (nTokens == 1 || xStride == cols) {
@@ -345,6 +391,46 @@ public final class CpuMatVec {
             srcOff = 0;
             srcStride = cols;
         }
+        InputTransform.ActQuant actQuant = transform.actQuant();
+        int[] perm = transform.perm();
+        if (actQuant == null && perm == null) {
+            return quantizeRows(type, src, srcOff, srcStride, cols, nTokens);
+        }
+        if (actQuant != null && src == x) {
+            src = copyRows(x, xOff, xStride, nTokens, cols);
+            srcOff = 0;
+            srcStride = cols;
+        }
+        QuantizedActivations[] acts = new QuantizedActivations[nTokens];
+        final float[] s = src;
+        final int so = srcOff;
+        final int ss = srcStride;
+        final float[] gathered = perm == null ? null : new float[Math.multiplyExact(nTokens, cols)];
+        final InputTransform.ActQuant q = actQuant;
+        final int[] p = perm;
+        CpuParallel.parallelFor(nTokens, 1, (from, to) -> {
+            for (int tok = from; tok < to; tok++) {
+                int row = so + tok * ss;
+                if (q != null) {
+                    q.apply(s, row, 1, cols, actExpert);
+                }
+                int actOff = row;
+                if (gathered != null) {
+                    int d = tok * cols;
+                    for (int k = 0; k < cols; k++) {
+                        gathered[d + k] = s[row + p[k]];
+                    }
+                    actOff = d;
+                }
+                acts[tok] = CpuActivationQuantizer.quantizeFor(type, gathered != null ? gathered : s, actOff, cols);
+            }
+        });
+        return acts;
+    }
+
+    /** The unchanged quantization of each token's row for {@code type}. */
+    private static QuantizedActivations[] quantizeRows(GGMLType type, float[] src, int srcOff, int srcStride,
+                                                       int cols, int nTokens) {
         QuantizedActivations[] acts = new QuantizedActivations[nTokens];
         final float[] s = src;
         final int so = srcOff;
@@ -355,6 +441,15 @@ public final class CpuMatVec {
             }
         });
         return acts;
+    }
+
+    /** {@code rows} rows of {@code cols} elements from a strided source, packed back to back. */
+    private static float[] copyRows(float[] x, int xOff, int xStride, int rows, int cols) {
+        float[] buf = new float[Math.multiplyExact(rows, cols)];
+        for (int r = 0; r < rows; r++) {
+            System.arraycopy(x, xOff + r * xStride, buf, r * cols, cols);
+        }
+        return buf;
     }
 
     private static float rowScale(Transforms t, long perExpert, long row) {

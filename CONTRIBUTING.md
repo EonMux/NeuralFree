@@ -41,6 +41,24 @@ The kernels live in two libraries, `llm` (the GGUF engine) and `train` (the trai
 
 Check kernel changes with `./gradlew inventoryCheck verifyGpuKernels`. Adding `-Pneuralfree.cuda.archs=75 -Pneuralfree.cuda.ptxOnly=true` makes the CUDA part a quick PTX-only compile check.
 
+### Generated HF tables
+
+`src/main/resources/hf` holds the data half of llama.cpp's HF-to-GGUF converter as checked-in resources: the architecture rows (`archs.tsv`, `dynamic_archs.tsv`), the tensor-name patterns, the GGUF writer keys, the hyperparameter aliases, the pre-tokenizer hashes, the tensor filters, and byte copies of the converter's bundled chat templates and built-in vocabularies. They are generated, not edited by hand:
+
+```bash
+./gradlew updateHfTables -PllamaCpp=<dir>   # <dir> is a llama.cpp checkout
+```
+
+- `updateHfTables` runs `gradle/hfgen/hfgen.py` on the checkout with an isolated Python (`python3 -I`, standard library only; llama.cpp is never imported), parses the converter sources, stages the tables, validates them, and replaces `src/main/resources/hf` with the result (the previous directory is moved aside and restored on failure). It needs git (to record the checkout's commit) and Python 3.9+, and warns when the checkout has local changes under the paths the tables are generated from. `-Pneuralfree.python` and `-Pneuralfree.git` point at the interpreters.
+- Do not edit the generated files. Every one of them starts with a `# ... do not edit` header naming the source commit and the row count. After a llama.cpp update, regenerate and commit the whole directory (including `manifest.tsv`, generated last).
+
+`verifyHfTables` (Groovy, in `buildSrc`; `processResources` depends on it) checks the checked-in directory on every build without Python:
+- every table's header line — file name, source commit, recorded row count — and every row's column count and values against the table's declared format;
+- the file set itself (missing, unexpected or empty);
+- the byte copies (`templates/*.jinja`, `vocab/*.gguf`), and every other file's size and sha256, against `src/main/resources/hf/manifest.tsv`.
+
+A build fails here when a stale or hand-edited table is checked in; regenerate with `updateHfTables` instead of editing the table.
+
 ## Tests
 
 - Tests use JUnit 4 and live under `src/test/java`, in the package of the class they test.

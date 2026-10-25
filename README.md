@@ -1,10 +1,10 @@
 # NeuralFree
 
-NeuralFree is a hardware-accelerated deep learning library written in Java. It runs GGUF language models and trains models of its own on OpenCL, CUDA and Vulkan GPUs, with CPU fallbacks, without Python or native ML libraries.
+NeuralFree is a hardware-accelerated deep learning library written in Java. It runs GGUF language models and trains models of its own on OpenCL, CUDA and Vulkan GPUs, with CPU fallbacks, without Python or native ML libraries. It also opens Hugging Face checkpoints (safetensors) directly, with no Python and no conversion step.
 
 It has two parts:
 
-1. **A GGUF inference engine** (`com.eonmux.neuralfree.gguf`). It loads `*.gguf` models and runs them on a GPU or the CPU. It follows [llama.cpp](https://github.com/ggml-org/llama.cpp) for:
+1. **A GGUF inference engine** (`com.eonmux.neuralfree.gguf`). It loads `*.gguf` models and Hugging Face checkpoint directories and runs them on a GPU or the CPU. It follows [llama.cpp](https://github.com/ggml-org/llama.cpp) for:
    - architectures (every architecture name llama.cpp defines);
    - quantization formats;
    - tokenizers and chat templates;
@@ -97,6 +97,10 @@ It has not been validated by running models on GPU hardware. The limitations the
 - **llama.cpp's sampler chain** and defaults.
 - **Context sizing:** the context is fitted to device memory automatically, and layer weights stream from host memory when VRAM is short.
 
+### Hugging Face checkpoints
+
+The same engine opens a Hugging Face checkpoint directory (`config.json` plus `*.safetensors` files, or a Mistral native `params.json` plus `consolidated*.safetensors` checkpoint) wherever it opens a GGUF file, with no Python and no offline conversion. The loader presents exactly what llama.cpp's `convert_hf_to_gguf.py` would write — the same metadata keys and value types, the same tensor names, shapes and types, and byte-equal tensor values — so quantized weights, tokenizers, chat templates, LoRA adapters, draft models and GGUF export go through the code the GGUF path already has. [USAGE.md](USAGE.md#hugging-face-checkpoints) is the reference: the flags, the properties, the supported quantization formats and the supported `architectures[0]` names. [LLM-INFERENCE.md](LLM-INFERENCE.md#model-sources) describes the `ModelSource` seam and the loading pipeline.
+
 ## Requirements
 
 - **JDK 11 or newer.** The Gradle wrapper (`./gradlew`) downloads Gradle 8.14.4.
@@ -146,6 +150,9 @@ cd NeuralFree
 ./gradlew runLLMDemo -Pargs="--model /path/to/model.gguf --prompt 'Explain recursion' --temp 0"
 ./gradlew runLLMDemo -Pargs="--model /path/to/model.gguf"
 ./gradlew runLLMDemo -Pargs="--model /path/to/model.gguf --prompt 'Hi' --cpu"
+
+# GGUF engine on a Hugging Face checkpoint directory (no conversion step)
+./gradlew runLLMDemo -Pargs="--model /path/to/Qwen3-4B --prompt 'Explain recursion' --temp 0"
 ```
 
 `./gradlew build` also runs the unit tests; tests that need a GPU API the machine lacks are skipped.
@@ -276,7 +283,7 @@ The build writes the CUDA modules and the SPIR-V under `build/generated/gpu`, an
   - the build, the GPU kernel tools and the kernel libraries;
   - backend selection;
   - how the training framework uses a GPU backend;
-  - every `LLMDemo` flag and `neuralfree.*` property;
+  - every `LLMDemo` flag and `neuralfree.*` property, including the Hugging Face checkpoint flags and properties, materialization, activation quantization, supported quantization formats and supported architectures;
   - troubleshooting.
 - [TRAINING.md](TRAINING.md): the training framework's API:
   - [Tensors](TRAINING.md#tensors) and [Autograd](TRAINING.md#autograd);
@@ -316,6 +323,8 @@ NeuralFree is licensed under the [NeuralFree License](LICENSE): the Apache Licen
 ## Acknowledgements
 
 NeuralFree's GGUF engine follows [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp) by the ggml authors: its architectures, quantization formats and tables, tokenizers, chat handling and sampler are ported from them. It also includes code derived from:
+- [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) (the NF4/FP4 codebooks);
+- the [vLLM](https://github.com/vllm-project/vllm) quantization kernels (activation-quantization schemes, KV-scale remapping);
 - the [YaRN](https://github.com/jquesnelle/yarn) reference implementation by Jeffrey Quesnelle and Bowen Peng (RoPE scaling);
 - the [JCuda](https://github.com/jcuda/jcuda-samples) and [JOCL](https://github.com/gpu/JOCLSamples) samples by Marco Hutter (device queries);
 - [Jinja2](https://github.com/pallets/jinja) by Pallets (the `indent` filter);

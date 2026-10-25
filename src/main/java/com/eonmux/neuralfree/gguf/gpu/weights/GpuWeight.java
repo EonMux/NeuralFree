@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.gpu.weights;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.quant.InputTransform;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -25,7 +26,11 @@ import java.util.Objects;
  * of a folded weight (llama-graph.cpp:1598-1626); {@link #inverseHadamard()} is the transform {@code D*(H*z)}
  * applied to rows looked up from a latent embedding table (llama-graph.cpp:2683-2690). {@link #scale()} is
  * the per-tensor output scale {@code w_s} ({@code <tensor>.scale}, llama-graph.cpp:1643-1645), 1 when
- * absent.</p>
+ * absent. {@link #inputTransform()} is the full input transform chain HADAMARD &rarr; ACT_QUANT &rarr; PERMUTE
+ * ({@link InputTransform}) of the matmul input (vLLM's compressed-tensors input transform before the quantization
+ * method and the act-order gather); its HADAMARD part is what {@link #hadamard()} returns, and {@link
+ * #inputPerm()} is the read-only device int buffer of the {@code <base>.input_perm} tensor the PERMUTE gather
+ * runs over.</p>
  *
  * <p>Immutable. The shard buffers belong to whoever uploaded the tensor (the weight uploader); a {@code GpuWeight}
  * never closes them.</p>
@@ -44,10 +49,12 @@ public final class GpuWeight {
     private final HadamardSpec hadamard;
     private final HadamardSpec inverseHadamard;
     private final float scale;
+    private final InputTransform inputTransform;
+    private final GpuBuffer inputPerm;
 
     private GpuWeight(String name, GGMLType type, long[] ne, long rows, long cols, long rowBytes, GpuBuffer[] shards,
                       long[] shardRowStart, long[] shardRows, HadamardSpec hadamard, HadamardSpec inverseHadamard,
-                      float scale) {
+                      float scale, InputTransform inputTransform, GpuBuffer inputPerm) {
         this.name = name;
         this.type = type;
         this.ne = ne;
@@ -60,6 +67,8 @@ public final class GpuWeight {
         this.hadamard = hadamard;
         this.inverseHadamard = inverseHadamard;
         this.scale = scale;
+        this.inputTransform = inputTransform;
+        this.inputPerm = inputPerm;
     }
 
     /**
@@ -131,7 +140,8 @@ public final class GpuWeight {
         if (next != rows) {
             throw new IllegalArgumentException("tensor " + name + ": shards hold " + next + " rows, the tensor has " + rows);
         }
-        return new GpuWeight(name, type, shape, rows, cols, rowBytes, bufs, starts, counts, null, null, 1.0f);
+        return new GpuWeight(name, type, shape, rows, cols, rowBytes, bufs, starts, counts, null, null, 1.0f, null,
+                null);
     }
 
     private static long[] checkShape(String name, GGMLType type, long[] ne) {
@@ -177,7 +187,7 @@ public final class GpuWeight {
         Objects.requireNonNull(forward, "forward");
         checkTransform(forward, "input");
         return new GpuWeight(name, type, ne, rows, cols, rowBytes, shards, shardRowStart, shardRows, forward,
-                inverseHadamard, scale);
+                inverseHadamard, scale, null, null);
     }
 
     /**
@@ -190,7 +200,60 @@ public final class GpuWeight {
         Objects.requireNonNull(inverse, "inverse");
         checkTransform(inverse, "lookup");
         return new GpuWeight(name, type, ne, rows, cols, rowBytes, shards, shardRowStart, shardRows, hadamard,
-                inverse, scale);
+                inverse, scale, inputTransform, inputPerm);
+    }
+
+    /**
+     * This tensor with the full input transform chain of its matmul input; the tensor is left unchanged for
+     * {@link InputTransform#IDENTITY}.
+     *
+     * @throws IllegalArgumentException when the transform does not fit the row width, its PERMUTE part lacks a
+     *                                  device buffer, its block exceeds what the {@value HadamardSpec#KERNEL}
+     *                                  kernel supports, or it would sit beside a {@link #withHadamard(HadamardSpec)
+     *                                  directly attached} rotation
+     */
+    public GpuWeight withInputTransform(InputTransform t) {
+        return withInputTransform(t, null);
+    }
+
+    /**
+     * {@link #withInputTransform(InputTransform)} with the device int buffer of the {@code <base>.input_perm}
+     * tensor the PERMUTE gather reads; the buffer belongs to whoever uploaded it.
+     *
+     * @throws IllegalArgumentException when {@code t} has a PERMUTE part and {@code perm} is null, or when a
+     *                                  PERMUTE part is absent and {@code perm} is given
+     */
+    public GpuWeight withInputTransform(InputTransform t, GpuBuffer perm) {
+        if (t == null || t.isIdentity()) {
+            return this;
+        }
+        if (hadamard != null && t.hadamard() != null) {
+            throw new IllegalArgumentException("tensor " + name + " already had a PRISM Hadamard transform attached;"
+                    + " a " + t + " would rotate twice");
+        }
+        if (cols > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("tensor " + name + ": row width " + cols
+                    + " is too wide for an input transform");
+        }
+        t.requireWidth((int) cols);
+        if (t.hadamard() != null) {
+            checkTransform(t.hadamard(), "input");
+        }
+        if (t.hasPerm()) {
+            if (perm == null) {
+                throw new IllegalArgumentException("tensor " + name + ": its " + t + " needs the device buffer of"
+                        + " the tensor " + permNameOf(name));
+            }
+            if ((long) cols * Integer.BYTES > perm.sizeInBytes()) {
+                throw new IllegalArgumentException("tensor " + name + ": the input permutation needs "
+                        + cols + " ints, its buffer holds " + perm.sizeInBytes() / Integer.BYTES);
+            }
+        } else if (perm != null) {
+            throw new IllegalArgumentException("tensor " + name + " was given an input permutation buffer without"
+                    + " a PERMUTE part");
+        }
+        return new GpuWeight(name, type, ne, rows, cols, rowBytes, shards, shardRowStart, shardRows, hadamard,
+                inverseHadamard, scale, t, perm);
     }
 
     private void checkTransform(HadamardSpec spec, String role) {
@@ -216,7 +279,7 @@ public final class GpuWeight {
             throw new IllegalArgumentException("tensor " + name + ": output scale " + s + " is not finite");
         }
         return new GpuWeight(name, type, ne, rows, cols, rowBytes, shards, shardRowStart, shardRows, hadamard,
-                inverseHadamard, s);
+                inverseHadamard, s, inputTransform, inputPerm);
     }
 
     public String name() { return name; }
@@ -264,13 +327,35 @@ public final class GpuWeight {
     }
 
     /** PRISM transform of the matmul input, or null. */
-    public HadamardSpec hadamard() { return hadamard; }
+    public HadamardSpec hadamard() { return hadamard != null ? hadamard : transformHadamard(); }
     /** Transform of rows looked up from this table, or null. */
     public HadamardSpec inverseHadamard() { return inverseHadamard; }
     /** Per-tensor output scale; 1 when the tensor has none. */
     public float scale() { return scale; }
     /** True when outputs are multiplied by {@link #scale()}. */
     public boolean hasScale() { return scale != 1.0f; }
+
+    /**
+     * The full input transform chain of the matmul input (HADAMARD, ACT_QUANT, PERMUTE), or null: the transform the
+     * uploader attaches over {@link #withInputTransform(InputTransform, GpuBuffer)}. Its HADAMARD part is what
+     * {@link #hadamard()} returns.
+     */
+    public InputTransform inputTransform() { return inputTransform; }
+
+    /** True when the matmul input takes a non-identity input transform. */
+    public boolean hasInputTransform() { return inputTransform != null; }
+
+    /** Device int buffer of the {@code <base>.input_perm} tensor, or null; belongs to its uploader. */
+    public GpuBuffer inputPerm() { return inputPerm; }
+
+    private HadamardSpec transformHadamard() { return inputTransform != null ? inputTransform.hadamard() : null; }
+
+    /** The {@code .input_perm} sibling tensor name of a projection weight. */
+    static String permNameOf(String weightName) {
+        return (weightName.endsWith(".weight")
+                ? weightName.substring(0, weightName.length() - ".weight".length()) : weightName)
+                + ".input_perm";
+    }
 
     private int checkShard(int i) {
         if (i < 0 || i >= shards.length) {
@@ -287,11 +372,14 @@ public final class GpuWeight {
         if (shards.length > 1) {
             sb.append(", shards=").append(Arrays.toString(shardRows));
         }
-        if (hadamard != null) {
-            sb.append(", hadamard=").append(hadamard);
+        if (hadamard() != null) {
+            sb.append(", hadamard=").append(hadamard());
         }
         if (inverseHadamard != null) {
             sb.append(", inverseHadamard=").append(inverseHadamard);
+        }
+        if (inputTransform != null) {
+            sb.append(", ").append(inputTransform);
         }
         if (hasScale()) {
             sb.append(", scale=").append(scale);

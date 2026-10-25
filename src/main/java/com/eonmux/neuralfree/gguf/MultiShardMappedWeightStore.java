@@ -4,55 +4,76 @@ import com.eonmux.neuralfree.utils.LoggingUtil;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Objects;
 
 /**
- * {@link WeightStore} implementation that spans multiple GGUF shard files.
+ * {@link WeightStore} over the {@link DataSegment}s of several files, such as the splits of a GGUF model.
  *
- * <p>Tensor offsets (as stored in {@link GGUFTensorInfo#offset()}) are in a unified
- * logical address space where shard N's tensors are offset by the cumulative data
- * length of all preceding shards.  Reads are dispatched to the correct per-shard
- * {@link MappedWeightStore} by binary-searching {@code shardBaseOffsets}.</p>
+ * <p>Tensor offsets (as stored in {@link GGUFTensorInfo#offset()}) are in one virtual address space in which segment
+ * {@code i} holds {@code [virtualBase, virtualEnd)}. Reads are dispatched to the {@link MappedWeightStore} of the
+ * segment holding the offset by binary search over the segment bases. Segments without data (header-only splits)
+ * open no store.</p>
  */
 public final class MultiShardMappedWeightStore implements WeightStore {
 
     private final MappedWeightStore[] shards;
-    /**
-     * shardBaseOffsets[i] = sum of shards[0..i-1] data lengths.
-     * shardBaseOffsets[0] is always 0.
-     */
+    /** Virtual base of each segment, in increasing order. */
     private final long[] shardBaseOffsets;
+    private final DataSegment[] segments;
 
     /**
-     * @param shardPaths       path to each shard file (length = splitCount)
-     * @param fileDataOffsets  byte offset within each file where the data section starts
-     * @param virtualBaseOffsets cumulative virtual offset for each shard (index 0 = 0)
-     * @param shardDataLengths  byte length of each shard's data section
+     * Maps every segment that holds data.
+     *
+     * @param segments the segments in increasing, non-overlapping virtual order
+     * @throws IllegalArgumentException when there are no segments or they are out of order or overlap
+     * @throws IOException              when a file cannot be opened
      */
-    public MultiShardMappedWeightStore(
-            String[] shardPaths,
-            long[] fileDataOffsets,
-            long[] virtualBaseOffsets,
-            long[] shardDataLengths) throws IOException {
-
-        int n = shardPaths.length;
-        this.shards = new MappedWeightStore[n];
-        this.shardBaseOffsets = virtualBaseOffsets.clone();
+    public MultiShardMappedWeightStore(List<DataSegment> segments) throws IOException {
+        Objects.requireNonNull(segments, "segments");
+        DataSegment[] segs = segments.toArray(new DataSegment[0]);
+        if (segs.length == 0) {
+            throw new IllegalArgumentException("a multi-segment weight store needs at least one data segment");
+        }
+        long[] bases = new long[segs.length];
+        for (int i = 0; i < segs.length; i++) {
+            Objects.requireNonNull(segs[i], "data segment " + i);
+            if (i > 0 && segs[i].virtualBase() < segs[i - 1].virtualEnd()) {
+                throw new IllegalArgumentException("data segment " + i + " (" + segs[i] + ") starts before the end"
+                        + " of segment " + (i - 1) + " (" + segs[i - 1] + ")");
+            }
+            bases[i] = segs[i].virtualBase();
+        }
+        this.segments = segs;
+        this.shardBaseOffsets = bases;
+        this.shards = new MappedWeightStore[segs.length];
 
         int emptyShards = 0;
-        for (int i = 0; i < n; i++) {
-            if (shardDataLengths[i] > 0) {
-                shards[i] = new MappedWeightStore(shardPaths[i], fileDataOffsets[i], shardDataLengths[i]);
+        try {
+            for (int i = 0; i < segs.length; i++) {
+                if (segs[i].dataLength() > 0) {
+                    shards[i] = new MappedWeightStore(segs[i].path(), segs[i].fileDataOffset(), segs[i].dataLength());
+                } else {
+                    emptyShards++;
+                }
             }
-            // else: shards[i] stays null — header-only shard, never accessed during reads
-            else {
-                emptyShards++;
+        } catch (IOException | RuntimeException e) {
+            for (MappedWeightStore opened : shards) {
+                if (opened != null) {
+                    try {
+                        opened.close();
+                    } catch (IOException closeFailure) {
+                        e.addSuppressed(closeFailure);
+                    }
+                }
             }
+            throw e;
         }
 
         String extra = emptyShards > 0 ? " (" + emptyShards + " header-only shard(s) skipped)" : "";
         LoggingUtil.getLogger(this).info(
                 "MultiShardMappedWeightStore: {} shards, total virtual address space {} MB{}",
-                n, (virtualBaseOffsets[n - 1] + shardDataLengths[n - 1]) / (1024 * 1024), extra);
+                segs.length, segs[segs.length - 1].virtualEnd() / (1024 * 1024), extra);
     }
 
     @Override
@@ -64,14 +85,23 @@ public final class MultiShardMappedWeightStore implements WeightStore {
     public void readTensor(long globalOffset, int size, byte[] dst, int dstOffset) throws IOException {
         int shard = findShard(globalOffset);
         long localOffset = globalOffset - shardBaseOffsets[shard];
-        shards[shard].readTensor(localOffset, size, dst, dstOffset);
+        storeOf(shard, globalOffset, size).readTensor(localOffset, size, dst, dstOffset);
     }
 
     @Override
     public void readTensorDirect(long globalOffset, int size, ByteBuffer dst) throws IOException {
         int shard = findShard(globalOffset);
         long localOffset = globalOffset - shardBaseOffsets[shard];
-        shards[shard].readTensorDirect(localOffset, size, dst);
+        storeOf(shard, globalOffset, size).readTensorDirect(localOffset, size, dst);
+    }
+
+    /** The store of {@code shard}, which must hold {@code [globalOffset, globalOffset + size)}. */
+    private MappedWeightStore storeOf(int shard, long globalOffset, int size) throws IOException {
+        if (!segments[shard].contains(globalOffset, size) || shards[shard] == null) {
+            throw new IOException("bytes [" + globalOffset + ", +" + size + ") do not lie inside one data segment;"
+                    + " the nearest is " + segments[shard]);
+        }
+        return shards[shard];
     }
 
     /** Returns a defensive copy of the shard base offset array (for diagnostics). */

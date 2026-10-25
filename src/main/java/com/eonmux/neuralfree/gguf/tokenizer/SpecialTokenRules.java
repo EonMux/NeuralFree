@@ -149,7 +149,7 @@ final class SpecialTokenRules {
         ids[SEP] = d[3];
         ids[PAD] = d[4];
         ids[MASK] = d[5];
-        PreTokenizerRegistry.PreTokenizer pre = v.preTokenizer();
+        PreTokenizerRegistry.PreTokenizer pre = v.namedPreTokenizer();
         if (pre != null && pre.suppressBos()) ids[BOS] = NULL;
     }
 
@@ -215,10 +215,15 @@ final class SpecialTokenRules {
         }
     }
 
-    /** The end-of-generation set and its attribute side effects (3162-3313). Sorted ascending. */
+    /**
+     * The end-of-generation set and its attribute side effects (3162-3313), then the
+     * vocabulary's extra end-of-generation ids ({@link TokenizerVocab#extraEogIds()}), which
+     * always end generation. Sorted ascending.
+     */
     private static List<Integer> buildEog(TokenizerVocab v, int[] ids, int[] attrs) {
         int n = attrs.length;
-        PreTokenizerType preType = v.preTokenizer() != null ? v.preTokenizer().type() : PreTokenizerType.DEFAULT;
+        PreTokenizerRegistry.PreTokenizer pre = v.namedPreTokenizer();
+        PreTokenizerType preType = pre != null ? pre.type() : PreTokenizerType.DEFAULT;
         TreeSet<Integer> eog = new TreeSet<>();
         for (int slot : new int[]{FIM_PAD, FIM_REP, FIM_SEP}) {
             if (ids[slot] != NULL) eog.add(ids[slot]);
@@ -244,6 +249,7 @@ final class SpecialTokenRules {
         }
         removeHarmonyEnd(v, attrs, eog);
         removeNormalEndOfSentence(v, attrs, eog);
+        for (int id : v.extraEogIds()) eog.add(id);
         return Collections.unmodifiableList(new ArrayList<>(eog));
     }
 

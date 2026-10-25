@@ -2,13 +2,15 @@ package com.eonmux.neuralfree.gguf.quant;
 
 /**
  * Lookup tables of the ggml quantization formats, transcribed verbatim from
- * llama.cpp ggml/src/ggml-common.h (line numbers cited per table).
+ * llama.cpp ggml/src/ggml-common.h (line numbers cited per table), and the 4-bit codebooks of the
+ * bitsandbytes NF4 / FP4 formats behind the {@code NF4} and {@code FP4_BNB} extension types.
  * <p>
  * Grid entries pack 8 (uint64 tables) or 4 (uint32 tables) byte lanes, lane {@code j} in bits
  * {@code [8j, 8j+8)}, exactly as ggml reinterprets them through a {@code uint8_t*}/{@code int8_t*}.
  * The arrays are private; read them through the accessors so the tables stay immutable.
  * <p>
- * The table data is from llama.cpp/ggml (MIT License, Copyright (c) 2023-2026 The ggml authors); see
+ * The ggml table data is from llama.cpp/ggml (MIT License, Copyright (c) 2023-2026 The ggml authors); the NF4 and
+ * FP4 codebooks are from bitsandbytes 0.48.2 (MIT License, Copyright (c) Facebook, Inc. and its affiliates); see
  * THIRD-PARTY-NOTICES.md.
  */
 public final class QuantTables {
@@ -30,6 +32,30 @@ public final class QuantTables {
      */
     private static final byte[] KVALUES_FP4 = {
         0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12
+    };
+
+    /**
+     * NF4 codebook of bitsandbytes ({@code get_4bit_type("nf4")}, bitsandbytes/functional.py:733-750): the 16
+     * fp32 values as written there, already normalized to a largest magnitude of 1 ({@code data.div_(data.abs()
+     * .max())}, functional.py:793-794, leaves them unchanged).
+     */
+    private static final float[] NF4_CODE = {
+        -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+        -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+        0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+        0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f
+    };
+
+    /**
+     * FP4 codebook of bitsandbytes ({@code get_4bit_type("fp4")}): the raw list of bitsandbytes/functional.py:764,
+     * {@code {0, 0.0625, 8, 12, 4, 6, 2, 3, -0, -0.0625, -8, -12, -4, -6, -2, -3}}, divided in fp32 by its largest
+     * magnitude 12 ({@code data.div_(data.abs().max())}, functional.py:793-794).
+     */
+    private static final float[] FP4_BNB_CODE = {
+        0.0f / 12.0f, 0.0625f / 12.0f, 8.0f / 12.0f, 12.0f / 12.0f,
+        4.0f / 12.0f, 6.0f / 12.0f, 2.0f / 12.0f, 3.0f / 12.0f,
+        -0.0f / 12.0f, -0.0625f / 12.0f, -8.0f / 12.0f, -12.0f / 12.0f,
+        -4.0f / 12.0f, -6.0f / 12.0f, -2.0f / 12.0f, -3.0f / 12.0f
     };
 
     /** 7-bit index to 8-bit sign pattern with even parity ({@code ksigns_iq2xs}). llama.cpp ggml-common.h:513-522. */
@@ -1132,6 +1158,16 @@ public final class QuantTables {
     /** Returns {@code kvalues_fp4[i]} (doubled E2M1 value) for {@code i} in [0, 16). */
     public static int kvalueFp4(int i) {
         return KVALUES_FP4[i];
+    }
+
+    /** Returns the NF4 codebook value {@code i} (bitsandbytes, normalized to [-1, 1]) for {@code i} in [0, 16). */
+    public static float nf4Code(int i) {
+        return NF4_CODE[i];
+    }
+
+    /** Returns the FP4_BNB codebook value {@code i} (bitsandbytes FP4, normalized to [-1, 1]), {@code i} in [0, 16). */
+    public static float fp4BnbCode(int i) {
+        return FP4_BNB_CODE[i];
     }
 
     /** Returns {@code ksigns_iq2xs[i]} (an unsigned byte value) for {@code i} in [0, 128). */

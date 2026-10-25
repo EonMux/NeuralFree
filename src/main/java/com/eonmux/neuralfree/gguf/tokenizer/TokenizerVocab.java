@@ -1,6 +1,8 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
-import com.eonmux.neuralfree.gguf.GGUFFileParser;
+import com.eonmux.neuralfree.gguf.ModelSource;
+import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
+import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -9,6 +11,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * Immutable tokenizer vocabulary loaded from GGUF {@code tokenizer.*} metadata.
@@ -17,6 +20,11 @@ import java.util.Map;
  * type from {@code tokenizer.ggml.model}, token texts, scores and attributes, BPE merge ranks,
  * and the resolved encoding flags (type defaults, then pre-tokenizer flags, then GGUF overrides).
  * Special-token ids and end-of-generation sets live in {@link SpecialTokens}.</p>
+ *
+ * <p>Hugging Face behaviour that GGUF cannot express arrives through the optional
+ * {@code neuralfree.tokenizer.*} overlay keys ({@link GgufKeys#NF_TOKENIZER_TOKEN_ATTRS} and
+ * following), applied last. A vocabulary without them is exactly the llama.cpp one, and a NONE
+ * vocabulary reads none of them.</p>
  */
 public final class TokenizerVocab {
 
@@ -49,6 +57,8 @@ public final class TokenizerVocab {
     public static final int ATTR_LSTRIP = 1 << 7;
     public static final int ATTR_RSTRIP = 1 << 8;
     public static final int ATTR_SINGLE_WORD = 1 << 9;
+    /** Every defined attribute bit. */
+    static final int ATTR_ALL = (1 << 10) - 1;
 
     public static final String KEY_MODEL = "tokenizer.ggml.model";
     public static final String KEY_PRE = "tokenizer.ggml.pre";
@@ -69,6 +79,14 @@ public final class TokenizerVocab {
     public static final String KEY_ARCHITECTURE = "general.architecture";
     public static final String KEY_NAME = "general.name";
 
+    /** The overlay keys only BPE encoding reads. */
+    private static final String[] BPE_ONLY_KEYS = {
+            GgufKeys.NF_TOKENIZER_NORMALIZER, GgufKeys.NF_TOKENIZER_PRE_TOKENIZER,
+            GgufKeys.NF_TOKENIZER_BPE_IGNORE_MERGES, GgufKeys.NF_TOKENIZER_BPE_ADD_PREFIX_SPACE,
+            GgufKeys.NF_TOKENIZER_BPE_UNK_FUSE, GgufKeys.NF_TOKENIZER_BPE_BYTE_FALLBACK,
+            GgufKeys.NF_TOKENIZER_BPE_CONTINUING_SUBWORD_PREFIX, GgufKeys.NF_TOKENIZER_BPE_END_OF_WORD_SUFFIX,
+    };
+
     /** Marker suffix that keeps hybriddna k-mer tokens distinct (llama-vocab.cpp:1784). */
     static final String DNA_KMER_MARKER = "\uE000";
 
@@ -84,6 +102,7 @@ public final class TokenizerVocab {
     private final int mergeCount;
     private final byte[] precompiledCharsmap;
     private final PreTokenizerRegistry.PreTokenizer preTokenizer;
+    private final PreTokenizerRegistry.PreTokenizer namedPreTokenizer;
     private final Map<String, Object> metadata;
 
     private final boolean addSpacePrefix;
@@ -99,6 +118,20 @@ public final class TokenizerVocab {
     private final boolean normalizerLowercase;
     private final boolean normalizerStripAccents;
 
+    private final Normalizer normalizer;
+    private final TokenDecoder decoder;
+    private final PreTokenizerSpec.PrependScheme prependScheme;
+    private final int[] prefixIds;
+    private final int[] suffixIds;
+    private final int[] extraEogIds;
+    private final Boolean cleanUpTokenizationSpaces;
+    private final boolean bpeAddPrefixSpace;
+    private final boolean bpeModelOverlay;
+    private final boolean bpeUnkFuse;
+    private final Boolean bpeByteFallback;
+    private final String bpeContinuingSubwordPrefix;
+    private final String bpeEndOfWordSuffix;
+
     private TokenizerVocab(Loader l) {
         this.model = l.model;
         this.pre = l.pre;
@@ -112,6 +145,7 @@ public final class TokenizerVocab {
         this.mergeCount = l.mergeCount;
         this.precompiledCharsmap = l.precompiledCharsmap;
         this.preTokenizer = l.preTokenizer;
+        this.namedPreTokenizer = l.namedPreTokenizer;
         this.metadata = Collections.unmodifiableMap(l.metadata);
         this.addSpacePrefix = l.addSpacePrefix;
         this.removeExtraWhitespaces = l.removeExtraWhitespaces;
@@ -125,12 +159,25 @@ public final class TokenizerVocab {
         this.normalizerNfc = l.normalizerNfc;
         this.normalizerLowercase = l.normalizerLowercase;
         this.normalizerStripAccents = l.normalizerStripAccents;
+        this.normalizer = l.normalizer;
+        this.decoder = l.decoder;
+        this.prependScheme = l.prependScheme;
+        this.prefixIds = l.prefixIds;
+        this.suffixIds = l.suffixIds;
+        this.extraEogIds = l.extraEogIds;
+        this.cleanUpTokenizationSpaces = l.cleanUpTokenizationSpaces;
+        this.bpeAddPrefixSpace = l.bpeAddPrefixSpace;
+        this.bpeModelOverlay = l.bpeModelOverlay;
+        this.bpeUnkFuse = l.bpeUnkFuse;
+        this.bpeByteFallback = l.bpeByteFallback;
+        this.bpeContinuingSubwordPrefix = l.bpeContinuingSubwordPrefix;
+        this.bpeEndOfWordSuffix = l.bpeEndOfWordSuffix;
     }
 
-    /** Loads the vocabulary from an open GGUF file. */
-    public static TokenizerVocab fromGguf(GGUFFileParser parser) {
-        if (parser == null) throw new IllegalArgumentException("GGUF parser is null");
-        return fromMetadata(parser.getMetadata());
+    /** Loads the vocabulary from the {@code tokenizer.*} metadata of an open model. */
+    public static TokenizerVocab fromSource(ModelSource source) {
+        if (source == null) throw new IllegalArgumentException("model source is null");
+        return fromMetadata(source.getMetadata());
     }
 
     /**
@@ -200,8 +247,19 @@ public final class TokenizerVocab {
         return precompiledCharsmap != null ? precompiledCharsmap.clone() : null;
     }
 
-    /** The BPE pre-tokenizer; null for vocabulary types other than BPE. */
+    /**
+     * The BPE pre-tokenizer that splits text: the one built from
+     * {@link GgufKeys#NF_TOKENIZER_PRE_TOKENIZER} when present, else the registry one of
+     * {@code tokenizer.ggml.pre}; null for vocabulary types other than BPE.
+     */
     public PreTokenizerRegistry.PreTokenizer preTokenizer() { return preTokenizer; }
+
+    /**
+     * The registry pre-tokenizer of {@code tokenizer.ggml.pre}, whose llama.cpp flags the
+     * vocabulary and the special-token rules resolve from even when a spec overlay splits the
+     * text; null for vocabulary types other than BPE.
+     */
+    PreTokenizerRegistry.PreTokenizer namedPreTokenizer() { return namedPreTokenizer; }
 
     /**
      * Scalar tokenizer metadata: every {@code tokenizer.*} key except the bulk token arrays,
@@ -214,7 +272,16 @@ public final class TokenizerVocab {
     public boolean addSpacePrefix() { return addSpacePrefix; }
     public boolean removeExtraWhitespaces() { return removeExtraWhitespaces; }
     public boolean escapeWhitespaces() { return escapeWhitespaces; }
+    /**
+     * llama.cpp {@code clean_spaces}, applied by detokenization; false whenever
+     * {@link #cleanUpTokenizationSpaces()} is present, since the Hugging Face clean-up then
+     * replaces it.
+     */
     public boolean cleanSpaces() { return cleanSpaces; }
+    /**
+     * {@code ignore_merges}: a BPE word that is itself a token skips merging. The pre-tokenizer
+     * name's flag, overridden by {@link GgufKeys#NF_TOKENIZER_BPE_IGNORE_MERGES}.
+     */
     public boolean ignoreMerges() { return ignoreMerges; }
     public boolean addBos() { return addBos; }
     public boolean addEos() { return addEos; }
@@ -223,6 +290,80 @@ public final class TokenizerVocab {
     public boolean normalizerNfc() { return normalizerNfc; }
     public boolean normalizerLowercase() { return normalizerLowercase; }
     public boolean normalizerStripAccents() { return normalizerStripAccents; }
+
+    /**
+     * The Hugging Face normalizer chain BPE encoding applies to each text fragment
+     * ({@link GgufKeys#NF_TOKENIZER_NORMALIZER}); the identity when absent. Never null.
+     */
+    public Normalizer normalizer() { return normalizer; }
+
+    /**
+     * The Hugging Face decoder chain that replaces piece concatenation in detokenization
+     * ({@link GgufKeys#NF_TOKENIZER_DECODER}); null when absent.
+     */
+    public TokenDecoder decoder() { return decoder; }
+
+    /**
+     * When SPM encoding prefixes a fragment with a space ({@link GgufKeys#NF_TOKENIZER_PREPEND_SCHEME}):
+     * {@code ALWAYS} (the default, llama.cpp) at the start and after every special token,
+     * {@code FIRST} only at the start of the input when the text does not begin with a space,
+     * {@code NEVER} not at all.
+     */
+    public PreTokenizerSpec.PrependScheme prependScheme() { return prependScheme; }
+
+    /**
+     * The post-processor ids put before the text in place of BOS when special tokens are added
+     * ({@link GgufKeys#NF_TOKENIZER_PREFIX_IDS}); a copy, or null when absent.
+     */
+    public int[] prefixIds() { return prefixIds != null ? prefixIds.clone() : null; }
+
+    /**
+     * The post-processor ids put after the text in place of EOS when special tokens are added
+     * ({@link GgufKeys#NF_TOKENIZER_SUFFIX_IDS}); a copy, or null when absent.
+     */
+    public int[] suffixIds() { return suffixIds != null ? suffixIds.clone() : null; }
+
+    /**
+     * End-of-generation ids beyond EOS/EOT/EOM ({@link GgufKeys#NF_TOKENIZER_EXTRA_EOG_IDS}); a
+     * copy, empty when absent.
+     */
+    public int[] extraEogIds() { return extraEogIds.clone(); }
+
+    /**
+     * Hugging Face {@code clean_up_tokenization_spaces} ({@link GgufKeys#NF_TOKENIZER_CLEAN_SPACES}),
+     * applied after detokenization; null when absent, in which case {@link #cleanSpaces()} applies.
+     */
+    public Boolean cleanUpTokenizationSpaces() { return cleanUpTokenizationSpaces; }
+
+    /** BPE {@code add_prefix_space}: a space before each text fragment that does not start with one. */
+    public boolean bpeAddPrefixSpace() { return bpeAddPrefixSpace; }
+
+    /**
+     * True when any of {@link GgufKeys#NF_TOKENIZER_BPE_UNK_FUSE},
+     * {@link GgufKeys#NF_TOKENIZER_BPE_CONTINUING_SUBWORD_PREFIX} or
+     * {@link GgufKeys#NF_TOKENIZER_BPE_END_OF_WORD_SUFFIX} is present, or
+     * {@link GgufKeys#NF_TOKENIZER_BPE_BYTE_FALLBACK} is true: BPE words then merge as the Hugging
+     * Face BPE model does, with byte fallback or the unknown token for characters that are not
+     * tokens.
+     */
+    public boolean bpeModelOverlay() { return bpeModelOverlay; }
+
+    /** BPE {@code fuse_unk}: consecutive unknown characters become one unknown token. */
+    public boolean bpeUnkFuse() { return bpeUnkFuse; }
+
+    /**
+     * BPE {@code byte_fallback} ({@link GgufKeys#NF_TOKENIZER_BPE_BYTE_FALLBACK}): whether a
+     * character that is not a token becomes its {@code <0xXX>} byte tokens; null when absent, in
+     * which case encoding falls back to byte tokens whenever the pre-tokenizer does not
+     * byte-encode and the byte tokens exist.
+     */
+    public Boolean bpeByteFallback() { return bpeByteFallback; }
+
+    /** BPE {@code continuing_subword_prefix} of every symbol but a word's first; empty when absent. */
+    public String bpeContinuingSubwordPrefix() { return bpeContinuingSubwordPrefix; }
+
+    /** BPE {@code end_of_word_suffix} of a word's last symbol; empty when absent. */
+    public String bpeEndOfWordSuffix() { return bpeEndOfWordSuffix; }
 
     /** llama.cpp {@code unicode_cpt_flags::is_whitespace} (src/unicode-data.cpp:2286). */
     public static boolean isWhitespace(int cp) {
@@ -265,6 +406,7 @@ public final class TokenizerVocab {
         int mergeCount;
         byte[] precompiledCharsmap;
         PreTokenizerRegistry.PreTokenizer preTokenizer;
+        PreTokenizerRegistry.PreTokenizer namedPreTokenizer;
         Map<String, Object> metadata = new LinkedHashMap<>();
         boolean addSpacePrefix;
         boolean removeExtraWhitespaces;
@@ -278,6 +420,19 @@ public final class TokenizerVocab {
         boolean normalizerNfc;
         boolean normalizerLowercase = true;
         boolean normalizerStripAccents;
+        Normalizer normalizer = Normalizer.identity();
+        TokenDecoder decoder;
+        PreTokenizerSpec.PrependScheme prependScheme = PreTokenizerSpec.PrependScheme.ALWAYS;
+        int[] prefixIds;
+        int[] suffixIds;
+        int[] extraEogIds = new int[0];
+        Boolean cleanUpTokenizationSpaces;
+        boolean bpeAddPrefixSpace;
+        boolean bpeModelOverlay;
+        boolean bpeUnkFuse;
+        Boolean bpeByteFallback;
+        String bpeContinuingSubwordPrefix = "";
+        String bpeEndOfWordSuffix = "";
 
         Loader(Map<String, Object> md) { this.md = md; }
 
@@ -305,6 +460,7 @@ public final class TokenizerVocab {
             if (rew != null) removeExtraWhitespaces = rew;
             loadTokens();
             applySpecialFlags();
+            applyOverlays();
             return this;
         }
 
@@ -378,17 +534,26 @@ public final class TokenizerVocab {
             mergeCount = merges.size();
         }
 
-        /** llama-vocab.cpp:2307-2336: the XCDA blob size must leave room for the replacements. */
+        /**
+         * llama-vocab.cpp:2307-2336: the XCDA blob size must leave room for the replacements. The
+         * blob is a {@code byte[]} or a list of byte numbers.
+         */
         private void loadCharsmap() {
-            List<?> raw = list(KEY_PRECOMPILED_CHARSMAP);
-            if (raw == null) return;
-            byte[] blob = new byte[raw.size()];
-            for (int i = 0; i < blob.length; i++) {
-                Object o = raw.get(i);
-                if (!(o instanceof Number)) {
-                    throw new IllegalArgumentException(KEY_PRECOMPILED_CHARSMAP + "[" + i + "] is not a byte");
+            Object value = md.get(KEY_PRECOMPILED_CHARSMAP);
+            if (value == null) return;
+            byte[] blob;
+            if (value instanceof byte[]) {
+                blob = ((byte[]) value).clone();
+            } else {
+                List<?> raw = list(KEY_PRECOMPILED_CHARSMAP);
+                blob = new byte[raw.size()];
+                for (int i = 0; i < blob.length; i++) {
+                    Object o = raw.get(i);
+                    if (!(o instanceof Number)) {
+                        throw new IllegalArgumentException(KEY_PRECOMPILED_CHARSMAP + "[" + i + "] is not a byte");
+                    }
+                    blob[i] = (byte) ((Number) o).intValue();
                 }
-                blob[i] = (byte) ((Number) o).intValue();
             }
             if (blob.length < 4) {
                 throw new IllegalArgumentException(KEY_PRECOMPILED_CHARSMAP + " too small for the xcda size header");
@@ -407,6 +572,7 @@ public final class TokenizerVocab {
                 case BPE:
                     addSpacePrefix = false;
                     preTokenizer = PreTokenizerRegistry.forName(pre);
+                    namedPreTokenizer = preTokenizer;
                     cleanSpaces = preTokenizer.cleanSpaces();
                     ignoreMerges = preTokenizer.ignoreMerges();
                     escapeWhitespaces = preTokenizer.escapeWhitespaces();
@@ -532,6 +698,156 @@ public final class TokenizerVocab {
             normalizerStripAccents = normalizerLowercase;
             b = bool(KEY_NORMALIZER_STRIP_ACCENTS);
             if (b != null) normalizerStripAccents = b;
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // Hugging Face overlays (neuralfree.tokenizer.*); each absent key leaves its default
+        // -----------------------------------------------------------------------------------------
+
+        /**
+         * The {@code neuralfree.tokenizer.*} keys, after every GGUF key: token attributes, extra
+         * end-of-generation ids, the decoder and clean-up for every type; the normalizer,
+         * pre-tokenizer spec, post-processor ids and BPE model options for BPE; the prepend scheme
+         * and post-processor ids for SPM. A key for a type that does not read it is logged and ignored.
+         */
+        private void applyOverlays() {
+            int n = texts.length;
+            applyTokenAttrs(n);
+            extraEogIds = ids(GgufKeys.NF_TOKENIZER_EXTRA_EOG_IDS, n, extraEogIds);
+            String json = str(GgufKeys.NF_TOKENIZER_DECODER);
+            if (json != null) {
+                decoder = parsed(GgufKeys.NF_TOKENIZER_DECODER, () -> TokenDecoder.fromCanonicalJson(json));
+            }
+            Boolean clean = bool(GgufKeys.NF_TOKENIZER_CLEAN_SPACES);
+            if (clean != null) {
+                cleanUpTokenizationSpaces = clean;
+                cleanSpaces = false;
+            }
+            if (type == Type.BPE || type == Type.SPM) {
+                prefixIds = ids(GgufKeys.NF_TOKENIZER_PREFIX_IDS, n, null);
+                suffixIds = ids(GgufKeys.NF_TOKENIZER_SUFFIX_IDS, n, null);
+            } else {
+                ignored(GgufKeys.NF_TOKENIZER_PREFIX_IDS);
+                ignored(GgufKeys.NF_TOKENIZER_SUFFIX_IDS);
+            }
+            if (type == Type.SPM) {
+                String scheme = str(GgufKeys.NF_TOKENIZER_PREPEND_SCHEME);
+                if (scheme != null) prependScheme = prependScheme(scheme);
+            } else {
+                ignored(GgufKeys.NF_TOKENIZER_PREPEND_SCHEME);
+            }
+            if (type == Type.BPE) {
+                applyBpeOverlays();
+            } else {
+                for (String key : BPE_ONLY_KEYS) ignored(key);
+            }
+        }
+
+        /** {@link GgufKeys#NF_TOKENIZER_TOKEN_ATTRS}: one attribute mask per token, OR-ed in. */
+        private void applyTokenAttrs(int n) {
+            List<?> raw = list(GgufKeys.NF_TOKENIZER_TOKEN_ATTRS);
+            if (raw == null) return;
+            String key = GgufKeys.NF_TOKENIZER_TOKEN_ATTRS;
+            if (raw.size() != n) {
+                throw new GgufFormatException(key + " has " + raw.size() + " entries for " + n + " tokens");
+            }
+            for (int i = 0; i < n; i++) {
+                long bits = integer(raw.get(i), key, i);
+                if (bits < 0 || (bits & ~ATTR_ALL) != 0) {
+                    throw new GgufFormatException(key + "[" + i + "] = " + bits + " has bits outside the token"
+                            + " attribute mask 0x" + Integer.toHexString(ATTR_ALL));
+                }
+                attrs[i] |= (int) bits;
+            }
+        }
+
+        /**
+         * Normalizer, pre-tokenizer spec and BPE model options of a BPE vocabulary. The gemma4
+         * model keeps its forced gemma4 pre-tokenizer, as llama.cpp does.
+         */
+        private void applyBpeOverlays() {
+            String json = str(GgufKeys.NF_TOKENIZER_NORMALIZER);
+            if (json != null) {
+                normalizer = parsed(GgufKeys.NF_TOKENIZER_NORMALIZER, () -> Normalizer.fromCanonicalJson(json));
+            }
+            if ("gemma4".equals(model)) {
+                if (md.containsKey(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER)) {
+                    LOGGER.warn("tokenizer metadata '{}' is ignored: model 'gemma4' always uses the gemma4"
+                            + " pre-tokenizer", GgufKeys.NF_TOKENIZER_PRE_TOKENIZER);
+                }
+            } else {
+                String spec = str(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER);
+                if (spec != null) {
+                    preTokenizer = parsed(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER,
+                            () -> PreTokenizerRegistry.fromSpec(PreTokenizerSpec.fromCanonicalJson(spec)));
+                }
+            }
+            Boolean b = bool(GgufKeys.NF_TOKENIZER_BPE_IGNORE_MERGES);
+            if (b != null) ignoreMerges = b;
+            b = bool(GgufKeys.NF_TOKENIZER_BPE_ADD_PREFIX_SPACE);
+            if (b != null) bpeAddPrefixSpace = b;
+            Boolean fuse = bool(GgufKeys.NF_TOKENIZER_BPE_UNK_FUSE);
+            String prefix = str(GgufKeys.NF_TOKENIZER_BPE_CONTINUING_SUBWORD_PREFIX);
+            String suffix = str(GgufKeys.NF_TOKENIZER_BPE_END_OF_WORD_SUFFIX);
+            bpeByteFallback = bool(GgufKeys.NF_TOKENIZER_BPE_BYTE_FALLBACK);
+            bpeModelOverlay = fuse != null || prefix != null || suffix != null || Boolean.TRUE.equals(bpeByteFallback);
+            if (fuse != null) bpeUnkFuse = fuse;
+            if (prefix != null) bpeContinuingSubwordPrefix = prefix;
+            if (suffix != null) bpeEndOfWordSuffix = suffix;
+        }
+
+        /**
+         * An optional list of token ids, each in {@code [0, n)}; {@code absent} when the key is
+         * missing.
+         */
+        private int[] ids(String key, int n, int[] absent) {
+            List<?> raw = list(key);
+            if (raw == null) return absent;
+            int[] out = new int[raw.size()];
+            for (int i = 0; i < out.length; i++) {
+                long id = integer(raw.get(i), key, i);
+                if (id < 0 || id >= n) {
+                    throw new GgufFormatException(key + "[" + i + "] = " + id + " is outside the vocabulary [0, "
+                            + n + ")");
+                }
+                out[i] = (int) id;
+            }
+            return out;
+        }
+
+        private static long integer(Object o, String key, int i) {
+            if (!(o instanceof Byte || o instanceof Short || o instanceof Integer || o instanceof Long)) {
+                throw new GgufFormatException(key + "[" + i + "] is not an integer: " + o);
+            }
+            return ((Number) o).longValue();
+        }
+
+        private static PreTokenizerSpec.PrependScheme prependScheme(String value) {
+            switch (value) {
+                case "always": return PreTokenizerSpec.PrependScheme.ALWAYS;
+                case "first": return PreTokenizerSpec.PrependScheme.FIRST;
+                case "never": return PreTokenizerSpec.PrependScheme.NEVER;
+                default:
+                    throw new GgufFormatException(GgufKeys.NF_TOKENIZER_PREPEND_SCHEME + " is '" + value
+                            + "'; expected always, first or never");
+            }
+        }
+
+        /** Builds an overlay value; a malformed one fails the load naming its key. */
+        private static <T> T parsed(String key, Supplier<T> build) {
+            try {
+                return build.get();
+            } catch (IllegalArgumentException e) {
+                throw new GgufFormatException(key + ": " + e.getMessage(), e);
+            }
+        }
+
+        /** Logs an overlay key that is present but not read by this vocabulary type. */
+        private void ignored(String key) {
+            if (md.containsKey(key)) {
+                LOGGER.warn("tokenizer metadata '{}' does not apply to {} vocabularies (model '{}'); it is ignored",
+                        key, type, model);
+            }
         }
 
         private String str(String key) {

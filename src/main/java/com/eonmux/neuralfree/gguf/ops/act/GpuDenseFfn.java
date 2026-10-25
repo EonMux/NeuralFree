@@ -258,8 +258,9 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         int rows = (int) w.rows();
         PreparedDispatch bias = biasDispatch(weights, layer, base, rows, target);
         PreparedDispatch tensorScale = w.hasScale() ? null : tensorScaleDispatch(weights, layer, base, rows, target);
-        String refusal = w.hadamard() != null ? w.name() + " rotates its input (PRISM Hadamard) inside the matmul; a"
-                + " LoRA delta would need the rotated rows" : null;
+        String refusal = w.hadamard() != null || (w.inputTransform() != null && !w.inputTransform().isIdentity())
+                ? w.name() + " transforms its input (PRISM Hadamard or input transform) inside the matmul; a LoRA"
+                + " delta would need the transformed rows" : null;
         GpuProjectionDeltas.Site deltas = ctx.projectionDeltas().serve(layer, TensorNames.weight(base), refusal);
         return new Projection(w, rows, bias, tensorScale, deltas);
     }

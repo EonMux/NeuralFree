@@ -31,7 +31,7 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
     private final int maxTokenBytes;
     private final ByteTrie userDefinedMatcher;
     private final float unknownTokenScore;
-    private final Xcda xcda;
+    private final PrecompiledCharsmap charsmap;
 
     public UgmTokenizer(TokenizerVocab vocab, SpecialTokens special) {
         if (vocab == null || special == null) throw new IllegalArgumentException("vocabulary and special tokens are required");
@@ -41,8 +41,8 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
         }
         this.vocab = vocab;
         this.special = special;
-        byte[] charsmap = vocab.precompiledCharsmap();
-        this.xcda = charsmap != null ? new Xcda(charsmap) : null;
+        byte[] blob = vocab.precompiledCharsmap();
+        this.charsmap = blob != null ? new PrecompiledCharsmap(blob) : null;
 
         Map<String, Integer> matcher = new HashMap<>();
         ByteTrie userDefined = new ByteTrie();
@@ -190,8 +190,8 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
             res[2] = userDefined;
             return input;
         }
-        if (xcda != null) {
-            byte[] repl = xcda.replace(input, off, res);
+        if (charsmap != null) {
+            byte[] repl = charsmap.replace(input, off, res);
             if (repl != null) return repl;
         }
         int len = codepointLength(input, off);
@@ -260,76 +260,6 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
                 depth++;
             }
             return depth;
-        }
-    }
-
-    /**
-     * {@code xcda_array_view} over the precompiled charsmap: a uint32 blob size, the XOR-compressed
-     * double array, then NUL-terminated replacement strings (llama-vocab.cpp:1188-1304).
-     */
-    private static final class Xcda {
-        private final byte[] blob;
-        private final int size;
-        private final int replacementsOffset;
-        private final int replacementsSize;
-
-        Xcda(byte[] blob) {
-            long bytes = (blob[0] & 0xFFL) | (blob[1] & 0xFFL) << 8 | (blob[2] & 0xFFL) << 16 | (blob[3] & 0xFFL) << 24;
-            this.blob = blob;
-            this.size = (int) (bytes / 4);
-            this.replacementsOffset = 4 + (int) bytes;
-            this.replacementsSize = blob.length - replacementsOffset;
-        }
-
-        private long node(int index) {
-            if (index < 0 || index >= size) throw new IllegalStateException("Index out of array bounds in XCDA array");
-            int o = 4 + index * 4;
-            return (blob[o] & 0xFFL) | (blob[o + 1] & 0xFFL) << 8 | (blob[o + 2] & 0xFFL) << 16 | (blob[o + 3] & 0xFFL) << 24;
-        }
-
-        private int base(int index) {
-            long p = node(index);
-            return (int) ((p >>> 10) << ((p & (1L << 9)) >>> 6));
-        }
-
-        private long lcheck(int index) { return node(index) & ((1L << 31) | 0xFF); }
-        private boolean leaf(int index) { return ((node(index) >>> 8) & 1) != 0; }
-        private int value(int index) { return (int) (node(index) & ((1L << 31) - 1)); }
-
-        /**
-         * Longest charsmap match at {@code off}; on a match fills {@code res} with the replacement
-         * slice and the consumed length and returns the blob, otherwise returns null.
-         */
-        byte[] replace(byte[] input, int off, int[] res) {
-            if (size == 0) return null;
-            int longestLength = 0;
-            int longestOffset = 0;
-            int nodeIndex = base(0);
-            for (int p = off; p < input.length; p++) {
-                int c = input[p] & 0xFF;
-                if (c == 0) break;
-                nodeIndex ^= c;
-                if (lcheck(nodeIndex) != c) break;
-                boolean isLeaf = leaf(nodeIndex);
-                nodeIndex ^= base(nodeIndex);
-                if (isLeaf) {
-                    longestLength = p - off + 1;
-                    longestOffset = value(nodeIndex);
-                }
-            }
-            if (longestLength == 0) return null;
-            if (longestOffset >= replacementsSize) {
-                throw new IllegalStateException("Index out of array bounds in precompiled charsmap");
-            }
-            int start = replacementsOffset + longestOffset;
-            int maxLen = replacementsSize - longestOffset;
-            int len = 0;
-            while (len < maxLen && blob[start + len] != 0) len++;
-            if (len == maxLen) throw new IllegalStateException("Unterminated string in precompiled charsmap");
-            res[0] = start;
-            res[1] = len;
-            res[2] = longestLength;
-            return blob;
         }
     }
 }
