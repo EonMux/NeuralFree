@@ -41,6 +41,8 @@ final class JsonParser {
     private static final class Frame {
         final Map<String, Object> map;
         final List<Object> list;
+        /** Members counted so far, against {@code limits.maxMembers()}. */
+        int members;
         String key;
 
         Frame(Map<String, Object> map, List<Object> list) {
@@ -122,6 +124,10 @@ final class JsonParser {
     /** Parses a scalar, an empty container, or opens a container and returns {@link #OPENED}. */
     private Object begin() {
         if (pos >= s.length()) throw error("unexpected end of input");
+        Frame top = stack.peek();
+        if (top != null && top.list != null && ++top.members > limits.maxMembers()) {
+            throw error("array member exceeds maxMembers " + limits.maxMembers());
+        }
         char c = s.charAt(pos);
         count();
         if (c == '{') {
@@ -141,11 +147,26 @@ final class JsonParser {
         if (eat("true")) return Boolean.TRUE;
         if (eat("false")) return Boolean.FALSE;
         if (eat("null")) return null;
-        if (eat("NaN")) return Double.NaN;
-        if (eat("Infinity")) return Double.POSITIVE_INFINITY;
-        if (eat("-Infinity")) return Double.NEGATIVE_INFINITY;
+        if (eat("NaN")) {
+            nonFinite("NaN");
+            return Double.NaN;
+        }
+        if (eat("Infinity")) {
+            nonFinite("Infinity");
+            return Double.POSITIVE_INFINITY;
+        }
+        if (eat("-Infinity")) {
+            nonFinite("-Infinity");
+            return Double.NEGATIVE_INFINITY;
+        }
         if (c == '-' || (c >= '0' && c <= '9')) return number();
         throw error("unexpected character '" + c + "'");
+    }
+
+    /** Rejects the {@code NaN} or {@code Infinity} literal just eaten, at its start, when {@code limits} forbids it. */
+    private void nonFinite(String literal) {
+        if (limits.allowNonFinite()) return;
+        throw new JsonException("non-finite literal '" + literal + "' is not allowed", pos - literal.length());
     }
 
     private void count() {
@@ -161,6 +182,9 @@ final class JsonParser {
 
     /** Reads {@code "key" :} into {@code f}, applying the duplicate-key policy. */
     private void member(Frame f) {
+        if (++f.members > limits.maxMembers()) {
+            throw error("object member exceeds maxMembers " + limits.maxMembers());
+        }
         if (pos >= s.length() || s.charAt(pos) != '"') throw error("expected property name");
         int keyPos = pos;
         String k = string();

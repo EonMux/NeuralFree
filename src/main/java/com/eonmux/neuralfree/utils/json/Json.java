@@ -60,7 +60,10 @@ public final class Json {
         LAST_WINS
     }
 
-    /** Immutable bounds applied while parsing one document. */
+    /**
+     * Immutable bounds applied while parsing one document. The seven fields cover an untrusted document end to
+     * end: every check precedes the allocation or recursion it bounds.
+     */
     public static final class Limits {
 
         public static final int DEFAULT_MAX_DEPTH = 512;
@@ -75,25 +78,57 @@ public final class Json {
         /** Default caps; the last duplicate wins silently, as Python {@code json.loads}. */
         public static final Limits PYTHON = STRICT.withDuplicateKeys(DuplicateKeys.LAST_WINS);
 
+        /**
+         * Caps for input from outside the trust boundary (§3.6): depth 128, 16 MiB, 4 Mi values, 8 Mi UTF-16 chars
+         * per string, 1 Mi members per container; duplicate keys are rejected and NaN, Infinity, -Infinity too.
+         */
+        public static final Limits UNTRUSTED = new Limits(128, 4_194_304L, 8_388_608, DuplicateKeys.REJECT,
+                16_777_216L, 1_048_576, false);
+
         private final int maxDepth;
         private final long maxValues;
         private final int maxStringChars;
+        private final long maxBytes;
+        private final int maxMembers;
         private final DuplicateKeys duplicateKeys;
+        private final boolean allowNonFinite;
 
         /**
+         * Bounds with the bytes, members and constants fields unbounded, so the constants built above and every
+         * existing caller keep HF.md's behaviour.
+         *
          * @param maxDepth       deepest nesting of objects and arrays (the outermost container is depth 1)
          * @param maxValues      most values in a document, containers included and object keys excluded
          * @param maxStringChars longest string or key, in UTF-16 chars after unescaping
          * @param duplicateKeys  policy for repeated object keys
          */
         public Limits(int maxDepth, long maxValues, int maxStringChars, DuplicateKeys duplicateKeys) {
+            this(maxDepth, maxValues, maxStringChars, duplicateKeys, Long.MAX_VALUE, Integer.MAX_VALUE, true);
+        }
+
+        /**
+         * @param maxDepth       deepest nesting of objects and arrays (the outermost container is depth 1)
+         * @param maxValues      most values in a document, containers included and object keys excluded
+         * @param maxStringChars longest string or key, in UTF-16 chars after unescaping
+         * @param duplicateKeys  policy for repeated object keys
+         * @param maxBytes       longest input, in bytes for byte and file input and in UTF-8 bytes for a CharSequence
+         * @param maxMembers     most members of one object or array
+         * @param allowNonFinite whether the {@code NaN}, {@code Infinity} and {@code -Infinity} literals parse
+         */
+        public Limits(int maxDepth, long maxValues, int maxStringChars, DuplicateKeys duplicateKeys,
+                long maxBytes, int maxMembers, boolean allowNonFinite) {
             if (maxDepth < 1) throw new IllegalArgumentException("maxDepth must be >= 1, got " + maxDepth);
             if (maxValues < 1) throw new IllegalArgumentException("maxValues must be >= 1, got " + maxValues);
             if (maxStringChars < 0) throw new IllegalArgumentException("maxStringChars must be >= 0, got " + maxStringChars);
+            if (maxBytes < 0) throw new IllegalArgumentException("maxBytes must be >= 0, got " + maxBytes);
+            if (maxMembers < 0) throw new IllegalArgumentException("maxMembers must be >= 0, got " + maxMembers);
             this.maxDepth = maxDepth;
             this.maxValues = maxValues;
             this.maxStringChars = maxStringChars;
+            this.maxBytes = maxBytes;
+            this.maxMembers = maxMembers;
             this.duplicateKeys = Objects.requireNonNull(duplicateKeys, "duplicateKeys");
+            this.allowNonFinite = allowNonFinite;
         }
 
         public int maxDepth() { return maxDepth; }
@@ -102,20 +137,50 @@ public final class Json {
 
         public int maxStringChars() { return maxStringChars; }
 
+        /** Longest input: bytes for byte and file input, UTF-8 bytes for a CharSequence. */
+        public long maxBytes() { return maxBytes; }
+
+        /** Most members of one object or array. */
+        public int maxMembers() { return maxMembers; }
+
         public DuplicateKeys duplicateKeys() { return duplicateKeys; }
 
-        public Limits withMaxDepth(int value) { return new Limits(value, maxValues, maxStringChars, duplicateKeys); }
+        /** Whether the {@code NaN}, {@code Infinity} and {@code -Infinity} literals parse. */
+        public boolean allowNonFinite() { return allowNonFinite; }
 
-        public Limits withMaxValues(long value) { return new Limits(maxDepth, value, maxStringChars, duplicateKeys); }
+        public Limits withMaxDepth(int value) {
+            return new Limits(value, maxValues, maxStringChars, duplicateKeys, maxBytes, maxMembers, allowNonFinite);
+        }
 
-        public Limits withMaxStringChars(int value) { return new Limits(maxDepth, maxValues, value, duplicateKeys); }
+        public Limits withMaxValues(long value) {
+            return new Limits(maxDepth, value, maxStringChars, duplicateKeys, maxBytes, maxMembers, allowNonFinite);
+        }
 
-        public Limits withDuplicateKeys(DuplicateKeys value) { return new Limits(maxDepth, maxValues, maxStringChars, value); }
+        public Limits withMaxStringChars(int value) {
+            return new Limits(maxDepth, maxValues, value, duplicateKeys, maxBytes, maxMembers, allowNonFinite);
+        }
+
+        public Limits withMaxBytes(long value) {
+            return new Limits(maxDepth, maxValues, maxStringChars, duplicateKeys, value, maxMembers, allowNonFinite);
+        }
+
+        public Limits withMaxMembers(int value) {
+            return new Limits(maxDepth, maxValues, maxStringChars, duplicateKeys, maxBytes, value, allowNonFinite);
+        }
+
+        public Limits withDuplicateKeys(DuplicateKeys value) {
+            return new Limits(maxDepth, maxValues, maxStringChars, value, maxBytes, maxMembers, allowNonFinite);
+        }
+
+        public Limits withAllowNonFinite(boolean value) {
+            return new Limits(maxDepth, maxValues, maxStringChars, duplicateKeys, maxBytes, maxMembers, value);
+        }
 
         @Override
         public String toString() {
             return "Limits{maxDepth=" + maxDepth + ", maxValues=" + maxValues + ", maxStringChars=" + maxStringChars
-                    + ", duplicateKeys=" + duplicateKeys + '}';
+                    + ", maxBytes=" + maxBytes + ", maxMembers=" + maxMembers + ", duplicateKeys=" + duplicateKeys
+                    + ", allowNonFinite=" + allowNonFinite + '}';
         }
     }
 
@@ -128,8 +193,60 @@ public final class Json {
 
     /** Parses one JSON document; whitespace may surround it, anything else after it is an error. */
     public static Object parse(String text, Limits limits) {
+        return parse((CharSequence) text, limits);
+    }
+
+    /**
+     * Parses one JSON document over any {@link CharSequence}; whitespace may surround it, anything else after it is
+     * an error. {@code limits.maxBytes()} bounds the UTF-8 byte length of the text, which is therefore checked before
+     * a non-{@link String} text is copied into one.
+     */
+    public static Object parse(CharSequence text, Limits limits) {
         Objects.requireNonNull(text, "text");
-        return new JsonParser(text, 0, Objects.requireNonNull(limits, "limits"), null).document();
+        Objects.requireNonNull(limits, "limits");
+        long bytes = utf8Length(text);
+        if (bytes > limits.maxBytes()) {
+            throw new JsonException("input length " + bytes + " bytes exceeds maxBytes " + limits.maxBytes());
+        }
+        return new JsonParser(text instanceof String ? (String) text : text.toString(), 0, limits, null).document();
+    }
+
+    /** UTF-8 byte length of {@code text}, without allocating; lone surrogates count as their escaped length. */
+    private static long utf8Length(CharSequence text) {
+        long bytes = 0;
+        for (int i = 0, n = text.length(); i < n; ) {
+            char c = text.charAt(i++);
+            if (c < 0x80) bytes++;
+            else if (c < 0x800) bytes += 2;
+            else if (Character.isHighSurrogate(c) && i < n && Character.isLowSurrogate(text.charAt(i))) {
+                i++;
+                bytes += 4;
+            } else bytes += 3;
+        }
+        return bytes;
+    }
+
+    /**
+     * Parses the JSON document in {@code bytes[off, off+len)}: strict UTF-8 (malformed bytes are an error, not
+     * replaced), with an optional leading byte order mark, at most {@code limits.maxBytes()} long — the length check
+     * precedes the decode. Positions are byte offsets for encoding errors and character offsets into the decoded
+     * text otherwise.
+     *
+     * @throws JsonException when the range is too large, is not UTF-8 or is not a valid document within {@code limits}
+     */
+    public static Object parse(byte[] bytes, int off, int len, Limits limits) {
+        Objects.requireNonNull(bytes, "bytes");
+        Objects.requireNonNull(limits, "limits");
+        if (off < 0 || len < 0 || off > bytes.length - len) {
+            throw new IllegalArgumentException(
+                    "off=" + off + ", len=" + len + " is not a range inside [0, " + bytes.length + ']');
+        }
+        if (len > limits.maxBytes()) {
+            throw new JsonException("input length " + len + " bytes exceeds maxBytes " + limits.maxBytes());
+        }
+        String text = decodeUtf8(bytes, off, len, null);
+        int start = !text.isEmpty() && text.charAt(0) == BOM ? 1 : 0;
+        return new JsonParser(text, start, limits, null).document();
     }
 
     /**
@@ -147,7 +264,8 @@ public final class Json {
             throw new IllegalArgumentException("maxBytes must be in [0, " + MAX_FILE_BYTES + "], got " + maxBytes);
         }
         String source = file.toString();
-        String text = decodeUtf8(readBounded(file, maxBytes, source), source);
+        byte[] bytes = readBounded(file, maxBytes, source);
+        String text = decodeUtf8(bytes, 0, bytes.length, source);
         int start = !text.isEmpty() && text.charAt(0) == BOM ? 1 : 0;
         try {
             return new JsonParser(text, start, limits, source).document();
@@ -170,15 +288,16 @@ public final class Json {
         }
     }
 
-    private static String decodeUtf8(byte[] bytes, String source) {
+    private static String decodeUtf8(byte[] bytes, int off, int len, String source) {
         CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT);
-        ByteBuffer in = ByteBuffer.wrap(bytes);
+        ByteBuffer in = ByteBuffer.wrap(bytes, off, len);
         try {
             return decoder.decode(in).toString();
         } catch (CharacterCodingException e) {
-            throw new JsonException(source + ": invalid UTF-8 byte sequence", in.position(), e);
+            throw new JsonException((source == null ? "" : source + ": ") + "invalid UTF-8 byte sequence",
+                    in.position(), e);
         }
     }
 
@@ -191,26 +310,42 @@ public final class Json {
         public static final Style PYTHON_DEFAULT = new Style(true, null, ", ", ": ", false);
         /** Compact, key-sorted, non-ASCII kept: one text per value, for comparison and hashing. */
         public static final Style CANONICAL = new Style(false, null, ",", ":", true);
+        /** Serving style: compact ({@code ","}, {@code ":"}), non-ASCII kept, insertion order, U+2028 and U+2029
+         *  escaped so a value stays on one SSE {@code data:} line, non-finite doubles rejected. */
+        public static final Style API = new Style(false, null, ",", ":", false, true, true);
 
         private final boolean ensureAscii;
         private final String indent;
         private final String itemSep;
         private final String keySep;
         private final boolean sortKeys;
+        private final boolean escapeLineSeparators;
+        private final boolean rejectNonFinite;
+
+        /** The options above with the two serving flags false, exactly as before they existed. */
+        public Style(boolean ensureAscii, String indent, String itemSep, String keySep, boolean sortKeys) {
+            this(ensureAscii, indent, itemSep, keySep, sortKeys, false, false);
+        }
 
         /**
-         * @param ensureAscii escape every character outside {@code ' '..'~'}
-         * @param indent      text repeated per nesting level after each newline, or null for single-line output
-         * @param itemSep     separator between items and members
-         * @param keySep      separator between a key and its value
-         * @param sortKeys    write object members ordered by key
+         * @param ensureAscii          escape every character outside {@code ' '..'~'}
+         * @param indent               text repeated per nesting level after each newline, or null for single-line output
+         * @param itemSep              separator between items and members
+         * @param keySep               separator between a key and its value
+         * @param sortKeys             write object members ordered by key
+         * @param escapeLineSeparators write U+2028 and U+2029 as {@code \u2028}/{@code \u2029} even when
+         *                             {@code ensureAscii} is false, so a value stays on one line
+         * @param rejectNonFinite      throw {@link IllegalArgumentException} for a non-finite double; callers clamp
          */
-        public Style(boolean ensureAscii, String indent, String itemSep, String keySep, boolean sortKeys) {
+        public Style(boolean ensureAscii, String indent, String itemSep, String keySep, boolean sortKeys,
+                boolean escapeLineSeparators, boolean rejectNonFinite) {
             this.ensureAscii = ensureAscii;
             this.indent = indent;
             this.itemSep = Objects.requireNonNull(itemSep, "itemSep");
             this.keySep = Objects.requireNonNull(keySep, "keySep");
             this.sortKeys = sortKeys;
+            this.escapeLineSeparators = escapeLineSeparators;
+            this.rejectNonFinite = rejectNonFinite;
         }
 
         public boolean ensureAscii() { return ensureAscii; }
@@ -223,6 +358,10 @@ public final class Json {
         public String keySep() { return keySep; }
 
         public boolean sortKeys() { return sortKeys; }
+
+        public boolean escapeLineSeparators() { return escapeLineSeparators; }
+
+        public boolean rejectNonFinite() { return rejectNonFinite; }
     }
 
     /**
@@ -410,6 +549,54 @@ public final class Json {
         }
     }
 
+    /**
+     * Writes the JSON text of the double {@code d} to {@code out}, formatted as {@link #numberText(double)}. The
+     * shared float path of {@link Json#write} and {@link JsonStreamWriter}; {@link Style#rejectNonFinite()} turns a
+     * non-finite {@code d} into an {@link IllegalArgumentException} instead of invalid JSON.
+     */
+    static void writeNumber(double d, Style st, Appendable out) throws IOException {
+        if (st.rejectNonFinite && !Double.isFinite(d)) {
+            throw new IllegalArgumentException("non-finite double is not valid JSON: " + numberText(d));
+        }
+        out.append(numberText(d));
+    }
+
+    /** Writes {@code s} as a JSON string, applying {@link Style}'s escaping; the shared string path above and below. */
+    static void writeString(String s, Style st, Appendable out) throws IOException {
+        out.append('"');
+        int run = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean escape = c < 0x20 || c == '"' || c == '\\' || (st.ensureAscii && c > 0x7e)
+                    || (st.escapeLineSeparators && (c == '\u2028' || c == '\u2029'));
+            if (!escape) continue;
+            out.append(s, run, i);
+            run = i + 1;
+            switch (c) {
+                case '"': out.append("\\\""); break;
+                case '\\': out.append("\\\\"); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                case '\b': out.append("\\b"); break;
+                case '\f': out.append("\\f"); break;
+                case '\u2028': out.append("\\u2028"); break;
+                case '\u2029': out.append("\\u2029"); break;
+                default:
+                    out.append("\\u").append(HEX[(c >> 12) & 0xF]).append(HEX[(c >> 8) & 0xF])
+                            .append(HEX[(c >> 4) & 0xF]).append(HEX[c & 0xF]);
+            }
+        }
+        out.append(s, run, s.length()).append('"');
+    }
+
+    /** One indent newline as {@link Json#write} writes it: nothing without an indent, else a newline and {@code depth} indents. */
+    static void newline(Appendable out, String indent, int depth) throws IOException {
+        if (indent == null) return;
+        out.append('\n');
+        for (int i = 0; i < depth; i++) out.append(indent);
+    }
+
     /** One {@code json.dumps} pass; detects reference cycles as Python's {@code check_circular} does. */
     private static final class Writer {
         private final Style st;
@@ -427,9 +614,9 @@ public final class Json {
             Object v = adapter.value(raw);
             if (v == null) out.append("null");
             else if (v instanceof Boolean) out.append((Boolean) v ? "true" : "false");
-            else if (v instanceof String) string((String) v);
+            else if (v instanceof String) writeString((String) v, st, out);
             else if (isIntegral(v)) out.append(v.toString());
-            else if (v instanceof Double || v instanceof Float) out.append(numberText(((Number) v).doubleValue()));
+            else if (v instanceof Double || v instanceof Float) writeNumber(((Number) v).doubleValue(), st, out);
             else if (v instanceof List) list((List<?>) v, depth);
             else if (v instanceof Map) map((Map<?, ?>) v, depth);
             else throw new JsonException("Object of type " + v.getClass().getSimpleName() + " is not JSON serializable");
@@ -440,9 +627,7 @@ public final class Json {
         }
 
         private void newline(int depth) throws IOException {
-            if (st.indent == null) return;
-            out.append('\n');
-            for (int i = 0; i < depth; i++) out.append(st.indent);
+            Json.newline(out, st.indent(), depth);
         }
 
         private void list(List<?> list, int depth) throws IOException {
@@ -477,37 +662,13 @@ public final class Json {
                 if (!first) out.append(st.itemSep);
                 first = false;
                 newline(depth + 1);
-                string(adapter.key(e.getKey()));
+                writeString(adapter.key(e.getKey()), st, out);
                 out.append(st.keySep);
                 value(e.getValue(), depth + 1);
             }
             newline(depth);
             out.append('}');
             active.remove(map);
-        }
-
-        private void string(String s) throws IOException {
-            out.append('"');
-            int run = 0;
-            for (int i = 0; i < s.length(); i++) {
-                char c = s.charAt(i);
-                if (c >= 0x20 && c != '"' && c != '\\' && (!st.ensureAscii || c <= 0x7e)) continue;
-                out.append(s, run, i);
-                run = i + 1;
-                switch (c) {
-                    case '"': out.append("\\\""); break;
-                    case '\\': out.append("\\\\"); break;
-                    case '\n': out.append("\\n"); break;
-                    case '\r': out.append("\\r"); break;
-                    case '\t': out.append("\\t"); break;
-                    case '\b': out.append("\\b"); break;
-                    case '\f': out.append("\\f"); break;
-                    default:
-                        out.append("\\u").append(HEX[(c >> 12) & 0xF]).append(HEX[(c >> 8) & 0xF])
-                                .append(HEX[(c >> 4) & 0xF]).append(HEX[c & 0xF]);
-                }
-            }
-            out.append(s, run, s.length()).append('"');
         }
     }
 }

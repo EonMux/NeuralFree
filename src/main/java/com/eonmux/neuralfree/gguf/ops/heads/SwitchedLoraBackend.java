@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf.ops.heads;
 
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.Observers;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.ops.heads.SwitchedLoraExtra.Router;
 
@@ -53,6 +55,55 @@ public final class SwitchedLoraBackend implements ForwardBackend {
     @Override
     public float[][] forwardRows(int[] tokens, int pos0, int[] outputRows) {
         return routed(pos0, tokens, t -> delegate.forwardRows(t, pos0, outputRows));
+    }
+
+    /**
+     * The router is per model ({@link SwitchedLoraExtra} records tokens from one stream), so a batched backend
+     * serves batches of one sequence by routing them like {@link #prefill} and refuses larger ones.
+     */
+    @Override
+    public String batchRefusal() {
+        return "graniteswitch routing is per model";
+    }
+
+    @Override
+    public int maxSequences() {
+        return delegate.maxSequences();
+    }
+
+    @Override
+    public Observers observers() {
+        // the router records tokens, it holds no observation channel of the residual stream
+        return delegate.observers();
+    }
+
+    @Override
+    public float[][] forwardBatch(ForwardBatch batch) {
+        Objects.requireNonNull(batch, "batch");
+        if (!batch.isSingleSequence()) {
+            throw new UnsupportedOperationException(batchRefusal());
+        }
+        if (batch.embeddings() != null) {
+            throw new UnsupportedOperationException("the router records token ids, an embedding-row batch does not "
+                    + "drive it: " + batchRefusal());
+        }
+        int[] tokens = batch.tokens();
+        int[] pos = batch.positions();
+        return routed(pos[0], tokens, t -> {
+            ForwardBatch.Builder built = ForwardBatch.builder(batch.nTokens());
+            for (int i = 0; i < batch.nTokens(); i++) {
+                built.add(t[i], pos[i], batch.seqIds()[i], batch.output(i));
+            }
+            int[][] sections = batch.ropePositions();
+            if (sections != null) {
+                built.ropePositions(sections);
+            }
+            int[] slots = batch.adapterSlots();
+            if (slots != null) {
+                built.adapterSlots(slots);
+            }
+            return delegate.forwardBatch(built.build());
+        });
     }
 
     /** Records {@code tokens} at {@code pos0}, runs {@code call} on their substitutes, resyncs on failure. */

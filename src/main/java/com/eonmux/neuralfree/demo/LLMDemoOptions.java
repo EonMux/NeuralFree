@@ -2,10 +2,12 @@ package com.eonmux.neuralfree.demo;
 
 import com.eonmux.neuralfree.gguf.GgufWriter;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
+import com.eonmux.neuralfree.gguf.TensorReadMode;
 import com.eonmux.neuralfree.gguf.engine.DiffusionConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
+import com.eonmux.neuralfree.gguf.load.RopeOverrides;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
@@ -312,7 +314,7 @@ final class LLMDemoOptions {
                     continue;
                 }
                 if (!general(a) && !backend(a) && !memory(a) && !sampling(a) && !speculative(a) && !diffusion(a)
-                        && !heads(a) && !huggingFace(a) && !exporting(a)) {
+                        && !heads(a) && !loadingExtras(a) && !huggingFace(a) && !exporting(a)) {
                     throw new UsageException("unknown option " + a + " (see --help)");
                 }
             }
@@ -497,6 +499,66 @@ final class LLMDemoOptions {
                 case "--diffusion-alg-temp": db.algTemp(floatValue(a, 0f, Float.MAX_VALUE)); return true;
                 case "--cfg": case "--diffusion-cfg-scale": db.cfgScale(floatValue(a, 0f, Float.MAX_VALUE)); return true;
                 case "--diffusion-add-gumbel-noise": db.addGumbelNoise(true); return true;
+                default: return false;
+            }
+        }
+
+        /** The loading extras of every source format: metadata, rope, dummy and check flags, and the lazy mode. */
+        private boolean loadingExtras(String a) throws UsageException {
+            switch (a) {
+                case "--override-kv":
+                    try {
+                        hb.metadataOverride(value(a));
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                case "--check-tensors": hb.checkTensors(true); return true;
+                case "--load-format": {
+                    String v = value(a).trim().toLowerCase(Locale.ROOT).replace('-', '_');
+                    if (v.equals("dummy")) {
+                        hb.loadFormat(ModelSourceOptions.LoadFormat.DUMMY);
+                        return true;
+                    }
+                    if (v.equals("auto") || v.equals("full")) {
+                        hb.loadFormat(ModelSourceOptions.LoadFormat.FULL);
+                        return true;
+                    }
+                    throw new UsageException(a + " " + v + " is invalid; use auto, full or dummy");
+                }
+                case "--no-warmup": hb.warmup(false); return true;
+                case "--lazy-mode":
+                    System.setProperty(TensorReadMode.PROP_READ_MODE, "lazy");
+                    return true;
+                case "--rope-scaling":
+                    try {
+                        hb.ropeScaling(RopeOverrides.ScalingType.parse(value(a)));
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                case "--rope-scale":
+                case "--rope-freq-scale":
+                    hb.ropeFreqScale(floatValue(a, 0f, Float.MAX_VALUE));
+                    return true;
+                case "--rope-freq-base":
+                    hb.ropeFreqBase(floatValue(a, 0f, Float.MAX_VALUE));
+                    return true;
+                case "--yarn-ext-factor":
+                    hb.yarnExtFactor(floatValue(a, -Float.MAX_VALUE, Float.MAX_VALUE));
+                    return true;
+                case "--yarn-attn-factor":
+                    hb.yarnAttnFactor(floatValue(a, 0f, Float.MAX_VALUE));
+                    return true;
+                case "--yarn-beta-fast":
+                    hb.yarnBetaFast(floatValue(a, 0f, Float.MAX_VALUE));
+                    return true;
+                case "--yarn-beta-slow":
+                    hb.yarnBetaSlow(floatValue(a, 0f, Float.MAX_VALUE));
+                    return true;
+                case "--yarn-orig-ctx":
+                    hb.yarnOrigCtx(intValue(a, 0, Integer.MAX_VALUE));
+                    return true;
                 default: return false;
             }
         }
@@ -857,6 +919,22 @@ final class LLMDemoOptions {
                 "  --no-prefix-reuse            Re-evaluate the whole prompt every turn",
                 "  --context-shift              Drop old positions when the context is full",
                 "  --no-kv-rotation             Store quantized KV rows without rotation",
+                "",
+                "Loading extras (every format; metadata and weights):",
+                "  --override-kv <kv>           Metadata override key=type:value (type str | bool | int | float);",
+                "                               repeatable; the last one of a key wins",
+                "  --rope-scaling <t>           Rope scaling type: none | linear | long | yarn",
+                "  --rope-scale, --rope-freq-scale <f>     Rope scaling factor",
+                "  --rope-freq-base <f>         Rope frequency base",
+                "  --yarn-ext-factor <f>        YaRN extrapolation mix (default -1)",
+                "  --yarn-attn-factor <f>       YaRN attention factor",
+                "  --yarn-beta-fast <f>         YaRN low correction bound (default 32)",
+                "  --yarn-beta-slow <f>         YaRN high correction bound (default 1)",
+                "  --yarn-orig-ctx <n>          YaRN's original context length (0 = the model's)",
+                "  --check-tensors              Reject a load whose tensor values hold NaN or infinity",
+                "  --load-format <f>            auto | full | dummy (seeded random weights for benchmarking)",
+                "  --lazy-mode                  Read row-gathered tensors per row on demand, not materialized",
+                "  --no-warmup                  Skip the load's warmup decode and reset",
                 "",
                 "Hugging Face checkpoints (model directories and .safetensors files; GGUF files ignore these):",
                 "  --hf-materialize <m>         Where derived tensors live (default auto): auto | memory | disk |",

@@ -1,76 +1,104 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import com.eonmux.neuralfree.gguf.engine.sampling.BiasStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.MinPStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.PenaltiesStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
+import com.eonmux.neuralfree.gguf.engine.sampling.TopKStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.TopPStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.TemperatureStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.TypicalStage;
+
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.SplittableRandom;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Host token sampler running llama.cpp's sampler chain over one logits row (llama.cpp src/llama-sampler.cpp, chain
- * order of llama.cpp common/common.h {@code common_params_sampling::samplers} as built by llama.cpp
- * common/sampling.cpp:329-406):
+ * Host token sampler running llama.cpp's sampler chain over one logits row (llama.cpp src/llama-sampler.cpp), as a
+ * stage chain with llama.cpp's configurable order (the {@code common_params_sampling::samplers} list,
+ * {@link StageKind}, currently carried by {@link SamplerConfig#order()}):
  * <ol>
- *   <li>logit bias: banned tokens ({@code tokenizer.ggml.suppress_tokens}, end-of-generation tokens under
+ *   <li>the fixed bias stage: banned tokens ({@code tokenizer.ggml.suppress_tokens}, end-of-generation tokens under
  *       ignore-eos) get {@code -inf} (llama_sampler_logit_bias_apply);</li>
- *   <li>penalties over the last {@code penaltyLastN} accepted tokens (llama_sampler_penalties_apply);</li>
- *   <li>top-k (llama_sampler_top_k_impl), typical-p (llama_sampler_typical_apply), nucleus top-p
- *       (llama_sampler_top_p_apply), min-p (llama_sampler_min_p_apply);</li>
- *   <li>temperature (llama_sampler_temp_impl);</li>
- *   <li>a seeded categorical draw (llama_sampler_dist_apply), or argmax when greedy
+ *   <li>the configured stages, one per configured kind that has a stage class, applied in the order's sequence;
+ *       a disabled stage (top-k 0, top-p 1, min-p 0, typical-p 1, penalties off) applies nothing exactly as
+ *       llama.cpp skips it, and a {@code min_keep} of 0 (the sampler default) leaves the stage unbounded;</li>
+ *   <li>the fixed dist stage: a seeded categorical draw (llama_sampler_dist_apply), or the argmax when greedy
  *       (llama_sampler_greedy_apply).</li>
  * </ol>
- * Disabled stages are skipped exactly as llama.cpp skips them. {@code min_keep} is llama.cpp's default 0.
+ * With the stages SA-2 adds (dry, top-n-sigma, xtc) building nothing, the default chain is
+ * {@code bias → penalties → top-k → typical-p → top-p → min-p → temperature → dist}.
+ *
+ * <p>Greedy decoding (an explicit greedy request or a temperature {@code <= 0}) runs the chain without the
+ * temperature stage and replaces the draw by the argmax; because top-k, top-p and min-p keep the highest logit
+ * on top, they are additionally skipped when locally typical sampling is inactive, as llama.cpp's greedy sampler
+ * only needs the argmax of such a set.
  *
  * <p>Candidates keep llama.cpp's {@code llama_token_data_array} semantics: the stages operate on the current
  * candidate set in its current order, and a {@code sorted} flag records whether it is in descending logit order.
  * Sorting is deterministic: equal logits keep their current relative order, so a vocabulary-ordered set breaks
  * ties by the lower token id.
  *
- * <p>Greedy decoding (an explicit greedy request or a temperature {@code <= 0}) selects the highest logit after
- * bias, penalties and, when typical-p is active, the truncation stages; top-k, top-p and min-p always keep the
- * highest logit, so they are skipped when typical-p is off.
- *
- * <p>A sampler is a mutable runtime object owned by one generation: it holds the penalty history, the RNG and
- * reusable candidate buffers. Not thread-safe.
+ * <p>A sampler is a mutable runtime object owned by one generation: it holds the chain stages (with the penalty
+ * history), the RNG and reusable candidate buffers. Not thread-safe.
  */
 public final class Sampler {
 
     private static final int[] NO_TOKENS = new int[0];
 
     private final int[] banned;
-    private final float repeatPenalty;
-    private final float presencePenalty;
-    private final float frequencyPenalty;
     private final boolean penalties;
     private final int topK;
     private final float typicalP;
-    private final float topP;
-    private final float minP;
-    private final float temperature;
     private final boolean greedy;
     private final long seed;
-    private final History history;
+    private final SamplerStage biasStage;
+    private final List<SamplerStage> chain;
     private final Candidates cur = new Candidates();
     private SplittableRandom rng;
-    private long[] keys = new long[0];
 
     private Sampler(int[] banned, float repeatPenalty, float presencePenalty, float frequencyPenalty, int penaltyLastN,
                     boolean penalties, int topK, float typicalP, float topP, float minP, float temperature,
-                    boolean greedy, long seed) {
+                    boolean greedy, long seed, List<StageKind> order, int minKeep) {
         this.banned = banned;
-        this.repeatPenalty = repeatPenalty;
-        this.presencePenalty = presencePenalty;
-        this.frequencyPenalty = frequencyPenalty;
         this.penalties = penalties;
         this.topK = topK;
         this.typicalP = typicalP;
-        this.topP = topP;
-        this.minP = minP;
-        this.temperature = temperature;
         this.greedy = greedy;
         this.seed = seed;
-        this.history = new History(penalties ? penaltyLastN : 0);
+        this.biasStage = new BiasStage(banned);
+        this.chain = buildChain(order, repeatPenalty, presencePenalty, frequencyPenalty, penaltyLastN, penalties,
+                topK, typicalP, topP, minP, temperature, minKeep);
         this.rng = new SplittableRandom(seed);
+    }
+
+    /** One built-in stage per configured kind that has a stage class. */
+    private static List<SamplerStage> buildChain(List<StageKind> order, float repeatPenalty, float presencePenalty,
+                                                 float frequencyPenalty, int penaltyLastN, boolean penalties, int topK,
+                                                 float typicalP, float topP, float minP, float temperature,
+                                                 int minKeep) {
+        List<SamplerStage> chain = new ArrayList<>();
+        for (StageKind kind : order) {
+            if (kind == StageKind.PENALTIES) {
+                chain.add(new PenaltiesStage(repeatPenalty, presencePenalty, frequencyPenalty, penaltyLastN, penalties));
+            } else if (kind == StageKind.TOP_K) {
+                chain.add(new TopKStage(topK, minKeep));
+            } else if (kind == StageKind.TYPICAL_P) {
+                chain.add(new TypicalStage(typicalP, minKeep));
+            } else if (kind == StageKind.TOP_P) {
+                chain.add(new TopPStage(topP, minKeep));
+            } else if (kind == StageKind.MIN_P) {
+                chain.add(new MinPStage(minP, minKeep));
+            } else if (kind == StageKind.TEMPERATURE) {
+                chain.add(new TemperatureStage(temperature));
+            }
+            // dry, top_n_sigma and xtc build nothing until SA-2 gives their stage classes.
+        }
+        return chain;
     }
 
     /** The generation chain for {@code config} without banned tokens. */
@@ -97,7 +125,33 @@ public final class Sampler {
         long seed = config.seeded() ? config.seed() : randomSeed();
         return new Sampler(banned, config.repeatPenalty(), config.presencePenalty(), config.frequencyPenalty(),
                 config.penaltyLastN(), config.penaltiesEnabled(), config.topK(), config.typicalP(), config.topP(),
-                config.minP(), config.temperature(), config.isGreedy(), seed);
+                config.minP(), config.temperature(), config.isGreedy(), seed, config.order(), config.minKeep());
+    }
+
+    /**
+     * The generation chain for {@code config} with the Java-API custom {@code extra} stages applied, in their list
+     * order, immediately before the temperature stage (or directly before the dist stage when the order has no
+     * temperature kind), so a custom stage always runs, including under greedy decoding.
+     *
+     * @throws IllegalArgumentException when {@code extra} or one of its entries is null
+     */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, List<SamplerStage> extra) {
+        Objects.requireNonNull(extra, "extra stages");
+        List<SamplerStage> stages = new ArrayList<>(extra);
+        if (stages.contains(null)) {
+            throw new IllegalArgumentException("extra stage list contains a null stage");
+        }
+        Sampler sampler = create(config, bannedTokens);
+        int insertAt = 0;
+        for (int i = 0; i < sampler.chain.size(); i++) {
+            if (sampler.chain.get(i).kind() == StageKind.TEMPERATURE) {
+                insertAt = i;
+                break;
+            }
+            insertAt = i + 1;
+        }
+        sampler.chain.addAll(insertAt, stages);
+        return sampler;
     }
 
     /**
@@ -119,7 +173,8 @@ public final class Sampler {
             throw new IllegalArgumentException("seed must be >= 0, or -1 for a random seed, got " + seed);
         }
         long s = seed == SamplerConfig.RANDOM_SEED ? randomSeed() : seed;
-        return new Sampler(NO_TOKENS, 1f, 0f, 0f, 0, false, topK, 1f, topP, 0f, temperature, false, s);
+        return new Sampler(NO_TOKENS, 1f, 0f, 0f, 0, false, topK, 1f, topP, 0f, temperature, false, s,
+                StageKind.DEFAULT_ORDER, 0);
     }
 
     /** A fresh non-negative seed for {@link SamplerConfig#RANDOM_SEED}. */
@@ -146,9 +201,11 @@ public final class Sampler {
         return banned.length == 0 && !penalties && ((greedy && typicalP >= 1f) || topK == 1);
     }
 
-    /** Records an accepted token for the penalties (prompt tokens included, as llama.cpp completion does). */
+    /** Records an accepted token with the chain's history stages (prompt tokens included, as llama.cpp does). */
     public void accept(int token) {
-        history.accept(token);
+        for (SamplerStage stage : chain) {
+            stage.accept(token);
+        }
     }
 
     /** {@link #accept(int)} for {@code tokens[off .. off + n)}. */
@@ -158,13 +215,15 @@ public final class Sampler {
             throw new IndexOutOfBoundsException("token range [" + off + ", " + (off + n) + ") outside " + tokens.length);
         }
         for (int i = off; i < off + n; i++) {
-            history.accept(tokens[i]);
+            accept(tokens[i]);
         }
     }
 
-    /** Forgets the penalty history and restarts the RNG from {@link #seed()}. */
+    /** Forgets the chain's histories and restarts the RNG from {@link #seed()}. */
     public void reset() {
-        history.clear();
+        for (SamplerStage stage : chain) {
+            stage.reset();
+        }
         rng = new SplittableRandom(seed);
     }
 
@@ -192,155 +251,29 @@ public final class Sampler {
             throw new IllegalArgumentException("cannot sample from an empty logits row");
         }
         cur.load(logits);
-        applyBias();
-        applyPenalties();
-        if (greedy) {
-            if (typicalP < 1f) {
-                applyTopK();
-                applyTypical();
-                applyTopP();
-                applyMinP();
+        biasStage.apply(cur);
+        for (SamplerStage stage : chain) {
+            StageKind kind = stage.kind();
+            if (greedy) {
+                if (kind == StageKind.TEMPERATURE) {
+                    continue;
+                }
+                if (typicalP >= 1f
+                        && (kind == StageKind.TOP_K || kind == StageKind.TOP_P || kind == StageKind.MIN_P)) {
+                    continue;
+                }
             }
+            stage.apply(cur);
+        }
+        if (greedy) {
             selectArgmax();
         } else {
-            applyTopK();
-            applyTypical();
-            applyTopP();
-            applyMinP();
-            applyTemperature();
             drawDist();
         }
         return cur;
     }
 
-    // ------------------------------------------------------------------ stages
-
-    private void applyBias() {
-        for (int id : banned) {
-            if (id < cur.size) {
-                cur.logits[id] = Float.NEGATIVE_INFINITY;
-            }
-        }
-    }
-
-    /** Candidates are still in vocabulary order here, so a token's candidate index is its id. */
-    private void applyPenalties() {
-        if (!penalties) {
-            return;
-        }
-        for (int a = 0; a < history.nActive; a++) {
-            int id = history.active[a];
-            if (id >= cur.size) {
-                continue;
-            }
-            int count = history.counts[id];
-            float l = cur.logits[id];
-            l = l <= 0f ? l * repeatPenalty : l / repeatPenalty;
-            l -= (float) count * frequencyPenalty + presencePenalty;
-            cur.logits[id] = l;
-        }
-        cur.sorted = false;
-    }
-
-    private void applyTopK() {
-        if (topK <= 0) {
-            return;
-        }
-        int k = Math.min(topK, cur.size);
-        if (!cur.sorted) {
-            partialSort(k);
-        }
-        cur.size = k;
-    }
-
-    /** Locally typical sampling; a zero probability contributes nothing to the entropy and ranks last. */
-    private void applyTypical() {
-        if (typicalP >= 1f) {
-            return;
-        }
-        softmax(true);
-        int n = cur.size;
-        float entropy = 0f;
-        for (int i = 0; i < n; i++) {
-            float p = cur.probs[i];
-            if (p > 0f) {
-                entropy += -p * (float) Math.log(p);
-            }
-        }
-        long[] k = keys(n);
-        for (int i = 0; i < n; i++) {
-            float p = cur.probs[i];
-            float shifted = p > 0f ? Math.abs(-(float) Math.log(p) - entropy) : Float.POSITIVE_INFINITY;
-            k[i] = ascendingKey(shifted, i);
-        }
-        Arrays.sort(k, 0, n);
-        float cum = 0f;
-        int last = n;
-        for (int i = 0; i < n; i++) {
-            cum += cur.probs[(int) k[i]];
-            if (cum > typicalP) {
-                last = i + 1;
-                break;
-            }
-        }
-        cur.permute(k, last);
-        cur.size = last;
-        cur.sorted = false;
-    }
-
-    /** Nucleus sampling: the smallest prefix of the descending order whose probability reaches {@code topP}. */
-    private void applyTopP() {
-        if (topP >= 1f) {
-            return;
-        }
-        softmax(false);
-        if (!cur.sorted) {
-            sortAll();
-        }
-        float cum = 0f;
-        int last = cur.size;
-        for (int i = 0; i < cur.size; i++) {
-            cum += cur.probs[i];
-            if (cum >= topP) {
-                last = i + 1;
-                break;
-            }
-        }
-        cur.size = last;
-    }
-
-    private void applyMinP() {
-        if (minP <= 0f || cur.size == 0) {
-            return;
-        }
-        if (!cur.sorted) {
-            float max = cur.maxLogit();
-            float minLogit = max + (float) Math.log(minP);
-            int kept = 0;
-            for (int i = 0; i < cur.size; i++) {
-                if (cur.logits[i] >= minLogit) {
-                    cur.move(i, kept++);
-                }
-            }
-            cur.size = kept;
-            return;
-        }
-        float minLogit = cur.logits[0] + (float) Math.log(minP);
-        int i = 1;
-        while (i < cur.size && cur.logits[i] >= minLogit) {
-            i++;
-        }
-        cur.size = i;
-    }
-
-    private void applyTemperature() {
-        if (temperature <= 0f) {
-            return;
-        }
-        for (int i = 0; i < cur.size; i++) {
-            cur.logits[i] /= temperature;
-        }
-    }
+    // ------------------------------------------------------------------ fixed chain end
 
     /** Argmax in the current order (the first maximum wins). */
     private void selectArgmax() {
@@ -402,27 +335,6 @@ public final class Sampler {
         cur.selected = selected >= 0 ? selected : lastPositive;
     }
 
-    /** llama_sampler_softmax_impl: probabilities of the current candidates, optionally sorting them first. */
-    private void softmax(boolean sort) {
-        if (sort && !cur.sorted) {
-            sortAll();
-        }
-        int n = cur.size;
-        float max = cur.sorted ? cur.logits[0] : cur.maxLogit();
-        if (max == Float.NEGATIVE_INFINITY) {
-            throw new IllegalStateException("no candidate has a finite logit (all banned, -inf or NaN)");
-        }
-        float sum = 0f;
-        for (int i = 0; i < n; i++) {
-            float p = expShift(cur.logits[i], max);
-            cur.probs[i] = p;
-            sum += p;
-        }
-        for (int i = 0; i < n; i++) {
-            cur.probs[i] /= sum;
-        }
-    }
-
     /**
      * {@code exp(logit - max)}; when {@code max} is {@code +inf} (an overflowed logit, for example after diffusion
      * Gumbel noise) this is its limit: the infinite logits share all the mass.
@@ -434,101 +346,12 @@ public final class Sampler {
         return (float) Math.exp(logit - max);
     }
 
-    // ------------------------------------------------------------------ ordering
-
-    private void sortAll() {
-        int n = cur.size;
-        long[] k = keys(n);
-        for (int i = 0; i < n; i++) {
-            k[i] = descendingKey(cur.logits[i], i);
-        }
-        Arrays.sort(k, 0, n);
-        cur.permute(k, n);
-        cur.sorted = true;
-    }
-
     /**
-     * Moves the {@code k} highest logits, in descending order, to the front (llama.cpp
-     * {@code llama_token_data_array_partial_sort_inplace}); the order of the rest is unspecified.
+     * Key whose ascending order is descending {@code logit}, then ascending {@code index}; the same image the
+     * chain's stages sort by ({@link Candidates#descendingKey}).
      */
-    private void partialSort(int k) {
-        int n = cur.size;
-        if ((long) k * 4 >= n) {
-            sortAll();
-            return;
-        }
-        long[] heap = keys(k);
-        int size = 0;
-        for (int i = 0; i < n; i++) {
-            long key = descendingKey(cur.logits[i], i);
-            if (size < k) {
-                heap[size] = key;
-                siftUp(heap, size++);
-            } else if (key < heap[0]) {
-                heap[0] = key;
-                siftDown(heap, size);
-            }
-        }
-        Arrays.sort(heap, 0, k);
-        cur.permute(heap, k);
-        cur.sorted = true;
-    }
-
-    /** Max-heap on the packed keys: the root is the worst of the kept candidates. */
-    private static void siftUp(long[] h, int i) {
-        long v = h[i];
-        while (i > 0) {
-            int parent = (i - 1) >>> 1;
-            if (h[parent] >= v) {
-                break;
-            }
-            h[i] = h[parent];
-            i = parent;
-        }
-        h[i] = v;
-    }
-
-    private static void siftDown(long[] h, int size) {
-        long v = h[0];
-        int i = 0;
-        while (true) {
-            int child = 2 * i + 1;
-            if (child >= size) {
-                break;
-            }
-            if (child + 1 < size && h[child + 1] > h[child]) {
-                child++;
-            }
-            if (h[child] <= v) {
-                break;
-            }
-            h[i] = h[child];
-            i = child;
-        }
-        h[i] = v;
-    }
-
-    private long[] keys(int n) {
-        if (keys.length < n) {
-            keys = new long[n];
-        }
-        return keys;
-    }
-
-    /** Monotone int image of a float: larger floats map to larger ints; {@code -0} and {@code +0} are equal. */
-    private static int sortableBits(float f) {
-        int bits = Float.floatToIntBits(f + 0.0f);
-        return bits ^ ((bits >> 31) & 0x7fffffff);
-    }
-
-    /** Key whose ascending order is descending {@code value}, then ascending {@code index}. */
-    static long descendingKey(float value, int index) {
-        return ((long) ~sortableBits(value) << 32) | (index & 0xffffffffL);
-    }
-
-    /** Key whose ascending order is ascending {@code value}, then ascending {@code index}. */
-    static long ascendingKey(float value, int index) {
-        return ((long) sortableBits(value) << 32) | (index & 0xffffffffL);
+    static long descendingKey(float logit, int index) {
+        return Candidates.descendingKey(logit, index);
     }
 
     // ------------------------------------------------------------------ candidate set
@@ -537,6 +360,12 @@ public final class Sampler {
      * The candidate set of the last {@link #apply} call: {@link #size()} candidates with their token id, logit
      * after the chain's transformations and probability from the last softmax or draw, plus the selected index.
      * Owned by the sampler and overwritten by its next call.
+     *
+     * <p>Alongside the reads below, the set also carries the mutation surface its chain's
+     * {@link com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage stages} apply through (logit edits, sorts,
+     * permutes and truncations with llama.cpp's {@code sorted} bookkeeping). Those methods are for the sampler and
+     * its stages: a set belongs to its sampler, and a caller outside the chain must not mutate it, or the
+     * sampler's view of its own last apply breaks.
      */
     public static final class Candidates {
 
@@ -546,6 +375,7 @@ public final class Sampler {
         private int[] tmpIds = new int[0];
         private float[] tmpLogits = new float[0];
         private float[] tmpProbs = new float[0];
+        private long[] sortKeys = new long[0];
         private int size;
         private boolean sorted;
         private int selected = -1;
@@ -563,6 +393,7 @@ public final class Sampler {
                 tmpIds = new int[n];
                 tmpLogits = new float[n];
                 tmpProbs = new float[n];
+                sortKeys = new long[n];
             }
             for (int i = 0; i < n; i++) {
                 float v = row[i];
@@ -575,7 +406,8 @@ public final class Sampler {
             selected = -1;
         }
 
-        float maxLogit() {
+        /** Largest logit of the current candidates (for stages that need the max over an unsorted set). */
+        public float maxLogit() {
             float max = logits[0];
             for (int i = 1; i < size; i++) {
                 if (logits[i] > max) {
@@ -586,7 +418,7 @@ public final class Sampler {
         }
 
         /** Reorders the first {@code n} candidates to {@code order[j]}'s low 32 bits (source index). */
-        void permute(long[] order, int n) {
+        public void permute(long[] order, int n) {
             for (int j = 0; j < n; j++) {
                 int src = (int) order[j];
                 tmpIds[j] = ids[src];
@@ -598,7 +430,8 @@ public final class Sampler {
             System.arraycopy(tmpProbs, 0, probs, 0, n);
         }
 
-        void move(int from, int to) {
+        /** Moves candidate {@code from} to slot {@code to} (llama.cpp's compaction while filtering). */
+        public void move(int from, int to) {
             if (from != to) {
                 ids[to] = ids[from];
                 logits[to] = logits[from];
@@ -649,80 +482,149 @@ public final class Sampler {
                 throw new IndexOutOfBoundsException("candidate " + i + " outside [0, " + size + ")");
             }
         }
-    }
 
-    // ------------------------------------------------------------------ penalty history
+        // ---------------------------------------------------------------- stage surface
 
-    /**
-     * Accepted tokens of the penalty window (llama_sampler_penalties ring buffer and {@code token_count}): a ring of
-     * the last {@code window} tokens, or every token when the window is {@link SamplerConfig#PENALTY_WHOLE_CONTEXT};
-     * nothing is kept for a window of 0. Distinct tokens with a positive count are listed in {@code active}.
-     */
-    private static final class History {
-
-        private final int window;
-        private int[] ring;
-        private int head;
-        private int stored;
-        private int[] counts = new int[0];
-        private int[] activePos = new int[0];
-        private int[] active = new int[16];
-        private int nActive;
-
-        History(int window) {
-            this.window = window;
-            this.ring = window > 0 ? new int[window] : null;
+        /**
+         * Key whose ascending order is descending {@code logit}, then ascending {@code index} (llama.cpp sorts on
+         * the logit; a vocabulary-first tie-break keeps sorting deterministic). {@code -0} and {@code +0} are equal.
+         */
+        public static long descendingKey(float logit, int index) {
+            return ((long) ~sortableBits(logit) << 32) | (index & 0xffffffffL);
         }
 
-        void accept(int token) {
-            if (window == 0) {
+        /** Key whose ascending order is ascending {@code value}, then ascending {@code index}. */
+        public static long ascendingKey(float value, int index) {
+            return ((long) sortableBits(value) << 32) | (index & 0xffffffffL);
+        }
+
+        /** Monotone int image of a float: larger floats map to larger ints; {@code -0} and {@code +0} are equal. */
+        private static int sortableBits(float f) {
+            int bits = Float.floatToIntBits(f + 0.0f);
+            return bits ^ ((bits >> 31) & 0x7fffffff);
+        }
+
+        /** Overwrites the logit of candidate {@code i}; the {@code sorted} flag is not touched (a stage decides). */
+        public void setLogit(int i, float logit) {
+            checkIndex(i);
+            logits[i] = logit;
+        }
+
+        /** Marks the set as no longer being in descending logit order. */
+        public void setSorted(boolean sorted) {
+            this.sorted = sorted;
+        }
+
+        /**
+         * Sorts all candidates in descending logit order, ties by index
+         * (llama.cpp {@code llama_token_data_array_partial_sort_inplace(cur_p, cur_p->size)}).
+         */
+        public void sortDescending() {
+            long[] k = sortKeys(size);
+            for (int i = 0; i < size; i++) {
+                k[i] = descendingKey(logits[i], i);
+            }
+            Arrays.sort(k, 0, size);
+            permute(k, size);
+            sorted = true;
+        }
+
+        /**
+         * Moves the {@code k} highest logits, in descending order, to the front, as a full sort of the primary part
+         * (llama.cpp {@code llama_token_data_array_partial_sort_inplace}); the order of the rest is unspecified. The
+         * full sort when {@code k} is close to the set size, as a partial sort costs no less then.
+         */
+        public void partialSortDescending(int k) {
+            int n = size;
+            if ((long) k * 4 >= n) {
+                sortDescending();
                 return;
             }
-            if (token < 0) {
-                throw new IllegalArgumentException("accepted token id " + token + " is negative");
-            }
-            increment(token);
-            if (window > 0) {
-                if (stored == window) {
-                    decrement(ring[head]);
-                    ring[head] = token;
-                    head = (head + 1) % window;
-                } else {
-                    ring[stored++] = token;
+            long[] heap = new long[k];
+            int heapSize = 0;
+            for (int i = 0; i < n; i++) {
+                long key = descendingKey(logits[i], i);
+                if (heapSize < k) {
+                    heap[heapSize] = key;
+                    siftUp(heap, heapSize++);
+                } else if (key < heap[0]) {
+                    heap[0] = key;
+                    siftDown(heap, heapSize);
                 }
             }
+            Arrays.sort(heap, 0, k);
+            permute(heap, k);
+            sorted = true;
         }
 
-        void clear() {
-            for (int a = 0; a < nActive; a++) {
-                counts[active[a]] = 0;
+        /** Keeps the first {@code newSize} candidates; candidates keep their order, so a sorted set stays sorted. */
+        public void truncate(int newSize) {
+            if (newSize < 0 || newSize > size) {
+                throw new IndexOutOfBoundsException("truncate to " + newSize + " outside [0, " + size + "]");
             }
-            nActive = 0;
-            head = 0;
-            stored = 0;
+            size = newSize;
         }
 
-        private void increment(int token) {
-            if (token >= counts.length) {
-                int cap = Math.max(token + 1, counts.length * 2);
-                counts = Arrays.copyOf(counts, cap);
-                activePos = Arrays.copyOf(activePos, cap);
+        /**
+         * llama_sampler_softmax_impl: probabilities of the current candidates from their logits, with
+         * probability 0 never rewritten. Callers sort first (llama.cpp passes a sort flag); the max must be finite.
+         *
+         * @throws IllegalStateException when no candidate has a finite logit
+         */
+        public void softmax() {
+            int n = size;
+            float max = sorted ? logits[0] : maxLogit();
+            if (max == Float.NEGATIVE_INFINITY) {
+                throw new IllegalStateException("no candidate has a finite logit (all banned, -inf or NaN)");
             }
-            if (counts[token]++ == 0) {
-                if (nActive == active.length) {
-                    active = Arrays.copyOf(active, nActive * 2);
+            float sum = 0f;
+            for (int i = 0; i < n; i++) {
+                float p = expShift(logits[i], max);
+                probs[i] = p;
+                sum += p;
+            }
+            for (int i = 0; i < n; i++) {
+                probs[i] /= sum;
+            }
+        }
+
+        private long[] sortKeys(int n) {
+            if (sortKeys.length < n) {
+                sortKeys = new long[n];
+            }
+            return sortKeys;
+        }
+
+        /** Max-heap on the packed keys: the root is the worst of the kept candidates. */
+        private static void siftUp(long[] h, int i) {
+            long v = h[i];
+            while (i > 0) {
+                int parent = (i - 1) >>> 1;
+                if (h[parent] >= v) {
+                    break;
                 }
-                activePos[token] = nActive;
-                active[nActive++] = token;
+                h[i] = h[parent];
+                i = parent;
             }
+            h[i] = v;
         }
 
-        private void decrement(int token) {
-            if (--counts[token] == 0) {
-                int pos = activePos[token];
-                int last = active[--nActive];
-                active[pos] = last;
-                activePos[last] = pos;
+        private static void siftDown(long[] h, int size) {
+            long v = h[0];
+            int i = 0;
+            while (true) {
+                int child = 2 * i + 1;
+                if (child >= size) {
+                    break;
+                }
+                if (child + 1 < size && h[child + 1] > h[child]) {
+                    child++;
+                }
+                if (h[child] <= v) {
+                    break;
+                }
+                h[i] = h[child];
+                i = child;
             }
         }
     }

@@ -1,5 +1,9 @@
 # kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
-# NeuralFree extension weight families (F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB; kernels/llm/matvec_extquant.cl) over the matvec_quant.comp and embed.comp templates (decoders in common/quant_ext.glsl).
+# NeuralFree extension weight families (F8_E5M2, F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB;
+# kernels/llm/matvec_extquant.cl) over the matvec_quant.comp and embed.comp templates (decoders in
+# common/quant_ext.glsl), plus the {T}_Hw_* hardware-FP8 fast paths of the four FP8 code types: GpuOps
+# selects a _Hw row only when the device reports the FP8 decode feature (CUDA sm_89+), and the rows
+# carry the same decoders, so the results stay bit-identical to the generic rows.
 F8_E4M3_MatVec	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_MATVEC	sg
 F8_E4M3_MatVecAdd	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_MATVEC_ADD	sg
 F8_E4M3_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_GATEUP_SILU	sg
@@ -48,3 +52,43 @@ FP4_BNB_EmbeddingLookup	embed.comp	QTYPE=QT_FP4_BNB OP=OP_EMBED
 FP4_BNB_BatchEmbeddingLookup	embed.comp	QTYPE=QT_FP4_BNB OP=OP_BATCH_EMBED
 FP4_BNB_BatchMatMul	matvec_quant.comp	QTYPE=QT_FP4_BNB OP=OP_BATCH	sg
 FP4_BNB_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_FP4_BNB OP=OP_BATCH_2D	sg
+F8_E5M2_MatVec	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_MATVEC	sg
+F8_E5M2_MatVecAdd	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_MATVEC_ADD	sg
+F8_E5M2_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_GATEUP_SILU	sg
+F8_E5M2_ComputeLogits	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_LOGITS	sg
+F8_E5M2_EmbeddingLookup	embed.comp	QTYPE=QT_F8_E5M2 OP=OP_EMBED
+F8_E5M2_BatchEmbeddingLookup	embed.comp	QTYPE=QT_F8_E5M2 OP=OP_BATCH_EMBED
+F8_E5M2_BatchMatMul	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_BATCH	sg
+F8_E5M2_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_BATCH_2D	sg
+F8_E5M2_Hw_MatVec	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_MATVEC	sg
+F8_E5M2_Hw_MatVecAdd	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_MATVEC_ADD	sg
+F8_E5M2_Hw_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_GATEUP_SILU	sg
+F8_E5M2_Hw_ComputeLogits	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_LOGITS	sg
+F8_E5M2_Hw_EmbeddingLookup	embed.comp	QTYPE=QT_F8_E5M2 OP=OP_EMBED
+F8_E5M2_Hw_BatchEmbeddingLookup	embed.comp	QTYPE=QT_F8_E5M2 OP=OP_BATCH_EMBED
+F8_E5M2_Hw_BatchMatMul	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_BATCH	sg
+F8_E5M2_Hw_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_F8_E5M2 OP=OP_BATCH_2D	sg
+F8_E4M3_Hw_MatVec	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_MATVEC	sg
+F8_E4M3_Hw_MatVecAdd	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_MATVEC_ADD	sg
+F8_E4M3_Hw_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_GATEUP_SILU	sg
+F8_E4M3_Hw_ComputeLogits	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_LOGITS	sg
+F8_E4M3_Hw_EmbeddingLookup	embed.comp	QTYPE=QT_F8_E4M3 OP=OP_EMBED
+F8_E4M3_Hw_BatchEmbeddingLookup	embed.comp	QTYPE=QT_F8_E4M3 OP=OP_BATCH_EMBED
+F8_E4M3_Hw_BatchMatMul	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_BATCH	sg
+F8_E4M3_Hw_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_F8_E4M3 OP=OP_BATCH_2D	sg
+F8_E4M3_B128_Hw_MatVec	matvec_quant.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_MATVEC	sg
+F8_E4M3_B128_Hw_MatVecAdd	matvec_quant.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_MATVEC_ADD	sg
+F8_E4M3_B128_Hw_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_GATEUP_SILU	sg
+F8_E4M3_B128_Hw_ComputeLogits	matvec_quant.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_LOGITS	sg
+F8_E4M3_B128_Hw_EmbeddingLookup	embed.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_EMBED
+F8_E4M3_B128_Hw_BatchEmbeddingLookup	embed.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_BATCH_EMBED
+F8_E4M3_B128_Hw_BatchMatMul	matvec_quant.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_BATCH	sg
+F8_E4M3_B128_Hw_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_F8_E4M3_B128 OP=OP_BATCH_2D	sg
+MXFP8_Hw_MatVec	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_MATVEC	sg
+MXFP8_Hw_MatVecAdd	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_MATVEC_ADD	sg
+MXFP8_Hw_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_GATEUP_SILU	sg
+MXFP8_Hw_ComputeLogits	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_LOGITS	sg
+MXFP8_Hw_EmbeddingLookup	embed.comp	QTYPE=QT_MXFP8 OP=OP_EMBED
+MXFP8_Hw_BatchEmbeddingLookup	embed.comp	QTYPE=QT_MXFP8 OP=OP_BATCH_EMBED
+MXFP8_Hw_BatchMatMul	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_BATCH	sg
+MXFP8_Hw_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_BATCH_2D	sg

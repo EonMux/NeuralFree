@@ -3,6 +3,8 @@ package com.eonmux.neuralfree.gguf.hf.arch;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.names.HfArchNames;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
+import com.eonmux.neuralfree.gguf.plugin.HfArchProvider;
+import com.eonmux.neuralfree.gguf.plugin.Plugins;
 import com.eonmux.neuralfree.utils.json.JsonView;
 
 import java.util.ArrayList;
@@ -18,8 +20,10 @@ import java.util.Optional;
 /**
  * Registry of the Hugging Face architectures NeuralFree converts at load time: the merge of the twelve
  * {@code HfArchTable*} tables and the rejected entries this class owns (the names llama.cpp's converter lists as text
- * models without registering a class for them). Built once on first use; a Hugging Face name registered twice for
- * one {@link HfArchEntry.Kind} fails the build with {@link IllegalStateException}.
+ * models without registering a class for them), plus the rows operator-installed plugin jars contribute through
+ * {@link Plugins#load(HfArchProvider.class)} (AX-0). Built once on first use; a Hugging Face name registered twice for
+ * one {@link HfArchEntry.Kind} fails the build with {@link IllegalStateException}, and a plugin row whose name collides
+ * with a built-in row or with the row of another plugin is rejected there with both sources named.
  *
  * <p>The name of a checkpoint follows the converter's {@code get_model_architecture}
  * (LC/conversion/base.py:3130-3159): for {@link HfArchEntry.Kind#TEXT} it is {@link HfConfig#architecture()}; for
@@ -34,20 +38,25 @@ public final class HfArchRegistry {
     }
 
     private static final class Holder {
-        static final Map<HfArchEntry.Kind, Map<String, HfArchEntry>> ENTRIES = merge(Arrays.asList(
-                rejectedEntries(),
-                HfArchTableLlama.entries(),
-                HfArchTableDenseClassic.entries(),
-                HfArchTableDense.entries(),
-                HfArchTableMoeClassic.entries(),
-                HfArchTableMoeSwa.entries(),
-                HfArchTableMoeMla.entries(),
-                HfArchTableHybridSsm.entries(),
-                HfArchTableHybridLinear.entries(),
-                HfArchTableSpecial.entries(),
-                HfArchTableSpecialGen.entries(),
-                HfArchTableMmproj.entries(),
-                HfArchTableDrafts.entries()));
+        static final Map<HfArchEntry.Kind, Map<String, HfArchEntry>> ENTRIES = withProviderRows();
+
+        private static Map<HfArchEntry.Kind, Map<String, HfArchEntry>> withProviderRows() {
+            Map<HfArchEntry.Kind, Map<String, HfArchEntry>> builtIn = merge(Arrays.asList(
+                    rejectedEntries(),
+                    HfArchTableLlama.entries(),
+                    HfArchTableDenseClassic.entries(),
+                    HfArchTableDense.entries(),
+                    HfArchTableMoeClassic.entries(),
+                    HfArchTableMoeSwa.entries(),
+                    HfArchTableMoeMla.entries(),
+                    HfArchTableHybridSsm.entries(),
+                    HfArchTableHybridLinear.entries(),
+                    HfArchTableSpecial.entries(),
+                    HfArchTableSpecialGen.entries(),
+                    HfArchTableMmproj.entries(),
+                    HfArchTableDrafts.entries()));
+            return mergeProviders(builtIn, Plugins.load(HfArchProvider.class));
+        }
     }
 
     /**
@@ -181,6 +190,71 @@ public final class HfArchRegistry {
             e.setValue(Collections.unmodifiableMap(e.getValue()));
         }
         return Collections.unmodifiableMap(m);
+    }
+
+    /**
+     * Adds the rows of plugin {@link HfArchProvider}s on top of the built-in map, in provider-name order
+     * ({@link Plugins#load} sorts them). A row whose Hugging Face name (for its kind) a built-in table or an
+     * earlier provider registers is rejected with both sources named: plugins never replace built-ins.
+     *
+     * <p>Public for the plugin tests, which rebuild what {@link Holder} builds without the
+     * {@code META-INF/services} resources of the production class path.
+     *
+     * @throws IllegalStateException with both sources named
+     */
+    public static Map<HfArchEntry.Kind, Map<String, HfArchEntry>> mergeProviders(
+            Map<HfArchEntry.Kind, Map<String, HfArchEntry>> builtIn, List<HfArchProvider> providers) {
+        Objects.requireNonNull(builtIn, "builtIn");
+        Objects.requireNonNull(providers, "providers");
+        Map<HfArchEntry.Kind, Map<String, HfArchEntry>> m = new EnumMap<>(HfArchEntry.Kind.class);
+        Map<HfArchEntry.Kind, Map<String, String>> source = new EnumMap<>(HfArchEntry.Kind.class);
+        for (HfArchEntry.Kind k : HfArchEntry.Kind.values()) {
+            m.put(k, new LinkedHashMap<>());
+            Map<String, String> src = new LinkedHashMap<>();
+            Map<String, HfArchEntry> built = builtIn.get(k);
+            if (built != null) {
+                for (String name : built.keySet()) {
+                    src.put(name, "the built-in HF architecture tables");
+                }
+            }
+            source.put(k, src);
+        }
+        for (HfArchProvider p : providers) {
+            addProviderRows(m, source, p);
+        }
+        for (Map.Entry<HfArchEntry.Kind, Map<String, HfArchEntry>> e : m.entrySet()) {
+            e.setValue(Collections.unmodifiableMap(e.getValue()));
+        }
+        return Collections.unmodifiableMap(m);
+    }
+
+    private static void addProviderRows(Map<HfArchEntry.Kind, Map<String, HfArchEntry>> m,
+                                       Map<HfArchEntry.Kind, Map<String, String>> source, HfArchProvider p) {
+        String name = p.getClass().getName();
+        List<HfArchEntry> rows = p.hfArchEntries();
+        if (rows == null) {
+            throw new IllegalStateException("plugin provider " + name + " returned null rows");
+        }
+        for (HfArchEntry e : rows) {
+            if (e == null) {
+                throw new IllegalStateException("plugin provider " + name + " returned a null row");
+            }
+            Map<String, HfArchEntry> kind = m.get(e.kind());
+            if (kind == null) {
+                throw new IllegalStateException("plugin provider " + name + " returned a row without a kind");
+            }
+            Map<String, String> kindSource = source.get(e.kind());
+            for (String hfName : e.hfNames()) {
+                String prev = kindSource.get(hfName);
+                if (prev != null) {
+                    throw new IllegalStateException("Hugging Face architecture '" + hfName + "' is registered by "
+                            + prev + " and by plugin provider " + name + " as " + e.kind()
+                            + "; plugins never replace built-in rows or the row of another provider");
+                }
+                kindSource.put(hfName, "plugin provider " + name);
+                kind.put(hfName, e);
+            }
+        }
     }
 
     /**

@@ -1,0 +1,144 @@
+package com.eonmux.neuralfree.gguf.engine.sampling;
+
+import com.eonmux.neuralfree.gguf.engine.Sampler.Candidates;
+
+import java.util.Arrays;
+
+/**
+ * llama.cpp's penalties sampler over the last {@code penaltyLastN} accepted tokens (prompt tokens included, as
+ * llama.cpp completion does): a seen token's logit is scaled by the repeat penalty (multiplied when the logit is
+ * negative, llama.cpp's fix for the old division making negative logits more likely), then reduced by the frequency
+ * penalty per occurrence and the presence penalty once. The set is marked unsorted, with no reorder. When the
+ * penalties are disabled the stage applies nothing and keeps no history, as llama.cpp's empty sampler does. Mutable
+ * (the accepted-token history); owned by the sampler that built it.
+ */
+public final class PenaltiesStage extends SamplerStage {
+
+    private final float repeatPenalty;
+    private final float presencePenalty;
+    private final float frequencyPenalty;
+    private final History history;
+
+    /**
+     * @param penaltyLastN accepted tokens the penalties look back over (0 disables the stage, -1 penalizes over the
+     *                     whole context)
+     * @param enabled      false for a chain whose configuration turned the penalties off (the stage then keeps no
+     *                     history and applies nothing, as llama.cpp's empty penalties sampler does)
+     */
+    public PenaltiesStage(float repeatPenalty, float presencePenalty, float frequencyPenalty, int penaltyLastN,
+                          boolean enabled) {
+        this.repeatPenalty = repeatPenalty;
+        this.presencePenalty = presencePenalty;
+        this.frequencyPenalty = frequencyPenalty;
+        this.history = new History(enabled ? penaltyLastN : 0);
+    }
+
+    @Override
+    public StageKind kind() {
+        return StageKind.PENALTIES;
+    }
+
+    /** Applies the penalties; candidates are still in vocabulary order here, so a token id is its candidate index. */
+    @Override
+    public void apply(Candidates candidates) {
+        if (history.window == 0) {
+            return;
+        }
+        for (int a = 0; a < history.nActive; a++) {
+            int id = history.active[a];
+            if (id >= candidates.size()) {
+                continue;
+            }
+            int count = history.counts[id];
+            float l = candidates.logit(id);
+            l = l <= 0f ? l * repeatPenalty : l / repeatPenalty;
+            l -= (float) count * frequencyPenalty + presencePenalty;
+            candidates.setLogit(id, l);
+        }
+        candidates.setSorted(false);
+    }
+
+    @Override
+    public void accept(int token) {
+        history.accept(token);
+    }
+
+    @Override
+    public void reset() {
+        history.clear();
+    }
+
+    /**
+     * Accepted tokens of the penalty window (the llama_sampler_penalties ring buffer and {@code token_count}): a ring
+     * of the last {@code window} tokens, or every token when the window is {@code -1} (the whole context); nothing is
+     * kept for a window of 0. Distinct tokens with a positive count are listed in {@code active}.
+     */
+    private static final class History {
+
+        private final int window;
+        private int[] ring;
+        private int head;
+        private int stored;
+        private int[] counts = new int[0];
+        private int[] activePos = new int[0];
+        private int[] active = new int[16];
+        private int nActive;
+
+        History(int window) {
+            this.window = window;
+            this.ring = window > 0 ? new int[window] : null;
+        }
+
+        void accept(int token) {
+            if (window == 0) {
+                return;
+            }
+            if (token < 0) {
+                throw new IllegalArgumentException("accepted token id " + token + " is negative");
+            }
+            increment(token);
+            if (window > 0) {
+                if (stored == window) {
+                    decrement(ring[head]);
+                    ring[head] = token;
+                    head = (head + 1) % window;
+                } else {
+                    ring[stored++] = token;
+                }
+            }
+        }
+
+        void clear() {
+            for (int a = 0; a < nActive; a++) {
+                counts[active[a]] = 0;
+            }
+            nActive = 0;
+            head = 0;
+            stored = 0;
+        }
+
+        private void increment(int token) {
+            if (token >= counts.length) {
+                int cap = Math.max(token + 1, counts.length * 2);
+                counts = Arrays.copyOf(counts, cap);
+                activePos = Arrays.copyOf(activePos, cap);
+            }
+            if (counts[token]++ == 0) {
+                if (nActive == active.length) {
+                    active = Arrays.copyOf(active, nActive * 2);
+                }
+                activePos[token] = nActive;
+                active[nActive++] = token;
+            }
+        }
+
+        private void decrement(int token) {
+            if (--counts[token] == 0) {
+                int pos = activePos[token];
+                int last = active[--nActive];
+                active[pos] = last;
+                activePos[last] = pos;
+            }
+        }
+    }
+}

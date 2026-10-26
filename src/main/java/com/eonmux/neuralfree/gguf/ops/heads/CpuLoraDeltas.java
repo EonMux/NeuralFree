@@ -8,14 +8,15 @@ import java.util.Objects;
  * Host deltas of one LoRA pair bound to its scale ({@link LoraAdapter.Delta}), as the three kinds of
  * {@link CpuProjectionDeltas}: a projection ({@link LoraAdapter.Delta#add}), the selected experts
  * ({@link LoraAdapter.Delta#addExperts}) and token-embedding rows ({@link LoraAdapter.Delta#addEmbedding}). Each delta
- * owns a scratch row grown on demand; one forward pass at a time.
+ * owns a scratch row grown on demand; one forward pass at a time, and the {@code LoraRegistry} of its attachment
+ * rescales the bound scale in place between steps ({@link Rescalable#rescale}, LR-1) on the engine thread.
  */
 public final class CpuLoraDeltas {
 
     private CpuLoraDeltas() {
     }
 
-    /** The host delta of {@code d} for its pair's kind. */
+    /** The host delta of {@code d} for its pair's kind; the delta carries the rescale of its bound scale. */
     public static Object of(LoraAdapter.Delta d) {
         switch (Objects.requireNonNull(d, "delta").pair().kind()) {
             case EXPERTS:
@@ -27,8 +28,17 @@ public final class CpuLoraDeltas {
         }
     }
 
+    /**
+     * A host delta that rewrites its bound scale between steps: every kind keeps only its {@link LoraAdapter.Delta}
+     * view, so the rescale is the delta's.
+     */
+    public interface Rescalable {
+        /** Binds the delta to {@code userScale} for the following products. */
+        void rescale(float userScale);
+    }
+
     /** A dense projection delta. */
-    public static final class Projection implements CpuProjectionDeltas.Delta {
+    public static final class Projection implements CpuProjectionDeltas.Delta, Rescalable {
         private final LoraAdapter.Delta delta;
         private float[] tmp = new float[0];
 
@@ -44,10 +54,15 @@ public final class CpuLoraDeltas {
             }
             delta.add(n, x, xOff, xStride, tmp, 0, y, yOff, yStride);
         }
+
+        @Override
+        public void rescale(float userScale) {
+            delta.rescale(userScale);
+        }
     }
 
     /** A per-expert delta over the selected pairs. */
-    public static final class Experts implements CpuProjectionDeltas.ExpertDelta {
+    public static final class Experts implements CpuProjectionDeltas.ExpertDelta, Rescalable {
         private final LoraAdapter.Delta delta;
         private final float[] tmp;
 
@@ -60,10 +75,15 @@ public final class CpuLoraDeltas {
         public void add(int pairs, int k, int[] ids, float[] x, int xOff, boolean tokenRows, float[] y, int yOff) {
             delta.addExperts(pairs, k, ids, x, xOff, tokenRows, tmp, y, yOff);
         }
+
+        @Override
+        public void rescale(float userScale) {
+            delta.rescale(userScale);
+        }
     }
 
     /** A token-embedding delta over looked-up rows. */
-    public static final class Embedding implements CpuProjectionDeltas.EmbeddingDelta {
+    public static final class Embedding implements CpuProjectionDeltas.EmbeddingDelta, Rescalable {
         private final LoraAdapter.Delta delta;
 
         Embedding(LoraAdapter.Delta delta) {
@@ -73,6 +93,11 @@ public final class CpuLoraDeltas {
         @Override
         public void add(int n, int[] ids, int idsOff, float[] y, int yOff, int yStride) {
             delta.addEmbedding(n, ids, idsOff, y, yOff, yStride);
+        }
+
+        @Override
+        public void rescale(float userScale) {
+            delta.rescale(userScale);
         }
     }
 }

@@ -6,8 +6,8 @@ package com.eonmux.neuralfree.gguf;
  * the elements per block. Q4_2 and Q4_3 were removed from ggml and keep zero sizes, as does UNKNOWN.
  * <p>
  * Ids 1000-1099 are the NeuralFree extension range ({@link #isExtension()}): block types that carry quantized
- * checkpoint formats exactly, with their scales inside each block. Ids 1000-1005 are assigned below; new extension
- * types take ids from 1006 on. Their block layouts (little-endian) are:
+ * checkpoint formats exactly, with their scales inside each block. Ids 1000-1006 are assigned below; new extension
+ * types take ids from 1007 on. Their block layouts (little-endian) are:
  * <ul>
  *   <li>{@link #F8_E4M3}: {@code u8 qs[32]}, E4M3FN codes; value {@code e4m3(qs[j])}.</li>
  *   <li>{@link #F8_E4M3_B128}: {@code f32 d; u8 qs[128]}; value {@code d * e4m3(qs[j])}.</li>
@@ -16,6 +16,8 @@ package com.eonmux.neuralfree.gguf;
  *   <li>{@link #NF4} and {@link #FP4_BNB}: {@code f32 absmax; u8 qs[32]}, byte {@code j} holding element {@code j}
  *       in its low nibble and element {@code j + 32} in its high nibble; value {@code code[q] * absmax} over the
  *       bitsandbytes NF4 or FP4 codebook.</li>
+ *   <li>{@link #F8_E5M2}: {@code u8 qs[32]}, E5M2 codes; value {@code e5m2(qs[j])} (IEEE half high bytes, with
+ *       the IEEE infinities and NaNs), scaled by the tensor's {@code .scale} sibling like {@link #F8_E4M3}.</li>
  * </ul>
  */
 public enum GGMLType {
@@ -62,6 +64,7 @@ public enum GGMLType {
     I8_B128(1003, 132, 128),
     NF4(1004, 36, 64),
     FP4_BNB(1005, 36, 64),
+    F8_E5M2(1006, 32, 32),
     UNKNOWN(-1, 0, 0);
 
     /** First id of the NeuralFree extension range. */

@@ -89,6 +89,7 @@ public final class CpuBlockDecoders {
         put(m, GGMLType.TQ2_0, TernaryBlockDecoders::decodeTq2_0);
 
         put(m, GGMLType.F8_E4M3, ExtBlockDecoders::decodeF8E4m3);
+        put(m, GGMLType.F8_E5M2, ExtBlockDecoders::decodeF8E5m2);
         put(m, GGMLType.F8_E4M3_B128, ExtBlockDecoders::decodeF8E4m3B128);
         put(m, GGMLType.MXFP8, ExtBlockDecoders::decodeMxfp8);
         put(m, GGMLType.I8_B128, ExtBlockDecoders::decodeI8B128);

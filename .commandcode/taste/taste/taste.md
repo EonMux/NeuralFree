@@ -1,4 +1,5 @@
 # Taste
+- When the user says to continue/resume a previous session, don't tell them to restart via CLI flags — locate and read that session's transcript on disk (e.g. under ~/.claude/projects/) and pick up the work in-session, even if it came from a different tool (e.g. a Claude Code session rather than command code). Confidence: 0.8
 - Never run tests, demos, apps or models directly; verify correctness by compiling (including kernel compilers where relevant) and tracing logic through code paths instead. Confidence: 0.95
 - Keep an existing codebase's design patterns when extending it; new work must be performant and well organized. Confidence: 0.85
 - When reference repos are provided (e.g. vllm, llama.cpp), use them as the semantic source of truth for feature parity. Confidence: 0.85

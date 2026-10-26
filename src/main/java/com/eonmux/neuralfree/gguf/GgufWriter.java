@@ -6,24 +6,23 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /**
- * Exports any {@link ModelSource} to a GGUF v3 file through {@link GgufEncoder}, the single GGUF encoder of
- * the repository. The export writes the header, the key/value pairs in the source's {@code getMetadata()}
- * order with their GGUF types (writing {@code general.alignment} only when the source lacks it), the tensor
- * infos, each validated with {@link GGUFTensorInfo#validate}, and the data streamed per tensor in one
- * sequential pass from {@code src.createMappedStore(StoreUse.RESIDENT_UPLOAD)} in chunks of at most
- * {@value #CHUNK_BYTES} bytes, zero-padded to the alignment — so no tensor is ever read into the heap
- * whole, and the whole-tensor window of the mapped store applies.
+ * Exports any {@link ModelSource} to one or more GGUF v3 files through {@link GgufEncoder}, the single
+ * GGUF encoder of the repository, streamed into the {@link GgufTensorSink} of the export — one file, or
+ * a rolling set of llama.cpp split shards. Every file holds the header, the key/value pairs in the
+ * source's {@code getMetadata()} order with their GGUF types (writing {@code general.alignment} only
+ * when the source lacks it), the tensor infos, each validated with {@link GGUFTensorInfo#validate}, and
+ * the data streamed per tensor in one sequential pass from {@code src.createMappedStore(
+ * StoreUse.RESIDENT_UPLOAD)} in chunks of at most {@value #CHUNK_BYTES} bytes, zero-padded to the
+ * alignment — so no tensor is ever read into the heap whole, and the whole-tensor window of the mapped
+ * store applies.
  *
  * <p>{@link Mode#NATIVE} keeps every extension tensor, marking the file with
  * {@link GgufKeys#NF_EXTENSION_TYPES} = BOOL true when the source does not carry the key itself.
@@ -31,12 +30,20 @@ import java.util.Objects;
  * {@link GgufCompatConverter} and drops the marker; {@link Mode#COMPAT_EXACT} exports every lossy or
  * approximate row as F32 instead. Conversion notes are logged per tensor. The {@code neuralfree.*} keys
  * stay in COMPAT too, because llama.cpp ignores keys it does not read; the {@code .input_perm} and
- * {@code .input_zero_point} tensors stay only in NATIVE, for which COMPAT fails with a named error.
+ * {@code .input_zero_point} tensors stay only in NATIVE, for which COMPAT fails with a named error.</p>
  *
- * <p>Output goes to {@code out + ".tmp"} and is renamed atomically on success; an existing {@code out} is
- * replaced only with {@code overwrite}. A failing export leaves the previous file untouched and removes the
- * temporary one. Split output, {@code --vocab-only} and the {@code runNfTool} task extend this class as
- * PAR TL-1 (§0.5). Not thread-safe.</p>
+ * <p>Every output file is written to a {@code .tmp} twin and renamed atomically on success, and the
+ * targets of the whole export (the shard files of a split too) are checked before the first byte is
+ * written, so a failing export leaves the previous files untouched and removes the temporary ones.
+ * {@link Options#vocabOnly} writes metadata and no tensor table at all (llama.cpp {@code --vocab-only}),
+ * never opening a store. The split limits of {@link Options} compute a llama.cpp-style tensor-to-shard
+ * plan: the files are named {@code <prefix>-<shard, %05d>-of-<count, %05d>.gguf}
+ * ({@code llama_split_path}, src/llama.cpp:570-596) and every shard carries the {@code split.*} keys
+ * {@link GGUFFileParser#loadShards()} reads — shard 0 the full metadata plus {@code split.no},
+ * {@code split.count} and {@code split.tensors.count}, every later shard the alignment plus those three
+ * keys. The declared tensor count is checked against the tensor table only for a single-file export;
+ * for a split of an already-split GGUF the source's declared count is its first file's shard-local
+ * count and is not re-checked. Not thread-safe.</p>
  */
 public final class GgufWriter {
 
@@ -63,6 +70,15 @@ public final class GgufWriter {
         public final boolean overwrite;
         /** Data alignment, used when the source carries no {@code general.alignment}. */
         public final int alignment;
+        /** Metadata-only export, no tensor table (llama.cpp {@code --vocab-only}); the split limits have no effect. */
+        public final boolean vocabOnly;
+        /** Largest tensor count of one shard: {@code 0} for no limit. */
+        public final long splitMaxTensors;
+        /**
+         * Largest data-section length of one shard in bytes, the length {@link GGUFFileParser} reads back
+         * and llama.cpp's split tool compares: {@code 0} for no limit.
+         */
+        public final long splitMaxBytes;
 
         /** Options with the default alignment {@link GGUFFileParser#DEFAULT_ALIGNMENT} and no overwrite. */
         public Options(Mode mode) {
@@ -70,22 +86,70 @@ public final class GgufWriter {
         }
 
         public Options(Mode mode, boolean overwrite, int alignment) {
+            this(mode, overwrite, alignment, false, 0L, 0L);
+        }
+
+        /** The full option set; every part validated as the narrower constructors validate it. */
+        public Options(Mode mode, boolean overwrite, int alignment, boolean vocabOnly, long splitMaxTensors,
+                       long splitMaxBytes) {
             if (mode == null) {
                 throw new IllegalArgumentException("export mode is null");
             }
             if (alignment <= 0 || (alignment & (alignment - 1)) != 0) {
                 throw new IllegalArgumentException("alignment " + alignment + " is not a positive power of two");
             }
+            if (splitMaxTensors < 0 || splitMaxTensors > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("splitMaxTensors " + splitMaxTensors
+                        + " is not 0 (no limit) or an int tensor count");
+            }
+            if (splitMaxBytes < 0) {
+                throw new IllegalArgumentException("splitMaxBytes " + splitMaxBytes + " is negative");
+            }
+            if (vocabOnly && (splitMaxTensors != 0 || splitMaxBytes != 0)) {
+                throw new IllegalArgumentException("--vocab-only exports no tensors; the split limits "
+                        + "(--split-max-tensors, --split-max-size) have nothing to limit");
+            }
             this.mode = mode;
             this.overwrite = overwrite;
             this.alignment = alignment;
+            this.vocabOnly = vocabOnly;
+            this.splitMaxTensors = splitMaxTensors;
+            this.splitMaxBytes = splitMaxBytes;
+        }
+
+        /** This options with {@code mode} set to the given value; the other values are kept. */
+        public Options mode(Mode mode) {
+            return mode == this.mode
+                    ? this
+                    : new Options(mode, overwrite, alignment, vocabOnly, splitMaxTensors, splitMaxBytes);
         }
 
         /** This options with {@code overwrite} set to the given value; the other values are kept. */
         public Options overwrite(boolean overwrite) {
             return overwrite == this.overwrite
                     ? this
-                    : new Options(mode, overwrite, alignment);
+                    : new Options(mode, overwrite, alignment, vocabOnly, splitMaxTensors, splitMaxBytes);
+        }
+
+        /** This options with {@code vocabOnly} set to the given value; the other values are kept. */
+        public Options vocabOnly(boolean vocabOnly) {
+            return vocabOnly == this.vocabOnly
+                    ? this
+                    : new Options(mode, overwrite, alignment, vocabOnly, splitMaxTensors, splitMaxBytes);
+        }
+
+        /** This options with {@code splitMaxTensors} set to the given value; the other values are kept. */
+        public Options splitMaxTensors(long splitMaxTensors) {
+            return splitMaxTensors == this.splitMaxTensors
+                    ? this
+                    : new Options(mode, overwrite, alignment, vocabOnly, splitMaxTensors, splitMaxBytes);
+        }
+
+        /** This options with {@code splitMaxBytes} set to the given value; the other values are kept. */
+        public Options splitMaxBytes(long splitMaxBytes) {
+            return splitMaxBytes == this.splitMaxBytes
+                    ? this
+                    : new Options(mode, overwrite, alignment, vocabOnly, splitMaxTensors, splitMaxBytes);
         }
     }
 
@@ -93,108 +157,204 @@ public final class GgufWriter {
     }
 
     /**
-     * Exports {@code src} to {@code out}.
+     * Exports {@code src} to {@code out} — or to the llama.cpp shard names derived from it, per the
+     * options' split limits.
      *
+     * @return the output files written, in order: {@code out} itself, or the split's shard paths
      * @throws IOException naming the source or the tensor for a malformed key/value value, an
-     *                     export-blocking tensor or a file-system problem; {@code out} is only replaced
-     *                     when the whole export succeeded
+     *                     export-blocking tensor, a tensor larger than the byte split limit or a
+     *                     file-system problem; an output file is only replaced when the whole export
+     *                     succeeded
      */
-    public static void write(ModelSource src, Path out, Options o) throws IOException {
+    public static List<Path> write(ModelSource src, Path out, Options o) throws IOException {
         Objects.requireNonNull(src, "src");
         Objects.requireNonNull(out, "out");
         Objects.requireNonNull(o, "options");
-        if (!o.overwrite && Files.exists(out)) {
-            throw new IOException("file '" + out + "' already exists; write with overwrite enabled to "
-                    + "replace it");
+        int alignment = effectiveAlignment(src, o);
+        if (o.vocabOnly) {
+            return exportVocabOnly(src, out, o, alignment);
         }
-        Path tmp = out.resolveSibling(out.getFileName().toString() + ".tmp");
-        boolean complete = false;
         try (WeightStore store = src.createMappedStore(StoreUse.RESIDENT_UPLOAD)) {
-            writeFile(src, out, tmp, store, o);
-            complete = true;
-        } finally {
-            if (!complete) {
-                try {
-                    Files.deleteIfExists(tmp);
-                } catch (IOException e) {
-                    LOGGER.warn("cannot remove the incomplete export {}", tmp, e);
-                }
-            }
+            return export(src, out, o, alignment, store);
         }
     }
 
-    /** Writes the whole export to {@code tmp} and renames it to {@code out}. */
-    private static void writeFile(ModelSource src, Path out, Path tmp, WeightStore store, Options o)
+    /** One metadata-and-tokenizer file ({@code --vocab-only}): the source's metadata order, no tensors. */
+    private static List<Path> exportVocabOnly(ModelSource src, Path out, Options o, int alignment)
             throws IOException {
-        List<GGUFTensorInfo> srcTensors = src.getTensors();
-        long declared = src.getTensorCount();
-        if (declared != srcTensors.size()) {
-            throw new IOException("source '" + src.getFilePath() + "' declares " + declared
-                    + " tensors but its table holds " + srcTensors.size()
-                    + "; the count must match for a single-file export");
+        GgufTensorSink sink = GgufTensorSink.singleFile(out, o.overwrite);
+        try {
+            checkTargets(sink, o);
+            try (sink) {
+                List<KvPair> kvs = vocabKvs(src, o.mode, alignment);
+                GgufEncoder enc = sink.begin(0);
+                enc.writeHeader(sink.channel(0), 0, kvs.size());
+                writeKvs(enc, kvs);
+                sink.end(0);
+            }
+            return List.of(out);
+        } finally {
+            sink.close();
         }
-        int alignment = effectiveAlignment(src, o);
-        List<KvPair> kvs = compatKvs(src, o.mode, alignment);
-        List<GGUFTensorInfo> outTensors = new ArrayList<>(srcTensors.size());
+    }
+
+    /** The whole export: the per-tensor target types, the shard plan, then every file written in order. */
+    private static List<Path> export(ModelSource src, Path out, Options o, int alignment, WeightStore store)
+            throws IOException {
+        List<GGUFTensorInfo> srcTensors = List.copyOf(src.getTensors());
+        int tensorCount = srcTensors.size();
+        // The per-tensor target types are decided for the whole table before the first file is opened, so
+        // a COMPAT-mode export of a native-only tensor fails before anything is replaced.
+        List<GGUFTensorInfo> targetTypes = new ArrayList<>(tensorCount);
         for (GGUFTensorInfo t : srcTensors) {
             GGMLType target = GgufCompatConverter.targetType(t, store, o.mode);
             if (target != t.type()) {
                 LOGGER.info("export converts tensor '{}' from {} to {} ({})", t.name(), t.type(), target,
                         GgufCompatConverter.isLossy(t.type(), target) ? "lossy" : "exact");
             }
-            outTensors.add(new GGUFTensorInfo(t.name(), t.dims(), target, t.offset()));
+            // The offsets of this type-side view are re-placed with the shard-local offsets below.
+            targetTypes.add(new GGUFTensorInfo(t.name(), t.dims(), target, t.offset()));
         }
-        try (FileChannel channel = FileChannel.open(tmp, StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
-            GgufEncoder enc = new GgufEncoder(channel, tmp.toString());
-            enc.writeHeader(channel, outTensors.size(), kvs.size());
-            for (KvPair kv : kvs) {
-                enc.writeKv(kv.key, kv.type, kv.elementType, kv.value);
+        List<List<GGUFTensorInfo>> shards = shardPlan(targetTypes, o, alignment);
+        int shardCount = shards.size();
+        if (shardCount == 1 && src.getTensorCount() != tensorCount) {
+            throw new IOException("source '" + src.getFilePath() + "' declares " + src.getTensorCount()
+                    + " tensors but its table holds " + tensorCount
+                    + "; the count must match for a single-file export");
+        }
+        GgufTensorSink sink = shardCount == 1
+                ? GgufTensorSink.singleFile(out, o.overwrite)
+                : GgufTensorSink.shards(out, shardCount, o.overwrite);
+        try {
+            checkTargets(sink, o);
+            List<Path> written = new ArrayList<>(shardCount);
+            for (int i = 0; i < sink.files(); i++) {
+                written.add(sink.file(i));
             }
-            long offset = 0;
-            String validatePrefix = "export of '" + src.getFilePath() + "' to '" + out + "'";
-            for (int i = 0; i < outTensors.size(); i++) {
-                GGUFTensorInfo info = outTensors.get(i);
-                GGUFTensorInfo.validate(validatePrefix, info);
-                GGUFTensorInfo placed = new GGUFTensorInfo(info.name(), info.dims(), info.type(), offset);
-                enc.writeTensorInfo(placed, offset);
-                outTensors.set(i, placed);
-                offset = alignUp(offset + info.sizeInBytes(), alignment);
-            }
-            enc.align(alignment);
-            for (int i = 0; i < outTensors.size(); i++) {
-                GGUFTensorInfo source = srcTensors.get(i);
-                if (source.type() == outTensors.get(i).type()) {
-                    copyStreamed(source, store, enc);
-                } else {
-                    GgufCompatConverter.convert(source, outTensors.get(i), store, enc);
+            try (sink) {
+                int first = 0;
+                for (int s = 0; s < shardCount; s++) {
+                    List<GGUFTensorInfo> shardTypes = shards.get(s);
+                    writeShard(sink, s, src,
+                            srcTensors.subList(first, first + shardTypes.size()), shardTypes,
+                            shardKvs(src, o.mode, alignment, s, shardCount, tensorCount, shardTypes), alignment,
+                            store);
+                    first += shardTypes.size();
                 }
-                enc.align(alignment);
             }
-            enc.flush();
-            channel.force(true);
+            return List.copyOf(written);
+        } finally {
+            sink.close();
         }
-        rename(tmp, out, o);
     }
 
-    /** Copies a tensor of unchanged type from the store in chunks; the alignment padding follows. */
-    private static void copyStreamed(GGUFTensorInfo src, WeightStore store, GgufEncoder enc) throws IOException {
-        long bytes = src.sizeInBytes();
-        byte[] buf = new byte[(int) Math.min(bytes, CHUNK_BYTES)];
-        long done = 0;
-        while (done < bytes) {
-            int n = (int) Math.min(buf.length, bytes - done);
-            store.readTensor(src.offset() + done, n, buf, 0);
-            enc.writeData(buf, 0, n);
-            done += n;
+    /** Writes one file of the export: header, key/values, tensor infos and the streamed tensor data. */
+    private static void writeShard(GgufTensorSink sink, int shardNo, ModelSource src,
+                                   List<GGUFTensorInfo> srcTensors, List<GGUFTensorInfo> targetTypes,
+                                   List<KvPair> kvs, int alignment, WeightStore store)
+            throws IOException {
+        GgufEncoder enc = sink.begin(shardNo);
+        String prefix = "export of '" + src.getFilePath() + "' to '" + sink.file(shardNo) + "'";
+        enc.writeHeader(sink.channel(shardNo), targetTypes.size(), kvs.size());
+        writeKvs(enc, kvs);
+        long offset = 0;
+        List<GGUFTensorInfo> placed = new ArrayList<>(targetTypes.size());
+        for (GGUFTensorInfo t : targetTypes) {
+            GGUFTensorInfo p = new GGUFTensorInfo(t.name(), t.dims(), t.type(), offset);
+            GGUFTensorInfo.validate(prefix, p);
+            enc.writeTensorInfo(p, offset);
+            placed.add(p);
+            offset = alignUp(offset + t.sizeInBytes(), alignment);
+        }
+        enc.align(alignment);
+        for (int i = 0; i < placed.size(); i++) {
+            GGUFTensorInfo source = srcTensors.get(i);
+            GGUFTensorInfo target = placed.get(i);
+            if (source.type() == target.type()) {
+                copyStreamed(source, store, enc);
+            } else {
+                GgufCompatConverter.convert(source, target, store, enc);
+            }
+            enc.align(alignment);
+        }
+        enc.flush();
+        sink.end(shardNo);
+    }
+
+    private static void writeKvs(GgufEncoder enc, List<KvPair> kvs) throws IOException {
+        for (KvPair kv : kvs) {
+            enc.writeKv(kv.key, kv.type, kv.elementType, kv.value);
         }
     }
 
     /**
-     * Key/value pairs of the export: the source's metadata in {@code getMetadata()} order, minus
-     * {@link GgufKeys#NF_EXTENSION_TYPES} in the COMPAT modes, plus the marker in NATIVE for a source whose
-     * tensors are of extension types but which does not carry the key, plus {@code general.alignment} when
-     * the source carries none.
+     * The key/value pairs of one output file: the source's metadata in {@code getMetadata()} order minus
+     * {@link GgufKeys#NF_EXTENSION_TYPES} in the COMPAT modes, plus the {@code split.*} keys of
+     * {@link GGUFFileParser#loadShards()} for a split ({@code split.no}, {@code split.count},
+     * {@code split.tensors.count} on every shard; shard 0 in its full metadata set, the later shards with
+     * only the alignment), plus {@code general.alignment} when the source carries none — so a later
+     * shard's data alignment is never silently the 32 default either.
+     */
+    private static List<KvPair> shardKvs(ModelSource src, Mode mode, int alignment, int shardNo, int shardCount,
+                                         long totalTensors, List<GGUFTensorInfo> shardTensors) throws IOException {
+        List<KvPair> kvs = new ArrayList<>();
+        if (shardNo > 0) {
+            kvs.add(new KvPair(GgufKeys.GENERAL_ALIGNMENT, GGUFValueType.UINT32, null, alignment));
+        }
+        // The header reader accepts an extension tensor only in a file whose own key/value section marks
+        // the extension types (see GGUFHeaderReader), so every shard holding one carries the key itself.
+        boolean extensionTensors = false;
+        for (GGUFTensorInfo t : shardTensors) {
+            extensionTensors |= t.type().isExtension();
+        }
+        if (extensionTensors && mode == Mode.NATIVE && shardNo > 0 && !src.getMetadata()
+                .containsKey(GgufKeys.NF_EXTENSION_TYPES)) {
+            kvs.add(new KvPair(GgufKeys.NF_EXTENSION_TYPES, GGUFValueType.BOOL, null, Boolean.TRUE));
+        }
+        if (shardCount > 1) {
+            kvs.add(new KvPair(GgufKeys.SPLIT_NO, GGUFValueType.UINT16, null, shardNo));
+            kvs.add(new KvPair(GgufKeys.SPLIT_COUNT, GGUFValueType.UINT16, null, shardCount));
+            kvs.add(new KvPair(GgufKeys.SPLIT_TENSORS_COUNT, GGUFValueType.INT32, null, (int) totalTensors));
+        }
+        if (shardNo == 0) {
+            kvs.addAll(compatKvs(src, mode, alignment));
+        }
+        return kvs;
+    }
+
+    /**
+     * The key/value pairs of a {@code --vocab-only} export: the source's metadata in
+     * {@code getMetadata()} order, minus {@link GgufKeys#NF_EXTENSION_TYPES} in the COMPAT modes, plus
+     * {@code general.alignment} when the source carries none. No tensor-based marker rule applies,
+     * because no tensor is exported.
+     */
+    private static List<KvPair> vocabKvs(ModelSource src, Mode mode, int alignment) throws IOException {
+        Map<String, Object> metadata = src.getMetadata();
+        List<KvPair> kvs = new ArrayList<>(metadata.size() + 1);
+        for (Map.Entry<String, Object> e : metadata.entrySet()) {
+            String key = e.getKey();
+            if (mode != Mode.NATIVE && GgufKeys.NF_EXTENSION_TYPES.equals(key)) {
+                continue;
+            }
+            GGUFValueType type = src.getValueType(key);
+            if (type == null) {
+                throw new IOException("metadata key '" + key + "' of source '" + src.getFilePath()
+                        + "' has no GGUF value type");
+            }
+            GGUFValueType elem = type == GGUFValueType.ARRAY ? src.getArrayElementType(key) : null;
+            kvs.add(new KvPair(key, type, elem, e.getValue()));
+        }
+        if (!metadata.containsKey(GgufKeys.GENERAL_ALIGNMENT)) {
+            kvs.add(new KvPair(GgufKeys.GENERAL_ALIGNMENT, GGUFValueType.UINT32, null, alignment));
+        }
+        return kvs;
+    }
+
+    /**
+     * Key/value pairs of shard 0's full metadata set: the source's metadata in {@code getMetadata()}
+     * order, minus {@link GgufKeys#NF_EXTENSION_TYPES} in the COMPAT modes, plus the marker in NATIVE for
+     * a source whose tensors are of extension types but which does not carry the key, plus
+     * {@code general.alignment} when the source carries none.
      */
     private static List<KvPair> compatKvs(ModelSource src, Mode mode, int alignment) throws IOException {
         Map<String, Object> metadata = src.getMetadata();
@@ -227,6 +387,56 @@ public final class GgufWriter {
     }
 
     /**
+     * The tensor-to-shard plan of the split: the target table in order, cut after a tensor that fills a
+     * limit the way llama.cpp's split tool cuts at tensor boundaries. A shard holds at most
+     * {@code splitMaxTensors} tensors and its data section at most {@code splitMaxBytes} bytes counting
+     * the padding the parser reads back, except that a single tensor always gets its own shard when it
+     * alone exceeds the byte limit — that is a named error instead. The table may be arbitrarily large;
+     * {@code 0} on either limit means no limit for it.
+     *
+     * @throws IOException naming the first tensor no split can make smaller
+     */
+    static List<List<GGUFTensorInfo>> shardPlan(List<GGUFTensorInfo> tensors, Options o, int alignment)
+            throws IOException {
+        if (o.splitMaxTensors == 0 && o.splitMaxBytes == 0) {
+            List<List<GGUFTensorInfo>> one = new ArrayList<>(1);
+            one.add(tensors);
+            return one;
+        }
+        List<List<GGUFTensorInfo>> shards = new ArrayList<>();
+        List<GGUFTensorInfo> shard = new ArrayList<>();
+        long end = 0;
+        for (GGUFTensorInfo t : tensors) {
+            long size = t.sizeInBytes();
+            long next = alignUp(end, alignment) + size;
+            if (o.splitMaxBytes != 0 && size > o.splitMaxBytes) {
+                throw new IOException("tensor '" + t.name() + "' alone occupies " + size
+                        + " bytes, more than --split-max-size " + o.splitMaxBytes
+                        + "; no split can produce a smaller shard");
+            }
+            if (!shard.isEmpty()) {
+                if (o.splitMaxTensors != 0 && shard.size() >= o.splitMaxTensors) {
+                    shards.add(shard);
+                    shard = new ArrayList<>();
+                    next = size;
+                } else if (o.splitMaxBytes != 0 && next > o.splitMaxBytes) {
+                    shards.add(shard);
+                    shard = new ArrayList<>();
+                    next = size;
+                }
+            }
+            shard.add(t);
+            end = next;
+        }
+        if (!shard.isEmpty()) {
+            shards.add(shard);
+        }
+        return shards;
+    }
+
+    // ------------------------------------------------------------------ alignment and file targets
+
+    /**
      * The alignment the data section uses: the source's {@code general.alignment} when it carries the key,
      * else the options'. As llama.cpp does, the value must be UINT32 and a positive power of two,
      * and the export reports a malformed one with a named error.
@@ -256,18 +466,33 @@ public final class GgufWriter {
         return (v + alignment - 1) / alignment * alignment;
     }
 
-    /** Renames {@code tmp} over {@code out}, replacing the previous file only when the options allow it. */
-    private static void rename(Path tmp, Path out, Options o) throws IOException {
+    /** Fails before the first byte when any target of the export exists and {@code overwrite} is off. */
+    private static void checkTargets(GgufTensorSink sink, Options o) throws IOException {
         if (o.overwrite) {
-            try {
-                Files.move(tmp, out, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                return;
-            } catch (AtomicMoveNotSupportedException e) {
-                Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
-                return;
+            return;
+        }
+        for (int i = 0; i < sink.files(); i++) {
+            Path out = sink.file(i);
+            if (Files.exists(out)) {
+                throw new IOException("file '" + out + "' already exists; write with overwrite enabled to "
+                        + "replace it");
             }
         }
-        Files.move(tmp, out, StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    // ------------------------------------------------------------------ streaming and held key/values
+
+    /** Copies a tensor of unchanged type from the store in chunks; the alignment padding follows. */
+    private static void copyStreamed(GGUFTensorInfo src, WeightStore store, GgufEncoder enc) throws IOException {
+        long bytes = src.sizeInBytes();
+        byte[] buf = new byte[(int) Math.min(bytes, CHUNK_BYTES)];
+        long done = 0;
+        while (done < bytes) {
+            int n = (int) Math.min(buf.length, bytes - done);
+            store.readTensor(src.offset() + done, n, buf, 0);
+            enc.writeData(buf, 0, n);
+            done += n;
+        }
     }
 
     /** One key/value pair of the export, held until every header count is known. */

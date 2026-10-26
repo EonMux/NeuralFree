@@ -237,6 +237,25 @@ task runLLMDemo(type: JavaExec) {
     }
 }
 
+task runNfTool(type: JavaExec) {
+    description = 'Runs the nftool CLI (export, and the tools of the later tool work packages)'
+    group = 'application'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.eonmux.neuralfree.demo.tools.NfTool'
+
+    jvmArgs '-Xmx4096m', '--add-opens=java.base/java.util=ALL-UNNAMED'
+    if (project.hasProperty('args')) {
+        // Parse args respecting quoted strings (single or double quotes), as runLLMDemo does
+        def parsed = []
+        def matcher = (project.args =~ /(?:"([^"]*)")|(?:'([^']*)')|(\S+)/)
+        while (matcher.find()) {
+            parsed << (matcher.group(1) ?: matcher.group(2) ?: matcher.group(3))
+        }
+        args parsed
+    }
+}
+
 task runDemos(type: JavaExec) {
     description = 'Runs the NeuralFree demo suite'
     group = 'application'

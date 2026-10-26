@@ -28,6 +28,14 @@ public interface ModelMemory extends AutoCloseable {
     /** Host record of the stored sequence. */
     SequenceState sequence();
 
+    /**
+     * The sequence-addressing API over this memory (llama.cpp {@code llama_memory_seq_*}). Default: the adapter
+     * over this memory's single contiguous sequence; memories that hold their own pages replace it.
+     */
+    default SequenceMemory sequences() {
+        return new SingleSequenceMemory(this);
+    }
+
     /** Empties all caches and zeroes all states. */
     void reset();
 

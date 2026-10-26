@@ -1,0 +1,37 @@
+plugins { id 'java'; id 'io.quarkus' }
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+repositories { mavenLocal(); mavenCentral() }
+dependencies {
+    implementation enforcedPlatform('io.quarkus.platform:quarkus-bom:3.40.1')
+    implementation project(':')
+    implementation 'io.quarkus:quarkus-rest'
+    implementation 'io.quarkus:quarkus-websockets-next'
+    implementation 'io.quarkus:quarkus-grpc'
+    implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
+    implementation 'io.quarkus:quarkus-smallrye-health'
+    implementation 'io.quarkus:quarkus-opentelemetry'
+    implementation 'io.quarkus:quarkus-scheduler'
+    implementation 'org.jboss.logmanager:log4j2-jboss-logmanager'
+    testImplementation 'io.quarkus:quarkus-junit'
+}
+configurations.all {
+    exclude group: 'io.netty', module: 'netty-transport-native-epoll'
+    exclude group: 'io.netty', module: 'netty-transport-native-kqueue'
+    exclude group: 'io.netty', module: 'netty-transport-native-io_uring'
+    exclude group: 'io.netty', module: 'netty-tcnative-boringssl-static'
+    exclude group: 'io.netty.incubator'
+}
+
+// Writes the server's resolved compile classpaths for srvjavac.sh (PARITY §4): the isolated
+// per-WP compile keeps server WPs of one stage independent, as nfjavac.sh does for core WPs.
+task writeServerClasspath {
+    description = 'Writes the main and test compile classpaths to build/classpath.txt for srvjavac.sh'
+    group = 'build'
+
+    doLast {
+        def file = layout.buildDirectory.file('classpath.txt').get().asFile
+        file.parentFile.mkdirs()
+        file.text = 'MAINCP=' + sourceSets.main.compileClasspath.files*.absolutePath.join(':') + '\n' +
+                    'TESTCP=' + sourceSets.test.compileClasspath.files*.absolutePath.join(':') + '\n'
+    }
+}

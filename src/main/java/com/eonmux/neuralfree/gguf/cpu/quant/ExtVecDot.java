@@ -16,7 +16,7 @@ import static com.eonmux.neuralfree.gguf.cpu.quant.Q8VecDot.putLong;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 
 /**
- * CPU vec-dot of the NeuralFree extension block types (F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB) with
+ * CPU vec-dot of the NeuralFree extension block types (F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB) with
  * Q8_0 activations, in the shape of ggml's {@code ggml_vec_dot_<w>_q8_0} kernels (llama.cpp
  * ggml/src/ggml-cpu/quants.c). Each weight block is walked in 32-element runs, one per Q8_0 activation block:
  * a run contributes {@code d_w * d_x * sum_j code_j * q_j}, where {@code code_j} is the decoded element (E4M3 value,
@@ -31,16 +31,19 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 public final class ExtVecDot implements CpuVecDot {
 
     public static final ExtVecDot F8_E4M3 = new ExtVecDot(GGMLType.F8_E4M3, ExtVecDot::dotF8E4m3);
+    public static final ExtVecDot F8_E5M2 = new ExtVecDot(GGMLType.F8_E5M2, ExtVecDot::dotF8E5m2);
     public static final ExtVecDot F8_E4M3_B128 = new ExtVecDot(GGMLType.F8_E4M3_B128, ExtVecDot::dotF8E4m3B128);
     public static final ExtVecDot MXFP8 = new ExtVecDot(GGMLType.MXFP8, ExtVecDot::dotMxfp8);
     public static final ExtVecDot I8_B128 = new ExtVecDot(GGMLType.I8_B128, ExtVecDot::dotI8B128);
     public static final ExtVecDot NF4 = new ExtVecDot(GGMLType.NF4, ExtVecDot::dotNf4);
     public static final ExtVecDot FP4_BNB = new ExtVecDot(GGMLType.FP4_BNB, ExtVecDot::dotFp4Bnb);
 
-    private static final Map<GGMLType, ExtVecDot> BY_TYPE = index(F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB);
+    private static final Map<GGMLType, ExtVecDot> BY_TYPE = index(F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB);
 
     /** Value of every E4M3FN code, from {@link FpBlockDecoders#e4m3ToFp32(int)} so it matches the decoder. */
     private static final float[] E4M3 = buildE4m3();
+    /** Value of every E5M2 code (IEEE half high bytes), from {@link FpBlockDecoders#e5m2ToFp32(int)}. */
+    private static final float[] E5M2 = buildE5m2();
     /** NF4 codebook ({@link QuantTables#nf4Code(int)}). */
     private static final float[] NF4_CODE = buildCodebook(false);
     /** FP4_BNB codebook ({@link QuantTables#fp4BnbCode(int)}). */
@@ -76,6 +79,14 @@ public final class ExtVecDot implements CpuVecDot {
         float[] t = new float[256];
         for (int i = 0; i < t.length; i++) {
             t[i] = FpBlockDecoders.e4m3ToFp32(i);
+        }
+        return t;
+    }
+
+    private static float[] buildE5m2() {
+        float[] t = new float[256];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = FpBlockDecoders.e5m2ToFp32(i);
         }
         return t;
     }
@@ -164,6 +175,27 @@ public final class ExtVecDot implements CpuVecDot {
         float sumf = 0.0f;
         for (int ib = 0; ib < nb; ib++, off += F8_E4M3_BYTES) {
             sumf += yd[ib] * runE4m3(b, off + F8_E4M3_QS, q8, ib * QK8_0);
+        }
+        return sumf;
+    }
+
+    /** {@code sum_j e5m2(w[qs + j]) * q8[o + j]} over one 32-element run. */
+    private static float runE5m2(ByteBuffer b, int qs, byte[] q8, int o) {
+        final float[] lut = E5M2;
+        float sum = 0.0f;
+        for (int j = 0; j < QK8_0; j++) {
+            sum += lut[b.get(qs + j) & 0xFF] * q8[o + j];
+        }
+        return sum;
+    }
+
+    /** F8_E5M2: block {@code ib} is Q8_0 run {@code ib}; {@code sumf += d_x * sum}. */
+    private static float dotF8E5m2(ByteBuffer b, int off, QuantizedActivations x, int nb, byte[] aux) {
+        final byte[] q8 = x.qs;
+        final float[] yd = x.d;
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++, off += F8_E5M2_BYTES) {
+            sumf += yd[ib] * runE5m2(b, off + F8_E5M2_QS, q8, ib * QK8_0);
         }
         return sumf;
     }

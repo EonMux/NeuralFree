@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.GpuBackendException;
 import com.eonmux.neuralfree.acceleration.GpuOutOfMemoryException;
 import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
@@ -31,6 +32,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -56,6 +58,12 @@ import java.util.Set;
  * ACT_QUANT fake-quantizing in place with {@value #ACT_FAKE_QUANT}, and PERMUTE gathering out of place with
  * {@value #PERMUTE_COLS} into a second staging region; a weight with an output scale multiplies the result
  * (llama-graph.cpp:1643-1645).</p>
+ *
+ * <p><b>Hardware-FP8 fast paths.</b> The FP8 code types {@code F8_E5M2}, {@code F8_E4M3}, {@code F8_E4M3_B128} and
+ * {@code MXFP8} also have a {@code {T}_Hw_*} row set over the same argument lists, converting the code pairs with
+ * the hardware float8 conversions (CUDA sm_89+, {@code cvt.rn.f16x2.e5m2x2}/{@code e4m3x2}); the results are
+ * bit-identical to the generic rows. {@link #hardwareFp8Decode} picks the {@code _Hw} set for a device that
+ * reports the feature; a missing feature, and OpenCL, selects the generic rows as the fallback.</p>
  *
  * <p><b>Optional projection kernels.</b> The tiled GEMM, the {@code _2D} batch and the in-kernel accumulate
  * ({@code {T}_MatVecAdd}) each have a fallback: the batched matvec, the one-dimensional batch, and the product into
@@ -163,13 +171,43 @@ public final class GpuOps implements AutoCloseable {
             GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S, GGMLType.IQ1_S,
             GGMLType.IQ1_M,
             GGMLType.TQ1_0, GGMLType.TQ2_0, GGMLType.NVFP4, GGMLType.Q1_0, GGMLType.Q2_0,
-            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4,
+            GGMLType.F8_E4M3, GGMLType.F8_E5M2, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4,
             GGMLType.FP4_BNB,
         };
         for (GGMLType t : standard) {
             m.put(t, WeightKernels.standard(t.name()));
         }
         return Collections.unmodifiableMap(m);
+    }
+
+    /** Weight types with hardware-FP8 decode rows ({@code *_Hw_*} kernels): the E4M3FN/E5M2 code types. */
+    private static final Set<GGMLType> HW_FP8_TYPES = Collections.unmodifiableSet(EnumSet.of(
+            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.F8_E5M2));
+
+    /** Lowest CUDA compute capability with the hardware FP8 conversions ({@code sm_89}: cvt.rn.f16x2.e4m3x2/e5m2x2). */
+    private static final int HW_FP8_COMPUTE_CAPABILITY = 89;
+
+    /**
+     * Hardware-FP8 decode is selected on a device that reports the feature: CUDA sm_89 or higher
+     * ({@link DeviceCapabilities#getComputeCapability()}), which converts the E4M3FN/E5M2 code pairs in hardware.
+     * A missing feature, or a CPU/OpenCL/Vulkan device, selects the generic rows.
+     */
+    private static boolean hardwareFp8Decode(ComputeBackend backend, DeviceCapabilities caps) {
+        if (backend == null || caps == null) {
+            return false;
+        }
+        return backend.backendType() == ComputeBackend.BackendType.CUDA && caps.getComputeCapability() >= HW_FP8_COMPUTE_CAPABILITY;
+    }
+
+    /**
+     * The {@code {T}_Hw_*} fast-path kernels of one weight type (see the class notes); these are the same
+     * argument lists and decoding contract as the generic rows, with the FP8 code pairs converted in hardware on
+     * CUDA sm_89+, so the results are bit-identical.
+     */
+    private static WeightKernels hardware(String t) {
+        return new WeightKernels(t + "_Hw_MatVec", t + "_Hw_MatVecAdd", t + "_Hw_BatchMatMul",
+                t + "_Hw_BatchMatMul_2D", t + "_Hw_MatMul_Tiled", t + "_Hw_EmbeddingLookup",
+                t + "_Hw_BatchEmbeddingLookup");
     }
 
     /** A float view (buffer, element offset). */
@@ -541,10 +579,8 @@ public final class GpuOps implements AutoCloseable {
      */
     public void prewarmWeightKernels(GGMLType type, boolean matmul, boolean lookup) {
         ensureOpen();
-        WeightKernels k = FAMILIES.get(Objects.requireNonNull(type, "type"));
-        if (k == null) {
-            throw new UnsupportedOperationException("no GPU projection kernels for weight type " + type);
-        }
+        Objects.requireNonNull(type, "type");
+        WeightKernels k = family(type);
         long[] rowReduce = {local};
         if (matmul && local % MATVEC_MAX_TPS == 0) {
             prewarmIfPresent(k.matvec, rowReduce);
@@ -1069,13 +1105,28 @@ public final class GpuOps implements AutoCloseable {
 
     // ================================================================== validation
 
-    private static WeightKernels family(GpuWeight w) {
+    /** The weight kernels of {@code type}; throws when GpuOps has none for it. */
+    private WeightKernels family(GGMLType type) {
+        WeightKernels k = FAMILIES.get(type);
+        if (k == null) {
+            throw new UnsupportedOperationException("no GPU projection kernels for weight type " + type);
+        }
+        return hwFamily(type, k);
+    }
+
+    private WeightKernels family(GpuWeight w) {
         WeightKernels k = FAMILIES.get(w.type());
         if (k == null) {
             throw new UnsupportedOperationException("tensor " + w.name() + ": no GPU kernels for weight type "
                     + w.type());
         }
-        return k;
+        return hwFamily(w.type(), k);
+    }
+
+    /** The weight kernels of {@code type}, or the {@code {T}_Hw_*} fast-path set when it applies. */
+    private WeightKernels hwFamily(GGMLType type, WeightKernels generic) {
+        return HW_FP8_TYPES.contains(type) && hardwareFp8Decode(backend, kernels.caps())
+                ? hardware(type.name()) : generic;
     }
 
     private static int cols(GpuWeight w) {

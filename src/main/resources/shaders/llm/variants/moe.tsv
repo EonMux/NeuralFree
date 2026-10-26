@@ -116,6 +116,10 @@ Q1_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q1_0 OP=OP_BATCH_MATMUL_ID	sg
 Q2_0_MatVecId	matvec_id.comp	QTYPE=QT_Q2_0 OP=OP_MATVEC_ID	sg
 Q2_0_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_Q2_0 OP=OP_MATVEC_ID_GATEUP	sg
 Q2_0_BatchMatMulId	matvec_id.comp	QTYPE=QT_Q2_0 OP=OP_BATCH_MATMUL_ID	sg
+# F8_E5M2
+F8_E5M2_MatVecId	matvec_id.comp	QTYPE=QT_F8_E5M2 OP=OP_MATVEC_ID	sg
+F8_E5M2_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_F8_E5M2 OP=OP_MATVEC_ID_GATEUP	sg
+F8_E5M2_BatchMatMulId	matvec_id.comp	QTYPE=QT_F8_E5M2 OP=OP_BATCH_MATMUL_ID	sg
 # F8_E4M3
 F8_E4M3_MatVecId	matvec_id.comp	QTYPE=QT_F8_E4M3 OP=OP_MATVEC_ID	sg
 F8_E4M3_MatVecIdGateUp	matvec_id.comp	QTYPE=QT_F8_E4M3 OP=OP_MATVEC_ID_GATEUP	sg

@@ -1,6 +1,8 @@
 package com.eonmux.neuralfree.gguf.arch;
 
 import com.eonmux.neuralfree.gguf.hparams.ArchHparamsHook;
+import com.eonmux.neuralfree.gguf.plugin.ArchProvider;
+import com.eonmux.neuralfree.gguf.plugin.Plugins;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -9,13 +11,16 @@ import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
  * Registry of every architecture: the merge of {@link ArchTableDense}, {@link ArchTableMoe},
  * {@link ArchTableHybrid}, {@link ArchTableSpecial} and the rejected entries for {@link Arch#CLIP},
- * {@link Arch#GPTJ} and {@link Arch#UNKNOWN}, which this class owns. Built once on first use; a duplicate
- * row fails the build, a missing row fails the lookup.
+ * {@link Arch#GPTJ} and {@link Arch#UNKNOWN}, which this class owns, plus the rows operator-installed plugin
+ * jars contribute through {@link Plugins#load(ArchProvider.class)} (AX-0). Built once on first use; a duplicate
+ * row fails the build, a missing row fails the lookup, and a plugin row whose architecture collides with a
+ * built-in row or with the row of another plugin is rejected there with both sources named.
  */
 public final class ArchRegistry {
 
@@ -23,12 +28,17 @@ public final class ArchRegistry {
     }
 
     private static final class Holder {
-        static final Map<Arch, ArchEntry> ENTRIES = merge(Arrays.asList(
-                rejectedEntries(),
-                ArchTableDense.entries(),
-                ArchTableMoe.entries(),
-                ArchTableHybrid.entries(),
-                ArchTableSpecial.entries()));
+        static final Map<Arch, ArchEntry> ENTRIES = withProviderRows();
+
+        private static Map<Arch, ArchEntry> withProviderRows() {
+            Map<Arch, ArchEntry> builtIn = merge(Arrays.asList(
+                    rejectedEntries(),
+                    ArchTableDense.entries(),
+                    ArchTableMoe.entries(),
+                    ArchTableHybrid.entries(),
+                    ArchTableSpecial.entries()));
+            return mergeProviders(builtIn, Plugins.load(ArchProvider.class));
+        }
     }
 
     /**
@@ -84,6 +94,53 @@ public final class ArchRegistry {
             }
         }
         return Collections.unmodifiableMap(m);
+    }
+
+    /**
+     * Adds the rows of plugin {@link ArchProvider}s on top of the built-in map, in provider-name order
+     * ({@link Plugins#load} sorts them). A row for an architecture the built-in map or an earlier provider
+     * registers is rejected with both sources named: plugins never replace built-ins.
+     *
+     * <p>Public for the plugin tests, which rebuild what {@link Holder} builds without the
+     * {@code META-INF/services} resources of the production class path.
+     *
+     * @throws IllegalStateException with both sources named
+     */
+    public static Map<Arch, ArchEntry> mergeProviders(Map<Arch, ArchEntry> builtIn, List<ArchProvider> providers) {
+        Objects.requireNonNull(builtIn, "builtIn");
+        Objects.requireNonNull(providers, "providers");
+        Map<Arch, ArchEntry> m = new EnumMap<>(Arch.class);
+        m.putAll(builtIn);
+        Map<Arch, String> source = new EnumMap<>(Arch.class);
+        for (Arch a : builtIn.keySet()) {
+            source.put(a, "the built-in architecture tables");
+        }
+        for (ArchProvider p : providers) {
+            addProviderRows(m, source, p);
+        }
+        return Collections.unmodifiableMap(m);
+    }
+
+    private static void addProviderRows(Map<Arch, ArchEntry> m, Map<Arch, String> source, ArchProvider p) {
+        String name = p.getClass().getName();
+        List<ArchEntry> rows = p.archEntries();
+        if (rows == null) {
+            throw new IllegalStateException("plugin provider " + name + " returned null rows");
+        }
+        for (ArchEntry e : rows) {
+            if (e == null) {
+                throw new IllegalStateException("plugin provider " + name + " returned a null row");
+            }
+            Arch a = e.arch();
+            String prev = source.get(a);
+            if (prev != null) {
+                throw new IllegalStateException("architecture '" + a.ggufName() + "' is registered by " + prev
+                        + " and by plugin provider " + name + "; plugins never replace built-in rows"
+                        + " or the row of another provider");
+            }
+            source.put(a, "plugin provider " + name);
+            m.put(a, e);
+        }
     }
 
     /** Architectures llama.cpp cannot run as a text model. */

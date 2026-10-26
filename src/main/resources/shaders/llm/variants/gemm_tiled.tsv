@@ -35,4 +35,9 @@ MXFP8_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_MXFP8
 I8_B128_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_I8_B128
 NF4_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_NF4
 FP4_BNB_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_FP4_BNB
+F8_E5M2_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F8_E5M2
+F8_E5M2_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F8_E5M2
+F8_E4M3_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F8_E4M3
+F8_E4M3_B128_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_F8_E4M3_B128
+MXFP8_Hw_MatMul_Tiled	matmul_tiled.comp	QTYPE=QT_MXFP8
 LLM_TopK_Partial	topk_partial.comp

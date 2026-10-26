@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The CPU tensor regions of a Hugging Face model source: stored tensors come from the checkpoint files through
- * {@link FileTensorRegions} (mapped or read per {@link TensorReadMode}); derived tensors come from the
+ * {@link FileTensorRegions} (mapped, read, direct or lazy per {@link TensorReadMode}); derived tensors come from the
  * {@link ProducedSegments.View} of the CPU reader, which produces a row-local tensor kept in memory into a new direct
  * buffer per region and hands out slices of the materialized copy otherwise. The reader may keep every buffer.
  * Thread-safe.

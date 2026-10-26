@@ -47,6 +47,7 @@ public final class CpuActivationQuantizer {
             case Q1_0:
             case Q2_0:
             case F8_E4M3:
+            case F8_E5M2:
             case F8_E4M3_B128:
             case MXFP8:
             case I8_B128:

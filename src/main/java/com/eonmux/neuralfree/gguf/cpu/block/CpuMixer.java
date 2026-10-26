@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.cpu.block;
 
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 
 /**
@@ -43,6 +44,33 @@ public interface CpuMixer extends AutoCloseable {
      */
     default String shiftRefusal() {
         return "context shift unsupported for " + getClass().getSimpleName();
+    }
+
+    /**
+     * Why this mixer has no batched step over {@link StepLayout#contiguousSingle()} == false, or null when it can
+     * run one. Default: refused, today's mixers run the contiguous step only.
+     */
+    default String batchRefusal() {
+        return getClass().getSimpleName() + " has no multi-sequence step";
+    }
+
+    /**
+     * One step over the rows of {@code s}: today's contiguous step ({@link #decode} / {@link #prefill} at
+     * {@code pos0(0)}) when the step is contiguous and the memory un-paged, the backend's batched step otherwise.
+     *
+     * @throws UnsupportedOperationException when the step is not contiguous-un-paged and this mixer has no
+     *                                       batched step ({@link #batchRefusal()})
+     */
+    default void batch(StepLayout s, float[] in, float[] out) {
+        if (s.contiguousSingle()) {
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        throw new UnsupportedOperationException(batchRefusal());
     }
 
     /** Releases what {@link #bind} created; the context's shared resources stay. */

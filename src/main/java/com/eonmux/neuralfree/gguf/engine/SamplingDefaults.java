@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
@@ -7,6 +8,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -18,9 +20,10 @@ import java.util.Objects;
  * {@link GenerationRequest#withModelDefaults}), as llama.cpp does ({@code common_init_sampler_from_model},
  * common/common.cpp:1088-1147) and as vLLM does with {@code generation_config}. Immutable.
  *
- * <p>{@code general.sampling.{sequence, mirostat, mirostat_tau, mirostat_eta, xtc_probability, xtc_threshold}} name
- * sampler stages NeuralFree's chain does not have; {@link #read} logs them as ignored, and logs the defaults it
- * reads, as vLLM reports the {@code generation_config} values that replace its own.
+ * <p>{@code general.sampling.sequence} is the configurable chain order ({@link StageKind}): a
+ * '{@code ;}'-separated list of llama.cpp stage names is read; anything else (an abbreviated or free-form value,
+ * as {@code generation_config} hands this metadata through) is logged as ignored, like the llama.cpp keys
+ * {@code general.sampling.{mirostat, mirostat_tau, mirostat_eta, xtc_probability, xtc_threshold}}.
  */
 public final class SamplingDefaults {
 
@@ -28,7 +31,6 @@ public final class SamplingDefaults {
 
     /** Keys of llama.cpp sampler settings without a stage in NeuralFree's chain. */
     private static final String[] UNSUPPORTED_KEYS = {
-            GgufKeys.GENERAL_SAMPLING_SEQUENCE,
             GgufKeys.GENERAL_SAMPLING_MIROSTAT,
             GgufKeys.GENERAL_SAMPLING_MIROSTAT_TAU,
             GgufKeys.GENERAL_SAMPLING_MIROSTAT_ETA,
@@ -49,6 +51,7 @@ public final class SamplingDefaults {
     private final Float presencePenalty;
     private final Float frequencyPenalty;
     private final Integer maxNewTokens;
+    private final List<StageKind> sequence;
 
     private SamplingDefaults(Builder b) {
         this.temp = b.temp;
@@ -61,6 +64,7 @@ public final class SamplingDefaults {
         this.presencePenalty = b.presencePenalty;
         this.frequencyPenalty = b.frequencyPenalty;
         this.maxNewTokens = b.maxNewTokens;
+        this.sequence = b.sequence;
     }
 
     public static Builder builder() {
@@ -86,6 +90,7 @@ public final class SamplingDefaults {
         b.presencePenalty = readFloat(kv, GgufKeys.NF_SAMPLING_PRESENCE_PENALTY, Range.FINITE);
         b.frequencyPenalty = readFloat(kv, GgufKeys.NF_SAMPLING_FREQUENCY_PENALTY, Range.FINITE);
         b.maxNewTokens = readInt(kv, GgufKeys.NF_SAMPLING_MAX_NEW_TOKENS, Range.TOKEN_BUDGET);
+        b.sequence = readSequence(kv);
         logUnsupported(kv);
         SamplingDefaults d = new SamplingDefaults(b);
         if (d.isEmpty()) {
@@ -129,12 +134,14 @@ public final class SamplingDefaults {
     public Float frequencyPenalty() { return frequencyPenalty; }
     /** New-token budget ({@code neuralfree.sampling.max_new_tokens}, -1 = unlimited), or null. */
     public Integer maxNewTokens() { return maxNewTokens; }
+    /** The configurable chain order ({@code general.sampling.sequence}, unmodifiable), or null. */
+    public List<StageKind> sequence() { return sequence; }
 
     /** True when the model gives no default. */
     public boolean isEmpty() {
         return temp == null && topK == null && topP == null && minP == null && typicalP == null
                 && penaltyRepeat == null && penaltyLastN == null && presencePenalty == null
-                && frequencyPenalty == null && maxNewTokens == null;
+                && frequencyPenalty == null && maxNewTokens == null && sequence == null;
     }
 
     @Override
@@ -150,13 +157,14 @@ public final class SamplingDefaults {
                 && Objects.equals(minP, d.minP) && Objects.equals(typicalP, d.typicalP)
                 && Objects.equals(penaltyRepeat, d.penaltyRepeat) && Objects.equals(penaltyLastN, d.penaltyLastN)
                 && Objects.equals(presencePenalty, d.presencePenalty)
-                && Objects.equals(frequencyPenalty, d.frequencyPenalty) && Objects.equals(maxNewTokens, d.maxNewTokens);
+                && Objects.equals(frequencyPenalty, d.frequencyPenalty) && Objects.equals(maxNewTokens, d.maxNewTokens)
+                && Objects.equals(sequence, d.sequence);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(temp, topK, topP, minP, typicalP, penaltyRepeat, penaltyLastN, presencePenalty,
-                frequencyPenalty, maxNewTokens);
+                frequencyPenalty, maxNewTokens, sequence);
     }
 
     @Override
@@ -175,6 +183,13 @@ public final class SamplingDefaults {
         add(parts, "presence", presencePenalty);
         add(parts, "frequency", frequencyPenalty);
         add(parts, "maxNewTokens", maxNewTokens);
+        if (sequence != null) {
+            List<String> labels = new ArrayList<>();
+            for (StageKind kind : sequence) {
+                labels.add(kind.label());
+            }
+            parts.add("sequence=" + String.join(";", labels));
+        }
         return "SamplingDefaults{" + String.join(", ", parts) + '}';
     }
 
@@ -221,6 +236,28 @@ public final class SamplingDefaults {
         }
     }
 
+    /**
+     * {@code general.sampling.sequence} as a configurable chain order ({@link StageKind}), or null when the key is
+     * absent or its value is not a '{@code ;}'-separated list of llama.cpp stage names (a free-form
+     * {@code generation_config} value: logged as with the keys without a stage, never applied).
+     */
+    private static List<StageKind> readSequence(GgufKv kv) {
+        if (!kv.has(GgufKeys.GENERAL_SAMPLING_SEQUENCE)) {
+            return null;
+        }
+        String joined = kv.str(GgufKeys.GENERAL_SAMPLING_SEQUENCE, null);
+        if (joined == null) {
+            return null;
+        }
+        try {
+            return StageKind.parseOrder(joined);
+        } catch (IllegalArgumentException e) {
+            LOGGER.info("model sampling default general.sampling.sequence={} is ignored: {}",
+                    joined, e.getMessage());
+            return null;
+        }
+    }
+
     /** The values {@link SamplerConfig.Builder#build()} and {@link GenerationRequest.Builder#build()} accept. */
     private enum Range {
         FINITE(null),
@@ -264,6 +301,7 @@ public final class SamplingDefaults {
         private Float presencePenalty;
         private Float frequencyPenalty;
         private Integer maxNewTokens;
+        private List<StageKind> sequence;
 
         private Builder() {
         }
@@ -278,6 +316,21 @@ public final class SamplingDefaults {
         public Builder presencePenalty(float v) { this.presencePenalty = v; return this; }
         public Builder frequencyPenalty(float v) { this.frequencyPenalty = v; return this; }
         public Builder maxNewTokens(int v) { this.maxNewTokens = v; return this; }
+        /** The configurable chain order, as llama.cpp's stage names ({@code general.sampling.sequence}). */
+        public Builder sequence(String joined) {
+            this.sequence = StageKind.parseOrder(joined);
+            return this;
+        }
+
+        /** The configurable chain order. */
+        public Builder sequence(List<StageKind> order) {
+            List<StageKind> parse = new ArrayList<>();
+            for (StageKind kind : order) {
+                parse.add(StageKind.ofLabel(kind.label()));
+            }
+            this.sequence = Collections.unmodifiableList(parse);
+            return this;
+        }
 
         /** @throws IllegalArgumentException naming the setting when a value is out of range */
         public SamplingDefaults build() {

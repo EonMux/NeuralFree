@@ -6,11 +6,16 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * A LoRA adapter loaded from a GGUF adapter file ({@link LoraAdapterLoader}, the llama.cpp adapter format,
@@ -34,6 +39,8 @@ public final class LoraAdapter {
     private final int[] invocationTokens;
     private final Map<String, Pair> pairs;
     private final Map<String, String> metadata;
+    private final String digest;
+    private final long contentLength;
 
     LoraAdapter(String path, String arch, float alpha, String taskName, String promptPrefix, int[] invocationTokens,
                 Map<String, Pair> pairs, Map<String, String> metadata) {
@@ -45,6 +52,111 @@ public final class LoraAdapter {
         this.invocationTokens = invocationTokens == null ? new int[0] : invocationTokens.clone();
         this.pairs = Collections.unmodifiableMap(new LinkedHashMap<>(pairs));
         this.metadata = Collections.unmodifiableMap(new LinkedHashMap<>(metadata));
+        long[] length = {0L};
+        this.digest = digestOf(arch, alpha, this.invocationTokens, this.metadata, this.pairs, length);
+        this.contentLength = length[0];
+    }
+
+    /**
+     * The content digest of the adapter, §5.5.1 N-2's persistent identity, as 64 hex characters together with
+     * {@link #contentLength}: a SHA-256 over the canonical view metadata ({@code general.architecture},
+     * {@code adapter.lora.alpha} — which folds a PEFT {@code use_rslora} adapter's alpha at open, the task and
+     * aLoRA metadata and every remaining metadata scalar, in sorted key order), the target mapping and tensor
+     * table (target name, pair kind, dimensions and rank per adapted tensor) and the exact tensor bytes the
+     * forward pass computes from — the decoded F32 halves of every pair. PC-8's {@code ContentDigest} recomputes
+     * this over the same recipe once the exact-bytes content-input regime of PC-8 exists; this constructor's form
+     * needs no file re-read after load.
+     */
+    public String digest() {
+        return digest;
+    }
+
+    /** The number of bytes the digest covers. */
+    public long contentLength() {
+        return contentLength;
+    }
+
+    private static String digestOf(String arch, float alpha, int[] tokens, Map<String, String> metadata,
+                                   Map<String, Pair> pairs, long[] lengthOut) {
+        MessageDigest sha;
+        try {
+            sha = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available", e);
+        }
+        byte[] tag = bytes("lora-adapter.n1");
+        sha.update(tag);
+        long length = tag.length;
+        length += hash(sha, bytes(arch));
+        length += hash(sha, f32(new float[]{alpha}));
+        length += hash(sha, u32(tokens));
+        Map<String, String> sorted = new TreeMap<>();
+        for (Map.Entry<String, String> e : metadata.entrySet()) {
+            if (e.getKey() != null && e.getValue() != null) {
+                sorted.put(e.getKey(), e.getValue());
+            }
+        }
+        for (Map.Entry<String, String> e : sorted.entrySet()) {
+            length += hash(sha, bytes(e.getKey()));
+            length += hash(sha, bytes(e.getValue()));
+        }
+        for (Pair p : pairs.values()) {
+            length += hash(sha, bytes(p.target()));
+            length += hash(sha, s32(p.kind().ordinal()));
+            length += hash(sha, u32(new int[]{p.inDim(), p.outDim(), p.rank(), p.experts()}));
+            length += hash(sha, f32(p.a));
+            length += hash(sha, f32(p.b));
+        }
+        lengthOut[0] = length;
+        return hex(sha.digest());
+    }
+
+    /** Hashes {@code values} and counts them. */
+    private static long hash(MessageDigest sha, byte[] values) {
+        sha.update(values);
+        return values.length;
+    }
+
+    private static byte[] bytes(String s) {
+        byte[] b = s.getBytes(StandardCharsets.UTF_8);
+        byte[] out = new byte[4 + b.length];
+        out[0] = (byte) b.length;
+        out[1] = (byte) (b.length >>> 8);
+        out[2] = (byte) (b.length >>> 16);
+        out[3] = (byte) (b.length >>> 24);
+        System.arraycopy(b, 0, out, 4, b.length);
+        return out;
+    }
+
+    private static byte[] u32(int[] values) {
+        byte[] out = new byte[4 * values.length];
+        for (int i = 0; i < values.length; i++) {
+            int v = values[i];
+            int o = i * 4;
+            out[o] = (byte) v;
+            out[o + 1] = (byte) (v >>> 8);
+            out[o + 2] = (byte) (v >>> 16);
+            out[o + 3] = (byte) (v >>> 24);
+        }
+        return out;
+    }
+
+    private static byte[] s32(int value) {
+        return u32(new int[]{value});
+    }
+
+    private static byte[] f32(float[] values) {
+        ByteBuffer buf = ByteBuffer.allocate(values.length * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        buf.asFloatBuffer().put(values);
+        return buf.array();
+    }
+
+    private static String hex(byte[] digest) {
+        StringBuilder sb = new StringBuilder(digest.length * 2);
+        for (byte b : digest) {
+            sb.append(String.format(Locale.ROOT, "%02x", b));
+        }
+        return sb.toString();
     }
 
     /** The file the adapter was read from. */
@@ -89,7 +201,7 @@ public final class LoraAdapter {
         for (int i = 0; i < b.length; i++) {
             b[i] *= s;
         }
-        return new Delta(p, b);
+        return new Delta(p, alpha, b, userScale);
     }
 
     private Pair requirePair(String target) {
@@ -187,16 +299,21 @@ public final class LoraAdapter {
     /**
      * One pair bound to a scale. {@link #a()} and {@link #scaledB()} are the F32 arrays the device paths upload; the
      * CPU products use {@link CpuMatVec#PLAIN} over F32 views of {@code A} and the scaled {@code B}, built on first
-     * use. The bound values are immutable.
+     * use and dropped by {@link #rescale}. The pair and {@code alpha} are immutable; the bound scale is an engine
+     * thread's mutability (LR-1).
      */
     public static final class Delta {
         private final Pair pair;
-        private final float[] scaledB;
+        private final float alpha;
+        private volatile float[] scaledB;
         private volatile Views views;
+        private volatile float userScale;
 
-        Delta(Pair pair, float[] scaledB) {
+        Delta(Pair pair, float alpha, float[] scaledB, float userScale) {
             this.pair = pair;
+            this.alpha = alpha;
             this.scaledB = scaledB;
+            this.userScale = userScale;
         }
 
         public Pair pair() { return pair; }
@@ -204,6 +321,31 @@ public final class LoraAdapter {
         public float[] a() { return pair.a; }
         /** {@code scale * B}, row-major (shared, read only). */
         public float[] scaledB() { return scaledB; }
+
+        /**
+         * Rewrites {@code scaledB} to the effective scale of {@code userScale} × B in place and drops the cached
+         * device views, so the next product rebuilds them from the new bytes. Same as the engine's rescale between
+         * steps (LR-1): it runs on the engine thread between two steps, never while a step dispatches.
+         */
+        public void rescale(float newUserScale) {
+            if (!Float.isFinite(newUserScale)) {
+                throw new IllegalArgumentException("LoRA pair " + pair.target + " cannot rescale to the non-finite"
+                        + " scale " + newUserScale);
+            }
+            float s = alpha != 0.0f ? newUserScale * alpha / pair.rank : newUserScale;
+            float[] b = pair.b.clone();
+            for (int i = 0; i < b.length; i++) {
+                b[i] *= s;
+            }
+            this.userScale = newUserScale;
+            this.views = null;
+            this.scaledB = b;
+        }
+
+        /** The user scale the delta's {@code scaledB} is bound to. */
+        public float userScale() {
+            return userScale;
+        }
 
         /**
          * {@code y[t] += scale * B (A x[t])} for {@code nTokens} rows of a projection.

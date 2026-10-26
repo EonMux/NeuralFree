@@ -109,9 +109,11 @@ public final class BlockLayout {
     public static final int IQ4_XS_D = 0, IQ4_XS_SCALES_H = 2, IQ4_XS_SCALES_L = 4, IQ4_XS_QS = 8,
             IQ4_XS_BYTES = 136;
 
-    // NeuralFree extension blocks (GGMLType ids 1000-1005).
+    // NeuralFree extension blocks (GGMLType ids 1000-1006).
     // F8_E4M3 {u8 qs[32]}: E4M3FN codes, the scale lives in the tensor's .scale sibling
     public static final int F8_E4M3_QS = 0, F8_E4M3_BYTES = 32;
+    // F8_E5M2 {u8 qs[32]}: E5M2 codes (IEEE half high bytes), the scale lives in the tensor's .scale sibling
+    public static final int F8_E5M2_QS = 0, F8_E5M2_BYTES = 32;
     // F8_E4M3_B128 {float d; u8 qs[128]}: E4M3FN codes times d
     public static final int F8B128_D = 0, F8B128_QS = 4, F8B128_BYTES = 132;
     // MXFP8 {u8 e; u8 qs[32]}: E4M3FN codes times the E8M0 scale 2^(e-127)

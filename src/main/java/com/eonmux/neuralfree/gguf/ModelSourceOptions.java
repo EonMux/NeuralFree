@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf;
 
+import com.eonmux.neuralfree.gguf.load.MetadataOverrides;
+import com.eonmux.neuralfree.gguf.load.RopeOverrides;
 import com.eonmux.neuralfree.utils.json.Json;
 import com.eonmux.neuralfree.utils.json.JsonException;
 
@@ -17,8 +19,10 @@ import java.util.Objects;
 import java.util.Properties;
 
 /**
- * How a checkpoint that is not stored as GGUF is turned into its GGUF view ({@link ModelSources}). GGUF files are read
- * as stored and ignore these options. Read from system properties (absent keys keep their defaults):
+ * How a model is opened: how a checkpoint that is not stored as GGUF is turned into its GGUF view
+ * ({@link ModelSources}), and the loading extras RX applies to every source format and engine as metadata
+ * overrides of the view, tensor checks, dummy weights, rope overrides and the warmup decode. GGUF files are read
+ * as stored except for those extras. Read from system properties (absent keys keep their defaults):
  * <ul>
  *   <li>{@value #PROP_MATERIALIZE}: auto | memory | disk | none, where derived tensors live; default auto.</li>
  *   <li>{@value #PROP_MEMORY_MAX}: {@code <n>[K|M|G]} bytes of derived tensors auto keeps in direct memory; default
@@ -39,8 +43,17 @@ import java.util.Properties;
  *       GGUF file; default none.</li>
  *   <li>{@value #PROP_BASE_DIR}: a local copy of the base model a decision-LoRA checkpoint merges at load; default
  *       none.</li>
+ *   <li>{@value #PROP_OVERRIDE_KV}: the {@code --override-kv} metadata overrides as {@code key=type:value} entries
+ *       in one string separated by {@code ;}; default none.</li>
+ *   <li>{@code neuralfree.rope.*} and {@code neuralfree.yarn.*} (see {@link RopeOverrides}): the rope and YaRN
+ *       context extension overrides; default none.</li>
+ *   <li>{@value #PROP_CHECK_TENSORS}: check every tensor value for NaN and infinity at load; default false.</li>
+ *   <li>{@value #PROP_LOAD_FORMAT}: full | dummy, seeded random weights instead of the file's (dummy loads have
+ *       no content inputs, so nothing under one persists); default full.</li>
+ *   <li>{@value #PROP_WARMUP}: run the load's warmup decode and reset; default true.</li>
  * </ul>
- * Enum values ignore case and treat {@code -} and {@code _} alike. Immutable.
+ * The tensor read mode is not here: it stays with {@link TensorReadMode}, whose property set every reader of
+ * tensor bytes consults. Enum values ignore case and treat {@code -} and {@code _} alike. Immutable.
  */
 public final class ModelSourceOptions {
 
@@ -56,6 +69,10 @@ public final class ModelSourceOptions {
     public static final String PROP_TOKENIZER = "neuralfree.hf.tokenizer";
     public static final String PROP_LORA_BASE_CONFIG = "neuralfree.lora.base.config";
     public static final String PROP_BASE_DIR = "neuralfree.hf.base.dir";
+    public static final String PROP_OVERRIDE_KV = "neuralfree.override.kv";
+    public static final String PROP_CHECK_TENSORS = "neuralfree.check.tensors";
+    public static final String PROP_LOAD_FORMAT = "neuralfree.load.format";
+    public static final String PROP_WARMUP = "neuralfree.warmup";
 
     /** Default {@link #memoryBudget()}: 2 GiB. */
     public static final long DEFAULT_MEMORY_BUDGET = 2L << 30;
@@ -116,6 +133,23 @@ public final class ModelSourceOptions {
         }
     }
 
+    /**
+     * The load's weights ({@code --load-format}, the dummy loaders of the benchmark setups).
+     */
+    public enum LoadFormat {
+        /** The checkpoint's own weights (and a Hugging Face conversion's). */
+        FULL,
+        /** Seeded random weights of the declared tensor types; nothing of the load is a content input. */
+        DUMMY;
+
+        /**
+         * @throws IllegalArgumentException for an unknown name, naming {@value #PROP_LOAD_FORMAT}
+         */
+        public static LoadFormat parse(String value) {
+            return parseEnum(LoadFormat.class, PROP_LOAD_FORMAT, value);
+        }
+    }
+
     private final Materialize materialize;
     private final long memoryBudget;
     private final Path cacheDir;
@@ -128,6 +162,11 @@ public final class ModelSourceOptions {
     private final Path tokenizerDir;
     private final Path loraBaseConfig;
     private final Path baseDir;
+    private final List<MetadataOverrides.Override> metadataOverrides;
+    private final RopeOverrides ropeOverrides;
+    private final boolean checkTensors;
+    private final LoadFormat loadFormat;
+    private final boolean warmup;
 
     private ModelSourceOptions(Builder b) {
         this.materialize = b.materialize;
@@ -142,6 +181,11 @@ public final class ModelSourceOptions {
         this.tokenizerDir = b.tokenizerDir;
         this.loraBaseConfig = b.loraBaseConfig;
         this.baseDir = b.baseDir;
+        this.metadataOverrides = b.metadataOverrides;
+        this.ropeOverrides = b.ropeOverrides;
+        this.checkTensors = b.checkTensors;
+        this.loadFormat = b.loadFormat;
+        this.warmup = b.warmup;
     }
 
     /** Defaults: auto materialization within 2 GiB, the user cache directory, stored types, no overrides. */
@@ -214,6 +258,26 @@ public final class ModelSourceOptions {
         if (v != null) {
             b.baseDir(parsePath(PROP_BASE_DIR, v));
         }
+        v = value(p, PROP_OVERRIDE_KV);
+        if (v != null) {
+            b.metadataOverrideList(v);
+        }
+        RopeOverrides rope = RopeOverrides.fromProperties(p);
+        if (!rope.isEmpty()) {
+            b.ropeOverrides(rope);
+        }
+        v = value(p, PROP_CHECK_TENSORS);
+        if (v != null) {
+            b.checkTensors(parseBoolean(PROP_CHECK_TENSORS, v));
+        }
+        v = value(p, PROP_LOAD_FORMAT);
+        if (v != null) {
+            b.loadFormat(LoadFormat.parse(v));
+        }
+        v = value(p, PROP_WARMUP);
+        if (v != null) {
+            b.warmup(parseBoolean(PROP_WARMUP, v));
+        }
         return b.build();
     }
 
@@ -248,6 +312,24 @@ public final class ModelSourceOptions {
     /** Local copy of the base model a decision-LoRA checkpoint merges, or null. */
     public Path baseDir() { return baseDir; }
 
+    /**
+     * The {@code --override-kv} metadata overrides applied to every opened source's GGUF view (post-conversion,
+     * as {@link MetadataOverrides}), in their {@code --override-kv} order; empty for none.
+     */
+    public List<MetadataOverrides.Override> metadataOverrides() { return metadataOverrides; }
+
+    /** The rope and YaRN context extension overrides ({@code ModelSources} applies them as metadata overrides). */
+    public RopeOverrides ropeOverrides() { return ropeOverrides; }
+
+    /** Whether every tensor value is checked for NaN and infinity at load ({@code --check-tensors}). */
+    public boolean checkTensors() { return checkTensors; }
+
+    /** The load's weights: the checkpoint's own ({@link LoadFormat#FULL}) or seeded random ({@link LoadFormat#DUMMY}). */
+    public LoadFormat loadFormat() { return loadFormat; }
+
+    /** Whether the load runs its warmup decode and reset ({@code --no-warmup} turns it off). */
+    public boolean warmup() { return warmup; }
+
     public Builder toBuilder() {
         Builder b = builder();
         b.materialize = materialize;
@@ -262,6 +344,11 @@ public final class ModelSourceOptions {
         b.tokenizerDir = tokenizerDir;
         b.loraBaseConfig = loraBaseConfig;
         b.baseDir = baseDir;
+        b.metadataOverrides = metadataOverrides;
+        b.ropeOverrides = ropeOverrides;
+        b.checkTensors = checkTensors;
+        b.loadFormat = loadFormat;
+        b.warmup = warmup;
         return b;
     }
 
@@ -280,13 +367,17 @@ public final class ModelSourceOptions {
                 && stDenseModules == other.stDenseModules
                 && configOverrides.equals(other.configOverrides)
                 && Objects.equals(tokenizerDir, other.tokenizerDir)
-                && Objects.equals(loraBaseConfig, other.loraBaseConfig) && Objects.equals(baseDir, other.baseDir);
+                && Objects.equals(loraBaseConfig, other.loraBaseConfig) && Objects.equals(baseDir, other.baseDir)
+                && metadataOverrides.equals(other.metadataOverrides) && ropeOverrides.equals(other.ropeOverrides)
+                && checkTensors == other.checkTensors && loadFormat == other.loadFormat
+                && warmup == other.warmup;
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(materialize, memoryBudget, cacheDir, outType, onlineQuant, exactQuant, includeMtp,
-                stDenseModules, configOverrides, tokenizerDir, loraBaseConfig, baseDir);
+                stDenseModules, configOverrides, tokenizerDir, loraBaseConfig, baseDir, metadataOverrides,
+                ropeOverrides, checkTensors, loadFormat, warmup);
     }
 
     @Override
@@ -295,6 +386,11 @@ public final class ModelSourceOptions {
                 + cacheDir + ", outType=" + outType + ", onlineQuant=" + onlineQuant + ", exactQuant=" + exactQuant
                 + ", includeMtp=" + includeMtp + ", stDenseModules=" + stDenseModules
                 + (configOverrides.isEmpty() ? "" : ", overrides=" + Json.toString(configOverrides, Json.Style.CANONICAL))
+                + (metadataOverrides.isEmpty() ? "" : ", kv=" + MetadataOverrides.toString(metadataOverrides))
+                + (ropeOverrides.isEmpty() ? "" : ", rope=" + ropeOverrides)
+                + (checkTensors ? ", checkTensors" : "")
+                + (loadFormat == LoadFormat.FULL ? "" : ", loadFormat=" + loadFormat.name().toLowerCase(Locale.ROOT))
+                + (warmup ? "" : ", no warmup")
                 + (tokenizerDir != null ? ", tokenizer=" + tokenizerDir : "")
                 + (loraBaseConfig != null ? ", loraBaseConfig=" + loraBaseConfig : "")
                 + (baseDir != null ? ", baseDir=" + baseDir : "") + '}';
@@ -454,6 +550,11 @@ public final class ModelSourceOptions {
         private Path tokenizerDir;
         private Path loraBaseConfig;
         private Path baseDir;
+        private List<MetadataOverrides.Override> metadataOverrides = Collections.emptyList();
+        private RopeOverrides ropeOverrides = RopeOverrides.defaults();
+        private boolean checkTensors;
+        private LoadFormat loadFormat = LoadFormat.FULL;
+        private boolean warmup = true;
 
         private Builder() {
         }
@@ -504,6 +605,94 @@ public final class ModelSourceOptions {
         public Builder loraBaseConfig(Path v) { this.loraBaseConfig = v; return this; }
         /** The decision-LoRA base directory; null removes it. */
         public Builder baseDir(Path v) { this.baseDir = v; return this; }
+
+        /**
+         * Replaces the {@code --override-kv} overrides with the entries of {@code v} (the
+         * {@value #PROP_OVERRIDE_KV} list form, {@code ;} separated); null or blank removes them all.
+         *
+         * @throws IllegalArgumentException naming the entry when one of them cannot be parsed
+         */
+        public Builder metadataOverrideList(String v) {
+            this.metadataOverrides = v == null || v.trim().isEmpty() ? Collections.emptyList()
+                    : MetadataOverrides.parseList(v, PROP_OVERRIDE_KV);
+            return this;
+        }
+
+        /**
+         * Appends one {@code key=type:value} entry ({@code --override-kv}); repeated flags accumulate in order.
+         *
+         * @throws IllegalArgumentException naming the entry when it cannot be parsed
+         */
+        public Builder metadataOverride(String kv) {
+            List<MetadataOverrides.Override> l = new ArrayList<>(metadataOverrides.size() + 1);
+            l.addAll(metadataOverrides);
+            l.add(MetadataOverrides.parse(kv, PROP_OVERRIDE_KV));
+            this.metadataOverrides = Collections.unmodifiableList(l);
+            return this;
+        }
+
+        /**
+         * Replaces the rope and YaRN context extension overrides; null removes them.
+         */
+        public Builder ropeOverrides(RopeOverrides v) {
+            this.ropeOverrides = v == null ? RopeOverrides.defaults() : v;
+            return this;
+        }
+
+        /** Builds the rope overrides on a {@link RopeOverrides.Builder} and replaces them. */
+        public Builder ropeOverrides(RopeOverrides.Builder v) {
+            return ropeOverrides(v == null ? null : v.build());
+        }
+
+        /** Changes one rope or YaRN option, keeping the ones already set ({@code R} e.g. {@code rope.freqBase}). */
+        public Builder ropeScaling(RopeOverrides.ScalingType v) {
+            RopeOverrides.Builder b = ropeOverrides.toBuilder();
+            b.scalingType(v);
+            return ropeOverrides(b);
+        }
+
+        /** {@code --rope-freq-scale} / its alias {@code --rope-scale}. */
+        public Builder ropeFreqScale(float v) {
+            RopeOverrides.Builder b = ropeOverrides.toBuilder();
+            b.freqScale(v);
+            return ropeOverrides(b);
+        }
+
+        public Builder ropeFreqBase(float v) {
+            RopeOverrides.Builder b = ropeOverrides.toBuilder();
+            b.freqBase(v);
+            return ropeOverrides(b);
+        }
+
+        /** The {@code --yarn-*} values: {@code --yarn-ext-factor}, {@code --yarn-attn-factor},
+         *  {@code --yarn-beta-fast} and {@code --yarn-beta-slow}. */
+        public Builder yarnExtFactor(float v) { return yarn((rb, f) -> rb.yarnExtFactor(f), v); }
+        public Builder yarnAttnFactor(float v) { return yarn((rb, f) -> rb.yarnAttnFactor(f), v); }
+        public Builder yarnBetaFast(float v) { return yarn((rb, f) -> rb.yarnBetaFast(f), v); }
+        public Builder yarnBetaSlow(float v) { return yarn((rb, f) -> rb.yarnBetaSlow(f), v); }
+
+        /** Applies one {@code --yarn-*} value to the rope overrides built so far. */
+        private Builder yarn(java.util.function.BiConsumer<RopeOverrides.Builder, Float> set, float v) {
+            RopeOverrides.Builder b = ropeOverrides.toBuilder();
+            set.accept(b, v);
+            return ropeOverrides(b);
+        }
+
+        /** {@code --yarn-orig-ctx}: 0 keeps the model's training context. */
+        public Builder yarnOrigCtx(int v) {
+            RopeOverrides.Builder b = ropeOverrides.toBuilder();
+            b.yarnOrigCtx(v);
+            return ropeOverrides(b);
+        }
+
+        public Builder checkTensors(boolean v) { this.checkTensors = v; return this; }
+
+        public Builder loadFormat(LoadFormat v) {
+            this.loadFormat = Objects.requireNonNull(v, PROP_LOAD_FORMAT);
+            return this;
+        }
+
+        public Builder warmup(boolean v) { this.warmup = v; return this; }
 
         /** @throws IllegalArgumentException for a negative memory budget */
         public ModelSourceOptions build() {

@@ -12,9 +12,18 @@ import java.util.Objects;
 
 /**
  * {@link TensorRegions} over the {@link DataSegment}s of a model's files: one {@link FileChannel} per segment, a
- * tensor found by binary search on {@link DataSegment#virtualBase()}, and each region memory-mapped read-only or, in
- * {@link TensorReadMode#READ} (llama.cpp {@code --no-mmap}), copied into a direct buffer with positional reads. A
- * requested range must lie inside one segment and inside its file. Thread-safe.
+ * tensor found by binary search on {@link DataSegment#virtualBase()}, and each region in its
+ * {@link TensorReadMode}:
+ * <ul>
+ *   <li>MMAP: memory-mapped read-only (the page cache backs it);</li>
+ *   <li>READ (llama.cpp {@code --no-mmap}): copied whole into a direct buffer with positional reads;</li>
+ *   <li>DIRECT: copied like READ but through sector-aligned channel reads, so nothing is relied on from the
+ *       page cache beyond the reads themselves (the JVM form of llama.cpp's direct I/O);</li>
+ *   <li>LAZY ({@code --lazy-mode}): read like READ on demand, per call: row-gathered tensors (per-layer
+ *       embeddings and their kin) leave their rows unmapped and unread until the gather asks for them, and their
+ *       buffers are not held by this class.</li>
+ * </ul>
+ * A requested range must lie inside one segment and inside its file. Thread-safe.
  */
 public final class FileTensorRegions implements TensorRegions {
 
@@ -35,7 +44,7 @@ public final class FileTensorRegions implements TensorRegions {
      * Opens every segment's file for reading.
      *
      * @param segments    the segments in increasing, non-overlapping virtual order
-     * @param mode        whether regions are memory-mapped or read into direct buffers
+     * @param mode        how regions are served ({@linkplain TensorReadMode MMAP}, READ, DIRECT or LAZY)
      * @param description the model the regions belong to, for messages
      * @throws IllegalArgumentException when there are no segments or they are out of order or overlap
      * @throws IOException              when a file cannot be opened
@@ -95,8 +104,19 @@ public final class FileTensorRegions implements TensorRegions {
             throw new IOException("tensor " + info.name() + " bytes [" + filePos + ", +" + length + ") lie outside"
                     + " its file '" + seg.path() + "' of " + fileSize + " bytes");
         }
-        ByteBuffer buf = mode == TensorReadMode.MMAP ? ch.map(FileChannel.MapMode.READ_ONLY, filePos, length)
-                : read(ch, info, filePos, (int) length);
+        ByteBuffer buf;
+        switch (mode) {
+            case MMAP:
+                buf = ch.map(FileChannel.MapMode.READ_ONLY, filePos, length);
+                break;
+            case DIRECT:
+                buf = readAligned(ch, info, filePos, (int) length);
+                break;
+            default:
+                // READ, and LAZY: rows are fetched as the gather asks for them
+                buf = read(ch, info, filePos, (int) length);
+                break;
+        }
         return buf.order(ByteOrder.LITTLE_ENDIAN);
     }
 
@@ -121,9 +141,8 @@ public final class FileTensorRegions implements TensorRegions {
         try {
             buf = ByteBuffer.allocateDirect(length);
         } catch (OutOfMemoryError e) {
-            throw new IOException("cannot allocate " + length + " bytes of direct memory for tensor "
-                    + info.name() + " with " + TensorReadMode.PROP_DISABLE_MMAP
-                    + "=true; raise -XX:MaxDirectMemorySize or use mmap", e);
+            throw new IOException("cannot allocate " + length + " bytes of direct memory for tensor " + info.name()
+                    + " with mapped reads off; raise -XX:MaxDirectMemorySize or go back to mmap", e);
         }
         while (buf.hasRemaining()) {
             if (ch.read(buf, start + buf.position()) < 0) {
@@ -134,6 +153,36 @@ public final class FileTensorRegions implements TensorRegions {
         buf.flip();
         return buf;
     }
+
+    /**
+     * The DIRECT-mode read: the channel serves {@code length} bytes at {@code start} through sector-aligned
+     * ({@value #SECTOR}-byte) reads from the aligned start, in a new direct buffer whose slice at the file
+     * position is returned, positioned at 0.
+     */
+    private ByteBuffer readAligned(FileChannel ch, GGUFTensorInfo info, long start, int length) throws IOException {
+        long alignedStart = start & ~((long) SECTOR - 1);
+        int alignedLength = SECTOR * (int) ((start - alignedStart + length + SECTOR - 1) / SECTOR);
+        ByteBuffer aligned;
+        try {
+            aligned = ByteBuffer.allocateDirect(alignedLength);
+        } catch (OutOfMemoryError e) {
+            throw new IOException("cannot allocate " + alignedLength + " bytes of aligned direct memory for tensor "
+                    + info.name() + " in direct mode; raise -XX:MaxDirectMemorySize or go back to mmap", e);
+        }
+        while (aligned.hasRemaining()) {
+            if (ch.read(aligned, alignedStart + aligned.position()) < 0) {
+                throw new EOFException("tensor " + info.name() + " ends at byte " + (alignedStart + aligned.position())
+                        + " of " + description + ", before its " + alignedLength + " aligned bytes");
+            }
+        }
+        aligned.flip();
+        int rel = (int) (start - alignedStart);
+        aligned.position(rel);
+        return aligned.slice();
+    }
+
+    /** Disk sectors per direct read, to copy nothing mapped and to leave nothing read but the sectors asked for. */
+    private static final int SECTOR = 4096;
 
     @Override
     public String description() {

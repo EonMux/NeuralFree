@@ -15,6 +15,8 @@ import java.util.Objects;
  * COMPAT export writes, and the streaming conversion of their bytes. The rules are those of the export:
  * <ul>
  *   <li>F8_E4M3 → F16, exact; the tensor's {@code .scale} sibling is a separate tensor and stays.</li>
+ *   <li>F8_E5M2 → F16, exact: an E5M2 code is the high byte of an IEEE half, so the decoded value
+ *       round-trips the F16 bits of {@code code &lt;&lt; 8}; the {@code .scale} sibling stays.</li>
  *   <li>MXFP8 → BF16 when every block's E8M0 exponent satisfies {@code e ∈ [3, 246]}, so that
  *       {@code 2^(e-127) × [2^-9, 448]} lies in the bf16 normal range exactly; some {@code e ∈ [0, 2]}
  *       needs a subnormal target, so the tensor becomes F32. Some {@code e ≥ 247} overflows f32 too, so
@@ -62,6 +64,7 @@ public final class GgufCompatConverter {
         checkNoConsumer(t);
         switch (from) {
             case F8_E4M3:
+            case F8_E5M2:
                 return GGMLType.F16;
             case MXFP8:
                 return mxfp8Target(t, store);

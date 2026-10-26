@@ -136,21 +136,46 @@ public final class LLMModelFactory {
         ModelSources.requireOpenable(path);
         EngineConfig c = withDraftRollback(path, cfg);
         if (sharedBackend == null && !c.backend().usesGpu()) {
-            return new GGUFModel(path, c);
+            return warmed(new GGUFModel(path, c), c);
         }
         try {
-            return openGpu(path, c, sharedBackend);
+            return warmed(openGpu(path, c, sharedBackend), c);
         } catch (IOException e) {
             throw e;
         } catch (RuntimeException | LinkageError gpuFailure) {
             LOGGER.warn("GPU load of {} failed: {}; falling back to the CPU engine", path, describe(gpuFailure));
             try {
-                return new GGUFModel(path, c.toBuilder().backend(EngineConfig.BackendMode.CPU).build());
+                return warmed(new GGUFModel(path, c.toBuilder().backend(EngineConfig.BackendMode.CPU).build()), c);
             } catch (IOException | RuntimeException | Error cpuFailure) {
                 cpuFailure.addSuppressed(gpuFailure);
                 throw cpuFailure;
             }
         }
+    }
+
+    /**
+     * The load's warmup ({@code llama_set_warmup}, the default of {@code --no-warmup} off): one decode on an
+     * empty sequence, token 0 at position 0, then a reset of the cache, so the first real request runs on kernels
+     * queued, blocks decoded and every lazy path touched once. Models that cannot decode (no decoder-only token
+     * loop, no model memory, {@code isDiffusion}) skip it, and {@code cfg.sourceOptions().warmup()} false skips
+     * it ({@code --no-warmup}). The decode and the reset run on the model's backend as the engine owns the thread
+     * does.
+     *
+     * @throws java.io.IOException          when the model cannot be read
+     * @throws IllegalStateException        from the backend when the decode fails: a warmup of a loadable model
+     *                                      that fails stops the load, like llama.cpp's warmup failure does
+     */
+    private static EngineModel warmed(EngineModel model, EngineConfig cfg) throws IOException {
+        if (!cfg.sourceOptions().warmup()) {
+            return model;
+        }
+        ForwardBackend backend = model.forwardBackend();
+        if (backend.memory() == null || !hasTokenLoop(model.supportClass())) {
+            return model;
+        }
+        backend.decode(0, 0);
+        model.resetKVCache();
+        return model;
     }
 
     /**

@@ -5,8 +5,8 @@ import java.nio.ByteBuffer;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 
 /**
- * CPU decoders for the NeuralFree extension block types ({@code GGMLType.isExtension()}): F8_E4M3, F8_E4M3_B128,
- * MXFP8, I8_B128, NF4 and FP4_BNB. These carry quantized checkpoint formats exactly, with every scale inside the
+ * CPU decoders for the NeuralFree extension block types ({@code GGMLType.isExtension()}): F8_E4M3, F8_E5M2,
+ * F8_E4M3_B128, MXFP8, I8_B128, NF4 and FP4_BNB. These carry quantized checkpoint formats exactly, with every scale inside the
  * block; the field offsets are the {@link BlockLayout} constants and the element codecs those of
  * {@link FpBlockDecoders} and {@link QuantTables}.
  * <p>
@@ -17,6 +17,9 @@ public final class ExtBlockDecoders {
 
     /** Value of every E4M3FN code, from {@link FpBlockDecoders#e4m3ToFp32(int)}; codes 0x7F / 0xFF are NaN. */
     private static final float[] E4M3 = buildE4m3();
+
+    /** Value of every E5M2 code, from {@link FpBlockDecoders#e5m2ToFp32(int)} (IEEE half high bytes). */
+    private static final float[] E5M2 = buildE5m2();
 
     private ExtBlockDecoders() {
     }
@@ -29,12 +32,29 @@ public final class ExtBlockDecoders {
         return t;
     }
 
+    private static float[] buildE5m2() {
+        float[] t = new float[256];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = FpBlockDecoders.e5m2ToFp32(i);
+        }
+        return t;
+    }
+
     /** F8_E4M3 {@code {u8 qs[32]}}: {@code y = e4m3(qs[j])}; the tensor's {@code .scale} applies after the matmul. */
     static void decodeF8E4m3(ByteBuffer b, int off, float[] y, int yOff, int nb) {
         final int n = nb * QK_F8_E4M3;
         final int qs = off + F8_E4M3_QS;
         for (int j = 0; j < n; j++) {
             y[yOff + j] = E4M3[b.get(qs + j) & 0xFF];
+        }
+    }
+
+    /** F8_E5M2 {@code {u8 qs[32]}}: {@code y = e5m2(qs[j])}; the tensor's {@code .scale} applies after the matmul. */
+    static void decodeF8E5m2(ByteBuffer b, int off, float[] y, int yOff, int nb) {
+        final int n = nb * QK_F8_E4M3;
+        final int qs = off + F8_E5M2_QS;
+        for (int j = 0; j < n; j++) {
+            y[yOff + j] = E5M2[b.get(qs + j) & 0xFF];
         }
     }
 

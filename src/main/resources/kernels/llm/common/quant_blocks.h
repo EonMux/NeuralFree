@@ -26,9 +26,11 @@
 #define MXFP4_THREADS_PER_BLOCK 4
 #define MXFP4_BYTES_PER_THREAD 4  /* 4 nibble-bytes = 8 elements */
 
-/* ---- NeuralFree extension blocks (GGMLType ids 1000-1005, gguf.quant.BlockLayout), little-endian ---- */
+/* ---- NeuralFree extension blocks (GGMLType ids 1000-1006, gguf.quant.BlockLayout), little-endian ---- */
 #define F8_E4M3_BLOCK_SIZE 32
 #define F8_E4M3_BLOCK_BYTES 32        /* qs[32](e4m3fn) */
+#define F8_E5M2_BLOCK_SIZE 32
+#define F8_E5M2_BLOCK_BYTES 32        /* qs[32](e5m2, IEEE half high bytes) */
 #define F8_E4M3_B128_BLOCK_SIZE 128
 #define F8_E4M3_B128_BLOCK_BYTES 132  /* d(f32) qs[128](e4m3fn) */
 #define MXFP8_BLOCK_SIZE 32
@@ -42,6 +44,7 @@
 
 /* Byte offsets of the extension block fields. */
 #define NF_F8_E4M3_QS      0
+#define NF_F8_E5M2_QS      0
 #define NF_F8_E4M3_B128_D  0
 #define NF_F8_E4M3_B128_QS 4
 #define NF_MXFP8_E         0

@@ -2,6 +2,8 @@ package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 
+import java.util.Objects;
+
 /**
  * Runs the model's forward passes for one sequence on one device (GPU or CPU). Implemented by
  * {@code GpuForwardBackend}, {@code CpuForwardBackend} and the encoder-decoder backends; driven by the generation
@@ -18,6 +20,104 @@ import com.eonmux.neuralfree.gguf.memory.ModelMemory;
  * </ul>
  */
 public interface ForwardBackend extends AutoCloseable {
+
+    /**
+     * Sequences the backend's memory can hold (llama.cpp {@code n_seq_max}). Default 1: contiguous single-sequence
+     * memory around {@link #prefill} / {@link #decode}.
+     */
+    default int maxSequences() {
+        return 1;
+    }
+
+    /**
+     * Why this backend refuses {@link #forwardBatch}, or null when it can run batches. Today's backends keep the
+     * default: on {@code neuralfree.parallel = 1} their memory holds one sequence.
+     */
+    default String batchRefusal() {
+        return "multi-sequence batches need neuralfree.parallel > 1";
+    }
+
+    /**
+     * Evaluates a {@link ForwardBatch} and returns the output rows of the batch in batch order: one logits row per
+     * output row (its kinds, {@code ForwardBatch.kinds(int)}; a backend that produces no requested kind
+     * refuses through {@link #batchRefusal()}).
+     *
+     * <p>Default: a single-sequence batch whose first position continues the held sequence
+     * ({@code memory().sequence().nPast() == positions[0]}) runs on {@link #forwardRows}; otherwise this backend
+     * refuses. Requests the default path cannot serve (several sequences, embedding rows, extra RoPE sections,
+     * adapter slots, kinds beyond {@code LOGITS}) also refuse. A backend with multi-sequence memory replaces this
+     * default.</p>
+     *
+     * @throws UnsupportedOperationException carrying {@link #batchRefusal()} or the refusing reason
+     */
+    default float[][] forwardBatch(ForwardBatch batch) {
+        Objects.requireNonNull(batch, "batch");
+        if (!batch.isSingleSequence()) {
+            throw new UnsupportedOperationException(batchRefusal());
+        }
+        int[] pos = batch.positions();
+        if (memory() == null || memory().sequence().nPast() != pos[0]) {
+            throw new UnsupportedOperationException(batchRefusal());
+        }
+        if (batch.embeddings() != null) {
+            throw new UnsupportedOperationException("the default " + ForwardBatch.class.getSimpleName()
+                    + " path runs token rows only; embedding rows need a batched backend");
+        }
+        if (batch.ropePositions() != null && batch.ropePositions().length > 1) {
+            throw new UnsupportedOperationException("the default forward path holds one RoPE position per token; "
+                    + "a batch with " + batch.ropePositions().length + " sections needs a batched backend");
+        }
+        for (int i = 0; i < batch.nTokens(); i++) {
+            if (batch.produces(i, OutputKind.HIDDEN) || batch.produces(i, OutputKind.ROUTING)) {
+                throw new UnsupportedOperationException("row " + i + " requests an output kind beyond "
+                        + OutputKind.LOGITS + ": " + batchRefusal());
+            }
+        }
+        int[] slots = batch.adapterSlots();
+        if (slots != null) {
+            for (int s : slots) {
+                if (s != 0) {
+                    throw new UnsupportedOperationException("row runs in adapter slot " + s + ", the default path "
+                            + "runs slot 0 only: " + batchRefusal());
+                }
+            }
+        }
+        return forwardRows(batch.tokens(), pos[0], batch.outputRows());
+    }
+
+    /**
+     * {@link #forwardBatch} with greedy selection per output row; default host argmax over the returned logits,
+     * the device path of llama.cpp {@code n_outputs} rows.
+     *
+     * @return the id of the highest logit of each output row (lowest id on ties), in batch order
+     */
+    default int[] forwardBatchGreedy(ForwardBatch batch) {
+        float[][] logits = forwardBatch(batch);
+        int[] out = new int[logits.length];
+        for (int i = 0; i < logits.length; i++) {
+            out[i] = argmax(logits[i]);
+        }
+        return out;
+    }
+
+    /**
+     * Final hidden states of the output rows of a batch (PL-1 consumes them). Default: refused.
+     *
+     * @throws UnsupportedOperationException carrying {@link #batchRefusal()}
+     */
+    default float[][] hiddenBatch(ForwardBatch batch) {
+        throw new UnsupportedOperationException("hidden states of batch rows are not produced by "
+                + getClass().getSimpleName() + ": " + batchRefusal());
+    }
+
+    /**
+     * The observer objects installed in the backend and its contexts (hidden taps, execution observers, matmul
+     * overrides, diagnostics hooks): the observation inventory that prompt-row consumers must respect. Default:
+     * {@link Observers#UNDECLARED}, which a consumer treats as observed (it skips no output row).
+     */
+    default Observers observers() {
+        return Observers.UNDECLARED;
+    }
 
     /**
      * Evaluates {@code tokens} at positions {@code pos0 .. pos0 + tokens.length - 1} (causal), chunked by the

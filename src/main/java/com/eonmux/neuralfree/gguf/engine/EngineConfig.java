@@ -33,8 +33,12 @@ import java.util.Properties;
  *       without its trunk), which drafts with those blocks only ({@link LLMModelFactory}).</li>
  *   <li>{@code neuralfree.draft.type}: how the draft file drafts, llama.cpp {@code --spec-type}
  *       ({@link DraftType}): auto (default; detected from the file), draft-mtp (alias mtp; its NextN / MTP blocks,
- *       or the model's own without a draft file) or draft-simple (aliases simple, model; a separate draft
- *       model).</li>
+ *       or the model's own without a draft file), draft-simple (aliases simple, model; a separate draft
+ *       model), ngram-simple (alias prompt-lookup; the target's own token history, no draft file), ngram-map
+ *       (aliases ngram-map-k / map-k, ngram-map-k4v / map-k4v and ngram-mod / mod; the n-gram map or mod hash),
+ *       ngram-cache (the {@link com.eonmux.neuralfree.gguf.engine.draft.NgramCache} chain with cache files) or
+ *       suffix (suffix decoding), the last five without a draft file ({@code NgramDrafter},
+ *       {@link com.eonmux.neuralfree.gguf.engine.draft.SuffixDrafter}, {@code DrafterChain} chains several).</li>
  *   <li>{@code neuralfree.draft.max} (default 3), {@code neuralfree.draft.min} (default 0),
  *       {@code neuralfree.draft.p.min} (default 0): llama.cpp {@code common_params_speculative_draft}.</li>
  *   <li>{@code neuralfree.mtp}: self-speculation with the model's own NextN / MTP layers, default false. A GPU
@@ -239,7 +243,33 @@ public final class EngineConfig {
          */
         MTP("draft-mtp"),
         /** {@code draft-simple}: the draft file as a separate draft model, NextN / MTP blocks or not. */
-        MODEL("draft-simple");
+        MODEL("draft-simple"),
+        /**
+         * {@code ngram-simple}: prompt-lookup drafting from the target's own token history with no draft model
+         * (vLLM {@code ngram_proposer.py}, llama.cpp {@code common_ngram_simple_draft},
+         * {@code NgramDrafter}); configured with {@code P/PROP_DRAFT_TYPE ngram-simple}, aliased
+         * {@code prompt-lookup}.
+         */
+        NGRAM("ngram-simple"),
+        /**
+         * {@code ngram-map}: n-gram map drafting from the target's history, keys only ({@code ngram-map-k},
+         * {@code map-k}), keys and the 4 most-frequent value m-grams ({@code ngram-map-k4v}, {@code map-k4v}) or the
+         * hashed n-gram index ({@code ngram-mod}, {@code mod}) (common/ngram-map.cpp); the sizes are the
+         * {@code NgramDrafter}'s options.
+         */
+        NGRAM_MAP("ngram-map"),
+        /**
+         * {@code ngram-cache}: drafting over the {@link com.eonmux.neuralfree.gguf.engine.draft.NgramCache} chain
+         * (context, dynamic and static parts, with cache files in the {@code common_ngram_cache_save} layout,
+         * {@link com.eonmux.neuralfree.gguf.engine.draft.NgramCacheFile}) (common/ngram-cache.cpp), as llama.cpp's
+         * {@code ngram-cache} type.
+         */
+        NGRAM_CACHE("ngram-cache"),
+        /**
+         * {@code suffix}: suffix decoding over a suffix tree (vLLM {@code suffix_decoding.py},
+         * {@code SuffixDrafter}), no draft model.
+         */
+        SUFFIX("suffix");
 
         private final String llamaName;
 
@@ -254,7 +284,8 @@ public final class EngineConfig {
 
         /**
          * The type of a llama.cpp name ({@code auto}, {@code draft-mtp}, {@code draft-simple}) or an alias
-         * ({@code mtp}; {@code simple}, {@code model}), ignoring case.
+         * ({@code mtp}; {@code simple}, {@code model}; {@code prompt-lookup}; {@code map-k}, {@code map-k4v},
+         * {@code mod}; {@code suffix}), ignoring case.
          *
          * @throws IllegalArgumentException for any other value, naming the valid ones
          */
@@ -270,13 +301,41 @@ public final class EngineConfig {
                 case "simple":
                 case "model":
                     return MODEL;
+                case "ngram-simple":
+                case "prompt-lookup":
+                    return NGRAM;
+                case "ngram-map":
+                case "ngram-map-k":
+                case "map-k":
+                case "ngram-map-k4v":
+                case "map-k4v":
+                case "ngram-mod":
+                case "mod":
+                    return NGRAM_MAP;
+                case "ngram-cache":
+                    return NGRAM_CACHE;
+                case "suffix":
+                    return SUFFIX;
                 case "draft-eagle3":
                 case "draft-dflash":
                     throw new IllegalArgumentException("draft type " + value + " is detected from the draft file's"
                             + " architecture; use auto");
                 default:
-                    throw new IllegalArgumentException("draft type " + value + " is invalid; use auto, draft-mtp or"
-                            + " draft-simple");
+                    throw new IllegalArgumentException("draft type " + value + " is invalid; use auto, draft-mtp,"
+                            + " draft-simple, ngram-simple, ngram-map, ngram-cache or suffix");
+            }
+        }
+
+        /** Whether the type drafts from the target's own tokens or a suffix text, needing no draft file. */
+        public boolean lookupWithoutDraftModel() {
+            switch (this) {
+                case NGRAM:
+                case NGRAM_MAP:
+                case NGRAM_CACHE:
+                case SUFFIX:
+                    return true;
+                default:
+                    return false;
             }
         }
     }
@@ -386,8 +445,9 @@ public final class EngineConfig {
     public String draftModelPath() { return draftModelPath; }
     /** How the draft file drafts for its target ({@link DraftType#AUTO} by default). */
     public DraftType draftType() { return draftType; }
-    /** Whether speculative decoding is configured: a draft model or NextN / MTP self-speculation. */
-    public boolean speculative() { return draftModelPath != null || mtp; }
+    /** Whether speculative decoding is configured: a draft model, NextN / MTP self-speculation, or a draft type
+     * that drafts from the target's own tokens or an external corpus without a draft file. */
+    public boolean speculative() { return draftModelPath != null || mtp || draftType.lookupWithoutDraftModel(); }
     /** Maximum tokens drafted per step. */
     public int draftMax() { return draftMax; }
     /** Minimum draft length worth verifying; shorter drafts are dropped. */

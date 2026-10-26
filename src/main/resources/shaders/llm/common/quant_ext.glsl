@@ -1,32 +1,40 @@
-/* common/quant_ext.glsl - QT_DECODE_* decoders for the NeuralFree extension weight types F8_E4M3,
- * F8_E4M3_B128, MXFP8, I8_B128, NF4 and FP4_BNB. GLSL twin of kernels/llm/common/quant_decode_ext.h
+/* common/quant_ext.glsl - QT_DECODE_* decoders for the NeuralFree extension weight types F8_E5M2,
+ * F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4 and FP4_BNB. GLSL twin of kernels/llm/common/quant_decode_ext.h
  * (the semantic reference). Requires: common/quant_blocks.glsl.
  *
  * Decoder interface and include contract: common/quant_blocks.glsl. Weights are read only through
  * nf_w_*(ws, off) and activations only through qt_x/qt_x4.
  *
- * Block layouts (little-endian; Java GGMLType ids 1000-1005, BlockLayout offsets):
- *   F8_E4M3       32 B: qs[32] (E4M3FN) @0               y[j] = e4m3(qs[j])
+ * Block layouts (little-endian; Java GGMLType ids 1000-1006, BlockLayout offsets):
+ *   F8_E5M2       32 B: qs[32] (E5M2) @0                y[j] = e5m2(qs[j])
+ *   F8_E4M3       32 B: qs[32] (E4M3FN) @0              y[j] = e4m3(qs[j])
  *   F8_E4M3_B128 132 B: d (f32) @0, qs[128] (E4M3FN) @4  y[j] = d * e4m3(qs[j])
  *   MXFP8         33 B: e (E8M0) @0, qs[32] (E4M3FN) @1  y[j] = 2^(e - 127) * e4m3(qs[j])
  *   I8_B128      132 B: d (f32) @0, qs[128] (int8) @4    y[j] = d * qs[j]
  *   NF4, FP4_BNB  36 B: absmax (f32) @0, qs[32] @4       y[j] = code[n_j] * absmax, n_j the low nibble
  *                                                        of qs[j] (j < 32) or the high nibble of qs[j - 32]
- * F8_E4M3 carries no block scale; its per-tensor or per-expert `.scale` is applied by the consumer
- * after the matmul. E4M3FN NaN codes (0x7F, 0xFF) decode to 0; repackers reject them.
+ * F8_E5M2 and F8_E4M3 carry no block scale; their per-tensor or per-expert `.scale` is applied by the
+ * consumer after the matmul. An E5M2 code is the high byte of an IEEE half, decoded exactly with
+ * nf_half (the infinities and the NaNs included, equal to the hardware-FP8 conversions on a float8
+ * device); E4M3FN NaN codes (0x7F, 0xFF) decode to 0. The repackers reject the non-finite codes.
  *
  * Work split (equal to the OpenCL triples): every invocation of a block owns the NF_QE_EPT = 8
  * consecutive elements [8*ltid, 8*ltid + 8), in two runs of 4:
- *   F8_E4M3, MXFP8            QT_TPS = 4    qs bytes 8*ltid .. +7
- *   F8_E4M3_B128, I8_B128     QT_TPS = 16   qs bytes 8*ltid .. +7
- *   NF4, FP4_BNB              QT_TPS = 8    low nibbles of qs bytes 8*ltid .. +7 (ltid < 4), high
- *                                           nibbles of qs bytes 8*(ltid - 4) .. +7 (ltid >= 4)
+ *   F8_E5M2, F8_E4M3, MXFP8   QT_TPS = 4   qs bytes 8*ltid .. +7
+ *   F8_E4M3_B128, I8_B128     QT_TPS = 16  qs bytes 8*ltid .. +7
+ *   NF4, FP4_BNB              QT_TPS = 8   low nibbles of qs bytes 8*ltid .. +7 (ltid < 4), high
+ *                                          nibbles of qs bytes 8*(ltid - 4) .. +7 (ltid >= 4)
  * Per type, nf_qe_w8() yields the unscaled values of both runs and nf_qe_scale() the block scale;
  * qt_dot is scale * (dot(w0, run 0) + dot(w1, run 1)).
  *
+ * Fast paths. The {T}_Hw_* rows of variants/matvec_extquant.tsv and variants/gemm_tiled.tsv target
+ * these decoders with the same QTYPE, so a _Hw variant is bit-identical to the generic row; GpuOps
+ * selects them by name only when the device reports the FP8 decode feature (CUDA sm_89+; the CUDA
+ * _Hw kernels convert the code pairs in hardware).
+ *
  * Alignment: block offsets (bp, rbase) are multiples of QT_BB from the start of a 4-byte aligned
- * binding. F8_E4M3 (32), F8_E4M3_B128 and I8_B128 (132), NF4 and FP4_BNB (36) blocks are 4-aligned
- * and read their f32 scale and code words with nf_w_f32 / nf_w_u32; MXFP8 (33) reads bytes
+ * binding. F8_E5M2 and F8_E4M3 (32), F8_E4M3_B128 and I8_B128 (132), NF4 and FP4_BNB (36) blocks are
+ * 4-aligned and read their f32 scale and code words with nf_w_f32 / nf_w_u32; MXFP8 (33) reads bytes
  * (nf_w_u8 / nf_w_u32_any).
  */
 #ifndef NF_QUANT_EXT_GLSL
@@ -37,8 +45,8 @@
 #endif
 
 #ifdef QTYPE
-#if QTYPE == QT_F8_E4M3 || QTYPE == QT_F8_E4M3_B128 || QTYPE == QT_MXFP8 || QTYPE == QT_I8_B128 \
- || QTYPE == QT_NF4 || QTYPE == QT_FP4_BNB
+#if QTYPE == QT_F8_E5M2 || QTYPE == QT_F8_E4M3 || QTYPE == QT_F8_E4M3_B128 || QTYPE == QT_MXFP8 \
+ || QTYPE == QT_I8_B128 || QTYPE == QT_NF4 || QTYPE == QT_FP4_BNB
 
 #define QT_DECODE_DOT  1
 #define QT_DECODE_DUAL 1
@@ -71,7 +79,35 @@ vec4 nf_qe_e4m3x4(uvec4 c) {
     return mix(vec4(0.0), (1.0 - 2.0 * vec4(c >> 7)) * v, notEqual(c & 0x7Fu, uvec4(0x7Fu)));
 }
 
-#if QTYPE == QT_F8_E4M3
+#if QTYPE == QT_F8_E5M2
+/* ---- F8_E5M2: qs[32] @0, no block scale ---- */
+#define QT_BS  NF_F8_E5M2_BS
+#define QT_BB  NF_F8_E5M2_BB
+#define QT_TPS 4
+
+/* The unscaled E5M2 values of the four codes of c: the code is the high byte of an IEEE half
+ * (Java Fp8Codec.E5M2 and the C half_bits_to_float), infinities and NaNs included. */
+vec4 nf_qe_e5m2x4(uvec4 c) {
+    return vec4(nf_half((c.x & 0xFFu) << 8), nf_half((c.y & 0xFFu) << 8),
+                nf_half((c.z & 0xFFu) << 8), nf_half((c.w & 0xFFu) << 8));
+}
+
+void nf_qe_w8(uint ws, uint bp, uint ltid, out vec4 w0, out vec4 w1) {
+    const uint q = bp + NF_QE_EPT * ltid;
+    w0 = nf_qe_e5m2x4(nf_qe_bytes(nf_w_u32(ws, q)));
+    w1 = nf_qe_e5m2x4(nf_qe_bytes(nf_w_u32(ws, q + 4u)));
+}
+
+float nf_qe_scale(uint ws, uint bp) {
+    return 1.0;
+}
+
+float qt_elem(uint ws, uint rbase, uint i) {
+    const uint bp = rbase + (i / uint(QT_BS)) * uint(QT_BB);
+    return nf_half(uint(nf_w_u8(ws, bp + i % uint(QT_BS))) << 8);
+}
+
+#elif QTYPE == QT_F8_E4M3
 /* ---- F8_E4M3: qs[32] @0, no block scale ---- */
 #define QT_BS  NF_F8_E4M3_BS
 #define QT_BB  NF_F8_E4M3_BB

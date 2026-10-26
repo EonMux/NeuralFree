@@ -3,6 +3,11 @@ package com.eonmux.neuralfree.gguf;
 import com.eonmux.neuralfree.gguf.hf.HfModelSource;
 import com.eonmux.neuralfree.gguf.hf.lora.PeftAdapterSource;
 import com.eonmux.neuralfree.gguf.hf.config.HfCheckpointDetectors;
+import com.eonmux.neuralfree.gguf.load.DummyWeights;
+import com.eonmux.neuralfree.gguf.load.MetadataOverrides;
+import com.eonmux.neuralfree.gguf.load.OverriddenSource;
+import com.eonmux.neuralfree.gguf.load.RopeOverrides;
+import com.eonmux.neuralfree.gguf.load.TensorChecker;
 import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
 
 import java.io.BufferedReader;
@@ -140,17 +145,74 @@ public final class ModelSources {
         Objects.requireNonNull(options, "options");
         Objects.requireNonNull(actQuant, "actQuant");
         Detection d = detectPath(path);
+        ModelSource source;
         switch (d.kind) {
             case GGUF:
-                return new GGUFFileParser(d.path);
+                source = new GGUFFileParser(d.path);
+                break;
             case SAFETENSORS_FILE:
                 rejectIndexedShard(path);
-                return HfModelSource.open(Paths.get(path), options, target, actQuant);
+                source = HfModelSource.open(Paths.get(path), options, target, actQuant);
+                break;
             case SAFETENSORS_DIR:
-                return HfModelSource.open(Paths.get(path), options, target, actQuant);
+                source = HfModelSource.open(Paths.get(path), options, target, actQuant);
+                break;
             default:
                 throw new IOException("'" + path + "' is a PEFT adapter; load it with --lora on its base model");
         }
+        return withLoadExtras(source, options);
+    }
+
+    /**
+     * The opened source with the loading extras of {@code options} applied to its GGUF view, in order:
+     * <ol>
+     *   <li>the rope overrides ({@code ModelSourceOptions#ropeOverrides()}, when set) fail with an
+     *       {@link IllegalArgumentException} when the source names no {@code general.architecture} to write their
+     *       {@code %s.rope.*} keys for, and become metadata overrides of its keys;</li>
+     *   <li>the {@code metadataOverrides} ({@code --override-kv}), the same view rewrite for GGUF and
+     *       Hugging Face sources, into {@link OverriddenSource};</li>
+     *   <li>{@code loadFormat = DUMMY}, weights regenerated as {@link DummyWeights} when the option asks;</li>
+     *   <li>{@code checkTensors}, the value validation of {@link TensorChecker} over the weights the view holds.
+     *       </li>
+     * </ol>
+     * A source with none of the extras set comes back unchanged, so every opener of a plain model sees today's
+     * behavior.
+     *
+     * @throws IOException  when a Hugging Face checkpoint cannot be read, the tensor check fails, or the check
+     *                      cannot read a tensor
+     * @throws IllegalArgumentException when a rope override or an {@code --override-kv} entry is malformed, or the
+     *                                  rope overrides have no architecture to write their keys for, or the
+     *                                  tensor table of a dummy load is not whole-block and non-overlapping
+     */
+    private static ModelSource withLoadExtras(ModelSource source, ModelSourceOptions options) throws IOException {
+        List<MetadataOverrides.Override> overrides = new ArrayList<>();
+        if (!options.ropeOverrides().isEmpty()) {
+            String arch = source.getString("general.architecture");
+            if (arch == null) {
+                throw new IllegalArgumentException("the model " + source.getFilePath() + " has no"
+                        + " general.architecture; the rope overrides cannot name their rope.* keys");
+            }
+            overrides.addAll(options.ropeOverrides().toOverrides(arch));
+        }
+        overrides.addAll(options.metadataOverrides());
+        ModelSource view = source;
+        if (!overrides.isEmpty()) {
+            view = new OverriddenSource(view, overrides);
+        }
+        if (options.loadFormat() == ModelSourceOptions.LoadFormat.DUMMY) {
+            view = DummyWeights.over(view);
+        }
+        if (options.checkTensors()) {
+            try {
+                TensorChecker.check(view);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                IOException io = new IOException("the tensor check of " + source.getFilePath() + " was"
+                        + " interrupted", e);
+                throw io;
+            }
+        }
+        return view;
     }
 
     /**

@@ -1,15 +1,21 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
+
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 
 /**
- * Token sampling settings, applied in llama.cpp's default chain order (llama.cpp common/common.h
- * {@code common_params_sampling::samplers}): penalties, top-k, typical-p, top-p, min-p, temperature, then a
- * seeded categorical draw. Defaults are llama.cpp's. Immutable.
+ * Token sampling settings, applied in a llama.cpp-configurable chain order. The order defaults to llama.cpp's
+ * {@code common_params_sampling::samplers} (llama.cpp common/common.h:265-273,
+ * {@link StageKind#DEFAULT_ORDER}), which with the stages SA-2 adds off is the fixed chain the fixed dist stage
+ * follows: penalties, top-k, typical-p, top-p, min-p, temperature, then a seeded categorical draw (the bias stage
+ * runs before the chain). Defaults are llama.cpp's. Immutable.
  *
  * <p>Disabled values: {@code topK <= 0}, {@code topP == 1}, {@code minP == 0}, {@code typicalP == 1},
  * {@code repeatPenalty == 1}, {@code presencePenalty == 0}, {@code frequencyPenalty == 0},
@@ -26,7 +32,7 @@ public final class SamplerConfig {
     /** The settings a model's sampling defaults can supply. */
     public enum Setting {
         TEMPERATURE, TOP_K, TOP_P, MIN_P, TYPICAL_P, REPEAT_PENALTY, PENALTY_LAST_N, PRESENCE_PENALTY,
-        FREQUENCY_PENALTY
+        FREQUENCY_PENALTY, SEQUENCE
     }
 
     /** Seed value meaning "draw a fresh random seed per generation". */
@@ -38,6 +44,7 @@ public final class SamplerConfig {
     public static final String PROP_TOP_K = "neuralfree.top.k";
     public static final String PROP_TOP_P = "neuralfree.top.p";
     public static final String PROP_MIN_P = "neuralfree.min.p";
+    public static final String PROP_MIN_KEEP = "neuralfree.min.keep";
     public static final String PROP_TYPICAL_P = "neuralfree.typical.p";
     public static final String PROP_REPEAT_PENALTY = "neuralfree.repeat.penalty";
     public static final String PROP_PRESENCE_PENALTY = "neuralfree.presence.penalty";
@@ -45,6 +52,7 @@ public final class SamplerConfig {
     public static final String PROP_PENALTY_LAST_N = "neuralfree.repeat.last.n";
     public static final String PROP_SEED = "neuralfree.seed";
     public static final String PROP_GREEDY = "neuralfree.greedy";
+    public static final String PROP_SAMPLERS = "neuralfree.samplers";
 
     private static final SamplerConfig DEFAULTS = builder().build();
 
@@ -52,6 +60,7 @@ public final class SamplerConfig {
     private final int topK;
     private final float topP;
     private final float minP;
+    private final int minKeep;
     private final float typicalP;
     private final float repeatPenalty;
     private final float presencePenalty;
@@ -59,6 +68,7 @@ public final class SamplerConfig {
     private final int penaltyLastN;
     private final long seed;
     private final boolean greedy;
+    private final List<StageKind> order;
     private final Set<Setting> explicit;
 
     private SamplerConfig(Builder b) {
@@ -66,6 +76,7 @@ public final class SamplerConfig {
         this.topK = b.topK;
         this.topP = b.topP;
         this.minP = b.minP;
+        this.minKeep = b.minKeep;
         this.typicalP = b.typicalP;
         this.repeatPenalty = b.repeatPenalty;
         this.presencePenalty = b.presencePenalty;
@@ -73,6 +84,7 @@ public final class SamplerConfig {
         this.penaltyLastN = b.penaltyLastN;
         this.seed = b.seed;
         this.greedy = b.greedy;
+        this.order = b.order;
         this.explicit = Collections.unmodifiableSet(EnumSet.copyOf(b.explicit));
     }
 
@@ -103,11 +115,20 @@ public final class SamplerConfig {
         intProperty(p, PROP_TOP_K, b::topK);
         floatProperty(p, PROP_TOP_P, b::topP);
         floatProperty(p, PROP_MIN_P, b::minP);
+        intProperty(p, PROP_MIN_KEEP, b::minKeep);
         floatProperty(p, PROP_TYPICAL_P, b::typicalP);
         floatProperty(p, PROP_REPEAT_PENALTY, b::repeatPenalty);
         floatProperty(p, PROP_PRESENCE_PENALTY, b::presencePenalty);
         floatProperty(p, PROP_FREQUENCY_PENALTY, b::frequencyPenalty);
         intProperty(p, PROP_PENALTY_LAST_N, b::penaltyLastN);
+        String samplers = EngineConfig.stringProperty(p, PROP_SAMPLERS);
+        if (samplers != null) {
+            try {
+                b.samplers(StageKind.parseOrder(samplers));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(PROP_SAMPLERS + ": " + e.getMessage(), e);
+            }
+        }
         return b.seed(EngineConfig.longProperty(p, PROP_SEED, b.seed))
                 .greedy(EngineConfig.booleanProperty(p, PROP_GREEDY, b.greedy))
                 .build();
@@ -147,10 +168,14 @@ public final class SamplerConfig {
     public float frequencyPenalty() { return frequencyPenalty; }
     /** Tokens the penalties look back over: 0 disables them, {@link #PENALTY_WHOLE_CONTEXT} means all. */
     public int penaltyLastN() { return penaltyLastN; }
+    /** Fewest candidates to keep after top-k, top-p, min-p and typical-p (llama.cpp's {@code min_keep}). */
+    public int minKeep() { return minKeep; }
     /** The RNG seed, or {@link #RANDOM_SEED}. */
     public long seed() { return seed; }
     /** Whether greedy decoding was requested explicitly. */
     public boolean greedy() { return greedy; }
+    /** llama.cpp's chain order (unmodifiable); {@link StageKind#DEFAULT_ORDER} unless configured otherwise. */
+    public List<StageKind> order() { return order; }
 
     /** The settings given explicitly (unmodifiable); a model's sampling defaults never replace them. */
     public Set<Setting> explicit() { return explicit; }
@@ -190,6 +215,7 @@ public final class SamplerConfig {
         b.penaltyLastN = penaltyLastN;
         b.seed = seed;
         b.greedy = greedy;
+        b.order = order;
         b.explicit.addAll(explicit);
         return b;
     }
@@ -238,6 +264,9 @@ public final class SamplerConfig {
         if (defaults.frequencyPenalty() != null && !explicit.contains(Setting.FREQUENCY_PENALTY)) {
             b.fallbackFrequencyPenalty(defaults.frequencyPenalty());
         }
+        if (defaults.sequence() != null && !explicit.contains(Setting.SEQUENCE)) {
+            b.fallbackSamplers(defaults.sequence());
+        }
         return b.build();
     }
 
@@ -258,6 +287,7 @@ public final class SamplerConfig {
         private int topK = 40;
         private float topP = 0.95f;
         private float minP = 0.05f;
+        private int minKeep = 0;
         private float typicalP = 1.0f;
         private float repeatPenalty = 1.0f;
         private float presencePenalty = 0.0f;
@@ -265,6 +295,7 @@ public final class SamplerConfig {
         private int penaltyLastN = 64;
         private long seed = RANDOM_SEED;
         private boolean greedy;
+        private List<StageKind> order = StageKind.DEFAULT_ORDER;
         private final EnumSet<Setting> explicit = EnumSet.noneOf(Setting.class);
 
         private Builder() {
@@ -279,8 +310,33 @@ public final class SamplerConfig {
         public Builder presencePenalty(float v) { this.presencePenalty = v; return mark(Setting.PRESENCE_PENALTY); }
         public Builder frequencyPenalty(float v) { this.frequencyPenalty = v; return mark(Setting.FREQUENCY_PENALTY); }
         public Builder penaltyLastN(int v) { this.penaltyLastN = v; return mark(Setting.PENALTY_LAST_N); }
+        public Builder minKeep(int v) { this.minKeep = v; return this; }
         public Builder seed(long v) { this.seed = v; return this; }
         public Builder greedy(boolean v) { this.greedy = v; return this; }
+
+        /** llama.cpp's chain order ({@code neuralfree.samplers}); the kind, not the fixed bias or dist stage. */
+        public Builder samplers(List<StageKind> order) {
+            this.order = StageKind.parseOrder(joined(order));
+            return mark(Setting.SEQUENCE);
+        }
+
+        /** {@link #samplers(List)} for a '{@code ;}'-separated order. */
+        public Builder samplers(String joined) {
+            this.order = StageKind.parseOrder(joined);
+            return mark(Setting.SEQUENCE);
+        }
+
+        /** {@link #fallbackSamplers(List)} taking the order and leaving {@link Setting#SEQUENCE} a fallback. */
+        public Builder fallbackSamplers(List<StageKind> order) {
+            this.order = StageKind.parseOrder(joined(order));
+            return unmark(Setting.SEQUENCE);
+        }
+
+        /** {@link #fallbackSamplers(List)} for a '{@code ;}'-separated order. */
+        public Builder fallbackSamplers(String joined) {
+            this.order = StageKind.parseOrder(joined);
+            return unmark(Setting.SEQUENCE);
+        }
 
         public Builder fallbackTemperature(float v) { this.temperature = v; return unmark(Setting.TEMPERATURE); }
         public Builder fallbackTopK(int v) { this.topK = v; return unmark(Setting.TOP_K); }
@@ -297,6 +353,21 @@ public final class SamplerConfig {
             return unmark(Setting.FREQUENCY_PENALTY);
         }
         public Builder fallbackPenaltyLastN(int v) { this.penaltyLastN = v; return unmark(Setting.PENALTY_LAST_N); }
+
+        private static String joined(List<StageKind> order) {
+            Objects.requireNonNull(order, "sampler order");
+            if (order.isEmpty()) {
+                throw new IllegalArgumentException("sampler order is empty");
+            }
+            StringBuilder s = new StringBuilder();
+            for (StageKind kind : order) {
+                if (s.length() > 0) {
+                    s.append(';');
+                }
+                s.append(kind.label());
+            }
+            return s.toString();
+        }
 
         private Builder mark(Setting s) {
             explicit.add(s);
@@ -323,6 +394,9 @@ public final class SamplerConfig {
             if (penaltyLastN < PENALTY_WHOLE_CONTEXT) {
                 throw new IllegalArgumentException(
                         "penaltyLastN must be >= -1 (-1 = whole context, 0 = disabled), got " + penaltyLastN);
+            }
+            if (minKeep < 0) {
+                throw new IllegalArgumentException(PROP_MIN_KEEP + " must be >= 0, got " + minKeep);
             }
             if (seed < RANDOM_SEED) {
                 throw new IllegalArgumentException("seed must be >= 0, or -1 for a random seed, got " + seed);

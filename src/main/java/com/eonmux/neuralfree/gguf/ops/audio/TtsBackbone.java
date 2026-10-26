@@ -5,7 +5,9 @@ import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.Observers;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
@@ -280,6 +282,29 @@ public final class TtsBackbone {
         @Override
         public float[][] forwardAll(int[] tokens, int[] outputRows) {
             return padAll(delegate.forwardAll(tokens, outputRows));
+        }
+
+        /** The padded layout holds for batched rows too: each output row is padded on the host. */
+        @Override
+        public float[][] forwardBatch(ForwardBatch batch) {
+            return padAll(delegate.forwardBatch(batch));
+        }
+
+        @Override
+        public int maxSequences() {
+            return delegate.maxSequences();
+        }
+
+        /** Padding is head-local: the batch refusal is the delegate's. */
+        @Override
+        public String batchRefusal() {
+            return delegate.batchRefusal();
+        }
+
+        @Override
+        public Observers observers() {
+            // padding adds no observation channel of the residual stream
+            return delegate.observers();
         }
 
         private float[][] padAll(float[][] rows) {
