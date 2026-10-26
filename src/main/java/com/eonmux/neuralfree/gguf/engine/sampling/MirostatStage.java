@@ -1,0 +1,147 @@
+package com.eonmux.neuralfree.gguf.engine.sampling;
+
+import com.eonmux.neuralfree.gguf.engine.Sampler.Candidates;
+
+/**
+ * llama.cpp's mirostat sampler, both versions (llama_sampler_mirostat_apply, llama.cpp src/llama-sampler.cpp:2466, and
+ * llama_sampler_mirostat_v2_apply, :2579): a terminal selector - it softmaxes, keeps or recomputes the candidate set
+ * around a target surprise {@code tau}, draws one token with its own std::mt19937 through llama_sample_dist, sets that
+ * candidate selected, and adapts {@code mu} toward the target by the learning rate {@code eta}. It replaces the chain's
+ * dist stage, as llama.cpp builds it ({@code temp + mirostat}, common/sampling.cpp:408-413).
+ *
+ * <p>v1 ({@code mirostat = 1}, {@code m = 100}) estimates the tail exponent {@code s_hat} over the first {@code m - 1}
+ * probabilities, cuts the set to max(1, int(k)) candidates via llama.top_k_impl with k from mu and the vocabulary size,
+ * then draws; the vocabulary size comes from the first candidate set (llama.cpp reads it from the vocabulary at chain
+ * construction; here the chain is {@code temperature + mirostat}, so the first full row is exactly that size).
+ * v2 ({@code mirostat = 2}) truncates at the first candidate with {@code -log2(p) > mu}, collapsing to one candidate
+ * when none survives, then draws.
+ */
+public final class MirostatStage extends SamplerStage {
+
+    private final int version;
+    private final float tau;
+    private final float eta;
+    private final long seed;
+    private int vocabSize;
+    private float mu;
+    private final Mt19937 rng;
+
+    public MirostatStage(int version, float tau, float eta, long seed) {
+        this.version = version;
+        this.tau = tau;
+        this.eta = eta;
+        this.seed = seed;
+        this.vocabSize = 0;
+        this.mu = 2.0f * tau;
+        this.rng = new Mt19937(seed);
+    }
+
+    @Override
+    public StageKind kind() {
+        return StageKind.MIROSTAT;
+    }
+
+    @Override
+    public void apply(Candidates candidates) {
+        if (vocabSize == 0) {
+            vocabSize = candidates.size();
+        }
+        if (version == 1) {
+            applyV1(candidates);
+        } else {
+            applyV2(candidates);
+        }
+    }
+
+    private void applyV1(Candidates candidates) {
+        if (!candidates.sorted()) {
+            candidates.sortDescending();
+        }
+        candidates.softmax();
+
+        // Estimate s_hat using the most probable m tokens
+        float sHat = 0f;
+        float sumTiBi = 0f;
+        float sumTiSq = 0f;
+        int m = 100;
+        for (int i = 0; i < m - 1 && i < candidates.size() - 1; i++) {
+            float ti = (float) Math.log((float) (i + 2) / (float) (i + 1));
+            float bi = (float) Math.log(candidates.prob(i) / candidates.prob(i + 1));
+            sumTiBi += ti * bi;
+            sumTiSq += ti * ti;
+        }
+        sHat = sumTiBi / sumTiSq;
+
+        // Compute k from the estimated s_hat and target surprise value
+        float epsilonHat = sHat - 1;
+        float k = (float) Math.pow((epsilonHat * Math.pow(2.0, mu)) / (1.0 - Math.pow(vocabSize, -epsilonHat)),
+                1.0 / sHat);
+        int keep = Math.max((int) k, 1);
+        int kImpl = Math.min(keep, candidates.size());
+        candidates.partialSortDescending(kImpl);
+        candidates.truncate(kImpl);
+
+        if (!candidates.sorted()) {
+            candidates.sortDescending();
+        }
+        candidates.softmax();
+
+        float[] probs = probs(candidates);
+        int idx = rng.distDraw(probs);
+        candidates.select(idx);
+
+        float observedSurprise = -log2f(candidates.prob(idx));
+        float e = observedSurprise - tau;
+        mu = mu - eta * e;
+    }
+
+    private void applyV2(Candidates candidates) {
+        if (!candidates.sorted()) {
+            candidates.sortDescending();
+        }
+        candidates.softmax();
+
+        // Truncate the words with surprise values greater than mu
+        int size = 0;
+        for (int i = 0; i < candidates.size(); i++) {
+            if (-log2f(candidates.prob(i)) > mu) {
+                break;
+            }
+            size++;
+        }
+        candidates.truncate(Math.max(size, 1));
+
+        // Normalize the probabilities of the remaining words
+        if (!candidates.sorted()) {
+            candidates.sortDescending();
+        }
+        candidates.softmax();
+
+        float[] probs = probs(candidates);
+        int idx = rng.distDraw(probs);
+        candidates.select(idx);
+
+        float observedSurprise = -log2f(candidates.prob(idx));
+        float e = observedSurprise - tau;
+        mu = mu - eta * e;
+    }
+
+    private static float log2f(float v) {
+        return (float) (Math.log(v) / Math.log(2.0));
+    }
+
+    /** The probabilities of the current candidates (llama_sample_dist's iterator range). */
+    private static float[] probs(Candidates candidates) {
+        float[] probs = new float[candidates.size()];
+        for (int i = 0; i < probs.length; i++) {
+            probs[i] = candidates.prob(i);
+        }
+        return probs;
+    }
+
+    @Override
+    public void reset() {
+        mu = 2.0f * tau;
+        rng.seed(seed);
+    }
+}

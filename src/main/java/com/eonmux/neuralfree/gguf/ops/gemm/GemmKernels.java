@@ -73,7 +73,7 @@ public final class GemmKernels {
     public static final int TOPK_ARG_COUNT = 6;
 
     /** Weight types with a {@code <T>_MatMul_Tiled} kernel: F32, F16, BF16 and every GPU quant type
-     *  (the F8_E5M2 extension type included). */
+     *  (the F8_E5M2, MXFP6_E3M2 and MXFP6_E2M3 extension types included). */
     public static final Set<GGMLType> TILED_TYPES = Collections.unmodifiableSet(EnumSet.of(
             GGMLType.F32, GGMLType.F16, GGMLType.BF16,
             GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0,
@@ -82,7 +82,8 @@ public final class GemmKernels {
             GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S,
             GGMLType.IQ1_S, GGMLType.IQ1_M,
             GGMLType.TQ1_0, GGMLType.TQ2_0, GGMLType.NVFP4, GGMLType.Q1_0, GGMLType.Q2_0,
-            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4,
+            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.MXFP6_E3M2, GGMLType.MXFP6_E2M3,
+            GGMLType.I8_B128, GGMLType.NF4,
             GGMLType.FP4_BNB, GGMLType.F8_E5M2));
 
     private GemmKernels() {

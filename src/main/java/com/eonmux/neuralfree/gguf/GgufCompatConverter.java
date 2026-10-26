@@ -22,6 +22,13 @@ import java.util.Objects;
  *       needs a subnormal target, so the tensor becomes F32. Some {@code e ≥ 247} overflows f32 too, so
  *       the export fails with an {@link IOException} naming the tensor. The exponent bytes are scanned
  *       once from the store.</li>
+ *   <li>MXFP6_E3M2 and MXFP6_E2M3 → BF16, exact: a block value is a 6-bit float mantissa (at most
+ *       four significant bits plus the shared E8M0 exponent, and every subnormal is a multiple of the
+ *       smallest bf16 subnormal), which bf16 represents exactly whenever the value stays inside its
+ *       normal range, i.e. {@code e ≤ 250} (E3M2: the largest block value {@code 28 × 2^123}) or
+ *       {@code e ≤ 252} (E2M3: {@code 7.5 × 2^125}); a larger exponent overflows f32 on decode too, so
+ *       the export fails with an {@link IOException} naming the tensor (the Nan exponent 0xFF is
+ *       rejected at the load of the source). The exponent bytes are scanned once from the store.</li>
  *   <li>F8_E4M3_B128 and I8_B128 → Q8_0 (lossy: a per-32 requantization of a per-128 scale; the scale is
  *       rounded to fp16 by the Q8_0 format itself).</li>
  *   <li>NF4 and FP4_BNB → F16 (lossy: the codebook values round).</li>
@@ -38,6 +45,12 @@ public final class GgufCompatConverter {
 
     /** Largest MXFP8 E8M0 exponent whose block range fits bf16 (and f32) as a normal number. */
     public static final int MAX_FITTING_EXPONENT = 246;
+
+    /** Largest MXFP6_E3M2 E8M0 exponent whose block values stay in bf16's normal range: {@code 28 × 2^123}. */
+    public static final int MXFP6_E3M2_MAX_EXPONENT = 250;
+
+    /** Largest MXFP6_E2M3 E8M0 exponent whose block values stay in bf16's normal range: {@code 7.5 × 2^125}. */
+    public static final int MXFP6_E2M3_MAX_EXPONENT = 252;
 
     /** Largest float window of one conversion chunk, in elements (16 Mi floats). */
     private static final int CHUNK_ELEMENTS = 1 << 24;
@@ -68,6 +81,10 @@ public final class GgufCompatConverter {
                 return GGMLType.F16;
             case MXFP8:
                 return mxfp8Target(t, store);
+            case MXFP6_E3M2:
+                return mxfp6Target(t, store, MXFP6_E3M2_MAX_EXPONENT);
+            case MXFP6_E2M3:
+                return mxfp6Target(t, store, MXFP6_E2M3_MAX_EXPONENT);
             case F8_E4M3_B128:
             case I8_B128:
                 if (mode == GgufWriter.Mode.COMPAT_EXACT) {
@@ -149,6 +166,42 @@ public final class GgufCompatConverter {
         return fitting == blocks ? GGMLType.BF16 : GGMLType.F32;
     }
 
+    /** Exponent byte of MXFP6 block {@code i} (values {@code ne / 32}) in raw tensor bytes. */
+    public static int mxfp6ExponentAt(byte[] raw, int block) {
+        return raw[block * BlockLayout.MXFP6_BYTES] & 0xFF;
+    }
+
+    /**
+     * Scans the E8M0 exponent bytes of an MXFP6_E3M2 / MXFP6_E2M3 tensor once and selects its target type. Every
+     * exponent within the type's limit converts exactly to BF16 (see the class notes); a larger exponent —
+     * including the NaN byte 0xFF, whose block the load of the source already rejects — overflows f32 on decode,
+     * so no COMPAT target exists.
+     *
+     * @throws IOException naming the tensor when any exponent exceeds {@code maxExp}
+     */
+    private static GGMLType mxfp6Target(GGUFTensorInfo t, WeightStore store, int maxExp) throws IOException {
+        BlockLayout layout = BlockLayout.of(t.type());
+        long blocks = layout.blocksForElements(t.numElements());
+        int chunkBlocks = chunkBlocks(t.type(), GGMLType.BF16);
+        byte[] raw = new byte[Math.multiplyExact(chunkBlocks, layout.blockBytes())];
+        long readAt = 0;
+        while (readAt < blocks) {
+            int n = (int) Math.min(chunkBlocks, blocks - readAt);
+            int bytes = Math.multiplyExact(n, layout.blockBytes());
+            store.readTensor(t.offset() + Math.multiplyExact(readAt, layout.blockBytes()), bytes, raw, 0);
+            for (int i = 0; i < n; i++) {
+                int e = mxfp6ExponentAt(raw, i);
+                if (e > maxExp) {
+                    throw new IOException("tensor '" + t.name() + "' of " + t.type() + " blocks has exponent byte "
+                            + e + " (the value 2^(e-127) × the largest code overflows bf16 as a COMPAT target) in"
+                            + " block " + (readAt + i) + "; a COMPAT export cannot represent it");
+                }
+            }
+            readAt += n;
+        }
+        return GGMLType.BF16;
+    }
+
     /**
      * Streams {@code src}'s data through {@code store}, converts it to {@code dst}'s type and writes it to
      * {@code enc}. The two tensor infos must share name and element count; whether the conversion is exact
@@ -196,9 +249,11 @@ public final class GgufCompatConverter {
 
     /** The conversions a COMPAT export ever writes; anything else is the writer's bug. */
     private static void checkConversion(String name, GGMLType from, GGMLType to) throws IOException {
-        boolean ok = from.isExtension()
-                && (to == GGMLType.F16 || to == GGMLType.F32 || to == GGMLType.Q8_0)
-                && (from != GGMLType.MXFP8 || to == GGMLType.BF16 || to == GGMLType.F32);
+        boolean bf16 = from == GGMLType.MXFP8 && (to == GGMLType.BF16 || to == GGMLType.F32)
+                || (from == GGMLType.MXFP6_E3M2 || from == GGMLType.MXFP6_E2M3) && to == GGMLType.BF16;
+        boolean ok = from.isExtension() && (bf16
+                || (to == GGMLType.F16 || to == GGMLType.F32 || to == GGMLType.Q8_0)
+                && from != GGMLType.MXFP8 && from != GGMLType.MXFP6_E3M2 && from != GGMLType.MXFP6_E2M3);
         if (!ok) {
             throw new IOException("tensor '" + name + "' has no COMPAT conversion from " + from + " to " + to);
         }

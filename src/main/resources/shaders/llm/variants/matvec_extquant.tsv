@@ -1,6 +1,6 @@
 # kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
-# NeuralFree extension weight families (F8_E5M2, F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB;
-# kernels/llm/matvec_extquant.cl) over the matvec_quant.comp and embed.comp templates (decoders in
+# NeuralFree extension weight families (F8_E5M2, F8_E4M3, F8_E4M3_B128, MXFP8, MXFP6_E2M3, MXFP6_E3M2,
+# I8_B128, NF4, FP4_BNB; kernels/llm/matvec_extquant.cl) over the matvec_quant.comp and embed.comp templates (decoders in
 # common/quant_ext.glsl), plus the {T}_Hw_* hardware-FP8 fast paths of the four FP8 code types: GpuOps
 # selects a _Hw row only when the device reports the FP8 decode feature (CUDA sm_89+), and the rows
 # carry the same decoders, so the results stay bit-identical to the generic rows.
@@ -28,6 +28,22 @@ MXFP8_EmbeddingLookup	embed.comp	QTYPE=QT_MXFP8 OP=OP_EMBED
 MXFP8_BatchEmbeddingLookup	embed.comp	QTYPE=QT_MXFP8 OP=OP_BATCH_EMBED
 MXFP8_BatchMatMul	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_BATCH	sg
 MXFP8_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_MXFP8 OP=OP_BATCH_2D	sg
+MXFP6_E2M3_MatVec	matvec_quant.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_MATVEC	sg
+MXFP6_E2M3_MatVecAdd	matvec_quant.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_MATVEC_ADD	sg
+MXFP6_E2M3_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_GATEUP_SILU	sg
+MXFP6_E2M3_ComputeLogits	matvec_quant.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_LOGITS	sg
+MXFP6_E2M3_EmbeddingLookup	embed.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_EMBED
+MXFP6_E2M3_BatchEmbeddingLookup	embed.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_BATCH_EMBED
+MXFP6_E2M3_BatchMatMul	matvec_quant.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_BATCH	sg
+MXFP6_E2M3_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_MXFP6_E2M3 OP=OP_BATCH_2D	sg
+MXFP6_E3M2_MatVec	matvec_quant.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_MATVEC	sg
+MXFP6_E3M2_MatVecAdd	matvec_quant.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_MATVEC_ADD	sg
+MXFP6_E3M2_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_GATEUP_SILU	sg
+MXFP6_E3M2_ComputeLogits	matvec_quant.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_LOGITS	sg
+MXFP6_E3M2_EmbeddingLookup	embed.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_EMBED
+MXFP6_E3M2_BatchEmbeddingLookup	embed.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_BATCH_EMBED
+MXFP6_E3M2_BatchMatMul	matvec_quant.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_BATCH	sg
+MXFP6_E3M2_BatchMatMul_2D	matvec_quant.comp	QTYPE=QT_MXFP6_E3M2 OP=OP_BATCH_2D	sg
 I8_B128_MatVec	matvec_quant.comp	QTYPE=QT_I8_B128 OP=OP_MATVEC	sg
 I8_B128_MatVecAdd	matvec_quant.comp	QTYPE=QT_I8_B128 OP=OP_MATVEC_ADD	sg
 I8_B128_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_I8_B128 OP=OP_GATEUP_SILU	sg

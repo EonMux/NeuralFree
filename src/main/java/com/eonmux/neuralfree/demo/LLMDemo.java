@@ -157,10 +157,25 @@ public final class LLMDemo {
     }
 
     /**
-     * The model path: the command line, else {@code -Dneuralfree.model}, else {@code NEURALFREE_MODEL}; null when none
-     * of them gives one.
+     * The model path: the {@code -hf} Hugging Face Hub download (PARITY TL-7: the file the Hub cache
+     * holds for the repo expression), else the command line, else {@code -Dneuralfree.model}, else
+     * {@code NEURALFREE_MODEL}; null when none of them gives one.
      */
     private static String resolveModelPath(LLMDemoOptions opts) {
+        if (opts.hfRepo != null) {
+            try {
+                return com.eonmux.neuralfree.demo.tools.DownloadCommand.downloadModel(
+                        opts.hfRepo, opts.hfFile);
+            } catch (java.io.IOException | java.lang.InterruptedException e) {
+                System.err.println("Error: " + e.getMessage());
+                System.exit(1);
+                return null;
+            } catch (com.eonmux.neuralfree.demo.tools.DownloadCommand.UsageException e) {
+                System.err.println("Error: " + e.getMessage());
+                System.exit(2);
+                return null;
+            }
+        }
         if (opts.modelPath != null) {
             return opts.modelPath;
         }

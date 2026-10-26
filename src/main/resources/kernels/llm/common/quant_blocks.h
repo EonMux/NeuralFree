@@ -26,7 +26,7 @@
 #define MXFP4_THREADS_PER_BLOCK 4
 #define MXFP4_BYTES_PER_THREAD 4  /* 4 nibble-bytes = 8 elements */
 
-/* ---- NeuralFree extension blocks (GGMLType ids 1000-1006, gguf.quant.BlockLayout), little-endian ---- */
+/* ---- NeuralFree extension blocks (GGMLType ids 1000-1008, gguf.quant.BlockLayout), little-endian ---- */
 #define F8_E4M3_BLOCK_SIZE 32
 #define F8_E4M3_BLOCK_BYTES 32        /* qs[32](e4m3fn) */
 #define F8_E5M2_BLOCK_SIZE 32
@@ -35,6 +35,10 @@
 #define F8_E4M3_B128_BLOCK_BYTES 132  /* d(f32) qs[128](e4m3fn) */
 #define MXFP8_BLOCK_SIZE 32
 #define MXFP8_BLOCK_BYTES 33          /* e(e8m0) qs[32](e4m3fn) */
+#define MXFP6_E2M3_BLOCK_SIZE 32
+#define MXFP6_E2M3_BLOCK_BYTES 25     /* e(e8m0) qs[24]: 4 packed 6-bit codes per 3 bytes, element j = code j */
+#define MXFP6_E3M2_BLOCK_SIZE 32
+#define MXFP6_E3M2_BLOCK_BYTES 25     /* e(e8m0) qs[24]: 4 packed 6-bit codes per 3 bytes, element j = code j */
 #define I8_B128_BLOCK_SIZE 128
 #define I8_B128_BLOCK_BYTES 132       /* d(f32) qs[128](int8) */
 #define NF4_BLOCK_SIZE 64
@@ -49,6 +53,9 @@
 #define NF_F8_E4M3_B128_QS 4
 #define NF_MXFP8_E         0
 #define NF_MXFP8_QS        1
+#define NF_MXFP6_E         0
+#define NF_MXFP6_QS        1
+#define NF_MXFP6_BYTES_PER_WORKITEM 6  /* 8 codes x 6 bits = 48 bits */
 #define NF_I8_B128_D       0
 #define NF_I8_B128_QS      4
 #define NF_NF4_D           0

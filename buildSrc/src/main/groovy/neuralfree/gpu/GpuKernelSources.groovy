@@ -8,7 +8,8 @@ import java.util.regex.Pattern
 /** Kernel manifest, source assembly and kernel-signature scanning of preprocessed dual-dialect sources. */
 class GpuKernelSources {
     static final int MAX_BUFFERS = 12
-    static final int MAX_SCALARS = 32
+    /** Widest kernel as of MS-4: LLM_FlashAttnPaged_Mixed takes 34 scalars (31 + page_shift/pt_off + kv_types). */
+    static final int MAX_SCALARS = 36
     /** Manifest tag of an OpenCL-only source. */
     static final String OPENCL_TAG = '[opencl]'
     /** Manifest tag of a header resolved against the shared root (KernelManifest.SHARED_TAG). */

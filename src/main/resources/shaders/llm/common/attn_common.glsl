@@ -118,6 +118,27 @@ vec2 nf_attn_sink(float m, float l, float sink) {
     return vec2(a, l * a + exp(sink - m2));
 }
 
+/*
+ * Physical KV row the cached row indexed by slot t reads (nf_kv_row of kernels/llm/common/attn_common.h). GLSL cannot
+ * pass a buffer block as a parameter, so the caller dereferences the page table: page_id is
+ * pt[pt_off + (t >> page_shift)] on paged rows (page_shift >= 0) and arbitrary on the identity path (page_shift < 0).
+ * page_size = 1 << page_shift; the row is (page_id << page_shift) | (t & (page_size - 1)).
+ */
+int nf_kv_row(int t, int page_shift, int page_id) {
+    if (page_shift < 0) {
+        return t;
+    }
+    return (page_id << page_shift) | (t & ((1 << page_shift) - 1));
+}
+
+/*
+ * 1 when the page of slot t is valid: always on the identity path, otherwise the page id must be >= 0 (a page the
+ * sequence never had; negative page ids are masked, never required: section 5.5.1 O-2).
+ */
+bool nf_kv_page_ok(int page_shift, int page_id) {
+    return page_shift < 0 || page_id >= 0;
+}
+
 #ifdef NF_KV_TYPES_GLSL
 /*
  * kv_types argument of the mixed-type flash shaders (LLM_FlashDecode_Mixed, LLM_FlashAttn_Mixed): the K cache type in

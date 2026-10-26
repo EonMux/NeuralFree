@@ -52,6 +52,42 @@ public final class CpuMatVec {
     /** Instance that applies no input transform and no output scale. */
     public static final CpuMatVec PLAIN = new CpuMatVec(w -> Transforms.NONE);
 
+    /** Observes the matmul activations of one call: the CPU tap channel the imatrix tool collects through (TL-3). */
+    @FunctionalInterface
+    public interface InputObserver {
+
+        /**
+         * One matvec or matmul dispatch over the {@code rows} weight rows starting at {@code rowStart}: after the
+         * weight's input transform (HADAMARD / ACT_QUANT / PERMUTE), before the vec-dot quantization — exactly the
+         * {@code src1} the ggml callback of llama.cpp's imatrix tool sees. The activations hold {@code nTokens}
+         * rows of {@code cols} values at {@code x[xOff + t*xStride]}; the observer must copy what it keeps, the
+         * call reuses the array. {@code experts} is the expert count of a 3-D expert tensor (0 for a 2-D weight),
+         * so {@code rowStart / (rows / experts)} is the expert this dispatch ran for. Called from the forward
+         * thread and from {@link CpuParallel} workers for per-token transforms; implementations must be
+         * thread-safe and cheap.
+         */
+        void observe(CpuTensorRef weight, long rowStart, int rows, int experts, float[] x, int xOff, int xStride,
+                     int cols, int nTokens);
+    }
+
+    /**
+     * The instance-independent tap of every CPU matvec and matmul, consulted by every {@link CpuMatVec} of the
+     * process (the weights' matvec, the head's and the blocks' unscaled instances alike): {@code null} unless a
+     * collection tool installed it. The llama.cpp tool keeps one global collector of its graph callback too
+     * ({@code g_collector}).
+     */
+    private static volatile InputObserver globalObserver;
+
+    /** Installs {@code observer} for every later CPU matvec and matmul; {@code null} removes it. */
+    public static void observeGlobally(InputObserver observer) {
+        globalObserver = observer;
+    }
+
+    /** The global tap, or null when none is installed. */
+    public static InputObserver globalObserver() {
+        return globalObserver;
+    }
+
     private final TransformSource transforms;
 
     /** A matvec that resolves each weight's transforms through {@code transforms}. */
@@ -345,7 +381,8 @@ public final class CpuMatVec {
             }
             actExpert = (int) (rowStart / perExpert);
         }
-        QuantizedActivations[] acts = prepare(w.type(), transform, actExpert, x, xOff, xStride, cols, nTokens);
+        QuantizedActivations[] acts = prepare(w, rowStart, rowCount, t.experts(), w.type(), transform, actExpert, x,
+                xOff, xStride, cols, nTokens);
         int grain = (int) Math.max(1L, MIN_TASK_WORK / ((long) cols * nTokens));
         CpuParallel.parallelFor(rowCount, grain, (from, to) -> {
             int n = to - from;
@@ -371,9 +408,12 @@ public final class CpuMatVec {
      * and HADAMARD-alone paths are today's unchanged code path: a model without the transform tensors and keys runs
      * exactly the code the PRISM support ran. The ACT_QUANT fake-quantization (per token row, in runs of the
      * scheme) and the PERMUTE gather of that row both read this call's scratch, never the caller's input.
-     */
-    private static QuantizedActivations[] prepare(GGMLType type, InputTransform transform, int actExpert, float[] x,
-                                                  int xOff, int xStride, int cols, int nTokens) {
+     * The global {@link InputObserver}, when installed, sees the rows with their transform applied and before the
+     * first quantization act, once per call (the unchanged branch) or once per token row (the transform paths). */
+    private static QuantizedActivations[] prepare(CpuTensorRef w, long rowStart, int rows, int experts, GGMLType type,
+                                                   InputTransform transform, int actExpert, float[] x, int xOff,
+                                                   int xStride, int cols, int nTokens) {
+        InputObserver observer = globalObserver;
         float[] src = x;
         int srcOff = xOff;
         int srcStride = xStride;
@@ -390,10 +430,17 @@ public final class CpuMatVec {
             src = rotated;
             srcOff = 0;
             srcStride = cols;
+            if (observer != null) {
+                observer.observe(w, rowStart, rows, experts, rotated, 0, cols, cols, nTokens);
+                observer = null;
+            }
         }
         InputTransform.ActQuant actQuant = transform.actQuant();
         int[] perm = transform.perm();
         if (actQuant == null && perm == null) {
+            if (observer != null) {
+                observer.observe(w, rowStart, rows, experts, x, xOff, xStride, cols, nTokens);
+            }
             return quantizeRows(type, src, srcOff, srcStride, cols, nTokens);
         }
         if (actQuant != null && src == x) {
@@ -405,6 +452,7 @@ public final class CpuMatVec {
         final float[] s = src;
         final int so = srcOff;
         final int ss = srcStride;
+        final var obs = observer;
         final float[] gathered = perm == null ? null : new float[Math.multiplyExact(nTokens, cols)];
         final InputTransform.ActQuant q = actQuant;
         final int[] p = perm;
@@ -421,6 +469,10 @@ public final class CpuMatVec {
                         gathered[d + k] = s[row + p[k]];
                     }
                     actOff = d;
+                }
+                if (obs != null) {
+                    obs.observe(w, rowStart, rows, experts, gathered != null ? gathered : s, actOff, cols,
+                            cols, 1);
                 }
                 acts[tok] = CpuActivationQuantizer.quantizeFor(type, gathered != null ? gathered : s, actOff, cols);
             }

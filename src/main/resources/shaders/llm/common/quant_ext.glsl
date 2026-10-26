@@ -1,15 +1,18 @@
 /* common/quant_ext.glsl - QT_DECODE_* decoders for the NeuralFree extension weight types F8_E5M2,
- * F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4 and FP4_BNB. GLSL twin of kernels/llm/common/quant_decode_ext.h
- * (the semantic reference). Requires: common/quant_blocks.glsl.
+ * F8_E4M3, F8_E4M3_B128, MXFP8, MXFP6_E2M3, MXFP6_E3M2, I8_B128, NF4 and FP4_BNB. GLSL twin of
+ * kernels/llm/common/quant_decode_ext.h (the semantic reference). Requires: common/quant_blocks.glsl.
  *
  * Decoder interface and include contract: common/quant_blocks.glsl. Weights are read only through
  * nf_w_*(ws, off) and activations only through qt_x/qt_x4.
  *
- * Block layouts (little-endian; Java GGMLType ids 1000-1006, BlockLayout offsets):
+ * Block layouts (little-endian; Java GGMLType ids 1000-1008, BlockLayout offsets):
  *   F8_E5M2       32 B: qs[32] (E5M2) @0                y[j] = e5m2(qs[j])
  *   F8_E4M3       32 B: qs[32] (E4M3FN) @0              y[j] = e4m3(qs[j])
  *   F8_E4M3_B128 132 B: d (f32) @0, qs[128] (E4M3FN) @4  y[j] = d * e4m3(qs[j])
  *   MXFP8         33 B: e (E8M0) @0, qs[32] (E4M3FN) @1  y[j] = 2^(e - 127) * e4m3(qs[j])
+ *   MXFP6_E2M3    25 B: e (E8M0) @0, qs[24] @1 (32 packed 6-bit codes)
+ *   MXFP6_E3M2    25 B: e (E8M0) @0, qs[24] @1 (32 packed 6-bit codes)
+ *                 y[j] = 2^(e - 127) * fp6(code j)
  *   I8_B128      132 B: d (f32) @0, qs[128] (int8) @4    y[j] = d * qs[j]
  *   NF4, FP4_BNB  36 B: absmax (f32) @0, qs[32] @4       y[j] = code[n_j] * absmax, n_j the low nibble
  *                                                        of qs[j] (j < 32) or the high nibble of qs[j - 32]
@@ -20,10 +23,11 @@
  *
  * Work split (equal to the OpenCL triples): every invocation of a block owns the NF_QE_EPT = 8
  * consecutive elements [8*ltid, 8*ltid + 8), in two runs of 4:
- *   F8_E5M2, F8_E4M3, MXFP8   QT_TPS = 4   qs bytes 8*ltid .. +7
- *   F8_E4M3_B128, I8_B128     QT_TPS = 16  qs bytes 8*ltid .. +7
- *   NF4, FP4_BNB              QT_TPS = 8   low nibbles of qs bytes 8*ltid .. +7 (ltid < 4), high
- *                                          nibbles of qs bytes 8*(ltid - 4) .. +7 (ltid >= 4)
+ *   F8_E5M2, F8_E4M3, MXFP8                    QT_TPS = 4  qs bytes 8*ltid .. +7
+ *   MXFP6_E2M3, MXFP6_E3M2                     QT_TPS = 4  the 48 bits: qs bytes 6*ltid .. 6*ltid + 5
+ *   F8_E4M3_B128, I8_B128                      QT_TPS = 16  qs bytes 8*ltid .. +7
+ *   NF4, FP4_BNB                               QT_TPS = 8   low nibbles of qs bytes 8*ltid .. +7 (ltid < 4), high
+ *                                                          nibbles of qs bytes 8*(ltid - 4) .. +7 (ltid >= 4)
  * Per type, nf_qe_w8() yields the unscaled values of both runs and nf_qe_scale() the block scale;
  * qt_dot is scale * (dot(w0, run 0) + dot(w1, run 1)).
  *
@@ -34,8 +38,8 @@
  *
  * Alignment: block offsets (bp, rbase) are multiples of QT_BB from the start of a 4-byte aligned
  * binding. F8_E5M2 and F8_E4M3 (32), F8_E4M3_B128 and I8_B128 (132), NF4 and FP4_BNB (36) blocks are
- * 4-aligned and read their f32 scale and code words with nf_w_f32 / nf_w_u32; MXFP8 (33) reads bytes
- * (nf_w_u8 / nf_w_u32_any).
+ * 4-aligned and read their f32 scale and code words with nf_w_f32 / nf_w_u32; MXFP8 (33) and the MXFP6
+ * types (25) read bytes (nf_w_u8 / nf_w_u32_any).
  */
 #ifndef NF_QUANT_EXT_GLSL
 #define NF_QUANT_EXT_GLSL
@@ -46,6 +50,7 @@
 
 #ifdef QTYPE
 #if QTYPE == QT_F8_E5M2 || QTYPE == QT_F8_E4M3 || QTYPE == QT_F8_E4M3_B128 || QTYPE == QT_MXFP8 \
+ || QTYPE == QT_MXFP6_E2M3 || QTYPE == QT_MXFP6_E3M2 \
  || QTYPE == QT_I8_B128 || QTYPE == QT_NF4 || QTYPE == QT_FP4_BNB
 
 #define QT_DECODE_DOT  1
@@ -168,6 +173,59 @@ float nf_qe_scale(uint ws, uint bp) {
 float qt_elem(uint ws, uint rbase, uint i) {
     const uint bp = rbase + (i / uint(QT_BS)) * uint(QT_BB);
     return nf_qe_scale(ws, bp) * nf_qe_e4m3(nf_w_u8(ws, bp + 1u + i % uint(QT_BS)));
+}
+
+#elif QTYPE == QT_MXFP6_E2M3 || QTYPE == QT_MXFP6_E3M2
+/* ---- MXFP6 (OCP MX FP6, Java GGMLType ids 1007 / 1008): e (E8M0) @0, qs[24] @1 ----
+ * 32 packed 6-bit codes, element j = code j (four codes per three bytes, little-endian bit order; the
+ * OCP-MX element order, matched by loops/FpBlockDecoders.java), times the block scale nf_e8m0(e) =
+ * 2^(e - 127). The FP6 formats have no infinities and no NaNs (every one of the 64 codes is finite);
+ * the NaN E8M0 reservation e == 0xFF is rejected at load. */
+#define QT_BS  (QTYPE == QT_MXFP6_E2M3 ? NF_MXFP6_E2M3_BS : NF_MXFP6_E3M2_BS)
+#define QT_BB  (QTYPE == QT_MXFP6_E2M3 ? NF_MXFP6_E2M3_BB : NF_MXFP6_E3M2_BB)
+#define QT_TPS 4
+
+#if QTYPE == QT_MXFP6_E2M3
+/* The value of an E2M3 code (sign 5, e bits 4-3 with bias 1, m bits 2-0), exactly the arithmetic of
+ * Java FpBlockDecoders.e2m3ToFp32: e == 0 the subnormal m * 2^-3, otherwise (8 + m) * 2^(e - 4). */
+float nf_qe_mxfp6(uint c) {
+    const uint e = (c >> 3u) & 3u;
+    const float v = float(e == 0u ? (c & 7u) : 8u + (c & 7u)) * uintBitsToFloat((max(e, 1u) + 123u) << 23);
+    return (c & 0x20u) != 0u ? -v : v;
+}
+#else
+/* The value of an E3M2 code (sign 5, e bits 4-2 with bias 3, m bits 1-0), exactly the arithmetic of
+ * Java FpBlockDecoders.e3m2ToFp32: e == 0 the subnormal m * 2^-4, otherwise (4 + m) * 2^(e - 5). */
+float nf_qe_mxfp6(uint c) {
+    const uint e = (c >> 2u) & 7u;
+    const float v = float(e == 0u ? (c & 3u) : 4u + (c & 3u)) * uintBitsToFloat((max(e, 1u) + 122u) << 23);
+    return (c & 0x20u) != 0u ? -v : v;
+}
+#endif
+
+/* The four 6-bit codes of the 24-bit word: code k from bits 6k .. 6k + 5. */
+vec4 nf_qe_mxfp6x4(uint word) {
+    return vec4(nf_qe_mxfp6(word & 63u), nf_qe_mxfp6((word >> 6u) & 63u),
+                nf_qe_mxfp6((word >> 12u) & 63u), nf_qe_mxfp6((word >> 18u) & 63u));
+}
+
+/* ltid owns elements 8*ltid .. +7: the 48 bits at qs + 6*ltid, the low 24 bits elements +0..+3
+ * (word 1) and bits 24..47 elements +4..+7 (a u32 at qs + 6*ltid + 2 shifted right by 8). */
+void nf_qe_w8(uint ws, uint bp, uint ltid, out vec4 w0, out vec4 w1) {
+    const uint q = bp + 1u + 6u * ltid;
+    w0 = nf_qe_mxfp6x4(nf_w_u32_any(ws, q));
+    w1 = nf_qe_mxfp6x4(nf_w_u32_any(ws, q + 2u) >> 8);
+}
+
+float nf_qe_scale(uint ws, uint bp) {
+    return nf_e8m0(nf_w_u8(ws, bp));
+}
+
+float qt_elem(uint ws, uint rbase, uint i) {
+    const uint bp = rbase + (i / uint(QT_BS)) * uint(QT_BB);
+    const uint e = i % uint(QT_BS);
+    const uint code = (nf_w_u32_any(ws, bp + 1u + (e >> 2) * 3u) >> (6u * (e & 3u))) & 63u;
+    return nf_qe_scale(ws, bp) * nf_qe_mxfp6(code);
 }
 
 #elif QTYPE == QT_I8_B128

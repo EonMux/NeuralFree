@@ -92,6 +92,8 @@ public final class CpuBlockDecoders {
         put(m, GGMLType.F8_E5M2, ExtBlockDecoders::decodeF8E5m2);
         put(m, GGMLType.F8_E4M3_B128, ExtBlockDecoders::decodeF8E4m3B128);
         put(m, GGMLType.MXFP8, ExtBlockDecoders::decodeMxfp8);
+        put(m, GGMLType.MXFP6_E3M2, (b, off, dst, dstOff, nBlocks) -> ExtBlockDecoders.decodeMxfp6(b, off, dst, dstOff, nBlocks, true));
+        put(m, GGMLType.MXFP6_E2M3, (b, off, dst, dstOff, nBlocks) -> ExtBlockDecoders.decodeMxfp6(b, off, dst, dstOff, nBlocks, false));
         put(m, GGMLType.I8_B128, ExtBlockDecoders::decodeI8B128);
         put(m, GGMLType.NF4, ExtBlockDecoders::decodeNf4);
         put(m, GGMLType.FP4_BNB, ExtBlockDecoders::decodeFp4Bnb);

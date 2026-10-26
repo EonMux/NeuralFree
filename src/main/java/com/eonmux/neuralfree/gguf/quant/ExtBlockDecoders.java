@@ -6,7 +6,7 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 
 /**
  * CPU decoders for the NeuralFree extension block types ({@code GGMLType.isExtension()}): F8_E4M3, F8_E5M2,
- * F8_E4M3_B128, MXFP8, I8_B128, NF4 and FP4_BNB. These carry quantized checkpoint formats exactly, with every scale inside the
+ * F8_E4M3_B128, MXFP8, MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4 and FP4_BNB. These carry quantized checkpoint formats exactly, with every scale inside the
  * block; the field offsets are the {@link BlockLayout} constants and the element codecs those of
  * {@link FpBlockDecoders} and {@link QuantTables}.
  * <p>
@@ -20,6 +20,12 @@ public final class ExtBlockDecoders {
 
     /** Value of every E5M2 code, from {@link FpBlockDecoders#e5m2ToFp32(int)} (IEEE half high bytes). */
     private static final float[] E5M2 = buildE5m2();
+
+    /** Value of every OCP-MX FP6 E2M3 code, from {@link FpBlockDecoders#e2m3ToFp32(int)}. */
+    private static final float[] E2M3 = buildE2m3();
+
+    /** Value of every OCP-MX FP6 E3M2 code, from {@link FpBlockDecoders#e3m2ToFp32(int)}. */
+    private static final float[] E3M2 = buildE3m2();
 
     private ExtBlockDecoders() {
     }
@@ -36,6 +42,22 @@ public final class ExtBlockDecoders {
         float[] t = new float[256];
         for (int i = 0; i < t.length; i++) {
             t[i] = FpBlockDecoders.e5m2ToFp32(i);
+        }
+        return t;
+    }
+
+    private static float[] buildE2m3() {
+        float[] t = new float[64];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = FpBlockDecoders.e2m3ToFp32(i);
+        }
+        return t;
+    }
+
+    private static float[] buildE3m2() {
+        float[] t = new float[64];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = FpBlockDecoders.e3m2ToFp32(i);
         }
         return t;
     }
@@ -76,6 +98,33 @@ public final class ExtBlockDecoders {
             final int qs = off + MXFP8_QS;
             for (int j = 0; j < QK_MXFP8; j++) {
                 y[yOff + j] = d * E4M3[b.get(qs + j) & 0xFF];
+            }
+        }
+    }
+
+    /**
+     * MXFP6 (OCP MX): {@code {u8 e; u8 qs[24]}}: the value of {@code code[j]} (element {@code j}, four 6-bit
+     * codes per three bytes, little-endian bit order) times {@code 2^(e-127)}. {@code e == 0xFF} is the NaN E8M0
+     * reservation and is rejected at load.
+     *
+     * @param e3m2 true for {@code MXFP6_E3M2} (2 mantissa bits), false for {@code MXFP6_E2M3} (3 mantissa bits)
+     * @throws IllegalArgumentException when a block's E8M0 exponent byte is 0xFF
+     */
+    static void decodeMxfp6(ByteBuffer b, int off, float[] y, int yOff, int nb, boolean e3m2) {
+        final float[] lut = e3m2 ? E3M2 : E2M3;
+        for (int i = 0; i < nb; i++, off += MXFP6_BYTES, yOff += QK_MXFP6) {
+            final int e = b.get(off + MXFP6_E) & 0xFF;
+            if (e == 0xFF) {
+                throw new IllegalArgumentException("MXFP6 block " + i + ": E8M0 exponent byte 0xFF is the NaN"
+                        + " reservation" + (e3m2 ? " (MXFP6_E3M2)" : " (MXFP6_E2M3)")
+                        + ", rejected at load");
+            }
+            final float d = FpBlockDecoders.e8m0ToFp32(e);
+            final int qs = off + MXFP6_QS;
+            for (int j = 0; j < QK_MXFP6; j++) {
+                final int b0 = qs + (j >> 2) * 3;
+                final int word = (b.get(b0) & 0xFF) | (b.get(b0 + 1) & 0xFF) << 8 | (b.get(b0 + 2) & 0xFF) << 16;
+                y[yOff + j] = d * lut[(word >>> (6 * (j & 3))) & 0x3F];
             }
         }
     }

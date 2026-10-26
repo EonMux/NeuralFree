@@ -1,17 +1,27 @@
 /* flash_decode.comp - LLM_FlashDecode_<KV> and LLM_FlashDecode_Mixed split-K decode attention (GLSL twin of
- * kernels/llm/flash_decode.cl; layouts, grid, plan constraints and algorithm are documented there).
+ * kernels/llm/flash_decode.cl; layouts, grid, plan constraints and algorithm are documented there), plus the
+ * LLM_FlashDecodePaged_* entry points under PAGED=1.
  * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl, common/reduce.glsl.
  *
  * Variants rows select the KV element type: KV=NF_KV_<type> (common/kv_types.glsl), or KV_MIXED=1 for
  * LLM_FlashDecode_Mixed, which reads K and V through the common/kv_types.glsl loaders with the types of its trailing
- * kv_types scalar (K type in bits 0-7, V type in bits 8-15; kernels/llm/common/attn_common.h); flag sg.
+ * kv_types scalar (K type in bits 0-7, V type in bits 8-15; kernels/llm/common/attn_common.h); flag sg. Rows with the
+ * additional define PAGED=1 are the LLM_FlashDecodePaged_* entry points: one launch over the batch's decode
+ * sequences, whose rows live behind one page table per sequence (page_shift >= 0; kernels/llm/common/attn_common.h
+ * nf_kv_row; the base rows pass page_shift = -1, the identity map), read at page_table[s * max_pages + slot's page].
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_head, i n_head_kv, i d_k, i d_v, i g_tile, i n_split, i split_len, i kv_start, i kv_end, i q_pos,
  *    i k_row_stride, i k_head_stride, i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias,
  *    i causal, i swa_type, i n_swa, i bias_mode, i n_buckets, i max_distance, i has_sinks, i direct_out,
  *    i q_off, i out_off,
- *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial[, i kv_types (KV_MIXED)])
- * Dispatch: 2-D, global {n_split * 128, n_head_kv * ceil(G / g_tile)}, local {128, 1, 1}.
+ *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial[, i kv_types (KV_MIXED)]
+ *    | PAGED: i page_shift, i max_pages, i n_seq, i q_seq_stride, i out_seq_stride,
+ *      R<int> page_table, R<int> seq_kv_len, R<int> q_pos_seq)
+ * The paged entry points ignore kv_start, kv_end and q_pos (the host passes 0).
+ * Dispatch: 2-D, global {n_split * 128, n_head_kv * ceil(G / g_tile)}, local {128, 1, 1}; under PAGED the
+ * sequence is folded into dimension 1 in front of the KV head and the tiles:
+ * gid1 = s * n_head_kv * ceil(G / g_tile) + kvh * ceil(G / g_tile) + gt, as
+ * gguf.ops.attn.FlashAttnTiling.decodePagedGlobal computes it.
  * The __sg variant needs full subgroups; 128 is a multiple of every subgroup size.
  */
 #version 450
@@ -41,6 +51,11 @@ layout(std430, binding = 4) readonly buffer NfFdSinks { float sinks[]; };
 layout(std430, binding = 5) readonly buffer NfFdRelBias { float rel_bias[]; };
 layout(std430, binding = 6) writeonly buffer NfFdOut { float dst[]; };
 layout(std430, binding = 7) writeonly buffer NfFdPartial { float partial[]; };
+#if defined(PAGED)
+layout(std430, binding = 8) readonly buffer NfFdPages { int page_table[]; };
+layout(std430, binding = 9) readonly buffer NfFdSeqKvLen { int seq_kv_len[]; };
+layout(std430, binding = 10) readonly buffer NfFdQPosSeq { int q_pos_seq[]; };
+#endif
 
 layout(push_constant) uniform NfFdParams {
     int n_head; int n_head_kv; int d_k; int d_v; int g_tile;
@@ -50,6 +65,9 @@ layout(push_constant) uniform NfFdParams {
     int causal; int swa_type; int n_swa;
     int bias_mode; int n_buckets; int max_distance;
     int has_sinks; int direct_out; int q_off; int out_off;
+#if defined(PAGED)
+    int page_shift; int max_pages; int n_seq; int q_seq_stride; int out_seq_stride;
+#endif
 #if defined(KV_MIXED)
     int kv_types;
 #endif
@@ -86,6 +104,17 @@ bool nf_fd_plan_ok() {
         && gl_WorkGroupSize.x == uint(NF_FA_WG);
 }
 
+#if defined(PAGED)
+/* The paged plan adds the page geometry (the .cl twin nf_fd_paged_ok): page_shift is the log2 page size, bounded so
+ * the physical row stays an int; the strides must be positive; seq_kv_len[s], q_pos_seq[s] and the page table are
+ * validated on the host before the upload (MS-2, section 5.5.1). */
+bool nf_fd_paged_plan_ok() {
+    return nf_fd_plan_ok()
+        && pc.page_shift >= 0 && pc.page_shift <= 20 && pc.max_pages >= 1 && pc.n_seq >= 1
+        && pc.q_seq_stride >= 0 && pc.out_seq_stride >= 0;
+}
+#endif
+
 /* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h); slope = ALiBi slope of h. */
 float nf_fd_bias(int h, int p_q, int p_k, float slope) {
     if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
@@ -99,7 +128,8 @@ float nf_fd_bias(int h, int p_q, int p_k, float slope) {
     return 0.0;
 }
 
-/* NaN over the outputs of a call that violates the plan (workgroup (0, 0) only). */
+/* NaN over the outputs of a call that violates the plan (workgroup (0, 0) only; the paged twin covers all n_seq
+ * sequence blocks, whose direct-out stride is n_head * d_v). */
 void nf_fd_poison() {
     if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
         return;
@@ -118,11 +148,68 @@ void nf_fd_poison() {
     }
 }
 
+#if defined(PAGED)
+void nf_fd_paged_poison() {
+    if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u
+        || pc.n_seq <= 0 || pc.n_head <= 0 || pc.d_v <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    if (pc.direct_out != 0) {
+        const uint n = uint(pc.n_head * pc.d_v);
+        for (int s = 0; s < pc.n_seq; s++) {
+            for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+                dst[uint(pc.out_off) + uint(s) * n + i] = NF_NAN;
+            }
+        }
+    } else {
+        const uint n = uint(pc.n_seq * pc.n_head * pc.n_split * (pc.d_v + 2));
+        for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+#endif
+
+/*
+ * Physical row of a key slot for the sequence s (nf_kv_row of kernels/llm/common/attn_common.h): the sequence's
+ * page table starts at s * maxPages (the host-validated int[nSeq x maxPages], PagedStep.pageTable(g)), and a
+ * negative page id masks the slot (the base rows' identity map: every slot t is row t, no page is masked).
+ */
+#if defined(PAGED)
+int nf_fd_page_id(int s, int slot) {
+    return page_table[uint(s * pc.max_pages + (slot >> pc.page_shift))];
+}
+
+int nf_fd_row(int s, int slot) {
+    return nf_kv_row(slot, pc.page_shift, nf_fd_page_id(s, slot));
+}
+
+bool nf_fd_page_ok(int s, int slot) {
+    return nf_fd_page_id(s, slot) >= 0;
+}
+#else
+int nf_fd_row(int s, int slot) {
+    return slot;
+}
+
+bool nf_fd_page_ok(int s, int slot) {
+    return true;
+}
+#endif
+
 void main() {
+#if defined(PAGED)
+    if (!nf_fd_paged_plan_ok()) {
+        nf_fd_paged_poison();
+        return;   /* uniform across the workgroup: no barrier has been reached */
+    }
+#else
     if (!nf_fd_plan_ok()) {
         nf_fd_poison();
         return;   /* uniform across the workgroup: no barrier has been reached */
     }
+#endif
 
     const int lid = int(gl_LocalInvocationID.x);
     const int split = int(gl_WorkGroupID.x);
@@ -132,19 +219,45 @@ void main() {
     const int split_len = pc.split_len;
     const int G = pc.n_head / pc.n_head_kv;
     const int n_gt = (G + g_tile - 1) / g_tile;
-    const int kvh = int(gl_WorkGroupID.y) / n_gt;
-    const int gt = int(gl_WorkGroupID.y) - kvh * n_gt;
+#if defined(PAGED)
+    const int seq = int(gl_WorkGroupID.y) / (pc.n_head_kv * n_gt);
+    const int gid = int(gl_WorkGroupID.y) - seq * (pc.n_head_kv * n_gt);
+#else
+    const int seq = -1;
+    const int gid = int(gl_WorkGroupID.y);
+#endif
+    const int kvh = gid / n_gt;
+    const int gt = gid - kvh * n_gt;
     const int h0 = kvh * G + gt * g_tile;
     const int g_cnt = min(g_tile, G - gt * g_tile);
-    const int k_begin = pc.kv_start + split * split_len;
-    const int k_stop = split < pc.n_split ? min(k_begin + split_len, pc.kv_end) : k_begin;
+#if defined(PAGED)
+    /* the sequence's slots [0, kv_len), with kv_len = seq_kv_len[seq] clamped to the page table's slots
+     * (the host contract of section 5.5.1 is that seqKvLen <= maxPages << page_shift; the clamp keeps every
+     * page-table read in bounds), and the per-sequence q / out blocks */
+    const int kv_cap_len = pc.max_pages << pc.page_shift;
+    const int kv_len = seq_kv_len[seq] < 0 ? 0
+                       : (seq_kv_len[seq] > kv_cap_len ? kv_cap_len : seq_kv_len[seq]);
+    const int kv_end = kv_len;
+    const int kv_start = 0;
+    const int q_pos = q_pos_seq[seq];
+    const int q_off = pc.q_off + seq * pc.q_seq_stride;
+    const int out_off = pc.out_off + seq * pc.out_seq_stride;
+#else
+    const int kv_end = pc.kv_end;
+    const int kv_start = pc.kv_start;
+    const int q_pos = pc.q_pos;
+    const int q_off = pc.q_off;
+    const int out_off = pc.out_off;
+#endif
+    const int k_begin = kv_start + split * split_len;
+    const int k_stop = split < pc.n_split ? min(k_begin + split_len, kv_end) : k_begin;
     const int n_keys = max(0, k_stop - k_begin);
     const int s_base = g_tile * d_k;   /* s_s = nf_fa_smem[s_base ..] */
 
     /* 1. stage q and the per-head ALiBi slopes */
     for (int i = lid; i < g_tile * d_k; i += NF_FA_WG) {
         const int g = i / d_k;
-        nf_fa_smem[i] = g < g_cnt ? q_in[uint(pc.q_off + (h0 + g) * d_k + (i - g * d_k))] : 0.0;
+        nf_fa_smem[i] = g < g_cnt ? q_in[uint(q_off + (h0 + g) * d_k + (i - g * d_k))] : 0.0;
     }
     if (lid < g_tile) {
         nf_fd_stats[2 * NF_FD_MAX_G + lid] = (pc.bias_mode == NF_ATTN_BIAS_ALIBI && lid < g_cnt)
@@ -165,12 +278,15 @@ void main() {
         }
         int p_k = -1;
         int vis = 0;
-        if (j < n_keys) {
+        if (j < n_keys && nf_fd_page_ok(seq, k_begin + j)) {
             const int t = k_begin + j;
-            p_k = kv_pos[t];
-            vis = nf_attn_visible(pc.q_pos, p_k, pc.causal, pc.swa_type, pc.n_swa);
+            /* A masked page's row is not a row, so kv_pos is read only after the page test; an empty cell's
+             * kv_pos stays -1 and is never visible. */
+            const int row = nf_fd_row(seq, t);
+            p_k = kv_pos[row];
+            vis = nf_attn_visible(q_pos, p_k, pc.causal, pc.swa_type, pc.n_swa) != 0 ? 1 : 0;
             if (vis != 0) {
-                const uint e0 = uint(t) * uint(pc.k_row_stride) + k_head;
+                const uint e0 = uint(row) * uint(pc.k_row_stride) + k_head;
                 for (int d = 0; d < d_k; d += 4) {
                     const vec4 k4 = kc_load4(e0 + uint(d));
                     [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
@@ -188,7 +304,7 @@ void main() {
                 float s = -NF_INF;
                 if (vis != 0 && g < g_cnt) {
                     s = nf_attn_score(acc[g], pc.scale, pc.softcap)
-                      + nf_fd_bias(h0 + g, pc.q_pos, p_k, nf_fd_stats[2 * NF_FD_MAX_G + g]);
+                      + nf_fd_bias(h0 + g, q_pos, p_k, nf_fd_stats[2 * NF_FD_MAX_G + g]);
                 }
                 nf_fa_smem[s_base + g * split_len + j] = s;
                 mx[g] = max(mx[g], s);
@@ -239,7 +355,8 @@ void main() {
     }
     const uint v_head = uint(kvh * pc.v_head_stride);
     for (int j = 0; j < n_keys; j++) {
-        const uint e0 = uint(k_begin + j) * uint(pc.v_row_stride) + v_head;
+        const int vrow = nf_fd_row(seq, k_begin + j);
+        const uint e0 = uint(vrow) * uint(pc.v_row_stride) + v_head;
         [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
             if (lid + i * NF_FA_WG < n_pairs) {
                 const float p = nf_fa_smem[s_base + pg[i] * split_len + j];
@@ -262,7 +379,11 @@ void main() {
                 const vec2 fl = pc.has_sinks != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
                 dst[uint(pc.out_off + h * d_v + d)] = fl.y > 0.0 ? o[i] * fl.x / fl.y : 0.0;
             } else {
+#if defined(PAGED)
+                const uint pb = uint(((seq * pc.n_head + h) * pc.n_split + split) * (d_v + 2));
+#else
                 const uint pb = uint((h * pc.n_split + split) * (d_v + 2));
+#endif
                 partial[pb + uint(d)] = o[i];
                 if (d == 0) {
                     partial[pb + uint(d_v)] = m;

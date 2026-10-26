@@ -16,7 +16,8 @@ import static com.eonmux.neuralfree.gguf.cpu.quant.Q8VecDot.putLong;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 
 /**
- * CPU vec-dot of the NeuralFree extension block types (F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB) with
+ * CPU vec-dot of the NeuralFree extension block types (F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, MXFP6_E3M2,
+ * MXFP6_E2M3, I8_B128, NF4, FP4_BNB) with
  * Q8_0 activations, in the shape of ggml's {@code ggml_vec_dot_<w>_q8_0} kernels (llama.cpp
  * ggml/src/ggml-cpu/quants.c). Each weight block is walked in 32-element runs, one per Q8_0 activation block:
  * a run contributes {@code d_w * d_x * sum_j code_j * q_j}, where {@code code_j} is the decoded element (E4M3 value,
@@ -30,15 +31,26 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
  */
 public final class ExtVecDot implements CpuVecDot {
 
+    /** Value of every OCP-MX FP6 E3M2 code, from {@link FpBlockDecoders#e3m2ToFp32(int)}; declared before the
+     *  vec-dot constants, whose MXFP6 lambdas read it (a field initializer may not forward-reference a field). */
+    private static final float[] E3M2 = buildE3m2();
+    /** Value of every OCP-MX FP6 E2M3 code, from {@link FpBlockDecoders#e2m3ToFp32(int)}. */
+    private static final float[] E2M3 = buildE2m3();
+
     public static final ExtVecDot F8_E4M3 = new ExtVecDot(GGMLType.F8_E4M3, ExtVecDot::dotF8E4m3);
     public static final ExtVecDot F8_E5M2 = new ExtVecDot(GGMLType.F8_E5M2, ExtVecDot::dotF8E5m2);
     public static final ExtVecDot F8_E4M3_B128 = new ExtVecDot(GGMLType.F8_E4M3_B128, ExtVecDot::dotF8E4m3B128);
     public static final ExtVecDot MXFP8 = new ExtVecDot(GGMLType.MXFP8, ExtVecDot::dotMxfp8);
+    public static final ExtVecDot MXFP6_E3M2 = new ExtVecDot(GGMLType.MXFP6_E3M2,
+            (b, off, x, nb, aux) -> dotMxfp6(b, off, x, nb, aux, E3M2));
+    public static final ExtVecDot MXFP6_E2M3 = new ExtVecDot(GGMLType.MXFP6_E2M3,
+            (b, off, x, nb, aux) -> dotMxfp6(b, off, x, nb, aux, E2M3));
     public static final ExtVecDot I8_B128 = new ExtVecDot(GGMLType.I8_B128, ExtVecDot::dotI8B128);
     public static final ExtVecDot NF4 = new ExtVecDot(GGMLType.NF4, ExtVecDot::dotNf4);
     public static final ExtVecDot FP4_BNB = new ExtVecDot(GGMLType.FP4_BNB, ExtVecDot::dotFp4Bnb);
 
-    private static final Map<GGMLType, ExtVecDot> BY_TYPE = index(F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, I8_B128, NF4, FP4_BNB);
+    private static final Map<GGMLType, ExtVecDot> BY_TYPE = index(F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8,
+            MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4, FP4_BNB);
 
     /** Value of every E4M3FN code, from {@link FpBlockDecoders#e4m3ToFp32(int)} so it matches the decoder. */
     private static final float[] E4M3 = buildE4m3();
@@ -87,6 +99,22 @@ public final class ExtVecDot implements CpuVecDot {
         float[] t = new float[256];
         for (int i = 0; i < t.length; i++) {
             t[i] = FpBlockDecoders.e5m2ToFp32(i);
+        }
+        return t;
+    }
+
+    private static float[] buildE3m2() {
+        float[] t = new float[64];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = FpBlockDecoders.e3m2ToFp32(i);
+        }
+        return t;
+    }
+
+    private static float[] buildE2m3() {
+        float[] t = new float[64];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = FpBlockDecoders.e2m3ToFp32(i);
         }
         return t;
     }
@@ -222,8 +250,35 @@ public final class ExtVecDot implements CpuVecDot {
         final float[] yd = x.d;
         float sumf = 0.0f;
         for (int ib = 0; ib < nb; ib++, off += MXFP8_BYTES) {
-            final float d = FpBlockDecoders.e8m0ToFp32(b.get(off + MXFP8_E));
+            final float d = FpBlockDecoders.e8m0ToFp32(b.get(off + MXFP8_E) & 0xFF);
             sumf += (yd[ib] * d) * runE4m3(b, off + MXFP8_QS, q8, ib * QK8_0);
+        }
+        return sumf;
+    }
+
+    /** Code {@code j} of the 24 packed 6-bit-code bytes starting at {@code qs}: element {@code j} of the block. */
+    private static int code6(ByteBuffer b, int qs, int j) {
+        final int b0 = qs + (j >> 2) * 3;
+        final int word = (b.get(b0) & 0xFF) | (b.get(b0 + 1) & 0xFF) << 8 | (b.get(b0 + 2) & 0xFF) << 16;
+        return (word >>> (6 * (j & 3))) & 0x3F;
+    }
+
+    /**
+     * MXFP6: block {@code ib} is Q8_0 run {@code ib}; every code is finite and
+     * {@code sumf += (d_x * 2^(e-127)) * sum}. Load rejects the NaN E8M0 exponent byte before the dot runs.
+     */
+    private static float dotMxfp6(ByteBuffer b, int off, QuantizedActivations x, int nb, byte[] aux, float[] lut) {
+        final byte[] q8 = x.qs;
+        final float[] yd = x.d;
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++, off += MXFP6_BYTES) {
+            final float d = FpBlockDecoders.e8m0ToFp32(b.get(off + MXFP6_E) & 0xFF);
+            float sum = 0.0f;
+            final int qs = off + MXFP6_QS;
+            for (int j = 0; j < QK8_0; j++) {
+                sum += lut[code6(b, qs, j)] * q8[ib * QK8_0 + j];
+            }
+            sumf += (yd[ib] * d) * sum;
         }
         return sumf;
     }

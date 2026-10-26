@@ -22,6 +22,11 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
  * <p>For head dims that are positive multiples of 4 up to {@value #MAX_HEAD_DIM} and {@code smemFloats} of at least
  * {@code FaSmem.MIN_FLOATS} (3072), both factories always return a plan. The constraints here are the ones the
  * kernels check ({@code nf_fd_plan_ok}, {@code nf_fa_plan_ok}).
+ *
+ * <p>{@link #decodePaged} plans the paged decode kernels {@code LLM_FlashDecodePaged_*} one launch over the batch's
+ * sequences: the constraints of {@link #decode}, with the split length chosen over the largest per-sequence slot
+ * range, and the n_seq of the launch entering the grid and partial sizes {@link #decodePagedGlobal} /
+ * {@link #decodePagedPartialFloats}.
  */
 public final class FlashAttnTiling {
 
@@ -178,6 +183,28 @@ public final class FlashAttnTiling {
                 bestG, nKvMax, 0, 0, 0, 0, bestRows / bestG, bestBk);
     }
 
+    /**
+     * Decode plan over a batch's paged decode sequences one launch: the plan constraints of {@link #decode}, with
+     * the split length chosen over {@code maxKvLen}, the largest per-sequence slot range any step scans (the
+     * longest {@code seq_kv_len}; {@link #decodeSplit} sizes each step from that sequence's live length, and every
+     * step fits this plan). {@code nSeq} enters only the dispatch and partial sizes of a paged call
+     * ({@link #decodePagedGlobal}, {@link #decodePagedPartialFloats}), which the caller fixes per launch.
+     *
+     * @param nSeq        sequences of the launch
+     * @param maxKvLen    largest per-sequence slot range a step scans ({@code ceil(nCtx / pageSize)} at the most)
+     * @param smemFloats  {@code LlmKernels.faSmemFloats()}
+     * @param computeUnits device compute units (SMs / CUs), used to choose the split count of each step
+     * @throws IllegalArgumentException for invalid shapes, or when even one head per workgroup does not fit
+     */
+    public static FlashAttnTiling decodePaged(int nSeq, int nHead, int nHeadKv, int dK, int dV, int maxKvLen,
+                                              int smemFloats, int computeUnits) {
+        if (nSeq <= 0) {
+            throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
+        }
+        validate(nHead, nHeadKv, dK, dV, maxKvLen, smemFloats, computeUnits);
+        return planDecode(Plan.DECODE, nHead, nHeadKv, dK, dV, maxKvLen, smemFloats, computeUnits);
+    }
+
     private static FlashAttnTiling planDecode(Plan plan, int nHead, int nHeadKv, int dK, int dV, int nKvMax,
                                               int smemFloats, int computeUnits) {
         int g0 = nHead / nHeadKv;
@@ -307,6 +334,25 @@ public final class FlashAttnTiling {
         return new long[]{(long) nSplit * WG, (long) nHeadKv * groupTiles()};
     }
 
+    /**
+     * Global size of a paged decode call for {@code nSeq} sequences and {@code nSplit} splits:
+     * {@code {n_split * 128, n_seq * n_head_kv * groupTiles}}, the sequence folded into dimension 1 in front of
+     * the KV head and its tiles ({@code gid1 = s * n_head_kv * groupTiles + kvh * groupTiles + gt}), the fold the
+     * {@code LLM_FlashDecodePaged_*} kernels subtract before the KV head index.
+     *
+     * @throws IllegalStateException    for a {@link Plan#TILED} plan
+     * @throws IllegalArgumentException when {@code nSeq} is not positive
+     */
+    public long[] decodePagedGlobal(int nSeq, int nSplit) {
+        if (plan == Plan.TILED) {
+            throw new IllegalStateException("decodePagedGlobal needs a decode plan, this is " + plan);
+        }
+        if (nSeq <= 0) {
+            throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
+        }
+        return new long[]{(long) nSplit * WG, (long) nSeq * nHeadKv * groupTiles()};
+    }
+
     /** Local size of a decode call. */
     public static long[] decodeLocal() {
         return new long[]{WG, 1};
@@ -318,6 +364,23 @@ public final class FlashAttnTiling {
             throw new IllegalStateException("decodePartialFloats needs a decode plan, this is " + plan);
         }
         return partialFloats(nHead, maxSplits, dV);
+    }
+
+    /**
+     * Partial-buffer floats of one paged decode call for {@code nSeq} sequences at {@link #maxSplits()}:
+     * {@code n_seq * n_head * maxSplits * (d_v + 2)} ({@code LLM_FlashAttn_Combine} merges paged partials with
+     * {@code rows = n_seq * n_head}).
+     *
+     * @throws IllegalStateException for a {@link Plan#TILED} plan
+     */
+    public long decodePagedPartialFloats(int nSeq) {
+        if (plan == Plan.TILED) {
+            throw new IllegalStateException("decodePagedPartialFloats needs a decode plan, this is " + plan);
+        }
+        if (nSeq <= 0) {
+            throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
+        }
+        return partialFloats((long) nSeq * nHead, maxSplits, dV);
     }
 
     /**

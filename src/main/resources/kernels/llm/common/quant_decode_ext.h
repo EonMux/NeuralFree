@@ -1,8 +1,9 @@
-/* common/quant_decode_ext.h - F8_E5M2, F8_E4M3, F8_E4M3_B128, MXFP8, I8_B128, NF4 and FP4_BNB decode
- * triples. Requires: common/dialect.h, common/config.h, common/quant_blocks.h, common/quant_decode_new.h */
+/* common/quant_decode_ext.h - F8_E5M2, F8_E4M3, F8_E4M3_B128, MXFP8, MXFP6_E2M3, MXFP6_E3M2, I8_B128,
+ * NF4 and FP4_BNB decode triples. Requires: common/dialect.h, common/config.h, common/quant_blocks.h,
+ * common/quant_decode_new.h */
 /*
  * Decode triples (_decode, _decode_dual, _decode_elem) of the NeuralFree extension block types
- * (gguf.GGMLType ids 1000-1006, field offsets of common/quant_blocks.h) for the IQ_ALL_KERNELS contract
+ * (gguf.GGMLType ids 1000-1008, field offsets of common/quant_blocks.h) for the IQ_ALL_KERNELS contract
  * of common/matvec_family.h; _decode and _decode_dual come from NF_NQ_DOT_PAIR (common/quant_decode_new.h).
  *
  * Element j of a block:
@@ -10,6 +11,8 @@
  *   F8_E4M3        e4m3(qs[j])                 (same .scale rule)
  *   F8_E4M3_B128   d * e4m3(qs[j])
  *   MXFP8          2^(e - 127) * e4m3(qs[j])
+ *   MXFP6_E2M3     2^(e - 127) * e2m3(code j)  (element j = code j, four 6-bit codes per three bytes)
+ *   MXFP6_E3M2     2^(e - 127) * e3m2(code j)
  *   I8_B128        d * qs[j]                   (qs signed)
  *   NF4, FP4_BNB   absmax * CODE[q], q the low nibble of qs[j] for j < 32, the high nibble of qs[j - 32]
  *                  otherwise; CODE is NF4_CODE or FP4_BNB_CODE
@@ -18,7 +21,8 @@
  *
  * Work split: every type has BS / TPS = NF_NQ_EPT = 8, and work-item ltid owns the consecutive elements
  * [8*ltid, 8*ltid + 8) as the runs [8*ltid, 8*ltid + 4) and [8*ltid + 4, 8*ltid + 8):
- *   F8_E5M2, F8_E4M3, MXFP8  TPS = 4    qs bytes 8*ltid .. 8*ltid + 7
+ *   F8_E5M2, F8_E4M3, MXFP8, MXFP6_E2M3, MXFP6_E3M2  TPS = 4    qs bytes 8*ltid .. 8*ltid + 7
+ *                                                               (MXFP6: the 48 bits at qs + 6*ltid)
  *   F8_E4M3_B128, I8_B128    TPS = 16   qs bytes 8*ltid .. 8*ltid + 7
  *   NF4, FP4_BNB             TPS = 8    qs bytes 8*(ltid%4) .. 8*(ltid%4) + 7, low nibbles for ltid < 4,
  *                                       high nibbles for ltid >= 4
@@ -110,6 +114,66 @@ NF_INLINE float MXFP8_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, in
     NF_GLOBAL const uchar* bp = nf_nq_block(w, dim, tok, i, MXFP8_BLOCK_SIZE, MXFP8_BLOCK_BYTES);
     return e8m0_scale((uint)bp[NF_MXFP8_E]) * F8_E4M3_LUT[bp[NF_MXFP8_QS + i % MXFP8_BLOCK_SIZE]];
 }
+
+/* ---- MXFP6_E2M3 and MXFP6_E3M2: E8M0 e, qs[24] packed 6-bit codes (Quark OCP-MX FP6, 6.25 bits/weight) ----
+ * Element j is code j (four 6-bit codes per three bytes, little-endian bit order, the OCP-MX element
+ * order); the value is 2^(e - 127) * the absolute value, the exact arithmetic of the Java
+ * FpBlockDecoders.e2m3ToFp32 / e3m2ToFp32 and the GLSL twin nf_qe_mxfp6x4 (common/quant_ext.glsl):
+ *   E2M3  sign 5, e bits 4-3 (bias 1), m bits 2-0: v = (e ? 8 + m : m) * 2^(max(e, 1) - 4)
+ *   E3M2  sign 5, e bits 4-2 (bias 3), m bits 1-0: v = (e ? 4 + m : m) * 2^(max(e, 1) - 5)
+ * The fp6 formats have no infinities and no NaNs (the largest magnitudes are 7.5 and 28 and the
+ * smallest subnormals 2^-3 and 2^-4), so every one of the 64 codes is finite; the NaN E8M0
+ * reservation e == 0xFF is rejected at load (gguf.quant.ExtBlockDecoders and the repackers).
+ * NF_XQ_MXFP6(T, t, VAL4, VAL, E, QS) defines the W8/SCALE pair, NF_NQ_DOT_PAIR and T_decode_elem for
+ * type T with helper prefix nf_<t>, the 4-code group of a 24-bit word VAL4 and the code VAL. Work-item
+ * ltid (TPS = 4, NF_NQ_EPT = 8 elements) reads 48 bits = 6 bytes at qs + 6*ltid: the low 24 bits are
+ * its elements 8*ltid .. +3, bits 24..47 (two u32 reads, the second shifted right by 8) elements
+ * 8*ltid + 4 .. +7. */
+#define MXFP6_E2M3_TPS 4
+#define MXFP6_E3M2_TPS 4
+
+#define NF_XQ_MXFP6(T, t, VAL4, VAL, E, QS) \
+NF_INLINE void nf_##t##_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4* w1) { \
+    NF_GLOBAL const uchar* q = bp + (QS) + NF_MXFP6_BYTES_PER_WORKITEM * ltid; \
+    *w0 = VAL4(read_u32_le(q)); \
+    *w1 = VAL4(read_u32_le(q + 2) >> 8); \
+} \
+NF_INLINE float nf_##t##_scale(NF_GLOBAL const uchar* bp, int ltid) { \
+    return e8m0_scale((uint)bp[(E)]); \
+} \
+NF_NQ_DOT_PAIR(T, nf_##t##_w8, nf_##t##_scale, nf_nq_xo8, NF_XQ_X1) \
+NF_INLINE float T##_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, int i) { \
+    NF_GLOBAL const uchar* bp = nf_nq_block(w, dim, tok, i, T##_BLOCK_SIZE, T##_BLOCK_BYTES); \
+    const int e = i % T##_BLOCK_SIZE; \
+    NF_GLOBAL const uchar* q = bp + (QS) + NF_MXFP6_BYTES_PER_WORKITEM * (e >> 2); \
+    const int code = (int)((read_u32_le(q) >> (uint)(6 * (e & 3))) & 63u); \
+    return e8m0_scale((uint)bp[(E)]) * VAL((uint)code); \
+}
+
+/* The value of an E2M3 code (sign 5, e bits 4-3, mantissa bits 2-0); 4 codes of a 24-bit little-endian word. */
+NF_INLINE float nf_xq_e2m3(uint c) {
+    const uint e = (c >> 3) & 3u, m = c & 7u;
+    const float v = (float)(e == 0u ? m : 8u + m) * as_float(((e == 0u ? 1u : e) + 124u - 1u) << 23);
+    return (c & 0x20u) != 0u ? -v : v;
+}
+NF_INLINE float4 nf_xq_e2m3x4(uint word) {
+    return NF_F4(nf_xq_e2m3(word & 63u), nf_xq_e2m3((word >> 6) & 63u),
+                 nf_xq_e2m3((word >> 12) & 63u), nf_xq_e2m3((word >> 18) & 63u));
+}
+
+/* The value of an E3M2 code (sign 5, e bits 4-2, mantissa bits 1-0); 4 codes of a 24-bit little-endian word. */
+NF_INLINE float nf_xq_e3m2(uint c) {
+    const uint e = (c >> 2) & 7u, m = c & 3u;
+    const float v = (float)(e == 0u ? m : 4u + m) * as_float(((e == 0u ? 1u : e) + 124u - 2u) << 23);
+    return (c & 0x20u) != 0u ? -v : v;
+}
+NF_INLINE float4 nf_xq_e3m2x4(uint word) {
+    return NF_F4(nf_xq_e3m2(word & 63u), nf_xq_e3m2((word >> 6) & 63u),
+                 nf_xq_e3m2((word >> 12) & 63u), nf_xq_e3m2((word >> 18) & 63u));
+}
+
+NF_XQ_MXFP6(MXFP6_E2M3, mxfp6e2m3, nf_xq_e2m3x4, nf_xq_e2m3, NF_MXFP6_E, NF_MXFP6_QS)
+NF_XQ_MXFP6(MXFP6_E3M2, mxfp6e3m2, nf_xq_e3m2x4, nf_xq_e3m2, NF_MXFP6_E, NF_MXFP6_QS)
 
 /* ---- I8_B128: f32 d, qs[128] int8 ---- */
 NF_INLINE void nf_i8b128_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4* w1) {

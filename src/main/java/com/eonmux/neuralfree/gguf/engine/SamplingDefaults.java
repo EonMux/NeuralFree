@@ -22,21 +22,14 @@ import java.util.Objects;
  *
  * <p>{@code general.sampling.sequence} is the configurable chain order ({@link StageKind}): a
  * '{@code ;}'-separated list of llama.cpp stage names is read; anything else (an abbreviated or free-form value,
- * as {@code generation_config} hands this metadata through) is logged as ignored, like the llama.cpp keys
- * {@code general.sampling.{mirostat, mirostat_tau, mirostat_eta, xtc_probability, xtc_threshold}}.
+ * as {@code generation_config} hands this metadata through) is logged as ignored. The llama.cpp keys
+ * {@code general.sampling.{mirostat, mirostat_tau, mirostat_eta, xtc_probability, xtc_threshold}} are the
+ * {@link SamplerConfig.Setting}s MIROSTAT, MIROSTAT_TAU, MIROSTAT_ETA, XTC_PROBABILITY and XTC_THRESHOLD, which
+ * {@link SamplerConfig#withModelDefaults} applies.
  */
 public final class SamplingDefaults {
 
     private static final Logger LOGGER = LogManager.getLogger(SamplingDefaults.class);
-
-    /** Keys of llama.cpp sampler settings without a stage in NeuralFree's chain. */
-    private static final String[] UNSUPPORTED_KEYS = {
-            GgufKeys.GENERAL_SAMPLING_MIROSTAT,
-            GgufKeys.GENERAL_SAMPLING_MIROSTAT_TAU,
-            GgufKeys.GENERAL_SAMPLING_MIROSTAT_ETA,
-            GgufKeys.GENERAL_SAMPLING_XTC_PROBABILITY,
-            GgufKeys.GENERAL_SAMPLING_XTC_THRESHOLD,
-    };
 
     /** No model defaults. */
     public static final SamplingDefaults NONE = builder().build();
@@ -52,6 +45,11 @@ public final class SamplingDefaults {
     private final Float frequencyPenalty;
     private final Integer maxNewTokens;
     private final List<StageKind> sequence;
+    private final Integer mirostat;
+    private final Float mirostatTau;
+    private final Float mirostatEta;
+    private final Float xtcProbability;
+    private final Float xtcThreshold;
 
     private SamplingDefaults(Builder b) {
         this.temp = b.temp;
@@ -65,6 +63,11 @@ public final class SamplingDefaults {
         this.frequencyPenalty = b.frequencyPenalty;
         this.maxNewTokens = b.maxNewTokens;
         this.sequence = b.sequence;
+        this.mirostat = b.mirostat;
+        this.mirostatTau = b.mirostatTau;
+        this.mirostatEta = b.mirostatEta;
+        this.xtcProbability = b.xtcProbability;
+        this.xtcThreshold = b.xtcThreshold;
     }
 
     public static Builder builder() {
@@ -91,7 +94,11 @@ public final class SamplingDefaults {
         b.frequencyPenalty = readFloat(kv, GgufKeys.NF_SAMPLING_FREQUENCY_PENALTY, Range.FINITE);
         b.maxNewTokens = readInt(kv, GgufKeys.NF_SAMPLING_MAX_NEW_TOKENS, Range.TOKEN_BUDGET);
         b.sequence = readSequence(kv);
-        logUnsupported(kv);
+        b.mirostat = readInt(kv, GgufKeys.GENERAL_SAMPLING_MIROSTAT, Range.MIROSTAT);
+        b.mirostatTau = readFloat(kv, GgufKeys.GENERAL_SAMPLING_MIROSTAT_TAU, Range.POSITIVE);
+        b.mirostatEta = readFloat(kv, GgufKeys.GENERAL_SAMPLING_MIROSTAT_ETA, Range.POSITIVE);
+        b.xtcProbability = readFloat(kv, GgufKeys.GENERAL_SAMPLING_XTC_PROBABILITY, Range.UNIT);
+        b.xtcThreshold = readFloat(kv, GgufKeys.GENERAL_SAMPLING_XTC_THRESHOLD, Range.UNIT);
         SamplingDefaults d = new SamplingDefaults(b);
         if (d.isEmpty()) {
             return NONE;
@@ -136,12 +143,24 @@ public final class SamplingDefaults {
     public Integer maxNewTokens() { return maxNewTokens; }
     /** The configurable chain order ({@code general.sampling.sequence}, unmodifiable), or null. */
     public List<StageKind> sequence() { return sequence; }
+    /** Mirostat version ({@code general.sampling.mirostat}, 0 = off, 1 or 2), or null. */
+    public Integer mirostat() { return mirostat; }
+    /** Mirostat target entropy ({@code general.sampling.mirostat_tau}), or null. */
+    public Float mirostatTau() { return mirostatTau; }
+    /** Mirostat learning rate ({@code general.sampling.mirostat_eta}), or null. */
+    public Float mirostatEta() { return mirostatEta; }
+    /** XTC's trim probability ({@code general.sampling.xtc_probability}), or null. */
+    public Float xtcProbability() { return xtcProbability; }
+    /** XTC's probability threshold ({@code general.sampling.xtc_threshold}), or null. */
+    public Float xtcThreshold() { return xtcThreshold; }
 
     /** True when the model gives no default. */
     public boolean isEmpty() {
         return temp == null && topK == null && topP == null && minP == null && typicalP == null
                 && penaltyRepeat == null && penaltyLastN == null && presencePenalty == null
-                && frequencyPenalty == null && maxNewTokens == null && sequence == null;
+                && frequencyPenalty == null && maxNewTokens == null && sequence == null
+                && mirostat == null && mirostatTau == null && mirostatEta == null
+                && xtcProbability == null && xtcThreshold == null;
     }
 
     @Override
@@ -157,14 +176,18 @@ public final class SamplingDefaults {
                 && Objects.equals(minP, d.minP) && Objects.equals(typicalP, d.typicalP)
                 && Objects.equals(penaltyRepeat, d.penaltyRepeat) && Objects.equals(penaltyLastN, d.penaltyLastN)
                 && Objects.equals(presencePenalty, d.presencePenalty)
-                && Objects.equals(frequencyPenalty, d.frequencyPenalty) && Objects.equals(maxNewTokens, d.maxNewTokens)
-                && Objects.equals(sequence, d.sequence);
+                && Objects.equals(frequencyPenalty, d.frequencyPenalty)
+                && Objects.equals(maxNewTokens, d.maxNewTokens) && Objects.equals(sequence, d.sequence)
+                && Objects.equals(mirostat, d.mirostat) && Objects.equals(mirostatTau, d.mirostatTau)
+                && Objects.equals(mirostatEta, d.mirostatEta) && Objects.equals(xtcProbability, d.xtcProbability)
+                && Objects.equals(xtcThreshold, d.xtcThreshold);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(temp, topK, topP, minP, typicalP, penaltyRepeat, penaltyLastN, presencePenalty,
-                frequencyPenalty, maxNewTokens, sequence);
+                frequencyPenalty, maxNewTokens, sequence, mirostat, mirostatTau, mirostatEta, xtcProbability,
+                xtcThreshold);
     }
 
     @Override
@@ -190,6 +213,11 @@ public final class SamplingDefaults {
             }
             parts.add("sequence=" + String.join(";", labels));
         }
+        add(parts, "mirostat", mirostat);
+        add(parts, "mirostatTau", mirostatTau);
+        add(parts, "mirostatEta", mirostatEta);
+        add(parts, "xtcProbability", xtcProbability);
+        add(parts, "xtcThreshold", xtcThreshold);
         return "SamplingDefaults{" + String.join(", ", parts) + '}';
     }
 
@@ -223,19 +251,6 @@ public final class SamplingDefaults {
         return v;
     }
 
-    private static void logUnsupported(GgufKv kv) {
-        List<String> present = new ArrayList<>();
-        for (String key : UNSUPPORTED_KEYS) {
-            if (kv.has(key)) {
-                present.add(key);
-            }
-        }
-        if (!present.isEmpty()) {
-            LOGGER.info("model sampling defaults {} are ignored: NeuralFree's sampler chain has no such stage",
-                    present);
-        }
-    }
-
     /**
      * {@code general.sampling.sequence} as a configurable chain order ({@link StageKind}), or null when the key is
      * absent or its value is not a '{@code ;}'-separated list of llama.cpp stage names (a free-form
@@ -264,7 +279,8 @@ public final class SamplingDefaults {
         UNIT("must be in [0, 1]"),
         POSITIVE("must be > 0"),
         PENALTY_WINDOW("must be >= -1 (-1 = whole context, 0 = disabled)"),
-        TOKEN_BUDGET("must be positive, or -1 for unlimited");
+        TOKEN_BUDGET("must be positive, or -1 for unlimited"),
+        MIROSTAT("must be 0 (off), 1 or 2");
 
         private final String rule;
 
@@ -283,6 +299,7 @@ public final class SamplingDefaults {
                 case POSITIVE: ok = v > 0; break;
                 case PENALTY_WINDOW: ok = v >= SamplerConfig.PENALTY_WHOLE_CONTEXT; break;
                 case TOKEN_BUDGET: ok = v > 0 || v == GenerationRequest.UNLIMITED; break;
+                case MIROSTAT: ok = v == 0 || v == 1 || v == 2; break;
                 default: ok = true; break;
             }
             return ok ? null : rule;
@@ -302,6 +319,11 @@ public final class SamplingDefaults {
         private Float frequencyPenalty;
         private Integer maxNewTokens;
         private List<StageKind> sequence;
+        private Integer mirostat;
+        private Float mirostatTau;
+        private Float mirostatEta;
+        private Float xtcProbability;
+        private Float xtcThreshold;
 
         private Builder() {
         }
@@ -316,6 +338,16 @@ public final class SamplingDefaults {
         public Builder presencePenalty(float v) { this.presencePenalty = v; return this; }
         public Builder frequencyPenalty(float v) { this.frequencyPenalty = v; return this; }
         public Builder maxNewTokens(int v) { this.maxNewTokens = v; return this; }
+        /** Mirostat version ({@code general.sampling.mirostat}, 0 = off, 1 or 2). */
+        public Builder mirostat(int v) { this.mirostat = v; return this; }
+        /** Mirostat target entropy ({@code general.sampling.mirostat_tau}). */
+        public Builder mirostatTau(float v) { this.mirostatTau = v; return this; }
+        /** Mirostat learning rate ({@code general.sampling.mirostat_eta}). */
+        public Builder mirostatEta(float v) { this.mirostatEta = v; return this; }
+        /** XTC's trim probability ({@code general.sampling.xtc_probability}). */
+        public Builder xtcProbability(float v) { this.xtcProbability = v; return this; }
+        /** XTC's probability threshold ({@code general.sampling.xtc_threshold}). */
+        public Builder xtcThreshold(float v) { this.xtcThreshold = v; return this; }
         /** The configurable chain order, as llama.cpp's stage names ({@code general.sampling.sequence}). */
         public Builder sequence(String joined) {
             this.sequence = StageKind.parseOrder(joined);
@@ -343,6 +375,11 @@ public final class SamplingDefaults {
             check("presencePenalty", presencePenalty, Range.FINITE);
             check("frequencyPenalty", frequencyPenalty, Range.FINITE);
             check("maxNewTokens", maxNewTokens, Range.TOKEN_BUDGET);
+            check("mirostat", mirostat, Range.MIROSTAT);
+            check("mirostatTau", mirostatTau, Range.POSITIVE);
+            check("mirostatEta", mirostatEta, Range.POSITIVE);
+            check("xtcProbability", xtcProbability, Range.UNIT);
+            check("xtcThreshold", xtcThreshold, Range.UNIT);
             return new SamplingDefaults(this);
         }
 

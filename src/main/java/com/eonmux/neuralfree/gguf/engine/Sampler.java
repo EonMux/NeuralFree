@@ -1,15 +1,26 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import com.eonmux.neuralfree.gguf.GGUFTokenizer;
+import com.eonmux.neuralfree.gguf.engine.sampling.AdaptivePStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.BiasStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.DryStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.InfillStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.MinPStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.MirostatStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.PenaltiesStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
 import com.eonmux.neuralfree.gguf.engine.sampling.TopKStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.TopNSigmaStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TopPStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TemperatureStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TypicalStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.XtcStage;
+import com.eonmux.neuralfree.gguf.tokenizer.SpecialTokens;
+import com.eonmux.neuralfree.gguf.tokenizer.TokenizerVocab;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -24,14 +35,16 @@ import java.util.concurrent.ThreadLocalRandom;
  * <ol>
  *   <li>the fixed bias stage: banned tokens ({@code tokenizer.ggml.suppress_tokens}, end-of-generation tokens under
  *       ignore-eos) get {@code -inf} (llama_sampler_logit_bias_apply);</li>
- *   <li>the configured stages, one per configured kind that has a stage class, applied in the order's sequence;
- *       a disabled stage (top-k 0, top-p 1, min-p 0, typical-p 1, penalties off) applies nothing exactly as
- *       llama.cpp skips it, and a {@code min_keep} of 0 (the sampler default) leaves the stage unbounded;</li>
- *   <li>the fixed dist stage: a seeded categorical draw (llama_sampler_dist_apply), or the argmax when greedy
- *       (llama_sampler_greedy_apply).</li>
+ *   <li>the configured stages, one per configured kind, applied in the order's sequence;
+ *       a disabled stage (top-k 0, top-p 1, min-p 0, typical-p 1, penalties off, DRY with a 0 multiplier, top-n-sigma
+ *       below 0, XTC with a probability of 0 or a threshold above 0.5) applies nothing exactly as llama.cpp skips it,
+ *       and a {@code min_keep} of 0 (the sampler default) leaves the stage unbounded; llama.cpp's adaptive-p entry is
+ *       built last (common/sampling.cpp:387-407), in place of the dist stage;</li>
+ *   <li>the fixed dist stage: a seeded categorical draw (llama_sampler_dist_apply), or the argmax when greedy;
+ *       a mirostat chain ({@code mirostat} 1 or 2) is instead {@code temperature + mirostat} with neither the rest of
+ *       the order nor the dist stage, and an {@code adaptive_p} order entry replaces the dist stage, both as llama.cpp
+ *       builds them.</li>
  * </ol>
- * With the stages SA-2 adds (dry, top-n-sigma, xtc) building nothing, the default chain is
- * {@code bias → penalties → top-k → typical-p → top-p → min-p → temperature → dist}.
  *
  * <p>Greedy decoding (an explicit greedy request or a temperature {@code <= 0}) runs the chain without the
  * temperature stage and replaces the draw by the argmax; because top-k, top-p and min-p keep the highest logit
@@ -61,44 +74,66 @@ public final class Sampler {
     private final Candidates cur = new Candidates();
     private SplittableRandom rng;
 
-    private Sampler(int[] banned, float repeatPenalty, float presencePenalty, float frequencyPenalty, int penaltyLastN,
-                    boolean penalties, int topK, float typicalP, float topP, float minP, float temperature,
-                    boolean greedy, long seed, List<StageKind> order, int minKeep) {
+    private Sampler(int[] banned, SamplerConfig config, long seed, boolean greedy, SamplerVocab vocab) {
         this.banned = banned;
-        this.penalties = penalties;
-        this.topK = topK;
-        this.typicalP = typicalP;
+        this.penalties = config.penaltiesEnabled();
+        this.topK = config.topK();
+        this.typicalP = config.typicalP();
         this.greedy = greedy;
         this.seed = seed;
         this.biasStage = new BiasStage(banned);
-        this.chain = buildChain(order, repeatPenalty, presencePenalty, frequencyPenalty, penaltyLastN, penalties,
-                topK, typicalP, topP, minP, temperature, minKeep);
+        this.chain = buildChain(config, seed, vocab);
         this.rng = new SplittableRandom(seed);
     }
 
-    /** One built-in stage per configured kind that has a stage class. */
-    private static List<SamplerStage> buildChain(List<StageKind> order, float repeatPenalty, float presencePenalty,
-                                                 float frequencyPenalty, int penaltyLastN, boolean penalties, int topK,
-                                                 float typicalP, float topP, float minP, float temperature,
-                                                 int minKeep) {
+    /** llama.cpp's chain construction (common/sampling.cpp:344-416). */
+    private static List<SamplerStage> buildChain(SamplerConfig config, long seed, SamplerVocab vocab) {
         List<SamplerStage> chain = new ArrayList<>();
-        for (StageKind kind : order) {
+        if (config.mirostat() == 1 || config.mirostat() == 2) {
+            // llama.cpp's mirostat chains are temperature + the mirostat sampler, nothing else
+            chain.add(new TemperatureStage(config.temperature()));
+            chain.add(new MirostatStage(config.mirostat(), config.mirostatTau(), config.mirostatEta(), seed));
+            return chain;
+        }
+        boolean adaptiveP = false;
+        for (StageKind kind : config.order()) {
             if (kind == StageKind.PENALTIES) {
-                chain.add(new PenaltiesStage(repeatPenalty, presencePenalty, frequencyPenalty, penaltyLastN, penalties));
+                chain.add(new PenaltiesStage(config.repeatPenalty(), config.presencePenalty(),
+                        config.frequencyPenalty(), config.penaltyLastN(), config.penaltiesEnabled()));
+            } else if (kind == StageKind.DRY) {
+                chain.add(new DryStage(config.dryMultiplier(), config.dryBase(), config.dryAllowedLength(),
+                        config.dryPenaltyLastN(), config.drySequenceBreakers(), vocab));
+            } else if (kind == StageKind.TOP_N_SIGMA) {
+                chain.add(new TopNSigmaStage(config.topNSigma()));
             } else if (kind == StageKind.TOP_K) {
-                chain.add(new TopKStage(topK, minKeep));
+                chain.add(new TopKStage(config.topK(), config.minKeep()));
             } else if (kind == StageKind.TYPICAL_P) {
-                chain.add(new TypicalStage(typicalP, minKeep));
+                chain.add(new TypicalStage(config.typicalP(), config.minKeep()));
             } else if (kind == StageKind.TOP_P) {
-                chain.add(new TopPStage(topP, minKeep));
+                chain.add(new TopPStage(config.topP(), config.minKeep()));
             } else if (kind == StageKind.MIN_P) {
-                chain.add(new MinPStage(minP, minKeep));
+                chain.add(new MinPStage(config.minP(), config.minKeep()));
+            } else if (kind == StageKind.XTC) {
+                chain.add(new XtcStage(config.xtcProbability(), config.xtcThreshold(), config.minKeep(),
+                        stageSeed(config, seed)));
             } else if (kind == StageKind.TEMPERATURE) {
-                chain.add(new TemperatureStage(temperature));
+                chain.add(new TemperatureStage(config.temperature(), config.dynatempRange(), config.dynatempExponent()));
+            } else if (kind == StageKind.INFILL) {
+                chain.add(new InfillStage(vocab));
+            } else if (kind == StageKind.ADAPTIVE_P) {
+                // llama.cpp keeps the adaptive-p position in the order but builds it last, in place of the dist stage
+                adaptiveP = true;
             }
-            // dry, top_n_sigma and xtc build nothing until SA-2 gives their stage classes.
+        }
+        if (adaptiveP) {
+            chain.add(new AdaptivePStage(config.adaptiveTarget(), config.adaptiveDecay(), stageSeed(config, seed)));
         }
         return chain;
+    }
+
+    /** llama.cpp's per-sampler {@code get_rng_seed(seed)}: every stage draws its own seed unless the seed is fixed. */
+    private static long stageSeed(SamplerConfig config, long seed) {
+        return config.seeded() ? seed : randomSeed();
     }
 
     /** The generation chain for {@code config} without banned tokens. */
@@ -114,6 +149,18 @@ public final class Sampler {
      * @throws IllegalArgumentException when a banned id is negative
      */
     public static Sampler create(SamplerConfig config, int[] bannedTokens) {
+        return create(config, bannedTokens, (SamplerVocab) null);
+    }
+
+    /**
+     * {@link #create(SamplerConfig, int[])} with the model's vocabulary, which the DRY stage tokenizes its sequence
+     * breakers over at construction and the infill stage reads its pieces and end-of-generation ids from. A null
+     * vocabulary is accepted as long as neither stage is enabled.
+     *
+     * @throws IllegalArgumentException when a banned id is negative, or a DRY or infill stage is enabled without a
+     *                                  vocabulary
+     */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, SamplerVocab vocab) {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(bannedTokens, "bannedTokens");
         int[] banned = bannedTokens.clone();
@@ -123,25 +170,35 @@ public final class Sampler {
             }
         }
         long seed = config.seeded() ? config.seed() : randomSeed();
-        return new Sampler(banned, config.repeatPenalty(), config.presencePenalty(), config.frequencyPenalty(),
-                config.penaltyLastN(), config.penaltiesEnabled(), config.topK(), config.typicalP(), config.topP(),
-                config.minP(), config.temperature(), config.isGreedy(), seed, config.order(), config.minKeep());
+        return new Sampler(banned, config, seed, config.isGreedy(), vocab);
     }
 
     /**
-     * The generation chain for {@code config} with the Java-API custom {@code extra} stages applied, in their list
-     * order, immediately before the temperature stage (or directly before the dist stage when the order has no
-     * temperature kind), so a custom stage always runs, including under greedy decoding.
+     * {@link #create(SamplerConfig, int[], SamplerVocab)} with the Java-API custom {@code extra} stages applied, in
+     * their list order, immediately before the temperature stage (or directly before the dist stage when the order
+     * has no temperature kind), so a custom stage always runs, including under greedy decoding.
      *
      * @throws IllegalArgumentException when {@code extra} or one of its entries is null
      */
     public static Sampler create(SamplerConfig config, int[] bannedTokens, List<SamplerStage> extra) {
+        return create(config, bannedTokens, extra, null);
+    }
+
+    /**
+     * {@link #create(SamplerConfig, int[], SamplerVocab)} with the Java-API custom {@code extra} stages applied, in
+     * their list order, immediately before the temperature stage (or directly before the dist stage when the order
+     * has no temperature kind), so a custom stage always runs, including under greedy decoding.
+     *
+     * @throws IllegalArgumentException when {@code extra} or one of its entries is null
+     */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, List<SamplerStage> extra,
+                                 SamplerVocab vocab) {
         Objects.requireNonNull(extra, "extra stages");
         List<SamplerStage> stages = new ArrayList<>(extra);
         if (stages.contains(null)) {
             throw new IllegalArgumentException("extra stage list contains a null stage");
         }
-        Sampler sampler = create(config, bannedTokens);
+        Sampler sampler = create(config, bannedTokens, vocab);
         int insertAt = 0;
         for (int i = 0; i < sampler.chain.size(); i++) {
             if (sampler.chain.get(i).kind() == StageKind.TEMPERATURE) {
@@ -173,8 +230,91 @@ public final class Sampler {
             throw new IllegalArgumentException("seed must be >= 0, or -1 for a random seed, got " + seed);
         }
         long s = seed == SamplerConfig.RANDOM_SEED ? randomSeed() : seed;
-        return new Sampler(NO_TOKENS, 1f, 0f, 0f, 0, false, topK, 1f, topP, 0f, temperature, false, s,
-                StageKind.DEFAULT_ORDER, 0);
+        SamplerConfig config = SamplerConfig.builder().topK(topK).topP(topP).minP(0f).typicalP(1f)
+                .temperature(temperature).penaltyLastN(0).seed(s).build();
+        return new Sampler(NO_TOKENS, config, s, false, null);
+    }
+
+    /**
+     * The vocabulary handle built on a GGUF model's tokenizer: the model handle the DRY and infill stages read through
+     * (llama.cpp's llama_vocab of the chain construction).
+     */
+    public static SamplerVocab vocab(GGUFTokenizer tokenizer) {
+        Objects.requireNonNull(tokenizer, "tokenizer");
+        return new GgufVocab(tokenizer);
+    }
+
+    /** A SamplerVocab on a GGUF model's tokenizer, following llama.cpp's piece semantics per id. */
+    private static final class GgufVocab implements SamplerVocab {
+
+        private static final int SPECIAL_ATTRS = TokenizerVocab.ATTR_UNKNOWN | TokenizerVocab.ATTR_CONTROL;
+
+        private final GGUFTokenizer tokenizer;
+        private final TokenizerVocab vocab;
+        private final SpecialTokens special;
+        private final byte[][] pieces;
+
+        GgufVocab(GGUFTokenizer tokenizer) {
+            this.tokenizer = tokenizer;
+            this.vocab = tokenizer.vocab();
+            this.special = tokenizer.specialTokens();
+            this.pieces = new byte[vocab.size()][];
+        }
+
+        @Override
+        public int vocabSize() {
+            return vocab.size();
+        }
+
+        @Override
+        public boolean isEog(int id) {
+            return special.isEog(id);
+        }
+
+        @Override
+        public int eotToken() {
+            return special.eot();
+        }
+
+        @Override
+        public int eosToken() {
+            return special.eos();
+        }
+
+        /** token_to_piece(id, lstrip = 0, special = false): UNKNOWN and CONTROL give no bytes, a byte token its byte. */
+        @Override
+        public byte[] piece(int id) {
+            if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
+                return new byte[0];
+            }
+            if (vocab.isByte(id)) {
+                return new byte[]{(byte) vocab.byteValue(id)};
+            }
+            byte[] cached = pieces[id];
+            if (cached == null) {
+                // the visible piece bytes (GGUFTokenizer.decode of one token, plain decoding)
+                cached = tokenizer.decode(id).getBytes(StandardCharsets.UTF_8);
+                pieces[id] = cached;
+            }
+            return cached;
+        }
+
+        /** detokenize({id}, special = true): special tokens render their raw text, visible tokens their piece. */
+        @Override
+        public String pieceText(int id) {
+            if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
+                return vocab.text(id);
+            }
+            if (vocab.isByte(id)) {
+                return new String(piece(id), StandardCharsets.ISO_8859_1);
+            }
+            return tokenizer.decode(id);
+        }
+
+        @Override
+        public int[] tokenize(String text) {
+            return tokenizer.encode(text, false, false);
+        }
     }
 
     /** A fresh non-negative seed for {@link SamplerConfig#RANDOM_SEED}. */
@@ -193,12 +333,30 @@ public final class Sampler {
     }
 
     /**
-     * True when the chain reduces to the argmax of the raw logits: no banned tokens, no penalties, and either
-     * greedy without typical-p or a top-k of 1 (llama.cpp common/sampling.cpp also replaces the draw by greedy for
-     * {@code top_k == 1}). A forward backend's on-device argmax then selects the same token.
+     * True when the chain reduces to the argmax of the raw logits: no banned tokens, no penalties, no enabled llama.cpp
+     * stage that edits or trims the set (dry, top-n-sigma, xtc, infill, a dynamic temperature range), no mirostat or
+     * adaptive-p terminal selector, and either greedy without typical-p or a top-k of 1 (llama.cpp common/sampling.cpp
+     * also replaces the draw by greedy for {@code top_k == 1}). A forward backend's on-device argmax then selects the
+     * same token.
      */
     public boolean argmaxOnly() {
-        return banned.length == 0 && !penalties && ((greedy && typicalP >= 1f) || topK == 1);
+        if (banned.length != 0 || penalties || !(greedy && typicalP >= 1f) && topK != 1) {
+            return false;
+        }
+        for (SamplerStage stage : chain) {
+            StageKind kind = stage.kind();
+            if (kind == null || kind == StageKind.PENALTIES || kind == StageKind.TOP_K || kind == StageKind.TYPICAL_P
+                    || kind == StageKind.TOP_P || kind == StageKind.MIN_P || kind == StageKind.TEMPERATURE) {
+                // the argmax cone (they preserve or are ignored by the argmax; penalties were checked)
+                continue;
+            }
+            // dry, top_n_sigma, xtc, infill and the terminal selectors edit the set - but a dry or top-n-sigma or
+            // xtc stage whose llama.cpp disable gate is hit never does, keeping the argmin chain argmax.
+            if (stage.modifies()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Records an accepted token with the chain's history stages (prompt tokens included, as llama.cpp does). */
@@ -242,6 +400,10 @@ public final class Sampler {
      * selection (llama.cpp {@code cur_p} after {@code llama_sampler_apply}). The view stays valid until the next
      * call on this sampler. {@code logits} is not modified.
      *
+     * <p>A chain built with mirostat or with {@code adaptive_p} in the order ends in its terminal selector, which
+     * selects the token itself, as llama.cpp's chain construction replaces the dist stage (common/sampling.cpp:344-416);
+     * the fixed draw only runs when no terminal selector applied.
+     *
      * @throws IllegalArgumentException when the row is empty
      * @throws IllegalStateException    when no candidate has a finite logit
      */
@@ -252,6 +414,7 @@ public final class Sampler {
         }
         cur.load(logits);
         biasStage.apply(cur);
+        boolean terminal = false;
         for (SamplerStage stage : chain) {
             StageKind kind = stage.kind();
             if (greedy) {
@@ -264,8 +427,14 @@ public final class Sampler {
                 }
             }
             stage.apply(cur);
+            if (kind == StageKind.MIROSTAT || kind == StageKind.ADAPTIVE_P) {
+                terminal = true;
+                break;
+            }
         }
-        if (greedy) {
+        if (terminal) {
+            // the terminal selector set the selected candidate already
+        } else if (greedy) {
             selectArgmax();
         } else {
             drawDist();
@@ -563,6 +732,57 @@ public final class Sampler {
                 throw new IndexOutOfBoundsException("truncate to " + newSize + " outside [0, " + size + "]");
             }
             size = newSize;
+        }
+
+        /**
+         * llama_sampler_softmax_impl(cur_p, true): sorts into descending logit order when needed, then softmaxes over
+         * the current candidates with probability 0 never rewritten.
+         *
+         * @throws IllegalStateException when no candidate has a finite logit
+         */
+        public void softmaxSorted() {
+            if (!sorted) {
+                sortDescending();
+            }
+            softmax();
+        }
+
+        /** llama_sampler_softmax_impl with no sort flag: the softmax over the current order. */
+        public void softmaxUnsorted() {
+            softmax();
+        }
+
+        /** Marks the candidate the sampler chains picked (llama.cpp's {@code cur_p->selected}). */
+        public void select(int index) {
+            checkIndex(index);
+            selected = index;
+        }
+
+        /** Overwrites the probability of candidate {@code i}. */
+        public void setProb(int i, float prob) {
+            checkIndex(i);
+            probs[i] = prob;
+        }
+
+        /**
+         * llama.cpp's {@code cur_p->data[pos_last] += ptr} advance: removes the first {@code k} candidates; the rest
+         * keep their order, so a sorted set stays sorted.
+         */
+        public void removeFirst(int k) {
+            if (k < 0 || k > size) {
+                throw new IndexOutOfBoundsException("remove first " + k + " outside [0, " + size + "]");
+            }
+            for (int i = k; i < size; i++) {
+                move(i, i - k);
+            }
+            size -= k;
+        }
+
+        /** Replaces the candidate at {@code i} by token {@code id} at {@code logit} (infill's EOT fallback). */
+        public void replaceCandidate(int i, int id, float logit) {
+            checkIndex(i);
+            ids[i] = id;
+            logits[i] = logit;
         }
 
         /**

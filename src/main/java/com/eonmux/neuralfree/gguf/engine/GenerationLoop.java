@@ -22,11 +22,11 @@ import java.util.Objects;
  * <ol>
  *   <li><b>Model defaults.</b> The request takes the loop's {@link SamplingDefaults} for every sampler setting and
  *       the token budget it leaves unset ({@link GenerationRequest#withModelDefaults}).</li>
- *   <li><b>Memory.</b> Every call starts a sequence. With prefix reuse, the longest common prefix of the
- *       stored tokens and the prompt is kept (at most {@code prompt.length - 1} tokens, so the last prompt token is
- *       evaluated for logits) when the memory can drop the rest ({@link ForwardBackend#canRollback}): full caches
- *       always can, rings until they wrap, and recurrent state only when nothing is dropped. Otherwise the memory
- *       is reset. Encoder-decoder models always reset.</li>
+ *   <li><b>Memory.</b> Every call starts with a reset (the stored sequence is cleared with it). With prefix reuse,
+ *       the longest common prefix of the stored tokens and the prompt would be kept (at most
+ *       {@code prompt.length - 1} tokens, so the last prompt token is evaluated for logits) when the memory can
+ *       drop the rest ({@link ForwardBackend#canRollback}) — until PC-9 the contiguous path reuses nothing
+ *       (PARITY §5.5.1 E-2); {@link #prefixReuse} and {@link SequenceState#reusable} stay as its switches.</li>
  *   <li><b>Prefill.</b> A decoder prompt longer than the context throws {@link ContextFullException} before any
  *       work. The unreused prompt tail is prefilled; every prompt token enters the penalty history (llama.cpp
  *       completion accepts prompt tokens into the sampler). For encoder-decoder models the history starts with the
@@ -34,9 +34,9 @@ import java.util.Objects;
  *       completion replaces the prompt by the decoder start token after encoding. A penalty window of
  *       {@link SamplerConfig#PENALTY_WHOLE_CONTEXT} covers the last {@code nCtx} tokens.</li>
  *   <li><b>Token loop.</b> Poll cancellation; sample ({@link Sampler}, llama.cpp chain); offer the token to the
- *       {@link StopCriteria} session (end of generation, stop strings, budget); if the memory is full, shift the
- *       context or stop with {@link StopReason#CONTEXT_FULL}; decode the token at the next position. When the
- *       chain is plain argmax ({@link Sampler#argmaxOnly()}), decoding uses
+ *       {@link SequenceRun} (its {@link StopCriteria} session: end of generation, stop strings, budget); if the
+ *       memory is full, shift the context or stop with {@link StopReason#CONTEXT_FULL}; decode the token at the
+ *       next position. When the chain is plain argmax ({@link Sampler#argmaxOnly()}), decoding uses
  *       {@link ForwardBackend#decodeGreedyOnDevice} and no logits are read back.</li>
  * </ol>
  * Positions come from the memory's {@link SequenceState}: the next position is {@code nPast}. For encoder-decoder
@@ -49,8 +49,9 @@ import java.util.Objects;
  * whose memory cannot shift (recurrent state, sparse caches, multi-section RoPE, step35) ends generation with
  * {@link StopReason#CONTEXT_FULL}.
  *
- * <p>When a forward call or the sampler fails, the memory is reset before the exception propagates, so the next
- * generation never reuses a half-written sequence.
+ * <p>When a forward call or the sampler fails, the memory is reset before the exception propagates and the memory's
+ * {@link SequenceState} is cleared with it, so the next generation never reuses a half-written sequence; the state
+ * is cleared even when the reset itself fails.
  */
 public final class GenerationLoop {
 
@@ -163,47 +164,58 @@ public final class GenerationLoop {
         Sampler sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens());
         String rendered = renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? renderedPrompt : stop.renderPrompt(prompt);
-        StopCriteria.Session session = stop.start(sink, rendered);
+        SequenceRun seqRun = SequenceRun.over(effective, tokenizer)
+                .stopCriteria(stop)
+                .sampler(sampler)
+                .sink(sink)
+                .renderedPrompt(rendered)
+                .build();
         try {
-            return run(prompt, seq, nCtx, sampler, session);
+            return run(prompt, seq, nCtx, seqRun);
         } catch (RuntimeException e) {
             try {
                 backend.reset();
             } catch (RuntimeException resetFailure) {
                 e.addSuppressed(resetFailure);
+            } finally {
+                // PARITY §5.5.1 E-2: a failed step leaves no recoverable sequence; the state is cleared even when
+                // the memory reset above throws, and never left half-written under a stored prefix.
+                try {
+                    seq.clear();
+                } catch (RuntimeException clearFailure) {
+                    e.addSuppressed(clearFailure);
+                }
             }
             throw e;
         }
     }
 
-    private GenerationResult run(int[] prompt, SequenceState seq, int nCtx, Sampler sampler,
-                                 StopCriteria.Session session) {
+    private GenerationResult run(int[] prompt, SequenceState seq, int nCtx, SequenceRun seqRun) {
         long t0 = System.nanoTime();
         int reused = prepareMemory(prompt, seq);
         int[] tail = reused == 0 ? prompt : Arrays.copyOfRange(prompt, reused, prompt.length);
         float[] logits = backend.prefill(tail, reused);
         int[] history = encoderDecoder ? seq.tokens() : prompt;
-        sampler.accept(history, 0, history.length);
-        long t1 = System.nanoTime();
+        seqRun.sampler().accept(history, 0, history.length);
+        seqRun.prefilled(tail.length, System.nanoTime() - t0);
 
-        boolean onDevice = sampler.argmaxOnly();
+        boolean onDevice = seqRun.sampler().argmaxOnly();
         int deviceToken = -1;
-        int sampled = 0;
-        StopReason reason;
-        while (true) {
-            if (session.cancelled()) {
-                reason = StopReason.CANCELLED;
+        while (!seqRun.done()) {
+            if (seqRun.cancelled()) {
+                seqRun.stop(StopReason.CANCELLED);
                 break;
             }
-            int token = deviceToken >= 0 ? deviceToken : sampler.sample(logits);
-            sampled++;
-            sampler.accept(token);
-            reason = session.offer(token);
-            if (reason != null) {
+            int token = deviceToken >= 0 ? deviceToken : seqRun.next(logits);
+            if (deviceToken >= 0) {
+                seqRun.accept(token);
+            }
+            SequenceRun.Step step = seqRun.offer(token);
+            if (step.stopped()) {
                 break;
             }
             if (seq.nPast() >= nCtx && !shiftContext(prompt, seq)) {
-                reason = StopReason.CONTEXT_FULL;
+                seqRun.stop(StopReason.CONTEXT_FULL);
                 break;
             }
             int pos = seq.nPast();
@@ -213,8 +225,7 @@ public final class GenerationLoop {
                 logits = backend.decode(token, pos);
             }
         }
-        long t2 = System.nanoTime();
-        return session.finish(reason, GenerationResult.Timings.of(tail.length, t1 - t0, sampled, t2 - t1));
+        return seqRun.result();
     }
 
     /** {@code config} with a whole-context penalty window bounded to the context length. */
@@ -224,21 +235,18 @@ public final class GenerationLoop {
     }
 
     /**
-     * Keeps the reusable prefix of the stored sequence, or resets the memory.
+     * Resets the memory for every request (the stored sequence is cleared with it).
      *
-     * @return the number of prompt tokens already in memory
+     * <p>The contiguous reuse path stays off until PC-9 turns it on (PARITY §5.5.1 E-2, no reuse before D-2's path
+     * enablement): prefix reuse would have kept the longest common prefix ({@link SequenceState#commonPrefix}, at
+     * most {@code prompt.length - 1} so the last prompt token is evaluated for logits) behind a
+     * {@link ForwardBackend#canRollback} check; until then {@link #prefixReuse} and
+     * {@link SequenceState#reusable} are only maintained for it, so a later enablement caps the reuse rows at the
+     * rows computed with exactly that prefix.
+     *
+     * @return the number of prompt tokens already in memory ({@code 0} until PC-9)
      */
     private int prepareMemory(int[] prompt, SequenceState seq) {
-        if (encoderDecoder || !prefixReuse) {
-            backend.reset();
-            return 0;
-        }
-        int common = Math.min(seq.commonPrefix(prompt), prompt.length - 1);
-        int drop = seq.nPast() - common;
-        if (common > 0 && backend.canRollback(drop)) {
-            backend.rollback(drop);
-            return common;
-        }
         backend.reset();
         return 0;
     }

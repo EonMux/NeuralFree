@@ -358,6 +358,11 @@ public final class GgufKeys {
     public static final String ADAPTER_LORA_PROMPT_PREFIX = "adapter.lora.prompt_prefix";
     public static final String ADAPTER_ALORA_INVOCATION_TOKENS = "adapter.alora.invocation_tokens";
 
+    /** Control-vector GGUF keys, written with arch {@code controlvector} (cvector-generator export_gguf,
+     *  tools/cvector-generator/cvector-generator.cpp:367-381: the base model's arch name as the base hint). */
+    public static final String CONTROLVECTOR_MODEL_HINT = "controlvector.model_hint";
+    public static final String CONTROLVECTOR_LAYER_COUNT = "controlvector.layer_count";
+
     public static final String XIELU_ALPHA_N = "xielu.alpha_n";
     public static final String XIELU_ALPHA_P = "xielu.alpha_p";
     public static final String XIELU_BETA = "xielu.beta";

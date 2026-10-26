@@ -1,6 +1,8 @@
 package com.eonmux.neuralfree.gguf;
 
 import com.eonmux.neuralfree.gguf.chat.ChatFormatter;
+import com.eonmux.neuralfree.gguf.chat.ChatMessages;
+import com.eonmux.neuralfree.gguf.chat.ChatRequest;
 import com.eonmux.neuralfree.gguf.chat.ChatTemplateSource;
 import com.eonmux.neuralfree.gguf.tokenizer.BpeTokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.Gemma4Tokenizer;
@@ -285,7 +287,7 @@ public final class GGUFTokenizer {
         List<Map<String, Object>> messages = new ArrayList<>(2);
         if (systemPrompt != null && !systemPrompt.isEmpty()) messages.add(message("system", systemPrompt));
         messages.add(message("user", userMessage));
-        return chat.format(messages, enableThinking);
+        return chat.format(ChatMessages.request(messages, enableThinking));
     }
 
     /**
@@ -301,7 +303,21 @@ public final class GGUFTokenizer {
      * ({@link #chatTemplate()}), applying llama.cpp's message workarounds; see {@link ChatFormatter}.
      */
     public String formatChat(List<Map<String, String>> messages, boolean enableThinking) {
-        return chat.format(messages, enableThinking);
+        return chat.format(ChatMessages.request(messages, enableThinking));
+    }
+
+    /**
+     * Renders a chat request ({@code messages}, {@code tools}, {@code tool_choice}, {@code
+     * chat_template_kwargs}, {@code add_generation_prompt}, {@code continue_final_message},
+     * {@code reasoning_effort}, {@code enable_thinking}) with the model's chat template through
+     * the full llama.cpp template-input conventions ({@link ChatFormatter#format(ChatRequest)});
+     * the overloads above delegate to this path.
+     *
+     * @throws IllegalArgumentException for malformed messages, tool calls or template kwargs
+     * @throws UnsupportedOperationException for a request with image or audio content parts
+     */
+    public String formatChat(ChatRequest request) {
+        return chat.format(request);
     }
 
     private static Map<String, Object> message(String role, String content) {

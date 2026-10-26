@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.engine.DiffusionConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
+import com.eonmux.neuralfree.gguf.hub.HubRef;
 import com.eonmux.neuralfree.gguf.load.RopeOverrides;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
@@ -30,8 +31,9 @@ import java.util.Locale;
  * flag ({@link EngineConfig#modelSamplingDefaults()}). Flag names follow llama.cpp where it has an equivalent
  * ({@code common/arg.cpp}); no short alias is given a meaning that differs from llama.cpp's. The Hugging Face
  * checkpoint flags set the matching {@link ModelSourceOptions} or {@link EngineConfig} fields on the builders, on
- * top of the {@code -Dneuralfree.*} property defaults, and {@code --export-gguf} exports the model's GGUF view
- * ({@link GgufWriter}) instead of generating. Immutable.
+ * top of the {@code -Dneuralfree.*} property defaults, {@code --export-gguf} exports the model's GGUF view
+ * ({@link GgufWriter}) instead of generating, and {@code -hf} names a Hugging Face Hub model whose GGUF the
+ * download of PARITY's TL-7 resolves into the model path before the demo opens it. Immutable.
  */
 final class LLMDemoOptions {
 
@@ -122,6 +124,10 @@ final class LLMDemoOptions {
     final String exportGguf;
     final GgufWriter.Mode exportMode;
     final boolean exportOverwrite;
+    /** The {@code -hf} Hugging Face Hub expression {@code <user>/<model>[:quant][@revision]}, or null. */
+    final String hfRepo;
+    /** The {@code -hff} repository file overriding the {@code -hf} quant tag, or null. */
+    final String hfFile;
 
     private LLMDemoOptions(Parser p) {
         this.modelPath = p.modelPath;
@@ -152,6 +158,8 @@ final class LLMDemoOptions {
         this.exportGguf = p.exportGguf;
         this.exportMode = p.exportMode;
         this.exportOverwrite = p.exportOverwrite;
+        this.hfRepo = p.hfRepo;
+        this.hfFile = p.hfFile;
     }
 
     /**
@@ -215,6 +223,8 @@ final class LLMDemoOptions {
         String exportGguf;
         GgufWriter.Mode exportMode = GgufWriter.Mode.NATIVE;
         boolean exportOverwrite;
+        String hfRepo;
+        String hfFile;
 
         private final EngineConfig.Builder eb;
         private final MemoryConfig.Builder mb;
@@ -569,6 +579,17 @@ final class LLMDemoOptions {
          */
         private boolean huggingFace(String a) throws UsageException {
             switch (a) {
+                case "-hf": case "-hfr": case "--hf-repo": {
+                    String spec = value(a);
+                    try {
+                        // as llama.cpp's -hf, parsed by the same grammar of PARITY's TL-7
+                        hfRepo = HubRef.parse(spec).toString();
+                    } catch (IllegalArgumentException e) {
+                        throw new UsageException(a + ": " + e.getMessage());
+                    }
+                    return true;
+                }
+                case "-hff": case "--hf-file": hfFile = value(a); return true;
                 case "--hf-materialize":
                     try {
                         hb.materialize(ModelSourceOptions.Materialize.parse(value(a)));
@@ -713,6 +734,10 @@ final class LLMDemoOptions {
             }
             if (benchmark && benchStreaming) {
                 throw new UsageException("--benchmark and --bench-streaming exclude each other");
+            }
+            if (hfRepo != null && modelPath != null) {
+                throw new UsageException("--model and -hf exclude each other: the Hub download supplies"
+                        + " the model file, a local path names its own");
             }
             try {
                 this.engine = eb.memory(mb.build()).sourceOptions(hb.build()).loras(loras).build();
@@ -886,6 +911,12 @@ final class LLMDemoOptions {
                 "",
                 "Model and prompt:",
                 "  --model, -m <path>           GGUF model (or NEURALFREE_MODEL / -Dneuralfree.model)",
+                "  --hf-repo, -hf <u>/<m>       Hugging Face Hub model instead of a local file:",
+                "                               <user>/<model>[:quant][@revision], downloaded into the",
+                "                               hub cache and its GGUF loaded (default quant Q4_K_M,",
+                "                               then Q8_0; HF_HUB_OFFLINE=1 uses the cache only)",
+                "  -hff, --hf-file <file>       Repository file of the -hf model, in place of the quant",
+                "                               tag (unused with --model)",
                 "  --prompt, -p <text>          Run one prompt instead of the console chat",
                 "  --system <text>              System prompt (default: '" + DEFAULT_SYSTEM_PROMPT + "')",
                 "  --raw                        Use the prompt verbatim (no chat template)",

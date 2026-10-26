@@ -1,4 +1,6 @@
-/* flash_prefill.cl - LLM_FlashAttn_<KV> and LLM_FlashAttn_Mixed tiled prefill attention. Requires: common/dialect.h, common/config.h, common/reduce.h, common/math.h, common/kv_types.h, common/attn_common.h */
+/* flash_prefill.cl - LLM_FlashAttn_<KV>, LLM_FlashAttn_Mixed (identity pages) and LLM_FlashAttnPaged_<KV>,
+ * LLM_FlashAttnPaged_Mixed (paged) tiled prefill attention. Requires: common/dialect.h, common/config.h,
+ * common/reduce.h, common/math.h, common/kv_types.h, common/attn_common.h */
 /*
  * Attention of n_tokens query rows against a key range (prefill through the KV cache, encoders and
  * non-causal passes over the current batch, speculative verification) with online softmax,
@@ -91,6 +93,7 @@ NF_INLINE void nf_fa_run(
     NF_GLOBAL const int* q_pos, NF_GLOBAL const int* kv_pos,
     NF_GLOBAL const float* sinks, NF_GLOBAL const float* rel_bias,
     NF_GLOBAL float* out, NF_GLOBAL float* partial, const int k_type, const int v_type,
+    const int page_shift, NF_GLOBAL const int* pt, const int pt_off,
     NF_LOCAL_PTR float* smem, NF_LOCAL_PTR float* red, NF_LOCAL_PTR float* slope_s)
 {
     if (!nf_fa_plan_ok(n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len, direct_out, k_type,
@@ -154,8 +157,11 @@ NF_INLINE void nf_fa_run(
         for (int idx = lid; idx < bq * nk; idx += NF_FA_WG) {
             const int i = idx / nk;
             const int tq = t0 + i;
+            const int slot = kt + idx - i * nk;
             if (tq < n_tokens
-                && nf_attn_visible(q_pos[tq], kv_pos[kt + idx - i * nk], causal, swa_type, n_swa)) {
+                && nf_kv_page_ok(slot, page_shift, pt, pt_off)
+                && nf_attn_visible(q_pos[tq], kv_pos[nf_kv_row(slot, page_shift, pt, pt_off)],
+                                   causal, swa_type, n_swa)) {
                 any = 1.0f;
             }
         }
@@ -188,8 +194,9 @@ NF_INLINE void nf_fa_run(
                 const int c4 = idx - kk * (NF_FA_CHUNK / 4);
                 const int d = c + 4 * c4;
                 float4 val = NF_F4S(0.0f);
-                if (kk < nk && d < d_k) {
-                    val = nf_kv_load4(k, (nf_i64)(kt + kk) * k_row_stride + k_head + d, k_type);
+                if (kk < nk && d < d_k && nf_kv_page_ok(kt + kk, page_shift, pt, pt_off)) {
+                    val = nf_kv_load4(k, (nf_i64)nf_kv_row(kt + kk, page_shift, pt, pt_off) * k_row_stride
+                                          + k_head + d, k_type);
                 }
                 vstore4(val, 0, kvc + kk * NF_FA_CHUNK + 4 * c4);
             }
@@ -218,8 +225,14 @@ NF_INLINE void nf_fa_run(
             const int tq = t0 + i;
             float s = -NF_INF;
             if (kk < nk && tq < n_tokens && g < g_cnt) {
+                const int slot = kt + kk;
                 const int p_q = q_pos[tq];
-                const int p_k = kv_pos[kt + kk];
+                /* A masked page's row is not a row, so kv_pos is read only after the page test; an empty
+                 * cell's kv_pos stays -1 and is never visible. */
+                int p_k = -1;
+                if (nf_kv_page_ok(slot, page_shift, pt, pt_off)) {
+                    p_k = kv_pos[nf_kv_row(slot, page_shift, pt, pt_off)];
+                }
                 if (nf_attn_visible(p_q, p_k, causal, swa_type, n_swa)) {
                     s = nf_attn_score(sc[idx], scale, softcap)
                       + nf_attn_bias(bias_mode, h0 + g, n_head, p_q, p_k, slope_s[g], rel_bias,
@@ -269,8 +282,9 @@ NF_INLINE void nf_fa_run(
                 const int c4 = idx - kk * (NF_FA_CHUNK / 4);
                 const int d = c + 4 * c4;
                 float4 val = NF_F4S(0.0f);
-                if (kk < nk && d < d_v) {
-                    val = nf_kv_load4(v, (nf_i64)(kt + kk) * v_row_stride + v_head + d, v_type);
+                if (kk < nk && d < d_v && nf_kv_page_ok(kt + kk, page_shift, pt, pt_off)) {
+                    val = nf_kv_load4(v, (nf_i64)nf_kv_row(kt + kk, page_shift, pt, pt_off) * v_row_stride
+                                          + v_head + d, v_type);
                 }
                 vstore4(val, 0, kvc + kk * NF_FA_CHUNK + 4 * c4);
             }
@@ -357,7 +371,8 @@ NF_KERNEL void LLM_FlashAttn_##SFX(                                             
               v_row_stride, v_head_stride, scale, softcap, max_bias, causal, swa_type,       \
               n_swa, bias_mode, n_buckets, max_distance, has_sinks, direct_out, q_off,        \
               out_off, q, (NF_GLOBAL const uchar*)k, (NF_GLOBAL const uchar*)v, q_pos,       \
-              kv_pos, sinks, rel_bias, out, partial, KV_CODE, KV_CODE, smem, red, slope_s);  \
+              kv_pos, sinks, rel_bias, out, partial, KV_CODE, KV_CODE, -1, kv_pos, 0,        \
+              smem, red, slope_s);                                                           \
 }
 
 NF_FLASH_PREFILL_KERNEL(F32, float, NF_KV_F32)
@@ -405,5 +420,130 @@ NF_KERNEL void LLM_FlashAttn_Mixed(
               v_row_stride, v_head_stride, scale, softcap, max_bias, causal, swa_type,
               n_swa, bias_mode, n_buckets, max_distance, has_sinks, direct_out, q_off,
               out_off, q, k, v, q_pos, kv_pos, sinks, rel_bias, out, partial,
-              nf_attn_kv_type_k(kv_types), nf_attn_kv_type_v(kv_types), smem, red, slope_s);
+              nf_attn_kv_type_k(kv_types), nf_attn_kv_type_v(kv_types), -1, kv_pos, 0,
+              smem, red, slope_s);
+}
+
+/*
+ * Paged prefill over one paginated KV segment (MS-4): the caller resolves kv_start / kv_end in the segment's slots
+ * and the tokens' positions come from q_pos; K, V and kv_pos are read at the physical row nf_kv_row(t)
+ * (common/attn_common.h; a page id below 0 masks the keys of its pages, section 5.5.1 O-2). One launch per
+ * multi-token segment, so the grid and every other argument are those of LLM_FlashAttn_<KV>.
+ */
+
+/* Plan constraints of LLM_FlashAttnPaged_*: those of LLM_FlashAttn_* plus the page geometry (page_shift is the
+ * log2 page size, bounded so the physical row stays an int; pt_off is the page table's element offset; the page
+ * table and kv_start / kv_end are validated on the host before the call, MS-2, section 5.5.1). */
+NF_INLINE int nf_fa_paged_ok(int n_head, int n_head_kv, int d_k, int d_v, int bq, int bk, int g_tile,
+                             int n_split, int split_len, int direct_out, int k_type, int v_type,
+                             int page_shift, int pt_off) {
+    return nf_fa_plan_ok(n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len, direct_out, k_type,
+                         v_type)
+        && page_shift >= 0 && page_shift <= 20 && pt_off >= 0;
+}
+
+/*
+ * LLM_FlashAttnPaged_<KV>(33 scalars, 10 buffers): the arguments are those of LLM_FlashAttn_<KV> (kv_start / kv_end
+ * count slots), then page_shift, pt_off and buffer page_table. k and v may be the same buffer (MLA latent cache);
+ * sinks and rel_bias are read-only placeholders when unused.
+ * Grid: the 3-D grid of LLM_FlashAttn_<KV>, one launch per multi-token segment.
+ */
+#define NF_FLASH_ATTN_PAGED_KERNEL(SFX, KV_T, KV_CODE)                                        \
+NF_KERNEL void LLM_FlashAttnPaged_##SFX(                                                      \
+    const int n_tokens, const int n_head, const int n_head_kv, const int d_k, const int d_v,   \
+    const int bq, const int bk, const int g_tile, const int n_split, const int split_len,     \
+    const int kv_start, const int kv_end,                                                    \
+    const int q_row_stride, const int out_row_stride,                                        \
+    const int k_row_stride, const int k_head_stride, const int v_row_stride,                  \
+    const int v_head_stride,                                                                 \
+    const float scale, const float softcap, const float max_bias,                            \
+    const int causal, const int swa_type, const int n_swa,                                   \
+    const int bias_mode, const int n_buckets, const int max_distance,                        \
+    const int has_sinks, const int direct_out, const int q_off, const int out_off,           \
+    const int page_shift, const int pt_off,                                                  \
+    NF_GLOBAL const float* q,                                                                \
+    NF_GLOBAL const KV_T* k,                                                                 \
+    NF_GLOBAL const KV_T* v,                                                                 \
+    NF_GLOBAL const int* NF_RESTRICT q_pos,                                                  \
+    NF_GLOBAL const int* NF_RESTRICT kv_pos,                                                 \
+    NF_GLOBAL const float* NF_RESTRICT sinks,                                                \
+    NF_GLOBAL const float* NF_RESTRICT rel_bias,                                             \
+    NF_GLOBAL float* out,                                                                    \
+    NF_GLOBAL float* partial,                                                                \
+    NF_GLOBAL const int* NF_RESTRICT page_table)                                             \
+{                                                                                             \
+    NF_LOCAL float smem[NF_FA_SMEM_FLOATS];                                                   \
+    NF_LOCAL float red[NF_FA_WG];                                                             \
+    NF_LOCAL float slope_s[NF_FD_MAX_G];                                                      \
+    if (!nf_fa_paged_ok(n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,       \
+                        direct_out, KV_CODE, KV_CODE, page_shift, pt_off)) {                   \
+        nf_fa_poison(n_tokens, n_head, d_v, n_split, out_row_stride, direct_out, out_off,       \
+                     out, partial);                                                            \
+        return;   /* uniform across the workgroup: no barrier has been reached */               \
+    }                                                                                         \
+    nf_fa_run(n_tokens, n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,      \
+              kv_start, kv_end, q_row_stride, out_row_stride, k_row_stride, k_head_stride,    \
+              v_row_stride, v_head_stride, scale, softcap, max_bias, causal, swa_type,        \
+              n_swa, bias_mode, n_buckets, max_distance, has_sinks, direct_out, q_off,         \
+              out_off, q, (NF_GLOBAL const uchar*)k, (NF_GLOBAL const uchar*)v, q_pos,        \
+              kv_pos, sinks, rel_bias, out, partial, KV_CODE, KV_CODE,                        \
+              page_shift, page_table, pt_off, smem, red, slope_s);                             \
+}
+
+NF_FLASH_ATTN_PAGED_KERNEL(F32, float, NF_KV_F32)
+NF_FLASH_ATTN_PAGED_KERNEL(F16, NF_HALF, NF_KV_F16)
+NF_FLASH_ATTN_PAGED_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
+NF_FLASH_ATTN_PAGED_KERNEL(BF16, ushort, NF_KV_BF16)
+NF_FLASH_ATTN_PAGED_KERNEL(Q4_0, uchar, NF_KV_Q4_0)
+NF_FLASH_ATTN_PAGED_KERNEL(Q4_1, uchar, NF_KV_Q4_1)
+NF_FLASH_ATTN_PAGED_KERNEL(IQ4_NL, uchar, NF_KV_IQ4_NL)
+NF_FLASH_ATTN_PAGED_KERNEL(Q5_0, uchar, NF_KV_Q5_0)
+NF_FLASH_ATTN_PAGED_KERNEL(Q5_1, uchar, NF_KV_Q5_1)
+
+/*
+ * LLM_FlashAttnPaged_Mixed(34 scalars, 10 buffers): LLM_FlashAttnPaged_<KV> over a K cache and a V cache of different
+ * types. The arguments are those of LLM_FlashAttnPaged_<KV> followed by kv_types (common/attn_common.h) after the
+ * buffers; k and v are byte buffers. A malformed kv_types violates the plan and writes NaN outputs.
+ */
+NF_KERNEL void LLM_FlashAttnPaged_Mixed(
+    const int n_tokens, const int n_head, const int n_head_kv, const int d_k, const int d_v,
+    const int bq, const int bk, const int g_tile, const int n_split, const int split_len,
+    const int kv_start, const int kv_end,
+    const int q_row_stride, const int out_row_stride,
+    const int k_row_stride, const int k_head_stride, const int v_row_stride,
+    const int v_head_stride,
+    const float scale, const float softcap, const float max_bias,
+    const int causal, const int swa_type, const int n_swa,
+    const int bias_mode, const int n_buckets, const int max_distance,
+    const int has_sinks, const int direct_out, const int q_off, const int out_off,
+    const int page_shift, const int pt_off,
+    NF_GLOBAL const float* q,
+    NF_GLOBAL const uchar* k,
+    NF_GLOBAL const uchar* v,
+    NF_GLOBAL const int* NF_RESTRICT q_pos,
+    NF_GLOBAL const int* NF_RESTRICT kv_pos,
+    NF_GLOBAL const float* NF_RESTRICT sinks,
+    NF_GLOBAL const float* NF_RESTRICT rel_bias,
+    NF_GLOBAL float* out,
+    NF_GLOBAL float* partial,
+    NF_GLOBAL const int* NF_RESTRICT page_table,
+    const int kv_types)
+{
+    NF_LOCAL float smem[NF_FA_SMEM_FLOATS];
+    NF_LOCAL float red[NF_FA_WG];
+    NF_LOCAL float slope_s[NF_FD_MAX_G];
+    if (!nf_fa_paged_ok(n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,
+                        direct_out, nf_attn_kv_type_k(kv_types), nf_attn_kv_type_v(kv_types),
+                        page_shift, pt_off)) {
+        nf_fa_poison(n_tokens, n_head, d_v, n_split, out_row_stride, direct_out, out_off,
+                     out, partial);
+        return;   /* uniform across the workgroup: no barrier has been reached */
+    }
+    nf_fa_run(n_tokens, n_head, n_head_kv, d_k, d_v, bq, bk, g_tile, n_split, split_len,
+              kv_start, kv_end, q_row_stride, out_row_stride, k_row_stride, k_head_stride,
+              v_row_stride, v_head_stride, scale, softcap, max_bias, causal, swa_type,
+              n_swa, bias_mode, n_buckets, max_distance, has_sinks, direct_out, q_off,
+              out_off, q, k, v, q_pos, kv_pos, sinks, rel_bias, out, partial,
+              nf_attn_kv_type_k(kv_types), nf_attn_kv_type_v(kv_types),
+              page_shift, page_table, pt_off, smem, red, slope_s);
 }

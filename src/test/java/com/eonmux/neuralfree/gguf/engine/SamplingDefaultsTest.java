@@ -22,7 +22,8 @@ import static org.junit.Assert.assertTrue;
 /**
  * {@link SamplingDefaults#read}: only present keys are read, with GGUF typing (integer settings need an integer
  * type, the others any number), finiteness and the ranges the sampler accepts, every error naming the key; the
- * llama.cpp keys without a NeuralFree stage are ignored. {@link SamplingDefaults#forModel} and
+ * llama.cpp {@code mirostat}/{@code xtc} keys fill the settings the request leaves unset (SA-2), and the
+ * free-form {@code general.sampling.sequence} is the one value ignored. {@link SamplingDefaults#forModel} and
  * {@link EngineConfig#modelSamplingDefaults()}: the opt-out.
  */
 public class SamplingDefaultsTest {
@@ -154,15 +155,50 @@ public class SamplingDefaultsTest {
     }
 
     @Test
-    public void stagesWithoutANeuralFreeSamplerAreIgnored() {
+    public void mirostatAndXtcDefaultsAreReadPerStage() {
         Map<String, Object> m = metadata();
-        m.put(GgufKeys.GENERAL_SAMPLING_SEQUENCE, "edkypmxt");
         m.put(GgufKeys.GENERAL_SAMPLING_MIROSTAT, 2);
         m.put(GgufKeys.GENERAL_SAMPLING_MIROSTAT_TAU, 5.0f);
         m.put(GgufKeys.GENERAL_SAMPLING_MIROSTAT_ETA, 0.1f);
         m.put(GgufKeys.GENERAL_SAMPLING_XTC_PROBABILITY, 0.5f);
         m.put(GgufKeys.GENERAL_SAMPLING_XTC_THRESHOLD, 0.1f);
-        assertSame(SamplingDefaults.NONE, read(m));
+        SamplingDefaults d = read(m);
+        assertFalse(d.isEmpty());
+        assertEquals(2, d.mirostat().intValue());
+        assertEquals(5.0f, d.mirostatTau(), 0f);
+        assertEquals(0.1f, d.mirostatEta(), 0f);
+        assertEquals(0.5f, d.xtcProbability(), 0f);
+        assertEquals(0.1f, d.xtcThreshold(), 0f);
+        assertEquals(SamplingDefaults.builder().mirostat(2).mirostatTau(5.0f).mirostatEta(0.1f)
+                .xtcProbability(0.5f).xtcThreshold(0.1f).build(), d);
+    }
+
+    @Test
+    public void valuesWithoutASamplerStageAreRejectedOrIgnored() {
+        assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT, 3);
+        assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT, 2L);
+        assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT_TAU, 0f);
+        assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT_ETA, -0.1f);
+        assertRejected(GgufKeys.GENERAL_SAMPLING_XTC_PROBABILITY, 1.5f);
+        assertRejected(GgufKeys.GENERAL_SAMPLING_XTC_THRESHOLD, -1f);
+    }
+
+    @Test
+    public void mirostatAndXtcKeysApplyThroughTheConfigBuilder() {
+        // The five previously-ignored keys now fill the settings the request leaves unset, as
+        // SamplerConfig.withModelDefaults applies them.
+        SamplerConfig filled = SamplerConfig.builder().build().withModelDefaults(SamplingDefaults.builder()
+                .mirostat(1).mirostatTau(3.0f).mirostatEta(0.2f).xtcProbability(0.4f).xtcThreshold(0.2f).build());
+        assertEquals(1, filled.mirostat());
+        assertEquals(3.0f, filled.mirostatTau(), 0f);
+        assertEquals(0.2f, filled.xtcThreshold(), 0f);
+        assertFalse(filled.isExplicit(SamplerConfig.Setting.XTC_PROBABILITY));
+
+        // request-explicit settings survive the model's defaults
+        SamplerConfig explicit = SamplerConfig.builder().mirostat(0).build().withModelDefaults(
+                SamplingDefaults.builder().mirostat(2).build());
+        assertEquals(0, explicit.mirostat());
+        assertTrue(explicit.isExplicit(SamplerConfig.Setting.MIROSTAT));
     }
 
     @Test

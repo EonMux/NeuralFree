@@ -776,16 +776,14 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
             }
         }
 
-        /** Removes positions {@code [nKeep, nKeep + nDiscard)} from the sequence record, keeping its wrap flag. */
+        /**
+         * Removes positions {@code [nKeep, nKeep + nDiscard)} from the sequence record, keeping its wrap flag. The
+         * record itself rewrites the tokens in place and caps its contiguous reuse frontier at the kept count
+         * ({@link SequenceState#shift}, PARITY §5.5.1 E-2), so a following generation can never reuse the rows
+         * that were computed with the discarded context.
+         */
         public static void shiftSequence(SequenceState sequence, int nKeep, int nDiscard) {
-            int[] tokens = sequence.tokens();
-            boolean wrapped = sequence.wrapped();
-            sequence.clear();
-            sequence.append(tokens, 0, nKeep);
-            sequence.append(tokens, nKeep + nDiscard, tokens.length - nKeep - nDiscard);
-            if (wrapped) {
-                sequence.markWrapped();
-            }
+            sequence.shift(nKeep, nDiscard);
         }
     }
 

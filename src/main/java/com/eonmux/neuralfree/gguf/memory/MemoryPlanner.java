@@ -54,7 +54,14 @@ import java.util.Set;
  *   <li><b>Rows</b>: {@code nCtx}, or a ring of {@link KvLayout#ringRows} rows for causal STANDARD / CHUNKED
  *       sliding-window layers of the memory kinds llama.cpp builds with an ISWA cache (KV, HYBRID, DSA_ISWA and
  *       the DSV4 raw cache; llama-kv-cache-iswa.cpp:73). The other kinds (DSA, HYBRID_IDX, MSA, ENC_DEC) keep
- *       full-size caches and mask the window.</li>
+ *       full-size caches and mask the window. A paged setting ({@code neuralfree.parallel > 1} or
+ *       {@code neuralfree.kv.paged}) replaces the rings with page pools of {@code neuralfree.kv.page.size}-row
+ *       pages: the full-attention groups keep {@code roundUp(nCtx, P)} cells shared by all sequences (llama.cpp
+ *       {@code -c} over an unified cache) and the SWA groups keep
+ *       {@code min(roundUp(nCtx, P), parallel x (roundUp(window + nUbatch, P) + P))}, the per-sequence window plus a
+ *       rollback margin of one page; a paged group never wraps. Recurrent state rows gain event slots for
+ *       {@code parallel} sequences with their rollback snapshots ({@link MemoryPlanner} counts
+ *       {@code parallel x (1 + n_rs_seq)} slots in the tensors, the PC-2 checkpoint slots are 0 until PC-2).</li>
  *   <li><b>Shared KV</b>: a layer whose {@link AttentionSpec#kvOwnerLayer()} is another layer reads that layer's
  *       cache, rows and rotation (gemma3n / gemma4 reuse); it owns nothing, including side caches.</li>
  *   <li><b>Recurrent state</b> ({@link LayerMemoryPlan#recurrentState}) on recurrent mixers, plus the qwen4exp
@@ -373,6 +380,8 @@ public final class MemoryPlanner {
         private final int ubatch;
         private final boolean nextnContext;
         private final int onlyLayer;
+        private final boolean paged;
+        private final int pageSize;
         private final Map<String, Integer> groupIndex = new LinkedHashMap<>();
         private final List<MemoryPlan.KvGroup> groups = new ArrayList<>();
         private int[] groupRemap = new int[0];
@@ -393,6 +402,8 @@ public final class MemoryPlanner {
             this.ubatch = Math.min(cfg.ubatch(), nCtx);
             this.nextnContext = nextnContext;
             this.onlyLayer = onlyLayer;
+            this.paged = cfg.paged();
+            this.pageSize = paged ? cfg.kvPageSize() : 0;
         }
 
         MemoryPlan run() {
@@ -456,7 +467,10 @@ public final class MemoryPlanner {
                 if (used[g]) {
                     MemoryPlan.KvGroup old = groups.get(g);
                     groupRemap[g] = out.size();
-                    out.add(MemoryPlan.KvGroup.of(out.size(), old.rows(), old.ring(), old.window()));
+                    out.add(old.paged()
+                            ? MemoryPlan.KvGroup.of(out.size(), old.rows(), old.ring(), old.window(),
+                            old.pageSize(), old.pages())
+                            : MemoryPlan.KvGroup.of(out.size(), old.rows(), old.ring(), old.window()));
                 }
             }
             return out;
@@ -490,7 +504,11 @@ public final class MemoryPlanner {
                 describeKv(d);
             }
             if (l.isRecurrent()) {
-                d.states.addAll(LayerMemoryPlan.recurrentState(l.recurrent()));
+                int slots = stateSlots();
+                for (LayerMemoryPlan.StateTensor state : LayerMemoryPlan.recurrentState(l.recurrent())) {
+                    d.states.add(slots == 1 ? state
+                            : LayerMemoryPlan.StateTensor.of(state.name(), state.layout(), state.floats(), slots));
+                }
             }
             addPleHistory(d);
             if (d.kv != null) {
@@ -508,7 +526,7 @@ public final class MemoryPlanner {
                             + "KV cache, got " + d.kind);
                 }
                 AttentionSpec x = l.crossAttention();
-                d.crossKv = KvLayout.of(nCtx, false, x.kDim(), x.vDim(),
+                d.crossKv = KvLayout.of(crossRows(), false, x.kDim(), x.vDim(),
                         storeK(x.kDim(), x.headDimK(), "cross K"),
                         storeV(x.vDim(), x.headDimV(), "cross V"), KvWindow.FULL_BIDIRECTIONAL);
             }
@@ -522,7 +540,7 @@ public final class MemoryPlanner {
             KvWindow window = a != null ? KvWindow.of(a.effectiveSwaType(), a.nSwa(), a.causal()) : KvWindow.FULL_CAUSAL;
             boolean swaSide = ringEligible(window);
             int rows = rowsFor(window, swaSide);
-            boolean ring = swaSide && rows < nCtx;
+            boolean ring = swaSide && rows < nCtx && !paged;
             if (mla != null) {
                 checkMlaCacheMode(l, mla);
             }
@@ -583,10 +601,10 @@ public final class MemoryPlanner {
             }
             KvWindow window = KvWindow.of(type, v4.window(), true);
             boolean swaSide = hp.isSwa(l.weightLayer()) && ringEligible(window);
-            int rows = swaSide ? rowsFor(window, true) : nCtx;
+            int rows = swaSide ? rowsFor(window, true) : crossRows();
             int width = v4.headDim();
             KvDType dtype = storeK(width, width, "DSV4 raw K");
-            assignKv(d, KvLayout.latent(rows, swaSide && rows < nCtx, width, width, dtype, window), swaSide);
+            assignKv(d, KvLayout.latent(rows, swaSide && rows < nCtx && !paged, width, width, dtype, window), swaSide);
             d.headDimK = width;
             d.headDimV = 0;
             int snapshots = Math.min(cfg.rollbackSnapshots(), ubatch);
@@ -613,7 +631,17 @@ public final class MemoryPlanner {
                 throw new IllegalArgumentException(layerName(l) + " is a PLE layer but not a linear-attention layer; the "
                         + "PLE convolution history lives in the recurrent cache");
             }
-            d.states.add(StateTensor.of(LayerMemoryPlan.STATE_PLE_CONV, LayerMemoryPlan.StateLayout.PLE_CONV, floats));
+            d.states.add(LayerMemoryPlan.StateTensor.of(LayerMemoryPlan.STATE_PLE_CONV,
+                    LayerMemoryPlan.StateLayout.PLE_CONV, floats, stateSlots()));
+        }
+
+        /**
+         * Recurrent state slots of the context: 1 for the contiguous single-sequence memory; paged memory keeps
+         * {@code parallel} live state slots plus {@code parallel x rollbackSnapshots} rollback snapshot slots
+         * (the PC-2 checkpoint slots are 0 until PC-2 lands).
+         */
+        private int stateSlots() {
+            return paged ? cfg.parallel() * (1 + cfg.rollbackSnapshots()) : 1;
         }
 
         /** Causal STANDARD / CHUNKED windows of ring memory kinds live on the sliding-window side. */
@@ -623,7 +651,23 @@ public final class MemoryPlanner {
         }
 
         private int rowsFor(KvWindow window, boolean swaSide) {
+            if (paged) {
+                if (swaSide) {
+                    // the per-sequence window plus a rollback margin of one page, times the sequence slots,
+                    // capped by the whole context (the PARITY MS row rule for SWA groups)
+                    long windowPageRows = (long) ((window.nSwa() + ubatch + pageSize - 1) / pageSize) * pageSize;
+                    long pool = (long) cfg.parallel() * (windowPageRows + pageSize);
+                    long capped = Math.min((long) ((nCtx + pageSize - 1) / pageSize) * pageSize, pool);
+                    return (int) capped;
+                }
+                return (int) (((long) nCtx + pageSize - 1) / pageSize) * pageSize;
+            }
             return swaSide ? KvLayout.ringRows(nCtx, window.nSwa(), ubatch, cfg.swaFull()) : nCtx;
+        }
+
+        /** Encoder cross-attention rows: page-rounded when the memory is paged. */
+        private int crossRows() {
+            return paged ? (int) (((long) nCtx + pageSize - 1) / pageSize) * pageSize : nCtx;
         }
 
         private void assignKv(Draft d, KvLayout kv, boolean swaSide) {
@@ -633,7 +677,9 @@ public final class MemoryPlanner {
             Integer g = groupIndex.get(key);
             if (g == null) {
                 g = groups.size();
-                groups.add(MemoryPlan.KvGroup.of(g, kv.rows(), kv.ring(), w));
+                groups.add(paged
+                        ? MemoryPlan.KvGroup.of(g, kv.rows(), false, w, pageSize, kv.rows() / pageSize)
+                        : MemoryPlan.KvGroup.of(g, kv.rows(), kv.ring(), w));
                 groupIndex.put(key, g);
             }
             d.kv = kv;

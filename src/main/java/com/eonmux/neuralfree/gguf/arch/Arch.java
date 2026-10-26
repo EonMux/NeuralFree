@@ -156,6 +156,7 @@ public enum Arch {
     RND1("rnd1"),
     PANGU_EMBED("pangu-embedded"),
     MISTRAL3("mistral3"),
+    EAGLE("eagle"),
     EAGLE3("eagle3"),
     DFLASH("dflash"),
     MISTRAL4("mistral4"),

@@ -101,6 +101,56 @@ public enum KvDType {
         return width >= 0 && width % blockSize() == 0;
     }
 
+    /**
+     * One per-row plane a dtype stores outside the row itself: an auxiliary row of {@code width} values of
+     * {@code dtype} that travels with every row of the cache when the values are copied, moved, sealed, restored or
+     * compared (the row-part rule of the prefix-cache design T-8). First declared by the FP4/NVFP4 quantization
+     * (its per-row scale row).
+     */
+    public static final class SidePlane {
+
+        private final String name;
+        private final KvDType dtype;
+        private final int width;
+
+        private SidePlane(String name, KvDType dtype, int width) {
+            this.name = name;
+            this.dtype = dtype;
+            this.width = width;
+        }
+
+        /** @throws IllegalArgumentException for a blank name, a non-positive width or an unusable width */
+        public static SidePlane of(String name, KvDType dtype, int width) {
+            if (name == null || name.trim().isEmpty()) {
+                throw new IllegalArgumentException("side plane needs a name");
+            }
+            if (width <= 0) {
+                throw new IllegalArgumentException("side plane " + name + " needs a positive width, got " + width);
+            }
+            dtype.rowBytes(width);
+            return new SidePlane(name.trim(), dtype, width);
+        }
+
+        public String name() { return name; }
+        public KvDType dtype() { return dtype; }
+        /** Values of one plane row. */
+        public int width() { return width; }
+        public long rowBytes() { return dtype.rowBytes(width); }
+
+        @Override
+        public String toString() {
+            return name + "[" + width + " " + dtype + "]";
+        }
+    }
+
+    /**
+     * The per-row planes this dtype stores outside the row, one instance per plane in declaration order. Empty for
+     * every type of today's set: no cache type keeps a value outside its row yet.
+     */
+    public List<SidePlane> sidePlanes() {
+        return Collections.emptyList();
+    }
+
     /** Every KV type, in declaration order. */
     public static List<KvDType> all() {
         return ALL;

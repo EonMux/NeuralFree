@@ -32,6 +32,17 @@ import java.util.Properties;
  *       context budget; default true when MTP drafting is configured. A GPU load also places the NextN / MTP blocks
  *       on the device when it is set, as llama.cpp loads them and counts them in its fit only with
  *       {@code load_mtp} (llama-model.cpp:3915-3917, common/fit.cpp:141-143).</li>
+ *   <li>{@code neuralfree.parallel}: how many sequences the memory holds at once, llama.cpp's {@code -np}
+ *       ({@code [1, 256]}, default 1). Values above 1 switch the memory to the paged form, as does
+ *       {@code neuralfree.kv.paged}.</li>
+ *   <li>{@code neuralfree.kv.paged}: force the paged memory form for a single sequence; default false. Paged memory
+ *       keeps the rows of a KV group in reference-counted pages of {@code neuralfree.kv.page.size} rows instead of
+ *       one contiguous row range.</li>
+ *   <li>{@code neuralfree.kv.page.size}: page size P of the paged KV pools, a power of two in {@code [1, 256]},
+ *       default 16 (vLLM {@code DEFAULT_BLOCK_SIZE}, vllm/config/cache.py:182).</li>
+ *   <li>{@code neuralfree.kv.unified}: share the whole context between the {@code neuralfree.parallel} sequences
+ *       of a paged memory; default true (llama.cpp {@code --kv-unified}). False gives each sequence a fixed
+ *       {@code nCtx / parallel} cap, enforced by {@link PagedSequences}.</li>
  * </ul>
  * One setting has no property: {@link #rollbackSnapshots()}, llama.cpp's {@code n_rs_seq}, which the engine derives
  * from the speculative settings ({@code EngineConfig}, {@code LLMModelFactory}) as llama.cpp derives it from the
@@ -54,6 +65,10 @@ public final class MemoryConfig {
     public static final String PROP_CONTEXT_SHIFT = "neuralfree.context.shift";
     public static final String PROP_STATE_SNAPSHOTS = "neuralfree.state.snapshots";
     public static final String PROP_NEXTN_MEMORY = "neuralfree.nextn.memory";
+    public static final String PROP_PARALLEL = "neuralfree.parallel";
+    public static final String PROP_KV_PAGED = "neuralfree.kv.paged";
+    public static final String PROP_KV_PAGE_SIZE = "neuralfree.kv.page.size";
+    public static final String PROP_KV_UNIFIED = "neuralfree.kv.unified";
 
     /** Engine key naming a draft model; when set, speculative decoding is configured. */
     private static final String ENGINE_DRAFT = "neuralfree.draft";
@@ -62,6 +77,13 @@ public final class MemoryConfig {
 
     /** Default tokens per forward step. */
     public static final int DEFAULT_UBATCH = 512;
+
+    /** Bounds of {@code neuralfree.parallel} and of {@code neuralfree.kv.page.size} (llama.cpp {@code -np}). */
+    public static final int MAX_PARALLEL = 256;
+    /** Bounds of the page size: a power of two in {@code [1, 256]} (vLLM block sizes). */
+    public static final int MAX_PAGE_SIZE = 256;
+    /** Default page size of the paged KV pools (vLLM {@code DEFAULT_BLOCK_SIZE}). */
+    public static final int DEFAULT_PAGE_SIZE = 16;
 
     /**
      * Row type of the K and V caches of every draft context ({@link #forDraftContext()}): F16, llama.cpp's
@@ -102,6 +124,10 @@ public final class MemoryConfig {
     private final boolean stateSnapshots;
     private final boolean nextnMemory;
     private final int rollbackSnapshots;
+    private final int parallel;
+    private final boolean kvPaged;
+    private final int kvPageSize;
+    private final boolean kvUnified;
     private final boolean stateSnapshotsSet;
     private final boolean nextnMemorySet;
     private final boolean rollbackSnapshotsSet;
@@ -119,6 +145,10 @@ public final class MemoryConfig {
         this.stateSnapshots = b.stateSnapshots;
         this.nextnMemory = b.nextnMemory;
         this.rollbackSnapshots = b.rollbackSnapshots;
+        this.parallel = b.parallel;
+        this.kvPaged = b.kvPaged;
+        this.kvPageSize = b.kvPageSize;
+        this.kvUnified = b.kvUnified;
         this.stateSnapshotsSet = b.stateSnapshotsSet;
         this.nextnMemorySet = b.nextnMemorySet;
         this.rollbackSnapshotsSet = b.rollbackSnapshotsSet;
@@ -183,6 +213,16 @@ public final class MemoryConfig {
         b.prefixReuse(parseBool(p, PROP_PREFIX_REUSE, true));
         b.kvRotation(parseBool(p, PROP_KV_ROTATION, true));
         b.contextShift(parseBool(p, PROP_CONTEXT_SHIFT, false));
+        String par = p.getProperty(PROP_PARALLEL);
+        if (par != null) {
+            b.parallel(parseInt(PROP_PARALLEL, par));
+        }
+        b.kvPaged(parseBool(p, PROP_KV_PAGED, false));
+        String page = p.getProperty(PROP_KV_PAGE_SIZE);
+        if (page != null) {
+            b.kvPageSize(parseInt(PROP_KV_PAGE_SIZE, page));
+        }
+        b.kvUnified(parseBool(p, PROP_KV_UNIFIED, true));
         if (p.getProperty(PROP_STATE_SNAPSHOTS) != null) {
             b.stateSnapshots(parseBool(p, PROP_STATE_SNAPSHOTS, false));
         }
@@ -257,7 +297,9 @@ public final class MemoryConfig {
      *       type is;</li>
      *   <li>no recurrent-state snapshots and no compressor rollback snapshots: the target is verified, never the
      *       draft context;</li>
-     *   <li>no context shift and no NextN draft context of its own.</li>
+     *   <li>no context shift and no NextN draft context of its own;</li>
+     *   <li>contiguous single-sequence memory ({@link #parallel()} 1, {@link #paged()} false): the draft context of
+     *       a drafter holds one sequence, as llama.cpp drafts run on a single-seq context.</li>
      * </ul>
      * The context and ubatch stay these settings' own; a caller applies the target plan's. Idempotent.
      */
@@ -269,6 +311,8 @@ public final class MemoryConfig {
                 .stateSnapshots(false)
                 .nextnMemory(false)
                 .rollbackSnapshots(0)
+                .parallel(1)
+                .kvPaged(false)
                 .build();
     }
 
@@ -378,6 +422,16 @@ public final class MemoryConfig {
      */
     public boolean nextnMemory() { return nextnMemory; }
 
+    /** Sequence slots the memory holds at once (llama.cpp {@code -np}): 1 keeps today's contiguous form. */
+    public int parallel() { return parallel; }
+    /** True when the memory uses the paged KV form: {@link #parallel()} over 1 or {@link #kvPaged()} set. */
+    public boolean paged() { return parallel > 1 || kvPaged; }
+    public boolean kvPaged() { return kvPaged; }
+    /** Page size P of the paged KV pools; a power of two in {@code [1, 256]}, irrelevant when not paged. */
+    public int kvPageSize() { return kvPageSize; }
+    /** True when the paged memory shares the whole context between its sequences (llama.cpp {@code --kv-unified}). */
+    public boolean kvUnified() { return kvUnified; }
+
     /**
      * Rollback snapshots of the DeepSeek-V4 compressor state (llama.cpp {@code n_rs_seq}, llama-cparams.h:16): the
      * most trailing positions a speculative verify may drop from a model whose compressors accumulate state across
@@ -391,7 +445,8 @@ public final class MemoryConfig {
     /** A builder with every setting of this configuration, including whether each speculative default was set. */
     public Builder toBuilder() {
         Builder b = builder().nCtx(nCtx).typeK(typeK).typeV(typeV).ubatch(ubatch).swaFull(swaFull).mlaCache(mlaCache)
-                .prefixReuse(prefixReuse).kvRotation(kvRotation).contextShift(contextShift);
+                .prefixReuse(prefixReuse).kvRotation(kvRotation).contextShift(contextShift)
+                .parallel(parallel).kvPaged(kvPaged).kvPageSize(kvPageSize).kvUnified(kvUnified);
         b.stateSnapshots = stateSnapshots;
         b.stateSnapshotsSet = stateSnapshotsSet;
         b.nextnMemory = nextnMemory;
@@ -403,11 +458,13 @@ public final class MemoryConfig {
 
     @Override
     public String toString() {
+        boolean paged = paged();
         return "MemoryConfig{ctx=" + (nCtx == 0 ? "auto" : String.valueOf(nCtx)) + ", K=" + typeK + ", V=" + typeV
                 + ", ubatch=" + ubatch + ", swaFull=" + swaFull + ", mla=" + mlaCache + ", prefixReuse=" + prefixReuse
                 + ", rotation=" + kvRotation + ", contextShift=" + contextShift + ", stateSnapshots=" + stateSnapshots
                 + ", nextnMemory=" + nextnMemory
-                + (rollbackSnapshots > 0 ? ", rollbackSnapshots=" + rollbackSnapshots : "") + '}';
+                + (rollbackSnapshots > 0 ? ", rollbackSnapshots=" + rollbackSnapshots : "")
+                + (paged ? ", parallel=" + parallel + ", pageSize=" + kvPageSize + ", unified=" + kvUnified : "") + '}';
     }
 
     public static final class Builder {
@@ -423,6 +480,10 @@ public final class MemoryConfig {
         private boolean stateSnapshots;
         private boolean nextnMemory;
         private int rollbackSnapshots;
+        private int parallel = 1;
+        private boolean kvPaged;
+        private int kvPageSize = DEFAULT_PAGE_SIZE;
+        private boolean kvUnified = true;
         private boolean stateSnapshotsSet;
         private boolean nextnMemorySet;
         private boolean rollbackSnapshotsSet;
@@ -434,6 +495,14 @@ public final class MemoryConfig {
         public Builder typeK(KvDType v) { this.typeK = Objects.requireNonNull(v, "typeK"); return this; }
         public Builder typeV(KvDType v) { this.typeV = Objects.requireNonNull(v, "typeV"); return this; }
         public Builder ubatch(int v) { this.ubatch = v; return this; }
+        /** Sets the sequence slots of the memory ({@code -np}); the default 1 keeps today's contiguous form. */
+        public Builder parallel(int v) { this.parallel = v; return this; }
+        /** Forces the paged KV form for a single sequence. */
+        public Builder kvPaged(boolean v) { this.kvPaged = v; return this; }
+        /** Sets the page size P of the paged KV pools (default {@link #DEFAULT_PAGE_SIZE}). */
+        public Builder kvPageSize(int v) { this.kvPageSize = v; return this; }
+        /** Shares the whole context between the paged sequences (default true, llama.cpp {@code --kv-unified}). */
+        public Builder kvUnified(boolean v) { this.kvUnified = v; return this; }
         public Builder swaFull(boolean v) { this.swaFull = v; return this; }
         public Builder mlaCache(MlaCacheMode v) { this.mlaCache = Objects.requireNonNull(v, "mlaCache"); return this; }
         public Builder prefixReuse(boolean v) { this.prefixReuse = v; return this; }
@@ -464,8 +533,9 @@ public final class MemoryConfig {
         }
 
         /**
-         * @throws IllegalArgumentException for a negative context, a non-positive ubatch or negative rollback
-         *                                  snapshots
+         * @throws IllegalArgumentException for a negative context, a non-positive ubatch, negative rollback
+         *                                  snapshots, a parallel count outside {@code [1, 256]}, or a page size
+         *                                  that is not a power of two in {@code [1, 256]}
          */
         public MemoryConfig build() {
             if (nCtx < 0) {
@@ -475,6 +545,14 @@ public final class MemoryConfig {
                 throw new IllegalArgumentException(PROP_UBATCH + " must be positive, got " + ubatch);
             }
             checkRollbackSnapshots(rollbackSnapshots);
+            if (parallel < 1 || parallel > MAX_PARALLEL) {
+                throw new IllegalArgumentException(PROP_PARALLEL + " must be in [1, " + MAX_PARALLEL + "], got "
+                        + parallel);
+            }
+            if (kvPageSize < 1 || kvPageSize > MAX_PAGE_SIZE || Integer.bitCount(kvPageSize) != 1) {
+                throw new IllegalArgumentException(PROP_KV_PAGE_SIZE + " must be a power of two in [1, "
+                        + MAX_PAGE_SIZE + "], got " + kvPageSize);
+            }
             return new MemoryConfig(this);
         }
     }

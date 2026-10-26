@@ -68,7 +68,7 @@
 #define QT_Q1_0     41
 #define QT_Q2_0     42
 
-/* ---- NeuralFree extension weight-type ids (GGMLType ids 1000-1006, no ggml_type counterpart) ---- */
+/* ---- NeuralFree extension weight-type ids (GGMLType ids 1000-1008, no ggml_type counterpart) ---- */
 #define QT_F8_E4M3       1000
 #define QT_F8_E4M3_B128  1001
 #define QT_MXFP8         1002
@@ -76,6 +76,8 @@
 #define QT_NF4           1004
 #define QT_FP4_BNB       1005
 #define QT_F8_E5M2       1006
+#define QT_MXFP6_E2M3    1007
+#define QT_MXFP6_E3M2    1008
 
 /* ---- Block constants: elements (_BS) and bytes (_BB) per block (llama.cpp ggml-common.h) ---- */
 #define NF_F32_BS      1
@@ -146,6 +148,10 @@
 #define NF_F8_E4M3_B128_BB  132
 #define NF_MXFP8_BS         32
 #define NF_MXFP8_BB         33
+#define NF_MXFP6_E2M3_BS    32
+#define NF_MXFP6_E2M3_BB    25
+#define NF_MXFP6_E3M2_BS    32
+#define NF_MXFP6_E3M2_BB    25
 #define NF_I8_B128_BS       128
 #define NF_I8_B128_BB       132
 #define NF_NF4_BS           64

@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf;
 import com.eonmux.neuralfree.gguf.hf.HfModelSource;
 import com.eonmux.neuralfree.gguf.hf.lora.PeftAdapterSource;
 import com.eonmux.neuralfree.gguf.hf.config.HfCheckpointDetectors;
+import com.eonmux.neuralfree.gguf.hf.st.CheckpointContainers;
 import com.eonmux.neuralfree.gguf.load.DummyWeights;
 import com.eonmux.neuralfree.gguf.load.MetadataOverrides;
 import com.eonmux.neuralfree.gguf.load.OverriddenSource;
@@ -47,8 +48,10 @@ import java.util.regex.Pattern;
  *       through {@link #openAdapter} (when the directory also holds a checkpoint of rule 3, that checkpoint is the
  *       model and the adapter is still opened by {@link #openAdapter}; so is a directory without
  *       {@code config.json} that a checkpoint detector recognizes, such as a decision-LoRA release);</li>
- *   <li>PyTorch pickle checkpoints ({@code pytorch_model*.bin}, {@code *.pt}, {@code *.pth}) are refused: unpickling
- *       executes code;</li>
+ *   <li>PyTorch pickle checkpoints ({@code pytorch_model*.bin}, {@code *.pt}, {@code *.pth}): asked at the
+ *       checkpoint-container registry (HF.md rule 6, H-K); with a registered container — FX-1's restricted pickle
+ *       reader — they open like safetensors checkpoints, without one the pickle is refused (unpickling executes
+ *       code);</li>
  *   <li>anything else is a {@link FileNotFoundException} naming what was looked for.</li>
  * </ol>
  * Directory entries and the given path may be symbolic links (the Hugging Face cache snapshot layout) and are
@@ -326,7 +329,14 @@ public final class ModelSources {
             return new Detection(Kind.SAFETENSORS_FILE, path);
         }
         if (isPickle(name)) {
-            throw pickle(path);
+            // Detection rule 6: the checkpoint-container registry is asked (H-K); a registered container (FX-1
+            // restricted pickle reader) reads the file through the safetensors open flow, without one the pickle
+            // is refused.
+            CheckpointContainers.Factory factory = CheckpointContainers.forFile(file);
+            if (factory == null) {
+                throw pickle(path);
+            }
+            return new Detection(Kind.SAFETENSORS_FILE, path);
         }
         throw new FileNotFoundException("'" + path + "' is not a model file: looked for the GGUF magic, a .gguf name"
                 + " and a .safetensors name");
@@ -383,7 +393,12 @@ public final class ModelSources {
             return new Detection(Kind.GGUF, dir.resolve(model).toString());
         }
         if (pickles) {
-            throw pickle(path);
+            // Detection rule 6, as in detectFile: the registry is asked for the directory's pickle files.
+            CheckpointContainers.Factory factory = CheckpointContainers.forFile(dir);
+            if (factory == null) {
+                throw pickle(path);
+            }
+            return new Detection(Kind.SAFETENSORS_DIR, path);
         }
         throw new FileNotFoundException("'" + path + "' holds no model: " + LOOKED_FOR);
     }

@@ -254,11 +254,18 @@ public class SamplerOrderTest {
 
     @Test
     public void extraStageArgumentsAreChecked() {
-        assertThrows(NullPointerException.class, () -> Sampler.create(base().build(), new int[0], null));
+        assertThrows(NullPointerException.class,
+                () -> Sampler.create(base().build(), new int[0], (List<SamplerStage>) null));
         List<SamplerStage> withNull = new ArrayList<>();
         withNull.add(null);
         assertThrows(IllegalArgumentException.class,
                 () -> Sampler.create(base().build(), new int[0], withNull));
+        assertThrows(NullPointerException.class,
+                () -> Sampler.create(base().build(), new int[0], Collections.singletonList(new SamplerStage() {
+                    @Override
+                    public void apply(Sampler.Candidates candidates) {
+                    }
+                }), (SamplerVocab) null));
     }
 
     @Test

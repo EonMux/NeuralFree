@@ -40,8 +40,12 @@ import java.util.TreeSet;
  *   <li>MXFP4 (compressed-tensors and Quark {@code weight_packed}/{@code weight} with E8M0 {@code weight_scale},
  *       DeepSeek-V4 experts with {@code scale}, gpt-oss {@code _blocks}/{@code _scales}): MXFP4 blocks, the E8M0
  *       byte copied.</li>
- *   <li>MXFP6 (Quark OCP-MX E2M3 or E3M2, four 6-bit codes per three bytes): BF16, exact while every block
- *       exponent keeps the values inside BF16's range; a larger exponent is rejected naming the tensor and block.</li>
+ *   <li>MXFP6 (Quark OCP-MX E2M3 or E3M2, four 6-bit codes per three bytes): MXFP6_E2M3 / MXFP6_E3M2 blocks,
+ *       a zero-copy repack of the codes (the codes carry the OCP-MX element order, so 24 bytes per 32-element
+ *       block copy unchanged) with the E8M0 scale of each block as its header byte; {@code e == 0xFF} is the
+ *       NaN reservation and is rejected at load. A GGUF COMPAT export converts to BF16 (GgufCompatConverter).
+ *       A gpt-oss-style blocks/scales layout is not defined for FP6: Quark's {@code weight}/{@code weight_scale}
+ *       keeps the only mapping.</li>
  * </ul>
  * Packed E2M1 codes are stored low nibble first in every source format (gpt-oss included).
  */
@@ -52,8 +56,6 @@ public final class Fp4Scheme {
     private static final int MX = 32;
     private static final int NV = 64;
     private static final int NV_SUB = 16;
-    private static final int E2M3_MAX_EXP = 252;
-    private static final int E3M2_MAX_EXP = 250;
 
     private Fp4Scheme() {
     }
@@ -410,6 +412,8 @@ public final class Fp4Scheme {
         if (Fp4Packing.dtype(w, wName) != StDType.U8) {
             throw new GgufFormatException("MXFP6 weight " + wName + " must be packed U8");
         }
+        final boolean e2m3 = ctx.fp6E2m3();
+        GGMLType target = e2m3 ? GGMLType.MXFP6_E2M3 : GGMLType.MXFP6_E3M2;
         Geometry g = Geometry.packed(w.shape(), 3, 4, wName);
         if (g.k % MX != 0) {
             throw new GgufFormatException("MXFP6 weight " + wName + " has K = " + g.k + ", not a multiple of 32");
@@ -418,34 +422,19 @@ public final class Fp4Scheme {
         RowSource s = ctx.in.get(sName);
         checkScaleDtype(s, sName, StDType.U8, StDType.F8_E8M0);
         g.checkRows(s, sName, g.k / MX);
-        final boolean e2m3 = ctx.fp6E2m3();
-        final int maxExp = e2m3 ? E2M3_MAX_EXP : E3M2_MAX_EXP;
         final int kb = g.k / 4 * 3;
         final int sc = g.k / MX;
-        Produced src = Fp4Packing.floats(ctx.describe(m, StDType.BF16), g.shape, StDType.BF16,
-                w.rowLocal() && s.rowLocal(), (first, count, out) -> {
+        Produced src = Produced.of(ctx.describe(m, target), ElementFormat.of(target), g.shape,
+                w.rowLocal() && s.rowLocal(), (first, count, dst) -> {
                     byte[] p = Fp4Packing.readRows(w, first, count);
                     byte[] e = Fp4Packing.readRows(s, first, count);
                     for (int i = 0; i < count; i++) {
                         long row = first + i;
                         for (int b = 0; b < sc; b++) {
-                            int exp = Fp4Packing.checkE8m0(e[i * sc + b], sName, row, b);
-                            if (exp > maxExp) {
-                                throw new IOException("tensor " + sName + " row " + row + " block " + b
-                                        + ": exponent " + exp + " overflows BF16 for fp6_" + (e2m3 ? "e2m3" : "e3m2")
-                                        + " (at most " + maxExp + ")");
-                            }
-                            int base = i * kb + b * 24;
-                            for (int q = 0; q < 8; q++) {
-                                int word = (p[base + 3 * q] & 0xFF) | (p[base + 3 * q + 1] & 0xFF) << 8
-                                        | (p[base + 3 * q + 2] & 0xFF) << 16;
-                                for (int j = 0; j < 4; j++) {
-                                    int code = (word >>> (6 * j)) & 0x3F;
-                                    float v = e2m3 ? FpBlockDecoders.e2m3ToFp32(code)
-                                            : FpBlockDecoders.e3m2ToFp32(code);
-                                    out[i * g.k + b * MX + 4 * q + j] = Math.scalb(v, exp - 127);
-                                }
-                            }
+                            // the E8M0 scale becomes the block's header byte; 0xFF is the NaN reservation
+                            dst.put((byte) Fp4Packing.checkE8m0(e[i * sc + b], sName, row, b));
+                            // the codes carry the OCP-MX element order: the 24 block bytes copy unchanged
+                            dst.put(p, i * kb + b * 24, 24);
                         }
                     }
                 });

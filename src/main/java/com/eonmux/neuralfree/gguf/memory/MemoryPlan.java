@@ -16,19 +16,25 @@ public final class MemoryPlan {
 
     /**
      * A set of layers whose caches share row addressing: one device {@code int kv_pos[rows]} buffer (the position
-     * stored in each row, -1 when empty) and one per-step {@code cell_idx} buffer.
+     * stored in each row, -1 when empty) and one per-step {@code cell_idx} buffer. Rows of a paged group live in the
+     * {@code pages} pages of {@link #pageSize()} rows each, and {@code PagedSequences} maps positions to rows;
+     * {@link #rowOf(int)} addresses the rows of a contiguous group ({@link #pageSize()} 0) only.
      */
     public static final class KvGroup {
         private final int index;
         private final int rows;
         private final boolean ring;
         private final KvWindow window;
+        private final int pageSize;
+        private final int pages;
 
-        private KvGroup(int index, int rows, boolean ring, KvWindow window) {
+        private KvGroup(int index, int rows, boolean ring, KvWindow window, int pageSize, int pages) {
             this.index = index;
             this.rows = rows;
             this.ring = ring;
             this.window = window;
+            this.pageSize = pageSize;
+            this.pages = pages;
         }
 
         /** @throws IllegalArgumentException for a negative index or non-positive rows */
@@ -36,16 +42,61 @@ public final class MemoryPlan {
             if (index < 0 || rows <= 0) {
                 throw new IllegalArgumentException("KV group needs index >= 0 and rows > 0, got " + index + "/" + rows);
             }
-            return new KvGroup(index, rows, ring, Objects.requireNonNull(window, "window"));
+            return new KvGroup(index, rows, ring, Objects.requireNonNull(window, "window"), 0, 0);
+        }
+
+        /**
+         * Paged form: {@code rows == pages x pageSize} rows in {@code pages} pages of a page pool, {@code pageSize}
+         * a power of two in {@code [1, 256]}. The paged form never wraps ({@code ring} false).
+         *
+         * @throws IllegalArgumentException for a negative index, non-positive rows, a page size that is not a power
+         *                                  of two in {@code [1, 256]}, rows that are not {@code pages x pageSize},
+         *                                  or a ring
+         */
+        public static KvGroup of(int index, int rows, boolean ring, KvWindow window, int pageSize, int pages) {
+            if (index < 0 || rows <= 0) {
+                throw new IllegalArgumentException("KV group needs index >= 0 and rows > 0, got " + index + "/" + rows);
+            }
+            if (pageSize > 0) {
+                if (pageSize < 1 || pageSize > MemoryConfig.MAX_PAGE_SIZE || Integer.bitCount(pageSize) != 1) {
+                    throw new IllegalArgumentException("KV group page size must be a power of two in [1, "
+                            + MemoryConfig.MAX_PAGE_SIZE + "], got " + pageSize);
+                }
+                if (pages <= 0) {
+                    throw new IllegalArgumentException("paged KV group needs pages > 0, got " + pages);
+                }
+                if ((long) pages * pageSize != rows) {
+                    throw new IllegalArgumentException("paged KV group rows " + rows + " are not " + pages
+                            + " pages of " + pageSize);
+                }
+                if (ring) {
+                    throw new IllegalArgumentException("paged KV groups never wrap (ring)");
+                }
+                return new KvGroup(index, rows, false, Objects.requireNonNull(window, "window"), pageSize, pages);
+            }
+            if (pages != 0) {
+                throw new IllegalArgumentException("KV group needs pages only with a positive page size, got " + pages);
+            }
+            return new KvGroup(index, rows, ring, Objects.requireNonNull(window, "window"), 0, 0);
         }
 
         public int index() { return index; }
         public int rows() { return rows; }
         public boolean ring() { return ring; }
         public KvWindow window() { return window; }
+        /** Page size P of the paged group's page pool; 0 for the contiguous form. */
+        public int pageSize() { return pageSize; }
+        /** Pages of the paged group's page pool; 0 for the contiguous form. */
+        public int pages() { return pages; }
+        /** True when the group's rows live in the pages of a page pool ({@link #pageSize()} over 0). */
+        public boolean paged() { return pageSize > 0; }
 
         /** Row of a position in this group ({@code pos % rows} for a ring). */
         public int rowOf(int pos) {
+            if (paged()) {
+                throw new UnsupportedOperationException("a paged KV group maps positions through PagedSequences; "
+                        + "rowOf is used only for a contiguous group (pageSize 0)");
+            }
             if (pos < 0) {
                 throw new IllegalArgumentException("KV position " + pos + " is negative");
             }
@@ -62,7 +113,8 @@ public final class MemoryPlan {
 
         @Override
         public String toString() {
-            return "KvGroup{" + index + ", rows=" + rows + (ring ? " ring" : "") + ", " + window + '}';
+            return "KvGroup{" + index + ", rows=" + rows + (ring ? " ring" : "")
+                    + (paged() ? ", pages=" + pages + "x" + pageSize : "") + ", " + window + '}';
         }
     }
 

@@ -46,6 +46,8 @@ public final class BlockLayout {
     public static final int QK_I8B128 = 128;
     /** Elements per NF4 / FP4_BNB block (one absmax). */
     public static final int QK_BNB4 = 64;
+    /** Elements per MXFP6 block (one E8M0 scale). */
+    public static final int QK_MXFP6 = 32;
 
     // block_q1_0 {half d; u8 qs[16]} (llama.cpp ggml-common.h:180-184)
     public static final int Q1_0_D = 0, Q1_0_QS = 2, Q1_0_BYTES = 18;
@@ -109,7 +111,7 @@ public final class BlockLayout {
     public static final int IQ4_XS_D = 0, IQ4_XS_SCALES_H = 2, IQ4_XS_SCALES_L = 4, IQ4_XS_QS = 8,
             IQ4_XS_BYTES = 136;
 
-    // NeuralFree extension blocks (GGMLType ids 1000-1006).
+    // NeuralFree extension blocks (GGMLType ids 1000-1008).
     // F8_E4M3 {u8 qs[32]}: E4M3FN codes, the scale lives in the tensor's .scale sibling
     public static final int F8_E4M3_QS = 0, F8_E4M3_BYTES = 32;
     // F8_E5M2 {u8 qs[32]}: E5M2 codes (IEEE half high bytes), the scale lives in the tensor's .scale sibling
@@ -118,6 +120,9 @@ public final class BlockLayout {
     public static final int F8B128_D = 0, F8B128_QS = 4, F8B128_BYTES = 132;
     // MXFP8 {u8 e; u8 qs[32]}: E4M3FN codes times the E8M0 scale 2^(e-127)
     public static final int MXFP8_E = 0, MXFP8_QS = 1, MXFP8_BYTES = 33;
+    // MXFP6_E3M2 and MXFP6_E2M3 {u8 e; u8 qs[24]}: 32 packed 6-bit codes, element j = code j
+    // (four codes per three bytes, little-endian bit order), times the E8M0 scale 2^(e-127)
+    public static final int MXFP6_E = 0, MXFP6_QS = 1, MXFP6_BYTES = 25;
     // I8_B128 {float d; i8 qs[128]}: signed codes times d
     public static final int I8B128_D = 0, I8B128_QS = 4, I8B128_BYTES = 132;
     // NF4 and FP4_BNB {float absmax; u8 qs[32]}: byte j holds element j (low nibble) and j + 32 (high nibble),

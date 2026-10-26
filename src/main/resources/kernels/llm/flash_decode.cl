@@ -1,4 +1,6 @@
-/* flash_decode.cl - LLM_FlashDecode_<KV> and LLM_FlashDecode_Mixed split-K decode attention. Requires: common/dialect.h, common/config.h, common/reduce.h, common/math.h, common/kv_types.h, common/attn_common.h */
+/* flash_decode.cl - LLM_FlashDecode_<KV>, LLM_FlashDecode_Mixed (identity pages) and LLM_FlashDecodePaged_<KV>,
+ * LLM_FlashDecodePaged_Mixed (paged) split-K decode attention. Requires: common/dialect.h, common/config.h,
+ * common/reduce.h, common/math.h, common/kv_types.h, common/attn_common.h */
 /*
  * Attention of one query token against a KV cache (decode, speculative per-row verify, MLA latent
  * cache, T5 cross-attention) with GQA packing and an optional split over the key range.
@@ -13,6 +15,9 @@
  *   out      out[out_off + h * d_v + d]                       (direct_out = 1, n_split == 1)
  *   partial  partial[(h * n_split + s) * (d_v + 2) + d], then m at + d_v and l at + d_v + 1
  *            (direct_out = 0; merged by LLM_FlashAttn_Combine with rows = heads)
+ * The paged entry points (below) address K, V and kv_pos at the physical row nf_kv_row(t, page_shift, pt, pt_off)
+ * (common/attn_common.h): the un-paged entry points pass page_shift = -1, the identity map, so every index above
+ * is exactly row t for them.
  * Query head h reads KV head kvh = h / (n_head / n_head_kv) (ggml broadcast rk2 = neq2 / nek2).
  * K is read as k_type and V as v_type: both are the variant's type in LLM_FlashDecode_<KV>; LLM_FlashDecode_Mixed
  * takes them from its trailing kv_types argument (common/attn_common.h), as ggml's flash attention reads K and V of
@@ -75,6 +80,15 @@ NF_INLINE void nf_fd_poison(int n_head, int d_v, int n_split, int direct_out, in
     }
 }
 
+/*
+ * The shared decode algorithm. The paged entry points pass page_shift >= 0, their page table (pt already offset to
+ * the sequence's block, pt_off of nf_kv_row) and seq >= 0 (their sequence): K, V and kv_pos are then read at the
+ * physical row nf_kv_row(t) (common/attn_common.h), page ids below 0 are masked, the sequence's q / out block
+ * (q_off += seq * q_seq_stride, out_off += seq * out_seq_stride, resolved by the entry point) and partial rows at
+ * (seq * n_head + h) are used, and the sequence's fold in front of grid dimension 1 is subtracted before the
+ * KV head index. The un-paged entry points pass page_shift = -1 and seq = -1: identity rows, no grid change, no
+ * partial offset, and pt (a placeholder, kv_pos) is never dereferenced.
+ */
 NF_INLINE void nf_fd_run(
     const int n_head, const int n_head_kv, const int d_k, const int d_v, const int g_tile,
     const int n_split, const int split_len, const int kv_start, const int kv_end, const int q_pos,
@@ -86,6 +100,7 @@ NF_INLINE void nf_fd_run(
     NF_GLOBAL const float* q, NF_GLOBAL const uchar* k, NF_GLOBAL const uchar* v,
     NF_GLOBAL const int* kv_pos, NF_GLOBAL const float* sinks, NF_GLOBAL const float* rel_bias,
     NF_GLOBAL float* out, NF_GLOBAL float* partial, const int k_type, const int v_type,
+    const int page_shift, NF_GLOBAL const int* pt, const int pt_off, const int seq,
     NF_LOCAL_PTR float* smem, NF_LOCAL_PTR float* red, NF_LOCAL_PTR float* stats)
 {
     if (!nf_fd_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct_out, k_type, v_type)) {
@@ -97,8 +112,12 @@ NF_INLINE void nf_fd_run(
     const int split = (int)get_group_id(0);
     const int G = n_head / n_head_kv;
     const int n_gt = (G + g_tile - 1) / g_tile;
-    const int kvh = (int)get_group_id(1) / n_gt;
-    const int gt = (int)get_group_id(1) - kvh * n_gt;
+    int y = (int)get_group_id(1);
+    if (seq > 0) {
+        y -= seq * (n_head_kv * n_gt);   /* the paged grid folds the sequence in front of the KV head */
+    }
+    const int kvh = y / n_gt;
+    const int gt = y - kvh * n_gt;
     const int h0 = kvh * G + gt * g_tile;
     const int g_cnt = min(g_tile, G - gt * g_tile);
     const int k_begin = kv_start + split * split_len;
@@ -135,12 +154,14 @@ NF_INLINE void nf_fd_run(
         }
         int p_k = -1;
         int vis = 0;
-        if (j < n_keys) {
-            const int t = k_begin + j;
-            p_k = kv_pos[t];
+        if (j < n_keys && nf_kv_page_ok(k_begin + j, page_shift, pt, pt_off)) {
+            /* A masked page's row is not a row, so kv_pos is read only after the page test; an empty cell's
+             * kv_pos stays -1 and is never visible. */
+            const int row = nf_kv_row(k_begin + j, page_shift, pt, pt_off);
+            p_k = kv_pos[row];
             vis = nf_attn_visible(q_pos, p_k, causal, swa_type, n_swa);
             if (vis) {
-                const nf_i64 e0 = (nf_i64)t * k_row_stride + k_head;
+                const nf_i64 e0 = (nf_i64)row * k_row_stride + k_head;
                 for (int d = 0; d < d_k; d += 4) {
                     const float4 k4 = nf_kv_load4(k, e0 + d, k_type);
 #pragma unroll
@@ -213,7 +234,7 @@ NF_INLINE void nf_fd_run(
     }
     const nf_i64 v_head = (nf_i64)kvh * v_head_stride;
     for (int j = 0; j < n_keys; j++) {
-        const nf_i64 e0 = (nf_i64)(k_begin + j) * v_row_stride + v_head;
+        const nf_i64 e0 = (nf_i64)nf_kv_row(k_begin + j, page_shift, pt, pt_off) * v_row_stride + v_head;
 #pragma unroll
         for (int i = 0; i < NF_FA_ACC_MAX; i++) {
             if (lid + i * NF_FA_WG < n_pairs) {
@@ -238,7 +259,7 @@ NF_INLINE void nf_fd_run(
                 const float2 fl = has_sinks ? nf_attn_sink(m, l, sinks[h]) : NF_F2(1.0f, l);
                 out[(nf_i64)out_off + (nf_i64)h * d_v + d] = fl.y > 0.0f ? o[i] * fl.x / fl.y : 0.0f;
             } else {
-                NF_GLOBAL float* pr = partial + ((nf_i64)h * n_split + split) * (d_v + 2);
+                NF_GLOBAL float* pr = partial + (((nf_i64)max(seq, 0) * n_head + h) * n_split + split) * (d_v + 2);
                 pr[d] = o[i];
                 if (d == 0) {
                     pr[d_v] = m;
@@ -281,7 +302,7 @@ NF_KERNEL void LLM_FlashDecode_##SFX(                                           
               scale, softcap, max_bias, causal, swa_type, n_swa, bias_mode, n_buckets,       \
               max_distance, has_sinks, direct_out, q_off, out_off,                           \
               q, (NF_GLOBAL const uchar*)k, (NF_GLOBAL const uchar*)v, kv_pos, sinks,         \
-              rel_bias, out, partial, KV_CODE, KV_CODE, smem, red, stats);                   \
+              rel_bias, out, partial, KV_CODE, KV_CODE, -1, kv_pos, 0, -1, smem, red, stats);  \
 }
 
 NF_FLASH_DECODE_KERNEL(F32, float, NF_KV_F32)
@@ -327,5 +348,187 @@ NF_KERNEL void LLM_FlashDecode_Mixed(
               scale, softcap, max_bias, causal, swa_type, n_swa, bias_mode, n_buckets,
               max_distance, has_sinks, direct_out, q_off, out_off,
               q, k, v, kv_pos, sinks, rel_bias, out, partial,
-              nf_attn_kv_type_k(kv_types), nf_attn_kv_type_v(kv_types), smem, red, stats);
+              nf_attn_kv_type_k(kv_types), nf_attn_kv_type_v(kv_types),
+              -1, kv_pos, 0, -1, smem, red, stats);
+}
+
+/*
+ * Paged decode over a paginated KV cache (MS-4): every sequence's rows live behind a page table
+ * page_table[s * maxPages .. ] (common/attn_common.h nf_kv_row), one page table per sequence.
+ */
+
+/* Plan constraints of LLM_FlashDecodePaged_*: those of LLM_FlashDecode_* plus the page geometry. page_shift is the
+ * log2 page size (0 = one row per page), bounded so the physical row stays an int; the strides must be positive;
+ * seq_kv_len[s] and the page table entries are validated on the host before the upload (MS-2, section 5.5.1). */
+NF_INLINE int nf_fd_paged_ok(int n_head, int n_head_kv, int d_k, int d_v, int g_tile, int n_split,
+                             int split_len, int direct_out, int k_type, int v_type,
+                             int page_shift, int max_pages, int n_seq, int q_seq_stride, int out_seq_stride) {
+    return page_shift >= 0 && page_shift <= 20 && max_pages >= 1 && n_seq >= 1
+        && q_seq_stride >= 0 && out_seq_stride >= 0
+        && nf_fd_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct_out, k_type, v_type);
+}
+
+/* NaN over the outputs of a paged call whose arguments violate the plan (workgroup (0, 0) only). The out stride of
+ * the direct-out case is n_head * d_v (the plan guarantees out_seq_stride >= n_head * d_v when the host reuses
+ * one dense output block per sequence). */
+NF_INLINE void nf_fd_paged_poison(int n_seq, int n_head, int d_v, int n_split, int direct_out, int out_off,
+                                  NF_GLOBAL float* out, NF_GLOBAL float* partial) {
+    if (get_group_id(0) != 0 || get_group_id(1) != 0 || n_seq <= 0 || n_head <= 0 || d_v <= 0 || n_split <= 0) {
+        return;
+    }
+    const int lid = (int)get_local_id(0);
+    const int lsz = (int)get_local_size(0);
+    if (direct_out) {
+        for (int s = 0; s < n_seq; s++) {
+            for (int i = lid; i < n_head * d_v; i += lsz) {
+                out[(nf_i64)out_off + (nf_i64)s * n_head * d_v + i] = NF_NAN;
+            }
+        }
+    } else {
+        const nf_i64 n = (nf_i64)n_seq * n_head * n_split * (d_v + 2);
+        for (nf_i64 i = lid; i < n; i += lsz) {
+            partial[i] = NF_NAN;
+        }
+    }
+}
+
+/*
+ * Full paged entry-point arguments: the LLM_FlashDecode_<KV> arguments in order (kv_start, kv_end and q_pos are
+ * ignored; the host passes 0), then page_shift, max_pages, n_seq, q_seq_stride, out_seq_stride and buffers
+ * page_table, seq_kv_len, q_pos_seq.
+ */
+#define NF_FLASH_DECODE_PAGED_RUN_ARGS_PAGED(KV_T)                                            \
+    const int n_head, const int n_head_kv, const int d_k, const int d_v, const int g_tile,     \
+    const int n_split, const int split_len, const int kv_start, const int kv_end,             \
+    const int q_pos,                                                                          \
+    const int k_row_stride, const int k_head_stride, const int v_row_stride,                  \
+    const int v_head_stride,                                                                  \
+    const float scale, const float softcap, const float max_bias,                             \
+    const int causal, const int swa_type, const int n_swa,                                    \
+    const int bias_mode, const int n_buckets, const int max_distance,                         \
+    const int has_sinks, const int direct_out, const int q_off, const int out_off,            \
+    const int page_shift, const int max_pages, const int n_seq,                               \
+    const int q_seq_stride, const int out_seq_stride,                                         \
+    NF_GLOBAL const float* q,                                                                 \
+    NF_GLOBAL const KV_T* k,                                                                  \
+    NF_GLOBAL const KV_T* v,                                                                  \
+    NF_GLOBAL const int* NF_RESTRICT kv_pos,                                                  \
+    NF_GLOBAL const float* NF_RESTRICT sinks,                                                 \
+    NF_GLOBAL const float* NF_RESTRICT rel_bias,                                              \
+    NF_GLOBAL float* out,                                                                     \
+    NF_GLOBAL float* partial,                                                                 \
+    NF_GLOBAL const int* NF_RESTRICT page_table,                                              \
+    NF_GLOBAL const int* NF_RESTRICT seq_kv_len,                                              \
+    NF_GLOBAL const int* NF_RESTRICT q_pos_seq
+
+/*
+ * Per workgroup: the sequence s, its slot range [0, kv_len) and its q / out blocks are resolved before
+ * nf_fd_run, which is the shared algorithm with page_shift >= 0 (K, V and kv_pos read at nf_kv_row(t),
+ * page ids below 0 masked, partial rows at s * n_head + h).
+ * kv_len = seq_kv_len[s] clamped to the page table's slots (maxPages << page_shift unreadable entries would be a
+ * host contract violation, section 5.5.1; the clamp keeps every page-table read in bounds).
+ */
+#define NF_FLASH_DECODE_PAGED_RUN_ARGS                                                       \
+    const int n_head, const int n_head_kv, const int d_k, const int d_v, const int g_tile,    \
+    const int n_split, const int split_len,                                                  \
+    const int k_row_stride, const int k_head_stride, const int v_row_stride,                  \
+    const int v_head_stride,                                                                 \
+    const float scale, const float softcap, const float max_bias,                            \
+    const int causal, const int swa_type, const int n_swa,                                   \
+    const int bias_mode, const int n_buckets, const int max_distance,                        \
+    const int has_sinks, const int direct_out, const int q_off, const int out_off,           \
+    const int page_shift, const int max_pages, const int n_seq,                              \
+    const int q_seq_stride, const int out_seq_stride,                                        \
+    NF_GLOBAL const float* q,                                                                \
+    NF_GLOBAL const uchar* k,                                                                \
+    NF_GLOBAL const uchar* v,                                                                \
+    NF_GLOBAL const int* NF_RESTRICT kv_pos,                                                 \
+    NF_GLOBAL const float* NF_RESTRICT sinks,                                                \
+    NF_GLOBAL const float* NF_RESTRICT rel_bias,                                             \
+    NF_GLOBAL float* out,                                                                    \
+    NF_GLOBAL float* partial,                                                                \
+    NF_GLOBAL const int* NF_RESTRICT page_table,                                             \
+    NF_GLOBAL const int* NF_RESTRICT seq_kv_len,                                             \
+    NF_GLOBAL const int* NF_RESTRICT q_pos_seq
+
+NF_INLINE void nf_fd_paged_run(
+    NF_FLASH_DECODE_PAGED_RUN_ARGS, const int k_type, const int v_type,
+    NF_LOCAL_PTR float* smem, NF_LOCAL_PTR float* red, NF_LOCAL_PTR float* stats)
+{
+    if (!nf_fd_paged_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct_out, k_type, v_type,
+                        page_shift, max_pages, n_seq, q_seq_stride, out_seq_stride)) {
+        nf_fd_paged_poison(n_seq, n_head, d_v, n_split, direct_out, out_off, out, partial);
+        return;   /* uniform across the workgroup: no barrier has been reached */
+    }
+
+    const int G = n_head / n_head_kv;
+    const int n_gt = (G + g_tile - 1) / g_tile;
+    const int gid = (int)get_group_id(1);
+    const int s = gid / (n_head_kv * n_gt);   /* the sequence is folded into dimension 1 in front */
+    const nf_i64 kv_cap = (nf_i64)max_pages << page_shift;
+    const int kv_len = seq_kv_len[s] < 0 ? 0
+                       : ((nf_i64)seq_kv_len[s] > kv_cap ? (int)kv_cap : seq_kv_len[s]);
+    /* The page table of sequence s starts at s * maxPages (PagedStep.pageTable(g), the host-validated
+     * int[nSeq x maxPages]; n_seq * maxPages fits int by the upload budget), so every row lookup lands in it. */
+    const int pt_off = s * max_pages;
+    nf_fd_run(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len,
+              0, kv_len, q_pos_seq[s],
+              k_row_stride, k_head_stride, v_row_stride, v_head_stride,
+              scale, softcap, max_bias, causal, swa_type, n_swa, bias_mode, n_buckets,
+              max_distance, has_sinks, direct_out, q_off + s * q_seq_stride, out_off + s * out_seq_stride,
+              q, k, v, kv_pos, sinks, rel_bias, out, partial, k_type, v_type,
+              page_shift, page_table, 0, s, smem, red, stats);
+}
+
+/*
+ * LLM_FlashDecodePaged_<KV>(32 scalars, 11 buffers): the arguments are those of LLM_FlashDecode_<KV>
+ * (kv_start, kv_end and q_pos are ignored there; the host passes 0), then page_shift, max_pages, n_seq,
+ * q_seq_stride, out_seq_stride and buffers page_table, seq_kv_len, q_pos_seq. k and v may be the same buffer
+ * (MLA latent cache); sinks, rel_bias, q_pos_seq and out are placeholders when unused.
+ * Grid: global {n_split * 128, n_seq * n_head_kv * ceil(G / g_tile)}, local {128, 1}.
+ */
+#define NF_FLASH_DECODE_PAGED_KERNEL(SFX, KV_T, KV_CODE)                                      \
+NF_KERNEL void LLM_FlashDecodePaged_##SFX(                                                    \
+    NF_FLASH_DECODE_PAGED_RUN_ARGS_PAGED(KV_T))                                               \
+{                                                                                             \
+    NF_LOCAL float smem[NF_FA_SMEM_FLOATS];                                                   \
+    NF_LOCAL float red[NF_FA_WG];                                                             \
+    NF_LOCAL float stats[3 * NF_FD_MAX_G];                                                    \
+    nf_fd_paged_run(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len,                   \
+                    k_row_stride, k_head_stride, v_row_stride, v_head_stride,                  \
+                    scale, softcap, max_bias, causal, swa_type, n_swa, bias_mode, n_buckets,   \
+                    max_distance, has_sinks, direct_out, q_off, out_off,                       \
+                    page_shift, max_pages, n_seq, q_seq_stride, out_seq_stride,                \
+                    q, (NF_GLOBAL const uchar*)k, (NF_GLOBAL const uchar*)v, kv_pos,            \
+                    sinks, rel_bias, out, partial, page_table, seq_kv_len, q_pos_seq,          \
+                    KV_CODE, KV_CODE, smem, red, stats);                                       \
+}
+
+NF_FLASH_DECODE_PAGED_KERNEL(F32, float, NF_KV_F32)
+NF_FLASH_DECODE_PAGED_KERNEL(F16, NF_HALF, NF_KV_F16)
+NF_FLASH_DECODE_PAGED_KERNEL(Q8_0, uchar, NF_KV_Q8_0)
+NF_FLASH_DECODE_PAGED_KERNEL(BF16, ushort, NF_KV_BF16)
+NF_FLASH_DECODE_PAGED_KERNEL(Q4_0, uchar, NF_KV_Q4_0)
+NF_FLASH_DECODE_PAGED_KERNEL(Q4_1, uchar, NF_KV_Q4_1)
+NF_FLASH_DECODE_PAGED_KERNEL(IQ4_NL, uchar, NF_KV_IQ4_NL)
+NF_FLASH_DECODE_PAGED_KERNEL(Q5_0, uchar, NF_KV_Q5_0)
+NF_FLASH_DECODE_PAGED_KERNEL(Q5_1, uchar, NF_KV_Q5_1)
+
+/*
+ * LLM_FlashDecodePaged_Mixed(33 scalars, 11 buffers): LLM_FlashDecodePaged_<KV> over a K cache and a V cache of
+ * different types. The arguments are those of LLM_FlashDecodePaged_<KV> followed by kv_types (common/attn_common.h)
+ * after the buffers; k and v are byte buffers. A malformed kv_types violates the plan and writes NaN outputs.
+ */
+NF_KERNEL void LLM_FlashDecodePaged_Mixed(NF_FLASH_DECODE_PAGED_RUN_ARGS_PAGED(uchar), const int kv_types)
+{
+    NF_LOCAL float smem[NF_FA_SMEM_FLOATS];
+    NF_LOCAL float red[NF_FA_WG];
+    NF_LOCAL float stats[3 * NF_FD_MAX_G];
+    nf_fd_paged_run(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len,
+                    k_row_stride, k_head_stride, v_row_stride, v_head_stride,
+                    scale, softcap, max_bias, causal, swa_type, n_swa, bias_mode, n_buckets,
+                    max_distance, has_sinks, direct_out, q_off, out_off,
+                    page_shift, max_pages, n_seq, q_seq_stride, out_seq_stride,
+                    q, k, v, kv_pos, sinks, rel_bias, out, partial, page_table, seq_kv_len,
+                    q_pos_seq, nf_attn_kv_type_k(kv_types), nf_attn_kv_type_v(kv_types), smem, red, stats);
 }

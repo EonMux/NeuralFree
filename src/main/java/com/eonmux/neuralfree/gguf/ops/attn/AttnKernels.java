@@ -28,6 +28,13 @@ import java.util.Objects;
  *       {@link #flashAttn(KvDType, KvDType)} and {@link #withKvTypes} select the kernel and its arguments, so the
  *       same-type kernels stay the path of equal types;</li>
  *   <li>{@code swa_type} is {@code SwaType.code()}, {@code bias_mode} is {@code AttentionSpec.BiasMode.code()};</li>
+ *   <li>over a paginated cache, {@link #FLASH_DECODE_PAGED_PREFIX} / {@link #FLASH_ATTN_PAGED_PREFIX} address K, V
+ *       and {@code kv_pos} at the physical row {@code r = (page << page_shift) | (slot & ((1 << page_shift) - 1))}
+ *       of {@code common/attn_common.h} nf_kv_row: the paged decode takes the base decode arguments, then the page
+ *       geometry and the per-sequence buffers (the {@code ARG_FDP_*} indices; {@code page_table} is the
+ *       {@code int[nSeq x maxPages]} of {@code PagedStep.pageTable(g)}), and the paged prefill takes the base
+ *       prefill arguments, then {@code page_shift}, {@code pt_off} and {@code page_table} (a page id below 0 masks
+ *       the slot's keys, never required). The base kernels are the identity map {@code page_shift = -1};</li>
  *   <li>{@code kv_pos[row]} is the position stored in a cache row, -1 for an empty row;</li>
  *   <li>unused {@code sinks}, {@code rel_bias} and {@code partial} buffers are bound to placeholders
  *       (read-only for the first two, writable for {@code partial});</li>
@@ -46,6 +53,14 @@ public final class AttnKernels {
     public static final String FLASH_DECODE_MIXED = "LLM_FlashDecode_Mixed";
     /** Prefill kernel over K and V caches of different types: the {@code LLM_FlashAttn_<KV>} arguments + kv_types. */
     public static final String FLASH_ATTN_MIXED = "LLM_FlashAttn_Mixed";
+    /** Name prefix of the paged decode variants over the batch's sequences ({@code PagedStep.pageTable(g)}). */
+    public static final String FLASH_DECODE_PAGED_PREFIX = "LLM_FlashDecodePaged_";
+    /** Name prefix of the paged prefill variants over one paginated KV segment. */
+    public static final String FLASH_ATTN_PAGED_PREFIX = "LLM_FlashAttnPaged_";
+    /** Paged decode over K and V caches of different types: the {@code LLM_FlashDecodePaged_<KV>} args + kv_types. */
+    public static final String FLASH_DECODE_PAGED_MIXED = "LLM_FlashDecodePaged_Mixed";
+    /** Paged prefill over K and V caches of different types: the {@code LLM_FlashAttnPaged_<KV>} args + kv_types. */
+    public static final String FLASH_ATTN_PAGED_MIXED = "LLM_FlashAttnPaged_Mixed";
 
     /** Bits of one type code in the packed {@code kv_types} argument ({@code NF_ATTN_KV_TYPE_BITS}). */
     public static final int KV_TYPE_BITS = 8;
@@ -58,6 +73,10 @@ public final class AttnKernels {
         all.addAll(KvDType.kernelVariants(FLASH_ATTN_PREFIX));
         all.add(FLASH_ATTN_MIXED);
         all.add(FLASH_COMBINE);
+        all.addAll(KvDType.kernelVariants(FLASH_DECODE_PAGED_PREFIX));
+        all.add(FLASH_DECODE_PAGED_MIXED);
+        all.addAll(KvDType.kernelVariants(FLASH_ATTN_PAGED_PREFIX));
+        all.add(FLASH_ATTN_PAGED_MIXED);
         ALL = Collections.unmodifiableList(all);
     }
 
@@ -166,6 +185,67 @@ public final class AttnKernels {
     public static final int FA_MIXED_SCALAR_COUNT = 32;
     public static final int FA_MIXED_ARG_COUNT = 41;
 
+    // ---- LLM_FlashDecodePaged_*: 32 scalars, then 11 buffers ----
+    /**
+     * Paged decode over the batch's sequences one launch ({@code LLM_FlashDecodePaged_<KV>}): the
+     * {@code LLM_FlashDecode_<KV>} arguments in order (their {@code kv_start}, {@code kv_end} and {@code q_pos} are
+     * ignored; the host passes 0), then the page geometry and the per-sequence buffers:
+     * {@code page_shift} (log2 page size), {@code max_pages} (page-table entries per sequence:
+     * {@code PagedStep.maxPages()}), {@code n_seq}, {@code q_seq_stride}, {@code out_seq_stride}, and buffers
+     * {@code page_table} (the host-validated int[nSeq x maxPages], sequence {@code s}'s block at
+     * {@code s * max_pages}), {@code seq_kv_len} (per-sequence slot count), {@code q_pos_seq} (per-sequence query
+     * position). {@code kv_start}/{@code kv_end}/{@code q_pos} and the buffers they address stay in the list so
+     * the same-type argument list is the base decode list's prefix.
+     */
+    public static final int ARG_FDP_PAGE_SHIFT = 27;
+    public static final int ARG_FDP_MAX_PAGES = 28;
+    public static final int ARG_FDP_N_SEQ = 29;
+    public static final int ARG_FDP_Q_SEQ_STRIDE = 30;
+    public static final int ARG_FDP_OUT_SEQ_STRIDE = 31;
+    public static final int ARG_FDP_BUF_Q = 32;
+    public static final int ARG_FDP_BUF_K = 33;
+    public static final int ARG_FDP_BUF_V = 34;
+    public static final int ARG_FDP_BUF_KV_POS = 35;
+    public static final int ARG_FDP_BUF_SINKS = 36;
+    public static final int ARG_FDP_BUF_REL_BIAS = 37;
+    public static final int ARG_FDP_BUF_OUT = 38;
+    public static final int ARG_FDP_BUF_PARTIAL = 39;
+    public static final int ARG_FDP_BUF_PAGE_TABLE = 40;
+    public static final int ARG_FDP_BUF_SEQ_KV_LEN = 41;
+    public static final int ARG_FDP_BUF_Q_POS_SEQ = 42;
+    public static final int FDP_SCALAR_COUNT = 32;
+    public static final int FDP_ARG_COUNT = 43;
+    /** {@link #FLASH_DECODE_PAGED_MIXED} only: {@link #kvTypes} of the K and V caches, after the buffers. */
+    public static final int ARG_FDP_KV_TYPES = 43;
+    public static final int FDP_MIXED_SCALAR_COUNT = 33;
+    public static final int FDP_MIXED_ARG_COUNT = 44;
+
+    // ---- LLM_FlashAttnPaged_*: 33 scalars, then 10 buffers ----
+    /**
+     * Paged prefill over one multi-token segment of a paginated KV cache ({@code LLM_FlashAttnPaged_<KV>}): the
+     * {@code LLM_FlashAttn_<KV>} arguments in order (their {@code kv_start} / {@code kv_end} count slots in the
+     * segment), then {@code page_shift} (log2 page size) and {@code pt_off} (the element offset of the segment's
+     * page-table block in {@code page_table}, the segment's sequence resolved by the caller).
+     */
+    public static final int ARG_FAP_PAGE_SHIFT = 31;
+    public static final int ARG_FAP_PT_OFF = 32;
+    public static final int ARG_FAP_BUF_Q = 33;
+    public static final int ARG_FAP_BUF_K = 34;
+    public static final int ARG_FAP_BUF_V = 35;
+    public static final int ARG_FAP_BUF_Q_POS = 36;
+    public static final int ARG_FAP_BUF_KV_POS = 37;
+    public static final int ARG_FAP_BUF_SINKS = 38;
+    public static final int ARG_FAP_BUF_REL_BIAS = 39;
+    public static final int ARG_FAP_BUF_OUT = 40;
+    public static final int ARG_FAP_BUF_PARTIAL = 41;
+    public static final int ARG_FAP_BUF_PAGE_TABLE = 42;
+    public static final int FAP_SCALAR_COUNT = 33;
+    public static final int FAP_ARG_COUNT = 43;
+    /** {@link #FLASH_ATTN_PAGED_MIXED} only: {@link #kvTypes} of the K and V caches, after the buffers. */
+    public static final int ARG_FAP_KV_TYPES = 43;
+    public static final int FAP_MIXED_SCALAR_COUNT = 34;
+    public static final int FAP_MIXED_ARG_COUNT = 44;
+
     // ---- LLM_FlashAttn_Combine: 6 scalars, then 3 buffers ----
     /** Per call: rows to merge (heads for decode, tokens x heads for prefill). */
     public static final int ARG_FC_N_ROWS = 0;
@@ -243,6 +323,49 @@ public final class AttnKernels {
 
     private static boolean mixed(KvDType k, KvDType v) {
         return Objects.requireNonNull(k, "k") != Objects.requireNonNull(v, "v");
+    }
+
+    /** Paged decode kernel for a KV element type: one launch over the batch's decode sequences. */
+    public static String flashDecodePaged(KvDType kv) {
+        return Objects.requireNonNull(kv, "kv").kernel(FLASH_DECODE_PAGED_PREFIX);
+    }
+
+    /** Paged tiled prefill kernel for a KV element type: one launch per multi-token segment. */
+    public static String flashAttnPaged(KvDType kv) {
+        return Objects.requireNonNull(kv, "kv").kernel(FLASH_ATTN_PAGED_PREFIX);
+    }
+
+    /** Paged decode kernel for a K cache of type {@code k} and a V cache of type {@code v} (as {@link #flashDecode(KvDType, KvDType)}). */
+    public static String flashDecodePaged(KvDType k, KvDType v) {
+        return mixed(k, v) ? FLASH_DECODE_PAGED_MIXED : flashDecodePaged(k);
+    }
+
+    /** Paged prefill kernel for a K cache of type {@code k} and a V cache of type {@code v} (as {@link #flashAttn(KvDType, KvDType)}). */
+    public static String flashAttnPaged(KvDType k, KvDType v) {
+        return mixed(k, v) ? FLASH_ATTN_PAGED_MIXED : flashAttnPaged(k);
+    }
+
+    /**
+     * Arguments of the paged kernel that {@link #flashDecodePaged(KvDType, KvDType)} or
+     * {@link #flashAttnPaged(KvDType, KvDType)} selects, built from the same-type paged argument list {@code args}
+     * (all {@link #FDP_ARG_COUNT} or {@link #FAP_ARG_COUNT} arguments in signature order): {@code args} itself when
+     * {@code k == v}, otherwise a copy with {@link #kvTypes} appended at {@link #ARG_FDP_KV_TYPES} /
+     * {@link #ARG_FAP_KV_TYPES}.
+     *
+     * @throws IllegalArgumentException when {@code args} is not a paged decode or paged prefill argument list
+     */
+    public static Object[] pagedWithKvTypes(Object[] args, KvDType k, KvDType v) {
+        Objects.requireNonNull(args, "args");
+        if (args.length != FDP_ARG_COUNT && args.length != FAP_ARG_COUNT) {
+            throw new IllegalArgumentException("paged flash attention takes " + FDP_ARG_COUNT + " (paged decode) or "
+                    + FAP_ARG_COUNT + " (paged prefill) arguments before kv_types, got " + args.length);
+        }
+        if (!mixed(k, v)) {
+            return args;
+        }
+        Object[] out = Arrays.copyOf(args, args.length + 1);
+        out[args.length] = kvTypes(k, v);
+        return out;
     }
 
     /** Every kernel of this family, for {@code LlmKernels.prewarm}. */

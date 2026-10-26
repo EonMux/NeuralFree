@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.engine;
 import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
@@ -32,13 +33,30 @@ public final class SamplerConfig {
     /** The settings a model's sampling defaults can supply. */
     public enum Setting {
         TEMPERATURE, TOP_K, TOP_P, MIN_P, TYPICAL_P, REPEAT_PENALTY, PENALTY_LAST_N, PRESENCE_PENALTY,
-        FREQUENCY_PENALTY, SEQUENCE
+        FREQUENCY_PENALTY, SEQUENCE, MIROSTAT, MIROSTAT_TAU, MIROSTAT_ETA, XTC_PROBABILITY, XTC_THRESHOLD
     }
 
     /** Seed value meaning "draw a fresh random seed per generation". */
     public static final long RANDOM_SEED = -1L;
     /** {@code penaltyLastN} value meaning "the whole context". */
     public static final int PENALTY_WHOLE_CONTEXT = -1;
+    /** llama.cpp's default DRY sequence breakers ({@code "\n", ":", '"', "*"}). */
+    public static final List<String> DRY_DEFAULT_BREAKERS =
+            Collections.unmodifiableList(Arrays.asList("\n", ":", "\"", "*"));
+    /** llama.cpp's default DRY base ({@code dry_base}). */
+    public static final float DRY_DEFAULT_BASE = 1.75f;
+    /** llama.cpp's default DRY allowed length ({@code dry_allowed_length}). */
+    public static final int DRY_DEFAULT_ALLOWED_LENGTH = 2;
+    /** llama.cpp's default DRY window ({@code dry_penalty_last_n}). */
+    public static final int DRY_DEFAULT_LAST_N = 64;
+    /** llama.cpp's default XTC threshold ({@code xtc_threshold}; above 0.5 is the disabled marker). */
+    public static final float XTC_DEFAULT_THRESHOLD = 0.10f;
+    /** llama.cpp's default mirostat target entropy ({@code mirostat_tau}). */
+    public static final float MIROSTAT_DEFAULT_TAU = 5.0f;
+    /** llama.cpp's default mirostat learning rate ({@code mirostat_eta}). */
+    public static final float MIROSTAT_DEFAULT_ETA = 0.10f;
+    /** Mirostat disabled ({@code mirostat = 0}). */
+    public static final int MIROSTAT_OFF = 0;
 
     public static final String PROP_TEMPERATURE = "neuralfree.temp";
     public static final String PROP_TOP_K = "neuralfree.top.k";
@@ -53,6 +71,23 @@ public final class SamplerConfig {
     public static final String PROP_SEED = "neuralfree.seed";
     public static final String PROP_GREEDY = "neuralfree.greedy";
     public static final String PROP_SAMPLERS = "neuralfree.samplers";
+    // llama.cpp's sampler flags, as SA-2's stage parameters (the only one is a repeated CLI flag, folded here into a
+    // ','-separated list: a sequence breaker keeps its ',' characters, the list boundaries cannot)
+    public static final String PROP_DRY_MULTIPLIER = "neuralfree.dry.multiplier";
+    public static final String PROP_DRY_BASE = "neuralfree.dry.base";
+    public static final String PROP_DRY_ALLOWED_LENGTH = "neuralfree.dry.allowed.length";
+    public static final String PROP_DRY_PENALTY_LAST_N = "neuralfree.dry.penalty.last.n";
+    public static final String PROP_DRY_SEQUENCE_BREAKERS = "neuralfree.dry.sequence.breakers";
+    public static final String PROP_TOP_N_SIGMA = "neuralfree.top.n.sigma";
+    public static final String PROP_XTC_PROBABILITY = "neuralfree.xtc.probability";
+    public static final String PROP_XTC_THRESHOLD = "neuralfree.xtc.threshold";
+    public static final String PROP_MIROSTAT = "neuralfree.mirostat";
+    public static final String PROP_MIROSTAT_TAU = "neuralfree.mirostat.tau";
+    public static final String PROP_MIROSTAT_ETA = "neuralfree.mirostat.eta";
+    public static final String PROP_DYNATEMP_RANGE = "neuralfree.dynatemp.range";
+    public static final String PROP_DYNATEMP_EXPONENT = "neuralfree.dynatemp.exponent";
+    public static final String PROP_ADAPTIVE_TARGET = "neuralfree.adaptive.target";
+    public static final String PROP_ADAPTIVE_DECAY = "neuralfree.adaptive.decay";
 
     private static final SamplerConfig DEFAULTS = builder().build();
 
@@ -69,6 +104,21 @@ public final class SamplerConfig {
     private final long seed;
     private final boolean greedy;
     private final List<StageKind> order;
+    private final float dryMultiplier;
+    private final float dryBase;
+    private final int dryAllowedLength;
+    private final int dryPenaltyLastN;
+    private final List<String> drySequenceBreakers;
+    private final float topNSigma;
+    private final float xtcProbability;
+    private final float xtcThreshold;
+    private final int mirostat;
+    private final float mirostatTau;
+    private final float mirostatEta;
+    private final float dynatempRange;
+    private final float dynatempExponent;
+    private final float adaptiveTarget;
+    private final float adaptiveDecay;
     private final Set<Setting> explicit;
 
     private SamplerConfig(Builder b) {
@@ -85,6 +135,21 @@ public final class SamplerConfig {
         this.seed = b.seed;
         this.greedy = b.greedy;
         this.order = b.order;
+        this.dryMultiplier = b.dryMultiplier;
+        this.dryBase = b.dryBase;
+        this.dryAllowedLength = b.dryAllowedLength;
+        this.dryPenaltyLastN = b.dryPenaltyLastN;
+        this.drySequenceBreakers = b.drySequenceBreakers;
+        this.topNSigma = b.topNSigma;
+        this.xtcProbability = b.xtcProbability;
+        this.xtcThreshold = b.xtcThreshold;
+        this.mirostat = b.mirostat;
+        this.mirostatTau = b.mirostatTau;
+        this.mirostatEta = b.mirostatEta;
+        this.dynatempRange = b.dynatempRange;
+        this.dynatempExponent = b.dynatempExponent;
+        this.adaptiveTarget = b.adaptiveTarget;
+        this.adaptiveDecay = b.adaptiveDecay;
         this.explicit = Collections.unmodifiableSet(EnumSet.copyOf(b.explicit));
     }
 
@@ -129,6 +194,32 @@ public final class SamplerConfig {
                 throw new IllegalArgumentException(PROP_SAMPLERS + ": " + e.getMessage(), e);
             }
         }
+        floatProperty(p, PROP_DRY_MULTIPLIER, b::dryMultiplier);
+        floatProperty(p, PROP_DRY_BASE, b::dryBase);
+        intProperty(p, PROP_DRY_ALLOWED_LENGTH, b::dryAllowedLength);
+        intProperty(p, PROP_DRY_PENALTY_LAST_N, b::dryPenaltyLastN);
+        String breakers = EngineConfig.stringProperty(p, PROP_DRY_SEQUENCE_BREAKERS);
+        if (breakers != null) {
+            List<String> list = new ArrayList<>();
+            for (String part : breakers.split(",", -1)) {
+                if (part.isEmpty()) {
+                    throw new IllegalArgumentException(
+                            PROP_DRY_SEQUENCE_BREAKERS + " has an empty breaker in '" + breakers + "'");
+                }
+                list.add(part);
+            }
+            b.drySequenceBreakers(list);
+        }
+        floatProperty(p, PROP_TOP_N_SIGMA, b::topNSigma);
+        floatProperty(p, PROP_XTC_PROBABILITY, b::xtcProbability);
+        floatProperty(p, PROP_XTC_THRESHOLD, b::xtcThreshold);
+        intProperty(p, PROP_MIROSTAT, b::mirostat);
+        floatProperty(p, PROP_MIROSTAT_TAU, b::mirostatTau);
+        floatProperty(p, PROP_MIROSTAT_ETA, b::mirostatEta);
+        floatProperty(p, PROP_DYNATEMP_RANGE, b::dynatempRange);
+        floatProperty(p, PROP_DYNATEMP_EXPONENT, b::dynatempExponent);
+        floatProperty(p, PROP_ADAPTIVE_TARGET, b::adaptiveTarget);
+        floatProperty(p, PROP_ADAPTIVE_DECAY, b::adaptiveDecay);
         return b.seed(EngineConfig.longProperty(p, PROP_SEED, b.seed))
                 .greedy(EngineConfig.booleanProperty(p, PROP_GREEDY, b.greedy))
                 .build();
@@ -177,6 +268,37 @@ public final class SamplerConfig {
     /** llama.cpp's chain order (unmodifiable); {@link StageKind#DEFAULT_ORDER} unless configured otherwise. */
     public List<StageKind> order() { return order; }
 
+    /** DRY repetition strength ({@code --dry-multiplier}); 0 disables the stage. */
+    public float dryMultiplier() { return dryMultiplier; }
+    /** DRY base of the exponential penalty ({@code --dry-base}); below 1 disables the stage. */
+    public float dryBase() { return dryBase; }
+    /** DRY repeated suffix length the penalty starts at ({@code --dry-allowed-length}). */
+    public int dryAllowedLength() { return dryAllowedLength; }
+    /** DRY window of accepted tokens ({@code --dry-penalty-last-n}); 0 disables the stage. */
+    public int dryPenaltyLastN() { return dryPenaltyLastN; }
+    /** DRY restart sequences ({@code --dry-sequence-breaker}, unmodifiable), llama.cpp's defaults unless set. */
+    public List<String> drySequenceBreakers() { return drySequenceBreakers; }
+    /** top-n-sigma's n ({@code --top-n-sigma}); 0 and below disables the stage. */
+    public float topNSigma() { return topNSigma; }
+    /** XTC's trim trigger probability ({@code --xtc-probability}); 0 disables the stage. */
+    public float xtcProbability() { return xtcProbability; }
+    /** XTC's probability threshold ({@code --xtc-threshold}); above 0.5 disables the stage. */
+    public float xtcThreshold() { return xtcThreshold; }
+    /** Mirostat version: {@link #MIROSTAT_OFF} (0), 1 or 2 ({@code --mirostat}). */
+    public int mirostat() { return mirostat; }
+    /** Mirostat target entropy ({@code --mirostat-ent}). */
+    public float mirostatTau() { return mirostatTau; }
+    /** Mirostat learning rate ({@code --mirostat-lr}). */
+    public float mirostatEta() { return mirostatEta; }
+    /** Dynamic temperature half-width ({@code --dynatemp-range}); 0 keeps the plain scaling. */
+    public float dynatempRange() { return dynatempRange; }
+    /** Dynamic temperature entropy exponent ({@code --dynatemp-exponent}). */
+    public float dynatempExponent() { return dynatempExponent; }
+    /** adaptive-p's target probability ({@code --adaptive-target}); negative disables the adaptation. */
+    public float adaptiveTarget() { return adaptiveTarget; }
+    /** adaptive-p's EMA decay ({@code --adaptive-decay}). */
+    public float adaptiveDecay() { return adaptiveDecay; }
+
     /** The settings given explicitly (unmodifiable); a model's sampling defaults never replace them. */
     public Set<Setting> explicit() { return explicit; }
 
@@ -216,6 +338,21 @@ public final class SamplerConfig {
         b.seed = seed;
         b.greedy = greedy;
         b.order = order;
+        b.dryMultiplier = dryMultiplier;
+        b.dryBase = dryBase;
+        b.dryAllowedLength = dryAllowedLength;
+        b.dryPenaltyLastN = dryPenaltyLastN;
+        b.drySequenceBreakers = drySequenceBreakers;
+        b.topNSigma = topNSigma;
+        b.xtcProbability = xtcProbability;
+        b.xtcThreshold = xtcThreshold;
+        b.mirostat = mirostat;
+        b.mirostatTau = mirostatTau;
+        b.mirostatEta = mirostatEta;
+        b.dynatempRange = dynatempRange;
+        b.dynatempExponent = dynatempExponent;
+        b.adaptiveTarget = adaptiveTarget;
+        b.adaptiveDecay = adaptiveDecay;
         b.explicit.addAll(explicit);
         return b;
     }
@@ -267,6 +404,21 @@ public final class SamplerConfig {
         if (defaults.sequence() != null && !explicit.contains(Setting.SEQUENCE)) {
             b.fallbackSamplers(defaults.sequence());
         }
+        if (defaults.mirostat() != null && !explicit.contains(Setting.MIROSTAT)) {
+            b.fallbackMirostat(defaults.mirostat());
+        }
+        if (defaults.mirostatTau() != null && !explicit.contains(Setting.MIROSTAT_TAU)) {
+            b.fallbackMirostatTau(defaults.mirostatTau());
+        }
+        if (defaults.mirostatEta() != null && !explicit.contains(Setting.MIROSTAT_ETA)) {
+            b.fallbackMirostatEta(defaults.mirostatEta());
+        }
+        if (defaults.xtcProbability() != null && !explicit.contains(Setting.XTC_PROBABILITY)) {
+            b.fallbackXtcProbability(defaults.xtcProbability());
+        }
+        if (defaults.xtcThreshold() != null && !explicit.contains(Setting.XTC_THRESHOLD)) {
+            b.fallbackXtcThreshold(defaults.xtcThreshold());
+        }
         return b.build();
     }
 
@@ -296,6 +448,22 @@ public final class SamplerConfig {
         private long seed = RANDOM_SEED;
         private boolean greedy;
         private List<StageKind> order = StageKind.DEFAULT_ORDER;
+        // llama.cpp's CLI defaults (common_params_sampling)
+        private float dryMultiplier = 0.0f;
+        private float dryBase = DRY_DEFAULT_BASE;
+        private int dryAllowedLength = DRY_DEFAULT_ALLOWED_LENGTH;
+        private int dryPenaltyLastN = DRY_DEFAULT_LAST_N;
+        private List<String> drySequenceBreakers = DRY_DEFAULT_BREAKERS;
+        private float topNSigma = 0.0f;
+        private float xtcProbability = 0.0f;
+        private float xtcThreshold = XTC_DEFAULT_THRESHOLD;
+        private int mirostat = MIROSTAT_OFF;
+        private float mirostatTau = MIROSTAT_DEFAULT_TAU;
+        private float mirostatEta = MIROSTAT_DEFAULT_ETA;
+        private float dynatempRange = 0.0f;
+        private float dynatempExponent = 1.0f;
+        private float adaptiveTarget = -1.0f;
+        private float adaptiveDecay = 0.90f;
         private final EnumSet<Setting> explicit = EnumSet.noneOf(Setting.class);
 
         private Builder() {
@@ -313,6 +481,51 @@ public final class SamplerConfig {
         public Builder minKeep(int v) { this.minKeep = v; return this; }
         public Builder seed(long v) { this.seed = v; return this; }
         public Builder greedy(boolean v) { this.greedy = v; return this; }
+
+        /** DRY repetition strength ({@code neuralfree.dry.multiplier}); 0 disables the stage. */
+        public Builder dryMultiplier(float v) { this.dryMultiplier = v; return this; }
+        /** DRY base of the exponential penalty ({@code neuralfree.dry.base}); below 1 disables the stage. */
+        public Builder dryBase(float v) { this.dryBase = v; return this; }
+        /** DRY length the penalty starts at ({@code neuralfree.dry.allowed.length}). */
+        public Builder dryAllowedLength(int v) { this.dryAllowedLength = v; return this; }
+        /** DRY window of accepted tokens ({@code neuralfree.dry.penalty.last.n}); 0 disables the stage. */
+        public Builder dryPenaltyLastN(int v) { this.dryPenaltyLastN = v; return this; }
+        /** DRY restart sequences ({@code neuralfree.dry.sequence.breakers}); llama.cpp's defaults unless set. */
+        public Builder drySequenceBreakers(List<String> v) {
+            this.drySequenceBreakers = Collections.unmodifiableList(new ArrayList<>(Objects.requireNonNull(v, "sequence breakers")));
+            return this;
+        }
+        /** top-n-sigma's n ({@code neuralfree.top.n.sigma}); 0 and below disables the stage. */
+        public Builder topNSigma(float v) { this.topNSigma = v; return this; }
+        /** XTC's trim probability ({@code neuralfree.xtc.probability}); 0 disables the stage. */
+        public Builder xtcProbability(float v) { this.xtcProbability = v; return mark(Setting.XTC_PROBABILITY); }
+        /** XTC's probability threshold ({@code neuralfree.xtc.threshold}); above 0.5 disables the stage. */
+        public Builder xtcThreshold(float v) { this.xtcThreshold = v; return mark(Setting.XTC_THRESHOLD); }
+        /** Mirostat version: {@link #MIROSTAT_OFF} (0), 1 or 2 ({@code neuralfree.mirostat}). */
+        public Builder mirostat(int v) { this.mirostat = v; return mark(Setting.MIROSTAT); }
+        /** Mirostat target entropy ({@code neuralfree.mirostat.tau}). */
+        public Builder mirostatTau(float v) { this.mirostatTau = v; return mark(Setting.MIROSTAT_TAU); }
+        /** Mirostat learning rate ({@code neuralfree.mirostat.eta}). */
+        public Builder mirostatEta(float v) { this.mirostatEta = v; return mark(Setting.MIROSTAT_ETA); }
+        /** Dynamic temperature half-width ({@code neuralfree.dynatemp.range}); 0 keeps the plain scaling. */
+        public Builder dynatempRange(float v) { this.dynatempRange = v; return this; }
+        /** Dynamic temperature entropy exponent ({@code neuralfree.dynatemp.exponent}). */
+        public Builder dynatempExponent(float v) { this.dynatempExponent = v; return this; }
+        /** adaptive-p's target probability ({@code neuralfree.adaptive.target}); negative disables the adaptation. */
+        public Builder adaptiveTarget(float v) { this.adaptiveTarget = v; return this; }
+        /** adaptive-p's EMA decay ({@code neuralfree.adaptive.decay}). */
+        public Builder adaptiveDecay(float v) { this.adaptiveDecay = v; return this; }
+
+        /** {@link #mirostat(int)} leaving {@link Setting#MIROSTAT} a fallback for a model's default. */
+        public Builder fallbackMirostat(int v) { this.mirostat = v; return unmark(Setting.MIROSTAT); }
+        /** {@link #mirostatTau(float)} leaving {@link Setting#MIROSTAT_TAU} a fallback. */
+        public Builder fallbackMirostatTau(float v) { this.mirostatTau = v; return unmark(Setting.MIROSTAT_TAU); }
+        /** {@link #mirostatEta(float)} leaving {@link Setting#MIROSTAT_ETA} a fallback. */
+        public Builder fallbackMirostatEta(float v) { this.mirostatEta = v; return unmark(Setting.MIROSTAT_ETA); }
+        /** {@link #xtcProbability(float)} leaving {@link Setting#XTC_PROBABILITY} a fallback. */
+        public Builder fallbackXtcProbability(float v) { this.xtcProbability = v; return unmark(Setting.XTC_PROBABILITY); }
+        /** {@link #xtcThreshold(float)} leaving {@link Setting#XTC_THRESHOLD} a fallback. */
+        public Builder fallbackXtcThreshold(float v) { this.xtcThreshold = v; return unmark(Setting.XTC_THRESHOLD); }
 
         /** llama.cpp's chain order ({@code neuralfree.samplers}); the kind, not the fixed bias or dist stage. */
         public Builder samplers(List<StageKind> order) {
@@ -400,6 +613,44 @@ public final class SamplerConfig {
             }
             if (seed < RANDOM_SEED) {
                 throw new IllegalArgumentException("seed must be >= 0, or -1 for a random seed, got " + seed);
+            }
+            requireFinite("dryMultiplier", dryMultiplier);
+            requireFinite("dryBase", dryBase);
+            if (dryAllowedLength < 0) {
+                throw new IllegalArgumentException(
+                        PROP_DRY_ALLOWED_LENGTH + " must be >= 0, got " + dryAllowedLength);
+            }
+            if (dryPenaltyLastN < 0) {
+                throw new IllegalArgumentException(
+                        PROP_DRY_PENALTY_LAST_N + " must be >= 0 (0 = disabled), got " + dryPenaltyLastN);
+            }
+            requireFinite("topNSigma", topNSigma);
+            requireUnit("xtcProbability", xtcProbability);
+            requireUnit("xtcThreshold", xtcThreshold);
+            if (mirostat < MIROSTAT_OFF || mirostat > 2) {
+                throw new IllegalArgumentException(
+                        PROP_MIROSTAT + " must be 0 (off), 1 or 2, got " + mirostat);
+            }
+            requireFinite("mirostatTau", mirostatTau);
+            if (mirostatTau <= 0f) {
+                throw new IllegalArgumentException(PROP_MIROSTAT_TAU + " must be > 0, got " + mirostatTau);
+            }
+            requireFinite("mirostatEta", mirostatEta);
+            if (mirostatEta <= 0f) {
+                throw new IllegalArgumentException(PROP_MIROSTAT_ETA + " must be > 0, got " + mirostatEta);
+            }
+            if (dynatempRange < 0f) {
+                throw new IllegalArgumentException(PROP_DYNATEMP_RANGE + " must be >= 0 (0 = off), got " + dynatempRange);
+            }
+            requireFinite("dynatempExponent", dynatempExponent);
+            if (dynatempExponent < 0f) {
+                throw new IllegalArgumentException(
+                        PROP_DYNATEMP_EXPONENT + " must be >= 0, got " + dynatempExponent);
+            }
+            requireFinite("adaptiveTarget", adaptiveTarget);
+            requireFinite("adaptiveDecay", adaptiveDecay);
+            if (!(adaptiveDecay >= 0f && adaptiveDecay <= 1f)) {
+                throw new IllegalArgumentException(PROP_ADAPTIVE_DECAY + " must be in [0, 1], got " + adaptiveDecay);
             }
             return new SamplerConfig(this);
         }

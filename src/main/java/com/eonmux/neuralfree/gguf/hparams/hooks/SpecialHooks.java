@@ -38,7 +38,7 @@ public final class SpecialHooks {
     }
 
     /** Format error prefixed with the architecture name. */
-    static GgufFormatException invalid(ModelHparamsBuilder b, String message) {
+    public static GgufFormatException invalid(ModelHparamsBuilder b, String message) {
         return new GgufFormatException(b.arch().ggufName() + ": " + message);
     }
 

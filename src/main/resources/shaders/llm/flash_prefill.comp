@@ -1,18 +1,24 @@
 /* flash_prefill.comp - LLM_FlashAttn_<KV> and LLM_FlashAttn_Mixed tiled prefill attention (GLSL twin of
- * kernels/llm/flash_prefill.cl; layouts, grid, shared-memory plan, constraints and algorithm are documented there).
+ * kernels/llm/flash_prefill.cl; layouts, grid, shared-memory plan, constraints and algorithm are documented there),
+ * plus the LLM_FlashAttnPaged_* entry points under PAGED=1.
  * Requires: common/nf_common.glsl, common/act.glsl, common/kv_types.glsl, common/attn_common.glsl, common/reduce.glsl.
  *
  * Variants rows select the KV element type: KV=NF_KV_<type> (common/kv_types.glsl), or KV_MIXED=1 for
  * LLM_FlashAttn_Mixed, which reads K and V through the common/kv_types.glsl loaders with the types of its trailing
- * kv_types scalar (K type in bits 0-7, V type in bits 8-15; kernels/llm/common/attn_common.h); flag sg.
+ * kv_types scalar (K type in bits 0-7, V type in bits 8-15; kernels/llm/common/attn_common.h); flag sg. Rows with the
+ * additional define PAGED=1 are the LLM_FlashAttnPaged_* entry points: one launch per multi-token paginated KV
+ * segment, whose slot range [kv_start, kv_end) reads K, V and kv_pos at the physical row nf_kv_row(slot, page_shift,
+ * page_table[pt_off + (slot >> page_shift)]) (kernels/llm/common/attn_common.h nf_kv_row; the kv_start / kv_end of the
+ * paged rows count slots, and the base rows pass the identity map).
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_tokens, i n_head, i n_head_kv, i d_k, i d_v, i bq, i bk, i g_tile, i n_split, i split_len,
  *    i kv_start, i kv_end, i q_row_stride, i out_row_stride, i k_row_stride, i k_head_stride,
  *    i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias, i causal, i swa_type, i n_swa,
  *    i bias_mode, i n_buckets, i max_distance, i has_sinks, i direct_out, i q_off, i out_off,
- *    R q, R k, R v, R<int> q_pos, R<int> kv_pos, R sinks, R rel_bias, W out, W partial[, i kv_types (KV_MIXED)])
- * Dispatch: 3-D, global {ceil(n_tokens / bq) * 128, n_head_kv * ceil(G / g_tile), n_split},
- * local {128, 1, 1}. The __sg variant needs full subgroups; 128 is a multiple of every subgroup size.
+ *    R q, R k, R v, R<int> q_pos, R<int> kv_pos, R sinks, R rel_bias, W out, W partial
+ *    | PAGED: i page_shift, i pt_off, R<int> page_table[, i kv_types (KV_MIXED)])
+ * Dispatch: the 3-D grid of the base rows, local {128, 1, 1}. The __sg variant needs full subgroups; 128 is a
+ * multiple of every subgroup size.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -42,6 +48,9 @@ layout(std430, binding = 5) readonly buffer NfFaSinks { float sinks[]; };
 layout(std430, binding = 6) readonly buffer NfFaRelBias { float rel_bias[]; };
 layout(std430, binding = 7) writeonly buffer NfFaOut { float dst[]; };
 layout(std430, binding = 8) writeonly buffer NfFaPartial { float partial[]; };
+#if defined(PAGED)
+layout(std430, binding = 9) readonly buffer NfFaPages { int page_table[]; };
+#endif
 
 layout(push_constant) uniform NfFaParams {
     int n_tokens; int n_head; int n_head_kv; int d_k; int d_v;
@@ -53,6 +62,9 @@ layout(push_constant) uniform NfFaParams {
     int causal; int swa_type; int n_swa;
     int bias_mode; int n_buckets; int max_distance;
     int has_sinks; int direct_out; int q_off; int out_off;
+#if defined(PAGED)
+    int page_shift; int pt_off;
+#endif
 #if defined(KV_MIXED)
     int kv_types;
 #endif
@@ -103,6 +115,39 @@ float nf_fa_bias(int h, int p_q, int p_k, float slope) {
     return 0.0;
 }
 
+#if defined(PAGED)
+/* The physical row and page validity of a key slot (GLSL cannot pass the table as a parameter, so the caller
+ * dereferences it: nf_kv_row / nf_kv_page_ok of kernels/llm/common/attn_common.h). The page table, kv_start /
+ * kv_end and n_tokens are validated on the host before the launch (MS-2, section 5.5.1), so slot < kv_end always
+ * reads page_table in bounds; a page id below 0 is masked, never required (section 5.5.1 O-2). */
+int nf_fa_page_id(int slot) {
+    return page_table[uint(pc.pt_off + (slot >> pc.page_shift))];
+}
+
+int nf_fa_row(int slot) {
+    return nf_kv_row(slot, pc.page_shift, page_table[uint(pc.pt_off + (slot >> pc.page_shift))]);
+}
+
+bool nf_fa_page_ok(int slot) {
+    return nf_fa_page_id(slot) >= 0;
+}
+
+/* The paged plan adds the page geometry (the .cl twin nf_fa_paged_ok): page_shift is the log2 page size, bounded so
+ * the physical row stays an int. */
+bool nf_fa_paged_plan_ok() {
+    return nf_fa_plan_ok() && pc.page_shift >= 0 && pc.page_shift <= 20 && pc.pt_off >= 0;
+}
+#else
+/* The base rows' identity map: every slot t is the physical row t, no page is masked. */
+int nf_fa_row(int slot) {
+    return slot;
+}
+
+bool nf_fa_page_ok(int slot) {
+    return true;
+}
+#endif
+
 /* NaN over the outputs of a call that violates the plan (workgroup (0, 0, 0) only). */
 void nf_fa_poison() {
     if (gl_WorkGroupID.x != 0u || gl_WorkGroupID.y != 0u || gl_WorkGroupID.z != 0u
@@ -126,7 +171,11 @@ void nf_fa_poison() {
 }
 
 void main() {
+#if defined(PAGED)
+    if (!nf_fa_paged_plan_ok()) {
+#else
     if (!nf_fa_plan_ok()) {
+#endif
         nf_fa_poison();
         return;   /* uniform across the workgroup: no barrier has been reached */
     }
@@ -189,8 +238,10 @@ void main() {
         for (int idx = lid; idx < bq * nk; idx += NF_FA_WG) {
             const int i = idx / nk;
             const int tq = t0 + i;
-            if (tq < pc.n_tokens
-                && nf_attn_visible(q_pos[tq], kv_pos[kt + idx - i * nk], pc.causal, pc.swa_type, pc.n_swa) != 0) {
+            const int slot = kt + idx - i * nk;
+            if (tq < pc.n_tokens && nf_fa_page_ok(slot)
+                && nf_attn_visible(q_pos[tq], kv_pos[nf_fa_row(slot)],
+                                   pc.causal, pc.swa_type, pc.n_swa) != 0) {
                 any_vis = 1.0;
             }
         }
@@ -229,7 +280,7 @@ void main() {
                 const int d = c + 4 * c4;
                 vec4 val = vec4(0.0);
                 if (kk < nk && d < d_k) {
-                    val = kc_load4(uint(kt + kk) * uint(pc.k_row_stride) + k_head + uint(d));
+                    val = kc_load4(uint(nf_fa_row(kt + kk)) * uint(pc.k_row_stride) + k_head + uint(d));
                 }
                 const int b = kvc + kk * NF_FA_CHUNK + 4 * c4;
                 nf_fa_smem[b] = val.x;
@@ -262,9 +313,11 @@ void main() {
             const int tq = t0 + i;
             float s = -NF_INF;
             if (kk < nk && tq < pc.n_tokens && g < g_cnt) {
+                const int slot = kt + kk;
                 const int p_q = q_pos[tq];
-                const int p_k = kv_pos[kt + kk];
-                if (nf_attn_visible(p_q, p_k, pc.causal, pc.swa_type, pc.n_swa) != 0) {
+                const int p_k = kv_pos[nf_fa_row(slot)];
+                if (nf_fa_page_ok(slot)
+                    && nf_attn_visible(p_q, p_k, pc.causal, pc.swa_type, pc.n_swa) != 0) {
                     s = nf_attn_score(nf_fa_smem[sc + idx], pc.scale, pc.softcap)
                       + nf_fa_bias(h0 + g, p_q, p_k, nf_fa_slope[g]);
                 }
@@ -312,7 +365,7 @@ void main() {
                 const int d = c + 4 * c4;
                 vec4 val = vec4(0.0);
                 if (kk < nk && d < d_v) {
-                    val = vc_load4(uint(kt + kk) * uint(pc.v_row_stride) + v_head + uint(d));
+                    val = vc_load4(uint(nf_fa_row(kt + kk)) * uint(pc.v_row_stride) + v_head + uint(d));
                 }
                 const int b = kvc + kk * NF_FA_CHUNK + 4 * c4;
                 nf_fa_smem[b] = val.x;

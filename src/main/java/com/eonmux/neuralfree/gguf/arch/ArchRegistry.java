@@ -36,7 +36,8 @@ public final class ArchRegistry {
                     ArchTableDense.entries(),
                     ArchTableMoe.entries(),
                     ArchTableHybrid.entries(),
-                    ArchTableSpecial.entries()));
+                    ArchTableSpecial.entries(),
+                    ArchTableDraft.entries()));
             return mergeProviders(builtIn, Plugins.load(ArchProvider.class));
         }
     }

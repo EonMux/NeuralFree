@@ -50,9 +50,13 @@ public final class CheckpointContainers {
         static final List<Factory> BUILT_INS = merge(builtIns(), Collections.emptyList());
     }
 
-    /** The container formats NeuralFree reads, in the order they are asked. */
+    /**
+     * The container formats NeuralFree reads, in the order they are asked (FX-1): safetensors first, then the
+     * restricted PyTorch pickle container, HF.md's detection rule order.
+     */
     static List<Factory> builtIns() {
-        return Collections.singletonList(SafetensorsCheckpoint.FACTORY);
+        return Arrays.asList(SafetensorsCheckpoint.FACTORY,
+                com.eonmux.neuralfree.gguf.hf.torch.TorchCheckpointFactory.FACTORY);
     }
 
     /**

@@ -460,12 +460,12 @@ public final class HfEagle3Hooks {
      * @throws IOException         when the target cannot be opened or its configuration read
      * @throws GgufFormatException when the target lacks its hidden size, layer count or vocabulary size
      */
-    static Target target(HfLoadContext ctx) throws IOException {
+    public static Target target(HfLoadContext ctx) throws IOException {
         return ctx.state(TARGET_STATE, TargetHolder.class, TargetHolder::new).get(ctx);
     }
 
     /** The target facts of one load. Immutable. */
-    static final class Target {
+    public static final class Target {
         /** The target directory (Hugging Face) or file (GGUF). */
         final Path path;
         /** The target's {@code config.json}, null for a GGUF target. */

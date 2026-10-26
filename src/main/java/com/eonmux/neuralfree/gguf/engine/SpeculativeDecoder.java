@@ -3,12 +3,20 @@ package com.eonmux.neuralfree.gguf.engine;
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.TokenCallback;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
+import com.eonmux.neuralfree.gguf.engine.draft.BlockVerifier;
+import com.eonmux.neuralfree.gguf.engine.draft.DraftProbs;
+import com.eonmux.neuralfree.gguf.engine.draft.FlyVerifier;
+import com.eonmux.neuralfree.gguf.engine.draft.RejectionVerifier;
+import com.eonmux.neuralfree.gguf.engine.draft.SyntheticVerifier;
+import com.eonmux.neuralfree.gguf.engine.draft.Verifier;
+import com.eonmux.neuralfree.gguf.engine.draft.VerifyMode;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
 
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.SplittableRandom;
 import java.util.function.Consumer;
 
 /**
@@ -30,16 +38,37 @@ import java.util.function.Consumer;
  *       proposes up to {@code k} tokens {@code d}. Without a usable proposal (empty, or shorter than
  *       {@code draftMin}) the round decodes {@code t} and samples one token. Otherwise
  *       {@link ForwardBackend#forwardRows} evaluates {@code [t, d_0 .. d_{k-1}]} at {@code P ..} and returns all
- *       {@code k + 1} logits rows; row {@code i} is sampled, accepted into the sampler and offered to the session,
- *       continuing while the sample equals {@code d_i}. With {@code a} drafted tokens confirmed, the round emits
- *       {@code d_0 .. d_{a-1}} and the sample of row {@code a}, and the last {@code k - a} positions leave memory:
- *       by {@link ForwardBackend#rollback}, or for recurrent memory by restoring the snapshot taken before the
- *       call and prefilling {@code [t, d_0 .. d_{a-1}]} again. The drafter then hears {@code accept(a)}.</li>
+ *       {@code k + 1} logits rows, whose processed distributions the verify mode decides over:</li>
+ * </ol>
+ * <p><b>Verification modes</b> ({@link VerifyMode}, the builder's {@code verifyMode}, default {@link VerifyMode#MATCH}):
+ * <ul>
+ *   <li>{@link VerifyMode#MATCH}: the longest matching prefix of the chain's own samples (llama.cpp
+ *       common/sampling.cpp:736 {@code common_sampler_sample_and_accept_n}), as described next.</li>
+ *   <li>{@link VerifyMode#REJECTION}: vLLM {@code standard} ({@link RejectionVerifier});</li>
+ *   <li>{@link VerifyMode#BLOCK}: Sun et al. block verification ({@link BlockVerifier});</li>
+ *   <li>{@link VerifyMode#FLY}: entropy-gated deferred verification ({@link FlyVerifier}, lossy);</li>
+ *   <li>{@link VerifyMode#SYNTHETIC}: benchmarking acceptance ({@link SyntheticVerifier}), refused unless the
+ *       system property {@code neuralfree.spec.synthetic} is {@code true} at build time.</li>
+ * </ul>
+ * <p>In {@code MATCH} row {@code i} is sampled, accepted into the sampler and offered to the session,
+ * continuing while the sample equals {@code d_i}. In every other mode a {@link Verifier} runs the round against
+ * the row distributions; each verifier documents its own RNG stream, and a drafter implementing
+ * {@link DraftProbs} supplies its proposal distributions (one-hot otherwise). A greedy target chain degenerates
+ * the lossless modes into {@code MATCH}'s argmax rule.
+ *
+ * <p>With {@code a} drafted tokens confirmed, the round emits
+ * {@code d_0 .. d_{a-1}} and the target's next token, and the last {@code k - a} positions leave memory:
+ * by {@link ForwardBackend#rollback}, or for recurrent memory by restoring the snapshot taken before the
+ * call and prefilling {@code [t, d_0 .. d_{a-1}]} again. A stop inside the verify (end of generation, stop string,
+ * budget, cancel) leaves the same state as the ordinary rejection path: the extra verified positions are dropped
+ * or replayed before the round returns, never left in the memory as an overshot state (PARITY §5.5.1 S-1). The
+ * drafter then hears {@code accept(a)}.
  * </ol>
  * Every emitted token passes through the same {@link Sampler} and {@link StopCriteria.Session} as in
  * {@link GenerationLoop}: banned tokens, penalties, stop strings, the token budget and reasoning routing are
- * unchanged. With an argmax sampler the output equals plain greedy decoding; with a stochastic chain each emitted
- * token is a draw from the target's distribution at its position.
+ * unchanged. {@code MATCH} with an argmax sampler equals plain greedy decoding; with a stochastic chain the
+ * lossless modes ({@code MATCH}, {@code REJECTION}, {@code BLOCK}) keep every emitted token a draw from the
+ * target's distribution at its position.
  *
  * <p>{@code k = min(draftMax, nCtx - P - 1, ubatch - 1, remaining - 1)}, lowered to the largest {@code k} for which
  * every sliding-window ring still holds the window of the new end after storing {@code k + 1} positions and dropping
@@ -98,6 +127,12 @@ public final class SpeculativeDecoder {
     private final int draftMin;
     private final Consumer<Stats> statsSink;
     private final SamplingDefaults samplingDefaults;
+    private final VerifyMode verifyMode;
+    private final int flyWindow;
+    private final double flyEntropyThreshold;
+    private final int flyEntropyTopK;
+    private final double[] syntheticRates;
+    private final Double syntheticLength;
 
     private SpeculativeDecoder(Builder b) {
         this.backend = b.backend;
@@ -108,9 +143,19 @@ public final class SpeculativeDecoder {
         this.draftMin = b.draftMin;
         this.statsSink = b.statsSink;
         this.samplingDefaults = b.samplingDefaults;
+        this.verifyMode = b.verifyMode;
+        this.flyWindow = b.flyWindow;
+        this.flyEntropyThreshold = b.flyEntropyThreshold;
+        this.flyEntropyTopK = b.flyEntropyTopK;
+        this.syntheticRates = b.syntheticRates;
+        this.syntheticLength = b.syntheticLength;
         if (draftMin > draftMax) {
             throw new IllegalArgumentException("draft min " + draftMin + " exceeds draft max " + draftMax);
         }
+    }
+
+    public VerifyMode verifyMode() {
+        return verifyMode;
     }
 
     /**
@@ -227,6 +272,9 @@ public final class SpeculativeDecoder {
         float[] logits = backend.prefill(prompt, 0);
         sampler.accept(prompt, 0, prompt.length);
         long t1 = System.nanoTime();
+        // Non-MATCH verification runs per generation with its own uniform stream, seeded like the sampler's chain.
+        Verifier verifier = verifyMode == VerifyMode.MATCH ? null : verifierFor(sampler);
+        SplittableRandom roundsRng = verifier == null ? null : new SplittableRandom(sampler.seed());
 
         int rounds = 0;
         int drafted = 0;
@@ -263,7 +311,7 @@ public final class SpeculativeDecoder {
                 reason = session.offer(token);
                 continue;
             }
-            Verified v = verify(memory, sampler, session, token, draft, pos);
+            Verified v = verify(memory, verifier, roundsRng, sampler, session, token, draft, pos);
             rounds++;
             drafted += draft.length;
             accepted += v.accepted;
@@ -292,11 +340,13 @@ public final class SpeculativeDecoder {
     }
 
     /**
-     * Scores {@code [token, draft..]} at {@code pos}, emits the confirmed prefix and the target's own next token,
-     * and drops the rejected positions from memory.
+     * Scores {@code [token, draft..]} at {@code pos} and emits the confirmation the verify mode decides over, then
+     * drops the rejected positions from memory. A stop inside the verify (a non-null reason) leaves the same state
+     * as the ordinary rejection path: the extra verified positions are replayed away, never left as an overshot
+     * state (PARITY §5.5.1 S-1).
      */
-    private Verified verify(ModelMemory memory, Sampler sampler, StopCriteria.Session session, int token,
-                            int[] draft, int pos) {
+    private Verified verify(ModelMemory memory, Verifier verifier, SplittableRandom roundsRng, Sampler sampler,
+                            StopCriteria.Session session, int token, int[] draft, int pos) {
         int k = draft.length;
         int[] batch = new int[k + 1];
         batch[0] = token;
@@ -310,6 +360,32 @@ public final class SpeculativeDecoder {
             throw new IllegalStateException("verification of " + (k + 1) + " tokens returned " + rows.length
                     + " logits rows");
         }
+        Verified outcome = verifier == null
+                ? matchVerify(sampler, session, draft, rows)
+                : verifierVerify(verifier, roundsRng, sampler, session, draft, rows);
+        int drop = k - outcome.accepted;
+        if (drop > 0) {
+            if (recurrent) {
+                memory.restore();
+                backend.prefill(Arrays.copyOf(batch, outcome.accepted + 1), pos);
+            } else {
+                if (!backend.canRollback(drop)) {
+                    throw new IllegalStateException("the target memory cannot drop the " + drop
+                            + " rejected draft positions");
+                }
+                backend.rollback(drop);
+            }
+        }
+        drafter.accept(outcome.accepted);
+        return outcome;
+    }
+
+    /**
+     * {@link VerifyMode#MATCH}: the longest prefix whose chain samples equal the draft (llama.cpp
+     * common/sampling.cpp:736); the first mismatching row's sample, or the last row's, is the target's next token.
+     */
+    private Verified matchVerify(Sampler sampler, StopCriteria.Session session, int[] draft, float[][] rows) {
+        int k = draft.length;
         int nAccepted = 0;
         int emitted = 0;
         int next = -1;
@@ -328,24 +404,212 @@ public final class SpeculativeDecoder {
             }
             nAccepted++;
         }
-        if (reason != null) {
-            return new Verified(nAccepted, emitted, next, reason);
+        return new Verified(nAccepted, emitted, next, reason);
+    }
+
+    /** A non-MATCH verifier decides the round over the rows' processed distributions. */
+    private Verified verifierVerify(Verifier verifier, SplittableRandom roundsRng, Sampler sampler,
+                                    StopCriteria.Session session, int[] draft, float[][] rows) {
+        int k = draft.length;
+        Round round = new Round(sampler, session, draft, k, rows, roundsRng);
+        verifier.verify(round);
+        return new Verified(round.accepted, round.emitted, round.next, round.reason);
+    }
+
+    /**
+     * One verify round of a non-MATCH verifier: the processed row distributions on demand, the drafter's proposal
+     * distributions, the round's uniform stream and its emissions through the session. Rows are handed out in
+     * ascending order at most once each; an emission's non-null stop reason ends the round.
+     */
+    private final class Round implements Verifier.Round {
+
+        private final Sampler sampler;
+        private final StopCriteria.Session session;
+        private final int[] draft;
+        private final int k;
+        private final float[][] rows;
+        private final SplittableRandom rng;
+        private final Verifier.Distribution[] draftDistributions;
+        private int lastRow = -1;
+        int accepted;
+        int emitted;
+        int next = -1;
+        private StopReason reason;
+
+        private Round(Sampler sampler, StopCriteria.Session session, int[] draft, int k, float[][] rows,
+                      SplittableRandom rng) {
+            this.sampler = sampler;
+            this.session = session;
+            this.draft = draft;
+            this.k = k;
+            this.rows = rows;
+            this.rng = rng;
+            this.draftDistributions = new Verifier.Distribution[k];
         }
-        int drop = k - nAccepted;
-        if (drop > 0) {
-            if (recurrent) {
-                memory.restore();
-                backend.prefill(Arrays.copyOf(batch, nAccepted + 1), pos);
+
+        @Override public int draftCount() {
+            return k;
+        }
+
+        @Override public int draftToken(int position) {
+            checkDraftPosition(position);
+            return draft[position];
+        }
+
+        @Override
+        public Verifier.Distribution target(int row) {
+            if (row <= lastRow || row > k) {
+                throw new IllegalStateException("verify row " + row + " after last-row " + lastRow + " (may be"
+                        + " requested in ascending order, once, up to " + k + ")");
+            }
+            lastRow = row;
+            return distribution(rows[row], sampler);
+        }
+
+        @Override
+        public Verifier.Distribution draft(int position) {
+            checkDraftPosition(position);
+            return draftDistribution(position);
+        }
+
+        private Verifier.Distribution draftDistribution(int position) {
+            Verifier.Distribution built = draftDistributions[position];
+            if (built != null) {
+                return built;
+            }
+            if (!(drafter instanceof DraftProbs)) {
+                built = Verifier.Distribution.oneHot(draft[position]);
             } else {
-                if (!backend.canRollback(drop)) {
-                    throw new IllegalStateException("the target memory cannot drop the " + drop
-                            + " rejected draft positions");
+                float[] row = ((DraftProbs) drafter).draftProbs(position);
+                if (row == null) {
+                    throw new IllegalStateException("the drafter returned no proposal probabilities for position "
+                            + position);
                 }
-                backend.rollback(drop);
+                int token = draft[position];
+                if (token >= row.length) {
+                    throw new IllegalStateException("the drafter proposed token " + token
+                            + " but offered " + row.length + " proposal probabilities");
+                }
+                for (float v : row) {
+                    if (Float.isNaN(v)) {
+                        throw new IllegalStateException("the drafter's proposal probability row contains NaN");
+                    }
+                }
+                if (row[token] <= 0f) {
+                    throw new IllegalStateException("the drafter drafted token " + token + " with proposal"
+                            + " probability " + row[token]);
+                }
+                int support = 0;
+                for (float v : row) {
+                    support += v > 0f ? 1 : 0;
+                }
+                int[] tokens = new int[support];
+                float[] probs = new float[support];
+                float[] logits = new float[support];
+                int j = 0;
+                for (int i = 0; i < row.length; i++) {
+                    if (row[i] > 0f) {
+                        tokens[j] = i;
+                        probs[j] = row[i];
+                        logits[j] = 0f;
+                        j++;
+                    }
+                }
+                built = new Verifier.Distribution(tokens, probs, logits, -1);
+            }
+            draftDistributions[position] = built;
+            return built;
+        }
+
+        @Override public double uniform() {
+            return rng.nextDouble();
+        }
+
+        @Override public StopReason confirm(int position) {
+            if (position != accepted) {
+                throw new IllegalStateException("confirm(" + position + ") after " + accepted
+                        + " confirmed draft tokens");
+            }
+            return emitOne(draft[position]);
+        }
+
+        @Override public StopReason emit(int token) {
+            return emitOne(token);
+        }
+
+        @Override public int accepted() {
+            return accepted;
+        }
+
+        @Override public boolean stopped() {
+            return reason != null;
+        }
+
+        private StopReason emitOne(int token) {
+            if (reason != null) {
+                throw new IllegalStateException("the verify round already stopped with " + reason);
+            }
+            if (session.cancelled()) {
+                reason = StopReason.CANCELLED;
+                return reason;
+            }
+            sampler.accept(token);
+            emitted++;
+            next = token;
+            reason = session.offer(token);
+            return reason;
+        }
+
+        private void checkDraftPosition(int position) {
+            if (position < 0 || position >= k) {
+                throw new IndexOutOfBoundsException("draft position " + position + " outside [0, " + k + ")");
             }
         }
-        drafter.accept(nAccepted);
-        return new Verified(nAccepted, emitted, next, null);
+    }
+
+    /**
+     * The processed distribution of one verify row: the surviving candidates with their post-chain probabilities
+     * and logits and the chain's own draw. A greedy chain keeps no normalized probabilities; its distribution is
+     * one-hot on the argmax (which leaves the argmax rule of the lossless modes intact), while the logits stay the
+     * chain's for FLy's entropy gate.
+     */
+    private static Verifier.Distribution distribution(float[] row, Sampler sampler) {
+        Sampler.Candidates cur = sampler.apply(row);
+        int n = cur.size();
+        int[] tokens = new int[n];
+        float[] probs = new float[n];
+        float[] logits = new float[n];
+        for (int i = 0; i < n; i++) {
+            tokens[i] = cur.id(i);
+            logits[i] = cur.logit(i);
+        }
+        if (sampler.greedy()) {
+            probs[cur.selected()] = 1f;
+        } else {
+            for (int i = 0; i < n; i++) {
+                probs[i] = cur.prob(i);
+            }
+        }
+        return new Verifier.Distribution(tokens, probs, logits, cur.selected());
+    }
+
+    /** The verify mode's verifier for one generation (stateless, shared across the generation's rounds). */
+    private Verifier verifierFor(Sampler sampler) {
+        switch (verifyMode) {
+            case REJECTION:
+                return new RejectionVerifier();
+            case BLOCK:
+                return new BlockVerifier();
+            case FLY:
+                return new FlyVerifier(flyWindow, flyEntropyThreshold, flyEntropyTopK, sampler.greedy());
+            case SYNTHETIC:
+                return new SyntheticVerifier(syntheticRates != null
+                        ? syntheticRates
+                        : SyntheticVerifier.ratesForLength(syntheticLength, draftMax));
+            case MATCH:
+            default:
+                throw new IllegalStateException("no verifier for verification mode " + verifyMode);
+        }
     }
 
     /**
@@ -420,7 +684,8 @@ public final class SpeculativeDecoder {
     @Override
     public String toString() {
         return "SpeculativeDecoder{" + drafter + ", draftMax=" + draftMax + ", draftMin=" + draftMin + ", "
-                + reasoning + (samplingDefaults.isEmpty() ? "" : ", " + samplingDefaults) + '}';
+                + "verify=" + verifyMode + ", " + reasoning
+                + (samplingDefaults.isEmpty() ? "" : ", " + samplingDefaults) + '}';
     }
 
     public static final class Builder {
@@ -432,6 +697,12 @@ public final class SpeculativeDecoder {
         private int draftMin;
         private Consumer<Stats> statsSink = s -> { };
         private SamplingDefaults samplingDefaults = SamplingDefaults.NONE;
+        private VerifyMode verifyMode = VerifyMode.MATCH;
+        private int flyWindow;
+        private double flyEntropyThreshold = 0.3;
+        private int flyEntropyTopK = 3;
+        private double[] syntheticRates;
+        private Double syntheticLength;
 
         private Builder(ForwardBackend backend, DraftModel drafter, GGUFTokenizer tokenizer) {
             this.backend = Objects.requireNonNull(backend, "backend");
@@ -472,7 +743,94 @@ public final class SpeculativeDecoder {
             return this;
         }
 
+        /** The verification mode (default {@link VerifyMode#MATCH}). */
+        public Builder verifyMode(VerifyMode v) {
+            this.verifyMode = Objects.requireNonNull(v, "verifyMode");
+            return this;
+        }
+
+        /**
+         * {@code fly_window_size}: FLy's future native acceptance decisions to check, or 0 for vLLM's default of
+         * {@code min(6, k - 1)} of the round's proposal (default 0; only {@link VerifyMode#FLY} reads it).
+         */
+        public Builder flyWindow(int v) {
+            if (v < 0) {
+                throw new IllegalArgumentException("fly window must not be negative, got " + v);
+            }
+            this.flyWindow = v;
+            return this;
+        }
+
+        /** {@code fly_entropy_threshold}: the entropy a deferral needs (default 0.3; only {@link VerifyMode#FLY}). */
+        public Builder flyEntropyThreshold(double v) {
+            if (!(v >= 0.0)) {
+                throw new IllegalArgumentException("fly entropy threshold must not be negative, got " + v);
+            }
+            this.flyEntropyThreshold = v;
+            return this;
+        }
+
+        /** {@code fly_entropy_top_k}: the processed probabilities the entropy covers (default 3; only {@link VerifyMode#FLY}). */
+        public Builder flyEntropyTopK(int v) {
+            if (v <= 0) {
+                throw new IllegalArgumentException("fly entropy top-k must be positive, got " + v);
+            }
+            this.flyEntropyTopK = v;
+            return this;
+        }
+
+        /**
+         * {@code synthetic_acceptance_rates}: the unconditional per-position acceptance rates of
+         * {@link VerifyMode#SYNTHETIC}; mutually exclusive with {@link #syntheticAcceptanceLength(double)}, which
+         * vLLM's minimum-variance schedule resolves to these rates.
+         */
+        public Builder syntheticAcceptanceRates(double... rates) {
+            new SyntheticVerifier(rates); // validation
+            this.syntheticRates = rates.clone();
+            return this;
+        }
+
+        /** @{@code synthetic_acceptance_length}: the target mean acceptance length (a shorthand for the rates). */
+        public Builder syntheticAcceptanceLength(double length) {
+            SyntheticVerifier.ratesForLength(length, draftMax); // validation against the proposal budget
+            this.syntheticLength = length;
+            return this;
+        }
+
+        /**
+         * The configured unconditional rates: the explicit {@code synthetic_acceptance_rates}, or the
+         * {@code synthetic_acceptance_length} resolved over {@code draftMax} proposal positions (vLLM's
+         * minimum-variance schedule).
+         */
+        private double[] resolvedSyntheticRates() {
+            return syntheticRates != null
+                    ? syntheticRates
+                    : SyntheticVerifier.ratesForLength(syntheticLength, draftMax);
+        }
+
+        /**
+         * Returns the decoder.
+         *
+         * @throws IllegalStateException when {@link VerifyMode#SYNTHETIC} is selected without the opt-in property
+         *                               {@code neuralfree.spec.synthetic}
+         * @throws IllegalArgumentException when both synthetic settings are given, or none outside synthetic mode,
+         *                                  when the synthetic settings are themselves invalid, or when the draft
+         *                                  lengths disagree
+         */
         public SpeculativeDecoder build() {
+            boolean synthetic = verifyMode == VerifyMode.SYNTHETIC;
+            if ((syntheticRates != null) == (syntheticLength != null)) {
+                throw new IllegalArgumentException("synthetic verification needs exactly one of"
+                        + " synthetic_acceptance_rates and synthetic_acceptance_length, or none of both"
+                        + (synthetic ? "" : " outside synthetic mode"));
+            }
+            if (synthetic) {
+                if (!Boolean.getBoolean(SyntheticVerifier.PROP_ENABLED)) {
+                    throw new IllegalStateException(SyntheticVerifier.PROP_ENABLED + "=true is required for"
+                            + " synthetic verification");
+                }
+                new SyntheticVerifier(resolvedSyntheticRates()); // validates the resolved rates
+            }
             return new SpeculativeDecoder(this);
         }
     }

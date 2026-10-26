@@ -11,16 +11,19 @@ import java.util.Objects;
  * list, which {@code SamplerConfig.order} defaults to; a configured order lists the kind labels in the order the
  * stages run, between the fixed bias stage (before the chain) and the dist stage (after it).
  *
- * <p>Until SA-2 adds the llama.cpp stages NeuralFree does not carry yet, a configured {@link #DRY}, {@link #TOP_N_SIGMA}
- * or {@link #XTC} kind builds no stage and applies nothing, which is the chain with those stages off.
+ * <p>A configured chain entry is any llama.cpp sampler name:
+ * {@code penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature;infill;adaptive_p}
+ * ({@code common/sampler_type}). Mirostat is not a chain entry: llama.cpp replaces the whole chain by
+ * {@code temp + mirostat} (or {@code mirostat_v2}, src/llama-sampler.cpp) when {@code mirostat} is 1 or 2, which
+ * {@code SamplerConfig.mirostat} selects instead.
  */
 public enum StageKind {
 
     /** llama.cpp {@code penalties}: the repetition, presence and frequency penalties over the accepted tokens. */
     PENALTIES("penalties"),
-    /** llama.cpp {@code dry}: no NeuralFree stage until SA-2, so building one applies nothing. */
+    /** llama.cpp {@code dry}: the DRY repetition penalty (DryStage). */
     DRY("dry"),
-    /** llama.cpp {@code top_n_sigma}: no NeuralFree stage until SA-2, so building one applies nothing. */
+    /** llama.cpp {@code top_n_sigma}: the n-std-deviation logit mask (TopNSigmaStage). */
     TOP_N_SIGMA("top_n_sigma"),
     /** llama.cpp {@code top_k}: the {@code k} highest logits. */
     TOP_K("top_k"),
@@ -30,17 +33,30 @@ public enum StageKind {
     TOP_P("top_p"),
     /** llama.cpp {@code min_p}: the {@code p * p_max} logit threshold. */
     MIN_P("min_p"),
-    /** llama.cpp {@code xtc}: no NeuralFree stage until SA-2, so building one applies nothing. */
+    /** llama.cpp {@code xtc}: the cross-token crossover trim (XtcStage). */
     XTC("xtc"),
     /** llama.cpp {@code temperature}: logit scaling (argmax at a temperature of 0, llama_sampler_temp_impl). */
-    TEMPERATURE("temperature");
+    TEMPERATURE("temperature"),
+    /** llama.cpp {@code infill}: llama_sampler_infill's EOG-aware filter (InfillStage). */
+    INFILL("infill"),
+    /**
+     * llama.cpp {@code adaptive_p}: trailing terminal selector in place of the dist stage (AdaptivePStage); llama.cpp
+     * appends it at the very end of the chain and never builds a dist stage behind it (common/sampling.cpp:387-407).
+     */
+    ADAPTIVE_P("adaptive_p"),
+    /**
+     * llama.cpp {@code mirostat}: not a chain entry (see the class doc); a build chain that sets
+     * {@code SamplerConfig.mirostat} to 1 or 2 replaces the order by {@code temperature + mirostat} as llama.cpp's
+     * chain construction does.
+     */
+    MIROSTAT("mirostat");
 
-    /** llama.cpp's default chain order, the label order of the constants above. */
+    /** llama.cpp's default chain order, the first nine kinds (common/common.h:265-273). */
     public static final List<StageKind> DEFAULT_ORDER;
 
     static {
         List<StageKind> order = new ArrayList<>();
-        Collections.addAll(order, values());
+        Collections.addAll(order, PENALTIES, DRY, TOP_N_SIGMA, TOP_K, TYPICAL_P, TOP_P, MIN_P, XTC, TEMPERATURE);
         DEFAULT_ORDER = Collections.unmodifiableList(order);
     }
 

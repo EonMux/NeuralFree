@@ -21,3 +21,23 @@ LLM_FlashAttn_Q5_0	flash_prefill.comp	KV=NF_KV_Q5_0	sg
 LLM_FlashAttn_Q5_1	flash_prefill.comp	KV=NF_KV_Q5_1	sg
 LLM_FlashAttn_Mixed	flash_prefill.comp	KV_MIXED=1	sg
 LLM_FlashAttn_Combine	flash_combine.comp
+LLM_FlashDecodePaged_F32	flash_decode.comp	KV=NF_KV_F32 PAGED=1	sg
+LLM_FlashDecodePaged_F16	flash_decode.comp	KV=NF_KV_F16 PAGED=1	sg
+LLM_FlashDecodePaged_Q8_0	flash_decode.comp	KV=NF_KV_Q8_0 PAGED=1	sg
+LLM_FlashDecodePaged_BF16	flash_decode.comp	KV=NF_KV_BF16 PAGED=1	sg
+LLM_FlashDecodePaged_Q4_0	flash_decode.comp	KV=NF_KV_Q4_0 PAGED=1	sg
+LLM_FlashDecodePaged_Q4_1	flash_decode.comp	KV=NF_KV_Q4_1 PAGED=1	sg
+LLM_FlashDecodePaged_IQ4_NL	flash_decode.comp	KV=NF_KV_IQ4_NL PAGED=1	sg
+LLM_FlashDecodePaged_Q5_0	flash_decode.comp	KV=NF_KV_Q5_0 PAGED=1	sg
+LLM_FlashDecodePaged_Q5_1	flash_decode.comp	KV=NF_KV_Q5_1 PAGED=1	sg
+LLM_FlashDecodePaged_Mixed	flash_decode.comp	KV_MIXED=1 PAGED=1	sg
+LLM_FlashAttnPaged_F32	flash_prefill.comp	KV=NF_KV_F32 PAGED=1	sg
+LLM_FlashAttnPaged_F16	flash_prefill.comp	KV=NF_KV_F16 PAGED=1	sg
+LLM_FlashAttnPaged_Q8_0	flash_prefill.comp	KV=NF_KV_Q8_0 PAGED=1	sg
+LLM_FlashAttnPaged_BF16	flash_prefill.comp	KV=NF_KV_BF16 PAGED=1	sg
+LLM_FlashAttnPaged_Q4_0	flash_prefill.comp	KV=NF_KV_Q4_0 PAGED=1	sg
+LLM_FlashAttnPaged_Q4_1	flash_prefill.comp	KV=NF_KV_Q4_1 PAGED=1	sg
+LLM_FlashAttnPaged_IQ4_NL	flash_prefill.comp	KV=NF_KV_IQ4_NL PAGED=1	sg
+LLM_FlashAttnPaged_Q5_0	flash_prefill.comp	KV=NF_KV_Q5_0 PAGED=1	sg
+LLM_FlashAttnPaged_Q5_1	flash_prefill.comp	KV=NF_KV_Q5_1 PAGED=1	sg
+LLM_FlashAttnPaged_Mixed	flash_prefill.comp	KV_MIXED=1 PAGED=1	sg

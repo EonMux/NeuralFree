@@ -15,7 +15,8 @@ import java.util.Objects;
  */
 public final class LayerMemoryPlan {
 
-    /** What memory the layer owns. */
+    /**
+     * What memory the layer owns. */
     public enum Kind {
         /** No memory (FFN-only layers, encoder layers, non-causal passes). */
         NONE,
@@ -29,6 +30,20 @@ public final class LayerMemoryPlan {
         KV_RECURRENT,
         /** DeepSeek-V4: raw window cache plus compressed caches and compressor states. */
         DSV4
+    }
+
+    /**
+     * Addressing declaration of one plan buffer (the row-part rule T-8): a KV group's cell index, a recurrent slot,
+     * or neither. {@code RowParts} (the paged package) derives every group's row parts from these declarations plus
+     * {@link KvDType#sidePlanes()}, never from a hand list.
+     */
+    public enum Addressing {
+        /** Addressed by the cell index of a KV group (K/V or latent rows, indexer keys, MSA keys, cross K/V). */
+        CELL,
+        /** Addressed by a recurrent state slot (one slot per sequence per state tensor). */
+        SLOT,
+        /** Not addressed by a group's cells or a recurrent slot (DSV4 compressed caches). */
+        NEITHER
     }
 
     /**
@@ -56,20 +71,35 @@ public final class LayerMemoryPlan {
         PLE_CONV
     }
 
-    /** One F32 recurrent state tensor of a layer. */
+    /**
+     * One F32 recurrent state tensor of a layer. {@code slots} records the state slots the plan reserves (1 for a
+     * contiguous single-sequence memory; {@code parallel x (1 + rollbackSnapshots)} for a paged memory): the per-slot
+     * row is {@code floats} wide and the tensor holds {@code slots} slots, so {@link #bytes()} covers all of them.
+     */
     public static final class StateTensor {
         private final String name;
         private final StateLayout layout;
         private final long floats;
+        private final int slots;
 
-        private StateTensor(String name, StateLayout layout, long floats) {
+        private StateTensor(String name, StateLayout layout, long floats, int slots) {
             this.name = name;
             this.layout = layout;
             this.floats = floats;
+            this.slots = slots;
         }
 
         /** @throws IllegalArgumentException for an empty name or a non-positive size */
         public static StateTensor of(String name, StateLayout layout, long floats) {
+            return of(name, layout, floats, 1);
+        }
+
+        /**
+         * A tensor of {@code slots} state slots, each {@code floats} wide.
+         *
+         * @throws IllegalArgumentException for an empty name, a non-positive size or a non-positive slot count
+         */
+        public static StateTensor of(String name, StateLayout layout, long floats, int slots) {
             if (name == null || name.isEmpty()) {
                 throw new IllegalArgumentException("state tensor name is empty");
             }
@@ -77,18 +107,28 @@ public final class LayerMemoryPlan {
             if (floats <= 0) {
                 throw new IllegalArgumentException("state tensor " + name + " needs a positive size, got " + floats);
             }
-            return new StateTensor(name, layout, floats);
+            if (slots <= 0) {
+                throw new IllegalArgumentException("state tensor " + name + " needs a positive slot count, got "
+                        + slots);
+            }
+            return new StateTensor(name, layout, floats, slots);
         }
 
         public String name() { return name; }
         public StateLayout layout() { return layout; }
         /** Floats per sequence. */
         public long floats() { return floats; }
-        public long bytes() { return floats * Float.BYTES; }
+        /** State slots the tensor reserves (one per sequence for a contiguous memory). */
+        public int slots() { return slots; }
+        public long bytes() { return floats * slots * Float.BYTES; }
+
+        /** Addressing declaration (T-8): a recurrent slot per tensor. */
+        public Addressing addressing() { return Addressing.SLOT; }
 
         @Override
         public String toString() {
-            return name + "[" + layout + ", " + floats + " f32]";
+            return name + "[" + layout + ", " + floats + " f32"
+                    + (slots > 1 ? ", " + slots + " slots" : "") + "]";
         }
     }
 
@@ -214,6 +254,8 @@ public final class LayerMemoryPlan {
         /** Hadamard rotation of indexer q/k. */
         public RotationPlan rotation() { return rotation; }
         public long bytes() { return rows * dtype.rowBytes(width); }
+        /** Addressing declaration (T-8): a KV group's cell index. */
+        public Addressing addressing() { return Addressing.CELL; }
 
         @Override
         public String toString() {
@@ -247,6 +289,8 @@ public final class LayerMemoryPlan {
         public int width() { return width; }
         public KvDType dtype() { return dtype; }
         public long bytes() { return rows * dtype.rowBytes(width); }
+        /** Addressing declaration (T-8): a KV group's cell index. */
+        public Addressing addressing() { return Addressing.CELL; }
 
         @Override
         public String toString() {
@@ -359,6 +403,8 @@ public final class LayerMemoryPlan {
         /** Both compressor tensors with every plane. */
         public long stateBytes() { return 2L * stateTensorBytes(); }
         public long bytes() { return cacheBytes() + stateBytes(); }
+        /** Addressing declaration (T-8): neither a group's cells nor a recurrent slot (MS-8 / PC-2 own its copying). */
+        public Addressing addressing() { return Addressing.NEITHER; }
 
         @Override
         public String toString() {

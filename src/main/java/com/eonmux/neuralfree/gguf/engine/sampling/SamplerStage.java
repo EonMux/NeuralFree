@@ -25,6 +25,14 @@ public abstract class SamplerStage {
     /** Applies the stage to {@code candidates}. */
     public abstract void apply(Sampler.Candidates candidates);
 
+    /**
+     * Whether the stage edits the candidate set under its configuration: false only when it provably applies nothing
+     * (a llama.cpp disable gate), defaulting to true. {@code Sampler} uses it to tell an argmax-only chain apart.
+     */
+    public boolean modifies() {
+        return true;
+    }
+
     /** Records an accepted token with the stage's history; the token id must be non-negative. */
     public void accept(int token) {
     }

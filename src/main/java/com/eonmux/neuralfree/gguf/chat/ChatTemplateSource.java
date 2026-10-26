@@ -5,7 +5,12 @@ import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.nio.CharBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.CharacterCodingException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -86,6 +91,12 @@ public final class ChatTemplateSource {
 
     private static final String DISABLED_CHECK = "{%- if false %}";
 
+    /**
+     * Cap for a template override file ({@code --chat-template-file}, server-chat.cpp:593): a
+     * file whose size exceeds it is refused before any allocation (§3.6).
+     */
+    public static final long TEMPLATE_FILE_MAX_BYTES = 4_194_304;
+
     private ChatTemplateSource() {}
 
     /**
@@ -120,6 +131,61 @@ public final class ChatTemplateSource {
     public static String namedKey(String name) {
         if (name == null || name.isEmpty()) throw new IllegalArgumentException("chat template name is empty");
         return String.format(GgufKeys.TOKENIZER_CHAT_TEMPLATE_N, name);
+    }
+
+    /**
+     * A template override file, llama.cpp's {@code --chat-template-file}: the file's contents are
+     * the template source, or one of the {@link #names()} to select a built-in template, resolved
+     * exactly like a GGUF's {@code tokenizer.chat_template} value. The file's UTF-8 text may
+     * carry a byte-order mark; malformed bytes are an error, not replacements; the size is capped
+     * by {@link #TEMPLATE_FILE_MAX_BYTES} before the file is read (§3.6).
+     *
+     * @return the Jinja source to render prompts with; never null or empty
+     * @throws IllegalArgumentException when {@code file} is null or not a regular file
+     * @throws UncheckedIOException     when the file cannot be read, is too large, or is not UTF-8
+     */
+    public static String fromFile(Path file) {
+        if (file == null) throw new IllegalArgumentException("chat template file is null");
+        long size;
+        try {
+            if (!Files.isRegularFile(file)) {
+                throw new IllegalArgumentException("chat template file is not a regular file: " + file);
+            }
+            size = Files.size(file);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot stat chat template file " + file, e);
+        }
+        if (size > TEMPLATE_FILE_MAX_BYTES) {
+            String message = "chat template file " + file + " is " + size
+                    + " bytes, over the " + TEMPLATE_FILE_MAX_BYTES + " cap";
+            throw new UncheckedIOException(message, new IOException(message));
+        }
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(file);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot read chat template file " + file, e);
+        }
+        String text;
+        CharBuffer decoded = CharBuffer.allocate(bytes.length);
+        java.nio.ByteBuffer wrapped = java.nio.ByteBuffer.wrap(bytes);
+        java.nio.charset.CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            decoder.decode(wrapped, decoded, true).throwException();
+        } catch (CharacterCodingException e) {
+            throw new UncheckedIOException("chat template file " + file + " is not UTF-8", e);
+        }
+        decoded.flip();
+        text = decoded.toString();
+        int start = !text.isEmpty() && text.charAt(0) == '\uFEFF' ? 1 : 0;
+        String source = start == 0 ? text : text.substring(start);
+        if (source.trim().isEmpty()) {
+            String message = "chat template file " + file + " is empty";
+            throw new UncheckedIOException(message, new IOException(message));
+        }
+        return resolve(source, null);
     }
 
     /** The template names that select a built-in template, in llama.cpp's table order (unmodifiable). */

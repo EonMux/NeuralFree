@@ -106,6 +106,33 @@ NF_INLINE float2 nf_attn_sink(float m, float l, float sink) {
 }
 
 /*
+ * Physical KV row the cached row indexed by slot t reads, as PagedSequences maps slots (MS-2):
+ *   page_shift < 0:   contiguous rows, t is the row (identity map; the un-paged flash entry points pass
+ *                     page_shift = -1, so their arguments and results are unchanged);
+ *   page_shift >= 0:  page size P = 1 << page_shift; pt[pt_off + (t >> page_shift)] is the page id of the page t
+ *                     falls on (one page table of page_size entries per sequence: page_table[seq * maxPages ..];
+ *                     MS-2/MS-3, DevicePageTables), and the row is (page id << page_shift) | (t & (P - 1)).
+ * The buffers k, v and kv_pos are laid out by physical row: the paged kernels read K, V and kv_pos at nf_kv_row(t).
+ * pt is never dereferenced on the identity path (page_shift < 0), so un-paged entry points pass any int buffer.
+ */
+NF_INLINE int nf_kv_row(int t, int page_shift, NF_GLOBAL const int* pt, const int pt_off) {
+    if (page_shift < 0) {
+        return t;
+    }
+    const int page_id = pt[pt_off + (t >> page_shift)];
+    return (page_id << page_shift) | (t & ((1 << page_shift) - 1));
+}
+
+/*
+ * 1 when the page of slot t is valid: always on the identity path, otherwise the page id must be >= 0 (a page the
+ * sequence never had; negative page ids are masked, never required: section 5.5.1 O-2, the prefix cache never
+ * relies on a masked page for a required row).
+ */
+NF_INLINE int nf_kv_page_ok(int t, int page_shift, NF_GLOBAL const int* pt, const int pt_off) {
+    return page_shift < 0 || pt[pt_off + (t >> page_shift)] >= 0;
+}
+
+/*
  * kv_types argument of the mixed-type flash kernels (LLM_FlashDecode_Mixed, LLM_FlashAttn_Mixed): the K cache type in
  * bits 0-7 and the V cache type in bits 8-15, each an NF_KV_* code of common/kv_types.h; no other bit is set
  * (gguf.ops.attn.AttnKernels.kvTypes). The same-type kernels fix both types at compile time.
