@@ -19,7 +19,7 @@ It has two parts:
 
 ## Status
 
-The GGUF engine covers every architecture name llama.cpp defines (164 entries, including `(unknown)`). [LLAMACPP-PARITY.md](LLAMACPP-PARITY.md) gives the class and cache of each one. Of these:
+The GGUF engine covers every architecture name llama.cpp defines (165 entries, including `(unknown)` and the `EAGLE` draft-class row). The arch registry (`ArchRegistry`) and its `ArchTable*` classes give the class and traits of each one. Of these:
 - 136 are generative models;
 - the rest are embedding, classifier, diffusion, drafter, audio and encoder-decoder models;
 - three are refused: `clip`, `gptj` and `(unknown)`.
@@ -75,7 +75,7 @@ It has not been validated by running models on GPU hardware. The limitations the
 ### GGUF inference engine
 - **Model files and types:**
   - single-file and split (`-0000N-of-0000M`) GGUF files;
-  - 29 weight types run natively on the GPU, the others are dequantized at upload;
+  - 38 weight types run natively on the GPU — including the NF extension types F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4 and FP4_BNB — the others are dequantized at upload;
   - the CPU engine runs the same types except Q8_K.
 - **Model classes:**
   - decoder-only text models, including mixture-of-experts, MLA, sparse-attention (DSA/MSA), recurrent (Mamba, RWKV) and hybrid linear-attention models;
@@ -86,12 +86,21 @@ It has not been validated by running models on GPU hardware. The limitations the
 - **Caches:**
   - nine KV cache types (`f32` to `q5_1`), with Hadamard rotation of quantized rows;
   - sliding-window rings;
-  - prefix reuse, context shift, rollback and recurrent-state snapshots.
+  - prefix reuse, context shift, rollback and recurrent-state snapshots;
+  - paged KV memory for parallel sequences (`neuralfree.parallel`, `neuralfree.kv.paged`), property-gated and not yet the engine default.
 - **Speculative decoding:**
   - built-in NextN/MTP heads;
   - MTP draft files;
   - separate draft models;
-  - EAGLE-3, Gemma 4 assistant and DFlash drafters.
+  - n-gram (simple, map, map-k4v, mod, cache) and suffix drafting from the prompt, with no draft file;
+  - EAGLE-3 and EAGLE-1, the Gemma 4 assistant and DFlash drafters;
+  - programmatic verify modes (`SpeculativeDecoder.Builder.verifyMode`).
+- **Grammar-constrained generation** (`gguf/grammar`): GBNF grammars, JSON schemas, JSON objects, regexes and choices compile into a sampler-chain stage (`ConstraintSpec`); structural-tag parsing is pending.
+- **Hugging Face Hub download** (`--hf-repo`, `nftool download`), with the llama.cpp cache-root precedence and `HF_TOKEN` auth.
+- **PyTorch pickle checkpoints** (`.bin`/`.pt`/`.pth`) load through a restricted unpickler that refuses unsafe opcodes by name.
+- **Control vectors** applied at inference (`ops/heads/ControlVector`); vector generation is pending.
+- **imatrix file I/O** (`quant/write/ImatrixFile`), llama.cpp GGUF and legacy `.dat` forms.
+- **Programmatic chat requests** (`gguf/chat`) and the `SequenceRun` per-sequence stepping API (`engine/SequenceRun`).
 - **LoRA adapters** on the CPU and the GPU.
 - **llama.cpp tokenizers** (SentencePiece, BPE with 63 pre-tokenizers, Unigram, WordPiece, RWKV, PLaMo) and Jinja chat templates.
 - **llama.cpp's sampler chain** and defaults.
@@ -248,8 +257,10 @@ com.eonmux.neuralfree
 ├── io/               Model serialization, ONNX export
 ├── gguf/             GGUF engine: arch, hparams, spec, tokenizer, jinja, chat, quant, memory,
 │                     ops, cpu, gpu, engine
+├── server/           Quarkus serving module (endpoints pending)
 └── demo/             Runnable demos (DemoRunner, MLPDemo, CNNDemo, GNNDemo, TransformerDemo,
-                      AutogradDemo, InferenceDemo, GpuMatmulDemo, LLMDemo)
+                      AutogradDemo, InferenceDemo, GpuMatmulDemo, LLMDemo) and the tools
+                      (NfTool, DownloadCommand, ExportCommand, CvectorGenerator)
 ```
 
 ### GPU kernel libraries
@@ -293,7 +304,6 @@ The build writes the CUDA modules and the SPIR-V under `build/generated/gpu`, an
   - [Distributed training](TRAINING.md#distributed-training), [Reinforcement learning](TRAINING.md#reinforcement-learning) and [Meta-learning and distillation](TRAINING.md#meta-learning-and-distillation);
   - [Inference, quantization and export](TRAINING.md#inference-quantization-and-export) and [Classical ML](TRAINING.md#classical-ml-and-other-packages).
 - [LLM-INFERENCE.md](LLM-INFERENCE.md): the GGUF engine, covering model selection, backends, the programmatic API, weight types, tokenizers, sampling, memory and model modes.
-- [LLAMACPP-PARITY.md](LLAMACPP-PARITY.md): the per-architecture matrix and the cache, speculative, LoRA, encoder-decoder, diffusion and audio support compared with llama.cpp.
 - [GAPS.md](GAPS.md): known limitations and defects.
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md): how to contribute and how to report a vulnerability.
 - [LICENSE](LICENSE), [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md), [NOTICE](NOTICE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md): the licence terms.

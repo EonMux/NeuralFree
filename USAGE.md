@@ -27,8 +27,14 @@ This guide covers:
    - [Supported quantization formats](#supported-quantization-formats)
    - [Rejected formats](#rejected-formats)
    - [Supported architectures](#supported-architectures)
-6. [System properties](#system-properties)
-7. [Troubleshooting](#troubleshooting)
+6. [Hugging Face Hub download](#hugging-face-hub-download)
+7. [nftool](#nftool)
+8. [Grammar-constrained generation](#grammar-constrained-generation)
+9. [Paged KV memory](#paged-kv-memory)
+10. [Control vectors](#control-vectors)
+11. [imatrix](#imatrix)
+12. [System properties](#system-properties)
+13. [Troubleshooting](#troubleshooting)
 
 ## Build
 
@@ -233,6 +239,8 @@ Every flag below is parsed by `LLMDemoOptions`. `--help` prints the same list.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--model`, `-m <path>` | GGUF file or Hugging Face checkpoint (directory or `.safetensors` file); see [Hugging Face checkpoints](#hugging-face-checkpoints) and [LLM-INFERENCE.md](LLM-INFERENCE.md#selecting-a-model) | see [LLM-INFERENCE.md](LLM-INFERENCE.md#selecting-a-model) |
+| `--hf-repo`, `-hf <user>/<model>[:quant][@revision]` | Download a model from the Hugging Face Hub and open it; the quant defaults to `Q4_K_M`, then `Q8_0`. `HF_HUB_OFFLINE=1` uses the cache only. Excludes `--model` ([Hugging Face Hub download](#hugging-face-hub-download)) | none |
+| `--hf-file`, `-hff <name>` | File inside the `--hf-repo` repository, replacing the default choice | none |
 | `--prompt`, `-p <text>` | Run one prompt instead of the console chat | console chat |
 | `--system <text>` | System prompt | `You are a helpful assistant.` |
 | `--raw` | Use the prompt verbatim, without the chat template | off |
@@ -309,10 +317,12 @@ The demo's defaults apply only where no `neuralfree.*` sampler property is set. 
 |---|---|---|
 | `--draft`, `-md`, `--model-draft <gguf>` | Drafter: a small model, an MTP draft file, eagle3, gemma4-assistant or dflash | none |
 | `--mtp` | Draft with the target's own NextN/MTP blocks (excludes `--draft`) | off |
-| `--spec-type <t>` | How the draft file drafts: `auto` (detected from the file), `draft-mtp` (alias `mtp`: its NextN/MTP blocks; without `--draft`, the target's own) or `draft-simple` (aliases `simple`, `model`: a separate draft model) | `auto` |
+| `--spec-type <t>` | How drafting runs: `auto` (detected from the file); `draft-mtp` (alias `mtp`: the file's NextN/MTP blocks; without `--draft`, the target's own); `draft-simple` (aliases `simple`, `model`: a separate draft model); `ngram-simple` (alias `prompt-lookup`); `ngram-map` (aliases `ngram-map-k`, `map-k`, `ngram-map-k4v`, `map-k4v`, `ngram-mod`, `mod`); `ngram-cache`; `suffix` — the n-gram and suffix drafters draft from the prompt and the output and need no draft file | `auto` |
 | `--draft-max`, `--draft-n-max`, `--spec-draft-n-max <n>` | Maximum drafted tokens per round | 3 |
 | `--draft-min`, `--draft-n-min`, `--spec-draft-n-min <n>` | Minimum draft length that is verified | 0 |
 | `--draft-p-min`, `--spec-draft-p-min <p>` | Stop drafting below this probability | 0 |
+
+How drafted tokens are verified is programmatic only: `SpeculativeDecoder.Builder.verifyMode(...)` selects the mode (`match`, `rejection`, `block`, `fly`, `synthetic`). No command-line flag exposes it.
 
 ### LoRA adapters
 
@@ -358,7 +368,7 @@ The engine opens a Hugging Face checkpoint wherever it opens a GGUF file. Format
 2. A directory containing `config.json` plus `*.safetensors` files — or `params.json` plus `consolidated*.safetensors` — is an HF checkpoint. Line endings, dtype names, index files (`*.safetensors.index.json`) and per-shard files are all handled; encoder-decoder, diffusion, embedding, reranker, audio and drafter architectures load like their GGUF counterparts.
 3. A directory without safetensors files that holds exactly one `.gguf` file, or one split set `*-00001-of-NNNNN.gguf`, opens that GGUF (the `gguf` load format vLLM and SGLang use).
 4. A directory with `adapter_config.json` and `adapter_model.safetensors` is a PEFT adapter: it attaches to a base model through `--lora` (`ModelSources.openAdapter`), and as a model it is refused with a message saying so.
-5. Only `pytorch_model*.bin`, `*.pt` or `*.pth` files: refused; pickle checkpoints are untrusted code ([GAPS.md](GAPS.md)).
+5. Only `pytorch_model*.bin`, `*.pt` or `*.pth` files: a torch pickle checkpoint, which loads through a restricted unpickler (`TorchCheckpointFactory` in `CheckpointContainers`); unsafe opcodes and non-tensor payloads are refused by name at load ([GAPS.md](GAPS.md)).
 
 A parsed HF checkpoint becomes the same `ModelSource` view a GGUF file produces ([LLM-INFERENCE.md](LLM-INFERENCE.md#model-sources)), so `--backend`, `--ctx`, `--kv-type`, `--mtp`, `--lora`, `--draft` and the sampler flags mean the same thing on both paths. On disk it needs nothing beside the checkpoint: the derived tensor cache below points at `~/.cache/neuralfree/hf` and is created only when derivations spill.
 
@@ -375,7 +385,7 @@ These flags set the matching `ModelSourceOptions` or `EngineConfig` fields. An e
 | `--quant-online none\|q8_0\|q4_0\|q4_1\|q5_0\|q5_1\|iq4_nl` | `neuralfree.quant.online` | `none` | Online quantization of float matmul weights with llama-quantize eligibility |
 | `--hf-quant-exact` | `neuralfree.hf.quant.exact` | off | Prefer bit-exact weight types over close repacks ([Supported quantization formats](#supported-quantization-formats)) |
 | `--hf-no-mtp` | `neuralfree.hf.mtp` | true | The flag keeps the model's MTP/NextN layers out (the converter's `no_mtp`); the property set to `true` includes them again |
-| `--hf-st-dense true\|false` | `neuralfree.hf.st.dense` | `true` | Include sentence-transformers `2_Dense`/`3_Dense` heads; `false` reproduces the converter's default off ([LLAMACPP-PARITY.md](LLAMACPP-PARITY.md#hugging-face-checkpoints)) |
+| `--hf-st-dense true\|false` | `neuralfree.hf.st.dense` | `true` | Include sentence-transformers `2_Dense`/`3_Dense` heads; `false` reproduces the converter's default off |
 | `--hf-overrides <json>` | `neuralfree.hf.overrides` | none | JSON object merged into `config.json` before conversion (vLLM's `hf_overrides`) |
 | `--hf-tokenizer <dir\|file.gguf>` | `neuralfree.hf.tokenizer` | none | Tokenizer files from another directory, or the `tokenizer.*` keys of a GGUF file, replacing the model's |
 | `--act-quant weight-only\|checkpoint` | `neuralfree.act.quant` | `weight-only` | Activation quantization ([Activation quantization](#activation-quantization)) |
@@ -658,6 +668,39 @@ An HF checkpoint is recognized by its `config.json` `architectures[0]` name. The
 | `wavtokenizer-dec` | 1 | `WavTokenizerDec` |
 | `xverse` | 1 | `XverseForCausalLM` |
 
+## Hugging Face Hub download
+
+`--hf-repo <user>/<model>[:quant][@revision]` (short `-hf`) downloads a model from the Hugging Face Hub and opens it; it excludes `--model`. The `:quant` defaults to `Q4_K_M`, then `Q8_0`; `@revision` names a branch or commit. `--hf-file <name>` (short `-hff`) picks a concrete file in the repository instead of the default choice. `HF_HUB_OFFLINE=1` resolves from the cache only and refuses to download. Requests authenticate with the `HF_TOKEN` environment variable.
+
+The cache root follows llama.cpp's environment precedence (`HubCache`): `LLAMA_CACHE`, then `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME/hub`, `XDG_CACHE_HOME/huggingface/hub`, and finally `~/.cache/huggingface/hub`. `nftool download` fills the same cache (below).
+
+## nftool
+
+`demo/tools/NfTool` is the maintenance CLI. Two subcommands are implemented:
+
+| Subcommand | Flags | Meaning |
+|---|---|---|
+| `export` | `--mode native\|compat\|compat-exact`, `--overwrite`, `--vocab-only`, `--split-max-tensors <n>`, `--split-max-size <n[K\|M\|G]>` | Write a model's GGUF view, as `--export-gguf` does |
+| `download` | the `--hf-repo` spec above | Download from the Hugging Face Hub into the cache root |
+
+Every other listed subcommand (`quantize`, `imatrix`, `perplexity`, `results`, `bench`, `batched-bench`, `split`, `merge`, `export-lora`, `tokenize`, `dump`, `hash`, `embedding`, `retrieval`, `cvector`) refuses with a `not implemented yet` message naming the subcommand.
+
+## Grammar-constrained generation
+
+`gguf/grammar` constrains sampling to a grammar: a `GbnfBuilder`/`GbnfParser` pair runs GBNF grammars (`Grammar`, `GrammarLimits`), and a `ConstraintSpec` selects the kind — `GBNF`, `JSON_SCHEMA` (compiled by `JsonSchemaToGbnf`), `JSON_OBJECT`, `REGEX` (compiled by `RegexToGbnf`), `CHOICE` and `STRUCTURAL_TAG`. The constraint runs as the `GrammarStage` of the sampler chain. The API is programmatic; structural-tag specs parse no input yet ([GAPS.md](GAPS.md)).
+
+## Paged KV memory
+
+`gguf/memory/paged` keeps the rows of a KV group in reference-counted pages instead of one buffer per sequence: `PagePool`, `PageList`, `PagedSequences`, `PagedStep`, `PageCopy` and `RowParts`. It is property-gated, not the engine default: `neuralfree.kv.paged=true` forces it for a single sequence, and `neuralfree.parallel > 1` selects it; `neuralfree.kv.page.size` (default 16, a power of two in [1, 256]) sizes the pages and `neuralfree.kv.unified` (default true) shares the whole context between the sequences. Without the properties, `ModelMemory.sequences()` returns `SingleSequenceMemory`.
+
+## Control vectors
+
+`ops/heads/ControlVector` (with `ControlVectorExtra` and `CpuControlVectorExtra`) applies a control vector to the hidden states at inference. `CvectorGenerator` (`demo/tools`) generates the data side (PCA over prompt pairs) and writes the GGUF; its prefill loop is pending ([GAPS.md](GAPS.md)).
+
+## imatrix
+
+`quant/write/ImatrixFile` reads and writes llama.cpp importance-matrix files, both the GGUF form and the legacy `*.dat` form. No statistics collector runs in the engine yet ([GAPS.md](GAPS.md)).
+
 ## System properties
 
 Every `neuralfree.*` system property the code reads is listed below. Every Gradle run task (`runApp`, `runDemos`, `runLLMDemo`) forwards `-Pneuralfree.x=y` and `-Dneuralfree.x=y` to the program's JVM; pass them to your own JVM as `-Dneuralfree.x=y`. The build properties are under [Build](#build). The demo's command-line flags take precedence over the engine properties they correspond to.
@@ -714,6 +757,10 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.context.shift` | Shift the context when full instead of stopping | false |
 | `neuralfree.state.snapshots` | Reserve recurrent-state snapshot buffers | true when speculative decoding is configured |
 | `neuralfree.nextn.memory` | Place the model's NextN/MTP blocks and their caches in the fit | true when `neuralfree.mtp` is set |
+| `neuralfree.parallel` | Sequences the memory holds at once (llama.cpp's `-np`), 1-256; above 1 selects the paged KV memory ([Paged KV memory](#paged-kv-memory)) | 1 |
+| `neuralfree.kv.paged` | Force the paged KV memory for a single sequence ([Paged KV memory](#paged-kv-memory)); property-gated, not the engine default | false |
+| `neuralfree.kv.page.size` | Page size of the paged KV pools, a power of two in [1, 256] | 16 |
+| `neuralfree.kv.unified` | Share the whole context between the `neuralfree.parallel` sequences instead of one pool per sequence | true |
 
 ### Sampling (`SamplerConfig.fromProperties`)
 
@@ -730,6 +777,23 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.repeat.last.n` | Penalty window; `-1` = whole context | 64 |
 | `neuralfree.seed` | Seed; `-1` = random | -1 |
 | `neuralfree.greedy` | Argmax decoding | false |
+| `neuralfree.samplers` | Comma list of stages overriding the default chain order (`StageKind.parseOrder`); an unknown stage is rejected naming the property | llama.cpp's order |
+| `neuralfree.min.keep` | Minimum keep count shared by top-k, top-p, min-p and typical-p | llama.cpp's |
+| `neuralfree.dry.multiplier` | DRY repetition strength; `0` disables the stage | 0 |
+| `neuralfree.dry.base` | DRY exponential-penalty base; below 1 disables the stage | llama.cpp's |
+| `neuralfree.dry.allowed.length` | DRY length the penalty starts at | llama.cpp's |
+| `neuralfree.dry.penalty.last.n` | DRY window of accepted tokens; `0` disables the stage | 0 |
+| `neuralfree.dry.sequence.breakers` | DRY restart sequences | llama.cpp's |
+| `neuralfree.top.n.sigma` | Top-n-sigma; `0` and below disables the stage | 0 |
+| `neuralfree.xtc.probability` | XTC trim probability; `0` disables the stage | 0 |
+| `neuralfree.xtc.threshold` | XTC probability threshold; above 0.5 disables the stage | llama.cpp's |
+| `neuralfree.mirostat` | Mirostat version: `0` off, `1` or `2` | 0 |
+| `neuralfree.mirostat.tau` | Mirostat target entropy | llama.cpp's |
+| `neuralfree.mirostat.eta` | Mirostat learning rate | llama.cpp's |
+| `neuralfree.dynatemp.range` | Dynamic-temperature half-width; `0` keeps the plain scaling | 0 |
+| `neuralfree.dynatemp.exponent` | Dynamic-temperature entropy exponent | llama.cpp's |
+| `neuralfree.adaptive.target` | adaptive-p's target probability; negative disables the adaptation | off |
+| `neuralfree.adaptive.decay` | adaptive-p's EMA decay | llama.cpp's |
 
 ### Loading, CPU and diagnostics
 

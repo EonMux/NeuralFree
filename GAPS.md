@@ -1,6 +1,6 @@
 # NeuralFree: Known Limitations
 
-This page lists only limitations that can be checked against the code. Each item names the class, or the file and line, that refuses the operation or holds the defect. For what the GGUF engine does support, see [LLM-INFERENCE.md](LLM-INFERENCE.md) and [LLAMACPP-PARITY.md](LLAMACPP-PARITY.md); for the training framework, see [TRAINING.md](TRAINING.md) and [USAGE.md](USAGE.md#the-training-framework-on-a-gpu-backend).
+This page lists only limitations that can be checked against the code. Each item names the class, or the file and line, that refuses the operation or holds the defect. For what the GGUF engine does support, see [LLM-INFERENCE.md](LLM-INFERENCE.md); for the training framework, see [TRAINING.md](TRAINING.md) and [USAGE.md](USAGE.md#the-training-framework-on-a-gpu-backend).
 
 ## GGUF engine: out of scope
 
@@ -67,6 +67,9 @@ This page lists only limitations that can be checked against the code. Each item
   - an MLA layer with a position bias is refused;
   - an MLA layer with a Q-interleaved gate is refused;
   - per-head MLA products take plain weights, so a PRISM Hadamard or a tensor scale on them is refused (`GpuMlaMixer`, `CpuMlaMixer`).
+- **Paged KV memory is not the default.** The paged form (`memory/paged`: `PagePool`, `PageList`, `PagedSequences`, `PagedStep`, `PageCopy`, `RowParts`) runs only when `neuralfree.kv.paged=true` or `neuralfree.parallel > 1`; by default `ModelMemory.sequences()` returns `SingleSequenceMemory`, and `PagedSequences` has no production call site (tests only).
+- **The paged flash-attention kernels have no caller.** `AttnKernels` lists `FLASH_DECODE_PAGED_*` and `FLASH_ATTN_PAGED_*` (OpenCL and GLSL sources, in the `kernels/llm` inventory), but no mixer dispatches them: `GpuAttentionMixer` reads the base kernels.
+- **Batched steps are refused by default.** `ForwardBackend.forwardBatch` throws unless the step holds a single sequence (`batchRefusal`); `GpuForwardBackend` does not override it, so a caller that raises `neuralfree.parallel` drives the sequences itself.
 
 ## GGUF engine: weights and devices
 
@@ -99,19 +102,30 @@ This page lists only limitations that can be checked against the code. Each item
 - **Draft-class files** (eagle3, gemma4-assistant, dflash) load only beside a target, as drafters (`GGUFModel`, `GGUFModelGPU`, `DraftModelLoader`).
 - **Models without a vocabulary** (`tokenizer.ggml.model = none`) cannot tokenize text (`NoVocabTokenizer`).
 - **Legacy `generate`.** The positional `LLMModel.generate(...)` overloads refuse request features they cannot honour (`LLMModel`). Use `generate(int[], GenerationRequest, TokenCallback)`.
+- **Structural-tag constraints parse no input.** `ConstraintSpec` accepts the `STRUCTURAL_TAG` kind, but the grammar engine has no consumer for it: nothing compiles a structural-tag spec into sampler stages (`gguf/grammar`).
+- **No logprobs.** `GenerationResult` carries the tokens, the text and the stop reason; per-token logprobs and alternative tokens are not produced (`engine/GenerationResult`).
 
 ## HF checkpoint loading
 
 Hugging Face checkpoints open through the same engine ([USAGE.md](USAGE.md#hugging-face-checkpoints)). These parts are refused or carried but unused:
 
 - **Vision/audio tower conversion.** An HF checkpoint's MMPROJ tower (vision or audio encoder) is not converted: the generated `HfArchTableMmproj` rows and `ModelSources.openProjector` reserve the seam, but the tower hook classes (67 converter classes) are not ported, because the engine has no vision or audio encoder to feed. The tower tensors are dropped and what was dropped is recorded (`neuralfree.hf.dropped_prefixes`); the checkpoint's text side loads and runs. The MMPROJ epic owns the conversion.
-- **FP8 KV-cache scales are carried but unused.** A checkpoint's `kv_scale`, `q_scale` and attention-prob scales are loaded as the per-layer tensors `blk.N.attn_k.kv_scale`, `blk.N.attn_v.kv_scale`, `blk.N.attn_q.q_scale` and `blk.N.attn_prob_scale`, but attention does not consume them: the FP8 KV cache is a cache-dtype feature, not a loading feature (`KvScaleCollector` emits the tensors; the cache-side consumer is the parity plan's QN-1).
-- **Pickle checkpoints are rejected.** `pytorch_model*.bin`, `*.pt` and `*.pth` are not read: unpickling executes code. `CheckpointContainers` is the registry a restricted pickle container attaches to; until then the load refuses them with a named error.
+- **FP8 KV-cache scales are carried but unused.** A checkpoint's `kv_scale`, `q_scale` and attention-prob scales are loaded as the per-layer tensors `blk.N.attn_k.kv_scale`, `blk.N.attn_v.kv_scale`, `blk.N.attn_q.q_scale` and `blk.N.attn_prob_scale`, but attention does not consume them: the FP8 KV cache is a cache-dtype feature, not a loading feature (`KvScaleCollector` emits the tensors; the cache-side consumer is not written yet).
+- **Pickle checkpoints load, but only torch's own payload.** `pytorch_model*.bin`, `*.pt` and `*.pth` are read by `TorchCheckpointFactory`, a built-in `CheckpointContainers` factory, through `RestrictedUnpickler`, a pickle-bytecode interpreter that accepts opcodes and globals by allow-list. Everything else is refused with a named error at load: a `STACK_GLOBAL` or `REDUCE` outside the allow-list (torch's `_rebuild_tensor_v2` and the standard dict/list primitives are what is on it), a `BUILD` whose state is not a dict or an item list, a `BINPERSID` whose persistent id does not resolve to tensor storage, and pickles past the size, opcode-count, stack and string limits. Object graphs, custom classes and non-tensor payloads are therefore refused, not silently loaded.
 - **torchao and Ascend ModelSlim checkpoints are rejected.** Their tensor layouts are defined in packages not on disk, so no layout can be specified without guessing; both are refused with a named error. The registry-based online quantizer (`OnlineQuantizers`) is the seam these formats attach through later.
 - **Other refused quantization formats.** `checkpoint_format: marlin`, compressed-tensors `sparsity_config`, the `quant_method`s `aqlm`, `eetq`, `vptq`, `spqr`, `higgs` and `quanto`, and Quark two-level weight specs (see [USAGE.md](USAGE.md#rejected-formats) for the reasons): vLLM rejects, deprecates or has removed each, and NF matches. The same refusal covers compressed-tensors transforms outside the input location (`output`, `k_cache`, `q_attn`), non-Hadamard transform types, and fp_quant's `transform_init: gsr`.
 - **K-quant, IQ and FP8 online quantization.** `--quant-online` quantizes float matmul weights into Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL only. Online quantization into K-quants, IQ types, FP8 and TQ/MXFP4 has no quantizer registered yet (`OnlineQuantizers` is the seam); a float tensor is served at full precision or F32-fallbacked when its target type is not among these.
-- **Tensor-core W8A8/FP8 kernels.** `--act-quant checkpoint` fake-quantizes input activations and runs the unchanged weight kernel, so it computes exactly (no speedup). Real int8/FP8 Tensor Core GEMM kernels, and real int8 GEMM speedups for the extension types, are not implemented (`ActQuantScheme` has the schemes; the kernels are the parity plan's QN-5).
-- **vLLM draft classes.** As HF draft checkpoints, NF loads EAGLE-3 and its vLLM alias classes with the Llama-EAGLE3 layout, the DFlash/DSpark drafters and the Gemma-4 assistant. EAGLE-1 (`Eagle*ForCausalLM` and `EagleDeepSeekMTPModel`), the remaining `Eagle3Qwen3*`/`PeagleQwen3*`/`Eagle3Deepseek*` classes, `DFlash2BeamDraftModel`, `DSparkV41DraftModel`, `Qwen3OmniDSparkModel`, `K3DSparkModel`, `DFlashLagunaForCausalLM` and standalone MTP checkpoints are refused: the draft-class table (`HfArchTableDrafts`) covers them when the speculative-decoding parity plan's SP-4 registers them.
+- **Tensor-core W8A8/FP8 kernels.** `--act-quant checkpoint` fake-quantizes input activations and runs the unchanged weight kernel, so it computes exactly (no speedup). Real int8/FP8 Tensor Core GEMM kernels, and real int8 GEMM speedups for the extension types, are not implemented (`ActQuantScheme` has the schemes; no such kernels exist).
+- **vLLM draft classes.** As HF draft checkpoints, NF loads EAGLE-3 and its vLLM alias classes with the Llama-EAGLE3 layout, the EAGLE-1 heads (`EagleForCausalLM`, `EagleModel`, `EagleLlamaModel`, SGLang's `LlamaEagleForCausalLM` alias, and `EagleDeepSeekMTPModel`, through `ArchTableDraft` and `HfEagle1Hooks`), the DFlash/DSpark drafters and the Gemma-4 assistant. The remaining `Eagle3*`/`Peagle*`/`Eagle3Deepseek*` fusion classes (for example `Eagle3MiniMaxM2ForCausalLM`, `PeagleLlamaForCausalLM`, `PEagleDraftModel`), `DFlash2BeamDraftModel`, `DSparkV41DraftModel`, `Qwen3OmniDSparkModel`, `K3DSparkModel`, `DFlashLagunaForCausalLM` and standalone MTP checkpoints are refused: the draft-class table (`HfArchTableDrafts`) has no rows for them.
+
+- **Speculative verify modes are programmatic only.** How drafted tokens are checked — `match`, `rejection`, `block`, `fly` or `synthetic` — is set through `SpeculativeDecoder.Builder.verifyMode(...)`; no command-line flag exposes it (`--spec-type` selects the drafter, never the verifier).
+
+## Demo tools
+
+- **nftool implements two subcommands.** `demo/tools/NfTool` runs `export` (`--mode native|compat|compat-exact`, `--overwrite`, `--vocab-only`, `--split-max-tensors`, `--split-max-size`) and `download`; every other listed subcommand (`quantize`, `imatrix`, `perplexity`, `results`, `bench`, `batched-bench`, `split`, `merge`, `export-lora`, `tokenize`, `dump`, `hash`, `embedding`, `retrieval`, `cvector`) refuses with `not implemented yet`.
+- **Control-vector generation stops at the prefill loop.** `CvectorGenerator` builds the prompt-pair data and writes the GGUF output, but refuses at the prefill loop, so it produces no vectors yet; its route is not wired into `NfTool`.
+- **No in-engine imatrix collector.** `quant/write/ImatrixFile` reads and writes llama.cpp imatrix files (the GGUF form and the legacy `*.dat` form); nothing computes importance-matrix statistics during a generation.
+- **The `server/` module serves nothing.** It is a Quarkus scaffold (in `settings.gradle`, Java 21 toolchain, extensions wired, bound to `127.0.0.1:8080`) whose only source is `package-info.java`: zero endpoints. `server/package-info.java` says the adapters come later.
 
 ## Training framework: device execution
 

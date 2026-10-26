@@ -97,7 +97,7 @@ The Gradle run tasks forward every `neuralfree.*` property given with `-P` or `-
 
 ## 5. Run a GGUF model
 
-`runLLMDemo` runs any GGUF model that llama.cpp runs, for example one downloaded from Hugging Face. It needs no native library. It also runs a Hugging Face checkpoint directory directly, with no conversion step (see [Hugging Face checkpoints](#hugging-face-checkpoints)). The model path is taken from the first of these that is set:
+`runLLMDemo` runs any GGUF model that llama.cpp runs, for example one downloaded from Hugging Face. It needs no native library. It also runs a Hugging Face checkpoint directory directly, with no conversion step (see [Hugging Face checkpoints](#hugging-face-checkpoints)), and downloads a model from the Hub with `-hf <user>/<model>` (see [USAGE.md](USAGE.md#hugging-face-hub-download)). The model path is taken from the first of these that is set:
 1. `--model <path>` (or `-m <path>`);
 2. `-Pneuralfree.model=<path>`;
 3. the `NEURALFREE_MODEL` environment variable.
@@ -126,6 +126,12 @@ Without any of them, `runLLMDemo` prints these options and exits with status 2.
 
 # Print the memory plan and exit
 ./gradlew runLLMDemo -Pargs="--model /path/to/model.gguf --vram-budget"
+
+# Download from the Hugging Face Hub (default quant Q4_K_M, then Q8_0; HF_HUB_OFFLINE=1 uses the cache only)
+./gradlew runLLMDemo -Pargs="-hf <user>/<model> --prompt 'Explain recursion' --temp 0"
+
+# N-gram (prompt-lookup) speculation, no draft file needed
+./gradlew runLLMDemo -Pargs="--model /path/to/model.gguf --prompt 'The capital of France is' --spec-type ngram-simple"
 
 # Every flag
 ./gradlew runLLMDemo -Pargs="--help"
@@ -408,6 +414,5 @@ try (EngineModel llm = LLMModelFactory.open("/path/to/model.gguf", cfg)) {
 - [TRAINING.md](TRAINING.md): the training framework's API in full.
 - [USAGE.md](USAGE.md): the build, backends, how the framework uses a GPU backend, and the complete LLMDemo reference.
 - [LLM-INFERENCE.md](LLM-INFERENCE.md): the GGUF engine and its Java API.
-- [LLAMACPP-PARITY.md](LLAMACPP-PARITY.md): which architectures run and how.
 - [GAPS.md](GAPS.md): known limitations.
 - [LICENSE](LICENSE) and [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md): the licence terms, including when a commercial licence is required (above USD 20 million in revenue).

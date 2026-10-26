@@ -8,8 +8,6 @@ Both paths are driven by the same resolved `ModelSpec`. A Hugging Face checkpoin
 
 Related pages:
 - [USAGE.md](USAGE.md#hugging-face-checkpoints): HF flags, materialization, quantization formats, supported architectures.
-- [LLAMACPP-PARITY.md](LLAMACPP-PARITY.md#hugging-face-checkpoints): what the HF loader does and does not imitate llama.cpp with.
-- [LLAMACPP-PARITY.md](LLAMACPP-PARITY.md): the per-architecture status.
 - [GAPS.md](GAPS.md): what the engine refuses.
 
 **Verification status.** The engine was verified by:
@@ -75,7 +73,8 @@ The path is detected by content, not by name ([USAGE.md](USAGE.md#hugging-face-c
 - a directory with safetensors files and a `config.json` (or the Mistral-native `params.json` with `consolidated*.safetensors`) is an HF checkpoint;
 - a directory without safetensors files that holds exactly one `.gguf`, or one split set, opens that GGUF;
 - a directory with `adapter_config.json` is a PEFT adapter and is refused as a model: it attaches with `--lora` to its base model;
-- a directory with only pickle files (`pytorch_model*.bin`, `*.pt`, `*.pth`) is refused: untrusted code.
+- a directory with only pickle files (`pytorch_model*.bin`, `*.pt`, `*.pth`) is a torch pickle checkpoint, which loads through a restricted unpickler (`TorchCheckpointFactory` in `CheckpointContainers`); unsafe opcodes and non-tensor payloads are refused by name at load;
+- `--hf-repo <user>/<model>[:quant][@revision]` (short `-hf`, with `--hf-file` to name a file) downloads from the Hugging Face Hub and opens the download; it excludes `--model` ([USAGE.md](USAGE.md#hugging-face-hub-download)).
 
 ## Model sources
 
@@ -92,7 +91,7 @@ Every consumer of a model sees one interface, `com.eonmux.neuralfree.gguf.ModelS
 
 ### The HF pipeline order
 
-`HfModelSource` assembles the HF view the way the llama.cpp converter does, so that the output equals `convert_hf_to_gguf.py`'s ([LLAMACPP-PARITY.md](LLAMACPP-PARITY.md#hugging-face-checkpoints)). The steps run in this order, each reading the previous's results:
+`HfModelSource` assembles the HF view the way the llama.cpp converter does, so that the output equals `convert_hf_to_gguf.py`'s. The steps run in this order, each reading the previous's results:
 
 1. **Config fixup.** `config.json` is read, `text_config` is merged (it wins), sub-config renames apply, `--hf-overrides` values are merged, and `generation_config.json` is taken raw (then mapped by the system properties, see below). `architectures[0]` names the entry of the arch registry, whose static tables and hook classes resolve the architecture.
 2. **Tokenizer location.** The tokenizer files (also `--hf-tokenizer`) overlay the checkpoint's: `tokenizer.json`, `tokenizer.model` (SentencePiece), `*.tiktoken`, `tekken.json`, `rwkv_vocab_v*.txt`, `tokenizer.jsonl` (PLaMo), WordPiece and Unigram installations.
@@ -161,7 +160,7 @@ try (EngineModel model = LLMModelFactory.open("/path/to/model.gguf", cfg)) {
 ```
 
 Other entry points:
-- **Speculative decoding.** `LLMModelFactory.openSpeculative(targetPath, draftPath, cfg)`, or `LLMModelFactory.speculate(model, cfg)` with `cfg.draftModelPath()` or `cfg.mtp()` set, returns a `SpeculativeSession`. Its `generate` has the same signature. `EngineConfig.Builder.draftType(EngineConfig.DraftType)` forces how a draft file drafts (`AUTO`, `MTP`, `MODEL`), as `--spec-type` does. Before planning, `LLMModelFactory.open` reads the configured draft file's metadata to size the DeepSeek-V4 compressor rollback snapshots (`n_rs_seq`); a draft file that cannot be read or bound gets 0 snapshots and a warning, and the target still opens. `MemoryConfig.Builder.rollbackSnapshots(int)` overrides the derived value.
+- **Speculative decoding.** `LLMModelFactory.openSpeculative(targetPath, draftPath, cfg)`, or `LLMModelFactory.speculate(model, cfg)` with `cfg.draftModelPath()` or `cfg.mtp()` set, returns a `SpeculativeSession`. Its `generate` has the same signature. `EngineConfig.Builder.draftType(EngineConfig.DraftType)` forces how drafting runs (`AUTO`, `MTP`, `MODEL`, or the n-gram and suffix drafters, as `--spec-type` does). The verify mode is programmatic only: `SpeculativeDecoder.Builder.verifyMode(...)` takes `match`, `rejection`, `block`, `fly` or `synthetic`; no flag exposes it. Before planning, `LLMModelFactory.open` reads the configured draft file's metadata to size the DeepSeek-V4 compressor rollback snapshots (`n_rs_seq`); a draft file that cannot be read or bound gets 0 snapshots and a warning, and the target still opens. `MemoryConfig.Builder.rollbackSnapshots(int)` overrides the derived value.
 - **Inspection.** `LLMModelFactory.inspect(path, memoryConfig)` resolves the `ModelSpec` without loading weights. `LLMModelFactory.memoryPlan(model)` returns the fitted plan.
 - **Caller-owned backend.** `LLMModelFactory.open(path, cfg, backend)` opens the model on a backend the caller created and keeps owning, with the same CPU fallback. A device filter in `cfg` has no effect then.
 - **Direct construction.** `new GGUFModelGPU(path)`, `new GGUFModelGPU(path, backend)` and `new GGUFModelGPU(path, backend, cfg)` open on the GPU; `new GGUFModel(path)` and `new GGUFModel(path, cfg)` open on the CPU. They do not fall back. A model given a backend does not close it.
@@ -174,16 +173,23 @@ Other entry points:
   - `decodeAudioCodes(int[])`;
   - `supportClass()`, `spec()`, and metadata accessors (`architecture()`, `contextLength()`, `embeddingLength()`, `layerCount()`, `vocabSize()`, ...).
 - **Legacy positional `generate`.** The overloads `generate(int[] tokens, int maxNewTokens, float temperature, float topP, ...)` remain for older callers.
+- **SequenceRun** (`engine/SequenceRun`): the per-sequence token pipeline the loop is built from — `over(...)` to open, `next(float[])` per step, then `accept`, `offer`, `stop` and `result` — for callers that step the generation themselves.
+- **Chat requests** (`gguf/chat`): `ChatRequest`, `ChatMessages`, `ChatTool`, `ChatTemplateSource`, `ChatFormatter` and `ToolChoice` model a chat completion programmatically, independent of the demo.
+- **Grammar constraints** (`gguf/grammar`): a `ConstraintSpec` of kind `GBNF`, `JSON_SCHEMA`, `JSON_OBJECT`, `REGEX` or `CHOICE` is compiled by the GBNF engine (`GbnfBuilder`, `GbnfParser`, `Grammar`, `GrammarLimits`, `JsonSchemaToGbnf`, `RegexToGbnf`) and runs as the sampler chain's `GrammarStage`; structural-tag specs parse no input yet.
+- **Speculative drafters without a draft file.** `NgramDrafter` (prompt-lookup and map variants), `SuffixDrafter` and `DrafterChain` draft from the prompt and the output; `SpeculativeDecoder.Builder.verifyMode(...)` selects how drafts are verified (`match`, `rejection`, `block`, `fly`, `synthetic`).
+- **Importance matrices** (`quant/write/ImatrixFile`): read and write llama.cpp imatrix files, GGUF and legacy `.dat`.
+- **Control vectors** (`ops/heads/ControlVector`, with `ControlVectorExtra` and `CpuControlVectorExtra`): apply a control vector to the hidden states at inference.
+- **Torch pickle checkpoints** (`hf/torch`): `TorchCheckpointFactory`, a built-in `CheckpointContainers` factory, reads `pytorch_model*.bin`/`.pt`/`.pth` through a restricted unpickler (`RestrictedUnpickler`).
 
 ## Weight types
 
 | Path | Native types | Other types |
 |---|---|---|
-| GPU (`GpuOps.supportsWeightType`, `MoeKernels`, `GemmKernels.TILED_TYPES`) | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0, Q2_0 | Dequantized to F32 on the CPU at upload (`GpuWeightUploader.TypePolicy`) |
+| GPU (`GpuOps.supportsWeightType`, `MoeKernels`, `GemmKernels.TILED_TYPES`) | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0, Q2_0, F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4, FP4_BNB | Dequantized to F32 on the CPU at upload (`GpuWeightUploader.TypePolicy`) |
 | CPU (`CpuMatVec`) | The same set except Q8_K | See below |
 
 Details:
-- **Shared kernel coverage.** Matrix-vector, tiled GEMM (prompt batches) and MoE expert kernels cover the same 29 GPU types.
+- **Shared kernel coverage.** Matrix-vector, tiled GEMM (prompt batches) and MoE expert kernels cover the same 38 GPU types.
 - **Upload type is decided per tensor.** Each tensor keeps its stored type when the backend has its kernel, so mixed-quantization files keep their per-tensor types.
 - **Large tensors.** Tensors above the device's allocation limit are split into row shards.
 - **CPU refusals.** The CPU engine refuses matmul weights of the types ggml-cpu has no vec-dot for: Q8_1, Q8_K, the integer types and F64.
@@ -191,7 +197,7 @@ Details:
 
 ### NF extension weight types
 
-Six weight types beyond ggml's ids (ids 1000-1005, `GGMLType` validity unchanged elsewhere) carry the quantization formats Hugging Face checkpoints use and llama.cpp has no type for. Every 2-D/3-D weight of one needs its inner dimension to be a whole number of blocks; a tensor that cannot be is served by its fallback instead ([USAGE.md](USAGE.md#supported-quantization-formats)).
+Nine weight types beyond ggml's ids (ids 1000-1008, `GGMLType` validity unchanged elsewhere) carry the quantization formats Hugging Face checkpoints use and llama.cpp has no type for. Every 2-D/3-D weight of one needs its inner dimension to be a whole number of blocks; a tensor that cannot be is served by its fallback instead ([USAGE.md](USAGE.md#supported-quantization-formats)).
 
 | Type | id | Block | Layout | Value |
 |---|---|---|---|---|
@@ -201,6 +207,9 @@ Six weight types beyond ggml's ids (ids 1000-1005, `GGMLType` validity unchanged
 | `I8_B128` | 1003 | 128 / 132 | `f32 d; i8 qs[128]` | `d * qs[j]` |
 | `NF4` | 1004 | 64 / 36 | `f32 absmax; u8 qs[32]` (two nibbles per byte) | `NF4_CODE[q] * absmax` |
 | `FP4_BNB` | 1005 | 64 / 36 | as NF4 | `FP4_BNB_CODE[q] * absmax` |
+| `F8_E5M2` | 1006 | 32 / 32 | `u8 qs[32]` E5M2 codes | `e5m2(qs[j])` (IEEE half high bytes), times the `.scale` |
+| `MXFP6_E3M2` | 1007 | 32 / 25 | `u8 e (E8M0); u8 qs[24]`, 32 packed 6-bit codes | `2^(e-127) * e3m2(qs[j])` |
+| `MXFP6_E2M3` | 1008 | 32 / 25 | as MXFP6_E3M2, `e2m3` codes | `2^(e-127) * e2m3(qs[j])` |
 
 Their codebooks are the output of bitsandbytes' `get_4bit_type`, normalized by the maximum magnitude. A checkpoint's `quant_map` is accepted when within 1e-4 of the codebook; a differing map makes the repack approximate, and `--hf-quant-exact` dequantizes through the stored map to F32 instead.
 
@@ -229,11 +238,7 @@ Chat templates are rendered from `tokenizer.chat_template` by the built-in Jinja
 
 ## Sampling
 
-`Sampler` runs llama.cpp's default chain:
-
-```
-logit bias -> penalties -> top-k -> typical-p -> top-p -> min-p -> temperature -> draw
-```
+The chain is built from twelve stage kinds (`engine/sampling/StageKind`): `PENALTIES`, `DRY`, `TOP_N_SIGMA`, `TOP_K`, `TYPICAL_P`, `TOP_P`, `MIN_P`, `XTC`, `TEMPERATURE` (dynamic temperature), `INFILL`, `ADAPTIVE_P` and `MIROSTAT`. `Sampler.buildChain` lays them out in that default order — llama.cpp's chain — with llama.cpp's special case that a mirostat configuration replaces the whole chain with temperature + mirostat. The `neuralfree.samplers` property overrides the order with a comma list of stage names (`StageKind.parseOrder`). `Sampler.create` appends the stages a request carries, such as the `GrammarStage` of a constraint (below).
 
 Notes:
 - **Engine defaults** (`SamplerConfig.defaults()`) are llama.cpp's: temperature 0.8, top-k 40, top-p 0.95, min-p 0.05, typical-p 1, penalties off, penalty window 64, random seed.
@@ -251,7 +256,11 @@ Notes:
   
   A user context is honoured as given. `--vram-budget` prints the plan and exits.
 - **Off-device weights.** Tensors only the host heads read are not uploaded. NextN/MTP blocks are placed on the device with `--mtp` or `neuralfree.nextn.memory`, or when an MTP drafter attaches to a model opened without them.
-- **KV cache types, rings, prefix reuse, context shift, rollback and snapshots** are described in [LLAMACPP-PARITY.md](LLAMACPP-PARITY.md#cache-features).
+- **KV cache types, rings, prefix reuse, context shift, rollback and snapshots.** The KV cache has nine row types: `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0` and `q5_1` (`KvDType`; there is no FP8 cache type — an FP8 checkpoint's KV scales are carried but attention does not consume them, see [GAPS.md](GAPS.md)). Quantized rows take an optional Hadamard rotation. Sliding-window layers keep ring caches; prefix reuse, context shift, rollback and recurrent-state snapshots are engine features ([USAGE.md](USAGE.md#memory-memoryconfigfromproperties) lists their properties, [GAPS.md](GAPS.md) the refusals).
+
+### Paged KV memory
+
+`gguf/memory/paged` keeps the rows of a KV group in reference-counted pages (`PagePool`, `PageList`, `PagedSequences`, `PagedStep`, `PageCopy`, `RowParts`) instead of one buffer per sequence. It is property-gated, not the engine default: `neuralfree.kv.paged=true` forces it for a single sequence and `neuralfree.parallel > 1` selects it; by default `ModelMemory.sequences()` returns `SingleSequenceMemory`. `neuralfree.kv.page.size` (default 16, a power of two in [1, 256]) sizes the pages, and `neuralfree.kv.unified` (default true) shares the whole context between the sequences.
 
 ## Other model modes
 

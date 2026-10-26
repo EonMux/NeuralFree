@@ -73,7 +73,7 @@ Run one class with `./gradlew test --tests 'com.eonmux.neuralfree.tensor.ShapeTe
 
 1. Fork the repository and create a branch from `main`.
 2. Keep each pull request to one change. Separate refactoring from behaviour changes.
-3. Update the documentation the change affects: the Javadoc, and the root guides (`USAGE.md`, `TRAINING.md`, `LLM-INFERENCE.md`, `LLAMACPP-PARITY.md`, `GAPS.md`) when a flag, property, API or limitation changes.
+3. Update the documentation the change affects: the Javadoc, and the root guides (`USAGE.md`, `TRAINING.md`, `LLM-INFERENCE.md`, `GAPS.md`) when a flag, property, API or limitation changes.
 4. Make sure `./gradlew build` passes. For kernel changes, also run `./gradlew inventoryCheck verifyGpuKernels` with the toolchains you have, and say in the pull request which backends you tested on.
 5. Write commit messages as `<type>: <summary>`, with `type` one of `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore` or `ci`, and a body that explains why when the summary does not.
 6. Describe in the pull request what changed, why, and how you tested it.
