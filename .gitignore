@@ -44,5 +44,11 @@ Thumbs.db
 .env
 .env.local
 
+# Plan / design working documents (local only, never committed)
+design/
+PARITY*.md
+PAUSE-STATE.md
+LLAMACPP-PARITY.md
+
 # Model files
 *.gguf
