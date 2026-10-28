@@ -238,7 +238,7 @@ Chat templates are rendered from `tokenizer.chat_template` by the built-in Jinja
 
 ## Sampling
 
-The chain is built from twelve stage kinds (`engine/sampling/StageKind`): `PENALTIES`, `DRY`, `TOP_N_SIGMA`, `TOP_K`, `TYPICAL_P`, `TOP_P`, `MIN_P`, `XTC`, `TEMPERATURE` (dynamic temperature), `INFILL`, `ADAPTIVE_P` and `MIROSTAT`. `Sampler.buildChain` lays them out in that default order — llama.cpp's chain — with llama.cpp's special case that a mirostat configuration replaces the whole chain with temperature + mirostat. The `neuralfree.samplers` property overrides the order with a comma list of stage names (`StageKind.parseOrder`). `Sampler.create` appends the stages a request carries, such as the `GrammarStage` of a constraint (below).
+The chain is built from twelve stage kinds (`engine/sampling/StageKind`): `PENALTIES`, `DRY`, `TOP_N_SIGMA`, `TOP_K`, `TYPICAL_P`, `TOP_P`, `MIN_P`, `XTC`, `TEMPERATURE` (dynamic temperature), `INFILL`, `ADAPTIVE_P` and `MIROSTAT`. `Sampler.buildChain` lays them out in that default order — llama.cpp's chain — with llama.cpp's special case that a mirostat configuration replaces the whole chain with temperature + mirostat. The `neuralfree.samplers` property overrides the order with a semicolon-separated list of stage names (`StageKind.parseOrder`, e.g. `top_k;top_p;min_p`). `Sampler.create` appends the stages a request carries, such as the `GrammarStage` of a constraint (below).
 
 Notes:
 - **Engine defaults** (`SamplerConfig.defaults()`) are llama.cpp's: temperature 0.8, top-k 40, top-p 0.95, min-p 0.05, typical-p 1, penalties off, penalty window 64, random seed.
@@ -261,6 +261,8 @@ Notes:
 ### Paged KV memory
 
 `gguf/memory/paged` keeps the rows of a KV group in reference-counted pages (`PagePool`, `PageList`, `PagedSequences`, `PagedStep`, `PageCopy`, `RowParts`) instead of one buffer per sequence. It is property-gated, not the engine default: `neuralfree.kv.paged=true` forces it for a single sequence and `neuralfree.parallel > 1` selects it; by default `ModelMemory.sequences()` returns `SingleSequenceMemory`. `neuralfree.kv.page.size` (default 16, a power of two in [1, 256]) sizes the pages, and `neuralfree.kv.unified` (default true) shares the whole context between the sequences.
+
+On the CPU, `ForwardBatch` batches over the paged memory: `CpuForwardBackend.forwardBatch` splits the batch into one-sequence ubatches (llama.cpp `split_seq`), reserves each ubatch's pages all-or-nothing (`PagedSequences.prepare`, `MemoryFullException` before anything changed), stores K/V at the step's `cellIdx` rows, attends through the step's page tables and commits. A batch over several sequences computes the same logits as the same tokens run one sequence at a time (`CpuForwardBatchTest`). The GPU path has no paging yet ([GAPS.md](GAPS.md) lists what refuses).
 
 ## Other model modes
 

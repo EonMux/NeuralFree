@@ -563,18 +563,54 @@ public final class CpuLayerExecutor implements AutoCloseable {
             throw new IllegalArgumentException(describe() + ": residual stream holds " + x.length + " floats, need "
                     + (long) n * streamWidth);
         }
+        forward(batchLayout(pos0, n), x);
+    }
+
+    /** The {@link StepLayout} of one contiguous segment at {@code pos0}, the layout {@link #forward} runs. */
+    private static com.eonmux.neuralfree.gguf.memory.StepLayout batchLayout(int pos0, int n) {
+        return com.eonmux.neuralfree.gguf.memory.StepLayout.of(n, new int[]{0}, new int[]{0}, new int[]{n},
+                new int[]{pos0}, new int[0], false);
+    }
+
+    /**
+     * Runs the layer over the rows of {@code s} ({@code s.nTokens()} rows of the stream width, from index 0), the
+     * batched twin of {@link #forward}: the steps are the same, but the mixer runs its batched step through the
+     * layout's segments (whose sequence memory may be paged) and every extra's batched hook runs instead of the
+     * contiguous one.
+     *
+     * @throws IllegalArgumentException when {@code s} holds more rows than the ubatch or {@code x} is too short
+     * @throws UnsupportedOperationException when a mixer or extra refuses the batched step
+     */
+    public void forward(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] x) {
+        Objects.requireNonNull(x, "x");
+        checkOpen();
+        int n = s.nTokens();
+        int ubatch = ctx.scratch().ubatch();
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException(describe() + ": step of " + n + " tokens outside [1, " + ubatch + "]");
+        }
+        if ((long) n * streamWidth > x.length) {
+            throw new IllegalArgumentException(describe() + ": residual stream holds " + x.length + " floats, need "
+                    + (long) n * streamWidth);
+        }
         if (layerIn != null) {
             System.arraycopy(x, 0, layerIn, 0, n * streamWidth);
         }
         for (CpuLayerExtra e : extras) {
-            e.beforeBlock(pos0, n, x);
+            e.beforeBlock(s, x);
         }
         if (attnNorm != null) {
             attnNorm.apply(x, normed, n, width);
         }
-        boolean attnPending = mixer != null && mixerBlock(pos0, n, x);
+        boolean attnPending;
+        if (s.contiguousSingle()) {
+            // the contiguous step keeps today's decode/prefill split (a one-token step with memory decodes)
+            attnPending = mixer != null && mixerBlock(s.pos0(0), n, x);
+        } else {
+            attnPending = mixer != null && mixerBlock(s, x);
+        }
         if (ffn != null) {
-            ffnBlock(pos0, n, x, attnPending);
+            ffnBlock(s, x, attnPending);
         } else if (attnPending) {
             mix(MixMode.ADD, 0f, n, x, branch, x);
         }
@@ -585,7 +621,7 @@ public final class CpuLayerExecutor implements AutoCloseable {
             System.arraycopy(layerIn, 0, x, 0, n * streamWidth);
         }
         for (CpuLayerExtra e : extras) {
-            e.afterBlock(pos0, n, x);
+            e.afterBlock(s, x);
         }
         if (layerOutScale != null) {
             scaleRows(n, x);
@@ -645,6 +681,54 @@ public final class CpuLayerExecutor implements AutoCloseable {
         return pending;
     }
 
+    /** Batched steps 3-6 over the layout {@code s}; the mixer runs its batched step ({@code CpuMixer.batch}). */
+    private boolean mixerBlock(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] x) {
+        int n = s.nTokens();
+        float[] in = attnNorm != null ? normed : x;
+        if (mixerNorm2 != null) {
+            mixerNorm2.apply(x, mixerIn, n, width);
+            in = mixerIn;
+        }
+        if (selfAttention != null) {
+            selfAttention.batch(s, in, branch);
+            residual(n, x, branch, in, false);
+            crossNorm.apply(x, normed, n, width);
+            in = normed;
+        }
+        mixer.batch(s, in, branch);
+        if (parallelAttention != null) {
+            parallelAttention.batch(s, in, aux);
+            CpuOps.add(aux, 0, branch, 0, branch, 0, n * width);
+        }
+        if (attnOutNorm != null) {
+            attnOutNorm.apply(branch, branch, n, width);
+        }
+        if (postAttnNorm != null) {
+            postAttnNorm.apply(branch, branch, n, width);
+        }
+        boolean consumed = false;
+        for (CpuLayerExtra e : extras) {
+            consumed |= e.afterMixer(s, x, branch);
+        }
+        boolean pending = false;
+        if (!consumed) {
+            requireConsumed("mixer");
+            if (parallel) {
+                pending = res.mixerResidual();
+            } else if (res.mixerResidual()) {
+                residual(n, x, branch, in, false);
+            }
+        }
+        if (postLnAttn != null) {
+            postLnAttn.apply(x, x, n, width);
+            if (postLnAttn2 != null) {
+                mix(MixMode.ADD, 0f, n, x, layerIn, x);
+                postLnAttn2.apply(x, x, n, width);
+            }
+        }
+        return pending;
+    }
+
     /** Steps 7-11. */
     private void ffnBlock(int pos0, int n, float[] x, boolean attnPending) {
         float[] in;
@@ -667,6 +751,44 @@ public final class CpuLayerExecutor implements AutoCloseable {
         boolean consumed = false;
         for (CpuLayerExtra e : extras) {
             consumed |= e.afterFfn(pos0, n, x, out);
+        }
+        if (consumed) {
+            return;
+        }
+        requireConsumed("FFN");
+        if (parallel) {
+            if (attnPending) {
+                CpuOps.add(out, 0, branch, 0, out, 0, n * width);
+            }
+            mix(MixMode.ADD, 0f, n, x, out, x);
+        } else {
+            residual(n, x, out, in, true);
+        }
+    }
+
+    /** Batched steps 7-11 over the layout {@code s} (the FFN is token-wise, the extras take their batched hooks). */
+    private void ffnBlock(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] x, boolean attnPending) {
+        int n = s.nTokens();
+        float[] in;
+        if (ffnNorm != null) {
+            ffnNorm.apply(x, normed, n, width);
+            in = normed;
+            if (ada != null) {
+                ada.apply(ctx.matVec(), adaCond, adaHidden, adaVector, normed, 0, n);
+            }
+        } else if (ffnReadsAttnNorm) {
+            in = normed;
+        } else {
+            in = x;
+        }
+        float[] out = ffnBranch != null ? ffnBranch : branch;
+        ffn.forward(n, in, out);
+        if (postFfnNorm != null) {
+            postFfnNorm.apply(out, out, n, width);
+        }
+        boolean consumed = false;
+        for (CpuLayerExtra e : extras) {
+            consumed |= e.afterFfn(s, x, out);
         }
         if (consumed) {
             return;

@@ -237,6 +237,62 @@ public final class CpuEmbeddingStage {
         RopePositions.fillStep(hp.mropeTextPositions(), pos0, n, scratch.ints(CpuScratch.POS));
     }
 
+    /**
+     * Embeds a batched ubatch's token rows at the explicit positions of {@code tokenPos} (batched steps over several
+     * sequences carry non-consecutive positions, one segment per sequence) and fills the step inputs from them.
+     *
+     * @param tokenPos position of every ubatch row, aligned with {@code tokens}
+     * @throws IllegalArgumentException  when a count or a position is out of range
+     * @throws IllegalStateException     when the model has no token table (drafters embed through their target)
+     */
+    public void embedBatched(int[] tokens, int[] tokenPos, float[] x) {
+        Objects.requireNonNull(tokens, "tokens");
+        Objects.requireNonNull(tokenPos, "tokenPos");
+        Objects.requireNonNull(x, "x");
+        if (tokenTable == null) {
+            throw new IllegalStateException(hp.arch().ggufName()
+                    + " has no token_embd table; its inputs come from the target model");
+        }
+        int n = tokens.length;
+        if (n < 1 || n > scratch.ubatch()) {
+            throw new IllegalArgumentException("step of " + n + " tokens outside [1, " + scratch.ubatch() + "]");
+        }
+        if (tokenPos.length != n) {
+            throw new IllegalArgumentException(tokenPos.length + " positions for " + n + " tokens");
+        }
+        if ((long) n * streamWidth > x.length) {
+            throw new IllegalArgumentException("residual stream holds " + x.length + " floats, need "
+                    + (long) n * streamWidth);
+        }
+        int[] ids = scratch.ints(CpuScratch.TOKEN_IDS);
+        for (int t = 0; t < n; t++) {
+            checkRow("token id", tokens[t], tokenTable);
+            ids[t] = tokens[t];
+            ids[n + t] = 0;
+        }
+        for (int p : tokenPos) {
+            if (p < 0) {
+                throw new IllegalArgumentException("token position " + p + " is negative");
+            }
+        }
+        RopePositions.fill(hp.ropeType(), hp.mropeTextPositions(), tokenPos, 0, n, scratch.ints(CpuScratch.POS));
+        float[] inp = scratch.slot(CpuScratch.INPUT_EMBD);
+        int[] stepIds = scratch.ints(CpuScratch.TOKEN_IDS);
+        CpuParallel.parallelFor(n, TOKEN_GRAIN, (from, to) -> {
+            for (int t = from; t < to; t++) {
+                embedToken(t, tokenPos[t], stepIds, 0, inp);
+            }
+        });
+        CpuParallel.parallelFor(n, TOKEN_GRAIN, (from, to) -> {
+            for (int t = from; t < to; t++) {
+                int src = t * nEmbdInp;
+                for (int h = 0; h < streams; h++) {
+                    System.arraycopy(inp, src, x, (t * streams + h) * nEmbd, nEmbd);
+                }
+            }
+        });
+    }
+
     /** Builds row {@code t} of {@link CpuScratch#INPUT_EMBD}. */
     private void embedToken(int t, int pos, int[] stepIds, int type, float[] inp) {
         int base = t * nEmbdInp;

@@ -365,6 +365,22 @@ public final class CpuAttentionCore {
     }
 
     /**
+     * Attention of {@code nTokens} query rows (row {@code t} at {@code qOff + t * qRowStride}, position
+     * {@code qPos[qPosOff + t]}, output at {@code outOff + t * outRowStride}) against the cache slots
+     * {@code [slotStart, slotEnd)} of one paged sequence: slot {@code s} is the physical row
+     * {@code PagedStep.cellIdx} convention maps it to, {@code pageTable[s >> pageShift] << pageShift |
+     * (s & (pageCount - 1))} of {@code common/attn_common.h} nf_kv_row; a page id below 0 masks the slot's keys
+     * (section 5.5.1 O-2). Positions come from {@code rowPos} over those physical rows, as the kernels read
+     * {@code kv_pos[nf_kv_row(...)]}.
+     */
+    public static void attendRows(Params p, int nTokens, float[] q, int qOff, int qRowStride, int[] qPos, int qPosOff,
+                                  KvAccessor kv, IntUnaryOperator rowPos, int pageShift, int[] pageTable,
+                                  int slotStart, int slotEnd, float[] out, int outOff, int outRowStride) {
+        attendMany(p, nTokens, q, qOff, qRowStride, qPos, qPosOff,
+                pagedRows(kv, rowPos, pageShift, pageTable), slotStart, slotEnd, out, outOff, outRowStride);
+    }
+
+    /**
      * {@link #attendRows(Params, int, float[], int, int, int[], int, DenseKv, int, int, float[], int, int)} with an
      * explicit key-split count instead of the one derived from the worker pool; {@code splits} is capped at one
      * split per key block.
@@ -479,6 +495,32 @@ public final class CpuAttentionCore {
             @Override
             public void readV(int row, int head, float[] dst) {
                 System.arraycopy(kv.v, kv.vOff + row * kv.vRowStride + head * kv.vHeadStride, dst, 0, kv.dV);
+            }
+        };
+    }
+
+    /**
+     * Key rows behind a page table: the row of slot {@code s} is {@code (pageTable[s >> pageShift] << pageShift) |
+     * (s & ((1 << pageShift) - 1))} ({@code nf_kv_row} of {@code kernels/llm/common/attn_common.h}); the kernels
+     * mask the keys of a page id below 0 (section 5.5.1 O-2) and the host mirror reports those rows' positions as
+     * -1, so this source reports the mirror's position directly and the window masks the row without reading it.
+     */
+    private static Rows pagedRows(final KvAccessor kv, final IntUnaryOperator rowPos, final int pageShift,
+                                  final int[] pageTable) {
+        Objects.requireNonNull(kv, "kv");
+        Objects.requireNonNull(pageTable, "pageTable");
+        final int pageMask = (1 << pageShift) - 1;
+        return new Rows() {
+            @Override public int nHeadKv() { return kv.nHeadKv(); }
+            @Override public int dK() { return kv.headDimK(); }
+            @Override public int dV() { return kv.headDimV(); }
+            @Override public int pos(int slot) { return rowPos.applyAsInt(rowOf(slot)); }
+            @Override public void readK(int slot, int head, float[] dst) { kv.readK(rowOf(slot), head, dst, 0); }
+            @Override public void readV(int slot, int head, float[] dst) { kv.readV(rowOf(slot), head, dst, 0); }
+
+            private int rowOf(int slot) {
+                int page = pageTable[slot >> pageShift];
+                return (page << pageShift) | (slot & pageMask);
             }
         };
     }

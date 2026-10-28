@@ -140,6 +140,14 @@ public final class CpuKvLayer implements KvAccessor {
         }
     }
 
+    @Override
+    public void copyRows(int srcRow, int dstRow, int n) {
+        k.copyRows(srcRow, dstRow, n);
+        if (v != null) {
+            v.copyRows(srcRow, dstRow, n);
+        }
+    }
+
     /** Zeroes every row. */
     void clear() {
         k.clear();
@@ -353,6 +361,23 @@ public final class CpuKvLayer implements KvAccessor {
             for (int i = 0; i < shift.runCount(); i++) {
                 for (int r = 0; r < shift.runRows(i); r++) {
                     putRow(shift.runTarget(i) + r, staged[at++]);
+                }
+            }
+        }
+
+        /** Moves {@code n} whole rows starting at {@code srcRow} onto the run at {@code dstRow} (a {@code PageCopy}). */
+        void copyRows(int srcRow, int dstRow, int n) {
+            if (n < 0 || srcRow < 0 || dstRow < 0 || srcRow + n > rows || dstRow + n > rows) {
+                throw new IndexOutOfBoundsException("copy of rows [" + srcRow + ", " + (srcRow + n) + ") onto ["
+                        + dstRow + ", " + (dstRow + n) + ") outside a cache of " + rows + " rows");
+            }
+            if (srcRow < dstRow) {
+                for (int i = n - 1; i >= 0; i--) {
+                    copyRow(srcRow + i, dstRow + i);
+                }
+            } else {
+                for (int i = 0; i < n; i++) {
+                    copyRow(srcRow + i, dstRow + i);
                 }
             }
         }

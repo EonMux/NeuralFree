@@ -620,7 +620,7 @@ try (Tensor sample = Tensor.randn(backend, Shape.of(1, 3, 224, 224))) {
 }
 ```
 
-`inference` also holds `SpeculativeDecoder`, `GraphOptimizer` and the configs `QuantizationConfig`, `KVCacheConfig` and `InferenceConfig`. Batched serving of LLMs is not a separate class here: it is the GGUF engine's `BatchEngine` (see LLM-INFERENCE.md).
+`inference` also holds `SpeculativeDecoder`, `GraphOptimizer` and the configs `QuantizationConfig`, `KVCacheConfig` and `InferenceConfig`. Batched serving of LLMs is not a separate class here: it is the GGUF engine's `ForwardBackend.forwardBatch` contract (`gguf/engine/ForwardBackend`), which backends refuse until they implement it (see LLM-INFERENCE.md).
 
 ### Post-training quantization
 

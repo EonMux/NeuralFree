@@ -8,6 +8,8 @@ import com.eonmux.neuralfree.gguf.memory.SequenceState;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.GroupPositions;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.KvShift;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.SequenceRules;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedSequences;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MlaSpec;
@@ -28,6 +30,13 @@ import java.util.Objects;
  * its K/V are written. A rollback of memory with DSV4 compressed caches stays within their rollback snapshots
  * ({@link CompressorRollback}) and copies that snapshot plane into the live compressor plane of every compressed
  * cache.
+ *
+ * <p>A paged plan ({@code neuralfree.parallel > 1} or {@code neuralfree.kv.paged}) replaces the single contiguous
+ * sequence by {@link PagedSequences} over the plan's page pools: {@link #sequences()} returns it,
+ * {@link #beginPagedStep} applies a step's row writes to the {@link GroupPositions} mirrors, and the causal K/V
+ * writes go through the physical rows the step's {@code cellIdx} names. The single-sequence calls
+ * ({@link #sequence}, {@link #canRollback}, {@link #rollback}, {@link #snapshot}) keep ruling sequence 0's
+ * {@link SequenceState}; the batched path ({@code CpuForwardBackend.forwardBatch}) drives the other sequences.
  *
  * <p>Head shapes of the KV caches come from the model spec: latent caches have one head of
  * {@code (kv_lora + n_rot, kv_lora)}; MLA decompressed caches {@code n_head} heads of {@code (head_k, head_v)};
@@ -54,7 +63,9 @@ public final class HeapModelMemory implements CpuMemory {
     private final List<CpuRecurrentState> ownedStates = new ArrayList<>();
     private final List<CpuCompressedKv> ownedCompressed = new ArrayList<>();
     private final CompressorRollback compressorRollback;
+    private final PagedSequences paged;
     private int[][] shiftDeltas;
+    private PagedStep pagedStep;
     private int snapshotPast = -1;
     private boolean closed;
 
@@ -62,6 +73,8 @@ public final class HeapModelMemory implements CpuMemory {
         this.plan = plan;
         this.sequence = new SequenceState(plan.nCtx());
         this.compressorRollback = new CompressorRollback(plan.rollbackSnapshots());
+        this.paged = plan.groups().isEmpty() || !plan.group(0).paged() ? null
+                : new PagedSequences(plan, plan.config().parallel());
         this.positions = new GroupPositions[plan.groups().size()];
         for (int g = 0; g < positions.length; g++) {
             positions[g] = new GroupPositions(plan.group(g));
@@ -248,6 +261,13 @@ public final class HeapModelMemory implements CpuMemory {
         return sequence;
     }
 
+    /** {@link PagedSequences} over the plan's page pools on a paged plan, else the contiguous adapter. */
+    @Override
+    public com.eonmux.neuralfree.gguf.memory.SequenceMemory sequences() {
+        checkOpen();
+        return paged != null ? paged : CpuMemory.super.sequences();
+    }
+
     @Override
     public KvAccessor kv(int il) {
         return kv[checkLayer(il)];
@@ -317,6 +337,88 @@ public final class HeapModelMemory implements CpuMemory {
         compressorRollback.onStep(nTokens);
     }
 
+    @Override
+    public PagedSequences pagedSequences() {
+        checkOpen();
+        return paged;
+    }
+
+    @Override
+    public String pagedStepRefusal(PagedStep step) {
+        return paged == null ? getClass().getSimpleName() + " holds no paged sequences" : null;
+    }
+
+    @Override
+    public void beginPagedStep(PagedStep step) {
+        checkOpen();
+        String refusal = pagedStepRefusal(step);
+        if (refusal != null) {
+            throw new UnsupportedOperationException(refusal);
+        }
+        if (step.maxSequences() != paged.maxSequences() || step.groups() != positions.length
+                || step.pageSize() != plan.group(0).pageSize() || step.nPages() != plan.group(0).pages()) {
+            throw new IllegalArgumentException("the step does not belong to this paged memory");
+        }
+        // mirror changes the page bookkeeping made besides the step's own writes (removals, shifts, partial copies),
+        // then the step's writes, so attention sees every row's true position
+        drainRowReports();
+        for (int g = 0; g < positions.length; g++) {
+            int[] rows = step.kvPosRows(g);
+            int[] values = step.kvPosValues(g);
+            for (int i = 0; i < rows.length; i++) {
+                positions[g].set(rows[i], values[i]);
+            }
+        }
+        pagedStep = step;
+    }
+
+    /** Applies the page bookkeeping's queued mirror changes to the {@code GroupPositions} and consumes them. */
+    private void drainRowReports() {
+        for (com.eonmux.neuralfree.gguf.memory.paged.PagedSequences.RowReport r : paged.pendingReports()) {
+            int[] rows = r.rows();
+            int[] values = r.values();
+            for (int i = 0; i < rows.length; i++) {
+                positions[r.group()].set(rows[i], values[i]);
+            }
+        }
+        paged.clearReports();
+    }
+
+    /**
+     * Runs one page copy on the host: every cache layer of the copy's group moves its rows
+     * {@code [srcPage * pageSize + srcRow0, .. + rows)} to the same rows of the destination page.
+     *
+     * @throws IllegalArgumentException when no cache layer belongs to the copy's group
+     */
+    public void copyPage(com.eonmux.neuralfree.gguf.memory.paged.PageCopy copy) {
+        int ps = plan.group(0).pageSize();
+        int src0 = copy.srcPage() * ps + copy.srcRow0();
+        int moved = 0;
+        for (int il = 0; il < kv.length; il++) {
+            KvAccessor k = kv[il];
+            if (k != null && k.group() == copy.group()) {
+                k.copyRows(src0, copy.dstPage() * ps + copy.srcRow0(), copy.rows());
+                moved++;
+            }
+        }
+        if (moved == 0) {
+            throw new IllegalArgumentException("no cache layer of group " + copy.group() + " runs the page copy "
+                    + copy);
+        }
+    }
+
+    @Override
+    public void endPagedStep() {
+        checkOpen();
+        pagedStep = null;
+    }
+
+    @Override
+    public PagedStep currentPagedStep() {
+        checkOpen();
+        return pagedStep;
+    }
+
     // ------------------------------------------------------------------ sequence operations
 
     @Override
@@ -330,6 +432,9 @@ public final class HeapModelMemory implements CpuMemory {
         }
         for (GroupPositions p : positions) {
             p.clear();
+        }
+        if (paged != null) {
+            paged.clear();
         }
         sequence.clear();
         compressorRollback.reset();
@@ -509,6 +614,6 @@ public final class HeapModelMemory implements CpuMemory {
 
     @Override
     public String toString() {
-        return "HeapModelMemory{" + plan + ", " + sequence + '}';
+        return "HeapModelMemory{" + plan + ", " + (paged != null ? paged : sequence) + '}';
     }
 }

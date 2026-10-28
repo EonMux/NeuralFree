@@ -59,4 +59,16 @@ public interface KvAccessor {
      * @throws UnsupportedOperationException for a latent cache, whose V is part of the K row
      */
     void writeV(int row, float[] src, int off);
+
+    /**
+     * Moves {@code n} whole rows starting at {@code srcRow} to the same-width run starting at {@code dstRow}
+     * ({@code System.arraycopy} per row, K and V), the host form of a {@code PageCopy}: stored bits move unchanged,
+     * as the device copy kernel moves them.
+     *
+     * @throws IndexOutOfBoundsException for a source or destination row outside the cache
+     */
+    default void copyRows(int srcRow, int dstRow, int n) {
+        throw new UnsupportedOperationException("row copies run on the page caches, not on "
+                + getClass().getSimpleName());
+    }
 }

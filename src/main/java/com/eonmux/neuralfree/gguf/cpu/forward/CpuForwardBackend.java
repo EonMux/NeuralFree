@@ -8,10 +8,16 @@ import com.eonmux.neuralfree.gguf.cpu.head.CpuLogitsHead;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
+import com.eonmux.neuralfree.gguf.engine.UBatch;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.BatchSplitter;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
+import com.eonmux.neuralfree.gguf.memory.MemoryFullException;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.HeapModelMemory;
+import com.eonmux.neuralfree.gguf.memory.paged.PageCopy;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.spec.LayerSchedule;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -226,6 +232,112 @@ public final class CpuForwardBackend implements ForwardBackend {
         }
         deliver(taps);
         return out;
+    }
+
+    /**
+     * Evaluates the batch over the paged memory: the rows are split into ubatches of one sequence each
+     * (llama.cpp {@code split_seq}), each ubatch reserves its pages all-or-nothing, runs the trunk through the
+     * page tables ({@code PagedSequences.prepare} -> the layer steps -> {@code PagedSequences.commit}), and the
+     * requested rows' logits come back in batch order. The tokens of a committed step land in the sequence's token
+     * record through {@code PagedSequences.appendTokens}.
+     *
+     * @throws UnsupportedOperationException when the memory is not paged ({@code PagedSequences} null)
+     * @throws MemoryFullException           (as {@link ContextFullException}) when a ubatch cannot reserve its pages
+     */
+    @Override
+    public float[][] forwardBatch(ForwardBatch batch) {
+        checkOpen();
+        CpuMemory memInterface = requireMemory("forwardBatch");
+        if (!(memInterface instanceof HeapModelMemory)) {
+            throw new UnsupportedOperationException("forwardBatch needs heap memory: " + batchRefusal());
+        }
+        HeapModelMemory mem = (HeapModelMemory) memInterface;
+        if (mem.pagedSequences() == null) {
+            throw new UnsupportedOperationException("forwardBatch needs paged memory (neuralfree.parallel > 1 or"
+                    + " neuralfree.kv.paged=true): " + batchRefusal());
+        }
+        if (batch.embeddings() != null) {
+            throw new UnsupportedOperationException("forwardBatch runs token rows only; embedding rows need an"
+                    + " embedding-batch path");
+        }
+        if (batch.ropePositions() != null) {
+            throw new UnsupportedOperationException("forwardBatch holds one RoPE position per token; explicit"
+                    + " sections need a section-aware batch path");
+        }
+        int n = batch.nTokens();
+        TapRows taps = TapRows.open(tap, n, spec.nLayer());
+        float[][] out = new float[batch.outputRows().length][];
+        com.eonmux.neuralfree.gguf.memory.paged.PagedSequences paged = mem.pagedSequences();
+        BatchSplitter splitter = new BatchSplitter(true);
+        for (UBatch u : splitter.split(batch, ubatch, BatchSplitter.Mode.SEQ)) {
+            float[][] rows = pagedUbatch(u, mem, paged, taps);
+            // map the ubatch's output rows back to their batch order positions
+            int[] ubatchRows = u.batchRows();
+            int[] outputs = batch.outputRows();
+            int k = 0;
+            for (int i = 0; i < outputs.length; i++) {
+                for (int r = 0; r < ubatchRows.length; r++) {
+                    if (ubatchRows[r] == outputs[i]) {
+                        out[i] = rows[k++];
+                    }
+                }
+            }
+        }
+        deliver(taps);
+        return out;
+    }
+
+    /**
+     * One paged ubatch: reserve the step, run the pages' copies on the host (the K/V bytes), begin the step (the
+     * position mirrors), run the trunk over the page tables, end the step and commit the reservation.
+     */
+    private float[][] pagedUbatch(UBatch u, HeapModelMemory mem,
+                                  com.eonmux.neuralfree.gguf.memory.paged.PagedSequences paged, TapRows taps) {
+        int[] tokens = u.tokens();
+        PagedStep step = paged.prepare(u.layout());
+        runPageCopies(mem, step.pageCopies());
+        mem.beginPagedStep(step);
+        try {
+            float[] x = scratch.slot(CpuScratch.X);
+            embedding.embedBatched(tokens, u.positions(), x);
+            runSlotsBatched(u.layout(), x, taps);
+            paged.appendTokens(step.segSeq(0), tokens);
+            float[][] rows = new float[u.layout().outputRows().length][];
+            emitRows(u.layout().outputRows(), 0, tokens.length, rows, true);
+            return rows;
+        } finally {
+            mem.endPagedStep();
+            paged.commit(step);
+        }
+    }
+
+    /** Runs the step's page copies in place (host K/V and V rows): each copy is one row-array move per layer. */
+    private void runPageCopies(HeapModelMemory mem, List<PageCopy> copies) {
+        if (copies.isEmpty()) {
+            return;
+        }
+        for (PageCopy c : copies) {
+            mem.copyPage(c);
+        }
+        mem.pagedSequences().releaseCopies(copies.toArray(new PageCopy[0]));
+    }
+
+    /**
+     * Runs every slot over the batched layout: the embedding stage has filled the token and position slots for the
+     * whole ubatch, every layer steps over the layout's segments through the page tables of
+     * {@link com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory#currentPagedStep}.
+     */
+    private void runSlotsBatched(com.eonmux.neuralfree.gguf.memory.StepLayout layout, float[] x, TapRows taps) {
+        for (int il = 0; il < layers.size(); il++) {
+            CpuLayerExecutor e = layers.get(il);
+            if (taps != null && taps.wants(il)) {
+                taps.capture(il, x, 0, layout.nTokens(), e.streamWidth());
+            }
+            e.forward(layout, x);
+        }
+        if (taps != null && taps.wants(layers.size())) {
+            taps.capture(layers.size(), x, 0, layout.nTokens(), finalWidth);
+        }
     }
 
     // ------------------------------------------------------------------ memory-less calls

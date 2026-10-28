@@ -19,6 +19,7 @@ import com.eonmux.neuralfree.gguf.memory.RotationPlan;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.HeapModelMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.ops.encdec.T5RelativeBias;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
 import com.eonmux.neuralfree.gguf.ops.rope.CpuRope;
@@ -109,6 +110,7 @@ public final class CpuAttentionMixer implements CpuMixer {
     private CpuQuantizedKvRotation rotation;
     private int shiftRotK;
     private CpuAttentionCore.Params params;
+    private PagedStep pagedStep;
 
     /** An unbound mixer; {@link #bind} reads the layer's attention spec. */
     public CpuAttentionMixer() {
@@ -391,6 +393,22 @@ public final class CpuAttentionMixer implements CpuMixer {
         run(pos0, n, in, out);
     }
 
+    /**
+     * One step over the rows of {@code s}: the contiguous step at {@code s.pos0(0)} when the step is contiguous —
+     * decode for one token with memory, prefill otherwise — the paged step through the memory's
+     * {@code CpuMemory.currentPagedStep} otherwise (the memory carries the page tables, whose {@link #run} reads;
+     * the step's own layout only picks the branch).
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        boolean paged = ctx.hasMemory() && ctx.memory().currentPagedStep() != null;
+        if (s.nTokens() == 1 && ctx.hasMemory() && !paged) {
+            decode(s.pos0(0), in, out);
+        } else {
+            run(s.pos0(0), s.nTokens(), in, out);
+        }
+    }
+
     private void run(int pos0, int n, float[] in, float[] out) {
         ensureBound();
         Objects.requireNonNull(in, "in");
@@ -402,6 +420,7 @@ public final class CpuAttentionMixer implements CpuMixer {
         if (pos0 < 0) {
             throw new IllegalArgumentException("layer " + layer.il() + ": negative position " + pos0);
         }
+        pagedStep = ctx.hasMemory() ? ctx.memory().currentPagedStep() : null;
         if (proj.source() == QkvProjection.Source.NONE) {
             matVec.matmul(wo, in, 0, out, 0, n);
             addDeltas(outSite, n, in, (int) wo.cols(), out, 0, (int) wo.rows());
@@ -444,11 +463,22 @@ public final class CpuAttentionMixer implements CpuMixer {
         }
         if (kv != null) {
             if (k != null) {
-                store(n, pos, k, v);
+                if (pagedStep != null) {
+                    storePaged(pagedStep, n, pos, k, v);
+                } else {
+                    store(n, pos, k, v);
+                }
             }
-            int keys = Math.min(kv.layout().rows(), pos0 + n);
-            CpuAttentionCore.attendRows(params, n, q, 0, spec.qDim(), pos, 0, kv, rowPos, 0, keys, attn, 0,
-                    spec.outDim());
+            if (pagedStep != null) {
+                int keys = pagedSlots(pagedStep, kv.group());
+                CpuAttentionCore.attendRows(params, n, q, 0, spec.qDim(), pos, 0, kv, rowPos,
+                        pagedPageShift(pagedStep), pagedPageTable(pagedStep, kv.group()), 0, keys, attn, 0,
+                        spec.outDim());
+            } else {
+                int keys = Math.min(kv.layout().rows(), pos0 + n);
+                CpuAttentionCore.attendRows(params, n, q, 0, spec.qDim(), pos, 0, kv, rowPos, 0, keys, attn, 0,
+                        spec.outDim());
+            }
         } else {
             CpuAttentionCore.DenseKv batch = CpuAttentionCore.DenseKv.of(k, 0, spec.kDim(), spec.headDimK(), v, 0,
                     spec.vDim(), spec.headDimV(), spec.nHeadKv(), spec.headDimK(), spec.headDimV(), pos, 0);
@@ -580,6 +610,52 @@ public final class CpuAttentionMixer implements CpuMixer {
             kv.writeK(row, k, t * spec.kDim());
             kv.writeV(row, v, t * spec.vDim());
         }
+    }
+
+    /**
+     * Paged store: row {@code t} goes to the physical cell the step's {@code cellIdx} names for the token (the step
+     * layout rows follow the ubatch order, the mixer rows the same order). The context shift rules do not apply
+     * here: a paged step never wraps, its slots are append ordered ({@code PagedSequences}).
+     */
+    private void storePaged(PagedStep step, int n, int[] pos, float[] k, float[] v) {
+        int[] cells = step.cellIdx(kv.group());
+        for (int t = 0; t < n; t++) {
+            kv.writeK(cells[t], k, t * spec.kDim());
+            kv.writeV(cells[t], v, t * spec.vDim());
+        }
+    }
+
+    /**
+     * The page-table slice of the step's one sequence (a SEQ-mode split ubatch), the single-sequence table
+     * {@code CpuAttentionCore.attendRows}' paged form indexes ({@code PagedStep.pageTable[g][seq * maxPages + k]}).
+     *
+     * @throws IllegalArgumentException when the step holds several segments (the ubatch is not SEQ-split)
+     */
+    private int[] pagedPageTable(PagedStep step, int group) {
+        if (step.nSeg() != 1) {
+            throw new IllegalArgumentException("layer " + layer.il() + ": a paged attention step holds one sequence,"
+                    + " got " + step.nSeg() + " segments");
+        }
+        int seq = step.segSeq(0);
+        int[] full = step.pageTable(group);
+        int[] slice = new int[step.maxPages()];
+        System.arraycopy(full, seq * step.maxPages(), slice, 0, step.maxPages());
+        return slice;
+    }
+
+    /** Slots the paged step's sequence of this cache's group holds, the attend span (contiguous slot space). */
+    private int pagedSlots(PagedStep step, int group) {
+        int seq = step.segSeq(0);
+        return step.seqSlots(group)[seq];
+    }
+
+    /** {@code log2(pageSize)}: slot {@code s} sits in page {@code s >> shift} (the kernel's page-table shift). */
+    private static int pagedPageShift(PagedStep step) {
+        int size = step.pageSize();
+        if (Integer.bitCount(size) != 1) {
+            throw new IllegalArgumentException("page size " + size + " is not a power of two");
+        }
+        return Integer.numberOfTrailingZeros(size);
     }
 
     // ================================================================== context shift

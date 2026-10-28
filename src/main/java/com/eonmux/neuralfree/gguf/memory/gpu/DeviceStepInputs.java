@@ -510,6 +510,16 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         }
 
         /**
+         * Sets the position stored in {@code row} directly (the paged step's partner of {@link #store}:
+         * {@code PagedStep} addresses rows by page table, not by consecutive position, so {@code upload} cannot
+         * derive the rows from the positions alone). Host mirror only; the caller uploads the range to the device
+         * like every other mirror change.
+         */
+        public void set(int row, int position) {
+            pos[row] = position;
+        }
+
+        /**
          * First row of the smallest contiguous row range covering positions {@code [pos0, pos0 + n)}: the run of
          * rows when it does not wrap, the whole group when it does.
          */

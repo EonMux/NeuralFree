@@ -76,9 +76,9 @@ public final class GgufEncoder {
     public void writeHeader(WritableByteChannel out, long tensorCount, long kvCount) throws IOException {
         checkCounts(tensorCount, kvCount);
         writeBytes(MAGIC_BYTES, 0, MAGIC_BYTES.length);
-        sink().putInt(GGUF_VERSION);
-        sink().putLong(tensorCount);
-        sink().putLong(kvCount);
+        putU32(GGUF_VERSION);
+        putU64(tensorCount);
+        putU64(kvCount);
         flush();
     }
 
@@ -113,6 +113,7 @@ public final class GgufEncoder {
         } else if (elementType != null) {
             throw fail(key, "takes no element type but one is given: " + elementType);
         }
+        putU64(keyBytes.length);
         put(keyBytes);
         putU32(type.id());
         if (type == GGUFValueType.ARRAY) {
@@ -143,13 +144,14 @@ public final class GgufEncoder {
         if (info.type() == null) {
             throw new IOException("tensor '" + info.name() + "' has no ggml type");
         }
+        putU64(name.length);
         put(name);
         putU32(dims.length);
         for (long dim : dims) {
-            sink().putLong(dim);
+            putU64(dim);
         }
         putU32(info.type().getId());
-        sink().putLong(relOffset);
+        putU64(relOffset);
     }
 
     /** Writes {@code data[off, off + len)} of tensor data. */
@@ -234,13 +236,13 @@ public final class GgufEncoder {
             }
             case UINT32:
             case INT32:
-                sink().putInt(integerValue(key, type, v));
+                putU32(integerValue(key, type, v));
                 break;
             case FLOAT32:
                 if (!(v instanceof Float)) {
                     throw notA(key, type, v, "a FLOAT32 value");
                 }
-                sink().putInt(Float.floatToRawIntBits((Float) v));
+                putU32(Float.floatToRawIntBits((Float) v));
                 break;
             case BOOL:
                 if (!(v instanceof Boolean)) {
@@ -253,7 +255,7 @@ public final class GgufEncoder {
                     throw notA(key, type, v, "a STRING value");
                 }
                 byte[] bytes = utf8((String) v, "value of key '" + key + "'");
-                sink().putLong(bytes.length);
+                putU64(bytes.length);
                 put(bytes);
                 break;
             }
@@ -262,13 +264,13 @@ public final class GgufEncoder {
                 if (!(v instanceof Long)) {
                     throw notA(key, type, v, "a " + type + " value (a JVM long)");
                 }
-                sink().putLong((Long) v);
+                putU64((Long) v);
                 break;
             case FLOAT64:
                 if (!(v instanceof Double)) {
                     throw notA(key, type, v, "a FLOAT64 value");
                 }
-                sink().putLong(Double.doubleToRawLongBits((Double) v));
+                putU64(Double.doubleToRawLongBits((Double) v));
                 break;
             default:
                 throw fail(key, ", an " + GGUFValueType.ARRAY + " value, was written as a scalar");
@@ -282,7 +284,7 @@ public final class GgufEncoder {
             throw new IOException("array key '" + key + "' has " + count + " elements, more than the maximum of "
                     + MAX_ARRAY_ELEMENTS);
         }
-        sink().putLong(count);
+        putU64(count);
         for (int i = 0; i < values.size(); i++) {
             Object v = values.get(i);
             if (v == null) {
@@ -332,6 +334,14 @@ public final class GgufEncoder {
         }
         buf.putInt(v);
         position += 4;
+    }
+
+    private void putU64(long v) throws IOException {
+        if (buf.remaining() < 8) {
+            flush();
+        }
+        buf.putLong(v);
+        position += 8;
     }
 
     private void putU16(int v) throws IOException {

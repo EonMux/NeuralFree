@@ -691,7 +691,7 @@ Every other listed subcommand (`quantize`, `imatrix`, `perplexity`, `results`, `
 
 ## Paged KV memory
 
-`gguf/memory/paged` keeps the rows of a KV group in reference-counted pages instead of one buffer per sequence: `PagePool`, `PageList`, `PagedSequences`, `PagedStep`, `PageCopy` and `RowParts`. It is property-gated, not the engine default: `neuralfree.kv.paged=true` forces it for a single sequence, and `neuralfree.parallel > 1` selects it; `neuralfree.kv.page.size` (default 16, a power of two in [1, 256]) sizes the pages and `neuralfree.kv.unified` (default true) shares the whole context between the sequences. Without the properties, `ModelMemory.sequences()` returns `SingleSequenceMemory`.
+`gguf/memory/paged` keeps the rows of a KV group in reference-counted pages instead of one buffer per sequence: `PagePool`, `PageList`, `PagedSequences`, `PagedStep`, `PageCopy` and `RowParts`. It is property-gated, not the engine default: `neuralfree.kv.paged=true` forces it for a single sequence, and `neuralfree.parallel > 1` selects it; `neuralfree.kv.page.size` (default 16, a power of two in [1, 256]) sizes the pages and `neuralfree.kv.unified` (default true) shares the whole context between the sequences. Without the properties, `ModelMemory.sequences()` returns `SingleSequenceMemory`. On the CPU path, `ForwardBatch` runs a batch of sequences over the paged memory — one-sequence ubatches (llama.cpp's `split_seq`), all-or-nothing page reservation per ubatch, K/V stored at the step's `cellIdx` rows and attention through the step's page tables ([LLM-INFERENCE.md](LLM-INFERENCE.md#paged-kv-memory) has the details; the GPU path refuses).
 
 ## Control vectors
 
@@ -777,7 +777,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.repeat.last.n` | Penalty window; `-1` = whole context | 64 |
 | `neuralfree.seed` | Seed; `-1` = random | -1 |
 | `neuralfree.greedy` | Argmax decoding | false |
-| `neuralfree.samplers` | Comma list of stages overriding the default chain order (`StageKind.parseOrder`); an unknown stage is rejected naming the property | llama.cpp's order |
+| `neuralfree.samplers` | Semicolon-separated list of stages overriding the default chain order, e.g. `top_k;top_p;min_p` (`StageKind.parseOrder`); an unknown stage is rejected naming the property | llama.cpp's order |
 | `neuralfree.min.keep` | Minimum keep count shared by top-k, top-p, min-p and typical-p | llama.cpp's |
 | `neuralfree.dry.multiplier` | DRY repetition strength; `0` disables the stage | 0 |
 | `neuralfree.dry.base` | DRY exponential-penalty base; below 1 disables the stage | llama.cpp's |
