@@ -411,6 +411,7 @@ final class PreSplitChain {
             h[i] = h[child];
             i = child;
         }
+        h[i] = v;
     }
 
     /**
