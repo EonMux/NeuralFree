@@ -51,8 +51,8 @@ import java.util.concurrent.TimeUnit;
 @Path("/")
 public class OpenAiResource {
 
-    /** One routed output piece on its way to a stream. */
-    private record Piece(ReasoningFilter.Channel channel, String text) { }
+    /** One routed output piece on its way to a stream, with the logprobs capture its token released (or none). */
+    private record Piece(ReasoningFilter.Channel channel, String text, TokenScore[] logprobs) { }
 
     /** The longest wait on one streamed request before the stream gives up (the engine may be stuck). */
     private static final long STREAM_TIMEOUT_MINUTES = 30;
@@ -460,11 +460,24 @@ public class OpenAiResource {
         String model = service.modelPath();
         EngineService.Submission submission;
         try {
-            submission = service.submit(prompt, request, (channel, tokenId, text) -> {
-                try {
-                    pieces.put(new Piece(channel, text));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+            submission = service.submit(prompt, request, new ReasoningFilter.Sink() {
+                @Override
+                public void accept(ReasoningFilter.Channel channel, int tokenId, String text) {
+                    enqueue(channel, text, null);
+                }
+
+                @Override
+                public void accept(ReasoningFilter.Channel channel, int tokenId, String text,
+                                   TokenScore[] logprobs) {
+                    enqueue(channel, text, logprobs != null && logprobs.length > 0 ? logprobs : null);
+                }
+
+                private void enqueue(ReasoningFilter.Channel channel, String text, TokenScore[] logprobs) {
+                    try {
+                        pieces.put(new Piece(channel, text, logprobs));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             }, rendered, constraint);
         } catch (InterruptedException e) {
@@ -540,6 +553,9 @@ public class OpenAiResource {
         Map<String, Object> choice = new LinkedHashMap<>();
         choice.put("index", 0);
         choice.put("delta", delta);
+        if (piece.logprobs() != null) {
+            choice.put("logprobs", Map.of("content", List.of(logprobsEntry(piece.logprobs()))));
+        }
         choice.put("finish_reason", null);
         Map<String, Object> chunk = chunkHead(id, created, model, chat);
         chunk.put("choices", List.of(choice));
@@ -577,17 +593,22 @@ public class OpenAiResource {
     private List<Map<String, Object>> logprobsBody(GenerationResult result) {
         List<Map<String, Object>> content = new ArrayList<>();
         for (TokenScore[] step : result.logprobs()) {
-            Map<String, Object> top = new LinkedHashMap<>();
-            for (int i = 1; i < step.length; i++) {
-                top.put(service.tokenText(step[i].tokenId()), (double) step[i].logprob());
-            }
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("token", service.tokenText(step[0].tokenId()));
-            entry.put("logprob", (double) step[0].logprob());
-            entry.put("top_logprobs", List.of(top));
-            content.add(entry);
+            content.add(logprobsEntry(step));
         }
         return content;
+    }
+
+    /** One content entry of the logprobs shape: the sampled token, its logprob, its top alternatives. */
+    private Map<String, Object> logprobsEntry(TokenScore[] step) {
+        Map<String, Object> top = new LinkedHashMap<>();
+        for (int i = 1; i < step.length; i++) {
+            top.put(service.tokenText(step[i].tokenId()), (double) step[i].logprob());
+        }
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("token", service.tokenText(step[0].tokenId()));
+        entry.put("logprob", (double) step[0].logprob());
+        entry.put("top_logprobs", List.of(top));
+        return entry;
     }
 
     private Map<String, Object> completionBody(String object, List<Map<String, Object>> choices,

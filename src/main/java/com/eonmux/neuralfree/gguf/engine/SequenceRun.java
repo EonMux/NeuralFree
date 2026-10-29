@@ -47,6 +47,8 @@ public final class SequenceRun {
     private long generationStart;
     private StopReason stopReason;
     private final int logprobs;
+    /** Whether the current offer's capture already rode a routed piece (one capture per token). */
+    private boolean logprobsRouted;
     private static final TokenScore[] EMPTY_LOGPROBS = new TokenScore[0];
 
     private TokenScore[] pendingLogprobs = EMPTY_LOGPROBS;
@@ -192,6 +194,7 @@ public final class SequenceRun {
         delta.setLength(0);
         StopReason reason;
         recording = true;
+        logprobsRouted = false;
         try {
             reason = session.offer(token);
         } finally {
@@ -205,6 +208,10 @@ public final class SequenceRun {
         Step step = Step.of(reason, routed, pendingLogprobs);
         if (pendingLogprobs.length > 0) {
             tokenLogprobs.add(pendingLogprobs);
+            if (!logprobsRouted) {
+                // the token's text is held back whole: its capture rides an empty piece on the content channel
+                sink.accept(ReasoningFilter.Channel.CONTENT, token, "", pendingLogprobs);
+            }
         }
         pendingLogprobs = EMPTY_LOGPROBS;
         return step;
@@ -293,7 +300,13 @@ public final class SequenceRun {
         if (recording && text != null && !text.isEmpty()) {
             delta.append(text);
         }
-        sink.accept(channel, tokenId, text);
+        if (logprobs > 0) {
+            // the capture rides the first piece the token releases; later pieces of the same offer carry none
+            sink.accept(channel, tokenId, text, logprobsRouted ? EMPTY_LOGPROBS : pendingLogprobs);
+            logprobsRouted = true;
+        } else {
+            sink.accept(channel, tokenId, text);
+        }
     }
 
     /**

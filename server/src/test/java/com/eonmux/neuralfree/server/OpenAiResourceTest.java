@@ -18,6 +18,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -140,6 +141,39 @@ public class OpenAiResourceTest {
         assertTrue(events.contains("\"text\""), "a delta carries text");
         assertTrue(events.contains("\"finish_reason\":\"stop\"") || events.contains("\"finish_reason\":\"length\""),
                 "the final chunk names the finish reason");
+    }
+
+    @Test
+    void aStreamedCompletionCarriesTheLogprobsEntriesPerToken() throws Exception {
+        Response response = resource.completions("""
+                {"prompt": "hello", "max_tokens": 3, "temperature": 0, "stream": true,
+                 "logprobs": true, "top_logprobs": 2}""");
+        assertEquals(200, response.getStatus());
+        StreamingOutput stream = (StreamingOutput) response.getEntity();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        stream.write(out);
+        List<Map<String, Object>> entries = new java.util.ArrayList<>();
+        for (String frame : out.toString(StandardCharsets.UTF_8).split("\n\n")) {
+            if (!frame.startsWith("data: ") || frame.equals("data: [DONE]")) {
+                continue;
+            }
+            JsonView chunk = JsonView.of(Json.parse(frame.substring("data: ".length()), Json.Limits.UNTRUSTED),
+                    "chunk");
+            JsonView choice = JsonView.of(((List<?>) chunk.raw("choices")).get(0), "choice");
+            if (choice.has("logprobs")) {
+                JsonView logprobs = JsonView.of(choice.raw("logprobs"), "logprobs");
+                List<?> content = (List<?>) logprobs.raw("content");
+                assertEquals(1, content.size(), "one entry per logprobs chunk");
+                entries.add((Map<String, Object>) content.get(0));
+            }
+        }
+        assertTrue(entries.size() >= 1, "the stream carries the per-token entries");
+        for (Map<String, Object> entry : entries) {
+            assertNotNull(entry.get("token"));
+            double logprob = ((Number) entry.get("logprob")).doubleValue();
+            assertTrue(logprob <= 0, "the sampled token's logprob is non-positive");
+            assertEquals(1, ((List<?>) entry.get("top_logprobs")).size(), "the requested alternative count");
+        }
     }
 
     @Test
