@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.hf;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.GGUFValueType;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.arch.Arch;
@@ -516,7 +517,9 @@ public final class HfSourceAssembler {
                                        HfQuantConfig q) {
         kv.set(GgufKeys.NF_SOURCE_FORMAT, SOURCE_FORMAT);
         kv.set(GgufKeys.NF_SOURCE_QUANT_METHOD, q.method().name().toLowerCase(Locale.ROOT));
-        kv.set(GgufKeys.NF_HF_DROPPED_PREFIXES, dropped);
+        // NeuralFree bookkeeping, not a converter key: an empty list means the source loaded with no drops,
+        // and absence must stay distinguishable from it, so the empty array is written (HfMetadataBuilder#setTyped)
+        kv.setTyped(GgufKeys.NF_HF_DROPPED_PREFIXES, GGUFValueType.ARRAY, GGUFValueType.STRING, dropped);
         for (PlannedTensor t : plan.tensors()) {
             if (t.type().isExtension()) {
                 kv.set(GgufKeys.NF_EXTENSION_TYPES, true);

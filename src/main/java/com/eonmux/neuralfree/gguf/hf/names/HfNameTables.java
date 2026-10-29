@@ -192,7 +192,7 @@ public final class HfNameTables {
         loadPatterns(tensorNames, global, block);
         this.globalPatterns = freezeLists(global);
         this.blockPatterns = freezeLists(block);
-        this.archTensors = loadArchTensors(tensorNames);
+        this.archTensors = loadArchTensors();
         this.blockOverrides = loadBlockOverrides(tensorNames);
         this.filters = loadFilters(tensorNames);
         this.forcedF32 = buildForcedF32(tensorNames, filters.get(FilterKind.FORCED_F32));
@@ -418,14 +418,16 @@ public final class HfNameTables {
         }
     }
 
-    private static Map<String, Set<String>> loadArchTensors(Map<String, String> names) {
+    /**
+     * MODEL_TENSORS membership per arch. llama.cpp's constants.py lists a few tensors that have no TENSOR_NAMES
+     * entry (the clip V_PROJ_NORM / V_QF_PROJ_* group); TensorNameMap never maps those, so absence from
+     * {@code names} is not a defect here. It also lists clip's V_QF_PROJ_NORM twice; a set membership dedupes.
+     */
+    private static Map<String, Set<String>> loadArchTensors() {
         Map<String, Set<String>> out = new LinkedHashMap<>();
         for (TsvRow row : read("arch_tensors.tsv", "gguf_arch", "tensor").rows()) {
             requireArch(row, row.get(0));
-            String tensor = requireTensor(row, names, row.get(1));
-            if (!out.computeIfAbsent(row.get(0), k -> new LinkedHashSet<>()).add(tensor)) {
-                throw row.defect("tensor '" + tensor + "' is listed twice for '" + row.get(0) + "'");
-            }
+            out.computeIfAbsent(row.get(0), k -> new LinkedHashSet<>()).add(row.get(1));
         }
         Map<String, Set<String>> frozen = new HashMap<>();
         for (Map.Entry<String, Set<String>> e : out.entrySet()) {

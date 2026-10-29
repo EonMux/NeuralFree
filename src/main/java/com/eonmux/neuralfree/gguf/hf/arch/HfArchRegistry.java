@@ -209,14 +209,16 @@ public final class HfArchRegistry {
         Map<HfArchEntry.Kind, Map<String, HfArchEntry>> m = new EnumMap<>(HfArchEntry.Kind.class);
         Map<HfArchEntry.Kind, Map<String, String>> source = new EnumMap<>(HfArchEntry.Kind.class);
         for (HfArchEntry.Kind k : HfArchEntry.Kind.values()) {
-            m.put(k, new LinkedHashMap<>());
+            Map<String, HfArchEntry> kind = new LinkedHashMap<>();
             Map<String, String> src = new LinkedHashMap<>();
             Map<String, HfArchEntry> built = builtIn.get(k);
             if (built != null) {
+                kind.putAll(built);
                 for (String name : built.keySet()) {
                     src.put(name, "the built-in HF architecture tables");
                 }
             }
+            m.put(k, kind);
             source.put(k, src);
         }
         for (HfArchProvider p : providers) {
