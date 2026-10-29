@@ -130,8 +130,8 @@ public class HfMistral3HooksTest {
         HfMistral3Hooks.meta(ctx, kv, null);
         HfMetadata m = kv.build();
         String g = Arch.MISTRAL3.ggufName();
-        assertEquals(2, num(m.get(String.format(GgufKeys.ATTENTION_HEAD_COUNT, g))));
-        assertEquals(1, num(m.get(String.format(GgufKeys.ATTENTION_HEAD_COUNT_KV, g))));
+        assertEquals(2f, num(m.get(String.format(GgufKeys.ATTENTION_HEAD_COUNT, g))), 0f);
+        assertEquals(1f, num(m.get(String.format(GgufKeys.ATTENTION_HEAD_COUNT_KV, g))), 0f);
         assertEquals(1e-05f, num(m.get(String.format(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS, g))), 1e-9f);
         assertEquals(1.0f, num(m.get(String.format(GgufKeys.ROPE_SCALING_YARN_LOG_MUL, g))), 0f);
         assertNull(m.get(String.format(GgufKeys.POOLING_TYPE, g)));
@@ -146,8 +146,8 @@ public class HfMistral3HooksTest {
                         + ", 'default_num_delay_tokens': 8}");
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.MISTRAL3.ggufName());
         HfMistral3Hooks.voxtralMeta(ctx, kv, null);
-        assertEquals(8, num(kv.build().get(String.format(GgufKeys.REALTIME_DELAY_TOKENS,
-                Arch.MISTRAL3.ggufName()))));
+        assertEquals(8f, num(kv.build().get(String.format(GgufKeys.REALTIME_DELAY_TOKENS,
+                Arch.MISTRAL3.ggufName()))), 0f);
     }
 
     // ------------------------------------------------------------------ the embedding branch vocabulary
