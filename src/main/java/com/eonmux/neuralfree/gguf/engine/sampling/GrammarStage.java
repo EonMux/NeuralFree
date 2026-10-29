@@ -104,7 +104,8 @@ public final class GrammarStage extends SamplerStage {
                 }
             } else {
                 byte[] piece = vocab.piece(id);
-                if (piece.length == 0) {
+                if (piece.length == 0 || piece[0] == 0) {
+                    // llama.cpp rejects an empty piece and a piece starting on the terminating 0 alike
                     candidates.setLogit(i, Float.NEGATIVE_INFINITY);
                 } else {
                     cands[i] = decode(piece, i);
