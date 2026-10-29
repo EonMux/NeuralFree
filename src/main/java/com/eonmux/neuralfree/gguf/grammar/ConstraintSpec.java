@@ -102,7 +102,7 @@ public final class ConstraintSpec {
     }
 
     /**
-     * A {@link Kind#STRUCTURAL_TAG} constraint carrying the raw tag text; SO-4 parses it into
+     * A {@link Kind#STRUCTURAL_TAG} constraint carrying the raw tag text; {@link StructuralTag} parses it into
      * the begin/end segments and per-segment schemas.
      */
     public static ConstraintSpec structuralTag(String tagText) {

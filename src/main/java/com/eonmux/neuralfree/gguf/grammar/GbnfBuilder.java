@@ -172,9 +172,9 @@ public final class GbnfBuilder {
                 return builder.grammar();
             }
             case STRUCTURAL_TAG:
+                return StructuralTag.parse(spec.text(), spec.whitespace());
             default:
-                throw new IllegalArgumentException("structural tags are converted by the "
-                        + "SO-4 WP, which parses the begin/schema/end segments");
+                throw new IllegalArgumentException("constraint kind " + spec.kind() + " has no compiler");
         }
     }
 

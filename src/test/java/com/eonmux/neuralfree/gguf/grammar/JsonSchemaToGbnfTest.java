@@ -280,15 +280,24 @@ public class JsonSchemaToGbnfTest {
         assertEquals(2, alternates);
     }
 
-    // -------------------------------------------------- ConstraintSpec refusal: structural tags
+    // -------------------------------------------------- ConstraintSpec: structural tags (SO-4)
 
     @Test
-    public void structuralTagIsRefusedUntilSo4() {
+    public void structuralTagTextWithoutAStructuresArrayRefusesByName() {
         try {
+            // a raw tag text is not the legacy payload: the payload needs its structures array
             GbnfBuilder.grammarOf(ConstraintSpec.structuralTag("<bos>"));
-            fail("structural tags are SO-4 work");
+            fail("a payload without structures refuses");
         } catch (IllegalArgumentException e) {
-            assertTrue(e.getMessage(), e.getMessage().contains("structural tags"));
+            assertTrue(e.getMessage(), e.getMessage().contains("not JSON"));
+        }
+        try {
+            GbnfBuilder.grammarOf(ConstraintSpec.structuralTag(
+                    "{\"structures\": [{\"begin\": \"<bos>\", \"schema\": {}, \"end\": \"<eos>\"}],"
+                            + " \"triggers\": [\"<bos>\"]}"));
+            fail("trigger-gated free text is pending");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("triggers"));
         }
     }
 

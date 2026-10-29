@@ -372,6 +372,10 @@ public class OpenAiResource {
             }
             return ConstraintSpec.choice(choices);
         }
+        if (body.has("guided_structural_tag") || body.has("structural_tag")) {
+            return ConstraintSpec.structuralTag(body.str(
+                    body.has("guided_structural_tag") ? "guided_structural_tag" : "structural_tag"));
+        }
         return null;
     }
 

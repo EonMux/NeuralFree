@@ -101,7 +101,7 @@ This page lists only limitations that can be checked against the code. Each item
 - **Draft-class files** (eagle3, gemma4-assistant, dflash) load only beside a target, as drafters (`GGUFModel`, `GGUFModelGPU`, `DraftModelLoader`).
 - **Models without a vocabulary** (`tokenizer.ggml.model = none`) cannot tokenize text (`NoVocabTokenizer`).
 - **Legacy `generate`.** The positional `LLMModel.generate(...)` overloads refuse request features they cannot honour (`LLMModel`). Use `generate(int[], GenerationRequest, TokenCallback)`.
-- **Structural-tag constraints parse no input.** `ConstraintSpec` accepts the `STRUCTURAL_TAG` kind, but the grammar engine has no consumer for it: nothing compiles a structural-tag spec into sampler stages (`gguf/grammar`).
+- **Structural tags compile without trigger gating.** `StructuralTag` compiles the vLLM legacy payload's structures (begin literal, schema grammar, end literal) into one alternated grammar, but a non-empty `triggers` array refuses: trigger-gated free text around the structures is not compiled — the grammar requires a structure outright. The modern xgrammar `format` object refuses too (pending).
 - **No logprobs.** `GenerationResult` carries the tokens, the text and the stop reason; per-token logprobs and alternative tokens are not produced (`engine/GenerationResult`).
 
 ## HF checkpoint loading
