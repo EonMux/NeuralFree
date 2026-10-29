@@ -24,7 +24,7 @@ final class PreSplitChain {
     private final float minP;
     private final float temperature;
     private final boolean greedy;
-    private final java.util.SplittableRandom rng;
+    private final Mt19937 rng;
 
     private int[] ids = new int[0];
     private float[] logits = new float[0];
@@ -50,7 +50,7 @@ final class PreSplitChain {
         this.temperature = c.temperature();
         this.greedy = c.isGreedy();
         this.history = new History(penalties ? c.penaltyLastN() : 0);
-        this.rng = new java.util.SplittableRandom(seed);
+        this.rng = new Mt19937(seed);
     }
 
     void accept(int token) {
@@ -258,7 +258,7 @@ final class PreSplitChain {
     }
 
     private void drawDist() {
-        double u = rng.nextDouble();
+        double u = rng.nextCanonicalDouble();
         int n = size;
         if (n == 1) {
             if (logits[0] == Float.NEGATIVE_INFINITY) {

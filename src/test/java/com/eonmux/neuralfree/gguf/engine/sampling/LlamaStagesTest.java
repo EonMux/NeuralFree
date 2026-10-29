@@ -78,11 +78,13 @@ public class LlamaStagesTest {
         assertEquals(3, c.selectedId());
         assertFalse(c.sorted());
 
-        // n = 2 cuts below 0.28707: the 1.0 and the 2.0 survive with the maximum.
+        // n = 2 cuts below 3 - 2*1.356466 = 0.28707: the 0.5 survives with the 1.0, 2.0 and the maximum, and
+        // only the -1.0 is masked.
         Sampler.Candidates wide = apply(topNSigmaSampler(2f));
-        assertEquals(Float.NEGATIVE_INFINITY, wide.logit(2), 0f);
+        assertEquals(Float.NEGATIVE_INFINITY, wide.logit(4), 0f);
         assertEquals(1.0f, wide.logit(1), 0f);
         assertEquals(2.0f, wide.logit(0), 0f);
+        assertEquals(0.5f, wide.logit(2), 0f);
         assertEquals(3, wide.selectedId());
     }
 
@@ -146,35 +148,41 @@ public class LlamaStagesTest {
 
     @Test
     public void xtcLowerThresholdKeepsMoreOfTheSmallMass() {
-        // Threshold 0.1 keeps id1 (0.08439) too: pos_last = 3 removals of the front candidates.
+        // Threshold 0.1: the scan advances while the sorted probability reaches it, so id0 (0.22941) is inside
+        // the trim and id1 (0.08439) stops it: pos_last = 1, and the front candidate id3 is removed.
         Sampler.Candidates c = apply(xtcSampler(0.9f, 0.1f, 0));
-        assertArrayEquals(new int[]{1, 2, 4}, ids(c));
-        assertEquals(0.08439f, c.prob(0), 1e-4f);
+        assertArrayEquals(new int[]{0, 1, 2, 4}, ids(c));
+        assertEquals(0.22941f, c.prob(0), 1e-4f);
+        assertEquals(0.08439f, c.prob(1), 1e-4f);
     }
 
     @Test
     public void xtcSkipsTheTrimWhenTheChanceMisses() {
-        // probability 0.1 < chance 0.37454012: no trim, not even the softmax (the raw set survives).
+        // probability 0.1 < chance 0.37454012: no trim, and not even the softmax runs, so the raw set stays in
+        // vocabulary order with its logits untouched.
         Sampler.Candidates c = apply(xtcSampler(0.1f, 0.1f, 0));
-        assertArrayEquals(new int[]{3, 0, 1, 2, 4}, ids(c));
-        assertEquals(0.62359f, c.prob(0), 1e-4f);
+        assertArrayEquals(new int[]{0, 1, 2, 3, 4}, ids(c));
+        assertEquals(2.0f, c.logit(0), 0f);
+        assertEquals(3.0f, c.logit(3), 0f);
     }
 
     @Test
     public void xtcMinKeepGuardsTheTail() {
-        // min_keep 4: only 3 candidates survive the 0.1-trim, so llama.cpp keeps the whole set.
-        Sampler.Candidates kept = apply(xtcSampler(0.9f, 0.1f, 4));
+        // min_keep 5 with threshold 0.2: the trim would keep 4, so llama.cpp keeps the whole sorted set.
+        Sampler.Candidates kept = apply(xtcSampler(0.9f, 0.2f, 5));
         assertArrayEquals(new int[]{3, 0, 1, 2, 4}, ids(kept));
-        // min_keep 3 is exactly the survivor count: the trim runs.
-        Sampler.Candidates trimmed = apply(xtcSampler(0.9f, 0.1f, 3));
-        assertArrayEquals(new int[]{1, 2, 4}, ids(trimmed));
+        assertEquals(0.62359f, kept.prob(0), 1e-4f);
+        assertEquals(0.22941f, kept.prob(1), 1e-4f);
+        // min_keep 4 is exactly the survivor count: the trim runs.
+        Sampler.Candidates trimmed = apply(xtcSampler(0.9f, 0.2f, 4));
+        assertArrayEquals(new int[]{0, 1, 2, 4}, ids(trimmed));
     }
 
     @Test
     public void xtcResetRestartsItsDraw() {
         Sampler s = xtcSampler(0.5f, 0.1f, 0);
         int[] first = ids(apply(s));
-        assertArrayEquals(new int[]{1, 2, 4}, first);
+        assertArrayEquals(new int[]{0, 1, 2, 4}, first);
         s.reset();
         // The draw restarts at the same chance 0.37454012, so the reset chain trims the same set again.
         assertArrayEquals(first, ids(apply(s)));
@@ -182,11 +190,12 @@ public class LlamaStagesTest {
 
     @Test
     public void xtcDisabledGatesNeverTouchTheSet() {
-        // probability 0 and a threshold above 0.5 are llama.cpp's empty samplers.
+        // probability 0 and a threshold above 0.5 are llama.cpp's empty samplers: they return before the softmax,
+        // so the raw set stays in vocabulary order.
         Sampler.Candidates off = apply(xtcSampler(0f, 0.1f, 0));
-        assertArrayEquals(new int[]{3, 0, 1, 2, 4}, ids(off));
+        assertArrayEquals(new int[]{0, 1, 2, 3, 4}, ids(off));
         Sampler.Candidates over = apply(xtcSampler(0.9f, 0.6f, 0));
-        assertArrayEquals(new int[]{3, 0, 1, 2, 4}, ids(over));
+        assertArrayEquals(new int[]{0, 1, 2, 3, 4}, ids(over));
         // both gates keep the chain argmax-only, the enabled stage does not
         assertTrue(Sampler.create(base().greedy(true).samplers("xtc").build()).argmaxOnly());
         assertTrue(Sampler.create(base().greedy(true).samplers("xtc").xtcProbability(0.5f).xtcThreshold(0.6f)
@@ -253,40 +262,48 @@ public class LlamaStagesTest {
     public void dynatempRescalesByTheEntropyMappedTemperature() {
         // The row's softmax has entropy 1.04411 against maximum ln 5 = 1.60944, so norm 0.64874; with exponent 1
         // and range 0.5 around temperature 1 the dynamic temperature is 1.14874, and the dist over the rescaled
-        // logits gives probs [0.24089, 0.10087, 0.06527, 0.57528, 0.01769] with the target 0.79654298 drawing id 3
+        // logits gives probs [0.24089, 0.10087, 0.06527, 0.57528, 0.01769] for ids 0..4. The stage sorted the set
+        // (softmax_impl with sort), so the sorted order is [id3 0.57528, id0 0.24089, id1 0.10087, id2 0.06527,
+        // id4 0.01769], and the draw target 0.79654298 lands past the first two (cumulative 0.81617) on id 0
         // (llama_sampler_temp_ext_apply).
         SamplerConfig config = base().seed(SEED).samplers("temperature").temperature(1f).dynatempRange(0.5f)
                 .dynatempExponent(1f).build();
         Sampler.Candidates c = apply(Sampler.create(config), LOGITS);
-        assertEquals(3, c.selectedId());
-        assertEquals(0.24089f, c.prob(0), 1e-3f);
-        assertEquals(0.10087f, c.prob(1), 1e-3f);
-        assertEquals(0.06527f, c.prob(2), 1e-3f);
-        assertEquals(0.57528f, c.prob(3), 1e-3f);
+        assertEquals(0, c.selectedId());
+        assertArrayEquals(new int[]{3, 0, 1, 2, 4}, ids(c));
+        assertEquals(0.57528f, c.prob(0), 1e-3f);
+        assertEquals(0.24089f, c.prob(1), 1e-3f);
+        assertEquals(0.10087f, c.prob(2), 1e-3f);
+        assertEquals(0.06527f, c.prob(3), 1e-3f);
         assertEquals(0.01769f, c.prob(4), 1e-3f);
     }
 
     @Test
     public void dynatempExponentOfZeroMapsToTheMaximumTemperature() {
-        // pow(norm, 0) = 1 → dyn_temp = min + (max - min) = 1.5: every logit is divided by 1.5, which widens the
-        // final softmax of [1.33333, 0.66667, 0.33333, 2.0, -0.66667].
+        // pow(norm, 0) = 1 → dyn_temp = min + (max - min) = 1.5: every logit is divided by 1.5, which gives the
+        // softmax [0.25225, 0.12951, 0.09280, 0.49131, 0.03414] for ids 0..4. The sorted set is [id3, id0, id1,
+        // id2, id4], and the draw target 0.79654298 lands on id1 (cumulative 0.87307 crosses it).
         SamplerConfig config = base().seed(SEED).samplers("temperature").temperature(1f).dynatempRange(0.5f)
                 .dynatempExponent(0f).build();
         Sampler.Candidates c = apply(Sampler.create(config), LOGITS);
-        assertEquals(3, c.selectedId());
-        assertEquals(0.25225f, c.prob(0), 1e-3f);
-        assertEquals(0.12951f, c.prob(1), 1e-3f);
-        assertEquals(0.09280f, c.prob(2), 1e-3f);
-        assertEquals(0.49131f, c.prob(3), 1e-3f);
+        assertEquals(1, c.selectedId());
+        assertArrayEquals(new int[]{3, 0, 1, 2, 4}, ids(c));
+        assertEquals(0.49131f, c.prob(0), 1e-3f);
+        assertEquals(0.25225f, c.prob(1), 1e-3f);
+        assertEquals(0.12951f, c.prob(2), 1e-3f);
+        assertEquals(0.09280f, c.prob(3), 1e-3f);
         assertEquals(0.03414f, c.prob(4), 1e-3f);
     }
 
     @Test
     public void dynatempRangeOfZeroKeepsThePlainScaling() {
-        // temperature 2 with no range: plain /2 scaling, then the draw over [1, 0.5, 0.25, 1.5, -0.5].
+        // temperature 2 with no range: plain /2 scaling over [1, 0.5, 0.25, 1.5, -0.5], whose softmax is
+        // [0.25310, 0.15352, 0.11956, 0.41732, 0.05649]. The plain temperature never sorts, so the set stays in
+        // vocabulary order, and the draw target 0.79654298 crosses at id3 (cumulative 0.94350).
         SamplerConfig config = base().seed(SEED).samplers("temperature").temperature(2f).build();
         Sampler.Candidates c = apply(Sampler.create(config), LOGITS);
-        assertArrayEquals(new int[]{3, 0, 1, 2, 4}, ids(c));
+        assertArrayEquals(new int[]{0, 1, 2, 3, 4}, ids(c));
+        assertEquals(3, c.selectedId());
         assertEquals(0.41732f, c.prob(3), 1e-3f);
     }
 
@@ -361,8 +378,9 @@ public class LlamaStagesTest {
             assertEquals(LOGITS[i], c.logit(i), 0f);
         }
         assertTrue(Sampler.create(config).argmaxOnly());
-        // an enabled stage leaves the argmax-only contract
-        assertFalse(Sampler.create(config.toBuilder().dryMultiplier(0.5f).build()).argmaxOnly());
+        // an enabled stage with breakers needs the vocabulary; an enabled stage with no breakers builds without one
+        assertFalse(Sampler.create(config.toBuilder().dryMultiplier(0.5f)
+                .drySequenceBreakers(Collections.emptyList()).build()).argmaxOnly());
         // base < 1 disables again
         assertTrue(Sampler.create(config.toBuilder().dryMultiplier(0.5f).dryBase(0.5f).build()).argmaxOnly());
     }
@@ -499,17 +517,17 @@ public class LlamaStagesTest {
 
     @Test
     public void infillCombinesPrefixTokensThenDropsTheSmallMass() {
-        // Row {1, 1, 2, 0} with pieces ab / c / a / !(EOG): the softmax sorted is [a .53446, ab .19657,
-        // c .19657, ! .07234]. The EOG ratio check 3*0.07234*4 = 0.868 < 0.92760 does not trigger, the "a" prefix
-        // absorbs "ab" (0.53446 + 0.19657 = 0.73103), the 0.2 threshold keeps "a" and the EOG token, and the
-        // renormalized pair keeps both survivors through the 1/(1+1) = 0.5 second threshold
+        // Row {1, 1, 2, 0, -2} with pieces ab / c / a / ! / <eot>(EOG): the softmax is [ab 0.1946, c 0.1946,
+        // a 0.5288, ! 0.0738, <eot> 0.0097]. The EOG ratio check 3*0.0097*5 = 0.1458 < 0.9903 does not trigger,
+        // the "a" prefix absorbs "ab" (0.5288 + 0.1946 = 0.7234), the 0.2 threshold keeps "a" and the EOG token,
+        // and the renormalized pair keeps both survivors through the 1/(1+1) = 0.5 second threshold
         // (llama_sampler_infill_apply).
         SamplerConfig config = base().greedy(true).samplers("infill").build();
-        float[] logits = {1f, 1f, 2f, 0f};
+        float[] logits = {1f, 1f, 2f, 0f, -2f};
         Sampler.Candidates c = apply(Sampler.create(config, new int[0], eogVocab()), logits);
-        assertArrayEquals(new int[]{2, 3}, ids(c));
-        assertEquals(0.91000f, c.prob(0), 1e-4f);
-        assertEquals(0.09000f, c.prob(1), 1e-4f);
+        assertArrayEquals(new int[]{2, 4}, ids(c));
+        assertEquals(0.9868f, c.prob(0), 1e-3f);
+        assertEquals(0.0132f, c.prob(1), 1e-3f);
         assertEquals(2, c.selectedId());
     }
 
@@ -678,13 +696,13 @@ public class LlamaStagesTest {
         assertTrue(explicit.isExplicit(SamplerConfig.Setting.MIROSTAT));
 
         // the model's mirostat version also builds the temp + mirostat chain: mu = 2*1 = 2 under the uniform
-        // surprise 2.32193 collapses the uniform row to its first candidate
+        // surprise 2.32193 collapses the uniform row to its first candidate, which id-order ties put at id 0
         SamplerConfig chain = base().seed(SEED).build().withModelDefaults(
                 SamplingDefaults.builder().mirostat(2).mirostatTau(1.0f).build());
         Sampler.Candidates c = apply(Sampler.create(chain), new float[]{0f, 0f, 0f, 0f, 0f});
-        assertArrayEquals(new int[]{1}, ids(c));
+        assertArrayEquals(new int[]{0}, ids(c));
         assertEquals(1.0f, c.prob(0), 1e-6f);
-        assertEquals(1, c.selectedId());
+        assertEquals(0, c.selectedId());
     }
 
     @Test

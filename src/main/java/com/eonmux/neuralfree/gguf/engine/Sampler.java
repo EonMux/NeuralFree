@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.engine.sampling.AdaptivePStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.BiasStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.DryStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.Mt19937;
 import com.eonmux.neuralfree.gguf.engine.sampling.InfillStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.MinPStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.MirostatStage;
@@ -73,7 +74,7 @@ public final class Sampler {
     private final SamplerStage biasStage;
     private final List<SamplerStage> chain;
     private final Candidates cur = new Candidates();
-    private SplittableRandom rng;
+    private Mt19937 rng;
 
     private Sampler(int[] banned, int[] biasedIds, float[] biases, SamplerConfig config, long seed, boolean greedy,
                     SamplerVocab vocab) {
@@ -85,7 +86,7 @@ public final class Sampler {
         this.seed = seed;
         this.biasStage = new BiasStage(banned, biasedIds, biases);
         this.chain = buildChain(config, seed, vocab);
-        this.rng = new SplittableRandom(seed);
+        this.rng = new Mt19937(seed);
     }
 
     /** llama.cpp's chain construction (common/sampling.cpp:344-416). */
@@ -445,7 +446,7 @@ public final class Sampler {
         for (SamplerStage stage : chain) {
             stage.reset();
         }
-        rng = new SplittableRandom(seed);
+        rng = new Mt19937(seed);
     }
 
     /**
@@ -522,19 +523,19 @@ public final class Sampler {
     }
 
     /**
-     * Softmax and a single categorical draw in the current order (llama_sampler_dist_apply): the first candidate
-     * whose running sum reaches {@code sum * u}, {@code u} uniform in [0, 1); candidates of probability 0 are never
-     * selected. One uniform is drawn per call, also for a single candidate.
+     * Softmax and a single categorical draw in the current order ({@code llama_sampler_dist_apply} through
+     * libstdc++'s {@code std::discrete_distribution}): the probabilities renormalized in double, the first
+     * candidate whose cumulative reaches the canonical double draw. The chain's own {@link Mt19937} draws once
+     * per call, also for a single candidate (llama.cpp keeps the RNG aligned with backend sampling).
      */
     private void drawDist() {
-        double u = rng.nextDouble();
         int n = cur.size;
         if (n == 1) {
             if (cur.logits[0] == Float.NEGATIVE_INFINITY) {
                 throw new IllegalStateException("no candidate has a finite logit (all banned, -inf or NaN)");
             }
             cur.probs[0] = 1f;
-            cur.selected = 0;
+            cur.selected = rng.distDraw(new float[]{1f});
             return;
         }
         float max = cur.sorted ? cur.logits[0] : cur.maxLogit();
@@ -543,28 +544,18 @@ public final class Sampler {
         }
         double sum = 0.0;
         for (int i = 0; i < n; i++) {
-            float p = expShift(cur.logits[i], max);
-            cur.probs[i] = p;
-            sum += p;
+            double e = expShift(cur.logits[i], max);
+            cur.probs[i] = (float) e;
+            sum += e;
         }
-        double target = sum * u;
-        double run = 0.0;
-        int selected = -1;
-        int lastPositive = -1;
         for (int i = 0; i < n; i++) {
-            float p = cur.probs[i];
-            if (p > 0f) {
-                lastPositive = i;
-                if (selected < 0) {
-                    run += p;
-                    if (run >= target) {
-                        selected = i;
-                    }
-                }
-            }
-            cur.probs[i] = (float) (p / sum);
+            cur.probs[i] = (float) (cur.probs[i] / sum);
         }
-        cur.selected = selected >= 0 ? selected : lastPositive;
+        float[] probs = new float[n];
+        for (int i = 0; i < n; i++) {
+            probs[i] = cur.prob(i);
+        }
+        cur.selected = rng.distDraw(probs);
     }
 
     /**

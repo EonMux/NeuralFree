@@ -198,8 +198,9 @@ public final class SamplerConfig {
         floatProperty(p, PROP_DRY_BASE, b::dryBase);
         intProperty(p, PROP_DRY_ALLOWED_LENGTH, b::dryAllowedLength);
         intProperty(p, PROP_DRY_PENALTY_LAST_N, b::dryPenaltyLastN);
-        String breakers = EngineConfig.stringProperty(p, PROP_DRY_SEQUENCE_BREAKERS);
-        if (breakers != null) {
+        // the breakers keep their whitespace: a leading newline is the most common breaker
+        String breakers = p.getProperty(PROP_DRY_SEQUENCE_BREAKERS);
+        if (breakers != null && !breakers.isBlank()) {
             List<String> list = new ArrayList<>();
             for (String part : breakers.split(",", -1)) {
                 if (part.isEmpty()) {

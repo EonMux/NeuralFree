@@ -100,7 +100,9 @@ public final class Mt19937 {
         do {
             long low = next() & 0xffffffffL;
             long high = next() & 0xffffffffL;
-            v = (double) (low + (high << 32)) / TWO_POW_64;
+            // the unsigned 64-bit fold as one double rounding: high's value scaled by the exact power of two,
+            // plus the low word — the same nearest-double the unsigned integer converts to
+            v = ((double) low + (double) high * 4294967296.0) / TWO_POW_64;
         } while (v >= 1.0);
         return v;
     }
