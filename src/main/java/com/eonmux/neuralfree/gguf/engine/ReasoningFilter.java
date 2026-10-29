@@ -50,6 +50,17 @@ public final class ReasoningFilter {
     @FunctionalInterface
     public interface Sink {
         void accept(Channel channel, int tokenId, String text);
+
+        /**
+         * Routed text with the step's logprobs capture: the accepting token's post-chain distribution (the sampled
+         * token plus its top alternatives, {@code SequenceRun.Step.logprobs()}) when the request captures them,
+         * empty otherwise. The default drops the capture and routes the text only; the logprobs-capturing runs
+         * ({@code request.logprobs()} above 0) take this overload, and a token whose text is fully held back
+         * arrives as an empty {@code text} on {@link Channel#CONTENT} with its capture.
+         */
+        default void accept(Channel channel, int tokenId, String text, com.eonmux.neuralfree.gguf.engine.TokenScore[] logprobs) {
+            accept(channel, tokenId, text);
+        }
     }
 
     static final String H_START = "<|start|>";
@@ -429,23 +440,18 @@ public final class ReasoningFilter {
             while (true) {
                 switch (phase) {
                     case PRELUDE: {
-                        int ws = leadingWhitespace(pending);
-                        if (ws == pending.length()) return;
-                        String rest = pending.substring(ws);
-                        String matched = null;
-                        boolean partial = false;
-                        for (String t : starts) {
-                            if (rest.startsWith(t)) matched = t;
-                            else if (t.startsWith(rest)) partial = true;
-                        }
-                        if (matched != null) {
-                            pending.delete(0, ws + matched.length());
-                            phase = Phase.REASONING;
-                        } else if (partial) {
+                        // the opener is recognized wherever it arrives (vLLM's thinking parser): the prelude
+                        // text before it streams as content, a partial opener holds its suffix back
+                        int[] hit = earliest(pending, starts, 0);
+                        if (hit == null) {
+                            int keep = partialSuffix(pending, starts);
+                            emit(Channel.CONTENT, tokenId, pending, 0, pending.length() - keep);
+                            pending.delete(0, pending.length() - keep);
                             return;
-                        } else {
-                            phase = Phase.CONTENT;
                         }
+                        emit(Channel.CONTENT, tokenId, pending, 0, hit[0]);
+                        pending.delete(0, hit[0] + starts.get(hit[1]).length());
+                        phase = Phase.REASONING;
                         break;
                     }
                     case REASONING: {
