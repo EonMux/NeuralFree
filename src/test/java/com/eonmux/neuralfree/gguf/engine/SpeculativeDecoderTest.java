@@ -65,8 +65,7 @@ public class SpeculativeDecoderTest {
      * the budget): {@code [5]} is confirmed and 6 ends the budget.
      */
     @Test
-    public void verifyKeepsTheLongestMatchingPrefixAndRollsBackTheRest() {
-        FakeTarget target = new FakeTarget(false);
+    public void verifyKeepsTheLongestMatchingPrefixAndRollsBackTheRest() {        FakeTarget target = new FakeTarget(false);
         FakeDrafter drafter = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7} : new int[]{5});
         List<SpeculativeDecoder.Stats> stats = new ArrayList<>();
         SpeculativeDecoder dec = SpeculativeDecoder.builder(target, drafter, tokenizer()).draftMax(4)
@@ -83,12 +82,41 @@ public class SpeculativeDecoderTest {
         assertEquals(Arrays.asList(2), target.rollbacks);
         assertEquals(6, target.memory.sequence().nPast());
         assertEquals(Arrays.asList(4, 1), drafter.requested);
-        assertEquals(Arrays.asList(2), drafter.accepted);
+        assertEquals(Arrays.asList(2, 1), drafter.accepted);
         assertEquals(1, drafter.resets);
         assertEquals(1, stats.size());
         assertEquals(2, stats.get(0).rounds());
         assertEquals(5, stats.get(0).drafted());
         assertEquals(3, stats.get(0).accepted());
+    }
+
+    /**
+     * The logprobs capture over speculation (MATCH verify): every emitted token — the prompt's first sample, the
+     * confirmed drafts and the target's own tokens — reports its post-chain distribution as log probabilities,
+     * the sampled token first and the alternatives in descending probability, one entry per generated token.
+     */
+    @Test
+    public void logprobsReportEveryEmittedTokensPostChainDistribution() {
+        FakeTarget target = new FakeTarget(false);
+        FakeDrafter drafter = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7} : new int[]{5});
+        SpeculativeDecoder dec = SpeculativeDecoder.builder(target, drafter, tokenizer()).draftMax(4).build();
+
+        GenerationRequest request = GenerationRequest.builder().maxNewTokens(6)
+                .sampler(SamplerConfig.greedyDecoding()).logprobs(3).build();
+        GenerationResult r = dec.generate(new int[]{0}, request, (TokenCallback) null);
+
+        assertArrayEquals(new int[]{1, 2, 3, 4, 5, 6}, r.tokens());
+        assertEquals("one capture per emitted token, including the verified rounds", 6, r.logprobs().size());
+        for (int step = 0; step < r.logprobs().size(); step++) {
+            TokenScore[] scores = r.logprobs().get(step);
+            assertEquals(3, scores.length);
+            assertEquals("the sampled token leads", r.tokens()[step], scores[0].tokenId());
+            assertTrue("the sampled token's logprob is at most 0", scores[0].logprob() <= 0f);
+            for (int k = 1; k < scores.length; k++) {
+                assertTrue("alternatives follow in descending probability",
+                        scores[k].logprob() <= scores[k - 1].logprob());
+            }
+        }
     }
 
     /**
@@ -98,7 +126,13 @@ public class SpeculativeDecoderTest {
     @Test
     public void recurrentMemoryRestoresTheSnapshotAndReplaysTheKeptTokens() {
         FakeTarget target = new FakeTarget(true);
-        FakeDrafter drafter = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7} : new int[0]);
+        FakeDrafter drafter = new FakeDrafter((last, n) -> {
+            if (last != 1) {
+                return new int[0];
+            }
+            int[] full = {2, 3, 7, 7};
+            return n < full.length ? Arrays.copyOf(full, n) : full;
+        });
 
         GenerationResult r = decoder(target, drafter, 4, 0).generate(new int[]{0}, greedy(5), (TokenCallback) null);
 

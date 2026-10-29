@@ -14,7 +14,9 @@ import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.SplittableRandom;
 import java.util.function.Consumer;
@@ -54,7 +56,9 @@ import java.util.function.Consumer;
  * continuing while the sample equals {@code d_i}. In every other mode a {@link Verifier} runs the round against
  * the row distributions; each verifier documents its own RNG stream, and a drafter implementing
  * {@link DraftProbs} supplies its proposal distributions (one-hot otherwise). A greedy target chain degenerates
- * the lossless modes into {@code MATCH}'s argmax rule.
+ * the lossless modes into {@code MATCH}'s argmax rule. A request with {@code logprobs(n)} captures the post-chain
+ * distribution of every emitted token under the default {@code MATCH} mode and the plain decode steps, the same
+ * capture the plain loop makes; the lossless verifier modes' emissions report no scores yet ([GAPS.md](GAPS.md)).
  *
  * <p>With {@code a} drafted tokens confirmed, the round emits
  * {@code d_0 .. d_{a-1}} and the target's next token, and the last {@code k - a} positions leave memory:
@@ -248,7 +252,7 @@ public final class SpeculativeDecoder {
                 ? renderedPrompt : stop.renderPrompt(prompt);
         StopCriteria.Session session = stop.start(sink, rendered);
         try {
-            return run(prompt, memory, seq, nCtx, sampler, session);
+            return run(prompt, memory, seq, nCtx, sampler, session, effective, sink);
         } catch (RuntimeException e) {
             try {
                 backend.reset();
@@ -265,10 +269,13 @@ public final class SpeculativeDecoder {
     }
 
     private GenerationResult run(int[] prompt, ModelMemory memory, SequenceState seq, int nCtx, Sampler sampler,
-                                 StopCriteria.Session session) {
+                                 StopCriteria.Session session, GenerationRequest effective,
+                                 ReasoningFilter.Sink sink) {
         long t0 = System.nanoTime();
         backend.reset();
         drafter.reset();
+        int n = effective.logprobs();
+        List<TokenScore[]> tokenLogprobs = new ArrayList<>();
         float[] logits = backend.prefill(prompt, 0);
         sampler.accept(prompt, 0, prompt.length);
         long t1 = System.nanoTime();
@@ -285,7 +292,9 @@ public final class SpeculativeDecoder {
         if (session.cancelled()) {
             reason = StopReason.CANCELLED;
         } else {
-            token = sampler.sample(logits);
+            Sampler.Candidates cur = sampler.apply(logits);
+            token = cur.id(cur.selected());
+            capture(tokenLogprobs, sink, cur, token, n);
             sampler.accept(token);
             sampled++;
             reason = session.offer(token);
@@ -305,13 +314,16 @@ public final class SpeculativeDecoder {
             if (draft.length == 0 || draft.length < draftMin) {
                 logits = backend.decode(token, pos);
                 drafter.accept(0);
-                token = sampler.sample(logits);
+                Sampler.Candidates cur = sampler.apply(logits);
+                token = cur.id(cur.selected());
+                capture(tokenLogprobs, sink, cur, token, n);
                 sampler.accept(token);
                 sampled++;
                 reason = session.offer(token);
                 continue;
             }
-            Verified v = verify(memory, verifier, roundsRng, sampler, session, token, draft, pos);
+            Verified v = verify(memory, verifier, roundsRng, sampler, session, token, draft, pos, n,
+                    tokenLogprobs, sink);
             rounds++;
             drafted += draft.length;
             accepted += v.accepted;
@@ -321,7 +333,89 @@ public final class SpeculativeDecoder {
         }
         long t2 = System.nanoTime();
         statsSink.accept(new Stats(rounds, drafted, accepted));
-        return session.finish(reason, GenerationResult.Timings.of(prompt.length, t1 - t0, sampled, t2 - t1));
+        GenerationResult result = session.finish(reason,
+                GenerationResult.Timings.of(prompt.length, t1 - t0, sampled, t2 - t1));
+        return tokenLogprobs.isEmpty() ? result : result.withLogprobs(tokenLogprobs);
+    }
+
+    /**
+     * The captured distribution of one emitted token: the token first with its post-chain log probability, then
+     * the top alternatives by probability — the same shape {@code SequenceRun} captures for the plain loop. Routed
+     * to the sink as an empty content piece carrying the capture, so a stream carries one entry per token.
+     */
+    private static void capture(List<TokenScore[]> out, ReasoningFilter.Sink sink, Sampler.Candidates cur,
+                                int token, int n) {
+        if (n <= 0) {
+            return;
+        }
+        int size = cur.size();
+        int[] ids = new int[size];
+        float[] probs = new float[size];
+        float[] logits = new float[size];
+        int live = 0;
+        double sum = 0;
+        for (int i = 0; i < size; i++) {
+            float p = cur.prob(i);
+            if (p <= 0f) {
+                continue;
+            }
+            ids[live] = cur.id(i);
+            probs[live] = p;
+            sum += p;
+            live++;
+        }
+        if (live == 0 || Math.abs(sum - 1f) > 1e-3) {
+            live = 0;
+            sum = 0;
+            double max = -Double.MAX_VALUE;
+            for (int i = 0; i < size; i++) {
+                float logit = cur.logit(i);
+                if (logit != Float.NEGATIVE_INFINITY) {
+                    max = Math.max(max, logit);
+                }
+            }
+            for (int i = 0; i < size; i++) {
+                float logit = cur.logit(i);
+                if (logit == Float.NEGATIVE_INFINITY) {
+                    continue;
+                }
+                double e = Math.exp(logit - max);
+                ids[live] = cur.id(i);
+                probs[live] = (float) e;
+                sum += e;
+                live++;
+            }
+            for (int i = 0; i < live; i++) {
+                probs[i] = (float) (probs[i] / sum);
+            }
+        }
+        int sampledIndex = -1;
+        for (int i = 0; i < live; i++) {
+            if (ids[i] == token) {
+                sampledIndex = i;
+                break;
+            }
+        }
+        int count = Math.min(n, live);
+        TokenScore[] scores = new TokenScore[count];
+        scores[0] = new TokenScore(token,
+                (float) Math.log(sampledIndex >= 0 ? probs[sampledIndex] : 0f));
+        boolean[] used = new boolean[live];
+        if (sampledIndex >= 0) {
+            used[sampledIndex] = true;
+        }
+        for (int k = 1; k < count; k++) {
+            int best = -1;
+            for (int i = 0; i < live; i++) {
+                if (!used[i] && (best < 0 || probs[i] > probs[best])) {
+                    best = i;
+                }
+            }
+            used[best] = true;
+            scores[k] = new TokenScore(ids[best], (float) Math.log(probs[best]));
+        }
+        out.add(scores);
+        sink.accept(ReasoningFilter.Channel.CONTENT, token, "", scores);
     }
 
     /** Outcome of one verify call. */
@@ -346,7 +440,8 @@ public final class SpeculativeDecoder {
      * state (PARITY §5.5.1 S-1).
      */
     private Verified verify(ModelMemory memory, Verifier verifier, SplittableRandom roundsRng, Sampler sampler,
-                            StopCriteria.Session session, int token, int[] draft, int pos) {
+                            StopCriteria.Session session, int token, int[] draft, int pos, int n,
+                            List<TokenScore[]> tokenLogprobs, ReasoningFilter.Sink sink) {
         int k = draft.length;
         int[] batch = new int[k + 1];
         batch[0] = token;
@@ -361,7 +456,7 @@ public final class SpeculativeDecoder {
                     + " logits rows");
         }
         Verified outcome = verifier == null
-                ? matchVerify(sampler, session, draft, rows)
+                ? matchVerify(sampler, session, draft, rows, n, tokenLogprobs, sink)
                 : verifierVerify(verifier, roundsRng, sampler, session, draft, rows);
         int drop = k - outcome.accepted;
         if (drop > 0) {
@@ -384,7 +479,8 @@ public final class SpeculativeDecoder {
      * {@link VerifyMode#MATCH}: the longest prefix whose chain samples equal the draft (llama.cpp
      * common/sampling.cpp:736); the first mismatching row's sample, or the last row's, is the target's next token.
      */
-    private Verified matchVerify(Sampler sampler, StopCriteria.Session session, int[] draft, float[][] rows) {
+    private Verified matchVerify(Sampler sampler, StopCriteria.Session session, int[] draft, float[][] rows,
+                                 int n, List<TokenScore[]> tokenLogprobs, ReasoningFilter.Sink sink) {
         int k = draft.length;
         int nAccepted = 0;
         int emitted = 0;
@@ -395,7 +491,9 @@ public final class SpeculativeDecoder {
                 reason = StopReason.CANCELLED;
                 break;
             }
-            next = sampler.sample(rows[i]);
+            Sampler.Candidates cur = sampler.apply(rows[i]);
+            next = cur.id(cur.selected());
+            capture(tokenLogprobs, sink, cur, next, n);
             sampler.accept(next);
             emitted++;
             reason = session.offer(next);
@@ -819,10 +917,13 @@ public final class SpeculativeDecoder {
          */
         public SpeculativeDecoder build() {
             boolean synthetic = verifyMode == VerifyMode.SYNTHETIC;
-            if ((syntheticRates != null) == (syntheticLength != null)) {
-                throw new IllegalArgumentException("synthetic verification needs exactly one of"
-                        + " synthetic_acceptance_rates and synthetic_acceptance_length, or none of both"
-                        + (synthetic ? "" : " outside synthetic mode"));
+            if (syntheticRates != null && syntheticLength != null) {
+                throw new IllegalArgumentException("synthetic_acceptance_rates and synthetic_acceptance_length"
+                        + " are mutually exclusive; configure one");
+            }
+            if (synthetic && syntheticRates == null && syntheticLength == null) {
+                throw new IllegalArgumentException("synthetic verification needs synthetic_acceptance_rates or"
+                        + " synthetic_acceptance_length");
             }
             if (synthetic) {
                 if (!Boolean.getBoolean(SyntheticVerifier.PROP_ENABLED)) {
