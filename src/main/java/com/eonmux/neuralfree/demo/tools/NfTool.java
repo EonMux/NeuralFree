@@ -63,9 +63,8 @@ public final class NfTool {
         try {
             out.append("nftool <command> [options]\n");
             out.append("commands: " + String.join(" | ", COMMANDS) + "\n");
-            out.append("implemented: export, download, imatrix\n");
-            out.append("run 'nftool export --help', 'nftool download --help' or 'nftool imatrix --help'"
-                    + " for the options.\n");
+            out.append("implemented: export, download, imatrix, cvector\n");
+            out.append("run 'nftool <command> --help' for the options of export, download, imatrix and cvector.\n");
         } catch (java.io.IOException e) {
             throw new IllegalStateException("cannot print the nftool usage", e);
         }
