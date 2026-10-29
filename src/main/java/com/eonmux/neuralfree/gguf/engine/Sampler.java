@@ -846,6 +846,7 @@ public final class Sampler {
                 h[i] = h[child];
                 i = child;
             }
+            h[i] = v;
         }
     }
 }
