@@ -15,11 +15,12 @@ public interface HfTensorHook {
 
     /**
      * {@code ModelBase.modify_tensors}: the tensor under its mapped name (base.py:845-846, 905). The converter's opt-in
-     * expert and QKV fusions (base.py:848-903) are not part of the view.
+     * expert and QKV fusions (base.py:848-903) are not part of the view. The base class filter's unconditional
+     * {@code language_model.} strip (base.py:591-592) happens before the mapping.
      */
     HfTensorHook DEFAULT = (ctx, hfName, src, out) -> {
         if (!out.isConsumed(hfName)) {
-            out.add(ctx.names().mapOrThrow(hfName), src);
+            out.add(ctx.names().mapOrThrow(hfName.replace("language_model.", "")), src);
         }
     };
 

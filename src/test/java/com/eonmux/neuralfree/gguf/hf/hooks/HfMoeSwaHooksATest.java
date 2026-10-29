@@ -52,14 +52,14 @@ public class HfMoeSwaHooksATest {
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.FLINT.ggufName());
         HfMoeSwaHooksA.flintMeta(ok, kv, null);
         assertEquals(2, kv.get(GgufKeys.LEADING_DENSE_BLOCK_COUNT));
-        assertEquals(1, kv.get(GgufKeys.EXPERT_SHARED_COUNT));
+        assertEquals(2, kv.get(GgufKeys.EXPERT_SHARED_COUNT));
         assertEquals(4, kv.get(GgufKeys.ATTENTION_SLIDING_WINDOW));
     }
 
     @Test
     public void flintTensorsDropTheRouterBiasAndRenameTheSoftmaxOffset() throws IOException {
         Map<String, com.eonmux.neuralfree.gguf.hf.tensor.RowSource> index = new LinkedHashMap<>();
-        index.put("model.layers.1.mlp.softmax_offset", seq(2));
+        index.put("model.layers.1.self_attn.softmax_offset", seq(2));
         index.put("model.layers.0.mlp.gate.expert_bias", seq(2));
         HfLoadContext ctx = context(dir(), Arch.FLINT, "FlintForCausalLM", "'num_experts': 2,"
                 + " 'router_expert_bias': false", index, false);
@@ -88,10 +88,18 @@ public class HfMoeSwaHooksATest {
         }
         HfMoeSwaHooksA.afmoeExtra(ctx, sink);
         assertEquals(3, sink.tensors.size());
+        Map<String, com.eonmux.neuralfree.gguf.hf.tensor.RowSource> partialIndex = new LinkedHashMap<>();
+        String only = "model.layers.0.mlp.experts.0.gate_proj.weight";
+        for (int x = 0; x < 2; x++) {
+            for (String part : new String[]{"gate_proj", "up_proj", "down_proj"}) {
+                partialIndex.put("model.layers.0.mlp.experts." + x + "." + part + ".weight", seq(2, 8));
+            }
+        }
         HfLoadContext partial = context(dir(), Arch.AFMOE, "AfmoeForCausalLM", "'num_local_experts': 2",
-                java.util.Collections.singletonMap("model.layers.0.mlp.experts.0.gate_proj.weight", seq(2, 8)),
-                false);
-        assertThrows(GgufFormatException.class, () -> HfMoeSwaHooksA.afmoeExtra(partial, new RecordingSink()));
+                partialIndex, false);
+        RecordingSink partialSink = new RecordingSink();
+        HfMoeSwaHooksA.afmoeTensors(partial, only, partial.index().get(only), partialSink);
+        assertThrows(GgufFormatException.class, () -> HfMoeSwaHooksA.afmoeExtra(partial, partialSink));
     }
 
     // ------------------------------------------------------------------ Kolibri1Model
@@ -105,7 +113,7 @@ public class HfMoeSwaHooksATest {
                 HfMoeSwaHooksA.kolibri1Fixup(ctx.config());
         assertEquals(1, fixed.findInt(0, "num_shared_experts"));
         assertTrue(fixed.find("route_norm").orElse(Boolean.FALSE).equals(Boolean.TRUE));
-        assertTrue(fixed.find("intermediate_size").orElse(0).equals(4));
+        assertEquals(4, fixed.findInt(0, "intermediate_size"));
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.KOLIBRI1.ggufName());
         HfMoeSwaHooksA.kolibri1Meta(ctx, kv, null);
         assertEquals(8, kv.get(GgufKeys.EXPERT_SHARED_FEED_FORWARD_LENGTH));
@@ -122,9 +130,11 @@ public class HfMoeSwaHooksATest {
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.GRANITE_SWA.ggufName());
         HfMoeSwaHooksA.graniteSwaMeta(ctx, kv, null);
         assertEquals(128, kv.get(GgufKeys.ATTENTION_SLIDING_WINDOW));
-        assertEquals(java.util.Arrays.asList(true, false),
+        // the period fallback is i % 4 != 0 (granite.py:110-113); the rope pattern is bool() of
+        // no_rope_layers' entries (granite.py:116-119) — [bool(0)] = [false]
+        assertEquals(java.util.Arrays.asList(false, true),
                 kv.get(GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN));
-        assertEquals(java.util.Arrays.asList(false, true), kv.get(GgufKeys.ATTENTION_ROPE_PATTERN));
+        assertEquals(java.util.Collections.singletonList(false), kv.get(GgufKeys.ATTENTION_ROPE_PATTERN));
         HfLoadContext moe = context(dir(), Arch.GRANITE_SWA, "GraniteMoeSWAForCausalLM",
                 "'layer_types': ['sliding_attention', 'full_attention']",
                 java.util.Collections.emptyMap(), false);

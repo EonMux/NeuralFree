@@ -150,9 +150,10 @@ public final class HfDenseHooksB {
         for (Map.Entry<?, ?> e : ((Map<?, ?>) decoder).entrySet()) {
             Object content = e.getValue() instanceof Map ? ((Map<?, ?>) e.getValue()).get("content") : null;
             if (IM_END.equals(content)) {
-                int id = HfQwenHooks.tokenId(files, IM_END);
-                md.put(GgufKeys.TOKENIZER_BOS_ID, id);
-                md.put(GgufKeys.TOKENIZER_EOS_ID, id);
+                // the decoder's map key is the id (qwen3vl.py:393: int(token_id))
+                int id = Integer.parseInt(String.valueOf(e.getKey()));
+                md.put(GgufKeys.TOKENIZER_BOS_ID, (long) id);
+                md.put(GgufKeys.TOKENIZER_EOS_ID, (long) id);
                 return;
             }
         }
@@ -222,6 +223,7 @@ public final class HfDenseHooksB {
                 throw new GgufFormatException("tensor '" + hfName + "' has no spatial counterpart '" + sibling
                         + "'");
             }
+            out.drop(sibling, "concatenated into the norm's spatial half");
             out.consume(sibling);
             HfTensorHook.DEFAULT.apply(ctx, hfName,
                     RowTransforms.concatRows(Arrays.asList(src, ctx.index().get(sibling))), out);

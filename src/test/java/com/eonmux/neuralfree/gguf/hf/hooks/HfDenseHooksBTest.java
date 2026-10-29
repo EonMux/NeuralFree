@@ -71,14 +71,14 @@ public class HfDenseHooksBTest {
         Files.writeString(dir.resolve("config.json"), json("{'architectures':['QWenLMHeadModel'],"
                         + "'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2,"
                         + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-06,"
-                        + " 'vocab_size': 4}"),
+                        + " 'vocab_size': 151851}"),
                 StandardCharsets.UTF_8);
         HfLoadContext ctx = context(Arch.QWEN, "QWenLMHeadModel", dir, QWEN2.replace("'vocab_size': 8",
-                "'vocab_size': 4"));
+                "'vocab_size': 151851"));
         Map<String, Object> md = HfDenseHooksB.qwenVocab(ctx, (tj, encode) -> "qwen2");
         assertEquals("gpt2", md.get(GgufKeys.TOKENIZER_MODEL));
         List<?> tokens = (List<?>) md.get(GgufKeys.TOKENIZER_LIST);
-        assertEquals(4, tokens.size());
+        assertEquals(151851, tokens.size());
         assertEquals("ab", tokens.get(0));
         assertEquals("a", tokens.get(1));
     }
@@ -115,8 +115,11 @@ public class HfDenseHooksBTest {
 
     @Test
     public void thinkerPrefixIsStrippedWhereverItOccurs() {
-        assertNull(HfDenseHooksB.THINKER_FILTER.filter("language_model.thinker.model.layers.0.self_attn"
-                + ".q_proj.weight", IDENTITY));
+        // the reference replace() is unconditional (qwenvl.py:37-38, qwen3vl.py:298): the
+        // language_model.thinker. name strips to the text-side name, not to a drop
+        assertEquals("language_model.model.layers.0.self_attn.q_proj.weight",
+                HfDenseHooksB.THINKER_FILTER.filter("language_model.thinker.model.layers.0.self_attn"
+                        + ".q_proj.weight", IDENTITY));
         assertEquals("model.layers.0.self_attn.q_proj.weight",
                 HfDenseHooksB.THINKER_FILTER.filter("model.thinker.layers.0.self_attn.q_proj.weight", IDENTITY));
         assertEquals("model.layers.0.self_attn.q_proj.weight",
@@ -142,7 +145,8 @@ public class HfDenseHooksBTest {
     public void deepstackCountAlsoReadsTheThinkerVisionConfig() throws IOException {
         Map<String, Object> flat = com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader.fromJson(
                 tmp.newFolder().toPath(), json("{'architectures': ['Qwen3VLForConditionalGeneration'],"
-                        + " 'thinker_config': {'vision_config': {'deepstack_visual_indexes': [1]}}}")).flat();
+                        + " 'thinker_config': {'text_config': {'num_hidden_layers': 1},"
+                        + " 'vision_config': {'deepstack_visual_indexes': [1]}}}")).flat();
         HfLoadContext ctx = context(Arch.QWEN3VL, "Qwen3VLForConditionalGeneration", QWEN2);
         assertEquals(1, HfDenseHooksB.deepstackCount(com.eonmux.neuralfree.gguf.hf.hooks.HfDenseHooksBTest
                 .configOf(flat)));
@@ -153,7 +157,8 @@ public class HfDenseHooksBTest {
             throws IOException {
         return com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader.fromJson(
                 java.nio.file.Path.of("."), json("{'architectures': ['Qwen3VLForConditionalGeneration'],"
-                        + " 'thinker_config': {'vision_config': {'deepstack_visual_indexes': [1]}}}"));
+                        + " 'thinker_config': {'text_config': {'num_hidden_layers': 1},"
+                        + " 'vision_config': {'deepstack_visual_indexes': [1]}}}"));
     }
 
     // ------------------------------------------------------------------ Qwen3ASRTextModel
@@ -172,14 +177,15 @@ public class HfDenseHooksBTest {
         write(dir, "tokenizer.json", json("{'added_tokens':[{'id':7,'content':'<|im_end|>','special':true,"
                 + "'normalized':false}],'normalizer':null,'pre_tokenizer':null,'post_processor':null,"
                 + "'decoder':null,'model':{'type':'BPE','unk_token':null,'byte_fallback':false,"
-                + "'vocab':{'<|im_end|>':7,'<|endoftext|>':8,'a':2},'merges':[]}}"));
+                + "'vocab':{'<|im_end|>':7,'<|endoftext|>':8,'a':2},'merges':[['a','a']]}}"));
         write(dir, "tokenizer_config.json", json("{'eos_token':'<|im_end|>',"
                 + "'added_tokens_decoder':{'151645':{'content':'<|im_end|>','special':true}}}"));
-        HfLoadContext ctx = context(Arch.QWEN3VL, "Qwen3ASRForConditionalGeneration", dir, QWEN2);
+        HfLoadContext ctx = context(Arch.QWEN3VL, "Qwen3ASRForConditionalGeneration", dir,
+                QWEN2.replace("'vocab_size': 8", "'vocab_size': 9"));
         Map<String, Object> md = HfDenseHooksB.asrVocab(ctx, (tj, encode) -> "qwen2");
         assertEquals(HfDenseHooksB.CHATML_TEMPLATE, md.get(GgufKeys.TOKENIZER_CHAT_TEMPLATE));
-        assertEquals(151645, md.get(GgufKeys.TOKENIZER_BOS_ID));
-        assertEquals(151645, md.get(GgufKeys.TOKENIZER_EOS_ID));
+        assertEquals(151645L, md.get(GgufKeys.TOKENIZER_BOS_ID));
+        assertEquals(151645L, md.get(GgufKeys.TOKENIZER_EOS_ID));
     }
 
     // ------------------------------------------------------------------ SenseNovaU1Model

@@ -500,7 +500,8 @@ public final class HfMoeSwaHooksA {
         if (!noRope.isEmpty()) {
             List<Boolean> rope = new ArrayList<>();
             for (Object v : noRope) {
-                rope.add(!Boolean.FALSE.equals(v) && !Integer.valueOf(0).equals(v));
+                // bool(x) per granite.py:118: false only for the numeric zero, whatever its width
+                rope.add(!(v instanceof Number) || ((Number) v).doubleValue() != 0.0);
             }
             kv.set(GgufKeys.ATTENTION_ROPE_PATTERN, rope);
         }
