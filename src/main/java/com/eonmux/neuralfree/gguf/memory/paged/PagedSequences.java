@@ -523,6 +523,11 @@ public final class PagedSequences implements SequenceMemory {
                 // the first dead slot, so the page addressing stays dense and attention reads the fresh rows
                 slots[g][seq] = firstCleared;
             }
+            if (lists[seq][g].isEmpty()) {
+                // an emptied list holds no rows: the counter drops with it (the armed-but-unfed token's slot
+                // never held a row, so the live-row sum can leave a residue an admission would trip over)
+                slots[g][seq] = 0;
+            }
         }
         if (hi == max + 1 && posMinArr[seq] == 0) {
             states[seq].truncate(Math.min(states[seq].nPast(), hi - lo));
@@ -535,12 +540,15 @@ public final class PagedSequences implements SequenceMemory {
 
     /**
      * Removes one group's rows in {@code [lo, hi)} and returns the slot of the first cleared row of a partially
-     * cleared page, or -1 when every touched page left whole (the cursor then needs no pull-down).
+     * cleared page, or -1 when every touched page left whole (the cursor then needs no pull-down). The walk runs
+     * from the back so every whole page in the range leaves through {@code removeBack}: a page that is wholly in
+     * the range always sits above the pages still to visit, so it is the last entry when the walk reaches it and
+     * no interior tombstone can ever stay behind in the list.
      */
     private int removeGroup(int g, int seq, int lo, int hi) {
         PageList list = lists[seq][g];
         int firstCleared = -1;
-        for (int k = 0; k < list.size(); ) {
+        for (int k = list.size() - 1; k >= 0; k--) {
             int page = list.page(k);
             int base = page * pageSize;
             int live = 0;
@@ -569,10 +577,13 @@ public final class PagedSequences implements SequenceMemory {
                     unref(true, g, page);
                     continue;
                 }
-                // interior whole page: the reference drops and the list keeps the id as a tombstone, so the slot
-                // addressing of the slots after it stays put
-                unref(false, g, page);
-                k++;
+                // defensive middle case (a contiguous range cannot reach it): the rows empty and the page stays
+                // HELD in its list slot, so the slot addressing after it stays put and the freed id can never be
+                // reallocated under a live entry of this list
+                if (pools[g].refCount(page) > 0) {
+                    privatize(g, seq, k);
+                    clearRowsIn(g, lists[seq][g].page(k) * pageSize, Integer.MIN_VALUE, Integer.MAX_VALUE);
+                }
                 continue;
             }
             if (liveIn > 0) {
@@ -586,8 +597,6 @@ public final class PagedSequences implements SequenceMemory {
                         }
                     }
                 }
-            } else {
-                k++;
             }
         }
         return firstCleared;

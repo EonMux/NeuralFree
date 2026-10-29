@@ -103,6 +103,42 @@ public class BatchPrefixCacheTest {
         }
     }
 
+    /**
+     * The regression of the adopt-cut page walk: over a context wide enough that an adopt's cut removes whole
+     * pages above a partially cut page, the walk ran ascending, so every whole page above the partial one sat
+     * behind an interior unref — its freed id was handed back by the pool and re-entered the same list as a live
+     * page, and the next eviction unref'd the live page twice ({@code page N is not held}). The walk runs from
+     * the back now: a run of sequential adopts and evictions keeps every page held exactly once and every
+     * generation finishes.
+     */
+    @Test
+    public void sequentialAdoptCutsAndEvictionsKeepEveryPageHeldOnce() throws IOException, InterruptedException {
+        MemoryConfig.Builder mc = MemoryConfig.builder().nCtx(256).ubatch(8).parallel(2)
+                .typeK(KvDType.F32).typeV(KvDType.F32).prefixReuse(true).kvPaged(true);
+        EngineConfig config = EngineConfig.builder().memory(mc.build()).build();
+        Path model = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel m = new GGUFModel(model.toString(), config);
+             BatchEngine engine = BatchEngine.forModel(m, config)) {
+            int[] longPrompt = new int[24];
+            for (int i = 0; i < longPrompt.length; i++) {
+                longPrompt[i] = 4 + (i * 13) % 250;
+            }
+            for (int round = 0; round < 6; round++) {
+                int[] prompt = new int[longPrompt.length];
+                System.arraycopy(longPrompt, 0, prompt, 0, longPrompt.length);
+                prompt[round * 3] = 4 + round * 17; // a divergent tail the adopt must cut
+                BatchSequence seq = engine.submit(prompt, request(8),
+                        (com.eonmux.neuralfree.gguf.TokenCallback) null);
+                engine.drain();
+                assertEquals("round " + round + " finishes", BatchSequence.State.DONE, seq.state());
+                if (round > 0) {
+                    assertTrue("round " + round + " adopts the shared prefix, got " + seq.reusedPrefix(),
+                            seq.reusedPrefix() >= 1);
+                }
+            }
+        }
+    }
+
     @Test
     public void aOneSlotMemoryEvictsTheOldestCachedPrefixForANewGeneration() throws IOException, InterruptedException {
         Path model = SyntheticModels.llama().writeTempFile();
