@@ -29,6 +29,7 @@ import java.util.TreeMap;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -243,8 +244,8 @@ public class HfGgufParityTest {
     private static Map<String, String> byName(List<GGUFTensorInfo> infos) {
         Map<String, String> out = new TreeMap<>();
         for (GGUFTensorInfo t : infos) {
-            String prev = out.put(t.name(), Arrays.toString(t.dims()) + " " + t.type());
-            assertNotNull("tensor '" + t.name() + "' appears twice", prev);
+            assertNull("tensor '" + t.name() + "' appears twice", out.put(t.name(),
+                    Arrays.toString(t.dims()) + " " + t.type()));
         }
         return out;
     }

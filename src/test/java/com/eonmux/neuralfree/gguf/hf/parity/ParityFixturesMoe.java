@@ -78,10 +78,10 @@ public final class ParityFixturesMoe {
 
     /** The expected GGUF view of {@link #deepSeekV2Checkpoint}. */
     public static GgufTestWriter deepSeekV2Expected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("deepseek2");
         g.str("general.architecture", "deepseek2");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 /* MOSTLY_BF16 */ : 0 /* ALL_F32 */);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 /* MOSTLY_BF16 */ : 1 /* MOSTLY_F16 */);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("deepseek2.block_count", 2);
@@ -105,7 +105,7 @@ public final class ParityFixturesMoe {
         g.u32("deepseek2.rope.dimension_count", 2); // qk_rope_head_dim
         g.f32("deepseek2.rope.freq_base", 10000.0f);
         ParityFixturesDense.tokenizerKv(g, ParityFixturesDense.gpt2Tokens(16),
-                ParityFixturesDense.gpt2Types(16));
+                ParityFixturesDense.gpt2Types(16), "mpt");
 
         int seed = 0;
         ParityFixturesDense.planMatrix(g, "token_embd.weight", w, new long[]{16, 16}, seed++);
@@ -222,10 +222,10 @@ public final class ParityFixturesMoe {
 
     /** The expected GGUF view of {@link #qwen3MoeCheckpoint}: fused experts split, no Q/K permutation. */
     public static GgufTestWriter qwen3MoeExpected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("qwen3moe");
         g.str("general.architecture", "qwen3moe");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 0);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 1);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("qwen3moe.block_count", 2);
@@ -235,11 +235,12 @@ public final class ParityFixturesMoe {
         g.u32("qwen3moe.attention.head_count", 2);
         g.u32("qwen3moe.attention.head_count_kv", 1);
         g.u32("qwen3moe.expert_count", 2);
+        g.u32("qwen3moe.expert_used_count", 1); // num_experts_per_tok (base.py:1694-1695)
         g.u32("qwen3moe.expert_feed_forward_length", 8);
         g.f32("qwen3moe.attention.layer_norm_rms_epsilon", 1e-5f);
         g.f32("qwen3moe.rope.freq_base", 10000.0f);
         ParityFixturesDense.tokenizerKv(g, ParityFixturesDense.gpt2Tokens(16),
-                ParityFixturesDense.gpt2Types(16));
+                ParityFixturesDense.gpt2Types(16), "mpt");
 
         int seed = 0;
         ParityFixturesDense.planMatrix(g, "token_embd.weight", w, new long[]{16, 16}, seed++);

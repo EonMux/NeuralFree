@@ -96,10 +96,10 @@ public final class ParityFixturesOther {
 
     /** The expected GGUF view of {@link #gemma3Checkpoint}: norms shifted + 1, embedding cut to 12 rows. */
     public static GgufTestWriter gemma3Expected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("gemma3");
         g.str("general.architecture", "gemma3");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 /* MOSTLY_BF16 */ : 0 /* ALL_F32 */);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 /* MOSTLY_BF16 */ : 1 /* MOSTLY_F16 */);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("gemma3.block_count", 2);
@@ -111,11 +111,12 @@ public final class ParityFixturesOther {
         g.u32("gemma3.attention.key_length", 8);
         g.u32("gemma3.attention.value_length", 8);
         g.u32("gemma3.attention.sliding_window", 4);
-        g.u32("gemma3.vocab_size", 12);
+        // llama.cpp writes no {arch}.vocab_size for a gemma3 with a gpt2 vocab (only the mistral vocab
+        // path calls add_vocab_size); the tokenizer keys carry the vocabulary size instead
         g.f32("gemma3.attention.layer_norm_rms_epsilon", 1e-5f);
         g.f32("gemma3.rope.freq_base", 10000.0f);
         ParityFixturesDense.tokenizerKv(g, ParityFixturesDense.gpt2Tokens(12),
-                ParityFixturesDense.gpt2Types(12));
+                ParityFixturesDense.gpt2Types(12), "mpt");
 
         // The embedding keeps the first 12 rows of the 14 checkpoint rows (gemma.py:160-163).
         g.tensorFromFloats("token_embd.weight", w, new long[]{16, 12},
@@ -134,7 +135,7 @@ public final class ParityFixturesOther {
             ParityFixturesDense.planMatrix(g, b + "attn_v.weight", w, new long[]{16, 8}, seed++);
             ParityFixturesDense.planMatrix(g, b + "attn_output.weight", w, new long[]{16, 16}, seed++);
             int ffnNorm = seed++;
-            g.tensorFromFloats(b + "ffn_norm.weight", GGMLType.F32, new long[]{16}, shifted(ffnNorm, 16, 1f));
+            g.tensorFromFloats(b + "post_attention_norm.weight", GGMLType.F32, new long[]{16}, shifted(ffnNorm, 16, 1f));
             ParityFixturesDense.planMatrix(g, b + "ffn_gate.weight", w, new long[]{16, 32}, seed++);
             ParityFixturesDense.planMatrix(g, b + "ffn_up.weight", w, new long[]{16, 32}, seed++);
             ParityFixturesDense.planMatrix(g, b + "ffn_down.weight", w, new long[]{32, 16}, seed++);
@@ -170,8 +171,8 @@ public final class ParityFixturesOther {
             b.floats(dtype, p + "self_attn.v_proj.weight", 16, 16);
             b.floats(dtype, p + "self_attn.o_proj.weight", 16, 16);
             b.floats(dtype, p + "post_attention_layernorm.weight", 16);
-            b.floats(dtype, p + "mlp.gate_proj.weight", 32, 16);
-            b.floats(dtype, p + "mlp.up_proj.weight", 32, 16);
+            // phi3 carries a fused gate_up projection (tensor_mapping.py FFN_UP row: model.layers.{bid}.mlp.gate_up_proj)
+            b.floats(dtype, p + "mlp.gate_up_proj.weight", 64, 16);
             b.floats(dtype, p + "mlp.down_proj.weight", 16, 32);
         }
         b.floats(dtype, "model.norm.weight", 16);
@@ -181,10 +182,10 @@ public final class ParityFixturesOther {
 
     /** The expected GGUF view of {@link #phi3Checkpoint} with the LongRoPE scalings (phi.py:148-211). */
     public static GgufTestWriter phi3Expected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("phi3");
         g.str("general.architecture", "phi3");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 0);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 1);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("phi3.block_count", 2);
@@ -200,7 +201,7 @@ public final class ParityFixturesOther {
         g.u32("phi3.attention.sliding_window", 0);
         g.f32("phi3.rope.scaling.attn_factor", (float) Math.sqrt(2.0)); // scale 64/8, type su
         ParityFixturesDense.tokenizerKv(g, ParityFixturesDense.gpt2Tokens(16),
-                ParityFixturesDense.gpt2Types(16));
+                ParityFixturesDense.gpt2Types(16), "mpt");
 
         int seed = 0;
         ParityFixturesDense.planMatrix(g, "token_embd.weight", w, new long[]{16, 16}, seed++);
@@ -216,8 +217,8 @@ public final class ParityFixturesOther {
             int ffnNorm = seed++;
             g.tensorFromFloats(b + "ffn_norm.weight", GGMLType.F32, new long[]{16},
                     ParityFixturesDense.valuesAt(ffnNorm, 16));
-            ParityFixturesDense.planMatrix(g, b + "ffn_gate.weight", w, new long[]{16, 32}, seed++);
-            ParityFixturesDense.planMatrix(g, b + "ffn_up.weight", w, new long[]{16, 32}, seed++);
+            // the fused gate_up projection maps to FFN_UP alone; PHI3 has no FFN_GATE tensor
+            ParityFixturesDense.planMatrix(g, b + "ffn_up.weight", w, new long[]{16, 64}, seed++);
             ParityFixturesDense.planMatrix(g, b + "ffn_down.weight", w, new long[]{32, 16}, seed++);
         }
         int finalNorm = seed++;
@@ -266,10 +267,10 @@ public final class ParityFixturesOther {
 
     /** The expected GGUF view of {@link #mamba2Checkpoint} (mamba.py:126-200). */
     public static GgufTestWriter mamba2Expected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("mamba2");
         g.str("general.architecture", "mamba2");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 0);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 1);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("mamba2.context_length", 1048576); // arbitrary (mamba.py:155)
@@ -284,7 +285,7 @@ public final class ParityFixturesOther {
         g.u32("mamba2.ssm.group_count", 1);
         g.f32("mamba2.attention.layer_norm_rms_epsilon", 1e-5f);
         ParityFixturesDense.tokenizerKv(g, ParityFixturesDense.gpt2Tokens(16),
-                ParityFixturesDense.gpt2Types(16));
+                ParityFixturesDense.gpt2Types(16), "mpt");
 
         int seed = 0;
         ParityFixturesDense.planMatrix(g, "token_embd.weight", w, new long[]{8, 16}, seed++);
@@ -355,10 +356,10 @@ public final class ParityFixturesOther {
 
     /** The expected GGUF view of {@link #bertCheckpoint} (bert.py:19-112). */
     public static GgufTestWriter bertExpected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("bert");
         g.str("general.architecture", "bert");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 0);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 1);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("bert.block_count", 2);

@@ -78,10 +78,11 @@ public final class ParityFixturesDense {
         w.tensorFromFloats(name, type, ne, v);
     }
 
-    /** Writes the shared tokenizer keys of the {@link SyntheticHf#GPT2_TOKENIZER} fixture. */
-    public static void tokenizerKv(GgufTestWriter w, List<String> tokens, int[] types) {
+    /** Writes the shared tokenizer keys of the {@link SyntheticHf#GPT2_TOKENIZER} fixture. The {@code pre} name is
+     * the converter's chkhsh lookup result for that vocab (a miss raises in llama.cpp, base.py:2132-2140). */
+    public static void tokenizerKv(GgufTestWriter w, List<String> tokens, int[] types, String pre) {
         w.str("tokenizer.ggml.model", "gpt2");
-        w.str("tokenizer.ggml.pre", "default");
+        w.str("tokenizer.ggml.pre", pre);
         w.strArray("tokenizer.ggml.tokens", tokens);
         w.i32Array("tokenizer.ggml.token_type", types);
         w.strArray("tokenizer.ggml.merges", "a b");
@@ -97,7 +98,8 @@ public final class ParityFixturesDense {
      * special added tokens), 4 USER_DEFINED (Ġhi, an added byte-level token that keeps its text), 5 UNUSED.
      */
     public static List<String> gpt2Tokens(int vocabSize) {
-        List<String> tokens = new ArrayList<>(Arrays.asList("<s>", "</s>", "a", "b", "ab", "<|begin|>", "Ġhi"));
+        // the 7th token is stored byte-decoded, as llama.cpp's _set_vocab_gpt2 writes Ġ-decoded pieces
+        List<String> tokens = new ArrayList<>(Arrays.asList("<s>", "</s>", "a", "b", "ab", "<|begin|>", " hi"));
         while (tokens.size() < vocabSize) {
             tokens.add("[PAD" + tokens.size() + "]");
         }
@@ -142,10 +144,10 @@ public final class ParityFixturesDense {
 
     /** The expected GGUF view of {@link #llamaCheckpoint}. */
     public static GgufTestWriter llamaExpected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("llama");
         g.str("general.architecture", "llama");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 /* MOSTLY_BF16 */ : 0 /* ALL_F32 */);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 /* MOSTLY_BF16 */ : 1 /* MOSTLY_F16 */);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("llama.block_count", 2);
@@ -158,7 +160,7 @@ public final class ParityFixturesDense {
         g.u32("llama.rope.dimension_count", 16);
         g.u32("llama.vocab_size", 16);
         g.f32("llama.rope.freq_base", 10000.0f);
-        tokenizerKv(g, gpt2Tokens(16), gpt2Types(16));
+        tokenizerKv(g, gpt2Tokens(16), gpt2Types(16), "mpt");
 
         int seed = 0;
         planMatrix(g, "token_embd.weight", w, new long[]{64, 16}, seed++);      // embed
@@ -219,10 +221,10 @@ public final class ParityFixturesDense {
 
     /** The expected GGUF view of {@link #qwen2Checkpoint}: no permutation, biases preserved. */
     public static GgufTestWriter qwen2Expected(StDType dtype) {
-        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F32;
+        GGMLType w = dtype == StDType.BF16 ? GGMLType.BF16 : GGMLType.F16; // --outtype auto defaults to F16 (base.py:181-196)
         GgufTestWriter g = new GgufTestWriter().architecture("qwen2");
         g.str("general.architecture", "qwen2");
-        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 0);
+        g.u32("general.file_type", dtype == StDType.BF16 ? 32 : 1);
         g.str("general.type", "model");
         g.u32("general.quantization_version", 2);
         g.u32("qwen2.block_count", 2);
@@ -233,7 +235,7 @@ public final class ParityFixturesDense {
         g.u32("qwen2.attention.head_count_kv", 2);
         g.f32("qwen2.attention.layer_norm_rms_epsilon", 1e-5f);
         g.f32("qwen2.rope.freq_base", 10000.0f);
-        tokenizerKv(g, gpt2Tokens(16), gpt2Types(16));
+        tokenizerKv(g, gpt2Tokens(16), gpt2Types(16), "mpt");
 
         int seed = 0;
         planMatrix(g, "token_embd.weight", w, new long[]{64, 16}, seed++);
@@ -279,20 +281,20 @@ public final class ParityFixturesDense {
      */
     private static void qPermuted(GgufTestWriter g, GGMLType type, String name, int seed, int nEmbd, int rows,
                                   int headGroups) {
-        // The LlamaModel.permute row order (llama.py:176-182), applied head-group-wise:
-        // new row (b * headGroups + a) takes the checkpoint row (a * stride + b), stride = nRows / headGroups.
-        int stride = rows / headGroups;
+        // LlamaModel.permute (llama.py:176-179): the head count falls back to n_head_kv when they differ, and the
+        // two halves of each head swap — new row (h, i, j) takes the checkpoint row (h, j, i).
+        int half = rows / headGroups / 2;
         long count = (long) nEmbd * rows;
         float[] src = valuesAt(seed, (int) count);
-        int[] rowMap = new int[rows];
-        for (int a = 0; a < headGroups; a++) {
-            for (int b = 0; b < stride; b++) {
-                rowMap[b * headGroups + a] = a * stride + b;
-            }
-        }
         float[] dst = new float[src.length];
-        for (int r = 0; r < rows; r++) {
-            System.arraycopy(src, rowMap[r] * nEmbd, dst, r * nEmbd, nEmbd);
+        for (int h = 0; h < headGroups; h++) {
+            for (int i = 0; i < half; i++) {
+                for (int j = 0; j < 2; j++) {
+                    int dstRow = h * half * 2 + i * 2 + j;
+                    int srcRow = h * half * 2 + j * half + i;
+                    System.arraycopy(src, srcRow * nEmbd, dst, dstRow * nEmbd, nEmbd);
+                }
+            }
         }
         g.tensorFromFloats(name, type, new long[]{nEmbd, rows}, dst);
     }
