@@ -67,7 +67,7 @@ public class RegexToGbnfTest {
     @Test
     public void escapesOfOperatorsBecomeOneLiteral() {
         assertEquals(qEscape() + " (" + q("[]{}()|+*?") + ") " + qEscape(),
-                translated("^[\\[\\]\\{\\}\\(\\)\\|\\+\\*\\?$").rule("root"));
+                translated("^\\[\\]\\{\\}\\(\\)\\|\\+\\*\\?$").rule("root"));
     }
 
     // -------------------------------------------------- LC test "regexp quote" (:768-779)

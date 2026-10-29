@@ -124,7 +124,7 @@ public final class RegexToGbnf {
         if (parenDepth != 0) {
             throw new InvalidRegexException("unbalanced parentheses");
         }
-        return builder.addRule(name, "\"\\\"\" (" + rule + ") \"\\\"");
+        return builder.addRule(name, "\"\\\"\" (" + rule + ") \"\\\"\"");
     }
 
     /**

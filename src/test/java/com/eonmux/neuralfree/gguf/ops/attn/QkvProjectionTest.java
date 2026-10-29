@@ -54,6 +54,8 @@ public class QkvProjectionTest {
                 .norm(NormSpec.builder(NormKind.RMS, 1e-6f).build())
                 .residual(ResidualSpec.builder(ResidualKind.STANDARD, WIDTH).build())
                 .attention(a)
+                .rope(com.eonmux.neuralfree.gguf.spec.RopeSpec.builder(
+                        com.eonmux.neuralfree.gguf.arch.RopeType.NORM).nDims(HEAD_DIM).freqBase(10000f).build())
                 .build();
     }
 
