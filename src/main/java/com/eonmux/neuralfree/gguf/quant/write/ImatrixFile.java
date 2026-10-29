@@ -176,7 +176,9 @@ public final class ImatrixFile {
         List<Entry> stats = sorted(entries);
         ImatrixSource source = new ImatrixSource(out.toString(), stats, datasets, chunkCount, chunkSize);
         try {
-            GgufWriter.write(source, out, new GgufWriter.Options(GgufWriter.Mode.NATIVE));
+            // llama.cpp's imatrix tool always replaces its output; the options carry overwrite for it.
+            GgufWriter.write(source, out, new GgufWriter.Options(GgufWriter.Mode.NATIVE, true,
+                    GGUFFileParser.DEFAULT_ALIGNMENT));
         } finally {
             source.close();
         }

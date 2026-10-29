@@ -41,6 +41,9 @@ public final class NfTool {
             case "download":
                 DownloadCommand.run(rest);
                 return;
+            case "imatrix":
+                ImatrixCommand.run(rest);
+                return;
             case "--help":
             case "-h":
                 usage(System.out);
@@ -49,7 +52,7 @@ public final class NfTool {
                 if (COMMANDS.contains(command)) {
                     // Explicit refusal, never a stub: the tool's WP owns its landing (§5.17).
                     usageError(command + " is not implemented yet; it arrives with its own PARITY.md work "
-                            + "package; until then the tools behind nftool are export and download");
+                            + "package; until then the tools behind nftool are export, download and imatrix");
                 }
                 usageError("nftool has no command '" + command + "': " + COMMANDS);
         }
@@ -60,8 +63,9 @@ public final class NfTool {
         try {
             out.append("nftool <command> [options]\n");
             out.append("commands: " + String.join(" | ", COMMANDS) + "\n");
-            out.append("implemented: export, download\n");
-            out.append("run 'nftool export --help' or 'nftool download --help' for the options.\n");
+            out.append("implemented: export, download, imatrix\n");
+            out.append("run 'nftool export --help', 'nftool download --help' or 'nftool imatrix --help'"
+                    + " for the options.\n");
         } catch (java.io.IOException e) {
             throw new IllegalStateException("cannot print the nftool usage", e);
         }
