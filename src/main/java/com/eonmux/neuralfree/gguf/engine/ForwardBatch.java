@@ -239,7 +239,6 @@ public final class ForwardBatch {
             if (ropeSet) {
                 throw new IllegalStateException("rope positions are set once");
             }
-            ropeSet = true;
             Objects.requireNonNull(sections, "sections");
             if (sections.length == 0) {
                 throw new IllegalArgumentException("rope positions need at least one section");
@@ -251,6 +250,8 @@ public final class ForwardBatch {
                             + " rows, the batch holds " + n);
                 }
             }
+            // a rejected call changes nothing: the set-once flag goes last, after the validation
+            ropeSet = true;
             ropeSection = new int[sections.length][];
             for (int k = 0; k < sections.length; k++) {
                 ropeSection[k] = sections[k].clone();
@@ -268,7 +269,6 @@ public final class ForwardBatch {
             if (adapterSet) {
                 throw new IllegalStateException("adapter slots are set once");
             }
-            adapterSet = true;
             Objects.requireNonNull(slots, "slots");
             if (slots.length != n) {
                 throw new IllegalArgumentException("adapter slots cover " + slots.length + " rows, the batch holds "
@@ -279,6 +279,8 @@ public final class ForwardBatch {
                     throw new IllegalArgumentException("adapter slots are non-negative, got " + s);
                 }
             }
+            // a rejected call changes nothing: the set-once flag goes last, after the validation
+            adapterSet = true;
             adapterSlot = slots.clone();
             return this;
         }

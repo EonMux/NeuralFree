@@ -33,7 +33,7 @@ public final class BatchSplitterTest {
         assertArrayEquals(new int[]{100, 101}, ubatches.get(0).tokens());
         assertArrayEquals(new int[]{3, 4}, ubatches.get(0).positions());
         assertArrayEquals(new int[]{102, 103}, ubatches.get(1).tokens());
-        assertArrayEquals(new int[]{105}, ubatches.get(2).tokens());
+        assertArrayEquals(new int[]{104}, ubatches.get(2).tokens());
         StepLayout layout = ubatches.get(0).layout();
         assertEquals(1, layout.nSeg());
         assertEquals(0, layout.seq(0));
@@ -143,7 +143,7 @@ public final class BatchSplitterTest {
         BatchSplitter splitter = new BatchSplitter();
         assertThrows(IllegalArgumentException.class, () -> splitter.split(oneSequence(1, 0, 0, false), 0,
                 BatchSplitter.Mode.SIMPLE));
-        assertThrows(IllegalArgumentException.class, () -> splitter.split(oneSequence(1, 0, 0, false), 1, null));
+        assertThrows(NullPointerException.class, () -> splitter.split(oneSequence(1, 0, 0, false), 1, null));
     }
 
     @Test

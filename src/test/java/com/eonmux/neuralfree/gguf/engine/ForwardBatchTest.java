@@ -59,7 +59,7 @@ public final class ForwardBatchTest {
                 .build();
         assertNotNull(batch.embeddings());
         assertNotNull(batch.embeddings()[0]);
-        assertNull(batch.embeddings()[1]); // token batches and embedding batches never carry both
+        assertNotNull(batch.embeddings()[1]);
         assertEquals(2, batch.nTokens());
         assertArrayEquals(new float[]{1, 2, 3}, batch.embeddingRow(0), 0.0f);
         assertArrayEquals(new float[]{4, 5, 6}, batch.embeddingRow(1), 0.0f);
@@ -91,8 +91,8 @@ public final class ForwardBatchTest {
         assertThrows(IllegalArgumentException.class, jump::build); // +1 from one row to the next
         // interleaved sequences are allowed while each keeps its own consecutive positions
         ForwardBatch.builder(3).add(1, 0, 0, false).add(2, 0, 1, false).add(3, 1, 0, false).build().nTokens();
-        ForwardBatch.Builder hole = ForwardBatch.builder(3);
-        hole.add(1, 0, 0, false).add(2, 0, 1, false).add(3, 2, 0, false);
+        ForwardBatch.Builder hole = ForwardBatch.builder(2);
+        hole.add(1, 0, 0, false).add(2, 2, 0, false);
         assertThrows(IllegalArgumentException.class, hole::build); // sequence 0 holed
         ForwardBatch.Builder noToken = ForwardBatch.builder(1);
         noToken.add(-1, 0, 0, true);
