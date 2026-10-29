@@ -308,16 +308,17 @@ public class PagedSequencesTest {
         // a mixed layout fails whole as well: no page of either segment is reserved
         assertThrows(MemoryFullException.class,
                 () -> mem.prepare(StepLayout.of(12, new int[]{0, 1}, new int[]{0, 8}, new int[]{8, 4},
-                        new int[]{16, 0}, new int[]{0}, true)));
+                        new int[]{16, 12}, new int[]{0}, true)));
         assertEquals(usedRows, mem.totalCells() - mem.freeCells());
 
         // the one-page plan that fits then runs with the page the failed plans never reserved
         PagedStep ok = step(mem, 0, tokens(16, 4));
         assertTrue(ok.pageTableEntry(0, 0, 4) >= 0);
 
-        // releasing a sequence opens the pool again (whole pages dropped, their rows emptied)
+        // releasing a sequence opens the pool again (whole pages dropped, their rows emptied): seq 0 held
+        // 20 rows, so only seq 1's 12 rows stay used
         mem.keep(1);
-        assertEquals(12, mem.freeCells());
+        assertEquals(12, mem.totalCells() - mem.freeCells());
     }
 
     @Test
@@ -349,8 +350,8 @@ public class PagedSequencesTest {
         int pageA = mem.pageCount() - 1;
         int pageB = mem.pageCount() - 2;
 
-        // positions [2, 8): page B shares whole, the partial page A gets a private copy of its in-range rows
-        mem.copy(0, 1, 2, -1);
+        // positions [2, 6): page B shares whole, the partial page A gets a private copy of its in-range rows
+        mem.copy(0, 1, 2, 6);
 
         List<PageCopy> pending = mem.pendingCopies();
         assertEquals(1, pending.size());
@@ -370,8 +371,9 @@ public class PagedSequencesTest {
         }
         mem.clearReports();
 
-        // the second sequence continues inside page B: the next write privatizes the shared tail page
-        PagedStep dst = step(mem, 1, tokens(8, 2));
+        // the second sequence continues INSIDE page B (positions 6, 7 are its shared rows): the write
+        // privatizes the shared tail page, and prepare reports the copy on the step
+        PagedStep dst = step(mem, 1, tokens(6, 2));
         assertEquals(1, dst.pageCopies().size());
         assertEquals(pageB, dst.pageCopies().get(0).srcPage());
         // ... and the first sequence's pages are untouched by it

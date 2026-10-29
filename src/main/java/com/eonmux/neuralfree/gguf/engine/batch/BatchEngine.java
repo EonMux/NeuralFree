@@ -78,11 +78,13 @@ public final class BatchEngine implements AutoCloseable {
     private final Slot[] slots;
     private final Deque<Submission> queue = new ArrayDeque<>();
     private final List<Slot> active = new ArrayList<>();
+    private final PrefixCache cache;
     private int nextSubmitId;
     private boolean closed;
 
     private BatchEngine(ForwardBackend backend, GGUFTokenizer tokenizer, ReasoningFilter reasoning,
-                        SamplingDefaults samplingDefaults, SequenceMemory sequences, int maxSequences) {
+                        SamplingDefaults samplingDefaults, SequenceMemory sequences, int maxSequences,
+                        boolean prefixReuse, boolean windowed) {
         this.backend = backend;
         this.tokenizer = tokenizer;
         this.reasoning = reasoning;
@@ -90,6 +92,9 @@ public final class BatchEngine implements AutoCloseable {
         this.sequences = sequences;
         this.nCtx = sequences.sequence(0).nCtx();
         this.slots = new Slot[maxSequences];
+        // the prefix cache holds retired sequences whose pages stay valid: a windowed (SWA) memory trims old
+        // positions per commit, so a cached prefix's rows can sit outside the window the next request reads
+        this.cache = !prefixReuse || windowed ? null : new PrefixCache();
     }
 
     /**
@@ -133,7 +138,12 @@ public final class BatchEngine implements AutoCloseable {
         }
         GGUFTokenizer tok = model.tokenizer();
         ReasoningFilter rf = ReasoningFilter.forChatTemplate(tok.chatTemplate()).withTagTokens(tok::getTokenId);
-        return new BatchEngine(backend, tok, rf, SamplingDefaults.forModel(model, config), paged, paged.maxSequences());
+        boolean windowed = false;
+        for (int g = 0; g < paged.plan().groups().size(); g++) {
+            windowed |= paged.plan().group(g).window().type() != com.eonmux.neuralfree.gguf.arch.SwaType.NONE;
+        }
+        return new BatchEngine(backend, tok, rf, SamplingDefaults.forModel(model, config), paged,
+                paged.maxSequences(), config.memory().prefixReuse(), windowed);
     }
 
     /** The model's tokenizer. */
@@ -271,13 +281,50 @@ public final class BatchEngine implements AutoCloseable {
     private void admit() {
         while (!queue.isEmpty()) {
             Submission head = queue.peek();
-            int slot = freeSlot();
+            int slot = claimSlot(head);
             if (slot < 0 || sequences.freeCells() < head.prompt.length) {
                 return; // FIFO: the head waits until its prompt fits whole
             }
             queue.poll();
             active.add(openSlot(slot, head));
         }
+    }
+
+    /**
+     * The slot for the head submission: when the prompt extends a cached prefix, that cached sequence is adopted
+     * in place — its slot, its pages, its divergent tail cut at the reused length ({@code remove(seq, reused, -1)})
+     * — so the request continues the exact rows its prompt's prefix already computed. Without a match a slot is
+     * freed by evicting the least recently used cached prefix when none is idle.
+     */
+    private int claimSlot(Submission head) {
+        if (cache != null) {
+            PrefixCache.Entry entry = cache.longestPrefix(head.prompt);
+            if (entry != null) {
+                int reused = Math.min(PrefixCache.commonLength(entry.tokens, head.prompt),
+                        head.prompt.length - 1);
+                cache.discard(entry.seq);
+                if (reused >= 1) {
+                    sequences.remove(entry.seq, reused, -1);
+                    head.reused = reused;
+                    head.handle.reused(reused);
+                    return entry.seq;
+                }
+                sequences.remove(entry.seq, 0, -1);
+            }
+        }
+        if (freeSlot() < 0 && cache != null) {
+            PrefixCache.Entry oldest = cache.evictOldest();
+            if (oldest != null) {
+                sequences.remove(oldest.seq, 0, -1);
+            }
+        }
+        int slot = freeSlot();
+        if (slot >= 0 && cache != null && cache.holds(slot)) {
+            // the new generation overwrites this slot: drop its cached entry and free its pages
+            cache.discard(slot);
+            sequences.remove(slot, 0, -1);
+        }
+        return slot;
     }
 
     private Slot firstWaitingPrefill() {
@@ -289,23 +336,26 @@ public final class BatchEngine implements AutoCloseable {
         return null;
     }
 
-    /** Prefills the oldest admitted submission: the whole prompt as one sequence batch, logits of its last row. */
+    /** Prefills the oldest admitted submission: the prompt's tail after any reused prefix, logits of its last row. */
     private void prefill(Slot slot) {
         if (slot.run.cancelled()) {
             finish(slot, StopReason.CANCELLED);
             return;
         }
-        int[] prompt = slot.submission.prompt;
+        Submission sub = slot.submission;
+        int reused = sub.reused;
+        int[] tail = reused == 0 ? sub.prompt
+                : java.util.Arrays.copyOfRange(sub.prompt, reused, sub.prompt.length);
         try {
             long t0 = System.nanoTime();
-            ForwardBatch.Builder batch = ForwardBatch.builder(prompt.length);
-            for (int i = 0; i < prompt.length; i++) {
-                batch.add(prompt[i], i, slot.seq, i == prompt.length - 1);
+            ForwardBatch.Builder batch = ForwardBatch.builder(tail.length);
+            for (int i = 0; i < tail.length; i++) {
+                batch.add(tail[i], reused + i, slot.seq, i == tail.length - 1);
             }
             float[] logits = backend.forwardBatch(batch.build())[0];
-            slot.run.prefilled(prompt.length, System.nanoTime() - t0);
-            slot.run.sampler().accept(prompt, 0, prompt.length);
-            slot.nextPos = prompt.length;
+            slot.run.prefilled(tail.length, System.nanoTime() - t0);
+            slot.run.sampler().accept(sub.prompt, 0, sub.prompt.length);
+            slot.nextPos = reused + tail.length;
             sampleAndOffer(slot, logits, false);
         } catch (RuntimeException e) {
             // prepare is all-or-nothing: the failed prompt wrote nothing, the other sequences are untouched
@@ -384,6 +434,18 @@ public final class BatchEngine implements AutoCloseable {
         active.remove(slot);
         slots[slot.seq] = null;
         try {
+            if (error == null && cache != null && slot.nextPos > 0) {
+                // the sequence's pages stay valid: cache it by its exact tokens. The memory stores the prompt
+                // plus the fed decodes; the final sampled token armed but unfed is not in the pages.
+                int[] generated = result == null ? new int[0] : result.tokens();
+                int decoded = Math.min(slot.nextPos - slot.submission.prompt.length, generated.length);
+                int[] full = new int[slot.submission.prompt.length + Math.max(decoded, 0)];
+                System.arraycopy(slot.submission.prompt, 0, full, 0, slot.submission.prompt.length);
+                System.arraycopy(generated, 0, full, slot.submission.prompt.length, Math.max(decoded, 0));
+                cache.offer(slot.seq, full);
+                slot.submission.handle.complete(result, cancelled);
+                return;
+            }
             sequences.remove(slot.seq, 0, -1);
         } catch (RuntimeException e) {
             if (error != null) {
@@ -467,6 +529,7 @@ public final class BatchEngine implements AutoCloseable {
         final ReasoningFilter.Sink sink;
         final String renderedPrompt;
         final com.eonmux.neuralfree.gguf.grammar.Grammar grammar;
+        int reused;
 
         Submission(BatchSequence handle, int[] prompt, GenerationRequest request,
                    ReasoningFilter.Sink sink, String renderedPrompt,

@@ -23,12 +23,25 @@ public final class BatchSequence {
     private final int submitId;
     private volatile State state = State.QUEUED;
     private volatile int seq = -1;
+    private volatile int reusedPrefix;
     private volatile GenerationResult result;
     private volatile Throwable error;
     private volatile Runnable onFinish;
 
     BatchSequence(int submitId) {
         this.submitId = submitId;
+    }
+
+    /**
+     * The tokens the prefix cache reused for this request (copied pages, not prefilled), or 0 without a cache
+     * hit. The count sits inside the prompt: at least the last prompt token always prefills.
+     */
+    public int reusedPrefix() {
+        return reusedPrefix;
+    }
+
+    void reused(int tokens) {
+        this.reusedPrefix = tokens;
     }
 
     /**

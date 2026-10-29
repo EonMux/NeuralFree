@@ -517,7 +517,12 @@ public final class PagedSequences implements SequenceMemory {
         }
         hi = Math.min(hi, max + 1);
         for (int g = 0; g < groupsCount(); g++) {
-            removeGroup(g, seq, lo, hi);
+            int firstCleared = removeGroup(g, seq, lo, hi);
+            if (firstCleared >= 0 && slots[g][seq] > firstCleared) {
+                // a partially cleared page strands its dead rows below the cursor: the next append continues at
+                // the first dead slot, so the page addressing stays dense and attention reads the fresh rows
+                slots[g][seq] = firstCleared;
+            }
         }
         if (hi == max + 1 && posMinArr[seq] == 0) {
             states[seq].truncate(Math.min(states[seq].nPast(), hi - lo));
@@ -528,8 +533,13 @@ public final class PagedSequences implements SequenceMemory {
         recomputePos(seq);
     }
 
-    private void removeGroup(int g, int seq, int lo, int hi) {
+    /**
+     * Removes one group's rows in {@code [lo, hi)} and returns the slot of the first cleared row of a partially
+     * cleared page, or -1 when every touched page left whole (the cursor then needs no pull-down).
+     */
+    private int removeGroup(int g, int seq, int lo, int hi) {
         PageList list = lists[seq][g];
+        int firstCleared = -1;
         for (int k = 0; k < list.size(); ) {
             int page = list.page(k);
             int base = page * pageSize;
@@ -548,7 +558,7 @@ public final class PagedSequences implements SequenceMemory {
             if (live == 0 || liveIn == live) {
                 // the whole page leaves the sequence
                 if (k == list.size() - 1) {
-                    slots[g][seq] = Math.max(0, slots[g][seq] - pageSize);
+                    slots[g][seq] = Math.max(0, slots[g][seq] - live);
                     list.removeBack(1);
                     unref(true, g, page);
                     continue;
@@ -567,11 +577,20 @@ public final class PagedSequences implements SequenceMemory {
             }
             if (liveIn > 0) {
                 privatize(g, seq, k);
-                clearRowsIn(g, lists[seq][g].page(k) * pageSize, lo, hi);
+                int base2 = lists[seq][g].page(k) * pageSize;
+                clearRowsIn(g, base2, lo, hi);
+                for (int r = 0; r < pageSize; r++) {
+                    if (kvPos[g][base2 + r] == -1) {
+                        if (firstCleared < 0 || base2 + r < firstCleared) {
+                            firstCleared = base2 + r;
+                        }
+                    }
+                }
             } else {
                 k++;
             }
         }
+        return firstCleared;
     }
 
     /** Sets the rows of {@code base} whose position is selected empty and reports any position that was dropped. */

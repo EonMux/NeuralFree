@@ -264,6 +264,8 @@ Notes:
 
 On the CPU, `ForwardBatch` batches over the paged memory: `CpuForwardBackend.forwardBatch` splits the batch into one-sequence ubatches (llama.cpp `split_seq`), reserves each ubatch's pages all-or-nothing (`PagedSequences.prepare`, `MemoryFullException` before anything changed), stores K/V at the step's `cellIdx` rows, attends through the step's page tables and commits. A batch over several sequences computes the same logits as the same tokens run one sequence at a time (`CpuForwardBatchTest`). The GPU path has no paging yet ([GAPS.md](GAPS.md) lists what refuses).
 
+The batch engine adds cross-request prefix reuse over this memory: retired sequences stay cached with their pages, an extending prompt adopts the cached sequence in place and prefills only its tail (`BatchEngine`, `PrefixCache`; [USAGE.md](USAGE.md#prefix-cache) has the user view, `BatchPrefixCacheTest` the parity runs).
+
 ### Continuous batching
 
 `gguf/engine/batch` runs several requests over one open model: `BatchEngine` admits submitted prompts FIFO into the paged memory's sequence slots (a free slot plus enough free cells; the per-ubatch reservation stays all-or-nothing) and every `pump()` runs one step — one prompt prefill, or one decode row per running sequence through `forwardBatch`. Each sequence runs its own `SequenceRun` pipeline (sample, stop, route), so a batch computes the same tokens and texts as the same requests run one at a time (`BatchEngineTest`). A sequence outgrowing the context stops with `StopReason.CONTEXT_FULL` (no context shift in batch mode); a cancellation polls per step. The HTTP server drives this engine (`server/`, see [USAGE.md](USAGE.md#http-server)).

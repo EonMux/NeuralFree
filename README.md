@@ -87,7 +87,7 @@ It has not been validated by running models on GPU hardware. The limitations the
   - nine KV cache types (`f32` to `q5_1`), with Hadamard rotation of quantized rows;
   - sliding-window rings;
   - prefix reuse, context shift, rollback and recurrent-state snapshots;
-  - paged KV memory for parallel sequences (`neuralfree.parallel`, `neuralfree.kv.paged`), property-gated and not yet the engine default; the CPU path batches over it (`ForwardBatch`), the GPU path is pending.
+  - paged KV memory for parallel sequences (`neuralfree.parallel`, `neuralfree.kv.paged`), property-gated and not yet the engine default; the CPU path batches over it (`ForwardBatch`) and the batch engine reuses prompt prefixes across requests (`PrefixCache`), the GPU path is pending.
 - **Speculative decoding:**
   - built-in NextN/MTP heads;
   - MTP draft files;

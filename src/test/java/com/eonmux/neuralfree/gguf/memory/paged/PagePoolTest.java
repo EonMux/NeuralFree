@@ -91,7 +91,7 @@ public class PagePoolTest {
         assertEquals(2, pool.free()); // the pool is untouched
         assertEquals(1, pool.alloc());
         assertEquals(0, pool.alloc());
-        assertEquals(2, pool.free());
+        assertEquals(0, pool.free()); // the pool is exhausted: peek never touched it
         assertThrows(IllegalArgumentException.class, () -> pool.peek(-1));
         assertThrows(IllegalArgumentException.class, () -> pool.peek(3));
     }

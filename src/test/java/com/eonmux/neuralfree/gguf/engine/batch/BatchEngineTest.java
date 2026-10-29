@@ -156,7 +156,10 @@ public class BatchEngineTest {
     @Test
     public void theBudgetEndsASequenceAndFreesItsSlotAndCells() throws IOException {
         Path model = SyntheticModels.llama().writeTempFile();
-        EngineConfig paged = config(true).build();
+        // reuse off: the test asserts the retirement frees the pages, which the prefix cache keeps taken
+        MemoryConfig.Builder mc = MemoryConfig.builder().nCtx(64).ubatch(8)
+                .typeK(KvDType.F32).typeV(KvDType.F32).prefixReuse(false).parallel(2);
+        EngineConfig paged = EngineConfig.builder().memory(mc.build()).build();
         try (GGUFModel two = new GGUFModel(model.toString(), paged);
              BatchEngine engine = BatchEngine.forModel(two, paged)) {
             HeapModelMemory mem = (HeapModelMemory) two.forwardBackend().memory();
