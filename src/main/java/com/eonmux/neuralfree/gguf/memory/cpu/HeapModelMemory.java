@@ -17,6 +17,10 @@ import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.SequenceRules;
+
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
@@ -591,6 +595,51 @@ public final class HeapModelMemory implements CpuMemory {
             throw new IndexOutOfBoundsException("memory has no layer " + il + " (" + kv.length + " layers)");
         }
         return il;
+    }
+
+    // ------------------------------------------------------------------ session file
+
+    /**
+     * Writes the session file of the held sequence to {@code out} ({@code llama_state_save_file}): the tokens
+     * with their reuse frontier and wrap flag, every KV group's position mirror, the K/V row values of every
+     * owning cache layer and the live recurrent state tensors ({@link SessionFile}, the llama.cpp session-file
+     * scope). A paged memory, DSV4 compressed caches, the sparse side caches and target-model caches refuse by
+     * name before anything is written.
+     *
+     * @throws UnsupportedOperationException when the memory is outside the session-file scope
+     */
+    public void saveSession(Path out) throws IOException {
+        checkOpen();
+        SessionFile.save(this, out);
+    }
+
+    /**
+     * Reads the session file at {@code in} into this memory ({@code llama_state_load_file}), resetting it first.
+     * The file's plan identity must match this memory's (context, ubatch, group and layer geometry, cache dtypes,
+     * head shapes, tensor names); the next decode then continues the saved sequence exactly. The runtime-only
+     * state stays out: snapshot shadows, compressor rollback planes and the sampler chain.
+     *
+     * @throws UnsupportedOperationException when the memory is outside the session-file scope
+     * @throws IOException                   for an unreadable file, a foreign format or a plan mismatch
+     */
+    public void loadSession(Path in) throws IOException {
+        checkOpen();
+        SessionFile.load(this, in);
+    }
+
+    /** The cache layers this memory owns (the shared views excluded), in allocation order. */
+    List<CpuKvLayer> kvOwners() {
+        return java.util.List.copyOf(ownedKv);
+    }
+
+    /** The recurrent-state layers this memory owns, in allocation order. */
+    List<CpuRecurrentState> stateOwners() {
+        return java.util.List.copyOf(ownedStates);
+    }
+
+    /** The host position mirror of every KV group, indexed by group. */
+    GroupPositions[] groupPositions() {
+        return positions;
     }
 
     private int checkGroup(int group) {
