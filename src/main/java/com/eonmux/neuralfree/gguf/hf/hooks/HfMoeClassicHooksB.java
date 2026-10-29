@@ -158,12 +158,13 @@ public final class HfMoeClassicHooksB {
             return;
         }
         HfConfig cfg = ctx.config();
-        int bid = HfHookSupport.layerOf(hfName);
-        if (hfName.endsWith("attention.dense.weight")) {
+        // the output/lm_head tensors live outside the blocks and carry no layer number
+        int bid = HfLoadContext.bidOf(hfName);
+        if (bid >= 0 && hfName.endsWith("attention.dense.weight")) {
             out.add(ctx.names().ggufName("ATTN_OUT", bid, WEIGHT), src);
             return;
         }
-        if (hfName.endsWith("query_key_value.weight")) {
+        if (bid >= 0 && hfName.endsWith("query_key_value.weight")) {
             splitQkv(ctx, cfg, hfName, src, bid, out);
             return;
         }
