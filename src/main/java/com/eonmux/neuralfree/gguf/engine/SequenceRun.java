@@ -2,6 +2,8 @@ package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -44,11 +46,17 @@ public final class SequenceRun {
     private long promptNanos;
     private long generationStart;
     private StopReason stopReason;
+    private final int logprobs;
+    private static final TokenScore[] EMPTY_LOGPROBS = new TokenScore[0];
+
+    private TokenScore[] pendingLogprobs = EMPTY_LOGPROBS;
+    private final List<TokenScore[]> tokenLogprobs = new ArrayList<>();
 
     private SequenceRun(Builder b) {
         this.stop = b.stop;
         this.sampler = b.sampler;
         this.sink = b.sink;
+        this.logprobs = Math.max(0, b.request.logprobs());
         this.session = stop.start(this::routed, b.renderedPrompt);
         this.generationStart = System.nanoTime();
     }
@@ -62,15 +70,106 @@ public final class SequenceRun {
 
     /**
      * Runs the sampler chain over {@code logits} and accepts the selected token into the chain's history stages —
-     * llama.cpp sample step and its sequence accept in one call.
+     * llama.cpp sample step and its sequence accept in one call. When the request asked for logprobs
+     * ({@code n_probs}), the step carries the post-chain distribution: the sampled token plus its top
+     * alternatives as log probabilities ({@link Step#logprobs()}).
      *
      * @throws IllegalArgumentException when the row is empty
      * @throws IllegalStateException    when no candidate has a finite logit
      */
     public int next(float[] logits) {
-        int token = sampler.sample(logits);
+        int token;
+        if (logprobs > 0) {
+            Sampler.Candidates candidates = sampler.apply(logits);
+            token = candidates.selectedId();
+            pendingLogprobs = capture(candidates, token);
+        } else {
+            token = sampler.sample(logits);
+        }
         accept(token);
         return token;
+    }
+
+    /** Whether the request's logprobs setting needs host-side logits every step (disables on-device greedy). */
+    public boolean wantsHostSampling() {
+        return logprobs > 0;
+    }
+
+    /**
+     * The sampled token plus the top alternatives of the post-chain distribution as log probabilities: exactly
+     * {@code min(logprobs, candidates)} entries, the sampled token first (llama.cpp's {@code n_probs} array).
+     * The probabilities are the softmax over the chain's surviving candidates (a greedy chain skips its dist
+     * stage, so the capture softmaxes the finite logits itself).
+     */
+    private TokenScore[] capture(Sampler.Candidates candidates, int sampledToken) {
+        int n = candidates.size();
+        int[] ids = new int[n];
+        float[] probs = new float[n];
+        int live = 0;
+        double sum = 0;
+        for (int i = 0; i < n; i++) {
+            float p = candidates.prob(i);
+            if (p <= 0f) {
+                continue; // a greedy chain never softmaxes: the pass below fills the probabilities
+            }
+            ids[live] = candidates.id(i);
+            probs[live] = p;
+            sum += p;
+            live++;
+        }
+        if (live == 0 || Math.abs(sum - 1f) > 1e-3) {
+            // softmax over the surviving (finite) logits, as llama.cpp's get_probabilities does
+            live = 0;
+            sum = 0;
+            double max = -Double.MAX_VALUE;
+            for (int i = 0; i < n; i++) {
+                float logit = candidates.logit(i);
+                if (logit != Float.NEGATIVE_INFINITY) {
+                    max = Math.max(max, logit);
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                float logit = candidates.logit(i);
+                if (logit == Float.NEGATIVE_INFINITY) {
+                    continue;
+                }
+                double e = Math.exp(logit - max);
+                ids[live] = candidates.id(i);
+                probs[live] = (float) e;
+                sum += e;
+                live++;
+            }
+            for (int i = 0; i < live; i++) {
+                probs[i] = (float) (probs[i] / sum);
+            }
+        }
+        int out = Math.min(logprobs, live);
+        TokenScore[] scores = new TokenScore[out];
+        boolean[] used = new boolean[live];
+        // the sampled token leads, wherever it ranks
+        int sampledIndex = -1;
+        for (int i = 0; i < live; i++) {
+            if (ids[i] == sampledToken) {
+                sampledIndex = i;
+                break;
+            }
+        }
+        scores[0] = new TokenScore(sampledToken,
+                (float) Math.log(sampledIndex >= 0 ? probs[sampledIndex] : 0f));
+        if (sampledIndex >= 0) {
+            used[sampledIndex] = true;
+        }
+        for (int k = 1; k < out; k++) {
+            int best = -1;
+            for (int i = 0; i < live; i++) {
+                if (!used[i] && (best < 0 || probs[i] > probs[best])) {
+                    best = i;
+                }
+            }
+            used[best] = true;
+            scores[k] = new TokenScore(ids[best], (float) Math.log(probs[best]));
+        }
+        return scores;
     }
 
     /**
@@ -103,7 +202,12 @@ public final class SequenceRun {
         if (reason != null) {
             this.stopReason = reason;
         }
-        return Step.of(reason, routed);
+        Step step = Step.of(reason, routed, pendingLogprobs);
+        if (pendingLogprobs.length > 0) {
+            tokenLogprobs.add(pendingLogprobs);
+        }
+        pendingLogprobs = EMPTY_LOGPROBS;
+        return step;
     }
 
     /**
@@ -122,7 +226,12 @@ public final class SequenceRun {
             throw new IllegalStateException("the sequence already stopped with " + stopReason);
         }
         this.stopReason = reason;
-        return new Step(reason, "");
+        if (pendingLogprobs.length > 0) {
+            tokenLogprobs.add(pendingLogprobs);
+        }
+        Step step = new Step(reason, "", pendingLogprobs);
+        pendingLogprobs = EMPTY_LOGPROBS;
+        return step;
     }
 
     /** The request's cancellation hook; true stops the generation with {@link StopReason#CANCELLED}. */
@@ -164,8 +273,14 @@ public final class SequenceRun {
             throw new IllegalStateException("the sequence has no stop decision yet");
         }
         long generationNanos = System.nanoTime() - generationStart;
-        return session.finish(stopReason,
+        GenerationResult result = session.finish(stopReason,
                 GenerationResult.Timings.of(promptTokens, promptNanos, sampled, generationNanos));
+        return tokenLogprobs.isEmpty() ? result : result.withLogprobs(tokenLogprobs);
+    }
+
+    /** The per-token log probabilities the run captured ({@code request.logprobs()} > 0), one entry per token. */
+    public List<TokenScore[]> tokenLogprobs() {
+        return tokenLogprobs;
     }
 
     @Override
@@ -187,18 +302,21 @@ public final class SequenceRun {
      */
     public static final class Step {
 
-        private static final Step EMPTY = new Step(null, "");
+        private static final Step EMPTY = new Step(null, "", EMPTY_LOGPROBS);
 
         private final StopReason reason;
         private final String text;
+        private final TokenScore[] logprobs;
 
-        private Step(StopReason reason, String text) {
+        private Step(StopReason reason, String text, TokenScore[] logprobs) {
             this.reason = reason;
             this.text = text;
+            this.logprobs = logprobs;
         }
 
-        private static Step of(StopReason reason, String text) {
-            return reason == null && text.isEmpty() ? EMPTY : new Step(reason, text);
+        private static Step of(StopReason reason, String text, TokenScore[] logprobs) {
+            return reason == null && text.isEmpty() && logprobs.length == 0
+                    ? EMPTY : new Step(reason, text, logprobs);
         }
 
         /** Whether the token ended the generation. */
@@ -214,6 +332,14 @@ public final class SequenceRun {
         /** The output text routed to the sink by this token's offer, across every channel. */
         public String text() {
             return text;
+        }
+
+        /**
+         * The sampled token plus its top alternatives of the post-chain distribution as log probabilities, when
+         * the request asked for them; empty otherwise.
+         */
+        public TokenScore[] logprobs() {
+            return logprobs;
         }
 
         @Override

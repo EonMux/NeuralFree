@@ -42,6 +42,7 @@ public final class GenerationRequest {
     private final List<String> stopStrings;
     private final boolean ignoreEos;
     private final BooleanSupplier cancellation;
+    private final int logprobs;
 
     private GenerationRequest(Builder b) {
         this.maxNewTokens = b.maxNewTokens;
@@ -50,6 +51,7 @@ public final class GenerationRequest {
         this.stopStrings = Collections.unmodifiableList(new ArrayList<>(b.stopStrings));
         this.ignoreEos = b.ignoreEos;
         this.cancellation = b.cancellation;
+        this.logprobs = b.logprobs;
     }
 
     /**
@@ -76,6 +78,9 @@ public final class GenerationRequest {
     public boolean ignoreEos() { return ignoreEos; }
     /** Polled once per generated token; true stops generation with {@link StopReason#CANCELLED}. */
     public BooleanSupplier cancellation() { return cancellation; }
+
+    /** Alternatives to report per generated token (the sampled token included), or 0 when off. */
+    public int logprobs() { return logprobs; }
     /** Whether a cancellation hook was supplied. */
     public boolean cancellable() { return cancellation != NEVER; }
 
@@ -91,7 +96,8 @@ public final class GenerationRequest {
 
     /** A builder holding these values; the token budget keeps its explicit or fallback state. */
     public Builder toBuilder() {
-        Builder b = builder().sampler(sampler).stopStrings(stopStrings).ignoreEos(ignoreEos).cancellation(cancellation);
+        Builder b = builder().sampler(sampler).stopStrings(stopStrings).ignoreEos(ignoreEos)
+                .cancellation(cancellation).logprobs(logprobs);
         return maxNewTokensExplicit ? b.maxNewTokens(maxNewTokens) : b.fallbackMaxNewTokens(maxNewTokens);
     }
 
@@ -128,6 +134,7 @@ public final class GenerationRequest {
         private SamplerConfig sampler = SamplerConfig.defaults();
         private final List<String> stopStrings = new ArrayList<>();
         private boolean ignoreEos;
+        private int logprobs;
         private BooleanSupplier cancellation = NEVER;
 
         private Builder() {
@@ -178,6 +185,18 @@ public final class GenerationRequest {
 
         /** Cancellation hook; null removes it. */
         public Builder cancellation(BooleanSupplier v) { this.cancellation = v == null ? NEVER : v; return this; }
+
+        /**
+         * Reports the post-chain distribution per generated token: the sampled token plus its {@code n} top
+         * alternatives as log probabilities (llama.cpp's {@code n_probs}; 0 = off, the default).
+         */
+        public Builder logprobs(int n) {
+            if (n < 0) {
+                throw new IllegalArgumentException("logprobs needs a non-negative alternative count, got " + n);
+            }
+            this.logprobs = n;
+            return this;
+        }
 
         /** @throws IllegalArgumentException when {@code maxNewTokens} is neither positive nor {@link #UNLIMITED} */
         public GenerationRequest build() {

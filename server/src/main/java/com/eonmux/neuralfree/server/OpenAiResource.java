@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.engine.GenerationResult;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
+import com.eonmux.neuralfree.gguf.engine.TokenScore;
 import com.eonmux.neuralfree.gguf.engine.batch.BatchSequence;
 import com.eonmux.neuralfree.gguf.grammar.ConstraintSpec;
 import com.eonmux.neuralfree.utils.json.Json;
@@ -103,7 +104,11 @@ public class OpenAiResource {
         List<String> reasoning = new ArrayList<>();
         GenerationResult result = run(tokens, request, constraint, reasoning);
         List<Map<String, Object>> choices = new ArrayList<>();
-        choices.add(choice(0, result.text(), null, finishReason(result.stopReason())));
+        Map<String, Object> choice = choice(0, result.text(), null, finishReason(result.stopReason()));
+        if (!result.logprobs().isEmpty()) {
+            choice.put("logprobs", Map.of("content", logprobsBody(result)));
+        }
+        choices.add(choice);
         return Response.ok(json(completionBody("text_completion", choices, result))).build();
     }
 
@@ -131,7 +136,11 @@ public class OpenAiResource {
             message.put("reasoning_content", String.join("", reasoning));
         }
         List<Map<String, Object>> choices = new ArrayList<>();
-        choices.add(choice(0, null, message, finishReason(result.stopReason())));
+        Map<String, Object> choice = choice(0, null, message, finishReason(result.stopReason()));
+        if (!result.logprobs().isEmpty()) {
+            choice.put("logprobs", Map.of("content", logprobsBody(result)));
+        }
+        choices.add(choice);
         return Response.ok(json(completionBody("chat.completion", choices, result))).build();
     }
 
@@ -268,6 +277,17 @@ public class OpenAiResource {
                 : body.optI32("max_tokens", -1);
         if (maxTokens >= 0) {
             builder.maxNewTokens(maxTokens);
+        }
+        int logprobs = 0;
+        if (body.has("n_probs")) {
+            logprobs = Math.max(0, body.optI32("n_probs", 0));
+        }
+        if (body.optBool("logprobs", false)) {
+            logprobs = Math.max(logprobs, body.optI32("top_logprobs", 0) > 0
+                    ? body.optI32("top_logprobs", 0) : 1);
+        }
+        if (logprobs > 0) {
+            builder.logprobs(logprobs);
         }
         List<String> stop = new ArrayList<>();
         Object rawStop = body.raw("stop");
@@ -531,6 +551,26 @@ public class OpenAiResource {
         usage.put("completion_tokens", result.timings().generatedTokens());
         usage.put("total_tokens", result.timings().promptTokens() + result.timings().generatedTokens());
         return usage;
+    }
+
+    /**
+     * The OpenAI logprobs shape of a result: one content entry per generated token with its log probability and
+     * its top alternatives ({@code token} renders through the model's tokenizer).
+     */
+    private List<Map<String, Object>> logprobsBody(GenerationResult result) {
+        List<Map<String, Object>> content = new ArrayList<>();
+        for (TokenScore[] step : result.logprobs()) {
+            Map<String, Object> top = new LinkedHashMap<>();
+            for (int i = 1; i < step.length; i++) {
+                top.put(service.tokenText(step[i].tokenId()), (double) step[i].logprob());
+            }
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("token", service.tokenText(step[0].tokenId()));
+            entry.put("logprob", (double) step[0].logprob());
+            entry.put("top_logprobs", List.of(top));
+            content.add(entry);
+        }
+        return content;
     }
 
     private Map<String, Object> completionBody(String object, List<Map<String, Object>> choices,

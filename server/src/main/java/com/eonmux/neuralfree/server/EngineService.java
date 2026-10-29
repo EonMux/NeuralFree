@@ -145,6 +145,12 @@ public final class EngineService implements AutoCloseable {
         return model.tokenizer().encode(text, addSpecial, parseSpecial);
     }
 
+    /** Decodes one token id to its text (the logprobs rendering). */
+    public String tokenText(int tokenId) {
+        requireLoaded();
+        return model.tokenizer().decode(tokenId);
+    }
+
     /** The pooled embedding of one input ({@code GGUFModel.encode}); an EMBED or pooling model carries it. */
     public float[] embed(int[] tokens) throws IOException {
         requireLoaded();

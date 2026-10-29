@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 
@@ -14,6 +15,7 @@ public final class GenerationResult {
     private final StopReason stopReason;
     private final String stopString;
     private final Timings timings;
+    private final List<TokenScore[]> logprobs;
 
     /**
      * @param tokens     generated token ids, prompt excluded (copied)
@@ -25,10 +27,16 @@ public final class GenerationResult {
      * @throws IllegalArgumentException when {@code stopString} disagrees with {@code stopReason}
      */
     public GenerationResult(int[] tokens, String text, StopReason stopReason, String stopString, Timings timings) {
+        this(tokens, text, stopReason, stopString, timings, List.of());
+    }
+
+    private GenerationResult(int[] tokens, String text, StopReason stopReason, String stopString, Timings timings,
+                             List<TokenScore[]> logprobs) {
         Objects.requireNonNull(tokens, "tokens");
         this.text = Objects.requireNonNull(text, "text");
         this.stopReason = Objects.requireNonNull(stopReason, "stopReason");
         this.timings = Objects.requireNonNull(timings, "timings");
+        this.logprobs = Objects.requireNonNull(logprobs, "logprobs");
         if ((stopReason == StopReason.STOP_STRING) != (stopString != null)) {
             throw new IllegalArgumentException("stop string " + (stopString == null ? "missing" : "'" + stopString + "' given")
                     + " for stop reason " + stopReason);
@@ -71,6 +79,21 @@ public final class GenerationResult {
         System.arraycopy(prompt, 0, all, 0, prompt.length);
         System.arraycopy(tokens, 0, all, prompt.length, tokens.length);
         return all;
+    }
+
+    /**
+     * The per-token log probabilities when the request asked for them ({@link
+     * GenerationRequest.Builder#logprobs(int)}), one entry per generated token: the sampled token plus its
+     * top alternatives of the post-chain distribution. Empty when the request asked for none.
+     */
+    public List<TokenScore[]> logprobs() {
+        return logprobs;
+    }
+
+    /** A copy carrying the per-token log probabilities ({@link SequenceRun}'s capture). */
+    public GenerationResult withLogprobs(List<TokenScore[]> logprobs) {
+        return new GenerationResult(tokens, text, stopReason, stopString, timings,
+                List.copyOf(logprobs));
     }
 
     @Override

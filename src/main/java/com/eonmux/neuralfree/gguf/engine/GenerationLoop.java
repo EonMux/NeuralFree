@@ -199,7 +199,7 @@ public final class GenerationLoop {
         seqRun.sampler().accept(history, 0, history.length);
         seqRun.prefilled(tail.length, System.nanoTime() - t0);
 
-        boolean onDevice = seqRun.sampler().argmaxOnly();
+        boolean onDevice = seqRun.sampler().argmaxOnly() && !seqRun.wantsHostSampling();
         int deviceToken = -1;
         while (!seqRun.done()) {
             if (seqRun.cancelled()) {

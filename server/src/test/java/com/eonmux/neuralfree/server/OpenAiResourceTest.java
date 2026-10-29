@@ -85,6 +85,23 @@ public class OpenAiResourceTest {
     }
 
     @Test
+    void requestedLogprobsCarryTheSampledTokenAndItsAlternatives() {
+        Response response = resource.completions("""
+                {"prompt": "hello", "max_tokens": 3, "temperature": 0, "logprobs": true, "top_logprobs": 2}""");
+        assertEquals(200, response.getStatus());
+        JsonView logprobs = JsonView.of(firstChoice(view(response.getEntity())).raw("logprobs"), "logprobs");
+        List<?> content = (List<?>) logprobs.raw("content");
+        assertEquals(3, content.size(), "one entry per generated token");
+        for (Object o : content) {
+            JsonView entry = JsonView.of(o, "content[i]");
+            assertTrue(entry.str("token") != null && entry.f64("logprob") <= 0,
+                    "the sampled token's logprob is non-positive");
+            List<?> top = (List<?>) entry.raw("top_logprobs");
+            assertEquals(1, top.size(), "the requested alternative count");
+        }
+    }
+
+    @Test
     void aChatCompletionAnswersWithAnAssistantMessage() {
         Response response = resource.chatCompletions("""
                 {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "temperature": 0}""");
