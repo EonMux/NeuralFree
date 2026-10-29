@@ -25,9 +25,19 @@ public final class BatchSequence {
     private volatile int seq = -1;
     private volatile GenerationResult result;
     private volatile Throwable error;
+    private volatile Runnable onFinish;
 
     BatchSequence(int submitId) {
         this.submitId = submitId;
+    }
+
+    /**
+     * Runs {@code callback} once when the request reaches a terminal state (done, cancelled or failed), on the
+     * engine thread. Set it right after {@code submit}, before the first pump can retire the sequence.
+     */
+    public BatchSequence onFinish(Runnable callback) {
+        this.onFinish = Objects.requireNonNull(callback, "callback");
+        return this;
     }
 
     /** The engine-unique submission number, in submit order from 0. */
@@ -69,11 +79,19 @@ public final class BatchSequence {
     void complete(GenerationResult result, boolean cancelled) {
         this.result = Objects.requireNonNull(result, "result");
         this.state = cancelled ? State.CANCELLED : State.DONE;
+        Runnable callback = onFinish;
+        if (callback != null) {
+            callback.run();
+        }
     }
 
     void fail(Throwable error) {
         this.error = Objects.requireNonNull(error, "error");
         this.state = State.FAILED;
+        Runnable callback = onFinish;
+        if (callback != null) {
+            callback.run();
+        }
     }
 
     @Override

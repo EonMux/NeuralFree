@@ -4,6 +4,7 @@ repositories { mavenLocal(); mavenCentral() }
 dependencies {
     implementation enforcedPlatform('io.quarkus.platform:quarkus-bom:3.40.1')
     implementation project(':')
+    testImplementation project(path: ':', configuration: 'testOutput')
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-websockets-next'
     implementation 'io.quarkus:quarkus-grpc'

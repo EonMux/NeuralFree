@@ -151,6 +151,11 @@ public final class BatchEngine implements AutoCloseable {
         return queue.size();
     }
 
+    /** Positions the paged memory holds per sequence (the plan's {@code nCtx}). */
+    public int contextLength() {
+        return nCtx;
+    }
+
     /** Submissions currently prefilling or decoding. */
     public int running() {
         return active.size();
@@ -327,7 +332,18 @@ public final class BatchEngine implements AutoCloseable {
             return;
         }
         for (int i = 0; i < batch.size(); i++) {
-            sampleAndOffer(batch.get(i), rows[i], true);
+            Slot slot = batch.get(i);
+            try {
+                sampleAndOffer(slot, rows[i], true);
+            } catch (RuntimeException e) {
+                // this slot's row is unpersisted and every later slot went unsampled; the earlier slots sampled
+                // fine: retire from here, naming the sampling failure (rare path, see class doc)
+                retire(slot, null, false, e);
+                for (int j = i + 1; j < batch.size(); j++) {
+                    retire(batch.get(j), null, false, e);
+                }
+                return;
+            }
         }
     }
 
