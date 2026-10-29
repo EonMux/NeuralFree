@@ -17,6 +17,8 @@ import com.eonmux.neuralfree.gguf.engine.SamplingDefaults;
 import com.eonmux.neuralfree.gguf.engine.SequenceRun;
 import com.eonmux.neuralfree.gguf.engine.StopCriteria;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
+import com.eonmux.neuralfree.gguf.engine.sampling.GrammarStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
@@ -173,6 +175,20 @@ public final class BatchEngine implements AutoCloseable {
      */
     public BatchSequence submit(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
                                 String renderedPrompt) {
+        return submit(prompt, request, sink, renderedPrompt, null);
+    }
+
+    /**
+     * Submits with a grammar constraint: {@code constraint} compiles now ({@link
+     * com.eonmux.neuralfree.gguf.grammar.GbnfBuilder#grammarOf}), so an invalid or untranslatable spec throws to
+     * the caller before anything is queued; a compiled grammar runs as the sequence's sampling stage
+     * ({@link com.eonmux.neuralfree.gguf.engine.sampling.GrammarStage}), masking every token the grammar cannot
+     * accept next (guided_json, guided_regex, guided_choice map onto the spec kinds).
+     *
+     * @throws IllegalArgumentException when the constraint compiles to an unusable grammar
+     */
+    public BatchSequence submit(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
+                                String renderedPrompt, com.eonmux.neuralfree.gguf.grammar.ConstraintSpec constraint) {
         Objects.requireNonNull(prompt, "prompt");
         Objects.requireNonNull(request, "request");
         Objects.requireNonNull(sink, "sink");
@@ -181,14 +197,16 @@ public final class BatchEngine implements AutoCloseable {
         if (prompt.length > nCtx) {
             throw new ContextFullException(prompt.length, nCtx);
         }
+        com.eonmux.neuralfree.gguf.grammar.Grammar grammar = constraint == null ? null
+                : com.eonmux.neuralfree.gguf.grammar.GbnfBuilder.grammarOf(constraint);
         BatchSequence handle = new BatchSequence(nextSubmitId++);
-        queue.add(new Submission(handle, prompt, request, sink, renderedPrompt));
+        queue.add(new Submission(handle, prompt, request, sink, renderedPrompt, grammar));
         return handle;
     }
 
     /** {@link #submit(int[], GenerationRequest, ReasoningFilter.Sink, String)} with a content-only callback. */
     public BatchSequence submit(int[] prompt, GenerationRequest request, TokenCallback callback) {
-        return submit(prompt, request, callback == null ? DISCARD : ReasoningFilter.contentTo(callback), null);
+        return submit(prompt, request, callback == null ? DISCARD : ReasoningFilter.contentTo(callback), null, null);
     }
 
     /**
@@ -380,7 +398,14 @@ public final class BatchEngine implements AutoCloseable {
     private Slot openSlot(int seq, Submission sub) {
         GenerationRequest effective = sub.request.withModelDefaults(samplingDefaults);
         StopCriteria stop = StopCriteria.of(effective, tokenizer, reasoning);
-        Sampler sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens());
+        Sampler sampler;
+        if (sub.grammar != null) {
+            SamplerVocab vocab = Sampler.vocab(tokenizer);
+            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(),
+                    List.of(new GrammarStage(sub.grammar, vocab)), vocab);
+        } else {
+            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens());
+        }
         String rendered = sub.renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? sub.renderedPrompt : stop.renderPrompt(sub.prompt);
         SequenceRun run = SequenceRun.over(effective, tokenizer)
@@ -425,14 +450,17 @@ public final class BatchEngine implements AutoCloseable {
         final GenerationRequest request;
         final ReasoningFilter.Sink sink;
         final String renderedPrompt;
+        final com.eonmux.neuralfree.gguf.grammar.Grammar grammar;
 
         Submission(BatchSequence handle, int[] prompt, GenerationRequest request,
-                   ReasoningFilter.Sink sink, String renderedPrompt) {
+                   ReasoningFilter.Sink sink, String renderedPrompt,
+                   com.eonmux.neuralfree.gguf.grammar.Grammar grammar) {
             this.handle = handle;
             this.prompt = prompt;
             this.request = request;
             this.sink = sink;
             this.renderedPrompt = renderedPrompt;
+            this.grammar = grammar;
         }
     }
 
