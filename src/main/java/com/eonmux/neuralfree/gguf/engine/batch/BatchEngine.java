@@ -18,6 +18,8 @@ import com.eonmux.neuralfree.gguf.engine.SequenceRun;
 import com.eonmux.neuralfree.gguf.engine.StopCriteria;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
 import com.eonmux.neuralfree.gguf.engine.sampling.GrammarStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.RequestStages;
+import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceMemory;
@@ -476,13 +478,16 @@ public final class BatchEngine implements AutoCloseable {
     private Slot openSlot(int seq, Submission sub) {
         GenerationRequest effective = sub.request.withModelDefaults(samplingDefaults);
         StopCriteria stop = StopCriteria.of(effective, tokenizer, reasoning);
+        SamplerVocab vocab = Sampler.vocab(tokenizer);
+        List<SamplerStage> stages = new ArrayList<>(RequestStages.of(effective, vocab));
         Sampler sampler;
         if (sub.grammar != null) {
-            SamplerVocab vocab = Sampler.vocab(tokenizer);
-            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(),
-                    List.of(new GrammarStage(sub.grammar, vocab)), vocab);
+            stages.add(new GrammarStage(sub.grammar, vocab));
+        }
+        if (stages.isEmpty()) {
+            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(), vocab);
         } else {
-            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens());
+            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(), stages, vocab);
         }
         String rendered = sub.renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? sub.renderedPrompt : stop.renderPrompt(sub.prompt);

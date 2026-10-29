@@ -102,6 +102,16 @@ public class OpenAiResourceTest {
     }
 
     @Test
+    void minTokensAndBadWordsRunThroughTheServerMapping() {
+        Response response = resource.completions("""
+                {"prompt": "hello", "max_tokens": 4, "temperature": 0,
+                 "min_tokens": 2, "bad_words": ["surely absent phrase"]}""");
+        assertEquals(200, response.getStatus(), "the parity stages accept the request");
+        String text = firstChoice(view(response.getEntity())).str("text");
+        assertNotNull(text);
+    }
+
+    @Test
     void aChatCompletionAnswersWithAnAssistantMessage() {
         Response response = resource.chatCompletions("""
                 {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "temperature": 0}""");

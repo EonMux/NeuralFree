@@ -40,18 +40,22 @@ public final class GenerationRequest {
     private final boolean maxNewTokensExplicit;
     private final SamplerConfig sampler;
     private final List<String> stopStrings;
+    private final List<String> badWords;
     private final boolean ignoreEos;
     private final BooleanSupplier cancellation;
     private final int logprobs;
+    private final int minTokens;
 
     private GenerationRequest(Builder b) {
         this.maxNewTokens = b.maxNewTokens;
         this.maxNewTokensExplicit = b.maxNewTokensExplicit;
         this.sampler = b.sampler;
         this.stopStrings = Collections.unmodifiableList(new ArrayList<>(b.stopStrings));
+        this.badWords = Collections.unmodifiableList(new ArrayList<>(b.badWords));
         this.ignoreEos = b.ignoreEos;
         this.cancellation = b.cancellation;
         this.logprobs = b.logprobs;
+        this.minTokens = b.minTokens;
     }
 
     /**
@@ -81,6 +85,12 @@ public final class GenerationRequest {
 
     /** Alternatives to report per generated token (the sampled token included), or 0 when off. */
     public int logprobs() { return logprobs; }
+
+    /** Phrases the output must not spell ({@code bad_words}); empty when none. */
+    public List<String> badWords() { return badWords; }
+
+    /** The generated-token minimum before end-of-generation tokens may be sampled (0 = off). */
+    public int minTokens() { return minTokens; }
     /** Whether a cancellation hook was supplied. */
     public boolean cancellable() { return cancellation != NEVER; }
 
@@ -96,8 +106,8 @@ public final class GenerationRequest {
 
     /** A builder holding these values; the token budget keeps its explicit or fallback state. */
     public Builder toBuilder() {
-        Builder b = builder().sampler(sampler).stopStrings(stopStrings).ignoreEos(ignoreEos)
-                .cancellation(cancellation).logprobs(logprobs);
+        Builder b = builder().sampler(sampler).stopStrings(stopStrings).badWords(badWords).ignoreEos(ignoreEos)
+                .cancellation(cancellation).logprobs(logprobs).minTokens(minTokens);
         return maxNewTokensExplicit ? b.maxNewTokens(maxNewTokens) : b.fallbackMaxNewTokens(maxNewTokens);
     }
 
@@ -135,6 +145,8 @@ public final class GenerationRequest {
         private final List<String> stopStrings = new ArrayList<>();
         private boolean ignoreEos;
         private int logprobs;
+        private int minTokens;
+        private List<String> badWords = new ArrayList<>();
         private BooleanSupplier cancellation = NEVER;
 
         private Builder() {
@@ -190,6 +202,29 @@ public final class GenerationRequest {
          * Reports the post-chain distribution per generated token: the sampled token plus its {@code n} top
          * alternatives as log probabilities (llama.cpp's {@code n_probs}; 0 = off, the default).
          */
+        /**
+         * Bans end-of-generation tokens until {@code n} tokens were generated (vLLM's {@code min_tokens};
+         * 0 = off, the default).
+         */
+        public Builder minTokens(int n) {
+            if (n < 0) {
+                throw new IllegalArgumentException("min tokens needs a non-negative count, got " + n);
+            }
+            this.minTokens = n;
+            return this;
+        }
+
+        /** Phrases the output must not spell (vLLM's {@code bad_words}); tokenized into sampling bans. */
+        public Builder badWords(List<String> v) {
+            this.badWords = new ArrayList<>(Objects.requireNonNull(v, "badWords"));
+            return this;
+        }
+
+        public Builder badWord(String v) {
+            this.badWords.add(Objects.requireNonNull(v, "badWord"));
+            return this;
+        }
+
         public Builder logprobs(int n) {
             if (n < 0) {
                 throw new IllegalArgumentException("logprobs needs a non-negative alternative count, got " + n);

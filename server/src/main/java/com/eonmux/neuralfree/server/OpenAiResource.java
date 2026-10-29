@@ -301,6 +301,19 @@ public class OpenAiResource {
             }
         }
         builder.stopStrings(stop);
+        List<String> badWords = new ArrayList<>();
+        Object rawBad = body.raw("bad_words");
+        if (rawBad instanceof String s) {
+            badWords.add(s);
+        } else if (rawBad instanceof List<?> list) {
+            for (Object o : list) {
+                if (o instanceof String s) {
+                    badWords.add(s);
+                }
+            }
+        }
+        builder.badWords(badWords);
+        builder.minTokens(Math.max(0, body.optI32("min_tokens", 0)));
         builder.sampler(samplerConfig(body));
         return builder.build();
     }

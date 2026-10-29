@@ -3,6 +3,8 @@ package com.eonmux.neuralfree.gguf.engine;
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.TokenCallback;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
+import com.eonmux.neuralfree.gguf.engine.sampling.RequestStages;
+import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
@@ -161,7 +163,9 @@ public final class GenerationLoop {
         }
         GenerationRequest effective = request.withModelDefaults(samplingDefaults);
         StopCriteria stop = StopCriteria.of(effective, tokenizer, reasoning);
-        Sampler sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens());
+        SamplerVocab vocab = Sampler.vocab(tokenizer);
+        Sampler sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(),
+                RequestStages.of(effective, vocab), vocab);
         String rendered = renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? renderedPrompt : stop.renderPrompt(prompt);
         SequenceRun seqRun = SequenceRun.over(effective, tokenizer)
