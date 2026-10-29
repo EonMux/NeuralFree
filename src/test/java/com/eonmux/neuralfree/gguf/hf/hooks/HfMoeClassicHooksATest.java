@@ -72,7 +72,11 @@ public class HfMoeClassicHooksATest {
                 "'intermediate_size': 4, 'intermediate_size_moe': 3");
         assertThrows(GgufFormatException.class, () -> HfMoeClassicHooksA.llama4Fixup(broken.config()));
         HfLoadContext brokenToo = context(dir(), Arch.LLAMA4, "Llama4ForCausalLM", "'intermediate_size_mlp': 8");
-        assertThrows(GgufFormatException.class, () -> HfMoeClassicHooksA.llama4Fixup(brokenToo.config()));
+        // the context helper's base config carries an intermediate_size, so the broken case is a bare config
+        com.eonmux.neuralfree.gguf.hf.config.HfConfig bare =
+                com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader.fromJson(dir(),
+                        "{\"architectures\":[\"Llama4ForCausalLM\"],\"intermediate_size_mlp\":8}");
+        assertThrows(GgufFormatException.class, () -> HfMoeClassicHooksA.llama4Fixup(bare));
     }
 
     private static HfConfig parser(HfLoadContext ctx, com.eonmux.neuralfree.gguf.hf.config.HfConfig raw) {
@@ -81,7 +85,7 @@ public class HfMoeClassicHooksATest {
 
     @Test
     public void llama4FusedGateUpExpertsAreTransposedAndSplit() throws IOException {
-        String name = "model.layers.1.feed_forward.experts.3.gate_up_proj.weight";
+        String name = "model.layers.1.feed_forward.experts.gate_up_proj";
         Map<String, RowSource> index = Collections.singletonMap(name, seq(2, 4, 4));
         HfLoadContext ctx = context(dir(), Arch.LLAMA4, "Llama4ForCausalLM", LLAMA4_CONFIG, index, false);
         RecordingSink sink = new RecordingSink();
@@ -96,14 +100,24 @@ public class HfMoeClassicHooksATest {
 
     @Test
     public void llama4DownExpertsAreTransposedWithAWeightSuffix() throws IOException {
-        String name = "model.layers.0.feed_forward.experts.0.down_proj";
+        String name = "model.layers.0.feed_forward.experts.down_proj";
         Map<String, RowSource> index = Collections.singletonMap(name, seq(2, 4, 8));
         HfLoadContext ctx = context(dir(), Arch.LLAMA4, "Llama4ForCausalLM", LLAMA4_CONFIG, index, false);
         RecordingSink sink = new RecordingSink();
         HfMoeClassicHooksA.llama4Tensors(ctx, name, ctx.index().get(name), sink);
         RowSource down = tensors(sink, "ffn_down_exps").get(0);
         assertArrayEquals(new long[]{2, 8, 4}, down.shape());
-        assertArrayEquals(values(ctx.index().get(name)), values(down), 0f);
+        // (e, j, i) of the transposed stack is (e, i, j) of the source
+        float[] src = values(ctx.index().get(name));
+        float[] expected = new float[src.length];
+        for (int e = 0; e < 2; e++) {
+            for (int j = 0; j < 8; j++) {
+                for (int i = 0; i < 4; i++) {
+                    expected[e * 32 + j * 4 + i] = src[e * 32 + i * 8 + j];
+                }
+            }
+        }
+        assertArrayEquals(expected, values(down), 0f);
     }
 
     // ------------------------------------------------------------------ DbrxModel
@@ -112,12 +126,12 @@ public class HfMoeClassicHooksATest {
     public void dbrxExpertsAreViewedWithAWeightSuffixAndW2IsTransposed() throws IOException {
         Map<String, RowSource> index = new LinkedHashMap<>();
         for (String p : Arrays.asList("w1", "w2", "v1")) {
-            index.put("model.layers.0.mlp.experts.mlp." + p, seq(2, 8, 8));
+            index.put("transformer.blocks.0.ffn.experts.mlp." + p, seq(2, 8, 8));
         }
         HfLoadContext ctx = context(dir(), Arch.DBRX, "DbrxForCausalLM", DBRX_CONFIG, index, false);
         RecordingSink sink = new RecordingSink();
         for (String p : Arrays.asList("w1", "w2", "v1")) {
-            String name = "model.layers.0.mlp.experts.mlp." + p;
+            String name = "transformer.blocks.0.ffn.experts.mlp." + p;
             HfMoeClassicHooksA.dbrxTensors(ctx, name, ctx.index().get(name), sink);
         }
         assertEquals(3, sink.tensors.size());
@@ -128,15 +142,24 @@ public class HfMoeClassicHooksATest {
         RowSource w2 = tensors(sink, "ffn_down_exps").get(0);
         RowSource v1 = tensors(sink, "ffn_up_exps").get(0);
         assertArrayEquals(new long[]{2, 8, 8}, w1.shape());
-        assertArrayEquals(values(ctx.index().get("model.layers.0.mlp.experts.mlp.w1")), values(w1), 0f);
-        assertArrayEquals(values(ctx.index().get("model.layers.0.mlp.experts.mlp.v1")), values(v1), 0f);
+        assertArrayEquals(values(ctx.index().get("transformer.blocks.0.ffn.experts.mlp.w1")), values(w1), 0f);
+        assertArrayEquals(values(ctx.index().get("transformer.blocks.0.ffn.experts.mlp.v1")), values(v1), 0f);
         // (e, j, k) of w2 is (e, k, j) of the source
-        assertArrayEquals(floats(0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25), values(w2), 0f);
+        float[] w2Expected = new float[128];
+        int w = 0;
+        for (int e = 0; e < 2; e++) {
+            for (int j = 0; j < 8; j++) {
+                for (int k = 0; k < 8; k++) {
+                    w2Expected[w++] = e * 64 + k * 8 + j;
+                }
+            }
+        }
+        assertArrayEquals(w2Expected, values(w2), 0f);
     }
 
     @Test
     public void dbrxAnExpertOfAnotherElementCountIsRejected() throws IOException {
-        String name = "model.layers.0.mlp.experts.mlp.w1";
+        String name = "transformer.blocks.0.ffn.experts.mlp.w1";
         Map<String, RowSource> index = Collections.singletonMap(name, seq(2, 4));
         HfLoadContext ctx = context(dir(), Arch.DBRX, "DbrxForCausalLM", DBRX_CONFIG, index, false);
         assertThrows(GgufFormatException.class,
@@ -171,7 +194,7 @@ public class HfMoeClassicHooksATest {
             placed++;
             assertEquals(placed < 6 ? 0 : 3, sink.tensors.size());
         }
-        HfMoeClassicHooksA.grokTensors(ctx, "transformer.decoder_layer.0.attn_norm.weight", seq(8), sink);
+        HfMoeClassicHooksA.grokTensors(ctx, "transformer.decoder_layer.0.rms_norm.weight", seq(8), sink);
         assertEquals(4, sink.tensors.size());
         assertArrayEquals(new long[]{2, 2, 4}, tensors(sink, "ffn_gate_exps").get(0).shape());
         assertArrayEquals(new long[]{2, 4, 2}, tensors(sink, "ffn_down_exps").get(0).shape());
@@ -229,13 +252,18 @@ public class HfMoeClassicHooksATest {
 
     @Test
     public void arcticLeftoversFailTheCompletenessCheck() throws IOException {
-        String name = "model.layers.0.block_sparse_moe.experts.0.w1.weight";
+        String w1 = "model.layers.0.block_sparse_moe.experts.0.w1.weight";
         Map<String, RowSource> index = new LinkedHashMap<>();
-        index.put(name, seq(2, 4));
+        for (int x = 0; x < 2; x++) {
+            for (String part : Arrays.asList("w1", "w2", "w3")) {
+                index.put("model.layers.0.block_sparse_moe.experts." + x + "." + part + ".weight", seq(2, 4));
+            }
+        }
         index.put("model.layers.0.self_attn.q_proj.weight", seq(8, 8));
         HfLoadContext ctx = context(dir(), Arch.ARCTIC, "ArcticForCausalLM", ARCTIC_CONFIG, index, false);
         RecordingSink sink = new RecordingSink();
-        HfMoeClassicHooksA.arcticTensors(ctx, name, ctx.index().get(name), sink);
+        // one expert part offered of the six planned: the leftover members fail the extra check
+        HfMoeClassicHooksA.arcticTensors(ctx, w1, ctx.index().get(w1), sink);
         HfMoeClassicHooksA.arcticTensors(ctx, "model.layers.0.self_attn.q_proj.weight",
                 ctx.index().get("model.layers.0.self_attn.q_proj.weight"), sink);
         assertThrows(GgufFormatException.class, () -> HfMoeClassicHooksA.arcticExtra(ctx, sink));
