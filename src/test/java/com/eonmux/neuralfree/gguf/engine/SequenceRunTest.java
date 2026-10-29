@@ -133,13 +133,17 @@ public class SequenceRunTest {
         assertTrue(run.offer(run.next(row(1))).text().equals("b"));
         assertFalse(run.done());
 
+        // the fourth generated token reaches the budget and stops the run
+        SequenceRun.Step last = run.offer(run.next(row(2)));
+        assertTrue(last.stopped());
+        assertEquals(StopReason.MAX_TOKENS, last.reason());
         GenerationResult r = run.result();
-        assertArrayEquals(new int[] {3, 2, 1}, r.tokens());
-        assertEquals("dcb", r.text());
+        assertArrayEquals(new int[] {3, 2, 1, 2}, r.tokens());
+        assertEquals("dcbc", r.text());
         assertEquals(StopReason.MAX_TOKENS, r.stopReason());
         assertEquals(2, r.timings().promptTokens());
         assertEquals(123L, r.timings().promptNanos());
-        assertEquals(3, r.timings().generatedTokens());
+        assertEquals(4, r.timings().generatedTokens());
         assertTrue(r.timings().split());
         assertTrue(r.timings().generationNanos() >= 0);
     }
@@ -250,7 +254,7 @@ public class SequenceRunTest {
     @Test
     public void deviceTokensAreAcceptedIntoTheHistoriesAndCounters() {
         GGUFTokenizer tok = tokenizer(false);
-        GenerationRequest request = request(4, false);
+        GenerationRequest request = request(2, false);
         SequenceRun run = run(tok, request);
 
         run.accept(0);
@@ -275,16 +279,20 @@ public class SequenceRunTest {
         // the tags are given as token ids 3 and 4, so the session renders those ids as their tag text
 
         assertEquals("f", run.offer(run.next(row(5))).text()); // before the opening tag: prelude content
+        run.accept(3);
         assertEquals("", run.offer(3).text());                 // the opening tag opens the block, routes nothing
         assertEquals("g", run.offer(run.next(row(6))).text()); // inside the block: reasoning
+        run.accept(4);
         assertEquals("", run.offer(4).text());                 // the closing tag closes the block, routes nothing
         assertEquals("f", run.offer(run.next(row(5))).text()); // after the block: content
 
-        assertFalse(run.done());
-        run.stop(StopReason.CANCELLED);
+        // the fifth offered token reaches the budget and stops the run, tag tokens included
+        assertTrue(run.done());
+        GenerationResult r = run.result();
+        assertEquals(StopReason.MAX_TOKENS, r.stopReason());
         assertArrayEquals(new String[] {"f", "f"}, texts(sink, Channel.CONTENT).toArray(new String[0]));
         assertArrayEquals(new String[] {"g"}, texts(sink, Channel.REASONING).toArray(new String[0]));
-        assertEquals(5, run.result().timings().generatedTokens()); // five offered tokens, tag tokens included
+        assertEquals(5, r.timings().generatedTokens());
     }
 
     /** Constraints of the run's own surface: stop reasons are single, validated and precede the result. */
