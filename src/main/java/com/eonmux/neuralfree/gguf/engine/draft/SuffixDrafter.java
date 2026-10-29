@@ -221,6 +221,10 @@ public final class SuffixDrafter implements DraftModel {
             localTree.clear();
             lastHistoryLength = 0;
         }
+        if (lastHistoryLength < 0) {
+            // First call of a generation (or right after a reset): the tree is empty, enter the full history.
+            lastHistoryLength = 0;
+        }
         if (lastHistoryLength < len) {
             int[] appended = new int[len - lastHistoryLength];
             for (int i = 0; i < appended.length; i++) {

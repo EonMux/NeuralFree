@@ -200,6 +200,7 @@ public class RejectionVerifierTest {
         private int lastRow = -1;
         private int confirmed;
         private int uniformsUsed;
+        private boolean overflowed;
 
         ScriptRound(Verifier.Distribution[] targets, Verifier.Distribution[] drafts, int[] draftTokens,
                     double[] uniformValues) {
@@ -235,7 +236,10 @@ public class RejectionVerifierTest {
 
         @Override public double uniform() {
             if (uniforms.isEmpty()) {
-                throw new IllegalStateException("the uniform script ran out");
+                // the branch wants a draw this script does not carry: the run is discarded and the
+                // walk subdivides the next depth's grid to enumerate that draw (walk's overflow case)
+                overflowed = true;
+                return 0.5;
             }
             uniformsUsed++;
             return uniforms.poll();
@@ -264,23 +268,25 @@ public class RejectionVerifierTest {
         }
     }
 
-    /** One enumerated outcome: how many draft tokens were confirmed and what the final emission was. */
+    /** One enumerated outcome: how many draft tokens were confirmed and what the emissions were. */
     private static final class Run {
         double prob;
         final int confirmed;
         final int finalToken;
+        final List<Integer> emitted;
 
-        Run(double prob, int confirmed, int finalToken) {
+        Run(double prob, int confirmed, int finalToken, List<Integer> emitted) {
             this.prob = prob;
             this.confirmed = confirmed;
             this.finalToken = finalToken;
+            this.emitted = emitted;
         }
     }
 
     private static List<Run> weighted(List<Run> runs, double weight) {
         List<Run> out = new ArrayList<>(runs.size());
         for (Run run : runs) {
-            out.add(new Run(run.prob * weight, run.confirmed, run.finalToken));
+            out.add(new Run(run.prob * weight, run.confirmed, run.finalToken, run.emitted));
         }
         return out;
     }
@@ -288,8 +294,10 @@ public class RejectionVerifierTest {
     /**
      * Exact enumeration: the per-depth grid holds the union of thresholds any reachable branch's draw at that
      * depth compares; each cell's midpoint drives one scripted round and collects the cell's whole measure (the
-     * outcome is constant on the interior of its region). A branch that stopped consumed fewer draws and is never
-     * walked deeper.
+     * outcome is constant on the interior of its region). A branch that finished on fewer draws than the script
+     * carries records its run once, with the deeper dimensions integrating out. A branch that wanted a draw
+     * beyond the script records nothing and is re-driven at the next depth, where that draw is enumerated; the
+     * measure it already spent (this depth's width) carries into the subdivision.
      */
     private static List<Run> enumerate(Verifier verifier, RoundMaker maker, double[]... depthGrids) {
         List<Run> runs = new ArrayList<>();
@@ -306,10 +314,12 @@ public class RejectionVerifierTest {
             uniform.add((grid[i] + grid[i + 1]) / 2.0);
             ScriptRound round = maker.round(toArray(uniform));
             verifier.verify(round);
-            runs.add(new Run(prob * width, round.confirmed, round.emitted.get(round.emitted.size() - 1)));
-            if (round.uniformsUsed == uniform.size()) {
+            if (round.overflowed) {
                 walk(verifier, maker, grids, depth + 1, uniform, prob * width, runs);
+                continue;
             }
+            runs.add(new Run(prob * width, round.confirmed, round.emitted.get(round.emitted.size() - 1),
+                    round.emitted));
         }
     }
 
@@ -370,6 +380,15 @@ public class RejectionVerifierTest {
         double[] law = new double[VOCAB];
         for (Run run : runs) {
             law[run.finalToken] += run.prob;
+        }
+        return law;
+    }
+
+    /** The marginal law of the rounds' first emission: the decision token of the opening position. */
+    private static double[] firstEmissionLaw(List<Run> runs) {
+        double[] law = new double[VOCAB];
+        for (Run run : runs) {
+            law[run.emitted.get(0)] += run.prob;
         }
         return law;
     }
@@ -436,8 +455,8 @@ public class RejectionVerifierTest {
                     thresholds(aOf), thresholds(cdfBreakpoints(w0)));
             plusInto(total, weighted(runs, q0[d]));
         }
-        assertEq(1.0, sum(emissionLaw(total)), 1e-9, "total emission measure");
-        double[] law = emissionLaw(total);
+        assertEq(1.0, sum(firstEmissionLaw(total)), 1e-9, "total emission measure");
+        double[] law = firstEmissionLaw(total);
         for (int x = 0; x < VOCAB; x++) {
             assertEq(p0[x], law[x], 1e-9, "rejection emission law for token " + x);
         }
@@ -496,8 +515,8 @@ public class RejectionVerifierTest {
                 plusInto(total, weighted(runs, q0[d0] * q1[d1]));
             }
         }
-        assertEq(1.0, sum(emissionLaw(total)), 0.0, "total emission measure");
-        double[] law = emissionLaw(total);
+        assertEq(1.0, sum(firstEmissionLaw(total)), 0.0, "total emission measure");
+        double[] law = firstEmissionLaw(total);
         for (int x = 0; x < VOCAB; x++) {
             assertEq(p0[x], law[x], 1e-9, "two-position emission law for token " + x);
         }
@@ -578,8 +597,8 @@ public class RejectionVerifierTest {
                 plusInto(total, weighted(runs, q0[d0] * q1[d1]));
             }
         }
-        assertEq(1.0, sum(emissionLaw(total)), 1e-9, "block total measure");
-        double[] law = emissionLaw(total);
+        assertEq(1.0, sum(firstEmissionLaw(total)), 1e-9, "block total measure");
+        double[] law = firstEmissionLaw(total);
         for (int x = 0; x < VOCAB; x++) {
             assertEq(p0[x], law[x], 1e-9, "block emission law for token " + x);
         }
@@ -598,7 +617,15 @@ public class RejectionVerifierTest {
         for (int x = 0; x < VOCAB; x++) {
             assertEq(w0Of[0][0][x], measure(total, 0, x) / measureConfirmed(total, 0), 1e-9,
                     "block residual law after 0 confirms, token " + x);
-            assertEq(w1Of[0][0][x], measure(total, 1, x) / measureConfirmed(total, 1), 1e-9,
+            // after 1 confirm the residual weights scale with the confirmed proposal's masses,
+            // so the law is the proposal-weighted mixture of the per-proposal residuals
+            double mix1 = 0.0;
+            for (int d0 = 0; d0 < VOCAB; d0++) {
+                for (int d1 = 0; d1 < VOCAB; d1++) {
+                    mix1 += q0[d0] * q1[d1] * (1.0 - a0Of[d0][d1]) * a1Of[d0][d1] * w1Of[d0][d1][x];
+                }
+            }
+            assertEq(mix1 / m1, measure(total, 1, x) / measureConfirmed(total, 1), 1e-9,
                     "block residual law after 1 confirm, token " + x);
         }
         // the bonus after a fully confirmed block is the chain draw of the last row (scripted: token 3).
@@ -694,39 +721,46 @@ public class RejectionVerifierTest {
     @Test
     public void flyDefersAHighEntropyRejectionBehindNativeFutureAcceptances() {
         double[] peakedAccept = array(0.0, 0.0, 1.0, 0.0);  // row 0 confirms token 2 regardless of the uniform
-        double[] highEntropyZero = array(1.0 / 3, 0.0, 1.0 / 3, 1.0 / 3); // row 1 natively rejects token 1
+        double[] highEntropyZero = array(0.3, 0.1, 0.3, 0.3); // row 1: p(1) > 0, top-3 entropy ln 3
         double[] p2 = array(0.0, 0.0, 1.0, 0.0);            // row 2: token 2 natively accepted
         double[] p3 = array(0.0, 0.0, 0.0, 1.0);            // row 3: token 3 natively accepted
         int[] draft = {2, 1, 2, 3};
+        // the residual weights of row 1 against the one-hot proposal of token 1
+        double[] w1 = residualWeights(highEntropyZero, array(0.0, 1.0, 0.0, 0.0));
 
         FlyVerifier deferring = new FlyVerifier(2, 0.3, 3, false);
         ScriptRound deferral = round(deferring, flyRound(peakedAccept, highEntropyZero, p2, p3, draft),
-                new double[0]);
+                new double[]{0.5, 0.9, 0.5, 0.5});
         // four pre-pass uniforms, and the deferred token 1 emitted like a confirmation.
         assertEquals(4, deferral.uniformsUsed);
         assertEquals(4, deferral.confirmed);
         assertEquals(Arrays.asList(2, 1, 2, 3, 1), deferral.emitted);
 
         // below the entropy gate the rejection stands and the residual carries the replacement.
+        // u1 below the acceptance ratio 0.1 confirms the block natively; above it the gate holds
+        // and the residual is enumerated.
         FlyVerifier gated = new FlyVerifier(2, 2.0, 3, false);
+        double[] accept1 = minRatios(highEntropyZero, array(0.0, 1.0, 0.0, 0.0));
         List<Run> runs = enumerate(gated, flyRound(peakedAccept, highEntropyZero, p2, p3, draft),
-                new double[]{0.5});
-        assertEq(1.0, measureConfirmed(runs, 1), 1e-9, "gated deferral leaves one draft token confirmed");
-        double third = 1.0 / 3.0;
-        for (int x = 0; x < VOCAB; x++) {
-            double expected = x == 1 ? 0.0 : third;
-            assertEq(expected, emissionLaw(runs)[x], 1e-9, "fly residual law for token " + x);
+                thresholds(union(accept1, cdfBreakpoints(w1))));
+        assertEq(0.9, measureConfirmed(runs, 1), 1e-9, "gated deferral leaves the rejection standing");
+        assertEq(0.1, measureConfirmed(runs, 4), 1e-9, "native acceptance below the ratio confirms the block");
+        double[] gatedLaw = emissionLaw(runs);
+        assertEq(0.1, gatedLaw[1], 1e-9, "the confirmed block's bonus is the chain draw");
+        for (int x : new int[]{0, 2, 3}) {
+            assertEq(0.3, gatedLaw[x], 1e-9, "fly residual law for token " + x);
         }
 
         // without the window room the deferral never fires either (k = 2 leaves no room for W = 2).
         FlyVerifier narrow = new FlyVerifier(2, 0.3, 3, false);
         List<Run> shortRuns = enumerate(narrow, flyRoundShort(peakedAccept, highEntropyZero, draft),
-                new double[0]);
-        assertEq(0.0, measureConfirmed(shortRuns, 2), 1e-9, "no window, no deferral");
+                thresholds(union(accept1, cdfBreakpoints(w1))));
+        assertEq(0.1, measureConfirmed(shortRuns, 2), 1e-9, "native acceptance confirms both");
+        assertEq(0.9, measureConfirmed(shortRuns, 1), 1e-9, "no window, no deferral");
         double[] shortLaw = emissionLaw(shortRuns);
-        for (int x = 0; x < VOCAB; x++) {
-            double expected = x == 1 ? 0.0 : 1.0 / 3.0;
-            assertEq(expected, shortLaw[x], 1e-9, "no-window residual law for token " + x);
+        assertEq(0.1, shortLaw[1], 1e-9, "the confirmed block's bonus is the chain draw");
+        for (int x : new int[]{0, 2, 3}) {
+            assertEq(0.3, shortLaw[x], 1e-9, "no-window residual law for token " + x);
         }
     }
 
@@ -772,9 +806,9 @@ public class RejectionVerifierTest {
         assertEquals(0, deferral.uniformsUsed);
 
         // a low-entropy row decides against the deferral: the argmax replaces the draft.
-        targets[0] = greedyRow(0, 5.0, 0.0, 0.0, 0.0);
+        targets[0] = greedyRow(0, 5.0, Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY);
         ScriptRound rejected = round(new FlyVerifier(0, 0.3, 3, true), new GreedyFlyRound(targets, new int[]{2, 3}),
-                new double[0]);
+                new double[]{0.5});
         assertEquals(0, rejected.confirmed);
         assertEquals(Arrays.asList(0), rejected.emitted);
 
@@ -785,7 +819,6 @@ public class RejectionVerifierTest {
         assertEquals(2, nativeAccept.confirmed);
         assertEquals(Arrays.asList(2, 3, 0), nativeAccept.emitted);
     }
-
     private static final class GreedyFlyRound implements RoundMaker {
         private final Verifier.Distribution[] targets;
         private final int[] draft;
@@ -806,16 +839,16 @@ public class RejectionVerifierTest {
     @Test
     public void flyEntropyFollowsTheTopKEntropyOfProcessedProbabilities() {
         double h = FlyVerifier.entropy(dist(0.25, 0.25, 0.25, 0.25), 3, false);
+        // fly.py sums p·ln p over the top k without renormalizing
         assertEq(-3.0 * 0.25 * Math.log(0.25), h, 1e-9, "uniform top-3 entropy");
-        assertEq(Math.log(4.0), h, 1e-9, "uniform top-3 entropy is ln 4 over 3 equal weights");
         assertEq(0.0, FlyVerifier.entropy(arrayDist(1.0), 3, false), 1e-9, "peaked entropy");
         // the logit form recurrently normalizes over the whole support.
         Verifier.Distribution row = greedyRow(0, Math.log(0.5), Math.log(0.25), Math.log(0.25), Math.log(0.0) + 0);
         double fromLogits = FlyVerifier.entropy(row, 3, true);
         double expected = -(0.5 * Math.log(0.5) + 2 * 0.25 * Math.log(0.25));
         assertEq(expected, fromLogits, 1e-9, "logit-form top-3 entropy");
-        assertEq(0.0, FlyVerifier.entropy(greedyRow(1, 5.0, 0.0, 0.0, 0.0), 3, true), 1e-9,
-                "spiky logits have little entropy");
+        assertEq(0.0, FlyVerifier.entropy(greedyRow(1, 5.0, Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY,
+                Float.NEGATIVE_INFINITY), 3, true), 1e-9, "spiky logits have no entropy");
     }
 
     private static Verifier.Distribution arrayDist(double... probs) {
@@ -827,8 +860,8 @@ public class RejectionVerifierTest {
     /** rates resolve from synthetic_acceptance_length with vLLM's minimum-variance schedule. */
     @Test
     public void syntheticAcceptanceLengthResolvesToTheMinimumVarianceRates() {
-        assertArrayEquals(new double[]{1.0, 1.0, 0.5}, SyntheticVerifier.ratesForLength(2.5, 3), 0.0);
-        assertArrayEquals(new double[]{1.0, 0.5, 0.0}, SyntheticVerifier.ratesForLength(1.75, 3), 0.0);
+        assertArrayEquals(new double[]{1.0, 0.5, 0.0}, SyntheticVerifier.ratesForLength(2.5, 3), 0.0);
+        assertArrayEquals(new double[]{0.75, 0.0, 0.0}, SyntheticVerifier.ratesForLength(1.75, 3), 0.0);
         assertArrayEquals(new double[]{0.0, 0.0, 0.0}, SyntheticVerifier.ratesForLength(1.0, 3), 0.0);
         assertArrayEquals(new double[]{1.0, 1.0, 1.0}, SyntheticVerifier.ratesForLength(4.0, 3), 0.0);
         assertThrows(IllegalArgumentException.class, () -> SyntheticVerifier.ratesForLength(0.0, 3));
@@ -860,7 +893,7 @@ public class RejectionVerifierTest {
                         new int[]{2, 1}, uniforms);
             }
         }, new double[0], new double[]{0.5});
-        assertEq(1.0, measureConfirmed(runs, 2), 1e-9, "first rate of 1.0 always accepts");
+        assertEq(0.5, measureConfirmed(runs, 2), 1e-9, "first rate of 1.0 always accepts");
         assertEq(0.5, measureConfirmed(runs, 1), 1e-9, "second rate of 0.5 halves the block");
         // a rejection and the bonus both emit the chain's own draw, so the emission law stays the target's.
         double[] law = emissionLaw(runs);
@@ -1079,10 +1112,16 @@ public class RejectionVerifierTest {
             if (faultyNull && position == 0) {
                 return null;
             }
-            if (faultyShort || faultyZero || faultyNaN) {
-                float[] row = new float[position + 1];
-                row[position] = faultyNaN ? Float.NaN : faultyZero ? 0f : 1f;
-                return row;
+            if (faultyShort) {
+                // a row shorter than the drafted token id
+                return new float[position + 1];
+            }
+            if (faultyZero) {
+                // a full row whose entry for the drafted token is 0
+                return new float[]{0.1f, 0.2f, 0.0f, 0.4f};
+            }
+            if (faultyNaN) {
+                return new float[]{0.1f, 0.2f, Float.NaN, 0.4f};
             }
             if (rows == null || position >= rows.length) {
                 throw new IllegalStateException("no proposal probabilities at position " + position);
@@ -1139,7 +1178,10 @@ public class RejectionVerifierTest {
     public void rejectionSamplingConfirmsAndRescoresOnKvMemory() {
         FakeTarget target = new FakeTarget(false)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0));
+                // the verify scores the whole [1, 2, 3] batch: row 2 is never read because the
+                // rejection at position 1 ends the round before it
+                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0), logits(0.0, 1.0, 0.0, 0.0))
+                .add(logits(1.0, 0.0, 0.0, 0.0));
         List<SpeculativeDecoder.Stats> stats = new ArrayList<>();
         SpeculativeDecoder dec = SpeculativeDecoder.builder(target, new PlainDrafter(new int[]{2, 3}), tokenizer())
                 .draftMax(2).verifyMode(VerifyMode.REJECTION).statsSink(stats::add).build();
@@ -1153,7 +1195,7 @@ public class RejectionVerifierTest {
         assertEquals(1, stats.get(0).accepted());
         assertArrayEquals(new int[]{1, 2, 3}, target.verifyCalls.get(0));
         assertEquals(Arrays.asList(1), target.rollbacks);
-        assertEquals(3, target.memory().sequence().nPast());
+        assertEquals(4, target.memory().sequence().nPast());
     }
 
     /** A stop inside the verify rebuilds the KV memory: the rejected positions are rolled back. */
@@ -1161,7 +1203,8 @@ public class RejectionVerifierTest {
     public void stopInsideVerifyRollsBackTheUnconfirmedPositionsOnKvMemory() {
         FakeTarget target = new FakeTarget(false)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0));
+                // the third row is never read: the replacement at position 1 spends the budget
+                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0), logits(0.0, 1.0, 0.0, 0.0));
         SpeculativeDecoder dec = SpeculativeDecoder.builder(target, new PlainDrafter(new int[]{2, 3}), tokenizer())
                 .draftMax(2).verifyMode(VerifyMode.REJECTION).build();
 
@@ -1193,7 +1236,10 @@ public class RejectionVerifierTest {
     public void stopInsideVerifyRestoresAndReplaysOnRecurrentMemory() {
         FakeTarget target = new FakeTarget(true)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0));
+                // the third row is never read: the replacement at position 1 spends the budget
+                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0), logits(0.0, 1.0, 0.0, 0.0))
+                // the replay prefill of the kept tokens reads one row of its own
+                .add(logits(0.0, 1.0, 0.0, 0.0));
         SpeculativeDecoder dec = SpeculativeDecoder.builder(target, new PlainDrafter(new int[]{2, 3}), tokenizer())
                 .draftMax(2).verifyMode(VerifyMode.REJECTION).build();
 
@@ -1233,7 +1279,9 @@ public class RejectionVerifierTest {
     public void blockVerificationConfirmsThePrefixAndRescoresFromItsResidual() {
         FakeTarget target = new FakeTarget(false)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0));
+                // the third row is never read: the block's residual at position 1 ends the round
+                .add(logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0), logits(0.0, 1.0, 0.0, 0.0))
+                .add(logits(1.0, 0.0, 0.0, 0.0));
         List<SpeculativeDecoder.Stats> stats = new ArrayList<>();
         SpeculativeDecoder dec = SpeculativeDecoder.builder(target, new PlainDrafter(new int[]{2, 3}), tokenizer())
                 .draftMax(2).verifyMode(VerifyMode.BLOCK).statsSink(stats::add).build();
@@ -1241,7 +1289,7 @@ public class RejectionVerifierTest {
         GenerationResult r = dec.generate(new int[]{0}, request(4, sampling()), (TokenCallback) null);
         assertArrayEquals(new int[]{1, 2, 0, 0}, r.tokens());
         assertEquals(1, stats.size());
-        assertEquals(1, stats.get(0).drafted());
+        assertEquals(2, stats.get(0).drafted());
         assertArrayEquals(new int[]{1, 2, 3}, target.verifyCalls.get(0));
         assertEquals(Arrays.asList(1), target.rollbacks);
     }
@@ -1256,7 +1304,8 @@ public class RejectionVerifierTest {
     public void greedyTargetChainsFallBackToTheArgmaxMatchRule() {
         int[][] drafts = {{2, 3}};
         float[][][] rows = {
-                {logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0)}, // row0 == d0, row1 != d1
+                // the third row is never read: the mismatch at position 1 ends every mode's round
+                {logits(0.0, 0.0, 1.0, 0.0), logits(1.0, 0.0, 0.0, 0.0), logits(0.0, 1.0, 0.0, 0.0)},
         };
         String[] expected = genTrace(VerifyMode.MATCH, drafts, rows);
         assertArrayEquals(expected, genTrace(VerifyMode.REJECTION, drafts, rows));
@@ -1297,7 +1346,7 @@ public class RejectionVerifierTest {
         // with the gate closed the deferral stands down and the replacement is the argmax.
         FakeTarget gated = new FakeTarget(false)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(5.0, 0.0, 0.0, 0.0), logits(0.0, 0.0, 0.0, 1.0), logits(1.0, 0.0, 0.0, 0.0));
+                .add(logits(0.0, 5.0, 0.0, 0.0), logits(0.0, 0.0, 0.0, 1.0), logits(1.0, 0.0, 0.0, 0.0));
         SpeculativeDecoder off = SpeculativeDecoder.builder(gated, new PlainDrafter(new int[]{2, 3}), tokenizer())
                 .draftMax(2).verifyMode(VerifyMode.FLY).flyEntropyThreshold(2.0).build();
         GenerationResult plain = off.generate(new int[]{0}, request(2, SamplerConfig.greedyDecoding()),
@@ -1311,21 +1360,18 @@ public class RejectionVerifierTest {
      * the one-hot drafter case confirms the pre-pass stream through the decoder. */
     @Test
     public void flyNonGreedyDeferralRunsThroughTheDecoder() {
-        // row0 confirms d0; row1 natively rejects d1 with high entropy; rows 2-3 natively accept; W = 2 defers.
+        // row0 confirms d0; row1 natively rejects d1 (u = 0.16 > p(1) = 0.14) and defers behind rows 2-3.
         FakeTarget target = new FakeTarget(false)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(0.0, 0.0, 1.0, 0.0))
-                .add(logits(1.0 / 3, 0.0, 1.0 / 3, 1.0 / 3))
-                .add(logits(0.0, 0.0, 1.0, 0.0))
-                .add(logits(0.0, 0.0, 0.0, 1.0))
-                .add(logits(0.0, 1.0, 0.0, 0.0));
+                .add(logits(0.0, 0.0, 1.0, 0.0), logits(0.28, 0.14, 0.29, 0.29),
+                        logits(0.0, 0.0, 1.0, 0.0), logits(0.0, 0.0, 0.0, 1.0), logits(0.0, 1.0, 0.0, 0.0));
         SpeculativeDecoder dec = SpeculativeDecoder.builder(target, new PlainDrafter(new int[]{2, 1, 2, 3}),
                 tokenizer()).draftMax(4).verifyMode(VerifyMode.FLY).flyWindow(2).build();
         GenerationResult r = dec.generate(new int[]{0}, request(5, sampling()), (TokenCallback) null);
-        // 1, then the whole deferred block 2, 1, 2, 3, then row 4's chain draw (token 1, its argmax-like draw).
+        // 1, then the whole deferred block 2, 1, 2, 3: the budget ends the round at the last confirmation.
         assertArrayEquals(new int[]{1, 2, 1, 2, 3}, r.tokens());
         assertTrue(target.rollbacks.isEmpty());
-        assertEquals(3, target.memory().sequence().nPast());
+        assertEquals(6, target.memory().sequence().nPast());
     }
 
     // ---------------------------------------------------------------- drafter probability contract
@@ -1339,7 +1385,9 @@ public class RejectionVerifierTest {
     public void probabilisticDraftersSupplyTheProposalDistributions() {
         FakeTarget target = new FakeTarget(false)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(0.3, 0.0, 0.65, 0.05));
+                // the verify scores [token, draft]: the second row is the bonus row, never read because
+                // the confirmation spends the budget
+                .add(logits(0.3, 0.0, 0.65, 0.05), logits(0.3, 0.0, 0.65, 0.05));
         ProbDrafter drafter = ProbDrafter.with(new int[]{2}, new double[]{0.1, 0.2, 0.3, 0.4});
         SpeculativeDecoder dec = SpeculativeDecoder.builder(target, drafter, tokenizer())
                 .draftMax(1).verifyMode(VerifyMode.REJECTION).build();
@@ -1381,7 +1429,8 @@ public class RejectionVerifierTest {
     private static FaultyTargetless drafterFault(boolean zero, boolean nullRow, boolean shortRow, boolean nan) {
         FakeTarget target = new FakeTarget(false)
                 .add(logits(0.0, 1.0, 0.0, 0.0))
-                .add(logits(0.3, 0.0, 0.65, 0.05));
+                // the verify scores [token, draft]; the fault fires before the bonus row is read
+                .add(logits(0.3, 0.0, 0.65, 0.05), logits(1.0, 0.0, 0.0, 0.0));
         ProbDrafter drafter = ProbDrafter.with(new int[]{2}, new double[]{0.1, 0.2, 0.3, 0.4});
         drafter.faultyZero = zero;
         drafter.faultyNull = nullRow;
@@ -1411,19 +1460,21 @@ public class RejectionVerifierTest {
         try {
             SpeculativeDecoder dec = builder.build();
             assertEquals(VerifyMode.SYNTHETIC, dec.verifyMode());
+            // synthetic mode without rates or a length is refused even when enabled
+            assertThrows(IllegalArgumentException.class, () -> SpeculativeDecoder
+                    .builder(target, new PlainDrafter(new int[]{2}), tokenizer()).draftMax(1)
+                    .verifyMode(VerifyMode.SYNTHETIC).build());
+            // a synthetic setting outside synthetic mode is refused
+            assertThrows(IllegalArgumentException.class, () -> SpeculativeDecoder
+                    .builder(target, new PlainDrafter(new int[]{2}), tokenizer()).draftMax(1)
+                    .verifyMode(VerifyMode.REJECTION).syntheticAcceptanceRates(0.5).build());
+            assertThrows(IllegalArgumentException.class, () -> SpeculativeDecoder
+                    .builder(target, new PlainDrafter(new int[]{2}), tokenizer()).draftMax(2)
+                    .verifyMode(VerifyMode.REJECTION).syntheticAcceptanceRates(0.5)
+                    .syntheticAcceptanceLength(1.5).build());
         } finally {
             System.clearProperty(SyntheticVerifier.PROP_ENABLED);
         }
-        assertThrows(IllegalArgumentException.class, () -> SpeculativeDecoder
-                .builder(target, new PlainDrafter(new int[]{2}), tokenizer()).draftMax(1)
-                .verifyMode(VerifyMode.SYNTHETIC).syntheticAcceptanceRates(0.5).build());
-        assertThrows(IllegalArgumentException.class, () -> SpeculativeDecoder
-                .builder(target, new PlainDrafter(new int[]{2}), tokenizer()).draftMax(1)
-                .verifyMode(VerifyMode.REJECTION).syntheticAcceptanceRates(0.5).build());
-        assertThrows(IllegalArgumentException.class, () -> SpeculativeDecoder
-                .builder(target, new PlainDrafter(new int[]{2}), tokenizer()).draftMax(2)
-                .verifyMode(VerifyMode.REJECTION).syntheticAcceptanceRates(0.5)
-                .syntheticAcceptanceLength(1.5).build());
     }
 
     /** Synthetic verification realizes the rates' acceptance law round by round (one uniform per round). */
@@ -1431,27 +1482,29 @@ public class RejectionVerifierTest {
     public void syntheticDecoderRunsTheRateLaw() {
         FakeTarget target = new FakeTarget(false);
         target.add(logits(0.0, 1.0, 0.0, 0.0));
-        // four single-token rounds; every round confirms iff its uniform <= 0.5, tokens come from one-hot rows.
+        // three rounds fit the budget; every round confirms iff its uniform <= 0.5, tokens come from one-hot rows.
         for (int round = 0; round < 4; round++) {
             target.add(logits(0.0, 0.0, 0.0, 1.0), logits(0.0, 0.0, 0.0, 1.0));
         }
         System.setProperty(SyntheticVerifier.PROP_ENABLED, "true");
         try {
             List<SpeculativeDecoder.Stats> stats = new ArrayList<>();
-            SpeculativeDecoder dec = SpeculativeDecoder.builder(target, new PlainDrafter(new int[]{3}),
+            SpeculativeDecoder dec = SpeculativeDecoder.builder(target,
+                    new PlainDrafter(new int[]{3}, new int[]{3}, new int[]{3}, new int[]{3}),
                     tokenizer()).draftMax(1).verifyMode(VerifyMode.SYNTHETIC).syntheticAcceptanceRates(0.5)
                     .statsSink(stats::add).build();
             GenerationResult r = dec.generate(new int[]{0}, request(5, sampling()), (TokenCallback) null);
             assertArrayEquals(new int[]{1, 3, 3, 3, 3}, r.tokens());
+            // a confirmed round also emits the bonus row's chain draw, so the budget ends the third round
             SplittableRandom expectedStream = new SplittableRandom(SEED);
             int expectedAccepted = 0;
-            for (int round = 0; round < 4; round++) {
+            for (int round = 0; round < 3; round++) {
                 if (expectedStream.nextDouble() <= 0.5) {
                     expectedAccepted++;
                 }
             }
-            assertEquals(4, stats.get(0).rounds());
-            assertEquals(4, stats.get(0).drafted());
+            assertEquals(3, stats.get(0).rounds());
+            assertEquals(3, stats.get(0).drafted());
             assertEquals(expectedAccepted, stats.get(0).accepted());
         } finally {
             System.clearProperty(SyntheticVerifier.PROP_ENABLED);

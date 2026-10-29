@@ -309,7 +309,7 @@ public final class SpeculativeDecoder {
                 reason = StopReason.CONTEXT_FULL;
                 break;
             }
-            int k = draftLength(memory, pos, nCtx, session.remaining());
+            int k = draftLength(memory, pos, nCtx);
             int[] draft = k > 0 ? checkDraft(drafter.draft(token, k), k) : new int[0];
             if (draft.length == 0 || draft.length < draftMin) {
                 logits = backend.decode(token, pos);
@@ -628,7 +628,11 @@ public final class SpeculativeDecoder {
                 throw new IllegalStateException("confirm(" + position + ") after " + accepted
                         + " confirmed draft tokens");
             }
-            return emitOne(draft[position]);
+            StopReason r = emitOne(draft[position]);
+            // the confirmed position is kept in the memory either way; the rollback accounting
+            // (drop = k - accepted) counts it as kept
+            accepted = position + 1;
+            return r;
         }
 
         @Override public StopReason emit(int token) {
@@ -712,18 +716,18 @@ public final class SpeculativeDecoder {
 
     /**
      * The longest proposal the round can verify and then drop: bounded by {@code draftMax}, the free context after
-     * {@code token}, one ubatch and the remaining budget, then the largest {@code k} for which the memory keeps every
+     * {@code token}, one ubatch, then the largest {@code k} for which the memory keeps every
      * sliding window after storing {@code k + 1} positions and dropping {@code k}
      * ({@link ModelMemory#ringsKeepWindow}, monotone in {@code k}). DSV4 compressed caches bound {@code k} by their
      * compressor rollback snapshots ({@link MemoryPlan#rollbackSnapshots()}): the verify stores {@code k + 1 <= ubatch}
      * positions in one step, whose snapshot planes cover dropping any {@code k} of them. 0 for recurrent state without
-     * snapshot shadows.
+     * snapshot shadows. The token budget does not bound {@code k}: a round that emits past the budget stops inside
+     * the verify (PARITY §5.5.1 S-1), as in llama.cpp and vLLM.
      */
-    private int draftLength(ModelMemory memory, int pos, int nCtx, int remaining) {
+    private int draftLength(ModelMemory memory, int pos, int nCtx) {
         MemoryPlan plan = memory.plan();
         int k = Math.min(draftMax, nCtx - pos - 1);
         k = Math.min(k, plan.ubatch() - 1);
-        k = Math.min(k, remaining - 1);
         if (plan.hasCompressed()) {
             k = Math.min(k, plan.rollbackSnapshots());
         }
@@ -843,7 +847,10 @@ public final class SpeculativeDecoder {
 
         /** The verification mode (default {@link VerifyMode#MATCH}). */
         public Builder verifyMode(VerifyMode v) {
-            this.verifyMode = Objects.requireNonNull(v, "verifyMode");
+            if (v == null) {
+                throw new IllegalArgumentException("verify mode must not be null");
+            }
+            this.verifyMode = v;
             return this;
         }
 
@@ -924,6 +931,10 @@ public final class SpeculativeDecoder {
             if (synthetic && syntheticRates == null && syntheticLength == null) {
                 throw new IllegalArgumentException("synthetic verification needs synthetic_acceptance_rates or"
                         + " synthetic_acceptance_length");
+            }
+            if (!synthetic && (syntheticRates != null || syntheticLength != null)) {
+                throw new IllegalArgumentException("synthetic_acceptance_rates and synthetic_acceptance_length"
+                        + " apply only to synthetic verification");
             }
             if (synthetic) {
                 if (!Boolean.getBoolean(SyntheticVerifier.PROP_ENABLED)) {

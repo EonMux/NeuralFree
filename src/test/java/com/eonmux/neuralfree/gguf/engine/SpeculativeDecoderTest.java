@@ -61,8 +61,9 @@ public class SpeculativeDecoderTest {
     /**
      * Round 1 at P = 1 drafts {@code [2, 3, 7, 7]}: the target's rows sample 2 (= d0), 3 (= d1), then 4 (!= 7), so
      * two drafted tokens are confirmed, 4 is the target's own token, and the last two of the five verified
-     * positions are rolled back (memory {@code [0, 1, 2, 3]}). Round 2 at P = 4 may draft one token (two remain in
-     * the budget): {@code [5]} is confirmed and 6 ends the budget.
+     * positions are rolled back (memory {@code [0, 1, 2, 3]}). Round 2 at P = 4 asks the full budget (the draft
+     * length does not shrink with the token budget, as llama.cpp's loop drafts {@code n_draft} regardless): the
+     * drafter proposes {@code [5]}, it is confirmed and 6 ends the budget.
      */
     @Test
     public void verifyKeepsTheLongestMatchingPrefixAndRollsBackTheRest() {        FakeTarget target = new FakeTarget(false);
@@ -81,7 +82,7 @@ public class SpeculativeDecoderTest {
         assertEquals(Arrays.asList(1, 4), target.verifyPositions);
         assertEquals(Arrays.asList(2), target.rollbacks);
         assertEquals(6, target.memory.sequence().nPast());
-        assertEquals(Arrays.asList(4, 1), drafter.requested);
+        assertEquals(Arrays.asList(4, 4), drafter.requested);
         assertEquals(Arrays.asList(2, 1), drafter.accepted);
         assertEquals(1, drafter.resets);
         assertEquals(1, stats.size());
@@ -149,7 +150,8 @@ public class SpeculativeDecoderTest {
         assertEquals(Arrays.asList(2, 0), drafter.accepted);
     }
 
-    /** All drafted tokens confirmed: nothing is dropped and the row after the last draft gives the next token. */
+    /** All drafted tokens confirmed: nothing is dropped and the row after the last draft gives the next token.
+     * The budget is wide enough that no round is cut mid-verify, so no position is ever rolled back. */
     @Test
     public void fullyAcceptedDraftNeedsNoRollback() {
         FakeTarget target = new FakeTarget(false);
@@ -161,9 +163,9 @@ public class SpeculativeDecoderTest {
             return d;
         });
 
-        GenerationResult r = decoder(target, drafter, 3, 0).generate(new int[]{0}, greedy(8), (TokenCallback) null);
+        GenerationResult r = decoder(target, drafter, 3, 0).generate(new int[]{0}, greedy(9), (TokenCallback) null);
 
-        assertArrayEquals(new int[]{1, 2, 3, 4, 5, 6, 7, 0}, r.tokens());
+        assertArrayEquals(new int[]{1, 2, 3, 4, 5, 6, 7, 0, 1}, r.tokens());
         assertTrue(target.rollbacks.isEmpty());
         assertArrayEquals(new int[]{1, 2, 3, 4}, target.verifyCalls.get(0));
         assertEquals(3, drafter.accepted.get(0).intValue());
