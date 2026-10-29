@@ -76,10 +76,10 @@ public final class EngineService implements AutoCloseable {
     private final String modelPath;
     private final EngineConfig config;
     private final GGUFModel model;
-    private final BatchEngine engine;
     private final BlockingQueue<Runnable> work = new ArrayBlockingQueue<>(256);
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final Thread pumpThread;
+    private volatile BatchEngine engine;
 
     /** Opens {@code path} (null keeps the service unloaded) with {@code config} and starts the pump thread. */
     public EngineService(String path, EngineConfig config) throws IOException {
@@ -87,15 +87,23 @@ public final class EngineService implements AutoCloseable {
         this.config = Objects.requireNonNull(config, "config");
         if (path == null || path.isBlank()) {
             this.model = null;
-            this.engine = null;
             this.pumpThread = null;
             return;
         }
         this.model = new GGUFModel(path, config);
-        this.engine = BatchEngine.forModel(model, config);
+        // the batch engine builds lazily: an embedding or classifier model loads for /v1/embeddings and
+        // /v1/rerank, and a generation request then refuses through BatchEngine.forModel by name
         this.pumpThread = new Thread(this::pumpLoop, "neuralfree-server-pump");
         this.pumpThread.setDaemon(false);
         this.pumpThread.start();
+    }
+
+    /** The batch engine over the model, built on first use (a non-generating model refuses here by name). */
+    private synchronized BatchEngine engine() {
+        if (engine == null) {
+            engine = BatchEngine.forModel(model, config);
+        }
+        return engine;
     }
 
     /** The opened model path, or null when unloaded ({@code neuralfree.server.model} unset). */
@@ -108,19 +116,21 @@ public final class EngineService implements AutoCloseable {
         return model == null ? null : model.architecture();
     }
 
-    /** The engine's sequence-slot count, or 0 when unloaded. */
+    /** The engine's sequence-slot count, or 0 while the batch engine is not built (no generation ran yet). */
     public int slots() {
-        return engine == null ? 0 : engine.maxSequences();
+        BatchEngine current = engine;
+        return current == null ? 0 : current.maxSequences();
     }
 
-    /** The memory's context length, or 0 when unloaded. */
+    /** The memory's context length, or 0 while the batch engine is not built. */
     public int contextLength() {
-        return engine == null ? 0 : engine.contextLength();
+        BatchEngine current = engine;
+        return current == null ? 0 : current.contextLength();
     }
 
     /** Whether a model is open and the pump thread runs. */
     public boolean loaded() {
-        return engine != null && running.get();
+        return model != null && running.get();
     }
 
     /** Renders the chat request through the model's template ({@code GGUFTokenizer.formatChat}). */
@@ -133,6 +143,24 @@ public final class EngineService implements AutoCloseable {
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         requireLoaded();
         return model.tokenizer().encode(text, addSpecial, parseSpecial);
+    }
+
+    /** The pooled embedding of one input ({@code GGUFModel.encode}); an EMBED or pooling model carries it. */
+    public float[] embed(int[] tokens) throws IOException {
+        requireLoaded();
+        return model.encode(tokens);
+    }
+
+    /** The rerank input tokens of one query-document pair ({@code ClassifierHead.rerankInput}). */
+    public int[] rerankInput(String query, String document) {
+        requireLoaded();
+        return com.eonmux.neuralfree.gguf.ops.heads.ClassifierHead.rerankInput(model.tokenizer(), query, document);
+    }
+
+    /** The relevance score of one rerank input ({@code GGUFModel.classify} over a RANK model). */
+    public float rerankScore(int[] tokens) throws IOException {
+        requireLoaded();
+        return model.classify(tokens)[0];
     }
 
     /**
@@ -148,7 +176,7 @@ public final class EngineService implements AutoCloseable {
         Submission submission = new Submission();
         work.put(() -> {
             try {
-                submission.registered(engine.submit(prompt, request, sink, renderedPrompt, constraint));
+                submission.registered(engine().submit(prompt, request, sink, renderedPrompt, constraint));
             } catch (RuntimeException e) {
                 submission.refused(e);
             }
@@ -208,8 +236,9 @@ public final class EngineService implements AutoCloseable {
                 LOGGER.log(Level.WARNING, "submit task failed", e);
             }
             try {
-                if (engine != null && !engine.idle()) {
-                    engine.pump();
+                BatchEngine current = engine;
+                if (current != null && !current.idle()) {
+                    current.pump();
                 }
             } catch (RuntimeException e) {
                 LOGGER.log(Level.WARNING, "engine step failed", e);

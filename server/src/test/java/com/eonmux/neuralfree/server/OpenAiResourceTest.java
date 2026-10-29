@@ -17,7 +17,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -139,7 +141,7 @@ public class OpenAiResourceTest {
                 "{\"prompt\": [\"a\", \"b\"]}")));
         assertEquals(400, statusOf(() -> resource.chatCompletions(
                 "{\"messages\": \"nope\"}")));
-        WebApplicationException unloadedModels = assertThrows(() -> new OpenAiResource(unloaded).models());
+        WebApplicationException unloadedModels = waeOf(() -> new OpenAiResource(unloaded).models());
         assertEquals(503, unloadedModels.getResponse().getStatus());
     }
 
@@ -150,6 +152,66 @@ public class OpenAiResourceTest {
         assertTrue(props.str("model_path").endsWith(".gguf"));
         assertEquals(2L, props.i64("total_slots"));
         assertEquals(64L, JsonView.of(props.raw("default_generation_settings"), "d").i64("n_ctx"));
+    }
+
+    @Test
+    void embeddingsServeFromAnEmbeddingModelAndRefuseAGenerativeOneByName() throws Exception {
+        Path bert = SyntheticModels.bert().writeTempFile();
+        EngineConfig config = EngineConfig.builder().build();
+        try (EngineService embedService = new EngineService(bert.toString(), config)) {
+            Response response;
+            try {
+                response = new OpenAiResource(embedService).embeddings("""
+                        {"input": ["hello world", "second"]}""");
+            } catch (WebApplicationException e) {
+                throw new AssertionError("embeddings refused: " + body(e.getResponse()), e);
+            }
+            assertEquals(200, response.getStatus());
+            JsonView body = view(response.getEntity());
+            assertEquals("list", body.str("object"));
+            List<?> data = (List<?>) body.raw("data");
+            assertEquals(2, data.size());
+            JsonView first = JsonView.of(data.get(0), "data[0]");
+            assertEquals("embedding", first.str("object"));
+            assertEquals(0L, first.i64("index"));
+            assertTrue(((List<?>) first.raw("embedding")).size() > 8,
+                    "the pooled vector is non-trivial");
+        }
+        // the generative llama refuses the embedding endpoint with its named pooling refusal
+        WebApplicationException refused = assertThrows(WebApplicationException.class,
+                () -> resource.embeddings("{\"input\": \"hello\"}"));
+        assertEquals(400, refused.getResponse().getStatus());
+        assertTrue(view(refused.getResponse().getEntity()).obj("error").str("message").contains("pool"),
+                "the pooling refusal names the model");
+    }
+
+    @Test
+    void rerankRefusesAGenerativeModelByNameAndValidatesItsBody() {
+        // the synthetic llama pools by NONE: the rerank forward refuses with the model's own refusal
+        WebApplicationException refused = assertThrows(WebApplicationException.class,
+                () -> resource.rerank("{\"query\": \"q\", \"documents\": [\"a\", \"b\"]}"));
+        assertEquals(400, refused.getResponse().getStatus());
+        assertTrue(view(refused.getResponse().getEntity()).obj("error").str("message").contains("pool"),
+                "the pooling refusal names the model");
+        assertEquals(400, rerankStatus("{\"query\": \"q\"}"));
+        assertEquals(400, rerankStatus("{\"query\": \"q\", \"documents\": [42]}"));
+    }
+
+    /** The response entity as text (JSON bodies are strings; streams render their class name). */
+    private static String body(Response response) {
+        Object entity = response.getEntity();
+        return entity instanceof String s ? s : String.valueOf(entity);
+    }
+
+    /** The status of a rerank call whose engine refusal surfaces as HTTP 400. */
+    private int rerankStatus(String body) {
+        try {
+            return resource.rerank(body).getStatus();
+        } catch (WebApplicationException e) {
+            return e.getResponse().getStatus();
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
     }
 
     // ------------------------------------------------------------------ helpers
@@ -171,7 +233,7 @@ public class OpenAiResourceTest {
         }
     }
 
-    private static WebApplicationException assertThrows(java.util.function.Supplier<?> call) {
+    private static WebApplicationException waeOf(java.util.function.Supplier<?> call) {
         try {
             call.get();
             throw new AssertionError("expected a WebApplicationException");

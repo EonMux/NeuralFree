@@ -135,6 +135,121 @@ public class OpenAiResource {
         return Response.ok(json(completionBody("chat.completion", choices, result))).build();
     }
 
+    @POST
+    @Path("/v1/embeddings")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response embeddings(String bodyText) throws IOException {
+        requireLoaded();
+        JsonView body = parse(bodyText);
+        List<String> inputs = new ArrayList<>();
+        Object raw = body.raw("input");
+        if (raw instanceof String s) {
+            inputs.add(s);
+        } else if (raw instanceof List<?> list) {
+            for (Object o : list) {
+                if (o instanceof String s) {
+                    inputs.add(s);
+                } else {
+                    throw badRequest("every input must be a string; token arrays are refused"
+                            + " (the server tokenizes text)");
+                }
+            }
+        } else {
+            throw badRequest("input is required and must be a string or an array of strings");
+        }
+        List<Map<String, Object>> data = new ArrayList<>();
+        long tokens = 0;
+        for (int i = 0; i < inputs.size(); i++) {
+            int[] ids = service.encode(inputs.get(i), false, false);
+            tokens += ids.length;
+            float[] embedding;
+            try {
+                embedding = service.embed(ids);
+            } catch (UnsupportedOperationException e) {
+                throw badRequest(e.getMessage());
+            }
+            List<Object> values = new ArrayList<>(embedding.length);
+            for (float v : embedding) {
+                values.add((double) v);
+            }
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("object", "embedding");
+            entry.put("index", i);
+            entry.put("embedding", values);
+            data.add(entry);
+        }
+        Map<String, Object> usage = new LinkedHashMap<>();
+        usage.put("prompt_tokens", tokens);
+        usage.put("total_tokens", tokens);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("object", "list");
+        out.put("data", data);
+        out.put("model", service.modelPath());
+        out.put("usage", usage);
+        return Response.ok(json(out)).build();
+    }
+
+    @POST
+    @Path("/v1/rerank")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response rerank(String bodyText) throws IOException {
+        requireLoaded();
+        JsonView body = parse(bodyText);
+        String query = body.optStr("query", null);
+        if (query == null) {
+            throw badRequest("query is required");
+        }
+        List<String> documents = new ArrayList<>();
+        Object raw = body.raw("documents");
+        if (raw instanceof List<?> list) {
+            for (Object o : list) {
+                if (o instanceof String s) {
+                    documents.add(s);
+                } else if (o instanceof Map<?, ?> map && map.get("text") instanceof String s) {
+                    documents.add(s);
+                } else {
+                    throw badRequest("every document must be a string or an object with a text field");
+                }
+            }
+        } else {
+            throw badRequest("documents is required and must be an array");
+        }
+        int topN = body.optI32("top_n", documents.size());
+        List<float[]> scored = new ArrayList<>();
+        long tokens = 0;
+        for (int i = 0; i < documents.size(); i++) {
+            int[] input = service.rerankInput(query, documents.get(i));
+            tokens += input.length;
+            float score;
+            try {
+                score = service.rerankScore(input);
+            } catch (UnsupportedOperationException e) {
+                throw badRequest(e.getMessage());
+            } catch (IOException e) {
+                throw new WebApplicationException("the rerank forward failed: " + e.getMessage(), 500);
+            }
+            scored.add(new float[]{score, i});
+        }
+        scored.sort((a, b) -> Float.compare(b[0], a[0]));
+        List<Map<String, Object>> results = new ArrayList<>();
+        for (int r = 0; r < Math.min(topN, scored.size()); r++) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("index", (int) scored.get(r)[1]);
+            result.put("relevance_score", (double) scored.get(r)[0]);
+            results.add(result);
+        }
+        Map<String, Object> usage = new LinkedHashMap<>();
+        usage.put("total_tokens", tokens);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("id", "rerank-" + System.nanoTime());
+        out.put("model", service.modelPath());
+        out.put("results", results);
+        out.put("usage", usage);
+        return Response.ok(json(out)).build();
+    }
+
     // ------------------------------------------------------------------ request mapping
 
     /** The sampling settings of one request body: only present keys leave their llama.cpp defaults. */
