@@ -95,7 +95,8 @@ It has not been validated by running models on GPU hardware. The limitations the
   - n-gram (simple, map, map-k4v, mod, cache) and suffix drafting from the prompt, with no draft file;
   - EAGLE-3 and EAGLE-1, the Gemma 4 assistant and DFlash drafters;
   - programmatic verify modes (`SpeculativeDecoder.Builder.verifyMode`).
-- **Grammar-constrained generation** (`gguf/grammar`): GBNF grammars, JSON schemas, JSON objects, regexes and choices compile into a sampler-chain stage (`ConstraintSpec`); structural-tag parsing is pending.
+- **Grammar-constrained generation** (`gguf/grammar`): GBNF grammars, JSON schemas, JSON objects, regexes and choices compile into a sampler-chain stage (`ConstraintSpec`, `GrammarStage`); structural-tag parsing is pending.
+- **Serving:** the batch engine (`gguf/engine/batch`) runs parallel requests over the paged memory, and `server/` exposes the OpenAI-compatible HTTP surface (`/v1/completions`, `/v1/chat/completions` with SSE, `/v1/embeddings`, `/v1/rerank`, `/v1/models`) plus llama.cpp's `/health` and `/props`.
 - **Hugging Face Hub download** (`--hf-repo`, `nftool download`), with the llama.cpp cache-root precedence and `HF_TOKEN` auth.
 - **PyTorch pickle checkpoints** (`.bin`/`.pt`/`.pth`) load through a restricted unpickler that refuses unsafe opcodes by name.
 - **Control vectors** applied at inference (`ops/heads/ControlVector`); vector generation is pending.
@@ -257,7 +258,7 @@ com.eonmux.neuralfree
 ├── io/               Model serialization, ONNX export
 ├── gguf/             GGUF engine: arch, hparams, spec, tokenizer, jinja, chat, quant, memory,
 │                     ops, cpu, gpu, engine
-├── server/           Quarkus serving module (endpoints pending)
+├── server/           Quarkus serving module: the OpenAI-compatible HTTP surface (see USAGE.md)
 └── demo/             Runnable demos (DemoRunner, MLPDemo, CNNDemo, GNNDemo, TransformerDemo,
                       AutogradDemo, InferenceDemo, GpuMatmulDemo, LLMDemo) and the tools
                       (NfTool, DownloadCommand, ExportCommand, CvectorGenerator)

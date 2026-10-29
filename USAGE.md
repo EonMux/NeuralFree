@@ -685,9 +685,15 @@ The cache root follows llama.cpp's environment precedence (`HubCache`): `LLAMA_C
 
 Every other listed subcommand (`quantize`, `imatrix`, `perplexity`, `results`, `bench`, `batched-bench`, `split`, `merge`, `export-lora`, `tokenize`, `dump`, `hash`, `embedding`, `retrieval`, `cvector`) refuses with a `not implemented yet` message naming the subcommand.
 
+## HTTP server
+
+`server/` serves the OpenAI-compatible surface over the batch engine: `GET /v1/models`, `POST /v1/completions`, `POST /v1/chat/completions` (both with `stream: true` server-sent events ending in `data: [DONE]`), `POST /v1/embeddings`, `POST /v1/rerank`, plus the llama.cpp-native `GET /health` and `GET /props`. Start it with the model path property (`-Dneuralfree.server.model=<gguf path>`; every other setting reads its `neuralfree.*` property) after `./gradlew :server:build` — the build produces the uber-jar under `server/build/`. Without the property the server starts unloaded: `/health` reports the error and every model request refuses with 503.
+
+One `EngineService` opens the model and pumps its `BatchEngine` on one thread; requests queue FIFO and admitted sequences decode together over the paged memory (`neuralfree.parallel` slots). Sampling settings (`temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `max_tokens`) map onto `SamplerConfig` — only present keys leave the llama.cpp defaults. Chat bodies render through the model's template (`tokenizer.formatChat`); reasoning output streams as `reasoning_content` deltas. Refusals name the gap: `n` above 1, `logit_bias` (no additive token biases), prompt arrays (one prompt per request), and image or audio message parts. Finish reasons: `stop` (end of generation, stop string, cancellation) and `length` (token budget, full context).
+
 ## Grammar-constrained generation
 
-`gguf/grammar` constrains sampling to a grammar: a `GbnfBuilder`/`GbnfParser` pair runs GBNF grammars (`Grammar`, `GrammarLimits`), and a `ConstraintSpec` selects the kind — `GBNF`, `JSON_SCHEMA` (compiled by `JsonSchemaToGbnf`), `JSON_OBJECT`, `REGEX` (compiled by `RegexToGbnf`), `CHOICE` and `STRUCTURAL_TAG`. The constraint runs as the `GrammarStage` of the sampler chain. The API is programmatic; structural-tag specs parse no input yet ([GAPS.md](GAPS.md)).
+`gguf/grammar` constrains sampling to a grammar: a `GbnfBuilder`/`GbnfParser` pair runs GBNF grammars (`Grammar`, `GrammarLimits`), and a `ConstraintSpec` selects the kind — `GBNF`, `JSON_SCHEMA` (compiled by `JsonSchemaToGbnf`), `JSON_OBJECT`, `REGEX` (compiled by `RegexToGbnf`), `CHOICE` and `STRUCTURAL_TAG`. The constraint runs as the `GrammarStage` of the sampler chain (`Sampler.create(config, bannedTokens, extra, vocab)`), which masks every token the grammar cannot accept next and advances on each accepted token; a completed rule admits the end-of-generation tokens again. The engine routes it through `BatchEngine.submit(..., constraint)` (compiled at submit, so an invalid spec throws to the caller) and the server exposes it as `grammar`, `guided_json`, `guided_regex` and `guided_choice`. Structural-tag specs parse no input yet ([GAPS.md](GAPS.md)).
 
 ## Paged KV memory
 
