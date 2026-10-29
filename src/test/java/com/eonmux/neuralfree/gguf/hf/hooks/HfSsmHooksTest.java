@@ -95,13 +95,15 @@ public class HfSsmHooksTest {
         // Mamba-1: pad 8, Mamba-2: pad 16 (mamba.py:29-36, :128-141)
         Map<String, Object> one = vocab("{'architectures': ['MambaForCausalLM'], " + MAMBA_BASE + "}",
                 "MambaForCausalLM", tmp.getRoot().toPath());
-        assertEquals("gpt-neox", one.get(GgufKeys.TOKENIZER_MODEL));
-        assertEquals("gpt_neox", one.get(GgufKeys.TOKENIZER_PRE));
+        // _set_vocab_builtin copies the builtin file's model ("gpt2") and falls back to the "mpt"
+        // pre-tokenizer when the file has no pre (base.py:2465-2477)
+        assertEquals("gpt2", one.get(GgufKeys.TOKENIZER_MODEL));
+        assertEquals("mpt", one.get(GgufKeys.TOKENIZER_PRE));
         assertEquals(16, size(one.get(GgufKeys.TOKENIZER_LIST)));
 
         Map<String, Object> two = vocab("{'architectures': ['Mamba2ForCausalLM'], " + MAMBA2_BASE + "}",
                 "Mamba2ForCausalLM", tmp.getRoot().toPath());
-        assertEquals("gpt-neox", two.get(GgufKeys.TOKENIZER_MODEL));
+        assertEquals("gpt2", two.get(GgufKeys.TOKENIZER_MODEL));
         assertEquals(16, size(two.get(GgufKeys.TOKENIZER_LIST)));
 
         Map<String, Object> padded = vocab("{'architectures': ['MambaForCausalLM'], " + MAMBA_BASE
@@ -124,7 +126,7 @@ public class HfSsmHooksTest {
         // Mamba-1 has no .v3 rule: the GPT-2 JSON, the SentencePiece model and the builtin follow
         Map<String, Object> one = vocab("{'architectures': ['MambaForCausalLM'], " + MAMBA_BASE + "}",
                 "MambaForCausalLM", dir);
-        assertEquals("gpt-neox", one.get(GgufKeys.TOKENIZER_MODEL));
+        assertEquals("gpt2", one.get(GgufKeys.TOKENIZER_MODEL));
     }
 
     // ------------------------------------------------------------------ metadata and tensors
@@ -133,7 +135,7 @@ public class HfSsmHooksTest {
     public void mambaMetaWritesTheDefaultSizesAndTheFalconMambaFlag() throws IOException {
         HfMetadata m = meta("{'architectures': ['MambaForCausalLM'], 'model_type': 'falcon_mamba', "
                 + MAMBA_BASE + "}");
-        assertEquals(1L << 20, m.get("mamba.context_length"));
+        assertEquals(1048576, m.get("mamba.context_length"));
         assertEquals(8, m.get("mamba.embedding_length"));
         assertEquals(16, m.get("mamba.ssm.state_size"));
         assertEquals(4, m.get("mamba.ssm.conv_kernel"));
@@ -156,14 +158,15 @@ public class HfSsmHooksTest {
                 .f32("backbone.layers.1.mixer.norm.weight", new long[]{8}, seq(8))
                 .f32("backbone.layers.1.mixer.dt_proj.bias", new long[]{2}, seq(2))
                 .f32("backbone.embeddings.weight", new long[]{16, 8}, seq(128)).index();
-        HfConfig cfg = c("{'architectures': ['Mamba2ForCausalLM'], " + MAMBA2_BASE + ", 'n_groups': 4}");
+        HfConfig cfg = c("{'architectures': ['Mamba2ForCausalLM'], " + MAMBA2_BASE + ", 'n_groups': 4, 'mamba_expand': 1}");
         Sink out = plan(context(cfg, e("Mamba2ForCausalLM"), index));
         assertArrayEquals(new long[]{4, 3}, out.get("blk.0.ssm_conv1d.weight").shape());
-        assertArrayEquals(new float[]{-1f, -1f * (float) Math.E}, floats(out.get("blk.0.ssm_a.weight")), 1e-4f);
-        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_a.weight").shape());
-        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_d.weight").shape());
+        // SSM_A / SSM_D templates carry no .weight (constants.py; mamba.py:192 appends only the trailing 1)
+        assertArrayEquals(new float[]{-1f, -1f * (float) Math.E}, floats(out.get("blk.0.ssm_a")), 1e-4f);
+        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_a").shape());
+        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_d").shape());
         assertArrayEquals(new long[]{4, 2}, out.get("blk.1.ssm_norm.weight").shape());
-        assertTrue(out.added.containsKey("blk.1.dt_proj.bias"));
+        assertTrue(out.added.containsKey("blk.1.ssm_dt.bias"));
         assertTrue(out.added.containsKey("token_embd.weight"));
     }
 
@@ -186,25 +189,26 @@ public class HfSsmHooksTest {
     public void falconH1FoldsTheMultipliersAndTheInProjRowSegments() throws IOException {
         ckpt = new Checkpoint(tmp.getRoot().toPath());
         HfTensorIndex index = ckpt
-                .f32("backbone.layers.0.mixer.in_proj.weight", new long[]{12, 2}, new float[24])
-                .f32("backbone.layers.0.mixer.out_proj.weight", new long[]{4, 4}, new float[16])
-                .f32("backbone.layers.0.mixer.down_proj.weight", new long[]{3, 4}, new float[12])
-                .f32("backbone.layers.0.mixer.k_proj.weight", new long[]{2, 4}, new float[8])
-                .f32("backbone.layers.0.mixer.norm.weight", new long[]{4}, new float[4])
-                .f32("model.embed_tokens.weight", new long[]{16, 4}, new float[64])
-                .f32("lm_head.weight", new long[]{4, 16}, new float[64]).index();
+                .f32("backbone.layers.0.mixer.in_proj.weight", new long[]{12, 2}, ones(24))
+                .f32("backbone.layers.0.mixer.out_proj.weight", new long[]{4, 4}, ones(16))
+                .f32("backbone.layers.0.mixer.down_proj.weight", new long[]{3, 4}, ones(12))
+                .f32("backbone.layers.0.mixer.k_proj.weight", new long[]{2, 4}, ones(8))
+                .f32("backbone.layers.0.mixer.norm.weight", new long[]{4}, ones(4))
+                .f32("model.embed_tokens.weight", new long[]{16, 4}, ones(64))
+                .f32("lm_head.weight", new long[]{4, 16}, ones(64)).index();
         HfConfig cfg = c("{'architectures': ['FalconH1ForCausalLM'], 'hidden_size': 4, 'num_hidden_layers': 2,"
-                + " 'vocab_size': 16, 'mamba_d_ssm': 4, 'n_groups': 1, 'mamba_d_state': 2, 'd_head': 4,"
+                + " 'vocab_size': 16, 'mamba_d_ssm': 4, 'mamba_n_groups': 1, 'mamba_d_state': 2, 'd_head': 4,"
                 + " 'mamba_d_head': 2, 'num_attention_heads': 2, 'num_key_value_heads': 1, 'intermediate_size': 3,"
                 + " 'max_position_embeddings': 32, 'rope_parameters': {'rope_theta': 10000.0},"
                 + " 'attention_in_multiplier': 2.0, 'ssm_in_multiplier': 3.0, 'ssm_out_multiplier': 5.0,"
                 + " 'embedding_multiplier': 7.0, 'lm_head_multiplier': 11.0,"
                 + " 'mlp_multipliers': [13.0, 17.0], 'ssm_multipliers': [1, 2, 3, 4, 5]}");
         Sink out = plan(context(cfg, e("FalconH1ForCausalLM"), index));
-        // rows: [0,4) x1, [4,8) x2, [8,10) x3 (n_groups * d_state), [10,12) x4, no tail
+        // rows: [0,4) x1, [4,8) x2, [8,10) x3 (n_groups * d_state), [10,12) x4 — all × ssm_in_multiplier 3
         float[] want = new float[24];
+        float[] multiplier = {1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4};
         for (int r = 0; r < 12; r++) {
-            want[2 * r] = want[2 * r + 1] = row(multiplier[r]);
+            want[2 * r] = want[2 * r + 1] = multiplier[r] * 3.0f;
         }
         float[] got = floats(out.get("blk.0.ssm_in.weight"));
         for (int r = 0; r < 12; r++) {
@@ -218,7 +222,11 @@ public class HfSsmHooksTest {
         assertArrayEquals(new long[]{1, 4}, out.get("blk.0.ssm_norm.weight").shape());
     }
 
-    private static float[] multiplier = {1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4};
+    private static float[] ones(int n) {
+        float[] v = new float[n];
+        java.util.Arrays.fill(v, 1f);
+        return v;
+    }
 
     private static float row(float v) {
         return v;
@@ -227,13 +235,14 @@ public class HfSsmHooksTest {
     @Test
     public void jambaWritesTheAttentionVectorAndMergesTheExperts() throws IOException {
         ckpt = new Checkpoint(tmp.getRoot().toPath());
+        // the collector plans the post-rename members (jamba.py:62-68 renames .moe. -> .feed_forward.)
         HfTensorIndex index = ckpt
-                .f32("model.layers.0.moe.experts.0.down_proj.weight", new long[]{4, 4}, seq(16))
-                .f32("model.layers.0.moe.experts.0.gate_proj.weight", new long[]{4, 4}, seq(16))
-                .f32("model.layers.0.moe.experts.0.up_proj.weight", new long[]{4, 4}, seq(16))
-                .f32("model.layers.0.moe.experts.1.down_proj.weight", new long[]{4, 4}, seq(16))
-                .f32("model.layers.0.moe.experts.1.gate_proj.weight", new long[]{4, 4}, seq(16))
-                .f32("model.layers.0.moe.experts.1.up_proj.weight", new long[]{4, 4}, seq(16)).index();
+                .f32("model.layers.0.feed_forward.experts.0.down_proj.weight", new long[]{4, 4}, seq(16))
+                .f32("model.layers.0.feed_forward.experts.0.gate_proj.weight", new long[]{4, 4}, seq(16))
+                .f32("model.layers.0.feed_forward.experts.0.up_proj.weight", new long[]{4, 4}, seq(16))
+                .f32("model.layers.0.feed_forward.experts.1.down_proj.weight", new long[]{4, 4}, seq(16))
+                .f32("model.layers.0.feed_forward.experts.1.gate_proj.weight", new long[]{4, 4}, seq(16))
+                .f32("model.layers.0.feed_forward.experts.1.up_proj.weight", new long[]{4, 4}, seq(16)).index();
         String json = "{'architectures': ['JambaForCausalLM'], 'hidden_size': 4, 'mamba_expand': 2,"
                 + " 'num_hidden_layers': 1, 'max_position_embeddings': 32, 'num_attention_heads': 2,"
                 + " 'num_key_value_heads': 1, 'intermediate_size': 5, 'attn_layer_offset': 0,"
@@ -264,11 +273,12 @@ public class HfSsmHooksTest {
         HfConfig cfg = c("{'architectures': ['Plamo2ForCausalLM'], 'num_hidden_layers': 1, 'vocab_size': 8}");
         Sink out = plan(context(cfg, e("Plamo2ForCausalLM"), index));
         assertArrayEquals(new float[]{2, 3, 4, 5}, floats(out.get("blk.0.attn_norm.weight")), 1e-5f);
-        assertArrayEquals(new float[]{1.2f, 2.2f, 3.2f, 4.2f},
-                floats(out.get("blk.0.post_attention_norm.weight")), 1e-5f);
+        // the converter's ATTN_POST_NORM / FFN_POST_NORM templates carry no .weight (constants.py:1583, 1593)
+        assertArrayEquals(new float[]{1.2f, 2.2f, 3.2f, 4.2f}, floats(out.get("blk.0.post_attention_norm")), 1e-5f);
         float mlpTail = 1f + (float) (1.0 / Math.pow(5.0, 1.5));
-        assertEquals(mlpTail, floats(out.get("blk.0.post_ffn_norm.weight"))[0], 1e-5f);
-        assertArrayEquals(new float[]{5, 6, 7, 8}, floats(out.get("blk.0.ssm_conv1d.weight")), 1e-5f);
-        assertTrue(out.added.containsKey("blk.0.dt_proj.bias"));
+        assertEquals(mlpTail, floats(out.get("blk.0.post_ffw_norm"))[0], 1e-5f);
+        assertArrayEquals(new float[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+                floats(out.get("blk.0.ssm_conv1d.weight")), 1e-5f);
+        assertTrue(out.added.containsKey("blk.0.ssm_dt.bias"));
     }
 }

@@ -215,6 +215,9 @@ public final class HfDenseHooksA {
                     + " sparsity fractions, got " + (v == null ? "nothing" : v.getClass().getSimpleName()));
         }
         List<?> pattern = (List<?>) v;
+        if (pattern.isEmpty()) {
+            throw new GgufFormatException(cfg.source() + ": 'activation_sparsity_pattern' must not be empty");
+        }
         List<Float> out = new ArrayList<>(pattern.size());
         for (int i = 0; i < pattern.size(); i++) {
             Object p = pattern.get(i);
@@ -259,7 +262,8 @@ public final class HfDenseHooksA {
 
     /** The standard normal CDF of {@code x}, through the complementary error function. */
     private static double phi(double x) {
-        return 0.5 * erfc(x / Math.sqrt(2.0));
+        // the normal CDF: 0.5 * erfc(-x / sqrt(2)) — a positive argument gives the upper tail instead
+        return 0.5 * erfc(-x / Math.sqrt(2.0));
     }
 
     /** The scaling {@code 1/sqrt(2*pi)} of the normal CDF's derivative. */

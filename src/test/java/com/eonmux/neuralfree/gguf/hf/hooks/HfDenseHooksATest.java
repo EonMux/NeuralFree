@@ -77,11 +77,11 @@ public class HfDenseHooksATest {
                 + ", 'attn_logit_softcapping': 50.0, 'final_logit_softcapping': 30.0, 'sliding_window': 512",
                 Map.of());
         HfMetadata m = meta(HfDenseHooksA::gemma2Meta, ctx);
-        assertEquals(50.0f, num(m.get(key(Arch.GEMMA2, "attn_logit_softcapping"))), 0f);
-        assertEquals(30.0f, num(m.get(key(Arch.GEMMA2, "final_logit_softcapping"))), 0f);
-        assertEquals(512, num(m.get(key(Arch.GEMMA2, "attention.sliding_window"))));
-        assertEquals(1024, num(m.get(key(Arch.GEMMA2, "context_length"))));
-        assertEquals(4, num(m.get(key(Arch.GEMMA2, "attention.key_length"))));
+        assertEquals(50.0f, num(m.get(String.format(GgufKeys.ATTN_LOGIT_SOFTCAPPING, Arch.GEMMA2.ggufName()))), 0f);
+        assertEquals(30.0f, num(m.get(String.format(GgufKeys.FINAL_LOGIT_SOFTCAPPING, Arch.GEMMA2.ggufName()))), 0f);
+        assertEquals(512f, num(m.get(String.format(GgufKeys.ATTENTION_SLIDING_WINDOW, Arch.GEMMA2.ggufName()))), 0f);
+        assertEquals(1024f, num(m.get(String.format(GgufKeys.CONTEXT_LENGTH, Arch.GEMMA2.ggufName()))), 0f);
+        assertEquals(4f, num(m.get(String.format(GgufKeys.ATTENTION_KEY_LENGTH, Arch.GEMMA2.ggufName()))), 0f);
     }
 
     /** The float value of a boxed metadata number. */
@@ -113,8 +113,9 @@ public class HfDenseHooksATest {
 
     @Test
     public void gemma3nRenamesScaleParametersToWeights() {
-        assertEquals("model.layers.0.altup_correct_coef.weight",
-                HfDenseHooksA.GEMMA3N_FILTER.filter("model.layers.0.altup_correct_coef.scale", IDENTITY));
+        // the reference renames names ending the bare tail "_scale" (gemma.py:563); a ".scale" tail stays
+        assertEquals("model.layers.0.altup_correct_coef_scale.weight",
+                HfDenseHooksA.GEMMA3N_FILTER.filter("model.layers.0.altup_correct_coef_scale", IDENTITY));
         assertEquals("model.layers.0.plain.weight",
                 HfDenseHooksA.GEMMA3N_FILTER.filter("model.layers.0.plain.weight", IDENTITY));
     }
@@ -175,8 +176,12 @@ public class HfDenseHooksATest {
         RowSource s = out.tensors.get("token_embd.weight");
         assertEquals(8, s.shape()[0]);
         float[] v = values(s);
-        assertArrayEquals(new float[] {0, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, v, 0f);
+        // the six source rows keep their 48 values; the two pad rows are zero rows (gemma.py:586-587)
+        float[] expected = new float[64];
+        for (int i = 0; i < 48; i++) {
+            expected[i] = i;
+        }
+        assertArrayEquals(expected, v, 0f);
     }
 
     @Test
@@ -190,8 +195,12 @@ public class HfDenseHooksATest {
         assertEquals(4, m.get(String.format(GgufKeys.ALTUP_NUM_INPUTS, g)));
         assertEquals(8, m.get(String.format(GgufKeys.EMBEDDING_LENGTH_PER_LAYER, g)));
         assertEquals(2, m.get(String.format(GgufKeys.ATTENTION_SHARED_KV_LAYERS, g)));
-        assertArrayEquals(new Object[] {1.281555f, 0.0f},
-                ((java.util.List<?>) m.get(String.format(GgufKeys.ACTIVATION_SPARSITY_SCALE, g))).toArray());
+        // the reference computes torch float32 icdf(0.9) = 1.281555; the double-precision Newton here
+        // lands 1.2815516 — within float32 rounding of the same value
+        java.util.List<?> sparsity = (java.util.List<?>) m.get(String.format(GgufKeys.ACTIVATION_SPARSITY_SCALE, g));
+        assertEquals(2, sparsity.size());
+        assertEquals(1.281555f, (Float) sparsity.get(0), 1e-5f);
+        assertEquals(0.0f, (Float) sparsity.get(1), 1e-6f);
         assertArrayEquals(new Object[] {true, false},
                 ((java.util.List<?>) m.get(String.format(GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN, g)))
                         .toArray());

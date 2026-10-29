@@ -187,16 +187,16 @@ public final class HfSsmHooks {
         RowSource s = hfName.endsWith(".A_log") ? ElementTransforms.negExp(src) : src;
         String gguf = ctx.names().mapOrThrow(hfName);
         int bid = HfLoadContext.bidOf(hfName);
-        if (ctx.names().matches(gguf, TensorNames.SSM_CONV1D, bid, WEIGHT)) {
+        if (ctx.names().matches(gguf, "SSM_CONV1D", bid, WEIGHT)) {
             s = ElementTransforms.squeezeConv(s);
         }
         AtomicReference<RowSource> tokEmbd = ctx.state(TOK_EMBD_STATE, AtomicReference.class, AtomicReference::new);
         if (tokEmbd.get() != null) {
-            if (ctx.names().matches(gguf, TensorNames.OUTPUT, -1, WEIGHT) && equalValues(tokEmbd.get(), s)) {
+            if (ctx.names().matches(gguf, "OUTPUT", -1, WEIGHT) && equalValues(tokEmbd.get(), s)) {
                 out.drop(hfName, "equals token_embd byte for byte (mamba.py:95)");
                 return;
             }
-        } else if (ctx.names().matches(gguf, TensorNames.TOKEN_EMBD, -1, WEIGHT)) {
+        } else if (ctx.names().matches(gguf, "TOKEN_EMBD", -1, WEIGHT)) {
             tokEmbd.set(s);
         }
         out.add(gguf, s);
@@ -364,12 +364,12 @@ public final class HfSsmHooks {
         String gguf = ctx.names().mapOrThrow(hfName);
         int bid = HfLoadContext.bidOf(hfName);
         RowSource s = src;
-        if (ctx.names().matches(gguf, TensorNames.SSM_CONV1D, bid, WEIGHT)) {
+        if (ctx.names().matches(gguf, "SSM_CONV1D", bid, WEIGHT)) {
             s = ElementTransforms.squeezeConv(s);
-        } else if (ctx.names().matches(gguf, TensorNames.SSM_A, bid, "")
-                || ctx.names().matches(gguf, TensorNames.SSM_D, bid, "")) {
+        } else if (ctx.names().matches(gguf, "SSM_A", bid, "")
+                || ctx.names().matches(gguf, "SSM_D", bid, "")) {
             s = reshapeAppendOne(s);
-        } else if (ctx.names().matches(gguf, TensorNames.SSM_NORM, bid, WEIGHT)) {
+        } else if (ctx.names().matches(gguf, "SSM_NORM", bid, WEIGHT)) {
             s = ElementTransforms.reshape(s, groupShape(ctx.config(), mamba2InnerSize(ctx.config()),
                     "n_groups", null));
         }

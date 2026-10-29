@@ -307,7 +307,7 @@ public final class HfSsmHooksA {
         }
         RowSource s = name.endsWith(".A_log") ? ElementTransforms.negExp(src) : src;
         String gguf = ctx.names().mapOrThrow(name);
-        if (ctx.names().matches(gguf, TensorNames.SSM_CONV1D, bid, HfSsmHooks.WEIGHT)) {
+        if (ctx.names().matches(gguf, "SSM_CONV1D", bid, HfSsmHooks.WEIGHT)) {
             s = ElementTransforms.squeezeConv(s);
         }
         out.add(gguf, s);
