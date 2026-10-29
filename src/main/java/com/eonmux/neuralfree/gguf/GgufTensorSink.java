@@ -163,7 +163,9 @@ public interface GgufTensorSink extends AutoCloseable {
                         Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
                     }
                 } else {
-                    Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
+                    // A plain move, not ATOMIC_MOVE: the atomic move flag replaces an existing target on
+                    // rename(2) platforms, which would break the overwrite refusal this sink promises.
+                    Files.move(tmp, target);
                 }
                 renamed = true;
             } finally {
