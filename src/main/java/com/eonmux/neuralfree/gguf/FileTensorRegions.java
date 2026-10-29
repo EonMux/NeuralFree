@@ -161,7 +161,11 @@ public final class FileTensorRegions implements TensorRegions {
      */
     private ByteBuffer readAligned(FileChannel ch, GGUFTensorInfo info, long start, int length) throws IOException {
         long alignedStart = start & ~((long) SECTOR - 1);
-        int alignedLength = SECTOR * (int) ((start - alignedStart + length + SECTOR - 1) / SECTOR);
+        // the aligned window may cross the end of the file (the last tensor of a file, a tiny test model);
+        // the channel reads only the sectors that exist
+        long window = Math.min(SECTOR * ((start - alignedStart + length + SECTOR - 1) / SECTOR),
+                ch.size() - alignedStart);
+        int alignedLength = (int) window;
         ByteBuffer aligned;
         try {
             aligned = ByteBuffer.allocateDirect(alignedLength);
@@ -177,6 +181,7 @@ public final class FileTensorRegions implements TensorRegions {
         }
         aligned.flip();
         int rel = (int) (start - alignedStart);
+        aligned.limit(rel + length);
         aligned.position(rel);
         return aligned.slice();
     }
