@@ -23,6 +23,11 @@ configurations.all {
     exclude group: 'io.netty.incubator'
 }
 
+// Full exception format for the message-last test style: the assertions name the mismatch.
+tasks.withType(Test).configureEach {
+    testLogging { exceptionFormat = 'full' }
+}
+
 // Writes the server's resolved compile classpaths for srvjavac.sh (PARITY §4): the isolated
 // per-WP compile keeps server WPs of one stage independent, as nfjavac.sh does for core WPs.
 task writeServerClasspath {

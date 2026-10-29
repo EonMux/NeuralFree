@@ -114,8 +114,13 @@ public class OpenAiResourceTest {
 
     @Test
     void aChatCompletionAnswersWithAnAssistantMessage() {
-        Response response = resource.chatCompletions("""
+        Response response;
+        try {
+            response = resource.chatCompletions("""
                 {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "temperature": 0}""");
+        } catch (WebApplicationException e) {
+            throw new AssertionError("sequence failed: " + e.getResponse().getEntity(), e);
+        }
         assertEquals(200, response.getStatus());
         JsonView body = view(response.getEntity());
         assertEquals("chat.completion", body.str("object"));
