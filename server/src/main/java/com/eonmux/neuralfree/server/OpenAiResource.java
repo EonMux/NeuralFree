@@ -39,9 +39,9 @@ import java.util.concurrent.TimeUnit;
  * {@link SamplerConfig} (only present keys leave the llama.cpp defaults); the grammar settings map onto
  * {@link ConstraintSpec} kinds ({@code grammar}, {@code guided_json}, {@code guided_regex}, {@code guided_choice}).
  *
- * <p>Refusals carry the gap by name: {@code n} above 1, {@code logit_bias} (the sampler has no additive token
- * biases), a prompt array (one prompt per request; the batch engine runs requests, not prompt batches) and image
- * or audio message parts (the projector epic).
+ * <p>Refusals carry the gap by name: {@code n} above 1, a prompt array (one prompt per request; the batch engine
+ * runs requests, not prompt batches) and image or audio message parts (the projector epic). {@code logit_bias}
+ * maps onto the sampler's first stage (additive biases; {@code -100} and below ban).
  *
  * <p>Finish reasons: {@code stop} for an end-of-generation token, a stop string or a cancellation; {@code length}
  * for the token budget or a full context. Reasoning output of the chat template's parser streams as
@@ -268,9 +268,28 @@ public class OpenAiResource {
             throw badRequest("n = " + n + " is refused: one choice per request (the engine runs requests,"
                     + " not choice batches)");
         }
+        Map<Integer, Float> logitBias = new LinkedHashMap<>();
         if (body.has("logit_bias")) {
-            throw badRequest("logit_bias is refused: the sampler has no additive token biases"
-                    + " (BiasStage bans token ids only)");
+            Object rawBias = body.raw("logit_bias");
+            if (!(rawBias instanceof Map<?, ?> biasMap)) {
+                throw badRequest("logit_bias must be an object of token id to bias");
+            }
+            for (Map.Entry<?, ?> e : biasMap.entrySet()) {
+                int id;
+                try {
+                    id = Integer.parseInt(String.valueOf(e.getKey()).trim());
+                } catch (NumberFormatException parse) {
+                    throw badRequest("logit_bias key '" + e.getKey() + "' is not a token id");
+                }
+                if (id < 0) {
+                    throw badRequest("logit_bias token id " + id + " is negative");
+                }
+                double bias = e.getValue() instanceof Number num ? num.doubleValue() : Double.NaN;
+                if (!Double.isFinite(bias) || bias < -100.0 || bias > 100.0) {
+                    throw badRequest("logit_bias value of token " + id + " must be a number in [-100, 100]");
+                }
+                logitBias.put(id, (float) bias);
+            }
         }
         GenerationRequest.Builder builder = GenerationRequest.builder();
         int maxTokens = body.has("max_completion_tokens") ? body.optI32("max_completion_tokens", -1)
@@ -314,6 +333,9 @@ public class OpenAiResource {
         }
         builder.badWords(badWords);
         builder.minTokens(Math.max(0, body.optI32("min_tokens", 0)));
+        if (!logitBias.isEmpty()) {
+            builder.logitBias(logitBias);
+        }
         builder.sampler(samplerConfig(body));
         return builder.build();
     }

@@ -197,13 +197,24 @@ public class OpenAiResourceTest {
         assertEquals(400, statusOf(() -> resource.completions(
                 "{\"prompt\": \"x\", \"n\": 2}")));
         assertEquals(400, statusOf(() -> resource.completions(
-                "{\"prompt\": \"x\", \"logit_bias\": {\"6\": -100}}")));
+                "{\"prompt\": \"x\", \"logit_bias\": {\"6\": -101}}")));
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": \"x\", \"logit_bias\": {\"cat\": -100}}")));
         assertEquals(400, statusOf(() -> resource.completions(
                 "{\"prompt\": [\"a\", \"b\"]}")));
         assertEquals(400, statusOf(() -> resource.chatCompletions(
                 "{\"messages\": \"nope\"}")));
         WebApplicationException unloadedModels = waeOf(() -> new OpenAiResource(unloaded).models());
         assertEquals(503, unloadedModels.getResponse().getStatus());
+    }
+
+    @Test
+    void logitBiasRunsThroughTheSamplerStage() {
+        Response response = resource.completions("""
+                {"prompt": "hello", "max_tokens": 4, "temperature": 0.9, "seed": 7,
+                 "logit_bias": {"6": -100, "7": 2.5}}""");
+        assertEquals(200, response.getStatus());
+        assertNotNull(firstChoice(view(response.getEntity())).str("text"));
     }
 
     @Test

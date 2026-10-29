@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.SplittableRandom;
 import java.util.concurrent.ThreadLocalRandom;
@@ -74,14 +75,15 @@ public final class Sampler {
     private final Candidates cur = new Candidates();
     private SplittableRandom rng;
 
-    private Sampler(int[] banned, SamplerConfig config, long seed, boolean greedy, SamplerVocab vocab) {
+    private Sampler(int[] banned, int[] biasedIds, float[] biases, SamplerConfig config, long seed, boolean greedy,
+                    SamplerVocab vocab) {
         this.banned = banned;
         this.penalties = config.penaltiesEnabled();
         this.topK = config.topK();
         this.typicalP = config.typicalP();
         this.greedy = greedy;
         this.seed = seed;
-        this.biasStage = new BiasStage(banned);
+        this.biasStage = new BiasStage(banned, biasedIds, biases);
         this.chain = buildChain(config, seed, vocab);
         this.rng = new SplittableRandom(seed);
     }
@@ -170,7 +172,46 @@ public final class Sampler {
             }
         }
         long seed = config.seeded() ? config.seed() : randomSeed();
-        return new Sampler(banned, config, seed, config.isGreedy(), vocab);
+        return new Sampler(banned, new int[0], new float[0], config, seed, config.isGreedy(), vocab);
+    }
+
+    /**
+     * {@link #create(SamplerConfig, int[])} with the request's {@code logit_bias} map: every entry's token takes
+     * its bias added to the logit at the chain's first stage, before penalties, top-k and the rest see the set —
+     * llama.cpp's {@code llama_sampler_init_logit_bias} position. A token in both the banned ids and the map takes
+     * the {@code -inf} ban; the additive bias never reaches it.
+     *
+     * @throws IllegalArgumentException for a negative id or a non-finite bias
+     */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, Map<Integer, Float> logitBias) {
+        return create(config, bannedTokens, logitBias, null);
+    }
+
+    /** {@link #create(SamplerConfig, int[], Map)} with the vocabulary the DRY and infill stages read. */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, Map<Integer, Float> logitBias,
+                                 SamplerVocab vocab) {
+        Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(bannedTokens, "bannedTokens");
+        int[] ids = new int[logitBias == null ? 0 : logitBias.size()];
+        float[] biases = new float[ids.length];
+        int n = 0;
+        if (logitBias != null) {
+            for (Map.Entry<Integer, Float> e : logitBias.entrySet()) {
+                Objects.requireNonNull(e.getKey(), "a logit_bias key is null");
+                Objects.requireNonNull(e.getValue(), "the bias of token " + e.getKey() + " is null");
+                ids[n] = e.getKey();
+                biases[n] = e.getValue();
+                n++;
+            }
+        }
+        int[] banned = bannedTokens.clone();
+        for (int id : banned) {
+            if (id < 0) {
+                throw new IllegalArgumentException("banned token id " + id + " is negative");
+            }
+        }
+        long seed = config.seeded() ? config.seed() : randomSeed();
+        return new Sampler(banned, ids, biases, config, seed, config.isGreedy(), vocab);
     }
 
     /**
@@ -185,6 +226,40 @@ public final class Sampler {
     }
 
     /**
+     * {@link #create(SamplerConfig, int[], Map)} with the Java-API custom {@code extra} stages applied, in their
+     * list order, immediately before the temperature stage (or directly before the dist stage when the order has
+     * no temperature kind), so a custom stage always runs, including under greedy decoding.
+     *
+     * @throws IllegalArgumentException when {@code extra} or one of its entries is null
+     */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, Map<Integer, Float> logitBias,
+                                 List<SamplerStage> extra, SamplerVocab vocab) {
+        Objects.requireNonNull(extra, "extra stages");
+        Sampler sampler = create(config, bannedTokens, logitBias, vocab);
+        insertExtras(sampler, extra);
+        return sampler;
+    }
+
+    /** Inserts {@code extra} into {@code sampler}'s chain before its temperature stage. */
+    private static void insertExtras(Sampler sampler, List<SamplerStage> extra) {
+        for (SamplerStage stage : extra) {
+            if (stage == null) {
+                throw new IllegalArgumentException("extra stage list contains a null stage");
+            }
+        }
+        int insertAt = 0;
+        List<SamplerStage> chain = sampler.chain;
+        for (int i = 0; i < chain.size(); i++) {
+            if (chain.get(i).kind() == StageKind.TEMPERATURE) {
+                insertAt = i;
+                break;
+            }
+            insertAt = i + 1;
+        }
+        chain.addAll(insertAt, extra);
+    }
+
+    /**
      * {@link #create(SamplerConfig, int[], SamplerVocab)} with the Java-API custom {@code extra} stages applied, in
      * their list order, immediately before the temperature stage (or directly before the dist stage when the order
      * has no temperature kind), so a custom stage always runs, including under greedy decoding.
@@ -194,20 +269,8 @@ public final class Sampler {
     public static Sampler create(SamplerConfig config, int[] bannedTokens, List<SamplerStage> extra,
                                  SamplerVocab vocab) {
         Objects.requireNonNull(extra, "extra stages");
-        List<SamplerStage> stages = new ArrayList<>(extra);
-        if (stages.contains(null)) {
-            throw new IllegalArgumentException("extra stage list contains a null stage");
-        }
         Sampler sampler = create(config, bannedTokens, vocab);
-        int insertAt = 0;
-        for (int i = 0; i < sampler.chain.size(); i++) {
-            if (sampler.chain.get(i).kind() == StageKind.TEMPERATURE) {
-                insertAt = i;
-                break;
-            }
-            insertAt = i + 1;
-        }
-        sampler.chain.addAll(insertAt, stages);
+        insertExtras(sampler, extra);
         return sampler;
     }
 
@@ -232,7 +295,7 @@ public final class Sampler {
         long s = seed == SamplerConfig.RANDOM_SEED ? randomSeed() : seed;
         SamplerConfig config = SamplerConfig.builder().topK(topK).topP(topP).minP(0f).typicalP(1f)
                 .temperature(temperature).penaltyLastN(0).seed(s).build();
-        return new Sampler(NO_TOKENS, config, s, false, null);
+        return new Sampler(NO_TOKENS, new int[0], new float[0], config, s, false, null);
     }
 
     /**

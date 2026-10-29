@@ -165,7 +165,7 @@ public final class GenerationLoop {
         StopCriteria stop = StopCriteria.of(effective, tokenizer, reasoning);
         SamplerVocab vocab = Sampler.vocab(tokenizer);
         Sampler sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(),
-                RequestStages.of(effective, vocab), vocab);
+                effective.logitBias(), RequestStages.of(effective, vocab), vocab);
         String rendered = renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? renderedPrompt : stop.renderPrompt(prompt);
         SequenceRun seqRun = SequenceRun.over(effective, tokenizer)

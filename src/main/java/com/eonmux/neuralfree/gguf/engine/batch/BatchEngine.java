@@ -485,9 +485,11 @@ public final class BatchEngine implements AutoCloseable {
             stages.add(new GrammarStage(sub.grammar, vocab));
         }
         if (stages.isEmpty()) {
-            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(), vocab);
+            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(),
+                    effective.logitBias(), vocab);
         } else {
-            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(), stages, vocab);
+            sampler = Sampler.create(samplerConfig(effective.sampler(), nCtx), stop.bannedTokens(),
+                    effective.logitBias(), stages, vocab);
         }
         String rendered = sub.renderedPrompt != null || reasoning.mode() == ReasoningFilter.Mode.NONE
                 ? sub.renderedPrompt : stop.renderPrompt(sub.prompt);

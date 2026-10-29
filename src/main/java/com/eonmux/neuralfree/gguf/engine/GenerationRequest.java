@@ -5,7 +5,9 @@ import com.eonmux.neuralfree.gguf.TokenCallback;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
@@ -45,6 +47,7 @@ public final class GenerationRequest {
     private final BooleanSupplier cancellation;
     private final int logprobs;
     private final int minTokens;
+    private final Map<Integer, Float> logitBias;
 
     private GenerationRequest(Builder b) {
         this.maxNewTokens = b.maxNewTokens;
@@ -56,6 +59,7 @@ public final class GenerationRequest {
         this.cancellation = b.cancellation;
         this.logprobs = b.logprobs;
         this.minTokens = b.minTokens;
+        this.logitBias = Collections.unmodifiableMap(new LinkedHashMap<>(b.logitBias));
     }
 
     /**
@@ -91,6 +95,14 @@ public final class GenerationRequest {
 
     /** The generated-token minimum before end-of-generation tokens may be sampled (0 = off). */
     public int minTokens() { return minTokens; }
+
+    /**
+     * The request's {@code logit_bias} map: token id to the additive bias applied at the sampler's first stage
+     * (llama.cpp {@code llama_sampler_init_logit_bias}); empty when none. A bias of {@code -100} or below means
+     * ban to OpenAI clients — the caller translates that into the banned ids before the sampler sees it.
+     */
+    public Map<Integer, Float> logitBias() { return logitBias; }
+
     /** Whether a cancellation hook was supplied. */
     public boolean cancellable() { return cancellation != NEVER; }
 
@@ -107,7 +119,7 @@ public final class GenerationRequest {
     /** A builder holding these values; the token budget keeps its explicit or fallback state. */
     public Builder toBuilder() {
         Builder b = builder().sampler(sampler).stopStrings(stopStrings).badWords(badWords).ignoreEos(ignoreEos)
-                .cancellation(cancellation).logprobs(logprobs).minTokens(minTokens);
+                .cancellation(cancellation).logprobs(logprobs).minTokens(minTokens).logitBias(logitBias);
         return maxNewTokensExplicit ? b.maxNewTokens(maxNewTokens) : b.fallbackMaxNewTokens(maxNewTokens);
     }
 
@@ -147,6 +159,29 @@ public final class GenerationRequest {
         private int logprobs;
         private int minTokens;
         private List<String> badWords = new ArrayList<>();
+        private Map<Integer, Float> logitBias = new LinkedHashMap<>();
+
+        /** Copies {@code logitBias}; keys must be non-negative ids, values finite. */
+        public Builder logitBias(Map<Integer, Float> v) {
+            Objects.requireNonNull(v, "logitBias");
+            for (Map.Entry<Integer, Float> e : v.entrySet()) {
+                logitBias(e.getKey(), e.getValue());
+            }
+            return this;
+        }
+
+        /** Adds one {@code logit_bias} entry; the key must be a non-negative id, the value finite. */
+        public Builder logitBias(int tokenId, float bias) {
+            Objects.requireNonNull(bias, "bias");
+            if (tokenId < 0) {
+                throw new IllegalArgumentException("logit_bias token id " + tokenId + " is negative");
+            }
+            if (!Float.isFinite(bias)) {
+                throw new IllegalArgumentException("the bias of token " + tokenId + " is not finite");
+            }
+            this.logitBias.put(tokenId, bias);
+            return this;
+        }
         private BooleanSupplier cancellation = NEVER;
 
         private Builder() {
