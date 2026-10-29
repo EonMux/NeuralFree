@@ -33,8 +33,9 @@ This guide covers:
 9. [Paged KV memory](#paged-kv-memory)
 10. [Control vectors](#control-vectors)
 11. [imatrix](#imatrix)
-12. [System properties](#system-properties)
-13. [Troubleshooting](#troubleshooting)
+12. [Session files](#session-files)
+13. [System properties](#system-properties)
+14. [Troubleshooting](#troubleshooting)
 
 ## Build
 
@@ -676,20 +677,22 @@ The cache root follows llama.cpp's environment precedence (`HubCache`): `LLAMA_C
 
 ## nftool
 
-`demo/tools/NfTool` is the maintenance CLI. Two subcommands are implemented:
+`demo/tools/NfTool` is the maintenance CLI. Four subcommands are implemented:
 
 | Subcommand | Flags | Meaning |
 |---|---|---|
 | `export` | `--mode native\|compat\|compat-exact`, `--overwrite`, `--vocab-only`, `--split-max-tensors <n>`, `--split-max-size <n[K\|M\|G]>` | Write a model's GGUF view, as `--export-gguf` does |
 | `download` | the `--hf-repo` spec above | Download from the Hugging Face Hub into the cache root |
+| `imatrix` | `--file <fname>` (repeatable), `--out-file <fname>`, `--chunk-size <n>` | Collect importance-matrix statistics over calibration text (below) |
+| `cvector` | `--positive-file <fname>`, `--negative-file <fname>`, `--out-file <fname>`, `--method pca\|mean`, `--model-hint <arch>`, `--pca-batch <n>`, `--pca-iter <n>`, `--overwrite` | Train a control vector from prompt pairs over one loaded engine (below) |
 
-Every other listed subcommand (`quantize`, `imatrix`, `perplexity`, `results`, `bench`, `batched-bench`, `split`, `merge`, `export-lora`, `tokenize`, `dump`, `hash`, `embedding`, `retrieval`, `cvector`) refuses with a `not implemented yet` message naming the subcommand.
+Every other listed subcommand (`quantize`, `perplexity`, `results`, `bench`, `batched-bench`, `split`, `merge`, `export-lora`, `tokenize`, `dump`, `hash`, `embedding`, `retrieval`) refuses with a `not implemented yet` message naming the subcommand.
 
 ## HTTP server
 
 `server/` serves the OpenAI-compatible surface over the batch engine: `GET /v1/models`, `POST /v1/completions`, `POST /v1/chat/completions` (both with `stream: true` server-sent events ending in `data: [DONE]`), `POST /v1/embeddings`, `POST /v1/rerank`, plus the llama.cpp-native `GET /health` and `GET /props`. Start it with the model path property (`-Dneuralfree.server.model=<gguf path>`; every other setting reads its `neuralfree.*` property) after `./gradlew :server:build` — the build produces the uber-jar under `server/build/`. Without the property the server starts unloaded: `/health` reports the error and every model request refuses with 503.
 
-One `EngineService` opens the model and pumps its `BatchEngine` on one thread; requests queue FIFO and admitted sequences decode together over the paged memory (`neuralfree.parallel` slots). Sampling settings (`temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `max_tokens`) map onto `SamplerConfig` — only present keys leave the llama.cpp defaults. Chat bodies render through the model's template (`tokenizer.formatChat`); reasoning output streams as `reasoning_content` deltas. Refusals name the gap: `n` above 1, `logit_bias` (no additive token biases), prompt arrays (one prompt per request), and image or audio message parts. Finish reasons: `stop` (end of generation, stop string, cancellation) and `length` (token budget, full context).
+One `EngineService` opens the model and pumps its `BatchEngine` on one thread; requests queue FIFO and admitted sequences decode together over the paged memory (`neuralfree.parallel` slots). Sampling settings (`temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `max_tokens`, `min_tokens`, `bad_words`) map onto `SamplerConfig` and the request stages — only present keys leave the llama.cpp defaults. `logprobs: true` with `top_logprobs: n` (or llama.cpp's `n_probs`) requests the per-token distributions: the non-streamed responses carry the OpenAI `logprobs.content` shape, and a stream carries it per chunk alongside the delta. Chat bodies render through the model's template (`tokenizer.formatChat`); reasoning output streams as `reasoning_content` deltas. Refusals name the gap: `n` above 1, `logit_bias` (no additive token biases), prompt arrays (one prompt per request), and image or audio message parts. Finish reasons: `stop` (end of generation, stop string, cancellation) and `length` (token budget, full context).
 
 ## Grammar-constrained generation
 
@@ -705,11 +708,15 @@ The batch engine reuses computed prompts: a retired sequence stays in the paged 
 
 ## Control vectors
 
-`ops/heads/ControlVector` (with `ControlVectorExtra` and `CpuControlVectorExtra`) applies a control vector to the hidden states at inference. `CvectorGenerator` (`demo/tools`) generates the data side (PCA over prompt pairs) and writes the GGUF; its prefill loop is pending ([GAPS.md](GAPS.md)).
+`ops/heads/ControlVector` (with `ControlVectorExtra` and `CpuControlVectorExtra`) applies a control vector to the hidden states at inference. `nftool cvector` trains one (`CvectorGenerator`, llama.cpp's cvector-generator): it opens the model on the CPU engine, tokenizes every positive/negative prompt pair with the vocabulary's BOS policy, pads both sides to one length with the pad token llama.cpp derives (the last token of tokenizing a single space), and per pair prefills the positive side from position 0, switches the tap side, prefills the negative side and keeps the per-layer differences (the rows whose every value stays within 1e-6 drop, as llama.cpp's `filter_nonzero_rows` drops them). The tracked layers are all decoder layers except the last. The directions reduce by PCA power iteration or the row mean, and the export writes the llama.cpp `controlvector` GGUF form (`direction.<il>` tensors, `controlvector.model_hint` from `--model-hint` or the model's architecture).
 
 ## imatrix
 
-`quant/write/ImatrixFile` reads and writes llama.cpp importance-matrix files, both the GGUF form and the legacy `*.dat` form. No statistics collector runs in the engine yet ([GAPS.md](GAPS.md)).
+`nftool imatrix` collects importance-matrix statistics over a calibration run (llama.cpp's imatrix tool): it opens the model on the CPU engine, installs the global matmul-input tap (`CpuMatVec.observeGlobally` with `cpu/quant/ImatrixCollector`), prefills every non-empty line of every `--file` from position 0 (cache reset between lines) and writes the statistics through `quant/write/ImatrixFile.writeGguf` — per weight tensor the column sums of the squared activations (`<tensor>.in_sum2`) and the activation-row counts (`<tensor>.counts`), one matrix per expert of a MoE tensor, keyed by the stored GGUF names. The chunk counters record llama.cpp's accounting: `--chunk-size` (default 512) and `chunk_count` as `ceil(tokens / chunk-size)` over the lines. `ImatrixFile` also reads both llama.cpp forms, GGUF and legacy `.dat`, so a matrix either tool collected combines into a run.
+
+## Session files
+
+`HeapModelMemory.saveSession(path)` / `loadSession(path)` save and restore a decoding sequence, llama.cpp `llama_state_save_file`/`llama_state_load_file` style (`memory/cpu/SessionFile`): the stored tokens with their reuse frontier and wrap flag, every KV group's position mirror, the K/V row values of every owning cache layer and the live recurrent state tensors. A load checks the whole plan identity first (context, ubatch, group and layer geometry, cache dtypes, head shapes, tensor names), resets the memory and writes everything back, so the next decode continues the saved sequence with the same logits. The scope is the single-sequence CPU path: a paged memory, DSV4 compressed caches, the sparse side caches and target-model caches refuse by name ([GAPS.md](GAPS.md)). Snapshot shadows, compressor rollback planes and the sampler chain stay runtime-only.
 
 ## System properties
 

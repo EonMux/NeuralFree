@@ -95,12 +95,13 @@ It has not been validated by running models on GPU hardware. The limitations the
   - n-gram (simple, map, map-k4v, mod, cache) and suffix drafting from the prompt, with no draft file;
   - EAGLE-3 and EAGLE-1, the Gemma 4 assistant and DFlash drafters;
   - programmatic verify modes (`SpeculativeDecoder.Builder.verifyMode`).
-- **Grammar-constrained generation** (`gguf/grammar`): GBNF grammars, JSON schemas, JSON objects, regexes and choices compile into a sampler-chain stage (`ConstraintSpec`, `GrammarStage`); structural-tag parsing is pending.
+- **Grammar-constrained generation** (`gguf/grammar`): GBNF grammars, JSON schemas, JSON objects, regexes, choices and structural tags compile into a sampler-chain stage (`ConstraintSpec`, `GrammarStage`, `StructuralTag`).
 - **Serving:** the batch engine (`gguf/engine/batch`) runs parallel requests over the paged memory, and `server/` exposes the OpenAI-compatible HTTP surface (`/v1/completions`, `/v1/chat/completions` with SSE, `/v1/embeddings`, `/v1/rerank`, `/v1/models`) plus llama.cpp's `/health` and `/props`.
 - **Hugging Face Hub download** (`--hf-repo`, `nftool download`), with the llama.cpp cache-root precedence and `HF_TOKEN` auth.
 - **PyTorch pickle checkpoints** (`.bin`/`.pt`/`.pth`) load through a restricted unpickler that refuses unsafe opcodes by name.
-- **Control vectors** applied at inference (`ops/heads/ControlVector`); vector generation is pending.
-- **imatrix file I/O** (`quant/write/ImatrixFile`), llama.cpp GGUF and legacy `.dat` forms.
+- **Control vectors** applied at inference (`ops/heads/ControlVector`); `nftool cvector` trains them from prompt pairs over one loaded engine (`CvectorGenerator`).
+- **imatrix collection** (`nftool imatrix`): the CPU matmul inputs of a calibration run accumulate into llama.cpp imatrix files (`ImatrixCollector`, `quant/write/ImatrixFile` for the GGUF and legacy `.dat` forms).
+- **Session files** (`HeapModelMemory.saveSession`/`loadSession`): save and restore a decoding sequence — tokens, KV rows with their positions and the recurrent state — llama.cpp `llama_state_*` style.
 - **Programmatic chat requests** (`gguf/chat`) and the `SequenceRun` per-sequence stepping API (`engine/SequenceRun`).
 - **LoRA adapters** on the CPU and the GPU.
 - **llama.cpp tokenizers** (SentencePiece, BPE with 63 pre-tokenizers, Unigram, WordPiece, RWKV, PLaMo) and Jinja chat templates.
