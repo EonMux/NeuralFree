@@ -3,17 +3,26 @@ package com.eonmux.neuralfree.demo.tools;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.GGUFModel;
 import com.eonmux.neuralfree.gguf.GGUFValueType;
 import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
+import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.GgufEncoder;
 import com.eonmux.neuralfree.gguf.GgufTensorSink;
+import com.eonmux.neuralfree.gguf.engine.ContextFullException;
+import com.eonmux.neuralfree.gguf.engine.EngineConfig;
+import com.eonmux.neuralfree.gguf.engine.EngineModel;
+import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.HiddenTapSlot;
+import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
 import com.eonmux.neuralfree.gguf.engine.Observers;
 import com.eonmux.neuralfree.gguf.gpu.forward.ExecutionObserver;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.ops.heads.ControlVector;
+import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -25,6 +34,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.SplittableRandom;
@@ -64,8 +74,9 @@ import java.util.SplittableRandom;
  * </ul>
  * One deviation from llama.cpp: power iteration starts from a fixed seed ({@link #PCA_SEED}), so a run is reproducible
  * where llama.cpp seeds with {@code time(0)}; the PCA sign ambiguity llama.cpp documents unresolved stays unresolved
- * (pca.hpp: "The output vector is randomly inverted"). An {@code nftool cvector} invocation refuses past flag and
- * prompt validation until TL-4 lands: the prefill loop is the serving side, not this tool's data side.</p>
+ * (pca.hpp: "The output vector is randomly inverted"). The serving loop ({@link #generate}) opens the model on the
+ * CPU engine, whose hidden tap feeds {@link HiddenDiffTap}; the GPU event-tap route of {@link EventTap} stays open
+ * (GAPS.md).</p>
  */
 public final class CvectorGenerator {
 
@@ -90,7 +101,7 @@ public final class CvectorGenerator {
             + "  --model-hint <arch>              controlvector.model_hint of the export, the base model's arch\n"
             + "  --overwrite                      replace the output\n"
             + "  --help, -h                       this text\n"
-            + "The prefill loop that fills the taps over the model is the TL-4 serving side.\n";
+            + "The model runs on the CPU engine; the collection reads the CPU hidden tap.\n";
 
     private CvectorGenerator() {
     }
@@ -98,25 +109,23 @@ public final class CvectorGenerator {
     // ------------------------------------------------------------------ the tool entry
 
     /**
-     * Runs the tool with the launcher's arguments after {@code cvector} (LR-4 puts the route lines in its report, the
-     * stage's designated writer of {@code NfTool} adds them, §6.3). It validates the flags and both prompt files and
-     * then refuses with the landing named: the model prefill loop that fills the taps is TL-4's serving side.
+     * Runs the tool with the launcher's arguments after {@code cvector}. It validates the flags and both prompt
+     * files, runs the prefill loop over one loaded engine ({@link #generate}, the llama.cpp
+     * {@code get_hidden_layers} driver) and writes the control-vector GGUF.
      */
     static void run(String[] args) {
         try {
             Options o = parse(args);
-            List<String> positive = promptLines(o.positiveFile());
-            List<String> negative = promptLines(o.negativeFile());
-            if (positive.size() != negative.size()) {
-                throw new UsageException("--positive-file and --negative-file need the same number of entries, got "
-                        + positive.size() + " and " + negative.size());
+            if (o == null) {
+                return;
             }
-            if (positive.isEmpty()) {
-                throw new UsageException("must provide at least one prompt pair");
+            if (o.modelPath().isEmpty()) {
+                throw new UsageException("cvector needs a model path");
             }
-            throw new UsageException("the model prefill loop that fills the taps is TL-4's serving side; the data"
-                    + " plumbing (entries, Differences, HiddenDiffTap/EventTap, train, export) is complete and driven"
-                    + " over one loaded engine");
+            List<Entry> pairs = entries(Paths.get(o.positiveFile()), Paths.get(o.negativeFile()));
+            Path written = generate(o.modelPath(), pairs, o);
+            System.out.println("nftool cvector: wrote " + written + " from " + pairs.size() + " pairs, "
+                    + "method " + o.method().name().toLowerCase(Locale.ROOT));
         } catch (UsageException e) {
             System.err.println("Error: " + e.getMessage());
             System.err.print(USAGE);
@@ -125,6 +134,100 @@ public final class CvectorGenerator {
             System.err.println("Error: " + e.getMessage());
             System.exit(1);
         }
+    }
+
+    /**
+     * The prefill loop (llama.cpp {@code get_hidden_layers} over each padded pair, cvector-generator.cpp:344-352):
+     * opens {@code modelPath} on the CPU engine — the collection reads the CPU hidden tap through
+     * {@link HiddenDiffTap}, the route a CPU forward context fires — tokenizes every pair's sides with the
+     * vocabulary's BOS policy, pads both to one length with the pad token llama.cpp derives (the last token of
+     * tokenizing a single space, cvector-generator.cpp:289-294), and per pair runs one {@link Differences#beginPair},
+     * the positive prefill from position 0, the side switch, the negative prefill and {@link Differences#endPair},
+     * the cache reset between sides. Tracked layers are all decoder layers except the last (llama.cpp discards the
+     * last layer's {@code l_out}), the tap rows of one side arrive per forward call, so equal padded lengths give
+     * equal row counts per layer. The directions then reduce through {@link #train} and the export follows.
+     *
+     * @return the written GGUF ({@link #export})
+     * @throws IOException for an unreadable model or prompt file, a pair longer than the model's context fits, or
+     *                     an existing output without {@code --overwrite}
+     * @throws UsageException when the model path is missing, unreadable, or the model cannot serve the loop
+     */
+    static Path generate(String modelPath, List<Entry> pairs, Options o) throws IOException, UsageException {
+        if (modelPath == null || modelPath.isEmpty()) {
+            throw new UsageException("cvector needs a model path");
+        }
+        EngineConfig cfg = EngineConfig.builder().backend(EngineConfig.BackendMode.CPU).build();
+        try (EngineModel model = LLMModelFactory.open(modelPath, cfg)) {
+            ForwardBackend backend = model.forwardBackend();
+            if (backend.memory() == null || !(model instanceof GGUFModel)) {
+                throw new UsageException("the collection reads the CPU hidden tap; " + model.architecture()
+                        + " opened as " + model.getClass().getSimpleName() + " has none");
+            }
+            ModelSpec spec = model.spec();
+            int nLayer = spec.nLayer();
+            if (nLayer < 2) {
+                throw new UsageException(model.architecture() + " holds " + nLayer
+                        + " layers; llama.cpp discards the last layer's taps, so at least two are needed");
+            }
+            int width = spec.embedding().nEmbd();
+            int[] layers = new int[nLayer - 1];
+            for (int il = 0; il < layers.length; il++) {
+                layers[il] = il;
+            }
+            Differences diffs = new Differences(layers, width);
+            HiddenTapSlot.Lease lease = HiddenTapSlot.acquire(backend, "nftool cvector");
+            backend.setHiddenTap(new HiddenDiffTap(diffs));
+            try {
+                GGUFTokenizer tok = model.tokenizer();
+                int[] pad = padToken(tok);
+                for (int p = 0; p < pairs.size(); p++) {
+                    Entry pair = pairs.get(p);
+                    int[] pos = tok.encode(pair.positive());
+                    int[] neg = tok.encode(pair.negative());
+                    int len = Math.max(pos.length, neg.length);
+                    pos = padTo(pos, len, pad);
+                    neg = padTo(neg, len, pad);
+                    diffs.beginPair();
+                    try {
+                        backend.reset();
+                        backend.prefill(pos, 0);
+                        diffs.setSide(false);
+                        backend.reset();
+                        backend.prefill(neg, 0);
+                    } catch (ContextFullException e) {
+                        throw new IOException("pair " + (p + 1) + " pads to " + len
+                                + " tokens, more than the model's context fits: " + e.getMessage(), e);
+                    }
+                    diffs.endPair();
+                }
+            } finally {
+                backend.setHiddenTap(HiddenTap.NONE);
+                lease.close();
+                backend.reset();
+            }
+            String hint = o.modelHint().isEmpty() ? model.architecture() : o.modelHint();
+            List<float[]> directions = train(diffs, o);
+            return export(directions, width, hint, Paths.get(o.outFile()), o.overwrite());
+        }
+    }
+
+    /** The pad token of llama.cpp's padding: the last token of tokenizing one space, no BOS (or the pad id). */
+    private static int[] padToken(GGUFTokenizer tok) {
+        int[] space = tok.encode(" ", false, false);
+        return space.length > 0 ? new int[]{space[space.length - 1]} : new int[]{tok.padId()};
+    }
+
+    /** {@code tokens} padded with {@code pad} to {@code len} (llama.cpp {@code padding_seq}). */
+    private static int[] padTo(int[] tokens, int len, int[] pad) {
+        if (tokens.length >= len) {
+            return tokens;
+        }
+        int[] out = new int[len];
+        System.arraycopy(tokens, 0, out, 0, tokens.length);
+        for (int i = tokens.length; i < len; i++) {
+            out[i] = pad[0];
+        }
+        return out;
     }
 
     /**
@@ -179,8 +282,9 @@ public final class CvectorGenerator {
                     if (a.startsWith("-")) {
                         throw new UsageException("unknown option " + a + " (run with --help for the options)");
                     }
-                    // The positional model path: TL-4's serving loop resolves it through ModelSources.open, exactly as
+                    // The positional model path: the serving loop resolves it through ModelSources.open, exactly as
                     // the demos do; the data-side options name no model.
+                    o = o.toBuilder().modelPath(a).build();
                     break;
             }
         }
@@ -246,6 +350,7 @@ public final class CvectorGenerator {
         private final String positiveFile;
         private final String negativeFile;
         private final String outFile;
+        private final String modelPath;
         private final String modelHint;
         private final Method method;
         private final int pcaBatch;
@@ -253,8 +358,9 @@ public final class CvectorGenerator {
         private final float pcaTolerance;
         private final boolean overwrite;
 
-        private Options(String positiveFile, String negativeFile, String outFile, String modelHint, Method method,
-                        int pcaBatch, int pcaIterations, float pcaTolerance, boolean overwrite) {
+        private Options(String positiveFile, String negativeFile, String outFile, String modelPath,
+                        String modelHint, Method method, int pcaBatch, int pcaIterations, float pcaTolerance,
+                        boolean overwrite) {
             if (pcaBatch < 1) {
                 throw new IllegalArgumentException(PROP_PCA_BATCH + " must be at least 1, got " + pcaBatch);
             }
@@ -268,6 +374,7 @@ public final class CvectorGenerator {
             this.positiveFile = positiveFile;
             this.negativeFile = negativeFile;
             this.outFile = outFile;
+            this.modelPath = modelPath;
             this.modelHint = modelHint;
             this.method = method;
             this.pcaBatch = pcaBatch;
@@ -278,13 +385,13 @@ public final class CvectorGenerator {
 
         /** The llama.cpp defaults: PCA, batch 20, 1000 iterations, tolerance {@code 1e-7}. */
         public static Options defaults() {
-            return new Options("", "", DEFAULT_OUT, "", Method.PCA, 20, 1000, 1e-7f, false);
+            return new Options("", "", DEFAULT_OUT, "", "", Method.PCA, 20, 1000, 1e-7f, false);
         }
 
         public Builder toBuilder() {
             return new Builder().positiveFile(positiveFile).negativeFile(negativeFile).outFile(outFile)
-                    .modelHint(modelHint).method(method).pcaBatch(pcaBatch).pcaIterations(pcaIterations)
-                    .pcaTolerance(pcaTolerance).overwrite(overwrite);
+                    .modelPath(modelPath).modelHint(modelHint).method(method).pcaBatch(pcaBatch)
+                    .pcaIterations(pcaIterations).pcaTolerance(pcaTolerance).overwrite(overwrite);
         }
 
         /** The {@code neuralfree.cvector.*} properties; a blank value keeps the default. */
@@ -352,6 +459,7 @@ public final class CvectorGenerator {
         public String positiveFile() { return positiveFile; }
         public String negativeFile() { return negativeFile; }
         public String outFile() { return outFile; }
+        public String modelPath() { return modelPath; }
         public String modelHint() { return modelHint; }
         public Method method() { return method; }
         public int pcaBatch() { return pcaBatch; }
@@ -361,8 +469,9 @@ public final class CvectorGenerator {
 
         @Override
         public String toString() {
-            return "Options{" + positiveFile + " - " + negativeFile + " -> " + outFile + ", " + method + ", batch "
-                    + pcaBatch + ", iter " + pcaIterations + ", tol " + pcaTolerance + "}";
+            return "Options{" + (modelPath.isEmpty() ? "" : modelPath + ": ") + positiveFile + " - " + negativeFile
+                    + " -> " + outFile + ", " + method + ", batch " + pcaBatch + ", iter " + pcaIterations
+                    + ", tol " + pcaTolerance + "}";
         }
     }
 
@@ -371,6 +480,7 @@ public final class CvectorGenerator {
         private String positiveFile = "";
         private String negativeFile = "";
         private String outFile = DEFAULT_OUT;
+        private String modelPath = "";
         private String modelHint = "";
         private Method method = Method.PCA;
         private int pcaBatch = 20;
@@ -381,6 +491,7 @@ public final class CvectorGenerator {
         public Builder positiveFile(String v) { this.positiveFile = Objects.requireNonNull(v, "positiveFile"); return this; }
         public Builder negativeFile(String v) { this.negativeFile = Objects.requireNonNull(v, "negativeFile"); return this; }
         public Builder outFile(String v) { this.outFile = Objects.requireNonNull(v, "outFile"); return this; }
+        public Builder modelPath(String v) { this.modelPath = Objects.requireNonNull(v, "modelPath"); return this; }
         public Builder modelHint(String v) { this.modelHint = Objects.requireNonNull(v, "modelHint"); return this; }
         public Builder method(Method v) { this.method = Objects.requireNonNull(v, "method"); return this; }
         public Builder pcaBatch(int v) { this.pcaBatch = v; return this; }
@@ -389,8 +500,8 @@ public final class CvectorGenerator {
         public Builder overwrite(boolean v) { this.overwrite = v; return this; }
 
         public Options build() {
-            return new Options(positiveFile, negativeFile, outFile, modelHint, method, pcaBatch, pcaIterations,
-                    pcaTolerance, overwrite);
+            return new Options(positiveFile, negativeFile, outFile, modelPath, modelHint, method, pcaBatch,
+                    pcaIterations, pcaTolerance, overwrite);
         }
     }
 
@@ -930,6 +1041,7 @@ public final class CvectorGenerator {
                         + (long) nRows * nEmbd);
             }
             float[] square = new float[nEmbd * nEmbd];
+            boolean degenerate = true;
             for (int s = 0; s < nRows; s++) {
                 int base = s * nEmbd;
                 for (int a = 0; a < nEmbd; a++) {
@@ -937,11 +1049,15 @@ public final class CvectorGenerator {
                     if (x == 0.0f) {
                         continue;
                     }
+                    degenerate = false;
                     int rowOff = a * nEmbd;
                     for (int b = 0; b < nEmbd; b++) {
                         square[rowOff + b] += x * rows[base + b];
                     }
                 }
+            }
+            if (degenerate) {
+                throw new IllegalArgumentException("PCA of an all-zero row block has no principal component");
             }
             SplittableRandom rng = new SplittableRandom(PCA_SEED);
             float vSumSquares = 0.0f;

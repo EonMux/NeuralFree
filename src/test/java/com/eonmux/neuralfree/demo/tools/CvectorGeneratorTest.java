@@ -34,14 +34,14 @@ public class CvectorGeneratorTest {
     @Test
     public void entriesReadOnePairPerNonEmptyLineWithEscapes() throws Exception {
         Path pos = write("pos.txt", "happy day\\n", "", "line with \\t tab", "");
-        Path neg = write("neg.txt", "sad day", "", "other line", "skipped");
+        Path neg = write("neg.txt", "sad day", "", "other line", "");
         var pairs = CvectorGenerator.entries(pos, neg);
         assertEquals(2, pairs.size());
         assertEquals("happy day\n", pairs.get(0).positive());
         assertEquals("sad day", pairs.get(0).negative());
         assertEquals("line with \t tab", pairs.get(1).positive());
         assertEquals("other line", pairs.get(1).negative());
-        // The counts must agree; a lone positive entry is refused.
+        // The counts must agree after the empty lines drop; a lone positive entry is refused.
         Path one = write("one.txt", "just one\n");
         assertThrows(Exception.class, () -> CvectorGenerator.entries(one, neg));
         assertThrows(Exception.class, () -> CvectorGenerator.entries(pos, one));
@@ -71,7 +71,7 @@ public class CvectorGeneratorTest {
         CvectorGenerator.Differences unstarted = new CvectorGenerator.Differences(new int[]{0}, 4);
         assertThrows(IllegalStateException.class, () -> unstarted.addSide(0, new float[4], 1, 4));
         assertThrows(IllegalStateException.class, unstarted::endPair);
-        assertThrows(IllegalStateException.class, () -> d.setSide(false));
+        assertThrows(IllegalStateException.class, () -> unstarted.setSide(false));
     }
 
     @Test
@@ -86,13 +86,14 @@ public class CvectorGeneratorTest {
         d.addSide(0, neg, 3, 2);
         d.addSide(1, pos, 3, 2);
         d.endPair();
-        // Row 0 cancels (|v| <= 1e-6 for every element) and drops; rows 1 and 2 keep their order.
+        // Row 0's difference cancels (|v| <= 1e-6 for every element) and drops, as llama.cpp calc_diff's
+        // filter_nonzero_rows drops it; rows 1 and 2 keep their order.
         assertArrayEquals(new float[]{3, 4, 6, 8}, d.rowBlock(0), 0f);
         assertArrayEquals(new float[]{-3, -4, -6, -8}, d.rowBlock(1), 0f);
-        assertEquals(3, d.rows(0));
-        assertEquals(3, d.rows(1));
+        assertEquals(2, d.rows(0));
+        assertEquals(2, d.rows(1));
         assertEquals(1, d.pairs());
-        // A second pair appends to what the first kept.
+        // A second pair appends what it kept to what the first kept.
         float[] p2 = {10, 20, 30, 40};
         float[] n2 = {0, 0, 30, 40};
         d.beginPair();
@@ -103,7 +104,7 @@ public class CvectorGeneratorTest {
         d.addSide(1, n2, 2, 2);
         d.endPair();
         assertArrayEquals(new float[]{3, 4, 6, 8, 10, 20}, d.rowBlock(0), 0f);
-        assertEquals(4, d.rows(0));
+        assertEquals(3, d.rows(0));
         assertEquals(2, d.pairs());
     }
 
@@ -113,9 +114,8 @@ public class CvectorGeneratorTest {
         d.beginPair();
         d.addSide(0, new float[4], 2, 2);
         d.setSide(false);
-        assertThrows(IllegalStateException.class, () -> d.addSide(0, new float[2], 1, 2));
-        // Completing the pair repairs nothing: the mismatch is named, not padded.
         d.addSide(0, new float[2], 1, 2);
+        // Completing the pair names the mismatch, it pads nothing.
         assertThrows(IllegalStateException.class, d::endPair);
         // A side with no rows at all is its own error.
         CvectorGenerator.Differences e = new CvectorGenerator.Differences(new int[]{0}, 2);
@@ -136,17 +136,19 @@ public class CvectorGeneratorTest {
         d.addSide(0, new float[]{0, 6}, 1, 2);
         d.addSide(1, new float[]{1, 2, 3, 4, 5, 6}, 3, 2);
         d.endPair();
-        assertArrayEquals(new float[]{0, 2, 0, 0, 5, 0}, d.rowBlock(0), 0f);
+        // The middle row's difference cancels and drops; the chunks survive as rows in order.
+        assertArrayEquals(new float[]{0, 2, 5, 0}, d.rowBlock(0), 0f);
         assertArrayEquals(new float[]{-2, -4, -6, -8, -10, -12}, d.rowBlock(1), 0f);
     }
 
     @Test
     public void pcaFindsTheDominantAxisAndMeanTheRowMean() {
-        // Rows along x with a small y component: the top component is (near) the x axis.
+        // Rows along x with a small y component: the top component sits within half a percent of the x axis
+        // (the exact top eigenvector of X^T X here is (0.99917, 0.04066), as x and y are slightly correlated).
         float[] rows = {3, 0.2f, -4, -0.3f, 5, 0.1f, -6, -0.2f};
         float[] pc = CvectorGenerator.Pca.component(rows, 4, 2, 20, 1000, 1e-7f);
-        assertEquals(1f, Math.abs(pc[0]), 1e-4f);
-        assertTrue(Math.abs(pc[1]) < 0.05f);
+        assertTrue("the component points along x: " + Math.abs(pc[0]), Math.abs(pc[0]) > 0.999f);
+        assertTrue("the y share stays small: " + Math.abs(pc[1]), Math.abs(pc[1]) < 0.045f);
         assertThrows(IllegalArgumentException.class,
                 () -> CvectorGenerator.Pca.component(rows, 4, 2, 1, 0, 1e-7f));
         assertThrows(IllegalArgumentException.class,
@@ -199,8 +201,8 @@ public class CvectorGeneratorTest {
         assertArrayEquals(new int[]{1, 2}, f.layers());
         assertArrayEquals(new float[]{1, 0, 0, 0}, f.row(1), 0f);
         assertArrayEquals(new float[]{0, 1, 0, 0}, f.row(2), 0f);
-        // A gap layer reads zero, as llama.cpp's zero-filled span does.
-        assertArrayEquals(new float[]{0, 0, 0, 0}, f.row(5), 0f);
+        // A row outside the file's span reads empty (the loader zero-fills only gaps inside the span).
+        assertEquals(0, f.row(5).length);
         assertEquals("controlvector", f.metadata().get("general.architecture"));
         assertEquals("llama", f.metadata().get("controlvector.model_hint"));
         assertEquals("2", f.metadata().get("controlvector.layer_count"));
@@ -248,6 +250,44 @@ public class CvectorGeneratorTest {
         assertEquals(5, CvectorGenerator.Options.fromProperties(p).pcaBatch());
         p.setProperty(CvectorGenerator.Options.PROP_METHOD, "nope");
         assertThrows(IllegalArgumentException.class, () -> CvectorGenerator.Options.fromProperties(p));
+    }
+
+    @Test
+    public void theParserCarriesThePositionalModelPath() throws Exception {
+        CvectorGenerator.Options o = CvectorGenerator.parse(new String[]{
+                "model.gguf", "--positive-file", "p.txt", "--negative-file", "n.txt"});
+        assertEquals("model.gguf", o.modelPath());
+    }
+
+    @Test
+    public void generateRunsThePaddedPairsOverOneLoadedEngineAndExports() throws Exception {
+        Path model = com.eonmux.neuralfree.gguf.testutil.SyntheticModels.llama().writeTempFile();
+        Path pos = write("pos.txt", "the cat sits", "a dog runs");
+        Path neg = write("neg.txt", "the cat sleeps", "a dog waits");
+        Path out = tmp.getRoot().toPath().resolve("cv-engine.gguf");
+        CvectorGenerator.Options o = CvectorGenerator.parse(new String[]{
+                model.toString(),
+                "--positive-file", pos.toString(), "--negative-file", neg.toString(),
+                "--out-file", out.toString(), "--method", "mean", "--overwrite"});
+        var pairs = CvectorGenerator.entries(pos, neg);
+        Path written = CvectorGenerator.generate(model.toString(), pairs, o);
+        assertEquals(out, written);
+        // The synthetic llama has 2 layers; the last layer's tap is discarded, so one direction of n_embd.
+        ControlVector.File f = ControlVector.File.load(out.toString());
+        assertEquals(64, f.nEmbd());
+        assertEquals(1, f.maxLayer());
+        assertArrayEquals(new int[]{1}, f.layers());
+        assertEquals("llama", f.metadata().get("controlvector.model_hint"));
+        assertEquals(1.0f, norm(f.row(1)), 1e-5f);
+    }
+
+    /** Euclidean norm of a unit direction. */
+    private static float norm(float[] v) {
+        double sum = 0;
+        for (float x : v) {
+            sum += (double) x * x;
+        }
+        return (float) Math.sqrt(sum);
     }
 
     private Path write(String name, String... lines) throws Exception {
