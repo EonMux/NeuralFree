@@ -96,9 +96,10 @@ public class HfQuantParityTest {
         float scale0 = 0.25f;
         float scale1 = 0.5f;
         // GPTQ v1 (zero offset 1), symmetric: the stored zero nibbles are 7 = 8 - 1, so v = (c - 8) * scale.
+        // qzeros packs N outputs' zero nibbles 8-per-32-bit-word, one word for the two outputs here.
         Fx f = fixture();
         f.i32(M + ".qweight", new long[]{k / 8, n}, gptqQweight(codes, n, k));
-        f.i32(M + ".qzeros", new long[]{1, 2}, 0x77777777, 0x77777777);
+        f.i32(M + ".qzeros", new long[]{1, 1}, 0x77777777);
         f.f16(M + ".scales", new long[]{1, n}, scale0, scale1);
         RowSource w = IntGroupScheme.rewriteModules(
                 QuantArgs.builder(QuantFormat.INT_GPTQ).bits(4).group(32).gptqVersion(1).symmetric(true).build(),
@@ -127,7 +128,8 @@ public class HfQuantParityTest {
         }
         Fx f = fixture();
         f.i32(M + ".qweight", new long[]{k, n / 8}, qw);
-        f.f16(M + ".scales", new long[]{1, n}, 0.5f);
+        // AWQ scales are [K/group, N]: one scale per output channel of the single group
+        f.f16(M + ".scales", new long[]{1, n}, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f);
         RowSource w = IntGroupScheme.rewriteModules(
                 QuantArgs.builder(QuantFormat.INT_AWQ).bits(4).group(32).symmetric(true).build(),
                 List.of(M), cfg(), f.index(), ModelSourceOptions.defaults()).get(M + ".weight");
@@ -153,9 +155,10 @@ public class HfQuantParityTest {
         return out;
     }
 
-    /** The AWQ nibble slot of element {@code j % 8}. */
+    /** The AWQ slot that holds element {@code j % 8} of a word: vllm's reverse AWQ order
+     * [0, 4, 1, 5, 2, 6, 3, 7] (awq_triton.py:54-57). */
     private static int awqSlot(int i) {
-        return new int[]{0, 2, 4, 6, 1, 3, 5, 7}[i];
+        return new int[]{0, 4, 1, 5, 2, 6, 3, 7}[i];
     }
 
     // ------------------------------------------------------------------ FP8 (Fp8Scheme)
@@ -170,10 +173,18 @@ public class HfQuantParityTest {
         f.f32(M + ".weight_scale_inv", new long[]{1, 1}, 0.375f);
         RowSource w = Fp8Scheme.rewriteModules(QuantArgs.builder(QuantFormat.FP8).block(128, 128).build(),
                 List.of(M), cfg(), f.index(), ModelSourceOptions.defaults()).get(M + ".weight");
-        assertEquals(GGMLType.F8_E4M3_B128, w.format().ggmlType());
+        // per-tensor E4M3 rides as raw codes plus the output multiplier; folded it becomes F8_E4M3_B128
+        assertEquals(GGMLType.F8_E4M3, w.format().ggmlType());
+        assertArrayEquals(new float[]{0.375f}, w.outputScale(), 0f);
+        RowSource b128 = w.foldOutputScale();
+        assertEquals(GGMLType.F8_E4M3_B128, b128.format().ggmlType());
         float[] v = blockValues(w);
         for (int i = 0; i < codes.length; i++) {
-            assertEquals("fp8 element " + i, FpBlockDecoders.e4m3ToFp32(codes[i]) * 0.375f, v[i], 0f);
+            assertEquals("fp8 element " + i, FpBlockDecoders.e4m3ToFp32(codes[i]), v[i], 0f);
+        }
+        float[] folded = blockValues(b128);
+        for (int i = 0; i < codes.length; i++) {
+            assertEquals("fp8 folded element " + i, FpBlockDecoders.e4m3ToFp32(codes[i]) * 0.375f, folded[i], 0f);
         }
     }
 
@@ -201,10 +212,12 @@ public class HfQuantParityTest {
         RowSource w = Fp4Scheme.rewriteModules(QuantArgs.builder(QuantFormat.NVFP4_CT).build(),
                 List.of(M), cfg(), f.index(), ModelSourceOptions.defaults()).get(M + ".weight");
         assertEquals(GGMLType.NVFP4, w.format().ggmlType());
+        // the compressed-tensors global scale is a divisor: it rides along as the output multiplier 1/4
+        assertArrayEquals(new float[]{0.25f}, w.outputScale(), 0f);
         float[] v = blockValues(w);
         for (int i = 0; i < c.length; i++) {
             assertEquals("nvfp4 CT element " + i,
-                    FpBlockDecoders.e2m1ToFp32(c[i]) * FpBlockDecoders.e4m3ToFp32(subs[i / 16]) * 0.25f, v[i], 0f);
+                    FpBlockDecoders.e2m1ToFp32(c[i]) * FpBlockDecoders.e4m3ToFp32(subs[i / 16]), v[i], 0f);
         }
     }
 
@@ -242,7 +255,7 @@ public class HfQuantParityTest {
 
     @Test
     public void mxfp4GptOssBlocksDecodeLowNibbleFirstWithE8m0Scales() throws IOException {
-        int[] c = codes(64, 2);
+        int[] c = codes(128, 2);
         byte[] e = {(byte) 126, (byte) 127, (byte) 130, (byte) 1}; // scales 0.5, 1.0, 2.0, 2^4
         Fx f = fixture();
         f.add(P + "_blocks", StDType.U8, new long[]{1, 2, 2, 16}, packLowFirst(c));
@@ -267,8 +280,8 @@ public class HfQuantParityTest {
         int n = 2;
         int k = 64;
         int[] c = codes(n * k, 9);
-        // The stores of fp_quant are per-row E8M0 scales {0.5, 2.0}; global scale 4 gives outputScale 0.25.
-        byte[] scales = {(byte) 126, (byte) 128};
+        // fp_quant stores per-group E8M0 scales [n, k/32]: {0.5, 1.0 | 2.0, 4.0}; global scale 4 gives outputScale 0.25.
+        byte[] scales = {(byte) 126, (byte) 127, (byte) 128, (byte) 129};
         String json = "{'architectures':['A'],'quantization_config':{'quant_method':'fp_quant',"
                 + "'forward_dtype':'mxfp4','hadamard_group_size':32,'forward_method':'quest'}}";
         HfConfig config = Fx.config(tmp.getRoot().toPath(), json);
@@ -283,11 +296,13 @@ public class HfQuantParityTest {
         RowSource w = FpQuantScheme.rewriteModules(argsOf(config), List.of(M), config, f.index(),
                 ModelSourceOptions.defaults()).get(M + ".weight");
         assertEquals(GGMLType.MXFP4, w.format().ggmlType());
+        // the global scale rides as the output multiplier (1 / 4)
         assertArrayEquals(new float[]{0.25f}, w.outputScale(), 0f);
         float[] v = blockValues(w);
+        byte[] groups = scales;
         for (int i = 0; i < c.length; i++) {
-            float rowScale = i < k ? 0.5f : 2.0f;
-            assertEquals("fp_quant element " + i, e2m1Literal(c[i]) * rowScale * 0.25f, v[i], 0f);
+            float groupScale = FpBlockDecoders.e8m0ToFp32(groups[(i / k) * (k / 32) + (i % k) / 32] & 0xFF);
+            assertEquals("fp_quant element " + i, e2m1Literal(c[i]) * groupScale, v[i], 0f);
         }
     }
 
@@ -329,8 +344,9 @@ public class HfQuantParityTest {
         for (int i = 0; i < 16; i++) {
             map[i] = QuantTables.nf4Code(i);
         }
-        byte[] state = ("{'quant_type':'nf4','blocksize':128,'dtype':'bfloat16','shape':[" + n + "," + k
-                + "]}").getBytes(StandardCharsets.UTF_8);
+        // bitsandbytes serializes the quant state as plain JSON
+        byte[] state = ("{\"quant_type\":\"nf4\",\"blocksize\":128,\"dtype\":\"bfloat16\",\"shape\":[" + n + ","
+                + k + "]}").getBytes(StandardCharsets.UTF_8);
         Fx f = fixture();
         f.add(M + ".weight", StDType.U8, new long[]{(n * (long) k + 1) / 2, 1}, packHighFirst(c));
         f.f32(M + ".weight.absmax", new long[]{2}, absmax);
@@ -419,12 +435,13 @@ public class HfQuantParityTest {
     }
 
     /** The little-endian bytes of the int32 words. */
+    /** One byte per packed word: an HQQ 4-bit word of {@code per = 8 / bits} slots holds 8 bits. */
     private static byte[] bytesOf(int[] words) {
-        ByteBuffer b = ByteBuffer.allocate(4 * words.length).order(ByteOrder.LITTLE_ENDIAN);
-        for (int x : words) {
-            b.putInt(x);
+        byte[] out = new byte[words.length];
+        for (int i = 0; i < words.length; i++) {
+            out[i] = (byte) words[i];
         }
-        return b.array();
+        return out;
     }
 
     /** Every value of {@code s}, read in one pass and decoded through {@link CpuBlockDecoders}. */
