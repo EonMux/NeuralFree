@@ -33,11 +33,18 @@ public class GgufEncoderTest {
     private static final class KvName {
         final String key;
         final GGUFValueType type;
+        /** Element type of an ARRAY value; null for every other type. */
+        final GGUFValueType elementType;
         final Object value;
 
         KvName(String key, GGUFValueType type, Object value) {
+            this(key, type, null, value);
+        }
+
+        KvName(String key, GGUFValueType type, GGUFValueType elementType, Object value) {
             this.key = key;
             this.type = type;
+            this.elementType = elementType;
             this.value = value;
         }
     }
@@ -58,18 +65,19 @@ public class GgufEncoderTest {
         kv.add(new KvName("k.u64", GGUFValueType.UINT64, -1L));
         kv.add(new KvName("k.i64", GGUFValueType.INT64, -1L));
         kv.add(new KvName("k.f64", GGUFValueType.FLOAT64, 2.5));
-        kv.add(new KvName("k.au8", GGUFValueType.ARRAY, Arrays.asList(0, 1, 255)));
-        kv.add(new KvName("k.ai8", GGUFValueType.ARRAY, Arrays.asList(-1, 0, 1)));
-        kv.add(new KvName("k.au16", GGUFValueType.ARRAY, Arrays.asList(0, 1, 65535)));
-        kv.add(new KvName("k.ai16", GGUFValueType.ARRAY, Arrays.asList(-1, 0, 32767)));
-        kv.add(new KvName("k.au32", GGUFValueType.ARRAY, Arrays.asList(0L, 1L, 0xFFFFFFFFL)));
-        kv.add(new KvName("k.ai32", GGUFValueType.ARRAY, Arrays.asList(-1, 0, 2147483647)));
-        kv.add(new KvName("k.af32", GGUFValueType.ARRAY, Arrays.asList(-1.5f, 0.0f, 2.0f)));
-        kv.add(new KvName("k.abool", GGUFValueType.ARRAY, Arrays.asList(true, false, true)));
-        kv.add(new KvName("k.astr", GGUFValueType.ARRAY, Arrays.asList("a", "b\u00e9", "c")));
-        kv.add(new KvName("k.au64", GGUFValueType.ARRAY, Arrays.asList(-1L, 0L, 1L)));
-        kv.add(new KvName("k.ai64", GGUFValueType.ARRAY, Arrays.asList(Long.MIN_VALUE, 0L, Long.MAX_VALUE)));
-        kv.add(new KvName("k.af64", GGUFValueType.ARRAY, Arrays.asList(-1.25, 0.0, 2.5)));
+        kv.add(new KvName("k.au8", GGUFValueType.ARRAY, GGUFValueType.UINT8, Arrays.asList(0, 1, 255)));
+        kv.add(new KvName("k.ai8", GGUFValueType.ARRAY, GGUFValueType.INT8, Arrays.asList(-1, 0, 1)));
+        kv.add(new KvName("k.au16", GGUFValueType.ARRAY, GGUFValueType.UINT16, Arrays.asList(0, 1, 65535)));
+        kv.add(new KvName("k.ai16", GGUFValueType.ARRAY, GGUFValueType.INT16, Arrays.asList(-1, 0, 32767)));
+        kv.add(new KvName("k.au32", GGUFValueType.ARRAY, GGUFValueType.UINT32, Arrays.asList(0, 1, -1))); // -1 = 2^32 - 1
+        kv.add(new KvName("k.ai32", GGUFValueType.ARRAY, GGUFValueType.INT32, Arrays.asList(-1, 0, 2147483647)));
+        kv.add(new KvName("k.af32", GGUFValueType.ARRAY, GGUFValueType.FLOAT32, Arrays.asList(-1.5f, 0.0f, 2.0f)));
+        kv.add(new KvName("k.abool", GGUFValueType.ARRAY, GGUFValueType.BOOL, Arrays.asList(true, false, true)));
+        kv.add(new KvName("k.astr", GGUFValueType.ARRAY, GGUFValueType.STRING, Arrays.asList("a", "b\u00e9", "c")));
+        kv.add(new KvName("k.au64", GGUFValueType.ARRAY, GGUFValueType.UINT64, Arrays.asList(-1L, 0L, 1L)));
+        kv.add(new KvName("k.ai64", GGUFValueType.ARRAY, GGUFValueType.INT64,
+                Arrays.asList(Long.MIN_VALUE, 0L, Long.MAX_VALUE)));
+        kv.add(new KvName("k.af64", GGUFValueType.ARRAY, GGUFValueType.FLOAT64, Arrays.asList(-1.25, 0.0, 2.5)));
         return kv;
     }
 
@@ -112,7 +120,7 @@ public class GgufEncoderTest {
         GgufEncoder enc = new GgufEncoder(Channels.newChannel(out), "test file");
         enc.writeHeader(Channels.newChannel(out), 1, kv.size());
         for (KvName pair : kv) {
-            enc.writeKv(pair.key, pair.type, null, pair.value);
+            enc.writeKv(pair.key, pair.type, pair.elementType, pair.value);
         }
         int alignment = GgufTestWriter.DEFAULT_ALIGNMENT;
         enc.writeTensorInfo(new GGUFTensorInfo("w", new long[]{4}, GGMLType.F32, 0), 0);
