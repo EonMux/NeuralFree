@@ -27,6 +27,16 @@ public class ExtVecDotTest {
         GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB
     };
 
+    /**
+     * The full vec-dot registry: the sanitized deep-test types above plus the block types whose kernels are
+     * exercised where their fixtures live (E5M2 and the MXFP6 codes carry NaN patterns the raw random rows here
+     * do not sanitize).
+     */
+    private static final GGMLType[] REGISTRY_TYPES = {
+        GGMLType.F8_E4M3, GGMLType.F8_E5M2, GGMLType.F8_E4M3_B128, GGMLType.MXFP8,
+        GGMLType.MXFP6_E3M2, GGMLType.MXFP6_E2M3, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB
+    };
+
     /** Random blocks with finite scales, moderate E8M0 exponents and no E4M3 NaN codes. */
     private static ByteBuffer randomRows(GGMLType t, int rows, int cols, Random rnd) {
         BlockLayout layout = BlockLayout.of(t);
@@ -173,7 +183,7 @@ public class ExtVecDotTest {
 
     @Test
     public void registeredInCpuMatVecWithQ8_0Activations() {
-        assertEquals(EnumSet.copyOf(Arrays.asList(EXT_TYPES)), EnumSet.copyOf(ExtVecDot.supportedTypes()));
+        assertEquals(EnumSet.copyOf(Arrays.asList(REGISTRY_TYPES)), EnumSet.copyOf(ExtVecDot.supportedTypes()));
         for (GGMLType t : EXT_TYPES) {
             assertEquals(t.toString(), GGMLType.Q8_0, CpuActivationQuantizer.activationType(t));
             assertEquals(t.toString(), GGMLType.Q8_0, ExtVecDot.forType(t).activationType());
