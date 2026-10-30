@@ -58,9 +58,9 @@ public class HfMoeClassicHooksCTest {
         }
         // the chunked experts hold the other half of each expert's width
         for (int c = 0; c < nLocal / 2; c++) {
-            index.put("model.layers.0.mlp.experts.chunk_experts." + c + ".down_proj.weight", filled(c + 9, 8, 2));
-            index.put("model.layers.0.mlp.experts.chunk_experts." + c + ".gate_proj.weight", filled(c + 9, 2, 8));
-            index.put("model.layers.0.mlp.experts.chunk_experts." + c + ".up_proj.weight", filled(c + 9, 2, 8));
+            index.put("model.layers.0.mlp.chunk_experts." + c + ".down_proj.weight", filled(c + 9, 8, 2));
+            index.put("model.layers.0.mlp.chunk_experts." + c + ".gate_proj.weight", filled(c + 9, 2, 8));
+            index.put("model.layers.0.mlp.chunk_experts." + c + ".up_proj.weight", filled(c + 9, 2, 8));
         }
         index.put("model.layers.0.mlp.expert_bias", seq(4));
         HfLoadContext ctx = context(dir(), Arch.GROVEMOE, "GroveMoeForCausalLM", "'num_local_experts': 4", index, false);
@@ -77,17 +77,22 @@ public class HfMoeClassicHooksCTest {
     }
     @Test
     public void groveMoeLeftoversFailAndTheChunkCountNeedsAnEvenSplit() throws IOException {
-        Map<String, RowSource> index = Collections.singletonMap("model.layers.0.mlp.experts.0.down_proj.weight",
-                seq(8, 2));
+        Map<String, RowSource> index = new LinkedHashMap<>();
+        for (int x = 0; x < 4; x++) {
+            for (String part : new String[]{"down_proj", "gate_proj", "up_proj"}) {
+                index.put("model.layers.0.mlp.experts." + x + "." + part + ".weight", seq(2, 8));
+            }
+        }
         HfLoadContext ctx = context(dir(), Arch.GROVEMOE, "GroveMoeForCausalLM", "'num_local_experts': 4", index, false);
         RecordingSink sink = new RecordingSink();
+        // one member offered of the twelve planned: the leftovers fail the extra check
         HfMoeClassicHooksC.groveMoeTensors(ctx, "model.layers.0.mlp.experts.0.down_proj.weight",
                 ctx.index().get("model.layers.0.mlp.experts.0.down_proj.weight"), sink);
         assertThrows(GgufFormatException.class, () -> HfMoeClassicHooksC.groveMoeExtra(ctx, sink));
         HfLoadContext odd = context(dir(), Arch.GROVEMOE, "GroveMoeForCausalLM", "'num_local_experts': 3",
-                Collections.singletonMap("model.layers.0.mlp.experts.0.gate_proj.weight", seq(2, 8)), false);
+                Collections.singletonMap("model.layers.0.mlp.chunk_experts.0.gate_proj.weight", seq(2, 8)), false);
         assertThrows(GgufFormatException.class,
-                () -> HfMoeClassicHooksC.groveMoeTensors(odd, "model.layers.0.mlp.experts.chunk_experts.0.gate_proj.weight",
+                () -> HfMoeClassicHooksC.groveMoeTensors(odd, "model.layers.0.mlp.chunk_experts.0.gate_proj.weight",
                         seq(2, 8), new RecordingSink()));
     }
 
@@ -111,7 +116,8 @@ public class HfMoeClassicHooksCTest {
         }
         HfMoeClassicHooksC.k2HorizonExtra(ctx, sink);
         assertTrue(countKey(sink, "exp_probs_b") == 1 || countKey(sink, "exp_probs_b") == 2);
-        assertEquals(2, countKey(sink, "v_experts"));
+        // the GGUF name of ATTN_V_EXP is attn_v_exps (constants.py:2177)
+        assertEquals(2, countKey(sink, "attn_v_exps"));
     }
 
     @Test
@@ -150,7 +156,9 @@ public class HfMoeClassicHooksCTest {
         Map<String, RowSource> index = new LinkedHashMap<>();
         index.put("lm_head.weight", seq(4, 8));
         index.put("model.embed_tokens.weight", seq(4, 8));
-        index.put("model.layers.0.mlp.experts.0.down_proj.weight", seq(8, 2));
+        for (String part : new String[]{"down_proj", "gate_proj", "up_proj"}) {
+            index.put("model.layers.0.mlp.experts.0." + part + ".weight", seq(8, 2));
+        }
         HfLoadContext ctx = context(dir(), Arch.HUNYUAN_MOE, "HunYuanMoEV1ForCausalLM", "'tie_word_embeddings': true,"
                 + " 'num_local_experts': 1", index, false);
         RecordingSink sink = new RecordingSink();
@@ -164,14 +172,17 @@ public class HfMoeClassicHooksCTest {
 
     // ------------------------------------------------------------------ HYV3Model
 
-    private static final String HYV3_CONFIG = "'num_local_experts': 2, 'moe_intermediate_size': 4";
+    private static final String HYV3_CONFIG = "'num_local_experts': 2, 'moe_intermediate_size': 4,"
+            + " 'num_nextn_predict_layers': 1";
 
     @Test
     public void hyV3FilterDropsAndRenamesTheMtpLayers() throws IOException {
         HfLoadContext keep = context(dir(), Arch.HY_V3, "HYV3ForCausalLM", HYV3_CONFIG, Collections.emptyMap(), true);
         HfLoadContext drop = context(dir(), Arch.HY_V3, "HYV3ForCausalLM", HYV3_CONFIG, Collections.emptyMap(), false);
         assertNull(HfMoeClassicHooksC.hyV3Filter(drop).filter("model.layers.2.final_layernorm.weight", IDENTITY));
-        assertNull(HfMoeClassicHooksC.hyV3Filter(keep).filter("model.layers.2.mlp.experts.0.up_proj.weight", IDENTITY));
+        // with MTP kept, the reference drops only under no_mtp — the MTP block's tensors stay
+        assertEquals("model.layers.2.mlp.experts.0.up_proj.weight",
+                HfMoeClassicHooksC.hyV3Filter(keep).filter("model.layers.2.mlp.experts.0.up_proj.weight", IDENTITY));
         assertEquals("model.layers.2.shared_head.norm.weight",
                 HfMoeClassicHooksC.hyV3Filter(keep).filter("model.layers.2.final_layernorm.weight", IDENTITY));
         // a main-block norm stays untouched
@@ -194,8 +205,9 @@ public class HfMoeClassicHooksCTest {
             assertNull(HfMoeClassicHooksD.JANUS_FILTER.filter(drop + "fc.weight", IDENTITY));
         }
         assertNull(HfMoeClassicHooksD.SARASHINA_FILTER.filter("norm.weight", IDENTITY));
-        assertEquals("model.norm.weight",
-                HfMoeClassicHooksD.SARASHINA_FILTER.filter("llm.norm.weight", IDENTITY));
+        // the filter returns the stripped checkpoint name; the OUTPUT_NORM global row maps
+        // norm.weight to model.norm.weight at planning (tensor_patterns.tsv row 63)
+        assertEquals("norm.weight", HfMoeClassicHooksD.SARASHINA_FILTER.filter("llm.norm.weight", IDENTITY));
         // the llm. strip feeds the rest to the Llama filter, which keeps model-space names
         assertEquals("model.layers.0.self_attn.q_proj.weight",
                 HfMoeClassicHooksD.SARASHINA_FILTER.filter("llm.model.layers.0.self_attn.q_proj.weight", IDENTITY));

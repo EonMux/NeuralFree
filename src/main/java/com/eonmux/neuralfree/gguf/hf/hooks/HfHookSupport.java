@@ -192,6 +192,7 @@ public final class HfHookSupport {
     public static final class ExpertCollector {
 
         private static final Pattern MEMBER = Pattern.compile("^(.*\\.experts)\\.(\\d{1,9})\\.([^.]+)(\\..*)?$");
+        private Pattern memberRegex = MEMBER;
 
         private final int nExperts;
         private final List<String> parts;
@@ -224,6 +225,17 @@ public final class HfHookSupport {
          */
         public ExpertCollector(int nExperts, List<String> parts, Function<List<RowSource>, RowSource> stacker,
                                MergedName mergedName) {
+            this(nExperts, parts, stacker, mergedName, MEMBER);
+        }
+
+        /**
+         * A collector whose member names follow a custom pattern: the pattern must hold four groups —
+         * the expert-family prefix, the expert index, the part and the trailing tail.
+         *
+         * @param memberRegex the anchored member pattern (e.g. grove-moe's {@code mlp.chunk_experts.<x>}.)
+         */
+        public ExpertCollector(int nExperts, List<String> parts, Function<List<RowSource>, RowSource> stacker,
+                               MergedName mergedName, java.util.regex.Pattern memberRegex) {
             if (nExperts < 1 || nExperts > HfConfig.MAX_EXPERTS) {
                 throw new GgufFormatException("expert count " + nExperts + " is outside [1, " + HfConfig.MAX_EXPERTS
                         + "]");
@@ -241,6 +253,7 @@ public final class HfHookSupport {
             this.parts = Collections.unmodifiableList(new ArrayList<>(parts));
             this.stacker = Objects.requireNonNull(stacker, "stacker");
             this.mergedName = Objects.requireNonNull(mergedName, "mergedName");
+            this.memberRegex = Objects.requireNonNull(memberRegex, "memberRegex");
         }
 
         /**
@@ -250,7 +263,7 @@ public final class HfHookSupport {
          * @throws GgufFormatException when the expert index is out of range or a member of the layer is missing
          */
         public boolean offer(HfLoadContext ctx, String hfName, TensorSink out) {
-            Matcher m = MEMBER.matcher(hfName);
+            Matcher m = memberRegex.matcher(hfName);
             if (!m.matches() || !parts.contains(m.group(3))) {
                 return false;
             }

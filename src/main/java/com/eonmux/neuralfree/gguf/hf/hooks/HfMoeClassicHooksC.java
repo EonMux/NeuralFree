@@ -178,7 +178,10 @@ public final class HfMoeClassicHooksC {
             throw new GgufFormatException(ctx.config().source() + ": num_local_experts " + n + " does not split into"
                     + " experts_per_group 2 chunk experts");
         }
-        return HfMoeClassicHooksA.stackedExperts(ctx, GROVE_CHUNK_STATE, n / 2, HfMoeClassicHooksA.GATE_UP_DOWN);
+        // the chunk members live under mlp.chunk_experts.<x>.<part> (grovemoe.py:54)
+        return new HfHookSupport.ExpertCollector(n / 2, HfMoeClassicHooksA.GATE_UP_DOWN,
+                ExpertTransforms::stack, HfHookSupport.MergedName.SAME_PREFIX,
+                java.util.regex.Pattern.compile("^(.*\\.chunk_experts)\\.(\\d{1,9})\\.([^.]+)(\\..*)?$"));
     }
 
     /** {@code GroveMoeModel.prepare_tensors} (grovemoe.py:96-109): leftover chunk experts and experts are invalid. */
