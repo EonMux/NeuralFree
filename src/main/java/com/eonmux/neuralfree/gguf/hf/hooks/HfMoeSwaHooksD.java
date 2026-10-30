@@ -50,7 +50,7 @@ public final class HfMoeSwaHooksD {
 
     /** The muse residual gate tensor, post-attention or post-ffn (muse_spark.py:134-149). */
     private static final java.util.regex.Pattern RESIDUAL_GATE =
-            java.util.regex.Pattern.compile("(post_\\w+|\\w+)_residual_gate\\.gate$");
+            java.util.regex.Pattern.compile(".*\\w+_residual_gate\\.gate$");
 
     /** The tensors of step3.py:284-286 that are squeezed to their layout shape. */
     private static final java.util.Set<String> STEP35_SQUEEZE = Collections.unmodifiableSet(

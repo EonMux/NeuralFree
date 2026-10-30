@@ -82,8 +82,9 @@ public class HfMoeClassicHooksDTest {
             assertNull(HfMoeClassicHooksD.JANUS_FILTER.filter(drop + "fc.weight", IDENTITY));
         }
         assertNull(HfMoeClassicHooksD.SARASHINA_FILTER.filter("norm.weight", IDENTITY));
-        assertEquals("model.norm.weight",
-                HfMoeClassicHooksD.SARASHINA_FILTER.filter("llm.norm.weight", IDENTITY));
+        // the filter returns the stripped checkpoint name; the OUTPUT_NORM global row maps
+        // norm.weight to model.norm.weight at planning (tensor_patterns.tsv row 63)
+        assertEquals("norm.weight", HfMoeClassicHooksD.SARASHINA_FILTER.filter("llm.norm.weight", IDENTITY));
         // the llm. strip feeds the rest to the Llama filter, which keeps model-space names
         assertEquals("model.layers.0.self_attn.q_proj.weight",
                 HfMoeClassicHooksD.SARASHINA_FILTER.filter("llm.model.layers.0.self_attn.q_proj.weight", IDENTITY));

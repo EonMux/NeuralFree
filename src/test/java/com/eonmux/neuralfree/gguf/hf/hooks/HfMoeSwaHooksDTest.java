@@ -44,6 +44,7 @@ public class HfMoeSwaHooksDTest {
     // ------------------------------------------------------------------ Step35Model
 
     private static final String STEP35_CONFIG = "'layer_types': ['sliding_attention', 'full_attention'],"
+            + " 'num_attention_groups': 1,"
             + " 'attention_other_setting': {'num_attention_heads': 1, 'num_attention_groups': 1},"
             + " 'sliding_window': 4, 'head_dim': 4, 'moe_num_experts': 2, 'moe_top_k': 1,"
             + " 'moe_intermediate_size': 4, 'share_expert_dim': 4,"
@@ -53,18 +54,21 @@ public class HfMoeSwaHooksDTest {
 
     @Test
     public void step35WritesThePerLayerArraysAndClamps() throws IOException {
+        // the MTP count rides the load's includeMtp option (the converter reads it unconditionally)
         HfLoadContext ctx = context(dir(), Arch.STEP35, "Step3p5ForCausalLM", STEP35_CONFIG,
-                java.util.Collections.emptyMap(), false);
+                java.util.Collections.emptyMap(), true);
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.STEP35.ggufName());
         HfMoeSwaHooksD.step35Meta(ctx, kv, null);
         assertEquals(Arrays.asList(1, 2), kv.get(GgufKeys.ATTENTION_HEAD_COUNT));
         assertEquals(Arrays.asList(1, 1), kv.get(GgufKeys.ATTENTION_HEAD_COUNT_KV));
         assertEquals(Arrays.asList(true, false), kv.get(GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN));
-        assertEquals(Arrays.asList(2.0, 0.0), kv.get(GgufKeys.SWIGLU_CLAMP_EXP));
+        java.util.List<?> clamp = (java.util.List<?>) kv.get(GgufKeys.SWIGLU_CLAMP_EXP);
+        assertEquals(2.0, (Float) clamp.get(0), 0f);
+        assertEquals(0.0, (Float) clamp.get(1), 0f);
         assertEquals(1, kv.get(GgufKeys.LEADING_DENSE_BLOCK_COUNT));
         assertEquals(2, kv.get(GgufKeys.MOE_EVERY_N_LAYERS));
         assertEquals(1, kv.get(GgufKeys.NEXTN_PREDICT_LAYERS));
-        assertEquals(500000.0, kv.get(GgufKeys.ROPE_FREQ_BASE_SWA));
+        assertEquals(500000.0, ((Number) kv.get(GgufKeys.ROPE_FREQ_BASE_SWA)).doubleValue(), 0f);
     }
 
     @Test
@@ -121,7 +125,7 @@ public class HfMoeSwaHooksDTest {
         HfLoadContext ctx = context(dir(), Arch.MUSE_SPARK, "MuseSparkForConditionalGeneration", MUSE_CONFIG);
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.MUSE_SPARK.ggufName());
         HfMoeSwaHooksD.museSparkMeta(ctx, kv, null);
-        assertEquals(2.0, kv.get(GgufKeys.LOGIT_SCALE));
+        assertEquals(2.0, ((Number) kv.get(GgufKeys.LOGIT_SCALE)).doubleValue(), 0f);
         assertEquals(Boolean.TRUE, kv.get(GgufKeys.EXPERT_WEIGHTS_NORM));
         assertEquals(Arrays.asList(true, false), kv.get(GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN));
         assertThrows(GgufFormatException.class, () -> HfMoeSwaHooksD.museSparkMeta(
