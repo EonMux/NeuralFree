@@ -96,13 +96,23 @@ public class HfMoeSwaHooksBTest {
         index.put("model.layers.0.self_attn.qkv_proj.weight_scale_inv", seq(3, 1));
         HfLoadContext ctx = context(dir(), Arch.MIMO2, "MiMoV2FlashForCausalLM", MIMO_CONFIG, index, false);
         assertThrows(GgufFormatException.class, () -> HfMoeSwaHooksB.mimoIndex(ctx, ctx.index()));
+        // the assembler's MTP load expands the block count by num_nextn_predict_layers and the
+        // MTP regex renames model.mtp.layers.0 -> model.layers.2; the collector plans the
+        // post-rename members, so the complete layer-2 member set feeds the hook
+        Map<String, RowSource> mtpIndex = new LinkedHashMap<>();
+        for (int x = 0; x < 2; x++) {
+            for (String part : new String[]{"gate_proj", "up_proj", "down_proj"}) {
+                mtpIndex.put("model.layers.2.mlp.experts." + x + "." + part + ".weight", seq(2, 8));
+            }
+        }
         HfLoadContext mtp = context(dir(), Arch.MIMO2, "MiMoV2FlashForCausalLM", MIMO_CONFIG,
-                java.util.Collections.emptyMap(), true);
+                mtpIndex, false).withBlockCount(3);
         RecordingSink sink = new RecordingSink();
-        HfMoeSwaHooksB.mimoTensors(mtp, "model.mtp.layers.0.mlp.experts.0.gate_proj.weight", seq(2, 8), sink);
-        HfMoeSwaHooksB.mimoTensors(mtp, "model.mtp.layers.0.mlp.experts.1.gate_proj.weight", seq(2, 8), sink);
+        for (String name : mtp.index().names()) {
+            HfMoeSwaHooksB.mimoTensors(mtp, name, mtp.index().get(name), sink);
+        }
         HfMoeSwaHooksB.mimoExtra(mtp, sink);
-        assertTrue(!sink.tensors.isEmpty());
+        org.junit.Assert.assertEquals(3, sink.tensors.size());
     }
 
     // ------------------------------------------------------------------ BeamModel
@@ -128,14 +138,14 @@ public class HfMoeSwaHooksBTest {
             index.put("model.layers.1.mlp.experts." + x + ".down_proj.weight", seq(2, 2));
         }
         index.put("model.layers.1.self_attn.gate_bias", seq(2));
-        HfLoadContext ctx = context(dir(), Arch.BEAM, "BeamForCausalLM", "'num_local_experts': 2,", index, false);
+        HfLoadContext ctx = context(dir(), Arch.BEAM, "BeamForCausalLM", "'num_local_experts': 2", index, false);
         RecordingSink sink = new RecordingSink();
         for (String name : index.keySet()) {
             HfMoeSwaHooksB.beamTensors(ctx, name, ctx.index().get(name), sink);
         }
         HfMoeSwaHooksB.beamExtra(ctx, sink);
         assertTrue(sink.tensors.size() >= 3);
-        HfLoadContext dense = context(dir(), Arch.BEAM, "BeamForCausalLM", "'num_local_experts': 2,",
+        HfLoadContext dense = context(dir(), Arch.BEAM, "BeamForCausalLM", "'num_local_experts': 2",
                 java.util.Collections.singletonMap("model.layers.0.mlp.experts.0.gate_proj.weight", seq(2, 8)),
                 false);
         assertThrows(GgufFormatException.class, () -> HfMoeSwaHooksB.beamTensors(dense,

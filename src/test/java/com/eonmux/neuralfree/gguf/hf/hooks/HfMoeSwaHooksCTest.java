@@ -55,14 +55,16 @@ public class HfMoeSwaHooksCTest {
         index.put("model.layers.1.mlp.experts.1.up_proj.weight", seq(2, 8));
         index.put("model.layers.1.mlp.experts.1.down_proj.weight", seq(2, 2));
         HfLoadContext gproj = context(dir(), Arch.LAGUNA, "LagunaForCausalLM", "'gating': 'per-head',"
-                + " 'moe_intermediate_size': 4, 'shared_expert_intermediate_size': 8,"
-                + " 'moe_routed_scaling_factor': 1.0, 'num_experts': 2, 'head_dim': 4", index, false);
+                + " 'num_attention_heads_per_layer': [2, 2], 'moe_intermediate_size': 4,"
+                + " 'shared_expert_intermediate_size': 8, 'moe_routed_scaling_factor': 1.0,"
+                + " 'num_experts': 2, 'head_dim': 4", index, false);
         RecordingSink sink = new RecordingSink();
         for (String name : index.keySet()) {
             HfMoeSwaHooksC.lagunaTensors(gproj, name, gproj.index().get(name), sink);
         }
         HfMoeSwaHooksC.lagunaExtra(gproj, sink);
-        assertEquals(3, sink.tensors.size());
+        // the mapped g_proj gate plus the three merged expert stacks
+        assertEquals(4, sink.tensors.size());
         Map<String, com.eonmux.neuralfree.gguf.hf.tensor.RowSource> wide = new LinkedHashMap<>();
         wide.put("model.layers.0.self_attn.g_proj.weight", seq(16, 5));
         HfLoadContext contradicting = context(dir(), Arch.LAGUNA, "LagunaForCausalLM", "'gating': 'per-head',"
@@ -81,7 +83,10 @@ public class HfMoeSwaHooksCTest {
                         + " 'partial_rotary_factor': 0.5, 'sliding_window': 4,"
                         + " 'layer_types': ['full_attention', 'sliding_attention'], 'moe_intermediate_size': 4"),
                 kv, null);
-        assertEquals(java.util.Arrays.asList(7.0, 7.0), kv.get(GgufKeys.SWIGLU_CLAMP_EXP));
+        java.util.List<?> clamp = (java.util.List<?>) kv.get(GgufKeys.SWIGLU_CLAMP_EXP);
+        assertEquals(2, clamp.size());
+        assertEquals(7.0, (Float) clamp.get(0), 0f);
+        assertEquals(7.0, (Float) clamp.get(1), 0f);
         assertThrows(GgufFormatException.class, () -> HfMoeSwaHooksC.mapleMeta(
                 context(dir(), Arch.MAPLE, "MapleForCausalLM", "'hidden_act': 'gelu', 'head_dim': 4,"
                         + " 'sliding_window': 4, 'layer_types': ['full_attention', 'full_attention']"
@@ -108,14 +113,19 @@ public class HfMoeSwaHooksCTest {
 
     @Test
     public void exaoneMoeReplicatesTheSharedMtpHeadIntoEveryNextNBlock() throws IOException {
+        // the collector plans the post-rename members; the mtp.fc / mtp.norm heads map directly
         Map<String, com.eonmux.neuralfree.gguf.hf.tensor.RowSource> index = new LinkedHashMap<>();
         index.put("mtp.fc.weight", seq(8, 8));
         index.put("mtp.norm.weight", seq(8));
-        index.put("mtp.layers.0.mlp.experts.0.gate_proj.weight", seq(2, 8));
-        index.put("mtp.layers.0.mlp.experts.1.gate_proj.weight", seq(2, 8));
+        for (int x = 0; x < 2; x++) {
+            for (String part : new String[]{"gate_proj", "up_proj", "down_proj"}) {
+                index.put("model.layers.2.mlp.experts." + x + "." + part + ".weight", seq(2, 8));
+            }
+        }
+        // the NextN rename targets blocks 2 and 3, so the load expands the block count to 4
         HfLoadContext ctx = context(dir(), Arch.EXAONE_MOE, "ExaoneMoEForCausalLM",
                 "'num_nextn_predict_layers': 2, 'moe_intermediate_size': 4, 'num_shared_experts': 1,"
-                        + " 'routed_scaling_factor': 1.0, 'num_local_experts': 2", index, true);
+                        + " 'routed_scaling_factor': 1.0, 'num_local_experts': 2", index, true).withBlockCount(4);
         RecordingSink sink = new RecordingSink();
         for (String name : index.keySet()) {
             HfMoeSwaHooksC.exaoneMoeTensors(ctx, name, ctx.index().get(name), sink);
@@ -123,8 +133,9 @@ public class HfMoeSwaHooksCTest {
         HfMoeSwaHooksC.exaoneMoeExtra(ctx, sink);
         // the shared mtp.fc / mtp.norm heads replicate into both NextN blocks (blocks 2 and 3); the
         // mtp.layers.0 per-expert names rename into the appended slots and map on the normal path
+        // NEXTN_EH_PROJ and NEXTN_SHARED_HEAD_NORM templates carry no .weight (constants.py)
         long replicated = sink.tensors.keySet().stream()
-                .filter(n -> n.endsWith("eh_proj.weight") || n.endsWith("shared_head.norm.weight")).count();
+                .filter(n -> n.endsWith("eh_proj.weight") || n.contains("shared_head_norm")).count();
         assertEquals(4, replicated);
         assertTrue(sink.tensors.keySet().stream().anyMatch(n -> n.contains(".3.")));
         assertTrue(sink.tensors.keySet().stream().anyMatch(n -> n.contains(".2.")));
@@ -137,13 +148,13 @@ public class HfMoeSwaHooksCTest {
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.SMALLTHINKER.ggufName());
         HfMoeSwaHooksC.smallthinkerMeta(context(dir(), Arch.SMALLTHINKER, "SmallThinkerForCausalLM",
                 "'moe_num_primary_experts': 2, 'moe_num_active_primary_experts': 1, 'moe_ffn_hidden_size': 4,"
-                        + " 'sliding_window_layout': ['0', '4'], 'sliding_window_size': 3"), kv, null);
+                        + " 'sliding_window_layout': [0, 4], 'sliding_window_size': 3"), kv, null);
         assertEquals(2, kv.get(GgufKeys.EXPERT_COUNT));
         assertEquals(4, kv.get(GgufKeys.FEED_FORWARD_LENGTH));
         assertEquals(3, kv.get(GgufKeys.ATTENTION_SLIDING_WINDOW));
         HfMetadataBuilder off = new HfMetadataBuilder(Arch.SMALLTHINKER.ggufName());
         HfMoeSwaHooksC.smallthinkerMeta(context(dir(), Arch.SMALLTHINKER, "SmallThinkerForCausalLM",
-                "'sliding_window_layout': ['0', '0'], 'sliding_window_size': 3"), off, null);
+                "'sliding_window_layout': [0, 0], 'sliding_window_size': 3"), off, null);
         assertEquals(null, off.get(GgufKeys.ATTENTION_SLIDING_WINDOW));
         Map<String, com.eonmux.neuralfree.gguf.hf.tensor.RowSource> index = new LinkedHashMap<>();
         for (int x = 0; x < 2; x++) {

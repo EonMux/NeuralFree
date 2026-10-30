@@ -561,6 +561,10 @@ public final class HfMoeSwaHooksB {
             }
             return;
         }
+        if (hfName.endsWith(".self_attn.gate_bias")) {
+            // beam.py:93-94 renames the attention gate bias into the gate projection's bias slot
+            hfName = hfName.replace(".self_attn.gate_bias", ".self_attn.gate_proj.bias");
+        }
         HfTensorHook.DEFAULT.apply(ctx, hfName, src, out);
     }
 

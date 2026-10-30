@@ -378,7 +378,12 @@ public final class HfMoeSwaHooksC {
         Object useSwa = cfg.find("use_sliding_window").orElse(null);
         Object window = cfg.find("sliding_window").orElse(null);
         boolean useSliding = useSwa == null || Boolean.TRUE.equals(useSwa);
-        int nextn = Math.max(0, ctx.blockCount() - cfg.blockCount());
+        // the reference reads the MTP count from the config (mellum.py:26), the expanded
+        // block-count difference as the fallback
+        int nextn = cfg.findInt(0, "num_nextn_predict_layers", "num_mtp_layers");
+        if (nextn == 0) {
+            nextn = Math.max(0, ctx.blockCount() - cfg.blockCount());
+        }
         if (useSliding && window instanceof Number) {
             kv.set(GgufKeys.ATTENTION_SLIDING_WINDOW, ((Number) window).intValue());
             List<String> types = HfMoeSwaHooksB.stringList(cfg, "layer_types");
@@ -473,21 +478,21 @@ public final class HfMoeSwaHooksC {
         if (hfName.startsWith("mtp.")) {
             Matcher layerM = EXAONE_MTP_LAYERS.matcher(hfName);
             if (layerM.matches()) {
-                String renamed = "model.layers." + (trunk + Integer.parseInt(layerM.group(1))) + "."
-                        + layerM.group(2);
-                HfTensorHook.DEFAULT.apply(ctx, renamed, src, out);
-                return;
-            }
-            String stem = hfName.endsWith(".weight") ? hfName.substring(0, hfName.length() - ".weight".length())
-                    : hfName;
-            String rename = EXAONE_MTP_HEAD_RENAMES.get(stem);
-            if (rename != null) {
-                String suffix = hfName.endsWith(".weight") ? ".weight" : "";
-                for (int bidMtp = 0; bidMtp < nextnN; bidMtp++) {
-                    HfTensorHook.DEFAULT.apply(ctx, "model.layers." + (trunk + bidMtp) + "." + rename + suffix,
-                            src, out);
+                // the renamed member joins the target block's expert collection like the converter's
+                // modify_tensors collection does (exaone.py:178-200)
+                hfName = "model.layers." + (trunk + Integer.parseInt(layerM.group(1))) + "." + layerM.group(2);
+            } else {
+                String stem = hfName.endsWith(".weight") ? hfName.substring(0, hfName.length() - ".weight".length())
+                        : hfName;
+                String rename = EXAONE_MTP_HEAD_RENAMES.get(stem);
+                if (rename != null) {
+                    String suffix = hfName.endsWith(".weight") ? ".weight" : "";
+                    for (int bidMtp = 0; bidMtp < nextnN; bidMtp++) {
+                        HfTensorHook.DEFAULT.apply(ctx, "model.layers." + (trunk + bidMtp) + "." + rename + suffix,
+                                src, out);
+                    }
+                    return;
                 }
-                return;
             }
         }
         if (offer(ctx, hfName, out, ctx.config().requireInt("num_local_experts", "num_experts"),
@@ -524,14 +529,14 @@ public final class HfMoeSwaHooksC {
     private static void optionalListWindow(HfMetadataBuilder kv, HfConfig cfg) {
         List<String> layout = HfMoeSwaHooksB.stringList(cfg, "sliding_window_layout");
         for (String t : layout) {
-            boolean nonzero = !Boolean.FALSE.toString().equals(t) && !"0".equals(t) && !"false".equals(t);
-            boolean enabled;
+            // smallthinker.py:35-41: the window enables on the first nonzero layout entry
+            int value;
             try {
-                enabled = !nonzero || Integer.parseInt(t) != 0;
+                value = Integer.parseInt(t);
             } catch (NumberFormatException e) {
                 continue;
             }
-            if (enabled) {
+            if (value != 0) {
                 Object window = cfg.find("sliding_window_size").orElse(null);
                 if (window instanceof Number && ((Number) window).intValue() > 0) {
                     kv.set(GgufKeys.ATTENTION_SLIDING_WINDOW, ((Number) window).intValue());
