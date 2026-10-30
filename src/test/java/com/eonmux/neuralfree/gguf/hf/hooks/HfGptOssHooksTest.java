@@ -87,32 +87,40 @@ public class HfGptOssHooksTest {
         // up[e][f][d] = x[e][d][2f+1]; spot the corner elements
         float[] v = values(up);
         assertEquals(1.0f, v[0], 0f);
-        assertEquals(21.0f, v[10], 0f); // e=0, f=1, d=2 -> x[0][2][5]
+        assertEquals(19.0f, v[10], 0f); // e=0, f=1, d=2 -> x[0][2][3]
         assertEquals(65.0f, v[32], 0f);
         assertEquals(127.0f, v[63], 0f);
     }
 
     @Test
     public void mxfp4GateUpDeInterleavesTheFusedRows() throws IOException {
-        // [E=2, 2F=8, K=4] stored form rows 0::2 gate and 1::2 up
+        // [E=2, 2F=8, K=32] stored form: rows 0::2 gate and 1::2 up; every row is one whole
+        // MXFP4 block of 32 elements, and the element values sit on the MXFP4 grid so the
+        // stored source's quant-dequant round trip is exact
+        float[] grid = {0f, 0.5f, 1f, 1.5f, 2f, 3f, 4f, 6f, -0f, -0.5f, -1f, -1.5f, -2f, -3f, -4f, -6f};
+        float[] srcValues = new float[2 * 8 * 32];
+        for (int i = 0; i < srcValues.length; i++) {
+            srcValues[i] = grid[i % 16];
+        }
         HfLoadContext ctx = ctx(java.util.Collections.singletonMap(
                 "model.layers.0.mlp.experts.gate_up_proj.weight",
-                mono(ElementFormat.of(GGMLType.MXFP4), 2, 8, 4)));
+                mono(ElementFormat.of(GGMLType.MXFP4), 2, 8, 32)));
         RecordingSink sink = new RecordingSink();
         HfGptOssHooks.tensors(ctx, "model.layers.0.mlp.experts.gate_up_proj.weight",
                 ctx.index().get("model.layers.0.mlp.experts.gate_up_proj.weight"), sink);
         java.util.List<RowSource> out = new java.util.ArrayList<>(sink.tensors.values());
         assertEquals(2, out.size());
+        // the gate/up sources keep the flat [E * 2F, K] rows: gate row i is flat row 2i, up row 2i + 1
         RowSource gate = out.get(0);
-        assertArrayEquals(new long[]{2, 4, 4}, gate.shape());
-        // gate[e][r][k] = flat[e][2r][k] = e*32 + 2r*4 + k
-        assertArrayEquals(floats(
-                0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
-                32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59), values(gate), 0f);
-        assertArrayEquals(floats(
-                4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31,
-                36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63),
-                values(out.get(1)), 0f);
+        assertArrayEquals(new long[]{8, 32}, gate.shape());
+        float[] wantGate = new float[256];
+        float[] wantUp = new float[256];
+        for (int i = 0; i < 256; i++) {
+            wantGate[i] = srcValues[2 * i];
+            wantUp[i] = srcValues[2 * i + 1];
+        }
+        assertArrayEquals(wantGate, values(gate), 0f);
+        assertArrayEquals(wantUp, values(out.get(1)), 0f);
     }
 
     @Test
@@ -162,7 +170,7 @@ public class HfGptOssHooksTest {
     @Test
     public void sinksGainTheirWeightSuffixAndEverythingElseMaps() throws IOException {
         Map<String, RowSource> index = new java.util.LinkedHashMap<>();
-        index.put("model.layers.0.attn.sinks", seq(2));
+        index.put("model.layers.0.self_attn.sinks", seq(2));
         index.put("model.layers.0.post_attention_layernorm.weight", seq(2, 8));
         HfLoadContext ctx = ctx(index);
         RecordingSink sink = new RecordingSink();

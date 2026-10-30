@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hf.hooks;
 
+import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.hf.arch.HfArchResolver;
 import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
@@ -113,7 +114,8 @@ public final class HfGptOssHooks {
      * de-interleaved columns; a bias {@code [E, 2F]} de-interleaved into two {@code [E, F]} rows.
      */
     private static void gateUp(HfLoadContext ctx, String name, RowSource src, TensorSink out) {
-        if (name.endsWith(BIAS)) {
+        if (name.endsWith("_bias")) {
+            // the checkpoint spells the fused bias gate_up_proj_bias (gpt_oss.py:108-113)
             biased(ctx, name, src, out);
             return;
         }
@@ -132,14 +134,10 @@ public final class HfGptOssHooks {
             throw new GgufFormatException("tensor '" + name + ": the fused gate/up row width " + rowsPerExpert
                     + " is not an even split");
         }
-        long e = shape[0];
-        long f = rowsPerExpert / 2;
-        long k = shape[shape.length - 1];
-        RowSource flat = ElementTransforms.reshape(src, Math.multiplyExact(e, rowsPerExpert), k);
-        out.add(ctx.names().mapOrThrow(gate),
-                ElementTransforms.reshape(RowTransforms.interleaveRows(flat, 2, 0), e, f, k));
-        out.add(ctx.names().mapOrThrow(up),
-                ElementTransforms.reshape(RowTransforms.interleaveRows(flat, 2, 1), e, f, k));
+        // the gate rows are the even rows of the fused stack, up the odd ones — kept as row-mapped
+        // views: reshaping the packed stack would break its block byte accounting
+        out.add(ctx.names().mapOrThrow(gate), RowTransforms.interleaveRows(src, 2, 0));
+        out.add(ctx.names().mapOrThrow(up), RowTransforms.interleaveRows(src, 2, 1));
     }
 
     /** The {@code [E, 2F]} biases, gate rows {@code [i::2]} and up rows {@code [i+1::2]} (gpt_oss.py:110-112). */
