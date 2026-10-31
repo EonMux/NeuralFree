@@ -276,8 +276,8 @@ public final class HfDenseClassicHooksF {
             }
         }
         if (max < 0) {
-            throw new GgufFormatException(ctx.config().source()
-                    + ": graniteswitch: no 'model.layers.N' tensors found in checkpoint");
+            // the names list is the input; the load context is not part of this walk
+            throw new GgufFormatException("graniteswitch: no 'model.layers.N' tensors found in checkpoint");
         }
         return max + 1;
     }

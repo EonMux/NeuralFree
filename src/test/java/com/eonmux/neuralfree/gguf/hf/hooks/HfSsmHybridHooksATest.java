@@ -62,11 +62,11 @@ public class HfSsmHybridHooksATest {
         HfTensorIndex index = ckpt
                 .f32("backbone.layers.0.mixer.conv1d.weight", new long[]{4, 1, 3}, seq(12))
                 .f32("backbone.layers.0.mixer.A_log", new long[]{2}, new float[]{0f, 0f})
-                .f32("backbone.layers.1.mixer.q_proj.weight", new long[]{2, 8}, seq(16))
+                .f32("backbone.layers.1.mixer.q_proj.weight", new long[]{8, 8}, seq(64))
                 .f32("backbone.layers.1.block_sparse_moe.input_linear.weight", new long[]{2, 4, 8}, seq(64))
                 .f32("backbone.final_layer_norm.weight", new long[]{8}, seq(8)).index();
         String json = "{'architectures': ['GraniteMoeHybridForCausalLM'], " + GRANITE_BASE
-                + ", 'layer_types': ['mamba', 'attention'], 'intermediate_size': 4}";
+                + ", 'd_head': 2, 'layer_types': ['mamba', 'attention'], 'intermediate_size': 4}";
         HfConfig cfg = HfLlamaHooksTest.config(json);
         HfLoadContext ctx = context(cfg, entry("GraniteMoeHybridForCausalLM"), index);
         assertEquals(Arch.GRANITE_HYBRID, ctx.arch());
@@ -100,14 +100,14 @@ public class HfSsmHybridHooksATest {
                 + ", 'layer_types': ['attention', 'attention']}";
         HfConfig cfg = HfLlamaHooksTest.config(json);
         assertEquals(Arch.GRANITE, HfSsmHybridHooksA.graniteHybridArch(cfg, null));
-        assertEquals(1, HfSsmHybridHooksA.graniteHybridFixup(cfg).findInt("pad_vocab_size_multiple"));
+        assertEquals(1, HfSsmHybridHooksA.graniteHybridFixup(cfg).findInt("pad_vocab_size_multiple").getAsInt());
         HfConfig moe = HfLlamaHooksTest.config("{'architectures': ['GraniteMoeHybridForCausalLM'], "
                 + GRANITE_BASE + ", 'layer_types': ['attention', 'attention'], 'num_experts_per_tok': 1}");
         assertEquals(Arch.GRANITE_MOE, HfSsmHybridHooksA.graniteHybridArch(moe, null));
         HfConfig hybrid = HfLlamaHooksTest.config("{'architectures': ['BambaForCausalLM'], " + GRANITE_BASE
                 + ", 'layer_types': ['mamba', 'attention']}");
         assertEquals(Arch.GRANITE_HYBRID, HfSsmHybridHooksA.graniteHybridArch(hybrid, null));
-        assertEquals(8, HfSsmHybridHooksA.graniteHybridFixup(hybrid).findInt("pad_vocab_size_multiple"));
+        assertEquals(8, HfSsmHybridHooksA.graniteHybridFixup(hybrid).findInt("pad_vocab_size_multiple").getAsInt());
     }
 
     @Test
@@ -145,7 +145,7 @@ public class HfSsmHybridHooksATest {
                 + " 'moe_shared_expert_intermediate_size': 6, 'n_routed_experts': 2, 'n_shared_experts': 1,"
                 + " 'norm_topk_prob': false, 'routed_scaling_factor': 1.0, 'n_group': 1, 'moe_latent_size': 8";
         String json = "{'architectures': ['NemotronHPuzzleForCausalLM'], " + GRANITE_BASE + ", " + bc
-                + ", 'num_hidden_layers': 20}";
+                + ", 'hidden_size': 8, 'head_dim': 4, 'd_head': 8, 'num_hidden_layers': 20}";
         HfConfig cfg = HfLlamaHooksTest.config(json);
         assertEquals(Arch.NEMOTRON_H_MOE, HfSsmHybridHooksA.nemotronHPuzzleArch(cfg, null));
         HfConfig fixed = HfSsmHybridHooksA.nemotronHPuzzleFixup(cfg);

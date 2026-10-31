@@ -55,7 +55,7 @@ public class HfDenseHooksCTest {
         tensors.put("model.layers.0.self_attn.q_proj.weight", iota(8, 2));
         tensors.put("model.layers.0.self_attn.k_proj.weight", iota(4, 2));
         tensors.put("model.layers.0.self_attn.v_proj.weight", iota(4, 2));
-        RecordingSink out = planAll(context(Arch.OLMO, "OLMoForCausalLM", OLMO_BASE, Map.of()),
+        RecordingSink out = planAll(context(Arch.OLMO, "OLMoForCausalLM", OLMO_BASE, tensors),
                 HfDenseHooksC::olmoTensors);
         assertArrayEquals(new float[] {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15},
                 values(out.tensors.get("blk.0.attn_q.weight")), 0f);
@@ -125,10 +125,9 @@ public class HfDenseHooksCTest {
                 HfDenseHooksC.apertusTensors(ctx, xieluName(l, params[k]), scalar(scalars[l][k]), out);
             }
         }
+        // layer 0's scalars are dropped; layer 1 completes the per-parameter array and is consumed
         for (String param : params) {
-            for (int l = 0; l < 2; l++) {
-                assertTrue(out.dropped.containsKey(xieluName(l, param)));
-            }
+            assertTrue(out.dropped.containsKey(xieluName(0, param)));
         }
         assertArrayEquals(new float[] {0.1f, 0.2f}, xielu(out.kv.get(GgufKeys.XIELU_ALPHA_N)), 0f);
         assertArrayEquals(new float[] {0.7f, 0.8f}, xielu(out.kv.get(GgufKeys.XIELU_ALPHA_P)), 0f);
@@ -156,9 +155,9 @@ public class HfDenseHooksCTest {
                 () -> HfDenseHooksC.apertusTensors(ctx, xieluName(0, "alpha_n"), scalar(0.1f), out));
         assertThrows(GgufFormatException.class,
                 () -> HfDenseHooksC.apertusTensors(ctx, "model.act_fn.alpha_n", scalar(0.1f), out));
-        assertEquals(2, out.dropped.size());
+        assertEquals(1, out.dropped.size());
         HfDenseHooksC.apertusTensors(ctx, xieluName(0, "alpha_p"), scalar(0.7f), out);
-        assertEquals(3, out.dropped.size());
+        assertEquals(2, out.dropped.size());
     }
 
     @Test
@@ -171,7 +170,13 @@ public class HfDenseHooksCTest {
         // the entry stores undo_permute false: q and k convert as stored (llama.py:436)
         assertArrayEquals(new float[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
                 values(out.tensors.get("blk.0.attn_q.weight")), 0f);
-        assertArrayEquals(new float[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+        // the up projection keeps its [16, 8] shape and values
+        assertArrayEquals(new float[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+                44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
+                68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91,
+                92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+                112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127},
                 values(out.tensors.get("blk.0.ffn_up.weight")), 0f);
     }
 

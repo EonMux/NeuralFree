@@ -610,8 +610,10 @@ public final class HfSsmHybridHooksA {
     public static void nemotronHPuzzleMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan)
             throws IOException {
         HfConfig cfg = ctx.config();
-        graniteCoreMeta(ctx, kv, plan, graniteAttnLayers(cfg, ctx.blockCount()),
-                graniteSsmLayers(cfg, ctx.blockCount()));
+        // the Puzzle pattern rides layers_block_type (the fixup copies block_configs' block_type),
+        // read through the Nemotron pattern readers like NemotronHModel's own metadata
+        graniteCoreMeta(ctx, kv, plan, nemotronAttnLayers(cfg, ctx.blockCount(), true),
+                nemotronSsmLayers(cfg, ctx.blockCount(), true));
         long headDim = prefixedRequireInt(cfg, "head_dim", "attention_head_dim");
         kv.set(GgufKeys.ATTENTION_KEY_LENGTH, headDim);
         kv.set(GgufKeys.ATTENTION_VALUE_LENGTH, headDim);

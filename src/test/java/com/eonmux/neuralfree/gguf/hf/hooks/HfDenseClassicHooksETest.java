@@ -15,7 +15,7 @@ public class HfDenseClassicHooksETest {
 
     @Test
     public void openelmFfnWidthRoundToDivisibleNeverRoundsDownPastNinePercent() {
-        assertEquals(8, HfDenseClassicHooksE.makeDivisible(2.0, 4)); // multiplier * modelDim = 8
+        assertEquals(4, HfDenseClassicHooksE.makeDivisible(2.0, 4)); // max(divisor, round(v/div)*div) = 4
         assertEquals(4, HfDenseClassicHooksE.makeDivisible(3.7, 4));
         assertEquals(20, HfDenseClassicHooksE.makeDivisible(12.0, 10)); // 10 < 0.9 * 12 -> +divisor
         assertEquals(10, HfDenseClassicHooksE.makeDivisible(10.0, 10));
