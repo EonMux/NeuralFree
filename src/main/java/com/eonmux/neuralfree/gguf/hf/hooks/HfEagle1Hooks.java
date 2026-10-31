@@ -64,8 +64,7 @@ public final class HfEagle1Hooks {
      */
     public static HfConfig fixup(HfConfig cfg) {
         if (!"EagleForCausalLM".equals(cfg.architecture())) {
-            cfg = cfg.withFlat(Collections.singletonMap("architectures",
-                    Collections.singletonList("EagleForCausalLM")));
+            cfg = cfg.withArchitecture("EagleForCausalLM");
         }
         if (cfg.flat().containsKey("num_hidden_layers")) {
             int layers = cfg.requireInt("num_hidden_layers");
@@ -209,15 +208,21 @@ public final class HfEagle1Hooks {
         }
 
         private static Target load(HfLoadContext ctx) throws IOException {
-            // Opening the target refuses the target-less load and keeps the source in the load's resources;
-            // the path it was opened from is what the converter's --target-model-dir names.
-            ctx.target();
+            if (ctx.targetPath().isEmpty()) {
+                throw new GgufFormatException(ctx.config().architecture()
+                        + " is a draft model; open it as a draft of its target model");
+            }
+            // the reference reads the target's config.json (llama.py:64-74); its weights are never
+            // converted, so the target is not opened as a model source here
             Path path = ctx.targetPath().get().toAbsolutePath().normalize();
             String arch = ctx.config().architecture();
             if (ModelSources.detect(path) == ModelFormat.GGUF) {
                 Map<String, Object> tokenizerKeys = ggufTokenizerKeys(ctx, path);
-                return new Target(path, null, tokenizerKeys, ggufInt(ctx, path, arch,
-                        GgufKeys.EMBEDDING_LENGTH), ggufInt(ctx, path, arch, GgufKeys.BLOCK_COUNT));
+                // the target GGUF carries its own architecture; the keys are prefixed with it
+                String targetArch = String.valueOf(ModelSources.open(path.toString())
+                        .getMetadata().getOrDefault(GgufKeys.GENERAL_ARCHITECTURE, arch));
+                return new Target(path, null, tokenizerKeys, ggufInt(ctx, path, targetArch,
+                        GgufKeys.EMBEDDING_LENGTH), ggufInt(ctx, path, targetArch, GgufKeys.BLOCK_COUNT));
             }
             Path dir = Files.isDirectory(path) ? path : path.getParent();
             HfConfig cfg = HfConfigLoader.load(dir.toAbsolutePath().normalize(),

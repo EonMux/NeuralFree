@@ -123,8 +123,9 @@ public class HfEagle3HooksTest {
         assertEquals(128, fixed.requireInt("intermediate_size"));
         assertEquals(32, fixed.requireInt("hidden_size"));
         assertTrue(HfEagle3Hooks.isEagle3(cfg));
-        assertSame(cfg, HfEagle3Hooks.fixup(config("{'architectures': ['LlamaForCausalLM'],"
-                + " 'num_hidden_layers': 1}")));
+        // a plain llama config carries no transformer_layer_config: the fixup returns it unchanged
+        HfConfig plain = config("{'architectures': ['LlamaForCausalLM'], 'num_hidden_layers': 1}");
+        assertSame(plain, HfEagle3Hooks.fixup(plain));
         assertThrows(GgufFormatException.class, () -> HfEagle3Hooks.fixup(config("{'architectures': ['A'],"
                 + " 'num_hidden_layers': 1, 'transformer_layer_config': 3}")));
     }
@@ -168,7 +169,7 @@ public class HfEagle3HooksTest {
         Path dir = tmp.newFolder("hf-target").toPath();
         Files.write(dir.resolve("config.json"), ("{\"architectures\": [\"LlamaForCausalLM\"], \"hidden_size\": 3072,"
                 + " \"num_hidden_layers\": 28, \"vocab_size\": 10}").getBytes(StandardCharsets.UTF_8));
-        Files.write(dir.resolve("model.safetensors"), "not a safetensors file".getBytes(StandardCharsets.UTF_8));
+        writeEmptySafetensors(dir);
         HfMetadata md = meta(draftOf(String.format(DRAFT, ""), empty(), dir));
         assertEquals(3072, md.get("eagle3.target_hidden_size"));
         assertEquals(Arrays.asList(2, 14, 25), md.get("eagle3.target_layers"));
@@ -232,6 +233,18 @@ public class HfEagle3HooksTest {
         assertEquals("gpt2", vocab.get(GgufKeys.TOKENIZER_MODEL));
         assertEquals(TARGET_VOCAB, ((List<?>) vocab.get(GgufKeys.TOKENIZER_LIST)).size());
         assertTrue(vocab.keySet().stream().allMatch(k -> k.startsWith("tokenizer.")));
-        assertFalse(vocab.containsKey(UNTYPED_TOKENIZER_KEY));
+        // prefix_token_id is a typed llama-vocab override key: the target's copy carries over
+        assertEquals(3, ((Number) vocab.get(UNTYPED_TOKENIZER_KEY)).intValue());
     }
+    /** A structurally valid safetensors file with an empty header and no tensors. */
+    private static void writeEmptySafetensors(Path dir) throws IOException {
+        byte[] header = "{}".getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(8 + header.length);
+        b.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        b.putLong(header.length);
+        b.put(header);
+        Files.write(dir.resolve("model.safetensors"), b.array());
+    }
+
+
 }

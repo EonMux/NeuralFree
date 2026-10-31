@@ -134,8 +134,14 @@ public class HfEagle1HooksTest {
     public void aCheckpointTargetIsReadFromItsConfigWithoutBeingConverted() throws Exception {
         Path dir = tmp.newFolder("hf-target").toPath();
         Files.write(dir.resolve("config.json"), ("{\"architectures\": [\"LlamaForCausalLM\"], \"hidden_size\": 3072,"
-                + " \"num_hidden_layers\": 28, \"vocab_size\": 10}").getBytes(StandardCharsets.UTF_8));
-        Files.write(dir.resolve("model.safetensors"), "not a safetensors file".getBytes(StandardCharsets.UTF_8));
+                + " \"num_hidden_layers\": 28, \"num_attention_heads\": 2, \"num_key_value_heads\": 1,"
+                + " \"intermediate_size\": 16, \"rms_norm_eps\": 1e-06, \"vocab_size\": 10,"
+                + " \"max_position_embeddings\": 64}").getBytes(StandardCharsets.UTF_8));
+        writeEmptySafetensors(dir);
+        // the target's tokenizer files feed the draft vocabulary when the target is a checkpoint
+        write(dir, "tokenizer.json", json("{'model':{'type':'BPE','vocab':{'a':0,'b':1},'merges':[['a','b']]}}"));
+        write(dir, "vocab.json", json("{'a':0,'b':1}"));
+        write(dir, "merges.txt", "#version: 0.0\na b");
         HfMetadata md = meta(draftOf(String.format(DRAFT, ""), empty(), dir));
         assertEquals(Arrays.asList(27), md.get("eagle.target_layers"));
         assertEquals(3072, md.get("eagle.target_hidden_size"));
@@ -189,4 +195,24 @@ public class HfEagle1HooksTest {
         ctx.entry().meta().apply(ctx, kv, null);
         return kv.build();
     }
+    /** A structurally valid safetensors file with an empty header and no tensors. */
+    private static void writeEmptySafetensors(Path dir) throws IOException {
+        byte[] header = "{}".getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(8 + header.length);
+        b.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        b.putLong(header.length);
+        b.put(header);
+        Files.write(dir.resolve("model.safetensors"), b.array());
+    }
+
+
+    private static void write(Path dir, String name, String text) throws IOException {
+        Files.write(dir.resolve(name), text.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String json(String singleQuoted) {
+        return singleQuoted.replace('\'', '"');
+    }
+
+
 }

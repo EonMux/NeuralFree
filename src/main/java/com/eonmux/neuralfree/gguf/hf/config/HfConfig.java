@@ -213,6 +213,24 @@ public final class HfConfig {
     }
 
     /**
+     * A copy with {@code architecture} renamed: for the fixups that normalize a checkpoint's
+     * alias architecture (e.g. LlamaEagleForCausalLM to the internal Eagle entry).
+     */
+    public HfConfig withArchitecture(String architecture) {
+        Map<String, Object> root = new LinkedHashMap<>(this.root);
+        root.put("architectures", Collections.singletonList(architecture));
+        Map<String, Object> merged = new LinkedHashMap<>(flat);
+        merged.put("architectures", Collections.singletonList(architecture));
+        return new HfConfig(dir, source, root, Collections.unmodifiableMap(merged), generation, architecture,
+                mistralNative, baseModelDir).renamed(architecture);
+    }
+
+    /** A copy with the architecture field itself renamed (the flat/root views already carry the name). */
+    private HfConfig renamed(String architecture) {
+        return new HfConfig(dir, source, root, flat, generation, architecture, mistralNative, baseModelDir);
+    }
+
+    /**
      * The model directory path of side file {@code name}, a name taken from file contents, validated by the
      * content-name rule: relative, no {@code ..} segment, no NUL, no drive or root, and lexically under the
      * model directory after normalization.
