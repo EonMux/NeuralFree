@@ -332,28 +332,39 @@ public final class HfSsmHybridHooksA {
     }
 
     /**
-     * {@code GraniteHybridModel.modify_tensors} (granite.py:514-518): the Granite MoE fused projections and shared
-     * MLP tensors always route through {@link HfGraniteHooks#moeTensors}; the other tensors of an SSM layer go
-     * through the Mamba 2 path and of an attention layer through the Granite MoE path; the rest (embeddings, the
-     * final norm) map through the plain Llama path.
+     * {@code GraniteHybridModel.modify_tensors} (granite.py:514-518) over the Granite layer rules.
      */
     public static void graniteHybridTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
+        HfConfig cfg = ctx.config();
+        int blockCount = ctx.blockCount();
+        graniteHybridTensor(ctx, hfName, src, out,
+                graniteAttnLayers(cfg, blockCount), graniteSsmLayers(cfg, blockCount));
+    }
+
+    /**
+     * The routing over the caller's layer lists: GraniteHybridModel.__init__ computes them from
+     * {@code self.get_attn_layers()}, whose NemotronHModel override (nemotron.py:481-490) reads the
+     * pattern the Nemotron readers resolve. The Granite MoE fused projections and shared MLP tensors
+     * always route through {@link HfGraniteHooks#moeTensors}; the other tensors of an SSM layer go
+     * through the Mamba 2 path and of an attention layer through the Granite MoE path; the rest
+     * (embeddings, the final norm) map through the plain Llama path.
+     */
+    static void graniteHybridTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out,
+                                    List<Integer> attnLayers, List<Integer> ssmLayers) throws IOException {
         if (out.isConsumed(hfName)) {
             return;
         }
-        HfConfig cfg = ctx.config();
         if (hfName.endsWith("block_sparse_moe.input_linear.weight") || hfName.contains("shared_mlp")) {
             HfGraniteHooks.moeTensors(ctx, hfName, src, out);
             return;
         }
         int bid = HfLoadContext.bidOf(hfName);
-        List<Integer> ssmLayers = graniteSsmLayers(cfg, ctx.blockCount());
         if (ssmLayers.contains(bid)) {
             HfSsmHooks.mamba2Tensor(ctx, hfName, src, out);
             return;
         }
-        if (graniteAttnLayers(cfg, ctx.blockCount()).contains(bid)) {
+        if (attnLayers.contains(bid)) {
             HfGraniteHooks.moeTensors(ctx, hfName, src, out);
             return;
         }
@@ -494,6 +505,19 @@ public final class HfSsmHybridHooksA {
      */
     public static void nemotronHTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
+        nemotronHTensor(ctx, hfName, src, out, nemotronIsMoe(ctx.config()));
+    }
+
+    /**
+     * The Nemotron-H tensor path with the MoE flag explicit: Puzzle is always a MoE build (nemotron.py:741).
+     * {@code NemotronHModel.modify_tensors} (nemotron.py:687-761): the folded MTP names rename first; then,
+     * on every block of a MoE build, the MoE mixer special cases (router bias through the plain path, the dt bias
+     * rename, the conv squeeze, the A/D negative-exponent single-column reshape, the grouped norm reshape and the
+     * routed experts stacked down/up); everything else routes through the hybrid path over the pattern's layer
+     * lists, the MTP block registered as an attention layer (nemotron.py:472-474).
+     */
+    static void nemotronHTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out, boolean moe)
+            throws IOException {
         if (out.isConsumed(hfName)) {
             return;
         }
@@ -506,7 +530,6 @@ public final class HfSsmHybridHooksA {
             name = special != null ? special.replace("{bid}", String.valueOf(mtp))
                     : "backbone.layers." + mtp + "." + suffix;
         }
-        boolean moe = nemotronIsMoe(cfg);
         if (moe && HfLoadContext.bidOf(name) >= 0) {
             if (name.endsWith("mixer.gate.e_score_correction.bias")) {
                 out.add(ctx.names().mapOrThrow(name), src);
@@ -542,7 +565,14 @@ public final class HfSsmHybridHooksA {
                 return;
             }
         }
-        graniteHybridTensor(ctx, name, src, out);
+        // the pattern's layer lists route the hybrid path; the folded MTP block registers
+        // as an attention layer (nemotron.py:472-474)
+        int blocks = nemotronHBlockCount(ctx);
+        List<Integer> attn = new ArrayList<>(nemotronAttnLayers(cfg, blocks, moe));
+        if (mtp >= 0) {
+            attn.add(mtp);
+        }
+        graniteHybridTensor(ctx, name, src, out, attn, nemotronSsmLayers(cfg, blocks, moe));
     }
 
     /** The per-load Nemotron MoE expert collector (nemotron.py:668-686), two parts down/up. */
@@ -659,7 +689,7 @@ public final class HfSsmHybridHooksA {
             name = name.substring(0, name.length() - "e_score_correction_bias".length())
                     + "e_score_correction.bias";
         }
-        nemotronHTensor(ctx, name, src, out);
+        nemotronHTensor(ctx, name, src, out, true);
     }
 
     /** {@link #nemotronHVocab}: the Puzzle shares the Nemotron-H vocabulary chain. */

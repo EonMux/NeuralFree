@@ -63,7 +63,7 @@ public class HfSsmHybridHooksATest {
                 .f32("backbone.layers.0.mixer.conv1d.weight", new long[]{4, 1, 3}, seq(12))
                 .f32("backbone.layers.0.mixer.A_log", new long[]{2}, new float[]{0f, 0f})
                 .f32("backbone.layers.1.mixer.q_proj.weight", new long[]{8, 8}, seq(64))
-                .f32("backbone.layers.1.block_sparse_moe.input_linear.weight", new long[]{2, 4, 8}, seq(64))
+                .f32("backbone.layers.1.block_sparse_moe.input_linear.weight", new long[]{2, 8, 8}, seq(128))
                 .f32("backbone.final_layer_norm.weight", new long[]{8}, seq(8)).index();
         String json = "{'architectures': ['GraniteMoeHybridForCausalLM'], " + GRANITE_BASE
                 + ", 'd_head': 2, 'layer_types': ['mamba', 'attention'], 'intermediate_size': 4}";
@@ -73,7 +73,7 @@ public class HfSsmHybridHooksATest {
         Sink out = plan(ctx);
         assertTrue(out.added.containsKey("blk.0.ssm_conv1d.weight"));
         assertTrue(out.added.containsKey("blk.1.attn_q.weight"));
-        assertArrayEquals(new long[]{2, 2, 8}, out.get("blk.1.ffn_gate_exps.weight").shape());
+        assertArrayEquals(new long[]{2, 4, 8}, out.get("blk.1.ffn_gate_exps.weight").shape());
         assertTrue(out.added.containsKey("output_norm.weight"));
     }
 
@@ -154,7 +154,8 @@ public class HfSsmHybridHooksATest {
         HfLoadContext ctx = context(fixed, entry("NemotronHPuzzleForCausalLM"), HfTensorIndex.of(Map.of()));
         entry("NemotronHPuzzleForCausalLM").meta().apply(ctx, kv, null);
         HfMetadata m = kv.build();
-        assertEquals(Arrays.asList(6L, 0L, 6L), m.get("nemotron_h_moe.feed_forward_length"));
+        // the reference writes moe_intermediate_size or 0 per block (nemotron.py:772)
+        assertEquals(Arrays.asList(0, 0, 6), m.get("nemotron_h_moe.feed_forward_length"));
         Integer latent = (Integer) m.get("nemotron_h_moe.moe_latent_size");
         assertEquals(8, latent.intValue());
         // the official checkpoint's model.* trunk names rename to backbone.*
@@ -166,8 +167,9 @@ public class HfSsmHybridHooksATest {
                 .f32("model.layers.0.mixer.norm.weight", new long[]{8}, seq(8)).index();
         Sink out = plan(context(fixed, entry("NemotronHPuzzleForCausalLM"), index));
         assertArrayEquals(new long[]{4, 3}, out.get("blk.0.ssm_conv1d.weight").shape());
-        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_a.weight").shape());
-        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_d.weight").shape());
+        // A_log/D map exactly, without the .weight suffix (tensor_mapping.py:3103-3112)
+        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_a").shape());
+        assertArrayEquals(new long[]{2, 1}, out.get("blk.0.ssm_d").shape());
         assertArrayEquals(new long[]{2, 4}, out.get("blk.0.ssm_norm.weight").shape());
         assertEquals(Arrays.asList(0, 2, 0), kv.build().get("nemotron_h_moe.attention.head_count_kv"));
     }

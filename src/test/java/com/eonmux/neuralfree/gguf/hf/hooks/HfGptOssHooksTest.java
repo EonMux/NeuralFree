@@ -13,10 +13,10 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.Map;
 
+import static com.eonmux.neuralfree.gguf.hf.hooks.HfLlamaHooksTest.bytes;
 import static com.eonmux.neuralfree.gguf.hf.hooks.HfQwenHooksTest.RecordingSink;
 import static com.eonmux.neuralfree.gguf.hf.hooks.HfQwenHooksTest.context;
 import static com.eonmux.neuralfree.gguf.hf.hooks.HfQwenHooksTest.floats;
@@ -94,14 +94,8 @@ public class HfGptOssHooksTest {
 
     @Test
     public void mxfp4GateUpDeInterleavesTheFusedRows() throws IOException {
-        // [E=2, 2F=8, K=32] stored form: rows 0::2 gate and 1::2 up; every row is one whole
-        // MXFP4 block of 32 elements, and the element values sit on the MXFP4 grid so the
-        // stored source's quant-dequant round trip is exact
-        float[] grid = {0f, 0.5f, 1f, 1.5f, 2f, 3f, 4f, 6f, -0f, -0.5f, -1f, -1.5f, -2f, -3f, -4f, -6f};
-        float[] srcValues = new float[2 * 8 * 32];
-        for (int i = 0; i < srcValues.length; i++) {
-            srcValues[i] = grid[i % 16];
-        }
+        // [E=2, 2F=8, K=32] stored form: packed rows of 17 bytes, one whole MXFP4 block each;
+        // rows 0::2 gate and 1::2 up (gpt_oss.py:74-81)
         HfLoadContext ctx = ctx(java.util.Collections.singletonMap(
                 "model.layers.0.mlp.experts.gate_up_proj.weight",
                 mono(ElementFormat.of(GGMLType.MXFP4), 2, 8, 32)));
@@ -110,17 +104,19 @@ public class HfGptOssHooksTest {
                 ctx.index().get("model.layers.0.mlp.experts.gate_up_proj.weight"), sink);
         java.util.List<RowSource> out = new java.util.ArrayList<>(sink.tensors.values());
         assertEquals(2, out.size());
-        // the gate/up sources keep the flat [E * 2F, K] rows: gate row i is flat row 2i, up row 2i + 1
+        // the gate/up sources keep the flat [E * 2F, K] rows: gate row k is packed row 2k, up row 2k + 1
         RowSource gate = out.get(0);
         assertArrayEquals(new long[]{8, 32}, gate.shape());
-        float[] wantGate = new float[256];
-        float[] wantUp = new float[256];
-        for (int i = 0; i < 256; i++) {
-            wantGate[i] = srcValues[2 * i];
-            wantUp[i] = srcValues[2 * i + 1];
+        byte[] wantGate = new byte[8 * 17];
+        byte[] wantUp = new byte[8 * 17];
+        for (int k = 0; k < 8; k++) {
+            for (int j = 0; j < 17; j++) {
+                wantGate[k * 17 + j] = packedByte(2 * k, j);
+                wantUp[k * 17 + j] = packedByte(2 * k + 1, j);
+            }
         }
-        assertArrayEquals(wantGate, values(gate), 0f);
-        assertArrayEquals(wantUp, values(out.get(1)), 0f);
+        assertArrayEquals(wantGate, bytes(gate));
+        assertArrayEquals(wantUp, bytes(out.get(1)));
     }
 
     @Test
@@ -184,30 +180,26 @@ public class HfGptOssHooksTest {
     // ------------------------------------------------------------------ helpers
 
     /**
-     * A synthetic stored source: {@code readRows} writes little-endian F32 (the dequantized view the converter
-     * computes) while the declared element format is {@code fmt}, so the hook's float branch is exercised.
+     * A synthetic stored source of packed rows: {@code rowBytes} is the format's packed row width and
+     * {@code readRows} writes row {@code r} as its scale byte {@code r} followed by the nibble bytes
+     * {@code 16 r .. 16 r + 15} — the packed layout a file-backed source reports.
      */
     static RowSource mono(ElementFormat fmt, long... shape) {
-        long n = 1;
-        for (long d : shape) {
-            n *= d;
-        }
-        float[] v = new float[(int) n];
-        for (int i = 0; i < v.length; i++) {
-            v[i] = i;
-        }
-        return new StoredSource(fmt, shape, v);
+        return new StoredSource(fmt, shape);
+    }
+
+    /** The synthesized byte {@code j} of packed row {@code r} (the {@link StoredSource} fill rule). */
+    private static byte packedByte(int r, int j) {
+        return j == 0 ? (byte) r : (byte) (r * 16 + j - 1);
     }
 
     static final class StoredSource implements RowSource {
         private final ElementFormat fmt;
         private final long[] shape;
-        private final float[] values;
 
-        StoredSource(ElementFormat fmt, long[] shape, float[] values) {
+        StoredSource(ElementFormat fmt, long[] shape) {
             this.fmt = fmt;
             this.shape = shape;
-            this.values = values;
         }
 
         @Override
@@ -236,7 +228,7 @@ public class HfGptOssHooksTest {
 
         @Override
         public long rowBytes() {
-            return 4L * shape[shape.length - 1];
+            return fmt.rowBytes(shape[shape.length - 1]);
         }
 
         @Override
@@ -246,12 +238,11 @@ public class HfGptOssHooksTest {
 
         @Override
         public void readRows(long first, int count, ByteBuffer dst) {
-            dst.order(ByteOrder.LITTLE_ENDIAN);
-            int perRow = (int) shape[shape.length - 1];
+            int perRow = (int) rowBytes();
             for (int i = 0; i < count; i++) {
-                long base = (first + i) * perRow;
+                int r = (int) (first + i);
                 for (int j = 0; j < perRow; j++) {
-                    dst.putFloat(values[(int) (base + j)]);
+                    dst.put(HfGptOssHooksTest.packedByte(r, j));
                 }
             }
         }

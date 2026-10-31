@@ -134,10 +134,10 @@ public final class HfGptOssHooks {
             throw new GgufFormatException("tensor '" + name + ": the fused gate/up row width " + rowsPerExpert
                     + " is not an even split");
         }
-        // the gate rows are the even rows of the fused stack, up the odd ones — kept as row-mapped
-        // views: reshaping the packed stack would break its block byte accounting
-        out.add(ctx.names().mapOrThrow(gate), RowTransforms.interleaveRows(src, 2, 0));
-        out.add(ctx.names().mapOrThrow(up), RowTransforms.interleaveRows(src, 2, 1));
+        // the gate rows are the even flat rows of the fused stack, up the odd ones — kept as row-mapped
+        // views over the [E * 2F, K] rows: reshaping the packed stack would break its block byte accounting
+        out.add(ctx.names().mapOrThrow(gate), RowTransforms.interleaveFlatRows(src, 2, 0));
+        out.add(ctx.names().mapOrThrow(up), RowTransforms.interleaveFlatRows(src, 2, 1));
     }
 
     /** The {@code [E, 2F]} biases, gate rows {@code [i::2]} and up rows {@code [i+1::2]} (gpt_oss.py:110-112). */

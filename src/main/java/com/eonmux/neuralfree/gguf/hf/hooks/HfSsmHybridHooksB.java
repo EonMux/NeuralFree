@@ -306,6 +306,9 @@ public final class HfSsmHybridHooksB {
      * flat configuration the generic metadata reads.
      */
     public static HfConfig d1OmniFixup(HfConfig cfg) {
+        if (cfg.flat().get("intermediate_size") instanceof List) {
+            return cfg; // the patch already ran; the reference loads the hparams once (lfm2.py:174-183)
+        }
         long nLayer = cfg.requireInt("num_hidden_layers");
         long nLayerHead = cfg.requireInt("head_layers");
         OptionalDouble multiplier = cfg.findFloat("block_ffn_dim_multiplier");
@@ -411,7 +414,7 @@ public final class HfSsmHybridHooksB {
 
     /**
      * {@code LFM2MoeModel.set_gguf_parameters}' key/value patch (lfm2.py:290-293): the per-layer key/value vector
-     * patches, zero off the {@code full_attention} layers.
+     * patches, the scalar on the {@code full_attention} layers and 0 elsewhere.
      */
     public static HfConfig lfm2MoeFixup(HfConfig cfg) {
         Object types = cfg.flat().get("layer_types");
@@ -422,7 +425,17 @@ public final class HfSsmHybridHooksB {
         if (!(heads instanceof Number)) {
             return cfg;
         }
-        return cfg.withFlat(Map.of("num_key_value_heads", perLayerKv((List<?>) types, "full_attention", heads)));
+        return cfg.withFlat(Map.of("num_key_value_heads", perLayerKeepKv((List<?>) types, "full_attention", heads)));
+    }
+
+    /** The per-layer vector: the scalar on the {@code keepType} layers, 0 elsewhere (lfm2.py:290-293). */
+    private static List<Number> perLayerKeepKv(List<?> types, String keepType, Object heads) {
+        long value = ((Number) heads).longValue();
+        List<Number> out = new ArrayList<>(types.size());
+        for (Object t : types) {
+            out.add(keepType.equals(t) ? value : 0L);
+        }
+        return out;
     }
 
     /**
@@ -459,11 +472,12 @@ public final class HfSsmHybridHooksB {
         lfm2Tensor(ctx, hfName, src, out);
     }
 
-    /** The per-load LFM2 MoE expert collector (lfm2.py:339-359). */
+    /** The per-load LFM2 MoE expert collector (lfm2.py:339-359); the merged name drops the {@code model.} prefix
+     * (lfm2.py:352 {@code layers.<b>.feed_forward.experts.<part>.weight}). */
     private static HfHookSupport.ExpertCollector lfm2MoeExperts(HfLoadContext ctx, int nExperts) {
         return ctx.state(HfSsmHybridHooksB.class.getName() + ".experts", HfHookSupport.ExpertCollector.class,
                 () -> new HfHookSupport.ExpertCollector(nExperts, Arrays.asList("w1", "w2", "w3"),
-                        HfHookSupport.MergedName.SAME_PREFIX));
+                        (prefix, part, tail) -> prefix.replaceFirst("^model\\.", "") + "." + part + tail));
     }
 
     /** {@code LFM2MoeModel.prepare_tensors}' unprocessed-experts assertion (lfm2.py:364-366). */

@@ -197,6 +197,23 @@ public final class RowTransforms {
     }
 
     /**
+     * {@code src[offset::stride]} over the flat {@code [rows, innermost]} rows of a rank-N source: only rows
+     * regroup, so a packed stack keeps its block byte accounting.
+     */
+    public static RowSource interleaveFlatRows(RowSource src, int stride, int offset) {
+        long d0 = src.rows();
+        if (stride <= 0 || offset < 0 || offset >= stride) {
+            throw new IllegalArgumentException(src.describe() + ": [" + offset + "::" + stride + "] is not a valid"
+                    + " stride slice");
+        }
+        long n = d0 > offset ? (d0 - offset + stride - 1) / stride : 0;
+        long[] outShape = {n, src.shape()[src.shape().length - 1]};
+        RowIndex index = r -> offset + r * stride;
+        return new RowMap(src.describe() + " [" + offset + "::" + stride + "]",
+                Collections.singletonList(src), outShape, index, null, null);
+    }
+
+    /**
      * {@code src.narrow(dim, from, count)}: a slice along any dimension. The innermost dimension is a column slice
      * ({@link ColumnTransforms#sliceCols}); an outer one keeps whole rows.
      *

@@ -75,12 +75,11 @@ public class HfSsmHybridHooksBTest {
         // (2 * 6 / 3) rounded to a multiple of 2 with no multiplier
         assertEquals(4, m.get("lfm2.feed_forward_length"));
         assertEquals(4, m.get("lfm2.shortconv.l_cache"));
-        assertEquals(1e-05, (Double) m.get("lfm2.attention.layer_norm_rms_epsilon"), 1e-12);
+        assertEquals(1e-05f, m.get("lfm2.attention.layer_norm_rms_epsilon"));
     }
 
     @Test
     public void theMoeFixupZeroesEveryLayerButFullAttentionAndStacksTheExperts() throws IOException {
-        cfg("/moe");
         String json = "{'architectures': ['Lfm2MoeForCausalLM'], " + LFM2_BASE
                 + ", 'layer_types': ['full_attention', 'shortconv', 'conv'], 'block_auto_adjust_ff_dim': false,"
                 + " 'moe_intermediate_size': 5, 'num_dense_layers': 1, 'score_func': 'sigmoid',"
@@ -112,8 +111,8 @@ public class HfSsmHybridHooksBTest {
     public void theD1OmniHeadFoldsIntoTheTrunkArrays() throws IOException {
         String json = "{'architectures': ['D1OmniModel'], " + LFM2_BASE
                 + ", 'layer_types': ['full_attention', 'shortconv', 'conv'], 'block_auto_adjust_ff_dim': true,"
-                + " 'block_ffn_dim_multiplier': 1.0, 'hidden_size': 8, 'head_layers': 1,"
-                + " 'max_length': 16384, 'image_text_length': 896, 'audio_text_length': 15360,"
+                + " 'intermediate_size': 6, 'block_ffn_dim_multiplier': 1.0, 'hidden_size': 8, 'head_layers': 1,"
+                + " 'head_dim': 4, 'max_length': 16384, 'image_text_length': 896, 'audio_text_length': 15360,"
                 + " 'temperatures': {'choice:3-5': 0.5, 'choice:11+': 0.25}}";
         HfConfig fixed = HfSsmHybridHooksB.d1OmniFixup(cfg(json));
         assertEquals(4, fixed.blockCount());
@@ -124,11 +123,12 @@ public class HfSsmHybridHooksBTest {
         entry("D1OmniModel").meta().apply(ctx, b, null);
         HfMetadata m = b.build();
         assertEquals(4, m.get("lfm2.block_count"));
-        assertEquals(4L, m.get("lfm2.embedding_length_out") == null ? 4 : m.get("lfm2.attention.key_length"));
+        assertEquals(4, m.get("lfm2.attention.key_length"));
         assertEquals("lfm2-d1-omni", m.get("lfm2.decision.type"));
         assertEquals(1, m.get("lfm2.decision.block_count"));
-        assertEquals(0.5, (Double) m.get("lfm2.decision.temperature.choice.3_5"), 0.0);
-        assertFalseHelper(tail(m));
+        assertEquals(0.5f, m.get("lfm2.decision.temperature.choice.3_5"));
+        // the ADD_BOS=false write belongs to set_vocab (lfm2.py:199-200), not to set_gguf_parameters
+        assertNull(tail(m));
         // the head blocks fold: head.layers. becomes blk.{trunk+bid}
         ckpt = new Checkpoint(tmp.getRoot().toPath());
         HfTensorIndex index = ckpt
@@ -139,10 +139,6 @@ public class HfSsmHybridHooksBTest {
 
     private static Object tail(HfMetadata m) {
         return m.get("lfm2.tokenizer.ggml.add_bos_token");
-    }
-
-    private static void assertFalseHelper(Object v) {
-        org.junit.Assert.assertEquals(Boolean.FALSE, v);
     }
 
     @Test
