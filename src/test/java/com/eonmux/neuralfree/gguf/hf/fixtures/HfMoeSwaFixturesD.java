@@ -39,21 +39,31 @@ public final class HfMoeSwaFixturesD {
         b.bf16("model.embed_tokens.weight", 8, 8);
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
-            attention(b, p);
+            b.bf16(p + "input_layernorm.weight", DIM);
+            b.bf16(p + "post_attention_layernorm.weight", DIM);
             if (l == 0) {
+                // the sliding layer runs the attention_other_setting widths (1 head of 4)
+                b.bf16(p + "self_attn.q_proj.weight", 4, DIM);
+                b.bf16(p + "self_attn.k_proj.weight", 4, DIM);
+                b.bf16(p + "self_attn.v_proj.weight", 4, DIM);
+                b.bf16(p + "self_attn.o_proj.weight", DIM, 4);
                 b.bf16(p + "mlp.gate_proj.weight", 8, DIM);
                 b.bf16(p + "mlp.up_proj.weight", 8, DIM);
                 b.bf16(p + "mlp.down_proj.weight", DIM, 8);
             } else {
-                b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
+                b.bf16(p + "self_attn.q_proj.weight", DIM, DIM);
+                b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
+                b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
+                b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
+                // the step3.5 MoE forms: the moe.gate router and the merged expert stacks
+                // (tensor_mapping.py:534/666/758)
+                b.bf16(p + "moe.gate.weight", EXPERTS, DIM);
+                b.bf16(p + "moe.gate_proj.weight", EXPERTS, FF, DIM);
+                b.bf16(p + "moe.up_proj.weight", EXPERTS, FF, DIM);
+                b.bf16(p + "moe.down_proj.weight", EXPERTS, DIM, FF);
                 b.bf16(p + "mlp.shared_expert.gate_proj.weight", 4, DIM);
                 b.bf16(p + "mlp.shared_expert.up_proj.weight", 4, DIM);
                 b.bf16(p + "mlp.shared_expert.down_proj.weight", DIM, 4);
-                for (int x = 0; x < EXPERTS; x++) {
-                    b.bf16(p + "mlp.experts." + x + ".gate_proj.weight", FF, DIM);
-                    b.bf16(p + "mlp.experts." + x + ".up_proj.weight", FF, DIM);
-                    b.bf16(p + "mlp.experts." + x + ".down_proj.weight", DIM, FF);
-                }
             }
         }
         b.bf16("model.norm.weight", DIM);
@@ -68,6 +78,7 @@ public final class HfMoeSwaFixturesD {
                 + " 'post_norm_eps': 1e-05, 'sliding_window': 4,"
                 + " 'layer_types': ['sliding_attention', 'full_attention'],"
                 + " 'moe_hidden_size': 2, 'moe_intermediate_size': 4, 'moe_top_k': 1,"
+                + " 'num_experts': 2, 'num_experts_per_tok': 1,"
                 + " 'routed_scaling_factor': 1.0, 'residual_gate_temperature': 1.0,"
                 + " 'num_hidden_layers': 2, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05, 'rope_theta': 10000.0,"
@@ -76,20 +87,26 @@ public final class HfMoeSwaFixturesD {
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             b.bf16(p + "input_layernorm.weight", DIM);
-            b.bf16(p + "post_attention_layernorm.weight", DIM);
+            // the muse-spark norms: the ffn pre/post norms; no post-attention norm
             b.bf16(p + "pre_feedforward_layernorm.weight", DIM);
             b.bf16(p + "post_feedforward_layernorm.weight", DIM);
-            b.bf16(p + "pre_expert_norm.weight", DIM);
-            b.bf16(p + "post_expert_norm.weight", DIM);
+            b.bf16(p + "mlp.pre_expert_norm.weight", DIM);
+            b.bf16(p + "mlp.experts.post_expert_norm.weight", DIM);
             b.bf16(p + "self_attn.q_proj.weight", DIM, DIM);
             b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
             b.bf16(p + "post_attention_residual_gate.gate", 4);
             b.bf16(p + "post_feedforward_residual_gate.gate", 4);
+            b.bf16(p + "self_attn.attn_gate_proj.weight", DIM, DIM);
             b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
+            // the muse router bias (tensor_patterns.tsv:355) and the latent projections
+            // (tensor_patterns.tsv:468/470; the latent width is moe_hidden_size)
+            b.bf16(p + "mlp.gate.e_score_correction_bias", EXPERTS);
+            b.bf16(p + "mlp.pre_expert_proj.weight", 2, DIM);
+            b.bf16(p + "mlp.post_expert_proj.weight", DIM, 2);
             b.bf16(p + "mlp.experts.gate_up_proj", EXPERTS, 2 * FF, DIM);
-            b.bf16(p + "mlp.experts.down_proj", EXPERTS, FF, DIM);
+            b.bf16(p + "mlp.experts.down_proj", EXPERTS, DIM, FF);
         }
         b.bf16("model.norm.weight", DIM);
         b.bf16("lm_head.weight", 8, 8);
@@ -113,16 +130,15 @@ public final class HfMoeSwaFixturesD {
             b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
+            b.bf16(p + "self_attn.o_proj.bias", DIM);
             b.bf16(p + "self_attn.sinks", 2);
             b.bf16(p + "mlp.router.weight", EXPERTS, DIM);
             b.bf16(p + "mlp.router.bias", EXPERTS);
-            for (int x = 0; x < EXPERTS; x++) {
-                String ep = p + "mlp.experts." + x + ".";
-                b.bf16(ep + "gate_up_proj", 8, 2 * FF);
-                b.bf16(ep + "gate_up_proj.bias", 2 * FF);
-                b.bf16(ep + "down_proj", 8, FF);
-                b.bf16(ep + "down_proj.bias", 8);
-            }
+            // the merged expert forms the gpt-oss hook and map handle (the hooks-test names)
+            b.bf16(p + "mlp.experts.gate_up_proj.weight", EXPERTS, DIM, 2 * FF);
+            b.bf16(p + "mlp.experts.gate_up_proj_bias", EXPERTS, 2 * FF);
+            b.bf16(p + "mlp.experts.down_proj.weight", EXPERTS, FF, DIM);
+            b.bf16(p + "mlp.experts.down_proj.bias", EXPERTS, DIM);
         }
         b.bf16("model.norm.weight", DIM);
         b.bf16("lm_head.weight", 8, 8);
