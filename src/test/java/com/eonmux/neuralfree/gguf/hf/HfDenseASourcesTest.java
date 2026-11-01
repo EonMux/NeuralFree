@@ -40,8 +40,8 @@ public class HfDenseASourcesTest {
     @Test
     public void everyPartAFixtureBuildsASpecClaimingItsTensors() throws IOException {
         for (HfDenseFixturesA.Named f : HfDenseFixturesA.all()) {
-            Path dir = f.fixture.get().write(tmp.newFolder("hf").toPath());
-            buildAndClaim(dir, tmp.newFolder("cache").toPath());
+            Path dir = f.fixture.get().write(tmp.newFolder(f.hfArch + "-hf").toPath());
+            buildAndClaim(dir, tmp.newFolder(f.hfArch + "-cache").toPath());
         }
     }
 

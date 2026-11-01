@@ -163,6 +163,7 @@ final class HfArchTableDenseClassic {
                 HfArchEntry.of(Collections.singletonList("OpenELMForCausalLM"), HfArchResolver.of(Arch.OPENELM),
                                 HfDenseClassicHooksE::openelmMeta, HfDenseClassicHooksE::openelmTensors,
                                 HfDenseClassicHooksE::openelmVocab)
+                        .withConfigFixup(HfDenseClassicHooksE::openelmFixup)
                         .withBlockCount(HfArchTableDenseClassic::openelmBlocks),
                 HfArchEntry.of(Collections.singletonList("OrionForCausalLM"), HfArchResolver.of(Arch.ORION),
                                 HfDenseClassicHooksE::orionMeta, HfTensorHook.DEFAULT,

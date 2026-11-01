@@ -36,8 +36,8 @@ public class HfSsmSsmSourcesTest {
     @Test
     public void everySsmFixtureBuildsASpecClaimingItsTensors() throws IOException {
         for (HfSsmFixturesSsm.Named f : HfSsmFixturesSsm.all()) {
-            Path dir = f.fixture.get().write(tmp.newFolder("hf").toPath());
-            buildAndClaim(dir, tmp.newFolder("cache").toPath());
+            Path dir = f.fixture.get().write(tmp.newFolder(f.hfArch + "-hf").toPath());
+            buildAndClaim(dir, tmp.newFolder(f.hfArch + "-cache").toPath());
         }
     }
 

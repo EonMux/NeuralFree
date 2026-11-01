@@ -143,6 +143,14 @@ public final class HfDenseClassicHooksE {
         return Collections.unmodifiableList(dims);
     }
 
+    /**
+     * {@code OpenELMModel.find_hparam}'s n_layers alias (openelm.py:68-72): every layer-count lookup reads
+     * {@code num_transformer_layers}, so the fixed-up configuration carries it as {@code num_hidden_layers}.
+     */
+    public static HfConfig openelmFixup(HfConfig cfg) {
+        return cfg.withFlat(Map.of("num_hidden_layers", (long) cfg.requireInt("num_transformer_layers")));
+    }
+
     /** {@code OpenELMModel._make_divisible} (openelm.py:17-21): round to a multiple of {@code divisor}, and never round down by more than 10 percent. */
     static long makeDivisible(double v, int divisor) {
         long newV = Math.max(divisor, (long) (v + divisor / 2.0) / divisor * divisor);
@@ -160,8 +168,10 @@ public final class HfDenseClassicHooksE {
         kv.set(GgufKeys.CONTEXT_LENGTH, cfg.requireInt("max_context_length"));
         kv.set(GgufKeys.EMBEDDING_LENGTH, cfg.requireInt("model_dim"));
         kv.set(GgufKeys.FEED_FORWARD_LENGTH, openelmFfnDims(ctx));
-        kv.set(GgufKeys.ATTENTION_HEAD_COUNT, cfg.findIntList("num_query_heads"));
-        kv.set(GgufKeys.ATTENTION_HEAD_COUNT_KV, cfg.findIntList("num_kv_heads"));
+        kv.set(GgufKeys.ATTENTION_HEAD_COUNT, cfg.findIntList("num_query_heads").orElseThrow(() ->
+                new GgufFormatException(cfg.source() + ": required key 'num_query_heads' is missing")));
+        kv.set(GgufKeys.ATTENTION_HEAD_COUNT_KV, cfg.findIntList("num_kv_heads").orElseThrow(() ->
+                new GgufFormatException(cfg.source() + ": required key 'num_kv_heads' is missing")));
         kv.set(GgufKeys.ROPE_FREQ_BASE, requireDouble(cfg, "rope_freq_constant"));
         kv.set(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS, 1e-6);
         kv.set(GgufKeys.ROPE_DIMENSION_COUNT, headDim);

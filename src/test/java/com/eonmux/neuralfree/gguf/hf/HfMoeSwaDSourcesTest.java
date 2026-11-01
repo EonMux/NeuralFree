@@ -33,8 +33,8 @@ public class HfMoeSwaDSourcesTest {
     @Test
     public void everyPartDFixtureBuildsASpecClaimingItsTensors() throws IOException {
         for (HfMoeSwaFixturesD.Named f : HfMoeSwaFixturesD.all()) {
-            Path dir = f.fixture.get().write(tmp.newFolder("hf").toPath());
-            buildAndClaim(dir, tmp.newFolder("cache").toPath());
+            Path dir = f.fixture.get().write(tmp.newFolder(f.hfArch + "-hf").toPath());
+            buildAndClaim(dir, tmp.newFolder(f.hfArch + "-cache").toPath());
         }
     }
 

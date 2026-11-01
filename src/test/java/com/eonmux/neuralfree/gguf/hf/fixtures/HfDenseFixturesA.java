@@ -19,6 +19,7 @@ public final class HfDenseFixturesA {
     private static final int KV = 4;
     private static final int FFN = 2 * DIM;
     private static final int VOCAB = 8;
+    private static final int HEAD_DIM = 4;
 
     private HfDenseFixturesA() {
     }
@@ -50,6 +51,24 @@ public final class HfDenseFixturesA {
         for (int slot = 0; slot < 3; slot++) {
             b.bf16("model.altup_projections." + slot + ".weight", 8, 16);
             b.bf16("model.altup_unembed_projections." + slot + ".weight", 16, 8);
+        }
+        // the per-layer-input (PLE) and AltUp tensors the GEMMA3N catalog requires
+        b.bf16("model.embed_tokens_per_layer.weight", VOCAB, 8);
+        b.bf16("model.per_layer_model_projection.weight", 8, 8);
+        b.bf16("model.per_layer_projection_norm.weight", 8);
+        for (int l = 0; l < LAYERS; l++) {
+            String p = "model.layers." + l + ".";
+            b.bf16(p + "per_layer_input_gate.weight", 8, 8);
+            b.bf16(p + "per_layer_projection.weight", 8, 8);
+            b.bf16(p + "post_per_layer_input_norm.weight", 8);
+            b.bf16(p + "altup.correction_coefs.weight", 4);
+            b.bf16(p + "altup.correct_output_scale", 1);
+            b.bf16(p + "altup.prediction_coefs.weight", 4);
+            b.bf16(p + "altup.modality_router.weight", 8, 8);
+            b.bf16(p + "altup.router_norm.weight", 8);
+            b.bf16(p + "laurel.linear_left.weight", 8, 8);
+            b.bf16(p + "laurel.linear_right.weight", 8, 8);
+            b.bf16(p + "laurel.post_laurel_norm.weight", 8);
         }
         return b;
     }
@@ -90,7 +109,7 @@ public final class HfDenseFixturesA {
         SyntheticHf.Builder b = builder("{'architectures': ['Qwen2VLForConditionalGeneration'], 'model_type': 'qwen2_vl',"
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-06, 'rope_theta': 10000.0,"
-                + " 'vocab_size': 8}");
+                + " 'vocab_size': 8, 'rope_scaling': {'rope_type': 'mrope', 'mrope_section': [1, 1, 0]}}");
         qwen(b);
         return b;
     }
@@ -100,8 +119,13 @@ public final class HfDenseFixturesA {
         SyntheticHf.Builder b = builder("{'architectures': ['Qwen3VLForConditionalGeneration'], 'model_type': 'qwen3_vl',"
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-06, 'rope_theta': 10000.0,"
-                + " 'vocab_size': 8, 'vision_config': {'deepstack_visual_indexes': [0, 1]}}");
+                + " 'vocab_size': 8, 'vision_config': {'deepstack_visual_indexes': [0, 1]},"
+                + " 'rope_scaling': {'rope_type': 'mrope', 'mrope_section': [1, 1, 0]}}");
         qwen(b);
+        for (int l = 0; l < LAYERS; l++) {
+            b.bf16("model.layers." + l + ".self_attn.q_norm.weight", 4);
+            b.bf16("model.layers." + l + ".self_attn.k_norm.weight", 4);
+        }
         return b;
     }
 
@@ -110,8 +134,12 @@ public final class HfDenseFixturesA {
         SyntheticHf.Builder b = builder("{'architectures': ['Qwen3ASRForConditionalGeneration'], 'model_type': 'qwen3_asr',"
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-06, 'rope_theta': 10000.0,"
-                + " 'vocab_size': 8}");
+                + " 'vocab_size': 8, 'rope_scaling': {'rope_type': 'mrope', 'mrope_section': [1, 1, 0]}}");
         qwen(b);
+        for (int l = 0; l < LAYERS; l++) {
+            b.bf16("model.layers." + l + ".self_attn.q_norm.weight", 4);
+            b.bf16("model.layers." + l + ".self_attn.k_norm.weight", 4);
+        }
         return b;
     }
 
@@ -125,6 +153,13 @@ public final class HfDenseFixturesA {
             b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
+            // the gemma3 q/k norms (attn_q_norm/attn_k_norm) and the ffn pre/post norms
+            // (gemma.py:915-917 pre_feedforward_layernorm -> ffn_norm; the post_feedforward
+            // norm maps through the base table to post_ffw_norm)
+            b.bf16(p + "self_attn.q_norm.weight", HEAD_DIM);
+            b.bf16(p + "self_attn.k_norm.weight", HEAD_DIM);
+            b.bf16(p + "pre_feedforward_layernorm.weight", DIM);
+            b.bf16(p + "post_feedforward_layernorm.weight", DIM);
             b.bf16(p + "post_attention_layernorm.weight", DIM);
             b.bf16(p + "mlp.gate_proj.weight", FFN, DIM);
             b.bf16(p + "mlp.up_proj.weight", FFN, DIM);

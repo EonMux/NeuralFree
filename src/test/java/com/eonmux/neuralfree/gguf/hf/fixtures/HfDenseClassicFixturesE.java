@@ -36,6 +36,8 @@ public final class HfDenseClassicFixturesE {
             b.bf16(p + "attn_norm.weight", DIM);
             b.bf16(p + "attn.qkv_proj.weight", 2 * DIM + KV, DIM);
             b.bf16(p + "attn.out_proj.weight", DIM, DIM);
+            b.bf16(p + "attn.q_norm.weight", 4);
+            b.bf16(p + "attn.k_norm.weight", 4);
             b.bf16(p + "ffn.proj_1.weight", 2 * FF, DIM);
             b.bf16(p + "ffn.proj_2.weight", DIM, FF);
             b.bf16(p + "ffn_norm.weight", DIM);
@@ -47,22 +49,29 @@ public final class HfDenseClassicFixturesE {
     /** {@code PhiForCausalLM} (phi-2): the unpermuted Phi attention with its partial rotary factor. */
     public static SyntheticHf.Builder phi2() {
         SyntheticHf.Builder b = builder("{'architectures': ['PhiForCausalLM'], 'hidden_size': 8,"
-                + " 'num_attention_heads': 4, 'num_key_value_heads': 4, 'num_hidden_layers': 2,"
+                + " 'num_attention_heads': 2, 'num_key_value_heads': 2, 'num_hidden_layers': 2,"
                 + " 'max_position_embeddings': 64, 'partial_rotary_factor': 0.5, 'layer_norm_epsilon': 1e-05,"
                 + " 'vocab_size': 8}");
         b.bf16("transformer.embd.wte.weight", 8, 8);
+        b.bf16("transformer.ln_f.weight", DIM);
+        b.bf16("transformer.ln_f.bias", DIM);
         for (int l = 0; l < LAYERS; l++) {
             String p = "transformer.h." + l + ".";
             b.bf16(p + "ln_1.weight", DIM);
+            b.bf16(p + "ln_1.bias", DIM);
             b.bf16(p + "attn.q_proj.weight", DIM, DIM);
             b.bf16(p + "attn.k_proj.weight", DIM, DIM);
             b.bf16(p + "attn.v_proj.weight", DIM, DIM);
             b.bf16(p + "attn.out_proj.weight", DIM, DIM);
-            b.bf16(p + "ln_2.weight", DIM);
+            b.bf16(p + "attn.out_proj.bias", DIM);
+            // phi2's graph loads no post-attention norm (phi2.cpp has no FFN_NORM load)
             b.bf16(p + "mlp.fc1.weight", 2 * FF, DIM);
+            b.bf16(p + "mlp.fc1.bias", 2 * FF);
             b.bf16(p + "mlp.fc2.weight", DIM, 2 * FF);
+            b.bf16(p + "mlp.fc2.bias", DIM);
         }
         b.bf16("lm_head.weight", 8, 8);
+        b.bf16("lm_head.bias", 8);
         return b;
     }
 
@@ -71,21 +80,26 @@ public final class HfDenseClassicFixturesE {
         SyntheticHf.Builder b = builder("{'architectures': ['Starcoder2ForCausalLM'], 'hidden_size': 8,"
                 + " 'intermediate_size': 8, 'num_hidden_layers': 2, 'num_attention_heads': 2,"
                 + " 'num_key_value_heads': 1, 'vocab_size': 8, 'max_position_embeddings': 64,"
-                + " 'rms_norm_eps': 1e-05, 'rope_theta': 10000.0}");
+                + " 'layer_norm_epsilon': 1e-05, 'rope_theta': 10000.0, 'partial_rotary_factor': 0.5}");
         b.bf16("model.embed_tokens.weight", 8, 8);
+        b.bf16("model.norm.bias", DIM);
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             b.bf16(p + "input_layernorm.weight", DIM);
+            b.bf16(p + "input_layernorm.bias", DIM);
             b.bf16(p + "self_attn.q_proj.weight", DIM, DIM);
             b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
-            b.bf16(p + "self_attn.q_norm.weight", 4);
-            b.bf16(p + "self_attn.k_norm.weight", 4);
+            b.bf16(p + "self_attn.o_proj.bias", DIM);
             b.bf16(p + "post_attention_layernorm.weight", DIM);
-            b.bf16(p + "mlp.gate_proj.weight", FF, DIM);
-            b.bf16(p + "mlp.up_proj.weight", FF, DIM);
-            b.bf16(p + "mlp.down_proj.weight", DIM, FF);
+            b.bf16(p + "post_attention_layernorm.bias", DIM);
+            // the starcoder2 mlp is the GPT-2 form: c_fc up and c_proj down, no gate;
+            // the arch carries no q/k norms (constants.py STARCODER2)
+            b.bf16(p + "mlp.c_fc.weight", FF, DIM);
+            b.bf16(p + "mlp.c_fc.bias", FF);
+            b.bf16(p + "mlp.c_proj.weight", DIM, FF);
+            b.bf16(p + "mlp.c_proj.bias", DIM);
         }
         b.bf16("model.norm.weight", DIM);
         b.bf16("lm_head.weight", 8, 8);
@@ -97,9 +111,11 @@ public final class HfDenseClassicFixturesE {
         SyntheticHf.Builder b = builder("{'architectures': ['Spark2_5ForCausalLM'], 'hidden_size': 8,"
                 + " 'head_dim': 4, 'num_hidden_layers': 2, 'num_attention_heads': 2,"
                 + " 'num_key_value_heads': 2, 'vocab_size': 8, 'sliding_window': 4,"
+                + " 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05,"
                 + " 'layer_types': ['sliding_attention', 'full_attention'], 'gate_attn_act_mode': 'sigmoid',"
                 + " 'headwise_attn_output_gate': true, 'hidden_act': 'gelu',"
-                + " 'partial_rotary_factor': 0.5}");
+                + " 'rope_scaling': {'full_attention': {'partial_rotary_factor': 0.5},"
+                + " 'sliding_attention': {'partial_rotary_factor': 0.5}}}");
         b.bf16("model.embed_tokens.weight", 8, 8);
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
@@ -123,23 +139,27 @@ public final class HfDenseClassicFixturesE {
                 + " 'head_dim': 4, 'num_hidden_layers': 2, 'num_attention_heads': 2, 'num_key_value_heads': 2,"
                 + " 'vocab_size': 8, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05,"
                 + " 'rope_theta': 10000.0}");
-        b.bf16("model.token_embd.weight", 8, 8);
+        b.bf16("model.embed.weight", 8, 8);
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.blocks." + l + ".";
-            b.bf16(p + "norm.weight", DIM);
+            // the TALKIE arch carries no ATTN_NORM/FFN_NORM (constants.py TALKIE); the
+            // query-side head gain is the ATTN_Q_NORM (tensor_patterns.tsv:541)
             b.bf16(p + "attn.attn_query.weight", DIM, DIM);
             b.bf16(p + "attn.attn_key.weight", DIM, DIM);
             b.bf16(p + "attn.attn_value.weight", DIM, DIM);
-            b.bf16(p + "attn.attn_out.weight", DIM, DIM);
-            b.f32(p + "attn_gain.a_g", DIM);
+            b.bf16(p + "attn.attn_resid.weight", DIM, DIM);
+            b.f32(p + "attn_gain.a_g", 1);
+            b.f32(p + "embed_skip.a_g", 1);
             b.bf16(p + "attn.head_gain.head_g", 2);
-            b.bf16(p + "norm2.weight", DIM);
-            b.bf16(p + "mlp.w1.weight", FF, DIM);
-            b.bf16(p + "mlp.w2.weight", DIM, FF);
-            b.f32(p + "mlp_gain.a_g", DIM);
+            b.bf16(p + "mlp.mlp_gate.weight", FF, DIM);
+            b.bf16(p + "mlp.mlp_linear.weight", FF, DIM);
+            b.bf16(p + "mlp.mlp_resid.weight", DIM, FF);
+            b.f32(p + "mlp_gain.a_g", 1);
         }
         b.bf16("model.lm_head.weight", 8, 8);
-        b.f32("lm_head_gain.w_g", 1);
+        // the logit scale must be positive (talkie.py:33-35 turns the gain into add_logit_scale)
+        b.tensor("lm_head_gain.w_g", com.eonmux.neuralfree.io.safetensors.StDType.F32, new long[]{1},
+                com.eonmux.neuralfree.gguf.testutil.SyntheticHf.f32(2.0f));
         return b;
     }
 
@@ -149,8 +169,8 @@ public final class HfDenseClassicFixturesE {
         SyntheticHf.Builder b = builder("{'architectures': ['GraniteSwitchForCausalLM'], 'hidden_size': 8,"
                 + " 'num_attention_heads': 2, 'num_key_value_heads': 1, 'head_dim': 4, 'num_hidden_layers': 2,"
                 + " 'vocab_size': 8, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05, 'rope_theta': 10000.0,"
-                + " 'num_adapters': 1, 'max_lora_rank': 2, 'adapter_token_ids': [3, 4],"
-                + " 'adapter_substitute_token_ids': [5, 6], 'adapter_names': ['ratescore'],"
+                + " 'num_adapters': 1, 'max_lora_rank': 2, 'adapter_token_ids': [3],"
+                + " 'adapter_substitute_token_ids': [5], 'adapter_names': ['ratescore'],"
                 + " 'shared_intermediate_size': 4, 'num_experts_per_tok': 1,"
                 + " 'attention_multiplier': 1.0, 'embedding_multiplier': 1.0, 'residual_multiplier': 1.0,"
                 + " 'logits_scaling': 1.0}");
@@ -161,8 +181,10 @@ public final class HfDenseClassicFixturesE {
             b.bf16(p + "self_attn.qkv_proj.base_layer.weight", DIM + KV + KV, DIM);
             b.bf16(p + "self_attn.qkv_proj.lora_A_slices.0", 1, 1, 2, 8);
             b.bf16(p + "self_attn.qkv_proj.lora_A_slices.1", 1, 1, 2, 8);
+            b.bf16(p + "self_attn.qkv_proj.lora_A_slices.2", 1, 1, 2, 8);
             b.bf16(p + "self_attn.qkv_proj.lora_B_slices.0", 1, 1, 8, 2);
             b.bf16(p + "self_attn.qkv_proj.lora_B_slices.1", 1, 1, KV, 2);
+            b.bf16(p + "self_attn.qkv_proj.lora_B_slices.2", 1, 1, KV, 2);
             b.bf16(p + "self_attn.o_proj.base_layer.weight", DIM, DIM);
             b.bf16(p + "self_attn.o_proj.lora_A", 1, 1, 2, 8);
             b.bf16(p + "self_attn.o_proj.lora_B", 1, 1, 8, 2);

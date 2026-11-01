@@ -200,6 +200,9 @@ public final class HfDenseHooksA {
         kv.set(GgufKeys.ATTENTION_SHARED_KV_LAYERS, cfg.requireInt("num_kv_shared_layers"));
         kv.set(GgufKeys.ACTIVATION_SPARSITY_SCALE, activationSparsityScale(cfg, 0));
         kv.set(GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN, HfBaseDenseHooks.slidingFlags(cfg));
+        // the Gemma3TextConfig constructor adjusts the window, so the raw configuration value always
+        // overrides the shared meta's pattern==1 skip (gemma.py:239-251)
+        kv.set(GgufKeys.ATTENTION_SLIDING_WINDOW, cfg.requireInt("sliding_window"));
     }
 
     /**

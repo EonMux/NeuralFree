@@ -34,6 +34,11 @@ public final class HfDenseFixturesC {
                 + " 'rope_theta': 10000.0, 'vocab_size': 8, 'num_experts': 1, 'pad_token_id': 2, 'eod_token_id': 1,"
                 + " 'tie_word_embeddings': false}");
         llama(b);
+        // the hunyuan qk-norms (attn_q_norm/attn_k_norm, the q_layernorm/k_layernorm sources)
+        for (int l = 0; l < LAYERS; l++) {
+            b.bf16("model.layers." + l + ".self_attn.q_layernorm.weight", 4);
+            b.bf16("model.layers." + l + ".self_attn.k_layernorm.weight", 4);
+        }
         return b;
     }
 
@@ -46,9 +51,13 @@ public final class HfDenseFixturesC {
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'head_dim': 4, 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05,"
                 + " 'rope_theta': 10000.0, 'vocab_size': 8, 'tie_word_embeddings': false,"
-                + " 'rope_scaling': {'rope_type': 'dynamic', 'mrope_section': [2, 2, 0, 0], 'alpha': 50.0,"
+                + " 'rope_scaling': {'rope_type': 'dynamic', 'mrope_section': [1, 1, 0, 0], 'alpha': 50.0,"
                 + " 'rope_theta': 10000.0, 'factor': 1.0}}");
         llama(b);
+        for (int l = 0; l < LAYERS; l++) {
+            b.bf16("model.layers." + l + ".self_attn.q_layernorm.weight", 4);
+            b.bf16("model.layers." + l + ".self_attn.k_layernorm.weight", 4);
+        }
         return b;
     }
 

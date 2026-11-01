@@ -35,7 +35,7 @@ public final class HfSsmFixturesSsm {
         b.tokenizerConfigJson(null);
         b.bf16("backbone.embeddings.weight", 16, DIM);
         b.bf16("backbone.final_layer_norm.weight", DIM);
-        b.bf16("embed_out.weight", DIM, 16);
+        b.bf16("embed_out.weight", 16, DIM);
         for (int l = 0; l < LAYERS; l++) {
             String p = "backbone.layers." + l + ".";
             b.bf16(p + "norm.weight", DIM);
@@ -63,7 +63,7 @@ public final class HfSsmFixturesSsm {
                 + ", 'state_size': " + STATE + "}");
         b.bf16("backbone.embeddings.weight", 16, DIM);
         b.bf16("backbone.final_layer_norm.weight", DIM);
-        b.bf16("lm_head.weight", DIM, 16);
+        b.bf16("lm_head.weight", 16, DIM);
         for (int l = 0; l < LAYERS; l++) {
             String p = "backbone.layers." + l + ".";
             b.bf16(p + "norm.weight", DIM);

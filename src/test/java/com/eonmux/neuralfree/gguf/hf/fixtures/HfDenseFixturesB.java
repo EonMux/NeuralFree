@@ -35,6 +35,11 @@ public final class HfDenseFixturesB {
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             llamaLayer(b, p);
+            // the apertus qk-norms (attn_q_norm/attn_k_norm); the apertus graph loads no
+            // ffn_gate (the spec refuses the unused tensor)
+            b.remove(p + "mlp.gate_proj.weight");
+            b.bf16(p + "self_attn.q_norm.weight", 4);
+            b.bf16(p + "self_attn.k_norm.weight", 4);
             b.f32(p + "mlp.act_fn.alpha_n");
             b.f32(p + "mlp.act_fn.alpha_p");
             b.f32(p + "mlp.act_fn.beta");
@@ -45,27 +50,41 @@ public final class HfDenseFixturesB {
         return b;
     }
 
-    /** {@code ArceeForCausalLM}: the Llama layout with no pooling side files of its own. */
+    /** {@code ArceeForCausalLM}: the Llama layout with the ungated relu^2 MLP of AFM — arcee.cpp:39-40 loads
+     * ffn_up/ffn_down with no gate (arcee.cpp:117). */
     public static SyntheticHf.Builder arcee() {
         SyntheticHf.Builder b = builder("{'architectures': ['ArceeForCausalLM'], 'model_type': 'arcee',"
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05, 'rope_theta': 10000.0,"
                 + " 'vocab_size': 8}");
         llama(b);
+        for (int l = 0; l < LAYERS; l++) {
+            b.remove("model.layers." + l + ".mlp.gate_proj.weight");
+        }
         return b;
     }
 
-    /** {@code OLMoForCausalLM}: the Llama layout the Olmo class renames, with its optional clip of the QKV scores. */
+    /** {@code OLMoForCausalLM}: the Llama layout the Olmo class renames, with its optional clip of the QKV scores.
+     * The OLMO arch maps no norm tensors (olmo.cpp creates no attn_norm/ffn_norm/output_norm), so the fixture
+     * carries none. */
     public static SyntheticHf.Builder olmo() {
         SyntheticHf.Builder b = builder("{'architectures': ['OLMoForCausalLM'], 'model_type': 'olmo',"
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05, 'rope_theta': 10000.0,"
                 + " 'vocab_size': 8, 'clip_qkv': 100.0}");
         llama(b);
+        for (int l = 0; l < LAYERS; l++) {
+            String p = "model.layers." + l + ".";
+            b.remove(p + "input_layernorm.weight");
+            b.remove(p + "post_attention_layernorm.weight");
+        }
+        b.remove("model.norm.weight");
         return b;
     }
 
-    /** {@code Olmo2ForCausalLM}: the Llama layout with the sliding window and its per-layer pattern. */
+    /** {@code Olmo2ForCausalLM}: the Llama layout with the sliding window and its per-layer pattern. The OLMO2
+     * arch carries the q/k norms and the post-attention/post-feedforward norms and no pre-attention norm
+     * (tensor_patterns.tsv ATTN_POST_NORM/FFN_POST_NORM rows). */
     public static SyntheticHf.Builder olmo2() {
         SyntheticHf.Builder b = builder("{'architectures': ['Olmo2ForCausalLM'], 'model_type': 'olmo2',"
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
@@ -73,6 +92,13 @@ public final class HfDenseFixturesB {
                 + " 'vocab_size': 8, 'sliding_window': 4096,"
                 + " 'layer_types': ['full_attention', 'sliding_attention']}");
         llama(b);
+        for (int l = 0; l < LAYERS; l++) {
+            String p = "model.layers." + l + ".";
+            b.remove(p + "input_layernorm.weight");
+            b.bf16(p + "self_attn.q_norm.weight", 4);
+            b.bf16(p + "self_attn.k_norm.weight", 4);
+            b.bf16(p + "post_feedforward_layernorm.weight", DIM);
+        }
         return b;
     }
 
@@ -83,17 +109,29 @@ public final class HfDenseFixturesB {
                 + " 'num_hidden_layers': 2, 'n_positions': 64, 'rms_norm_eps': 1e-05, 'vocab_size': 8,"
                 + " 'rope_parameters': {'rope_theta': 10000.0, 'factor': 4.0, 'original_max_position_embeddings': 4096},"
                 + " 'max_position_embeddings': 32768}");
+        // the GPT2Tokenizer class routes set_vocab through _set_vocab_gpt2 instead of the
+        // required sentencepiece tokenizer.model (phi.py:44-51)
+        b.tokenizerConfigJson(SyntheticHf.json("{'tokenizer_class': 'GPT2Tokenizer', 'bos_token': '<s>',"
+                + " 'eos_token': '</s>', 'add_bos_token': false, 'clean_up_tokenization_spaces': false}"));
         llama(b);
+        // phi3 fuses gate+up: the mlp carries gate_up_proj and no gate_proj/up_proj
+        // (PHI3 has no FFN_GATE; the graph splits the fused ffn_up)
+        for (int l = 0; l < LAYERS; l++) {
+            String p = "model.layers." + l + ".";
+            b.remove(p + "mlp.gate_proj.weight");
+            b.remove(p + "mlp.up_proj.weight");
+            b.bf16(p + "mlp.gate_up_proj.weight", 2 * FFN, DIM);
+        }
         return b;
     }
 
-    /** {@code Qwen3MoeForCausalLM}: the Qwen 3 layout with the per-expert and shared-expert MLPs of every layer. */
+    /** {@code Qwen3MoeForCausalLM}: the Qwen 3 layout with the per-expert MLPs and the q/k norms of every
+     * layer (constants.py:2961 QWEN3MOE: FFN_GATE_INP + the stacked experts, no shared-expert tensors). */
     public static SyntheticHf.Builder qwen3Moe() {
         SyntheticHf.Builder b = builder("{'architectures': ['Qwen3MoeForCausalLM'], 'model_type': 'qwen3_moe',"
                 + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-06, 'rope_theta': 1000000.0,"
-                + " 'vocab_size': 8, 'num_experts': 2, 'moe_intermediate_size': 4,"
-                + " 'shared_expert_intermediate_size': 4}");
+                + " 'vocab_size': 8, 'num_experts': 2, 'moe_intermediate_size': 4, 'num_experts_per_tok': 1}");
         b.bf16("model.embed_tokens.weight", VOCAB, DIM);
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
@@ -102,6 +140,8 @@ public final class HfDenseFixturesB {
             b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
             b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
+            b.bf16(p + "self_attn.q_norm.weight", 4);
+            b.bf16(p + "self_attn.k_norm.weight", 4);
             b.bf16(p + "post_attention_layernorm.weight", DIM);
             b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
             for (int x = 0; x < EXPERTS; x++) {
@@ -109,9 +149,6 @@ public final class HfDenseFixturesB {
                 b.bf16(p + "mlp.experts." + x + ".gate_proj.weight", EXPERT_FFN, DIM);
                 b.bf16(p + "mlp.experts." + x + ".up_proj.weight", EXPERT_FFN, DIM);
             }
-            b.bf16(p + "mlp.shared_expert.down_proj.weight", DIM, EXPERT_FFN);
-            b.bf16(p + "mlp.shared_expert.gate_proj.weight", EXPERT_FFN, DIM);
-            b.bf16(p + "mlp.shared_expert.up_proj.weight", EXPERT_FFN, DIM);
         }
         b.bf16("model.norm.weight", DIM);
         b.bf16("lm_head.weight", VOCAB, DIM);

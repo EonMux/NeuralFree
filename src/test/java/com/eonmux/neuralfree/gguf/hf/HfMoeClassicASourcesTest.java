@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.arch.ArchRegistry;
 import com.eonmux.neuralfree.gguf.hf.arch.HfArchEntry;
 import com.eonmux.neuralfree.gguf.hf.arch.HfArchRegistry;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader;
+import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -38,20 +39,23 @@ public class HfMoeClassicASourcesTest {
     @Test
     public void everyPartAFixtureBuildsASpecClaimingItsTensors() throws IOException {
         for (HfMoeClassicFixturesA.Named f : HfMoeClassicFixturesA.all()) {
-            Path dir = f.fixture.get().write(tmp.newFolder("hf").toPath());
-            buildAndClaim(dir, tmp.newFolder("cache").toPath());
+            Path dir = f.fixture.get().write(tmp.newFolder(f.hfArch + "-hf").toPath());
+            buildAndClaim(dir, tmp.newFolder(f.hfArch + "-cache").toPath());
         }
     }
 
     @Test
     public void ultravoxIsANamedRejection() throws IOException {
         Path dir = SyntheticHf.builder().config(SyntheticHf.json(
-                "{'architectures': ['UltravoxModel'], 'vocab_size': 8}")).write(tmp.newFolder("hf").toPath());
+                        "{'architectures': ['UltravoxModel'], 'vocab_size': 8}"))
+                .bf16("model.embed_tokens.weight", 8, 8)
+                .write(tmp.newFolder("hf").toPath());
         com.eonmux.neuralfree.gguf.hf.config.HfConfig cfg = HfConfigLoader.fromJson(dir,
                 SyntheticHf.json("{'architectures': ['UltravoxModel'], 'vocab_size': 8}"));
-        HfArchEntry entry = HfArchRegistry.resolve(cfg, HfArchEntry.Kind.TEXT);
-        assertTrue(entry.isRejected());
-        assertTrue(entry.rejection().contains("UltravoxModel has no text model"));
+        // the registry throws a rejected entry's message at resolve (HfArchRegistry.resolve)
+        GgufFormatException e = org.junit.Assert.assertThrows(GgufFormatException.class,
+                () -> HfArchRegistry.resolve(cfg, HfArchEntry.Kind.TEXT));
+        assertTrue(e.getMessage().contains("UltravoxModel has no text model"));
     }
 
     /** Builds and claims the spec of one checkpoint dir. */

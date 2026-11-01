@@ -176,6 +176,7 @@ public final class SyntheticHf {
         private String config;
         private final Map<String, Tensor> tensors = new LinkedHashMap<>();
         private final Map<String, String> files = new LinkedHashMap<>();
+        private final Map<String, byte[]> binaryFiles = new LinkedHashMap<>();
         private int shards = 1;
         private boolean symlinkSnapshot;
 
@@ -260,6 +261,12 @@ public final class SyntheticHf {
             return this;
         }
 
+        /** A binary file of the model directory at {@code relPath} (a {@code tokenizer.model}, ...). */
+        public Builder binaryFile(String relPath, byte[] bytes) {
+            binaryFiles.put(Objects.requireNonNull(relPath, "relPath"), bytes.clone());
+            return this;
+        }
+
         /** The number of safetensors files; more than one writes an index. */
         public Builder shards(int n) {
             if (n < 1) {
@@ -292,6 +299,12 @@ public final class SyntheticHf {
             writeText(out, "config.json", config, written);
             for (Map.Entry<String, String> f : files.entrySet()) {
                 writeText(out, f.getKey(), f.getValue(), written);
+            }
+            for (Map.Entry<String, byte[]> f : binaryFiles.entrySet()) {
+                Path p = out.resolve(f.getKey());
+                Files.createDirectories(p.getParent());
+                Files.write(p, f.getValue());
+                written.add(f.getKey());
             }
             writeShards(out, written);
             return symlinkSnapshot ? link(root, written) : root;

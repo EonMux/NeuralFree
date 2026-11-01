@@ -432,8 +432,10 @@ public final class HfMoeClassicHooksA {
 
         void buffer(HfLoadContext ctx, String hfName, RowSource src, TensorSink out) {
             boolean expert = hfName.contains(".moe.") || hfName.contains(".block_sparse_moe.experts.");
-            long bid = HfLoadContext.bidOf(hfName);
-            if (bid < 0) {
+            // only the expert cache is keyed by layer; the other tensors plan with bid outside
+            // the expert branch (grok.py:77-79 asserts the bid there)
+            long bid = expert ? HfLoadContext.bidOf(hfName) : -1;
+            if (expert && bid < 0) {
                 throw new GgufFormatException("tensor '" + hfName + "' has no layer number");
             }
             Map<String, List<RowSource>> layer = parts.get(bid);
