@@ -466,6 +466,6 @@ public final class HfSsmHooksA {
      * {@code <|plamo:op|>} end-of-turn token.
      */
     public static Map<String, Object> plamo2Vocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {
-        return HfVocabWriters.plamo(HfHookSupport.vocabInput(ctx), "<|plamo:op|>", null);
+        return HfVocabWriters.plamo(HfHookSupport.vocabInput(ctx), "<|plamo:op|>", java.util.List.of());
     }
 }

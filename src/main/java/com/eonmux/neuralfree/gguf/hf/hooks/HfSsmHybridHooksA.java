@@ -467,6 +467,12 @@ public final class HfSsmHybridHooksA {
             mlp.add(mtp);
         }
         graniteCoreMeta(ctx, kv, plan, attn, ssm);
+        // the nemotron layer norm epsilon is the plain LAYER_NORM_EPS of the four aliases
+        // (nemotron.py:379-380), not the granite RMS epsilon
+        kv.set(GgufKeys.ATTENTION_LAYERNORM_EPS, cfg.findFloat("layer_norm_eps", "layer_norm_epsilon",
+                "norm_epsilon", "norm_eps").orElseThrow(() -> new GgufFormatException(cfg.source()
+                + ": required key (one of layer_norm_eps, layer_norm_epsilon, norm_epsilon, norm_eps)"
+                + " is missing")));
         long headDim = prefixedRequireInt(cfg, "head_dim", "attention_head_dim");
         kv.set(GgufKeys.ATTENTION_KEY_LENGTH, headDim);
         kv.set(GgufKeys.ATTENTION_VALUE_LENGTH, headDim);
@@ -644,6 +650,11 @@ public final class HfSsmHybridHooksA {
         // read through the Nemotron pattern readers like NemotronHModel's own metadata
         graniteCoreMeta(ctx, kv, plan, nemotronAttnLayers(cfg, ctx.blockCount(), true),
                 nemotronSsmLayers(cfg, ctx.blockCount(), true));
+        // the nemotron layer norm epsilon (nemotron.py:379-380)
+        kv.set(GgufKeys.ATTENTION_LAYERNORM_EPS, cfg.findFloat("layer_norm_eps", "layer_norm_epsilon",
+                "norm_epsilon", "norm_eps").orElseThrow(() -> new GgufFormatException(cfg.source()
+                + ": required key (one of layer_norm_eps, layer_norm_epsilon, norm_epsilon, norm_eps)"
+                + " is missing")));
         long headDim = prefixedRequireInt(cfg, "head_dim", "attention_head_dim");
         kv.set(GgufKeys.ATTENTION_KEY_LENGTH, headDim);
         kv.set(GgufKeys.ATTENTION_VALUE_LENGTH, headDim);

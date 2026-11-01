@@ -58,13 +58,42 @@ public final class HfSsmFixturesHybridB {
      * (the {@code feed_forward.experts.w1/w2/w3} parts the LFM2-MoE path stacks) (lfm2.py:279-345).
      */
     public static SyntheticHf.Builder lfm2Moe() {
-        SyntheticHf.Builder b = lfm2();
-        b.bf16("model.layers.0.feed_forward.gate.weight", EXPERTS, DIM);
-        b.bf16("model.layers.0.feed_forward.expert_bias", EXPERTS);
-        for (int e = 0; e < EXPERTS; e++) {
-            b.bf16("model.layers.0.feed_forward.experts." + e + ".w1.weight", EXPERT_FFN, DIM);
-            b.bf16("model.layers.0.feed_forward.experts." + e + ".w2.weight", DIM, EXPERT_FFN);
-            b.bf16("model.layers.0.feed_forward.experts." + e + ".w3.weight", EXPERT_FFN, DIM);
+        // the lfm2moe fixup keeps the KV heads on the full_attention layer only, so the trunk
+        // differs from lfm2(): block 0 attention+FFN, blocks 1-2 shortconv+MoE; the tied
+        // output (the lfm2moe set carries no OUTPUT tensor)
+        SyntheticHf.Builder b = builder("{'architectures': ['Lfm2MoeForCausalLM'], " + LFM2_BASE
+                + ", 'intermediate_size': " + FFN
+                + ", 'num_experts_per_tok': 1, 'num_local_experts': " + EXPERTS
+                + ", 'moe_intermediate_size': " + EXPERT_FFN + ", 'num_dense_layers': 1}");
+        b.bf16("model.embed_tokens.weight", VOCAB, DIM);
+        b.bf16("model.embedding_norm.weight", DIM);
+        // block 0: attention + FFN
+        String a = "model.layers.0.";
+        b.bf16(a + "input_layernorm.weight", DIM);
+        b.bf16(a + "self_attn.q_proj.weight", DIM, DIM);
+        b.bf16(a + "self_attn.k_proj.weight", KV, DIM);
+        b.bf16(a + "self_attn.v_proj.weight", KV, DIM);
+        b.bf16(a + "self_attn.o_proj.weight", DIM, DIM);
+        b.bf16(a + "self_attn.q_norm.weight", KV);
+        b.bf16(a + "self_attn.k_norm.weight", KV);
+        b.bf16(a + "post_attention_layernorm.weight", DIM);
+        b.bf16(a + "mlp.gate_proj.weight", FFN, DIM);
+        b.bf16(a + "mlp.up_proj.weight", FFN, DIM);
+        b.bf16(a + "mlp.down_proj.weight", DIM, FFN);
+        // blocks 1-2: shortconv + MoE (after the dense lead)
+        for (String p : new String[] {"model.layers.1.", "model.layers.2."}) {
+            b.bf16(p + "input_layernorm.weight", DIM);
+            b.bf16(p + "conv.conv.weight", DIM, 1, CONV);
+            b.bf16(p + "conv.in_proj.weight", DIM, DIM);
+            b.bf16(p + "conv.out_proj.weight", DIM, DIM);
+            b.bf16(p + "post_attention_layernorm.weight", DIM);
+            b.bf16(p + "feed_forward.gate.weight", EXPERTS, DIM);
+            b.bf16(p + "feed_forward.expert_bias.bias", EXPERTS);
+            for (int e = 0; e < EXPERTS; e++) {
+                b.bf16(p + "feed_forward.experts." + e + ".w1.weight", EXPERT_FFN, DIM);
+                b.bf16(p + "feed_forward.experts." + e + ".w2.weight", DIM, EXPERT_FFN);
+                b.bf16(p + "feed_forward.experts." + e + ".w3.weight", EXPERT_FFN, DIM);
+            }
         }
         return b;
     }
@@ -82,15 +111,34 @@ public final class HfSsmFixturesHybridB {
      * {@code head.layers.{bid}.linear1/linear2/self_attn.in_proj} (lfm2.py:188-276).
      */
     public static SyntheticHf.Builder d1Omni() {
-        SyntheticHf.Builder b = lfm2Trunk(builder("{'architectures': ['D1OmniModel'], " + LFM2_BASE
+        // the decision head's centred short convolution requires conv_L_cache 3 (lfm2.cpp:369)
+        SyntheticHf.Builder b = lfm2Trunk(builder("{'architectures': ['D1OmniModel'], "
+                + LFM2_BASE.replace("'conv_L_cache': " + CONV, "'conv_L_cache': 3")
+                + ", 'intermediate_size': " + FFN
                 + ", 'head_layers': 1, 'block_ffn_dim_multiplier': 1.0, 'max_length': 16384"
                 + ", 'image_text_length': 896, 'audio_text_length': 15360"
                 + ", 'temperatures': {'choice:3-5': 0.5}}"));
+        // the decision head block folds to blk.3: the LAYA-form block (the head.layers rows)
+        // with the claimed biases, plus the type embedding and the scorer head
         b.bf16("head.layers.0.norm1.weight", DIM);
+        b.bf16("head.layers.0.norm1.bias", DIM);
         b.bf16("head.layers.0.self_attn.in_proj.weight", 4 * DIM, DIM);
+        b.bf16("head.layers.0.self_attn.in_proj.bias", 4 * DIM);
+        b.bf16("head.layers.0.self_attn.out_proj.weight", DIM, DIM);
+        b.bf16("head.layers.0.self_attn.out_proj.bias", DIM);
         b.bf16("head.layers.0.norm2.weight", DIM);
+        b.bf16("head.layers.0.norm2.bias", DIM);
         b.bf16("head.layers.0.linear1.weight", 4 * DIM, DIM);
+        b.bf16("head.layers.0.linear1.bias", 4 * DIM);
         b.bf16("head.layers.0.linear2.weight", DIM, 4 * DIM);
+        b.bf16("head.layers.0.linear2.bias", DIM, 4 * DIM);
+        b.bf16("head.type_emb.weight", 3, DIM);
+        b.bf16("head.scorer.0.weight", DIM);
+        b.bf16("head.scorer.0.bias", DIM);
+        b.bf16("head.scorer.1.weight", DIM, DIM);
+        b.bf16("head.scorer.1.bias", DIM);
+        b.bf16("head.scorer.3.weight", DIM, DIM);
+        b.bf16("head.scorer.3.bias", DIM);
         return b;
     }
 
@@ -104,47 +152,63 @@ public final class HfSsmFixturesHybridB {
                 + ", 'sliding_window': " + CONV + ", 'output_size': " + DIM
                 + ", 'layer_types': ['shortconv', 'shortconv', 'shortconv']}");
         b.bf16("model.embed_tokens.weight", VOCAB, DIM);
-        b.bf16("model.norm.weight", DIM);
-        b.bf16("lm_head.weight", DIM, VOCAB);
+        b.bf16("model.embedding_norm.weight", DIM);
+        b.bf16("lm_head.weight", VOCAB, DIM);
+        // the audio build runs through the LFM2 claims: the attention projections with the
+        // per-layer q/k norms, the operator norms and the FFN on every layer
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             b.bf16(p + "input_layernorm.weight", DIM);
-            b.bf16(p + "conv.conv", DIM, 1, CONV);
-            b.bf16(p + "conv.in_proj", DIM, DIM);
-            b.bf16(p + "conv.out_proj", DIM, DIM);
+            b.bf16(p + "self_attn.q_proj.weight", DIM, DIM);
+            b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
+            b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
+            b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
+            b.bf16(p + "self_attn.q_norm.weight", KV);
+            b.bf16(p + "self_attn.k_norm.weight", KV);
             b.bf16(p + "post_attention_layernorm.weight", DIM);
+            b.bf16(p + "mlp.gate_proj.weight", FFN, DIM);
+            b.bf16(p + "mlp.up_proj.weight", FFN, DIM);
+            b.bf16(p + "mlp.down_proj.weight", DIM, FFN);
         }
         return b;
     }
 
-    /** The tensors of the LFM2 trunk: one attention, one short-convolution and one dense-FFN layer. */
+    /**
+     * The tensors of the LFM2 trunk: two attention layers and one convolution layer (the config's
+     * {@code layer_types}; the LFM2 claims carry the two operator norms per layer, the per-layer q/k norms and
+     * the attention projections on the attention layers, the short-convolution weights on the recurrent ones).
+     */
     private static SyntheticHf.Builder lfm2Trunk(SyntheticHf.Builder b) {
         b.bf16("model.embed_tokens.weight", VOCAB, DIM);
-        b.bf16("model.norm.weight", DIM);
-        b.bf16("lm_head.weight", DIM, VOCAB);
-        attentionLayer(b, "model.layers.0.");
-        convLayer(b, "model.layers.1.");
-        denseFfn(b, "model.layers.2.");
+        b.bf16("model.embedding_norm.weight", DIM);
+        // the LFM2 set carries no OUTPUT_NORM (the per-block operator norms only)
+        b.bf16("lm_head.weight", VOCAB, DIM);
+        // the lfm2moe fixup keeps the KV heads on the full_attention layer only: the conv
+        // layers are the recurrent ones (arch_tensors/lfm2moe claims)
+        lfm2Attention(b, "model.layers.0.");
+        lfm2Attention(b, "model.layers.1.");
+        lfm2Conv(b, "model.layers.2.");
         return b;
     }
-
-    /** A full-attention layer: the {@code self_attn.*} projections and the dense {@code mlp.*} FFN. */
-    private static void attentionLayer(SyntheticHf.Builder b, String p) {
+    /** An LFM2 attention layer: the {@code self_attn.*} projections with the per-layer q/k norms and the FFN. */
+    private static void lfm2Attention(SyntheticHf.Builder b, String p) {
         b.bf16(p + "input_layernorm.weight", DIM);
         b.bf16(p + "self_attn.q_proj.weight", DIM, DIM);
         b.bf16(p + "self_attn.k_proj.weight", KV, DIM);
         b.bf16(p + "self_attn.v_proj.weight", KV, DIM);
         b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
+        b.bf16(p + "self_attn.q_norm.weight", KV);
+        b.bf16(p + "self_attn.k_norm.weight", KV);
         b.bf16(p + "post_attention_layernorm.weight", DIM);
         denseFfn(b, p);
     }
 
-    /** A short-convolution layer: the {@code conv.conv}/{@code conv.in_proj}/{@code conv.out_proj} weights. */
-    private static void convLayer(SyntheticHf.Builder b, String p) {
+    /** An LFM2 short-convolution layer: the {@code conv.*} weights and the FFN. */
+    private static void lfm2Conv(SyntheticHf.Builder b, String p) {
         b.bf16(p + "input_layernorm.weight", DIM);
-        b.bf16(p + "conv.conv", DIM, 1, CONV);
-        b.bf16(p + "conv.in_proj", DIM, DIM);
-        b.bf16(p + "conv.out_proj", DIM, DIM);
+        b.bf16(p + "conv.conv.weight", DIM, 1, CONV);
+        b.bf16(p + "conv.in_proj.weight", DIM, DIM);
+        b.bf16(p + "conv.out_proj.weight", DIM, DIM);
         b.bf16(p + "post_attention_layernorm.weight", DIM);
         denseFfn(b, p);
     }

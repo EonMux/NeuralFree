@@ -280,19 +280,26 @@ public final class HparamsLoader {
 
     private static void readHeadDims(ModelHparamsBuilder b, GgufKv kv) {
         int nHead0 = b.nHead(0);
+        int headK;
+        int headV;
+        int nRot;
         if (nHead0 > 0) {
-            int headK = kv.u32(GgufKeys.ATTENTION_KEY_LENGTH, b.nEmbd() / nHead0);
-            int headV = kv.u32(GgufKeys.ATTENTION_VALUE_LENGTH, b.nEmbd() / nHead0);
-            int nRot = kv.u32(GgufKeys.ROPE_DIMENSION_COUNT, headK);
+            headK = kv.u32(GgufKeys.ATTENTION_KEY_LENGTH, b.nEmbd() / nHead0);
+            headV = kv.u32(GgufKeys.ATTENTION_VALUE_LENGTH, b.nEmbd() / nHead0);
+            nRot = kv.u32(GgufKeys.ROPE_DIMENSION_COUNT, headK);
             Arch a = b.arch();
             boolean rotIsHead = a == Arch.LLAMA || a == Arch.DECI || a == Arch.FALCON || a == Arch.LLAMA_EMBED;
             if (rotIsHead && nRot != headK) {
                 throw new GgufFormatException(a.ggufName() + ": invalid n_rot " + nRot + ", expected " + headK);
             }
-            b.headKFull(headK).headVFull(headV).nRotFull(nRot);
         } else {
-            b.headKFull(0).headVFull(0).nRotFull(0);
+            // a mamba-first layer 0 (plamo2) has no attention heads; the metadata still
+            // carries the head dims
+            headK = kv.u32(GgufKeys.ATTENTION_KEY_LENGTH, 0);
+            headV = kv.u32(GgufKeys.ATTENTION_VALUE_LENGTH, 0);
+            nRot = kv.u32(GgufKeys.ROPE_DIMENSION_COUNT, headK);
         }
+        b.headKFull(headK).headVFull(headV).nRotFull(nRot);
         b.headKSwa(kv.u32(GgufKeys.ATTENTION_KEY_LENGTH_SWA, b.headKFull()));
         b.headVSwa(kv.u32(GgufKeys.ATTENTION_VALUE_LENGTH_SWA, b.headVFull()));
         b.nRotSwa(kv.u32(GgufKeys.ROPE_DIMENSION_COUNT_SWA, b.nRotFull()));
