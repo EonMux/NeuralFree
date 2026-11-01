@@ -26,7 +26,7 @@ public final class HfMoeSwaFixturesB {
                 + " 'moe_intermediate_size': 4, 'n_routed_experts': 2, 'num_experts_per_tok': 1,"
                 + " 'hybrid_layer_pattern': [0, 1], 'swa_num_key_value_heads': 1,"
                 + " 'v_head_dim': 4, 'head_dim': 4, 'sliding_window': 4, 'partial_rotary_factor': 0.5,"
-                + " 'quantization_config': {'quant_method': 'fp8'},"
+                + " 'quantization_config': {'quant_method': 'fp8', 'activation_scheme': 'dynamic'},"
                 + " 'norm_topk_prob': true,"
                 + " 'num_hidden_layers': 2, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05, 'rope_theta': 10000.0,"
@@ -36,9 +36,7 @@ public final class HfMoeSwaFixturesB {
             String p = "model.layers." + l + ".";
             b.bf16(p + "input_layernorm.weight", DIM);
             b.bf16(p + "post_attention_layernorm.weight", DIM);
-            b.bf16(p + "post_feedforward_layernorm.weight", DIM);
             b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
-            b.bf16(p + "self_attn.attention_sink", 2);
             // the TP-4 sharded fused [Q(2 heads x 4)|K(4)|V(4)] rows: 16 x 8 stored as e4m3 1.0 bytes,
             // one scale block per rank
             b.tensor(p + "self_attn.qkv_proj.weight", com.eonmux.neuralfree.io.safetensors.StDType.U8,
@@ -77,6 +75,13 @@ public final class HfMoeSwaFixturesB {
             b.bf16(p + "self_attn.v_proj.weight", 4, DIM);
             b.bf16(p + "self_attn.o_proj.weight", DIM, DIM);
             b.bf16(p + "self_attn.gate_bias", 2);
+            // the beam attention gate and q/k norms (tensor_patterns.tsv:292; the BEAM set)
+            b.bf16(p + "self_attn.attn_gate_proj.weight", DIM, DIM);
+            b.bf16(p + "self_attn.q_norm.weight", 4);
+            b.bf16(p + "self_attn.k_norm.weight", 4);
+            // the dual FFN norms (FFN_PRE_NORM/FFN_POST_NORM)
+            b.bf16(p + "pre_feedforward_layernorm.weight", DIM);
+            b.bf16(p + "post_feedforward_layernorm.weight", DIM);
             if (l == 0) {
                 b.bf16(p + "post_attention_layernorm.weight", DIM);
                 b.bf16(p + "mlp.gate_proj.weight", 8, DIM);
@@ -85,6 +90,7 @@ public final class HfMoeSwaFixturesB {
             } else {
                 b.bf16(p + "post_attention_layernorm.weight", DIM);
                 b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
+                b.bf16(p + "mlp.gate.e_score_correction.bias", EXPERTS);
                 for (int x = 0; x < EXPERTS; x++) {
                     b.bf16(p + "mlp.experts." + x + ".gate_proj.weight", FF, DIM);
                     b.bf16(p + "mlp.experts." + x + ".up_proj.weight", FF, DIM);

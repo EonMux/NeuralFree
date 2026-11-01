@@ -29,7 +29,8 @@ public final class HfMoeSwaFixturesC {
         SyntheticHf.Builder b = builder("{'architectures': ['LagunaForCausalLM'], 'hidden_size': 8,"
                 + " 'head_dim': 4, 'gating': 'per-head', 'num_attention_heads_per_layer': [2, 2],"
                 + " 'moe_intermediate_size': 4, 'shared_expert_intermediate_size': 8,"
-                + " 'moe_routed_scaling_factor': 1.0, 'num_experts': 2, 'norm_topk_prob': true,"
+                + " 'moe_routed_scaling_factor': 1.0, 'num_experts': 2, 'num_experts_per_tok': 1,"
+                + " 'norm_topk_prob': true,"
                 + " 'sliding_window': 4, 'mlp_layer_types': ['sparse', 'sparse'],"
                 + " 'partial_rotary_factor': 0.5,"
                 + " 'num_hidden_layers': 2, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
@@ -39,8 +40,12 @@ public final class HfMoeSwaFixturesC {
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             attention(b, p);
+            b.bf16(p + "self_attn.q_norm.weight", KV);
+            b.bf16(p + "self_attn.k_norm.weight", KV);
             b.bf16(p + "self_attn.g_proj.weight", 2, DIM);
             b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
+            // the laguna router bias takes the normal mapping path (laguna.py:174)
+            b.bf16(p + "mlp.experts.e_score_correction.bias", EXPERTS);
             b.bf16(p + "mlp.shared_expert.gate_proj.weight", 8, DIM);
             b.bf16(p + "mlp.shared_expert.up_proj.weight", 8, DIM);
             b.bf16(p + "mlp.shared_expert.down_proj.weight", DIM, 8);
@@ -68,6 +73,8 @@ public final class HfMoeSwaFixturesC {
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             attention(b, p);
+            b.bf16(p + "self_attn.q_norm.weight", KV);
+            b.bf16(p + "self_attn.k_norm.weight", KV);
             b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
             for (int x = 0; x < EXPERTS; x++) {
                 b.bf16(p + "mlp.experts." + x + ".gate_proj.weight", FF, DIM);
@@ -93,6 +100,8 @@ public final class HfMoeSwaFixturesC {
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             attention(b, p);
+            b.bf16(p + "self_attn.q_norm.weight", KV);
+            b.bf16(p + "self_attn.k_norm.weight", KV);
             b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
             for (int x = 0; x < EXPERTS; x++) {
                 b.bf16(p + "mlp.experts." + x + ".gate_proj.weight", FF, DIM);
@@ -109,8 +118,9 @@ public final class HfMoeSwaFixturesC {
     public static SyntheticHf.Builder exaoneMoe() {
         SyntheticHf.Builder b = builder("{'architectures': ['ExaoneMoEForCausalLM'], 'hidden_size': 8,"
                 + " 'head_dim': 4, 'moe_intermediate_size': 4, 'num_experts_per_tok': 1,"
-                + " 'num_shared_experts': 1, 'norm_topk_prob': true, 'routed_scaling_factor': 1.0,"
-                + " 'num_local_experts': 2,"
+                + " 'num_shared_experts': 1, 'score_func': 'sigmoid', 'norm_topk_prob': true,"
+                + " 'routed_scaling_factor': 1.0,"
+                + " 'num_local_experts': 2, 'sliding_window': 4,"
                 + " 'num_hidden_layers': 2, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
                 + " 'max_position_embeddings': 64, 'rms_norm_eps': 1e-05, 'rope_theta': 10000.0,"
                 + " 'vocab_size': 8}");
@@ -118,7 +128,12 @@ public final class HfMoeSwaFixturesC {
         for (int l = 0; l < LAYERS; l++) {
             String p = "model.layers." + l + ".";
             attention(b, p);
+            b.bf16(p + "self_attn.q_norm.weight", KV);
+            b.bf16(p + "self_attn.k_norm.weight", KV);
             b.bf16(p + "mlp.gate.weight", EXPERTS, DIM);
+            b.bf16(p + "mlp.shared_experts.gate_proj.weight", FF, DIM);
+            b.bf16(p + "mlp.shared_experts.up_proj.weight", FF, DIM);
+            b.bf16(p + "mlp.shared_experts.down_proj.weight", DIM, FF);
             for (int x = 0; x < EXPERTS; x++) {
                 b.bf16(p + "mlp.experts." + x + ".gate_proj.weight", FF, DIM);
                 b.bf16(p + "mlp.experts." + x + ".up_proj.weight", FF, DIM);
