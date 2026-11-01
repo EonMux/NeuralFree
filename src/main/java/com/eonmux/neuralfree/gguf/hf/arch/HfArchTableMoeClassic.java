@@ -140,7 +140,7 @@ final class HfArchTableMoeClassic {
                         .withExtra(HfQwenMoeHooks::qwen2MoeExtra),
                 HfArchEntry.of(Collections.singletonList("Qwen3OmniMoeForConditionalGeneration"),
                                 HfArchResolver.of(Arch.QWEN3VLMOE),
-                                HfMoeClassicHooksD::qwen3OmniMoeMeta, HfQwenMoeHooks::qwen2MoeTensors,
+                                HfMoeClassicHooksD::qwen3OmniMoeMeta, HfMoeClassicHooksD::qwen3VlMoeTensors,
                                 HfMoeClassicHooksD::qwen3OmniMoeVocab)
                         .withNameFilter(HfMoeClassicHooksD.THINKER_FILTER)
                         .withExtra(HfQwenMoeHooks::qwen2MoeExtra),

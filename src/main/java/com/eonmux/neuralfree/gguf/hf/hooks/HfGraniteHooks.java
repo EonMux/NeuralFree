@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hf.hooks;
 
+import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.arch.HfNameFilter;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
@@ -250,17 +251,31 @@ public final class HfGraniteHooks {
             return;
         }
         HfConfig cfg = ctx.config();
+        // GraniteMoeSWA keeps the fused gate/up stacks whole (granite.py:150-172: the routed
+        // stack maps to FFN_GATE_UP_EXP and the shared stack to FFN_UP_SHEXP); the GraniteMoeModel
+        // contract splits them into gate and up halves (granite.py:201-227)
+        boolean keepFused = ctx.arch() == Arch.GRANITE_SWA;
         if (hfName.endsWith(INPUT_LINEAR)) {
-            RowSource[] gateUp = splitFused(cfg, hfName, src, "intermediate_size");
             int bid = HfHookSupport.layerOf(hfName);
+            if (keepFused) {
+                requireFused(cfg, hfName, src, "intermediate_size");
+                out.add(ctx.names().ggufName("FFN_GATE_UP_EXP", bid, ".weight"), src);
+                return;
+            }
+            RowSource[] gateUp = splitFused(cfg, hfName, src, "intermediate_size");
             out.add(ctx.names().ggufName("FFN_GATE_EXP", bid, ".weight"), gateUp[0]);
             out.add(ctx.names().ggufName("FFN_UP_EXP", bid, ".weight"), gateUp[1]);
             return;
         }
         boolean hasExperts = truthy(cfg.flat().get("num_local_experts"));
         if (hfName.endsWith(SHARED_INPUT_LINEAR)) {
-            RowSource[] gateUp = splitFused(cfg, hfName, src, "shared_intermediate_size");
             int bid = HfHookSupport.layerOf(hfName);
+            if (keepFused) {
+                requireFused(cfg, hfName, src, "shared_intermediate_size");
+                out.add(ctx.names().ggufName("FFN_UP_SHEXP", bid, ".weight"), src);
+                return;
+            }
+            RowSource[] gateUp = splitFused(cfg, hfName, src, "shared_intermediate_size");
             out.add(ctx.names().ggufName(hasExperts ? "FFN_GATE_SHEXP" : "FFN_GATE", bid, ".weight"), gateUp[0]);
             out.add(ctx.names().ggufName(hasExperts ? "FFN_UP_SHEXP" : "FFN_UP", bid, ".weight"), gateUp[1]);
             return;
@@ -284,5 +299,15 @@ public final class HfGraniteHooks {
                     + " size must be 2 * " + sizeKey + " (" + 2L * ffnDim + ") along dim -2");
         }
         return ExpertTransforms.splitExperts(src, FUSED_DIM, FUSED_PARTS);
+    }
+
+    /** The fused-stack width check of {@code GraniteMoeSWAModel.modify_tensors} (granite.py:156, 171). */
+    private static void requireFused(HfConfig cfg, String hfName, RowSource src, String sizeKey) {
+        int ffnDim = cfg.requireInt(sizeKey);
+        long[] shape = src.shape();
+        if (shape.length < 2 || shape[shape.length - 2] != 2L * ffnDim) {
+            throw new GgufFormatException("tensor '" + hfName + "' " + Arrays.toString(shape) + ": merged FFN tensor"
+                    + " size must be 2 * " + sizeKey + " (" + 2L * ffnDim + ") along dim -2");
+        }
     }
 }
