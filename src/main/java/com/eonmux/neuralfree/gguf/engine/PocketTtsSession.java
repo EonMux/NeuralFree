@@ -89,6 +89,28 @@ public final class PocketTtsSession implements AutoCloseable {
         return hidden.decode(token, pos);
     }
 
+    /** Evaluates embedding rows at {@code pos0 ..} into the cache; returns {@code t_embd} of the last row. */
+    public float[] prefillEmbeddings(float[][] rows, int pos0) {
+        ensureOpen();
+        return hidden.prefillEmbeddings(rows, pos0);
+    }
+
+    /** Evaluates embedding rows at {@code pos0 ..} into the cache; returns {@code t_embd} of every row. */
+    public float[][] prefillEmbeddingsAll(float[][] rows, int pos0) {
+        ensureOpen();
+        return hidden.prefillEmbeddingsAll(rows, pos0);
+    }
+
+    /** Evaluates one embedding row at {@code pos} into the cache; returns its {@code t_embd}. */
+    public float[] decodeEmbedding(float[] row, int pos) {
+        ensureOpen();
+        if (row == null || row.length != width()) {
+            throw new IllegalArgumentException("an embedding row holds " + (row == null ? "no" : row.length)
+                    + " values, the backbone takes " + width());
+        }
+        return hidden.prefillEmbeddings(new float[][]{row}, pos);
+    }
+
     /**
      * {@code t_embd} of a whole sequence from position 0 without the cache. The memory is emptied first, because a
      * memoryless pass runs over an empty memory.

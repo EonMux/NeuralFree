@@ -65,9 +65,17 @@ public final class CpuRope {
         final int span = table.pairSpan();
         CpuParallel.parallelFor(nTokens, GRAIN, (from, to) -> {
             final float[] cs = new float[2 * pairs];
+            final float[] basis = table.basisSize() > 0 ? new float[table.basisSize()] : null;
             for (int t = from; t < to; t++) {
-                table.cosSin(pos, posOff, t, posStride, cs);
+                if (basis == null) {
+                    table.cosSin(pos, posOff, t, posStride, cs);
+                    for (int h = 0; h < nHeads; h++) {
+                        rotate(table, cs, pairs, span, x, xOff + t * rowStride + h * headStride + nOffs);
+                    }
+                    continue;
+                }
                 for (int h = 0; h < nHeads; h++) {
+                    table.cosSin(pos, posOff, t, posStride, nHeads, h, cs, basis);
                     rotate(table, cs, pairs, span, x, xOff + t * rowStride + h * headStride + nOffs);
                 }
             }
@@ -156,6 +164,47 @@ public final class CpuRope {
         }
     }
 
+    /**
+     * {@code LLM_KV_Store_FP8_E4M3} / {@code _FP8_E5M2}: cache row {@code cellIdx[t]} receives the {@code rowElems}
+     * values of src row {@code t} as the FP8 codes of {@code value / kvScale[value / headElems]} (the cache's
+     * per-head checkpoint KV scale, vLLM {@code reshape_and_cache_fp8}); so {@code fp8Value(code) * kvScale} is the
+     * stored value again.
+     *
+     * @throws IllegalArgumentException when {@code type} is not an FP8 KV type, {@code headElems} does not tile the
+     *                                 row or the geometry is invalid
+     */
+    public static void storeFp8(KvDType type, float[] src, int srcOff, int srcRowStride, int nTokens, int rowElems,
+                                int headElems, int[] cellIdx, byte[] dst, int dstRowStride, float[] kvScale) {
+        Objects.requireNonNull(dst, "dst");
+        if (!Objects.requireNonNull(type, "type").fp8()) {
+            throw new IllegalArgumentException(type + " is not an FP8 KV type");
+        }
+        if (headElems <= 0 || rowElems % headElems != 0) {
+            throw new IllegalArgumentException("FP8 KV store needs a head width that tiles its " + rowElems
+                    + " values per row, got " + headElems);
+        }
+        Objects.requireNonNull(kvScale, "kvScale");
+        checkStore(type, src, srcOff, srcRowStride, nTokens, rowElems, cellIdx, dstRowStride);
+        final int heads = rowElems / headElems;
+        for (int t = 0; t < nTokens; t++) {
+            final int cell = cellIdx[t];
+            if (cell < 0) {
+                continue;
+            }
+            requireRange("dst", (long) cell * dstRowStride + rowElems, dst.length);
+            final int s = srcOff + t * srcRowStride;
+            final int d = cell * dstRowStride;
+            for (int h = 0; h < heads; h++) {
+                final float scale = kvScale[h];
+                final int hb = s + h * headElems;
+                final int db = d + h * headElems;
+                for (int e = 0; e < headElems; e++) {
+                    dst[db + e] = (byte) KvBlockCodec.fp8Code(type, src[hb + e] / scale);
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ LLM_KV_RopeShift_*
 
     /**
@@ -231,6 +280,42 @@ public final class CpuRope {
                         final float x1 = FpBlockDecoders.bf16ToFp32(cache[b]);
                         cache[a] = (short) KvBlockCodec.fp32ToBf16(x0 * cs[2 * i] - x1 * cs[2 * i + 1]);
                         cache[b] = (short) KvBlockCodec.fp32ToBf16(x0 * cs[2 * i + 1] + x1 * cs[2 * i]);
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * {@code LLM_KV_RopeShift_FP8_E4M3} / {@code _FP8_E5M2}: {@link #shiftF32} over the stored FP8 codes, each result
+     * re-encoded. The rotation is linear, so it moves the stored, scale-divided values exactly (attention undoes the
+     * scale through its per-head multiply).
+     *
+     * @throws IllegalArgumentException when {@code type} is not an FP8 KV type or the geometry is invalid
+     */
+    public static void shiftFp8(KvDType type, RopeFreqTable shiftTable, byte[] cache, int nCells, int nHeads,
+                                int headStride, int rowStride, int nOffs, int[] delta) {
+        Objects.requireNonNull(cache, "cache");
+        if (!Objects.requireNonNull(type, "type").fp8()) {
+            throw new IllegalArgumentException(type + " is not an FP8 KV type");
+        }
+        checkShift(type, shiftTable, nCells, nHeads, headStride, rowStride, nOffs, 0, delta);
+        requireRange("cache", (long) nCells * rowStride, cache.length);
+        final int pairs = shiftTable.pairs();
+        final int span = shiftTable.pairSpan();
+        CpuParallel.parallelFor(nCells, GRAIN, (from, to) -> {
+            final float[] cs = new float[2 * pairs];
+            for (int c = from; c < to; c++) {
+                shiftTable.cosSin(delta[c], cs);
+                for (int h = 0; h < nHeads; h++) {
+                    final int base = c * rowStride + h * headStride + nOffs;
+                    for (int i = 0; i < pairs; i++) {
+                        final int a = base + shiftTable.pairFirst(i);
+                        final int b = a + span;
+                        final float x0 = KvBlockCodec.fp8Value(type, cache[a]);
+                        final float x1 = KvBlockCodec.fp8Value(type, cache[b]);
+                        cache[a] = (byte) KvBlockCodec.fp8Code(type, x0 * cs[2 * i] - x1 * cs[2 * i + 1]);
+                        cache[b] = (byte) KvBlockCodec.fp8Code(type, x0 * cs[2 * i + 1] + x1 * cs[2 * i]);
                     }
                 }
             }

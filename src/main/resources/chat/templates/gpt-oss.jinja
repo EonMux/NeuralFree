@@ -1,0 +1,9 @@
+{#- llama.cpp gpt-oss chat template (src/llama-chat.cpp:820-829). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|start|>' ~ message['role'] ~ '<|message|>' ~ content -}}
+    {{- '<|return|>' if message['role'] == 'assistant' else '<|end|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|start|>assistant' -}}
+{%- endif -%}

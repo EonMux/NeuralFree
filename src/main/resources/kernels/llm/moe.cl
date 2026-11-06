@@ -1,4 +1,4 @@
-/* moe.cl - MoE router, hash ids, weighted sum, add-id, bucketize and input-scale kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h */
+/* moe.cl - MoE router, hash ids, weighted sum, add-id, bucketize, block-align and input-scale kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/quant_blocks.h, common/matmul_tiled_family.h */
 /*
  * Routing follows llama.cpp build_moe_ffn (src/llama-graph.cpp:2189-2345); the Java twin is
  * gguf.ops.moe.MoeRouting (routing) and gguf.ops.moe.MoeCombine (the other kernels), with the same
@@ -10,6 +10,10 @@
  *   LLM_MoE_WeightedSum  global >= n_tokens * n_embd, 1-D
  *   LLM_AddId            global >= n_sel * dim, 1-D
  *   LLM_MoE_Bucketize    global = local = L (one workgroup, power of two <= LLM_DIMX)
+ *   LLM_MoE_BucketCount  global = ceil(n_tokens * k / chunk) * L, local = L (power of two <= LLM_DIMX)
+ *   LLM_MoE_BucketScan   global = local = L (one workgroup, power of two <= LLM_DIMX)
+ *   LLM_MoE_BucketScatter global = ceil(n_tokens * k / chunk) * L, local = L (power of two <= LLM_DIMX)
+ *   LLM_MoE_AlignBlocks  global = G * L for any G >= 1, local = L (power of two <= LLM_DIMX)
  *   LLM_MoE_ScaleInput   global >= n_tokens * k * n_embd, 1-D
  */
 
@@ -118,8 +122,10 @@ NF_INLINE float nf_moe_gate(int gating, float x, float m) {
  *   probs  = gating(logits[t]) over n_expert            (SOFTMAX: exp(x - max) * (1 / sum))
  *   sel    = sel_mode 0: probs (+ exp_probs_b when has_bias); 1: logits (llama4);
  *            2: sigmoid(logits) (grovemoe); 3: no selection, ids[t * k ..] are given (hash layers)
- *   groups = when n_groups > 1 and sel_mode < 3: group score = sum of the group's two largest sel;
+ *   groups = when n_groups > 1 and sel_mode < 3 and !per_group: group score = sum of the group's two largest sel;
  *            the n_group_used best groups are kept, the others' sel set to -INF (llama-graph.cpp:2281-2305)
+ *   per_group = when n_groups > 1 and sel_mode < 3: each group contributes k / n_groups of its own best experts,
+ *            groups in index order (vLLM's InternS1-Pro router, interns1_pro.py:196-213)
  *   ids    = k rounds of arg-max over the unpicked sel (descending, ties to the lower index)
  *   id_div = when > 0 and sel_mode < 3, ids are divided as nf_moe_div_id (grovemoe chunk experts)
  *   w[j]   = probs[ids[j]]; SOFTMAX_WEIGHT: softmax over the k weights; norm_w: w / max(sum w,
@@ -127,12 +133,12 @@ NF_INLINE float nf_moe_gate(int gating, float x, float m) {
  * Writes ids[t * k + j] and weights[t * k + j]. Router logits must already include ffn_gate_inp.bias.
  * Host limits: n_expert <= min(NF_MOE_MAX_EXPERTS, 32 * L), k <= min(n_expert, NF_MOE_MAX_K),
  * n_groups <= NF_MOE_MAX_GROUPS with n_expert % n_groups == 0 and n_expert / n_groups >= 2,
- * n_group_used <= n_groups.
+ * n_group_used <= n_groups; per_group needs k divisible by n_groups.
  */
 NF_KERNEL void LLM_MoE_Router(
     const int n_tokens, const int n_expert, const int k, const int gating,
     const int n_groups, const int n_group_used, const int norm_w, const float w_scale,
-    const int has_bias, const int sel_mode, const int id_div,
+    const int has_bias, const int sel_mode, const int id_div, const int per_group,
     NF_GLOBAL const float* NF_RESTRICT logits,
     NF_GLOBAL const float* NF_RESTRICT exp_probs_b,
     NF_GLOBAL int* NF_RESTRICT ids,
@@ -188,8 +194,8 @@ NF_KERNEL void LLM_MoE_Router(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    /* group-limited routing */
-    if (sel_mode != NF_MOE_SEL_PRESELECTED && n_groups > 1) {
+    /* group-limited routing (not used by per-group selection) */
+    if (sel_mode != NF_MOE_SEL_PRESELECTED && n_groups > 1 && !per_group) {
         const int n_per = n_expert / n_groups;
         for (int g = lid; g < n_groups; g += lsize) {
             float a = -NF_INF, b = -NF_INF;
@@ -232,7 +238,37 @@ NF_KERNEL void LLM_MoE_Router(
     }
 
     /* top-k: work-item lid owns experts lid + c * L, c < 32, with bit c of `taken` marking a pick */
-    if (sel_mode != NF_MOE_SEL_PRESELECTED) {
+    if (sel_mode != NF_MOE_SEL_PRESELECTED && n_groups > 1 && per_group) {
+        const int n_per = n_expert / n_groups;
+        const int per_k = k / n_groups;
+        uint taken = 0u;
+        for (int g = 0; g < n_groups; g++) {
+            const int lo = g * n_per;
+            const int hi = lo + n_per;
+            for (int j = 0; j < per_k; j++) {
+                float bv = -NF_INF;
+                int bi = -1;
+                int c = 0;
+                for (int e = lid; e < n_expert; e += lsize, c++) {
+                    if (e < lo || e >= hi || ((taken >> c) & 1u)) {
+                        continue;
+                    }
+                    const float v = nf_moe_key(nf_moe_sel[e]);
+                    if (nf_moe_better(v, e, bv, bi)) {
+                        bv = v;
+                        bi = e;
+                    }
+                }
+                const int pick = nf_moe_wg_argmax(nf_moe_rv, nf_moe_ri, bv, bi);
+                if (pick >= 0 && pick % lsize == lid) {
+                    taken |= 1u << (pick / lsize);
+                }
+                if (lid == 0) {
+                    nf_moe_pick[g * per_k + j] = pick;
+                }
+            }
+        }
+    } else if (sel_mode != NF_MOE_SEL_PRESELECTED) {
         uint taken = 0u;
         for (int j = 0; j < k; j++) {
             float bv = -NF_INF;
@@ -348,6 +384,74 @@ NF_KERNEL void LLM_MoE_WeightedSum(
     dst[gid] = (flags & NF_MOE_WS_ACCUMULATE) ? acc + dst[gid] : acc;
 }
 
+/*
+ * LongCat-Flash identity (zero-compute) experts: ids >= n_real_experts select no expert FFN, so their weight is
+ * summed per token into zero_weights and the slot is remapped to expert 0 with weight 0 before any expert kernel
+ * reads it (vLLM's ZeroExpertRouter masks the same way, router/zero_expert_router.py:86-95). One work-item per
+ * token; k <= NF_MOE_MAX_K.
+ */
+NF_KERNEL void LLM_MoE_ZeroExperts(
+    const int n_tokens, const int k, const int n_real_experts,
+    NF_GLOBAL int* NF_RESTRICT ids,
+    NF_GLOBAL float* NF_RESTRICT weights,
+    NF_GLOBAL float* NF_RESTRICT zero_weights) {
+    const int t = get_global_id(0);
+    if (t >= n_tokens) return;
+    float zero = 0.0f;
+    for (int j = 0; j < k; j++) {
+        const nf_i64 p = (nf_i64)t * k + j;
+        if (ids[p] >= n_real_experts) {
+            zero += weights[p];
+            ids[p] = 0;
+            weights[p] = 0.0f;
+        }
+    }
+    zero_weights[t] = zero;
+}
+
+/*
+ * EPLB replica mapping: out[p] = logical_to_physical[e * map_stride + hash(t) % replica_count[e]] for the logical
+ * expert e = ids[p] of pair p = t * k + j, or -1 for an id outside [0, n_logical). The token index goes through the
+ * reference's Knuth multiplicative hash and its low bits choose one of the expert's physical replicas
+ * (vllm/model_executor/layers/fused_moe/eplb_triton.py eplb_map_and_record), so a pair is computed by exactly one
+ * rank even when the expert is replicated. Ids of any pair width k >= 1; one work-item per pair.
+ */
+NF_KERNEL void LLM_MoE_EplbMap(
+    const int n_pairs, const int k, const int n_logical, const int map_stride,
+    NF_GLOBAL const int* NF_RESTRICT ids,
+    NF_GLOBAL const int* NF_RESTRICT replica_count,
+    NF_GLOBAL const int* NF_RESTRICT logical_to_physical,
+    NF_GLOBAL int* NF_RESTRICT out) {
+    const int p = get_global_id(0);
+    if (p >= n_pairs) return;
+    const int e = ids[p];
+    if (e < 0 || e >= n_logical) {
+        out[p] = -1;
+        return;
+    }
+    const int replicas = replica_count[e];
+    const unsigned int token = (unsigned int)(p / k);
+    const unsigned int hashed = token * 2654435769u;
+    const int slot = (int)(hashed % (unsigned int)replicas);
+    out[p] = logical_to_physical[e * map_stride + slot];
+}
+
+/*
+ * dst[t][c] += x[t][c] * zero_weights[t]: the identity experts' contribution, which vLLM's
+ * zero_experts_compute_triton accumulates from the expert input over the selected zero slots
+ * (fused_moe.py:1051-1126). x and dst are element offsets; they may name the same buffer.
+ */
+NF_KERNEL void LLM_MoE_ZeroApply(
+    const int n_tokens, const int n_embd, const int x_off, const int dst_off,
+    NF_GLOBAL const float* NF_RESTRICT x,
+    NF_GLOBAL const float* NF_RESTRICT zero_weights,
+    NF_GLOBAL float* dst) {
+    const nf_i64 gid = (nf_i64)get_global_id(0);
+    if (gid >= (nf_i64)n_tokens * n_embd) return;
+    const int t = (int)(gid / n_embd);
+    dst[dst_off + gid] += x[x_off + gid] * zero_weights[t];
+}
+
 /* data[s][c] += bias[slots[s]][c] (ggml_add_id, expert biases, llama-graph.cpp:2381, 2397, 2410, 2525). */
 NF_KERNEL void LLM_AddId(
     const int n_sel, const int dim,
@@ -366,6 +470,82 @@ NF_INLINE int nf_moe_bucket(int id, int n_expert) {
 }
 
 /*
+ * Rank of this work-item's bucket b among the earlier entries of the local chunk, and whether no later
+ * entry of the chunk shares it (the work-item then advances the bucket's cursor).
+ */
+NF_INLINE int nf_moe_rank(NF_LOCAL_PTR const int* chunk, int b, int lid, int lsize, int* last) {
+    int rank = 0;
+    *last = 1;
+    for (int l = 0; l < lsize; l++) {
+        if (chunk[l] == b) {
+            if (l < lid) rank++;
+            else if (l > lid) *last = 0;
+        }
+    }
+    return rank;
+}
+
+/*
+ * Writes the sorted rows of the pairs [p0, p1) in L-pair passes: pair p of bucket b goes to
+ * cur[b] + (its rank among b's pairs of the pass), and the pass's last pair of b advances cur[b], so the
+ * rows of a bucket keep ascending pair order without atomics. Every work-item of the workgroup calls it
+ * with the same range (the barriers inside are uniform).
+ */
+NF_INLINE void nf_moe_scatter_rows(NF_GLOBAL const int* NF_RESTRICT ids, int n_expert, int p0, int p1,
+                                   NF_LOCAL_PTR int* cur, NF_LOCAL_PTR int* chunk, int lid, int lsize,
+                                   NF_GLOBAL int* NF_RESTRICT row_token, NF_GLOBAL int* NF_RESTRICT row_slot) {
+    for (int base = p0; base < p1; base += lsize) {
+        const int p = base + lid;
+        const int b = p < p1 ? nf_moe_bucket(ids[p], n_expert) : -1;
+        chunk[lid] = b;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int rank = 0, last = 0;
+        if (b >= 0) {
+            rank = nf_moe_rank(chunk, b, lid, lsize, &last);
+            const int pos = cur[b] + rank;
+            row_token[pos] = p;
+            row_slot[pos] = b < n_expert ? b : -1;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (b >= 0 && last) {
+            cur[b] += rank + 1;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
+/*
+ * In-place exclusive prefix sum of v[0, n) over one workgroup, returning the total: work-item lid sums
+ * the contiguous segment [lid * s, (lid + 1) * s) (s = ceil(n / L)), part[] scans the L segment sums
+ * (Hillis-Steele), and each work-item rewrites its segment. Integer adds, so the result is exact and
+ * independent of the work-group size. Every work-item must call it (it holds barriers).
+ */
+NF_INLINE int nf_moe_excl_scan(NF_LOCAL_PTR int* v, int n, NF_LOCAL_PTR int* part, int lid, int lsize) {
+    const int seg = (n + lsize - 1) / lsize;
+    const int b0 = lid * seg < n ? lid * seg : n;
+    const int b1 = b0 + seg < n ? b0 + seg : n;
+    int sum = 0;
+    for (int b = b0; b < b1; b++) sum += v[b];
+    part[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = 1; off < lsize; off <<= 1) {
+        const int add = lid >= off ? part[lid - off] : 0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        part[lid] += add;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    int run = lid == 0 ? 0 : part[lid - 1];
+    const int total = part[lsize - 1];
+    for (int b = b0; b < b1; b++) {
+        const int c = v[b];
+        v[b] = run;
+        run += c;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return total;
+}
+
+/*
  * Stable counting sort of the n_tokens * k pairs by expert, one workgroup:
  *   counts[e]  = pairs routed to e; offsets[e] = exclusive prefix sum of counts
  *   sorted row i = offsets[e] + (rank of the pair among e's pairs in ascending pair order):
@@ -373,7 +553,8 @@ NF_INLINE int nf_moe_bucket(int id, int n_expert) {
  * Pairs whose id is outside [0, n_expert) follow all valid rows with row_slot = -1
  * ({T}_BatchMatMulId writes 0 for them). Each pass handles L pairs at a time; work-item lid ranks its
  * pair by scanning the chunk, and the chunk's last pair of a bucket advances that bucket's cursor, so
- * no atomics are used and the result is deterministic.
+ * no atomics are used and the result is deterministic. Large batches use the multi-workgroup
+ * LLM_MoE_BucketCount / LLM_MoE_BucketScan / LLM_MoE_BucketScatter, which write the same output.
  */
 NF_KERNEL void LLM_MoE_Bucketize(
     const int n_tokens, const int k, const int n_expert,
@@ -399,13 +580,8 @@ NF_KERNEL void LLM_MoE_Bucketize(
         nf_moe_chunk[lid] = b;
         barrier(CLK_LOCAL_MEM_FENCE);
         if (b >= 0) {
-            int rank = 0, last = 1;
-            for (int l = 0; l < lsize; l++) {
-                if (nf_moe_chunk[l] == b) {
-                    if (l < lid) rank++;
-                    else if (l > lid) last = 0;
-                }
-            }
+            int last = 0;
+            const int rank = nf_moe_rank(nf_moe_chunk, b, lid, lsize, &last);
             if (last) {
                 nf_moe_cur[b] += rank + 1;
             }
@@ -429,29 +605,171 @@ NF_KERNEL void LLM_MoE_Bucketize(
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
+    nf_moe_scatter_rows(ids, n_expert, 0, n_rows, nf_moe_cur, nf_moe_chunk, lid, lsize, row_token, row_slot);
+}
 
-    for (int base = 0; base < n_rows; base += lsize) {
-        const int p = base + lid;
-        const int b = p < n_rows ? nf_moe_bucket(ids[p], n_expert) : -1;
-        nf_moe_chunk[lid] = b;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        int rank = 0, last = 1;
-        if (b >= 0) {
-            for (int l = 0; l < lsize; l++) {
-                if (nf_moe_chunk[l] == b) {
-                    if (l < lid) rank++;
-                    else if (l > lid) last = 0;
-                }
+/*
+ * Multi-workgroup stable counting sort, phase 1 of 3 (the output of all three equals
+ * LLM_MoE_Bucketize). Workgroup g counts the buckets of the pairs [g * chunk, min((g + 1) * chunk,
+ * n_tokens * k)) into hist[g * (n_expert + 1) + b], the out-of-range bucket b = n_expert last. The
+ * counts do not depend on the order of the local atomic increments. The host launches
+ * ceil(n_tokens * k / chunk) workgroups (Java: MoeKernels.bucketGroups).
+ */
+NF_KERNEL void LLM_MoE_BucketCount(
+    const int n_tokens, const int k, const int n_expert, const int chunk,
+    NF_GLOBAL const int* NF_RESTRICT ids,
+    NF_GLOBAL int* NF_RESTRICT hist) {
+    NF_LOCAL int nf_moe_cnt[NF_MOE_MAX_EXPERTS + 1];
+    const int lid = get_local_id(0), lsize = get_local_size(0);
+    const int g = get_group_id(0);
+    const int n_rows = n_tokens * k;
+    const int nb = n_expert + 1;
+    for (int b = lid; b < nb; b += lsize) {
+        nf_moe_cnt[b] = 0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const nf_i64 p0 = (nf_i64)g * chunk;
+    const int p1 = p0 + chunk < n_rows ? (int)(p0 + chunk) : n_rows;
+    for (nf_i64 p = p0 + lid; p < p1; p += lsize) {
+        atomic_inc(&nf_moe_cnt[nf_moe_bucket(ids[p], n_expert)]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int b = lid; b < nb; b += lsize) {
+        hist[(nf_i64)g * nb + b] = nf_moe_cnt[b];
+    }
+}
+
+/*
+ * Multi-workgroup stable counting sort, phase 2 of 3, one workgroup: from the per-group bucket counts
+ * of LLM_MoE_BucketCount writes counts[e] and offsets[e] exactly as LLM_MoE_Bucketize does, and
+ * rewrites hist[g * (n_expert + 1) + b] in place to the first sorted row of group g's pairs of bucket b:
+ * offsets[b] (valid_total for the out-of-range bucket) plus the pairs of b in the groups before g.
+ */
+NF_KERNEL void LLM_MoE_BucketScan(
+    const int n_tokens, const int k, const int n_expert, const int chunk,
+    NF_GLOBAL int* NF_RESTRICT hist,
+    NF_GLOBAL int* NF_RESTRICT counts,
+    NF_GLOBAL int* NF_RESTRICT offsets) {
+    if (get_group_id(0) != 0) return;
+    NF_LOCAL int nf_moe_tot[NF_MOE_MAX_EXPERTS + 1];
+    NF_LOCAL int nf_moe_part[LLM_DIMX];
+    const int lid = get_local_id(0), lsize = get_local_size(0);
+    const int n_rows = n_tokens * k;
+    const int nb = n_expert + 1;
+    const int n_groups = (n_rows + chunk - 1) / chunk;
+    for (int b = lid; b < nb; b += lsize) {
+        int run = 0;
+        for (int g = 0; g < n_groups; g++) {
+            const nf_i64 i = (nf_i64)g * nb + b;
+            const int c = hist[i];
+            hist[i] = run;
+            run += c;
+        }
+        nf_moe_tot[b] = run;
+        if (b < n_expert) {
+            counts[b] = run;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    nf_moe_excl_scan(nf_moe_tot, nb, nf_moe_part, lid, lsize);
+    for (int b = lid; b < nb; b += lsize) {
+        const int start = nf_moe_tot[b];
+        if (b < n_expert) {
+            offsets[b] = start;
+        }
+        for (int g = 0; g < n_groups; g++) {
+            hist[(nf_i64)g * nb + b] += start;
+        }
+    }
+}
+
+/*
+ * Multi-workgroup stable counting sort, phase 3 of 3: workgroup g writes the sorted rows of its pairs
+ * [g * chunk, min((g + 1) * chunk, n_tokens * k)) from the row starts LLM_MoE_BucketScan left in hist,
+ * ranking them in L-pair passes as LLM_MoE_Bucketize does, so row_token and row_slot equal its output.
+ */
+NF_KERNEL void LLM_MoE_BucketScatter(
+    const int n_tokens, const int k, const int n_expert, const int chunk,
+    NF_GLOBAL const int* NF_RESTRICT ids,
+    NF_GLOBAL const int* NF_RESTRICT hist,
+    NF_GLOBAL int* NF_RESTRICT row_token,
+    NF_GLOBAL int* NF_RESTRICT row_slot) {
+    NF_LOCAL int nf_moe_cur[NF_MOE_MAX_EXPERTS + 1];
+    NF_LOCAL int nf_moe_chunk[LLM_DIMX];
+    const int lid = get_local_id(0), lsize = get_local_size(0);
+    const int g = get_group_id(0);
+    const int n_rows = n_tokens * k;
+    const int nb = n_expert + 1;
+    for (int b = lid; b < nb; b += lsize) {
+        nf_moe_cur[b] = hist[(nf_i64)g * nb + b];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const nf_i64 p0 = (nf_i64)g * chunk;
+    if (p0 >= n_rows) return;
+    const int p1 = p0 + chunk < n_rows ? (int)(p0 + chunk) : n_rows;
+    nf_moe_scatter_rows(ids, n_expert, (int)p0, p1, nf_moe_cur, nf_moe_chunk, lid, lsize, row_token, row_slot);
+}
+
+/*
+ * Block-aligned copy of the sorted rows for the grouped GEMM ({T}_GroupedGemm,
+ * common/matmul_grouped_family.h; the layout of vLLM moe_align_block_size) over the counts, offsets
+ * and sorted rows of LLM_MoE_Bucketize. n_tiles is the host's worst-case tile bound (Java:
+ * MoeKernels.groupedTiles) and fixes the written length n_tiles * NF_GEMM_TN: bucket b's rows keep
+ * their sorted order at positions [tile_base[b] * NF_GEMM_TN, ..), tile_base being the exclusive
+ * prefix sum of the buckets' ceil(count / NF_GEMM_TN) tile counts, and the bucket's tile padding
+ * holds gemm_token = gemm_slot = -1. A position's pair is gemm_token[i] (p = t * k + j) and its
+ * expert gemm_slot[i] (the invalid-id bucket keeps -1), so tile q's expert is
+ * gemm_slot[q * NF_GEMM_TN]: every tile's first position is a real row, and the tiles past the
+ * aligned count hold only fillers. The sum-order and output positions of {T}_GroupedGemm equal
+ * {T}_BatchMatMulId, whose row_token / row_slot this kernel consumes unchanged.
+ *
+ * Any number of workgroups: each computes tile_base in local memory, then every position is gathered
+ * by exactly one work-item of the grid-stride loop (the bucket of its tile by binary search over
+ * tile_base), so the output does not depend on the grid.
+ */
+NF_KERNEL void LLM_MoE_AlignBlocks(
+    const int n_tokens, const int k, const int n_expert, const int n_tiles,
+    NF_GLOBAL const int* NF_RESTRICT counts,
+    NF_GLOBAL const int* NF_RESTRICT offsets,
+    NF_GLOBAL const int* NF_RESTRICT row_token,
+    NF_GLOBAL const int* NF_RESTRICT row_slot,
+    NF_GLOBAL int* NF_RESTRICT gemm_token,
+    NF_GLOBAL int* NF_RESTRICT gemm_slot) {
+    NF_LOCAL int nf_moe_base[NF_MOE_MAX_EXPERTS + 1];
+    NF_LOCAL int nf_moe_part[LLM_DIMX];
+    const int lid = get_local_id(0), lsize = get_local_size(0);
+    const int n_rows = n_tokens * k;
+    const int nb = n_expert + 1;
+    /* requires n_expert >= 1 (MoeKernels validates), so both arrays below are in range */
+    const int valid_total = offsets[n_expert - 1] + counts[n_expert - 1];
+    for (int b = lid; b < nb; b += lsize) {
+        const int c = b < n_expert ? counts[b] : n_rows - valid_total;
+        nf_moe_base[b] = (c + NF_GEMM_TN - 1) / NF_GEMM_TN;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const int used = nf_moe_excl_scan(nf_moe_base, nb, nf_moe_part, lid, lsize);
+    const nf_i64 n_pos = (nf_i64)n_tiles * NF_GEMM_TN;
+    const nf_i64 stride = (nf_i64)get_global_size(0);
+    for (nf_i64 q = (nf_i64)get_global_id(0); q < n_pos; q += stride) {
+        const int tile = (int)(q / NF_GEMM_TN);
+        int tok = -1, slot = -1;
+        if (tile < used) {
+            int lo = 0, hi = nb - 1;
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) >> 1;
+                if (nf_moe_base[mid] <= tile) lo = mid;
+                else hi = mid - 1;
             }
-            const int pos = nf_moe_cur[b] + rank;
-            row_token[pos] = p;
-            row_slot[pos] = b < n_expert ? b : -1;
+            const int idx = (int)(q - (nf_i64)nf_moe_base[lo] * NF_GEMM_TN);
+            const int cnt = lo < n_expert ? counts[lo] : n_rows - valid_total;
+            if (idx < cnt) {
+                const int start = lo < n_expert ? offsets[lo] : valid_total;
+                tok = row_token[start + idx];
+                slot = row_slot[start + idx];
+            }
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (b >= 0 && last) {
-            nf_moe_cur[b] += rank + 1;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
+        gemm_token[q] = tok;
+        gemm_slot[q] = slot;
     }
 }
 

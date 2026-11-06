@@ -22,7 +22,8 @@ import java.util.Map;
  *
  * <p>A tensor of a NeuralFree extension type ({@link GGMLType#isExtension()}, ids 1000-1099, which ggml does not
  * define) is accepted only when the same file's key/value section sets {@link GgufKeys#NF_EXTENSION_TYPES} to BOOL
- * true. Every file of a split model that holds such tensors therefore carries the key itself. Ids that map to
+ * true. Every file of a split model that holds such tensors therefore carries the key itself. A tensor of a
+ * device-resident type ({@link GGMLType#isDeviceOnly()}) is refused by name whatever the key says. Ids that map to
  * {@link GGMLType#UNKNOWN} are left to {@link GGUFTensorInfo#validate}.</p>
  *
  * <p>Reads are positional channel reads through a private buffer, so the channel position and any file pointer
@@ -42,8 +43,11 @@ final class GGUFHeaderReader {
     /** Largest tensor or key/value count one Java collection indexes. */
     private static final long MAX_ENTRIES = Integer.MAX_VALUE - 8L;
 
-    /** Smallest key/value pair: key length, a one-byte key, the type id and a one-byte value. */
-    private static final long MIN_KV_BYTES = 8 + 1 + 4 + 1;
+    /**
+     * Smallest key/value pair: key length, the type id and a one-byte value. An empty key fits this bound, so the
+     * pair is read and refused by name ("key N is empty") rather than by the entry count.
+     */
+    private static final long MIN_KV_BYTES = 8 + 4 + 1;
 
     /** Smallest tensor info: name length, rank, type id and data offset. */
     private static final long MIN_TENSOR_INFO_BYTES = 8 + 4 + 4 + 8;
@@ -122,9 +126,12 @@ final class GGUFHeaderReader {
      * Reads key/value pair {@code index} into {@code values}, recording its type in {@code types} and, for an
      * array, the element type in {@code elementTypes} (which may be null). The {@link GgufKeys#NF_EXTENSION_TYPES}
      * pair is also kept by the reader, which checks the tensor infos that follow against it.
+     *
+     * @return the key read, so a caller that recorded {@link #position()} before the call has the file offset of
+     *         the pair
      */
-    void readKVPair(long index, Map<String, Object> values, Map<String, GGUFValueType> types,
-                    Map<String, GGUFValueType> elementTypes) throws IOException {
+    String readKVPair(long index, Map<String, Object> values, Map<String, GGUFValueType> types,
+                      Map<String, GGUFValueType> elementTypes) throws IOException {
         String key = readString("key " + index, -1L);
         if (key.isEmpty()) {
             throw format("key " + index + " is empty");
@@ -150,6 +157,7 @@ final class GGUFHeaderReader {
             extensionMarkerType = type;
             extensionMarkerValue = values.get(key);
         }
+        return key;
     }
 
     /**
@@ -176,6 +184,10 @@ final class GGUFHeaderReader {
             dims[i] = u64();
         }
         GGMLType type = GGMLType.fromId(u32());
+        if (type.isDeviceOnly()) {
+            throw format("tensor '" + name + "' has type " + type + ", a device-resident form that GGUF files never"
+                    + " store");
+        }
         if (type.isExtension()) {
             requireExtensionTypesDeclared(name, type);
         }

@@ -171,6 +171,14 @@ public final class KernelSignature {
         return layoutIsBuffer != null;
     }
 
+    /**
+     * Copy of the declaration-order buffer flags (true for a buffer parameter), or null when the signature records
+     * no layout ({@link #hasLayout()}).
+     */
+    public boolean[] layout() {
+        return layoutIsBuffer == null ? null : layoutIsBuffer.clone();
+    }
+
     public int bufferCount() {
         return bufferReadOnly.length;
     }

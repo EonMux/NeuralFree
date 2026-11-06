@@ -1,15 +1,16 @@
-/* common/quant_decode_ext.h - F8_E5M2, F8_E4M3, F8_E4M3_B128, MXFP8, MXFP6_E2M3, MXFP6_E3M2, I8_B128,
+/* common/quant_decode_ext.h - F8_E5M2, F8_E4M3, F8_E4M3_B128, F8_E4M3_B32, MXFP8, MXFP6_E2M3, MXFP6_E3M2, I8_B128,
  * NF4 and FP4_BNB decode triples. Requires: common/dialect.h, common/config.h, common/quant_blocks.h,
  * common/quant_decode_new.h */
 /*
  * Decode triples (_decode, _decode_dual, _decode_elem) of the NeuralFree extension block types
- * (gguf.GGMLType ids 1000-1008, field offsets of common/quant_blocks.h) for the IQ_ALL_KERNELS contract
+ * (gguf.GGMLType ids 1000-1009, field offsets of common/quant_blocks.h) for the IQ_ALL_KERNELS contract
  * of common/matvec_family.h; _decode and _decode_dual come from NF_NQ_DOT_PAIR (common/quant_decode_new.h).
  *
  * Element j of a block:
  *   F8_E5M2        e5m2(qs[j])                 (a per-tensor or per-expert .scale multiplies the product)
  *   F8_E4M3        e4m3(qs[j])                 (same .scale rule)
  *   F8_E4M3_B128   d * e4m3(qs[j])
+ *   F8_E4M3_B32    d * e4m3(qs[j])
  *   MXFP8          2^(e - 127) * e4m3(qs[j])
  *   MXFP6_E2M3     2^(e - 127) * e2m3(code j)  (element j = code j, four 6-bit codes per three bytes)
  *   MXFP6_E3M2     2^(e - 127) * e3m2(code j)
@@ -21,7 +22,8 @@
  *
  * Work split: every type has BS / TPS = NF_NQ_EPT = 8, and work-item ltid owns the consecutive elements
  * [8*ltid, 8*ltid + 8) as the runs [8*ltid, 8*ltid + 4) and [8*ltid + 4, 8*ltid + 8):
- *   F8_E5M2, F8_E4M3, MXFP8, MXFP6_E2M3, MXFP6_E3M2  TPS = 4    qs bytes 8*ltid .. 8*ltid + 7
+ *   F8_E5M2, F8_E4M3, F8_E4M3_B32, MXFP8,
+ *   MXFP6_E2M3, MXFP6_E3M2                         TPS = 4    qs bytes 8*ltid .. 8*ltid + 7
  *                                                               (MXFP6: the 48 bits at qs + 6*ltid)
  *   F8_E4M3_B128, I8_B128    TPS = 16   qs bytes 8*ltid .. 8*ltid + 7
  *   NF4, FP4_BNB             TPS = 8    qs bytes 8*(ltid%4) .. 8*(ltid%4) + 7, low nibbles for ltid < 4,
@@ -42,6 +44,7 @@
 #define F8_E5M2_TPS      4
 #define F8_E4M3_TPS      4
 #define F8_E4M3_B128_TPS 16
+#define F8_E4M3_B32_TPS  4
 #define MXFP8_TPS        4
 #define I8_B128_TPS      16
 #define NF4_TPS          8
@@ -100,6 +103,20 @@ NF_INLINE float F8_E4M3_B128_decode_elem(NF_GLOBAL const uchar* w, int dim, int 
     NF_GLOBAL const uchar* bp = nf_nq_block(w, dim, tok, i, F8_E4M3_B128_BLOCK_SIZE, F8_E4M3_B128_BLOCK_BYTES);
     return nf_xq_f32(bp, NF_F8_E4M3_B128_D)
          * F8_E4M3_LUT[bp[NF_F8_E4M3_B128_QS + i % F8_E4M3_B128_BLOCK_SIZE]];
+}
+
+/* ---- F8_E4M3_B32: f32 d, qs[32] E4M3FN codes ---- */
+NF_INLINE void nf_f8b32_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4* w1) {
+    nf_xq_e4m3_w8(bp + NF_F8_E4M3_B32_QS, ltid, w0, w1);
+}
+NF_INLINE float nf_f8b32_scale(NF_GLOBAL const uchar* bp, int ltid) {
+    return nf_xq_f32(bp, NF_F8_E4M3_B32_D);
+}
+NF_NQ_DOT_PAIR(F8_E4M3_B32, nf_f8b32_w8, nf_f8b32_scale, nf_nq_xo8, NF_XQ_X1)
+NF_INLINE float F8_E4M3_B32_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, int i) {
+    NF_GLOBAL const uchar* bp = nf_nq_block(w, dim, tok, i, F8_E4M3_B32_BLOCK_SIZE, F8_E4M3_B32_BLOCK_BYTES);
+    return nf_xq_f32(bp, NF_F8_E4M3_B32_D)
+         * F8_E4M3_LUT[bp[NF_F8_E4M3_B32_QS + i % F8_E4M3_B32_BLOCK_SIZE]];
 }
 
 /* ---- MXFP8: E8M0 e, qs[32] E4M3FN codes ---- */

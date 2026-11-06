@@ -295,24 +295,29 @@ public class MemoryPlannerTest {
     }
 
     /**
-     * With rollback snapshots the trailing {@code 1 + s} tokens of a call stay in one step, as llama.cpp's
-     * {@code split_equal} keeps {@code n_keep_tail} (src/llama-batch.cpp:714-765).
+     * A call's steps are as few as its cap allows and of equal size up to one token, and with rollback snapshots
+     * the trailing {@code 1 + s} tokens of the call stay in the last step, as llama.cpp's {@code split_equal} keeps
+     * {@code n_keep_tail} (src/llama-batch.cpp:714-765).
      */
     @Test
-    public void stepTokensKeepTheRollbackTailInOneStep() {
+    public void stepTokensSplitACallEquallyAndKeepTheRollbackTailInOneStep() {
         MemoryPlan plain = MemoryPlanner.planForContext(deepseek4Csa(), f16(), 4096);
-        assertEquals(8, plain.stepTokens(10, 8));
+        assertEquals("10 tokens in steps of at most 8 run as 5 + 5", 5, plain.stepTokens(10, 8));
         assertEquals(2, plain.stepTokens(2, 8));
         MemoryPlan three = MemoryPlanner.planForContext(deepseek4Csa(), f16().forRollback(3), 4096);
-        assertEquals("10 = 6 + 4 keeps the 4-token tail whole", 6, three.stepTokens(10, 8));
+        assertEquals("10 = 5 + 5 keeps the 4-token tail whole", 5, three.stepTokens(10, 8));
         assertEquals(4, three.stepTokens(4, 8));
-        assertEquals(8, three.stepTokens(12, 8));
+        assertEquals(6, three.stepTokens(12, 8));
         assertEquals(8, three.stepTokens(16, 8));
-        assertEquals(8, three.stepTokens(13, 8));
-        assertEquals(7, three.stepTokens(11, 8));
+        assertEquals(7, three.stepTokens(13, 8));
+        assertEquals(6, three.stepTokens(11, 8));
         assertEquals(5, three.stepTokens(9, 8));
         assertEquals(8, three.stepTokens(8, 8));
         assertEquals("a step no larger than the tail splits plainly", 4, three.stepTokens(6, 4));
+        assertEquals("an equal split leaving 3 of the 4-token tail takes it from the step before", 4,
+                three.stepTokens(11, 5));
+        assertEquals(3, three.stepTokens(7, 5));
+        assertEquals(4, three.stepTokens(4, 5));
         assertThrows(IllegalArgumentException.class, () -> three.stepTokens(0, 8));
         assertThrows(IllegalArgumentException.class, () -> three.stepTokens(3, 0));
     }
@@ -424,6 +429,37 @@ public class MemoryPlannerTest {
             assertEquals(t, kv.dtypeK());
             assertEquals(t, kv.dtypeV());
             assertEquals(1024L * 2 * t.rowBytes(160), plan.layer(0).kvBytes());
+        }
+    }
+
+    /** Per-token-head caches size rows plus one F32 scale per KV head, and only the main attention supports them. */
+    @Test
+    public void perTokenHeadTypesPlanScalePlanesOnMainAttentionOnly() {
+        for (KvDType t : new KvDType[]{KvDType.FP8_PER_TOKEN_HEAD, KvDType.INT8_PER_TOKEN_HEAD,
+                KvDType.INT4_PER_TOKEN_HEAD}) {
+            MemoryConfig cfg = MemoryConfig.builder().typeK(t).typeV(t).build();
+            MemoryPlan plan = MemoryPlanner.planForContext(llamaHead(64, 2), cfg, 1024);
+            KvLayout kv = plan.layer(0).kv();
+            assertEquals(t, kv.dtypeK());
+            assertEquals(t, kv.dtypeV());
+            assertEquals(2, kv.nHeadKv());
+            assertEquals(t.rowBytes(128), kv.rowBytesK());
+            assertEquals(1024L * (2 * t.rowBytes(128) + 2L * 2 * Float.BYTES), plan.layer(0).kvBytes());
+            assertEquals(kv.totalBytes(), plan.layer(0).totalBytes());
+            assertTotalsMatchLayers(plan);
+
+            IllegalArgumentException latent = assertThrows(IllegalArgumentException.class,
+                    () -> MemoryPlanner.planForContext(deepseek2(true), cfg, 1024));
+            assertTrue(latent.getMessage(), latent.getMessage().contains("MLA latent cache of layer 0"));
+            assertTrue(latent.getMessage(), latent.getMessage().contains(t.name().toLowerCase(Locale.ROOT)));
+            IllegalArgumentException raw = assertThrows(IllegalArgumentException.class,
+                    () -> MemoryPlanner.planForContext(deepseek4Csa(), cfg, 4096));
+            assertTrue(raw.getMessage(), raw.getMessage().contains("DeepSeek-V4 raw K cache of layer 0"));
+
+            MemoryConfig mixed = MemoryConfig.builder().typeK(t).typeV(KvDType.F16).build();
+            IllegalArgumentException pair = assertThrows(IllegalArgumentException.class,
+                    () -> MemoryPlanner.planForContext(llamaHead(64, 2), mixed, 1024));
+            assertTrue(pair.getMessage(), pair.getMessage().contains("must be per-token-head"));
         }
     }
 
@@ -557,6 +593,29 @@ public class MemoryPlannerTest {
         assertEquals(target.totalBytes() + plan.totalBytes(), ContextFitter.requiredBytes(spec, q8, 4096));
         assertEquals(plan.totalBytes(), ContextFitter.reservedBytes(spec, q8, target,
                 ContextFitter.Companion.NONE));
+    }
+
+    @Test
+    public void nextnContextRunsWithTheConfiguredDraftCacheTypesAndUbatch() {
+        ModelSpec spec = withNextn();
+        MemoryConfig cfg = MemoryConfig.builder().draftTypeK(KvDType.Q8_0).draftTypeV(KvDType.Q8_0).draftUbatch(128)
+                .stateSnapshots(true).nextnMemory(true).build();
+        MemoryPlan target = MemoryPlanner.planForContext(spec, cfg, 4096);
+        assertEquals(KvDType.F16, target.layer(0).kv().dtypeK());
+        assertEquals(512, target.ubatch());
+        MemoryPlan plan = MemoryPlanner.planNextn(spec, target, 2);
+        LayerMemoryPlan nextn = plan.layer(2);
+        assertEquals(KvDType.Q8_0, nextn.kv().dtypeK());
+        assertEquals(KvDType.Q8_0, nextn.kv().dtypeV());
+        assertEquals(128, plan.ubatch());
+        assertFalse(plan.config().stateSnapshots());
+        // one NextN layer: 4096 rows of 2 * 136 bytes (Q8_0 K and V, 4 blocks of 32 per 128-value row)
+        // plus 4096 position floats
+        assertEquals(4096L * 272 + 4096L * 4, plan.totalBytes());
+        assertEquals(plan.totalBytes(), MemoryPlanner.nextnBytes(spec, cfg, 4096, target.ubatch()));
+        assertEquals(target.totalBytes() + plan.totalBytes(), ContextFitter.requiredBytes(spec, cfg, 4096));
+        assertEquals(plan.totalBytes(),
+                ContextFitter.reservedBytes(spec, cfg, target, ContextFitter.Companion.NONE));
     }
 
     @Test

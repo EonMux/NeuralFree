@@ -10,11 +10,13 @@ import java.util.Objects;
  * in floats, per backend and device.
  *
  * <ul>
- *   <li>CUDA: {@value #MAX_FLOATS}, the value the fatbins are compiled with (48 KiB static shared
- *       memory minus 4 KiB for the kernels' other shared arrays).</li>
+ *   <li>CUDA and HIP: {@value #MAX_FLOATS}, the value the fatbins and code objects are compiled
+ *       with (48 KiB static shared memory minus 4 KiB for the kernels' other shared arrays).</li>
  *   <li>OpenCL and Vulkan: {@code min(MAX_FLOATS, sharedBytes/4 - RESERVED_FLOATS)} with a floor of
  *       {@value #MIN_FLOATS}; OpenCL passes it as {@code -DNF_FA_SMEM_FLOATS}, Vulkan as specialisation
  *       constant {@value #VULKAN_SPEC_ID}.</li>
+ *   <li>An accelerator backend: the same formula, because the value never exceeds the device's shared
+ *       memory; the provider's own kernel library decides the static limit its kernels were built with.</li>
  * </ul>
  */
 public final class FaSmem {
@@ -40,7 +42,7 @@ public final class FaSmem {
         if (type == null || caps == null) {
             throw new IllegalArgumentException("backend type and capabilities must not be null");
         }
-        if (type == ComputeBackend.BackendType.CUDA) {
+        if (type == ComputeBackend.BackendType.CUDA || type == ComputeBackend.BackendType.HIP) {
             return MAX_FLOATS;
         }
         long sharedFloats = Math.max(0L, caps.getMaxSharedMemoryBytes()) / 4L - RESERVED_FLOATS;

@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.cpu.ops;
 
+import com.eonmux.neuralfree.gguf.cpu.numa.NumaPlacement;
+
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.RecursiveAction;
@@ -11,6 +13,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>The pool size comes from the system property {@value #THREADS_PROPERTY} (a positive integer) and
  * defaults to {@link Runtime#availableProcessors()}. Worker threads are daemons named {@code nf-cpu-N}.
  * Loops called from a pool worker run on the same pool (work stealing), so nesting does not deadlock.
+ *
+ * <p>When {@value com.eonmux.neuralfree.gguf.cpu.numa.NumaStrategy#PROPERTY} selects a NUMA strategy and
+ * the host has more than one node, worker {@code N} pins itself to its node's CPUs when it starts
+ * ({@link NumaPlacement}); the pool is created on first use, so the strategy must be set before that, as
+ * the demos and the server do before they open a model.
  */
 public final class CpuParallel {
 
@@ -24,7 +31,8 @@ public final class CpuParallel {
     }
 
     private static final class Holder {
-        static final ForkJoinPool POOL = createPool(threadCount());
+        static final NumaPlacement NUMA = NumaPlacement.fromSystemProperties();
+        static final ForkJoinPool POOL = createPool(threadCount(), NUMA);
     }
 
     private CpuParallel() {
@@ -89,15 +97,37 @@ public final class CpuParallel {
         return n;
     }
 
-    private static ForkJoinPool createPool(int threads) {
+    private static ForkJoinPool createPool(int threads, NumaPlacement placement) {
         AtomicInteger counter = new AtomicInteger();
         ForkJoinPool.ForkJoinWorkerThreadFactory factory = pool -> {
-            ForkJoinWorkerThread t = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
-            t.setName("nf-cpu-" + counter.getAndIncrement());
+            NumaWorkerThread t = new NumaWorkerThread(pool, placement, counter.getAndIncrement());
+            t.setName("nf-cpu-" + t.workerIndex());
             t.setDaemon(true);
+            t.setContextClassLoader(null);
             return t;
         };
         return new ForkJoinPool(threads, factory, null, false);
+    }
+
+    /** A pool worker that pins itself to its NUMA node's CPUs once the pool starts it. */
+    private static final class NumaWorkerThread extends ForkJoinWorkerThread {
+        private final NumaPlacement placement;
+        private final int workerIndex;
+
+        NumaWorkerThread(ForkJoinPool pool, NumaPlacement placement, int workerIndex) {
+            super(pool);
+            this.placement = placement;
+            this.workerIndex = workerIndex;
+        }
+
+        int workerIndex() {
+            return workerIndex;
+        }
+
+        @Override
+        protected void onStart() {
+            placement.pinCurrentThread(workerIndex);
+        }
     }
 
     /** Splits {@code [from, to)} in halves until a range fits in one chunk. */

@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf;
 
+import com.eonmux.neuralfree.gguf.cpu.numa.NumaPlacement;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 
 import java.io.IOException;
@@ -14,6 +15,11 @@ import java.nio.channels.FileChannel;
  * <p>The OS manages the page cache — hot weights stay in physical RAM transparently.
  * Uses multiple 1GB segments to handle files larger than {@code Integer.MAX_VALUE}.</p>
  *
+ * <p>The region's {@link TensorReadMode} decides how tensors are served: {@link TensorReadMode#MMAP} maps them,
+ * {@link TensorReadMode#MLOCK} reads them through the channel and pins the file's mapped pages, and
+ * {@link TensorReadMode#MMAP_MLOCK} maps and pins them; the remaining modes read through the channel. When a NUMA
+ * strategy is active the mapping is advised {@code POSIX_MADV_RANDOM}, as llama.cpp does on a NUMA host.</p>
+ *
  * <p>Thread-safe: all reads use absolute-position accessors.</p>
  */
 public class MappedWeightStore implements WeightStore {
@@ -27,6 +33,8 @@ public class MappedWeightStore implements WeightStore {
     private final FileChannel channel;
     private final MappedByteBuffer[] mappings;
     private final boolean mmapAvailable;
+    /** Whether {@link #mappings} were pinned with {@code mlock} ({@link TensorReadMode#locksMemory()}). */
+    private final boolean pinned;
 
     // Fallback when mmap fails (32-bit JVM, OS restrictions, etc.)
     private final RandomAccessFile fallbackFile;
@@ -48,10 +56,12 @@ public class MappedWeightStore implements WeightStore {
             raf = new RandomAccessFile(path, "r");
             ch = raf.getChannel();
 
+            TensorReadMode mode = TensorReadMode.current();
             MappedByteBuffer[] maps = null;
-            boolean mmapOk = false;
+            boolean mapped = false;
 
-            if (TensorReadMode.current() == TensorReadMode.MMAP) {
+            // MLOCK maps the file too, but only to pin its pages: tensor reads stay on the channel
+            if (mode.usesMmap() || mode.locksMemory()) {
                 try {
                     long fileSize = ch.size();
                     long effectiveDataLen = Math.min(dataLength, fileSize - dataOffset);
@@ -78,34 +88,51 @@ public class MappedWeightStore implements WeightStore {
                         }
                         maps[i] = ch.map(FileChannel.MapMode.READ_ONLY, segStart, segLen);
                     }
-                    mmapOk = true;
-                    LoggingUtil.getLogger(MappedWeightStore.class).info(
-                            "MappedWeightStore: mmap active, {} segment(s), {} MB data region",
+                    mapped = true;
+                    LoggingUtil.getLogger(MappedWeightStore.class).info(loadModeMessage(mode), mode.flagName(),
                             segmentCount, dataLength / (1024 * 1024));
                 } catch (IOException | UnsupportedOperationException e) {
                     maps = null;
                     LoggingUtil.getLogger(MappedWeightStore.class).warn(
-                            "MappedWeightStore: mmap failed ({}), using RandomAccessFile fallback",
-                            e.getMessage());
+                            "MappedWeightStore: {} could not map the data region ({}), using RandomAccessFile"
+                                    + " reads", mode.flagName(), e.getMessage());
                 }
             } else {
                 LoggingUtil.getLogger(MappedWeightStore.class).info(
-                        "MappedWeightStore: mmap disabled ({}=true), using RandomAccessFile reads",
-                        TensorReadMode.PROP_DISABLE_MMAP);
+                        "MappedWeightStore: mmap disabled ({}={}), using RandomAccessFile reads",
+                        TensorReadMode.PROP_READ_MODE, mode.flagName());
             }
 
-            this.mmapAvailable = mmapOk;
-            this.mappings = mmapOk ? maps : null;
+            this.mmapAvailable = mapped && mode.usesMmap();
+            this.mappings = mapped ? maps : null;
+            this.pinned = mapped && mode.locksMemory();
 
-            if (mmapOk) {
-                this.raf = raf;
-                this.channel = ch;
-                this.fallbackFile = null;
-            } else {
-                this.raf = raf;
-                this.channel = null;
-                this.fallbackFile = raf;
+            if (pinned) {
+                pinMappings(maps);
             }
+            if (mapped && NumaPlacement.activeIn(System.getProperties())) {
+                for (MappedByteBuffer seg : maps) {
+                    if (seg != null) {
+                        MemoryLock.adviseRandom(seg);
+                    }
+                }
+            }
+
+            // a model larger than RAM only fits beside its host through the mmap page cache; a no-mmap read of it
+            // allocates the whole model in heap or swaps
+            if (!mmapAvailable) {
+                long totalRam = HostMemory.totalBytes();
+                if (dataLength > 0 && totalRam > 0 && dataLength > totalRam) {
+                    LoggingUtil.getLogger(MappedWeightStore.class).warn(
+                            "tensor data of {} MB is larger than RAM of {} MB; without mmap every tensor read"
+                                    + " allocates heap beside the model instead of sharing its page cache",
+                            dataLength / (1024 * 1024), totalRam / (1024 * 1024));
+                }
+            }
+
+            this.raf = raf;
+            this.channel = ch;
+            this.fallbackFile = raf;
         } catch (IOException | RuntimeException e) {
             try { if (ch != null) ch.close(); } catch (IOException ignored) {}
             try { if (raf != null) raf.close(); } catch (IOException ignored) {}
@@ -113,7 +140,38 @@ public class MappedWeightStore implements WeightStore {
         }
     }
 
-    /** Returns true if mmap is active (not using fallback). */
+    /** The log line of a mapping created for {@code mode}. */
+    private static String loadModeMessage(TensorReadMode mode) {
+        if (mode.locksMemory()) {
+            return "MappedWeightStore: {} active, {} segment(s), {} MB data region, pinning it in RAM";
+        }
+        return "MappedWeightStore: {} active, {} segment(s), {} MB data region";
+    }
+
+    /** Pins every mapped segment in RAM, reporting how much was actually locked. */
+    private static void pinMappings(MappedByteBuffer[] maps) {
+        long locked = 0;
+        long bytes = 0;
+        for (MappedByteBuffer seg : maps) {
+            if (seg == null) {
+                continue;
+            }
+            bytes += seg.capacity();
+            if (MemoryLock.lock(seg)) {
+                locked += seg.capacity();
+            }
+        }
+        if (locked > 0) {
+            LoggingUtil.getLogger(MappedWeightStore.class).info(
+                    "MappedWeightStore: pinned {} of {} MB of tensor data in RAM",
+                    locked / (1024 * 1024), bytes / (1024 * 1024));
+        }
+    }
+
+    /**
+     * Whether tensor reads are served from the memory mapping (not the channel fallback). A mapping created only to
+     * pin the file's pages ({@link TensorReadMode#MLOCK}) does not count.
+     */
     public boolean isMmapAvailable() {
         return mmapAvailable;
     }
@@ -259,6 +317,9 @@ public class MappedWeightStore implements WeightStore {
         // Unmap by nulling references — actual unmap happens at GC
         if (mappings != null) {
             for (int i = 0; i < mappings.length; i++) {
+                if (pinned && mappings[i] != null) {
+                    MemoryLock.unlock(mappings[i]);
+                }
                 mappings[i] = null;
             }
         }

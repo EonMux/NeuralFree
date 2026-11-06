@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.server;
 
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
+import com.eonmux.neuralfree.gguf.mm.ClipDualEncoder;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.utils.json.Json;
@@ -21,9 +22,31 @@ final class ServerTestSupport {
     private ServerTestSupport() {
     }
 
+    /**
+     * The engine backend the tests run on: {@code neuralfree.backend} when the run sets it
+     * ({@code ./gradlew :server:test -Pneuralfree.backend=cuda}), auto (the GPU when one is present) otherwise.
+     */
+    static EngineConfig.BackendMode backend() {
+        return EngineConfig.BackendMode.parse(System.getProperty(EngineConfig.PROP_BACKEND, "auto"));
+    }
+
+    /** A config builder on the tests' backend ({@link #backend()}). */
+    static EngineConfig.Builder config() {
+        return EngineConfig.builder().backend(backend());
+    }
+
+    /**
+     * The dual encoder at {@code path} opened as a service on {@code config} opens it: its load options and the
+     * towers on the device the engine backend chooses, so its embeddings are the service's own.
+     */
+    static ClipDualEncoder dualReference(String path, EngineConfig config) throws IOException {
+        return ClipDualEncoder.open(path, config.sourceOptions(),
+                EngineService.onEngineBackend(MediaOptions.none(), config).encoder());
+    }
+
     /** A paged config with {@code parallel} slots over an F32 KV cache of {@code nCtx} positions. */
     static EngineConfig pagedConfig(int nCtx, int parallel) {
-        return EngineConfig.builder()
+        return config()
                 .memory(MemoryConfig.builder()
                         .nCtx(nCtx).ubatch(8).parallel(parallel).typeK(KvDType.F32).typeV(KvDType.F32).build())
                 .build();

@@ -8,7 +8,8 @@ package com.eonmux.neuralfree.gguf.ops.deltanet;
  * <p>With {@code s_h = slopes[h] * layerScale}, the per-token recurrence
  * {@code kv = e^{-s_h} kv + k_t (x) v_t, o_t = q_t . kv} equals the block form of src/models/minimax-01.cpp:288-398
  * ({@code o_t = e^{-s(t+1)} q_t.kv_old + sum_{j<=t} e^{-s(t-j)} (q_t.k_j) v_j},
- * {@code kv_new = e^{-sT} kv_old + sum_j e^{-s(T-1-j)} k_j (x) v_j}). No {@code 1/sqrt(D)} scale is applied.
+ * {@code kv_new = e^{-sT} kv_old + sum_j e^{-s(T-1-j)} k_j (x) v_j}). The recurrence applies no {@code 1/sqrt(D)}
+ * scale: MiniMax-01 does not, and the Bailing V2.5 mixer scales Q before the call ({@link #scaleQ}).
  */
 public final class CpuLightning {
 
@@ -57,6 +58,32 @@ public final class CpuLightning {
                                float[] out, int outOff, int outStride) {
         forwardHeads(nTokens, nHead, headDim, layerScale, slopes, qkv, qkvOff, qkvStride, state, stateOff,
                 out, outOff, outStride, 0, nHead);
+    }
+
+    /**
+     * Scales the Q rows of a head-interleaved Q/K/V tensor in place: {@code qkv[qkvOff + t*qkvStride + h*3D + i] *= s}
+     * for {@code i < D}. vLLM multiplies the split Q by {@code head_size^-0.5} for the minimax lightning backend.
+     *
+     * @throws IllegalArgumentException when the shape is not positive or a view lies outside the array
+     */
+    public static void scaleQ(int nTokens, int nHead, int headDim, int qkvStride, float s, float[] qkv, int qkvOff) {
+        if (nTokens < 0 || nHead <= 0 || headDim <= 0 || qkvStride < 3 * headDim) {
+            throw new IllegalArgumentException("scaleQ needs non-negative tokens and a Q/K/V row of at least 3 x "
+                    + headDim + " values, got tokens " + nTokens + ", heads " + nHead + ", stride " + qkvStride);
+        }
+        long last = qkvOff + (long) (nTokens - 1) * qkvStride + (long) (nHead - 1) * 3 * headDim + headDim;
+        if (qkvOff < 0 || last > qkv.length) {
+            throw new IllegalArgumentException("scaleQ reads outside its array: last element " + last + " of "
+                    + qkv.length);
+        }
+        for (int t = 0; t < nTokens; t++) {
+            for (int h = 0; h < nHead; h++) {
+                int base = qkvOff + t * qkvStride + h * 3 * headDim;
+                for (int i = 0; i < headDim; i++) {
+                    qkv[base + i] *= s;
+                }
+            }
+        }
     }
 
     /**

@@ -15,6 +15,7 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.MXFP4_E;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.MXFP4_QS;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.QK_MXFP4;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.e8m0ToFp32Half;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.longAt;
 
 /**
  * CPU vec-dot of MXFP4 weights with Q8_0 activations, {@code ggml_vec_dot_mxfp4_q8_0_generic}
@@ -82,14 +83,18 @@ public final class Fp4VecDot implements CpuVecDot {
     @Override
     public float dotRow(CpuTensorRef w, long row, QuantizedActivations x) {
         check(w, x);
-        return dot(w.rowBuffer(row), w.rowOffset(row), x, Q8VecDot.scratch().quants);
+        return dot(CpuVecDotRows.copyRow(w, row), 0, x, Q8VecDot.scratch().quants);
+    }
+
+    @Override
+    public float dotRowBytes(byte[] row, int off, QuantizedActivations x) {
+        return dot(row, off, x, Q8VecDot.scratch().quants);
     }
 
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        final byte[] aux = Q8VecDot.scratch().quants;
-        CpuVecDotRows.forEachRow(w, rowStart, rowCount, y, yOff, (b, off) -> dot(b, off, x, aux));
+        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
     }
 
     private static void check(CpuTensorRef w, QuantizedActivations x) {
@@ -102,7 +107,7 @@ public final class Fp4VecDot implements CpuVecDot {
      * {@code sumi1 = sum_j y.qs[j] * kv[qs[j] & 0xf]}, {@code sumi2 = sum_j y.qs[j + 16] * kv[qs[j] >> 4]},
      * {@code sumf += d * (sumi1 + sumi2)}.
      */
-    private static float dot(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dot(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] kv = KVALUES;
         final byte[] yq = x.qs;
         final float[] yd = x.d;
@@ -111,8 +116,8 @@ public final class Fp4VecDot implements CpuVecDot {
         float sumf = 0;
         for (int ib = 0; ib < nb; ib++, off += MXFP4_BYTES) {
             final int qs = off + MXFP4_QS;
-            final long lo = b.getLong(qs);
-            final long hi = b.getLong(qs + 8);
+            final long lo = longAt(b, qs);
+            final long hi = longAt(b, qs + 8);
             for (int j = 0; j < 8; j++) {
                 final int q0 = (int) (lo >>> (8 * j)) & 0xFF;
                 final int q1 = (int) (hi >>> (8 * j)) & 0xFF;
@@ -122,7 +127,7 @@ public final class Fp4VecDot implements CpuVecDot {
                 aux[j + 8 + half] = kv[q1 >>> 4];
             }
             final int sumi = dotI8(aux, 0, yq, ib * QK_MXFP4, QK_MXFP4);
-            final float d = yd[ib] * e8m0ToFp32Half(b.get(off + MXFP4_E));
+            final float d = yd[ib] * e8m0ToFp32Half(b[off + MXFP4_E]);
             sumf += d * sumi;
         }
         return sumf;

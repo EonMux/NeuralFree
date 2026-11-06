@@ -7,9 +7,9 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-MS part C converter classes: {@code LagunaModel} (laguna.py:17-208, the
+ * Synthetic checkpoints of the converter classes: {@code LagunaModel} (laguna.py:17-208, the
  * attention gating and per-layer heads), {@code MapleModel} (maple.py:15-129), {@code MellumModel}
- * (mellum.py:15-131), {@code ExaoneMoEModel} (exaone.py:132-229, on the HK-B2 Exaone4 hooks) and
+ * (mellum.py:15-131), {@code ExaoneMoEModel} (exaone.py:132-229, on the Exaone4 hooks) and
  * {@code SmallThinkerModel} (smallthinker.py:15-83). Two layers, a hidden size of 8, two query heads, one
  * key/value head, an MoE of two experts and the checkpoint's real names and config keys.
  */

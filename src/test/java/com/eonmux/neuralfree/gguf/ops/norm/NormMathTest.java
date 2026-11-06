@@ -222,6 +222,46 @@ public class NormMathTest {
         assertSame(ph, m0[NormKernels.ARG_MIX_ALPHA]);
         expectIae(() -> NormKernels.residualMixArgs(MixMode.ALPHA_BETA, 12, 0f, x, 0, x, 16, w, w, 8, x, 0, ph));
 
+        GpuBuffer addend = buffer(64);
+        GpuBuffer y = buffer(64);
+        GpuBuffer bias = buffer(8);
+        Object[] mn = NormKernels.residualMixNormArgs(MixMode.ADD, 0f, NormKind.RMS, 1e-5f, 4, 8, 0, 32, 16,
+                x, addend, w, null, 1, y, ph);
+        assertEquals(NormKernels.RESIDUAL_MIX_NORM_ARG_COUNT, mn.length);
+        assertEquals(4, mn[NormKernels.ARG_MIX_NORM_N_ROWS]);
+        assertEquals(8, mn[NormKernels.ARG_MIX_NORM_ROW_LEN]);
+        assertEquals(0, mn[NormKernels.ARG_MIX_NORM_MODE]);
+        assertEquals(1e-5f, mn[NormKernels.ARG_MIX_NORM_EPS]);
+        assertEquals(NormKernels.FLAG_HAS_W, mn[NormKernels.ARG_MIX_NORM_FLAGS]);
+        assertEquals(1, mn[NormKernels.ARG_MIX_NORM_W_ROWS]);
+        assertEquals(0, mn[NormKernels.ARG_MIX_NORM_MIX_MODE]);
+        assertEquals(32, mn[NormKernels.ARG_MIX_NORM_ADD_OFF]);
+        assertSame(x, mn[NormKernels.ARG_MIX_NORM_X]);
+        assertSame(addend, mn[NormKernels.ARG_MIX_NORM_ADDEND]);
+        assertSame(w, mn[NormKernels.ARG_MIX_NORM_W]);
+        assertSame(ph, mn[NormKernels.ARG_MIX_NORM_B]);
+        assertSame(y, mn[NormKernels.ARG_MIX_NORM_Y]);
+        Object[] mns = NormKernels.residualMixNormArgs(MixMode.SCALED, 0.25f, NormKind.LAYER, 1e-5f, 2, 8, 0, 16, 32,
+                x, addend, null, bias, 1, y, ph);
+        assertEquals(1, mns[NormKernels.ARG_MIX_NORM_MIX_MODE]);
+        assertEquals(0.25f, mns[NormKernels.ARG_MIX_NORM_MIX_S]);
+        assertEquals(NormKernels.FLAG_HAS_B, mns[NormKernels.ARG_MIX_NORM_FLAGS]);
+        assertSame(ph, mns[NormKernels.ARG_MIX_NORM_W]);
+        expectIae(() -> NormKernels.residualMixNormArgs(MixMode.ALPHA_BETA, 0f, NormKind.RMS, 1e-5f, 4, 8, 0, 32, 0,
+                x, addend, null, null, 1, y, ph));
+        expectIae(() -> NormKernels.residualMixNormArgs(MixMode.NORMED_INPUT_SCALED, 1f, NormKind.RMS, 1e-5f, 4, 8,
+                0, 32, 0, x, addend, null, null, 1, y, ph));
+        expectIae(() -> NormKernels.residualMixNormArgs(MixMode.ADD, 0f, NormKind.GROUP, 1e-5f, 4, 8, 0, 32, 0,
+                x, addend, null, null, 1, y, ph));
+        expectIae(() -> NormKernels.residualMixNormArgs(MixMode.ADD, 0f, NormKind.RMS, -1f, 4, 8, 0, 32, 0,
+                x, addend, null, null, 1, y, ph));
+        expectIae(() -> NormKernels.residualMixNormArgs(MixMode.ADD, Float.NaN, NormKind.RMS, 1e-5f, 4, 8, 0, 32, 0,
+                x, addend, null, null, 1, y, ph));
+        expectIae(() -> NormKernels.residualMixNormArgs(MixMode.ADD, 0f, NormKind.RMS, 1e-5f, 4, 8, 0, 32, 16,
+                x, addend, null, null, 1, x, ph));
+        expectIae(() -> NormKernels.residualMixNormArgs(MixMode.ADD, 0f, NormKind.RMS, 1e-5f, 4, 8, 0, 32, 0,
+                x, addend, null, null, 0, y, ph));
+
         assertEquals(NormKernels.GROUP_RMS_ARG_COUNT,
                 NormKernels.groupRmsArgs(2, 8, 2, 1e-5f, x, 0, 8, w, x).length);
         expectIae(() -> NormKernels.groupRmsArgs(2, 8, 2, 1e-5f, x, 4, 8, w, x));

@@ -7,7 +7,14 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
+import com.eonmux.neuralfree.acceleration.backend.GpuGraph;
+import com.eonmux.neuralfree.acceleration.backend.GpuGraphDispatch;
+import com.eonmux.neuralfree.acceleration.backend.GpuGraphMismatchException;
+import com.eonmux.neuralfree.acceleration.backend.GpuGraphPatchPlan;
+import com.eonmux.neuralfree.acceleration.backend.GpuUncapturableCommandException;
 import com.eonmux.neuralfree.acceleration.backend.KernelArtifact;
+import com.eonmux.neuralfree.acceleration.backend.KernelArgs;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 
 import java.nio.ByteBuffer;
@@ -54,13 +61,13 @@ import java.util.Set;
  */
 public final class FakeComputeBackend implements ComputeBackend {
 
-    public static final int MAX_LLM_SCALARS = 32;
-    public static final int MAX_LLM_BUFFERS = 12;
+    public static final int MAX_LLM_SCALARS = 33;
+    public static final int MAX_LLM_BUFFERS = 13;
     public static final String COMPUTE_QUEUE = "compute";
     public static final String TRANSFER_QUEUE = "transfer";
 
     /** Kind of a recorded queue operation. */
-    public enum OpKind { DISPATCH, WRITE, READ, COPY, FILL, MARKER, FLUSH, FINISH }
+    public enum OpKind { DISPATCH, WRITE, READ, COPY, FILL, MARKER, FLUSH, FINISH, REPLAY, LAUNCH }
 
     /** Host-side stand-in for a kernel's effect, invoked with the recorded dispatch. */
     @FunctionalInterface
@@ -68,12 +75,14 @@ public final class FakeComputeBackend implements ComputeBackend {
         void run(Dispatch dispatch);
     }
 
-    private final Object lock = new Object();
+    final Object lock = new Object();
     private final BackendType backendType;
     private final DeviceCapabilities capabilities;
-    private final boolean strictLlmArgs;
+    final boolean strictLlmArgs;
+    final boolean graphCapture;
+    final boolean graphArgUpdates;
     private final Set<String> unavailableKernels;
-    private final Map<String, KernelEmulator> emulators;
+    final Map<String, KernelEmulator> emulators;
     private final FakeQueue computeQueue;
     private final FakeQueue transferQueue;
     private final List<Op> ops = new ArrayList<>();
@@ -81,22 +90,27 @@ public final class FakeComputeBackend implements ComputeBackend {
     private final Map<String, Kernel> kernelCache = new HashMap<>();
     private final List<String> compileCalls = new ArrayList<>();
     private final List<String> preparedKernels = new ArrayList<>();
+    final List<PendingDispatch> captured = new ArrayList<>();
+    FakeGraph replaying;
+    boolean capturing;
     private long nextBufferId = 1;
     private long nextEventId = 1;
-    private int nextSequence;
+    int nextSequence;
     private int createdQueues;
     private long allocatedBytes;
     private int openEvents;
-    private boolean closed;
+    boolean closed;
 
     private FakeComputeBackend(Builder b) {
         this.backendType = b.backendType;
         this.capabilities = b.capabilities;
         this.strictLlmArgs = b.strictLlmArgs;
+        this.graphCapture = b.graphCapture;
+        this.graphArgUpdates = b.graphArgUpdates;
         this.unavailableKernels = Collections.unmodifiableSet(new HashSet<>(b.unavailable));
         this.emulators = Collections.unmodifiableMap(new HashMap<>(b.emulators));
-        this.computeQueue = new FakeQueue(COMPUTE_QUEUE, ComputeQueue.QueueType.COMPUTE, true);
-        this.transferQueue = new FakeQueue(TRANSFER_QUEUE, ComputeQueue.QueueType.TRANSFER, true);
+        this.computeQueue = new FakeQueue(this, COMPUTE_QUEUE, ComputeQueue.QueueType.COMPUTE, true);
+        this.transferQueue = new FakeQueue(this, TRANSFER_QUEUE, ComputeQueue.QueueType.TRANSFER, true);
     }
 
     /** An OpenCL-typed fake with {@link #defaultCapabilities()} and lenient argument rules. */
@@ -180,6 +194,25 @@ public final class FakeComputeBackend implements ComputeBackend {
     @Override
     public GpuBuffer allocateBuffer(long sizeInBytes) {
         return allocateBuffer(sizeInBytes, false);
+    }
+
+    /** The fake holds every buffer in host memory, so the host-mapped tier needs no device. */
+    @Override
+    public boolean supportsHostMappedBuffers() {
+        return true;
+    }
+
+    @Override
+    public HostMappedBuffer allocateHostMappedBuffer(long sizeInBytes) {
+        synchronized (lock) {
+            ensureOpen();
+            if (sizeInBytes <= 0) {
+                throw new IllegalArgumentException("buffer size must be positive, got " + sizeInBytes);
+            }
+            FakeGpuBuffer buffer = new FakeGpuBuffer(nextBufferId++, sizeInBytes, true, this, null);
+            buffers.add(buffer);
+            return buffer;
+        }
     }
 
     /**
@@ -289,7 +322,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         synchronized (lock) {
             ensureOpen();
             createdQueues++;
-            return new FakeQueue(COMPUTE_QUEUE + "#" + createdQueues, ComputeQueue.QueueType.COMPUTE, false);
+            return new FakeQueue(this, COMPUTE_QUEUE + "#" + createdQueues, ComputeQueue.QueueType.COMPUTE, false);
         }
     }
 
@@ -440,24 +473,391 @@ public final class FakeComputeBackend implements ComputeBackend {
         }
     }
 
-    private void ensureOpen() {
+    /**
+     * Refuses a command the captured dispatch sequence cannot hold: a host transfer, a read, a device
+     * copy or fill, a marker or a finish while capturing, and any command outside the capture during a
+     * replay.
+     */
+    void uncapturable(String op) {
+        if (!capturing && replaying == null) {
+            return;
+        }
+        if (replaying != null) {
+            throw new GpuGraphMismatchException("command replay of " + replaying + " hit " + op
+                    + ", which the captured dispatches do not contain");
+        }
+        throw new GpuUncapturableCommandException("a " + op + " cannot be captured: perform host transfers and"
+                + " reads before beginCapture, and read results only after the graph has been launched");
+    }
+
+    /** Discards the dispatches recorded so far; the failed step leaves no device work behind. */
+    void discardCapturedLocked() {
+        capturing = false;
+        captured.clear();
+    }
+
+    /** Runs recorded dispatches against the buffers and emulators; the REPLAY op covers them in the log. */
+    private void executeCapturedLocked(List<PendingDispatch> dispatches) {
+        for (PendingDispatch p : dispatches) {
+            Dispatch d = new Dispatch(nextSequence++, COMPUTE_QUEUE, p.kernel.kernelName(), p.global.clone(),
+                    p.local == null ? null : p.local.clone(), p.args, p.preBound, false, 0);
+            KernelEmulator emulator = emulators.get(p.kernel.kernelName());
+            if (emulator != null) {
+                emulator.run(d);
+            }
+        }
+    }
+
+    private void beginReplayLocked(FakeGraph graph) {
+        if (capturing || replaying != null) {
+            throw new IllegalStateException("FakeComputeBackend is already "
+                    + (capturing ? "capturing" : "replaying") + " dispatches");
+        }
+        if (graph.closed) {
+            throw new IllegalStateException(graph + " is closed");
+        }
+        replaying = graph;
+        graph.position = 0;
+        graph.changed.clear();
+    }
+
+    private void submitReplayLocked(FakeGraph graph) {
+        if (replaying != graph) {
+            throw new IllegalStateException("FakeComputeBackend: " + graph + " is not replaying");
+        }
+        record(Op.builder(OpKind.REPLAY, COMPUTE_QUEUE).bytes(graph.dispatches.size()));
+        executeCapturedLocked(graph.dispatches);
+    }
+
+    /** One launch of a freshly captured graph, the step that recorded it keeping its device work. */
+    private void launchCapturedGraphLocked(FakeGraph graph) {
+        if (capturing || replaying != null) {
+            throw new IllegalStateException("FakeComputeBackend is already "
+                    + (capturing ? "capturing" : "replaying") + " dispatches");
+        }
+        if (graph.closed) {
+            throw new IllegalStateException(graph + " is closed");
+        }
+        record(Op.builder(OpKind.LAUNCH, COMPUTE_QUEUE).bytes(graph.dispatches.size()));
+        executeCapturedLocked(graph.dispatches);
+    }
+
+    private void endReplayLocked(FakeGraph graph) {
+        if (replaying != graph) {
+            throw new IllegalStateException("FakeComputeBackend: " + graph + " is not replaying");
+        }
+        replaying = null;
+    }
+
+    void verifyReplayLocked(FakeGraph graph, Kernel k, long[] global, long[] local, Object[] bound) {
+        if (graph.position >= graph.dispatches.size()) {
+            throw new GpuGraphMismatchException("command replay of " + graph + ": " + k.kernelName()
+                    + " enqueues more dispatches than the " + graph.dispatches.size() + " captured");
+        }
+        PendingDispatch p = graph.dispatches.get(graph.position++);
+        if (p.kernel != k) {
+            throw new GpuGraphMismatchException("command replay of " + graph + ": dispatch " + graph.position
+                    + " is " + k.kernelName() + " but the capture holds " + p.kernel.kernelName() + " at this point");
+        }
+        boolean updated = false;
+        if (!Arrays.equals(p.global, global)) {
+            if (!graph.argUpdates || p.global.length != global.length) {
+                throw new GpuGraphMismatchException("command replay of " + graph + ": " + k.kernelName()
+                        + " changed its work sizes from global " + Arrays.toString(p.global) + " local "
+                        + Arrays.toString(p.local) + " to global " + Arrays.toString(global) + " local "
+                        + Arrays.toString(local) + "; re-capture the step");
+            }
+            System.arraycopy(global, 0, p.global, 0, global.length);
+            updated = true;
+        }
+        if (!Arrays.equals(p.local, local)) {
+            throw new GpuGraphMismatchException("command replay of " + graph + ": " + k.kernelName()
+                    + " changed its local size from " + Arrays.toString(p.local) + " to "
+                    + Arrays.toString(local) + "; re-capture the step");
+        }
+        if (p.args.length != bound.length) {
+            throw new GpuGraphMismatchException("command replay of " + graph + ": " + k.kernelName() + " binds "
+                    + bound.length + " arguments, the capture holds " + p.args.length);
+        }
+        for (int i = 0; i < bound.length; i++) {
+            if (p.args[i] instanceof FakeGpuBuffer && ((FakeGpuBuffer) p.args[i]).isClosed()) {
+                throw new IllegalStateException(k.kernelName() + ": bound buffer " + p.args[i] + " is closed while"
+                        + " its command graph is open; close the graph first");
+            }
+            if (KernelArgs.sameValue(p.args[i], bound[i])) {
+                continue;
+            }
+            if (!graph.argUpdates) {
+                throw new GpuGraphMismatchException("command replay of " + graph + ": " + k.kernelName()
+                        + " argument " + i + " changed since the capture; the recorded arguments are fixed,"
+                        + " re-capture the step");
+            }
+            p.args[i] = KernelArgs.snapshot(bound[i], p.args[i]);
+            updated = true;
+        }
+        if (updated) {
+            graph.changed.add(graph.position - 1);
+        }
+    }
+
+    static Object[] copyArgs(Object[] args) {
+        Object[] out = new Object[args.length];
+        for (int i = 0; i < args.length; i++) {
+            Object v = args[i];
+            out[i] = v instanceof int[] ? ((int[]) v).clone()
+                    : v instanceof float[] ? ((float[]) v).clone()
+                    : v instanceof long[] ? ((long[]) v).clone()
+                    : v instanceof double[] ? ((double[]) v).clone()
+                    : v instanceof byte[] ? ((byte[]) v).clone()
+                    : v instanceof short[] ? ((short[]) v).clone()
+                    : v;
+        }
+        return out;
+    }
+
+    /** One dispatch recorded by a capture: its handle, launch sizes and owned argument snapshots. */
+    static final class PendingDispatch {
+        final Kernel kernel;
+        final long[] global;
+        final long[] local;
+        final Object[] args;
+        final boolean preBound;
+
+        PendingDispatch(Kernel kernel, long[] global, long[] local, Object[] args, boolean preBound) {
+            this.kernel = kernel;
+            this.global = global;
+            this.local = local;
+            this.args = args;
+            this.preBound = preBound;
+        }
+    }
+
+    /**
+     * A captured dispatch sequence of the fake queue, replayed by re-running the captured dispatches
+     * with their emulators after the replay body's dispatches verified against the capture: the
+     * host-only stand-in of a CUDA graph or a pre-recorded Vulkan command buffer. When the backend was
+     * built with {@link Builder#graphArgUpdates(boolean)} the body's argument and work-size updates are
+     * written into the recorded dispatches (the CUDA semantics) and a patch plan can set the recorded
+     * values without a body; without it the recorded arguments are fixed (the verify-only semantics).
+     * The graph launches on any open queue of the fake backend.
+     */
+    public static final class FakeGraph implements GpuGraph {
+
+        private final FakeComputeBackend backend;
+        private final List<PendingDispatch> dispatches;
+        /** Kernel-dispatch positions whose recorded dispatch the current replay body updated so far. */
+        private final List<Integer> changed = new ArrayList<>();
+        private final boolean argUpdates;
+        private int position;
+        boolean closed;
+
+        FakeGraph(FakeComputeBackend backend, List<PendingDispatch> dispatches) {
+            this.backend = backend;
+            this.dispatches = dispatches;
+            this.argUpdates = backend.graphArgUpdates;
+        }
+
+        @Override
+        public int dispatchCount() {
+            synchronized (backend.lock) {
+                return dispatches.size();
+            }
+        }
+
+        @Override
+        public GpuEvent launch(ComputeQueue queue, GpuEvent... waitOnEvents) {
+            synchronized (backend.lock) {
+                backend.ensureOpen();
+                backend.requireOwnQueue(queue);
+                backend.validateWaits(waitOnEvents);
+                backend.launchCapturedGraphLocked(this);
+                // the fake allocates no device event; the queue's own ordering completes the launch
+                return null;
+            }
+        }
+
+        @Override
+        public void replay(Runnable body) {
+            if (body == null) {
+                throw new IllegalArgumentException("replay body must not be null");
+            }
+            synchronized (backend.lock) {
+                backend.ensureOpen();
+                backend.beginReplayLocked(this);
+            }
+            boolean submitted = false;
+            try {
+                body.run();
+                synchronized (backend.lock) {
+                    backend.ensureOpen();
+                    if (position != dispatches.size()) {
+                        throw new GpuGraphMismatchException("command replay of " + this + " enqueues "
+                                + position + " dispatches, the capture holds " + dispatches.size());
+                    }
+                    backend.submitReplayLocked(this);
+                }
+                submitted = true;
+            } finally {
+                synchronized (backend.lock) {
+                    backend.endReplayLocked(this);
+                }
+            }
+        }
+
+        @Override
+        public List<GpuGraphDispatch> kernelDispatches() {
+            synchronized (backend.lock) {
+                requireOpenLocked("report its dispatches");
+                List<GpuGraphDispatch> out = new ArrayList<>(dispatches.size());
+                for (int i = 0; i < dispatches.size(); i++) {
+                    out.add(dispatchOfLocked(dispatches.get(i), i));
+                }
+                return out;
+            }
+        }
+
+        @Override
+        public GpuGraphDispatch kernelDispatch(int index) {
+            synchronized (backend.lock) {
+                requireOpenLocked("report a dispatch");
+                return dispatchOfLocked(dispatch(dispatches, index), index);
+            }
+        }
+
+        @Override
+        public int[] takeReplayChanges() {
+            synchronized (backend.lock) {
+                if (changed.isEmpty()) {
+                    return new int[0];
+                }
+                int[] out = new int[changed.size()];
+                for (int i = 0; i < out.length; i++) {
+                    out[i] = changed.get(i);
+                }
+                changed.clear();
+                return out;
+            }
+        }
+
+        @Override
+        public boolean supportsPatchedReplay() {
+            synchronized (backend.lock) {
+                return argUpdates;
+            }
+        }
+
+        @Override
+        public boolean replayPatched(GpuGraphPatchPlan plan, int pos) {
+            if (plan == null) {
+                throw new IllegalArgumentException("patch plan must not be null");
+            }
+            synchronized (backend.lock) {
+                backend.ensureOpen();
+                if (!argUpdates) {
+                    return false;
+                }
+                backend.beginReplayLocked(this);
+                boolean submitted = false;
+                try {
+                    boolean patched = plan.patchStep(pos, this::patchDispatchLocked);
+                    if (!patched) {
+                        return false;
+                    }
+                    backend.submitReplayLocked(this);
+                    submitted = true;
+                } finally {
+                    backend.endReplayLocked(this);
+                }
+                return true;
+            }
+        }
+
+        /** Writes one plan patch into the recorded dispatch: its changed arguments and work size. */
+        private void patchDispatchLocked(int recordIndex, long[] grid, int[] argIndices, Object[] values) {
+            PendingDispatch p = dispatch(dispatches, recordIndex);
+            if (grid != null && !Arrays.equals(p.global, grid)) {
+                if (p.global.length != grid.length) {
+                    throw new GpuGraphMismatchException("command patch of " + this + ": " + p.kernel.kernelName()
+                            + " changed its work-size dimensions from " + Arrays.toString(p.global) + " to "
+                            + Arrays.toString(grid) + "; re-capture the step");
+                }
+                System.arraycopy(grid, 0, p.global, 0, grid.length);
+            }
+            for (int i = 0; i < argIndices.length; i++) {
+                if (!KernelArgs.sameValue(p.args[argIndices[i]], values[i])) {
+                    p.args[argIndices[i]] = KernelArgs.snapshot(values[i], p.args[argIndices[i]]);
+                }
+            }
+        }
+
+        /** The current state of one recorded dispatch. */
+        private GpuGraphDispatch dispatchOfLocked(PendingDispatch p, int index) {
+            return new GpuGraphDispatch(index, p.kernel.kernelName(), p.global, p.local, p.args);
+        }
+
+        private static PendingDispatch dispatch(List<PendingDispatch> dispatches, int index) {
+            if (index < 0 || index >= dispatches.size()) {
+                throw new IllegalArgumentException("the capture holds " + dispatches.size() + " dispatches,"
+                        + " no dispatch " + index);
+            }
+            return dispatches.get(index);
+        }
+
+        /** Throws when the graph is closed; {@code what} names the refused operation. */
+        private void requireOpenLocked(String what) {
+            if (closed) {
+                throw new IllegalStateException("command graph cannot " + what + ": " + this + " is closed");
+            }
+        }
+
+        @Override
+        public boolean isClosed() {
+            synchronized (backend.lock) {
+                return closed;
+            }
+        }
+
+        @Override
+        public void close() {
+            synchronized (backend.lock) {
+                if (backend.replaying == this) {
+                    throw new IllegalStateException(this + " is replaying");
+                }
+                closed = true;
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "FakeGraph{" + dispatches.size() + " dispatches" + (closed ? ", closed" : "") + "}";
+        }
+    }
+
+    /** Rejects a queue of another backend, naming it. */
+    private void requireOwnQueue(ComputeQueue queue) {
+        if (!(queue instanceof FakeQueue) || ((FakeQueue) queue).owner() != this) {
+            throw new IllegalArgumentException("queue " + queue + " does not belong to this fake backend");
+        }
+    }
+
+    void ensureOpen() {
         if (closed) {
             throw new IllegalStateException("FakeComputeBackend is closed");
         }
     }
 
-    private int record(Op.Builder op) {
+    int record(Op.Builder op) {
         int seq = nextSequence++;
         ops.add(op.build(seq));
         return seq;
     }
 
-    private GpuEvent newEvent() {
+    GpuEvent newEvent() {
         openEvents++;
         return new FakeEvent(nextEventId++);
     }
 
-    private Kernel ownKernel(KernelHandle handle) {
+    Kernel ownKernel(KernelHandle handle) {
         if (!(handle instanceof Kernel) || ((Kernel) handle).owner() != this) {
             throw new IllegalArgumentException("kernel handle " + handle + " does not belong to this backend");
         }
@@ -468,7 +868,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         return k;
     }
 
-    private FakeGpuBuffer ownBuffer(GpuBuffer buffer, String role) {
+    FakeGpuBuffer ownBuffer(GpuBuffer buffer, String role) {
         if (!(buffer instanceof FakeGpuBuffer) || ((FakeGpuBuffer) buffer).owner() != this) {
             throw new IllegalArgumentException(role + " " + buffer + " does not belong to this backend");
         }
@@ -479,7 +879,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         return b;
     }
 
-    private int validateWaits(GpuEvent[] waits) {
+    int validateWaits(GpuEvent[] waits) {
         if (waits == null) {
             return 0;
         }
@@ -498,7 +898,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         return waits.length;
     }
 
-    private Object snapshotArg(String kernel, int index, Object arg) {
+    Object snapshotArg(String kernel, int index, Object arg) {
         if (arg == null) {
             throw new IllegalArgumentException("arg " + index + " of " + kernel + " is null");
         }
@@ -541,7 +941,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         return arg;
     }
 
-    private void validateWorkSizes(String kernel, long[] global, long[] local) {
+    void validateWorkSizes(String kernel, long[] global, long[] local) {
         if (global == null || global.length < 1 || global.length > 3) {
             throw new IllegalArgumentException("global size of " + kernel + " must have 1 to 3 dimensions: "
                     + Arrays.toString(global));
@@ -581,7 +981,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         }
     }
 
-    private void validateLlmArgCounts(String kernel, Object[] args) {
+    void validateLlmArgCounts(String kernel, Object[] args) {
         int buffersBound = 0;
         for (Object a : args) {
             if (a instanceof FakeGpuBuffer) {
@@ -595,281 +995,11 @@ public final class FakeComputeBackend implements ComputeBackend {
         }
     }
 
-    // ================================================================== queue
-
-    private final class FakeQueue implements ComputeQueue {
-        private final String name;
-        private final QueueType type;
-        private final boolean ownedByBackend;
-        private boolean queueClosed;
-
-        FakeQueue(String name, QueueType type, boolean ownedByBackend) {
-            this.name = name;
-            this.type = type;
-            this.ownedByBackend = ownedByBackend;
-        }
-
-        @Override
-        public QueueType getQueueType() {
-            return type;
-        }
-
-        @Override
-        public GpuEvent enqueueWriteBuffer(GpuBuffer dstBuffer, long dstOffset, long sizeInBytes,
-                                           byte[] srcData, GpuEvent... waitOnEvents) {
-            Objects.requireNonNull(srcData, "srcData");
-            if (sizeInBytes < 0 || sizeInBytes > srcData.length) {
-                throw new IllegalArgumentException("write of " + sizeInBytes + " bytes from a " + srcData.length
-                        + "-byte array");
-            }
-            return write(dstBuffer, dstOffset, srcData, (int) sizeInBytes, waitOnEvents);
-        }
-
-        @Override
-        public GpuEvent enqueueWriteBuffer(GpuBuffer dstBuffer, long dstOffset, long sizeInBytes,
-                                           float[] srcData, GpuEvent... waitOnEvents) {
-            Objects.requireNonNull(srcData, "srcData");
-            checkFloatTransfer(sizeInBytes, srcData.length);
-            ByteBuffer bytes = ByteBuffer.allocate((int) sizeInBytes).order(ByteOrder.LITTLE_ENDIAN);
-            bytes.asFloatBuffer().put(srcData, 0, (int) (sizeInBytes / 4));
-            return write(dstBuffer, dstOffset, bytes.array(), (int) sizeInBytes, waitOnEvents);
-        }
-
-        @Override
-        public GpuEvent enqueueWriteBuffer(GpuBuffer dstBuffer, long dstOffset, long sizeInBytes,
-                                           ByteBuffer srcData, GpuEvent... waitOnEvents) {
-            Objects.requireNonNull(srcData, "srcData");
-            ByteBuffer view = srcData.duplicate();
-            view.clear();
-            if (sizeInBytes < 0 || sizeInBytes > view.capacity()) {
-                throw new IllegalArgumentException("write of " + sizeInBytes + " bytes from a " + view.capacity()
-                        + "-byte ByteBuffer");
-            }
-            byte[] bytes = new byte[(int) sizeInBytes];
-            view.get(bytes);
-            return write(dstBuffer, dstOffset, bytes, bytes.length, waitOnEvents);
-        }
-
-        @Override
-        public GpuEvent enqueueReadBuffer(GpuBuffer srcBuffer, long srcOffset, long sizeInBytes,
-                                          byte[] dstData, GpuEvent... waitOnEvents) {
-            Objects.requireNonNull(dstData, "dstData");
-            if (sizeInBytes < 0 || sizeInBytes > dstData.length) {
-                throw new IllegalArgumentException("read of " + sizeInBytes + " bytes into a " + dstData.length
-                        + "-byte array");
-            }
-            return read(srcBuffer, srcOffset, dstData, (int) sizeInBytes, waitOnEvents);
-        }
-
-        @Override
-        public GpuEvent enqueueReadBuffer(GpuBuffer srcBuffer, long srcOffset, long sizeInBytes,
-                                          float[] dstData, GpuEvent... waitOnEvents) {
-            Objects.requireNonNull(dstData, "dstData");
-            checkFloatTransfer(sizeInBytes, dstData.length);
-            byte[] bytes = new byte[(int) sizeInBytes];
-            GpuEvent event = read(srcBuffer, srcOffset, bytes, bytes.length, waitOnEvents);
-            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(dstData, 0, bytes.length / 4);
-            return event;
-        }
-
-        @Override
-        public GpuEvent enqueueKernel(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize,
-                                      Object[] args, GpuEvent... waitOnEvents) {
-            return dispatch(kernel, globalWorkSize, localWorkSize, args, false, true, waitOnEvents);
-        }
-
-        @Override
-        public void enqueueKernelNoEvent(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize,
-                                         Object[] args, GpuEvent... waitOnEvents) {
-            dispatch(kernel, globalWorkSize, localWorkSize, args, false, false, waitOnEvents);
-        }
-
-        @Override
-        public void enqueueKernelPreBound(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize,
-                                          GpuEvent... waitOnEvents) {
-            dispatch(kernel, globalWorkSize, localWorkSize, null, true, false, waitOnEvents);
-        }
-
-        @Override
-        public GpuEvent enqueueKernelPreBoundWithEvent(KernelHandle kernel, long[] globalWorkSize,
-                                                       long[] localWorkSize, GpuEvent... waitOnEvents) {
-            return dispatch(kernel, globalWorkSize, localWorkSize, null, true, true, waitOnEvents);
-        }
-
-        @Override
-        public void setKernelArg(KernelHandle kernel, int argIndex, Object arg) {
-            synchronized (lock) {
-                ensureUsable();
-                Kernel k = ownKernel(kernel);
-                if (argIndex < 0) {
-                    throw new IllegalArgumentException("negative arg index " + argIndex + " for " + k.kernelName());
-                }
-                k.setArg(argIndex, snapshotArg(k.kernelName(), argIndex, arg));
-            }
-        }
-
-        @Override
-        public void enqueueCopyBuffer(GpuBuffer src, long srcOffset, GpuBuffer dst, long dstOffset,
-                                      long sizeInBytes, GpuEvent... waitOnEvents) {
-            synchronized (lock) {
-                ensureUsable();
-                FakeGpuBuffer s = ownBuffer(src, "copy source");
-                FakeGpuBuffer d = ownBuffer(dst, "copy destination");
-                int waits = validateWaits(waitOnEvents);
-                if (sizeInBytes <= 0) {
-                    throw new IllegalArgumentException("copy size must be positive, got " + sizeInBytes);
-                }
-                d.copyFrom(s, srcOffset, dstOffset, sizeInBytes);
-                record(Op.builder(OpKind.COPY, name).buffer(d, dstOffset).source(s, srcOffset)
-                        .bytes(sizeInBytes).waits(waits));
-            }
-        }
-
-        /**
-         * Fills {@code [dstOffset, dstOffset+sizeInBytes)} with a repeating little-endian 32-bit
-         * pattern. A negative, misaligned or out-of-bounds range fails with
-         * {@link IllegalArgumentException}, as the queue contract specifies.
-         */
-        @Override
-        public void enqueueFillBuffer(GpuBuffer dst, long dstOffset, long sizeInBytes, int pattern,
-                                      GpuEvent... waitOnEvents) {
-            synchronized (lock) {
-                ensureUsable();
-                FakeGpuBuffer d = ownBuffer(dst, "fill destination");
-                if (dstOffset < 0 || sizeInBytes < 0 || (dstOffset & 3) != 0 || (sizeInBytes & 3) != 0) {
-                    throw new IllegalArgumentException("fill offset " + dstOffset + " and size " + sizeInBytes
-                            + " must be non-negative multiples of 4");
-                }
-                if (sizeInBytes > d.sizeInBytes() - dstOffset) {
-                    throw new IllegalArgumentException("fill range [" + dstOffset + ", " + dstOffset + "+"
-                            + sizeInBytes + ") exceeds " + d);
-                }
-                int waits = validateWaits(waitOnEvents);
-                d.fill(dstOffset, sizeInBytes, pattern);
-                record(Op.builder(OpKind.FILL, name).buffer(d, dstOffset).bytes(sizeInBytes).pattern(pattern)
-                        .waits(waits));
-            }
-        }
-
-        /** Returns an event that completes after all previously enqueued work and the waits. */
-        @Override
-        public GpuEvent enqueueMarker(GpuEvent... waitOnEvents) {
-            synchronized (lock) {
-                ensureUsable();
-                int waits = validateWaits(waitOnEvents);
-                record(Op.builder(OpKind.MARKER, name).waits(waits));
-                return newEvent();
-            }
-        }
-
-        @Override
-        public void flush() {
-            synchronized (lock) {
-                ensureUsable();
-                record(Op.builder(OpKind.FLUSH, name));
-            }
-        }
-
-        @Override
-        public void finish() {
-            synchronized (lock) {
-                ensureUsable();
-                record(Op.builder(OpKind.FINISH, name));
-            }
-        }
-
-        @Override
-        public void close() {
-            synchronized (lock) {
-                if (ownedByBackend) {
-                    if (!closed) {
-                        finish();
-                    }
-                    return;
-                }
-                if (!queueClosed && !closed) {
-                    finish();
-                }
-                queueClosed = true;
-            }
-        }
-
-        @Override
-        public String toString() {
-            return "FakeQueue[" + name + "]";
-        }
-
-        private void ensureUsable() {
-            ensureOpen();
-            if (queueClosed) {
-                throw new IllegalStateException("queue " + name + " is closed");
-            }
-        }
-
-        private void checkFloatTransfer(long sizeInBytes, int floats) {
-            if (sizeInBytes < 0 || (sizeInBytes & 3) != 0 || sizeInBytes > floats * 4L) {
-                throw new IllegalArgumentException("float transfer of " + sizeInBytes + " bytes with a " + floats
-                        + "-element array; the size must be a non-negative multiple of 4 within the array");
-            }
-        }
-
-        private GpuEvent write(GpuBuffer dstBuffer, long dstOffset, byte[] bytes, int len, GpuEvent[] waitOnEvents) {
-            synchronized (lock) {
-                ensureUsable();
-                FakeGpuBuffer d = ownBuffer(dstBuffer, "write destination");
-                int waits = validateWaits(waitOnEvents);
-                d.write(dstOffset, bytes, 0, len);
-                record(Op.builder(OpKind.WRITE, name).buffer(d, dstOffset).bytes(len).waits(waits));
-                return newEvent();
-            }
-        }
-
-        private GpuEvent read(GpuBuffer srcBuffer, long srcOffset, byte[] bytes, int len, GpuEvent[] waitOnEvents) {
-            synchronized (lock) {
-                ensureUsable();
-                FakeGpuBuffer s = ownBuffer(srcBuffer, "read source");
-                int waits = validateWaits(waitOnEvents);
-                s.read(srcOffset, bytes, 0, len);
-                record(Op.builder(OpKind.READ, name).buffer(s, srcOffset).bytes(len).waits(waits));
-                return newEvent();
-            }
-        }
-
-        private GpuEvent dispatch(KernelHandle kernel, long[] global, long[] local, Object[] args,
-                                  boolean preBound, boolean wantEvent, GpuEvent[] waitOnEvents) {
-            synchronized (lock) {
-                ensureUsable();
-                Kernel k = ownKernel(kernel);
-                int waits = validateWaits(waitOnEvents);
-                if (args != null && args.length > 0) {
-                    Object[] snap = new Object[args.length];
-                    for (int i = 0; i < args.length; i++) {
-                        snap[i] = snapshotArg(k.kernelName(), i, args[i]);
-                    }
-                    k.replaceArgs(snap);
-                }
-                Object[] bound = k.boundArgs();
-                validateWorkSizes(k.kernelName(), global, local);
-                if (strictLlmArgs) {
-                    validateLlmArgCounts(k.kernelName(), bound);
-                }
-                Dispatch d = new Dispatch(nextSequence, name, k.kernelName(), global.clone(),
-                        local == null ? null : local.clone(), bound, preBound, wantEvent, waits);
-                record(Op.builder(OpKind.DISPATCH, name).dispatch(d));
-                KernelEmulator emulator = emulators.get(k.kernelName());
-                if (emulator != null) {
-                    emulator.run(d);
-                }
-                return wantEvent ? newEvent() : null;
-            }
-        }
-    }
-
     // ================================================================== event
 
     private final class FakeEvent implements GpuEvent {
         private final long id;
-        private boolean closed;
+        boolean closed;
 
         FakeEvent(long id) {
             this.id = id;
@@ -918,7 +1048,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         private final String buildOptions;
         private final boolean clone;
         private final List<Object> args = new ArrayList<>();
-        private boolean closed;
+        boolean closed;
 
         Kernel(FakeComputeBackend owner, String kernelName, String buildOptions, boolean clone) {
             this.owner = owner;
@@ -1348,12 +1478,13 @@ public final class FakeComputeBackend implements ComputeBackend {
         private BackendType backendType = BackendType.OPENCL;
         private DeviceCapabilities capabilities = defaultCapabilities();
         private boolean strictLlmArgs;
+        private boolean graphCapture;
+        private boolean graphArgUpdates;
         private final Set<String> unavailable = new LinkedHashSet<>();
         private final Map<String, KernelEmulator> emulators = new LinkedHashMap<>();
 
         private Builder() {
         }
-
         public Builder backendType(BackendType type) {
             this.backendType = Objects.requireNonNull(type, "backendType");
             return this;
@@ -1367,6 +1498,22 @@ public final class FakeComputeBackend implements ComputeBackend {
         /** Enforces the LLM kernel argument and work-size rules on every dispatch. */
         public Builder strictLlmArgs(boolean strict) {
             this.strictLlmArgs = strict;
+            return this;
+        }
+
+        /** Lets the queues capture kernel dispatches into a replayable {@link FakeGraph}. */
+        public Builder graphCapture(boolean supported) {
+            this.graphCapture = supported;
+            return this;
+        }
+
+        /**
+         * Lets captured graphs take a replay body's argument and work-size updates (the CUDA/HIP
+         * semantics) and apply a patch plan's values without a body, instead of refusing every change
+         * like a verify-only command buffer. Without it the recorded arguments are fixed.
+         */
+        public Builder graphArgUpdates(boolean supported) {
+            this.graphArgUpdates = supported;
             return this;
         }
 

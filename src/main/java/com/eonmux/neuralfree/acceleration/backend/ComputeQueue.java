@@ -131,6 +131,28 @@ public interface ComputeQueue extends AutoCloseable {
     }
 
     /**
+     * Whether this queue's device can reach {@code peer}'s device memory without a host round trip (CUDA peer
+     * access, or the same physical device). The default knows only this queue's own device.
+     */
+    default boolean supportsPeerCopy(ComputeQueue peer) {
+        return peer == this;
+    }
+
+    /**
+     * Enqueues a copy from {@code src} into {@code dst}, a buffer of {@code destination}'s device, when
+     * {@link #supportsPeerCopy} reports that this queue's device can reach it. The copy runs on this queue, so it is
+     * ordered after the work already enqueued here and before any later work — the caller passes a source buffer
+     * whose contents later work on this queue may still overwrite.
+     *
+     * @throws UnsupportedOperationException when this backend has no peer copy, or the copy cannot be recorded in a
+     *                                       graph capture
+     */
+    default void enqueuePeerCopy(ComputeQueue destination, GpuBuffer src, long srcOffset, GpuBuffer dst,
+                                 long dstOffset, long sizeInBytes, GpuEvent... waitOnEvents) {
+        throw new UnsupportedOperationException("peer copy not implemented");
+    }
+
+    /**
      * Sets a single kernel argument on a pre-bound kernel handle.
      * Only the specified argument index is updated; all others remain as previously set.
      */
@@ -211,6 +233,89 @@ public interface ComputeQueue extends AutoCloseable {
      */
     default GpuEvent enqueueMarker(GpuEvent... waitOnEvents) {
         throw new UnsupportedOperationException("enqueueMarker not implemented");
+    }
+
+    /**
+     * Whether this queue can capture its commands into a replayable {@link GpuGraph}. Only a backend
+     * with device-side command graphs does; on the others the capture methods throw
+     * {@link UnsupportedOperationException} naming the queue.
+     */
+    default boolean supportsGraphCapture() {
+        return false;
+    }
+
+    /**
+     * Starts capturing the commands enqueued on this queue: until {@link #endCapture} or
+     * {@link #abortCapture}, kernel dispatches (and, on a backend that records them, device copies and
+     * fills) are recorded into a graph instead of executed. Every command whose result the host can
+     * observe is refused while capturing: host transfers and reads, markers, synchronizations and waits
+     * on another queue's events throw {@link GpuUncapturableCommandException} naming the command, so the
+     * capture can be aborted and the step run directly. The capture
+     * begins after the work enqueued so far has finished.
+     *
+     * @throws IllegalStateException    when the queue is closed or already capturing
+     * @throws UnsupportedOperationException when this queue does not support capture
+     * @throws RuntimeException         the translated backend failure
+     */
+    default void beginCapture() {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not support graph capture");
+    }
+
+    /**
+     * Ends the capture and returns the {@link GpuGraph} of the recorded commands. The captured
+     * commands do not run until the graph is launched. The queue stops capturing whether or not the
+     * graph can be built.
+     *
+     * @throws IllegalStateException    when the queue is closed or not capturing
+     * @throws UnsupportedOperationException when this queue does not support capture
+     * @throws RuntimeException         the translated backend failure
+     */
+    default GpuGraph endCapture() {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not support graph capture");
+    }
+
+    /**
+     * Ends an open capture and discards the recorded commands, so a failed step leaves no device work
+     * behind. Does nothing when the queue is not capturing, so a failure handler can call it
+     * unconditionally.
+     *
+     * @throws UnsupportedOperationException when this queue does not support capture
+     * @throws RuntimeException the translated backend failure
+     */
+    default void abortCapture() {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not support graph capture");
+    }
+
+    /** True between {@link #beginCapture} and {@link #endCapture} or {@link #abortCapture}. */
+    default boolean isCapturing() {
+        return false;
+    }
+
+    /** Whether {@link #beginKernelBatch} is available on this queue. */
+    default boolean supportsKernelBatching() {
+        return false;
+    }
+
+    /**
+     * A new, empty {@link KernelTaskBatch} on this queue's backend: independent small kernels
+     * recorded with {@code add} and submitted as one device-side submission with
+     * {@code launch}. The batch is caller-owned and closed by the caller.
+     *
+     * @throws UnsupportedOperationException when the backend does not batch kernel launches
+     *                                       ({@link #supportsKernelBatching} is false)
+     */
+    default KernelTaskBatch beginKernelBatch() {
+        throw new UnsupportedOperationException("kernel batching not supported by this backend");
+    }
+
+    /**
+     * The per-command device timing this queue accumulates while
+     * {@code -Dneuralfree.gpu.profile=true} is set, or null when the queue does not measure its
+     * dispatches (the property is unset, the backend cannot time commands, or a graph capture or
+     * replay is recording). The report covers the commands completed by the last {@link #finish()}.
+     */
+    default KernelTiming kernelTiming() {
+        return null;
     }
 
     void flush();

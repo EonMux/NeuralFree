@@ -77,6 +77,26 @@ public final class CpuCompressedKv implements KvAccessor {
         state.reset();
     }
 
+    /**
+     * Replaces the compressed rows and both compressor tensors, every plane, by {@code src}'s (a sequence copy of
+     * the stream, llama.cpp {@code llama_dsv4_comp_state::apply_copies}, llama-kv-cache-dsv4.cpp:1073-1083).
+     *
+     * @throws IllegalArgumentException when {@code src} is another kind or shape of cache
+     */
+    public void copyFrom(CpuCompressedKv src) {
+        Objects.requireNonNull(src, "src");
+        LayerMemoryPlan.CompressedKvPlan p = src.plan;
+        if (p.kind() != plan.kind() || p.rows() != plan.rows() || p.width() != plan.width()
+                || p.dtype() != plan.dtype() || p.planes() != plan.planes() || p.planeFloats() != plan.planeFloats()) {
+            throw new IllegalArgumentException(this + " cannot take the stream of " + src);
+        }
+        rows.copyAllFrom(src.rows);
+        for (String name : new String[]{CpuMemory.COMPRESSOR_KV, CpuMemory.COMPRESSOR_SCORE}) {
+            float[] from = src.state.tensor(name);
+            System.arraycopy(from, 0, state.tensor(name), 0, from.length);
+        }
+    }
+
     @Override
     public int layer() {
         return rows.layer();
@@ -110,6 +130,11 @@ public final class CpuCompressedKv implements KvAccessor {
     @Override
     public void readK(int row, int head, float[] dst, int off) {
         rows.readK(row, head, dst, off);
+    }
+
+    @Override
+    public void readKSlice(int row, int from, int n, float[] dst, int off) {
+        rows.readKSlice(row, from, n, dst, off);
     }
 
     @Override

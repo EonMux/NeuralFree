@@ -60,6 +60,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -69,10 +70,10 @@ import java.util.Set;
  * A PEFT LoRA adapter directory seen as the GGUF adapter {@code convert_lora_to_gguf.py} writes: the metadata of
  * {@code LoraModel.set_type} / {@code set_gguf_parameters} and the {@code <gguf name>.lora_a} / {@code .lora_b}
  * factor tensors of {@link com.eonmux.neuralfree.gguf.ModelSources#openAdapter}, with the base model's architecture
- * mapping the module names through the package-public HS-1 assembler steps {@code filter} and {@code plan}
+ * mapping the module names through the package-public {@link HfSourceAssembler} steps {@code filter} and {@code plan}
  * (LC/convert_lora_to_gguf.py:410-529, the {@code LoraModel}).
  *
- * <p>The pipeline (HF.md §LA-1): {@link PeftAdapterConfig#read} validates {@code adapter_config.json}; the adapter
+ * <p>The pipeline: {@link PeftAdapterConfig#read} validates {@code adapter_config.json}; the adapter
  * weights open through the checkpoint containers; the base model's configuration resolves — a safetensors base's own
  * configuration, {@link ModelSourceOptions#loraBaseConfig()}, a local {@code base_model_name_or_path} directory, else
  * the named error of rule 4; the base architecture's {@code HfArchEntry} fixes the configuration and the block count;
@@ -158,7 +159,7 @@ public final class PeftAdapterSource implements ModelSource {
      * @throws IOException                    when the adapter, its base configuration or the invocation tokenizer
      *                                        cannot be read
      * @throws GgufFormatException            for an adapter the conversion refuses, or for rule 4 of the base
-     *                                        configuration (HF.md §LA-1)
+     *                                        configuration
      * @throws UnsupportedArchException when the base architecture is registered as not supported
      */
     public static PeftAdapterSource open(Path dir, SourceOrigin base, ModelSourceOptions o) throws IOException {
@@ -180,14 +181,14 @@ public final class PeftAdapterSource implements ModelSource {
         HfArchEntry entry = HfArchRegistry.resolve(baseCfg, kind);
         HfResources resources = new HfResources();
         try {
+            HfTokenizerFiles tokenizer = HfTokenizerFiles.locate(baseCfg.dir())
+                    .withTokenizerDir(o.tokenizerDir());
             HfTensorIndex moduleIndex = lora.moduleIndex(dir);
             Arch arch = entry.arch().resolve(baseCfg, moduleIndex);
             requireSupported(baseCfg, arch);
             HfConfig fixed = entry.configFixup().apply(baseCfg);
             HfLoadContext ctx = HfLoadContext.builder(fixed, entry.withExtra(HfExtraTensors.NONE), arch)
-                    .options(o).checkpoint(ckpt)
-                    .tokenizerFiles(HfTokenizerFiles.locate(baseCfg.dir())
-                            .withTokenizerDir(o.tokenizerDir()))
+                    .options(o).checkpoint(ckpt).tokenizerFiles(tokenizer)
                     .index(moduleIndex).resources(resources).build().withBlockCount(entry.blockCount(
                             HfLoadContext.builder(fixed, entry, arch).build()));
             lora.requireNamed(dir, ctx);
@@ -199,14 +200,24 @@ public final class PeftAdapterSource implements ModelSource {
             HfSourceAssembler.Filtered kept = HfSourceAssembler.filter(ctx, pass, kind);
             HfSourceAssembler.Planned p = HfSourceAssembler.plan(kept.ctx(), kept, pass.moduleArgs());
             lora.requireMappedLmHead(dir, kept, p.plan());
-            HfMetadata md = metadata(config, arch, p.plan(), kept.ctx(), base);
-            validate(dir, p.plan(), md, arch);
-            VirtualLayout layout = VirtualLayout.of(ckpt, p.plan());
-            PeftAdapterSource s = new PeftAdapterSource(dir.toString(), o, kept.ctx(), p.plan(), md, layout, ckpt,
+            TensorPlan plan = p.plan();
+            // the vision-tower and connector modules the text route's filter drop run through the base
+            // architecture's projector conversion, which plans them as VISION pairs (vLLM's tower/connector LoRA)
+            Set<String> towerModules = towerModules(lora, ctx);
+            VisionRoute vision = towerModules.isEmpty() ? null
+                    : visionRoute(dir, baseCfg, ckpt, resources, o, tokenizer, lora, towerModules);
+            if (vision != null) {
+                plan = TensorPlan.merge(plan, vision.plan);
+            }
+            HfMetadata md = metadata(config, arch, plan, kept.ctx(), base);
+            validate(dir, plan, md, arch);
+            VirtualLayout layout = VirtualLayout.of(ckpt, plan);
+            PeftAdapterSource s = new PeftAdapterSource(dir.toString(), o, kept.ctx(), plan, md, layout, ckpt,
                     resources);
-            LOG.info("Opened PEFT adapter {} as '{}': {} tensors ({} produced), alpha {}, {} metadata keys", dir,
+            LOG.info("Opened PEFT adapter {} as '{}': {} tensors ({} produced), alpha {}, {} metadata keys{}", dir,
                     arch.ggufName(), layout.produced().size(), layout.tensors().size() - layout.produced().size(),
-                    config.alpha(), s.metadata.size());
+                    config.alpha(), s.metadata.size(), vision == null ? ""
+                    : " (" + vision.plan.tensors().size() + " vision-tower tensors)");
             return s;
         } catch (IOException | RuntimeException | Error e) {
             try {
@@ -374,12 +385,100 @@ public final class PeftAdapterSource implements ModelSource {
                 + " tensors}";
     }
 
+    // ------------------------------------------------------------------ the vision tower's modules
+
+    /**
+     * One vision-tower planning route: the projector conversion's load context, its plan and the GGUF tensors each
+     * module planned. Immutable.
+     */
+    private static final class VisionRoute {
+        final HfLoadContext ctx;
+        final TensorPlan plan;
+        final Map<String, List<String>> added;
+
+        VisionRoute(HfLoadContext ctx, HfSourceAssembler.Planned planned) {
+            this.ctx = ctx;
+            this.plan = planned.plan();
+            this.added = planned.added();
+        }
+    }
+
+    /**
+     * The adapter modules the text route's filter drops: the vision-tower and connector candidates, which the
+     * projector conversion plans. The paired modules and the kept side tensors, plus the raw names of neither kind
+     * under their module weight name (those are refused through the vision route when its filter keeps them).
+     */
+    private static Set<String> towerModules(LoraTensors lora, HfLoadContext ctx) {
+        Set<String> out = new LinkedHashSet<>();
+        for (String module : lora.moduleNames()) {
+            if (HfTensorFilters.filterName(ctx, module) == null) {
+                out.add(module);
+            }
+        }
+        for (String raw : lora.unmappedNames()) {
+            String base = LoraTensors.baseName(raw);
+            if (HfTensorFilters.filterName(ctx, base) == null) {
+                out.add(base);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The projector conversion of the tower and connector modules: the base architecture's MMPROJ entry resolves the
+     * checkpoint's projector class, whose name filters and tensor hooks plan the modules over a vision-only module
+     * index exactly as an mmproj export does, and every routed module must land in the plan or be refused by name.
+     *
+     * @throws GgufFormatException when the base architecture has no projector conversion, a routed module maps to
+     *                             no tensor of the projector conversion, or a module name the projector filter
+     *                             keeps is neither a LoRA factor pair nor a norm
+     */
+    private static VisionRoute visionRoute(Path dir, HfConfig baseCfg, CheckpointContainer ckpt,
+                                           HfResources resources, ModelSourceOptions o, HfTokenizerFiles tokenizer,
+                                           LoraTensors lora, Set<String> modules) throws IOException {
+        HfArchEntry projEntry;
+        try {
+            projEntry = HfArchRegistry.resolve(baseCfg, HfArchEntry.Kind.MMPROJ);
+        } catch (GgufFormatException e) {
+            throw new GgufFormatException("Invalid PEFT adapter '" + dir + "': it adapts the vision tower or the"
+                    + " connector (" + modules.iterator().next() + "), which needs the base architecture's"
+                    + " projector conversion: " + e.getMessage(), e);
+        }
+        HfTensorIndex visionIndex = lora.moduleIndex(dir, modules);
+        Arch arch = projEntry.arch().resolve(baseCfg, visionIndex);
+        requirePlannableArch(baseCfg, arch);
+        HfConfig fixed = projEntry.configFixup().apply(baseCfg);
+        HfLoadContext ctx = HfLoadContext.builder(fixed, projEntry.withExtra(HfExtraTensors.NONE), arch)
+                .options(o).checkpoint(ckpt).tokenizerFiles(tokenizer)
+                .index(visionIndex).resources(resources).build().withBlockCount(projEntry.blockCount(
+                        HfLoadContext.builder(fixed, projEntry, arch).build()));
+        lora.requireNamed(dir, ctx);
+        // the factors are plain float sources, as in the text route: the projector filters and tensor hooks act on
+        // the module names as on an mmproj export's tensors
+        HfQuantRewriter.Result pass = HfQuantRewriter.rewrite(HfQuantConfig.none(), ctx, visionIndex, o);
+        HfSourceAssembler.Filtered kept = HfSourceAssembler.filter(ctx, pass, HfArchEntry.Kind.MMPROJ);
+        HfSourceAssembler.Planned planned = HfSourceAssembler.plan(kept.ctx(), kept, pass.moduleArgs());
+        for (String module : modules) {
+            String filtered = HfTensorFilters.filterName(ctx, module);
+            if (filtered == null) {
+                continue; // the projector filter drops the name, as the converter skips filter-dropped names
+            }
+            if (planned.added().getOrDefault(filtered, List.of()).isEmpty()
+                    && !planned.plan().dropped().containsKey(filtered)) {
+                throw new GgufFormatException("Invalid PEFT adapter '" + dir + "': the vision-tower module '"
+                        + module + "' maps to no tensor of the projector conversion (arch '" + arch.ggufName()
+                        + "')");
+            }
+        }
+        return new VisionRoute(kept.ctx(), planned);
+    }
+
     // ------------------------------------------------------------------ pieces
 
     /**
      * The adapter weights of {@code dir}, stored or its declared container format: the safetensors file the
-     * lookahead detects (HF.md §1.2 rule 5), else {@code adapter_model.bin} when a registered container accepts it,
-     * which none does by default (LA-1 rejects).
+     * lookahead detects, else {@code adapter_model.bin} when a registered container accepts it,
+     * which none does by default.
      *
      * @throws FileNotFoundException         when the directory holds no adapter weights
      * @throws IOException                   when the weights cannot be read or no container accepts the format
@@ -407,7 +506,7 @@ public final class PeftAdapterSource implements ModelSource {
     }
 
     /**
-     * The base model's configuration, in the order HF.md §LA-1 gives: the safetensors base's own {@code HfConfig};
+     * The base model's configuration, in the order {@code convert_lora_to_gguf.py} follows: the safetensors base's own {@code HfConfig};
      * {@link ModelSourceOptions#loraBaseConfig()}, a directory or a {@code config.json}; {@code
      * base_model_name_or_path} when it names an existing local directory (absolute, or relative to the adapter
      * directory); else rule 4's error, as llama.cpp needs {@code --base} for the same reason.
@@ -462,7 +561,19 @@ public final class PeftAdapterSource implements ModelSource {
     }
 
     /**
-     * The adapter's metadata (Hf.md §LA-1): {@code general.architecture}, {@code general.type = adapter},
+     * The planning arch of the projector conversion: its MMPROJ entry resolves to a projector arch (SupportClass
+     * NA), which never opens standalone but here only names the planned tensors, so only an unknown architecture
+     * is refused; the base architecture's own support was checked on the text route.
+     */
+    private static void requirePlannableArch(HfConfig cfg, Arch arch) {
+        if (arch == null || arch == Arch.UNKNOWN) {
+            throw new GgufFormatException("Hugging Face architecture '" + cfg.architecture()
+                    + "' resolves to no NeuralFree architecture for this checkpoint");
+        }
+    }
+
+    /**
+     * The adapter's metadata: {@code general.architecture}, {@code general.type = adapter},
      * {@code adapter.type = lora}, {@code adapter.lora.alpha} and the aLoRA invocation tokens of the two
      * configuration forms; first the keys the tensor hooks recorded in {@code plan.kv()}.
      */
@@ -512,8 +623,8 @@ public final class PeftAdapterSource implements ModelSource {
 
     /**
      * The tokenizer of the base model at {@code base}: a GGUF base's {@code tokenizer.*} metadata through
-     * {@link GGUFTokenizer}, an HF-directory base's signals through the TK-3 vocabulary written by the base arch's
-     * vocab hook (HF.md §LA-1, the {@code AutoTokenizer.from_pretrained} of the converter).
+     * {@link GGUFTokenizer}, an HF-directory base's signals through the vocabulary written by the base arch's
+     * vocab hook (the {@code AutoTokenizer.from_pretrained} of the converter).
      *
      * @throws IOException when the base tokenizer cannot be read
      */
@@ -650,6 +761,28 @@ public final class PeftAdapterSource implements ModelSource {
                     .replace(".lora_embedding_A", ".weight").replace(".lora_embedding_B", ".weight");
         }
 
+        /** The module weight names of the paired modules and the kept side tensors, in index order. */
+        List<String> moduleNames() {
+            List<String> out = new ArrayList<>(halves.keySet());
+            out.addAll(plain.keySet());
+            return out;
+        }
+
+        /** The raw checkpoint names of neither kind, in discovery order. */
+        List<String> unmappedNames() {
+            return Collections.unmodifiableList(new ArrayList<>(unmapped));
+        }
+
+        /** The raw checkpoint name behind the module name {@code module}, or null when it is of a known kind. */
+        String rawNameOf(String module) {
+            for (String raw : unmapped) {
+                if (baseName(raw).equals(module)) {
+                    return raw;
+                }
+            }
+            return null;
+        }
+
         /**
          * The module index the base arch's hooks run over: one {@link LoraFactorSource} per paired module under its
          * weight name, the kept side tensors as stored sources.
@@ -668,6 +801,28 @@ public final class PeftAdapterSource implements ModelSource {
                 index.put(e.getKey(), new LoraFactorSource(e.getKey(), ckptSource(h.a), ckptSource(h.b)));
             }
             index.putAll(plain);
+            return HfTensorIndex.of(index);
+        }
+
+        /**
+         * {@link #moduleIndex(Path)} over the modules {@code modules} name only: their paired factors, then their
+         * kept side tensors ({@link #requirePaired} has run, so every half pair is complete). A module of neither
+         * kind is in no index: {@link #requireNamed} refuses it by name or both filters drop it.
+         */
+        HfTensorIndex moduleIndex(Path dir, Set<String> modules) {
+            LinkedHashMap<String, RowSource> index = new LinkedHashMap<>();
+            for (Map.Entry<String, Half> e : halves.entrySet()) {
+                if (!modules.contains(e.getKey())) {
+                    continue;
+                }
+                Half h = e.getValue();
+                index.put(e.getKey(), new LoraFactorSource(e.getKey(), ckptSource(h.a), ckptSource(h.b)));
+            }
+            for (Map.Entry<String, RowSource> e : plain.entrySet()) {
+                if (modules.contains(e.getKey())) {
+                    index.put(e.getKey(), e.getValue());
+                }
+            }
             return HfTensorIndex.of(index);
         }
 

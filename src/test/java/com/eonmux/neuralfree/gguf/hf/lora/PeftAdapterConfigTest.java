@@ -21,7 +21,7 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The validation matrix of {@link PeftAdapterConfig}, read from synthetic {@code adapter_config.json} files of
- * temporary directories (HF.md §LA-1): what {@code convert_lora_to_gguf.py} needs is accepted (plain LoRA,
+ * temporary directories: what {@code convert_lora_to_gguf.py} needs is accepted (plain LoRA,
  * {@code rank_pattern}, an {@code alpha_pattern} whose every value is {@code lora_alpha}, the {@code init_lora_weights}
  * values that seed the two factors only), what an adapter GGUF cannot represent is refused with a named error
  * (the PEFT methods, DoRA, {@code modules_to_save}, {@code layer_replication}, {@code lora_bias}, a non-LoRA init), the

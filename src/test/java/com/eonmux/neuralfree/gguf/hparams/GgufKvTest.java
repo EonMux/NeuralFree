@@ -51,6 +51,20 @@ public class GgufKvTest {
     }
 
     @Test
+    public void keysWithPrefixListsTheSortedConcreteKeys() {
+        Map<String, Object> m = llama();
+        m.put("llama.decision.temperature.score", 0.5f);
+        m.put("llama.decision.temperature.choice.3_5", 0.7f);
+        m.put("llama.decision.temperature.choice", 0.6f);
+        m.put("llama.decision.type", "vllm-decision2");
+        GgufKv kv = GgufKv.ofMap(m);
+        assertEquals(java.util.Arrays.asList("llama.decision.temperature.choice",
+                        "llama.decision.temperature.choice.3_5", "llama.decision.temperature.score"),
+                kv.keysWithPrefix(kv.key(GgufKeys.DECISION_TEMPERATURE_PREFIX)));
+        assertTrue(kv.keysWithPrefix(kv.key(GgufKeys.DECISION_SCORE_BIAS_PREFIX)).isEmpty());
+    }
+
+    @Test
     public void typedScalarGetters() {
         Map<String, Object> m = llama();
         m.put("llama.block_count", 32);

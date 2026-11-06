@@ -1,0 +1,19 @@
+{#- llama.cpp gemma chat template (src/llama-chat.cpp:379-400): system text joins the next non-model turn. -#}
+{%- set ns = namespace(system_prompt='') -%}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {%- set ns.system_prompt = ns.system_prompt ~ (content | trim(' \t\n\v\f\r')) -%}
+    {%- else -%}
+        {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
+        {{- '<start_of_turn>' ~ role ~ '\n' -}}
+        {%- if ns.system_prompt != '' and role != 'model' -%}
+            {{- ns.system_prompt ~ '\n\n' -}}
+            {%- set ns.system_prompt = '' -%}
+        {%- endif -%}
+        {{- (content | trim(' \t\n\v\f\r')) ~ '<end_of_turn>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<start_of_turn>model\n' -}}
+{%- endif -%}

@@ -252,9 +252,46 @@ public class SamplerOrderTest {
         assertEquals(5, sizes.get(0).intValue());
     }
 
+    /**
+     * Custom logits processors run at the chain head, after the constraint head and before penalties and the
+     * truncating stages (vLLM applies them to the logits before its sampling stages), so a mask can keep a token
+     * top-k would otherwise prune.
+     */
     @Test
-    public void extraStageArgumentsAreChecked() {
-        assertThrows(NullPointerException.class,
+    public void logitsProcessorsRunAtTheChainHeadBeforeTopK() {
+        final List<Integer> sizes = new ArrayList<>();
+        final List<Float> logits = new ArrayList<>();
+        SamplerStage recorder = new SamplerStage() {
+            @Override
+            public void apply(Sampler.Candidates candidates) {
+                sizes.add(candidates.size());
+                logits.add(candidates.logit(0));
+            }
+        };
+        Sampler s = Sampler.create(base().topK(2).temperature(0.5f).build(), new int[0],
+                Collections.<SamplerStage>emptyList(), Collections.singletonList(recorder));
+        s.apply(LOGITS);
+        assertEquals("the processor sees the whole row, before top-k", 5, sizes.get(0).intValue());
+        assertEquals(2.0f, logits.get(0), 0f);
+
+        SamplerStage maskIdZero = new SamplerStage() {
+            @Override
+            public void apply(Sampler.Candidates candidates) {
+                for (int i = 0; i < candidates.size(); i++) {
+                    if (candidates.id(i) != 0) {
+                        candidates.setLogit(i, Float.NEGATIVE_INFINITY);
+                    }
+                }
+                candidates.setSorted(false);
+            }
+        };
+        Sampler forced = Sampler.create(base().topK(1).temperature(0.5f).build(), new int[0],
+                Collections.<SamplerStage>emptyList(), Collections.singletonList(maskIdZero));
+        assertEquals(0, forced.apply(LOGITS).selectedId());
+    }
+
+    @Test
+    public void extraStageArgumentsAreChecked() {        assertThrows(NullPointerException.class,
                 () -> Sampler.create(base().build(), new int[0], (List<SamplerStage>) null));
         List<SamplerStage> withNull = new ArrayList<>();
         withNull.add(null);
@@ -284,12 +321,16 @@ public class SamplerOrderTest {
         assertEquals(Arrays.asList("typ_p"), labels(kept.order()));
         assertTrue(kept.isExplicit(SamplerConfig.Setting.SEQUENCE));
 
-        // Other model defaults still fill fallbacks while the model's sequence is taken when SEQUENCE is unset.
-        SamplerConfig both = config.withModelDefaults(SamplingDefaults.builder().temp(0.3f)
+        // Other model defaults still fill fallbacks while the model's sequence is taken when SEQUENCE is unset; the
+        // temperature is left a fallback here, since base() gives it explicitly and an explicit value always wins.
+        SamplerConfig fallbackTemperature = SamplerConfig.builder().topK(0).topP(1f).minP(0f).typicalP(1f)
+                .seed(SEED).build();
+        SamplerConfig both = fallbackTemperature.withModelDefaults(SamplingDefaults.builder().temp(0.3f)
                 .sequence("temperature").build());
         assertEquals(Arrays.asList("temperature"), labels(both.order()));
         assertFalse(both.isExplicit(SamplerConfig.Setting.SEQUENCE));
         assertEquals(0.3f, both.temperature(), 0f);
+        assertEquals(1f, config.withModelDefaults(SamplingDefaults.builder().temp(0.3f).build()).temperature(), 0f);
     }
 
     @Test

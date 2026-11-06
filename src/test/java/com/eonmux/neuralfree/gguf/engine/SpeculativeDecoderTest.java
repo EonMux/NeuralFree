@@ -92,6 +92,50 @@ public class SpeculativeDecoderTest {
     }
 
     /**
+     * Prefix reuse across the decoder's generations (llama.cpp's speculative loop over a cached prompt): the
+     * second call whose prompt extends the stored sequence keeps the common prefix behind a rollback, prefills
+     * only the tail (the prefill lands at the reused position), and emits the same continuation the full prefill
+     * produces. With reuse off the whole prompt prefills from position 0.
+     */
+    @Test
+    public void aSecondGenerationReusesTheStoredTargetPrefix() {
+        FakeTarget target = new FakeTarget(false);
+        FakeDrafter drafter = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7} : new int[]{5});
+        SpeculativeDecoder dec = SpeculativeDecoder.builder(target, drafter, tokenizer()).draftMax(4)
+                .prefixReuse(true).build();
+
+        GenerationResult first = dec.generate(new int[]{0}, greedy(6), (TokenCallback) null);
+        GenerationResult second = dec.generate(new int[]{0, 1, 2, 3}, greedy(3), (TokenCallback) null);
+
+        assertArrayEquals(new int[]{1, 2, 3, 4, 5, 6}, first.tokens());
+        assertArrayEquals("the reused run emits the stored prompt's own continuation", new int[]{4, 5, 6},
+                second.tokens());
+        assertEquals(2, target.prefills.size());
+        assertArrayEquals("the second prefill evaluated only the last prompt token", new int[]{3},
+                target.prefills.get(1));
+        assertEquals(Integer.valueOf(3), target.prefillPositions.get(1));
+        assertEquals("generation 1 rolls back its rejected drafts, generation 2 drops the suffix"
+                        + " past the reused prefix", Arrays.asList(2, 3), target.rollbacks);
+        assertEquals(1, second.timings().promptTokens());
+    }
+
+    @Test
+    public void theReuseSwitchPrefillsTheWholePrompt() {
+        FakeTarget target = new FakeTarget(false);
+        FakeDrafter drafter = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7} : new int[]{5});
+        SpeculativeDecoder dec = SpeculativeDecoder.builder(target, drafter, tokenizer()).draftMax(4)
+                .prefixReuse(false).build();
+
+        dec.generate(new int[]{0}, greedy(6), (TokenCallback) null);
+        GenerationResult second = dec.generate(new int[]{0, 1, 2, 3}, greedy(3), (TokenCallback) null);
+
+        assertArrayEquals(new int[]{4, 5, 6}, second.tokens());
+        assertEquals(2, target.prefills.size());
+        assertArrayEquals(new int[]{0, 1, 2, 3}, target.prefills.get(1));
+        assertEquals(Integer.valueOf(0), target.prefillPositions.get(1));
+    }
+
+    /**
      * The logprobs capture over speculation (MATCH verify): every emitted token — the prompt's first sample, the
      * confirmed drafts and the target's own tokens — reports its post-chain distribution as log probabilities,
      * the sampled token first and the alternatives in descending probability, one entry per generated token.
@@ -118,6 +162,74 @@ public class SpeculativeDecoderTest {
                         scores[k].logprob() <= scores[k - 1].logprob());
             }
         }
+    }
+
+    /**
+     * Device selection (llama.cpp backend sampling): a greedy MATCH generation verifies through
+     * {@code forwardRowsGreedy} and decodes its draftless rounds through {@code decodeGreedyOnDevice}, reading back
+     * ids only, and emits exactly the host path's tokens with the same verify batches and rollbacks.
+     */
+    @Test
+    public void greedyMatchRoundsSelectOnTheDevice() {
+        FakeDrafter script = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7}
+                : last == 4 ? new int[0] : new int[]{6});
+        FakeTarget device = new FakeTarget(false);
+        GenerationResult onDevice = SpeculativeDecoder.builder(device, script, tokenizer()).draftMax(4).build()
+                .generate(new int[]{0}, greedy(7), (TokenCallback) null);
+        FakeDrafter hostScript = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7}
+                : last == 4 ? new int[0] : new int[]{6});
+        FakeTarget host = new FakeTarget(false);
+        GenerationResult onHost = SpeculativeDecoder.builder(host, hostScript, tokenizer()).draftMax(4)
+                .verifyOnDevice(false).build()
+                .generate(new int[]{0}, greedy(7), (TokenCallback) null);
+
+        assertArrayEquals(new int[]{1, 2, 3, 4, 5, 6, 7}, onDevice.tokens());
+        assertArrayEquals(onHost.tokens(), onDevice.tokens());
+        assertEquals("both verify rounds read greedy ids", 2, device.greedyVerifies);
+        assertEquals("the draftless round decoded on the device", 1, device.greedyDecodes);
+        assertEquals(0, host.greedyVerifies);
+        assertEquals(0, host.greedyDecodes);
+        assertEquals(host.verifyCalls.size(), device.verifyCalls.size());
+        for (int i = 0; i < host.verifyCalls.size(); i++) {
+            assertArrayEquals(host.verifyCalls.get(i), device.verifyCalls.get(i));
+        }
+        assertEquals(host.rollbacks, device.rollbacks);
+        assertEquals(host.decodes, device.decodes);
+        assertEquals(hostScript.accepted, script.accepted);
+    }
+
+    /** A logprobs capture needs the rows' distributions, so a greedy chain with logprobs verifies on the host. */
+    @Test
+    public void aLogprobsRequestVerifiesOnTheHost() {
+        FakeTarget target = new FakeTarget(false);
+        FakeDrafter drafter = new FakeDrafter((last, n) -> last == 1 ? new int[]{2, 3, 7, 7} : new int[]{5});
+        GenerationRequest request = GenerationRequest.builder().maxNewTokens(6)
+                .sampler(SamplerConfig.greedyDecoding()).logprobs(2).build();
+
+        GenerationResult r = SpeculativeDecoder.builder(target, drafter, tokenizer()).draftMax(4).build()
+                .generate(new int[]{0}, request, (TokenCallback) null);
+
+        assertArrayEquals(new int[]{1, 2, 3, 4, 5, 6}, r.tokens());
+        assertEquals(6, r.logprobs().size());
+        assertEquals(0, target.greedyVerifies);
+        assertEquals(0, target.greedyDecodes);
+    }
+
+    /** A stochastic chain samples every row on the host; only an argmax chain selects on the device. */
+    @Test
+    public void aStochasticChainVerifiesOnTheHost() {
+        FakeTarget target = new FakeTarget(false);
+        FakeDrafter drafter = new FakeDrafter((last, n) -> new int[]{(last + 1) % VOCAB});
+        GenerationRequest request = GenerationRequest.builder().maxNewTokens(6)
+                .sampler(SamplerConfig.builder().temperature(0.8f).seed(7).build()).build();
+
+        GenerationResult r = SpeculativeDecoder.builder(target, drafter, tokenizer()).draftMax(2).build()
+                .generate(new int[]{0}, request, (TokenCallback) null);
+
+        assertEquals(6, r.tokens().length);
+        assertTrue(target.verifyCalls.size() > 0);
+        assertEquals(0, target.greedyVerifies);
+        assertEquals(0, target.greedyDecodes);
     }
 
     /**
@@ -169,6 +281,30 @@ public class SpeculativeDecoderTest {
         assertTrue(target.rollbacks.isEmpty());
         assertArrayEquals(new int[]{1, 2, 3, 4}, target.verifyCalls.get(0));
         assertEquals(3, drafter.accepted.get(0).intValue());
+    }
+
+    /**
+     * {@code repetition_detection} inside a verify round: the target's period-8 output repeats twice at token 16,
+     * mid-way through the round verifying tokens 14 to 17, so generation ends there with
+     * {@link StopReason#REPETITION} and the confirmed tokens after it are dropped.
+     */
+    @Test
+    public void aRepetitionStopEndsGenerationInsideAVerifyRound() {
+        FakeTarget target = new FakeTarget(false);
+        FakeDrafter drafter = new FakeDrafter((last, n) -> {
+            int[] d = new int[n];
+            for (int i = 0; i < n; i++) {
+                d[i] = (last + 1 + i) % VOCAB;
+            }
+            return d;
+        });
+        GenerationRequest request = GenerationRequest.builder().maxNewTokens(28)
+                .sampler(SamplerConfig.greedyDecoding()).repetitionDetection(RepetitionDetection.of(8, 2, 2)).build();
+
+        GenerationResult r = decoder(target, drafter, 3, 0).generate(new int[]{0}, request, (TokenCallback) null);
+
+        assertEquals(StopReason.REPETITION, r.stopReason());
+        assertArrayEquals(new int[]{1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0}, r.tokens());
     }
 
     /** An empty proposal, or one shorter than draft-min, decodes the token alone and reports zero accepted. */
@@ -370,6 +506,9 @@ public class SpeculativeDecoderTest {
         final List<Integer> rollbacks = new ArrayList<>();
         int snapshots;
         int restores;
+        /** Verify calls and plain decodes that selected on the "device" (read back ids, not logits). */
+        int greedyVerifies;
+        int greedyDecodes;
 
         FakeTarget(boolean recurrent) {
             this(new FakeMemory(recurrent, true, Integer.MAX_VALUE));
@@ -418,6 +557,18 @@ public class SpeculativeDecoderTest {
                 out[i] = next(tokens[rows[i]]);
             }
             return out;
+        }
+
+        @Override
+        public int[] forwardRowsGreedy(int[] tokens, int pos0, int[] outputRows) {
+            greedyVerifies++;
+            return ForwardBackend.super.forwardRowsGreedy(tokens, pos0, outputRows);
+        }
+
+        @Override
+        public int decodeGreedyOnDevice(int token, int pos) {
+            greedyDecodes++;
+            return ForwardBackend.super.decodeGreedyOnDevice(token, pos);
         }
 
         @Override

@@ -29,7 +29,9 @@ import static org.junit.Assert.assertTrue;
  * The tensors a GPU load places on the device: a Nemotron-H model with one NextN block keeps the block off the device
  * and out of the planned bytes unless MTP is loaded, as llama.cpp skips the NextN tensors without {@code load_mtp}
  * (llama-model.cpp:3915-3917) and counts them in its fit only with it (common/fit.cpp:141-143); placing them later
- * uploads exactly the block. A model without NextN blocks places every tensor.
+ * uploads exactly the block. A model without NextN blocks places every tensor. Placement rules
+ * ({@link TensorPlacementOverrides}) keep the expert tensors they match in RAM and can shield a tensor from a later
+ * rule.
  */
 public class WeightPlacementTest {
 
@@ -219,5 +221,25 @@ public class WeightPlacementTest {
             assertTrue(t.name(), p.onDevice(t));
             assertFalse(t.name(), p.isNextn(t));
         }
+    }
+
+    @Test
+    public void cpuMoeKeepsTheExpertTensorsOutOfThePlacement() {
+        WeightPlacement p = WeightPlacement.of(spec(false), false, TensorPlacementOverrides.cpuMoe());
+        assertFalse(p.onDevice(t("blk.2.ffn_up_exps.weight")));
+        assertFalse(p.onDevice(t("blk.2.ffn_down_exps.weight")));
+        assertTrue("the shared experts are dense weights", p.onDevice(t("blk.2.ffn_up_shexp.weight")));
+        assertTrue("the router is a device tensor", p.onDevice(t("blk.2.ffn_gate_inp.weight")));
+        assertTrue("the gate input is a device tensor", p.onDevice(t("blk.1.attn_q.weight")));
+        assertEquals(p.overrides(), TensorPlacementOverrides.cpuMoe());
+    }
+
+    @Test
+    public void anOverrideCanShieldATensorFromALaterCpuRule() {
+        TensorPlacementOverrides rules = TensorPlacementOverrides.parse("blk\\.2\\.ffn_up_exps=GPU")
+                .with(TensorPlacementOverrides.cpuMoe());
+        WeightPlacement p = WeightPlacement.of(spec(false), false, rules);
+        assertTrue(p.onDevice(t("blk.2.ffn_up_exps.weight")));
+        assertFalse(p.onDevice(t("blk.2.ffn_down_exps.weight")));
     }
 }

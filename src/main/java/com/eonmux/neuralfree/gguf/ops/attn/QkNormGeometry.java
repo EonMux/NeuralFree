@@ -34,10 +34,12 @@ public final class QkNormGeometry {
      * Graphs that normalize Q only when {@code attn_q_norm} exists and K only when {@code attn_k_norm} exists:
      * k2-horizon (models/k2-horizon.cpp:255-261), stablelm (models/stablelm.cpp:84-97), command-r
      * (models/command-r.cpp:79-89), chameleon (models/chameleon.cpp:90-104), glm4-moe (models/glm4-moe.cpp:197-204,
-     * 325-332) and step35 (models/step35.cpp:225-232, 435-442).
+     * 325-332), step35 (models/step35.cpp:225-232, 435-442) and openPangu's static sink attention, which normalizes
+     * K only ({@code k_layernorm}, vLLM {@code OpenPanguSinkAttention.forward}).
      */
     private static final Set<Arch> PER_TENSOR = Collections.unmodifiableSet(EnumSet.of(
-            Arch.K2_HORIZON, Arch.STABLELM, Arch.COMMAND_R, Arch.CHAMELEON, Arch.GLM4_MOE, Arch.STEP35));
+            Arch.K2_HORIZON, Arch.STABLELM, Arch.COMMAND_R, Arch.CHAMELEON, Arch.GLM4_MOE, Arch.STEP35,
+            Arch.PANGU_MOE));
 
     private final QkNormKind kind;
     private final NormKind normKind;
@@ -79,10 +81,11 @@ public final class QkNormGeometry {
         switch (kind) {
             case RMS_HEAD:
                 return new QkNormGeometry(kind, NormKind.RMS, rmsEps, nHeads, nHeads, headDim, layer);
+            case L2_HEAD:
+                return new QkNormGeometry(kind, NormKind.L2_GDN, rmsEps, nHeads, nHeads, headDim, layer);
             case LN_HEAD:
                 return new QkNormGeometry(kind, NormKind.LAYER, normEps, nHeads, nHeads, headDim, layer);
-            case RMS_SPLIT_HALF:
-                if (headDim % 2 != 0) {
+            case RMS_SPLIT_HALF:                if (headDim % 2 != 0) {
                     throw new IllegalArgumentException("layer " + layer + ": split-half QK norm needs an even head"
                             + " dim, got " + headDim);
                 }

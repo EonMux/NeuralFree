@@ -168,6 +168,40 @@ public class SpecialTokensTest {
     }
 
     @Test
+    public void preservedMarkersAreSplitAsTokensOnlyWhenParsingSpecial() {
+        Map<String, Object> md = bpe("gpt-2", Arrays.asList("<|call|>", "a", "b"), Arrays.<String>asList());
+        SpecialTokens s = SpecialTokens.of(TokenizerVocab.fromMetadata(md),
+                Arrays.asList("<|call|>", "<absent>"));
+        assertEquals(Arrays.asList(0), new ArrayList<>(s.preservedIds()));
+        List<SpecialTokens.Fragment> parsed = s.partition("a<|call|>b", true);
+        assertEquals(3, parsed.size());
+        assertEquals("a", parsed.get(0).text());
+        assertEquals(0, parsed.get(1).token());
+        assertEquals("b", parsed.get(2).text());
+        List<SpecialTokens.Fragment> plain = s.partition("a<|call|>b", false);
+        assertEquals(1, plain.size());
+        assertEquals("a<|call|>b", plain.get(0).text());
+    }
+
+    @Test
+    public void theTokenizerPreservesTheAnalysedMarkers() {
+        String template = "{%- for message in messages -%}"
+                + "<|{{ message['role'] }}|>{{ message['content'] }}"
+                + "{%- if message.get('tool_calls') -%}"
+                + "{%- for call in message['tool_calls'] -%}"
+                + "<|call|><function={{ call['function']['name'] }}>"
+                + "{{ call['function']['arguments'] | tojson }}</function><|/call|>"
+                + "{%- endfor -%}{%- endif -%}"
+                + "{%- endfor -%}"
+                + "{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+        Map<String, Object> md = bpe("gpt-2", Arrays.asList("<|call|>", "a"), Arrays.<String>asList());
+        md.put("tokenizer.chat_template", template);
+        com.eonmux.neuralfree.gguf.GGUFTokenizer tokenizer =
+                new com.eonmux.neuralfree.gguf.GGUFTokenizer(TokenizerVocab.fromMetadata(md));
+        assertEquals(Arrays.asList(0), new ArrayList<>(tokenizer.specialTokens().preservedIds()));
+    }
+
+    @Test
     public void suppressTokensDropOutOfRangeIds() {
         Map<String, Object> md = bpe("gpt-2", Arrays.asList("a", "b"), Arrays.<String>asList());
         md.put("tokenizer.ggml.suppress_tokens", new ArrayList<Object>(Arrays.asList(1, 7, 0)));

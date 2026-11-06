@@ -88,7 +88,12 @@ public final class Int8Scheme {
             requireIntegerOrFloat(m, zp, "weight_zero_point");
             s.zeros = IntPacking.shifted(m.rowMajor(zp, experts, ws[0], groups, "weight_zero_point"), 128);
         }
-        return b.finish(m, s.build());
+        IntWeightSpec spec = s.build();
+        float[] pre = w.inputPreScale();
+        if (pre != null) {
+            return b.finishPreScaled(m, spec, pre, "activation pre-scale");
+        }
+        return b.finish(m, spec);
     }
 
     private static RowSource block(IntRewriteBatch b, IntModuleTensors m) throws IOException {

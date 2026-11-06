@@ -19,6 +19,11 @@ public enum QuantFormat {
     INT_HQQ,
     /** int4 values stored one per int8 (compressed-tensors W4A8 int, W4AFP8 experts). */
     INT4_IN_INT8,
+    /**
+     * torchao {@code Int4Tensor}/{@code Int4TilePackedTo4dTensor} weights: two signed int4 values per byte, a
+     * float scale and a float zero point per group, as the tensor subclass stores them.
+     */
+    INT4_TORCHAO,
     /** int8 weights with per-tensor or per-channel scales. */
     INT8_CHANNEL,
     /** int8 weights with block scales ({@code blockwise_int8}). */
@@ -35,6 +40,11 @@ public enum QuantFormat {
     NVFP4_CT,
     /** ModelOpt NVFP4 ({@code weight_scale_2}). */
     NVFP4_MODELOPT,
+    /**
+     * Quark NVFP4 from two-level weight and input specs: {@code weight}, E4M3 {@code weight_scale}, the global
+     * {@code weight_scale_2} and the input global scale {@code input_scale_2} (V quark/schemes/quark_nvfp4.py).
+     */
+    NVFP4_QUARK,
     /** compressed-tensors / Quark MXFP4 ({@code weight_packed} plus E8M0 scales). */
     MXFP4_CT,
     /** gpt-oss MXFP4 {@code _blocks}/{@code _scales}. */

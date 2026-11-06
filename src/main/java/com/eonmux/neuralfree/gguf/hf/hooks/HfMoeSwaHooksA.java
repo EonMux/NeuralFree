@@ -442,7 +442,7 @@ public final class HfMoeSwaHooksA {
     // ------------------------------------------------------------------ Granite SWA rows
 
     /**
-     * {@code Gemma4UnifiedModel} (gemma.py:936-...), the HK-B2 {@code Gemma4Model} hooks plus the
+     * {@code Gemma4UnifiedModel} (gemma.py:936-...), the {@code Gemma4Model} hooks plus the
      * {@code suppress_tokens} of the checkpoint's {@code generation_config.json}.
      */
     public static void gemma4UnifiedMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) {

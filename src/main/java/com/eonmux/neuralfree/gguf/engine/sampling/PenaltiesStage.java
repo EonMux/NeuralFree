@@ -38,10 +38,58 @@ public final class PenaltiesStage extends SamplerStage {
         return StageKind.PENALTIES;
     }
 
-    /** Applies the penalties; candidates are still in vocabulary order here, so a token id is its candidate index. */
+    /** Whether the stage keeps a window ({@code penalty_last_n} != 0); the penalties may still be all neutral. */
+    public boolean enabled() {
+        return history.window != 0;
+    }
+
+    /** llama.cpp's repeat penalty. */
+    public float repeatPenalty() {
+        return repeatPenalty;
+    }
+
+    /** The frequency penalty per occurrence in the window. */
+    public float frequencyPenalty() {
+        return frequencyPenalty;
+    }
+
+    /** The presence penalty once per window token. */
+    public float presencePenalty() {
+        return presencePenalty;
+    }
+
+    /** Distinct token ids with a positive count in the window, in no particular order (a copy). */
+    public int[] activeTokens() {
+        return Arrays.copyOf(history.active, history.nActive);
+    }
+
+    /** The occurrence count of each {@link #activeTokens()} id (a copy). */
+    public int[] activeCounts() {
+        int[] out = new int[history.nActive];
+        for (int a = 0; a < history.nActive; a++) {
+            out[a] = history.counts[history.active[a]];
+        }
+        return out;
+    }
+
+    /**
+     * Applies the penalties. A vocabulary-ordered set indexes token ids by candidate slot; over a ranked cone (a
+     * device top-k readback) the candidates carry their ids explicitly, so their logits are looked up by id.
+     */
     @Override
     public void apply(Candidates candidates) {
         if (history.window == 0) {
+            return;
+        }
+        if (!candidates.indexedByTokenId()) {
+            for (int i = 0; i < candidates.size(); i++) {
+                int id = candidates.id(i);
+                if (id < 0 || id >= history.counts.length || history.counts[id] == 0) {
+                    continue;
+                }
+                candidates.setLogit(i, penalize(candidates.logit(i), history.counts[id]));
+            }
+            candidates.setSorted(false);
             return;
         }
         for (int a = 0; a < history.nActive; a++) {
@@ -49,13 +97,15 @@ public final class PenaltiesStage extends SamplerStage {
             if (id >= candidates.size()) {
                 continue;
             }
-            int count = history.counts[id];
-            float l = candidates.logit(id);
-            l = l <= 0f ? l * repeatPenalty : l / repeatPenalty;
-            l -= (float) count * frequencyPenalty + presencePenalty;
-            candidates.setLogit(id, l);
+            candidates.setLogit(id, penalize(candidates.logit(id), history.counts[id]));
         }
         candidates.setSorted(false);
+    }
+
+    /** One token's logit under llama.cpp's repeat, frequency and presence penalties. */
+    private float penalize(float logit, int count) {
+        float l = logit <= 0f ? logit * repeatPenalty : logit / repeatPenalty;
+        return l - ((float) count * frequencyPenalty + presencePenalty);
     }
 
     @Override
@@ -66,6 +116,27 @@ public final class PenaltiesStage extends SamplerStage {
     @Override
     public void reset() {
         history.clear();
+    }
+
+    /** The window's tokens, oldest first; null when the stage is off. */
+    @Override
+    public Object saveState() {
+        return history.window == 0 ? null : history.tokens();
+    }
+
+    /** Rebuilds the window and its counts from the saved tokens. */
+    @Override
+    public void restoreState(Object state) {
+        if (history.window == 0) {
+            return;
+        }
+        if (!(state instanceof int[])) {
+            throw new IllegalArgumentException("not a penalties stage state: " + state);
+        }
+        history.clear();
+        for (int token : (int[]) state) {
+            history.accept(token);
+        }
     }
 
     /**
@@ -106,6 +177,16 @@ public final class PenaltiesStage extends SamplerStage {
                     ring[stored++] = token;
                 }
             }
+        }
+
+        /** The stored tokens, oldest first. */
+        int[] tokens() {
+            int[] out = new int[stored];
+            int first = stored == window ? head : 0;
+            for (int k = 0; k < stored; k++) {
+                out[k] = ring[(first + k) % window];
+            }
+            return out;
         }
 
         void clear() {

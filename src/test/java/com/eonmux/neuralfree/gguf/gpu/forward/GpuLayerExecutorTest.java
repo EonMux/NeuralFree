@@ -84,6 +84,7 @@ public class GpuLayerExecutorTest {
 
     private static final String NORM = NormKernels.ROW_NORM;
     private static final String MIX = NormKernels.RESIDUAL_MIX;
+    private static final String MIX_NORM = NormKernels.RESIDUAL_MIX_NORM;
 
     /** A recording block call and the number of dispatches enqueued before it. */
     private static final class Event {
@@ -354,9 +355,13 @@ public class GpuLayerExecutorTest {
                 1.0f, 0f, MemoryKind.NONE);
     }
 
-    /** Opens the fake device, F32 weights for every tensor of the spec, and a context (with memory when asked). */
-    private GpuForwardContext open(ModelSpec spec, boolean withMemory) {
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+    /**
+     * Opens the fake device, F32 weights for every tensor of the spec, and a context (with memory when asked);
+     * {@code unavailableKernels} are kernels the fake device refuses to build.
+     */
+    private GpuForwardContext open(ModelSpec spec, boolean withMemory, String... unavailableKernels) {
+        backend = FakeComputeBackend.builder().strictLlmArgs(true)
+                .unavailableKernels(unavailableKernels).build();
         kernels = LlmKernels.open(backend);
         scratch = GpuScratch.forModel(backend, spec, UBATCH);
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
@@ -420,15 +425,37 @@ public class GpuLayerExecutorTest {
 
         exec.run(5, 1, GpuLayerExecutor.StepMode.DECODE, GpuLayerExecutor.TapSink.NONE);
 
-        List<String> expected = new ArrayList<>();
-        expected.addAll(preNormLayer("ATTENTION", 0));
-        expected.addAll(preNormLayer("ATTENTION", 1));
+        // each sub-block residual fuses with the row norm that reads the stream next: the FFN norm here,
+        // the next layer's attention norm across the layer boundary; the last residual runs alone
+        List<String> expected = Arrays.asList(
+                NORM, "mixer ATTENTION 0 decode NORMED->BRANCH", MIX_NORM, "ffn 0 NORMED->BRANCH", MIX_NORM,
+                "mixer ATTENTION 1 decode NORMED->BRANCH", MIX_NORM, "ffn 1 NORMED->BRANCH", MIX);
         assertEquals(expected, trace());
         assertNoHostSync(backend.ops());
         List<Dispatch> norms = dispatchesOf(NORM);
+        assertEquals(1, norms.size());
+        assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
+        List<Dispatch> mixNorms = dispatchesOf(MIX_NORM);
+        assertEquals(3, mixNorms.size());
+        assertTrue(uses(mixNorms.get(0), weightMap.get(blk(0, TensorNames.FFN_NORM))));
+        assertTrue(uses(mixNorms.get(1), weightMap.get(blk(1, TensorNames.ATTN_NORM))));
+        assertTrue(uses(mixNorms.get(2), weightMap.get(blk(1, TensorNames.FFN_NORM))));
+    }
+
+    @Test
+    public void withoutTheFusedKernelTheResidualAndNormRunAsSeparateLaunches() {
+        GpuForwardContext ctx = open(llama(1, null, null, MemoryKind.NONE), false, NormKernels.RESIDUAL_MIX_NORM);
+        GpuLayerExecutor exec = executor(ctx);
+        startTrace();
+
+        exec.run(5, 1, GpuLayerExecutor.StepMode.DECODE, GpuLayerExecutor.TapSink.NONE);
+
+        assertEquals(preNormLayer("ATTENTION", 0), trace());
+        assertNoHostSync(backend.ops());
+        assertEquals(0, dispatchesOf(MIX_NORM).size());
+        List<Dispatch> norms = dispatchesOf(NORM);
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
         assertTrue(uses(norms.get(1), weightMap.get(blk(0, TensorNames.FFN_NORM))));
-        assertTrue(uses(norms.get(3), weightMap.get(blk(1, TensorNames.FFN_NORM))));
     }
 
     @Test
@@ -439,8 +466,8 @@ public class GpuLayerExecutorTest {
 
         exec.run(0, 3, GpuLayerExecutor.StepMode.PREFILL, GpuLayerExecutor.TapSink.NONE);
 
-        assertEquals(Arrays.asList(NORM, "mixer ATTENTION 0 prefill 3 NORMED->BRANCH", MIX,
-                NORM, "ffn 0 NORMED->BRANCH", MIX), trace());
+        assertEquals(Arrays.asList(NORM, "mixer ATTENTION 0 prefill 3 NORMED->BRANCH", MIX_NORM,
+                "ffn 0 NORMED->BRANCH", MIX), trace());
     }
 
     @Test
@@ -464,13 +491,14 @@ public class GpuLayerExecutorTest {
 
         List<String> t = trace();
         assertEquals(2, t.stream().filter(s -> s.startsWith("tap ")).count());
-        assertEquals("tap 1 X 2x" + N_EMBD, t.get(6));
+        assertEquals("tap 1 X 2x" + N_EMBD, t.get(5));
         assertEquals("tap 2 X 2x" + N_EMBD, t.get(t.size() - 1));
     }
 
     @Test
     public void parallelResidualFeedsTheSharedNormToBothBlocksAndAddsBothBranches() {
-        NormSpec shared = NormSpec.builder(NormKind.RMS, RMS_EPS).attnNorm(true).sharedAttnNormForFfn(true).build();
+        NormSpec shared = NormSpec.builder(NormKind.RMS, RMS_EPS).attnNorm(true).ffnNorm(false)
+                .sharedAttnNormForFfn(true).build();
         ResidualSpec parallel = ResidualSpec.builder(ResidualKind.PARALLEL, N_EMBD).build();
         GpuForwardContext ctx = open(llama(1, parallel, shared, MemoryKind.NONE), false);
         GpuLayerExecutor exec = executor(ctx);
@@ -541,7 +569,11 @@ public class GpuLayerExecutorTest {
 
         List<String> expected = new ArrayList<>();
         expected.add(GpuOps.COPY2D);
-        expected.addAll(preNormLayer("ATTENTION", 0));
+        expected.add(NORM);
+        expected.add("mixer ATTENTION 0 decode NORMED->BRANCH");
+        expected.add(MIX_NORM);
+        expected.add("ffn 0 NORMED->BRANCH");
+        expected.add(MIX);
         expected.add(GpuOps.COPY2D);
         assertEquals(expected, trace());
     }
@@ -555,7 +587,12 @@ public class GpuLayerExecutorTest {
 
         exec.run(0, 1, GpuLayerExecutor.StepMode.DECODE, GpuLayerExecutor.TapSink.NONE);
 
-        assertEquals(preNormLayer("ATTENTION", 0), trace());
+        assertEquals(Arrays.asList(NORM, "mixer ATTENTION 0 decode NORMED->BRANCH", MIX_NORM,
+                "ffn 0 NORMED->BRANCH", MIX), trace());
+        for (Dispatch d : dispatchesOf(MIX_NORM)) {
+            assertTrue(d.args().contains(NormKernels.MixMode.SCALED.code()));
+            assertTrue(d.args().contains(0.25f));
+        }
         for (Dispatch d : dispatchesOf(MIX)) {
             assertTrue(d.args().contains(NormKernels.MixMode.SCALED.code()));
             assertTrue(d.args().contains(0.25f));
@@ -598,16 +635,27 @@ public class GpuLayerExecutorTest {
 
         List<String> expected = new ArrayList<>();
         for (int il = 0; il < 2; il++) {
-            expected.addAll(Arrays.asList(NORM, "mixer ATTENTION " + il + " decode NORMED->BRANCH", NORM, MIX,
-                    NORM, "ffn " + il + " NORMED->BRANCH", NORM, MIX));
+            // the attention norm is a plain launch on layer 0 and the previous FFN residual's fused form on layer 1
+            expected.add(il == 0 ? NORM : MIX_NORM);
+            expected.add("mixer ATTENTION " + il + " decode NORMED->BRANCH");
+            expected.add(NORM);
+            expected.add(MIX_NORM);
+            expected.add("ffn " + il + " NORMED->BRANCH");
+            expected.add(NORM);
         }
+        expected.add(MIX);
         assertEquals(expected, trace());
         assertNoHostSync(backend.ops());
         List<Dispatch> norms = dispatchesOf(NORM);
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
         assertTrue(uses(norms.get(1), weightMap.get(blk(0, TensorNames.ATTN_POST_NORM))));
-        assertTrue(uses(norms.get(2), weightMap.get(blk(0, TensorNames.FFN_NORM))));
-        assertTrue(uses(norms.get(3), weightMap.get(blk(0, TensorNames.FFN_POST_NORM))));
+        assertTrue(uses(norms.get(2), weightMap.get(blk(0, TensorNames.FFN_POST_NORM))));
+        assertTrue(uses(norms.get(3), weightMap.get(blk(1, TensorNames.ATTN_POST_NORM))));
+        assertTrue(uses(norms.get(4), weightMap.get(blk(1, TensorNames.FFN_POST_NORM))));
+        List<Dispatch> mixNorms = dispatchesOf(MIX_NORM);
+        assertTrue(uses(mixNorms.get(0), weightMap.get(blk(0, TensorNames.FFN_NORM))));
+        assertTrue(uses(mixNorms.get(1), weightMap.get(blk(1, TensorNames.ATTN_NORM))));
+        assertTrue(uses(mixNorms.get(2), weightMap.get(blk(1, TensorNames.FFN_NORM))));
     }
 
     @Test
@@ -645,15 +693,26 @@ public class GpuLayerExecutorTest {
         List<String> expected = new ArrayList<>();
         for (int il = 0; il < 4; il++) {
             String kind = il < 3 ? "GDN" : "ATTENTION";
-            expected.addAll(Arrays.asList(NORM, "mixer " + kind + " " + il + " prefill 3 NORMED->BRANCH", MIX,
-                    NORM, "ffn " + il + " NORMED->BRANCH", MIX));
+            // the attention norm is a plain launch on layer 0 and the previous FFN residual's fused form after it
+            expected.add(il == 0 ? NORM : MIX_NORM);
+            expected.add("mixer " + kind + " " + il + " prefill 3 NORMED->BRANCH");
+            // the mixer residual fuses with the FFN norm over post_attention_norm
+            expected.add(MIX_NORM);
+            expected.add("ffn " + il + " NORMED->BRANCH");
         }
+        expected.add(MIX);
         assertEquals(expected, trace());
         assertNoHostSync(backend.ops());
         List<Dispatch> norms = dispatchesOf(NORM);
+        assertEquals(1, norms.size());
+        assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
+        List<Dispatch> mixNorms = dispatchesOf(MIX_NORM);
+        assertEquals(7, mixNorms.size());
         for (int il = 0; il < 4; il++) {
-            assertTrue(uses(norms.get(2 * il), weightMap.get(blk(il, TensorNames.ATTN_NORM))));
-            assertTrue(uses(norms.get(2 * il + 1), weightMap.get(blk(il, TensorNames.ATTN_POST_NORM))));
+            assertTrue(uses(mixNorms.get(2 * il), weightMap.get(blk(il, TensorNames.ATTN_POST_NORM))));
+            if (il < 3) {
+                assertTrue(uses(mixNorms.get(2 * il + 1), weightMap.get(blk(il + 1, TensorNames.ATTN_NORM))));
+            }
         }
     }
 
@@ -698,8 +757,8 @@ public class GpuLayerExecutorTest {
         assertEquals(1, Collections.frequency(k, OpKind.READ));
         assertEquals(OpKind.FINISH, k.get(k.size() - 1));
         List<String> t = trace();
-        assertTrue(t.contains("mixer ATTENTION 0 prefill " + UBATCH + " NORMED->BRANCH"));
-        assertTrue(t.contains("mixer ATTENTION 0 prefill 2 NORMED->BRANCH"));
+        // 6 rows at a ubatch of 4 split into 2 steps of 3, not the greedy 4 and 2
+        assertEquals(2, Collections.frequency(t, "mixer ATTENTION 0 prefill 3 NORMED->BRANCH"));
         assertEquals(6, memory.sequence().nPast());
     }
 
@@ -730,7 +789,7 @@ public class GpuLayerExecutorTest {
             ids.add(f.featureId());
         }
         assertEquals(Arrays.asList(LayerSpec.Extras.EMBD_SKIP, LayerSpec.Extras.RESID_ALPHA_BETA,
-                LayerSpec.Extras.LOOP_NORM), ids);
+                LayerSpec.Extras.RESID_SCALE, LayerSpec.Extras.MUDD, LayerSpec.Extras.LOOP_NORM), ids);
         assertSame(BuiltInGpuExtras.factories(), BuiltInGpuExtras.factories());
     }
 }

@@ -1,0 +1,14 @@
+{#- llama.cpp rwkv-world chat template (src/llama-chat.cpp:616-630): a last user message always opens the assistant turn. -#}
+{%- for message in messages -%}
+    {%- set content = (message['content'] if message['content'] is string else '') | trim(' \t\n\v\f\r') -%}
+    {%- if message['role'] == 'system' -%}
+        {{- 'System: ' ~ content ~ '\n\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- 'User: ' ~ content ~ '\n\n' -}}
+        {%- if loop.last -%}
+            {{- 'Assistant:' -}}
+        {%- endif -%}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- 'Assistant: ' ~ content ~ '\n\n' -}}
+    {%- endif -%}
+{%- endfor -%}

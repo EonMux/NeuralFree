@@ -1,0 +1,226 @@
+/* moe_gemm_mma.comp - cooperative-matrix (tensor-core) MoE grouped GEMM over a QT_DECODE_ELEM weight
+ * decoder: the Vulkan twin of NF_GEMM_GROUPED_MMA (kernels/llm/moe_gemm_mma.cl, CUDA only) with the
+ * arguments, aligned-row layout and semantics of moe_gemm.comp / NF_GEMM_GROUPED
+ * (kernels/llm/common/matmul_grouped_family.h), which is the semantic reference.
+ * Requires: common/nf_common.glsl, common/quant_blocks.glsl, common/iq_tables.glsl and the decoder
+ * file that serves QTYPE.
+ *
+ * Variant rows (flagged sg, so the full-workgroup dispatch runs the __sg module with
+ * REQUIRE_FULL_SUBGROUPS), QTYPE=QT_<T>, and IND=1 for the expert-cache form:
+ *     Q4_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q4_K	sg
+ *     Q4_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q4_K IND=1	sg
+ * Every grouped weight type except F32 and BF16 has rows: BF16 experts keep the scalar
+ * moe_gemm.comp, because the fp16 operands of VK_KHR_cooperative_matrix cannot hold every bfloat16
+ * weight exactly, and F32 experts keep it as on CUDA.
+ *
+ * Arguments: those of moe_gemm.comp (and of its IND=1 form), bindings and push block identical.
+ *
+ * Compute: 16x16x16 f16*f16 -> f32 cooperative matrices per subgroup, the matrices of
+ * matmul_mma.comp. A workgroup of 256 invocations computes 64 weight rows of the tile's expert x the
+ * 32 aligned positions of one tile in 16-deep stages: every stage decodes its weight elements with
+ * qt_elem and converts them, and the activations of the tile's pairs, to fp16 in shared memory
+ * (invocation lid loads depth lid % 16 of rows lid / 16 + 16 q and positions lid / 16 + 16 j, so the
+ * global loads run along the reduction). The 8 output blocks of 16 rows x 16 positions are
+ * distributed cyclically over the workgroup's subgroups, so the kernel is correct for every
+ * full-subgroup size that divides 256. Products are fp16, accumulation fp32, so results differ from
+ * the scalar grouped GEMM by the operand rounding, as llama.cpp's ggml-vulkan mul_mm (COOPMAT) and
+ * the CUDA twin. Each block is staged column-major in shared memory and copied out per position, so
+ * the stores of a pair's rows are contiguous; fillers (gemm_token < 0) and rows past out_dim write
+ * nothing.
+ *
+ * Dispatch: 2-D (never folded), global = {ceil(out_dim / 64) * 256, n_tiles, 1}, local =
+ * {256, 1, 1}. Requires VK_KHR_cooperative_matrix, shaderFloat16, full subgroups and vulkanMemoryModel,
+ * which glslang declares for every cooperative-matrix module (the host selects
+ * these kernels only on a device reporting DeviceFeature.COOPERATIVE_MATRIX, and falls back to
+ * moe_gemm.comp when the pipeline cannot be created). Shared memory: a 64 x 24 and a 32 x 40 half
+ * tile, 8 * 16 * 16 stage floats, plus the IQ grid of the selected QTYPE (at most 8 KB).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+
+#include "common/nf_common.glsl"
+
+#ifndef QTYPE
+#error "moe_gemm_mma.comp requires QTYPE"
+#endif
+
+layout(std430, binding = 0) readonly buffer NfGmToken { int gemm_token[]; };
+layout(std430, binding = 1) readonly buffer NfGmSlot { int gemm_slot[]; };
+#ifdef IND
+layout(std430, binding = 2) readonly buffer NfGmMap { int map[]; };
+NF_BUFFER_VIEWS(3, w)
+layout(std430, binding = 4) readonly buffer NfGmInput { float x_in[]; };
+layout(std430, binding = 5) readonly buffer NfGmScales { float scales[]; };
+layout(std430, binding = 6) writeonly buffer NfGmOutput { float y_out[]; };
+layout(push_constant) uniform NfGmParams {
+    int out_dim; int in_dim; int n_tiles; int x_div; int x_stride; int in_off; int out_off;
+    int has_scale;
+} pc;
+#else
+NF_BUFFER_VIEWS(2, w)
+layout(std430, binding = 3) readonly buffer NfGmInput { float x_in[]; };
+layout(std430, binding = 4) readonly buffer NfGmScales { float scales[]; };
+layout(std430, binding = 5) writeonly buffer NfGmOutput { float y_out[]; };
+layout(push_constant) uniform NfGmParams {
+    int out_dim; int in_dim; int n_tiles; int x_div; int x_stride; int in_off; int out_off;
+    int has_scale; int expert_base; int expert_count;
+} pc;
+#endif
+
+#include "common/quant_blocks.glsl"
+#include "common/iq_tables.glsl"
+#include "common/quant_legacy.glsl"
+#include "common/quant_k.glsl"
+#include "common/quant_iq.glsl"
+#include "common/quant_new.glsl"
+#include "common/quant_ext.glsl"
+
+#if !defined(QT_DECODE_ELEM) || !defined(QT_BS) || !defined(QT_BB)
+#error "moe_gemm_mma.comp: no QT_DECODE_ELEM decoder serves QTYPE"
+#endif
+
+#define NF_GM_TM 64                           /* weight rows per workgroup tile */
+#define NF_GM_TN 32                           /* aligned positions per workgroup tile */
+#define NF_GM_TK 16                           /* reduction depth of one stage */
+#define NF_GM_CM 16                           /* cooperative-matrix edge (M = K = N = 16) */
+#define NF_GM_AS 24                           /* padded half stride of a weight-tile row */
+#define NF_GM_BS 40                           /* padded half stride of a position-tile row */
+#define NF_GM_RB (NF_GM_TM / NF_GM_CM)        /* 4 row blocks */
+#define NF_GM_CB (NF_GM_TN / NF_GM_CM)        /* 2 position blocks */
+#define NF_GM_BLOCKS (NF_GM_RB * NF_GM_CB)    /* 8 output blocks */
+#define NF_GM_RM (NF_GM_TM / NF_GM_TK)        /* 4 weight rows loaded per invocation */
+#define NF_GM_RN (NF_GM_TN / NF_GM_TK)        /* 2 positions loaded per invocation */
+
+shared float16_t nf_gm_a[NF_GM_TM * NF_GM_AS];
+shared float16_t nf_gm_b[NF_GM_TN * NF_GM_BS];
+shared float nf_gm_stage[NF_GM_BLOCKS * NF_GM_CM * NF_GM_CM];
+
+#ifndef IND
+/* True when expert e lies in the bound shard [expert_base, expert_base + expert_count). */
+bool nf_gm_in_shard(int e) {
+    return e >= pc.expert_base && e - pc.expert_base < pc.expert_count;
+}
+#endif
+
+/* Writes 0 to the outputs of the real positions of a tile whose pairs had an out-of-range id. */
+void nf_gm_zero(int tile, int m0, uint lid) {
+    for (uint i = lid; i < uint(NF_GM_TM * NF_GM_TN); i += 256u) {
+        const int r = m0 + int(i % uint(NF_GM_TM));
+        const int p = gemm_token[tile * NF_GM_TN + int(i / uint(NF_GM_TM))];
+        if (p >= 0 && r < pc.out_dim) {
+            y_out[uint(pc.out_off) + uint(p) * uint(pc.out_dim) + uint(r)] = 0.0;
+        }
+    }
+}
+
+void main() {
+    nf_iq_init_shared();
+
+    const uint lid = gl_LocalInvocationID.x;
+    const int out_dim = pc.out_dim;
+    const int in_dim = pc.in_dim;
+    const int tile = int(gl_WorkGroupID.y);
+    const int e = gemm_slot[tile * NF_GM_TN];
+    const int m0 = int(gl_WorkGroupID.x) * NF_GM_TM;
+
+    /* The slot is the workgroup's, so every return below is uniform. */
+    if (e < 0) {
+#ifndef IND
+        if (pc.expert_base != 0) {
+            return;
+        }
+#endif
+        nf_gm_zero(tile, m0, lid);
+        return;
+    }
+#ifdef IND
+    const int we = map[e];
+    if (we < 0) {
+        return;
+    }
+#else
+    if (!nf_gm_in_shard(e)) {
+        return;
+    }
+    const int we = e - pc.expert_base;
+#endif
+
+    const uint lk = lid % uint(NF_GM_TK);
+    const uint lr = lid / uint(NF_GM_TK);
+    const uint row_bytes = uint(in_dim / QT_BS) * uint(QT_BB);
+    const uint wbase = uint(we) * uint(out_dim) * row_bytes;
+    uint wrow[NF_GM_RM];
+    bool wok[NF_GM_RM];
+    [[unroll]] for (int q = 0; q < NF_GM_RM; ++q) {
+        const int r = m0 + int(lr) + NF_GM_TK * q;
+        wok[q] = r < out_dim;
+        wrow[q] = wbase + (wok[q] ? uint(r) * row_bytes : 0u);
+    }
+    uint xrow[NF_GM_RN];
+    bool xok[NF_GM_RN];
+    [[unroll]] for (int q = 0; q < NF_GM_RN; ++q) {
+        const int p = gemm_token[tile * NF_GM_TN + int(lr) + NF_GM_TK * q];
+        xok[q] = p >= 0;
+        xrow[q] = uint(pc.in_off) + (xok[q] ? uint(p / pc.x_div) * uint(pc.x_stride) : 0u);
+    }
+
+    const uint sgid = gl_SubgroupID;
+    const uint nsg = gl_NumSubgroups;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ca =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(float16_t(0.0));
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> cb =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(float16_t(0.0));
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NF_GM_BLOCKS];
+    for (uint b = 0u; b < uint(NF_GM_BLOCKS); ++b) {
+        acc[b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    for (int k0 = 0; k0 < in_dim; k0 += NF_GM_TK) {
+        const int k = k0 + int(lk);
+        const bool kok = k < in_dim;
+        [[unroll]] for (int q = 0; q < NF_GM_RM; ++q) {
+            nf_gm_a[(lr + uint(NF_GM_TK * q)) * uint(NF_GM_AS) + lk] =
+                float16_t((wok[q] && kok) ? qt_elem(NF_WS_A, wrow[q], uint(k)) : 0.0);
+        }
+        [[unroll]] for (int q = 0; q < NF_GM_RN; ++q) {
+            nf_gm_b[(lr + uint(NF_GM_TK * q)) * uint(NF_GM_BS) + lk] =
+                float16_t((xok[q] && kok) ? x_in[xrow[q] + uint(k)] : 0.0);
+        }
+        barrier();
+        /* block b: weight rows br * 16 .. of the A tile (row-major [row][depth]) against positions
+         * bc * 16 .. of the B tile, stored [position][depth], i.e. a column-major K x N matrix */
+        for (uint b = sgid; b < uint(NF_GM_BLOCKS); b += nsg) {
+            const uint br = b / uint(NF_GM_CB), bc = b % uint(NF_GM_CB);
+            coopMatLoad(ca, nf_gm_a, br * uint(NF_GM_CM * NF_GM_AS), uint(NF_GM_AS),
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(cb, nf_gm_b, bc * uint(NF_GM_CM * NF_GM_BS), uint(NF_GM_BS),
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            acc[b] = coopMatMulAdd(ca, cb, acc[b]);
+        }
+        barrier();
+    }
+
+    const float scale = pc.has_scale != 0 ? scales[e] : 1.0;
+    for (uint b = sgid; b < uint(NF_GM_BLOCKS); b += nsg) {
+        const int br = int(b / uint(NF_GM_CB)), bc = int(b % uint(NF_GM_CB));
+        /* column-major stage: element (row r, position c) at b * 256 + c * 16 + r */
+        coopMatStore(acc[b], nf_gm_stage, b * uint(NF_GM_CM * NF_GM_CM), uint(NF_GM_CM),
+                     gl_CooperativeMatrixLayoutColumnMajor);
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared,
+                       gl_SemanticsAcquireRelease);
+        for (uint i = gl_SubgroupInvocationID; i < uint(NF_GM_CM * NF_GM_CM); i += gl_SubgroupSize) {
+            const int r = m0 + br * NF_GM_CM + int(i % uint(NF_GM_CM));
+            const int p = gemm_token[tile * NF_GM_TN + bc * NF_GM_CM + int(i / uint(NF_GM_CM))];
+            if (p >= 0 && r < out_dim) {
+                y_out[uint(pc.out_off) + uint(p) * uint(out_dim) + uint(r)] =
+                    nf_gm_stage[b * uint(NF_GM_CM * NF_GM_CM) + i] * scale;
+            }
+        }
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared,
+                       gl_SemanticsAcquireRelease);
+    }
+}

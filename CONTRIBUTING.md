@@ -6,7 +6,7 @@ Thank you for helping improve NeuralFree. This page covers the build, the code s
 
 - **Bugs.** Open an issue with the NeuralFree commit, the JDK version, the operating system, the GPU and driver, the command or code you ran, and the full output. For the GGUF engine, also give the model file's name and quantization, and the `runLLMDemo` flags.
 - **Larger changes.** Open an issue describing the change before you write it, so that the approach can be agreed first. This applies in particular to new public API, new dependencies and changes to the kernel libraries.
-- **Known limitations.** [GAPS.md](GAPS.md) lists what the code refuses or does differently from llama.cpp and PyTorch; check it before reporting one of those as a bug.
+- **Known limitations.** The guides ([USAGE.md](USAGE.md), [LLM-INFERENCE.md](LLM-INFERENCE.md)) document what the code refuses or does differently from llama.cpp and PyTorch; check them before reporting one of those as a bug.
 
 ## Build
 
@@ -73,7 +73,7 @@ Run one class with `./gradlew test --tests 'com.eonmux.neuralfree.tensor.ShapeTe
 
 1. Fork the repository and create a branch from `main`.
 2. Keep each pull request to one change. Separate refactoring from behaviour changes.
-3. Update the documentation the change affects: the Javadoc, and the root guides (`USAGE.md`, `TRAINING.md`, `LLM-INFERENCE.md`, `GAPS.md`) when a flag, property, API or limitation changes.
+3. Update the documentation the change affects: the Javadoc, and the root guides (`README.md`, `QUICK-START.md`, `USAGE.md`, `TRAINING.md`, `LLM-INFERENCE.md`) when a flag, property, API or limitation changes.
 4. Make sure `./gradlew build` passes. For kernel changes, also run `./gradlew inventoryCheck verifyGpuKernels` with the toolchains you have, and say in the pull request which backends you tested on.
 5. Write commit messages as `<type>: <summary>`, with `type` one of `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `chore` or `ci`, and a body that explains why when the summary does not.
 6. Describe in the pull request what changed, why, and how you tested it.

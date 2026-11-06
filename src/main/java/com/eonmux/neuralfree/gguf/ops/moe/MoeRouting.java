@@ -39,6 +39,7 @@ public final class MoeRouting {
         private final GatingFunc gating;
         private final int nGroups;
         private final int nGroupUsed;
+        private final boolean perGroup;
         private final boolean normWeights;
         private final float weightsScale;
         private final boolean hasBias;
@@ -54,10 +55,12 @@ public final class MoeRouting {
          * @param selMode      {@link MoeKernels#SEL_PROBS}, {@link MoeKernels#SEL_RAW_LOGITS},
          *                     {@link MoeKernels#SEL_SIGMOID_LOGITS} or {@link MoeKernels#SEL_PRESELECTED}
          * @param idDiv        grovemoe chunk divisor of the selected ids; 0 disables it
+         * @param perGroup     select {@code k / nGroups} experts from every group (InternS1-Pro) instead of the
+         *                     {@code nGroupUsed} best groups
          * @throws IllegalArgumentException when the configuration is inconsistent
          */
         public Params(int nExpert, int k, GatingFunc gating, int nGroups, int nGroupUsed, boolean normWeights,
-                      float weightsScale, boolean hasBias, int selMode, int idDiv) {
+                      float weightsScale, boolean hasBias, int selMode, int idDiv, boolean perGroup) {
             this.gating = Objects.requireNonNull(gating, "gating");
             if (nExpert <= 0 || k <= 0 || k > nExpert) {
                 throw new IllegalArgumentException("router needs 0 < k <= n_expert, got k = " + k + ", n_expert = "
@@ -77,10 +80,15 @@ public final class MoeRouting {
                 throw new IllegalArgumentException("id divisor must be in [0, 2^24) with fewer than 2^24 experts, got "
                         + idDiv);
             }
+            if (perGroup && (groups <= 1 || k % groups != 0 || k / groups < 1)) {
+                throw new IllegalArgumentException("per-group top-k needs more than one group and a selected count"
+                        + " divisible by the group count, got " + k + " of " + groups);
+            }
             this.nExpert = nExpert;
             this.k = k;
             this.nGroups = groups;
             this.nGroupUsed = groups > 1 ? nGroupUsed : 1;
+            this.perGroup = perGroup;
             this.normWeights = normWeights;
             this.weightsScale = weightsScale;
             this.hasBias = hasBias;
@@ -98,8 +106,9 @@ public final class MoeRouting {
             if (spec.hashRouting()) {
                 return preselected(spec);
             }
-            return new Params(spec.nExpert(), spec.nUsed(), spec.gating(), spec.nGroups(), spec.nGroupUsed(),
-                    spec.normWeights(), spec.weightsScale(), spec.probBias(), spec.selectionMode().code(), 0);
+            return new Params(spec.nRouterExpert(), spec.nUsed(), spec.gating(), spec.nGroups(), spec.nGroupUsed(),
+                    spec.normWeights(), spec.weightsScale(), spec.probBias(), spec.selectionMode().code(), 0,
+                    spec.perGroupTopK());
         }
 
         /**
@@ -119,14 +128,32 @@ public final class MoeRouting {
                 throw new IllegalStateException("chunk experts with expert groups are not defined by llama.cpp: " + spec);
             }
             return new Params(spec.nExpert(), Math.min(spec.nUsed(), spec.nChunkExperts()), spec.gating(), 1, 1,
-                    spec.normWeights(), spec.weightsScale(), false, spec.selectionMode().code(), spec.idDiv());
+                    spec.normWeights(), spec.weightsScale(), false, spec.selectionMode().code(), spec.idDiv(), false);
+        }
+
+        /**
+         * The routed-expert pass of an embedding row on a {@link MoeSpec#mediaRouting()} layer
+         * (models/deepseek4.cpp:1290-1301): the router's own top-k with the spec's gating, groups and selection
+         * mode, {@code exp_probs_b_vl} as the selection bias when {@link MoeSpec#mediaProbBias()} and none
+         * otherwise (a hash layer has no {@code exp_probs_b}).
+         *
+         * @throws IllegalStateException when the spec routes embedding rows as token rows
+         */
+        public static Params forMedia(MoeSpec spec) {
+            Objects.requireNonNull(spec, "spec");
+            if (!spec.mediaRouting()) {
+                throw new IllegalStateException("MoE spec routes embedding rows as token rows: " + spec);
+            }
+            return new Params(spec.nExpert(), spec.nUsed(), spec.gating(), spec.nGroups(), spec.nGroupUsed(),
+                    spec.normWeights(), spec.weightsScale(), spec.mediaProbBias(), spec.selectionMode().code(), 0,
+                    spec.perGroupTopK());
         }
 
         /** Weights of given ids (hash-routed layers): selection, groups, bias and id division are skipped. */
         public static Params preselected(MoeSpec spec) {
             Objects.requireNonNull(spec, "spec");
             return new Params(spec.nExpert(), spec.nUsed(), spec.gating(), 1, 1, spec.normWeights(),
-                    spec.weightsScale(), false, MoeKernels.SEL_PRESELECTED, 0);
+                    spec.weightsScale(), false, MoeKernels.SEL_PRESELECTED, 0, false);
         }
 
         public int nExpert() { return nExpert; }
@@ -134,6 +161,7 @@ public final class MoeRouting {
         public GatingFunc gating() { return gating; }
         public int nGroups() { return nGroups; }
         public int nGroupUsed() { return nGroupUsed; }
+        public boolean perGroup() { return perGroup; }
         public boolean normWeights() { return normWeights; }
         public float weightsScale() { return weightsScale; }
         public boolean hasBias() { return hasBias; }
@@ -143,7 +171,7 @@ public final class MoeRouting {
         @Override
         public String toString() {
             return "MoeRouting.Params{experts=" + nExpert + ", k=" + k + ", gating=" + gating + ", groups=" + nGroups
-                    + "/" + nGroupUsed + ", norm=" + normWeights + ", scale=" + weightsScale + ", bias=" + hasBias
+                    + "/" + nGroupUsed + (perGroup ? " per-group" : "") + ", norm=" + normWeights + ", scale=" + weightsScale + ", bias=" + hasBias
                     + ", sel=" + selMode + ", idDiv=" + idDiv + '}';
         }
     }
@@ -192,6 +220,47 @@ public final class MoeRouting {
     }
 
     /**
+     * One selection of {@code nTokens} rows from two selections over disjoint row sets: row {@code rowsA[i]} takes
+     * row {@code i} of {@code a}, row {@code rowsB[i]} row {@code i} of {@code b} (a step whose token and embedding
+     * rows route differently).
+     *
+     * @throws IllegalArgumentException when the selections pick different counts, a row list does not match its
+     *                                  selection, or the rows do not cover {@code [0, nTokens)} exactly once
+     */
+    public static Selection merge(int nTokens, int[] rowsA, Selection a, int[] rowsB, Selection b) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        Objects.requireNonNull(rowsA, "rowsA");
+        Objects.requireNonNull(rowsB, "rowsB");
+        if (a.k != b.k || rowsA.length != a.nTokens() || rowsB.length != b.nTokens()
+                || rowsA.length + rowsB.length != nTokens) {
+            throw new IllegalArgumentException("cannot merge " + rowsA.length + " rows of k " + a.k + " and "
+                    + rowsB.length + " rows of k " + b.k + " into " + nTokens + " rows");
+        }
+        int k = a.k;
+        int[] ids = new int[nTokens * k];
+        float[] weights = new float[nTokens * k];
+        boolean[] filled = new boolean[nTokens];
+        place(rowsA, a, ids, weights, filled);
+        place(rowsB, b, ids, weights, filled);
+        return new Selection(k, ids, weights);
+    }
+
+    private static void place(int[] rows, Selection from, int[] ids, float[] weights, boolean[] filled) {
+        int k = from.k;
+        for (int i = 0; i < rows.length; i++) {
+            int r = rows[i];
+            if (r < 0 || r >= filled.length || filled[r]) {
+                throw new IllegalArgumentException("row " + r + " is outside [0, " + filled.length
+                        + ") or given twice");
+            }
+            filled[r] = true;
+            System.arraycopy(from.ids, i * k, ids, r * k, k);
+            System.arraycopy(from.weights, i * k, weights, r * k, k);
+        }
+    }
+
+    /**
      * Weights of given ids ({@code ids[t * k + j]}, e.g. from {@link MoeCombine#hashIds}); the ids are kept, an id
      * outside {@code [0, nExpert)} gets weight 0 before normalization, as in the kernel.
      */
@@ -213,6 +282,43 @@ public final class MoeRouting {
         return new Selection(p.k(), outIds, weights);
     }
 
+    /**
+     * The selection with its identity (zero-compute) experts taken out: an id at or above {@code nRealExperts} is
+     * remapped to expert 0 with weight 0, so the expert kernels never read a zero slot, and its weight is added to
+     * {@code zeroWeights[token]}. The identity contribution of a token is then {@code zeroWeights[token]} times its
+     * expert input, as vLLM's {@code zero_experts_compute_triton} accumulates it (fused_moe.py:1051-1126).
+     *
+     * @param nRealExperts the experts the expert tensors hold
+     * @param zeroWeights  receives one value per token of the selection
+     * @throws IllegalArgumentException when an id is outside the router width or a buffer is too small
+     */
+    public static Selection maskZeroExperts(Selection sel, int nRealExperts, float[] zeroWeights) {
+        Objects.requireNonNull(sel, "sel");
+        Objects.requireNonNull(zeroWeights, "zeroWeights");
+        int k = sel.k;
+        int n = sel.nTokens();
+        if (zeroWeights.length < n) {
+            throw new IllegalArgumentException("zero-expert weights must hold " + n + " values, got "
+                    + zeroWeights.length);
+        }
+        int[] ids = sel.ids.clone();
+        float[] weights = sel.weights.clone();
+        for (int t = 0; t < n; t++) {
+            float zero = 0.0f;
+            for (int j = 0; j < k; j++) {
+                int p = t * k + j;
+                int id = ids[p];
+                if (id >= nRealExperts) {
+                    zero += weights[p];
+                    ids[p] = 0;
+                    weights[p] = 0.0f;
+                }
+            }
+            zeroWeights[t] = zero;
+        }
+        return new Selection(k, ids, weights);
+    }
+
     private static void checkLogits(Params p, float[] logits, int nTokens) {
         Objects.requireNonNull(logits, "logits");
         if (nTokens < 0 || (long) nTokens * p.nExpert() > logits.length) {
@@ -231,10 +337,14 @@ public final class MoeRouting {
             System.arraycopy(given, t * p.k(), pick, 0, p.k());
         } else {
             float[] sel = selectionScores(p, logits, xb, probs, expProbsB);
-            if (p.nGroups() > 1) {
-                maskGroups(sel, p.nGroups(), p.nGroupUsed());
+            if (p.perGroup() && p.nGroups() > 1) {
+                topKPerGroup(sel, p.nGroups(), p.k() / p.nGroups(), pick);
+            } else {
+                if (p.nGroups() > 1) {
+                    maskGroups(sel, p.nGroups(), p.nGroupUsed());
+                }
+                topK(sel, pick);
             }
-            topK(sel, pick);
             if (p.idDiv() > 0) {
                 for (int j = 0; j < pick.length; j++) {
                     pick[j] = divId(pick[j], p.idDiv());
@@ -342,6 +452,44 @@ public final class MoeRouting {
         for (int e = 0; e < sel.length; e++) {
             if (!keep[e / nPer]) {
                 sel[e] = Float.NEGATIVE_INFINITY;
+            }
+        }
+    }
+
+    /**
+     * Per-group top-k (vLLM's InternS1-Pro router, {@code topk} over each group's slice): {@code perGroupK} rounds of
+     * arg-max inside every group, groups in index order, ties to the lower expert index.
+     *
+     * @throws IllegalArgumentException when the group count does not divide the expert or pick count
+     */
+    static void topKPerGroup(float[] sel, int nGroups, int perGroupK, int[] pick) {
+        int nExpert = sel.length;
+        if (nGroups <= 0 || nExpert % nGroups != 0 || pick.length != nGroups * perGroupK) {
+            throw new IllegalArgumentException("per-group top-k needs " + nGroups + " groups over " + nExpert
+                    + " experts picking " + pick.length);
+        }
+        int nPer = nExpert / nGroups;
+        boolean[] taken = new boolean[nExpert];
+        for (int g = 0; g < nGroups; g++) {
+            final int lo = g * nPer;
+            final int hi = lo + nPer;
+            for (int j = 0; j < perGroupK; j++) {
+                float bv = Float.NEGATIVE_INFINITY;
+                int bi = -1;
+                for (int e = lo; e < hi; e++) {
+                    if (taken[e]) {
+                        continue;
+                    }
+                    float v = key(sel[e]);
+                    if (better(v, e, bv, bi)) {
+                        bv = v;
+                        bi = e;
+                    }
+                }
+                pick[g * perGroupK + j] = bi;
+                if (bi >= 0) {
+                    taken[bi] = true;
+                }
             }
         }
     }

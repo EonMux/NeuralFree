@@ -29,7 +29,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <ul>
  *   <li><b>VRAM</b>: the device slots of
  *       {@link com.eonmux.neuralfree.gguf.gpu.weights.StreamingLayerWeightSource}.</li>
- *   <li><b>RAM</b>: this class's cache, bounded by {@code maxCacheBytes} ({@code neuralfree.ram.cache.mb}).</li>
+ *   <li><b>RAM</b>: this class's cache, bounded by {@code maxCacheBytes} ({@code neuralfree.ram.cache.mb};
+ *       {@link #ramCacheBytes(EngineConfig, long, long)} sizes the automatic value against the heap, the physical
+ *       RAM and the model, and a model larger than RAM runs with the cache off).</li>
  *   <li><b>Disk</b>: the {@link WeightStore} (mmap backed by the OS page cache).</li>
  * </ul>
  *
@@ -43,6 +45,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class WeightDataProvider implements AutoCloseable {
 
     private static final long MIB = 1024L * 1024L;
+    private static final double GIB = 1024.0 * 1024.0 * 1024.0;
     /** Prefetch window when the per-layer size is unknown. */
     private static final int DEFAULT_RAM_WINDOW = 20;
 
@@ -95,7 +98,7 @@ public final class WeightDataProvider implements AutoCloseable {
     public WeightDataProvider(WeightStore store, List<GGUFTensorInfo> tensors,
                               List<? extends List<String>> streamedByLayer, EngineConfig config) {
         this(store, tensors, streamedByLayer, Objects.requireNonNull(config, "config").vramDepth(),
-                ramCacheBytes(config));
+                ramCacheBytes(config, modelBytes(tensors)));
     }
 
     /**
@@ -175,22 +178,81 @@ public final class WeightDataProvider implements AutoCloseable {
     }
 
     /**
-     * Heap bytes of the RAM cache for a configuration: {@link EngineConfig#RAM_CACHE_AUTO} is half the maximum heap,
-     * 0 disables the cache, any other value is that many MiB.
+     * Heap bytes of the RAM cache for a configuration, with the model size unknown: as
+     * {@link #ramCacheBytes(EngineConfig, long)} with a model of 0 bytes.
      */
     public static long ramCacheBytes(EngineConfig config) {
+        return ramCacheBytes(config, 0L);
+    }
+
+    /**
+     * Heap bytes of the RAM cache for a configuration and a model, against the host's physical RAM: as
+     * {@link #ramCacheBytes(EngineConfig, long, long)} with {@link HostMemory#totalBytes()}.
+     */
+    public static long ramCacheBytes(EngineConfig config, long modelBytes) {
+        return ramCacheBytes(config, modelBytes, HostMemory.totalBytes());
+    }
+
+    /**
+     * Heap bytes of the RAM cache for a configuration, a model and a host (Avalon
+     * tools/server/server-context.cpp:1550-1566 sizes its prompt cache by the same comparison). An explicit
+     * {@link EngineConfig#ramCacheMb()} wins over every rule; it is returned as given, with a warning when it
+     * exceeds the maximum heap or physical RAM, since a heap cache larger than either competes with the page
+     * cache that holds the model. The automatic size:
+     * <ul>
+     *   <li>a model whose tensor bytes exceed the physical RAM (larger-than-RAM mode) disables the cache: the
+     *       model lives in the page cache of the {@link MappedWeightStore} mapping, and every heap byte evicts
+     *       model pages through direct reclaim;</li>
+     *   <li>otherwise half the maximum heap, capped at half of what the RAM holds beside the model, which the
+     *       page cache needs to keep the mapping resident.</li>
+     * </ul>
+     * An unknown physical RAM ({@code totalRamBytes <= 0}) falls back to the heap-only figure.
+     *
+     * @param modelBytes    storage bytes of the model's tensors; negative is refused
+     * @param totalRamBytes total physical RAM of the host, or &lt;= 0 when unknown
+     * @throws IllegalArgumentException when {@code modelBytes} is negative
+     */
+    public static long ramCacheBytes(EngineConfig config, long modelBytes, long totalRamBytes) {
+        if (modelBytes < 0) {
+            throw new IllegalArgumentException("model size must be >= 0 bytes, got " + modelBytes);
+        }
         long mb = Objects.requireNonNull(config, "config").ramCacheMb();
         long maxHeap = Runtime.getRuntime().maxMemory();
-        if (mb == EngineConfig.RAM_CACHE_AUTO) {
-            return maxHeap / 2;
+        if (mb != EngineConfig.RAM_CACHE_AUTO) {
+            long bytes = mb > Long.MAX_VALUE / MIB ? Long.MAX_VALUE : mb * MIB;
+            if (bytes > maxHeap) {
+                LogManager.getLogger(WeightDataProvider.class).warn(
+                        "{}={} MiB exceeds the maximum heap of {} MiB; the RAM cache may run the JVM out of memory",
+                        EngineConfig.PROP_RAM_CACHE_MB, mb, maxHeap / MIB);
+            } else if (totalRamBytes > 0 && bytes > totalRamBytes) {
+                LogManager.getLogger(WeightDataProvider.class).warn(
+                        "{}={} MiB exceeds physical RAM of {} MiB; the RAM cache evicts the page cache that holds"
+                                + " the model",
+                        EngineConfig.PROP_RAM_CACHE_MB, mb, totalRamBytes / MIB);
+            }
+            return bytes;
         }
-        long bytes = mb > Long.MAX_VALUE / MIB ? Long.MAX_VALUE : mb * MIB;
-        if (bytes > maxHeap) {
-            LogManager.getLogger(WeightDataProvider.class).warn(
-                    "{}={} MiB exceeds the maximum heap of {} MiB; the RAM cache may run the JVM out of memory",
-                    EngineConfig.PROP_RAM_CACHE_MB, mb, maxHeap / MIB);
+        if (totalRamBytes > 0 && modelBytes > totalRamBytes) {
+            LoggingUtil.getLogger(WeightDataProvider.class).info(
+                    "model ({} GiB) is larger than RAM ({} GiB): the RAM weight cache is disabled and the weights"
+                            + " stream from the mmap page cache, set {}=N to force it",
+                    modelBytes / GIB, totalRamBytes / GIB, EngineConfig.PROP_RAM_CACHE_MB);
+            return 0;
         }
-        return bytes;
+        long auto = maxHeap / 2;
+        if (totalRamBytes > 0) {
+            auto = Math.min(auto, Math.max(0, totalRamBytes - modelBytes) / 2);
+        }
+        return auto;
+    }
+
+    /** Storage bytes of every tensor of the model file. */
+    private static long modelBytes(List<GGUFTensorInfo> tensors) {
+        long total = 0;
+        for (GGUFTensorInfo t : Objects.requireNonNull(tensors, "tensors")) {
+            total += t.sizeInBytes();
+        }
+        return total;
     }
 
     /** Sets the number of layers resident in VRAM; the RAM prefetch window starts that many layers ahead. */

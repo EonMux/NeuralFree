@@ -31,7 +31,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertThrows;
 
 /**
- * The plugin SPI (AX-0): {@link Plugins#load} finds the providers declared in
+ * The plugin SPI: {@link Plugins#load} finds the providers declared in
  * {@code META-INF/services} once, sorted by class name, and the registries merge the provider rows with the
  * collision rule "providers never replace built-ins": every collision is rejected at registry-table build
  * with both sources named.
@@ -203,12 +203,20 @@ public class PluginsTest {
         assertFalse(HfArchRegistry.has(PLUGIN_HF_NAME, HfArchEntry.Kind.MMPROJ));
     }
 
-    /** The SPIs whose registries are built by later work packages load, empty until someone registers. */
+    /** The SPIs whose registries ship without providers load empty until someone registers. */
     @Test
     public void projectorsToolParsersAndReasoningParsersLoadEmpty() {
         assertTrue(Plugins.load(ProjectorProvider.class).isEmpty());
         assertTrue(Plugins.load(ToolParserProvider.class).isEmpty());
         assertTrue(Plugins.load(ReasoningParserProvider.class).isEmpty());
+    }
+
+    /** The logits-processor SPI loads its service provider (this test's one contributes no factory). */
+    @Test
+    public void logitsProcessorProvidersLoad() {
+        List<LogitsProcessorProvider> providers = Plugins.load(LogitsProcessorProvider.class);
+        assertEquals(1, providers.size());
+        assertEquals(EmptyLogitsProcessorProvider.class.getName(), providers.get(0).getClass().getName());
     }
 
     @Test

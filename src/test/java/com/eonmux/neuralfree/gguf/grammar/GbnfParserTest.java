@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -155,6 +156,30 @@ public class GbnfParserTest {
         assertEquals(List.of(element(GrammarElement.Type.TOKEN, 42),
                 element(GrammarElement.Type.TOKEN_NOT, 3),
                 element(GrammarElement.Type.END, 0)), parse("root ::= <[42]> !<[3]>"));
+    }
+
+    @Test
+    public void tokenSetShapes() {
+        assertEquals(List.of(element(GrammarElement.Type.TOKEN, 7),
+                element(GrammarElement.Type.TOKEN_ALT, 8),
+                element(GrammarElement.Type.TOKEN_NOT, 1),
+                element(GrammarElement.Type.TOKEN_ALT, 2),
+                element(GrammarElement.Type.TOKEN_ALT, 3),
+                element(GrammarElement.Type.END, 0)), parse("root ::= <[7],[8]> !<[1],[2],[3]>"));
+        parseFails("root ::= !<[1],>");
+        parseFails("root ::= <[1],[2]");
+    }
+
+    @Test
+    public void tokenSetsMatchAnyIdOrAnyOtherId() {
+        Grammar either = GbnfParser.parse("root ::= <[65],[66]>");
+        assertTrue(GrammarMatcher.matches(either, "A"));
+        assertTrue(GrammarMatcher.matches(either, "B"));
+        assertFalse(GrammarMatcher.matches(either, "C"));
+        Grammar neither = GbnfParser.parse("root ::= !<[65],[66]>+");
+        assertTrue(GrammarMatcher.matches(neither, "CDE"));
+        assertFalse(GrammarMatcher.matches(neither, "CAE"));
+        assertFalse(GrammarMatcher.matches(neither, "B"));
     }
 
     @Test

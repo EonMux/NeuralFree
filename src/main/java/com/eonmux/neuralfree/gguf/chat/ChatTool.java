@@ -8,8 +8,9 @@ import java.util.Objects;
 /**
  * A function tool definition a chat request offers the model, as the OpenAI ({@code tools})
  * and llama.cpp ({@code common_params.tools}, JSON-schema function definitions) shapes do:
- * a function {@code name}, an optional {@code description} and an optional {@code parameters}
- * JSON-schema object the arguments follow.
+ * a function {@code name}, an optional {@code description}, an optional {@code parameters}
+ * JSON-schema object the arguments follow and an optional {@code strict} flag saying the
+ * arguments are held to that schema ({@link com.eonmux.neuralfree.gguf.chat.tools.ToolRouting}).
  *
  * <p>{@link #templateObject()} renders the shape llama.cpp binds as an entry of the template's
  * {@code tools} list (common/chat.cpp apply_jinja), from which templates such as Qwen's write
@@ -21,11 +22,13 @@ public final class ChatTool {
     private final String name;
     private final String description;
     private final Map<String, Object> parameters;
+    private final Boolean strict;
 
     private ChatTool(Builder b) {
         this.name = b.name;
         this.description = b.description;
         this.parameters = b.parameters;
+        this.strict = b.strict;
     }
 
     /** Starts a definition for a function whose name is set later on the builder. */
@@ -52,6 +55,12 @@ public final class ChatTool {
         return parameters == null ? null : Collections.unmodifiableMap(chatCopyObject(parameters, name));
     }
 
+    /**
+     * Whether the arguments are held to {@link #parameters()} in the model's tool-call grammar
+     * (the OpenAI {@code strict} function flag); null when the request leaves it unset.
+     */
+    public Boolean strict() { return strict; }
+
     /** The map bound as one entry of the template's {@code tools} list ({@code tojson} input). */
     public Map<String, Object> templateObject() {
         Map<String, Object> fn = new LinkedHashMap<>();
@@ -66,7 +75,7 @@ public final class ChatTool {
 
     /** A new builder with this instance's values. */
     public Builder toBuilder() {
-        return new Builder().name(name).description(description).parameters(parameters);
+        return new Builder().name(name).description(description).parameters(parameters).strict(strict);
     }
 
     @Override
@@ -75,25 +84,28 @@ public final class ChatTool {
         ChatTool that = (ChatTool) o;
         return name.equals(that.name)
                 && Objects.equals(description, that.description)
-                && Objects.equals(parameters, that.parameters);
+                && Objects.equals(parameters, that.parameters)
+                && Objects.equals(strict, that.strict);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, description, parameters);
+        return Objects.hash(name, description, parameters, strict);
     }
 
     @Override
     public String toString() {
-        return "ChatTool(" + name + ", description=" + description + ", parameters=" + parameters + ")";
+        return "ChatTool(" + name + ", description=" + description + ", parameters=" + parameters
+                + ", strict=" + strict + ")";
     }
 
-    /** Builder of an immutable {@link ChatTool}; starts with no description and no parameters. */
+    /** Builder of an immutable {@link ChatTool}; starts with no description, no parameters and no strict flag. */
     public static final class Builder {
 
         private String name = null;
         private String description = null;
         private Map<String, Object> parameters = null;
+        private Boolean strict = null;
 
         private Builder() {}
 
@@ -121,6 +133,12 @@ public final class ChatTool {
          */
         public Builder parameters(Map<String, Object> parameters) {
             this.parameters = parameters == null ? null : chatCopyObject(parameters, name);
+            return this;
+        }
+
+        /** Sets the {@code strict} flag; null clears it (the OpenAI request may leave it unset). */
+        public Builder strict(Boolean strict) {
+            this.strict = strict;
             return this;
         }
 

@@ -247,13 +247,44 @@ public final class DenseTensorRequirementsLlama {
                 .build();
     }
 
-    /** qwen2.cpp:19-47 and qwen2vl.cpp:8-36; optional output bias. */
+    /**
+     * qwen2.cpp:19-47 and qwen2vl.cpp:8-36; optional output bias. The NextN blocks of a MiMo checkpoint
+     * ({@code mimo_mtp.py}) carry a decoder block of the same shape as the trunk's beside the NextN tensors, so the
+     * list repeats the block body on those layers and makes the {@code nextn.*} tensors optional.
+     */
     public static List<TensorRequirement> qwen2() {
         return DenseTensorRequirements.builder()
                 .tokenEmbd()
                 .model("output_norm.weight")
                 .outputOrTied()
                 .modelOptional("output.bias")
+                .modelOptional("cls.weight", "cls.bias", "cls.output.weight", "cls.output.bias")
+                .layer("attn_norm.weight")
+                .qkv()
+                .layer("attn_output.weight", "ffn_norm.weight")
+                .gatedFfn()
+                .layerWhen(TensorRequirement.NEXTN, "attn_norm.weight")
+                .qkvWhen(TensorRequirement.NEXTN)
+                .layerWhen(TensorRequirement.NEXTN, "attn_output.weight", "ffn_norm.weight")
+                .layerWhen(TensorRequirement.NEXTN, "ffn_gate.weight", "ffn_down.weight", "ffn_up.weight")
+                .layerOptionalWhen(TensorRequirement.NEXTN, "nextn.eh_proj.weight", "nextn.enorm.weight",
+                        "nextn.hnorm.weight", "nextn.shared_head_norm.weight", "nextn.embed_tokens.weight",
+                        "nextn.shared_head_head.weight")
+                .build();
+    }
+
+    /**
+     * qwen2vl: the qwen2 list plus the optional two-layer classifier head of the jina_vl reranker
+     * ({@code JinaVLForRanking}'s {@code score.0} / {@code score.2}, written as {@code cls} and {@code cls.output}
+     * by the Hugging Face loader), which RANK pooling runs.
+     */
+    public static List<TensorRequirement> qwen2vl() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("output_norm.weight")
+                .outputOrTied()
+                .modelOptional("output.bias")
+                .modelOptional("cls.weight", "cls.bias", "cls.output.weight", "cls.output.bias")
                 .layer("attn_norm.weight")
                 .qkv()
                 .layer("attn_output.weight", "ffn_norm.weight")
@@ -338,6 +369,48 @@ public final class DenseTensorRequirementsLlama {
                 .layer("attn_norm.weight")
                 .qkv()
                 .layer("attn_output.weight", "ffn_norm.weight", "ffn_up.weight", "ffn_down.weight")
+                .build();
+    }
+
+    /**
+     * HyperCLOVAX: the Llama layout with optional attention and MLP biases, the
+     * {@code post_attention_norm}/{@code post_ffw_norm} norms of each sub-layer output and the untied output head.
+     */
+    public static List<TensorRequirement> hyperclovax() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("output_norm.weight")
+                .outputOrTied()
+                .layer("attn_norm.weight")
+                .qkv()
+                .layer("attn_output.weight")
+                .layerOptional("attn_output.bias")
+                .layer("post_attention_norm.weight")
+                .layer("ffn_norm.weight")
+                .gatedFfn()
+                .layerOptional("ffn_gate.bias", "ffn_up.bias", "ffn_down.bias")
+                .layer("post_ffw_norm.weight")
+                .build();
+    }
+
+    /**
+     * DomynEdge: Qwen2 with the {@code post_attention_norm}/{@code post_ffw_norm} sandwich norms and a per-head RMS
+     * norm on K; the checkpoint's Q norm carries no weight, so the layer lists no {@code attn_q_norm} weight and the
+     * graph normalizes Q weightlessly.
+     */
+    public static List<TensorRequirement> domynEdge() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("output_norm.weight")
+                .outputOrTied()
+                .layer("attn_norm.weight")
+                .qkv()
+                .layer("attn_k_norm.weight")
+                .layer("attn_output.weight")
+                .layer("post_attention_norm.weight")
+                .layer("ffn_norm.weight")
+                .gatedFfn()
+                .layer("post_ffw_norm.weight")
                 .build();
     }
 }

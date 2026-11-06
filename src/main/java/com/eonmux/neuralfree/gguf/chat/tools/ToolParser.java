@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.chat.tools;
 
+import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.chat.ChatTool;
 
 import java.util.List;
@@ -45,5 +46,16 @@ public interface ToolParser {
 
         /** A parser over the request's tools (their schemas type the argument values); never null. */
         ToolParser create(List<ChatTool> tools);
+
+        /**
+         * The factory for a loaded model, whose tokenizer may decide the format's markers (the Hunyuan
+         * structural-token suffix of {@code hy_v3} / {@code hy_v4}, read from the vocabulary as vLLM reads it from
+         * the tokenizer); this factory by default.
+         *
+         * @throws IllegalArgumentException when the model cannot serve the format, naming what it lacks
+         */
+        default Factory forModel(GGUFTokenizer tokenizer) {
+            return this;
+        }
     }
 }

@@ -22,10 +22,23 @@ public class BackendEquivalencyTest {
     private static OclComputeBackend openCLBackend;
     private static CudaComputeBackend cudaBackend;
     private static VkComputeBackend vulkanBackend;
+    /** True once setUp ran its OpenCL block, so a failed initialization is not re-enumerated per method. */
+    private static boolean openClEnumerated = false;
 
     private static boolean openCLAvailable = false;
     private static boolean cudaAvailable = false;
     private static boolean vulkanAvailable = false;
+
+    /** GpuEvents of the current test method; each holds a driver event until it is closed in tearDown. */
+    private static final List<GpuEvent> pendingEvents = new ArrayList<>();
+
+    /** Registers an event for release in tearDown, so no cl_event or driver event outlives the method. */
+    private static GpuEvent track(GpuEvent event) {
+        if (event != null) {
+            pendingEvents.add(event);
+        }
+        return event;
+    }
 
     private final List<EquivalencyResult> results = new ArrayList<>();
 
@@ -216,10 +229,11 @@ public class BackendEquivalencyTest {
     @Before
     public void setUp() {
         results.clear();
-        
-        if (openCLBackend == null) {
+
+        if (!openClEnumerated) {
             try {
                 hwAccel = new HWAcceleration();
+                openClEnumerated = true;
                 if (!hwAccel.getCLDevices().isEmpty()) {
                     CLDevice clDevice = hwAccel.getCLDevices().get(0);
                     openCLBackend = new OclComputeBackend(clDevice);
@@ -232,17 +246,27 @@ public class BackendEquivalencyTest {
         }
 
         if (cudaBackend == null) {
+            HWAcceleration hwAccelCuda = null;
             try {
-                HWAcceleration hwAccelCuda = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
+                hwAccelCuda = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
                 if (!hwAccelCuda.getCUDevices().isEmpty()) {
                     CUDevice cuDevice = hwAccelCuda.getCUDevices().get(0);
                     cudaBackend = new CudaComputeBackend(cuDevice);
                     cudaAvailable = true;
                     System.out.println("CUDA backend initialized: " + cudaBackend.capabilities().getDeviceName());
                 }
-                hwAccelCuda.shutdown();
             } catch (Throwable e) {
                 System.out.println("CUDA initialization failed: " + e.getMessage());
+            } finally {
+                // The backend holds its own primary-context retain, so the enumeration can be released
+                // whether or not the backend was created.
+                if (hwAccelCuda != null) {
+                    try {
+                        hwAccelCuda.shutdown();
+                    } catch (Throwable e) {
+                        System.out.println("CUDA enumeration shutdown failed: " + e.getMessage());
+                    }
+                }
             }
         }
 
@@ -260,6 +284,13 @@ public class BackendEquivalencyTest {
     @After
     public void tearDown() {
         results.forEach(r -> completedTests.add(r.testName + "_" + r.matrixSize));
+        for (GpuEvent event : pendingEvents) {
+            try {
+                event.close();
+            } catch (Throwable ignored) {
+            }
+        }
+        pendingEvents.clear();
     }
 
     @AfterClass
@@ -560,18 +591,18 @@ public class BackendEquivalencyTest {
             ComputeQueue tQueue = backend.transferQueue();
             ComputeQueue cQueue = backend.computeQueue();
 
-            tQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a);
-            tQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b);
+            track(tQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a));
+            track(tQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b));
             tQueue.finish();
 
             Object[] args = new Object[]{bufferA, bufferB, bufferC, size};
             int localSize = Math.min(64, size);
             int globalSize = ((size + localSize - 1) / localSize) * localSize;
-            cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args);
+            track(cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args));
             cQueue.finish();
 
             float[] result = new float[size];
-            cQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result);
+            track(cQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result));
             cQueue.finish();
 
             return result;
@@ -592,17 +623,17 @@ public class BackendEquivalencyTest {
             ComputeQueue tQueue = backend.transferQueue();
             ComputeQueue cQueue = backend.computeQueue();
 
-            tQueue.enqueueWriteBuffer(buffer, 0, bufferSize, data);
+            track(tQueue.enqueueWriteBuffer(buffer, 0, bufferSize, data));
             tQueue.finish();
 
             Object[] args = new Object[]{buffer, factor, size};
             int localSize = Math.min(64, size);
             int globalSize = ((size + localSize - 1) / localSize) * localSize;
-            cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args);
+            track(cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args));
             cQueue.finish();
 
             float[] result = new float[size];
-            cQueue.enqueueReadBuffer(buffer, 0, bufferSize, result);
+            track(cQueue.enqueueReadBuffer(buffer, 0, bufferSize, result));
             cQueue.finish();
 
             return result;
@@ -622,8 +653,8 @@ public class BackendEquivalencyTest {
             ComputeQueue tQueue = backend.transferQueue();
             ComputeQueue cQueue = backend.computeQueue();
 
-            tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A);
-            tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B);
+            track(tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A));
+            track(tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B));
             tQueue.finish();
 
             Object[] args = new Object[]{bufferA, bufferB, bufferC, M, K, N};
@@ -631,11 +662,11 @@ public class BackendEquivalencyTest {
             if (blockSize < 1) blockSize = 1;
             int gridX = ((M + blockSize - 1) / blockSize) * blockSize;
             int gridY = ((N + blockSize - 1) / blockSize) * blockSize;
-            cQueue.enqueueKernel(kernel, new long[]{gridX, gridY}, new long[]{blockSize, blockSize}, args);
+            track(cQueue.enqueueKernel(kernel, new long[]{gridX, gridY}, new long[]{blockSize, blockSize}, args));
             cQueue.finish();
 
             float[] result = new float[M * N];
-            cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result);
+            track(cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result));
             cQueue.finish();
 
             return result;
@@ -658,18 +689,18 @@ public class BackendEquivalencyTest {
             ComputeQueue tQueue = vulkanBackend.transferQueue();
             ComputeQueue cQueue = vulkanBackend.computeQueue();
 
-            tQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a);
-            tQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b);
+            track(tQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a));
+            track(tQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b));
             tQueue.finish();
 
             Object[] args = new Object[]{bufferA, bufferB, bufferC, size};
             int localSize = Math.min(64, size);
             int globalSize = ((size + localSize - 1) / localSize) * localSize;
-            cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args);
+            track(cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args));
             cQueue.finish();
 
             float[] result = new float[size];
-            cQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result);
+            track(cQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result));
             cQueue.finish();
 
             return result;
@@ -690,17 +721,17 @@ public class BackendEquivalencyTest {
             ComputeQueue tQueue = vulkanBackend.transferQueue();
             ComputeQueue cQueue = vulkanBackend.computeQueue();
 
-            tQueue.enqueueWriteBuffer(buffer, 0, bufferSize, data);
+            track(tQueue.enqueueWriteBuffer(buffer, 0, bufferSize, data));
             tQueue.finish();
 
             Object[] args = new Object[]{buffer, factor, size};
             int localSize = Math.min(64, size);
             int globalSize = ((size + localSize - 1) / localSize) * localSize;
-            cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args);
+            track(cQueue.enqueueKernel(kernel, new long[]{globalSize}, new long[]{localSize}, args));
             cQueue.finish();
 
             float[] result = new float[size];
-            cQueue.enqueueReadBuffer(buffer, 0, bufferSize, result);
+            track(cQueue.enqueueReadBuffer(buffer, 0, bufferSize, result));
             cQueue.finish();
 
             return result;
@@ -720,8 +751,8 @@ public class BackendEquivalencyTest {
             ComputeQueue tQueue = vulkanBackend.transferQueue();
             ComputeQueue cQueue = vulkanBackend.computeQueue();
 
-            tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A);
-            tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B);
+            track(tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A));
+            track(tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B));
             tQueue.finish();
 
             Object[] args = new Object[]{bufferA, bufferB, bufferC, M, K, N};
@@ -729,11 +760,11 @@ public class BackendEquivalencyTest {
             if (blockSize < 1) blockSize = 1;
             int globalCols = ((N + blockSize - 1) / blockSize) * blockSize;
             int globalRows = ((M + blockSize - 1) / blockSize) * blockSize;
-            cQueue.enqueueKernel(kernel, new long[]{globalCols, globalRows}, new long[]{blockSize, blockSize}, args);
+            track(cQueue.enqueueKernel(kernel, new long[]{globalCols, globalRows}, new long[]{blockSize, blockSize}, args));
             cQueue.finish();
 
             float[] result = new float[M * N];
-            cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result);
+            track(cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result));
             cQueue.finish();
 
             return result;
@@ -894,56 +925,68 @@ public class BackendEquivalencyTest {
         Map<ComputeBackend.BackendType, float[]> roundTripResults = new EnumMap<>(ComputeBackend.BackendType.class);
 
         if (openCLAvailable) {
+            GpuBuffer buffer = null;
             try {
-                GpuBuffer buffer = openCLBackend.allocateBuffer(size * Float.BYTES);
-                openCLBackend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+                buffer = openCLBackend.allocateBuffer(size * Float.BYTES);
+                track(openCLBackend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data));
                 openCLBackend.transferQueue().finish();
 
                 float[] result = new float[size];
-                openCLBackend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+                track(openCLBackend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result));
                 openCLBackend.transferQueue().finish();
-                buffer.close();
 
                 roundTripResults.put(ComputeBackend.BackendType.OPENCL, result);
                 assertTrue("OpenCL buffer round-trip should preserve data", compareArrays(data, result, "OpenCL round-trip"));
             } catch (Exception e) {
                 System.out.println("OpenCL buffer round-trip failed: " + e.getMessage());
+            } finally {
+                if (buffer != null) {
+                    buffer.close();
+                }
             }
         }
 
         if (cudaAvailable) {
+            GpuBuffer buffer = null;
             try {
-                GpuBuffer buffer = cudaBackend.allocateBuffer(size * Float.BYTES);
-                cudaBackend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+                buffer = cudaBackend.allocateBuffer(size * Float.BYTES);
+                track(cudaBackend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data));
                 cudaBackend.transferQueue().finish();
 
                 float[] result = new float[size];
-                cudaBackend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+                track(cudaBackend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result));
                 cudaBackend.transferQueue().finish();
-                buffer.close();
 
                 roundTripResults.put(ComputeBackend.BackendType.CUDA, result);
                 assertTrue("CUDA buffer round-trip should preserve data", compareArrays(data, result, "CUDA round-trip"));
             } catch (Exception e) {
                 System.out.println("CUDA buffer round-trip failed: " + e.getMessage());
+            } finally {
+                if (buffer != null) {
+                    buffer.close();
+                }
             }
         }
 
         if (vulkanAvailable) {
+            GpuBuffer buffer = null;
             try {
-                GpuBuffer buffer = vulkanBackend.allocateBuffer(size * Float.BYTES);
-                vulkanBackend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+                buffer = vulkanBackend.allocateBuffer(size * Float.BYTES);
+                track(vulkanBackend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data));
                 vulkanBackend.transferQueue().finish();
 
                 float[] result = new float[size];
-                vulkanBackend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+                track(vulkanBackend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result));
                 vulkanBackend.transferQueue().finish();
-                buffer.close();
 
                 roundTripResults.put(ComputeBackend.BackendType.VULKAN, result);
                 assertTrue("Vulkan buffer round-trip should preserve data", compareArrays(data, result, "Vulkan round-trip"));
             } catch (Exception e) {
                 System.out.println("Vulkan buffer round-trip failed: " + e.getMessage());
+            } finally {
+                if (buffer != null) {
+                    buffer.close();
+                }
             }
         }
 

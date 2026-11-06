@@ -1,0 +1,279 @@
+/* cert_rescore.comp - certified exact-argmax rescore of one hidden row against the stored head rows.
+ * GLSL twin of the LLM_CertRescore_* kernels in kernels/llm/cert_argmax.cl. Requires:
+ * common/nf_common.glsl, common/quant_blocks.glsl.
+ *
+ * Variants rows (WT selects the stored weight layout the OpenCL kernel reads):
+ *     LLM_CertRescore_F16	cert_rescore.comp	OP=OP_CERT_RESCORE WT=WT_F16
+ *     LLM_CertRescore_BF16	cert_rescore.comp	OP=OP_CERT_RESCORE WT=WT_BF16
+ *     LLM_CertRescore_Q8_0	cert_rescore.comp	OP=OP_CERT_RESCORE WT=WT_Q8_0
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_CERT_RESCORE  (i vocab, i cols, i n_rows, i kmax, f ebmax, R weight, R float bounds,
+ *                     R float hidden, R float screened, W int ids)
+ *              ids[row] is the greedy id of hidden row `row`: the first maximum of the exact
+ *              logits, decided from the screen values `screened` under the per-row error bounds
+ *              `bounds` (kernels/llm/cert_argmax.cl). One workgroup per row: global = n_rows
+ *              rounded up to L. A row with more candidates than kmax, or none, rescores every row.
+ *
+ * The row dot arithmetic repeats the OpenCL matvec helpers (nf_mvf16_partial, nf_mvbf16_partial,
+ * nf_mvq8_row_partial): F16/BF16 take the float4 prefix and scalar tail of the row, Q8_0 the
+ * (block, ltid) mapping with Q8_0_THREADS_PER_BLOCK adjacent invocations sharing a block.
+ * Certification holds for every accumulation order (the bound is a norm product); ties resolve to
+ * the lower token id, so the atomic gather order cannot change the result.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#define NF_WEIGHT_STREAMS 1
+NF_BUFFER_VIEWS(0, w)
+
+#define OP_CERT_RESCORE 133
+#define WT_F16 1
+#define WT_BF16 2
+#define WT_Q8_0 3
+
+#if !defined(OP) || OP != OP_CERT_RESCORE || !defined(WT)
+#error "cert_rescore.comp requires OP=OP_CERT_RESCORE and WT"
+#endif
+#if WT != WT_F16 && WT != WT_BF16 && WT != WT_Q8_0
+#error "cert_rescore.comp: WT must be WT_F16, WT_BF16 or WT_Q8_0"
+#endif
+
+layout(std430, binding = 1) readonly buffer NfCrBounds { float bounds_in[]; };
+layout(std430, binding = 2) readonly buffer NfCrHidden { float hidden_in[]; };
+layout(std430, binding = 3) readonly buffer NfCrScreen { float screen_in[]; };
+layout(std430, binding = 4) writeonly buffer NfCrIds { int ids_out[]; };
+layout(push_constant) uniform NfCrParams { int vocab; int cols; int n_rows; int kmax; float ebmax; } pc;
+
+#include "common/quant_blocks.glsl"
+
+#ifndef CERT_KMAX
+#define CERT_KMAX 256
+#endif
+
+#define NF_Q8_0_TPS 4   /* Q8_0_THREADS_PER_BLOCK (kernels/llm/common/config.h) */
+
+/* Relative tie slack: one ulp of the f32 logit format (both powers of two, so exact). */
+#define NF_CERT_TIE_REL (1.0 / 8388608.0)
+
+/* Index sentinel of a candidate that holds no element. */
+#define NF_CERT_NONE 0x7fffffff
+
+shared float nf_cr_scratch[gl_WorkGroupSize.x];
+shared float nf_cr_best_v[gl_WorkGroupSize.x];
+shared int nf_cr_best_i[gl_WorkGroupSize.x];
+shared int nf_cr_cand[CERT_KMAX];
+shared int nf_cr_cnt;
+
+/* Smallest power of two >= the local size; the tree folds the upper half with a bounds check. */
+uint nf_cr_span() {
+    const uint n = gl_WorkGroupSize.x;
+    return n <= 1u ? 1u : (1u << uint(findMSB(n - 1u) + 1));
+}
+
+/* True when candidate (v, i) beats (bv, bi), as nf_argmax_better (kernels/llm/sampling.cl): the NaN
+ * test reads the bit pattern, since Vulkan leaves NaN operands undefined without
+ * SignedZeroInfNanPreserve. */
+bool nf_cert_better(float v, int i, float bv, int bi) {
+    const bool is_nan_v = (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u;
+    const bool is_nan_b = (floatBitsToUint(bv) & 0x7fffffffu) > 0x7f800000u;
+    if (is_nan_v) {
+        return is_nan_b && i < bi;
+    }
+    if (is_nan_b) {
+        return true;
+    }
+    return v > bv || (v == bv && i < bi);
+}
+
+/* This invocation's share of dot(weight row v, the hidden row at xbase) for an F16 row. */
+float nf_cert_f16_partial(uint v, uint xbase) {
+    const uint cols = uint(pc.cols);
+    const uint base = v * cols;
+    const uint n4 = cols & ~3u;
+    float ps = 0.0;
+    for (uint j = gl_LocalInvocationID.x * 4u; j < n4; j += gl_WorkGroupSize.x * 4u) {
+        const vec4 wv = vec4(
+            nf_half(nf_w_u16(NF_WS_A, base + 2u * j)),
+            nf_half(nf_w_u16(NF_WS_A, base + 2u * j + 2u)),
+            nf_half(nf_w_u16(NF_WS_A, base + 2u * j + 4u)),
+            nf_half(nf_w_u16(NF_WS_A, base + 2u * j + 6u)));
+        const vec4 xv = vec4(hidden_in[xbase + j], hidden_in[xbase + j + 1u],
+                             hidden_in[xbase + j + 2u], hidden_in[xbase + j + 3u]);
+        ps += dot(wv, xv);
+    }
+    for (uint j = n4 + gl_LocalInvocationID.x; j < cols; j += gl_WorkGroupSize.x) {
+        ps += nf_half(nf_w_u16(NF_WS_A, base + 2u * j)) * hidden_in[xbase + j];
+    }
+    return ps;
+}
+
+/* nf_cert_f16_partial for a BF16 row. */
+float nf_cert_bf16_partial(uint v, uint xbase) {
+    const uint cols = uint(pc.cols);
+    const uint base = v * cols;
+    const uint n4 = cols & ~3u;
+    float ps = 0.0;
+    for (uint j = gl_LocalInvocationID.x * 4u; j < n4; j += gl_WorkGroupSize.x * 4u) {
+        const vec4 wv = vec4(
+            nf_bf16(nf_w_u16(NF_WS_A, base + 2u * j)),
+            nf_bf16(nf_w_u16(NF_WS_A, base + 2u * j + 2u)),
+            nf_bf16(nf_w_u16(NF_WS_A, base + 2u * j + 4u)),
+            nf_bf16(nf_w_u16(NF_WS_A, base + 2u * j + 6u)));
+        const vec4 xv = vec4(hidden_in[xbase + j], hidden_in[xbase + j + 1u],
+                             hidden_in[xbase + j + 2u], hidden_in[xbase + j + 3u]);
+        ps += dot(wv, xv);
+    }
+    for (uint j = n4 + gl_LocalInvocationID.x; j < cols; j += gl_WorkGroupSize.x) {
+        ps += nf_bf16(nf_w_u16(NF_WS_A, base + 2u * j)) * hidden_in[xbase + j];
+    }
+    return ps;
+}
+
+/* This invocation's share of dot(weight row v, the hidden row at xbase) for a Q8_0 row:
+ * Q8_0_THREADS_PER_BLOCK adjacent invocations share each 32-element block, 8 consecutive
+ * elements each, as nf_mvq8_row_partial (kernels/llm/matvec_q8_0.cl). */
+float nf_cert_q8_partial(uint v, uint xbase) {
+    const uint nblk = uint(pc.cols) / uint(NF_Q8_0_BS);
+    const uint rbase = v * nblk * uint(NF_Q8_0_BB);
+    const uint gpi = gl_WorkGroupSize.x / uint(NF_Q8_0_TPS);
+    const uint sub = gl_LocalInvocationID.x % uint(NF_Q8_0_TPS);
+    float ps = 0.0;
+    for (uint b = gl_LocalInvocationID.x / uint(NF_Q8_0_TPS); b < nblk; b += gpi) {
+        const uint bp = rbase + b * uint(NF_Q8_0_BB);
+        const uint e = sub * 8u;
+        const uint xb = xbase + b * uint(NF_Q8_0_BS) + e;
+        const float s = dot(vec4(hidden_in[xb], hidden_in[xb + 1u], hidden_in[xb + 2u], hidden_in[xb + 3u]),
+                            vec4(nf_w_i8x4(NF_WS_A, bp + 2u + e)))
+                      + dot(vec4(hidden_in[xb + 4u], hidden_in[xb + 5u], hidden_in[xb + 6u], hidden_in[xb + 7u]),
+                            vec4(nf_w_i8x4(NF_WS_A, bp + 6u + e)));
+        ps += s * nf_w_f16(NF_WS_A, bp);
+    }
+    return ps;
+}
+
+#if WT == WT_F16
+#define NF_CERT_PARTIAL(v, xbase) nf_cert_f16_partial((v), (xbase))
+#elif WT == WT_BF16
+#define NF_CERT_PARTIAL(v, xbase) nf_cert_bf16_partial((v), (xbase))
+#else
+#define NF_CERT_PARTIAL(v, xbase) nf_cert_q8_partial((v), (xbase))
+#endif
+
+/* dot(weight row v, the hidden row at xbase) reduced over the workgroup; every invocation calls it,
+ * in uniform control flow, and every invocation receives the value. */
+float nf_cert_wg_dot(uint v, uint xbase) {
+    nf_cr_scratch[gl_LocalInvocationID.x] = NF_CERT_PARTIAL(v, xbase);
+    barrier();
+    for (uint s = nf_cr_span() >> 1; s > 0u; s >>= 1) {
+        if (gl_LocalInvocationID.x < s && gl_LocalInvocationID.x + s < gl_WorkGroupSize.x) {
+            nf_cr_scratch[gl_LocalInvocationID.x] += nf_cr_scratch[gl_LocalInvocationID.x + s];
+        }
+        barrier();
+    }
+    const float r = nf_cr_scratch[0];
+    barrier();
+    return r;
+}
+
+/* In-place reduction of nf_cr_scratch into element 0 (max); the caller writes nf_cr_scratch[lid]
+ * and issues a barrier first, and every invocation receives the result. */
+float nf_cert_wg_max() {
+    for (uint s = nf_cr_span() >> 1; s > 0u; s >>= 1) {
+        if (gl_LocalInvocationID.x < s && gl_LocalInvocationID.x + s < gl_WorkGroupSize.x) {
+            nf_cr_scratch[gl_LocalInvocationID.x] = max(nf_cr_scratch[gl_LocalInvocationID.x],
+                                                        nf_cr_scratch[gl_LocalInvocationID.x + s]);
+        }
+        barrier();
+    }
+    const float r = nf_cr_scratch[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint row = nf_wg_id();
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint xbase = row * uint(pc.cols);
+
+    /* Hidden L2 norm. */
+    float hs = 0.0;
+    for (uint i = lid; i < uint(pc.cols); i += lsize) {
+        const float v = hidden_in[xbase + i];
+        hs += v * v;
+    }
+    nf_cr_scratch[lid] = hs;
+    barrier();
+    const float hn = sqrt(nf_cert_wg_max());
+
+    /* Threshold. */
+    float my = -NF_INF;
+    for (uint v = lid; v < uint(pc.vocab); v += lsize) {
+        my = max(my, screen_in[row * uint(pc.vocab) + v] - bounds_in[v] * hn);
+    }
+    nf_cr_scratch[lid] = my;
+    barrier();
+    const float lower = nf_cert_wg_max();
+    const float thr = lower - ((abs(lower) + 2.0 * hn * pc.ebmax) * NF_CERT_TIE_REL + 1.0e-30);
+
+    /* Compaction of the candidates that can still reach the threshold. */
+    if (lid == 0u) {
+        nf_cr_cnt = 0;
+    }
+    barrier();
+    for (uint v = lid; v < uint(pc.vocab); v += lsize) {
+        if (screen_in[row * uint(pc.vocab) + v] + bounds_in[v] * hn >= thr) {
+            const int slot = atomicAdd(nf_cr_cnt, 1);
+            if (slot < int(pc.kmax)) {
+                nf_cr_cand[slot] = int(v);
+            }
+        }
+    }
+    barrier();
+    const int cnt = min(nf_cr_cnt, int(pc.kmax));
+
+    /* Exact rescore: the candidates, or every row when the cap overflowed or none passed. */
+    float bv = NF_NAN;
+    int bi = NF_CERT_NONE;
+    if (cnt == 0 || cnt < nf_cr_cnt) {
+        for (uint v = 0u; v < uint(pc.vocab); v++) {
+            const float val = nf_cert_wg_dot(v, xbase);
+            if (nf_cert_better(val, int(v), bv, bi)) {
+                bv = val;
+                bi = int(v);
+            }
+        }
+    } else {
+        for (int j = 0; j < cnt; j++) {
+            const int v = nf_cr_cand[j];
+            const float val = nf_cert_wg_dot(uint(v), xbase);
+            if (nf_cert_better(val, v, bv, bi)) {
+                bv = val;
+                bi = v;
+            }
+        }
+    }
+
+    nf_cr_best_v[lid] = bv;
+    nf_cr_best_i[lid] = bi;
+    barrier();
+    for (uint s = nf_cr_span() >> 1; s > 0u; s >>= 1) {
+        if (lid < s && lid + s < lsize) {
+            const float ov = nf_cr_best_v[lid + s];
+            const int oi = nf_cr_best_i[lid + s];
+            if (nf_cert_better(ov, oi, nf_cr_best_v[lid], nf_cr_best_i[lid])) {
+                nf_cr_best_v[lid] = ov;
+                nf_cr_best_i[lid] = oi;
+            }
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        ids_out[row] = nf_cr_best_i[0] == NF_CERT_NONE ? 0 : nf_cr_best_i[0];
+    }
+}

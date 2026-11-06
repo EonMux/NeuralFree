@@ -5,9 +5,12 @@ import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.ToIntFunction;
 
 /**
@@ -19,6 +22,13 @@ import java.util.function.ToIntFunction;
  * reason; resolving it throws {@link GgufFormatException} with that reason.</p>
  */
 public final class HfArchEntry {
+
+    /**
+     * The tensor-map block count of a projector file that carries several encoders (llama.cpp's
+     * {@code MmprojModel.__init__} fixes {@code block_count} at 128 when both encoders are present, so that one name
+     * map covers the blocks of both towers).
+     */
+    public static final int MULTI_TOWER_BLOCKS = 128;
 
     /** Which converter map a name belongs to: {@code TEXT_MODEL_MAP} or {@code MMPROJ_MODEL_MAP}. */
     public enum Kind {
@@ -42,7 +52,11 @@ public final class HfArchEntry {
     private final HfConfigFixup configFixup;
     private final HfForceType forceType;
     private final boolean undoPermute;
+    private final boolean multiTower;
     private final String rejection;
+    private final boolean supportsMtpExport;
+    private final Set<String> mtpOnlyRootKeep;
+    private final Predicate<HfConfig> mtpOnlyGuard;
 
     private HfArchEntry(Builder b) {
         this.hfNames = b.hfNames;
@@ -59,7 +73,11 @@ public final class HfArchEntry {
         this.configFixup = b.configFixup;
         this.forceType = b.forceType;
         this.undoPermute = b.undoPermute;
+        this.multiTower = b.multiTower;
         this.rejection = b.rejection;
+        this.supportsMtpExport = b.supportsMtpExport;
+        this.mtpOnlyRootKeep = b.mtpOnlyRootKeep;
+        this.mtpOnlyGuard = b.mtpOnlyGuard;
     }
 
     /**
@@ -199,10 +217,68 @@ public final class HfArchEntry {
         return new HfArchEntry(b);
     }
 
-    /** A copy registered under {@code kind}. */
+    /**
+     * A copy registered under {@code kind}.
+     */
     public HfArchEntry withKind(Kind kind) {
         Builder b = new Builder(this);
         b.kind = Objects.requireNonNull(kind, "kind");
+        return new HfArchEntry(b);
+    }
+
+    /**
+     * A copy for a projector file that carries several encoders (a vision and an audio tower in one checkpoint). The
+     * entry's metadata hook writes each tower's {@code clip.has_*_encoder} flag and geometry, and the tensor name map
+     * covers {@link #MULTI_TOWER_BLOCKS} blocks so that both towers' numbered tensors resolve, as llama.cpp's
+     * {@code MmprojModel} does. A later {@link #withBlockCount} overrides the block count.
+     */
+    public HfArchEntry withMultiTower() {
+        Builder b = new Builder(this);
+        b.multiTower = true;
+        b.blockCount = cfg -> MULTI_TOWER_BLOCKS;
+        return new HfArchEntry(b);
+    }
+
+    /**
+     * A copy that declares the converter class's {@code supports_mtp_export}: the entry accepts
+     * {@link com.eonmux.neuralfree.gguf.ModelSourceOptions.DraftMode#MTP_ONLY} and
+     * {@link com.eonmux.neuralfree.gguf.ModelSourceOptions.DraftMode#NO_NEXTN}.
+     */
+    public HfArchEntry withMtpExport(boolean supports) {
+        Builder b = new Builder(this);
+        b.supportsMtpExport = supports;
+        return new HfArchEntry(b);
+    }
+
+    /**
+     * A copy with the tensors the converter keeps beside the NextN / MTP blocks under {@code --mtp} (its
+     * {@code mtp_only} filter's shared embedding, final norm and output head), by filtered Hugging Face name.
+     *
+     * @throws IllegalArgumentException for no name, an empty name or a repeated name
+     */
+    public HfArchEntry withMtpOnlyRootKeep(String... names) {
+        Objects.requireNonNull(names, "names");
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        for (String n : names) {
+            if (n == null || n.isEmpty()) {
+                throw new IllegalArgumentException("an mtp-only root keep name must be non-empty");
+            }
+            if (!set.add(n)) {
+                throw new IllegalArgumentException("mtp-only root keep name '" + n + "' is repeated");
+            }
+        }
+        Builder b = new Builder(this);
+        b.mtpOnlyRootKeep = Collections.unmodifiableSet(set);
+        return new HfArchEntry(b);
+    }
+
+    /**
+     * A copy whose {@code --mtp} export additionally requires {@code guard} of the configuration (a class that
+     * supports MTP export only for some checkpoints). Without a guard any checkpoint of the entry converts.
+     */
+    public HfArchEntry withMtpOnlyGuard(Predicate<HfConfig> guard) {
+        Builder b = new Builder(this);
+        b.mtpOnlyGuard = Objects.requireNonNull(guard, "guard");
         return new HfArchEntry(b);
     }
 
@@ -244,6 +320,9 @@ public final class HfArchEntry {
 
     public boolean undoPermute() { return undoPermute; }
 
+    /** True for a projector entry made by {@link #withMultiTower}: one checkpoint, several encoder towers. */
+    public boolean multiTower() { return multiTower; }
+
     /**
      * The block count of {@code cfg}.
      *
@@ -277,6 +356,15 @@ public final class HfArchEntry {
         return n;
     }
 
+    /** The converter class's {@code supports_mtp_export} (base.py:121-123). */
+    public boolean supportsMtpExport() { return supportsMtpExport; }
+
+    /** The shared tensors a {@code --mtp} export keeps beside the NextN / MTP blocks (unmodifiable). */
+    public Set<String> mtpOnlyRootKeep() { return mtpOnlyRootKeep; }
+
+    /** The extra requirement of a {@code --mtp} export, or null when the entry has none. */
+    public Predicate<HfConfig> mtpOnlyGuard() { return mtpOnlyGuard; }
+
     /** True for an entry made by {@link #rejected}. */
     public boolean isRejected() { return rejection != null; }
 
@@ -303,7 +391,11 @@ public final class HfArchEntry {
         HfConfigFixup configFixup = HfConfigFixup.NONE;
         HfForceType forceType = HfForceType.NONE;
         boolean undoPermute = true;
+        boolean multiTower;
         String rejection;
+        boolean supportsMtpExport;
+        Set<String> mtpOnlyRootKeep = Collections.emptySet();
+        Predicate<HfConfig> mtpOnlyGuard;
 
         Builder(List<String> hfNames) {
             this.hfNames = hfNames;
@@ -324,7 +416,11 @@ public final class HfArchEntry {
             this.configFixup = e.configFixup;
             this.forceType = e.forceType;
             this.undoPermute = e.undoPermute;
+            this.multiTower = e.multiTower;
             this.rejection = e.rejection;
+            this.supportsMtpExport = e.supportsMtpExport;
+            this.mtpOnlyRootKeep = e.mtpOnlyRootKeep;
+            this.mtpOnlyGuard = e.mtpOnlyGuard;
         }
     }
 }

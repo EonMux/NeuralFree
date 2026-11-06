@@ -1,0 +1,8 @@
+{#- llama.cpp megrez chat template (src/llama-chat.cpp:698-707). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|role_start|>' ~ message['role'] ~ '<|role_end|>' ~ content ~ '<|turn_end|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|role_start|>assistant<|role_end|>' -}}
+{%- endif -%}

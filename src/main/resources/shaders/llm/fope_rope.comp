@@ -1,0 +1,73 @@
+/* fope_rope.comp - LLM_RoPE_FoPE Fourier position embedding (GLSL twin of kernels/llm/rope.cl, the semantic
+ * reference). Requires: common/nf_common.glsl, common/rope_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_heads, i head_stride, i row_stride, i n_dims, i x_off,
+ *    i n_inv, i n_coef_rows, i sep_head, R int pos, R float cos_coef, R float sin_coef, R float inv_freq, float x)
+ * In place: pair i of head h at token t rotates dims (i, i + n_dims/2) by the learned coefficients, with
+ * cos/sin projected from cos(pos[t] * inv_freq[d]) and the coefficient row of the head; pairs at or above n_inv
+ * use (1, 1). The coefficient matrix is indexed row * n_inv^2 + d * n_inv + i.
+ *
+ * Dispatch: 1-D, one invocation per (token, head), g = t * n_heads + h; global = n_tokens*n_heads rounded up to L,
+ * local = {L, 1, 1}; folded group counts are recovered by nf_global_id(). No barriers; every pair of a head is
+ * owned by one invocation.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfFopePos { int pos[]; };
+layout(std430, binding = 1) readonly buffer NfFopeCos { float cos_coef[]; };
+layout(std430, binding = 2) readonly buffer NfFopeSin { float sin_coef[]; };
+layout(std430, binding = 3) readonly buffer NfFopeInv { float inv_freq[]; };
+layout(std430, binding = 4) buffer NfFopeX { float x[]; };
+
+layout(push_constant) uniform NfFopeParams {
+    int n_tokens;
+    int n_heads;
+    int head_stride;
+    int row_stride;
+    int n_dims;
+    int x_off;
+    int n_inv;
+    int n_coef_rows;
+    int sep_head;
+} pc;
+
+void main() {
+    const int pairs = pc.n_dims >> 1;
+    const uint gid = nf_global_id();
+    if (pairs <= 0 || pc.n_inv <= 0 || pc.n_inv > pairs || pc.n_coef_rows <= 0
+            || gid >= uint(pc.n_tokens) * uint(pc.n_heads)) {
+        return;
+    }
+    const int h = int(gid % uint(pc.n_heads));
+    const int t = int(gid / uint(pc.n_heads));
+    const int group = pc.sep_head != 0 ? (pc.n_heads / pc.n_coef_rows) : pc.n_heads;
+    const int row = pc.sep_head != 0 ? (h / group) : 0;
+    const uint row_off = uint(row) * uint(pc.n_inv) * uint(pc.n_inv);
+    const int p = pos[t];
+    const uint base = uint(pc.x_off) + uint(t) * uint(pc.row_stride) + uint(h) * uint(pc.head_stride);
+    for (int i = 0; i < pairs; i++) {
+        float c = 1.0;
+        float s = 1.0;
+        if (i < pc.n_inv) {
+            c = 0.0;
+            s = 0.0;
+            for (int d = 0; d < pc.n_inv; d++) {
+                const vec2 trig = nf_rope_cos_sin(float(p) * inv_freq[d]);
+                const uint off = row_off + uint(d) * uint(pc.n_inv) + uint(i);
+                c += trig.x * cos_coef[off];
+                s += trig.y * sin_coef[off];
+            }
+        }
+        const uint a = base + uint(i);
+        const uint b = a + uint(pairs);
+        const float x0 = x[a];
+        const float x1 = x[b];
+        x[a] = x0 * c - x1 * s;
+        x[b] = x0 * s + x1 * c;
+    }
+}

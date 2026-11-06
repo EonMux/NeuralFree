@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.GGUFValueType;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
+import com.eonmux.neuralfree.gguf.ModelSourceOptions.OnlineQuant;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.ArchRegistry;
 import com.eonmux.neuralfree.gguf.arch.ArchTraits;
@@ -18,7 +19,9 @@ import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader;
 import com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig;
 import com.eonmux.neuralfree.gguf.hf.config.HfQuantMethod;
+import com.eonmux.neuralfree.gguf.hf.config.OnlineQuantConfig;
 import com.eonmux.neuralfree.gguf.hf.config.QuantArgs;
+import com.eonmux.neuralfree.gguf.hf.config.VllmWeightsMapper;
 import com.eonmux.neuralfree.gguf.hf.meta.HfHadamardMetadata;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadata;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadataBuilder;
@@ -44,6 +47,8 @@ import com.eonmux.neuralfree.gguf.quant.RequantPolicy;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfGenerationDefaults;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfPreTokenizerResolver;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfTokenizerFiles;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -72,7 +77,7 @@ import java.util.TreeMap;
  *   <li>{@link #filter}: the converter's name filters and {@code --no-mtp};</li>
  *   <li>{@link #vocab}: the tokenizer metadata;</li>
  *   <li>{@link #plan}: the tensor plan and the {@code prec_a4} flags, requantized by the online-quantization seam
- *       ({@link #requant}, QZ-1);</li>
+ *       ({@link #requant});</li>
  *   <li>{@link #metadata}: every metadata key;</li>
  *   <li>{@link #validate}: the view's invariants;</li>
  *   <li>{@link #layout}: the virtual tensor-data layout.</li>
@@ -80,6 +85,8 @@ import java.util.TreeMap;
  * {@link #assemble} runs them all.
  */
 public final class HfSourceAssembler {
+
+    private static final Logger LOG = LogManager.getLogger(HfSourceAssembler.class);
 
     /** {@code neuralfree.source.format} of every view built here. */
     public static final String SOURCE_FORMAT = "safetensors";
@@ -122,13 +129,15 @@ public final class HfSourceAssembler {
         private final HfTensorIndex guessIndex;
         private final List<String> droppedPrefixes;
         private final List<KvScaleCollector.Scale> kvScales;
+        private final Map<String, String> checkpointNames;
 
         Filtered(HfLoadContext ctx, HfTensorIndex guessIndex, List<String> droppedPrefixes,
-                 List<KvScaleCollector.Scale> kvScales) {
+                 List<KvScaleCollector.Scale> kvScales, Map<String, String> checkpointNames) {
             this.ctx = ctx;
             this.guessIndex = guessIndex;
             this.droppedPrefixes = droppedPrefixes;
             this.kvScales = kvScales;
+            this.checkpointNames = checkpointNames;
         }
 
         /** The load with the filtered index and the final block count. */
@@ -141,6 +150,9 @@ public final class HfSourceAssembler {
 
         /** The KV-cache scales of the kept layers. */
         public List<KvScaleCollector.Scale> kvScales() { return kvScales; }
+
+        /** The checkpoint name of each kept tensor, by its converter name (unmodifiable). */
+        public Map<String, String> checkpointNames() { return checkpointNames; }
     }
 
     /** Step 7: the load with the vocabulary's token count, and the tokenizer metadata. Immutable. */
@@ -163,15 +175,24 @@ public final class HfSourceAssembler {
     public static final class Planned {
         private final HfLoadContext ctx;
         private final TensorPlan plan;
+        private final Map<String, List<String>> added;
 
-        Planned(HfLoadContext ctx, TensorPlan plan) {
+        Planned(HfLoadContext ctx, TensorPlan plan, Map<String, List<String>> added) {
             this.ctx = ctx;
             this.plan = plan;
+            Map<String, List<String>> copy = new LinkedHashMap<>();
+            for (Map.Entry<String, List<String>> e : added.entrySet()) {
+                copy.put(e.getKey(), Collections.unmodifiableList(new ArrayList<>(e.getValue())));
+            }
+            this.added = Collections.unmodifiableMap(copy);
         }
 
         public HfLoadContext ctx() { return ctx; }
 
         public TensorPlan plan() { return plan; }
+
+        /** The GGUF tensors each checkpoint tensor planned, by its filtered name (unmodifiable). */
+        public Map<String, List<String>> added() { return added; }
     }
 
     /** Every step's product. The checkpoint and the resources stay open until the model source closes them. */
@@ -216,10 +237,11 @@ public final class HfSourceAssembler {
     public static Assembly assemble(Path path, ModelSourceOptions o, Path target, ActivationQuant mode,
                                     HfArchEntry.Kind kind) throws IOException {
         Config c = config(path, o);
-        CheckpointContainer ckpt = checkpoint(path, c, o);
+        ModelSourceOptions effective = onlineDefault(c.quant(), o);
+        CheckpointContainer ckpt = checkpoint(path, c, effective);
         HfResources resources = new HfResources();
         try {
-            HfLoadContext ctx = index(resolve(c, ckpt, kind, o, resources, target));
+            HfLoadContext ctx = index(resolve(c, ckpt, kind, effective, resources, target));
             HfQuantRewriter.Result q = quant(ctx, c.quant(), mode);
             Filtered f = filter(ctx, q, kind);
             Vocab v = vocab(f.ctx());
@@ -233,6 +255,59 @@ public final class HfSourceAssembler {
             closeAfterFailure(resources, ckpt, e);
             throw e;
         }
+    }
+
+    /**
+     * The options of the load, with its online quantization resolved against the checkpoint's quantization
+     * config, so the requantization seam, the file type and every step after see the quantized load:
+     * <ul>
+     *   <li>{@code --quant-online mxfp4} or {@code mxfp8} on a checkpoint stored in that method names the
+     *       checkpoint's own quantization and adds none, as vLLM's deferred shorthands, unless a
+     *       {@code --quantization-config} is given;</li>
+     *   <li>without {@code --quant-online}, a checkpoint whose quant_method is one of vLLM's online shorthands
+     *       ({@link HfQuantConfig#onlineTarget()}) quantizes with it, and one whose quant_method is
+     *       {@code online} with its own linear/moe/ignore/targets ({@link HfQuantConfig#onlineConfig()});</li>
+     *   <li>{@code --quant-online online} quantizes with {@code --quantization-config}, else the checkpoint's online
+     *       config; a {@code --quantization-config} without {@code --quant-online} is the {@code online} method
+     *       (over the checkpoint's shorthand or online config, when it has one).</li>
+     * </ul>
+     *
+     * @throws GgufFormatException when the result is no usable configuration ({@link OnlineQuantConfig#effective})
+     */
+    static ModelSourceOptions onlineDefault(HfQuantConfig q, ModelSourceOptions o) {
+        OnlineQuant flag = o.onlineQuant();
+        OnlineQuantConfig user = o.quantConfig();
+        HfQuantConfig ckpt = q == null ? HfQuantConfig.none() : q;
+        if (user == null && (flag == OnlineQuant.MXFP4 && ckpt.method() == HfQuantMethod.MXFP4
+                || flag == OnlineQuant.MXFP8 && ckpt.method() == HfQuantMethod.MXFP8)) {
+            LOG.info("--quant-online {} names the checkpoint's own quant_method '{}'; no online quantization is"
+                    + " added", flag.name().toLowerCase(Locale.ROOT), ckpt.methodName());
+            return o.toBuilder().onlineQuant(OnlineQuant.NONE).build();
+        }
+        OnlineQuant resolvedFlag = flag;
+        OnlineQuantConfig resolvedConfig = user;
+        try {
+            if (flag == OnlineQuant.NONE && ckpt.onlineTarget() != null) {
+                resolvedFlag = ckpt.onlineTarget();
+                LOG.info("quant_method '{}' quantizes at load as {}", ckpt.methodName(),
+                        resolvedFlag.name().toLowerCase(Locale.ROOT));
+            } else if ((flag == OnlineQuant.NONE || flag == OnlineQuant.ONLINE) && ckpt.onlineConfig() != null) {
+                resolvedFlag = OnlineQuant.ONLINE;
+                resolvedConfig = user == null ? ckpt.onlineConfig() : user.over(ckpt.onlineConfig());
+                LOG.info("quant_method 'online' quantizes at load as its quantization_config selects");
+            } else if (flag == OnlineQuant.NONE && user != null) {
+                resolvedFlag = OnlineQuant.ONLINE;
+            }
+            if (resolvedFlag == OnlineQuant.NONE) {
+                return o;
+            }
+            OnlineQuantConfig.effective(resolvedFlag, resolvedConfig);
+        } catch (IllegalArgumentException e) {
+            throw new GgufFormatException(ModelSourceOptions.PROP_ONLINE_QUANT + "="
+                    + resolvedFlag.name().toLowerCase(Locale.ROOT) + (resolvedConfig == null ? ""
+                    : " with " + ModelSourceOptions.PROP_QUANT_CONFIG) + ": " + e.getMessage(), e);
+        }
+        return o.toBuilder().onlineQuant(resolvedFlag).quantConfig(resolvedConfig).build();
     }
 
     /**
@@ -258,7 +333,8 @@ public final class HfSourceAssembler {
      * sentence-transformers {@code N_Dense} side files read as absent.
      */
     public static CheckpointContainer checkpoint(Path path, Config c, ModelSourceOptions o) throws IOException {
-        CheckpointContainer ckpt = CheckpointContainers.open(path, c.dir(), c.config().mistralNative());
+        CheckpointContainer ckpt = CheckpointContainers.open(path, c.dir(), c.config().mistralNative(),
+                c.config());
         return o.stDenseModules() ? ckpt : new HfAssemblerParts.WithoutDenseModules(ckpt);
     }
 
@@ -272,13 +348,43 @@ public final class HfSourceAssembler {
     public static HfLoadContext resolve(Config c, CheckpointContainer ckpt, HfArchEntry.Kind kind,
                                         ModelSourceOptions o, HfResources resources, Path target) {
         HfTensorIndex index = HfTensorIndex.of(ckpt);
+        // a projector checkpoint has no text blocks: --no-nextn leaves it alone, the two draft exports do not apply
+        if (kind == HfArchEntry.Kind.MMPROJ && (o.mtpOnly() || o.dspark())) {
+            throw new GgufFormatException((o.dspark() ? "--dspark" : "--mtp")
+                    + " selects a text model's tensors; a projector export has none");
+        }
         HfArchEntry entry = kind == HfArchEntry.Kind.MMPROJ ? projectorEntry(c.config())
-                : HfArchRegistry.resolve(c.config(), kind);
+                : textEntry(c.config(), o);
         Arch arch = entry.arch().resolve(c.config(), index);
-        requireSupported(c.config(), arch);
+        requireSupported(c.config(), entry, arch);
         HfConfig fixed = entry.configFixup().apply(c.config());
         return HfLoadContext.builder(fixed, entry, arch).options(o).checkpoint(ckpt).tokenizerFiles(c.tokenizer())
                 .index(index).resources(resources).targetPath(target).build();
+    }
+
+    /**
+     * The text entry of {@code cfg}: the DSpark draft the target's architecture selects under {@code --dspark}, else
+     * the target's own entry. {@code --mtp} and {@code --no-nextn} are refused for a class whose converter does not
+     * support the MTP export ({@code supports_mtp_export}), and {@code --mtp} for a checkpoint without the MTP head its
+     * class requires.
+     *
+     * @throws GgufFormatException with the converter's message for an unsupported target
+     */
+    private static HfArchEntry textEntry(HfConfig cfg, ModelSourceOptions o) {
+        if (o.dspark()) {
+            return HfArchRegistry.resolveDspark(cfg);
+        }
+        HfArchEntry entry = HfArchRegistry.resolve(cfg, HfArchEntry.Kind.TEXT);
+        if (o.mtpOnly() || o.draftMode() == ModelSourceOptions.DraftMode.NO_NEXTN) {
+            if (!entry.supportsMtpExport()) {
+                throw new GgufFormatException("--mtp / --no-nextn are not supported for " + cfg.architecture());
+            }
+            if (o.mtpOnly() && entry.mtpOnlyGuard() != null && !entry.mtpOnlyGuard().test(cfg)) {
+                throw new GgufFormatException("--mtp was requested, but this model does not contain a supported"
+                        + " MTP head");
+            }
+        }
+        return entry;
     }
 
     /** Step 4: the entry's index hook, then the block count that may depend on the checkpoint's names. */
@@ -308,9 +414,20 @@ public final class HfSourceAssembler {
         HfTensorIndex guess = HfTensorFilters.apply(ctx, ctx.index(), kind).index();
         HfTensorIndex index = kept.index();
         HfLoadContext next = ctx;
-        int base = Math.min(ctx.blockCount(), ctx.config().blockCount());
-        boolean dropMtp = !ctx.options().includeMtp();
+        int base = ctx.blockCount();
+        // --mtp keeps only the NextN / MTP tensors and the shared root tensors the class names; the block count
+        // stays the extended one, as the converter's mtp_only classes keep it
+        boolean mtpOnly = kind == HfArchEntry.Kind.TEXT && ctx.options().mtpOnly();
+        if (mtpOnly) {
+            int main = ctx.config().blockCount();
+            Set<String> rootKeep = ctx.entry().mtpOnlyRootKeep();
+            index = HfAssemblerParts.MtpFilter.only(index, rootKeep, main);
+            guess = HfAssemblerParts.MtpFilter.only(guess, rootKeep, main);
+        }
+        // --no-mtp drops text-model MTP layers; a projector checkpoint has no text blocks to drop past
+        boolean dropMtp = kind == HfArchEntry.Kind.TEXT && !ctx.options().includeMtp();
         if (dropMtp) {
+            base = Math.min(ctx.blockCount(), ctx.config().blockCount());
             index = HfAssemblerParts.MtpFilter.drop(index, base);
             guess = HfAssemblerParts.MtpFilter.drop(guess, base);
             if (base < ctx.blockCount()) {
@@ -321,7 +438,9 @@ public final class HfSourceAssembler {
         Map<String, KvScaleCollector.Scale> scales = new LinkedHashMap<>();
         for (KvScaleCollector.Scale s : q.kvScales()) {
             String filtered = HfTensorFilters.filterName(ctx, s.hfName());
-            if (filtered == null || (dropMtp && HfAssemblerParts.MtpFilter.isMtp(filtered, base))) {
+            if (filtered == null || (dropMtp && HfAssemblerParts.MtpFilter.isMtp(filtered, base))
+                    || (mtpOnly && !HfAssemblerParts.MtpFilter.keepForMtpOnly(filtered,
+                    ctx.entry().mtpOnlyRootKeep(), ctx.config().blockCount()))) {
                 continue;
             }
             int bid = HfLoadContext.bidOf(filtered);
@@ -336,7 +455,7 @@ public final class HfSourceAssembler {
             }
         }
         return new Filtered(next.withIndex(index), guess, kept.droppedPrefixes(),
-                Collections.unmodifiableList(new ArrayList<>(scales.values())));
+                Collections.unmodifiableList(new ArrayList<>(scales.values())), kept.origins());
     }
 
     /** Step 7: the entry's vocabulary, and the load with its token count. */
@@ -357,7 +476,7 @@ public final class HfSourceAssembler {
         DtypePolicy policy = new DtypePolicy(HfNameTables.forcedF32(), ctx.options().outType())
                 .resolveAuto(f.guessIndex());
         TensorPlanBuilder b = new TensorPlanBuilder(policy, ctx.entry().forceType());
-        HfAssemblerParts.Requant requant = requant(ctx, policy);
+        HfOnlineRequant requant = requant(ctx, policy, f.checkpointNames());
         HfAssemblerParts.RecordingSink sink = new HfAssemblerParts.RecordingSink(b, requant);
         HfTensorIndex index = ctx.index();
         for (String name : index.names()) {
@@ -366,32 +485,63 @@ public final class HfSourceAssembler {
                 ctx.entry().tensors().apply(ctx, name, index.get(name), sink);
             }
         }
+        sink.flush();
         for (KvScaleCollector.Scale s : f.kvScales()) {
             b.add(s.ggufName(), s.source());
         }
         ctx.entry().extra().generate(ctx, b);
         TensorPlan plan = b.build();
         Map<String, Boolean> prec = HfAssemblerParts.PrecA4.flags(ctx, moduleArgs, sink.added(), plan);
-        return new Planned(prec.isEmpty() ? ctx : ctx.withPrecA4(prec), plan);
+        return new Planned(prec.isEmpty() ? ctx : ctx.withPrecA4(prec), plan, sink.added());
     }
 
     /**
-     * Step 8a (QZ-1): the plan's online-quantization seam. {@code --quant-online} requantizes float matmul weights
-     * while planning, after the plan's tensors are decided and before {@link #metadata} types them: every tensor the
-     * hooks plan ({@link RequantPolicy#eligible(String, GGMLType, long[], GGMLType)}, llama-quant.cpp:295-396) from
-     * a plain float source is planned from a producer that requantizes its stored floats into the option's
+     * Step 8a: the plan's online-quantization seam. {@code --quant-online} and the checkpoint's own online
+     * quantization configuration (the {@link #onlineDefault} resolution) requantize float matmul weights while
+     * planning, after the plan's tensors are decided and before {@link #metadata} types them: every tensor the
+     * hooks plan ({@link RequantPolicy#eligible(String, Arch, boolean, GGMLType, long[], GGMLType)},
+     * llama-quant.cpp:302-421)
+     * from a plain float source is planned from a producer that requantizes its stored floats into the option's
      * quantizer, so the planned type, the served bytes and the recomputed {@code general.file_type} are the
-     * quantized ones; an already-quantized checkpoint's tensors and {@code NONE} requantize nothing. The decision
-     * runs on the plan's add-time sink because the planned type it reads is the policy's; PAR QN-4 extends the
-     * quantizers behind {@link OnlineQuantizers}.
+     * quantized ones; an already-quantized checkpoint's tensors and {@code NONE} requantize nothing. vLLM's
+     * methods select layers by their quantization config ({@link OnlineQuantConfig}) and quantize each fused
+     * projection with shared scales when the pass ends. The decision runs on the plan's add-time sink because the
+     * planned type it reads is the policy's; {@link OnlineQuantizers} is the extension point of the quantizers.
      *
-     * @return the requantization the adds of {@code ctx}'s planning pass apply, null for {@code NONE}
+     * vLLM matches its configuration's patterns against its own layer names: the checkpoint names
+     * ({@code checkpointNames}, by converter name) through the architecture's {@link VllmWeightsMapper}.
+     *
+     * @return the requantization the adds of {@code ctx}'s planning pass apply, null for none
+     * @throws GgufFormatException when the options carry no usable online quantization config
      */
-    static HfAssemblerParts.Requant requant(HfLoadContext ctx, DtypePolicy policy) {
-        if (ctx.options().onlineQuant() == ModelSourceOptions.OnlineQuant.NONE) {
+    static HfOnlineRequant requant(HfLoadContext ctx, DtypePolicy policy, Map<String, String> checkpointNames) {
+        ModelSourceOptions o = ctx.options();
+        if (o.onlineQuant() == OnlineQuant.NONE && o.quantConfig() == null) {
             return null;
         }
-        return new HfAssemblerParts.Requant(ctx.entry().forceType(), policy, ctx.options().onlineQuant());
+        OnlineQuantConfig config;
+        try {
+            config = OnlineQuantConfig.effective(o.onlineQuant(), o.quantConfig());
+        } catch (IllegalArgumentException e) {
+            throw new GgufFormatException(ModelSourceOptions.PROP_ONLINE_QUANT + "="
+                    + o.onlineQuant().name().toLowerCase(Locale.ROOT) + ": " + e.getMessage(), e);
+        }
+        VllmWeightsMapper mapper = VllmWeightsMapper.of(vllmArchitecture(ctx.config()));
+        Set<String> stored = new HashSet<>(checkpointNames.values());
+        return new HfOnlineRequant(ctx.entry().forceType(), policy, ctx.arch(), o.quantizeOutputTensor(),
+                o.onlineQuant(), config, stored::contains, name -> checkpointNames.getOrDefault(name, name), mapper);
+    }
+
+    /**
+     * The architecture vLLM serves the checkpoint as: the root {@code architectures[0]} of {@code config.json}
+     * (vLLM's {@code ModelConfig.architectures}), else the converter's architecture.
+     */
+    static String vllmArchitecture(HfConfig cfg) {
+        Object arches = cfg.raw().raw("architectures");
+        if (arches instanceof List && !((List<?>) arches).isEmpty() && ((List<?>) arches).get(0) instanceof String) {
+            return (String) ((List<?>) arches).get(0);
+        }
+        return cfg.architecture();
     }
 
     /**
@@ -415,7 +565,8 @@ public final class HfSourceAssembler {
             kv.set(GgufKeys.GENERAL_NAME, generalName(ctx.config()));
         }
         kv.set(GgufKeys.GENERAL_TYPE, ctx.entry().kind() == HfArchEntry.Kind.MMPROJ ? TYPE_MMPROJ : TYPE_MODEL);
-        kv.set(GgufKeys.GENERAL_FILE_TYPE, HfFileType.guess(plan));
+        kv.set(GgufKeys.GENERAL_FILE_TYPE, ctx.options().onlineQuant() == OnlineQuant.NONE
+                ? HfFileType.forOutType(ctx.options().outType(), plan) : HfFileType.guess(plan));
         kv.set(GgufKeys.GENERAL_QUANTIZATION_VERSION, QUANTIZATION_VERSION);
         neuralfreeKeys(kv, plan, droppedPrefixes, q);
         kv.putAll(vocab);
@@ -469,26 +620,27 @@ public final class HfSourceAssembler {
     // ------------------------------------------------------------------ helpers
 
     /**
-     * The projector entry of {@code cfg}; a registered entry that is rejected throws its own reason.
+     * The projector entry of {@code cfg}.
      *
      * @throws GgufFormatException when no projector entry is registered for the checkpoint
      */
     static HfArchEntry projectorEntry(HfConfig cfg) {
-        try {
-            return HfArchRegistry.resolve(cfg, HfArchEntry.Kind.MMPROJ);
-        } catch (GgufFormatException e) {
-            if (HfArchRegistry.has(cfg.architecture(), HfArchEntry.Kind.MMPROJ)) {
-                throw e;
-            }
-            throw new GgufFormatException("'" + cfg.architecture() + "' has no projector conversion yet"
-                    + " (vision/audio towers are delivered by the multimodal work)", e);
-        }
+        return HfArchRegistry.resolve(cfg, HfArchEntry.Kind.MMPROJ);
     }
 
-    private static void requireSupported(HfConfig cfg, Arch arch) {
+    /**
+     * Refuses an architecture NeuralFree does not run. {@link Arch#CLIP} is never a text model: a {@link
+     * HfArchEntry.Kind#TEXT} entry is a dual encoder ({@code CLIPModel}, {@code SiglipModel}), whose two-tower file
+     * the CLIP dual encoder serves, and a {@link HfArchEntry.Kind#MMPROJ} entry is a projector view, whose file the
+     * projector loaders serve; the language-model path refuses the architecture when it opens the file.
+     */
+    private static void requireSupported(HfConfig cfg, HfArchEntry entry, Arch arch) {
         if (arch == null || arch == Arch.UNKNOWN) {
             throw new GgufFormatException("Hugging Face architecture '" + cfg.architecture()
                     + "' resolves to no NeuralFree architecture for this checkpoint");
+        }
+        if (arch == Arch.CLIP) {
+            return;
         }
         if (ArchRegistry.has(arch)) {
             ArchTraits traits = ArchRegistry.traits(arch);
@@ -540,7 +692,7 @@ public final class HfSourceAssembler {
     }
 
     /**
-     * {@code neuralfree.act_quant.scale_ub} (QZ-1, §1.4/§1.7): the fbgemm_fp8 {@code activation_scale_ub}
+     * {@code neuralfree.act_quant.scale_ub}: the fbgemm_fp8 {@code activation_scale_ub}
      * (vllm model_executor/layers/quantization/fbgemm_fp8.py:76, :142-146) written as the upper bound on
      * {@code max|x|} of the dynamic FP8 per-token scheme when the checkpoint is fbgemm_fp8 and any weight carries
      * {@link ActQuantScheme#FP8_TOKEN}; a two-entry bound keeps its upper entry (the transformers form). Nothing is
@@ -584,6 +736,6 @@ public final class HfSourceAssembler {
         }
     }
 
-    /** The {@code --no-mtp} drop and the QZ-1 requantization decisions, the recording sink, the {@code prec_a4}
+    /** The {@code --no-mtp} drop and the online requantization decisions, the recording sink, the {@code prec_a4}
      *  flags and the dense-module wrapper live in {@link HfAssemblerParts}. */
 }

@@ -10,7 +10,11 @@ LLM_DSV4_LidUpdate_Q4_1	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q4_1	s
 LLM_DSV4_LidUpdate_IQ4_NL	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_IQ4_NL	sg
 LLM_DSV4_LidUpdate_Q5_0	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q5_0	sg
 LLM_DSV4_LidUpdate_Q5_1	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_Q5_1	sg
+LLM_DSV4_LidUpdate_FP8_E4M3	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_FP8_E4M3	sg
+LLM_DSV4_LidUpdate_FP8_E5M2	dsv4_compress.comp	OP=OP_LID_UPDATE KV=NF_DSV4_KV_FP8_E5M2	sg
 LLM_DSV4_StateUpdate	dsv4_compress.comp	OP=OP_STATE_UPDATE
 LLM_DSV4_StateSnapshot	dsv4_compress.comp	OP=OP_STATE_SNAPSHOT
 LLM_DSV4_CacheStore	dsv4_compress.comp	OP=OP_CACHE_STORE
 LLM_DSV4_CompressedAttn	dsv4_attn.comp		sg
+LLM_DSV4_CompressV41	dsv4_compress_v41.comp		sg
+LLM_DSV4_EngramAdd	dsv4_engram.comp		sg

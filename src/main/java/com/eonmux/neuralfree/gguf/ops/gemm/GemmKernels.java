@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
+import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -14,14 +15,53 @@ import java.util.Set;
 
 /**
  * Kernel names and argument indices of the GEMM family ({@code kernels/llm/matmul_tiled.cl},
- * {@code kernels/llm/sampling_topk.cl}; GLSL twins {@code shaders/llm/matmul_tiled.comp},
- * {@code shaders/llm/topk_partial.comp}).
+ * {@code kernels/llm/matmul_mmq.cl}, {@code kernels/llm/matmul_mma.cl}, {@code kernels/llm/matmul_cm.cl},
+ * {@code kernels/llm/split_k_reduce.cl}, {@code kernels/llm/sampling_topk.cl}; GLSL twins
+ * {@code shaders/llm/matmul_tiled.comp}, {@code shaders/llm/matmul_mmq.comp},
+ * {@code shaders/llm/matmul_mma.comp}, {@code shaders/llm/matmul_mmq_cm.comp},
+ * {@code shaders/llm/split_k_reduce.comp}, {@code shaders/llm/topk_partial.comp}).
  *
  * <p>Argument lists (buffers and scalars in declared order):</p>
  * <ul>
  *   <li>{@code <T>_MatMul_Tiled(int M, int K, int N, int x_stride, int x_off, int y_stride, int y_off,
  *       GpuBuffer weight, GpuBuffer x, GpuBuffer y)}: {@code y[y_off + t*y_stride + r] =
  *       sum_k W[r][k] * x[x_off + t*x_stride + k]}; dispatch geometry in {@link TiledGemmPlan}.</li>
+ *   <li>{@code <T>_MatMul_MMA(...)} and {@code <T>_MatMul_CM(...)}: the tiled argument list and
+ *       semantics with their own dispatch geometry ({@link MmaGemmPlan}, {@link CmGemmPlan}).</li>
+ *   <li>{@code <T>_MatMul_MMQ(int M, int K, int N, int q_stride, int q_off, int y_stride, int y_off,
+ *       GpuBuffer weight, GpuBuffer q8, GpuBuffer y)}: the int8 MMQ GEMM over the activations staged
+ *       by {@link #QUANT_MMQ_Q8_1}, or, for the FP8 types, the E4M3 GEMM over the E4M3 records of the
+ *       {@code LLM_Quant_MMQ_Fp8*}/{@code Fp4*} stagings; {@code q_stride} / {@code q_off} are in 32-bit
+ *       record units; dispatch geometry in {@link MmqGemmPlan}.</li>
+ *   <li>{@code <T>_MatMul_W4A8(int M, int K, int N, int q_stride, int q_off, int y_stride, int y_off,
+ *       GpuBuffer weight, GpuBuffer q8, GpuBuffer y)}: the E4M3 GEMM of a 4-bit weight type, same argument
+ *       list and staged records as the MMQ form ({@link #MATMUL_W4A8_SUFFIX}).</li>
+ *   <li>{@code <T>_MatMul_MMQ_S(...)} and {@code <T>_MatMul_W4A8_S(...)}: the small-token-tile twins
+ *       of the two forms above over a 16-token tile, same argument list and staged records; the host
+ *       serves staged launches of fewer tokens than the device tile with them
+ *       ({@link MmqGemmPlan#smallOf}), so a multi-row step does not stream its weights through
+ *       64-token tiles.</li>
+ *   <li>{@code LLM_Quant_MMQ_Q8_1(int N, int K, int tk, int x_stride, int x_off, GpuBuffer x,
+ *       GpuBuffer q8)}: quantizes every token row of a projection once, per {@code tk}-deep chunk
+ *       (the device's {@link MmqConfig#stageDepth()}), into the records the MMQ GEMM kernels read,
+ *       shared by all row tiles (llama.cpp quantize_mmq_q8_1); one work-item per chunk, a 1-D
+ *       dispatch of {@code N * (K / tk)} work-items.</li>
+ *   <li>{@code LLM_Quant_MMQ_Int8Static(int N, int K, int tk, int x_stride, int x_off, float scale,
+ *       GpuBuffer x, GpuBuffer q8)}, {@code LLM_Quant_MMQ_Int8Row(int N, int K, int tk, int x_stride,
+ *       int x_off, GpuBuffer x, GpuBuffer q8)} and {@code LLM_Quant_MMQ_Int8Group128(...)}: the same
+ *       records with the checkpoint activation scheme's own int8 codes ({@code INT8_STATIC},
+ *       {@code INT8_TOKEN} and {@code INT8_GROUP128}), so the GEMM multiplies the checkpoint's int8
+ *       activations (W8A8). The row and per-128-run forms launch one workgroup per run.</li>
+ *   <li>{@code <T>_MatMul_MMA_KSplit(int M, int K, int N, int x_stride, int x_off, int k_slice,
+ *       GpuBuffer weight, GpuBuffer x, GpuBuffer partial)}: the split-K twin of the MMA GEMM over the
+ *       same tiles, writing per-slice planes; dispatch geometry in {@link SplitKGemmPlan}, whose
+ *       reduce launches {@code LLM_SplitK_Reduce}.</li>
+ *   <li>{@code <T>_MatMul_MMQ_KSplit(int M, int K, int N, int q_stride, int q_off, int k_slice,
+ *       GpuBuffer weight, GpuBuffer q8, GpuBuffer partial)} and
+ *       {@code <T>_MatMul_CM_KSplit(...)} with the tiled {@code x} list: the split-K twins of the
+ *       MMQ and CM GEMM lanes, same plane layout; dispatch geometry in {@link SplitKGemmPlan}.</li>
+ *   <li>{@code LLM_SplitK_Reduce(int ne, int splits, int M, int y_stride, int y_off,
+ *       GpuBuffer partial, GpuBuffer y)}: sums the split-K slice planes into the strided output.</li>
  *   <li>{@code LLM_TopK_Partial(int n, int k, float inv_temp, GpuBuffer logits, GpuBuffer cand_val,
  *       GpuBuffer cand_idx)}: per-slice top-k candidates for the host sampler; dispatch geometry in
  *       {@link TopKPartialPlan}.</li>
@@ -31,10 +71,75 @@ public final class GemmKernels {
 
     /** Name suffix of the per-weight-type tiled GEMM kernels, {@code <T>_MatMul_Tiled}. */
     public static final String MATMUL_TILED_SUFFIX = "_MatMul_Tiled";
+    /** Name suffix of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ}. */
+    public static final String MATMUL_MMQ_SUFFIX = "_MatMul_MMQ";
+    /** Name suffix of the split-K twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_KSplit}. */
+    public static final String MATMUL_MMQ_KSPLIT_SUFFIX = "_MatMul_MMQ_KSplit";
+    /** Name suffix of the small-token-tile twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_S}. */
+    public static final String MATMUL_MMQ_S_SUFFIX = "_MatMul_MMQ_S";
+    /** Name suffix of the small-token-tile twins of the W4A8 GEMM kernels, {@code <T>_MatMul_W4A8_S}. */
+    public static final String MATMUL_W4A8_S_SUFFIX = "_MatMul_W4A8_S";
+    /** Name suffix of the dequantizing GEMM kernels of the MMQ types, {@code <T>_MatMul_CM}. */
+    public static final String MATMUL_CM_SUFFIX = "_MatMul_CM";
+    /** Name suffix of the split-K twins of the CM GEMM kernels, {@code <T>_MatMul_CM_KSplit}. */
+    public static final String MATMUL_CM_KSPLIT_SUFFIX = "_MatMul_CM_KSplit";
+    /** Name suffix of the E4M3 GEMM kernels of the 4-bit weight types, {@code <T>_MatMul_W4A8}. */
+    public static final String MATMUL_W4A8_SUFFIX = "_MatMul_W4A8";
+    /** Name suffix of the split-K twins of the W4A8 GEMM kernels, {@code <T>_MatMul_W4A8_KSplit}. */
+    public static final String MATMUL_W4A8_KSPLIT_SUFFIX = "_MatMul_W4A8_KSplit";
+    /** Name suffix of the tensor-core MMA GEMM kernels, {@code <T>_MatMul_MMA}. */
+    public static final String MATMUL_MMA_SUFFIX = "_MatMul_MMA";
+    /** Name suffix of the split-K twins of the MMA GEMM kernels, {@code <T>_MatMul_MMA_KSplit}. */
+    public static final String MATMUL_MMA_KSPLIT_SUFFIX = "_MatMul_MMA_KSplit";
+    /**
+     * The MMQ activation staging ({@code kernels/llm/quant_mmq_q8_1.cl}, llama.cpp
+     * {@code quantize_mmq_q8_1}): quantizes every token row of a projection once, per stage-depth
+     * chunk, into the records the {@code <T>_MatMul_MMQ} and {@code <T>_MatMul_MMQ_KSplit} kernels
+     * read, shared by all row tiles.
+     */
+    public static final String QUANT_MMQ_Q8_1 = "LLM_Quant_MMQ_Q8_1";
+    /**
+     * The static int8 activation staging of an {@link ActQuantScheme#INT8_STATIC}
+     * weight ({@code kernels/llm/quant_mmq_q8_1.cl}): the codes are {@code sat8(rne(x / input_scale))} and the
+     * chunk scale is {@code input_scale}, so the int8 MMQ GEMM multiplies the checkpoint's own int8 codes.
+     */
+    public static final String QUANT_MMQ_INT8_STATIC = "LLM_Quant_MMQ_Int8Static";
+    /**
+     * The dynamic per-token int8 staging of an {@link ActQuantScheme#INT8_TOKEN}
+     * weight: one row scale {@code amax / 127}, codes {@code sat8(rne(x * 127 / amax))}.
+     */
+    public static final String QUANT_MMQ_INT8_ROW = "LLM_Quant_MMQ_Int8Row";
+    /**
+     * The dynamic per-128-run int8 staging of an
+     * {@link ActQuantScheme#INT8_GROUP128} weight.
+     */
+    public static final String QUANT_MMQ_INT8_GROUP128 = "LLM_Quant_MMQ_Int8Group128";
+    /** The static asymmetric int8 staging of an {@link ActQuantScheme#INT8_STATIC_ASYM} weight: codes
+     *  {@code sat8(rne(x / input_scale) + input_zero_point)}, and the record carries the zero point the
+     *  GEMM subtracts per weight row. */
+    public static final String QUANT_MMQ_INT8_ASYM = "LLM_Quant_MMQ_Int8Asym";
+    /** The static E4M3 staging of an {@link ActQuantScheme#FP8_STATIC} weight. */
+    public static final String QUANT_MMQ_FP8_STATIC = "LLM_Quant_MMQ_Fp8Static";
+    /** The per-token E4M3 staging of an {@link ActQuantScheme#FP8_TOKEN} weight. */
+    public static final String QUANT_MMQ_FP8_ROW = "LLM_Quant_MMQ_Fp8Row";
+    /** The per-128-run E4M3 staging of an {@link ActQuantScheme#FP8_GROUP128} weight. */
+    public static final String QUANT_MMQ_FP8_GROUP128 = "LLM_Quant_MMQ_Fp8Group128";
+    /** The power-of-two per-run E4M3 staging of an {@link ActQuantScheme#MXFP8} weight. */
+    public static final String QUANT_MMQ_FP8_MX = "LLM_Quant_MMQ_Fp8Mx";
+    /** The E2M1 staging of an {@link ActQuantScheme#MXFP4} weight, as the exact E4M3 codes of the values. */
+    public static final String QUANT_MMQ_FP4_MX = "LLM_Quant_MMQ_Fp4Mx";
+    /** The E2M1 staging of an {@link ActQuantScheme#NVFP4} weight, re-encoded to E4M3 with a chunk scale. */
+    public static final String QUANT_MMQ_FP4_NV = "LLM_Quant_MMQ_Fp4Nv";
+    /** The split-K slice reduce. */
+    public static final String SPLIT_K_REDUCE = "LLM_SplitK_Reduce";
     /** Partial top-k over vocabulary slices. */
     public static final String TOPK_PARTIAL = "LLM_TopK_Partial";
+    /** Row-wise top-k in rank order with the row's softmax denominators. */
+    public static final String ROW_TOPK = "LLM_Row_TopK";
+    /** Per-row pre-top-k logit edits: the logit-bias table, penalties and DRY. */
+    public static final String LOGITS_PREFILTER = "LLM_LogitsPrefilter";
 
-    /** {@code <T>_MatMul_Tiled}: weight rows (output features). */
+    /** {@code <T>_MatMul_Tiled}: weight rows (output features); argument 0 of every GEMM form. */
     public static final int ARG_M = 0;
     /** {@code <T>_MatMul_Tiled}: reduction length (input features). */
     public static final int ARG_K = 1;
@@ -54,8 +159,49 @@ public final class GemmKernels {
     public static final int ARG_X = 8;
     /** {@code <T>_MatMul_Tiled}: F32 output. */
     public static final int ARG_Y = 9;
-    /** Number of {@code <T>_MatMul_Tiled} arguments. */
+    /**
+     * Number of arguments of every {@code <T>_MatMul_Tiled} / {@code <T>_MatMul_MMQ} /
+     * {@code <T>_MatMul_MMA} / {@code <T>_MatMul_CM} launch (the GEMM forms share the argument list).
+     */
     public static final int MATMUL_TILED_ARG_COUNT = 10;
+
+    /** {@code <T>_MatMul_MMA_KSplit}: weight rows (output features). */
+    public static final int KSPLIT_ARG_M = 0;
+    /** {@code <T>_MatMul_MMA_KSplit}: reduction length (input features). */
+    public static final int KSPLIT_ARG_K = 1;
+    /** {@code <T>_MatMul_MMA_KSplit}: token count. */
+    public static final int KSPLIT_ARG_N = 2;
+    /** {@code <T>_MatMul_MMA_KSplit}: element stride between activation rows. */
+    public static final int KSPLIT_ARG_X_STRIDE = 3;
+    /** {@code <T>_MatMul_MMA_KSplit}: element offset of the first activation row. */
+    public static final int KSPLIT_ARG_X_OFF = 4;
+    /** {@code <T>_MatMul_MMA_KSplit}: k length of every slice (a multiple of the stage depth). */
+    public static final int KSPLIT_ARG_K_SLICE = 5;
+    /** {@code <T>_MatMul_MMA_KSplit}: weight bytes. */
+    public static final int KSPLIT_ARG_WEIGHT = 6;
+    /** {@code <T>_MatMul_MMA_KSplit}: F32 activations. */
+    public static final int KSPLIT_ARG_X = 7;
+    /** {@code <T>_MatMul_MMA_KSplit}: F32 slice planes, {@code splits * M * N}. */
+    public static final int KSPLIT_ARG_PARTIAL = 8;
+    /** Number of arguments of a {@code <T>_MatMul_MMA_KSplit} launch. */
+    public static final int KSPLIT_ARG_COUNT = 9;
+
+    /** {@code LLM_SplitK_Reduce}: plane length in elements ({@code M * N}). */
+    public static final int REDUCE_ARG_NE = 0;
+    /** {@code LLM_SplitK_Reduce}: slice planes. */
+    public static final int REDUCE_ARG_SPLITS = 1;
+    /** {@code LLM_SplitK_Reduce}: weight rows; plane element {@code e} sits at token {@code e / M}, row {@code e % M}. */
+    public static final int REDUCE_ARG_M = 2;
+    /** {@code LLM_SplitK_Reduce}: element stride between output rows. */
+    public static final int REDUCE_ARG_Y_STRIDE = 3;
+    /** {@code LLM_SplitK_Reduce}: element offset of the first output row. */
+    public static final int REDUCE_ARG_Y_OFF = 4;
+    /** {@code LLM_SplitK_Reduce}: F32 slice planes. */
+    public static final int REDUCE_ARG_PARTIAL = 5;
+    /** {@code LLM_SplitK_Reduce}: F32 output. */
+    public static final int REDUCE_ARG_Y = 6;
+    /** Number of arguments of an {@code LLM_SplitK_Reduce} launch. */
+    public static final int SPLIT_K_REDUCE_ARG_COUNT = 7;
 
     /** {@code LLM_TopK_Partial}: logits length. */
     public static final int TOPK_ARG_N = 0;
@@ -72,6 +218,23 @@ public final class GemmKernels {
     /** Number of {@code LLM_TopK_Partial} arguments. */
     public static final int TOPK_ARG_COUNT = 6;
 
+    /** {@code LLM_Row_TopK}: logits per row. */
+    public static final int ROWTOPK_ARG_SIZE = 0;
+    /** {@code LLM_Row_TopK}: candidates per row. */
+    public static final int ROWTOPK_ARG_K = 1;
+    /** {@code LLM_Row_TopK}: rows. */
+    public static final int ROWTOPK_ARG_N_ROWS = 2;
+    /** {@code LLM_Row_TopK}: F32 logits, {@code n_rows} rows of {@code size}. */
+    public static final int ROWTOPK_ARG_LOGITS = 3;
+    /** {@code LLM_Row_TopK}: F32 candidate values, {@code n_rows * k}. */
+    public static final int ROWTOPK_ARG_TOP_VAL = 4;
+    /** {@code LLM_Row_TopK}: int32 candidate indices, {@code n_rows * k}; -1 marks an empty slot. */
+    public static final int ROWTOPK_ARG_TOP_IDX = 5;
+    /** {@code LLM_Row_TopK}: F32 softmax denominator of each row, {@code n_rows}. */
+    public static final int ROWTOPK_ARG_SUM_EXP = 6;
+    /** Number of {@code LLM_Row_TopK} arguments. */
+    public static final int ROWTOPK_ARG_COUNT = 7;
+
     /** Weight types with a {@code <T>_MatMul_Tiled} kernel: F32, F16, BF16 and every GPU quant type
      *  (the F8_E5M2, MXFP6_E3M2 and MXFP6_E2M3 extension types included). */
     public static final Set<GGMLType> TILED_TYPES = Collections.unmodifiableSet(EnumSet.of(
@@ -80,11 +243,38 @@ public final class GemmKernels {
             GGMLType.IQ4_NL, GGMLType.IQ4_XS, GGMLType.MXFP4,
             GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K, GGMLType.Q8_K,
             GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S,
+            GGMLType.IQ3_K, GGMLType.IQ3_KS,
             GGMLType.IQ1_S, GGMLType.IQ1_M,
             GGMLType.TQ1_0, GGMLType.TQ2_0, GGMLType.NVFP4, GGMLType.Q1_0, GGMLType.Q2_0,
-            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.MXFP6_E3M2, GGMLType.MXFP6_E2M3,
-            GGMLType.I8_B128, GGMLType.NF4,
+            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.F8_E4M3_B32, GGMLType.MXFP8, GGMLType.MXFP6_E3M2,
+            GGMLType.MXFP6_E2M3, GGMLType.I8_B128, GGMLType.NF4,
             GGMLType.FP4_BNB, GGMLType.F8_E5M2));
+
+    /** The E4M3 weight types of the FP8 W8A8 lane: the checkpoint's FP8 codes (per tensor, per 128 and per
+     *  32 blocks) and the MXFP8 E8M0-scaled form. They join {@link #MMQ_TYPES}, whose staged-activation GEMM
+     *  multiplies their codes by the scheme's E4M3 activation codes through the FP8 tensor cores. */
+    public static final Set<GGMLType> FP8_TYPES = Collections.unmodifiableSet(EnumSet.of(
+            GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.F8_E4M3_B32, GGMLType.MXFP8));
+
+    /** The 4-bit weight types of the W4A8 lane: the MXFP4 and NVFP4 codebooks and the IQ4_NL / IQ4_XS ones,
+     *  whose codes map to E4M3 codes the FP8 tensor cores multiply by the staged E4M3 activations. */
+    public static final Set<GGMLType> W4A8_TYPES = Collections.unmodifiableSet(EnumSet.of(
+            GGMLType.MXFP4, GGMLType.NVFP4, GGMLType.IQ4_NL, GGMLType.IQ4_XS));
+
+    /** Weight types of the int8 MMQ GEMM: the set llama.cpp serves with MMQ (ggml-cuda/mmq.cu), the legacy
+     *  32-element blocks, the 256-element K-quants and the i-quants iq1_s..iq4_xs, plus the int8 checkpoint type
+     *  I8_B128 (a per-128 scale over int8 codes, the W8A8 int8 weight format). The FP8 types share the kernel
+     *  name through {@link #FP8_TYPES} but carry the E4M3 datapath. */
+    public static final Set<GGMLType> MMQ_TYPES = Collections.unmodifiableSet(EnumSet.of(
+            GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0,
+            GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K,
+            GGMLType.IQ1_S, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S,
+            GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ4_NL, GGMLType.IQ4_XS,
+            GGMLType.I8_B128));
+
+    /** Weight types of the tensor-core MMA GEMM family: the dense 16-bit types F16 and BF16. */
+    public static final Set<GGMLType> MMA_TYPES = Collections.unmodifiableSet(EnumSet.of(
+            GGMLType.F16, GGMLType.BF16));
 
     private GemmKernels() {
     }
@@ -107,13 +297,286 @@ public final class GemmKernels {
         return type.name() + MATMUL_TILED_SUFFIX;
     }
 
-    /** Every kernel name of this family, tiled GEMM kernels in {@link GGMLType} order then the top-k. */
+    /**
+     * Whether {@code type} has a staged-activation GEMM kernel of the {@code <T>_MatMul_MMQ} name: the int8 MMQ
+     * types ({@link #MMQ_TYPES}) and the FP8 types ({@link #FP8_TYPES}, whose kernel carries the E4M3 datapath).
+     */
+    public static boolean hasMmq(GGMLType type) {
+        return type != null && (MMQ_TYPES.contains(type) || FP8_TYPES.contains(type));
+    }
+
+    /** Whether {@code type} has the int8 MMQ datapath ({@link #MMQ_TYPES}). */
+    public static boolean isInt8Mmq(GGMLType type) {
+        return type != null && MMQ_TYPES.contains(type);
+    }
+
+    /**
+     * The int8 activation staging kernel that applies an activation quantization scheme directly into the MMQ
+     * record layout ({@link #QUANT_MMQ_INT8_STATIC}, {@link #QUANT_MMQ_INT8_ROW},
+     * {@link #QUANT_MMQ_INT8_GROUP128} or {@link #QUANT_MMQ_INT8_ASYM}), or null for the schemes that only the
+     * fake-quantization path serves.
+     */
+    public static String int8ActivationStaging(ActQuantScheme scheme) {
+        if (scheme == null) {
+            return null;
+        }
+        switch (scheme) {
+            case INT8_STATIC:
+                return QUANT_MMQ_INT8_STATIC;
+            case INT8_TOKEN:
+                return QUANT_MMQ_INT8_ROW;
+            case INT8_GROUP128:
+                return QUANT_MMQ_INT8_GROUP128;
+            case INT8_STATIC_ASYM:
+                return QUANT_MMQ_INT8_ASYM;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Name of the int8 MMQ GEMM kernel of a weight type.
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel
+     */
+    public static String matmulMmq(GGMLType type) {
+        if (!hasMmq(type)) {
+            throw new IllegalArgumentException("no MMQ GEMM kernel for weight type " + type
+                    + "; supported: " + MMQ_TYPES);
+        }
+        return type.name() + MATMUL_MMQ_SUFFIX;
+    }
+
+    /**
+     * Name of the split-K twin of the int8 MMQ GEMM kernel of a weight type
+     * ({@code <T>_MatMul_MMQ_KSplit}).
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel
+     */
+    public static String matmulMmqKSplit(GGMLType type) {
+        if (!hasMmq(type)) {
+            throw new IllegalArgumentException("no split-K MMQ GEMM kernel for weight type " + type
+                    + "; supported: " + MMQ_TYPES);
+        }
+        return type.name() + MATMUL_MMQ_KSPLIT_SUFFIX;
+    }
+
+    /**
+     * Name of the small-token-tile twin of the staged GEMM kernel of a weight type
+     * ({@code <T>_MatMul_MMQ_S}, also for the FP8 types; llama.cpp picks the J tile per launch,
+     * ggml_cuda_mmq_get_J_best). The twin exists on every device whose MMQ tile is wider than 16
+     * tokens (the CUDA and HIP tiles, and the OpenCL forced tiles over 16); a 16-token device tile
+     * has no twin and the plain kernel serves, so callers select the twin through
+     * {@code ops.optionalReady(name, workGroup, 1)}.
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel
+     */
+    public static String matmulMmqSmall(GGMLType type) {
+        if (!hasMmq(type)) {
+            throw new IllegalArgumentException("no small-token-tile MMQ GEMM kernel for weight type " + type
+                    + "; supported: " + MMQ_TYPES);
+        }
+        return type.name() + MATMUL_MMQ_S_SUFFIX;
+    }
+
+    /**
+     * Name of the small-token-tile twin of the W4A8 GEMM kernel of a 4-bit weight type
+     * ({@code <T>_MatMul_W4A8_S}).
+     *
+     * @throws IllegalArgumentException when the type has no W4A8 GEMM kernel
+     */
+    public static String matmulW4a8Small(GGMLType type) {
+        if (!isW4a8(type)) {
+            throw new IllegalArgumentException("no small-token-tile W4A8 GEMM kernel for weight type " + type
+                    + "; supported: " + W4A8_TYPES);
+        }
+        return type.name() + MATMUL_W4A8_S_SUFFIX;
+    }
+
+    /**
+     * Name of the tensor-core MMA GEMM kernel of a dense 16-bit weight type ({@code F16_MatMul_MMA},
+     * {@code BF16_MatMul_MMA}).
+     *
+     * @throws IllegalArgumentException when the type has no MMA GEMM kernel
+     */
+    public static String matmulMma(GGMLType type) {
+        if (!hasMma(type)) {
+            throw new IllegalArgumentException("no MMA GEMM kernel for weight type " + type
+                    + "; supported: " + MMA_TYPES);
+        }
+        return type.name() + MATMUL_MMA_SUFFIX;
+    }
+
+    /** Whether {@code type} has a tensor-core MMA GEMM kernel (the dense 16-bit types). */
+    public static boolean hasMma(GGMLType type) {
+        return type != null && MMA_TYPES.contains(type);
+    }
+
+    /**
+     * Name of the split-K twin of the MMA GEMM kernel of a dense 16-bit weight type
+     * ({@code <T>_MatMul_MMA_KSplit}).
+     *
+     * @throws IllegalArgumentException when the type has no MMA GEMM kernel
+     */
+    public static String matmulMmaKSplit(GGMLType type) {
+        if (!hasMma(type)) {
+            throw new IllegalArgumentException("no split-K MMA GEMM kernel for weight type " + type
+                    + "; supported: " + MMA_TYPES);
+        }
+        return type.name() + MATMUL_MMA_KSPLIT_SUFFIX;
+    }
+
+    /**
+     * Whether {@code type} has a dequantizing {@code <T>_MatMul_CM} GEMM kernel: the MMQ set except the FP8
+     * types, whose cooperative-matrix form would need a float8 component type the shader toolchain does not
+     * provide; they keep the exact tiled GEMM on Vulkan.
+     */
+    public static boolean hasCm(GGMLType type) {
+        return hasMmq(type) && !FP8_TYPES.contains(type);
+    }
+
+    /** Whether {@code type} is an E4M3 weight type of the FP8 lane ({@link #FP8_TYPES}). */
+    public static boolean isFp8(GGMLType type) {
+        return type != null && FP8_TYPES.contains(type);
+    }
+
+    /** Whether {@code type} is a 4-bit weight type of the W4A8 lane ({@link #W4A8_TYPES}). */
+    public static boolean isW4a8(GGMLType type) {
+        return type != null && W4A8_TYPES.contains(type);
+    }
+
+    /**
+     * Name of the E4M3 GEMM kernel of a 4-bit weight type ({@code <T>_MatMul_W4A8}).
+     *
+     * @throws IllegalArgumentException when the type has no W4A8 GEMM kernel
+     */
+    public static String matmulW4a8(GGMLType type) {
+        if (!isW4a8(type)) {
+            throw new IllegalArgumentException("no W4A8 GEMM kernel for weight type " + type
+                    + "; supported: " + W4A8_TYPES);
+        }
+        return type.name() + MATMUL_W4A8_SUFFIX;
+    }
+
+    /**
+     * Name of the split-K twin of the W4A8 GEMM kernel of a 4-bit weight type
+     * ({@code <T>_MatMul_W4A8_KSplit}).
+     *
+     * @throws IllegalArgumentException when the type has no W4A8 GEMM kernel
+     */
+    public static String matmulW4a8KSplit(GGMLType type) {
+        if (!isW4a8(type)) {
+            throw new IllegalArgumentException("no split-K W4A8 GEMM kernel for weight type " + type
+                    + "; supported: " + W4A8_TYPES);
+        }
+        return type.name() + MATMUL_W4A8_KSPLIT_SUFFIX;
+    }
+
+    /**
+     * The E4M3 activation staging kernel that applies an activation scheme directly into the staged record
+     * layout ({@link #QUANT_MMQ_FP8_STATIC}, {@link #QUANT_MMQ_FP8_ROW}, {@link #QUANT_MMQ_FP8_GROUP128},
+     * {@link #QUANT_MMQ_FP8_MX}, {@link #QUANT_MMQ_FP4_MX} or {@link #QUANT_MMQ_FP4_NV}), or null for the
+     * schemes the E4M3 lanes do not stage.
+     */
+    public static String fp8ActivationStaging(ActQuantScheme scheme) {
+        if (scheme == null) {
+            return null;
+        }
+        switch (scheme) {
+            case FP8_STATIC:
+                return QUANT_MMQ_FP8_STATIC;
+            case FP8_TOKEN:
+                return QUANT_MMQ_FP8_ROW;
+            case FP8_GROUP128:
+                return QUANT_MMQ_FP8_GROUP128;
+            case MXFP8:
+                return QUANT_MMQ_FP8_MX;
+            case MXFP4:
+                return QUANT_MMQ_FP4_MX;
+            case NVFP4:
+                return QUANT_MMQ_FP4_NV;
+            default:
+                return null;
+        }
+    }
+
+    /** Whether an activation scheme is staged in the E4M3 code form (the E4M3 lanes' record layout). */
+    public static boolean isFp8Scheme(ActQuantScheme scheme) {
+        return fp8ActivationStaging(scheme) != null;
+    }
+
+    /**
+     * Name of the dequantizing GEMM kernel of an MMQ weight type ({@code <T>_MatMul_CM}).
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel
+     */
+    public static String matmulCm(GGMLType type) {
+        if (!hasCm(type)) {
+            throw new IllegalArgumentException("no CM GEMM kernel for weight type " + type
+                    + "; supported: " + MMQ_TYPES);
+        }
+        return type.name() + MATMUL_CM_SUFFIX;
+    }
+
+    /**
+     * Name of the split-K twin of the dequantizing CM GEMM kernel of an MMQ weight type
+     * ({@code <T>_MatMul_CM_KSplit}).
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel
+     */
+    public static String matmulCmKSplit(GGMLType type) {
+        if (!hasCm(type)) {
+            throw new IllegalArgumentException("no split-K CM GEMM kernel for weight type " + type
+                    + "; supported: " + MMQ_TYPES);
+        }
+        return type.name() + MATMUL_CM_KSPLIT_SUFFIX;
+    }
+
+    /** Every kernel name of this family: tiled, MMQ, MMQ KSplit, MMQ S, CM, CM KSplit and MMA GEMM
+     *  kernels in {@link GGMLType} order, the FP8 and W4A8 E4M3 GEMMs with their S twins, then the
+     *  activation staging kernels, the reduce and the top-k. */
     public static List<String> kernelNames() {
-        List<String> names = new ArrayList<>(TILED_TYPES.size() + 1);
+        List<String> names = new ArrayList<>(TILED_TYPES.size() + 5 * MMQ_TYPES.size() + MMA_TYPES.size()
+                + 3 * W4A8_TYPES.size() + 7);
         for (GGMLType type : TILED_TYPES) {
             names.add(matmulTiled(type));
         }
+        for (GGMLType type : MMQ_TYPES) {
+            names.add(matmulMmq(type));
+            names.add(matmulMmqKSplit(type));
+            names.add(matmulMmqSmall(type));
+            names.add(matmulCm(type));
+            names.add(matmulCmKSplit(type));
+        }
+        for (GGMLType type : FP8_TYPES) {
+            names.add(matmulMmq(type));
+            names.add(matmulMmqKSplit(type));
+            names.add(matmulMmqSmall(type));
+        }
+        for (GGMLType type : MMA_TYPES) {
+            names.add(matmulMma(type));
+            names.add(matmulMmaKSplit(type));
+        }
+        for (GGMLType type : W4A8_TYPES) {
+            names.add(matmulW4a8(type));
+            names.add(matmulW4a8KSplit(type));
+            names.add(matmulW4a8Small(type));
+        }
+        names.add(QUANT_MMQ_Q8_1);
+        names.add(QUANT_MMQ_INT8_STATIC);
+        names.add(QUANT_MMQ_INT8_ROW);
+        names.add(QUANT_MMQ_INT8_GROUP128);
+        names.add(QUANT_MMQ_INT8_ASYM);
+        names.add(QUANT_MMQ_FP8_STATIC);
+        names.add(QUANT_MMQ_FP8_ROW);
+        names.add(QUANT_MMQ_FP8_GROUP128);
+        names.add(QUANT_MMQ_FP8_MX);
+        names.add(QUANT_MMQ_FP4_MX);
+        names.add(QUANT_MMQ_FP4_NV);
+        names.add(SPLIT_K_REDUCE);
         names.add(TOPK_PARTIAL);
+        names.add(ROW_TOPK);
+        names.add(LOGITS_PREFILTER);
         return Collections.unmodifiableList(names);
     }
 

@@ -5,11 +5,23 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
 import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
+import com.eonmux.neuralfree.acceleration.backend.hip.HipComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.hip.HipDeviceRanking;
 import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.cuda.CudaDeviceRanking;
+import com.eonmux.neuralfree.acceleration.backend.metal.MetalComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.ocl.OclErrors;
+import com.eonmux.neuralfree.acceleration.backend.spi.AcceleratorBackendProvider;
+import com.eonmux.neuralfree.acceleration.backend.spi.AcceleratorDevice;
+import com.eonmux.neuralfree.acceleration.backend.spi.AcceleratorProviders;
 import com.eonmux.neuralfree.acceleration.backend.vulkan.VkComputeBackend;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
+import com.eonmux.neuralfree.acceleration.hip.HipDevice;
+import com.eonmux.neuralfree.acceleration.hip.HipRuntime;
+import com.eonmux.neuralfree.acceleration.metal.MetalDevice;
+import com.eonmux.neuralfree.acceleration.metal.MetalDeviceRanking;
+import com.eonmux.neuralfree.acceleration.metal.MetalRuntime;
 import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
 import com.eonmux.neuralfree.acceleration.ocl.CLDeviceRanking;
 import com.eonmux.neuralfree.acceleration.vulkan.VkDevice;
@@ -33,6 +45,7 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -48,15 +61,22 @@ public class HWAcceleration {
 
     public static boolean enableCuda = false;
     public static boolean enableVulkan = false;
+    public static boolean enableHip = false;
+    /** Enumerates Metal even when the host is not macOS; on macOS Metal is always enumerated. */
+    public static boolean enableMetal = false;
 
     ObjectSet<CLDevice> CLDevices = new ObjectSet<>();
     ObjectSet<CUDevice> CUDevices = new ObjectSet<>();
     ObjectSet<VkDevice> VkDevices = new ObjectSet<>();
+    ObjectSet<HipDevice> HipDevices = new ObjectSet<>();
+    ObjectSet<MetalDevice> MetalDevices = new ObjectSet<>();
 
     /** The APIs this instance enumerates. */
     private final Set<BackendType> apis;
     /** True when {@link #apis} came from the static enable flags rather than an explicit set. */
     private final boolean apisFromStaticFlags;
+    /** The accelerator devices this instance enumerated, with their ranking and creation policy. */
+    private final AcceleratorBackendSet acceleratorBackends;
     /** Why an enumerated API offers no device, when its initialization failed. */
     private final Map<BackendType, String> enumerationFailures = new EnumMap<>(BackendType.class);
     /** Why the last explicit-mode backend creation of an API failed; cleared when one succeeds. */
@@ -71,27 +91,43 @@ public class HWAcceleration {
     private boolean openClRanked;
 
     /**
-     * Enumerates OpenCL always, CUDA when {@link #enableCuda} is set and Vulkan when
-     * {@link #enableVulkan} is set.
+     * Enumerates OpenCL always, CUDA when {@link #enableCuda} is set, Vulkan when
+     * {@link #enableVulkan} is set, HIP when {@link #enableHip} is set, Metal on macOS or when
+     * {@link #enableMetal} is set, and every accelerator API whose backend provider is installed.
      */
     public HWAcceleration() {
-        this(defaultApis(), true);
+        this(defaultApis(AcceleratorProviders.installed()), true, AcceleratorProviders.installed());
     }
 
     /**
-     * Enumerates exactly the given APIs; the static {@link #enableCuda} and
-     * {@link #enableVulkan} flags are not consulted.
+     * Enumerates exactly the given APIs; the static {@link #enableCuda}, {@link #enableVulkan}
+     * and {@link #enableHip} flags are not consulted. Accelerator APIs are enumerated through the
+     * providers installed on the application class path.
      *
      * @param apis the APIs to enumerate; not null, not empty
      * @throws IllegalArgumentException when {@code apis} is null, empty or holds null
      */
     public HWAcceleration(Set<BackendType> apis) {
-        this(apis, false);
+        this(apis, false, AcceleratorProviders.installed());
     }
 
-    private HWAcceleration(Set<BackendType> apis, boolean apisFromStaticFlags) {
+    /**
+     * Enumerates exactly the given APIs through an explicit provider table, so an embedder can
+     * supply its accelerator backends itself instead of installing them on the class path.
+     *
+     * @param apis      the APIs to enumerate; not null, not empty
+     * @param providers the accelerator backend providers; not null
+     * @throws IllegalArgumentException when {@code apis} is null, empty or holds null
+     */
+    public HWAcceleration(Set<BackendType> apis, AcceleratorProviders providers) {
+        this(apis, false, providers);
+    }
+
+    private HWAcceleration(Set<BackendType> apis, boolean apisFromStaticFlags, AcceleratorProviders providers) {
         this.apis = validatedApis(apis);
         this.apisFromStaticFlags = apisFromStaticFlags;
+        this.acceleratorBackends = new AcceleratorBackendSet(Objects.requireNonNull(providers,
+                "accelerator providers must not be null"));
         /*
             It is possible we didn't properly shutdown the program previously, in-which case the GPU will be in a bad-state
             So we call shutdown first to ensure that it is ready to be used again.
@@ -124,6 +160,31 @@ public class HWAcceleration {
                 enableVulkan = false;
             }
         }
+        if (this.apis.contains(BackendType.HIP)) {
+            try {
+                initHIP();
+            } catch (Throwable e) {
+                System.out.println("HIP initialization failed (the shim or ROCm runtime may be unavailable): "
+                        + e.getMessage());
+                enumerationFailures.put(BackendType.HIP, String.valueOf(e.getMessage()));
+                enableHip = false;
+            }
+        }
+        if (this.apis.contains(BackendType.METAL)) {
+            try {
+                initMetal();
+            } catch (Throwable e) {
+                System.out.println("Metal initialization failed (the framework is available only on macOS and"
+                        + " the shim may not be built): " + e.getMessage());
+                enumerationFailures.put(BackendType.METAL, String.valueOf(e.getMessage()));
+                enableMetal = false;
+            }
+        }
+        for (BackendType api : this.apis) {
+            if (api.isAccelerator()) {
+                acceleratorBackends.enumerate(api);
+            }
+        }
     }
 
     /**
@@ -137,18 +198,10 @@ public class HWAcceleration {
         if (mode == null) {
             mode = ACCELERATION_MODE.AUTO;
         }
-        switch (mode) {
-            case AUTO:
-                return new HWAcceleration(EnumSet.allOf(BackendType.class));
-            case OPENCL:
-                return new HWAcceleration(EnumSet.of(BackendType.OPENCL));
-            case CUDA:
-                return new HWAcceleration(EnumSet.of(BackendType.CUDA));
-            case VULKAN:
-                return new HWAcceleration(EnumSet.of(BackendType.VULKAN));
-            default:
-                throw new IllegalArgumentException("Unknown acceleration mode: " + mode);
+        if (mode == ACCELERATION_MODE.AUTO) {
+            return new HWAcceleration(EnumSet.allOf(BackendType.class));
         }
+        return new HWAcceleration(EnumSet.of(BackendType.valueOf(mode.name())));
     }
 
     /** The APIs this instance enumerated (unmodifiable). */
@@ -156,7 +209,7 @@ public class HWAcceleration {
         return apis;
     }
 
-    private static Set<BackendType> defaultApis() {
+    private static Set<BackendType> defaultApis(AcceleratorProviders providers) {
         Set<BackendType> defaults = EnumSet.of(BackendType.OPENCL);
         if (enableCuda) {
             defaults.add(BackendType.CUDA);
@@ -164,7 +217,19 @@ public class HWAcceleration {
         if (enableVulkan) {
             defaults.add(BackendType.VULKAN);
         }
+        if (enableHip) {
+            defaults.add(BackendType.HIP);
+        }
+        if (enableMetal || isMacOs()) {
+            defaults.add(BackendType.METAL);
+        }
+        defaults.addAll(providers.installedTypes());
         return defaults;
+    }
+
+    /** True on a host that provides Metal; the shim still has to be built and load there. */
+    private static boolean isMacOs() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).startsWith("mac");
     }
 
     private static Set<BackendType> validatedApis(Set<BackendType> apis) {
@@ -190,46 +255,35 @@ public class HWAcceleration {
      */
     public void shutdown() {
         closeCreatedBackends();
-
-        if (!CUDevices.isEmpty()) {
-            //CUDA
-            try {
-                for (CUDevice device : CUDevices) {
-                    //Release the primary-context retains the devices hold
-                    device.release();
-                }
-                CUDevices.clear();
-            } catch (Throwable e) {
-                System.out.println("CUDA shutdown failed (native libraries may be unavailable): " + e.getMessage());
-            }
-        }
-
-        if (!VkDevices.isEmpty()) {
-            //VULKAN
-            try {
-                for (VkDevice device : VkDevices) {
-                    device.release();
-                }
-                VkDevices.clear();
-            } catch (Throwable e) {
-                System.out.println("Vulkan shutdown failed: " + e.getMessage());
-            }
-        }
-
-        //OPENCL
-        try {
-            for (CLDevice clDevice : CLDevices) {
-                clDevice.release();
-            }
-            CLDevices.clear();
-        } catch (Throwable e) {
-            System.out.println("OpenCL shutdown failed: " + e.getMessage());
-        }
+        // CUDA devices drop their primary-context retains, Vulkan devices their instance references,
+        // OpenCL devices their contexts and queues, HIP devices hold no runtime state.
+        releaseDevices(CUDevices, "CUDA");
+        releaseDevices(VkDevices, "Vulkan");
+        releaseDevices(CLDevices, "OpenCL");
+        releaseDevices(HipDevices, "HIP");
+        releaseDevices(MetalDevices, "Metal");
+        acceleratorBackends.clear();
         synchronized (this) {
             rankedOpenClDevice = null;
             rankedOpenClFilter = null;
             openClRanked = false;
         }
+    }
+
+    /**
+     * Releases every device of one API and empties the list. A failing release is reported and the remaining
+     * devices are still released, so one bad device never keeps the others' driver resources alive.
+     */
+    private static void releaseDevices(List<? extends HardwareDevice> devices, String api) {
+        for (HardwareDevice device : devices) {
+            try {
+                device.release();
+            } catch (Throwable e) {
+                System.out.println(api + " device release failed (native libraries may be unavailable): "
+                        + e.getMessage());
+            }
+        }
+        devices.clear();
     }
 
     /**
@@ -336,16 +390,21 @@ public class HWAcceleration {
 
             try {
                 int[] numDevices = new int[1];
-                clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 0, null, numDevices);
-
-                if (numDevices[0] <= 0) continue;
+                // A failed enumeration leaves numDevices untouched (rusticl reports CL_DEVICE_NOT_FOUND
+                // into a garbage count), and the stub cl_device_ids of a failed platform crash
+                // clGetDeviceInfo. Only enumerate a device list the driver says it has.
+                int countStatus = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 0, null, numDevices);
+                if (countStatus != CL_SUCCESS || numDevices[0] <= 0) continue;
 
                 cl_platform_id platform = platforms[i];
                 cl_context_properties contextProperties = new cl_context_properties();
                 contextProperties.addProperty(CL_CONTEXT_PLATFORM, platform);
 
                 cl_device_id[] devicesArray = new cl_device_id[numDevices[0]];
-                clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, numDevices[0], devicesArray, null);
+                if (clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, numDevices[0], devicesArray, null)
+                        != CL_SUCCESS) {
+                    continue;
+                }
 
                 for (cl_device_id device : devicesArray) {
                     if (device == null) continue;
@@ -356,21 +415,17 @@ public class HWAcceleration {
                         continue;
                     }
 
-                    cl_context context = clCreateContext(
-                            contextProperties, 1, new cl_device_id[]{device},
-                            null, null, null);
-                    cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, null, null);
-
-                    CLDevice clDevice = new CLDevice(device, context, queue);
-
-                    String deviceName = (String) clDevice.getDeviceInfo().get("CL_DEVICE_NAME");
-                    if (deviceName == null || deviceName.trim().isEmpty()) {
-                        clReleaseCommandQueue(queue);
-                        clReleaseContext(context);
+                    CLDevice clDevice;
+                    try {
+                        clDevice = openClDevice(contextProperties, device);
+                    } catch (RuntimeException e) {
+                        System.out.println("OpenCL device of platform " + i + " failed: " + e.getMessage());
+                        enumerationFailures.put(BackendType.OPENCL, String.valueOf(e.getMessage()));
                         continue;
                     }
-
-                    CLDevices.add(clDevice);
+                    if (clDevice != null) {
+                        CLDevices.add(clDevice);
+                    }
                 }
             } catch (Throwable t) {
                 System.out.println("OpenCL platform " + i + " failed: " + t.getMessage());
@@ -380,6 +435,55 @@ public class HWAcceleration {
         queryCLDeviceInfo();
 
         LoggingUtil.getLogger(this).info("Found " + CLDevices.size() + " OpenCL capable device(s)");
+    }
+
+    /**
+     * Creates the context and the in-order command queue of one enumerated GPU and wraps them in a {@link CLDevice}.
+     * Both creations are checked: a device the driver cannot open (an exhausted device reports
+     * {@code CL_OUT_OF_RESOURCES} or {@code CL_OUT_OF_HOST_MEMORY}) throws with the status named instead of yielding
+     * a {@code CLDevice} whose context is invalid. Whatever was created is released when a later step fails, and for
+     * a device that reports no name, which is skipped.
+     *
+     * @return the opened device, or null when the device reports no name
+     * @throws RuntimeException the translated driver failure ({@link OclErrors#translate})
+     */
+    private static CLDevice openClDevice(cl_context_properties properties, cl_device_id device) {
+        int[] status = new int[1];
+        cl_context context;
+        try {
+            context = clCreateContext(properties, 1, new cl_device_id[]{device}, null, null, status);
+        } catch (CLException e) {
+            throw OclErrors.translate(e.getStatus(), "clCreateContext", null, -1, e);
+        }
+        if (status[0] != CL_SUCCESS || context == null) {
+            throw OclErrors.translate(status[0] != CL_SUCCESS ? status[0] : CL_INVALID_CONTEXT,
+                    "clCreateContext", null, -1, null);
+        }
+        cl_command_queue queue = null;
+        try {
+            try {
+                queue = clCreateCommandQueueWithProperties(context, device, null, status);
+            } catch (CLException e) {
+                throw OclErrors.translate(e.getStatus(), "clCreateCommandQueueWithProperties", null, -1, e);
+            }
+            if (status[0] != CL_SUCCESS || queue == null) {
+                throw OclErrors.translate(status[0] != CL_SUCCESS ? status[0] : CL_INVALID_COMMAND_QUEUE,
+                        "clCreateCommandQueueWithProperties", null, -1, null);
+            }
+            CLDevice clDevice = new CLDevice(device, context, queue);
+            String deviceName = (String) clDevice.getDeviceInfo().get("CL_DEVICE_NAME");
+            if (deviceName == null || deviceName.trim().isEmpty()) {
+                clDevice.release();
+                return null;
+            }
+            return clDevice;
+        } catch (RuntimeException | Error e) {
+            if (queue != null) {
+                clReleaseCommandQueue(queue);
+            }
+            clReleaseContext(context);
+            throw e;
+        }
     }
 
     // Matches Mesa/libdrm "pci id for fd N: VVVV:DDDD, driver (null)" messages.
@@ -632,6 +736,42 @@ public class HWAcceleration {
         }
     }
 
+    /**
+     * Enumerates the HIP devices through the JNI shim. Without the shim ({@code HipRuntime}
+     * cannot load, usually because ROCm is not installed or {@code libhipshim} was not built)
+     * nothing is enumerated and the failure reason is recorded. Enumeration creates no device
+     * state: each backend selects the device per thread with {@code hipSetDevice}.
+     */
+    private void initHIP() {
+        if (!HipRuntime.available()) {
+            String reason = HipRuntime.unavailableReason();
+            System.out.println("HIP unavailable: " + reason);
+            enumerationFailures.put(BackendType.HIP, reason);
+            return;
+        }
+        // The enumeration path only calls the ordinal-parameterized queries, so any driver
+        // ordinal works here; each backend creates its own driver for its device.
+        HipDevices.addAll(HipRuntime.enumerate(new com.eonmux.neuralfree.acceleration.hip.JniHipDriver(0)));
+        LoggingUtil.getLogger(this).info("Found " + HipDevices.size() + " HIP capable device(s)");
+    }
+
+    /**
+     * Enumerates Apple GPUs through the Metal JNI shim. Without the shim ({@link MetalRuntime}
+     * cannot load, usually because the host is not macOS or {@code libmetalshim} was not built)
+     * nothing is enumerated and the failure reason is recorded. Enumeration creates no device
+     * state and no backend.
+     */
+    private void initMetal() {
+        if (!MetalRuntime.available()) {
+            String reason = MetalRuntime.unavailableReason();
+            System.out.println("Metal unavailable: " + reason);
+            enumerationFailures.put(BackendType.METAL, reason);
+            return;
+        }
+        MetalDevices.addAll(MetalRuntime.enumerate());
+        LoggingUtil.getLogger(this).info("Found " + MetalDevices.size() + " Metal capable device(s)");
+    }
+
     public ObjectSet<CLDevice> getCLDevices() {
         return CLDevices;
     }
@@ -642,6 +782,33 @@ public class HWAcceleration {
 
     public ObjectSet<VkDevice> getVkDevices() {
         return VkDevices;
+    }
+
+    public ObjectSet<HipDevice> getHipDevices() {
+        return HipDevices;
+    }
+
+    /** The Metal devices this instance enumerated, in framework order. */
+    public ObjectSet<MetalDevice> getMetalDevices() {
+        return MetalDevices;
+    }
+
+    /**
+     * The devices one accelerator API enumerated, in provider order; empty when the API reported
+     * none or was not enumerated by this instance.
+     *
+     * @throws IllegalArgumentException when {@code api} is null or not an accelerator API
+     */
+    public List<AcceleratorDevice> getAcceleratorDevices(BackendType api) {
+        if (api == null) {
+            throw new IllegalArgumentException("API must not be null");
+        }
+        if (!api.isAccelerator()) {
+            throw new IllegalArgumentException(api + " is not an accelerator API; the devices of the built-in APIs"
+                    + " are read through getCLDevices, getCUDevices, getVkDevices, getHipDevices and"
+                    + " getMetalDevices");
+        }
+        return acceleratorBackends.devices(api);
     }
 
     /**
@@ -692,13 +859,17 @@ public class HWAcceleration {
         if (device == null) {
             throw new IllegalArgumentException("Device cannot be null");
         }
-        
+
         if (device instanceof CLDevice) {
             return track(new OclComputeBackend((CLDevice) device));
         } else if (device instanceof CUDevice) {
             return track(new CudaComputeBackend((CUDevice) device));
         } else if (device instanceof VkDevice) {
             return track(((VkDevice) device).getBackend());
+        } else if (device instanceof HipDevice) {
+            return track(new HipComputeBackend((HipDevice) device));
+        } else if (device instanceof MetalDevice) {
+            return track(new MetalComputeBackend((MetalDevice) device));
         }
 
         throw new IllegalArgumentException("Unknown device type: " + device.getClass().getName());
@@ -725,6 +896,37 @@ public class HWAcceleration {
         return track(device.getBackend());
     }
 
+    public ComputeBackend createBackend(HipDevice device) {
+        if (device == null) {
+            throw new IllegalArgumentException("HipDevice cannot be null");
+        }
+        return track(new HipComputeBackend(device));
+    }
+
+    public ComputeBackend createBackend(MetalDevice device) {
+        if (device == null) {
+            throw new IllegalArgumentException("MetalDevice cannot be null");
+        }
+        return track(new MetalComputeBackend(device));
+    }
+
+    /**
+     * Opens an accelerator device this instance enumerated.
+     *
+     * @throws IllegalArgumentException when the device is null or its API is not one this instance enumerated
+     * @throws IllegalStateException    when the device's provider returns no backend or one of another API
+     */
+    public ComputeBackend createBackend(AcceleratorDevice device) {
+        if (device == null) {
+            throw new IllegalArgumentException("Accelerator device cannot be null");
+        }
+        if (!apis.contains(device.backendType())) {
+            throw new IllegalArgumentException("this HWAcceleration does not enumerate " + device.backendType().label()
+                    + "; its APIs are " + apis);
+        }
+        return track(device.openBackend());
+    }
+
     /**
      * Creates a ComputeBackend on the fastest device this host offers.
      *
@@ -740,23 +942,31 @@ public class HWAcceleration {
      * <p>AUTO additionally chooses the API, but only among the APIs this instance
      * enumerated and that found a device. Which APIs those are is fixed at
      * construction: {@link #HWAcceleration()} enumerates OpenCL, plus CUDA when
-     * {@link #enableCuda} and Vulkan when {@link #enableVulkan} was set before
-     * constructing (both default to {@code false}, so such an instance offers AUTO
-     * OpenCL alone unless a flag was set); {@link #HWAcceleration(Set)} enumerates
-     * exactly the given APIs; {@link #forMode}{@code (AUTO)} enumerates all three.</p>
+     * {@link #enableCuda}, Vulkan when {@link #enableVulkan} and HIP when
+     * {@link #enableHip} was set before constructing (all three default to
+     * {@code false}, so such an instance offers AUTO OpenCL alone unless a flag was
+     * set), Metal on macOS or when {@link #enableMetal} was set, plus every
+     * accelerator API whose provider is installed;
+     * {@link #HWAcceleration(Set)} enumerates exactly the given APIs;
+     * {@link #forMode}{@code (AUTO)} enumerates all of them.</p>
      *
      * <p>AUTO is device-first. It settles on one physical device, then drives it
      * with the first API in the order that can: the device named by
-     * {@code -Dneuralfree.device=<substring>} when set, otherwise the OpenCL
-     * ranking's measured winner (else Vulkan's, else CUDA's); the API order is
-     * {@code -Dneuralfree.backend.order} (default {@code vulkan,cuda,opencl}).
-     * The views one GPU offers through several APIs are recognised as one device
-     * by {@link DeviceIdentity#samePhysicalDevice}. When no API runs that device,
-     * each API's own winner is tried, discrete first.</p>
+     * {@code -Dneuralfree.device=<substring>} when set, otherwise the Metal
+     * ranking's winner (else the OpenCL ranking's measured winner, else Vulkan's,
+     * else CUDA's); the API order is
+     * {@code -Dneuralfree.backend.order} (default {@code metal,vulkan,cuda,opencl,hip}, then the
+     * accelerator APIs in declaration order). The views one GPU offers through several APIs are
+     * recognised as one device by {@link DeviceIdentity#samePhysicalDevice}. When no API runs that
+     * device, each API's own winner is tried, discrete first.</p>
+     *
+     * <p>An accelerator API (SYCL/Level Zero, XPU, CANN, Hexagon, OpenVINO, WebGPU, MUSA, zDNN or
+     * ZenDNN) is offered AUTO by the {@link AcceleratorDevice}s its installed
+     * {@link AcceleratorBackendProvider} enumerated, ranked by {@link AcceleratorDeviceRanking}.</p>
      *
      * @param mode The acceleration mode; null means AUTO. AUTO selects among the
      *             enumerated APIs as described above. Specific modes (VULKAN, CUDA,
-     *             OPENCL) only try that API.
+     *             OPENCL, HIP, METAL and the accelerator APIs) only try that API.
      * @return A ComputeBackend for the best available GPU
      * @throws NoBackendAvailableException if no GPU backend can be initialized
      */
@@ -800,6 +1010,25 @@ public class HWAcceleration {
             case OPENCL:
                 return track(BackendSelector.requireAccepted(BackendType.OPENCL, createOpenCLBackendOrThrow(),
                         requirement));
+            case HIP:
+                return track(BackendSelector.requireAccepted(BackendType.HIP, createHipBackendOrThrow(),
+                        requirement));
+            case METAL:
+                return track(BackendSelector.requireAccepted(BackendType.METAL, createMetalBackendOrThrow(),
+                        requirement));
+            case SYCL:
+            case XPU:
+            case CANN:
+            case HEXAGON:
+            case OPENVINO:
+            case WEBGPU:
+            case MUSA:
+            case ZDNN:
+            case ZENDNN: {
+                BackendType api = BackendType.valueOf(mode.name());
+                return track(BackendSelector.requireAccepted(api, acceleratorBackends.openFastestOrThrow(api),
+                        requirement));
+            }
             default:
                 throw new IllegalArgumentException("Unknown acceleration mode: " + mode);
         }
@@ -842,7 +1071,10 @@ public class HWAcceleration {
             "Troubleshooting: " + failureReasons.toString() + ". " +
             "For OpenCL, install OpenCL runtime from your GPU vendor (NVIDIA/AMD/Intel). " +
             "For CUDA, install CUDA Toolkit from NVIDIA. " +
-            "For Vulkan, install Vulkan drivers from your GPU vendor."
+            "For Vulkan, install Vulkan drivers from your GPU vendor. " +
+            "For SYCL/Level Zero, XPU, CANN, Hexagon, OpenVINO, WebGPU, MUSA, zDNN or ZenDNN, install the"
+            + " vendor runtime and a backend provider jar ("
+            + AcceleratorBackendProvider.class.getName() + " in META-INF/services)."
         );
     }
 
@@ -875,6 +1107,9 @@ public class HWAcceleration {
      */
     private String absentReason(BackendType api) {
         String label = BackendSelector.label(api);
+        if (api.isAccelerator()) {
+            return acceleratorBackends.reason(api, apis.contains(api));
+        }
         String failure = enumerationFailures.get(api);
         if (failure != null) {
             return label + ": initialization failed: " + failure;
@@ -890,6 +1125,12 @@ public class HWAcceleration {
             case CUDA:
                 reason = whyUnavailable(label, "enableCuda", apis.contains(api), CUDevices.size());
                 break;
+            case HIP:
+                reason = whyUnavailable(label, "enableHip", apis.contains(api), HipDevices.size());
+                break;
+            case METAL:
+                reason = whyUnavailable(label, "enableMetal", apis.contains(api), MetalDevices.size());
+                break;
             default:
                 reason = whyUnavailable(label, "n/a", apis.contains(api), CLDevices.size());
                 break;
@@ -899,10 +1140,17 @@ public class HWAcceleration {
 
     /** What each API offers AUTO: its devices as candidates and its own ranking's winner. */
     private List<BackendSelector.ApiView> autoViews() {
-        List<BackendSelector.ApiView> views = new ArrayList<>(3);
+        List<BackendSelector.ApiView> views = new ArrayList<>(BackendType.values().length);
+        views.add(metalView());
         views.add(openClView());
         views.add(cudaView());
         views.add(vulkanView());
+        views.add(hipView());
+        for (BackendType api : BackendType.values()) {
+            if (api.isAccelerator()) {
+                views.add(acceleratorBackends.view(api, apis.contains(api)));
+            }
+        }
         return views;
     }
 
@@ -963,6 +1211,44 @@ public class HWAcceleration {
                 null);
     }
 
+    private BackendSelector.ApiView metalView() {
+        if (MetalDevices.isEmpty()) {
+            return BackendSelector.ApiView.absent(BackendType.METAL, absentReason(BackendType.METAL));
+        }
+        MetalDevice best = fastestMetalDevice();
+        List<BackendSelector.Candidate> devices = new ArrayList<>(MetalDevices.size());
+        BackendSelector.Candidate winner = null;
+        for (MetalDevice device : MetalDevices) {
+            BackendSelector.Candidate c = new BackendSelector.Candidate(BackendType.METAL, device.getIdentity(),
+                    device.getDeviceClass(), () -> new MetalComputeBackend(device));
+            devices.add(c);
+            if (device == best) {
+                winner = c;
+            }
+        }
+        return new BackendSelector.ApiView(BackendType.METAL, devices, winner == null ? devices.get(0) : winner,
+                null);
+    }
+
+    private BackendSelector.ApiView hipView() {
+        if (HipDevices.isEmpty()) {
+            return BackendSelector.ApiView.absent(BackendType.HIP, absentReason(BackendType.HIP));
+        }
+        HipDevice best = fastestHipDevice();
+        List<BackendSelector.Candidate> devices = new ArrayList<>(HipDevices.size());
+        BackendSelector.Candidate winner = null;
+        for (HipDevice device : HipDevices) {
+            BackendSelector.Candidate c = new BackendSelector.Candidate(BackendType.HIP, hipIdentity(device),
+                    device.getDeviceClass(), () -> new HipComputeBackend(device));
+            devices.add(c);
+            if (device == best) {
+                winner = c;
+            }
+        }
+        return new BackendSelector.ApiView(BackendType.HIP, devices, winner == null ? devices.get(0) : winner,
+                null);
+    }
+
     /**
      * The OpenCL device to run on: {@link CLDeviceRanking#fastest} over the devices,
      * narrowed first to the names matching {@code -Dneuralfree.device} unless
@@ -1005,6 +1291,16 @@ public class HWAcceleration {
 
     /** The device's cross-API identity, or a name-only identity when the driver query fails. */
     private static DeviceIdentity cudaIdentity(CUDevice device) {
+        try {
+            return device.getIdentity();
+        } catch (RuntimeException e) {
+            String name = device.getDeviceName();
+            return DeviceIdentity.ofName(name == null ? "" : name);
+        }
+    }
+
+    /** The device's cross-API identity, or a name-only identity when the driver query fails. */
+    private static DeviceIdentity hipIdentity(HipDevice device) {
         try {
             return device.getIdentity();
         } catch (RuntimeException e) {
@@ -1127,6 +1423,75 @@ public class HWAcceleration {
      */
     private CUDevice fastestCudaDevice() {
         return CudaDeviceRanking.fastest(CUDevices);
+    }
+
+    /** The fastest HIP device, by compute-unit count times clock ({@link HipDeviceRanking}). */
+    private HipDevice fastestHipDevice() {
+        return HipDeviceRanking.fastest(HipDevices);
+    }
+
+    /** The fastest Metal device, by working-set size with discrete before integrated ({@link MetalDeviceRanking}). */
+    private MetalDevice fastestMetalDevice() {
+        return MetalDeviceRanking.fastest(MetalDevices);
+    }
+
+    private ComputeBackend createMetalBackendOrThrow() {
+        ComputeBackend backend = tryCreateMetalBackend();
+        if (backend == null) {
+            throw explicitModeUnavailable(BackendType.METAL, MetalDevices.size(),
+                    "Metal backend requested but no Metal devices available. "
+                    + "Metal exists only on macOS; build the JNI shim with clang (make native/metal) "
+                    + "and run on an Apple GPU.");
+        }
+        return backend;
+    }
+
+    private ComputeBackend tryCreateMetalBackend() {
+        if (MetalDevices.isEmpty()) {
+            return null;
+        }
+        try {
+            MetalDevice metalDevice = fastestMetalDevice();
+            if (metalDevice != null) {
+                ComputeBackend backend = new MetalComputeBackend(metalDevice);
+                creationFailures.remove(BackendType.METAL);
+                return backend;
+            }
+        } catch (Exception e) {
+            LoggingUtil.getLogger(this).warn("Failed to create Metal backend: {}", e.getMessage());
+            creationFailures.put(BackendType.METAL, String.valueOf(e.getMessage()));
+        }
+        return null;
+    }
+
+    private ComputeBackend createHipBackendOrThrow() {
+        ComputeBackend backend = tryCreateHipBackend();
+        if (backend == null) {
+            throw explicitModeUnavailable(BackendType.HIP, HipDevices.size(),
+                "HIP backend requested but no HIP devices available. "
+                + "Please install the ROCm runtime from AMD, build the JNI shim (make native/hip), "
+                + "and ensure you have an AMD GPU."
+            );
+        }
+        return backend;
+    }
+
+    private ComputeBackend tryCreateHipBackend() {
+        if (HipDevices.isEmpty()) {
+            return null;
+        }
+        try {
+            HipDevice hipDevice = fastestHipDevice();
+            if (hipDevice != null) {
+                ComputeBackend backend = new HipComputeBackend(hipDevice);
+                creationFailures.remove(BackendType.HIP);
+                return backend;
+            }
+        } catch (Exception e) {
+            LoggingUtil.getLogger(this).warn("Failed to create HIP backend: {}", e.getMessage());
+            creationFailures.put(BackendType.HIP, String.valueOf(e.getMessage()));
+        }
+        return null;
     }
 
     private ComputeBackend tryCreateOpenCLBackend() {

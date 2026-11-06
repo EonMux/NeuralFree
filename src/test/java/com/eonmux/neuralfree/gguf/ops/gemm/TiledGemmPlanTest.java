@@ -9,6 +9,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
@@ -33,20 +34,38 @@ public class TiledGemmPlanTest {
 
     @Test
     public void everyWeightTypeOfTheFamilyHasOneTiledKernel() {
-        assertEquals(35, GemmKernels.TILED_TYPES.size());
+        assertEquals(41, GemmKernels.TILED_TYPES.size());
         assertEquals("Q4_K_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.Q4_K));
         assertEquals("BF16_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.BF16));
         assertEquals("Q2_0_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.Q2_0));
+        assertEquals("IQ3_K_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.IQ3_K));
+        assertEquals("IQ3_KS_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.IQ3_KS));
         assertEquals("F8_E4M3_B128_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.F8_E4M3_B128));
+        assertEquals("F8_E4M3_B32_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.F8_E4M3_B32));
         assertEquals("FP4_BNB_MatMul_Tiled", GemmKernels.matmulTiled(GGMLType.FP4_BNB));
         assertFalse(GemmKernels.hasTiled(GGMLType.Q8_1));
         assertFalse(GemmKernels.hasTiled(GGMLType.I32));
         assertFalse(GemmKernels.hasTiled(null));
         List<String> names = GemmKernels.kernelNames();
-        assertEquals(36, names.size());
+        assertEquals(41 + GemmKernels.MMQ_TYPES.size() * 4 + GemmKernels.FP8_TYPES.size() * 2
+                + GemmKernels.W4A8_TYPES.size() * 2 + 2 * 2 + 15, names.size());
         assertEquals("F32_MatMul_Tiled", names.get(0));
-        assertEquals(GemmKernels.TOPK_PARTIAL, names.get(names.size() - 1));
-        assertEquals(36, new TreeSet<>(names).size());
+        assertEquals(GemmKernels.QUANT_MMQ_Q8_1, names.get(names.size() - 15));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_STATIC, names.get(names.size() - 14));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_ROW, names.get(names.size() - 13));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_GROUP128, names.get(names.size() - 12));
+        assertEquals(GemmKernels.QUANT_MMQ_INT8_ASYM, names.get(names.size() - 11));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_STATIC, names.get(names.size() - 10));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_ROW, names.get(names.size() - 9));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_GROUP128, names.get(names.size() - 8));
+        assertEquals(GemmKernels.QUANT_MMQ_FP8_MX, names.get(names.size() - 7));
+        assertEquals(GemmKernels.QUANT_MMQ_FP4_MX, names.get(names.size() - 6));
+        assertEquals(GemmKernels.QUANT_MMQ_FP4_NV, names.get(names.size() - 5));
+        assertEquals(GemmKernels.SPLIT_K_REDUCE, names.get(names.size() - 4));
+        assertEquals(GemmKernels.TOPK_PARTIAL, names.get(names.size() - 3));
+        assertEquals(GemmKernels.ROW_TOPK, names.get(names.size() - 2));
+        assertEquals(GemmKernels.LOGITS_PREFILTER, names.get(names.size() - 1));
+        assertEquals(names.size(), new TreeSet<>(names).size());
     }
 
     @Test(expected = IllegalArgumentException.class)
@@ -66,7 +85,17 @@ public class TiledGemmPlanTest {
         for (GGMLType t : GemmKernels.TILED_TYPES) {
             expected.add(t.name());
         }
-        assertEquals(expected, instantiated);
+        // the hardware-FP8 fast paths reuse the generic element loaders under _Hw kernel names
+        Set<String> hwRows = new TreeSet<>(Arrays.asList("F8_E5M2_Hw", "F8_E4M3_Hw", "F8_E4M3_B128_Hw",
+                "MXFP8_Hw"));
+        assertTrue("the hardware-FP8 rows must instantiate the _Hw kernels", instantiated.containsAll(hwRows));
+        Set<String> unexpected = new TreeSet<>(instantiated);
+        unexpected.removeAll(expected);
+        unexpected.removeAll(hwRows);
+        assertEquals(Set.of(), unexpected);
+        Set<String> missing = new TreeSet<>(expected);
+        missing.removeAll(instantiated);
+        assertEquals(Set.of(), missing);
     }
 
     @Test

@@ -6,13 +6,16 @@ import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixer;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.cpu.block.CpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
+import com.eonmux.neuralfree.gguf.cpu.forward.CpuRecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuScratch;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
+import com.eonmux.neuralfree.gguf.engine.RecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.ops.ssm.CpuSsmConv;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmKernels;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
@@ -31,14 +34,18 @@ import java.util.Objects;
  * the scratch slots Q, K, V (conv outputs) and ATTN_OUT (projection input of the convs, then the decay, then
  * {@code g2}) plus bind-time temporaries. Not thread-safe.
  */
-public final class CpuKdaMixer implements CpuMixer {
+public final class CpuKdaMixer implements CpuMixer, CpuRecurrentTreeMixer {
 
     private CpuMatVec mv;
+    private CpuScratch scratch;
     private int ubatch;
+    private int width;
     private int nHead;
     private int headDim;
     private int dInner;
     private int dConv;
+    private int convFloats;
+    private int scanFloats;
     private float l2Eps;
     private float rmsEps;
     private KdaGateMode gateMode;
@@ -132,6 +139,8 @@ public final class CpuKdaMixer implements CpuMixer {
         }
         l2Eps = DeltaNetBlocks.l2Eps(ctx.spec());
         rmsEps = DeltaNetBlocks.rmsEps(ctx.spec());
+        convFloats = DeltaNetBlocks.toInt(r.convStateFloats(), "conv state of the KDA layer");
+        scanFloats = DeltaNetBlocks.toInt(r.stateFloats(), "scan state of the KDA layer");
     }
 
     /** Projection matrices, their LoRA delta sites, the norm weight and the conv / decay vectors. */
@@ -188,6 +197,8 @@ public final class CpuKdaMixer implements CpuMixer {
     /** Scratch rows and temporaries of one ubatch, the row views of the scan and the layer's recurrent states. */
     private void bindScratch(CpuForwardContext ctx, LayerSpec layer, RecurrentSpec r) {
         CpuScratch scratch = ctx.scratch();
+        this.scratch = scratch;
+        width = DeltaNetBlocks.mixerWidth(layer);
         qkv[0] = slot(scratch, CpuScratch.Q, dInner);
         qkv[1] = slot(scratch, CpuScratch.K, dInner);
         qkv[2] = slot(scratch, CpuScratch.V, dInner);
@@ -249,15 +260,57 @@ public final class CpuKdaMixer implements CpuMixer {
 
     @Override
     public void decode(int pos, float[] in, float[] out) {
-        run(1, in, out);
+        run(1, 0, 0, 0, in, out);
     }
 
     @Override
     public void prefill(int pos0, int n, float[] in, float[] out) {
-        run(n, in, out);
+        run(n, 0, 0, 0, in, out);
     }
 
-    private void run(int n, float[] in, float[] out) {
+    /**
+     * One batched step over the rows of {@code s}: one segment runs whole ({@link #run} at its sequence's state
+     * rows), several segments run one at a time through a scratch relay, each with its own sequence's conv and scan
+     * state rows.
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        if (s.nSeg() == 1) {
+            run(s.nTokens(), 0, 0, s.seq(0), in, out);
+            return;
+        }
+        if (!bound) {
+            throw new IllegalStateException("KDA mixer is not bound");
+        }
+        float[] buf = scratch.temp(TEMP_SEGMENT, Math.multiplyExact(ubatch, width));
+        float[] bufOut = scratch.temp(TEMP_SEGMENT_OUT, Math.multiplyExact(ubatch, width));
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            int len = s.len(seg);
+            System.arraycopy(in, start * width, buf, 0, len * width);
+            run(len, 0, 0, s.seq(seg), buf, bufOut);
+            System.arraycopy(bufOut, 0, out, start * width, len * width);
+        }
+    }
+
+    private static final String TEMP_SEGMENT = "CpuKdaMixer.segmentIn";
+    private static final String TEMP_SEGMENT_OUT = "CpuKdaMixer.segmentOut";
+
+    private void run(int n, int inOff, int outOff, int seq, float[] in, float[] out) {
+        if (!bound) {
+            throw new IllegalStateException("KDA mixer is not bound");
+        }
+        states.clearTransient();
+        runState(n, inOff, outOff, in, out, states.conv, states.convBase(seq), states.scan, states.scanBase(seq));
+    }
+
+    /**
+     * The step against explicit state: the committed rows for a decode step ({@link #run}), one stack slot of the
+     * tree round for a verify row ({@link #treeStep}). Identical arithmetic on both sides, so a replayed row
+     * reproduces the state the verify step used bit for bit.
+     */
+    private void runState(int n, int inOff, int outOff, float[] in, float[] out,
+                          float[] convState, int convBase, float[] scanState, int scanBase) {
         if (!bound) {
             throw new IllegalStateException("KDA mixer is not bound");
         }
@@ -267,59 +320,106 @@ public final class CpuKdaMixer implements CpuMixer {
             throw new IllegalArgumentException("KDA step of " + n + " tokens is outside [1, " + ubatch + "]");
         }
         DeltaNetBlocks.checkStepArrays("KDA mixer", in, out, working);
-        states.clearTransient();
         if (wQkv != null) {
-            mv.matmul(wQkv, in, 0, work, 0, n);
-            qkvDeltas.applyRows(n, in, 0, work, 0);
+            mv.matmul(wQkv, in, inOff, work, 0, n);
+            qkvDeltas.applyRows(n, in, inOff, work, 0);
             for (int i = 0; i < 3; i++) {
-                conv(i, n, i * dInner, 3 * dInner);
+                conv(i, n, i * dInner, 3 * dInner, convState, convBase);
             }
         } else {
             for (int i = 0; i < 3; i++) {
-                mv.matmul(wSeparate[i], in, 0, work, 0, n);
-                separateDeltas[i].applyRows(n, in, 0, work, 0);
-                conv(i, n, 0, dInner);
+                mv.matmul(wSeparate[i], in, inOff, work, 0, n);
+                separateDeltas[i].applyRows(n, in, inOff, work, 0);
+                conv(i, n, 0, dInner, convState, convBase);
             }
         }
 
         if (wFb != null) {
-            mv.matmul(wFa, in, 0, fa, 0, n);
-            faDeltas.applyRows(n, in, 0, fa, 0);
+            mv.matmul(wFa, in, inOff, fa, 0, n);
+            faDeltas.applyRows(n, in, inOff, fa, 0);
             mv.matmul(wFb, fa, 0, work, 0, n);
             fbDeltas.applyRows(n, fa, 0, work, 0);
         } else {
-            mv.matmul(wFa, in, 0, work, 0, n);
-            faDeltas.applyRows(n, in, 0, work, 0);
+            mv.matmul(wFa, in, inOff, work, 0, n);
+            faDeltas.applyRows(n, in, inOff, work, 0);
         }
-        mv.matmul(wBeta, in, 0, bl, 0, n);
-        betaDeltas.applyRows(n, in, 0, bl, 0);
+        mv.matmul(wBeta, in, inOff, bl, 0, n);
+        betaDeltas.applyRows(n, in, inOff, bl, 0);
         CpuGatedDeltaNet.gatePrep(gateShape, n, fRows, bRows, dtBias, ssmA, g, 0, beta, 0);
 
         CpuOps.norm(NormKind.L2_GDN, l2Eps, qkv[0], 0, qkv[0], 0, n * nHead, headDim, null, null);
         CpuOps.norm(NormKind.L2_GDN, l2Eps, qkv[1], 0, qkv[1], 0, n * nHead, headDim, null, null);
         CpuParallel.parallelFor(nHead, 1, (h0, h1) -> CpuGatedDeltaNet.scanHeads(scanShape, n, qRows, kRows, vRows,
-                g, 0, beta, 0, states.scan, 0, vRows, h0, h1));
+                g, 0, beta, 0, scanState, scanBase, vRows, h0, h1));
 
         float[] o = qkv[2];
         CpuOps.norm(NormKind.RMS, rmsEps, o, 0, o, 0, n * nHead, headDim, normW, null);
         if (wGa != null) {
-            mv.matmul(wGa, in, 0, ga, 0, n);
-            gaDeltas.applyRows(n, in, 0, ga, 0);
+            mv.matmul(wGa, in, inOff, ga, 0, n);
+            gaDeltas.applyRows(n, in, inOff, ga, 0);
             mv.matmul(wGb, ga, 0, work, 0, n);
             gbDeltas.applyRows(n, ga, 0, work, 0);
         } else {
-            mv.matmul(wG, in, 0, work, 0, n);
-            gDeltas.applyRows(n, in, 0, work, 0);
+            mv.matmul(wG, in, inOff, work, 0, n);
+            gDeltas.applyRows(n, in, inOff, work, 0);
         }
         CpuOps.gluRows(GluOp.SIGMUL, ActParams.NONE, n, dInner, work, 0, dInner, o, 0, dInner, o, 0, dInner);
-        mv.matmul(wOut, o, 0, out, 0, n);
-        outDeltas.applyRows(n, o, 0, out, 0);
+        mv.matmul(wOut, o, 0, out, outOff, n);
+        outDeltas.applyRows(n, o, 0, out, outOff);
     }
 
     /** Causal conv of slice {@code i} (q, k or v) from {@code work} into its slot, with SiLU and no bias. */
-    private void conv(int i, int n, int xOff, int xStride) {
+    private void conv(int i, int n, int xOff, int xStride, float[] convState, int convBase) {
         CpuSsmConv.forward(dInner, dConv, n, SsmKernels.CONV_FLAG_SILU, work, xOff, xStride, convW[i], null,
-                states.conv, 0, i * dInner, qkv[i], 0, dInner);
+                convState, convBase, i * dInner, qkv[i], 0, dInner);
+    }
+
+    @Override
+    public String treeStepRefusal() {
+        return null;
+    }
+
+    @Override
+    public int treeRowWidth() {
+        return width;
+    }
+
+    @Override
+    public void treeStep(CpuRecurrentTreeRound round, float[] in, float[] out) {
+        if (!bound) {
+            throw new IllegalStateException("KDA mixer is not bound");
+        }
+        long[] mask = round.mask();
+        int realRows = round.realRows();
+        float[] convStack = round.convStack();
+        float[] scanStack = round.scanStack();
+        // a memory-less layer zeroes its state at every step, the committed rows it sees are the zeroed ones
+        states.clearTransient();
+        for (int row = 0; row < realRows; row++) {
+            int depth = RecurrentTreeRound.depth(mask[row]);
+            if (depth < 0) {
+                throw new IllegalArgumentException("the tree step's row " + row + " is padding, the mixer runs the"
+                        + " computed rows");
+            }
+            int parent = RecurrentTreeRound.parentRow(mask[row], row);
+            seedSlot(convFloats, convStack, row, depth, parent, states.conv, states.convBase(0));
+            seedSlot(scanFloats, scanStack, row, depth, parent, states.scan, states.scanBase(0));
+            runState(1, row * width, row * width, in, out,
+                    convStack, row * convFloats, scanStack, row * scanFloats);
+        }
+    }
+
+    /** Fills the row's stack slot: the committed state at the root, else the parent row's slot. */
+    private static void seedSlot(int floats, float[] stack, int row, int depth, int parent, float[] committed,
+                                 int committedBase) {
+        if (floats == 0) {
+            return;
+        }
+        if (depth == 0) {
+            System.arraycopy(committed, committedBase, stack, row * floats, floats);
+        } else {
+            System.arraycopy(stack, parent * floats, stack, row * floats, floats);
+        }
     }
 
     @Override

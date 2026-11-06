@@ -54,6 +54,12 @@ public final class GpuPleExtra implements GpuLayerExtra {
     private ScratchSlot inputs;
     private LayerGate gate;
 
+    /** The gate and the per-layer inputs are per row, exact over any step layout. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
     @Override
     public void bind(GpuForwardContext ctx, LayerSpec layer) {
         Objects.requireNonNull(ctx, "ctx");
@@ -168,7 +174,8 @@ public final class GpuPleExtra implements GpuLayerExtra {
      * Computes the per-layer inputs of a step into {@link #TEMP_INPUTS} ({@link PleLayout}). Dispatches for
      * {@code T} tokens: the {@code per_layer_model_proj} projection, a scale by {@code 1/sqrt(n_embd)},
      * {@code LLM_RowNorm} (RMS, {@code T*n_layer} rows of {@code width}); with a token table, the row lookup
-     * ({@link RowLookup}), a scale by {@code sqrt(width)}, the add and a scale by {@code 1/sqrt(2)}.
+     * ({@link RowLookup#stepTokens}, the padding row for an embedding row), a scale by {@code sqrt(width)}, the add
+     * and a scale by {@code 1/sqrt(2)}.
      */
     static final class PerLayerInputs {
         private final PleLayout layout;
@@ -377,7 +384,10 @@ public final class GpuPleExtra implements GpuLayerExtra {
         }
 
         /**
-         * Looks up the rows of the step's {@code nTokens} tokens into {@code out[outOff + t*cols ...]}.
+         * Looks up the rows of the step's {@code nTokens} tokens into {@code out[outOff + t*cols ...]}; an embedding
+         * row of the step reads the padding row ({@link PleLayout#tableRow}). The device ids already hold it: the
+         * embedding stage writes lookup id {@link PleLayout#EMBEDDING_ROW_TOKEN} for an embedding row to
+         * {@link ScratchSlots#TOKEN_IDS} and the null token to the host record, which is mapped here.
          *
          * @throws IllegalStateException when this lookup was made for host ids
          */
@@ -391,6 +401,9 @@ public final class GpuPleExtra implements GpuLayerExtra {
             }
             int[] ids = hostArray(nTokens);
             stepTokens.read(nTokens, ids, 0);
+            for (int t = 0; t < nTokens; t++) {
+                ids[t] = PleLayout.tableRow(ids[t]);
+            }
             ops.embed(table, ids, out, outOff);
         }
 

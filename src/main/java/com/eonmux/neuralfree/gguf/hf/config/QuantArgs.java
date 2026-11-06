@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.hf.config;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -359,12 +360,33 @@ public final class QuantArgs {
 
     /**
      * One Quark layer config ({@code weight}, {@code input_tensors}, {@code output_tensors}), as V quark.py
-     * dispatches it. A single-element spec list is unwrapped; a longer one (two-level weight specs) is rejected.
-     * FP8 {@code per_block} weights with {@code [R, 32]} blocks and {@code float8_e8m0fnu} scales are the 2-D MXFP8
-     * spelling (V ocp_mx_utils.ocp_mx_weight_dtype_and_rows): one E8M0 scale per R rows and 32 columns.
+     * dispatches it. A single-element spec list is unwrapped. Two-level weight and input specs that match V
+     * quark.py {@code _is_nvfp4} are Quark NVFP4: fp4 per-group weights with group size 16 followed by a per-tensor
+     * {@code fp8_e4m3} scale, and fp4 per-group dynamic input activations with group size 16 followed by a
+     * per-tensor {@code fp8_e4m3} scale. Any other multi-entry spec is rejected, as in vLLM. FP8 {@code per_block}
+     * weights with {@code [R, 32]} blocks and {@code float8_e8m0fnu} scales are the 2-D MXFP8 spelling
+     * (V ocp_mx_utils.ocp_mx_weight_dtype_and_rows): one E8M0 scale per R rows and 32 columns.
      */
     static QuantArgs quark(Map<String, Object> layer, String packMethod, String where) {
-        Map<String, Object> w = quarkSpec(layer.get("weight"), where + ".weight");
+        List<Map<String, Object>> weights = quarkSpecs(layer.get("weight"), where + ".weight");
+        List<Map<String, Object>> inputs = quarkSpecs(layer.get("input_tensors"), where + ".input_tensors");
+        if (weights.size() > 1 || inputs.size() > 1) {
+            if (!isNvfp4(weights, inputs)) {
+                throw new GgufFormatException("unsupported quant_method 'quark': " + where
+                        + ".weight and .input_tensors have multi-entry specs; Quark multi-entry weight or activation"
+                        + " specs are only supported for NVFP4 (fp4 per_group group_size 16 with an fp8_e4m3"
+                        + " per_tensor scale)");
+            }
+            return quarkNvfp4(layer, where);
+        }
+        return quarkSingle(layer, packMethod, where, weights, inputs);
+    }
+
+    /** The single-entry Quark spec dialects: int4/uint4, int8, FP8, OCP-MX FP4/FP6 and FP8 per-block. */
+    private static QuantArgs quarkSingle(Map<String, Object> layer, String packMethod, String where,
+                                         List<Map<String, Object>> weights,
+                                         List<Map<String, Object>> inputs) {
+        Map<String, Object> w = weights.isEmpty() ? null : weights.get(0);
         if (w == null) {
             throw new GgufFormatException(where + ": Quark layer config has no 'weight' spec");
         }
@@ -405,7 +427,7 @@ public final class QuantArgs {
         if (qscheme != null && !qscheme.startsWith("per_")) {
             throw unsupported(where, "Quark qscheme '" + qscheme + "'");
         }
-        Map<String, Object> in = quarkSpec(layer.get("input_tensors"), where + ".input_tensors");
+        Map<String, Object> in = inputs.isEmpty() ? null : inputs.get(0);
         if (in != null) {
             ActQuantScheme s = quarkActivation(in, where + ".input_tensors");
             if (s != null) {
@@ -414,19 +436,80 @@ public final class QuantArgs {
                 b.actUnemulated("Quark input_tensors " + describe(in));
             }
         }
-        Map<String, Object> out = quarkSpec(layer.get("output_tensors"), where + ".output_tensors");
+        Map<String, Object> out = quarkOutputSpec(layer.get("output_tensors"), where + ".output_tensors");
         if (out != null) {
             b.outputActivations("Quark output_tensors " + describe(out));
         }
         return b.build();
     }
 
-    private static Map<String, Object> quarkSpec(Object v, String where) {
+    /**
+     * The arguments of the Quark NVFP4 layout: two-level weight and input specs whose first entry is a 16-element
+     * fp4 group and whose second is the per-tensor {@code fp8_e4m3} global scale (V quark_nvfp4.py). The global
+     * scales are the stored {@code weight_scale_2} and {@code input_scale_2} tensors, so the activations are
+     * emulated as {@link ActQuantScheme#NVFP4}.
+     */
+    private static QuantArgs quarkNvfp4(Map<String, Object> layer, String where) {
+        Builder b = builder(QuantFormat.NVFP4_QUARK).actScheme(ActQuantScheme.NVFP4);
+        Map<String, Object> out = quarkOutputSpec(layer.get("output_tensors"), where + ".output_tensors");
+        if (out != null) {
+            b.outputActivations("Quark output_tensors " + describe(out));
+        }
+        return b.build();
+    }
+
+    /**
+     * True when the two-level weight and input specs are V quark.py {@code _is_nvfp4}: fp4 per-group weights with
+     * group size 16 followed by a per-tensor {@code fp8_e4m3} scale, and the same pair for the input activations
+     * with the fp4 entry dynamic.
+     */
+    private static boolean isNvfp4(List<Map<String, Object>> weights, List<Map<String, Object>> inputs) {
+        return weights.size() == 2 && inputs.size() == 2
+                && isFp4Group(weights.get(0), false) && isFp4Group(inputs.get(0), true)
+                && isGlobalScale(weights.get(1)) && isGlobalScale(inputs.get(1));
+    }
+
+    private static boolean isFp4Group(Map<String, Object> spec, boolean dynamic) {
+        Object group = spec.get("group_size");
+        boolean isDynamic = Boolean.TRUE.equals(spec.get("is_dynamic"));
+        return "fp4".equals(spec.get("dtype")) && "per_group".equals(spec.get("qscheme"))
+                && group instanceof Number && ((Number) group).longValue() == 16 && isDynamic == dynamic;
+    }
+
+    private static boolean isGlobalScale(Map<String, Object> spec) {
+        return "fp8_e4m3".equals(spec.get("dtype")) && "per_tensor".equals(spec.get("qscheme"))
+                && !Boolean.TRUE.equals(spec.get("is_dynamic"));
+    }
+
+    /** The objects of a Quark spec or spec list; an absent spec and an empty list are no specs. */
+    private static List<Map<String, Object>> quarkSpecs(Object v, String where) {
+        List<Map<String, Object>> specs = new ArrayList<>();
+        if (v == null) {
+            return specs;
+        }
+        if (v instanceof List) {
+            for (Object item : (List<?>) v) {
+                if (!(item instanceof Map)) {
+                    throw new GgufFormatException(where + ": expected an object, got " + HfConfig.typeName(item));
+                }
+                specs.add(HfConfig.asObject(item));
+            }
+            return specs;
+        }
+        if (!(v instanceof Map)) {
+            throw new GgufFormatException(where + ": expected an object, got " + HfConfig.typeName(v));
+        }
+        specs.add(HfConfig.asObject(v));
+        return specs;
+    }
+
+    /** One output-tensor spec; a multi-entry output spec has no NF mapping. */
+    private static Map<String, Object> quarkOutputSpec(Object v, String where) {
         if (v instanceof List) {
             List<?> l = (List<?>) v;
             if (l.size() > 1) {
                 throw new GgufFormatException("unsupported quant_method 'quark': " + where
-                        + " is a two-level spec list; Quark multi-entry weight specs are not supported");
+                        + " is a multi-entry spec list; Quark multi-entry output specs are not supported");
             }
             v = l.isEmpty() ? null : l.get(0);
         }
@@ -576,7 +659,7 @@ public final class QuantArgs {
                 case BITNET:
                     bits = 2;
                     break;
-                case NVFP4_CT: case NVFP4_MODELOPT: case FPQUANT_NVFP4:
+                case NVFP4_CT: case NVFP4_MODELOPT: case NVFP4_QUARK: case FPQUANT_NVFP4:
                     bits = 4;
                     groupSize = 16;
                     strategy = Strategy.GROUP;

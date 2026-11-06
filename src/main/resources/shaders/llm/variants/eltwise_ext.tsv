@@ -3,3 +3,4 @@
 # eltwise_ext.cl
 LLM_Copy2D_F32	eltwise_ext.comp	OP=OP_COPY2D_F32
 LLM_Axpby_F32	eltwise_ext.comp	OP=OP_AXPBY_F32
+LLM_MuddMix	eltwise_ext.comp	OP=OP_MUDD_MIX

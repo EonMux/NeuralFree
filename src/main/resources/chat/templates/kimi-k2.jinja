@@ -1,0 +1,17 @@
+{#- llama.cpp kimi-k2 chat template (src/llama-chat.cpp:862-880): tool results take the system marker. -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- '<|im_system|>system<|im_middle|>' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '<|im_user|>user<|im_middle|>' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- '<|im_assistant|>assistant<|im_middle|>' -}}
+    {%- elif message['role'] == 'tool' -%}
+        {{- '<|im_system|>tool<|im_middle|>' -}}
+    {%- endif -%}
+    {{- content ~ '<|im_end|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|im_assistant|>assistant<|im_middle|>' -}}
+{%- endif -%}

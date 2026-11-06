@@ -145,7 +145,7 @@ public class SafetensorsHeaderTest {
         assertEquals(64, StDType.C64.bits());
         assertSame(GGMLType.BF16, StDType.BF16.directType());
         assertNull(StDType.U8.directType());
-        assertNull(StDType.F8_E4M3.directType());
+        assertSame(GGMLType.F8_E4M3FN, StDType.F8_E4M3.directType());
         assertSame(StDType.I64, StDType.forDirectType(GGMLType.I64));
         assertNull(StDType.forDirectType(GGMLType.Q8_0));
     }
@@ -301,6 +301,68 @@ public class SafetensorsHeaderTest {
     @Test
     public void rejectsDataPastTheEndOfTheFile() throws IOException {
         assertInvalid(raw("{" + tensor("a", "U8", "[8]", 0, 8) + "}", 4), "runs past the end of the file");
+    }
+
+    // ------------------------------------------------------------------ fetched headers
+
+    /** The prefix {@link SafetensorsHeader#read} would read from {@code p}: the length field and the JSON bytes. */
+    private static byte[] prefixOf(Path p) throws IOException {
+        byte[] whole = Files.readAllBytes(p);
+        long n = ByteBuffer.wrap(whole, 0, 8).order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong(0);
+        return Arrays.copyOf(whole, (int) (8 + n));
+    }
+
+    @Test
+    public void parsesAHeaderFetchedApartFromItsData() throws IOException {
+        Path p = file("remote.safetensors");
+        SafetensorsWriter.builder()
+                .add("w", StDType.F32, new long[]{2, 3}, ramp(0, 24))
+                .add("bias", StDType.BF16, new long[]{3}, ramp(50, 6))
+                .metadata("format", "pt")
+                .build()
+                .write(p);
+        SafetensorsHeader local = read(p);
+        SafetensorsHeader remote = SafetensorsHeader.parse(prefixOf(p), Files.size(p), "remote.safetensors");
+        assertEquals(local.headerLength(), remote.headerLength());
+        assertEquals(local.dataStart(), remote.dataStart());
+        assertEquals(local.dataLength(), remote.dataLength());
+        assertEquals(local.metadata(), remote.metadata());
+        assertEquals(names(local), names(remote));
+        assertEquals(local.tensor("w").begin(), remote.tensor("w").begin());
+        assertEquals(local.tensor("w").byteLength(), remote.tensor("w").byteLength());
+        assertArrayEquals(local.tensor("w").shape(), remote.tensor("w").shape());
+    }
+
+    @Test
+    public void refusesAFetchedHeaderShorterThanItsLengthField() {
+        IOException e = assertThrows(IOException.class,
+                () -> SafetensorsHeader.parse(new byte[4], 100, "remote.safetensors"));
+        assertTrue(e.getMessage(), e.getMessage().startsWith("Invalid safetensors file 'remote.safetensors': "));
+        assertTrue(e.getMessage(), e.getMessage().contains("fewer than the 8-byte header length field"));
+    }
+
+    @Test
+    public void refusesAFetchedHeaderWhoseLengthFieldDisagreesWithItsBytes() throws IOException {
+        Path p = file("short.safetensors");
+        SafetensorsWriter.builder().add("w", StDType.F32, new long[]{2}, ramp(0, 8)).build().write(p);
+        byte[] prefix = prefixOf(p);
+        byte[] shortPrefix = Arrays.copyOf(prefix, prefix.length - 1);
+        IOException e = assertThrows(IOException.class,
+                () -> SafetensorsHeader.parse(shortPrefix, Files.size(p), "remote.safetensors"));
+        assertTrue(e.getMessage(), e.getMessage().contains("bytes after its length field, but the field announces"));
+    }
+
+    @Test
+    public void refusesAFetchedHeaderWhoseDataDoesNotEndAtTheFileSize() throws IOException {
+        Path p = file("size.safetensors");
+        SafetensorsWriter.builder().add("w", StDType.F32, new long[]{2}, ramp(0, 8)).build().write(p);
+        byte[] prefix = prefixOf(p);
+        IOException trailing = assertThrows(IOException.class,
+                () -> SafetensorsHeader.parse(prefix, Files.size(p) + 3, "remote.safetensors"));
+        assertTrue(trailing.getMessage(), trailing.getMessage().contains("3 trailing bytes follow"));
+        IOException past = assertThrows(IOException.class,
+                () -> SafetensorsHeader.parse(prefix, Files.size(p) - 1, "remote.safetensors"));
+        assertTrue(past.getMessage(), past.getMessage().contains("runs past the end of the file"));
     }
 
     private static List<String> names(SafetensorsHeader h) {

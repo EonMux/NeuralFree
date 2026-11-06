@@ -1,4 +1,4 @@
-# chkhsh.tsv - Generated from llama.cpp a37cc4610 by the updateHfTables Gradle task; do not edit. Rows: 103
+# chkhsh.tsv - Generated from llama.cpp dde879bc4 by the updateHfTables Gradle task; do not edit. Rows: 104
 # sha256	pre_name	repo
 b6e8e1518dc4305be2fe39c313ed643381c4da5db34a98f6a04c093f8afbe99b	chatglm-bpe	THUDM/glm-4-9b-chat
 81d72c7348a9f0ebe86f23298d37debe0a5e71149e29bd283904c02262b27516	chatglm-bpe	THUDM/glm-4-9b-chat
@@ -6,6 +6,7 @@ a1336059768a55c99a734006ffb02203cd450fed003e9a71886c88acf24fdbc2	glm4	THUDM/glm-
 9ca2dd618e8afaf09731a7cf6e2105b373ba6a1821559f258b272fe83e6eb902	glm4	zai-org/GLM-4.5-Air
 cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267	glm4	zai-org/GLM-4.7-Flash
 1431a23e583c97432bc230bff598d103ddb5a1f89960c8f1d1051aaa944d0b35	minerva-7b	sapienzanlp/Minerva-7B-base-v1.0
+6e4d72c6e5260b90606e26a0931fa15e4b42ec6e97719d12919f2b1f93478262	domyn-small	domyn/Domyn-Small-v1.0
 7e57df22b1fe23a7b1e1c7f3dc4e3f96d43a4eb0836d0c6bdc3436d7b2f1c664	hunyuan	tencent/Hunyuan-A13B-Instruct
 bba3b3366b646dbdded5dbc42d59598b849371afc42f7beafa914afaa5b70aa6	hunyuan-dense	tencent/Hunyuan-4B-Instruct
 e6ddf9c6686791c12d698d34c31ab9be1fea9af5a3d9a6909783ab382198ae1c	hy_v4	tencent/Hy4-preview

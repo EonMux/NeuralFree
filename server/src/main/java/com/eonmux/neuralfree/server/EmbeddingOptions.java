@@ -12,29 +12,77 @@ import java.util.List;
 
 /**
  * How one embeddings request shapes its vectors, with the llama.cpp and vLLM fields: {@code embd_normalize}
- * (llama.cpp's modes, {@link EmbeddingNorm}; default 2, euclidean), {@code use_activation} or {@code normalize}
- * false for raw vectors (vLLM), {@code dimensions} (the first {@code n} values, normalized after the cut, as vLLM's
- * matryoshka truncation), {@code truncate_prompt_tokens} (keep the last {@code n} tokens, -1 for the context
- * length), {@code add_special_tokens} (default true) and {@code encoding_format} {@code float} or {@code base64}
- * (float32 bytes, little-endian unless {@code endianness} is {@code big}). Immutable.
+ * (llama.cpp's modes, {@link EmbeddingNorm}; default 2, euclidean), {@code use_activation} false for raw vectors
+ * (vLLM; the removed {@code normalize} refuses, as vLLM refuses it), {@code dimensions} (the first {@code n}
+ * values, normalized after the cut, as vLLM's matryoshka truncation), {@code truncate_prompt_tokens} ({@code n}
+ * tokens, -1 for the context length) cut from the {@code truncation_side} ({@code left}, the default, keeps the
+ * last tokens; {@code right} keeps the first, as vLLM's), {@code add_special_tokens} (default true) and {@code
+ * encoding_format} {@code float} or {@code base64} (float32 bytes, little-endian unless {@code endianness} is
+ * {@code big}). Immutable.
  *
  * @param norm          the normalization mode
  * @param dimensions    the kept leading values, or 0 for all
- * @param truncate      the kept trailing prompt tokens, or 0 for all
+ * @param truncate      the kept prompt tokens, or 0 for all
+ * @param keepFirst     whether truncation keeps the first tokens ({@code truncation_side} right) instead of the last
  * @param addSpecial    whether text inputs get the vocabulary's BOS/EOS (CLS/SEP)
  * @param base64        whether vectors are written as base64 float32 bytes
  * @param order         the byte order of base64 vectors
+ * @param sparse        whether the model answers a SPLADE sparse embedding, whose vocab-aligned weights stay raw
  */
-record EmbeddingOptions(int norm, int dimensions, int truncate, boolean addSpecial, boolean base64,
-                        ByteOrder order) {
+record EmbeddingOptions(int norm, int dimensions, int truncate, boolean keepFirst, boolean addSpecial,
+                        boolean base64, ByteOrder order, boolean sparse) {
 
     /** The options of {@code body} for a model whose prompts hold at most {@code contextLength} tokens. */
     static EmbeddingOptions of(JsonView body, int contextLength) {
-        return new EmbeddingOptions(norm(body), dimensions(body), truncate(body, contextLength),
-                body.optBool("add_special_tokens", true), base64(body), order(body));
+        return of(body, contextLength, false);
+    }
+
+    /**
+     * {@link #of} for a model whose answers are dense vectors only when {@code sparse} is false: a sparse
+     * embedding's weights are the raw {@code log1p(relu(x))} scores, so the fields that rescale or cut them refuse
+     * by name and the vectors leave the service unnormalized.
+     */
+    static EmbeddingOptions of(JsonView body, int contextLength, boolean sparse) {
+        if (body.raw("normalize") != null) {
+            throw ServerJson.badRequest("Parameter `normalize` was removed; use `use_activation` instead.");
+        }
+        if (!sparse) {
+            return new EmbeddingOptions(norm(body), dimensions(body), truncate(body, contextLength), keepFirst(body),
+                    body.optBool("add_special_tokens", true), base64(body), order(body), false);
+        }
+        if (body.raw("embd_normalize") != null) {
+            throw ServerJson.badRequest("embd_normalize does not apply to a sparse embedding; the vector holds the"
+                    + " raw log1p(relu(x)) weights over the vocabulary, which normalization would rescale");
+        }
+        if (body.raw("dimensions") != null) {
+            throw ServerJson.badRequest("dimensions does not apply to a sparse embedding; the vector holds one"
+                    + " weight per vocabulary entry, and cutting it would misalign the vocabulary");
+        }
+        return new EmbeddingOptions(EmbeddingNorm.NONE, 0, truncate(body, contextLength), keepFirst(body),
+                body.optBool("add_special_tokens", true), base64(body), order(body), true);
+    }
+
+    /**
+     * The truncation fields only ({@code truncate_prompt_tokens}, {@code truncation_side}), for the score and
+     * rerank pairs that cut a composed prompt without shaping vectors; the vector fields stay at their defaults.
+     */
+    static EmbeddingOptions truncation(JsonView body, int contextLength) {
+        return new EmbeddingOptions(EmbeddingNorm.EUCLIDEAN, 0, truncate(body, contextLength), keepFirst(body),
+                true, false, ByteOrder.LITTLE_ENDIAN, false);
+    }
+
+    private static boolean keepFirst(JsonView body) {
+        String side = body.optStr("truncation_side", "left");
+        if (!side.equals("left") && !side.equals("right")) {
+            throw ServerJson.badRequest("truncation_side must be left or right, got '" + side + "'");
+        }
+        return side.equals("right");
     }
 
     private static int norm(JsonView body) {
+        if (body.raw("normalize") != null) {
+            throw ServerJson.badRequest("Parameter `normalize` was removed; use `use_activation` instead.");
+        }
         if (body.raw("embd_normalize") != null) {
             int mode = body.i32("embd_normalize");
             if (mode < EmbeddingNorm.NONE) {
@@ -43,8 +91,7 @@ record EmbeddingOptions(int norm, int dimensions, int truncate, boolean addSpeci
             }
             return mode;
         }
-        boolean activation = body.optBool("use_activation", body.optBool("normalize", true));
-        return activation ? EmbeddingNorm.EUCLIDEAN : EmbeddingNorm.NONE;
+        return body.optBool("use_activation", true) ? EmbeddingNorm.EUCLIDEAN : EmbeddingNorm.NONE;
     }
 
     private static int dimensions(JsonView body) {
@@ -97,9 +144,12 @@ record EmbeddingOptions(int norm, int dimensions, int truncate, boolean addSpeci
         }
     }
 
-    /** The prompt after {@code truncate_prompt_tokens}: its last tokens. */
+    /** The prompt after {@code truncate_prompt_tokens}: its last tokens, or its first under {@code right}. */
     int[] truncated(int[] tokens) {
-        return truncate == 0 || tokens.length <= truncate ? tokens
+        if (truncate == 0 || tokens.length <= truncate) {
+            return tokens;
+        }
+        return keepFirst ? Arrays.copyOf(tokens, truncate)
                 : Arrays.copyOfRange(tokens, tokens.length - truncate, tokens.length);
     }
 

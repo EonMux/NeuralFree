@@ -261,6 +261,12 @@ public final class TtsBackbone {
             return layout.toVocabRow(delegate.prefill(tokens, pos0));
         }
 
+        /** The codec-head padding applies to an embedding-row prefill's last row too. */
+        @Override
+        public float[] prefillEmbeddings(float[][] rows, int pos0) {
+            return layout.toVocabRow(delegate.prefillEmbeddings(rows, pos0));
+        }
+
         @Override
         public float[] decode(int token, int pos) {
             return layout.toVocabRow(delegate.decode(token, pos));
@@ -472,6 +478,27 @@ public final class TtsBackbone {
         }
 
         /**
+         * Evaluates precomputed embedding rows at {@code pos0 ..} into the KV cache and returns {@code t_embd} of the
+         * last row (llama.cpp's {@code prompt_embeds} path; the pockettts pipeline feeds its flow feedback rows this
+         * way).
+         *
+         * @return a fresh {@code n_embd} row
+         */
+        public float[] prefillEmbeddings(float[][] rows, int pos0) {
+            return prefillEmbeddingRows(rows, pos0, true)[0];
+        }
+
+        /**
+         * Evaluates precomputed embedding rows at {@code pos0 ..} into the KV cache and returns {@code t_embd} of
+         * every row.
+         *
+         * @return fresh {@code [rows.length][n_embd]} rows
+         */
+        public float[][] prefillEmbeddingsAll(float[][] rows, int pos0) {
+            return prefillEmbeddingRows(rows, pos0, false);
+        }
+
+        /**
          * {@code t_embd} of a whole sequence from position 0 without touching the KV cache
          * ({@link ForwardBackend#hiddenRows}, which applies the output norm on the device).
          */
@@ -489,6 +516,17 @@ public final class TtsBackbone {
             capture.clear();
             backend.prefill(tokens, pos0);
             return normalizedRows(tokens.length, lastOnly);
+        }
+
+        private float[][] prefillEmbeddingRows(float[][] rows, int pos0, boolean lastOnly) {
+            ensureOpen();
+            Objects.requireNonNull(rows, "rows");
+            if (rows.length == 0) {
+                throw new IllegalArgumentException("embedding prefill needs at least one row");
+            }
+            capture.clear();
+            backend.prefillEmbeddings(rows, pos0);
+            return normalizedRows(rows.length, lastOnly);
         }
 
         /**

@@ -16,6 +16,7 @@ import com.eonmux.neuralfree.gguf.spec.Dsv4Spec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MlaSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
+import com.eonmux.neuralfree.gguf.spec.Step5Spec;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -28,6 +29,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.IntPredicate;
 
 /**
  * Builds the byte-exact {@link MemoryPlan} of a model: the NeuralFree counterpart of llama.cpp
@@ -51,8 +53,8 @@ import java.util.Set;
  *       {@code kvLoraRank + headKRope} with V aliasing the first {@code kvLoraRank} values
  *       ({@link MlaSpec#latentCache()}), or per-head K and V when decompressed; DeepSeek-V4 stores a K-only raw row
  *       of {@code headDim} (MQA, K = V).</li>
- *   <li><b>Rows</b>: {@code nCtx}, or a ring of {@link KvLayout#ringRows} rows for causal STANDARD / CHUNKED
- *       sliding-window layers of the memory kinds llama.cpp builds with an ISWA cache (KV, HYBRID, DSA_ISWA and
+ *   <li><b>Rows</b>: {@code nCtx}, or a ring of {@link KvLayout#ringRows} rows for causal STANDARD / CHUNKED /
+ *       CHUNKED_LOOKBACK sliding-window layers of the memory kinds llama.cpp builds with an ISWA cache (KV, HYBRID, DSA_ISWA and
  *       the DSV4 raw cache; llama-kv-cache-iswa.cpp:73). The other kinds (DSA, HYBRID_IDX, MSA, ENC_DEC) keep
  *       full-size caches and mask the window. A paged setting ({@code neuralfree.parallel > 1} or
  *       {@code neuralfree.kv.paged}) replaces the rings with page pools of {@code neuralfree.kv.page.size}-row
@@ -61,7 +63,7 @@ import java.util.Set;
  *       {@code min(roundUp(nCtx, P), parallel x (roundUp(window + nUbatch, P) + P))}, the per-sequence window plus a
  *       rollback margin of one page; a paged group never wraps. Recurrent state rows gain event slots for
  *       {@code parallel} sequences with their rollback snapshots ({@link MemoryPlanner} counts
- *       {@code parallel x (1 + n_rs_seq)} slots in the tensors, the PC-2 checkpoint slots are 0 until PC-2).</li>
+ *       {@code parallel x (1 + n_rs_seq)} slots in the tensors; context checkpoints add no slots of their own).</li>
  *   <li><b>Shared KV</b>: a layer whose {@link AttentionSpec#kvOwnerLayer()} is another layer reads that layer's
  *       cache, rows and rotation (gemma3n / gemma4 reuse); it owns nothing, including side caches.</li>
  *   <li><b>Recurrent state</b> ({@link LayerMemoryPlan#recurrentState}) on recurrent mixers, plus the qwen4exp
@@ -72,8 +74,11 @@ import java.util.Set;
  *       the indexer for ratio 4, HCA for ratio 128; llama-kv-cache-dsv4.cpp:1244-1340), each compressor tensor
  *       with {@link MemoryConfig#rollbackSnapshots()} rollback snapshot planes ({@code n_rs_seq},
  *       llama-kv-cache-dsv4.cpp:968-970), at most the plan's ubatch since one rollback drops at most the positions
- *       of the last step; and the T5
- *       cross-attention K/V of {@code nCtx} encoder rows. Every indexer cache has the K type, as llama.cpp creates
+ *       of the last step, and on a paged plan one stream per sequence sized for the sequence's context cap
+ *       (llama.cpp's DSV4 streams, llama-kv-cache-dsv4.cpp:51-60); and the T5
+ *       cross-attention K/V: one stream of encoder rows per sequence ({@code nCtx} rows on a contiguous plan, the
+ *       sequence's context cap per sequence on a paged one), so each sequence attends to its own source as
+ *       llama.cpp's cross mask keeps a decoder row on its sequence's encoder rows (llama-graph.cpp:1093-1105). Every indexer cache has the K type, as llama.cpp creates
  *       it with the context's {@code type_k} (llama-kv-cache-dsa.cpp:51, llama-kv-cache-dsv4.cpp:1308-1312,
  *       llama-memory-hybrid-idx.cpp:71), with each {@code indexer_head_size} slot whole blocks.</li>
  *   <li><b>KV dtypes</b>: {@link MemoryConfig#typeK()} / {@link MemoryConfig#typeV()}, any {@link KvDType}. As
@@ -136,19 +141,82 @@ public final class MemoryPlanner {
         return logged(spec, new Planning(spec, cfg, nCtx, false, -1).run(), "memory plan");
     }
 
+    /**
+     * Plans memory for an explicit context length over the layers {@code layerFilter} accepts (an {@code il} of a
+     * trunk or NextN layer): the other layers get empty slots at their {@code il}, so a device of a layer split
+     * allocates and indexes only its own caches. KV groups are renumbered over the kept layers, so each device's
+     * plan carries its own {@code kv_pos} buffers. A shared-KV layer whose owner the filter refuses cannot be
+     * planned: the split has to keep the two on one device.
+     *
+     * @throws IllegalArgumentException as {@link #planForContext}, or when a kept layer reads the cache of a
+     *                                  refused one
+     */
+    public static MemoryPlan planForContext(ModelSpec spec, MemoryConfig cfg, int nCtx, IntPredicate layerFilter) {
+        Objects.requireNonNull(layerFilter, "layerFilter");
+        return logged(spec, new Planning(spec, cfg, nCtx, false, -1, layerFilter).run(), "device memory plan");
+    }
+
     /** {@link #planForContext} without logging; used by {@link ContextFitter} while searching. */
     static MemoryPlan planQuietly(ModelSpec spec, MemoryConfig cfg, int nCtx) {
         return new Planning(spec, cfg, nCtx, false, -1).run();
+    }
+
+    /** {@link #planForContext(ModelSpec, MemoryConfig, int, IntPredicate)} without logging. */
+    static MemoryPlan planQuietly(ModelSpec spec, MemoryConfig cfg, int nCtx, IntPredicate layerFilter) {
+        return new Planning(spec, cfg, nCtx, false, -1, layerFilter).run();
+    }
+
+    /**
+     * Plans one rank's share of a context-parallel split (vLLM's decode context parallelism): the layers
+     * {@code layerFilter} accepts keep only the context block {@code [rank * nCtx / ranks, (rank + 1) * nCtx /
+     * ranks)} of their full-attention KV caches, so each rank stores about {@code 1 / ranks} of the KV bytes. Row
+     * {@code r} of such a cache holds global position {@code rowBase + r}; the other layers get empty slots at their
+     * {@code il}, exactly as {@link #planForContext(ModelSpec, MemoryConfig, int, IntPredicate)} leaves them. The
+     * context length and ubatch stay the model's, so a rank still runs the whole step.
+     *
+     * <p>Over a paged memory ({@link MemoryConfig#paged()}) the shard is page-granular instead (vLLM's
+     * {@code dcp_kv_cache_interleave_size} with the interleave at one page): every rank's pool holds
+     * {@code ceil(mainPages / ranks) + parallel} pages of its own — the margin covers the per-sequence round-robin
+     * imbalance — and a page belongs to rank {@code (firstStoredPosition / pageSize) % ranks}. Every rank's plan is
+     * identical in size; the runtime ownership lives in the page shard ({@code CpPageShard}), so {@code rank} only
+     * validates here.</p>
+     *
+     * @throws IllegalArgumentException for fewer than two ranks, a rank outside them, or a context shorter than
+     *                                  the ranks
+     */
+    public static MemoryPlan planForContextShard(ModelSpec spec, MemoryConfig cfg, int nCtx, int rank, int ranks,
+                                                 IntPredicate layerFilter) {
+        Objects.requireNonNull(layerFilter, "layerFilter");
+        Objects.requireNonNull(cfg, "cfg");
+        if (ranks < 2) {
+            throw new IllegalArgumentException("a context shard needs at least two ranks, got " + ranks);
+        }
+        if (rank < 0 || rank >= ranks) {
+            throw new IllegalArgumentException("rank " + rank + " is outside the " + ranks + " rank(s)");
+        }
+        if (nCtx < ranks) {
+            throw new IllegalArgumentException("a context split over " + ranks + " ranks needs at least " + ranks
+                    + " positions, got " + nCtx);
+        }
+        if (cfg.paged()) {
+            Planning planning = new Planning(spec, cfg, nCtx, false, -1, layerFilter, -1, 0, ranks);
+            return logged(spec, planning.run(), "context page shard rank " + rank + " of " + ranks);
+        }
+        int base = (int) ((long) rank * nCtx / ranks);
+        int end = (int) ((long) (rank + 1) * nCtx / ranks);
+        Planning planning = new Planning(spec, cfg, nCtx, false, -1, layerFilter, base, end - base);
+        return logged(spec, planning.run(), "context shard rank " + rank + " of " + ranks);
     }
 
     /**
      * Plans the NextN / MTP draft context of a model (llama.cpp {@code LLAMA_CONTEXT_TYPE_MTP},
      * src/llama-model.cpp:3240-3247): every NextN layer keeps its caches and the trunk keeps none. Rotation domains
      * and their shared head dims are taken over the NextN layers, the layers llama.cpp's MTP cache holds. The
-     * context length and ubatch are the target plan's; the settings are the target plan's as a draft context runs
-     * with them ({@link MemoryConfig#forDraftContext()}: F16 rows, so no rotation, and no state snapshots), as
-     * llama.cpp creates the MTP context from the speculative parameters (common/speculative.cpp:2606-2607,
-     * 2658-2669).
+     * context length is the target plan's; the ubatch is the draft ubatch of the target plan's settings when one is
+     * set, else the target plan's. The settings are the target plan's as a draft context runs with them
+     * ({@link MemoryConfig#forDraftContext()}: the draft cache types, so no rotation at F16, and no state
+     * snapshots), as llama.cpp creates the MTP context from the speculative parameters
+     * (common/speculative.cpp:2714-2715, 2658-2669).
      *
      * @param spec   the model whose NextN layers draft: the target, or a draft file with NextN blocks of the target's
      *               model whose trunk slots are the target's
@@ -200,8 +268,8 @@ public final class MemoryPlanner {
      * Bytes of the NextN draft memory of {@code spec} beside a target context of {@code nCtx} tokens and a ubatch of
      * {@code ubatch} planned with {@code cfg}: the sum of the per-block plans of
      * {@link #planNextn(ModelSpec, MemoryPlan, int)} at those settings as a draft context runs with them
-     * ({@link MemoryConfig#forDraftContext()}). This sizes the MTP context of a draft file with NextN blocks before
-     * its target's plan exists.
+     * ({@link MemoryConfig#forDraftContext()}), with the draft ubatch of {@code cfg} when one is set in place of
+     * {@code ubatch}. This sizes the MTP context of a draft file with NextN blocks before its target's plan exists.
      *
      * @throws IllegalArgumentException when the model has no NextN layers or no trunk, or the context or ubatch is
      *                                  not positive
@@ -214,7 +282,8 @@ public final class MemoryPlanner {
             throw new IllegalArgumentException(spec.arch().ggufName() + ": NextN memory of a context of " + nCtx
                     + " tokens and a ubatch of " + ubatch);
         }
-        MemoryConfig nextnCfg = cfg.forDraftContext().toBuilder().nCtx(nCtx).ubatch(ubatch).build();
+        MemoryConfig nextnCfg = cfg.forDraftContext().toBuilder().nCtx(nCtx)
+                .ubatch(cfg.draftUbatchOr(ubatch)).build();
         long bytes = 0;
         for (LayerSpec l : spec.nextnLayers()) {
             bytes = Math.addExact(bytes, new Planning(spec, nextnCfg, nCtx, true, l.il()).run().totalBytes());
@@ -253,7 +322,8 @@ public final class MemoryPlanner {
             throw new IllegalArgumentException(name + ": the target memory plan has " + slots + " layer slots, the"
                     + " model " + spec.nLayer() + " trunk layers and " + spec.nextnLayers().size() + " NextN layers");
         }
-        MemoryConfig nextnCfg = cfg.forDraftContext().toBuilder().nCtx(target.nCtx()).ubatch(target.ubatch()).build();
+        MemoryConfig nextnCfg = cfg.forDraftContext().toBuilder().nCtx(target.nCtx())
+                .ubatch(cfg.draftUbatchOr(target.ubatch())).build();
         return new Planning(spec, nextnCfg, target.nCtx(), true, only).run();
     }
 
@@ -380,10 +450,18 @@ public final class MemoryPlanner {
         private final int ubatch;
         private final boolean nextnContext;
         private final int onlyLayer;
+        /** Layers the plan keeps memory for, or null for the context's own set. */
+        private final IntPredicate layerFilter;
         private final boolean paged;
         private final int pageSize;
         private final Map<String, Integer> groupIndex = new LinkedHashMap<>();
         private final List<MemoryPlan.KvGroup> groups = new ArrayList<>();
+        /** First position of this plan's context shard, or -1 for a whole cache. */
+        private final int shardBase;
+        /** Rows of this plan's context shard; 0 for a whole cache. */
+        private final int shardRows;
+        /** Rank count of a page-granular context shard, or 0 for none. */
+        private final int shardRanks;
         private int[] groupRemap = new int[0];
 
         /**
@@ -391,6 +469,21 @@ public final class MemoryPlanner {
          * @param onlyLayer    the one layer of the context that keeps memory, or -1 for all of them
          */
         Planning(ModelSpec spec, MemoryConfig cfg, int nCtx, boolean nextnContext, int onlyLayer) {
+            this(spec, cfg, nCtx, nextnContext, onlyLayer, null);
+        }
+
+        Planning(ModelSpec spec, MemoryConfig cfg, int nCtx, boolean nextnContext, int onlyLayer,
+                 IntPredicate layerFilter) {
+            this(spec, cfg, nCtx, nextnContext, onlyLayer, layerFilter, -1, 0);
+        }
+
+        Planning(ModelSpec spec, MemoryConfig cfg, int nCtx, boolean nextnContext, int onlyLayer,
+                 IntPredicate layerFilter, int shardBase, int shardRows) {
+            this(spec, cfg, nCtx, nextnContext, onlyLayer, layerFilter, shardBase, shardRows, 0);
+        }
+
+        Planning(ModelSpec spec, MemoryConfig cfg, int nCtx, boolean nextnContext, int onlyLayer,
+                 IntPredicate layerFilter, int shardBase, int shardRows, int shardRanks) {
             this.spec = Objects.requireNonNull(spec, "spec");
             this.hp = spec.hparams();
             this.cfg = Objects.requireNonNull(cfg, "cfg");
@@ -402,8 +495,23 @@ public final class MemoryPlanner {
             this.ubatch = Math.min(cfg.ubatch(), nCtx);
             this.nextnContext = nextnContext;
             this.onlyLayer = onlyLayer;
+            this.layerFilter = layerFilter;
             this.paged = cfg.paged();
             this.pageSize = paged ? cfg.kvPageSize() : 0;
+            this.shardBase = shardBase;
+            this.shardRows = shardRows;
+            this.shardRanks = shardRanks;
+            if (shardRows > 0 && paged) {
+                throw new IllegalArgumentException("a context block shard needs the contiguous KV form, not a paged one");
+            }
+            if (shardRanks > 0 && !paged) {
+                throw new IllegalArgumentException("a page-granular context shard needs a paged memory");
+            }
+        }
+
+        /** True when this plan keeps one rank's context block of the full-attention caches. */
+        private boolean sharded() {
+            return shardRows > 0 || shardRanks > 0;
         }
 
         MemoryPlan run() {
@@ -449,7 +557,10 @@ public final class MemoryPlanner {
 
         /** Whether a layer of the context keeps memory in this plan. */
         private boolean kept(LayerSpec l) {
-            return inContext(l) && (onlyLayer < 0 || l.il() == onlyLayer);
+            if (!inContext(l)) {
+                return false;
+            }
+            return layerFilter != null ? layerFilter.test(l.il()) : onlyLayer < 0 || l.il() == onlyLayer;
         }
 
         /** The KV groups the kept layers use, renumbered in creation order; fills {@link #groupRemap}. */
@@ -470,18 +581,31 @@ public final class MemoryPlanner {
                     out.add(old.paged()
                             ? MemoryPlan.KvGroup.of(out.size(), old.rows(), old.ring(), old.window(),
                             old.pageSize(), old.pages())
+                            : old.sharded()
+                            ? MemoryPlan.KvGroup.ofShard(out.size(), old.rows(), old.rowBase(), old.window())
                             : MemoryPlan.KvGroup.of(out.size(), old.rows(), old.ring(), old.window()));
                 }
+            }
+            if (paged && out.isEmpty()) {
+                // A model with only recurrent state (Mamba, RWKV) owns no KV groups; the paged memory still tracks
+                // its sequences over one bookkeeping group whose pages no cache reads, so the batched path can
+                // reserve, commit and free the sequences' slots (the vLLM state pool without KV pages).
+                int pages = Math.max(1, (nCtx + pageSize - 1) / pageSize);
+                out.add(MemoryPlan.KvGroup.of(0, pages * pageSize, false, KvWindow.FULL_CAUSAL, pageSize, pages));
             }
             return out;
         }
 
-        /** No memory for cache-less models and LFM2 decision models (llama-model.cpp:2781-2784). */
+        /** No memory for cache-less models, LFM2 decision models and the non-causal lfm3 d1 graph
+         * (llama-model.cpp:2781-2784, 2816-2818). */
         private boolean memoryless() {
             if (spec.memoryKind() == MemoryKind.NONE) {
                 return true;
             }
-            return spec.arch() == Arch.LFM2 && !hp.causal() && hp.nLayerDecision() > 0;
+            if (spec.arch() == Arch.LFM2) {
+                return !hp.causal() && hp.nLayerDecision() > 0;
+            }
+            return spec.arch() == Arch.LFM3 && !hp.causal();
         }
 
         /** Fills the layer's own caches (shared layers are completed by {@link #resolveShared}). */
@@ -496,6 +620,7 @@ public final class MemoryPlanner {
                     throw new IllegalArgumentException(layerName(l) + " shares the KV of layer " + d.ownerLayer
                             + " but also needs recurrent or cross-attention memory of its own");
                 }
+                describeIndexer(d);
                 return;
             }
             if (l.dsv4() != null) {
@@ -511,6 +636,7 @@ public final class MemoryPlanner {
                 }
             }
             addPleHistory(d);
+            addStep5State(d);
             if (d.kv != null) {
                 d.kind = d.layer.dsv4() != null ? LayerMemoryPlan.Kind.DSV4
                         : d.states.isEmpty() ? LayerMemoryPlan.Kind.KV : LayerMemoryPlan.Kind.KV_RECURRENT;
@@ -526,9 +652,14 @@ public final class MemoryPlanner {
                             + "KV cache, got " + d.kind);
                 }
                 AttentionSpec x = l.crossAttention();
-                d.crossKv = KvLayout.of(crossRows(), false, x.kDim(), x.vDim(),
-                        storeK(x.kDim(), x.headDimK(), "cross K"),
-                        storeV(x.vDim(), x.headDimV(), "cross V"), KvWindow.FULL_BIDIRECTIONAL);
+                KvDType crossK = storeK(x.kDim(), x.headDimK(), "cross K");
+                KvDType crossV = storeV(x.vDim(), x.headDimV(), "cross V");
+                checkPerTokenHead(crossK, "the cross-attention K cache of layer " + l.il());
+                checkPerTokenHead(crossV, "the cross-attention V cache of layer " + l.il());
+                refuseVendorType(crossK, "the cross-attention K cache of layer " + l.il());
+                refuseVendorType(crossV, "the cross-attention V cache of layer " + l.il());
+                d.crossKv = KvLayout.of(sequenceContext(), false, x.kDim(), x.vDim(), crossK, crossV,
+                        KvWindow.FULL_BIDIRECTIONAL).withHeads(x.nHeadKv());
             }
         }
 
@@ -539,43 +670,74 @@ public final class MemoryPlanner {
             MlaSpec mla = l.mla();
             KvWindow window = a != null ? KvWindow.of(a.effectiveSwaType(), a.nSwa(), a.causal()) : KvWindow.FULL_CAUSAL;
             boolean swaSide = ringEligible(window);
-            int rows = rowsFor(window, swaSide);
-            boolean ring = swaSide && rows < nCtx && !paged;
+            /* A context shard keeps the full-attention block (or the page pool's share) of its rank; a windowed or
+             * MLA cache has no such block. */
+            boolean shard = sharded() && mla == null && !swaSide && kept(l);
+            int rows = shard ? shardRowsFor(window, swaSide) : rowsFor(window, swaSide);
+            boolean ring = !shard && swaSide && rows < nCtx && !paged;
             if (mla != null) {
                 checkMlaCacheMode(l, mla);
             }
             KvLayout kv;
             if (mla != null && mla.latentCache()) {
                 int width = mla.latentRowWidth();
-                kv = KvLayout.latent(rows, ring, width, mla.kvLoraRank(),
-                        storeK(width, mla.kvLoraRank(), "MLA latent"), window);
+                KvDType latentType = storeK(width, mla.kvLoraRank(), "MLA latent");
+                checkPerTokenHead(latentType, "the MLA latent cache of layer " + d.layer.il());
+                checkLatentType(latentType, width, mla.kvLoraRank(), "the MLA latent cache of layer " + d.layer.il());
+                kv = KvLayout.latent(rows, ring, width, mla.kvLoraRank(), latentType, window);
                 d.headDimK = width;
                 d.headDimV = 0;
             } else if (mla != null) {
                 int wk = mla.nHead() * mla.headK();
                 int wv = mla.nHead() * mla.headV();
-                kv = KvLayout.of(rows, ring, wk, wv, storeK(wk, mla.headK(), "attention K"),
-                        storeV(wv, mla.headV(), "attention V"), window);
+                KvDType mlaK = storeK(wk, mla.headK(), "attention K");
+                KvDType mlaV = storeV(wv, mla.headV(), "attention V");
+                checkPerTokenHead(mlaK, "the MLA K cache of layer " + d.layer.il());
+                checkPerTokenHead(mlaV, "the MLA V cache of layer " + d.layer.il());
+                checkAttentionVendorType(mlaK, mla.headK(), "the MLA K cache of layer " + d.layer.il());
+                checkAttentionVendorType(mlaV, mla.headV(), "the MLA V cache of layer " + d.layer.il());
+                kv = KvLayout.of(rows, ring, wk, wv, mlaK, mlaV, window).withHeads(mla.nHead());
                 d.headDimK = mla.headK();
                 d.headDimV = mla.headV();
             } else {
-                kv = KvLayout.of(rows, ring, a.kDim(), a.vDim(), storeK(a.kDim(), a.headDimK(), "attention K"),
-                        storeV(a.vDim(), a.headDimV(), "attention V"), window);
+                KvDType attnK = storeK(a.kDim(), a.headDimK(), "attention K");
+                KvDType attnV = storeV(a.vDim(), a.headDimV(), "attention V");
+                checkPerTokenHeadMix(attnK, attnV, "the attention K and V caches of layer " + d.layer.il());
+                checkAttentionVendorType(attnK, a.headDimK(), "the attention K cache of layer " + d.layer.il());
+                checkAttentionVendorType(attnV, a.headDimV(), "the attention V cache of layer " + d.layer.il());
+                kv = KvLayout.of(rows, ring, a.kDim(), a.vDim(), attnK, attnV, window).withHeads(a.nHeadKv());
                 d.headDimK = a.headDimK();
                 d.headDimV = a.headDimV();
             }
+            if (shard && !paged) {
+                kv = kv.withShard(shardBase);
+            }
             assignKv(d, kv, swaSide);
-            DsaSpec dsa = l.dsa();
+            describeIndexer(d);
+            if (l.msa() != null && l.msa().sparse()) {
+                int width = l.msa().idxHeadDim();
+                KvDType msaType = storeK(width, width, "MSA index key");
+                checkPerTokenHead(msaType, "the MSA index-key cache of layer " + d.layer.il());
+                refuseVendorType(msaType, "the MSA index-key cache of layer " + d.layer.il());
+                d.msa = MsaPlan.of(rows, width, msaType);
+            }
+        }
+
+        /**
+         * The DSA indexer cache of a full-indexer layer; shared-indexer layers read the selection of their source
+         * (SparseBlocks) and keep no cache of their own. A KV-sharing layer with a full indexer plans its own
+         * indexer cache (mistral-large4).
+         */
+        private void describeIndexer(Draft d) {
+            DsaSpec dsa = d.layer.dsa();
             if (dsa != null && dsa.full()) {
                 d.indexerWidth = dsa.indexerHeadDim() * (dsa.kpool() > 0 ? dsa.kpoolRow() : 1);
                 d.indexerType = storeK(d.indexerWidth, dsa.indexerHeadDim(), "DSA indexer");
+                checkPerTokenHead(d.indexerType, "the DSA indexer cache of layer " + d.layer.il());
+                refuseVendorType(d.indexerType, "the DSA indexer cache of layer " + d.layer.il());
                 d.indexerForced = dsa.hadamard()
                         || (INDEXER_ROTATION_ARCHS.contains(spec.arch()) && dsa.indexerHeadDim() == hp.indexerHeadSize()
                         && dsa.kpool() == 0);
-            }
-            if (l.msa() != null && l.msa().sparse()) {
-                int width = l.msa().idxHeadDim();
-                d.msa = MsaPlan.of(rows, width, storeK(width, width, "MSA index key"));
             }
         }
 
@@ -601,23 +763,79 @@ public final class MemoryPlanner {
             }
             KvWindow window = KvWindow.of(type, v4.window(), true);
             boolean swaSide = hp.isSwa(l.weightLayer()) && ringEligible(window);
-            int rows = swaSide ? rowsFor(window, true) : crossRows();
+            int rows = swaSide ? rowsFor(window, true) : fullRows();
             int width = v4.headDim();
             KvDType dtype = storeK(width, width, "DSV4 raw K");
+            checkPerTokenHead(dtype, "the DeepSeek-V4 raw K cache of layer " + d.layer.il());
+            refuseVendorType(dtype, "the DeepSeek-V4 raw K cache of layer " + d.layer.il());
             assignKv(d, KvLayout.latent(rows, swaSide && rows < nCtx && !paged, width, width, dtype, window), swaSide);
             d.headDimK = width;
             d.headDimV = 0;
             int snapshots = Math.min(cfg.rollbackSnapshots(), ubatch);
+            int streams = paged ? cfg.parallel() : 1;
+            int seqCtx = sequenceContext();
+            boolean owns = v4.dsv41() == null || v4.dsv41().ownsCompressed();
+            if (!owns) {
+                return;
+            }
+            if (v4.dsv41() != null) {
+                // V4.1 stores the index key beside the compressed KV and only KV source layers own the rows
+                int idx = v4.dsv41().indexerHeadDim();
+                int rowWidth = width + idx;
+                if (v4.csa()) {
+                    d.compressed.add(CompressedKvPlan.ofDsv41(CompressedKvPlan.Kind.CSA, v4.compressRatio(), seqCtx,
+                            rowWidth, width, storeK(rowWidth, rowWidth, "DSV4 CSA"), snapshots, streams));
+                } else if (v4.hca()) {
+                    d.compressed.add(CompressedKvPlan.ofDsv41(CompressedKvPlan.Kind.HCA, v4.compressRatio(), seqCtx,
+                            rowWidth, width, storeK(rowWidth, rowWidth, "DSV4 HCA"), snapshots, streams));
+                }
+                return;
+            }
             if (v4.csa()) {
                 int idx = v4.indexer().indexerHeadDim();
-                d.compressed.add(CompressedKvPlan.of(CompressedKvPlan.Kind.CSA, nCtx, width, idx,
-                        storeK(width, width, "DSV4 CSA"), snapshots));
-                d.compressed.add(CompressedKvPlan.of(CompressedKvPlan.Kind.INDEXER, nCtx, width, idx,
-                        storeK(idx, idx, "DSV4 indexer"), snapshots));
+                d.compressed.add(CompressedKvPlan.of(CompressedKvPlan.Kind.CSA, seqCtx, width, idx,
+                        storeK(width, width, "DSV4 CSA"), snapshots, streams));
+                d.compressed.add(CompressedKvPlan.of(CompressedKvPlan.Kind.INDEXER, seqCtx, width, idx,
+                        storeK(idx, idx, "DSV4 indexer"), snapshots, streams));
             } else if (v4.hca()) {
-                d.compressed.add(CompressedKvPlan.of(CompressedKvPlan.Kind.HCA, nCtx, width, 0,
-                        storeK(width, width, "DSV4 HCA"), snapshots));
+                d.compressed.add(CompressedKvPlan.of(CompressedKvPlan.Kind.HCA, seqCtx, width, 0,
+                        storeK(width, width, "DSV4 HCA"), snapshots, streams));
             }
+        }
+
+        /**
+         * Positions one sequence can hold: the context, or on a paged plan without {@code neuralfree.kv.unified}
+         * the per-sequence cap {@code nCtx / parallel} {@code PagedSequences} enforces.
+         */
+        private int sequenceContext() {
+            return paged && !cfg.kvUnified() ? Math.max(1, nCtx / cfg.parallel()) : nCtx;
+        }
+
+        /**
+         * Step5 full-attention layers keep the closed-region summaries and the open-region ring as state tensors: the
+         * summary is a per-sequence array of {@code regions * proxy} values and the ring
+         * {@code ringCapacity * 2 * proxy}. The paged plan gives each sequence its own state slot. The ring keeps the
+         * whole open region plus every row one step can write over it and then drop, so its capacity also follows the
+         * plan's ubatch (a draft context drops up to one step of rows and re-evaluates them). A context-shift plan
+         * keeps the whole sequence context in the ring instead: a shift re-positions the kept rows and rebuilds the
+         * summaries from them ({@code CpuStep5Mixer#shiftContext}).
+         */
+        private void addStep5State(Draft d) {
+            Step5Spec s = d.layer.step5();
+            if (s == null || !s.full()) {
+                return;
+            }
+            int regions = s.regions(sequenceContext());
+            int drops = Math.max(cfg.rollbackSnapshots(), ubatch - 1);
+            int capacity = Step5Spec.ringCapacity(s.regionBlock(), drops);
+            if (cfg.contextShift() && !paged) {
+                capacity = Math.max(capacity, sequenceContext());
+            }
+            int slots = stateSlots();
+            d.states.add(LayerMemoryPlan.StateTensor.of(LayerMemoryPlan.STATE_STEP5_SUMMARY,
+                    LayerMemoryPlan.StateLayout.STEP5_SUMMARY, (long) regions * s.proxyDim(), slots));
+            d.states.add(LayerMemoryPlan.StateTensor.of(LayerMemoryPlan.STATE_STEP5_RING,
+                    LayerMemoryPlan.StateLayout.STEP5_RING, (long) capacity * 2L * s.proxyDim(), slots));
         }
 
         /** qwen4exp PLE convolution history: a row of the recurrent cache of the PLE layer. */
@@ -638,46 +856,77 @@ public final class MemoryPlanner {
         /**
          * Recurrent state slots of the context: 1 for the contiguous single-sequence memory; paged memory keeps
          * {@code parallel} live state slots plus {@code parallel x rollbackSnapshots} rollback snapshot slots
-         * (the PC-2 checkpoint slots are 0 until PC-2 lands).
+         * (context checkpoints add no slots of their own).
          */
         private int stateSlots() {
             return paged ? cfg.parallel() * (1 + cfg.rollbackSnapshots()) : 1;
         }
 
-        /** Causal STANDARD / CHUNKED windows of ring memory kinds live on the sliding-window side. */
+        /** Causal STANDARD / CHUNKED / CHUNKED_LOOKBACK windows of ring memory kinds live on the sliding-window side. */
         private boolean ringEligible(KvWindow window) {
             return RING_KINDS.contains(spec.memoryKind()) && window.windowed() && window.causal()
-                    && (window.type() == SwaType.STANDARD || window.type() == SwaType.CHUNKED);
+                    && (window.type() == SwaType.STANDARD || window.type() == SwaType.CHUNKED
+                        || window.type() == SwaType.CHUNKED_LOOKBACK);
+        }
+
+        /**
+         * Positions the window keeps behind the oldest query of a step: {@code nSwa} for STANDARD and CHUNKED,
+         * twice that for CHUNKED_LOOKBACK.
+         */
+        private int windowSpan(KvWindow window) {
+            long span = window.retainedPositions(1);
+            if (span <= 0 || span > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("window " + window + " has an unsupported span " + span);
+            }
+            return (int) span;
+        }
+
+        /**
+         * Rows of the shard side: the contiguous block size, or over a paged memory the rank pool's page count —
+         * the main pool's pages split over the ranks plus one page of margin per sequence slot (the round-robin
+         * page assignment never imbalances a rank by more than that).
+         */
+        private int shardRowsFor(KvWindow window, boolean swaSide) {
+            if (!paged) {
+                return shardRows;
+            }
+            long mainPages = ((long) nCtx + pageSize - 1) / pageSize;
+            long rankPages = (mainPages + shardRanks - 1) / shardRanks + cfg.parallel();
+            return (int) (rankPages * pageSize);
         }
 
         private int rowsFor(KvWindow window, boolean swaSide) {
             if (paged) {
                 if (swaSide) {
+                    int span = windowSpan(window);
                     // the per-sequence window plus a rollback margin of one page, times the sequence slots,
-                    // capped by the whole context (the PARITY MS row rule for SWA groups)
-                    long windowPageRows = (long) ((window.nSwa() + ubatch + pageSize - 1) / pageSize) * pageSize;
-                    long pool = (long) cfg.parallel() * (windowPageRows + pageSize);
+                    // plus the pages reserved for checkpoint windows, capped by the whole context
+                    long windowPageRows = (long) ((span + ubatch + pageSize - 1) / pageSize) * pageSize;
+                    long pool = (long) cfg.parallel() * (windowPageRows + pageSize)
+                            + (long) cfg.swaCheckpointReserve() * pageSize;
                     long capped = Math.min((long) ((nCtx + pageSize - 1) / pageSize) * pageSize, pool);
                     return (int) capped;
                 }
                 return (int) (((long) nCtx + pageSize - 1) / pageSize) * pageSize;
             }
-            return swaSide ? KvLayout.ringRows(nCtx, window.nSwa(), ubatch, cfg.swaFull()) : nCtx;
+            return swaSide ? KvLayout.ringRows(nCtx, windowSpan(window), ubatch, cfg.swaFull()) : nCtx;
         }
 
-        /** Encoder cross-attention rows: page-rounded when the memory is paged. */
-        private int crossRows() {
+        /** Rows of a full (unwindowed) cache: {@code nCtx}, page-rounded when the memory is paged. */
+        private int fullRows() {
             return paged ? (int) (((long) nCtx + pageSize - 1) / pageSize) * pageSize : nCtx;
         }
 
         private void assignKv(Draft d, KvLayout kv, boolean swaSide) {
             KvWindow w = kv.window();
-            String key = (swaSide ? "swa" : "full") + '|' + kv.rows() + '|' + kv.ring() + '|' + w.type() + '/' + w.nSwa()
-                    + '/' + w.causal();
+            String key = (swaSide ? "swa" : "full") + '|' + kv.rows() + '|' + kv.ring() + '|' + kv.rowBase() + '|'
+                    + w.type() + '/' + w.nSwa() + '/' + w.causal();
             Integer g = groupIndex.get(key);
             if (g == null) {
                 g = groups.size();
-                groups.add(paged
+                groups.add(kv.sharded()
+                        ? MemoryPlan.KvGroup.ofShard(g, kv.rows(), kv.rowBase(), w)
+                        : paged
                         ? MemoryPlan.KvGroup.of(g, kv.rows(), false, w, pageSize, kv.rows() / pageSize)
                         : MemoryPlan.KvGroup.of(g, kv.rows(), kv.ring(), w));
                 groupIndex.put(key, g);
@@ -780,8 +1029,17 @@ public final class MemoryPlanner {
             LayerMemoryPlan.Builder b = LayerMemoryPlan.builder(l.il(), d.kind);
             if (d.kind == LayerMemoryPlan.Kind.SHARED_KV) {
                 Draft owner = drafts.get(d.ownerLayer);
-                return b.sharedFrom(SharedKv.local(d.ownerLayer)).kv(d.kv, groupRemap[d.group])
-                        .rotation(rotation(owner, headKAll, headVAll)).build();
+                if (!kept(owner.layer)) {
+                    throw new IllegalArgumentException(layerName(l) + " shares the KV of layer " + d.ownerLayer
+                            + ", which the layer filter refuses; a layer split has to keep the two on one device");
+                }
+                b.sharedFrom(SharedKv.local(d.ownerLayer)).kv(d.kv, groupRemap[d.group])
+                        .rotation(rotation(owner, headKAll, headVAll));
+                if (d.indexerWidth > 0) {
+                    b.indexer(IndexerPlan.of(d.kv.rows(), d.indexerWidth, d.indexerType,
+                            indexerRotation(d.indexerType, idxWidthAll, d.indexerWidth, d.indexerForced)));
+                }
+                return b.build();
             }
             if (d.kv != null) {
                 RotationPlan rot = rotation(d, headKAll, headVAll);
@@ -799,7 +1057,7 @@ public final class MemoryPlanner {
                 b.compressed(c);
             }
             if (d.crossKv != null) {
-                b.crossKv(d.crossKv);
+                b.crossKv(d.crossKv, paged ? cfg.parallel() : 1);
             }
             return b.build();
         }
@@ -843,7 +1101,8 @@ public final class MemoryPlanner {
          * @throws IllegalArgumentException with llama.cpp's message when they differ
          */
         private static void checkKvTypes(ModelSpec spec, MemoryConfig cfg) {
-            boolean shared = spec.hparams().isMla() || spec.arch() == Arch.DEEPSEEK4 || hasLatentMla(spec.layers())
+            boolean shared = spec.hparams().isMla() || spec.arch() == Arch.DEEPSEEK4
+                    || spec.arch() == Arch.DEEPSEEK41 || hasLatentMla(spec.layers())
                     || hasLatentMla(spec.nextnLayers());
             if (shared && cfg.typeK() != cfg.typeV()) {
                 throw new IllegalArgumentException(spec.arch().ggufName() + ": model does not support different K ("
@@ -881,7 +1140,11 @@ public final class MemoryPlanner {
          */
         private KvDType storeType(KvDType wanted, int width, int segment, String what, String side, String property,
                                   String option) {
-            if (!wanted.quantized() || (segment > 0 && wanted.supportsWidth(width) && wanted.supportsWidth(segment))) {
+            if (wanted.latentFormat()) {
+                return wanted;
+            }
+            boolean packs = wanted.quantized() || wanted.perTokenHead() || wanted.vendorFormat();
+            if (!packs || (segment > 0 && wanted.supportsWidth(width) && wanted.supportsWidth(segment))) {
                 return wanted;
             }
             throw new IllegalArgumentException(spec.arch().ggufName() + ": " + side + " cache type "
@@ -889,6 +1152,96 @@ public final class MemoryPlanner {
                     + " does not divide the " + what + " cache (rows of " + width + " values addressed in units of "
                     + segment + "); set " + property + " (or " + option + ") to f32, f16, bf16 or a block type that"
                     + " divides it");
+        }
+
+        /**
+         * Validates a vendor format on a main attention K or V cache: a latent row format only fits an MLA latent
+         * cache, and NVFP4 and the TurboQuant streams need head widths their packing and rotation can address.
+         *
+         * @throws IllegalArgumentException naming the type, the cache and the unmet shape
+         */
+        private static void checkAttentionVendorType(KvDType type, int headDim, String what) {
+            if (type.latentFormat()) {
+                throw new IllegalArgumentException("the KV cache type " + type.name().toLowerCase(Locale.ROOT)
+                        + " is a DeepSeek MLA latent row format and cannot fill " + what
+                        + "; it needs an MLA latent cache, and the per-head cache takes nvfp4 or a TurboQuant"
+                        + " stream instead");
+            }
+            if (type.nvfp4() && (headDim <= 0 || headDim % 16 != 0)) {
+                throw new IllegalArgumentException("the KV cache type " + type.name().toLowerCase(Locale.ROOT)
+                        + " needs a head width that is a multiple of 16, and " + what + " has heads of " + headDim);
+            }
+            if (type.turboQuantMse() && !KvVendorCodec.hadamardWidth(headDim)) {
+                throw new IllegalArgumentException("the KV cache type " + type.name().toLowerCase(Locale.ROOT)
+                        + " rotates every key with a power-of-two Hadamard matrix, and " + what
+                        + " has heads of " + headDim + "; use turboquant_k8v4 (FP8 keys, no rotation) or a"
+                        + " power-of-two head size");
+            }
+            if ((type.turboQuantKey() || type.turboQuantValue()) && (headDim <= 0 || headDim % 8 != 0)) {
+                throw new IllegalArgumentException("the KV cache type " + type.name().toLowerCase(Locale.ROOT)
+                        + " packs its codes in groups of 8 and needs a head width that is a multiple of 8, and "
+                        + what + " has heads of " + headDim);
+            }
+        }
+
+        /**
+         * Validates a vendor format on an MLA latent cache: the DeepSeek MLA latent rows are fixed at 576 values
+         * ({@code kv_lora_rank} 512 and {@code pe_dim} 64), the shape vLLM's kernels accept; every other vendor format
+         * fills per-head K and V rows instead.
+         *
+         * @throws IllegalArgumentException naming the type, the cache and the unmet shape
+         */
+        private static void checkLatentType(KvDType type, int width, int kvLora, String what) {
+            if (!type.latentFormat()) {
+                if (type.vendorFormat()) {
+                    throw new IllegalArgumentException("the KV cache type " + type.name().toLowerCase(Locale.ROOT)
+                            + " fills per-head K and V rows and cannot fill " + what + "; use fp8_ds_mla or"
+                            + " nvfp4_ds_mla");
+                }
+                return;
+            }
+            if (width != KvDType.DS_MLA_ROW_VALUES || kvLora != KvDType.DS_MLA_NOPE_VALUES) {
+                throw new IllegalArgumentException("the KV cache type " + type.name().toLowerCase(Locale.ROOT)
+                        + " stores DeepSeek MLA latent rows of " + KvDType.DS_MLA_ROW_VALUES + " values (kv_lora "
+                        + KvDType.DS_MLA_NOPE_VALUES + " + 64 RoPE), and " + what + " holds " + width + " values of"
+                        + " kv_lora " + kvLora);
+            }
+        }
+
+        /** Refuses a vendor format on a cache the vendor codecs do not fill. */
+        private static void refuseVendorType(KvDType type, String what) {
+            if (type.vendorFormat()) {
+                throw new IllegalArgumentException("the KV cache type " + type.name().toLowerCase(Locale.ROOT)
+                        + " is not supported for " + what + "; use f16, a block type or an FP8 type");
+            }
+        }
+
+        /**
+         * Refuses a per-token-head cache type for a cache whose store and attention paths do not compute and read
+         * per-(token, head) scales: only the main attention K and V caches support them.
+         *
+         * @throws IllegalArgumentException naming the cache
+         */
+        private static void checkPerTokenHead(KvDType type, String what) {
+            if (type.perTokenHead()) {
+                throw new IllegalArgumentException("the per-token-head KV cache type "
+                        + type.name().toLowerCase(Locale.ROOT) + " is not supported for " + what
+                        + "; use f16, a block type or an FP8 type");
+            }
+        }
+
+        /**
+         * Refuses a main attention cache whose K and V types disagree on the per-token-head form: the store and
+         * attention kernels read both sides' row scales from one interleaved buffer.
+         *
+         * @throws IllegalArgumentException naming the cache and both types
+         */
+        private void checkPerTokenHeadMix(KvDType k, KvDType v, String what) {
+            if (k.perTokenHead() != v.perTokenHead()) {
+                throw new IllegalArgumentException(what + " mix " + k.name().toLowerCase(Locale.ROOT) + " and "
+                        + v.name().toLowerCase(Locale.ROOT) + "; both must be per-token-head (or neither), because"
+                        + " the flash attention reads their row scales from one buffer");
+            }
         }
 
         private String layerName(LayerSpec l) {

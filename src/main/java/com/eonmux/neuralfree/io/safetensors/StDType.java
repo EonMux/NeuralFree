@@ -30,8 +30,8 @@ public enum StDType {
     I8("I8", 8, GGMLType.I8),
     /** FP8 E5M2. */
     F8_E5M2("F8_E5M2", 8, null),
-    /** FP8 E4M3FN (no infinities, {@code 0x7F}/{@code 0xFF} NaN). */
-    F8_E4M3("F8_E4M3", 8, null),
+    /** FP8 E4M3FN (no infinities, {@code 0x7F}/{@code 0xFF} NaN); ggml's per-element F8_E4M3FN stores these bytes. */
+    F8_E4M3("F8_E4M3", 8, GGMLType.F8_E4M3FN),
     /** OCP MX E8M0 scale ({@code 2^(e-127)}, {@code 0xFF} NaN). */
     F8_E8M0("F8_E8M0", 8, null),
     /** FP8 E4M3FNUZ (NeuralFree extension of the format; PyTorch {@code float8_e4m3fnuz}). */

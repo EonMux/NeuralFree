@@ -1,0 +1,11 @@
+{#- llama.cpp seed_oss chat template (src/llama-chat.cpp:881-888): assistant messages trimmed. -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'assistant' -%}
+        {%- set content = content | trim(' \t\n\v\f\r') -%}
+    {%- endif -%}
+    {{- '<seed:bos>' ~ message['role'] ~ '\n' ~ content ~ '<seed:eos>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<seed:bos>assistant\n' -}}
+{%- endif -%}

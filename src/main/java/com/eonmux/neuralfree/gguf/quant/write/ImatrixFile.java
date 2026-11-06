@@ -30,15 +30,19 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 
 /**
- * The llama.cpp imatrix file format (PARITY.md WP TL-3, ported from {@code tools/imatrix/imatrix.cpp} and
+ * The llama.cpp imatrix file format (ported from {@code tools/imatrix/imatrix.cpp} and
  * {@code common/imatrix-loader.*}). The collected statistics are per-tensor entries: for every weight tensor
  * whose matmul inputs were collected, the column sums of the squared activations ({@code <tensor>.in_sum2}, one
  * F32 row per matrix — per expert of a 3-D expert tensor) and the activation-row counts ({@code <tensor>.counts},
- * one F32 value per matrix). The GGUF form carries the keys {@code general.type} = {@code "imatrix"}, the
- * {@code imatrix.datasets} string array, and the {@code imatrix.chunk_count} and {@code imatrix.chunk_size}
- * counters; the legacy {@code .dat} form is llama.cpp's pre-GGUF binary layout, written and read back verbatim.
+ * one F32 value per matrix), the plain activation sums ({@code <tensor>.in_sum}, the {@code .in_sum2} shape, for
+ * entries that carry them) and the twelve per-tensor statistics ({@code <tensor>.stats}, in the order the
+ * {@code imatrix.stats_schema} key names, computed by {@link ImatrixStatistics#stored}). The GGUF form carries the
+ * keys {@code general.type} = {@code "imatrix"}, the {@code imatrix.datasets} string array, the
+ * {@code imatrix.chunk_count} and {@code imatrix.chunk_size} counters, {@code imatrix.stats_schema} and, for a
+ * matrix collected over NextN/MTP layers, {@code imatrix.n_layer_nextn}; the legacy {@code .dat} form is
+ * llama.cpp's pre-GGUF binary layout, written and read back verbatim.
  *
- * <p>The GGUF form is written through HF.md GW-1's {@link GgufWriter}, like every GGUF output of the tools: the
+ * <p>The GGUF form is written through {@link GgufWriter}, like every GGUF output of the tools: the
  * statistics are a {@link ModelSource} in the GGUF contract (the F32 stats tensors over one backing byte array)
  * and {@link GgufWriter#write(ModelSource, Path, GgufWriter.Options)} streams the file the way it streams an
  * exported model. Reading accepts both llama.cpp's GGUF form (through {@link GGUFFileParser}) and the legacy
@@ -54,9 +58,19 @@ public final class ImatrixFile {
     public static final String KEY_CHUNK_COUNT = "imatrix.chunk_count";
     /** {@code imatrix.chunk_size}: the tokens per chunk of the collection. */
     public static final String KEY_CHUNK_SIZE = "imatrix.chunk_size";
+    /** {@code imatrix.stats_schema}: the names of the {@code .stats} values, in their stored order. */
+    public static final String KEY_STATS_SCHEMA = "imatrix.stats_schema";
+    /** {@code imatrix.n_layer_nextn}: how many of the top block layers are NextN/MTP layers. */
+    public static final String KEY_N_LAYER_NEXTN = "imatrix.n_layer_nextn";
+
+    /** The {@code .stats} value names of llama.cpp's {@code save_imatrix}, in their stored order. */
+    public static final List<String> STATS_SCHEMA = List.of("sum_sq", "mean", "elements", "std_deviation",
+            "skewness", "kurtosis", "gain", "h_norm", "l2_dist", "cossim", "pearson", "covariance");
 
     static final String IN_SUM2_SUFFIX = ".in_sum2";
+    static final String IN_SUM_SUFFIX = ".in_sum";
     static final String COUNTS_SUFFIX = ".counts";
+    static final String STATS_SUFFIX = ".stats";
 
     private ImatrixFile() {
     }
@@ -66,14 +80,26 @@ public final class ImatrixFile {
     /**
      * The collected statistics of one weight tensor: the column sums of the squared activations over each of the
      * {@code nMat} matrices ({@code 1} for a dense tensor, the expert count of a 3-D expert tensor), and the
-     * activation-row count of each matrix. Immutable; a defensive copy of every array.
+     * activation-row count of each matrix, and, unless the entry came from a legacy {@code .dat} file or was
+     * combined with one, the column sums of the plain activations ({@code .in_sum}). Immutable; a defensive copy of
+     * every array.
      */
     public static final class Entry {
         private final String tensor;
         private final int nMat;
         private final int cols;
         private final float[] sumSq;
+        private final float[] sums;
         private final long[] counts;
+
+        /**
+         * An entry without plain activation sums (the legacy layout).
+         *
+         * @see #Entry(String, int, int, float[], float[], long[])
+         */
+        public Entry(String tensor, int nMat, int cols, float[] sumSq, long[] counts) {
+            this(tensor, nMat, cols, sumSq, null, counts);
+        }
 
         /**
          * An entry's statistics.
@@ -81,13 +107,20 @@ public final class ImatrixFile {
          * @param tensor the GGUF name of the weight, without the {@code .in_sum2} suffix
          * @param sumSq  the column sums of the squared activations, {@code nMat * cols} values in matrix-major
          *               order ({@code sumSq[expert * cols + col]}); a defensive copy
+         * @param sums   the column sums of the plain activations in the {@code sumSq} layout, or null for an entry
+         *               without them; a defensive copy
          * @param counts the activation-row count of each matrix; a defensive copy
-         * @throws IllegalArgumentException for a matrix count below 1, a column count below 1, a {@code sumSq} of
-         *                                  another length, a count array of another length or a negative count
+         * @throws IllegalArgumentException for a matrix count below 1, a column count below 1, a {@code sumSq} or
+         *                                  {@code sums} of another length, a count array of another length or a
+         *                                  negative count
          */
-        public Entry(String tensor, int nMat, int cols, float[] sumSq, long[] counts) {
+        public Entry(String tensor, int nMat, int cols, float[] sumSq, float[] sums, long[] counts) {
             Objects.requireNonNull(tensor, "tensor");
             Objects.requireNonNull(sumSq, "sumSq");
+            if (sums != null && sums.length != sumSq.length) {
+                throw new IllegalArgumentException(tensor + ": " + sums.length + " activation sums for "
+                        + sumSq.length + " squared sums");
+            }
             if (nMat < 1) {
                 throw new IllegalArgumentException(tensor + " holds " + nMat + " matrices; at least one");
             }
@@ -111,6 +144,7 @@ public final class ImatrixFile {
             this.nMat = nMat;
             this.cols = cols;
             this.sumSq = sumSq.clone();
+            this.sums = sums == null ? null : sums.clone();
             this.counts = c.clone();
         }
 
@@ -134,6 +168,16 @@ public final class ImatrixFile {
             return sumSq.clone();
         }
 
+        /** The column sums of the plain activations in the {@link #sumSq()} layout, or null without them; a copy. */
+        public float[] sums() {
+            return sums == null ? null : sums.clone();
+        }
+
+        /** True when the entry carries the plain activation sums ({@code .in_sum}). */
+        public boolean hasSums() {
+            return sums != null;
+        }
+
         /** The activation-row counts, one per matrix; a copy. */
         public long[] counts() {
             return counts.clone();
@@ -155,32 +199,125 @@ public final class ImatrixFile {
 
     // ------------------------------------------------------------------ writing
 
-    /**
-     * Writes the GGUF imatrix file {@code out} for {@code entries}, through {@link GgufWriter} as every GGUF
-     * output of the tools is written. The tensors are the {@code <tensor>.in_sum2} and {@code <tensor>.counts}
-     * F32 pairs in sorted name order in llama.cpp's 2-D shapes {@code [cols, nMat]} and {@code [1, nMat]}
-     * ({@code save_as_gguf}), the data section one tensor pair behind the other at the default alignment.
-     *
-     * @param datasets   the files the matrix was collected from ({@code imatrix.datasets}); never null
-     * @param chunkCount the chunk count of the collection ({@code imatrix.chunk_count})
-     * @param chunkSize  the tokens per chunk ({@code imatrix.chunk_size}); {@code 0}, as llama.cpp writes for a
-     *                   matrix combined from legacy files
-     * @return {@code out}, written (and replaced when it exists, like llama.cpp saves)
-     * @throws IOException when the file cannot be written: a tensor name beyond GGUF's 63-byte limit, or a
-     *                     file-system error
-     */
+    /** {@link #writeGguf(Path, List, List, int, int, int)} of a matrix without NextN layers. */
     public static Path writeGguf(Path out, List<Entry> entries, List<String> datasets, int chunkCount, int chunkSize)
             throws IOException {
+        return writeGguf(out, entries, datasets, chunkCount, chunkSize, 0);
+    }
+
+    /**
+     * Writes the GGUF imatrix file {@code out} for {@code entries}, through {@link GgufWriter} as every GGUF
+     * output of the tools is written. Per entry, in sorted name order, the tensors are llama.cpp's
+     * ({@code save_imatrix}): {@code <tensor>.in_sum2} {@code [cols, nMat]}, {@code <tensor>.counts}
+     * {@code [1, nMat]}, {@code <tensor>.in_sum} {@code [cols, nMat]} when the entry carries plain sums, and
+     * {@code <tensor>.stats} {@code [12]} ({@link ImatrixStatistics#stored}), all F32, the data section one tensor
+     * behind the other at the default alignment.
+     *
+     * @param datasets    the files the matrix was collected from ({@code imatrix.datasets}); never null
+     * @param chunkCount  the chunk count of the collection ({@code imatrix.chunk_count})
+     * @param chunkSize   the tokens per chunk ({@code imatrix.chunk_size}); {@code 0}, as llama.cpp writes for a
+     *                    matrix combined from legacy files
+     * @param nLayerNextn the NextN/MTP layers among the top blocks ({@code imatrix.n_layer_nextn}, written when
+     *                    positive)
+     * @return {@code out}, written (and replaced when it exists, like llama.cpp saves)
+     * @throws IOException              when the file cannot be written: a tensor name beyond GGUF's 63-byte limit,
+     *                                  or a file-system error
+     * @throws IllegalArgumentException for a negative {@code nLayerNextn}
+     */
+    public static Path writeGguf(Path out, List<Entry> entries, List<String> datasets, int chunkCount, int chunkSize,
+                                 int nLayerNextn) throws IOException {
         Objects.requireNonNull(entries, "entries");
         Objects.requireNonNull(datasets, "datasets");
+        if (nLayerNextn < 0) {
+            throw new IllegalArgumentException("imatrix.n_layer_nextn " + nLayerNextn + " is negative");
+        }
         List<Entry> stats = sorted(entries);
-        ImatrixSource source = new ImatrixSource(out.toString(), stats, datasets, chunkCount, chunkSize);
+        ImatrixSource source = new ImatrixSource(out.toString(), stats, datasets, chunkCount, chunkSize,
+                nLayerNextn, ImatrixStatistics.stored(stats, nLayerNextn));
         try {
             // llama.cpp's imatrix tool always replaces its output; the options carry overwrite for it.
             GgufWriter.write(source, out, new GgufWriter.Options(GgufWriter.Mode.NATIVE, true,
                     GGUFFileParser.DEFAULT_ALIGNMENT));
         } finally {
             source.close();
+        }
+        return out;
+    }
+
+    /**
+     * Merges two entry lists into one, the {@code load_imatrix} accumulation of llama.cpp's collector: the
+     * statistics of the same tensor name sum element-wise, a single-matrix side broadcasts its one activation
+     * count over the other side's matrices when the summed values share the flat layout (a legacy {@code .dat}
+     * entry merged into a multi-matrix GGUF entry), and any other shape mismatch fails naming the tensor. The plain
+     * activation sums survive only when both sides carry them; a side without them (a legacy entry) drops them,
+     * as {@code load_imatrix} clears the activations of an entry with a contribution that has none.
+     *
+     * @return the merged entries in tensor-name order
+     * @throws IllegalArgumentException when a tensor's summed-value lengths differ beyond the broadcast case, or
+     *                                  two multi-matrix sides disagree on the matrix count
+     */
+    public static List<Entry> combine(List<Entry> a, List<Entry> b) {
+        Objects.requireNonNull(a, "a");
+        Objects.requireNonNull(b, "b");
+        Map<String, Entry> merged = new TreeMap<>();
+        for (Entry e : a) {
+            merged.put(e.tensor(), e);
+        }
+        for (Entry e : b) {
+            Entry base = merged.get(e.tensor());
+            merged.put(e.tensor(), base == null ? e : merge(base, e));
+        }
+        return new ArrayList<>(merged.values());
+    }
+
+    /** Two same-name entries summed; the flat single-matrix side broadcasts its count over the other's matrices. */
+    private static Entry merge(Entry a, Entry b) {
+        int aLen = a.nMat() * a.cols();
+        int bLen = b.nMat() * b.cols();
+        if (aLen != bLen) {
+            throw new IllegalArgumentException("cannot combine imatrix entries for '" + a.tensor() + "': "
+                    + aLen + " summed values against " + bLen);
+        }
+        int nMat;
+        long[] counts;
+        if (a.nMat() == b.nMat()) {
+            nMat = a.nMat();
+            counts = addCounts(a.counts(), b.counts());
+        } else if (a.nMat() == 1) {
+            nMat = b.nMat();
+            counts = broadcastCounts(a.counts()[0], b.counts());
+        } else if (b.nMat() == 1) {
+            nMat = a.nMat();
+            counts = broadcastCounts(b.counts()[0], a.counts());
+        } else {
+            throw new IllegalArgumentException("cannot combine imatrix entries for '" + a.tensor() + "': "
+                    + a.nMat() + " matrices against " + b.nMat());
+        }
+        float[] sumSq = added(a.sumSq, b.sumSq);
+        float[] sums = a.sums != null && b.sums != null ? added(a.sums, b.sums) : null;
+        return new Entry(a.tensor(), nMat, sumSq.length / nMat, sumSq, sums, counts);
+    }
+
+    private static float[] added(float[] a, float[] b) {
+        float[] out = a.clone();
+        for (int j = 0; j < out.length; j++) {
+            out[j] += b[j];
+        }
+        return out;
+    }
+
+    private static long[] addCounts(long[] a, long[] b) {
+        long[] out = new long[a.length];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = Math.addExact(a[i], b[i]);
+        }
+        return out;
+    }
+
+    private static long[] broadcastCounts(long one, long[] many) {
+        long[] out = new long[many.length];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = Math.addExact(one, many[i]);
         }
         return out;
     }
@@ -292,10 +429,15 @@ public final class ImatrixFile {
     }
 
     /**
-     * Reads the GGUF form: per weight tensor its {@code .in_sum2} (F32) and its matrix counts whose element sums
-     * match; every other tensor ({@code .in_sum}, {@code .stats} or an unrelated name) is skipped, as
-     * {@code common_imatrix_load} skips them. The counters come from the two {@code imatrix.*} keys; missing ones
-     * leave the read without metadata, and datasets when the key is absent are empty.
+     * Reads the GGUF form ({@code common_imatrix_load}): per weight tensor its {@code .in_sum2} and {@code .counts}
+     * (F32, the summed values filling the counted matrices), its {@code .in_sum} when present (the
+     * {@code .in_sum2} element count), and its {@code .stats} row when present (one value per
+     * {@code imatrix.stats_schema} name); an unrelated tensor name is skipped. The counters come from the
+     * {@code imatrix.*} keys; missing ones leave the read without metadata, and datasets when the key is absent are
+     * empty.
+     *
+     * @throws IOException when a statistics tensor is not F32, appears twice, lacks its {@code .in_sum2} or
+     *                     {@code .counts} partner, or holds another element count than its partner or schema
      */
     public static Read readGguf(Path file) throws IOException {
         try (GGUFFileParser parser = new GGUFFileParser(file.toString())) {
@@ -303,76 +445,112 @@ public final class ImatrixFile {
                 throw new IOException(file + " is a GGUF file of general.type '" + parser.getString("general.type")
                         + "', not an imatrix");
             }
-            List<String> datasets = stringArray(parser);
-            Long nextn = parser.getUInt32("imatrix.n_layer_nextn");
+            List<String> schema = stringArray(parser, KEY_STATS_SCHEMA);
             TensorRegions regions = parser.openRegions(TensorReadMode.current());
             try {
-                Map<String, float[]> sums = new TreeMap<>();
-                Map<String, GGUFTensorInfo> sumInfo = new TreeMap<>();
-                Map<String, GGUFTensorInfo> countInfo = new TreeMap<>();
-                for (GGUFTensorInfo t : parser.getTensors()) {
-                    if (t.type() != GGMLType.F32 && (t.name().endsWith(IN_SUM2_SUFFIX)
-                            || t.name().endsWith(COUNTS_SUFFIX))) {
-                        throw new IOException(file + ": tensor '" + t.name() + "' is " + t.type()
-                                + ", but the imatrix tensors are F32");
-                    }
-                    if (t.name().endsWith(IN_SUM2_SUFFIX)) {
-                        String name = t.name().substring(0, t.name().length() - IN_SUM2_SUFFIX.length());
-                        if (sums.containsKey(name)) {
-                            throw new IOException(file + ": two " + IN_SUM2_SUFFIX + " tensors for '" + name + "'");
-                        }
-                        sums.put(name, floats(regions, t));
-                        sumInfo.put(name, t);
-                    } else if (t.name().endsWith(COUNTS_SUFFIX)) {
-                        String name = t.name().substring(0, t.name().length() - COUNTS_SUFFIX.length());
-                        if (countInfo.containsKey(name)) {
-                            throw new IOException(file + ": two " + COUNTS_SUFFIX + " tensors for '" + name + "'");
-                        }
-                        countInfo.put(name, t);
-                    }
-                }
-                List<Entry> entries = new ArrayList<>();
-                for (String name : sums.keySet()) {
-                    GGUFTensorInfo counts = countInfo.get(name);
-                    if (counts == null) {
-                        throw new IOException(file + ": tensor '" + name + "' has no matching "
-                                + COUNTS_SUFFIX + " tensor");
-                    }
-                    float[] countFloats = floats(regions, counts);
-                    long[] countLongs = new long[countFloats.length];
-                    for (int i = 0; i < countFloats.length; i++) {
-                        countLongs[i] = Math.round(countFloats[i]);
-                    }
-                    int nMat = countLongs.length;
-                    if (nMat < 1) {
-                        throw new IOException(file + ": tensor '" + counts.name() + "' counts " + nMat
-                                + " matrices");
-                    }
-                    float[] sumSq = sums.get(name);
-                    long sumElements = elements(sumInfo.get(name).dims());
-                    if (sumSq.length == 0 || sumElements != sumSq.length || sumSq.length % nMat != 0) {
-                        throw new IOException(file + ": the " + sumSq.length + " summed values of '" + name
-                                + "' do not fill " + nMat + " matrices");
-                    }
-                    int cols = sumSq.length / nMat;
-                    entries.add(new Entry(name, nMat, cols, sumSq, countLongs));
-                }
+                Map<String, Map<String, GGUFTensorInfo>> bySuffix = indexStatsTensors(file, parser.getTensors());
+                List<Entry> entries = readEntries(file, regions, bySuffix);
+                Map<String, float[]> stats = readStats(file, regions, bySuffix.get(STATS_SUFFIX),
+                        schema.isEmpty() ? STATS_SCHEMA.size() : schema.size());
                 Long chunkCount = parser.getUInt32(KEY_CHUNK_COUNT);
                 Long chunkSize = parser.getUInt32(KEY_CHUNK_SIZE);
+                Long nextn = parser.getUInt32(KEY_N_LAYER_NEXTN);
                 boolean hasMetadata = parser.getValueType(KEY_DATASETS) == GGUFValueType.ARRAY
                         && parser.getValueType(KEY_CHUNK_COUNT) == GGUFValueType.UINT32
                         && parser.getValueType(KEY_CHUNK_SIZE) == GGUFValueType.UINT32;
-                if (nextn != null && nextn != 0) {
-                    // an MTP matrix is quantized against the NextN layer set; no TL-3 consumer reads it today
-                    throw new IOException(file + " was collected over NextN layers (imatrix.n_layer_nextn "
-                            + nextn + "); combining it is not supported");
-                }
-                return new Read(entries, datasets, chunkCount == null ? 0 : chunkCount.intValue(),
-                        chunkSize == null ? 0 : chunkSize.intValue(), false, hasMetadata, file);
+                return new Read(entries, stringArray(parser, KEY_DATASETS), chunkCount == null ? 0
+                        : chunkCount.intValue(), chunkSize == null ? 0 : chunkSize.intValue(),
+                        nextn == null ? 0 : Math.toIntExact(nextn), stats, schema, false, hasMetadata, file);
             } finally {
                 regions.close();
             }
         }
+    }
+
+    /** The statistics tensors of a file by suffix, then by weight name; each must be F32 and appear once. */
+    private static Map<String, Map<String, GGUFTensorInfo>> indexStatsTensors(Path file, List<GGUFTensorInfo> tensors)
+            throws IOException {
+        Map<String, Map<String, GGUFTensorInfo>> out = new LinkedHashMap<>();
+        for (String suffix : new String[]{IN_SUM2_SUFFIX, IN_SUM_SUFFIX, COUNTS_SUFFIX, STATS_SUFFIX}) {
+            out.put(suffix, new TreeMap<>());
+        }
+        for (GGUFTensorInfo t : tensors) {
+            for (Map.Entry<String, Map<String, GGUFTensorInfo>> e : out.entrySet()) {
+                String suffix = e.getKey();
+                if (!t.name().endsWith(suffix)) {
+                    continue;
+                }
+                if (t.type() != GGMLType.F32) {
+                    throw new IOException(file + ": tensor '" + t.name() + "' is " + t.type()
+                            + ", but the imatrix tensors are F32");
+                }
+                String name = t.name().substring(0, t.name().length() - suffix.length());
+                if (e.getValue().put(name, t) != null) {
+                    throw new IOException(file + ": two " + suffix + " tensors for '" + name + "'");
+                }
+                break;
+            }
+        }
+        return out;
+    }
+
+    /** The entries of the indexed {@code .in_sum2} / {@code .counts} / {@code .in_sum} tensors, in name order. */
+    private static List<Entry> readEntries(Path file, TensorRegions regions,
+                                           Map<String, Map<String, GGUFTensorInfo>> bySuffix) throws IOException {
+        Map<String, GGUFTensorInfo> sumSqInfo = bySuffix.get(IN_SUM2_SUFFIX);
+        Map<String, GGUFTensorInfo> sumInfo = bySuffix.get(IN_SUM_SUFFIX);
+        Map<String, GGUFTensorInfo> countInfo = bySuffix.get(COUNTS_SUFFIX);
+        for (String name : sumInfo.keySet()) {
+            if (!sumSqInfo.containsKey(name)) {
+                throw new IOException(file + ": tensor '" + name + IN_SUM_SUFFIX + "' has no matching "
+                        + IN_SUM2_SUFFIX + " tensor");
+            }
+        }
+        List<Entry> entries = new ArrayList<>();
+        for (Map.Entry<String, GGUFTensorInfo> e : sumSqInfo.entrySet()) {
+            String name = e.getKey();
+            GGUFTensorInfo counts = countInfo.get(name);
+            if (counts == null) {
+                throw new IOException(file + ": tensor '" + name + "' has no matching " + COUNTS_SUFFIX + " tensor");
+            }
+            float[] countFloats = floats(regions, counts);
+            long[] countLongs = new long[countFloats.length];
+            for (int i = 0; i < countFloats.length; i++) {
+                countLongs[i] = Math.round(countFloats[i]);
+            }
+            int nMat = countLongs.length;
+            if (nMat < 1) {
+                throw new IOException(file + ": tensor '" + counts.name() + "' counts " + nMat + " matrices");
+            }
+            float[] sumSq = floats(regions, e.getValue());
+            if (sumSq.length == 0 || elements(e.getValue().dims()) != sumSq.length || sumSq.length % nMat != 0) {
+                throw new IOException(file + ": the " + sumSq.length + " summed values of '" + name
+                        + "' do not fill " + nMat + " matrices");
+            }
+            GGUFTensorInfo plain = sumInfo.get(name);
+            float[] sums = plain == null ? null : floats(regions, plain);
+            if (sums != null && sums.length != sumSq.length) {
+                throw new IOException(file + ": the " + sums.length + " activation sums of '" + name
+                        + "' do not match its " + sumSq.length + " squared sums");
+            }
+            entries.add(new Entry(name, nMat, sumSq.length / nMat, sumSq, sums, countLongs));
+        }
+        return entries;
+    }
+
+    /** The {@code .stats} rows by weight name, each holding {@code width} values. */
+    private static Map<String, float[]> readStats(Path file, TensorRegions regions, Map<String, GGUFTensorInfo> info,
+                                                  int width) throws IOException {
+        Map<String, float[]> out = new TreeMap<>();
+        for (Map.Entry<String, GGUFTensorInfo> e : info.entrySet()) {
+            float[] row = floats(regions, e.getValue());
+            if (row.length != width) {
+                throw new IOException(file + ": tensor '" + e.getValue().name() + "' holds " + row.length
+                        + " values, the statistics schema names " + width);
+            }
+            out.put(e.getKey(), row);
+        }
+        return out;
     }
 
     /** Reads the F32 tensor {@code t} of {@code regions} as a host float array. */
@@ -387,21 +565,16 @@ public final class ImatrixFile {
         return out;
     }
 
-    /** The per-matrix activation counts of one read, as longs (each an F32 value, read through the regions). */
-    private static float[] countsF32(TensorRegions regions, GGUFTensorInfo t) throws IOException {
-        return floats(regions, t);
-    }
-
     private static long elements(long[] dims) {
-        long n = dims.length == 0 ? 1 : 1;
+        long n = 1;
         for (long d : dims) {
             n *= d;
         }
         return n;
     }
 
-    private static List<String> stringArray(GGUFFileParser parser) {
-        List<Object> arr = parser.getArray(KEY_DATASETS);
+    private static List<String> stringArray(GGUFFileParser parser, String key) {
+        List<Object> arr = parser.getArray(key);
         if (arr == null) {
             return List.of();
         }
@@ -476,31 +649,68 @@ public final class ImatrixFile {
                 dataset = new String(ds, StandardCharsets.UTF_8);
             }
         }
-        return new Read(entries, dataset.isEmpty() ? List.of() : List.of(dataset), chunkCount, 0, true, false,
-                file);
+        return new Read(entries, dataset.isEmpty() ? List.of() : List.of(dataset), chunkCount, 0, 0, Map.of(),
+                List.of(), true, false, file);
     }
 
     // ------------------------------------------------------------------ read result
 
-    /** One read imatrix file: its entries, its dataset names and its chunk counters. */
+    /**
+     * One read imatrix file: its entries, its dataset names, its chunk counters, its NextN layer count and the
+     * stored per-tensor statistics with their schema.
+     */
     public static final class Read {
         private final List<Entry> entries;
         private final List<String> datasets;
         private final int chunkCount;
         private final int chunkSize;
+        private final int nLayerNextn;
+        private final Map<String, float[]> stats;
+        private final List<String> statsSchema;
         private final boolean legacy;
         private final boolean hasMetadata;
         private final Path file;
 
-        Read(List<Entry> entries, List<String> datasets, int chunkCount, int chunkSize, boolean legacy,
-             boolean hasMetadata, Path file) {
+        Read(List<Entry> entries, List<String> datasets, int chunkCount, int chunkSize, int nLayerNextn,
+             Map<String, float[]> stats, List<String> statsSchema, boolean legacy, boolean hasMetadata, Path file) {
             this.entries = List.copyOf(entries);
             this.datasets = List.copyOf(datasets);
             this.chunkCount = chunkCount;
             this.chunkSize = chunkSize;
+            this.nLayerNextn = nLayerNextn;
+            Map<String, float[]> copy = new TreeMap<>();
+            for (Map.Entry<String, float[]> e : stats.entrySet()) {
+                copy.put(e.getKey(), e.getValue().clone());
+            }
+            this.stats = Collections.unmodifiableMap(copy);
+            this.statsSchema = List.copyOf(statsSchema);
             this.legacy = legacy;
             this.hasMetadata = hasMetadata;
             this.file = file;
+        }
+
+        /** {@code imatrix.n_layer_nextn}; {@code 0} when the file records none. */
+        public int nLayerNextn() {
+            return nLayerNextn;
+        }
+
+        /** The weight names whose {@code .stats} row the file stores, in name order. */
+        public java.util.Set<String> statsTensors() {
+            return stats.keySet();
+        }
+
+        /**
+         * The stored {@code .stats} row of {@code tensor} in {@link #statsSchema()} order, or null when the file
+         * stores none for it; a copy.
+         */
+        public float[] stats(String tensor) {
+            float[] row = stats.get(tensor);
+            return row == null ? null : row.clone();
+        }
+
+        /** {@code imatrix.stats_schema}: the names of the {@code .stats} values; empty when the file has none. */
+        public List<String> statsSchema() {
+            return statsSchema;
         }
 
         /** The imatrix entries, one per weight tensor, in name order. */
@@ -541,7 +751,8 @@ public final class ImatrixFile {
         @Override
         public String toString() {
             return file + ": " + entries.size() + " entries, " + (legacy ? "legacy .dat" : "gguf")
-                    + ", chunk_count " + chunkCount + (chunkSize > 0 ? ", chunk_size " + chunkSize : "");
+                    + ", chunk_count " + chunkCount + (chunkSize > 0 ? ", chunk_size " + chunkSize : "")
+                    + (nLayerNextn > 0 ? ", n_layer_nextn " + nLayerNextn : "");
         }
     }
 
@@ -549,16 +760,30 @@ public final class ImatrixFile {
 
     /**
      * The collected statistics as a {@link ModelSource} in the GGUF contract, written by {@link GgufWriter}: the
-     * key set of llama.cpp's {@code save_as_gguf} and one F32 {@code .in_sum2}/{@code .counts} pair per entry
-     * over one aligned backing byte array. The virtual offsets of the tensor table are the backing layout — the
-     * writer aliases every tensor of the pair sequence in order, so the offsets the writer passes to the store
-     * (its own per-shard placement of the same sequence with the same alignment) land on the same bytes.
+     * key set of llama.cpp's {@code save_imatrix} and, per entry, its F32 {@code .in_sum2}, {@code .counts},
+     * {@code .in_sum} (when carried) and {@code .stats} tensors over one aligned backing byte array. The virtual
+     * offsets of the tensor table are the backing layout — the writer aliases every tensor of the sequence in
+     * order, so the offsets the writer passes to the store (its own per-shard placement of the same sequence with
+     * the same alignment) land on the same bytes.
      */
     static final class ImatrixSource implements ModelSource {
         private static final int ALIGNMENT = GGUFFileParser.DEFAULT_ALIGNMENT;
 
         private static long alignUp(long v, int alignment) {
             return (v + alignment - 1) & ~((long) alignment - 1);
+        }
+
+        /** One F32 tensor of the file: its name, its ggml shape and its values. */
+        private static final class Part {
+            final String name;
+            final long[] dims;
+            final float[] values;
+
+            Part(String name, long[] dims, float[] values) {
+                this.name = name;
+                this.dims = dims;
+                this.values = values;
+            }
         }
 
         private final String filePath;
@@ -569,7 +794,12 @@ public final class ImatrixFile {
         private final byte[] data;
         private volatile boolean closed;
 
-        ImatrixSource(String filePath, List<Entry> entries, List<String> datasets, int chunkCount, int chunkSize) {
+        /**
+         * @param entries the entries in name order
+         * @param stats   the {@code .stats} row of every entry, {@link #STATS_SCHEMA} values each
+         */
+        ImatrixSource(String filePath, List<Entry> entries, List<String> datasets, int chunkCount, int chunkSize,
+                      int nLayerNextn, Map<String, float[]> stats) {
             this.filePath = Objects.requireNonNull(filePath, "filePath");
             this.metadata = new LinkedHashMap<>();
             this.valueTypes = new LinkedHashMap<>();
@@ -578,79 +808,83 @@ public final class ImatrixFile {
             valueTypes.put("general.type", GGUFValueType.STRING);
             List<String> ds = sortedUnique(Objects.requireNonNull(datasets, "datasets"));
             if (!ds.isEmpty()) {
-                metadata.put(KEY_DATASETS, ds);
-                valueTypes.put(KEY_DATASETS, GGUFValueType.ARRAY);
-                elementTypes.put(KEY_DATASETS, GGUFValueType.STRING);
+                putStrings(KEY_DATASETS, ds);
             }
             metadata.put(KEY_CHUNK_COUNT, chunkCount);
             valueTypes.put(KEY_CHUNK_COUNT, GGUFValueType.UINT32);
             metadata.put(KEY_CHUNK_SIZE, Math.max(0, chunkSize));
             valueTypes.put(KEY_CHUNK_SIZE, GGUFValueType.UINT32);
-            this.tensors = layout(entries);
-            this.data = fill(entries);
+            if (nLayerNextn > 0) {
+                metadata.put(KEY_N_LAYER_NEXTN, nLayerNextn);
+                valueTypes.put(KEY_N_LAYER_NEXTN, GGUFValueType.UINT32);
+            }
+            putStrings(KEY_STATS_SCHEMA, STATS_SCHEMA);
+            List<Part> parts = parts(entries, stats);
+            this.tensors = layout(parts);
+            this.data = fill(parts);
         }
 
-        /** The stats tensor pairs in sorted name order, placed back to back at the default alignment. */
-        private static List<GGUFTensorInfo> layout(List<Entry> entries) {
-            List<GGUFTensorInfo> out = new ArrayList<>();
-            long offset = 0;
+        private void putStrings(String key, List<String> values) {
+            metadata.put(key, values);
+            valueTypes.put(key, GGUFValueType.ARRAY);
+            elementTypes.put(key, GGUFValueType.STRING);
+        }
+
+        /** The tensors of every entry in llama.cpp's order: in_sum2, counts, in_sum (when carried), stats. */
+        private static List<Part> parts(List<Entry> entries, Map<String, float[]> stats) {
+            List<Part> out = new ArrayList<>();
             for (Entry e : entries) {
-                GGUFTensorInfo sums = new GGUFTensorInfo(e.tensor() + IN_SUM2_SUFFIX,
-                        new long[]{e.cols(), e.nMat()}, GGMLType.F32, offset);
-                out.add(sums);
-                offset = alignUp(offset + sums.sizeInBytes(), ALIGNMENT);
-                GGUFTensorInfo counts = new GGUFTensorInfo(e.tensor() + COUNTS_SUFFIX,
-                        new long[]{1, e.nMat()}, GGMLType.F32, offset);
-                out.add(counts);
-                offset = alignUp(offset + counts.sizeInBytes(), ALIGNMENT);
+                long[] matrix = {e.cols(), e.nMat()};
+                out.add(new Part(e.tensor() + IN_SUM2_SUFFIX, matrix, e.sumSq));
+                float[] counts = new float[e.nMat()];
+                for (int j = 0; j < counts.length; j++) {
+                    counts[j] = e.counts[j];
+                }
+                out.add(new Part(e.tensor() + COUNTS_SUFFIX, new long[]{1, e.nMat()}, counts));
+                if (e.sums != null) {
+                    out.add(new Part(e.tensor() + IN_SUM_SUFFIX, matrix, e.sums));
+                }
+                float[] row = stats.get(e.tensor());
+                if (row == null || row.length != STATS_SCHEMA.size()) {
+                    throw new IllegalArgumentException("no statistics row of " + STATS_SCHEMA.size()
+                            + " values for '" + e.tensor() + "'");
+                }
+                out.add(new Part(e.tensor() + STATS_SUFFIX, new long[]{row.length}, row));
+            }
+            return out;
+        }
+
+        /** The tensor table: the parts back to back at the default alignment. */
+        private static List<GGUFTensorInfo> layout(List<Part> parts) {
+            List<GGUFTensorInfo> out = new ArrayList<>(parts.size());
+            long offset = 0;
+            for (Part p : parts) {
+                GGUFTensorInfo t = new GGUFTensorInfo(p.name, p.dims, GGMLType.F32, offset);
+                out.add(t);
+                offset = alignUp(offset + t.sizeInBytes(), ALIGNMENT);
             }
             return Collections.unmodifiableList(out);
         }
 
         /** The flat little-endian data section behind the tensor table. */
-        private static byte[] fill(List<Entry> entries) {
-            byte[] data = layoutCapacity(entries);
-            ByteBuffer buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
-            TreeMap<String, Entry> byName = new TreeMap<>();
-            for (Entry e : entries) {
-                byName.put(e.tensor(), e);
-            }
-            for (Entry e : byName.values()) {
-                for (int j = 0; j < e.nMat() * e.cols(); j++) {
-                    buf.putFloat(e.sumSq[j]);
-                }
-                for (int p = 0; p < pad(e.nMat() * (long) e.cols() * 4L); p++) {
-                    buf.put((byte) 0);
-                }
-                for (int j = 0; j < e.nMat(); j++) {
-                    buf.putFloat(e.counts[j]);
-                }
-                for (int p = 0; p < pad(e.nMat() * 4L); p++) {
-                    buf.put((byte) 0);
-                }
-            }
-            if (buf.remaining() != 0) {
-                throw new IllegalStateException("the imatrix data section is " + buf.remaining()
-                        + " bytes larger than its layout");
-            }
-            return data;
-        }
-
-        private static long pad(long bytes) {
-            return alignUp(bytes, ALIGNMENT) - bytes;
-        }
-
-        private static byte[] layoutCapacity(List<Entry> entries) {
+        private static byte[] fill(List<Part> parts) {
             long bytes = 0;
-            for (Entry e : entries) {
-                bytes = alignUp(bytes + e.nMat() * (long) e.cols() * 4L, ALIGNMENT);
-                bytes = alignUp(bytes + e.nMat() * 4L, ALIGNMENT);
+            for (Part p : parts) {
+                bytes = alignUp(bytes + p.values.length * 4L, ALIGNMENT);
             }
             if (bytes > Integer.MAX_VALUE - 8) {
                 throw new IllegalArgumentException("the collected imatrix takes " + bytes
                         + " bytes, more than one array holds");
             }
-            return new byte[(int) bytes];
+            byte[] data = new byte[(int) bytes];
+            ByteBuffer buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+            for (Part p : parts) {
+                for (float v : p.values) {
+                    buf.putFloat(v);
+                }
+                buf.position((int) alignUp(buf.position(), ALIGNMENT));
+            }
+            return data;
         }
 
         // ------------------------------------------------------------------ ModelSource

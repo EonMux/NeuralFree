@@ -9,10 +9,12 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileAttributeView;
 import java.nio.file.attribute.FileStoreAttributeView;
@@ -44,6 +46,37 @@ public class SidecarDirectoryTest {
 
     private static boolean posix(Path p) {
         return p.getFileSystem().supportedFileAttributeViews().contains("posix");
+    }
+
+    /**
+     * A path whose attributes are those of the open sidecar file {@code file}: the file itself while its name exists,
+     * or, where {@code DELETE_ON_CLOSE} unlinks the name at open (the JDK on Unix), this process's descriptor link
+     * of the unlinked file under {@code /proc/self/fd}; null when the name is gone and the platform has no
+     * {@code /proc} to reach the open file through.
+     */
+    private static Path openedFile(Path file) throws IOException {
+        if (Files.exists(file)) {
+            return file;
+        }
+        Path fds = Paths.get("/proc/self/fd");
+        if (!Files.isDirectory(fds)) {
+            return null;
+        }
+        String deleted = file + " (deleted)";
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(fds)) {
+            for (Path fd : entries) {
+                String target;
+                try {
+                    target = Files.readSymbolicLink(fd).toString();
+                } catch (IOException e) {
+                    continue; // the descriptor of the directory stream itself closes while it is read
+                }
+                if (target.equals(deleted)) {
+                    return fd;
+                }
+            }
+        }
+        throw new AssertionError("the open sidecar " + file + " has neither its name nor a descriptor under " + fds);
     }
 
     private static byte[] ramp(int n, int first) {
@@ -128,7 +161,10 @@ public class SidecarDirectoryTest {
                 assertEquals(run, s.path().getParent());
                 if (posix(run)) {
                     assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(run)));
-                    assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(s.path())));
+                    Path file = openedFile(s.path());
+                    if (file != null) {
+                        assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(file)));
+                    }
                 }
             }
         }

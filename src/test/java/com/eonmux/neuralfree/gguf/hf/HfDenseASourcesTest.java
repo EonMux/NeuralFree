@@ -21,8 +21,9 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-D2 part A fixtures ({@code Gemma3Model}, {@code Gemma3NModel}, {@code SenseNovaU1Model}, {@code
- * Qwen2VLModel}, {@code Qwen3VLTextModel}, {@code Qwen3ASRTextModel}) build through the registered entries:
+ * The fixtures ({@code Gemma3Model}, {@code Gemma3NModel}, {@code SenseNovaU1Model}, {@code
+ * Qwen2VLModel}, {@code Qwen3VLTextModel}, {@code Qwen3ASRTextModel}, {@code
+ * Qwen3ASRForcedAlignerForTokenClassification}) build through the registered entries:
  * {@link ModelSpecBuilder} succeeds and every catalog tensor is claimed ({@code TensorClaims}), which is the
  * done-getting-tensors check of the converter's tensor plan.
  *

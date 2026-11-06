@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import org.junit.jupiter.api.AfterAll;
@@ -85,7 +86,7 @@ class RequestLifetimeTest {
         AtomicReference<Handler<Void>> onClose = new AtomicReference<>();
         GenerationRequest request = GenerationRequest.builder().maxNewTokens(800).ignoreEos(true).build();
         GenerationBatch batch = GenerationBatch.start(service, List.of(
-                new GenerationBatch.Job(service.encode("hello", true, false), request, null, null)),
+                new GenerationBatch.Job(service.encode("hello", true, false), request, null, null, null)),
                 client(onClose));
         assertNotNull(onClose.get(), "the batch registered a close handler");
         onClose.get().handle(null);
@@ -111,6 +112,9 @@ class RequestLifetimeTest {
                 new Class<?>[]{HttpServerRequest.class}, (proxy, method, args) -> {
                     if (method.getName().equals("response")) {
                         return response;
+                    }
+                    if (method.getName().equals("headers")) {
+                        return MultiMap.caseInsensitiveMultiMap();
                     }
                     throw new UnsupportedOperationException(method.getName());
                 });

@@ -1,0 +1,110 @@
+/* conv1d_causal.comp - LLM_Conv1dCausal and LLM_Conv1dDepthwiseCausal, the speech generators' causal
+ * convolutions. GLSL twin of kernels/llm/speech.cl (the semantic reference). Requires: common/nf_common.glsl.
+ *
+ * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
+ *     LLM_Conv1dCausal	conv1d_causal.comp	OP=OP_CONV1D_CAUSAL
+ *
+ * Layout: token-major F32, element (t, c) at v[t*channels + c]. The full signal is `state` (pad rows) followed by
+ * `x` (n rows); the kernel also writes the next left context (the full signal's last pad rows).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_CONV1D_CAUSAL (i n, i ic, i oc, i k, i dil, i pad, R x, R w, R b, R state, W y, W nstate)
+ *       y[t][oc] = b[oc] + sum_{c,j} w[(oc*IC + c)*K + j] * full[t + j*dil][c]
+ *       nstate[j][c] = full[n + j][c] for j < pad
+ *   OP_CONV1D_DW_CAUSAL (i n, i c, i k, i pad, R x, R w, R b, R state, W y, W nstate)
+ *       y[t][c] = b[c] + sum_j w[c*K + j] * full[t + j][c]
+ *
+ * Dispatch: 1-D, one invocation per output or state element, global = roundUp(max(outputs, states), L),
+ * local = {L, 1, 1}. Folded group counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_CONV1D_CAUSAL    401
+#define OP_CONV1D_DW_CAUSAL 402
+
+#ifndef OP
+#error "conv1d_causal.comp requires OP"
+#endif
+
+layout(std430, binding = 0) restrict readonly buffer NfCausalX { float x_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfCausalW { float w_in[]; };
+layout(std430, binding = 2) restrict readonly buffer NfCausalB { float b_in[]; };
+layout(std430, binding = 3) restrict readonly buffer NfCausalS { float state_in[]; };
+layout(std430, binding = 4) restrict writeonly buffer NfCausalY { float y_out[]; };
+layout(std430, binding = 5) restrict writeonly buffer NfCausalN { float nstate_out[]; };
+
+#if OP == OP_CONV1D_CAUSAL
+layout(push_constant) uniform NfCausalParams {
+    int n;
+    int ic;
+    int oc;
+    int k;
+    int dil;
+    int pad;
+} pc;
+#elif OP == OP_CONV1D_DW_CAUSAL
+layout(push_constant) uniform NfCausalParams {
+    int n;
+    int c;
+    int k;
+    int pad;
+} pc;
+#else
+#error "conv1d_causal.comp: unknown OP"
+#endif
+
+void main() {
+    const uint idx = nf_global_id();
+#if OP == OP_CONV1D_CAUSAL
+    const uint oc_n = uint(pc.oc);
+    const uint ic_n = uint(pc.ic);
+    const uint out_n = uint(pc.n) * oc_n;
+    if (idx < out_n) {
+        const uint t = idx / oc_n;
+        const uint oc = idx - t * oc_n;
+        const uint w_oc = oc * ic_n * uint(pc.k);
+        float acc = b_in[oc];
+        for (uint c = 0u; c < ic_n; ++c) {
+            const uint w_row = w_oc + c * uint(pc.k);
+            for (int j = 0; j < pc.k; ++j) {
+                const int r = int(t) + j * pc.dil;
+                const float v = r < pc.pad ? state_in[uint(r) * ic_n + c] : x_in[uint(r - pc.pad) * ic_n + c];
+                acc += w_in[w_row + uint(j)] * v;
+            }
+        }
+        y_out[idx] = acc;
+    }
+    const uint state_n = uint(pc.pad) * ic_n;
+    if (idx < state_n) {
+        const uint j = idx / ic_n;
+        const uint c = idx - j * ic_n;
+        const uint r = uint(pc.n) + j;
+        nstate_out[idx] = r < uint(pc.pad) ? state_in[r * ic_n + c] : x_in[(r - uint(pc.pad)) * ic_n + c];
+    }
+#elif OP == OP_CONV1D_DW_CAUSAL
+    const uint c_n = uint(pc.c);
+    const uint out_n = uint(pc.n) * c_n;
+    if (idx < out_n) {
+        const uint t = idx / c_n;
+        const uint c = idx - t * c_n;
+        const uint w_row = c * uint(pc.k);
+        float acc = b_in[c];
+        for (int j = 0; j < pc.k; ++j) {
+            const int r = int(t) + j;
+            const float v = r < pc.pad ? state_in[uint(r) * c_n + c] : x_in[uint(r - pc.pad) * c_n + c];
+            acc += w_in[w_row + uint(j)] * v;
+        }
+        y_out[idx] = acc;
+    }
+    const uint state_n = uint(pc.pad) * c_n;
+    if (idx < state_n) {
+        const uint j = idx / c_n;
+        const uint c = idx - j * c_n;
+        const uint r = uint(pc.n) + j;
+        nstate_out[idx] = r < uint(pc.pad) ? state_in[r * c_n + c] : x_in[(r - uint(pc.pad)) * c_n + c];
+    }
+#endif
+}

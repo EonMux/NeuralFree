@@ -34,6 +34,8 @@ public final class RopeSpec {
     private final int nCtxOrig;
     private final int[] sections;
     private final TensorRef freqFactors;
+    private final float[] computedFreqFactors;
+    private final FopeSpec fope;
     private final MropeTextPositions textPositions;
 
     private RopeSpec(Builder b) {
@@ -52,6 +54,8 @@ public final class RopeSpec {
         this.nCtxOrig = b.nCtxOrig;
         this.sections = b.sections.clone();
         this.freqFactors = b.freqFactors;
+        this.computedFreqFactors = b.computedFreqFactors != null ? b.computedFreqFactors.clone() : null;
+        this.fope = b.fope;
         this.textPositions = b.textPositions;
     }
 
@@ -81,6 +85,14 @@ public final class RopeSpec {
     public int[] sections() { return sections.clone(); }
     /** Per-dim frequency divisors ({@code rope_freqs}, or the long/short factors chosen by context); null when absent. */
     public TensorRef freqFactors() { return freqFactors; }
+    /**
+     * Per-pair frequency divisors the resolver computes instead of reading them from a tensor (vLLM's fixed and mixed
+     * NTK scaling), at least {@link RopeMath#pairCount} values, or null when the divisors come from {@link #freqFactors()}
+     * or there are none.
+     */
+    public float[] computedFreqFactors() { return computedFreqFactors != null ? computedFreqFactors.clone() : null; }
+    /** Fourier position embedding parameters, or null for analytic RoPE. */
+    public FopeSpec fope() { return fope; }
     /** Section positions of text tokens for multi-section types. */
     public MropeTextPositions textPositions() { return textPositions; }
 
@@ -93,7 +105,8 @@ public final class RopeSpec {
     public String toString() {
         return "RopeSpec{" + type + ", nDims=" + nDims + ", nOffs=" + nOffs + ", base=" + freqBase + ", scale=" + freqScale
                 + ", ext=" + extFactor + ", attn=" + attnFactor + ", corr=[" + corrLo + ", " + corrHi + "], sections="
-                + Arrays.toString(sections) + ", factors=" + (freqFactors != null ? freqFactors.name() : "none") + '}';
+                + Arrays.toString(sections) + ", factors=" + (freqFactors != null ? freqFactors.name()
+                        : computedFreqFactors != null ? "computed" : "none") + ", fope=" + fope + '}';
     }
 
     public static final class Builder {
@@ -112,6 +125,8 @@ public final class RopeSpec {
         private int nCtxOrig;
         private int[] sections = new int[MropeTextPositions.SECTIONS];
         private TensorRef freqFactors;
+        private float[] computedFreqFactors;
+        private FopeSpec fope;
         private MropeTextPositions textPositions = MropeTextPositions.PPP0;
 
         private Builder(RopeType type) {
@@ -141,7 +156,19 @@ public final class RopeSpec {
             this.sections = v.clone();
             return this;
         }
-        public Builder freqFactors(TensorRef v) { this.freqFactors = v; return this; }
+        /** Per-dim divisors read from a tensor; clears the computed divisors. */
+        public Builder freqFactors(TensorRef v) {
+            this.freqFactors = v;
+            this.computedFreqFactors = null;
+            return this;
+        }
+        /** Per-pair divisors computed by the resolver; clears the tensor divisors. */
+        public Builder computedFreqFactors(float[] v) {
+            this.computedFreqFactors = v != null ? v.clone() : null;
+            this.freqFactors = null;
+            return this;
+        }
+        public Builder fope(FopeSpec v) { this.fope = v; return this; }
         public Builder textPositions(MropeTextPositions v) {
             this.textPositions = Objects.requireNonNull(v, "textPositions");
             return this;
@@ -189,6 +216,19 @@ public final class RopeSpec {
             if (freqFactors != null && freqFactors.numElements() < nDims / 2) {
                 throw new IllegalArgumentException("rope freq factors " + freqFactors + " hold fewer than nDims/2 = "
                         + nDims / 2);
+            }
+            if (computedFreqFactors != null && computedFreqFactors.length < pairs) {
+                throw new IllegalArgumentException("computed rope freq factors hold " + computedFreqFactors.length
+                        + " values, " + type + " with nDims " + nDims + " reads " + pairs);
+            }
+            if (fope != null) {
+                if (nOffs != 0) {
+                    throw new IllegalArgumentException("FoPE rotates whole heads and needs nOffs 0, got " + nOffs);
+                }
+                if (fope.numInvFreq() > pairs) {
+                    throw new IllegalArgumentException("FoPE projects " + fope.numInvFreq() + " frequencies, more"
+                            + " than the " + pairs + " rotation pairs of nDims " + nDims);
+                }
             }
             return new RopeSpec(this);
         }

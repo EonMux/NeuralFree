@@ -7,7 +7,12 @@ import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.LogitPrefilter;
+import com.eonmux.neuralfree.gguf.engine.OutputKind;
+import com.eonmux.neuralfree.gguf.engine.RowTopK;
+import com.eonmux.neuralfree.gguf.engine.SequenceEncoder;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuBlockRegistry;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.forward.BuiltInGpuExtras;
@@ -38,6 +43,7 @@ import com.eonmux.neuralfree.utils.Closeables;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -72,13 +78,21 @@ import java.util.Set;
  * {@code t_embd}, t5.cpp:344) without touching the memory or the cross caches; {@link #forwardAll} has no meaning
  * for an encoder-decoder model and is refused.</p>
  *
+ * <p>Over paged memory ({@code neuralfree.parallel > 1} or {@code neuralfree.kv.paged=true}) the backend runs several
+ * decoder sequences at once, each over the encoding of its own source ({@link SequenceEncoder}, llama.cpp's
+ * {@code cross.seq_ids_enc} and cross mask, llama-context.cpp:1776-1785 and llama-graph.cpp:1093-1105), the twin of
+ * {@code CpuEncDecBackend}: {@link #encodeSequence} encodes a source into one sequence's cross caches, and
+ * {@link #forwardBatch} runs a batch of decoder rows through {@link GpuPrefillDriver#runBatch} over the page tables,
+ * where the self-attention reads each sequence's own cells and the cross-attention each sequence's own encoder rows.
+ * The contiguous calls run sequence 0.</p>
+ *
  * <p>The encoder runs the whole source in one step, as llama.cpp does (llama-context.cpp:1628), and the cross caches
  * hold {@code nCtx} rows, so a source longer than {@code min(ubatch, nCtx)} is refused with
  * {@link ContextFullException} before anything changes. The hidden tap observes the decoder stack. The context's
  * queue, scratch, weights, memory and placeholders belong to whoever built the context; this backend closes only the
  * blocks and head preprocessors it bound. Not thread-safe.</p>
  */
-public final class GpuEncDecBackend implements ForwardBackend {
+public final class GpuEncDecBackend implements ForwardBackend, SequenceEncoder {
 
     private final GpuForwardContext ctx;
     private final ModelSpec spec;
@@ -100,7 +114,8 @@ public final class GpuEncDecBackend implements ForwardBackend {
     private final int[] posInts;
     private final ByteBuffer posBytes;
     private HiddenTap tap;
-    private boolean encoded;
+    /** Per sequence, whether its cross caches hold the encoding of a source (sequence 0 for the contiguous calls). */
+    private final boolean[] encoded;
     private boolean closed;
 
     /**
@@ -148,6 +163,7 @@ public final class GpuEncDecBackend implements ForwardBackend {
         this.posInts = new int[MropeTextPositions.SECTIONS * ubatch];
         this.posBytes = ByteBuffer.allocate(posInts.length * Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN);
         this.sourceLimit = Math.min(ubatch, CpuEncDecBackend.crossRows(spec, ctx.memory().plan()));
+        this.encoded = new boolean[CpuEncDecBackend.crossStreams(spec, ctx.memory().plan())];
 
         GpuLayerExecutor enc = GpuLayerExecutor.forStack(ctx, registry, spec.encoderLayers());
         GpuLayerExecutor dec = null;
@@ -233,18 +249,14 @@ public final class GpuEncDecBackend implements ForwardBackend {
         ensureOpen();
         checkSource(source, pos0);
         GpuMemory memory = ctx.memory();
-        encoded = false;
+        Arrays.fill(encoded, false);
         memory.reset();
         try {
-            encode(source, null);
-            for (GpuCrossAttentionMixer m : crossMixers) {
-                m.encode(normed.buffer(), normed.offset(), source.length);
-            }
-            encoded = true;
+            encodeInto(0, source);
             return driver.run(new int[]{startToken}, null, 0, new int[]{0}, GpuPrefillDriver.Output.LOGITS, true,
                     tap).rows()[0];
         } catch (RuntimeException e) {
-            encoded = false;
+            Arrays.fill(encoded, false);
             drain(e);
             try {
                 memory.reset();
@@ -261,11 +273,49 @@ public final class GpuEncDecBackend implements ForwardBackend {
             throw new IllegalArgumentException(arch() + ": an encoder-decoder prefill encodes a new source and"
                     + " restarts the decoder at position 0, got " + pos0);
         }
+        checkSourceTokens(source);
+    }
+
+    private void checkSourceTokens(int[] source) {
         if (source.length == 0) {
             throw new IllegalArgumentException("encoder source without tokens");
         }
         CpuEncDecBackend.checkSourceLength(source.length, ctx.scratch().ubatch(), sourceLimit);
         checkTokens(source);
+    }
+
+    /**
+     * Encodes {@code source} into sequence {@code seq}'s cross caches (the decoder memory stays): the encoder pass,
+     * then every decoder layer's cross K/V. The sequence counts as encoded only once every layer holds the source.
+     *
+     * @throws IndexOutOfBoundsException when the memory keeps no cross caches for {@code seq}
+     * @throws ContextFullException      when the source is longer than {@link #maxSourceTokens()}; nothing changes
+     * @throws IllegalArgumentException  for an empty source or a token outside the vocabulary
+     */
+    @Override
+    public void encodeSequence(int seq, int[] source) {
+        ensureOpen();
+        Objects.requireNonNull(source, "source");
+        if (seq < 0 || seq >= encoded.length) {
+            throw new IndexOutOfBoundsException(arch() + ": the memory keeps cross caches for " + encoded.length
+                    + " sequences, not sequence " + seq);
+        }
+        checkSourceTokens(source);
+        try {
+            encodeInto(seq, source);
+        } catch (RuntimeException e) {
+            drain(e);
+            throw e;
+        }
+    }
+
+    private void encodeInto(int seq, int[] source) {
+        encoded[seq] = false;
+        encode(source, null);
+        for (GpuCrossAttentionMixer m : crossMixers) {
+            m.encode(seq, normed.buffer(), normed.offset(), source.length);
+        }
+        encoded[seq] = true;
     }
 
     private void checkTokens(int[] tokens) {
@@ -374,10 +424,128 @@ public final class GpuEncDecBackend implements ForwardBackend {
     }
 
     private void requireEncoded() {
-        if (!encoded) {
+        if (!encoded[0]) {
             throw new IllegalStateException(arch() + ": the decoder runs over an encoded source; call prefill(source,"
                     + " 0) after every reset");
         }
+    }
+
+    // ================================================================== batched decoder steps
+
+    /** Sequences the paged memory holds ({@code PagedSequences.maxSequences()}); 1 on the contiguous form. */
+    @Override
+    public int maxSequences() {
+        ensureOpen();
+        DeviceModelMemory paged = pagedMemory();
+        return paged == null ? 1 : paged.pagedSequences().maxSequences();
+    }
+
+    /** Null over paged device memory, which runs batches of several decoder sequences; the refusal otherwise. */
+    @Override
+    public String batchRefusal() {
+        return pagedMemory() != null ? null
+                : arch() + " batches several decoder sequences only over paged memory (neuralfree.parallel > 1 or"
+                        + " neuralfree.kv.paged=true)";
+    }
+
+    /** This backend over paged device memory, where every sequence keeps its own encoding; null otherwise. */
+    @Override
+    public SequenceEncoder sequenceEncoder() {
+        return pagedMemory() != null ? this : null;
+    }
+
+    private DeviceModelMemory pagedMemory() {
+        GpuMemory m = ctx.memory();
+        return m instanceof DeviceModelMemory && ((DeviceModelMemory) m).pagedSequences() != null
+                ? (DeviceModelMemory) m : null;
+    }
+
+    /**
+     * Decoder rows of several sequences over the paged memory, each sequence over its own encoding: the batch runs
+     * through {@link GpuPrefillDriver#runBatch} (multi-sequence ubatches, each reserving its cells, running the owed
+     * page copies, committing and uploading its page tables), where every decoder layer steps over the page tables
+     * (self-attention over the sequence's own cells, cross-attention over its own encoder rows) and the head reads the
+     * output rows. A non-causal batch flags its ubatches for the self-attention. Returns one logits row per output
+     * row, in batch order.
+     *
+     * @throws UnsupportedOperationException when the memory is not paged, or the batch carries embedding rows, rope
+     *                                       sections or adapter slots that hold no adapter
+     * @throws IllegalStateException         when a row's sequence holds no encoding ({@link #encodeSequence})
+     * @throws ContextFullException          (as {@code MemoryFullException}) when a ubatch cannot reserve its pages
+     */
+    @Override
+    public float[][] forwardBatch(ForwardBatch batch) {
+        ensureOpen();
+        Objects.requireNonNull(batch, "batch");
+        if (pagedMemory() == null) {
+            throw new UnsupportedOperationException("forwardBatch: " + batchRefusal());
+        }
+        checkBatch(batch);
+        return driver.runBatch(batch, null, GpuPrefillDriver.Output.LOGITS, tap).rows();
+    }
+
+    /** Whether the decoder head's device row top-k readout runs ({@code LLM_Row_TopK}). */
+    @Override
+    public boolean batchTopKOnDevice() {
+        ensureOpen();
+        return head.rowTopKAvailable();
+    }
+
+    /** Whether the decoder head's prefilter kernel runs on this backend ({@code LLM_LogitsPrefilter}). */
+    @Override
+    public boolean batchPrefilterOnDevice() {
+        ensureOpen();
+        return head.prefilterAvailable();
+    }
+
+    /** Top candidates of every output row on the device; only the candidates are read back. */
+    @Override
+    public RowTopK forwardBatchTopK(ForwardBatch batch, int k) {
+        return forwardBatchTopK(batch, k, null);
+    }
+
+    /** Top candidates of every output row after the per-row prefilter (the logit bias, penalties and DRY). */
+    @Override
+    public RowTopK forwardBatchTopK(ForwardBatch batch, int k, LogitPrefilter prefilter) {
+        ensureOpen();
+        Objects.requireNonNull(batch, "batch");
+        if (k < 1) {
+            throw new IllegalArgumentException("top-k readback of " + k + " candidates");
+        }
+        if (pagedMemory() == null) {
+            throw new UnsupportedOperationException("forwardBatchTopK: " + batchRefusal());
+        }
+        checkBatch(batch);
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = driver.runBatchTopK(batch, null, width, tap, prefilter);
+        return RowTopK.packed(width, batch.outputRows().length, r.topIds(), r.topLogits());
+    }
+
+    /** Refuses before any ubatch reserves pages: rows the decoder cannot take, or a sequence without an encoding. */
+    private void checkBatch(ForwardBatch batch) {
+        String slotRefusal = batch.adapterSlotRefusal(getClass().getSimpleName(), ctx.projectionDeltas()::holdsSlot);
+        if (slotRefusal != null) {
+            throw new UnsupportedOperationException(slotRefusal);
+        }
+        if (batch.embeddings() != null) {
+            throw new UnsupportedOperationException(arch() + ": " + embeddingRowsRefusal());
+        }
+        if (batch.ropePositions() != null) {
+            throw new UnsupportedOperationException(arch() + " has no RoPE; a batch with rope sections does not fit");
+        }
+        int[] seqs = batch.seqIds();
+        for (int r = 0; r < batch.nTokens(); r++) {
+            int seq = seqs[r];
+            if (seq < 0 || seq >= encoded.length || !encoded[seq]) {
+                throw new IllegalStateException(arch() + ": decoder row " + r + " runs sequence " + seq
+                        + ", which holds no encoded source; call encodeSequence first");
+            }
+            if (batch.produces(r, OutputKind.ROUTING)) {
+                throw new UnsupportedOperationException("row " + r + " requests " + OutputKind.ROUTING
+                        + "; the batched encoder-decoder path reads logits");
+            }
+        }
+        checkTokens(batch.tokens());
     }
 
     // ================================================================== encoder output
@@ -444,11 +612,11 @@ public final class GpuEncDecBackend implements ForwardBackend {
 
     // ================================================================== memory
 
-    /** Empties the decoder memory and forgets the encoding; the next decoder call needs a new prefill. */
+    /** Empties the decoder memory and forgets every encoding; the next decoder call needs a new prefill. */
     @Override
     public void reset() {
         ensureOpen();
-        encoded = false;
+        Arrays.fill(encoded, false);
         ctx.memory().reset();
     }
 
@@ -493,7 +661,7 @@ public final class GpuEncDecBackend implements ForwardBackend {
         try {
             decoder.shiftContext(nKeep, nDiscard);
         } catch (RuntimeException e) {
-            encoded = false;
+            Arrays.fill(encoded, false);
             try {
                 memory.reset();
             } catch (RuntimeException resetFailure) {
@@ -523,18 +691,20 @@ public final class GpuEncDecBackend implements ForwardBackend {
     }
 
     /** The decoder start token this backend evaluates after each encoding. */
+    @Override
     public int decoderStartToken() {
         return startToken;
     }
 
     /** Longest source {@link #prefill} accepts: {@code min(ubatch, cross cache rows)}. */
+    @Override
     public int maxSourceTokens() {
         return sourceLimit;
     }
 
-    /** True once a source is encoded and until the next reset. */
+    /** True once a source is encoded into sequence 0 and until the next reset. */
     public boolean encoded() {
-        return encoded;
+        return encoded[0];
     }
 
     private String arch() {
@@ -584,7 +754,7 @@ public final class GpuEncDecBackend implements ForwardBackend {
     @Override
     public String toString() {
         return "GpuEncDecBackend{" + arch() + ", encoder " + spec.encoderLayers().size() + " layers, decoder "
-                + spec.nLayer() + " layers, start " + startToken + (encoded ? ", encoded" : "")
+                + spec.nLayer() + " layers, start " + startToken + (encoded[0] ? ", encoded" : "")
                 + (closed ? ", closed" : "") + '}';
     }
 }

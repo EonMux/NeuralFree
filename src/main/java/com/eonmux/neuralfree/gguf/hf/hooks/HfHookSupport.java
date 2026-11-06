@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf.hf.hooks;
 
+import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
+import com.eonmux.neuralfree.gguf.hf.names.HfNameTables;
 import com.eonmux.neuralfree.gguf.hf.names.HfTensorNameMap;
 import com.eonmux.neuralfree.gguf.hf.tensor.ElementTransforms;
 import com.eonmux.neuralfree.gguf.hf.tensor.ExpertTransforms;
@@ -28,6 +30,9 @@ import java.util.OptionalInt;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 /**
  * Helpers the Hugging Face hook packs share: name surgery, required hyperparameters, the vocabulary writers' input,
@@ -36,6 +41,27 @@ import java.util.regex.Pattern;
 public final class HfHookSupport {
 
     private HfHookSupport() {
+    }
+
+    /**
+     * The full float32 contents of {@code src}, for the folds that need a tensor's values (the small scale tensors of
+     * Limite and the LeRoPE factors, for example).
+     *
+     * @throws GgufFormatException when the tensor is too large to hold in one array
+     * @throws IOException         when its data cannot be read
+     */
+    public static float[] floats(RowSource src, String name) throws IOException {
+        RowSource f = ElementTransforms.convert(src, GGMLType.F32);
+        long total = f.rows() * f.rowBytes();
+        if (total > Integer.MAX_VALUE - 8) {
+            throw new GgufFormatException("tensor '" + name + "' is too large to read as float32");
+        }
+        ByteBuffer b = ByteBuffer.allocate((int) total).order(ByteOrder.LITTLE_ENDIAN);
+        f.readRows(0, (int) f.rows(), b);
+        float[] values = new float[Math.toIntExact(total / 4L)];
+        b.flip();
+        b.asFloatBuffer().get(values);
+        return values;
     }
 
     /**
@@ -117,6 +143,11 @@ public final class HfHookSupport {
     public static HfVocabWriters.Input vocabInput(HfLoadContext ctx, HfTokenizerFiles files, HfConfig vocabConfig) {
         HfVocabWriters.Input in = HfVocabWriters.Input.of(vocabConfig, files, PreTokenizerCanonicalizer::toSpec)
                 .withGgufArch(ctx.arch().ggufName());
+        // An architecture outside llama.cpp's converter has no tensor name map to find the token embedding with; the
+        // writers then size the vocabulary from the configuration's vocab_size, as they do without an embedding.
+        if (HfNameTables.archTensors(ctx.arch().ggufName()).isEmpty()) {
+            return in;
+        }
         OptionalInt rows = embeddingRows(ctx);
         return rows.isPresent() ? in.withEmbeddingRows(rows.getAsInt()) : in;
     }
@@ -127,6 +158,11 @@ public final class HfHookSupport {
      * @throws GgufFormatException when that tensor has no rows or more than an {@code int} holds
      */
     public static OptionalInt embeddingRows(HfLoadContext ctx) {
+        if (HfNameTables.archTensors(ctx.arch().ggufName()).isEmpty()) {
+            // A vLLM-only architecture whose converter has no tensor table (OPT): its hooks name the embedding
+            // tensors themselves, so the vocabulary writer derives its rows from the token list instead.
+            return OptionalInt.empty();
+        }
         String target = TensorNames.weight(TensorNames.TOKEN_EMBD);
         HfTensorNameMap names = ctx.names();
         HfTensorIndex index = ctx.index();

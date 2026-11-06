@@ -1,0 +1,14 @@
+{#- llama.cpp deepseek chat template (src/llama-chat.cpp:455-469). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- content -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '### Instruction:\n' ~ content ~ '\n' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- '### Response:\n' ~ content ~ '\n<|EOT|>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '### Response:\n' -}}
+{%- endif -%}

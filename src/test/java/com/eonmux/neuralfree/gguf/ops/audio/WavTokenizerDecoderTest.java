@@ -718,8 +718,7 @@ public class WavTokenizerDecoderTest {
         assertEquals(C, fa.intArg(AttnKernels.ARG_FA_D_K));
         assertEquals(C, fa.intArg(AttnKernels.ARG_FA_D_V));
         assertEquals(t, fa.intArg(AttnKernels.ARG_FA_KV_END));
-        assertEquals(0, fa.intArg(AttnKernels.ARG_FA_CAUSAL));
-        assertEquals(1, fa.intArg(AttnKernels.ARG_FA_DIRECT_OUT));
+        assertEquals(AttnKernels.FLAG_DIRECT, fa.intArg(AttnKernels.ARG_FA_FLAGS));
         assertEquals(C, fa.intArg(AttnKernels.ARG_FA_Q_ROW_STRIDE));
         assertEquals(C, fa.intArg(AttnKernels.ARG_FA_K_ROW_STRIDE));
         assertEquals(d.attentionScale(), fa.floatArg(AttnKernels.ARG_FA_SCALE), 0f);

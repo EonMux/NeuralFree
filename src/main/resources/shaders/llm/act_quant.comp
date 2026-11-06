@@ -1,6 +1,6 @@
-/* act_quant.comp - LLM_ActFakeQuant, LLM_PermuteCols: activation fake-quantization and input column permutation
- * of matmul inputs. GLSL twin of kernels/llm/act_quant.cl (the semantic reference).
- * Requires: common/nf_common.glsl, common/reduce.glsl (OP_ACT_FAKE_QUANT).
+/* act_quant.comp - LLM_ActFakeQuant, LLM_PermuteCols, LLM_ScaleCols: activation fake-quantization, input column
+ * permutation and activation pre-scale of matmul inputs. GLSL twin of kernels/llm/act_quant.cl (the semantic
+ * reference). Requires: common/nf_common.glsl, common/reduce.glsl (OP_ACT_FAKE_QUANT).
  *
  * A variants row selects OP. Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   OP_ACT_FAKE_QUANT (i n_runs, i run_len, i scheme, f scale, i zero_point, f global_scale, i x_off, i y_off,
@@ -40,14 +40,19 @@
  *   OP_PERMUTE_COLS   (i n_rows, i row_len, i x_off, i y_off, R int perm, float x, float y)
  *       y[y_off + r*row_len + k] = x[x_off + r*row_len + perm[k]], r < n_rows, k < row_len; out of place
  *       (y never overlaps x; validated on the host).
+ *   OP_SCALE_COLS     (i n_rows, i row_len, i x_off, i y_off, float scale, float x, float y)
+ *       y[y_off + r*row_len + k] = x[x_off + r*row_len + k] * scale[k] (the activation pre-scale applied before
+ *       the fake-quantization); out of place (y never overlaps x; validated on the host).
  *
  * Preconditions (validated on the host): run_len > 0; scale > 0 and finite for the static schemes, scale > 0
- * (+inf for none) for FP8_TOKEN; global_scale > 0 and finite for NVFP4; perm is a permutation of [0, row_len).
+ * (+inf for none) for FP8_TOKEN; global_scale > 0 and finite for NVFP4; perm is a permutation of [0, row_len);
+ * the pre-scale holds at least row_len values.
  * Element indices stay below 2^31, so 32-bit index arithmetic is exact. Results are specified for finite x.
  *
  * Dispatch: 1-D, local = {L, 1, 1}. OP_ACT_FAKE_QUANT: one workgroup per run, global = n_runs * L (L a power of
- * two <= LLM_DIMX); the run index comes from nf_wg_id() and surplus groups exit uniformly. OP_PERMUTE_COLS: one
- * invocation per output element, global = roundUp(n_rows * row_len, L), bounds-checked over nf_global_id().
+ * two <= LLM_DIMX); the run index comes from nf_wg_id() and surplus groups exit uniformly. OP_PERMUTE_COLS and
+ * OP_SCALE_COLS: one invocation per output element, global = roundUp(n_rows * row_len, L), bounds-checked over
+ * nf_global_id().
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -56,6 +61,7 @@
 
 #define OP_ACT_FAKE_QUANT 321
 #define OP_PERMUTE_COLS   322
+#define OP_SCALE_COLS     323
 
 #ifndef OP
 #error "act_quant.comp requires OP"
@@ -88,6 +94,16 @@ layout(push_constant) uniform NfAqParams {
 } pc;
 #elif OP == OP_PERMUTE_COLS
 layout(std430, binding = 0) restrict readonly buffer NfAqPerm { int perm[]; };
+layout(std430, binding = 1) readonly buffer NfAqX { float x_in[]; };
+layout(std430, binding = 2) writeonly buffer NfAqY { float y_out[]; };
+layout(push_constant) uniform NfAqParams {
+    int n_rows;
+    int row_len;
+    int x_off;
+    int y_off;
+} pc;
+#elif OP == OP_SCALE_COLS
+layout(std430, binding = 0) restrict readonly buffer NfAqScale { float scale[]; };
 layout(std430, binding = 1) readonly buffer NfAqX { float x_in[]; };
 layout(std430, binding = 2) writeonly buffer NfAqY { float y_out[]; };
 layout(push_constant) uniform NfAqParams {
@@ -417,5 +433,12 @@ void main() {
     const uint r = idx / row_len;
     const uint k = idx - r * row_len;
     y_out[uint(pc.y_off) + idx] = x_in[uint(pc.x_off) + r * row_len + uint(perm[k])];
+#elif OP == OP_SCALE_COLS
+    const uint idx = nf_global_id();
+    const uint row_len = uint(pc.row_len);
+    if (row_len == 0u || idx >= uint(pc.n_rows) * row_len) {
+        return;
+    }
+    y_out[uint(pc.y_off) + idx] = x_in[uint(pc.x_off) + idx] * scale[idx - (idx / row_len) * row_len];
 #endif
 }

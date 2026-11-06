@@ -20,7 +20,9 @@ public final class CpuHcHeadCollapse implements CpuHeadPreprocessor {
 
     @Override
     public boolean appliesTo(ModelSpec spec) {
-        return HcSubBlock.headApplies(Objects.requireNonNull(spec, "spec"));
+        Objects.requireNonNull(spec, "spec");
+        // DeepSeek-V4.1 has no output_hc weights: CpuDsv41HeadCollapse reuses the last FFN pre-mix
+        return spec.arch() != com.eonmux.neuralfree.gguf.arch.Arch.DEEPSEEK41 && HcSubBlock.headApplies(spec);
     }
 
     @Override

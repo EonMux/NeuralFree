@@ -94,6 +94,25 @@ public class GpuTensorOpsParityTest {
                 .toFloatArray());
     }
 
+    /** neg flips and abs clears only the sign bit, so NaNs of either sign keep their quiet bit and payload. */
+    @Test
+    public void signOpsKeepNaNPayloadsBitForBit() {
+        int[] bits = {0x7fc00000, 0xffc00000, 0x7fc12345, 0xffd54321, 0x7f800001, 0xff800001, 0x7fffffff,
+                0xffffffff};
+        float[] x = new float[bits.length];
+        float[] negated = new float[bits.length];
+        float[] magnitudes = new float[bits.length];
+        for (int i = 0; i < bits.length; i++) {
+            x[i] = Float.intBitsToFloat(bits[i]);
+            negated[i] = Float.intBitsToFloat(bits[i] ^ 0x80000000);
+            magnitudes[i] = Float.intBitsToFloat(bits[i] & 0x7fffffff);
+        }
+        TrainParity.assertBitIdentical("neg", negated,
+                keep(GpuTensorOps.neg(floats(gpu, x, x.length))).toFloatArray());
+        TrainParity.assertBitIdentical("abs", magnitudes,
+                keep(GpuTensorOps.abs(floats(gpu, x, x.length))).toFloatArray());
+    }
+
     @Test
     public void singleRoundingUnaryOps() {
         float[] x = withSpecials(TrainParity.uniform(2, 24 * 40, -10f, 10f));

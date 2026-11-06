@@ -1,0 +1,75 @@
+/* step5_cast.comp - LLM_Step5_Cast: the Step5 BF16 / FP8 E4M3 representation roundings.
+ * GLSL twin of kernels/llm/sparse/step5.cl (the semantic reference).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n, i mode, R float x, W float y)
+ *     y[i] = bf16(x[i])               mode 0
+ *     y[i] = e4m3(bf16(x[i]))         mode 1
+ * y may alias x. Dispatch: 1-D, one work-item per element, global = round_up(n, L).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/kv_types.glsl"
+
+layout(std430, binding = 0) readonly buffer NfStep5CastIn { float x[]; };
+layout(std430, binding = 1) writeonly buffer NfStep5CastOut { float y[]; };
+layout(push_constant) uniform NfStep5CastParams {
+    int n;
+    int mode;
+} pc;
+
+uint nf_step5_bf16_bits(float f) {
+    const uint u = floatBitsToUint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return (u >> 16) | 64u;
+    }
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+
+float nf_step5_bf16(float f) {
+    return uintBitsToFloat(nf_step5_bf16_bits(f) << 16);
+}
+
+/* RNE saturating E4M3 encode (common/kv_types.h nf_kv_fp8_e4m3_bits). */
+uint nf_step5_e4m3_bits(float v) {
+    const uint sign = (floatBitsToUint(v) >> 24) & 0x80u;
+    const float m = abs(v);
+    if (isnan(m)) {
+        return sign | 0x7Fu;
+    }
+    if (m >= 448.0) {
+        return sign | 0x7Eu;
+    }
+    if (m == 0.0) {
+        return sign;
+    }
+    const int ex0 = max(int((floatBitsToUint(m) >> 23) & 0xFFu) - 127, -6);
+    int units = int(roundEven(ldexp(m, 3 - ex0)));
+    int ex = ex0;
+    if (units < 8) {
+        return sign | uint(units);
+    }
+    if (units == 16) {
+        units = 8;
+        ex++;
+    }
+    return sign | uint(min(((ex + 7) << 3) | (units - 8), 0x7E));
+}
+
+float nf_step5_e4m3(float x) {
+    if (isnan(x)) {
+        return x;
+    }
+    return nf_kv_e4m3(nf_step5_e4m3_bits(x));
+}
+
+void main() {
+    const uint i = nf_global_id();
+    if (i >= uint(pc.n)) {
+        return;
+    }
+    const float rounded = nf_step5_bf16(x[i]);
+    y[i] = pc.mode == 1 ? nf_step5_e4m3(rounded) : rounded;
+}

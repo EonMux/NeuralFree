@@ -1,0 +1,8 @@
+{#- llama.cpp llama3 chat template (src/llama-chat.cpp:485-493). -#}
+{%- for message in messages -%}
+    {%- set content = (message['content'] if message['content'] is string else '') | trim(' \t\n\v\f\r') -%}
+    {{- '<|start_header_id|>' ~ message['role'] ~ '<|end_header_id|>\n\n' ~ content ~ '<|eot_id|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' -}}
+{%- endif -%}

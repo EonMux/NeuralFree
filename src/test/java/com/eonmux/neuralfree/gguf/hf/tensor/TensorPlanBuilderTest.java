@@ -116,6 +116,36 @@ public class TensorPlanBuilderTest {
     }
 
     @Test
+    public void activationPreScaleBecomesASiblingOnScaledBases() throws IOException {
+        float[] pre = new float[32];
+        for (int i = 0; i < pre.length; i++) {
+            pre[i] = i % 2 == 0 ? 0.5f : 2f;
+        }
+        TensorPlanBuilder b = builder(OutType.SOURCE);
+        b.add("blk.0.attn_q.weight", withSiblings(q8(2), null, null, null, null, null, pre));
+        TensorPlan p = b.build();
+        assertEquals(GGMLType.F32, p.type("blk.0.attn_q.input_pre_scale"));
+        assertArrayEquals(new long[]{32}, p.ne("blk.0.attn_q.input_pre_scale"));
+        assertArrayEquals(pre, p.readF32("blk.0.attn_q.input_pre_scale", 32), 0f);
+
+        float[] perExpert = new float[2 * 32];
+        for (int i = 0; i < perExpert.length; i++) {
+            perExpert[i] = i % 3 == 0 ? 0.25f : 1f;
+        }
+        TensorPlanBuilder ex = builder(OutType.SOURCE);
+        ex.add("blk.0.ffn_up_exps.weight", withSiblings(seq(2, 2, 32), null, null, null, null, null, perExpert));
+        TensorPlan pEx = ex.build();
+        assertEquals(GGMLType.F32, pEx.type("blk.0.ffn_up_exps.input_pre_scale"));
+        assertArrayEquals(perExpert, pEx.readF32("blk.0.ffn_up_exps.input_pre_scale", 64), 0f);
+
+        // A weight outside the scaled projections has no sibling slot, and a length that is not K or E * K is bad.
+        assertThrows(IllegalArgumentException.class, () -> builder(OutType.SOURCE).add("token_embd.weight",
+                withSiblings(q8(2), null, null, null, null, null, pre)));
+        assertThrows(IllegalArgumentException.class, () -> builder(OutType.SOURCE).add("blk.0.attn_q.weight",
+                withSiblings(q8(2), null, null, null, null, null, new float[16])));
+    }
+
+    @Test
     public void malformedSiblingValuesAreRejected() {
         assertThrows(IllegalArgumentException.class, () -> builder(OutType.SOURCE).add("blk.0.attn_q.weight",
                 withSiblings(q8(2), new float[]{2f, 3f}, null, null, null, null)));

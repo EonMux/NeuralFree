@@ -170,7 +170,7 @@ public class CpuPoolingTest {
         float[] y = random(r, nTokens * yStride);
         float[] ref = y.clone();
         float[] tmp = new float[1 + nTokens * rank];
-        CpuPooling.switchedLoraAdd(nTokens, inDim, outDim, rank, nSlots, slots, a, b, x, 0, xStride, tmp, 1,
+        CpuPooling.switchedLoraAdd(nTokens, inDim, outDim, rank, nSlots, slots, a, b, x, 0, xStride, tmp, 1, 1.0f,
                 y, 0, yStride);
         referenceLora(nTokens, inDim, outDim, rank, nSlots, slots, a, b, x, xStride, ref, yStride);
         assertArrayEquals(ref, y, EPS);

@@ -10,19 +10,37 @@
  *   OP_MATVEC_ID         (i out_dim, i in_dim, i n_sel, i x_stride, i in_off, i out_off, i has_scale,
  *                         i expert_base, i expert_count, R int slots, R weight, R float input,
  *                         R float scales, W float output)
+ *   OP_MATVEC_ID_T       (i out_dim, i in_dim, i n_sel, i x_stride, i in_off, i out_off, i has_scale,
+ *                         i expert_base, i expert_count, R int slots, R weight, R float input,
+ *                         R float scales, W float output)
+ *                          the transposed slot read of OP_MATVEC_ID (common/matvec_id_family.h
+ *                          {T}_MatVecIdT): the slot block is [in_dim x out_dim] row-major and each
+ *                          workgroup dots its column row with the slot's input row through qt_elem.
  *   OP_MATVEC_ID_GATEUP  (i out_dim, i in_dim, i n_sel, i x_stride, i in_off, i glu_op, f limit,
  *                         f alpha, f beta, i fused, i has_scale, i expert_base, i expert_count,
  *                         R int slots, R gate_w, R up_w, R float input, R float scales, W float output)
  *   OP_BATCH_MATMUL_ID   (i out_dim, i in_dim, i n_rows, i x_div, i in_off, i has_scale,
  *                         i expert_base, i expert_count, R int row_token, R int row_slot, R weight,
  *                         R float input, R float scales, W float output)
+ *   OP_MATVEC_ID_IND         (i out_dim, i in_dim, i n_sel, i x_stride, i in_off, i out_off,
+ *                         i has_scale, R int slots, R int map, R weight, R float input,
+ *                         R float scales, W float output)
+ *   OP_MATVEC_ID_GATEUP_IND  (i out_dim, i in_dim, i n_sel, i x_stride, i in_off, i glu_op, f limit,
+ *                         f alpha, f beta, i fused, i has_scale, R int slots, R int map, R gate_w,
+ *                         R up_w, R float input, R float scales, W float output)
+ *   OP_BATCH_MATMUL_ID_IND   (i out_dim, i in_dim, i n_rows, i x_div, i in_off, i has_scale,
+ *                         R int row_token, R int row_slot, R int map, R weight, R float input,
+ *                         R float scales, W float output)
  * Semantics, slot layout, the expert shard range and the has_scale / fused codes:
  * kernels/llm/common/matvec_id_family.h. The weight binding holds the experts [expert_base, expert_base +
  * expert_count) of the tensor; byte offsets are 32-bit, which every shard satisfies because shards
- * stay below maxStorageBufferRange.
+ * stay below maxStorageBufferRange. The _Ind variants read the routed experts of an expert cache bank
+ * through the per-layer map (local expert, or -1 for an expert the host computes); scales stay
+ * indexed with the global expert.
  *
- * Dispatch (2-D, never folded): local = {L, 1, 1}; global = {out_dim * L, n_sel, 1} for OP_MATVEC_ID
- * and OP_MATVEC_ID_GATEUP, {out_dim * L, ceil(n_rows / NF_MOE_BMM_ROWS), 1} for OP_BATCH_MATMUL_ID.
+ * Dispatch (2-D, never folded): local = {L, 1, 1}; global = {out_dim * L, n_sel, 1} for OP_MATVEC_ID,
+ * OP_MATVEC_ID_T and OP_MATVEC_ID_GATEUP, {out_dim * L, ceil(n_rows / NF_MOE_BMM_ROWS), 1} for
+ * OP_BATCH_MATMUL_ID.
  * out_dim must not exceed maxComputeWorkGroupCount[0]. Any L is reduced exactly; with multiples of
  * QT_TPS the block/invocation mapping equals the OpenCL kernels'.
  */
@@ -32,8 +50,12 @@
 #include "common/nf_common.glsl"
 
 #define OP_MATVEC_ID        301
+#define OP_MATVEC_ID_T      307
 #define OP_MATVEC_ID_GATEUP 302
 #define OP_BATCH_MATMUL_ID  303
+#define OP_MATVEC_ID_IND         304
+#define OP_MATVEC_ID_GATEUP_IND  305
+#define OP_BATCH_MATMUL_ID_IND   306
 
 /* Sorted rows per OP_BATCH_MATMUL_ID workgroup, equal to NF_MOE_BMM_ROWS of matvec_id_family.h. */
 #define NF_MOE_BMM_ROWS 8u
@@ -42,7 +64,7 @@
 #error "matvec_id.comp requires OP and QTYPE"
 #endif
 
-#if OP == OP_MATVEC_ID
+#if OP == OP_MATVEC_ID || OP == OP_MATVEC_ID_T
 layout(std430, binding = 0) readonly buffer NfMiSlots { int slots[]; };
 NF_BUFFER_VIEWS(1, w)
 layout(std430, binding = 2) readonly buffer NfMiInput { float x_in[]; };
@@ -76,6 +98,40 @@ layout(push_constant) uniform NfMiParams {
     int out_dim; int in_dim; int n_rows; int x_div; int in_off; int has_scale;
     int expert_base; int expert_count;
 } pc;
+#elif OP == OP_MATVEC_ID_IND
+layout(std430, binding = 0) readonly buffer NfMiSlots { int slots[]; };
+layout(std430, binding = 1) readonly buffer NfMiMap { int map[]; };
+NF_BUFFER_VIEWS(2, w)
+layout(std430, binding = 3) readonly buffer NfMiInput { float x_in[]; };
+layout(std430, binding = 4) readonly buffer NfMiScales { float scales[]; };
+layout(std430, binding = 5) writeonly buffer NfMiOutput { float y_out[]; };
+layout(push_constant) uniform NfMiParams {
+    int out_dim; int in_dim; int n_sel; int x_stride; int in_off; int out_off; int has_scale;
+} pc;
+#elif OP == OP_MATVEC_ID_GATEUP_IND
+#define NF_WEIGHT_STREAMS 2
+layout(std430, binding = 0) readonly buffer NfMiSlots { int slots[]; };
+layout(std430, binding = 1) readonly buffer NfMiMap { int map[]; };
+NF_BUFFER_VIEWS(2, w)
+NF_BUFFER_VIEWS(3, u)
+layout(std430, binding = 4) readonly buffer NfMiInput { float x_in[]; };
+layout(std430, binding = 5) readonly buffer NfMiScales { float scales[]; };
+layout(std430, binding = 6) writeonly buffer NfMiOutput { float y_out[]; };
+layout(push_constant) uniform NfMiParams {
+    int out_dim; int in_dim; int n_sel; int x_stride; int in_off; int glu_op;
+    float limit; float alpha; float beta; int fused; int has_scale;
+} pc;
+#elif OP == OP_BATCH_MATMUL_ID_IND
+layout(std430, binding = 0) readonly buffer NfMiRowToken { int row_token[]; };
+layout(std430, binding = 1) readonly buffer NfMiRowSlot { int row_slot[]; };
+layout(std430, binding = 2) readonly buffer NfMiMap { int map[]; };
+NF_BUFFER_VIEWS(3, w)
+layout(std430, binding = 4) readonly buffer NfMiInput { float x_in[]; };
+layout(std430, binding = 5) readonly buffer NfMiScales { float scales[]; };
+layout(std430, binding = 6) writeonly buffer NfMiOutput { float y_out[]; };
+layout(push_constant) uniform NfMiParams {
+    int out_dim; int in_dim; int n_rows; int x_div; int in_off; int has_scale;
+} pc;
 #else
 #error "matvec_id.comp: OP is not an expert matvec op"
 #endif
@@ -94,10 +150,13 @@ layout(push_constant) uniform NfMiParams {
 #error "matvec_id.comp: no QT_DECODE_DOT decoder serves QTYPE"
 #endif
 
-/* True when expert e lies in the bound shard [expert_base, expert_base + expert_count). */
+/* True when expert e lies in the bound shard [expert_base, expert_base + expert_count); the ops with
+ * an indirection map have no expert range and never call it. */
+#if OP == OP_MATVEC_ID || OP == OP_MATVEC_ID_T || OP == OP_MATVEC_ID_GATEUP || OP == OP_BATCH_MATMUL_ID
 bool nf_mi_in_shard(int e) {
     return e >= pc.expert_base && e - pc.expert_base < pc.expert_count;
 }
+#endif
 
 float qt_x(uint i) {
     return x_in[i];
@@ -119,7 +178,7 @@ float nf_mi_row_partial(uint ws, uint rbase, uint xoff, uint nblk) {
     return ps;
 }
 
-#if OP == OP_MATVEC_ID_GATEUP
+#if OP == OP_MATVEC_ID_GATEUP || OP == OP_MATVEC_ID_GATEUP_IND
 /* Gate (stream A, row at gbase) and up (stream B, row at ubase) shares with the same pair mapping. */
 void nf_mi_gateup_partial(uint gbase, uint ubase, uint xoff, uint nblk, inout float gs, inout float us) {
     const uint pairs = nblk * uint(QT_TPS);
@@ -171,6 +230,33 @@ void main() {
             y_out[p * out_dim + row] = e < 0 ? 0.0 : (pc.has_scale != 0 ? acc * scales[e] : acc);
         }
     }
+#elif OP == OP_BATCH_MATMUL_ID_IND
+    const uint n_rows = uint(pc.n_rows);
+    const uint i0 = gl_WorkGroupID.y * NF_MOE_BMM_ROWS;
+    /* Depends only on the workgroup id, so the return is uniform per workgroup. */
+    if (row >= out_dim || i0 >= n_rows) {
+        return;
+    }
+    const uint i1 = min(i0 + NF_MOE_BMM_ROWS, n_rows);
+    for (uint i = i0; i < i1; ++i) {
+        const uint p = uint(row_token[i]);
+        const int e = row_slot[i];
+        const int l = e < 0 ? -1 : map[e];
+        /* e and l are shared by the workgroup, so skipping a row is uniform. Rows with e < 0
+         * (out-of-range ids) are written as 0; rows with map[e] < 0 are the host's, which computes
+         * the pairs whose expert is not in the cache. */
+        if (l < 0) {
+            if (e < 0 && lid == 0u) {
+                y_out[p * out_dim + row] = 0.0;
+            }
+            continue;
+        }
+        const uint xoff = uint(pc.in_off) + (p / uint(pc.x_div)) * uint(pc.in_dim);
+        const float acc = nf_wg_sum(nf_mi_row_partial(NF_WS_A, (uint(l) * out_dim + row) * row_bytes, xoff, nblk));
+        if (lid == 0u) {
+            y_out[p * out_dim + row] = pc.has_scale != 0 ? acc * scales[e] : acc;
+        }
+    }
 #else
     const uint s = gl_WorkGroupID.y;
     /* Depends only on the workgroup id, so the return is uniform per workgroup. */
@@ -178,14 +264,36 @@ void main() {
         return;
     }
     const int e = slots[s];
+#if OP == OP_MATVEC_ID_IND || OP == OP_MATVEC_ID_GATEUP_IND
+    /* The slot is the workgroup's, so the map return is uniform too. */
+    const int le_i = map[e];
+    if (le_i < 0) {
+        return;
+    }
+    const uint le = uint(le_i);
+#else
     /* The slot is the workgroup's, so the shard-range return is uniform too. */
     if (!nf_mi_in_shard(e)) {
         return;
     }
     const uint le = uint(e - pc.expert_base);
+#endif
     const uint xoff = uint(pc.in_off) + s * uint(pc.x_stride);
-#if OP == OP_MATVEC_ID
+#if OP == OP_MATVEC_ID || OP == OP_MATVEC_ID_IND
     const float acc = nf_wg_sum(nf_mi_row_partial(NF_WS_A, (le * out_dim + row) * row_bytes, xoff, nblk));
+    if (lid == 0u) {
+        y_out[uint(pc.out_off) + s * out_dim + row] = pc.has_scale != 0 ? acc * scales[e] : acc;
+    }
+#elif OP == OP_MATVEC_ID_T
+    /* Column row of the [in_dim x out_dim] slot block: the input row dotted with the column's in_dim
+     * elements, one slot-row base (out_dim elements) per element index. */
+    const uint trow_bytes = uint(pc.out_dim) / uint(QT_BS) * uint(QT_BB);
+    const uint wbase = le * uint(pc.in_dim) * trow_bytes;
+    float ps = 0.0;
+    for (uint i = lid; i < uint(pc.in_dim); i += gl_WorkGroupSize.x) {
+        ps += qt_elem(NF_WS_A, wbase + i * trow_bytes, row) * qt_x(xoff + i);
+    }
+    const float acc = nf_wg_sum(ps);
     if (lid == 0u) {
         y_out[uint(pc.out_off) + s * out_dim + row] = pc.has_scale != 0 ? acc * scales[e] : acc;
     }

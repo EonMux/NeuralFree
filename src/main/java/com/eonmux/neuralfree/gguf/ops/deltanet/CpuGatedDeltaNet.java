@@ -125,22 +125,37 @@ public final class CpuGatedDeltaNet {
         private final RecurrentSpec.DecayGate decayGate;
         private final int headDim;
         private final float lb;
+        private final float betaScale;
 
         /**
-         * @param layout  {@link DeltaNetKernels#LAYOUT_SEPARATE} or {@link DeltaNetKernels#LAYOUT_FUSED_BA}
+         * @param layout  {@link DeltaNetKernels#LAYOUT_SEPARATE}, {@link DeltaNetKernels#LAYOUT_FUSED_BA} or
+         *                {@link DeltaNetKernels#LAYOUT_CONCAT_BA}
          * @param headDim KDA head dim (gated values per head); ignored for GDN
          * @param lb      KDA gate lower bound; read only by {@code LB_NEG} and {@code LB_POS}, which need it finite
          * @throws IllegalArgumentException when the kernel cannot run this shape
          */
-        public GateShape(int nVHeads, int nKHeads, int layout, RecurrentSpec.DecayGate decayGate, int headDim, float lb) {
+        public GateShape(int nVHeads, int nKHeads, int layout, RecurrentSpec.DecayGate decayGate, int headDim,
+                         float lb) {
+            this(nVHeads, nKHeads, layout, decayGate, headDim, lb, 1f);
+        }
+
+        /**
+         * @param betaScale multiplier of the sigmoid update rate (OLMo Hybrid's {@code linear_allow_neg_eigval})
+         */
+        public GateShape(int nVHeads, int nKHeads, int layout, RecurrentSpec.DecayGate decayGate, int headDim,
+                         float lb, float betaScale) {
             Objects.requireNonNull(decayGate, "decayGate");
             DeltaNetKernels.validateGatePrep(nVHeads, nKHeads, layout, decayGate.code(), headDim, lb);
+            if (!(betaScale > 0f)) {
+                throw new IllegalArgumentException("beta scale must be positive, got " + betaScale);
+            }
             this.nVHeads = nVHeads;
             this.nKHeads = nKHeads;
             this.layout = layout;
             this.decayGate = decayGate;
             this.headDim = headDim;
             this.lb = lb;
+            this.betaScale = betaScale;
         }
 
         /**
@@ -151,9 +166,10 @@ public final class CpuGatedDeltaNet {
         public static GateShape of(RecurrentSpec spec) {
             Objects.requireNonNull(spec, "spec");
             if (spec.kind() == MixerKind.GDN) {
-                return new GateShape(spec.nVHeads(), spec.nKHeads(),
-                        spec.fusedBetaAlpha() ? DeltaNetKernels.LAYOUT_FUSED_BA : DeltaNetKernels.LAYOUT_SEPARATE,
-                        RecurrentSpec.DecayGate.GDN, spec.headVDim(), 0f);
+                int layout = spec.fusedBetaAlpha() ? DeltaNetKernels.LAYOUT_FUSED_BA
+                        : spec.concatBetaAlpha() ? DeltaNetKernels.LAYOUT_CONCAT_BA : DeltaNetKernels.LAYOUT_SEPARATE;
+                return new GateShape(spec.nVHeads(), spec.nKHeads(), layout,
+                        RecurrentSpec.DecayGate.GDN, spec.headVDim(), 0f, spec.betaScale());
             }
             if (spec.kind() == MixerKind.KDA) {
                 RecurrentSpec.DecayGate gate = spec.decayGate();
@@ -171,6 +187,8 @@ public final class CpuGatedDeltaNet {
         public int kdaMode() { return decayGate.code(); }
         public int headDim() { return headDim; }
         public float lb() { return lb; }
+        /** Multiplier of the sigmoid update rate. */
+        public float betaScale() { return betaScale; }
         /** Gate values per (token, value head): 1 for GDN, {@code headDim} for KDA. */
         public int gatesPerHead() { return decayGate == RecurrentSpec.DecayGate.GDN ? 1 : headDim; }
     }
@@ -210,8 +228,8 @@ public final class CpuGatedDeltaNet {
      * {@code gOut[gOff + (t*n_v + h)*G + d]} with G = {@link GateShape#gatesPerHead()} and
      * {@code betaOut[betaOff + t*n_v + h]}.
      *
-     * @param a      alpha (GDN) or {@code f} (KDA) rows; for the fused layout the {@code ssm_ba} rows
-     * @param b      beta logits rows; for the fused layout the same rows as {@code a}
+     * @param a      alpha (GDN) or {@code f} (KDA) rows; for the fused layouts the merged projection rows
+     * @param b      beta logits rows; for the fused layouts the same buffer as {@code a}
      * @param dtBias {@code ssm_dt} bias: n_v floats (GDN) or n_v*headDim floats (KDA)
      * @param ssmA   {@code ssm_a}: n_v floats
      */
@@ -221,6 +239,7 @@ public final class CpuGatedDeltaNet {
         final int perHead = shape.gatesPerHead();
         final int kdaMode = shape.kdaMode();
         final boolean fused = shape.layout == DeltaNetKernels.LAYOUT_FUSED_BA;
+        final boolean concat = shape.layout == DeltaNetKernels.LAYOUT_CONCAT_BA;
         final int ratio = nV / shape.nKHeads;
         for (int t = 0; t < nTokens; t++) {
             for (int h = 0; h < nV; h++) {
@@ -231,6 +250,9 @@ public final class CpuGatedDeltaNet {
                     int r = h - kh * ratio;
                     bIdx = kh * 2 * ratio + r;
                     aBase = bIdx + ratio;
+                } else if (concat) {
+                    bIdx = h;
+                    aBase = nV + h;
                 } else {
                     bIdx = h;
                     aBase = kdaMode < 0 ? h : h * shape.headDim;
@@ -242,7 +264,7 @@ public final class CpuGatedDeltaNet {
                     float x = a.data[a.index(t, aBase + d)] + dtBias[dtBase + d];
                     gOut[gBase + d] = gateValue(kdaMode, x, aH, shape.lb);
                 }
-                betaOut[betaOff + t * nV + h] = ActMath.sigmoid(b.data[b.index(t, bIdx)]);
+                betaOut[betaOff + t * nV + h] = shape.betaScale * ActMath.sigmoid(b.data[b.index(t, bIdx)]);
             }
         }
     }

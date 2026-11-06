@@ -27,16 +27,20 @@ import java.util.Set;
  *       graph's last FFN branch, whose {@code build_ffn} takes no bias (bert.cpp:202-207); nomic-bert-moe's dense
  *       layers take the biased branch (:186-192).</li>
  * </ul>
+ *
+ * <p>Dory carries no projection biases at all ({@code attention_bias} and {@code mlp_bias} are refused by its
+ * conversion), so its graph passes {@code NULL} for every optional bias.</p>
  */
 public final class UnusedBiases {
 
-    private static final Set<Arch> ATTN_INPUT = Collections.unmodifiableSet(EnumSet.of(Arch.MIMO2, Arch.QWEN4EXP));
+    private static final Set<Arch> ATTN_INPUT = Collections.unmodifiableSet(EnumSet.of(
+            Arch.MIMO2, Arch.QWEN4EXP, Arch.DORY));
 
     private static final Set<Arch> ATTN_OUTPUT = Collections.unmodifiableSet(EnumSet.of(
-            Arch.FALCON_H1, Arch.ERNIE4_5, Arch.ERNIE4_5_MOE, Arch.LLADA, Arch.REFACT));
+            Arch.FALCON_H1, Arch.ERNIE4_5, Arch.ERNIE4_5_MOE, Arch.LLADA, Arch.REFACT, Arch.DORY));
 
     private static final Set<Arch> FFN = Collections.unmodifiableSet(EnumSet.of(
-            Arch.LLADA, Arch.REFACT, Arch.NOMIC_BERT));
+            Arch.LLADA, Arch.REFACT, Arch.NOMIC_BERT, Arch.DORY));
 
     private UnusedBiases() {
     }

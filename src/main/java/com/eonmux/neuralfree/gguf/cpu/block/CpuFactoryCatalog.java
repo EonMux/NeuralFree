@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.cpu.block;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.cpu.forward.BuiltInCpuExtras;
 import com.eonmux.neuralfree.gguf.cpu.head.CpuHeadPreprocessor;
+import com.eonmux.neuralfree.gguf.ops.longcat.LongcatBlocks;
 import com.eonmux.neuralfree.gguf.ops.act.FfnBlocks;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnBlocks;
 import com.eonmux.neuralfree.gguf.ops.deltanet.DeltaNetBlocks;
@@ -10,6 +11,7 @@ import com.eonmux.neuralfree.gguf.ops.dsv4.Dsv4Blocks;
 import com.eonmux.neuralfree.gguf.ops.encdec.EncDecBlocks;
 import com.eonmux.neuralfree.gguf.ops.gemma3n.Gemma3nBlocks;
 import com.eonmux.neuralfree.gguf.ops.hc.HcBlocks;
+import com.eonmux.neuralfree.gguf.ops.heads.ControlVector;
 import com.eonmux.neuralfree.gguf.ops.heads.HeadsBlocks;
 import com.eonmux.neuralfree.gguf.ops.heads.SwitchedLoraExtra;
 import com.eonmux.neuralfree.gguf.ops.mla.MlaBlocks;
@@ -17,6 +19,7 @@ import com.eonmux.neuralfree.gguf.ops.moe.MoeBlocks;
 import com.eonmux.neuralfree.gguf.ops.rwkv.RwkvBlocks;
 import com.eonmux.neuralfree.gguf.ops.sparse.MsaBlocks;
 import com.eonmux.neuralfree.gguf.ops.sparse.SparseBlocks;
+import com.eonmux.neuralfree.gguf.ops.sparse.Step5Blocks;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmBlocks;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -50,22 +53,28 @@ public final class CpuFactoryCatalog {
     }
 
     /**
-     * The registry of every CPU factory without a switched-LoRA router (a graniteswitch layer then fails to
-     * create its extra).
+     * The registry of every CPU factory without a switched-LoRA router and without control vectors (a graniteswitch
+     * layer then fails to create its extra).
      */
     public static CpuBlockRegistry defaults() {
-        return defaults(null);
+        return defaults(null, null);
+    }
+
+    /** The registry of every CPU factory with {@code router} and without control vectors. */
+    public static CpuBlockRegistry defaults(SwitchedLoraExtra.Router router) {
+        return defaults(router, null);
     }
 
     /**
      * The registry of every CPU factory.
      *
-     * @param router the graniteswitch adapter router shared by the switched-LoRA extras; null for models without
-     *               switched LoRA
+     * @param router          the graniteswitch adapter router shared by the switched-LoRA extras; null for models
+     *                        without switched LoRA
+     * @param controlVectors  the engine's active control-vector set; null for a model without control vectors
      * @throws IllegalArgumentException when two families register the same kind or feature id
      */
-    public static CpuBlockRegistry defaults(SwitchedLoraExtra.Router router) {
-        return new CpuBlockRegistry(mixers(), ffns(), extras(router));
+    public static CpuBlockRegistry defaults(SwitchedLoraExtra.Router router, ControlVector controlVectors) {
+        return new CpuBlockRegistry(mixers(), ffns(), extras(router, controlVectors));
     }
 
     /** Every mixer factory, one per {@link MixerKind} the CPU runs (unmodifiable). */
@@ -79,6 +88,7 @@ public final class CpuFactoryCatalog {
         out.addAll(RwkvBlocks.cpuMixers());
         out.addAll(DeltaNetBlocks.cpuMixers());
         out.addAll(SparseBlocks.cpuMixers());
+        out.addAll(Step5Blocks.cpuMixers());
         out.addAll(MsaBlocks.cpuMixers(denseAttention(attention)));
         out.addAll(HcBlocks.cpuMixers());
         out.addAll(Gemma3nBlocks.cpuMixers());
@@ -105,6 +115,7 @@ public final class CpuFactoryCatalog {
         out.addAll(EncDecBlocks.cpuFfns());
         out.addAll(HeadsBlocks.cpuFfns());
         out.addAll(Dsv4Blocks.cpuFfns());
+        out.addAll(LongcatBlocks.cpuFfns());
         return Collections.unmodifiableList(out);
     }
 
@@ -114,6 +125,16 @@ public final class CpuFactoryCatalog {
      * @param router the graniteswitch adapter router, or null
      */
     public static List<CpuLayerExtraFactory> extras(SwitchedLoraExtra.Router router) {
+        return extras(router, null);
+    }
+
+    /**
+     * Every layer-extra factory, one per feature id (unmodifiable).
+     *
+     * @param router         the graniteswitch adapter router, or null
+     * @param controlVectors the engine's active control-vector set, or null
+     */
+    public static List<CpuLayerExtraFactory> extras(SwitchedLoraExtra.Router router, ControlVector controlVectors) {
         List<CpuLayerExtraFactory> out = new ArrayList<>();
         out.addAll(AttnBlocks.cpuExtras());
         out.addAll(MlaBlocks.cpuExtras());
@@ -127,8 +148,9 @@ public final class CpuFactoryCatalog {
         out.addAll(HcBlocks.cpuExtras());
         out.addAll(Gemma3nBlocks.cpuExtras());
         out.addAll(EncDecBlocks.cpuExtras());
-        out.addAll(HeadsBlocks.cpuExtras(router));
+        out.addAll(HeadsBlocks.cpuExtras(router, controlVectors));
         out.addAll(Dsv4Blocks.cpuExtras());
+        out.addAll(LongcatBlocks.cpuExtras());
         out.addAll(BuiltInCpuExtras.cpuExtras());
         return Collections.unmodifiableList(out);
     }

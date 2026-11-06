@@ -25,14 +25,14 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * PT-1, HfExportRoundTripTest: the {@code GgufWriter} NATIVE export of a Hugging Face checkpoint is a GGUF file whose
- * {@link ModelSpec} equals the spec of the checkpoint itself (PT-1 spec, HF.md GW-1). Both sides are resolved without
+ * The {@code GgufWriter} NATIVE export of a Hugging Face checkpoint is a GGUF file whose
+ * {@link ModelSpec} equals the spec of the checkpoint itself. Both sides are resolved without
  * opening weights, so equality is decided by the metadata and tensor infos only, exactly what {@code GgufWriter}
- * copies (GW-1: the header and KV entries from the source's view, tensor infos backed by the copied payload).
+ * copies (the header and KV entries from the source's view, tensor infos backed by the copied payload).
  *
  * <p>The spec comparison is field-by-field: {@code ModelSpec} has no {@code equals} of its own, so this ports the
  * fields {@code ModelSpecBuilderTest} asserts. The NATIVE mode is asserted through the marker key
- * {@code neuralfree.native_skip}-free read-back of every tensor the checkpoint plans (GW-1 §4: NATIVE keeps every
+ * {@code neuralfree.native_skip}-free read-back of every tensor the checkpoint plans (NATIVE keeps every
  * extension tensor); a plain Llama checkpoint has none, so NATIVE and COMPAT write the same infos, and the test pins
  * the round trip precisely without an extension tensor in play.</p>
  */
@@ -93,7 +93,7 @@ public class HfExportRoundTripTest {
         return ModelSpecBuilder.build(GgufKv.of(source), TensorCatalog.of(source), MemoryConfig.defaults());
     }
 
-    /** Opens the HF path again (ModelSources.open twice, WP spec) and returns its spec. */
+    /** Opens the HF path again (ModelSources.open twice) and returns its spec. */
     private static ModelSpec roundTripSpec(Path dir, ModelSourceOptions options) throws IOException {
         try (ModelSource hf = ModelSources.open(dir.toString(), options, null)) {
             return specOf(hf);

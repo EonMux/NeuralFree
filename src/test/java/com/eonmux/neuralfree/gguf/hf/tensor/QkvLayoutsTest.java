@@ -7,6 +7,7 @@ import java.io.IOException;
 import static com.eonmux.neuralfree.gguf.hf.tensor.RowTransformsTest.seq;
 import static com.eonmux.neuralfree.gguf.hf.tensor.RowTransformsTest.values;
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
@@ -56,9 +57,17 @@ public class QkvLayoutsTest {
 
     @Test
     public void qwen3NextQkvzRegroup() throws IOException {
-        RowSource[] qz = QkvLayouts.splitQkvz(seq(12, 1), 2, 4, 1, 1);
+        RowSource src = seq(12, 1);
+        RowSource[] qz = QkvLayouts.splitQkvz(src, 2, 4, 1, 1);
         assertArrayEquals(new float[]{0, 6, 1, 7, 2, 3, 8, 9}, values(qz[0]), 0f);
         assertArrayEquals(new float[]{4, 5, 10, 11}, values(qz[1]), 0f);
+        for (RowSource part : qz) {
+            assertSame("the parts trace the stored per-key-head rows", src, RowTransforms.storedSource(part));
+            float[] v = values(part);
+            for (int r = 0; r < v.length; r++) {
+                assertEquals(v[r], RowTransforms.storedRow(part, r), 0f);
+            }
+        }
         assertThrows(IllegalArgumentException.class, () -> QkvLayouts.splitQkvz(seq(10, 1), 2, 4, 1, 1));
     }
 

@@ -1,0 +1,33 @@
+/* adain_modulate.comp - LLM_AdaInModulate: AdaLN modulation of a normalized row against a projection of the
+ * conditioning vector (the pockettts flow network's blocks). GLSL twin of kernels/llm/speech.cl.
+ * Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i rows, i cols, R x, R mod, W y).
+ *   y[r][c] = x[r][c] * (1 + mod[r][2*cols + c]) + mod[r][c]
+ * x and y [rows][cols], mod [rows][2*cols]; x and y must not overlap.
+ * Dispatch: 1-D, one invocation per element, global = roundUp(rows*cols, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfAmX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfAmM { float mod_in[]; };
+layout(std430, binding = 2) writeonly buffer NfAmY { float y_out[]; };
+
+layout(push_constant) uniform NfAmParams {
+    int rows;
+    int cols;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.rows) * uint(pc.cols)) {
+        return;
+    }
+    const uint r = idx / uint(pc.cols);
+    const uint c = idx - r * uint(pc.cols);
+    const uint mod_row = r * 2u * uint(pc.cols);
+    y_out[idx] = x_in[idx] * (1.0 + mod_in[mod_row + uint(pc.cols) + c]) + mod_in[mod_row + c];
+}

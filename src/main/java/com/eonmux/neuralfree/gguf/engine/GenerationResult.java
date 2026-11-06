@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -14,9 +16,16 @@ public final class GenerationResult {
     private final String text;
     private final StopReason stopReason;
     private final String stopString;
+    /** A stop token id the generation ended on, or {@link #NO_STOP_TOKEN}. */
+    private final int stopTokenId;
     private final Timings timings;
     private final List<TokenScore[]> logprobs;
+    private final List<TokenScore[]> promptLogprobs;
+    private final float[][] promptTokenIdLogprobs;
     private final int reasoningTokens;
+
+    /** {@link #stopTokenId()} value meaning the generation did not end on a request's stop token id. */
+    public static final int NO_STOP_TOKEN = -1;
 
     /**
      * @param tokens     generated token ids, prompt excluded (copied)
@@ -28,19 +37,26 @@ public final class GenerationResult {
      * @throws IllegalArgumentException when {@code stopString} disagrees with {@code stopReason}
      */
     public GenerationResult(int[] tokens, String text, StopReason stopReason, String stopString, Timings timings) {
-        this(tokens, text, stopReason, stopString, timings, List.of(), 0);
+        this(tokens, text, stopReason, stopString, NO_STOP_TOKEN, timings, List.of(), List.of(), null, 0);
     }
 
-    private GenerationResult(int[] tokens, String text, StopReason stopReason, String stopString, Timings timings,
-                             List<TokenScore[]> logprobs, int reasoningTokens) {
+    private GenerationResult(int[] tokens, String text, StopReason stopReason, String stopString, int stopTokenId,
+                             Timings timings, List<TokenScore[]> logprobs, List<TokenScore[]> promptLogprobs,
+                             float[][] promptTokenIdLogprobs, int reasoningTokens) {
         Objects.requireNonNull(tokens, "tokens");
         this.text = Objects.requireNonNull(text, "text");
         this.stopReason = Objects.requireNonNull(stopReason, "stopReason");
         this.timings = Objects.requireNonNull(timings, "timings");
         this.logprobs = Objects.requireNonNull(logprobs, "logprobs");
+        this.promptLogprobs = Objects.requireNonNull(promptLogprobs, "promptLogprobs");
+        this.promptTokenIdLogprobs = promptTokenIdLogprobs;
         if ((stopReason == StopReason.STOP_STRING) != (stopString != null)) {
             throw new IllegalArgumentException("stop string " + (stopString == null ? "missing" : "'" + stopString + "' given")
                     + " for stop reason " + stopReason);
+        }
+        if (stopTokenId != NO_STOP_TOKEN && stopTokenId < 0) {
+            throw new IllegalArgumentException("stop token id must be " + NO_STOP_TOKEN + " (none) or a token id,"
+                    + " got " + stopTokenId);
         }
         if (reasoningTokens < 0 || reasoningTokens > tokens.length) {
             throw new IllegalArgumentException("reasoning tokens " + reasoningTokens + " outside [0, "
@@ -48,6 +64,7 @@ public final class GenerationResult {
         }
         this.tokens = tokens.clone();
         this.stopString = stopString;
+        this.stopTokenId = stopTokenId;
         this.reasoningTokens = reasoningTokens;
     }
 
@@ -75,6 +92,21 @@ public final class GenerationResult {
         return stopString;
     }
 
+    /**
+     * The request's stop token id the generation ended on (vLLM's {@code stop_reason} for a stop-token end),
+     * or {@link #NO_STOP_TOKEN}: the vocabulary's own end-of-generation tokens, a stop string and every other
+     * reason leave it unset.
+     */
+    public int stopTokenId() {
+        return stopTokenId;
+    }
+
+    /** A copy naming {@code stopTokenId} as the stop token id the generation ended on. */
+    public GenerationResult withStopTokenId(int stopTokenId) {
+        return new GenerationResult(tokens, text, stopReason, stopString, stopTokenId, timings, logprobs,
+                promptLogprobs, promptTokenIdLogprobs, reasoningTokens);
+    }
+
     public Timings timings() {
         return timings;
     }
@@ -89,8 +121,9 @@ public final class GenerationResult {
 
     /**
      * The per-token log probabilities when the request asked for them ({@link
-     * GenerationRequest.Builder#logprobs(int)}), one entry per generated token: the sampled token plus its
-     * top alternatives of the post-chain distribution. Empty when the request asked for none.
+     * GenerationRequest.Builder#logprobs(int)} or {@link GenerationRequest.Builder#logprobTokenIds}), one entry
+     * per generated token: the sampled token first, then its best alternatives or the requested token ids, scored
+     * in the request's {@link LogprobsMode}. Empty when the request asked for none.
      */
     public List<TokenScore[]> logprobs() {
         return logprobs;
@@ -98,8 +131,51 @@ public final class GenerationResult {
 
     /** A copy carrying the per-token log probabilities ({@link SequenceRun}'s capture). */
     public GenerationResult withLogprobs(List<TokenScore[]> logprobs) {
-        return new GenerationResult(tokens, text, stopReason, stopString, timings,
-                List.copyOf(logprobs), reasoningTokens);
+        return new GenerationResult(tokens, text, stopReason, stopString, stopTokenId, timings,
+                List.copyOf(logprobs), promptLogprobs, promptTokenIdLogprobs, reasoningTokens);
+    }
+
+    /**
+     * The per-prompt-token log probabilities when the request asked for them ({@link
+     * GenerationRequest.Builder#promptLogprobs}), one entry per prompt token: the prompt token plus its top
+     * alternatives of the distribution that predicted it; empty when the request asked for none.
+     */
+    public List<TokenScore[]> promptLogprobs() {
+        return promptLogprobs;
+    }
+
+    /** A copy carrying the per-prompt-token log probabilities (the batch engine's prompt-row readback). */
+    public GenerationResult withPromptLogprobs(List<TokenScore[]> promptLogprobs) {
+        return new GenerationResult(tokens, text, stopReason, stopString, stopTokenId, timings, logprobs,
+                Collections.unmodifiableList(new ArrayList<>(promptLogprobs)), promptTokenIdLogprobs,
+                reasoningTokens);
+    }
+
+    /**
+     * The scores of the request's prompt token-id rows ({@link GenerationRequest#promptLogprobTokenIds()}, vLLM's
+     * {@code prompt_token_id_logprobs}): {@code [rows][ids]}, row {@code i} scoring its ids as predictions of
+     * prompt token {@code promptLogprobStart + i + 1}, a padding entry at {@code -inf}. A deep copy; null when
+     * the request named no rows.
+     */
+    public float[][] promptTokenIdLogprobs() {
+        return copy(promptTokenIdLogprobs);
+    }
+
+    /** A copy carrying the prompt token-id scores (copied; the batch engine's prompt-row readback). */
+    public GenerationResult withPromptTokenIdLogprobs(float[][] scores) {
+        return new GenerationResult(tokens, text, stopReason, stopString, stopTokenId, timings, logprobs,
+                promptLogprobs, copy(Objects.requireNonNull(scores, "scores")), reasoningTokens);
+    }
+
+    private static float[][] copy(float[][] rows) {
+        if (rows == null) {
+            return null;
+        }
+        float[][] out = new float[rows.length][];
+        for (int i = 0; i < rows.length; i++) {
+            out[i] = rows[i].clone();
+        }
+        return out;
     }
 
     /**
@@ -112,7 +188,8 @@ public final class GenerationResult {
 
     /** A copy counting {@code reasoningTokens} generated tokens as reasoning. */
     public GenerationResult withReasoningTokens(int reasoningTokens) {
-        return new GenerationResult(tokens, text, stopReason, stopString, timings, logprobs, reasoningTokens);
+        return new GenerationResult(tokens, text, stopReason, stopString, stopTokenId, timings, logprobs,
+                promptLogprobs, promptTokenIdLogprobs, reasoningTokens);
     }
 
     @Override

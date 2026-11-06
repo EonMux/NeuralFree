@@ -18,6 +18,16 @@ public interface TensorRegions extends AutoCloseable {
      */
     ByteBuffer region(GGUFTensorInfo info, long byteOff, long length) throws IOException;
 
+    /**
+     * Length of the runs in which the bytes of {@code info} are stored contiguously: the tensor's bytes
+     * {@code [k * run, (k + 1) * run)} lie together in the model, so a {@link #region} that stays inside one run is
+     * served in place, while one that crosses a run boundary may be assembled into a copy. The whole tensor is one
+     * run unless the model stores it in pieces (the experts of a packed-expert layer, one run per expert).
+     */
+    default long contiguousRunBytes(GGUFTensorInfo info) {
+        return info.sizeInBytes();
+    }
+
     /** The model the regions belong to, for messages. */
     String description();
 

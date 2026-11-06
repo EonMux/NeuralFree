@@ -10,8 +10,9 @@ import java.util.Objects;
  * <p>Each entry is read from {@link KernelManifest.Entry#resourcePath(String)} (the library root, or
  * {@value KernelManifest#SHARED_ROOT} for {@code [shared]} entries) and preceded by
  * {@code #line 1 "<path>"} with the entry's plain {@link KernelManifest.Entry#path()}, so compiler
- * diagnostics name the real file and line. No {@code #include} processing takes place: the manifest order
- * already places every dependency before its users, and the sources contain no includes.</p>
+ * diagnostics name the real file and line. {@code [cuda]} entries are skipped: only the CUDA build
+ * compiles them. No {@code #include} processing takes place: the manifest order already places every
+ * dependency before its users, and the sources contain no includes.</p>
  */
 public final class KernelSourceAssembler {
 
@@ -19,7 +20,8 @@ public final class KernelSourceAssembler {
     }
 
     /**
-     * Concatenates every manifest entry, including the {@code [opencl]} ones, in manifest order.
+     * Concatenates the entries the OpenCL build compiles (every entry except the {@code [cuda]} ones),
+     * in manifest order.
      *
      * @param m    the library manifest
      * @param cl   class loader whose resources hold the sources
@@ -31,10 +33,16 @@ public final class KernelSourceAssembler {
         Objects.requireNonNull(m, "manifest must not be null");
         Objects.requireNonNull(cl, "class loader must not be null");
         String r = KernelManifest.requireRoot(root);
-        List<String> texts = new ArrayList<>(m.entries().size());
+        List<KernelManifest.Entry> entries = new ArrayList<>(m.entries().size());
+        for (KernelManifest.Entry e : m.entries()) {
+            if (!e.cudaOnly()) {
+                entries.add(e);
+            }
+        }
+        List<String> texts = new ArrayList<>(entries.size());
         List<String> missing = new ArrayList<>();
         long total = 0;
-        for (KernelManifest.Entry e : m.entries()) {
+        for (KernelManifest.Entry e : entries) {
             String text = KernelManifest.readText(cl, e.resourcePath(r));
             if (text == null) {
                 missing.add(describe(e));
@@ -49,7 +57,7 @@ public final class KernelSourceAssembler {
         }
         StringBuilder sb = new StringBuilder((int) Math.min(Integer.MAX_VALUE - 8, total));
         for (int i = 0; i < texts.size(); i++) {
-            String path = m.entries().get(i).path();
+            String path = entries.get(i).path();
             String text = texts.get(i);
             sb.append("#line 1 \"").append(path).append("\"\n");
             sb.append(text);
@@ -61,8 +69,9 @@ public final class KernelSourceAssembler {
     }
 
     /**
-     * The manifest entries whose source resource is missing, in manifest order; empty when the library
-     * is complete. A library entry is named by its path, a shared entry by {@code "[shared] <path>"}.
+     * The manifest entries the OpenCL build compiles whose source resource is missing, in manifest order;
+     * empty when the library is complete. A library entry is named by its path, a shared entry by
+     * {@code "[shared] <path>"}.
      */
     public static List<String> missingSources(KernelManifest m, ClassLoader cl, String root) {
         Objects.requireNonNull(m, "manifest must not be null");
@@ -70,7 +79,7 @@ public final class KernelSourceAssembler {
         String r = KernelManifest.requireRoot(root);
         List<String> missing = new ArrayList<>();
         for (KernelManifest.Entry e : m.entries()) {
-            if (cl.getResource(e.resourcePath(r)) == null) {
+            if (!e.cudaOnly() && cl.getResource(e.resourcePath(r)) == null) {
                 missing.add(describe(e));
             }
         }

@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-MS part A fixtures (the Afmoe\n * Kolibri-1, Flint, Cohere-2 MoE, Granite SWA, Granite MoE SWA and Gemma4Unified rows) build through the registered entries: {@link ModelSpecBuilder} succeeds and every
+ * The fixtures (the Afmoe\n * Kolibri-1, Flint, Cohere-2 MoE, Granite SWA, Granite MoE SWA and Gemma4Unified rows) build through the registered entries: {@link ModelSpecBuilder} succeeds and every
  * catalog tensor is claimed ({@code TensorClaims}), which is the done-getting-tensors check of the
  * converter's tensor plan.
  */

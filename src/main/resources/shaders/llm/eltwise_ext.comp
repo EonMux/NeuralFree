@@ -1,4 +1,4 @@
-/* eltwise_ext.comp - LLM_Copy2D_F32 and LLM_Axpby_F32 offset-aware generic ops. GLSL twin of
+/* eltwise_ext.comp - LLM_Copy2D_F32, LLM_Axpby_F32 and LLM_MuddMix offset-aware generic ops. GLSL twin of
  * kernels/llm/eltwise_ext.cl (the semantic reference). Requires: common/nf_common.glsl.
  *
  * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
@@ -12,11 +12,17 @@
  *       out[out_off + i] = (alpha != 0 ? alpha*a[a_off + i] : 0) + (beta != 0 ? beta*b[b_off + i] : 0);
  *       a zero coefficient skips the read of its operand; out may alias b element for element
  *       (same buffer, out_off == b_off), so b and out carry no restrict qualifiers.
+ *   OP_MUDD_MIX   (i n_tokens, i n_embd, i n_taps, i bank_off, i bank_stride,
+ *                  R float bank, R float w, R int taps, W float cur, W float resid)
+ *       cur[t][i] = sum_j w[t][j] * bank[bank_off + taps[j]*bank_stride + t*n_embd + i],
+ *       resid[t][i] = sum_j w[t][n_taps+j] * bank[...] over j < n_taps
+ *       (limite's MUDD dense cross-layer mix, models/limite.cpp:100-140).
  * Offsets and strides are in float elements.
  *
- * Dispatch: 1-D, local = {L, 1, 1}, global = n invocations (Copy2D: n = rows*cols) rounded up to L.
- * Folded group counts are recovered by nf_global_id(). Element indices stay below 2^31 and every
- * binding stays below maxStorageBufferRange, so 32-bit index arithmetic is exact.
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n invocations (Copy2D: n = rows*cols, MuddMix:
+ * n = n_tokens*n_embd) rounded up to L. Folded group counts are recovered by nf_global_id(). Element
+ * indices stay below 2^31 and every binding stays below maxStorageBufferRange, so 32-bit index
+ * arithmetic is exact.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -25,6 +31,7 @@
 
 #define OP_COPY2D_F32 201
 #define OP_AXPBY_F32  202
+#define OP_MUDD_MIX   203
 
 #ifndef OP
 #error "eltwise_ext.comp requires OP"
@@ -53,6 +60,19 @@ layout(push_constant) uniform NfExParams {
     int b_off;
     int out_off;
 } pc;
+#elif OP == OP_MUDD_MIX
+layout(std430, binding = 0) restrict readonly buffer NfExBank { float bank_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfExW { float w_in[]; };
+layout(std430, binding = 2) restrict readonly buffer NfExTaps { int taps_in[]; };
+layout(std430, binding = 3) restrict writeonly buffer NfExCur { float cur_out[]; };
+layout(std430, binding = 4) restrict writeonly buffer NfExResid { float resid_out[]; };
+layout(push_constant) uniform NfExParams {
+    int n_tokens;
+    int n_embd;
+    int n_taps;
+    int bank_off;
+    int bank_stride;
+} pc;
 #else
 #error "eltwise_ext.comp: unknown OP"
 #endif
@@ -73,5 +93,22 @@ void main() {
     const float av = pc.alpha != 0.0 ? pc.alpha * a_in[uint(pc.a_off) + idx] : 0.0;
     const float bv = pc.beta != 0.0 ? pc.beta * b_in[uint(pc.b_off) + idx] : 0.0;
     y_out[uint(pc.out_off) + idx] = av + bv;
+#elif OP == OP_MUDD_MIX
+    if (pc.n_embd <= 0 || idx >= uint(pc.n_tokens) * uint(pc.n_embd)) {
+        return;
+    }
+    const uint t = idx / uint(pc.n_embd);
+    const uint i = idx - t * uint(pc.n_embd);
+    const uint w_base = t * uint(2 * pc.n_taps);
+    float c = 0.0;
+    float r = 0.0;
+    for (int j = 0; j < pc.n_taps; j++) {
+        const uint h = uint(pc.bank_off) + uint(taps_in[j]) * uint(pc.bank_stride) + t * uint(pc.n_embd) + i;
+        const float v = bank_in[h];
+        c += w_in[w_base + uint(j)] * v;
+        r += w_in[w_base + uint(pc.n_taps + j)] * v;
+    }
+    cur_out[idx] = c;
+    resid_out[idx] = r;
 #endif
 }

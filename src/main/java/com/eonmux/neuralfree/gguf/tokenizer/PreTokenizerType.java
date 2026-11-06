@@ -4,9 +4,9 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * llama.cpp {@code llama_vocab_pre_type} (src/llama-vocab.h:10-74): the 63 BPE pre-tokenizer
+ * llama.cpp {@code llama_vocab_pre_type} (src/llama-vocab.h:10-78): the 67 BPE pre-tokenizer
  * types with their {@code llm_tokenizer_bpe} regex sequence and byte-encoding flag
- * (src/llama-vocab.cpp:280-594), plus the Hugging Face form of the sequences llama.cpp adapted
+ * (src/llama-vocab.cpp:281-608), plus the Hugging Face form of the sequences llama.cpp adapted
  * ({@link #hfRegexes()}). {@link #code()} is the llama.cpp enum value. CHATGLM3, LLAMA4 and
  * PIXTRAL have no case in the llama.cpp constructor and therefore use the default sequence; no
  * {@code tokenizer.ggml.pre} name maps to them.
@@ -74,7 +74,11 @@ public enum PreTokenizerType {
     UFAKZEKA(59, PreTokenizerPatterns.UFAKZEKA, true),
     MMBERT(60, PreTokenizerPatterns.NEWLINE_RUNS, false),
     K2_HORIZON(61, PreTokenizerPatterns.K2_HORIZON, true),
-    FLINT(62, PreTokenizerPatterns.FLINT, true);
+    FLINT(62, PreTokenizerPatterns.FLINT, true),
+    DOMYN_SMALL(63, PreTokenizerPatterns.NEWLINE_RUNS, false),
+    NEMOTRON_3_5_EMBD(64, PreTokenizerPatterns.TEKKEN, PreTokenizerPatterns.TEKKEN_HF, true),
+    SOPRANO(65, PreTokenizerPatterns.SOPRANO, false),
+    TEKKEN_NUM3(66, PreTokenizerPatterns.TEKKEN_NUM3, true);
 
     private final int code;
     private final List<String> regexes;
@@ -120,4 +124,43 @@ public enum PreTokenizerType {
 
     /** {@code add_bos} is forced on after the GGUF override (src/llama-vocab.cpp:2931-2937). */
     public boolean forceAddBos() { return this == GEMMA4; }
+
+    /**
+     * The text a raw fragment is split from, after whitespace escaping
+     * ({@code llm_tokenizer_bpe_session::tokenize}, src/llama-vocab.cpp:653-680): NEMOTRON_3_5_EMBD
+     * drops the U+200C after each {@code [} and {@code <}; SOPRANO collapses each whitespace run to
+     * one space and lowercases every other code point, U+0130 becoming {@code i} followed by U+0307
+     * as Unicode full lowercase maps it; every other type splits the text as it is.
+     */
+    public String normalizeFragment(String text) {
+        if (this == NEMOTRON_3_5_EMBD) return text.replace("[‌", "[").replace("<‌", "<");
+        if (this != SOPRANO) return text;
+        StringBuilder sb = new StringBuilder(text.length());
+        boolean space = false;
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            i += Character.charCount(cp);
+            if (TokenizerVocab.isWhitespace(cp)) {
+                if (!space) sb.append(' ');
+                space = true;
+            } else {
+                if (cp == 0x0130) {
+                    sb.append("i̇");
+                } else {
+                    sb.appendCodePoint(UnicodeFlags.toLower(cp));
+                }
+                space = false;
+            }
+        }
+        return sb.toString();
+    }
+
+    /** A merged symbol that is not a token becomes the unknown token, not byte tokens (src/llama-vocab.cpp:800-801). */
+    public boolean unknownSymbolsAsUnk() { return this == SOPRANO; }
+
+    /** NORMAL tokens render their raw text, without byte or whitespace decoding (src/llama-vocab.cpp:4142-4144). */
+    public boolean rawNormalPieces() { return this == SOPRANO; }
+
+    /** The EOS token always ends generation (src/llama-vocab.cpp:3325-3327). */
+    public boolean eosIsEog() { return this == SOPRANO; }
 }

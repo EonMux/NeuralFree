@@ -7,8 +7,8 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the LFM2 converter family (LC/conversion/lfm2.py), the LFM2 rows of the Appendix A
- * HK-H1 table: {@code LFM2Model} ({@code LFM2ForCausalLM} and its alias {@code Lfm2ForCausalLM}), the decision
+ * Synthetic checkpoints of the LFM2 converter family (LC/conversion/lfm2.py), the LFM2 rows of
+ * {@code HfArchTableHybridSsm}: {@code LFM2Model} ({@code LFM2ForCausalLM} and its alias {@code Lfm2ForCausalLM}), the decision
  * {@code D1Model}, the decision {@code D1OmniModel}, the MoE {@code LFM2MoeModel}
  * ({@code Lfm2MoeForCausalLM}) and the audio {@code LFM25AudioTokenizer}. Three layers, hidden size 8, and the exact
  * tensor names and configuration keys of the converters and the generated pattern tables: full-attention layers use

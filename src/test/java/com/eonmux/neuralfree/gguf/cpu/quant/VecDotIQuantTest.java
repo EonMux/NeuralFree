@@ -26,7 +26,8 @@ import static org.junit.Assert.fail;
 public class VecDotIQuantTest {
 
     private static final GGMLType[] IQ_TYPES = {GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S,
-            GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ1_S, GGMLType.IQ1_M, GGMLType.IQ4_NL, GGMLType.IQ4_XS};
+            GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ3_K, GGMLType.IQ3_KS,
+            GGMLType.IQ1_S, GGMLType.IQ1_M, GGMLType.IQ4_NL, GGMLType.IQ4_XS};
     private static final GGMLType[] TERNARY_TYPES = {GGMLType.TQ1_0, GGMLType.TQ2_0};
     private static final GGMLType[] NEW_FP_TYPES = {GGMLType.NVFP4, GGMLType.Q1_0, GGMLType.Q2_0};
     private static final GGMLType[] FLOAT_TYPES = {GGMLType.F32, GGMLType.F16, GGMLType.BF16};
@@ -203,6 +204,37 @@ public class VecDotIQuantTest {
         Arrays.fill(ones, 1f);
         QuantizedActivations x = CpuActivationQuantizer.quantizeQ8_K(ones, 0, ones.length);
         assertEquals(256f, IQuantVecDot.IQ2_XXS.dotRow(w, 0, x), 1e-3f);
+    }
+
+    /**
+     * Hand trace of IQ3_K against Q8_K: an all-zero block with {@code d = 1} and activations of 1 (the Q8_K
+     * convention gives {@code q = -127}, {@code yd = -1/127}, so every element contributes
+     * {@code q * yd = 1}). Every element decodes to {@code iq3nl_values[0] = -63} times its sub-block
+     * scale; scale nibble 1 of the first sub-block scales its 32 elements by 3 and sign bit 0 of
+     * {@code scales_h} negates its first 16, so the dot is {@code 16 * 189 + 240 * -63 = -12096}.
+     */
+    @Test
+    public void iq3KTimesQ8KHandTrace() {
+        byte[] block = new byte[BlockLayout.IQ3_K_BYTES];
+        putHalf(block, 0, HALF_ONE);
+        block[BlockLayout.IQ3_K_SCALES_L] = 0x01;   // sub-block 0: low nibble 1 -> ls = 3
+        block[BlockLayout.IQ3_K_SCALES_H] = 0x01;   // sign bit 0 -> sub-block 0's first half negated
+        CpuTensorRef w = CpuTensorRef.of(GGMLType.IQ3_K, ByteBuffer.wrap(block), 1, BlockLayout.QK_K);
+        float[] ones = new float[BlockLayout.QK_K];
+        Arrays.fill(ones, 1f);
+        QuantizedActivations x = CpuActivationQuantizer.quantizeFor(GGMLType.IQ3_K, ones, 0, ones.length);
+        assertEquals(GGMLType.Q8_K, x.type());
+        assertEquals(-127, x.quant(0));
+
+        float expected = 16f * (3f * -63f * -1f) + 240f * -63f;
+        assertEquals(expected, IQuantVecDot.IQ3_K.dotRow(w, 0, x), 1e-2f);
+
+        // the same block decodes element-wise: +189 in the negated half, -63 in the other 240 elements
+        float[] decoded = new float[BlockLayout.QK_K];
+        w.decodeRow(0, decoded, 0);
+        assertEquals(3f * -63f * -1f, decoded[0], 0f);
+        assertEquals(-63f, decoded[16], 0f);
+        assertEquals(-63f, decoded[32], 0f);
     }
 
     // ------------------------------------------------------------------ decoder agreement

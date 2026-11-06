@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
@@ -59,6 +60,8 @@ public final class GpuRwkv7Mixer implements GpuMixer {
     private RwkvBlocks.GpuKit kit;
     private GpuOps ops;
     private boolean closed;
+    /** Whether the memory holds per-sequence state rows a batched step routes through. */
+    private boolean routeState;
 
     private int nEmbd;
     private int headSize;
@@ -151,6 +154,9 @@ public final class GpuRwkv7Mixer implements GpuMixer {
             throw e;
         }
         kit = k0;
+        routeState = kit.ctx.hasMemory()
+                && kit.ctx.memory() instanceof com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory
+                && kit.ctx.memory().pagedSequences() != null;
         ops = ctx.ops();
     }
 
@@ -207,7 +213,9 @@ public final class GpuRwkv7Mixer implements GpuMixer {
         aa = kt.temp("rwkv7.aa", c);
         bb = kt.temp("rwkv7.bb", c);
         y = kt.temp("rwkv7.y", c);
-        vFirst = kt.temp(RwkvBlocks.V_FIRST, c);
+        // the value rows one RWKV7 slot per sequence: a batched step's layer 0 refreshes its segment's rows,
+        // the later layers read the same segment's back
+        vFirst = kt.temp(RwkvBlocks.V_FIRST, c, stateSlots());
         List<GpuBuffer> b = new ArrayList<>();
         for (ScratchSlot s : Arrays.asList(planes, r, w, k, v, a, lora, tmp, tmp2, aa, bb, y, vFirst)) {
             b.add(s.buffer());
@@ -256,6 +264,37 @@ public final class GpuRwkv7Mixer implements GpuMixer {
         prefill(pos, 1, in, out);
     }
 
+    /** Why this mixer runs a batched step: every sequence's rows dispatch as its own contiguous step. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
+    /**
+     * One batched step: every segment of {@code s} dispatches its rows as the contiguous step, reading and
+     * writing its sequence's shift and WKV state (the kernels re-point their state-row routing per segment) and
+     * reading its rows at their place in the step's input and output. The value residual of a later layer reads
+     * layer 0's {@code v_first} rows, which the step's layer-0 segment of the same sequence refreshed.
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        if (s.contiguousSingle()) {
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        int c = nEmbd;
+        kit.checkStep(s.nTokens(), in, out, c, working);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            run(s.len(seg), in.buffer(), in.offset() + start * c, out.buffer(), out.offset() + start * c,
+                    s.seq(seg));
+        }
+    }
+
     /**
      * Runs the time mix over {@code nTokens} rows of {@code in} into {@code out} and advances the layer's shift and
      * WKV state; layer 0 also refreshes {@link RwkvBlocks#V_FIRST} for the later layers of the same step.
@@ -266,15 +305,20 @@ public final class GpuRwkv7Mixer implements GpuMixer {
      */
     @Override
     public void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
+        run(nTokens, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
+    }
+
+    private void run(int t, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff, int stateRow) {
         if (closed || kit == null) {
             throw new IllegalStateException("RWKV7 time mix is " + (closed ? "closed" : "not bound"));
         }
         int c = nEmbd;
-        int t = nTokens;
-        kit.checkStep(t, in, out, c, working);
         int plane = t * c;
         GpuBuffer x = planes.buffer();
-        kit.runShift(shift, t, c, in);
+        if (routeState) {
+            GpuMixer.routeStateRow(stateRow, kit.stateRows(), ops.queue());
+        }
+        kit.runShift(shift, t, c, inBuf, inOff);
         ops.matmul(wr, x, PLANE_R * plane, r.buffer(), 0, t);
         rDeltas.applyRows(t, x, PLANE_R * plane, r.buffer(), 0);
         ops.matmul(w1, x, PLANE_W * plane, lora.buffer(), 0, t);
@@ -285,7 +329,7 @@ public final class GpuRwkv7Mixer implements GpuMixer {
         kDeltas.applyRows(t, x, PLANE_K * plane, k.buffer(), 0);
         ops.matmul(wv, x, PLANE_V * plane, v.buffer(), 0, t);
         vDeltas.applyRows(t, x, PLANE_V * plane, v.buffer(), 0);
-        valueResidual(t, plane, x);
+        valueResidual(t, plane, x, stateRow * kit.ubatch * c);
         if (gating) {
             ops.matmul(g1, x, PLANE_G * plane, lora.buffer(), 0, t);
             kit.runUnary(gSigmoid, t, gateDim);
@@ -304,21 +348,26 @@ public final class GpuRwkv7Mixer implements GpuMixer {
         if (gating) {
             kit.runGlu(gateMul, t, c);
         }
-        ops.matmul(wo, y.buffer(), 0, out.buffer(), out.offset(), t);
-        oDeltas.applyRows(t, y.buffer(), 0, out.buffer(), out.offset());
+        ops.matmul(wo, y.buffer(), 0, outBuf, outOff, t);
+        oDeltas.applyRows(t, y.buffer(), 0, outBuf, outOff);
+    }
+
+    /** The sequence slots the working rows serve: the memory's parallel count, 1 without memory. */
+    private int stateSlots() {
+        return kit.ctx.hasMemory() ? kit.ctx.memory().plan().config().parallel() : 1;
     }
 
     /** Layer 0 stores {@code v}; later layers compute {@code v += (v_first - v) * sigmoid(V2 V1 x_v + v0)}. */
-    private void valueResidual(int t, int plane, GpuBuffer x) {
+    private void valueResidual(int t, int plane, GpuBuffer x, int slotOff) {
         if (firstLayer) {
-            ops.copy(v.buffer(), 0, vFirst.buffer(), 0, plane);
+            ops.copy(v.buffer(), 0, vFirst.buffer(), slotOff, plane);
             return;
         }
         ops.matmul(v1, x, PLANE_V * plane, lora.buffer(), 0, t);
         ops.matmul(v2, lora.buffer(), 0, tmp.buffer(), 0, t);
         kit.runBias(vBias, t);
         kit.runUnary(vSigmoid, t, nEmbd);
-        ops.copy(vFirst.buffer(), 0, tmp2.buffer(), 0, plane);
+        ops.copy(vFirst.buffer(), slotOff, tmp2.buffer(), 0, plane);
         ops.scaleAdd(v.buffer(), 0, -1.0f, tmp2.buffer(), 0, plane);
         kit.runGlu(vMix, t, nEmbd);
         ops.add(v.buffer(), 0, tmp2.buffer(), 0, v.buffer(), 0, plane);

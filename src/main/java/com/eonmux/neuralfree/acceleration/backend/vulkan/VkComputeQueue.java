@@ -6,19 +6,15 @@ import com.eonmux.neuralfree.acceleration.NotThreadSafe;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.acceleration.backend.GpuGraph;
+import com.eonmux.neuralfree.acceleration.backend.GpuGraphMismatchException;
+import com.eonmux.neuralfree.acceleration.backend.GpuUncapturableCommandException;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
-import com.eonmux.neuralfree.acceleration.backend.WorkSizes;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
-import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
-import org.lwjgl.vulkan.VkCommandBufferAllocateInfo;
-import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
-import org.lwjgl.vulkan.VkSemaphoreCreateInfo;
-import org.lwjgl.vulkan.VkSemaphoreTypeCreateInfo;
-import org.lwjgl.vulkan.VkSemaphoreWaitInfo;
 import org.lwjgl.vulkan.VkSubmitInfo;
 import org.lwjgl.vulkan.VkTimelineSemaphoreSubmitInfo;
 
@@ -28,25 +24,13 @@ import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
-import static org.lwjgl.vulkan.VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-import static org.lwjgl.vulkan.VK10.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 import static org.lwjgl.vulkan.VK10.VK_NULL_HANDLE;
 import static org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 import static org.lwjgl.vulkan.VK10.VK_QUEUE_COMPUTE_BIT;
-import static org.lwjgl.vulkan.VK10.VK_SUCCESS;
-import static org.lwjgl.vulkan.VK10.VK_TIMEOUT;
-import static org.lwjgl.vulkan.VK10.vkAllocateCommandBuffers;
-import static org.lwjgl.vulkan.VK10.vkCreateCommandPool;
-import static org.lwjgl.vulkan.VK10.vkCreateSemaphore;
 import static org.lwjgl.vulkan.VK10.vkDestroyCommandPool;
 import static org.lwjgl.vulkan.VK10.vkDestroySemaphore;
-import static org.lwjgl.vulkan.VK10.vkFreeCommandBuffers;
-import static org.lwjgl.vulkan.VK12.VK_SEMAPHORE_TYPE_TIMELINE;
-import static org.lwjgl.vulkan.VK12.vkGetSemaphoreCounterValue;
-import static org.lwjgl.vulkan.VK12.vkWaitSemaphores;
 
 /**
  * A Vulkan queue with the {@link ComputeQueue} contract: commands are recorded into batched
@@ -95,6 +79,16 @@ import static org.lwjgl.vulkan.VK12.vkWaitSemaphores;
  * the linear group id ({@code nf_wg_id()}) and discard the overflow groups. Multi-dimensional
  * dispatches are never folded, and any count above the device limits is rejected. A queue on a
  * transfer-only family rejects dispatches.</p>
+ *
+ * <p><b>Graph capture.</b> {@code beginCapture()} records dispatches into a dedicated simultaneous-use
+ * command buffer instead of the current batch; {@code endCapture()} returns them as a replayable
+ * {@link VkGraph}. The step that captured them submits them once with
+ * {@link GpuGraph#launch(ComputeQueue, GpuEvent...)}, and a replay verifies the step's dispatches against
+ * the capture and resubmits the recorded buffer once, ordered on the queue's timeline. Host transfers,
+ * reads, copies, fills, markers and event dispatches are refused while capturing with
+ * {@link IllegalStateException}; during a replay they report a mismatch. A graph launches only on the
+ * queue that captured it. A replay refuses a dispatch whose bound arguments or group counts changed since
+ * the capture: the recorded push constants and group counts are fixed.</p>
  */
 @NotThreadSafe("Commands are recorded by one thread at a time. Event completion, waits from other queues and "
         + "flushes are thread-safe: all queue state is guarded by the queue's monitor, and a queue never "
@@ -107,9 +101,6 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     public static final String DISPATCHES_PER_SUBMIT_PROPERTY = "neuralfree.vulkan.dispatchesPerSubmit";
     /** Default of {@value #DISPATCHES_PER_SUBMIT_PROPERTY}. */
     public static final int DEFAULT_DISPATCHES_PER_SUBMIT = 256;
-
-    private static final long INFINITE_TIMEOUT = -1L;
-    private static final long INTERRUPT_POLL_NANOS = 50_000_000L;
 
     private final VkComputeBackend backend;
     private final VkDevice device;
@@ -137,6 +128,17 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     private volatile long completedValue;
     private volatile long lastUseValue;
     private volatile boolean closed;
+    /** True between {@code beginCapture} and its end: dispatches record into the captured batch. */
+    private boolean capturing;
+    private VkCommandBatch captureBatch;
+    private final List<VkGraph.Dispatch> captureDispatches = new ArrayList<>();
+    private final List<VkGraph> graphs = new ArrayList<>();
+    /** The graph whose replay body is dispatching, or null; dispatches verify against its capture. */
+    private VkGraph replayGraph;
+    /** Timeline values of submitted replays, in order; retired like the batches of {@link #inFlight}. */
+    private final ArrayDeque<Long> replaySignals = new ArrayDeque<>();
+    /** Largest submitted replay value not known complete; later submissions wait on it. */
+    private long pendingReplaySignal;
 
     /**
      * @param backend        the owning backend (device, allocator, descriptor strategy, limits)
@@ -162,10 +164,10 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         this.strategy = backend.descriptorStrategy();
         this.maxGroups = backend.info().maxComputeWorkGroupCount();
         this.submitPolicy = new VkSubmitPolicy(backend.dispatchesPerSubmit());
-        this.commandPool = createCommandPool(device, context.family());
+        this.commandPool = VkQueueResources.createCommandPool(device, context.family());
         long semaphore;
         try {
-            semaphore = createTimeline(device);
+            semaphore = VkQueueResources.createTimeline(device);
         } catch (RuntimeException e) {
             vkDestroyCommandPool(device, commandPool, null);
             throw e;
@@ -243,7 +245,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         if (srcData == null) {
             throw new IllegalArgumentException("write source array must not be null");
         }
-        requireWithin(sizeInBytes, srcData.length, "write source array");
+        VkQueueChecks.requireWithin(sizeInBytes, srcData.length, "write source array");
         return write(dstBuffer, dstOffset, sizeInBytes,
                 (from, dst) -> dst.put(srcData, (int) from, dst.remaining()), waitOnEvents);
     }
@@ -254,7 +256,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         if (srcData == null) {
             throw new IllegalArgumentException("write source array must not be null");
         }
-        requireFloatSized(sizeInBytes, srcData.length, "write source array");
+        VkQueueChecks.requireFloatSized(sizeInBytes, srcData.length, "write source array");
         return write(dstBuffer, dstOffset, sizeInBytes,
                 (from, dst) -> dst.order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                         .put(srcData, (int) (from / Float.BYTES), dst.remaining() / Float.BYTES),
@@ -268,7 +270,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         if (srcData == null) {
             throw new IllegalArgumentException("write source ByteBuffer must not be null");
         }
-        requireWithin(sizeInBytes, srcData.capacity(), "write source ByteBuffer");
+        VkQueueChecks.requireWithin(sizeInBytes, srcData.capacity(), "write source ByteBuffer");
         return write(dstBuffer, dstOffset, sizeInBytes, (from, dst) -> {
             ByteBuffer view = srcData.duplicate();
             view.clear();
@@ -283,7 +285,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         if (dstData == null) {
             throw new IllegalArgumentException("read destination array must not be null");
         }
-        requireWithin(sizeInBytes, dstData.length, "read destination array");
+        VkQueueChecks.requireWithin(sizeInBytes, dstData.length, "read destination array");
         return read(srcBuffer, srcOffset, sizeInBytes,
                 (slice, done) -> VkCommandBatch.PendingRead.ofBytes(slice, dstData, (int) done), waitOnEvents);
     }
@@ -294,7 +296,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         if (dstData == null) {
             throw new IllegalArgumentException("read destination array must not be null");
         }
-        requireFloatSized(sizeInBytes, dstData.length, "read destination array");
+        VkQueueChecks.requireFloatSized(sizeInBytes, dstData.length, "read destination array");
         return read(srcBuffer, srcOffset, sizeInBytes,
                 (slice, done) -> VkCommandBatch.PendingRead.ofFloats(slice, dstData, (int) (done / Float.BYTES)),
                 waitOnEvents);
@@ -303,18 +305,19 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     @Override
     public void enqueueCopyBuffer(GpuBuffer src, long srcOffset, GpuBuffer dst, long dstOffset, long sizeInBytes,
                                   GpuEvent... waitOnEvents) {
-        VkGpuBuffer from = ownBuffer(src, "copy source");
-        VkGpuBuffer to = ownBuffer(dst, "copy destination");
-        requireRange(from, srcOffset, sizeInBytes, "copy source");
-        requireRange(to, dstOffset, sizeInBytes, "copy destination");
+        VkGpuBuffer from = VkQueueChecks.ownBuffer(src, "copy source", allocator);
+        VkGpuBuffer to = VkQueueChecks.ownBuffer(dst, "copy destination", allocator);
+        VkQueueChecks.requireRange(from, srcOffset, sizeInBytes, "copy source");
+        VkQueueChecks.requireRange(to, dstOffset, sizeInBytes, "copy destination");
         if (from == to && srcOffset < dstOffset + sizeInBytes && dstOffset < srcOffset + sizeInBytes) {
             throw new IllegalArgumentException("copy ranges [" + srcOffset + ", " + (srcOffset + sizeInBytes)
                     + ") and [" + dstOffset + ", " + (dstOffset + sizeInBytes) + ") of one buffer overlap");
         }
-        validateWaits(waitOnEvents);
-        flushProducers(waitOnEvents);
+        VkEventWaits.validate(waitOnEvents, backend);
+        VkEventWaits.flushProducers(waitOnEvents, this);
         synchronized (this) {
             enter();
+            uncapturable("a device copy");
             applyWaits(waitOnEvents);
             if (sizeInBytes == 0) {
                 return;
@@ -329,20 +332,21 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     @Override
     public void enqueueFillBuffer(GpuBuffer dst, long dstOffset, long sizeInBytes, int pattern,
                                   GpuEvent... waitOnEvents) {
-        VkGpuBuffer to = ownBuffer(dst, "fill destination");
+        VkGpuBuffer to = VkQueueChecks.ownBuffer(dst, "fill destination", allocator);
         if (dstOffset < 0 || sizeInBytes < 0 || (dstOffset & 3) != 0 || (sizeInBytes & 3) != 0) {
             throw new IllegalArgumentException("fill offset " + dstOffset + " and size " + sizeInBytes
                     + " must be non-negative multiples of 4");
         }
-        requireRange(to, dstOffset, sizeInBytes, "fill destination");
-        validateWaits(waitOnEvents);
-        flushProducers(waitOnEvents);
+        VkQueueChecks.requireRange(to, dstOffset, sizeInBytes, "fill destination");
+        VkEventWaits.validate(waitOnEvents, backend);
+        VkEventWaits.flushProducers(waitOnEvents, this);
         synchronized (this) {
             enter();
-            applyWaits(waitOnEvents);
             if (sizeInBytes == 0) {
                 return;
             }
+            uncapturable("a fill");
+            applyWaits(waitOnEvents);
             VkCommandBatch b = batch();
             transferHazard(b, 0, 0, 0, to.trackingId(), dstOffset, sizeInBytes);
             b.fill(to.vkBuffer(), to.offset() + dstOffset, sizeInBytes, pattern);
@@ -352,10 +356,11 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     /** An event that completes when every command enqueued so far on this queue, and the waits, complete. */
     @Override
     public GpuEvent enqueueMarker(GpuEvent... waitOnEvents) {
-        validateWaits(waitOnEvents);
-        flushProducers(waitOnEvents);
+        VkEventWaits.validate(waitOnEvents, backend);
+        VkEventWaits.flushProducers(waitOnEvents, this);
         synchronized (this) {
             enter();
+            uncapturable("a marker");
             applyWaits(waitOnEvents);
             return markerLocked();
         }
@@ -378,7 +383,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
 
     @Override
     public void setKernelArg(KernelHandle kernel, int argIndex, Object arg) {
-        ownHandle(kernel).argState().set(argIndex, arg);
+        VkQueueChecks.ownHandle(kernel, strategy).argState().set(argIndex, arg);
     }
 
     @Override
@@ -391,6 +396,362 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     public GpuEvent enqueueKernelPreBoundWithEvent(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize,
                                                    GpuEvent... waitOnEvents) {
         return launch(kernel, globalWorkSize, localWorkSize, null, waitOnEvents, true);
+    }
+
+    // ------------------------------------------------------------------ command capture
+
+    @Override
+    public boolean supportsGraphCapture() {
+        return dispatchCapable;
+    }
+
+    @Override
+    public boolean isCapturing() {
+        synchronized (this) {
+            return capturing;
+        }
+    }
+
+    @Override
+    public void beginCapture() {
+        synchronized (this) {
+            enter();
+            if (!dispatchCapable) {
+                throw new UnsupportedOperationException("Vulkan " + queueType + " queue on transfer-only family "
+                        + context.family() + " cannot capture dispatches");
+            }
+            if (capturing || replayGraph != null) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue is already "
+                        + (capturing ? "capturing" : "replaying") + " dispatches");
+            }
+            submitLocked();
+            capturing = true;
+            captureBatch = null;
+            captureDispatches.clear();
+            lastUseValue = pendingValue();
+        }
+    }
+
+    @Override
+    public GpuGraph endCapture() {
+        synchronized (this) {
+            enter();
+            if (replayGraph != null) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue: endCapture needs a capture,"
+                        + " a replay of " + replayGraph + " is dispatching");
+            }
+            if (!capturing) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue is not capturing a graph");
+            }
+            List<VkGraph.Dispatch> dispatches = new ArrayList<>(captureDispatches);
+            VkCommandBatch b = captureBatch;
+            capturing = false;
+            captureBatch = null;
+            captureDispatches.clear();
+            if (b == null || dispatches.isEmpty()) {
+                disposeCaptureBatch(b);
+                return null;
+            }
+            try {
+                b.end();
+            } catch (RuntimeException e) {
+                disposeCaptureBatch(b);
+                throw e;
+            }
+            VkGraph graph = new VkGraph(this, b, dispatches);
+            graphs.add(graph);
+            return graph;
+        }
+    }
+
+    @Override
+    public void abortCapture() {
+        synchronized (this) {
+            enter();
+            if (replayGraph != null) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue: abortCapture needs a"
+                        + " capture, a replay of " + replayGraph + " is dispatching");
+            }
+            if (!capturing) {
+                return;
+            }
+            discardCaptureLocked();
+        }
+    }
+
+    /** One dispatch of a capture: recorded into the captured command batch, executed by no replay. */
+    private void recordCaptureLocked(VkKernelHandle handle, VkKernelHandle.Variant variant, long[] groups,
+                                     Object[] args) {
+        VkArgState state = handle.argState();
+        if (args != null && args.length > 0) {
+            state.setAll(args);
+        }
+        state.materialize();
+        VkCommandBatch b = captureBatchLocked();
+        if (tracker.needsBarrier(state.readIds(), state.writeIds())) {
+            b.barrier();
+            tracker.reset();
+        }
+        b.bindPipeline(variant.pipeline());
+        b.bindDescriptors(variant.program(), state);
+        variant.program().pushConstants(b.commandBuffer(), state);
+        b.dispatch((int) groups[0], (int) groups[1], (int) groups[2]);
+        tracker.record(state.readIds(), state.writeIds());
+        captureDispatches.add(new VkGraph.Dispatch(handle, groups.clone(), VkGraph.copyArgs(state)));
+    }
+
+    /** One dispatch of a replay body: matched against the next captured dispatch, never executed. */
+    private void verifyReplayLocked(VkKernelHandle handle, long[] groups, Object[] args) {
+        VkArgState state = handle.argState();
+        if (args != null && args.length > 0) {
+            state.setAll(args);
+        }
+        replayGraph.dispatch(handle, groups, VkGraph.copyArgs(state));
+    }
+
+    /** The command batch the capture records into, begun on first use. */
+    private VkCommandBatch captureBatchLocked() {
+        lastUseValue = pendingValue();
+        if (captureBatch == null) {
+            captureBatch = newReplayableBatch();
+            captureDispatches.clear();
+        }
+        return captureBatch;
+    }
+
+    private VkCommandBatch newReplayableBatch() {
+        VkCommandBuffer cb = VkQueueResources.allocateCommandBuffer(device, commandPool);
+        VkDescriptorStrategy.Frame frame;
+        try {
+            frame = strategy.newFrame();
+        } catch (RuntimeException e) {
+            VkQueueResources.freeCommandBuffer(device, commandPool, cb);
+            throw e;
+        }
+        VkCommandBatch b = new VkCommandBatch(cb, frame, dispatchCapable, true);
+        try {
+            b.begin();
+        } catch (RuntimeException e) {
+            step(() -> strategy.destroy(frame), e);
+            b.close();
+            VkQueueResources.freeCommandBuffer(device, commandPool, cb);
+            throw e;
+        }
+        return b;
+    }
+
+    /** Returns an unused capture batch's command buffer and frame to the queue. */
+    private void disposeCaptureBatch(VkCommandBatch b) {
+        if (b == null) {
+            return;
+        }
+        if (b.isRecording()) {
+            b.reset();
+        }
+        strategy.destroy(b.descriptorFrame());
+        b.close();
+        VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer());
+    }
+
+    /**
+     * Ends an open capture, discarding the dispatches recorded so far: a failed step leaves no device
+     * work behind and the queue returns to normal dispatching.
+     */
+    private void discardCaptureLocked() {
+        capturing = false;
+        VkCommandBatch b = captureBatch;
+        captureBatch = null;
+        captureDispatches.clear();
+        tracker.reset();
+        disposeCaptureBatch(b);
+    }
+
+    /**
+     * Refuses a command the captured dispatch sequence cannot hold: a host transfer, a read, a device
+     * copy or fill, a marker or an event while a capture is recording, and any command that is not
+     * part of the capture during a replay.
+     */
+    private void uncapturable(String op) {
+        if (!capturing && replayGraph == null) {
+            return;
+        }
+        if (replayGraph != null) {
+            throw new GpuGraphMismatchException("command replay of " + replayGraph + " hit " + op
+                    + ", which the captured dispatches do not contain");
+        }
+        throw new GpuUncapturableCommandException("a " + op + " cannot be captured: perform host transfers and"
+                + " reads before beginCapture, and read results only after the graph has been launched");
+    }
+
+    /**
+     * A replay's step body: dispatches verify against the capture instead of recording.
+     *
+     * @throws IllegalStateException when the queue is closed, another recording is active or the graph
+     *                               does not belong to this queue
+     */
+    void beginGraphReplay(VkGraph graph) {
+        synchronized (this) {
+            enter();
+            if (capturing || replayGraph != null) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue is already "
+                        + (capturing ? "capturing" : "replaying") + " dispatches");
+            }
+            if (graph.isClosed()) {
+                throw new IllegalStateException(graph + " is closed");
+            }
+            if (!graphs.contains(graph)) {
+                throw new IllegalArgumentException(graph + " was not captured on this queue");
+            }
+            replayGraph = graph;
+        }
+    }
+
+    /** The replay submission: one resubmission of the captured command buffer, ordered on the timeline. */
+    void submitGraphReplay(VkGraph graph) {
+        synchronized (this) {
+            enter();
+            if (replayGraph != graph) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue: " + graph + " is not replaying");
+            }
+            submitCapturedBatchLocked(graph.batch());
+        }
+    }
+
+    /**
+     * One submission of the graph captured by the step itself, with its capture-time push constants:
+     * the step that recorded the dispatches submitted through
+     * {@link GpuGraph#launch(ComputeQueue, GpuEvent...)}. A Vulkan graph runs only on the queue that
+     * captured it, because its command buffer belongs to that queue.
+     *
+     * @throws IllegalArgumentException when {@code target} is another queue
+     * @throws IllegalStateException    when the queue or graph is closed, or another recording is active
+     */
+    GpuEvent launchCapture(VkGraph graph, ComputeQueue target, GpuEvent[] waitOnEvents) {
+        if (target != this) {
+            throw new IllegalArgumentException("Vulkan graph " + graph + " runs only on the queue that captured"
+                    + " it, not on " + (target == null ? "null" : target.toString()));
+        }
+        VkEventWaits.validate(waitOnEvents, backend);
+        VkEventWaits.flushProducers(waitOnEvents, this);
+        synchronized (this) {
+            enter();
+            if (capturing || replayGraph != null) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue is already "
+                        + (capturing ? "capturing" : "replaying") + " dispatches");
+            }
+            if (graph.isClosed()) {
+                throw new IllegalStateException(graph + " is closed");
+            }
+            if (!graphs.contains(graph)) {
+                throw new IllegalArgumentException(graph + " was not captured on this queue");
+            }
+            applyWaitsTo(graph.batch(), waitOnEvents);
+            long signal = submitCapturedBatchLocked(graph.batch());
+            return new VkGpuEvent(this, signal);
+        }
+    }
+
+    /** Adds a timeline wait for each event of another queue to {@code batch}, as {@link #applyWaits} does. */
+    private void applyWaitsTo(VkCommandBatch batch, GpuEvent[] waits) {
+        if (waits == null) {
+            return;
+        }
+        for (GpuEvent e : waits) {
+            VkGpuEvent event = (VkGpuEvent) e;
+            VkComputeQueue producer = event.owner();
+            long value = event.value();
+            if (producer == this || value <= producer.completedValue) {
+                continue;
+            }
+            if (value > producer.submittedValue) {
+                throw new IllegalStateException("wait event value " + value + " of " + producer
+                        + " was never submitted" + (producer.closed ? " before the queue closed" : ""));
+            }
+            if (current != null && current.commandCount() > 0) {
+                submitLocked();
+            }
+            batch.addWait(producer, value);
+        }
+    }
+
+    /**
+     * Submits a captured graph's command buffer after the queue's recorded batch, on the timeline; a
+     * later batch waits on the replay signal, so the queue's order is kept.
+     *
+     * @return the timeline value the submission signals
+     */
+    private long submitCapturedBatchLocked(VkCommandBatch batch) {
+        submitLocked();
+        long signal = submittedValue + 1;
+        submitBatchLocked(batch, signal, submittedValue);
+        replaySignals.addLast(signal);
+        pendingReplaySignal = signal;
+        submittedValue = signal;
+        lastUseValue = signal;
+        submitPolicy.onSubmit();
+        return signal;
+    }
+
+    /** Ends a replay's step body: a failed body leaves the device untouched (nothing was submitted). */
+    void endGraphReplay(VkGraph graph, boolean submitted) {
+        synchronized (this) {
+            if (replayGraph != graph) {
+                throw new IllegalStateException("Vulkan " + queueType + " queue: " + graph + " is not replaying");
+            }
+            replayGraph = null;
+            if (!submitted) {
+                LOGGER.debug("Command replay of {} did not reach its submission; the caller retries", graph);
+            }
+        }
+    }
+
+    /** Waits for the graph's submitted replays, then frees its command buffer and descriptor frame. */
+    void releaseGraph(VkGraph graph) {
+        long last = 0;
+        synchronized (this) {
+            enter();
+            if (!graphs.contains(graph)) {
+                throw new IllegalArgumentException(graph + " was not captured on this queue");
+            }
+            for (Long value : replaySignals) {
+                last = Math.max(last, value);
+            }
+        }
+        if (last > 0 && last > completedValue) {
+            VkTimelineWait.wait(device, timeline, last);
+        }
+        synchronized (this) {
+            retireUpTo(last);
+            graphs.remove(graph);
+            graph.destroy();
+            strategy.destroy(graph.batch().descriptorFrame());
+            graph.batch().close();
+            VkQueueResources.freeCommandBuffer(device, commandPool, graph.batch().commandBuffer());
+        }
+    }
+
+    /** Frees every open graph's command buffer and descriptor frame; called on queue close. */
+    private void closeGraphsLocked() {
+        RuntimeException failure = null;
+        for (VkGraph graph : graphs) {
+            failure = step(() -> strategy.destroy(graph.batch().descriptorFrame()), failure);
+            failure = step(graph.batch()::close, failure);
+            failure = step(() -> VkQueueResources.freeCommandBuffer(device, commandPool,
+                    graph.batch().commandBuffer()), failure);
+            graph.destroy();
+        }
+        graphs.clear();
+        if (captureBatch != null) {
+            VkCommandBatch b = captureBatch;
+            captureBatch = null;
+            capturing = false;
+            failure = step(() -> strategy.destroy(b.descriptorFrame()), failure);
+            failure = step(b::close, failure);
+            failure = step(() -> VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer()), failure);
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     // ------------------------------------------------------------------ submission and completion
@@ -429,7 +790,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             target = submittedValue;
         }
         if (target > completedValue) {
-            waitTimeline(target);
+            VkTimelineWait.wait(device, timeline, target);
         }
         synchronized (this) {
             retireUpTo(target);
@@ -465,7 +826,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     @Override
     public void waitForValue(long value) {
         if (prepareWait(value)) {
-            waitTimeline(value);
+            VkTimelineWait.wait(device, timeline, value);
         }
         synchronized (this) {
             retireUpTo(Math.min(value, submittedValue));
@@ -480,7 +841,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
      */
     void awaitValue(long value) throws InterruptedException {
         if (prepareWait(value)) {
-            waitTimelineInterruptibly(value);
+            VkTimelineWait.waitInterruptibly(device, timeline, value, this);
         }
         synchronized (this) {
             retireUpTo(Math.min(value, submittedValue));
@@ -502,7 +863,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
                 return true;
             }
             ensureSubmitted(value);
-            long reached = counterValue();
+            long reached = VkTimelineWait.counter(device, timeline);
             if (reached > completedValue) {
                 retireUpTo(Math.min(reached, submittedValue));
             }
@@ -539,7 +900,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
                 target = submittedValue;
             }
             if (target > completedValue) {
-                waitTimeline(target);
+                VkTimelineWait.wait(device, timeline, target);
             }
             synchronized (this) {
                 retireUpTo(target);
@@ -549,6 +910,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             LOGGER.warn("Vulkan queue {} did not drain before closing: {}", this, e.getMessage());
         }
         synchronized (this) {
+            failure = step(this::closeGraphsLocked, failure);
             for (VkCommandBatch b : allBatches) {
                 failure = step(() -> strategy.destroy(b.descriptorFrame()), failure);
                 failure = step(b::close, failure);
@@ -556,6 +918,8 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             allBatches.clear();
             freeBatches.clear();
             inFlight.clear();
+            replaySignals.clear();
+            pendingReplaySignal = 0;
             current = null;
             failure = step(() -> vkDestroyCommandPool(device, commandPool, null), failure);
             failure = step(() -> vkDestroySemaphore(device, timeline, null), failure);
@@ -588,15 +952,15 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
      */
     private VkGpuEvent launch(KernelHandle kernel, long[] global, long[] local, Object[] args, GpuEvent[] waits,
                               boolean wantEvent) {
-        VkKernelHandle handle = ownHandle(kernel);
+        VkKernelHandle handle = VkQueueChecks.ownHandle(kernel, strategy);
         enter();
         if (!dispatchCapable) {
             throw new UnsupportedOperationException("Vulkan " + queueType + " queue on transfer-only family "
                     + context.family() + " cannot dispatch kernel " + handle.kernelName());
         }
-        validateWaits(waits);
+        VkEventWaits.validate(waits, backend);
         int[] local3 = handle.resolveLocalSize(global, local);
-        long[] groups = groupCounts(handle.kernelName(), global, local3);
+        long[] groups = VkDispatchLimits.groupCounts(handle.kernelName(), global, local3, maxGroups);
         VkKernelHandle.Variant variant = handle.preparedVariant(local3);
         if (variant == null) {
             synchronized (this) {
@@ -607,9 +971,26 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             }
             variant = handle.select(local3);
         }
-        flushProducers(waits);
+        VkEventWaits.flushProducers(waits, this);
         synchronized (this) {
             enter();
+            if (capturing) {
+                if (wantEvent || (waits != null && waits.length > 0)) {
+                    throw new GpuUncapturableCommandException("a " + handle.kernelName() + " dispatch that "
+                            + (wantEvent ? "returns an event" : "waits on events") + " cannot be captured: enqueue"
+                            + " it before beginCapture, or return no event and wait on this queue's order");
+                }
+                recordCaptureLocked(handle, variant, groups, args);
+                return null;
+            } else if (replayGraph != null) {
+                if (wantEvent || (waits != null && waits.length > 0)) {
+                    throw new GpuGraphMismatchException("command replay of " + replayGraph + ": "
+                            + handle.kernelName() + (wantEvent ? " returns an event" : " waits on another queue's"
+                            + " events") + ", which the captured dispatches do not contain");
+                }
+                verifyReplayLocked(handle, groups, args);
+                return null;
+            }
             applyWaits(waits);
             VkArgState state = handle.argState();
             if (args != null && args.length > 0) {
@@ -635,46 +1016,14 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         }
     }
 
-    /**
-     * Group counts {@code ceil(global / local3)} padded to three dimensions. The count of a
-     * one-dimensional dispatch ({@code global.length == 1}) above {@code maxComputeWorkGroupCount[0]}
-     * is folded into the y dimension; multi-dimensional kernels read {@code gl_WorkGroupID.y} as their
-     * own axis, so they are never folded.
-     *
-     * @throws IllegalArgumentException when a count exceeds the device limits after folding
-     */
-    private long[] groupCounts(String kernel, long[] global, int[] local3) {
-        long[] local = new long[global.length];
-        for (int d = 0; d < global.length; d++) {
-            local[d] = local3[d];
-        }
-        long[] groups = WorkSizes.pad3(WorkSizes.groupCounts(global, local), 1);
-        if (groups[0] > maxGroups[0]) {
-            if (global.length != 1) {
-                throw new IllegalArgumentException(kernel + ": " + groups[0] + " work-groups in x exceed "
-                        + "maxComputeWorkGroupCount[0] = " + maxGroups[0] + "; only one-dimensional dispatches are "
-                        + "folded (global " + Arrays.toString(global) + ", groups " + Arrays.toString(groups) + ")");
-            }
-            long folded = (groups[0] - 1) / maxGroups[0] + 1;
-            groups[0] = maxGroups[0];
-            groups[1] = folded;
-        }
-        for (int d = 0; d < 3; d++) {
-            if (groups[d] > maxGroups[d]) {
-                throw new IllegalArgumentException(kernel + ": work-group counts " + Arrays.toString(groups)
-                        + " exceed maxComputeWorkGroupCount " + Arrays.toString(maxGroups));
-            }
-        }
-        return groups;
-    }
-
     private GpuEvent write(GpuBuffer dst, long dstOffset, long size, HostSource source, GpuEvent[] waits) {
-        VkGpuBuffer to = ownBuffer(dst, "write destination");
-        requireRange(to, dstOffset, size, "write destination");
-        validateWaits(waits);
-        flushProducers(waits);
+        VkGpuBuffer to = VkQueueChecks.ownBuffer(dst, "write destination", allocator);
+        VkQueueChecks.requireRange(to, dstOffset, size, "write destination");
+        VkEventWaits.validate(waits, backend);
+        VkEventWaits.flushProducers(waits, this);
         synchronized (this) {
             enter();
+            uncapturable("a host write");
             applyWaits(waits);
             if (size == 0) {
                 return markerLocked();
@@ -705,12 +1054,13 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     private GpuEvent read(GpuBuffer src, long srcOffset, long size, ReadTarget target, GpuEvent[] waits) {
-        VkGpuBuffer from = ownBuffer(src, "read source");
-        requireRange(from, srcOffset, size, "read source");
-        validateWaits(waits);
-        flushProducers(waits);
+        VkGpuBuffer from = VkQueueChecks.ownBuffer(src, "read source", allocator);
+        VkQueueChecks.requireRange(from, srcOffset, size, "read source");
+        VkEventWaits.validate(waits, backend);
+        VkEventWaits.flushProducers(waits, this);
         synchronized (this) {
             enter();
+            uncapturable("a host read");
             applyWaits(waits);
             if (size == 0) {
                 return markerLocked();
@@ -757,7 +1107,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         }
         VkCommandBatch b = freeBatches.pollFirst();
         if (b == null && !inFlight.isEmpty()) {
-            long reached = counterValue();
+            long reached = VkTimelineWait.counter(device, timeline);
             if (reached > completedValue) {
                 retireUpTo(Math.min(reached, submittedValue));
             }
@@ -775,12 +1125,12 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     private VkCommandBatch newBatch() {
-        VkCommandBuffer cb = allocateCommandBuffer();
+        VkCommandBuffer cb = VkQueueResources.allocateCommandBuffer(device, commandPool);
         VkDescriptorStrategy.Frame frame;
         try {
             frame = strategy.newFrame();
         } catch (RuntimeException e) {
-            freeCommandBuffer(cb);
+            VkQueueResources.freeCommandBuffer(device, commandPool, cb);
             throw e;
         }
         VkCommandBatch b = new VkCommandBatch(cb, frame, dispatchCapable);
@@ -803,53 +1153,11 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         }
         current = null;
         long signal = submittedValue + 1;
+        // the batch orders after a pending replay, which runs outside the queue's batch sequence
+        long selfWait = pendingReplaySignal;
         try {
             b.end();
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                VkComputeQueue[] producers = b.waitProducers();
-                long[] values = b.waitValues();
-                LongBuffer waitSemaphores = stack.mallocLong(Math.max(1, producers.length));
-                LongBuffer waitValues = stack.mallocLong(Math.max(1, producers.length));
-                int waitCount = 0;
-                for (int i = 0; i < producers.length; i++) {
-                    if (values[i] <= producers[i].completedValue) {
-                        continue;
-                    }
-                    if (producers[i].closed) {
-                        throw new IllegalStateException("wait on timeline value " + values[i] + " of " + producers[i]
-                                + ", which closed without reaching it");
-                    }
-                    waitSemaphores.put(waitCount, producers[i].timeline);
-                    waitValues.put(waitCount, values[i]);
-                    waitCount++;
-                }
-                IntBuffer waitStages = null;
-                if (waitCount > 0) {
-                    waitSemaphores.limit(waitCount);
-                    waitValues.limit(waitCount);
-                    waitStages = stack.mallocInt(waitCount);
-                    for (int i = 0; i < waitCount; i++) {
-                        waitStages.put(i, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-                    }
-                } else {
-                    waitSemaphores = null;
-                    waitValues = null;
-                }
-                VkTimelineSemaphoreSubmitInfo timelineInfo = VkTimelineSemaphoreSubmitInfo.calloc(stack)
-                        .sType$Default()
-                        .waitSemaphoreValueCount(waitCount)
-                        .pWaitSemaphoreValues(waitValues)
-                        .pSignalSemaphoreValues(stack.longs(signal));
-                VkSubmitInfo info = VkSubmitInfo.calloc(stack)
-                        .sType$Default()
-                        .pNext(timelineInfo.address())
-                        .waitSemaphoreCount(waitCount)
-                        .pWaitSemaphores(waitSemaphores)
-                        .pWaitDstStageMask(waitStages)
-                        .pCommandBuffers(stack.pointers(b.commandBuffer()))
-                        .pSignalSemaphores(stack.longs(timeline));
-                context.submit(info, VK_NULL_HANDLE);
-            }
+            submitBatchLocked(b, signal, selfWait);
         } catch (RuntimeException e) {
             recycleUnsubmitted(b, e);
             throw e;
@@ -858,6 +1166,64 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         inFlight.addLast(b);
         submittedValue = signal;
         submitPolicy.onSubmit();
+    }
+
+    /**
+     * Submits an ended batch, signalling {@code signal}: the batch's recorded cross-queue waits, and
+     * {@code selfWaitValue} on this queue's own timeline when it is still pending (0 for none), so the
+     * batch executes after that timeline point's work.
+     */
+    private void submitBatchLocked(VkCommandBatch b, long signal, long selfWaitValue) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkComputeQueue[] producers = b.waitProducers();
+            long[] values = b.waitValues();
+            LongBuffer waitSemaphores = stack.mallocLong(producers.length + 1);
+            LongBuffer waitValues = stack.mallocLong(producers.length + 1);
+            int waitCount = 0;
+            for (int i = 0; i < producers.length; i++) {
+                if (values[i] <= producers[i].completedValue) {
+                    continue;
+                }
+                if (producers[i].closed) {
+                    throw new IllegalStateException("wait on timeline value " + values[i] + " of " + producers[i]
+                            + ", which closed without reaching it");
+                }
+                waitSemaphores.put(waitCount, producers[i].timeline);
+                waitValues.put(waitCount, values[i]);
+                waitCount++;
+            }
+            if (selfWaitValue > completedValue) {
+                waitSemaphores.put(waitCount, timeline);
+                waitValues.put(waitCount, selfWaitValue);
+                waitCount++;
+            }
+            IntBuffer waitStages = null;
+            if (waitCount > 0) {
+                waitSemaphores.limit(waitCount);
+                waitValues.limit(waitCount);
+                waitStages = stack.mallocInt(waitCount);
+                for (int i = 0; i < waitCount; i++) {
+                    waitStages.put(i, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                }
+            } else {
+                waitSemaphores = null;
+                waitValues = null;
+            }
+            VkTimelineSemaphoreSubmitInfo timelineInfo = VkTimelineSemaphoreSubmitInfo.calloc(stack)
+                    .sType$Default()
+                    .waitSemaphoreValueCount(waitCount)
+                    .pWaitSemaphoreValues(waitValues)
+                    .pSignalSemaphoreValues(stack.longs(signal));
+            VkSubmitInfo info = VkSubmitInfo.calloc(stack)
+                    .sType$Default()
+                    .pNext(timelineInfo.address())
+                    .waitSemaphoreCount(waitCount)
+                    .pWaitSemaphores(waitSemaphores)
+                    .pWaitDstStageMask(waitStages)
+                    .pCommandBuffers(stack.pointers(b.commandBuffer()))
+                    .pSignalSemaphores(stack.longs(timeline));
+            context.submit(info, VK_NULL_HANDLE);
+        }
     }
 
     /** Returns a batch whose submission failed to the free list; its readbacks never complete. */
@@ -871,14 +1237,15 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             allBatches.remove(b);
             step(() -> strategy.destroy(b.descriptorFrame()), null);
             b.close();
-            freeCommandBuffer(b.commandBuffer());
+            VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer());
         }
     }
 
     /**
-     * Retires every in-flight batch whose value is at most {@code value} (which the timeline has
-     * reached): copies out its readbacks, resets its descriptor frame and command buffer, and
-     * reclaims the staging space of every batch up to {@code value}.
+     * Retires every in-flight batch and replay submission whose value is at most {@code value} (which
+     * the timeline has reached): copies out its readbacks, resets its descriptor frame and command
+     * buffer, and reclaims the staging space of every submission up to {@code value}. A captured
+     * command graph's batch stays recorded for its replays; only its submissions retire here.
      */
     private void retireUpTo(long value) {
         while (!inFlight.isEmpty() && inFlight.peekFirst().signalValue() <= value) {
@@ -894,10 +1261,15 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
                 allBatches.remove(b);
                 step(() -> strategy.destroy(b.descriptorFrame()), null);
                 b.close();
-                freeCommandBuffer(b.commandBuffer());
+                VkQueueResources.freeCommandBuffer(device, commandPool, b.commandBuffer());
                 throw e;
             }
         }
+        while (!replaySignals.isEmpty() && replaySignals.peekFirst() <= value) {
+            replaySignals.pollFirst();
+        }
+        // a later batch must wait on the last submitted replay still outstanding, not only on the earliest
+        pendingReplaySignal = replaySignals.isEmpty() ? 0 : replaySignals.peekLast();
         if (value > completedValue) {
             completedValue = value;
         }
@@ -914,44 +1286,6 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     // ------------------------------------------------------------------ waits
-
-    /**
-     * Checks every wait is an open event of this backend.
-     *
-     * @throws IllegalArgumentException for a null, foreign or closed event
-     */
-    private void validateWaits(GpuEvent[] waits) {
-        if (waits == null) {
-            return;
-        }
-        for (int i = 0; i < waits.length; i++) {
-            GpuEvent e = waits[i];
-            if (!(e instanceof VkGpuEvent)) {
-                throw new IllegalArgumentException("wait event " + i + " is not a Vulkan event of this backend: "
-                        + (e == null ? "null" : e.getClass().getName()));
-            }
-            VkGpuEvent event = (VkGpuEvent) e;
-            if (event.owner().backend() != backend) {
-                throw new IllegalArgumentException("wait event " + i + " belongs to another Vulkan backend");
-            }
-            if (event.isClosed()) {
-                throw new IllegalArgumentException("wait event " + i + " was already closed");
-            }
-        }
-    }
-
-    /** Submits the producer batches of other queues' events; runs without this queue's monitor. */
-    private void flushProducers(GpuEvent[] waits) {
-        if (waits == null) {
-            return;
-        }
-        for (GpuEvent e : waits) {
-            VkGpuEvent event = (VkGpuEvent) e;
-            if (event.owner() != this) {
-                event.owner().flushIfPending(event.value());
-            }
-        }
-    }
 
     /**
      * Adds a timeline wait for each event of another queue that has not completed; the batch recorded
@@ -1006,39 +1340,6 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         }
     }
 
-    private void waitTimeline(long value) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkSemaphoreWaitInfo info = waitInfo(stack, value);
-            VkErrors.check(vkWaitSemaphores(device, info, INFINITE_TIMEOUT), "vkWaitSemaphores");
-        }
-    }
-
-    private void waitTimelineInterruptibly(long value) throws InterruptedException {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkSemaphoreWaitInfo info = waitInfo(stack, value);
-            while (true) {
-                int result = vkWaitSemaphores(device, info, INTERRUPT_POLL_NANOS);
-                if (result == VK_SUCCESS) {
-                    return;
-                }
-                if (result != VK_TIMEOUT) {
-                    throw VkErrors.translate(result, "vkWaitSemaphores on " + this);
-                }
-                if (Thread.interrupted()) {
-                    throw new InterruptedException("interrupted while waiting for Vulkan timeline value " + value);
-                }
-            }
-        }
-    }
-
-    private VkSemaphoreWaitInfo waitInfo(MemoryStack stack, long value) {
-        return VkSemaphoreWaitInfo.calloc(stack)
-                .sType$Default()
-                .semaphoreCount(1)
-                .pSemaphores(stack.longs(timeline))
-                .pValues(stack.longs(value));
-    }
-
     /**
      * True when the device has finished every submitted batch; polls the timeline when needed and
      * retires the batches that completed. Caller holds the monitor.
@@ -1047,17 +1348,11 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         if (submittedValue <= completedValue) {
             return true;
         }
-        long reached = counterValue();
+        long reached = VkTimelineWait.counter(device, timeline);
         if (reached > completedValue) {
             retireUpTo(Math.min(reached, submittedValue));
         }
         return reached >= submittedValue;
-    }
-
-    private long counterValue() {
-        long[] out = new long[1];
-        VkErrors.check(vkGetSemaphoreCounterValue(device, timeline, out), "vkGetSemaphoreCounterValue");
-        return out[0];
     }
 
     // ------------------------------------------------------------------ helpers
@@ -1090,74 +1385,6 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         }
     }
 
-    private VkCommandBuffer allocateCommandBuffer() {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkCommandBufferAllocateInfo info = VkCommandBufferAllocateInfo.calloc(stack)
-                    .sType$Default()
-                    .commandPool(commandPool)
-                    .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-                    .commandBufferCount(1);
-            PointerBuffer handle = stack.mallocPointer(1);
-            VkErrors.check(vkAllocateCommandBuffers(device, info, handle), "vkAllocateCommandBuffers");
-            return new VkCommandBuffer(handle.get(0), device);
-        }
-    }
-
-    private void freeCommandBuffer(VkCommandBuffer cb) {
-        vkFreeCommandBuffers(device, commandPool, cb);
-    }
-
-    private VkGpuBuffer ownBuffer(GpuBuffer buffer, String role) {
-        if (!(buffer instanceof VkGpuBuffer)) {
-            throw new IllegalArgumentException(role + " is not a Vulkan buffer: "
-                    + (buffer == null ? "null" : buffer.getClass().getName()));
-        }
-        VkGpuBuffer vk = (VkGpuBuffer) buffer;
-        if (vk.owner() != allocator) {
-            throw new IllegalArgumentException(role + " " + vk + " belongs to another Vulkan backend");
-        }
-        if (vk.isClosed()) {
-            throw new IllegalArgumentException(role + " " + vk + " is closed");
-        }
-        return vk;
-    }
-
-    private VkKernelHandle ownHandle(KernelHandle kernel) {
-        if (!(kernel instanceof VkKernelHandle)) {
-            throw new IllegalArgumentException("kernel must be a VkKernelHandle, got "
-                    + (kernel == null ? "null" : kernel.getClass().getName()));
-        }
-        VkKernelHandle handle = (VkKernelHandle) kernel;
-        if (handle.program().descriptorStrategy() != strategy) {
-            throw new IllegalArgumentException("Vulkan kernel " + handle.kernelName() + " belongs to another backend");
-        }
-        if (handle.isClosed()) {
-            throw new IllegalStateException("Vulkan kernel " + handle.kernelName() + " was used after it was closed");
-        }
-        return handle;
-    }
-
-    private static void requireRange(VkGpuBuffer buffer, long offset, long size, String role) {
-        if (offset < 0 || size < 0 || offset > buffer.sizeInBytes() - size) {
-            throw new IllegalArgumentException(role + " range [" + offset + ", " + (offset + size)
-                    + ") is outside the buffer of " + buffer.sizeInBytes() + " bytes");
-        }
-    }
-
-    private static void requireWithin(long size, long available, String what) {
-        if (size < 0 || size > available) {
-            throw new IllegalArgumentException("transfer of " + size + " bytes does not fit the " + available
-                    + "-byte " + what);
-        }
-    }
-
-    private static void requireFloatSized(long size, int floats, String what) {
-        if (size < 0 || (size & 3) != 0 || size > (long) floats * Float.BYTES) {
-            throw new IllegalArgumentException("float transfer of " + size + " bytes must be a non-negative multiple"
-                    + " of 4 within the " + floats + "-float " + what);
-        }
-    }
-
     /**
      * Checks this queue and its backend are open.
      *
@@ -1169,33 +1396,6 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         }
         if (backend.isClosed()) {
             throw new IllegalStateException("VkComputeBackend already closed");
-        }
-    }
-
-    private static long createCommandPool(VkDevice device, int family) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkCommandPoolCreateInfo info = VkCommandPoolCreateInfo.calloc(stack)
-                    .sType$Default()
-                    .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
-                    .queueFamilyIndex(family);
-            LongBuffer pool = stack.mallocLong(1);
-            VkErrors.check(vkCreateCommandPool(device, info, null, pool), "vkCreateCommandPool");
-            return pool.get(0);
-        }
-    }
-
-    private static long createTimeline(VkDevice device) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkSemaphoreTypeCreateInfo type = VkSemaphoreTypeCreateInfo.calloc(stack)
-                    .sType$Default()
-                    .semaphoreType(VK_SEMAPHORE_TYPE_TIMELINE)
-                    .initialValue(0);
-            VkSemaphoreCreateInfo info = VkSemaphoreCreateInfo.calloc(stack)
-                    .sType$Default()
-                    .pNext(type.address());
-            LongBuffer semaphore = stack.mallocLong(1);
-            VkErrors.check(vkCreateSemaphore(device, info, null, semaphore), "vkCreateSemaphore(timeline)");
-            return semaphore.get(0);
         }
     }
 

@@ -1,6 +1,6 @@
 # NeuralFree
 
-NeuralFree is a hardware-accelerated deep learning library written in Java. It runs GGUF language models and trains models of its own on OpenCL, CUDA and Vulkan GPUs, with CPU fallbacks, without Python or native ML libraries. It also opens Hugging Face checkpoints (safetensors) directly, with no Python and no conversion step.
+NeuralFree is a hardware-accelerated deep learning library written in Java. It runs GGUF language models and trains models of its own on OpenCL, CUDA, Vulkan and HIP GPUs, with CPU fallbacks, without Python or native ML libraries. It also opens Hugging Face checkpoints (safetensors) directly, with no Python and no conversion step.
 
 It has two parts:
 
@@ -15,26 +15,27 @@ It has two parts:
    - N-dimensional tensors, reverse-mode autograd and a module system;
    - optimizers, a data pipeline, `Trainer` and `MixedPrecisionTrainer`;
    - classical ML, reinforcement learning, meta-learning and distributed training on the same tensors;
-   - the `train` GPU kernel library, built from one source set for OpenCL, CUDA and Vulkan, behind the `ComputeBackend` interface. On a backend that cannot run it, each op computes on the CPU.
+   - the `train` GPU kernel library, built from one source set for OpenCL, CUDA, Vulkan and HIP, behind the `ComputeBackend` interface. On a backend that cannot run it, each op computes on the CPU.
 
 ## Status
 
-The GGUF engine covers every architecture name llama.cpp defines (165 entries, including `(unknown)` and the `EAGLE` draft-class row). The arch registry (`ArchRegistry`) and its `ArchTable*` classes give the class and traits of each one. Of these:
-- 136 are generative models;
+The GGUF engine covers every architecture name llama.cpp defines (168, `(unknown)` included) plus 24 that NeuralFree defines itself, 192 entries in all: the EAGLE draft classes `eagle`, `eagle-cohere`, `eagle-llama4`, `eagle-minicpm` and `eagle-mistral-large3`, and its own layouts for families only vLLM runs (`opt`, `step1`, `step3text`, `step5`, `pangu-moe`, `hyperclovax`, `domyn-edge`, `rnj1`, `axk1`, `olmo-hybrid`, `zamba2`, `longcat-flash`, `longcat-flash-ngram`, `alice-ai`, `bailingmoe-v25`, `inkling`, `dory`, `iquest-loopcoder`, `interns1-pro`). The arch registry (`ArchRegistry`) and its `ArchTable*` classes give the class and traits of each one. Of these:
+- 160 are generative models;
 - the rest are embedding, classifier, diffusion, drafter, audio and encoder-decoder models;
-- three are refused: `clip`, `gptj` and `(unknown)`.
+- two are refused: `clip` and `(unknown)`.
 
 **How the engine was verified:**
 - the Java sources compile;
-- the GPU kernels compile with clang (OpenCL C 1.2), nvcc (PTX) and glslc with spirv-val (SPIR-V);
-- the code was traced against the llama.cpp sources.
+- the OpenCL, CUDA and Vulkan GPU kernels compile with clang (OpenCL C 1.2), nvcc (PTX) and glslc with spirv-val (SPIR-V);
+- the code was traced against the llama.cpp sources;
+- the automated GPU tests pass on real hardware: an NVIDIA GeForce RTX 5080 Laptop GPU through OpenCL and CUDA, and an Intel integrated GPU through Vulkan (the NVIDIA driver exposes no Vulkan device on that machine). They check the kernels against their CPU references and the engine paths against the host engine over synthetic models.
 
-It has not been validated by running models on GPU hardware. The limitations the code refuses explicitly are listed in [GAPS.md](GAPS.md).
+The engine has not been validated by running real production models end to end on GPU hardware; the GPU runs above are the automated test suite over synthetic models. HIP has been exercised only against a simulated device, not an AMD GPU.
 
 ## Features
 
 ### Training framework
-- **Backends.** OpenCL, CUDA and Vulkan behind `ComputeBackend`, with automatic device-first selection. Tensor, layer, loss, optimizer and classical-ML ops run the same `train` kernels on all three APIs, and tensors stay on the device between ops. Device results match the CPU reference within documented tolerance classes. On a backend where the `train` library is unavailable, each op takes its CPU reference path.
+- **Backends.** OpenCL, CUDA, Vulkan and HIP behind `ComputeBackend`, with automatic device-first selection. Tensor, layer, loss, optimizer and classical-ML ops run the same `train` kernels on all four APIs, and tensors stay on the device between ops. Device results match the CPU reference within documented tolerance classes. On a backend where the `train` library is unavailable, each op takes its CPU reference path.
 - **Tensors.** N-dimensional with broadcasting and strided views (reshape, transpose, permute, slice, expand). Ops compute in FLOAT32. INT32, INT64 and BOOL tensors carry indices, class targets and masks. `Tensor.to` converts FLOAT32 to and from FLOAT16, BFLOAT16, FLOAT64, INT32 and BOOL.
 - **Autograd.** Reverse-mode, recorded per thread, with:
   - `noGrad` and `enableGrad` scopes;
@@ -75,7 +76,7 @@ It has not been validated by running models on GPU hardware. The limitations the
 ### GGUF inference engine
 - **Model files and types:**
   - single-file and split (`-0000N-of-0000M`) GGUF files;
-  - 38 weight types run natively on the GPU — including the NF extension types F8_E4M3, F8_E5M2, F8_E4M3_B128, MXFP8, MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4 and FP4_BNB — the others are dequantized at upload;
+  - 42 weight types run natively on the GPU — including the ten NF extension types F8_E4M3, F8_E4M3_B128, F8_E4M3_B32, F8_E5M2, MXFP8, MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4 and FP4_BNB — the others are dequantized at upload;
   - the CPU engine runs the same types except Q8_K.
 - **Model classes:**
   - decoder-only text models, including mixture-of-experts, MLA, sparse-attention (DSA/MSA), recurrent (Mamba, RWKV) and hybrid linear-attention models;
@@ -84,27 +85,27 @@ It has not been validated by running models on GPU hardware. The limitations the
   - masked-diffusion models;
   - audio decoders.
 - **Caches:**
-  - nine KV cache types (`f32` to `q5_1`), with Hadamard rotation of quantized rows;
+  - fourteen KV cache types — `f32`, `f16`, `bf16`, the block types `q8_0` to `q5_1`, vLLM's `fp8_e4m3`/`fp8_e5m2`, and the per-token-head `fp8_per_token_head`, `int8_per_token_head` and `int4_per_token_head` — with Hadamard rotation of the quantized rows;
   - sliding-window rings;
   - prefix reuse, context shift, rollback and recurrent-state snapshots;
-  - paged KV memory for parallel sequences (`neuralfree.parallel`, `neuralfree.kv.paged`), property-gated and not yet the engine default; the CPU path batches over it (`ForwardBatch`) and the batch engine reuses prompt prefixes across requests (`PrefixCache`), the GPU path is pending.
+  - paged KV memory for parallel sequences (`neuralfree.parallel`, `neuralfree.kv.paged`), property-gated and not yet the engine default; the CPU and GPU paths batch over it (`ForwardBatch`, `CpuForwardBackend` and `GpuForwardBackend`), and the batch engine reuses prompt prefixes across requests (`PrefixCache`).
 - **Speculative decoding:**
   - built-in NextN/MTP heads;
   - MTP draft files;
   - separate draft models;
   - n-gram (simple, map, map-k4v, mod, cache) and suffix drafting from the prompt, with no draft file;
   - EAGLE-3 and EAGLE-1, the Gemma 4 assistant and DFlash drafters;
-  - programmatic verify modes (`SpeculativeDecoder.Builder.verifyMode`).
+  - match, rejection, block, FLy and synthetic verification (`--spec-verify`).
 - **Grammar-constrained generation** (`gguf/grammar`): GBNF grammars, JSON schemas, JSON objects, regexes, choices and structural tags compile into a sampler-chain stage (`ConstraintSpec`, `GrammarStage`, `StructuralTag`).
-- **Serving:** the batch engine (`gguf/engine/batch`) runs parallel requests over the paged memory with vLLM-style admission and recompute preemption, and `server/` exposes the OpenAI-compatible HTTP surface (`/v1/completions`, `/v1/chat/completions` with SSE, `n` choices, prompt arrays, tool calls, `response_format` and `structured_outputs`, `/v1/embeddings`, `/v1/rerank`, `/v1/models`), Anthropic's `/v1/messages` with tool use, llama.cpp's `/health`, `/props`, `/tokenize`, `/detokenize` and `/apply-template`, and API-key authentication. Reasoning and tool-call parsing takes vLLM's parser names.
+- **Serving:** the batch engine (`gguf/engine/batch`) runs parallel requests over the paged memory with vLLM-style admission and recompute preemption, and `server/` exposes the OpenAI-compatible HTTP surface (`/v1/completions`, `/v1/chat/completions` with SSE, `n` choices, prompt arrays, tool calls, `response_format` and `structured_outputs`, `/v1/embeddings`, `/v1/rerank`, `/v1/responses`, `/v1/models`), Anthropic's `/v1/messages` with tool use, llama.cpp's `/health`, `/props`, `/tokenize`, `/detokenize`, `/apply-template`, `/completion` and `/infill`, vLLM's scoring, pooling, slot, sleep and operational endpoints, `/tts`, API-key authentication, and a bundled browser chat UI. Reasoning and tool-call parsing takes vLLM's parser names.
 - **Hugging Face Hub download** (`--hf-repo`, `nftool download`), with the llama.cpp cache-root precedence and `HF_TOKEN` auth.
 - **PyTorch pickle checkpoints** (`.bin`/`.pt`/`.pth`) load through a restricted unpickler that refuses unsafe opcodes by name.
 - **Control vectors** applied at inference (`ops/heads/ControlVector`); `nftool cvector` trains them from prompt pairs over one loaded engine (`CvectorGenerator`).
 - **imatrix collection** (`nftool imatrix`): the CPU matmul inputs of a calibration run accumulate into llama.cpp imatrix files (`ImatrixCollector`, `quant/write/ImatrixFile` for the GGUF and legacy `.dat` forms).
-- **Session files** (`HeapModelMemory.saveSession`/`loadSession`): save and restore a decoding sequence — tokens, KV rows with their positions and the recurrent state — llama.cpp `llama_state_*` style.
+- **Session files** (`EngineModel.saveSession`/`loadSession`, on both the CPU and the GPU models): save and restore a decoding sequence — tokens, KV rows with their positions and the recurrent state — llama.cpp `llama_state_*` style; a file saved on the CPU loads on the device and back.
 - **Programmatic chat requests** (`gguf/chat`) and the `SequenceRun` per-sequence stepping API (`engine/SequenceRun`).
 - **LoRA adapters** on the CPU and the GPU.
-- **llama.cpp tokenizers** (SentencePiece, BPE with 63 pre-tokenizers, Unigram, WordPiece, RWKV, PLaMo) and Jinja chat templates.
+- **llama.cpp tokenizers** (SentencePiece, BPE with the 98 `tokenizer.ggml.pre` names llama.cpp defines, Unigram, WordPiece, RWKV, PLaMo) and Jinja chat templates.
 - **llama.cpp's sampler chain** and defaults.
 - **Context sizing:** the context is fitted to device memory automatically, and layer weights stream from host memory when VRAM is short.
 
@@ -122,9 +123,11 @@ The same engine opens a Hugging Face checkpoint directory (`config.json` plus `*
   | OpenCL | OpenCL 1.2 or newer | Nothing more | Work-groups of at least 256 items |
   | Vulkan | Vulkan 1.2 with timeline semaphores and a compute queue | 8-bit and 16-bit storage | Work-groups of at least 256 items |
   | CUDA | An NVIDIA driver | A device and driver the built modules cover; the default kernel build targets compute capability 7.5 and newer | The same as the GGUF kernels |
+  | HIP | The ROCm runtime (5.5 or newer) and the HIP JNI shim (`libhipshim.so`) | Code objects built with hipcc for the device's `gfx` target | The same |
 
 - **Optional build tools:**
   - `nvcc` from the CUDA Toolkit, for the CUDA kernels;
+  - `hipcc` from the ROCm toolkit, for the HIP code objects and the JNI shim;
   - `glslc` (or `glslangValidator`) with `spirv-dis`, `spirv-opt` and `spirv-val` from the Vulkan SDK, for the Vulkan kernels;
   - `clang`, for the OpenCL syntax check and to check and regenerate the kernel inventories (nvcc's preprocessor stands in when clang is missing).
 
@@ -132,6 +135,7 @@ The same engine opens a Hugging Face checkpoint directory (`config.json` plus `*
 
 OpenCL needs no build tool, because the driver compiles the kernel sources at run time. Each build tool serves both kernel libraries, `llm` and `train`:
 - **Without `nvcc`**, the build warns and builds no CUDA kernels. The CUDA backend then reports both libraries unavailable.
+- **Without `hipcc`**, the build warns and builds no HIP code objects or shim. The HIP backend then reports both libraries unavailable.
 - **Without a shader compiler or `spirv-dis`**, the build warns and builds no Vulkan kernels. The Vulkan backend then reports both libraries unavailable.
 - **Without `clang`**, the OpenCL syntax check is skipped and the inventory tasks use nvcc's preprocessor.
 - **Without `clang` and `nvcc`**, the build warns that the inventories' freshness was not checked. Both inventories (`kernels/llm/inventory.txt` and `kernels/train/inventory.txt`) are checked in, so the Vulkan backend still runs both libraries from the shaders the build compiled.
@@ -140,7 +144,7 @@ When a backend cannot run a library:
 - for the GGUF engine, AUTO skips that backend and uses the next one;
 - for the training framework, AUTO prefers a backend that runs the `train` kernels; on a backend that does not, every op takes its CPU path.
 
-To make a missing tool fail the build instead of warning, pass `-Pneuralfree.requireCuda=true` or `-Pneuralfree.requireShaders=true`. See [USAGE.md](USAGE.md#gpu-kernel-tools-all-optional).
+To make a missing tool fail the build instead of warning, pass `-Pneuralfree.requireCuda=true`, `-Pneuralfree.requireHip=true` or `-Pneuralfree.requireShaders=true`. See [USAGE.md](USAGE.md#gpu-kernel-tools-all-optional).
 
 ## Quick start
 
@@ -168,9 +172,9 @@ cd NeuralFree
 
 `./gradlew build` also runs the unit tests; tests that need a GPU API the machine lacks are skipped.
 
-**Backend selection.** AUTO chooses the device first, then tries Vulkan, CUDA and OpenCL on it, in that order by default. The property `neuralfree.device=<name substring>` picks the GPU, and `neuralfree.backend.order` changes the API order. The Gradle run tasks forward every `neuralfree.*` property given with `-P` or `-D` to the JVM.
-- **`runApp` and `runDemos`** choose AUTO among the backends that run the `train` kernels. To force an API, pass `-Pneuralfree.backend=opencl|cuda|vulkan`. `runDemos` also takes `--args="--backend auto|opencl|cuda|vulkan"`, which overrides the property.
-- **The GGUF engine** chooses AUTO among the backends that run the `llm` kernels. To force an API, pass `--backend opencl|cuda|vulkan|cpu`.
+**Backend selection.** AUTO chooses the device first, then tries Vulkan, CUDA, OpenCL and HIP on it, in that order by default. The property `neuralfree.device=<name substring>` picks the GPU, and `neuralfree.backend.order` changes the API order. The Gradle run tasks forward every `neuralfree.*` property given with `-P` or `-D` to the JVM.
+- **`runApp` and `runDemos`** choose AUTO among the backends that run the `train` kernels. To force an API, pass `-Pneuralfree.backend=opencl|cuda|vulkan|hip`. `runDemos` also takes `--args="--backend auto|opencl|cuda|vulkan|hip"`, which overrides the property.
+- **The GGUF engine** chooses AUTO among the backends that run the `llm` kernels. To force an API, pass `--backend opencl|cuda|vulkan|hip|cpu`.
 - **In code**, call `NeuralFree.createTrainingBackend(hw, mode)` for the framework. `NeuralFree.describeTrainKernels(backend)` reports whether the `train` kernels run on a backend, and why not when they do not.
 
 **Logging.** The run tasks log at INFO to the console through `src/main/config/log4j2.xml`. The library jar ships no logging configuration; an application that uses NeuralFree configures Log4j 2 itself, for example with `-Dlog4j2.configurationFile=<file>`.
@@ -240,7 +244,7 @@ hw.shutdown();   // closes the backend and releases the devices
 
 ```
 com.eonmux.neuralfree
-├── acceleration/     GPU backends (backend/ocl, backend/cuda, backend/vulkan), device selection,
+├── acceleration/     GPU backends (backend/ocl, backend/cuda, backend/vulkan, backend/hip), device selection,
 │                     kernel libraries, memory pool, execution pipeline, kernel cache
 ├── tensor/           Tensor, Shape, TensorOps and the device dispatchers; tensor/gpu holds the
 │                     train-library runtime (TrainGpu, TrainOps)
@@ -306,7 +310,6 @@ The build writes the CUDA modules and the SPIR-V under `build/generated/gpu`, an
   - [Distributed training](TRAINING.md#distributed-training), [Reinforcement learning](TRAINING.md#reinforcement-learning) and [Meta-learning and distillation](TRAINING.md#meta-learning-and-distillation);
   - [Inference, quantization and export](TRAINING.md#inference-quantization-and-export) and [Classical ML](TRAINING.md#classical-ml-and-other-packages).
 - [LLM-INFERENCE.md](LLM-INFERENCE.md): the GGUF engine, covering model selection, backends, the programmatic API, weight types, tokenizers, sampling, memory and model modes.
-- [GAPS.md](GAPS.md): known limitations and defects.
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md): how to contribute and how to report a vulnerability.
 - [LICENSE](LICENSE), [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md), [NOTICE](NOTICE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md): the licence terms.
 

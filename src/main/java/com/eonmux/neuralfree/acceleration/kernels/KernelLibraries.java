@@ -9,9 +9,10 @@ import java.util.Objects;
  * Ids and default registrations of the built-in kernel libraries.
  *
  * <p>The LLM library ({@link #LLM}) keeps its dual-dialect sources and {@code manifest.txt} under
- * {@code kernels/llm}, the CUDA fatbins under {@code kernels/llm/cuda} and the SPIR-V modules under
- * {@code shaders/llm}. CUDA and Vulkan require the complete kernel inventory, so backend selection never
- * accepts a backend that would miss a kernel at the first layer.</p>
+ * {@code kernels/llm}, the CUDA fatbins under {@code kernels/llm/cuda}, the SPIR-V modules under
+ * {@code shaders/llm} and the Metal Shading Language kernels under {@code shaders/llm/metal}. CUDA, Vulkan
+ * and Metal require the complete kernel inventory, so backend selection never accepts a backend that would
+ * miss a kernel at the first layer.</p>
  *
  * <p>The training library ({@link #TRAIN}) uses the same layout under {@code kernels/train},
  * {@code kernels/train/cuda} and {@code shaders/train}, also requires its complete inventory, and has its own
@@ -43,9 +44,9 @@ public final class KernelLibraries {
     }
 
     /**
-     * Registers the OpenCL, CUDA and Vulkan libraries of {@link #LLM_CONFIG} and {@link #TRAIN_CONFIG} in
-     * the global registry, keeping any library already registered under the same id and backend type.
-     * Idempotent.
+     * Registers the OpenCL, CUDA, Vulkan, HIP and Metal libraries of {@link #LLM_CONFIG} and
+     * {@link #TRAIN_CONFIG} in the global registry, keeping any library already registered under
+     * the same id and backend type. Idempotent.
      */
     public static void ensureDefaults() {
         if (defaultsRegistered) {
@@ -58,6 +59,8 @@ public final class KernelLibraries {
                     r.registerIfAbsent(new OpenClKernelLibrary(config));
                     r.registerIfAbsent(new CudaKernelLibrary(config));
                     r.registerIfAbsent(new VulkanKernelLibrary(config));
+                    r.registerIfAbsent(new HipKernelLibrary(config));
+                    r.registerIfAbsent(new MetalKernelLibrary(config));
                 }
                 defaultsRegistered = true;
             }
@@ -65,8 +68,9 @@ public final class KernelLibraries {
     }
 
     /**
-     * Registers the OpenCL, CUDA and Vulkan libraries of a configuration in the global registry,
-     * replacing the libraries registered under the same id. Kernel sets opened afterwards use them.
+     * Registers the OpenCL, CUDA, Vulkan, HIP and Metal libraries of a configuration in the global
+     * registry, replacing the libraries registered under the same id. Kernel sets opened
+     * afterwards use them.
      *
      * @throws IllegalArgumentException when the id is already registered with another OpenCL source root
      *                                  (see {@link KernelLibraryRegistry#register}); nothing is replaced then
@@ -79,6 +83,8 @@ public final class KernelLibraries {
             r.register(new OpenClKernelLibrary(config));
             r.register(new CudaKernelLibrary(config));
             r.register(new VulkanKernelLibrary(config));
+            r.register(new HipKernelLibrary(config));
+            r.register(new MetalKernelLibrary(config));
         }
     }
 }

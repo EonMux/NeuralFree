@@ -1,0 +1,191 @@
+/* matmul_mmq.comp - int8 MMQ GEMM (prefill and batched decode) over the llama.cpp MMQ quant types,
+ * over the activations staged once per projection by quant_mmq.comp. GLSL twin of NF_MMQ_GEMM and
+ * NF_MMQ_GEMM_KSPLIT (kernels/llm/common/matmul_mmq_family.h, instantiated in
+ * kernels/llm/matmul_mmq.cl). Requires: common/nf_common.glsl, common/quant_mmq.glsl.
+ *
+ * A variants row selects QTYPE=QT_<T>; its kernel name is the OpenCL name, e.g.
+ *     Q4_K_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q4_K
+ *     Q4_K_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_K
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   plain:  (i M, i K, i N, i q_stride, i q_off, i y_stride, i y_off, R weight, R uint q8,
+ *            W float y)
+ *   ksplit: (i M, i K, i N, i q_stride, i q_off, i k_slice, R weight, R uint q8, W float partial)
+ *   y[y_off + t*y_stride + r] = sum_{k < K} W[r][k] * x[t][k],  r < M, t < N; the split-K twin
+ *   writes partial[(slice * N + t) * M + r] for k in slice * k_slice .. +k_slice, slice taken from
+ *   the work-group id, and LLM_SplitK_Reduce sums the planes into the output.
+ * A weight row holds K / MMQ_BS blocks of MMQ_BB bytes; the staged q8 records follow
+ * quant_mmq.comp (per token and K-step chunk: codes, chunk scale, 16-half code sums); q_stride is
+ * the record stride between tokens.
+ *
+ * The weight stays quantized: each stage (16 deep) stages the raw integer code of every tile
+ * element plus one (scale, offset) pair per weight row, and reads the staged codes, chunk scale and
+ * code sums of its tokens from q8, so the exact dot is d * (scale * sum(c*q) + offset * sum(q)) up
+ * to the 8-bit activation error of the staging pass. Codes and (scale, offset) come from
+ * mmq_code/mmq_scale/mmq_off (common/quant_mmq.glsl, the GLSL twins of the per-type macros of
+ * kernels/llm/matmul_mmq.cl, value = scale * code + offset); IQ types read their grids through the
+ * nf_iq* accessors, so main() fills the shared grid first.
+ *
+ * Tiling equals the C family's packed-dot path: a workgroup of 256 invocations computes 64 weight
+ * rows x 16 tokens in 16-deep stages; invocation lid owns rows tx + 16*i (i < 4) and the one token
+ * ty, tx = lid % 16, ty = lid / 16, and takes the integer dot products over its 4 rows. Rows past
+ * M and tokens past N contribute 0.
+ *
+ * Dispatch: 2-D (never folded), global = {ceil(M / 64) * 256, ceil(N / 16), 1}, local = {256, 1, 1}.
+ * Shared memory: 64*16 code ints and 2*64 scale floats.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#ifndef QTYPE
+#error "matmul_mmq.comp requires QTYPE"
+#endif
+
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfMmqStaged { uint q8_in[]; };
+#ifdef NF_SPLIT_K
+layout(std430, binding = 2) writeonly buffer NfMmqPartial { float partial_out[]; };
+layout(push_constant) uniform NfMmqParams {
+    int M; int K; int N; int q_stride; int q_off; int k_slice;
+} pc;
+#define NF_MMQ_OUT partial_out
+#else
+layout(std430, binding = 2) writeonly buffer NfMmqOutput { float y_out[]; };
+layout(push_constant) uniform NfMmqParams {
+    int M; int K; int N; int q_stride; int q_off; int y_stride; int y_off;
+} pc;
+#define NF_MMQ_OUT y_out
+#endif
+
+#include "common/quant_blocks.glsl"
+#include "common/iq_tables.glsl"
+#include "common/quant_legacy.glsl"
+#include "common/quant_k.glsl"
+#include "common/quant_mmq.glsl"
+
+#define NF_MMQ_TM 64                          /* weight rows per workgroup tile */
+#define NF_MMQ_TN 16                          /* tokens per workgroup tile */
+#define NF_MMQ_TK 16                          /* reduction depth of one stage */
+#define NF_MMQ_RM 4                           /* rows per invocation */
+#define NF_MMQ_TX (NF_MMQ_TM / NF_MMQ_RM)     /* 16 row lanes */
+#define NF_MMQ_QS (NF_MMQ_TK / 4)             /* code ints of one chunk record */
+#define NF_MMQ_RC (NF_MMQ_QS + 2 + NF_MMQ_TK / 16)
+
+shared int nf_mmq_w[NF_MMQ_TM * NF_MMQ_TK];
+shared float nf_mmq_ws[NF_MMQ_TM];
+shared float nf_mmq_wo[NF_MMQ_TM];
+
+/* The signed code in byte b of a staged code word. */
+int nf_mmq_q(uint word, uint b) {
+    const uint v = (word >> (8u * b)) & 0xFFu;
+    return int(v) - int((v & 0x80u) << 1u);
+}
+
+void main() {
+    nf_iq_init_shared();
+
+    const uint lid = gl_LocalInvocationID.x;
+    const int M = pc.M;
+    const int K = pc.K;
+    const int N = pc.N;
+#ifdef NF_SPLIT_K
+    const int rtiles = (M + NF_MMQ_TM - 1) / NF_MMQ_TM;
+    const int slice = int(gl_WorkGroupID.x) / rtiles;
+    const int m0 = (int(gl_WorkGroupID.x) - slice * rtiles) * NF_MMQ_TM;
+    const int kb = slice * pc.k_slice;
+    const int ke = min(kb + pc.k_slice, K);
+#else
+    const int m0 = int(gl_WorkGroupID.x) * NF_MMQ_TM;
+    const int kb = 0;
+    const int ke = K;
+#endif
+    const int n0 = int(gl_WorkGroupID.y) * NF_MMQ_TN;
+    const int tx = int(lid) % NF_MMQ_TX;
+    const int ty = int(lid) / NF_MMQ_TX;
+    const int tok = n0 + ty;
+    const bool tokok = tok < N;
+    const uint row_bytes = uint(K / MMQ_BS) * uint(MMQ_BB);
+
+    uint wrow[NF_MMQ_RM];
+    bool wok[NF_MMQ_RM];
+    for (int q = 0; q < NF_MMQ_RM; ++q) {
+        const int r = m0 + tx + NF_MMQ_TX * q;
+        wok[q] = r < M;
+        wrow[q] = wok[q] ? uint(r) * row_bytes : 0u;
+    }
+
+    float acc[NF_MMQ_RM];
+    for (int q = 0; q < NF_MMQ_RM; ++q) {
+        acc[q] = 0.0;
+    }
+
+    for (int k0 = kb; k0 < ke; k0 += NF_MMQ_TK) {
+        const int c = k0 / NF_MMQ_TK;
+        const uint blk = uint(k0 / MMQ_BS) * uint(MMQ_BB);
+        /* weight codes: depth lanes are the token lanes */
+        for (int q = 0; q < NF_MMQ_RM; ++q) {
+            nf_mmq_w[(tx + NF_MMQ_TX * q) * NF_MMQ_TK + ty] =
+                wok[q] ? mmq_code(NF_WS_A, wrow[q] + blk, uint(k0 + ty) % uint(MMQ_BS)) : 0;
+        }
+        /* per-row stage scale and offset: the ty < 4 invocations cover rows tx + 16*ty */
+        if (ty < NF_MMQ_TM / NF_MMQ_TN) {
+            const int sr = tx + NF_MMQ_TX * ty;
+            const bool sok = m0 + sr < M;
+            const uint sbp = (sok ? uint(m0 + sr) * row_bytes : 0u) + blk;
+            nf_mmq_ws[sr] = sok ? mmq_scale(NF_WS_A, sbp, k0) : 0.0;
+            nf_mmq_wo[sr] = sok ? mmq_off(NF_WS_A, sbp, k0) : 0.0;
+        }
+        barrier();
+        /* the token's staged codes, chunk scale and code sum (invocation-private) */
+        float xd = 0.0;
+        int xs = 0;
+        int zp = 0;
+        int xq[NF_MMQ_TK];
+        {
+            const uint rec = uint(pc.q_off) + (uint(tok) * uint(pc.q_stride) + uint(c)) * uint(NF_MMQ_RC);
+            for (int u = 0; u < NF_MMQ_QS; ++u) {
+                const uint word = tokok ? q8_in[rec + uint(u)] : 0u;
+                for (int b = 0; b < 4; ++b) {
+                    xq[4 * u + b] = nf_mmq_q(word, uint(b));
+                }
+            }
+            xd = tokok ? uintBitsToFloat(q8_in[rec + uint(NF_MMQ_QS)]) : 0.0;
+            xs = tokok ? int(q8_in[rec + uint(NF_MMQ_QS + 1)]) : 0;
+            /* the asymmetric int8 scheme's zero point (0 for every symmetric record) */
+            zp = tokok ? int(q8_in[rec + uint(NF_MMQ_RC - 1)]) : 0;
+        }
+        for (int q = 0; q < NF_MMQ_RM; ++q) {
+            const int sr = tx + NF_MMQ_TX * q;
+            int ib = 0;
+            int wsum = 0;
+            for (int kk = 0; kk < NF_MMQ_TK; ++kk) {
+                const int wc = nf_mmq_w[sr * NF_MMQ_TK + kk];
+                ib += wc * xq[kk];
+                wsum += wc;
+            }
+            acc[q] += xd * (nf_mmq_ws[sr] * float(ib) + nf_mmq_wo[sr] * float(xs)
+                    - float(zp) * (nf_mmq_ws[sr] * float(wsum) + nf_mmq_wo[sr] * float(NF_MMQ_TK)));
+        }
+        barrier();
+    }
+
+#ifdef NF_SPLIT_K
+    if (!tokok) {
+        return;
+    }
+    const uint ybase = (uint(slice) * uint(N) + uint(tok)) * uint(M);
+#else
+    if (!tokok) {
+        return;
+    }
+    const uint ybase = uint(pc.y_off) + uint(tok) * uint(pc.y_stride);
+#endif
+    for (int q = 0; q < NF_MMQ_RM; ++q) {
+        const int r = m0 + tx + NF_MMQ_TX * q;
+        if (r < M) {
+            NF_MMQ_OUT[ybase + uint(r)] = acc[q];
+        }
+    }
+}

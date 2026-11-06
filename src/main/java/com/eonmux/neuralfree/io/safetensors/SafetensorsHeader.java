@@ -28,7 +28,7 @@ import java.util.Objects;
  * object maps each tensor name to {@code {"dtype", "shape", "data_offsets": [begin, end]}} (offsets relative to the
  * data section at {@code 8 + n}) and the optional {@code "__metadata__"} entry holds string metadata. Immutable.
  *
- * <p>{@link #read} enforces, in order: the length field ({@code 2 <= n <= 100,000,000} and {@code 8 + n <= size});
+ * <p>{@link #read} and {@link #parse} enforce, in order: the length field ({@code 2 <= n <= 100,000,000} and {@code 8 + n <= size});
  * strict UTF-8 starting with {@code '{'} after whitespace; JSON under {@link Json.Limits#STRICT} (duplicate keys
  * rejected); string-valued metadata; exactly the three tensor fields; shapes of at most {@value #MAX_RANK} integer
  * dimensions in {@code [0, 2^53)} whose element count (checked multiplication) is a whole number of bytes; offsets
@@ -96,8 +96,42 @@ public final class SafetensorsHeader {
         long n = readLength(ch, path, size);
         byte[] bytes = new byte[(int) n];
         readFully(ch, ByteBuffer.wrap(bytes), LENGTH_FIELD_BYTES, path);
-        Map<?, ?> root = parseJson(bytes, path);
+        return fromHeaderBytes(bytes, n, size, path);
+    }
 
+    /**
+     * Parses and validates a header that was fetched apart from its data section, as a hub client that reads only
+     * the beginning of a remote shard does: {@code headerPrefix} is the {@value #LENGTH_FIELD_BYTES}-byte
+     * little-endian length field followed by exactly the {@code n} header bytes it announces, and {@code fileSize}
+     * is the size of the whole file the header belongs to. Every rule of {@link #read} applies, including the one
+     * that the data section ends exactly at {@code fileSize}.
+     *
+     * @throws IOException when the prefix violates a rule of the class description
+     */
+    public static SafetensorsHeader parse(byte[] headerPrefix, long fileSize, String path) throws IOException {
+        Objects.requireNonNull(headerPrefix, "headerPrefix");
+        Objects.requireNonNull(path, "path");
+        if (fileSize < 0) {
+            throw new IllegalArgumentException("the size of '" + path + "' must be known, got " + fileSize);
+        }
+        if (headerPrefix.length < LENGTH_FIELD_BYTES) {
+            throw invalid(path, "the fetched header has " + headerPrefix.length + " bytes, fewer than the "
+                    + LENGTH_FIELD_BYTES + "-byte header length field");
+        }
+        long n = ByteBuffer.wrap(headerPrefix, 0, LENGTH_FIELD_BYTES).order(ByteOrder.LITTLE_ENDIAN).getLong(0);
+        validateLength(n, fileSize, path);
+        if (n != headerPrefix.length - LENGTH_FIELD_BYTES) {
+            throw invalid(path, "the fetched header holds " + (headerPrefix.length - LENGTH_FIELD_BYTES)
+                    + " bytes after its length field, but the field announces " + n);
+        }
+        byte[] bytes = Arrays.copyOfRange(headerPrefix, LENGTH_FIELD_BYTES, headerPrefix.length);
+        return fromHeaderBytes(bytes, n, fileSize, path);
+    }
+
+    /** Validates the JSON bytes of a header of {@code n} bytes and returns the header. */
+    private static SafetensorsHeader fromHeaderBytes(byte[] bytes, long n, long size, String path)
+            throws IOException {
+        Map<?, ?> root = parseJson(bytes, path);
         Map<String, String> metadata = new LinkedHashMap<>();
         List<StTensor> tensors = new ArrayList<>(root.size());
         for (Map.Entry<?, ?> e : root.entrySet()) {
@@ -132,6 +166,12 @@ public final class SafetensorsHeader {
         ByteBuffer len = ByteBuffer.allocate(LENGTH_FIELD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
         readFully(ch, len, 0, path);
         long n = len.getLong(0);
+        validateLength(n, size, path);
+        return n;
+    }
+
+    /** The length-field rules: {@code 2 <= n <= 100,000,000} and {@code 8 + n <= size}. */
+    private static void validateLength(long n, long size, String path) throws IOException {
         if (n < 0 || n > MAX_HEADER_BYTES) {
             throw invalid(path, "header length " + Long.toUnsignedString(n) + " exceeds the limit of "
                     + MAX_HEADER_BYTES + " bytes");
@@ -142,7 +182,6 @@ public final class SafetensorsHeader {
         if (n > size - LENGTH_FIELD_BYTES) {
             throw invalid(path, "header length " + n + " exceeds the file size (" + size + " bytes)");
         }
-        return n;
     }
 
     private static Map<?, ?> parseJson(byte[] bytes, String path) throws IOException {

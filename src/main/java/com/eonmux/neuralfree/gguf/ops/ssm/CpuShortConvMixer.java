@@ -27,6 +27,7 @@ public final class CpuShortConvMixer implements CpuMixer {
     private final MixerKind kind;
 
     private CpuMatVec mv;
+    private CpuScratch scratch;
     private int ubatch;
     private int nEmbd;
     private int width;
@@ -37,6 +38,9 @@ public final class CpuShortConvMixer implements CpuMixer {
     private CpuProjectionDeltas.Site outDeltas;
     private float[] convW;
     private float[] convState;
+    /** Floats of one conv-state slot and the slots the memory keeps ({@code RecurrentStateAccessor}). */
+    private int convRow;
+    private int stateSlots;
     private float[] q;
     private float[] k;
     private float[] v;
@@ -70,7 +74,7 @@ public final class CpuShortConvMixer implements CpuMixer {
         SsmBlocks.checkKind(kind, layer);
         RecurrentSpec r = layer.recurrent();
         mv = ctx.matVec();
-        CpuScratch scratch = ctx.scratch();
+        scratch = ctx.scratch();
         ubatch = scratch.ubatch();
         nEmbd = r.nEmbd();
         width = r.lCache();
@@ -89,6 +93,8 @@ public final class CpuShortConvMixer implements CpuMixer {
             }
             SsmBlocks.stateFloats(state.tensors(), LayerMemoryPlan.STATE_CONV, (long) (width - 1) * nEmbd, layer);
             convState = state.tensor(LayerMemoryPlan.STATE_CONV);
+            convRow = state.slotFloats(LayerMemoryPlan.STATE_CONV);
+            stateSlots = state.slots();
         } else {
             SsmKernels.checkCenteredShape(nEmbd, width);
         }
@@ -118,38 +124,75 @@ public final class CpuShortConvMixer implements CpuMixer {
 
     @Override
     public void decode(int pos, float[] in, float[] out) {
-        forward(1, in, out);
+        forward(1, 0, 0, 0, in, out);
     }
 
     @Override
     public void prefill(int pos0, int n, float[] in, float[] out) {
-        forward(n, in, out);
+        forward(n, 0, 0, 0, in, out);
     }
 
-    private void forward(int t, float[] in, float[] out) {
+    /**
+     * One batched step over the rows of {@code s}: one segment runs whole ({@link #forward} at its sequence's state
+     * row), several segments run one at a time through a scratch relay, each with its own sequence's conv-state row.
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        if (s.nSeg() == 1) {
+            forward(s.nTokens(), 0, 0, s.seq(0), in, out);
+            return;
+        }
+        if (!bound || closed) {
+            throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
+        }
+        float[] buf = scratch.temp(TEMP_SEGMENT, Math.multiplyExact(ubatch, nEmbd));
+        float[] bufOut = scratch.temp(TEMP_SEGMENT_OUT, Math.multiplyExact(ubatch, nEmbd));
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            int len = s.len(seg);
+            System.arraycopy(in, start * nEmbd, buf, 0, len * nEmbd);
+            forward(len, 0, 0, s.seq(seg), buf, bufOut);
+            System.arraycopy(bufOut, 0, out, start * nEmbd, len * nEmbd);
+        }
+    }
+
+    private static final String TEMP_SEGMENT = "CpuShortConvMixer.segmentIn";
+    private static final String TEMP_SEGMENT_OUT = "CpuShortConvMixer.segmentOut";
+
+    /** The conv-state slot of {@code seq}, validated against the memory's slots. */
+    private int stateSlot(int seq) {
+        if (seq < 0 || seq >= stateSlots) {
+            throw new UnsupportedOperationException(kind + " mixer runs sequence " + seq + ", the memory keeps "
+                    + stateSlots + " state slots");
+        }
+        return seq;
+    }
+
+    private void forward(int t, int inOff, int outOff, int seq, float[] in, float[] out) {
         if (!bound || closed) {
             throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
         }
         if (t < 1 || t > ubatch) {
             throw new IllegalArgumentException(kind + " step of " + t + " tokens is outside [1, " + ubatch + "]");
         }
+        int base = kind == MixerKind.SHORTCONV ? stateSlot(seq) * convRow : 0;
         int n = t * nEmbd;
-        if (in.length < n || out.length < n) {
+        if (in.length < (long) inOff + n || out.length < (long) outOff + n) {
             throw new IllegalArgumentException(kind + " step of " + t + " tokens needs " + n
-                    + " floats of input and output");
+                    + " floats of input and output from the given offsets");
         }
         if (in == out || in == q || in == k || in == v || out == q || out == k || out == v) {
             throw new IllegalArgumentException(kind + " mixer input and output must be distinct caller arrays");
         }
-        mv.matmul(inProj, in, 0, q, 0, t);
-        inDeltas.applyRows(t, in, 0, q, 0);
+        mv.matmul(inProj, in, inOff, q, 0, t);
+        inDeltas.applyRows(t, in, inOff, q, 0);
         if (kind == MixerKind.SHORTCONV) {
-            CpuShortConv.gatedCausal(nEmbd, width, t, q, 0, 3 * nEmbd, convW, convState, 0, k, v, 0, nEmbd);
+            CpuShortConv.gatedCausal(nEmbd, width, t, q, 0, 3 * nEmbd, convW, convState, base, k, v, 0, nEmbd);
         } else {
             CpuShortConv.gatedCentered(nEmbd, width, t, q, 0, 3 * nEmbd, convW, k, v, 0, nEmbd);
         }
-        mv.matmul(outProj, v, 0, out, 0, t);
-        outDeltas.applyRows(t, v, 0, out, 0);
+        mv.matmul(outProj, v, 0, out, outOff, t);
+        outDeltas.applyRows(t, v, 0, out, outOff);
     }
 
     @Override

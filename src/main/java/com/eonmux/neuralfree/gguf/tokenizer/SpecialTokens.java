@@ -68,6 +68,12 @@ public final class SpecialTokens {
     private final int[] suppressTokens;
     private final int[] prefixIds;
     private final int[] suffixIds;
+    /**
+     * Tokens the chat autoparser's analysis preserves: marker texts that name one vocabulary token each. They are
+     * split out of the text as tokens when special tokens are parsed, like the vocabulary's own special tokens,
+     * although the vocabulary does not mark them special.
+     */
+    private final Set<Integer> preservedIds;
     /** True when a partition token is {@link TokenizerVocab#ATTR_NORMALIZED}. */
     private final boolean normalizedTokens;
     /**
@@ -77,6 +83,10 @@ public final class SpecialTokens {
     private final String[] normalizedTexts;
 
     private SpecialTokens(SpecialTokenRules.Result r) {
+        this(r, Collections.<String>emptyList());
+    }
+
+    private SpecialTokens(SpecialTokenRules.Result r, List<String> preserved) {
         this.vocab = r.vocab;
         this.bos = r.ids[SpecialTokenRules.BOS];
         this.eos = r.ids[SpecialTokenRules.EOS];
@@ -94,7 +104,15 @@ public final class SpecialTokens {
         this.fimSep = r.ids[SpecialTokenRules.FIM_SEP];
         this.attrs = r.attrs;
         this.eogIds = Collections.unmodifiableSet(new LinkedHashSet<>(r.eog));
-        this.partitionOrder = r.partitionOrder;
+        Set<Integer> preservedIds = new LinkedHashSet<>();
+        for (String marker : preserved) {
+            int id = marker == null || marker.isEmpty() ? -1 : r.vocab.tokenId(marker);
+            if (id >= 0 && marker.equals(r.vocab.text(id))) {
+                preservedIds.add(id);
+            }
+        }
+        this.preservedIds = Collections.unmodifiableSet(preservedIds);
+        this.partitionOrder = mergePartitionOrder(r.partitionOrder, preservedIds, r.vocab);
         this.suppressTokens = r.suppressTokens;
         this.prefixIds = r.vocab.prefixIds();
         this.suffixIds = r.vocab.suffixIds();
@@ -102,6 +120,29 @@ public final class SpecialTokens {
         for (int id : partitionOrder) normalized |= (attrs[id] & TokenizerVocab.ATTR_NORMALIZED) != 0;
         this.normalizedTokens = normalized;
         this.normalizedTexts = normalized && !r.vocab.normalizer().isIdentity() ? normalizedTexts(r.vocab) : null;
+    }
+
+    /**
+     * {@code order} with the preserved ids merged in, longest token text first as llama.cpp's partition order.
+     * Duplicates are dropped, so a preserved marker the vocabulary already marks special keeps its place.
+     */
+    private static int[] mergePartitionOrder(int[] order, Set<Integer> preserved, TokenizerVocab vocab) {
+        if (preserved.isEmpty()) {
+            return order;
+        }
+        LinkedHashSet<Integer> merged = new LinkedHashSet<>();
+        for (int id : order) {
+            merged.add(id);
+        }
+        merged.addAll(preserved);
+        List<Integer> ids = new ArrayList<>(merged);
+        Collections.sort(ids, (a, b) -> Integer.compare(SpecialTokenRules.utf8Length(vocab.text(b)),
+                SpecialTokenRules.utf8Length(vocab.text(a))));
+        int[] out = new int[ids.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = ids.get(i);
+        }
+        return out;
     }
 
     private String[] normalizedTexts(TokenizerVocab v) {
@@ -114,8 +155,18 @@ public final class SpecialTokens {
 
     /** Builds the special-token view of a vocabulary. */
     public static SpecialTokens of(TokenizerVocab vocab) {
+        return of(vocab, Collections.<String>emptyList());
+    }
+
+    /**
+     * {@link #of(TokenizerVocab)} with {@code preserved} marker texts split out as tokens: each marker that names
+     * exactly one vocabulary token joins the partition order, so encoding parses it as that token (the chat
+     * autoparser's preserved markers, llama.cpp's {@code common_sampling_add_preserved_tokens} resolution).
+     */
+    public static SpecialTokens of(TokenizerVocab vocab, List<String> preserved) {
         if (vocab == null) throw new IllegalArgumentException("vocabulary is null");
-        return new SpecialTokens(SpecialTokenRules.resolve(vocab));
+        return new SpecialTokens(SpecialTokenRules.resolve(vocab),
+                preserved == null ? Collections.<String>emptyList() : preserved);
     }
 
     public int bos() { return bos; }
@@ -231,7 +282,7 @@ public final class SpecialTokens {
         boolean normalizedText = normalizedPhase && normalize && normalizedTexts != null;
         List<Fragment> current = fragments;
         for (int id : partitionOrder) {
-            if (!parseSpecial && (attrs[id] & HIDDEN_ATTRS) != 0) continue;
+            if (!parseSpecial && ((attrs[id] & HIDDEN_ATTRS) != 0 || preservedIds.contains(id))) continue;
             if (((attrs[id] & TokenizerVocab.ATTR_NORMALIZED) != 0) != normalizedPhase) continue;
             String special = normalizedText ? normalizedTexts[id] : vocab.text(id);
             if (special.isEmpty()) continue;
@@ -337,6 +388,9 @@ public final class SpecialTokens {
 
     /** The special-token ids in partition order (longest text first); a copy. */
     public int[] partitionOrder() { return partitionOrder.clone(); }
+
+    /** The autoparser-preserved token ids, in marker order. */
+    public Set<Integer> preservedIds() { return preservedIds; }
 
     private static int require(int id, String what) {
         if (id == NULL) {

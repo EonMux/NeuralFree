@@ -10,7 +10,8 @@ import java.util.Map;
 
 /**
  * Block geometry of every ggml storage type: elements and bytes per block, plus the byte offset of
- * every field inside each block struct of llama.cpp ggml/src/ggml-common.h (lines 178-459) and of the
+ * every field inside each block struct of llama.cpp ggml/src/ggml-common.h (lines 178-459), the
+ * ik_llama.cpp-family blocks IQ3_K / IQ3_KS of Avalon ggml/src/ggml-common.h (lines 466-486) and of the
  * NeuralFree extension blocks ({@link GGMLType#isExtension()}). The field offsets are the single source of
  * truth for the CPU decoders and the CPU vec-dot kernels.
  * <p>
@@ -40,6 +41,8 @@ public final class BlockLayout {
     public static final int QK_F8_E4M3 = 32;
     /** Elements per F8_E4M3_B128 block. */
     public static final int QK_F8B128 = 128;
+    /** Elements per F8_E4M3_B32 block. */
+    public static final int QK_F8B32 = 32;
     /** Elements per MXFP8 block (one E8M0 scale). */
     public static final int QK_MXFP8 = 32;
     /** Elements per I8_B128 block. */
@@ -105,19 +108,29 @@ public final class BlockLayout {
     public static final int IQ1_S_D = 0, IQ1_S_QS = 2, IQ1_S_QH = 34, IQ1_S_BYTES = 50;
     // block_iq1_m {u8 qs[32]; u8 qh[16]; u8 scales[8]} (llama.cpp ggml-common.h:433-437)
     public static final int IQ1_M_QS = 0, IQ1_M_QH = 32, IQ1_M_SCALES = 48, IQ1_M_BYTES = 56;
+    // block_iq3_k {half d; u16 extra; u16 scales_h; u8 scales_l[8]; u8 qs[64]; u8 qh[32]}
+    // (Avalon ggml/src/ggml-common.h:466-473)
+    public static final int IQ3_K_D = 0, IQ3_K_EXTRA = 2, IQ3_K_SCALES_H = 4, IQ3_K_SCALES_L = 6,
+            IQ3_K_QS = 14, IQ3_K_QH = 78, IQ3_K_BYTES = 110;
+    // block_iq3_ks {half d; u16 extra; u8 scales[4]; u8 qs[64]; u8 qh[32]}
+    // (Avalon ggml/src/ggml-common.h:479-486)
+    public static final int IQ3_KS_D = 0, IQ3_KS_EXTRA = 2, IQ3_KS_SCALES = 4, IQ3_KS_QS = 8, IQ3_KS_QH = 72,
+            IQ3_KS_BYTES = 104;
     // block_iq4_nl {half d; u8 qs[16]} (llama.cpp ggml-common.h:447-451)
     public static final int IQ4_NL_D = 0, IQ4_NL_QS = 2, IQ4_NL_BYTES = 18;
     // block_iq4_xs {half d; u16 scales_h; u8 scales_l[4]; u8 qs[128]} (llama.cpp ggml-common.h:454-459)
     public static final int IQ4_XS_D = 0, IQ4_XS_SCALES_H = 2, IQ4_XS_SCALES_L = 4, IQ4_XS_QS = 8,
             IQ4_XS_BYTES = 136;
 
-    // NeuralFree extension blocks (GGMLType ids 1000-1008).
+    // NeuralFree extension blocks (GGMLType ids 1000-1009).
     // F8_E4M3 {u8 qs[32]}: E4M3FN codes, the scale lives in the tensor's .scale sibling
     public static final int F8_E4M3_QS = 0, F8_E4M3_BYTES = 32;
     // F8_E5M2 {u8 qs[32]}: E5M2 codes (IEEE half high bytes), the scale lives in the tensor's .scale sibling
     public static final int F8_E5M2_QS = 0, F8_E5M2_BYTES = 32;
     // F8_E4M3_B128 {float d; u8 qs[128]}: E4M3FN codes times d
     public static final int F8B128_D = 0, F8B128_QS = 4, F8B128_BYTES = 132;
+    // F8_E4M3_B32 {float d; u8 qs[32]}: E4M3FN codes times d
+    public static final int F8B32_D = 0, F8B32_QS = 4, F8B32_BYTES = 36;
     // MXFP8 {u8 e; u8 qs[32]}: E4M3FN codes times the E8M0 scale 2^(e-127)
     public static final int MXFP8_E = 0, MXFP8_QS = 1, MXFP8_BYTES = 33;
     // MXFP6_E3M2 and MXFP6_E2M3 {u8 e; u8 qs[24]}: 32 packed 6-bit codes, element j = code j

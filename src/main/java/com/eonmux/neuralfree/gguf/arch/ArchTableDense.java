@@ -3,9 +3,11 @@ package com.eonmux.neuralfree.gguf.arch;
 import com.eonmux.neuralfree.gguf.hparams.MropeTextPositions;
 import com.eonmux.neuralfree.gguf.hparams.hooks.DenseHooks;
 import com.eonmux.neuralfree.gguf.hparams.hooks.DenseHooksModern;
+import com.eonmux.neuralfree.gguf.hparams.hooks.DenseHooksRepeat;
 import com.eonmux.neuralfree.gguf.hparams.hooks.DenseHooksSwa;
 import com.eonmux.neuralfree.gguf.spec.req.DenseTensorRequirementsClassic;
 import com.eonmux.neuralfree.gguf.spec.req.DenseTensorRequirementsLlama;
+import com.eonmux.neuralfree.gguf.spec.req.DenseTensorRequirementsLoop;
 import com.eonmux.neuralfree.gguf.spec.req.DenseTensorRequirementsSandwich;
 
 import java.util.Arrays;
@@ -13,9 +15,10 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Architecture table for the plain decoder attention architectures: 62 generative
- * decoders with a standard KV cache, in llama.cpp {@code llm_arch} order. {@link ArchRegistry} merges this
- * table with the other tables; an architecture appears in exactly one table.
+ * Architecture table for the plain decoder attention architectures: 67 generative
+ * decoders with a standard KV cache, in llama.cpp {@code llm_arch} order followed by the vLLM-only
+ * {@link Arch#OPT} row. {@link ArchRegistry} merges this table with the other tables; an architecture appears in
+ * exactly one table.
  *
  * <p>Traits record the static facts of each llama.cpp graph (src/models/&lt;arch&gt;.cpp): RoPE type
  * ({@code llama_model_rope_type}, llama-model.cpp:3476-3674), norm kind, FFN activation and gating from the
@@ -40,6 +43,13 @@ public final class ArchTableDense {
                         DenseHooks::layerNormEps, DenseTensorRequirementsClassic.falcon()),
                 ArchEntry.of(layerNormGeluDecoder(Arch.GPT2, RopeType.NONE).build(),
                         DenseHooks::layerNormEps, DenseTensorRequirementsClassic.gpt2()),
+                ArchEntry.of(layerNormGeluDecoder(Arch.GPTJ, RopeType.NORM)
+                                .residualKind(ResidualKind.PARALLEL).build(),
+                        DenseHooks::layerNormEps, DenseTensorRequirementsClassic.gptj()),
+                // vLLM opt.py: learned positions (offset by two padding rows), no rotary, ReLU MLP. The 350M
+                // variant applies the block norms after the residual adds, which its converted tensor names select.
+                ArchEntry.of(layerNormGeluDecoder(Arch.OPT, RopeType.NONE).ffnAct(ActOp.RELU).build(),
+                        DenseHooks::layerNormEps, DenseTensorRequirementsClassic.opt()),
                 // Parallel residual is per file: ModelHparams.useParallelResidual() (gptneox.cpp:143).
                 ArchEntry.of(layerNormGeluDecoder(Arch.GPTNEOX, RopeType.NEOX).build(),
                         DenseHooks::gptneox, DenseTensorRequirementsClassic.gptneox()),
@@ -62,7 +72,7 @@ public final class ArchTableDense {
                 ArchEntry.of(decoder(Arch.QWEN2, RopeType.NEOX).build(),
                         DenseHooks::rmsEps, DenseTensorRequirementsLlama.qwen2()),
                 ArchEntry.of(decoder(Arch.QWEN2VL, RopeType.MROPE).build(),
-                        DenseHooksModern::qwen2vl, DenseTensorRequirementsLlama.qwen2()),
+                        DenseHooksModern::qwen2vl, DenseTensorRequirementsLlama.qwen2vl()),
                 // llama.cpp reports MROPE, but the graph rotates text with NEOX over head/2 and
                 // feeds text positions [t, 0, 0, 0] (sensenova-u1.cpp:12-18).
                 ArchEntry.of(decoder(Arch.SENSENOVA_U1, RopeType.NEOX).mropeTextPositions(MropeTextPositions.P000).build(),
@@ -89,7 +99,7 @@ public final class ArchTableDense {
                 ArchEntry.of(decoder(Arch.ORION, RopeType.NEOX).normKind(NormKind.LAYER).build(),
                         DenseHooks::layerNormEps, DenseTensorRequirementsClassic.orion()),
                 ArchEntry.of(decoder(Arch.INTERNLM2, RopeType.NORM).build(),
-                        DenseHooks::rmsEps, DenseTensorRequirementsClassic.llamaUntied()),
+                        DenseHooks::rmsEps, DenseTensorRequirementsClassic.internlm2()),
                 // Runs the Granite graph (models.h:1885): scaled residual branches and divided logits.
                 ArchEntry.of(decoder(Arch.MINICPM, RopeType.NORM).residualKind(ResidualKind.SCALED)
                                 .graphFamily(Arch.GRANITE).build(),
@@ -186,9 +196,42 @@ public final class ArchTableDense {
                         DenseHooksSwa::spark25, DenseTensorRequirementsLlama.spark25()),
                 ArchEntry.of(decoder(Arch.MAINCODER, RopeType.NORM).build(),
                         DenseHooks::rmsEps, DenseTensorRequirementsLlama.llamaQkNorm()),
+                // vLLM's Step1 decoder (step1.py): no rotary position; square-root ALiBi with per-head slopes over
+                // the full head, RMSNorm, gated SiLU FFN and optional projection biases.
+                ArchEntry.of(decoder(Arch.STEP1, RopeType.NONE).build(),
+                        DenseHooks::step1, DenseTensorRequirementsClassic.step1()),
                 // Weightless norms, embedding skip scaled by layer_output_scale, multiplied logits.
                 ArchEntry.of(decoder(Arch.TALKIE, RopeType.NEOX).build(),
-                        DenseHooks::talkie, DenseTensorRequirementsLlama.talkie())));
+                        DenseHooks::talkie, DenseTensorRequirementsLlama.talkie()),
+                // Value embeddings, exclusive self attention, per-head output gate, learned residual scales and
+                // MUDD cross-layer connections; SWA layers only rotate (limite.cpp:163-170).
+                ArchEntry.of(decoder(Arch.LIMITE, RopeType.NORM).build(),
+                        DenseHooksSwa::limite, DenseTensorRequirementsClassic.limite()),
+                // HyperCLOVAX (vLLM hyperclovax.py): Llama attention and SwiGLU with MuP embedding, residual and
+                // logit scales and the peri-layer post norms of each sub-layer output.
+                ArchEntry.of(decoder(Arch.HYPERCLOVAX, RopeType.NEOX).postNormRole(PostNormRole.SANDWICH)
+                                .residualKind(ResidualKind.SCALED).build(),
+                        DenseHooksModern::hyperclovax, DenseTensorRequirementsLlama.hyperclovax()),
+                // DomynEdge (vLLM domyn_edge.py): Qwen2 with sandwich norms, per-head Q/K RMS norms, per-layer RoPE
+                // and sliding-window switches and a per-layer head width resolved by the hparams hook.
+                ArchEntry.of(decoder(Arch.DOMYN_EDGE, RopeType.NEOX).postNormRole(PostNormRole.SANDWICH).build(),
+                        DenseHooksSwa::domynEdge, DenseTensorRequirementsLlama.domynEdge()),
+                // RNJ-1 (vLLM rnj1.py): the Gemma 3 block with Q/K head norms and sandwich norms, a gated
+                // tanh-GELU MLP, the sqrt(embedding_width) token scale and chunked local attention whose layers
+                // see their aligned chunk and the one before it.
+                ArchEntry.of(decoder(Arch.RNJ1, RopeType.NEOX).ffnAct(ActOp.GELU_TANH)
+                                .postNormRole(PostNormRole.SANDWICH).graphFamily(Arch.GEMMA3).build(),
+                        DenseHooksSwa::rnj1, DenseTensorRequirementsSandwich.rnj1()),
+                // DoryForCausalLM (dory.py): nGPT blocks with a justnorm residual helper, alternating attention-only
+                // and MLP-only blocks, the block [n_input, n_input + n_recurrent) repeated n_recurrent_loops times
+                // with one KV cache per pass and slerp residuals. Q/K are justnormed after RoPE and the branch
+                // outputs justnormed before their projection; the logits carry a per-vocabulary scale.
+                ArchEntry.of(decoder(Arch.DORY, RopeType.NEOX).residualKind(ResidualKind.SLERP).build(),
+                        DenseHooksRepeat::dory, DenseTensorRequirementsLoop.dory()),
+                // IQuestLoopCoder: a Llama block repeated loop_num times, later passes mixing a read-only global
+                // attention over the first pass's cache with a sliding-window local attention over their own cache.
+                ArchEntry.of(decoder(Arch.IQUEST_LOOPCODER, RopeType.NEOX).build(),
+                        DenseHooksRepeat::iquestLoopCoder, DenseTensorRequirementsLoop.iquestLoopCoder())));
     }
 
     /**

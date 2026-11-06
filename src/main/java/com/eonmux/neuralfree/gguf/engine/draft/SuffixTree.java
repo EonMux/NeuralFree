@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.engine.draft;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,14 +16,18 @@ import java.util.Objects;
  *
  * <p>Sequences are added incrementally ({@link #extend}): at each token the suffixes of length 1..{@link #maxDepth()}
  * that end at it are entered (the depth cap keeps each insert at {@code maxDepth} traversals). A sequence id can be
- * extended more than once with its appended tokens, which must arrive in order; {@link #dropSequence} forgets one, and
- * {@link #clear()} frees the whole tree. Sequence ids are caller-chosen ints ({@code >= 0}).
+ * extended more than once with its appended tokens, which must arrive in order. {@link #remove} takes a sequence's
+ * substrings back out of the tree (Arctic Inference's {@code SuffixTree::remove}, how its global cache evicts a
+ * request), {@link #dropSequence} only forgets its extension state, and {@link #clear()} frees the whole tree.
+ * Sequence ids are caller-chosen ints ({@code >= 0}).
  *
- * <p>{@link #speculate} matches the longest prefix of the given context that the tree contains — the tree's paths are
- * substrings, so any suffix of the context matches where a stored sequence contains it — then drafts the chain of its
- * most probable children (the chain speculation of the references' {@code speculate}, tree speculation off), scoring
- * each token by {@code child.count / parent continuation count}, bounded by the maximum speculation tokens and by
- * {@code maxSpecFactor * matchedLength + maxSpecOffset}.
+ * <p>{@link #speculate} follows the references' {@code speculate} with tree speculation off: for every suffix length
+ * of the context, shortest first, the context's suffix of that length is matched from the root (the tree's paths are
+ * substrings, so it matches where a stored sequence contains it) until one is not found; each matched suffix drafts the
+ * path of its most frequent children, each token carrying the running product of {@code child.count / node.count}
+ * and the path stopping once that product falls below {@code minTokenProb}, bounded by the maximum speculation tokens
+ * and by {@code maxSpecFactor * matchedLength + maxSpecOffset}. The draft with the highest score (the sum of its token
+ * probabilities) wins, a tie going to the longer match.
  */
 public final class SuffixTree {
 
@@ -43,7 +48,10 @@ public final class SuffixTree {
         /** The proposed token ids, in proposal order (empty when nothing was matched). */
         public int[] tokenIds() { return tokens; }
 
-        /** The estimated probability of each drafted token (parallel to {@link #tokenIds()}). */
+        /**
+         * The estimated probability of each drafted token, the running product of the path's child frequencies
+         * (parallel to {@link #tokenIds()}).
+         */
         public double[] probabilities() { return probabilities; }
 
         /** The sum of the drafted token probabilities. */
@@ -63,11 +71,25 @@ public final class SuffixTree {
         int count;
     }
 
-    /** The suffix positions of one stored sequence, so its next tokens extend, as llama.cpp's suffix states. */
+    /**
+     * The suffix positions of one stored sequence, so its next tokens extend, as llama.cpp's suffix states, and the
+     * sequence's tokens, so {@link #remove} can take its substrings back out.
+     */
     private static final class SuffixState {
         Node[] nodes = new Node[0];
+        int[] tokens = new int[16];
         int length;
+
+        void append(int token) {
+            if (length == tokens.length) {
+                tokens = Arrays.copyOf(tokens, tokens.length * 2);
+            }
+            tokens[length] = token;
+        }
     }
+
+    /** Absorbs the rounding of {@code matchedLength * maxSpecFactor + maxSpecOffset} before its floor. */
+    private static final double LENGTH_EPSILON = 1e-6;
 
     private final Node root = new Node();
     private final int maxDepth;
@@ -88,7 +110,7 @@ public final class SuffixTree {
         return maxDepth;
     }
 
-    /** Number of stored sequences (still tracked: removed states age out only via {@link #clear()}). */
+    /** Number of sequences the tree tracks (neither {@linkplain #remove removed} nor {@linkplain #dropSequence dropped}). */
     public int sequenceCount() {
         return sequences.size();
     }
@@ -119,6 +141,7 @@ public final class SuffixTree {
                 next[d] = childOf(state.nodes[d - 1], t);
             }
             state.nodes = next;
+            state.append(t);
             state.length++;
         }
     }
@@ -143,72 +166,117 @@ public final class SuffixTree {
         sequences.clear();
     }
 
-    /** Removes one sequence's suffix state: extension of an evicted sequence's id starts fresh. */
+    /**
+     * Forgets one sequence's extension state and leaves its substrings in the tree: extension of the id starts a
+     * fresh sequence.
+     */
     public void dropSequence(int sequenceId) {
         sequences.remove(sequenceId);
     }
 
     /**
-     * Drafts after the given context: the longest prefix of {@code pattern} that the tree contains is matched (the
-     * pattern is the caller's choice of suffix of the generation; a full pattern is the conventional
-     * {@code min(maxDepth, tokens)} tail), then its best child chain is drafted.
+     * Takes sequence {@code sequenceId} out of the tree: every substring it entered loses that occurrence, and a node
+     * left without occurrences is pruned with its subtree. Extension of the id afterwards starts a fresh sequence.
      *
-     * @param pattern        the context to match (a suffix of the token history)
+     * @return whether the tree tracked the sequence
+     */
+    public boolean remove(int sequenceId) {
+        SuffixState state = sequences.remove(sequenceId);
+        if (state == null) {
+            return false;
+        }
+        // extend entered, for each start s, the substrings tokens[s .. s + d) with d up to maxDepth
+        for (int s = 0; s < state.length; s++) {
+            Node node = root;
+            int depth = Math.min(maxDepth, state.length - s);
+            for (int d = 0; d < depth; d++) {
+                int token = state.tokens[s + d];
+                Node child = node.children.get(token);
+                if (child == null) {
+                    throw new IllegalStateException("suffix tree lost the substring of sequence " + sequenceId
+                            + " at " + s + " (+" + d + ")");
+                }
+                if (--child.count == 0) {
+                    // every deeper substring of this path occurs no more often than its prefix: all gone too
+                    node.children.remove(token);
+                    break;
+                }
+                node = child;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Drafts after the given context: every suffix of {@code pattern} the tree contains is matched, and the best of
+     * their drafts is returned (the empty draft, with a match length of 0, when not even the last token is known).
+     *
+     * @param pattern        the context to match (a suffix of the token history, typically its last
+     *                       {@link #maxDepth()} tokens)
      * @param maxSpecTokens  draft length cap ({@code max_spec_tokens}; 0 or negative keeps nothing)
      * @param maxSpecFactor  draft length factor against the matched length ({@code max_spec_factor})
      * @param maxSpecOffset  draft length offset added to the factor ({@code max_spec_offset})
-     * @param minTokenProb   smallest accepted child probability ({@code min_token_prob})
+     * @param minTokenProb   smallest accepted cumulative token probability ({@code min_token_prob})
      */
     public Draft speculate(int[] pattern, int maxSpecTokens, double maxSpecFactor, double maxSpecOffset,
                            double minTokenProb) {
         Objects.requireNonNull(pattern, "pattern");
-        Node node = root;
-        int matched = 0;
-        for (int token : pattern) {
-            Node child = node.children.get(token);
-            if (child == null) {
+        Draft best = new Draft(new int[0], new double[0], 0.0, 0);
+        for (int matchLength = 1; matchLength <= pattern.length; matchLength++) {
+            Node node = match(pattern, pattern.length - matchLength);
+            if (node == null) {
                 break;
             }
-            node = child;
-            matched++;
+            double budget = Math.floor(matchLength * maxSpecFactor + maxSpecOffset + LENGTH_EPSILON);
+            int maxTokens = (int) Math.max(0.0, Math.min(maxSpecTokens, budget));
+            Draft draft = speculatePath(node, matchLength, maxTokens, minTokenProb);
+            if (draft.score >= best.score) {
+                best = draft;
+            }
         }
-        if (matched == 0 || maxSpecTokens <= 0) {
-            return new Draft(new int[0], new double[0], 0.0, matched);
-        }
-        return speculateFrom(node, matched, maxSpecTokens, maxSpecFactor, maxSpecOffset, minTokenProb);
+        return best;
     }
 
-    private static Draft speculateFrom(Node node, int matched, int maxSpecTokens, double maxSpecFactor,
-                                       double maxSpecOffset, double minTokenProb) {
+    /** The node of {@code pattern[from ..]}, or null when the tree does not contain it. */
+    private Node match(int[] pattern, int from) {
+        Node node = root;
+        for (int i = from; i < pattern.length; i++) {
+            node = node.children.get(pattern[i]);
+            if (node == null) {
+                return null;
+            }
+        }
+        return node;
+    }
+
+    /** The path of most frequent children below {@code node}, as long as its running probability allows. */
+    private static Draft speculatePath(Node node, int matchLength, int maxTokens, double minTokenProb) {
         List<Integer> tokens = new ArrayList<>();
         List<Double> probs = new ArrayList<>();
         double score = 0.0;
-        while (!node.children.isEmpty()) {
-            if (tokens.size() >= maxSpecTokens
-                    || tokens.size() >= maxSpecFactor * matched + maxSpecOffset) {
-                break;
-            }
+        double prob = 1.0;
+        while (tokens.size() < maxTokens) {
+            int bestToken = -1;
             Node best = null;
-            for (Node child : node.children.values()) {
-                if (best == null || child.count > best.count) {
+            for (Map.Entry<Integer, Node> e : node.children.entrySet()) {
+                Node child = e.getValue();
+                if (best == null || child.count > best.count
+                        || (child.count == best.count && e.getKey() < bestToken)) {
                     best = child;
+                    bestToken = e.getKey();
                 }
             }
-            long continuation = 0;
-            for (Node child : node.children.values()) {
-                continuation += child.count;
+            if (best == null) {
+                break;
             }
-            double prob = (double) best.count / continuation;
+            prob *= (double) best.count / node.count;
             if (prob < minTokenProb) {
                 break;
             }
-            tokens.add(bestChildToken(node, best));
+            tokens.add(bestToken);
             probs.add(prob);
             score += prob;
             node = best;
-            if (tokens.size() >= Integer.MAX_VALUE / 2) {
-                break;
-            }
         }
         int[] t = new int[tokens.size()];
         double[] p = new double[probs.size()];
@@ -216,17 +284,7 @@ public final class SuffixTree {
             t[i] = tokens.get(i);
             p[i] = probs.get(i);
         }
-        return new Draft(t, p, score, matched);
-    }
-
-    /** The token id whose child node is {@code child} (counts are distinct enough to match it again). */
-    private static int bestChildToken(Node node, Node child) {
-        for (Map.Entry<Integer, Node> e : node.children.entrySet()) {
-            if (e.getValue() == child) {
-                return e.getKey();
-            }
-        }
-        throw new IllegalStateException("a child node disappeared from its parent");
+        return new Draft(t, p, score, matchLength);
     }
 
     @Override

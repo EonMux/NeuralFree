@@ -1,0 +1,9 @@
+{#- llama.cpp minicpm chat template (src/llama-chat.cpp:521-532): no generation prompt. -#}
+{%- for message in messages -%}
+    {%- set content = (message['content'] if message['content'] is string else '') | trim(' \t\n\v\f\r') -%}
+    {%- if message['role'] == 'user' -%}
+        {{- '<用户>' ~ content ~ '<AI>' -}}
+    {%- else -%}
+        {{- content -}}
+    {%- endif -%}
+{%- endfor -%}

@@ -6,9 +6,13 @@ import com.eonmux.neuralfree.gguf.arch.AttnGateKind;
 import com.eonmux.neuralfree.gguf.arch.GatingFunc;
 import com.eonmux.neuralfree.gguf.arch.MemoryKind;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
+import com.eonmux.neuralfree.gguf.arch.NormKind;
+import com.eonmux.neuralfree.gguf.arch.QkNormKind;
+import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
+import com.eonmux.neuralfree.gguf.spec.DualChunkSpec;
 import com.eonmux.neuralfree.gguf.spec.MlaSpec;
 import com.eonmux.neuralfree.gguf.spec.MoeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
@@ -94,12 +98,16 @@ public final class AttentionResolver {
         if (kind == MixerKind.NONE) {
             return null;
         }
+        if (arch == Arch.INKLING) {
+            return inkling(il);
+        }
         boolean linear = kind == MixerKind.ATTENTION_LINEAR_REPLACE;
         boolean swaLayer = hp.isSwa(il) && hp.swaType() != SwaType.NONE;
         int headK = hp.headK(il);
         int headV = hp.headV(il);
         int nHead = hp.nHead(il);
         int nRot = linear ? 0 : rope.nRot(il);
+        int qLatent = linear ? 0 : qLatentDim(il);
         AttentionSpec.Builder b = AttentionSpec.builder()
                 .nHead(nHead)
                 .nHeadKv(linear ? 0 : hp.nHeadKv(il))
@@ -109,18 +117,19 @@ public final class AttentionResolver {
                 .noRope(nRot == 0)
                 .causal(causal(il))
                 .swaType(hp.swaType())
-                .nSwa(hp.nSwa())
+                .nSwa(hp.nSwa(il))
                 .swaLayer(swaLayer)
                 .qkNorm(norm.qkNorm(il))
                 .qkNormAfterRope(nRot != 0 && norm.qkNormAfterRope(il))
                 .qkNormBias(norm.qkNormBias(il))
-                .inBias(!UnusedBiases.attnInputUnused(arch))
+                .inBias(qLatent == 0 && !UnusedBiases.attnInputUnused(arch))
                 .outBias(!UnusedBiases.attnOutputUnused(arch))
                 .vNorm(vNorm(il))
                 .gate(linear ? AttnGateKind.NONE : gate(il, nHead, headV))
                 .temperature(temperature(il))
                 .clampKqv(hp.clampKqv() > 0f ? hp.clampKqv() : 0f)
                 .sinks(has(il, TensorNames.ATTN_SINKS))
+                .sinkTokens(hp.sinkTokenCount())
                 .softcap(softcap())
                 .valueScale(hp.attnValueScale())
                 .kqScale(kqScale(il))
@@ -129,11 +138,102 @@ public final class AttentionResolver {
                 .kvOwnerLayer(hp.kvOwnerLayer(il))
                 .fusedQkv(tc.fusedQkv(il) != null)
                 .linearReplace(linear)
+                .qLatentDim(qLatent)
                 .valueExperts(linear ? null : valueExperts(il, hp.nHeadKv(il) * headV));
-        if (hp.maxAlibiBias() > 0f) {
+        if (hp.hasDualChunkAttention()) {
+            if (hp.kvOwnerLayer(il) != il) {
+                throw new IllegalStateException(arch.ggufName() + ": dual-chunk attention of layer " + il
+                        + " reads layer " + hp.kvOwnerLayer(il) + "'s cache; the stage key ranges need the layer's"
+                        + " own cache rows");
+            }
+            b.dualChunk(dualChunk());
+        }
+        if (arch == Arch.DORY) {
+            b.outNorm(NormKind.L2_GDN, hp.normRmsEps());
+        }
+        if (arch == Arch.LIMITE) {
+            b.valueEmbeddings(true)
+                    .valueEmbeddingGate(tc.layer(il, TensorNames.weight(TensorNames.ATTN_VE_GATE)) != null)
+                    .xsaEps(hp.xsaEps() > 0f && tc.layer(il, TensorNames.weight(TensorNames.ATTN_XSA_ALPHA)) != null
+                            ? hp.xsaEps() : 0f);
+        }
+        if (hp.alibiSqrt()) {
+            b.biasMode(AttentionSpec.BiasMode.ALIBI_SQRT).alibiMaxBias(hp.maxAlibiBias());
+        } else if (hp.maxAlibiBias() > 0f) {
             b.biasMode(AttentionSpec.BiasMode.ALIBI).alibiMaxBias(hp.maxAlibiBias());
         }
         return b.build();
+    }
+
+    /**
+     * The model's dual-chunk attention configuration (Qwen2.5-1M), shared by every attention layer.
+     *
+     * @throws IllegalStateException when the model's RoPE is neither NORM nor NEOX, whose pair layouts the
+     *                               five-rotation query needs
+     */
+    private DualChunkSpec dualChunk() {
+        if (hp.ropeType() != RopeType.NORM && hp.ropeType() != RopeType.NEOX) {
+            throw new IllegalStateException(arch.ggufName() + ": dual-chunk attention needs a NORM or NEOX rope, got "
+                    + hp.ropeType());
+        }
+        return DualChunkSpec.builder()
+                .chunkSize(hp.dualChunkChunkSize())
+                .localSize(hp.dualChunkLocalSize())
+                .originalMaxPositionEmbeddings(hp.dualChunkOriginalMaxPositionEmbeddings())
+                .sparseAttentionEnabled(hp.dualChunkSparseEnabled())
+                .sparseAttentionThreshold(hp.dualChunkSparseThreshold())
+                .sparseAttentionLastQ(hp.dualChunkSparseLastQ())
+                .build();
+    }
+
+    /**
+     * Inkling attention (vLLM {@code InklingAttention}): no RoPE, per-head RMS norms on Q and K without bias, score
+     * scale {@code 1 / head_dim}, the layer's relative-logit extent (its sliding window on a local layer, the model's
+     * {@code rel_extent} otherwise) and the {@link AttentionSpec.BiasMode#INKLING} table.
+     */
+    private AttentionSpec inkling(int il) {
+        checkLayer(il);
+        boolean swaLayer = hp.isSwa(il) && hp.swaType() != SwaType.NONE;
+        int headK = hp.headK(il);
+        int relExtent = swaLayer ? hp.nSwa(il) : hp.inklingRelExtent();
+        if (relExtent <= 0) {
+            throw new IllegalStateException(arch.ggufName() + " layer " + il + " has a relative-logit extent of "
+                    + relExtent);
+        }
+        // q_bias adds one fused bias to the whole qkvr product, o_bias one to wo_ud.
+        boolean inBias = tc.layer(il, TensorNames.bias(TensorNames.ATTN_Q)) != null;
+        boolean outBias = tc.layer(il, TensorNames.bias(TensorNames.ATTN_OUT)) != null;
+        return AttentionSpec.builder()
+                .nHead(hp.nHead(il))
+                .nHeadKv(hp.nHeadKv(il))
+                .headDimK(headK)
+                .headDimV(hp.headV(il))
+                .nRot(0)
+                .noRope(true)
+                .causal(true)
+                .swaType(hp.swaType())
+                .nSwa(swaLayer ? hp.nSwa(il) : 0)
+                .swaLayer(swaLayer)
+                .qkNorm(QkNormKind.RMS_HEAD)
+                .qkNormAfterRope(false)
+                .qkNormBias(false)
+                .inBias(inBias)
+                .outBias(outBias)
+                .biasMode(AttentionSpec.BiasMode.INKLING)
+                .relBiasExtent(relExtent)
+                .kqScale(1.0f / headK)
+                .usesMemory(true)
+                .kvOwnerLayer(hp.kvOwnerLayer(il))
+                .build();
+    }
+
+    /**
+     * Width of the shared query projection when Q is low-rank (Step3 text, {@code attention.q_lora_rank}); 0 for a
+     * single Q projection. The layer projects {@code attn_q_a}, RMS-normalizes it and widens it with
+     * {@code attn_q_b} before RoPE.
+     */
+    private int qLatentDim(int il) {
+        return hp.arch() == Arch.STEP3_TEXT ? hp.nLoraQ() : 0;
     }
 
     /**
@@ -200,7 +300,7 @@ public final class AttentionResolver {
                 .noRope(!roped)
                 .causal(causal(il))
                 .swaType(hp.swaType())
-                .nSwa(hp.nSwa())
+                .nSwa(hp.nSwa(il))
                 .swaLayer(hp.isSwa(il) && hp.swaType() != SwaType.NONE)
                 .qkNorm(norm.qkNorm(il))
                 .qkNormAfterRope(roped && norm.qkNormAfterRope(il))
@@ -208,6 +308,7 @@ public final class AttentionResolver {
                 .gate(gate(il, m.nHead(), m.headV()))
                 .temperature(temp)
                 .sinks(has(il, TensorNames.ATTN_SINKS))
+                .sinkTokens(hp.sinkTokenCount())
                 .softcap(softcap())
                 .kqScale(m.kqScale())
                 .usesMemory(usesMemory(false))
@@ -234,25 +335,37 @@ public final class AttentionResolver {
     /**
      * Causal mask of main-stack layer {@code il}: the model's causality, except that with
      * {@code non_causal_type SWA_ONLY} the dense layers of a non-causal model stay causal
-     * (llama-kv-cache.cpp:1777-1781).
+     * (llama-kv-cache.cpp:1777-1781) and with {@code DENSE_ONLY} the dense layers of a non-causal model
+     * turn non-causal while the SWA layers stay causal (lfm3 d1, llama-hparams.h:37).
      */
     public boolean causal(int il) {
         if (hp.causal()) {
             return true;
         }
-        return hp.nonCausalType() == ModelHparams.NON_CAUSAL_SWA_ONLY && !(hp.isSwa(il) && hp.swaType() != SwaType.NONE);
+        boolean swaLayer = hp.isSwa(il) && hp.swaType() != SwaType.NONE;
+        switch (hp.nonCausalType()) {
+            case ModelHparams.NON_CAUSAL_SWA_ONLY:
+                return !swaLayer;
+            case ModelHparams.NON_CAUSAL_DENSE_ONLY:
+                return swaLayer;
+            default:
+                return false;
+        }
     }
 
     /**
      * False when the attention reads only the current batch: models without memory (encoders, classifiers,
-     * diffusion), the LFM2 decision graph (non-causal with decision layers, llama-model.cpp:2782-2784) and the T5
-     * encoder stack.
+     * diffusion), the LFM2 decision graph and the non-causal lfm3 d1 graph (both run the whole prompt in one
+     * batch with no memory, llama-model.cpp:2812-2817) and the T5 encoder stack.
      */
     private boolean usesMemory(boolean encoderStack) {
         if (encoderStack || hp.traits().memoryKind() == MemoryKind.NONE) {
             return false;
         }
-        return !(arch == Arch.LFM2 && !hp.causal() && hp.nLayerDecision() > 0);
+        if (arch == Arch.LFM2) {
+            return !(!hp.causal() && hp.nLayerDecision() > 0);
+        }
+        return arch != Arch.LFM3 || hp.causal();
     }
 
     /**
@@ -279,6 +392,10 @@ public final class AttentionResolver {
                 return 1.0f / hp.headK(il);
             case PLAMO2:
                 return invSqrt(hp.headV(il));
+            case ZAMBA2:
+                // the shared block's queries and keys span 2 * n_embd per token: vLLM scales by
+                // (attention_head_dim / 2) ** -0.5 (vllm/model_executor/models/zamba2.py, Zamba2Attention.__init__)
+                return invSqrt(hp.headK(il) / 2);
             case BAILINGMOE:
             case OPENAI_MOE:
                 return invSqrt(hp.nRot(0));
@@ -424,6 +541,7 @@ public final class AttentionResolver {
     public AttentionSpec.Temperature temperature(int il) {
         switch (arch) {
             case LLAMA4:
+            case EAGLE_LLAMA4:
                 return rope.appliesRope(il) ? AttentionSpec.Temperature.NONE : temperature();
             case BEAM:
                 return hp.isSwa(il) ? AttentionSpec.Temperature.NONE : temperature();

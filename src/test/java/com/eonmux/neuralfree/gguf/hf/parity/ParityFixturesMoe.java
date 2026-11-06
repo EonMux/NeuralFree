@@ -9,7 +9,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 
 /**
- * PT-1 fixtures of the MoE families: DeepSeek-V3's MLA with the kv_b split and stacked routed experts, and the
+ * Fixtures of the MoE families: DeepSeek-V3's MLA with the kv_b split and stacked routed experts, and the
  * Qwen3-MoE fused expert tensors, each in its F32 and BF16 form. Every expected GGUF value and tensor here is
  * hand-derived from the converter rules the ports cite — never read back from NeuralFree:
  *

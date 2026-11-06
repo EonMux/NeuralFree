@@ -9,7 +9,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the T5 rows of Appendix A table HK-SP: {@code T5ForConditionalGeneration} and
+ * Synthetic checkpoints of the T5 rows: {@code T5ForConditionalGeneration} and
  * {@code T5EncoderModel} on {@link com.eonmux.neuralfree.gguf.hf.hooks.HfT5Hooks}. Two encoder layers, two decoder
  * layers, hidden size 8, two heads with a key/value width of 4, FFN 16, the Unigram tokenizer.model of t5.py:30-119
  * and the exact tensor names and config keys of the t5.py converters.

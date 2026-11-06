@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.Arch;
@@ -15,8 +16,10 @@ import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixerFactory;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.FusedMode;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuOpsFixture;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
@@ -33,12 +36,15 @@ import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuKvLayer;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
+import com.eonmux.neuralfree.gguf.ops.fused.FusedKernels;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeKernels;
+import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
 import com.eonmux.neuralfree.gguf.spec.EmbeddingSpec;
+import com.eonmux.neuralfree.gguf.spec.FopeSpec;
 import com.eonmux.neuralfree.gguf.spec.HeadSpec;
 import com.eonmux.neuralfree.gguf.spec.LayerSchedule;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
@@ -48,9 +54,11 @@ import com.eonmux.neuralfree.gguf.spec.NormSpec;
 import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
+import com.eonmux.neuralfree.gguf.spec.TensorRef;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Test;
 
@@ -109,26 +117,38 @@ public class GpuAttentionMixerTest {
     private GpuOps ops;
     private GpuMixer mixer;
     private Map<String, GpuWeight> tensors;
+    /** Fused-kernel selection of the next bind; the traces below check the unfused kernels. */
+    private FusedMode fusedMode = FusedMode.OFF;
 
     @After
     public void tearDown() {
+        closeRig();
+    }
+
+    private void closeRig() {
         if (mixer != null) {
             mixer.close();
+            mixer = null;
         }
         if (ops != null) {
             ops.close();
+            ops = null;
         }
         if (placeholders != null) {
             placeholders.close();
+            placeholders = null;
         }
         if (scratch != null) {
             scratch.close();
+            scratch = null;
         }
         if (memory != null) {
             memory.close();
+            memory = null;
         }
         if (backend != null) {
             backend.close();
+            backend = null;
         }
     }
 
@@ -145,7 +165,7 @@ public class GpuAttentionMixerTest {
 
     private static LayerSpec.Builder layerBuilder(MixerKind kind, AttentionSpec attention) {
         return LayerSpec.builder(0, kind, FfnKind.NONE)
-                .norm(NormSpec.builder(NormKind.RMS, 1e-6f).build())
+                .norm(NormSpec.builder(NormKind.RMS, 1e-6f).qkNorm(attention.qkNorm()).build())
                 .residual(ResidualSpec.builder(ResidualKind.STANDARD, WIDTH).build())
                 .attention(attention);
     }
@@ -240,6 +260,14 @@ public class GpuAttentionMixerTest {
         return out;
     }
 
+    /**
+     * The matvec the 256-row Q and output projections launch: at this device's 256-work-item matvec work-group
+     * they meet the two-row thread floor and pair their rows, where the 128-row K and V projections stay below it.
+     */
+    private static String pairedMatvec() {
+        return GpuOps.matVecKernel(GGMLType.F32).replace("MatVec", "MatVec2");
+    }
+
     private void decode(int pos) {
         steps().upload(pos, 1);
         mixer.decode(pos, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH));
@@ -319,9 +347,7 @@ public class GpuAttentionMixerTest {
         assertEquals(HEAD_DIM, fd.intArg(AttnKernels.ARG_FD_K_HEAD_STRIDE));
         assertEquals(KQ_SCALE, fd.floatArg(AttnKernels.ARG_FD_SCALE), 0f);
         assertEquals(0f, fd.floatArg(AttnKernels.ARG_FD_SOFTCAP), 0f);
-        assertEquals(1, fd.intArg(AttnKernels.ARG_FD_CAUSAL));
-        assertEquals(0, fd.intArg(AttnKernels.ARG_FD_HAS_SINKS));
-        assertEquals(1, fd.intArg(AttnKernels.ARG_FD_DIRECT_OUT));
+        assertEquals(AttnKernels.FLAG_CAUSAL | AttnKernels.FLAG_DIRECT, fd.intArg(AttnKernels.ARG_FD_FLAGS));
         assertEquals(0, fd.intArg(AttnKernels.ARG_FD_Q_OFF));
         assertEquals(0, fd.intArg(AttnKernels.ARG_FD_OUT_OFF));
         assertSame(slot(ScratchSlots.Q).buffer(), fd.bufferArg(AttnKernels.ARG_FD_BUF_Q));
@@ -367,9 +393,8 @@ public class GpuAttentionMixerTest {
             assertEquals(Q_DIM, fa.intArg(AttnKernels.ARG_FA_Q_ROW_STRIDE));
             assertEquals(Q_DIM, fa.intArg(AttnKernels.ARG_FA_OUT_ROW_STRIDE));
             assertEquals(KV_DIM, fa.intArg(AttnKernels.ARG_FA_K_ROW_STRIDE));
-            assertEquals(1, fa.intArg(AttnKernels.ARG_FA_CAUSAL));
+            assertEquals(AttnKernels.FLAG_CAUSAL | AttnKernels.FLAG_DIRECT, fa.intArg(AttnKernels.ARG_FA_FLAGS));
             assertEquals(1, fa.intArg(AttnKernels.ARG_FA_N_SPLIT));
-            assertEquals(1, fa.intArg(AttnKernels.ARG_FA_DIRECT_OUT));
             assertSame(steps().qPos(), fa.bufferArg(AttnKernels.ARG_FA_BUF_Q_POS));
             assertSame(steps().kvPos(kv.group()), fa.bufferArg(AttnKernels.ARG_FA_BUF_KV_POS));
             assertTrue(Arrays.equals(plan.prefillGlobal(n, 1), fa.global()));
@@ -382,6 +407,32 @@ public class GpuAttentionMixerTest {
                 assertEquals(t * Q_DIM, r.intArg(AttnKernels.ARG_FD_Q_OFF));
                 assertEquals(t * Q_DIM, r.intArg(AttnKernels.ARG_FD_OUT_OFF));
             }
+        }
+    }
+
+    /**
+     * The cache-write-only step launches only the K projection and its norm/RoPE, the store rotation and the store:
+     * no Q RoPE, no attention and no output projection, and fewer kernels than the whole prefill.
+     */
+    @Test
+    public void kvOnlyPrefillRunsTheStoreWithoutQueryOrAttention() {
+        bindLlama(llama(llamaAttention().build()), KvDType.F16, false);
+        int n = 4;
+        List<Dispatch> whole = run(() -> prefill(0, n));
+        List<Dispatch> only = run(() -> {
+            steps().upload(0, n);
+            mixer.prefillKV(0, n, slot(ScratchSlots.NORMED));
+        });
+        assertTrue("the cache-write-only step launches fewer kernels", only.size() < whole.size());
+        assertEquals("one Q and one K RoPE in the whole step", 2,
+                named(whole, RopeKernels.ROPE_EXT).size());
+        assertEquals("the K RoPE alone in the cache-write-only step", 1,
+                named(only, RopeKernels.ROPE_EXT).size());
+        assertEquals("both stores run", 2, named(only, RopeKernels.kvStore(KvDType.F16)).size());
+        for (Dispatch d : only) {
+            String kernel = d.kernelName();
+            assertFalse("no flash attention: " + kernel, kernel.equals(AttnKernels.flashAttn(KvDType.F16))
+                    || kernel.equals(AttnKernels.flashDecode(KvDType.F16)));
         }
     }
 
@@ -411,7 +462,7 @@ public class GpuAttentionMixerTest {
         assertEquals(nSplit == 1 ? 0 : 1, combines.size());
         if (nSplit > 1) {
             Dispatch c = combines.get(0);
-            assertEquals(0, fd.intArg(AttnKernels.ARG_FD_DIRECT_OUT));
+            assertEquals(0, fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_DIRECT);
             assertEquals(N_HEAD, c.intArg(AttnKernels.ARG_FC_N_ROWS));
             assertEquals(nSplit, c.intArg(AttnKernels.ARG_FC_N_SPLIT));
             assertEquals(0, c.intArg(AttnKernels.ARG_FC_OUT_OFF));
@@ -517,13 +568,100 @@ public class GpuAttentionMixerTest {
         bindPrepared(spec, KvDType.F16);
         List<Dispatch> ds = run(() -> decode(2));
         Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
-        assertEquals(1, fd.intArg(AttnKernels.ARG_FD_HAS_SINKS));
+        assertTrue((fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
         assertEquals(30f, fd.floatArg(AttnKernels.ARG_FD_SOFTCAP), 0f);
         String sinks = TensorNames.layerName(l.stack(), 0, TensorNames.weight(TensorNames.ATTN_SINKS));
         assertSame(tensors.get(sinks).shard(0), fd.bufferArg(AttnKernels.ARG_FD_BUF_SINKS));
         assertEquals(Arrays.asList(GpuAttentionMixer.BIAS_ADD, GpuAttentionMixer.BIAS_ADD,
                 GpuAttentionMixer.BIAS_ADD, RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT, RopeKernels.kvStore(KvDType.F16),
                 RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16), GpuAttentionMixer.BIAS_ADD), trace(ds));
+    }
+
+    /**
+     * One token of a qwen3 layer whose Q and K carry per-head RMS norms before RoPE and whose V carries the
+     * weightless RMS norm. The fused path runs the Q norm, rotation and V norm as one multi-task launch and writes
+     * the K row straight to the cache with its norm and rotation, where the unfused path launches five kernels.
+     */
+    @Test
+    public void fusedQkNormDecodeLaunchesFewerKernels() {
+        String mv = GpuOps.matVecKernel(GGMLType.F32);
+        String wide = pairedMatvec();
+        assertEquals(Arrays.asList(wide, mv, mv, NormKernels.ROW_NORM, NormKernels.ROW_NORM, NormKernels.ROW_NORM,
+                RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT, RopeKernels.kvStore(KvDType.F16),
+                RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16), wide),
+                qkNormDecode(FusedMode.OFF));
+        assertEquals(Arrays.asList(wide, mv, mv, FusedKernels.MULTI_TASK, FusedKernels.NORM_ROPE_STORE,
+                RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16), wide),
+                qkNormDecode(FusedMode.ON));
+    }
+
+    /**
+     * Without a V norm the fused K store leaves the multi-task launch with only the Q body, so the path keeps the
+     * single {@code LLM_RmsNormRope} launch instead of wrapping one body in the persistent kernel.
+     */
+    @Test
+    public void fusedQkNormWithoutVNormUsesTheSingleNormRope() {
+        fusedMode = FusedMode.ON;
+        AttentionSpec a = llamaAttention().qkNorm(QkNormKind.RMS_HEAD).build();
+        ModelSpec spec = model(Arch.QWEN3, layerBuilder(MixerKind.ATTENTION, a).rope(rope()).build());
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        LayerSpec l = spec.layers().get(0);
+        llamaTensors(l, false);
+        vector(l, TensorNames.weight(TensorNames.ATTN_Q_NORM), HEAD_DIM);
+        vector(l, TensorNames.weight(TensorNames.ATTN_K_NORM), HEAD_DIM);
+        bindPrepared(spec, KvDType.F16);
+        List<String> t = new ArrayList<>();
+        for (Dispatch d : run(() -> decode(2))) {
+            t.add(d.kernelName());
+        }
+        String mv = GpuOps.matVecKernel(GGMLType.F32);
+        assertEquals(Arrays.asList(pairedMatvec(), mv, mv, FusedKernels.RMS_NORM_ROPE,
+                FusedKernels.NORM_ROPE_STORE, RopeKernels.kvStore(KvDType.F16),
+                AttnKernels.flashDecode(KvDType.F16), pairedMatvec()), t);
+    }
+
+    /**
+     * A layer without a QK norm rotates its K rows straight into the cache ({@code LLM_RopeStore}), so only the V
+     * row keeps a separate store; the unfused path launches the K rotation and two stores.
+     */
+    @Test
+    public void fusedRopeStoreSkipsTheSeparateKRotation() {
+        fusedMode = FusedMode.ON;
+        AttentionSpec a = llamaAttention().build();
+        ModelSpec spec = model(Arch.LLAMA, layerBuilder(MixerKind.ATTENTION, a).rope(rope()).build());
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        LayerSpec l = spec.layers().get(0);
+        llamaTensors(l, false);
+        bindPrepared(spec, KvDType.F16);
+        List<Dispatch> ds = run(() -> decode(1));
+        String mv = GpuOps.matVecKernel(GGMLType.F32);
+        List<String> t = new ArrayList<>();
+        for (Dispatch d : ds) {
+            t.add(d.kernelName());
+        }
+        assertEquals(Arrays.asList(pairedMatvec(), mv, mv, RopeKernels.ROPE_EXT, FusedKernels.ROPE_STORE,
+                RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16), pairedMatvec()), t);
+        assertEquals("only the V row keeps a separate store",
+                1, named(ds, RopeKernels.kvStore(KvDType.F16)).size());
+    }
+
+    /** The kernels of one qwen3 decode step with the given fused-kernel selection. */
+    private List<String> qkNormDecode(FusedMode mode) {
+        fusedMode = mode;
+        AttentionSpec a = llamaAttention().qkNorm(QkNormKind.RMS_HEAD).vNorm(true).build();
+        ModelSpec spec = model(Arch.QWEN3, layerBuilder(MixerKind.ATTENTION, a).rope(rope()).build());
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        LayerSpec l = spec.layers().get(0);
+        llamaTensors(l, false);
+        vector(l, TensorNames.weight(TensorNames.ATTN_Q_NORM), HEAD_DIM);
+        vector(l, TensorNames.weight(TensorNames.ATTN_K_NORM), HEAD_DIM);
+        bindPrepared(spec, KvDType.F16);
+        List<String> names = new ArrayList<>();
+        for (Dispatch d : run(() -> decode(2))) {
+            names.add(d.kernelName());
+        }
+        closeRig();
+        return names;
     }
 
     @Test
@@ -673,12 +811,12 @@ public class GpuAttentionMixerTest {
         assertEquals(Q_DIM, g.intArg(AttnExtKernels.ARG_GATE_GATE_STRIDE));
     }
 
-    private ModelSpec movaModel() {
+    private ModelSpec movaModel(String... unavailableKernels) {
         MoeSpec experts = MoeSpec.builder().experts(8, 2, KV_DIM).gating(GatingFunc.SIGMOID).probBias(true)
                 .normWeights(true).weightsScale(1f).act(ActOp.SILU).build();
         AttentionSpec a = llamaAttention().valueExperts(experts).build();
         ModelSpec spec = model(Arch.LLAMA, layerBuilder(MixerKind.ATTENTION, a).rope(rope()).build());
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).unavailableKernels(unavailableKernels).build();
         LayerSpec l = spec.layers().get(0);
         tensors = new HashMap<>();
         matrix(l, TensorNames.ATTN_Q, WIDTH, Q_DIM);
@@ -716,10 +854,38 @@ public class GpuAttentionMixerTest {
         List<String> t = trace(ds);
         assertEquals(Arrays.asList(MoeKernels.ROUTER, MoeKernels.BUCKETIZE, ActKernels.UNARY,
                 MoeKernels.WEIGHTED_SUM), t.subList(0, 4));
-        assertEquals(1, named(ds, MoeKernels.batchMatMulId(GGMLType.F32)).size());
+        assertTrue(named(ds, MoeKernels.batchMatMulId(GGMLType.F32)).isEmpty());
         assertTrue(named(ds, MoeKernels.matVecId(GGMLType.F32)).isEmpty());
         assertEquals(n, named(ds, MoeKernels.ROUTER).get(0).intArg(MoeKernels.ARG_N_TOKENS));
         assertEquals(n, named(ds, MoeKernels.WEIGHTED_SUM).get(0).intArg(MoeKernels.ARG_N_TOKENS));
+        Dispatch bucket = named(ds, MoeKernels.BUCKETIZE).get(0);
+        Dispatch align = named(ds, MoeKernels.ALIGN_BLOCKS).get(0);
+        List<Dispatch> gg = named(ds, MoeKernels.groupedGemm(GGMLType.F32));
+        assertEquals(1, gg.size());
+        Dispatch g = gg.get(0);
+        int tiles = MoeKernels.groupedTiles(UBATCH * 2, 8);
+        assertEquals(n, align.intArg(MoeKernels.ARG_N_TOKENS));
+        assertEquals(tiles, g.intArg(MoeKernels.ARG_GG_N_TILES));
+        assertEquals(KV_DIM, g.intArg(0));
+        assertEquals(WIDTH, g.intArg(1));
+        assertEquals("token rows", 2, g.intArg(MoeKernels.ARG_GG_X_DIV));
+        assertEquals(WIDTH, g.intArg(MoeKernels.ARG_GG_X_STRIDE));
+        assertEquals(MoeKernels.SCALE_NONE, g.intArg(MoeKernels.ARG_GG_HAS_SCALE));
+        assertSame(bucket.bufferArg(3), named(ds, MoeKernels.ROUTER).get(0).bufferArg(MoeKernels.ARG_ROUTER_IDS));
+        assertSame(align.bufferArg(8), g.bufferArg(MoeKernels.ARG_GG_GEMM_TOKEN));
+        assertSame(align.bufferArg(9), g.bufferArg(MoeKernels.ARG_GG_GEMM_SLOT));
+        assertTrue(ds.indexOf(bucket) < ds.indexOf(align) && ds.indexOf(align) < ds.indexOf(g));
+        assertTrue(ds.indexOf(g) < ds.indexOf(named(ds, ActKernels.UNARY).get(0)));
+    }
+
+    /** Without the align kernel the value experts of a prefill keep the per-pair {@code {T}_BatchMatMulId}. */
+    @Test
+    public void movaPrefillWithoutTheAlignKernelKeepsBatchMatMulId() {
+        bindPrepared(movaModel(MoeKernels.ALIGN_BLOCKS), KvDType.F16);
+        int n = 3;
+        List<Dispatch> ds = run(() -> prefill(0, n));
+        assertTrue(named(ds, MoeKernels.groupedGemm(GGMLType.F32)).isEmpty());
+        assertEquals(1, named(ds, MoeKernels.batchMatMulId(GGMLType.F32)).size());
         assertEquals(n * 2, named(ds, MoeKernels.batchMatMulId(GGMLType.F32)).get(0)
                 .intArg(MoeKernels.ARG_BMM_N_ROWS));
     }
@@ -741,7 +907,7 @@ public class GpuAttentionMixerTest {
         if (plan.plan() == FlashAttnTiling.Plan.TILED) {
             Dispatch fa = named(ds, AttnKernels.flashAttn(KvDType.F32)).get(0);
             assertEquals(n, fa.intArg(AttnKernels.ARG_FA_KV_END));
-            assertEquals(0, fa.intArg(AttnKernels.ARG_FA_CAUSAL));
+            assertEquals(0, fa.intArg(AttnKernels.ARG_FA_FLAGS) & (AttnKernels.FLAG_CAUSAL | AttnKernels.FLAG_SINKS));
             assertSame(slot(ScratchSlots.K).buffer(), fa.bufferArg(AttnKernels.ARG_FA_BUF_K));
             assertSame(slot(ScratchSlots.POS).buffer(), fa.bufferArg(AttnKernels.ARG_FA_BUF_Q_POS));
             assertSame(slot(ScratchSlots.POS).buffer(), fa.bufferArg(AttnKernels.ARG_FA_BUF_KV_POS));
@@ -750,7 +916,7 @@ public class GpuAttentionMixerTest {
             assertEquals(n, rows.size());
             for (Dispatch r : rows) {
                 assertEquals(n, r.intArg(AttnKernels.ARG_FD_KV_END));
-                assertEquals(0, r.intArg(AttnKernels.ARG_FD_CAUSAL));
+                assertEquals(0, r.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_CAUSAL);
             }
         }
         assertThrows(UnsupportedOperationException.class, () -> mixer.shiftContext(0, 1));
@@ -811,11 +977,12 @@ public class GpuAttentionMixerTest {
 
     @Test
     public void factoriesCoverBothKindsAndRejectOthers() {
-        assertEquals(2, AttnBlocks.gpuMixers().size());
-        assertEquals(2, AttnBlocks.cpuMixers().size());
+        assertEquals(3, AttnBlocks.gpuMixers().size());
+        assertEquals(3, AttnBlocks.cpuMixers().size());
         assertTrue(AttnBlocks.gpuFfns().isEmpty());
         assertTrue(AttnBlocks.cpuFfns().isEmpty());
-        assertTrue(AttnBlocks.gpuExtras().isEmpty());
+        assertEquals(1, AttnBlocks.gpuExtras().size());
+        assertEquals(LayerSpec.Extras.INKLING_SCONV, AttnBlocks.gpuExtras().get(0).featureId());
         assertTrue(AttnBlocks.cpuExtras().isEmpty());
         LayerSpec plain = layerBuilder(MixerKind.ATTENTION, llamaAttention().build()).rope(rope()).build();
         assertThrows(IllegalArgumentException.class,
@@ -848,12 +1015,131 @@ public class GpuAttentionMixerTest {
                 .build();
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
         kernels = LlmKernels.open(backend);
-        ops = new GpuOps(backend.computeQueue(), kernels, scratch, placeholders);
+        ops = GpuOpsFixture.withFusedMode(backend.computeQueue(), kernels, scratch, placeholders, fusedMode);
         GpuForwardContext.Builder cb = GpuForwardContext.builder(kernels, ops, tensors::get, spec);
         if (memory != null) {
             cb.memory(memory);
         }
         mixer = factory(l.mixerKind()).create(l);
         mixer.bind(cb.build(), l);
+    }
+
+    // ================================================================== NTK frequency factors
+
+    /**
+     * A layer whose per-pair divisors the resolver computed (vLLM's fixed NTK scaling) rotates with them bound as
+     * {@code ff}: the values ride a mixer-owned buffer both rotations share, uploaded once.
+     */
+    @Test
+    public void computedFrequencyFactorsAreUploadedAsTheRopeDivisors() {
+        float[] factors = RopeMath.ntkFactors(4f, Float.NaN, HEAD_DIM);
+        RopeSpec ntk = RopeSpec.builder(RopeType.NORM).nDims(HEAD_DIM).freqBase(10000f)
+                .computedFreqFactors(factors).build();
+        ModelSpec spec = model(Arch.LLAMA,
+                layerBuilder(MixerKind.ATTENTION, llamaAttention().build()).rope(ntk).build());
+        bindLlama(spec, KvDType.F16, false);
+        List<Dispatch> ds = run(() -> decode(5));
+        List<Dispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
+        assertEquals(2, ropes.size());
+        FakeGpuBuffer ff = (FakeGpuBuffer) ropes.get(0).bufferArg(21);
+        assertSame("both rotations share the uploaded divisors", ff, ropes.get(1).bufferArg(21));
+        for (Dispatch r : ropes) {
+            assertEquals("has_ff", 1, r.intArg(8));
+        }
+        for (int i = 0; i < factors.length; i++) {
+            assertEquals("divisor " + i, factors[i], ff.getFloat(i), 0f);
+        }
+    }
+
+    // ================================================================== Fourier position embedding
+
+    private static final int FOPE_DIM = 4;
+
+    private static RopeSpec fopeRope() {
+        float[] inv = RopeMath.fopeInvFreq(10000f, HEAD_DIM, FOPE_DIM, 512);
+        TensorRef cos = TensorRef.of(TensorNames.weight(TensorNames.ROPE_COS_COEF), GGMLType.F32,
+                FOPE_DIM, FOPE_DIM, N_HEAD_KV);
+        TensorRef sin = TensorRef.of(TensorNames.weight(TensorNames.ROPE_SIN_COEF), GGMLType.F32,
+                FOPE_DIM, FOPE_DIM, N_HEAD_KV);
+        return RopeSpec.builder(RopeType.NEOX).nDims(HEAD_DIM).freqBase(10000f)
+                .fope(FopeSpec.of(N_HEAD_KV, true, inv, cos, sin)).build();
+    }
+
+    /** The model-level coefficient matrices, read by every FoPE layer of the model. */
+    private void fopeTensors() {
+        for (String name : Arrays.asList(TensorNames.weight(TensorNames.ROPE_COS_COEF),
+                TensorNames.weight(TensorNames.ROPE_SIN_COEF))) {
+            tensors.put(name, GpuWeight.of(name, GGMLType.F32,
+                    new long[]{FOPE_DIM, FOPE_DIM, N_HEAD_KV},
+                    backend.allocateBuffer((long) FOPE_DIM * FOPE_DIM * N_HEAD_KV * Float.BYTES, true)));
+        }
+    }
+
+    /**
+     * A FoPE layer rotates Q and K with {@link RopeKernels#ROPE_FOPE} in decode and prefill alike: the learned
+     * coefficients replace the analytic pairs, so the fused norm+rope and fused cache-store kernels stay off.
+     */
+    @Test
+    public void fopeDecodeAndPrefillRotateWithTheCoefficientKernel() {
+        ModelSpec spec = model(Arch.INTERN_S1_PRO,
+                layerBuilder(MixerKind.ATTENTION, llamaAttention().build()).rope(fopeRope()).build());
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        llamaTensors(spec.layers().get(0), false);
+        fopeTensors();
+        bindPrepared(spec, KvDType.F16);
+
+        List<Dispatch> ds = run(() -> decode(5));
+        assertEquals(Arrays.asList(RopeKernels.ROPE_FOPE, RopeKernels.ROPE_FOPE, RopeKernels.kvStore(KvDType.F16),
+                RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16)), trace(ds));
+        checkFopeSteps(named(ds, RopeKernels.ROPE_FOPE), 1);
+
+        backend.clearLog();
+        int n = 4;
+        List<Dispatch> pre = run(() -> prefill(0, n));
+        assertEquals(n, named(pre, RopeKernels.ROPE_FOPE).get(0).intArg(RopeKernels.ARG_N_TOKENS));
+        assertEquals(RopeKernels.ROPE_FOPE, trace(pre).get(0));
+        assertEquals(RopeKernels.ROPE_FOPE, trace(pre).get(1));
+        checkFopeSteps(named(pre, RopeKernels.ROPE_FOPE), n);
+    }
+
+    /** The learned cos/sin do not factor into a rotation of a position delta, so the shift is refused by name. */
+    @Test
+    public void aFourierLayerRefusesTheContextShiftWithoutBuildingTheShiftKernel() {
+        ModelSpec spec = model(Arch.INTERN_S1_PRO,
+                layerBuilder(MixerKind.ATTENTION, llamaAttention().build()).rope(fopeRope()).build());
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        llamaTensors(spec.layers().get(0), false);
+        fopeTensors();
+        bindPrepared(spec, KvDType.F16);
+
+        String refusal = mixer.shiftRefusal();
+        assertNotNull(refusal);
+        assertTrue(refusal, refusal.contains("Fourier position embedding"));
+        assertThrows(UnsupportedOperationException.class, () -> mixer.shiftContext(0, 1));
+        assertFalse(backend.preparedKernels().contains(RopeKernels.kvRopeShift(KvDType.F16)));
+    }
+
+    private void checkFopeSteps(List<Dispatch> ropes, int nTokens) {
+        assertEquals(2, ropes.size());
+        int[] heads = {N_HEAD, N_HEAD_KV};
+        GpuBuffer cos = tensors.get(TensorNames.weight(TensorNames.ROPE_COS_COEF)).shard(0);
+        GpuBuffer sin = tensors.get(TensorNames.weight(TensorNames.ROPE_SIN_COEF)).shard(0);
+        for (int i = 0; i < 2; i++) {
+            Dispatch r = ropes.get(i);
+            assertEquals(nTokens, r.intArg(RopeKernels.ARG_FOPE_N_TOKENS));
+            assertEquals(heads[i], r.intArg(RopeKernels.ARG_FOPE_N_HEADS));
+            assertEquals(HEAD_DIM, r.intArg(RopeKernels.ARG_FOPE_HEAD_STRIDE));
+            assertEquals(i == 0 ? Q_DIM : KV_DIM, r.intArg(RopeKernels.ARG_FOPE_ROW_STRIDE));
+            assertEquals(HEAD_DIM, r.intArg(RopeKernels.ARG_FOPE_N_DIMS));
+            assertEquals(FOPE_DIM, r.intArg(RopeKernels.ARG_FOPE_N_INV));
+            assertEquals(N_HEAD_KV, r.intArg(RopeKernels.ARG_FOPE_N_COEF_ROWS));
+            assertEquals(1, r.intArg(RopeKernels.ARG_FOPE_SEP_HEAD));
+            assertSame(steps().ropePos(), r.bufferArg(RopeKernels.ARG_FOPE_POS));
+            assertSame(cos, r.bufferArg(RopeKernels.ARG_FOPE_COS));
+            assertSame(sin, r.bufferArg(RopeKernels.ARG_FOPE_SIN));
+            assertNotNull(r.bufferArg(RopeKernels.ARG_FOPE_INV));
+            assertSame(slot(i == 0 ? ScratchSlots.Q : ScratchSlots.K).buffer(),
+                    r.bufferArg(RopeKernels.ARG_FOPE_X));
+        }
     }
 }

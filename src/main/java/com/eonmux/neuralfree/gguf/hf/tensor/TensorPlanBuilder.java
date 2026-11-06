@@ -27,9 +27,10 @@ import java.util.Set;
  *
  * <p>Sibling values of quantized sources become sibling tensors on projections the runtime gives them a slot
  * ({@link TensorClaims#scaledBase}): {@code <base>.scale} (F32), {@code <base>.input_scale} (F32),
- * {@code <base>.input_zero_point} (I32) and {@code <base>.input_perm} (I32). Elsewhere the output scale and the
- * permutation are folded into the weight, and a static activation scheme is dropped (one warning per plan). An
- * activation scheme kept for a weight is recorded in {@link TensorPlan#actQuantEntries()}.</p>
+ * {@code <base>.input_zero_point} (I32), {@code <base>.input_perm} (I32) and {@code <base>.input_pre_scale} (F32).
+ * Elsewhere the output scale and the permutation are folded into the weight, and a static activation scheme is
+ * dropped (one warning per plan). An activation scheme kept for a weight is recorded in
+ * {@link TensorPlan#actQuantEntries()}.</p>
  *
  * <p>A {@link LoraFactorSource} is planned as its two factors {@code <name>.lora_a} and {@code <name>.lora_b}, with
  * {@code A} transposed for {@code token_embd.weight} (LC/convert_lora_to_gguf.py:521-529). Not thread-safe; one
@@ -75,6 +76,7 @@ public final class TensorPlanBuilder implements TensorSink {
             }
         }
         activation(ggufName, base, s, siblings);
+        preScale(ggufName, base, s, siblings);
         float[] os = s.outputScale();
         if (os != null) {
             requirePerTensorOrExpert(ggufName, s, os.length, "output scale");
@@ -223,6 +225,32 @@ public final class TensorPlanBuilder implements TensorSink {
                     ElementTransforms.keepInteger(RopeTensors.fromInts(new long[]{zp.length}, zp))));
         }
         actQuant.put(ggufName, scheme);
+    }
+
+    /** Queues the {@code <base>.input_pre_scale} sibling of {@code s} when it carries one. */
+    private static void preScale(String ggufName, String base, RowSource s, List<Sibling> siblings) {
+        float[] pre = s.inputPreScale();
+        if (pre == null) {
+            return;
+        }
+        long[] shape = s.shape();
+        int rank = Math.max(1, shape.length);
+        long k = shape[rank - 1];
+        long experts = shape.length >= 3 ? shape[0] : 0;
+        long want = experts > 0 ? Math.multiplyExact(experts, k) : k;
+        if (pre.length != k && pre.length != want) {
+            throw new IllegalArgumentException("tensor '" + ggufName + "' from " + s.describe() + ": "
+                    + pre.length + " activation pre-scale values for " + k + " columns"
+                    + (experts > 0 ? " or " + want + " (one per expert)" : ""));
+        }
+        if (base == null) {
+            throw new IllegalArgumentException("tensor '" + ggufName + "' from " + s.describe() + " has an"
+                    + " activation pre-scale, but the runtime gives no weight outside a blk.N.<projection> slot an"
+                    + " input_pre_scale sibling");
+        }
+        long[] preShape = experts > 0 && pre.length == want ? new long[]{experts, k} : new long[]{k};
+        siblings.add(new Sibling(base + "." + TensorClaims.INPUT_PRE_SCALE,
+                RopeTensors.fromFloats(preShape, pre)));
     }
 
     /**

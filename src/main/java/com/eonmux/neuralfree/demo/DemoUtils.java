@@ -27,12 +27,14 @@ import java.util.function.UnaryOperator;
 final class DemoUtils {
 
     /**
-     * The APIs that run the training framework's GPU kernels. The framework's tensor ops dispatch to the
-     * {@code train} kernel library, which is built for OpenCL (C source), CUDA (PTX) and Vulkan (SPIR-V) with the
-     * same kernels and semantics, so AUTO considers all three.
+     * The APIs that can run the training framework's GPU kernels. The framework's tensor ops dispatch to the
+     * {@code train} kernel library, which is built for OpenCL (C source), CUDA (PTX), Vulkan (SPIR-V) and
+     * HIP (code objects) with the same kernels and semantics; an accelerator backend provider may register
+     * its own {@code train} library under its API, so AUTO considers every API and rejects the ones without
+     * one through {@code TrainKernels.requirement()}.
      */
     static final Set<BackendType> FRAMEWORK_APIS = Collections.unmodifiableSet(
-            EnumSet.of(BackendType.OPENCL, BackendType.CUDA, BackendType.VULKAN));
+            EnumSet.allOf(BackendType.class));
 
     private DemoUtils() {}
 
@@ -75,16 +77,7 @@ final class DemoUtils {
         if (mode == null || mode == ACCELERATION_MODE.AUTO) {
             return FRAMEWORK_APIS;
         }
-        switch (mode) {
-            case OPENCL:
-                return EnumSet.of(BackendType.OPENCL);
-            case CUDA:
-                return EnumSet.of(BackendType.CUDA);
-            case VULKAN:
-                return EnumSet.of(BackendType.VULKAN);
-            default:
-                throw new IllegalArgumentException("Unknown acceleration mode: " + mode);
-        }
+        return EnumSet.of(BackendType.valueOf(mode.name()));
     }
 
     // ------------------------------------------------------------------ tensor lifetime

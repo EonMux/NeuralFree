@@ -1,4 +1,4 @@
-# TRAIN kernel inventory: every kernel of the untagged kernels/train/manifest.txt entries.
+# TRAIN kernel inventory: every kernel of the untagged and [cuda] kernels/train/manifest.txt entries.
 # Generated from the kernel sources by the updateKernelInventory Gradle task and checked by inventoryCheck; do not edit.
 # kernel_name<TAB>source<TAB>buffers<TAB>scalars<TAB>scalar kinds (i,u,f)<TAB>parameter layout (B buffer, else the scalar kind)
 ML_Forecast_Forward	ml/forecast.cl	7	2	i,i	iiBBBBBBB

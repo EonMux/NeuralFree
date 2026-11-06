@@ -1,0 +1,13 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# W12 kernels of matvec_w12.cl: the exact lossless decode (VIEW=0 default), the nested 8-bit Q view of
+# the same code bytes (VIEW=1), and the whole-tensor BF16 decode for large prefills.
+W12_MatVec	matvec_w12.comp	OP=OP_MATVEC	sg
+W12_MatVecAdd	matvec_w12.comp	OP=OP_MATVEC_ADD	sg
+W12_MatVecFusedGateUp	matvec_w12.comp	OP=OP_GATEUP_SILU	sg
+W12_BatchMatMul	matvec_w12.comp	OP=OP_BATCH	sg
+W12_BatchMatMul_2D	matvec_w12.comp	OP=OP_BATCH_2D	sg
+W12Q_MatVec	matvec_w12.comp	OP=OP_MATVEC VIEW=1	sg
+W12Q_MatVecAdd	matvec_w12.comp	OP=OP_MATVEC_ADD VIEW=1	sg
+W12Q_BatchMatMul	matvec_w12.comp	OP=OP_BATCH VIEW=1	sg
+W12Q_BatchMatMul_2D	matvec_w12.comp	OP=OP_BATCH_2D VIEW=1	sg
+W12_DecodeBF16	matvec_w12.comp	OP=OP_DECODE

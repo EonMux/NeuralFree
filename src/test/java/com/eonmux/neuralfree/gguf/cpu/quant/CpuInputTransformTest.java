@@ -226,6 +226,55 @@ public class CpuInputTransformTest {
         }
     }
 
+    /** A pre-scale multiplies the row before the fake-quantization, as torchao's linear does. */
+    @Test
+    public void preScaleAppliesBeforeActivationQuantization() {
+        Random rnd = new Random(4417L);
+        int rows = 3;
+        int cols = 16;
+        float[][] w = matrix(rows, cols, rnd);
+        CpuTensorRef weight = f32(w);
+        float[] pre = new float[cols];
+        for (int k = 0; k < cols; k++) {
+            pre[k] = k % 2 == 0 ? 0.5f : 2.0f;
+        }
+        float scale = 0.25f;
+        InputTransform it = InputTransform.of(null, InputTransform.ActQuant.of(
+                ActQuantScheme.INT8_STATIC, new float[]{scale}, null, 0.0f), null, pre);
+        CpuMatVec mv = new CpuMatVec(ref -> CpuMatVec.Transforms.from(it, null, 0));
+
+        int tokens = 2;
+        float[] x = new float[tokens * cols];
+        for (int k = 0; k < x.length; k++) {
+            x[k] = rnd.nextFloat() * 4.0f - 2.0f;
+        }
+        float[] original = x.clone();
+        float[] y = new float[tokens * rows];
+        mv.matmul(weight, x, 0, y, 0, tokens);
+        assertArrayEquals(original, x, 0.0f);
+
+        float[] transformed = new float[cols];
+        float[] wrongOrder = new float[cols];
+        boolean differs = false;
+        for (int t = 0; t < tokens; t++) {
+            System.arraycopy(x, t * cols, transformed, 0, cols);
+            for (int k = 0; k < cols; k++) {
+                transformed[k] *= pre[k];
+            }
+            ActFakeQuant.apply(ActQuantScheme.INT8_STATIC, scale, 0, 0.0f, transformed, 0, 1, cols);
+            System.arraycopy(x, t * cols, wrongOrder, 0, cols);
+            ActFakeQuant.apply(ActQuantScheme.INT8_STATIC, scale, 0, 0.0f, wrongOrder, 0, 1, cols);
+            for (int k = 0; k < cols; k++) {
+                wrongOrder[k] *= pre[k];
+                differs |= wrongOrder[k] != transformed[k];
+            }
+            for (int r = 0; r < rows; r++) {
+                assertDot(y[t * rows + r], w[r], 0, transformed, 0, cols);
+            }
+        }
+        assertTrue("the test inputs must distinguish the orders", differs);
+    }
+
     // ------------------------------------------------------------------ expert handling
 
     /** Static per-expert schemes fake-quantize each gathered row with the pair's expert's {@code .input_scale}. */
@@ -259,6 +308,48 @@ public class CpuInputTransformTest {
             int e = ids[p];
             System.arraycopy(x, p * cols, transformed, 0, cols);
             ActFakeQuant.apply(ActQuantScheme.INT8_STATIC, scales[e], 0, 0.0f, transformed, 0, 1, cols);
+            for (int r = 0; r < rows; r++) {
+                assertDot(y[p * rows + r], w3[e * rows + r], 0, transformed, 0, cols);
+            }
+        }
+    }
+
+    /** A per-expert pre-scale gives each gathered row its own expert's multipliers. */
+    @Test
+    public void perExpertPreScaleAppliesPerGatheredRow() {
+        Random rnd = new Random(331L);
+        int experts = 2;
+        int rows = 3;
+        int cols = 8;
+        float[][] w3 = matrix(experts * rows, cols, rnd);
+        CpuTensorRef w = f32(w3);
+        float[] pre = new float[experts * cols];
+        for (int e = 0; e < experts; e++) {
+            for (int k = 0; k < cols; k++) {
+                pre[e * cols + k] = e == 0 ? (k % 2 == 0 ? 0.5f : 2.0f) : (k % 2 == 0 ? 2.0f : 0.5f);
+            }
+        }
+        InputTransform it = InputTransform.of(null, null, null, pre);
+        CpuMatVec mv = new CpuMatVec(ref -> ref == w ? CpuMatVec.Transforms.from(it, null, experts)
+                : CpuMatVec.Transforms.NONE);
+        CpuExpertMatmul step = new CpuExpertMatmul(mv);
+
+        int[] ids = {0, 1, 1, 0};
+        CpuExpertMatmul.Groups g = CpuExpertMatmul.Groups.of(ids, ids.length, experts);
+        float[] x = new float[g.pairs() * cols];
+        for (int p = 0; p < g.pairs(); p++) {
+            float[] tok = row(cols, rnd);
+            System.arraycopy(tok, 0, x, p * cols, cols);
+        }
+        float[] y = new float[g.pairs() * rows];
+        step.run(w, experts, g, x, 0, 1, y, 0);
+
+        float[] transformed = new float[cols];
+        for (int p = 0; p < g.pairs(); p++) {
+            int e = ids[p];
+            for (int k = 0; k < cols; k++) {
+                transformed[k] = x[p * cols + k] * pre[e * cols + k];
+            }
             for (int r = 0; r < rows; r++) {
                 assertDot(y[p * rows + r], w3[e * rows + r], 0, transformed, 0, cols);
             }

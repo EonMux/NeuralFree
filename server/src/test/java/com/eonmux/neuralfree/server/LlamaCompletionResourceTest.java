@@ -12,6 +12,7 @@ import java.util.List;
 
 import static com.eonmux.neuralfree.server.ServerTestSupport.at;
 import static com.eonmux.neuralfree.server.ServerTestSupport.dataFrames;
+import static com.eonmux.neuralfree.server.ServerTestSupport.errorOf;
 import static com.eonmux.neuralfree.server.ServerTestSupport.size;
 import static com.eonmux.neuralfree.server.ServerTestSupport.statusOf;
 import static com.eonmux.neuralfree.server.ServerTestSupport.streamText;
@@ -75,13 +76,27 @@ class LlamaCompletionResourceTest {
     }
 
     @Test
+    void aRepetitionStopReportsTheLimitStopType() {
+        JsonView body = view(llama.completion("""
+                {"prompt": "hello", "n_predict": 8, "temperature": 0, "allowed_token_ids": [20],
+                 "repetition_detection": {"max_pattern_size": 1, "min_count": 4}}""").getEntity());
+        assertTrue(body.bool("stop"));
+        assertEquals("limit", body.str("stop_type"), "llama.cpp reports its heuristic early stops as limit");
+        assertEquals(4L, body.i64("tokens_predicted"));
+    }
+
+    @Test
     void oneStringPromptAnswersTheNativeObject() {
         JsonView body = view(llama.completion("""
-                {"prompt": "hello", "n_predict": 4, "ignore_eos": true, "temperature": 0}""").getEntity());
+                {"prompt": "hello", "n_predict": 4, "ignore_eos": true, "temperature": 0,
+                 "return_tokens": true}""").getEntity());
         assertTrue(body.bool("stop"));
         assertEquals("limit", body.str("stop_type"));
         assertEquals(4L, body.i64("tokens_predicted"));
         assertEquals(4, size(body, "tokens"));
+        JsonView plain = view(llama.completion("""
+                {"prompt": "hello", "n_predict": 4, "ignore_eos": true, "temperature": 0}""").getEntity());
+        assertEquals(0, size(plain, "tokens"), "without return_tokens the final object lists no tokens");
         assertEquals(service.encode("hello", true, true).length, body.i64("tokens_evaluated"));
         assertEquals(4L, body.obj("generation_settings").i64("n_predict"));
         assertEquals(4L, body.obj("timings").i64("predicted_n"));
@@ -134,6 +149,16 @@ class LlamaCompletionResourceTest {
     }
 
     @Test
+    void aDisaggregatedTransferRefusesOnTheLlamaCppRoutes() {
+        String body = "{\"prompt\": \"x\", \"n_predict\": 1,"
+                + " \"kv_transfer_params\": {\"do_remote_decode\": true}}";
+        assertEquals(400, statusOf(() -> llama.completion(body)));
+        assertTrue(errorOf(() -> llama.completion(body)).contains("kv_transfer_params"));
+        assertEquals(400, statusOf(() -> infill.infill("{\"input_prefix\": \"a\", \"input_suffix\": \"b\","
+                + " \"kv_transfer_params\": {\"do_remote_decode\": true}}")));
+    }
+
+    @Test
     void malformedRequestsRefuse() {
         for (String body : new String[]{
                 "{\"n_predict\": 2}",
@@ -142,7 +167,7 @@ class LlamaCompletionResourceTest {
                 "{\"prompt\": [999999999]}",
                 "{\"prompt\": {\"prompt_string\": \"x\", \"multimodal_data\": [\"AA==\"]}}",
                 "{\"prompt\": \"x\", \"n_predict\": -2}",
-                "{\"prompt\": \"x\", \"post_sampling_probs\": true}",
+                "{\"prompt\": \"x\", \"post_sampling_probs\": \"yes\"}",
                 "{\"prompt\": \"x\", \"response_fields\": \"content\"}"}) {
             assertEquals(400, statusOf(() -> llama.completion(body)), body);
         }

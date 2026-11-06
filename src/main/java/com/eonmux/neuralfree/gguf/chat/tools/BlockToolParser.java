@@ -19,20 +19,20 @@ import java.util.List;
  * finds no call). A block cut off by the end of a final text keeps its finished calls; the unfinished rest stays in
  * the content.
  */
-abstract class BlockToolParser implements ToolParser {
+public abstract class BlockToolParser implements ToolParser {
 
     /** {@link #bareStart}: the text may still become a bare call; nothing can be released yet. */
-    static final int UNDECIDED = -2;
+    public static final int UNDECIDED = -2;
 
     /** How a block read ended. */
-    enum State { COMPLETE, INCOMPLETE, MALFORMED }
+    public enum State { COMPLETE, INCOMPLETE, MALFORMED }
 
     /** One block read: its calls, where it ends and how; {@code rest} is where an unfinished call starts. */
-    static final class Block {
-        final State state;
-        final List<ToolCall> calls;
-        final int end;
-        final int rest;
+    public static final class Block {
+        public final State state;
+        public final List<ToolCall> calls;
+        public final int end;
+        public final int rest;
 
         private Block(State state, List<ToolCall> calls, int end, int rest) {
             this.state = state;
@@ -41,23 +41,23 @@ abstract class BlockToolParser implements ToolParser {
             this.rest = rest;
         }
 
-        static Block complete(List<ToolCall> calls, int end) {
+        public static Block complete(List<ToolCall> calls, int end) {
             return new Block(State.COMPLETE, calls, end, -1);
         }
 
         /** Cut off: {@code calls} are what was read (the last may be partial), {@code rest} where it started. */
-        static Block incomplete(List<ToolCall> calls, int rest) {
+        public static Block incomplete(List<ToolCall> calls, int rest) {
             return new Block(State.INCOMPLETE, calls, -1, rest);
         }
 
-        static Block malformed(int end) {
+        public static Block malformed(int end) {
             return new Block(State.MALFORMED, Collections.<ToolCall>emptyList(), end, -1);
         }
     }
 
     private final List<String> openers;
 
-    BlockToolParser(List<String> openers) {
+    protected BlockToolParser(List<String> openers) {
         this.openers = Collections.unmodifiableList(new ArrayList<>(openers));
     }
 
@@ -70,13 +70,13 @@ abstract class BlockToolParser implements ToolParser {
      * Reads the block whose opener {@code opener} starts at {@code at} ({@code opener} is empty for a bare call).
      * {@link Block#end} of a malformed block is where scanning resumes; a malformed block must end past {@code at}.
      */
-    abstract Block readBlock(String text, int at, String opener, boolean partial);
+    protected abstract Block readBlock(String text, int at, String opener, boolean partial);
 
     /**
      * Where a call opens the text without an opener: its index, -1 when the text does not open with one, or
      * {@link #UNDECIDED} while the text so far could still become one. The default: no bare calls.
      */
-    int bareStart(String text, boolean partial) {
+    protected int bareStart(String text, boolean partial) {
         return -1;
     }
 

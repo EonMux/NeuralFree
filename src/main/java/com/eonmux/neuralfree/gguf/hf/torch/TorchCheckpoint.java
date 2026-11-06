@@ -6,7 +6,11 @@ import com.eonmux.neuralfree.gguf.hf.st.CheckpointContainers;
 import com.eonmux.neuralfree.gguf.hf.st.SafetensorsCheckpoint;
 import com.eonmux.neuralfree.gguf.hf.tensor.ElementFormat;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoCheckpoints;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoPickle;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoWeight;
 import com.eonmux.neuralfree.io.safetensors.SafetensorsFile;
+import com.eonmux.neuralfree.io.safetensors.StDType;
 import com.eonmux.neuralfree.io.safetensors.StTensor;
 import com.eonmux.neuralfree.utils.json.Json;
 import com.eonmux.neuralfree.utils.json.JsonException;
@@ -33,18 +37,21 @@ import java.util.Objects;
  * .pth}), read by the restricted unpickler. Its files are those Hugging Face finds ({@link
  * SafetensorsCheckpoint} in kind): the shards an index maps ({@code pytorch_model.bin.index.json}), else every
  * {@code pytorch_model*.bin} / {@code .pt} / {@code .pth} file but an adapter's. A file is torch's zip container:
- * {@code archive/data.pkl} holds an ordered map of ({@code torch._utils._rebuild_tensor_v2}) views over {@code
+ * {@code <name>/data.pkl} holds an ordered map of ({@code torch._utils._rebuild_tensor_v2}) views over {@code
  * archive/data/<k>} storages. Only tensor views are served; the pickle's other entries are skipped with a log
- * (the container is the checkpoint's weights). Views are checked for offset, stride and contiguity; the caps of
+ * (the container is the checkpoint's weights). A value that is a torchao tensor subclass ({@code
+ * _rebuild_from_type_v2} over {@code _rebuild_wrapper_subclass}, with its inner {@code _rebuild_tensor_v3} views)
+ * is served as a {@link TorchaoWeight} for the shared decoder; its flattened inner tensors are not served.
+ * Views are checked for offset, stride and contiguity; the caps of
  * safetensors (file and tensor counts, index size) hold, and the pickle runs under {@link RestrictedUnpickler}'s
- * own limits, nothing executed (§3.6).
+ * own limits, nothing executed.
  *
  * <p>The files occupy the virtual address space as safetensors files do ({@code V_f = Σ align64(dataLength_g)}),
  * one segment per stored (uncompressed) storage entry plus one for the pickle itself, so the weights digest
  * covers the pickle and the storages, and a tensor of a stored entry keeps its direct virtual offset and is
  * mapped in place. {@code head.pt} and the registry's rule 6 keep the decision hooks' named refusals.</p>
  */
-public final class TorchCheckpoint implements CheckpointContainer {
+public final class TorchCheckpoint implements CheckpointContainer, TorchaoCheckpoints.Source {
 
     private static final Logger LOGGER = LogManager.getLogger(TorchCheckpoint.class);
 
@@ -54,7 +61,7 @@ public final class TorchCheckpoint implements CheckpointContainer {
     public static final String PREFIX = "pytorch_model";
     /** An adapter's weights, never part of a model checkpoint found by file name. */
     public static final String ADAPTER_MODEL = "adapter_model";
-    /** The entry name of a container's pickle. */
+    /** The entry name of a container's pickle ({@code archive/data.pkl} in older torch versions). */
     public static final String PICKLE_ENTRY = "archive/data.pkl";
     /** Most files of one checkpoint. */
     public static final int MAX_FILES = 10_000;
@@ -88,6 +95,9 @@ public final class TorchCheckpoint implements CheckpointContainer {
     private static final class Parse {
         final Map<String, TorchStorage> storages = new LinkedHashMap<>();
         final List<NamedView> views = new ArrayList<>();
+        final List<TorchaoWeight> torchao = new ArrayList<>();
+        TorchZipReader.Entry pickle;
+        String prefix = TorchStorage.ARCHIVE;
     }
 
     /** A tensor name and its pickled view. */
@@ -107,17 +117,20 @@ public final class TorchCheckpoint implements CheckpointContainer {
     private final List<DataSegment> segments;
     private final List<StTensor> tensors;
     private final Map<String, Located> byName;
+    private final List<TorchaoWeight> torchaoWeights;
     private final List<SafetensorsFile> sideFiles = new ArrayList<>();
     private volatile boolean closed;
 
     private TorchCheckpoint(String description, Path modelDir, List<TorchZipReader> files,
-                            List<DataSegment> segments, List<StTensor> tensors, Map<String, Located> byName) {
+                            List<DataSegment> segments, List<StTensor> tensors, Map<String, Located> byName,
+                            List<TorchaoWeight> torchaoWeights) {
         this.description = description;
         this.modelDir = modelDir;
         this.files = files;
         this.segments = segments;
         this.tensors = tensors;
         this.byName = byName;
+        this.torchaoWeights = Collections.unmodifiableList(new ArrayList<>(torchaoWeights));
     }
 
     /**
@@ -301,12 +314,13 @@ public final class TorchCheckpoint implements CheckpointContainer {
         List<DataSegment> segments = new ArrayList<>();
         List<StTensor> tensors = new ArrayList<>();
         Map<String, Located> byName = new HashMap<>();
+        List<TorchaoWeight> torchao = new ArrayList<>();
         long base = 0;
         int count = 0;
         for (int f = 0; f < files.size(); f++) {
             TorchZipReader zip = files.get(f);
             Parse parse = parsePickle(configDir, zip);
-            TorchZipReader.Entry pickle = zip.entry(PICKLE_ENTRY);
+            TorchZipReader.Entry pickle = parse.pickle;
             Map<TorchStorage, Long> storageBases = new LinkedHashMap<>();
             if (pickle.size() > 0) {
                 segments.add(new DataSegment(zip.path().toString(), pickle.dataOffset(), base, pickle.size()));
@@ -322,7 +336,7 @@ public final class TorchCheckpoint implements CheckpointContainer {
                 base = align(base, storage.length());
             }
             for (NamedView named : parse.views) {
-                StTensor tensor = tensor(configDir, zip, named);
+                StTensor tensor = tensor(zip, named);
                 TorchStorage storage = (TorchStorage) named.view.storage();
                 Long storageBase = storageBases.get(storage);
                 long direct = storageBase == null ? -1 : Math.addExact(storageBase, tensor.begin());
@@ -339,25 +353,32 @@ public final class TorchCheckpoint implements CheckpointContainer {
                 }
                 tensors.add(tensor);
             }
+            for (TorchaoWeight w : parse.torchao) {
+                for (TorchaoWeight existing : torchao) {
+                    if (existing.name().equals(w.name())) {
+                        throw new IOException("Invalid Hugging Face checkpoint '" + configDir + "': tensor '"
+                                + w.name() + "' is a torchao tensor in both '" + files.get(f).path()
+                                + "' and another file");
+                    }
+                }
+                torchao.add(w);
+            }
         }
         String description = "PyTorch checkpoint '" + configDir + "' (" + files.size() + " file"
                 + (files.size() == 1 ? "" : "s") + ", " + tensors.size() + " tensors)";
         return new TorchCheckpoint(description, configDir, files, Collections.unmodifiableList(segments),
-                Collections.unmodifiableList(tensors), byName);
+                Collections.unmodifiableList(tensors), byName, Collections.unmodifiableList(torchao));
     }
 
     /** The pickle of {@code zip}, its persistent ids resolved into the parse's storages and tensor views. */
     private static Parse parsePickle(Path configDir, TorchZipReader zip) throws IOException {
-        TorchZipReader.Entry pickle = zip.entry(PICKLE_ENTRY);
-        if (pickle == null || pickle.directory()) {
-            throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': it holds no '"
-                    + PICKLE_ENTRY + "' entry (not a torch.save container, or a legacy torch pickle)");
-        }
-        ByteBuffer data = zip.readAll(pickle);
         Parse out = new Parse();
+        out.pickle = pickleEntry(zip);
+        out.prefix = prefix(out.pickle.name());
+        ByteBuffer data = zip.readAll(out.pickle);
         Object root;
         try {
-            root = RestrictedUnpickler.unpickle(data.array(), id -> persistent(zip, id, out.storages));
+            root = RestrictedUnpickler.unpickle(data.array(), id -> persistent(zip, id, out.storages, out.prefix));
         } catch (IOException e) {
             close(Collections.singletonList(zip), e);
             throw e;
@@ -367,19 +388,53 @@ public final class TorchCheckpoint implements CheckpointContainer {
                     + name(root) + " instead of a map of tensors");
         }
         collect(zip, out, root, 0);
-        if (out.views.isEmpty()) {
-            throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': its " + PICKLE_ENTRY
+        if (out.views.isEmpty() && out.torchao.isEmpty()) {
+            throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': its " + out.pickle.name()
                     + " holds no tensors");
         }
         return out;
     }
 
-    /** A persistent id ({@code ('storage', <type>, <key>, <location>)}): the file's storage for its key. */
-    private static Object persistent(TorchZipReader zip, List<Object> id, Map<String, TorchStorage> storages)
-            throws IOException {
-        if (id.size() != 4) {
+    /** The container's pickle entry: {@code archive/data.pkl}, or the one {@code <name>/data.pkl} torch writes. */
+    private static TorchZipReader.Entry pickleEntry(TorchZipReader zip) throws IOException {
+        TorchZipReader.Entry archive = zip.entry(PICKLE_ENTRY);
+        if (archive != null && !archive.directory()) {
+            return archive;
+        }
+        TorchZipReader.Entry found = null;
+        for (TorchZipReader.Entry e : zip.entries()) {
+            if (!e.directory() && e.name().endsWith("/data.pkl")) {
+                if (found != null) {
+                    throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': it holds both '"
+                            + found.name() + "' and '" + e.name() + "' as its pickle");
+                }
+                found = e;
+            }
+        }
+        if (found == null) {
+            throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': it holds no '"
+                    + PICKLE_ENTRY + "' entry (not a torch.save container, or a legacy torch pickle)");
+        }
+        return found;
+    }
+
+    /** The archive directory of a pickle entry: {@code archive/} for {@code archive/data.pkl}. */
+    private static String prefix(String pickleName) throws IOException {
+        String prefix = pickleName.substring(0, pickleName.length() - "data.pkl".length());
+        if (!prefix.matches("[A-Za-z0-9_.-]+/")) {
+            throw new IOException("Invalid PyTorch checkpoint pickle path '" + pickleName + "': its archive"
+                    + " directory is not a single safe path component");
+        }
+        return prefix;
+    }
+
+    /** A persistent id ({@code ('storage', <type>, <key>, <location>[, <numel>])}): the file's storage. */
+    private static Object persistent(TorchZipReader zip, List<Object> id, Map<String, TorchStorage> storages,
+                                     String prefix) throws IOException {
+        if (id.size() != 4 && id.size() != 5) {
             throw new IOException("Invalid PyTorch checkpoint pickle: the persistent id carries " + id.size()
-                    + " values instead of the 4 of ('storage', <type>, <key>, <location>)");
+                    + " values instead of the 4 of ('storage', <type>, <key>, <location>) or the 5 of torch's"
+                    + " ('storage', <type>, <key>, <location>, <numel>)");
         }
         if (!"storage".equals(id.get(0))) {
             throw new IOException("Invalid PyTorch checkpoint pickle: the persistent id is '" + name(id.get(0))
@@ -401,7 +456,20 @@ public final class TorchCheckpoint implements CheckpointContainer {
             }
             return cached;
         }
-        TorchStorage storage = TorchStorage.of(zip, typeName, key, (String) id.get(3));
+        TorchStorage storage = TorchStorage.of(zip, typeName, key, (String) id.get(3), prefix);
+        if (id.size() == 5) {
+            if (!(id.get(4) instanceof Long) || (Long) id.get(4) < 0) {
+                throw new IOException("Invalid PyTorch checkpoint pickle: storage '" + key + "' carries " + name(
+                        id.get(4)) + " instead of a non-negative element count");
+            }
+            long numel = (Long) id.get(4);
+            long bytes = storage.dtype() == null ? numel
+                    : Math.multiplyExact(numel, (long) storage.elementBytes());
+            if (bytes != storage.length()) {
+                throw new IOException("Invalid PyTorch checkpoint pickle: storage '" + key + "' declares " + numel
+                        + " elements (" + bytes + " bytes) but holds " + storage.length() + " bytes");
+            }
+        }
         storages.put(key, storage);
         return storage;
     }
@@ -434,6 +502,21 @@ public final class TorchCheckpoint implements CheckpointContainer {
                 out.views.add(new NamedView(tensorName, (RestrictedUnpickler.TensorView) value));
                 continue;
             }
+            if (value instanceof TorchaoPickle.TensorObject) {
+                if (!(e.getKey() instanceof String)) {
+                    throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': tensor name "
+                            + name(e.getKey()) + " is not a string");
+                }
+                String tensorName = (String) e.getKey();
+                for (TorchaoWeight existing : out.torchao) {
+                    if (existing.name().equals(tensorName)) {
+                        throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': tensor '"
+                                + tensorName + "' appears twice in its pickle");
+                    }
+                }
+                out.torchao.add(torchao(zip, tensorName, (TorchaoPickle.TensorObject) value));
+                continue;
+            }
             if (value instanceof Map) {
                 collect(zip, out, value, depth + 1);
                 continue;
@@ -441,6 +524,85 @@ public final class TorchCheckpoint implements CheckpointContainer {
             LOGGER.debug("{}: skipping the pickle entry '{}' ({}), which is not a saved tensor", zip.path(),
                     e.getKey(), name(value));
         }
+    }
+
+    /**
+     * The torchao weight a wrapper subclass rebuilds: its inner tensor views become row sources, its other state
+     * fields (block size, shape, swizzle flag, activation kwargs) become attributes. Every field is checked to be a
+     * value the restricted unpickler models; nothing else is carried into the decode.
+     */
+    private static TorchaoWeight torchao(TorchZipReader zip, String name, TorchaoPickle.TensorObject obj)
+            throws IOException {
+        int dot = obj.type().lastIndexOf('.');
+        String simple = dot < 0 ? obj.type() : obj.type().substring(dot + 1);
+        if (!TorchaoPickle.TENSOR_SIMPLE_NAMES.contains(simple)) {
+            throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': tensor '" + name
+                    + "' is the torchao tensor subclass '" + obj.type() + "', which NeuralFree does not decode");
+        }
+        Map<String, Object> attributes = new LinkedHashMap<>();
+        Map<String, TorchaoWeight.Inner> inner = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : obj.state().entrySet()) {
+            Object value = e.getValue();
+            if (value instanceof RestrictedUnpickler.TensorView) {
+                RestrictedUnpickler.TensorView view = (RestrictedUnpickler.TensorView) value;
+                StTensor tensor = tensor(zip, new NamedView(name + "." + e.getKey(), view));
+                if (!(view.storage() instanceof TorchStorage)) {
+                    throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': tensor '" + name
+                            + "' inner tensor '" + e.getKey() + "' resolves to " + name(view.storage())
+                            + " instead of a storage of its archive");
+                }
+                inner.put(e.getKey(), new TorchaoWeight.Inner(tensor.dtype(), tensor.shape(),
+                        new Row((TorchStorage) view.storage(), tensor, -1), null));
+            } else {
+                field(name, e.getKey(), value, zip);
+                attributes.put(e.getKey(), value);
+            }
+        }
+        return new TorchaoWeight(name, simple, obj.view().size(), attributes, inner);
+    }
+
+    /** Checks that a torchao state field is a value the restricted unpickler models. */
+    private static void field(String tensor, String field, Object value, TorchZipReader zip) throws IOException {
+        if (value == null || value instanceof String || value instanceof Long || value instanceof Boolean
+                || value instanceof Double || value instanceof TorchaoPickle.EnumValue) {
+            return;
+        }
+        if (value instanceof TorchaoPickle.AttributeObject) {
+            TorchaoPickle.AttributeObject o = (TorchaoPickle.AttributeObject) value;
+            for (Map.Entry<String, Object> e : o.state().entrySet()) {
+                field(tensor, field + "." + e.getKey(), e.getValue(), zip);
+            }
+            return;
+        }
+        if (value instanceof TorchaoPickle.WrapperView || value instanceof TorchaoPickle.TensorObject) {
+            throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': torchao tensor '" + tensor
+                    + "' field '" + field + "' holds a nested tensor subclass, which NeuralFree does not decode");
+        }
+        if (value instanceof Object[]) {
+            for (Object item : (Object[]) value) {
+                field(tensor, field, item, zip);
+            }
+            return;
+        }
+        if (value instanceof List) {
+            for (Object item : (List<?>) value) {
+                field(tensor, field, item, zip);
+            }
+            return;
+        }
+        if (value instanceof Map) {
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) value).entrySet()) {
+                if (!(e.getKey() instanceof String)) {
+                    throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': torchao tensor '"
+                            + tensor + "' field '" + field + "' has a non-string key");
+                }
+                field(tensor, field + "." + e.getKey(), e.getValue(), zip);
+            }
+            return;
+        }
+        throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': torchao tensor '" + tensor
+                + "' field '" + field + "' is " + name(value) + ", which is not a serialized tensor or plain"
+                + " attribute");
     }
 
     private static String name(Object value) {
@@ -469,7 +631,7 @@ public final class TorchCheckpoint implements CheckpointContainer {
     }
 
     /** The stored tensor entry of a view: element count, offset, contiguity and storage bounds checked. */
-    private static StTensor tensor(Path configDir, TorchZipReader zip, NamedView named) throws IOException {
+    private static StTensor tensor(TorchZipReader zip, NamedView named) throws IOException {
         RestrictedUnpickler.TensorView view = named.view;
         if (!(view.storage() instanceof TorchStorage)) {
             throw new IOException("Invalid PyTorch checkpoint file '" + zip.path() + "': the persistent id of tensor '"
@@ -493,10 +655,22 @@ public final class TorchCheckpoint implements CheckpointContainer {
                     + "' has a shape " + Arrays.toString(view.size()) + " whose element count overflows a 64-bit"
                     + " integer", e);
         }
-        long elemBytes = storage.dtype().bits() / 8;
+        StDType dtype = storage.dtype();
+        if (view.dtype() != null) {
+            dtype = TorchaoPickle.dtype(view.dtype());
+            if (dtype == null) {
+                throw new IOException("Invalid PyTorch checkpoint file '" + file + "': tensor '" + named.name
+                        + "' names the element dtype '" + view.dtype() + "', which NeuralFree does not store");
+            }
+        }
+        if (dtype == null) {
+            throw new IOException("Invalid PyTorch checkpoint file '" + file + "': tensor '" + named.name
+                    + "' is stored in an untyped storage without a dtype");
+        }
+        long elemBytes = dtype.bits() / 8;
         if (numel > Long.MAX_VALUE / elemBytes) {
             throw new IOException("Invalid PyTorch checkpoint file '" + file + "': tensor '" + named.name + "' of "
-                    + numel + " " + storage.dtype().headerName() + " elements overflows a 64-bit byte count");
+                    + numel + " " + dtype.headerName() + " elements overflows a 64-bit byte count");
         }
         long byteLength = numel * elemBytes;
         long begin;
@@ -516,7 +690,7 @@ public final class TorchCheckpoint implements CheckpointContainer {
                     + "' spans bytes [" + begin + ", " + (begin + byteLength) + ") of storage '" + storage.key()
                     + "' of " + storage.length() + " bytes");
         }
-        return new StTensor(named.name, storage.dtype(), view.size(), begin, byteLength);
+        return new StTensor(named.name, dtype, view.size(), begin, byteLength);
     }
 
     /** The torch contiguity test (the view's own strides match its shape as PyTorch lays them out). */
@@ -561,6 +735,11 @@ public final class TorchCheckpoint implements CheckpointContainer {
     public RowSource source(String name) {
         Located loc = locate(name);
         return new Row(loc.storage, loc.tensor, loc.virtualOffset);
+    }
+
+    @Override
+    public List<TorchaoWeight> torchaoWeights() {
+        return torchaoWeights;
     }
 
     @Override

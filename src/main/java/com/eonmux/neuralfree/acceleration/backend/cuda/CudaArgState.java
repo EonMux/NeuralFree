@@ -125,7 +125,7 @@ public final class CudaArgState {
         int count = sticky.count();
         for (int i = 0; i < count; i++) {
             Object value = sticky.get(i);
-            if (value instanceof CudaGpuBuffer && ((CudaGpuBuffer) value).isClosed()) {
+            if (value instanceof CudaBuffer && ((CudaBuffer) value).isClosed()) {
                 throw new IllegalStateException("arg " + i + " of " + sticky.kernelName()
                         + " is a CUDA buffer that was closed after it was set");
             }
@@ -141,6 +141,29 @@ public final class CudaArgState {
     /** The underlying argument snapshots. */
     public StickyArgs sticky() {
         return sticky;
+    }
+
+    /**
+     * Deep-cloned copy of the current argument values, in argument order: buffers by identity, scalars
+     * boxed, arrays cloned, unset indices null. A captured command graph node keeps this as the record
+     * of what its parameters hold.
+     */
+    public Object[] snapshotValues() {
+        int n = sticky.count();
+        Object[] out = new Object[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = sticky.isSet(i) ? KernelArgs.snapshot(sticky.get(i), null) : null;
+        }
+        return out;
+    }
+
+    /**
+     * The live parameter holder of argument {@code i}: the array whose bytes the kernel parameters
+     * point at, or null when the argument was never set. A graph patch writes the new value into it,
+     * so the next node-parameter update reads it. Callers must not replace the holder object.
+     */
+    Object holder(int i) {
+        return i >= 0 && i < holders.length ? holders[i] : null;
     }
 
     /** The build-time signature launches are checked against, or null. */
@@ -294,11 +317,11 @@ public final class CudaArgState {
     }
 
     private CUdeviceptr devicePointerOf(GpuBuffer buffer, int index) {
-        if (!(buffer instanceof CudaGpuBuffer)) {
+        if (!(buffer instanceof CudaBuffer)) {
             throw new IllegalArgumentException("arg " + index + " of " + sticky.kernelName() + " is a "
                     + buffer.getClass().getSimpleName() + ", not a CUDA buffer");
         }
-        CudaGpuBuffer cuda = (CudaGpuBuffer) buffer;
+        CudaBuffer cuda = (CudaBuffer) buffer;
         if (cuda.backend() != backend) {
             throw new IllegalArgumentException("arg " + index + " of " + sticky.kernelName()
                     + " is a buffer of another CUDA backend");

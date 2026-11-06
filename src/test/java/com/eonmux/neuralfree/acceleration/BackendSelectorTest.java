@@ -260,10 +260,18 @@ public class BackendSelectorTest {
 
         assertNull(s.backend);
         assertNull(s.chosen);
-        assertEquals(Arrays.asList(
+        List<String> expected = new ArrayList<>(Arrays.asList(
                 "CUDA on '" + RTX_CUDA.name() + "': rejected CUDA",
                 "OpenCL on '" + RTX_OPENCL.name() + "': rejected OPENCL",
-                "Vulkan: no devices found"), s.reasons);
+                "Metal: not enumerated",
+                "Vulkan: no devices found",
+                "HIP: not enumerated"));
+        for (BackendType api : BackendType.values()) {
+            if (api.isAccelerator()) {
+                expected.add(api.label() + ": not enumerated");
+            }
+        }
+        assertEquals(expected, s.reasons);
         assertTrue(fakeOf(BackendType.CUDA, RTX_CUDA.name()).closed);
         assertTrue(fakeOf(BackendType.OPENCL, RTX_OPENCL.name()).closed);
     }
@@ -338,9 +346,21 @@ public class BackendSelectorTest {
         assertEquals(BackendSelector.DEFAULT_ORDER, BackendSelector.parseOrder(null));
         assertEquals(BackendSelector.DEFAULT_ORDER, BackendSelector.parseOrder("  "));
         assertEquals(Arrays.asList(BackendType.CUDA, BackendType.OPENCL), BackendSelector.parseOrder(" CUDA , opencl "));
-        assertRejected("metal");
+        assertEquals(Collections.singletonList(BackendType.SYCL), BackendSelector.parseOrder("level-zero"));
+        assertRejected("not-an-api");
         assertRejected("cuda,Cuda");
         assertRejected(" , ");
+    }
+
+    @Test
+    public void orderParsingAndLabelsCoverHip() {
+        assertEquals(Collections.singletonList(BackendType.HIP), BackendSelector.parseOrder("hip"));
+        assertEquals("HIP stays the last built-in API", BackendType.HIP,
+                BackendSelector.parseOrder(null).get(4));
+        assertEquals("the accelerator APIs follow the built-in ones", BackendType.SYCL,
+                BackendSelector.parseOrder(null).get(5));
+        assertEquals("HIP", BackendSelector.label(BackendType.HIP));
+        assertEquals("Metal", BackendSelector.label(BackendType.METAL));
     }
 
     private static void assertRejected(String spec) {

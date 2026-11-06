@@ -3,6 +3,9 @@ package com.eonmux.neuralfree.server;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
 import com.eonmux.neuralfree.gguf.engine.InfillPrompt;
+import com.eonmux.neuralfree.gguf.engine.LogprobsMode;
+import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
+import com.eonmux.neuralfree.gguf.engine.lora.LoraSlotKey;
 import com.eonmux.neuralfree.gguf.grammar.ConstraintSpec;
 import com.eonmux.neuralfree.utils.json.JsonView;
 import io.vertx.core.http.HttpServerRequest;
@@ -20,12 +23,14 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * llama.cpp's native completion, {@code POST /completion} and {@code /completions} (its OpenAI form is
  * {@code /v1/completions}): llama.cpp's prompt forms ({@link LlamaPrompts}), {@code n_predict} as the budget,
- * {@code n_probs}, {@code response_fields} and every sampler and grammar field the OpenAI routes take. One prompt
- * answers one object, several an array of them. A stream sends {@code data:} chunks of each released piece and a
+ * {@code n_probs} (with {@code post_sampling_probs}), {@code return_tokens}, {@code response_fields}, the
+ * per-request {@code reasoning_format} (llama.cpp's server-schema.cpp:313) and every sampler and grammar field the
+ * OpenAI routes take. One prompt answers one object, several an array of them. A stream sends {@code data:} chunks of each released piece and a
  * final object per prompt, with no {@code [DONE]} marker.
  *
  * <p>{@code POST /infill} answers the same way over a fill-in-the-middle prompt ({@link InfillPrompt}):
@@ -42,9 +47,19 @@ public class LlamaCompletionResource {
     @Inject
     HttpServerRequest http;
 
+    /** The multi-model router; null in manual wiring, where requests serve on {@code service} directly. */
+    @Inject
+    ModelRouter router;
+
     /** Test and manual wiring: builds the resource over an explicit service. */
     public LlamaCompletionResource(EngineService service) {
+        this(service, null);
+    }
+
+    /** Test and manual wiring over an explicit service and router. */
+    public LlamaCompletionResource(EngineService service, ModelRouter router) {
         this.service = service;
+        this.router = router;
     }
 
     public LlamaCompletionResource() {
@@ -55,8 +70,10 @@ public class LlamaCompletionResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response completion(String bodyText) {
-        ServerJson.requireLoaded(service);
-        return OpenAiResource.mapped(() -> completionOf(ServerJson.parse(bodyText)));
+        JsonView body = ServerJson.parse(bodyText);
+        EngineService target = ModelRouter.target(router, service, body, null);
+        ServerJson.requireLoaded(target);
+        return OpenAiResource.mapped(() -> completionOf(target, body));
     }
 
     @POST
@@ -72,15 +89,19 @@ public class LlamaCompletionResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response infill(String bodyText) {
-        ServerJson.requireLoaded(service);
-        return OpenAiResource.mapped(() -> infillOf(ServerJson.parse(bodyText)));
+        JsonView body = ServerJson.parse(bodyText);
+        EngineService target = ModelRouter.target(router, service, body, null);
+        ServerJson.requireLoaded(target);
+        return OpenAiResource.mapped(() -> infillOf(target, body));
     }
 
-    private Response completionOf(JsonView body) {
-        return respond(body, LlamaPrompts.of(body.raw("prompt"), service));
+    private Response completionOf(EngineService service, JsonView body) {
+        String model = service.loras().model(body);
+        Supplier<LoraSlotKey> mediaLoras = ChatPlan.mediaLoras(service, service.loras().selection(body, model));
+        return respond(service, body, LlamaPrompts.generation(body.raw("prompt"), service, mediaLoras));
     }
 
-    private Response infillOf(JsonView body) {
+    private Response infillOf(EngineService service, JsonView body) {
         String missing = service.infillMissingTokens();
         if (missing != null) {
             throw ServerJson.error(501, "Infill is not supported by this model: " + missing, "not_supported_error");
@@ -100,7 +121,7 @@ public class LlamaCompletionResource {
         int[] promptTokens = prompt.isEmpty() ? new int[0] : service.encode(prompt, false, true);
         int nPredict = body.raw("n_predict") == null ? -1 : body.i32("n_predict");
         int[] tokens = service.infillPrompt(prefix, suffix, extraChunks(body), promptTokens, nPredict);
-        return respond(body, List.of(tokens));
+        return respond(service, body, List.of(new LlamaPrompts.Prompt(tokens, null)));
     }
 
     /** {@code input_extra}: an array of {@code {"filename": string, "text": string}}, filename optional. */
@@ -126,21 +147,30 @@ public class LlamaCompletionResource {
         return out;
     }
 
-    private Response respond(JsonView body, List<int[]> prompts) {
-        String model = service.served().resolve(body);
-        int nProbs = Math.max(0, body.optI32("n_probs", 0));
-        if (Boolean.TRUE.equals(body.raw("post_sampling_probs"))) {
-            throw ServerJson.badRequest("post_sampling_probs is not supported: the probabilities are the model's,"
-                    + " before the sampler chain");
+    private Response respond(EngineService service, JsonView body, List<LlamaPrompts.Prompt> prompts) {
+        if (body.raw(com.eonmux.neuralfree.gguf.engine.kvtransfer.KvTransferParams.FIELD) != null) {
+            throw ServerJson.badRequest("kv_transfer_params is not supported on llama.cpp's /completion and /infill:"
+                    + " send the disaggregated prefill/decode request to /v1/completions or /v1/chat/completions");
         }
-        GenerationRequest request = request(body, nProbs);
+        String model = service.loras().model(body);
+        int nProbs = Math.max(0, body.optI32("n_probs", 0));
+        boolean postSampling = body.optBool("post_sampling_probs", false);
+        GenerationRequest request = service.loras().apply(body, model, request(body, nProbs, postSampling,
+                service.vocabSize(), service.logitsProcessors(), service.options().watermark()));
+        OpenAiRequests.requireServedPriority(request, service.schedulingPolicy());
         ConstraintSpec constraint = OpenAiRequests.constraint(body);
         OpenAiRequests.requireGenerationBudget(prompts.size(), 1);
+        // llama.cpp's per-request reasoning_format (server-schema.cpp:313) over the configured parser
+        ReasoningFilter reasoning = ReasoningFormats.fromBody(body, service.reasoning(),
+                body.optBool("stream", false));
         List<GenerationBatch.Job> jobs = new ArrayList<>();
-        for (int[] prompt : prompts) {
-            jobs.add(new GenerationBatch.Job(prompt, request, null, constraint));
+        for (LlamaPrompts.Prompt prompt : prompts) {
+            jobs.add(prompt.media() == null
+                    ? new GenerationBatch.Job(prompt.tokens(), request, null, constraint, reasoning)
+                    : GenerationBatch.Job.ofMedia(prompt.media(), request, null, constraint, reasoning));
         }
-        LlamaCompletionBodies bodies = new LlamaCompletionBodies(service, model, nProbs, fields(body));
+        LlamaCompletionBodies bodies = new LlamaCompletionBodies(service, model, nProbs, postSampling,
+                body.optBool("return_tokens", false), fields(body));
         boolean streamed = body.optBool("stream", false);
         GenerationBatch batch = GenerationBatch.start(service, jobs, http);
         if (streamed) {
@@ -155,9 +185,17 @@ public class LlamaCompletionResource {
         return Response.ok(ServerJson.write(results.size() == 1 ? results.get(0) : results)).build();
     }
 
-    /** The OpenAI request mapping with llama.cpp's {@code n_predict} as the budget (-1 unlimited). */
-    private static GenerationRequest request(JsonView body, int nProbs) {
-        GenerationRequest base = OpenAiRequests.sampling(body, nProbs > 0 ? nProbs : -1);
+    /**
+     * The OpenAI request mapping with llama.cpp's {@code n_predict} as the budget (-1 unlimited), its probabilities
+     * the model's ({@link LogprobsMode#RAW_LOGPROBS}, llama.cpp's default) or with {@code post_sampling_probs} the
+     * sampler chain's ({@link LogprobsMode#PROCESSED_LOGPROBS}).
+     */
+    private static GenerationRequest request(JsonView body, int nProbs, boolean postSampling, int vocabSize,
+                                             com.eonmux.neuralfree.gguf.engine.sampling.LogitsProcessors processors,
+                                             com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig watermark) {
+        GenerationRequest base = OpenAiRequests.sampling(body, nProbs > 0 ? nProbs : -1, vocabSize, -1,
+                postSampling ? LogprobsMode.PROCESSED_LOGPROBS : LogprobsMode.RAW_LOGPROBS,
+                processors, watermark);
         if (body.raw("n_predict") == null) {
             return base;
         }
@@ -186,8 +224,8 @@ public class LlamaCompletionResource {
         return out;
     }
 
-    private void stream(OutputStream out, GenerationBatch batch, LlamaCompletionBodies bodies, List<int[]> prompts,
-                        GenerationRequest request) throws IOException {
+    private void stream(OutputStream out, GenerationBatch batch, LlamaCompletionBodies bodies,
+                        List<LlamaPrompts.Prompt> prompts, GenerationRequest request) throws IOException {
         LlamaStreamChunks chunks = new LlamaStreamChunks(batch.size());
         try {
             int done = 0;
@@ -216,16 +254,17 @@ public class LlamaCompletionResource {
 
     /** Writes one token's chunk when it released text or carries its logprobs. */
     private static void chunk(OutputStream out, GenerationBatch batch, LlamaCompletionBodies bodies,
-                              List<int[]> prompts, GenerationBatch.Text piece) throws IOException {
+                              List<LlamaPrompts.Prompt> prompts, GenerationBatch.Text piece) throws IOException {
         if (piece == null || piece.text().isEmpty() && piece.logprobs() == null) {
             return;
         }
         int i = piece.choice();
-        ServerJson.event(out, null, bodies.partial(i, piece, prompts.get(i).length, batch.sequence(i)));
+        ServerJson.event(out, null, bodies.partial(i, piece, prompts.get(i).rows(), batch.sequence(i)));
     }
 
     private static void finish(OutputStream out, GenerationBatch batch, LlamaCompletionBodies bodies,
-                               List<int[]> prompts, GenerationRequest request, int choice) throws IOException {
+                               List<LlamaPrompts.Prompt> prompts, GenerationRequest request, int choice)
+            throws IOException {
         String failure = batch.failure(choice);
         if (failure != null) {
             ServerJson.event(out, null, ServerJson.errorBody(failure, "server_error"));

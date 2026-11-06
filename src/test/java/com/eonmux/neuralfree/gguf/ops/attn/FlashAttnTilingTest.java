@@ -23,29 +23,31 @@ public class FlashAttnTilingTest {
 
     @Test
     public void decodePlansForCommonHeadDims() {
-        // max splits = max(ceil(n_kv / maxSplitLen), min(wanted, ceil(n_kv / 128))), wanted = ceil(2 CU / groups).
-        assertDecode(FlashAttnTiling.decode(32, 32, 128, 128, N_KV, SMEM_48K, CU), 1, 11136, 3);
-        assertDecode(FlashAttnTiling.decode(32, 8, 128, 128, N_KV, SMEM_48K, CU), 4, 2688, 10);
-        assertDecode(FlashAttnTiling.decode(8, 4, 256, 256, N_KV, SMEM_48K, CU), 2, 5376, 20);
-        assertDecode(FlashAttnTiling.decode(16, 2, 512, 512, N_KV, SMEM_48K, CU), 8, 896, 32);
-        assertDecode(FlashAttnTiling.decode(32, 32, 128, 128, N_KV, SMEM_MIN, CU), 1, 2944, 3);
-        assertDecode(FlashAttnTiling.decode(32, 8, 128, 128, N_KV, SMEM_MIN, CU), 4, 640, 10);
-        assertDecode(FlashAttnTiling.decode(8, 4, 256, 256, N_KV, SMEM_MIN, CU), 2, 1280, 20);
-        // gemma4-style d=512 with 8 heads per KV head: g*512 <= 3072/2 gives g <= 3, balanced as 3+3+2.
+        // One query head per workgroup (g_tile = 1): n_head workgroups, maxSplitLen = roundDown32(smem
+        // - d_k - 4 * d_v), max splits = max(ceil(n_kv / maxSplitLen), min(wanted, ceil(n_kv / minSplitLen))),
+        // wanted = ceil(2 CU / (n_head_kv * groupTiles)).
+        assertDecode(FlashAttnTiling.decode(32, 32, 128, 128, N_KV, SMEM_48K, CU), 1, 10624, 3);
+        assertDecode(FlashAttnTiling.decode(32, 8, 128, 128, N_KV, SMEM_48K, CU), 1, 10624, 3);
+        assertDecode(FlashAttnTiling.decode(8, 4, 256, 256, N_KV, SMEM_48K, CU), 1, 9984, 10);
+        assertDecode(FlashAttnTiling.decode(16, 2, 512, 512, N_KV, SMEM_48K, CU), 1, 8704, 5);
+        assertDecode(FlashAttnTiling.decode(32, 32, 128, 128, N_KV, SMEM_MIN, CU), 1, 2432, 3);
+        assertDecode(FlashAttnTiling.decode(32, 8, 128, 128, N_KV, SMEM_MIN, CU), 1, 2432, 3);
+        assertDecode(FlashAttnTiling.decode(8, 4, 256, 256, N_KV, SMEM_MIN, CU), 1, 1792, 10);
+        // gemma4-style d=512 with 8 heads per KV head: eight one-head tiles over the eight heads.
         FlashAttnTiling d512 = FlashAttnTiling.decode(16, 2, 512, 512, N_KV, SMEM_MIN, CU);
-        assertDecode(d512, 3, 512, 14);
-        assertEquals(3, d512.groupTiles());
+        assertDecode(d512, 1, 512, 8);
+        assertEquals(8, d512.groupTiles());
     }
 
     @Test
     public void decodePlansForMlaLatentCache() {
         // d_k = kv_lora + rope = 576, d_v = kv_lora = 512, one KV head for 128 query heads.
         FlashAttnTiling big = FlashAttnTiling.decode(128, 1, 576, 512, N_KV, SMEM_48K, CU);
-        assertDecode(big, 8, 832, 5);
+        assertDecode(big, 1, 8640, 1);
         assertEquals(SMEM_48K, big.smemUsed());
-        assertEquals(16, big.groupTiles());
+        assertEquals(128, big.groupTiles());
         FlashAttnTiling small = FlashAttnTiling.decode(128, 1, 576, 512, N_KV, SMEM_MIN, CU);
-        assertDecode(small, 2, 960, 5);
+        assertDecode(small, 1, 448, 10);
         assertEquals(SMEM_MIN, small.smemUsed());
     }
 
@@ -73,8 +75,8 @@ public class FlashAttnTilingTest {
         FlashAttnTiling t = FlashAttnTiling.prefill(32, 32, 128, 128, N_KV, 1100, CU);
         assertEquals(FlashAttnTiling.Plan.PER_ROW_DECODE, t.plan());
         assertEquals(1, t.gTile());
-        assertEquals(960, t.maxSplitLen());
-        assertEquals(5, t.maxSplits());
+        assertEquals(448, t.maxSplitLen());
+        assertEquals(10, t.maxSplits());
         // wanted = ceil(80 / 32) = 3 splits: split_len = roundUp32(ceil(1000 / 3)) = 352.
         FlashAttnTiling.Split s = t.decodeSplit(1000);
         assertEquals(3, s.count());
@@ -89,8 +91,17 @@ public class FlashAttnTilingTest {
             for (int dK = 4; dK <= FlashAttnTiling.MAX_HEAD_DIM; dK += 4) {
                 for (int dV : new int[]{dK, Math.max(4, dK - 64)}) {
                     for (int smem : new int[]{SMEM_MIN, SMEM_48K}) {
-                        FlashAttnTiling dec = FlashAttnTiling.decode(hh[0], hh[1], dK, dV, 32768, smem, CU);
-                        checkDecodeConstraints(dec);
+                        // One decode workgroup needs d_k + 4 * d_v + 32 floats; larger dims only plan
+                        // where that fits (the smallest budgets otherwise have no decode kernel).
+                        boolean oneHeadFits = (long) dK + FlashAttnTiling.PASS2_GROUPS * dV
+                                + FlashAttnTiling.SPLIT_QUANTUM <= smem;
+                        if (oneHeadFits) {
+                            checkDecodeConstraints(FlashAttnTiling.decode(hh[0], hh[1], dK, dV, 32768, smem, CU));
+                        } else {
+                            final int h0 = hh[0], h1 = hh[1], fk = dK, fv = dV, fs = smem;
+                            assertThrows(IllegalArgumentException.class, () -> FlashAttnTiling
+                                    .decode(h0, h1, fk, fv, 32768, fs, CU));
+                        }
                         FlashAttnTiling pre = FlashAttnTiling.prefill(hh[0], hh[1], dK, dV, 32768, smem, CU);
                         if (pre.plan() == FlashAttnTiling.Plan.TILED) {
                             checkTiledConstraints(pre);
@@ -105,37 +116,37 @@ public class FlashAttnTilingTest {
 
     @Test
     public void decodeSplitsFollowTheLiveKeyCount() {
-        // 8 workgroups per split on 40 compute units: wanted = 10 splits, split_len in [128, 2688].
+        // 32 heads on 40 compute units: wanted = ceil(80 / 32) = 3 splits, split_len in [32, 10624].
         FlashAttnTiling t = FlashAttnTiling.decode(32, 8, 128, 128, N_KV, SMEM_48K, CU);
-        assertEquals(128, t.minSplitLen());
+        assertEquals(32, t.minSplitLen());
         assertEquals(N_KV, t.keyCapacity());
-        assertSplit(t.decodeSplit(0), 1, 128);
-        FlashAttnTiling.Split one = t.decodeSplit(128);
-        assertSplit(one, 1, 128);
+        assertSplit(t.decodeSplit(0), 1, 32);
+        FlashAttnTiling.Split one = t.decodeSplit(32);
+        assertSplit(one, 1, 32);
         assertTrue(one.direct());
-        FlashAttnTiling.Split two = t.decodeSplit(129);
-        assertSplit(two, 2, 128);
+        FlashAttnTiling.Split two = t.decodeSplit(33);
+        assertSplit(two, 2, 32);
         assertFalse(two.direct());
-        assertSplit(t.decodeSplit(1000), 8, 128);
-        assertSplit(t.decodeSplit(2000), 9, 224);
-        assertSplit(t.decodeSplit(N_KV), 10, 416);
+        assertSplit(t.decodeSplit(1000), 3, 352);
+        assertSplit(t.decodeSplit(2000), 3, 672);
+        assertSplit(t.decodeSplit(N_KV), 3, 1376);
         assertThrows(IllegalArgumentException.class, () -> t.decodeSplit(N_KV + 1));
         assertThrows(IllegalArgumentException.class, () -> t.decodeSplit(-1));
-        assertArrayEquals(new long[]{10 * 128, 8 * 1}, t.decodeGlobal(10));
+        assertArrayEquals(new long[]{3 * 128, 8 * 4}, t.decodeGlobal(3));
         assertArrayEquals(new long[]{128, 1}, FlashAttnTiling.decodeLocal());
-        assertEquals(32L * 10 * 130, t.decodePartialFloats());
+        assertEquals(32L * 3 * 130, t.decodePartialFloats());
     }
 
     @Test
     public void largeContextDecodeFillsTheDeviceAtShortPositions() {
         // Llama-3-8B shape on 80 compute units with a 131072-row cache: short live ranges still split.
         FlashAttnTiling t = FlashAttnTiling.decode(32, 8, 128, 128, 131072, SMEM_48K, 80);
-        assertEquals(2688, t.maxSplitLen());
-        assertEquals(49, t.maxSplits());
-        assertSplit(t.decodeSplit(1000), 8, 128);
-        assertSplit(t.decodeSplit(5000), 20, 256);
-        assertSplit(t.decodeSplit(131072), 49, 2688);
-        assertEquals(32L * 49 * 130, t.decodePartialFloats());
+        assertEquals(10624, t.maxSplitLen());
+        assertEquals(13, t.maxSplits());
+        assertSplit(t.decodeSplit(1000), 5, 224);
+        assertSplit(t.decodeSplit(5000), 5, 1024);
+        assertSplit(t.decodeSplit(131072), 13, 10624);
+        assertEquals(32L * 13 * 130, t.decodePartialFloats());
     }
 
     @Test

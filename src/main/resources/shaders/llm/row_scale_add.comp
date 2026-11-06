@@ -1,0 +1,32 @@
+/* row_scale_add.comp - LLM_RowScaleAdd: per-channel scaled row add. GLSL twin of kernels/llm/speech.cl.
+ * Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i rows, i cols, i scale_off, R a, R b, R scale, W y).
+ *   y[r][c] = a[r][c] + b[r][c] * scale[scale_off + c]
+ * y must not overlap a, b or scale. Dispatch: 1-D, one invocation per element, global = roundUp(rows*cols, L),
+ * local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfRsaA { float a_in[]; };
+layout(std430, binding = 1) readonly buffer NfRsaB { float b_in[]; };
+layout(std430, binding = 2) readonly buffer NfRsaS { float scale_in[]; };
+layout(std430, binding = 3) writeonly buffer NfRsaY { float y_out[]; };
+
+layout(push_constant) uniform NfRsaParams {
+    int rows;
+    int cols;
+    int scale_off;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.rows) * uint(pc.cols)) {
+        return;
+    }
+    const uint c = idx % uint(pc.cols);
+    y_out[idx] = a_in[idx] + b_in[idx] * scale_in[uint(pc.scale_off) + c];
+}

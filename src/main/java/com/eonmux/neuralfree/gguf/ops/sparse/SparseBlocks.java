@@ -15,6 +15,7 @@ import com.eonmux.neuralfree.gguf.memory.RotationPlan;
 import com.eonmux.neuralfree.gguf.ops.mla.MlaBlocks;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
 import com.eonmux.neuralfree.gguf.spec.DsaSpec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MlaSpec;
@@ -75,8 +76,7 @@ public final class SparseBlocks {
      * Checks that a layer is a DSA sparse-MLA layer this family runs.
      *
      * @throws IllegalArgumentException      when the layer's mixer kind is not {@link MixerKind#DSA_MLA}
-     * @throws UnsupportedOperationException for a pooled (QSA) indexer, a Q path without the {@code q_lora} rank, a
-     *                                       non-absorbed or decompressed MLA cache, or MLA without RoPE
+     * @throws UnsupportedOperationException for a pooled (QSA) indexer or a non-absorbed or decompressed MLA cache
      */
     static void checkVariant(LayerSpec layer) {
         Objects.requireNonNull(layer, "layer");
@@ -91,16 +91,9 @@ public final class SparseBlocks {
             throw new UnsupportedOperationException(where + ": the pooled QSA indexer (kpool " + dsa.kpool()
                     + ") is not a DSA sparse-MLA layer");
         }
-        if (mla.qLoraRank() <= 0) {
-            throw new UnsupportedOperationException(where + ": DSA needs the q_lora path (wq_a, attn_q_a_norm, wq_b),"
-                    + " whose normalized rank also feeds the indexer queries (deepseek32.cpp:207-218)");
-        }
         if (!mla.absorbed() || !mla.latentCache()) {
             throw new UnsupportedOperationException(where + ": DSA attends over the absorbed latent cache only"
                     + " (llama-graph.cpp:3402-3478); neuralfree.mla.cache=decompressed is not supported for DSA");
-        }
-        if (!mla.ropeApplied() || layer.rope() == null) {
-            throw new UnsupportedOperationException(where + ": DSA MLA layers apply RoPE to q_pe and k_pe");
         }
     }
 
@@ -191,7 +184,9 @@ public final class SparseBlocks {
                 throw new IllegalStateException("layer " + layer.stack() + "." + layer.il() + ": the DSA indexer"
                         + " needs its Hadamard rotation but the indexer cache plan " + rotation + " does not rotate");
             }
-            RopeSpec r = indexerRope(dsa, layer.rope());
+            // a NoPE layer of a mixed rope pattern (mistral-large4) rotates neither its indexer queries nor its keys
+            RopeSpec r = layer.mla() != null && layer.mla().ropeApplied()
+                    ? indexerRope(dsa, layer.rope()) : null;
             int offset = r != null && dsa.ropeTail() ? dsa.indexerHeadDim() - dsa.indexerRopeDim() : 0;
             return builder()
                     .heads(dsa.indexerHeads(), dsa.indexerHeadDim())
@@ -206,10 +201,11 @@ public final class SparseBlocks {
 
         /**
          * The RoPE of the indexer q/k: {@code dsa.indexerRopeDim()} dims of type {@code dsa.ropeType()} with the
-         * layer's frequency base, scaling and YaRN parameters and no frequency factors (the graphs pass
-         * {@code nullptr}: deepseek32.cpp:225-227 and 240-242, glm-dsa.cpp:261-263, dots3note.cpp:214-216 and
-         * 227-229, hy-v4.cpp:361-374). The YaRN correction dims are recomputed when the dim count differs from the
-         * layer's. Null when the indexer applies no RoPE.
+         * layer's frequency base, scaling and YaRN parameters and, when the layer's RoPE carries them, its learned
+         * frequency factors (the LeRoPE {@code rope_freqs} of mistral-large4, mistral-large4.cpp:252-262); the other
+         * graphs pass {@code nullptr} and their layer RoPE has no factors (deepseek32.cpp:225-227 and 240-242,
+         * glm-dsa.cpp:261-263, dots3note.cpp:214-216 and 227-229, hy-v4.cpp:361-374). The YaRN correction dims are
+         * recomputed when the dim count differs from the layer's. Null when the indexer applies no RoPE.
          *
          * @throws IllegalStateException when the indexer needs RoPE and the layer has none
          */
@@ -238,6 +234,7 @@ public final class SparseBlocks {
                     .yarn(base.extFactor(), base.attnFactor(), base.betaFast(), base.betaSlow())
                     .corrDims(lo, hi)
                     .nCtxOrig(base.nCtxOrig())
+                    .freqFactors(base.freqFactors())
                     .textPositions(base.textPositions());
             if (dsa.ropeType().usesSections()) {
                 b.sections(base.sections());
@@ -346,6 +343,10 @@ public final class SparseBlocks {
      * {@code n_head * head_v} outputs (hy-v4.cpp:486-488), {@code attn_sinks} (hy-v4.cpp:483), the
      * {@code attn_output.scale} of {@code build_lora_mm} (llama-graph.cpp:1643-1645) and the indexer key-norm weight
      * and bias, which glm-dsa loads as optional (glm-dsa.cpp:134-135; {@code build_norm} skips an absent operand).
+     * mistral-large4 adds the direct {@code attn_q} path, the SSMax per-head query temperatures ({@code attn_ssmax},
+     * {@code indexer.ssmax}), the layer-normed indexer queries ({@code indexer.q_norm}) and NoPE layers of a mixed
+     * rope pattern, which absorb the whole query head and zero-pad the rope dims of Q and of the latent row
+     * (mistral-large4.cpp:85-101, 181-190, 232-241, 345-378).
      *
      * <p>A shared layer reads the top-k its source layer left in the shared selection buffer, so the source must be
      * an earlier full DSA layer with the same top-k width and no full DSA layer may lie between them (it would
@@ -360,6 +361,7 @@ public final class SparseBlocks {
         static final String WQ_A = TensorNames.weight(TensorNames.ATTN_Q_A);
         static final String Q_A_NORM = TensorNames.weight(TensorNames.ATTN_Q_A_NORM);
         static final String WQ_B = TensorNames.weight(TensorNames.ATTN_Q_B);
+        static final String WQ = TensorNames.weight(TensorNames.ATTN_Q);
         static final String WKV_A = TensorNames.weight(TensorNames.ATTN_KV_A_MQA);
         static final String KV_A_NORM = TensorNames.weight(TensorNames.ATTN_KV_A_NORM);
         static final String K_PE_NORM = TensorNames.weight(TensorNames.ATTN_K_NORM);
@@ -374,18 +376,32 @@ public final class SparseBlocks {
         static final String IDX_K = TensorNames.weight(TensorNames.INDEXER_ATTN_K);
         static final String IDX_K_NORM = TensorNames.weight(TensorNames.INDEXER_K_NORM);
         static final String IDX_K_NORM_B = TensorNames.bias(TensorNames.INDEXER_K_NORM);
+        static final String SSMAX = TensorNames.weight(TensorNames.ATTN_SSMAX);
+        static final String SSMAX_B = TensorNames.bias(TensorNames.ATTN_SSMAX);
+        static final String IDX_SSMAX = TensorNames.weight(TensorNames.INDEXER_SSMAX);
+        static final String IDX_SSMAX_B = TensorNames.bias(TensorNames.INDEXER_SSMAX);
+        static final String IDX_Q_NORM = TensorNames.weight(TensorNames.INDEXER_Q_NORM);
+        static final String IDX_Q_NORM_B = TensorNames.bias(TensorNames.INDEXER_Q_NORM);
 
         final String where;
         final int nEmbd;
         final int nHead;
+        /** Q low-rank rank, 0 when the layer projects Q directly with {@code attn_q}. */
         final int qLora;
         final int kvLora;
+        /** Query dims absorbed into the latent and padded rope dims, see the class layout description. */
         final int nope;
         final int rope;
+        /** Query head width: {@code nope} for a NoPE layer, {@code nope + rope} for a roped one. */
         final int headK;
         final int headV;
         /** Latent row and absorbed query head width, {@code kvLora + rope}. */
         final int dK;
+        /** The layer rotates {@code q_pe} / {@code k_pe}; false for a NoPE layer of a mixed rope pattern. */
+        final boolean ropeApplied;
+        final boolean ssmax;
+        final boolean indexerSsmax;
+        final boolean indexerQueryNorm;
         final float kqScale;
         final float softcap;
         /** {@code f_norm_rms_eps} of {@code attn_q_a_norm}, {@code attn_kv_a_norm} and {@code attn_k_norm}. */
@@ -399,6 +415,9 @@ public final class SparseBlocks {
         final boolean woScale;
         final boolean full;
         final int sourceLayer;
+        /** The layer reads another layer's KV cache ({@code attention.kv_source_map}). */
+        final boolean kvShared;
+        final int kvSourceLayer;
         final int topK;
         final int idxHeads;
         final int idxDim;
@@ -414,43 +433,74 @@ public final class SparseBlocks {
             this.nHead = mla.nHead();
             this.qLora = mla.qLoraRank();
             this.kvLora = mla.kvLoraRank();
-            this.nope = mla.headKNope();
+            this.ropeApplied = mla.ropeApplied();
             this.rope = mla.headKRope();
-            this.headK = mla.headK();
             this.headV = mla.headV();
+            // a NoPE layer of a mixed rope pattern absorbs the whole query head into the latent and pads the
+            // latent row's rope dims with zeros (mistral-large4.cpp:85-87, 192-197, 345-378)
+            this.nope = ropeApplied ? mla.headKNope() : mla.headKNope() + mla.headKRope();
+            this.headK = nope + (ropeApplied ? rope : 0);
             this.dK = kvLora + rope;
             this.kqScale = mla.kqScale();
             this.softcap = layer.attention() != null ? layer.attention().softcap() : 0f;
             this.rmsEps = spec.hparams().normRmsEps();
             this.normEps = spec.hparams().normEps();
-            this.ropeSpec = layer.rope();
+            this.ropeSpec = ropeSpec(layer, ropeApplied, rope);
             this.full = dsa.full();
             this.sourceLayer = dsa.sourceLayer();
+            AttentionSpec attention = layer.attention();
+            this.kvShared = attention != null && attention.sharesKv(layer.il());
+            this.kvSourceLayer = kvShared ? attention.kvOwnerLayer() : layer.il();
+            if (kvShared && (kvSourceLayer < 0 || kvSourceLayer >= layer.il())) {
+                throw new IllegalStateException(where + ": reads the KV cache of layer " + kvSourceLayer
+                        + ", which is not an earlier layer");
+            }
             this.topK = dsa.topK();
             this.idxHeads = dsa.indexerHeads();
             this.idxDim = dsa.indexerHeadDim();
+            this.ssmax = dsa.ssmax();
             if (layer.il() >= spec.nLayer()) {
                 throw new IllegalStateException(where + " is a NextN block; llama.cpp runs NextN/MTP blocks as dense"
                         + " MLA without the DSA indexer (llama-model.cpp:2830-2836, glm-dsa.cpp:519-526)");
             }
-            if (RopeMath.rotatedWidth(ropeSpec.type(), ropeSpec.nDims()) != rope) {
-                throw new IllegalStateException(where + ": the layer RoPE rotates " + ropeSpec.nDims()
-                        + " dims of type " + ropeSpec.type() + ", the MLA rope part q_pe / k_pe has " + rope
-                        + " (both are hparams.n_rot(), deepseek32.cpp:166, 350-355)");
-            }
 
-            matrix(shapes, WQ_A, nEmbd, qLora);
-            vector(shapes, Q_A_NORM, qLora);
-            matrix(shapes, WQ_B, qLora, (long) nHead * headK);
-            matrix(shapes, WKV_A, nEmbd, dK);
-            vector(shapes, KV_A_NORM, kvLora);
+            if (qLora > 0) {
+                matrix(shapes, WQ_A, nEmbd, qLora);
+                vector(shapes, Q_A_NORM, qLora);
+                matrix(shapes, WQ_B, qLora, (long) nHead * headK);
+            } else {
+                matrix(shapes, WQ, nEmbd, (long) nHead * headK);
+            }
+            if (!kvShared) {
+                matrix(shapes, WKV_A, nEmbd, kvLora + (ropeApplied ? rope : 0));
+                vector(shapes, KV_A_NORM, kvLora);
+            } else {
+                // a shared layer may still carry the projections its source layer uses; check them when present
+                optionalMatrix(shapes, WKV_A, nEmbd, kvLora + (ropeApplied ? rope : 0));
+                optionalVector(shapes, KV_A_NORM, kvLora);
+            }
             matrix(shapes, WK_B, nope, (long) kvLora * nHead);
             matrix(shapes, WV_B, kvLora, (long) headV * nHead);
             matrix(shapes, WO, (long) nHead * headV, nEmbd);
 
             this.kPeNorm = MlaBlocks.kPeNorm(layer);
             if (kPeNorm) {
+                if (kvShared) {
+                    throw new IllegalStateException(where + ": " + K_PE_NORM + " normalizes a rotary key the layer"
+                            + " does not store; it reads layer " + kvSourceLayer + "'s cache");
+                }
+                if (!ropeApplied) {
+                    throw new IllegalStateException(where + ": " + K_PE_NORM + " normalizes a rotary key the layer"
+                            + " does not rotate (a NoPE layer of a mixed rope pattern)");
+                }
                 vector(shapes, K_PE_NORM, rope);
+            }
+            if (ssmax) {
+                vector(shapes, SSMAX, nHead);
+                vector(shapes, SSMAX_B, nHead);
+            } else {
+                rejectIfPresent(shapes, SSMAX);
+                rejectIfPresent(shapes, SSMAX_B);
             }
             long[] g = shapes.shape(GATE);
             if (g == null) {
@@ -473,7 +523,20 @@ public final class SparseBlocks {
                 vector(shapes, WO_SCALE, 1);
             }
             if (full) {
-                matrix(shapes, IDX_Q_B, qLora, (long) idxHeads * idxDim);
+                this.indexerQueryNorm = dsa.indexerQueryNorm();
+                long idxIn = indexerQueryNorm ? nEmbd : qLora;
+                if (idxIn <= 0) {
+                    throw new IllegalStateException(where + ": the indexer queries need the q_lora row or the"
+                            + " layer-normed input of " + IDX_Q_NORM + " (indexer.attn_q_b reads " + idxIn + " values)");
+                }
+                if (indexerQueryNorm) {
+                    vector(shapes, IDX_Q_NORM, nEmbd);
+                    vector(shapes, IDX_Q_NORM_B, nEmbd);
+                } else {
+                    rejectIfPresent(shapes, IDX_Q_NORM);
+                    rejectIfPresent(shapes, IDX_Q_NORM_B);
+                }
+                matrix(shapes, IDX_Q_B, idxIn, (long) idxHeads * idxDim);
                 matrix(shapes, IDX_PROJ, nEmbd, idxHeads);
                 matrix(shapes, IDX_K, nEmbd, idxDim);
                 this.idxKeyNorm = shapes.shape(IDX_K_NORM) != null;
@@ -484,13 +547,57 @@ public final class SparseBlocks {
                 if (idxKeyBias) {
                     vector(shapes, IDX_K_NORM_B, idxDim);
                 }
+                this.indexerSsmax = ssmax;
+                if (indexerSsmax) {
+                    vector(shapes, IDX_SSMAX, idxHeads);
+                    vector(shapes, IDX_SSMAX_B, idxHeads);
+                } else {
+                    rejectIfPresent(shapes, IDX_SSMAX);
+                    rejectIfPresent(shapes, IDX_SSMAX_B);
+                }
             } else {
+                this.indexerQueryNorm = false;
+                this.indexerSsmax = false;
                 this.idxKeyNorm = false;
                 this.idxKeyBias = false;
                 checkSharedSource(spec, layer);
             }
             SparseKernels.checkTopK(topK);
             SparseKernels.checkSparseMla(nHead, kvLora, rope, topK);
+        }
+
+        /**
+         * The layer's rotary spec, or null for a NoPE layer. A NoPE layer of a mixed rope pattern keeps the roped
+         * cache layout ({@code headKRope} dims) but rotates nothing; its mixer pads those dims with zeros
+         * (mistral-large4.cpp:192-197, 376-377, 414-416).
+         */
+        private RopeSpec ropeSpec(LayerSpec layer, boolean applied, int ropeDims) {
+            RopeSpec r = layer.rope();
+            if (!applied) {
+                if (r != null) {
+                    throw new IllegalStateException(where + ": the layer's MLA spec applies no RoPE but the layer"
+                            + " carries a rotary spec " + r);
+                }
+                return null;
+            }
+            if (r == null) {
+                throw new IllegalStateException(where + ": the MLA layer applies RoPE to its " + ropeDims
+                        + " rotary dims but the layer spec has no RoPE");
+            }
+            if (RopeMath.rotatedWidth(r.type(), r.nDims()) != ropeDims) {
+                throw new IllegalStateException(where + ": the layer RoPE rotates " + r.nDims()
+                        + " dims of type " + r.type() + ", the MLA rope part q_pe / k_pe has " + ropeDims
+                        + " (both are hparams.n_rot(), deepseek32.cpp:166, 350-355)");
+            }
+            return r;
+        }
+
+        /** Refuses a tensor whose feature the layer's DSA spec does not enable, instead of ignoring it. */
+        private void rejectIfPresent(ShapeSource shapes, String suffix) {
+            if (shapes.shape(suffix) != null) {
+                throw new IllegalStateException(where + ": " + suffix + " is present, but the layer's DSA spec"
+                        + " does not enable that feature");
+            }
         }
 
         /**
@@ -561,6 +668,22 @@ public final class SparseBlocks {
         private void vector(ShapeSource shapes, String suffix, long n) {
             long[] s = required(shapes, suffix);
             if (s[0] * s[1] != n) {
+                throw new IllegalStateException(where + ": " + suffix + " holds " + s[0] * s[1] + " values, expected "
+                        + n);
+            }
+        }
+
+        private void optionalMatrix(ShapeSource shapes, String suffix, long cols, long rows) {
+            long[] s = shapes.shape(suffix);
+            if (s != null && (s[0] != cols || s[1] != rows)) {
+                throw new IllegalStateException(where + ": " + suffix + " has shape [" + s[0] + ", " + s[1]
+                        + "], expected [" + cols + ", " + rows + "]");
+            }
+        }
+
+        private void optionalVector(ShapeSource shapes, String suffix, long n) {
+            long[] s = shapes.shape(suffix);
+            if (s != null && s[0] * s[1] != n) {
                 throw new IllegalStateException(where + ": " + suffix + " holds " + s[0] * s[1] + " values, expected "
                         + n);
             }

@@ -5,7 +5,8 @@ package com.eonmux.neuralfree.tensor;
  * {@code ConvTranspose2d}, {@code MaxPool2d}, {@code AvgPool2d} and {@code AdaptiveAvgPool2d}, in the modules' loop
  * order and Java float arithmetic, and the backward passes of {@link GpuConvGradOps}, in the order its kernels
  * document. Operands are read in row-major order ({@link Tensor#toFloatArray()}, so they must be FLOAT32) and each
- * result is uploaded as a new contiguous FLOAT32 tensor on the operands' backend with {@code requiresGrad} false.
+ * result is uploaded as a new contiguous FLOAT32 tensor on the operands' backend with {@code requiresGrad} false. The
+ * forwards take FLOAT64 operands to {@link CpuFloat64Conv}.
  *
  * <p>Callers validate every argument first: {@link ConvOps} offers each op to {@link GpuConvOps} or
  * {@link GpuConvGradOps}, which check the shapes, parameters and backends and that every output size lies in
@@ -25,6 +26,9 @@ final class CpuConvPool {
     /** {@code nn/layers/Conv2d} forward: input {@code [B, C, H, W]}, weight {@code [OC, C/groups, KH, KW]}. */
     static Tensor conv2d(Tensor input, Tensor weight, Tensor bias, int[] kernelSize, int[] stride, int[] padding,
                          int[] dilation, int groups) {
+        if (CpuFloat64.applies("conv2d", input, weight, bias)) {
+            return CpuFloat64Conv.conv2d(input, weight, bias, kernelSize, stride, padding, dilation, groups);
+        }
         Shape inputShape = input.shape();
         int batch = inputShape.dim(0);
         int inChannels = inputShape.dim(1);
@@ -92,6 +96,9 @@ final class CpuConvPool {
     /** {@code nn/layers/Conv1d} forward: input {@code [B, C, L]}, weight {@code [OC, C/groups, K]}. */
     static Tensor conv1d(Tensor input, Tensor weight, Tensor bias, int kernelSize, int stride, int padding,
                          int dilation, int groups) {
+        if (CpuFloat64.applies("conv1d", input, weight, bias)) {
+            return CpuFloat64Conv.conv1d(input, weight, bias, kernelSize, stride, padding, dilation, groups);
+        }
         Shape inputShape = input.shape();
         int batch = inputShape.dim(0);
         int inChannels = inputShape.dim(1);
@@ -147,6 +154,10 @@ final class CpuConvPool {
      */
     static Tensor convTranspose2d(Tensor input, Tensor weight, Tensor bias, int[] kernelSize, int[] stride,
                                   int[] padding, int[] outputPadding, int[] dilation, int groups) {
+        if (CpuFloat64.applies("convTranspose2d", input, weight, bias)) {
+            return CpuFloat64Conv.convTranspose2d(input, weight, bias, kernelSize, stride, padding, outputPadding,
+                    dilation, groups);
+        }
         Shape inputShape = input.shape();
         int batch = inputShape.dim(0);
         int inChannels = inputShape.dim(1);
@@ -219,6 +230,9 @@ final class CpuConvPool {
      */
     static Tensor maxPool2d(Tensor input, int[] kernelSize, int[] stride, int[] padding, int[] dilation,
                             boolean ceilMode) {
+        if (CpuFloat64.applies("maxPool2d", input)) {
+            return CpuFloat64Conv.maxPool2d(input, kernelSize, stride, padding, dilation, ceilMode);
+        }
         Shape inputShape = input.shape();
         int batch = inputShape.dim(0);
         int channels = inputShape.dim(1);
@@ -267,6 +281,9 @@ final class CpuConvPool {
      */
     static Tensor avgPool2d(Tensor input, int[] kernelSize, int[] stride, int[] padding, boolean ceilMode,
                             boolean countIncludePad) {
+        if (CpuFloat64.applies("avgPool2d", input)) {
+            return CpuFloat64Conv.avgPool2d(input, kernelSize, stride, padding, ceilMode, countIncludePad);
+        }
         Shape inputShape = input.shape();
         int planes = inputShape.dim(0) * inputShape.dim(1);
         int inH = inputShape.dim(2);
@@ -325,6 +342,9 @@ final class CpuConvPool {
      * order from 0 and divided once by the window's element count; a window without input elements yields 0.
      */
     static Tensor adaptiveAvgPool2d(Tensor input, int outH, int outW) {
+        if (CpuFloat64.applies("adaptiveAvgPool2d", input)) {
+            return CpuFloat64Conv.adaptiveAvgPool2d(input, outH, outW);
+        }
         Shape inputShape = input.shape();
         int batch = inputShape.dim(0);
         int channels = inputShape.dim(1);

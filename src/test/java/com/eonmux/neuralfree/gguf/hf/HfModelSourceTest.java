@@ -18,6 +18,7 @@ import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.arch.HfResources;
 import com.eonmux.neuralfree.gguf.hf.config.HfQuantMethod;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadata;
+import com.eonmux.neuralfree.gguf.hf.HfFileType;
 import com.eonmux.neuralfree.gguf.hf.quant.HfQuantRewriter;
 import com.eonmux.neuralfree.gguf.hf.st.CheckpointContainer;
 import com.eonmux.neuralfree.gguf.hf.st.CheckpointContainers;
@@ -344,6 +345,26 @@ public class HfModelSourceTest {
     }
 
     @Test
+    public void theCheckpointsResponseTemplateReachesTheView() throws IOException {
+        String withTemplate = SyntheticHf.GPT2_TOKENIZER_CONFIG.substring(0,
+                SyntheticHf.GPT2_TOKENIZER_CONFIG.lastIndexOf('}'))
+                + ", \"response_template\": {\"start_anchor\": \"<s>\", \"fields\": {\"content\": {},"
+                + " \"thinking\": {\"open\": \"<think>\", \"close\": \"</think>\"}}}}";
+        Path dir = write(llama().tokenizerConfigJson(withTemplate));
+        try (HfModelSource s = HfModelSource.open(dir, options, null)) {
+            String json = s.getString(GgufKeys.TOKENIZER_RESPONSE_TEMPLATE);
+            assertTrue("the template travels as a JSON string", json != null);
+            assertEquals(Arrays.asList("content", "thinking"), new ArrayList<>(
+                    com.eonmux.neuralfree.gguf.chat.response.ResponseTemplate.parse(json).forServing().fields()
+                            .keySet()));
+        }
+        try (HfModelSource s = HfModelSource.open(write(llama()), options, null)) {
+            assertNull("a checkpoint without the field carries none",
+                    s.getString(GgufKeys.TOKENIZER_RESPONSE_TEMPLATE));
+        }
+    }
+
+    @Test
     public void modelSourcesOpensCheckpointDirectoriesAndFiles() throws IOException {
         Path dir = write(llama());
         try (ModelSource s = ModelSources.open(dir.toString(), options, null)) {
@@ -418,6 +439,24 @@ public class HfModelSourceTest {
         }
     }
 
+    @Test
+    public void mtpOnlyKeepsTheNextnHeadAndTheSharedRoots() throws IOException {
+        Path dir = write(llamaWithMtp());
+        ModelSourceOptions mtpOnly = options.toBuilder().draftMode(ModelSourceOptions.DraftMode.MTP_ONLY).build();
+        try (HfModelSource s = HfModelSource.open(dir, mtpOnly, null)) {
+            assertEquals("the extended block count stays, as the converter's mtp_only classes keep it", 3,
+                    s.context().blockCount());
+            List<String> names = names(s.getTensors());
+            assertEquals("the shared embedding, final norm and head plus the MTP block", 3 + 9, names.size());
+            assertTrue(names.containsAll(block(2)));
+            assertTrue(names.contains("token_embd.weight"));
+            assertTrue(names.contains("output_norm.weight"));
+            for (String n : names) {
+                assertFalse("a trunk tensor leaked: " + n, n.startsWith("blk.0.") || n.startsWith("blk.1."));
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ output type
 
     @Test
@@ -442,6 +481,36 @@ public class HfModelSourceTest {
             assertEquals(GGMLType.F16, s.plan().type("blk.0.attn_q.weight"));
             assertEquals(GGMLType.F16, s.plan().type("blk.1.attn_q.weight"));
             assertEquals("fp8", s.getString(GgufKeys.NF_SOURCE_QUANT_METHOD));
+        }
+    }
+
+    @Test
+    public void autoOutTypePreservesE4m3WeightsAsGgmlF8E4M3Fn() throws IOException {
+        SyntheticHf.Builder b = SyntheticHf.llama(LAYERS, DIM, HEADS, KV_HEADS, VOCAB, StDType.F16)
+                .config(config("'torch_dtype':'float16','quantization_config':{'quant_method':'fp8',"
+                        + "'activation_scheme':'dynamic'}"));
+        byte[] codes = new byte[DIM * DIM];
+        for (int i = 0; i < codes.length; i++) {
+            codes[i] = (byte) (((i * 37) & 0x7E) + (i % 2 == 0 ? 0x00 : 0x81));
+        }
+        b.tensor(L0 + "self_attn.q_proj.weight", StDType.F8_E4M3, new long[]{DIM, DIM}, codes);
+        b.tensor(L0 + "self_attn.q_proj.weight_scale_inv", StDType.F32, new long[]{}, SyntheticHf.f32(0.25f));
+        Path dir = write(b);
+
+        ModelSourceOptions auto = options.toBuilder().outType(OutType.AUTO).build();
+        try (HfModelSource s = HfModelSource.open(dir, auto, null);
+             WeightStore store = s.createMappedStore(StoreUse.RESIDENT_UPLOAD)) {
+            assertEquals("the codes store as ggml's per-element F8_E4M3FN", GGMLType.F8_E4M3FN,
+                    s.plan().type("blk.0.attn_q.weight"));
+            assertArrayEquals("the codes are stored byte for byte", codes,
+                    read(store, info(s, "blk.0.attn_q.weight")));
+            assertEquals("the scale rides as the .scale sibling", GGMLType.F32,
+                    info(s, "blk.0.attn_q.scale").type());
+            assertArrayEquals(new float[]{0.25f}, floats(read(store, info(s, "blk.0.attn_q.scale"))), 0f);
+            assertEquals("FP8 weights set general.file_type to MOSTLY_F8_E4M3", HfFileType.MOSTLY_F8_E4M3,
+                    intValue(s.getMetadata().get(GgufKeys.GENERAL_FILE_TYPE)));
+            assertFalse("the upstream type needs no extension marker",
+                    s.getTensors().stream().anyMatch(t -> t.type().isExtension()));
         }
     }
 

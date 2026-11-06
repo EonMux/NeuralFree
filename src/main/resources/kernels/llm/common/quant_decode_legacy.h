@@ -38,6 +38,12 @@ NF_INLINE uint nf_ql_q5_hbit(uint qh, int e) {
     return ((qh >> e) & 1u) << 4;
 }
 
+/* Nibble k of a four-byte quant word: k in [0, 4) is the low nibble of byte k, k in [4, 8) the high
+ * nibble of byte k - 4 (one 8-element group: element k low, element k + 16 high). */
+NF_INLINE uint nf_ql_nib(uint q, int k) {
+    return (q >> (8 * (k & 3) + 4 * (k >> 2))) & 0xFu;
+}
+
 /* Start of block i/BS of row tok in a [rows x dim] weight with BB-byte blocks (64-bit offsets). */
 NF_INLINE NF_GLOBAL const uchar* nf_ql_elem_block(NF_GLOBAL const uchar* weight, int dim, int tok,
                                                   int i, int bs, int bb) {
@@ -50,13 +56,14 @@ NF_INLINE NF_GLOBAL const uchar* nf_ql_elem_block(NF_GLOBAL const uchar* weight,
 NF_INLINE float Q4_0_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
                             int off, int blk, int ltid) {
     const float d = nf_ql_half(bp, 0);
-    const int bo = ltid * 4;
-    NF_GLOBAL const float* x = input + off + blk * Q4_0_BLOCK_SIZE + bo;
+    const uint q = nf_read_u32_u16(bp + 2 + ltid * 4);
+    NF_GLOBAL const float* x = input + off + blk * Q4_0_BLOCK_SIZE + ltid * 4;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float sum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const uint q = bp[2 + bo + j];
-        sum += (float)((int)(q & 0xFu) - 8) * x[j];
-        sum += (float)((int)(q >> 4) - 8) * x[j + 16];
+        sum += (float)((int)nf_ql_nib(q, j) - 8) * xa[j];
+        sum += (float)((int)nf_ql_nib(q, j + 4) - 8) * xa[j + 4];
     }
     return sum * d;
 }
@@ -65,14 +72,16 @@ NF_INLINE void Q4_0_decode_dual(NF_GLOBAL const uchar* gbp, NF_GLOBAL const ucha
                                 NF_GLOBAL const float* input, int off, int blk, int ltid,
                                 float* gs, float* us) {
     const float gd = nf_ql_half(gbp, 0), ud = nf_ql_half(ubp, 0);
-    const int bo = ltid * 4;
-    NF_GLOBAL const float* x = input + off + blk * Q4_0_BLOCK_SIZE + bo;
+    const uint gq = nf_read_u32_u16(gbp + 2 + ltid * 4), uq = nf_read_u32_u16(ubp + 2 + ltid * 4);
+    NF_GLOBAL const float* x = input + off + blk * Q4_0_BLOCK_SIZE + ltid * 4;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float gsum = 0.0f, usum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint gq = gbp[2 + bo + j], uq = ubp[2 + bo + j];
-        gsum += x0 * (float)((int)(gq & 0xFu) - 8) + x1 * (float)((int)(gq >> 4) - 8);
-        usum += x0 * (float)((int)(uq & 0xFu) - 8) + x1 * (float)((int)(uq >> 4) - 8);
+        gsum += (float)((int)nf_ql_nib(gq, j) - 8) * xa[j]
+              + (float)((int)nf_ql_nib(gq, j + 4) - 8) * xa[j + 4];
+        usum += (float)((int)nf_ql_nib(uq, j) - 8) * xa[j]
+              + (float)((int)nf_ql_nib(uq, j + 4) - 8) * xa[j + 4];
     }
     *gs += gsum * gd;
     *us += usum * ud;
@@ -92,14 +101,14 @@ NF_INLINE float Q4_0_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok
 NF_INLINE float Q4_1_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
                             int off, int blk, int ltid) {
     const float d = nf_ql_half(bp, 0), m = nf_ql_half(bp, 2);
-    const int bo = ltid * 4;
-    NF_GLOBAL const float* x = input + off + blk * Q4_1_BLOCK_SIZE + bo;
+    const uint q = nf_read_u32(bp + 4 + ltid * 4);
+    NF_GLOBAL const float* x = input + off + blk * Q4_1_BLOCK_SIZE + ltid * 4;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float qsum = 0.0f, xsum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint q = bp[4 + bo + j];
-        qsum += (float)(q & 0xFu) * x0 + (float)(q >> 4) * x1;
-        xsum += x0 + x1;
+        qsum += (float)nf_ql_nib(q, j) * xa[j] + (float)nf_ql_nib(q, j + 4) * xa[j + 4];
+        xsum += xa[j] + xa[j + 4];
     }
     return d * qsum + m * xsum;
 }
@@ -109,15 +118,15 @@ NF_INLINE void Q4_1_decode_dual(NF_GLOBAL const uchar* gbp, NF_GLOBAL const ucha
                                 float* gs, float* us) {
     const float gd = nf_ql_half(gbp, 0), gm = nf_ql_half(gbp, 2);
     const float ud = nf_ql_half(ubp, 0), um = nf_ql_half(ubp, 2);
-    const int bo = ltid * 4;
-    NF_GLOBAL const float* x = input + off + blk * Q4_1_BLOCK_SIZE + bo;
+    const uint gb = nf_read_u32(gbp + 4 + ltid * 4), ub = nf_read_u32(ubp + 4 + ltid * 4);
+    NF_GLOBAL const float* x = input + off + blk * Q4_1_BLOCK_SIZE + ltid * 4;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float gq = 0.0f, uq = 0.0f, xsum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint gb = gbp[4 + bo + j], ub = ubp[4 + bo + j];
-        gq += (float)(gb & 0xFu) * x0 + (float)(gb >> 4) * x1;
-        uq += (float)(ub & 0xFu) * x0 + (float)(ub >> 4) * x1;
-        xsum += x0 + x1;
+        gq += (float)nf_ql_nib(gb, j) * xa[j] + (float)nf_ql_nib(gb, j + 4) * xa[j + 4];
+        uq += (float)nf_ql_nib(ub, j) * xa[j] + (float)nf_ql_nib(ub, j + 4) * xa[j + 4];
+        xsum += xa[j] + xa[j + 4];
     }
     *gs += gd * gq + gm * xsum;
     *us += ud * uq + um * xsum;
@@ -138,16 +147,17 @@ NF_INLINE float Q4_1_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok
 NF_INLINE float Q5_0_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
                             int off, int blk, int ltid) {
     const float d = nf_ql_half(bp, 0);
-    const uint qh = read_u32_le(bp + 2);
+    const uint qh = nf_read_u32_u16(bp + 2);
+    const uint q = nf_read_u32_u16(bp + 6 + ltid * 4);
     const int bo = ltid * 4;
     NF_GLOBAL const float* x = input + off + blk * Q5_0_BLOCK_SIZE + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float sum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const int k = bo + j;
-        const uint q = bp[6 + k];
-        const int lo = (int)((q & 0xFu) | nf_ql_q5_hbit(qh, k)) - 16;
-        const int hi = (int)((q >> 4) | nf_ql_q5_hbit(qh, k + 16)) - 16;
-        sum += (float)lo * x[j] + (float)hi * x[j + 16];
+        const int lo = (int)(nf_ql_nib(q, j) | nf_ql_q5_hbit(qh, bo + j)) - 16;
+        const int hi = (int)(nf_ql_nib(q, j + 4) | nf_ql_q5_hbit(qh, bo + j + 16)) - 16;
+        sum += (float)lo * xa[j] + (float)hi * xa[j + 4];
     }
     return sum * d;
 }
@@ -156,20 +166,20 @@ NF_INLINE void Q5_0_decode_dual(NF_GLOBAL const uchar* gbp, NF_GLOBAL const ucha
                                 NF_GLOBAL const float* input, int off, int blk, int ltid,
                                 float* gs, float* us) {
     const float gd = nf_ql_half(gbp, 0), ud = nf_ql_half(ubp, 0);
-    const uint gqh = read_u32_le(gbp + 2), uqh = read_u32_le(ubp + 2);
+    const uint gqh = nf_read_u32_u16(gbp + 2), uqh = nf_read_u32_u16(ubp + 2);
+    const uint gq = nf_read_u32_u16(gbp + 6 + ltid * 4), uq = nf_read_u32_u16(ubp + 6 + ltid * 4);
     const int bo = ltid * 4;
     NF_GLOBAL const float* x = input + off + blk * Q5_0_BLOCK_SIZE + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float gsum = 0.0f, usum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const int k = bo + j;
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint gq = gbp[6 + k], uq = ubp[6 + k];
-        const int glo = (int)((gq & 0xFu) | nf_ql_q5_hbit(gqh, k)) - 16;
-        const int ghi = (int)((gq >> 4) | nf_ql_q5_hbit(gqh, k + 16)) - 16;
-        const int ulo = (int)((uq & 0xFu) | nf_ql_q5_hbit(uqh, k)) - 16;
-        const int uhi = (int)((uq >> 4) | nf_ql_q5_hbit(uqh, k + 16)) - 16;
-        gsum += (float)glo * x0 + (float)ghi * x1;
-        usum += (float)ulo * x0 + (float)uhi * x1;
+        const int glo = (int)(nf_ql_nib(gq, j) | nf_ql_q5_hbit(gqh, bo + j)) - 16;
+        const int ghi = (int)(nf_ql_nib(gq, j + 4) | nf_ql_q5_hbit(gqh, bo + j + 16)) - 16;
+        const int ulo = (int)(nf_ql_nib(uq, j) | nf_ql_q5_hbit(uqh, bo + j)) - 16;
+        const int uhi = (int)(nf_ql_nib(uq, j + 4) | nf_ql_q5_hbit(uqh, bo + j + 16)) - 16;
+        gsum += (float)glo * xa[j] + (float)ghi * xa[j + 4];
+        usum += (float)ulo * xa[j] + (float)uhi * xa[j + 4];
     }
     *gs += gsum * gd;
     *us += usum * ud;
@@ -191,18 +201,17 @@ NF_INLINE float Q5_0_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok
 NF_INLINE float Q5_1_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
                             int off, int blk, int ltid) {
     const float d = nf_ql_half(bp, 0), m = nf_ql_half(bp, 2);
-    const uint qh = read_u32_le(bp + 4);
+    const uint qh = nf_read_u32(bp + 4), q = nf_read_u32(bp + 8 + ltid * 4);
     const int bo = ltid * 4;
     NF_GLOBAL const float* x = input + off + blk * Q5_1_BLOCK_SIZE + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float qsum = 0.0f, xsum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const int k = bo + j;
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint q = bp[8 + k];
-        const uint lo = (q & 0xFu) | nf_ql_q5_hbit(qh, k);
-        const uint hi = (q >> 4) | nf_ql_q5_hbit(qh, k + 16);
-        qsum += (float)lo * x0 + (float)hi * x1;
-        xsum += x0 + x1;
+        const uint lo = nf_ql_nib(q, j) | nf_ql_q5_hbit(qh, bo + j);
+        const uint hi = nf_ql_nib(q, j + 4) | nf_ql_q5_hbit(qh, bo + j + 16);
+        qsum += (float)lo * xa[j] + (float)hi * xa[j + 4];
+        xsum += xa[j] + xa[j + 4];
     }
     return d * qsum + m * xsum;
 }
@@ -212,21 +221,21 @@ NF_INLINE void Q5_1_decode_dual(NF_GLOBAL const uchar* gbp, NF_GLOBAL const ucha
                                 float* gs, float* us) {
     const float gd = nf_ql_half(gbp, 0), gm = nf_ql_half(gbp, 2);
     const float ud = nf_ql_half(ubp, 0), um = nf_ql_half(ubp, 2);
-    const uint gqh = read_u32_le(gbp + 4), uqh = read_u32_le(ubp + 4);
+    const uint gqh = nf_read_u32(gbp + 4), uqh = nf_read_u32(ubp + 4);
+    const uint gq = nf_read_u32(gbp + 8 + ltid * 4), uq = nf_read_u32(ubp + 8 + ltid * 4);
     const int bo = ltid * 4;
     NF_GLOBAL const float* x = input + off + blk * Q5_1_BLOCK_SIZE + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float gsum = 0.0f, usum = 0.0f, xsum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const int k = bo + j;
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint gq = gbp[8 + k], uq = ubp[8 + k];
-        const uint glo = (gq & 0xFu) | nf_ql_q5_hbit(gqh, k);
-        const uint ghi = (gq >> 4) | nf_ql_q5_hbit(gqh, k + 16);
-        const uint ulo = (uq & 0xFu) | nf_ql_q5_hbit(uqh, k);
-        const uint uhi = (uq >> 4) | nf_ql_q5_hbit(uqh, k + 16);
-        gsum += (float)glo * x0 + (float)ghi * x1;
-        usum += (float)ulo * x0 + (float)uhi * x1;
-        xsum += x0 + x1;
+        const uint glo = nf_ql_nib(gq, j) | nf_ql_q5_hbit(gqh, bo + j);
+        const uint ghi = nf_ql_nib(gq, j + 4) | nf_ql_q5_hbit(gqh, bo + j + 16);
+        const uint ulo = nf_ql_nib(uq, j) | nf_ql_q5_hbit(uqh, bo + j);
+        const uint uhi = nf_ql_nib(uq, j + 4) | nf_ql_q5_hbit(uqh, bo + j + 16);
+        gsum += (float)glo * xa[j] + (float)ghi * xa[j + 4];
+        usum += (float)ulo * xa[j] + (float)uhi * xa[j + 4];
+        xsum += xa[j] + xa[j + 4];
     }
     *gs += gd * gsum + gm * xsum;
     *us += ud * usum + um * xsum;
@@ -247,12 +256,14 @@ NF_INLINE float Q5_1_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok
 NF_INLINE float IQ4_NL_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
                               int off, int blk, int ltid) {
     const float d = nf_ql_half(bp, 0);
-    const int bo = ltid * 4;
-    NF_GLOBAL const float* x = input + off + blk * IQ4_NL_BLOCK_SIZE + bo;
+    const uint q = nf_read_u32_u16(bp + 2 + ltid * 4);
+    NF_GLOBAL const float* x = input + off + blk * IQ4_NL_BLOCK_SIZE + ltid * 4;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float sum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const uint q = bp[2 + bo + j];
-        sum += x[j] * IQ4_NL_KVALUES[q & 0xFu] + x[j + 16] * IQ4_NL_KVALUES[q >> 4];
+        sum += xa[j] * IQ4_NL_KVALUES[nf_ql_nib(q, j)]
+             + xa[j + 4] * IQ4_NL_KVALUES[nf_ql_nib(q, j + 4)];
     }
     return sum * d;
 }
@@ -261,14 +272,16 @@ NF_INLINE void IQ4_NL_decode_dual(NF_GLOBAL const uchar* gbp, NF_GLOBAL const uc
                                   NF_GLOBAL const float* input, int off, int blk, int ltid,
                                   float* gs, float* us) {
     const float gd = nf_ql_half(gbp, 0), ud = nf_ql_half(ubp, 0);
-    const int bo = ltid * 4;
-    NF_GLOBAL const float* x = input + off + blk * IQ4_NL_BLOCK_SIZE + bo;
+    const uint gq = nf_read_u32_u16(gbp + 2 + ltid * 4), uq = nf_read_u32_u16(ubp + 2 + ltid * 4);
+    NF_GLOBAL const float* x = input + off + blk * IQ4_NL_BLOCK_SIZE + ltid * 4;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float gsum = 0.0f, usum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint gq = gbp[2 + bo + j], uq = ubp[2 + bo + j];
-        gsum += x0 * IQ4_NL_KVALUES[gq & 0xFu] + x1 * IQ4_NL_KVALUES[gq >> 4];
-        usum += x0 * IQ4_NL_KVALUES[uq & 0xFu] + x1 * IQ4_NL_KVALUES[uq >> 4];
+        gsum += xa[j] * IQ4_NL_KVALUES[nf_ql_nib(gq, j)]
+              + xa[j + 4] * IQ4_NL_KVALUES[nf_ql_nib(gq, j + 4)];
+        usum += xa[j] * IQ4_NL_KVALUES[nf_ql_nib(uq, j)]
+              + xa[j + 4] * IQ4_NL_KVALUES[nf_ql_nib(uq, j + 4)];
     }
     *gs += gsum * gd;
     *us += usum * ud;
@@ -285,9 +298,8 @@ NF_INLINE float IQ4_NL_decode_elem(NF_GLOBAL const uchar* weight, int dim, int t
  * 34 B: d(f16)@0, qs[32](int8)@2. y[k] = qs[k]*d (llama.cpp ggml-quants.c:551-566).
  * Work-item ltid owns elements 8*ltid .. 8*ltid+7. */
 NF_INLINE float nf_ql_q8_0_part(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* x, int eo) {
-    NF_GLOBAL const nf_i8* q = (NF_GLOBAL const nf_i8*)(bp + 2 + eo);
-    return dot(vload4(0, x), convert_float4(vload4(0, q)))
-         + dot(vload4(0, x + 4), convert_float4(vload4(0, q + 4)));
+    return dot(nf_read_float4(x), nf_i8x4_to_float4(nf_read_u32_u16(bp + 2 + eo)))
+         + dot(nf_read_float4(x + 4), nf_i8x4_to_float4(nf_read_u32_u16(bp + 6 + eo)));
 }
 
 NF_INLINE float Q8_0_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
@@ -321,10 +333,12 @@ NF_INLINE float MXFP4_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* i
                              int off, int blk, int ltid) {
     const int bo = ltid * MXFP4_BYTES_PER_THREAD;
     NF_GLOBAL const float* x = input + off + blk * MXFP4_BLOCK_SIZE + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float sum = 0.0f;
     for (int j = 0; j < MXFP4_BYTES_PER_THREAD; j++) {
         const uint q = bp[1 + bo + j];
-        sum += x[j] * MXFP4_KVALUES[q & 0xFu] + x[j + 16] * MXFP4_KVALUES[q >> 4];
+        sum += xa[j] * MXFP4_KVALUES[q & 0xFu] + xa[j + 4] * MXFP4_KVALUES[q >> 4];
     }
     return sum * mxfp4_scale(bp[0]);
 }
@@ -334,12 +348,13 @@ NF_INLINE void MXFP4_decode_dual(NF_GLOBAL const uchar* gbp, NF_GLOBAL const uch
                                  float* gs, float* us) {
     const int bo = ltid * MXFP4_BYTES_PER_THREAD;
     NF_GLOBAL const float* x = input + off + blk * MXFP4_BLOCK_SIZE + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float gsum = 0.0f, usum = 0.0f;
     for (int j = 0; j < MXFP4_BYTES_PER_THREAD; j++) {
-        const float x0 = x[j], x1 = x[j + 16];
         const uint gq = gbp[1 + bo + j], uq = ubp[1 + bo + j];
-        gsum += x0 * MXFP4_KVALUES[gq & 0xFu] + x1 * MXFP4_KVALUES[gq >> 4];
-        usum += x0 * MXFP4_KVALUES[uq & 0xFu] + x1 * MXFP4_KVALUES[uq >> 4];
+        gsum += xa[j] * MXFP4_KVALUES[gq & 0xFu] + xa[j + 4] * MXFP4_KVALUES[gq >> 4];
+        usum += xa[j] * MXFP4_KVALUES[uq & 0xFu] + xa[j + 4] * MXFP4_KVALUES[uq >> 4];
     }
     *gs += gsum * mxfp4_scale(gbp[0]);
     *us += usum * mxfp4_scale(ubp[0]);
@@ -359,12 +374,14 @@ NF_INLINE float MXFP4_decode_elem(NF_GLOBAL const uchar* weight, int dim, int to
 NF_INLINE float IQ4_XS_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
                               int off, int blk, int ltid) {
     const int sb = ltid / 4, bo = (ltid % 4) * 4;
-    NF_GLOBAL const uchar* qs = bp + IQ4_XS_HEADER_BYTES + sb * IQ4_XS_SUB_BLOCK_QUANT_BYTES + bo;
+    const uint q = nf_read_u32(bp + IQ4_XS_HEADER_BYTES + sb * IQ4_XS_SUB_BLOCK_QUANT_BYTES + bo);
     NF_GLOBAL const float* x = input + off + blk * IQ4_XS_BLOCK_SIZE + sb * 32 + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float sum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const uint q = qs[j];
-        sum += x[j] * IQ4_NL_KVALUES[q & 0xFu] + x[j + 16] * IQ4_NL_KVALUES[q >> 4];
+        sum += xa[j] * IQ4_NL_KVALUES[nf_ql_nib(q, j)]
+             + xa[j + 4] * IQ4_NL_KVALUES[nf_ql_nib(q, j + 4)];
     }
     return sum * iq4xs_sub_scale(bp, sb);
 }
@@ -374,13 +391,16 @@ NF_INLINE void IQ4_XS_decode_dual(NF_GLOBAL const uchar* gbp, NF_GLOBAL const uc
                                   float* gs, float* us) {
     const int sb = ltid / 4, bo = (ltid % 4) * 4;
     const int qo = IQ4_XS_HEADER_BYTES + sb * IQ4_XS_SUB_BLOCK_QUANT_BYTES + bo;
+    const uint gq = nf_read_u32(gbp + qo), uq = nf_read_u32(ubp + qo);
     NF_GLOBAL const float* x = input + off + blk * IQ4_XS_BLOCK_SIZE + sb * 32 + bo;
+    const float4 x0 = nf_read_float4(x), x1 = nf_read_float4(x + 16);
+    const float xa[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
     float gsum = 0.0f, usum = 0.0f;
     for (int j = 0; j < 4; j++) {
-        const float x0 = x[j], x1 = x[j + 16];
-        const uint gq = gbp[qo + j], uq = ubp[qo + j];
-        gsum += x0 * IQ4_NL_KVALUES[gq & 0xFu] + x1 * IQ4_NL_KVALUES[gq >> 4];
-        usum += x0 * IQ4_NL_KVALUES[uq & 0xFu] + x1 * IQ4_NL_KVALUES[uq >> 4];
+        gsum += xa[j] * IQ4_NL_KVALUES[nf_ql_nib(gq, j)]
+              + xa[j + 4] * IQ4_NL_KVALUES[nf_ql_nib(gq, j + 4)];
+        usum += xa[j] * IQ4_NL_KVALUES[nf_ql_nib(uq, j)]
+              + xa[j + 4] * IQ4_NL_KVALUES[nf_ql_nib(uq, j + 4)];
     }
     *gs += gsum * iq4xs_sub_scale(gbp, sb);
     *us += usum * iq4xs_sub_scale(ubp, sb);

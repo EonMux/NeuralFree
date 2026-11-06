@@ -4,12 +4,17 @@ import com.eonmux.neuralfree.gguf.GGUFModel;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
+import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.GenerationLoop;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
+import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
+import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
+import com.eonmux.neuralfree.gguf.grammar.ConstraintSpec;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.cpu.HeapModelMemory;
@@ -21,18 +26,19 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Continuous batching over the paged memory (PARITY P2): a {@link BatchEngine} over the synthetic two-layer llama
+ * Continuous batching over the paged memory: a {@link BatchEngine} over the synthetic two-layer llama
  * admits, prefills and decodes several sequences at once, and every finished sequence carries the same tokens and
  * text as the same prompt and request run one at a time through {@link GenerationLoop} on the contiguous path.
  * Oversize prompts refuse at submit, the budget ends a sequence and frees its slot for the next queued one, a
  * cancellation stops with {@code StopReason.CANCELLED}, an unpaged memory refuses the engine by name and a
- * non-generating model refuses with its support class.
+ * memoryless encoder refuses with its memory form.
  */
 public class BatchEngineTest {
 
@@ -73,6 +79,39 @@ public class BatchEngineTest {
         }
     }
 
+    /**
+     * The default {@link ForwardBackend#forwardBatchTopK} (a backend without the device readout) selects the same
+     * candidates the batch's rows hold, on the host, in batch order; a width below one refuses.
+     */
+    @Test
+    public void theHostBatchTopKMatchesTheRowsItSelectsFrom() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        EngineConfig paged = config(true).build();
+        int[] a = tokens(1);
+        int[] b = tokens(2);
+        ForwardBatch.Builder builder = ForwardBatch.builder(2 * N_TOKENS);
+        for (int i = 0; i < N_TOKENS; i++) {
+            builder.add(a[i], i, 0, i == N_TOKENS - 1);
+            builder.add(b[i], i, 1, i == N_TOKENS - 1);
+        }
+        ForwardBatch batch = builder.build();
+        int k = 5;
+        try (GGUFModel two = new GGUFModel(model.toString(), paged)) {
+            ForwardBackend f = two.forwardBackend();
+            RowTopK expected = RowTopK.of(f.forwardBatch(batch), k);
+            f.reset();
+            RowTopK actual = f.forwardBatchTopK(batch, k);
+            assertEquals(expected.rows(), actual.rows());
+            assertEquals(expected.k(), actual.k());
+            for (int r = 0; r < expected.rows(); r++) {
+                assertArrayEquals("row " + r + " ids", expected.ids(r), actual.ids(r));
+                assertArrayEquals("row " + r + " logits", expected.logits(r), actual.logits(r), 0f);
+            }
+            f.reset();
+            assertThrows(IllegalArgumentException.class, () -> f.forwardBatchTopK(batch, 0));
+        }
+    }
+
     @Test
     public void twoConcurrentSequencesMatchTheSequentialGenerationLoopRuns() throws IOException {
         Path model = SyntheticModels.llama().writeTempFile();
@@ -105,6 +144,35 @@ public class BatchEngineTest {
             assertResultsMatch(refA, a.result());
             assertResultsMatch(refB, b.result());
             assertEquals("routed content pieces build the result text", refA.text(), textA.toString());
+        }
+    }
+
+    /**
+     * A watermarked sequence decodes on the continuous-batching path exactly as it does one at a time: the prompt
+     * marks where generation starts, so a context the prompt repeated is not a repeated generated context. The
+     * prompt ends with the four tokens it began with, which a scope that searched the prompt too would treat as a
+     * repeated context and sample with the ordinary draw instead of the watermark.
+     */
+    @Test
+    public void aWatermarkedSequenceMatchesTheSequentialGenerationLoop() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        EngineConfig paged = config(true).build();
+        int[] prompt = {4, 5, 6, 7, 4, 5, 6, 7};
+        GenerationRequest request = GenerationRequest.builder()
+                .maxNewTokens(N_NEW)
+                .sampler(SamplerConfig.builder().topK(0).topP(1f).minP(0f).typicalP(1f).temperature(1f)
+                        .seed(7L)
+                        .watermark(WatermarkConfig.builder(1234L).contextWidth(4).build())
+                        .build())
+                .build();
+        GenerationResult ref = reference(model, config(false).build(), prompt, request);
+        try (GGUFModel two = new GGUFModel(model.toString(), paged);
+             BatchEngine engine = BatchEngine.forModel(two, paged)) {
+            BatchSequence a = engine.submit(prompt, request,
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            assertDone(a);
+            assertResultsMatch(ref, a.result());
         }
     }
 
@@ -234,15 +302,20 @@ public class BatchEngineTest {
         }
     }
 
+    /**
+     * A pooling-only model over a memory that holds no paged sequences (the BERT family plans no memory) refuses
+     * the engine by name; with a paged memory the engine serves its pooling requests, and its generation submits
+     * refuse by name (see BatchEnginePoolingTest's refusals for the pooling-only refusals).
+     */
     @Test
-    public void aNonGeneratingModelRefusesWithItsSupportClass() throws IOException {
+    public void aNonGeneratingModelRefusesWithItsMemoryForm() throws IOException {
         Path model = SyntheticModels.bert().writeTempFile();
         EngineConfig cfg = EngineConfig.builder().build();
         try (GGUFModel bert = new GGUFModel(model.toString(), cfg)) {
             assertEquals(SupportClass.EMBED, bert.spec().supportClass());
             UnsupportedOperationException e = assertThrows(UnsupportedOperationException.class,
                     () -> BatchEngine.forModel(bert, cfg));
-            assertTrue(e.getMessage(), e.getMessage().contains("EMBED"));
+            assertTrue(e.getMessage(), e.getMessage().contains("paged memory"));
         }
     }
 
@@ -260,5 +333,32 @@ public class BatchEngineTest {
         assertTrue("expected DONE but was " + sequence.state()
                         + (sequence.error() == null ? "" : ": " + sequence.error()),
                 sequence.state() == BatchSequence.State.DONE);
+    }
+
+    @Test
+    public void aRequestCarriedConstraintCompilesAtSubmitAndShapesTheOutput() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        EngineConfig paged = config(true).build();
+        GenerationRequest request = GenerationRequest.builder()
+                .maxNewTokens(N_NEW)
+                .sampler(SamplerConfig.greedyDecoding())
+                .constraint(ConstraintSpec.choice(List.of("yes", "no")))
+                .build();
+        try (GGUFModel two = new GGUFModel(model.toString(), paged);
+             BatchEngine engine = BatchEngine.forModel(two, paged)) {
+            BatchSequence a = engine.submit(tokens(1), request, (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            assertDone(a);
+            String text = a.result().text();
+            assertTrue("constrained text was '" + text + "'", text.matches("(yes|no)+"));
+
+            GenerationRequest unusable = GenerationRequest.builder()
+                    .maxNewTokens(2)
+                    .sampler(SamplerConfig.greedyDecoding())
+                    .constraint(ConstraintSpec.gbnf("root ::= (unclosed"))
+                    .build();
+            assertThrows(IllegalArgumentException.class,
+                    () -> engine.submit(tokens(1), unusable, (com.eonmux.neuralfree.gguf.TokenCallback) null));
+        }
     }
 }

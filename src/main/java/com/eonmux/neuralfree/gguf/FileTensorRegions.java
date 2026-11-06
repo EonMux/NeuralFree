@@ -107,14 +107,21 @@ public final class FileTensorRegions implements TensorRegions {
         ByteBuffer buf;
         switch (mode) {
             case MMAP:
+            case MMAP_MLOCK:
                 buf = ch.map(FileChannel.MapMode.READ_ONLY, filePos, length);
+                if (mode.locksMemory()) {
+                    MemoryLock.lock(buf);
+                }
                 break;
             case DIRECT:
                 buf = readAligned(ch, info, filePos, (int) length);
                 break;
             default:
-                // READ, and LAZY: rows are fetched as the gather asks for them
+                // READ, MLOCK and LAZY: rows are fetched as the gather asks for them
                 buf = read(ch, info, filePos, (int) length);
+                if (mode.locksMemory()) {
+                    MemoryLock.lock(buf);
+                }
                 break;
         }
         return buf.order(ByteOrder.LITTLE_ENDIAN);

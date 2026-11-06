@@ -15,13 +15,13 @@ import java.util.stream.Stream;
 
 /**
  * The Hugging Face Hub cache, in the Hub's own layout over its root:
- * {@code <root>/models--user--model/{blobs,refs,snapshots}} (PARITY.md WP TL-7). The root is
+ * {@code <root>/models--user--model/{blobs,refs,snapshots}}. The root is
  * {@code LLAMA_CACHE} when that environment variable is set, then {@code HF_HUB_CACHE},
  * {@code HUGGINGFACE_HUB_CACHE}, {@code HF_HOME/hub}, {@code XDG_CACHE_HOME/huggingface/hub} and
  * finally {@code $HOME/.cache/huggingface/hub}, llama.cpp's {@code get_cache_directory}
  * ({@code common/hf-cache.cpp:27-53}) at the same precedence. Every path a downloaded file may land
  * on is confined to its repository's own directory ({@link #snapshotPath}): an untrusted repository
- * path (§3.6) escapes the cache by no route of {@code ..}, an absolute path or an empty segment.
+ * path escapes the cache by no route of {@code ..}, an absolute path or an empty segment.
  * Immutable; safe for concurrent readers.
  */
 public final class HubCache {
@@ -232,6 +232,11 @@ public final class HubCache {
                 repoFilePath, "repository path");
     }
 
+    /** The snapshot directory of commit {@code commit}; a valid 40-hex commit only. */
+    public Path snapshotDir(HubRef ref, String commit) {
+        return repoPath(ref).resolve("snapshots").resolve(validCommit(commit));
+    }
+
     /** The blob an LFS object of the repository lands in ({@code blobs/<oid>}); the oid is 64-hex LFS sha256. */
     public Path blobPath(HubRef ref, String oid) {
         return repoPath(ref).resolve("blobs").resolve(validOid(oid, "LFS oid"));
@@ -326,11 +331,26 @@ public final class HubCache {
         return out;
     }
 
+    /**
+     * The snapshot files of one repository, model or dataset, through the commit its refs name (main
+     * first). The folder prefix follows the reference's type, so a dataset never reads a model's
+     * snapshot and vice versa; an invalid commit or a path outside the layout yields nothing.
+     */
+    public List<CachedFile> cachedFilesOf(HubRef ref) throws IOException {
+        List<CachedFile> out = new ArrayList<>();
+        Path repo = repoPath(ref);
+        if (!Files.isDirectory(repo.resolve("snapshots"))) {
+            return out;
+        }
+        listRepo(repo, ref.repository(), out);
+        return out;
+    }
+
     /** The snapshot files of one repository directory, through the commit its refs name (main first). */
     private void listRepo(Path repo, String id, List<CachedFile> out) throws IOException {
         Path refs = repo.resolve("refs");
         String commit = readRefFile(refs.resolve("main"));
-        if (commit == null) {
+        if (commit == null && Files.isDirectory(refs)) {
             try (Stream<Path> entries = Files.list(refs).sorted()) {
                 for (Path entry : entries.collect(java.util.stream.Collectors.toList())) {
                     String candidate = readRefFile(entry);

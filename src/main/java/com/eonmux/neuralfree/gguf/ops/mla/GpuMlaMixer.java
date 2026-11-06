@@ -2,12 +2,14 @@ package com.eonmux.neuralfree.gguf.ops.mla;
 
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.AttnGateKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuMatmulTap;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
@@ -15,18 +17,21 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
+import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
-import com.eonmux.neuralfree.gguf.memory.KvWindow;
-import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
+import com.eonmux.neuralfree.gguf.memory.gpu.DeviceKvFormats;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuKvLayer;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnExtKernels;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnExtMath;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnKernels;
 import com.eonmux.neuralfree.gguf.ops.attn.FlashAttnTiling;
+import com.eonmux.neuralfree.gguf.ops.moe.GpuGroupedRows;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeKernels;
@@ -35,7 +40,6 @@ import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
-import com.eonmux.neuralfree.gguf.spec.MlaSpec;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.spec.TensorRef;
@@ -57,9 +61,16 @@ import java.util.Objects;
  *       {@code LLM_RoPE_Ext} on the query rope dims ({@code n_offs = n_nope}) and on the shared key
  *       ({@code n_offs = kv_lora}); {@code LLM_RowNorm(attn_kv_a_norm)} over the strided latent prefix.</li>
  *   <li>Latent cache: {@code {T}_MatVecId(attn_k_b)} with slot {@code s = t*n_head + h -> h} absorbs {@code q_nope}
- *       into {@code kv_lora} values per head; two {@code LLM_Copy2D_F32} build {@code [q_abs | q_pe]}; the K row is
- *       the {@code attn_kv_a_mqa} row itself. Decompressed cache: {@code attn_kv_b} gives {@code [k_nope | v]} per
- *       head; {@code LLM_MLA_KV_Assemble} (one token) or copies (several) build K and V.</li>
+ *       into {@code kv_lora} values per head; a step of several tokens sorts the slots by head once
+ *       ({@link GpuGroupedRows}, the heads as experts) and runs the absorption and the expansion below as grouped
+ *       GEMMs over the aligned rows ({@code {T}_GroupedGemm}, {@code {T}_GroupedGemmMma} on CUDA or Vulkan tensor
+ *       cores) when the weight types and the device's grid allow; two {@code LLM_Copy2D_F32} build
+ *       {@code [q_abs | q_pe]}; the K row is the {@code attn_kv_a_mqa} row itself. Decompressed cache:
+ *       {@code attn_kv_b} gives {@code [k_nope | v]} per head; {@code LLM_MLA_KV_Assemble} (one token) or copies
+ *       (several) build K and V. Decompressed cache over absorbed weights (deepseek2 converted without
+ *       {@code attn_kv_b}): one {@code {T}_MatVecIdT} per token reads {@code attn_k_b} transposed into
+ *       {@code k_nope} and one {@code {T}_MatVecId} per token expands {@code attn_v_b} into V, with the same
+ *       copies, rotations and stores as the {@code attn_kv_b} cache.</li>
  *   <li>Optional {@code LLM_AttnTempScale}, the Hadamard rotations the memory plan assigns the cache,
  *       {@code LLM_KV_Store_*}, then flash attention: decode, tiled prefill or per-row decode, with
  *       {@code LLM_FlashAttn_Combine} after a split, and the per-head {@code attn_sinks} logits in the softmax when
@@ -74,7 +85,11 @@ import java.util.Objects;
  * {@code attn_kv_b} (it uses the absorbed {@code attn_k_b} / {@code attn_v_b}), so it refuses deltas on it.
  * Every buffer comes from the scratch temporaries, the memory and the weights, except the constant head-slot index
  * table this mixer owns. Dispatches are prepared at bind; a step re-sets only token counts, key ranges, positions,
- * splits and the row offsets of per-head products that exceed the device's grid in one call.
+ * splits and the row offsets of per-head products that exceed the device's grid in one call. With
+ * {@link com.eonmux.neuralfree.gguf.BatchInvariance} on, the step keeps the single-row kernel choices at every row
+ * count: the per-head absorption and expansion never take their grouped GEMMs, and the attention runs one
+ * flash-decode launch per query row on the unpaged and on the paged cache, so a row's key split comes from its own
+ * key count (the paged launch reads the row's segment through the focus table).
  */
 public final class GpuMlaMixer implements GpuMixer {
 
@@ -91,6 +106,8 @@ public final class GpuMlaMixer implements GpuMixer {
     static final String TEMP_GATE = "mla.gate";
     /** {@code LLM_MLA_KV_Assemble} (kernels/llm/mla.cl): 6 scalars then 4 buffers, all at element 0. */
     static final String KV_ASSEMBLE = "LLM_MLA_KV_Assemble";
+    /** Scratch prefix of the head sort of the grouped per-head products ({@link GpuGroupedRows}). */
+    static final String TEMP_HEAD_ROWS = "mla.head_rows";
 
     private final List<PreparedDispatch> prepared = new ArrayList<>();
     private final List<GpuBuffer> owned = new ArrayList<>();
@@ -99,6 +116,13 @@ public final class GpuMlaMixer implements GpuMixer {
 
     private GpuOps ops;
     private GpuMemory memory;
+    /** The identity KV-scale placeholder the flash kernels read on an unscaled latent cache. */
+    private GpuBuffer kvScalesPlaceholder;
+    private com.eonmux.neuralfree.acceleration.backend.ComputeBackend backend;
+    private GpuBuffer focus;
+    /** The one-sequence slot count and query position of the batch-invariant per-row paged launches. */
+    private GpuBuffer focusKvLen;
+    private GpuBuffer focusQPos;
     private int il;
     private int local;
     private int idLocal;
@@ -118,16 +142,22 @@ public final class GpuMlaMixer implements GpuMixer {
     private HadamardSpec rotKSpec;
     private HadamardSpec rotVSpec;
 
-    /** Why the latent cache refuses deltas on {@code attn_kv_b}, which it never multiplies. */
-    static final String LATENT_KV_B_REFUSAL = "the latent MLA cache runs the absorbed attn_k_b / attn_v_b instead of"
-            + " attn_kv_b; set " + MemoryConfig.PROP_MLA_CACHE
-            + "=decompressed to apply a LoRA delta on attn_kv_b";
+    /**
+     * Why the absorbed MLA paths (the latent cache and the decompressed cache over {@code attn_k_b} /
+     * {@code attn_v_b}) refuse deltas on {@code attn_kv_b}, which they never multiply.
+     */
+    static final String ABSORBED_KV_B_REFUSAL = "the absorbed attn_k_b / attn_v_b weights replace attn_kv_b in this"
+            + " MLA layer, which therefore never multiplies attn_kv_b; a LoRA delta on attn_kv_b needs a conversion"
+            + " with the fused attn_kv_b instead of the per-head pair";
 
     private GpuWeight wq;
     private GpuWeight wqA;
     private GpuWeight wqB;
     private GpuWeight wkvA;
     private GpuWeight wkvB;
+    /** The absorbed per-head {@code attn_k_b} and {@code attn_v_b}, bound whenever the layer has them. */
+    private GpuWeight wkB;
+    private GpuWeight wvB;
     private GpuWeight wo;
     private GpuWeight wGate;
     private GpuProjectionDeltas.Site qDeltas;
@@ -157,6 +187,14 @@ public final class GpuMlaMixer implements GpuMixer {
     private PreparedDispatch ropeK;
     private PreparedDispatch absorb;
     private PreparedDispatch expand;
+    /** The per-head products of a decompressed cache over absorbed weights: the transposed
+     * {@code attn_k_b} read into k_nope, and the {@code attn_v_b} expansion into V. */
+    private PreparedDispatch kDecomp;
+    private PreparedDispatch vExpand;
+    /** Head-sorted slot rows of a several-token latent step; null when the per-head products stay per row. */
+    private GpuGroupedRows headRows;
+    private PreparedDispatch absorbGrouped;
+    private PreparedDispatch expandGrouped;
     private PreparedDispatch assemble;
     private PreparedDispatch tempScale;
     private PreparedDispatch storeK;
@@ -164,33 +202,33 @@ public final class GpuMlaMixer implements GpuMixer {
     private PreparedDispatch fd;
     private PreparedDispatch fdRow;
     private PreparedDispatch fa;
+    private PreparedDispatch fdPaged;
+    private PreparedDispatch faPaged;
     private PreparedDispatch fc;
+    /** The causal and sink bits of the flash {@code flags} argument; each launch adds its direct bit. */
+    private int flashFlags;
+    /** The flash-attention argument builders of this layer's bound geometry. */
+    private MlaFlashArgs flashArgs;
     private PreparedDispatch outGate;
 
     private FlashAttnTiling decodeTiling;
     private FlashAttnTiling prefillTiling;
+    private FlashAttnTiling pagedTiling;
     private long partialCapacity;
+    private int pageShift = -1;
+    private int maxPages;
+    private int maxLaunchSeq;
 
     GpuMlaMixer() {
     }
 
     /**
-     * Why the GPU cannot run this MLA layer, or null: the shared limits of {@link MlaBlocks#unsupportedCommon}, and
-     * a decompressed cache over absorbed {@code attn_k_b}/{@code attn_v_b}, whose key decompression multiplies by
-     * the transposed {@code attn_k_b} (no typed GPU kernel; {@code LLM_MLA_AbsorbedKVDecomp} reads F32 weights of one
-     * token only).
+     * Why the GPU cannot run this MLA layer, or null: the shared limits of {@link MlaBlocks#unsupportedCommon}.
+     * A decompressed cache over absorbed {@code attn_k_b}/{@code attn_v_b} runs like any other decompressed cache,
+     * through {@code {T}_MatVecIdT} ({@code attn_k_b}) and {@code {T}_MatVecId} ({@code attn_v_b}).
      */
     static String unsupported(LayerSpec layer) {
-        String why = MlaBlocks.unsupportedCommon(layer);
-        if (why != null) {
-            return why;
-        }
-        MlaSpec m = layer.mla();
-        if (m.absorbed() && !m.latentCache()) {
-            return "layer " + layer.il() + ": a decompressed MLA cache over absorbed attn_k_b/attn_v_b weights has no "
-                    + "GPU kernel; use neuralfree.mla.cache=latent (or auto)";
-        }
-        return null;
+        return MlaBlocks.unsupportedCommon(layer);
     }
 
     // ================================================================== bind
@@ -233,6 +271,7 @@ public final class GpuMlaMixer implements GpuMixer {
         }
         il = layer.il();
         ops = ctx.ops();
+        backend = ctx.backend();
         local = ops.local();
         NormKernels.checkReduceLocal(local);
         memory = ctx.memory();
@@ -253,6 +292,7 @@ public final class GpuMlaMixer implements GpuMixer {
         bindWeights(ws, layer);
         bindDeltas(ctx.projectionDeltas(), layer);
         GpuBuffer ph = ctx.placeholders().readOnlyFloats();
+        kvScalesPlaceholder = ctx.placeholders().kvScalesOnes();
         bindRopeFactors(ws, layer, ph);
         bindTemps(ctx.scratch(), layer);
         prepareProjections(ctx, layer, ws, ph);
@@ -275,7 +315,7 @@ public final class GpuMlaMixer implements GpuMixer {
             wq = ws.layer(layer, TensorNames.weight(TensorNames.ATTN_Q));
             MlaBlocks.checkShape(wq.name(), wq.cols(), wq.rows(), nEmbd, g.qWidth);
         }
-        if (!g.latent) {
+        if (!g.latent && !g.absorbed) {
             wkvB = ws.layer(layer, TensorNames.weight(TensorNames.ATTN_KV_B));
             MlaBlocks.checkShape(wkvB.name(), wkvB.cols(), wkvB.rows(), g.kvLora, (long) g.nHead * (g.nope + g.headV));
         }
@@ -297,10 +337,10 @@ public final class GpuMlaMixer implements GpuMixer {
         } else {
             qDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_Q), wq);
         }
-        if (g.latent) {
-            deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_KV_B), LATENT_KV_B_REFUSAL);
-        } else {
+        if (wkvB != null) {
             kvbDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_KV_B), wkvB);
+        } else {
+            deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_KV_B), ABSORBED_KV_B_REFUSAL);
         }
         outDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_OUT), wo);
         if (wGate != null) {
@@ -340,6 +380,10 @@ public final class GpuMlaMixer implements GpuMixer {
         if (g.latent) {
             lat = scratch.temp(TEMP_LATENT, rows * g.kvLora);
             qlat = scratch.temp(TEMP_Q_LATENT, rows * g.kvaWidth);
+        } else if (g.absorbed) {
+            kvb = scratch.temp(TEMP_KV_B, rows * g.nope);
+            k = scratch.temp(TEMP_K, rows * g.headK);
+            v = scratch.temp(TEMP_V, rows * g.headV);
         } else {
             kvc = scratch.temp(TEMP_KV_C, u * g.kvLora);
             kvb = scratch.temp(TEMP_KV_B, rows * (g.nope + g.headV));
@@ -382,9 +426,9 @@ public final class GpuMlaMixer implements GpuMixer {
                             steps.ropePos(), ff, kva.buffer())));
         }
         int rows = u * g.nHead;
-        if (g.latent) {
-            GpuWeight wkB = ws.layer(layer, TensorNames.weight(TensorNames.ATTN_K_B));
-            GpuWeight wvB = ws.layer(layer, TensorNames.weight(TensorNames.ATTN_V_B));
+        if (g.absorbed) {
+            wkB = ws.layer(layer, TensorNames.weight(TensorNames.ATTN_K_B));
+            wvB = ws.layer(layer, TensorNames.weight(TensorNames.ATTN_V_B));
             MlaBlocks.checkShape(wkB.name(), wkB.cols(), wkB.rows(), g.nope, (long) g.kvLora * g.nHead);
             MlaBlocks.checkShape(wvB.name(), wvB.cols(), wvB.rows(), g.kvLora, (long) g.headV * g.nHead);
             requirePlainHeads(wkB);
@@ -392,15 +436,33 @@ public final class GpuMlaMixer implements GpuMixer {
             idLocal = Math.min(MoeKernels.MAX_LOCAL, local);
             MoeKernels.checkIdLocal(wkB.type(), idLocal);
             MoeKernels.checkIdLocal(wvB.type(), idLocal);
-            idChunkTokens = idChunkTokens(ctx.kernels().caps().getMaxWorkGroupCount()[1]);
             GpuBuffer slots = headSlots(ctx, rows);
-            absorb = keep(ops.prepare(MoeKernels.matVecId(wkB.type()), MoeKernels.idMatVecGlobal(g.kvLora, rows, idLocal),
-                    new long[]{idLocal, 1}, MoeKernels.matVecIdArgs(g.kvLora, g.nope, rows, g.headK, q.offset(),
-                            lat.offset(), false, 0, g.nHead, slots, wkB.shard(0), q.buffer(), ph, lat.buffer())));
-            expand = keep(ops.prepare(MoeKernels.matVecId(wvB.type()), MoeKernels.idMatVecGlobal(g.headV, rows, idLocal),
-                    new long[]{idLocal, 1}, MoeKernels.matVecIdArgs(g.headV, g.kvLora, rows, g.kvLora, lat.offset(),
-                            attn.offset(), false, 0, g.nHead, slots, wvB.shard(0), lat.buffer(), ph,
-                            attn.buffer())));
+            if (g.latent) {
+                idChunkTokens = idChunkTokens(ctx.kernels().caps().getMaxWorkGroupCount()[1]);
+                absorb = keep(ops.prepare(MoeKernels.matVecId(wkB.type()),
+                        MoeKernels.idMatVecGlobal(g.kvLora, rows, idLocal), new long[]{idLocal, 1},
+                        MoeKernels.matVecIdArgs(g.kvLora, g.nope, rows, g.headK, q.offset(), lat.offset(), false, 0,
+                                g.nHead, slots, wkB.shard(0), q.buffer(), ph, lat.buffer())));
+                expand = keep(ops.prepare(MoeKernels.matVecId(wvB.type()),
+                        MoeKernels.idMatVecGlobal(g.headV, rows, idLocal), new long[]{idLocal, 1},
+                        MoeKernels.matVecIdArgs(g.headV, g.kvLora, rows, g.kvLora, lat.offset(), attn.offset(),
+                                false, 0, g.nHead, slots, wvB.shard(0), lat.buffer(), ph, attn.buffer())));
+                prepareGroupedHeads(ctx, wkB, wvB, slots, ph);
+            } else {
+                // The absorbed attn_k_b stores each head's block [kv_lora x n_nope] row-major, so the
+                // k_nope product reads it transposed ({T}_MatVecIdT); the launches run one token at a
+                // time (x_stride = 0 broadcasts the token's latent row to its heads), like the CPU twin,
+                // and the head count of one such launch must still fit the grid.
+                idChunkTokens(ctx.kernels().caps().getMaxWorkGroupCount()[1]);
+                kDecomp = keep(ops.prepare(MoeKernels.matVecIdT(wkB.type()),
+                        MoeKernels.idMatVecGlobal(g.nope, rows, idLocal), new long[]{idLocal, 1},
+                        MoeKernels.matVecIdArgs(g.nope, g.kvLora, rows, 0, kva.offset(), kvb.offset(), false, 0,
+                                g.nHead, slots, wkB.shard(0), kva.buffer(), ph, kvb.buffer())));
+                vExpand = keep(ops.prepare(MoeKernels.matVecId(wvB.type()),
+                        MoeKernels.idMatVecGlobal(g.headV, rows, idLocal), new long[]{idLocal, 1},
+                        MoeKernels.matVecIdArgs(g.headV, g.kvLora, rows, 0, kva.offset(), v.offset(), false, 0,
+                                g.nHead, slots, wvB.shard(0), kva.buffer(), ph, v.buffer())));
+            }
         } else if (kva.offset() == 0 && kvb.offset() == 0 && k.offset() == 0 && v.offset() == 0) {
             assemble = keep(ops.prepare(KV_ASSEMBLE,
                     new long[]{RopeKernels.roundUp((long) g.nHead * (g.headK + g.headV), local)}, new long[]{local},
@@ -416,9 +478,9 @@ public final class GpuMlaMixer implements GpuMixer {
         }
         if (owns) {
             ScratchSlot ks = g.latent ? kva : k;
-            storeK = keep(prepareStore(layout.dtypeK(), u, layout.widthK(), ks, kv.k()));
+            storeK = keep(prepareStore(layout.dtypeK(), true, u, layout.widthK(), ks, kv.k()));
             if (!g.latent) {
-                storeV = keep(prepareStore(layout.dtypeV(), u, layout.widthV(), v, kv.v()));
+                storeV = keep(prepareStore(layout.dtypeV(), false, u, layout.widthV(), v, kv.v()));
             }
         }
         if (wGate != null) {
@@ -438,11 +500,24 @@ public final class GpuMlaMixer implements GpuMixer {
         }
     }
 
-    private PreparedDispatch prepareStore(KvDType type, int u, int rowElems, ScratchSlot src, GpuBuffer dst) {
+    /**
+     * The store of one side of the layer's cache: {@code kSide} picks the K or V rows, their packed side planes and
+     * (for a TurboQuant key stream) the centroid table of a vendor latent cache.
+     */
+    private PreparedDispatch prepareStore(KvDType type, boolean kSide, int u, int rowElems, ScratchSlot src,
+                                          GpuBuffer dst) {
+        KvLayout layout = kv.layout();
+        GpuBuffer side = kv.vendorSide();
+        long items = type.perTokenHead() || type.vendorFormat()
+                ? RopeKernels.kvStoreWorkItemsPerTokenHead(type, 1, rowElems, rowElems)
+                : RopeKernels.kvStoreWorkItems(type, 1, rowElems);
         return ops.prepare(RopeKernels.kvStore(type),
-                new long[]{RopeKernels.roundUp(RopeKernels.kvStoreWorkItems(type, u, rowElems), local)},
-                new long[]{local}, RopeKernels.kvStoreArgs(type, u, rowElems, rowElems, src.offset(), rowElems, src.buffer(),
-                        steps.cellIdx(kv.group()), dst));
+                new long[]{RopeKernels.roundUp(u * items, local)}, new long[]{local},
+                RopeKernels.kvStoreArgs(type, u, rowElems, rowElems, src.offset(), rowElems, rowElems,
+                        src.buffer(), steps.cellIdx(kv.group()), ops.placeholders().kvScalesOnes(), dst, null,
+                        side != null ? side : ops.placeholders().scratchInts(),
+                        side != null ? DeviceKvFormats.sideRowBytes(layout) : 0,
+                        DeviceKvFormats.sidePlaneOffset(layout, !kSide), kSide ? 0 : 1));
     }
 
     private void prepareAttention(GpuForwardContext ctx, LayerSpec layer, GpuWeights ws, GpuBuffer ph) {
@@ -453,9 +528,17 @@ public final class GpuMlaMixer implements GpuMixer {
         partialCapacity = decodeTiling.decodePartialFloats();
         if (prefillTiling.plan() == FlashAttnTiling.Plan.TILED) {
             partialCapacity = Math.max(partialCapacity,
-                    prefillPartialFloats(prefillTiling, ctx.scratch().ubatch(), layout.rows()));
+                    MlaFlashArgs.prefillPartialFloats(prefillTiling, ctx.scratch().ubatch(), layout.rows()));
         } else {
             partialCapacity = Math.max(partialCapacity, prefillTiling.decodePartialFloats());
+        }
+        if (steps.pageShift() >= 0) {
+            pageShift = steps.pageShift();
+            maxPages = steps.maxPages();
+            maxLaunchSeq = Math.min(steps.pagedMaxSequences(), ctx.scratch().ubatch());
+            pagedTiling = FlashAttnTiling.decodePaged(maxLaunchSeq, g.nHead, g.nHeadKv, g.dQ, g.dV,
+                    maxPages << pageShift, smem, cus);
+            partialCapacity = Math.max(partialCapacity, pagedTiling.decodePagedPartialFloats(maxLaunchSeq));
         }
         GpuBuffer partials = ctx.scratch().partials(MlaBlocks.toInt(partialCapacity, "MLA flash partial floats"));
         ScratchSlot qs = g.latent ? qlat : q;
@@ -464,15 +547,30 @@ public final class GpuMlaMixer implements GpuMixer {
         GpuBuffer sinks = sinksBuffer(ws, layer);
         GpuBuffer sinkArg = sinks != null ? sinks : ph;
         int hasSinks = sinks != null ? 1 : 0;
+        /* Every step rebuilds the flag word from this field: a latent cache's V alias bit is part of it. */
+        flashFlags = AttnKernels.attnFlags(layout.window().causal(), sinks != null, false)
+                | (layout.vAliasesK() ? AttnKernels.FLAG_V_ALIAS : 0);
+        flashArgs = new MlaFlashArgs(g, layout, kv, steps, kvScalesPlaceholder, prefillTiling, pagedTiling,
+                flashFlags, pageShift, maxPages);
         String kernel = AttnKernels.flashDecode(layout.dtypeK());
         fd = keep(ops.prepare(kernel, decodeTiling.decodeGlobal(1), FlashAttnTiling.decodeLocal(),
-                decodeArgs(decodeTiling, qs, os, softcap, hasSinks, sinkArg, ph, partials)));
+                flashArgs.decodeArgs(decodeTiling, qs, os, softcap, sinkArg, ph, partials)));
         if (prefillTiling.plan() == FlashAttnTiling.Plan.TILED) {
             fa = keep(ops.prepare(AttnKernels.flashAttn(layout.dtypeK()), prefillTiling.prefillGlobal(1, 1),
-                    FlashAttnTiling.prefillLocal(), prefillArgs(qs, os, softcap, hasSinks, sinkArg, ph, partials)));
+                    FlashAttnTiling.prefillLocal(), flashArgs.prefillArgs(qs, os, softcap, sinkArg, ph, partials)));
         } else {
             fdRow = keep(ops.prepare(kernel, prefillTiling.decodeGlobal(1), FlashAttnTiling.decodeLocal(),
-                    decodeArgs(prefillTiling, qs, os, softcap, hasSinks, sinkArg, ph, partials)));
+                    flashArgs.decodeArgs(prefillTiling, qs, os, softcap, sinkArg, ph, partials)));
+        }
+        if (pagedTiling != null) {
+            fdPaged = keep(ops.prepare(AttnKernels.flashDecodePaged(layout.dtypeK(), layout.dtypeV()),
+                    pagedTiling.decodePagedGlobal(1, 1), FlashAttnTiling.decodeLocal(),
+                    flashArgs.pagedDecodeArgs(qs, os, softcap, sinkArg, ph, partials)));
+            if (prefillTiling.plan() == FlashAttnTiling.Plan.TILED) {
+                faPaged = keep(ops.prepare(AttnKernels.flashAttnPaged(layout.dtypeK(), layout.dtypeV()),
+                        prefillTiling.prefillGlobal(1, 1), FlashAttnTiling.prefillLocal(),
+                        flashArgs.pagedPrefillArgs(qs, os, softcap, sinkArg, ph, partials)));
+            }
         }
         Object[] c = new Object[AttnKernels.FC_ARG_COUNT];
         c[AttnKernels.ARG_FC_N_ROWS] = g.nHead;
@@ -486,116 +584,6 @@ public final class GpuMlaMixer implements GpuMixer {
         c[AttnKernels.ARG_FC_BUF_OUT] = os.buffer();
         fc = keep(ops.prepare(AttnKernels.FLASH_COMBINE, FlashAttnTiling.combineGlobal(g.nHead),
                 FlashAttnTiling.combineLocal(), c));
-    }
-
-    /**
-     * Partial floats the largest split of a tiled prefill needs: the most {@link FlashAttnTiling#prefillSplit} chooses
-     * for any call of up to {@code ubatch} tokens over the whole cache, unconstrained by capacity. A smaller capacity
-     * only lowers the split count, because {@code prefillSplit} fits its splits to the capacity it is given.
-     */
-    private static long prefillPartialFloats(FlashAttnTiling p, int ubatch, int nKvMax) {
-        long cap = 0;
-        for (int n = 1; n <= ubatch; n++) {
-            FlashAttnTiling.Split s = p.prefillSplit(n, nKvMax, Long.MAX_VALUE);
-            if (!s.direct()) {
-                cap = Math.max(cap, FlashAttnTiling.partialFloats((long) n * p.nHead(), s.count(), p.dV()));
-            }
-        }
-        return cap;
-    }
-
-    /**
-     * {@code LLM_FlashDecode_*} arguments in kernel signature order; the per-step values start as one direct split at
-     * row 0.
-     */
-    private Object[] decodeArgs(FlashAttnTiling t, ScratchSlot qs, ScratchSlot os, float softcap, int hasSinks,
-                                GpuBuffer sinks, GpuBuffer ph, GpuBuffer partials) {
-        KvWindow w = layout.window();
-        Object[] a = new Object[AttnKernels.FD_ARG_COUNT];
-        a[AttnKernels.ARG_FD_N_HEAD] = g.nHead;
-        a[AttnKernels.ARG_FD_N_HEAD_KV] = g.nHeadKv;
-        a[AttnKernels.ARG_FD_D_K] = g.dQ;
-        a[AttnKernels.ARG_FD_D_V] = g.dV;
-        a[AttnKernels.ARG_FD_G_TILE] = t.gTile();
-        a[AttnKernels.ARG_FD_N_SPLIT] = 1;
-        a[AttnKernels.ARG_FD_SPLIT_LEN] = t.maxSplitLen();
-        a[AttnKernels.ARG_FD_KV_START] = 0;
-        a[AttnKernels.ARG_FD_KV_END] = 1;
-        a[AttnKernels.ARG_FD_Q_POS] = 0;
-        a[AttnKernels.ARG_FD_K_ROW_STRIDE] = g.kRowStride;
-        a[AttnKernels.ARG_FD_K_HEAD_STRIDE] = g.kHeadStride;
-        a[AttnKernels.ARG_FD_V_ROW_STRIDE] = g.vRowStride;
-        a[AttnKernels.ARG_FD_V_HEAD_STRIDE] = g.vHeadStride;
-        a[AttnKernels.ARG_FD_SCALE] = g.kqScale;
-        a[AttnKernels.ARG_FD_SOFTCAP] = softcap;
-        a[AttnKernels.ARG_FD_MAX_BIAS] = 0.0f;
-        a[AttnKernels.ARG_FD_CAUSAL] = w.causal() ? 1 : 0;
-        a[AttnKernels.ARG_FD_SWA_TYPE] = w.type().code();
-        a[AttnKernels.ARG_FD_N_SWA] = w.nSwa();
-        a[AttnKernels.ARG_FD_BIAS_MODE] = AttentionSpec.BiasMode.NONE.code();
-        a[AttnKernels.ARG_FD_N_BUCKETS] = 0;
-        a[AttnKernels.ARG_FD_MAX_DISTANCE] = 0;
-        a[AttnKernels.ARG_FD_HAS_SINKS] = hasSinks;
-        a[AttnKernels.ARG_FD_DIRECT_OUT] = 1;
-        a[AttnKernels.ARG_FD_Q_OFF] = qs.offset();
-        a[AttnKernels.ARG_FD_OUT_OFF] = os.offset();
-        a[AttnKernels.ARG_FD_BUF_Q] = qs.buffer();
-        a[AttnKernels.ARG_FD_BUF_K] = kv.k();
-        a[AttnKernels.ARG_FD_BUF_V] = kv.v();
-        a[AttnKernels.ARG_FD_BUF_KV_POS] = steps.kvPos(kv.group());
-        a[AttnKernels.ARG_FD_BUF_SINKS] = sinks;
-        a[AttnKernels.ARG_FD_BUF_REL_BIAS] = ph;
-        a[AttnKernels.ARG_FD_BUF_OUT] = os.buffer();
-        a[AttnKernels.ARG_FD_BUF_PARTIAL] = partials;
-        return a;
-    }
-
-    /** {@code LLM_FlashAttn_*} arguments in kernel signature order; the per-call values start as one token, one split. */
-    private Object[] prefillArgs(ScratchSlot qs, ScratchSlot os, float softcap, int hasSinks, GpuBuffer sinks,
-                                 GpuBuffer ph, GpuBuffer partials) {
-        KvWindow w = layout.window();
-        Object[] a = new Object[AttnKernels.FA_ARG_COUNT];
-        a[AttnKernels.ARG_FA_N_TOKENS] = 1;
-        a[AttnKernels.ARG_FA_N_HEAD] = g.nHead;
-        a[AttnKernels.ARG_FA_N_HEAD_KV] = g.nHeadKv;
-        a[AttnKernels.ARG_FA_D_K] = g.dQ;
-        a[AttnKernels.ARG_FA_D_V] = g.dV;
-        a[AttnKernels.ARG_FA_BQ] = prefillTiling.bq();
-        a[AttnKernels.ARG_FA_BK] = prefillTiling.bk();
-        a[AttnKernels.ARG_FA_G_TILE] = prefillTiling.gTile();
-        a[AttnKernels.ARG_FA_N_SPLIT] = 1;
-        a[AttnKernels.ARG_FA_SPLIT_LEN] = prefillTiling.bk();
-        a[AttnKernels.ARG_FA_KV_START] = 0;
-        a[AttnKernels.ARG_FA_KV_END] = 1;
-        a[AttnKernels.ARG_FA_Q_ROW_STRIDE] = g.nHead * g.dQ;
-        a[AttnKernels.ARG_FA_OUT_ROW_STRIDE] = g.nHead * g.dV;
-        a[AttnKernels.ARG_FA_K_ROW_STRIDE] = g.kRowStride;
-        a[AttnKernels.ARG_FA_K_HEAD_STRIDE] = g.kHeadStride;
-        a[AttnKernels.ARG_FA_V_ROW_STRIDE] = g.vRowStride;
-        a[AttnKernels.ARG_FA_V_HEAD_STRIDE] = g.vHeadStride;
-        a[AttnKernels.ARG_FA_SCALE] = g.kqScale;
-        a[AttnKernels.ARG_FA_SOFTCAP] = softcap;
-        a[AttnKernels.ARG_FA_MAX_BIAS] = 0.0f;
-        a[AttnKernels.ARG_FA_CAUSAL] = w.causal() ? 1 : 0;
-        a[AttnKernels.ARG_FA_SWA_TYPE] = w.type().code();
-        a[AttnKernels.ARG_FA_N_SWA] = w.nSwa();
-        a[AttnKernels.ARG_FA_BIAS_MODE] = AttentionSpec.BiasMode.NONE.code();
-        a[AttnKernels.ARG_FA_N_BUCKETS] = 0;
-        a[AttnKernels.ARG_FA_MAX_DISTANCE] = 0;
-        a[AttnKernels.ARG_FA_HAS_SINKS] = hasSinks;
-        a[AttnKernels.ARG_FA_DIRECT_OUT] = 1;
-        a[AttnKernels.ARG_FA_Q_OFF] = qs.offset();
-        a[AttnKernels.ARG_FA_OUT_OFF] = os.offset();
-        a[AttnKernels.ARG_FA_BUF_Q] = qs.buffer();
-        a[AttnKernels.ARG_FA_BUF_K] = kv.k();
-        a[AttnKernels.ARG_FA_BUF_V] = kv.v();
-        a[AttnKernels.ARG_FA_BUF_Q_POS] = steps.qPos();
-        a[AttnKernels.ARG_FA_BUF_KV_POS] = steps.kvPos(kv.group());
-        a[AttnKernels.ARG_FA_BUF_SINKS] = sinks;
-        a[AttnKernels.ARG_FA_BUF_REL_BIAS] = ph;
-        a[AttnKernels.ARG_FA_BUF_OUT] = os.buffer();
-        a[AttnKernels.ARG_FA_BUF_PARTIAL] = partials;
-        return a;
     }
 
     /**
@@ -617,6 +605,36 @@ public final class GpuMlaMixer implements GpuMixer {
         MlaBlocks.checkF32Vector(w.name(), w.type(), w.rows() * w.cols(), len);
         requireOneBinding(w);
         return w;
+    }
+
+    /**
+     * The grouped form of the per-head products of a several-token step, when the device can run it: the constant
+     * slot table is the expert-id list of {@code n} tokens of {@code n_head} pairs, so {@link GpuGroupedRows} sorts
+     * the step's rows by head and the absorption ({@code x_stride = head_k}) and expansion
+     * ({@code x_stride = kv_lora}) multiply each head's rows as one tiled GEMM, writing the same rows as the
+     * per-head {@code {T}_MatVecId}.
+     */
+    private void prepareGroupedHeads(GpuForwardContext ctx, GpuWeight wkB, GpuWeight wvB, GpuBuffer slots,
+                                     GpuBuffer ph) {
+        int u = ctx.scratch().ubatch();
+        LlmKernels kernels = ctx.kernels();
+        if (u < 2 || !GpuGroupedRows.alignUsable(kernels, u * g.nHead, g.nHead, Math.max(g.kvLora, g.headV))
+                || !GpuGroupedRows.groupedUsable(kernels, wkB.type(), g.nope)
+                || !GpuGroupedRows.groupedUsable(kernels, wvB.type(), g.kvLora)) {
+            return;
+        }
+        headRows = new GpuGroupedRows(ops, ctx.scratch(), kernels, TEMP_HEAD_ROWS, u, g.nHead, g.nHead, slots, true);
+        int tiles = headRows.nTiles();
+        absorbGrouped = keep(ops.prepare(GpuGroupedRows.groupedKernel(ops, wkB.type(), false),
+                MoeKernels.groupedGemmGlobal(g.kvLora, tiles), MoeKernels.groupedGemmLocal(),
+                MoeKernels.groupedGemmArgs(g.kvLora, g.nope, tiles, 1, g.headK, q.offset(), lat.offset(), false, 0,
+                        g.nHead, headRows.gemmToken(), headRows.gemmSlot(), wkB.shard(0), q.buffer(), ph,
+                        lat.buffer())));
+        expandGrouped = keep(ops.prepare(GpuGroupedRows.groupedKernel(ops, wvB.type(), false),
+                MoeKernels.groupedGemmGlobal(g.headV, tiles), MoeKernels.groupedGemmLocal(),
+                MoeKernels.groupedGemmArgs(g.headV, g.kvLora, tiles, 1, g.kvLora, lat.offset(), attn.offset(), false,
+                        0, g.nHead, headRows.gemmToken(), headRows.gemmSlot(), wvB.shard(0), lat.buffer(), ph,
+                        attn.buffer())));
     }
 
     /**
@@ -700,6 +718,144 @@ public final class GpuMlaMixer implements GpuMixer {
         run(pos0, nTokens, in, out);
     }
 
+    /**
+     * The cache writes of a step: the latent KV projection with its norms and RoPE, then the latent store (a latent
+     * cache) or the per-head K/V decompression, the K/V rotations and both stores. The query projection, the
+     * absorption, the attention, the output expansion and the output projection do not run.
+     */
+    @Override
+    public void prefillKV(int pos0, int n, ScratchSlot in) {
+        checkBound();
+        Objects.requireNonNull(in, "in");
+        if (n < 1 || n > ops.scratch().ubatch()) {
+            throw new IllegalArgumentException("MLA step of " + n + " tokens is outside [1, " + ops.scratch().ubatch()
+                    + "]");
+        }
+        if (pos0 < 0) {
+            throw new IllegalArgumentException("layer " + il + ": negative position " + pos0);
+        }
+        if (steps.pos0() != pos0 || steps.nTokens() != n) {
+            throw new IllegalStateException("layer " + il + ": step inputs hold positions [" + steps.pos0() + ", "
+                    + (steps.pos0() + steps.nTokens()) + "), the MLA step runs [" + pos0 + ", " + (pos0 + n) + ")");
+        }
+        in.require((long) n * nEmbd);
+        if (!owns) {
+            return;
+        }
+        projectKV(n, in);
+        if (g.latent) {
+            latentIntoKV(n);
+        } else {
+            decompressedIntoKV(n);
+        }
+    }
+
+    @Override
+    public String kvRefusal() {
+        checkBound();
+        return null;
+    }
+
+    /**
+     * The latent row alone: the projection, the optional RMS norm of the shared rotary key, RoPE of the rotary
+     * dims and the RMS norm of the latent prefix. The query's products, its norm and its RoPE do not run.
+     */
+    private void projectKV(int n, ScratchSlot in) {
+        ops.matmul(wkvA, in.buffer(), in.offset(), kva.buffer(), kva.offset(), n);
+        kvaDeltas.applyRows(n, in.buffer(), in.offset(), kva.buffer(), kva.offset());
+        if (normKPe != null) {
+            normKPe.setInt(NormKernels.ARG_ROW_NORM_N_ROWS, n);
+            normKPe.setGlobal(rowNormGlobal(n));
+            normKPe.dispatch();
+        }
+        if (rope != null) {
+            runRope(ropeK, n, 1);
+        }
+        normKv.setInt(NormKernels.ARG_ROW_NORM_N_ROWS, n);
+        normKv.setGlobal(rowNormGlobal(n));
+        normKv.dispatch();
+    }
+
+    /** The latent step up to the store: the K rotation of the latent row and the store. */
+    private void latentIntoKV(int n) {
+        if (rotKSpec != null) {
+            ops.hadamard(rotKSpec, kva.buffer(), kva.offset(), kva.buffer(), kva.offset(), n, g.kvaWidth);
+        }
+        runStore(storeK, layout.dtypeK(), n, layout.widthK());
+    }
+
+    /**
+     * The decompressed step up to the stores: decompression, per-head K/V, the K and V rotations and both stores.
+     * The temperature and the Q rotation (query-only) do not run.
+     */
+    private void decompressedIntoKV(int n) {
+        decompressHeads(n);
+        int rows = g.headRows(n);
+        if (rotKSpec != null) {
+            ops.hadamard(rotKSpec, k.buffer(), k.offset(), k.buffer(), k.offset(), rows, g.headK);
+        }
+        if (rotVSpec != null) {
+            ops.hadamard(rotVSpec, v.buffer(), v.offset(), v.buffer(), v.offset(), rows, g.headV);
+        }
+        runStore(storeK, layout.dtypeK(), n, layout.widthK());
+        runStore(storeV, layout.dtypeV(), n, layout.widthV());
+    }
+
+    /**
+     * The decompression of a decompressed-cache step into its per-head K and V: the {@code attn_kv_b} product
+     * and its assembly, or the absorbed {@code attn_k_b} / {@code attn_v_b} products when the cache runs over
+     * them.
+     */
+    private void decompressHeads(int n) {
+        if (g.absorbed) {
+            absorbedIntoHeads(n);
+        } else {
+            kvbIntoHeads(n);
+        }
+    }
+
+    /** The {@code attn_kv_b} decompression: the product (over the copied latent rows of a several-token
+     * step), then {@code LLM_MLA_KV_Assemble} or the copies that split {@code [k_nope | v]} per head. */
+    private void kvbIntoHeads(int n) {
+        int rows = g.headRows(n);
+        int kvRow = g.nope + g.headV;
+        if (n == 1) {
+            ops.matmul(wkvB, kva.buffer(), kva.offset(), kvb.buffer(), kvb.offset(), 1);
+            kvbDeltas.applyRows(1, kva.buffer(), kva.offset(), kvb.buffer(), kvb.offset());
+        } else {
+            ops.copy2d(kva.buffer(), kva.offset(), g.kvaWidth, kvc.buffer(), kvc.offset(), g.kvLora, n, g.kvLora);
+            ops.matmul(wkvB, kvc.buffer(), kvc.offset(), kvb.buffer(), kvb.offset(), n);
+            kvbDeltas.applyRows(n, kvc.buffer(), kvc.offset(), kvb.buffer(), kvb.offset());
+        }
+        if (n == 1 && assemble != null) {
+            assemble.dispatch();
+        } else {
+            ops.copy2d(kvb.buffer(), kvb.offset(), kvRow, k.buffer(), k.offset(), g.headK, rows, g.nope);
+            ops.copy2d(kvb.buffer(), kvb.offset() + g.nope, kvRow, v.buffer(), v.offset(), g.headV, rows, g.headV);
+            ropeIntoK(n);
+        }
+    }
+
+    /** The absorbed decompression: the per-token transposed {@code attn_k_b} reads into k_nope and the
+     * {@code attn_v_b} expansions straight into V, then the k_nope copy and the rope broadcast. */
+    private void absorbedIntoHeads(int n) {
+        int rows = g.headRows(n);
+        runPerToken(kDecomp, n, g.nope, kva.offset(), kvb.offset());
+        runPerToken(vExpand, n, g.headV, kva.offset(), v.offset());
+        ops.copy2d(kvb.buffer(), kvb.offset(), g.nope, k.buffer(), k.offset(), g.headK, rows, g.nope);
+        ropeIntoK(n);
+    }
+
+    /** The shared rotary key broadcast into the k_rope dims of every head. */
+    private void ropeIntoK(int n) {
+        if (g.rope > 0) {
+            for (int h = 0; h < g.nHead; h++) {
+                ops.copy2d(kva.buffer(), kva.offset() + g.kvLora, g.kvaWidth, k.buffer(),
+                        k.offset() + h * g.headK + g.nope, g.qWidth, n, g.rope);
+            }
+        }
+    }
+
     private void run(int pos0, int n, ScratchSlot in, ScratchSlot out) {
         checkBound();
         Objects.requireNonNull(in, "in");
@@ -714,21 +870,31 @@ public final class GpuMlaMixer implements GpuMixer {
         }
         in.require((long) n * nEmbd);
         out.require((long) n * nOut);
-        project(n, in);
-        if (g.latent) {
-            latentStep(pos0, n);
-        } else {
-            decompressedStep(pos0, n);
+        // The query, latent and gate projections of a single-token step all read this row, so its Q8_1
+        // blocks are quantized once.
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(in.offset(), nEmbd)
+                ? ops.shareQ8Activations(in.buffer(), in.offset(), nEmbd) : null;
+        try {
+            project(n, in);
+            if (g.latent) {
+                latentStep(pos0, n);
+            } else {
+                decompressedStep(pos0, n);
+            }
+            if (outGate != null) {
+                ops.matmul(wGate, in.buffer(), in.offset(), gate.buffer(), gate.offset(), n);
+                gateDeltas.applyRows(n, in.buffer(), in.offset(), gate.buffer(), gate.offset());
+                outGate.setInt(AttnExtKernels.ARG_GATE_N_TOKENS, n);
+                outGate.setGlobal(AttnExtKernels.global(n, g.nHead, g.headV, local));
+                outGate.dispatch();
+            }
+            ops.matmul(wo, attn.buffer(), attn.offset(), out.buffer(), out.offset(), n);
+            outDeltas.applyRows(n, attn.buffer(), attn.offset(), out.buffer(), out.offset());
+        } finally {
+            if (share != null) {
+                share.close();
+            }
         }
-        if (outGate != null) {
-            ops.matmul(wGate, in.buffer(), in.offset(), gate.buffer(), gate.offset(), n);
-            gateDeltas.applyRows(n, in.buffer(), in.offset(), gate.buffer(), gate.offset());
-            outGate.setInt(AttnExtKernels.ARG_GATE_N_TOKENS, n);
-            outGate.setGlobal(AttnExtKernels.global(n, g.nHead, g.headV, local));
-            outGate.dispatch();
-        }
-        ops.matmul(wo, attn.buffer(), attn.offset(), out.buffer(), out.offset(), n);
-        outDeltas.applyRows(n, attn.buffer(), attn.offset(), out.buffer(), out.offset());
     }
 
     /**
@@ -773,8 +939,31 @@ public final class GpuMlaMixer implements GpuMixer {
 
     /** Absorbed Q, latent K row, attention over the latent cache, per-head expansion by {@code attn_v_b}. */
     private void latentStep(int pos0, int n) {
+        latentInto(n);
+        attend(pos0, n, qlat, lat);
+        latentFrom(n);
+    }
+
+    /** The batched latent step: the same pipeline, its attention through the paged step. */
+    private void latentBatched(PagedStep step, StepLayout s, int n) {
+        latentInto(n);
+        attendBatched(step, s, qlat, lat);
+        latentFrom(n);
+    }
+
+    /** The latent pipeline up to the attention: absorbed Q, the latent K row, its rotation and the store. */
+    private void latentInto(int n) {
         int rows = g.headRows(n);
-        runPerHead(absorb, n, g.kvLora, g.headK, q.offset(), lat.offset());
+        GpuMatmulTap.heads(ops.queue(), wkB, g.nHead, q.buffer(), q.offset(), g.headK, g.nope, n);
+        /* Batch invariance keeps the per-head {T}_MatVecId at every row count: the grouped GEMM tiles the rows
+         * differently from the per-head product, so a row's value would depend on the step's token count. */
+        if (n > 1 && headRows != null && !BatchInvariance.enabled()) {
+            headRows.update(n);
+            headRows.dispatch();
+            absorbGrouped.dispatch();
+        } else {
+            runPerHead(absorb, n, g.kvLora, g.headK, q.offset(), lat.offset());
+        }
         ops.copy2d(lat.buffer(), lat.offset(), g.kvLora, qlat.buffer(), qlat.offset(), g.dQ, rows, g.kvLora);
         if (g.rope > 0) {
             ops.copy2d(q.buffer(), q.offset() + g.nope, g.headK, qlat.buffer(), qlat.offset() + g.kvLora, g.dQ, rows,
@@ -786,11 +975,20 @@ public final class GpuMlaMixer implements GpuMixer {
             ops.hadamard(rotKSpec, kva.buffer(), kva.offset(), kva.buffer(), kva.offset(), n, g.kvaWidth);
         }
         runStore(storeK, layout.dtypeK(), n, layout.widthK());
-        attend(pos0, n, qlat, lat);
+    }
+
+    /** The latent pipeline after the attention: the inverse rotation and the per-head {@code attn_v_b} expansion. */
+    private void latentFrom(int n) {
+        int rows = g.headRows(n);
         if (rotKSpec != null) {
             ops.hadamard(rotKSpec, lat.buffer(), lat.offset(), lat.buffer(), lat.offset(), rows, g.kvLora);
         }
-        runPerHead(expand, n, g.headV, g.kvLora, lat.offset(), attn.offset());
+        GpuMatmulTap.heads(ops.queue(), wvB, g.nHead, lat.buffer(), lat.offset(), g.kvLora, g.kvLora, n);
+        if (n > 1 && headRows != null && !BatchInvariance.enabled()) {
+            expandGrouped.dispatch();
+        } else {
+            runPerHead(expand, n, g.headV, g.kvLora, lat.offset(), attn.offset());
+        }
     }
 
     /**
@@ -810,30 +1008,39 @@ public final class GpuMlaMixer implements GpuMixer {
         }
     }
 
-    /** {@code attn_kv_b} decompression, per-head K/V, attention over the per-head cache. */
+    /**
+     * A per-head product of the absorbed decompressed cache, one launch per token: {@code x_stride = 0}
+     * broadcasts the token's latent row to its {@code n_head} head slots, which write the token's
+     * {@code n_head * out_dim} outputs.
+     */
+    private void runPerToken(PreparedDispatch d, int n, int outDim, int inOff, int outOff) {
+        for (int t = 0; t < n; t++) {
+            d.setInt(MoeKernels.ARG_ID_N_SEL, g.nHead);
+            d.setInt(MoeKernels.ARG_ID_IN_OFF, inOff + t * g.kvaWidth);
+            d.setInt(MoeKernels.ARG_ID_OUT_OFF, outOff + t * g.nHead * outDim);
+            d.setGlobal(MoeKernels.idMatVecGlobal(outDim, g.nHead, idLocal));
+            d.dispatch();
+        }
+    }
+
+    /** Per-head K/V decompression ({@code attn_kv_b} or the absorbed pair), attention over the per-head cache. */
     private void decompressedStep(int pos0, int n) {
+        decompressedInto(n);
+        attend(pos0, n, q, attn);
+        decompressedFrom(n);
+    }
+
+    /** The batched decompressed step: the same pipeline, its attention through the paged step. */
+    private void decompressedBatched(PagedStep step, StepLayout s, int n) {
+        decompressedInto(n);
+        attendBatched(step, s, q, attn);
+        decompressedFrom(n);
+    }
+
+    /** The decompressed pipeline up to the attention: decompression, per-head K/V and the stores. */
+    private void decompressedInto(int n) {
+        decompressHeads(n);
         int rows = g.headRows(n);
-        int kvRow = g.nope + g.headV;
-        if (n == 1) {
-            ops.matmul(wkvB, kva.buffer(), kva.offset(), kvb.buffer(), kvb.offset(), 1);
-            kvbDeltas.applyRows(1, kva.buffer(), kva.offset(), kvb.buffer(), kvb.offset());
-        } else {
-            ops.copy2d(kva.buffer(), kva.offset(), g.kvaWidth, kvc.buffer(), kvc.offset(), g.kvLora, n, g.kvLora);
-            ops.matmul(wkvB, kvc.buffer(), kvc.offset(), kvb.buffer(), kvb.offset(), n);
-            kvbDeltas.applyRows(n, kvc.buffer(), kvc.offset(), kvb.buffer(), kvb.offset());
-        }
-        if (n == 1 && assemble != null) {
-            assemble.dispatch();
-        } else {
-            ops.copy2d(kvb.buffer(), kvb.offset(), kvRow, k.buffer(), k.offset(), g.headK, rows, g.nope);
-            ops.copy2d(kvb.buffer(), kvb.offset() + g.nope, kvRow, v.buffer(), v.offset(), g.headV, rows, g.headV);
-            if (g.rope > 0) {
-                for (int h = 0; h < g.nHead; h++) {
-                    ops.copy2d(kva.buffer(), kva.offset() + g.kvLora, g.kvaWidth, k.buffer(),
-                            k.offset() + h * g.headK + g.nope, g.qWidth, n, g.rope);
-                }
-            }
-        }
         runTemperature(n);
         if (rotKSpec != null) {
             ops.hadamard(rotKSpec, q.buffer(), q.offset(), q.buffer(), q.offset(), rows, g.headK);
@@ -844,7 +1051,11 @@ public final class GpuMlaMixer implements GpuMixer {
         }
         runStore(storeK, layout.dtypeK(), n, layout.widthK());
         runStore(storeV, layout.dtypeV(), n, layout.widthV());
-        attend(pos0, n, q, attn);
+    }
+
+    /** The decompressed pipeline after the attention: the inverse V rotation. */
+    private void decompressedFrom(int n) {
+        int rows = g.headRows(n);
         if (rotVSpec != null) {
             ops.hadamard(rotVSpec, attn.buffer(), attn.offset(), attn.buffer(), attn.offset(), rows, g.headV);
         }
@@ -870,9 +1081,267 @@ public final class GpuMlaMixer implements GpuMixer {
 
     // ------------------------------------------------------------------ attention
 
+    /**
+     * One step over the rows of {@code s}: the contiguous step at {@code s.pos0(0)} when no paged step is current,
+     * the paged batched step through the memory's current {@code PagedStep} otherwise.
+     *
+     * @throws UnsupportedOperationException when the step is not contiguous and the memory holds no paged step
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        checkBound();
+        Objects.requireNonNull(s, "s");
+        PagedStep step = steps.currentPagedStep();
+        if (step == null) {
+            if (!s.contiguousSingle()) {
+                throw new UnsupportedOperationException(batchRefusal());
+            }
+            run(s.pos0(0), s.nTokens(), in, out);
+            return;
+        }
+        int n = s.nTokens();
+        if (n < 1 || n > ops.scratch().ubatch()) {
+            throw new IllegalArgumentException("MLA step of " + n + " tokens is outside [1, "
+                    + ops.scratch().ubatch() + "]");
+        }
+        in.require((long) n * nEmbd);
+        out.require((long) n * nOut);
+        project(n, in);
+        if (g.latent) {
+            latentBatched(step, s, n);
+        } else {
+            decompressedBatched(step, s, n);
+        }
+        if (outGate != null) {
+            ops.matmul(wGate, in.buffer(), in.offset(), gate.buffer(), gate.offset(), n);
+            gateDeltas.applyRows(n, in.buffer(), in.offset(), gate.buffer(), gate.offset());
+            outGate.setInt(AttnExtKernels.ARG_GATE_N_TOKENS, n);
+            outGate.setGlobal(AttnExtKernels.global(n, g.nHead, g.headV, local));
+            outGate.dispatch();
+        }
+        ops.matmul(wo, attn.buffer(), attn.offset(), out.buffer(), out.offset(), n);
+        outDeltas.applyRows(n, attn.buffer(), attn.offset(), out.buffer(), out.offset());
+    }
+
+    /**
+     * The batched attention: one paged decode launch when every segment of {@code s} carries one row, else one
+     * paged prefill per segment ({@code LLM_FlashAttnPaged_*}; a PER_ROW plan falls back to the paged decode once
+     * per row over the segment's page-table block). Batch invariance runs every segment per row through the focus
+     * table with that segment's own slot count, the launches of the segments' single-sequence steps, so the batch's
+     * longest sequence cannot size another sequence's key split. A tree verify step's mask rides the paged prefill
+     * like the standard attention's: every segment's rows are its launch's fresh rows, whose relativized mask rows
+     * and depth positions the launch uploads, and whose count rides the flags (a masked step always holds a
+     * multi-row segment, so it never takes the decode path).
+     *
+     * @throws UnsupportedOperationException when the memory holds no paged step for this mixer, or the step carries
+     *         a tree mask this layer's launch cannot take
+     */
+    private void attendBatched(PagedStep step, StepLayout s, ScratchSlot qs, ScratchSlot os) {
+        if (fdPaged == null) {
+            throw new UnsupportedOperationException("layer " + il + " runs a batched step on an unpaged cache");
+        }
+        int nSeg = step.nSeg();
+        if (steps.treeMask() != null) {
+            if (BatchInvariance.enabled()) {
+                throw new UnsupportedOperationException("layer " + il + " runs a tree verify step on a batch-invariant"
+                        + " plan, whose every segment runs through the per-row fallback");
+            }
+            if (faPaged == null) {
+                throw new UnsupportedOperationException("layer " + il + " runs a tree verify step on a PER_ROW plan,"
+                        + " whose segments run through the per-row fallback");
+            }
+        }
+        if (BatchInvariance.enabled()) {
+            int[] slots = step.seqSlots(kv.group());
+            for (int seg = 0; seg < nSeg; seg++) {
+                rowsFallback(step, seg, slots[step.segSeq(seg)], qs, os);
+            }
+            return;
+        }
+        boolean allSingle = true;
+        for (int i = 0; i < nSeg; i++) {
+            allSingle &= step.segLen(i) == 1;
+        }
+        if (allSingle) {
+            decodeBatched(step, nSeg, qs, os);
+            return;
+        }
+        int qStride = g.nHead * g.dQ;
+        int outStride = g.nHead * g.dV;
+        boolean treeStep = steps.treeMask() != null;
+        GpuBuffer tree = treeStep ? steps.treeMask() : null;
+        for (int seg = 0; seg < nSeg; seg++) {
+            int len = step.segLen(seg);
+            int keys = step.seqSlots(kv.group())[step.segSeq(seg)];
+            int tokStart = step.segStart(seg);
+            if (treeStep) {
+                // the segment's rows rope at their tree depth positions and see their own ancestor bits,
+                // both launch-local ([0, len) of the segment positions and mask buffers)
+                steps.uploadSegmentTreePositions(tokStart, len);
+                steps.uploadTreeMaskSegment(tokStart, len);
+            } else {
+                steps.uploadSegmentPositions(step.segPos0(seg), len);
+            }
+            if (faPaged != null) {
+                FlashAttnTiling.Split sp = prefillTiling.prefillSplit(len, keys, partialCapacity);
+                if (treeStep) {
+                    faPaged.setBuffer(AttnKernels.ARG_FAP_BUF_TREE_MASK, tree);
+                }
+                faPaged.setInt(AttnKernels.ARG_FA_N_TOKENS, len);
+                faPaged.setInt(AttnKernels.ARG_FA_N_SPLIT, sp.count());
+                faPaged.setInt(AttnKernels.ARG_FA_SPLIT_LEN, sp.length());
+                faPaged.setInt(AttnKernels.ARG_FA_KV_END, keys);
+                // a tree step's fresh rows are the segment's rows, packed beside the tree bit
+                faPaged.setInt(AttnKernels.ARG_FA_FLAGS, treeStep
+                        ? AttnKernels.treeFlags(pagedFlags(sp.direct()), len) : pagedFlags(sp.direct()));
+                faPaged.setInt(AttnKernels.ARG_FA_Q_OFF, (int) (qs.offset() + (long) tokStart * qStride));
+                faPaged.setInt(AttnKernels.ARG_FA_OUT_OFF, (int) (os.offset() + (long) tokStart * outStride));
+                faPaged.setInt(AttnKernels.ARG_FAP_PT_OFF, seg * maxPages);
+                faPaged.setGlobal(prefillTiling.prefillGlobal(len, sp.count()));
+                faPaged.dispatch();
+                if (!sp.direct()) {
+                    combine(g.headRows(len), sp.count(), (int) (os.offset() + (long) tokStart * outStride));
+                }
+            } else {
+                rowsFallback(step, seg, keys, qs, os);
+            }
+        }
+    }
+
+    /**
+     * Segment {@code seg} row by row through the paged decode kernel, each row over the segment's own {@code keys}
+     * slots and query position: the segment's page-table row, slot count and the rows' positions go to the mixer's
+     * one-sequence buffers, which the launch's one sequence reads ({@code LLM_FlashDecodePaged_*} takes its
+     * sequence's slot count and query position from the bound buffers, not from the launch scalars), and the
+     * launch's rows point back at the step's buffers afterwards.
+     */
+    private void rowsFallback(PagedStep step, int seg, int keys, ScratchSlot qs, ScratchSlot os) {
+        int qStride = g.nHead * g.dQ;
+        int outStride = g.nHead * g.dV;
+        int tokStart = step.segStart(seg);
+        ops.queue().enqueueCopyBuffer(steps.pageTable(kv.group()),
+                (long) seg * maxPages * Integer.BYTES, focusTable(), 0, (long) maxPages * Integer.BYTES);
+        writeLaunchInt(focusKvLen(), keys);
+        fdPaged.setBuffer(AttnKernels.ARG_FDP_BUF_PAGE_TABLE, focusTable());
+        fdPaged.setBuffer(AttnKernels.ARG_FDP_BUF_SEQ_KV_LEN, focusKvLen());
+        fdPaged.setBuffer(AttnKernels.ARG_FDP_BUF_Q_POS_SEQ, focusQPos());
+        for (int t = 0; t < step.segLen(seg); t++) {
+            writeLaunchInt(focusQPos(), step.segPos0(seg) + t);
+            decodePagedRow(qs.offset() + (tokStart + t) * qStride, os.offset() + (tokStart + t) * outStride, keys);
+        }
+        restorePagedRows();
+    }
+
+    /** Points the paged decode launch's rows back at the step's page table, slot counts and positions. */
+    private void restorePagedRows() {
+        fdPaged.setBuffer(AttnKernels.ARG_FDP_BUF_PAGE_TABLE, steps.pageTable(kv.group()));
+        fdPaged.setBuffer(AttnKernels.ARG_FDP_BUF_SEQ_KV_LEN, steps.seqKvLen(kv.group()));
+        fdPaged.setBuffer(AttnKernels.ARG_FDP_BUF_Q_POS_SEQ, steps.qPosSeq());
+        fdPaged.setInt(AttnKernels.ARG_FDP_Q_SEQ_STRIDE, g.nHead * g.dQ);
+        fdPaged.setInt(AttnKernels.ARG_FDP_OUT_SEQ_STRIDE, g.nHead * g.dV);
+    }
+
+    /**
+     * The flags of a paged launch: the layer's flash flags without the causal bit when the step is non-causal
+     * ({@link GpuStepInputs#stepNonCausal()}, every row then sees its whole sequence), plus the direct bit.
+     */
+    private int pagedFlags(boolean direct) {
+        int f = steps.stepNonCausal() ? flashFlags & ~AttnKernels.FLAG_CAUSAL : flashFlags;
+        return direct ? f | AttnKernels.FLAG_DIRECT : f;
+    }
+
+    /** One paged decode launch over the step's {@code nSeq} one-row segments (launch order = segment order). */
+    private void decodeBatched(PagedStep step, int nSeq, ScratchSlot qs, ScratchSlot os) {
+        int[] slots = step.seqSlots(kv.group());
+        int maxKeys = 0;
+        for (int i = 0; i < nSeq; i++) {
+            maxKeys = Math.max(maxKeys, slots[step.segSeq(i)]);
+        }
+        FlashAttnTiling.Split sp = pagedTiling.decodeSplit(maxKeys);
+        fdPaged.setInt(AttnKernels.ARG_FD_N_SPLIT, sp.count());
+        fdPaged.setInt(AttnKernels.ARG_FD_SPLIT_LEN, sp.length());
+        fdPaged.setInt(AttnKernels.ARG_FD_FLAGS, pagedFlags(sp.direct()));
+        fdPaged.setInt(AttnKernels.ARG_FDP_N_SEQ, nSeq);
+        fdPaged.setInt(AttnKernels.ARG_FD_Q_OFF, qs.offset());
+        fdPaged.setInt(AttnKernels.ARG_FD_OUT_OFF, os.offset());
+        fdPaged.setGlobal(pagedTiling.decodePagedGlobal(nSeq, sp.count()));
+        fdPaged.dispatch();
+        if (!sp.direct()) {
+            combine(nSeq * g.nHead, sp.count(), os.offset());
+        }
+    }
+
+    /** One query row through the paged decode kernel, whose one sequence sits at page-table row 0. */
+    private void decodePagedRow(long qOff, long outOff, int keys) {
+        FlashAttnTiling.Split sp = pagedTiling.decodeSplit(keys);
+        fdPaged.setInt(AttnKernels.ARG_FD_N_SPLIT, sp.count());
+        fdPaged.setInt(AttnKernels.ARG_FD_SPLIT_LEN, sp.length());
+        fdPaged.setInt(AttnKernels.ARG_FD_FLAGS, pagedFlags(sp.direct()));
+        fdPaged.setInt(AttnKernels.ARG_FDP_N_SEQ, 1);
+        fdPaged.setInt(AttnKernels.ARG_FDP_Q_SEQ_STRIDE, 0);
+        fdPaged.setInt(AttnKernels.ARG_FDP_OUT_SEQ_STRIDE, 0);
+        fdPaged.setInt(AttnKernels.ARG_FD_Q_OFF, (int) qOff);
+        fdPaged.setInt(AttnKernels.ARG_FD_OUT_OFF, (int) outOff);
+        fdPaged.setGlobal(pagedTiling.decodePagedGlobal(1, sp.count()));
+        fdPaged.dispatch();
+        if (!sp.direct()) {
+            combine(g.nHead, sp.count(), (int) outOff);
+        }
+    }
+
+    /**
+     * The one-sequence page table of the per-row fallback launches, allocated at first use and owned by this
+     * mixer ({@code LLM_FlashDecodePaged_*} reads its launch's one sequence at page-table row 0).
+     */
+    private GpuBuffer focusTable() {
+        if (focus == null) {
+            focus = backend.allocateBuffer((long) maxPages * Integer.BYTES, true);
+            owned.add(focus);
+        }
+        return focus;
+    }
+
+    /** The one-int slot count of the batch-invariant per-row paged launches, allocated at first use. */
+    private GpuBuffer focusKvLen() {
+        if (focusKvLen == null) {
+            focusKvLen = backend.allocateBuffer(Integer.BYTES, true);
+            owned.add(focusKvLen);
+        }
+        return focusKvLen;
+    }
+
+    /** The one-int query position of the batch-invariant per-row paged launches, allocated at first use. */
+    private GpuBuffer focusQPos() {
+        if (focusQPos == null) {
+            focusQPos = backend.allocateBuffer(Integer.BYTES, true);
+            owned.add(focusQPos);
+        }
+        return focusQPos;
+    }
+
+    /** Writes one little-endian int to element 0 of {@code dst}, ordered on the queue before later launches. */
+    private void writeLaunchInt(GpuBuffer dst, int value) {
+        byte[] b = ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array();
+        GpuEvent e = ops.queue().enqueueWriteBuffer(dst, 0, Integer.BYTES, b);
+        if (e != null) {
+            e.close();
+        }
+    }
+
+    /**
+     * The attention of one sequence's {@code n} rows: one decode launch for one row, else the tiled prefill, or the
+     * per-row decode when the plan has no prefill kernel. Batch invariance always runs one decode launch per row
+     * over the decode tiling, the exact launches of {@code n} single-row steps, so a row's key split comes from its
+     * own key count instead of the tiled call's token tile.
+     */
     private void attend(int pos0, int n, ScratchSlot qs, ScratchSlot os) {
         if (n == 1) {
             decodeRow(fd, decodeTiling, pos0, qs.offset(), os.offset());
+        } else if (BatchInvariance.enabled()) {
+            for (int t = 0; t < n; t++) {
+                decodeRow(fd, decodeTiling, pos0 + t, qs.offset() + t * g.nHead * g.dQ,
+                        os.offset() + t * g.nHead * g.dV);
+            }
         } else if (fa != null) {
             tiled(pos0, n, os);
         } else {
@@ -893,7 +1362,7 @@ public final class GpuMlaMixer implements GpuMixer {
         d.setInt(AttnKernels.ARG_FD_KV_START, start);
         d.setInt(AttnKernels.ARG_FD_KV_END, end);
         d.setInt(AttnKernels.ARG_FD_Q_POS, pos);
-        d.setInt(AttnKernels.ARG_FD_DIRECT_OUT, s.direct() ? 1 : 0);
+        d.setInt(AttnKernels.ARG_FD_FLAGS, flashFlags | (s.direct() ? AttnKernels.FLAG_DIRECT : 0));
         d.setInt(AttnKernels.ARG_FD_Q_OFF, qOff);
         d.setInt(AttnKernels.ARG_FD_OUT_OFF, outOff);
         d.setGlobal(t.decodeGlobal(s.count()));
@@ -913,7 +1382,7 @@ public final class GpuMlaMixer implements GpuMixer {
         fa.setInt(AttnKernels.ARG_FA_SPLIT_LEN, s.length());
         fa.setInt(AttnKernels.ARG_FA_KV_START, start);
         fa.setInt(AttnKernels.ARG_FA_KV_END, end);
-        fa.setInt(AttnKernels.ARG_FA_DIRECT_OUT, s.direct() ? 1 : 0);
+        fa.setInt(AttnKernels.ARG_FA_FLAGS, flashFlags | (s.direct() ? AttnKernels.FLAG_DIRECT : 0));
         fa.setGlobal(prefillTiling.prefillGlobal(n, s.count()));
         fa.dispatch();
         if (!s.direct()) {
@@ -1004,6 +1473,8 @@ public final class GpuMlaMixer implements GpuMixer {
     private void release() {
         RuntimeException first = Closeables.closeAll(prepared, null);
         prepared.clear();
+        first = Closeables.close(headRows, first);
+        headRows = null;
         first = Closeables.closeAll(owned, first);
         owned.clear();
         if (first != null) {

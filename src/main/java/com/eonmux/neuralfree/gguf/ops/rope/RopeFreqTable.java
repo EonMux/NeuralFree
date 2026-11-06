@@ -29,9 +29,12 @@ public final class RopeFreqTable {
     private final float attnFactor;
     private final float corrLo;
     private final float corrHi;
+    private final FopeWeights fope;
 
     private RopeFreqTable(RopeType type, int nDims, float thetaScale, float freqScale, float extFactor,
-                          float attnFactor, float corrLo, float corrHi, int[] sections, float[] freqFactors) {
+                          float attnFactor, float corrLo, float corrHi, int[] sections, float[] freqFactors,
+                          FopeWeights fope) {
+        this.fope = fope;
         this.type = type;
         this.nDims = nDims;
         this.pairs = RopeMath.pairCount(type, nDims);
@@ -60,22 +63,71 @@ public final class RopeFreqTable {
      * @throws IllegalArgumentException when the factors are too short or the sections do not fit the type
      */
     public static RopeFreqTable of(RopeSpec spec, float[] freqFactors) {
+        return of(spec, freqFactors, null);
+    }
+
+    /**
+     * Table of a layer's rotation, with the learned coefficients of a FoPE layer.
+     *
+     * @param freqFactors per-pair divisors read from a tensor, or null for none; the spec's computed divisors take
+     *                    precedence
+     * @param fope        the layer's FoPE coefficients, or null for analytic RoPE
+     * @throws IllegalArgumentException when the factors are too short, the sections do not fit the type, or a FoPE
+     *                                  table is combined with per-pair divisors or a type other than NEOX
+     */
+    public static RopeFreqTable of(RopeSpec spec, float[] freqFactors, FopeWeights fope) {
         Objects.requireNonNull(spec, "spec");
-        return of(spec.type(), spec.nDims(), spec.thetaScale(), spec.freqScale(), spec.extFactor(), spec.attnFactor(),
-                spec.corrLo(), spec.corrHi(), spec.sections(), freqFactors);
+        float[] factors = spec.computedFreqFactors() != null ? spec.computedFreqFactors() : freqFactors;
+        if (fope != null) {
+            if (freqFactors != null || spec.computedFreqFactors() != null) {
+                throw new IllegalArgumentException("FoPE replaces the analytic frequencies; it takes no per-pair"
+                        + " divisors");
+            }
+            if (spec.type() != RopeType.NEOX) {
+                throw new IllegalArgumentException("FoPE is a single-section NEOX rotation, not " + spec.type());
+            }
+            if (fope.dim() > RopeMath.pairCount(spec.type(), spec.nDims())) {
+                throw new IllegalArgumentException("FoPE projects " + fope.dim() + " frequencies, more than the "
+                        + RopeMath.pairCount(spec.type(), spec.nDims()) + " pairs of nDims " + spec.nDims());
+            }
+        }
+        return new RopeFreqTable(spec.type(), spec.nDims(), spec.thetaScale(), spec.freqScale(), spec.extFactor(),
+                spec.attnFactor(), spec.corrLo(), spec.corrHi(), spec.sections(), factors, fope);
+    }
+
+    /**
+     * Table of the plain rotation dual-chunk attention uses: the layer's base and rotary width with no frequency
+     * scaling, no extrapolation and no learned factors (vLLM's {@code DualChunkRotaryEmbedding} computes its own
+     * {@code inv_freq} from {@code rope_theta} and ignores every RoPE scaling parameter).
+     *
+     * @throws IllegalArgumentException when the spec is not a NORM or NEOX rotation
+     */
+    public static RopeFreqTable forDualChunk(RopeSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        if (spec.type() != RopeType.NORM && spec.type() != RopeType.NEOX) {
+            throw new IllegalArgumentException("dual-chunk attention needs a NORM or NEOX rope, got " + spec.type());
+        }
+        return of(spec.type(), spec.nDims(), spec.thetaScale(), 1.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                new int[MropeTextPositions.SECTIONS], null);
     }
 
     /**
      * Table of the K-cache context shift of a layer ({@code LLM_KV_RopeShift_*}): the layer's parameters with the
      * {@link RopeMath#shiftType shift type} (NORM or NEOX, one position, exponent {@code i}).
      *
-     * @throws IllegalArgumentException for a type that cannot be shifted or factors that are too short
+     * @throws IllegalArgumentException for a type that cannot be shifted, factors that are too short, or a FoPE layer
+     *                                  (its learned rotation does not compose with a position delta)
      */
     public static RopeFreqTable forShift(RopeSpec spec, float[] freqFactors) {
         Objects.requireNonNull(spec, "spec");
+        if (spec.fope() != null) {
+            throw new IllegalArgumentException("a FoPE layer's K cache cannot be shifted by a position delta: its"
+                    + " rotation comes from learned coefficients, not from an angle at the stored position");
+        }
         return of(RopeMath.shiftType(spec.type()), spec.nDims(), spec.thetaScale(), spec.freqScale(),
                 spec.extFactor(), spec.attnFactor(), spec.corrLo(), spec.corrHi(),
-                new int[MropeTextPositions.SECTIONS], freqFactors);
+                new int[MropeTextPositions.SECTIONS],
+                spec.computedFreqFactors() != null ? spec.computedFreqFactors() : freqFactors);
     }
 
     /**
@@ -118,7 +170,7 @@ public final class RopeFreqTable {
                     + type + " with nDims " + nDims + " reads " + pairs);
         }
         return new RopeFreqTable(type, nDims, thetaScale, freqScale, extFactor, attnFactor, corrLo, corrHi,
-                sections.clone(), freqFactors);
+                sections.clone(), freqFactors, null);
     }
 
     public RopeType type() {
@@ -160,19 +212,51 @@ public final class RopeFreqTable {
         return RopeMath.rotatedWidth(type, nDims);
     }
 
+    /** The learned FoPE coefficients of the layer, or null for analytic RoPE. */
+    public FopeWeights fourier() {
+        return fope;
+    }
+
     /**
      * Fills {@code cs[2i] = cos * mscale}, {@code cs[2i + 1] = sin * mscale} for every pair of token {@code t}, whose
      * section {@code k} position is {@code pos[posOff + t + k * posStride]} (single-section types read
      * {@code pos[posOff + t]} only).
      *
      * @throws IllegalArgumentException when {@code cs} holds fewer than {@code 2 * pairs()} values
+     * @throws IllegalStateException    for a FoPE table, whose rows depend on the head
      */
     public void cosSin(int[] pos, int posOff, int t, int posStride, float[] cs) {
         requireRow(cs);
+        if (fope != null) {
+            throw new IllegalStateException("a FoPE cos/sin row depends on the head; use the head-aware overload");
+        }
         for (int i = 0; i < pairs; i++) {
             final int p = multi ? pos[posOff + t + section[i] * posStride] : pos[posOff + t];
             pair(p, i, cs);
         }
+    }
+
+    /**
+     * Fills the cos/sin row of head {@code h} of {@code nHeads} rotated heads for token {@code t}: the analytic pairs
+     * of {@link #cosSin(int[], int, int, int, float[])}, or the coefficient projection of a FoPE table.
+     *
+     * @param basis caller-owned scratch of at least {@link #basisSize()} values, used only by a FoPE table
+     * @throws IllegalArgumentException when a row or the scratch array is too short, or the head count does not match
+     *                                  the FoPE coefficient rows
+     */
+    public void cosSin(int[] pos, int posOff, int t, int posStride, int nHeads, int h, float[] cs, float[] basis) {
+        if (fope == null) {
+            cosSin(pos, posOff, t, posStride, cs);
+            return;
+        }
+        requireRow(cs);
+        final int p = pos[posOff + t];
+        fope.cosSin(p, nHeads, h, pairs, cs, basis);
+    }
+
+    /** Values a caller-owned scratch array must hold for the head-aware {@link #cosSin}. */
+    public int basisSize() {
+        return fope != null ? fope.basisSize() : 0;
     }
 
     /**

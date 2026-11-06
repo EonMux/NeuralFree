@@ -12,11 +12,23 @@
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_head, i n_head_kv, i d_k, i d_v, i g_tile, i n_split, i split_len, i kv_start, i kv_end, i q_pos,
  *    i k_row_stride, i k_head_stride, i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias,
- *    i causal, i swa_type, i n_swa, i bias_mode, i n_buckets, i max_distance, i has_sinks, i direct_out,
+ *    i flags, i swa_type, i n_swa, i bias_mode, i n_buckets, i max_distance,
  *    i q_off, i out_off,
- *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial[, i kv_types (KV_MIXED)]
+ *    R q, R k, R v, R<int> kv_pos, R sinks, R rel_bias, W out, W partial, R kv_scales, R<uvec2> tree_mask
+ *    [, i kv_types (KV_MIXED)]
  *    | PAGED: i page_shift, i max_pages, i n_seq, i q_seq_stride, i out_seq_stride,
- *      R<int> page_table, R<int> seq_kv_len, R<int> q_pos_seq)
+ *      R<int> page_table, R<int> seq_kv_len, R<int> q_pos_seq, R kv_scales, R<uvec2> tree_mask)
+ * tree_mask holds one uvec2 per query row (low 32 bits, high 32), the row's ancestor-or-self bitmask over the
+ * step's fresh slots; under flags bit 4 (NF_ATTN_FLAG_TREE) the last n_fresh slots of the key range take their
+ * visibility from it (common/attn_common.glsl nf_attn_tree_visible), and every other slot keeps the position
+ * rules; n_fresh rides in flags bits 5-31 (nf_attn_flag_fresh) and is 0 without the flag. The base rows launch
+ * one query row per workgroup, so tree_mask[0] names it; the paged rows read the sequence's block tree_mask + s.
+ * kv_scales holds the FP8 KV-cache scales as n_head_kv K values then n_head_kv V values (all 1.0 without an FP8
+ * cache): pass 1 multiplies the loaded K by kv_scales[kvh] and pass 2 the loaded V by kv_scales[n_head_kv + kvh]
+ * (the .cl twin nf_fd_run). A per-token-head cache stores its per-(row, KV head) scales interleaved in the same
+ * buffer ([row0 K heads, row0 V heads, ...]).
+ * flags packs causal (bit 0), has_sinks (bit 1), direct_out (bit 2), the tree mask (bit 4) and n_fresh
+ * (bits 5-31) (common/attn_common.glsl NF_ATTN_FLAG_*, nf_attn_flag_fresh).
  * The paged entry points ignore kv_start, kv_end and q_pos (the host passes 0).
  * Dispatch: 2-D, global {n_split * 128, n_head_kv * ceil(G / g_tile)}, local {128, 1, 1}; under PAGED the
  * sequence is folded into dimension 1 in front of the KV head and the tiles:
@@ -36,8 +48,18 @@
 #error "flash_decode.comp requires exactly one of KV and KV_MIXED"
 #endif
 
-layout(std430, binding = 0) readonly buffer NfFdQ { float q_in[]; };
+/* A vendor variant (KV >= NF_KV_NVFP4) and the mixed one decode through the packed side planes and the centroid
+ * table, so their cache views are byte views and the side data rides the kv_scales binding. */
 #if defined(KV_MIXED)
+#define NF_FD_VENDOR 1
+#elif KV >= NF_KV_NVFP4
+#define NF_FD_VENDOR 1
+#else
+#define NF_FD_VENDOR 0
+#endif
+
+layout(std430, binding = 0) readonly buffer NfFdQ { float q_in[]; };
+#if NF_FD_VENDOR
 NF_BUFFER_VIEWS(1, kc)
 NF_KV_LOADERS(kc)
 NF_BUFFER_VIEWS(2, vc)
@@ -55,16 +77,36 @@ layout(std430, binding = 7) writeonly buffer NfFdPartial { float partial[]; };
 layout(std430, binding = 8) readonly buffer NfFdPages { int page_table[]; };
 layout(std430, binding = 9) readonly buffer NfFdSeqKvLen { int seq_kv_len[]; };
 layout(std430, binding = 10) readonly buffer NfFdQPosSeq { int q_pos_seq[]; };
+layout(std430, binding = 11) readonly buffer NfFdKvScales { float kv_scales[]; };
+layout(std430, binding = 12) readonly buffer NfFdTreeMask { uvec2 tree_mask[]; };
+#if NF_FD_VENDOR
+layout(std430, binding = 11) readonly buffer NfFdKvScales8 { uint8_t kvs_u8[]; };
 #endif
+#else
+layout(std430, binding = 8) readonly buffer NfFdKvScales { float kv_scales[]; };
+layout(std430, binding = 9) readonly buffer NfFdTreeMask { uvec2 tree_mask[]; };
+#if NF_FD_VENDOR
+layout(std430, binding = 8) readonly buffer NfFdKvScales8 { uint8_t kvs_u8[]; };
+#endif
+#endif
+
+#if defined(KV_MIXED)
+#define NF_FD_K_TYPE nf_attn_kv_type_k(pc.kv_types)
+#define NF_FD_V_TYPE nf_attn_kv_type_v(pc.kv_types)
+#else
+#define NF_FD_K_TYPE KV
+#define NF_FD_V_TYPE KV
+#endif
+
 
 layout(push_constant) uniform NfFdParams {
     int n_head; int n_head_kv; int d_k; int d_v; int g_tile;
     int n_split; int split_len; int kv_start; int kv_end; int q_pos;
     int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
     float scale; float softcap; float max_bias;
-    int causal; int swa_type; int n_swa;
+    int flags; int swa_type; int n_swa;
     int bias_mode; int n_buckets; int max_distance;
-    int has_sinks; int direct_out; int q_off; int out_off;
+    int q_off; int out_off;
 #if defined(PAGED)
     int page_shift; int max_pages; int n_seq; int q_seq_stride; int out_seq_stride;
 #endif
@@ -72,6 +114,58 @@ layout(push_constant) uniform NfFdParams {
     int kv_types;
 #endif
 } pc;
+
+#if NF_FD_VENDOR
+NF_KV_VENDOR_DECODE(kc, kc, kvs, kv_scales)
+NF_KV_VENDOR_DECODE(vc, vc, kvs, kv_scales)
+
+/* V of a latent cache reads the K row (flags bit NF_ATTN_FLAG_V_ALIAS) and therefore the K side planes. */
+bool nf_fd_v_alias() { return (pc.flags & NF_ATTN_FLAG_V_ALIAS) != 0; }
+
+/* Bytes of one row of the K / V packed side planes of a vendor cache side, 0 for a side without planes. */
+uint nf_fd_k_plane() {
+    return nf_kv_is_vendor(NF_FD_K_TYPE)
+        ? nf_kv_vendor_plane_bytes(NF_FD_K_TYPE, uint(pc.k_row_stride), uint(pc.n_head_kv)) : 0u;
+}
+uint nf_fd_v_plane() {
+    return !nf_fd_v_alias() && nf_kv_is_vendor(NF_FD_V_TYPE)
+        ? nf_kv_vendor_plane_bytes(NF_FD_V_TYPE, uint(pc.v_row_stride), uint(pc.n_head_kv)) : 0u;
+}
+
+/* Byte offset of the first plane row of the side in the kv_scales binding, and the bytes between two rows. */
+uint nf_fd_plane_base(bool v) {
+    return nf_kv_side_plane_base(uint(pc.n_head_kv)) + (v && !nf_fd_v_alias() ? nf_fd_k_plane() : 0u);
+}
+uint nf_fd_plane_stride() { return nf_fd_k_plane() + nf_fd_v_plane(); }
+
+/* Four values e .. e + 3 of the K cache row `row`, decoded through the row's side planes when it is a vendor row. */
+vec4 nf_fd_k4(uint e, int row) {
+    return nf_kv_is_vendor(NF_FD_K_TYPE)
+        ? kc_vendor_load4(e, row, NF_FD_K_TYPE, uint(pc.k_row_stride), uint(pc.k_head_stride),
+                          nf_fd_plane_base(false), nf_fd_plane_stride())
+        : kc_kv_load4(e, NF_FD_K_TYPE);
+}
+
+/* Value e of the V cache row `row`. */
+float nf_fd_v1(uint e, int row) {
+    return nf_kv_is_vendor(NF_FD_V_TYPE)
+        ? vc_vendor_load1(e, row, NF_FD_V_TYPE, uint(pc.v_row_stride), uint(pc.v_head_stride),
+                          nf_fd_plane_base(true), nf_fd_plane_stride())
+        : vc_kv_load1(e, NF_FD_V_TYPE);
+}
+
+/* norm / |centroids| of a TurboQuant key row, else 1. */
+float nf_fd_tq_score(uint e_head, int row) {
+    return nf_kv_is_vendor(NF_FD_K_TYPE)
+        ? kc_vendor_tq_score(e_head, row, NF_FD_K_TYPE, uint(pc.k_row_stride), uint(pc.k_head_stride),
+                             nf_fd_plane_base(false), nf_fd_plane_stride())
+        : 1.0;
+}
+#else
+vec4 nf_fd_k4(uint e, int row) { return kc_load4(e); }
+float nf_fd_v1(uint e, int row) { return vc_load1(e); }
+float nf_fd_tq_score(uint e_head, int row) { return 1.0; }
+#endif
 
 #if defined(KV_MIXED)
 /* K and V reads at the types packed in pc.kv_types (common/attn_common.glsl). */
@@ -100,14 +194,14 @@ bool nf_fd_plan_ok() {
         && pc.n_split >= 1 && pc.split_len > 0
         && pc.g_tile * (pc.d_k + pc.split_len) <= NF_FA_SMEM_FLOATS
         && pc.g_tile * pc.d_v <= NF_FA_WG * NF_FA_ACC_MAX
-        && (pc.direct_out == 0 || pc.n_split == 1)
+        && ((pc.flags & NF_ATTN_FLAG_DIRECT) == 0 || pc.n_split == 1)
         && gl_WorkGroupSize.x == uint(NF_FA_WG);
 }
 
 #if defined(PAGED)
 /* The paged plan adds the page geometry (the .cl twin nf_fd_paged_ok): page_shift is the log2 page size, bounded so
  * the physical row stays an int; the strides must be positive; seq_kv_len[s], q_pos_seq[s] and the page table are
- * validated on the host before the upload (MS-2, section 5.5.1). */
+ * validated on the host before the upload. */
 bool nf_fd_paged_plan_ok() {
     return nf_fd_plan_ok()
         && pc.page_shift >= 0 && pc.page_shift <= 20 && pc.max_pages >= 1 && pc.n_seq >= 1
@@ -115,15 +209,26 @@ bool nf_fd_paged_plan_ok() {
 }
 #endif
 
-/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h); slope = ALiBi slope of h. */
-float nf_fd_bias(int h, int p_q, int p_k, float slope) {
+/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h); slope = ALiBi slope of h,
+ * q_row = the query token's row in the step (the sequence index on a paged decode). */
+float nf_fd_bias(int h, int p_q, int p_k, float slope, int q_row) {
     if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
         return slope * (-float(abs(p_q - p_k)));
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) {
+        return p_k <= p_q ? slope * (-sqrt(float(p_q - p_k))) : 0.0;
     }
     if (pc.bias_mode == NF_ATTN_BIAS_T5_CAUSAL || pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR) {
         const int bucket = nf_t5_bucket(p_k, p_q, pc.n_buckets, pc.max_distance,
                                         pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR ? 1 : 0);
         return rel_bias[bucket * pc.n_head + h];
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_INKLING) {
+        const int dist = p_q - p_k;
+        if (dist < 0 || dist >= pc.n_buckets) {
+            return 0.0;
+        }
+        return rel_bias[(q_row * pc.n_head + h) * pc.n_buckets + dist];
     }
     return 0.0;
 }
@@ -135,7 +240,7 @@ void nf_fd_poison() {
         return;
     }
     const uint lid = gl_LocalInvocationID.x;
-    if (pc.direct_out != 0) {
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
         const uint n = uint(pc.n_head * pc.d_v);
         for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
             dst[uint(pc.out_off) + i] = NF_NAN;
@@ -155,7 +260,7 @@ void nf_fd_paged_poison() {
         return;
     }
     const uint lid = gl_LocalInvocationID.x;
-    if (pc.direct_out != 0) {
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
         const uint n = uint(pc.n_head * pc.d_v);
         for (int s = 0; s < pc.n_seq; s++) {
             for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
@@ -232,7 +337,7 @@ void main() {
     const int g_cnt = min(g_tile, G - gt * g_tile);
 #if defined(PAGED)
     /* the sequence's slots [0, kv_len), with kv_len = seq_kv_len[seq] clamped to the page table's slots
-     * (the host contract of section 5.5.1 is that seqKvLen <= maxPages << page_shift; the clamp keeps every
+     * (the host contract is that seqKvLen <= maxPages << page_shift; the clamp keeps every
      * page-table read in bounds), and the per-sequence q / out blocks */
     const int kv_cap_len = pc.max_pages << pc.page_shift;
     const int kv_len = seq_kv_len[seq] < 0 ? 0
@@ -253,6 +358,14 @@ void main() {
     const int k_stop = split < pc.n_split ? min(k_begin + split_len, kv_end) : k_begin;
     const int n_keys = max(0, k_stop - k_begin);
     const int s_base = g_tile * d_k;   /* s_s = nf_fa_smem[s_base ..] */
+    /* The step's one query row (the sequence's row on a paged decode) and its tree-mask word. */
+    const uvec2 t_bits = tree_mask[
+#if defined(PAGED)
+        seq
+#else
+        0
+#endif
+    ];
 
     /* 1. stage q and the per-head ALiBi slopes */
     for (int i = lid; i < g_tile * d_k; i += NF_FA_WG) {
@@ -260,7 +373,7 @@ void main() {
         nf_fa_smem[i] = g < g_cnt ? q_in[uint(q_off + (h0 + g) * d_k + (i - g * d_k))] : 0.0;
     }
     if (lid < g_tile) {
-        nf_fd_stats[2 * NF_FD_MAX_G + lid] = (pc.bias_mode == NF_ATTN_BIAS_ALIBI && lid < g_cnt)
+        nf_fd_stats[2 * NF_FD_MAX_G + lid] = ((pc.bias_mode == NF_ATTN_BIAS_ALIBI || pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) && lid < g_cnt)
                                              ? nf_alibi_slope(h0 + lid, pc.n_head, pc.max_bias) : 1.0;
     }
     barrier();
@@ -284,11 +397,15 @@ void main() {
              * kv_pos stays -1 and is never visible. */
             const int row = nf_fd_row(seq, t);
             p_k = kv_pos[row];
-            vis = nf_attn_visible(q_pos, p_k, pc.causal, pc.swa_type, pc.n_swa) != 0 ? 1 : 0;
+            vis = nf_attn_tree_visible(p_k, t_bits, kv_end, nf_attn_flag_fresh(pc.flags), q_pos,
+                                       (pc.flags & NF_ATTN_FLAG_CAUSAL), pc.swa_type, pc.n_swa) != 0 ? 1 : 0;
             if (vis != 0) {
                 const uint e0 = uint(row) * uint(pc.k_row_stride) + k_head;
+                float ks = nf_kv_is_per_token_head(NF_FD_K_TYPE)
+                    ? kv_scales[(row * 2u) * uint(pc.n_head_kv) + kvh] : kv_scales[kvh];
+                ks *= nf_fd_tq_score(e0, row);
                 for (int d = 0; d < d_k; d += 4) {
-                    const vec4 k4 = kc_load4(e0 + uint(d));
+                    const vec4 k4 = nf_fd_k4(e0 + uint(d), row) * ks;
                     [[unroll]] for (int g = 0; g < NF_FD_MAX_G; g++) {
                         if (g < g_tile) {
                             const int qi = g * d_k + d;
@@ -304,7 +421,7 @@ void main() {
                 float s = -NF_INF;
                 if (vis != 0 && g < g_cnt) {
                     s = nf_attn_score(acc[g], pc.scale, pc.softcap)
-                      + nf_fd_bias(h0 + g, q_pos, p_k, nf_fd_stats[2 * NF_FD_MAX_G + g]);
+                      + nf_fd_bias(h0 + g, q_pos, p_k, nf_fd_stats[2 * NF_FD_MAX_G + g], max(seq, 0));
                 }
                 nf_fa_smem[s_base + g * split_len + j] = s;
                 mx[g] = max(mx[g], s);
@@ -357,11 +474,14 @@ void main() {
     for (int j = 0; j < n_keys; j++) {
         const int vrow = nf_fd_row(seq, k_begin + j);
         const uint e0 = uint(vrow) * uint(pc.v_row_stride) + v_head;
+        const float v_scale = nf_kv_is_per_token_head(NF_FD_V_TYPE)
+            ? kv_scales[(vrow * 2u + 1u) * uint(pc.n_head_kv) + kvh]
+            : kv_scales[uint(pc.n_head_kv) + kvh];
         [[unroll]] for (int i = 0; i < NF_FA_ACC_MAX; i++) {
             if (lid + i * NF_FA_WG < n_pairs) {
                 const float p = nf_fa_smem[s_base + pg[i] * split_len + j];
                 if (p != 0.0) {
-                    o[i] += p * vc_load1(e0 + uint(pd[i]));
+                    o[i] += p * (nf_fd_v1(e0 + uint(pd[i]), vrow) * v_scale);
                 }
             }
         }
@@ -375,8 +495,8 @@ void main() {
             const int h = h0 + g;
             const float m = nf_fd_stats[g];
             const float l = nf_fd_stats[NF_FD_MAX_G + g];
-            if (pc.direct_out != 0) {
-                const vec2 fl = pc.has_sinks != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
+            if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
+                const vec2 fl = (pc.flags & NF_ATTN_FLAG_SINKS) != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
                 dst[uint(pc.out_off + h * d_v + d)] = fl.y > 0.0 ? o[i] * fl.x / fl.y : 0.0;
             } else {
 #if defined(PAGED)

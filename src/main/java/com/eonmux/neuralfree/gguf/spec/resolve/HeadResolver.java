@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.spec.resolve;
 
 import com.eonmux.neuralfree.gguf.arch.Arch;
+import com.eonmux.neuralfree.gguf.arch.PoolingKind;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.HparamsSupport;
@@ -13,6 +14,7 @@ import com.eonmux.neuralfree.gguf.spec.TensorRef;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 
@@ -23,6 +25,8 @@ import java.util.Set;
  *       ({@link NormResolver#normGroups(ModelHparams)}); LFM2's {@code token_embd_norm}; the T5 decoder's
  *       {@code dec.output_norm}, the {@code enc.output_norm} of the T5 encoder and neo-bert
  *       (models/neo-bert.cpp:21, 126-128);</li>
+ *   <li>{@code project_out} ({@code {n_embd, LM head width}}) maps the normed rows before the LM head when the
+ *       checkpoint's word width differs from {@code n_embd} (OPT {@code word_embed_proj_dim != hidden_size});</li>
  *   <li>LM head: {@code output}, else the token table (tied) for every model that generates and for clef, whose
  *       lexical option term reads the tied table (models/qwen35.cpp:43-53, models/clef.cpp:567); other embedding and
  *       classifier models get an LM head only when the file stores {@code output}; gemma-embedding2's
@@ -33,8 +37,8 @@ import java.util.Set;
  *       (llama-graph.cpp:4166-4171, llama-model.cpp:3330), so it is also the classifier output;</li>
  *   <li>{@code output.bias} only where the graph loads and adds it: qwen2, also over a tied head (models/qwen2.cpp:
  *       26-31, 147-148), phi2 (phi2.cpp:22, 136), phimoe through the phi3 graph (phimoe.cpp:23, phi3.cpp:184-186) and
- *       wavtokenizer-dec (wavtokenizer-dec.cpp:111, 258); phi3 and pangu-embedded add a bias their loaders never
- *       create, and dream and qwen2vl load it without using it;</li>
+ *       wavtokenizer-dec (wavtokenizer-dec.cpp:111, 258), and GPT-J (vLLM gpt_j.py); phi3 and pangu-embedded add a
+ *       bias their loaders never create, and dream and qwen2vl load it without using it;</li>
  *   <li>chameleon masks the image-token logits {@code [4, 8196)} with {@code -FLT_MAX} (models/chameleon.cpp:186-198).
  *       llama.cpp writes the mask into the first output row only ({@code ggml_set_1d}); the mask applies to every
  *       logits row here, so text generation never samples an image token at any output position;</li>
@@ -42,7 +46,7 @@ import java.util.Set;
  *       and minicpm divide; command-r, cohere2, cohere2moe, grok, talkie, muse-*, dflash and minicpm3 multiply,
  *       minicpm3's {@code n_embd_base / n_embd} on the hidden state before the linear head being the same product,
  *       models/minicpm3.cpp:240-246), final softcap where the graph applies one (gemma2/3/3n/4, grok, beam, muse-*,
- *       dflash), the qwen3tts codec-head shape check, the hyper-connection head, eagle3 {@code d2t}, pooling,
+ *       dflash), the qwen3tts codec-head shape check, the hyper-connection head, the drafters' {@code d2t}, pooling,
  *       {@code dense_2}/{@code dense_3} and the {@code cls} classifier.</li>
  * </ul>
  * Immutable.
@@ -52,11 +56,11 @@ public final class HeadResolver {
     /** Graphs that apply {@code f_final_logit_softcapping} to the logits. */
     private static final Set<Arch> FINAL_SOFTCAP = Collections.unmodifiableSet(EnumSet.of(
             Arch.GEMMA2, Arch.GEMMA3, Arch.GEMMA3N, Arch.GEMMA4, Arch.GROK, Arch.BEAM, Arch.MUSE_SPARK,
-            Arch.MUSE_GLIMMER, Arch.DFLASH));
+            Arch.MUSE_GLIMMER, Arch.DFLASH, Arch.MISTRAL_LARGE4, Arch.RNJ1, Arch.INKLING));
 
     /** Graphs that load {@code output.bias} and add it to the logits. */
     private static final Set<Arch> OUTPUT_BIAS = Collections.unmodifiableSet(EnumSet.of(
-            Arch.QWEN2, Arch.PHI2, Arch.PHIMOE, Arch.WAVTOKENIZER_DEC));
+            Arch.QWEN2, Arch.GPTJ, Arch.PHI2, Arch.PHIMOE, Arch.WAVTOKENIZER_DEC));
 
     /** chameleon image-token logit range set to {@code -FLT_MAX} (models/chameleon.cpp:188-189). */
     static final int CHAMELEON_IMAGE_TOKEN_START = 4;
@@ -65,11 +69,22 @@ public final class HeadResolver {
     private final ModelHparams hp;
     private final TensorCatalog tc;
     private final Arch arch;
+    /** The caller's pooling override ({@code neuralfree.pooling}), or null for the GGUF's pooling. */
+    private final PoolingKind poolingOverride;
 
     public HeadResolver(ModelHparams hp, TensorCatalog tc) {
+        this(hp, tc, null);
+    }
+
+    /**
+     * @param poolingOverride the pooling type override (llama.cpp {@code --pooling}, {@code EngineConfig#pooling()});
+     *                        null takes the GGUF's {@code <arch>.pooling_type}
+     */
+    public HeadResolver(ModelHparams hp, TensorCatalog tc, PoolingKind poolingOverride) {
         this.hp = Objects.requireNonNull(hp, "hp");
         this.tc = Objects.requireNonNull(tc, "tc");
         this.arch = hp.arch();
+        this.poolingOverride = poolingOverride;
     }
 
     /**
@@ -89,11 +104,13 @@ public final class HeadResolver {
             output = null;
         }
         boolean tied = false;
-        if (output == null && arch != Arch.GEMMA_EMBEDDING2 && (generates() || arch == Arch.CLEF)) {
+        if (output == null && arch != Arch.GEMMA_EMBEDDING2 && (generates() || arch == Arch.CLEF)
+                && !qwen4expMtpOnly()) {
             output = tc.get(TensorNames.weight(TensorNames.TOKEN_EMBD));
             tied = output != null;
         }
         b.output(output, tied);
+        b.outputProjection(tc.get(TensorNames.weight(TensorNames.PROJECT_OUT)));
         if (output != null && OUTPUT_BIAS.contains(arch)) {
             b.outputBias(tc.get(TensorNames.bias(TensorNames.OUTPUT)));
         }
@@ -101,28 +118,63 @@ public final class HeadResolver {
             int end = (int) Math.min(CHAMELEON_IMAGE_TOKEN_END, output.ne(1));
             b.maskedLogits(Math.min(CHAMELEON_IMAGE_TOKEN_START, end), end);
         }
+        if (arch == Arch.INKLING && output != null && output.ne(1) > hp.nVocab()) {
+            // vLLM's Inkling logits processor drops the padded vocabulary rows; sampling must never reach them.
+            b.maskedLogits(hp.nVocab(), (int) output.ne(1));
+        }
         if (FINAL_SOFTCAP.contains(arch)) {
             b.finalSoftcap(hp.finalSoftcap());
+        }
+        if (arch == Arch.LIMITE) {
+            b.finalSigmoidCapping(hp.finalLogitSigmoidCapping());
         }
         boolean multiplies = HparamsSupport.ScalingDefaults.multipliesLogits(arch);
         boolean divides = HparamsSupport.ScalingDefaults.dividesLogits(arch);
         if ((multiplies || divides) && hp.logitScale() != 0f) {
             b.logitScale(hp.logitScale(), hp.logitScaleDivides());
         }
+        if (arch == Arch.DORY) {
+            b.logitScaleVector(tc.get(TensorNames.weight(TensorNames.OUTPUT_LOGIT_SCALE)));
+        }
         if (arch == Arch.QWEN3TTS) {
             checkCodecHead(output);
         }
         b.hcHead(hp.dsv4HcMult() > 1 && tc.get(TensorNames.weight(TensorNames.HC_HEAD_FN)) != null);
         TensorRef d2t = tc.get(TensorNames.D2T);
-        b.eagle3D2t(d2t != null ? d2t : tc.get(TensorNames.weight(TensorNames.D2T)));
-        b.pooling(hp.pooling());
+        b.d2t(d2t != null ? d2t : tc.get(TensorNames.weight(TensorNames.D2T)));
+        PoolingKind pooling = resolvePooling();
+        b.pooling(pooling);
         b.dense(tc.get(TensorNames.weight(TensorNames.DENSE_2_OUT)), tc.get(TensorNames.weight(TensorNames.DENSE_3_OUT)));
         b.classifier(tc.get(TensorNames.weight(TensorNames.CLS)), tc.get(TensorNames.weight(TensorNames.CLS_OUT)),
                 tc.get(TensorNames.weight(TensorNames.CLS_NORM)));
+        b.tokenHeads(tc.get(TensorNames.weight(TensorNames.CLS_COLBERT)),
+                tc.get(TensorNames.bias(TensorNames.CLS_COLBERT)),
+                tc.get(TensorNames.weight(TensorNames.CLS_SPARSE)),
+                tc.get(TensorNames.bias(TensorNames.CLS_SPARSE)));
+        b.classifierScope(hp.classifierScope());
         if (arch == Arch.QWEN35) {
             resolveEmbeddingOutput(b);
         }
         return b.build();
+    }
+
+    /**
+     * The pooling the head runs: the caller's override when given, else the GGUF's {@code <arch>.pooling_type}.
+     * A {@code rank} override refuses a model that stores no classifier head, which has no scores to produce.
+     *
+     * @throws IllegalArgumentException naming the override when {@code rank} finds no {@code cls} tensors
+     */
+    private PoolingKind resolvePooling() {
+        if (poolingOverride == null) {
+            return hp.pooling();
+        }
+        if (poolingOverride == PoolingKind.RANK && tc.get(TensorNames.weight(TensorNames.CLS)) == null
+                && tc.get(TensorNames.weight(TensorNames.CLS_OUT)) == null) {
+            throw new IllegalArgumentException("pooling override " + poolingOverride.name().toLowerCase(Locale.ROOT)
+                    + " needs the classifier head (cls.weight or cls.output) the scores come from; "
+                    + arch.ggufName() + " stores none");
+        }
+        return poolingOverride;
     }
 
     /**
@@ -172,6 +224,15 @@ public final class HeadResolver {
             throw new GgufFormatException(arch.ggufName() + ": a codec head padded to the token table needs "
                     + outputNormName() + " (qwen3vl.cpp:178)");
         }
+    }
+
+    /**
+     * True for a file that holds only the qwen4exp MTP blocks: the LM head is not tied to the embeddings there —
+     * an MTP-only file without a head takes the target's, not its embeddings (qwen4exp.cpp:298-300,
+     * {@code llama_model_share_mtp_io}).
+     */
+    private boolean qwen4expMtpOnly() {
+        return arch == Arch.QWEN4EXP && ModelSpecValidator.isMtpOnly(hp, tc);
     }
 
     /** Name of the final norm tensor. */

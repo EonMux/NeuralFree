@@ -53,6 +53,10 @@ public final class SsmKernels {
     public static final int ARG_CONV_N_TOKENS = 2;
     /** {@link #SSM_CONV} argument count (10 scalars, 6 buffers). */
     public static final int CONV_ARG_COUNT = 16;
+    /** {@link #SSM_CONV} {@code conv_state} buffer (the recurrent rows the step reads and writes). */
+    public static final int CONV_ARG_STATE = 13;
+    /** {@link #SSM_CONV} {@code state_rows} buffer (the per-sequence row the step addresses). */
+    public static final int CONV_ARG_STATE_ROWS = 14;
 
     /** {@link #SHORTCONV_CENTERED} {@code n_tokens}. */
     public static final int ARG_CENTERED_N_TOKENS = 2;
@@ -63,6 +67,10 @@ public final class SsmKernels {
     public static final int ARG_SCAN_N_TOKENS = 4;
     /** {@link #SSM_SCAN} argument count (17 scalars, 9 buffers). */
     public static final int SCAN_ARG_COUNT = 26;
+    /** {@link #SSM_SCAN} {@code ssm_state} buffer (the recurrent rows the step reads and writes). */
+    public static final int SCAN_ARG_STATE = 23;
+    /** {@link #SSM_SCAN} {@code state_rows} buffer (the per-sequence row the step addresses). */
+    public static final int SCAN_ARG_STATE_ROWS = 24;
 
     /** {@link #MAMBA_GATE_OUT} {@code n = n_tokens * width}. */
     public static final int ARG_GATE_N = 0;

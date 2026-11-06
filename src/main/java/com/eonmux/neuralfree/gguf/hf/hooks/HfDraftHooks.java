@@ -36,7 +36,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * The shared draft load of Appendix A table HK-SG: the target model the drafts serve (the converter's
+ * The shared draft load: the target model the drafts serve (the converter's
  * {@code --target-model-dir}, a Hugging Face checkpoint or a GGUF file), the {@code mask_embedding} patch and the
  * {@code dflash_config} numbers every draft reads. The draft classes themselves live in {@link HfDraftHooksA}
  * (DFlash, DSpark, MuseGlimmerAssistant) and {@link HfDraftHooksB} (DeepseekV4DSpark, LiLiCorr, the Gemma 4 drafts
@@ -53,8 +53,10 @@ public final class HfDraftHooks {
 
     /** The draft names the target dispatch falls back on, as {@code target_cls is type(self)} would recurse. */
     static final Set<String> DRAFT_NAMES = Set.of("DFlashDraftModel", "DFlash2DraftModel", "Qwen3DSparkModel",
-            "DSparkDraftModel", "DSparkSpeculator", "Lfm2DSparkDraftModel", "LingDSparkModel",
-            "DeepseekV4DSparkModel", "Gemma4DSparkModel", "LiLiCorrDraftModel", "MuseGlimmerAssistantModel");
+            "Qwen3OmniDSparkModel", "DSparkDraftModel", "DSparkSpeculator", "Lfm2DSparkDraftModel", "LingDSparkModel",
+            "DeepseekV4DSparkModel", "DeepseekV41DSparkModel", "MistralLarge4DSparkModel",
+            "Gemma4DSparkModel", "LiLiCorrDraftModel", "MuseGlimmerAssistantModel",
+            "DFlashMuseGlimmerAssistantModel");
 
     /** The {@code .weight} suffix the draft name maps add. */
     static final String WEIGHT = ".weight";
@@ -339,7 +341,7 @@ public final class HfDraftHooks {
     /**
      * The mask vector of the load, or null. {@code mask_embedding.pt} is a pickle, which NF never unpickles: a
      * {@code mask_embedding.safetensors} sibling provides {@code mask_token_id} and {@code embedding}; without one
-     * {@code .pt} is offered to {@link CheckpointContainers#forFile} (the restricted pickle reader of PAR FX-1 can
+     * {@code .pt} is offered to {@link CheckpointContainers#forFile} (the restricted pickle reader can
      * accept it) and otherwise the pickle error is thrown. A checkpoint without {@code mask_embedding.pt} keeps the
      * unpatched embeddings.
      */

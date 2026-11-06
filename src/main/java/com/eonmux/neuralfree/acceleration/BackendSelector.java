@@ -22,18 +22,19 @@ import java.util.function.Function;
 /**
  * The AUTO backend policy of {@link HWAcceleration}: device first, then API.
  *
- * <p>The same GPU is usually visible through OpenCL, CUDA and Vulkan at once. AUTO first decides
+ * <p>The same GPU is usually visible through several APIs at once (Metal and Vulkan on an Apple GPU,
+ * OpenCL, CUDA and Vulkan on an NVIDIA one). AUTO first decides
  * which <em>physical device</em> to run on, then which API to drive it with, recognising the views
  * of one device across APIs by {@link DeviceIdentity#samePhysicalDevice(DeviceIdentity)}:</p>
  * <ol>
  *   <li><b>Target device.</b> The first device, in any API, whose name contains
- *       {@code -Dneuralfree.device}; otherwise the OpenCL ranking's winner
- *       ({@code CLDeviceRanking}, discrete first and then measured), else the Vulkan
- *       ranking's, else the CUDA ranking's.</li>
+ *       {@code -Dneuralfree.device}; otherwise the winner of the first API, in target preference
+ *       order (Metal, OpenCL, Vulkan, CUDA, HIP, then the accelerator APIs), that has a device.
+ *       OpenCL's ranking is measured ({@code CLDeviceRanking}, discrete first and then timed).</li>
  *   <li><b>API order on the target.</b> For each API of {@code -Dneuralfree.backend.order}
- *       (default {@code vulkan,cuda,opencl}), the API's view of the target device is turned into a
- *       backend and returned when the requirement accepts it; otherwise it is closed and the
- *       reason logged.</li>
+ *       (default {@code metal,vulkan,cuda,opencl,hip}, then the accelerator APIs in declaration
+ *       order), the API's view of the target device is turned into a backend and returned when the
+ *       requirement accepts it; otherwise it is closed and the reason logged.</li>
  *   <li><b>Fallback.</b> When no API ran the target, each API's own ranking winner is tried,
  *       discrete before integrated before the rest, then in API order, under the same
  *       requirement. An API and device pair is never tried twice.</li>
@@ -51,13 +52,21 @@ final class BackendSelector {
     /** Comma-separated APIs AUTO may use, in preference order, for example {@code cuda,opencl}. */
     static final String ORDER_PROPERTY = "neuralfree.backend.order";
 
-    /** AUTO's API preference when {@link #ORDER_PROPERTY} is unset. */
-    static final List<BackendType> DEFAULT_ORDER =
-            Collections.unmodifiableList(Arrays.asList(BackendType.VULKAN, BackendType.CUDA, BackendType.OPENCL));
+    /**
+     * AUTO's API preference when {@link #ORDER_PROPERTY} is unset: Metal first on a host that offers it
+     * (Apple GPUs), then Vulkan, CUDA, OpenCL and HIP, then the accelerator APIs in declaration order.
+     * Metal first makes the native path win over the Vulkan view MoltenVK exposes; a host without
+     * Metal simply has no view of it.
+     */
+    static final List<BackendType> DEFAULT_ORDER = order(
+            BackendType.METAL, BackendType.VULKAN, BackendType.CUDA, BackendType.OPENCL, BackendType.HIP);
 
-    /** Whose ranking winner becomes the target device when no filter names one: OpenCL measures. */
-    private static final List<BackendType> TARGET_SOURCES =
-            Collections.unmodifiableList(Arrays.asList(BackendType.OPENCL, BackendType.VULKAN, BackendType.CUDA));
+    /**
+     * Whose ranking winner becomes the target device when no filter names one: Metal, then OpenCL
+     * (which measures), then Vulkan, CUDA, HIP and the accelerator APIs.
+     */
+    private static final List<BackendType> TARGET_SOURCES = order(
+            BackendType.METAL, BackendType.OPENCL, BackendType.VULKAN, BackendType.CUDA, BackendType.HIP);
 
     private BackendSelector() {
     }
@@ -271,8 +280,10 @@ final class BackendSelector {
     }
 
     /**
-     * Parses a comma-separated API list ({@code vulkan}, {@code cuda}, {@code opencl}, any case).
-     * Null or blank gives {@link #DEFAULT_ORDER}.
+     * Parses a comma-separated API list: the built-in {@code metal}, {@code vulkan}, {@code cuda},
+     * {@code opencl} and {@code hip}, or an accelerator API ({@code sycl}, {@code xpu}, {@code cann},
+     * {@code hexagon}, {@code openvino}, {@code webgpu}, {@code musa}, {@code zdnn}, {@code zendnn},
+     * with their runtime spellings), any case. Null or blank gives {@link #DEFAULT_ORDER}.
      *
      * @throws IllegalArgumentException when a token is unknown or repeated, or the list is empty
      */
@@ -299,18 +310,20 @@ final class BackendSelector {
         return Collections.unmodifiableList(order);
     }
 
-    /** The name users read: OpenCL, CUDA or Vulkan. */
+    /** The name users read: OpenCL, CUDA, Vulkan, HIP, Metal or an accelerator API's label. */
     static String label(BackendType api) {
-        switch (api) {
-            case OPENCL:
-                return "OpenCL";
-            case CUDA:
-                return "CUDA";
-            case VULKAN:
-                return "Vulkan";
-            default:
-                return api.name();
+        return api.label();
+    }
+
+    /** The built-in APIs followed by every accelerator API, in declaration order. */
+    private static List<BackendType> order(BackendType... builtIns) {
+        List<BackendType> order = new ArrayList<>(Arrays.asList(builtIns));
+        for (BackendType api : BackendType.values()) {
+            if (api.isAccelerator()) {
+                order.add(api);
+            }
         }
+        return Collections.unmodifiableList(order);
     }
 
     /**
@@ -334,16 +347,11 @@ final class BackendSelector {
     }
 
     private static BackendType parseApi(String token) {
-        switch (token.toLowerCase(Locale.ROOT)) {
-            case "vulkan":
-                return BackendType.VULKAN;
-            case "cuda":
-                return BackendType.CUDA;
-            case "opencl":
-                return BackendType.OPENCL;
-            default:
-                throw new IllegalArgumentException("-D" + ORDER_PROPERTY + " names unknown API '" + token
-                        + "'; expected vulkan, cuda or opencl");
+        try {
+            return BackendType.fromApiName(token);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("-D" + ORDER_PROPERTY + " names unknown API '" + token
+                    + "'; expected " + BackendType.acceptedApiNames());
         }
     }
 

@@ -1,0 +1,4 @@
+{#- llama.cpp deepseek-ocr chat template (src/llama-chat.cpp:563-567): the message contents alone. -#}
+{%- for message in messages -%}
+    {{- message['content'] if message['content'] is string else '' -}}
+{%- endfor -%}

@@ -45,7 +45,7 @@ public final class DeltaNetKernels {
     public static final int SCAN_ARG_OUT = 23;
     public static final int SCAN_ARG_COUNT = 24;
 
-    // ---- LLM_GDN_GatePrep: 11 scalars, 6 buffers ----
+    // ---- LLM_GDN_GatePrep: 12 scalars, 6 buffers ----
     /** Re-set per step. */
     public static final int GATE_ARG_N_TOKENS = 0;
     public static final int GATE_ARG_N_V_HEADS = 1;
@@ -58,13 +58,14 @@ public final class DeltaNetKernels {
     public static final int GATE_ARG_A_OFF = 8;
     public static final int GATE_ARG_B_STRIDE = 9;
     public static final int GATE_ARG_B_OFF = 10;
-    public static final int GATE_ARG_A_IN = 11;
-    public static final int GATE_ARG_B_IN = 12;
-    public static final int GATE_ARG_DT_BIAS = 13;
-    public static final int GATE_ARG_SSM_A = 14;
-    public static final int GATE_ARG_G_OUT = 15;
-    public static final int GATE_ARG_BETA_OUT = 16;
-    public static final int GATE_ARG_COUNT = 17;
+    public static final int GATE_ARG_BETA_SCALE = 11;
+    public static final int GATE_ARG_A_IN = 12;
+    public static final int GATE_ARG_B_IN = 13;
+    public static final int GATE_ARG_DT_BIAS = 14;
+    public static final int GATE_ARG_SSM_A = 15;
+    public static final int GATE_ARG_G_OUT = 16;
+    public static final int GATE_ARG_BETA_OUT = 17;
+    public static final int GATE_ARG_COUNT = 18;
 
     // ---- LLM_LightningAttn: 4 scalars, 5 buffers ----
     /** Re-set per step. */
@@ -88,6 +89,8 @@ public final class DeltaNetKernels {
     public static final int LAYOUT_SEPARATE = 0;
     /** {@code layout}: qwen3next fused {@code ssm_ba}, per key head {@code [b(R) | a(R)]} with R = n_v / n_k. */
     public static final int LAYOUT_FUSED_BA = 1;
+    /** {@code layout}: qwen4exp merged {@code ssm_beta_alpha}, per token row {@code [b(n_v) | a(n_v)]}. */
+    public static final int LAYOUT_CONCAT_BA = 2;
 
     /** Largest key head dim of {@code LLM_GDN_Scan} ({@code NF_GDN_MAX_SK}). */
     public static final int GDN_MAX_KEY_DIM = 256;
@@ -181,11 +184,13 @@ public final class DeltaNetKernels {
         if (kdaMode < -1 || kdaMode > 2) {
             throw new IllegalArgumentException("kda_mode must be -1 (GDN), 0, 1 or 2, got " + kdaMode);
         }
-        if (layout != LAYOUT_SEPARATE && layout != LAYOUT_FUSED_BA) {
-            throw new IllegalArgumentException("gate prep layout must be 0 (separate) or 1 (fused ssm_ba), got " + layout);
+        if (layout != LAYOUT_SEPARATE && layout != LAYOUT_FUSED_BA && layout != LAYOUT_CONCAT_BA) {
+            throw new IllegalArgumentException("gate prep layout must be 0 (separate), 1 (fused ssm_ba) or 2"
+                    + " (concat ssm_beta_alpha), got " + layout);
         }
-        if (layout == LAYOUT_FUSED_BA && kdaMode >= 0) {
-            throw new IllegalArgumentException("the fused ssm_ba layout exists only for gated delta-net (kda_mode -1)");
+        if (layout != LAYOUT_SEPARATE && kdaMode >= 0) {
+            throw new IllegalArgumentException("the fused and concat beta/alpha layouts exist only for gated"
+                    + " delta-net (kda_mode -1)");
         }
         if (kdaMode >= 0 && headDim <= 0) {
             throw new IllegalArgumentException("KDA gate prep needs a positive head dim, got " + headDim);

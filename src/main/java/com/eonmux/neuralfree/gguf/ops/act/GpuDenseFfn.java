@@ -88,12 +88,18 @@ public final class GpuDenseFfn implements GpuFfnBlock {
     private Projection gate;
     private Projection up;
     private Projection down;
+    /**
+     * True when the gate and up weights admit the single-token fused gate+up+GLU kernel. Deltas register after the
+     * block is bound, so whether a step may use the kernel is decided per step ({@link #fusedGateUpServes}).
+     */
+    private boolean fusedGateUp;
     private PreparedDispatch topK;
     private int topKLocal;
     private PreparedDispatch glu;
     private PreparedDispatch unary;
     private PreparedDispatch actScale;
     private PreparedDispatch subNorm;
+    private PreparedDispatch justNorm;
     private GpuBuffer actScaleReciprocals;
     private boolean closed;
 
@@ -139,6 +145,7 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         unary = null;
         actScale = null;
         subNorm = null;
+        justNorm = null;
     }
 
     private void bindLayer(LayerSpec layer, FfnSpec spec) {
@@ -168,6 +175,9 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         up = projection(weights, layer, upW, layout.upBase(),
                 upTemp != null ? upTemp.buffer() : gateUp.buffer());
         down = projectionDown(weights, layer, downW);
+        fusedGateUp = layout.form() == DenseLayout.Form.PARALLEL_GLU && layout.sparsity() <= 0f
+                && gate.plainWeight() && up.plainWeight()
+                && ops.gateUpGluUsable(gate.weight, up.weight, layout.glu(), layout.params());
 
         if (layout.sparsity() > 0f) {
             topKLocal = Gemma3nKernels.rowLocal(local);
@@ -185,6 +195,13 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         }
         if (layout.subNorm()) {
             bindSubNorm(weights, layer);
+        }
+        if (spec.justNorm()) {
+            GpuBuffer act = activated();
+            justNorm = prepare(NormKernels.ROW_NORM,
+                    NormKernels.reduceGlobal(NormKernels.rowNormGroups(ubatch), local), local,
+                    NormKernels.rowNormArgs(NormKind.L2_GDN, ctx.spec().hparams().normRmsEps(), ubatch, layout.nFf(),
+                            layout.nFf(), act, 0, act, 0, null, null, 1, ctx.placeholders().readOnlyFloats()));
         }
     }
 
@@ -353,12 +370,25 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         int xOff = in.offset();
         GpuBuffer g = gateUp.buffer();
         switch (layout.form()) {
-            case PARALLEL_GLU:
-                gate.run(ops, nTokens, x, xOff, g, 0);
-                sparsity(nTokens);
-                up.run(ops, nTokens, x, xOff, upTemp.buffer(), 0);
-                runGlu(nTokens);
+            case PARALLEL_GLU: {
+                if (fusedGateUpServes(nTokens, xOff)) {
+                    ops.gateUpGlu(gate.weight, up.weight, layout.glu(), layout.params(), x, g);
+                    break;
+                }
+                GpuOps.SharedQ8 share = nTokens == 1 && GpuOps.shareableQ8Activations(xOff, layout.nIn())
+                        ? ops.shareQ8Activations(x, xOff, layout.nIn()) : null;
+                try {
+                    gate.run(ops, nTokens, x, xOff, g, 0);
+                    sparsity(nTokens);
+                    up.run(ops, nTokens, x, xOff, upTemp.buffer(), 0);
+                    runGlu(nTokens);
+                } finally {
+                    if (share != null) {
+                        share.close();
+                    }
+                }
                 break;
+            }
             case FUSED_GLU:
                 up.run(ops, nTokens, x, xOff, g, 0);
                 sparsity(nTokens);
@@ -379,6 +409,11 @@ public final class GpuDenseFfn implements GpuFfnBlock {
             subNorm.setGlobal(NormKernels.reduceGlobal(NormKernels.rowNormGroups(nTokens), local));
             subNorm.dispatch();
         }
+        if (justNorm != null) {
+            justNorm.setInt(NormKernels.ARG_ROW_NORM_N_ROWS, nTokens);
+            justNorm.setGlobal(NormKernels.reduceGlobal(NormKernels.rowNormGroups(nTokens), local));
+            justNorm.dispatch();
+        }
         int nOut = layout.nOut();
         if (downTemp != null && out.offset() != 0) {
             down.run(ops, nTokens, act, 0, downTemp.buffer(), 0);
@@ -386,6 +421,18 @@ public final class GpuDenseFfn implements GpuFfnBlock {
         } else {
             down.run(ops, nTokens, act, 0, out.buffer(), out.offset());
         }
+    }
+
+    /**
+     * Whether this step runs the fused gate+up+GLU kernel: a single token at element 0 of a layer whose weights admit
+     * it, and no LoRA delta registered on the gate or up product now, since the fused kernel computes the bare
+     * {@code W x} products and an adapter registered after binding must still apply from its first step.
+     */
+    private boolean fusedGateUpServes(int nTokens, int xOff) {
+        // a W12 Q-view scope refuses the fused kernel while open, so the ops-level form is re-checked per step
+        // and the separate products read the Q rows instead
+        return fusedGateUp && nTokens == 1 && xOff == 0 && !gate.hasDeltas() && !up.hasDeltas()
+                && ops.gateUpGluUsable(gate.weight, up.weight, layout.glu(), layout.params());
     }
 
     private void sparsity(int nTokens) {
@@ -443,6 +490,21 @@ public final class GpuDenseFfn implements GpuFfnBlock {
             this.bias = bias;
             this.tensorScale = tensorScale;
             this.deltas = Objects.requireNonNull(deltas, "deltas");
+        }
+
+        /**
+         * Whether the weight side of this projection is a bare {@code W x}: no bias, tensor scale, per-tensor scale,
+         * Hadamard rotation or input transform, so the fused gate+up kernel computes what {@link GpuOps#matmul}
+         * would. Deltas are not part of it: they are registered after binding and checked per step.
+         */
+        boolean plainWeight() {
+            return bias == null && tensorScale == null && !weight.hasScale()
+                    && !weight.hasInputTransform() && weight.hadamard() == null;
+        }
+
+        /** Whether a delta is registered on this product in any adapter slot. */
+        boolean hasDeltas() {
+            return !deltas.isEmpty();
         }
 
         /**

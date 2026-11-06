@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.engine.sampling;
 import com.eonmux.neuralfree.gguf.engine.Sampler;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
@@ -10,7 +11,9 @@ import java.util.Objects;
  * The bad-words stage (vLLM's {@code bad_words}): every banned phrase is tokenized once, and while the accepted
  * history ends with a phrase's proper prefix, the token that would continue the phrase takes a {@code -inf}
  * logit — so no continuation of the generated text can spell a banned phrase. The stage keeps the longest
- * phrase's tail of the accepted history in a ring; a Java-API custom stage ({@code Sampler.create(config,
+ * phrase's tail of the accepted history in a ring. A masking stage ({@link #masks()}): the chain applies it from
+ * the constraint head, before the configured chain, so a truncating stage cannot cut the phrase-continuing
+ * tokens out of a set that holds nothing else. A Java-API custom stage ({@code Sampler.create(config,
  * bannedTokens, extra, vocab)}) that always applies.
  */
 public final class BadWordsStage extends SamplerStage {
@@ -115,7 +118,28 @@ public final class BadWordsStage extends SamplerStage {
     }
 
     @Override
+    public boolean masks() {
+        return true;
+    }
+
+    @Override
     public void reset() {
         tailLen = 0;
+    }
+
+    /** The history tail a next token can continue into a phrase. */
+    @Override
+    public Object saveState() {
+        return Arrays.copyOf(tail, tailLen);
+    }
+
+    @Override
+    public void restoreState(Object state) {
+        if (!(state instanceof int[]) || ((int[]) state).length > keep) {
+            throw new IllegalArgumentException("not a bad-words stage state: " + state);
+        }
+        int[] saved = (int[]) state;
+        System.arraycopy(saved, 0, tail, 0, saved.length);
+        tailLen = saved.length;
     }
 }

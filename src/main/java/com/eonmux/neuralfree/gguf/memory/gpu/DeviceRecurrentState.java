@@ -3,7 +3,9 @@ package com.eonmux.neuralfree.gguf.memory.gpu;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.RecurrentStateCopy;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -132,6 +134,63 @@ public final class DeviceRecurrentState implements GpuRecurrentState, AutoClosea
         }
         for (Map.Entry<String, GpuBuffer> e : buffers.entrySet()) {
             queue.enqueueCopyBuffer(shadows.get(e.getKey()), 0, e.getValue(), 0, e.getValue().sizeInBytes());
+        }
+    }
+
+    /**
+     * Copies state slot {@code seq}'s row of every tensor into {@code rows} (one row per tensor, in plan order);
+     * the reads enqueue and land when the queue finishes.
+     *
+     * @throws IndexOutOfBoundsException when {@code seq} is outside the tensor's slots
+     */
+    void readSlot(ComputeQueue queue, int seq, List<float[]> rows) {
+        checkOpen();
+        for (LayerMemoryPlan.StateTensor t : tensors) {
+            long floats = t.floats();
+            Objects.checkIndex(seq, t.slots());
+            float[] row = new float[(int) floats];
+            GpuEvent e = queue.enqueueReadBuffer(buffers.get(t.name()), seq * floats * Float.BYTES,
+                    floats * Float.BYTES, row);
+            if (e != null) {
+                e.close();
+            }
+            rows.add(row);
+        }
+    }
+
+    /**
+     * Writes {@code copy}'s rows {@code [first, first + tensors)} into state slot {@code seq} of every tensor.
+     *
+     * @throws IllegalArgumentException when a row does not match its tensor's width
+     * @throws IndexOutOfBoundsException when {@code seq} is outside the tensor's slots
+     */
+    void writeSlot(ComputeQueue queue, int seq, RecurrentStateCopy copy, int first) {
+        checkOpen();
+        for (int i = 0; i < tensors.size(); i++) {
+            LayerMemoryPlan.StateTensor t = tensors.get(i);
+            long floats = t.floats();
+            Objects.checkIndex(seq, t.slots());
+            if (copy.floats(first + i) != floats) {
+                throw new IllegalArgumentException("state copy row " + (first + i) + " holds " + copy.floats(first + i)
+                        + " floats, tensor " + t.name() + " of layer " + layer + " keeps " + floats);
+            }
+            float[] row = new float[copy.floats(first + i)];
+            copy.copyInto(first + i, row, 0);
+            GpuEvent e = queue.enqueueWriteBuffer(buffers.get(t.name()), seq * floats * Float.BYTES,
+                    floats * Float.BYTES, row);
+            if (e != null) {
+                e.close();
+            }
+        }
+    }
+
+    /** Zeroes state slot {@code seq}'s row of every tensor. */
+    void clearSlot(ComputeQueue queue, int seq) {
+        checkOpen();
+        for (LayerMemoryPlan.StateTensor t : tensors) {
+            Objects.checkIndex(seq, t.slots());
+            queue.enqueueFillBuffer(buffers.get(t.name()), seq * t.floats() * Float.BYTES,
+                    t.floats() * Float.BYTES, 0);
         }
     }
 

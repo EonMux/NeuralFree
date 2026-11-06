@@ -2,7 +2,7 @@ package com.eonmux.neuralfree.gguf.memory.paged;
 
 /**
  * Page list of one sequence in one KV group: the sequence's pages in append order. Logical slot {@code j} of the
- * sequence maps to physical row {@code page(j >> log2P) * pageSize + (j & (pageSize - 1))} (PARITY invariant 4), so
+ * sequence maps to physical row {@code page(j >> log2P) * pageSize + (j & (pageSize - 1))}, so
  * prefill and decode appends simply extend the list; trimming and context removals drop whole pages from the front,
  * leaving at most two partially holed pages per sequence.
  *

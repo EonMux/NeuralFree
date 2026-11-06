@@ -13,6 +13,7 @@ import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
+import com.eonmux.neuralfree.gguf.gpu.forward.Int8MatvecMode;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
@@ -53,6 +54,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -70,8 +72,8 @@ import static org.junit.Assert.assertTrue;
  * norm, per-head absorption by {@code {T}_MatVecId}, the {@code [q_abs | q_pe]} assembly, the latent row store, flash
  * attention with one buffer bound as K and V, the per-head {@code attn_v_b} expansion and {@code attn_output}), the
  * unrotated Q8_0 latent cache and the geometry's plan-only rotation, the {@code attn_k_norm} RMS norm of the shared
- * rotary key (dots3note), the per-head sinks of every flash kernel (hy_v4 without an indexer), and the GPU refusal of
- * a decompressed cache over absorbed weights.
+ * rotary key (dots3note), the per-head sinks of every flash kernel (hy_v4 without an indexer), and the decompressed
+ * cache over absorbed weights (the per-token transposed {@code attn_k_b} read and {@code attn_v_b} expansion).
  */
 public class GpuMlaMixerTest {
 
@@ -123,15 +125,27 @@ public class GpuMlaMixerTest {
     // ------------------------------------------------------------------ fixtures
 
     private void open(KvDType kvType, int kvLoraRank, int nRot) {
-        open(kvType, kvLoraRank, nRot, FakeComputeBackend.defaultCapabilities());
+        open(kvType, kvLoraRank, nRot, true);
     }
 
-    private void open(KvDType kvType, int kvLoraRank, int nRot, DeviceCapabilities caps) {
+    /** Opens the fixture with an absorbed model over a latent ({@code latent}) or decompressed cache. */
+    private void open(KvDType kvType, int kvLoraRank, int nRot, boolean latent) {
+        open(kvType, kvLoraRank, nRot, FakeComputeBackend.defaultCapabilities(), latent);
+    }
+
+    private void open(KvDType kvType, int kvLoraRank, int nRot, DeviceCapabilities caps,
+                      String... unavailableKernels) {
+        open(kvType, kvLoraRank, nRot, caps, true, unavailableKernels);
+    }
+
+    private void open(KvDType kvType, int kvLoraRank, int nRot, DeviceCapabilities caps, boolean latent,
+                      String... unavailableKernels) {
         kvLora = kvLoraRank;
         rope = nRot;
         width = kvLora + rope;
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).capabilities(caps).build();
-        ModelSpec spec = deepseek2(latentMla(true));
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).capabilities(caps)
+                .unavailableKernels(unavailableKernels).build();
+        ModelSpec spec = deepseek2(latentMla(latent));
         LayerSpec layer = spec.layers().get(0);
         MemoryConfig cfg = MemoryConfig.builder().ubatch(UBATCH).typeK(kvType).typeV(kvType).build();
         MemoryPlan plan = MemoryPlanner.planForContext(spec, cfg, N_CTX);
@@ -199,12 +213,23 @@ public class GpuMlaMixerTest {
     }
 
     private void put(String base, long... ne) {
+        put(base, GGMLType.F32, ne);
+    }
+
+    /** The 2-D {@code [cols, rows]} tensor {@code base} of layer 0 on {@code type}. */
+    private void put(String base, GGMLType type, long... ne) {
         String name = TensorNames.layerName(0, TensorNames.weight(base));
-        long n = 1;
-        for (long d : ne) {
-            n *= d;
+        long bytes;
+        if (type == GGMLType.F32) {
+            long n = 1;
+            for (long d : ne) {
+                n *= d;
+            }
+            bytes = n * Float.BYTES;
+        } else {
+            bytes = (long) (ne[0] / type.getBlockSize()) * type.getTypeSize() * ne[1];
         }
-        tensors.put(name, GpuWeight.of(name, GGMLType.F32, ne, backend.allocateBuffer(n * Float.BYTES, true)));
+        tensors.put(name, GpuWeight.of(name, type, ne, backend.allocateBuffer(bytes, true)));
     }
 
     private GpuBuffer weight(String base) {
@@ -232,6 +257,14 @@ public class GpuMlaMixerTest {
         return backend.dispatches();
     }
 
+    /** The cache writes of {@code n} rows: {@link GpuMlaMixer#prefillKV} over the same step inputs. */
+    private List<Dispatch> kvOnlyStep(int pos0, int n) {
+        steps().upload(pos0, n);
+        backend.clearLog();
+        mixer.prefillKV(pos0, n, scratch.slot(ScratchSlots.NORMED));
+        return backend.dispatches();
+    }
+
     private static List<Dispatch> named(List<Dispatch> ds, String kernel) {
         List<Dispatch> out = new ArrayList<>();
         for (Dispatch d : ds) {
@@ -256,7 +289,7 @@ public class GpuMlaMixerTest {
         List<String> out = new ArrayList<>();
         for (Dispatch d : ds) {
             String k = d.kernelName();
-            if (k.equals(NormKernels.ROW_NORM) || k.equals(RopeKernels.ROPE_EXT) || k.endsWith("_MatVecId")
+            if (k.equals(NormKernels.ROW_NORM) || k.equals(RopeKernels.ROPE_EXT) || k.contains("_MatVecId")
                     || k.equals(GpuOps.COPY2D) || k.startsWith("LLM_KV_Store_") || k.startsWith("LLM_Flash")
                     || k.equals(HadamardSpec.KERNEL)) {
                 out.add(k);
@@ -338,7 +371,9 @@ public class GpuMlaMixerTest {
         assertEquals(width, fd.intArg(AttnKernels.ARG_FD_K_ROW_STRIDE));
         assertEquals(width, fd.intArg(AttnKernels.ARG_FD_V_ROW_STRIDE));
         assertEquals(KQ_SCALE, fd.floatArg(AttnKernels.ARG_FD_SCALE), 0.0f);
-        assertEquals(1, fd.intArg(AttnKernels.ARG_FD_DIRECT_OUT));
+        assertEquals("a latent V reads the K rows",
+                AttnKernels.FLAG_CAUSAL | AttnKernels.FLAG_DIRECT | AttnKernels.FLAG_V_ALIAS,
+                fd.intArg(AttnKernels.ARG_FD_FLAGS));
         assertSame(qlat.buffer(), fd.bufferArg(AttnKernels.ARG_FD_BUF_Q));
         assertSame(kv.k(), fd.bufferArg(AttnKernels.ARG_FD_BUF_K));
         assertSame(kv.k(), fd.bufferArg(AttnKernels.ARG_FD_BUF_V));
@@ -360,6 +395,61 @@ public class GpuMlaMixerTest {
         assertEquals(3, fd.intArg(AttnKernels.ARG_FD_Q_POS));
     }
 
+    @Test
+    public void decodeOnTheInt8LaneQuantizesTheSharedInputRowOnce() {
+        openLane(KvDType.F16, 64, 32);
+        List<Dispatch> ds = step(0, 1);
+        List<String> names = kernelNames(ds);
+        // The shared stream row backs the query-A and latent projections: one quantize serves both
+        // single-token matvecs; the query-B projection reads the LoRA row off the lane (an F32 weight).
+        assertEquals(names.toString(), 1, Collections.frequency(names, GpuOps.QUANTIZE_Q8_1));
+        assertEquals(names.toString(), 2, Collections.frequency(names, "Q4_0_MatVec_Q8"));
+        int shared = names.indexOf(GpuOps.QUANTIZE_Q8_1);
+        int queryA = firstIndex(ds, "Q4_0_MatVec_Q8", 0);
+        int latent = firstIndex(ds, "Q4_0_MatVec_Q8", queryA + 1);
+        assertTrue(names.toString(), shared < queryA && shared < latent);
+        // A two-row step takes the multi-column integer-dot lane: each stream projection quantizes its
+        // two rows and runs the Q4_0 MatVecN kernel; the single-row share does not apply.
+        List<String> prefill = kernelNames(step(1, 2));
+        assertEquals(prefill.toString(), 2, Collections.frequency(prefill, GpuOps.QUANTIZE_Q8_1));
+        assertEquals(prefill.toString(), 2, Collections.frequency(prefill, "Q4_0_MatVecN_Q8"));
+        assertEquals(prefill.toString(), 0, Collections.frequency(prefill, "Q4_0_BatchMatMul_2D"));
+    }
+
+    /** Opens the fixture with the stream projections on Q4_0 and the int8 matvec lane forced on. */
+    private void openLane(KvDType kvType, int kvLoraRank, int nRot) {
+        kvLora = kvLoraRank;
+        rope = nRot;
+        width = kvLora + rope;
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+        ModelSpec spec = deepseek2(latentMla(true));
+        LayerSpec layer = spec.layers().get(0);
+        MemoryConfig cfg = MemoryConfig.builder().ubatch(UBATCH).typeK(kvType).typeV(kvType).build();
+        MemoryPlan plan = MemoryPlanner.planForContext(spec, cfg, N_CTX);
+        memory = DeviceModelMemory.allocate(backend, backend.computeQueue(), plan, MropeTextPositions.PPP0, null);
+        scratch = GpuScratch.builder(backend, UBATCH)
+                .slot(ScratchSlots.NORMED, (long) UBATCH * N_EMBD)
+                .slot(ScratchSlots.BRANCH, (long) UBATCH * N_EMBD)
+                .build();
+        placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
+        kernels = LlmKernels.open(backend);
+        ops = new GpuOps(backend.computeQueue(), kernels, scratch, placeholders, Int8MatvecMode.ON);
+        putTensors();
+        put(TensorNames.ATTN_Q_A, GGMLType.Q4_0, N_EMBD, Q_LORA);
+        put(TensorNames.ATTN_KV_A_MQA, GGMLType.Q4_0, N_EMBD, width);
+        GpuForwardContext ctx = GpuForwardContext.builder(kernels, ops, tensors::get, spec).memory(memory).build();
+        mixer = (GpuMlaMixer) MlaBlocks.gpuMixers().get(0).create(layer);
+        mixer.bind(ctx, layer);
+    }
+
+    private static List<String> kernelNames(List<Dispatch> ds) {
+        List<String> out = new ArrayList<>();
+        for (Dispatch d : ds) {
+            out.add(d.kernelName());
+        }
+        return out;
+    }
+
     // ------------------------------------------------------------------ prefill
 
     @Test
@@ -370,12 +460,35 @@ public class GpuMlaMixerTest {
         GpuKvLayer kv = memory.kv(0);
         ScratchSlot qlat = temp(GpuMlaMixer.TEMP_Q_LATENT, (long) UBATCH * N_HEAD * width);
         ScratchSlot lat = temp(GpuMlaMixer.TEMP_LATENT, (long) UBATCH * N_HEAD * kvLora);
+        ScratchSlot q = temp(GpuMlaMixer.TEMP_Q, (long) UBATCH * N_HEAD * (NOPE + rope));
+        ScratchSlot attn = temp(GpuMlaMixer.TEMP_ATTN, (long) UBATCH * N_HEAD * HEAD_V);
 
-        String id = MoeKernels.matVecId(GGMLType.F32);
-        List<Dispatch> ids = named(ds, id);
+        assertTrue(named(ds, MoeKernels.matVecId(GGMLType.F32)).isEmpty());
+        Dispatch bucket = named(ds, MoeKernels.BUCKETIZE).get(0);
+        assertEquals(Arrays.asList(n, N_HEAD, N_HEAD), Arrays.asList(bucket.intArg(0), bucket.intArg(1),
+                bucket.intArg(2)));
+        Dispatch align = named(ds, MoeKernels.ALIGN_BLOCKS).get(0);
+        int tiles = MoeKernels.groupedTiles(UBATCH * N_HEAD, N_HEAD);
+        assertEquals(n, align.intArg(MoeKernels.ARG_N_TOKENS));
+        assertEquals(tiles, align.intArg(3));
+        List<Dispatch> ids = named(ds, MoeKernels.groupedGemm(GGMLType.F32));
         assertEquals(2, ids.size());
-        assertEquals(n * N_HEAD, ids.get(0).intArg(MoeKernels.ARG_ID_N_SEL));
-        assertEquals(n * N_HEAD, ids.get(1).intArg(MoeKernels.ARG_ID_N_SEL));
+        Dispatch absorb = ids.get(0);
+        Dispatch expandGg = ids.get(1);
+        assertEquals(Arrays.asList(kvLora, NOPE, tiles, 1, NOPE + rope, q.offset(), lat.offset()),
+                ggInts(absorb));
+        assertEquals(Arrays.asList(HEAD_V, kvLora, tiles, 1, kvLora, lat.offset(), attn.offset()), ggInts(expandGg));
+        for (Dispatch d : ids) {
+            assertSame(align.bufferArg(8), d.bufferArg(MoeKernels.ARG_GG_GEMM_TOKEN));
+            assertSame(align.bufferArg(9), d.bufferArg(MoeKernels.ARG_GG_GEMM_SLOT));
+            assertEquals(0, d.intArg(MoeKernels.ARG_GG_EXPERT_BASE));
+            assertEquals(N_HEAD, d.intArg(MoeKernels.ARG_GG_EXPERT_COUNT));
+        }
+        assertSame(q.buffer(), absorb.bufferArg(MoeKernels.ARG_GG_INPUT));
+        assertSame(lat.buffer(), absorb.bufferArg(MoeKernels.ARG_GG_OUTPUT));
+        assertSame(lat.buffer(), expandGg.bufferArg(MoeKernels.ARG_GG_INPUT));
+        assertSame(attn.buffer(), expandGg.bufferArg(MoeKernels.ARG_GG_OUTPUT));
+        assertTrue(ds.indexOf(bucket) < ds.indexOf(align) && ds.indexOf(align) < ds.indexOf(absorb));
         assertEquals(n, named(ds, RopeKernels.kvStore(KvDType.F16)).get(0).intArg(RopeKernels.ARG_N_TOKENS));
         List<Dispatch> copies = named(ds, GpuOps.COPY2D);
         assertEquals(2, copies.size());
@@ -403,7 +516,8 @@ public class GpuMlaMixerTest {
             assertSame(steps().qPos(), fa.bufferArg(AttnKernels.ARG_FA_BUF_Q_POS));
             assertSame(lat.buffer(), fa.bufferArg(AttnKernels.ARG_FA_BUF_OUT));
             int combines = named(ds, AttnKernels.FLASH_COMBINE).size();
-            assertEquals(fa.intArg(AttnKernels.ARG_FA_DIRECT_OUT) == 1 ? 0 : 1, combines);
+            assertEquals((fa.intArg(AttnKernels.ARG_FA_FLAGS) & AttnKernels.FLAG_DIRECT) != 0 ? 0 : 1,
+                    combines);
         } else {
             List<Dispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F16));
             assertEquals(n, rows.size());
@@ -418,8 +532,50 @@ public class GpuMlaMixerTest {
         int store = firstIndex(ds, RopeKernels.kvStore(KvDType.F16), 0);
         int expand = ds.indexOf(ids.get(1));
         assertTrue(store < expand);
+
+        List<Dispatch> decode = step(n, 1);
+        List<Dispatch> perHead = named(decode, MoeKernels.matVecId(GGMLType.F32));
+        assertEquals("one token keeps the per-head products", 2, perHead.size());
+        assertTrue(named(decode, MoeKernels.BUCKETIZE).isEmpty());
+        assertSame("the head sort reads the per-head slot table", perHead.get(0).bufferArg(MoeKernels.ARG_ID_SLOTS),
+                bucket.bufferArg(3));
     }
 
+    /**
+     * The latent cache writes alone: the KV projection, its norm and the K RoPE, then the latent store. The query's
+     * products, its RoPE, the absorption, the attention and the output projection do not run.
+     */
+    @Test
+    public void kvOnlyPrefillStopsAtTheLatentStore() {
+        open(KvDType.F16, 64, 32);
+        List<Dispatch> whole = step(0, 5);
+        List<Dispatch> kvOnly = kvOnlyStep(0, 5);
+
+        assertEquals(Arrays.asList(RopeKernels.ROPE_EXT, NormKernels.ROW_NORM,
+                RopeKernels.kvStore(KvDType.F16)), mlaKernels(kvOnly));
+        assertTrue("the cache write runs fewer kernels: " + kvOnly.size() + " vs " + whole.size(),
+                kvOnly.size() < whole.size());
+        assertEquals(0, named(kvOnly, MoeKernels.matVecId(GGMLType.F32)).size());
+        assertEquals(0, named(kvOnly, GpuOps.COPY2D).size());
+        assertEquals(0, named(kvOnly, AttnKernels.flashAttn(KvDType.F16)).size());
+        assertEquals(0, named(kvOnly, AttnKernels.flashDecode(KvDType.F16)).size());
+        assertEquals(1, named(kvOnly, RopeKernels.ROPE_EXT).size());
+        assertEquals(1, named(kvOnly, NormKernels.ROW_NORM).size());
+        Dispatch store = named(kvOnly, RopeKernels.kvStore(KvDType.F16)).get(0);
+        assertEquals(5, store.intArg(RopeKernels.ARG_N_TOKENS));
+        assertSame(memory.kv(0).k(), store.bufferArg(7));
+    }
+
+    /** The scalar arguments of a grouped GEMM before has_scale: out, in, tiles, x_div, x_stride, in_off, out_off. */
+    private static List<Integer> ggInts(Dispatch d) {
+        List<Integer> v = new ArrayList<>();
+        for (int i = 0; i < MoeKernels.ARG_GG_HAS_SCALE; i++) {
+            v.add(d.intArg(i));
+        }
+        return v;
+    }
+
+    /** Without {@code LLM_MoE_AlignBlocks} the per-head products stay per row and split under the grid limit. */
     @Test
     public void perHeadProductsSplitOnTokenBoundariesUnderTheGridLimit() {
         DeviceCapabilities caps = new DeviceCapabilities.Builder()
@@ -436,7 +592,7 @@ public class GpuMlaMixerTest {
                 .maxLocalMemoryBytes(48L * 1024)
                 .maxWorkGroupCount(new long[]{Integer.MAX_VALUE, 5, 65535})
                 .build();
-        open(KvDType.F16, 64, 32, caps);
+        open(KvDType.F16, 64, 32, caps, MoeKernels.ALIGN_BLOCKS);
         int n = 5;
         List<Dispatch> ds = step(0, n);
         ScratchSlot q = temp(GpuMlaMixer.TEMP_Q, (long) UBATCH * N_HEAD * (NOPE + rope));
@@ -536,17 +692,17 @@ public class GpuMlaMixerTest {
         open(KvDType.F16, 64, 32);
         GpuBuffer sinks = weight(TensorNames.ATTN_SINKS);
         Dispatch fd = named(step(0, 1), AttnKernels.flashDecode(KvDType.F16)).get(0);
-        assertEquals(1, fd.intArg(AttnKernels.ARG_FD_HAS_SINKS));
+        assertTrue((fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
         assertSame(sinks, fd.bufferArg(AttnKernels.ARG_FD_BUF_SINKS));
 
         List<Dispatch> ds = step(1, 5);
         List<Dispatch> fa = named(ds, AttnKernels.flashAttn(KvDType.F16));
         for (Dispatch d : fa) {
-            assertEquals(1, d.intArg(AttnKernels.ARG_FA_HAS_SINKS));
+            assertTrue((d.intArg(AttnKernels.ARG_FA_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
             assertSame(sinks, d.bufferArg(AttnKernels.ARG_FA_BUF_SINKS));
         }
         for (Dispatch d : named(ds, AttnKernels.flashDecode(KvDType.F16))) {
-            assertEquals(1, d.intArg(AttnKernels.ARG_FD_HAS_SINKS));
+            assertTrue((d.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
             assertSame(sinks, d.bufferArg(AttnKernels.ARG_FD_BUF_SINKS));
         }
         for (Dispatch d : named(ds, AttnKernels.FLASH_COMBINE)) {
@@ -556,17 +712,132 @@ public class GpuMlaMixerTest {
         assertTrue(fa.size() + named(ds, AttnKernels.flashDecode(KvDType.F16)).size() > 0);
     }
 
-    // ------------------------------------------------------------------ refusals
+    // ------------------------------------------------- decompressed cache over absorbed weights
 
+    /**
+     * The decompressed cache over absorbed weights, decode: the per-token transposed {@code attn_k_b} read into
+     * k_nope and the {@code attn_v_b} expansion into V replace the {@code attn_kv_b} product, then the k_nope copy
+     * and the rope broadcast per head build the per-head cache for flash attention.
+     */
     @Test
-    public void gpuRefusesADecompressedCacheOverAbsorbedWeights() {
-        kvLora = 64;
-        rope = 32;
-        width = kvLora + rope;
-        ModelSpec spec = deepseek2(latentMla(false));
-        LayerSpec layer = spec.layers().get(0);
-        assertThrows(UnsupportedOperationException.class, () -> MlaBlocks.gpuMixers().get(0).create(layer));
+    public void decodeRunsTheAbsorbedDecompressedSequence() {
+        open(KvDType.F16, 64, 32, false);
+        List<Dispatch> ds = step(0, 1);
+        String id = MoeKernels.matVecId(GGMLType.F32);
+        String idT = MoeKernels.matVecIdT(GGMLType.F32);
+        List<String> expected = new ArrayList<>();
+        Collections.addAll(expected, NormKernels.ROW_NORM, RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT,
+                NormKernels.ROW_NORM, idT, id, GpuOps.COPY2D, GpuOps.COPY2D, GpuOps.COPY2D,
+                RopeKernels.kvStore(KvDType.F16), RopeKernels.kvStore(KvDType.F16),
+                AttnKernels.flashDecode(KvDType.F16));
+        assertEquals(expected, mlaKernels(ds));
+
+        GpuKvLayer kv = memory.kv(0);
+        ScratchSlot kva = temp(GpuMlaMixer.TEMP_KV_A, (long) UBATCH * width);
+        ScratchSlot kvb = temp(GpuMlaMixer.TEMP_KV_B, (long) UBATCH * N_HEAD * NOPE);
+        ScratchSlot k = temp(GpuMlaMixer.TEMP_K, (long) UBATCH * N_HEAD * (NOPE + rope));
+        ScratchSlot v = temp(GpuMlaMixer.TEMP_V, (long) UBATCH * N_HEAD * HEAD_V);
+        ScratchSlot attn = temp(GpuMlaMixer.TEMP_ATTN, (long) UBATCH * N_HEAD * HEAD_V);
+
+        Dispatch kNope = named(ds, idT).get(0);
+        assertEquals(NOPE, kNope.intArg(0));
+        assertEquals(kvLora, kNope.intArg(1));
+        assertEquals(N_HEAD, kNope.intArg(MoeKernels.ARG_ID_N_SEL));
+        assertEquals(0, kNope.intArg(3));
+        assertSame(weight(TensorNames.ATTN_K_B), kNope.bufferArg(MoeKernels.ARG_ID_WEIGHT));
+        assertSame(kva.buffer(), kNope.bufferArg(MoeKernels.ARG_ID_INPUT));
+        assertSame(kvb.buffer(), kNope.bufferArg(MoeKernels.ARG_ID_OUTPUT));
+        Dispatch expand = named(ds, id).get(0);
+        assertEquals(HEAD_V, expand.intArg(0));
+        assertEquals(kvLora, expand.intArg(1));
+        assertEquals(N_HEAD, expand.intArg(MoeKernels.ARG_ID_N_SEL));
+        assertEquals(0, expand.intArg(3));
+        assertSame(weight(TensorNames.ATTN_V_B), expand.bufferArg(MoeKernels.ARG_ID_WEIGHT));
+        assertSame(kva.buffer(), expand.bufferArg(MoeKernels.ARG_ID_INPUT));
+        assertSame(v.buffer(), expand.bufferArg(MoeKernels.ARG_ID_OUTPUT));
+        assertSame(kNope.bufferArg(MoeKernels.ARG_ID_SLOTS), expand.bufferArg(MoeKernels.ARG_ID_SLOTS));
+
+        List<Dispatch> copies = named(ds, GpuOps.COPY2D);
+        Dispatch kNopeCopy = copies.get(0);
+        assertEquals(N_HEAD, kNopeCopy.intArg(0));
+        assertEquals(NOPE, kNopeCopy.intArg(1));
+        assertEquals(NOPE, kNopeCopy.intArg(2));
+        assertEquals(NOPE + rope, kNopeCopy.intArg(4));
+        assertSame(kvb.buffer(), kNopeCopy.bufferArg(6));
+        assertSame(k.buffer(), kNopeCopy.bufferArg(7));
+        for (int h = 0; h < N_HEAD; h++) {
+            Dispatch ropeCopy = copies.get(1 + h);
+            assertEquals(1, ropeCopy.intArg(0));
+            assertEquals(rope, ropeCopy.intArg(1));
+            assertEquals(width, ropeCopy.intArg(2));
+            assertEquals(kva.offset() + kvLora, ropeCopy.intArg(3));
+            assertEquals(N_HEAD * (NOPE + rope), ropeCopy.intArg(4));
+            assertEquals(h * (NOPE + rope) + NOPE, ropeCopy.intArg(5));
+            assertSame(kva.buffer(), ropeCopy.bufferArg(6));
+            assertSame(k.buffer(), ropeCopy.bufferArg(7));
+        }
+
+        Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        assertEquals(NOPE + rope, fd.intArg(AttnKernels.ARG_FD_D_K));
+        assertEquals(HEAD_V, fd.intArg(AttnKernels.ARG_FD_D_V));
+        assertSame(kv.k(), fd.bufferArg(AttnKernels.ARG_FD_BUF_K));
+        assertSame(kv.v(), fd.bufferArg(AttnKernels.ARG_FD_BUF_V));
+        assertSame(attn.buffer(), fd.bufferArg(AttnKernels.ARG_FD_BUF_OUT));
     }
+
+    /**
+     * The same cache, prefill: one transposed read and one expansion per token with that token's latent row as the
+     * broadcast input and its per-head k_nope and V as the outputs, then the row copies and both cache stores.
+     */
+    @Test
+    public void prefillRunsTheAbsorbedDecompressedProductsPerToken() {
+        open(KvDType.F16, 64, 32, false);
+        int n = 3;
+        List<Dispatch> ds = step(0, n);
+        String id = MoeKernels.matVecId(GGMLType.F32);
+        String idT = MoeKernels.matVecIdT(GGMLType.F32);
+        List<Dispatch> decomp = named(ds, idT);
+        List<Dispatch> expand = named(ds, id);
+        assertEquals(n, decomp.size());
+        assertEquals(n, expand.size());
+        ScratchSlot kva = temp(GpuMlaMixer.TEMP_KV_A, (long) UBATCH * width);
+        ScratchSlot kvb = temp(GpuMlaMixer.TEMP_KV_B, (long) UBATCH * N_HEAD * NOPE);
+        ScratchSlot v = temp(GpuMlaMixer.TEMP_V, (long) UBATCH * N_HEAD * HEAD_V);
+        for (int t = 0; t < n; t++) {
+            Dispatch d = decomp.get(t);
+            assertEquals(NOPE, d.intArg(0));
+            assertEquals(kvLora, d.intArg(1));
+            assertEquals(N_HEAD, d.intArg(MoeKernels.ARG_ID_N_SEL));
+            assertEquals(0, d.intArg(3));
+            assertEquals(t * width, d.intArg(MoeKernels.ARG_ID_IN_OFF));
+            assertEquals(t * N_HEAD * NOPE, d.intArg(MoeKernels.ARG_ID_OUT_OFF));
+            assertSame(kva.buffer(), d.bufferArg(MoeKernels.ARG_ID_INPUT));
+            assertSame(kvb.buffer(), d.bufferArg(MoeKernels.ARG_ID_OUTPUT));
+            Dispatch e = expand.get(t);
+            assertEquals(t * width, e.intArg(MoeKernels.ARG_ID_IN_OFF));
+            assertEquals(t * N_HEAD * HEAD_V, e.intArg(MoeKernels.ARG_ID_OUT_OFF));
+            assertSame(v.buffer(), e.bufferArg(MoeKernels.ARG_ID_OUTPUT));
+            assertTrue(ds.indexOf(d) < ds.indexOf(e));
+        }
+
+        List<Dispatch> copies = named(ds, GpuOps.COPY2D);
+        assertEquals(1 + N_HEAD, copies.size());
+        assertEquals(n * N_HEAD, copies.get(0).intArg(0));
+        assertEquals(NOPE, copies.get(0).intArg(1));
+        for (int h = 1; h <= N_HEAD; h++) {
+            assertEquals(n, copies.get(h).intArg(0));
+            assertEquals(rope, copies.get(h).intArg(1));
+        }
+        assertEquals(2, named(ds, RopeKernels.kvStore(KvDType.F16)).size());
+        GpuKvLayer kv = memory.kv(0);
+        List<Dispatch> stores = named(ds, RopeKernels.kvStore(KvDType.F16));
+        assertSame(kv.k(), stores.get(0).bufferArg(7));
+        assertSame(kv.v(), stores.get(1).bufferArg(7));
+        assertTrue(named(ds, AttnKernels.flashAttn(KvDType.F16)).size()
+                + named(ds, AttnKernels.flashDecode(KvDType.F16)).size() > 0);
+    }
+
+    // ------------------------------------------------------------------ refusals
 
     @Test
     public void keyNormAfterRopeIsRefused() {

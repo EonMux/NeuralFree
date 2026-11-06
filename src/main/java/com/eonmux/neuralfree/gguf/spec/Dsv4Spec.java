@@ -5,7 +5,11 @@ package com.eonmux.neuralfree.gguf.spec;
  * K-only sliding window of {@link #window()} tokens (shared K/V, MQA). Layers with {@code compressRatio == 4}
  * (CSA) add a compressed K cache scored through the lightning {@link #indexer()}; {@code compressRatio == 128}
  * (HCA) adds a heavily compressed cache attended densely; 0 is window-only. The output projection is grouped
- * ({@link #oGroupCount()} groups through a rank {@link #oLoraRank()} bottleneck). Immutable.
+ * ({@link #oGroupCount()} groups through a rank {@link #oLoraRank()} bottleneck).
+ *
+ * <p>A DeepSeek-V4.1 layer ({@link #dsv41()} non-null) uses ratios 2 (selected, CSA-like) and 1 (dense, HCA-like),
+ * reads the compressed rows and the indexer top-k of earlier source layers, and stores the index key inside each
+ * compressed row. Immutable.</p>
  */
 public final class Dsv4Spec {
 
@@ -26,6 +30,7 @@ public final class Dsv4Spec {
     private final DsaSpec indexer;
     private final boolean sinks;
     private final float kqScale;
+    private final Dsv41Spec dsv41;
 
     private Dsv4Spec(Builder b) {
         this.nHead = b.nHead;
@@ -40,6 +45,7 @@ public final class Dsv4Spec {
         this.indexer = b.indexer;
         this.sinks = b.sinks;
         this.kqScale = b.kqScale;
+        this.dsv41 = b.dsv41;
     }
 
     public static Builder builder() {
@@ -47,7 +53,7 @@ public final class Dsv4Spec {
     }
 
     public int nHead() { return nHead; }
-    /** 0 (window only), {@link #RATIO_CSA} or {@link #RATIO_HCA}. */
+    /** 0 (window only), or {@link #RATIO_CSA} / {@link #RATIO_HCA} (V4) and 2 / 1 (V4.1). */
     public int compressRatio() { return compressRatio; }
     /** Raw sliding window ({@code n_swa}). */
     public int window() { return window; }
@@ -60,18 +66,28 @@ public final class Dsv4Spec {
     public int oLoraRank() { return oLoraRank; }
     /** RoPE base used on compressed rows ({@code compress_rope_freq_base}). */
     public float compressRopeBase() { return compressRopeBase; }
-    /** Lightning indexer of a CSA layer; null otherwise. */
+    /** Lightning indexer of a selected layer; null on a dense or window-only layer. */
     public DsaSpec indexer() { return indexer; }
     public boolean sinks() { return sinks; }
     public float kqScale() { return kqScale; }
+    /** The V4.1 cross-layer sharing facet, or null for a DeepSeek-V4 layer. */
+    public Dsv41Spec dsv41() { return dsv41; }
 
-    public boolean csa() { return compressRatio == RATIO_CSA; }
-    public boolean hca() { return compressRatio == RATIO_HCA; }
+    /** Selected compressed rows: V4 CSA or V4.1 ratio 2. */
+    public boolean csa() {
+        return compressRatio == RATIO_CSA || (dsv41 != null && compressRatio == Dsv41Spec.RATIO_SELECTED);
+    }
+
+    /** Every visible compressed row: V4 HCA or V4.1 ratio 1. */
+    public boolean hca() {
+        return compressRatio == RATIO_HCA || (dsv41 != null && compressRatio == Dsv41Spec.RATIO_DENSE);
+    }
 
     @Override
     public String toString() {
         return "Dsv4Spec{nHead=" + nHead + ", ratio=" + compressRatio + ", window=" + window + ", head=" + headDim
-                + ", rope=" + ropeDim + ", oGroups=" + oGroupCount + ", oLora=" + oLoraRank + ", indexer=" + indexer + '}';
+                + ", rope=" + ropeDim + ", oGroups=" + oGroupCount + ", oLora=" + oLoraRank + ", indexer=" + indexer
+                + (dsv41 != null ? ", " + dsv41 : "") + '}';
     }
 
     public static final class Builder {
@@ -87,6 +103,7 @@ public final class Dsv4Spec {
         private DsaSpec indexer;
         private boolean sinks;
         private float kqScale = Float.NaN;
+        private Dsv41Spec dsv41;
 
         private Builder() {
         }
@@ -103,15 +120,33 @@ public final class Dsv4Spec {
         public Builder indexer(DsaSpec v) { this.indexer = v; return this; }
         public Builder sinks(boolean v) { this.sinks = v; return this; }
         public Builder kqScale(float v) { this.kqScale = v; return this; }
+        /** The V4.1 cross-layer sharing facet (ratio 2 or 1, index key in the compressed row). */
+        public Builder dsv41(Dsv41Spec v) { this.dsv41 = v; return this; }
 
         /** @throws IllegalArgumentException for an unknown ratio, inconsistent indexer presence or bad dims */
         public Dsv4Spec build() {
-            if (compressRatio != 0 && compressRatio != RATIO_CSA && compressRatio != RATIO_HCA) {
-                throw new IllegalArgumentException("DSV4 compress ratio must be 0, 4 or 128, got " + compressRatio);
+            boolean v41 = dsv41 != null;
+            boolean ratioOk = v41
+                    ? compressRatio == 0 || compressRatio == Dsv41Spec.RATIO_SELECTED
+                        || compressRatio == Dsv41Spec.RATIO_DENSE
+                    : compressRatio == 0 || compressRatio == RATIO_CSA || compressRatio == RATIO_HCA;
+            if (!ratioOk) {
+                throw new IllegalArgumentException("DSV4 compress ratio must be " + (v41 ? "0, 2 or 1"
+                        : "0, 4 or 128") + ", got " + compressRatio);
             }
-            if ((compressRatio == RATIO_CSA) != (indexer != null)) {
-                throw new IllegalArgumentException("DSV4 layers have an indexer exactly when the compress ratio is 4 (ratio "
-                        + compressRatio + ", indexer " + (indexer != null) + ")");
+            if (v41) {
+                if (compressRatio == 0 && (dsv41.ownsCompressed() || dsv41.computesTopk())) {
+                    throw new IllegalArgumentException("DSV4.1 window-only layer " + dsv41.il()
+                            + " cannot own compressed rows or an indexer");
+                }
+                if (compressRatio != 0 && (indexer != null) != dsv41.computesTopk()) {
+                    throw new IllegalArgumentException("DSV4.1 layer " + dsv41.il() + " has an indexer exactly when"
+                            + " it computes the top-k (ratio " + compressRatio + ", indexer " + (indexer != null)
+                            + ", top-k source " + dsv41.topkSourceLayer() + ")");
+                }
+            } else if ((compressRatio == RATIO_CSA) != (indexer != null)) {
+                throw new IllegalArgumentException("DSV4 layers have an indexer exactly when the compress ratio is 4"
+                        + " (ratio " + compressRatio + ", indexer " + (indexer != null) + ")");
             }
             if (nHead <= 0 || window <= 0 || headDim <= 0 || oGroupCount <= 0 || oLoraRank <= 0 || qLoraRank < 0) {
                 throw new IllegalArgumentException("DSV4 dims must be positive: nHead=" + nHead + " window=" + window

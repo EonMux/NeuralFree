@@ -1,0 +1,30 @@
+/* row_affine.comp - LLM_RowAffine: per-channel affine over token-major rows. GLSL twin of
+ * kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i rows, i cols, R x, R scale, R bias, W y).
+ *   y[r][c] = x[r][c] * scale[c] + bias[c]
+ * y must not overlap x. Dispatch: 1-D, one invocation per element, global = roundUp(rows*cols, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfRaX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfRaS { float scale_in[]; };
+layout(std430, binding = 2) readonly buffer NfRaB { float bias_in[]; };
+layout(std430, binding = 3) writeonly buffer NfRaY { float y_out[]; };
+
+layout(push_constant) uniform NfRaParams {
+    int rows;
+    int cols;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.rows) * uint(pc.cols)) {
+        return;
+    }
+    const uint c = idx % uint(pc.cols);
+    y_out[idx] = x_in[idx] * scale_in[c] + bias_in[c];
+}

@@ -45,7 +45,7 @@ import java.util.OptionalInt;
 /**
  * Hooks of the classic MoE converter classes, part A: {@code Llama4Model} (LC/conversion/llama.py:380-417),
  * {@code DbrxModel} (dbrx.py:13-76), {@code GrokModel} (grok.py:17-117) and {@code ArcticModel} (arctic.py:20-163).
- * {@link #gpt2Vocab} serves the default {@code TextModel.set_vocab} the other HK-MC classes keep; the Bailing MoE
+ * {@link #gpt2Vocab} serves the default {@code TextModel.set_vocab} the other classic-MoE classes keep; the Bailing MoE
  * classes and Deepseek v1 are in {@link HfMoeClassicHooksB}, the long tail in {@link HfMoeClassicHooksC}.
  */
 public final class HfMoeClassicHooksA {
@@ -74,8 +74,8 @@ public final class HfMoeClassicHooksA {
     }
 
     /**
-     * The default vocabulary of {@code TextModel.set_vocab} (LC/conversion/base.py:1575-1576), for the HK-MC classes
-     * that leave {@code set_vocab} on the default.
+     * The default vocabulary of {@code TextModel.set_vocab} (LC/conversion/base.py:1575-1576), for the classic-MoE
+     * classes that leave {@code set_vocab} on the default.
      */
     public static Map<String, Object> gpt2Vocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {
         return HfVocabWriters.gpt2(HfHookSupport.vocabInput(ctx), pre);

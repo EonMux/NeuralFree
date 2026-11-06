@@ -1,0 +1,92 @@
+/* dsv4_compress_v41.comp - LLM_DSV4_CompressV41: pooled, normed DeepSeek-V4.1 block latents as F32 rows.
+ * GLSL twin of kernels/llm/dsv4/compress.cl LLM_DSV4_CompressV41 (which documents the math and the caller's
+ * follow-up steps). Requires: common/nf_common.glsl, common/reduce.glsl, common/rope_common.glsl,
+ * common/kv_types.glsl, common/dsv4_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i pos0, i n_tokens, i ratio, i width, f eps, i cur_kv_off, i cur_score_off,
+ *    R state_kv, R state_score, R cur_kv, R cur_score, R ape, R norm_w, W out_v)
+ * DeepSeek-V4.1 compressors use ratio 1 or 2, so no plane is overlapped and ape is a zero row of ratio * width
+ * values. Block g of the ubatch is written to out[g * width, (g + 1) * width) without rope or cache rotation.
+ *
+ * Dispatch: 1-D, one work-group per completed block, local = L (a power of two in [32, LLM_DIMX]);
+ * global = n_blocks * L with n_blocks = (pos0 + n_tokens) / ratio - pos0 / ratio.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+#include "common/rope_common.glsl"
+#include "common/kv_types.glsl"
+#include "common/dsv4_common.glsl"
+
+layout(push_constant) uniform NfDsv4CompressV41Params {
+    int pos0;
+    int n_tokens;
+    int ratio;
+    int width;
+    float eps;
+    int cur_kv_off;
+    int cur_score_off;
+} pc;
+
+layout(std430, binding = 0) readonly buffer NfDsv4V41StateKv    { float state_kv[]; };
+layout(std430, binding = 1) readonly buffer NfDsv4V41StateScore { float state_score[]; };
+layout(std430, binding = 2) readonly buffer NfDsv4V41CurKv      { float cur_kv[]; };
+layout(std430, binding = 3) readonly buffer NfDsv4V41CurScore   { float cur_score[]; };
+layout(std430, binding = 4) readonly buffer NfDsv4V41Ape        { float ape[]; };
+layout(std430, binding = 5) readonly buffer NfDsv4V41NormW      { float norm_w[]; };
+layout(std430, binding = 6) writeonly buffer NfDsv4V41Out       { float out_v[]; };
+
+shared float row_s[NF_DSV4_MAX_WIDTH];
+
+/* Window source (kv, score) of position p, state column col (C nf_dsv4_src; non-overlap form). */
+vec2 dsv4_v41_src(int p, int col) {
+    if (p < 0) {
+        return vec2(0.0, -NF_INF);
+    }
+    if (p >= pc.pos0) {
+        const int t = (p - pc.pos0) * pc.width + col;
+        return vec2(cur_kv[pc.cur_kv_off + t], cur_score[pc.cur_score_off + t] + ape[(p % pc.ratio) * pc.width + col]);
+    }
+    const int r = (p % pc.ratio) * pc.width + col;
+    return vec2(state_kv[r], state_score[r]);
+}
+
+void main() {
+    const int b0 = pc.pos0 / pc.ratio;
+    const int g = int(nf_wg_id());
+    if (g >= (pc.pos0 + pc.n_tokens) / pc.ratio - b0) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int start = (b0 + g) * pc.ratio;
+
+    float ss = 0.0;
+    for (int c = lid; c < pc.width; c += lsize) {
+        float m = -NF_INF;
+        for (int j = 0; j < pc.ratio; ++j) {
+            m = max(m, dsv4_v41_src(start + j, c).y);
+        }
+        float l = 0.0;
+        float acc = 0.0;
+        for (int j = 0; j < pc.ratio; ++j) {
+            const vec2 s = dsv4_v41_src(start + j, c);
+            const float e = (s.y == -NF_INF) ? 0.0 : exp(s.y - m);
+            l += e;
+            acc += e * s.x;
+        }
+        const float y = acc * (1.0 / l);
+        row_s[c] = y;
+        ss += y * y;
+    }
+    const float sum = nf_wg_sum(ss);
+    const float scale = 1.0 / sqrt(sum / float(pc.width) + pc.eps);
+    barrier();
+    const uint base = uint(g) * uint(pc.width);
+    for (int c = lid; c < pc.width; c += lsize) {
+        out_v[base + uint(c)] = row_s[c] * scale * norm_w[c];
+    }
+}

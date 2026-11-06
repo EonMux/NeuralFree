@@ -139,6 +139,19 @@ public class ContextFitterTest {
     }
 
     @Test
+    public void companionStepBytesFollowTheDraftUbatch() {
+        ModelSpec spec = MemoryPlannerTest.gemma3();
+        ContextFitter.Companion scratch = ContextFitter.Companion.of("draft scratch", 0L, 100L).withStepUbatch(64);
+        assertEquals(gemma3Bytes(4096) + 100L * 64, ContextFitter.requiredBytes(spec, auto(), 4096, scratch));
+        assertEquals("0 keeps the target plan's ubatch",
+                gemma3Bytes(4096) + 100L * MemoryConfig.DEFAULT_UBATCH,
+                ContextFitter.requiredBytes(spec, auto(), 4096,
+                        ContextFitter.Companion.of("draft scratch", 0L, 100L).withStepUbatch(0)));
+        assertThrows(IllegalArgumentException.class,
+                () -> ContextFitter.Companion.of("draft scratch", 0L, 100L).withStepUbatch(-1));
+    }
+
+    @Test
     public void companionCachesArePlannedAtTheTargetContextWithTheirOwnSettings() {
         ModelSpec spec = MemoryPlannerTest.gemma3();
         ContextFitter.Companion drafter = ContextFitter.Companion.withCaches("eagle3 drafter", 0L, 0L,

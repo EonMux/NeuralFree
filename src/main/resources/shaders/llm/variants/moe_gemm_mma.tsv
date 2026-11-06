@@ -1,0 +1,81 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Cooperative-matrix MoE grouped GEMM (VK_KHR_cooperative_matrix) for every grouped weight type except F32 and BF16, the Vulkan twins of kernels/llm/moe_gemm_mma.cl; the host picks them over moe_gemm.comp on a device with DeviceFeature.COOPERATIVE_MATRIX.
+F16_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_F16	sg
+Q4_0_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q4_0	sg
+Q4_1_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q4_1	sg
+Q5_0_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q5_0	sg
+Q5_1_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q5_1	sg
+Q8_0_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q8_0	sg
+IQ4_NL_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ4_NL	sg
+IQ4_XS_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ4_XS	sg
+MXFP4_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_MXFP4	sg
+Q2_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q2_K	sg
+Q3_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q3_K	sg
+Q4_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q4_K	sg
+Q5_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q5_K	sg
+Q6_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q6_K	sg
+Q8_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q8_K	sg
+IQ3_XXS_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ3_XXS	sg
+IQ3_S_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ3_S	sg
+IQ3_K_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ3_K	sg
+IQ3_KS_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ3_KS	sg
+IQ2_XXS_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ2_XXS	sg
+IQ2_XS_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ2_XS	sg
+IQ2_S_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ2_S	sg
+IQ1_S_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ1_S	sg
+IQ1_M_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_IQ1_M	sg
+TQ1_0_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_TQ1_0	sg
+TQ2_0_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_TQ2_0	sg
+NVFP4_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_NVFP4	sg
+Q1_0_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q1_0	sg
+Q2_0_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_Q2_0	sg
+F8_E5M2_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_F8_E5M2	sg
+F8_E4M3_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_F8_E4M3	sg
+F8_E4M3_B128_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_F8_E4M3_B128	sg
+F8_E4M3_B32_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_F8_E4M3_B32	sg
+MXFP8_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_MXFP8	sg
+MXFP6_E2M3_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_MXFP6_E2M3	sg
+MXFP6_E3M2_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_MXFP6_E3M2	sg
+I8_B128_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_I8_B128	sg
+NF4_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_NF4	sg
+FP4_BNB_GroupedGemmMma	moe_gemm_mma.comp	QTYPE=QT_FP4_BNB	sg
+# Expert-cache form (T_GroupedGemmMmaInd): the same products over a cache bank through the per-layer map.
+F16_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_F16 IND=1	sg
+Q4_0_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q4_0 IND=1	sg
+Q4_1_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q4_1 IND=1	sg
+Q5_0_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q5_0 IND=1	sg
+Q5_1_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q5_1 IND=1	sg
+Q8_0_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q8_0 IND=1	sg
+IQ4_NL_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ4_NL IND=1	sg
+IQ4_XS_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ4_XS IND=1	sg
+MXFP4_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_MXFP4 IND=1	sg
+Q2_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q2_K IND=1	sg
+Q3_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q3_K IND=1	sg
+Q4_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q4_K IND=1	sg
+Q5_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q5_K IND=1	sg
+Q6_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q6_K IND=1	sg
+Q8_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q8_K IND=1	sg
+IQ3_XXS_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ3_XXS IND=1	sg
+IQ3_S_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ3_S IND=1	sg
+IQ3_K_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ3_K IND=1	sg
+IQ3_KS_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ3_KS IND=1	sg
+IQ2_XXS_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ2_XXS IND=1	sg
+IQ2_XS_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ2_XS IND=1	sg
+IQ2_S_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ2_S IND=1	sg
+IQ1_S_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ1_S IND=1	sg
+IQ1_M_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_IQ1_M IND=1	sg
+TQ1_0_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_TQ1_0 IND=1	sg
+TQ2_0_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_TQ2_0 IND=1	sg
+NVFP4_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_NVFP4 IND=1	sg
+Q1_0_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q1_0 IND=1	sg
+Q2_0_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_Q2_0 IND=1	sg
+F8_E5M2_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_F8_E5M2 IND=1	sg
+F8_E4M3_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_F8_E4M3 IND=1	sg
+F8_E4M3_B128_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_F8_E4M3_B128 IND=1	sg
+F8_E4M3_B32_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_F8_E4M3_B32 IND=1	sg
+MXFP8_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_MXFP8 IND=1	sg
+MXFP6_E2M3_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_MXFP6_E2M3 IND=1	sg
+MXFP6_E3M2_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_MXFP6_E3M2 IND=1	sg
+I8_B128_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_I8_B128 IND=1	sg
+NF4_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_NF4 IND=1	sg
+FP4_BNB_GroupedGemmMmaInd	moe_gemm_mma.comp	QTYPE=QT_FP4_BNB IND=1	sg

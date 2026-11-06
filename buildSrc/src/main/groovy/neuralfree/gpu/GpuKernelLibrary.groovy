@@ -13,6 +13,8 @@ class GpuKernelLibrary {
     final String id, label
     /** Classpath dirs: sources with manifest and inventory; CUDA modules and index; GLSL with variants and SPIR-V. */
     final String kernelRootPath, cudaDir, shaderRootPath
+    /** Classpath dir of the HIP code objects (HipKernelLibrary derives it from sourceRoot). */
+    final String hipDir
     /** The shader root's directory name directly under shaders/; inventoryPath is inventoryFile for messages. */
     final String shaderDirName, inventoryPath
     final File kernelRoot, shaderRoot, variantsDir, inventoryFile
@@ -34,6 +36,7 @@ class GpuKernelLibrary {
         kernelRootPath = spec.kernelRoot.toString()
         cudaDir = spec.cudaDir.toString()
         shaderRootPath = spec.shaderRoot.toString()
+        hipDir = kernelRootPath + '/hip'
         if (!kernelRootPath.startsWith('kernels/') || kernelRootPath == 'kernels/common' || kernelRootPath.contains('..')) {
             throw new GradleException("GPU kernel library ${id}: kernelRoot '${kernelRootPath}' must be a directory under kernels/ other than the shared kernels/common")
         }
@@ -63,14 +66,14 @@ class GpuKernelLibrary {
 
     /** Comment lines that open the generated inventory. */
     String inventoryHeader() {
-        return "# ${label} kernel inventory: every kernel of the untagged ${kernelRootPath}/manifest.txt entries.\n" +
+        return "# ${label} kernel inventory: every kernel of the untagged and [cuda] ${kernelRootPath}/manifest.txt entries.\n" +
                 '# Generated from the kernel sources by the updateKernelInventory Gradle task and checked by inventoryCheck; do not edit.\n' +
                 '# kernel_name<TAB>source<TAB>buffers<TAB>scalars<TAB>scalar kinds (i,u,f)<TAB>parameter layout (B buffer, else the scalar kind)\n'
     }
 
     /** Every option that changes the library's build outputs, for up-to-date checks. */
     String fingerprint() {
-        "${id}[${kernelRootPath} ${cudaDir} ${shaderRootPath} cuda=${cudaFlags.join(' ')} ${cudaDefines().join(' ')} sg=${subgroupVariants} kinds=${compareKinds}]"
+        "${id}[${kernelRootPath} ${cudaDir} ${hipDir} ${shaderRootPath} cuda=${cudaFlags.join(' ')} ${cudaDefines().join(' ')} sg=${subgroupVariants} kinds=${compareKinds}]"
     }
 
     @Override

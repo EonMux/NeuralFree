@@ -33,9 +33,9 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * PT-1, HfGgufParityTest: each synthetic HF checkpoint opened with {@code outType = AUTO} carries exactly the GGUF
- * view a llama.cpp converter of that family writes for it with {@code --outtype auto} (PT-1 and the HF.md parity
- * section). The expected GGUF of every family is a hand-built {@link GgufTestWriter} — its KV entries, value types,
+ * Each synthetic HF checkpoint opened with {@code outType = AUTO} carries exactly the GGUF
+ * view a llama.cpp converter of that family writes for it with {@code --outtype auto}.
+ * The expected GGUF of every family is a hand-built {@link GgufTestWriter} — its KV entries, value types,
  * tensor names, dimensions, storage types and data are constants derived from the converter rules the fixture files
  * cite (never produced by NeuralFree).
  *
@@ -181,7 +181,7 @@ public class HfGgufParityTest {
 
     // ------------------------------------------------------------------ KV comparison
 
-    /** {@code general.name} and the {@code neuralfree.*} overlays are the PT-1 exclusions. */
+    /** {@code general.name} and the {@code neuralfree.*} overlays are the exclusions. */
     private static boolean isExcluded(String key) {
         return "general.name".equals(key) || key.startsWith("neuralfree.");
     }

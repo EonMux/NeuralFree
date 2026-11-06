@@ -50,6 +50,7 @@ public final class SsmBlocks {
                 gpuMamba(MixerKind.MAMBA1),
                 gpuMamba(MixerKind.MAMBA2),
                 gpuMamba(MixerKind.PLAMO2_MAMBA),
+                gpuZamba2(),
                 gpuShortConv(MixerKind.SHORTCONV),
                 gpuShortConv(MixerKind.SHORTCONV_CENTERED)));
     }
@@ -60,8 +61,55 @@ public final class SsmBlocks {
                 cpuMamba(MixerKind.MAMBA1),
                 cpuMamba(MixerKind.MAMBA2),
                 cpuMamba(MixerKind.PLAMO2_MAMBA),
+                cpuZamba2(),
                 cpuShortConv(MixerKind.SHORTCONV),
                 cpuShortConv(MixerKind.SHORTCONV_CENTERED)));
+    }
+
+    private static GpuMixerFactory gpuZamba2() {
+        return new GpuMixerFactory() {
+            @Override
+            public MixerKind kind() {
+                return MixerKind.ZAMBA2;
+            }
+
+            @Override
+            public GpuMixer create(LayerSpec layer) {
+                if (layer.zamba2() == null) {
+                    throw new IllegalArgumentException("layer " + layer.il() + " has no Zamba2 shared block");
+                }
+                checkKind(MixerKind.ZAMBA2, layer);
+                return new GpuZamba2Mixer();
+            }
+
+            @Override
+            public String toString() {
+                return "SsmBlocks.gpu(ZAMBA2)";
+            }
+        };
+    }
+
+    private static CpuMixerFactory cpuZamba2() {
+        return new CpuMixerFactory() {
+            @Override
+            public MixerKind kind() {
+                return MixerKind.ZAMBA2;
+            }
+
+            @Override
+            public CpuMixer create(LayerSpec layer) {
+                if (layer.zamba2() == null) {
+                    throw new IllegalArgumentException("layer " + layer.il() + " has no Zamba2 shared block");
+                }
+                checkKind(MixerKind.ZAMBA2, layer);
+                return new CpuZamba2Mixer();
+            }
+
+            @Override
+            public String toString() {
+                return "SsmBlocks.cpu(ZAMBA2)";
+            }
+        };
     }
 
     /** The SSM family has no FFN blocks. */

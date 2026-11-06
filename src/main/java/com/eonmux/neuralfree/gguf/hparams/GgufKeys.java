@@ -112,7 +112,11 @@ public final class GgufKeys {
     public static final String EXPERT_GROUP_SCALE = "%s.expert_group_scale";
     public static final String EXPERTS_PER_GROUP = "%s.experts_per_group";
     public static final String MOE_EVERY_N_LAYERS = "%s.moe_every_n_layers";
+    /** Per-block routed-expert flag array (Step5's arbitrary {@code moe_layers_enum} / {@code moe_layer_list}). */
+    public static final String MOE_LAYER_MASK = "%s.moe_layer_mask";
     public static final String MOE_LATENT_SIZE = "%s.moe_latent_size";
+    /** Routed-expert slots whose FFN is the identity (LongCat-Flash {@code zero_expert_num}). */
+    public static final String EXPERT_ZERO_COUNT = "%s.expert_zero_count";
     public static final String POST_NORM_EPS = "%s.post_norm_epsilon";
     public static final String NEXTN_PREDICT_LAYERS = "%s.nextn_predict_layers";
     public static final String NUM_DEEPSTACK_LAYERS = "%s.n_deepstack_layers";
@@ -125,12 +129,17 @@ public final class GgufKeys {
     public static final String ATTN_LOGIT_SOFTCAPPING = "%s.attn_logit_softcapping";
     public static final String ROUTER_LOGIT_SOFTCAPPING = "%s.router_logit_softcapping";
     public static final String FINAL_LOGIT_SOFTCAPPING = "%s.final_logit_softcapping";
+    public static final String FINAL_LOGIT_SIGMOID_CAPPING = "%s.final_logit_sigmoid_capping";
     public static final String SWIN_NORM = "%s.swin_norm";
     public static final String RESCALE_EVERY_N_LAYERS = "%s.rescale_every_n_layers";
     public static final String TIME_MIX_EXTRA_DIM = "%s.time_mix_extra_dim";
     public static final String TIME_DECAY_EXTRA_DIM = "%s.time_decay_extra_dim";
     public static final String RESIDUAL_SCALE = "%s.residual_scale";
+    public static final String MUDD_FEED_FORWARD_LENGTH = "%s.mudd.feed_forward_length";
+    public static final String MUDD_TAP_COUNT = "%s.mudd.tap_count";
+    public static final String MUDD_TAP_INDICES = "%s.mudd.tap_indices";
     public static final String EMBEDDING_SCALE = "%s.embedding_scale";
+    public static final String OUTPUT_HIDDEN_SCALE = "%s.output_hidden_scale";
     public static final String ADAPTER_COUNT = "%s.adapters.count";
     public static final String ADAPTER_TOKEN_IDS_ACTIVATE = "%s.adapters.token_ids_activate";
     public static final String ADAPTER_TOKEN_IDS_SUBSTITUTE = "%s.adapters.token_ids_substitute";
@@ -145,6 +154,23 @@ public final class GgufKeys {
     public static final String HRM_H_CYCLES = "%s.hrm.h_cycles";
     public static final String HRM_L_CYCLES = "%s.hrm.l_cycles";
     public static final String HRM_PREFIX_LM = "%s.hrm.prefix_lm";
+    /** Repeat-block schedule (Dory, IQuestLoopCoder): the block {@code [n_input, n_input + n_recurrent)} runs
+     * {@code num_loops} times with one KV cache per pass. */
+    public static final String RECURRENT_BLOCK_LOOPS = "%s.recurrent_block.num_loops";
+    public static final String RECURRENT_BLOCK_INPUT = "%s.recurrent_block.n_input_layers";
+    public static final String RECURRENT_BLOCK_RECURRENT = "%s.recurrent_block.n_recurrent_layers";
+    public static final String RECURRENT_BLOCK_OUTPUT = "%s.recurrent_block.n_output_layers";
+    /** 1 when a repeat pass starts from {@code justNorm(state + input)} and ends with {@code justNorm(x)}. */
+    public static final String RECURRENT_BLOCK_JUSTNORM = "%s.recurrent_block.justnorm";
+    public static final String RECURRENT_BLOCK_JUSTNORM_EPS = "%s.recurrent_block.justnorm_epsilon";
+    /** Slerp-residual alpha scale of Dory ({@code ngpt_alpha_init / initializer_range}). */
+    public static final String SLERP_ALPHA_SCALE = "%s.slerp_alpha_scale";
+    /** Per-layer switch: 1 for a block that is an MLP only, without attention (Dory's {@code layer_types}). */
+    public static final String MLP_LAYER_PATTERN = "%s.mlp_layer_pattern";
+    /** IQuestLoopCoder: loop passes after the first mix a read-only global attention with a per-loop local one. */
+    public static final String RECURRENT_BLOCK_DUAL_ATTENTION = "%s.recurrent_block.dual_attention";
+    /** IQuestLoopCoder: sliding window of the per-loop local attention of {@link #RECURRENT_BLOCK_DUAL_ATTENTION}. */
+    public static final String RECURRENT_BLOCK_LOCAL_WINDOW = "%s.recurrent_block.local_window";
     /** Gemma 3n per-layer activation sparsity (gguf-py/gguf/constants.py:158). */
     public static final String ACTIVATION_SPARSITY_SCALE = "%s.activation_sparsity_scale";
     /** Gemma 3n AltUp (gguf-py/gguf/constants.py:159-160). */
@@ -173,12 +199,22 @@ public final class GgufKeys {
     public static final String ATTENTION_GATE_LORA_RANK = "%s.attention.gate_lora_rank";
     public static final String ATTENTION_RELATIVE_BUCKETS_COUNT = "%s.attention.relative_buckets_count";
     public static final String ATTENTION_SLIDING_WINDOW = "%s.attention.sliding_window";
+    /**
+     * Per-layer sliding windows (one entry per block, 0 = full attention) when the layers use different sizes;
+     * {@link #ATTENTION_SLIDING_WINDOW} then holds the largest one. NeuralFree extension.
+     */
+    public static final String ATTENTION_SLIDING_WINDOW_PER_LAYER = "%s.attention.sliding_window_per_layer";
     public static final String ATTENTION_SLIDING_WINDOW_PATTERN = "%s.attention.sliding_window_pattern";
     public static final String ATTENTION_ROPE_PATTERN = "%s.attention.rope_pattern";
     public static final String ATTENTION_VALUE_EXPERT_COUNT = "%s.attention.value_expert_count";
+    /** Number of learned static sink tokens of a layer; 0 or absent for layers without them. NeuralFree extension. */
+    public static final String ATTENTION_SINK_TOKEN_COUNT = "%s.attention.sink_token_count";
     public static final String ATTENTION_VALUE_EXPERT_USED_COUNT = "%s.attention.value_expert_used_count";
 
     public static final String ATTENTION_SCALE = "%s.attention.scale";
+    public static final String ATTENTION_USE_QK_NORM = "%s.attention.use_qk_norm";
+    public static final String ATTENTION_XSA_EPS = "%s.attention.xsa_epsilon";
+    public static final String ATTENTION_KV_SOURCE_MAP = "%s.attention.kv_source_map";
     public static final String ATTENTION_OUTPUT_SCALE = "%s.attention.output_scale";
     public static final String ATTENTION_VALUE_SCALE = "%s.attention.value_scale";
     public static final String ATTENTION_TEMPERATURE_LENGTH = "%s.attention.temperature_length";
@@ -199,18 +235,51 @@ public final class GgufKeys {
     public static final String ATTENTION_INDEXER_TYPES = "%s.attention.indexer.types";
     public static final String ATTENTION_INDEXER_KPOOL = "%s.attention.indexer.kpool";
     public static final String ATTENTION_INDEXER_KPOOL_SELECT_TAIL = "%s.attention.indexer.kpool_select_tail";
+    public static final String ATTENTION_INDEXER_SOURCE_LAYERS = "%s.attention.indexer.source_layers";
+    public static final String ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER = "%s.attention.indexer.candidate_source_layer";
+    public static final String ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS = "%s.attention.indexer.candidate_top_k_blocks";
+    public static final String ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE = "%s.attention.indexer.candidate_block_size";
+    /** Step5 indexer rope width over the 256-wide proxy head and the indexer provider group count. */
+    public static final String ATTENTION_INDEXER_ROPE_DIM = "%s.attention.indexer.rope_dim";
+    public static final String ATTENTION_INDEXER_GROUP_COUNT = "%s.attention.indexer.group_count";
+    /** Step5 residual accumulator kept in F32 while the block parameters round to BF16. */
+    public static final String FP32_RESIDUAL_CONNECTION = "%s.fp32_residual_connection";
+    /** Step5 RMS norm weights are centered on zero: the converter stores {@code 1 + weight}. */
+    public static final String ZERO_CENTERED_NORMS = "%s.zero_centered_norms";
     public static final String ATTENTION_OUTPUT_GROUP_COUNT = "%s.attention.output_group_count";
     public static final String ATTENTION_OUTPUT_LORA_RANK = "%s.attention.output_lora_rank";
     public static final String ATTENTION_COMPRESS_ROPE_FREQ_BASE = "%s.attention.compress_rope_freq_base";
     public static final String ATTENTION_COMPRESS_RATIOS = "%s.attention.compress_ratios";
     public static final String ATTENTION_SHARED_KV_LAYERS = "%s.attention.shared_kv_layers";
+    public static final String ATTENTION_KV_SOURCE_LAYERS = "%s.attention.kv_source_layers";
     public static final String ATTENTION_RECURRENT_LAYERS = "%s.attention.recurrent_layers";
+
+    /**
+     * Dual-chunk attention (Qwen2.5-1M, vLLM {@code dual_chunk_attention_config}): the chunk and local sizes, the
+     * trained context length of the logit scaling factor (0 disables it) and the sparse-attention knobs vLLM reads.
+     * NeuralFree reads the dense form only; a file whose {@link #ATTENTION_DUAL_CHUNK_SPARSE_ENABLED} is true is
+     * refused by name. NeuralFree extension.
+     */
+    public static final String ATTENTION_DUAL_CHUNK_CHUNK_SIZE = "%s.attention.dual_chunk.chunk_size";
+    public static final String ATTENTION_DUAL_CHUNK_LOCAL_SIZE = "%s.attention.dual_chunk.local_size";
+    public static final String ATTENTION_DUAL_CHUNK_ORIGINAL_MAX_POSITION_EMBEDDINGS =
+            "%s.attention.dual_chunk.original_max_position_embeddings";
+    public static final String ATTENTION_DUAL_CHUNK_SPARSE_ENABLED =
+            "%s.attention.dual_chunk.sparse_attention_enabled";
+    public static final String ATTENTION_DUAL_CHUNK_SPARSE_THRESHOLD =
+            "%s.attention.dual_chunk.sparse_attention_threshold";
+    public static final String ATTENTION_DUAL_CHUNK_SPARSE_LAST_Q =
+            "%s.attention.dual_chunk.sparse_attention_last_q";
 
     public static final String HYPER_CONNECTION_COUNT = "%s.hyper_connection.count";
     public static final String HYPER_CONNECTION_SINKHORN_ITERATIONS = "%s.hyper_connection.sinkhorn_iterations";
     public static final String HYPER_CONNECTION_EPSILON = "%s.hyper_connection.epsilon";
     public static final String HYPER_CONNECTION_MAGNITUDE = "%s.hyper_connection.magnitude";
     public static final String HYPER_CONNECTION_LOW_RANK = "%s.hyper_connection.low_rank";
+    public static final String HYPER_CONNECTION_SINGLE_PASS = "%s.hyper_connection.single_pass";
+
+    public static final String ENGRAM_PAD_TOKEN_ID = "%s.engram.pad_token_id";
+    public static final String ENGRAM_TOKEN_MAP = "%s.engram.token_map";
 
     public static final String PLE_LAYERS = "%s.ple.layers";
     public static final String PLE_NGRAM_SIZE = "%s.ple.ngram_size";
@@ -222,12 +291,26 @@ public final class GgufKeys {
     public static final String PLE_EOS_TOKEN_ID = "%s.ple.eos_token_id";
     public static final String PLE_IMAGE_TOKEN_ID = "%s.ple.image_token_id";
 
+    /** LongCat-Flash n-gram input embedding: base table size {@code m = ngram_vocab_size_ratio * vocab_size}. */
+    public static final String NGRAM_BASE_TABLE_SIZE = "%s.ngram.base_table_size";
+    /** LongCat-Flash n-gram input embedding: tokens hashed per n-gram order ({@code emb_neighbor_num}). */
+    public static final String NGRAM_NEIGHBOR_COUNT = "%s.ngram.neighbor_count";
+    /** LongCat-Flash n-gram input embedding: hash tables per n-gram order ({@code emb_split_num}). */
+    public static final String NGRAM_SPLIT_COUNT = "%s.ngram.split_count";
+    /** LongCat-Flash n-gram input embedding: token id that ends an n-gram walk. */
+    public static final String NGRAM_EOS_TOKEN_ID = "%s.ngram.eos_token_id";
+
     public static final String HASH_LAYER_COUNT = "%s.hash_layer_count";
 
     public static final String ROPE_DIMENSION_COUNT = "%s.rope.dimension_count";
     public static final String ROPE_DIMENSION_COUNT_SWA = "%s.rope.dimension_count_swa";
     public static final String ROPE_DIMENSION_SECTIONS = "%s.rope.dimension_sections";
     public static final String ROPE_SECTION_ORDER = "%s.rope.section_order";
+    /**
+     * Rotary variant when a checkpoint's configuration selects it over the architecture default: {@code norm}
+     * (consecutive pairs) or {@code neox} (pairs offset by half the rotated width). NeuralFree extension.
+     */
+    public static final String ROPE_TYPE = "%s.rope.type";
     public static final String ROPE_FREQ_BASE = "%s.rope.freq_base";
     public static final String ROPE_FREQ_BASE_SPATIAL = "%s.rope.freq_base_spatial";
     public static final String ROPE_FREQ_BASE_SWA = "%s.rope.freq_base_swa";
@@ -245,10 +328,34 @@ public final class GgufKeys {
     public static final String ROPE_SCALING_YARN_ATTN_FACTOR = "%s.rope.scaling.yarn_attn_factor";
     public static final String ROPE_SCALING_YARN_BETA_FAST = "%s.rope.scaling.yarn_beta_fast";
     public static final String ROPE_SCALING_YARN_BETA_SLOW = "%s.rope.scaling.yarn_beta_slow";
+    /** vLLM fixed/mixed NTK mixed exponent ({@code rope_parameters.mixed_b}, ntk_scaling_rope.py). */
+    public static final String ROPE_SCALING_MIXED_B = "%s.rope.scaling.mixed_b";
+    /** Fourier position embedding of the layer's rotation ({@code use_fope}, rotary_embedding/fope.py). */
+    public static final String ROPE_FOPE_USE = "%s.rope.fope.use";
+    /** Per-KV-head FoPE coefficients ({@code fope_sep_head}). */
+    public static final String ROPE_FOPE_SEP_HEAD = "%s.rope.fope.sep_head";
+    /** Number of frequencies the FoPE coefficients project, 0 = select by period ({@code num_inv_freq}). */
+    public static final String ROPE_FOPE_NUM_INV_FREQ = "%s.rope.fope.num_inv_freq";
+    /** FoPE initialization factor ({@code fope_init_factor}); recorded from the configuration, not used by the rotation. */
+    public static final String ROPE_FOPE_INIT_FACTOR = "%s.rope.fope.init_factor";
+    /**
+     * Router selection that takes {@code expert_used_count / expert_group_count} experts from each expert group
+     * (vLLM's InternS1-Pro {@code _custom_routing_function}, interns1_pro.py:196-213).
+     */
+    public static final String EXPERT_PER_GROUP_TOP_K = "%s.expert_per_group_top_k";
 
     public static final String SPLIT_NO = "split.no";
     public static final String SPLIT_COUNT = "split.count";
     public static final String SPLIT_TENSORS_COUNT = "split.tensors.count";
+
+    // Zamba2 shared transformer blocks (NeuralFree keys: llama.cpp has no zamba2 graph). Each hybrid layer runs one of
+    // {@code shared_blocks.count} attention/MLP blocks, assigned cyclically, and adds its own adapter to the block's
+    // projections; the block weights are stored once under the {@code shared_blk} stack.
+    public static final String SHARED_BLOCKS_COUNT = "%s.shared_blocks.count";
+    public static final String SHARED_BLOCKS_ADAPTER_RANK = "%s.shared_blocks.adapter_rank";
+    public static final String SHARED_BLOCKS_ATTENTION_ADAPTER = "%s.shared_blocks.attention_adapter";
+    public static final String SHARED_BLOCKS_MEMORY_ROPE = "%s.shared_blocks.memory_rope";
+    public static final String SHARED_BLOCKS_HYBRID_LAYERS = "%s.shared_blocks.hybrid_layers";
 
     public static final String SSM_CONV_KERNEL = "%s.ssm.conv_kernel";
     public static final String SSM_INNER_SIZE = "%s.ssm.inner_size";
@@ -256,6 +363,20 @@ public final class GgufKeys {
     public static final String SSM_TIME_STEP_RANK = "%s.ssm.time_step_rank";
     public static final String SSM_GROUP_COUNT = "%s.ssm.group_count";
     public static final String SSM_DT_B_C_RMS = "%s.ssm.dt_b_c_rms";
+    /** Epsilon of the delta-rule output norm when it differs from the block RMS epsilon (OLMo Hybrid's 1e-5). */
+    public static final String SSM_NORM_EPS = "%s.ssm.norm_eps";
+    /** Multiplier of the delta-rule update rate {@code beta} (OLMo Hybrid's {@code linear_allow_neg_eigval}). */
+    public static final String SSM_BETA_SCALE = "%s.ssm.beta_scale";
+    /** Groups of the lightning-attention output RMS norm ({@code group_norm_size}; 1 normalizes the whole row). */
+    public static final String SSM_GROUP_NORM_SIZE = "%s.ssm.group_norm_size";
+    /** SiLU on the fused lightning-attention Q/K/V projection ({@code use_linear_silu}). */
+    public static final String SSM_LINEAR_SILU = "%s.ssm.linear_silu";
+    /** Per-head RMS norm of the lightning-attention Q and K ({@code use_qk_norm}). */
+    public static final String SSM_QK_NORM = "%s.ssm.qk_norm";
+    /** {@code head_size^-0.5} scale on the lightning-attention Q ({@code linear_scale}). */
+    public static final String SSM_Q_SCALE = "%s.ssm.q_scale";
+    /** Rotary dims of the lightning-attention heads ({@code partial_rotary_factor} of the linear-attention head). */
+    public static final String SSM_ROPE_DIMENSION_COUNT = "%s.ssm.rope_dimension_count";
 
     public static final String KDA_HEAD_DIM = "%s.kda.head_dim";
     public static final String KDA_SAFE_GATE = "%s.kda.safe_gate";
@@ -272,6 +393,19 @@ public final class GgufKeys {
     public static final String CLASSIFIER_OUTPUT_LABELS = "%s.classifier.output_labels";
     public static final String CLASSIFIER_POOLING_TYPE = "%s.classifier.pooling_type";
     public static final String CLASSIFIER_ACTIVATION = "%s.classifier.activation";
+    public static final String CLASSIFIER_POOLER_ACTIVATION = "%s.classifier.pooler_activation";
+    public static final String CLASSIFIER_TOKEN_DIRECT = "%s.classifier.token_direct";
+    public static final String CLASSIFIER_SPARSE = "%s.classifier.sparse";
+    public static final String CLASSIFIER_SPARSE_CLS_TOKEN = "%s.classifier.sparse_cls_token";
+    public static final String CLASSIFIER_SPARSE_SEP_TOKEN = "%s.classifier.sparse_sep_token";
+    /** The leading per-token output row dropped when its token id matches (a BOS/CLS boundary). */
+    public static final String CLASSIFIER_BOS_TOKEN = "%s.classifier.bos_token";
+    /** The trailing per-token output row dropped when its token id matches (an EOS/SEP boundary). */
+    public static final String CLASSIFIER_EOS_TOKEN = "%s.classifier.eos_token";
+    /** The process-reward step filter applied when a {@code token_classify} request omits {@code step_tag_id}. */
+    public static final String CLASSIFIER_STEP_TAG_ID = "%s.classifier.step_tag_id";
+    public static final String CLASSIFIER_SCOPE = "%s.classifier.scope";
+    public static final String POOLING_NORMALIZE = "%s.pooling.normalize";
 
     public static final String DECISION_BLOCK_COUNT = "%s.decision.block_count";
     public static final String DECISION_ROUTING_BLOCK_COUNT = "%s.decision.routing_block_count";
@@ -282,6 +416,9 @@ public final class GgufKeys {
     public static final String DECISION_MAX_HEAD_TOKENS = "%s.decision.max_head_tokens";
     public static final String DECISION_TEMPERATURE = "%s.decision.temperature.%s";
     public static final String DECISION_SCORE_BIAS = "%s.decision.score_bias.%d.%d";
+    /** Key prefixes the loaders enumerate to collect the keyed temperature and score-bias families. */
+    public static final String DECISION_TEMPERATURE_PREFIX = "%s.decision.temperature.";
+    public static final String DECISION_SCORE_BIAS_PREFIX = "%s.decision.score_bias.";
 
     public static final String TARGET_LAYERS = "%s.target_layers";
     public static final String TARGET_HIDDEN_SIZE = "%s.target_hidden_size";
@@ -304,6 +441,16 @@ public final class GgufKeys {
     public static final String LILICORR_MLP_HIDDEN_SIZE = "lilicorr.mlp_hidden_size";
 
     public static final String SHORTCONV_L_CACHE = "%s.shortconv.l_cache";
+    /** Inkling: distances of the per-query relative-logit table (vLLM {@code rel_extent}). */
+    public static final String INKLING_RELATIVE_EXTENT = "%s.inkling.relative_extent";
+    /** Inkling: width of the per-head relative projection (vLLM {@code d_rel}). */
+    public static final String INKLING_RELATIVE_DIM = "%s.inkling.relative_dim";
+    /** Inkling: width of the short convolutions (vLLM {@code sconv_kernel_size}). */
+    public static final String INKLING_SCONV_KERNEL = "%s.inkling.sconv_kernel_size";
+    /** Inkling: query/relative-logit log scaling floor ({@code log_scaling_n_floor}); absent or 0 disables it. */
+    public static final String INKLING_LOG_SCALING_FLOOR = "%s.inkling.log_scaling_n_floor";
+    /** Inkling: query/relative-logit log scaling alpha ({@code log_scaling_alpha}). */
+    public static final String INKLING_LOG_SCALING_ALPHA = "%s.inkling.log_scaling_alpha";
     // sentence-transformers dense modules feature dims
     public static final String DENSE_2_FEAT_IN = "%s.dense_2_feat_in";
     public static final String DENSE_2_FEAT_OUT = "%s.dense_2_feat_out";
@@ -333,6 +480,8 @@ public final class GgufKeys {
     public static final String TOKENIZER_DNA_AUTO_TAGS = "tokenizer.ggml.dna_auto_tags";
     public static final String TOKENIZER_ADD_PREFIX = "tokenizer.ggml.add_space_prefix";
     public static final String TOKENIZER_REMOVE_EXTRA_WS = "tokenizer.ggml.remove_extra_whitespaces";
+    /** BOOL: {@code clean_spaces}, the detokenization clean-up; overrides the pre-tokenizer default. */
+    public static final String TOKENIZER_CLEAN_SPACES = "tokenizer.ggml.clean_spaces";
     public static final String TOKENIZER_PRECOMPILED_CHARSMAP = "tokenizer.ggml.precompiled_charsmap";
     public static final String TOKENIZER_HF_JSON = "tokenizer.huggingface.json";
     public static final String TOKENIZER_RWKV = "tokenizer.rwkv.world";
@@ -341,9 +490,16 @@ public final class GgufKeys {
     public static final String TOKENIZER_CHAT_TEMPLATE_N = "tokenizer.chat_template.%s";
     /** The names of the named chat templates (gguf-py/gguf/constants.py:380). */
     public static final String TOKENIZER_CHAT_TEMPLATES = "tokenizer.chat_templates";
+    /**
+     * STRING: the checkpoint's {@code response_template} (tokenizer_config.json), as JSON text; vLLM's {@code hf} and
+     * {@code beam} parsers read the assistant message with it.
+     */
+    public static final String TOKENIZER_RESPONSE_TEMPLATE = "tokenizer.response_template";
     public static final String TOKENIZER_NORMALIZER_NFC = "tokenizer.ggml.normalizer.nfc";
     public static final String TOKENIZER_NORMALIZER_LOWERCASE = "tokenizer.ggml.normalizer.lowercase";
     public static final String TOKENIZER_NORMALIZER_STRIP_ACCENTS = "tokenizer.ggml.normalizer.strip_accents";
+    /** STRING: the Hugging Face Metaspace {@code prepend_scheme}: never, first or always (constants.py:406). */
+    public static final String TOKENIZER_METASPACE_PREPEND_SCHEME = "tokenizer.ggml.metaspace.prepend_scheme";
     public static final String TOKENIZER_FIM_PRE_ID = "tokenizer.ggml.fim_pre_token_id";
     public static final String TOKENIZER_FIM_SUF_ID = "tokenizer.ggml.fim_suf_token_id";
     public static final String TOKENIZER_FIM_MID_ID = "tokenizer.ggml.fim_mid_token_id";
@@ -370,6 +526,7 @@ public final class GgufKeys {
 
     // Projector (mmproj) keys, typed for the projector checkpoints (gguf-py/gguf/constants.py:409-511).
     public static final String CLIP_AUDIO_ATTENTION_HEAD_COUNT = "clip.audio.attention.head_count";
+    public static final String CLIP_AUDIO_ATTENTION_HEAD_COUNT_KV = "clip.audio.attention.head_count_kv";
     public static final String CLIP_AUDIO_ATTENTION_HEAD_DIM = "clip.audio.attention.head_dim";
     public static final String CLIP_AUDIO_ATTENTION_LAYER_NORM_EPSILON = "clip.audio.attention.layer_norm_epsilon";
     public static final String CLIP_AUDIO_BLOCK_COUNT = "clip.audio.block_count";
@@ -406,9 +563,15 @@ public final class GgufKeys {
     public static final String CLIP_GEN_AUDIO_MODEL_VARIANT = "clip.gen.audio.model_variant";
     public static final String CLIP_GEN_AUDIO_PROJECTION_DIM = "clip.gen.audio.projection_dim";
     public static final String CLIP_GEN_AUDIO_PROJECTOR_TYPE = "clip.gen.audio.projector_type";
+    public static final String CLIP_GEN_AUDIO_SAMPLING_TEMP = "clip.gen.audio.sampling.temp";
+    public static final String CLIP_GEN_AUDIO_SAMPLING_TOP_K = "clip.gen.audio.sampling.top_k";
+    public static final String CLIP_GEN_AUDIO_SAMPLING_PENALTY_REPEAT = "clip.gen.audio.sampling.penalty_repeat";
+    public static final String CLIP_GEN_AUDIO_SAMPLING_PENALTY_LAST_N = "clip.gen.audio.sampling.penalty_last_n";
     public static final String CLIP_HAS_AUDIO_ENCODER = "clip.has_audio_encoder";
     public static final String CLIP_HAS_GEN_AUDIO_ENCODER = "clip.has_gen_audio_encoder";
     public static final String CLIP_HAS_VISION_ENCODER = "clip.has_vision_encoder";
+    public static final String CLIP_MINICPMV_QUERY_NUM = "clip.minicpmv_query_num";
+    public static final String CLIP_MINICPMV_VERSION = "clip.minicpmv_version";
     public static final String CLIP_PROJECTOR_TYPE = "clip.projector_type";
     public static final String CLIP_USE_GELU = "clip.use_gelu";
     public static final String CLIP_USE_SILU = "clip.use_silu";
@@ -554,6 +717,12 @@ public final class GgufKeys {
      * tokenizer conversion.
      */
     public static final String NF_TOKENIZER_SUFFIX_IDS = "neuralfree.tokenizer.suffix_ids";
+    /**
+     * ARRAY of INT32: token ids appended to every rerank prompt after the filled {@code tokenizer.chat_template.rerank}
+     * (vLLM's {@code post_process_tokens}, the score token of {@code JinaVLForSequenceClassification}). Written by the
+     * Hugging Face loader.
+     */
+    public static final String NF_RERANK_SUFFIX_IDS = "neuralfree.tokenizer.rerank_suffix_ids";
     /**
      * ARRAY of INT32: end-of-generation token ids beyond the vocabulary's EOS / EOT / EOM (from
      * {@code generation_config.json}). Written by the Hugging Face tokenizer conversion.

@@ -1,0 +1,62 @@
+/* GLSL twins of the DFlash2 selector kernels in kernels/llm/dflash.cl. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common/nf_common.glsl"
+#if OP == 0
+layout(std430, binding = 0) readonly buffer Inverse { int inverse[]; };
+layout(std430, binding = 1) readonly buffer Logits { float logits[]; };
+layout(std430, binding = 2) writeonly buffer Out { float out_data[]; };
+layout(push_constant) uniform Params { int n_rows; int draft_vocab; int target_vocab; float scale; float cap; } pc;
+void main() {
+    const uint idx = nf_wg_id() * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (idx >= uint(pc.n_rows) * uint(pc.target_vocab)) return;
+    const int src = inverse[idx % uint(pc.target_vocab)];
+    float v = -NF_INF;
+    if (src >= 0) {
+        v = logits[(idx / uint(pc.target_vocab)) * uint(pc.draft_vocab) + uint(src)];
+        if (pc.scale != 0.0) v *= pc.scale;
+        if (pc.cap > 0.0) v = tanh(v * (1.0 / pc.cap)) * pc.cap;
+    }
+    out_data[idx] = v;
+}
+#elif OP == 1
+layout(std430, binding = 0) readonly buffer TopVal { float top_val[]; };
+layout(std430, binding = 1) readonly buffer TopIdx { int top_idx[]; };
+layout(std430, binding = 2) readonly buffer Gate { float gate[]; };
+layout(std430, binding = 3) readonly buffer Prev { float prev[]; };
+layout(std430, binding = 4) readonly buffer Next { float next_data[]; };
+layout(std430, binding = 5) readonly buffer Ids { int ids[]; };
+layout(std430, binding = 6) writeonly buffer Scores { float scores[]; };
+layout(push_constant) uniform Params { int row; int k; int rank; int anchor; } pc;
+void main() {
+    const uint j = nf_wg_id() * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (j >= uint(pc.k)) return;
+    const int pred = pc.row == 1 ? pc.anchor : ids[pc.row - 1];
+    const int succ = top_idx[uint(pc.row * pc.k) + j];
+    precise float dot = 0.0;
+    for (int r = 0; r < pc.rank; ++r) {
+        const float cond = prev[pred * pc.rank + r] * gate[pc.row * pc.rank + r];
+        dot += next_data[succ * pc.rank + r] * cond;
+    }
+    scores[j] = dot + top_val[uint(pc.row * pc.k) + j];
+}
+#elif OP == 2
+layout(std430, binding = 0) readonly buffer TopIdx { int top_idx[]; };
+layout(std430, binding = 1) readonly buffer Scores { float scores[]; };
+layout(std430, binding = 2) writeonly buffer Ids { int ids[]; };
+layout(std430, binding = 3) writeonly buffer Probs { float probs[]; };
+layout(push_constant) uniform Params { int row; int k; int probability; } pc;
+void main() {
+    if (nf_wg_id() * gl_WorkGroupSize.x + gl_LocalInvocationID.x != 0u) return;
+    int best = 0;
+    for (int j = 1; j < pc.k; ++j) if (scores[j] > scores[best]) best = j;
+    ids[pc.row] = top_idx[pc.row * pc.k + best];
+    if (pc.probability != 0) {
+        float sum = 0.0;
+        for (int j = 0; j < pc.k; ++j) sum += exp(scores[j] - scores[best]);
+        probs[pc.row] = 1.0 / sum;
+    }
+}
+#else
+#error "dflash_selector.comp requires OP=0 (logits), 1 (score) or 2 (pick)"
+#endif

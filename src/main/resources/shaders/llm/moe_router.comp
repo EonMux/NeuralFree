@@ -7,7 +7,7 @@
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_tokens, i n_expert, i k, i gating, i n_groups, i n_group_used, i norm_w, f w_scale,
- *    i has_bias, i sel_mode, i id_div, R float logits, R float exp_probs_b, int ids, W float weights)
+ *    i has_bias, i sel_mode, i id_div, i per_group, R float logits, R float exp_probs_b, int ids, W float weights)
  * ids is read (sel_mode 3) and written, so it is not writeonly.
  *
  * Dispatch: 1-D, local = {L, 1, 1} with L a power of two, 32 <= L <= LLM_DIMX, global = n_tokens * L;
@@ -24,7 +24,7 @@ layout(std430, binding = 2) buffer NfMrIds { int ids[]; };
 layout(std430, binding = 3) writeonly buffer NfMrWeights { float weights[]; };
 layout(push_constant) uniform NfMrParams {
     int n_tokens; int n_expert; int k; int gating; int n_groups; int n_group_used; int norm_w;
-    float w_scale; int has_bias; int sel_mode; int id_div;
+    float w_scale; int has_bias; int sel_mode; int id_div; int per_group;
 } pc;
 
 #include "common/reduce.glsl"
@@ -172,9 +172,9 @@ void main() {
     }
     barrier();
 
-    /* group-limited routing */
+    /* group-limited routing (not used by per-group selection) */
     const uint n_groups = uint(pc.n_groups);
-    if (sel_mode != NF_MOE_SEL_PRESELECTED && n_groups > 1u) {
+    if (sel_mode != NF_MOE_SEL_PRESELECTED && n_groups > 1u && pc.per_group == 0) {
         const uint n_per = n_expert / n_groups;
         for (uint g = lid; g < n_groups; g += lsize) {
             float a = -NF_INF;
@@ -218,7 +218,37 @@ void main() {
     }
 
     /* top-k: invocation lid owns experts lid + c * L, bit c of `taken` marking a pick */
-    if (sel_mode != NF_MOE_SEL_PRESELECTED) {
+    if (sel_mode != NF_MOE_SEL_PRESELECTED && n_groups > 1u && pc.per_group != 0) {
+        const uint n_per = n_expert / n_groups;
+        const uint per_k = k / n_groups;
+        uint taken = 0u;
+        for (uint g = 0u; g < n_groups; ++g) {
+            const uint lo = g * n_per;
+            const uint hi = lo + n_per;
+            for (uint j = 0u; j < per_k; ++j) {
+                float bv = -NF_INF;
+                int bi = -1;
+                uint c = 0u;
+                for (uint e = lid; e < n_expert; e += lsize, ++c) {
+                    if (e < lo || e >= hi || ((taken >> c) & 1u) != 0u) {
+                        continue;
+                    }
+                    const float v = nf_moe_key(moe_sel[e]);
+                    if (nf_moe_better(v, int(e), bv, bi)) {
+                        bv = v;
+                        bi = int(e);
+                    }
+                }
+                const int pick = nf_moe_wg_argmax(bv, bi);
+                if (pick >= 0 && uint(pick) % lsize == lid) {
+                    taken |= 1u << (uint(pick) / lsize);
+                }
+                if (lid == 0u) {
+                    moe_pick[g * per_k + j] = pick;
+                }
+            }
+        }
+    } else if (sel_mode != NF_MOE_SEL_PRESELECTED) {
         uint taken = 0u;
         for (uint j = 0u; j < k; ++j) {
             float bv = -NF_INF;

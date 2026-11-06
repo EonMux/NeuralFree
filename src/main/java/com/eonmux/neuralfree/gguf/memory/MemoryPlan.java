@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.memory;
 
 import com.eonmux.neuralfree.gguf.arch.MemoryKind;
+import com.eonmux.neuralfree.gguf.engine.StepSizes;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -27,14 +28,23 @@ public final class MemoryPlan {
         private final KvWindow window;
         private final int pageSize;
         private final int pages;
+        private final int rowBase;
+        private final boolean sharded;
 
         private KvGroup(int index, int rows, boolean ring, KvWindow window, int pageSize, int pages) {
+            this(index, rows, ring, window, pageSize, pages, 0, false);
+        }
+
+        private KvGroup(int index, int rows, boolean ring, KvWindow window, int pageSize, int pages, int rowBase,
+                        boolean sharded) {
             this.index = index;
             this.rows = rows;
             this.ring = ring;
             this.window = window;
             this.pageSize = pageSize;
             this.pages = pages;
+            this.rowBase = rowBase;
+            this.sharded = sharded;
         }
 
         /** @throws IllegalArgumentException for a negative index or non-positive rows */
@@ -80,6 +90,22 @@ public final class MemoryPlan {
             return new KvGroup(index, rows, ring, Objects.requireNonNull(window, "window"), 0, 0);
         }
 
+        /**
+         * Context-shard form: rows {@code [rowBase, rowBase + rows)} of the context, the block one rank of a
+         * context-parallel split keeps (vLLM's decode context parallelism). Never paged and never a ring.
+         *
+         * @throws IllegalArgumentException for a negative index or base, or non-positive rows
+         */
+        public static KvGroup ofShard(int index, int rows, int rowBase, KvWindow window) {
+            if (index < 0 || rows <= 0) {
+                throw new IllegalArgumentException("KV group needs index >= 0 and rows > 0, got " + index + "/" + rows);
+            }
+            if (rowBase < 0) {
+                throw new IllegalArgumentException("KV group needs a non-negative row base, got " + rowBase);
+            }
+            return new KvGroup(index, rows, false, Objects.requireNonNull(window, "window"), 0, 0, rowBase, true);
+        }
+
         public int index() { return index; }
         public int rows() { return rows; }
         public boolean ring() { return ring; }
@@ -91,7 +117,13 @@ public final class MemoryPlan {
         /** True when the group's rows live in the pages of a page pool ({@link #pageSize()} over 0). */
         public boolean paged() { return pageSize > 0; }
 
-        /** Row of a position in this group ({@code pos % rows} for a ring). */
+        /** Global position of row 0 of a context shard; 0 for a whole cache. */
+        public int rowBase() { return rowBase; }
+
+        /** True when the group is one rank's context shard, covering positions {@code [rowBase, rowBase + rows)}. */
+        public boolean sharded() { return sharded; }
+
+        /** Row of a position in this group ({@code pos % rows} for a ring, {@code pos - rowBase} for a shard). */
         public int rowOf(int pos) {
             if (paged()) {
                 throw new UnsupportedOperationException("a paged KV group maps positions through PagedSequences; "
@@ -100,10 +132,28 @@ public final class MemoryPlan {
             if (pos < 0) {
                 throw new IllegalArgumentException("KV position " + pos + " is negative");
             }
+            if (sharded) {
+                if (pos < rowBase || pos >= rowBase + rows) {
+                    throw new IllegalArgumentException("KV position " + pos + " is outside the context shard of rows ["
+                            + rowBase + ", " + (rowBase + rows) + ")");
+                }
+                return pos - rowBase;
+            }
             if (!ring && pos >= rows) {
                 throw new IllegalArgumentException("KV position " + pos + " is beyond the group of " + rows + " rows");
             }
             return ring ? pos % rows : pos;
+        }
+
+        /** True when the group, or the context shard, stores position {@code pos}. */
+        public boolean holds(int pos) {
+            if (pos < 0) {
+                return false;
+            }
+            if (paged()) {
+                return pos < rows;
+            }
+            return ring || (sharded ? pos >= rowBase && pos < rowBase + rows : pos < rows);
         }
 
         /** Bytes of the {@code kv_pos} buffer. */
@@ -114,6 +164,7 @@ public final class MemoryPlan {
         @Override
         public String toString() {
             return "KvGroup{" + index + ", rows=" + rows + (ring ? " ring" : "")
+                    + (sharded ? " shard@" + rowBase : "")
                     + (paged() ? ", pages=" + pages + "x" + pageSize : "") + ", " + window + '}';
         }
     }
@@ -153,6 +204,14 @@ public final class MemoryPlan {
     }
     /** KV groups; index {@code g} has {@code index() == g} (unmodifiable). */
     public List<KvGroup> groups() { return groups; }
+    /** Pages of the largest paged group's pool; the page ids of every group stay below it. */
+    public int maxGroupPages() {
+        int max = 0;
+        for (KvGroup g : groups) {
+            max = Math.max(max, g.pages());
+        }
+        return max;
+    }
     public KvGroup group(int g) {
         if (g < 0 || g >= groups.size()) {
             throw new IndexOutOfBoundsException("memory plan has no KV group " + g + " (" + groups.size() + " groups)");
@@ -171,6 +230,36 @@ public final class MemoryPlan {
         for (LayerMemoryPlan l : layers) {
             if (l.hasState()) {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * True when the plan keeps recurrent state and every state tensor is
+     * {@link LayerMemoryPlan.StateLayout#positional() positional}: the positions it holds are re-evaluated after a
+     * drop, so dropping trailing positions leaves no state to restore ({@link ModelMemory#dropRecomputed(int)}).
+     */
+    public boolean hasOnlyPositionalState() {
+        boolean any = false;
+        for (LayerMemoryPlan l : layers) {
+            for (LayerMemoryPlan.StateTensor s : l.states()) {
+                any = true;
+                if (!s.layout().positional()) {
+                    return false;
+                }
+            }
+        }
+        return any;
+    }
+
+    /** True when any layer keeps a {@link LayerMemoryPlan.StateLayout#positional() positional} state tensor. */
+    public boolean hasPositionalState() {
+        for (LayerMemoryPlan l : layers) {
+            for (LayerMemoryPlan.StateTensor s : l.states()) {
+                if (s.layout().positional()) {
+                    return true;
+                }
             }
         }
         return false;
@@ -212,29 +301,23 @@ public final class MemoryPlan {
 
     /**
      * Tokens of the next step when {@code remaining} tokens of one call are still to be stored and a step holds at
-     * most {@code maxStep}: {@code min(maxStep, remaining)}, except that with {@link #rollbackSnapshots()}
-     * {@code s > 0} the trailing {@code 1 + s} tokens of the call stay in one step, as llama.cpp splits a batch for
-     * memory with rollback snapshots ({@code split_equal} with {@code n_keep_tail = 1 + n_rs_seq},
-     * src/llama-batch.cpp:714-765, src/llama-kv-cache-dsv4.cpp:1414-1417): a full step that would leave between 1
-     * and {@code s} tokens stops early so exactly {@code 1 + s} remain. The snapshots are written from the last step
-     * only, so this keeps a rollback of up to {@code s} positions after the call possible. A step of at most
-     * {@code 1 + s} tokens cannot keep the tail apart and splits plainly (llama.cpp asserts
-     * {@code n_ubatch > n_keep_tail}).
+     * most {@code maxStep}: the call splits into as few steps as {@code maxStep} allows, of equal size up to one
+     * token ({@link StepSizes}), so a call of 19014 tokens at a cap of 8192 runs as 6338, 6338 and 6338 instead of
+     * 8192, 8192 and 2630 — a short step costs nearly as much as a full one when a step pays a fixed cost.
+     *
+     * <p>With {@link #rollbackSnapshots()} {@code s > 0} the trailing {@code 1 + s} tokens of the call stay in the
+     * last step, as llama.cpp splits a batch for memory with rollback snapshots ({@code split_equal} with
+     * {@code n_keep_tail = 1 + n_rs_seq}, src/llama-batch.cpp:714-765,
+     * src/llama-kv-cache-dsv4.cpp:1414-1417): when an equal split would leave fewer than {@code 1 + s} tokens
+     * there, the steps before it give up the tokens it needs. The snapshots are written from the last step only, so
+     * this keeps a rollback of up to {@code s} positions after the call possible. A step of at most {@code 1 + s}
+     * tokens cannot keep the tail apart and splits plainly (llama.cpp asserts {@code n_ubatch > n_keep_tail}).
      *
      * @throws IllegalArgumentException for {@code remaining < 1} or {@code maxStep < 1}
      */
     public int stepTokens(int remaining, int maxStep) {
-        if (remaining < 1 || maxStep < 1) {
-            throw new IllegalArgumentException("a step needs remaining >= 1 and maxStep >= 1, got " + remaining + "/"
-                    + maxStep);
-        }
-        int n = Math.min(maxStep, remaining);
         int keepTail = rollbackSnapshots() > 0 ? 1 + rollbackSnapshots() : 0;
-        int left = remaining - n;
-        if (keepTail == 0 || left == 0 || left >= keepTail || maxStep <= keepTail) {
-            return n;
-        }
-        return remaining - keepTail;
+        return StepSizes.next(remaining, maxStep, keepTail);
     }
 
     /**
@@ -291,10 +374,11 @@ public final class MemoryPlan {
         return kvBytes() + stateBytes() + snapshotBytes() + sideCacheBytes() + positionBytes();
     }
 
+    /** The plan's kind, sizes, KV groups (rows, ring or page pool, window) and byte totals per category. */
     @Override
     public String toString() {
         return "MemoryPlan{" + kind + ", nCtx=" + nCtx + ", ubatch=" + ubatch + ", layers=" + layers.size() + ", groups="
-                + groups.size() + ", kv=" + kvBytes() + "B, state=" + stateBytes() + "B, snapshots=" + snapshotBytes()
+                + groups + ", kv=" + kvBytes() + "B, state=" + stateBytes() + "B, snapshots=" + snapshotBytes()
                 + "B, side=" + sideCacheBytes() + "B, pos=" + positionBytes() + "B}";
     }
 

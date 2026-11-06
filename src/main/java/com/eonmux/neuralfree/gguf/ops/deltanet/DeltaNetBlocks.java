@@ -50,6 +50,8 @@ public final class DeltaNetBlocks {
 
     /** Temporary holding the decay gate written by {@code LLM_GDN_GatePrep} (dense from element 0). */
     static final String TEMP_G = "deltanet.g";
+    /** Merged qwen4exp linear-attention projection {@code attn_qkv_gate} rows before the split. */
+    static final String TEMP_QKV_GATE = "deltanet.qkv_gate";
     /** Temporary holding the update rate written by {@code LLM_GDN_GatePrep} (dense from element 0). */
     static final String TEMP_BETA = "deltanet.beta";
     /** Zeroed conv state of a layer run without memory. */
@@ -186,9 +188,11 @@ public final class DeltaNetBlocks {
         return spec.arch() == Arch.GLM5_NEXT ? GLM5_NEXT_L2_EPS : spec.hparams().normRmsEps();
     }
 
-    /** Epsilon of the RMS norms inside the mixers ({@code build_norm(..., LLM_NORM_RMS)}: {@code f_norm_rms_eps}). */
+    /** Epsilon of the RMS norms inside the mixers ({@code build_norm(..., LLM_NORM_RMS)}: {@code f_norm_rms_eps}),
+     * or {@code ssm.norm_eps} when the file carries a delta-rule norm epsilon of its own. */
     static float rmsEps(ModelSpec spec) {
-        return spec.hparams().normRmsEps();
+        float eps = spec.hparams().ssmNormEps();
+        return eps > 0f ? eps : spec.hparams().normRmsEps();
     }
 
     /**
@@ -534,13 +538,23 @@ public final class DeltaNetBlocks {
         final float[] scan;
         private final int convFloats;
         private final int scanFloats;
+        /** Floats of one state slot and the slots the memory keeps; sequence {@code seq} runs row {@code seq}. */
+        private final int convRow;
+        private final int scanRow;
+        private final int slots;
+        private final String where;
         private final boolean transientState;
 
-        private CpuStates(float[] conv, float[] scan, int convFloats, int scanFloats, boolean transientState) {
+        private CpuStates(float[] conv, float[] scan, int convFloats, int scanFloats, int convRow, int scanRow,
+                          int slots, String where, boolean transientState) {
             this.conv = conv;
             this.scan = scan;
             this.convFloats = convFloats;
             this.scanFloats = scanFloats;
+            this.convRow = convRow;
+            this.scanRow = scanRow;
+            this.slots = slots;
+            this.where = where;
             this.transientState = transientState;
         }
 
@@ -550,25 +564,61 @@ public final class DeltaNetBlocks {
          * @throws IllegalStateException when the memory has no matching state for the layer
          */
         static CpuStates bind(CpuForwardContext ctx, LayerSpec layer, long convFloats, long scanFloats) {
-            int nConv = toInt(convFloats, "conv state of layer " + describe(layer));
-            int nScan = toInt(scanFloats, "scan state of layer " + describe(layer));
+            String where = describe(layer);
+            int nConv = toInt(convFloats, "conv state of layer " + where);
+            int nScan = toInt(scanFloats, "scan state of layer " + where);
             if (!ctx.hasMemory()) {
                 float[] conv = nConv > 0 ? ctx.scratch().temp(TEMP_CONV_STATE, nConv) : null;
                 float[] scan = ctx.scratch().temp(TEMP_SCAN_STATE, nScan);
-                return new CpuStates(conv, scan, nConv, nScan, true);
+                return new CpuStates(conv, scan, nConv, nScan, nConv, nScan, 1, where, true);
             }
             RecurrentStateAccessor state = ctx.memory().recurrent(layer.il());
             if (state == null) {
-                throw new IllegalStateException("layer " + describe(layer) + " has no recurrent state");
+                throw new IllegalStateException("layer " + where + " has no recurrent state");
             }
             float[] conv = null;
+            int convRow = 0;
             if (nConv > 0) {
                 checkStateTensor(state.tensors(), LayerMemoryPlan.STATE_CONV, nConv, layer);
                 conv = state.tensor(LayerMemoryPlan.STATE_CONV);
+                convRow = state.slotFloats(LayerMemoryPlan.STATE_CONV);
             }
             checkStateTensor(state.tensors(), LayerMemoryPlan.STATE_SCAN, nScan, layer);
             float[] scan = state.tensor(LayerMemoryPlan.STATE_SCAN);
-            return new CpuStates(conv, scan, nConv, nScan, false);
+            int scanRow = state.slotFloats(LayerMemoryPlan.STATE_SCAN);
+            return new CpuStates(conv, scan, nConv, nScan, convRow, scanRow, state.slots(), where, false);
+        }
+
+        /**
+         * Conv-state row base of {@code seq}: {@code seq * <slot floats>}, validated against the memory's slots.
+         *
+         * @throws UnsupportedOperationException when {@code seq} is outside the slots
+         */
+        int convBase(int seq) {
+            return check(seq) * convRow;
+        }
+
+        /** Floats of one conv-state slot (the copy span of one state row), 0 when the layer has no conv state. */
+        int convFloats() {
+            return convFloats;
+        }
+
+        /** Floats of one scan-state slot (the copy span of one state row). */
+        int scanFloats() {
+            return scanFloats;
+        }
+
+        /** Scan-state row base of {@code seq}, as {@link #convBase}. */
+        int scanBase(int seq) {
+            return check(seq) * scanRow;
+        }
+
+        private int check(int seq) {
+            if (seq < 0 || seq >= slots) {
+                throw new UnsupportedOperationException("layer " + where + " runs sequence " + seq + ", the memory"
+                        + " keeps " + slots + " state slots");
+            }
+            return seq;
         }
 
         /** Zeroes the temporaries of a memory-less layer; nothing to do when the state lives in memory. */
@@ -606,7 +656,7 @@ public final class DeltaNetBlocks {
                                  int bOff, GpuBuffer aIn, GpuBuffer bIn, GpuBuffer dtBias, GpuBuffer ssmA,
                                  GpuBuffer gOut, GpuBuffer betaOut) {
         Object[] a = {nTokens, shape.nVHeads(), shape.nKHeads(), shape.layout(), shape.kdaMode(), shape.headDim(),
-                shape.lb(), aStride, aOff, bStride, bOff, aIn, bIn, dtBias, ssmA, gOut, betaOut};
+                shape.lb(), aStride, aOff, bStride, bOff, shape.betaScale(), aIn, bIn, dtBias, ssmA, gOut, betaOut};
         checkCount(a, DeltaNetKernels.GATE_ARG_COUNT, DeltaNetKernels.GDN_GATE_PREP);
         return a;
     }

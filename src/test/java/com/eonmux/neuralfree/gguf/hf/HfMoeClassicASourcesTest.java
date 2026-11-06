@@ -26,7 +26,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-MC part A fixtures ({@code Llama4Model}, {@code DbrxModel}, {@code GrokModel}, {@code ArcticModel}) build
+ * The fixtures ({@code Llama4Model}, {@code DbrxModel}, {@code GrokModel}, {@code ArcticModel}) build
  * through the registered entries: {@link ModelSpecBuilder} succeeds and every catalog tensor is claimed
  * ({@code TensorClaims}), which is the done-getting-tensors check of the converter's tensor plan. {@code
  * UltravoxModel}, the named rejection of the table, refuses with the converter's reason.

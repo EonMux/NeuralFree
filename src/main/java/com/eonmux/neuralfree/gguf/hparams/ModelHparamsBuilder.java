@@ -1,17 +1,22 @@
 package com.eonmux.neuralfree.gguf.hparams;
 
 import com.eonmux.neuralfree.gguf.arch.ActOp;
+import com.eonmux.neuralfree.gguf.arch.ClassifierScope;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.ArchTraits;
 import com.eonmux.neuralfree.gguf.arch.GatingFunc;
 import com.eonmux.neuralfree.gguf.arch.GdnHeadMap;
 import com.eonmux.neuralfree.gguf.arch.KdaGateMode;
 import com.eonmux.neuralfree.gguf.arch.PoolingKind;
+import com.eonmux.neuralfree.gguf.arch.PoolerAct;
 import com.eonmux.neuralfree.gguf.arch.RopeScalingType;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -93,6 +98,7 @@ public final class ModelHparamsBuilder implements Cloneable {
     float clampKqv = 0f;
     float maxAlibiBias = 0f;
     boolean useAlibi = false;
+    boolean alibiSqrt = false;
     int nRelAttnBuckets = 0;
     int attnTempLength = 0;
     int attnTempFloorScale = 0;
@@ -105,10 +111,21 @@ public final class ModelHparamsBuilder implements Cloneable {
     int sharedKvLayers = 0;
     int nValueExpert = 0;
     int nValueExpertUsed = 0;
+    float xsaEps = 0f;
+
+    // ---- limite: dense cross-layer connections and the sigmoid logit cap ----
+    int muddTapCount = 0;
+    int muddFf = 0;
+    int[] muddTapIdx = new int[0];
+    float[] finalLogitSigmoidCapping = new float[3];
 
     // ---- sliding window ----
     SwaType swaType = SwaType.NONE;
     int nSwa = 0;
+    /** Per-layer windows (0 = full attention) when the layers use different sizes; empty for the scalar window. */
+    int[] swaWindowArr = new int[0];
+    /** Learned static sink tokens per layer ({@code attention.sink_token_count}); 0 without them. */
+    int sinkTokenCount = 0;
 
     // ---- rope ----
     RopeType ropeType = RopeType.NONE;
@@ -119,7 +136,14 @@ public final class ModelHparamsBuilder implements Cloneable {
     float ropeFreqScaleSwa = 1.0f;
     RopeScalingType ropeScalingType = RopeScalingType.LINEAR;
     float ropeScalingAlpha = 0f;
+    float ropeScalingFactor = 0f;
+    float ropeScalingMixedB = Float.NaN;
+    boolean ropeFope = false;
+    boolean ropeFopeSepHead = false;
+    int ropeFopeNumInvFreq = 0;
+    float ropeFopeInitFactor = 0f;
     float ropeAttnFactor = 1.0f;
+    boolean moePerGroupTopK = false;
     int nCtxOrigYarn = 0;
     boolean ropeFinetuned = false;
     float yarnLogMul = 0f;
@@ -131,6 +155,15 @@ public final class ModelHparamsBuilder implements Cloneable {
     int ropeSectionOrder = ModelHparams.SECTION_ORDER_TYXZ;
     MropeTextPositions mropeTextPositions = MropeTextPositions.PPP0;
 
+    // ---- dual-chunk attention ----
+    /** {@code attention.dual_chunk.chunk_size}; 0 when the model has no dual-chunk attention. */
+    int dualChunkChunkSize = 0;
+    int dualChunkLocalSize = 0;
+    int dualChunkOriginalMaxPositionEmbeddings = 0;
+    boolean dualChunkSparseEnabled = false;
+    int dualChunkSparseThreshold = 32768;
+    int dualChunkSparseLastQ = 64;
+
     // ---- recurrent and linear attention ----
     int ssmDConv = 0;
     int ssmDInner = 0;
@@ -138,6 +171,13 @@ public final class ModelHparamsBuilder implements Cloneable {
     int ssmDtRank = 0;
     int ssmNGroup = 0;
     boolean ssmDtBcRms = false;
+    float ssmNormEps = 0f;
+    float ssmBetaScale = 1f;
+    int ssmGroupNormSize = 1;
+    boolean ssmLinearSilu = false;
+    boolean ssmQkNorm = false;
+    boolean ssmQScale = false;
+    int ssmRopeDims = 0;
     GdnHeadMap gdnHeadMap = null;
     int headLinearAttn = 0;
     int kdaHeadDim = 0;
@@ -157,8 +197,22 @@ public final class ModelHparamsBuilder implements Cloneable {
     int fullAttentionInterval = 0;
     int attnResBlockSize = 0;
 
+    // ---- zamba2 shared transformer blocks ----
+    int zamba2MemBlocks = 0;
+    int zamba2AdapterRank = 0;
+    boolean zamba2AttentionAdapter = false;
+    boolean zamba2MemoryRope = false;
+
+    // ---- Inkling relative attention and short convolutions ----
+    int inklingRelExtent = 0;
+    int inklingRelDim = 0;
+    int inklingSconvKernel = 0;
+    int inklingLogScalingFloor = 0;
+    float inklingLogScalingAlpha = 0.1f;
+
     // ---- mixture of experts ----
     int nExpert = 0;
+    int nExpertZero = 0;
     int nExpertShared = 0;
     int nExpertGroups = 0;
     int nGroupUsed = 0;
@@ -185,6 +239,12 @@ public final class ModelHparamsBuilder implements Cloneable {
     boolean indexerKpoolByOrder = false;
     int indexerBlockSize = 0;
     int indexerLocalBlocks = 0;
+    /** Step5: rotary width of each 256-wide indexer head and the indexer provider group count. */
+    int indexerRopeDim = 0;
+    int indexerGroupCount = 0;
+    /** Step5: residual accumulator kept in F32 and RMS norm weights stored as {@code 1 + weight}. */
+    boolean fp32Residual;
+    boolean zeroCenteredNorms;
     int dsv4OGroupCount = 0;
     int dsv4OLoraRank = 0;
     int dsv4HcMult = 0;
@@ -192,6 +252,11 @@ public final class ModelHparamsBuilder implements Cloneable {
     int dsv4HashLayerCount = 0;
     float dsv4CompressRopeBase = 0f;
     float dsv4HcEps = 0f;
+    int dsv41CandidateSourceLayer = -1;
+    int dsv41CandidateTopKBlocks = 0;
+    int dsv41CandidateBlockSize = 0;
+    int engramPadTokenId = -1;
+    int[] engramTokenMap = new int[0];
     int hcLowRank = 0;
     float hcMagnitude = 0f;
 
@@ -203,6 +268,10 @@ public final class ModelHparamsBuilder implements Cloneable {
     int pleHeadDim = 0;
     int pleEosTokenId = 0;
     int pleImageTokenId = 0;
+    int ngramVocabSize = 0;
+    int ngramNeighborCount = 0;
+    int ngramSplitCount = 0;
+    int ngramEosTokenId = -1;
     long[] pleLayerMultipliers = new long[0];
     long[] pleHeadOffsets = new long[0];
     long[] pleHeadVocabSizes = new long[0];
@@ -216,6 +285,7 @@ public final class ModelHparamsBuilder implements Cloneable {
     boolean logitScaleDivides = false;
     float residualScale = 0f;
     float embeddingScale = 0f;
+    float outputHiddenScale = 0f;
     float situBeta = 1.0f;
     float situLinearBeta = 0f;
 
@@ -226,17 +296,43 @@ public final class ModelHparamsBuilder implements Cloneable {
     int hrmHCycles = 0;
     int hrmLCycles = 0;
     boolean hrmPrefixLm = false;
+    /** Repeat-block schedule: 0 disables; otherwise the block [nInput, nInput + nRecurrent) runs nLoops times. */
+    int repeatLoops = 0;
+    int repeatInputLayers = 0;
+    int repeatRecurrentLayers = 0;
+    int repeatOutputLayers = 0;
+    boolean repeatJustNorm = false;
+    float repeatJustNormEps = 1e-6f;
+    /** Dory's {@code ngpt_alpha_init / initializer_range}, the slerp-residual alpha scale. */
+    float slerpAlphaScale = 0f;
+    /** IQuestLoopCoder: loop passes after the first gate a global (loop 0) and a local (own) attention. */
+    boolean repeatDualAttention = false;
+    int repeatLocalWindow = 0;
 
     // ---- heads, encoders and pooling ----
     PoolingKind pooling = PoolingKind.NONE;
     PoolingKind poolingCls = null;
     int nClsOut = 1;
     String[] classifierLabels = new String[0];
+    ClassifierScope classifierScope;
     String[] decisionLabels = new String[0];
+    String decisionType = null;
+    int decisionMaxHeadTokens = 0;
+    Map<String, Float> decisionTemperatures = Collections.emptyMap();
+    Map<Integer, float[]> decisionScoreBias = Collections.emptyMap();
     int decisionRoutingLayers = 0;
     int decisionJointLayers = 0;
     int decisionHeadCount = 0;
     ActOp classifierActivation = ActOp.TANH;
+    PoolerAct poolerActivation = null;
+    boolean classifierTokenDirect = false;
+    String classifierSparse = null;
+    int sparseClsToken = 101;
+    int sparseSepToken = 102;
+    int classifierBosToken = -1;
+    int classifierEosToken = -1;
+    int classifierStepTagId = -1;
+    boolean poolingNormalize = false;
     String hiddenActivation = null;
     int decStartTokenId = -1;
     int decNLayer = 0;
@@ -275,11 +371,16 @@ public final class ModelHparamsBuilder implements Cloneable {
     int[] nFfExpArr;
     int[] nExpertUsedArr;
     boolean[] swaArr;
+    boolean[] mlpArr;
     boolean[] ropeArr;
     boolean[] recurrentArr;
+    boolean[] hybridArr;
+    int[] sharedBlockArr;
     boolean[] indexerFullArr;
     boolean[] pleArr;
     int[] compressRatioArr;
+    int[] dsv41KvSourceArr;
+    int[] dsv41TopkSourceArr;
     int[] deepstackMappingArr;
     float[] xieluAlphaNArr;
     float[] xieluAlphaPArr;
@@ -381,6 +482,32 @@ public final class ModelHparamsBuilder implements Cloneable {
     public int nonCausalType() { return nonCausalType; }
     public ModelHparamsBuilder attentionScale(float v) { this.attentionScale = v; return this; }
     public float attentionScale() { return attentionScale; }
+    public ModelHparamsBuilder xsaEps(float v) { this.xsaEps = v; return this; }
+    public float xsaEps() { return xsaEps; }
+    public ModelHparamsBuilder muddTapCount(int v) { this.muddTapCount = v; return this; }
+    public int muddTapCount() { return muddTapCount; }
+    public ModelHparamsBuilder muddFf(int v) { this.muddFf = v; return this; }
+    public int muddFf() { return muddFf; }
+    public ModelHparamsBuilder muddTapIdxArray(int[] v) {
+        // a flat [n_layer][n_mudd_taps] table, not a per-layer array
+        int expected = this.nLayerAll * this.muddTapCount;
+        if (v == null || v.length != expected) {
+            throw new IllegalArgumentException("muddTapIdx needs " + expected + " entries (block count x tap count),"
+                    + " got " + (v == null ? 0 : v.length));
+        }
+        this.muddTapIdx = v.clone();
+        return this;
+    }
+    public int[] muddTapIdxArray() { return muddTapIdx.clone(); }
+    public ModelHparamsBuilder finalLogitSigmoidCapping(float[] v) {
+        if (v == null || v.length != 3) {
+            throw new IllegalArgumentException("finalLogitSigmoidCapping needs scale, shift and temperature, got "
+                    + (v == null ? "null" : v.length + " values"));
+        }
+        this.finalLogitSigmoidCapping = v.clone();
+        return this;
+    }
+    public float[] finalLogitSigmoidCapping() { return finalLogitSigmoidCapping.clone(); }
     public ModelHparamsBuilder attnOutScale(float v) { this.attnOutScale = v; return this; }
     public float attnOutScale() { return attnOutScale; }
     public ModelHparamsBuilder attnValueScale(float v) { this.attnValueScale = v; return this; }
@@ -399,6 +526,8 @@ public final class ModelHparamsBuilder implements Cloneable {
     public float maxAlibiBias() { return maxAlibiBias; }
     public ModelHparamsBuilder useAlibi(boolean v) { this.useAlibi = v; return this; }
     public boolean useAlibi() { return useAlibi; }
+    public ModelHparamsBuilder alibiSqrt(boolean v) { this.alibiSqrt = v; return this; }
+    public boolean alibiSqrt() { return alibiSqrt; }
     public ModelHparamsBuilder nRelAttnBuckets(int v) { this.nRelAttnBuckets = v; return this; }
     public int nRelAttnBuckets() { return nRelAttnBuckets; }
     public ModelHparamsBuilder attnTempLength(int v) { this.attnTempLength = v; return this; }
@@ -430,6 +559,18 @@ public final class ModelHparamsBuilder implements Cloneable {
     public ModelHparamsBuilder nSwa(int v) { this.nSwa = v; return this; }
     public int nSwa() { return nSwa; }
 
+    /**
+     * Per-layer sliding windows, one entry per block ({@code 0} = full attention). When set, it overrides the
+     * scalar {@link #nSwa()} for each layer; {@link #nSwa()} should then hold the largest one.
+     *
+     * @throws IllegalArgumentException when the array does not hold one entry per block
+     */
+    public ModelHparamsBuilder nSwaArray(int[] v) { this.swaWindowArr = layerArray("nSwa", v).clone(); return this; }
+
+    /** Learned static sink tokens per attention layer; 0 without them. */
+    public ModelHparamsBuilder sinkTokenCount(int v) { this.sinkTokenCount = v; return this; }
+    public int sinkTokenCount() { return sinkTokenCount; }
+
     // ---- rope accessors ----
     public ModelHparamsBuilder ropeType(RopeType v) { this.ropeType = v; return this; }
     public RopeType ropeType() { return ropeType; }
@@ -447,10 +588,41 @@ public final class ModelHparamsBuilder implements Cloneable {
     public RopeScalingType ropeScalingType() { return ropeScalingType; }
     public ModelHparamsBuilder ropeScalingAlpha(float v) { this.ropeScalingAlpha = v; return this; }
     public float ropeScalingAlpha() { return ropeScalingAlpha; }
+    public ModelHparamsBuilder ropeScalingFactor(float v) { this.ropeScalingFactor = v; return this; }
+    public float ropeScalingFactor() { return ropeScalingFactor; }
+    public ModelHparamsBuilder ropeScalingMixedB(float v) { this.ropeScalingMixedB = v; return this; }
+    public float ropeScalingMixedB() { return ropeScalingMixedB; }
+    public ModelHparamsBuilder ropeFope(boolean v) { this.ropeFope = v; return this; }
+    public boolean ropeFope() { return ropeFope; }
+    public ModelHparamsBuilder ropeFopeSepHead(boolean v) { this.ropeFopeSepHead = v; return this; }
+    public boolean ropeFopeSepHead() { return ropeFopeSepHead; }
+    public ModelHparamsBuilder ropeFopeNumInvFreq(int v) { this.ropeFopeNumInvFreq = v; return this; }
+    public int ropeFopeNumInvFreq() { return ropeFopeNumInvFreq; }
+    public ModelHparamsBuilder ropeFopeInitFactor(float v) { this.ropeFopeInitFactor = v; return this; }
+    public float ropeFopeInitFactor() { return ropeFopeInitFactor; }
     public ModelHparamsBuilder ropeAttnFactor(float v) { this.ropeAttnFactor = v; return this; }
     public float ropeAttnFactor() { return ropeAttnFactor; }
+    public ModelHparamsBuilder moePerGroupTopK(boolean v) { this.moePerGroupTopK = v; return this; }
+    public boolean moePerGroupTopK() { return moePerGroupTopK; }
     public ModelHparamsBuilder nCtxOrigYarn(int v) { this.nCtxOrigYarn = v; return this; }
     public int nCtxOrigYarn() { return nCtxOrigYarn; }
+
+    // ---- dual-chunk attention accessors ----
+    public ModelHparamsBuilder dualChunkChunkSize(int v) { this.dualChunkChunkSize = v; return this; }
+    public int dualChunkChunkSize() { return dualChunkChunkSize; }
+    public ModelHparamsBuilder dualChunkLocalSize(int v) { this.dualChunkLocalSize = v; return this; }
+    public int dualChunkLocalSize() { return dualChunkLocalSize; }
+    public ModelHparamsBuilder dualChunkOriginalMaxPositionEmbeddings(int v) {
+        this.dualChunkOriginalMaxPositionEmbeddings = v;
+        return this;
+    }
+    public int dualChunkOriginalMaxPositionEmbeddings() { return dualChunkOriginalMaxPositionEmbeddings; }
+    public ModelHparamsBuilder dualChunkSparseEnabled(boolean v) { this.dualChunkSparseEnabled = v; return this; }
+    public boolean dualChunkSparseEnabled() { return dualChunkSparseEnabled; }
+    public ModelHparamsBuilder dualChunkSparseThreshold(int v) { this.dualChunkSparseThreshold = v; return this; }
+    public int dualChunkSparseThreshold() { return dualChunkSparseThreshold; }
+    public ModelHparamsBuilder dualChunkSparseLastQ(int v) { this.dualChunkSparseLastQ = v; return this; }
+    public int dualChunkSparseLastQ() { return dualChunkSparseLastQ; }
     public ModelHparamsBuilder ropeFinetuned(boolean v) { this.ropeFinetuned = v; return this; }
     public boolean ropeFinetuned() { return ropeFinetuned; }
     public ModelHparamsBuilder yarnLogMul(float v) { this.yarnLogMul = v; return this; }
@@ -489,6 +661,25 @@ public final class ModelHparamsBuilder implements Cloneable {
     public int ssmNGroup() { return ssmNGroup; }
     public ModelHparamsBuilder ssmDtBcRms(boolean v) { this.ssmDtBcRms = v; return this; }
     public boolean ssmDtBcRms() { return ssmDtBcRms; }
+    public ModelHparamsBuilder ssmNormEps(float v) { this.ssmNormEps = v; return this; }
+    public float ssmNormEps() { return ssmNormEps; }
+    public ModelHparamsBuilder ssmBetaScale(float v) { this.ssmBetaScale = v; return this; }
+    public float ssmBetaScale() { return ssmBetaScale; }
+    /** Group count of the lightning-attention output norm ({@code ssm.group_norm_size}). */
+    public ModelHparamsBuilder ssmGroupNormSize(int v) { this.ssmGroupNormSize = v; return this; }
+    public int ssmGroupNormSize() { return ssmGroupNormSize; }
+    /** SiLU on the fused lightning-attention Q/K/V projection ({@code ssm.linear_silu}). */
+    public ModelHparamsBuilder ssmLinearSilu(boolean v) { this.ssmLinearSilu = v; return this; }
+    public boolean ssmLinearSilu() { return ssmLinearSilu; }
+    /** Per-head RMS norm of the lightning-attention Q and K ({@code ssm.qk_norm}). */
+    public ModelHparamsBuilder ssmQkNorm(boolean v) { this.ssmQkNorm = v; return this; }
+    public boolean ssmQkNorm() { return ssmQkNorm; }
+    /** {@code head_size^-0.5} scale on the lightning-attention Q ({@code ssm.q_scale}). */
+    public ModelHparamsBuilder ssmQScale(boolean v) { this.ssmQScale = v; return this; }
+    public boolean ssmQScale() { return ssmQScale; }
+    /** Rotary dims of the lightning-attention heads ({@code ssm.rope_dimension_count}). */
+    public ModelHparamsBuilder ssmRopeDims(int v) { this.ssmRopeDims = v; return this; }
+    public int ssmRopeDims() { return ssmRopeDims; }
     public ModelHparamsBuilder gdnHeadMap(GdnHeadMap v) { this.gdnHeadMap = v; return this; }
     public GdnHeadMap gdnHeadMap() { return gdnHeadMap; }
     public ModelHparamsBuilder headLinearAttn(int v) { this.headLinearAttn = v; return this; }
@@ -525,10 +716,32 @@ public final class ModelHparamsBuilder implements Cloneable {
     public int fullAttentionInterval() { return fullAttentionInterval; }
     public ModelHparamsBuilder attnResBlockSize(int v) { this.attnResBlockSize = v; return this; }
     public int attnResBlockSize() { return attnResBlockSize; }
+    public ModelHparamsBuilder inklingRelExtent(int v) { this.inklingRelExtent = v; return this; }
+    public int inklingRelExtent() { return inklingRelExtent; }
+    public ModelHparamsBuilder inklingRelDim(int v) { this.inklingRelDim = v; return this; }
+    public int inklingRelDim() { return inklingRelDim; }
+    public ModelHparamsBuilder inklingSconvKernel(int v) { this.inklingSconvKernel = v; return this; }
+    public int inklingSconvKernel() { return inklingSconvKernel; }
+    public ModelHparamsBuilder inklingLogScalingFloor(int v) { this.inklingLogScalingFloor = v; return this; }
+    public int inklingLogScalingFloor() { return inklingLogScalingFloor; }
+    public ModelHparamsBuilder inklingLogScalingAlpha(float v) { this.inklingLogScalingAlpha = v; return this; }
+    public float inklingLogScalingAlpha() { return inklingLogScalingAlpha; }
+
+    // ---- zamba2 shared transformer block accessors ----
+    public ModelHparamsBuilder zamba2MemBlocks(int v) { this.zamba2MemBlocks = v; return this; }
+    public int zamba2MemBlocks() { return zamba2MemBlocks; }
+    public ModelHparamsBuilder zamba2AdapterRank(int v) { this.zamba2AdapterRank = v; return this; }
+    public int zamba2AdapterRank() { return zamba2AdapterRank; }
+    public ModelHparamsBuilder zamba2AttentionAdapter(boolean v) { this.zamba2AttentionAdapter = v; return this; }
+    public boolean zamba2AttentionAdapter() { return zamba2AttentionAdapter; }
+    public ModelHparamsBuilder zamba2MemoryRope(boolean v) { this.zamba2MemoryRope = v; return this; }
+    public boolean zamba2MemoryRope() { return zamba2MemoryRope; }
 
     // ---- mixture of experts accessors ----
     public ModelHparamsBuilder nExpert(int v) { this.nExpert = v; return this; }
     public int nExpert() { return nExpert; }
+    public ModelHparamsBuilder nExpertZero(int v) { this.nExpertZero = v; return this; }
+    public int nExpertZero() { return nExpertZero; }
     public ModelHparamsBuilder nExpertShared(int v) { this.nExpertShared = v; return this; }
     public int nExpertShared() { return nExpertShared; }
     public ModelHparamsBuilder nExpertGroups(int v) { this.nExpertGroups = v; return this; }
@@ -579,6 +792,14 @@ public final class ModelHparamsBuilder implements Cloneable {
     public int indexerBlockSize() { return indexerBlockSize; }
     public ModelHparamsBuilder indexerLocalBlocks(int v) { this.indexerLocalBlocks = v; return this; }
     public int indexerLocalBlocks() { return indexerLocalBlocks; }
+    public ModelHparamsBuilder indexerRopeDim(int v) { this.indexerRopeDim = v; return this; }
+    public int indexerRopeDim() { return indexerRopeDim; }
+    public ModelHparamsBuilder indexerGroupCount(int v) { this.indexerGroupCount = v; return this; }
+    public int indexerGroupCount() { return indexerGroupCount; }
+    public ModelHparamsBuilder fp32Residual(boolean v) { this.fp32Residual = v; return this; }
+    public boolean fp32Residual() { return fp32Residual; }
+    public ModelHparamsBuilder zeroCenteredNorms(boolean v) { this.zeroCenteredNorms = v; return this; }
+    public boolean zeroCenteredNorms() { return zeroCenteredNorms; }
     public ModelHparamsBuilder dsv4OGroupCount(int v) { this.dsv4OGroupCount = v; return this; }
     public int dsv4OGroupCount() { return dsv4OGroupCount; }
     public ModelHparamsBuilder dsv4OLoraRank(int v) { this.dsv4OLoraRank = v; return this; }
@@ -593,6 +814,16 @@ public final class ModelHparamsBuilder implements Cloneable {
     public float dsv4CompressRopeBase() { return dsv4CompressRopeBase; }
     public ModelHparamsBuilder dsv4HcEps(float v) { this.dsv4HcEps = v; return this; }
     public float dsv4HcEps() { return dsv4HcEps; }
+    public ModelHparamsBuilder dsv41CandidateSourceLayer(int v) { this.dsv41CandidateSourceLayer = v; return this; }
+    public int dsv41CandidateSourceLayer() { return dsv41CandidateSourceLayer; }
+    public ModelHparamsBuilder dsv41CandidateTopKBlocks(int v) { this.dsv41CandidateTopKBlocks = v; return this; }
+    public int dsv41CandidateTopKBlocks() { return dsv41CandidateTopKBlocks; }
+    public ModelHparamsBuilder dsv41CandidateBlockSize(int v) { this.dsv41CandidateBlockSize = v; return this; }
+    public int dsv41CandidateBlockSize() { return dsv41CandidateBlockSize; }
+    public ModelHparamsBuilder engramPadTokenId(int v) { this.engramPadTokenId = v; return this; }
+    public int engramPadTokenId() { return engramPadTokenId; }
+    public ModelHparamsBuilder engramTokenMap(int[] v) { this.engramTokenMap = Objects.requireNonNull(v, "engramTokenMap").clone(); return this; }
+    public int[] engramTokenMap() { return engramTokenMap.clone(); }
     public ModelHparamsBuilder hcLowRank(int v) { this.hcLowRank = v; return this; }
     public int hcLowRank() { return hcLowRank; }
     public ModelHparamsBuilder hcMagnitude(float v) { this.hcMagnitude = v; return this; }
@@ -613,6 +844,14 @@ public final class ModelHparamsBuilder implements Cloneable {
     public int pleEosTokenId() { return pleEosTokenId; }
     public ModelHparamsBuilder pleImageTokenId(int v) { this.pleImageTokenId = v; return this; }
     public int pleImageTokenId() { return pleImageTokenId; }
+    public ModelHparamsBuilder ngramVocabSize(int v) { this.ngramVocabSize = v; return this; }
+    public int ngramVocabSize() { return ngramVocabSize; }
+    public ModelHparamsBuilder ngramNeighborCount(int v) { this.ngramNeighborCount = v; return this; }
+    public int ngramNeighborCount() { return ngramNeighborCount; }
+    public ModelHparamsBuilder ngramSplitCount(int v) { this.ngramSplitCount = v; return this; }
+    public int ngramSplitCount() { return ngramSplitCount; }
+    public ModelHparamsBuilder ngramEosTokenId(int v) { this.ngramEosTokenId = v; return this; }
+    public int ngramEosTokenId() { return ngramEosTokenId; }
     public ModelHparamsBuilder pleLayerMultipliers(long[] v) { this.pleLayerMultipliers = Objects.requireNonNull(v, "pleLayerMultipliers").clone(); return this; }
     public long[] pleLayerMultipliers() { return pleLayerMultipliers.clone(); }
     public ModelHparamsBuilder pleHeadOffsets(long[] v) { this.pleHeadOffsets = Objects.requireNonNull(v, "pleHeadOffsets").clone(); return this; }
@@ -637,6 +876,8 @@ public final class ModelHparamsBuilder implements Cloneable {
     public float residualScale() { return residualScale; }
     public ModelHparamsBuilder embeddingScale(float v) { this.embeddingScale = v; return this; }
     public float embeddingScale() { return embeddingScale; }
+    public ModelHparamsBuilder outputHiddenScale(float v) { this.outputHiddenScale = v; return this; }
+    public float outputHiddenScale() { return outputHiddenScale; }
     public ModelHparamsBuilder situBeta(float v) { this.situBeta = v; return this; }
     public float situBeta() { return situBeta; }
     public ModelHparamsBuilder situLinearBeta(float v) { this.situLinearBeta = v; return this; }
@@ -656,6 +897,27 @@ public final class ModelHparamsBuilder implements Cloneable {
     public ModelHparamsBuilder hrmPrefixLm(boolean v) { this.hrmPrefixLm = v; return this; }
     public boolean hrmPrefixLm() { return hrmPrefixLm; }
 
+    // ---- repeat-block schedule ----
+
+    public ModelHparamsBuilder repeatLoops(int v) { this.repeatLoops = v; return this; }
+    public int repeatLoops() { return repeatLoops; }
+    public ModelHparamsBuilder repeatInputLayers(int v) { this.repeatInputLayers = v; return this; }
+    public int repeatInputLayers() { return repeatInputLayers; }
+    public ModelHparamsBuilder repeatRecurrentLayers(int v) { this.repeatRecurrentLayers = v; return this; }
+    public int repeatRecurrentLayers() { return repeatRecurrentLayers; }
+    public ModelHparamsBuilder repeatOutputLayers(int v) { this.repeatOutputLayers = v; return this; }
+    public int repeatOutputLayers() { return repeatOutputLayers; }
+    public ModelHparamsBuilder repeatJustNorm(boolean v) { this.repeatJustNorm = v; return this; }
+    public boolean repeatJustNorm() { return repeatJustNorm; }
+    public ModelHparamsBuilder repeatJustNormEps(float v) { this.repeatJustNormEps = v; return this; }
+    public float repeatJustNormEps() { return repeatJustNormEps; }
+    public ModelHparamsBuilder slerpAlphaScale(float v) { this.slerpAlphaScale = v; return this; }
+    public float slerpAlphaScale() { return slerpAlphaScale; }
+    public ModelHparamsBuilder repeatDualAttention(boolean v) { this.repeatDualAttention = v; return this; }
+    public boolean repeatDualAttention() { return repeatDualAttention; }
+    public ModelHparamsBuilder repeatLocalWindow(int v) { this.repeatLocalWindow = v; return this; }
+    public int repeatLocalWindow() { return repeatLocalWindow; }
+
     // ---- heads, encoders and pooling accessors ----
     public ModelHparamsBuilder pooling(PoolingKind v) { this.pooling = v; return this; }
     public PoolingKind pooling() { return pooling; }
@@ -667,14 +929,57 @@ public final class ModelHparamsBuilder implements Cloneable {
     public String[] classifierLabels() { return classifierLabels.clone(); }
     public ModelHparamsBuilder decisionLabels(String[] v) { this.decisionLabels = Objects.requireNonNull(v, "decisionLabels").clone(); return this; }
     public String[] decisionLabels() { return decisionLabels.clone(); }
+    public ModelHparamsBuilder decisionType(String v) { this.decisionType = v; return this; }
+    public String decisionType() { return decisionType; }
+    public ModelHparamsBuilder decisionMaxHeadTokens(int v) { this.decisionMaxHeadTokens = v; return this; }
+    public int decisionMaxHeadTokens() { return decisionMaxHeadTokens; }
+    public ModelHparamsBuilder decisionTemperatures(Map<String, Float> v) {
+        this.decisionTemperatures = v == null ? Collections.emptyMap()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(v));
+        return this;
+    }
+    public Map<String, Float> decisionTemperatures() { return decisionTemperatures; }
+    public ModelHparamsBuilder decisionScoreBias(Map<Integer, float[]> v) {
+        if (v == null) {
+            this.decisionScoreBias = Collections.emptyMap();
+            return this;
+        }
+        Map<Integer, float[]> copy = new LinkedHashMap<>();
+        for (Map.Entry<Integer, float[]> e : v.entrySet()) {
+            copy.put(e.getKey(), e.getValue().clone());
+        }
+        this.decisionScoreBias = Collections.unmodifiableMap(copy);
+        return this;
+    }
+    public Map<Integer, float[]> decisionScoreBias() { return decisionScoreBias; }
     public ModelHparamsBuilder decisionRoutingLayers(int v) { this.decisionRoutingLayers = v; return this; }
     public int decisionRoutingLayers() { return decisionRoutingLayers; }
     public ModelHparamsBuilder decisionJointLayers(int v) { this.decisionJointLayers = v; return this; }
     public int decisionJointLayers() { return decisionJointLayers; }
     public ModelHparamsBuilder decisionHeadCount(int v) { this.decisionHeadCount = v; return this; }
     public int decisionHeadCount() { return decisionHeadCount; }
+    public ModelHparamsBuilder classifierScope(ClassifierScope v) { this.classifierScope = v; return this; }
+    public ClassifierScope classifierScope() { return classifierScope; }
     public ModelHparamsBuilder classifierActivation(ActOp v) { this.classifierActivation = v; return this; }
     public ActOp classifierActivation() { return classifierActivation; }
+    public ModelHparamsBuilder poolerActivation(PoolerAct v) { this.poolerActivation = v; return this; }
+    public PoolerAct poolerActivation() { return poolerActivation; }
+    public ModelHparamsBuilder classifierTokenDirect(boolean v) { this.classifierTokenDirect = v; return this; }
+    public boolean classifierTokenDirect() { return classifierTokenDirect; }
+    public ModelHparamsBuilder classifierSparse(String v) { this.classifierSparse = v; return this; }
+    public String classifierSparse() { return classifierSparse; }
+    public ModelHparamsBuilder sparseClsToken(int v) { this.sparseClsToken = v; return this; }
+    public int sparseClsToken() { return sparseClsToken; }
+    public ModelHparamsBuilder sparseSepToken(int v) { this.sparseSepToken = v; return this; }
+    public int sparseSepToken() { return sparseSepToken; }
+    public ModelHparamsBuilder classifierBosToken(int v) { this.classifierBosToken = v; return this; }
+    public int classifierBosToken() { return classifierBosToken; }
+    public ModelHparamsBuilder classifierEosToken(int v) { this.classifierEosToken = v; return this; }
+    public int classifierEosToken() { return classifierEosToken; }
+    public ModelHparamsBuilder classifierStepTagId(int v) { this.classifierStepTagId = v; return this; }
+    public int classifierStepTagId() { return classifierStepTagId; }
+    public ModelHparamsBuilder poolingNormalize(boolean v) { this.poolingNormalize = v; return this; }
+    public boolean poolingNormalize() { return poolingNormalize; }
     public ModelHparamsBuilder hiddenActivation(String v) { this.hiddenActivation = v; return this; }
     public String hiddenActivation() { return hiddenActivation; }
     public ModelHparamsBuilder decStartTokenId(int v) { this.decStartTokenId = v; return this; }
@@ -759,6 +1064,11 @@ public final class ModelHparamsBuilder implements Cloneable {
     public ModelHparamsBuilder isSwa(int il, boolean v) { swaArr[layer(il)] = v; return this; }
     public boolean[] isSwaArray() { return swaArr.clone(); }
     public ModelHparamsBuilder isSwaArray(boolean[] v) { swaArr = layerArray("isSwa", v).clone(); return this; }
+    /** True when layer {@code il} is an MLP-only block (Dory's {@code layer_types} entry "mlp"). */
+    public boolean isMlp(int il) { return mlpArr[layer(il)]; }
+    public ModelHparamsBuilder isMlp(int il, boolean v) { mlpArr[layer(il)] = v; return this; }
+    public boolean[] isMlpArray() { return mlpArr.clone(); }
+    public ModelHparamsBuilder isMlpArray(boolean[] v) { mlpArr = layerArray("isMlp", v).clone(); return this; }
     public boolean ropeEnabled(int il) { return ropeArr[layer(il)]; }
     public ModelHparamsBuilder ropeEnabled(int il, boolean v) { ropeArr[layer(il)] = v; return this; }
     public boolean[] ropeEnabledArray() { return ropeArr.clone(); }
@@ -767,6 +1077,14 @@ public final class ModelHparamsBuilder implements Cloneable {
     public ModelHparamsBuilder isRecurrent(int il, boolean v) { recurrentArr[layer(il)] = v; return this; }
     public boolean[] isRecurrentArray() { return recurrentArr.clone(); }
     public ModelHparamsBuilder isRecurrentArray(boolean[] v) { recurrentArr = layerArray("isRecurrent", v).clone(); return this; }
+    public boolean isHybridLayer(int il) { return hybridArr[layer(il)]; }
+    public ModelHparamsBuilder isHybridLayer(int il, boolean v) { hybridArr[layer(il)] = v; return this; }
+    public boolean[] isHybridLayerArray() { return hybridArr.clone(); }
+    public ModelHparamsBuilder isHybridLayerArray(boolean[] v) { hybridArr = layerArray("isHybridLayer", v).clone(); return this; }
+    public int zamba2SharedBlock(int il) { return sharedBlockArr[layer(il)]; }
+    public ModelHparamsBuilder zamba2SharedBlock(int il, int v) { sharedBlockArr[layer(il)] = v; return this; }
+    public int[] zamba2SharedBlockArray() { return sharedBlockArr.clone(); }
+    public ModelHparamsBuilder zamba2SharedBlockArray(int[] v) { sharedBlockArr = layerArray("zamba2SharedBlock", v).clone(); return this; }
     public boolean isIndexerFull(int il) { return indexerFullArr[layer(il)]; }
     public ModelHparamsBuilder isIndexerFull(int il, boolean v) { indexerFullArr[layer(il)] = v; return this; }
     public boolean[] isIndexerFullArray() { return indexerFullArr.clone(); }
@@ -779,6 +1097,14 @@ public final class ModelHparamsBuilder implements Cloneable {
     public ModelHparamsBuilder compressRatio(int il, int v) { compressRatioArr[layer(il)] = v; return this; }
     public int[] compressRatioArray() { return compressRatioArr.clone(); }
     public ModelHparamsBuilder compressRatioArray(int[] v) { compressRatioArr = layerArray("compressRatio", v).clone(); return this; }
+    public int dsv41KvSource(int il) { return dsv41KvSourceArr[layer(il)]; }
+    public ModelHparamsBuilder dsv41KvSource(int il, int v) { dsv41KvSourceArr[layer(il)] = v; return this; }
+    public int[] dsv41KvSourceArray() { return dsv41KvSourceArr.clone(); }
+    public ModelHparamsBuilder dsv41KvSourceArray(int[] v) { dsv41KvSourceArr = layerArray("dsv41KvSource", v).clone(); return this; }
+    public int dsv41TopkSource(int il) { return dsv41TopkSourceArr[layer(il)]; }
+    public ModelHparamsBuilder dsv41TopkSource(int il, int v) { dsv41TopkSourceArr[layer(il)] = v; return this; }
+    public int[] dsv41TopkSourceArray() { return dsv41TopkSourceArr.clone(); }
+    public ModelHparamsBuilder dsv41TopkSourceArray(int[] v) { dsv41TopkSourceArr = layerArray("dsv41TopkSource", v).clone(); return this; }
     public int deepstackMapping(int il) { return deepstackMappingArr[layer(il)]; }
     public ModelHparamsBuilder deepstackMapping(int il, int v) { deepstackMappingArr[layer(il)] = v; return this; }
     public int[] deepstackMappingArray() { return deepstackMappingArr.clone(); }
@@ -815,11 +1141,18 @@ public final class ModelHparamsBuilder implements Cloneable {
         nFfExpArr = resize(keep ? nFfExpArr : null, n, 0);
         nExpertUsedArr = resize(keep ? nExpertUsedArr : null, n, 0);
         swaArr = resize(keep ? swaArr : null, n, false);
+        /* Without the per-layer windows the scalar nSwa applies; a zero array would silently disable every window. */
+        swaWindowArr = keep && swaWindowArr.length > 0 ? resize(swaWindowArr, n, 0) : new int[0];
+        mlpArr = resize(keep ? mlpArr : null, n, false);
         ropeArr = resize(keep ? ropeArr : null, n, true);
         recurrentArr = resize(keep ? recurrentArr : null, n, recurrentDefault);
+        hybridArr = resize(keep ? hybridArr : null, n, false);
+        sharedBlockArr = resize(keep ? sharedBlockArr : null, n, -1);
         indexerFullArr = resize(keep ? indexerFullArr : null, n, false);
         pleArr = resize(keep ? pleArr : null, n, false);
         compressRatioArr = resize(keep ? compressRatioArr : null, n, 0);
+        dsv41KvSourceArr = resize(keep ? dsv41KvSourceArr : null, n, -1);
+        dsv41TopkSourceArr = resize(keep ? dsv41TopkSourceArr : null, n, -1);
         deepstackMappingArr = resize(keep ? deepstackMappingArr : null, n, -1);
         xieluAlphaNArr = resize(keep ? xieluAlphaNArr : null, n, 0f);
         xieluAlphaPArr = resize(keep ? xieluAlphaPArr : null, n, 0f);
@@ -934,7 +1267,7 @@ public final class ModelHparamsBuilder implements Cloneable {
      * the bert-graph architectures only, {@code il % moeEveryN == 1} when set (bert.cpp:171); other
      * architectures reading {@code moe_every_n_layers} (k2-horizon) ignore it in their graph
      * (k2-horizon.cpp:67). KV owners follow the gemma3n/gemma4 reuse rule
-     * (llama-model.cpp:3222-3231): layers at or after {@code nLayerKvFromStart} read layer
+     * (gemma3n.cpp:10-13, gemma4.cpp:14-18): layers at or after {@code nLayerKvFromStart} read layer
      * {@code nLayerKvFromStart - (isSwa(il) ? 2 : 1)}.
      *
      * @throws IllegalStateException when the layer counts were never set
@@ -997,6 +1330,7 @@ public final class ModelHparamsBuilder implements Cloneable {
         c.pleLayerMultipliers = pleLayerMultipliers.clone();
         c.pleHeadOffsets = pleHeadOffsets.clone();
         c.pleHeadVocabSizes = pleHeadVocabSizes.clone();
+        c.engramTokenMap = engramTokenMap.clone();
         c.classifierLabels = classifierLabels.clone();
         c.decisionLabels = decisionLabels.clone();
         c.targetLayers = targetLayers.clone();
@@ -1008,11 +1342,17 @@ public final class ModelHparamsBuilder implements Cloneable {
         c.nFfExpArr = nFfExpArr.clone();
         c.nExpertUsedArr = nExpertUsedArr.clone();
         c.swaArr = swaArr.clone();
+        c.swaWindowArr = swaWindowArr.clone();
+        c.mlpArr = mlpArr.clone();
         c.ropeArr = ropeArr.clone();
         c.recurrentArr = recurrentArr.clone();
+        c.hybridArr = hybridArr.clone();
+        c.sharedBlockArr = sharedBlockArr.clone();
         c.indexerFullArr = indexerFullArr.clone();
         c.pleArr = pleArr.clone();
         c.compressRatioArr = compressRatioArr.clone();
+        c.dsv41KvSourceArr = dsv41KvSourceArr.clone();
+        c.dsv41TopkSourceArr = dsv41TopkSourceArr.clone();
         c.deepstackMappingArr = deepstackMappingArr.clone();
         c.xieluAlphaNArr = xieluAlphaNArr.clone();
         c.xieluAlphaPArr = xieluAlphaPArr.clone();

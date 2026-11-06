@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.spec.DsaSpec;
+import com.eonmux.neuralfree.gguf.spec.Dsv41Spec;
 import com.eonmux.neuralfree.gguf.spec.Dsv4Spec;
 import com.eonmux.neuralfree.gguf.spec.MsaSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
@@ -64,6 +65,17 @@ public final class SparseResolver {
                 boolean full = hp.isIndexerFull(il);
                 return indexer(full, sourceLayer(il, false), hp.ropeType(), ropeDims(), true, false).build();
             }
+            case MISTRAL_LARGE4: {
+                if (il >= hp.nLayer()) {
+                    return null;                                       // no NextN blocks
+                }
+                // the [rope | nope] head layout with the layer's own LeRoPE factors (mistral-large4.cpp:252-262),
+                // SSMax per-head query temperatures and indexer queries from the layer-normed input (:232-241)
+                return indexer(hp.isIndexerFull(il), sourceLayer(il, false), hp.ropeType(), ropeDims(), false, true)
+                        .ssmax(true)
+                        .indexerQueryNorm(true)
+                        .build();
+            }
             case GLM5_NEXT: {
                 if (hp.isRecurrent(il)) {
                     return null;
@@ -110,12 +122,15 @@ public final class SparseResolver {
     /**
      * DeepSeek-V4 attention of layer {@code il}, or null for other architectures: compress ratio 0 (sliding window
      * only), 4 (CSA with a lightning indexer) or 128 (HCA), grouped low-rank output and optional sinks.
+     * DeepSeek-V4.1 layers ({@code deepseek41}) additionally read the compressed rows and top-k of their source
+     * layers and may take part in the two-level candidate selection.
      */
     public Dsv4Spec dsv4(int il) {
         checkLayer(il);
-        if (hp.arch() != Arch.DEEPSEEK4) {
+        if (hp.arch() != Arch.DEEPSEEK4 && hp.arch() != Arch.DEEPSEEK41) {
             return null;
         }
+        boolean v41 = hp.arch() == Arch.DEEPSEEK41;
         int ratio = hp.compressRatio(il);
         int headDim = hp.headK(0);                             // deepseek4.cpp:897: n_embd_head_k()
         Dsv4Spec.Builder b = Dsv4Spec.builder()
@@ -130,7 +145,29 @@ public final class SparseResolver {
                 .compressRopeBase(hp.dsv4CompressRopeBase())
                 .sinks(tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_SINKS)))
                 .kqScale(1.0f / (float) Math.sqrt((float) headDim));
-        if (ratio == Dsv4Spec.RATIO_CSA) {
+        if (v41) {
+            if (ratio != 0) {
+                int kvSrc = hp.dsv41KvSource(il);
+                int topkSrc = hp.dsv41TopkSource(il);
+                int cand = hp.dsv41CandidateSourceLayer();
+                Dsv41Spec.Builder f = Dsv41Spec.builder(il)
+                        .kvSourceLayer(kvSrc)
+                        .topkSourceLayer(topkSrc)
+                        .indexer(hp.indexerNHead(), hp.indexerHeadSize(), hp.indexerTopK());
+                if (cand >= 0 && cand <= il) {
+                    f.candidate(cand, hp.dsv41CandidateTopKBlocks(), hp.dsv41CandidateBlockSize());
+                }
+                b.dsv41(f.build());
+                if (topkSrc == il) {
+                    b.indexer(indexer(true, il, hp.ropeType(), ropeDims(), true, false).build());
+                }
+            } else {
+                // a window-only layer owns no compressed rows and reuses no selection
+                b.dsv41(Dsv41Spec.builder(il)
+                        .indexer(hp.indexerNHead(), hp.indexerHeadSize(), hp.indexerTopK())
+                        .build());
+            }
+        } else if (ratio == Dsv4Spec.RATIO_CSA) {
             b.indexer(indexer(true, il, hp.ropeType(), ropeDims(), true, true).build());   // deepseek4.cpp:590-624
         }
         return b.build();

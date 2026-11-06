@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
+import com.eonmux.neuralfree.gguf.quant.TapProduct;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
@@ -80,6 +81,10 @@ public final class CpuRwkv6Mixer implements CpuMixer {
 
     private float[] shift;
     private float[] state;
+    /** Floats of one state slot and the slots the memory keeps ({@code RecurrentStateAccessor}). */
+    private int shiftRow;
+    private int stateRow;
+    private int stateSlots;
 
     private float[] xy;
     private float[] h;
@@ -188,6 +193,9 @@ public final class CpuRwkv6Mixer implements CpuMixer {
     private void bindWorking(RwkvBlocks.CpuKit kt, int c) {
         shift = kt.state(LayerMemoryPlan.STATE_SHIFT);
         state = kt.state(LayerMemoryPlan.STATE_SCAN);
+        shiftRow = kt.stateRow(LayerMemoryPlan.STATE_SHIFT);
+        stateRow = kt.stateRow(LayerMemoryPlan.STATE_SCAN);
+        stateSlots = kt.stateSlots();
         CpuWkv.checkRows("RWKV6 shift state", shift, 0, 1, c);
         CpuWkv.checkRows("RWKV6 WKV state", state, 0, nHead * headSize, headSize);
         xy = kt.temp("rwkv6.xy", c);
@@ -206,7 +214,7 @@ public final class CpuRwkv6Mixer implements CpuMixer {
 
     @Override
     public void decode(int pos, float[] in, float[] out) {
-        prefill(pos, 1, in, out);
+        forward(1, 0, 0, 0, in, out);
     }
 
     /**
@@ -218,21 +226,69 @@ public final class CpuRwkv6Mixer implements CpuMixer {
      */
     @Override
     public void prefill(int pos0, int n, float[] in, float[] out) {
+        forward(n, 0, 0, 0, in, out);
+    }
+
+    /**
+     * One batched step over the rows of {@code s}: one segment runs whole ({@link #forward} at its sequence's state
+     * rows), several segments run one at a time through a scratch relay, each with its own sequence's shift and WKV
+     * state rows.
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        if (s.nSeg() == 1) {
+            forward(s.nTokens(), 0, 0, s.seq(0), in, out);
+            return;
+        }
+        if (closed || kit == null) {
+            throw new IllegalStateException("RWKV6 time mix is " + (closed ? "closed" : "not bound"));
+        }
+        int c = nEmbd;
+        float[] buf = kit.temp(TEMP_SEGMENT, c);
+        float[] bufOut = kit.temp(TEMP_SEGMENT_OUT, c);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            int len = s.len(seg);
+            System.arraycopy(in, start * c, buf, 0, len * c);
+            forward(len, 0, 0, s.seq(seg), buf, bufOut);
+            System.arraycopy(bufOut, 0, out, start * c, len * c);
+        }
+    }
+
+    private static final String TEMP_SEGMENT = "rwkv6.segmentIn";
+    private static final String TEMP_SEGMENT_OUT = "rwkv6.segmentOut";
+
+    /** The state slot of {@code seq}, validated against the memory's slots. */
+    private int stateSlot(int seq) {
+        if (seq < 0 || seq >= stateSlots) {
+            throw new UnsupportedOperationException("RWKV6 time mix runs sequence " + seq + ", the memory keeps "
+                    + stateSlots + " state slots");
+        }
+        return seq;
+    }
+
+    private void forward(int n, int inOff, int outOff, int seq, float[] in, float[] out) {
         if (closed || kit == null) {
             throw new IllegalStateException("RWKV6 time mix is " + (closed ? "closed" : "not bound"));
         }
         int c = nEmbd;
         kit.checkStep(n, in, out, c);
+        int base = stateSlot(seq);
+        int sb = base * shiftRow;
+        int kb = base * stateRow;
         int plane = n * c;
-        CpuRwkvMix.tokenShiftLerp(n, c, 0, RwkvKernels.SHIFT_MODE_LERP_X, in, 0, shift, 0, lerpX, null, xy, 0);
+        CpuRwkvMix.tokenShiftLerp(n, c, 0, RwkvKernels.SHIFT_MODE_LERP_X, in, inOff, shift, sb, lerpX, null, xy, 0);
         mv.matmul(w1, xy, 0, h, 0, n);
         CpuOps.unary(ActOp.TANH, ActParams.NONE, h, 0, h, 0, n * N_MIX * extra);
-        for (int m = 0; m < N_MIX; m++) {
-            for (int t = 0; t < n; t++) {
-                mv.matvecRows(w2, (long) m * c, c, h, t * N_MIX * extra + m * extra, planes, m * plane + t * c);
+        try (TapProduct mix = TapProduct.dense(n)) {
+            for (int m = 0; m < N_MIX; m++) {
+                for (int t = 0; t < n; t++) {
+                    mv.matvecRows(w2, (long) m * c, c, h, t * N_MIX * extra + m * extra, planes, m * plane + t * c);
+                }
             }
         }
-        CpuRwkvMix.tokenShiftLerp(n, c, N_MIX, RwkvKernels.SHIFT_MODE_LORA, in, 0, shift, 0, null, lerps, planes, 0);
+        CpuRwkvMix.tokenShiftLerp(n, c, N_MIX, RwkvKernels.SHIFT_MODE_LORA, in, inOff, shift, sb, null, lerps,
+                planes, 0);
         project(wr, rDeltas, rBias, planes, PLANE_R * plane, r, n);
         project(wk, kDeltas, kBias, planes, PLANE_K * plane, kRaw, n);
         project(wv, vDeltas, vBias, planes, PLANE_V * plane, vRaw, n);
@@ -250,15 +306,15 @@ public final class CpuRwkv6Mixer implements CpuMixer {
             CpuOps.glu(GluOp.MUL, ActParams.NONE, k, 0, w, 0, wRaw, 0, plane);
             CpuOps.axpy(-1.0f, wRaw, 0, k, 0, plane);
             CpuWkv.gla(n, c, nHead, RwkvKernels.GLA_G_PER_CHANNEL, RwkvKernels.glaScale(headSize), k, 0, v, 0, r, 0,
-                    w, 0, state, 0, xy, 0);
+                    w, 0, state, kb, xy, 0);
         } else {
-            CpuWkv.wkv6(n, c, nHead, k, 0, v, 0, r, 0, first, w, 0, state, 0, xy, 0);
+            CpuWkv.wkv6(n, c, nHead, k, 0, v, 0, r, 0, first, w, 0, state, kb, xy, 0);
             NormMath.rowNorm(NormKind.LAYER, RwkvBlocks.GROUP_NORM_EPS, n * nHead, headSize, headSize, nHead, xy, 0,
                     ln, lnB, xy, 0);
         }
         CpuOps.glu(qrwkv ? GluOp.SIGMUL : GluOp.SWIGLU, ActParams.NONE, g, 0, xy, 0, xy, 0, plane);
-        mv.matmul(wo, xy, 0, out, 0, n);
-        oDeltas.applyRows(n, xy, 0, out, 0);
+        mv.matmul(wo, xy, 0, out, outOff, n);
+        oDeltas.applyRows(n, xy, 0, out, outOff);
     }
 
     /** {@code out[t] = W in[t] + deltas (+ b)} into rows from index 0 of {@code out}. */

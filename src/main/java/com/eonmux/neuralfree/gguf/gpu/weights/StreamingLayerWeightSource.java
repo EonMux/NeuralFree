@@ -95,6 +95,28 @@ public final class StreamingLayerWeightSource implements LayerWeightSource {
     }
 
     /**
+     * Opens a streaming source as {@link #open(ComputeBackend, ComputeQueue, GpuWeights, WeightStore, List,
+     * ModelSpec, List, EngineConfig, long)} does, with a host tier of {@code ramCacheBytes}: the share of the RAM
+     * cache one stage of a layer split takes when several stages stream.
+     *
+     * @param ramCacheBytes heap bytes of the host tier; 0 disables it
+     * @throws IllegalArgumentException as {@link #open(ComputeBackend, ComputeQueue, GpuWeights, WeightDataProvider,
+     *                                  ModelSpec, List, int)}, or for a negative {@code ramCacheBytes}
+     * @throws GpuOutOfMemoryException  when not even one slot fits the budget
+     */
+    public static StreamingLayerWeightSource open(ComputeBackend backend, ComputeQueue computeQueue,
+                                                  GpuWeights resident, WeightStore store,
+                                                  List<GGUFTensorInfo> tensors, ModelSpec spec,
+                                                  List<LayerWeightSet> sets, EngineConfig config,
+                                                  long streamingBudgetBytes, long ramCacheBytes) {
+        int depth = resolveDepth(config, streamingBudgetBytes, spec, sets);
+        int nWeightLayers = Index.of(spec, sets).setOfLayer.length;
+        WeightDataProvider data = new WeightDataProvider(store, tensors,
+                LayerWeightSet.namesByLayer(sets, nWeightLayers), config.vramDepth(), ramCacheBytes);
+        return open(backend, computeQueue, resident, data, spec, sets, depth);
+    }
+
+    /**
      * Opens a streaming source.
      *
      * @param backend      backend allocating the slots

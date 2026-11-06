@@ -16,11 +16,14 @@ import com.eonmux.neuralfree.gguf.hparams.MropeTextPositions;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.RotationPlan;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.ops.rope.CpuRope;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeFreqTable;
 import com.eonmux.neuralfree.gguf.ops.rope.RopePositions;
+import com.eonmux.neuralfree.gguf.quant.TapProduct;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
 import com.eonmux.neuralfree.gguf.spec.DsaSpec;
@@ -55,12 +58,18 @@ import java.util.Objects;
  * </pre>
  * The cached indexer rows are written whole with a zero pooled slot, as llama.cpp packs them; the STORE stage then
  * fills the pooled slot of each completed pool's last member. A shared-indexer layer reads the selection the
- * preceding full layer left in the scratch temporary {@link MsaBlocks#QSA_SELECTION}. Not thread-safe.
+ * preceding full layer left in the scratch temporary {@link MsaBlocks#QSA_SELECTION}. The token-wise stages and
+ * every cache store run over the whole step first; then each segment (one sequence's rows) pools, scores, selects
+ * and gathers over its own sequence's position &rarr; row map ({@link PositionRows}), the contiguous step being one
+ * segment over the un-ring cache, a paged step ({@link #batch}) one segment per sequence through its page table.
+ * Not thread-safe.
  */
 public final class CpuQsaMixer implements CpuMixer {
 
+    private CpuForwardContext ctx;
     private CpuMatVec mv;
     private CpuMemory memory;
+    private String where;
     private int ubatch;
     private float rmsEps;
     private float normEps;
@@ -75,7 +84,12 @@ public final class CpuQsaMixer implements CpuMixer {
     private KvAccessor kv;
     private KvLayout kvLayout;
     private int[] qPos;
-    private int[] kvPos;
+    /** Step-row positions and cells of the contiguous step (the paged step reads the POS slot and its cells). */
+    private int[] tokenPos;
+    private int[] tokenCells;
+    /** One sequence's position &rarr; row map ({@link PositionRows}) and the cells of its slots. */
+    private int[] rowOfPos;
+    private int[] slotCells;
     private int[] sel;
     private float[] att;
 
@@ -118,7 +132,6 @@ public final class CpuQsaMixer implements CpuMixer {
     private float[] w;
     private float[] pooled;
     private float[] scores;
-    private int[] idxPos;
     private int[] poolPos;
     private RopeSpec idxRope;
     private RopeFreqTable idxTable;
@@ -185,6 +198,8 @@ public final class CpuQsaMixer implements CpuMixer {
         if (!ctx.hasMemory()) {
             throw new IllegalStateException("QSA layer " + MsaBlocks.describe(layer) + " needs a KV cache");
         }
+        this.ctx = ctx;
+        where = "QSA layer " + MsaBlocks.describe(layer);
         mv = ctx.matVec();
         memory = ctx.memory();
         CpuScratch scratch = ctx.scratch();
@@ -222,7 +237,10 @@ public final class CpuQsaMixer implements CpuMixer {
         int ub = ubatch;
         sel = scratch.intTemp(MsaBlocks.QSA_SELECTION, MsaBlocks.selectionInts(ctx.spec(), ub));
         qPos = scratch.intTemp("qsa.q_pos", ub);
-        kvPos = scratch.intTemp("qsa.kv_pos", kvLayout.rows());
+        tokenPos = scratch.intTemp("qsa.token_pos", ub);
+        tokenCells = scratch.intTemp("qsa.token_cells", ub);
+        rowOfPos = scratch.intTemp("qsa.row_of_pos", posLimit);
+        slotCells = scratch.intTemp("qsa.slot_cells", posLimit);
         if (mla) {
             bindMla(ws, layer, scratch);
         } else {
@@ -339,6 +357,11 @@ public final class CpuQsaMixer implements CpuMixer {
         MsaBlocks.checkQsaIndexer(layer, dsa, plan, kvLayout);
         idxLayout = idxCache.layout();
         MsaBlocks.checkNoRing(layer, idxLayout, "indexer cache");
+        if (idxCache.group() != kv.group() || idxLayout.rows() != kvLayout.rows()) {
+            throw new IllegalStateException(where + ": the indexer cache (group " + idxCache.group() + ", "
+                    + idxLayout.rows() + " rows) must address the KV cache's rows (group " + kv.group() + ", "
+                    + kvLayout.rows() + " rows)");
+        }
         width = plan.width();
         gateOff = MsaKernels.kpoolGateOffset(dsa.kpoolRow(), idx);
         pooledOff = MsaKernels.kpoolPooledOffset(dsa.kpoolRow(), idx);
@@ -354,7 +377,6 @@ public final class CpuQsaMixer implements CpuMixer {
         pooled = scratch.temp(GpuQsaMixer.TEMP_POOLED, Math.multiplyExact(maxNew, idx));
         scores = scratch.temp(GpuQsaMixer.TEMP_SCORES,
                 Math.multiplyExact(ub, Math.max(1, MsaKernels.completePools(posLimit, kpool))));
-        idxPos = scratch.intTemp("qsa.idx_pos", idxLayout.rows());
         if (mode == MsaKernels.KPOOL_MODE_GATED) {
             wIq = MsaBlocks.cpuMatrix(ws, layer, TensorNames.INDEXER_ATTN_Q_B, qLora, (long) nIdxH * idx);
             wIk = MsaBlocks.cpuMatrix(ws, layer, TensorNames.INDEXER_ATTN_K, nEmbd, idx);
@@ -389,12 +411,15 @@ public final class CpuQsaMixer implements CpuMixer {
         run(pos0, n, in, out);
     }
 
-    private void run(int pos0, int n, float[] in, float[] out) {
-        if (!bound || closed) {
-            throw new IllegalStateException("QSA mixer is not bound or already closed");
-        }
+    /**
+     * The cache writes of a step: the latent (MLA) or K/V (GQA) projections with their norms and RoPE, the indexer's
+     * keys and completed pools, the KV rotations and the stores. The query path, the selection, the attention and the
+     * output projection do not run.
+     */
+    @Override
+    public void prefillKV(int pos0, int n, float[] in) {
+        checkBound();
         Objects.requireNonNull(in, "in");
-        Objects.requireNonNull(out, "out");
         if (n < 1 || n > ubatch) {
             throw new IllegalArgumentException("QSA step of " + n + " tokens is outside [1, " + ubatch + "]");
         }
@@ -402,15 +427,136 @@ public final class CpuQsaMixer implements CpuMixer {
             throw new IllegalArgumentException("QSA step at positions [" + pos0 + ", " + (pos0 + n) + ") exceeds the "
                     + posLimit + " cached positions");
         }
-        MsaBlocks.fillQueryPositions(pos0, n, qPos);
+        MsaBlocks.fillQueryPositions(pos0, n, tokenPos);
+        for (int t = 0; t < n; t++) {
+            tokenCells[t] = kvLayout.rowOf(pos0 + t);
+        }
+        StepLayout single = StepLayout.of(n, new int[]{0}, new int[]{0}, new int[]{n}, new int[]{pos0}, new int[0],
+                false);
         if (mla) {
-            runMla(pos0, n, in, out);
+            runMlaKV(single, tokenPos, tokenCells, n, in);
         } else {
-            runGqa(pos0, n, in, out);
+            runGqaKV(single, tokenPos, tokenCells, n, in);
         }
     }
 
-    private void runMla(int pos0, int n, float[] in, float[] out) {
+    @Override
+    public String kvRefusal() {
+        checkBound();
+        return null;
+    }
+
+    /** The latent cache writes: the latent projection, its norm, the indexer's keys and the latent store. */
+    private void runMlaKV(StepLayout s, int[] pos, int[] cells, int n, float[] in) {
+        mv.matmul(wKva, in, 0, kvl, 0, n);
+        kvaDeltas.applyRows(n, in, 0, kvl, 0);
+        CpuOps.norm(NormKind.RMS, rmsEps, kvl, 0, kvl, 0, n, kvLora, kvaNorm, null);
+        if (full) {
+            mv.matmul(wIk, in, 0, ik, 0, n);
+            ikDeltas.applyRows(n, in, 0, ik, 0);
+            CpuOps.norm(NormKind.LAYER, normEps, ik, 0, ik, 0, n, idx, ikNormW, ikNormB);
+            mv.matmul(wIg, in, 0, ig, 0, n);
+            igDeltas.applyRows(n, in, 0, ig, 0);
+            Arrays.fill(rows, 0, n * width, 0f);
+            for (int t = 0; t < n; t++) {
+                System.arraycopy(ik, t * idx, rows, t * width, idx);
+                System.arraycopy(ig, t * idx, rows, t * width + gateOff, idx);
+            }
+            storeIndexerRows(cells, n);
+            pool(segmentRows(s, null, 0), s.pos0(0), n);
+        }
+        MsaBlocks.cpuRotate(rotK, kvl, n, kvLora);
+        for (int t = 0; t < n; t++) {
+            kv.writeK(cells[t], kvl, t * kvLora);
+        }
+    }
+
+    /** The GQA cache writes: the indexer's keys, then K and V with their norm, RoPE, rotations and stores. */
+    private void runGqaKV(StepLayout s, int[] pos, int[] cells, int n, float[] in) {
+        if (full) {
+            mv.matmul(wIk, in, 0, ik, 0, n);
+            ikDeltas.applyRows(n, in, 0, ik, 0);
+            Arrays.fill(rows, 0, n * width, 0f);
+            for (int t = 0; t < n; t++) {
+                System.arraycopy(ik, t * idx, rows, t * width, idx);
+            }
+            storeIndexerRows(cells, n);
+            pool(segmentRows(s, null, 0), s.pos0(0), n);
+        }
+        mv.matmul(wK, in, 0, k, 0, n);
+        kDeltas.applyRows(n, in, 0, k, 0);
+        mv.matmul(wV, in, 0, v, 0, n);
+        vDeltas.applyRows(n, in, 0, v, 0);
+        CpuOps.norm(NormKind.RMS, rmsEps, k, 0, k, 0, n * nKv, hd, kNorm, null);
+        RopePositions.fill(rope.type(), rope.textPositions(), pos, 0, n, ropePos);
+        CpuRope.apply(ropeTable, k, 0, n, nKv, hd, kDim, rope.nOffs(), ropePos, 0, n);
+        MsaBlocks.cpuRotate(rotK, k, n, kDim);
+        MsaBlocks.cpuRotate(rotV, v, n, kDim);
+        for (int t = 0; t < n; t++) {
+            kv.writeK(cells[t], k, t * kDim);
+            kv.writeV(cells[t], v, t * kDim);
+        }
+    }
+
+    /**
+     * One step over the rows of {@code s}: the contiguous step when the memory runs no paged step, else the paged
+     * step through the memory's {@code CpuMemory.currentPagedStep}, every row stored at the step's cells and every
+     * segment pooling, selecting and gathering over its own sequence's cells only, so it computes the outputs its
+     * rows would compute run one sequence at a time. A non-causal step ({@code CpuForwardContext.stepNonCausal})
+     * scores every cached pool and sees every cached position of the sequence.
+     *
+     * @throws UnsupportedOperationException for a segment whose positions do not follow each other (the pools a step
+     *                                       completes are counted from consecutive positions)
+     */
+    @Override
+    public void batch(StepLayout s, float[] in, float[] out) {
+        checkBound();
+        PagedStep step = memory.currentPagedStep();
+        if (step == null) {
+            CpuMixer.super.batch(s, in, out);
+            return;
+        }
+        int n = s.nTokens();
+        checkStep(n, in, out);
+        int[] pos = ctx.scratch().ints(CpuScratch.POS);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            checkConsecutive(s, seg, pos);
+        }
+        int[] cells = step.cellIdx(kv.group());
+        if (mla) {
+            runMla(s, step, pos, cells, in, out);
+        } else {
+            runGqa(s, step, pos, cells, in, out);
+        }
+    }
+
+    @Override
+    public String batchRefusal() {
+        return "the QSA mixer mixes several sequences per step only over paged memory (a currentPagedStep)";
+    }
+
+    private void run(int pos0, int n, float[] in, float[] out) {
+        checkBound();
+        checkStep(n, in, out);
+        if (pos0 < 0 || pos0 + n > posLimit) {
+            throw new IllegalArgumentException("QSA step at positions [" + pos0 + ", " + (pos0 + n) + ") exceeds the "
+                    + posLimit + " cached positions");
+        }
+        MsaBlocks.fillQueryPositions(pos0, n, tokenPos);
+        for (int t = 0; t < n; t++) {
+            tokenCells[t] = kvLayout.rowOf(pos0 + t);
+        }
+        StepLayout single = StepLayout.of(n, new int[]{0}, new int[]{0}, new int[]{n}, new int[]{pos0}, new int[0],
+                false);
+        if (mla) {
+            runMla(single, null, tokenPos, tokenCells, in, out);
+        } else {
+            runGqa(single, null, tokenPos, tokenCells, in, out);
+        }
+    }
+
+    private void runMla(StepLayout s, PagedStep step, int[] pos, int[] cells, float[] in, float[] out) {
+        int n = s.nTokens();
         mv.matmul(wQa, in, 0, qr, 0, n);
         qaDeltas.applyRows(n, in, 0, qr, 0);
         CpuOps.norm(NormKind.RMS, rmsEps, qr, 0, qr, 0, n, qLora, qaNorm, null);
@@ -419,8 +565,10 @@ public final class CpuQsaMixer implements CpuMixer {
         mv.matmul(wKva, in, 0, kvl, 0, n);
         kvaDeltas.applyRows(n, in, 0, kvl, 0);
         CpuOps.norm(NormKind.RMS, rmsEps, kvl, 0, kvl, 0, n, kvLora, kvaNorm, null);
-        for (int s = 0; s < n * nHead; s++) {
-            mv.matvecExpert(wKb, s % nHead, nHead, qn, s * qkNope, qabs, s * kvLora);
+        try (TapProduct heads = TapProduct.dense(n)) {
+            for (int r = 0; r < n * nHead; r++) {
+                mv.matvecExpert(wKb, r % nHead, nHead, qn, r * qkNope, qabs, r * kvLora);
+            }
         }
         if (full) {
             mv.matmul(wIq, qr, 0, iq, 0, n);
@@ -435,29 +583,42 @@ public final class CpuQsaMixer implements CpuMixer {
                 System.arraycopy(ik, t * idx, rows, t * width, idx);
                 System.arraycopy(ig, t * idx, rows, t * width + gateOff, idx);
             }
-            storeIndexerRows(pos0, n);
-            pool(pos0, n);
+            storeIndexerRows(cells, n);
             mv.matmul(wProj, in, 0, w, 0, n);
             projDeltas.applyRows(n, in, 0, w, 0);
-            score(pos0, n, w);
         }
         MsaBlocks.cpuRotate(rotK, qabs, n, nHead * kvLora);
         MsaBlocks.cpuRotate(rotK, kvl, n, kvLora);
         for (int t = 0; t < n; t++) {
-            kv.writeK(kvLayout.rowOf(pos0 + t), kvl, t * kvLora);
+            kv.writeK(cells[t], kvl, t * kvLora);
         }
-        MsaBlocks.fillKvPos(memory, kv.group(), kvLayout, pos0 + n, kvPos);
-        CpuMsa.gatherAttn(n, nHead, 1, kvLora, kpool, selWidth, kqScale, 1, tail, kvLayout.rows(), qabs, 0,
-                nHead * kvLora, kv, kv, qPos, kvPos, sel, att, 0, nHead * kvLora);
+        int stride = nHead * kvLora;
+        boolean causal = !ctx.stepNonCausal();
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int t0 = s.tokStart(seg);
+            int len = s.len(seg);
+            PositionRows map = segmentRows(s, step, seg);
+            int nPos = s.pos0(seg) + len;
+            System.arraycopy(pos, t0, qPos, 0, len);
+            if (full) {
+                pool(map, s.pos0(seg), len);
+                score(map, t0, len, nPos, w, causal);
+            }
+            CpuMsa.gatherAttn(len, nHead, 1, kvLora, kpool, selWidth, kqScale, 1, tail, nPos, qabs, t0 * stride,
+                    stride, kv, kv, qPos, map, causal, sel, t0 * selWidth, att, t0 * stride, stride);
+        }
         MsaBlocks.cpuRotate(rotK, att, n, nHead * kvLora);
-        for (int s = 0; s < n * nHead; s++) {
-            mv.matvecExpert(wVb, s % nHead, nHead, att, s * kvLora, vout, s * headV);
+        try (TapProduct heads = TapProduct.dense(n)) {
+            for (int r = 0; r < n * nHead; r++) {
+                mv.matvecExpert(wVb, r % nHead, nHead, att, r * kvLora, vout, r * headV);
+            }
         }
         mv.matmul(wO, vout, 0, out, 0, n);
         oDeltas.applyRows(n, vout, 0, out, 0);
     }
 
-    private void runGqa(int pos0, int n, float[] in, float[] out) {
+    private void runGqa(StepLayout s, PagedStep step, int[] pos, int[] cells, float[] in, float[] out) {
+        int n = s.nTokens();
         if (full) {
             mv.matmul(wIk, in, 0, ik, 0, n);
             ikDeltas.applyRows(n, in, 0, ik, 0);
@@ -465,19 +626,17 @@ public final class CpuQsaMixer implements CpuMixer {
             for (int t = 0; t < n; t++) {
                 System.arraycopy(ik, t * idx, rows, t * width, idx);
             }
-            storeIndexerRows(pos0, n);
-            pool(pos0, n);
+            storeIndexerRows(cells, n);
             mv.matmul(wIq, in, 0, iq, 0, n);
             iqDeltas.applyRows(n, in, 0, iq, 0);
             CpuOps.norm(NormKind.RMS, rmsEps, iq, 0, iq, 0, n * nIdxH, idx, iqNorm, null);
-            RopePositions.fill(idxRope.type(), idxRope.textPositions(), pos0, n, ropePos);
+            RopePositions.fill(idxRope.type(), idxRope.textPositions(), pos, 0, n, ropePos);
             CpuRope.apply(idxTable, iq, 0, n, nIdxH, idx, nIdxH * idx, idxRope.nOffs(), ropePos, 0, n);
-            score(pos0, n, null);
         }
         mv.matmul(wQ, in, 0, qg, 0, n);
         qDeltas.applyRows(n, in, 0, qg, 0);
-        for (int s = 0; s < n * nHead; s++) {
-            System.arraycopy(qg, s * 2 * hd, q, s * hd, hd);
+        for (int r = 0; r < n * nHead; r++) {
+            System.arraycopy(qg, r * 2 * hd, q, r * hd, hd);
         }
         CpuOps.norm(NormKind.RMS, rmsEps, q, 0, q, 0, n * nHead, hd, qNorm, null);
         mv.matmul(wK, in, 0, k, 0, n);
@@ -485,46 +644,74 @@ public final class CpuQsaMixer implements CpuMixer {
         mv.matmul(wV, in, 0, v, 0, n);
         vDeltas.applyRows(n, in, 0, v, 0);
         CpuOps.norm(NormKind.RMS, rmsEps, k, 0, k, 0, n * nKv, hd, kNorm, null);
-        RopePositions.fill(rope.type(), rope.textPositions(), pos0, n, ropePos);
+        RopePositions.fill(rope.type(), rope.textPositions(), pos, 0, n, ropePos);
         CpuRope.apply(ropeTable, q, 0, n, nHead, hd, qDim, rope.nOffs(), ropePos, 0, n);
         CpuRope.apply(ropeTable, k, 0, n, nKv, hd, kDim, rope.nOffs(), ropePos, 0, n);
         MsaBlocks.cpuRotate(rotK, q, n, qDim);
         MsaBlocks.cpuRotate(rotK, k, n, kDim);
         MsaBlocks.cpuRotate(rotV, v, n, kDim);
         for (int t = 0; t < n; t++) {
-            int row = kvLayout.rowOf(pos0 + t);
-            kv.writeK(row, k, t * kDim);
-            kv.writeV(row, v, t * kDim);
+            kv.writeK(cells[t], k, t * kDim);
+            kv.writeV(cells[t], v, t * kDim);
         }
-        MsaBlocks.fillKvPos(memory, kv.group(), kvLayout, pos0 + n, kvPos);
-        CpuMsa.gatherAttn(n, nHead, nKv, hd, kpool, selWidth, kqScale, 1, tail, kvLayout.rows(), q, 0, qDim, kv, kv,
-                qPos, kvPos, sel, att, 0, qDim);
+        boolean causal = !ctx.stepNonCausal();
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int t0 = s.tokStart(seg);
+            int len = s.len(seg);
+            PositionRows map = segmentRows(s, step, seg);
+            int nPos = s.pos0(seg) + len;
+            System.arraycopy(pos, t0, qPos, 0, len);
+            if (full) {
+                pool(map, s.pos0(seg), len);
+                score(map, t0, len, nPos, null, causal);
+            }
+            CpuMsa.gatherAttn(len, nHead, nKv, hd, kpool, selWidth, kqScale, 1, tail, nPos, q, t0 * qDim, qDim, kv,
+                    kv, qPos, map, causal, sel, t0 * selWidth, att, t0 * qDim, qDim);
+        }
         MsaBlocks.cpuRotate(rotV, att, n, qDim);
         CpuOps.gluRows(GluOp.SIGMUL, ActParams.NONE, n * nHead, hd, qg, hd, 2 * hd, att, 0, hd, att, 0, hd);
         mv.matmul(wO, att, 0, out, 0, n);
         oDeltas.applyRows(n, att, 0, out, 0);
     }
 
-    private void storeIndexerRows(int pos0, int n) {
+    /**
+     * The position &rarr; row map of segment {@code seg}: the un-ring cache's rows on the contiguous step, the
+     * segment's sequence's cells on a paged one; it spans the positions up to the segment's last.
+     */
+    private PositionRows segmentRows(StepLayout s, PagedStep step, int seg) {
+        int nPos = s.pos0(seg) + s.len(seg);
+        if (step == null) {
+            MsaBlocks.fillContiguousRows(memory, kv.group(), kvLayout, nPos, rowOfPos);
+            return PositionRows.of(rowOfPos, nPos);
+        }
+        int held = MsaBlocks.fillSequenceRows(memory, kv.group(), step, s.seq(seg), slotCells, rowOfPos, where);
+        if (held != nPos) {
+            throw new IllegalStateException(where + ": sequence " + s.seq(seg) + " holds positions up to "
+                    + (held - 1) + " but the step ends at " + (nPos - 1));
+        }
+        return PositionRows.of(rowOfPos, nPos);
+    }
+
+    private void storeIndexerRows(int[] cells, int n) {
         for (int t = 0; t < n; t++) {
-            idxCache.writeK(idxLayout.rowOf(pos0 + t), rows, t * width);
+            idxCache.writeK(cells[t], rows, t * width);
         }
     }
 
-    /** Pools, normalizes and ropes (mean mode) and stores the pools the step completes. */
-    private void pool(int pos0, int n) {
+    /** Pools, normalizes and ropes (mean mode) and stores the pools a segment at {@code pos0 ..} completes. */
+    private void pool(PositionRows map, int pos0, int n) {
         int nNew = MsaKernels.newPoolCount(pos0, n, kpool);
         if (nNew == 0) {
             return;
         }
         int first = MsaKernels.firstNewPool(pos0, kpool);
-        CpuQsa.kpoolPool(nNew, first, mode, kpool, idx, gateOff, idxLayout.rows(), ape, idxCache, pooled);
+        CpuQsa.kpoolPool(nNew, first, mode, kpool, idx, gateOff, map, ape, idxCache, pooled);
         if (mode == MsaKernels.KPOOL_MODE_MEAN) {
             CpuOps.norm(NormKind.RMS, rmsEps, pooled, 0, pooled, 0, nNew, idx, ikNormW, null);
             fillPoolPositions(first, nNew);
             CpuRope.apply(idxTable, pooled, 0, nNew, 1, idx, idx, idxRope.nOffs(), poolPos, 0, nNew);
         }
-        CpuQsa.kpoolStore(nNew, first, kpool, idx, pooledOff, idxLayout.rows(), pooled, idxCache);
+        CpuQsa.kpoolStore(nNew, first, kpool, idx, pooledOff, map, pooled, idxCache);
     }
 
     /** {@link GpuQsaMixer}'s pool positions: {@code [p, y(p), x(p), p]} of each new pool's first member. */
@@ -538,20 +725,52 @@ public final class CpuQsaMixer implements CpuMixer {
         }
     }
 
-    /** Scores the complete pools and selects {@code K} per token; -1 everywhere when no pool is complete yet. */
-    private void score(int pos0, int n, float[] weights) {
+    /**
+     * Scores the complete pools of a segment's sequence and selects {@code K} per token of the rows
+     * {@code [t0, t0 + n)} into the selection at {@code t0 * selWidth}; -1 there when no pool is complete yet.
+     */
+    private void score(PositionRows map, int t0, int n, int nPos, float[] weights, boolean causal) {
         if (selWidth == 0) {
             return;
         }
-        int nPool = MsaKernels.completePools(pos0 + n, kpool);
+        int nPool = MsaKernels.completePools(nPos, kpool);
         if (nPool == 0) {
-            Arrays.fill(sel, 0, n * selWidth, -1);
+            Arrays.fill(sel, t0 * selWidth, (t0 + n) * selWidth, -1);
             return;
         }
-        MsaBlocks.fillKvPos(memory, idxCache.group(), idxLayout, pos0 + n, idxPos);
-        CpuQsa.kpoolScore(n, nPool, nIdxH, idx, kpool, pooledOff, idxLayout.rows(), wScale, iq, 0, weights, 0,
-                idxCache, qPos, idxPos, scores);
-        CpuTopK.topKRows(scores, 0, n, nPool, selWidth, sel, 0);
+        CpuQsa.kpoolScore(n, nPool, nIdxH, idx, kpool, pooledOff, wScale, iq, t0 * nIdxH * idx, weights,
+                t0 * nIdxH, idxCache, qPos, map, causal, scores);
+        CpuTopK.topKRows(scores, 0, n, nPool, selWidth, sel, t0 * selWidth);
+    }
+
+    /**
+     * The pools a segment completes are counted from consecutive positions {@code pos0, pos0 + 1, ..}.
+     *
+     * @throws UnsupportedOperationException when the segment's rows share or skip positions
+     */
+    private void checkConsecutive(StepLayout s, int seg, int[] pos) {
+        int t0 = s.tokStart(seg);
+        for (int t = 0; t < s.len(seg); t++) {
+            if (pos[t0 + t] != s.pos0(seg) + t) {
+                throw new UnsupportedOperationException(where + ": row " + (t0 + t) + " of sequence " + s.seq(seg)
+                        + " is at position " + pos[t0 + t] + ", not " + (s.pos0(seg) + t) + "; the k-pool selection"
+                        + " pools consecutive positions (a media chunk sharing positions is refused)");
+            }
+        }
+    }
+
+    private void checkBound() {
+        if (!bound || closed) {
+            throw new IllegalStateException("QSA mixer is not bound or already closed");
+        }
+    }
+
+    private void checkStep(int n, float[] in, float[] out) {
+        Objects.requireNonNull(in, "in");
+        Objects.requireNonNull(out, "out");
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("QSA step of " + n + " tokens is outside [1, " + ubatch + "]");
+        }
     }
 
     @Override

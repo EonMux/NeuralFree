@@ -2,7 +2,10 @@ package com.eonmux.neuralfree.gguf.quant;
 
 import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 
@@ -23,6 +26,24 @@ public final class FpBlockDecoders {
     private FpBlockDecoders() {
     }
 
+    private static final VarHandle LE_SHORTS =
+            MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle LE_INTS =
+            MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle LE_LONGS =
+            MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+
+    /** Value of every E4M3FN code, from {@link #e4m3ToFp32(int)}; read only after the class initializes. */
+    private static final float[] E4M3FN_TABLE = buildE4m3Table();
+
+    private static float[] buildE4m3Table() {
+        float[] t = new float[256];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = e4m3ToFp32(i);
+        }
+        return t;
+    }
+
     // ------------------------------------------------------------------ scalar conversions
 
     /**
@@ -36,6 +57,31 @@ public final class FpBlockDecoders {
     /** Reads the little-endian half at absolute index {@code i} of a little-endian buffer and widens it. */
     public static float fp16At(ByteBuffer le, int i) {
         return Fp16Table.TABLE[le.getShort(i) & 0xFFFF];
+    }
+
+    /** Reads the little-endian half at index {@code i} of a little-endian byte array and widens it. */
+    public static float fp16At(byte[] le, int i) {
+        return Fp16Table.TABLE[shortAt(le, i) & 0xFFFF];
+    }
+
+    /** The little-endian 16-bit value at index {@code i} of {@code a}. */
+    public static short shortAt(byte[] a, int i) {
+        return (short) LE_SHORTS.get(a, i);
+    }
+
+    /** The little-endian 32-bit value at index {@code i} of {@code a}. */
+    public static int intAt(byte[] a, int i) {
+        return (int) LE_INTS.get(a, i);
+    }
+
+    /** The little-endian 64-bit value at index {@code i} of {@code a}. */
+    public static long longAt(byte[] a, int i) {
+        return (long) LE_LONGS.get(a, i);
+    }
+
+    /** The little-endian float at index {@code i} of {@code a}. */
+    public static float floatAt(byte[] a, int i) {
+        return Float.intBitsToFloat(intAt(a, i));
     }
 
     /** Direct computation behind {@link #fp16ToFp32(int)} (llama.cpp ggml-impl.h:396-417). */
@@ -273,6 +319,17 @@ public final class FpBlockDecoders {
     static void decodeI64(ByteBuffer b, int off, float[] y, int yOff, int n) {
         for (int i = 0; i < n; i++) {
             y[yOff + i] = (float) b.getLong(off + 8 * i);
+        }
+    }
+
+    /**
+     * F8_E4M3FN: one E4M3FN code per element ({@code dequantize_row_f8_e4m3}, llama.cpp ggml.c), served from a
+     * 256-entry table of {@link #e4m3ToFp32(int)}; codes {@code 0x7F} / {@code 0xFF} decode to NaN.
+     */
+    static void decodeF8E4m3fn(ByteBuffer b, int off, float[] y, int yOff, int n) {
+        final float[] lut = E4M3FN_TABLE;
+        for (int i = 0; i < n; i++) {
+            y[yOff + i] = lut[b.get(off + i) & 0xFF];
         }
     }
 

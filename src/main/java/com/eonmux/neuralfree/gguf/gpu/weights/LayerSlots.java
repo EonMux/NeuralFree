@@ -103,7 +103,8 @@ final class LayerSlots implements AutoCloseable {
 
     private LayerSlots(ComputeQueue computeQueue, ComputeQueue transferQueue, WeightDataProvider data,
                        List<LayerWeightSet> sets, int[] slotOf,
-                       GpuBuffer[][] pools, Plan plan, Map<String, GpuBuffer> perms, List<GpuBuffer> permBuffers) {
+                       GpuBuffer[][] pools, Plan plan, Map<String, GpuBuffer> perms,
+                       Map<String, GpuBuffer> preScales, List<GpuBuffer> permBuffers) {
         this.computeQueue = computeQueue;
         this.transferQueue = transferQueue;
         this.sameQueue = transferQueue == computeQueue;
@@ -138,7 +139,8 @@ final class LayerSlots implements AutoCloseable {
                 GpuWeight w = GpuWeight.sharded(e.name(), e.uploadType(), e.ne(), bufs, e.shardRowCounts());
                 if (e.inputTransform() != null) {
                     w = w.withInputTransform(e.inputTransform(), e.inputPerm() == null ? null
-                            : perms.get(i + ":" + e.name()));
+                            : perms.get(i + ":" + e.name()), e.inputPreScale() == null ? null
+                            : preScales.get(i + ":" + e.name()));
                 } else if (e.hadamard() != null) {
                     w = w.withHadamard(e.hadamard());
                 }
@@ -201,6 +203,7 @@ final class LayerSlots implements AutoCloseable {
         GpuBuffer[][] pools = new GpuBuffer[slotCount][];
         List<GpuBuffer> permBuffers = new ArrayList<>();
         Map<String, GpuBuffer> perms = new HashMap<>();
+        Map<String, GpuBuffer> preScales = new HashMap<>();
         try {
             for (int s = 0; s < slotCount; s++) {
                 pools[s] = new GpuBuffer[plan.poolBytes[s].length];
@@ -220,11 +223,16 @@ final class LayerSlots implements AutoCloseable {
                         perms.put(i + ":" + e.name(), b);
                         permBuffers.add(b);
                     }
+                    if (e.inputTransform() != null && e.inputTransform().hasPreScale()) {
+                        GpuBuffer b = uploadPreScale(backend, computeQueue, data, e);
+                        preScales.put(i + ":" + e.name(), b);
+                        permBuffers.add(b);
+                    }
                 }
             }
             computeQueue.finish();
             LayerSlots slots = new LayerSlots(computeQueue, transfer, data, setList, slotOf, pools, plan, perms,
-                    permBuffers);
+                    preScales, permBuffers);
             LOGGER.info(
                     "Layer weight streaming: {} layers in {} slots, {} MB on the device, async={}",
                     setList.size(), slotCount, plan.totalBytes() / (1024 * 1024), transfer != computeQueue);
@@ -324,7 +332,7 @@ final class LayerSlots implements AutoCloseable {
      * @throws UncheckedIOException  when the scale cannot be read
      * @throws IllegalStateException when the scale is not finite
      */
-    private static float readScale(WeightDataProvider data, Entry e) {
+    static float readScale(WeightDataProvider data, Entry e) {
         String name = e.scale().name();
         int bytes = Math.toIntExact(e.scale().sizeInBytes());
         ByteBuffer buf = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
@@ -360,6 +368,35 @@ final class LayerSlots implements AutoCloseable {
             data.readRange(name, 0, bytes, buf);
         } catch (IOException ex) {
             throw new UncheckedIOException("cannot read input permutation " + name + ": " + ex.getMessage(), ex);
+        }
+        GpuBuffer b = backend.allocateBuffer(bytes);
+        GpuEvent evt = queue.enqueueWriteBuffer(b, 0, bytes, buf.array());
+        if (evt != null) {
+            evt.close();
+        }
+        return b;
+    }
+
+    /**
+     * The device float buffer of a streamed weight's {@code <base>.input_pre_scale} tensor: the values read whole from
+     * the host tier and written once on the compute queue, which the caller finishes before the weights read them.
+     *
+     * @throws UncheckedIOException when the tensor cannot be read
+     */
+    private static GpuBuffer uploadPreScale(ComputeBackend backend, ComputeQueue queue, WeightDataProvider data,
+                                            Entry e) {
+        String name = e.inputPreScale().name();
+        long floats = e.inputPreScale().numElements();
+        if (floats <= 0 || floats > Integer.MAX_VALUE / Float.BYTES) {
+            throw new IllegalStateException("activation pre-scale " + name + " holds " + floats
+                    + " values, outside the float array range");
+        }
+        int bytes = (int) (floats * Float.BYTES);
+        ByteBuffer buf = ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        try {
+            data.readRange(name, 0, bytes, buf);
+        } catch (IOException ex) {
+            throw new UncheckedIOException("cannot read activation pre-scale " + name + ": " + ex.getMessage(), ex);
         }
         GpuBuffer b = backend.allocateBuffer(bytes);
         GpuEvent evt = queue.enqueueWriteBuffer(b, 0, bytes, buf.array());

@@ -60,13 +60,69 @@ public final class CpuQuantizedKvRotation {
         return new CpuQuantizedKvRotation(hk, hv, qWidth, kWidth, vWidth, outWidth);
     }
 
+    /**
+     * The store half alone, for a write that runs no attention: K in blocks of {@code plan.nRotK()} and V in blocks
+     * of {@code plan.nRotV()}, with no Q rotation and no output step.
+     *
+     * @param kWidth K row width, or 0 when the write stores no K
+     * @param vWidth V row width, or 0 when the write stores no V
+     * @throws IllegalArgumentException when a width is not a multiple of its block
+     */
+    public static CpuQuantizedKvRotation forStore(RotationPlan plan, int kWidth, int vWidth) {
+        Objects.requireNonNull(plan, "plan");
+        if (!plan.rotateK() && !plan.rotateV()) {
+            return null;
+        }
+        HadamardSpec hk = plan.rotateK() ? HadamardSpec.rotation(plan.nRotK()) : null;
+        HadamardSpec hv = plan.rotateV() ? HadamardSpec.rotation(plan.nRotV()) : null;
+        if (hk != null && kWidth > 0) {
+            hk.checkWidth(kWidth);
+        }
+        if (hv != null && vWidth > 0) {
+            hv.checkWidth(vWidth);
+        }
+        return new CpuQuantizedKvRotation(hk, hv, 0, kWidth, vWidth, 0);
+    }
+
     /** Rotates Q, and K and V when the layer stores them ({@code kv != null}), for {@code nTokens} rows. */
     public void beforeStore(int nTokens, float[] q, float[] kRows, float[] vRows) {
+        beforeStorePlanes(nTokens, q, 1, 0, kRows, vRows);
+    }
+
+    /**
+     * Rotates the query planes of a multi-plane query buffer, and K and V when the layer stores them, for
+     * {@code nTokens} rows: dual-chunk attention keeps its five query rotations {@code planeStride} floats apart and
+     * every plane has to be rotated like the keys it is scored against.
+     *
+     * @param planes      query planes to rotate
+     * @param planeStride floats between consecutive planes
+     * @throws IllegalArgumentException when the plane stride is negative or the buffer is too short
+     */
+    public void beforeStorePlanes(int nTokens, float[] q, int planes, int planeStride, float[] kRows,
+                                  float[] vRows) {
+        if (planes < 0 || planeStride < 0) {
+            throw new IllegalArgumentException("rotation needs planes >= 0 and a non-negative plane stride, got "
+                    + planes + " / " + planeStride);
+        }
         if (k != null) {
-            CpuHadamard.applyInPlace(k, q, 0, nTokens, qWidth);
+            for (int plane = 0; plane < planes; plane++) {
+                CpuHadamard.applyInPlace(k, q, plane * planeStride, nTokens, qWidth);
+            }
             if (kRows != null && kWidth > 0) {
                 CpuHadamard.applyInPlace(k, kRows, 0, nTokens, kWidth);
             }
+        }
+        if (v != null && vRows != null && vWidth > 0) {
+            CpuHadamard.applyInPlace(v, vRows, 0, nTokens, vWidth);
+        }
+    }
+
+    /**
+     * Rotates the stored K and V rows alone for {@code nTokens} rows, for a write that runs no query or attention.
+     */
+    public void beforeStoreKV(int nTokens, float[] kRows, float[] vRows) {
+        if (k != null && kRows != null && kWidth > 0) {
+            CpuHadamard.applyInPlace(k, kRows, 0, nTokens, kWidth);
         }
         if (v != null && vRows != null && vWidth > 0) {
             CpuHadamard.applyInPlace(v, vRows, 0, nTokens, vWidth);

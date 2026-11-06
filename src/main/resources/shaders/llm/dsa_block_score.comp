@@ -1,0 +1,48 @@
+/* dsa_block_score.comp - LLM_DSA_BlockScore: level one of the DeepSeek-V4.1 two-level candidate selection.
+ * GLSL twin of kernels/llm/sparse/dsa.cl (which documents the block score). Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_kv, i block_size, i ratio, R int q_pos, R scores, W block_scores)
+ * block_scores[t * n_blk + b] is the maximum row score of block b; the block holding the newest visible row gets
+ * +1e30. n_blk = ceil(n_kv / block_size).
+ *
+ * Dispatch: 1-D, global = n_tokens * n_blk, any local size.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(push_constant) uniform NfDsaBlockScoreParams {
+    int n_tokens;
+    int n_kv;
+    int block_size;
+    int ratio;
+} pc;
+
+layout(std430, binding = 0) readonly buffer NfDsaBlockQPos    { int q_pos[]; };
+layout(std430, binding = 1) readonly buffer NfDsaBlockScores  { float scores[]; };
+layout(std430, binding = 2) writeonly buffer NfDsaBlockOut    { float block_scores[]; };
+
+void main() {
+    const int n_blk = (pc.n_kv + pc.block_size - 1) / pc.block_size;
+    const uint gid = nf_global_id();
+    if (gid >= uint(pc.n_tokens) * uint(n_blk)) {
+        return;
+    }
+    const int t = int(gid) / n_blk;
+    const int b = int(gid) - t * n_blk;
+    const int lo = b * pc.block_size;
+    const int hi = min(pc.n_kv, lo + pc.block_size);
+    const uint row = uint(t) * uint(pc.n_kv);
+    float m = -NF_INF;
+    for (int r = lo; r < hi; ++r) {
+        m = max(m, scores[row + uint(r)]);
+    }
+    const int p = q_pos[t];
+    const int n_vis = p < 0 ? 0 : (p + 1) / pc.ratio;
+    if (n_vis > 0 && b == (n_vis - 1) / pc.block_size) {
+        m += 1e30;
+    }
+    block_scores[gid] = m;
+}

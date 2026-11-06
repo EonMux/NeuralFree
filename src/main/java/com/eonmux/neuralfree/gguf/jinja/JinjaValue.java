@@ -503,7 +503,8 @@ public final class JinjaValue {
                     if (b == 0) throw new JinjaRuntime.TemplateException("integer modulo by zero");
                     return Math.floorMod(a, b);
                 case "**":
-                    return b >= 0 ? intPow(a, b) : Math.pow(a, b);
+                    if (b >= 0) return intPow(a, b); // a ternary would widen the long to Math.pow's double
+                    return Math.pow(a, b);
                 default:
                     break;
             }

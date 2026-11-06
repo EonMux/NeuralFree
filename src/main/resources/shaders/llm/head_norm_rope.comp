@@ -1,0 +1,49 @@
+/* head_norm_rope.comp - LLM_HeadRmsNormRope: the code predictor's per-head RMS norm followed by NEOX RoPE at one
+ * step position. GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n_heads, i head_dim, i pos, f theta_scale, f eps, R x, R w, W y).
+ *   half = head_dim/2, s = 1/sqrt(mean(x^2 over the head) + eps), a = x*s*w,
+ *   angle = pos * theta_scale^i,
+ *   y[i] = a[i]*cos(angle) - a[i+half]*sin(angle), y[i+half] = a[i]*sin(angle) + a[i+half]*cos(angle).
+ * Dispatch: 1-D, one invocation per (head, pair), global = roundUp(n_heads*half, L), local = {L, 1, 1}.
+ * x and y must not overlap (the mean is read by every pair of a head).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfHnrX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfHnrW { float w_in[]; };
+layout(std430, binding = 2) writeonly buffer NfHnrY { float y_out[]; };
+
+layout(push_constant) uniform NfHnrParams {
+    int n_heads;
+    int head_dim;
+    int pos;
+    float theta_scale;
+    float eps;
+} pc;
+
+void main() {
+    const uint d_half = uint(pc.head_dim / 2);
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.n_heads) * d_half) {
+        return;
+    }
+    const uint h = idx / d_half;
+    const uint i = idx - h * d_half;
+    const uint base = h * uint(pc.head_dim);
+    float sum = 0.0;
+    for (int d = 0; d < pc.head_dim; ++d) {
+        sum += x_in[base + uint(d)] * x_in[base + uint(d)];
+    }
+    const float scale = 1.0 / sqrt(sum / float(pc.head_dim) + pc.eps);
+    const float x0 = x_in[base + i] * scale * w_in[i];
+    const float x1 = x_in[base + i + d_half] * scale * w_in[i + d_half];
+    const float angle = float(pc.pos) * pow(pc.theta_scale, float(i));
+    const float cs = cos(angle);
+    const float sn = sin(angle);
+    y_out[base + i] = x0 * cs - x1 * sn;
+    y_out[base + i + d_half] = x0 * sn + x1 * cs;
+}

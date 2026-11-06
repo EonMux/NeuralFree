@@ -33,7 +33,7 @@ public final class LayerMemoryPlan {
     }
 
     /**
-     * Addressing declaration of one plan buffer (the row-part rule T-8): a KV group's cell index, a recurrent slot,
+     * Addressing declaration of one plan buffer (the row-part rule): a KV group's cell index, a recurrent slot,
      * or neither. {@code RowParts} (the paged package) derives every group's row parts from these declarations plus
      * {@link KvDType#sidePlanes()}, never from a hand list.
      */
@@ -68,7 +68,20 @@ public final class LayerMemoryPlan {
         /** {@code [att_shift(n_embd) | ffn_shift(n_embd)]}, the second half only with two shift slots (RWKV). */
         TOKEN_SHIFT,
         /** qwen4exp PLE convolution history: {@code (ple_conv_kernel - 1) * ple_ngram_size * hc_mult * n_embd}. */
-        PLE_CONV
+        PLE_CONV,
+        /** Step5 region summaries: {@code [region][proxy]} FP8-rounded values kept in F32. */
+        STEP5_SUMMARY,
+        /** Step5 decode ring: {@code [row][key | z]}, {@code 2 * proxy} BF16-rounded values kept in F32. */
+        STEP5_RING;
+
+        /**
+         * Whether this state is a pure function of the positions stored so far, so that dropping trailing positions
+         * needs no state change: a summary is rewritten when its region closes again, and ring rows are rewritten by
+         * the positions they hold. Only the Step5 state, whose rows are re-evaluated after a drop, is positional.
+         */
+        public boolean positional() {
+            return this == STEP5_SUMMARY || this == STEP5_RING;
+        }
     }
 
     /**
@@ -122,7 +135,7 @@ public final class LayerMemoryPlan {
         public int slots() { return slots; }
         public long bytes() { return floats * slots * Float.BYTES; }
 
-        /** Addressing declaration (T-8): a recurrent slot per tensor. */
+        /** Addressing declaration: a recurrent slot per tensor. */
         public Addressing addressing() { return Addressing.SLOT; }
 
         @Override
@@ -137,6 +150,10 @@ public final class LayerMemoryPlan {
     public static final String STATE_SCAN = "state";
     public static final String STATE_SHIFT = "shift";
     public static final String STATE_PLE_CONV = "ple_conv";
+    /** Step5 region-summary tensor of a full-attention layer. */
+    public static final String STATE_STEP5_SUMMARY = "step5.summary";
+    /** Step5 open-region ring of a full-attention layer. */
+    public static final String STATE_STEP5_RING = "step5.ring";
 
     /**
      * The recurrent state tensors of a recurrent mixer: the "r" tensor ({@link #STATE_CONV}, or
@@ -162,6 +179,9 @@ public final class LayerMemoryPlan {
                 out.add(StateTensor.of(STATE_CONV, StateLayout.CONV, r));
                 break;
             case SHORTCONV_CENTERED:
+                break;
+            case INKLING:
+                out.add(StateTensor.of(STATE_CONV, StateLayout.CONV, r));
                 break;
             case LIGHTNING:
                 out.add(StateTensor.of(STATE_SCAN, StateLayout.LIGHTNING, spec.stateFloats()));
@@ -254,7 +274,7 @@ public final class LayerMemoryPlan {
         /** Hadamard rotation of indexer q/k. */
         public RotationPlan rotation() { return rotation; }
         public long bytes() { return rows * dtype.rowBytes(width); }
-        /** Addressing declaration (T-8): a KV group's cell index. */
+        /** Addressing declaration: a KV group's cell index. */
         public Addressing addressing() { return Addressing.CELL; }
 
         @Override
@@ -289,7 +309,7 @@ public final class LayerMemoryPlan {
         public int width() { return width; }
         public KvDType dtype() { return dtype; }
         public long bytes() { return rows * dtype.rowBytes(width); }
-        /** Addressing declaration (T-8): a KV group's cell index. */
+        /** Addressing declaration: a KV group's cell index. */
         public Addressing addressing() { return Addressing.CELL; }
 
         @Override
@@ -309,8 +329,14 @@ public final class LayerMemoryPlan {
      *   <li>CSA: ratio 4, width {@code head_k}, state {@code 8 x 2 * head_k};</li>
      *   <li>HCA: ratio 128, width {@code head_k}, state {@code 128 x head_k};</li>
      *   <li>INDEXER (lightning indexer of CSA layers): ratio 4, width {@code indexer_head_size}, state
-     *       {@code 8 x 2 * indexer_head_size}.</li>
+     *       {@code 8 x 2 * indexer_head_size};</li>
+     *   <li>DeepSeek-V4.1 CSA (ratio 2) / HCA (ratio 1): rows of {@code head_k + indexer_head_size} values (the
+     *       index key is stored beside the compressed KV), state {@code ratio x head_k} without overlap.</li>
      * </ul>
+     * A paged plan keeps {@link #streams()} of them, one per sequence (llama.cpp's DSV4 streams,
+     * llama-kv-cache-dsv4.cpp:51-60): each stream is sized for one sequence's context and the compressor of a
+     * sequence reads and writes its own stream only. {@link #cacheBytes()} and {@link #stateBytes()} size one stream,
+     * {@link #bytes()} all of them.
      */
     public static final class CompressedKvPlan {
 
@@ -324,9 +350,11 @@ public final class LayerMemoryPlan {
         private final int stateRows;
         private final int stateWidth;
         private final int snapshots;
+        private final int streams;
+        private final boolean overlap;
 
         private CompressedKvPlan(Kind kind, int ratio, int rows, int width, KvDType dtype, int stateRows, int stateWidth,
-                                 int snapshots) {
+                                 int snapshots, int streams, boolean overlap) {
             this.kind = kind;
             this.ratio = ratio;
             this.rows = rows;
@@ -335,6 +363,8 @@ public final class LayerMemoryPlan {
             this.stateRows = stateRows;
             this.stateWidth = stateWidth;
             this.snapshots = snapshots;
+            this.streams = streams;
+            this.overlap = overlap;
         }
 
         /**
@@ -357,6 +387,17 @@ public final class LayerMemoryPlan {
          */
         public static CompressedKvPlan of(Kind kind, int nCtx, int headK, int indexerHeadSize, KvDType dtype,
                                           int snapshots) {
+            return of(kind, nCtx, headK, indexerHeadSize, dtype, snapshots, 1);
+        }
+
+        /**
+         * The plan of {@code streams} per-sequence caches of one kind (a paged memory's sequences), each sized for a
+         * sequence context of {@code nCtx} positions, with {@code snapshots} rollback snapshot planes per stream.
+         *
+         * @throws IllegalArgumentException for a non-positive width or stream count, or negative {@code snapshots}
+         */
+        public static CompressedKvPlan of(Kind kind, int nCtx, int headK, int indexerHeadSize, KvDType dtype,
+                                          int snapshots, int streams) {
             Objects.requireNonNull(kind, "kind");
             Objects.requireNonNull(dtype, "dtype");
             int ratio = kind == Kind.HCA ? 128 : 4;
@@ -368,11 +409,55 @@ public final class LayerMemoryPlan {
                 throw new IllegalArgumentException(kind + " compressor state needs >= 0 rollback snapshots, got "
                         + snapshots);
             }
+            if (streams < 1) {
+                throw new IllegalArgumentException(kind + " compressed cache needs at least one stream, got " + streams);
+            }
+            boolean overlap = kind == Kind.CSA;
             int stateRows = kind == Kind.HCA ? ratio : 2 * ratio;
             int stateWidth = kind == Kind.HCA ? width : 2 * width;
             dtype.rowBytes(width);
             return new CompressedKvPlan(kind, ratio, compressedRows(nCtx, ratio), width, dtype, stateRows, stateWidth,
-                    snapshots);
+                    snapshots, streams, overlap);
+        }
+
+        /**
+         * The DeepSeek-V4.1 compressed cache of a KV source layer: rows of {@code rowWidth} values (the compressed
+         * KV followed by the index key stored beside it) and a non-overlapping compressor plane of {@code ratio}
+         * rows of {@code stateWidth} values (models/deepseek41.cpp:build_attention41; llama-kv-cache-dsv4.cpp:
+         * 1297-1427).
+         *
+         * @param kind       {@link Kind#CSA} (ratio 2) or {@link Kind#HCA} (ratio 1)
+         * @param rowWidth   compressed KV width plus the indexer head size
+         * @param stateWidth compressed KV width (the index key is not compressed)
+         * @throws IllegalArgumentException for a ratio the kind does not carry or a non-positive size
+         */
+        public static CompressedKvPlan ofDsv41(Kind kind, int ratio, int nCtx, int rowWidth, int stateWidth,
+                                               KvDType dtype, int snapshots, int streams) {
+            Objects.requireNonNull(kind, "kind");
+            Objects.requireNonNull(dtype, "dtype");
+            if (kind == Kind.INDEXER) {
+                throw new IllegalArgumentException("DeepSeek-V4.1 stores the index key inside the compressed row,"
+                        + " not in an indexer cache");
+            }
+            int expected = kind == Kind.CSA ? 2 : 1;
+            if (ratio != expected) {
+                throw new IllegalArgumentException(kind + " compressed cache of DeepSeek-V4.1 has ratio " + expected
+                        + ", got " + ratio);
+            }
+            if (rowWidth <= 0 || stateWidth <= 0 || stateWidth > rowWidth) {
+                throw new IllegalArgumentException(kind + " compressed cache needs positive state/row widths, got "
+                        + stateWidth + "/" + rowWidth);
+            }
+            if (snapshots < 0) {
+                throw new IllegalArgumentException(kind + " compressor state needs >= 0 rollback snapshots, got "
+                        + snapshots);
+            }
+            if (streams < 1) {
+                throw new IllegalArgumentException(kind + " compressed cache needs at least one stream, got " + streams);
+            }
+            dtype.rowBytes(rowWidth);
+            return new CompressedKvPlan(kind, ratio, compressedRows(nCtx, ratio), rowWidth, dtype, ratio, stateWidth,
+                    snapshots, streams, false);
         }
 
         /** {@code GGML_PAD(max(1, ceil(nCtx / ratio)), 256)}. */
@@ -391,26 +476,33 @@ public final class LayerMemoryPlan {
         public KvDType dtype() { return dtype; }
         public int stateRows() { return stateRows; }
         public int stateWidth() { return stateWidth; }
+        /** True for the overlapped V4 CSA compressor (2 * ratio rows of 2 * width); false for V4 HCA and V4.1. */
+        public boolean overlap() { return overlap; }
         /** Rollback snapshot planes ({@code n_rs_seq}): the most trailing positions one rollback can drop. */
         public int snapshots() { return snapshots; }
+        /** Per-sequence streams: 1 for a contiguous memory, the paged memory's sequence count otherwise. */
+        public int streams() { return streams; }
         /** Planes of each compressor tensor: the live state plus {@link #snapshots()}. */
         public int planes() { return 1 + snapshots; }
         /** Floats of one plane: {@code stateRows * stateWidth}. */
         public int planeFloats() { return stateRows * stateWidth; }
+        /** Bytes of one stream's compressed rows. */
         public long cacheBytes() { return rows * dtype.rowBytes(width); }
-        /** Bytes of one compressor tensor (kv or score): {@link #planes()} planes. */
+        /** Bytes of one stream's compressor tensor (kv or score): {@link #planes()} planes. */
         public long stateTensorBytes() { return (long) planes() * planeFloats() * Float.BYTES; }
-        /** Both compressor tensors with every plane. */
+        /** One stream's two compressor tensors with every plane. */
         public long stateBytes() { return 2L * stateTensorBytes(); }
-        public long bytes() { return cacheBytes() + stateBytes(); }
-        /** Addressing declaration (T-8): neither a group's cells nor a recurrent slot (MS-8 / PC-2 own its copying). */
+        /** Every stream's rows and compressor tensors. */
+        public long bytes() { return streams * (cacheBytes() + stateBytes()); }
+        /** Addressing declaration: neither a group's cells nor a recurrent slot (nothing here addresses or copies them). */
         public Addressing addressing() { return Addressing.NEITHER; }
 
         @Override
         public String toString() {
             return "CompressedKvPlan{" + kind + ", ratio=" + ratio + ", rows=" + rows + ", width=" + width + ", " + dtype
-                    + ", state=" + stateRows + "x" + stateWidth + (snapshots > 0 ? ", snapshots=" + snapshots : "")
-                    + '}';
+                    + ", state=" + stateRows + "x" + stateWidth + (overlap ? ", overlapped" : "")
+                    + (snapshots > 0 ? ", snapshots=" + snapshots : "")
+                    + (streams > 1 ? ", streams=" + streams : "") + '}';
         }
     }
 
@@ -425,6 +517,7 @@ public final class LayerMemoryPlan {
     private final MsaPlan msa;
     private final List<CompressedKvPlan> compressed;
     private final KvLayout crossKv;
+    private final int crossStreams;
 
     private LayerMemoryPlan(Builder b) {
         this.layer = b.layer;
@@ -438,6 +531,7 @@ public final class LayerMemoryPlan {
         this.msa = b.msa;
         this.compressed = Collections.unmodifiableList(new ArrayList<>(b.compressed));
         this.crossKv = b.crossKv;
+        this.crossStreams = b.crossStreams;
     }
 
     public static Builder builder(int layer, Kind kind) {
@@ -459,8 +553,13 @@ public final class LayerMemoryPlan {
     public MsaPlan msa() { return msa; }
     /** DSV4 compressed caches (unmodifiable; empty otherwise). */
     public List<CompressedKvPlan> compressed() { return compressed; }
-    /** T5 decoder cross-attention K/V over the encoder output; null otherwise. */
+    /** T5 decoder cross-attention K/V over the encoder output, the layout of one stream; null otherwise. */
     public KvLayout crossKv() { return crossKv; }
+    /**
+     * Cross-attention streams: one encoder output per stream, 1 for a contiguous memory and the paged memory's
+     * sequence count otherwise (each sequence attends to its own source); 0 without cross-attention.
+     */
+    public int crossStreams() { return crossKv == null ? 0 : crossStreams; }
 
     public boolean ownsKv() { return kind == Kind.KV || kind == Kind.KV_RECURRENT || kind == Kind.DSV4; }
     public boolean hasState() { return !states.isEmpty(); }
@@ -468,7 +567,7 @@ public final class LayerMemoryPlan {
     /** Bytes of the KV cache this layer owns. */
     public long kvBytes() {
         long b = ownsKv() ? kv.totalBytes() : 0L;
-        return crossKv != null ? b + crossKv.totalBytes() : b;
+        return crossKv != null ? b + crossStreams * crossKv.totalBytes() : b;
     }
 
     /** Bytes of recurrent state per sequence. */
@@ -500,7 +599,8 @@ public final class LayerMemoryPlan {
                 + (kvGroup >= 0 ? ", group=" + kvGroup : "")
                 + (sharedFrom != null ? ", shared=" + sharedFrom : "") + (states.isEmpty() ? "" : ", states=" + states)
                 + (indexer != null ? ", " + indexer : "") + (msa != null ? ", " + msa : "")
-                + (compressed.isEmpty() ? "" : ", " + compressed) + '}';
+                + (compressed.isEmpty() ? "" : ", " + compressed)
+                + (crossKv != null ? ", cross=" + crossKv + (crossStreams > 1 ? "x" + crossStreams : "") : "") + '}';
     }
 
     public static final class Builder {
@@ -515,6 +615,7 @@ public final class LayerMemoryPlan {
         private MsaPlan msa;
         private final List<CompressedKvPlan> compressed = new ArrayList<>();
         private KvLayout crossKv;
+        private int crossStreams = 1;
 
         private Builder(int layer, Kind kind) {
             this.layer = layer;
@@ -537,7 +638,13 @@ public final class LayerMemoryPlan {
             this.compressed.add(Objects.requireNonNull(v, "compressed"));
             return this;
         }
-        public Builder crossKv(KvLayout v) { this.crossKv = v; return this; }
+        public Builder crossKv(KvLayout v) { return crossKv(v, 1); }
+        /** Cross-attention K/V of {@code streams} streams of layout {@code v} each, one per sequence. */
+        public Builder crossKv(KvLayout v, int streams) {
+            this.crossKv = v;
+            this.crossStreams = streams;
+            return this;
+        }
 
         /** @throws IllegalArgumentException when the parts present do not match the kind */
         public LayerMemoryPlan build() {
@@ -555,8 +662,10 @@ public final class LayerMemoryPlan {
                     check(hasKv && !hasStates && sharedFrom == null && compressed.isEmpty(), "a KV layout only");
                     break;
                 case SHARED_KV:
-                    check(sharedFrom != null && !hasStates && indexer == null && msa == null && compressed.isEmpty(),
-                            "a shared-KV source and no owned caches");
+                    // KV sharing covers the attention cache only: a full DSA indexer keeps its own keys
+                    // (llama-kv-cache-dsa.cpp:44-51, mistral-large4)
+                    check(sharedFrom != null && !hasStates && msa == null && compressed.isEmpty(),
+                            "a shared-KV source and no owned caches besides a DSA indexer");
                     check(sharedFrom.target() || sharedFrom.layer() != layer, "a source layer other than itself");
                     break;
                 case RECURRENT:
@@ -574,6 +683,7 @@ public final class LayerMemoryPlan {
             }
             check(crossKv == null || kind == Kind.KV, "cross-attention K/V only on a decoder KV layer");
             check(crossKv == null || !crossKv.ring(), "a full (non-ring) cross-attention cache");
+            check(crossStreams >= 1, "at least one cross-attention stream");
             check(hasKv == (kvGroup >= 0), "a KV group exactly when a KV layout is present");
             check(indexer == null || (hasKv && indexer.rows() == kv.rows()), "indexer rows equal to the KV rows");
             check(msa == null || (hasKv && msa.rows() == kv.rows()), "MSA rows equal to the KV rows");

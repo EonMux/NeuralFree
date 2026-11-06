@@ -38,6 +38,8 @@ public final class DryStage extends SamplerStage {
     private final int penaltyLastN;
     /** head token -> its tail suffixes (any of which completes a restart sequence at that head). */
     private final Map<Integer, List<List<Integer>>> breakers;
+    /** The same breakers as one array per restart sequence: the head token first, its tail ids after it. */
+    private final int[][] breakerEntries;
 
     private int[] ring;
     private int ringHead;
@@ -86,7 +88,24 @@ public final class DryStage extends SamplerStage {
             }
         }
         this.breakers = processed;
+        this.breakerEntries = flatten(processed);
         this.ring = enabled ? new int[lastN] : new int[0];
+    }
+
+    /** The head-and-tail breaker map as one id array per restart sequence. */
+    private static int[][] flatten(Map<Integer, List<List<Integer>>> breakers) {
+        List<int[]> entries = new ArrayList<>();
+        for (Map.Entry<Integer, List<List<Integer>>> e : breakers.entrySet()) {
+            for (List<Integer> tail : e.getValue()) {
+                int[] entry = new int[1 + tail.size()];
+                entry[0] = e.getKey();
+                for (int i = 0; i < tail.size(); i++) {
+                    entry[1 + i] = tail.get(i);
+                }
+                entries.add(entry);
+            }
+        }
+        return entries.toArray(new int[0][]);
     }
 
     /** llama.cpp's breaker processing: every breaker string goes through the token scans once. */
@@ -184,8 +203,64 @@ public final class DryStage extends SamplerStage {
         return false;
     }
 
-    private boolean enabled() {
+    /** Whether the stage applies ({@code multiplier != 0}, {@code base >= 1} and a non-zero window). */
+    public boolean enabled() {
         return multiplier != 0.0f && base >= 1.0f && penaltyLastN != 0;
+    }
+
+    /** DRY's repetition strength. */
+    public float multiplier() {
+        return multiplier;
+    }
+
+    /** DRY's penalty base. */
+    public float base() {
+        return base;
+    }
+
+    /** The repeated suffix length the penalty starts at. */
+    public int allowedLength() {
+        return allowedLength;
+    }
+
+    /** Accepted tokens currently in the window. */
+    public int windowSize() {
+        return ringSize;
+    }
+
+    /** The window's accepted tokens, oldest first (a copy); empty when the stage is off. */
+    public int[] windowTokens() {
+        if (!enabled()) {
+            return new int[0];
+        }
+        int[] tokens = new int[ringSize];
+        for (int k = 0; k < ringSize; k++) {
+            tokens[k] = ring[(ringHead + k) % ring.length];
+        }
+        return tokens;
+    }
+
+    /** The restart sequences as the head token followed by its tail ids; each entry is a copy. */
+    public int[][] breakerEntries() {
+        int[][] copy = new int[breakerEntries.length][];
+        for (int i = 0; i < breakerEntries.length; i++) {
+            copy[i] = breakerEntries[i].clone();
+        }
+        return copy;
+    }
+
+    /** Number of restart sequences the stage carries. */
+    public int breakerCount() {
+        return breakerEntries.length;
+    }
+
+    /** Total tail token ids across the restart sequences. */
+    public int breakerTailCount() {
+        int tails = 0;
+        for (int[] entry : breakerEntries) {
+            tails += entry.length - 1;
+        }
+        return tails;
     }
 
     @Override
@@ -345,5 +420,32 @@ public final class DryStage extends SamplerStage {
     public void reset() {
         ringSize = 0;
         ringHead = 0;
+    }
+
+    /** The accepted tokens in the window, oldest first; null when the stage is off. */
+    @Override
+    public Object saveState() {
+        if (!enabled()) {
+            return null;
+        }
+        int[] tokens = new int[ringSize];
+        for (int k = 0; k < ringSize; k++) {
+            tokens[k] = ring[(ringHead + k) % ring.length];
+        }
+        return tokens;
+    }
+
+    @Override
+    public void restoreState(Object state) {
+        if (!enabled()) {
+            return;
+        }
+        if (!(state instanceof int[])) {
+            throw new IllegalArgumentException("not a DRY stage state: " + state);
+        }
+        int[] tokens = (int[]) state;
+        System.arraycopy(tokens, 0, ring, 0, tokens.length);
+        ringHead = 0;
+        ringSize = tokens.length;
     }
 }

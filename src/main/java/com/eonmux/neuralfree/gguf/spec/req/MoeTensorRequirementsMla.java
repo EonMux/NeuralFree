@@ -36,6 +36,8 @@ public final class MoeTensorRequirementsMla {
     private static final String[] HC_HEAD = {"output_hc_fn.weight", "output_hc_base.weight", "output_hc_scale.weight"};
 
     private static final LayerCondition SHEXP_BY_COUNT = (hp, il) -> hp.nExpertShared() > 0;
+    /** First block of each logical LongCat layer: the one carrying the shortcut MoE. */
+    private static final LayerCondition LONGCAT_SHORTCUT = (hp, il) -> il < hp.nLayer() && il % 2 == 0;
 
     private MoeTensorRequirementsMla() {
     }
@@ -67,8 +69,33 @@ public final class MoeTensorRequirementsMla {
                 .layer("attn_kv_a_mqa.weight")
                 .when(mla, "attn_k_b.weight", "attn_v_b.weight").when(noMla, "attn_kv_b.weight")
                 .layer("attn_output.weight", "ffn_norm.weight")
+                .layerOptional("post_attention_norm.weight", "post_ffw_norm.weight")
                 .denseFfn(DENSE_LEAD)
                 .probsBiasOptional(AFTER_LEAD).expertsGateUp(AFTER_LEAD).sharedExperts(AFTER_LEAD)
+                .nextn()
+                .build();
+    }
+
+    /**
+     * vLLM's {@code AXK1ForCausalLM} (AXK1.py): the deepseek2 set, but the shared experts are optional because AXK-1
+     * may set no {@code n_shared_experts}, and every sparse layer may carry the extra post-MLP norm as
+     * {@code post_ffw_norm}. A checkpoint without Q LoRA uses the plain {@code attn_q} projection.
+     */
+    public static List<TensorRequirement> axk1() {
+        LayerCondition qLora = (hp, il) -> il < hp.nLayer() && hp.nLoraQ() > 0;
+        LayerCondition noQLora = (hp, il) -> il < hp.nLayer() && hp.nLoraQ() == 0;
+        LayerCondition mla = (hp, il) -> il < hp.nLayer() && hp.isMla();
+        LayerCondition noMla = (hp, il) -> il < hp.nLayer() && !hp.isMla();
+        return builder().embdAndOutputNorm().outputOrTied()
+                .layer("attn_norm.weight")
+                .when(qLora, "attn_q_a_norm.weight").layer("attn_kv_a_norm.weight")
+                .when(qLora, "attn_q_a.weight", "attn_q_b.weight").when(noQLora, "attn_q.weight")
+                .layer("attn_kv_a_mqa.weight")
+                .when(mla, "attn_k_b.weight", "attn_v_b.weight").when(noMla, "attn_kv_b.weight")
+                .layer("attn_output.weight", "ffn_norm.weight")
+                .layerOptional("post_attention_norm.weight", "post_ffw_norm.weight")
+                .denseFfn(DENSE_LEAD)
+                .probsBiasOptional(AFTER_LEAD).expertsGateUp(AFTER_LEAD).sharedExpertsOptional(SHEXP_BY_COUNT)
                 .nextn()
                 .build();
     }
@@ -118,6 +145,36 @@ public final class MoeTensorRequirementsMla {
                 .layer("ffn_norm.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight", "ffn_up_exps.weight")
                 .sharedExperts(TRUNK)
                 .nextn()
+                .build();
+    }
+
+    /**
+     * models/deepseek41.cpp:134-222: the DeepSeek-V4 projections and hyper-connections, but only KV source layers
+     * load a compressor (with its gate above ratio 1) and the index-key tensors, only indexer source layers load the
+     * indexer queries, Engram layers load their own {@code engram_kv}/{@code engram_gate}, and there is no
+     * hyper-connection head. Every layer has the bias-routed expert set (no hash routing).
+     */
+    public static List<TensorRequirement> deepseek41() {
+        LayerCondition compressed = (hp, il) -> il < hp.nLayer() && hp.compressRatio(il) != 0;
+        LayerCondition kvSource = (hp, il) -> compressed.test(hp, il) && hp.dsv41KvSource(il) == il;
+        LayerCondition gated = (hp, il) -> kvSource.test(hp, il) && hp.compressRatio(il) > 1;
+        LayerCondition topkSource = (hp, il) -> compressed.test(hp, il) && hp.dsv41TopkSource(il) == il;
+        LayerCondition engram = (hp, il) -> il < hp.nLayer() && hp.isPleLayer(il);
+        return builder().embdAndOutputNorm().outputRequired()
+                .modelWhen(hp -> hp.pleNHeads() > 0, "per_layer_token_embd.weight")
+                .layer("attn_norm.weight", "attn_sinks.weight", "attn_q_a.weight", "attn_q_a_norm.weight",
+                        "attn_q_b.weight", "attn_kv.weight", "attn_kv_a_norm.weight", "attn_output_a.weight",
+                        "attn_output_b.weight")
+                .layer(HC_BLOCK)
+                .when(kvSource, "attn_compressor_kv.weight", "attn_compressor_norm.weight")
+                .when(gated, "attn_compressor_gate.weight")
+                .when(kvSource, "indexer.attn_k.weight", "indexer.k_norm.weight")
+                .when(topkSource, "indexer.proj.weight", "indexer.attn_q_b.weight")
+                .when(engram, "engram_kv.weight", "engram_gate.weight")
+                .layer("ffn_gate_inp.weight", "exp_probs_b.bias")
+                .layerOptional("exp_probs_b_vl.bias")
+                .layer("ffn_norm.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight", "ffn_up_exps.weight")
+                .sharedExperts(TRUNK)
                 .build();
     }
 
@@ -189,6 +246,29 @@ public final class MoeTensorRequirementsMla {
                 .build();
     }
 
+    /**
+     * models/mistral-large4.cpp:58-148. Direct {@code attn_q} (the optional Q LoRA rank 0 skips wq_a/wq_b),
+     * the learned LeRoPE factors (one model-level table the loader aliases to every layer, converter
+     * mistral4.py:92-95), SSMax scale and bias, and the DSA indexer tensors with biased layer norms on the
+     * full-indexer layers. FFN: dense on the leading blocks, routed experts with a shared expert after them.
+     */
+    public static List<TensorRequirement> mistralLarge4() {
+        LayerCondition indexer = (hp, il) -> il < hp.nLayer() && hp.isIndexerFull(il);
+        // a layer whose KV cache is shared from an earlier layer stores no latent rows (mistral-large4.cpp:96-99)
+        LayerCondition ownsKv = (hp, il) -> il < hp.nLayer() && hp.kvOwnerLayer(il) == il;
+        return builder().embdAndOutputNorm().outputRequired()
+                .model("rope_freqs.weight")
+                .layer("attn_norm.weight", "attn_q.weight", "attn_k_b.weight", "attn_v_b.weight",
+                        "attn_output.weight", "attn_ssmax.weight", "attn_ssmax.bias", "ffn_norm.weight")
+                .when(ownsKv, "attn_kv_a_norm.weight", "attn_kv_a_mqa.weight")
+                .when(indexer, "indexer.q_norm.weight", "indexer.q_norm.bias", "indexer.attn_q_b.weight",
+                        "indexer.attn_k.weight", "indexer.k_norm.weight", "indexer.k_norm.bias",
+                        "indexer.proj.weight", "indexer.ssmax.weight", "indexer.ssmax.bias")
+                .denseFfn(DENSE_LEAD)
+                .experts(AFTER_LEAD).sharedExperts(AFTER_LEAD)
+                .build();
+    }
+
     /** models/minimax-m3.cpp:41-89: MoE layers carry the MiniMax sparse-attention indexer projections. */
     public static List<TensorRequirement> minimaxM3() {
         return builder().embdAndOutputNorm().outputRequired()
@@ -199,5 +279,38 @@ public final class MoeTensorRequirementsMla {
                 .when(AFTER_LEAD, "indexer.q_proj.weight", "indexer.k_proj.weight", "indexer.q_norm.weight",
                         "indexer.k_norm.weight")
                 .build();
+    }
+
+    /**
+     * vLLM's longcat_flash.py, whose two physical blocks per logical layer each hold an MLA attention and a SwiGLU
+     * MLP; the first block of each layer also holds the shortcut MoE (router, stacked experts and selection bias).
+     * The bias-free MLA projections are the split {@code attn_k_b}/{@code attn_v_b} form. The NextN block carries the
+     * shared {@code nextn} projection and norms.
+     */
+    public static List<TensorRequirement> longcatFlash() {
+        return longcatBlocks()
+                .when(LONGCAT_SHORTCUT, "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                        "ffn_down_exps.weight", "exp_probs_b.bias")
+                .nextn()
+                .build();
+    }
+
+    /** {@link #longcatFlash()} plus the fused n-gram input embedding tables. */
+    public static List<TensorRequirement> longcatNgram() {
+        return longcatBlocks()
+                .model("ngram_embd.weight", "ngram_proj.weight")
+                .when(LONGCAT_SHORTCUT, "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                        "ffn_down_exps.weight", "exp_probs_b.bias")
+                .nextn()
+                .build();
+    }
+
+    /** The model-level and per-block tensors both LongCat layouts share. */
+    private static MoeTensorRequirementsSupport.Builder longcatBlocks() {
+        return builder().embdAndOutputNorm().outputOrTied()
+                .layer("attn_norm.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
+                        "attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_k_b.weight",
+                        "attn_v_b.weight", "attn_output.weight", "ffn_norm.weight",
+                        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight");
     }
 }

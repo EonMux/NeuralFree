@@ -114,6 +114,45 @@ public class MetadataOverridesTest {
         assertEquals("a=str:x;b=int:3", MetadataOverrides.toString(list));
     }
 
+    // ---------------------------------------------------------------- the scalar and array factories
+
+    @Test
+    public void scalarAndArrayOverridesCarryTheTypesTheGrammarCannot() {
+        MetadataOverrides.Override count = MetadataOverrides.Override.scalar("c", GGUFValueType.UINT32, 2);
+        assertEquals(GGUFValueType.UINT32, count.type());
+        assertEquals("c=uint32:2", count.toString());
+        assertEquals("w=int64:5", MetadataOverrides.Override.scalar("w", GGUFValueType.INT64, 5L).toString());
+        assertEquals("d=float64:1.0E300",
+                MetadataOverrides.Override.scalar("d", GGUFValueType.FLOAT64, 1.0e300).toString());
+
+        MetadataOverrides.Override tags = MetadataOverrides.Override.array("t", GGUFValueType.STRING,
+                List.of("a", "b"));
+        assertEquals(GGUFValueType.ARRAY, tags.type());
+        assertEquals(GGUFValueType.STRING, tags.elementType());
+        assertEquals(List.of("a", "b"), tags.value());
+        assertEquals("t=array(str):[a, b]", tags.toString());
+        assertEquals(null, count.elementType());
+    }
+
+    @Test
+    public void factoriesRefuseValuesOutsideTheirRepresentation() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> MetadataOverrides.Override.scalar("k", GGUFValueType.INT32, 2L));
+        assertTrue(e.getMessage(), e.getMessage().contains("'k'") && e.getMessage().contains("Integer"));
+        assertThrows(IllegalArgumentException.class,
+                () -> MetadataOverrides.Override.scalar("k", GGUFValueType.ARRAY, List.of(1)));
+        assertEquals("k=uint8:1",
+                MetadataOverrides.Override.scalar("k", GGUFValueType.UINT8, 1).toString());
+        assertThrows(IllegalArgumentException.class,
+                () -> MetadataOverrides.Override.scalar("k", GGUFValueType.UINT8, 1L));
+        assertThrows(IllegalArgumentException.class,
+                () -> MetadataOverrides.Override.array("k", GGUFValueType.ARRAY, List.of(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> MetadataOverrides.Override.array("k", GGUFValueType.FLOAT32, List.of(1.0)));
+        assertThrows(NullPointerException.class,
+                () -> MetadataOverrides.Override.array("k", GGUFValueType.STRING, java.util.Arrays.asList("a", null)));
+    }
+
     // ---------------------------------------------------------------- ModelSourceOptions carries it
 
     @Test

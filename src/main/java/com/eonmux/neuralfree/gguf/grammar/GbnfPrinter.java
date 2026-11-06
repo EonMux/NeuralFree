@@ -7,8 +7,10 @@ import java.util.List;
  * Writes a compiled {@link Grammar} back as GBNF text that {@link GbnfParser} parses to the same rules (llama.cpp's
  * {@code llama_grammar_print} in valid syntax). Every rule is renamed {@code prefix + name + "-" + id}: the id keeps
  * names unique, the prefix lets the text join another grammar without clashes, and the parser's synthesized
- * {@code name_id} rules become valid names. Characters print as bracket sets and tokens by id ({@code <[42]>}), so the
- * text needs no vocabulary.
+ * {@code name_id} rules become valid names. Characters print as bracket sets and tokens by id ({@code <[42]>}, any
+ * token as {@code !<>}), so the text needs no vocabulary. The budget elements a single-alternative rule opens with
+ * print as xgrammar's rule attributes ({@code name[max_tokens=n, max_chars=m] ::= …}), the one place
+ * {@link GbnfParser} reads them.
  */
 public final class GbnfPrinter {
 
@@ -19,11 +21,45 @@ public final class GbnfPrinter {
     public static String print(Grammar grammar, String prefix) {
         StringBuilder out = new StringBuilder();
         for (int id = 0; id < grammar.ruleCount(); id++) {
-            out.append(ruleName(grammar, id, prefix)).append(" ::=");
-            appendRule(out, grammar, grammar.rule(id), prefix);
+            List<GrammarElement> rule = grammar.rule(id);
+            int head = budgetHead(rule);
+            out.append(ruleName(grammar, id, prefix));
+            appendBudgets(out, rule, head);
+            out.append(" ::=");
+            appendRule(out, grammar, rule.subList(head, rule.size()), prefix);
             out.append('\n');
         }
         return out.toString();
+    }
+
+    /** The number of budget elements {@code rule} opens with; a budget anywhere else has no GBNF form. */
+    private static int budgetHead(List<GrammarElement> rule) {
+        int head = 0;
+        while (GrammarElement.isBudget(rule.get(head).type())) {
+            head++;
+        }
+        for (int i = head; i < rule.size(); i++) {
+            GrammarElement.Type type = rule.get(i).type();
+            if (GrammarElement.isBudget(type) || (head > 0 && type == GrammarElement.Type.ALT)) {
+                throw new IllegalStateException("a budget element prints only at the head of a single-alternative"
+                        + " rule");
+            }
+        }
+        return head;
+    }
+
+    /** The rule attributes {@code [max_tokens=n, max_chars=m]} of the first {@code head} elements. */
+    private static void appendBudgets(StringBuilder out, List<GrammarElement> rule, int head) {
+        if (head == 0) {
+            return;
+        }
+        out.append('[');
+        for (int i = 0; i < head; i++) {
+            GrammarElement e = rule.get(i);
+            out.append(i > 0 ? ", " : "").append(e.type() == GrammarElement.Type.TOKEN_BUDGET
+                    ? "max_tokens=" : "max_chars=").append(e.value());
+        }
+        out.append(']');
     }
 
     /** The printed name of rule {@code id}. */
@@ -70,10 +106,10 @@ public final class GbnfPrinter {
                 out.append('.');
                 return i + 1;
             case TOKEN:
-                out.append("<[").append(Integer.toUnsignedString(e.value())).append("]>");
-                return i + 1;
             case TOKEN_NOT:
-                out.append("!<[").append(Integer.toUnsignedString(e.value())).append("]>");
+                return appendTokenSet(out, rule, i);
+            case TOKEN_ANY:
+                out.append("!<>");
                 return i + 1;
             case CHAR:
             case CHAR_NOT:
@@ -81,6 +117,20 @@ public final class GbnfPrinter {
             default:
                 throw new IllegalStateException("grammar element " + e.type() + " outside a character set");
         }
+    }
+
+    /** One token element starting at {@code start}: {@code <[a]>}, {@code !<[a]>}, or a set with its TOKEN_ALTs. */
+    private static int appendTokenSet(StringBuilder out, List<GrammarElement> rule, int start) {
+        GrammarElement head = rule.get(start);
+        out.append(head.type() == GrammarElement.Type.TOKEN_NOT ? "!<[" : "<[")
+                .append(Integer.toUnsignedString(head.value())).append(']');
+        int i = start + 1;
+        while (i < rule.size() && rule.get(i).type() == GrammarElement.Type.TOKEN_ALT) {
+            out.append(",[").append(Integer.toUnsignedString(rule.get(i).value())).append(']');
+            i++;
+        }
+        out.append('>');
+        return i;
     }
 
     /** One character set starting at {@code start}: the CHAR/CHAR_NOT and its CHAR_ALT and range elements. */

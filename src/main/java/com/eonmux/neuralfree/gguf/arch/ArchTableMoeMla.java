@@ -29,6 +29,12 @@ public final class ArchTableMoeMla {
                 // llama-model.cpp:3520. MLA (absorbed when k_b/v_b are split), YaRN, grouped and biased routing.
                 ArchEntry.of(decoder(Arch.DEEPSEEK2, RopeType.NORM).build(),
                         MoeHooksMla::deepseek2, MoeTensorRequirementsMla.deepseek2()),
+                // vLLM's AXK1ForCausalLM (AXK1.py): the deepseek2 MLA/MoE graph with a post-MLP norm on the
+                // sparse layers and the llama 4 query temperature. NF-defined because no llama.cpp converter or
+                // graph carries that arrangement.
+                ArchEntry.of(decoder(Arch.AXK1, RopeType.NORM).graphFamily(Arch.DEEPSEEK2)
+                                .defaultGating(GatingFunc.SIGMOID).build(),
+                        MoeHooksMla::axk1, MoeTensorRequirementsMla.axk1()),
                 // llama-model.cpp:3521. deepseek2 graph (models.h) with plain multi-head attention.
                 ArchEntry.of(decoder(Arch.DEEPSEEK2OCR, RopeType.NORM).graphFamily(Arch.DEEPSEEK2).build(),
                         MoeHooksMla::deepseek2ocr, MoeTensorRequirementsMla.deepseek2ocr()),
@@ -41,6 +47,13 @@ public final class ArchTableMoeMla {
                                 .residualKind(ResidualKind.HYPER_CONNECTIONS)
                                 .defaultGating(GatingFunc.SQRT_SOFTPLUS).build(),
                         MoeHooksMla::deepseek4, MoeTensorRequirementsMla.deepseek4()),
+                // models/deepseek41.cpp: the DeepSeek-V4 attention reads other layers' compressed caches
+                // (attention.kv_source_layers / indexer.source_layers), attends over the window plus the indexer's
+                // top-k compressed rows, picks candidate blocks in two levels and adds the Engram n-gram layers.
+                ArchEntry.of(decoder(Arch.DEEPSEEK41, RopeType.NORM, MemoryKind.DSV4)
+                                .residualKind(ResidualKind.HYPER_CONNECTIONS)
+                                .defaultGating(GatingFunc.SQRT_SOFTPLUS).build(),
+                        MoeHooksMla::deepseek41, MoeTensorRequirementsMla.deepseek41()),
                 // llama-model.cpp:3663-3664: MROPE when the file carries rope sections, NEOX otherwise.
                 // post_attention_norm is the pre-FFN norm.
                 ArchEntry.of(decoder(Arch.GLM4_MOE, RopeType.NEOX).mropeWhenSections(true)
@@ -53,6 +66,10 @@ public final class ArchTableMoeMla {
                 // llama-model.cpp:3526. MLA without Q LoRA; ungated squared-ReLU FFN (models/plm.cpp:180).
                 ArchEntry.of(decoder(Arch.PLM, RopeType.NORM).ffnAct(ActOp.RELU_SQR).ffnGating(FfnGating.SEQ).build(),
                         MoeHooksMla::plm, MoeTensorRequirementsMla.plm()),
+                // llama-model.cpp:3600. MLA with the SSMax temperature, LeRoPE factors, per-layer rope patterns and
+                // KV source maps; the DSA indexer runs on the full-indexer layers only.
+                ArchEntry.of(decoder(Arch.MISTRAL_LARGE4, RopeType.NORM, MemoryKind.DSA).build(),
+                        MoeHooksMla::mistralLarge4, MoeTensorRequirementsMla.mistralLarge4()),
                 // llama-model.cpp:3542. Loads and runs as deepseek2 (models.h).
                 ArchEntry.of(decoder(Arch.MISTRAL4, RopeType.NORM).graphFamily(Arch.DEEPSEEK2).build(),
                         MoeHooksMla::deepseek2, MoeTensorRequirementsMla.deepseek2()),
@@ -66,6 +83,14 @@ public final class ArchTableMoeMla {
                 // llama-model.cpp:3622. Block-sparse MiniMax attention; experts use the clamped OpenAI SwiGLU variant
                 // (LLM_FFN_SWIGLU_OAI_MOE, models/minimax-m3.cpp:568), resolved by the MoE graph.
                 ArchEntry.of(decoder(Arch.MINIMAX_M3, RopeType.NEOX, MemoryKind.MSA).build(),
-                        MoeHooksMla::minimaxM3, MoeTensorRequirementsMla.minimaxM3())));
+                        MoeHooksMla::minimaxM3, MoeTensorRequirementsMla.minimaxM3()),
+                // vLLM's longcat_flash.py: one logical block is two physical blocks of MLA attention and a dense MLP,
+                // the first also carrying the shortcut-connected MoE with its identity (zero-compute) experts.
+                ArchEntry.of(decoder(Arch.LONGCAT_FLASH, RopeType.NORM).build(),
+                        MoeHooksMla::longcatFlash, MoeTensorRequirementsMla.longcatFlash()),
+                // vLLM's longcat_flash_ngram.py: the same model, with an n-gram input embedding fused with the token
+                // embedding instead of the plain token lookup.
+                ArchEntry.of(decoder(Arch.LONGCAT_FLASH_NGRAM, RopeType.NORM).build(),
+                        MoeHooksMla::longcatFlash, MoeTensorRequirementsMla.longcatNgram())));
     }
 }

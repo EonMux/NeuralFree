@@ -11,11 +11,12 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The structural-tag parser (PARITY SO-4): the vLLM legacy payload compiles to one grammar whose root
+ * The structural-tag parser: the vLLM legacy payload compiles to one grammar whose root
  * alternates the structures — each begin literal, the schema's grammar, the end literal — rules renaming under
  * a per-structure prefix so several structures compose; the compiled grammar constrains sampling through the
  * {@code GrammarStage}; the named refusals fire for a payload without structures, a structure no trigger opens,
- * or a structure missing a member. Trigger dispatch itself runs in {@code TriggeredGrammarStageTest}.
+ * or a structure missing a member. The modern {@code format} object compiles in {@code StructuralTagFormatTest};
+ * trigger dispatch itself runs in {@code TriggeredGrammarStageTest}.
  */
 public class StructuralTagTest {
 
@@ -99,7 +100,8 @@ public class StructuralTagTest {
 
     @Test
     public void theNamedRefusalsFire() {
-        assertRefused("{\"format\": {}}", "structures");
+        assertRefused("{\"format\": {}}", "matches no supported type");
+        assertRefused("{\"triggers\": []}", "structures array or a format object");
         assertRefused("{\"structures\": [{\"begin\": \"a\", \"schema\": {}, \"end\": \"b\"}],"
                 + "\"triggers\": [\"<call>\"]}", "no trigger");
         assertRefused("{\"structures\": [{\"begin\": \"a\", \"schema\": {}, \"end\": \"b\"}],"

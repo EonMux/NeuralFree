@@ -16,6 +16,9 @@ import java.util.Set;
  * {@link TernaryBlockDecoders}, {@link FpBlockDecoders}, {@link ExtBlockDecoders}); this class validates
  * ranges, normalizes byte order and dispatches.
  * <p>
+ * {@link GGMLType#W12} has no entry here: its per-row record is a GPU-resident form (never stored in GGUF
+ * files), decoded by {@link W12Codec#decode} directly and by the GPU kernels.
+ * <p>
  * Thread-safe and stateless. Source buffers are read with absolute indexing only; their position,
  * limit and byte order are never modified.
  */
@@ -60,6 +63,7 @@ public final class CpuBlockDecoders {
         put(m, GGMLType.NVFP4, FpBlockDecoders::decodeNvfp4);
         put(m, GGMLType.Q1_0, FpBlockDecoders::decodeQ1_0);
         put(m, GGMLType.Q2_0, FpBlockDecoders::decodeQ2_0);
+        put(m, GGMLType.F8_E4M3FN, FpBlockDecoders::decodeF8E4m3fn);
 
         put(m, GGMLType.Q4_0, LegacyBlockDecoders::decodeQ4_0);
         put(m, GGMLType.Q4_1, LegacyBlockDecoders::decodeQ4_1);
@@ -80,6 +84,8 @@ public final class CpuBlockDecoders {
         put(m, GGMLType.IQ2_S, IQuantBlockDecoders::decodeIq2S);
         put(m, GGMLType.IQ3_XXS, IQuantBlockDecoders::decodeIq3Xxs);
         put(m, GGMLType.IQ3_S, IQuantBlockDecoders::decodeIq3S);
+        put(m, GGMLType.IQ3_K, IQuantBlockDecoders::decodeIq3K);
+        put(m, GGMLType.IQ3_KS, IQuantBlockDecoders::decodeIq3Ks);
         put(m, GGMLType.IQ1_S, IQuantBlockDecoders::decodeIq1S);
         put(m, GGMLType.IQ1_M, IQuantBlockDecoders::decodeIq1M);
         put(m, GGMLType.IQ4_NL, IQuantBlockDecoders::decodeIq4Nl);
@@ -91,6 +97,7 @@ public final class CpuBlockDecoders {
         put(m, GGMLType.F8_E4M3, ExtBlockDecoders::decodeF8E4m3);
         put(m, GGMLType.F8_E5M2, ExtBlockDecoders::decodeF8E5m2);
         put(m, GGMLType.F8_E4M3_B128, ExtBlockDecoders::decodeF8E4m3B128);
+        put(m, GGMLType.F8_E4M3_B32, ExtBlockDecoders::decodeF8E4m3B32);
         put(m, GGMLType.MXFP8, ExtBlockDecoders::decodeMxfp8);
         put(m, GGMLType.MXFP6_E3M2, (b, off, dst, dstOff, nBlocks) -> ExtBlockDecoders.decodeMxfp6(b, off, dst, dstOff, nBlocks, true));
         put(m, GGMLType.MXFP6_E2M3, (b, off, dst, dstOff, nBlocks) -> ExtBlockDecoders.decodeMxfp6(b, off, dst, dstOff, nBlocks, false));

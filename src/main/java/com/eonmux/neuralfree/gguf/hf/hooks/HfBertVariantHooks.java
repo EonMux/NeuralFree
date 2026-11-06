@@ -14,6 +14,7 @@ import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfTensorIndex;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
+import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfChatTemplates;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfTokenizerFiles;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfTokenizerJson;
@@ -351,6 +352,7 @@ public final class HfBertVariantHooks {
     public static void modernMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) throws IOException {
         HfBertHooks.meta(ctx, kv, plan);
         HfConfig cfg = ctx.config();
+        kv.set(GgufKeys.ATTENTION_LAYERNORM_EPS, cfg.findFloat(1e-5, "norm_eps"));          // modern-bert.cpp:16
         kv.set(GgufKeys.ATTENTION_SLIDING_WINDOW, cfg.requireInt("local_attention"));        // bert.py:622
         Object pattern = cfg.find("global_attn_every_n_layers").orElse(null);               // bert.py:623-624
         if (pattern instanceof Number) {
@@ -367,10 +369,32 @@ public final class HfBertVariantHooks {
         }
     }
 
-    /** {@code ModernBertModel.modify_tensors} (bert.py:643-652): the classifier renames inside BERT's step. */
+    /**
+     * {@code ModernBertModel.modify_tensors} (bert.py:643-652): the prediction head's {@code head.dense} and
+     * {@code head.norm} map to {@code cls} and {@code cls.norm}, and the final {@code classifier} maps to
+     * {@code cls.output}. The shared name table maps both {@code head.dense} and {@code classifier} to {@code cls};
+     * the explicit output mapping keeps vLLM's prediction-head-then-classifier chain (modernbert.py:428-443,
+     * {@code ModernBertPredictionHead}) instead of a duplicate {@code cls} tensor.
+     */
     public static void modernTensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
+        if (out.isConsumed(hfName)) {
+            return;
+        }
+        if (hfName.startsWith("classifier.") && (hfName.endsWith(".weight") || hfName.endsWith(".bias"))) {
+            out.add(TensorNames.CLS_OUT + hfName.substring("classifier".length()), src);
+            return;
+        }
         HfBertHooks.tensors(ctx, hfName, src, out);
+    }
+
+    /**
+     * {@code ModernBertForTokenClassification.modify_tensors}: {@link #modernTensors}, whose mapping already writes
+     * the final {@code classifier} as {@code cls.output} over the prediction head.
+     */
+    public static void modernTokenTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
+            throws IOException {
+        modernTensors(ctx, hfName, src, out);
     }
 
     // ------------------------------------------------------------------ ModernBertDecisionModel

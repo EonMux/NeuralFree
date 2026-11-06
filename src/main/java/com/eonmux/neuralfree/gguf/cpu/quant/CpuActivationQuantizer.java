@@ -13,8 +13,10 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.QK_K;
  * to ggml's reference quantizers: {@code quantize_row_q8_0_ref}, {@code quantize_row_q8_1_ref} and
  * {@code quantize_row_q8_K_ref} (llama.cpp ggml/src/ggml-quants.c). The pairing of weight type and activation
  * type follows {@code type_traits_cpu[].vec_dot_type} (llama.cpp ggml/src/ggml-cpu/ggml-cpu.c:215-416), except
- * that F16 and BF16 weights take F32 activations (direct float dot products). The NeuralFree extension block
- * types take Q8_0 activations, as their ggml analogues with 32-element runs (MXFP4, IQ4_NL, Q8_0) do.
+ * that F16 and BF16 weights take F32 activations (direct float dot products) and the per-element F8_E4M3FN
+ * weights take F32 activations like ggml's {@code ggml_vec_dot_f8_e4m3_f32}, which serves any row length. The
+ * NeuralFree extension block types take Q8_0 activations, as their ggml analogues with 32-element runs
+ * (MXFP4, IQ4_NL, Q8_0) do.
  * <p>
  * Stateless and thread-safe. The input array is only read.
  */
@@ -37,6 +39,7 @@ public final class CpuActivationQuantizer {
             case F32:
             case F16:
             case BF16:
+            case F8_E4M3FN:
                 return GGMLType.F32;
             case Q4_0:
             case Q5_0:
@@ -49,6 +52,7 @@ public final class CpuActivationQuantizer {
             case F8_E4M3:
             case F8_E5M2:
             case F8_E4M3_B128:
+            case F8_E4M3_B32:
             case MXFP8:
             case MXFP6_E3M2:
             case MXFP6_E2M3:
@@ -69,6 +73,8 @@ public final class CpuActivationQuantizer {
             case IQ2_S:
             case IQ3_XXS:
             case IQ3_S:
+            case IQ3_K:
+            case IQ3_KS:
             case IQ1_S:
             case IQ1_M:
             case IQ4_XS:

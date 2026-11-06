@@ -10,11 +10,12 @@ import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 import java.util.Arrays;
 
 /**
- * Hparams hooks of the Kimi delta attention (KDA) hybrids: kimi-linear, kimi-k3, bailingmoe3 and glm5-next.
+ * Hparams hooks of the Kimi delta attention (KDA) hybrids: kimi-linear, kimi-k3, alice-ai, bailingmoe3 and
+ * glm5-next.
  * A layer without KV heads is a KDA (recurrent) layer with {@code kda.head_dim} heads; the others are MLA
  * attention layers. The {@link KdaGateMode} records the form of the KDA gates:
  * <ul>
- *   <li>kimi-linear, glm5-next: decay gate {@code ssm_f_b(ssm_f_a x) + dt_b}, low-rank output gate
+ *   <li>kimi-linear, alice-ai, glm5-next: decay gate {@code ssm_f_b(ssm_f_a x) + dt_b}, low-rank output gate
  *       {@code ssm_g_b(ssm_g_a x)} ({@link KdaGateMode#LOWRANK}; kimi-linear.cpp:314-317, 367-368,
  *       glm5-next.cpp:835-837, 874-875);</li>
  *   <li>kimi-k3: the same decay gate, full-rank output gate {@code ssm_g x} ({@link KdaGateMode#FULL_SSM_G};
@@ -71,6 +72,53 @@ public final class HybridHooksKda {
         b.situBeta(kv.f32Required(GgufKeys.ACTIVATION_SITU_BETA));            // kimi-k3.cpp:44
         b.situLinearBeta(kv.f32Required(GgufKeys.ACTIVATION_SITU_LINEAR_BETA));   // kimi-k3.cpp:45
         b.kdaGateMode(KdaGateMode.FULL_SSM_G);
+    }
+
+    /**
+     * AliceAI (vLLM models/alice_ai.py): the KDA geometry with the low-rank decay and output gates, a softplus
+     * decay gate ({@code kda_allow_negative_eigenvalues: false} maps to no lower bound), the sigmoid-routed MoE with
+     * a gated shared expert and the cross-layer attention-residual block size. The recurrent layers are the ones
+     * without KV heads; every KDA layer shares one head count, which sizes the shared recurrent-state rows.
+     */
+    public static void aliceAi(ModelHparamsBuilder b, GgufKv kv) {
+        HybridHooks.readRmsEps(b, kv);
+        b.ssmDConv(kv.u32Required(GgufKeys.SSM_CONV_KERNEL));
+        b.kdaHeadDim(kv.u32Required(GgufKeys.KDA_HEAD_DIM));
+        HybridHooks.markRecurrentByKvHeads(b);
+        requireUniformKdaHeads(b);
+        HparamsSupport.readExpertFfLength(b, kv, true);
+        b.nFfShexp(kv.u32(GgufKeys.EXPERT_SHARED_FEED_FORWARD_LENGTH, 0));
+        b.nExpertShared(kv.u32Required(GgufKeys.EXPERT_SHARED_COUNT));
+        b.nLayerDenseLead(kv.u32(GgufKeys.LEADING_DENSE_BLOCK_COUNT, 0));
+        b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, 1.0f));
+        b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, true));
+        b.gating(HybridHooks.requiredGating(kv));
+        b.attnResBlockSize(kv.u32Required(GgufKeys.ATTN_RES_BLOCK_SIZE));
+        b.kdaGateMode(KdaGateMode.LOWRANK);
+    }
+
+    /**
+     * AliceAI keeps one recurrent-state geometry for every KDA layer, so the layers must share a positive head count.
+     *
+     * @throws GgufFormatException when a KDA layer has no heads or the counts differ
+     */
+    private static void requireUniformKdaHeads(ModelHparamsBuilder b) {
+        int expected = 0;
+        for (int il = 0; il < b.nLayer(); il++) {
+            if (!b.isRecurrent(il)) {
+                continue;
+            }
+            int heads = b.nHead(il);
+            if (heads <= 0) {
+                throw HybridHooks.invalid(b, "KDA layer " + il + " has no attention head count");
+            }
+            if (expected == 0) {
+                expected = heads;
+            } else if (heads != expected) {
+                throw HybridHooks.invalid(b, "KDA layers must share one head count, got " + expected + " and "
+                        + heads + " on layer " + il);
+            }
+        }
     }
 
     /**

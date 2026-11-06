@@ -3,10 +3,12 @@ package com.eonmux.neuralfree.gguf.hf.tensor;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions.OutType;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
+import com.eonmux.neuralfree.gguf.hf.names.HfNameTables;
 import com.eonmux.neuralfree.gguf.memory.KvBlockCodec;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
+import com.eonmux.neuralfree.gguf.quant.TernaryBlockQuantizers;
 import com.eonmux.neuralfree.io.safetensors.StDType;
 import com.eonmux.neuralfree.tensor.HalfFloats;
 
@@ -30,19 +32,28 @@ import java.util.function.Predicate;
  *       weight suffix (base.py:1254 tests the suffix only when there is no override).</li>
  *   <li>Step 3: without an override, a forced-F32 name, or a name that does not end in {@code .weight},
  *       {@code .lora_a} or {@code .lora_b}, is F32 (base.py:1254-1284).</li>
- *   <li>Step 4: a float source (F32, F16, BF16, F64) takes the output type; a ggml block source keeps its type.</li>
- *   <li>Step 5: any other integer source is rejected.</li>
- *   <li>Step 6: an eight-, six- or four-bit float, unsigned, boolean or complex source is rejected.</li>
+ *   <li>Step 4: a float source (F32, F16, BF16, F64) takes the output type; a ggml block source keeps its type.
+ *       Under a ternary output type ({@code TQ1_0}/{@code TQ2_0}) the converter's embedding, output, altup-router
+ *       and laurel weights stay F16 instead (base.py:1513-1525), and a row that is not whole blocks of 256 falls
+ *       back to F16 the way a failed quantization does (base.py:1561-1564).</li>
+ *   <li>Step 5: an E4M3FN source keeps its codes as ggml's F8_E4M3FN when the output type is AUTO (the converter
+ *       preserves float8_e4m3fn weights, base.py:1475-1483), and is dequantized and typed as a float source
+ *       (step 4) otherwise.</li>
+ *   <li>Step 6: any other integer source is rejected.</li>
+ *   <li>Step 7: any other eight-, six- or four-bit float, unsigned, boolean or complex source is rejected.</li>
  * </ol>
  *
  * <p>The class also holds the value codec the transforms convert with ({@link #decode} reads any element format as
- * floats, {@link #encode} writes floats as F32, F16, BF16 or Q8_0) and the producers built on it: the element-wise
- * conversion behind {@link ElementTransforms#convert} and its element ops, and the integer tensors
+ * floats, {@link #encode} writes floats as F32, F16, BF16, Q8_0, TQ1_0 or TQ2_0) and the producers built on it: the
+ * element-wise conversion behind {@link ElementTransforms#convert} and its element ops, and the integer tensors
  * {@link ElementTransforms#keepInteger} marks.</p>
  */
 public final class DtypePolicy {
 
     private static final String[] WEIGHT_SUFFIXES = {".weight", ".lora_a", ".lora_b"};
+
+    /** The names that stay F16 under a ternary output type ({@code HfNameTables.ternaryKeptF16()}). */
+    private static final Predicate<String> TERNARY_F16 = HfNameTables.ternaryKeptF16();
 
     private final Predicate<String> forcedF32;
     private final OutType outType;
@@ -123,10 +134,16 @@ public final class DtypePolicy {
             return GGMLType.F32;
         }
         if (f.isFloat()) {
-            return floatTarget(f.ggmlType());
+            return weightTarget(ggufName, f.ggmlType());
         }
         if (f.isBlock()) {
             return f.ggmlType();
+        }
+        if (f.ggmlType() == GGMLType.F8_E4M3FN) {
+            // The stored E4M3FN codes are ggml's per-element F8_E4M3FN (llama.cpp GGML_TYPE_F8_E4M3):
+            // --outtype auto keeps them (base.py:1475-1483 preserves float8_e4m3fn weights), the named
+            // output types dequantize them and type them as any float weight.
+            return outType == OutType.AUTO ? GGMLType.F8_E4M3FN : weightTarget(ggufName, f.ggmlType());
         }
         if (isInteger(f)) {
             throw new GgufFormatException(ggufName + ": integer tensor of dtype " + f + " from " + src.describe()
@@ -138,14 +155,16 @@ public final class DtypePolicy {
 
     /**
      * {@code src} in the type {@link #typeFor} chooses: converted when the type differs from the source's, with the
-     * converter's F16 fallback for a Q8_0 target whose rows are not whole blocks (base.py:1318-1323).
+     * converter's F16 fallback for a Q8_0 target whose rows are not whole blocks (base.py:1318-1323) and for a
+     * TQ1_0 / TQ2_0 target whose rows are not whole blocks of 256 (a failed ternary quantization, base.py:1561-1564).
      */
     public RowSource apply(String ggufName, RowSource src, GGMLType forced) {
         GGMLType t = typeFor(ggufName, src, forced);
-        if (t == GGMLType.Q8_0 && src.format().ggmlType() != GGMLType.Q8_0) {
+        if ((t == GGMLType.Q8_0 || t == GGMLType.TQ1_0 || t == GGMLType.TQ2_0)
+                && src.format().ggmlType() != t) {
             long[] shape = src.shape();
             long inner = shape.length == 0 ? 1 : shape[shape.length - 1];
-            if (inner % GGMLType.Q8_0.getBlockSize() != 0) {
+            if (inner % t.getBlockSize() != 0) {
                 t = GGMLType.F16;
             }
         }
@@ -153,6 +172,17 @@ public final class DtypePolicy {
             return src;
         }
         return ElementTransforms.convert(src, t);
+    }
+
+    /**
+     * The type of a float (or dequantized) weight {@code ggufName}: F16 for the names a ternary output type keeps
+     * (base.py:1513-1525), the output type otherwise.
+     */
+    private GGMLType weightTarget(String ggufName, GGMLType source) {
+        if ((outType == OutType.TQ1_0 || outType == OutType.TQ2_0) && TERNARY_F16.test(ggufName)) {
+            return GGMLType.F16;
+        }
+        return floatTarget(source);
     }
 
     private GGMLType floatTarget(GGMLType source) {
@@ -173,6 +203,10 @@ public final class DtypePolicy {
                 return GGMLType.BF16;
             case Q8_0:
                 return GGMLType.Q8_0;
+            case TQ1_0:
+                return GGMLType.TQ1_0;
+            case TQ2_0:
+                return GGMLType.TQ2_0;
             default:
                 throw new IllegalStateException("unhandled output type " + outType);
         }
@@ -279,9 +313,10 @@ public final class DtypePolicy {
     /**
      * Writes {@code v[off, off + n)} as {@code target} at {@code out}'s position: F32, F16 and BF16 rounded to
      * nearest even; Q8_0 with the reference quantizer ({@code quantize_row_q8_0_ref}, rounding half away from zero),
-     * {@code n} a multiple of 32.
+     * {@code n} a multiple of 32; TQ1_0 and TQ2_0 with the reference ternary quantizers
+     * ({@code quantize_row_tq1_0_ref} / {@code quantize_row_tq2_0_ref}), {@code n} a multiple of 256.
      *
-     * @throws IllegalArgumentException for another target, or a Q8_0 run that is not whole blocks
+     * @throws IllegalArgumentException for another target, or a quantized run that is not whole blocks
      */
     static void encode(GGMLType target, float[] v, int off, int n, ByteBuffer out) {
         switch (target) {
@@ -312,9 +347,33 @@ public final class DtypePolicy {
                 }
                 return;
             }
+            case TQ1_0: {
+                int qk = GGMLType.TQ1_0.getBlockSize();
+                if (n % qk != 0) {
+                    throw new IllegalArgumentException(n + " elements are not whole TQ1_0 blocks of " + qk);
+                }
+                byte[] block = new byte[GGMLType.TQ1_0.getTypeSize()];
+                for (int i = 0; i < n; i += qk) {
+                    TernaryBlockQuantizers.quantizeTq1_0(v, off + i, block, 0);
+                    out.put(block);
+                }
+                return;
+            }
+            case TQ2_0: {
+                int qk = GGMLType.TQ2_0.getBlockSize();
+                if (n % qk != 0) {
+                    throw new IllegalArgumentException(n + " elements are not whole TQ2_0 blocks of " + qk);
+                }
+                byte[] block = new byte[GGMLType.TQ2_0.getTypeSize()];
+                for (int i = 0; i < n; i += qk) {
+                    TernaryBlockQuantizers.quantizeTq2_0(v, off + i, block, 0);
+                    out.put(block);
+                }
+                return;
+            }
             default:
-                throw new IllegalArgumentException("cannot convert to " + target + "; the targets are F32, F16, BF16"
-                        + " and Q8_0");
+                throw new IllegalArgumentException("cannot convert to " + target + "; the targets are F32, F16,"
+                        + " BF16, Q8_0, TQ1_0 and TQ2_0");
         }
     }
 

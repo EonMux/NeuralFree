@@ -110,10 +110,17 @@ public final class KernelInventoryChecks {
         return kernels;
     }
 
-    /** Kernels above {@link #MAX_SCALARS} scalars or {@link #MAX_BUFFERS} buffers. */
+    /**
+     * Kernels above {@link #MAX_SCALARS} scalars or {@link #MAX_BUFFERS} buffers, except those of {@code [cuda]}
+     * files: the limits are the Vulkan push block's and binding table's, which the CUDA build does not have.
+     */
     public List<String> argumentLimitViolations() {
+        Set<String> cudaOnly = new HashSet<>(manifest.cudaOnlyPaths());
         List<String> violations = new ArrayList<>();
         for (KernelSig k : kernels) {
+            if (cudaOnly.contains(k.file)) {
+                continue;
+            }
             if (k.scalars > MAX_SCALARS) {
                 violations.add(k + ": " + k.scalars + " scalars > " + MAX_SCALARS);
             }
@@ -138,11 +145,15 @@ public final class KernelInventoryChecks {
         return duplicates(kernels);
     }
 
-    /** Portable kernels (of files not in {@code openClOnly}, the OpenCL-only paths) without exactly one variant row. */
+    /**
+     * Portable kernels (of files neither in {@code openClOnly}, the OpenCL-only paths, nor tagged {@code [cuda]})
+     * without exactly one variant row.
+     */
     public List<String> variantRowViolations(Set<String> openClOnly) {
+        Set<String> cudaOnly = new HashSet<>(manifest.cudaOnlyPaths());
         List<String> violations = new ArrayList<>();
         for (KernelSig k : kernels) {
-            if (openClOnly.contains(k.file)) {
+            if (openClOnly.contains(k.file) || cudaOnly.contains(k.file)) {
                 continue;
             }
             List<String> rows = variantRows.get(k.name);
@@ -155,18 +166,22 @@ public final class KernelInventoryChecks {
         return violations;
     }
 
-    /** Variant rows that name no kernel of a file outside {@code openClOnly}, then the malformed rows. */
+    /**
+     * Variant rows that name no inventory kernel (a kernel of a file outside {@code openClOnly}), then the malformed
+     * rows. A {@code [cuda]} file's kernel may have a row, its optional Vulkan twin, as the build's inventory
+     * coverage check allows.
+     */
     public List<String> orphanVariantRowViolations(Set<String> openClOnly) {
-        Set<String> portable = new HashSet<>();
+        Set<String> inventory = new HashSet<>();
         for (KernelSig k : kernels) {
             if (!openClOnly.contains(k.file)) {
-                portable.add(k.name);
+                inventory.add(k.name);
             }
         }
         List<String> violations = new ArrayList<>();
         for (Map.Entry<String, List<String>> e : variantRows.entrySet()) {
-            if (!portable.contains(e.getKey())) {
-                violations.add(e.getKey() + " (" + e.getValue() + ") is not a kernel of a portable manifest file");
+            if (!inventory.contains(e.getKey())) {
+                violations.add(e.getKey() + " (" + e.getValue() + ") is not a kernel of an inventory manifest file");
             }
         }
         violations.addAll(variantFormatErrors);

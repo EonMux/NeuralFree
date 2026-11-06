@@ -55,6 +55,10 @@ import java.util.Set;
  *   inputs) and the gradients in the slots of leaves this graph gave gradients to are never closed. A caller that
  *   needs an intermediate result after its graph is released takes its own reference with {@link Tensor#detach()}
  *   first.</li>
+ *   <li>The graph remembers the leaves it gave gradients to only weakly: the thread's graph outlives every model it
+ *   trains, so it never keeps a leaf (and the module, storage and backend behind it) reachable once its owner dropped
+ *   it. The gradient of a dropped leaf stays with that leaf; its owner closes it (the parameter's, module's or
+ *   optimizer's {@code zeroGrad}).</li>
  *   <li>Outputs of the identity nodes {@link Autograd#reattach} records belong to the graph: every way a node leaves
  *   the graph (release, {@link #discardRecordedSince}, {@link #clear()}, pruning, {@link StepScope}) closes them.</li>
  *   <li>{@link #zeroGrad()} closes and clears the gradients of the leaves this graph gave gradients to and of the
@@ -75,13 +79,14 @@ public final class ComputationGraph {
 
     private final List<GraphNode> nodes;
     private final Map<Tensor, GraphNode> tensorToNode;
+    /** The leaves this graph gave gradients to, held weakly: the graph never keeps a parameter reachable. */
     private final Set<Tensor> gradientLeaves;
     private long nextSequence;
 
     private ComputationGraph() {
         this.nodes = new ArrayList<>();
         this.tensorToNode = new IdentityHashMap<>();
-        this.gradientLeaves = identitySet();
+        this.gradientLeaves = new WeakIdentitySet<>();
     }
 
     public static ComputationGraph current() {

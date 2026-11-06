@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.gguf.hf.tensor.HfTensorIndex;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.testutil.GgufTestWriter;
+import com.eonmux.neuralfree.gguf.testutil.SyntheticHf;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfTokenizerFiles;
 import org.junit.Rule;
 import org.junit.Test;
@@ -164,7 +165,33 @@ public class HfMistral3HooksTest {
         assertFalse(text.containsKey(GgufKeys.TOKENIZER_ADD_EOS));
     }
 
+    @Test
+    public void aMistral3ModelEmbeddingCheckpointPinsTheNemotronEmbedPreTokenizer() throws Exception {
+        Map<String, Object> mistral3 = gpt2Vocab("{'architectures': ['Mistral3Model'], " + LLAMA_BASE
+                + ", 'is_causal': false}");
+        assertEquals(HfMistral3Hooks.NEMOTRON_EMBED_PRE, mistral3.get(GgufKeys.TOKENIZER_PRE));
+        assertEquals(Boolean.FALSE, mistral3.get(GgufKeys.TOKENIZER_ADD_BOS));
+        Map<String, Object> ministral3 = gpt2Vocab("{'architectures': ['Ministral3Model'], " + LLAMA_BASE
+                + ", 'is_causal': false}");
+        assertEquals("the fingerprint name", "gpt-2", ministral3.get(GgufKeys.TOKENIZER_PRE));
+    }
+
     // ------------------------------------------------------------------ helpers
+
+    /** The vocabulary of {@code configs} over the GPT-2 BPE tokenizer.json fixture, its fingerprint naming gpt-2. */
+    private Map<String, Object> gpt2Vocab(String configs) throws Exception {
+        Path dir = tmp.newFolder().toPath();
+        Files.writeString(dir.resolve("config.json"), configs.replace('\'', '"'), StandardCharsets.UTF_8);
+        Files.writeString(dir.resolve("tokenizer.json"), SyntheticHf.GPT2_TOKENIZER, StandardCharsets.UTF_8);
+        Files.writeString(dir.resolve("tokenizer_config.json"), SyntheticHf.GPT2_TOKENIZER_CONFIG,
+                StandardCharsets.UTF_8);
+        HfConfig cfg = config(configs);
+        HfArchEntry entry = HfArchRegistry.resolve(cfg, HfArchEntry.Kind.TEXT);
+        HfLoadContext ctx = HfLoadContext.builder(cfg, entry, Arch.MISTRAL3)
+                .tokenizerFiles(HfTokenizerFiles.locate(dir))
+                .build();
+        return HfMistral3Hooks.vocab(ctx, (tj, encode) -> "gpt-2");
+    }
 
     /** The vocabulary of {@code configs} over a distributed GGUF tokenizer, as the assembler builds it. */
     private Map<String, Object> vocab(String configs, Arch arch) throws Exception {

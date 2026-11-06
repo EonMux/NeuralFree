@@ -58,14 +58,13 @@ public final class LoraAdapter {
     }
 
     /**
-     * The content digest of the adapter, §5.5.1 N-2's persistent identity, as 64 hex characters together with
+     * The content digest of the adapter, the persistent identity, as 64 hex characters together with
      * {@link #contentLength}: a SHA-256 over the canonical view metadata ({@code general.architecture},
      * {@code adapter.lora.alpha} — which folds a PEFT {@code use_rslora} adapter's alpha at open, the task and
      * aLoRA metadata and every remaining metadata scalar, in sorted key order), the target mapping and tensor
      * table (target name, pair kind, dimensions and rank per adapted tensor) and the exact tensor bytes the
-     * forward pass computes from — the decoded F32 halves of every pair. PC-8's {@code ContentDigest} recomputes
-     * this over the same recipe once the exact-bytes content-input regime of PC-8 exists; this constructor's form
-     * needs no file re-read after load.
+     * forward pass computes from — the decoded F32 halves of every pair. The digest needs no file re-read
+     * after load.
      */
     public String digest() {
         return digest;
@@ -173,6 +172,29 @@ public final class LoraAdapter {
     public int[] invocationTokens() { return invocationTokens.clone(); }
     /** True for an activated LoRA, whose delta applies only from its invocation tokens on. */
     public boolean isActivated() { return invocationTokens.length > 0; }
+    /**
+     * The start of the last occurrence of the invocation tokens in {@code tokens}, the first row an activated LoRA
+     * applies to (llama.cpp's backward scan of {@code launch_slot_with_task}); -1 when they do not occur or the
+     * adapter is not activated.
+     */
+    public int invocationStart(int[] tokens) {
+        Objects.requireNonNull(tokens, "tokens");
+        int n = invocationTokens.length;
+        if (n == 0) {
+            return -1;
+        }
+        for (int start = tokens.length - n; start >= 0; start--) {
+            boolean match = true;
+            for (int i = 0; i < n && match; i++) {
+                match = tokens[start + i] == invocationTokens[i];
+            }
+            if (match) {
+                return start;
+            }
+        }
+        return -1;
+    }
+
     /** Scalar metadata of the adapter file as strings (llama_adapter_meta_*). */
     public Map<String, String> metadata() { return metadata; }
     /** Names of the adapted base tensors, in file order. */
@@ -219,6 +241,14 @@ public final class LoraAdapter {
                 + (invocationTokens.length > 0 ? ", aLoRA" : "") + '}';
     }
 
+    /** The model a pair adapts: the text model's weights, or the vision/connector tensors of its mmproj file. */
+    public enum Side {
+        /** A tensor of the text model's forward pass. */
+        TEXT,
+        /** A tensor of the vision encoder or its connector (the mmproj file beside the text model). */
+        VISION
+    }
+
     /** The product a pair adapts. */
     public enum Target {
         /** A dense projection {@code W {in, out}}. */
@@ -244,6 +274,7 @@ public final class LoraAdapter {
     public static final class Pair {
         final String target;
         final Target kind;
+        final Side side;
         final int inDim;
         final int outDim;
         final int rank;
@@ -251,12 +282,20 @@ public final class LoraAdapter {
         final float[] a;
         final float[] b;
 
-        /** A projection ({@code embedding} false) or token-embedding pair. */
+        /** A projection ({@code embedding} false) or token-embedding pair of the text model. */
         Pair(String target, boolean embedding, int inDim, int outDim, int rank, float[] a, float[] b) {
-            this(target, embedding ? Target.EMBEDDING : Target.PROJECTION, inDim, outDim, rank, 1, a, b);
+            this(target, embedding ? Target.EMBEDDING : Target.PROJECTION, Side.TEXT, inDim, outDim, rank, 1, a, b);
         }
 
+        /** A text-model pair of {@code kind}. */
         Pair(String target, Target kind, int inDim, int outDim, int rank, int experts, float[] a, float[] b) {
+            this(target, kind, Side.TEXT, inDim, outDim, rank, experts, a, b);
+        }
+
+        /** A pair of {@code side} and {@code kind}. */
+        Pair(String target, Target kind, Side side, int inDim, int outDim, int rank, int experts, float[] a,
+             float[] b) {
+            this.side = Objects.requireNonNull(side, "side");
             if (inDim < 1 || outDim < 1 || rank < 1 || experts < 1) {
                 throw new IllegalArgumentException("LoRA pair of " + target + " needs positive sizes, got in " + inDim
                         + ", out " + outDim + ", rank " + rank + ", experts " + experts);
@@ -279,6 +318,8 @@ public final class LoraAdapter {
 
         public String target() { return target; }
         public Target kind() { return kind; }
+        /** The model whose weights this pair adapts. */
+        public Side side() { return side; }
         /** True for a token-embedding table, adapted per looked-up row. */
         public boolean embedding() { return kind == Target.EMBEDDING; }
         /** Projection input width, or the vocabulary size of an embedding table. */
@@ -291,7 +332,8 @@ public final class LoraAdapter {
 
         @Override
         public String toString() {
-            return "LoraAdapter.Pair{" + target + ", " + kind + ", " + inDim + " -> " + outDim + ", rank " + rank
+            return "LoraAdapter.Pair{" + target + ", " + kind + (side == Side.VISION ? ", vision" : "") + ", "
+                    + inDim + " -> " + outDim + ", rank " + rank
                     + (experts > 1 ? ", " + experts + " experts" : "") + '}';
         }
     }
@@ -300,7 +342,7 @@ public final class LoraAdapter {
      * One pair bound to a scale. {@link #a()} and {@link #scaledB()} are the F32 arrays the device paths upload; the
      * CPU products use {@link CpuMatVec#PLAIN} over F32 views of {@code A} and the scaled {@code B}, built on first
      * use and dropped by {@link #rescale}. The pair and {@code alpha} are immutable; the bound scale is an engine
-     * thread's mutability (LR-1).
+     * thread's mutability.
      */
     public static final class Delta {
         private final Pair pair;
@@ -325,7 +367,7 @@ public final class LoraAdapter {
         /**
          * Rewrites {@code scaledB} to the effective scale of {@code userScale} × B in place and drops the cached
          * device views, so the next product rebuilds them from the new bytes. Same as the engine's rescale between
-         * steps (LR-1): it runs on the engine thread between two steps, never while a step dispatches.
+         * steps: it runs on the engine thread between two steps, never while a step dispatches.
          */
         public void rescale(float newUserScale) {
             if (!Float.isFinite(newUserScale)) {
@@ -348,33 +390,82 @@ public final class LoraAdapter {
         }
 
         /**
-         * {@code y[t] += scale * B (A x[t])} for {@code nTokens} rows of a projection.
-         *
-         * @param tmp scratch of at least {@code tmpOff + nTokens * rank} floats, overwritten
-         * @throws IllegalStateException for an expert or embedding pair
+         * {@link #add(int, float[], int, int, float[], int, float[], int, int)} at scale 1.
          */
         public void add(int nTokens, float[] x, int xOff, int xStride, float[] tmp, int tmpOff, float[] y, int yOff,
                         int yStride) {
+            addScaled(1.0f, nTokens, x, xOff, xStride, tmp, tmpOff, y, yOff, yStride);
+        }
+
+        /**
+         * {@code y[t] += scale * (scale * B) (A x[t])} for {@code nTokens} rows of a projection: the effective
+         * scale of {@code userScale} times {@code factor} ({@code factor} 1.0 adds the bound delta as bound; a
+         * rescaled slot's rows run it at their slot key's factor of it).
+         *
+         * @param tmp scratch of at least {@code tmpOff + nTokens * rank} floats, overwritten
+         * @throws IllegalStateException     for an expert or embedding pair
+         * @throws IllegalArgumentException  for a non-finite factor
+         */
+        public void addScaled(float factor, int nTokens, float[] x, int xOff, int xStride, float[] tmp, int tmpOff,
+                              float[] y, int yOff, int yStride) {
             require(Target.PROJECTION, "add");
+            if (!Float.isFinite(factor)) {
+                throw new IllegalArgumentException("LoRA pair " + pair.target + " needs a finite factor, got "
+                        + factor);
+            }
             Views v = views();
+            if (factor == 1.0f) {
+                CpuMatVec.PLAIN.matmul(v.a, x, xOff, xStride, tmp, tmpOff, pair.rank, nTokens);
+                for (int t = 0; t < nTokens; t++) {
+                    CpuMatVec.PLAIN.matvecAdd(v.b, tmp, tmpOff + t * pair.rank, y, yOff + t * yStride);
+                }
+                return;
+            }
             CpuMatVec.PLAIN.matmul(v.a, x, xOff, xStride, tmp, tmpOff, pair.rank, nTokens);
             for (int t = 0; t < nTokens; t++) {
-                CpuMatVec.PLAIN.matvecAdd(v.b, tmp, tmpOff + t * pair.rank, y, yOff + t * yStride);
+                scaledMatvecAdd(v.b, tmp, tmpOff + t * pair.rank, factor, y, yOff + t * yStride);
+            }
+        }
+
+        /** {@code y[yOff + o] += factor * (b[o] . tmp[tmpOff ..])} over the pair's outputs. */
+        private void scaledMatvecAdd(CpuTensorRef b, float[] tmp, int tmpOff, float factor, float[] y, int yOff) {
+            int r = pair.rank;
+            int out = pair.outDim;
+            for (int o = 0; o < out; o++) {
+                ByteBuffer row = b.rowBuffer(o);
+                int off = b.rowOffset(o);
+                float acc = 0.0f;
+                for (int j = 0; j < r; j++) {
+                    acc += row.getFloat(off + 4 * j) * tmp[tmpOff + j];
+                }
+                y[yOff + o] += factor * acc;
             }
         }
 
         /**
-         * {@code y[p] += scale * B[ids[p]] (A[ids[p]] x_p)} for the {@code pairs} pairs {@code p = t*k + j}: the input
-         * row of pair {@code p} at {@code xOff + (tokenRows ? p / k : p) * inDim}, its output row at
-         * {@code yOff + p * outDim}.
-         *
-         * @param tmp scratch of at least {@code rank + outDim} floats, overwritten
-         * @throws IllegalStateException    for a projection or embedding pair
-         * @throws IllegalArgumentException for an expert id outside the pair's experts
+         * {@link #addExperts(int, int, int[], float[], int, boolean, float[], float[], int)} at scale 1.
          */
         public void addExperts(int pairs, int k, int[] ids, float[] x, int xOff, boolean tokenRows, float[] tmp,
                                float[] y, int yOff) {
+            addExpertsScaled(1.0f, pairs, k, ids, x, xOff, tokenRows, tmp, y, yOff);
+        }
+
+        /**
+         * {@code y[p] += factor * (scale * B[ids[p]]) (A[ids[p]] x_p)} for the {@code pairs} pairs
+         * {@code p = t*k + j}: the input row of pair {@code p} at {@code xOff + (tokenRows ? p / k : p) * inDim},
+         * its output row at {@code yOff + p * outDim}.
+         *
+         * @param tmp scratch of at least {@code rank + outDim} floats, overwritten
+         * @throws IllegalStateException    for a projection or embedding pair
+         * @throws IllegalArgumentException for an expert id outside the pair's experts or a non-finite factor
+         */
+        public void addExpertsScaled(float factor, int pairs, int k, int[] ids, float[] x, int xOff, boolean tokenRows,
+                                     float[] tmp, float[] y, int yOff) {
             require(Target.EXPERTS, "addExperts");
+            if (!Float.isFinite(factor)) {
+                throw new IllegalArgumentException("LoRA pair " + pair.target + " needs a finite factor, got "
+                        + factor);
+            }
             Views v = views();
             int r = pair.rank;
             int out = pair.outDim;
@@ -389,19 +480,31 @@ public final class LoraAdapter {
                 CpuMatVec.PLAIN.matvecRows(v.b, (long) e * out, out, tmp, 0, tmp, r);
                 int base = yOff + p * out;
                 for (int o = 0; o < out; o++) {
-                    y[base + o] += tmp[r + o];
+                    y[base + o] += factor * tmp[r + o];
                 }
             }
         }
 
         /**
-         * {@code y[t] += scale * B A[ids[idsOff + t]]} for {@code n} embedded rows (llama-graph.cpp:2694-2709).
-         *
-         * @throws IllegalStateException    for a projection or expert pair
-         * @throws IllegalArgumentException for an id outside the table
+         * {@link #addEmbedding(int, int[], int, float[], int, int)} at scale 1.
          */
         public void addEmbedding(int n, int[] ids, int idsOff, float[] y, int yOff, int yStride) {
+            addEmbeddingScaled(1.0f, n, ids, idsOff, y, yOff, yStride);
+        }
+
+        /**
+         * {@code y[t] += factor * (scale * B) A[ids[idsOff + t]]} for {@code n} embedded rows
+         * (llama-graph.cpp:2694-2709); {@code factor} is the delta's slot's factor of the bound scale.
+         *
+         * @throws IllegalStateException    for a projection or expert pair
+         * @throws IllegalArgumentException for an id outside the table or a non-finite factor
+         */
+        public void addEmbeddingScaled(float factor, int n, int[] ids, int idsOff, float[] y, int yOff, int yStride) {
             require(Target.EMBEDDING, "addEmbedding");
+            if (!Float.isFinite(factor)) {
+                throw new IllegalArgumentException("LoRA pair " + pair.target + " needs a finite factor, got "
+                        + factor);
+            }
             Views v = views();
             for (int t = 0; t < n; t++) {
                 int id = ids[idsOff + t];
@@ -409,7 +512,15 @@ public final class LoraAdapter {
                     throw new IllegalArgumentException("token " + id + " is outside the " + pair.inDim
                             + " rows of the LoRA table of " + pair.target);
                 }
-                CpuMatVec.PLAIN.matvecAdd(v.b, pair.a, id * pair.rank, y, yOff + t * yStride);
+                for (int o = 0; o < pair.outDim; o++) {
+                    ByteBuffer bRow = v.b.rowBuffer(o);
+                    int bOff = v.b.rowOffset(o);
+                    float acc = 0.0f;
+                    for (int j = 0; j < pair.rank; j++) {
+                        acc += bRow.getFloat(bOff + 4 * j) * pair.a[id * pair.rank + j];
+                    }
+                    y[yOff + t * yStride + o] += factor * acc;
+                }
             }
         }
 

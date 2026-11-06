@@ -122,14 +122,16 @@ public final class ReplayBuffer implements AutoCloseable {
      * Draws {@code batchSize} stored transitions, uniformly or by priority. The batch's state, next-state and
      * continuous-action rows are fresh copies the caller owns: modifying them does not change the stored transitions.
      *
-     * @throws IllegalStateException when fewer than {@code batchSize} transitions are stored
+     * @throws IllegalStateException when the buffer is not full and holds fewer than {@code batchSize} transitions
+     *                               (a full buffer serves any batch size, drawing with replacement, as
+     *                               Stable-Baselines3's replay buffer does)
      */
     public synchronized SampleBatch sample(int batchSize, Random random) {
         checkNotClosed();
-        if (size < batchSize) {
+        Objects.requireNonNull(random, "Random cannot be null");
+        if (!isFull() && size < batchSize) {
             throw new IllegalStateException("Not enough transitions: have " + size + ", need " + batchSize);
         }
-        Objects.requireNonNull(random, "Random cannot be null");
 
         int[] indices = new int[batchSize];
         float[] weights = new float[batchSize];

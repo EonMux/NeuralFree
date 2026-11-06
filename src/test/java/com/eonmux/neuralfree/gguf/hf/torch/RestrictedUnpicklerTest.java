@@ -203,6 +203,17 @@ public class RestrictedUnpicklerTest {
             return this;
         }
 
+        /** A {@code BINFLOAT} (8 big-endian IEEE bytes). */
+        Pb binfloat(double v) {
+            long bits = Double.doubleToRawLongBits(v);
+            byte[] b = new byte[9];
+            b[0] = 0x47;
+            for (int i = 0; i < 8; i++) {
+                b[1 + i] = (byte) (bits >>> (8 * (7 - i)));
+            }
+            return rawBytes(b);
+        }
+
         byte[] build() {
             return out.toByteArray();
         }
@@ -257,7 +268,7 @@ public class RestrictedUnpicklerTest {
         o.write(0x93); // STACK_GLOBAL
         o.write(0x94); // MEMOIZE (slot 0)
         o.write(0x2e); // STOP
-        assertEquals("torch._utils._rebuild_tensor_v2", unpickle(o.toByteArray()));
+        assertEquals("c:torch._utils._rebuild_tensor_v2", unpickle(o.toByteArray()));
     }
 
     @Test
@@ -281,10 +292,17 @@ public class RestrictedUnpicklerTest {
         b.str("p");
         b.global("torch._utils", "_rebuild_parameter");
         b.mark();
+        // The saved tensor: torch writes _rebuild_tensor_v2 as its own REDUCE inside the parameter's arguments
+        // (torch/_utils.py _rebuild_parameter takes the built tensor, its requires_grad flag and its hooks).
+        b.global("torch._utils", "_rebuild_tensor_v2");
+        b.mark();
         b.viewBytes("HalfStorage", "9", "cpu", 0, 2, 3);
+        b.tuple();
+        b.reduce();
         b.raw(0x88); // the parameter's requires_grad
         b.newOd();   // the parameter's hooks
         b.tuple();
+        b.reduce();
         b.raw(0x73); // SETITEM
         b.stop();
         Map<?, ?> d = (Map<?, ?>) unpickle(b.build());
@@ -334,8 +352,9 @@ public class RestrictedUnpicklerTest {
         b.stop();
         IOException e = assertThrows(IOException.class, () -> unpickle(b.build()));
         assertEquals("Invalid PyTorch checkpoint pickle: the global 'os.system' is not on the allowed list"
-                + " (torch._utils._rebuild_tensor_v2, torch._utils._rebuild_parameter, torch's storage classes,"
-                + " torch.storage.UntypedStorage, collections.OrderedDict)", e.getMessage());
+                + " (torch's tensor rebuild functions, its plain storage classes, torch.storage.UntypedStorage,"
+                + " torch.device, torch.Size, its dtype constants, collections.OrderedDict, and the torchao tensor"
+                + " subclasses with their attribute and enum classes)", e.getMessage());
     }
 
     @Test
@@ -378,7 +397,7 @@ public class RestrictedUnpicklerTest {
         Pb b = new Pb().proto(2).global("torch", "FloatStorage").emptyTuple().reduce().stop();
         IOException e = assertThrows(IOException.class, () -> unpickle(b.build()));
         assertEquals("Invalid PyTorch checkpoint pickle: REDUCE builds from 'torch.FloatStorage', which is not an"
-                + " allowed global", e.getMessage());
+                + " allowed function or enum", e.getMessage());
     }
 
     @Test
@@ -439,6 +458,25 @@ public class RestrictedUnpicklerTest {
     }
 
     @Test
+    public void binfloatCarriesAnAttributeValue() throws IOException {
+        assertEquals(0.25, (Double) unpickle(new Pb().proto(2).binfloat(0.25).stop().build()), 0.0);
+    }
+
+    @Test
+    public void torchSizeBecomesAnIntegerTuple() throws IOException {
+        Pb b = new Pb().proto(2);
+        b.global("torch", "Size").mark().mark().b1(2).b1(3).tuple().tuple().reduce().stop();
+        assertTrue(Arrays.equals(new Long[]{2L, 3L}, (Long[]) unpickle(b.build())));
+    }
+
+    @Test
+    public void torchDeviceTakesAnIndex() throws IOException {
+        Pb b = new Pb().proto(2);
+        b.global("torch", "device").mark().str("cuda").b1(0).tuple().reduce().stop();
+        assertEquals("cuda:0", unpickle(b.build()));
+    }
+
+    @Test
     public void long1CarriesOffsetsPastTheIntMax() throws IOException {
         Pb b = new Pb().proto(2);
         b.global("torch._utils", "_rebuild_tensor_v2");
@@ -455,8 +493,7 @@ public class RestrictedUnpicklerTest {
         b.tuple();
         b.mark();
         b.b1(1);
-        b.b1(1);
-        b.tuple();
+        b.tuple(); // the stride list is as long as the shape list (torch/_utils.py _rebuild_tensor_v2)
         b.raw(0x88);
         b.newOd();
         b.tuple();

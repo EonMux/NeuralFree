@@ -1,0 +1,40 @@
+/* rms_norm_unbiased.comp - LLM_RmsNormUnbiased: the pockettts flow time embedder's _rms_norm. GLSL twin of
+ * kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n, f eps, R x, R w, W y).
+ *   mean = sum(x)/n; var = sum((x-mean)^2)/n; denom = sqrt(var*n/(n-1) + eps); y[i] = x[i]/denom * w[i].
+ * One row of n >= 2 values. Dispatch: 1-D, one invocation per element, global = roundUp(n, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfRnuX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfRnuW { float w_in[]; };
+layout(std430, binding = 2) writeonly buffer NfRnuY { float y_out[]; };
+
+layout(push_constant) uniform NfRnuParams {
+    int n;
+    float eps;
+} pc;
+
+void main() {
+    const uint i = nf_global_id();
+    if (i >= uint(pc.n)) {
+        return;
+    }
+    float mean = 0.0;
+    for (int d = 0; d < pc.n; ++d) {
+        mean += x_in[uint(d)];
+    }
+    mean /= float(pc.n);
+    float var = 0.0;
+    for (int d = 0; d < pc.n; ++d) {
+        const float diff = x_in[uint(d)] - mean;
+        var += diff * diff;
+    }
+    var /= float(pc.n);
+    const float denom = sqrt(var * float(pc.n) / float(pc.n - 1) + pc.eps);
+    y_out[i] = x_in[i] / denom * w_in[i];
+}

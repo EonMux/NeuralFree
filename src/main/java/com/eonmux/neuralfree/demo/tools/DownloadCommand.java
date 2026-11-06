@@ -3,14 +3,16 @@ package com.eonmux.neuralfree.demo.tools;
 import com.eonmux.neuralfree.gguf.hub.HubCache;
 import com.eonmux.neuralfree.gguf.hub.HubClient;
 import com.eonmux.neuralfree.gguf.hub.HubRef;
+import com.eonmux.neuralfree.gguf.mm.MmprojSources;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
 
 /**
- * {@code nftool download}: the Hugging Face Hub surface of PARITY.md WP TL-7, the mirror of
+ * {@code nftool download}: the Hugging Face Hub surface of the tools, the mirror of
  * llama.cpp's {@code -hf} model selection ({@code common/download.cpp:731-834}) around
  * {@link HubClient}: the repository file list is fetched online when {@code HF_HUB_OFFLINE} is not
  * set, and read back from {@link HubCache} otherwise, exactly as llama.cpp's downloader falls back to
@@ -20,9 +22,10 @@ import java.util.regex.Pattern;
  * every shard but the first. The primary model and its split shards ({@link #splitFiles}) download
  * into the hub cache, and the tool prints the snapshot path of the primary model — the path the
  * {@code -hf} option of the demos opens as their model. Every downloaded path stays inside the cache
- * root and is verified (TL-7's path confinement and the LFS sha256 pointer), {@code HF_TOKEN} reaches
- * the client's {@code Authorization} header and is never printed, and the repository listing is
- * untrusted input parsed under the plan's untrusted JSON limits.
+ * root and is verified (the cache's path confinement and the LFS sha256 pointer), {@code HF_TOKEN} or the
+ * token file of {@code HF_TOKEN_PATH} / {@code HF_HOME/token} reaches the client's {@code Authorization}
+ * header and is never printed, and the repository listing is
+ * untrusted input parsed under the untrusted JSON limits.
  */
 public final class DownloadCommand {
 
@@ -43,9 +46,13 @@ public final class DownloadCommand {
             + "                                               takes it; quant defaults to Q4_K_M\n"
             + "                                               (then Q8_0, then the first model file)\n"
             + "  -hff, --hf-file <file>        the repository file to download, in place of the quant tag\n"
+            + "  -cl, --cache-list             show list of models in cache and exit\n"
             + "environment:\n"
             + "  HF_HUB_OFFLINE=1              use the hub cache only; an uncached repository is an error\n"
-            + "  HF_TOKEN                      access token, sent in the Authorization header, never printed\n"
+            + "  HF_TOKEN                      access token, sent in the Authorization header, never printed;\n"
+            + "                                when it is unset, the token file HF_TOKEN_PATH names, else\n"
+            + "                                HF_HOME/token (what `hf auth login` writes), is sent\n"
+            + "  HF_HUB_DISABLE_IMPLICIT_TOKEN send no token from HF_TOKEN or the token file\n"
             + "  LLAMA_CACHE, HF_HUB_CACHE, HUGGINGFACE_HUB_CACHE, HF_HOME,   the cache root\n"
             + "  XDG_CACHE_HOME                 (llama.cpp's precedence; see HubCache.defaultRoot)\n"
             + "  --help, -h                    this text\n";
@@ -85,6 +92,16 @@ public final class DownloadCommand {
                 System.out.println(USAGE);
                 return null;
             }
+            if (a.equals("-cl") || a.equals("--cache-list")) {
+                try {
+                    com.eonmux.neuralfree.cli.CacheListing.print(System.out,
+                            new HubCache(HubCache.defaultRoot()));
+                } catch (IOException | IllegalStateException | IllegalArgumentException e) {
+                    System.err.println("Error: " + e.getMessage());
+                    System.exit(1);
+                }
+                return null;
+            }
             if (a.equals("-hf") || a.equals("-hfr") || a.equals("--hf-repo")) {
                 spec = value(a, args, i++);
             } else if (a.equals("-hff") || a.equals("--hf-file")) {
@@ -119,6 +136,15 @@ public final class DownloadCommand {
      */
     public static String downloadModel(String spec, String hfFile)
             throws IOException, InterruptedException, UsageException {
+        return downloadModel(spec, hfFile, null);
+    }
+
+    /**
+     * {@link #downloadModel(String, String)} carrying {@code hfToken} instead of the environment's
+     * token (llama-bench's {@code -hft}); a null token keeps the environment's token.
+     */
+    public static String downloadModel(String spec, String hfFile, String hfToken)
+            throws IOException, InterruptedException, UsageException {
         HubRef ref;
         try {
             ref = HubRef.parse(spec);
@@ -126,7 +152,7 @@ public final class DownloadCommand {
             throw new UsageException(e.getMessage());
         }
         HubCache cache = new HubCache(HubCache.defaultRoot());
-        HubClient client = new HubClient(cache);
+        HubClient client = hfToken == null ? new HubClient(cache) : new HubClient(cache, hfToken);
         List<HubClient.RepoFile> files = new ArrayList<>();
         String commit = null;
         if (!HubClient.offline()) {
@@ -166,6 +192,115 @@ public final class DownloadCommand {
                     + (ref.quant() != null ? " for the quant tag " + ref.quant() : ""));
         }
         return download(client, ref, commit, splitFiles(files, primary));
+    }
+
+    /**
+     * The mmproj sidecar of the repository, llama.cpp's download plan (common/download.cpp): the
+     * {@code *mmproj*.gguf} file whose name pairs with the primary model downloads beside it, and the
+     * cache answers when the Hub is unreachable, as {@link #downloadModel} reads the model back. Null
+     * when no pairing sidecar is in the repository or the cache — the {@code --mmproj-auto} search then
+     * finds none and the model runs text-only.
+     */
+    public static Path downloadMmproj(String spec, String hfFile)
+            throws IOException, InterruptedException, UsageException {
+        HubRef ref;
+        try {
+            ref = HubRef.parse(spec);
+        } catch (IllegalArgumentException e) {
+            throw new UsageException(e.getMessage());
+        }
+        HubCache cache = new HubCache(HubCache.defaultRoot());
+        HubClient client = new HubClient(cache);
+        List<HubClient.RepoFile> files = new ArrayList<>();
+        String commit = null;
+        if (!HubClient.offline()) {
+            try {
+                commit = client.resolveCommit(ref);
+                files.addAll(client.listFiles(ref, commit));
+            } catch (IOException | IllegalArgumentException e) {
+                // llama.cpp: a repository that resolves to nothing reads back from the cache below
+            }
+        }
+        if (!files.isEmpty()) {
+            HubClient.RepoFile primary = primaryOf(files, ref, hfFile);
+            if (primary != null) {
+                return siblingDownload(client, ref, commit, files, primary.path(), ref.quant());
+            }
+        }
+        return cachedMmproj(cache, ref, hfFile);
+    }
+
+    /** The primary model file of the request: the {@code -hff} file, else the best model of the quant tag. */
+    private static HubClient.RepoFile primaryOf(List<HubClient.RepoFile> files, HubRef ref, String hfFile) {
+        if (hfFile != null && !hfFile.isEmpty()) {
+            for (HubClient.RepoFile f : files) {
+                if (f.path().equals(hfFile)) {
+                    return f;
+                }
+            }
+            return null;
+        }
+        return bestModel(files, ref.quant());
+    }
+
+    /** Downloads the sidecar {@link MmprojSources#bestSibling} names for the primary model, or answers null. */
+    private static Path siblingDownload(HubClient client, HubRef ref, String commit,
+                                        List<HubClient.RepoFile> files, String primaryPath, String tag)
+            throws IOException, InterruptedException {
+        List<String> candidates = new ArrayList<>();
+        for (HubClient.RepoFile f : files) {
+            candidates.add(f.path());
+        }
+        String sibling = MmprojSources.bestSibling(candidates, primaryPath, tag);
+        if (sibling == null) {
+            return null;
+        }
+        for (HubClient.RepoFile f : files) {
+            if (f.path().equals(sibling)) {
+                Path path = client.download(ref, commit, f);
+                System.out.println("hub: " + f.path() + " -> " + path);
+                return path;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The snapshot path of a cached sidecar of {@code ref}, or null, as {@link #cachedModelPath} picks the
+     * model: the primary of the cached files, then the sidecar pairing with it among the cached paths.
+     */
+    private static Path cachedMmproj(HubCache cache, HubRef ref, String hfFile) throws IOException {
+        try {
+            String commit = cache.cachedCommit(ref);
+            if (commit == null) {
+                return null;
+            }
+            List<HubCache.CachedFile> cached = cache.cachedFiles(ref.repository());
+            boolean explicitFile = hfFile != null && !hfFile.isEmpty();
+            String primary = null;
+            List<String> candidates = new ArrayList<>();
+            for (HubCache.CachedFile f : cached) {
+                candidates.add(f.repoPath());
+                if (primary == null && HubCache.isModel(f.repoPath())
+                        && (explicitFile ? f.repoPath().equals(hfFile) : isPrimaryCandidate(f, ref.quant()))) {
+                    primary = f.repoPath();
+                }
+            }
+            if (primary == null) {
+                return null;
+            }
+            String sibling = MmprojSources.bestSibling(candidates, primary, ref.quant());
+            for (HubCache.CachedFile f : cached) {
+                if (f.repoPath().equals(sibling)) {
+                    System.out.println("hub: cached " + f.repoPath() + " -> " + f.localPath());
+                    return f.localPath();
+                }
+            }
+            return null;
+        } catch (IllegalArgumentException e) {
+            // an invalid repository id, commit or cached path names nothing the loader may open
+            return null;
+        }
     }
 
     /** The snapshot paths of the model files, printed one hub line per file as each resolves. */

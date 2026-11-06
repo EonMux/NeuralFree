@@ -33,6 +33,13 @@ import java.util.function.Supplier;
  * gather, scatter or row index throws {@link IndexOutOfBoundsException} at the call on the CPU path and at the
  * backend's next host synchronization on the device path.</p>
  *
+ * <p><b>FLOAT64.</b> The forward arithmetic, the unary functions and activations, {@link #sum}, {@link #mean},
+ * {@link #matmul}, {@link #bmm} and {@link #cat} also take operands that are all FLOAT64 and compute them in double
+ * precision on the host ({@code CpuFloat64}), returning FLOAT64; so do the forwards of {@link ConvOps} and
+ * {@link NormOps#batchNorm}. This is the double-precision reference of the gradient checks; the backward primitives
+ * and every other op are FLOAT32-only, and mixing FLOAT64 with another dtype in one op throws
+ * {@link IllegalArgumentException}.</p>
+ *
  * <p><b>Autograd.</b> A differentiable operation records one node ({@link Autograd#record}) exactly when grad mode is
  * on and one of its differentiable tensor operands requires grad ({@link Autograd#needsGrad}); its result then
  * requires grad and carries the node's gradient function ({@code GradFunctions}, {@code SelectionGradFunctions},

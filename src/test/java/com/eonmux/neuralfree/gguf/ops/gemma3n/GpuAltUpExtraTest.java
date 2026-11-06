@@ -260,6 +260,32 @@ public class GpuAltUpExtraTest {
         assertThrows(IllegalStateException.class, () -> ple.bind(ctx, spec.layer(0)));
     }
 
+    @Test
+    public void aShardedPerLayerTableReadsThePaddingRowForEmbeddingRows() {
+        GpuForwardContext ctx = context(gemma3n());
+        long cols = (long) N_LAYER * WIDTH;
+        int shardRows = VOCAB / 2;
+        List<GpuBuffer> shards = Arrays.asList(backend.allocateBuffer(shardRows * cols * Float.BYTES),
+                backend.allocateBuffer(shardRows * cols * Float.BYTES));
+        GpuWeight table = GpuWeight.sharded(TensorNames.weight(TensorNames.PER_LAYER_TOKEN_EMBD), GGMLType.F32,
+                new long[]{cols, VOCAB}, shards, new long[]{shardRows, shardRows});
+        GpuPleExtra.RowLookup lookup = GpuPleExtra.RowLookup.forStepTokens(ctx, table);
+        ScratchSlot out = scratch.temp(GpuPleExtra.TEMP_TOKENS, 3 * cols);
+        // the embedding stage records the null token for an embedding row
+        scratch.recordStepTokens(new int[]{-1, shardRows + 3, -1}, 3);
+
+        List<Dispatch> ds = run(() -> lookup.stepTokens(3, out.buffer(), out.offset()));
+        List<String> rows = new ArrayList<>();
+        for (Dispatch d : ds) {
+            List<? extends GpuBuffer> bufs = d.bufferArgs();
+            if (!bufs.isEmpty() && shards.contains(bufs.get(0))) {
+                rows.add("shard " + shards.indexOf(bufs.get(0)) + " row " + d.intArg(1));
+            }
+        }
+        assertEquals("embedding rows read row 0, the token row its own",
+                Arrays.asList("shard 0 row 0", "shard 1 row 3", "shard 0 row 0"), rows);
+    }
+
     // ------------------------------------------------------------------ fixtures
 
     private GpuLayerExtra bind(GpuForwardContext ctx, LayerSpec layer, String id) {

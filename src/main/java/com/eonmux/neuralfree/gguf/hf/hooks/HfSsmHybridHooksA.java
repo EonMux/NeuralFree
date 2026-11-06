@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.arch.HfNameFilter;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadataBuilder;
+import com.eonmux.neuralfree.gguf.hf.names.HfNameTables;
 import com.eonmux.neuralfree.gguf.hf.tensor.ElementTransforms;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfPlanView;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
@@ -81,6 +82,9 @@ public final class HfSsmHybridHooksA {
         m.put("mtp.layers.0.eh_proj.weight", "model.layers.{bid}.eh_proj.weight");
         m.put("mtp.layers.1.norm.weight", "model.layers.{bid}.post_attention_layernorm.weight");
         m.put("mtp.layers.1.final_layernorm.weight", "model.layers.{bid}.shared_head.norm.weight");
+        // a dense build's NextN block is the single attention layer 0 (vLLM mtp_hybrid_override_pattern "*"), so
+        // its end norm is the head norm
+        m.put("mtp.layers.0.final_layernorm.weight", "model.layers.{bid}.shared_head.norm.weight");
         MTP_SPECIAL_RENAMES = Collections.unmodifiableMap(m);
     }
 
@@ -382,12 +386,15 @@ public final class HfSsmHybridHooksA {
 
     // ------------------------------------------------------------------ NemotronHModel (nemotron.py:405)
 
-    /** True when the checkpoint is a MoE build: the flat configuration holds {@code num_experts_per_tok}. */
+    /**
+     * True when the checkpoint is a MoE build: the flat configuration holds the {@code num_experts_per_tok} key,
+     * whatever its value ({@code has_moe_params}, nemotron.py:449-451).
+     */
     public static boolean nemotronIsMoe(HfConfig cfg) {
-        return truthy(cfg.find("num_experts_per_tok").orElse(null));
+        return cfg.flat().containsKey("num_experts_per_tok");
     }
 
-    /** NEMOTRON_H_MOE for the {@code num_experts_per_tok} checkpoints, NEMOTRON_H otherwise (nemotron.py:429-433). */
+    /** NEMOTRON_H_MOE for the {@code num_experts_per_tok} checkpoints, NEMOTRON_H otherwise (nemotron.py:451-456). */
     public static Arch nemotronHArch(HfConfig cfg, com.eonmux.neuralfree.gguf.hf.tensor.HfTensorIndex index) {
         return nemotronIsMoe(cfg) ? Arch.NEMOTRON_H_MOE : Arch.NEMOTRON_H;
     }
@@ -402,22 +409,28 @@ public final class HfSsmHybridHooksA {
         if (lbt instanceof List && !((List<?>) lbt).isEmpty()) {
             out = out.withFlat(Map.of("num_hidden_layers", (long) ((List<?>) lbt).size()));
         }
-        if (nemotronIsMoe(cfg) && cfg.findLong(0, "num_nextn_predict_layers") > 1) {
+        if (cfg.findLong(0, "num_nextn_predict_layers") > 1) {
             throw new GgufFormatException(cfg.source() + ": NemotronH MTP conversion supports"
                     + " num_nextn_predict_layers == 1");
         }
         return out;
     }
 
-    /** True when the config folds an MTP block as the converter's MoE MTP head does (nemotron.py:443-459). */
+    /**
+     * True when the config folds an MTP block: the MoE build's converter folds the expert head (nemotron.py:443-459),
+     * and a dense build's NextN layer is the attention-only head of vLLM's {@code NemotronHMTPModel}.
+     */
     public static boolean nemotronMtpFolded(HfConfig cfg) {
-        return nemotronIsMoe(cfg) && cfg.findLong(0, "num_nextn_predict_layers") > 0;
+        return cfg.findLong(0, "num_nextn_predict_layers") > 0;
     }
 
-    /** The nonzero block count of a Nemotron load: the trunk layers plus the folded MTP block when there is one. */
+    /**
+     * The nonzero block count of a Nemotron load: the trunk layers plus the folded MTP block when there is one and
+     * the load keeps the MTP layers ({@code --no-nextn} drops it, nemotron.py:485-498).
+     */
     public static int nemotronHBlockCount(HfLoadContext ctx) {
         int base = ctx.config().blockCount();
-        return nemotronMtpFolded(ctx.config()) ? base + 1 : base;
+        return ctx.options().includeMtp() && nemotronMtpFolded(ctx.config()) ? base + 1 : base;
     }
 
     /** The pattern the layer lists come from: the override string or the {@code layers_block_type} list. */
@@ -458,13 +471,16 @@ public final class HfSsmHybridHooksA {
         HfConfig cfg = ctx.config();
         boolean moe = nemotronIsMoe(cfg);
         int blockCount = ctx.blockCount();
-        int mtp = nemotronMtpFolded(cfg) ? cfg.blockCount() : NO_MTP;
+        int mtp = ctx.options().includeMtp() && nemotronMtpFolded(cfg) ? cfg.blockCount() : NO_MTP;
         List<Integer> attn = new ArrayList<>(nemotronAttnLayers(cfg, blockCount, moe));
         List<Integer> ssm = new ArrayList<>(nemotronSsmLayers(cfg, blockCount, moe));
         List<Integer> mlp = new ArrayList<>(nemotronMlpLayers(cfg, blockCount, moe));
         if (mtp >= 0) {
             attn.add(mtp);
-            mlp.add(mtp);
+            if (moe) {
+                // the MoE build's folded block carries the expert FFN too; a dense build's is attention only
+                mlp.add(mtp);
+            }
         }
         graniteCoreMeta(ctx, kv, plan, attn, ssm);
         // the nemotron layer norm epsilon is the plain LAYER_NORM_EPS of the four aliases
@@ -536,6 +552,15 @@ public final class HfSsmHybridHooksA {
             name = special != null ? special.replace("{bid}", String.valueOf(mtp))
                     : "backbone.layers." + mtp + "." + suffix;
         }
+        if (mtp >= 0 && HfLoadContext.bidOf(name) == mtp) {
+            // the nemotron_h tensor table has no NextN rows (llama.cpp folds only the MoE head), so the dense
+            // block's head tensors are named directly
+            String nextn = nemotronNextnTensor(name);
+            if (nextn != null) {
+                out.add(HfNameTables.formatTensorName(nextn, mtp) + ".weight", src);
+                return;
+            }
+        }
         if (moe && HfLoadContext.bidOf(name) >= 0) {
             if (name.endsWith("mixer.gate.e_score_correction.bias")) {
                 out.add(ctx.names().mapOrThrow(name), src);
@@ -579,6 +604,20 @@ public final class HfSsmHybridHooksA {
             attn.add(mtp);
         }
         graniteHybridTensor(ctx, name, src, out, attn, nemotronSsmLayers(cfg, blocks, moe));
+    }
+
+    /** The NextN head tensor of a folded block's renamed name, or null for a decoder or head tensor. */
+    private static String nemotronNextnTensor(String name) {
+        if (name.endsWith(".eh_proj.weight")) {
+            return "NEXTN_EH_PROJ";
+        }
+        if (name.endsWith(".enorm.weight")) {
+            return "NEXTN_ENORM";
+        }
+        if (name.endsWith(".hnorm.weight")) {
+            return "NEXTN_HNORM";
+        }
+        return name.endsWith(".shared_head.norm.weight") ? "NEXTN_SHARED_HEAD_NORM" : null;
     }
 
     /** The per-load Nemotron MoE expert collector (nemotron.py:668-686), two parts down/up. */

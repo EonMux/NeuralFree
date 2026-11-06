@@ -204,7 +204,7 @@ public final class SelectionGradFunctions {
         public SumToShapeGrad(Shape sourceShape, Shape target) {
             this.sourceShape = Objects.requireNonNull(sourceShape, "sourceShape");
             Objects.requireNonNull(target, "target");
-            if (!sourceShape.equals(target) && broadcastsTo(target, sourceShape)) {
+            if (!sourceShape.equals(target) && BroadcastEngine.broadcastsTo(target, sourceShape)) {
                 int[] kept = new int[sourceShape.rank()];
                 Arrays.fill(kept, 1);
                 int offset = sourceShape.rank() - target.rank();
@@ -247,25 +247,6 @@ public final class SelectionGradFunctions {
 
         @Override
         public boolean supportsCreateGraph() {
-            return true;
-        }
-
-        /**
-         * Whether broadcasting {@code target} against {@code shape} gives {@code shape} (the forward's broadcasting
-         * test): no higher rank, and every aligned dim equal or 1 where {@code shape} has more than 1.
-         */
-        private static boolean broadcastsTo(Shape target, Shape shape) {
-            if (target.rank() > shape.rank()) {
-                return false;
-            }
-            int offset = shape.rank() - target.rank();
-            for (int i = 0; i < target.rank(); i++) {
-                int t = target.dim(i);
-                int s = shape.dim(offset + i);
-                if (t != s && !(t == 1 && s > 1)) {
-                    return false;
-                }
-            }
             return true;
         }
     }

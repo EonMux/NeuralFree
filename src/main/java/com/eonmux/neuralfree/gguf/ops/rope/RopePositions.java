@@ -68,6 +68,35 @@ public final class RopePositions {
     }
 
     /**
+     * Batched form of {@link #fillStep}: per-row positions {@code tokenPos[off + t]} (batched steps over several
+     * sequences carry non-consecutive positions, one segment per sequence), four sections per token alike.
+     *
+     * @throws IllegalArgumentException when an array is too short or a position is negative
+     */
+    public static void fillStep(MropeTextPositions pattern, int[] tokenPos, int off, int nTokens, int[] dst) {
+        Objects.requireNonNull(pattern, "pattern");
+        Objects.requireNonNull(tokenPos, "tokenPos");
+        Objects.requireNonNull(dst, "dst");
+        if (off < 0 || nTokens < 0 || (long) off + nTokens > tokenPos.length) {
+            throw new IllegalArgumentException("token positions [" + off + ", " + ((long) off + nTokens)
+                    + ") exceed " + tokenPos.length + " values");
+        }
+        if (nTokens > 0 && dst.length < MropeTextPositions.SECTIONS * nTokens) {
+            throw new IllegalArgumentException("destination holds " + dst.length + " positions, need "
+                    + MropeTextPositions.SECTIONS * nTokens);
+        }
+        for (int t = 0; t < nTokens; t++) {
+            final int p = tokenPos[off + t];
+            if (p < 0) {
+                throw new IllegalArgumentException("token " + t + " has negative position " + p);
+            }
+            for (int s = 0; s < MropeTextPositions.SECTIONS; s++) {
+                dst[s * nTokens + t] = pattern.position(s, p);
+            }
+        }
+    }
+
+    /**
      * Writes the positions of {@code nTokens} text tokens with explicit positions {@code tokenPos[off + t]} (for
      * example rows gathered out of order): four sections per the pattern for multi-section types, the positions
      * themselves otherwise.

@@ -3,18 +3,27 @@ package com.eonmux.neuralfree.gguf.engine;
 import java.util.Objects;
 
 /**
- * One token's log probability of a sampled step's post-chain distribution (llama.cpp's
- * {@code n_probs} array after the chain): the token id and {@code ln(p)} of its probability among
- * the chain's surviving candidates. A capture's first entry is the sampled token.
+ * One token's score in a logprobs capture: the token id and its value in the capture's {@link LogprobsMode} —
+ * {@code ln(p)} of the raw or the processed distribution, or the raw or processed logit. A generated step's
+ * capture ({@link LogprobCapture}) leads with the sampled token, a prompt capture with the prompt token.
+ * {@link #rank()} carries the token's vocabulary rank (1 = highest score) when the producer knows it — the
+ * leading token and the best alternatives carry it — and -1 when it does not (a requested token id).
  */
 public final class TokenScore {
 
     private final int tokenId;
     private final float logprob;
+    private final int rank;
 
     public TokenScore(int tokenId, float logprob) {
+        this(tokenId, logprob, -1);
+    }
+
+    /** @param rank the token's 1-based vocabulary rank, or -1 when unknown */
+    public TokenScore(int tokenId, float logprob, int rank) {
         this.tokenId = tokenId;
         this.logprob = logprob;
+        this.rank = rank;
     }
 
     /** The token id. */
@@ -22,9 +31,17 @@ public final class TokenScore {
         return tokenId;
     }
 
-    /** {@code ln(p)} of the token's probability ({@code -Infinity} for a zero probability). */
+    /**
+     * The token's score: {@code ln(p)} of its probability under a logprobs mode ({@code -Infinity} for a zero
+     * probability), its logit under a logits mode ({@code -Infinity} for a removed token).
+     */
     public float logprob() {
         return logprob;
+    }
+
+    /** The token's 1-based vocabulary rank, or -1 when the producer did not compute it. */
+    public int rank() {
+        return rank;
     }
 
     @Override

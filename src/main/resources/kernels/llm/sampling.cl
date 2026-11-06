@@ -122,3 +122,126 @@ NF_KERNEL void LLM_Argmax(
         max_idx[row] = (r == NF_ARGMAX_NONE) ? 0 : r;
     }
 }
+
+/*
+ * The single-pass tree verify's acceptance walk on the device (llama.cpp token-match acceptance over
+ * one masked batch): follows the accepted path through the proposal's parent array over the verify
+ * rows' greedy ids, so the host reads back the accepted depth and path instead of every logits row.
+ *
+ * Per depth the workgroup scans the nodes of that depth whose parent is in the frontier — the set of
+ * nodes the walk matched at the previous depth, the depth-1 roots when it is empty — and keeps the
+ * ones whose token equals the pending sample `pred` (the greedy id of the predecessor row). The
+ * matched set becomes the next frontier; the walk records its smallest index and continues from that
+ * node's row. Per walk step every work-item stages its matches, one reduction folds the smallest
+ * matched index and the matched bit set, and the walk advances uniformly: every work-item reads the
+ * reduced values, so the next scan runs on the same frontier. The walk stops at the first depth with
+ * no matched node.
+ *
+ * Arguments:
+ *   n_nodes  the proposal's node count (at most 63: the verify batch's rows and the frontier bits
+ *            name rows of one 64-bit mask)
+ *   tree     3 ints per node: token, parent (-1 for a root), depth (1-based); a parent precedes its
+ *            child
+ *   argmax   the verify rows' greedy ids in row order: row 0 the pending token, row i + 1 node i
+ *   out      [0] the accepted depth, [1] the first emission (row 0's greedy id), [2] the final draw
+ *            (the greedy id of the last accepted row, row 0's when nothing was accepted), [3 ..]
+ *            the accepted path's node indices in depth order
+ *
+ * A session stop the host replays can only cut the walk short: the emissions it produces are a
+ * prefix of [out[1], the accepted nodes' tokens from the second match on, out[2]] — the first
+ * match's token is out[1] itself — so the host stops that replay at the stop.
+ *
+ * Dispatch: global = local = {L} (exactly one workgroup).
+ */
+NF_KERNEL void LLM_TreeAccept(
+    const int n_nodes,
+    NF_GLOBAL const int* NF_RESTRICT tree,
+    NF_GLOBAL const int* NF_RESTRICT argmax,
+    NF_GLOBAL int* out)
+{
+    if (get_group_id(0) != 0) return;
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    NF_LOCAL int matched[LLM_DIMX];
+    NF_LOCAL uint lo_set[LLM_DIMX];
+    NF_LOCAL uint hi_set[LLM_DIMX];
+    NF_LOCAL int stop;
+
+    /* the frontier as a bit set over the node indices, empty before the first depth */
+    uint lo = 0u;
+    uint hi = 0u;
+    int pred_row = 0;
+    int accepted = 0;
+    const int first = argmax[0];
+    int pred = first;
+    int depth = 1;
+
+    for (;;) {
+        int my_match = NF_ARGMAX_NONE;
+        uint my_lo = 0u;
+        uint my_hi = 0u;
+        for (int i = lid; i < n_nodes; i += lsize) {
+            if (tree[3 * i + 2] != depth) {
+                continue;
+            }
+            const int parent = tree[3 * i + 1];
+            const int in_frontier = (lo | hi) == 0u
+                ? (int)(parent == -1)
+                : (parent < 32 ? (int)((lo >> parent) & 1u) : (int)((hi >> (parent - 32)) & 1u));
+            if (in_frontier == 0 || tree[3 * i] != pred) {
+                continue;
+            }
+            if (my_match == NF_ARGMAX_NONE) {
+                my_match = i; /* the scan ascends: the first hit is the smallest */
+            }
+            if (i < 32) {
+                my_lo |= 1u << i;
+            } else {
+                my_hi |= 1u << (i - 32);
+            }
+        }
+        matched[lid] = my_match;
+        lo_set[lid] = my_lo;
+        hi_set[lid] = my_hi;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        /* ceiling halving: every lane's content reaches lane 0 for any work-group size (plain halving
+         * drops the tail lane on a non-power-of-two lsize) */
+        for (int live = lsize; live > 1; live = (live + 1) >> 1) {
+            const int stride = (live + 1) >> 1;
+            if (lid < stride && lid + stride < live) {
+                if (matched[lid + stride] < matched[lid]) {
+                    matched[lid] = matched[lid + stride];
+                }
+                lo_set[lid] |= lo_set[lid + stride];
+                hi_set[lid] |= hi_set[lid + stride];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+        if (lid == 0) {
+            stop = matched[0] == NF_ARGMAX_NONE ? 1 : 0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (stop == 1) {
+            break;
+        }
+        if (lid == 0) {
+            out[3 + accepted] = matched[0];
+        }
+        pred_row = matched[0] + 1;
+        pred = argmax[pred_row];
+        lo = lo_set[0];
+        hi = hi_set[0];
+        accepted++;
+        depth++;
+        /* the reads of the reduced values above must finish before the next scan writes the arrays */
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0) {
+        out[0] = accepted;
+        out[1] = first;
+        out[2] = argmax[pred_row];
+    }
+}

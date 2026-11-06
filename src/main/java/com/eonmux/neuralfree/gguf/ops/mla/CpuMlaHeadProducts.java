@@ -60,6 +60,7 @@ public final class CpuMlaHeadProducts {
         checkView("output", y, yOff, yTokenStride, yHeadStride, nTokens, nHead, rowsPerHead);
         final CpuVecDot dot = CpuMatVec.vecDot(w.type());
 
+        observe(w, nHead, rowsPerHead, nTokens, x, xOff, xTokenStride, xHeadStride, cols);
         final int pairs = nTokens * nHead;
         final QuantizedActivations[] acts = new QuantizedActivations[pairs];
         CpuParallel.parallelFor(pairs, Math.max(1, MIN_QUANT_VALUES / cols), (from, to) -> {
@@ -85,6 +86,25 @@ public final class CpuMlaHeadProducts {
                 }
             }
         });
+    }
+
+    /**
+     * Hands every (token, head) input row to the installed {@link CpuMatVec.InputObserver} as matrix {@code h} of
+     * the {@code nHead} stacked heads, the per-matrix statistics llama.cpp's imatrix callback keeps for a 3-D
+     * {@code MUL_MAT} operand, when it wants the dense product of {@code nTokens} rows.
+     */
+    private static void observe(CpuTensorRef w, int nHead, int rowsPerHead, int nTokens, float[] x, int xOff,
+                                int xTokenStride, int xHeadStride, int cols) {
+        CpuMatVec.InputObserver observer = CpuMatVec.askedObserver(w, false, nTokens);
+        if (observer == null) {
+            return;
+        }
+        for (int t = 0; t < nTokens; t++) {
+            for (int h = 0; h < nHead; h++) {
+                observer.observe(w, (long) h * rowsPerHead, rowsPerHead, nHead, x,
+                        xOff + t * xTokenStride + h * xHeadStride, cols, cols, 1);
+            }
+        }
     }
 
     private static void checkView(String what, float[] a, int off, int tokenStride, int headStride, int nTokens,

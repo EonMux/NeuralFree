@@ -16,5 +16,11 @@ public enum ResidualKind {
      * {@code x = x * streamScale + branch * branchScale} with per-sub-block scales from the depth of the add (beam:
      * {@code branch / sqrt(i) + x * sqrt((i - 1) / i)}, models/beam.cpp:109-113).
      */
-    DEPTH_SCALED
+    DEPTH_SCALED,
+    /**
+     * Dory's nGPT slerp residual: both the stream and the branch are L2-normalized, mixed by
+     * {@code lr = |alpha * alphaScale|} and normalized again, {@code justNorm(justNorm(x) + lr * (justNorm(b) -
+     * justNorm(x)))}. The per-element alpha vector is {@code attn_slerp_alpha} / {@code ffn_slerp_alpha}.
+     */
+    SLERP
 }

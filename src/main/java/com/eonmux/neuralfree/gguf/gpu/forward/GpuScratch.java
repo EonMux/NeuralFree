@@ -50,7 +50,24 @@ public final class GpuScratch implements AutoCloseable {
         /** Per-shard or offset-free matmul output. */
         OUTPUT("gpuops.stage.output"),
         /** Complete projection before an accumulate or scatter. */
-        RESULT("gpuops.stage.result");
+        RESULT("gpuops.stage.result"),
+        /** Split-K slice planes, apart from every view a projection reads or writes. */
+        SPLIT_K("gpuops.stage.splitk"),
+        /**
+         * Staged 8-bit activation records: the int8 MMQ GEMM staging (LLM_Quant_MMQ_Q8_1's output) and the Q8_1
+         * blocks of the integer-dot matvec lane (LLM_QuantizeQ8_1's output).
+         */
+        Q8_1("gpuops.stage.q8_1"),
+        /**
+         * Q8_1 blocks of an activation row shared by several projections (GpuOps.SharedQ8), apart from the
+         * per-projection {@link #Q8_1} staging so an intervening projection cannot overwrite them.
+         */
+        SHARED_Q8_1("gpuops.stage.shared_q8_1"),
+        /**
+         * The BF16 mirror a W12 projection decodes its weight into (GpuOps.w12Bf16Mirror), apart from every
+         * staging view the projection on the mirror touches.
+         */
+        W12_BF16("gpuops.stage.w12_bf16");
 
         private final String name;
 
@@ -162,13 +179,13 @@ public final class GpuScratch implements AutoCloseable {
 
     // ------------------------------------------------------------------ sizing
 
-    static Map<String, Long> modelSlotFloats(ModelSpec spec, int ubatch) {
+    public static Map<String, Long> modelSlotFloats(ModelSpec spec, int ubatch) {
         ScratchWidths w = ScratchWidths.of(spec);
         Map<String, Long> m = new LinkedHashMap<>();
         m.put(ScratchSlots.X, ScratchWidths.rows(ubatch, w.stream()));
         m.put(ScratchSlots.BRANCH, ScratchWidths.rows(ubatch, w.stream()));
         m.put(ScratchSlots.NORMED, ScratchWidths.rows(ubatch, w.stream()));
-        m.put(ScratchSlots.Q, ScratchWidths.rows(ubatch, w.projection()));
+        m.put(ScratchSlots.Q, ScratchWidths.rows(ubatch, w.query()));
         m.put(ScratchSlots.K, ScratchWidths.rows(ubatch, w.projection()));
         m.put(ScratchSlots.V, ScratchWidths.rows(ubatch, w.projection()));
         m.put(ScratchSlots.ATTN_OUT, ScratchWidths.rows(ubatch, w.projection()));

@@ -1,6 +1,9 @@
 package com.eonmux.neuralfree.gguf.hf.hooks;
 
 import com.eonmux.neuralfree.gguf.arch.Arch;
+import com.eonmux.neuralfree.gguf.arch.ClassifierScope;
+import com.eonmux.neuralfree.gguf.arch.PoolerAct;
+import com.eonmux.neuralfree.gguf.arch.PoolingKind;
 import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.arch.HfNameFilter;
 import com.eonmux.neuralfree.gguf.hf.arch.HfTensorHook;
@@ -14,6 +17,7 @@ import com.eonmux.neuralfree.gguf.hf.tensor.RowTransforms;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
+import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfSpecialVocab;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfTokenizerFiles;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfTokenizerJson;
@@ -31,7 +35,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.TreeMap;
 import java.util.function.UnaryOperator;
 
@@ -132,6 +135,19 @@ public final class HfBertHooks {
     public static final HfNameFilter FILTER = HfBertHooks::filter;
 
     /**
+     * {@link #filter} keeping the {@code cls.predictions} tensors (bert.py:86-91 drops them for the plain BERT, but
+     * the SPLADE head scores through them, bert.py:753); the {@code cls.seq_relationship} tensors still drop.
+     */
+    public static String filterKeepingPredictions(String name, UnaryOperator<String> base) {
+        String n = name.startsWith("roberta.") ? name.substring(8) : name;
+        n = bertPrefix(n);
+        if (DROPS.contains(n) || n.startsWith("cls.seq_relationship")) {
+            return null;
+        }
+        return base.apply(n);
+    }
+
+    /**
      * {@code RobertaModel.filter_tensors} (bert.py:296-306): it is {@link #filter} with the RobertaModel
      * {@code roberta.} strip already inside, so the entry reuses the same hook.
      */
@@ -184,12 +200,146 @@ public final class HfBertHooks {
      */
     public static void meta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) throws IOException {
         HfGenericMetadata.apply(ctx, kv);
+        kv.set(GgufKeys.ATTENTION_LAYERNORM_EPS, ctx.config().findFloat(1e-12, "layer_norm_eps"));
         kv.set(GgufKeys.ATTENTION_CAUSAL, false);                                      // bert.py:34
         HfQwenHooks.pooling(ctx, kv);                                                    // bert.py:35
+        applyClassifierPooling(ctx.config(), kv);
         Map<Integer, String> labels = id2label(ctx.config());
         if (!labels.isEmpty()) {
             kv.set(GgufKeys.CLASSIFIER_OUTPUT_LABELS, new ArrayList<>(labels.values())); // bert.py:37-38
         }
+    }
+
+    /**
+     * The pooling of a vLLM classifier checkpoint: a token classifier scores every token ({@code NONE}), and a
+     * sequence classifier pools one row first (vLLM's {@code CLS} default, or the configuration's
+     * {@code classifier_pooling} {@code mean}). Other BERT checkpoints keep the sentence-transformers pooling
+     * {@link HfQwenHooks#pooling} wrote.
+     */
+    static void applyClassifierPooling(HfConfig cfg, HfMetadataBuilder kv) {
+        String architecture = cfg.architecture();
+        if (isTokenClassifier(architecture)) {
+            kv.set(GgufKeys.POOLING_TYPE, PoolingKind.NONE.ggufCode());
+            kv.set(GgufKeys.CLASSIFIER_SCOPE, ClassifierScope.TOKEN.ggufName());
+            applyModernActivation(cfg, kv);
+            applyPoolerActivation(cfg, kv);
+            return;
+        }
+        if (isSequenceClassifier(architecture)) {
+            boolean mean = cfg.findString("classifier_pooling").map("mean"::equals).orElse(false);
+            kv.set(GgufKeys.POOLING_TYPE, (mean ? PoolingKind.MEAN : PoolingKind.CLS).ggufCode());
+            kv.set(GgufKeys.CLASSIFIER_SCOPE, ClassifierScope.SEQUENCE.ggufName());
+            applyModernActivation(cfg, kv);
+            applyPoolerActivation(cfg, kv);
+            if ("ModernBertForSequenceClassification".equals(architecture)) {
+                // vLLM's for_seq_cls applies the prediction head to the pooled row only; its token_classify
+                // runs the final classifier projection over every row (modernbert.py:381-384)
+                kv.set(GgufKeys.CLASSIFIER_TOKEN_DIRECT, true);
+            }
+        }
+    }
+
+    /**
+     * The pooler-level activation over the classifier scores (vLLM's {@code get_act_fn}): a {@code problem_type} of
+     * {@code regression} keeps the scores, {@code multi_label_classification} applies the sigmoid per output, and
+     * {@code single_label_classification} softmaxes them ({@code sigmoid} for one output); without one of those
+     * problem types the sentence-transformers {@code activation_fn} / {@code sbert_ce_default_activation_function}
+     * applies, restricted to {@code torch.nn.modules} names, and the default is the single-label classification
+     * ({@code sigmoid} for one output).
+     *
+     * @throws GgufFormatException when the activation function is outside the torch.nn.modules set or not one the
+     *                             pooler activation supports by name
+     */
+    static void applyPoolerActivation(HfConfig cfg, HfMetadataBuilder kv) {
+        String problem = cfg.findString("problem_type").orElse("");
+        if ("regression".equals(problem)) {
+            kv.set(GgufKeys.CLASSIFIER_POOLER_ACTIVATION, PoolerAct.IDENTITY.ggufName());
+            return;
+        }
+        if ("multi_label_classification".equals(problem)) {
+            kv.set(GgufKeys.CLASSIFIER_POOLER_ACTIVATION, PoolerAct.SIGMOID.ggufName());
+            return;
+        }
+        if (!"single_label_classification".equals(problem)) {
+            String fn = sentenceTransformersActivation(cfg);
+            if (fn != null) {
+                kv.set(GgufKeys.CLASSIFIER_POOLER_ACTIVATION, torchActivation(cfg, fn));
+                return;
+            }
+        }
+        // single_label_classification, and vLLM's PoolerClassify default: sigmoid for one output, softmax beyond
+        int numLabels = cfg.findInt("num_labels").isPresent() ? cfg.findInt("num_labels").getAsInt()
+                : Math.max(1, id2label(cfg).size());
+        kv.set(GgufKeys.CLASSIFIER_POOLER_ACTIVATION,
+                numLabels < 2 ? PoolerAct.SIGMOID.ggufName() : PoolerAct.SOFTMAX.ggufName());
+    }
+
+    /**
+     * The sentence-transformers activation function of the configuration: {@code
+     * sentence_transformers.activation_fn} or {@code sbert_ce_default_activation_function}, or null when the
+     * checkpoint sets neither (vLLM's cross-encoder branch, only read without a problem type).
+     */
+    private static String sentenceTransformersActivation(HfConfig cfg) {
+        Object st = cfg.find("sentence_transformers").orElse(null);
+        if (st instanceof Map && ((Map<?, ?>) st).get("activation_fn") instanceof String) {
+            return (String) ((Map<?, ?>) st).get("activation_fn");
+        }
+        return cfg.findString("sbert_ce_default_activation_function").orElse(null);
+    }
+
+    /**
+     * The pooler activation of a {@code torch.nn.modules} activation function name (vLLM restricts the loading to
+     * that package): {@code Identity}, {@code Sigmoid}, {@code Softmax} and {@code Tanh} map to their names.
+     *
+     * @throws GgufFormatException for a name outside {@code torch.nn.modules} or one the pooler activation does
+     *                             not support
+     */
+    private static String torchActivation(HfConfig cfg, String fn) {
+        if (!fn.startsWith("torch.nn.modules.")) {
+            throw new GgufFormatException(cfg.source() + ": loading of activation functions is restricted to"
+                    + " torch.nn.modules for security reasons, got '" + fn + "'");
+        }
+        if (fn.endsWith(".Identity")) {
+            return PoolerAct.IDENTITY.ggufName();
+        }
+        if (fn.endsWith(".Sigmoid")) {
+            return PoolerAct.SIGMOID.ggufName();
+        }
+        if (fn.endsWith(".Softmax")) {
+            return PoolerAct.SOFTMAX.ggufName();
+        }
+        if (fn.endsWith(".Tanh")) {
+            return PoolerAct.TANH.ggufName();
+        }
+        throw new GgufFormatException(cfg.source() + ": unsupported pooler activation function '" + fn
+                + "', expected a torch.nn.modules Identity, Sigmoid, Softmax or Tanh");
+    }
+
+    /**
+     * ModernBERT's prediction head applies GELU between its dense projection and its LayerNorm (modernbert.py:428-443,
+     * {@code ModernBertPredictionHead}), and containers omit the configuration's default; the other BERT-family
+     * classifiers apply the classifier chain's default tanh, or no activation at all.
+     */
+    private static void applyModernActivation(HfConfig cfg, HfMetadataBuilder kv) {
+        if (cfg.architecture().startsWith("ModernBert") && !cfg.findString("classifier_activation").isPresent()) {
+            kv.set(GgufKeys.CLASSIFIER_ACTIVATION, "gelu");
+        }
+    }
+
+    /** True for a vLLM token-classification architecture name. */
+    public static boolean isTokenClassifier(String architecture) {
+        return architecture != null && architecture.endsWith("ForTokenClassification");
+    }
+
+    /**
+     * True for a BERT-family architecture of vLLM's sequence-classification table: the classifier projection runs
+     * over the pooled row rather than over every token.
+     */
+    public static boolean isSequenceClassifier(String architecture) {
+        return "BertForSequenceClassification".equals(architecture)
+                || "RobertaForSequenceClassification".equals(architecture)
+                || "XLMRobertaForSequenceClassification".equals(architecture)
+                || "ModernBertForSequenceClassification".equals(architecture);
     }
 
     /**
@@ -297,6 +447,50 @@ public final class HfBertHooks {
             return name.replace("classifier.", "classifier.out_proj.");
         }
         return name;
+    }
+
+    /**
+     * {@code BertForTokenClassification.modify_tensors}: the single-layer {@code classifier} becomes the GGUF
+     * {@code cls.output} projection applied to every token, so the head runs without the sequence classifier's
+     * activation. Every other tensor follows {@link #tensors}.
+     */
+    public static void tokenTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
+            throws IOException {
+        if (classifierOutput(hfName, src, out)) {
+            return;
+        }
+        tensors(ctx, hfName, src, out);
+    }
+
+    /** {@link #tokenTensor} over a RoBERTa / XLM-R checkpoint's backbone. */
+    public static void robertaTokenTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
+            throws IOException {
+        if (classifierOutput(hfName, src, out)) {
+            return;
+        }
+        robertaTensor(ctx, hfName, src, out);
+    }
+
+    /** {@link #tokenTensor} over an XLM-RoBERTa checkpoint's backbone. */
+    public static void xlmRobertaTokenTensor(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
+            throws IOException {
+        if (classifierOutput(hfName, src, out)) {
+            return;
+        }
+        xlmRobertaTensor(ctx, hfName, src, out);
+    }
+
+    /** Plans {@code classifier.weight}/{@code classifier.bias} as {@code cls.output} when present. */
+    private static boolean classifierOutput(String hfName, RowSource src, TensorSink out) {
+        if ("classifier.weight".equals(hfName)) {
+            out.add(TensorNames.weight(TensorNames.CLS_OUT), src);
+            return true;
+        }
+        if ("classifier.bias".equals(hfName)) {
+            out.add(TensorNames.bias(TensorNames.CLS_OUT), src);
+            return true;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ BERT vocabularies
@@ -519,10 +713,26 @@ public final class HfBertHooks {
         return out;
     }
 
-    /** The XLM-R entry's step-1 arch switch (bert.py:478-481): JINA_BERT_V3 with task adapters, else BERT. */
+    /**
+     * The XLM-R entry's step-1 arch switch (bert.py:478-481): JINA_BERT_V3 when {@code lora_adaptations} names task
+     * adapters, else BERT. The converter tests the value's Python truthiness, so an absent, null, false, zero or
+     * empty value keeps BERT.
+     *
+     * @throws GgufFormatException when {@code lora_adaptations} holds a truthy value that is not a list of task names
+     */
     public static Arch xlmRobertaArch(HfConfig cfg, HfTensorIndex index) {
-        Optional<Object> loras = cfg.find("lora_adaptations");
-        return loras.isPresent() && loras.get() instanceof List ? Arch.JINA_BERT_V3 : Arch.BERT;
+        Object loras = cfg.find("lora_adaptations").orElse(null);
+        if (loras instanceof List) {
+            return ((List<?>) loras).isEmpty() ? Arch.BERT : Arch.JINA_BERT_V3;
+        }
+        if (loras == null || Boolean.FALSE.equals(loras)
+                || loras instanceof Number && ((Number) loras).doubleValue() == 0.0
+                || loras instanceof String && ((String) loras).isEmpty()
+                || loras instanceof Map && ((Map<?, ?>) loras).isEmpty()) {
+            return Arch.BERT;
+        }
+        throw new GgufFormatException(cfg.source() + ": 'lora_adaptations' must be a list of task adapter names, got "
+                + loras);
     }
 
     /** The XLM-R entry's vocabulary reference: {@link #xlmRobertaVocab} without the NomicBert mask piece. */

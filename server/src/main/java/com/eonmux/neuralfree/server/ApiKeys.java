@@ -24,6 +24,9 @@ final class ApiKeys {
     static final String PROPERTY = "neuralfree.server.api.key";
     static final String FILE_PROPERTY = "neuralfree.server.api.key.file";
 
+    /** The message of a refusal for a missing or wrong key, in the HTTP envelope and the gRPC status. */
+    static final String REFUSAL_MESSAGE = "Invalid API Key";
+
     private static final String BEARER = "Bearer ";
 
     private final List<byte[]> keys;
@@ -88,7 +91,7 @@ final class ApiKeys {
 
     /** The refusal body of a request without an accepted key. */
     static String refusalBody() {
-        return ServerJson.write(ServerJson.errorBody("Invalid API Key", "authentication_error"));
+        return ServerJson.write(ServerJson.errorBody(REFUSAL_MESSAGE, "authentication_error"));
     }
 
     /** Whether {@code presented} is one of the keys; every key is compared, in constant time each. */

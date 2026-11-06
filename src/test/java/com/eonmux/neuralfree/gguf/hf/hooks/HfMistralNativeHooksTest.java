@@ -113,6 +113,31 @@ public class HfMistralNativeHooksTest {
     }
 
     @Test
+    public void moeMetadataAddsTheLlama4TemperatureScale() throws IOException {
+        String moe = ", \"moe\": {\"num_experts\": 2, \"num_experts_per_tok\": 1, \"expert_hidden_dim\": 8,"
+                + " \"first_k_dense_replace\": 1, \"num_shared_experts\": 1}, \"q_lora_rank\": 4,"
+                + " \"kv_lora_rank\": 4, \"qk_nope_head_dim\": 2, \"qk_rope_head_dim\": 2, \"v_head_dim\": 1,"
+                + " \"yarn\": {\"factor\": 4.0, \"beta\": 32.0, \"alpha\": 1.0,"
+                + " \"original_max_position_embeddings\": 4096, \"apply_scale\": true}";
+        HfConfig scaled = params(moe + ", \"llama_4_scaling\": {\"beta\": 0.25,"
+                + " \"original_max_position_embeddings\": 4096}");
+        assertEquals(HfConfigLoader.MISTRAL_NATIVE_MOE, scaled.architecture());
+        HfMetadata m = moeMetadata(scaled);
+        assertEquals(0.25f, m.get("deepseek2.attention.temperature_scale"));
+        assertEquals(4096, m.get("deepseek2.attention.temperature_length"));
+
+        assertFalse(moeMetadata(params(moe)).has("deepseek2.attention.temperature_scale"));
+    }
+
+    private static HfMetadata moeMetadata(HfConfig raw) throws IOException {
+        HfArchEntry entry = entry(raw);
+        HfLoadContext ctx = context(raw, entry, empty());
+        HfMetadataBuilder kv = new HfMetadataBuilder(ctx.arch().ggufName());
+        entry.meta().apply(ctx, kv, null);
+        return kv.build();
+    }
+
+    @Test
     public void nativeNamesMapWithoutThePermutation() throws IOException {
         ckpt = new Checkpoint(tmp.newFolder().toPath());
         HfTensorIndex index = ckpt.f32("tok_embeddings.weight", new long[]{10, 8}, seq(80))

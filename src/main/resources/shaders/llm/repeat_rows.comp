@@ -1,0 +1,31 @@
+/* repeat_rows.comp - LLM_RepeatRows: nearest-neighbour row repeat (the liquid codec's frame stack). GLSL twin of
+ * kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i src_rows, i repeat, i cols, R x, W y).
+ *   y[(r*repeat + s)][c] = x[r][c]
+ * Dispatch: 1-D, one invocation per output element, global = roundUp(src_rows*repeat*cols, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfRrX { float x_in[]; };
+layout(std430, binding = 1) writeonly buffer NfRrY { float y_out[]; };
+
+layout(push_constant) uniform NfRrParams {
+    int src_rows;
+    int repeat;
+    int cols;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.src_rows) * uint(pc.repeat) * uint(pc.cols)) {
+        return;
+    }
+    const uint c = idx % uint(pc.cols);
+    const uint row = idx / uint(pc.cols);
+    const uint r = row / uint(pc.repeat);
+    y_out[idx] = x_in[r * uint(pc.cols) + c];
+}

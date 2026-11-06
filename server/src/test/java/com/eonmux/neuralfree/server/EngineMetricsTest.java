@@ -16,6 +16,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class EngineMetricsTest {
 
     private static EngineService service;
+    /** The bound meters; micrometer reads them through a weak reference, so the test keeps them reachable. */
+    private static volatile EngineMetrics bound;
 
     @BeforeAll
     static void open() throws IOException {
@@ -26,6 +28,7 @@ class EngineMetricsTest {
     @AfterAll
     static void close() {
         service.close();
+        bound = null;
     }
 
     private static SimpleMeterRegistry bound(EngineService current) {
@@ -36,7 +39,8 @@ class EngineMetricsTest {
             }
         };
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        new EngineMetrics(lifecycle).bindTo(registry);
+        bound = new EngineMetrics(lifecycle);
+        bound.bindTo(registry);
         return registry;
     }
 
@@ -44,6 +48,7 @@ class EngineMetricsTest {
     void withoutAServiceEveryMeterReadsZero() {
         SimpleMeterRegistry registry = bound(null);
         assertEquals(0.0, registry.get("neuralfree.prompt.tokens").functionCounter().count());
+        assertEquals(0.0, registry.get("neuralfree.tokens.predicted.device").functionCounter().count());
         assertEquals(0.0, registry.get("neuralfree.requests.processing").gauge().value());
     }
 
@@ -70,5 +75,22 @@ class EngineMetricsTest {
         double usage = registry.get("neuralfree.kv.cache.usage").gauge().value();
         assertTrue(usage >= 0 && usage <= 1);
         assertEquals(0.0, registry.get("neuralfree.request.failures").functionCounter().count());
+    }
+
+    @Test
+    void aRepetitionStopCountsUnderItsOwnFinishedReason() throws InterruptedException {
+        SimpleMeterRegistry registry = bound(service);
+        double before = registry.get("neuralfree.request.success").tag("finished_reason", "repetition")
+                .functionCounter().count();
+        new OpenAiResource(service).completions("""
+                {"prompt": "hello there", "max_tokens": 8, "temperature": 0, "allowed_token_ids": [20],
+                 "repetition_detection": {"max_pattern_size": 1, "min_count": 3}}""");
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (registry.get("neuralfree.request.success").tag("finished_reason", "repetition").functionCounter()
+                .count() < before + 1 && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertEquals(before + 1, registry.get("neuralfree.request.success").tag("finished_reason", "repetition")
+                .functionCounter().count(), "vLLM's finished_reason=\"repetition\" label");
     }
 }

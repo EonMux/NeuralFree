@@ -169,8 +169,21 @@ final class DflashLilicorr {
      * @return the lattice with rows {@code 1 .. blockSize - 1}
      */
     DflashSelector.Lattice score(float[] logits, float[] tEmbd, float[] anchor) {
+        return score(candidates(logits, tEmbd), tEmbd, anchor);
+    }
+
+    /**
+     * Scores one block over its per-row candidates and their softmax probabilities, the readback of a device
+     * top-k block; {@link #score(float[], float[], float[])} builds them from whole logits rows.
+     *
+     * @param cand   candidates of rows {@code 0 ..}, row {@code r} holding its {@code topK} best
+     * @param tEmbd  {@code t_embd} rows {@code [blockSize][nEmbd]}
+     * @param anchor fused target feature ({@code nEmbd} values) of the position before the block
+     * @return the lattice with rows {@code 1 .. cand.rows() - 1}
+     */
+    DflashSelector.Lattice score(DflashCandidates cand, float[] tEmbd, float[] anchor) {
         DflashSelector.Lattice lattice = new DflashSelector.Lattice(topK, slots + 1);
-        float[] x = nodeInputs(logits, tEmbd, lattice);
+        float[] x = nodeInputs(cand, tEmbd, lattice);
         for (Layer l : layers) {
             block(l, x);
         }
@@ -217,22 +230,40 @@ final class DflashLilicorr {
         return lattice;
     }
 
+    /**
+     * Candidates and probabilities of whole logits rows: the {@code topK} largest of each of rows {@code 1 ..},
+     * their probabilities from the row's full softmax.
+     */
+    private DflashCandidates candidates(float[] logits, float[] tEmbd) {
+        final int rows = slots + 1;
+        int[] ids = new int[rows * topK];
+        float[] probs = new float[rows * topK];
+        float[] row = new float[nVocab];
+        int[] top = new int[topK];
+        for (int r = 1; r < rows; r++) {
+            final int lOff = r * nVocab;
+            CpuOps.topK(logits, lOff, nVocab, topK, top, 0);
+            System.arraycopy(logits, lOff, row, 0, nVocab);
+            CpuOps.softmax(row, 0, nVocab);
+            for (int k = 0; k < topK; k++) {
+                ids[r * topK + k] = top[k];
+                probs[r * topK + k] = row[top[k]];
+            }
+        }
+        return new DflashCandidates(rows, topK, ids, probs);
+    }
+
     /** Candidates and node inputs {@code x} ({@code [nodes][hidden]}); fills the lattice candidates. */
-    private float[] nodeInputs(float[] logits, float[] tEmbd, DflashSelector.Lattice lattice) {
-        int[] cand = new int[topK];
-        float[] probs = new float[nVocab];
+    private float[] nodeInputs(DflashCandidates cand, float[] tEmbd, DflashSelector.Lattice lattice) {
         float[] feature = new float[nodes * FEATURES];
         float[] tokens = new float[nodes * nEmbd];
         for (int s = 0; s < slots; s++) {
-            final int lOff = (s + 1) * nVocab;
-            CpuOps.topK(logits, lOff, nVocab, topK, cand, 0);
-            System.arraycopy(logits, lOff, probs, 0, nVocab);
-            CpuOps.softmax(probs, 0, nVocab);
-            final float lpTop = (float) Math.log(probs[cand[0]]);
+            final int row = s + 1;
+            final float lpTop = (float) Math.log(cand.probability(row, 0));
             for (int k = 0; k < topK; k++) {
-                lattice.setCandidate(s + 1, k, cand[k]);
+                lattice.setCandidate(row, k, cand.id(row, k));
                 final int nd = s * topK + k;
-                final float p = probs[cand[k]];
+                final float p = cand.probability(row, k);
                 final float lp = (float) Math.log(p);
                 final int fo = nd * FEATURES;
                 feature[fo] = lp;
@@ -240,7 +271,7 @@ final class DflashLilicorr {
                 feature[fo + 2] = lp - lpTop;
                 feature[fo + 3] = topK == 1 ? 0.0f : k * (1.0f / (topK - 1));
                 feature[fo + 4] = k == 0 ? 1.0f : 0.0f;
-                tokEmbd.row(cand[k], tokens, nd * nEmbd);
+                tokEmbd.row(cand.id(row, k), tokens, nd * nEmbd);
             }
         }
         float[] x;

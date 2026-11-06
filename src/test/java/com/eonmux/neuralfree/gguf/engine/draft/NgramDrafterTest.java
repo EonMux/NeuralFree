@@ -1,14 +1,12 @@
 package com.eonmux.neuralfree.gguf.engine.draft;
 
-import com.eonmux.neuralfree.gguf.TokenCallback;
 import com.eonmux.neuralfree.gguf.engine.DraftModel;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
 import com.eonmux.neuralfree.gguf.engine.HiddenTapSlot;
-import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
-import com.eonmux.neuralfree.gguf.memory.ModelMemory;
+import com.eonmux.neuralfree.gguf.engine.draft.LookupTargetFixture.FakeModel;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
 import org.junit.Test;
 
@@ -33,7 +31,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The SP-1 drafter surface on token streams: {@link NgramDrafter} in llama.cpp's {@code ngram-simple},
+ * The drafter surface on token streams: {@link NgramDrafter} in llama.cpp's {@code ngram-simple},
  * {@code ngram-map-k}, {@code ngram-map-k4v}, {@code ngram-mod} and {@code ngram-cache} modes, {@link NgramCorpus},
  * {@link NgramCache}, {@link NgramCacheFile} in the {@code common_ngram_cache_save} format, {@link SuffixTree} and
  * {@link SuffixDrafter} (vLLM's suffix decoding proposer), {@link DrafterChain} (llama.cpp {@code --spec-type a,b}),
@@ -44,219 +42,6 @@ import static org.junit.Assert.assertTrue;
 public class NgramDrafterTest {
 
     // ---- fixtures -------------------------------------------------------------------------
-
-    private static final class FakeMem implements ModelMemory {
-        final SequenceState sequence = new SequenceState(64);
-
-        void prefill(int[] tokens) {
-            if (sequence.nPast() != 0) {
-                throw new IllegalStateException();
-            }
-            sequence.append(tokens, 0, tokens.length);
-        }
-
-        int[] append(int[] tokens) {
-            sequence.append(tokens, 0, tokens.length);
-            return tokens;
-        }
-
-        @Override public MemoryPlan plan() {
-            return null;
-        }
-
-        @Override public SequenceState sequence() {
-            return sequence;
-        }
-
-        @Override public void reset() {
-            sequence.clear();
-        }
-
-        @Override public boolean canRollback(int nTokens) {
-            return nTokens <= sequence.nPast();
-        }
-
-        @Override public void rollback(int nTokens) {
-            sequence.truncate(nTokens);
-        }
-
-        @Override public boolean hasRecurrentState() {
-            return false;
-        }
-
-        @Override public boolean canSnapshot() {
-            return false;
-        }
-
-        @Override public boolean ringsKeepWindow(int nWrite, int nDrop) {
-            return true;
-        }
-
-        @Override public void snapshot() {
-        }
-
-        @Override public void restore() {
-        }
-
-        @Override public void close() {
-        }
-    }
-
-    private static final class FakeBackend implements ForwardBackend {
-        final FakeMem memory = new FakeMem();
-
-        @Override public float[] prefill(int[] tokens, int pos0) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public float[] decode(int token, int pos) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public float[][] forwardRows(int[] tokens, int pos0, int[] outputRows) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public float[][] forwardAll(int[] tokens, int[] outputRows) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public float[][] hiddenRows(int[] tokens, int[] tokenTypes) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public void reset() {
-            memory.reset();
-        }
-
-        @Override public boolean canRollback(int nTokens) {
-            return memory.canRollback(nTokens);
-        }
-
-        @Override public void rollback(int nTokens) {
-            memory.rollback(nTokens);
-        }
-
-        @Override public void shiftContext(int nKeep, int nDiscard) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public ModelMemory memory() {
-            return memory;
-        }
-
-        @Override public void setHiddenTap(HiddenTap tap) {
-        }
-
-        @Override public void close() {
-        }
-    }
-
-    private static final class FakeModel implements EngineModel {
-        final FakeBackend backend = new FakeBackend();
-
-        FakeModel prefill(int[] tokens) {
-            backend.memory.prefill(tokens);
-            return this;
-        }
-
-        @Override public com.eonmux.neuralfree.gguf.GGUFTokenizer tokenizer() {
-            return null;
-        }
-
-        @Override public void close() {
-        }
-
-        @Override public ForwardBackend forwardBackend() {
-            return backend;
-        }
-
-        @Override public com.eonmux.neuralfree.gguf.spec.ModelSpec spec() {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public String name() {
-            return "fake";
-        }
-
-        @Override public String architecture() {
-            return "fake-llama";
-        }
-
-        @Override public int vocabSize() {
-            return 16;
-        }
-
-        @Override public int contextLength() {
-            return 64;
-        }
-
-        @Override public int[] generate(int[] tokens, int maxNewTokens, float temperature, float topP) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public int[] generate(int[] tokens, int maxNewTokens, float temperature, float topP,
-                                        TokenCallback callback) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public int[] generateWithPrompt(String prompt, int maxNewTokens, float temperature, float topP) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public int[] generateWithPrompt(String prompt, int maxNewTokens, float temperature, float topP,
-                                                  TokenCallback callback) {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public void resetKVCache() {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public void printInfo() {
-            throw new UnsupportedOperationException("not used by the drafter tests");
-        }
-
-        @Override public int kvCacheContext() {
-            return 64;
-        }
-
-        @Override public int embeddingLength() {
-            return 0;
-        }
-
-        @Override public int layerCount() {
-            return 0;
-        }
-
-        @Override public int headCount() {
-            return 0;
-        }
-
-        @Override public int headCountKv() {
-            return 0;
-        }
-
-        @Override public int feedForwardLength() {
-            return 0;
-        }
-
-        @Override public float rmsNormEps() {
-            return 0.0f;
-        }
-
-        @Override public float ropeFreqBase() {
-            return 0.0f;
-        }
-
-        @Override public int headDim() {
-            return 0;
-        }
-
-        @Override public int kvDim() {
-            return 0;
-        }
-    }
 
     /** A drafter answering from the first proposal of its script, then draftless, for the chain tests. */
     private static class ScriptedDrafter implements DraftModel {
@@ -374,6 +159,41 @@ public class NgramDrafterTest {
     }
 
     @Test
+    public void modDropsAChainBrokenBelowItsFloorButKeepsAFullOne() {
+        FakeModel target = new FakeModel().prefill(new int[]{1, 2, 3, 4, 1, 2});
+        // the chain [4, 1, 2] breaks at [4, 1, 2]: below n_min 4 of an n_max 8 it is dropped
+        NgramDrafter broken = NgramDrafter.of(NgramDrafter.Options.builder(NgramDrafter.Kind.MOD)
+                .sizeN(3).sizeM(8).draftMin(4).modTableSize(1 << 12).build());
+        broken.bindTarget(target);
+        assertArrayEquals(new int[0], broken.draft(3, 8));
+        // llama.cpp checks n_min only where the chain breaks: a chain of the full n_max 3 stays
+        NgramDrafter full = NgramDrafter.of(NgramDrafter.Options.builder(NgramDrafter.Kind.MOD)
+                .sizeN(3).sizeM(3).draftMin(4).modTableSize(1 << 12).build());
+        full.bindTarget(target);
+        assertArrayEquals(new int[]{4, 1, 2}, full.draft(3, 8));
+        // the floor applies before the round's cap: the 3-token chain reaches n_min 3, then the cap cuts it to 2
+        NgramDrafter capped = NgramDrafter.of(NgramDrafter.Options.builder(NgramDrafter.Kind.MOD)
+                .sizeN(3).sizeM(8).draftMin(3).modTableSize(1 << 12).build());
+        capped.bindTarget(target);
+        assertArrayEquals(new int[]{4, 1}, capped.draft(3, 2));
+    }
+
+    @Test
+    public void llamaCppDefaultSizesPerKind() {
+        assertEquals(Arrays.asList(12, 12, 48, 0), sizes(NgramDrafter.Kind.SIMPLE));
+        assertEquals(Arrays.asList(12, 12, 48, 0), sizes(NgramDrafter.Kind.MAP_K));
+        assertEquals(Arrays.asList(12, 12, 48, 0), sizes(NgramDrafter.Kind.MAP_K4V));
+        assertEquals(Arrays.asList(24, 24, 64, 48), sizes(NgramDrafter.Kind.MOD));
+        assertEquals(8, NgramDrafter.Options.builder(NgramDrafter.Kind.CACHE).build().sizeM());
+        assertEquals(4 * 1024 * 1024, NgramDrafter.Options.builder(NgramDrafter.Kind.MOD).build().modTableSize());
+    }
+
+    private static List<Integer> sizes(NgramDrafter.Kind kind) {
+        NgramDrafter.Options o = NgramDrafter.Options.builder(kind).build();
+        return Arrays.asList(o.sizeN(), o.sizeNMin(), o.sizeM(), o.draftMin());
+    }
+
+    @Test
     public void modRebuildsAfterARollback() {
         FakeModel target = new FakeModel().prefill(new int[]{1, 2, 3, 4, 1, 2});
         NgramDrafter d = drafter(NgramDrafter.Kind.MOD, target, 3, 3);
@@ -435,13 +255,49 @@ public class NgramDrafterTest {
         NgramDrafter d = NgramDrafter.of(NgramDrafter.Options.builder(NgramDrafter.Kind.CACHE)
                 .sizeM(3).draftMin(4).corpus(corpus).build());
         d.bindTarget(target);
-        // the 3-token chain stays below the draft minimum
-        assertArrayEquals(new int[0], d.draft(7, 4));
+        // the chain fills the whole sizeM, so the floor above it does not drop it
+        assertArrayEquals(new int[]{1, 2, 7}, d.draft(7, 4));
         assertThrows(IllegalArgumentException.class,
                 () -> NgramDrafter.Options.builder(NgramDrafter.Kind.CACHE).ngramMin(3).ngramMax(2).build());
         NgramDrafter.Options sized = NgramDrafter.Options.builder(NgramDrafter.Kind.CACHE)
                 .ngramMax(2).build();
         assertEquals(2, sized.ngramMax());
+    }
+
+    @Test
+    public void cacheDraftRunsOverExplicitCaches() {
+        NgramCache.Key key12 = NgramCache.Key.of(new int[]{1, 2}, 0, 2);
+        NgramCache context = new NgramCache();
+        context.addCount(key12, 5, 2);
+        // the context offers 5 with a lax sample of 2; no static cache validates it
+        assertArrayEquals(new int[]{5}, NgramDrafter.draftCache(new int[]{1, 2}, 4, 1, 4, context, null, null));
+
+        // without the context the empty proposal comes back; a static 2-gram then drafts its best token
+        NgramCache stat = new NgramCache();
+        stat.addCount(key12, 7, 2);
+        assertArrayEquals(new int[]{7}, NgramDrafter.draftCache(new int[]{1, 2}, 4, 1, 4, null, null, stat));
+        NgramCache tie = new NgramCache();
+        tie.addCount(key12, 7, 1);
+        tie.addCount(key12, 8, 1);
+        tie.addCount(key12, 9, 1);
+        // no token reaches the 50% dominance of the static fallback: no draft
+        assertArrayEquals(new int[0], NgramDrafter.draftCache(new int[]{1, 2}, 4, 1, 4, null, null, tie));
+
+        // a 1-gram only offers below ngramMin = 2, and offers once the window reaches 1-grams
+        NgramCache unigram = new NgramCache();
+        unigram.addCount(NgramCache.Key.of(new int[]{1}, 0, 1), 9, 4);
+        assertArrayEquals(new int[0],
+                NgramDrafter.draftCache(new int[]{1, 1}, 4, 2, 4, unigram, null, null));
+        assertArrayEquals(new int[]{9},
+                NgramDrafter.draftCache(new int[]{1, 1}, 4, 1, 4, unigram, null, null));
+        assertArrayEquals("a sequence with no sampled token drafts nothing",
+                new int[0], NgramDrafter.draftCache(new int[0], 4, 1, 4, unigram, null, null));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> NgramDrafter.draftCache(new int[]{1}, 4, 3, 2, null, null, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> NgramDrafter.draftCache(new int[]{-1}, 4, 1, 4, null, null, null));
+        assertArrayEquals(new int[0], NgramDrafter.draftCache(new int[]{1, 2}, 0, 1, 4, context, null, null));
     }
 
     // ---- NgramCorpus -----------------------------------------------------------------------
@@ -473,8 +329,12 @@ public class NgramDrafterTest {
         // the budget eviction drops "a"'s oldest sequence when "a" overflows
         corpus.add("a", new int[]{1, 2, 3, 4, 5});
         assertArrayEquals(new int[][]{{4, 5, 6}, {1, 2, 3, 4, 5}}, corpus.sequences("a"));
-        corpus.add("a", new int[]{6, 7, 8, 9, 10, 11});
-        assertArrayEquals(new int[][]{{1, 2, 3, 4, 5}, {6, 7, 8, 9, 10, 11}}, corpus.sequences("a"));
+        corpus.add("a", new int[]{6, 7, 8, 9, 10});
+        assertArrayEquals(new int[][]{{1, 2, 3, 4, 5}, {6, 7, 8, 9, 10}}, corpus.sequences("a"));
+        // a sequence that only fits once every older one is gone evicts them all
+        corpus.add("a", new int[]{1, 2, 3, 4, 5, 6});
+        assertArrayEquals(new int[][]{{1, 2, 3, 4, 5, 6}}, corpus.sequences("a"));
+        assertEquals(6, corpus.list().get(0).tokenCount());
     }
 
     @Test
@@ -559,7 +419,7 @@ public class NgramDrafterTest {
                 () -> NgramCacheFile.load(new ByteArrayInputStream(withoutTokens), "zero.bin")).getMessage()
                 .contains("non-positive token count"));
         byte[] badCount = raw.clone();
-        setInt32LE(badCount, 20, 0);
+        setInt32LE(badCount, 24, 0);
         assertTrue(assertThrows(UncheckedIOException.class,
                 () -> NgramCacheFile.load(new ByteArrayInputStream(badCount), "row.bin")).getMessage()
                 .contains("non-positive count"));
@@ -585,11 +445,12 @@ public class NgramDrafterTest {
         tree.extend(1, new int[]{1, 2, 3, 4});
         tree.extend(2, new int[]{1, 2, 3, 4});
         tree.extend(3, new int[]{1, 2, 3, 5});
-        // pattern [2, 3]: the child 4 counts 2 against 5 once -> chain [4], and [3, 4] ends the stored sequences
+        // pattern [2, 3]: [2, 3] occurs 3 times, followed by 4 twice and 5 once -> chain [4], and [3, 4] ends the
+        // stored sequences; the one-token draft scores its own probability
         SuffixTree.Draft d = tree.speculate(new int[]{2, 3}, 4, 1.0, 0.0, 0.05);
         assertArrayEquals(new int[]{4}, d.tokenIds());
         assertEquals(2, d.matchLength());
-        assertEquals(1.0, d.score(), 1e-9);
+        assertEquals(2.0 / 3.0, d.score(), 1e-9);
         assertEquals(2.0 / 3.0, d.probabilities()[0], 1e-9);
         // [3, 4] matches fully but has no continuation
         assertEquals(0, tree.speculate(new int[]{3, 4}, 4, 1.0, 0.0, 0.05).tokenIds().length);
@@ -608,9 +469,9 @@ public class NgramDrafterTest {
         SuffixTree tree = new SuffixTree(8);
         tree.extend(1, new int[]{1, 2, 3});
         tree.extend(1, new int[]{4, 5});
-        // the committed suffix [3, 4, 5] matches the extended sequence, which ends there
+        // [2, 3, 4, 5] spans both extensions and matches whole; the extended sequence ends there
         SuffixTree.Draft d = tree.speculate(new int[]{2, 3, 4, 5}, 4, 1.0, 0.0, 0.05);
-        assertEquals(3, d.matchLength());
+        assertEquals(4, d.matchLength());
         assertEquals(0, d.tokenIds().length);
         tree.dropSequence(1);
         tree.clear();
@@ -627,9 +488,39 @@ public class NgramDrafterTest {
     public void suffixTreeCapsItsDepth() {
         SuffixTree deep = new SuffixTree(2);
         deep.extend(1, new int[]{1, 2, 3, 4});
-        // suffix ends longer than 2 are never entered: [3, 4] matches but is never proposed from
-        assertEquals(2, deep.speculate(new int[]{3, 4, 5}, 4, 1.0, 0.0, 0.05).matchLength());
+        // suffix ends longer than 2 are never entered: [2, 3, 4] is not matched, [3, 4] is but is never proposed from
+        assertEquals(2, deep.speculate(new int[]{2, 3, 4}, 4, 1.0, 0.0, 0.05).matchLength());
         assertEquals(0, deep.speculate(new int[]{3, 4}, 9, 1.0, 0.0, 0.05).tokenIds().length);
+    }
+
+    @Test
+    public void suffixTreeMatchesTheContextsSuffixesAndKeepsTheBestDraft() {
+        SuffixTree tree = new SuffixTree(8);
+        tree.extend(1, new int[]{1, 2, 3, 4, 5});
+        // the context's head [9, 9] is unknown: its suffixes [3] and [2, 3] match, and the longer one may draft two
+        SuffixTree.Draft d = tree.speculate(new int[]{9, 9, 2, 3}, 4, 1.0, 0.0, 0.05);
+        assertArrayEquals(new int[]{4, 5}, d.tokenIds());
+        assertEquals(2, d.matchLength());
+        assertEquals(2.0, d.score(), 1e-9);
+        // the offset lets the one-token match draft past the factor's budget
+        assertArrayEquals(new int[]{4, 5}, tree.speculate(new int[]{3}, 4, 1.0, 1.0, 0.05).tokenIds());
+    }
+
+    @Test
+    public void suffixTreeProbabilitiesCompoundAlongThePath() {
+        SuffixTree tree = new SuffixTree(8);
+        tree.extend(1, new int[]{7, 1, 2, 8});
+        tree.extend(2, new int[]{7, 1, 2, 8});
+        tree.extend(3, new int[]{7, 1, 3, 9});
+        // [7] -> 1 always (3 of 3), then 2 in 2 of the 3 [7, 1], then 8 after both [7, 1, 2]
+        SuffixTree.Draft d = tree.speculate(new int[]{7}, 8, 4.0, 0.0, 0.05);
+        assertArrayEquals(new int[]{1, 2, 8}, d.tokenIds());
+        assertEquals(1.0, d.probabilities()[0], 1e-9);
+        assertEquals(2.0 / 3.0, d.probabilities()[1], 1e-9);
+        assertEquals(2.0 / 3.0, d.probabilities()[2], 1e-9);
+        assertEquals(1.0 + 4.0 / 3.0, d.score(), 1e-9);
+        // a minimum above the compounded 2/3 stops the path after its first token
+        assertArrayEquals(new int[]{1}, tree.speculate(new int[]{7}, 8, 4.0, 0.0, 0.7).tokenIds());
     }
 
     // ---- SuffixDrafter ---------------------------------------------------------------------
@@ -639,11 +530,13 @@ public class NgramDrafterTest {
         FakeModel target = new FakeModel().prefill(new int[]{1, 2, 3, 4, 5, 1, 2, 3});
         SuffixDrafter d = SuffixDrafter.of();
         d.bindTarget(target);
-        // the local tree holds the committed tokens; the pattern [1, 2, 3, 4] + sampled 5 matches, and its most
-        // probable chain continues into the stored sequence's own continuation [5, 1, 2, 3]
-        assertArrayEquals(new int[]{5, 1, 2, 3}, d.draft(5, 4));
+        // the local tree holds the committed tokens; the history's [1, 2, 3] + sampled 4 matches the pattern
+        // [1, 2, 3, 4], whose most probable chain is the stored sequence's own continuation [5, 1, 2, 3]
+        assertArrayEquals(new int[]{5, 1, 2, 3}, d.draft(4, 4));
         // the request caps the chain
-        assertArrayEquals(new int[]{5}, d.draft(5, 1));
+        assertArrayEquals(new int[]{5}, d.draft(4, 1));
+        // a sampled token the history never continued drafts from its shortest match: [5] -> [1]
+        assertArrayEquals(new int[]{1}, d.draft(5, 4));
     }
 
     @Test
@@ -660,11 +553,22 @@ public class NgramDrafterTest {
     }
 
     @Test
+    public void suffixDrafterEntersCorpusSequencesLongerThanItsDepthWhole() {
+        NgramCorpus corpus = new NgramCorpus();
+        corpus.add("docs", new int[]{1, 2, 3, 4, 5, 6, 7, 8});
+        FakeModel target = new FakeModel().prefill(new int[]{2});
+        SuffixDrafter d = SuffixDrafter.of(SuffixDrafter.Options.builder().maxTreeDepth(4).corpus(corpus).build());
+        d.bindTarget(target);
+        // [2, 3] lies in the sequence's head, before its last maxTreeDepth tokens
+        assertArrayEquals(new int[]{4, 5}, d.draft(3, 4));
+    }
+
+    @Test
     public void suffixDrafterResetsItsLocalTree() {
         FakeModel target = new FakeModel().prefill(new int[]{1, 2, 3, 4, 5, 1, 2, 3});
         SuffixDrafter d = SuffixDrafter.of();
         d.bindTarget(target);
-        assertArrayEquals(new int[]{5, 1, 2, 3}, d.draft(5, 4));
+        assertArrayEquals(new int[]{5, 1, 2, 3}, d.draft(4, 4));
         d.accept(1);
         d.reset();
         // the decoder resets the target memory with the drafter: the fresh generation drafts nothing
@@ -726,6 +630,38 @@ public class NgramDrafterTest {
         assertNotNull(cacheDrafter.options());
     }
 
+    @Test
+    public void cacheKeepsEveryHistoryForTheDynamicCacheFile() {
+        NgramCache.Key nine = NgramCache.Key.of(new int[]{9}, 0, 1);
+        NgramCache.Key one = NgramCache.Key.of(new int[]{1}, 0, 1);
+        NgramCache preloaded = new NgramCache();
+        preloaded.addCount(nine, 8, 3);
+        FakeModel target = new FakeModel().prefill(new int[]{1, 2, 3, 1, 2});
+        NgramDrafter d = NgramDrafter.of(NgramDrafter.Options.builder(NgramDrafter.Kind.CACHE)
+                .dynamicCache(preloaded).build());
+        d.bindTarget(target);
+        d.draft(3, 4);
+        NgramCache first = d.learnedDynamicCache();
+        assertEquals("the preloaded counts stay", 3, first.count(nine, 8));
+        assertEquals("the history's (1) -> 2 n-grams join", 2, first.count(one, 2));
+        assertEquals("the preloaded cache is not written", 0, preloaded.count(one, 2));
+
+        // a new generation drops the context cache but keeps its n-grams for the file
+        d.reset();
+        target.backend.memory.reset();
+        target.prefill(new int[]{1, 2, 4});
+        d.draft(4, 4);
+        assertEquals(3, d.learnedDynamicCache().count(one, 2));
+        d.close();
+        assertEquals("the cache outlives the drafter for the write after close", 3,
+                d.learnedDynamicCache().count(one, 2));
+
+        NgramDrafter withoutFile = drafter(NgramDrafter.Kind.CACHE, new FakeModel().prefill(new int[]{1}), 2, 4);
+        assertThrows(IllegalStateException.class, withoutFile::learnedDynamicCache);
+        assertThrows(IllegalStateException.class, () -> NgramDrafter.of(NgramDrafter.Options
+                .builder(NgramDrafter.Kind.CACHE).dynamicCache(new NgramCache()).build()).learnedDynamicCache());
+    }
+
     // ---- DrafterChain ----------------------------------------------------------------------
 
     @Test
@@ -784,6 +720,32 @@ public class NgramDrafterTest {
     }
 
     // ---- HiddenTapSlot ---------------------------------------------------------------------
+
+    @Test
+    public void chainCapsEachMemberAtItsOwnLimit() {
+        int[] asked = new int[2];
+        ScriptedDrafter silent = new ScriptedDrafter() {
+            @Override public int[] draft(int lastToken, int n) {
+                asked[0] = n;
+                return new int[0];
+            }
+        };
+        ScriptedDrafter capped = new ScriptedDrafter() {
+            @Override public int[] draft(int lastToken, int n) {
+                asked[1] = n;
+                return new int[n];
+            }
+        };
+        DrafterChain chain = new DrafterChain(Arrays.asList(silent, capped), new int[]{Integer.MAX_VALUE, 2});
+        assertEquals(2, chain.draft(0, 6).length);
+        assertEquals("an unlimited member drafts the whole round", 6, asked[0]);
+        assertEquals("a member with its own cap drafts at most that", 2, asked[1]);
+        assertEquals(1, chain.draft(0, 1).length);
+        assertThrows(IllegalArgumentException.class,
+                () -> new DrafterChain(Arrays.asList(silent, capped), new int[]{3}));
+        assertThrows(IllegalArgumentException.class,
+                () -> new DrafterChain(Arrays.asList(silent, capped), new int[]{3, 0}));
+    }
 
     private static final class TapRoute implements HiddenTap {
         final List<Integer> layers = new ArrayList<>();
@@ -864,9 +826,9 @@ public class NgramDrafterTest {
     public void draftTypeParsesTheNewLookupTypes() {
         assertEquals(EngineConfig.DraftType.NGRAM, EngineConfig.DraftType.parse("ngram-simple"));
         assertEquals(EngineConfig.DraftType.NGRAM, EngineConfig.DraftType.parse("prompt-lookup"));
-        assertEquals(EngineConfig.DraftType.NGRAM_MAP, EngineConfig.DraftType.parse("ngram-map-k"));
-        assertEquals(EngineConfig.DraftType.NGRAM_MAP, EngineConfig.DraftType.parse("map-k4v"));
-        assertEquals(EngineConfig.DraftType.NGRAM_MAP, EngineConfig.DraftType.parse("mod"));
+        assertEquals(EngineConfig.DraftType.NGRAM_MAP_K, EngineConfig.DraftType.parse("ngram-map-k"));
+        assertEquals(EngineConfig.DraftType.NGRAM_MAP_K4V, EngineConfig.DraftType.parse("map-k4v"));
+        assertEquals(EngineConfig.DraftType.NGRAM_MOD, EngineConfig.DraftType.parse("mod"));
         assertEquals(EngineConfig.DraftType.NGRAM_CACHE, EngineConfig.DraftType.parse("ngram-cache"));
         assertEquals(EngineConfig.DraftType.SUFFIX, EngineConfig.DraftType.parse("suffix"));
         assertEquals(EngineConfig.DraftType.MODEL, EngineConfig.DraftType.parse("model"));
@@ -874,7 +836,7 @@ public class NgramDrafterTest {
         assertEquals("ngram-cache", EngineConfig.DraftType.NGRAM_CACHE.llamaName());
         assertEquals("suffix", EngineConfig.DraftType.SUFFIX.llamaName());
         assertTrue(EngineConfig.DraftType.NGRAM.lookupWithoutDraftModel());
-        assertTrue(EngineConfig.DraftType.NGRAM_MAP.lookupWithoutDraftModel());
+        assertTrue(EngineConfig.DraftType.NGRAM_MAP_K.lookupWithoutDraftModel());
         assertTrue(EngineConfig.DraftType.NGRAM_CACHE.lookupWithoutDraftModel());
         assertTrue(EngineConfig.DraftType.SUFFIX.lookupWithoutDraftModel());
         assertFalse(EngineConfig.DraftType.MODEL.lookupWithoutDraftModel());
@@ -883,7 +845,8 @@ public class NgramDrafterTest {
         assertThrows(IllegalArgumentException.class, () -> EngineConfig.DraftType.parse("draft-eagle3"));
         java.util.Properties p = new java.util.Properties();
         p.setProperty(EngineConfig.PROP_DRAFT_TYPE, "pRoMpT-lOoKuP");
-        assertEquals(EngineConfig.DraftType.NGRAM, EngineConfig.fromProperties(p).draftType());
+        assertEquals(java.util.Collections.singletonList(EngineConfig.DraftType.NGRAM),
+                EngineConfig.fromProperties(p).draftTypes());
         // and a config with only a lookup type is speculative
         assertTrue(EngineConfig.fromProperties(p).speculative());
         assertFalse(EngineConfig.defaults().speculative());

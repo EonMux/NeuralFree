@@ -4,16 +4,17 @@
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_tokens, i n_v_heads, i n_k_heads, i layout, i kda_mode, i head_dim, f lb, i a_stride, i a_off,
- *    i b_stride, i b_off, R a_in, R b_in, R dt_bias, R ssm_a, W g_out, W beta_out)
+ *    i b_stride, i b_off, f beta_scale, R a_in, R b_in, R dt_bias, R ssm_a, W g_out, W beta_out)
  * With x = a + dt_bias and A = ssm_a[h]:
  *   kda_mode -1 GDN       g[t][h]    = softplus(x) * A                (dt_bias[h])
  *   kda_mode  0 SOFTPLUS  g[t][h][d] = softplus(x) * A                (dt_bias[h*head_dim + d])
  *   kda_mode  1 LB_NEG    g[t][h][d] = lb * sigmoid(-(A * x))
  *   kda_mode  2 LB_POS    g[t][h][d] = lb * sigmoid(A * x)
- *   beta[t][h] = sigmoid(b)
+ *   beta[t][h] = beta_scale * sigmoid(b)
  * layout 0 reads a at a_in[a_off + t*a_stride + (h | h*head_dim + d)] and b at b_in[b_off + t*b_stride + h];
  * layout 1 (fused ssm_ba, GDN) reads, for h = kh*R + r with R = n_v_heads / n_k_heads, b at row index
- * kh*2R + r and a at kh*2R + R + r.
+ * kh*2R + r and a at kh*2R + R + r;
+ * layout 2 (merged ssm_beta_alpha, GDN) reads b at row index h and a at n_v_heads + h ([beta | alpha] rows).
  *
  * Dispatch: 1-D, one invocation per (t, h, d): global = n_tokens * n_v_heads * (kda_mode < 0 ? 1 : head_dim),
  * any local = {L, 1, 1}; folded group counts are recovered by nf_global_id().
@@ -43,6 +44,7 @@ layout(push_constant) uniform NfGdnGateParams {
     int a_off;
     int b_stride;
     int b_off;
+    float beta_scale;
 } pc;
 
 void main() {
@@ -65,6 +67,9 @@ void main() {
         const uint r = h - kh * R;
         b_idx = kh * 2u * R + r;
         a_idx = b_idx + R;
+    } else if (pc.layout_mode == 2) {
+        b_idx = h;
+        a_idx = n_v + h;
     } else {
         a_idx = pc.kda_mode < 0 ? h : h * uint(pc.head_dim) + d;
         b_idx = h;
@@ -84,6 +89,6 @@ void main() {
     g_out[gid] = gv;
 
     if (d == 0u) {
-        beta_out[th] = nf_sigmoid(b_in[uint(pc.b_off) + t * uint(pc.b_stride) + b_idx]);
+        beta_out[th] = pc.beta_scale * nf_sigmoid(b_in[uint(pc.b_off) + t * uint(pc.b_stride) + b_idx]);
     }
 }

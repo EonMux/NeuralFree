@@ -43,4 +43,20 @@ public enum MropeTextPositions {
             }
         }
     }
+
+    /**
+     * Fills {@code dst[0 .. 4 * nTokens)} with the section-major positions of the rows at
+     * {@code tokenPos[off .. off + nTokens)} (batched rows out of position order).
+     */
+    public void fill(int[] tokenPos, int off, int nTokens, int[] dst) {
+        if (nTokens < 0 || off < 0 || tokenPos.length < off + nTokens || dst.length < SECTIONS * nTokens) {
+            throw new IllegalArgumentException("destination holds " + dst.length + " positions, need "
+                    + SECTIONS * nTokens + ", for " + nTokens + " rows from " + off + " of " + tokenPos.length);
+        }
+        for (int s = 0; s < SECTIONS; s++) {
+            for (int t = 0; t < nTokens; t++) {
+                dst[s * nTokens + t] = position(s, tokenPos[off + t]);
+            }
+        }
+    }
 }

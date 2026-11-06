@@ -1,9 +1,12 @@
-/* common/quant_decode_iq.h - IQ3_XXS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S and IQ1_M decode triples. Requires: common/dialect.h, common/quant_blocks.h, common/iq_tables.h */
+/* common/quant_decode_iq.h - IQ3_XXS, IQ3_S, IQ3_K, IQ3_KS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S and IQ1_M decode
+ * triples. Requires: common/dialect.h, common/quant_blocks.h, common/iq_tables.h */
 /*
  * Decode triples T_decode / T_decode_dual / T_decode_elem for the 256-element i-quant super-blocks,
  * with the contract of common/matvec_family.h. The math is llama.cpp ggml/src/ggml-quants.c
  * dequantize_row_iq2_xxs (2489), _iq2_xs (2517), _iq2_s (2544), _iq3_xxs (2576), _iq3_s (2608),
- * _iq1_s (2651) and _iq1_m (2676); block layouts are llama.cpp ggml/src/ggml-common.h block_iq*.
+ * _iq1_s (2651) and _iq1_m (2676); IQ3_K and IQ3_KS follow Avalon ggml/src/ggml-quants.c
+ * dequantize_row_iq3_k (5381) and _iq3_ks (5613); block layouts are llama.cpp ggml/src/ggml-common.h
+ * block_iq* and their Avalon block_iq3_k / block_iq3_ks.
  *
  * Work split (TPS = NF_IQD_TPS = 32): work-item ltid of a block owns the 8-element group
  * ltid = 4 * sb + grp, where sb in [0, 8) is the 32-element sub-block (ggml ib32) and grp in [0, 4)
@@ -14,6 +17,9 @@
  *                                  mag[j] = unsigned byte j of the 8 grid bytes (lo: 0-3, hi: 4-7)
  *   nf_iqd_tgroup (IQ1_*):         y[j] = dl * (val[j] + delta)
  *                                  val[j] = signed byte j of the 8 grid bytes, in {-1, 0, 1}
+ *   nf_iqd_kgroup (IQ3_K, IQ3_KS): y[j] = dl * IQ3NL_KVALUES[code j + grid]
+ *                                  code j is a 3-bit base code, 4 per uint (lo: 0-3, hi: 4-7);
+ *                                  grid is 0 or 8, the block's grid-select bit times 8
  * and the triples are generated from the per-type descriptor builders nf_iqd_<type>(bp, sb, grp).
  */
 #ifndef NF_QUANT_DECODE_IQ_H
@@ -38,6 +44,15 @@ typedef struct {
     uint lo;      /* signed grid bytes 0-3 (values -1, 0, 1) */
     uint hi;      /* signed grid bytes 4-7 */
 } nf_iqd_tgroup;
+
+/* iq3nl group of the IQ3_K / IQ3_KS grid: 8 three-bit base codes, 4 per word, plus the shared
+ * grid offset (8 when the block's grid-select bit is set, else 0). */
+typedef struct {
+    float dl;     /* group scale */
+    uint lo;      /* base codes 0-3, code j at bits 3j */
+    uint hi;      /* base codes 4-7, code j at bits 3(j-4) */
+    uint grid;    /* 0 or 8: the shifted-grid offset of the group */
+} nf_iqd_kgroup;
 
 /* Unsigned byte k of w. */
 NF_INLINE float nf_iqd_ubyte(uint w, int k) {
@@ -79,6 +94,30 @@ NF_INLINE float nf_iqd_sgroup_dot(nf_iqd_sgroup g, float4 x0, float4 x1) {
 /* Dot of a ternary group with its 8 activations. */
 NF_INLINE float nf_iqd_tgroup_dot(nf_iqd_tgroup g, float4 x0, float4 x1) {
     return g.dl * (nf_iqd_tdot4(x0, g.lo, g.delta) + nf_iqd_tdot4(x1, g.hi, g.delta));
+}
+
+/* Code k in [0, 4) of a packed iq3nl group word (a base code in [0, 7)). */
+NF_INLINE int nf_iqd_kcode(uint codes, int k) {
+    return (int)((codes >> (3 * k)) & 7u);
+}
+
+/* sum_k x[k] * IQ3NL_KVALUES[codes[k] + grid] over 4 elements. */
+NF_INLINE float nf_iqd_kdot4(float4 x, uint codes, uint grid) {
+    return x.x * IQ3NL_KVALUES[nf_iqd_kcode(codes, 0) + grid]
+         + x.y * IQ3NL_KVALUES[nf_iqd_kcode(codes, 1) + grid]
+         + x.z * IQ3NL_KVALUES[nf_iqd_kcode(codes, 2) + grid]
+         + x.w * IQ3NL_KVALUES[nf_iqd_kcode(codes, 3) + grid];
+}
+
+/* Dot of an iq3nl group with its 8 activations x0 (elements 0-3) and x1 (4-7). */
+NF_INLINE float nf_iqd_kgroup_dot(nf_iqd_kgroup g, float4 x0, float4 x1) {
+    return g.dl * (nf_iqd_kdot4(x0, g.lo, g.grid) + nf_iqd_kdot4(x1, g.hi, g.grid));
+}
+
+/* Element e in [0, 8) of an iq3nl group. */
+NF_INLINE float nf_iqd_kgroup_elem(nf_iqd_kgroup g, int e) {
+    const uint codes = e < 4 ? g.lo : g.hi;
+    return g.dl * IQ3NL_KVALUES[nf_iqd_kcode(codes, e & 3) + g.grid];
 }
 
 /* Element e in [0, 8) of a sign-magnitude group. */
@@ -150,6 +189,58 @@ NF_INLINE nf_iqd_sgroup nf_iqd_iq3s(NF_GLOBAL const uchar* bp, int sb, int grp) 
     const uint i1 = (uint)qs[1] | ((qh << (7 - 2 * grp)) & 256u);
     return nf_iqd_sgroup32(iq3s_scale(bp, sb), IQ3S_GRID_CL[i0], IQ3S_GRID_CL[i1],
                            bp[74 + 4 * sb + grp]);
+}
+
+/* Shared builder of the IQ3_K / IQ3_KS base codes: the 8 elements grp*8+k of sub-block sb take their
+ * two low code bits from qs byte 32*(sb/4) + grp*8 + k at shift 2*(sb%4) and their high bit from bit
+ * sb of qh byte grp*8 + k; the caller adds the shifted-grid offset at the value lookup. */
+NF_INLINE nf_iqd_kgroup nf_iqd_iq3k_codes(NF_GLOBAL const uchar* qs, NF_GLOBAL const uchar* qh,
+                                          int sb, int grp) {
+    const int shift_l = 2 * (sb & 3);
+    const int shift_h = sb & 7;
+    uint lo = 0u, hi = 0u;
+    for (int k = 0; k < 4; ++k) {
+        const uint c0 = ((qs[k] >> shift_l) & 3u) | (((qh[k] >> shift_h) & 1u) << 2);
+        const uint c1 = ((qs[k + 4] >> shift_l) & 3u) | (((qh[k + 4] >> shift_h) & 1u) << 2);
+        lo |= c0 << (3 * k);
+        hi |= c1 << (3 * k);
+    }
+    nf_iqd_kgroup g;
+    g.lo = lo;
+    g.hi = hi;
+    return g;
+}
+
+/* IQ3_K, 110 bytes: d(f16) | extra(u16 grid-select bits) | scales_h(u16 sign bits) | scales_l[8]
+ * | qs[64] | qh[32]. The 16-element half h of sub-block sb (ib = 2*sb + h) has scale (2*ls + 1)
+ * from nibble h of scales_l[sb], sign bit ib of scales_h and grid-select bit ib of extra
+ * (Avalon ggml-quants.c:5395-5406). */
+NF_INLINE nf_iqd_kgroup nf_iqd_iq3k(NF_GLOBAL const uchar* bp, int sb, int grp) {
+    const uint extra = (uint)bp[2] | ((uint)bp[3] << 8);
+    const uint sh = (uint)bp[4] | ((uint)bp[5] << 8);
+    const uint sl = bp[6 + sb];
+    const int ib = 2 * sb + (grp >> 1);
+    const float dl = nf_iqd_d(bp) * (float)(2u * ((sl >> (4 * (grp >> 1))) & 0xFu) + 1u)
+                   * ((sh >> ib) & 1u ? -1.0f : 1.0f);
+    nf_iqd_kgroup g = nf_iqd_iq3k_codes(bp + 14 + 32 * (sb >> 2) + 8 * grp, bp + 78 + 8 * grp,
+                                        sb, grp);
+    g.dl = dl;
+    g.grid = ((extra >> ib) & 1u) ? 8u : 0u;
+    return g;
+}
+
+/* IQ3_KS, 104 bytes: d(f16) | extra(u16: bits 0-7 the scales' bit 4, bits 8-15 the grid bits)
+ * | scales[4] | qs[64] | qh[32]. Sub-block sb has the signed 5-bit scale
+ * (nibble sb/4 of scales[sb%4] | bit sb of extra << 4) - 16 and the grid-select bit 8+sb of extra
+ * (Avalon ggml-quants.c:5619-5629). */
+NF_INLINE nf_iqd_kgroup nf_iqd_iq3ks(NF_GLOBAL const uchar* bp, int sb, int grp) {
+    const uint extra = (uint)bp[2] | ((uint)bp[3] << 8);
+    const uint ls = (((bp[4 + (sb & 3)] >> (4 * (sb >> 2))) & 0xFu) | ((extra >> sb) & 1u) << 4) - 16u;
+    nf_iqd_kgroup g = nf_iqd_iq3k_codes(bp + 8 + 32 * (sb >> 2) + 8 * grp, bp + 72 + 8 * grp,
+                                        sb, grp);
+    g.dl = nf_iqd_d(bp) * (float)(int)ls;
+    g.grid = ((extra >> (8 + sb)) & 1u) ? 8u : 0u;
+    return g;
 }
 
 /* IQ2_XXS, 66 bytes: d(f16) | 8 sub-blocks of 8 bytes: 4 grid indices, then a u32 whose bits
@@ -242,6 +333,8 @@ NF_INLINE float N##_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok,
 
 NF_IQD_TRIPLE(IQ3_XXS, nf_iqd_iq3xxs, s, IQ3_XXS_BLOCK_BYTES)
 NF_IQD_TRIPLE(IQ3_S,   nf_iqd_iq3s,   s, IQ3_S_BLOCK_BYTES)
+NF_IQD_TRIPLE(IQ3_K,   nf_iqd_iq3k,   k, IQ3_K_BLOCK_BYTES)
+NF_IQD_TRIPLE(IQ3_KS,  nf_iqd_iq3ks,  k, IQ3_KS_BLOCK_BYTES)
 NF_IQD_TRIPLE(IQ2_XXS, nf_iqd_iq2xxs, s, IQ2_XXS_BLOCK_BYTES)
 NF_IQD_TRIPLE(IQ2_XS,  nf_iqd_iq2xs,  s, IQ2_XS_BLOCK_BYTES)
 NF_IQD_TRIPLE(IQ2_S,   nf_iqd_iq2s,   s, IQ2_S_BLOCK_BYTES)

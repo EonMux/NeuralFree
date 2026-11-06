@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.grammar;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -11,11 +12,11 @@ import java.util.TreeMap;
  * ({@code common/json-schema-to-grammar.cpp:356-369}) and of its {@code format_grammar}
  * ({@code :984-990}).
  *
- * <p>Every grammar-building WP of the PARITY grammar epic ({@link JsonSchemaToGbnf},
+ * <p>Every grammar builder ({@link JsonSchemaToGbnf},
  * {@link RegexToGbnf} and their callers) writes llama.cpp-style rule text into one builder;
  * {@link #format()} emits the registry as a GBNF grammar text (one {@code name ::= rule} line
  * per entry, entries in name order as llama.cpp's sorted map emits them) and is normally passed
- * to {@link GbnfParser#parse}, which yields the {@link Grammar} the SO-2 runtime consumes
+ * to {@link GbnfParser#parse}, which yields the {@link Grammar} the sampling runtime consumes
  * (validation for undefined rules and left recursion included).</p>
  *
  * <p>{@link #addRule} sanitizes the requested name (every run of characters outside
@@ -39,6 +40,9 @@ public final class GbnfBuilder {
     /** Rule definitions in name order; {@code format()} iterates exactly this order. */
     private final TreeMap<String, String> rules = new TreeMap<>();
 
+    /** The attribute text of the budgeted rules ({@code [max_tokens=n]}), by stored name. */
+    private final Map<String, String> attributes = new HashMap<>();
+
     /** A builder seeding {@code space} with the flexible-whitespace rule. */
     public GbnfBuilder() {
         rules.put("space", SPACE_RULE);
@@ -46,12 +50,12 @@ public final class GbnfBuilder {
 
     /**
      * A builder seeding {@code space} with an explicit rule text; {@code JsonSchemaToGbnf}
-     * passes the compact mode's empty alternate here (row G8). Does not run through
+     * passes the compact mode's empty literal here. Does not run through
      * {@link #addRule}: llama.cpp seeds {@code _rules["space"]}
      * ({@code common/json-schema-to-grammar.cpp:817-818}) directly.
      *
-     * @param spaceRule the right-hand text of the {@code space} rule; an empty string is the
-     *                  compact mode (whitespace forbidden between JSON tokens)
+     * @param spaceRule the right-hand text of the {@code space} rule; the empty literal {@code ""} is
+     *                  the compact mode (whitespace forbidden between JSON tokens)
      */
     public GbnfBuilder(String spaceRule) {
         rules.put("space", spaceRule);
@@ -67,28 +71,56 @@ public final class GbnfBuilder {
      * @return the stored name, which callers reference in other rules
      */
     public String addRule(String name, String definition) {
-        String storedName = sanitizeRuleName(name);
-        String existing = rules.get(storedName);
-        if (existing != null && existing.equals(definition)) {
-            return storedName;
+        return store(sanitizeRuleName(name), "", definition);
+    }
+
+    /**
+     * Adds or deduplicates a rule carrying xgrammar's budget attributes ({@code name[max_tokens=n, max_chars=m]},
+     * {@link GbnfParser}): its text consumes at most {@code maxTokens} tokens and {@code maxChars} code points.
+     *
+     * @param maxTokens the token budget, or negative for none
+     * @param maxChars  the code-point budget, or negative for none
+     * @return the stored rule name
+     */
+    public String addBudgetedRule(String name, int maxTokens, int maxChars, String definition) {
+        List<String> budgets = new ArrayList<>();
+        if (maxTokens >= 0) {
+            budgets.add("max_tokens=" + maxTokens);
         }
-        if (existing == null) {
-            rules.put(storedName, definition);
-            return storedName;
+        if (maxChars >= 0) {
+            budgets.add("max_chars=" + maxChars);
         }
-        int suffix = 0;
+        String attribute = budgets.isEmpty() ? "" : "[" + String.join(", ", budgets) + "]";
+        return store(sanitizeRuleName(name), attribute, definition);
+    }
+
+    private String store(String storedName, String attribute, String definition) {
+        int suffix = -1;
         while (true) {
-            String suffixed = storedName + suffix;
-            existing = rules.get(suffixed);
+            String candidate = suffix < 0 ? storedName : storedName + suffix;
+            String existing = rules.get(candidate);
             if (existing == null) {
-                rules.put(suffixed, definition);
-                return suffixed;
+                rules.put(candidate, definition);
+                if (!attribute.isEmpty()) {
+                    attributes.put(candidate, attribute);
+                }
+                return candidate;
             }
-            if (existing.equals(definition)) {
-                return suffixed;
+            if (existing.equals(definition) && attribute.equals(attributes.getOrDefault(candidate, ""))) {
+                return candidate;
             }
             suffix++;
         }
+    }
+
+    /**
+     * Replaces the seeded {@code space} rule. A converter translating an explicit whitespace pattern calls this
+     * before any schema rule references the rule, so every JSON token is separated by the pattern's grammar.
+     *
+     * @param definition the right-hand text of the {@code space} rule
+     */
+    void setSpaceRule(String definition) {
+        rules.put("space", definition);
     }
 
     /** Whether {@code name} (already sanitized) is defined. */
@@ -110,6 +142,7 @@ public final class GbnfBuilder {
     public void restore(Map<String, String> taken) {
         rules.clear();
         rules.putAll(taken);
+        attributes.keySet().retainAll(taken.keySet());
     }
 
     /**
@@ -123,14 +156,15 @@ public final class GbnfBuilder {
             if (out.length() > 0) {
                 out.append('\n');
             }
-            out.append(entry.getKey()).append(" ::= ").append(entry.getValue());
+            out.append(entry.getKey()).append(attributes.getOrDefault(entry.getKey(), "")).append(" ::= ")
+                    .append(entry.getValue());
         }
         return out.toString();
     }
 
     /**
      * Formats the registry and parses it with {@link GbnfParser}, producing the validated
-     * {@link Grammar} (the compiled automaton the SO-2 runtime and lazy triggers consume).
+     * {@link Grammar} (the compiled automaton the sampling runtime and lazy triggers consume).
      *
      * @throws GrammarException when the formatted text violates the GBNF grammar (an undefined
      *                          rule, a missing {@code root} rule, left recursion) or a
@@ -142,10 +176,12 @@ public final class GbnfBuilder {
 
     /**
      * Converts a {@link ConstraintSpec} to its validated {@link Grammar}, the dispatch the
-     * request wiring calls ({@code response_format}, {@code json_schema}, G3/G4):
-     * {@link Kind#GBNF GBNF} through {@link GbnfParser}, {@link Kind#JSON_SCHEMA JSON_SCHEMA}
-     * and {@link Kind#JSON_OBJECT JSON_OBJECT} through {@link JsonSchemaToGbnf} in the spec's
-     * whitespace mode, {@link Kind#REGEX REGEX} through {@link RegexToGbnf#compile} and
+     * request wiring calls ({@code response_format}, {@code json_schema}):
+     * {@link Kind#GBNF GBNF} through {@link GbnfParser}, {@link Kind#LARK LARK} through
+     * {@link LarkGrammar}, {@link Kind#JSON_SCHEMA JSON_SCHEMA}
+     * and {@link Kind#JSON_OBJECT JSON_OBJECT} through {@link JsonSchemaToGbnf} under the spec's JSON options (the
+     * whitespace mode, {@code whitespace_pattern} and {@code disable_additional_properties}), {@link Kind#REGEX
+     * REGEX} through {@link RegexToGbnf#compile} and
      * {@link Kind#CHOICE CHOICE} as an alternation of escaped literals.
      *
      * @throws IllegalArgumentException when the constraint is malformed or untranslatable
@@ -165,12 +201,14 @@ public final class GbnfBuilder {
         switch (spec.kind()) {
             case GBNF:
                 return GbnfParser.parse(spec.text(), vocab);
+            case LARK:
+                return LarkGrammar.compile(spec.text(), spec.whitespace(), vocab);
             case JSON_SCHEMA:
-                return JsonSchemaToGbnf.convert(spec.text(), spec.whitespace());
+                return JsonSchemaToGbnf.convert(spec.text(), spec.jsonOptions());
             case JSON_OBJECT:
-                return GbnfParser.parse(JsonSchemaToGbnf.gbnf("{}", spec.whitespace()));
+                return GbnfParser.parse(JsonSchemaToGbnf.gbnf("{}", spec.jsonOptions()));
             case REGEX:
-                return RegexToGbnf.compile(spec.text(), Grammar.ROOT_RULE, spec.dotAll());
+                return regexGrammar(spec);
             case CHOICE: {
                 GbnfBuilder builder = new GbnfBuilder();
                 List<String> literals = new ArrayList<>();
@@ -181,17 +219,33 @@ public final class GbnfBuilder {
                 return builder.grammar();
             }
             case STRUCTURAL_TAG:
-                return StructuralTag.parse(spec.text(), spec.whitespace());
+                return StructuralTag.parse(spec.text(), spec.whitespace(), vocab);
             default:
                 throw new IllegalArgumentException("constraint kind " + spec.kind() + " has no compiler");
         }
     }
 
     /**
+     * The grammar of a {@link Kind#REGEX REGEX} spec through {@link RegexToGbnf#compile}; a
+     * refusal names the regex constraint and the construct or problem.
+     */
+    private static Grammar regexGrammar(ConstraintSpec spec) {
+        try {
+            return RegexToGbnf.compile(spec.text(), Grammar.ROOT_RULE, spec.dotAll());
+        } catch (RegexToGbnf.UnsupportedRegexException e) {
+            throw new IllegalArgumentException("regex constraint " + spec.text()
+                    + " uses an unsupported construct: " + e.getMessage(), e);
+        } catch (RegexToGbnf.InvalidRegexException e) {
+            throw new IllegalArgumentException("regex constraint " + spec.text()
+                    + " is not a valid regex: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * Compiles {@code spec} for a sampler: its grammar ({@link #grammarOf}) and the triggers gating it — the spec's
-     * own {@link ConstraintSpec#triggers()}, else, for a structural tag whose payload names {@code triggers}, the
-     * payload's tag-dispatch triggers ({@link StructuralTag#triggers}), else the {@link ConstraintSpec#gate() gate}'s
-     * words, the grammar then wrapped behind the gate's prefix ({@link ConstraintGate}).
+     * own {@link ConstraintSpec#triggers()}, else, for a structural tag, the payload's own triggers and free-text
+     * exclusions ({@link StructuralTag#compileConstraint}), else the {@link ConstraintSpec#gate() gate}'s words, the
+     * grammar then wrapped behind the gate's prefix ({@link ConstraintGate}).
      *
      * @throws IllegalArgumentException when the constraint is malformed or untranslatable
      */
@@ -206,11 +260,15 @@ public final class GbnfBuilder {
      * @throws IllegalArgumentException when the constraint is malformed or untranslatable
      */
     public static CompiledConstraint compile(ConstraintSpec spec, GrammarVocab vocab) {
+        if (spec.kind() == ConstraintSpec.Kind.STRUCTURAL_TAG && spec.triggers() == null) {
+            CompiledConstraint compiled = StructuralTag.compileConstraint(spec.text(), spec.whitespace(), vocab);
+            if (compiled.triggers() == null && spec.gate() != null) {
+                return new CompiledConstraint(spec.gate().wrap(compiled.grammar()), spec.gate().triggers());
+            }
+            return compiled;
+        }
         Grammar grammar = grammarOf(spec, vocab);
         GrammarTriggers triggers = spec.triggers();
-        if (triggers == null && spec.kind() == ConstraintSpec.Kind.STRUCTURAL_TAG) {
-            triggers = StructuralTag.triggers(spec.text());
-        }
         if (triggers == null && spec.gate() != null) {
             return new CompiledConstraint(spec.gate().wrap(grammar), spec.gate().triggers());
         }
@@ -218,7 +276,7 @@ public final class GbnfBuilder {
     }
 
     /** Sanitizes a rule name, llama.cpp {@code INVALID_RULE_CHARS_RE} ({@code :275}). */
-    private static String sanitizeRuleName(String name) {
+    static String sanitizeRuleName(String name) {
         return name.replaceAll("[^a-zA-Z0-9-]+", "-");
     }
 

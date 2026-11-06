@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic WordPiece/BPE checkpoints of the plain BERT rows of Appendix A table HK-SP on
+ * Synthetic WordPiece/BPE checkpoints of the plain BERT rows on
  * {@link com.eonmux.neuralfree.gguf.hf.hooks.HfBertHooks}: {@code BertModel}, {@code
  * BertForSequenceClassification} and {@code RobertaModel}. Two layers, hidden size 8, two heads, the
  * sentences-transformers phantom-space WordPiece vocabulary and the exact tensor names and config keys of

@@ -44,7 +44,7 @@ public final class ElementFormat {
         return dtype;
     }
 
-    /** The ggml type, or null when ggml has no type for these bytes (U8, F8, F4, F6, BOOL, unsigned, C64). */
+    /** The ggml type, or null when ggml has no type for these bytes (U8, F8 E5M2/FNUZ/E8M0, F4, F6, BOOL, unsigned, C64). */
     public GGMLType ggmlType() {
         return ggml;
     }

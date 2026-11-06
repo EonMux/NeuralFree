@@ -23,15 +23,17 @@
 #define NF_DSV4_MAX_WIDTH 1024
 
 /* Cache element types: gguf.memory.KvDType (Dsv4Kernels.kvTypeCode), the NF_KV_* codes of common/kv_types.glsl. */
-#define NF_DSV4_KV_F32    NF_KV_F32
-#define NF_DSV4_KV_F16    NF_KV_F16
-#define NF_DSV4_KV_Q8_0   NF_KV_Q8_0
-#define NF_DSV4_KV_BF16   NF_KV_BF16
-#define NF_DSV4_KV_Q4_0   NF_KV_Q4_0
-#define NF_DSV4_KV_Q4_1   NF_KV_Q4_1
-#define NF_DSV4_KV_IQ4_NL NF_KV_IQ4_NL
-#define NF_DSV4_KV_Q5_0   NF_KV_Q5_0
-#define NF_DSV4_KV_Q5_1   NF_KV_Q5_1
+#define NF_DSV4_KV_F32      NF_KV_F32
+#define NF_DSV4_KV_F16      NF_KV_F16
+#define NF_DSV4_KV_Q8_0     NF_KV_Q8_0
+#define NF_DSV4_KV_BF16     NF_KV_BF16
+#define NF_DSV4_KV_Q4_0     NF_KV_Q4_0
+#define NF_DSV4_KV_Q4_1     NF_KV_Q4_1
+#define NF_DSV4_KV_IQ4_NL   NF_KV_IQ4_NL
+#define NF_DSV4_KV_Q5_0     NF_KV_Q5_0
+#define NF_DSV4_KV_Q5_1     NF_KV_Q5_1
+#define NF_DSV4_KV_FP8_E4M3 NF_KV_FP8_E4M3
+#define NF_DSV4_KV_FP8_E5M2 NF_KV_FP8_E5M2
 
 #define NF_DSV4_ROPE_ROWS_FN(fn, buf) \
     void fn(int base, int n_rows, int width, int n_rot, int mode, int p, float sin_sign, float theta_scale, \

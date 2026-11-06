@@ -147,20 +147,24 @@ public final class CpuPooling {
      * {@code s = clamp(slots[t], 0, nSlots-1)}
      * <pre>
      *   tmp[tmpOff + t*rank + r] = sum_i a[(s*rank + r)*inDim + i] * x[xOff + t*xStride + i]
-     *   y[yOff + t*yStride + o] += sum_{r ascending} b[(s*outDim + o)*rank + r] * tmp[tmpOff + t*rank + r]
+     *   y[yOff + t*yStride + o] += scale * sum_{r ascending} b[(s*outDim + o)*rank + r] * tmp[tmpOff + t*rank + r]
      * </pre>
      * (models/granite-switch.cpp build_switched_lora_delta: {@code lora_a {inDim, rank, nSlots}},
      * {@code lora_b {rank, outDim, nSlots}}, two mul_mat_id with the slot as expert, then ggml_add onto the base
-     * projection).
+     * projection). {@code scale} multiplies the up stage's accumulation (1.0 for the plain delta), the factor a
+     * slot's rows run the uploaded factors at.
      *
      * @param tmp scratch of at least {@code tmpOff + nTokens*rank} floats, overwritten
-     * @throws IllegalArgumentException on a bad shape, overlapping {@code x}, {@code tmp} and {@code y} views or a view
-     *                                  that does not fit its array
+     * @throws IllegalArgumentException on a bad shape, a non-finite scale, overlapping {@code x}, {@code tmp} and
+     *                                  {@code y} views or a view that does not fit its array
      */
     public static void switchedLoraAdd(int nTokens, int inDim, int outDim, int rank, int nSlots, int[] slots,
                                        float[] a, float[] b, float[] x, int xOff, int xStride,
-                                       float[] tmp, int tmpOff, float[] y, int yOff, int yStride) {
+                                       float[] tmp, int tmpOff, float scale, float[] y, int yOff, int yStride) {
         HeadsKernels.checkLoraShape(inDim, outDim, rank, nSlots);
+        if (!Float.isFinite(scale)) {
+            throw new IllegalArgumentException("switched LoRA needs a finite scale, got " + scale);
+        }
         if (nTokens < 1) {
             throw new IllegalArgumentException("switched LoRA needs n_tokens >= 1, got " + nTokens);
         }
@@ -204,7 +208,7 @@ public final class CpuPooling {
                     acc += b[bRow + r] * tmp[tRow + r];
                 }
                 int yi = yOff + t * yStride + o;
-                y[yi] = y[yi] + acc;
+                y[yi] = y[yi] + scale * acc;
             }
         });
     }

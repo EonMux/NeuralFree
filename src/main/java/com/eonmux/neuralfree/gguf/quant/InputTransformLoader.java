@@ -27,13 +27,16 @@ import java.util.Objects;
  *   <li>the PRISM Hadamard transforms ({@link PrismHadamardLoader}), unchanged;</li>
  *   <li>the act-order permutations {@code <base>.input_perm} (I32 {@code [K]}, {@code K = ne[0]} of
  *       {@code <base>.weight}), whatever the activation mode, since the weight is stored in permuted input order;</li>
+ *   <li>the activation pre-scales {@code <base>.input_pre_scale} (F32 {@code [K]}, or {@code [E, K]} for a stacked
+ *       tensor's experts in expert-major order), whatever the activation mode: the multiplier runs before the
+ *       quantization;</li>
  *   <li>under {@link ActivationQuant#CHECKPOINT}, the activation schemes of the {@code neuralfree.act_quant.*}
  *       carrier ({@link ActQuantPlan}) with their static siblings {@code <base>.input_scale} (F32 {@code [1]} or
  *       {@code [E]}) and {@code <base>.input_zero_point} (I32 {@code [1]} or {@code [E]}), and the model's
  *       {@code scale_ub} for {@link ActQuantScheme#FP8_TOKEN}. {@link ActivationQuant#WEIGHT_ONLY} ignores the
  *       carrier.</li>
  * </ul>
- * A model without act-quant metadata and without {@code .input_perm} tensors yields the PRISM forward map, each
+ * A model without activation tensors and without {@code .input_perm} tensors yields the PRISM forward map, each
  * transform holding only its {@link HadamardSpec}. Every malformed input throws {@link GgufFormatException} naming the
  * tensor or key.
  */
@@ -41,6 +44,7 @@ public final class InputTransformLoader {
 
     private static final String WEIGHT_SUFFIX = ".weight";
     private static final String PERM_SUFFIX = "." + TensorClaims.INPUT_PERM;
+    private static final String PRE_SCALE_SUFFIX = "." + TensorClaims.INPUT_PRE_SCALE;
 
     /** Reads the values of an I32 tensor of the model. */
     @FunctionalInterface
@@ -185,6 +189,11 @@ public final class InputTransformLoader {
                 bindPerm(name, shapes, i32, forward);
             }
         }
+        for (String name : tensorNames) {
+            if (name.endsWith(PRE_SCALE_SUFFIX) && name.length() > PRE_SCALE_SUFFIX.length()) {
+                bindPreScale(name, shapes, f32, forward);
+            }
+        }
         if (mode == ActivationQuant.CHECKPOINT) {
             ActQuantPlan plan = ActQuantPlan.load(kv);
             for (Map.Entry<String, ActQuantScheme> e : plan.schemes().entrySet()) {
@@ -217,6 +226,35 @@ public final class InputTransformLoader {
             forward.put(weight, t.withPerm(perm).requireWidth(k));
         } catch (IllegalArgumentException e) {
             throw new GgufFormatException(permName + ": " + e.getMessage(), e);
+        }
+    }
+
+    /** Adds the activation pre-scale {@code preScaleName} to its weight's transform. */
+    private static void bindPreScale(String preScaleName, PrismHadamardLoader.TensorShapes shapes, F32Reader f32,
+                                     Map<String, InputTransform> forward) throws IOException {
+        String weight = preScaleName.substring(0, preScaleName.length() - PRE_SCALE_SUFFIX.length())
+                + WEIGHT_SUFFIX;
+        String what = "activation pre-scale " + preScaleName;
+        int k = inputWidth(weight, shapes, what);
+        long[] dims = shapes.dims(preScaleName);
+        long count = dims == null ? -1 : elements(dims);
+        long[] ws = shapes.dims(weight);
+        long experts = ws != null && ws.length >= 3 ? ws[2] : 0;
+        long want = experts > 0 ? Math.multiplyExact(experts, k) : k;
+        if (count != k && count != want) {
+            throw new GgufFormatException(preScaleName + " has " + (count < 0 ? "no values" : count + " values")
+                    + "; " + weight + " needs " + k + (experts > 0 ? " or " + want + " (one per expert)" : ""));
+        }
+        float[] pre = f32.read(preScaleName);
+        if (pre == null || pre.length != count) {
+            throw new GgufFormatException(preScaleName + " read "
+                    + (pre == null ? "no" : String.valueOf(pre.length)) + " values; its shape holds " + count);
+        }
+        InputTransform t = forward.getOrDefault(weight, InputTransform.IDENTITY);
+        try {
+            forward.put(weight, t.withPreScale(pre).requireWidth(k));
+        } catch (IllegalArgumentException e) {
+            throw new GgufFormatException(preScaleName + ": " + e.getMessage(), e);
         }
     }
 

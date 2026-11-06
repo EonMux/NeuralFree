@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
+import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -50,6 +52,7 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
     private final TokenizerVocab vocab;
     private final SpecialTokens special;
     private final PreTokenizerRegistry.PreTokenizer pre;
+    private final PreTokenizerType vocabPreType;
     private final Mode mode;
     private final boolean byteFallback;
 
@@ -69,6 +72,8 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         this.vocab = vocab;
         this.special = special;
         this.pre = pre;
+        PreTokenizerRegistry.PreTokenizer named = vocab.namedPreTokenizer();
+        this.vocabPreType = named != null && named.type() != null ? named.type() : PreTokenizerType.DEFAULT;
         this.mode = "whitespace".equals(vocab.model()) ? Mode.WHITESPACE
                 : "hybriddna".equals(vocab.model()) ? Mode.HYBRIDDNA : Mode.STANDARD;
         Boolean fallback = vocab.bpeByteFallback();
@@ -80,7 +85,7 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
      *
      * <p>Text fragments arrive normalized from {@link SpecialTokens#partition(String, boolean, boolean)};
      * only the first fragment begins the input, which a Metaspace {@code first} prepend scheme of
-     * the pre-tokenizer reads.</p>
+     * the pre-tokenizer or of the vocabulary ({@link TokenizerVocab#metaspacePrependScheme()}) reads.</p>
      */
     @Override
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
@@ -92,7 +97,7 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
             if (f.isToken()) {
                 out.add(f.token());
             } else {
-                tokenizeFragment(prepareFragment(f.text()), i == 0, out);
+                tokenizeFragment(prepareFragment(f.text(), i == 0), i == 0, out);
             }
         }
         if (addSpecial) addAll(special.trailingIds(), out);
@@ -105,11 +110,16 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
 
     /**
      * Hugging Face ByteLevel {@code add_prefix_space} (a space before a fragment that does not
-     * start with one), then llama.cpp whitespace escaping.
+     * start with one), then llama.cpp whitespace escaping, then the vocabulary's Metaspace
+     * {@code first} scheme: U+2581 before the first fragment of the input unless it starts with
+     * one (llama-vocab.cpp:3902-3907).
      */
-    private String prepareFragment(String text) {
+    private String prepareFragment(String text, boolean inputStart) {
         String raw = vocab.bpeAddPrefixSpace() && !text.startsWith(" ") ? " " + text : text;
-        return vocab.escapeWhitespaces() ? TokenizerVocab.escapeWhitespace(raw) : raw;
+        String escaped = vocab.escapeWhitespaces() ? TokenizerVocab.escapeWhitespace(raw) : raw;
+        boolean prepend = inputStart && vocab.metaspacePrependScheme() == PreTokenizerSpec.PrependScheme.FIRST
+                && !escaped.startsWith("\u2581");
+        return prepend ? "\u2581" + escaped : escaped;
     }
 
     @Override
@@ -117,13 +127,17 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         return TokenizerAlgorithm.detokenize(this, vocab, special, ids);
     }
 
-    /** BPE branch of {@code token_to_piece} (llama-vocab.cpp:4028-4049). */
+    /**
+     * BPE branch of {@code token_to_piece} (llama-vocab.cpp:4135-4157); NORMAL tokens of a
+     * {@link PreTokenizerType#rawNormalPieces()} vocabulary render their raw text.
+     */
     @Override
     public byte[] piece(int id) {
         if (id < 0 || id >= vocab.size()) return EMPTY;
         String text = vocab.text(id);
         if (vocab.hasAttr(id, RAW_TEXT_ATTRS)) return TokenizerAlgorithm.utf8(text);
         if (vocab.isNormal(id)) {
+            if (vocabPreType.rawNormalPieces()) return TokenizerAlgorithm.utf8(text);
             return vocab.escapeWhitespaces()
                     ? TokenizerAlgorithm.utf8(TokenizerVocab.unescapeWhitespace(text))
                     : decodeText(text);
@@ -149,13 +163,14 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
     }
 
     /**
-     * {@code llm_tokenizer_bpe_session::tokenize}: split, merge per word, resolve with byte
+     * {@code llm_tokenizer_bpe_session::tokenize}: the vocabulary's pre-tokenizer normalization
+     * ({@link PreTokenizerType#normalizeFragment}), split, merge per word, resolve with byte
      * fallback; with {@link TokenizerVocab#bpeModelOverlay()}, each word goes through
      * {@link #tokenizeModelWord} instead.
      */
     private void tokenizeBpe(String text, boolean inputStart, IdBuffer out) {
         boolean model = vocab.bpeModelOverlay();
-        for (String word : words(text, inputStart)) {
+        for (String word : words(vocabPreType.normalizeFragment(text), inputStart)) {
             if (model) {
                 tokenizeModelWord(word, out);
             } else {
@@ -377,13 +392,26 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
     }
 
     /**
-     * Resolves one merged symbol; a non-token symbol emits the single-byte token of each byte,
-     * or nothing when the pre-tokenizer does not byte-encode and byte fallback is off.
+     * Resolves one merged symbol; a non-token symbol becomes the unknown token for a
+     * {@link PreTokenizerType#unknownSymbolsAsUnk()} vocabulary, else the single-byte token of
+     * each byte, or nothing when the pre-tokenizer does not byte-encode and byte fallback is off.
+     *
+     * @throws IllegalStateException when the symbol must become the unknown token and the
+     *         vocabulary has none
      */
     private void emitSymbol(String symbol, IdBuffer out) {
         int id = vocab.tokenId(symbol);
         if (id >= 0) {
             out.add(id);
+            return;
+        }
+        if (vocabPreType.unknownSymbolsAsUnk()) {
+            if (special.unk() == SpecialTokens.NULL) {
+                throw new IllegalStateException("pre-tokenizer '" + vocab.pre() + "' encodes the symbol '" + symbol
+                        + "', which is not a token, as the unknown token, but the vocabulary has no "
+                        + GgufKeys.TOKENIZER_UNK_ID);
+            }
+            out.add(special.unk());
             return;
         }
         if (!pre.byteEncode() && !byteFallback) return;

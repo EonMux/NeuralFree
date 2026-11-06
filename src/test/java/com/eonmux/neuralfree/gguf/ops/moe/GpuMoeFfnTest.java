@@ -40,9 +40,12 @@ import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Test;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -59,12 +62,13 @@ import static org.junit.Assert.assertThrows;
 /**
  * Dispatch sequences of {@link GpuMoeFfn} on the host-only fake backend with strict LLM argument rules: the
  * qwen3moe decode step (router, fused gate-up id-matvec, down id-matvec, weighted sum straight into the branch),
- * its prefill step (bucketize then batched id-matmuls re-sized per step only), a qwen2moe sigmoid-gated shared
+ * its prefill step (bucketize, block-align, then the grouped GEMM per expert shard), the same prefill over
+ * {@code {T}_BatchMatMulId} when the grouped GEMM kernels are unavailable, a qwen2moe sigmoid-gated shared
  * expert accumulated by a one-slot weighted sum, the cohere2moe halved (routed + shared) sum, the kolibri1 selection
- * by biased logits, expert tensors held in several device shards of whole experts (one id-matvec per shard with its
- * expert range, decode and prefill, and the separate gate/up fallback when the two tensors are split differently),
- * the separate one-token gate/up products a gate LoRA delta attached after bind runs without preparing any kernel,
- * and the missing-tensor error.
+ * by biased logits, expert tensors held in several device shards of whole experts (one expert product per shard
+ * with its expert range, decode and prefill, and the separate gate/up fallback when the two tensors are split
+ * differently), the separate one-token gate/up products a gate LoRA delta attached after bind runs without
+ * preparing any kernel, and the missing-tensor error.
  */
 public class GpuMoeFfnTest {
 
@@ -79,6 +83,7 @@ public class GpuMoeFfnTest {
     private static final String GATE_UP = MoeKernels.matVecIdGateUp(GGMLType.F32);
     private static final String MATVEC_ID = MoeKernels.matVecId(GGMLType.F32);
     private static final String BMM_ID = MoeKernels.batchMatMulId(GGMLType.F32);
+    private static final String GG = MoeKernels.groupedGemm(GGMLType.F32);
 
     private FakeComputeBackend backend;
     private GpuScratch scratch;
@@ -87,8 +92,8 @@ public class GpuMoeFfnTest {
     private final Map<String, GpuWeight> tensors = new HashMap<>();
     private GpuFfnBlock block;
 
-    private void open() {
-        backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
+    private void open(String... unavailableKernels) {
+        backend = FakeComputeBackend.builder().strictLlmArgs(true).unavailableKernels(unavailableKernels).build();
         scratch = GpuScratch.builder(backend, UBATCH)
                 .slot(ScratchSlots.X, (long) UBATCH * N_EMBD)
                 .slot(ScratchSlots.NORMED, (long) UBATCH * N_EMBD)
@@ -171,6 +176,10 @@ public class GpuMoeFfnTest {
     }
 
     private GpuForwardContext context(Arch arch, LayerSpec l) {
+        return context(arch, l, null);
+    }
+
+    private GpuForwardContext context(Arch arch, LayerSpec l, MoeExpertHeat heat) {
         ModelHparams hp = new ModelHparamsBuilder(ArchRegistry.traits(arch)).layerCounts(1, 0).nCtxTrain(4096)
                 .nEmbd(N_EMBD).build();
         ModelSpec spec = ModelSpec.builder(hp, TensorCatalog.of(arch.ggufName(), Collections.emptyList()))
@@ -185,7 +194,9 @@ public class GpuMoeFfnTest {
                 return tensors.get(name);
             }
         };
-        return GpuForwardContext.builder(ops.kernels(), ops, weights, spec).build();
+        return GpuForwardContext.builder(ops.kernels(), ops, weights, spec)
+                .heat(heat)
+                .build();
     }
 
     private GpuFfnBlock create(LayerSpec l) {
@@ -259,11 +270,11 @@ public class GpuMoeFfnTest {
         Dispatch router = ds.get(1);
         assertEquals(MoeKernels.ROUTER_ARG_COUNT, router.argCount());
         assertArrayEquals(new int[]{1, N_EXPERT, K, GatingFunc.SOFTMAX.code(), 1, 1, 1}, ints(router, 0, 7));
-        assertSame(logits.bufferArg(4), router.bufferArg(11));
+        assertSame(logits.bufferArg(4), router.bufferArg(MoeKernels.ARG_ROUTER_LOGITS));
         assertEquals(1, router.global().length);
         assertEquals(router.local()[0], router.global()[0]);
-        GpuBuffer ids = router.bufferArg(13);
-        GpuBuffer weights = router.bufferArg(14);
+        GpuBuffer ids = router.bufferArg(MoeKernels.ARG_ROUTER_IDS);
+        GpuBuffer weights = router.bufferArg(MoeKernels.ARG_ROUTER_WEIGHTS);
 
         Dispatch gu = ds.get(2);
         assertEquals(MoeKernels.GU_ARG_COUNT, gu.argCount());
@@ -296,6 +307,67 @@ public class GpuMoeFfnTest {
         assertSame(branch(), wsum.bufferArg(6));
     }
 
+    /**
+     * The heat tap: every router step enqueues exactly one routed-ids read of {@code pairs * 4} bytes after the
+     * router kernels (decode and the batched path), from the same ids view, the read of the previous step counts at
+     * the next step, and {@code close()} drains the last read into the profile.
+     */
+    @Test
+    public void theRouterCountsItsRoutedRowsIntoTheExpertHeat() {
+        MoeExpertHeat heat = new MoeExpertHeat();
+        open();
+        putExperts();
+        LayerSpec l = layer(qwen3moe().build());
+        block = create(l);
+        block.bind(context(Arch.QWEN3MOE, l, heat), l);
+
+        backend.clearLog();
+        block.forward(1, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
+        FakeComputeBackend.Op decodeRead = singleRead(backend, (long) K * Integer.BYTES);
+
+        seed(decodeRead.buffer(), decodeRead.offset(), 3, 1, 3, 1);
+        backend.clearLog();
+        block.forward(2, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
+        FakeComputeBackend.Op batchRead = singleRead(backend, 2L * K * Integer.BYTES);
+        assertSame("both steps read the same ids view", decodeRead.buffer(), batchRead.buffer());
+        assertEquals("both steps read from the same byte offset", decodeRead.offset(), batchRead.offset());
+
+        block.close();
+        block = null;
+        assertEquals("the decode read held the zeroed ids (expert 0 twice), the batch read the seeded ids",
+                Arrays.asList(
+                        new RankedExpert(0, 0, 2),
+                        new RankedExpert(0, 1, 2),
+                        new RankedExpert(0, 3, 2)), heat.snapshot());
+    }
+
+    /** The only READ op since the last clear, of exactly {@code bytes} bytes. */
+    private static FakeComputeBackend.Op singleRead(FakeComputeBackend backend, long bytes) {
+        FakeComputeBackend.Op read = null;
+        for (FakeComputeBackend.Op op : backend.ops()) {
+            if (op.kind() == FakeComputeBackend.OpKind.READ) {
+                if (read != null) {
+                    throw new AssertionError("more than one read enqueued");
+                }
+                read = op;
+            }
+        }
+        if (read == null) {
+            throw new AssertionError("no routed-ids read enqueued");
+        }
+        assertEquals(bytes, read.bytes());
+        return read;
+    }
+
+    /** Writes {@code ids} little-endian at {@code byteOffset} of the host-backed buffer. */
+    private static void seed(FakeGpuBuffer buffer, long byteOffset, int... ids) {
+        ByteBuffer out = ByteBuffer.allocate(ids.length * Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        for (int id : ids) {
+            out.putInt(id);
+        }
+        buffer.write(byteOffset, out.array(), 0, out.array().length);
+    }
+
     @Test
     public void gateDeltaAttachedAfterBindRunsTheSplitProductsPreparedAtBind() {
         open();
@@ -308,7 +380,7 @@ public class GpuMoeFfnTest {
         List<int[]> calls = new ArrayList<>();
         ctx.projectionDeltas().registerExperts(
                 GpuProjectionDeltas.key(l, TensorNames.weight(TensorNames.FFN_GATE_EXPS)),
-                (n, k, ids, x, xOff, tokenRows, y, yOff) -> calls.add(new int[]{n, k}));
+                (scale, n, k, ids, idsOff, x, xOff, tokenRows, y, yOff) -> calls.add(new int[]{n, k}));
         List<Dispatch> ds = run(1);
 
         assertEquals(Arrays.asList(MATVEC, MoeKernels.ROUTER, MATVEC_ID, MATVEC_ID, ActKernels.GLU, MATVEC_ID,
@@ -327,54 +399,69 @@ public class GpuMoeFfnTest {
     // ------------------------------------------------------------------ qwen3moe prefill
 
     @Test
-    public void qwen3moePrefillBucketizesThenRunsBatchedIdMatmuls() {
+    public void qwen3moePrefillAlignsThenRunsGroupedGemms() {
         open();
         putExperts();
         bind(Arch.QWEN3MOE, layer(qwen3moe().build()));
         int n = 5;
         List<Dispatch> ds = run(n);
 
-        assertEquals(Arrays.asList(BATCH_2D, MoeKernels.ROUTER, MoeKernels.BUCKETIZE, BMM_ID, BMM_ID,
-                ActKernels.GLU, BMM_ID, MoeKernels.WEIGHTED_SUM), names(ds));
+        assertEquals(Arrays.asList(BATCH_2D, MoeKernels.ROUTER, MoeKernels.BUCKETIZE, MoeKernels.ALIGN_BLOCKS,
+                GG, GG, ActKernels.GLU, GG, MoeKernels.WEIGHTED_SUM), names(ds));
         Dispatch router = ds.get(1);
         assertEquals(n, router.intArg(MoeKernels.ARG_N_TOKENS));
         assertEquals(n * router.local()[0], router.global()[0]);
 
         Dispatch bucket = ds.get(2);
         assertArrayEquals(new int[]{n, K, N_EXPERT}, ints(bucket, 0, 3));
-        assertSame(router.bufferArg(13), bucket.bufferArg(3));
+        assertSame(router.bufferArg(MoeKernels.ARG_ROUTER_IDS), bucket.bufferArg(3));
         assertEquals(bucket.local()[0], bucket.global()[0]);
         GpuBuffer rowToken = bucket.bufferArg(6);
         GpuBuffer rowSlot = bucket.bufferArg(7);
 
-        int pairs = n * K;
-        long tiles = (pairs + MoeKernels.BMM_ROWS - 1) / MoeKernels.BMM_ROWS;
-        Dispatch gate = ds.get(3);
-        Dispatch up = ds.get(4);
-        Dispatch down = ds.get(6);
-        assertArrayEquals(new int[]{N_FF_EXP, N_EMBD, pairs, K, 0, MoeKernels.SCALE_NONE}, ints(gate, 0, 6));
-        assertArrayEquals(new int[]{N_FF_EXP, N_EMBD, pairs, K, 0, MoeKernels.SCALE_NONE}, ints(up, 0, 6));
-        assertArrayEquals(new int[]{N_EMBD, N_FF_EXP, pairs, 1, 0, MoeKernels.SCALE_NONE}, ints(down, 0, 6));
+        int tiles = MoeKernels.groupedTiles(n * K, N_EXPERT);
+        Dispatch align = ds.get(3);
+        assertEquals(MoeKernels.ALIGN_ARG_COUNT, align.argCount());
+        assertArrayEquals(new int[]{n, K, N_EXPERT, tiles}, ints(align, 0, 4));
+        assertSame(bucket.bufferArg(4), align.bufferArg(4));
+        assertSame(bucket.bufferArg(5), align.bufferArg(5));
+        assertSame(rowToken, align.bufferArg(6));
+        assertSame(rowSlot, align.bufferArg(7));
+        assertArrayEquals(MoeKernels.alignGlobal(tiles, (int) align.local()[0]), align.global());
+        GpuBuffer gemmToken = align.bufferArg(8);
+        GpuBuffer gemmSlot = align.bufferArg(9);
+
+        Dispatch gate = ds.get(4);
+        Dispatch up = ds.get(5);
+        Dispatch down = ds.get(7);
+        assertEquals(MoeKernels.GG_ARG_COUNT, gate.argCount());
+        assertArrayEquals(new int[]{N_FF_EXP, N_EMBD, tiles, K, N_EMBD, 0, 0, MoeKernels.SCALE_NONE},
+                ints(gate, 0, 8));
+        assertArrayEquals(new int[]{N_FF_EXP, N_EMBD, tiles, K, N_EMBD, 0, 0, MoeKernels.SCALE_NONE},
+                ints(up, 0, 8));
+        assertArrayEquals(new int[]{N_EMBD, N_FF_EXP, tiles, 1, N_FF_EXP, 0, 0, MoeKernels.SCALE_NONE},
+                ints(down, 0, 8));
         for (Dispatch d : Arrays.asList(gate, up, down)) {
-            assertSame(rowToken, d.bufferArg(MoeKernels.ARG_BMM_ROW_TOKEN));
-            assertSame(rowSlot, d.bufferArg(MoeKernels.ARG_BMM_ROW_SLOT));
+            assertSame(gemmToken, d.bufferArg(MoeKernels.ARG_GG_GEMM_TOKEN));
+            assertSame(gemmSlot, d.bufferArg(MoeKernels.ARG_GG_GEMM_SLOT));
             assertEquals(tiles, d.global()[1]);
-            assertArrayEquals(new int[]{0, N_EXPERT}, expertRange(d, MoeKernels.ARG_BMM_EXPERT_BASE));
+            assertArrayEquals(new long[]{MoeKernels.GROUPED_WORKGROUP, 1}, d.local());
+            assertArrayEquals(new int[]{0, N_EXPERT}, expertRange(d, MoeKernels.ARG_GG_EXPERT_BASE));
         }
-        assertSame(weight(TensorNames.FFN_GATE_EXPS), gate.bufferArg(MoeKernels.ARG_BMM_WEIGHT));
-        assertSame(weight(TensorNames.FFN_UP_EXPS), up.bufferArg(MoeKernels.ARG_BMM_WEIGHT));
-        assertSame(normed(), gate.bufferArg(MoeKernels.ARG_BMM_INPUT));
-        assertSame(normed(), up.bufferArg(MoeKernels.ARG_BMM_INPUT));
+        assertSame(weight(TensorNames.FFN_GATE_EXPS), gate.bufferArg(MoeKernels.ARG_GG_WEIGHT));
+        assertSame(weight(TensorNames.FFN_UP_EXPS), up.bufferArg(MoeKernels.ARG_GG_WEIGHT));
+        assertSame(normed(), gate.bufferArg(MoeKernels.ARG_GG_INPUT));
+        assertSame(normed(), up.bufferArg(MoeKernels.ARG_GG_INPUT));
 
-        Dispatch glu = ds.get(5);
-        assertEquals(pairs, glu.intArg(ActKernels.ARG_GLU_N_ROWS));
-        assertSame(gate.bufferArg(MoeKernels.ARG_BMM_OUTPUT), glu.bufferArg(ActKernels.ARG_GLU_GATE));
-        assertSame(up.bufferArg(MoeKernels.ARG_BMM_OUTPUT), glu.bufferArg(ActKernels.ARG_GLU_UP));
-        assertSame(glu.bufferArg(ActKernels.ARG_GLU_OUT), down.bufferArg(MoeKernels.ARG_BMM_INPUT));
+        Dispatch glu = ds.get(6);
+        assertEquals(n * K, glu.intArg(ActKernels.ARG_GLU_N_ROWS));
+        assertSame(gate.bufferArg(MoeKernels.ARG_GG_OUTPUT), glu.bufferArg(ActKernels.ARG_GLU_GATE));
+        assertSame(up.bufferArg(MoeKernels.ARG_GG_OUTPUT), glu.bufferArg(ActKernels.ARG_GLU_UP));
+        assertSame(glu.bufferArg(ActKernels.ARG_GLU_OUT), down.bufferArg(MoeKernels.ARG_GG_INPUT));
 
-        Dispatch wsum = ds.get(7);
+        Dispatch wsum = ds.get(8);
         assertArrayEquals(new int[]{n, N_EMBD, K, 0}, ints(wsum, 0, 4));
-        assertSame(down.bufferArg(MoeKernels.ARG_BMM_OUTPUT), wsum.bufferArg(4));
+        assertSame(down.bufferArg(MoeKernels.ARG_GG_OUTPUT), wsum.bufferArg(4));
         assertSame(branch(), wsum.bufferArg(6));
 
         List<Dispatch> again = run(1);
@@ -382,6 +469,25 @@ public class GpuMoeFfnTest {
                 names(again));
         assertEquals(1, again.get(1).intArg(MoeKernels.ARG_N_TOKENS));
         assertEquals(1, again.get(4).intArg(MoeKernels.ARG_N_TOKENS));
+    }
+
+    /**
+     * Without the align kernel, or without a weight type's grouped GEMM, the batched path keeps
+     * {@code LLM_MoE_Bucketize} + {@code {T}_BatchMatMulId}.
+     */
+    @Test
+    public void withoutTheGroupedGemmKernelsTheBatchedPathFallsBackToBatchMatMulId() {
+        for (String[] unavailable : new String[][]{{MoeKernels.ALIGN_BLOCKS},
+                {MoeKernels.groupedGemm(GGMLType.F32)}}) {
+            open(unavailable);
+            putExperts();
+            bind(Arch.QWEN3MOE, layer(qwen3moe().build()));
+            List<Dispatch> ds = run(5);
+            assertEquals(Arrays.asList(BATCH_2D, MoeKernels.ROUTER, MoeKernels.BUCKETIZE, BMM_ID, BMM_ID,
+                    ActKernels.GLU, BMM_ID, MoeKernels.WEIGHTED_SUM), names(ds));
+            block.close();
+            block = null;
+        }
     }
 
     // ------------------------------------------------------------------ qwen2moe gated shared expert
@@ -492,15 +598,15 @@ public class GpuMoeFfnTest {
         Dispatch pick = ds.get(3);
         assertEquals(MoeKernels.SEL_RAW_LOGITS, pick.intArg(9));
         assertEquals(0, pick.intArg(8));
-        assertSame(selection, pick.bufferArg(11));
+        assertSame(selection, pick.bufferArg(MoeKernels.ARG_ROUTER_LOGITS));
         Dispatch weigh = ds.get(4);
         assertEquals(MoeKernels.SEL_PRESELECTED, weigh.intArg(9));
         assertEquals(GatingFunc.SIGMOID.code(), weigh.intArg(3));
         assertEquals(1, weigh.intArg(6));
-        assertSame(logits, weigh.bufferArg(11));
-        assertSame(pick.bufferArg(13), weigh.bufferArg(13));
-        assertSame(weigh.bufferArg(13), ds.get(5).bufferArg(MoeKernels.ARG_GU_SLOTS));
-        assertSame(weigh.bufferArg(14), ds.get(7).bufferArg(5));
+        assertSame(logits, weigh.bufferArg(MoeKernels.ARG_ROUTER_LOGITS));
+        assertSame(pick.bufferArg(MoeKernels.ARG_ROUTER_IDS), weigh.bufferArg(MoeKernels.ARG_ROUTER_IDS));
+        assertSame(weigh.bufferArg(MoeKernels.ARG_ROUTER_IDS), ds.get(5).bufferArg(MoeKernels.ARG_GU_SLOTS));
+        assertSame(weigh.bufferArg(MoeKernels.ARG_ROUTER_WEIGHTS), ds.get(7).bufferArg(5));
     }
 
     // ------------------------------------------------------------------ sharded experts
@@ -521,7 +627,7 @@ public class GpuMoeFfnTest {
 
         assertEquals(Arrays.asList(MATVEC, MoeKernels.ROUTER, GATE_UP, GATE_UP, MATVEC_ID, MATVEC_ID,
                 MoeKernels.WEIGHTED_SUM), names(ds));
-        GpuBuffer ids = ds.get(1).bufferArg(13);
+        GpuBuffer ids = ds.get(1).bufferArg(MoeKernels.ARG_ROUTER_IDS);
         GpuBuffer act = ds.get(2).bufferArg(MoeKernels.ARG_GU_OUTPUT);
         GpuBuffer expertOut = ds.get(4).bufferArg(MoeKernels.ARG_ID_OUTPUT);
         for (int i = 0; i < SHARDS.length; i++) {
@@ -547,8 +653,44 @@ public class GpuMoeFfnTest {
     }
 
     @Test
-    public void shardedExpertsPrefillWithOneBatchedIdMatmulPerShard() {
+    public void shardedExpertsPrefillWithOneGroupedGemmPerShard() {
         open();
+        put(TensorNames.weight(TensorNames.FFN_GATE_INP), N_EMBD, N_EXPERT);
+        GpuWeight gate = putSharded(TensorNames.weight(TensorNames.FFN_GATE_EXPS), N_EMBD, N_FF_EXP, SHARDS);
+        GpuWeight up = putSharded(TensorNames.weight(TensorNames.FFN_UP_EXPS), N_EMBD, N_FF_EXP, SHARDS);
+        GpuWeight down = putSharded(TensorNames.weight(TensorNames.FFN_DOWN_EXPS), N_FF_EXP, N_EMBD, SHARDS);
+        bind(Arch.QWEN3MOE, layer(qwen3moe().build()));
+        int n = 5;
+        List<Dispatch> ds = run(n);
+
+        assertEquals(Arrays.asList(BATCH_2D, MoeKernels.ROUTER, MoeKernels.BUCKETIZE, MoeKernels.ALIGN_BLOCKS,
+                GG, GG, GG, GG, ActKernels.GLU, GG, GG, MoeKernels.WEIGHTED_SUM), names(ds));
+        Dispatch align = ds.get(3);
+        int tiles = MoeKernels.groupedTiles(n * K, N_EXPERT);
+        GpuWeight[] tensorsInOrder = {gate, up, down};
+        int[] first = {4, 6, 9};
+        for (int t = 0; t < tensorsInOrder.length; t++) {
+            GpuBuffer out = ds.get(first[t]).bufferArg(MoeKernels.ARG_GG_OUTPUT);
+            for (int i = 0; i < SHARDS.length; i++) {
+                Dispatch d = ds.get(first[t] + i);
+                assertEquals(tiles, d.intArg(MoeKernels.ARG_GG_N_TILES));
+                assertArrayEquals(RANGES[i], expertRange(d, MoeKernels.ARG_GG_EXPERT_BASE));
+                assertSame(tensorsInOrder[t].shard(i), d.bufferArg(MoeKernels.ARG_GG_WEIGHT));
+                assertSame(align.bufferArg(8), d.bufferArg(MoeKernels.ARG_GG_GEMM_TOKEN));
+                assertSame(align.bufferArg(9), d.bufferArg(MoeKernels.ARG_GG_GEMM_SLOT));
+                assertSame(out, d.bufferArg(MoeKernels.ARG_GG_OUTPUT));
+            }
+        }
+        assertSame(ds.get(9).bufferArg(MoeKernels.ARG_GG_OUTPUT), ds.get(11).bufferArg(4));
+
+        List<Dispatch> again = run(1);
+        assertEquals(Arrays.asList(MATVEC, MoeKernels.ROUTER, GATE_UP, GATE_UP, MATVEC_ID, MATVEC_ID,
+                MoeKernels.WEIGHTED_SUM), names(again));
+    }
+
+    @Test
+    public void shardedExpertsPrefillFallsBackToOneBatchedIdMatmulPerShard() {
+        open(MoeKernels.ALIGN_BLOCKS);
         put(TensorNames.weight(TensorNames.FFN_GATE_INP), N_EMBD, N_EXPERT);
         GpuWeight gate = putSharded(TensorNames.weight(TensorNames.FFN_GATE_EXPS), N_EMBD, N_FF_EXP, SHARDS);
         GpuWeight up = putSharded(TensorNames.weight(TensorNames.FFN_UP_EXPS), N_EMBD, N_FF_EXP, SHARDS);
@@ -576,10 +718,6 @@ public class GpuMoeFfnTest {
             }
         }
         assertSame(ds.get(8).bufferArg(MoeKernels.ARG_BMM_OUTPUT), ds.get(10).bufferArg(4));
-
-        List<Dispatch> again = run(1);
-        assertEquals(Arrays.asList(MATVEC, MoeKernels.ROUTER, GATE_UP, GATE_UP, MATVEC_ID, MATVEC_ID,
-                MoeKernels.WEIGHTED_SUM), names(again));
     }
 
     /**

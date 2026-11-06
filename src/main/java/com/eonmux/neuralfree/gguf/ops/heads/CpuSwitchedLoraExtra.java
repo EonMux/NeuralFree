@@ -102,8 +102,8 @@ public final class CpuSwitchedLoraExtra implements CpuLayerExtra {
         this.registry = ctx.projectionDeltas();
         try {
             for (Projection p : Projection.values()) {
-                CpuProjectionDeltas.Delta d = (n, x, xOff, xStride, y, yOff, yStride) ->
-                        addDelta(p, n, x, xOff, xStride, y, yOff, yStride);
+                CpuProjectionDeltas.Delta d = (scale, n, x, xOff, xStride, y, yOff, yStride) ->
+                        addDelta(p, scale, n, x, xOff, xStride, y, yOff, yStride);
                 registry.register(layer, TensorNames.weight(p.base()), d);
                 registered.put(p, d);
             }
@@ -124,17 +124,19 @@ public final class CpuSwitchedLoraExtra implements CpuLayerExtra {
     }
 
     /**
-     * {@code y[t] += B[s_t] (A[s_t] x[t])} for the {@code n} rows of the current step after projection {@code p}'s
-     * base product: row {@code t} of {@code x} at {@code xOff + t*xStride}, of {@code y} at {@code yOff + t*yStride}.
+     * {@code y[t] += scale * B[s_t] (A[s_t] x[t])} for the {@code n} rows of the current step after projection
+     * {@code p}'s base product: row {@code t} of {@code x} at {@code xOff + t*xStride}, of {@code y} at
+     * {@code yOff + t*yStride}; {@code scale} is the factor the delta's slot runs the factors at.
      */
-    public void addDelta(Projection p, int n, float[] x, int xOff, int xStride, float[] y, int yOff, int yStride) {
+    public void addDelta(Projection p, float scale, int n, float[] x, int xOff, int xStride, float[] y, int yOff,
+                         int yStride) {
         ensureBound();
         Pair pair = pairs.get(Objects.requireNonNull(p, "projection"));
         if (n < 1 || n > ubatch) {
             throw new IllegalArgumentException("switched LoRA delta of " + n + " rows, ubatch is " + ubatch);
         }
         CpuPooling.switchedLoraAdd(n, pair.in, pair.out, pair.rank, nSlots, slots, pair.a, pair.b, x, xOff, xStride,
-                tmp, 0, y, yOff, yStride);
+                tmp, 0, scale, y, yOff, yStride);
     }
 
     private void ensureBound() {

@@ -1,13 +1,17 @@
 package com.eonmux.neuralfree.gguf.ops.deltanet;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.arch.KdaGateMode;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
+import com.eonmux.neuralfree.gguf.engine.RecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.gpu.block.GpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuRecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
@@ -16,6 +20,7 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmKernels;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
@@ -50,7 +55,7 @@ import java.util.Objects;
  * {@code conv[c][j]} (kimi-linear.cpp:175-231); the scan state is {@code s[h*D*D + col*D + i]}.
  * A model without memory runs on zeroed temporaries (see {@link DeltaNetBlocks.GpuStates}). Not thread-safe.
  */
-public final class GpuKdaMixer implements GpuMixer {
+public final class GpuKdaMixer implements GpuMixer, GpuRecurrentTreeMixer {
 
     /** Temporary holding the low-rank decay projection {@code ssm_f_a(x)}. */
     static final String TEMP_FA = "kda.fa";
@@ -116,6 +121,14 @@ public final class GpuKdaMixer implements GpuMixer {
     private PreparedDispatch scanDispatch;
 
     private boolean bound;
+    /** The layer's stream width: the rows the mixer reads and writes. */
+    private int rowWidth;
+    /** Floats of one conv-state row (three slices, one stride); the stride the conv kernels index a slot with. */
+    private int convStride;
+    /** Floats of one scan-state row; the stride the scan kernel indexes a stack slot with. */
+    private int scanStride;
+    /** Whether the memory holds per-sequence state rows a batched step routes through. */
+    private boolean routeState;
     private boolean closed;
 
     // ================================================================== bind
@@ -176,11 +189,14 @@ public final class GpuKdaMixer implements GpuMixer {
         }
         l2Eps = DeltaNetBlocks.l2Eps(ctx.spec());
         rmsEps = DeltaNetBlocks.rmsEps(ctx.spec());
+        convStride = DeltaNetBlocks.toInt(r.convStateFloats(), "conv state stride");
+        scanStride = DeltaNetBlocks.toInt(r.stateFloats(), "scan state stride");
     }
 
     /** Projection matrices, their LoRA delta sites, the norm weight and the F32 conv / decay vectors. */
     private void bindWeights(GpuForwardContext ctx, LayerSpec layer, RecurrentSpec r) {
         int nEmbd = DeltaNetBlocks.mixerWidth(layer);
+        this.rowWidth = nEmbd;
         GpuWeights ws = ctx.weightSource().weightsFor(layer.weightLayer());
         wQkv = DeltaNetBlocks.gpuMatrixOrNull(ws, layer, TensorNames.ATTN_QKV, nEmbd, 3L * dInner);
         if (wQkv == null) {
@@ -227,6 +243,8 @@ public final class GpuKdaMixer implements GpuMixer {
         betaSlot = DeltaNetBlocks.atZero(scratch.temp(DeltaNetBlocks.TEMP_BETA, (long) ubatch * nHead),
                 DeltaNetKernels.GDN_GATE_PREP);
         states = DeltaNetBlocks.GpuStates.bind(ctx, layer, r.convStateFloats(), r.stateFloats());
+        routeState = ctx.hasMemory() && ctx.memory() instanceof com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory
+                && ctx.memory().pagedSequences() != null;
         working = new GpuBuffer[]{q.buffer(), k.buffer(), v.buffer(), work.buffer(), bl.buffer(),
                 fa != null ? fa.buffer() : work.buffer(), ga != null ? ga.buffer() : work.buffer()};
     }
@@ -336,84 +354,192 @@ public final class GpuKdaMixer implements GpuMixer {
 
     @Override
     public void decode(int pos, ScratchSlot in, ScratchSlot out) {
-        run(1, in, out);
+        run(1, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
     }
 
     @Override
     public void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
-        run(nTokens, in, out);
+        run(nTokens, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
+    }
+
+    /** Why this mixer runs a batched step: every sequence's rows dispatch as its own contiguous step. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
+    /**
+     * One batched step: every segment of {@code s} dispatches its rows as the contiguous step, reading and
+     * writing its sequence's recurrent state (the convs and the scan re-point the kernels' state-row routing per
+     * segment) and reading its rows at their place in the step's input and output.
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        if (s.contiguousSingle()) {
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        long n = (long) s.nTokens() * rowWidth;
+        in.require(n);
+        out.require(n);
+        DeltaNetBlocks.checkStepViews("KDA mixer", in, out, working);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            run(s.len(seg), in.buffer(), in.offset() + start * rowWidth, out.buffer(),
+                    out.offset() + start * rowWidth, s.seq(seg));
+        }
     }
 
     private void run(int n, ScratchSlot in, ScratchSlot out) {
+        run(n, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
+    }
+
+    private void run(int n, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff, int stateRow) {
         if (!bound || closed) {
             throw new IllegalStateException("KDA mixer is not bound or already closed");
         }
-        Objects.requireNonNull(in, "in");
-        Objects.requireNonNull(out, "out");
         if (n < 1 || n > ops.scratch().ubatch()) {
             throw new IllegalArgumentException("KDA step of " + n + " tokens is outside [1, "
                     + ops.scratch().ubatch() + "]");
         }
-        DeltaNetBlocks.checkStepViews("KDA mixer", in, out, working);
+        if (routeState) {
+            GpuMixer.routeStateRow(stateRow, states.rows, ops.queue());
+        }
         states.clearTransient(ops);
-        GpuBuffer x = in.buffer();
-        int x0 = in.offset();
-        if (wQkv != null) {
-            ops.matmul(wQkv, x, x0, work.buffer(), work.offset(), n);
-            qkvDeltas.applyRows(n, x, x0, work.buffer(), work.offset());
-            for (PreparedDispatch c : convs) {
-                conv(c, n);
+        GpuBuffer x = inBuf;
+        int x0 = inOff;
+        // The input, fine-tuning, beta and gate-logit projections of a single-token step all read this row,
+        // so its Q8_1 blocks are quantized once.
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(x0, rowWidth)
+                ? ops.shareQ8Activations(x, x0, rowWidth) : null;
+        try {
+            if (wQkv != null) {
+                ops.matmul(wQkv, x, x0, work.buffer(), work.offset(), n);
+                qkvDeltas.applyRows(n, x, x0, work.buffer(), work.offset());
+                for (PreparedDispatch c : convs) {
+                    conv(c, n);
+                }
+            } else {
+                for (int i = 0; i < 3; i++) {
+                    ops.matmul(wSeparate[i], x, x0, work.buffer(), work.offset(), n);
+                    separateDeltas[i].applyRows(n, x, x0, work.buffer(), work.offset());
+                    conv(convs[i], n);
+                }
             }
-        } else {
-            for (int i = 0; i < 3; i++) {
-                ops.matmul(wSeparate[i], x, x0, work.buffer(), work.offset(), n);
-                separateDeltas[i].applyRows(n, x, x0, work.buffer(), work.offset());
-                conv(convs[i], n);
+
+            if (wFb != null) {
+                ops.matmul(wFa, x, x0, fa.buffer(), fa.offset(), n);
+                faDeltas.applyRows(n, x, x0, fa.buffer(), fa.offset());
+                ops.matmul(wFb, fa.buffer(), fa.offset(), work.buffer(), work.offset(), n);
+                fbDeltas.applyRows(n, fa.buffer(), fa.offset(), work.buffer(), work.offset());
+            } else {
+                ops.matmul(wFa, x, x0, work.buffer(), work.offset(), n);
+                faDeltas.applyRows(n, x, x0, work.buffer(), work.offset());
+            }
+            ops.matmul(wBeta, x, x0, bl.buffer(), bl.offset(), n);
+            betaDeltas.applyRows(n, x, x0, bl.buffer(), bl.offset());
+            gateDispatch.setInt(DeltaNetKernels.GATE_ARG_N_TOKENS, n);
+            gateDispatch.setGlobal(DeltaNetKernels.gatePrepGlobal(n, nHead, gateShape.kdaMode(), headDim, elLocal));
+            gateDispatch.dispatch();
+
+            ops.norm(NormKind.L2_GDN, null, null, l2Eps, q.buffer(), q.offset(), q.buffer(), q.offset(), n * nHead,
+                    headDim);
+            ops.norm(NormKind.L2_GDN, null, null, l2Eps, k.buffer(), k.offset(), k.buffer(), k.offset(), n * nHead,
+                    headDim);
+            scanDispatch.setInt(DeltaNetKernels.SCAN_ARG_N_TOKENS, n);
+            scanDispatch.dispatch();
+
+            ops.norm(NormKind.RMS, normW, null, rmsEps, v.buffer(), v.offset(), v.buffer(), v.offset(), n * nHead,
+                    headDim);
+            if (wGa != null) {
+                ops.matmul(wGa, x, x0, ga.buffer(), ga.offset(), n);
+                gaDeltas.applyRows(n, x, x0, ga.buffer(), ga.offset());
+                ops.matmul(wGb, ga.buffer(), ga.offset(), work.buffer(), work.offset(), n);
+                gbDeltas.applyRows(n, ga.buffer(), ga.offset(), work.buffer(), work.offset());
+            } else {
+                ops.matmul(wG, x, x0, work.buffer(), work.offset(), n);
+                gDeltas.applyRows(n, x, x0, work.buffer(), work.offset());
+            }
+            ops.glu(GluOp.SIGMUL, ActParams.NONE, work.buffer(), work.offset(), dInner, v.buffer(), v.offset(), dInner,
+                    v.buffer(), v.offset(), dInner, n, dInner);
+            ops.matmul(wOut, v.buffer(), v.offset(), outBuf, outOff, n);
+            outDeltas.applyRows(n, v.buffer(), v.offset(), outBuf, outOff);
+        } finally {
+            if (share != null) {
+                share.close();
             }
         }
-
-        if (wFb != null) {
-            ops.matmul(wFa, x, x0, fa.buffer(), fa.offset(), n);
-            faDeltas.applyRows(n, x, x0, fa.buffer(), fa.offset());
-            ops.matmul(wFb, fa.buffer(), fa.offset(), work.buffer(), work.offset(), n);
-            fbDeltas.applyRows(n, fa.buffer(), fa.offset(), work.buffer(), work.offset());
-        } else {
-            ops.matmul(wFa, x, x0, work.buffer(), work.offset(), n);
-            faDeltas.applyRows(n, x, x0, work.buffer(), work.offset());
-        }
-        ops.matmul(wBeta, x, x0, bl.buffer(), bl.offset(), n);
-        betaDeltas.applyRows(n, x, x0, bl.buffer(), bl.offset());
-        gateDispatch.setInt(DeltaNetKernels.GATE_ARG_N_TOKENS, n);
-        gateDispatch.setGlobal(DeltaNetKernels.gatePrepGlobal(n, nHead, gateShape.kdaMode(), headDim, elLocal));
-        gateDispatch.dispatch();
-
-        ops.norm(NormKind.L2_GDN, null, null, l2Eps, q.buffer(), q.offset(), q.buffer(), q.offset(), n * nHead,
-                headDim);
-        ops.norm(NormKind.L2_GDN, null, null, l2Eps, k.buffer(), k.offset(), k.buffer(), k.offset(), n * nHead,
-                headDim);
-        scanDispatch.setInt(DeltaNetKernels.SCAN_ARG_N_TOKENS, n);
-        scanDispatch.dispatch();
-
-        ops.norm(NormKind.RMS, normW, null, rmsEps, v.buffer(), v.offset(), v.buffer(), v.offset(), n * nHead,
-                headDim);
-        if (wGa != null) {
-            ops.matmul(wGa, x, x0, ga.buffer(), ga.offset(), n);
-            gaDeltas.applyRows(n, x, x0, ga.buffer(), ga.offset());
-            ops.matmul(wGb, ga.buffer(), ga.offset(), work.buffer(), work.offset(), n);
-            gbDeltas.applyRows(n, ga.buffer(), ga.offset(), work.buffer(), work.offset());
-        } else {
-            ops.matmul(wG, x, x0, work.buffer(), work.offset(), n);
-            gDeltas.applyRows(n, x, x0, work.buffer(), work.offset());
-        }
-        ops.glu(GluOp.SIGMUL, ActParams.NONE, work.buffer(), work.offset(), dInner, v.buffer(), v.offset(), dInner,
-                v.buffer(), v.offset(), dInner, n, dInner);
-        ops.matmul(wOut, v.buffer(), v.offset(), out.buffer(), out.offset(), n);
-        outDeltas.applyRows(n, v.buffer(), v.offset(), out.buffer(), out.offset());
     }
 
     private static void conv(PreparedDispatch c, int n) {
         c.setInt(SsmKernels.ARG_CONV_N_TOKENS, n);
         c.dispatch();
+    }
+
+    @Override
+    public String treeStepRefusal() {
+        return null;
+    }
+
+    @Override
+    public int treeRowWidth() {
+        return rowWidth;
+    }
+
+    @Override
+    public void treeStep(GpuRecurrentTreeRound round, ScratchSlot in, ScratchSlot out) {
+        if (!bound || closed) {
+            throw new IllegalStateException("KDA mixer is not bound or already closed");
+        }
+        long[] mask = round.mask();
+        int realRows = round.realRows();
+        GpuBuffer convStack = round.convStack();
+        GpuBuffer scanStack = round.scanStack();
+        // the stateful kernels read the round's stack slots instead of the committed rows for the step; the
+        // per-row routing still rides the live routing buffer, so every dispatch addresses its slot
+        for (PreparedDispatch c : convs) {
+            c.setBuffer(SsmKernels.CONV_ARG_STATE, convStack);
+        }
+        scanDispatch.setBuffer(DeltaNetKernels.SCAN_ARG_STATE, scanStack);
+        try {
+            for (int row = 0; row < realRows; row++) {
+                int depth = RecurrentTreeRound.depth(mask[row]);
+                if (depth < 0) {
+                    throw new IllegalArgumentException("the tree step's row " + row + " is padding, the mixer runs"
+                            + " the computed rows");
+                }
+                int parent = RecurrentTreeRound.parentRow(mask[row], row);
+                seedStack(round.queue(), convStack, row, depth, parent, convStride, states.conv);
+                seedStack(round.queue(), scanStack, row, depth, parent, scanStride, states.scan);
+                run(1, in.buffer(), in.offset() + row * rowWidth, out.buffer(), out.offset() + row * rowWidth, row);
+            }
+        } finally {
+            for (PreparedDispatch c : convs) {
+                c.setBuffer(SsmKernels.CONV_ARG_STATE, states.conv);
+            }
+            scanDispatch.setBuffer(DeltaNetKernels.SCAN_ARG_STATE, states.scan);
+        }
+    }
+
+    /**
+     * Enqueues the copy that fills the row's stack slot: the committed rows at the root, else the parent row's
+     * slot.
+     */
+    private static void seedStack(ComputeQueue queue, GpuBuffer stack, int row, int depth, int parent, int stride,
+                                  GpuBuffer committed) {
+        if (stride == 0) {
+            return;
+        }
+        long bytes = (long) stride * Float.BYTES;
+        if (depth == 0) {
+            queue.enqueueCopyBuffer(committed, 0, stack, (long) row * bytes, bytes);
+        } else {
+            queue.enqueueCopyBuffer(stack, (long) parent * bytes, stack, (long) row * bytes, bytes);
+        }
     }
 
     // ================================================================== close

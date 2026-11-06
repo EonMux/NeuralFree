@@ -9,6 +9,9 @@ import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import static org.junit.Assert.*;
 
 public class OclComputeBackendIntegrationTest {
@@ -46,6 +49,16 @@ public class OclComputeBackendIntegrationTest {
     private CLDevice clDevice;
     private OclComputeBackend backend;
     private boolean gpuAvailable = false;
+    /** GpuEvents of the current test; each pins its queue and context until it is released in tearDown. */
+    private final List<GpuEvent> events = new ArrayList<>();
+
+    /** Registers an event for release in tearDown, so no cl_event outlives the test method. */
+    private GpuEvent track(GpuEvent event) {
+        if (event != null) {
+            events.add(event);
+        }
+        return event;
+    }
 
     @Before
     public void setUp() {
@@ -69,6 +82,13 @@ public class OclComputeBackendIntegrationTest {
 
     @After
     public void tearDown() {
+        for (GpuEvent event : events) {
+            try {
+                event.close();
+            } catch (RuntimeException ignored) {
+            }
+        }
+        events.clear();
         if (backend != null) {
             backend.close();
         }
@@ -109,19 +129,19 @@ public class OclComputeBackendIntegrationTest {
         ComputeQueue transferQueue = backend.transferQueue();
         ComputeQueue computeQueue = backend.computeQueue();
 
-        GpuEvent writeEventA = transferQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a);
-        GpuEvent writeEventB = transferQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b);
+        GpuEvent writeEventA = track(transferQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a));
+        GpuEvent writeEventB = track(transferQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b));
 
         assertNotNull("Write event A should not be null", writeEventA);
         assertNotNull("Write event B should not be null", writeEventB);
 
         Object[] kernelArgs = new Object[]{bufferA, bufferB, bufferC, size};
-        GpuEvent kernelEvent = computeQueue.enqueueKernel(kernel, new long[]{size}, new long[]{64}, kernelArgs, writeEventA, writeEventB);
+        GpuEvent kernelEvent = track(computeQueue.enqueueKernel(kernel, new long[]{size}, new long[]{64}, kernelArgs, writeEventA, writeEventB));
 
         assertNotNull("Kernel event should not be null", kernelEvent);
 
         float[] result = new float[size];
-        GpuEvent readEvent = computeQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result, kernelEvent);
+        GpuEvent readEvent = track(computeQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result, kernelEvent));
 
         assertNotNull("Read event should not be null", readEvent);
 
@@ -176,14 +196,14 @@ public class OclComputeBackendIntegrationTest {
         ComputeQueue tQueue = backend.transferQueue();
         ComputeQueue cQueue = backend.computeQueue();
 
-        GpuEvent writeEventA = tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A);
-        GpuEvent writeEventB = tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B);
+        GpuEvent writeEventA = track(tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A));
+        GpuEvent writeEventB = track(tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B));
 
         Object[] args = new Object[]{bufferA, bufferB, bufferC, M, K, N};
-        GpuEvent kernelEvent = cQueue.enqueueKernel(kernel, new long[]{M, N}, new long[]{2, 2}, args, writeEventA, writeEventB);
+        GpuEvent kernelEvent = track(cQueue.enqueueKernel(kernel, new long[]{M, N}, new long[]{2, 2}, args, writeEventA, writeEventB));
 
         float[] result = new float[M * N];
-        GpuEvent readEvent = cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result, kernelEvent);
+        GpuEvent readEvent = track(cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result, kernelEvent));
         readEvent.awaitCompletion();
 
         for (int i = 0; i < M * N; i++) {
@@ -232,13 +252,13 @@ public class OclComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("scale", SCALE_KERNEL, null);
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        GpuEvent writeEvent = computeQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        GpuEvent writeEvent = track(computeQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data));
 
         Object[] args = new Object[]{buffer, 3.0f, size};
-        GpuEvent kernelEvent = computeQueue.enqueueKernel(kernel, new long[]{size}, new long[]{32}, args, writeEvent);
+        GpuEvent kernelEvent = track(computeQueue.enqueueKernel(kernel, new long[]{size}, new long[]{32}, args, writeEvent));
 
         float[] result = new float[size];
-        GpuEvent readEvent = computeQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result, kernelEvent);
+        GpuEvent readEvent = track(computeQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result, kernelEvent));
         readEvent.awaitCompletion();
 
         for (int i = 0; i < size; i++) {
@@ -262,10 +282,10 @@ public class OclComputeBackendIntegrationTest {
 
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        GpuEvent writeEvent = transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, writeData);
+        GpuEvent writeEvent = track(transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, writeData));
 
         float[] readData = new float[size];
-        GpuEvent readEvent = transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, readData, writeEvent);
+        GpuEvent readEvent = track(transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, readData, writeEvent));
         readEvent.awaitCompletion();
 
         for (int i = 0; i < size; i++) {
@@ -293,16 +313,16 @@ public class OclComputeBackendIntegrationTest {
 
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        track(transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data));
         transferQueue.finish();
 
         KernelHandle kernel = backend.compileKernel("scale", SCALE_KERNEL, null);
         Object[] args = new Object[]{buffer, 2.0f, size};
-        computeQueue.enqueueKernel(kernel, new long[]{size}, new long[]{32}, args);
+        track(computeQueue.enqueueKernel(kernel, new long[]{size}, new long[]{32}, args));
         computeQueue.finish();
 
         float[] result = new float[size];
-        GpuEvent readEvent = transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+        GpuEvent readEvent = track(transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result));
         readEvent.awaitCompletion();
 
         for (int i = 0; i < size; i++) {
@@ -352,18 +372,18 @@ public class OclComputeBackendIntegrationTest {
         GpuBuffer bufferB = backend.allocateBuffer(size * Float.BYTES);
         GpuBuffer bufferC = backend.allocateBuffer(size * Float.BYTES);
 
-        GpuEvent writeEventA = backend.transferQueue().enqueueWriteBuffer(bufferA, 0, size * Float.BYTES, a);
-        GpuEvent writeEventB = backend.transferQueue().enqueueWriteBuffer(bufferB, 0, size * Float.BYTES, b);
+        GpuEvent writeEventA = track(backend.transferQueue().enqueueWriteBuffer(bufferA, 0, size * Float.BYTES, a));
+        GpuEvent writeEventB = track(backend.transferQueue().enqueueWriteBuffer(bufferB, 0, size * Float.BYTES, b));
 
         assertNotNull("Write event A should not be null", writeEventA);
         assertNotNull("Write event B should not be null", writeEventB);
 
         Object[] args = new Object[]{bufferA, bufferB, bufferC, size};
-        GpuEvent kernelEvent = backend.computeQueue().enqueueKernel(
-                kernel, new long[]{size}, new long[]{64}, args, writeEventA, writeEventB);
+        GpuEvent kernelEvent = track(backend.computeQueue().enqueueKernel(
+                kernel, new long[]{size}, new long[]{64}, args, writeEventA, writeEventB));
 
         float[] result = new float[size];
-        GpuEvent readEvent = backend.computeQueue().enqueueReadBuffer(bufferC, 0, size * Float.BYTES, result, kernelEvent);
+        GpuEvent readEvent = track(backend.computeQueue().enqueueReadBuffer(bufferC, 0, size * Float.BYTES, result, kernelEvent));
 
         readEvent.awaitCompletion();
 
@@ -388,16 +408,16 @@ public class OclComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("scale", SCALE_KERNEL, null);
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        GpuEvent writeEvent = backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        GpuEvent writeEvent = track(backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data));
 
         Object[] args = new Object[]{buffer, 2.0f, size};
-        GpuEvent kernelEvent1 = backend.computeQueue().enqueueKernel(kernel, new long[]{size}, new long[]{32}, args, writeEvent);
+        GpuEvent kernelEvent1 = track(backend.computeQueue().enqueueKernel(kernel, new long[]{size}, new long[]{32}, args, writeEvent));
 
         args = new Object[]{buffer, 3.0f, size};
-        GpuEvent kernelEvent2 = backend.computeQueue().enqueueKernel(kernel, new long[]{size}, new long[]{32}, args, kernelEvent1);
+        GpuEvent kernelEvent2 = track(backend.computeQueue().enqueueKernel(kernel, new long[]{size}, new long[]{32}, args, kernelEvent1));
 
         float[] result = new float[size];
-        GpuEvent readEvent = backend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result, kernelEvent2);
+        GpuEvent readEvent = track(backend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result, kernelEvent2));
         readEvent.awaitCompletion();
 
         float expected = 1.0f * 2.0f * 3.0f;
@@ -416,6 +436,36 @@ public class OclComputeBackendIntegrationTest {
         backend.close();
     }
 
+    @Test
+    public void testCloseReleasesBuffersLeftOpen() {
+        OclGpuBuffer leftOpen = (OclGpuBuffer) backend.allocateBuffer(1024);
+        OclGpuBuffer closedByHolder = (OclGpuBuffer) backend.allocateBuffer(4096);
+        closedByHolder.close();
+        assertEquals(1024, backend.getAllocatedBytes());
+
+        backend.close();
+
+        assertNull("a buffer left open is released with its backend", leftOpen.getCLMem());
+        assertEquals(-1, leftOpen.bufferId());
+        assertEquals(0, backend.getAllocatedBytes());
+        leftOpen.close();
+        assertEquals("closing a released buffer again changes nothing", 0, backend.getAllocatedBytes());
+    }
+
+    @Test
+    public void testCloseReleasesCallerOwnedQueues() {
+        OclComputeQueue leftOpen = (OclComputeQueue) backend.createComputeQueue();
+        OclComputeQueue closedByCaller = (OclComputeQueue) backend.createComputeQueue();
+        closedByCaller.close();
+        assertTrue(closedByCaller.isReleased());
+        assertFalse(leftOpen.isReleased());
+
+        backend.close();
+
+        assertTrue("a caller-owned queue left open is released with its backend", leftOpen.isReleased());
+        leftOpen.close();
+    }
+
     @Test(expected = IllegalStateException.class)
     public void testOperationsAfterCloseThrow() {
         backend.close();
@@ -428,7 +478,7 @@ public class OclComputeBackendIntegrationTest {
         backend.close();
 
         float[] data = new float[256];
-        backend.computeQueue().enqueueWriteBuffer(buffer, 0, 1024, data);
+        track(backend.computeQueue().enqueueWriteBuffer(buffer, 0, 1024, data));
     }
 
     @Test
@@ -460,10 +510,10 @@ public class OclComputeBackendIntegrationTest {
             data[i] = i % 100;
         }
 
-        GpuEvent writeEvent = backend.transferQueue().enqueueWriteBuffer(buffer, 0, bufferSize, data);
+        GpuEvent writeEvent = track(backend.transferQueue().enqueueWriteBuffer(buffer, 0, bufferSize, data));
 
         float[] result = new float[size];
-        GpuEvent readEvent = backend.transferQueue().enqueueReadBuffer(buffer, 0, bufferSize, result, writeEvent);
+        GpuEvent readEvent = track(backend.transferQueue().enqueueReadBuffer(buffer, 0, bufferSize, result, writeEvent));
         readEvent.awaitCompletion();
 
         for (int i = 0; i < 100; i++) {
@@ -487,7 +537,7 @@ public class OclComputeBackendIntegrationTest {
             data[i] = i;
         }
 
-        GpuEvent writeEvent = backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        GpuEvent writeEvent = track(backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data));
         writeEvent.awaitCompletion();
 
         buffer.close();

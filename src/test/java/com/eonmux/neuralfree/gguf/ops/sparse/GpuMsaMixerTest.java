@@ -188,7 +188,7 @@ public class GpuMsaMixerTest {
         MsaSpec msa = MsaSpec.builder().idxHeads(N_KV).idxHeadDim(IDX).idxRopeDim(N_ROT).blockSize(BLK)
                 .localBlocks(LOCAL_BLOCKS).topKBlocks(TOP_K).sparse(sparse).kqScale(KQ).build();
         return LayerSpec.builder(0, MixerKind.MSA, FfnKind.NONE)
-                .norm(NormSpec.builder(NormKind.RMS, 1e-6f).build())
+                .norm(NormSpec.builder(NormKind.RMS, 1e-6f).qkNorm(a.qkNorm()).build())
                 .residual(ResidualSpec.builder(ResidualKind.STANDARD, N_EMBD).build())
                 .attention(a)
                 .msa(msa)
@@ -438,6 +438,40 @@ public class GpuMsaMixerTest {
         assertSame(temp(GpuMsaMixer.TEMP_QKV), bias.bufferArg(3));
         List<Dispatch> sparse = nonProjection(ds);
         checkSelection(sparse.subList(4, sparse.size()), 1, 1);
+    }
+
+    /**
+     * The cache writes alone: the K and V products with their biases, the K norm and RoPE, the indexer's keys and
+     * their store, then the rotated K/V stores. The Q path, the indexer's queries, the block selection and the
+     * attention do not run.
+     */
+    @Test
+    public void kvOnlyPrefillStopsAtTheStores() {
+        open();
+        separateQkv();
+        LayerSpec layer = layer(true);
+        bind(layer);
+        List<Dispatch> whole = run(() -> mixer.prefill(0, 6, slot(ScratchSlots.NORMED),
+                slot(ScratchSlots.BRANCH)));
+        List<Dispatch> ds = run(() -> mixer.prefillKV(0, 6, slot(ScratchSlots.NORMED)));
+
+        List<Dispatch> sparse = nonProjection(ds);
+        assertEquals(Arrays.asList(NORM, ROPE, NORM, ROPE, STORE, STORE, STORE), names(sparse));
+        assertTrue("the cache write runs fewer kernels: " + ds.size() + " vs " + whole.size(),
+                ds.size() < whole.size());
+
+        Dispatch ik = sparse.get(4);
+        assertArrayEquals(new int[]{6, IDX, IDX, 0, IDX}, ints(ik, 0, 5));
+        assertSame(temp(GpuMsaMixer.TEMP_IK), ik.bufferArg(5));
+        assertSame(cellIdx, ik.bufferArg(6));
+        assertSame(indexKeys, ik.bufferArg(7));
+        Dispatch k = sparse.get(5);
+        assertArrayEquals(new int[]{6, K_DIM, K_DIM, 0, K_DIM}, ints(k, 0, 5));
+        assertSame(temp(GpuMsaMixer.TEMP_K), k.bufferArg(5));
+        assertSame(kCache, k.bufferArg(7));
+        Dispatch v = sparse.get(6);
+        assertSame(temp(GpuMsaMixer.TEMP_V), v.bufferArg(5));
+        assertSame(vCache, v.bufferArg(7));
     }
 
     @Test

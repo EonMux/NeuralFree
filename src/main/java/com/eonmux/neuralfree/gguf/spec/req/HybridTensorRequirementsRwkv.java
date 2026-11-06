@@ -105,11 +105,12 @@ public final class HybridTensorRequirementsRwkv {
      * {@code LLM_TENSOR_OUTPUT_NORM_LFM2}). A decision model replaces the output head with
      * {@code token_types}, {@code cls.norm}, {@code cls} and {@code cls.output} (lfm2.cpp:78-85) and its last
      * blocks are plain pre-norm blocks with biases (lfm2.cpp:55-71). The decision tensors are required when
-     * {@code n_layer_decision > 0}.
+     * {@code n_layer_decision > 0}; the ColBERT head's {@code dense_2} projection loads when present (bert.py:753).
      */
     public static List<TensorRequirement> lfm2() {
         HybridTensorRequirements.Builder b = HybridTensorRequirements.builder();
         b.model("token_embd.weight", "token_embd_norm.weight");
+        b.modelOptional("dense_2.weight", "dense_2.bias");
         b.layer(LFM_DECISION, "attn_norm.weight", "attn_norm.bias", "attn_qkv.weight", "attn_qkv.bias",
                 "attn_output.weight", "attn_output.bias", "ffn_norm.weight", "ffn_norm.bias", "ffn_up.weight",
                 "ffn_up.bias", "ffn_down.weight", "ffn_down.bias");
@@ -126,6 +127,27 @@ public final class HybridTensorRequirementsRwkv {
         b.model("token_embd.weight", "token_embd_norm.weight");
         b.outputOrTied();
         lfmTrunk(b);
+        return b.build();
+    }
+
+    /**
+     * lfm3.cpp:33-88. Every layer has an operator norm and a gated SwiGLU FFN behind an FFN norm; the sandwich
+     * post norms are optional but stand or fall together (lfm3.cpp:51-55, enforced by the norm resolver).
+     * Attention layers carry per-head Q/K norms, the per-head output gate and the learned {@code rope_freqs}
+     * factors on the full-attention layers; the other layers are short convolutions.
+     */
+    public static List<TensorRequirement> lfm3() {
+        HybridTensorRequirements.Builder b = HybridTensorRequirements.builder();
+        b.model("token_embd.weight", "output_norm.weight");
+        b.outputOrTied();
+        b.layer(ALL, "attn_norm.weight", "ffn_norm.weight");
+        b.layerOptional(ALL, "post_attention_norm.weight", "post_ffw_norm.weight");
+        b.gatedFfn(ALL);
+        b.layer(ATTENTION, "attn_q_norm.weight", "attn_k_norm.weight");
+        b.qkv(ATTENTION);
+        b.layer(ATTENTION, "attn_output.weight", "attn_gate.weight");
+        b.modelOptional("rope_freqs.weight");
+        b.layer(RECURRENT, "shortconv.conv.weight", "shortconv.in_proj.weight", "shortconv.out_proj.weight");
         return b.build();
     }
 

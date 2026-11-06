@@ -12,9 +12,11 @@ import java.util.List;
  *
  * <ul>
  *   <li>{@link #SWITCHED_LORA_ADD} {@code (n_tokens*, in_dim, out_dim, rank, stage*, n_slots, x_stride, x_off,
- *       y_stride, y_off, tmp_off; slots, A, B, x, tmp, y)}: graniteswitch per-token LoRA delta
- *       {@code y[t] += B[s_t](A[s_t] x[t])} in two dispatches, {@link #LORA_STAGE_DOWN} then {@link #LORA_STAGE_UP}
- *       on one queue; geometry from {@link #loraGlobal}. CPU twin {@link CpuPooling#switchedLoraAdd}.</li>
+ *       y_stride, y_off, tmp_off, scale; slots, A, B, x, tmp, y)}: graniteswitch per-token LoRA delta
+ *       {@code y[t] += scale * B[s_t](A[s_t] x[t])} in two dispatches, {@link #LORA_STAGE_DOWN} then
+ *       {@link #LORA_STAGE_UP} on one queue; geometry from {@link #loraGlobal}. {@code scale} multiplies the up
+ *       stage's accumulation (1.0 for the plain delta), so a slot's rows can run the uploaded factors at a factor
+ *       of their bound scale. CPU twin {@link CpuPooling#switchedLoraAdd}.</li>
  * </ul>
  * {@code *} marks the arguments re-set per dispatch, at the matching {@code ARG_*} index.
  */
@@ -29,8 +31,10 @@ public final class HeadsKernels {
     public static final int ARG_LORA_N_TOKENS = 0;
     /** {@link #SWITCHED_LORA_ADD} {@code stage}. */
     public static final int ARG_LORA_STAGE = 4;
-    /** {@link #SWITCHED_LORA_ADD} argument count (11 scalars, 6 buffers). */
-    public static final int LORA_ARG_COUNT = 17;
+    /** {@link #SWITCHED_LORA_ADD} {@code scale}, the up stage's multiplier. */
+    public static final int ARG_LORA_SCALE = 11;
+    /** {@link #SWITCHED_LORA_ADD} argument count (12 scalars, 6 buffers). */
+    public static final int LORA_ARG_COUNT = 18;
 
     /** Stage 0: {@code tmp[t][r] = A[s_t][r] . x[t]}, one workgroup per (token, rank row). */
     public static final int LORA_STAGE_DOWN = 0;

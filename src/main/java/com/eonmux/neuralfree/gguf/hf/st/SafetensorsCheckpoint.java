@@ -2,6 +2,9 @@ package com.eonmux.neuralfree.gguf.hf.st;
 
 import com.eonmux.neuralfree.gguf.DataSegment;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoCheckpoints;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoSafetensors;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoWeight;
 import com.eonmux.neuralfree.io.safetensors.SafetensorsFile;
 import com.eonmux.neuralfree.io.safetensors.StTensor;
 import com.eonmux.neuralfree.utils.json.Json;
@@ -45,8 +48,13 @@ import java.util.Set;
  * layout) and are followed. File {@code f} occupies the virtual range starting at
  * {@code V_f = sum over earlier files g of align64(dataLength_g)}, so a tensor's direct virtual offset is
  * {@code V_f + begin}. At most {@value #MAX_FILES} files and {@value #MAX_TENSORS} tensors are accepted.</p>
+ *
+ * <p>A file's {@code __metadata__} may carry torchao's flattened subclass descriptors ({@code tensor_names} and a
+ * per-tensor {@code _type}/{@code _data}/{@code _tensor_data_names} JSON object). They are read into {@link
+ * TorchaoWeight}s for the shared decoder ({@link TorchaoCheckpoints}); the flattened inner tensors they name are
+ * hidden when the decoder exposes its canonical tensors.</p>
  */
-public final class SafetensorsCheckpoint implements CheckpointContainer {
+public final class SafetensorsCheckpoint implements CheckpointContainer, TorchaoCheckpoints.Source {
 
     private static final Logger LOGGER = LogManager.getLogger(SafetensorsCheckpoint.class);
 
@@ -76,21 +84,27 @@ public final class SafetensorsCheckpoint implements CheckpointContainer {
     /** Natural file order: digit runs compared as numbers, other runs as text, then the plain name. */
     static final Comparator<String> NATURAL_ORDER = SafetensorsCheckpoint::compareNatural;
 
-    /** The built-in factory: accepts any checkpoint with a {@code *.safetensors} file. */
+    /** The built-in factory of {@link SafetensorsCheckpoint}s; it wraps the container with {@link
+     *  TorchaoCheckpoints} so torchao subclasses become ordinary checkpoint tensors. */
     public static final CheckpointContainers.Factory FACTORY = new CheckpointContainers.Factory() {
         @Override
         public boolean accepts(Path dir, List<Path> files) {
+            boolean safetensors = false;
             for (Path f : files) {
-                if (f.getFileName().toString().endsWith(SUFFIX)) {
-                    return true;
+                String name = f.getFileName().toString();
+                if (VllmShardFiles.isPreSharded(name)) {
+                    return false;
+                }
+                if (name.endsWith(SUFFIX)) {
+                    safetensors = true;
                 }
             }
-            return false;
+            return safetensors;
         }
 
         @Override
         public CheckpointContainer open(Path path, Path configDir, boolean mistralNative) throws IOException {
-            return SafetensorsCheckpoint.open(path, configDir, mistralNative);
+            return TorchaoCheckpoints.wrap(SafetensorsCheckpoint.open(path, configDir, mistralNative));
         }
 
         @Override
@@ -118,17 +132,20 @@ public final class SafetensorsCheckpoint implements CheckpointContainer {
     private final List<DataSegment> segments;
     private final List<StTensor> tensors;
     private final Map<String, Located> byName;
+    private final List<TorchaoWeight> torchaoWeights;
     private final List<SafetensorsFile> sideFiles = new ArrayList<>();
     private boolean closed;
 
     private SafetensorsCheckpoint(String description, Path modelDir, List<SafetensorsFile> files,
-                                  List<DataSegment> segments, List<StTensor> tensors, Map<String, Located> byName) {
+                                  List<DataSegment> segments, List<StTensor> tensors, Map<String, Located> byName,
+                                  List<TorchaoWeight> torchaoWeights) {
         this.description = description;
         this.modelDir = modelDir;
         this.files = Collections.unmodifiableList(files);
         this.segments = Collections.unmodifiableList(segments);
         this.tensors = Collections.unmodifiableList(tensors);
         this.byName = byName;
+        this.torchaoWeights = Collections.unmodifiableList(new ArrayList<>(torchaoWeights));
     }
 
     /**
@@ -307,9 +324,39 @@ public final class SafetensorsCheckpoint implements CheckpointContainer {
                         + files.get(loc.file).path() + "')"));
             }
         }
+        List<TorchaoWeight> torchao = TorchaoSafetensors.read(metadata(files), new TorchaoSafetensors.Tensors() {
+            @Override
+            public StTensor tensor(String name) {
+                Located loc = byName.get(name);
+                return loc == null ? null : loc.tensor;
+            }
+
+            @Override
+            public RowSource source(String name) {
+                Located loc = locate(byName, name);
+                return new StRowSource(files.get(loc.file), loc.tensor, loc.virtualOffset);
+            }
+        }, path.toString());
         String description = "safetensors checkpoint '" + path + "' (" + files.size() + " file"
                 + (files.size() == 1 ? "" : "s") + ", " + tensors.size() + " tensors)";
-        return new SafetensorsCheckpoint(description, configDir, files, segments, tensors, byName);
+        return new SafetensorsCheckpoint(description, configDir, files, segments, tensors, byName, torchao);
+    }
+
+    /** The {@code __metadata__} entries of every file, in file order. */
+    private static List<Map<String, String>> metadata(List<SafetensorsFile> files) {
+        List<Map<String, String>> out = new ArrayList<>(files.size());
+        for (SafetensorsFile f : files) {
+            out.add(f.metadata());
+        }
+        return out;
+    }
+
+    private static Located locate(Map<String, Located> byName, String name) {
+        Located loc = byName.get(name);
+        if (loc == null) {
+            throw new IllegalArgumentException("the checkpoint has no tensor '" + name + "'");
+        }
+        return loc;
     }
 
     // ------------------------------------------------------------------ CheckpointContainer
@@ -349,6 +396,11 @@ public final class SafetensorsCheckpoint implements CheckpointContainer {
     /** The checkpoint files in virtual order (unmodifiable). */
     public List<SafetensorsFile> files() {
         return files;
+    }
+
+    @Override
+    public List<TorchaoWeight> torchaoWeights() {
+        return torchaoWeights;
     }
 
     @Override

@@ -136,13 +136,44 @@ public final class CpuDsv4Compressor {
             float[] row = new float[cfg.width];
             for (int g = from; g < to; g++) {
                 int b = b0 + g;
-                compressRow(cfg, step, b, stateKv, stateScore, normW, row);
+                compressRow(cfg, step, b, stateKv, stateScore, normW, row, true);
                 if (cfg.rotBlock > 0) {
                     hadamard(row, 0, cfg.width, cfg.rotBlock);
                 }
                 cache.writeK(b, row, 0);
             }
         });
+    }
+
+    /**
+     * The compressed rows a step completes, before their rope and the Hadamard rotation, into
+     * {@code out[(b - b0) * width ..]}: rows of {@link #compressRow} without the tail rotation, so the caller can
+     * derive the index key from the unrotated row and rotate both afterwards (DeepSeek-V4.1,
+     * models/deepseek41.cpp:493-505).
+     *
+     * @param out at least {@code blockCount(pos0, n_tokens, ratio) * width} values
+     * @throws IllegalArgumentException when the step or the output array does not fit
+     */
+    public static void compressUnroped(Config cfg, Step step, float[] stateKv, float[] stateScore, float[] normW,
+                                       float[] out) {
+        checkStep(cfg, step, stateKv, stateScore);
+        Objects.requireNonNull(normW, "norm_w");
+        Objects.requireNonNull(out, "out");
+        if (normW.length < cfg.width) {
+            throw new IllegalArgumentException("norm weights hold " + normW.length + " < " + cfg.width + " values");
+        }
+        final int b0 = Dsv4Kernels.firstBlock(step.pos0, cfg.ratio);
+        final int nBlocks = Dsv4Kernels.blockCount(step.pos0, step.nTokens, cfg.ratio);
+        if ((long) nBlocks * cfg.width > out.length) {
+            throw new IllegalArgumentException("compressed rows need " + ((long) nBlocks * cfg.width)
+                    + " values, got " + out.length);
+        }
+        for (int g = 0; g < nBlocks; g++) {
+            compressRow(cfg, step, b0 + g, stateKv, stateScore, normW, out, g * cfg.width, false);
+            if (cfg.rotBlock > 0) {
+                hadamard(out, g * cfg.width, cfg.width, cfg.rotBlock);
+            }
+        }
     }
 
     /**
@@ -268,12 +299,21 @@ public final class CpuDsv4Compressor {
     }
 
     /**
-     * Pooled, RMS-normalized and rotated row of block {@code b} (before the Hadamard step) into {@code row}: per
-     * channel a softmax over the window scores and the weighted kv sum, then RMS norm times {@code normW} and RoPE at
-     * {@code b * ratio} (deepseek4.cpp:499-511, 572-585).
+     * Pooled, RMS-normalized row of block {@code b}, rotated at {@code b * ratio} when {@code ropeRow}: per channel a
+     * softmax over the window scores and the weighted kv sum, then RMS norm times {@code normW} and RoPE
+     * (deepseek4.cpp:499-511, 572-585).
      */
     static void compressRow(Config cfg, Step step, int b, float[] stateKv, float[] stateScore, float[] normW,
-                            float[] row) {
+                            float[] row, boolean ropeRow) {
+        compressRow(cfg, step, b, stateKv, stateScore, normW, row, 0, ropeRow);
+    }
+
+    /**
+     * {@link #compressRow(Config, Step, int, float[], float[], float[], float[], boolean)} writing the {@code width}
+     * values of block {@code b} at {@code row[rowOff ..]}.
+     */
+    static void compressRow(Config cfg, Step step, int b, float[] stateKv, float[] stateScore, float[] normW,
+                            float[] row, int rowOff, boolean ropeRow) {
         final int ratio = cfg.ratio;
         final int width = cfg.width;
         final boolean overlap = cfg.overlapped();
@@ -296,10 +336,12 @@ public final class CpuDsv4Compressor {
                 l += e;
                 acc += e * kv[j];
             }
-            row[c] = acc * (1f / l);
+            row[rowOff + c] = acc * (1f / l);
         }
-        rmsNorm(row, 0, width, normW, cfg.eps);
-        rope(row, 0, width, cfg.rope, start, false);
+        rmsNorm(row, rowOff, width, normW, cfg.eps);
+        if (ropeRow) {
+            rope(row, rowOff, width, cfg.rope, start, false);
+        }
     }
 
     /** Window source of position {@code p}, state column {@code col}, into {@code kv[j]}, {@code sc[j]}. */

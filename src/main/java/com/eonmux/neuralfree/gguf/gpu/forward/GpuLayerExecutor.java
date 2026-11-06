@@ -1,6 +1,8 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.acceleration.backend.GpuStepPatcher;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.FfnKind;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
@@ -12,9 +14,11 @@ import com.eonmux.neuralfree.gguf.gpu.block.GpuFfnBlock;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtra;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.gpu.block.GpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.weights.LayerWeightSource;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.ops.norm.GpuAdaNorm;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels.MixMode;
@@ -119,7 +123,8 @@ public final class GpuLayerExecutor implements AutoCloseable {
 
     /** Kernels the executor launches itself, for prewarming. */
     public static final List<String> KERNELS = Collections.unmodifiableList(Arrays.asList(
-            NormKernels.ROW_NORM, NormKernels.RESIDUAL_MIX, NormKernels.MUL_ROW_SCALE, GpuOps.COPY2D, GpuOps.AXPBY));
+            NormKernels.ROW_NORM, NormKernels.RESIDUAL_MIX, NormKernels.RESIDUAL_MIX_NORM,
+            NormKernels.MUL_ROW_SCALE, GpuOps.COPY2D, GpuOps.AXPBY));
 
     /** Mixer branch held back for a PARALLEL residual. */
     static final String TEMP_PARALLEL = "exec.parallel_branch";
@@ -131,6 +136,13 @@ public final class GpuLayerExecutor implements AutoCloseable {
     static final String TEMP_HRM_HIGH = "exec.hrm.z_h";
     /** HRM low-level stream {@code zL}. */
     static final String TEMP_HRM_LOW = "exec.hrm.z_l";
+    /** Repeat schedule: the stream entering the repeated block. */
+    static final String TEMP_REPEAT_INPUT = "exec.repeat.input";
+    /** Repeat schedule: the state carried between passes. */
+    static final String TEMP_REPEAT_STATE = "exec.repeat.state";
+    /** SLERP residual: the normalized stream and branch rows. */
+    static final String TEMP_SLERP_A = "exec.slerp.a";
+    static final String TEMP_SLERP_B = "exec.slerp.b";
     private static final int ONE_BITS = Float.floatToRawIntBits(1.0f);
 
     private final GpuForwardContext ctx;
@@ -147,11 +159,21 @@ public final class GpuLayerExecutor implements AutoCloseable {
     private final ScratchSlot hrmLow;
     private final GpuWeight hrmLowInit;
     private final int hrmWidth;
+    private final ScratchSlot repeatInput;
+    private final ScratchSlot repeatState;
+    private final int repeatWidth;
+    private final boolean repeatCombine;
+    private final ScratchSlot slerpA;
+    private final ScratchSlot slerpB;
     private final int ubatch;
     private final int local;
     private final GpuBuffer placeholder;
     /** Adaptive FFN-norm vectors shared by the layers with {@code NormSpec.ffnAda()}; null when none has it. */
     private final GpuAdaNorm adaNorm;
+    /** A residual mix held back for fusion with the next row norm of the stream; null when none is held. */
+    private PendingMix pendingMix;
+    /** The running recurrent tree round, or null when no tree verify runs over a recurrent target. */
+    private GpuRecurrentTreeRound round;
     private boolean closed;
 
     /**
@@ -219,6 +241,23 @@ public final class GpuLayerExecutor implements AutoCloseable {
         if (hrm && hrmLow.offset() != 0) {
             throw new IllegalStateException(TEMP_HRM_LOW + " must start at element 0 for " + NormKernels.MUL_ROW_SCALE);
         }
+        this.repeatCombine = schedule != null && schedule.kind() == LayerSchedule.Kind.REPEAT
+                && schedule.loopCombine() == LayerSchedule.LoopCombine.JUSTNORM;
+        if (repeatCombine) {
+            this.repeatWidth = stack.get(0).residual().streamWidth();
+            this.repeatInput = scratch.temp(TEMP_REPEAT_INPUT, (long) ubatch * repeatWidth);
+            this.repeatState = scratch.temp(TEMP_REPEAT_STATE, (long) ubatch * repeatWidth);
+        } else {
+            this.repeatWidth = 0;
+            this.repeatInput = null;
+            this.repeatState = null;
+        }
+        boolean anySlerp = false;
+        for (LayerSpec l : stack) {
+            anySlerp |= l.residual().kind() == ResidualKind.SLERP;
+        }
+        this.slerpA = anySlerp ? scratch.temp(TEMP_SLERP_A, rows) : null;
+        this.slerpB = anySlerp ? scratch.temp(TEMP_SLERP_B, rows) : null;
         this.layers = Collections.unmodifiableList(bindAll(ctx, registry, stack, schedule));
         try {
             for (LayerBlocks l : layers) {
@@ -227,6 +266,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
                             + x.offset());
                 }
             }
+            bindResidualNormFusion(hrm);
             this.adaNorm = adaNorm(ctx, layers);
             prewarmKernels(hrm);
         } catch (RuntimeException e) {
@@ -236,16 +276,43 @@ public final class GpuLayerExecutor implements AutoCloseable {
     }
 
     /**
+     * Marks the layers whose FFN residual may fuse with the next layer's attention norm
+     * ({@link LayerBlocks#carriesFfnResidual}): the launches between the residual and that norm are the
+     * in-place post-LN norm, the discard copy, the output scales and the extras' and schedules' stream
+     * accesses, so a layer with none of them and a next layer that starts from a plain attention norm of the
+     * same width carries it.
+     */
+    private void bindResidualNormFusion(boolean hrm) {
+        if (hrm || repeatCombine) {
+            return;
+        }
+        for (int i = 0; i < layers.size() - 1; i++) {
+            LayerBlocks l = layers.get(i);
+            LayerBlocks next = layers.get(i + 1);
+            l.carriesFfnResidual = l.postLnLayer == null && !l.discard && l.outScale == null
+                    && l.blockScale == 1.0f && l.extras.isEmpty() && next.extras.isEmpty() && !next.keepInput
+                    && next.mixer != null && next.attnNorm != null && l.width == l.streamWidth
+                    && next.width == l.width && next.streamWidth == l.streamWidth;
+        }
+    }
+
+    /**
      * Prepares the kernels this executor launches at work-group size {@code L} ({@link GpuOps#prewarm}):
-     * {@value NormKernels#RESIDUAL_MIX} for every residual, and {@value NormKernels#MUL_ROW_SCALE} when a layer has
+     * {@value NormKernels#RESIDUAL_MIX} for every residual, {@value NormKernels#RESIDUAL_MIX_NORM} when a layer
+     * fuses its residual with a row norm, and {@value NormKernels#MUL_ROW_SCALE} when a layer has
      * {@code layer_output_scale} or a weighted-input post-FFN norm, or the schedule is HRM.
      */
     private void prewarmKernels(boolean hrm) {
         long[] size = {local};
         ops.prewarm(NormKernels.RESIDUAL_MIX, size);
         boolean rowScale = hrm;
+        boolean mixNorm = false;
         for (LayerBlocks l : layers) {
             rowScale |= l.outScale != null || (l.postFfn != null && l.postFfn.weightFirst);
+            mixNorm |= l.carriesFfnResidual || (l.ffn != null && l.ffnNorm != null && !l.sharedFfnNorm);
+        }
+        if (mixNorm) {
+            ops.prewarm(NormKernels.RESIDUAL_MIX_NORM, size);
         }
         if (rowScale) {
             ops.prewarm(NormKernels.MUL_ROW_SCALE, size);
@@ -339,6 +406,66 @@ public final class GpuLayerExecutor implements AutoCloseable {
         return layers.get(layers.size() - 1).streamWidth;
     }
 
+    /** The stack's slot count. */
+    public int layerCount() {
+        return layers.size();
+    }
+
+    /** The spec of slot {@code i}. */
+    public LayerSpec spec(int i) {
+        return layers.get(i).spec;
+    }
+
+    /** The mixer of slot {@code i}, or null when the layer has none. */
+    public GpuMixer mixer(int i) {
+        return layers.get(i).mixer;
+    }
+
+    /**
+     * Installs the running tree round (a tree verify's masked step over a recurrent target); the mixer blocks
+     * route the recurrent layers' steps through it while it is set, and the caller clears it after the step.
+     */
+    public void recurrentTreeRound(GpuRecurrentTreeRound r) {
+        this.round = r;
+    }
+
+    /**
+     * Whether a decode step of this stack enqueues only kernel dispatches, which the decode-step replay records.
+     * False when a layer's FFN block reads step results back to the host (a hosted MoE expert pass).
+     */
+    public boolean capturableDecode() {
+        ensureOpen();
+        for (LayerBlocks l : layers) {
+            if (l.ffn != null && !l.ffn.capturableDecode()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The decode-replay patchers of every mixer this stack's decode step runs: each layer's mixer, its parallel
+     * attention and its cross attention, in trunk order. A graph plan claims the captured dispatches of the
+     * step with them and patches the per-step values the decode body would re-set. Empty when no mixer has
+     * per-step derivable kernel values.
+     */
+    public List<GpuStepPatcher> decodeReplayPatchers() {
+        ensureOpen();
+        List<GpuStepPatcher> out = new ArrayList<>();
+        for (LayerBlocks l : layers) {
+            if (l.mixer != null) {
+                out.addAll(l.mixer.decodeReplayPatchers());
+            }
+            if (l.parallelAttention != null) {
+                out.addAll(l.parallelAttention.decodeReplayPatchers());
+            }
+            if (l.crossMixer != null) {
+                out.addAll(l.crossMixer.decodeReplayPatchers());
+            }
+        }
+        return out;
+    }
+
     /**
      * Starts making the first layer's weights resident, so a streamed upload overlaps the embedding stage of the
      * step; {@link #run} prefetches it again (a no-op once started) for callers that skip this.
@@ -387,18 +514,309 @@ public final class GpuLayerExecutor implements AutoCloseable {
             if (hrm && schedule.passStart(i)) {
                 mix(MixMode.ADD, 1.0f, hrmHigh, hrmLow, nTokens * hrmWidth);
             }
+            repeatBeforeSlot(i, nTokens);
+            if (sink.wants(i) && pendingMix != null) {
+                flushPendingMix();
+            }
             if (sink.wants(i)) {
                 sink.capture(i, x, nTokens, l.streamWidth);
             }
             runLayer(l, pos0, nTokens, mode);
+            repeatAfterSlot(i, nTokens);
             if (hrm && schedule.passEnd(i)) {
                 endHrmPass(i, l, nTokens);
             }
             ctx.queue().flush();
         }
+        flushPendingMix();
         int out = layers.size();
         if (sink.wants(out)) {
             sink.capture(out, x, nTokens, outputWidth());
+        }
+    }
+
+    /**
+     * Enqueues every layer's cache writes alone: the extras' pre-block hooks, the attention norm and the mixer's
+     * cache-write-only step ({@link GpuMixer#prefillKV}). A layer whose mixer has no such step runs its whole
+     * attention part instead ({@link #mixerBlock}), so its caches are written either way. A step whose stack output
+     * no reader consumes thus stops at the K/V projections and the store; {@code X} is left mid-layer. The queue is
+     * flushed after every layer, as {@link #run} does.
+     *
+     * @throws IllegalArgumentException as {@link #run(int, int, StepMode, TapSink)}
+     * @throws IllegalStateException    when the stack is a looped schedule (HRM), whose passes read the stream
+     *                                  between layers
+     */
+    public void runKV(int pos0, int nTokens, StepMode mode) {
+        ensureOpen();
+        Objects.requireNonNull(mode, "mode");
+        if (hrmHigh != null) {
+            throw new IllegalStateException("a looped-schedule stack cannot run its cache writes only");
+        }
+        if (nTokens < 1 || nTokens > ubatch) {
+            throw new IllegalArgumentException("step of " + nTokens + " tokens outside [1, " + ubatch + "]");
+        }
+        if (mode == StepMode.DECODE && nTokens != 1) {
+            throw new IllegalArgumentException("DECODE steps carry one token, got " + nTokens);
+        }
+        if (pos0 < 0) {
+            throw new IllegalArgumentException("step position " + pos0 + " is negative");
+        }
+        LayerWeightSource ws = ctx.weightSource();
+        for (int i = 0; i < layers.size(); i++) {
+            LayerBlocks l = layers.get(i);
+            if (i + 1 < layers.size()) {
+                ws.prefetch(layers.get(i + 1).spec.weightLayer());
+            }
+            ws.await(l.spec.weightLayer());
+            int streamLen = nTokens * l.streamWidth;
+            if (l.keepInput) {
+                ops.copy(x.buffer(), x.offset(), layerInput.buffer(), layerInput.offset(), streamLen);
+            }
+            for (GpuLayerExtra e : l.extras) {
+                e.beforeBlock(pos0, nTokens, x);
+            }
+            mixerBlockKV(l, pos0, nTokens, mode);
+            ctx.queue().flush();
+        }
+        flushPendingMix();
+    }
+
+    /**
+     * The cache-write-only form of steps 2-6: the attention norm and the mixer's {@link GpuMixer#prefillKV}. The
+     * branch norms, the extras' mixer hooks, the residual and the post-LN steps are skipped, since no reader consumes
+     * the layer output. A layer whose mixer (or parallel attention) has no cache-write-only step falls back to
+     * {@link #mixerBlock}, whose attention part writes the same caches.
+     */
+    private void mixerBlockKV(LayerBlocks l, int pos0, int n, StepMode mode) {
+        if (l.mixer == null) {
+            return;
+        }
+        ScratchSlot in = x;
+        if (l.attnNorm != null) {
+            stageNorm(l.spec.il(), ExecutionObserver.Stage.ATTN_NORM, l.attnNorm, l, x, normed, n);
+            in = normed;
+        }
+        if (!kvOnlyCapable(l)) {
+            mixerBlock(l, pos0, n, mode, in);
+            return;
+        }
+        l.mixer.prefillKV(pos0, n, in);
+        if (l.parallelAttention != null) {
+            l.parallelAttention.prefillKV(pos0, n, in);
+        }
+    }
+    /**
+     * Whether a layer's whole attention part can be reduced to its cache writes: the mixer and any parallel
+     * attention have a cache-write-only step, and no cross attention feeds the mixer a different input.
+     */
+    private static boolean kvOnlyCapable(LayerBlocks l) {
+        return l.mixer.kvRefusal() == null
+                && (l.parallelAttention == null || l.parallelAttention.kvRefusal() == null)
+                && l.crossMixer == null;
+    }
+
+    /**
+     * Enqueues every layer over the rows of a {@link StepLayout}: {@link #run(int, int, StepMode, TapSink)} for a
+     * contiguous un-paged step, the batched step otherwise — every mixer steps over the layout's segments through
+     * the batched hooks ({@code GpuMixer.batch}, {@code GpuLayerExtra} batched forms), whose paged steps address
+     * the KV rows through the memory's current {@code PagedStep}. {@code X} holds the stack input on entry and the
+     * stack output afterwards. The queue is flushed after every layer.
+     *
+     * @throws IllegalArgumentException when the step holds more rows than the ubatch
+     * @throws UnsupportedOperationException when a mixer or extra refuses the batched step
+     */
+    public void run(StepLayout s, TapSink taps) {
+        ensureOpen();
+        Objects.requireNonNull(s, "s");
+        int n = s.nTokens();
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("step of " + n + " tokens outside [1, " + ubatch + "]");
+        }
+        if (s.contiguousSingle()) {
+            run(s.pos0(0), n, ctx.hasMemory() && n == 1 ? StepMode.DECODE : StepMode.PREFILL, taps);
+            return;
+        }
+        TapSink sink = taps != null ? taps : TapSink.NONE;
+        LayerWeightSource ws = ctx.weightSource();
+        boolean hrm = hrmHigh != null;
+        if (hrm) {
+            startHrm(n);
+        }
+        ws.prefetch(layers.get(0).spec.weightLayer());
+        for (int i = 0; i < layers.size(); i++) {
+            LayerBlocks l = layers.get(i);
+            if (i + 1 < layers.size()) {
+                ws.prefetch(layers.get(i + 1).spec.weightLayer());
+            }
+            ws.await(l.spec.weightLayer());
+            if (hrm && schedule.passStart(i)) {
+                mix(MixMode.ADD, 1.0f, hrmHigh, hrmLow, n * hrmWidth);
+            }
+            repeatBeforeSlot(i, n);
+            if (sink.wants(i) && pendingMix != null) {
+                flushPendingMix();
+            }
+            if (sink.wants(i)) {
+                sink.capture(i, x, n, l.streamWidth);
+            }
+            runLayerBatched(l, s);
+            repeatAfterSlot(i, n);
+            if (hrm && schedule.passEnd(i)) {
+                endHrmPass(i, l, n);
+            }
+            ctx.queue().flush();
+        }
+        flushPendingMix();
+        int out = layers.size();
+        if (sink.wants(out)) {
+            sink.capture(out, x, n, outputWidth());
+        }
+    }
+
+    /** One layer over a batched step: the extras' and mixers' batched hooks instead of the contiguous ones. */
+    private void runLayerBatched(LayerBlocks l, StepLayout s) {
+        ExecutionObserver obs = ctx.observer();
+        boolean observed = obs.enabled();
+        int il = l.spec.il();
+        int n = s.nTokens();
+        if (observed) {
+            obs.onStageStart(il, ExecutionObserver.Stage.LAYER);
+        }
+        int streamLen = n * l.streamWidth;
+        if (l.keepInput) {
+            ops.copy(x.buffer(), x.offset(), layerInput.buffer(), layerInput.offset(), streamLen);
+        }
+        for (GpuLayerExtra e : l.extras) {
+            e.beforeBlock(s, x);
+        }
+        ScratchSlot deferred = mixerBlockBatched(l, s);
+        if (l.crossMixer != null) {
+            crossBlockBatched(l, s);
+        }
+        ffnBlock(l, s.pos0(0), n, deferred);
+        if (l.discard) {
+            ops.copy(layerInput.buffer(), layerInput.offset(), x.buffer(), x.offset(), streamLen);
+        }
+        for (GpuLayerExtra e : l.extras) {
+            e.afterBlock(s, x);
+        }
+        if (l.outScale != null) {
+            ops.enqueue(NormKernels.MUL_ROW_SCALE, global(streamLen), new long[]{local},
+                    NormKernels.mulRowScaleArgs(n, l.streamWidth, l.outScale.shard(0), (int) l.outScale.cols(),
+                            x.buffer()));
+        }
+        if (l.blockScale != 1.0f) {
+            ops.scale(x.buffer(), x.offset(), streamLen, l.blockScale);
+        }
+        if (observed) {
+            flushPendingMix();
+            obs.onStageEnd(il, ExecutionObserver.Stage.LAYER, x, n, l.streamWidth);
+        }
+    }
+
+    /** Steps 2-6 over a batched step. Returns the mixer branch of a PARALLEL residual, else null. */
+    private ScratchSlot mixerBlockBatched(LayerBlocks l, StepLayout s) {
+        int il = l.spec.il();
+        int n = s.nTokens();
+        int len = n * l.width;
+        if (l.mixer == null) {
+            if (l.sharedFfnNorm) {
+                stageNorm(il, ExecutionObserver.Stage.ATTN_NORM, l.attnNorm, l, x, normed, n);
+            }
+            return null;
+        }
+        ScratchSlot in = x;
+        if (l.attnNorm != null) {
+            stageNorm(il, ExecutionObserver.Stage.ATTN_NORM, l.attnNorm, l, x, normed, n);
+            in = normed;
+        }
+        ScratchSlot out = l.kind == ResidualKind.PARALLEL ? parallel : branch;
+        ExecutionObserver obs = ctx.observer();
+        boolean observed = obs.enabled();
+        if (observed) {
+            obs.onStageStart(il, ExecutionObserver.Stage.MIXER);
+        }
+        if (!mixerTreeStep(l, n, in, out)) {
+            l.mixer.batch(s, in, out);
+        }
+        if (l.parallelAttention != null) {
+            l.parallelAttention.batch(s, in, second);
+            ops.add(out.buffer(), out.offset(), second.buffer(), second.offset(), out.buffer(), out.offset(), len);
+        }
+        if (l.postAttn != null) {
+            norm(l.postAttn, l, out, out, n);
+        }
+        if (l.attnOutBranch != null) {
+            norm(l.attnOutBranch, l, out, out, n);
+        }
+        if (observed) {
+            obs.onStageEnd(il, ExecutionObserver.Stage.MIXER, out, n, l.width);
+            obs.onStageStart(il, ExecutionObserver.Stage.MIXER_RESIDUAL);
+        }
+        boolean consumed = false;
+        for (GpuLayerExtra e : l.extras) {
+            consumed |= e.afterMixer(s, x, out);
+        }
+        ScratchSlot deferred = null;
+        if (!consumed) {
+            requireNotHc(l, "afterMixer");
+            if (l.mixerResidual) {
+                if (l.kind == ResidualKind.PARALLEL) {
+                    deferred = out;
+                } else {
+                    residual(l, in, out, len, false);
+                }
+            }
+        }
+        if (l.postLnAttn != null) {
+            norm(l.postLnAttn, l, x, x, n);
+            if (l.postLnAttn2 != null) {
+                mix(MixMode.ADD, 1.0f, x, layerInput, len);
+                norm(l.postLnAttn2, l, x, x, n);
+            }
+        }
+        if (observed) {
+            flushPendingMix();
+            obs.onStageEnd(il, ExecutionObserver.Stage.MIXER_RESIDUAL, x, n, l.streamWidth);
+        }
+        return deferred;
+    }
+
+    /**
+     * The recurrent tree step of the running round: captures the step's mixer-input rows for the round's replay,
+     * then runs every computed row through the mixer against its stack slot (the rows of a padding tail stay
+     * uncomputed — no reader consumes them). False when no round runs or this layer's mixer keeps no recurrent
+     * tree step, so the normal batched step runs instead; the layer's other sub-blocks (a hybrid layer's parallel
+     * attention, the norms, the residual) always run their normal step, which the tree mask makes per-path correct.
+     */
+    private boolean mixerTreeStep(LayerBlocks l, int n, ScratchSlot in, ScratchSlot out) {
+        GpuRecurrentTreeRound r = round;
+        if (r == null || !(l.mixer instanceof GpuRecurrentTreeMixer)) {
+            return false;
+        }
+        r.captureInput(l.spec.il(), in, n);
+        ((GpuRecurrentTreeMixer) l.mixer).treeStep(r, in, out);
+        return true;
+    }
+
+    /** T5 decoder cross attention over a batched step (t5.cpp:178-206). */
+    private void crossBlockBatched(LayerBlocks l, StepLayout s) {
+        int il = l.spec.il();
+        int n = s.nTokens();
+        stageNorm(il, ExecutionObserver.Stage.ATTN_NORM, l.crossNorm, l, x, normed, n);
+        ExecutionObserver obs = ctx.observer();
+        boolean observed = obs.enabled();
+        if (observed) {
+            obs.onStageStart(il, ExecutionObserver.Stage.MIXER);
+        }
+        l.crossMixer.batch(s, normed, branch);
+        if (observed) {
+            obs.onStageEnd(il, ExecutionObserver.Stage.MIXER, branch, n, l.width);
+            obs.onStageStart(il, ExecutionObserver.Stage.MIXER_RESIDUAL);
+        }
+        mix(MixMode.ADD, 1.0f, x, branch, n * l.width);
+        if (observed) {
+            obs.onStageEnd(il, ExecutionObserver.Stage.MIXER_RESIDUAL, x, n, l.streamWidth);
         }
     }
 
@@ -409,6 +827,24 @@ public final class GpuLayerExecutor implements AutoCloseable {
         if (observed) {
             obs.onStageStart(il, ExecutionObserver.Stage.LAYER);
         }
+        ScratchSlot in = runLayerNorm(l.spec.il(), pos0, n);
+        ScratchSlot deferred = runLayerAttention(l.spec.il(), pos0, n, mode, in);
+        runLayerPost(l.spec.il(), pos0, n, deferred);
+        if (observed) {
+            flushPendingMix();
+            obs.onStageEnd(il, ExecutionObserver.Stage.LAYER, x, n, l.streamWidth);
+        }
+    }
+
+    /**
+     * The first phase of layer {@code il}'s contiguous blocks: the layer-input copy, the extras' pre-block hooks and
+     * the attention norm. Returns the (normed) input the mixer blocks read; pass it to
+     * {@link #runLayerAttention}. A stack runs whole through {@link #run}; the phase entries exist for the prefill
+     * context-parallel coordinator, which interleaves the ranks layer by layer between the phases.
+     */
+    public ScratchSlot runLayerNorm(int il, int pos0, int n) {
+        ensureOpen();
+        LayerBlocks l = layerAt(il);
         int streamLen = n * l.streamWidth;
         if (l.keepInput) {
             ops.copy(x.buffer(), x.offset(), layerInput.buffer(), layerInput.offset(), streamLen);
@@ -416,9 +852,35 @@ public final class GpuLayerExecutor implements AutoCloseable {
         for (GpuLayerExtra e : l.extras) {
             e.beforeBlock(pos0, n, x);
         }
-        ScratchSlot deferred = mixerBlock(l, pos0, n, mode);
+        ScratchSlot in = x;
+        if ((l.mixer != null || l.sharedFfnNorm) && l.attnNorm != null) {
+            stageNorm(il, ExecutionObserver.Stage.ATTN_NORM, l.attnNorm, l, x, normed, n);
+            in = normed;
+        }
+        return in;
+    }
+
+    /**
+     * The mixer phase of layer {@code il}'s contiguous blocks: the mixer (and any parallel attention) over
+     * {@code in}, the branch norms, the extras' mixer hooks, the residual and the post-attention norms. Returns the
+     * branch a PARALLEL residual defers to the FFN phase; pass it to {@link #runLayerPost}.
+     */
+    public ScratchSlot runLayerAttention(int il, int pos0, int n, StepMode mode, ScratchSlot in) {
+        ensureOpen();
+        return mixerBlock(layerAt(il), pos0, n, mode, in);
+    }
+
+    /**
+     * The last phase of layer {@code il}'s contiguous blocks: the cross attention (when the layer has one), the FFN
+     * block, the discard, the extras' after-block hooks and the output scales. {@code deferred} is the branch
+     * {@link #runLayerAttention} returned.
+     */
+    public void runLayerPost(int il, int pos0, int n, ScratchSlot deferred) {
+        ensureOpen();
+        LayerBlocks l = layerAt(il);
+        int streamLen = n * l.streamWidth;
         if (l.crossMixer != null) {
-            crossBlock(l, pos0, n, mode);
+            crossBlock(l, pos0, n, StepMode.PREFILL);
         }
         ffnBlock(l, pos0, n, deferred);
         if (l.discard) {
@@ -435,27 +897,27 @@ public final class GpuLayerExecutor implements AutoCloseable {
         if (l.blockScale != 1.0f) {
             ops.scale(x.buffer(), x.offset(), streamLen, l.blockScale);
         }
-        if (observed) {
-            obs.onStageEnd(il, ExecutionObserver.Stage.LAYER, x, n, l.streamWidth);
+    }
+
+    private LayerBlocks layerAt(int il) {
+        for (LayerBlocks l : layers) {
+            if (l.spec.il() == il) {
+                return l;
+            }
         }
+        throw new IllegalArgumentException("layer " + il + " is not one of this executor's "
+                + layers.size() + " layers");
     }
 
     /**
-     * Steps 2-6. Returns the mixer branch when a PARALLEL residual defers its add to step 11, else null.
+     * Steps 3-6 over the (normed) input {@code in} the norm phase produced. Returns the mixer branch when a
+     * PARALLEL residual defers its add to step 11, else null.
      */
-    private ScratchSlot mixerBlock(LayerBlocks l, int pos0, int n, StepMode mode) {
+    private ScratchSlot mixerBlock(LayerBlocks l, int pos0, int n, StepMode mode, ScratchSlot in) {
         int il = l.spec.il();
         int len = n * l.width;
         if (l.mixer == null) {
-            if (l.sharedFfnNorm) {
-                stageNorm(il, ExecutionObserver.Stage.ATTN_NORM, l.attnNorm, l, x, normed, n);
-            }
             return null;
-        }
-        ScratchSlot in = x;
-        if (l.attnNorm != null) {
-            stageNorm(il, ExecutionObserver.Stage.ATTN_NORM, l.attnNorm, l, x, normed, n);
-            in = normed;
         }
         ScratchSlot out = l.kind == ResidualKind.PARALLEL ? parallel : branch;
         ExecutionObserver obs = ctx.observer();
@@ -501,6 +963,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
             }
         }
         if (observed) {
+            flushPendingMix();
             obs.onStageEnd(il, ExecutionObserver.Stage.MIXER_RESIDUAL, x, n, l.streamWidth);
         }
         return deferred;
@@ -577,6 +1040,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
             norm(l.postLnLayer, l, x, x, n);
         }
         if (observed) {
+            flushPendingMix();
             obs.onStageEnd(il, ExecutionObserver.Stage.FFN_RESIDUAL, x, n, l.streamWidth);
         }
     }
@@ -590,16 +1054,17 @@ public final class GpuLayerExecutor implements AutoCloseable {
 
     /**
      * {@code x} joins {@code branch} by the layer's residual kind; {@code in} is the sub-block's (normed) input and
-     * {@code ffn} tells the FFN sub-block from the mixer.
+     * {@code ffn} tells the FFN sub-block from the mixer. The add and scaled residuals hold back for fusion with the
+     * next row norm of the stream ({@link #deferOrMix}) where the launches between them are exactly that norm.
      */
     private void residual(LayerBlocks l, ScratchSlot in, ScratchSlot branchOut, int len, boolean ffn) {
         switch (l.kind) {
             case STANDARD:
             case PARALLEL:
-                mix(MixMode.ADD, 1.0f, x, branchOut, len);
+                deferOrMix(MixMode.ADD, 1.0f, branchOut, len, l, ffn);
                 break;
             case SCALED:
-                mix(MixMode.SCALED, l.residualScale, x, branchOut, len);
+                deferOrMix(MixMode.SCALED, l.residualScale, branchOut, len, l, ffn);
                 break;
             case NORMED_INPUT_SCALED:
                 mix(MixMode.NORMED_INPUT_SCALED, l.residualScale, in, branchOut, len);
@@ -610,9 +1075,89 @@ public final class GpuLayerExecutor implements AutoCloseable {
                 mix(MixMode.SCALED, r.branchScale(ffn), x, branchOut, len);
                 break;
             }
+            case SLERP:
+                slerp(l, in, branchOut, len, ffn);
+                break;
             default:
                 throw new IllegalStateException("layer " + l.spec.il() + ": no executor residual for " + l.kind);
         }
+    }
+
+    /** A residual mix held back for {@link #consumePendingMix}: the add it owes {@code x}, its scale and shape. */
+    private static final class PendingMix {
+        final MixMode mode;
+        final float s;
+        final ScratchSlot addend;
+        final int nRows;
+        final int width;
+
+        PendingMix(MixMode mode, float s, ScratchSlot addend, int nRows, int width) {
+            this.mode = mode;
+            this.s = s;
+            this.addend = addend;
+            this.nRows = nRows;
+            this.width = width;
+        }
+    }
+
+    /**
+     * Launches {@code x = mix(x, addend)} ({@value NormKernels#RESIDUAL_MIX}) or, when the launches that follow
+     * before {@code x} is read again are exactly one row norm of {@code x}, holds the mix back for
+     * {@link NormKernels#RESIDUAL_MIX_NORM}. The mixer and FFN residuals of the add and scaled kinds fuse with the
+     * layer's FFN norm ({@code nextFfnNorm} false, a sub-block residual) or, at {@code carriesFfnResidual}, with
+     * the next layer's attention norm. An {@link ExecutionObserver} sees the streams at stage boundaries, so an
+     * observed step applies the pending mix first and runs the two launches it would without the fusion.
+     */
+    private void deferOrMix(MixMode mode, float s, ScratchSlot addend, int len, LayerBlocks l, boolean nextFfnNorm) {
+        int n = len / l.width;
+        boolean deferrable = (mode == MixMode.ADD || mode == MixMode.SCALED) && n >= 1
+                && (nextFfnNorm ? l.carriesFfnResidual : canFuseIntoFfnNorm(l));
+        if (!deferrable) {
+            mix(mode, s, x, addend, len);
+            return;
+        }
+        pendingMix = new PendingMix(mode, s, addend, n, l.width);
+    }
+
+    /**
+     * Whether this layer's next launch reading {@code x} is the FFN sub-block's input norm: the mixer residual
+     * fuses into it when no in-place post-attention norm sits between them.
+     */
+    private static boolean canFuseIntoFfnNorm(LayerBlocks l) {
+        return l.postLnAttn == null && l.ffn != null && l.ffnNorm != null && !l.sharedFfnNorm
+                && l.width == l.streamWidth;
+    }
+
+    /** Applies a held-back residual mix as its own launch ({@value NormKernels#RESIDUAL_MIX}). */
+    private void flushPendingMix() {
+        if (pendingMix == null) {
+            return;
+        }
+        PendingMix p = pendingMix;
+        pendingMix = null;
+        mix(p.mode, p.s, x, p.addend, p.nRows * p.width);
+    }
+
+    /**
+     * Launches a held-back residual mix and the norm of {@code dst} as one {@value NormKernels#RESIDUAL_MIX_NORM}
+     * dispatch when both are the plain forms the kernel provides: {@code src} is the stream, the norm is an
+     * ungrouped row norm without the weighted-input form, the shapes match and the backend provides the kernel.
+     *
+     * @return true when the fused launch replaced the pending mix and this norm; false leaves the pending mix for
+     *         the caller to flush and this norm to run as it would
+     */
+    private boolean consumePendingMix(Norm nw, LayerBlocks l, ScratchSlot src, ScratchSlot dst, int n, float eps) {
+        PendingMix p = pendingMix;
+        if (src != x || nw.groups > 1 || nw.weightFirst || dst == x || n != p.nRows || l.width != p.width) {
+            return false;
+        }
+        if (!ops.residualMixNorm(p.mode, p.s, l.normKind, nw.weight, nw.bias, eps,
+                x.buffer(), x.offset(), p.addend.buffer(), p.addend.offset(), dst.buffer(), dst.offset(),
+                n, l.width)) {
+            return false;
+        }
+        pendingMix = null;
+        return true;
     }
 
     /** {@code X = mix(inp, cur)} over {@code n} floats ({@value NormKernels#RESIDUAL_MIX}). */
@@ -620,6 +1165,29 @@ public final class GpuLayerExecutor implements AutoCloseable {
         ops.enqueue(NormKernels.RESIDUAL_MIX, global(n), new long[]{local},
                 NormKernels.residualMixArgs(mode, n, s, inp.buffer(), inp.offset(), cur.buffer(), cur.offset(),
                         placeholder, placeholder, 1, x.buffer(), x.offset(), placeholder));
+    }
+
+    /**
+     * Dory's slerp residual on the GPU: {@code justNorm(justNorm(a) + lr * (justNorm(b) - justNorm(a)))} over each
+     * row, with the sub-block's per-element {@code lr} and its complement ({@link MixMode#ALPHA_BETA}).
+     */
+    private void slerp(LayerBlocks l, ScratchSlot in, ScratchSlot branchOut, int len, boolean ffn) {
+        GpuWeight lr = ffn ? l.ffnSlerpLr : l.attnSlerpLr;
+        GpuWeight oneMinus = ffn ? l.ffnSlerpOneMinus : l.attnSlerpOneMinus;
+        if (lr == null || slerpA == null) {
+            throw new IllegalStateException("layer " + l.spec.il() + ": no slerp alpha for the "
+                    + (ffn ? "FFN" : "mixer") + " sub-block");
+        }
+        int n = len / l.width;
+        ops.norm(NormKind.L2_GDN, null, null, l.normEps, in.buffer(), in.offset(), slerpA.buffer(),
+                slerpA.offset(), n, l.width);
+        ops.norm(NormKind.L2_GDN, null, null, l.normEps, branchOut.buffer(), branchOut.offset(), slerpB.buffer(),
+                slerpB.offset(), n, l.width);
+        ops.enqueue(NormKernels.RESIDUAL_MIX, global(len), new long[]{local},
+                NormKernels.residualMixArgs(MixMode.ALPHA_BETA, len, 1.0f, slerpA.buffer(), slerpA.offset(),
+                        slerpB.buffer(), slerpB.offset(), oneMinus.shard(0), lr.shard(0), l.width, x.buffer(),
+                        x.offset(), placeholder));
+        ops.norm(NormKind.L2_GDN, null, null, l.normEps, x.buffer(), x.offset(), x.buffer(), x.offset(), n, l.width);
     }
 
     private void stageNorm(int il, ExecutionObserver.Stage stage, Norm nw, LayerBlocks l, ScratchSlot src,
@@ -637,6 +1205,12 @@ public final class GpuLayerExecutor implements AutoCloseable {
 
     private void norm(Norm nw, LayerBlocks l, ScratchSlot src, ScratchSlot dst, int n) {
         float eps = Float.isNaN(nw.eps) ? l.normEps : nw.eps;
+        if (pendingMix != null) {
+            if (consumePendingMix(nw, l, src, dst, n, eps)) {
+                return;
+            }
+            flushPendingMix();
+        }
         if (nw.groups > 1) {
             int rows = n * nw.groups;
             int slice = l.width / nw.groups;
@@ -665,6 +1239,52 @@ public final class GpuLayerExecutor implements AutoCloseable {
             m.decode(pos0, in, out);
         } else {
             m.prefill(pos0, n, in, out);
+        }
+    }
+
+    // ================================================================== repeat schedules
+
+    /**
+     * {@link LayerSchedule.LoopCombine#JUSTNORM} before slot {@code i}: keep the stream entering the repeated block,
+     * start each pass from {@code justNorm(state + input)} (Dory's {@code combined = justnorm(state + input_h)}).
+     */
+    private void repeatBeforeSlot(int i, int n) {
+        if (!repeatCombine) {
+            return;
+        }
+        int len = n * repeatWidth;
+        if (i == 0 && schedule.nInputLayers() == 0) {
+            ops.copy(x.buffer(), x.offset(), repeatInput.buffer(), repeatInput.offset(), len);
+        }
+        if (i == schedule.recurrentStart()) {
+            ops.copy(repeatInput.buffer(), repeatInput.offset(), repeatState.buffer(), repeatState.offset(), len);
+        }
+        if (schedule.loopStart(i)) {
+            mix(MixMode.ADD, 1.0f, repeatState, repeatInput, len);
+            ops.norm(NormKind.L2_GDN, null, null, schedule.loopEps(), x.buffer(), x.offset(), x.buffer(), x.offset(),
+                    n, repeatWidth);
+        }
+    }
+
+    /**
+     * {@link LayerSchedule.LoopCombine#JUSTNORM} after slot {@code i}: a pass ends with {@code state = justNorm(x)};
+     * the input stream is captured after the last input layer, and the first output layer starts from the state.
+     */
+    private void repeatAfterSlot(int i, int n) {
+        if (!repeatCombine) {
+            return;
+        }
+        int len = n * repeatWidth;
+        if (schedule.loopEnd(i)) {
+            ops.norm(NormKind.L2_GDN, null, null, schedule.loopEps(), x.buffer(), x.offset(), x.buffer(), x.offset(),
+                    n, repeatWidth);
+            ops.copy(x.buffer(), x.offset(), repeatState.buffer(), repeatState.offset(), len);
+        }
+        if (i == schedule.nInputLayers() - 1) {
+            ops.copy(x.buffer(), x.offset(), repeatInput.buffer(), repeatInput.offset(), len);
+        }
+        if (i + 1 == schedule.recurrentEnd() && schedule.nOutputLayers() > 0) {
+            ops.copy(repeatState.buffer(), repeatState.offset(), x.buffer(), x.offset(), len);
         }
     }
 
@@ -704,6 +1324,23 @@ public final class GpuLayerExecutor implements AutoCloseable {
             GpuMixer owner = l.cacheMixer();
             if (owner != null) {
                 owner.shiftContext(nKeep, nDiscard);
+            }
+        }
+    }
+
+    /**
+     * Re-rotates every cache-owning mixer by the memory's last per-row shift deltas, without a keep/discard rule:
+     * the position edits ({@code seq_add}, {@code seq_div}) re-rotate by the same {@code shift_delta} buffer a
+     * paged shift fills.
+     *
+     * @throws UnsupportedOperationException when a cache-owning mixer cannot shift its memory
+     */
+    public void applyShiftDeltas() {
+        ensureOpen();
+        for (LayerBlocks l : layers) {
+            GpuMixer owner = l.cacheMixer();
+            if (owner != null) {
+                owner.applyShiftDeltas();
             }
         }
     }
@@ -933,9 +1570,16 @@ public final class GpuLayerExecutor implements AutoCloseable {
         Norm ffnNorm;
         Norm postFfn;
         boolean sharedFfnNorm;
+        /** Whether the FFN residual may fuse with the next layer's attention norm; set by the executor. */
+        boolean carriesFfnResidual;
         GpuWeight outScale;
         /** Adaptive conditioning of {@link #ffnNorm}'s output, or null. */
         GpuAdaNorm.Layer ada;
+        /** SLERP residual: {@code |alpha * scale|} and its complement per sub-block; null without SLERP. */
+        GpuWeight attnSlerpLr;
+        GpuWeight attnSlerpOneMinus;
+        GpuWeight ffnSlerpLr;
+        GpuWeight ffnSlerpOneMinus;
 
         private LayerBlocks(ModelSpec model, LayerSpec spec) {
             this.spec = spec;
@@ -1000,6 +1644,7 @@ public final class GpuLayerExecutor implements AutoCloseable {
             LayerBlocks b = new LayerBlocks(ctx.spec(), spec);
             try {
                 b.resolveNorms(ctx, names);
+                b.bindSlerp(ctx, names);
                 b.bindBlocks(ctx, registry);
             } catch (RuntimeException e) {
                 b.close(e);
@@ -1086,8 +1731,56 @@ public final class GpuLayerExecutor implements AutoCloseable {
             }
         }
 
-        private Norm ffnInputNorm(GpuWeights w, String arch, NormNames names, NormSpec ns, boolean weightless) {
-            boolean expected = ns.ffnNorm() || ns.ffnInputIsPostAttnNorm()
+        /**
+         * SLERP residuals: the per-element {@code |alpha * slerpScale|} of each sub-block and its complement,
+         * uploaded as two F32 vectors this layer owns.
+         */
+        private void bindSlerp(GpuForwardContext ctx, NormNames names) {
+            if (kind != ResidualKind.SLERP) {
+                return;
+            }
+            ResidualSpec r = spec.residual();
+            attnSlerpLr = slerpVector(ctx, r.attnSlerp(), true);
+            attnSlerpOneMinus = slerpVector(ctx, r.attnSlerp(), false);
+            ffnSlerpLr = slerpVector(ctx, r.ffnSlerp(), true);
+            ffnSlerpOneMinus = slerpVector(ctx, r.ffnSlerp(), false);
+        }
+
+        private GpuWeight slerpVector(GpuForwardContext ctx, TensorRef ref, boolean lr) {
+            if (ref == null) {
+                return null;
+            }
+            GpuWeights weights = ctx.weightSource().weightsFor(spec.weightLayer());
+            String arch = ctx.spec().arch().ggufName();
+            GpuWeight alpha = vector(weights, arch, ref.name());
+            if (alpha.cols() != width) {
+                throw new IllegalArgumentException(arch + " layer " + spec.il() + ": " + ref.name() + " must hold "
+                        + width + " values, got " + alpha.cols());
+            }
+            LayerWeightSource source = ctx.weightSource();
+            source.prefetch(spec.weightLayer());
+            source.await(spec.weightLayer());
+            float[] host = new float[width];
+            GpuEvent read = ctx.queue().enqueueReadBuffer(alpha.shard(0), 0, (long) width * Float.BYTES, host);
+            if (read != null) {
+                read.close();
+            }
+            ctx.queue().finish();
+            float[] values = new float[width];
+            float scale = spec.residual().slerpScale();
+            for (int i = 0; i < width; i++) {
+                float v = Math.abs(host[i] * scale);
+                values[i] = lr ? v : 1.0f - v;
+            }
+            GpuBuffer buffer = ctx.backend().allocateBuffer((long) width * Float.BYTES, true);
+            GpuEvent write = ctx.queue().enqueueWriteBuffer(buffer, 0, (long) width * Float.BYTES, values);
+            if (write != null) {
+                write.close();
+            }
+            return GpuWeight.of(ref.name() + (lr ? ".lr" : ".inv"), GGMLType.F32, new long[]{width}, buffer);
+        }
+
+        private Norm ffnInputNorm(GpuWeights w, String arch, NormNames names, NormSpec ns, boolean weightless) {            boolean expected = ns.ffnNorm() || ns.ffnInputIsPostAttnNorm()
                     || (ns.attnNorm2() && spec.residual().ffnUsesAttnNorm2());
             if (!expected) {
                 return null;
@@ -1212,7 +1905,21 @@ public final class GpuLayerExecutor implements AutoCloseable {
             crossMixer = null;
             ffn = null;
             extras.clear();
+            closeOwned(attnSlerpLr);
+            closeOwned(attnSlerpOneMinus);
+            closeOwned(ffnSlerpLr);
+            closeOwned(ffnSlerpOneMinus);
+            attnSlerpLr = null;
+            attnSlerpOneMinus = null;
+            ffnSlerpLr = null;
+            ffnSlerpOneMinus = null;
             return err;
+        }
+
+        private static void closeOwned(GpuWeight w) {
+            if (w != null) {
+                w.shard(0).close();
+            }
         }
     }
 }

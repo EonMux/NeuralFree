@@ -35,6 +35,26 @@ public final class BroadcastEngine {
         return Shape.of(resultDims);
     }
 
+    /**
+     * Whether broadcasting {@code smaller} to {@code larger} succeeds and gives exactly {@code larger}: no higher
+     * rank, and every aligned dim equal to {@code larger}'s or 1 where {@code larger} has more than 1. Unlike
+     * {@link #broadcastShape}, it reports rather than throws.
+     */
+    public static boolean broadcastsTo(Shape smaller, Shape larger) {
+        if (smaller.rank() > larger.rank()) {
+            return false;
+        }
+        int offset = larger.rank() - smaller.rank();
+        for (int i = 0; i < smaller.rank(); i++) {
+            int s = smaller.dim(i);
+            int l = larger.dim(offset + i);
+            if (s != l && !(s == 1 && l > 1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public static long[] broadcastStrides(Shape sourceShape, Shape targetShape, Strides sourceStrides) {
         Objects.requireNonNull(sourceShape, "Source shape cannot be null");
         Objects.requireNonNull(targetShape, "Target shape cannot be null");

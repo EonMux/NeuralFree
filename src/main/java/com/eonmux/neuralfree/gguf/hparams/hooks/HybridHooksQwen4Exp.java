@@ -47,7 +47,8 @@ final class HybridHooksQwen4Exp {
     /**
      * qwen4exp.cpp:56-83: the indexer sizes (all required and nonzero) and the per-layer
      * {@code attention.compress_ratios}; every QSA layer pools keys over one shared ratio above 1 that
-     * divides {@code attention.indexer.top_k}.
+     * divides {@code attention.indexer.top_k}. An MTP block with no ratio takes the last QSA layer's
+     * ({@link #inheritMtpRatios}).
      */
     static void readIndexer(ModelHparamsBuilder b, GgufKv kv) {
         b.indexerNHead(kv.u32Required(GgufKeys.ATTENTION_INDEXER_HEAD_COUNT));        // qwen4exp.cpp:56
@@ -57,6 +58,7 @@ final class HybridHooksQwen4Exp {
         HybridHooks.requireNonZero(kv, GgufKeys.ATTENTION_INDEXER_KEY_LENGTH, b.indexerHeadSize()); // qwen4exp.cpp:60
         HybridHooks.requireNonZero(kv, GgufKeys.ATTENTION_INDEXER_TOP_K, b.indexerTopK());          // qwen4exp.cpp:61
         int[] ratios = kv.keyOrArr(GgufKeys.ATTENTION_COMPRESS_RATIOS, b.nLayerAll(), 0);   // qwen4exp.cpp:62
+        inheritMtpRatios(b, ratios);                                          // qwen4exp.cpp:141-156
         b.compressRatioArray(ratios);
         int kpool = 0;                                                        // qwen4exp.cpp:65-75
         for (int r : ratios) {
@@ -76,6 +78,26 @@ final class HybridHooksQwen4Exp {
         b.indexerKpoolRow(KPOOL_ROW_RAW_AND_POOLED);                          // qwen4exp.cpp:81
         b.indexerKpoolByOrder(true);                                          // qwen4exp.cpp:82
         b.indexerKpoolSelectTail(true);                                       // qwen4exp.cpp:83
+    }
+
+    /**
+     * qwen4exp.cpp:141-156: the MTP block is a QSA layer like the last trunk one, but some MTP files (Unsloth's)
+     * give it no compress ratio: it takes the last trunk QSA layer's (ik_llama.cpp #2369). With 0 its indexer
+     * tensors would go unused, or its attention would run dense. A file with no QSA layer at all keeps 0.
+     */
+    private static void inheritMtpRatios(ModelHparamsBuilder b, int[] ratios) {
+        int trunk = b.nLayer();
+        for (int il = trunk; il < ratios.length; il++) {
+            if (ratios[il] != 0) {
+                continue;
+            }
+            for (int j = trunk - 1; j >= 0; j--) {
+                if (ratios[j] != 0) {
+                    ratios[il] = ratios[j];
+                    break;
+                }
+            }
+        }
     }
 
     /**

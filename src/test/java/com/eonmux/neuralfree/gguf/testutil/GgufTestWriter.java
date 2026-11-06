@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.GGUFValueType;
 import com.eonmux.neuralfree.gguf.GgufEncoder;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
+import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
 
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
@@ -358,6 +359,11 @@ public final class GgufTestWriter {
         return requireTensor(name).ne.clone();
     }
 
+    /** The raw storage bytes of a tensor (copy). */
+    public byte[] tensorData(String name) {
+        return requireTensor(name).data.clone();
+    }
+
     public GGMLType tensorType(String name) {
         return requireTensor(name).type;
     }
@@ -429,7 +435,8 @@ public final class GgufTestWriter {
 
     /** True when {@link #encodeFloats} supports {@code type}. */
     public static boolean canEncodeFloats(GGMLType type) {
-        return type == GGMLType.F32 || type == GGMLType.F16 || type == GGMLType.BF16 || type == GGMLType.Q8_0;
+        return type == GGMLType.F32 || type == GGMLType.F16 || type == GGMLType.BF16 || type == GGMLType.Q8_0
+                || type == GGMLType.F8_E4M3FN;
     }
 
     /** Encodes floats into the storage bytes of {@code type}. Q8_0 needs a multiple of 32 values. */
@@ -439,6 +446,13 @@ public final class GgufTestWriter {
                 byte[] out = new byte[values.length * 4];
                 for (int i = 0; i < values.length; i++) {
                     FakeGpuBuffer.putIntLE(out, i * 4, Float.floatToRawIntBits(values[i]));
+                }
+                return out;
+            }
+            case F8_E4M3FN: {
+                byte[] out = new byte[values.length];
+                for (int i = 0; i < values.length; i++) {
+                    out[i] = (byte) FpBlockDecoders.fp32ToE4m3(values[i]);
                 }
                 return out;
             }

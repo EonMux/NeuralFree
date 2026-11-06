@@ -67,8 +67,10 @@
 #define QT_NVFP4    40
 #define QT_Q1_0     41
 #define QT_Q2_0     42
+#define QT_IQ3_K    43
+#define QT_IQ3_KS   44
 
-/* ---- NeuralFree extension weight-type ids (GGMLType ids 1000-1008, no ggml_type counterpart) ---- */
+/* ---- NeuralFree extension weight-type ids (GGMLType ids 1000-1010, no ggml_type counterpart) ---- */
 #define QT_F8_E4M3       1000
 #define QT_F8_E4M3_B128  1001
 #define QT_MXFP8         1002
@@ -78,6 +80,8 @@
 #define QT_F8_E5M2       1006
 #define QT_MXFP6_E2M3    1007
 #define QT_MXFP6_E3M2    1008
+#define QT_F8_E4M3_B32   1009
+#define QT_W12           1010
 
 /* ---- Block constants: elements (_BS) and bytes (_BB) per block (llama.cpp ggml-common.h) ---- */
 #define NF_F32_BS      1
@@ -128,6 +132,10 @@
 #define NF_IQ3_XXS_BB  98
 #define NF_IQ3_S_BS    256
 #define NF_IQ3_S_BB    110
+#define NF_IQ3_K_BS    256
+#define NF_IQ3_K_BB    110
+#define NF_IQ3_KS_BS   256
+#define NF_IQ3_KS_BB   104
 #define NF_IQ1_S_BS    256
 #define NF_IQ1_S_BB    50
 #define NF_IQ1_M_BS    256
@@ -146,6 +154,8 @@
 #define NF_F8_E5M2_BB       32
 #define NF_F8_E4M3_B128_BS  128
 #define NF_F8_E4M3_B128_BB  132
+#define NF_F8_E4M3_B32_BS   32
+#define NF_F8_E4M3_B32_BB   36
 #define NF_MXFP8_BS         32
 #define NF_MXFP8_BB         33
 #define NF_MXFP6_E2M3_BS    32
@@ -158,6 +168,8 @@
 #define NF_NF4_BB           36
 #define NF_FP4_BNB_BS       64
 #define NF_FP4_BNB_BB       36
+#define NF_W12_BS           64
+#define NF_W12_BB           96
 
 /* ---- Weight streams and readers ---- */
 #ifndef NF_WEIGHT_STREAMS
@@ -254,6 +266,13 @@ int nf_kvalue_iq4nl(uint q) {
     return bitfieldExtract(int(NF_KVALUES_IQ4NL[q >> 2]), int((q & 3u) * 8u), 8);
 }
 
+/* iq3nl_values[q] for q in [0, 16): the IQ3_K / IQ3_KS grid of 8 values and its shifted copy
+ * (Avalon ggml-common.h:1151-1155), int8 values packed little-endian. */
+const uvec4 NF_KVALUES_IQ3NL = uvec4(0xF6E9D8C1u, 0x2F1C0D01u, 0xFAEDDCC5u, 0x33201105u);
+int nf_kvalue_iq3nl(uint q) {
+    return bitfieldExtract(int(NF_KVALUES_IQ3NL[q >> 2]), int((q & 3u) * 8u), 8);
+}
+
 /* kvalues_fp4[q] for q in [0, 16): doubled e2m1 values shared by MXFP4 and NVFP4
  * (llama.cpp ggml-common.h:1126), int8 values packed little-endian. */
 const uvec4 NF_KVALUES_FP4 = uvec4(0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu);
@@ -265,6 +284,19 @@ int nf_kvalue_fp4(uint q) {
  * (llama.cpp ggml-impl.h:489 ggml_e8m0_to_fp32_half; C mxfp4_scale). */
 float nf_e8m0_half(uint e) {
     return uintBitsToFloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
+}
+
+/* UE4M3 scale byte to float, halved for the doubled E2M1 codebook (llama.cpp ggml-impl.h:514
+ * ggml_ue4m3_to_fp32): 0 and 0x7F give 0; otherwise (e ? 8 + m : m) * 2^(max(e,1) - 11), exact. */
+float nf_ue4m3_half(uint x) {
+    if (x == 0u || x == 0x7Fu) {
+        return 0.0;
+    }
+    const uint e = (x >> 3) & 0xFu;
+    const uint m = x & 7u;
+    const float mant = float(e == 0u ? m : 8u + m);
+    const uint ex = e == 0u ? 1u : e;
+    return mant * uintBitsToFloat((ex + 116u) << 23);
 }
 
 /* E8M0 exponent byte to 2^(e - 127) exactly, the OCP MX block scale (Java FpBlockDecoders.e8m0ToFp32;

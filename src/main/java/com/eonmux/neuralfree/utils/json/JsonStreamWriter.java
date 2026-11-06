@@ -17,7 +17,7 @@ import java.util.Objects;
  * {@link IllegalStateException}. Consecutive top-level values are written without any separator; the caller frames
  * them, as an SSE {@code data:} line does.</p>
  *
- * <p>Not thread-safe: owned by its writing thread (§3.3).</p>
+ * <p>Not thread-safe: owned by its writing thread.</p>
  */
 public final class JsonStreamWriter {
 
@@ -53,8 +53,9 @@ public final class JsonStreamWriter {
         begin(false);
     }
 
+    /** Opens a container as the next value: a pending member's value, an array element or a top-level value. */
     private void begin(boolean object) throws IOException {
-        if (awaitValue) throw new IllegalStateException("object member without a value");
+        beforeValue();
         out.append(object ? '{' : '[');
         frames.push(new Frame(object));
     }

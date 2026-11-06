@@ -1,8 +1,8 @@
 package com.eonmux.neuralfree.gguf.grammar;
 
 /**
- * Bounds for parsing and validating GBNF grammars, an untrusted input class for every engine
- * (PARITY §3.6 and §5.7 SO-1). A grammar that exceeds a bound fails to parse with an explicit
+ * Bounds for parsing and validating GBNF grammars, an untrusted input class for every engine.
+ * A grammar that exceeds a bound fails to parse with an explicit
  * {@link GrammarException} naming the limit; nothing is silently truncated.
  *
  * <p>{@link #MAX_REPETITION_EXPANSION} takes over llama.cpp's {@code MAX_REPETITION_THRESHOLD}
@@ -24,6 +24,13 @@ public final class GrammarLimits {
 
     /** Largest per-axis repetition; counts above it are rejected or fall back to unbounded. */
     public static final int MAX_REPETITION_EXPANSION = 10_000;
+
+    /**
+     * Deepest nesting a translated pattern may hold, llama.cpp's {@code COMMON_RECURSIVE_LIMIT}
+     * ({@code common/common.h}): the group depth of every regex use and the depth of a Lark grammar's
+     * expressions, so no translation recurses past it.
+     */
+    public static final int MAX_NESTING_DEPTH = 128;
 
     private GrammarLimits() {}
 }

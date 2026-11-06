@@ -35,6 +35,16 @@ public final class QuantTables {
     };
 
     /**
+     * Non-linear 3-bit codebook of IQ3_K / IQ3_KS ({@code iq3nl_values}, Avalon ggml-common.h:1151-1155): the
+     * base grid of 8 values, then the same values shifted by one grid position ({@code iq3nl_values + 8}), which
+     * a block's grid-select bit chooses.
+     */
+    private static final byte[] IQ3NL_VALUES = {
+        -63, -40, -23, -10, 1, 13, 28, 47,
+        -59, -36, -19, -6, 5, 17, 32, 51
+    };
+
+    /**
      * NF4 codebook of bitsandbytes ({@code get_4bit_type("nf4")}, bitsandbytes/functional.py:733-750): the 16
      * fp32 values as written there, already normalized to a largest magnitude of 1 ({@code data.div_(data.abs()
      * .max())}, functional.py:793-794, leaves them unchanged).
@@ -1158,6 +1168,11 @@ public final class QuantTables {
     /** Returns {@code kvalues_fp4[i]} (doubled E2M1 value) for {@code i} in [0, 16). */
     public static int kvalueFp4(int i) {
         return KVALUES_FP4[i];
+    }
+
+    /** Returns {@code iq3nl_values[i]} for {@code i} in [0, 16). */
+    public static int iq3NlValue(int i) {
+        return IQ3NL_VALUES[i];
     }
 
     /** Returns the NF4 codebook value {@code i} (bitsandbytes, normalized to [-1, 1]) for {@code i} in [0, 16). */

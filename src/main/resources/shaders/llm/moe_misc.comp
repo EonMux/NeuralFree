@@ -1,5 +1,6 @@
-/* moe_misc.comp - LLM_MoE_HashIds, LLM_AddId, LLM_MoE_Bucketize and LLM_MoE_ScaleInput. GLSL twin
- * of those kernels in kernels/llm/moe.cl, which is the semantic reference. Requires: common/nf_common.glsl.
+/* moe_misc.comp - LLM_MoE_HashIds, LLM_AddId, LLM_MoE_Bucketize, LLM_MoE_BucketCount,
+ * LLM_MoE_BucketScan, LLM_MoE_BucketScatter, LLM_MoE_AlignBlocks and LLM_MoE_ScaleInput. GLSL twin of those kernels in kernels/llm/moe.cl, which is the semantic
+ * reference. Requires: common/nf_common.glsl.
  *
  * A variants row selects OP=<op>; its kernel name is the OpenCL name, e.g.
  *     LLM_AddId	moe_misc.comp	OP=OP_MOE_ADD_ID
@@ -12,12 +13,23 @@
  *   OP_MOE_BUCKETIZE    (i n_tokens, i k, i n_expert, R int ids, W int counts, W int offsets,
  *                        W int row_token, W int row_slot)
  *                       stable counting sort of the pairs by expert (kernels/llm/moe.cl LLM_MoE_Bucketize)
+ *   OP_MOE_BUCKET_COUNT (i n_tokens, i k, i n_expert, i chunk, R int ids, W int hist)
+ *   OP_MOE_BUCKET_SCAN  (i n_tokens, i k, i n_expert, i chunk, int hist, W int counts, W int offsets)
+ *   OP_MOE_BUCKET_SCATTER (i n_tokens, i k, i n_expert, i chunk, R int ids, R int hist,
+ *                        W int row_token, W int row_slot)
+ *                       the three phases of the multi-workgroup sort (kernels/llm/moe.cl
+ *                       LLM_MoE_BucketCount / LLM_MoE_BucketScan / LLM_MoE_BucketScatter)
+ *   OP_MOE_ALIGN_BLOCKS (i n_tokens, i k, i n_expert, i n_tiles, R int counts, R int offsets,
+ *                        R int row_token, R int row_slot, W int gemm_token, W int gemm_slot)
+ *                       block-aligned copy of the sorted rows for the grouped GEMM
+ *                       (kernels/llm/moe.cl LLM_MoE_AlignBlocks)
  *   OP_MOE_SCALE_INPUT  (i n_tokens, i n_embd, i k, R float x, R float weights, W float out)
  *                       out[(t * k + j) * n_embd + c] = x[t * n_embd + c] * weights[t * k + j]
  *
- * Dispatch: OP_MOE_BUCKETIZE is one workgroup, global = local = {L, 1, 1} with L a power of two
- * <= LLM_DIMX. The others are 1-D element grids, local = {L, 1, 1}, global rounded up to L
- * (folding-aware nf_global_id()).
+ * Dispatch (L a power of two <= LLM_DIMX): OP_MOE_BUCKETIZE and OP_MOE_BUCKET_SCAN are one
+ * workgroup, global = local = {L, 1, 1}; OP_MOE_BUCKET_COUNT and OP_MOE_BUCKET_SCATTER one workgroup
+ * per chunk of pairs; OP_MOE_ALIGN_BLOCKS any number of workgroups (grid-stride loop). The others are
+ * 1-D element grids, local = {L, 1, 1}, global rounded up to L (folding-aware nf_global_id()).
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -27,7 +39,11 @@
 #define OP_MOE_HASH_IDS    311
 #define OP_MOE_ADD_ID      312
 #define OP_MOE_BUCKETIZE   313
+#define OP_MOE_ALIGN_BLOCKS 315
 #define OP_MOE_SCALE_INPUT 314
+#define OP_MOE_BUCKET_COUNT 316
+#define OP_MOE_BUCKET_SCAN 317
+#define OP_MOE_BUCKET_SCATTER 318
 
 #ifndef OP
 #error "moe_misc.comp requires OP"
@@ -53,6 +69,42 @@ layout(std430, binding = 4) writeonly buffer NfMmRowSlot { int row_slot[]; };
 layout(push_constant) uniform NfMmParams { int n_tokens; int k; int n_expert; } pc;
 shared int moe_cur[NF_MOE_MAX_EXPERTS + 1];
 shared int moe_chunk[gl_WorkGroupSize.x];
+#elif OP == OP_MOE_BUCKET_COUNT
+#define NF_MOE_MAX_EXPERTS 1024
+layout(std430, binding = 0) readonly buffer NfMmIds { int ids[]; };
+layout(std430, binding = 1) writeonly buffer NfMmHist { int hist[]; };
+layout(push_constant) uniform NfMmParams { int n_tokens; int k; int n_expert; int chunk; } pc;
+shared int moe_cnt[NF_MOE_MAX_EXPERTS + 1];
+#elif OP == OP_MOE_BUCKET_SCAN
+#define NF_MOE_MAX_EXPERTS 1024
+layout(std430, binding = 0) buffer NfMmHist { int hist[]; };
+layout(std430, binding = 1) writeonly buffer NfMmCounts { int counts[]; };
+layout(std430, binding = 2) writeonly buffer NfMmOffsets { int offsets[]; };
+layout(push_constant) uniform NfMmParams { int n_tokens; int k; int n_expert; int chunk; } pc;
+shared int moe_v[NF_MOE_MAX_EXPERTS + 1];
+shared int moe_part[gl_WorkGroupSize.x];
+#elif OP == OP_MOE_BUCKET_SCATTER
+#define NF_MOE_MAX_EXPERTS 1024
+layout(std430, binding = 0) readonly buffer NfMmIds { int ids[]; };
+layout(std430, binding = 1) readonly buffer NfMmHist { int hist[]; };
+layout(std430, binding = 2) writeonly buffer NfMmRowToken { int row_token[]; };
+layout(std430, binding = 3) writeonly buffer NfMmRowSlot { int row_slot[]; };
+layout(push_constant) uniform NfMmParams { int n_tokens; int k; int n_expert; int chunk; } pc;
+shared int moe_cur[NF_MOE_MAX_EXPERTS + 1];
+shared int moe_chunk[gl_WorkGroupSize.x];
+#elif OP == OP_MOE_ALIGN_BLOCKS
+#define NF_MOE_MAX_EXPERTS 1024
+/* Aligned positions per tile, equal to NF_GEMM_TN of matmul_grouped_family.h / moe_gemm.comp. */
+#define NF_GEMM_TN 32
+layout(std430, binding = 0) readonly buffer NfMmCounts { int counts[]; };
+layout(std430, binding = 1) readonly buffer NfMmOffsets { int offsets[]; };
+layout(std430, binding = 2) readonly buffer NfMmRowToken { int row_token[]; };
+layout(std430, binding = 3) readonly buffer NfMmRowSlot { int row_slot[]; };
+layout(std430, binding = 4) writeonly buffer NfMmGemmToken { int gemm_token[]; };
+layout(std430, binding = 5) writeonly buffer NfMmGemmSlot { int gemm_slot[]; };
+layout(push_constant) uniform NfMmParams { int n_tokens; int k; int n_expert; int n_tiles; } pc;
+shared int moe_v[NF_MOE_MAX_EXPERTS + 1];
+shared int moe_part[gl_WorkGroupSize.x];
 #elif OP == OP_MOE_SCALE_INPUT
 layout(std430, binding = 0) readonly buffer NfMmX { float x_in[]; };
 layout(std430, binding = 1) readonly buffer NfMmWeights { float weights[]; };
@@ -62,12 +114,14 @@ layout(push_constant) uniform NfMmParams { int n_tokens; int n_embd; int k; } pc
 #error "moe_misc.comp: OP is not a MoE helper op"
 #endif
 
-#if OP == OP_MOE_BUCKETIZE
+#if OP == OP_MOE_BUCKETIZE || OP == OP_MOE_BUCKET_COUNT || OP == OP_MOE_BUCKET_SCATTER
 /* Bucket of an id: the expert, or n_expert for an id out of range (C nf_moe_bucket). */
 int nf_moe_bucket(int id, int n_expert) {
     return (id >= 0 && id < n_expert) ? id : n_expert;
 }
+#endif
 
+#if OP == OP_MOE_BUCKETIZE || OP == OP_MOE_BUCKET_SCATTER
 /* Rank of this invocation's bucket b among the chunk's earlier entries, and whether it is the last. */
 void nf_moe_rank(int b, out int rank, out bool last) {
     const uint lid = gl_LocalInvocationID.x;
@@ -82,6 +136,63 @@ void nf_moe_rank(int b, out int rank, out bool last) {
             }
         }
     }
+}
+
+/* Sorted rows of the pairs [p0, p1) from the cursors moe_cur (C nf_moe_scatter_rows). */
+void nf_moe_scatter_rows(int p0, int p1) {
+    const uint lid = gl_LocalInvocationID.x;
+    const int n_expert = pc.n_expert;
+    for (int base = p0; base < p1; base += int(gl_WorkGroupSize.x)) {
+        const int p = base + int(lid);
+        const int b = p < p1 ? nf_moe_bucket(ids[p], n_expert) : -1;
+        moe_chunk[lid] = b;
+        barrier();
+        int rank = 0;
+        bool last = false;
+        if (b >= 0) {
+            nf_moe_rank(b, rank, last);
+            const int pos = moe_cur[b] + rank;
+            row_token[pos] = p;
+            row_slot[pos] = b < n_expert ? b : -1;
+        }
+        barrier();
+        if (b >= 0 && last) {
+            moe_cur[b] += rank + 1;
+        }
+        barrier();
+    }
+}
+#endif
+
+#if OP == OP_MOE_BUCKET_SCAN || OP == OP_MOE_ALIGN_BLOCKS
+/* In-place exclusive prefix sum of moe_v[0, n), returning the total (C nf_moe_excl_scan). */
+int nf_moe_excl_scan(int n) {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int seg = (n + lsize - 1) / lsize;
+    const int b0 = min(lid * seg, n);
+    const int b1 = min(b0 + seg, n);
+    int sum = 0;
+    for (int b = b0; b < b1; ++b) {
+        sum += moe_v[b];
+    }
+    moe_part[lid] = sum;
+    barrier();
+    for (int off = 1; off < lsize; off <<= 1) {
+        const int add = lid >= off ? moe_part[lid - off] : 0;
+        barrier();
+        moe_part[lid] += add;
+        barrier();
+    }
+    int run = lid == 0 ? 0 : moe_part[lid - 1];
+    const int total = moe_part[lsize - 1];
+    for (int b = b0; b < b1; ++b) {
+        const int c = moe_v[b];
+        moe_v[b] = run;
+        run += c;
+    }
+    barrier();
+    return total;
 }
 #endif
 
@@ -156,25 +267,119 @@ void main() {
         }
     }
     barrier();
-
-    for (int base = 0; base < n_rows; base += int(lsize)) {
-        const int p = base + int(lid);
-        const int b = p < n_rows ? nf_moe_bucket(ids[p], n_expert) : -1;
-        moe_chunk[lid] = b;
-        barrier();
-        int rank = 0;
-        bool last = true;
-        if (b >= 0) {
-            nf_moe_rank(b, rank, last);
-            const int pos = moe_cur[b] + rank;
-            row_token[pos] = p;
-            row_slot[pos] = b < n_expert ? b : -1;
+    nf_moe_scatter_rows(0, n_rows);
+#elif OP == OP_MOE_BUCKET_COUNT
+    const uint lid = gl_LocalInvocationID.x;
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int g = int(nf_wg_id());
+    const int n_rows = pc.n_tokens * pc.k;
+    const int nb = pc.n_expert + 1;
+    for (int b = int(lid); b < nb; b += lsize) {
+        moe_cnt[b] = 0;
+    }
+    barrier();
+    const int p0 = g * pc.chunk;
+    const int p1 = min(p0 + pc.chunk, n_rows);
+    for (int p = p0 + int(lid); p < p1; p += lsize) {
+        atomicAdd(moe_cnt[nf_moe_bucket(ids[p], pc.n_expert)], 1);
+    }
+    barrier();
+    for (int b = int(lid); b < nb; b += lsize) {
+        hist[uint(g) * uint(nb) + uint(b)] = moe_cnt[b];
+    }
+#elif OP == OP_MOE_BUCKET_SCAN
+    /* One workgroup; the check is uniform. */
+    if (nf_wg_id() != 0u) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int n_expert = pc.n_expert;
+    const int n_rows = pc.n_tokens * pc.k;
+    const int nb = n_expert + 1;
+    const int n_groups = (n_rows + pc.chunk - 1) / pc.chunk;
+    for (int b = int(lid); b < nb; b += lsize) {
+        int run = 0;
+        for (int g = 0; g < n_groups; ++g) {
+            const uint i = uint(g) * uint(nb) + uint(b);
+            const int c = hist[i];
+            hist[i] = run;
+            run += c;
         }
-        barrier();
-        if (b >= 0 && last) {
-            moe_cur[b] += rank + 1;
+        moe_v[b] = run;
+        if (b < n_expert) {
+            counts[b] = run;
         }
-        barrier();
+    }
+    barrier();
+    nf_moe_excl_scan(nb);
+    for (int b = int(lid); b < nb; b += lsize) {
+        const int start = moe_v[b];
+        if (b < n_expert) {
+            offsets[b] = start;
+        }
+        for (int g = 0; g < n_groups; ++g) {
+            hist[uint(g) * uint(nb) + uint(b)] += start;
+        }
+    }
+#elif OP == OP_MOE_BUCKET_SCATTER
+    const uint lid = gl_LocalInvocationID.x;
+    const int g = int(nf_wg_id());
+    const int n_rows = pc.n_tokens * pc.k;
+    const int nb = pc.n_expert + 1;
+    for (int b = int(lid); b < nb; b += int(gl_WorkGroupSize.x)) {
+        moe_cur[b] = hist[uint(g) * uint(nb) + uint(b)];
+    }
+    barrier();
+    const int p0 = g * pc.chunk;
+    /* Depends only on the workgroup id, so the return is uniform. */
+    if (p0 >= n_rows) {
+        return;
+    }
+    nf_moe_scatter_rows(p0, min(p0 + pc.chunk, n_rows));
+#elif OP == OP_MOE_ALIGN_BLOCKS
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const int n_expert = pc.n_expert;
+    const int n_rows = pc.n_tokens * pc.k;
+    const int nb = n_expert + 1;
+    /* n_expert >= 1 (the host validates), so both arrays below are in range. */
+    const int valid_total = offsets[n_expert - 1] + counts[n_expert - 1];
+    for (int b = int(lid); b < nb; b += int(lsize)) {
+        const int c = b < n_expert ? counts[b] : n_rows - valid_total;
+        moe_v[b] = (c + NF_GEMM_TN - 1) / NF_GEMM_TN;
+    }
+    barrier();
+    const int used = nf_moe_excl_scan(nb);
+    /* Grid-stride over the positions: every position is gathered by exactly one invocation, also
+     * when the backend folds the group count. */
+    const uint n_pos = uint(pc.n_tiles) * uint(NF_GEMM_TN);
+    const uint stride = gl_NumWorkGroups.x * gl_NumWorkGroups.y * lsize;
+    for (uint q = nf_global_id(); q < n_pos; q += stride) {
+        const int tile = int(q / uint(NF_GEMM_TN));
+        int tok = -1;
+        int slot = -1;
+        if (tile < used) {
+            int lo = 0;
+            int hi = nb - 1;
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) >> 1;
+                if (moe_v[mid] <= tile) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            const int idx = int(q) - moe_v[lo] * NF_GEMM_TN;
+            const int cnt = lo < n_expert ? counts[lo] : n_rows - valid_total;
+            if (idx < cnt) {
+                const int start = lo < n_expert ? offsets[lo] : valid_total;
+                tok = row_token[start + idx];
+                slot = row_slot[start + idx];
+            }
+        }
+        gemm_token[q] = tok;
+        gemm_slot[q] = slot;
     }
 #endif
 }

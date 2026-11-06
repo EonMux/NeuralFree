@@ -40,10 +40,17 @@ public final class HfTensorFilters {
     public static final class Result {
         private final HfTensorIndex index;
         private final List<String> droppedPrefixes;
+        private final Map<String, String> origins;
 
-        Result(HfTensorIndex index, List<String> droppedPrefixes) {
+        Result(HfTensorIndex index, List<String> droppedPrefixes, Map<String, String> origins) {
             this.index = index;
             this.droppedPrefixes = droppedPrefixes;
+            this.origins = origins;
+        }
+
+        /** The checkpoint name of each kept tensor, by its filtered name (unmodifiable). */
+        public Map<String, String> origins() {
+            return origins;
         }
 
         /** The kept tensors under their filtered names, in checkpoint order. */
@@ -114,7 +121,7 @@ public final class HfTensorFilters {
                     + (skipped == 0 ? "" : ", skipped " + skipped + " unused buffers"));
         }
         return new Result(HfTensorIndex.of(kept),
-                Collections.unmodifiableList(new ArrayList<>(dropped)));
+                Collections.unmodifiableList(new ArrayList<>(dropped)), Collections.unmodifiableMap(origin));
     }
 
     /**

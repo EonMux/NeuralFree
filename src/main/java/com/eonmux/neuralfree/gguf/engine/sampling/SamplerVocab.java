@@ -40,4 +40,13 @@ public interface SamplerVocab {
 
     /** llama_tokenize(text, add_special = false, parse_special = false). */
     int[] tokenize(String text);
+
+    /**
+     * llama_tokenize(text, add_special = false, parse_special = true): the special tokens named in {@code text}
+     * ({@code <|think>}) become their ids instead of plain pieces. The default is {@link #tokenize}, right for a
+     * vocabulary whose special tokens the plain pass already splits; the GGUF vocab resolves them.
+     */
+    default int[] tokenizeSpecial(String text) {
+        return tokenize(text);
+    }
 }

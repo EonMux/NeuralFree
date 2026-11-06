@@ -549,22 +549,65 @@ public final class GpuOptimizerOps {
     public static void storeFloats(Tensor target, float[] values) {
         Objects.requireNonNull(target, "target must not be null");
         Objects.requireNonNull(values, "values must not be null");
-        GpuTensorOps.requireWritable(target);
-        if (target.dtype() != DType.FLOAT32) {
-            throw new IllegalArgumentException("storeFloats needs a FLOAT32 tensor, got " + target.dtype());
-        }
-        if (values.length != target.numElements()) {
-            throw new IllegalArgumentException(values.length + " values for a tensor of " + target.numElements()
-                    + " elements " + target.shape());
-        }
-        if (values.length == 0) {
-            return;
-        }
+        requireStore(target, DType.FLOAT32, values.length, "storeFloats");
         ComputeQueue queue = target.backend().transferQueue();
         TensorStorage storage = target.storage();
+        forEachRun(target, values.length, (start, end, address) -> closeEvent(storage.copyFromHostFloat(
+                start == 0 && end == values.length ? values : Arrays.copyOfRange(values, start, end), address,
+                queue)));
+    }
+
+    /**
+     * {@link #storeFloats} for a FLOAT64 {@code target}: writes {@code values}, in row-major order, through
+     * {@link TensorStorage#copyFromHostDouble(double[], long, ComputeQueue)}, one write per run of consecutive
+     * elements. The FLOAT64 host ops store their in-place results (batch-norm running statistics) with it.
+     *
+     * @throws IllegalArgumentException when the dtype is not FLOAT64, the lengths differ, or the view addresses an
+     *                                  element more than once
+     * @throws IllegalStateException    when {@code target} requires grad while grad mode is enabled
+     */
+    public static void storeDoubles(Tensor target, double[] values) {
+        Objects.requireNonNull(target, "target must not be null");
+        Objects.requireNonNull(values, "values must not be null");
+        requireStore(target, DType.FLOAT64, values.length, "storeDoubles");
+        ComputeQueue queue = target.backend().transferQueue();
+        TensorStorage storage = target.storage();
+        forEachRun(target, values.length, (start, end, address) -> closeEvent(storage.copyFromHostDouble(
+                start == 0 && end == values.length ? values : Arrays.copyOfRange(values, start, end), address,
+                queue)));
+    }
+
+    /** The checks of a store of {@code length} values of {@code dtype} into {@code target}. */
+    private static void requireStore(Tensor target, DType dtype, int length, String what) {
+        GpuTensorOps.requireWritable(target);
+        if (target.dtype() != dtype) {
+            throw new IllegalArgumentException(what + " needs a " + dtype + " tensor, got " + target.dtype());
+        }
+        if (length != target.numElements()) {
+            throw new IllegalArgumentException(length + " values for a tensor of " + target.numElements()
+                    + " elements " + target.shape());
+        }
+    }
+
+    /** A write of the row-major values {@code [start, end)} to consecutive storage elements from {@code address}. */
+    @FunctionalInterface
+    private interface RunWriter {
+        void write(int start, int end, long address);
+    }
+
+    /**
+     * Calls {@code writer} once for a dense {@code target} and once per run of consecutive storage elements
+     * otherwise, covering its {@code length} row-major elements in order.
+     *
+     * @throws IllegalArgumentException when the view addresses an element more than once
+     */
+    private static void forEachRun(Tensor target, int length, RunWriter writer) {
+        if (length == 0) {
+            return;
+        }
         Strides strides = target.strides();
         if (target.isDense()) {
-            closeEvent(storage.copyFromHostFloat(values, strides.offset(), queue));
+            writer.write(0, length, strides.offset());
             return;
         }
         int rank = target.shape().rank();
@@ -579,8 +622,8 @@ public final class GpuOptimizerOps {
         long address = strides.offset();
         int runStart = 0;
         long runAddress = address;
-        for (int i = 1; i <= values.length; i++) {
-            if (i < values.length) {
+        for (int i = 1; i <= length; i++) {
+            if (i < length) {
                 for (int k = rank - 1; k >= 0; k--) {
                     if (++idx[k] < dims[k]) {
                         address += strides.stride(k);
@@ -593,8 +636,7 @@ public final class GpuOptimizerOps {
                     continue;
                 }
             }
-            float[] run = Arrays.copyOfRange(values, runStart, i);
-            closeEvent(storage.copyFromHostFloat(run, runAddress, queue));
+            writer.write(runStart, i, runAddress);
             runStart = i;
             runAddress = address;
         }

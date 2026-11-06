@@ -3,6 +3,8 @@ package com.eonmux.neuralfree.gguf.gpu.block;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.gpu.forward.BuiltInGpuExtras;
 import com.eonmux.neuralfree.gguf.gpu.head.GpuHeadPreprocessor;
+import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
+import com.eonmux.neuralfree.gguf.ops.longcat.LongcatBlocks;
 import com.eonmux.neuralfree.gguf.ops.act.FfnBlocks;
 import com.eonmux.neuralfree.gguf.ops.act.GpuDenseFfn;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnBlocks;
@@ -16,6 +18,7 @@ import com.eonmux.neuralfree.gguf.ops.gemma3n.Gemma3nBlocks;
 import com.eonmux.neuralfree.gguf.ops.gemma3n.Gemma3nKernels;
 import com.eonmux.neuralfree.gguf.ops.hc.HcBlocks;
 import com.eonmux.neuralfree.gguf.ops.hc.HcKernels;
+import com.eonmux.neuralfree.gguf.ops.heads.ControlVector;
 import com.eonmux.neuralfree.gguf.ops.heads.HeadsBlocks;
 import com.eonmux.neuralfree.gguf.ops.heads.HeadsKernels;
 import com.eonmux.neuralfree.gguf.ops.heads.SwitchedLoraExtra;
@@ -26,6 +29,7 @@ import com.eonmux.neuralfree.gguf.ops.rwkv.RwkvBlocks;
 import com.eonmux.neuralfree.gguf.ops.sparse.MsaBlocks;
 import com.eonmux.neuralfree.gguf.ops.sparse.MsaKernels;
 import com.eonmux.neuralfree.gguf.ops.sparse.SparseBlocks;
+import com.eonmux.neuralfree.gguf.ops.sparse.Step5Blocks;
 import com.eonmux.neuralfree.gguf.ops.sparse.SparseKernels;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmBlocks;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmKernels;
@@ -51,8 +55,9 @@ import java.util.Set;
  * the {@link AttnBlocks} attention factory), and a lightning indexer without pooling to {@link MixerKind#DSA_MLA},
  * served by {@link SparseBlocks}. {@link #checkRouting} rejects a spec that breaks this split.</p>
  *
- * <p>The switched-LoRA extra ({@link HeadsBlocks#gpuExtras(SwitchedLoraExtra.Router)}) reads the adapter slots
- * of the model's one {@link SwitchedLoraExtra.Router}; whoever drives the forward passes feeds that router.</p>
+ * <p>The switched-LoRA extra ({@link HeadsBlocks#gpuExtras(SwitchedLoraExtra.Router, ControlVector)}) reads the
+ * adapter slots of the model's one {@link SwitchedLoraExtra.Router}; whoever drives the forward passes feeds that
+ * router. The control-vector extra adds the rows of the engine's loaded {@link ControlVector} set.</p>
  */
 public final class GpuFactoryCatalog {
 
@@ -68,18 +73,24 @@ public final class GpuFactoryCatalog {
     private GpuFactoryCatalog() {
     }
 
-    /** Every family's factories, without a switched-LoRA router (a switched-LoRA layer then fails to bind). */
+    /** Every family's factories, without a switched-LoRA router and without control vectors. */
     public static GpuBlockRegistry defaults() {
-        return defaults(null);
+        return defaults(null, null);
+    }
+
+    /** Every family's factories with {@code router} and without control vectors. */
+    public static GpuBlockRegistry defaults(SwitchedLoraExtra.Router router) {
+        return defaults(router, null);
     }
 
     /**
      * Every family's factories.
      *
-     * @param router the model's switched-LoRA router, or null for a model without switched-LoRA layers
+     * @param router          the model's switched-LoRA router, or null for a model without switched-LoRA layers
+     * @param controlVectors  the engine's active control-vector set, or null for a model without control vectors
      * @throws IllegalStateException when the attention family serves no {@link MixerKind#ATTENTION} factory
      */
-    public static GpuBlockRegistry defaults(SwitchedLoraExtra.Router router) {
+    public static GpuBlockRegistry defaults(SwitchedLoraExtra.Router router, ControlVector controlVectors) {
         GpuMixerFactory attention = attentionFactory();
         List<GpuMixerFactory> mixers = new ArrayList<>();
         mixers.addAll(AttnBlocks.gpuMixers());
@@ -90,6 +101,7 @@ public final class GpuFactoryCatalog {
         mixers.addAll(RwkvBlocks.gpuMixers());
         mixers.addAll(DeltaNetBlocks.gpuMixers());
         mixers.addAll(SparseBlocks.gpuMixers());
+        mixers.addAll(Step5Blocks.gpuMixers());
         mixers.addAll(MsaBlocks.gpuMixers(attention));
         mixers.addAll(HcBlocks.gpuMixers());
         mixers.addAll(Gemma3nBlocks.gpuMixers());
@@ -112,6 +124,7 @@ public final class GpuFactoryCatalog {
         ffns.addAll(EncDecBlocks.gpuFfns());
         ffns.addAll(HeadsBlocks.gpuFfns());
         ffns.addAll(Dsv4Blocks.gpuFfns());
+        ffns.addAll(LongcatBlocks.gpuFfns());
 
         List<GpuLayerExtraFactory> extras = new ArrayList<>();
         extras.addAll(AttnBlocks.gpuExtras());
@@ -126,8 +139,9 @@ public final class GpuFactoryCatalog {
         extras.addAll(HcBlocks.gpuExtras());
         extras.addAll(Gemma3nBlocks.gpuExtras());
         extras.addAll(EncDecBlocks.gpuExtras());
-        extras.addAll(HeadsBlocks.gpuExtras(router));
+        extras.addAll(HeadsBlocks.gpuExtras(router, controlVectors));
         extras.addAll(Dsv4Blocks.gpuExtras());
+        extras.addAll(LongcatBlocks.gpuExtras());
         extras.addAll(BuiltInGpuExtras.factories());
         return new GpuBlockRegistry(mixers, ffns, extras);
     }
@@ -141,6 +155,20 @@ public final class GpuFactoryCatalog {
     public static boolean usesSwitchedLora(ModelSpec spec) {
         for (LayerSpec l : allLayers(spec)) {
             if (l.hasExtra(LayerSpec.Extras.SWITCHED_LORA)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * True when a layer of {@code spec} carries the limite MUDD extra, whose weighted sums read earlier layers'
+     * banked inputs: a layer split runs each device's layers over its own bank, so the inputs of layers on another
+     * device (or on the host) are absent.
+     */
+    public static boolean usesMudd(ModelSpec spec) {
+        for (LayerSpec l : allLayers(spec)) {
+            if (l.hasExtra(LayerSpec.Extras.MUDD)) {
                 return true;
             }
         }
@@ -203,6 +231,7 @@ public final class GpuFactoryCatalog {
         switch (kind) {
             case ATTENTION:
             case ATTENTION_LINEAR_REPLACE:
+            case INKLING:
             case CROSS_ATTENTION_T5:
             case MLA:
                 k.addAll(AttnBlocks.KERNELS);
@@ -215,6 +244,9 @@ public final class GpuFactoryCatalog {
                 k.addAll(AttnBlocks.KERNELS);
                 k.addAll(MsaKernels.ALL);
                 break;
+            case STEP5:
+                k.addAll(Step5Blocks.KERNELS);
+                break;
             case DSV4:
                 k.addAll(AttnKernels.all());
                 k.addAll(Dsv4Kernels.ALL);
@@ -226,6 +258,12 @@ public final class GpuFactoryCatalog {
             case SHORTCONV:
             case SHORTCONV_CENTERED:
                 k.addAll(SsmKernels.ALL);
+                break;
+            case ZAMBA2:
+                // the Mamba-2 mixer, the shared block's attention, and its GEGLU MLP
+                k.addAll(SsmKernels.ALL);
+                k.addAll(AttnBlocks.KERNELS);
+                k.add(ActKernels.GLU);
                 break;
             case RWKV6:
             case RWKV6_QWEN2:
@@ -254,6 +292,9 @@ public final class GpuFactoryCatalog {
         }
         if (l.hasExtra(LayerSpec.Extras.SWITCHED_LORA)) {
             k.addAll(HeadsKernels.ALL);
+        }
+        if (l.hasExtra(LayerSpec.Extras.INKLING_SCONV)) {
+            k.add(SsmKernels.SSM_CONV);
         }
     }
 

@@ -10,9 +10,9 @@ import static com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirements.ATTEN
 import static com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirements.RECURRENT;
 
 /**
- * Tensor lists of the Gated DeltaNet hybrids (qwen3next, qwen35, qwen35moe, qwen4exp) and of the
- * lightning-attention hybrid minimax-01. The GDN recurrent layers name {@code ssm_a} without a suffix
- * ({@code LLM_TENSOR_SSM_A_NOSCAN}).
+ * Tensor lists of the Gated DeltaNet hybrids (qwen3next, qwen35, qwen35moe, qwen4exp), of the lightning-attention
+ * hybrid minimax-01 and of Bailing MoE V2.5 (lightning plus MLA). The GDN recurrent layers name {@code ssm_a}
+ * without a suffix ({@code LLM_TENSOR_SSM_A_NOSCAN}).
  */
 public final class HybridTensorRequirementsGdn {
 
@@ -79,12 +79,20 @@ public final class HybridTensorRequirementsGdn {
      * streams through
      * {@code hc_attn_*} / {@code hc_ffn_*}. Attention layers carry the QSA indexer; the PLE layer carries the
      * n-gram embedding module, whose {@code per_layer_token_embd} table is required when the PLE metadata
-     * declares heads ({@code ple_n_heads > 0}, qwen4exp.cpp:196-215).
+     * declares heads ({@code ple_n_heads > 0}, qwen4exp.cpp:196-215). {@code token_embd} is created with the
+     * trunk flags too (:279): an MTP-only file may lack it and takes the target's ({@code llama_model_share_mtp_io}).
+     * The projections that read one input exist as the merged {@code attn_qkv_gate} / {@code ssm_beta_alpha} /
+     * {@code hc_*_down_inject} weights (added on convert, qwen4exp.cpp:233-248) or as the separate pairs; one of the
+     * two forms is required.
      */
     public static List<TensorRequirement> qwen4exp() {
         HybridTensorRequirements.Builder b = HybridTensorRequirements.builder();
-        b.model("token_embd.weight");
+        b.modelTrunk("token_embd.weight");
         b.modelTrunk("output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight");
+        // an MTP-only file may carry its own LM head cut to its most frequent tokens, with d2t naming the
+        // target token of every row (qwen4exp.cpp:287-296); that head is required when d2t is in the file
+        b.modelOptional("d2t");
+        b.modelWhenPresent("d2t", "output.weight");
         b.outputOrTied();
         b.modelWhen(hp -> hp.pleNHeads() > 0, "per_layer_token_embd.weight");
         qwen4expBlock(b);
@@ -92,6 +100,24 @@ public final class HybridTensorRequirementsGdn {
         qwen4expBlock(b);
         b.layer(ALL, "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
                 "nextn.hc_head_norm.weight", "nextn.hc_head_down.weight", "nextn.hc_head_up.weight");
+        return b.build();
+    }
+
+    /**
+     * OLMo Hybrid (vLLM {@code olmo_hybrid.py}). Gated DeltaNet layers carry {@code attn_norm} and the pre-FFN
+     * {@code post_attention_norm}; attention layers carry the branch post norms {@code post_attention_norm} and
+     * {@code post_ffw_norm} instead, with the full-width Q and K norms OLMo2 uses. The dense SwiGLU FFN is on every
+     * layer.
+     */
+    public static List<TensorRequirement> olmoHybrid() {
+        HybridTensorRequirements.Builder b = header();
+        b.gatedFfn(ALL);
+        b.layer(RECURRENT, "attn_norm.weight", "post_attention_norm.weight", "attn_qkv.weight", "attn_gate.weight",
+                "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a", "ssm_beta.weight", "ssm_alpha.weight",
+                "ssm_norm.weight", "ssm_out.weight");
+        b.qkv(ATTENTION);
+        b.layer(ATTENTION, "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+                "post_attention_norm.weight", "post_ffw_norm.weight");
         return b.build();
     }
 
@@ -109,6 +135,39 @@ public final class HybridTensorRequirementsGdn {
         b.layer(ALL, "ffn_down_exps.weight", "ffn_up_exps.weight");
         return b.build();
     }
+
+    /**
+     * Bailing MoE V2.5 (vLLM {@code bailing_moe_linear.py}). Lightning layers carry {@code attn_norm_2} (the gated
+     * output norm), the fused {@code attn_qkv} with its output gate and, when {@code use_qk_norm}, the per-head Q/K
+     * norms. MLA layers carry the compressed KV latent, its norm and the absorbed {@code attn_k_b}/{@code attn_v_b}
+     * split of {@code kv_b_proj}; the query is low-rank ({@code attn_q_a} + {@code attn_q_b} + {@code attn_q_a_norm})
+     * when {@code q_lora_rank} is set and a full {@code attn_q} otherwise. Every layer has the input and pre-FFN
+     * norms; the leading dense layers use the dense SwiGLU FFN and the rest routed plus shared experts.
+     */
+    public static List<TensorRequirement> bailingV25() {
+        HybridTensorRequirements.Builder b = header();
+        b.layer(ALL, "attn_norm.weight", "attn_output.weight", "ffn_norm.weight");
+        b.layer(RECURRENT, "attn_norm_2.weight", "attn_qkv.weight", "attn_gate.weight");
+        b.layer((hp, il) -> hp.isRecurrent(il) && hp.ssmQkNorm(), "attn_q_norm.weight", "attn_k_norm.weight");
+        b.layer((hp, il) -> !hp.isRecurrent(il) && hp.nLoraQ() > 0, "attn_q_a.weight", "attn_q_b.weight",
+                "attn_q_a_norm.weight");
+        b.layer((hp, il) -> !hp.isRecurrent(il) && hp.nLoraQ() <= 0, "attn_q.weight");
+        b.layer(ATTENTION, "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight", "attn_v_b.weight");
+        b.gatedFfn(DENSE_FFN_LAYER);
+        b.layer(MOE_LAYER, "ffn_gate_inp.weight", "ffn_down_exps.weight");
+        b.gateUpExps(MOE_LAYER);
+        b.layerOptional(MOE_LAYER, "exp_probs_b.bias");
+        b.layer((hp, il) -> hp.nExpert() > 1 && il >= hp.nLayerDenseLead() && hp.nExpertShared() > 0,
+                "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight");
+        return b.build();
+    }
+
+    /** Layers that run the dense SwiGLU FFN: the leading dense blocks, or every block of a dense model. */
+    private static final LayerCondition DENSE_FFN_LAYER =
+            (hp, il) -> hp.nExpert() <= 1 || il < hp.nLayerDenseLead();
+    /** Layers that run routed experts: after the leading dense blocks of a model with experts. */
+    private static final LayerCondition MOE_LAYER =
+            (hp, il) -> hp.nExpert() > 1 && il >= hp.nLayerDenseLead();
 
     /** qwen3next.cpp:68-105 ({@code load_block_trunk}). */
     private static void qwen3nextBlock(HybridTensorRequirements.Builder b) {
@@ -147,15 +206,30 @@ public final class HybridTensorRequirementsGdn {
 
     /** qwen4exp.cpp:217-283 ({@code load_block}). */
     private static void qwen4expBlock(HybridTensorRequirements.Builder b) {
-        b.layer(ALL, "hc_attn_norm.weight", "hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
-                "hc_ffn_norm.weight", "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight");
+        b.layer(ALL, "hc_attn_norm.weight", "hc_attn_up.weight", "hc_ffn_norm.weight", "hc_ffn_up.weight");
+        b.layerAnyOf(ALL, new String[] {"hc_attn_down_inject.weight"},
+                new String[] {"hc_attn_down.weight", "hc_attn_inject.weight"});
+        b.layerAnyOf(ALL, new String[] {"hc_ffn_down_inject.weight"},
+                new String[] {"hc_ffn_down.weight", "hc_ffn_inject.weight"});
         qwenAttention(b, ATTENTION);
         b.layer(ATTENTION, "indexer.q_proj.weight", "indexer.k_proj.weight", "indexer.q_norm.weight",
                 "indexer.k_norm.weight");
-        qwen35Recurrent(b);
+        qwen4expRecurrent(b);
         b.layer(PLE_LAYER, "ple_key.weight", "ple_value.weight", "ple_norm_key.weight", "ple_norm_query.weight",
                 "ple_norm_conv.weight", "ple_conv1d.weight");
         qwenMoe(b);
+    }
+
+    /**
+     * The qwen4exp GDN mixer: like {@link #qwen35Recurrent} but with the merged {@code attn_qkv_gate} /
+     * {@code ssm_beta_alpha} weights as an alternative (qwen4exp.cpp:272-274, 289-290).
+     */
+    private static void qwen4expRecurrent(HybridTensorRequirements.Builder b) {
+        b.layer(RECURRENT, "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a", "ssm_norm.weight", "ssm_out.weight");
+        b.layerAnyOf(RECURRENT, new String[] {"attn_qkv_gate.weight"},
+                new String[] {"attn_qkv.weight", "attn_gate.weight"});
+        b.layerAnyOf(RECURRENT, new String[] {"ssm_beta_alpha.weight"},
+                new String[] {"ssm_beta.weight", "ssm_alpha.weight"});
     }
 
     /** {@code token_embd}, {@code output_norm} and the untied-or-tied output head. */

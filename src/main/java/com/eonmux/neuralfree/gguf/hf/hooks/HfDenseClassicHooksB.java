@@ -31,7 +31,7 @@ import java.util.Map;
 
 
 /**
- * Hooks of the llama.cpp classic-dense converter classes of Appendix A table HK-D1, part B: {@code CommandR2Model}
+ * Hooks of the llama.cpp classic-dense converter classes, part B: {@code CommandR2Model}
  * and {@code Cohere2Model} (LC/conversion/command_r.py:17-82), {@code DeciModel} (deci.py:17-185),
  * {@code ExaoneModel} (exaone.py:19-40), {@code Exaone4Model} (exaone.py:65-102) and
  * {@code Exaone4_5_TextModel} (exaone.py:221-285).
@@ -378,14 +378,38 @@ public final class HfDenseClassicHooksB {
                 p.highFreqFactor().orElse(4.0), p.originalMaxPositionEmbeddings().orElse(8192), false));
     }
 
+    /** The block count of {@code Exaone4_5_TextModel.__init__} (exaone.py:225-230): nextn layers appended. */
+    public static int exaone45Blocks(HfConfig cfg) {
+        int nNextn = cfg.findInt(0, "num_nextn_predict_layers");
+        return cfg.blockCount() + Math.max(0, nNextn);
+    }
+
     /**
-     * The NextN-block renames of {@code Exaone4_5_TextModel.modify_tensors} (exaone.py:238-262): {@code mtp.}
-     * tensors of the last layers land in their trunk slots, the sidecar tensors in the shared slots of the final
-     * NextN block; tensors outside {@code mtp.} pass on.
+     * {@code Exaone4_5_TextModel.set_gguf_parameters} (exaone.py:232-236): the Exaone4 keys and
+     * {@code nextn_predict_layers} when the checkpoint carries the MTP head.
+     */
+    public static void exaone45Meta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) {
+        exaone4Meta(ctx, kv, plan);
+        HfConfig cfg = ctx.config();
+        int nNextn = ctx.options().includeMtp() ? cfg.findInt(0, "num_nextn_predict_layers") : 0;
+        if (nNextn > 0) {
+            kv.set(GgufKeys.NEXTN_PREDICT_LAYERS, nNextn);
+        }
+    }
+
+    /**
+     * The NextN-block renames of {@code Exaone4_5_TextModel.modify_tensors} (exaone.py:238-262): the
+     * {@code mtp.layers.N.} tensors land in their appended trunk slot ({@code mtp_share_layers} replicates them into
+     * every NextN block), the sidecar {@code mtp.fc}/norm tensors in the shared slots of every NextN block; tensors
+     * outside {@code mtp.} pass on.
      */
     public static void exaone45Tensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
-        if (out.isConsumed(hfName) || !hfName.startsWith("mtp.")) {
+        if (out.isConsumed(hfName)) {
+            return;
+        }
+        if (!hfName.startsWith("mtp.")) {
+            HfTensorHook.DEFAULT.apply(ctx, hfName, src, out);
             return;
         }
         HfConfig cfg = ctx.config();
@@ -396,8 +420,16 @@ public final class HfDenseClassicHooksB {
         int nh = cfg.requireInt("num_hidden_layers");
         if (hfName.contains(".layers.")) {
             int bid = HfLoadContext.bidOf(hfName);
-            HfTensorHook.DEFAULT.apply(ctx, hfName.replaceFirst("mtp\\.layers\\.\\d+",
-                    "model.layers." + (bid + nh)), src, out);
+            if (bid < 0) {
+                throw new GgufFormatException(cfg.source() + ": MTP tensor without a layer index: " + hfName);
+            }
+            if (cfg.findBool(false, "mtp_share_layers")) {
+                for (int k = 0; k < nNextn; k++) {
+                    applyLayer(ctx, hfName, nh + k, src, out);
+                }
+            } else {
+                applyLayer(ctx, hfName, nh + bid, src, out);
+            }
             return;
         }
         String tail = ".weight";
@@ -423,6 +455,15 @@ public final class HfDenseClassicHooksB {
             default:
                 return;
         }
-        out.add(ctx.names().ggufName(tensor, ctx.blockCount() - 1, tail), src);
+        for (int k = 0; k < nNextn; k++) {
+            out.add(ctx.names().ggufName(tensor, nh + k, tail), src);
+        }
+    }
+
+    /** {@link HfTensorHook#DEFAULT} over {@code hfName}, its {@code mtp.layers.N} prefix moved to layer {@code il}. */
+    private static void applyLayer(HfLoadContext ctx, String hfName, int il, RowSource src, TensorSink out)
+            throws IOException {
+        String renamed = hfName.replaceFirst("mtp\\.layers\\.\\d+", "model.layers." + il);
+        HfTensorHook.DEFAULT.apply(ctx, renamed, src, out);
     }
 }

@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.tokenizer.hf;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.utils.json.Json;
+import com.eonmux.neuralfree.utils.json.JsonException;
 import com.eonmux.neuralfree.utils.json.JsonView;
 import org.junit.Rule;
 import org.junit.Test;
@@ -212,5 +213,53 @@ public class HfSpecialVocabTest {
         JsonView map = config("{'eos_token':'</s>','extra_special_tokens':{'x':'<c>'}}");
         assertEquals(Arrays.asList("<s>", "<a>", "<b>", "</s>", "<c>"),
                 Arrays.asList(HfSpecialVocab.declaredSpecialTokens(tc, map).toArray()));
+    }
+
+    // ------------------------------------------------------------------ clean_spaces and the Metaspace scheme
+
+    private static HfTokenizerJson withPreTokenizer(String preTokenizer) {
+        String doc = "{" + ADDED + "," + MODEL + ",'pre_tokenizer':" + preTokenizer + "}";
+        return HfTokenizerJson.of(Json.parse(json(doc)), "tokenizer.json");
+    }
+
+    @Test
+    public void cleanUpTokenizationSpacesIsWrittenWhenItIsABoolean() throws IOException {
+        Map<String, Object> on = written(HfSpecialVocab.load(files("{'clean_up_tokenization_spaces':true}"),
+                tokenizer(null, null), config("{}"), false, 7));
+        assertEquals(true, on.get(GgufKeys.TOKENIZER_CLEAN_SPACES));
+        Map<String, Object> off = written(HfSpecialVocab.load(files("{'clean_up_tokenization_spaces':false}"),
+                null, config("{}"), false, 7));
+        assertEquals(false, off.get(GgufKeys.TOKENIZER_CLEAN_SPACES));
+        Map<String, Object> text = written(HfSpecialVocab.load(files("{'clean_up_tokenization_spaces':'yes'}"),
+                tokenizer(null, null), config("{}"), false, 7));
+        assertFalse(text.containsKey(GgufKeys.TOKENIZER_CLEAN_SPACES));
+        Map<String, Object> none = written(HfSpecialVocab.load(files(null), tokenizer(null, null), config("{}"),
+                false, 7));
+        assertFalse(none.containsKey(GgufKeys.TOKENIZER_CLEAN_SPACES));
+    }
+
+    @Test
+    public void theMetaspacePrependSchemeIsWrittenAsTheLastMetaspaceStatesIt() throws IOException {
+        Map<String, Object> single = written(HfSpecialVocab.load(files(null),
+                withPreTokenizer("{'type':'Metaspace','replacement':'_','prepend_scheme':'first','split':false}"),
+                config("{}"), false, 7));
+        assertEquals("first", single.get(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME));
+
+        Map<String, Object> sequence = written(HfSpecialVocab.load(files(null), withPreTokenizer(
+                "{'type':'Sequence','pretokenizers':[{'type':'Metaspace','prepend_scheme':'always'},"
+                        + "{'type':'Digits','individual_digits':true},{'type':'Metaspace','prepend_scheme':'never'}]}"),
+                config("{}"), false, 7));
+        assertEquals("never", sequence.get(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME));
+
+        Map<String, Object> legacy = written(HfSpecialVocab.load(files(null),
+                withPreTokenizer("{'type':'Metaspace','add_prefix_space':true}"), config("{}"), false, 7));
+        assertFalse(legacy.containsKey(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME));
+
+        Map<String, Object> byteLevel = written(HfSpecialVocab.load(files(null),
+                withPreTokenizer("{'type':'ByteLevel','add_prefix_space':false}"), config("{}"), false, 7));
+        assertFalse(byteLevel.containsKey(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME));
+
+        HfTokenizerJson numeric = withPreTokenizer("{'type':'Metaspace','prepend_scheme':3}");
+        assertThrows(JsonException.class, () -> HfSpecialVocab.load(files(null), numeric, config("{}"), false, 7));
     }
 }

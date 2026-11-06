@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Typed, read-only view of GGUF metadata with llama.cpp loader semantics
@@ -109,6 +110,23 @@ public final class GgufKv {
     /** True when the key is present (scalar or array). */
     public boolean has(String keyFmt) {
         return values.containsKey(key(keyFmt));
+    }
+
+    /**
+     * The concrete metadata keys that start with {@code prefix}, in sorted order: the enumeration
+     * llama.cpp's loaders do by index ({@code llama_model_meta_key_by_index}) to collect the keyed
+     * families such as {@code <arch>.decision.temperature.<name>}.
+     */
+    public List<String> keysWithPrefix(String prefix) {
+        Objects.requireNonNull(prefix, "prefix");
+        List<String> out = new ArrayList<>();
+        for (String k : values.keySet()) {
+            if (k.startsWith(prefix)) {
+                out.add(k);
+            }
+        }
+        Collections.sort(out);
+        return out;
     }
 
     /** True when the key is present and holds an array. */

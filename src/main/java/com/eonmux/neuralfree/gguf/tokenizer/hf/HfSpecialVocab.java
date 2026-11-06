@@ -20,9 +20,9 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Port of llama.cpp's {@code gguf.SpecialVocab} (LC/gguf-py/gguf/vocab.py:50-386): the merges, the special token ids,
- * the {@code add_*_token} flags and the normalizer flags of a Hugging Face tokenizer, as {@code add_to_gguf} writes
- * them (vocab.py:84-121). The chat template, which SpecialVocab also reads, is resolved by {@link HfChatTemplates}.
+ * Port of llama.cpp's {@code gguf.SpecialVocab} (LC/gguf-py/gguf/vocab.py:50-400): the merges, the special token ids,
+ * the {@code add_*_token} flags, the normalizer flags, the {@code clean_up_tokenization_spaces} decision and the
+ * Metaspace {@code prepend_scheme} of a Hugging Face tokenizer, as {@code add_to_gguf} writes them (vocab.py:88-134). The chat template, which SpecialVocab also reads, is resolved by {@link HfChatTemplates}.
  *
  * <p>Every special token id is kept below the vocabulary size given to {@link #load}, and the {@code cls} id, for
  * which the converter's writer has no handler (vocab.py:91-96), is never written. Instances are immutable.</p>
@@ -82,28 +82,23 @@ public final class HfSpecialVocab {
     private final List<String> merges;
     private final Map<String, Integer> ids;
     private final Map<String, Boolean> add;
-    private final Boolean normalizerNfc;
-    private final Boolean normalizerLowercase;
-    private final Boolean normalizerStripAccents;
+    private final Flags flags;
     private final int nVocab;
 
     private HfSpecialVocab(boolean loadMerges, List<String> merges, Map<String, Integer> ids,
-                           Map<String, Boolean> add, Boolean nfc, Boolean lowercase, Boolean stripAccents,
-                           int nVocab) {
+                           Map<String, Boolean> add, Flags flags, int nVocab) {
         this.loadMerges = loadMerges;
         this.merges = Collections.unmodifiableList(new ArrayList<>(merges));
         this.ids = Collections.unmodifiableMap(new LinkedHashMap<>(ids));
         this.add = Collections.unmodifiableMap(new LinkedHashMap<>(add));
-        this.normalizerNfc = nfc;
-        this.normalizerLowercase = lowercase;
-        this.normalizerStripAccents = stripAccents;
+        this.flags = flags;
         this.nVocab = nVocab;
     }
 
     /**
      * Reads the special vocabulary as {@code SpecialVocab(dir, load_merges, n_vocab=nVocab)} does: tokenizer.json
-     * (merges, normalizer, post-processor), tokenizer_config.json (add flags and special token texts, matched
-     * against tokenizer.json {@code added_tokens}), then config.json {@code <typ>_token_id} (or its
+     * (merges, normalizer, pre-tokenizer, post-processor), tokenizer_config.json ({@code clean_up_tokenization_spaces},
+     * add flags and special token texts, matched against tokenizer.json {@code added_tokens}), then config.json {@code <typ>_token_id} (or its
      * {@code text_config}) for the slots still unset, then {@code merges.txt} when merges were requested and
      * tokenizer.json has none.
      *
@@ -114,6 +109,7 @@ public final class HfSpecialVocab {
      * @param nVocab     the token count; ids at or above it are skipped
      * @throws IOException         when a tokenizer file cannot be read
      * @throws GgufFormatException when a special token id is negative
+     * @throws com.eonmux.neuralfree.utils.json.JsonException when a Metaspace {@code prepend_scheme} is not a string
      */
     public static HfSpecialVocab load(HfTokenizerFiles files, HfTokenizerJson tj, JsonView config,
                                       boolean loadMerges, int nVocab) throws IOException {
@@ -122,10 +118,12 @@ public final class HfSpecialVocab {
         Loader l = new Loader(nVocab);
         if (tj != null && loadMerges) l.merges.addAll(Arrays.asList(tj.model().merges()));
         if (tj != null && tj.normalizer() != null) l.parseNormalizer(tj.normalizer());
+        if (tj != null && tj.preTokenizer() != null) l.parsePreTokenizer(tj.preTokenizer());
         l.loadTokenizerConfig(tj, files.readTokenizerConfig());
         l.loadConfigIds(config);
         if (loadMerges && l.merges.isEmpty()) l.merges.addAll(files.readMergesTxt());
-        return new HfSpecialVocab(loadMerges, l.merges, l.ids, l.add, l.nfc, l.lowercase, l.stripAccents, nVocab);
+        Flags flags = new Flags(l.nfc, l.lowercase, l.stripAccents, l.cleanSpaces, l.prependScheme);
+        return new HfSpecialVocab(loadMerges, l.merges, l.ids, l.add, flags, nVocab);
     }
 
     /** The merges as {@code "a b"} strings (unmodifiable). */
@@ -142,8 +140,7 @@ public final class HfSpecialVocab {
 
     /** This vocabulary with {@code merges} in place of its own ({@code special_vocab.merges = merges}). */
     public HfSpecialVocab withMerges(List<String> newMerges) {
-        return new HfSpecialVocab(loadMerges, newMerges, ids, add, normalizerNfc, normalizerLowercase,
-                normalizerStripAccents, nVocab);
+        return new HfSpecialVocab(loadMerges, newMerges, ids, add, flags, nVocab);
     }
 
     /**
@@ -160,8 +157,7 @@ public final class HfSpecialVocab {
         }
         Map<String, Integer> next = new LinkedHashMap<>(ids);
         setSpecialToken(next, nVocab, type, id);
-        return new HfSpecialVocab(loadMerges, merges, next, add, normalizerNfc, normalizerLowercase,
-                normalizerStripAccents, nVocab);
+        return new HfSpecialVocab(loadMerges, merges, next, add, flags, nVocab);
     }
 
     /**
@@ -178,13 +174,13 @@ public final class HfSpecialVocab {
         }
         Map<String, Integer> next = new LinkedHashMap<>(ids);
         next.put(type, id);
-        return new HfSpecialVocab(loadMerges, merges, next, add, normalizerNfc, normalizerLowercase,
-                normalizerStripAccents, nVocab);
+        return new HfSpecialVocab(loadMerges, merges, next, add, flags, nVocab);
     }
 
     /**
-     * Writes the keys {@code add_to_gguf} writes (vocab.py:84-121): the merges, each special token id with a writer
-     * handler, the {@code add_bos/eos/sep_token} flags and the normalizer flags.
+     * Writes the keys {@code add_to_gguf} writes (vocab.py:88-134): the merges, each special token id with a writer
+     * handler, the {@code add_bos/eos/sep_token} flags, the normalizer flags, {@code clean_spaces} and the Metaspace
+     * {@code prepend_scheme}.
      */
     public void writeTo(Map<String, Object> out) {
         if (!merges.isEmpty()) {
@@ -208,11 +204,7 @@ public final class HfSpecialVocab {
             }
             out.put(key, e.getValue());
         }
-        if (normalizerNfc != null) out.put(GgufKeys.TOKENIZER_NORMALIZER_NFC, normalizerNfc);
-        if (normalizerLowercase != null) out.put(GgufKeys.TOKENIZER_NORMALIZER_LOWERCASE, normalizerLowercase);
-        if (normalizerStripAccents != null) {
-            out.put(GgufKeys.TOKENIZER_NORMALIZER_STRIP_ACCENTS, normalizerStripAccents);
-        }
+        flags.writeTo(out);
     }
 
     /**
@@ -365,6 +357,8 @@ public final class HfSpecialVocab {
         Boolean nfc;
         Boolean lowercase;
         Boolean stripAccents;
+        Boolean cleanSpaces;
+        String prependScheme;
 
         Loader(int nVocab) {
             this.nVocab = nVocab;
@@ -398,6 +392,28 @@ public final class HfSpecialVocab {
             }
         }
 
+        /**
+         * {@code _parse_pre_tokenizer} (vocab.py:204-212): the {@code prepend_scheme} of a {@code Metaspace}
+         * pre-tokenizer, the last one of a {@code Sequence} winning; a JSON null unsets it.
+         *
+         * @throws com.eonmux.neuralfree.utils.json.JsonException when a {@code prepend_scheme} is not a string
+         */
+        void parsePreTokenizer(JsonView p) {
+            Object type = p.raw("type");
+            if ("Metaspace".equals(type)) {
+                if (p.has("prepend_scheme")) {
+                    prependScheme = p.raw("prepend_scheme") == null ? null : p.str("prepend_scheme");
+                }
+            } else if ("Sequence".equals(type) && p.raw("pretokenizers") instanceof List) {
+                List<?> items = (List<?>) p.raw("pretokenizers");
+                for (int i = 0; i < items.size(); i++) {
+                    if (items.get(i) instanceof Map) {
+                        parsePreTokenizer(JsonView.of(items.get(i), p.source(), p.path() + ".pretokenizers[" + i + "]"));
+                    }
+                }
+            }
+        }
+
         private static Boolean optionalBool(Object v) {
             return v instanceof Boolean ? (Boolean) v : null;
         }
@@ -408,6 +424,8 @@ public final class HfSpecialVocab {
             for (String key : configView.keys()) tc.put(key, configView.raw(key));
             if (tj != null) applyPostProcessor(tj, tc);
             if (tc.isEmpty()) return;
+            Object clean = tc.get("clean_up_tokenization_spaces");
+            if (clean instanceof Boolean) cleanSpaces = (Boolean) clean;
             List<HfTokenizerJson.AddedToken> added = tj != null ? tj.addedTokens()
                     : Collections.<HfTokenizerJson.AddedToken>emptyList();
             for (String typ : types) {
@@ -613,6 +631,34 @@ public final class HfSpecialVocab {
             sep = tc.get("sep_token");
             if (!truthy(bos) && truthy(cls) && !tc.isEmpty()) tc.put("bos_token", bos = cls);
             if (!truthy(eos) && truthy(sep) && !tc.isEmpty()) tc.put("eos_token", eos = sep);
+        }
+    }
+
+    /**
+     * The optional tokenizer flags {@code add_to_gguf} writes when set: the normalizer flags, {@code clean_spaces} and
+     * the Metaspace {@code prepend_scheme}; null means unset. Immutable.
+     */
+    private static final class Flags {
+        final Boolean nfc;
+        final Boolean lowercase;
+        final Boolean stripAccents;
+        final Boolean cleanSpaces;
+        final String prependScheme;
+
+        Flags(Boolean nfc, Boolean lowercase, Boolean stripAccents, Boolean cleanSpaces, String prependScheme) {
+            this.nfc = nfc;
+            this.lowercase = lowercase;
+            this.stripAccents = stripAccents;
+            this.cleanSpaces = cleanSpaces;
+            this.prependScheme = prependScheme;
+        }
+
+        void writeTo(Map<String, Object> out) {
+            if (nfc != null) out.put(GgufKeys.TOKENIZER_NORMALIZER_NFC, nfc);
+            if (lowercase != null) out.put(GgufKeys.TOKENIZER_NORMALIZER_LOWERCASE, lowercase);
+            if (stripAccents != null) out.put(GgufKeys.TOKENIZER_NORMALIZER_STRIP_ACCENTS, stripAccents);
+            if (cleanSpaces != null) out.put(GgufKeys.TOKENIZER_CLEAN_SPACES, cleanSpaces);
+            if (prependScheme != null) out.put(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME, prependScheme);
         }
     }
 }

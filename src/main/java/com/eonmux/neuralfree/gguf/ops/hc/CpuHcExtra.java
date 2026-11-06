@@ -28,6 +28,12 @@ public final class CpuHcExtra implements CpuLayerExtra {
     private int streamWidth;
     private int nEmbd;
 
+    /** Every hook is a per-row collapse or expand of x and the branch, exact over any step layout. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
     @Override
     public void bind(CpuForwardContext ctx, LayerSpec layer) {
         Objects.requireNonNull(ctx, "ctx");

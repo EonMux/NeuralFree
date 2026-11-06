@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuScratch;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuInt8Fusion;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
@@ -51,6 +52,7 @@ public final class CpuMoeFfn implements CpuFfnBlock {
     private static final String T_WEIGHTS = "moe.weights";
     private static final String T_ROUTER_IN = "moe.router_in";
     private static final String T_SELECTION = "moe.selection";
+    private static final String T_ROW_LOGITS = "moe.row_logits";
     private static final String T_MOE_IN = "moe.moe_in";
     private static final String T_LATENT_IN = "moe.latent_in";
     private static final String T_LATENT_SUM = "moe.latent_sum";
@@ -63,6 +65,7 @@ public final class CpuMoeFfn implements CpuFfnBlock {
     private static final String T_FFN_UP = "moe.ffn_up";
     private static final String T_FFN_OUT = "moe.ffn_out";
     private static final String T_SHEXP_GATE = "moe.shexp_gate";
+    private static final String T_ZERO_WEIGHTS = "moe.zero_weights";
     /** grok-2 parallel combine factor {@code std::sqrt(2) / 2} (grok.cpp:178). */
     private static final float GROK_COMBINE = (float) (Math.sqrt(2.0) / 2.0);
 
@@ -92,7 +95,12 @@ public final class CpuMoeFfn implements CpuFfnBlock {
     private MoeRouting.Params routing;
     private MoeRouting.Params selectionRouting;
     private float[] selection;
+    private MoeRouting.Params mediaRouting;
+    private float[] mediaBias;
+    private float[] rowLogits;
     private MoeRouting.Params chunkRouting;
+    /** Per-token weight sum of the selected identity experts; null without them. */
+    private float[] zeroWeights;
 
     private float[] expertNorm;
     private float[] moeIn;
@@ -106,6 +114,7 @@ public final class CpuMoeFfn implements CpuFfnBlock {
     private ExpertPass routed;
     private ExpertPass chunk;
     private float[] chunkOut;
+    private MoeExpertHeat heat;
 
     private DenseFfn shared;
     private CpuTensorRef sharedGateInp;
@@ -138,6 +147,7 @@ public final class CpuMoeFfn implements CpuFfnBlock {
         }
         this.ctx = Objects.requireNonNull(ctx, "ctx");
         this.mv = ctx.matVec();
+        this.heat = ctx.heat();
         CpuScratch scratch = ctx.scratch();
         CpuWeights w = ctx.weights();
         this.ubatch = scratch.ubatch();
@@ -146,13 +156,16 @@ public final class CpuMoeFfn implements CpuFfnBlock {
 
         gateInp = w.layer(layer, TensorNames.weight(TensorNames.FFN_GATE_INP));
         TensorRef gi = w.describe(gateInp);
-        if (gi.rank() != 2 || gi.ne(1) != spec.nExpert()) {
+        if (gi.rank() != 2 || gi.ne(1) != spec.nRouterExpert()) {
             throw new IllegalStateException("layer " + layer.il() + ": " + gi.name() + " must be [n_embd, "
-                    + spec.nExpert() + "], got " + gi);
+                    + spec.nRouterExpert() + "], got " + gi);
         }
         nEmbd = Math.toIntExact(gi.ne(0));
         gateInpDeltas = ctx.projectionDeltas().serve(layer, TensorNames.weight(TensorNames.FFN_GATE_INP), gateInp, mv);
         bindRouter(w, scratch);
+        if (spec.zeroExperts() > 0) {
+            zeroWeights = scratch.temp(T_ZERO_WEIGHTS, ubatch);
+        }
         bindExpertInput(w, scratch);
         int expertDim = spec.latent() ? spec.latentSize() : nEmbd;
         routed = new ExpertPass(MoeExpertWeights.routed(spec, expertDim), w, routing.k(), spec.weightBeforeFfn(),
@@ -191,22 +204,22 @@ public final class CpuMoeFfn implements CpuFfnBlock {
     }
 
     private void bindRouter(CpuWeights w, CpuScratch scratch) {
-        logits = scratch.temp(T_LOGITS, rows(spec.nExpert()));
+        logits = scratch.temp(T_LOGITS, rows(spec.nRouterExpert()));
         if (wiring.selection == MoeBlocks.Selection.BIASED_LOGITS) {
             routing = MoeRouting.Params.preselected(spec);
-            selectionRouting = new MoeRouting.Params(spec.nExpert(), spec.nUsed(), spec.gating(), 1, 1, false, 1.0f,
-                    false, MoeKernels.SEL_RAW_LOGITS, 0);
-            selection = scratch.temp(T_SELECTION, rows(spec.nExpert()));
+            selectionRouting = new MoeRouting.Params(spec.nRouterExpert(), spec.nUsed(), spec.gating(), 1, 1, false,
+                    1.0f, false, MoeKernels.SEL_RAW_LOGITS, 0, false);
+            selection = scratch.temp(T_SELECTION, rows(spec.nRouterExpert()));
         } else {
             routing = MoeRouting.Params.forExperts(spec);
         }
         if (spec.routerBias()) {
-            routerBias = vector(w, TensorNames.bias(TensorNames.FFN_GATE_INP), spec.nExpert());
+            routerBias = vector(w, TensorNames.bias(TensorNames.FFN_GATE_INP), spec.nRouterExpert());
         }
         if (spec.probBias()) {
             float[] b = w.layerFloatsOrNull(layer, TensorNames.bias(TensorNames.FFN_EXP_PROBS_B));
-            probBias = b != null ? checkLength(b, spec.nExpert(), TensorNames.bias(TensorNames.FFN_EXP_PROBS_B))
-                    : vector(w, TensorNames.FFN_EXP_PROBS_B, spec.nExpert());
+            probBias = b != null ? checkLength(b, spec.nRouterExpert(), TensorNames.bias(TensorNames.FFN_EXP_PROBS_B))
+                    : vector(w, TensorNames.FFN_EXP_PROBS_B, spec.nRouterExpert());
         }
         if (wiring.router == MoeBlocks.RouterInput.SCALED_RESIDUAL) {
             routerIn = scratch.temp(T_ROUTER_IN, rows(nEmbd));
@@ -223,6 +236,25 @@ public final class CpuMoeFfn implements CpuFfnBlock {
         if (spec.hashRouting()) {
             tid2eid = readHashTable(w);
         }
+        if (spec.mediaRouting()) {
+            bindMediaRouting(w, scratch);
+        }
+    }
+
+    /**
+     * The routing of embedding rows on a hash or {@code exp_probs_b_vl} layer (deepseek4.cpp:1290-1301): the router
+     * with {@code exp_probs_b_vl} or no selection bias.
+     */
+    private void bindMediaRouting(CpuWeights w, CpuScratch scratch) {
+        if (wiring.selection == MoeBlocks.Selection.BIASED_LOGITS) {
+            throw new UnsupportedOperationException("layer " + layer.il() + ": embedding-row routing over the"
+                    + " logits + exp_probs_b selection has no llama.cpp graph");
+        }
+        mediaRouting = MoeRouting.Params.forMedia(spec);
+        if (spec.mediaProbBias()) {
+            mediaBias = vector(w, TensorNames.bias(TensorNames.FFN_EXP_PROBS_B_VL), spec.nExpert());
+        }
+        rowLogits = scratch.temp(T_ROW_LOGITS, rows(spec.nExpert()));
     }
 
     /** {@code ffn_gate_tid2eid} ({@code [k, n_vocab]} I32), validated once (deepseek4.cpp:1297-1299). */
@@ -305,6 +337,13 @@ public final class CpuMoeFfn implements CpuFfnBlock {
             x = moeIn;
         }
         MoeRouting.Selection sel = route(n, in, x);
+        if (zeroWeights != null) {
+            sel = MoeRouting.maskZeroExperts(sel, spec.nExpert(), zeroWeights);
+        }
+        if (heat != null) {
+            int[] ids = sel.ids();
+            heat.note(layer.weightLayer(), ids, ids.length);
+        }
         if (spec.latent()) {
             int latent = spec.latentSize();
             mv.matmul(latentDown, x, 0, latentIn, 0, n);
@@ -321,8 +360,15 @@ public final class CpuMoeFfn implements CpuFfnBlock {
         } else {
             routed.run(n, x, sel, out, 0);
         }
+        if (zeroWeights != null) {
+            addZeroExperts(n, x, out);
+        }
         if (chunk != null) {
             MoeRouting.Selection chunkSel = MoeRouting.route(chunkRouting, logits, n, null);
+            if (heat != null) {
+                int[] ids = chunkSel.ids();
+                heat.note(layer.weightLayer(), ids, ids.length);
+            }
             chunk.run(n, out, chunkSel, chunkOut, 0);
             CpuOps.axpy(spec.chunkScale(), chunkOut, 0, out, 0, nx);
         }
@@ -335,9 +381,23 @@ public final class CpuMoeFfn implements CpuFfnBlock {
     }
 
     /**
-     * Router logits, then the expert selection of this step's tokens: hash ids, ids picked by
-     * {@code logits + exp_probs_b} ({@link MoeBlocks.Selection#BIASED_LOGITS}), or the spec's routing; {@code expertIn}
-     * is the experts' input.
+     * Adds the identity experts' share of the routing weight: {@code out[t] += zeroWeights[t] * x[t]}, the
+     * contribution vLLM's zero-expert router computes from the expert input (fused_moe.py:1110-1126).
+     */
+    private void addZeroExperts(int n, float[] x, float[] out) {
+        for (int t = 0; t < n; t++) {
+            float w = zeroWeights[t];
+            int off = t * nEmbd;
+            for (int c = 0; c < nEmbd; c++) {
+                out[off + c] += w * x[off + c];
+            }
+        }
+    }
+
+    /**
+     * Router logits, then the expert selection of this step's rows: token rows by {@link #tokenSelection}, embedding
+     * rows (token id {@code -1}) of a {@link MoeSpec#mediaRouting()} layer by the media routing; {@code expertIn} is
+     * the experts' input.
      */
     private MoeRouting.Selection route(int n, float[] in, float[] expertIn) {
         switch (wiring.router) {
@@ -360,20 +420,74 @@ public final class CpuMoeFfn implements CpuFfnBlock {
                 throw new IllegalStateException("unhandled router input " + wiring.router);
         }
         if (routerBias != null) {
-            CpuOps.addRowBias(logits, 0, n, spec.nExpert(), routerBias, 0);
+            CpuOps.addRowBias(logits, 0, n, spec.nRouterExpert(), routerBias, 0);
         }
+        int[] tokens = ctx.scratch().ints(CpuScratch.TOKEN_IDS);
+        if (mediaRouting != null) {
+            int media = 0;
+            for (int t = 0; t < n; t++) {
+                media += tokens[t] < 0 ? 1 : 0;
+            }
+            if (media > 0) {
+                return routeWithMedia(n, tokens, media);
+            }
+        }
+        return tokenSelection(n, logits, tokens);
+    }
+
+    /**
+     * The selection of {@code n} token rows over their logits {@code lg}: hash ids, ids picked by
+     * {@code logits + exp_probs_b} ({@link MoeBlocks.Selection#BIASED_LOGITS}), or the spec's routing.
+     */
+    private MoeRouting.Selection tokenSelection(int n, float[] lg, int[] tokens) {
         if (tid2eid != null) {
-            int[] ids = MoeCombine.hashIds(ctx.scratch().ints(CpuScratch.TOKEN_IDS), n, routing.k(), tid2eid);
-            return MoeRouting.routePreselected(routing, logits, n, ids);
+            int[] ids = MoeCombine.hashIds(tokens, n, routing.k(), tid2eid);
+            return MoeRouting.routePreselected(routing, lg, n, ids);
         }
         if (selection != null) {
-            int ne = n * spec.nExpert();
-            System.arraycopy(logits, 0, selection, 0, ne);
-            CpuOps.addRowBias(selection, 0, n, spec.nExpert(), probBias, 0);
+            int ne = n * spec.nRouterExpert();
+            System.arraycopy(lg, 0, selection, 0, ne);
+            CpuOps.addRowBias(selection, 0, n, spec.nRouterExpert(), probBias, 0);
             int[] ids = MoeRouting.route(selectionRouting, selection, n, null).ids();
-            return MoeRouting.routePreselected(routing, logits, n, ids);
+            return MoeRouting.routePreselected(routing, lg, n, ids);
         }
-        return MoeRouting.route(routing, logits, n, probBias);
+        return MoeRouting.route(routing, lg, n, probBias);
+    }
+
+    /**
+     * A step holding {@code media} embedding rows: they route through the router with the media bias, the token rows
+     * as {@link #tokenSelection} routes them, each set over its own rows' logits (a mixed paged ubatch holds both).
+     */
+    private MoeRouting.Selection routeWithMedia(int n, int[] tokens, int media) {
+        if (media == n) {
+            return MoeRouting.route(mediaRouting, logits, n, mediaBias);
+        }
+        int[] mediaRows = new int[media];
+        int[] tokenRows = new int[n - media];
+        int[] tokenIds = new int[n - media];
+        int m = 0;
+        int k = 0;
+        for (int t = 0; t < n; t++) {
+            if (tokens[t] < 0) {
+                mediaRows[m++] = t;
+            } else {
+                tokenIds[k] = tokens[t];
+                tokenRows[k++] = t;
+            }
+        }
+        gatherLogits(mediaRows);
+        MoeRouting.Selection mediaSel = MoeRouting.route(mediaRouting, rowLogits, media, mediaBias);
+        gatherLogits(tokenRows);
+        MoeRouting.Selection tokenSel = tokenSelection(tokenRows.length, rowLogits, tokenIds);
+        return MoeRouting.merge(n, tokenRows, tokenSel, mediaRows, mediaSel);
+    }
+
+    /** Copies the router logits of {@code rows} into the first rows of {@link #rowLogits}, in order. */
+    private void gatherLogits(int[] rows) {
+        int ne = spec.nRouterExpert();
+        for (int i = 0; i < rows.length; i++) {
+            System.arraycopy(logits, rows[i] * ne, rowLogits, i * ne, ne);
+        }
     }
 
     /**
@@ -430,6 +544,11 @@ public final class CpuMoeFfn implements CpuFfnBlock {
         return ctx.scratch().slot(CpuScratch.X);
     }
 
+    /** True when the routed experts run the fused int8 pass ({@code CpuInt8Moe}) instead of the per-pair path. */
+    boolean fusedExperts() {
+        return routed != null && routed.fused != null;
+    }
+
     @Override
     public String toString() {
         return "CpuMoeFfn{layer=" + layer.il() + ", kind=" + kind + ", " + spec + (wiring != null ? ", " + wiring : "")
@@ -483,6 +602,8 @@ public final class CpuMoeFfn implements CpuFfnBlock {
         final CpuProjectionDeltas.ExpertSite upSite;
         final CpuProjectionDeltas.ExpertSite gateUpSite;
         final CpuProjectionDeltas.ExpertSite downSite;
+        /** Fused int8 pass of this set, or null when the set runs the generic per-pair path. */
+        final CpuInt8Moe fused;
 
         ExpertPass(MoeExpertWeights plan, CpuWeights weights, int k, boolean weightBefore, float[] postNorm,
                    float postEps) {
@@ -508,6 +629,31 @@ public final class CpuMoeFfn implements CpuFfnBlock {
             this.gateUpSite = plan.fused
                     ? deltas.serveExperts(layer, plan.gateUpName(), w.gateUp, plan.nExpert, mv) : null;
             this.downSite = deltas.serveExperts(layer, plan.downName(), w.down, plan.nExpert, mv);
+            this.fused = fusedCapable(weightBefore, postNorm) ? new CpuInt8Moe(mv) : null;
+        }
+
+        /**
+         * Whether this set runs the fused int8 pass: the engine's fused paths are selected, every projection is
+         * int8, and the set has none of the features the pass leaves to the generic path — a fused
+         * {@code gate_up} tensor, LoRA deltas on any projection, a post-expert norm or llama4's weighted input
+         * scaling.
+         */
+        private boolean fusedCapable(boolean weightBefore, float[] postNorm) {
+            if (!CpuInt8Fusion.enabled() || weightBefore || postNorm != null || plan.fused) {
+                return false;
+            }
+            if (!CpuInt8Moe.isInt8(w.up) || !CpuInt8Moe.isInt8(w.down)) {
+                return false;
+            }
+            if (plan.gated && !CpuInt8Moe.isInt8(w.gate)) {
+                return false;
+            }
+            return empty(gateSite) && empty(upSite) && empty(gateUpSite) && empty(downSite);
+        }
+
+        /** True when a delta site of this set holds no delta. */
+        private boolean empty(CpuProjectionDeltas.ExpertSite site) {
+            return site == null || site.isEmpty();
         }
 
         /**
@@ -527,6 +673,14 @@ public final class CpuMoeFfn implements CpuFfnBlock {
             int nFf = plan.nFf;
             int gu = plan.gateUpRows();
             CpuExpertMatmul.Groups groups = CpuExpertMatmul.Groups.of(ids, pairs, plan.nExpert);
+            if (fused != null && flags == 0) {
+                boolean gated = plan.gated;
+                fused.run(w.up, gated ? w.gate : null, w.down, plan.nExpert, groups, xs, perRow, ids, weights, k,
+                        w.upBias, gated ? w.gateBias : null, w.downBias, gated ? plan.glu : null,
+                        gated ? null : plan.act, plan.params, nFf, plan.outDim, gated ? up : act,
+                        gated ? gate : null, act, expertOut, dst);
+                return;
+            }
             if (plan.fused) {
                 products.run(w.gateUp, plan.nExpert, groups, xs, 0, perRow, gate, 0);
                 if (w.fusedUpScale != null) {

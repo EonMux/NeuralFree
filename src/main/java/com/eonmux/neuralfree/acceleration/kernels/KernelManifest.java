@@ -21,10 +21,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * Immutable, ordered list of the source files of one dual-dialect kernel library, read from
  * {@code <root>/manifest.txt} on the classpath.
  *
- * <p>Format: one path per line, relative to the root. {@code #} starts a comment. Two optional, mutually
- * exclusive leading tags exist:</p>
+ * <p>Format: one path per line, relative to the root. {@code #} starts a comment. Three optional,
+ * mutually exclusive leading tags exist:</p>
  * <ul>
  *   <li>{@code [opencl]} marks a file that only the OpenCL build uses (CUDA and Vulkan never build it);</li>
+ *   <li>{@code [cuda]} marks a file that only the CUDA build uses (its kernels are absent from the OpenCL
+ *       program and from the Vulkan shader set, so hosts select them only on a CUDA device that supports
+ *       them);</li>
  *   <li>{@code [shared]} marks a header that several libraries share: its path is relative to
  *       {@value #SHARED_ROOT} instead of the library root, and every backend builds it. Shared entries
  *       precede every other entry, so the OpenCL concatenation and the CUDA units (which place shared
@@ -48,6 +51,8 @@ public final class KernelManifest {
     public static final String INVENTORY_FILE = "inventory.txt";
     /** Tag that marks an OpenCL-only entry. */
     public static final String OPENCL_TAG = "[opencl]";
+    /** Tag that marks a CUDA-only entry. */
+    public static final String CUDA_TAG = "[cuda]";
     /** Tag that marks a header resolved against {@link #SHARED_ROOT}. */
     public static final String SHARED_TAG = "[shared]";
     /** Classpath root of the {@code [shared]} entries of every library. */
@@ -56,28 +61,35 @@ public final class KernelManifest {
     private static final Map<ClassLoader, Map<String, KernelManifest>> MANIFESTS = new WeakHashMap<>();
     private static final Map<ClassLoader, Map<String, Optional<Set<String>>>> INVENTORIES = new WeakHashMap<>();
 
-    /** One manifest line: a source path, whether only OpenCL builds it and whether it is shared. */
+    /** One manifest line: a source path, whether only OpenCL or only CUDA builds it and whether it is shared. */
     public static final class Entry {
         private final String path;
         private final boolean openClOnly;
+        private final boolean cudaOnly;
         private final boolean shared;
 
         /** A library entry (not shared). */
         public Entry(String path, boolean openClOnly) {
-            this(path, openClOnly, false);
+            this(path, openClOnly, false, false);
+        }
+
+        /** A library entry shared by no backend but the tagged one. */
+        public Entry(String path, boolean openClOnly, boolean shared) {
+            this(path, openClOnly, false, shared);
         }
 
         /**
          * @throws IllegalArgumentException when the path is not a clean relative path, or when the entry
-         *                                  would be both OpenCL-only and shared
+         *                                  combines tags that exclude each other
          */
-        public Entry(String path, boolean openClOnly, boolean shared) {
+        public Entry(String path, boolean openClOnly, boolean cudaOnly, boolean shared) {
             this.path = requireRelativePath(path, "manifest entry");
-            if (openClOnly && shared) {
-                throw new IllegalArgumentException("manifest entry '" + path + "': " + OPENCL_TAG + " and "
-                        + SHARED_TAG + " are mutually exclusive");
+            if (openClOnly && cudaOnly || openClOnly && shared || cudaOnly && shared) {
+                throw new IllegalArgumentException("manifest entry '" + path + "': " + OPENCL_TAG + ", "
+                        + CUDA_TAG + " and " + SHARED_TAG + " are mutually exclusive");
             }
             this.openClOnly = openClOnly;
+            this.cudaOnly = cudaOnly;
             this.shared = shared;
         }
 
@@ -93,6 +105,11 @@ public final class KernelManifest {
         /** True when the entry carries the {@code [opencl]} tag. */
         public boolean openClOnly() {
             return openClOnly;
+        }
+
+        /** True when the entry carries the {@code [cuda]} tag. */
+        public boolean cudaOnly() {
+            return cudaOnly;
         }
 
         /** True when the entry carries the {@code [shared]} tag. */
@@ -121,12 +138,14 @@ public final class KernelManifest {
                 return false;
             }
             Entry that = (Entry) o;
-            return openClOnly == that.openClOnly && shared == that.shared && path.equals(that.path);
+            return openClOnly == that.openClOnly && cudaOnly == that.cudaOnly
+                    && shared == that.shared && path.equals(that.path);
         }
 
         @Override
         public int hashCode() {
-            return (path.hashCode() * 31 + (openClOnly ? 1 : 0)) * 31 + (shared ? 1 : 0);
+            return ((((path.hashCode() * 31 + (openClOnly ? 1 : 0)) * 31) + (cudaOnly ? 1 : 0)) * 31)
+                    + (shared ? 1 : 0);
         }
 
         /** The manifest line form: the tag, if any, then the path. */
@@ -134,6 +153,9 @@ public final class KernelManifest {
         public String toString() {
             if (openClOnly) {
                 return OPENCL_TAG + " " + path;
+            }
+            if (cudaOnly) {
+                return CUDA_TAG + " " + path;
             }
             return shared ? SHARED_TAG + " " + path : path;
         }
@@ -204,19 +226,23 @@ public final class KernelManifest {
             }
             String where = origin + ":" + (i + 1) + ": ";
             boolean openClOnly = false;
+            boolean cudaOnly = false;
             boolean shared = false;
             while (line.startsWith("[")) {
                 int close = line.indexOf(']');
                 String tag = close < 0 ? line : line.substring(0, close + 1);
                 if (OPENCL_TAG.equals(tag) && !openClOnly) {
                     openClOnly = true;
+                } else if (CUDA_TAG.equals(tag) && !cudaOnly) {
+                    cudaOnly = true;
                 } else if (SHARED_TAG.equals(tag) && !shared) {
                     shared = true;
-                } else if (OPENCL_TAG.equals(tag) || SHARED_TAG.equals(tag)) {
-                    throw new IllegalArgumentException(where + "repeated tag '" + tag + "'");
                 } else {
-                    throw new IllegalArgumentException(where + "unknown tag '" + tag + "'; the tags are "
-                            + OPENCL_TAG + " and " + SHARED_TAG);
+                    throw new IllegalArgumentException(where + (OPENCL_TAG.equals(tag) || CUDA_TAG.equals(tag)
+                            || SHARED_TAG.equals(tag)
+                            ? "repeated or conflicting tag '" + tag + "'"
+                            : "unknown tag '" + tag + "'; the tags are " + OPENCL_TAG + ", " + CUDA_TAG
+                            + " and " + SHARED_TAG));
                 }
                 line = line.substring(close + 1).trim();
             }
@@ -226,7 +252,7 @@ public final class KernelManifest {
             }
             Entry entry;
             try {
-                entry = new Entry(line, openClOnly, shared);
+                entry = new Entry(line, openClOnly, cudaOnly, shared);
             } catch (IllegalArgumentException e) {
                 throw new IllegalArgumentException(where + e.getMessage(), e);
             }
@@ -307,12 +333,12 @@ public final class KernelManifest {
 
     /**
      * Unmodifiable paths of the entries that every backend builds (the untagged and {@code [shared]}
-     * entries), in order.
+     * entries, so not the {@code [opencl]} and {@code [cuda]} ones), in order.
      */
     public List<String> portablePaths() {
         List<String> out = new ArrayList<>();
         for (Entry e : entries) {
-            if (!e.openClOnly()) {
+            if (!e.openClOnly() && !e.cudaOnly()) {
                 out.add(e.path());
             }
         }
@@ -324,6 +350,17 @@ public final class KernelManifest {
         List<String> out = new ArrayList<>();
         for (Entry e : entries) {
             if (e.openClOnly()) {
+                out.add(e.path());
+            }
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    /** Unmodifiable paths of the {@code [cuda]} entries, in order. */
+    public List<String> cudaOnlyPaths() {
+        List<String> out = new ArrayList<>();
+        for (Entry e : entries) {
+            if (e.cudaOnly()) {
                 out.add(e.path());
             }
         }
@@ -351,6 +388,57 @@ public final class KernelManifest {
      */
     static Availability inventoryCoverage(ClassLoader cl, String libraryId, String sourceRoot,
                                           Set<String> built, String builtWhat) {
+        return coverage(cl, libraryId, sourceRoot, built, builtWhat, Collections.<String>emptySet());
+    }
+
+    /**
+     * Whether a portable backend build (one built from the untagged and {@code [shared]} sources, such as the
+     * Vulkan shaders) covers the inventory of a library: as {@link #inventoryCoverage}, over the inventory
+     * kernels whose source is not a {@code [cuda]} entry of the library's manifest.
+     */
+    static Availability portableInventoryCoverage(ClassLoader cl, String libraryId, String sourceRoot,
+                                                  Set<String> built, String builtWhat) {
+        Set<String> cudaOnly;
+        try {
+            cudaOnly = cudaOnlyInventoryKernels(cl, sourceRoot);
+        } catch (RuntimeException e) {
+            return Availability.no("kernel manifest classpath:" + sourceRoot + "/" + MANIFEST_FILE
+                    + " is unreadable: " + e.getMessage());
+        }
+        return coverage(cl, libraryId, sourceRoot, built, builtWhat, cudaOnly);
+    }
+
+    /**
+     * The inventory kernels of {@code root} whose source (the inventory's second column) is a {@code [cuda]}
+     * entry of the library's manifest: only the CUDA build provides them. Empty when the library has no
+     * manifest or no inventory.
+     *
+     * @throws IllegalArgumentException when the manifest exists but is invalid
+     */
+    public static Set<String> cudaOnlyInventoryKernels(ClassLoader cl, String root) {
+        Objects.requireNonNull(cl, "class loader must not be null");
+        String r = requireRoot(root);
+        String inventoryText = readText(cl, r + "/" + INVENTORY_FILE);
+        if (inventoryText == null || readText(cl, r + "/" + MANIFEST_FILE) == null) {
+            return Collections.emptySet();
+        }
+        Set<String> cudaSources = new HashSet<>(load(cl, r).cudaOnlyPaths());
+        Set<String> out = new LinkedHashSet<>();
+        for (String line : inventoryText.split("\r?\n")) {
+            String t = line.trim();
+            if (t.isEmpty() || t.startsWith("#")) {
+                continue;
+            }
+            String[] cols = t.split("[\t ]+", 3);
+            if (cols.length > 1 && cudaSources.contains(cols[1])) {
+                out.add(cols[0]);
+            }
+        }
+        return Collections.unmodifiableSet(out);
+    }
+
+    private static Availability coverage(ClassLoader cl, String libraryId, String sourceRoot, Set<String> built,
+                                         String builtWhat, Set<String> exempt) {
         Optional<Set<String>> inventory;
         try {
             inventory = inventory(cl, sourceRoot);
@@ -364,7 +452,12 @@ public final class KernelManifest {
                     + " updateKernelInventory Gradle task)");
         }
         List<String> missing = new ArrayList<>();
+        int required = 0;
         for (String name : inventory.get()) {
+            if (exempt.contains(name)) {
+                continue;
+            }
+            required++;
             if (!built.contains(name)) {
                 missing.add(name);
             }
@@ -375,7 +468,7 @@ public final class KernelManifest {
         Collections.sort(missing);
         StringBuilder sb = new StringBuilder();
         sb.append(libraryId.toUpperCase(java.util.Locale.ROOT)).append(" kernel inventory incomplete: ")
-                .append(missing.size()).append(" of ").append(inventory.get().size())
+                .append(missing.size()).append(" of ").append(required)
                 .append(" kernels are missing from ").append(builtWhat).append(" (");
         int shown = Math.min(missing.size(), 5);
         for (int i = 0; i < shown; i++) {

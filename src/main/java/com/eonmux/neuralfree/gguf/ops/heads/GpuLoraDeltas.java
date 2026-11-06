@@ -29,10 +29,12 @@ import java.util.Objects;
  * {@code A} and {@code scale * B} are uploaded once as F32 and owned by the delta, which releases them on
  * {@link AutoCloseable#close}. Every dispatch is enqueued on the queue of the {@link GpuOps} the delta was built with.
  * Between steps, on the engine thread, the bound scale rewrites the host {@code scale * B} and re-uploads the buffer
- * in place ({@link Rescalable#rescale}, LR-1): no kernel ABI change, the device bytes of the same buffer change and
+ * in place ({@link Rescalable#rescale}): no kernel ABI change, the device bytes of the same buffer change and
  * every following dispatch reads the new B. A rescale after the last dispatch of a step and before the first of the
- * next one is safe; the fencers of {@code LoraRegistry} events (PC-1's ParameterChanges) keep that between registry
- * events and steps.
+ * next one is safe; the fencers of {@code LoraRegistry} events keep that between registry
+ * events and steps. An expert or embedding delta over the ids from a later element (a per-request adapter's run of
+ * rows, {@link GpuProjectionDeltas}) first copies that slice of the ids to the front of a buffer it owns, since
+ * the kernels read the ids from element 0.
  */
 public final class GpuLoraDeltas {
 
@@ -65,7 +67,7 @@ public final class GpuLoraDeltas {
     }
 
     /**
-     * A device delta whose bound scale rewrites its {@code scale * B} buffer in place between steps (LR-1).
+     * A device delta whose bound scale rewrites its {@code scale * B} buffer in place between steps.
      */
     public interface Rescalable {
         /** Rewrites the bound scale to {@code userScale}; the next dispatch reads the new {@code B}. */
@@ -107,10 +109,11 @@ public final class GpuLoraDeltas {
         }
 
         @Override
-        public void add(int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff, int yStride) {
+        public void add(float scale, int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff,
+                        int yStride) {
             for (int t = 0; t < nTokens; t += ubatch) {
                 int n = Math.min(ubatch, nTokens - t);
-                kernel.add(n, zeroSlots(), x, xOff + t * xStride, xStride, y, yOff + t * yStride, yStride);
+                kernel.add(scale, n, zeroSlots(), x, xOff + t * xStride, xStride, y, yOff + t * yStride, yStride);
             }
         }
 
@@ -140,12 +143,14 @@ public final class GpuLoraDeltas {
         private final GpuBuffer b;
         private final List<GpuBuffer> owned = new ArrayList<>();
         private final GpuBuffer a;
+        private final RunIds runIds;
 
         Experts(GpuOps ops, LoraAdapter.Delta d) {
             requireKind(d, LoraAdapter.Target.EXPERTS);
             this.delta = d;
             this.ops = Objects.requireNonNull(ops, "ops");
             this.pair = d.pair();
+            this.runIds = new RunIds(ops, pair.target());
             HeadsKernels.checkLoraShape(pair.inDim(), pair.outDim(), pair.rank(), pair.experts());
             try {
                 this.a = upload(ops, pair.target() + LoraAdapterLoader.SUFFIX_A, d.a(), owned, true);
@@ -158,9 +163,10 @@ public final class GpuLoraDeltas {
         }
 
         @Override
-        public void add(int nTokens, int k, GpuBuffer ids, GpuBuffer x, int xOff, boolean tokenRows, GpuBuffer y,
-                        int yOff) {
+        public void add(float scale, int nTokens, int k, GpuBuffer ids, int idsOff, GpuBuffer x, int xOff,
+                        boolean tokenRows, GpuBuffer y, int yOff) {
             int pairs = Math.multiplyExact(nTokens, k);
+            ids = runIds.slice(ids, idsOff, pairs);
             int in = pair.inDim();
             GpuBuffer src = x;
             int srcOff = xOff;
@@ -176,16 +182,17 @@ public final class GpuLoraDeltas {
                 srcOff = rows.offset();
             }
             ScratchSlot tmp = ops.scratch().temp(TEMP_TMP, (long) pairs * pair.rank());
-            stages(pairs, ids, src, srcOff, xStride, tmp, y, yOff);
+            stages(scale, pairs, ids, src, srcOff, xStride, tmp, y, yOff);
         }
 
-        private void stages(int pairs, GpuBuffer ids, GpuBuffer x, int xOff, int xStride, ScratchSlot tmp,
-                            GpuBuffer y, int yOff) {
+        private void stages(float scale, int pairs, GpuBuffer ids, GpuBuffer x, int xOff, int xStride,
+                            ScratchSlot tmp, GpuBuffer y, int yOff) {
             for (int stage : new int[]{HeadsKernels.LORA_STAGE_DOWN, HeadsKernels.LORA_STAGE_UP}) {
                 long[] global = {HeadsKernels.loraGlobal(stage, pairs, pair.rank(), pair.outDim())};
                 ops.enqueue(HeadsKernels.SWITCHED_LORA_ADD, global, new long[]{HeadsKernels.LORA_LOCAL},
                         pairs, pair.inDim(), pair.outDim(), pair.rank(), stage, pair.experts(), xStride, xOff,
-                        pair.outDim(), yOff, tmp.offset(), ids, a, b, x, tmp.buffer(), y);
+                        pair.outDim(), yOff, tmp.offset(), stage == HeadsKernels.LORA_STAGE_UP ? scale : 1.0f,
+                        ids, a, b, x, tmp.buffer(), y);
             }
         }
 
@@ -197,6 +204,7 @@ public final class GpuLoraDeltas {
 
         @Override
         public void close() {
+            runIds.close();
             SwitchedLoraExtra.closeAll(owned);
         }
     }
@@ -211,12 +219,14 @@ public final class GpuLoraDeltas {
         private final int ubatch;
         private final List<GpuBuffer> owned = new ArrayList<>();
         private final GpuBuffer a;
+        private final RunIds runIds;
 
         Embedding(GpuOps ops, LoraAdapter.Delta d) {
             requireKind(d, LoraAdapter.Target.EMBEDDING);
             this.delta = d;
             this.ops = Objects.requireNonNull(ops, "ops");
             this.pair = d.pair();
+            this.runIds = new RunIds(ops, pair.target());
             this.ubatch = ops.scratch().ubatch();
             HeadsKernels.checkLoraShape(pair.rank(), pair.outDim(), pair.rank(), 1);
             if ((long) pair.inDim() * pair.rank() > Integer.MAX_VALUE) {
@@ -238,10 +248,11 @@ public final class GpuLoraDeltas {
         }
 
         @Override
-        public void add(int nTokens, GpuBuffer ids, GpuBuffer y, int yOff, int yStride) {
+        public void add(float scale, int nTokens, GpuBuffer ids, int idsOff, GpuBuffer y, int yOff, int yStride) {
             if (nTokens > ubatch) {
                 throw new IllegalArgumentException("LoRA embedding delta of " + nTokens + " rows, ubatch is " + ubatch);
             }
+            ids = runIds.slice(ids, idsOff, nTokens);
             int r = pair.rank();
             ScratchSlot tmp = ops.scratch().temp(TEMP_TMP, (long) nTokens * r);
             ops.enqueue(FlowKernels.GATHER_ROWS, new long[]{FlowKernels.gatherGlobal(nTokens, r)},
@@ -249,7 +260,7 @@ public final class GpuLoraDeltas {
             long[] global = {HeadsKernels.loraGlobal(HeadsKernels.LORA_STAGE_UP, nTokens, r, pair.outDim())};
             ops.enqueue(HeadsKernels.SWITCHED_LORA_ADD, global, new long[]{HeadsKernels.LORA_LOCAL},
                     nTokens, r, pair.outDim(), r, HeadsKernels.LORA_STAGE_UP, 1, r, 0, yStride, yOff, tmp.offset(),
-                    zeroSlots, a, b, ops.placeholders().readOnlyFloats(), tmp.buffer(), y);
+                    scale, zeroSlots, a, b, ops.placeholders().readOnlyFloats(), tmp.buffer(), y);
         }
 
         @Override
@@ -260,7 +271,52 @@ public final class GpuLoraDeltas {
 
         @Override
         public void close() {
+            runIds.close();
             SwitchedLoraExtra.closeAll(owned);
+        }
+    }
+
+    /**
+     * The owned device buffer an id slice is copied to the front of, grown on demand: the kernels read the ids from
+     * element 0, so a run of rows starting later in the step reads its copy. The copy is enqueued on the delta's
+     * queue ahead of the kernels that read it. An outgrown buffer stays allocated until {@link #close}, since
+     * enqueued kernels may still read it.
+     */
+    private static final class RunIds implements AutoCloseable {
+        private final GpuOps ops;
+        private final String what;
+        private final List<GpuBuffer> buffers = new ArrayList<>();
+        private GpuBuffer buffer;
+        private long capacity;
+
+        RunIds(GpuOps ops, String target) {
+            this.ops = ops;
+            this.what = target + " LoRA run ids";
+        }
+
+        /** {@code ids} itself for {@code idsOff == 0}, else the owned buffer holding {@code ids[idsOff, +count)}. */
+        GpuBuffer slice(GpuBuffer ids, int idsOff, int count) {
+            if (idsOff == 0) {
+                return ids;
+            }
+            if (idsOff < 0 || count < 1) {
+                throw new IllegalArgumentException(what + ": slice of " + count + " ids at " + idsOff);
+            }
+            if (count > capacity) {
+                buffer = SwitchedLoraExtra.allocateFloats(ops, what, count, false);
+                buffers.add(buffer);
+                capacity = count;
+            }
+            ops.queue().enqueueCopyBuffer(ids, (long) idsOff * Integer.BYTES, buffer, 0L,
+                    (long) count * Integer.BYTES);
+            return buffer;
+        }
+
+        @Override
+        public void close() {
+            buffer = null;
+            capacity = 0;
+            SwitchedLoraExtra.closeAll(buffers);
         }
     }
 

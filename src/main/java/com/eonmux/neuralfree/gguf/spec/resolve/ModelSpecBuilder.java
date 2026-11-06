@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.arch.ArchEntry;
 import com.eonmux.neuralfree.gguf.arch.ArchRegistry;
 import com.eonmux.neuralfree.gguf.arch.MemoryKind;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
+import com.eonmux.neuralfree.gguf.arch.PoolingKind;
 import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.arch.UnsupportedArchException;
 import com.eonmux.neuralfree.gguf.hparams.ArchHparamsHook;
@@ -25,8 +26,10 @@ import com.eonmux.neuralfree.gguf.spec.MsaSpec;
 import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
 import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
+import com.eonmux.neuralfree.gguf.spec.Step5Spec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
+import com.eonmux.neuralfree.gguf.spec.Zamba2Spec;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -90,8 +93,14 @@ public final class ModelSpecBuilder {
     private final MlaResolver mla;
     private final RecurrentResolver recurrent;
     private final SparseResolver sparse;
+    private final PoolingKind poolingOverride;
 
     private ModelSpecBuilder(ModelHparams hp, TensorCatalog tc, MemoryConfig cfg, int nCtxSeq) {
+        this(hp, tc, cfg, nCtxSeq, null);
+    }
+
+    private ModelSpecBuilder(ModelHparams hp, TensorCatalog tc, MemoryConfig cfg, int nCtxSeq,
+                             PoolingKind poolingOverride) {
         this.hp = hp;
         this.tc = tc;
         this.arch = hp.arch();
@@ -102,8 +111,9 @@ public final class ModelSpecBuilder {
         this.residual = new ResidualResolver(hp, tc);
         this.ffn = new FfnResolver(hp, tc);
         this.mla = new MlaResolver(hp, tc, cfg);
-        this.recurrent = new RecurrentResolver(hp, tc);
+        this.recurrent = new RecurrentResolver(hp, tc, rope);
         this.sparse = new SparseResolver(hp, tc);
+        this.poolingOverride = poolingOverride;
     }
 
     /**
@@ -143,6 +153,18 @@ public final class ModelSpecBuilder {
      * @throws IllegalArgumentException for a negative {@code nCtxSeq} or inconsistent resolved values
      */
     public static ModelSpec build(GgufKv kv, TensorCatalog tc, MemoryConfig cfg, int nCtxSeq) {
+        return build(kv, tc, cfg, nCtxSeq, null);
+    }
+
+    /**
+     * The spec for a session of {@code cfg} and per-sequence context {@code nCtxSeq}, the head pooling taken from
+     * {@code poolingOverride} ({@code neuralfree.pooling}, llama.cpp {@code --pooling}) when not null.
+     *
+     * @param poolingOverride the pooling type override, or null for the GGUF's {@code <arch>.pooling_type}
+     * @throws IllegalArgumentException when a {@code rank} override finds no classifier head, naming it
+     */
+    public static ModelSpec build(GgufKv kv, TensorCatalog tc, MemoryConfig cfg, int nCtxSeq,
+                                  PoolingKind poolingOverride) {
         Objects.requireNonNull(kv, "kv");
         Objects.requireNonNull(tc, "tc");
         Objects.requireNonNull(cfg, "cfg");
@@ -157,7 +179,7 @@ public final class ModelSpecBuilder {
         refuseMtpOnly(hp, tc);
         ModelSpecValidator.checkGraphAsserts(hp);
         int ctx = nCtxSeq > 0 ? nCtxSeq : cfg.autoContext() ? hp.nCtxTrain() : cfg.nCtx();
-        ModelSpec spec = new ModelSpecBuilder(hp, tc, cfg, ctx).assemble();
+        ModelSpec spec = new ModelSpecBuilder(hp, tc, cfg, ctx, poolingOverride).assemble();
         ModelSpecValidator.checkShapes(spec, ModelSpecValidator.vocabTokens(kv, hp));
         return spec;
     }
@@ -410,7 +432,7 @@ public final class ModelSpecBuilder {
      * absent NextN blocks are excluded by {@link ScheduleResolver}.
      */
     static ArchEntry withNextnProbe(ArchEntry entry, TensorCatalog tc) {
-        if (entry.arch() != Arch.DEEPSEEK4) {
+        if (entry.arch() != Arch.DEEPSEEK4 && entry.arch() != Arch.DEEPSEEK41) {
             return entry;
         }
         ArchHparamsHook hook = entry.hook();
@@ -448,7 +470,7 @@ public final class ModelSpecBuilder {
             b.nextnLayer(mainLayer(first + i, first + i, false, false));
         }
         b.embedding(new EmbeddingResolver(hp, tc).resolve());
-        b.head(new HeadResolver(hp, tc).resolve());
+        b.head(new HeadResolver(hp, tc, poolingOverride).resolve());
         return b.build();
     }
 
@@ -483,7 +505,7 @@ public final class ModelSpecBuilder {
             }
         }
         b.embedding(new EmbeddingResolver(hp, tc).resolve());
-        b.head(new HeadResolver(hp, tc).resolve());
+        b.head(new HeadResolver(hp, tc, poolingOverride).resolve());
         if (arch == Arch.LFM2 && !hp.causal() && hp.nLayerDecision() > 0) {
             b.memoryKind(MemoryKind.NONE);
         }
@@ -529,18 +551,22 @@ public final class ModelSpecBuilder {
         Mixer m = mixer(wl);
         FfnResolver.Result f = ffn.resolve(wl);
         ResidualSpec r = residual.resolve(wl);
+        int loop = trunk ? schedule.schedule().loopIndex(slot) : -1;
         LayerSpec.Builder b = LayerSpec.builder(slot, m.kind, f.kind())
                 .weightLayer(wl)
+                .loopIndex(loop)
                 .norm(norm.resolve(wl))
                 .residual(r)
-                .attention(ownedBySlot(m.attention, slot, wl))
+                .attention(dualAttention(ownedBySlot(m.attention, slot, wl), wl, loop))
                 .parallelAttention(m.parallel)
                 .mla(m.mla)
                 .dsa(m.dsa)
                 .msa(m.msa)
+                .step5(m.step5)
                 .dsv4(m.dsv4)
                 .recurrent(m.recurrent)
                 .rope(m.rope)
+                .zamba2(m.zamba2)
                 .ffn(f.ffn())
                 .moe(f.moe());
         if (slot != wl && (m.dsa != null || m.dsv4 != null)) {
@@ -551,6 +577,19 @@ public final class ModelSpecBuilder {
             b.extra(id);
         }
         return b.build();
+    }
+
+    /**
+     * The gated mixed attention of a repeat schedule's later passes (IQuestLoopCoder): pass {@code loop > 0} reads
+     * the first pass's cache of the same block layer (slot {@code wl}, which owns the loop-0 rows) and its own cache
+     * over a sliding window. {@link AttentionSpec#dualReadLayer} is an absolute slot: it is set after
+     * {@link #ownedBySlot}, so it is not translated with the layers.
+     */
+    private AttentionSpec dualAttention(AttentionSpec a, int wl, int loop) {
+        if (a == null || loop <= 0 || !hp.repeatDualAttention()) {
+            return a;
+        }
+        return a.toBuilder().dualRead(wl, hp.repeatLocalWindow()).build();
     }
 
     /**
@@ -575,45 +614,67 @@ public final class ModelSpecBuilder {
         private final MlaSpec mla;
         private final DsaSpec dsa;
         private final MsaSpec msa;
+        private final Step5Spec step5;
         private final Dsv4Spec dsv4;
         private final RecurrentSpec recurrent;
         private final RopeSpec rope;
+        private final Zamba2Spec zamba2;
 
         private Mixer(MixerKind kind, AttentionSpec attention, boolean parallel, MlaSpec mla, DsaSpec dsa, MsaSpec msa,
-                      Dsv4Spec dsv4, RecurrentSpec recurrent, RopeSpec rope) {
+                      Dsv4Spec dsv4, RecurrentSpec recurrent, RopeSpec rope, Zamba2Spec zamba2) {
+            this(kind, attention, parallel, mla, dsa, msa, null, dsv4, recurrent, rope, zamba2);
+        }
+
+        private Mixer(MixerKind kind, AttentionSpec attention, boolean parallel, MlaSpec mla, DsaSpec dsa, MsaSpec msa,
+                      Step5Spec step5, Dsv4Spec dsv4, RecurrentSpec recurrent, RopeSpec rope, Zamba2Spec zamba2) {
             this.kind = kind;
             this.attention = attention;
             this.parallel = parallel;
             this.mla = mla;
             this.dsa = dsa;
             this.msa = msa;
+            this.step5 = step5;
             this.dsv4 = dsv4;
             this.recurrent = recurrent;
             this.rope = rope;
+            this.zamba2 = zamba2;
         }
 
         /** A softmax-attention mixer (or none, for a null {@code attention}), optionally under a sparse facet. */
         static Mixer attention(MixerKind kind, AttentionSpec attention, DsaSpec dsa, MsaSpec msa, RopeSpec rope) {
-            return new Mixer(kind, attention, false, null, dsa, msa, null, null, rope);
+            return new Mixer(kind, attention, false, null, dsa, msa, null, null, rope, null);
         }
     }
 
     private Mixer mixer(int il) {
+        if (arch == Arch.STEP5) {
+            return step5Mixer(il);
+        }
         if (arch == Arch.WAVTOKENIZER_DEC) {
+            return Mixer.attention(MixerKind.NONE, null, null, null, null);
+        }
+        if (arch == Arch.ZAMBA2) {
+            return zamba2Mixer(il);
+        }
+        if (arch == Arch.INKLING) {
+            return new Mixer(MixerKind.INKLING, attention.resolve(il), false, null, null, null, null,
+                    recurrent.resolveInkling(il), null, null);
+        }
+        if (arch == Arch.DORY && hp.isMlpLayer(il)) {
             return Mixer.attention(MixerKind.NONE, null, null, null, null);
         }
         if (recurrent.isRecurrentLayer(il)) {
             RecurrentSpec rec = recurrent.resolve(il);
             if (arch == Arch.FALCON_H1) {
                 AttentionSpec a = attention.resolve(il);
-                return new Mixer(recurrent.kind(), a, true, null, null, null, null, rec, attentionRope(il, a));
+                return new Mixer(recurrent.kind(), a, true, null, null, null, null, rec, attentionRope(il, a), null);
             }
-            return new Mixer(recurrent.kind(), null, false, null, null, null, null, rec, null);
+            return new Mixer(recurrent.kind(), null, false, null, null, null, null, rec, null, null);
         }
-        if (arch == Arch.DEEPSEEK4) {
+        if (arch == Arch.DEEPSEEK4 || arch == Arch.DEEPSEEK41) {
             Dsv4Spec d = sparse.dsv4(il);
             RopeSpec r = rope.appliesRope(il) ? rope.forLayer(il, d.ropeDim(), d.headDim() - d.ropeDim()) : null;
-            return new Mixer(MixerKind.DSV4, null, false, null, null, null, d, null, r);
+            return new Mixer(MixerKind.DSV4, null, false, null, null, null, d, null, r, null);
         }
         MsaSpec msa = sparse.msa(il);
         if (msa != null) {
@@ -650,13 +711,56 @@ public final class ModelSpecBuilder {
         return (arch == Arch.NEMOTRON_H || arch == Arch.NEMOTRON_H_MOE) && il < hp.nLayer() && hp.nFf(il) != 0;
     }
 
+    /**
+     * Step5 layer: GQA with the per-head output gate, and the region indexer on full-attention layers. A block without
+     * the indexer's region-weight projection is a sliding-window layer (vLLM keeps sliding blocks off the DSA path).
+     */
+    private Mixer step5Mixer(int il) {
+        AttentionSpec a = attention.resolve(il);
+        boolean full = tc.hasLayer(il, TensorNames.weight(TensorNames.INDEXER_Z));
+        Step5Spec spec = Step5Spec.builder()
+                .indexerHeads(hp.indexerNHead())
+                .proxyDim(hp.indexerHeadSize())
+                .indexerRopeDim(hp.indexerRopeDim())
+                .topK(hp.indexerTopK())
+                .regionBlock(hp.indexerBlockSize())
+                .groups(hp.indexerGroupCount())
+                .full(full)
+                .indexerRope(full ? rope.forLayer(il, hp.indexerRopeDim(), 0) : null)
+                .defaultWeightScale()
+                .build();
+        return new Mixer(MixerKind.STEP5, a, false, null, null, null, spec, null, null, attentionRope(il, a), null);
+    }
+
     /** MLA, DSA over MLA, or QSA over nope MLA (glm5-next), with the MLA attention facet. */
     private Mixer mlaMixer(int il) {
         MlaSpec spec = mla.resolve(il);
         DsaSpec dsa = sparse.dsa(il);
         MixerKind kind = dsa == null ? MixerKind.MLA : dsa.kpool() > 0 ? MixerKind.MSA : MixerKind.DSA_MLA;
         RopeSpec r = spec.ropeApplied() ? rope.forLayer(il, spec.headKRope(), spec.headKNope()) : null;
-        return new Mixer(kind, attention.mlaFacet(il, spec), false, spec, dsa, null, null, null, r);
+        return new Mixer(kind, attention.mlaFacet(il, spec), false, spec, dsa, null, null, null, r, null);
+    }
+
+    /**
+     * Zamba2: every layer is a Mamba-2 layer; a hybrid layer also runs one of the shared attention/MLP blocks before
+     * its mixer (vLLM {@code Zamba2HybridLayer}). The shared block's attention is the layer's {@code attention}
+     * facet (its KV cache belongs to the layer), with the per-use q/k/v adapters when the model has them.
+     */
+    private Mixer zamba2Mixer(int il) {
+        RecurrentSpec rec = recurrent.resolve(il);
+        int block = hp.zamba2SharedBlock(il);
+        if (block < 0) {
+            Zamba2Spec z = Zamba2Spec.builder().adapterRank(hp.zamba2AdapterRank()).build();
+            return new Mixer(MixerKind.ZAMBA2, null, false, null, null, null, null, rec, null, z);
+        }
+        AttentionSpec.Builder a = attention.resolve(il).toBuilder().inBias(false).outBias(false);
+        if (hp.zamba2AttentionAdapter()) {
+            a.qkvAdapterRank(hp.zamba2AdapterRank()).qkvAdapterLayer(il);
+        }
+        AttentionSpec attn = a.build();
+        Zamba2Spec z = Zamba2Spec.builder().sharedBlock(block).adapterRank(hp.zamba2AdapterRank())
+                .attentionAdapter(hp.zamba2AttentionAdapter()).build();
+        return new Mixer(MixerKind.ZAMBA2, attn, false, null, null, null, null, rec, attentionRope(il, attn), z);
     }
 
     /** RoPE of a softmax-attention branch: its {@code nRot} leading dims, none for NoPE and linear-replace layers. */
@@ -679,8 +783,11 @@ public final class ModelSpecBuilder {
      *   <li>gemma4 with {@code per_layer_token_embd} and gemma-embedding2 trunk layers: {@code ple}
      *       (gemma4.cpp:376-403, gemma-embedding2.cpp:172-197);</li>
      *   <li>the qwen4exp PLE layer: {@code ngram_ple} before {@code hc} (qwen4exp.cpp:452-461);</li>
+     *   <li>LongCat-Flash-Lite's first block: {@code ngram_embd}, which fuses the hashed n-gram rows into the
+     *       model input (longcat_flash_ngram.py:298-374);</li>
      *   <li>{@code hc} for hyper-connection residuals;</li>
-     *   <li>kimi-k3 trunk layers with {@code attn_res_block_size > 0}: {@code attn_res} (kimi-k3.cpp:273-335);</li>
+     *   <li>trunk layers with {@code attn_res_block_size > 0} (kimi-k3, alice-ai): {@code attn_res}
+     *       (kimi-k3.cpp:273-335, vLLM models/alice_ai.py);</li>
      *   <li>{@code resid_alpha_beta} (muse-spark) and {@code embd_skip} (talkie) from the residual spec;</li>
      *   <li>granite-switch trunk layers: {@code switched_lora} (granite-switch.cpp:115-130, 242-427);</li>
      *   <li>{@code loop_norm} on the slots the schedule closes with {@code output_norm} (nanbeige.cpp:164-170).</li>
@@ -688,6 +795,9 @@ public final class ModelSpecBuilder {
      */
     private List<String> extras(int wl, boolean trunk, boolean loopNorm, ResidualSpec r, FfnResolver.Result f) {
         List<String> ids = new ArrayList<>();
+        if (arch == Arch.INKLING) {
+            ids.add(LayerSpec.Extras.INKLING_SCONV);
+        }
         if (f.moe() != null && (arch == Arch.ARCTIC || arch == Arch.SMALLTHINKER)) {
             ids.add(LayerSpec.Extras.MOE_LAYER_INPUT);
         }
@@ -701,14 +811,29 @@ public final class ModelSpecBuilder {
         if (arch == Arch.QWEN4EXP && hp.isPleLayer(wl)) {
             ids.add(LayerSpec.Extras.NGRAM_PLE);
         }
+        if (arch == Arch.DEEPSEEK41 && hp.isPleLayer(wl)) {
+            ids.add(LayerSpec.Extras.ENGRAM);
+        }
+        if (arch == Arch.LONGCAT_FLASH_NGRAM && wl == 0) {
+            ids.add(LayerSpec.Extras.NGRAM_EMBD);
+        }
         if (r.kind() == ResidualKind.HYPER_CONNECTIONS) {
             ids.add(LayerSpec.Extras.HC);
         }
-        if (trunk && arch == Arch.KIMI_K3 && hp.attnResBlockSize() > 0) {
+        if (trunk && hp.attnResBlockSize() > 0) {
             ids.add(LayerSpec.Extras.ATTN_RES);
         }
         if (r.alphaBeta()) {
             ids.add(LayerSpec.Extras.RESID_ALPHA_BETA);
+        }
+        if (arch == Arch.LIMITE && trunk) {
+            boolean mudd = tc.layer(wl, TensorNames.weight(TensorNames.MUDD_DOWN)) != null;
+            // the MUDD mix replaces the plain scales of its layer; layers without it keep the scales
+            if (mudd) {
+                ids.add(LayerSpec.Extras.MUDD);
+            } else if (tc.layer(wl, TensorNames.weight(TensorNames.ATTN_RESID_SCALE)) != null) {
+                ids.add(LayerSpec.Extras.RESID_SCALE);
+            }
         }
         if (r.embeddingSkip()) {
             ids.add(LayerSpec.Extras.EMBD_SKIP);

@@ -24,7 +24,7 @@ import static org.junit.Assert.assertTrue;
  * ({@code calc_diff} and {@code filter_nonzero_rows}), both reductions (pca.hpp, mean.hpp) and the GGUF export
  * round-tripping through {@code ControlVector.File.load} (the loader {@code common_control_vector_load_one}
  * mirrors). No model, engine or device is touched: the collector is fed synthetic rows directly, and the tap
- * drivers over a running engine are TL-4's serving side.
+ * drivers over a running engine are {@link CvectorGenerator#run}'s serving side.
  */
 public class CvectorGeneratorTest {
 

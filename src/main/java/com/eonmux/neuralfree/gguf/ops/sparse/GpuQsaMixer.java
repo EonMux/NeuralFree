@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.gguf.arch.QkNormKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuMatmulTap;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
@@ -181,6 +182,9 @@ public final class GpuQsaMixer implements GpuMixer {
     private GpuWeight wQb;
     private GpuWeight wKva;
     private GpuWeight kvaNorm;
+    /** The per-head {@code attn_k_b} and {@code attn_v_b} the id-matvec kernels multiply. */
+    private GpuWeight wKb;
+    private GpuWeight wVb;
     private GpuWeight wO;
     private ScratchSlot qr;
     private ScratchSlot qn;
@@ -196,6 +200,7 @@ public final class GpuQsaMixer implements GpuMixer {
     private int hd;
     private int qDim;
     private int kDim;
+    private int inWidth;
     private RopeSpec rope;
     private GpuWeight wQ;
     private GpuWeight wK;
@@ -330,14 +335,15 @@ public final class GpuQsaMixer implements GpuMixer {
         headV = m.headV();
         MsaBlocks.checkRotation(rotK, kvLora);
         int nEmbd = MsaBlocks.mixerWidth(layer);
+        inWidth = nEmbd;
         wQa = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_Q_A, nEmbd, qLora);
         qaNorm = MsaBlocks.gpuVector(ctx, ws, layer, TensorNames.weight(TensorNames.ATTN_Q_A_NORM), qLora, true, owned);
         wQb = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_Q_B, qLora, (long) nHead * qkNope);
         wKva = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_KV_A_MQA, nEmbd, kvLora);
         kvaNorm = MsaBlocks.gpuVector(ctx, ws, layer, TensorNames.weight(TensorNames.ATTN_KV_A_NORM), kvLora, true,
                 owned);
-        GpuWeight wKb = MsaBlocks.gpuHeadStack(ws, layer, TensorNames.ATTN_K_B, qkNope, kvLora, nHead);
-        GpuWeight wVb = MsaBlocks.gpuHeadStack(ws, layer, TensorNames.ATTN_V_B, kvLora, headV, nHead);
+        wKb = MsaBlocks.gpuHeadStack(ws, layer, TensorNames.ATTN_K_B, qkNope, kvLora, nHead);
+        wVb = MsaBlocks.gpuHeadStack(ws, layer, TensorNames.ATTN_V_B, kvLora, headV, nHead);
         wO = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_OUT, (long) nHead * headV, nEmbd);
 
         GpuScratch scratch = ctx.scratch();
@@ -431,6 +437,7 @@ public final class GpuQsaMixer implements GpuMixer {
         MsaBlocks.checkRotation(rotV, hd);
         rope = MsaBlocks.rope(layer, hd, 0, "QSA attention");
         int nEmbd = MsaBlocks.mixerWidth(layer);
+        inWidth = nEmbd;
         wQ = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_Q, nEmbd, 2L * qDim);
         wK = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_K, nEmbd, kDim);
         wV = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_V, nEmbd, kDim);
@@ -569,6 +576,96 @@ public final class GpuQsaMixer implements GpuMixer {
         run(pos0, nTokens, in, out);
     }
 
+    /**
+     * The cache writes of a step: the latent (MLA) or K/V (GQA) projections with their norms and RoPE, the indexer's
+     * keys and completed pools, the KV rotations and the stores. The query path, the selection, the attention and the
+     * output projection do not run.
+     */
+    @Override
+    public void prefillKV(int pos0, int n, ScratchSlot in) {
+        if (!bound || closed) {
+            throw new IllegalStateException("QSA mixer is not bound or already closed");
+        }
+        Objects.requireNonNull(in, "in");
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("QSA step of " + n + " tokens is outside [1, " + ubatch + "]");
+        }
+        if (pos0 < 0 || pos0 + n > posLimit) {
+            throw new IllegalArgumentException("QSA step at positions [" + pos0 + ", " + (pos0 + n) + ") exceeds the "
+                    + posLimit + " cached positions");
+        }
+        if (mla) {
+            runMlaKV(pos0, n, in);
+        } else {
+            runGqaKV(pos0, n, in);
+        }
+    }
+
+    @Override
+    public String kvRefusal() {
+        return null;
+    }
+
+    /** The latent cache writes: the latent projection, its norm, the indexer's keys and the latent store. */
+    private void runMlaKV(int pos0, int n, ScratchSlot in) {
+        GpuOps.SharedQ8 share = kvShare(n, in);
+        try {
+            ops.matmul(wKva, in.buffer(), in.offset(), kvl.buffer(), 0, n);
+            kvaDeltas.applyRows(n, in.buffer(), in.offset(), kvl.buffer(), 0);
+            ops.norm(NormKind.RMS, kvaNorm, null, rmsEps, kvl.buffer(), 0, kvl.buffer(), 0, n, kvLora);
+            if (full) {
+                ops.matmul(wIk, in.buffer(), in.offset(), ik.buffer(), 0, n);
+                ikDeltas.applyRows(n, in.buffer(), in.offset(), ik.buffer(), 0);
+                ops.norm(NormKind.LAYER, ikNormW, ikNormB, normEps, ik.buffer(), 0, ik.buffer(), 0, n, idx);
+                ops.matmul(wIg, in.buffer(), in.offset(), ig.buffer(), 0, n);
+                igDeltas.applyRows(n, in.buffer(), in.offset(), ig.buffer(), 0);
+                ops.copy2d(ik.buffer(), 0, idx, packed.buffer(), 0, 2 * idx, n, idx);
+                ops.copy2d(ig.buffer(), 0, idx, packed.buffer(), idx, 2 * idx, n, idx);
+                MsaBlocks.runStore(storeIdx, idxPlan.dtype(), n, 2 * idx, local);
+                pool(pos0, n);
+            }
+            MsaBlocks.rotate(ops, rotK, kvl.buffer(), n, kvLora);
+            MsaBlocks.runStore(storeK, kvLayout.dtypeK(), n, kvLora, local);
+        } finally {
+            if (share != null) {
+                share.close();
+            }
+        }
+    }
+
+    /** The GQA cache writes: the indexer's keys, then K and V with their norm, RoPE, rotations and stores. */
+    private void runGqaKV(int pos0, int n, ScratchSlot in) {
+        GpuOps.SharedQ8 share = kvShare(n, in);
+        try {
+            if (full) {
+                ops.matmul(wIk, in.buffer(), in.offset(), ik.buffer(), 0, n);
+                ikDeltas.applyRows(n, in.buffer(), in.offset(), ik.buffer(), 0);
+                MsaBlocks.runStore(storeIdx, idxPlan.dtype(), n, idx, local);
+                pool(pos0, n);
+            }
+            ops.matmul(wK, in.buffer(), in.offset(), k.buffer(), 0, n);
+            kDeltas.applyRows(n, in.buffer(), in.offset(), k.buffer(), 0);
+            ops.matmul(wV, in.buffer(), in.offset(), v.buffer(), 0, n);
+            vDeltas.applyRows(n, in.buffer(), in.offset(), v.buffer(), 0);
+            ops.norm(NormKind.RMS, kNorm, null, rmsEps, k.buffer(), 0, k.buffer(), 0, n * nKv, hd);
+            MsaBlocks.runRope(ropeK, rope, n, nKv, n, local);
+            MsaBlocks.rotate(ops, rotK, k.buffer(), n, kDim);
+            MsaBlocks.rotate(ops, rotV, v.buffer(), n, kDim);
+            MsaBlocks.runStore(storeK, kvLayout.dtypeK(), n, kDim, local);
+            MsaBlocks.runStore(storeV, kvLayout.dtypeV(), n, kDim, local);
+        } finally {
+            if (share != null) {
+                share.close();
+            }
+        }
+    }
+
+    /** The cache-write share over the step's input row when one token's row backs several projections. */
+    private GpuOps.SharedQ8 kvShare(int n, ScratchSlot in) {
+        return n == 1 && GpuOps.shareableQ8Activations(in.offset(), inWidth)
+                ? ops.shareQ8Activations(in.buffer(), in.offset(), inWidth) : null;
+    }
+
     private void run(int pos0, int n, ScratchSlot in, ScratchSlot out) {
         if (!bound || closed) {
             throw new IllegalStateException("QSA mixer is not bound or already closed");
@@ -582,10 +679,20 @@ public final class GpuQsaMixer implements GpuMixer {
             throw new IllegalArgumentException("QSA step at positions [" + pos0 + ", " + (pos0 + n) + ") exceeds the "
                     + posLimit + " cached positions");
         }
-        if (mla) {
-            runMla(pos0, n, in, out);
-        } else {
-            runGqa(pos0, n, in, out);
+        // The input and indexer projections of a single-token step all read this row, so its Q8_1 blocks
+        // are quantized once.
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(in.offset(), inWidth)
+                ? ops.shareQ8Activations(in.buffer(), in.offset(), inWidth) : null;
+        try {
+            if (mla) {
+                runMla(pos0, n, in, out);
+            } else {
+                runGqa(pos0, n, in, out);
+            }
+        } finally {
+            if (share != null) {
+                share.close();
+            }
         }
     }
 
@@ -598,6 +705,7 @@ public final class GpuQsaMixer implements GpuMixer {
         ops.matmul(wKva, in.buffer(), in.offset(), kvl.buffer(), 0, n);
         kvaDeltas.applyRows(n, in.buffer(), in.offset(), kvl.buffer(), 0);
         ops.norm(NormKind.RMS, kvaNorm, null, rmsEps, kvl.buffer(), 0, kvl.buffer(), 0, n, kvLora);
+        GpuMatmulTap.heads(ops.queue(), wKb, nHead, qn.buffer(), 0, qkNope, qkNope, n);
         runId(absorbK, kvLora, qkNope, n);
         if (full) {
             ops.matmul(wIq, qr.buffer(), 0, iq.buffer(), 0, n);
@@ -620,6 +728,7 @@ public final class GpuQsaMixer implements GpuMixer {
         MsaBlocks.runStore(storeK, kvLayout.dtypeK(), n, kvLora, local);
         MsaBlocks.runGather(gather, n, nHead);
         MsaBlocks.rotate(ops, rotK, att.buffer(), n, nHead * kvLora);
+        GpuMatmulTap.heads(ops.queue(), wVb, nHead, att.buffer(), 0, kvLora, kvLora, n);
         runId(absorbV, headV, kvLora, n);
         ops.matmul(wO, vout.buffer(), 0, out.buffer(), out.offset(), n);
         oDeltas.applyRows(n, vout.buffer(), 0, out.buffer(), out.offset());

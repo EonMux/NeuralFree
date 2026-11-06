@@ -19,7 +19,8 @@ import static org.junit.Assert.fail;
 public class ExtBlockDecodersTest {
 
     private static final GGMLType[] EXT_TYPES = {
-        GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB
+        GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB,
+        GGMLType.F8_E4M3_B32
     };
 
     private static ByteBuffer blocks(GGMLType type, int nBlocks) {
@@ -32,6 +33,17 @@ public class ExtBlockDecodersTest {
         return out;
     }
 
+    /** One more than the largest id of the extension rows; the table grows by appending ids. */
+    static int nextExtensionId() {
+        int max = 0;
+        for (GGMLType t : GGMLType.values()) {
+            if (t.isExtension()) {
+                max = Math.max(max, t.getId());
+            }
+        }
+        return max + 1;
+    }
+
     /** An E4M3 code that is never NaN, with the sign bit set for odd {@code j}. */
     private static int e4m3Code(int j) {
         return ((j * 37) % 0x7F) | ((j & 1) << 7);
@@ -42,7 +54,8 @@ public class ExtBlockDecodersTest {
     @Test
     public void typeRowsFollowTheExtensionTable() {
         int[][] expected = {
-            {1000, 32, 32}, {1001, 132, 128}, {1002, 33, 32}, {1003, 132, 128}, {1004, 36, 64}, {1005, 36, 64}
+            {1000, 32, 32}, {1001, 132, 128}, {1002, 33, 32}, {1003, 132, 128}, {1004, 36, 64}, {1005, 36, 64},
+            {1009, 36, 32}
         };
         for (int i = 0; i < EXT_TYPES.length; i++) {
             GGMLType t = EXT_TYPES[i];
@@ -57,7 +70,8 @@ public class ExtBlockDecodersTest {
             assertEquals(t.getBlockSize(), BlockLayout.of(t).blockElements());
             assertTrue(t + " has a decoder", CpuBlockDecoders.supports(t));
         }
-        assertEquals(GGMLType.UNKNOWN, GGMLType.fromId(1006));
+        assertEquals("the id after the last extension row is unassigned", GGMLType.UNKNOWN,
+                GGMLType.fromId(nextExtensionId()));
         assertFalse(GGMLType.Q8_0.isExtension());
         assertFalse(GGMLType.Q2_0.isExtension());
         assertFalse(GGMLType.UNKNOWN.isExtension());
@@ -67,11 +81,13 @@ public class ExtBlockDecodersTest {
     public void bytesForElementsAreWholeBlocks() {
         assertEquals(96, GGMLType.F8_E4M3.getBytesForElements(96));
         assertEquals(2 * 132, GGMLType.F8_E4M3_B128.getBytesForElements(256));
+        assertEquals(6 * 36, GGMLType.F8_E4M3_B32.getBytesForElements(192));
         assertEquals(2 * 33, GGMLType.MXFP8.getBytesForElements(64));
         assertEquals(3 * 132, GGMLType.I8_B128.getBytesForElements(384));
         assertEquals(2 * 36, GGMLType.NF4.getBytesForElements(128));
         assertEquals(36, GGMLType.FP4_BNB.getBytesForElements(64));
         assertEquals(BlockLayout.F8B128_BYTES, BlockLayout.F8B128_QS + BlockLayout.QK_F8B128);
+        assertEquals(BlockLayout.F8B32_BYTES, BlockLayout.F8B32_QS + BlockLayout.QK_F8B32);
         assertEquals(BlockLayout.MXFP8_BYTES, BlockLayout.MXFP8_QS + BlockLayout.QK_MXFP8);
         assertEquals(BlockLayout.I8B128_BYTES, BlockLayout.I8B128_QS + BlockLayout.QK_I8B128);
         assertEquals(BlockLayout.BNB4_BYTES, BlockLayout.BNB4_QS + BlockLayout.QK_BNB4 / 2);
@@ -111,6 +127,26 @@ public class ExtBlockDecodersTest {
             for (int j = 0; j < BlockLayout.QK_F8B128; j++) {
                 float expected = d[i] * FpBlockDecoders.e4m3ToFp32(e4m3Code(j + i));
                 assertEquals("block " + i + " element " + j, expected, y[i * BlockLayout.QK_F8B128 + j], 0f);
+            }
+        }
+    }
+
+    @Test
+    public void f8E4m3B32AppliesEachRunsScale() {
+        ByteBuffer b = blocks(GGMLType.F8_E4M3_B32, 3);
+        float[] d = {0.25f, 0.25f, -6f};
+        for (int i = 0; i < 3; i++) {
+            int o = i * BlockLayout.F8B32_BYTES;
+            b.putFloat(o + BlockLayout.F8B32_D, d[i]);
+            for (int j = 0; j < BlockLayout.QK_F8B32; j++) {
+                b.put(o + BlockLayout.F8B32_QS + j, (byte) e4m3Code(j + 3 * i));
+            }
+        }
+        float[] y = decode(GGMLType.F8_E4M3_B32, b, 3);
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < BlockLayout.QK_F8B32; j++) {
+                float expected = d[i] * FpBlockDecoders.e4m3ToFp32(e4m3Code(j + 3 * i));
+                assertEquals("block " + i + " element " + j, expected, y[i * BlockLayout.QK_F8B32 + j], 0f);
             }
         }
     }

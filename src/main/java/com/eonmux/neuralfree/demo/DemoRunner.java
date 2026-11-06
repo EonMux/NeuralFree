@@ -4,19 +4,26 @@ import com.eonmux.neuralfree.Config.ACCELERATION_MODE;
 import com.eonmux.neuralfree.NeuralFree;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
+
+import java.util.Locale;
 
 /**
  * Runs the training-framework demos on one shared backend.
  *
- * <p>{@code --backend auto|opencl|cuda|vulkan} chooses the API; without it, {@code -Dneuralfree.backend} (forwarded
- * from {@code -Pneuralfree.backend} by the {@code runDemos} task) does, and AUTO is the default. AUTO selects a
- * backend that runs the train kernels, as {@link NeuralFree#createTrainingBackend} documents.</p>
+ * <p>{@code --backend} chooses the API: {@code auto}, one of the built-in APIs ({@code opencl}, {@code cuda},
+ * {@code vulkan}, {@code hip}, {@code metal}) or an accelerator API served by an installed backend provider.
+ * Without it, {@code -Dneuralfree.backend} (forwarded from {@code -Pneuralfree.backend} by the {@code runDemos}
+ * task) does, and AUTO is the default. AUTO selects a backend that runs the train kernels, as
+ * {@link NeuralFree#createTrainingBackend} documents.</p>
  */
 public final class DemoRunner {
 
-    private static final String USAGE = String.join(System.lineSeparator(),
-            "Usage: DemoRunner [--backend auto|opencl|cuda|vulkan]",
-            "  --backend <api>   API the demos run on (default: -D" + NeuralFree.BACKEND_PROPERTY + ", else auto)",
+    /** The usage text {@code --help} prints; the backend names are {@link NeuralFree#parseBackend}'s. */
+    static final String USAGE = String.join(System.lineSeparator(),
+            "Usage: DemoRunner [--backend " + backendNames("|") + "]",
+            "  --backend <api>   API the demos run on: " + backendNames(", ")
+                    + " (default: -D" + NeuralFree.BACKEND_PROPERTY + ", else auto)",
             "  --help, -h        Print this help");
 
     private DemoRunner() {}
@@ -80,6 +87,21 @@ public final class DemoRunner {
     }
 
     /**
+     * The API names {@link NeuralFree#parseBackend} accepts, lowercase in declaration order, joined by
+     * {@code separator}.
+     */
+    private static String backendNames(String separator) {
+        StringBuilder s = new StringBuilder();
+        for (ACCELERATION_MODE mode : ACCELERATION_MODE.values()) {
+            if (s.length() > 0) {
+                s.append(separator);
+            }
+            s.append(mode.name().toLowerCase(Locale.ROOT));
+        }
+        return s.toString();
+    }
+
+    /**
      * The API the arguments choose: {@code --backend <api>}, else {@code -Dneuralfree.backend}, else AUTO; null
      * when help was requested.
      *
@@ -95,7 +117,8 @@ public final class DemoRunner {
                     return null;
                 case "--backend":
                     if (i + 1 >= args.length) {
-                        throw new IllegalArgumentException("--backend needs a value: auto, opencl, cuda or vulkan");
+                        throw new IllegalArgumentException("--backend needs a value: auto, "
+                                + BackendType.acceptedApiNames());
                     }
                     String value = args[++i];
                     try {

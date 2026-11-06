@@ -39,8 +39,13 @@ import static org.jocl.CL.*;
  * falling back to a source build when the driver rejects a binary.</p>
  *
  * <p><b>Queues.</b> {@link #computeQueue()} and {@link #transferQueue()} are owned by the backend:
- * closing them only finishes them, and {@link #close()} releases them. Queues are created with
+ * closing them only finishes them, and {@link #close()} releases them, together with the caller-owned
+ * queues of {@link #createComputeQueue()} and the buffers still open. Queues are created with
  * {@code CL_QUEUE_PROFILING_ENABLE} only when {@code -Dneuralfree.gpu.profile=true}.</p>
+ *
+ * <p><b>Events.</b> Every event the backend's queues issue is counted by {@link #openEvents()} until
+ * its holder closes it; {@link #close()} releases the events still counted, since an unreleased
+ * {@code cl_event} keeps its command queue and with it the context alive.</p>
  *
  * <p><b>Errors.</b> Driver failures are translated by {@link OclErrors} in either JOCL exception
  * mode. Each kernel handle carries its {@code CL_KERNEL_NUM_ARGS}, {@code CL_KERNEL_WORK_GROUP_SIZE}
@@ -48,6 +53,11 @@ import static org.jocl.CL.*;
  *
  * <p><b>Subgroups.</b> The subgroup capability is reported only when OpenCL C 1.2 programs can
  * enable subgroup reductions ({@code cl_intel_subgroups}); see {@link #programsCanUseSubgroups}.</p>
+ *
+ * <p><b>Command buffers.</b> When the device advertises {@code cl_khr_command_buffer} and the ICD
+ * loader resolves its entry points, the backend reports {@link DeviceFeature#COMMAND_BUFFER} and
+ * every queue can capture and replay its commands ({@link OclComputeQueue#beginCapture()}). The
+ * entry points are reached through JNA, because JOCL binds only the core API.</p>
  */
 @NotThreadSafe("Delegates to non-thread-safe OclComputeQueue instances for compute and transfer. "
         + "KernelCache is thread-safe, but buffer allocation/queue operations require external synchronization. "
@@ -63,6 +73,7 @@ public final class OclComputeBackend implements ComputeBackend {
 
     private final CLDevice clDevice;
     private final DeviceCapabilities capabilities;
+    private final OclCommandBufferApi commandBuffers;
     private final KernelCache kernelCache;
     // Compiled cl_program cache. Keys are "source:<sha256>|<options>" for compileKernel and
     // "program:<programKey>" for loadKernel. All kernels of one program share ONE compiled program;
@@ -75,6 +86,14 @@ public final class OclComputeBackend implements ComputeBackend {
     private final OclComputeQueue computeQueue;
     private final OclComputeQueue transferQueue;
     private final AtomicLong allocatedBytes = new AtomicLong(0);
+    /** Buffers allocated and not yet closed, by identity; guarded by {@code this}, released by {@link #close()}. */
+    private final java.util.Set<OclGpuBuffer> openBuffers =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    /** Caller-owned queues of {@link #createComputeQueue()} not yet released; guarded by {@code this}. */
+    private final java.util.List<OclComputeQueue> callerQueues = new java.util.ArrayList<>();
+    /** Events the backend's queues issued that their callers have not closed; guarded by {@code this}. */
+    private final java.util.Set<OclGpuEvent> openEvents =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private boolean closed = false;
 
     public OclComputeBackend(CLDevice clDevice) {
@@ -82,9 +101,10 @@ public final class OclComputeBackend implements ComputeBackend {
             throw new IllegalArgumentException("CLDevice cannot be null");
         }
         this.clDevice = clDevice;
+        this.profiling = Boolean.getBoolean(PROFILE_PROPERTY);
+        this.commandBuffers = loadCommandBuffers(clDevice, profiling);
         this.capabilities = buildCapabilities(clDevice);
         this.kernelCache = new KernelCache();
-        this.profiling = Boolean.getBoolean(PROFILE_PROPERTY);
 
         cl_device_id deviceId = clDevice.getDeviceID();
         this.binaryCache = OclProgramBinaryCache.forDevice(
@@ -97,9 +117,10 @@ public final class OclComputeBackend implements ComputeBackend {
         cl_command_queue transferCmdQueue = null;
         try {
             transferCmdQueue = createCommandQueue(context, deviceId);
-            this.computeQueue = new OclComputeQueue(computeCmdQueue, ComputeQueue.QueueType.COMPUTE, true, profiling);
+            this.computeQueue = new OclComputeQueue(computeCmdQueue, ComputeQueue.QueueType.COMPUTE, true, profiling,
+                    this, commandBuffers);
             this.transferQueue = new OclComputeQueue(transferCmdQueue, ComputeQueue.QueueType.TRANSFER, true,
-                    profiling);
+                    profiling, this, commandBuffers);
         } catch (RuntimeException | Error e) {
             // close() cannot run on a backend that was never constructed, so the queues are released here.
             releaseQueue(computeCmdQueue, e);
@@ -176,7 +197,35 @@ public final class OclComputeBackend implements ComputeBackend {
 
         allocatedBytes.addAndGet(alignedSize);
         LOGGER.trace("Allocated OpenCL buffer: {} bytes (aligned to {}), readOnly={}", alignedSize, GPU_BUFFER_ALIGNMENT, readOnly);
-        return new OclGpuBuffer(mem, alignedSize, allocatedBytes);
+        OclGpuBuffer buffer = new OclGpuBuffer(mem, alignedSize, allocatedBytes, this::onBufferClosed);
+        synchronized (this) {
+            openBuffers.add(buffer);
+        }
+        return buffer;
+    }
+
+    /** Stops tracking a buffer its holder closed. */
+    private synchronized void onBufferClosed(OclGpuBuffer buffer) {
+        openBuffers.remove(buffer);
+    }
+
+    /** Starts counting an event an owned queue issued; it leaves the count when its holder closes it. */
+    synchronized void onEventCreated(OclGpuEvent event) {
+        openEvents.add(event);
+    }
+
+    /** Stops counting an event its holder closed. */
+    synchronized void onEventClosed(OclGpuEvent event) {
+        openEvents.remove(event);
+    }
+
+    /**
+     * The number of events this backend's queues issued that their callers have not closed yet. An
+     * unreleased {@code cl_event} keeps its command queue and with it the context alive, so
+     * {@link #close()} releases the events still counted here.
+     */
+    public synchronized int openEvents() {
+        return openEvents.size();
     }
 
     @Override
@@ -291,14 +340,23 @@ public final class OclComputeBackend implements ComputeBackend {
         return createKernel(ocl.getCLProgram(), ocl.kernelName(), "program of " + ocl.kernelName());
     }
 
-    /** Creates a caller-owned compute queue on the same context; its {@code close()} releases it. */
+    /**
+     * Creates a caller-owned compute queue on the same context; its {@code close()} releases it, and
+     * {@link #close()} releases it when the caller has not.
+     */
     @Override
     public ComputeQueue createComputeQueue() {
         ensureOpen();
         cl_context context = clDevice.getDeviceContext();
         cl_device_id deviceId = clDevice.getDeviceID();
         cl_command_queue cmdQueue = createCommandQueue(context, deviceId);
-        return new OclComputeQueue(cmdQueue, ComputeQueue.QueueType.COMPUTE, false, profiling);
+        OclComputeQueue queue = new OclComputeQueue(cmdQueue, ComputeQueue.QueueType.COMPUTE, false, profiling,
+                this, commandBuffers);
+        synchronized (this) {
+            callerQueues.removeIf(OclComputeQueue::isReleased);
+            callerQueues.add(queue);
+        }
+        return queue;
     }
 
     @Override
@@ -340,14 +398,23 @@ public final class OclComputeBackend implements ComputeBackend {
         }
         closed = true;
         // Every resource is released even when an earlier step reports a device error.
-        RuntimeException failure = null;
-        for (OclComputeQueue queue : new OclComputeQueue[]{computeQueue, transferQueue}) {
+        RuntimeException failure = releaseOpenEvents();
+        java.util.List<OclComputeQueue> queues;
+        synchronized (this) {
+            queues = new java.util.ArrayList<>(callerQueues);
+            callerQueues.clear();
+        }
+        queues.add(computeQueue);
+        queues.add(transferQueue);
+        for (OclComputeQueue queue : queues) {
             try {
                 queue.closeInternal();
             } catch (RuntimeException e) {
                 LOGGER.error("Closing an OpenCL {} queue failed: {}", queue.getQueueType(), e.toString());
                 if (failure == null) {
                     failure = e;
+                } else {
+                    failure.addSuppressed(e);
                 }
             }
         }
@@ -359,8 +426,57 @@ public final class OclComputeBackend implements ComputeBackend {
             programCache.clear();
             artifactOptions.clear();
         }
+        releaseOpenBuffers();
         if (failure != null) {
             throw failure;
+        }
+    }
+
+    /** Releases outstanding events before queues; returns release failures after attempting every event. */
+    private RuntimeException releaseOpenEvents() {
+        java.util.List<OclGpuEvent> leaked;
+        synchronized (this) {
+            leaked = new java.util.ArrayList<>(openEvents);
+        }
+        if (!leaked.isEmpty()) {
+            LOGGER.warn("Releasing {} event(s) left open by callers of the OpenCL backend on {} at close;"
+                            + " an unreleased cl_event keeps its queue and context alive",
+                    leaked.size(), capabilities.getDeviceName());
+        }
+        RuntimeException failure = null;
+        for (OclGpuEvent event : leaked) {
+            try {
+                event.close();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        return failure;
+    }
+
+    /**
+     * Releases every buffer of this backend that is still open, as the CUDA backend frees its pool on close: a
+     * buffer is invalid once its backend is closed, and an unreleased {@code cl_mem} would otherwise keep its
+     * device memory and the context alive for the rest of the process. Closing such a buffer afterwards does
+     * nothing. The tracking set is cleared even when a release fails.
+     */
+    private void releaseOpenBuffers() {
+        java.util.List<OclGpuBuffer> leaked;
+        synchronized (this) {
+            leaked = new java.util.ArrayList<>(openBuffers);
+            openBuffers.clear();
+        }
+        for (OclGpuBuffer buffer : leaked) {
+            try {
+                buffer.close();
+            } catch (RuntimeException e) {
+                LOGGER.error("Releasing an OpenCL buffer of {} bytes left open at close failed: {}",
+                        buffer.sizeInBytes(), e.toString());
+            }
         }
     }
 
@@ -771,6 +887,12 @@ public final class OclComputeBackend implements ComputeBackend {
         if (hasExtension(extensions, "cl_khr_integer_dot_product")) {
             features.add(DeviceFeature.INTEGER_DOT_PRODUCT);
         }
+        if (hasExtension(extensions, "cl_khr_cooperative_matrix")) {
+            features.add(DeviceFeature.COOPERATIVE_MATRIX);
+        }
+        if (commandBuffers != null) {
+            features.add(DeviceFeature.COMMAND_BUFFER);
+        }
 
         return new DeviceCapabilities.Builder()
                 .deviceName(deviceName)
@@ -920,6 +1042,17 @@ public final class OclComputeBackend implements ComputeBackend {
                     stringFor_errorCode(e.getStatus()));
             return null;
         }
+    }
+
+    /**
+     * Loads the device's {@code cl_khr_command_buffer} entry points, or returns null when the
+     * extension is absent or its functions cannot be reached. The required queue properties are
+     * compared with the properties this backend gives its queues.
+     */
+    private static OclCommandBufferApi loadCommandBuffers(CLDevice device, boolean profiling) {
+        String extensions = getStringDeviceInfo(device.getDeviceID(), CL_DEVICE_EXTENSIONS);
+        long queueProperties = profiling ? CL_QUEUE_PROFILING_ENABLE : 0L;
+        return JnaOclCommandBufferApi.tryLoad(device.getDeviceID(), extensions, queueProperties);
     }
 
     private static String getStringDeviceInfo(cl_device_id deviceId, int paramName) {

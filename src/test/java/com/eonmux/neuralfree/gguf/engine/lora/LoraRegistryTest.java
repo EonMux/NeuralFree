@@ -39,12 +39,12 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * {@link LoraRegistry} and its engine surface (LR-1, J3 and J7): a load makes the handle resident and its events
+ * {@link LoraRegistry} and its engine surface: a load makes the handle resident and its events
  * reach a {@link LoraAttachment} synchronously, refusals name the adapter or tensor, displacement keeps the host
  * cache under {@code neuralfree.lora.cache} and the residents under {@code neuralfree.lora.max}, an unload detaches
  * the deltas and reload reattaches them, {@code setScale} of a held adapter rescales its pairs to
  * {@code newScale * B} and creates a new epoch (also returning to an earlier value), an unheld adapter's scale is
- * the default of its later requests, and the content digest covers the adapter's content (§5.5.1 N-2).
+ * the default of its later requests, and the content digest covers the adapter's content.
  */
 public class LoraRegistryTest {
 
@@ -52,6 +52,8 @@ public class LoraRegistryTest {
     private static final int N_EMBD = 6;
     private static final int N_VOCAB = 11;
     private static final String Q = TensorNames.weight(TensorNames.ATTN_Q);
+    /** The layer-qualified query tensor an adapter targets and the delta sites are keyed by. */
+    private static final String BLK_Q = layer(0).tensorName(Q);
     private static final String OUTPUT = TensorNames.weight(TensorNames.OUTPUT);
     private static final String EMBD = TensorNames.weight(TensorNames.TOKEN_EMBD);
 
@@ -87,18 +89,14 @@ public class LoraRegistryTest {
         return CpuTensorRef.of(GGMLType.F32, buf, rows, cols);
     }
 
-    /** Deltas of a one-layer model serving atto_q, the output head and the token table. */
+    /** Deltas of a one-layer model serving blk.0.attn_q, the output head and the token table. */
     private static CpuProjectionDeltas servedModel() {
         CpuProjectionDeltas d = new CpuProjectionDeltas();
         LayerSpec l = layer(0);
-        d.serve(l, blkQ0(l), f32(N_EMBD, N_EMBD), CpuMatVec.PLAIN);
+        d.serve(l, Q, f32(N_EMBD, N_EMBD), CpuMatVec.PLAIN);
         d.serveModel(OUTPUT, N_EMBD, N_VOCAB, null);
         d.serveEmbedding(EMBD, N_VOCAB, N_EMBD, null);
         return d;
-    }
-
-    private static String blkQ0(LayerSpec l) {
-        return l.tensorName(TensorNames.weight(TensorNames.ATTN_Q));
     }
 
     /** The in-memory adapter source: one path always builds equal content (equal digests, fresh objects). */
@@ -138,7 +136,7 @@ public class LoraRegistryTest {
     public void aLoadMakesTheHandleResidentAndDeliversItsEventsSynchronously() throws IOException {
         Adapters adapters = new Adapters();
         LoraAdapter a = LoraFixtures.adapter("a.gguf", 0.0f,
-                LoraFixtures.projection(TensorNames.weight(TensorNames.ATTN_Q), N_EMBD, N_EMBD, 2, 1));
+                LoraFixtures.projection(BLK_Q, N_EMBD, N_EMBD, 2, 1));
         adapters.put("a.gguf", a);
         LoraRegistry registry = LoraRegistry.of(adapters, config(4, 64, 8));
         Events events = new Events();
@@ -207,7 +205,7 @@ public class LoraRegistryTest {
     public void aPairAboveTheMaxRankIsRefusedNamingItsTensorAndRank() throws IOException {
         Adapters adapters = new Adapters();
         adapters.put("wide.gguf", LoraFixtures.adapter("wide.gguf", 0.0f,
-                LoraFixtures.projection(TensorNames.weight(TensorNames.ATTN_Q), N_EMBD, N_EMBD, 65, 1)));
+                LoraFixtures.projection(BLK_Q, N_EMBD, N_EMBD, 65, 1)));
         try {
             LoraRegistry.of(adapters, config(4, 64, 8)).load("w", "wide.gguf");
             fail("a rank 65 pair must be refused at max rank 64");
@@ -243,9 +241,27 @@ public class LoraRegistryTest {
     }
 
     @Test
+    public void aCacheOfNoEntriesDropsUnloadedAndEvictedHandles() throws IOException {
+        Adapters adapters = new Adapters();
+        adapters.put("a0.gguf", buildQ("a0.gguf"));
+        adapters.put("b0.gguf", buildQ("b0.gguf"));
+        LoraRegistry registry = LoraRegistry.of(adapters, config(1, 64, 0));
+        registry.load("first", "a0.gguf");
+        // the residency limit of 1 evicts "first", and the empty cache keeps nothing
+        LoraHandle second = registry.load("second", "b0.gguf");
+        assertNull(registry.handle("first"));
+        assertEquals(Collections.singletonList(second), registry.list());
+        assertTrue(registry.cached().isEmpty());
+        registry.unload("second");
+        assertNull(registry.handle("second"));
+        assertTrue(registry.list().isEmpty());
+        assertTrue(registry.cached().isEmpty());
+    }
+
+    @Test
     public void theResidencyLimitEvictsTheOldestUnheldResidentAndRefusesWhenEveryResidentIsHeld() throws IOException {
         Adapters adapters = new Adapters();
-        adapters.put("a.gguf", buildQ("a0.gguf"));
+        adapters.put("a0.gguf", buildQ("a0.gguf"));
         adapters.put("b0.gguf", buildQ("b0.gguf"));
         adapters.put("c0.gguf", buildQ("c0.gguf"));
 
@@ -254,7 +270,7 @@ public class LoraRegistryTest {
         LoraHandle first = unheld.load("first", "a0.gguf");
         LoraHandle second = unheld.load("second", "b0.gguf");
         LoraHandle third = unheld.load("third", "c0.gguf");
-        assertNull(unheld.handle("first"));
+        assertSame(first, unheld.handle("first"));
         assertEquals(Arrays.asList(second, third), unheld.list());
         assertEquals(Collections.singletonList(first), unheld.cached());
 
@@ -282,7 +298,7 @@ public class LoraRegistryTest {
     public void unloadDetachesTheDeltasAndAHotReloadReattachesThem() throws IOException {
         Adapters adapters = new Adapters();
         adapters.putRebuilt("a.gguf", LoraFixtures.adapter("a.gguf", 4.0f,
-                LoraFixtures.projection(TensorNames.weight(TensorNames.ATTN_Q), N_EMBD, N_EMBD, 2, 1),
+                LoraFixtures.projection(BLK_Q, N_EMBD, N_EMBD, 2, 1),
                 LoraFixtures.embedding(EMBD, N_VOCAB, N_EMBD, 2, 7)));
         CpuProjectionDeltas deltas = servedModel();
         LoraRegistry registry = LoraRegistry.of(adapters, config(4, 64, 8));
@@ -291,11 +307,11 @@ public class LoraRegistryTest {
 
         LoraHandle handle = registry.load("hot", "a.gguf");
         assertEquals(2, att.deltaCount());
-        assertTrue(att.bindings().get(0).adapter().targets().contains(TensorNames.weight(TensorNames.ATTN_Q)));
+        assertTrue(att.bindings().get(0).adapter().targets().contains(BLK_Q));
 
         registry.unload("hot");
         assertEquals(0, att.deltaCount());
-        assertTrue(deltas.served(TensorNames.weight(TensorNames.ATTN_Q)).isEmpty());
+        assertTrue(deltas.served(BLK_Q).isEmpty());
         assertTrue(deltas.served(EMBD).isEmpty());
         assertSame(handle, registry.handle("hot"));
         assertEquals(Collections.singletonList(handle), registry.cached());
@@ -312,7 +328,7 @@ public class LoraRegistryTest {
     public void aHotLoadOfAnUnrunnablePairFailsWholeAndRegistersNothing() throws IOException {
         Adapters adapters = new Adapters();
         adapters.putRebuilt("bad.gguf", LoraFixtures.adapter("bad.gguf", 0.0f,
-                LoraFixtures.projection(TensorNames.weight(TensorNames.ATTN_Q), N_EMBD, N_EMBD, 2, 1),
+                LoraFixtures.projection(BLK_Q, N_EMBD, N_EMBD, 2, 1),
                 LoraFixtures.projection("blk.0.attn_k.weight", N_EMBD, N_EMBD, 2, 3)));
         CpuProjectionDeltas deltas = servedModel();
         LoraRegistry registry = LoraRegistry.of(adapters, config(4, 64, 8));
@@ -325,7 +341,7 @@ public class LoraRegistryTest {
             assertTrue(expected.getMessage(), expected.getMessage().contains("bad.gguf"));
         }
         assertEquals(0, att.deltaCount());
-        assertTrue(deltas.served(TensorNames.weight(TensorNames.ATTN_Q)).isEmpty());
+        assertTrue(deltas.served(BLK_Q).isEmpty());
         assertTrue(registry.list().isEmpty());
         assertTrue(registry.cached().isEmpty());
         att.close();
@@ -369,13 +385,14 @@ public class LoraRegistryTest {
         applyOutput(deltas, 2, x, atQuarter);
         assertArrayEquals(expectedQuarter, atQuarter, EPS);
 
-        // Returning to an earlier user scale is a new epoch of the held state (§5.5.1 N-2), never the first one.
+        // Returning to an earlier user scale is a new epoch of the held state, never the first one.
         registry.setScale("work", 0.5f);
         assertEquals(2L, handle.revision());
         float[] backAtHalf = new float[2 * N_VOCAB];
         applyOutput(deltas, 2, x, backAtHalf);
         assertArrayEquals(atHalf, backAtHalf, EPS);
-        assertEquals(2, handle.holds());
+        // the one attachment still holds the adapter: rescaling neither holds nor releases it
+        assertEquals(1, handle.holds());
         assertEquals(1, att.deltaCount());
         att.close();
     }
@@ -480,7 +497,7 @@ public class LoraRegistryTest {
 
     private static LoraAdapter buildQ(String path) {
         return LoraFixtures.adapter(path, 0.0f,
-                LoraFixtures.projection(TensorNames.weight(TensorNames.ATTN_Q), N_EMBD, N_EMBD, 2, 1));
+                LoraFixtures.projection(BLK_Q, N_EMBD, N_EMBD, 2, 1));
     }
 
     private static void applyOutput(CpuProjectionDeltas deltas, int n, float[] x, float[] y) {

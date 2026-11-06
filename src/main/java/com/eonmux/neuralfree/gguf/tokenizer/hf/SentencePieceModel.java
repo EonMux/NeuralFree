@@ -552,9 +552,11 @@ public final class SentencePieceModel {
                     require(8);
                     pos += 8;
                     return;
-                case WIRE_LEN:
-                    pos += length();
+                case WIRE_LEN: {
+                    int len = length(); // read first: it advances pos past the length varint
+                    pos += len;
                     return;
+                }
                 case WIRE_FIXED32:
                     require(4);
                     pos += 4;

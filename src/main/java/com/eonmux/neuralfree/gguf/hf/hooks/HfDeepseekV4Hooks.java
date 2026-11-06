@@ -333,7 +333,8 @@ public final class HfDeepseekV4Hooks {
      * {@code num_hash_layers} blocks as I32, the routed experts of every block stacked {@code [E, rows, cols]} per
      * projection ({@code w1} gate, {@code w2} down, {@code w3} up) in the format the quantization rewrite produced,
      * and for each MTP block the concatenation of {@code e_proj} and {@code h_proj} along the input dimension as
-     * {@code nextn.eh_proj}.
+     * {@code nextn.eh_proj}. With {@link ModelSourceOptions#mtpOnly()} the main-model blocks are absent from the
+     * index, so only the MTP blocks' experts and projections are generated (deepseek.py:777-787).
      *
      * @throws GgufFormatException when a hash table, an expert or one of an MTP projection pair is missing, an expert
      *                             block scale was not consumed by the quantization rewrite, or the parts do not fit
@@ -344,8 +345,10 @@ public final class HfDeepseekV4Hooks {
         HfTensorIndex index = ctx.index();
         HfTensorNameMap names = ctx.names();
 
+        // --mtp keeps no main-model block, so neither the hash tables nor the main experts are written
+        int firstBlock = ctx.options().mtpOnly() ? cfg.requireInt("num_hidden_layers") : 0;
         int hashLayers = cfg.requireInt("num_hash_layers");
-        for (int bid = 0; bid < hashLayers; bid++) {
+        for (int bid = 0; bid < hashLayers && firstBlock == 0; bid++) {
             String name = "layers." + bid + ".ffn.gate.tid2eid";
             if (!index.has(name)) {
                 throw new GgufFormatException("Missing hash routing tensor " + name);
@@ -354,7 +357,7 @@ public final class HfDeepseekV4Hooks {
         }
 
         int nExperts = cfg.requireInt("n_routed_experts");
-        for (int bid = 0; bid < ctx.blockCount(); bid++) {
+        for (int bid = firstBlock; bid < ctx.blockCount(); bid++) {
             for (Map.Entry<String, String> e : EXPERT_TENSORS.entrySet()) {
                 out.add(names.ggufName(e.getValue(), bid, ".weight"), stackExperts(index, bid, e.getKey(), nExperts));
             }

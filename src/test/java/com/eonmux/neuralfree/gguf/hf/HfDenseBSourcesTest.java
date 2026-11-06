@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-D2 part B fixtures ({@code ApertusModel}, {@code ArceeModel}, {@code OlmoModel}, {@code Olmo2Model}, {@code
+ * The fixtures ({@code ApertusModel}, {@code ArceeModel}, {@code OlmoModel}, {@code Olmo2Model}, {@code
  * Phi3MiniModel}, {@code Qwen3MoeModel}) build through the registered entries: {@link ModelSpecBuilder} succeeds and
  * every catalog tensor is claimed ({@code TensorClaims}), which is the done-getting-tensors check of the converter's
  * tensor plan.

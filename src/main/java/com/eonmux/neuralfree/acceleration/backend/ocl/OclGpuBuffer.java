@@ -11,9 +11,23 @@ public final class OclGpuBuffer implements GpuBuffer {
     private cl_mem mem;
     private final long sizeBytes;
     private final AtomicLong allocatedBytesTracker;
+    private final java.util.function.Consumer<OclGpuBuffer> onClosed;
     private boolean closed = false;
 
     public OclGpuBuffer(cl_mem mem, long sizeBytes, AtomicLong allocatedBytesTracker) {
+        this(mem, sizeBytes, allocatedBytesTracker, null);
+    }
+
+    public OclGpuBuffer(cl_mem mem, long sizeBytes) {
+        this(mem, sizeBytes, null, null);
+    }
+
+    /**
+     * @param onClosed run once after the {@code cl_mem} is released, so the allocating backend can stop
+     *                 tracking the buffer; may be null
+     */
+    OclGpuBuffer(cl_mem mem, long sizeBytes, AtomicLong allocatedBytesTracker,
+                 java.util.function.Consumer<OclGpuBuffer> onClosed) {
         if (mem == null) {
             throw new IllegalArgumentException("cl_mem cannot be null");
         }
@@ -23,10 +37,7 @@ public final class OclGpuBuffer implements GpuBuffer {
         this.mem = mem;
         this.sizeBytes = sizeBytes;
         this.allocatedBytesTracker = allocatedBytesTracker;
-    }
-
-    public OclGpuBuffer(cl_mem mem, long sizeBytes) {
-        this(mem, sizeBytes, null);
+        this.onClosed = onClosed;
     }
 
     @Override
@@ -35,15 +46,16 @@ public final class OclGpuBuffer implements GpuBuffer {
     }
 
     @Override
-    public long bufferId() {
+    public synchronized long bufferId() {
         if (closed || mem == null) {
             return -1;
         }
         return System.identityHashCode(mem);
     }
 
+    /** Releases the {@code cl_mem}; idempotent and safe against a concurrent close by the allocating backend. */
     @Override
-    public void close() {
+    public synchronized void close() {
         if (!closed) {
             clReleaseMemObject(mem);
             mem = null;
@@ -51,10 +63,13 @@ public final class OclGpuBuffer implements GpuBuffer {
             if (allocatedBytesTracker != null) {
                 allocatedBytesTracker.addAndGet(-sizeBytes);
             }
+            if (onClosed != null) {
+                onClosed.accept(this);
+            }
         }
     }
 
-    public cl_mem getCLMem() {
+    public synchronized cl_mem getCLMem() {
         return mem;
     }
 }

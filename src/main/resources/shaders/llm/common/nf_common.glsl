@@ -41,6 +41,10 @@ layout(constant_id = 3) const int NF_FA_SMEM_FLOATS = 3072;
 #define OP_BATCH_2D     7
 #define OP_EMBED        8
 #define OP_BATCH_EMBED  9
+#define OP_MATVEC2      10
+#define OP_GATEUP2      11
+#define OP_MATVEC2_Q8   12   /* matvec_q8.comp: two rows per workgroup over a Q8_1 activation row */
+#define OP_GATEUP2_Q8   13   /* matvec_q8.comp: two gate/up rows per workgroup over a Q8_1 activation row */
 
 /* Declares three read-only aliased views of one storage-buffer binding, for byte-addressed data
  * such as quantized weights: name_u8[] (uint8_t), name_u16[] (uint16_t) and name_u32[] (uint).

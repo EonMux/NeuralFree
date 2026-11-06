@@ -20,8 +20,8 @@ import java.util.Set;
  * {@link GpuOps} launches it with ({@link GpuOps#prewarmWeightKernels}). Every 3-D tensor (experts, and the per-head
  * products of MLA absorption and DSV4 {@code wo_a}) takes {@code {T}_MatVecId}; experts also take the fused gate-up
  * and batched id products. A model prepares the plans of its own weights; a drafter with a weight file of its own
- * (eagle3, gemma4-assistant, an MTP draft file) prepares the plans of the weights it places on the device, whose types
- * the target may not use. Stateless.
+ * (eagle, eagle3, gemma4-assistant, an MTP draft file) prepares the plans of the weights it places on the device,
+ * whose types the target may not use. Stateless.
  */
 public final class WeightKernelPrewarm {
 

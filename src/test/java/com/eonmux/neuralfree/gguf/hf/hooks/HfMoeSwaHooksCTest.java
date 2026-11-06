@@ -99,10 +99,11 @@ public class HfMoeSwaHooksCTest {
     @Test
     public void mellumWritesTheMtpLayerCount() throws IOException {
         HfMetadataBuilder kv = new HfMetadataBuilder(Arch.MELLUM.ggufName());
-        HfMoeSwaHooksC.mellumMeta(context(dir(), Arch.MELLUM, "MellumForCausalLM", "'num_mtp_layers': 1,"
+        HfLoadContext kept = context(dir(), Arch.MELLUM, "MellumForCausalLM", "'num_mtp_layers': 1,"
                 + " 'use_sliding_window': true, 'sliding_window': 4,"
-                + " 'layer_types': ['sliding_attention', 'full_attention'], 'mtp_layer_types': ['full_attention']"),
-                kv, null);
+                + " 'layer_types': ['sliding_attention', 'full_attention'], 'mtp_layer_types': ['full_attention']",
+                java.util.Collections.emptyMap(), true);
+        HfMoeSwaHooksC.mellumMeta(kept, kv, null);
         assertEquals(1, kv.get(GgufKeys.NEXTN_PREDICT_LAYERS));
         assertEquals(4, kv.get(GgufKeys.ATTENTION_SLIDING_WINDOW));
         assertEquals(java.util.Arrays.asList(true, false, false),

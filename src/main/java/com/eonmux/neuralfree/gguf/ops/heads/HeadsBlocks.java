@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.ops.heads;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuFfnFactory;
+import com.eonmux.neuralfree.gguf.cpu.block.CpuLayerExtra;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixerFactory;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
@@ -10,23 +11,30 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuFfnFactory;
+import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtra;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixerFactory;
 import com.eonmux.neuralfree.gguf.memory.KvWindow;
 import com.eonmux.neuralfree.gguf.ops.attn.CpuAttentionCore;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
+import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Block factories of the heads family, exposed to the block catalogs, and the host math the heads share.
  *
- * <p>The family has no mixers and no FFN blocks. Its one layer extra is the graniteswitch switched LoRA
- * ({@code LayerSpec.Extras.SWITCHED_LORA}: {@link SwitchedLoraExtra}, {@link CpuSwitchedLoraExtra}). Its extras
- * share one model-level {@link SwitchedLoraExtra.Router}, which the factory catalog creates per model and passes
- * to {@link #gpuExtras(SwitchedLoraExtra.Router)} / {@link #cpuExtras(SwitchedLoraExtra.Router)}. The no-argument
- * lists register the feature id with factories whose creation fails with a message naming the missing router.</p>
+ * <p>The family has two layer extras: the graniteswitch switched LoRA ({@code LayerSpec.Extras.SWITCHED_LORA}:
+ * {@link SwitchedLoraExtra}, {@link CpuSwitchedLoraExtra}) and the control-vector add
+ * ({@code LayerSpec.Extras.CONTROL_VECTOR}: {@link ControlVectorExtra}, {@link CpuControlVectorExtra}). The
+ * switched-LoRA extras share one model-level {@link SwitchedLoraExtra.Router}; the control-vector extras share one
+ * engine-level {@link ControlVector} set; both are created per model by the factory catalog and passed to
+ * {@link #gpuExtras(SwitchedLoraExtra.Router, ControlVector)} / {@link #cpuExtras(SwitchedLoraExtra.Router,
+ * ControlVector)}. The single-argument and no-argument lists register the feature ids with factories whose creation
+ * fails with a message naming the missing router or set.</p>
  *
  * <p>The pooling, classifier and decision heads ({@link PoolingHead}, {@link ClassifierHead}, {@link ClefDecoder},
  * {@link VllmDecision2Head}, {@link Lfm2DecisionHead}, {@link ModernBertDecisionHead}) run once per request over the
@@ -62,30 +70,96 @@ public final class HeadsBlocks {
 
     /** GPU switched-LoRA extras without a router: creation fails until the catalog passes one. */
     public static List<GpuLayerExtraFactory> gpuExtras() {
-        return gpuExtras(null);
+        return gpuExtras(null, null);
+    }
+
+    /** GPU switched-LoRA extras sharing {@code router}, without control vectors. */
+    public static List<GpuLayerExtraFactory> gpuExtras(SwitchedLoraExtra.Router router) {
+        return gpuExtras(router, null);
     }
 
     /**
-     * GPU switched-LoRA extras sharing {@code router}.
+     * GPU switched-LoRA extras sharing {@code router} and control-vector extras over {@code controlVectors}.
      *
-     * @param router the model's adapter router, or null when the catalog has none (creation then fails)
+     * @param router          the model's adapter router, or null when the catalog has none (creation then fails)
+     * @param controlVectors  the engine's active control-vector set, or null when none is loaded (creation of a
+     *                        control-vector extra then fails)
      */
-    public static List<GpuLayerExtraFactory> gpuExtras(SwitchedLoraExtra.Router router) {
-        return Collections.singletonList(SwitchedLoraExtra.factory(router));
+    public static List<GpuLayerExtraFactory> gpuExtras(SwitchedLoraExtra.Router router, ControlVector controlVectors) {
+        return Arrays.asList(SwitchedLoraExtra.factory(router), controlVectorGpuFactory(controlVectors));
     }
 
     /** CPU switched-LoRA extras without a router: creation fails until the catalog passes one. */
     public static List<CpuLayerExtraFactory> cpuExtras() {
-        return cpuExtras(null);
+        return cpuExtras(null, null);
+    }
+
+    /** CPU switched-LoRA extras sharing {@code router}, without control vectors. */
+    public static List<CpuLayerExtraFactory> cpuExtras(SwitchedLoraExtra.Router router) {
+        return cpuExtras(router, null);
     }
 
     /**
-     * CPU switched-LoRA extras sharing {@code router}.
+     * CPU switched-LoRA extras sharing {@code router} and control-vector extras over {@code controlVectors}.
      *
-     * @param router the model's adapter router, or null when the catalog has none (creation then fails)
+     * @param router          the model's adapter router, or null when the catalog has none (creation then fails)
+     * @param controlVectors  the engine's active control-vector set, or null when none is loaded (creation of a
+     *                        control-vector extra then fails)
      */
-    public static List<CpuLayerExtraFactory> cpuExtras(SwitchedLoraExtra.Router router) {
-        return Collections.singletonList(CpuSwitchedLoraExtra.factory(router));
+    public static List<CpuLayerExtraFactory> cpuExtras(SwitchedLoraExtra.Router router, ControlVector controlVectors) {
+        return Arrays.asList(CpuSwitchedLoraExtra.factory(router), controlVectorCpuFactory(controlVectors));
+    }
+
+    /** The {@code CONTROL_VECTOR} extra factory of the device forward pass. */
+    private static GpuLayerExtraFactory controlVectorGpuFactory(ControlVector set) {
+        return new GpuLayerExtraFactory() {
+            @Override
+            public String featureId() {
+                return LayerSpec.Extras.CONTROL_VECTOR;
+            }
+
+            @Override
+            public GpuLayerExtra create(LayerSpec layer) {
+                Objects.requireNonNull(layer, "layer");
+                if (set == null) {
+                    throw new UnsupportedOperationException("layer " + layer.stack() + "." + layer.il()
+                            + " lists '" + LayerSpec.Extras.CONTROL_VECTOR + "' but no control vectors are loaded;"
+                            + " build the extras with HeadsBlocks.gpuExtras(router, controlVectors)");
+                }
+                return new ControlVectorExtra(set, layer);
+            }
+
+            @Override
+            public String toString() {
+                return "HeadsBlocks[" + LayerSpec.Extras.CONTROL_VECTOR + "]";
+            }
+        };
+    }
+
+    /** The {@code CONTROL_VECTOR} extra factory of the host forward pass. */
+    private static CpuLayerExtraFactory controlVectorCpuFactory(ControlVector set) {
+        return new CpuLayerExtraFactory() {
+            @Override
+            public String featureId() {
+                return LayerSpec.Extras.CONTROL_VECTOR;
+            }
+
+            @Override
+            public CpuLayerExtra create(LayerSpec layer) {
+                Objects.requireNonNull(layer, "layer");
+                if (set == null) {
+                    throw new UnsupportedOperationException("layer " + layer.stack() + "." + layer.il()
+                            + " lists '" + LayerSpec.Extras.CONTROL_VECTOR + "' but no control vectors are loaded;"
+                            + " build the extras with HeadsBlocks.cpuExtras(router, controlVectors)");
+                }
+                return new CpuControlVectorExtra(set, layer);
+            }
+
+            @Override
+            public String toString() {
+                return "HeadsBlocks[" + LayerSpec.Extras.CONTROL_VECTOR + "]";
+            }
+        };
     }
 
     // ================================================================== shared host math

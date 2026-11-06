@@ -11,8 +11,10 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.ops.mla.CpuMlaHeadProducts;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
 import com.eonmux.neuralfree.gguf.ops.rope.CpuRope;
@@ -23,6 +25,7 @@ import com.eonmux.neuralfree.gguf.ops.sparse.SparseBlocks.DsaLayout;
 import com.eonmux.neuralfree.gguf.ops.sparse.SparseBlocks.IndexerConfig;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
+import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 
 import java.util.Arrays;
@@ -35,7 +38,9 @@ import java.util.Objects;
  * RoPE {@link CpuRope#apply} ({@code LLM_RoPE_Ext}); the latent store {@link KvAccessor#writeK} at
  * {@code layout.rowOf(pos)} ({@code LLM_KV_Store_<KV>}); the sparse attention {@link CpuSparseMla}
  * ({@code LLM_MLA_Sparse*}); the gate {@link CpuOps#glu} with {@code SIGMUL} ({@code LLM_GLU_F32}); the indexer
- * {@link CpuDsaIndexerStage}.
+ * {@link CpuDsaIndexerStage}. Q comes from {@code wq_b . qr} or directly from {@code attn_q . x}; mistral-large4
+ * additionally scales {@code qcur} by the per-head SSMax temperature and reads the learned {@code rope_freqs} factors,
+ * and its NoPE layers zero-pad the rope dims of Q and of the latent row.
  *
  * <p>The top-k selection lives in the shared int temporary {@value GpuDsaMlaMixer#TEMP_TOPK} of
  * {@code ubatch * topK} entries, which a shared layer reads after its source layer wrote it in the same step.
@@ -45,6 +50,8 @@ import java.util.Objects;
 public final class CpuDsaMlaMixer implements CpuMixer {
 
     public static final String TEMP_POSITIONS = "dsa.pos";
+    public static final String TEMP_SLOT_ROWS = "dsa.slot.rows";
+    public static final String TEMP_KV_PROJ = "dsa.kvproj";
 
     private CpuForwardContext ctx;
     private CpuMatVec matVec;
@@ -52,6 +59,7 @@ public final class CpuDsaMlaMixer implements CpuMixer {
     private int ubatch;
     private int kvRows;
 
+    private CpuTensorRef wq;
     private CpuTensorRef wqA;
     private CpuTensorRef wqB;
     private CpuTensorRef wkvA;
@@ -64,6 +72,7 @@ public final class CpuDsaMlaMixer implements CpuMixer {
      * LoRA deltas of the dense projections, after the product and its scale ({@code build_lora_mm},
      * llama-graph.cpp:1629-1667); the per-head absorbed {@code attn_k_b} / {@code attn_v_b} take none.
      */
+    private CpuProjectionDeltas.Site qDeltas;
     private CpuProjectionDeltas.Site qaDeltas;
     private CpuProjectionDeltas.Site qbDeltas;
     private CpuProjectionDeltas.Site kvaDeltas;
@@ -74,6 +83,9 @@ public final class CpuDsaMlaMixer implements CpuMixer {
     private float[] kvANormW;
     private float[] kPeNormW;
     private float[] sinks;
+    /** SSMax per-head scale and bias ({@code attn_ssmax}); null when the query is not scaled. */
+    private float[] ssmaxW;
+    private float[] ssmaxB;
 
     private KvAccessor cache;
     private RowReader latentRows;
@@ -82,12 +94,15 @@ public final class CpuDsaMlaMixer implements CpuMixer {
     private float[] qr;
     private float[] q;
     private float[] kv;
+    private float[] kvProj;
     private float[] qcur;
     private float[] latent;
     private float[] gate;
     private float[] gateWide;
     private int[] topK;
     private int[] ropePos;
+    /** The cells of one sequence's slots in a paged step ({@code PagedStep.seqCells}), one per cache row. */
+    private int[] slotRows;
 
     private CpuDsaIndexerStage indexer;
     private boolean closed;
@@ -132,10 +147,16 @@ public final class CpuDsaMlaMixer implements CpuMixer {
         cache = latentCache(memory, layer.il());
         kvRows = cache.layout().rows();
         latentRows = RowReader.ofKeys(cache);
+        if (l.kvShared) {
+            KvAccessor src = memory.kv(l.kvSourceLayer);
+            if (src == null || src.group() != cache.group() || src.layout().rows() != kvRows) {
+                throw new IllegalStateException(l.where + ": reads the latent cache of layer " + l.kvSourceLayer
+                        + ", which must use the layer's KV group and rows (group " + cache.group() + ", " + kvRows
+                        + " rows)");
+            }
+        }
 
-        wqA = weights.layer(layer, DsaLayout.WQ_A);
-        wqB = weights.layer(layer, DsaLayout.WQ_B);
-        wkvA = weights.layer(layer, DsaLayout.WKV_A);
+        wkvA = l.kvShared ? null : weights.layer(layer, DsaLayout.WKV_A);
         wkB = perHead(weights.layer(layer, DsaLayout.WK_B));
         wvB = perHead(weights.layer(layer, DsaLayout.WV_B));
         wo = weights.layer(layer, DsaLayout.WO);
@@ -147,29 +168,59 @@ public final class CpuDsaMlaMixer implements CpuMixer {
             }
         }
         CpuProjectionDeltas deltas = ctx.projectionDeltas();
-        qaDeltas = deltas.serve(layer, DsaLayout.WQ_A, wqA, matVec);
-        qbDeltas = deltas.serve(layer, DsaLayout.WQ_B, wqB, matVec);
-        kvaDeltas = deltas.serve(layer, DsaLayout.WKV_A, wkvA, matVec);
+        if (l.qLora > 0) {
+            wqA = weights.layer(layer, DsaLayout.WQ_A);
+            wqB = weights.layer(layer, DsaLayout.WQ_B);
+            qaDeltas = deltas.serve(layer, DsaLayout.WQ_A, wqA, matVec);
+            qbDeltas = deltas.serve(layer, DsaLayout.WQ_B, wqB, matVec);
+            qANormW = vector(weights.layerFloatsOrNull(layer, DsaLayout.Q_A_NORM), l.qLora, DsaLayout.Q_A_NORM);
+        } else {
+            wq = weights.layer(layer, DsaLayout.WQ);
+            qDeltas = deltas.serve(layer, DsaLayout.WQ, wq, matVec);
+        }
+        if (!l.kvShared) {
+            kvaDeltas = deltas.serve(layer, DsaLayout.WKV_A, wkvA, matVec);
+            kvANormW = vector(weights.layerFloatsOrNull(layer, DsaLayout.KV_A_NORM), l.kvLora, DsaLayout.KV_A_NORM);
+        }
         outDeltas = deltas.serve(layer, DsaLayout.WO, wo, matVec);
-        qANormW = vector(weights.layerFloatsOrNull(layer, DsaLayout.Q_A_NORM), l.qLora, DsaLayout.Q_A_NORM);
-        kvANormW = vector(weights.layerFloatsOrNull(layer, DsaLayout.KV_A_NORM), l.kvLora, DsaLayout.KV_A_NORM);
         if (l.kPeNorm) {
             kPeNormW = vector(weights.layerFloatsOrNull(layer, DsaLayout.K_PE_NORM), l.rope, DsaLayout.K_PE_NORM);
         }
         if (l.sinks) {
             sinks = vector(weights.layerFloatsOrNull(layer, DsaLayout.SINKS), l.nHead, DsaLayout.SINKS);
         }
+        if (l.ssmax) {
+            ssmaxW = vector(weights.layerFloatsOrNull(layer, DsaLayout.SSMAX), l.nHead, DsaLayout.SSMAX);
+            ssmaxB = vector(weights.layerFloatsOrNull(layer, DsaLayout.SSMAX_B), l.nHead, DsaLayout.SSMAX_B);
+        }
         RopeSpec r = l.ropeSpec;
-        ropeTable = RopeFreqTable.of(r, null);
+        if (r != null) {
+            float[] factors = null;
+            if (r.freqFactors() != null) {
+                factors = weights.floats(r.freqFactors());
+                if (factors == null) {
+                    throw new MissingTensorException(weights.archName(), layer.il(), r.freqFactors().name());
+                }
+            }
+            ropeTable = RopeFreqTable.of(r, factors);
+        }
 
         CpuScratch s = ctx.scratch();
-        qr = s.temp(GpuDsaMlaMixer.TEMP_QR, ubatch * l.qLora);
+        if (l.qLora > 0) {
+            qr = s.temp(GpuDsaMlaMixer.TEMP_QR, ubatch * l.qLora);
+        }
         q = s.temp(GpuDsaMlaMixer.TEMP_Q, ubatch * l.qBufferWidth());
         kv = s.temp(GpuDsaMlaMixer.TEMP_KV, ubatch * l.dK);
+        if (!l.ropeApplied) {
+            kvProj = s.temp(TEMP_KV_PROJ, ubatch * l.kvLora);
+        }
         qcur = s.temp(GpuDsaMlaMixer.TEMP_QCUR, ubatch * l.nHead * l.dK);
         latent = s.temp(GpuDsaMlaMixer.TEMP_LATENT, ubatch * l.nHead * l.kvLora);
         topK = s.intTemp(GpuDsaMlaMixer.TEMP_TOPK, ubatch * l.topK);
-        ropePos = s.intTemp(TEMP_POSITIONS, r.positionsPerToken() * ubatch);
+        if (r != null) {
+            ropePos = s.intTemp(TEMP_POSITIONS, r.positionsPerToken() * ubatch);
+        }
+        slotRows = s.intTemp(TEMP_SLOT_ROWS, kvRows);
         if (l.gate != DsaLayout.Gate.NONE) {
             gateW = weights.layer(layer, DsaLayout.GATE);
             gateDeltas = ctx.projectionDeltas().serve(layer, DsaLayout.GATE, gateW, matVec);
@@ -220,7 +271,25 @@ public final class CpuDsaMlaMixer implements CpuMixer {
         IndexerConfig cfg = IndexerConfig.forLayer(layer, memory.plan().layer(layer.il()).indexer().rotation(),
                 cache.layout().window(), l.normEps);
         indexer = new CpuDsaIndexerStage(ctx, l.where, cfg);
-        indexer.bindQueries(weights.layer(layer, DsaLayout.IDX_Q_B), weights.layer(layer, DsaLayout.IDX_PROJ));
+        RopeSpec rope = cfg.rope();
+        float[] factors = null;
+        if (rope != null && rope.freqFactors() != null) {
+            factors = weights.floats(rope.freqFactors());
+            if (factors == null) {
+                throw new MissingTensorException(weights.archName(), layer.il(), rope.freqFactors().name());
+            }
+        }
+        indexer.bindQueries(weights.layer(layer, DsaLayout.IDX_Q_B), weights.layer(layer, DsaLayout.IDX_PROJ), factors);
+        if (l.indexerQueryNorm) {
+            indexer.bindQueryNorm(vector(weights.layerFloatsOrNull(layer, DsaLayout.IDX_Q_NORM), l.nEmbd,
+                    DsaLayout.IDX_Q_NORM), vector(weights.layerFloatsOrNull(layer, DsaLayout.IDX_Q_NORM_B), l.nEmbd,
+                    DsaLayout.IDX_Q_NORM_B));
+        }
+        if (l.indexerSsmax) {
+            indexer.bindSsmax(vector(weights.layerFloatsOrNull(layer, DsaLayout.IDX_SSMAX), l.idxHeads,
+                    DsaLayout.IDX_SSMAX), vector(weights.layerFloatsOrNull(layer, DsaLayout.IDX_SSMAX_B), l.idxHeads,
+                    DsaLayout.IDX_SSMAX_B));
+        }
         indexer.bindKeys(weights.layer(layer, DsaLayout.IDX_K),
                 l.idxKeyNorm ? vector(weights.layerFloatsOrNull(layer, DsaLayout.IDX_K_NORM), l.idxDim,
                         DsaLayout.IDX_K_NORM) : null,
@@ -243,16 +312,39 @@ public final class CpuDsaMlaMixer implements CpuMixer {
         forward(pos0, n, in, out);
     }
 
+    /**
+     * One step over the rows of {@code s}: the contiguous step when the memory runs no paged step, else the paged
+     * step through the memory's {@code CpuMemory.currentPagedStep}. The token-wise stages run over the whole step;
+     * the indexer keys and the latent rows go to the step's cells; every segment selects among its own sequence's
+     * slots only (through the sequence's page table, {@link CpuDsaIndexerStage#selectSlots}) and attends the
+     * selected cells, so a segment computes the outputs its rows would compute run one sequence at a time. A
+     * non-causal step ({@code CpuForwardContext.stepNonCausal}) selects without the causal mask.
+     */
+    @Override
+    public void batch(StepLayout s, float[] in, float[] out) {
+        ensureBound();
+        PagedStep step = ctx.memory().currentPagedStep();
+        if (step == null) {
+            CpuMixer.super.batch(s, in, out);
+            return;
+        }
+        forwardPaged(s, step, in, out);
+    }
+
+    @Override
+    public String batchRefusal() {
+        return "the DSA mixer mixes several sequences per step only over paged memory (a currentPagedStep)";
+    }
+
     private void forward(int pos0, int n, float[] x, float[] out) {
         ensureBound();
         DsaLayout l = layout;
         checkStep(pos0, n, x, out);
         int nKv = Math.min(kvRows, pos0 + n);
 
-        matVec.matmul(wqA, x, 0, qr, 0, n);
-        qaDeltas.applyRows(n, x, 0, qr, 0);
-        NormMath.rowNorm(NormKind.RMS, l.rmsEps, n, l.qLora, l.qLora, 1, qr, 0, qANormW, null, qr, 0);
-
+        if (l.qLora > 0) {
+            projectLowRankQuery(n, x);
+        }
         int k;
         if (indexer != null) {
             indexer.queries(pos0, n, qr, 0, x, 0);
@@ -261,41 +353,185 @@ public final class CpuDsaMlaMixer implements CpuMixer {
         } else {
             k = SparseKernels.selectedCount(nKv, l.topK);
         }
+        RopeSpec r = l.ropeSpec;
+        if (r != null) {
+            RopePositions.fill(r.type(), r.textPositions(), pos0, n, ropePos);
+        }
+        projectQuery(n, x);
+        applyQueryRope(n);
+        if (!l.kvShared) {
+            projectLatent(n, x);
+            KvLayout kvl = cache.layout();
+            for (int t = 0; t < n; t++) {
+                cache.writeK(kvl.rowOf(pos0 + t), kv, t * l.dK);
+            }
+        }
+        absorbQueries(n);
+        applyQuerySsmax(0, n, null, pos0);
+        attend(0, n, k);
+        output(n, x, out);
+    }
 
-        matVec.matmul(wqB, qr, 0, q, 0, n);
-        qbDeltas.applyRows(n, qr, 0, q, 0);
-        matVec.matmul(wkvA, x, 0, kv, 0, n);
-        kvaDeltas.applyRows(n, x, 0, kv, 0);
-        if (kPeNormW != null) {
-            NormMath.rowNorm(NormKind.RMS, l.rmsEps, n, l.rope, l.dK, 1, kv, l.kvLora, kPeNormW, null, kv, l.kvLora);
+    /**
+     * The paged step: the rows' positions come from the {@link CpuScratch#POS} slot (section 0), their indexer keys
+     * and latent rows are stored at the step's cells, and every segment of {@code s} selects and attends over its
+     * sequence's slots.
+     */
+    private void forwardPaged(StepLayout s, PagedStep step, float[] x, float[] out) {
+        DsaLayout l = layout;
+        int n = s.nTokens();
+        checkStep(0, n, x, out);
+        int[] pos = ctx.scratch().ints(CpuScratch.POS);
+        int group = cache.group();
+        int[] cells = step.cellIdx(group);
+
+        if (l.qLora > 0) {
+            projectLowRankQuery(n, x);
+        }
+        if (indexer != null) {
+            indexer.queries(pos, n, qr, 0, x, 0);
+            indexer.storeKeys(pos, cells, n, x, 0);
         }
         RopeSpec r = l.ropeSpec;
-        RopePositions.fill(r.type(), r.textPositions(), pos0, n, ropePos);
-        CpuRope.apply(ropeTable, q, 0, n, l.nHead, l.headK, l.nHead * l.headK, l.nope, ropePos, 0, n);
-        CpuRope.apply(ropeTable, kv, 0, n, 1, l.dK, l.dK, l.kvLora, ropePos, 0, n);
-        NormMath.rowNorm(NormKind.RMS, l.rmsEps, n, l.kvLora, l.dK, 1, kv, 0, kvANormW, null, kv, 0);
-        KvLayout kvl = cache.layout();
-        for (int t = 0; t < n; t++) {
-            cache.writeK(kvl.rowOf(pos0 + t), kv, t * l.dK);
+        if (r != null) {
+            RopePositions.fill(r.type(), r.textPositions(), pos, 0, n, ropePos);
         }
+        projectQuery(n, x);
+        applyQueryRope(n);
+        if (!l.kvShared) {
+            projectLatent(n, x);
+            for (int t = 0; t < n; t++) {
+                cache.writeK(cells[t], kv, t * l.dK);
+            }
+        }
+        absorbQueries(n);
+        applyQuerySsmax(0, n, pos, 0);
+        boolean causal = indexer == null || (indexer.config().mask().causal() && !ctx.stepNonCausal());
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int t0 = s.tokStart(seg);
+            int len = s.len(seg);
+            int slots = step.seqCells(group, s.seq(seg), slotRows);
+            int k = indexer != null
+                    ? indexer.selectSlots(t0, len, pos, slots, slotRows, causal, topK, t0 * l.topK)
+                    : SparseKernels.selectedCount(slots, l.topK);
+            attend(t0, len, k);
+        }
+        output(n, x, out);
+    }
 
+    /** {@code qr = rms_norm(wq_a @ x)}, the low-rank query the indexer and {@code wq_b} read. */
+    private void projectLowRankQuery(int n, float[] x) {
+        DsaLayout l = layout;
+        matVec.matmul(wqA, x, 0, qr, 0, n);
+        qaDeltas.applyRows(n, x, 0, qr, 0);
+        NormMath.rowNorm(NormKind.RMS, l.rmsEps, n, l.qLora, l.qLora, 1, qr, 0, qANormW, null, qr, 0);
+    }
+
+    /** Q of every token, from {@code wq_b . qr} or directly from {@code attn_q . x}. */
+    private void projectQuery(int n, float[] x) {
+        DsaLayout l = layout;
+        if (l.qLora > 0) {
+            matVec.matmul(wqB, qr, 0, q, 0, n);
+            qbDeltas.applyRows(n, qr, 0, q, 0);
+        } else {
+            matVec.matmul(wq, x, 0, q, 0, n);
+            qDeltas.applyRows(n, x, 0, q, 0);
+        }
+    }
+
+    /**
+     * The latent row of every token: {@code [kv_cmpr | k_pe]} for a roped layer, {@code [kv_cmpr | 0]} for a NoPE
+     * layer (mistral-large4.cpp:192-197, 388-421); the latent prefix is RMS-normed and the rotary key rotated.
+     */
+    private void projectLatent(int n, float[] x) {
+        DsaLayout l = layout;
+        if (l.ropeApplied) {
+            matVec.matmul(wkvA, x, 0, kv, 0, n);
+            kvaDeltas.applyRows(n, x, 0, kv, 0);
+            if (kPeNormW != null) {
+                NormMath.rowNorm(NormKind.RMS, l.rmsEps, n, l.rope, l.dK, 1, kv, l.kvLora, kPeNormW, null, kv,
+                        l.kvLora);
+            }
+            CpuRope.apply(ropeTable, kv, 0, n, 1, l.dK, l.dK, l.kvLora, ropePos, 0, n);
+        } else {
+            matVec.matmul(wkvA, x, 0, kvProj, 0, n);
+            kvaDeltas.applyRows(n, x, 0, kvProj, 0);
+            for (int t = 0; t < n; t++) {
+                System.arraycopy(kvProj, t * l.kvLora, kv, t * l.dK, l.kvLora);
+                Arrays.fill(kv, t * l.dK + l.kvLora, (t + 1) * l.dK, 0f);
+            }
+        }
+        NormMath.rowNorm(NormKind.RMS, l.rmsEps, n, l.kvLora, l.dK, 1, kv, 0, kvANormW, null, kv, 0);
+    }
+
+    /** The rotary part of Q of every token (on a NoPE layer Q has none). */
+    private void applyQueryRope(int n) {
+        DsaLayout l = layout;
+        if (l.ropeApplied) {
+            CpuRope.apply(ropeTable, q, 0, n, l.nHead, l.headK, l.nHead * l.headK, l.nope, ropePos, 0, n);
+        }
+    }
+
+    /**
+     * SSMax: multiplies {@code qcur[t][h]} by {@code attn_ssmax.weight[h] * log(pos + 1) + bias[h]}
+     * (mistral-large4.cpp:181-190, 381). A null {@code tokenPos} uses {@code pos0 + t}.
+     */
+    private void applyQuerySsmax(int t0, int n, int[] tokenPos, int pos0) {
+        if (ssmaxW == null) {
+            return;
+        }
+        DsaLayout l = layout;
+        for (int t = 0; t < n; t++) {
+            int pos = tokenPos != null ? tokenPos[t0 + t] : pos0 + t;
+            double basis = Math.log(pos + 1.0);
+            for (int h = 0; h < l.nHead; h++) {
+                float f = (float) (ssmaxW[h] * basis) + ssmaxB[h];
+                int base = ((t0 + t) * l.nHead + h) * l.dK;
+                for (int d = 0; d < l.dK; d++) {
+                    qcur[base + d] *= f;
+                }
+            }
+        }
+    }
+
+    /** The absorbed queries {@code [wk_b . q_nope | q_pe]} of every (token, head) pair into {@link #qcur}. */
+    private void absorbQueries(int n) {
+        DsaLayout l = layout;
         CpuMlaHeadProducts.run(wkB, l.nHead, l.kvLora, n, q, 0, l.nHead * l.headK, l.headK, latent, 0,
                 l.nHead * l.kvLora, l.kvLora);
         for (int pair = 0; pair < n * l.nHead; pair++) {
             System.arraycopy(latent, pair * l.kvLora, qcur, pair * l.dK, l.kvLora);
-            System.arraycopy(q, pair * l.headK + l.nope, qcur, pair * l.dK + l.kvLora, l.rope);
+            if (l.ropeApplied) {
+                System.arraycopy(q, pair * l.headK + l.nope, qcur, pair * l.dK + l.kvLora, l.rope);
+            } else {
+                Arrays.fill(qcur, pair * l.dK + l.kvLora, (pair + 1) * l.dK, 0f);
+            }
         }
+    }
 
-        if (n == 1) {
-            CpuSparseMla.decode(l.nHead, l.kvLora, l.rope, k, l.kqScale, l.softcap, sinks != null, qcur, 0,
-                    latentRows, topK, 0, sinks, 0, latent, 0);
+    /**
+     * Sparse attention of the tokens {@code [t0, t0 + len)} over their {@code k} selected latent rows
+     * {@code topK[t0*topK + t*k ..]}, into {@link #latent} at the tokens' rows.
+     */
+    private void attend(int t0, int len, int k) {
+        DsaLayout l = layout;
+        int qOff = t0 * l.nHead * l.dK;
+        int selOff = t0 * l.topK;
+        int outOff = t0 * l.nHead * l.kvLora;
+        if (len == 1) {
+            CpuSparseMla.decode(l.nHead, l.kvLora, l.rope, k, l.kqScale, l.softcap, sinks != null, qcur, qOff,
+                    latentRows, topK, selOff, sinks, 0, latent, outOff);
         } else {
-            CpuSparseMla.prefill(n, l.nHead, l.kvLora, l.rope, k, l.kqScale, l.softcap, sinks != null, qcur, 0,
-                    l.nHead * l.dK, latentRows, topK, 0, sinks, 0, latent, 0);
+            CpuSparseMla.prefill(len, l.nHead, l.kvLora, l.rope, k, l.kqScale, l.softcap, sinks != null, qcur, qOff,
+                    l.nHead * l.dK, latentRows, topK, selOff, sinks, 0, latent, outOff);
         }
+    }
+
+    /** {@code wv_b} expansion, the optional gate and {@code wo} of every token. */
+    private void output(int n, float[] x, float[] out) {
+        DsaLayout l = layout;
         CpuMlaHeadProducts.run(wvB, l.nHead, l.headV, n, latent, 0, l.nHead * l.kvLora, l.kvLora, q, 0,
                 l.nHead * l.headV, l.headV);
-
         if (gateW != null) {
             applyGate(n, x);
         }

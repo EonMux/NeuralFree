@@ -1,10 +1,17 @@
 plugins { id 'java'; id 'io.quarkus' }
+// the runner jar's name in server/build and in the distribution's server/ directory, with the
+// root project's version (Quarkus names it <archivesName>-<version>-runner.jar)
+version = rootProject.version
+base { archivesName = 'neuralfree-server' }
 java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
 repositories { mavenLocal(); mavenCentral() }
 dependencies {
     implementation enforcedPlatform('io.quarkus.platform:quarkus-bom:3.40.1')
     implementation project(':')
     testImplementation project(path: ':', configuration: 'testOutput')
+    // the KV cache events subscriber of the tests speaks the core's ZMQ transport and msgpack
+    testImplementation "org.zeromq:jeromq:${rootProject.jeromqVersion}"
+    testImplementation "org.msgpack:msgpack-core:${rootProject.msgpackVersion}"
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-websockets-next'
     implementation 'io.quarkus:quarkus-grpc'
@@ -14,6 +21,8 @@ dependencies {
     implementation 'io.quarkus:quarkus-scheduler'
     implementation 'org.jboss.logmanager:log4j2-jboss-logmanager'
     testImplementation 'io.quarkus:quarkus-junit'
+    // the gRPC tests' client transport; the server side is Quarkus's
+    testImplementation 'io.grpc:grpc-netty'
 }
 configurations.all {
     exclude group: 'io.netty', module: 'netty-transport-native-epoll'
@@ -21,15 +30,32 @@ configurations.all {
     exclude group: 'io.netty', module: 'netty-transport-native-io_uring'
     exclude group: 'io.netty', module: 'netty-tcnative-boringssl-static'
     exclude group: 'io.netty.incubator'
+    // The gRPC client transport of the tests wants animal-sniffer-annotations 1.27; the 1.24 the rest of the
+    // build resolves is sufficient (they are class-retention annotations only, not code).
+    resolutionStrategy { force 'org.codehaus.mojo:animal-sniffer-annotations:1.24' }
+}
+
+// The version /version reports: the root project's version, expanded into the server's version resource.
+def serverVersion = rootProject.version.toString()
+processResources {
+    inputs.property('serverVersion', serverVersion)
+    filesMatching('neuralfree-server-version.properties') { expand(version: serverVersion) }
 }
 
 // Full exception format for the message-last test style: the assertions name the mismatch.
 tasks.withType(Test).configureEach {
     testLogging { exceptionFormat = 'full' }
+    // the incubator Vector API module, so the CPU kernels the server inherits from the core jar are usable
+    // in the test JVM (CpuSimd falls back to the scalar kernels without it)
+    jvmArgs '--add-modules=jdk.incubator.vector'
+    // neuralfree.* system (-D) and project (-P) properties reach the test JVM, so a run selects the engine
+    // backend the tests open their models on (-Pneuralfree.backend=cuda)
+    systemProperties System.properties.findAll { it.key.startsWith('neuralfree.') }
+    project.properties.findAll { it.key.startsWith('neuralfree.') }.each { k, v -> systemProperty k, v }
 }
 
-// Writes the server's resolved compile classpaths for srvjavac.sh (PARITY §4): the isolated
-// per-WP compile keeps server WPs of one stage independent, as nfjavac.sh does for core WPs.
+// Writes the server's resolved compile classpaths (MAINCP and TESTCP) to build/classpath.txt,
+// for tooling that compiles the server sources directly against the resolved jars.
 task writeServerClasspath {
     description = 'Writes the main and test compile classpaths to build/classpath.txt for srvjavac.sh'
     group = 'build'

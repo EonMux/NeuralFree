@@ -1,0 +1,325 @@
+/* matvec_w12.comp - one-workgroup-per-row matvec op templates over the W12 per-row weight records, plus the
+ * whole-tensor BF16 decode for large prefills. GLSL twin of kernels/llm/matvec_w12.cl (the .cl file is the
+ * semantic reference). Requires: common/nf_common.glsl, common/quant_blocks.glsl, common/reduce.glsl,
+ * common/act.glsl.
+ *
+ * A variants row selects OP=<op> and VIEW=<0|1>; its kernel name is the OpenCL name, e.g.
+ *     W12_MatVec	matvec_w12.comp	OP=OP_MATVEC	sg
+ *     W12Q_MatVec	matvec_w12.comp	OP=OP_MATVEC VIEW=1	sg
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_MATVEC      (i out_dim, i in_dim, R weight, R float input, W float output)
+ *   OP_MATVEC_ADD  (i out_dim, i in_dim, R weight, R float input, float addend_output)
+ *                  addend_output[row] += dot(weight row, input)
+ *   OP_GATEUP_SILU (i out_dim, i in_dim, R gate_weight, R up_weight, R float input, W float output)
+ *                  output[row] = silu(dot(gate row, input)) * dot(up row, input)
+ *   OP_BATCH       (i out_dim, i in_dim, i seq_len, R weight, R float input, W float output)
+ *                  output[s * out_dim + row] = dot(weight row, input row s), s in [0, seq_len)
+ *   OP_BATCH_2D    same arguments and result, one token per workgroup row
+ *   OP_DECODE      (i out_dim, i in_dim, i out_row0, R weight, W uint16 output) one workgroup per row,
+ *                  writing rows [out_row0, out_row0 + out_dim) of the u16 output
+ * VIEW=1 reads the nested 8-bit view of the code bytes (every B nibble as the fixed midpoint 0x8), streams
+ * only the Q regions and corrects only the Q-table escapes; VIEW=0 decodes exactly with the exact-table
+ * corrections. A row without escapes reproduces the BF16 matvec bit for bit under both.
+ *
+ * One W12 row record (GGMLType.W12, W12Codec; a device-resident form, never stored in GGUF files) holds,
+ * for a row of in_dim elements (a whole number of 64): the Q region (one byte per element: bits 7..4 the
+ * exponent offset c into the row's 16-binade window [E - 15, E], bit 3 the sign, bits 2..0 mantissa bits
+ * 6..4), the B region (mantissa bits 3..0, element 2j in the low nibble of byte j, 2j + 1 in the high one),
+ * and 12 bytes of metadata: the scale f32 2^(E-127), then the row's exact escape count rp and Q escape
+ * count rpq as i32 exclusive ends (a row's start is the previous row's end, 0 for row 0). After the row
+ * region follow the shard's two escape tables: the exact table at byte out_dim * row_stride, 12-byte
+ * entries [col i32][bf16 bits u16][pad u16][val f32], and the Q table after it, 8-byte entries
+ * [col i32][val f32], with val the scaled true weight w * 2^(127-E). Every plane code decodes with the
+ * exponent field pinned at 112 + c: an escaped element's all-zero code reads as exactly 2^-15 (the Q
+ * nibble: 1.0625 * 2^-15) whatever the row window, the per-entry correction acc += x * val - x * 2^-15
+ * cancels that placeholder, and the epilogue scales the row sum by 2^(E-127) once.
+ *
+ * Dispatch: as in matvec_dense.comp — every op except OP_BATCH_2D is 1-D with global = rows * L and
+ * local = {L, 1, 1} (folded group counts recovered by nf_wg_id()); OP_BATCH_2D uses
+ * global = {out_dim * L, seq_len, 1} and local = {L, 1, 1}. Weight bytes are read through the u32 word
+ * view (nf_w_u32): every row stride, plane region and metadata field keeps 4-byte alignment (96 * n + 12
+ * bytes per row; table bases are multiples of 4 and entries of 12/8), so the Q bytes of a chunk, the two B
+ * bytes, the scale, both counts and every escape field read with one word load. Element indices are
+ * 32-bit: a weight binding never exceeds maxStorageBufferRange (GpuWeight shards keep it below).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#if !defined(OP)
+#error "matvec_w12.comp requires OP"
+#endif
+/* VIEW=1 (the nested 8-bit view) comes from the defines column; rows without it decode exactly. */
+#if !defined(VIEW)
+#define VIEW 0
+#endif
+#if VIEW != 0 && VIEW != 1
+#error "matvec_w12.comp: VIEW must be 0 (exact) or 1 (Q view)"
+#endif
+
+#define NF_W12_PLANE_BYTES 96u
+#define NF_W12_BLOCK_ELEMENTS 64u
+#define NF_W12_ROW_META_BYTES 12u
+#define NF_W12_ESC_ENTRY_BYTES 12u
+#define NF_W12_QESC_ENTRY_BYTES 8u
+#define NF_W12_QVIEW_NIBBLE 0x8u
+/* The plane placeholder of an escaped element (the all-zero code, exponent pinned at 112), and the Q
+ * pass's placeholder over the midpoint nibble. */
+#define NF_W12_PLACEHOLDER 3.0517578125e-05
+#define NF_W12_Q_PLACEHOLDER 3.24249267578125e-05
+
+#if OP == OP_GATEUP_SILU
+#define NF_W12_GATEUP 1
+#define NF_WEIGHT_STREAMS 2
+NF_BUFFER_VIEWS(0, w)
+NF_BUFFER_VIEWS(1, u)
+layout(std430, binding = 2) readonly buffer NfW12Input { float x_in[]; };
+layout(std430, binding = 3) writeonly buffer NfW12Output { float y_out[]; };
+layout(push_constant) uniform NfW12Params { int out_dim; int in_dim; } pc;
+#elif OP == OP_MATVEC || OP == OP_MATVEC_ADD
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfW12Input { float x_in[]; };
+#if OP == OP_MATVEC_ADD
+layout(std430, binding = 2) buffer NfW12Output { float y_out[]; };
+#else
+layout(std430, binding = 2) writeonly buffer NfW12Output { float y_out[]; };
+#endif
+layout(push_constant) uniform NfW12Params { int out_dim; int in_dim; } pc;
+#elif OP == OP_BATCH || OP == OP_BATCH_2D
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfW12Input { float x_in[]; };
+layout(std430, binding = 2) writeonly buffer NfW12Output { float y_out[]; };
+layout(push_constant) uniform NfW12Params { int out_dim; int in_dim; int seq_len; } pc;
+#elif OP == OP_DECODE
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) writeonly buffer NfW12Out16 { uint16_t o_u16[]; };
+layout(push_constant) uniform NfW12Params { int out_dim; int in_dim; int out_row0; } pc;
+#else
+#error "matvec_w12.comp: OP is not a W12 op"
+#endif
+
+#include "common/quant_blocks.glsl"
+#include "common/reduce.glsl"
+#include "common/act.glsl"
+
+/* The plane region size of a row. */
+uint nf_w12_planes(uint in_dim) {
+    return (in_dim / NF_W12_BLOCK_ELEMENTS) * NF_W12_PLANE_BYTES;
+}
+
+/* The byte stride of one row record: the planes plus the metadata. */
+uint nf_w12_stride(uint in_dim) {
+    return nf_w12_planes(in_dim) + NF_W12_ROW_META_BYTES;
+}
+
+/* The plane value bits of an element: the exponent field pinned at 112 + c, so the value is the true
+ * value times 2^(127 - top) (an escaped element's all-zero bytes read as NF_W12_PLACEHOLDER, the Q nibble
+ * as NF_W12_Q_PLACEHOLDER, whatever the row window). */
+uint nf_w12_plane_bits(uint q, uint nibble) {
+    const uint c = (q >> 4) & 0xFu;
+    const uint s = (q >> 3) & 0x1u;
+    const uint m654 = q & 0x7u;
+    return ((s << 15) | ((c + 112u) << 7) | (m654 << 4) | nibble) & 0xFFFFu;
+}
+
+/* The true bf16 bits of an in-band element: the exponent field c + top - 15 (the decode path's form). */
+uint nf_w12_true_bits(uint q, uint nibble, uint top) {
+    const uint c = (q >> 4) & 0xFu;
+    const uint s = (q >> 3) & 0x1u;
+    const uint m654 = q & 0x7u;
+    return ((s << 15) | ((c + top - 15u) << 7) | (m654 << 4) | nibble) & 0xFFFFu;
+}
+
+/* The exact escape table's base: after the row region of the shard whose records start at 0. */
+uint nf_w12_esc_base(uint ws, uint out_dim, uint in_dim) {
+    return out_dim * nf_w12_stride(in_dim);
+}
+
+/* The Q escape table's base: after the exact table, whose size the last row's exact escape count holds. */
+uint nf_w12_qesc_base(uint ws, uint out_dim, uint in_dim) {
+    const uint stride = nf_w12_stride(in_dim);
+    const uint n_esc = nf_w_u32(ws, (out_dim - 1u) * stride + nf_w12_planes(in_dim) + 4u);
+    return nf_w12_esc_base(ws, out_dim, in_dim) + n_esc * NF_W12_ESC_ENTRY_BYTES;
+}
+
+/* The four plane values of the chunk at element offset k (a multiple of 4) of the row at byte rbase,
+ * whose B region starts bBase bytes in (the row's width, right after the Q bytes); the Q view reads
+ * every B nibble as the midpoint. */
+vec4 nf_w12_load4(uint ws, uint rbase, uint bBase, uint k) {
+    const uint qw = nf_w_u32(ws, rbase + k);
+#if VIEW == 0
+    /* the B nibble word sits at an offset of 2 mod 4 for odd nibble pairs, so it loads as two u16s */
+    const uint bw = nf_w_u32_even(ws, rbase + bBase + (k >> 1u));
+    const uint b0 = bw & 0xFFu;
+    const uint b1 = (bw >> 8) & 0xFFu;
+#endif
+    return vec4(
+#if VIEW == 1
+        uintBitsToFloat(nf_w12_plane_bits(qw & 0xFFu, NF_W12_QVIEW_NIBBLE) << 16u),
+        uintBitsToFloat(nf_w12_plane_bits((qw >> 8) & 0xFFu, NF_W12_QVIEW_NIBBLE) << 16u),
+        uintBitsToFloat(nf_w12_plane_bits((qw >> 16) & 0xFFu, NF_W12_QVIEW_NIBBLE) << 16u),
+        uintBitsToFloat(nf_w12_plane_bits((qw >> 24) & 0xFFu, NF_W12_QVIEW_NIBBLE) << 16u));
+#else
+        uintBitsToFloat(nf_w12_plane_bits(qw & 0xFFu, b0 & 0xFu) << 16u),
+        uintBitsToFloat(nf_w12_plane_bits((qw >> 8) & 0xFFu, (b0 >> 4) & 0xFu) << 16u),
+        uintBitsToFloat(nf_w12_plane_bits((qw >> 16) & 0xFFu, b1 & 0xFu) << 16u),
+        uintBitsToFloat(nf_w12_plane_bits((qw >> 24) & 0xFFu, (b1 >> 4) & 0xFu) << 16u));
+#endif
+}
+
+#if OP != OP_DECODE
+/* This invocation's share of the row matvec of the record at byte rbase over activations
+ * xbase .. xbase + n: the plane products over 4-element groups lid, lid + L, ... (n is a whole number of
+ * plane footprints, so no scalar tail), then this invocation's share of the row's escape corrections
+ * [escStart, escEnd) over the table at escBase. The caller scales the workgroup sum by 2^(E-127) once. */
+float nf_w12_row_partial(uint ws, uint rbase, uint xbase, uint n, uint escBase, uint escStart,
+                         uint escEnd) {
+    float ps = 0.0;
+    for (uint j = gl_LocalInvocationID.x * 4u; j < n; j += gl_WorkGroupSize.x * 4u) {
+        ps += dot(nf_w12_load4(ws, rbase, n, j),
+                  vec4(x_in[xbase + j], x_in[xbase + j + 1u], x_in[xbase + j + 2u],
+                       x_in[xbase + j + 3u]));
+    }
+    const uint entry = VIEW == 1 ? NF_W12_QESC_ENTRY_BYTES : NF_W12_ESC_ENTRY_BYTES;
+    const uint valOff = VIEW == 1 ? 4u : 8u;
+    const float ph = VIEW == 1 ? NF_W12_Q_PLACEHOLDER : NF_W12_PLACEHOLDER;
+    for (uint i = escStart + gl_LocalInvocationID.x; i < escEnd; i += gl_WorkGroupSize.x) {
+        const uint e = escBase + i * entry;
+        const float xv = x_in[xbase + nf_w_u32(ws, e)];
+        ps = fma(uintBitsToFloat(nf_w_u32(ws, e + valOff)), xv, fma(-ph, xv, ps));
+    }
+    return ps;
+}
+
+/* This invocation's share of a row's exact escape corrections over the 12-byte entries at escBase (the
+ * fused gate/up pass, exact-only). */
+float nf_w12_exact_correct(uint ws, uint xbase, uint escBase, uint escStart, uint escEnd, float ps) {
+    for (uint i = escStart + gl_LocalInvocationID.x; i < escEnd; i += gl_WorkGroupSize.x) {
+        const uint e = escBase + i * NF_W12_ESC_ENTRY_BYTES;
+        const float xv = x_in[xbase + nf_w_u32(ws, e)];
+        ps = fma(uintBitsToFloat(nf_w_u32(ws, e + 8u)), xv, fma(-NF_W12_PLACEHOLDER, xv, ps));
+    }
+    return ps;
+}
+#endif /* OP != OP_DECODE */
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint out_dim = uint(pc.out_dim);
+    const uint in_dim = uint(pc.in_dim);
+    const uint row_bytes = nf_w12_stride(in_dim);
+
+#if OP == OP_BATCH_2D
+    /* 2-D dispatch (never folded); with local y == 1 the return is uniform per workgroup. */
+    const uint row = gl_WorkGroupID.x;
+    const uint s = gl_GlobalInvocationID.y;
+    if (row >= out_dim || s >= uint(pc.seq_len)) {
+        return;
+    }
+    const uint rbase = row * row_bytes;
+    const uint planes = nf_w12_planes(in_dim);
+    const uint escBase = VIEW == 1 ? nf_w12_qesc_base(NF_WS_A, out_dim, in_dim)
+                                   : nf_w12_esc_base(NF_WS_A, out_dim, in_dim);
+    const uint escEnd = nf_w_u32(NF_WS_A, rbase + planes + (VIEW == 1 ? 8u : 4u));
+    const uint escStart = row == 0u ? 0u
+                                    : nf_w_u32(NF_WS_A, rbase - NF_W12_ROW_META_BYTES
+                                                       + (VIEW == 1 ? 8u : 4u));
+    const float acc = nf_wg_sum(nf_w12_row_partial(NF_WS_A, rbase, s * in_dim, in_dim, escBase,
+                                                   escStart, escEnd))
+            * uintBitsToFloat(nf_w_u32(NF_WS_A, rbase + planes));
+    if (lid == 0u) {
+        y_out[s * out_dim + row] = acc;
+    }
+#elif OP == OP_DECODE
+    /* One workgroup per row (global = rows * L): bf16 bits of every element into the u16 view (true
+     * exponent field c + top - 15), then the row's escaped elements overwritten from the exact table. */
+    const uint row = nf_wg_id();
+    if (row >= out_dim) {
+        return;
+    }
+    const uint wbase = row * row_bytes;
+    const uint planes = nf_w12_planes(in_dim);
+    const uint top = (nf_w_u32(NF_WS_A, wbase + planes) >> 23) & 0xFFu;
+    const uint obase = (uint(pc.out_row0) + row) * in_dim;
+    for (uint j = lid * 4u; j < in_dim; j += gl_WorkGroupSize.x * 4u) {
+        const uint qw = nf_w_u32(NF_WS_A, wbase + j);
+        /* the B nibble word sits at an offset of 2 mod 4 for odd nibble pairs, so it loads as two u16s */
+        const uint bw = nf_w_u32_even(NF_WS_A, wbase + in_dim + (j >> 1u));
+        const uint b0 = bw & 0xFFu;
+        const uint b1 = (bw >> 8) & 0xFFu;
+        /* one bf16 element per u16 slot: element obase + j + lane of the mirror */
+        o_u16[obase + j] = uint16_t(nf_w12_true_bits(qw & 0xFFu, b0 & 0xFu, top));
+        o_u16[obase + j + 1u] = uint16_t(nf_w12_true_bits((qw >> 8) & 0xFFu, (b0 >> 4) & 0xFu, top));
+        o_u16[obase + j + 2u] = uint16_t(nf_w12_true_bits((qw >> 16) & 0xFFu, b1 & 0xFu, top));
+        o_u16[obase + j + 3u] = uint16_t(nf_w12_true_bits((qw >> 24) & 0xFFu, (b1 >> 4) & 0xFu, top));
+    }
+    memoryBarrierBuffer();
+    barrier();
+    const uint escBase = nf_w12_esc_base(NF_WS_A, out_dim, in_dim);
+    const uint escEnd = nf_w_u32(NF_WS_A, wbase + planes + 4u);
+    const uint escStart = row == 0u ? 0u : nf_w_u32(NF_WS_A, wbase - NF_W12_ROW_META_BYTES + 4u);
+    for (uint i = escStart + lid; i < escEnd; i += gl_WorkGroupSize.x) {
+        const uint e = escBase + i * NF_W12_ESC_ENTRY_BYTES;
+        o_u16[obase + nf_w_u32(NF_WS_A, e)] = uint16_t(nf_w_u32(NF_WS_A, e + 4u) & 0xFFFFu);
+    }
+#else
+    /* The row depends only on the workgroup id, so this return is uniform per workgroup. */
+    const uint row = nf_wg_id();
+    if (row >= out_dim) {
+        return;
+    }
+    const uint rbase = row * row_bytes;
+    const uint planes = nf_w12_planes(in_dim);
+    const uint escBase = VIEW == 1 ? nf_w12_qesc_base(NF_WS_A, out_dim, in_dim)
+                                   : nf_w12_esc_base(NF_WS_A, out_dim, in_dim);
+    const uint escEnd = nf_w_u32(NF_WS_A, rbase + planes + (VIEW == 1 ? 8u : 4u));
+    const uint escStart = row == 0u ? 0u
+                                    : nf_w_u32(NF_WS_A, rbase - NF_W12_ROW_META_BYTES
+                                                       + (VIEW == 1 ? 8u : 4u));
+#if OP == OP_BATCH
+    for (uint s = 0u; s < uint(pc.seq_len); ++s) {
+        const float acc = nf_wg_sum(nf_w12_row_partial(NF_WS_A, rbase, s * in_dim, in_dim, escBase,
+                                                       escStart, escEnd))
+                * uintBitsToFloat(nf_w_u32(NF_WS_A, rbase + planes));
+        if (lid == 0u) {
+            y_out[s * out_dim + row] = acc;
+        }
+    }
+#elif defined(NF_W12_GATEUP)
+    /* The gate and up weights are separate shard records, each with its own escape tables (the Q view
+     * never runs fused). */
+    const uint gBase = nf_w12_esc_base(NF_WS_A, out_dim, in_dim);
+    const uint uBase = nf_w12_esc_base(NF_WS_B, out_dim, in_dim);
+    const uint gEnd = nf_w_u32(NF_WS_A, rbase + planes + 4u);
+    const uint gStart = row == 0u ? 0u : nf_w_u32(NF_WS_A, rbase - NF_W12_ROW_META_BYTES + 4u);
+    const uint uEnd = nf_w_u32(NF_WS_B, rbase + planes + 4u);
+    const uint uStart = row == 0u ? 0u : nf_w_u32(NF_WS_B, rbase - NF_W12_ROW_META_BYTES + 4u);
+    float gs = 0.0;
+    float us = 0.0;
+    for (uint j = lid * 4u; j < in_dim; j += gl_WorkGroupSize.x * 4u) {
+        const vec4 xv = vec4(x_in[j], x_in[j + 1u], x_in[j + 2u], x_in[j + 3u]);
+        gs += dot(nf_w12_load4(NF_WS_A, rbase, in_dim, j), xv);
+        us += dot(nf_w12_load4(NF_WS_B, rbase, in_dim, j), xv);
+    }
+    gs = nf_w12_exact_correct(NF_WS_A, 0u, gBase, gStart, gEnd, gs);
+    us = nf_w12_exact_correct(NF_WS_B, 0u, uBase, uStart, uEnd, us);
+    const float g = nf_wg_sum(gs) * uintBitsToFloat(nf_w_u32(NF_WS_A, rbase + planes));
+    const float up = nf_wg_sum(us) * uintBitsToFloat(nf_w_u32(NF_WS_B, rbase + planes));
+    if (lid == 0u) {
+        y_out[row] = nf_silu(g) * up;
+    }
+#else
+    const float acc = nf_wg_sum(nf_w12_row_partial(NF_WS_A, rbase, 0u, in_dim, escBase, escStart, escEnd))
+            * uintBitsToFloat(nf_w_u32(NF_WS_A, rbase + planes));
+    if (lid == 0u) {
+#if OP == OP_MATVEC_ADD
+        y_out[row] += acc;
+#else
+        y_out[row] = acc;
+#endif
+    }
+#endif
+#endif
+}

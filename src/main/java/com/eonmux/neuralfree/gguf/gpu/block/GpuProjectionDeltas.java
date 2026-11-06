@@ -1,15 +1,20 @@
 package com.eonmux.neuralfree.gguf.gpu.block;
 
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.gguf.engine.lora.AdapterRows;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * Additive deltas on the weight products of one model: the LoRA terms of llama.cpp {@code build_lora_mm}
@@ -27,6 +32,15 @@ import java.util.Objects;
  * block serves, or on a site of another kind, is refused, so a provider never has its delta silently dropped. A block
  * keeps its live site, so deltas registered or removed later take effect from the next step, and a step allocates
  * nothing. Layers that share physical weights (loop slots) share the site of each tensor.</p>
+ *
+ * <p>Every delta belongs to an adapter slot (vLLM's multi-LoRA batching, punica_wrapper) and applies only to the rows
+ * the pass's {@link AdapterRows} table puts in its slot, dispatched run by run over the consecutive rows of that
+ * slot: slot 0 holds the startup adapters (llama.cpp {@code --lora}), a slot {@code s >= 1} the per-request adapters
+ * {@code LoraRegistry} opened there, which replace the startup set for its rows. A registration binds the factor its
+ * slot's rows run the delta at (1.0 for a plain registration, a slot-key's factor of the uploaded factors for a
+ * rescaled startup set). The forward backend sets the table ({@link #rows()}) on the host before it enqueues the
+ * rows' products; {@link #openSlot} and {@link #closeSlot} track the slots a registry opened, including one that
+ * holds no delta.</p>
  *
  * <p>Shared by every block of one model through the forward context. Not thread-safe: one forward pass at a
  * time.</p>
@@ -47,48 +61,68 @@ public final class GpuProjectionDeltas {
     @FunctionalInterface
     public interface Delta {
         /**
-         * {@code y[t] += delta(x[t])} for {@code t < nTokens}: row {@code t} of {@code x} at
-         * {@code xOff + t*xStride}, of {@code y} at {@code yOff + t*yStride} (floats), enqueued on the context queue.
+         * {@code y[t] += scale * delta(x[t])} for {@code t < nTokens}: row {@code t} of {@code x} at
+         * {@code xOff + t*xStride}, of {@code y} at {@code yOff + t*yStride} (floats), enqueued on the context
+         * queue; {@code scale} is the factor the delta's slot runs the delta at (1.0 for a plain registration).
          */
-        void add(int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff, int yStride);
+        void add(float scale, int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff, int yStride);
     }
 
     /** One additive delta on a per-expert product's pair rows. */
     @FunctionalInterface
     public interface ExpertDelta {
         /**
-         * {@code y[p] += delta_{e_p}(x_p)} for the {@code nTokens * k} pairs {@code p = t*k + j} of the step, enqueued
-         * on the context queue. {@code ids} holds the expert {@code e_p} of every pair (ints from element 0). Input
-         * row of pair {@code p}: {@code x[xOff + (tokenRows ? p / k : p) * inDim]}; output row:
-         * {@code y[yOff + p * outDim]} (pair order).
+         * {@code y[p] += scale * delta_{e_p}(x_p)} for the {@code nTokens * k} pairs {@code p = t*k + j} of the
+         * step, enqueued on the context queue. {@code ids} holds the expert {@code e_p} of every pair (ints from
+         * element {@code idsOff}). Input row of pair {@code p}: {@code x[xOff + (tokenRows ? p / k : p) * inDim]};
+         * output row: {@code y[yOff + p * outDim]} (pair order).
          */
-        void add(int nTokens, int k, GpuBuffer ids, GpuBuffer x, int xOff, boolean tokenRows, GpuBuffer y, int yOff);
+        void add(float scale, int nTokens, int k, GpuBuffer ids, int idsOff, GpuBuffer x, int xOff, boolean tokenRows,
+                 GpuBuffer y, int yOff);
     }
 
     /** One additive delta on looked-up table rows. */
     @FunctionalInterface
     public interface EmbeddingDelta {
         /**
-         * {@code y[t] += delta(ids[t])} for {@code t < nTokens}: {@code ids} ints from element 0, row {@code t} of
-         * {@code y} at {@code yOff + t*yStride} (floats), enqueued on the context queue.
+         * {@code y[t] += scale * delta(ids[t])} for {@code t < nTokens}: {@code ids} ints from element
+         * {@code idsOff}, row {@code t} of {@code y} at {@code yOff + t*yStride} (floats), enqueued on the context
+         * queue.
          */
-        void add(int nTokens, GpuBuffer ids, GpuBuffer y, int yOff, int yStride);
+        void add(float scale, int nTokens, GpuBuffer ids, int idsOff, GpuBuffer y, int yOff, int yStride);
+    }
+
+    /** One delta registered in a slot, bound to the factor its slot's rows run it at. */
+    public static final class Bound<D> {
+        final D delta;
+        final float scale;
+
+        Bound(D delta, float scale) {
+            this.delta = delta;
+            this.scale = scale;
+        }
     }
 
     /** The served state of one product: its kind, shape, refusal and registered deltas. */
     public abstract static class Served<D> {
         private final String name;
         private final Kind kind;
-        final List<D> deltas = new ArrayList<>();
+        /** The adapter-slot table of the pass, shared by every site of the model. */
+        final AdapterRows rows;
+        /** The slot-0 deltas, applied to the rows of slot 0. */
+        final List<Bound<D>> deltas = new ArrayList<>();
+        /** The deltas of slots 1 and up, applied to the rows of their slot. */
+        final Map<Integer, List<Bound<D>>> slotDeltas = new TreeMap<>();
         private boolean served;
         private String refusal;
         private long inDim = -1L;
         private long outDim = -1L;
         private long experts = -1L;
 
-        Served(String name, Kind kind) {
+        Served(String name, Kind kind, AdapterRows rows) {
             this.name = name;
             this.kind = kind;
+            this.rows = rows;
         }
 
         /** Canonical tensor name of the product. */
@@ -103,9 +137,14 @@ public final class GpuProjectionDeltas {
         /** Why the serving block cannot take deltas, or null. */
         public String refusal() { return refusal; }
 
-        /** True when no delta is registered. */
+        /** True when no delta is registered in any slot. */
         public boolean isEmpty() {
-            return deltas.isEmpty();
+            return deltas.isEmpty() && slotDeltas.isEmpty();
+        }
+
+        /** The deltas of slot {@code slot}, or null when it holds none. */
+        List<Bound<D>> slotted(int slot) {
+            return slot == 0 ? deltas : slotDeltas.get(slot);
         }
 
         void markServed(String why, long in, long out, long nExperts) {
@@ -128,20 +167,46 @@ public final class GpuProjectionDeltas {
         @Override
         public String toString() {
             return "GpuProjectionDeltas." + kind + "{" + name + ", " + deltas.size() + " deltas"
+                    + (slotDeltas.isEmpty() ? "" : ", slots " + slotDeltas.keySet())
                     + (served ? "" : ", unserved") + '}';
         }
     }
 
     /** The registered deltas of one dense product. */
     public static final class Site extends Served<Delta> {
-        private Site(String name) {
-            super(name, Kind.PROJECTION);
+        private Site(String name, AdapterRows rows) {
+            super(name, Kind.PROJECTION, rows);
         }
 
-        /** Adds every registered delta to {@code y}; see {@link Delta#add}. */
+        /**
+         * Adds the registered deltas to {@code y}; see {@link Delta#add}. Each slot's deltas cover the rows the pass
+         * runs in that slot.
+         *
+         * @throws IllegalStateException when the pass's rows run in different slots and {@code nTokens} is not
+         *                               their count
+         */
         public void apply(int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff, int yStride) {
-            for (int i = 0; i < deltas.size(); i++) {
-                deltas.get(i).add(nTokens, x, xOff, xStride, y, yOff, yStride);
+            if (isEmpty()) {
+                return;
+            }
+            if (rows.uniform() >= 0) {
+                List<Bound<Delta>> all = slotted(rows.uniform());
+                for (int i = 0; all != null && i < all.size(); i++) {
+                    Bound<Delta> b = all.get(i);
+                    b.delta.add(b.scale, nTokens, x, xOff, xStride, y, yOff, yStride);
+                }
+                return;
+            }
+            rows.checkSpan(name(), nTokens);
+            for (int start = 0; start < nTokens; ) {
+                int end = rows.runEnd(start, nTokens);
+                List<Bound<Delta>> run = slotted(rows.slot(start));
+                for (int i = 0; run != null && i < run.size(); i++) {
+                    Bound<Delta> b = run.get(i);
+                    b.delta.add(b.scale, end - start, x, xOff + start * xStride, xStride, y,
+                            yOff + start * yStride, yStride);
+                }
+                start = end;
             }
         }
 
@@ -151,7 +216,7 @@ public final class GpuProjectionDeltas {
          * @throws IllegalStateException when the serving block gave no shape
          */
         public void applyRows(int nTokens, GpuBuffer x, int xOff, GpuBuffer y, int yOff) {
-            if (deltas.isEmpty()) {
+            if (isEmpty()) {
                 return;
             }
             if (inDim() < 0) {
@@ -163,34 +228,118 @@ public final class GpuProjectionDeltas {
 
     /** The registered deltas of one per-expert product. */
     public static final class ExpertSite extends Served<ExpertDelta> {
-        private ExpertSite(String name) {
-            super(name, Kind.EXPERTS);
+        private ExpertSite(String name, AdapterRows rows) {
+            super(name, Kind.EXPERTS, rows);
         }
 
-        /** Adds every registered delta to the pair rows of {@code y}; see {@link ExpertDelta#add}. */
+        /**
+         * Adds the registered deltas to the pair rows of {@code y}; see {@link ExpertDelta#add}. A slot's deltas
+         * cover the pairs of the tokens the pass runs in that slot.
+         *
+         * @throws IllegalStateException when the pass's rows run in different slots and {@code nTokens} is not
+         *                               their count
+         */
         public void apply(int nTokens, int k, GpuBuffer ids, GpuBuffer x, int xOff, boolean tokenRows, GpuBuffer y,
                           int yOff) {
-            for (int i = 0; i < deltas.size(); i++) {
-                deltas.get(i).add(nTokens, k, ids, x, xOff, tokenRows, y, yOff);
+            if (isEmpty()) {
+                return;
+            }
+            if (rows.uniform() >= 0) {
+                List<Bound<ExpertDelta>> all = slotted(rows.uniform());
+                for (int i = 0; all != null && i < all.size(); i++) {
+                    Bound<ExpertDelta> b = all.get(i);
+                    b.delta.add(b.scale, nTokens, k, ids, 0, x, xOff, tokenRows, y, yOff);
+                }
+                return;
+            }
+            rows.checkSpan(name(), nTokens);
+            int in = (int) inDim();
+            int out = (int) outDim();
+            for (int start = 0; start < nTokens; ) {
+                int end = rows.runEnd(start, nTokens);
+                List<Bound<ExpertDelta>> run = slotted(rows.slot(start));
+                int runX = xOff + (tokenRows ? start : start * k) * in;
+                for (int i = 0; run != null && i < run.size(); i++) {
+                    Bound<ExpertDelta> b = run.get(i);
+                    b.delta.add(b.scale, end - start, k, ids, start * k, x, runX, tokenRows, y,
+                            yOff + start * k * out);
+                }
+                start = end;
             }
         }
     }
 
     /** The registered deltas of one table lookup. */
     public static final class EmbeddingSite extends Served<EmbeddingDelta> {
-        private EmbeddingSite(String name) {
-            super(name, Kind.EMBEDDING);
+        private EmbeddingSite(String name, AdapterRows rows) {
+            super(name, Kind.EMBEDDING, rows);
         }
 
-        /** Adds every registered delta to the looked-up rows; see {@link EmbeddingDelta#add}. */
+        /**
+         * Adds the registered deltas to the looked-up rows; see {@link EmbeddingDelta#add}. Each slot's deltas
+         * cover the rows the pass runs in that slot.
+         *
+         * @throws IllegalStateException when the pass's rows run in different slots and {@code nTokens} is not
+         *                               their count
+         */
         public void apply(int nTokens, GpuBuffer ids, GpuBuffer y, int yOff, int yStride) {
-            for (int i = 0; i < deltas.size(); i++) {
-                deltas.get(i).add(nTokens, ids, y, yOff, yStride);
+            if (isEmpty()) {
+                return;
+            }
+            if (rows.uniform() >= 0) {
+                List<Bound<EmbeddingDelta>> all = slotted(rows.uniform());
+                for (int i = 0; all != null && i < all.size(); i++) {
+                    Bound<EmbeddingDelta> b = all.get(i);
+                    b.delta.add(b.scale, nTokens, ids, 0, y, yOff, yStride);
+                }
+                return;
+            }
+            rows.checkSpan(name(), nTokens);
+            for (int start = 0; start < nTokens; ) {
+                int end = rows.runEnd(start, nTokens);
+                List<Bound<EmbeddingDelta>> run = slotted(rows.slot(start));
+                for (int i = 0; run != null && i < run.size(); i++) {
+                    Bound<EmbeddingDelta> b = run.get(i);
+                    b.delta.add(b.scale, end - start, ids, start, y, yOff + start * yStride, yStride);
+                }
+                start = end;
             }
         }
     }
 
     private final Map<String, Served<?>> sites = new HashMap<>();
+    /** The adapter slot of every row of the current pass. */
+    private final AdapterRows rows = new AdapterRows();
+    /** The slots >= 1 a registry opened on this model ({@link #openSlot}), the slots {@link #holdsSlot} reports. */
+    private final Set<Integer> openSlots = new HashSet<>();
+
+    /** The adapter-slot table of the current pass; the forward backend sets it before it enqueues the rows. */
+    public AdapterRows rows() {
+        return rows;
+    }
+
+    /** True when slot {@code slot} >= 1 is open on this model: rows may run in it, with or without deltas. */
+    public boolean holdsSlot(int slot) {
+        return openSlots.contains(slot);
+    }
+
+    /**
+     * Marks slot {@code slot} >= 1 open: rows may run in it from now on; it applies the deltas registered in it,
+     * none for a slot that runs the bare base model.
+     *
+     * @throws IllegalArgumentException for a slot below 1
+     */
+    public void openSlot(int slot) {
+        if (slot < 1) {
+            throw new IllegalArgumentException("per-request adapter slots start at 1, got " + slot);
+        }
+        openSlots.add(slot);
+    }
+
+    /** Marks slot {@code slot} closed; its deltas must be unregistered before the slot opens again. */
+    public void closeSlot(int slot) {
+        openSlots.remove(slot);
+    }
 
     // ================================================================== serving
 
@@ -272,6 +421,15 @@ public final class GpuProjectionDeltas {
     }
 
     /**
+     * The live dense site of product {@code name}, or null when no bound block serves it as a projection (it is
+     * served as another kind, or not at all).
+     */
+    public Site site(String name) {
+        Served<?> s = served(name);
+        return s instanceof Site ? (Site) s : null;
+    }
+
+    /**
      * Adds {@code delta} to {@code layer}'s dense product {@code weight}.
      *
      * @throws IllegalStateException         when no bound block serves that product, or it is not a dense product
@@ -283,20 +441,77 @@ public final class GpuProjectionDeltas {
 
     /** Adds {@code delta} to the dense product of tensor {@code name}; failures as {@link #register(LayerSpec, String, Delta)}. */
     public void register(String name, Delta delta) {
+        register(name, 0, delta);
+    }
+
+    /**
+     * Adds {@code delta} to the dense product of tensor {@code name} in adapter slot {@code slot}: slot 0 applies
+     * to every row, a slot {@code >= 1} to the rows the pass runs in it; failures as
+     * {@link #register(LayerSpec, String, Delta)}.
+     *
+     * @throws IllegalArgumentException for a negative slot
+     */
+    public void register(String name, int slot, Delta delta) {
+        register(name, slot, 1.0f, delta);
+    }
+
+    /**
+     * Adds {@code delta} to the dense product of tensor {@code name} in slot {@code slot} at the factor
+     * {@code scale} (a rescaled slot's factor of the uploaded factors); failures as
+     * {@link #register(String, int, Delta)}.
+     *
+     * @throws IllegalArgumentException for a negative slot or a non-finite scale
+     */
+    public void register(String name, int slot, float scale, Delta delta) {
         Objects.requireNonNull(delta, "delta");
-        registered(name, Site.class, Kind.PROJECTION).deltas.add(delta);
+        add(registered(name, Site.class, Kind.PROJECTION), slot, scale, delta);
     }
 
     /** Adds {@code delta} to the per-expert product of tensor {@code name}; failures as {@link #register(String, Delta)}. */
     public void registerExperts(String name, ExpertDelta delta) {
+        registerExperts(name, 0, delta);
+    }
+
+    /** Adds {@code delta} to the per-expert product of tensor {@code name} in slot {@code slot}; see {@link #register(String, int, Delta)}. */
+    public void registerExperts(String name, int slot, ExpertDelta delta) {
+        registerExperts(name, slot, 1.0f, delta);
+    }
+
+    /** Adds {@code delta} to the per-expert product of tensor {@code name} in slot {@code slot} at {@code scale}. */
+    public void registerExperts(String name, int slot, float scale, ExpertDelta delta) {
         Objects.requireNonNull(delta, "delta");
-        registered(name, ExpertSite.class, Kind.EXPERTS).deltas.add(delta);
+        add(registered(name, ExpertSite.class, Kind.EXPERTS), slot, scale, delta);
     }
 
     /** Adds {@code delta} to the lookup of table {@code name}; failures as {@link #register(String, Delta)}. */
     public void registerEmbedding(String name, EmbeddingDelta delta) {
+        registerEmbedding(name, 0, delta);
+    }
+
+    /** Adds {@code delta} to the lookup of table {@code name} in slot {@code slot}; see {@link #register(String, int, Delta)}. */
+    public void registerEmbedding(String name, int slot, EmbeddingDelta delta) {
+        registerEmbedding(name, slot, 1.0f, delta);
+    }
+
+    /** Adds {@code delta} to the lookup of table {@code name} in slot {@code slot} at {@code scale}. */
+    public void registerEmbedding(String name, int slot, float scale, EmbeddingDelta delta) {
         Objects.requireNonNull(delta, "delta");
-        registered(name, EmbeddingSite.class, Kind.EMBEDDING).deltas.add(delta);
+        add(registered(name, EmbeddingSite.class, Kind.EMBEDDING), slot, scale, delta);
+    }
+
+    private <D> void add(Served<D> site, int slot, float scale, D delta) {
+        if (slot < 0) {
+            throw new IllegalArgumentException("adapter slots are non-negative, got " + slot + " for " + site.name());
+        }
+        if (!Float.isFinite(scale)) {
+            throw new IllegalArgumentException("a delta of " + site.name() + " needs a finite scale, got " + scale);
+        }
+        Bound<D> bound = new Bound<>(delta, scale);
+        if (slot == 0) {
+            site.deltas.add(bound);
+            return;
+        }
+        site.slotDeltas.computeIfAbsent(slot, s -> new ArrayList<>()).add(bound);
     }
 
     /** Removes {@code delta} (by identity) from {@code layer}'s product {@code weight}; absent ones are ignored. */
@@ -311,8 +526,21 @@ public final class GpuProjectionDeltas {
             return;
         }
         for (int i = s.deltas.size() - 1; i >= 0; i--) {
-            if (s.deltas.get(i) == delta) {
+            if (s.deltas.get(i).delta == delta) {
                 s.deltas.remove(i);
+            }
+        }
+        for (Iterator<? extends Map.Entry<Integer, ? extends List<?>>> it = s.slotDeltas.entrySet().iterator();
+                it.hasNext(); ) {
+            Map.Entry<Integer, ? extends List<?>> e = it.next();
+            List<?> list = e.getValue();
+            for (int i = list.size() - 1; i >= 0; i--) {
+                if (((Bound<?>) list.get(i)).delta == delta) {
+                    list.remove(i);
+                }
+            }
+            if (list.isEmpty()) {
+                it.remove();
             }
         }
     }
@@ -338,13 +566,13 @@ public final class GpuProjectionDeltas {
             Served<?> fresh;
             switch (kind) {
                 case PROJECTION:
-                    fresh = new Site(name);
+                    fresh = new Site(name, rows);
                     break;
                 case EXPERTS:
-                    fresh = new ExpertSite(name);
+                    fresh = new ExpertSite(name, rows);
                     break;
                 default:
-                    fresh = new EmbeddingSite(name);
+                    fresh = new EmbeddingSite(name, rows);
                     break;
             }
             sites.put(name, fresh);

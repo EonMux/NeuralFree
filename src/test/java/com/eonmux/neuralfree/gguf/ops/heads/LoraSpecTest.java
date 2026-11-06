@@ -1,7 +1,7 @@
 package com.eonmux.neuralfree.gguf.ops.heads;
 
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
-import com.eonmux.neuralfree.gguf.engine.EngineConfig.LoraSpec;
+import com.eonmux.neuralfree.gguf.engine.LoraSpec;
 import org.junit.Test;
 
 import java.util.Arrays;

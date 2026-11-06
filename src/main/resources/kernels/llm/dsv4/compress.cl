@@ -1,4 +1,4 @@
-/* dsv4/compress.cl - LLM_DSV4_Compress, LLM_DSV4_LidUpdate_<KV>, LLM_DSV4_StateUpdate, LLM_DSV4_StateSnapshot and LLM_DSV4_CacheStore: DeepSeek-V4 KV compressor and cache commits. Requires: common/dialect.h, common/config.h, common/reduce.h, common/rope_common.h, common/kv_types.h, common/hadamard.h, common/dsv4_common.h */
+/* dsv4/compress.cl - LLM_DSV4_Compress, LLM_DSV4_CompressV41, LLM_DSV4_LidUpdate_<KV>, LLM_DSV4_StateUpdate, LLM_DSV4_StateSnapshot and LLM_DSV4_CacheStore: DeepSeek-V4 KV compressor and cache commits. Requires: common/dialect.h, common/config.h, common/reduce.h, common/rope_common.h, common/kv_types.h, common/hadamard.h, common/dsv4_common.h */
 /*
  * DeepSeek-V4 compressed caches (llama.cpp src/models/deepseek4.cpp, src/llama-kv-cache-dsv4.cpp). Java:
  * gguf.ops.dsv4.Dsv4Kernels (argument lists, geometry, validation) and gguf.ops.dsv4.CpuDsv4Compressor (CPU twin: same
@@ -212,6 +212,42 @@ NF_DSV4_LID_KERNEL(Q4_1, uchar, NF_DSV4_KV_Q4_1)
 NF_DSV4_LID_KERNEL(IQ4_NL, uchar, NF_DSV4_KV_IQ4_NL)
 NF_DSV4_LID_KERNEL(Q5_0, uchar, NF_DSV4_KV_Q5_0)
 NF_DSV4_LID_KERNEL(Q5_1, uchar, NF_DSV4_KV_Q5_1)
+NF_DSV4_LID_KERNEL(FP8_E4M3, uchar, NF_DSV4_KV_FP8_E4M3)
+NF_DSV4_LID_KERNEL(FP8_E5M2, uchar, NF_DSV4_KV_FP8_E5M2)
+
+/*
+ * LLM_DSV4_CompressV41: the pooled, normed latent of every block the ubatch completes, without rope and without the
+ * cache rotation, as F32 rows of the staging buffer out (models/deepseek41.cpp:480-505): the caller derives the index
+ * key of each block from this row, rotates the latent and the key, rotates the latent block and stores the combined
+ * [latent | index key] row itself. DeepSeek-V4.1 compressors use ratio 1 or 2, so no plane is overlapped; ape is a
+ * zero row of ratio * width values and the score projection is all zero on an ungated source.
+ * Launch: as LLM_DSV4_Compress; block g is written to out[g * width, (g + 1) * width).
+ */
+NF_KERNEL void LLM_DSV4_CompressV41(
+    int pos0, int n_tokens, int ratio, int width, float eps,
+    int cur_kv_off, int cur_score_off,
+    NF_GLOBAL const float* NF_RESTRICT state_kv,
+    NF_GLOBAL const float* NF_RESTRICT state_score,
+    NF_GLOBAL const float* NF_RESTRICT cur_kv,
+    NF_GLOBAL const float* NF_RESTRICT cur_score,
+    NF_GLOBAL const float* NF_RESTRICT ape,
+    NF_GLOBAL const float* NF_RESTRICT norm_w,
+    NF_GLOBAL float* NF_RESTRICT out) {
+    NF_LOCAL float row[NF_DSV4_MAX_WIDTH];
+    NF_LOCAL float red[LLM_DIMX];
+
+    const int g = get_group_id(0);
+    const int b0 = pos0 / ratio;
+    if (g >= (pos0 + n_tokens) / ratio - b0) {
+        return;
+    }
+    nf_dsv4_compress_row(b0 + g, pos0, ratio, width, 0, 0, eps,
+                         1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                         cur_kv_off, cur_score_off, state_kv, state_score, cur_kv, cur_score, ape, norm_w, row, red);
+    for (int c = get_local_id(0); c < width; c += get_local_size(0)) {
+        out[(nf_i64)g * width + c] = row[c];
+    }
+}
 
 /*
  * LLM_DSV4_StateUpdate: persists the current ubatch into the compressor planes (state_persist_src/dst_idxs,

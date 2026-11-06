@@ -30,12 +30,42 @@ public interface CpuMixer extends AutoCloseable {
     void prefill(int pos0, int n, float[] in, float[] out);
 
     /**
+     * The cache writes of {@code n} tokens at positions {@code pos0 ..} alone: the projections, norms and rotations
+     * the stored K and V rows need, and the store; no query, attention, output projection or branch residual, none
+     * of which a reader of these caches consumes. {@code in} holds the normalized layer input and is left unread
+     * afterwards. The stored rows are the ones {@link #prefill} stores.
+     *
+     * <p>A mixer that writes no cache (a linear replacement, a reader of another layer's cache) does nothing.</p>
+     *
+     * @throws UnsupportedOperationException when this mixer has no cache-write-only step ({@link #kvRefusal()})
+     */
+    default void prefillKV(int pos0, int n, float[] in) {
+        throw new UnsupportedOperationException(kvRefusal());
+    }
+
+    /**
+     * Why this mixer has no cache-write-only step ({@link #prefillKV}), or null when it has one. The layer executor
+     * asks before the pass; a refusing mixer runs its whole attention part instead, so the cache rows are the same.
+     */
+    default String kvRefusal() {
+        return getClass().getSimpleName() + " cannot run its cache writes without its attention";
+    }
+
+    /**
      * Drops cached positions {@code [nKeep, nKeep + nDiscard)} and shifts the later ones down (context shift).
      *
      * @throws UnsupportedOperationException when this mixer cannot shift its memory
      */
     default void shiftContext(int nKeep, int nDiscard) {
         throw new UnsupportedOperationException(shiftRefusal());
+    }
+
+    /**
+     * Re-rotates this mixer's cached keys by the paged shift deltas its memory records
+     * ({@code HeapModelMemory#shiftDelta}): the row moves already happened, {@code delta[r]} is the position
+     * delta of row {@code r} (0 for a row the move kept). No-op for a mixer without its own K cache.
+     */
+    default void applyShiftDeltas() {
     }
 
     /**

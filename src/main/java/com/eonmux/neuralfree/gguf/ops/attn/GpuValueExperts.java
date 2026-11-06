@@ -4,11 +4,13 @@ import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuMatmulTap;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
+import com.eonmux.neuralfree.gguf.ops.moe.GpuGroupedRows;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeKernels;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeRouting;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
@@ -31,8 +33,11 @@ import java.util.Objects;
  *       {@link MoeSpec#NORM_SUM_MIN} when {@code expert_weights_norm}, scaled when {@code expert_weights_scale} is
  *       not 0 or 1;</li>
  *   <li>the selected experts' products {@code attn_v_exps[id] . x}: {@code {T}_MatVecId} with a broadcast input row
- *       for one token, {@code LLM_MoE_Bucketize} + {@code {T}_BatchMatMulId} (token rows, {@code x_div = k}) for
- *       several, one dispatch per expert shard of the tensor; then their LoRA deltas ({@code build_lora_mm_id});</li>
+ *       for one token; for several the expert sort ({@link GpuGroupedRows}) and the grouped GEMM over its aligned
+ *       rows ({@code LLM_MoE_AlignBlocks} + {@code {T}_GroupedGemm}, {@code {T}_GroupedGemmMma} on CUDA or
+ *       Vulkan tensor cores; token rows, {@code x_div = k}), or {@code {T}_BatchMatMulId} when the expert type or
+ *       the device cannot run the grouped GEMM; one dispatch per expert shard of the tensor; then their LoRA deltas
+ *       ({@code build_lora_mm_id});</li>
  *   <li>{@code silu} ({@code LLM_Unary}) and {@code LLM_MoE_WeightedSum}, which adds the weighted experts in
  *       selection order into the V rows.</li>
  * </ol>
@@ -45,10 +50,8 @@ final class GpuValueExperts implements AutoCloseable {
     private static final String T_IDS = "attn.vexp.ids";
     private static final String T_WEIGHTS = "attn.vexp.weights";
     private static final String T_OUT = "attn.vexp.out";
-    private static final String T_COUNTS = "attn.vexp.counts";
-    private static final String T_OFFSETS = "attn.vexp.offsets";
-    private static final String T_ROW_TOKEN = "attn.vexp.row_token";
-    private static final String T_ROW_SLOT = "attn.vexp.row_slot";
+    /** Scratch prefix of the expert sort ({@link GpuGroupedRows}). */
+    private static final String T_ROWS = "attn.vexp";
 
     private final GpuOps ops;
     private final int layer;
@@ -60,6 +63,8 @@ final class GpuValueExperts implements AutoCloseable {
     private final int idLocal;
     private final int routerLocal;
     private final GpuWeight router;
+    /** The routed value-expert stack, multiplied by the block's own id-matvec kernels and tapped per pair. */
+    private final GpuWeight exps;
     private final GpuProjectionDeltas.Site routerDeltas;
     private final GpuProjectionDeltas.ExpertSite expertDeltas;
     private final GpuBuffer logits;
@@ -68,7 +73,9 @@ final class GpuValueExperts implements AutoCloseable {
     private final GpuBuffer expertOut;
     private final List<PreparedDispatch> prepared = new ArrayList<>();
     private final PreparedDispatch select;
-    private final PreparedDispatch bucket;
+    /** Batched path over the aligned rows ({@code {T}_GroupedGemm*}) instead of {@code {T}_BatchMatMulId}. */
+    private final boolean grouped;
+    private final GpuGroupedRows rows;
     private final PreparedDispatch[] decode;
     private final PreparedDispatch[] batch;
     private final PreparedDispatch wsum;
@@ -96,6 +103,7 @@ final class GpuValueExperts implements AutoCloseable {
         GpuWeights w = ctx.weightSource().weightsFor(layer.weightLayer());
         this.router = w.layer(layer, proj.vGateWeight());
         GpuWeight exps = w.layer(layer, proj.vExpsWeight());
+        this.exps = exps;
         this.nEmbd = Math.toIntExact(router.cols());
         checkTensors(exps);
         if (spec.probBias() != (gateBias != null)) {
@@ -110,6 +118,9 @@ final class GpuValueExperts implements AutoCloseable {
         this.idLocal = idLocal(exps);
         MoeKernels.checkIdLocal(exps.type(), idLocal);
         int ubatch = ctx.scratch().ubatch();
+        int maxRows = Math.toIntExact((long) ubatch * k);
+        this.grouped = GpuGroupedRows.alignUsable(ctx.kernels(), maxRows, nExpert, vDim)
+                && GpuGroupedRows.groupedUsable(ctx.kernels(), exps.type(), nEmbd);
         checkGrid(ctx, ubatch);
         GpuScratch scratch = ctx.scratch();
         long pairs = (long) ubatch * k;
@@ -117,37 +128,41 @@ final class GpuValueExperts implements AutoCloseable {
         this.ids = scratch.temp(T_IDS, pairs).buffer();
         this.weights = scratch.temp(T_WEIGHTS, pairs).buffer();
         this.expertOut = scratch.temp(T_OUT, pairs * vDim).buffer();
-        GpuBuffer rowToken = scratch.temp(T_ROW_TOKEN, pairs).buffer();
-        GpuBuffer rowSlot = scratch.temp(T_ROW_SLOT, pairs).buffer();
         GpuBuffer ph = ctx.placeholders().readOnlyFloats();
+        GpuGroupedRows r = null;
         try {
             select = prepare(MoeKernels.ROUTER, MoeKernels.routerGlobal(1, routerLocal), new long[]{routerLocal},
                     MoeKernels.routerArgs(params, 1, logits, gateBias != null ? gateBias : ph, ids, weights));
-            long[] group = {Integer.highestOneBit(ops.local())};
-            bucket = prepare(MoeKernels.BUCKETIZE, group, group, MoeKernels.bucketizeArgs(1, k, nExpert, ids,
-                    scratch.temp(T_COUNTS, nExpert).buffer(), scratch.temp(T_OFFSETS, nExpert).buffer(), rowToken,
-                    rowSlot));
+            r = new GpuGroupedRows(ops, scratch, ctx.kernels(), T_ROWS, ubatch, k, nExpert, ids, grouped);
             int shards = exps.shardCount();
             decode = new PreparedDispatch[shards];
             batch = new PreparedDispatch[shards];
             long[] local2 = {idLocal, 1};
+            String groupedKernel = grouped ? GpuGroupedRows.groupedKernel(ops, exps.type(), false)
+                    : null;
             for (int i = 0; i < shards; i++) {
                 int base = expertOf(exps, exps.shardRowStart(i), i);
                 int count = expertOf(exps, exps.shardRows(i), i);
                 decode[i] = prepare(MoeKernels.matVecId(exps.type()), MoeKernels.idMatVecGlobal(vDim, k, idLocal),
                         local2, MoeKernels.matVecIdArgs(vDim, nEmbd, k, 0, 0, 0, false, base, count, ids,
                                 exps.shard(i), ph, ph, expertOut));
-                batch[i] = prepare(MoeKernels.batchMatMulId(exps.type()),
-                        MoeKernels.batchMatMulIdGlobal(vDim, k, idLocal), local2,
-                        MoeKernels.batchMatMulIdArgs(vDim, nEmbd, k, k, 0, false, base, count, rowToken, rowSlot,
-                                exps.shard(i), ph, ph, expertOut));
+                batch[i] = grouped
+                        ? prepare(groupedKernel, MoeKernels.groupedGemmGlobal(vDim, r.nTiles()),
+                                MoeKernels.groupedGemmLocal(), MoeKernels.groupedGemmArgs(vDim, nEmbd, r.nTiles(), k,
+                                        nEmbd, 0, 0, false, base, count, r.gemmToken(), r.gemmSlot(), exps.shard(i),
+                                        ph, ph, expertOut))
+                        : prepare(MoeKernels.batchMatMulId(exps.type()),
+                                MoeKernels.batchMatMulIdGlobal(vDim, k, idLocal), local2,
+                                MoeKernels.batchMatMulIdArgs(vDim, nEmbd, k, k, 0, false, base, count, r.rowToken(),
+                                        r.rowSlot(), exps.shard(i), ph, ph, expertOut));
             }
+            this.rows = r;
             wsum = prepare(MoeKernels.WEIGHTED_SUM, MoeKernels.elementGlobal(vDim, ops.local()),
                     new long[]{ops.local()}, MoeKernels.weightedSumArgs(1, vDim, k, 0, expertOut, weights,
                             Objects.requireNonNull(v, "v")));
         } catch (RuntimeException e) {
             close();
-            throw e;
+            throw Closeables.close(r, e);
         }
     }
 
@@ -197,7 +212,7 @@ final class GpuValueExperts implements AutoCloseable {
 
     private void checkGrid(GpuForwardContext ctx, int ubatch) {
         long[] max = ctx.kernels().caps().getMaxWorkGroupCount();
-        long tiles = ((long) ubatch * k + MoeKernels.BMM_ROWS - 1) / MoeKernels.BMM_ROWS;
+        long tiles = grouped ? k : ((long) ubatch * k + MoeKernels.BMM_ROWS - 1) / MoeKernels.BMM_ROWS;
         if (max.length >= 2 && ((max[0] > 0 && vDim > max[0]) || (max[1] > 0 && Math.max(tiles, k) > max[1]))) {
             throw new UnsupportedOperationException("layer " + layer + ": value experts of " + vDim + " rows over "
                     + tiles + " row tiles at ubatch " + ubatch + " exceed the device's work-group counts " + max[0]
@@ -225,10 +240,12 @@ final class GpuValueExperts implements AutoCloseable {
         if (n != lastN) {
             select.setInt(MoeKernels.ARG_N_TOKENS, n);
             select.setGlobal(MoeKernels.routerGlobal(n, routerLocal));
-            bucket.setInt(MoeKernels.ARG_N_TOKENS, n);
-            for (PreparedDispatch d : batch) {
-                d.setInt(MoeKernels.ARG_BMM_N_ROWS, n * k);
-                d.setGlobal(MoeKernels.batchMatMulIdGlobal(vDim, n * k, idLocal));
+            rows.update(n);
+            if (!grouped) {
+                for (PreparedDispatch d : batch) {
+                    d.setInt(MoeKernels.ARG_BMM_N_ROWS, n * k);
+                    d.setGlobal(MoeKernels.batchMatMulIdGlobal(vDim, n * k, idLocal));
+                }
             }
             wsum.setInt(MoeKernels.ARG_N_TOKENS, n);
             wsum.setGlobal(MoeKernels.elementGlobal((long) n * vDim, ops.local()));
@@ -240,19 +257,23 @@ final class GpuValueExperts implements AutoCloseable {
                 d.setInt(MoeKernels.ARG_ID_IN_OFF, xOff);
             }
             for (PreparedDispatch d : batch) {
-                d.setBuffer(MoeKernels.ARG_BMM_INPUT, x);
-                d.setInt(MoeKernels.ARG_BMM_IN_OFF, xOff);
+                d.setBuffer(grouped ? MoeKernels.ARG_GG_INPUT : MoeKernels.ARG_BMM_INPUT, x);
+                d.setInt(grouped ? MoeKernels.ARG_GG_IN_OFF : MoeKernels.ARG_BMM_IN_OFF, xOff);
             }
             lastX = x;
             lastXOff = xOff;
         }
         select.dispatch();
+        if (GpuMatmulTap.wantsExperts(exps)) {
+            int[] routed = GpuMatmulTap.readInts(ops.queue(), ids, 0, n * k);
+            GpuMatmulTap.experts(ops.queue(), exps, nExpert, routed, k, x, xOff, n, nEmbd, false);
+        }
         if (n == 1) {
             for (PreparedDispatch d : decode) {
                 d.dispatch();
             }
         } else {
-            bucket.dispatch();
+            rows.dispatch();
             for (PreparedDispatch d : batch) {
                 d.dispatch();
             }
@@ -268,6 +289,7 @@ final class GpuValueExperts implements AutoCloseable {
     public void close() {
         RuntimeException failure = Closeables.closeAll(prepared, null);
         prepared.clear();
+        failure = Closeables.close(rows, failure);
         if (failure != null) {
             throw failure;
         }

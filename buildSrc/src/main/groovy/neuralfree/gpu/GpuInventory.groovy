@@ -61,10 +61,13 @@ class GpuInventory {
         return entries
     }
 
-    /** Problems of a library's portable kernel-name set against its variants rows (exactly one row per kernel). */
-    static List<String> variantCoverageProblems(GpuKernelLibrary lib, Set<String> kernelNames) {
+    /**
+     * Problems of a library's portable kernel-name set against its variants rows (exactly one row per kernel,
+     * except the cudaOnly ones, which only the CUDA fatbins build and the Vulkan backend never serves).
+     */
+    static List<String> variantCoverageProblems(GpuKernelLibrary lib, Set<String> kernelNames, Set<String> cudaOnly) {
         Set<String> rowNames = GpuShaderVariants.read(lib.variantsDir, lib.shaderRoot, lib.subgroupVariants).collect { (String) it.name } as Set
-        List<String> withoutRow = (kernelNames - rowNames).sort()
+        List<String> withoutRow = ((kernelNames - cudaOnly) - rowNames).sort()
         List<String> withoutKernel = (rowNames - kernelNames).sort()
         List<String> problems = []
         if (!withoutRow.isEmpty()) {
@@ -77,19 +80,24 @@ class GpuInventory {
     }
 
     /**
-     * Problems of a library's checked-in inventory that need no preprocessor: every source must be an untagged
-     * .cl entry of the manifest (shared entries resolved against sharedRoot), and the variant rows must cover it.
+     * Problems of a library's checked-in inventory that need no preprocessor: every source must be a .cl entry of
+     * the manifest that at least the CUDA dialect builds (shared entries resolved against sharedRoot), and the
+     * variant rows must cover every kernel except the CUDA-only ones.
      */
     static List<String> coverageProblems(GpuKernelLibrary lib, Map<String, Map> inventory, File sharedRoot) {
-        Set<String> portableUnits = lib.manifest(sharedRoot)
+        List<Map> manifest = lib.manifest(sharedRoot)
+        Set<String> cudaOnlyPaths = manifest.findAll { it.cudaOnly }.collect { (String) it.path } as Set
+        Set<String> units = manifest
                 .findAll { !it.openClOnly && ((String) it.path).endsWith('.cl') }.collect { (String) it.path } as Set
+        Set<String> cudaOnly = inventory.findAll { it.value.file in cudaOnlyPaths }.keySet()
         List<String> problems = []
         inventory.each { String name, Map k ->
-            if (!portableUnits.contains(k.file)) {
-                problems.add("${name}: source ${k.file} is not an untagged .cl entry of ${lib.kernelRootPath}/manifest.txt")
+            if (!units.contains(k.file)) {
+                problems.add("${name}: source ${k.file} is not a .cl entry of ${lib.kernelRootPath}/manifest.txt "
+                        + 'that the CUDA build includes')
             }
         }
-        problems.addAll(variantCoverageProblems(lib, inventory.keySet()))
+        problems.addAll(variantCoverageProblems(lib, inventory.keySet(), cudaOnly))
         return problems
     }
 

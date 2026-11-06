@@ -1,18 +1,25 @@
-/* argmax.comp - row-wise argmax. GLSL twin of LLM_Argmax in kernels/llm/sampling.cl.
+/* argmax.comp - row-wise argmax and the tree verify's device accept walk. GLSL twins of LLM_Argmax
+ * and LLM_TreeAccept in kernels/llm/sampling.cl.
  * Requires: common/nf_common.glsl.
  *
- * Variants row:
+ * Variants rows:
  *     LLM_Argmax	argmax.comp	OP=OP_ARGMAX
+ *     LLM_TreeAccept	argmax.comp	OP=OP_TREE_ACCEPT
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   OP_ARGMAX  (i size, float input, int max_idx, i n_rows)
  *              max_idx[row] = index of the first maximum of input[row * size .. row * size + size)
+ *   OP_TREE_ACCEPT  (i n_nodes, int tree, int argmax, int out)
+ *              the tree verify's acceptance walk (LLM_TreeAccept): tree holds 3 ints per node
+ *              (token, parent, depth), argmax the verify rows' greedy ids, out the accepted depth,
+ *              the first emission, the final draw and the accepted path's node indices.
  * Candidates are ordered as in nf_argmax_better (kernels/llm/sampling.cl): a non-NaN value beats NaN, the
  * larger value wins, equal values go to the lower index. NaN is never selected; a row of only NaN
  * yields 0, and so does size == 0.
  *
- * Dispatch: 1-D, global = n_rows * L, local = {L, 1, 1}; one workgroup per row. Folded group
- * counts are recovered by nf_wg_id(); surplus groups exit uniformly. Any L is reduced exactly.
+ * Dispatch: 1-D, global = n_rows * L, local = {L, 1, 1}; one workgroup per row (OP_TREE_ACCEPT:
+ * global = local = {L}, exactly one workgroup). Folded group counts are recovered by nf_wg_id();
+ * surplus groups exit uniformly. Any L is reduced exactly.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -20,17 +27,29 @@
 #include "common/nf_common.glsl"
 
 #define OP_ARGMAX 131
+#define OP_TREE_ACCEPT 132
 
-#if !defined(OP) || OP != OP_ARGMAX
-#error "argmax.comp requires OP=OP_ARGMAX"
+#if !defined(OP)
+#error "argmax.comp requires OP"
+#endif
+#if OP != OP_ARGMAX && OP != OP_TREE_ACCEPT
+#error "argmax.comp requires OP=OP_ARGMAX or OP=OP_TREE_ACCEPT"
 #endif
 
+#if OP == OP_ARGMAX
 layout(std430, binding = 0) buffer NfAmInput { float x_in[]; };
 layout(std430, binding = 1) buffer NfAmOutput { int max_idx[]; };
-layout(push_constant) uniform NfAmParams { int size; int n_rows; } pc;
+#else
+layout(std430, binding = 0) buffer NfAmTree { int tree[]; };
+layout(std430, binding = 1) buffer NfAmRowIds { int row_ids[]; };
+layout(std430, binding = 2) buffer NfAmAccept { int accept[]; };
+#endif
+layout(push_constant) uniform NfAmParams { int block0; int block1; } pc;
 
-/* Index sentinel of a candidate that holds no element. */
+/* Index sentinel of an argmax candidate that holds no element. */
 #define NF_ARGMAX_NONE 0x7fffffff
+
+#if OP == OP_ARGMAX
 
 shared float nf_am_v[gl_WorkGroupSize.x];
 shared int nf_am_i[gl_WorkGroupSize.x];
@@ -60,12 +79,12 @@ uint nf_am_span() {
 
 void main() {
     const uint row = nf_wg_id();
-    if (row >= uint(pc.n_rows)) {
+    if (row >= uint(pc.block1)) {
         return;
     }
     const uint lid = gl_LocalInvocationID.x;
     const uint lsize = gl_WorkGroupSize.x;
-    const int size = pc.size;
+    const int size = pc.block0;
     const uint base = row * uint(size);
 
     float bv = NF_NAN;
@@ -98,3 +117,102 @@ void main() {
         max_idx[row] = (r == NF_ARGMAX_NONE) ? 0 : r;
     }
 }
+
+#else
+
+/* The tree verify's acceptance walk on the device: per depth one scan of the depth's nodes, one
+ * reduction of the smallest matched index and the matched bit set, one uniform advance (see
+ * LLM_TreeAccept in kernels/llm/sampling.cl). */
+shared int nf_am_min[gl_WorkGroupSize.x];
+shared uint nf_am_lo[gl_WorkGroupSize.x];
+shared uint nf_am_hi[gl_WorkGroupSize.x];
+shared int nf_am_stop;
+
+void main() {
+    if (nf_wg_id() != 0u) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const int n_nodes = pc.block0;
+
+    uint lo = 0u;
+    uint hi = 0u;
+    int pred_row = 0;
+    int accepted = 0;
+    const int first = row_ids[0];
+    int pred = first;
+    int depth = 1;
+
+    for (;;) {
+        int my_match = NF_ARGMAX_NONE;
+        uint my_lo = 0u;
+        uint my_hi = 0u;
+        for (int i = int(lid); i < n_nodes; i += int(lsize)) {
+            if (tree[3 * i + 2] != depth) {
+                continue;
+            }
+            const int parent = tree[3 * i + 1];
+            const int in_frontier = (lo | hi) == 0u
+                ? int(parent == -1)
+                : (parent < 32 ? int((lo >> uint(parent)) & 1u)
+                               : int((hi >> uint(parent - 32)) & 1u));
+            if (in_frontier == 0 || tree[3 * i] != pred) {
+                continue;
+            }
+            if (my_match == NF_ARGMAX_NONE) {
+                my_match = i; /* the scan ascends: the first hit is the smallest */
+            }
+            if (i < 32) {
+                my_lo |= 1u << uint(i);
+            } else {
+                my_hi |= 1u << uint(i - 32);
+            }
+        }
+        nf_am_min[lid] = my_match;
+        nf_am_lo[lid] = my_lo;
+        nf_am_hi[lid] = my_hi;
+        barrier();
+
+        /* ceiling halving: every lane's content reaches lane 0 for any work-group size (plain halving
+         * drops the tail lane on a non-power-of-two lsize) */
+        for (uint live = lsize; live > 1u; live = (live + 1u) >> 1u) {
+            const uint stride = (live + 1u) >> 1u;
+            if (lid < stride && lid + stride < live) {
+                if (nf_am_min[lid + stride] < nf_am_min[lid]) {
+                    nf_am_min[lid] = nf_am_min[lid + stride];
+                }
+                nf_am_lo[lid] |= nf_am_lo[lid + stride];
+                nf_am_hi[lid] |= nf_am_hi[lid + stride];
+            }
+            barrier();
+        }
+
+        if (lid == 0u) {
+            nf_am_stop = nf_am_min[0] == NF_ARGMAX_NONE ? 1 : 0;
+        }
+        barrier();
+        if (nf_am_stop == 1) {
+            break;
+        }
+        if (lid == 0u) {
+            accept[3 + accepted] = nf_am_min[0];
+        }
+        pred_row = nf_am_min[0] + 1;
+        pred = row_ids[pred_row];
+        lo = nf_am_lo[0];
+        hi = nf_am_hi[0];
+        accepted++;
+        depth++;
+        /* the reads of the reduced values above must finish before the next scan writes the arrays */
+        barrier();
+    }
+
+    if (lid == 0u) {
+        accept[0] = accepted;
+        accept[1] = first;
+        accept[2] = row_ids[pred_row];
+    }
+}
+
+#endif

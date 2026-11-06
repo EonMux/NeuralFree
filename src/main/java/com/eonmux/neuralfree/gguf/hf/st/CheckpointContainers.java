@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.hf.st;
 
+import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
+
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
@@ -13,8 +15,9 @@ import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Registry of checkpoint container formats: the built-in factories ({@link #builtIns()}, safetensors) merged with
- * factories registered at run time, asked in that order. The first factory that accepts a checkpoint opens it.
+ * Registry of checkpoint container formats: the built-in factories ({@link #builtIns()}: safetensors, vLLM's
+ * pre-sharded state dicts and tensorizer files, and the restricted pickle reader) merged with factories registered at
+ * run time, asked in that order. The first factory that accepts a checkpoint opens it.
  * Registering the same factory twice fails, as a duplicate row fails the architecture tables.
  */
 public final class CheckpointContainers {
@@ -39,6 +42,18 @@ public final class CheckpointContainers {
          * @throws IOException when the checkpoint cannot be read or is invalid
          */
         CheckpointContainer open(Path path, Path configDir, boolean mistralNative) throws IOException;
+
+        /**
+         * Opens the checkpoint with the configuration the load already read, for formats whose tensor names depend
+         * on it (vLLM's packed module state dicts). The default ignores the configuration and calls
+         * {@link #open(Path, Path, boolean)}.
+         *
+         * @param config the checkpoint's configuration, or null when the load has none to pass
+         */
+        default CheckpointContainer open(Path path, Path configDir, boolean mistralNative, HfConfig config)
+                throws IOException {
+            return open(path, configDir, mistralNative);
+        }
     }
 
     private static final List<Factory> REGISTERED = new CopyOnWriteArrayList<>();
@@ -51,11 +66,14 @@ public final class CheckpointContainers {
     }
 
     /**
-     * The container formats NeuralFree reads, in the order they are asked (FX-1): safetensors first, then the
-     * restricted PyTorch pickle container, HF.md's detection rule order.
+     * The container formats NeuralFree reads, in the order they are asked: safetensors, vLLM's pre-sharded and
+     * tensorizer state dicts (their own file names and extensions, which safetensors never accepts) and the restricted
+     * PyTorch pickle container.
      */
     static List<Factory> builtIns() {
         return Arrays.asList(SafetensorsCheckpoint.FACTORY,
+                ShardedStateCheckpoint.FACTORY,
+                TensorizerCheckpoint.FACTORY,
                 com.eonmux.neuralfree.gguf.hf.torch.TorchCheckpointFactory.FACTORY);
     }
 
@@ -129,13 +147,25 @@ public final class CheckpointContainers {
      * @throws IOException when no factory accepts the checkpoint, or it cannot be read or is invalid
      */
     public static CheckpointContainer open(Path path, Path configDir, boolean mistralNative) throws IOException {
+        return open(path, configDir, mistralNative, null);
+    }
+
+    /**
+     * Opens the checkpoint at {@code path} with the first factory that accepts it, passing the load's configuration
+     * to formats whose tensor names depend on it.
+     *
+     * @param config the checkpoint's configuration, or null when the caller has none
+     * @throws IOException when no factory accepts the checkpoint, or it cannot be read or is invalid
+     */
+    public static CheckpointContainer open(Path path, Path configDir, boolean mistralNative, HfConfig config)
+            throws IOException {
         Objects.requireNonNull(configDir, "configDir");
         Factory f = forFile(path);
         if (f == null) {
             throw new IOException("Invalid checkpoint '" + path + "': no checkpoint container reads it (looked for"
-                    + " *.safetensors files)");
+                    + " *.safetensors, *.tensors and vLLM's pre-sharded *.safetensors files)");
         }
-        return f.open(path, configDir, mistralNative);
+        return f.open(path, configDir, mistralNative, config);
     }
 
     /** The regular files of {@code dir} (symbolic links followed), sorted by name. */

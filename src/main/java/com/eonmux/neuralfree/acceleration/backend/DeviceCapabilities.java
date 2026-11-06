@@ -21,6 +21,15 @@ public final class DeviceCapabilities {
     /** Default push-constant block limit (the Vulkan minimum guarantee). */
     private static final int DEFAULT_MAX_PUSH_CONSTANT_BYTES = 128;
 
+    /**
+     * {@link #getComputeUnits()} of a device whose driver reports no shader-core or compute-unit
+     * count (Vulkan without {@code VK_NV_shader_sm_builtins} or {@code VK_AMD_shader_core_properties2},
+     * such as Intel). No device has zero compute units, so 0 can only mean "not reported";
+     * heuristics that size work by the count fall back to their conservative shape instead of
+     * dividing by it.
+     */
+    public static final int UNKNOWN_COMPUTE_UNITS = 0;
+
     private final String deviceName;
     private final long totalVramBytes;
     private final long maxAllocSizeBytes;
@@ -79,6 +88,10 @@ public final class DeviceCapabilities {
         this.deviceName = b.deviceName;
         this.totalVramBytes = b.totalVramBytes;
         this.maxAllocSizeBytes = b.maxAllocSizeBytes > 0 ? b.maxAllocSizeBytes : b.totalVramBytes;
+        if (b.computeUnits < UNKNOWN_COMPUTE_UNITS) {
+            throw new IllegalArgumentException("compute units must not be negative, got " + b.computeUnits
+                    + " (" + UNKNOWN_COMPUTE_UNITS + " means the device does not report a count)");
+        }
         this.computeUnits = b.computeUnits;
         this.maxClockFrequencyMhz = b.maxClockFrequencyMhz;
         this.maxWorkGroupSize = b.maxWorkGroupSize;
@@ -135,8 +148,17 @@ public final class DeviceCapabilities {
         return maxAllocSizeBytes;
     }
 
+    /**
+     * Compute units (SMs, work-group processors, shader cores), or
+     * {@link #UNKNOWN_COMPUTE_UNITS} when the device or driver does not report them.
+     */
     public int getComputeUnits() {
         return computeUnits;
+    }
+
+    /** Whether the device or driver reports a compute-unit count ({@link #getComputeUnits()} is not 0). */
+    public boolean isComputeUnitsKnown() {
+        return computeUnits != UNKNOWN_COMPUTE_UNITS;
     }
 
     public int getMaxClockFrequencyMhz() {
@@ -306,6 +328,7 @@ public final class DeviceCapabilities {
             return this;
         }
 
+        /** Default {@link #UNKNOWN_COMPUTE_UNITS}; negative values are rejected by {@link #build()}. */
         public Builder computeUnits(int computeUnits) {
             this.computeUnits = computeUnits;
             return this;

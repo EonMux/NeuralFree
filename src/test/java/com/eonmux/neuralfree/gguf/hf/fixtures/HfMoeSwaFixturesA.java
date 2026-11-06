@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-MS part A converter classes: {@code AfmoeModel} (afmoe.py:17-80),
+ * Synthetic checkpoints of the converter classes: {@code AfmoeModel} (afmoe.py:17-80),
  * {@code FlintModel} (flint.py:9-37), {@code Kolibri1Model} (kolibri1.py:9-22), {@code Cohere2MoeModel}
  * (command_r.py:67-183), the Granite model (granite.py:78-200), {@code Kolibri1Model} and the
  * {@code Gemma4UnifiedModel} suppress-tokens row. Two layers, a hidden size of 8, two query heads, one

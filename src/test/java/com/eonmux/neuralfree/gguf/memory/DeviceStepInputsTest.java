@@ -154,7 +154,7 @@ public class DeviceStepInputsTest {
     public void uploadWritesEachBufferOnceWithSectionMajorRopePositions() {
         SequenceState seq = new SequenceState(64);
         try (DeviceStepInputs in = DeviceStepInputs.allocate(backend, backend.computeQueue(),
-                Arrays.asList(fullGroup(0, 64), ringGroup(1, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, seq)) {
+                Arrays.asList(fullGroup(0, 64), ringGroup(1, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, seq, null)) {
             backend.clearLog();
             in.upload(3, 4);
 
@@ -184,7 +184,7 @@ public class DeviceStepInputsTest {
     public void textOnlyTemporalPatternLeavesSpatialSectionsZero() {
         SequenceState seq = new SequenceState(64);
         try (DeviceStepInputs in = DeviceStepInputs.allocate(backend, backend.computeQueue(),
-                Arrays.asList(fullGroup(0, 64)), UBATCH, UBATCH, MropeTextPositions.P000, seq)) {
+                Arrays.asList(fullGroup(0, 64)), UBATCH, UBATCH, MropeTextPositions.P000, seq, null)) {
             in.upload(10, 2);
             assertArrayEquals(new int[]{10, 11, 0, 0, 0, 0, 0, 0}, ints(in.ropePos(), 8));
         }
@@ -199,7 +199,7 @@ public class DeviceStepInputsTest {
     public void ringWrapUploadRewritesTheWholeRingOnce() {
         SequenceState seq = new SequenceState(64);
         try (DeviceStepInputs in = DeviceStepInputs.allocate(backend, backend.computeQueue(),
-                Arrays.asList(ringGroup(0, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, seq)) {
+                Arrays.asList(ringGroup(0, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, seq, null)) {
             in.upload(0, 8);
             in.upload(8, 6);
             assertFalse(seq.wrapped());
@@ -227,7 +227,7 @@ public class DeviceStepInputsTest {
     public void uploadRejectsStepsThatDoNotFitAndChangesNothing() {
         SequenceState seq = new SequenceState(16);
         try (DeviceStepInputs in = DeviceStepInputs.allocate(backend, backend.computeQueue(),
-                Arrays.asList(ringGroup(0, 16), fullGroup(1, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, seq)) {
+                Arrays.asList(ringGroup(0, 16), fullGroup(1, 16)), UBATCH, UBATCH, MropeTextPositions.PPP0, seq, null)) {
             assertThrows(IllegalArgumentException.class, () -> in.upload(0, UBATCH + 1));
             assertThrows(IllegalArgumentException.class, () -> in.upload(0, 0));
             assertThrows(IllegalArgumentException.class, () -> in.upload(12, 5));
@@ -561,6 +561,28 @@ public class DeviceStepInputsTest {
             assertFalse(fake(ph.scratchFloats()).isReadOnly());
             assertFalse(fake(ph.scratchInts()).isReadOnly());
             assertArrayEquals(new int[GpuPlaceholders.ELEMENTS], ints(ph.readOnlyInts(), GpuPlaceholders.ELEMENTS));
+        }
+        assertTrue(backend.liveBuffers().isEmpty());
+    }
+
+    @Test
+    public void restrictKvPosHidesEveryRowOutsideTheBlockAndKeepsTheMirror() {
+        DeviceModelMemory mem = allocate(fullPlan(8));
+        try {
+            step(mem, 0, 8);
+            assertArrayEquals(new int[]{0, 1, 2, 3, 4, 5, 6, 7}, ints(mem.stepInputs().kvPos(0), 8));
+            mem.stepInputs().restrictKvPos(3, 6);
+            assertArrayEquals("only the block's positions stay visible",
+                    new int[]{-1, -1, -1, 3, 4, 5, -1, -1}, ints(mem.stepInputs().kvPos(0), 8));
+            assertEquals("the host mirror keeps the sequence's own positions",
+                    2, mem.stepInputs().positionOfRow(0, 2));
+            mem.stepInputs().restrictKvPos(0, 8);
+            assertArrayEquals("a later step restores the whole context",
+                    new int[]{0, 1, 2, 3, 4, 5, 6, 7}, ints(mem.stepInputs().kvPos(0), 8));
+            assertThrows(IllegalArgumentException.class, () -> mem.stepInputs().restrictKvPos(4, 3));
+            assertThrows(IllegalArgumentException.class, () -> mem.stepInputs().restrictKvPos(-1, 3));
+        } finally {
+            mem.close();
         }
         assertTrue(backend.liveBuffers().isEmpty());
     }

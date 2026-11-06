@@ -32,16 +32,21 @@ public class KernelManifestTest {
                         + "\n"
                         + "  b.cl   # trailing comment\n"
                         + "[opencl] legacy/c.cl\r\n"
-                        + "[opencl]d.cl\n", "test");
+                        + "[opencl]d.cl\n"
+                        + "[cuda] mma.cl\n", "test");
         assertEquals("lib", m.root());
         assertEquals(Arrays.asList(
                 new KernelManifest.Entry("common/a.h", false),
                 new KernelManifest.Entry("b.cl", false),
                 new KernelManifest.Entry("legacy/c.cl", true),
-                new KernelManifest.Entry("d.cl", true)), m.entries());
+                new KernelManifest.Entry("d.cl", true),
+                new KernelManifest.Entry("mma.cl", false, true, false)), m.entries());
         assertEquals(Arrays.asList("common/a.h", "b.cl"), m.portablePaths());
         assertEquals(Arrays.asList("legacy/c.cl", "d.cl"), m.openClOnlyPaths());
+        assertEquals(Arrays.asList("mma.cl"), m.cudaOnlyPaths());
         assertEquals("lib/legacy/c.cl", m.resourcePath(m.entries().get(2)));
+        assertEquals("[cuda] mma.cl", m.entries().get(4).toString());
+        assertTrue(m.entries().get(4).cudaOnly());
     }
 
     @Test
@@ -107,7 +112,6 @@ public class KernelManifestTest {
 
     @Test
     public void rejectsMalformedManifests() {
-        assertRejected("[cuda] a.cl\n", "unknown tag");
         assertRejected("a.cl\na.cl\n", "duplicate entry");
         assertRejected("/abs/a.cl\n", "relative");
         assertRejected("x/../a.cl\n", "'..'");
@@ -116,7 +120,11 @@ public class KernelManifestTest {
         assertRejected("# only comments\n\n", "no source files");
         assertRejected("[shared] [opencl] a.h\n", "mutually exclusive");
         assertRejected("[opencl] [shared] a.h\n", "mutually exclusive");
-        assertRejected("[shared] [shared] a.h\n", "repeated tag");
+        assertRejected("[shared] [shared] a.h\n", "repeated or conflicting tag");
+        assertRejected("[cuda] [opencl] a.cl\n", "mutually exclusive");
+        assertRejected("[opencl] [cuda] a.cl\n", "mutually exclusive");
+        assertRejected("[cuda] [shared] a.cl\n", "mutually exclusive");
+        assertRejected("[shared] [cuda] a.h\n", "mutually exclusive");
         assertRejected("a.cl\n[shared] common/d.h\n", "must precede every library entry");
         assertRejected("[shared] ../d.h\n", "'..'");
         assertRejected("[shared] /d.h\n", "relative");
@@ -240,6 +248,26 @@ public class KernelManifestTest {
                     new java.util.HashSet<String>(), "the index");
             assertFalse(noInventory.available());
             assertTrue(noInventory.reason(), noInventory.reason().contains("classpath:other/inventory.txt is missing"));
+        }
+    }
+
+    @Test
+    public void portableCoverageSkipsKernelsOfCudaOnlySources() throws IOException {
+        Path dir = Files.createTempDirectory("nf-manifest");
+        try (URLClassLoader cl = loaderFor(dir)) {
+            write(dir.resolve("lib/manifest.txt"), "a.cl\n[cuda] b.cl\n");
+            write(dir.resolve("lib/inventory.txt"), "K1\ta.cl\t0\t1\ti\tB\nK2\tb.cl\t0\t1\ti\tB\n");
+            assertEquals(java.util.Collections.singleton("K2"), KernelManifest.cudaOnlyInventoryKernels(cl, "lib"));
+            Set<String> portable = new java.util.HashSet<>(Arrays.asList("K1"));
+            assertFalse("the CUDA build must hold its own kernels",
+                    KernelManifest.inventoryCoverage(cl, "llm", "lib", portable, "the index").available());
+            Availability vulkan = KernelManifest.portableInventoryCoverage(cl, "llm", "lib", portable, "the index");
+            assertTrue(vulkan.reason(), vulkan.available());
+            Availability empty = KernelManifest.portableInventoryCoverage(cl, "llm", "lib",
+                    new java.util.HashSet<String>(), "the index");
+            assertFalse(empty.available());
+            assertTrue(empty.reason(), empty.reason().startsWith("LLM kernel inventory incomplete: 1 of 1"));
+            assertTrue(empty.reason(), empty.reason().contains("K1"));
         }
     }
 

@@ -1,0 +1,56 @@
+/* kv_tq_rotate.comp - LLM_KvTqRotateQ (GLSL twin of kernels/llm/kv_cache.cl, the semantic reference).
+ * Requires: common/nf_common.glsl, common/hadamard.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_rows, i n_heads, i d, i x_off, i x_row_stride, i out_off, R src, W dst)
+ *
+ * Rotates every query row of a TurboQuant key cache by the normalized Sylvester Hadamard matrix, the query half of
+ * the cache's key encoding: the flash attention then scores the centroid vectors of the stored key codes against
+ * H q. One workgroup per (row, head), the row's d values staged in the workgroup's shared buffer. Dispatch: 1-D,
+ * global = n_rows * n_heads * L, local = L (a power of two); host preconditions: d is a power of two of at most
+ * NF_KV_TQ_MAX_DIM.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/hadamard.glsl"
+
+layout(std430, binding = 0) readonly buffer NfTqSrc { float src[]; };
+layout(std430, binding = 1) writeonly buffer NfTqDst { float dst[]; };
+
+layout(push_constant) uniform NfTqParams {
+    int n_rows;
+    int n_heads;
+    int d;
+    int x_off;
+    int x_row_stride;
+    int out_off;
+} pc;
+
+const uint NF_TQ_MAX_DIM = 256u;
+
+shared float nf_tq_buf[NF_TQ_MAX_DIM];
+NF_FWHT_SHARED_FN(nf_tq_fwht, nf_tq_buf)
+
+void main() {
+    const int g = int(gl_WorkGroupID.x);
+    if (pc.d <= 0 || uint(pc.d) > NF_TQ_MAX_DIM || pc.n_heads <= 0 || g >= pc.n_rows * pc.n_heads) {
+        return;
+    }
+    const uint row = uint(g / pc.n_heads);
+    const uint h = uint(g) - row * uint(pc.n_heads);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint d = uint(pc.d);
+    const uint base = uint(pc.x_off) + row * uint(pc.x_row_stride) + h * d;
+    for (uint i = lid; i < d; i += lsize) {
+        nf_tq_buf[i] = src[base + i];
+    }
+    barrier();
+    nf_tq_fwht(0u, d, d);
+    const uint out_base = uint(pc.out_off) + row * uint(pc.x_row_stride) + h * d;
+    for (uint i = lid; i < d; i += lsize) {
+        dst[out_base + i] = nf_tq_buf[i];
+    }
+}

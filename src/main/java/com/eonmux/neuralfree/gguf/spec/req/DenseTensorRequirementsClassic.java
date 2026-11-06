@@ -6,7 +6,7 @@ import com.eonmux.neuralfree.gguf.arch.TensorRequirement.LayerCondition;
 import java.util.List;
 
 /**
- * Tensor lists of the LayerNorm-era and early RMSNorm decoders: the GPT-2, GPT-NeoX, Falcon, MPT, BLOOM,
+ * Tensor lists of the LayerNorm-era and early RMSNorm decoders: the GPT-2, GPT-J, GPT-NeoX, Falcon, MPT, BLOOM,
  * StarCoder, Phi-2, Cohere, OLMo, JAIS, Nemotron, Chameleon, BitNet, Qwen-1, PLaMo, InternLM2, XVERSE and
  * Baichuan families. Each method cites the llama.cpp {@code load_arch_tensors} it transcribes
  * (src/models/&lt;arch&gt;.cpp).
@@ -16,12 +16,34 @@ public final class DenseTensorRequirementsClassic {
     /** command-r loads per-head Q/K norms only for its 64-layer (35B+) variants (command-r.cpp:28-31). */
     private static final LayerCondition COMMAND_R_QK_NORM = (hp, il) -> il < hp.nLayer() && hp.nLayer() >= 64;
 
+    /** Layers that mix earlier layer inputs (limite.cpp:62): a MUDD tap count and a first tap >= 0. */
+    private static final LayerCondition LIMITE_MUDD =
+            (hp, il) -> hp.muddTapCount() > 0 && hp.muddTapIdx(il, 0) >= 0;
+
     private DenseTensorRequirementsClassic() {
     }
 
-    /** falcon.cpp:13-44; {@code attn_norm_2} exists on the 40B variant only. */
-    public static List<TensorRequirement> falcon() {
+    /**
+     * limite.cpp:30-69. The value embeddings are a model-level table looked up by token id; the attention
+     * output gates, the XSA alpha and the MUDD mixers are optional per layer; the learned residual scales are
+     * required. The output head falls back to the duplicated {@code token_embd.weight} (:36-40).
+     */
+    public static List<TensorRequirement> limite() {
         return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("value_embd.weight")
+                .outputOrTied()
+                .qkv()
+                .layer("attn_output.weight", "attn_resid_scale.weight", "ffn_resid_scale.weight")
+                .layerOptional("attn_gate.weight", "attn_ve_gate.weight", "attn_xsa_alpha.weight")
+                .gatedFfn()
+                .layerWhen(LIMITE_MUDD, "mudd_down.weight", "mudd_up.weight")
+                .layerOptionalWhen(LIMITE_MUDD, "mudd_up.bias")
+                .build();
+    }
+
+    /** falcon.cpp:13-44; {@code attn_norm_2} exists on the 40B variant only. */
+    public static List<TensorRequirement> falcon() {        return DenseTensorRequirements.builder()
                 .tokenEmbd()
                 .model("output_norm.weight", "output_norm.bias")
                 .outputOrTied()
@@ -37,9 +59,45 @@ public final class DenseTensorRequirementsClassic {
                 .tokenEmbd()
                 .model("position_embd.weight", "output_norm.weight", "output_norm.bias")
                 .outputOrTied()
+                .modelOptional("cls.output.weight", "cls.output.bias")
                 .layer("attn_norm.weight", "attn_norm.bias", "attn_qkv.weight", "attn_qkv.bias",
                         "attn_output.weight", "attn_output.bias", "ffn_norm.weight", "ffn_norm.bias",
                         "ffn_down.weight", "ffn_down.bias", "ffn_up.weight", "ffn_up.bias")
+                .build();
+    }
+
+    /** GPT-J uses separate, bias-free attention projections and biased MLP and output heads. */
+    public static List<TensorRequirement> gptj() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("output_norm.weight", "output_norm.bias", "output.weight", "output.bias")
+                .layer("attn_norm.weight", "attn_norm.bias", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                        "attn_output.weight", "ffn_down.weight", "ffn_down.bias", "ffn_up.weight", "ffn_up.bias")
+                .build();
+    }
+
+    /**
+     * OPT (vLLM opt.py, which has no llama.cpp counterpart): learned position rows, separate q/k/v projections and
+     * an ungated MLP, all with optional biases. The pre-LN layers carry {@code attn_norm} and {@code ffn_norm}; the
+     * 350M post-LN variant carries {@code attn_output_norm} and {@code layer_output_norm} instead. The decoder and
+     * output projections exist only when {@code word_embed_proj_dim != hidden_size}; {@code output_norm} is absent
+     * on post-LN files and when the checkpoint removed it, and the LM head may be tied.
+     */
+    public static List<TensorRequirement> opt() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("position_embd.weight")
+                .modelOptional("project_in.weight", "project_out.weight", "output_norm.weight", "output_norm.bias")
+                .outputOrTied()
+                .layerAnyOf(TensorRequirement.TRUNK, new String[] {"attn_norm.weight"},
+                        new String[] {"attn_output_norm.weight"})
+                .layerAnyOf(TensorRequirement.TRUNK, new String[] {"ffn_norm.weight"},
+                        new String[] {"layer_output_norm.weight"})
+                .layerOptional("attn_norm.bias", "attn_output_norm.bias", "ffn_norm.bias", "layer_output_norm.bias")
+                .layer("attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+                        "ffn_up.weight", "ffn_down.weight")
+                .layerOptional("attn_q.bias", "attn_k.bias", "attn_v.bias", "attn_output.bias",
+                        "ffn_up.bias", "ffn_down.bias")
                 .build();
     }
 
@@ -51,6 +109,25 @@ public final class DenseTensorRequirementsClassic {
                 .layer("attn_norm.weight", "attn_norm.bias", "attn_qkv.weight", "attn_qkv.bias",
                         "attn_output.weight", "attn_output.bias", "ffn_norm.weight", "ffn_norm.bias",
                         "ffn_down.weight", "ffn_down.bias", "ffn_up.weight", "ffn_up.bias")
+                .build();
+    }
+
+    /**
+     * vLLM's Step1 decoder: separate q/k/v projections (or a fused one) with optional biases, an optional
+     * attention-output bias, and the biased gated SiLU feed-forward of {@code mlp_bias}.
+     */
+    public static List<TensorRequirement> step1() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("output_norm.weight")
+                .outputOrTied()
+                .layer("attn_norm.weight")
+                .qkv()
+                .layer("attn_output.weight")
+                .layerOptional("attn_output.bias")
+                .layer("ffn_norm.weight")
+                .gatedFfn()
+                .layerOptional("ffn_gate.bias", "ffn_up.bias", "ffn_down.bias")
                 .build();
     }
 
@@ -84,6 +161,7 @@ public final class DenseTensorRequirementsClassic {
                 .tokenEmbd()
                 .model("position_embd.weight", "output_norm.weight", "output_norm.bias")
                 .outputOrTied()
+                .modelOptional("cls.output.weight", "cls.output.bias")
                 .layer("attn_norm.weight", "attn_norm.bias", "attn_qkv.weight", "attn_qkv.bias",
                         "attn_output.weight", "attn_output.bias", "ffn_norm.weight", "ffn_norm.bias",
                         "ffn_down.weight", "ffn_down.bias", "ffn_up.weight", "ffn_up.bias")
@@ -297,6 +375,24 @@ public final class DenseTensorRequirementsClassic {
                 .layer("attn_norm.weight")
                 .qkv()
                 .layer("attn_output.weight")
+                .gatedFfn()
+                .build();
+    }
+
+    /**
+     * InternLM2 (internlm2.cpp:13-35): the plain llama-1 layout with the optional {@code v_head} projection the
+     * reward loader writes as {@code cls.output}, and no required LM head on a classifier checkpoint (vLLM's
+     * {@code InternLM2ForRewardModel} loads no LM head).
+     */
+    public static List<TensorRequirement> internlm2() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("output_norm.weight")
+                .modelWhen(hp -> hp.classifierScope() == null, "output.weight")
+                .modelOptional("cls.output.weight", "cls.output.bias")
+                .layer("attn_norm.weight")
+                .qkv()
+                .layer("attn_output.weight", "ffn_norm.weight")
                 .gatedFfn()
                 .build();
     }

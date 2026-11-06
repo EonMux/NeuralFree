@@ -1,12 +1,16 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtra;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
+import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
+import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels.MixMode;
 import com.eonmux.neuralfree.gguf.spec.EmbeddingSpec;
@@ -35,28 +39,41 @@ import java.util.Objects;
  *   <li>{@value LayerSpec.Extras#LOOP_NORM} (nanbeige): after the slots that end a loop
  *       ({@link LayerSchedule#normAfterSlot(int)}), {@code x = rms(x) * output_norm} with {@code f_norm_rms_eps}
  *       (models/nanbeige.cpp:164-171).</li>
+ *   <li>{@value LayerSpec.Extras#RESID_SCALE} (limite without MUDD): the learned {@code attn_resid_scale} and
+ *       {@code ffn_resid_scale} fold each sub-block's residual, {@code x = x * scale + branch};</li>
+ *   <li>{@value LayerSpec.Extras#MUDD} (limite): the dense cross-layer mix (models/limite.cpp:100-140) whose
+ *       attention input and residual are weighted sums of earlier layers' inputs, plus the FFN residual scale. It
+ *       keeps the per-layer input bank in a shared temporary and mixes with {@value #MUDD_MIX}.</li>
  * </ul>
- * Each runs {@value NormKernels#RESIDUAL_MIX} or {@value NormKernels#ROW_NORM}; per step they allocate nothing and
- * never wait on the host. Not thread-safe.
+ * Each runs {@value NormKernels#RESIDUAL_MIX}, {@value NormKernels#ROW_NORM} or {@value #MUDD_MIX}; per step they
+ * allocate nothing and never wait on the host. Not thread-safe.
  */
 public final class BuiltInGpuExtras {
 
+    /** limite MUDD dense cross-layer mix ({@code kernels/llm/eltwise_ext.cl}). */
+    public static final String MUDD_MIX = "LLM_MuddMix";
+
     /** Kernels the built-in extras launch, for prewarming. */
     public static final List<String> KERNELS = Collections.unmodifiableList(Arrays.asList(
-            NormKernels.RESIDUAL_MIX, NormKernels.ROW_NORM, GpuOps.AXPBY, GpuOps.COPY2D));
+            NormKernels.RESIDUAL_MIX, NormKernels.ROW_NORM, GpuOps.AXPBY, GpuOps.COPY2D,
+            GpuOps.BATCH_BIAS_ADD, ActKernels.UNARY, MUDD_MIX));
 
     /** Shared temporary holding ones (alpha of the embedding skip); every binder writes the same content. */
     static final String TEMP_ONES = "builtin.ones";
     /** Prefix of the per-layer embedding-skip beta temporaries. */
     static final String TEMP_SKIP_BETA = "builtin.embd_skip.beta.";
+    /** Shared bank of the limite trunk layer inputs; slot il holds layer il's input of the current step. */
+    static final String TEMP_BANK = "builtin.limite.bank";
     private static final int ONE_BITS = Float.floatToRawIntBits(1.0f);
 
     private static final List<GpuLayerExtraFactory> FACTORIES = Collections.unmodifiableList(Arrays.asList(
             factory(LayerSpec.Extras.EMBD_SKIP, Kind.EMBEDDING_SKIP),
             factory(LayerSpec.Extras.RESID_ALPHA_BETA, Kind.ALPHA_BETA),
+            factory(LayerSpec.Extras.RESID_SCALE, Kind.RESID_SCALE),
+            factory(LayerSpec.Extras.MUDD, Kind.MUDD),
             factory(LayerSpec.Extras.LOOP_NORM, Kind.LOOP_NORM)));
 
-    private enum Kind { EMBEDDING_SKIP, ALPHA_BETA, LOOP_NORM }
+    private enum Kind { EMBEDDING_SKIP, ALPHA_BETA, LOOP_NORM, RESID_SCALE, MUDD }
 
     private BuiltInGpuExtras() {
     }
@@ -81,6 +98,10 @@ public final class BuiltInGpuExtras {
                         return new EmbeddingSkip();
                     case ALPHA_BETA:
                         return new AlphaBetaResidual();
+                    case RESID_SCALE:
+                        return new ResidScale();
+                    case MUDD:
+                        return new Mudd();
                     default:
                         return new LoopNorm();
                 }
@@ -270,6 +291,277 @@ public final class BuiltInGpuExtras {
         @Override
         public String toString() {
             return "AlphaBetaResidual{attn=" + (attnAlpha != null) + ", ffn=" + (ffnAlpha != null) + '}';
+        }
+    }
+
+    // ================================================================== limite
+
+    /**
+     * Common state of the limite extras: the learned residual scales, the shared bank of every trunk layer's input
+     * and the ones factor of the alpha/beta mix. Every hook folds one step row at a time over the bank, so a paged or
+     * multi-segment step is exact.
+     */
+    abstract static class LimiteResid implements GpuLayerExtra {
+        static final String TEMP_CUR = "builtin.limite.cur.";
+        static final String TEMP_RESID = "builtin.limite.resid.";
+        static final String TEMP_W = "builtin.limite.w.";
+        static final String TEMP_NORMED = "builtin.limite.normed.";
+        static final String TEMP_DOWN = "builtin.limite.down.";
+        static final String TEMP_TAPS = "builtin.limite.taps.";
+
+        GpuOps ops;
+        GpuBuffer placeholder;
+        ScratchSlot ones;
+        GpuWeight attnScale;
+        GpuWeight ffnScale;
+        GpuScratch scratch;
+        ScratchSlot bank;
+        int nEmbd;
+        int il;
+        int ubatch;
+        boolean bound;
+
+        @Override
+        public String batchRefusal() {
+            return null;
+        }
+
+        @Override
+        public void bind(GpuForwardContext ctx, LayerSpec layer) {
+            requireUnbound(bound ? this : null, layer, featureId());
+            String arch = ctx.spec().arch().ggufName();
+            GpuWeights weights = ctx.weightSource().weightsFor(layer.weightLayer());
+            this.nEmbd = ctx.spec().hparams().nEmbd();
+            if (layer.residual().streamWidth() != nEmbd) {
+                throw new IllegalStateException(arch + " layer " + layer.il() + ": the '" + featureId()
+                        + "' extra needs an " + nEmbd + "-wide stream, got " + layer.residual().streamWidth());
+            }
+            this.il = layer.il();
+            this.scratch = ctx.scratch();
+            this.ubatch = scratch.ubatch();
+            this.attnScale = scalar(weights, arch, layer, TensorNames.weight(TensorNames.ATTN_RESID_SCALE));
+            this.ffnScale = scalar(weights, arch, layer, TensorNames.weight(TensorNames.FFN_RESID_SCALE));
+            ScratchSlot a = scratch.temp(TEMP_ONES, 1);
+            if (a.offset() != 0) {
+                throw new IllegalStateException("a limite temporary must start at element 0");
+            }
+            ops = ctx.ops();
+            ops.fill(a.buffer(), 0, Float.BYTES, ONE_BITS);
+            this.ones = a;
+            this.placeholder = ctx.placeholders().readOnlyFloats();
+            long bankFloats = (long) ctx.spec().nLayer() * ubatch * nEmbd;
+            if (bankFloats > Integer.MAX_VALUE - 8) {
+                throw new IllegalArgumentException(arch + " layer " + layer.il() + ": the layer bank of " + bankFloats
+                        + " floats exceeds the kernels' int addressing; lower neuralfree.ubatch");
+            }
+            this.bank = scratch.temp(TEMP_BANK, bankFloats);
+            this.bound = true;
+            ops.prewarm(NormKernels.RESIDUAL_MIX, new long[]{ops.local()});
+        }
+
+        /** Feature id of the concrete extra, for the double-bind check. */
+        abstract String featureId();
+
+        /** An F32 single-buffer scalar of the layer. */
+        private static GpuWeight scalar(GpuWeights weights, String arch, LayerSpec layer, String name) {
+            GpuWeight w = weights.layerOrNull(layer, name);
+            if (w == null) {
+                throw new MissingTensorException(arch, layer.il(), name);
+            }
+            if (w.type() != GGMLType.F32 || !w.isSingleShard() || w.rows() * w.cols() != 1L) {
+                throw new IllegalArgumentException(arch + " layer " + layer.il() + ": " + name
+                        + " must be a single-buffer F32 scalar, got " + w);
+            }
+            return w;
+        }
+
+        /** An F32 single-buffer vector of the layer holding exactly {@code n} values. */
+        static GpuWeight vector(GpuWeights weights, String arch, LayerSpec layer, String name, long n) {
+            GpuWeight w = weights.layerOrNull(layer, name);
+            if (w == null) {
+                throw new MissingTensorException(arch, layer.il(), name);
+            }
+            if (w.type() != GGMLType.F32 || !w.isSingleShard() || w.rows() * w.cols() != n) {
+                throw new IllegalArgumentException(arch + " layer " + layer.il() + ": " + name + " must be a"
+                        + " single-buffer F32 tensor of " + n + " values, got " + w);
+            }
+            return w;
+        }
+
+        /** Copies {@code n} rows of the residual stream into this layer's bank slot. */
+        void bankRows(int n, ScratchSlot x) {
+            checkStep(n);
+            ops.copy(x.buffer(), x.offset(), bank.buffer(), il * ubatch * nEmbd, n * nEmbd);
+        }
+
+        /** {@code x = x * scale + branch} over the step rows. */
+        boolean fold(GpuWeight scale, int n, ScratchSlot x, ScratchSlot branch) {
+            checkStep(n);
+            alphaBeta(ops, placeholder, n * nEmbd, x, branch, scale.shard(0), ones.buffer(), 1, x);
+            return true;
+        }
+
+        void checkStep(int n) {
+            if (!bound) {
+                throw new IllegalStateException(featureId() + " extra used before bind()");
+            }
+            if (n < 1 || n > ubatch) {
+                throw new IllegalArgumentException("layer " + il + ": step of " + n + " tokens outside [1, " + ubatch
+                        + "]");
+            }
+        }
+
+        long roundUp(long items) {
+            int local = ops.local();
+            return Math.max(1, (items + local - 1) / local) * local;
+        }
+    }
+
+    /** limite without MUDD: the learned scales fold the plain residual and the FFN input. */
+    static final class ResidScale extends LimiteResid {
+        @Override
+        String featureId() {
+            return LayerSpec.Extras.RESID_SCALE;
+        }
+
+        @Override
+        public boolean afterMixer(int pos0, int nTokens, ScratchSlot x, ScratchSlot branch) {
+            return fold(attnScale, nTokens, x, branch);
+        }
+
+        @Override
+        public boolean afterFfn(int pos0, int nTokens, ScratchSlot x, ScratchSlot branch) {
+            return fold(ffnScale, nTokens, x, branch);
+        }
+
+        @Override
+        public void close() {
+            ops = null;
+        }
+    }
+
+    /**
+     * limite MUDD (models/limite.cpp:100-140): the attention input and the residual of the layer become weighted
+     * sums of the banked inputs of its taps, {@code w = mudd_up @ gelu_erf(mudd_down @ rms(x)) + mudd_up_b} holding
+     * one weight per tap for each mix. {@link #beforeBlock} banks the input, rewrites the stream with the attention
+     * mix (which the mixer reads) and keeps the residual mix for {@link #afterMixer}.
+     */
+    static final class Mudd extends LimiteResid {
+        private GpuWeight down;
+        private GpuWeight up;
+        private GpuWeight upBias;
+        private ScratchSlot cur;
+        private ScratchSlot resid;
+        private ScratchSlot w;
+        private ScratchSlot normed;
+        private ScratchSlot downOut;
+        private GpuBuffer taps;
+        private int nTaps;
+        private int nFf;
+        private float eps;
+
+        @Override
+        String featureId() {
+            return LayerSpec.Extras.MUDD;
+        }
+
+        @Override
+        public void bind(GpuForwardContext ctx, LayerSpec layer) {
+            super.bind(ctx, layer);
+            String arch = ctx.spec().arch().ggufName();
+            GpuWeights weights = ctx.weightSource().weightsFor(layer.weightLayer());
+            ModelHparams hp = ctx.spec().hparams();
+            this.nTaps = hp.muddTapCount();
+            if (nTaps <= 0) {
+                throw new IllegalStateException("limite layer " + il + " lists '" + LayerSpec.Extras.MUDD
+                        + "' but the file sets no mudd.tap_count");
+            }
+            int[] tapIdx = new int[nTaps];
+            for (int j = 0; j < nTaps; j++) {
+                tapIdx[j] = hp.muddTapIdx(il, j);
+                if (tapIdx[j] < 0 || tapIdx[j] > il) {
+                    throw new IllegalStateException("limite layer " + il + ": every MUDD tap of a mixing layer must be"
+                            + " in [0, " + il + "], got " + Arrays.toString(tapIdx) + " (limite.cpp:120)");
+                }
+            }
+            this.down = weights.layerOrNull(layer, TensorNames.weight(TensorNames.MUDD_DOWN));
+            this.up = weights.layerOrNull(layer, TensorNames.weight(TensorNames.MUDD_UP));
+            if (down == null || up == null) {
+                throw new MissingTensorException(arch, il, down == null ? TensorNames.weight(TensorNames.MUDD_DOWN)
+                        : TensorNames.weight(TensorNames.MUDD_UP));
+            }
+            this.nFf = (int) down.rows();
+            if (down.cols() != nEmbd || up.rows() != 2L * nTaps || up.cols() != nFf) {
+                throw new IllegalArgumentException("limite layer " + il + ": mudd_down must be [" + nEmbd + ", " + nFf
+                        + "] and mudd_up [" + (2 * nTaps) + ", " + nFf + "], got [" + down.cols() + ", " + down.rows()
+                        + "] and [" + up.cols() + ", " + up.rows() + "]");
+            }
+            this.upBias = vector(weights, arch, layer, TensorNames.bias(TensorNames.MUDD_UP), 2L * nTaps);
+            this.eps = hp.normRmsEps();
+            this.cur = scratch.temp(TEMP_CUR + il, (long) ubatch * nEmbd);
+            this.resid = scratch.temp(TEMP_RESID + il, (long) ubatch * nEmbd);
+            this.w = scratch.temp(TEMP_W + il, (long) ubatch * 2 * nTaps);
+            this.normed = scratch.temp(TEMP_NORMED + il, (long) ubatch * nEmbd);
+            this.downOut = scratch.temp(TEMP_DOWN + il, (long) ubatch * nFf);
+            this.taps = writeTaps(ctx, scratch.temp(TEMP_TAPS + il, nTaps).buffer(), tapIdx);
+            ops.prewarm(ActKernels.UNARY, new long[]{ops.local()});
+            ops.prewarm(MUDD_MIX, new long[]{ops.local()});
+        }
+
+        /** Uploads the layer's tap indices as one int buffer for {@value #MUDD_MIX}. */
+        private static GpuBuffer writeTaps(GpuForwardContext ctx, GpuBuffer dst, int[] tapIdx) {
+            byte[] bytes = new byte[tapIdx.length * Integer.BYTES];
+            for (int j = 0; j < tapIdx.length; j++) {
+                int v = tapIdx[j];
+                int b = j * Integer.BYTES;
+                bytes[b] = (byte) v;
+                bytes[b + 1] = (byte) (v >>> 8);
+                bytes[b + 2] = (byte) (v >>> 16);
+                bytes[b + 3] = (byte) (v >>> 24);
+            }
+            GpuEvent e = ctx.queue().enqueueWriteBuffer(dst, 0L, bytes.length, bytes);
+            if (e != null) {
+                e.close();
+            }
+            return dst;
+        }
+
+        @Override
+        public void beforeBlock(int pos0, int nTokens, ScratchSlot x) {
+            checkStep(nTokens);
+            bankRows(nTokens, x);
+            ops.norm(NormKind.RMS, null, null, eps, x.buffer(), x.offset(), normed.buffer(), normed.offset(),
+                    nTokens, nEmbd);
+            ops.matmul(down, normed.buffer(), normed.offset(), downOut.buffer(), downOut.offset(), nTokens);
+            int downLen = nTokens * nFf;
+            ops.unary(ActOp.GELU_ERF, null, downOut.buffer(), downOut.offset(), downOut.buffer(), downOut.offset(),
+                    downLen);
+            ops.matmul(up, downOut.buffer(), downOut.offset(), w.buffer(), w.offset(), nTokens);
+            int width = 2 * nTaps;
+            ops.enqueue(GpuOps.BATCH_BIAS_ADD, new long[]{roundUp(width)}, new long[]{ops.local()}, width, nTokens,
+                    upBias.shard(0), w.buffer());
+            int bankStride = ubatch * nEmbd;
+            ops.enqueue(MUDD_MIX, new long[]{roundUp((long) nTokens * nEmbd)}, new long[]{ops.local()}, nTokens,
+                    nEmbd, nTaps, il * bankStride, bankStride, bank.buffer(), w.buffer(), taps, cur.buffer(),
+                    resid.buffer());
+            ops.copy(cur.buffer(), cur.offset(), x.buffer(), x.offset(), nTokens * nEmbd);
+        }
+
+        @Override
+        public boolean afterMixer(int pos0, int nTokens, ScratchSlot x, ScratchSlot branch) {
+            checkStep(nTokens);
+            alphaBeta(ops, placeholder, nTokens * nEmbd, resid, branch, attnScale.shard(0), ones.buffer(), 1, x);
+            return true;
+        }
+
+        @Override
+        public boolean afterFfn(int pos0, int nTokens, ScratchSlot x, ScratchSlot branch) {
+            return fold(ffnScale, nTokens, x, branch);
+        }
+
+        @Override
+        public void close() {
+            ops = null;
         }
     }
 

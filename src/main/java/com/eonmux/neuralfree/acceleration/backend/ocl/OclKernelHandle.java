@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.acceleration.backend.ocl;
 
 import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
+import com.eonmux.neuralfree.acceleration.backend.StickyArgs;
 import org.jocl.cl_kernel;
 import org.jocl.cl_program;
 
@@ -27,6 +28,7 @@ public final class OclKernelHandle implements KernelHandle {
     private final long maxWorkGroupSize;
     private final long localMemBytes;
     private final String deviceName;
+    private final StickyArgs args;
     private boolean closed = false;
 
     /** A handle that owns its program and carries no driver-reported limits. */
@@ -59,6 +61,15 @@ public final class OclKernelHandle implements KernelHandle {
         this.maxWorkGroupSize = maxWorkGroupSize <= 0 ? UNKNOWN : maxWorkGroupSize;
         this.localMemBytes = localMemBytes < 0 ? UNKNOWN : localMemBytes;
         this.deviceName = deviceName == null ? "" : deviceName;
+        this.args = new StickyArgs(kernelName);
+    }
+
+    /**
+     * The argument values last set on this handle, with {@code clSetKernelArg} snapshot semantics. A
+     * capture and its replay read them to compare the step's arguments with the recorded ones.
+     */
+    StickyArgs args() {
+        return args;
     }
 
     @Override

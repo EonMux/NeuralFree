@@ -1,12 +1,25 @@
-/* flash_combine.comp - LLM_FlashAttn_Combine split-K merge (GLSL twin of kernels/llm/flash_combine.cl; merge
- * formula, layout and sink handling are documented there). Requires: common/nf_common.glsl,
- * common/act.glsl, common/attn_common.glsl.
+/* flash_combine.comp - LLM_FlashAttn_Combine split-K merge, LLM_FlashAttn_Lse merged log-sum-exp and
+ * LLM_AttnStaticSinkPartial (GLSL twins of kernels/llm/flash_combine.cl and kernels/llm/cp_merge.cl; merge
+ * formula, layouts and sink handling are documented there). Requires: common/nf_common.glsl, common/act.glsl,
+ * common/attn_common.glsl.
  *
- * Variants row: LLM_FlashAttn_Combine	flash_combine.comp	(no defines, no subgroups)
+ * Variants rows:
+ *   LLM_FlashAttn_Combine	flash_combine.comp	(no defines, no subgroups)
+ *   LLM_FlashAttn_Lse	flash_combine.comp	NF_FC_LSE=1
+ *   LLM_AttnStaticSinkPartial	flash_combine.comp	NF_STATIC_SINK_PARTIAL=1
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
- *   (i n_rows, i d_v, i n_split, i n_head, i has_sinks, i out_off, R partial, R sinks, W out)
- * Dispatch: 1-D, global {n_rows * 128}, local {128, 1, 1}; one workgroup per row, folded group counts
- * are recovered by nf_wg_id(). No barriers, so any local size is valid.
+ *   LLM_FlashAttn_Combine
+ *     (i n_rows, i d_v, i n_split, i n_head, i has_sinks, i out_off, R partial, R sinks, W out)
+ *     Dispatch: 1-D, global {n_rows * 128}, local {128, 1, 1}; one workgroup per row, folded group counts
+ *     are recovered by nf_wg_id(). No barriers, so any local size is valid.
+ *   LLM_FlashAttn_Lse
+ *     (i n_rows, i d_v, i n_split, i n_head, i has_sinks, i out_off, R partial, R sinks, W lse)
+ *     Dispatch as LLM_FlashAttn_Combine; only local id 0 writes the row's value.
+ *   LLM_AttnStaticSinkPartial
+ *     (i n_rows, i n_head, i n_head_kv, i d_k, i d_v, i n_sink, i q_off, i q_row_stride, i pos_off,
+ *      i pos_stride, i fixed_pos, i n_split, i split_index, f scale, f softcap, i causal, i swa_type,
+ *      i n_swa, R q, R<int> q_pos, R sink_k, R sink_v, W partial)
+ *     Dispatch: 1-D, global {roundUp(n_rows, WG)}, local {WG}; one work item per (token, head) row, no barriers.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -15,6 +28,110 @@
 #include "common/act.glsl"
 #include "common/attn_common.glsl"
 
+#if defined(NF_STATIC_SINK_PARTIAL)
+layout(std430, binding = 0) readonly buffer NfSsQ { float q[]; };
+layout(std430, binding = 1) readonly buffer NfSsQPos { int q_pos[]; };
+layout(std430, binding = 2) readonly buffer NfSsK { float sink_k[]; };
+layout(std430, binding = 3) readonly buffer NfSsV { float sink_v[]; };
+layout(std430, binding = 4) writeonly buffer NfSsPartial { float partial[]; };
+
+layout(push_constant) uniform NfSsParams {
+    int n_rows; int n_head; int n_head_kv; int d_k; int d_v; int n_sink;
+    int q_off; int q_row_stride; int pos_off; int pos_stride; int fixed_pos;
+    int n_split; int split_index;
+    float scale; float softcap;
+    int causal; int swa_type; int n_swa;
+} pc;
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x
+        + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x);
+    if (row >= uint(pc.n_rows) || pc.n_head <= 0 || pc.n_head_kv <= 0 || pc.n_head % pc.n_head_kv != 0
+        || pc.d_k <= 0 || pc.d_v <= 0 || pc.n_sink <= 0 || pc.n_split <= 0) {
+        return;
+    }
+    const uint t = row / uint(pc.n_head);
+    const uint h = row - t * uint(pc.n_head);
+    const uint kvh = h / (uint(pc.n_head) / uint(pc.n_head_kv));
+    const int p_q = pc.pos_stride == 0 ? pc.fixed_pos : q_pos[pc.pos_off + int(t) * pc.pos_stride];
+    const int p_k = p_q + pc.n_sink;
+    const uint k_step = uint(pc.n_head_kv) * uint(pc.d_k);
+    const uint v_step = uint(pc.n_head_kv) * uint(pc.d_v);
+    const uint qr = uint(pc.q_off) + t * uint(pc.q_row_stride) + h * uint(pc.d_k);
+
+    float m = -NF_INF;
+    for (int r = 0; r < pc.n_sink; r++) {
+        if (pc.causal == 0 || nf_attn_visible(p_k, r, 1, pc.swa_type, pc.n_swa) != 0) {
+            const uint kr = uint(r) * k_step + kvh * uint(pc.d_k);
+            float dot = 0.0;
+            for (int d = 0; d < pc.d_k; d++) {
+                dot += q[qr + uint(d)] * sink_k[kr + uint(d)];
+            }
+            m = max(m, nf_attn_score(dot, pc.scale, pc.softcap));
+        }
+    }
+
+    const uint pr = (row * uint(pc.n_split) + uint(pc.split_index)) * (uint(pc.d_v) + 2u);
+    for (int d = 0; d < pc.d_v; d++) {
+        partial[pr + uint(d)] = 0.0;
+    }
+    float l = 0.0;
+    if (m != -NF_INF) {
+        for (int r = 0; r < pc.n_sink; r++) {
+            if (pc.causal != 0 && nf_attn_visible(p_k, r, 1, pc.swa_type, pc.n_swa) == 0) {
+                continue;
+            }
+            const uint kr = uint(r) * k_step + kvh * uint(pc.d_k);
+            float dot = 0.0;
+            for (int d = 0; d < pc.d_k; d++) {
+                dot += q[qr + uint(d)] * sink_k[kr + uint(d)];
+            }
+            const float p = nf_attn_rescale(nf_attn_score(dot, pc.scale, pc.softcap), m);
+            l += p;
+            const uint vr = uint(r) * v_step + kvh * uint(pc.d_v);
+            for (int d = 0; d < pc.d_v; d++) {
+                partial[pr + uint(d)] += p * sink_v[vr + uint(d)];
+            }
+        }
+    }
+    partial[pr + uint(pc.d_v)] = m;
+    partial[pr + uint(pc.d_v) + 1u] = l;
+}
+#elif defined(NF_FC_LSE)
+layout(std430, binding = 0) readonly buffer NfFcLsePartial { float partial[]; };
+layout(std430, binding = 1) readonly buffer NfFcLseSinks { float sinks[]; };
+layout(std430, binding = 2) writeonly buffer NfFcLseOut { float lse[]; };
+
+layout(push_constant) uniform NfFcLseParams {
+    int n_rows; int d_v; int n_split; int n_head; int has_sinks; int out_off;
+} pc;
+
+void main() {
+    const uint row = nf_wg_id();
+    if (row >= uint(pc.n_rows) || gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    const uint d_v = uint(pc.d_v);
+    const uint stride = d_v + 2u;
+    const uint n_split = uint(pc.n_split);
+    const uint pr = row * n_split * stride;
+    const float sink = pc.has_sinks != 0 ? sinks[row % uint(pc.n_head)] : -NF_INF;
+    float m = sink;
+    for (uint s = 0u; s < n_split; s++) {
+        m = max(m, partial[pr + s * stride + d_v]);
+    }
+    if (m == -NF_INF) {
+        lse[uint(pc.out_off) + row] = -NF_INF;
+        return;
+    }
+    float l = nf_attn_rescale(sink, m);
+    for (uint s = 0u; s < n_split; s++) {
+        const uint ps = pr + s * stride;
+        l += partial[ps + d_v + 1u] * nf_attn_rescale(partial[ps + d_v], m);
+    }
+    lse[uint(pc.out_off) + row] = l > 0.0 ? m + log(l) : -NF_INF;
+}
+#else
 layout(std430, binding = 0) readonly buffer NfFcPartial { float partial[]; };
 layout(std430, binding = 1) readonly buffer NfFcSinks { float sinks[]; };
 layout(std430, binding = 2) writeonly buffer NfFcOut { float dst[]; };
@@ -60,3 +177,4 @@ void main() {
         dst[ob + d] = l > 0.0 ? o / l : 0.0;
     }
 }
+#endif

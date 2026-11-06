@@ -13,7 +13,7 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 
 /**
- * {@link OnlineQuantizers} (QZ-1): the legacy block types quantize rows exactly as {@link KvBlockCodec} stores the
+ * {@link OnlineQuantizers}: the legacy block types quantize rows exactly as {@link KvBlockCodec} stores the
  * blocks, a registered extension replaces the default it is keyed to and is used until restored, and NONE carries no
  * quantizer.
  */
@@ -90,9 +90,33 @@ public class OnlineQuantizersTest {
     }
 
     @Test
+    public void everyVllmMethodHasExactlyOneQuantizerOfItsTargetType() {
+        assertSame(GGMLType.F8_E4M3_B128, OnlineQuantizers.get(OnlineQuant.FP8_PER_CHANNEL).type());
+        assertSame(GGMLType.I8_B128, OnlineQuantizers.get(OnlineQuant.INT8_PER_CHANNEL_WEIGHT_ONLY).type());
+        assertSame(GGMLType.I8_B128, OnlineQuantizers.get(OnlineQuant.EXPERTS_INT8).type());
+        assertSame(GGMLType.MXFP8, OnlineQuantizers.get(OnlineQuant.MXFP8).type());
+        assertSame(GGMLType.MXFP4, OnlineQuantizers.get(OnlineQuant.MXFP4).type());
+        assertSame(GGMLType.F8_E4M3_B128, OnlineQuantizers.scanning(OnlineQuant.FP8_PER_TENSOR).type());
+        assertSame(GGMLType.F8_E4M3_B128, OnlineQuantizers.scanning(OnlineQuant.FP8_PER_BLOCK).type());
+        assertSame(GGMLType.NVFP4, OnlineQuantizers.scanning(OnlineQuant.NVFP4_PER_TOKEN).type());
+        for (OnlineQuant q : OnlineQuant.values()) {
+            boolean row = OnlineQuantizers.get(q) != null;
+            boolean scan = OnlineQuantizers.scanning(q) != null;
+            if (q == OnlineQuant.NONE || q == OnlineQuant.ONLINE) {
+                assertEquals(q.name() + " carries no quantizer", false, row || scan);
+            } else {
+                assertEquals(q.name() + " has exactly one quantizer", true, row ^ scan);
+            }
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> OnlineQuantizers.register(OnlineQuant.FP8_PER_TENSOR, FAKE));
+    }
+
+    @Test
     public void noneCarriesNoQuantizerAndTheRegistryRefusesNullFakes() {
         assertNull(OnlineQuantizers.get(OnlineQuant.NONE));
         assertThrows(IllegalArgumentException.class, () -> OnlineQuantizers.register(OnlineQuant.NONE, FAKE));
+        assertThrows(IllegalArgumentException.class, () -> OnlineQuantizers.register(OnlineQuant.ONLINE, FAKE));
         assertThrows(NullPointerException.class, () -> OnlineQuantizers.register(OnlineQuant.Q4_0, null));
         assertThrows(NullPointerException.class, () -> OnlineQuantizers.get(null));
         assertSame(FAKE.type(), GGMLType.F32);

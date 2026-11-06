@@ -57,8 +57,18 @@ public final class JinjaRuntime {
     public static final class Scope {
         private final Scope parent;
         private final Map<String, Object> vars = new HashMap<>();
+        /** The render's usage statistics, shared by the whole chain; null when not collected. */
+        final JinjaUsage usage;
 
-        Scope(Scope parent) { this.parent = parent; }
+        Scope(Scope parent) {
+            this.parent = parent;
+            this.usage = parent == null ? null : parent.usage;
+        }
+
+        private Scope(JinjaUsage usage) {
+            this.parent = null;
+            this.usage = usage;
+        }
 
         /** Variable value, then global function, otherwise Undefined. */
         Object resolve(String name) {
@@ -74,15 +84,22 @@ public final class JinjaRuntime {
 
     private JinjaRuntime() {}
 
-    static String render(List<Node> body, Map<String, ?> context) {
-        Scope root = new Scope(null);
+    /**
+     * Renders {@code body} with the converted {@code context}; with a non-null {@code usage} the render
+     * records into it which context values it used ({@link JinjaUsage}).
+     */
+    static String render(List<Node> body, Map<String, ?> context, JinjaUsage usage) {
+        Scope root = new Scope(usage);
         if (context != null) {
             for (Map.Entry<String, ?> e : context.entrySet()) {
+                Object converted;
                 try {
-                    root.set(e.getKey(), JinjaValue.fromJava(e.getValue()));
+                    converted = JinjaValue.fromJava(e.getValue());
                 } catch (IllegalArgumentException ex) {
                     throw new TemplateException(-1, "context variable '" + e.getKey() + "': " + ex.getMessage(), ex);
                 }
+                root.set(e.getKey(), converted);
+                if (usage != null) usage.bind(e.getKey(), converted);
             }
         }
         StringBuilder out = new StringBuilder(1024);
@@ -118,6 +135,7 @@ public final class JinjaRuntime {
      */
     static void execFor(JinjaAst.For f, Scope scope, StringBuilder out) {
         Object iterable = f.iterable.eval(scope);
+        if (scope.usage != null) scope.usage.iterate(iterable);
         boolean dictPairs = JinjaValue.isDict(iterable) && f.target.isTuple() && f.target.elements.size() == 2;
         List<Object> items = dictPairs ? JinjaValue.items((Map<?, ?>) iterable) : JinjaValue.iterate(iterable);
         if (f.filter != null) {

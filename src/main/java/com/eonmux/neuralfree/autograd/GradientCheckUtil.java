@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.autograd;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.nn.Module;
 import com.eonmux.neuralfree.nn.Parameter;
+import com.eonmux.neuralfree.tensor.DType;
 import com.eonmux.neuralfree.tensor.Shape;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorOps;
@@ -11,17 +12,28 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.function.IntFunction;
 import java.util.function.Supplier;
 
 /**
  * Compares the gradients autograd computes with central finite differences: for the inputs of a function
  * ({@link #gradCheck}), for its second-order gradients ({@link #gradGradCheck}) and for the parameters of modules
- * ({@link #gradCheckParameters}).
+ * ({@link #gradCheckParameters}), with float32 finite differences or, for the inputs and the parameters, a float64
+ * reference ({@link #gradCheckFloat64}, {@link #gradCheckParametersFloat64}).
  *
  * <p>The scalar checked is the float sum of the output (or loss) elements. The analytical gradient of every input
  * comes from one backward pass of {@code TensorOps.sum(output)} over fresh leaf copies of the inputs; the numerical
  * gradient of element {@code j} is {@code (f(x + eps e_j) - f(x - eps e_j)) / (2 eps)}, evaluated without recording.
  * The values are read back to the host for the comparison (the pass/fail decision).</p>
+ *
+ * <p><b>Float64 reference.</b> {@link #gradCheckFloat64} and {@link #gradCheckParametersFloat64} keep the
+ * analytical side (the FLOAT32 backward pass on the backend under test) and take the numerical side from a FLOAT64
+ * evaluation of the same function: the step is added and the loss summed in {@code double}, and the forward ops run
+ * on the host in double precision ({@link TensorOps}). A float32 finite difference resolves a loss change only to
+ * the float spacing of the loss, divided by {@code 2 epsilon}; that noise exceeds the tolerance for deep networks
+ * (many training-mode batch norms over few values), which is why PyTorch's {@code gradcheck} asks for double
+ * inputs. Unlike {@code gradcheck}, which differentiates the double function, these checks test the FLOAT32
+ * gradient every backend computes against the double-precision reference.</p>
  *
  * <p><b>Tensor lifetime.</b> The inputs stay the caller's and are not modified. Every copy, output and gradient the
  * check creates is closed before it returns. Only the nodes the check recorded are released or discarded, so the
@@ -34,6 +46,8 @@ public final class GradientCheckUtil {
     private static final float DEFAULT_TOLERANCE = 1e-2f;
     /** Seed of the fixed weights of {@link #gradGradCheck}; input {@code i} draws from {@code WEIGHT_SEED + i}. */
     private static final long WEIGHT_SEED = 0x6E6667726164L;
+    /** The smallest distance of a standard check's inputs from a kink of the checked function. */
+    private static final float KINK_CLEARANCE = 5e-2f;
 
     private GradientCheckUtil() {
     }
@@ -97,17 +111,69 @@ public final class GradientCheckUtil {
         ComputeBackend backend = requireInputs(fn, inputs);
         List<float[]> values = hostValues(inputs);
         List<Shape> shapes = shapes(inputs);
+        return compareInputs(analyticalGradients(fn, backend, values, shapes), tolerance,
+            i -> numericalGradient(fn, backend, values, shapes, i, epsilon));
+    }
 
-        float[][] analytical = analyticalGradients(fn, backend, values, shapes);
+    /**
+     * {@link #gradCheckFloat64(TensorFunction, TensorFunction, List, double, float)} with {@code fn} as its own
+     * reference: for a function of its arguments alone, built from ops with a FLOAT64 path ({@link TensorOps}).
+     */
+    public static GradientCheckResult gradCheckFloat64(TensorFunction fn, List<Tensor> inputs, double epsilon,
+                                                       float tolerance) {
+        return gradCheckFloat64(fn, fn, inputs, epsilon, tolerance);
+    }
+
+    /**
+     * Checks {@code fn}'s gradients at the FLOAT32 {@code inputs} against a double-precision reference (see the class
+     * javadoc). The analytical gradient is {@code fn}'s backward pass, as in
+     * {@link #gradCheck(TensorFunction, List, float, float)}. The numerical gradient of element {@code j} is
+     * {@code (S(x + epsilon e_j) - S(x - epsilon e_j)) / (2 epsilon)}, where {@code S} is the double sum of the
+     * elements of {@code reference} applied, under {@link ComputationGraph#noGrad()}, to FLOAT64 copies of the inputs
+     * on their backend. {@code reference} must compute the same function as {@code fn} in FLOAT64 and return a new
+     * FLOAT64 tensor (or one of its arguments): where {@code fn} reads a module or constant tensors, {@code reference}
+     * reads FLOAT64 copies of them, for example a module of the same architecture converted with
+     * {@code Module.to(DType.FLOAT64)} that loaded {@code fn}'s module's state. Elements fail as in {@link #gradCheck}.
+     *
+     * @throws IllegalArgumentException when {@code fn} or {@code reference} is null, {@code inputs} is null or empty,
+     *                                  holds a tensor that is not FLOAT32, or lives on different backends, or when
+     *                                  {@code epsilon} is not positive and finite or {@code tolerance} is negative
+     *                                  or NaN
+     * @throws IllegalStateException    when {@code reference} returns null or a tensor that is not FLOAT64
+     */
+    public static GradientCheckResult gradCheckFloat64(TensorFunction fn, TensorFunction reference,
+                                                       List<Tensor> inputs, double epsilon, float tolerance) {
+        ComputeBackend backend = requireInputs(fn, inputs);
+        if (reference == null) {
+            throw new IllegalArgumentException("Reference function cannot be null");
+        }
+        for (int i = 0; i < inputs.size(); i++) {
+            if (inputs.get(i).dtype() != DType.FLOAT32) {
+                throw new IllegalArgumentException("Input " + i + " has dtype " + inputs.get(i).dtype()
+                    + "; the analytical side of a float64 check runs on FLOAT32 inputs");
+            }
+        }
+        requireStep(epsilon, tolerance);
+        List<float[]> values = hostValues(inputs);
+        List<Shape> shapes = shapes(inputs);
+        return compareInputs(analyticalGradients(fn, backend, values, shapes), tolerance,
+            i -> Float64Reference.inputGradient(reference, backend, values, shapes, i, epsilon));
+    }
+
+    /**
+     * The comparison of {@code analytical} (null when the function returned null) with the numerical gradient of
+     * every input.
+     */
+    private static GradientCheckResult compareInputs(float[][] analytical, float tolerance,
+                                                     IntFunction<float[]> numericalGradient) {
         if (analytical == null) {
             return new GradientCheckResult(false, Float.NaN, Float.NaN, "Function returned null");
         }
-
         float maxDiff = 0.0f;
         float maxRelError = 0.0f;
         int failingIndex = -1;
-        for (int i = 0; i < inputs.size(); i++) {
-            float[] numerical = numericalGradient(fn, backend, values, shapes, i, epsilon);
+        for (int i = 0; i < analytical.length; i++) {
+            float[] numerical = numericalGradient.apply(i);
             for (int j = 0; j < numerical.length; j++) {
                 float diff = Math.abs(analytical[i][j] - numerical[j]);
                 float denom = Math.max(Math.abs(analytical[i][j]), Math.abs(numerical[j]));
@@ -126,6 +192,16 @@ public final class GradientCheckUtil {
                 : String.format("Gradient mismatch at input %d (diff=%.6e, rel=%.6e)", failingIndex, maxDiff,
                         maxRelError);
         return new GradientCheckResult(passed, maxDiff, maxRelError, message);
+    }
+
+    /** Checks a finite-difference step and a tolerance as the float64 checks document. */
+    private static void requireStep(double epsilon, float tolerance) {
+        if (!(epsilon > 0.0) || Double.isInfinite(epsilon)) {
+            throw new IllegalArgumentException("Epsilon must be positive and finite, got " + epsilon);
+        }
+        if (!(tolerance >= 0.0f)) {
+            throw new IllegalArgumentException("Tolerance must be non-negative, got " + tolerance);
+        }
     }
 
     /** The common backend of {@code inputs}, after checking {@code fn} and {@code inputs} as the checks document. */
@@ -583,6 +659,71 @@ public final class GradientCheckUtil {
         return ParameterGradientCheck.run(loss, module, params, epsilon, tolerance, maxElementsPerParameter);
     }
 
+    /**
+     * Checks the gradients a backward pass gives {@code params} against a double-precision reference (see the class
+     * javadoc): {@link #gradCheckParameters} with its numerical side taken from {@code reference}, a module of the
+     * same architecture as {@code module} holding its state in FLOAT64.
+     *
+     * <p><b>Analytical side.</b> As in {@link #gradCheckParameters}: one backward pass of {@code loss} on the
+     * backend under test, with {@code module}'s buffers and gradient slots preserved. <b>Numerical side.</b> For each
+     * sampled element (as in {@link #gradCheckParameters}) of each checked parameter, the parameter of
+     * {@code reference} under the same dotted name ({@link Module#namedParameters()}) is set to {@code w + epsilon}
+     * and to {@code w - epsilon} in double, {@code referenceLoss} is evaluated each time under
+     * {@link ComputationGraph#noGrad()} and its FLOAT64 elements are summed in double, and the element is restored;
+     * the numerical gradient is {@code (S(w + epsilon) - S(w - epsilon)) / (2 epsilon)}. The buffers of
+     * {@code reference} are restored after every evaluation, so the check leaves {@code reference} as it found it.
+     * An element fails as in {@link #gradCheck(TensorFunction, List, float, float)}.</p>
+     *
+     * <p><b>The reference.</b> {@code reference} has the parameters and buffers of {@code module} under the same
+     * names, with the same shapes and the same values (compared exactly as doubles), for example a second instance
+     * converted with {@code reference.to(DType.FLOAT64)} after {@code reference.loadStateDict(module.stateDict())};
+     * the counterparts of the checked parameters are FLOAT64, and its buffers are FLOAT32 or FLOAT64.
+     * {@code referenceLoss} computes the same loss as {@code loss} from {@code reference} and FLOAT64 copies of the
+     * tensors {@code loss} reads ({@link Tensor#to}), and returns a new FLOAT64 tensor on every call; the forward ops
+     * it uses need a FLOAT64 path ({@link TensorOps}). It runs on the backend its tensors live on.</p>
+     *
+     * @param loss                    the loss under test, as in {@link #gradCheckParameters}
+     * @param module                  the module whose parameters are checked, its buffers and gradient slots
+     *                                preserved; not null
+     * @param params                  the parameters to check: trainable FLOAT32 parameters of {@code module}, each
+     *                                listed once
+     * @param referenceLoss           the same loss evaluated with {@code reference} in FLOAT64
+     * @param reference               the FLOAT64 module holding {@code module}'s state
+     * @param epsilon                 the finite-difference step, positive and finite
+     * @param tolerance               the absolute and relative tolerance, non-negative
+     * @param maxElementsPerParameter the number of elements checked per parameter at most, positive
+     * @return the comparison; a failed result when {@code loss} returns null on the analytical pass
+     * @throws IllegalArgumentException as {@link #gradCheckParameters}, and when {@code module}, {@code reference}
+     *                                  or {@code referenceLoss} is null, a checked parameter is not a parameter of
+     *                                  {@code module}, or {@code reference} does not hold {@code module}'s state as
+     *                                  described above
+     * @throws IllegalStateException    as {@link #gradCheckParameters}, when a counterpart in {@code reference} is
+     *                                  substituted, or when {@code referenceLoss} returns null or a tensor that is
+     *                                  not FLOAT64
+     */
+    public static GradientCheckResult gradCheckParametersFloat64(Supplier<Tensor> loss, Module module,
+                                                                 List<Parameter> params,
+                                                                 Supplier<Tensor> referenceLoss, Module reference,
+                                                                 double epsilon, float tolerance,
+                                                                 int maxElementsPerParameter) {
+        ParameterGradientCheck.validateParameterCheck(loss, params, tolerance, maxElementsPerParameter);
+        requireStep(epsilon, tolerance);
+        if (module == null) {
+            throw new IllegalArgumentException("Module cannot be null for a float64 check");
+        }
+        if (reference == null || referenceLoss == null) {
+            throw new IllegalArgumentException("Reference module and reference loss cannot be null");
+        }
+        for (int i = 0; i < params.size(); i++) {
+            if (params.get(i) == null) {
+                throw new IllegalArgumentException("Parameter " + i + " is null");
+            }
+        }
+        Float64Reference.Parameters numerical = Float64Reference.Parameters.bind(module, params, reference,
+            referenceLoss, epsilon);
+        return ParameterGradientCheck.runFloat64(loss, module, params, numerical, tolerance, maxElementsPerParameter);
+    }
+
     // ------------------------------------------------------------------ tensors
 
     /** A new tensor of {@code shape} holding {@code data}. */
@@ -617,6 +758,64 @@ public final class GradientCheckUtil {
             data[i] = v * scale + offset;
         }
         return tensor(backend, data, shape);
+    }
+
+    /**
+     * A new tensor of {@code shape} whose values are uniform over {@code [lo, hi)} with the band of half-width
+     * {@link #KINK_CLEARANCE} around every kink removed, so no evaluation of a piecewise function with the standard
+     * steps (all smaller than the clearance) crosses a kink. Each uniform draw maps onto the remaining segments in
+     * proportion to their lengths.
+     */
+    private static Tensor kinkFree(ComputeBackend backend, Shape shape, float lo, float hi, float... kinks) {
+        float[] bounds = kinkFreeSegments(lo, hi, kinks);
+        float total = 0f;
+        for (int s = 0; s < bounds.length; s += 2) {
+            total += bounds[s + 1] - bounds[s];
+        }
+        float[] data;
+        try (Tensor r = Tensor.rand(backend, shape)) {
+            data = r.toFloatArray();
+        }
+        for (int i = 0; i < data.length; i++) {
+            float t = data[i] * total;
+            int s = 0;
+            while (s + 2 < bounds.length && t >= bounds[s + 1] - bounds[s]) {
+                t -= bounds[s + 1] - bounds[s];
+                s += 2;
+            }
+            data[i] = Math.min(bounds[s] + t, Math.nextDown(bounds[s + 1]));
+        }
+        return tensor(backend, data, shape);
+    }
+
+    /**
+     * The segments of {@code [lo, hi)} at least {@link #KINK_CLEARANCE} from every kink, as consecutive
+     * {@code (start, end)} pairs in increasing order.
+     *
+     * @throws IllegalArgumentException when the kinks are not increasing or leave no segment
+     */
+    private static float[] kinkFreeSegments(float lo, float hi, float[] kinks) {
+        float[] bounds = new float[2 * (kinks.length + 1)];
+        int n = 0;
+        float start = lo;
+        for (int k = 0; k <= kinks.length; k++) {
+            if (k > 0 && k < kinks.length && !(kinks[k] > kinks[k - 1])) {
+                throw new IllegalArgumentException("kinks must be increasing: " + Arrays.toString(kinks));
+            }
+            float end = k < kinks.length ? kinks[k] - KINK_CLEARANCE : hi;
+            if (end > start) {
+                bounds[n++] = start;
+                bounds[n++] = end;
+            }
+            if (k < kinks.length) {
+                start = Math.max(start, kinks[k] + KINK_CLEARANCE);
+            }
+        }
+        if (n == 0) {
+            throw new IllegalArgumentException("no value of [" + lo + ", " + hi + ") clears the kinks "
+                    + Arrays.toString(kinks));
+        }
+        return Arrays.copyOf(bounds, n);
     }
 
     // ------------------------------------------------------------------ standard checks
@@ -684,14 +883,23 @@ public final class GradientCheckUtil {
                 Arrays.asList(shiftedRand(backend, Shape.of(4, 4), 1f, 0.1f, true)));
     }
 
+    /**
+     * {@code abs} over values at least {@value #KINK_CLEARANCE} from the kink at 0 (the finite-difference step is
+     * smaller, so no evaluation crosses it).
+     */
     public static boolean checkAbs(ComputeBackend backend) {
         return check(inputs -> TensorOps.abs(inputs.get(0)),
-                Arrays.asList(shiftedRand(backend, Shape.of(4, 4), 2f, -1f, false)), 1e-3f, 5e-2f);
+                Arrays.asList(kinkFree(backend, Shape.of(4, 4), -1f, 1f, 0f)), 1e-3f, 5e-2f);
     }
 
+    /**
+     * {@code clamp} into {@code [0.2, 0.8]} over values at least {@value #KINK_CLEARANCE} from both bounds (the
+     * finite-difference step is smaller, so no evaluation crosses them). Clamp is piecewise linear, so the step adds
+     * no truncation error; see {@link #checkGather} for why it is 1e-3.
+     */
     public static boolean checkClamp(ComputeBackend backend) {
         return check(inputs -> TensorOps.clamp(inputs.get(0), 0.2f, 0.8f),
-                Arrays.asList(Tensor.rand(backend, Shape.of(4, 4))), 1e-5f, 5e-3f);
+                Arrays.asList(kinkFree(backend, Shape.of(4, 4), 0f, 1f, 0.2f, 0.8f)), 1e-3f, 5e-3f);
     }
 
     public static boolean checkNeg(ComputeBackend backend) {
@@ -734,10 +942,15 @@ public final class GradientCheckUtil {
                 Arrays.asList(Tensor.rand(backend, Shape.of(2, 4)), Tensor.rand(backend, Shape.of(2, 4))));
     }
 
+    /**
+     * {@code gather} along dim 1. Gather is linear in its input, so the step adds no truncation error; it is 1e-3
+     * because a float32 central difference resolves {@code sum(output)} (about 4) only to its float spacing, about
+     * 4.8e-7, divided by {@code 2 epsilon}: 2.4e-4 at 1e-3, but 2.4e-2 at 1e-5, above the 5e-3 tolerance.
+     */
     public static boolean checkGather(ComputeBackend backend) {
         try (Tensor index = indices(backend, new int[]{0, 2, 1, 3, 3, 0, 2, 1}, Shape.of(2, 4))) {
             return check(inputs -> TensorOps.gather(inputs.get(0), 1, index),
-                    Arrays.asList(Tensor.rand(backend, Shape.of(4, 4))), 1e-5f, 5e-3f);
+                    Arrays.asList(Tensor.rand(backend, Shape.of(4, 4))), 1e-3f, 5e-3f);
         }
     }
 

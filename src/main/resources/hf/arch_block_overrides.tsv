@@ -1,4 +1,4 @@
-# arch_block_overrides.tsv - Generated from llama.cpp a37cc4610 by the updateHfTables Gradle task; do not edit. Rows: 24
+# arch_block_overrides.tsv - Generated from llama.cpp dde879bc4 by the updateHfTables Gradle task; do not edit. Rows: 24
 # gguf_arch	tensor	hf_template	seq
 arctic	FFN_NORM	model.layers.{bid}.residual_layernorm	0
 arctic	FFN_NORM_EXP	model.layers.{bid}.post_attention_layernorm	1

@@ -67,13 +67,38 @@ public final class ForwardBatchTest {
         row[0] = 99; // rows are copied at add time
         assertArrayEquals(new float[]{1, 2, 3}, batch.embeddingRow(0), 0.0f);
         assertThrows(IllegalArgumentException.class, () -> ForwardBatch.builder(2)
-                .add(7, 0, 0, true)
-                .addEmbedding(new float[]{1}, 1, 0, false)
-                .build());
-        assertThrows(IllegalArgumentException.class, () -> ForwardBatch.builder(2)
                 .addEmbedding(new float[]{1}, 0, 0, true)
                 .addEmbedding(new float[]{1, 2}, 1, 0, false)
                 .build());
+    }
+
+    @Test
+    public void tokenAndEmbeddingRowsShareABatchEachByItsKind() {
+        ForwardBatch batch = ForwardBatch.builder(3)
+                .add(7, 0, 0, false)
+                .addEmbedding(new float[]{1, 2}, 1, 0, false)
+                .add(9, 0, 1, true)
+                .build();
+        assertArrayEquals(new int[]{7, -1, 9}, batch.tokens());
+        assertNull("a token row carries no embedding", batch.embeddingRow(0));
+        assertArrayEquals(new float[]{1, 2}, batch.embeddingRow(1), 0.0f);
+        assertNull(batch.embeddings()[2]);
+        assertThrows("a mixed batch keeps one embedding width", IllegalArgumentException.class,
+                () -> ForwardBatch.builder(3).add(7, 0, 0, false)
+                        .addEmbedding(new float[]{1}, 1, 0, false)
+                        .addEmbedding(new float[]{1, 2}, 2, 0, true));
+    }
+
+    @Test
+    public void adapterSlotRefusalNamesTheFirstRowOutsideSlotZero() {
+        ForwardBatch plain = tokenBatch(2).build();
+        assertNull(plain.adapterSlotRefusal("X"));
+        ForwardBatch zero = tokenBatch(2).adapterSlots(new int[]{0, 0}).build();
+        assertNull(zero.adapterSlotRefusal("X"));
+        String refusal = tokenBatch(2).adapterSlots(new int[]{0, 3}).build().adapterSlotRefusal("GpuForwardBackend");
+        assertNotNull(refusal);
+        assertTrue(refusal, refusal.contains("adapterSlots") && refusal.contains("row 1")
+                && refusal.contains("slot 3") && refusal.contains("GpuForwardBackend"));
     }
 
     @Test
@@ -86,14 +111,14 @@ public final class ForwardBatchTest {
         ForwardBatch.Builder pos = ForwardBatch.builder(1);
         pos.add(1, -1, 0, false);
         assertThrows(IllegalArgumentException.class, pos::build); // positions >= 0
-        ForwardBatch.Builder jump = ForwardBatch.builder(2);
-        jump.add(1, 0, 0, false).add(2, 2, 0, false);
-        assertThrows(IllegalArgumentException.class, jump::build); // +1 from one row to the next
-        // interleaved sequences are allowed while each keeps its own consecutive positions
+        ForwardBatch.Builder desc = ForwardBatch.builder(2);
+        desc.add(1, 1, 0, false).add(2, 0, 0, false);
+        assertThrows(IllegalArgumentException.class, desc::build); // positions ascend within a sequence
+        // a gap builds: rows of a media chunk share one position and explicit positions may skip; the default
+        // forward path refuses non-consecutive batches (ForwardBackend.forwardBatch), the paged one runs them
+        ForwardBatch.builder(2).add(1, 0, 0, false).add(2, 2, 0, false).build().nTokens();
+        // interleaved sequences are allowed while each keeps its own ascending positions
         ForwardBatch.builder(3).add(1, 0, 0, false).add(2, 0, 1, false).add(3, 1, 0, false).build().nTokens();
-        ForwardBatch.Builder hole = ForwardBatch.builder(2);
-        hole.add(1, 0, 0, false).add(2, 2, 0, false);
-        assertThrows(IllegalArgumentException.class, hole::build); // sequence 0 holed
         ForwardBatch.Builder noToken = ForwardBatch.builder(1);
         noToken.add(-1, 0, 0, true);
         assertThrows(IllegalArgumentException.class, noToken::build); // token ids on a token batch

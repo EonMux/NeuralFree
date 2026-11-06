@@ -184,6 +184,11 @@ public final class HfNameTables {
     private final Map<String, Map<String, List<String>>> blockOverrides;
     private final Map<FilterKind, List<FilterRule>> filters;
     private final Predicate<String> forcedF32;
+    private final Predicate<String> ternaryKeptF16;
+
+    /** The converter tensors that stay F16 under the ternary outtypes (base.py:1513-1525). */
+    private static final List<String> TERNARY_F16_TENSORS = List.of("TOKEN_EMBD", "PER_LAYER_TOKEN_EMBD", "OUTPUT",
+            "ALTUP_ROUTER", "LAUREL_L", "LAUREL_R");
 
     private HfNameTables() {
         this.tensorNames = loadTensorNames();
@@ -196,6 +201,7 @@ public final class HfNameTables {
         this.blockOverrides = loadBlockOverrides(tensorNames);
         this.filters = loadFilters(tensorNames);
         this.forcedF32 = buildForcedF32(tensorNames, filters.get(FilterKind.FORCED_F32));
+        this.ternaryKeptF16 = buildWeightPredicate(tensorNames, TERNARY_F16_TENSORS);
     }
 
     private static final class Holder {
@@ -259,6 +265,16 @@ public final class HfNameTables {
      */
     public static Predicate<String> forcedF32() {
         return tables().forcedF32;
+    }
+
+    /**
+     * True for the GGUF names the converter stores as F16 when the output type is TQ1_0 or TQ2_0
+     * ({@code prepare_tensors}, base.py:1513-1525): {@code token_embd}, {@code per_layer_token_embd},
+     * {@code output}, {@code altup_router}, {@code laurel_l} and {@code laurel_r}, with any block number, each
+     * with {@code .weight}. Thread-safe.
+     */
+    public static Predicate<String> ternaryKeptF16() {
+        return tables().ternaryKeptF16;
     }
 
     /**
@@ -419,15 +435,99 @@ public final class HfNameTables {
     }
 
     /**
+     * The {@code MODEL_TENSOR} sets of the architectures NeuralFree defines for checkpoints llama.cpp's converter does
+     * not list. They are laid out like the llama.cpp architecture they mirror: the openPangu MoE trunk
+     * ({@code pangu-moe}) reuses the pangu-embedded attention tensors and adds the DeepSeek-style routed and shared
+     * experts, and the EAGLE-1 drafter row ({@code eagle}, vLLM's {@code speculative_method "eagle"} heads) holds the
+     * llama-shaped draft layer, the DeepSeek multi-head latent attention of a DeepSeek-MTP-shaped draft
+     * ({@code q_a_proj}, {@code kv_a_proj_with_mqa}, the absorbed {@code k_b}/{@code v_b} decompression) and the
+     * routed experts of such a draft's FFN, AXK-1 ({@code axk1}) the DeepSeek-V2 tensor names plus the sparse
+     * layers' post-MLP norm, AliceAI ({@code alice-ai}) the KDA projections and convolutions with the Qwen3-Next
+     * gated attention, its fused residual scores and the routed-plus-shared-expert FFN, and RNJ-1 ({@code rnj1})
+     * the Gemma 3 block tensors. Regenerating the tables from llama.cpp leaves these rows alone.
+     */
+    private static final Map<String, Set<String>> NF_ARCH_TENSORS = nfArchTensors();
+
+    private static Map<String, Set<String>> nfArchTensors() {
+        Map<String, Set<String>> m = new HashMap<>();
+        m.put("eagle", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT", "OUTPUT_NORM", "FC", "ENC_OUTPUT_NORM", "ROPE_FREQS",
+                "ATTN_NORM", "ATTN_NORM_2", "ATTN_Q", "ATTN_K", "ATTN_V", "ATTN_OUT",
+                "ATTN_Q_A", "ATTN_Q_A_NORM", "ATTN_Q_B", "ATTN_KV_A_MQA", "ATTN_KV_A_NORM", "ATTN_K_B", "ATTN_V_B",
+                "ATTN_KV_B", "FFN_NORM", "FFN_GATE", "FFN_UP", "FFN_DOWN", "FFN_GATE_INP", "FFN_GATE_EXP",
+                "FFN_UP_EXP", "FFN_DOWN_EXP", "FFN_GATE_SHEXP", "FFN_UP_SHEXP", "FFN_DOWN_SHEXP",
+                "FFN_EXP_PROBS_B"))));
+        m.put("step1", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT_NORM", "OUTPUT", "ATTN_NORM", "ATTN_QKV", "ATTN_Q", "ATTN_K", "ATTN_V",
+                "ATTN_OUT", "FFN_NORM", "FFN_GATE", "FFN_DOWN", "FFN_UP"))));
+        m.put("step3text", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT_NORM", "OUTPUT",
+                "ATTN_NORM", "ATTN_Q_A", "ATTN_Q_A_NORM", "ATTN_Q_B", "ATTN_K", "ATTN_V", "ATTN_OUT",
+                "FFN_NORM", "FFN_GATE", "FFN_DOWN", "FFN_UP",
+                "FFN_GATE_INP", "FFN_GATE_EXP", "FFN_DOWN_EXP", "FFN_UP_EXP",
+                "FFN_GATE_SHEXP", "FFN_DOWN_SHEXP", "FFN_UP_SHEXP"))));
+        // Step5 (vLLM models/step5): GQA attention with a per-head output gate, the sparse indexer projections,
+        // dense and routed-plus-shared-expert FFNs, and the NextN/MTP block's fusion and shared head.
+        m.put("step5", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT_NORM", "OUTPUT",
+                "ATTN_NORM", "ATTN_Q", "ATTN_K", "ATTN_V", "ATTN_OUT", "ATTN_Q_NORM", "ATTN_K_NORM", "ATTN_GATE",
+                "INDEXER_ATTN_Q_B", "INDEXER_ATTN_K", "INDEXER_PROJ", "INDEXER_Q_NORM", "INDEXER_K_NORM",
+                "FFN_NORM", "FFN_GATE", "FFN_DOWN", "FFN_UP",
+                "FFN_GATE_INP", "FFN_EXP_PROBS_B",
+                "FFN_GATE_EXP", "FFN_DOWN_EXP", "FFN_UP_EXP",
+                "FFN_GATE_SHEXP", "FFN_DOWN_SHEXP", "FFN_UP_SHEXP",
+                "NEXTN_EH_PROJ", "NEXTN_ENORM", "NEXTN_HNORM", "NEXTN_SHARED_HEAD_HEAD",
+                "NEXTN_SHARED_HEAD_NORM"))));
+        m.put("pangu-moe", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT_NORM", "OUTPUT",
+                "ATTN_NORM", "ATTN_QKV", "ATTN_Q", "ATTN_K", "ATTN_V", "ATTN_OUT",
+                "FFN_NORM", "FFN_GATE", "FFN_DOWN", "FFN_UP",
+                "FFN_GATE_INP", "FFN_EXP_PROBS_B",
+                "FFN_GATE_EXP", "FFN_DOWN_EXP", "FFN_UP_EXP",
+                "FFN_GATE_SHEXP", "FFN_DOWN_SHEXP", "FFN_UP_SHEXP"))));
+        // AXK-1 has no llama.cpp converter; its checkpoint names are the DeepSeek-V2 ones plus the post-MLP norm
+        // of the sparse layers, which the graph carries as ffn.post_ffw_norm.
+        m.put("axk1", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT_NORM", "OUTPUT", "ROPE_FREQS",
+                "ATTN_NORM", "ATTN_Q", "ATTN_Q_A", "ATTN_Q_B", "ATTN_KV_A_MQA", "ATTN_KV_B", "ATTN_K",
+                "ATTN_K_B", "ATTN_V", "ATTN_V_B", "ATTN_Q_A_NORM", "ATTN_KV_A_NORM", "ATTN_OUT", "ATTN_ROT_EMBD",
+                "FFN_GATE_INP", "FFN_NORM", "FFN_POST_NORM", "FFN_GATE", "FFN_DOWN", "FFN_UP",
+                "FFN_GATE_EXP", "FFN_DOWN_EXP", "FFN_UP_EXP",
+                "FFN_GATE_SHEXP", "FFN_DOWN_SHEXP", "FFN_UP_SHEXP", "FFN_EXP_PROBS_B",
+                "NEXTN_EH_PROJ", "NEXTN_EMBED_TOKENS", "NEXTN_ENORM", "NEXTN_HNORM", "NEXTN_SHARED_HEAD_HEAD",
+                "NEXTN_SHARED_HEAD_NORM"))));
+        // AliceAI has no llama.cpp converter: KDA projections and convolutions, the Qwen3-Next gated attention,
+        // the fused attention-residual scores and the routed-plus-shared-expert FFN (vLLM models/alice_ai.py).
+        m.put("alice-ai", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT", "OUTPUT_NORM", "ATTN_RES_SCORE", "FFN_RES_SCORE", "OUTPUT_RES_SCORE",
+                "ATTN_NORM", "FFN_NORM", "ATTN_Q", "ATTN_K", "ATTN_V", "ATTN_OUT", "ATTN_Q_NORM", "ATTN_K_NORM",
+                "SSM_CONV1D_Q", "SSM_CONV1D_K", "SSM_CONV1D_V",
+                "SSM_F_A", "SSM_F_B", "SSM_BETA", "SSM_A", "SSM_DT", "SSM_G_A", "SSM_G_B", "SSM_NORM",
+                "FFN_GATE_INP", "FFN_EXP_PROBS_B", "FFN_GATE_EXP", "FFN_UP_EXP", "FFN_DOWN_EXP",
+                "FFN_GATE_INP_SHEXP", "FFN_GATE_SHEXP", "FFN_UP_SHEXP", "FFN_DOWN_SHEXP"))));
+        // RNJ-1 has no llama.cpp converter; its checkpoint names are the Gemma 3 ones.
+        m.put("rnj1", Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+                "TOKEN_EMBD", "OUTPUT", "OUTPUT_NORM",
+                "ATTN_QKV", "ATTN_Q", "ATTN_Q_NORM", "ATTN_K", "ATTN_K_NORM", "ATTN_V", "ATTN_OUT",
+                "ATTN_NORM", "ATTN_POST_NORM", "FFN_PRE_NORM", "FFN_POST_NORM",
+                "FFN_GATE", "FFN_DOWN", "FFN_UP"))));
+        return Collections.unmodifiableMap(m);
+    }
+
+    /**
      * MODEL_TENSORS membership per arch. llama.cpp's constants.py lists a few tensors that have no TENSOR_NAMES
      * entry (the clip V_PROJ_NORM / V_QF_PROJ_* group); TensorNameMap never maps those, so absence from
      * {@code names} is not a defect here. It also lists clip's V_QF_PROJ_NORM twice; a set membership dedupes.
+     * {@link #NF_ARCH_TENSORS} adds the rows of the architectures llama.cpp does not run.
      */
     private static Map<String, Set<String>> loadArchTensors() {
         Map<String, Set<String>> out = new LinkedHashMap<>();
         for (TsvRow row : read("arch_tensors.tsv", "gguf_arch", "tensor").rows()) {
             requireArch(row, row.get(0));
             out.computeIfAbsent(row.get(0), k -> new LinkedHashSet<>()).add(row.get(1));
+        }
+        for (Map.Entry<String, Set<String>> e : NF_ARCH_TENSORS.entrySet()) {
+            out.computeIfAbsent(e.getKey(), k -> new LinkedHashSet<>()).addAll(e.getValue());
         }
         Map<String, Set<String>> frozen = new HashMap<>();
         for (Map.Entry<String, Set<String>> e : out.entrySet()) {
@@ -491,9 +591,27 @@ public final class HfNameTables {
     }
 
     private static Predicate<String> buildForcedF32(Map<String, String> names, List<FilterRule> rules) {
-        StringBuilder regex = new StringBuilder();
+        List<String> tensors = new ArrayList<>(rules.size());
         for (FilterRule rule : rules) {
-            String template = names.get(rule.value());
+            tensors.add(rule.value());
+        }
+        return buildWeightPredicate(names, tensors);
+    }
+
+    /**
+     * A predicate over the GGUF names of {@code tensors} ({@code tensor_names.tsv} keys) expanded with any block
+     * number and a {@code .weight} suffix ({@code match_model_tensor_name}, base.py:609-620).
+     *
+     * @throws IllegalStateException when {@code names} has no template for a tensor
+     */
+    private static Predicate<String> buildWeightPredicate(Map<String, String> names, List<String> tensors) {
+        StringBuilder regex = new StringBuilder();
+        for (String tensor : tensors) {
+            String template = names.get(tensor);
+            if (template == null) {
+                throw new IllegalStateException("hf/tensor_names.tsv: tensor '" + tensor
+                        + "' is not in the table");
+            }
             if (regex.length() > 0) {
                 regex.append('|');
             }

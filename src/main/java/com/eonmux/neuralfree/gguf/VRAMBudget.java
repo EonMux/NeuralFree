@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
@@ -13,6 +14,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -30,10 +32,12 @@ import java.util.concurrent.TimeUnit;
  * budget and maximum streaming depth. When the depth reaches the layer count every streamed layer stays resident and no
  * RAM prefetch tier is needed.</p>
  *
- * <p>Free VRAM comes from {@link #queryFreeVram(ComputeBackend)}: the driver's own figure through
- * {@link ComputeBackend#getFreeVramBytes()} where it reflects every process (CUDA {@code cuMemGetInfo}, Vulkan
- * {@code VK_EXT_memory_budget}), {@code nvidia-smi} for other APIs on NVIDIA devices, and otherwise the backend's
- * estimate (total minus this process's allocations) with the larger fixed reserve.</p>
+ * <p>Free VRAM comes from {@link #queryFreeVram(ComputeBackend)}: on AMD devices the platform's own counters, the
+ * amdgpu driver's sysfs {@code mem_info_vram_{total,used}} on Linux and WDDM's {@code D3DKMT} segment statistics on
+ * Windows, both of which count every process; the driver's figure through {@link ComputeBackend#getFreeVramBytes()}
+ * where it reflects every process (CUDA {@code cuMemGetInfo}, Vulkan {@code VK_EXT_memory_budget}); {@code nvidia-smi}
+ * for other APIs on NVIDIA devices; and otherwise the backend's estimate (total minus this process's allocations)
+ * with the larger fixed reserve.</p>
  */
 public final class VRAMBudget {
 
@@ -50,8 +54,18 @@ public final class VRAMBudget {
     /** PCI vendor id of NVIDIA. */
     private static final int NVIDIA_VENDOR_ID = 0x10DE;
 
+    /** PCI vendor id of AMD. */
+    private static final int AMD_VENDOR_ID = 0x1002;
+
     /** Seconds to wait for {@code nvidia-smi}. */
     private static final long NVIDIA_SMI_TIMEOUT_SECONDS = 5;
+
+    /**
+     * VRAM held by other processes that a Windows figure from the runtime alone must assume: the
+     * desktop compositor and browsers typically keep 2-3 GiB of a discrete card resident, and
+     * WDDM's own statistics cannot be read in that case.
+     */
+    private static final long WDDM_OTHER_PROCESS_RESERVE_BYTES = 3072L * 1024 * 1024;
 
     /** Where a free-VRAM figure came from. */
     public enum FreeVramSource {
@@ -59,6 +73,10 @@ public final class VRAMBudget {
         DRIVER,
         /** {@code nvidia-smi}, which accounts for every process. */
         NVIDIA_SMI,
+        /** The amdgpu driver's sysfs {@code mem_info_vram_{total,used}} counters, which count every process. */
+        AMDGPU_SYSFS,
+        /** WDDM's {@code D3DKMT} adapter segment statistics, which count every process. */
+        WDDM_D3DKMT,
         /** Total VRAM minus this process's allocations; other processes are not accounted for. */
         ESTIMATE,
         /** Nothing is known; the budget uses the total VRAM minus the fixed reserve. */
@@ -66,7 +84,7 @@ public final class VRAMBudget {
 
         /** True when the figure accounts for memory used by other processes. */
         public boolean measured() {
-            return this == DRIVER || this == NVIDIA_SMI;
+            return this == DRIVER || this == NVIDIA_SMI || this == AMDGPU_SYSFS || this == WDDM_D3DKMT;
         }
     }
 
@@ -83,10 +101,13 @@ public final class VRAMBudget {
             this.source = source;
         }
 
-        /** A known figure; a non-positive byte count yields {@link #UNKNOWN}. */
+        /**
+         * A known figure; a negative byte count yields {@link #UNKNOWN}. Zero is a real reading from a
+         * source that measured a full device and is kept as such.
+         */
         public static FreeVram of(long bytes, FreeVramSource source) {
             Objects.requireNonNull(source, "source");
-            if (bytes <= 0 || source == FreeVramSource.UNKNOWN) {
+            if (bytes < 0 || source == FreeVramSource.UNKNOWN) {
                 return UNKNOWN;
             }
             return new FreeVram(bytes, source);
@@ -251,6 +272,10 @@ public final class VRAMBudget {
                 return "free VRAM measured by the driver";
             case NVIDIA_SMI:
                 return "free VRAM measured via nvidia-smi";
+            case AMDGPU_SYSFS:
+                return "free VRAM measured by the amdgpu driver counters";
+            case WDDM_D3DKMT:
+                return "free VRAM measured by WDDM adapter statistics";
             case ESTIMATE:
                 return "free VRAM estimated from this process's allocations";
             default:
@@ -264,9 +289,9 @@ public final class VRAMBudget {
      */
     private static long usableVram(long totalVram, FreeVram free, long fixedReserveBytes) {
         long usable;
-        if (free.bytes() > 0 && free.bytes() < totalVram && free.source().measured()) {
+        if (free.bytes() >= 0 && free.bytes() < totalVram && free.source().measured()) {
             usable = free.bytes() - MEASURED_RESERVE_BYTES;
-        } else if (free.bytes() > 0 && free.bytes() < totalVram && free.source() == FreeVramSource.ESTIMATE) {
+        } else if (free.bytes() >= 0 && free.bytes() < totalVram && free.source() == FreeVramSource.ESTIMATE) {
             usable = free.bytes() - fixedReserveBytes;
         } else {
             usable = totalVram - fixedReserveBytes;
@@ -275,26 +300,47 @@ public final class VRAMBudget {
     }
 
     /**
-     * Free VRAM of the backend's device, preferring figures that account for every process: the driver's
-     * ({@link ComputeBackend#getFreeVramBytes()} on CUDA, and on Vulkan with {@link DeviceFeature#MEMORY_BUDGET}),
-     * then {@code nvidia-smi} on NVIDIA devices (matched by PCI bus id or UUID), then the backend's estimate.
-     * Call it before this process allocates model buffers so the figure is the true baseline.
+     * Free VRAM of the backend's device, preferring figures that account for every process. On a discrete AMD
+     * device without {@link DeviceFeature#MEMORY_BUDGET} it reads the platform counters first: the amdgpu driver's
+     * sysfs counters on Linux ({@link AmdgpuVramCounters}) or WDDM's {@code D3DKMT} statistics on Windows
+     * ({@link WddmAdapterStatistics}), which are exact where the HIP runtime only reports this process's share.
+     * Otherwise: the driver's figure ({@link ComputeBackend#getFreeVramBytes()} on CUDA, on HIP and on Vulkan with
+     * {@code VK_EXT_memory_budget}), then {@code nvidia-smi} on NVIDIA devices (matched by PCI bus id or UUID), then
+     * the backend's estimate. Call it before this process allocates model buffers so the figure is the true
+     * baseline.
      */
     public static FreeVram queryFreeVram(ComputeBackend backend) {
+        return queryFreeVram(backend, AmdgpuVramCounters.SYSFS_PCI_DEVICES);
+    }
+
+    /** {@link #queryFreeVram(ComputeBackend)} reading the amdgpu counters from {@code sysfsDevices}, for tests. */
+    static FreeVram queryFreeVram(ComputeBackend backend, Path sysfsDevices) {
         Objects.requireNonNull(backend, "backend");
         DeviceCapabilities caps = backend.capabilities();
-        ComputeBackend.BackendType type = backend.backendType();
+        if (backend instanceof com.eonmux.neuralfree.gguf.rpc.RemoteComputeBackend) {
+            return remoteFreeVram(backend, caps);
+        }        ComputeBackend.BackendType type = backend.backendType();
+        boolean vulkanBudget = type == ComputeBackend.BackendType.VULKAN
+                && caps.hasFeature(DeviceFeature.MEMORY_BUDGET);
         boolean driverMeasured = type == ComputeBackend.BackendType.CUDA
-                || (type == ComputeBackend.BackendType.VULKAN && caps.hasFeature(DeviceFeature.MEMORY_BUDGET));
-        long estimate = -1;
+                || type == ComputeBackend.BackendType.HIP
+                || vulkanBudget;
+        long driverFree = -1;
         try {
-            long free = backend.getFreeVramBytes();
-            if (driverMeasured && free > 0) {
-                return FreeVram.of(free, FreeVramSource.DRIVER);
-            }
-            estimate = free;
+            driverFree = backend.getFreeVramBytes();
         } catch (RuntimeException e) {
             LOGGER.warn("{} backend could not report free VRAM on {}: {}", type, caps.getDeviceName(), e.getMessage());
+        }
+        if (isAmd(caps) && !vulkanBudget) {
+            FreeVram amd = amdFreeVram(caps, driverFree, sysfsDevices);
+            if (amd != null) {
+                LOGGER.debug("AMD free VRAM on {}: {} MiB ({})",
+                        caps.getDeviceName(), amd.bytes() >> 20, amd.source());
+                return amd;
+            }
+        }
+        if (driverMeasured && driverFree > 0) {
+            return FreeVram.of(driverFree, FreeVramSource.DRIVER);
         }
         if (isNvidia(caps)) {
             long smi = nvidiaSmiFreeBytes(caps.getIdentity());
@@ -302,7 +348,86 @@ public final class VRAMBudget {
                 return FreeVram.of(smi, FreeVramSource.NVIDIA_SMI);
             }
         }
+        return FreeVram.of(driverFree, FreeVramSource.ESTIMATE);
+    }
+
+    /**
+     * Free VRAM of a remote device: the figure its own machine reports. The host-local probes (amdgpu sysfs,
+     * {@code nvidia-smi}) describe this machine's cards and must not be matched against a remote device's identity.
+     */
+    private static FreeVram remoteFreeVram(ComputeBackend backend, DeviceCapabilities caps) {
+        long free = -1L;
+        try {
+            free = backend.getFreeVramBytes();
+        } catch (RuntimeException e) {
+            LOGGER.warn("remote device {} could not report free VRAM: {}", caps.getDeviceName(), e.getMessage());
+        }
+        if (free > 0) {
+            return FreeVram.of(free, FreeVramSource.DRIVER);
+        }
+        long estimate = Math.max(0L, caps.getTotalVramBytes() - backend.getAllocatedBytes());
         return FreeVram.of(estimate, FreeVramSource.ESTIMATE);
+    }
+
+    /**
+     * AMD free VRAM from the platform counters, or null when the platform has no usable counter and the caller
+     * should fall back to the runtime's figure. Integrated devices are skipped: their VRAM counters cover only the
+     * BIOS carve-out, while the driver budgets the shared system memory.
+     */
+    private static FreeVram amdFreeVram(DeviceCapabilities caps, long driverFree, Path sysfsDevices) {
+        if (caps.getDeviceClass() == DeviceClass.INTEGRATED) {
+            return null;
+        }
+        DeviceIdentity identity = caps.getIdentity();
+        long total = caps.getTotalVramBytes();
+        if (isWindows()) {
+            return selectWindowsAmd(total, driverFree, WddmAdapterStatistics.freeBytes(identity));
+        }
+        return selectLinuxAmd(total, AmdgpuVramCounters.freeBytes(sysfsDevices, identity.pciBusId()));
+    }
+
+    /** The Linux figure: the amdgpu sysfs counters when readable, else null to use the runtime's figure. */
+    static FreeVram selectLinuxAmd(long totalVram, long sysfsFree) {
+        return sysfsFree < 0 ? null : FreeVram.of(clampToTotal(sysfsFree, totalVram), FreeVramSource.AMDGPU_SYSFS);
+    }
+
+    /**
+     * The Windows figure: WDDM's statistics (never larger than the runtime's own figure) when readable; otherwise
+     * the runtime's figure less a reserve for the other processes WDDM cannot report, as an estimate; otherwise
+     * null.
+     */
+    static FreeVram selectWindowsAmd(long totalVram, long driverFree, long wddmFree) {
+        if (wddmFree >= 0) {
+            long measured = driverFree > 0 ? Math.min(wddmFree, driverFree) : wddmFree;
+            return FreeVram.of(clampToTotal(measured, totalVram), FreeVramSource.WDDM_D3DKMT);
+        }
+        if (driverFree > 0) {
+            long reduced = Math.max(0L, driverFree - WDDM_OTHER_PROCESS_RESERVE_BYTES);
+            return FreeVram.of(clampToTotal(reduced, totalVram), FreeVramSource.ESTIMATE);
+        }
+        return null;
+    }
+
+    /** Caps a measured figure at the device's reported size; a non-positive total leaves it unchanged. */
+    private static long clampToTotal(long bytes, long totalVram) {
+        return totalVram > 0 ? Math.min(bytes, totalVram) : bytes;
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    private static boolean isAmd(DeviceCapabilities caps) {
+        DeviceIdentity id = caps.getIdentity();
+        if (id != null && id.vendorId() == AMD_VENDOR_ID) {
+            return true;
+        }
+        String name = caps.getDeviceName();
+        if (name == null) {
+            return false;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.contains("amd") || lower.contains("radeon") || lower.contains("advanced micro devices");
     }
 
     /**
@@ -330,6 +455,22 @@ public final class VRAMBudget {
         }
         long usable = usableVram(totalVram, free, FIXED_RESERVE_BYTES);
         return Math.max(0, usable - residentWeightBytes - computeBytes - miscBytes);
+    }
+
+    /**
+     * {@code budget} capped by a per-device allocation limit ({@code neuralfree.gpu.vram.limit}): at most the limit
+     * less what the load already allocated on the device and the allocations still to come. Never negative.
+     *
+     * @param limitBytes     the bytes the load may allocate on the device, 0 or less for no limit
+     * @param allocatedSince bytes the load allocated on the device so far
+     * @param pendingBytes   bytes still to be allocated that the budget holds back
+     */
+    public static long limitedBytes(long budget, long limitBytes, long allocatedSince, long pendingBytes) {
+        if (limitBytes <= 0) {
+            return budget;
+        }
+        long left = limitBytes - Math.max(0L, allocatedSince) - Math.max(0L, pendingBytes);
+        return Math.max(0L, Math.min(budget, left));
     }
 
     private static boolean isNvidia(DeviceCapabilities caps) {

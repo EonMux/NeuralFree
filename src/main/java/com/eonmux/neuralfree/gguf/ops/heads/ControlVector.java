@@ -5,9 +5,13 @@ import com.eonmux.neuralfree.gguf.GGUFFileParser;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
+import com.eonmux.neuralfree.gguf.engine.ControlVectorSpec;
+import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
+import com.eonmux.neuralfree.gguf.spec.LayerSpec;
+import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 
 import java.io.IOException;
@@ -39,24 +43,24 @@ import java.util.TreeSet;
  * and with the default layer range {@code [1, n_layer]} no layer-0 row is ever read. Several active vectors are summed,
  * each with its own scale and 1-based layer range ({@code --control-vector-scaled} and
  * {@code --control-vector-layer-range}, carried per file here where llama.cpp folds the strengths into the file data
- * and holds one global range for the whole set). A shorter file row extends by zeros, as llama.cpp zero-extends the
- * loaded span.
+ * and holds one global range for the whole set). Every direction row must be exactly {@code n_embd} wide, as llama.cpp's
+ * {@code apply} refuses any other width; a file that ends before the model's last layer adds nothing on the layers it
+ * has no row for, which is the zero the llama.cpp buffer holds there.
  *
- * <p>The runtime surface follows the one LR-1 established for adapters ({@code J/gguf/engine/lora}, the
+ * <p>The runtime surface follows the one the adapters established ({@code J/gguf/engine/lora}, the
  * {@code LoraRegistry} / {@code LoraHandle} / {@code LoraListener} shape): {@link #add} makes a vector active under a
  * name at a scale over a range; {@link #setScale} changes the scale — always a new epoch, this is an engine-global
  * (static) change, also when the value returns to an earlier one; {@link #unload} removes it. Every change is delivered
- * synchronously on the engine thread the caller owns (§3.3), through a {@link Listener} that mirrors
- * {@code LoraListener}, before the change returns, and a failing listener rolls the change back. PC-0/PC-1 mount the
- * namespace identity on the revisions ({@code LoadId} and {@link Entry#revision() epoch()}, K-2 field 2, §5.5.1 O-6)
- * exactly as PC-0 mounts {@code LoadIds} on {@code LoraHandle} (PC-0 edits this class onwards, §6.3). The identity of
- * an entry is its content digest of §5.5.1 N-2 (the {@code controlvector} metadata, the direction table and the exact
- * tensor bytes — PC-8's {@code ContentDigest} in persistent form) plus its scale bits, layer range and epoch.
+ * synchronously on the engine thread the caller owns, through a {@link Listener} that mirrors
+ * {@code LoraListener}, before the change returns, and a failing listener rolls the change back. The revisions carry
+ * the epochs ({@link Entry#revision()}), exactly as {@code LoraHandle}'s revision does for the adapters. The identity of
+ * an entry is its content digest (the {@code controlvector} metadata, the direction table and the exact
+ * tensor bytes) plus its scale bits, layer range and epoch.
  *
  * <p>The application path the endpoint uses is the extras ({@link ControlVectorExtra} on the device,
  * {@link CpuControlVectorExtra} on the host): their {@code afterBlock} adds the graph layer's {@linkplain #snapshot()
  * sum} to every row of the residual stream, a token-wise add, with {@code batchRefusal()} null because the add does not
- * depend on the sequence layout. Mutable, owned by the engine thread like {@code LoraRegistry} (§3.1); one set per
+ * depend on the sequence layout. Mutable, owned by the engine thread like {@code LoraRegistry}; one set per
  * loaded model.
  */
 public final class ControlVector {
@@ -102,8 +106,8 @@ public final class ControlVector {
     }
 
     /**
-     * A counter that changes on every set change: PC-0 names the resulting identity a new epoch of the engine-global
-     * set, also when a scale returns to an earlier value (§5.5.1 K-4, N-2); the extras re-read their sum only on it.
+     * A counter that changes on every set change: every change is a new epoch of the engine-global
+     * set, also when a scale returns to an earlier value; the extras re-read their sum only on it.
      */
     public long revision() {
         return revision;
@@ -151,8 +155,8 @@ public final class ControlVector {
      *
      * @throws IllegalArgumentException for a null file, a blank name, a non-finite scale or a range outside
      *                                  {@code [1, nLayer]}
-     * @throws GgufFormatException      when the file's rows are wider than {@link #nEmbd()} — llama.cpp refuses it the
-     *                                  same way at apply ("control vector n_embd does not match model")
+     * @throws GgufFormatException      when the file's rows are not exactly {@link #nEmbd()} wide — llama.cpp refuses
+     *                                  any other width at apply ("control vector n_embd does not match model")
      * @throws IllegalStateException    when {@code name} is already active
      */
     public Entry add(String name, File file, float scale, int layerStart, int layerEnd) {
@@ -167,9 +171,11 @@ public final class ControlVector {
             throw new IllegalArgumentException("control vector " + name + ": layer range [" + layerStart + ", "
                     + layerEnd + "] is outside [1, " + nLayer + "]");
         }
-        if (file.nEmbd() > nEmbd) {
-            throw new GgufFormatException("control vector " + name + ": n_embd does not match model: the file is "
-                    + file.nEmbd() + " wide, the model is " + nEmbd);
+        if (file.nEmbd() != nEmbd) {
+            String where = name.equals(file.path()) ? name : name + " (" + file.path() + ")";
+            throw new GgufFormatException("control vector " + where + ": n_embd does not match model: the file's"
+                    + " direction rows (layers 1.." + file.maxLayer() + ") are " + file.nEmbd() + " wide, the model's"
+                    + " residual stream (layers " + layerStart + ".." + layerEnd + ") is " + nEmbd + " wide");
         }
         if (entries.containsKey(name)) {
             throw new IllegalStateException("control vector " + name + " is already active; unload it first");
@@ -190,8 +196,8 @@ public final class ControlVector {
 
     /**
      * Changes the scale of the active vector {@code name}. An engine-global change every later step runs with, so it
-     * creates a new epoch: {@link Entry#revision()} rises, also when the value returns to an earlier one (§5.5.1 N-2,
-     * K-4), and {@link #revision()} rises with it.
+     * creates a new epoch: {@link Entry#revision()} rises, also when the value returns to an earlier one,
+     * and {@link #revision()} rises with it.
      *
      * @throws IllegalArgumentException for a non-finite scale or a name active nowhere
      */
@@ -221,7 +227,7 @@ public final class ControlVector {
     /**
      * Removes the active vector {@code name}, as llama.cpp's {@code apply(null)} disables the vector
      * (src/llama-adapter.cpp:104-108): its rows leave the sum at once; nothing of it is cached, a later add of the same
-     * file is a fresh in-process identity (§5.5.1 N-2: two loads never share one).
+     * file is a fresh in-process identity (two loads never share one).
      *
      * @throws IllegalArgumentException when {@code name} is active nowhere
      */
@@ -256,6 +262,74 @@ public final class ControlVector {
     /** True when nothing is active: the extras add nothing. */
     public boolean isEmpty() {
         return entries.isEmpty();
+    }
+
+    // ------------------------------------------------------------------ the load-time surface the engines use
+
+    /**
+     * The set of the configured vectors over the model {@code spec} (llama.cpp
+     * {@code common/common.cpp:1483-1499}): every {@link ControlVectorSpec} file is read and becomes
+     * active at its scale over one shared range, llama.cpp's {@code --control-vector-layer-range} — the configured
+     * start and end, each {@code <= 0} value replaced by llama.cpp's default ({@code 1}, and the model's layer
+     * count), the end clipped to the layers the model has. The entry name is the file's path.
+     *
+     * @throws IOException          when a file cannot be read
+     * @throws GgufFormatException  when a file is not a control vector in the llama.cpp file form or its direction
+     *                              rows are not exactly the model's {@code n_embd} wide
+     * @throws IllegalArgumentException for a start below 1, a start above the end, or a scale that is not finite
+     * @throws IllegalStateException    when one path is listed twice
+     */
+    public static ControlVector load(ModelSpec spec, List<ControlVectorSpec> vectors,
+                                     int layerStart, int layerEnd) throws IOException {
+        Objects.requireNonNull(spec, "spec");
+        Objects.requireNonNull(vectors, "vectors");
+        if (vectors.isEmpty()) {
+            throw new IllegalArgumentException("a control-vector set needs at least one vector");
+        }
+        int nLayer = spec.nLayer();
+        int start = layerStart > 0 ? layerStart : 1;
+        int end = layerEnd > 0 ? Math.min(layerEnd, nLayer) : nLayer;
+        ControlVector set = new ControlVector(nLayer, spec.hparams().nEmbd());
+        for (ControlVectorSpec v : vectors) {
+            set.add(v.path(), v.path(), v.scale(), start, end);
+        }
+        return set;
+    }
+
+    /**
+     * The spec whose trunk layers list {@link LayerSpec.Extras#CONTROL_VECTOR}, so the block registry installs the
+     * set's extras on them; the NextN and encoder stacks are untouched, as llama.cpp applies the vector in the
+     * decoder layers' graph only ({@code build_cvec(cur, il)}, src/models/llama.cpp:223). Layers that list the id
+     * already keep it, so the method is idempotent.
+     */
+    public static ModelSpec applied(ModelSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        boolean anyMissing = false;
+        for (LayerSpec l : spec.layers()) {
+            anyMissing |= !l.hasExtra(LayerSpec.Extras.CONTROL_VECTOR);
+        }
+        if (!anyMissing) {
+            return spec;
+        }
+        ModelSpec.Builder b = ModelSpec.builder(spec.hparams(), spec.tensors())
+                .schedule(spec.schedule())
+                .embedding(spec.embedding())
+                .head(spec.head())
+                .memoryKind(spec.memoryKind());
+        for (LayerSpec l : spec.layers()) {
+            if (l.hasExtra(LayerSpec.Extras.CONTROL_VECTOR)) {
+                b.layer(l);
+            } else {
+                b.layer(LayerSpec.builder(l).extra(LayerSpec.Extras.CONTROL_VECTOR).build());
+            }
+        }
+        for (LayerSpec l : spec.nextnLayers()) {
+            b.nextnLayer(l);
+        }
+        for (LayerSpec l : spec.encoderLayers()) {
+            b.encoderLayer(l);
+        }
+        return b.build();
     }
 
     // ------------------------------------------------------------------ the sum the extras add
@@ -355,8 +429,8 @@ public final class ControlVector {
 
     /**
      * One active vector: its set name, its loaded {@link File}, the scale the sum folds and the 1-based layer range the
-     * add touches. The scale is mutated only by the owning set, on the engine thread (§3.1); the epoch PC-0 mounts
-     * ({@code LoadId}) rises with every scale change.
+     * add touches. The scale is mutated only by the owning set, on the engine thread; the epoch rises with every
+     * scale change.
      */
     public static final class Entry {
 
@@ -406,8 +480,8 @@ public final class ControlVector {
         }
 
         /**
-         * The content digest of the vector (§5.5.1 N-2, PC-8's persistent form), as 64 lowercase hex characters.
-         * In-process identity is (digest, scale bits, layer range, epoch); PC-0 mounts the {@code LoadId} on the epoch.
+         * The content digest of the vector, as 64 lowercase hex characters.
+         * In-process identity is (digest, scale bits, layer range, epoch).
          */
         public String digest() {
             return file.digest();
@@ -438,18 +512,17 @@ public final class ControlVector {
 
     /**
      * The changes of the {@link ControlVector} set, delivered synchronously on the engine thread the set's caller owns
-     * before the change returns — LR-1's {@code LoraListener} events for the engine-global vector set:
+     * before the change returns — the listener events for the engine-global vector set:
      * <ul>
      *   <li>{@link #loaded}: a vector became active; the extras take the layers it now adds from their next snapshot
      *       and rewrite their buffers between steps;</li>
      *   <li>{@link #unloaded}: a vector left the set ({@link ControlVector#unload}); its rows go and nothing of it
      *       is held after the event;</li>
      *   <li>{@link #scaleChanged}: the scale of an active vector changed — a new epoch of the entry ({@link
-     *       Entry#revision()} rose, also back at an earlier value) and of the set's identity with it (§5.5.1 N-2,
-     *       K-4).</li>
+     *       Entry#revision()} rose, also back at an earlier value) and of the set's identity with it.</li>
      * </ul>
      * A failure applies no change and fails the registry call that caused it, as {@code LoraRegistry} fails a hot
-     * unload that an attachment cannot execute (LR-1).
+     * unload that an attachment cannot execute.
      */
     public interface Listener {
 
@@ -468,7 +541,7 @@ public final class ControlVector {
     /**
      * One control-vector GGUF (immutable): the file's path, its shared {@code n_embd}, the file's F32 rows stored the
      * way llama.cpp stores them — {@code direction.<il>}'s row at {@code n_embd * (il - 1)}, one span of
-     * {@code n_embd * maxLayer} floats, gaps zero — its content digest of §5.5.1 N-2. The rows are shared, read only.
+     * {@code n_embd * maxLayer} floats, gaps zero — its content digest. The rows are shared, read only.
      */
     public static final class File {
 
@@ -649,7 +722,7 @@ public final class ControlVector {
             return out;
         }
 
-        /** The digest of the canonical view metadata, the direction table and the exact tensor bytes (§5.5.1 N-2). */
+        /** The digest of the canonical view metadata, the direction table and the exact tensor bytes. */
         private static String digestOf(String arch, int nEmbd, int maxLayer, int[] layers, float[] data,
                                        Map<String, String> metadata, long[] lengthOut) {
             MessageDigest sha;
@@ -708,12 +781,12 @@ public final class ControlVector {
             return java.util.Arrays.copyOfRange(data, off, off + nEmbd);
         }
 
-        /** Scalar metadata of the file as strings (the N-2 canonical view metadata). */
+        /** Scalar metadata of the file as strings (the canonical view metadata). */
         public Map<String, String> metadata() {
             return new TreeMap<>(metadata);
         }
 
-        /** The content digest of the control vector, §5.5.1 N-2's persistent form, 64 hex characters. */
+        /** The content digest of the control vector, 64 hex characters. */
         public String digest() {
             return digest;
         }

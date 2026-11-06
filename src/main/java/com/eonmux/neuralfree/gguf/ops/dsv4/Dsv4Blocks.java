@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuFfnFactory;
+import com.eonmux.neuralfree.gguf.cpu.block.CpuLayerExtra;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixer;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixerFactory;
@@ -21,6 +22,7 @@ import com.eonmux.neuralfree.gguf.ops.dsv4.Dsv4Kernels.RopeParams;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
 import com.eonmux.neuralfree.gguf.ops.sparse.SparseBlocks.IndexerConfig;
 import com.eonmux.neuralfree.gguf.spec.DsaSpec;
+import com.eonmux.neuralfree.gguf.spec.Dsv41Spec;
 import com.eonmux.neuralfree.gguf.spec.Dsv4Spec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -67,14 +69,54 @@ public final class Dsv4Blocks {
         return Collections.emptyList();
     }
 
-    /** No layer extras in this family. */
+    /** No layer extras in this family on the GPU. */
     public static List<GpuLayerExtraFactory> gpuExtras() {
-        return Collections.emptyList();
+        return Collections.<GpuLayerExtraFactory>singletonList(GPU_ENGRAM.INSTANCE);
     }
 
-    /** No layer extras in this family. */
+    /** The CPU Engram n-gram layer extra (DeepSeek-V4.1). */
     public static List<CpuLayerExtraFactory> cpuExtras() {
-        return Collections.emptyList();
+        return Collections.<CpuLayerExtraFactory>singletonList(CPU_ENGRAM.INSTANCE);
+    }
+
+    private enum CPU_ENGRAM implements CpuLayerExtraFactory {
+        INSTANCE;
+
+        @Override
+        public String featureId() {
+            return LayerSpec.Extras.ENGRAM;
+        }
+
+        @Override
+        public CpuLayerExtra create(LayerSpec layer) {
+            Objects.requireNonNull(layer, "layer");
+            return new CpuEngramExtra();
+        }
+
+        @Override
+        public String toString() {
+            return "Dsv4Blocks.cpu(" + LayerSpec.Extras.ENGRAM + ")";
+        }
+    }
+
+    private enum GPU_ENGRAM implements GpuLayerExtraFactory {
+        INSTANCE;
+
+        @Override
+        public String featureId() {
+            return LayerSpec.Extras.ENGRAM;
+        }
+
+        @Override
+        public com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtra create(LayerSpec layer) {
+            Objects.requireNonNull(layer, "layer");
+            return new GpuEngramExtra();
+        }
+
+        @Override
+        public String toString() {
+            return "Dsv4Blocks.gpu(" + LayerSpec.Extras.ENGRAM + ")";
+        }
     }
 
     /**
@@ -173,6 +215,9 @@ public final class Dsv4Blocks {
         static final String IDX_COMP_WGATE = TensorNames.weight(TensorNames.INDEXER_COMPRESSOR_WGATE);
         static final String IDX_COMP_APE = TensorNames.weight(TensorNames.INDEXER_COMPRESSOR_APE);
         static final String IDX_COMP_NORM = TensorNames.weight(TensorNames.INDEXER_COMPRESSOR_NORM);
+        /** V4.1 index-key projection of a compressed row and its norm (models/deepseek41.cpp:196-197). */
+        static final String IDX_K = TensorNames.weight(TensorNames.INDEXER_ATTN_K);
+        static final String IDX_K_NORM = TensorNames.weight(TensorNames.INDEXER_K_NORM);
 
         final String where;
         final int il;
@@ -189,7 +234,10 @@ public final class Dsv4Blocks {
         final int oGroupDim;
         /** Compress ratio: 0 (window only), {@link Dsv4Spec#RATIO_CSA} or {@link Dsv4Spec#RATIO_HCA}. */
         final int ratio;
+        /** Compressed-cache kind: {@link CompMode#SELECTED} on V4 CSA and every V4.1 compressed layer, else dense. */
         final CompMode mode;
+        /** What the attention kernel attends: V4.1 always its selected rows, V4 by the ratio. */
+        final CompMode attnMode;
         /** Raw sliding window {@code n_swa}. */
         final int window;
         /** {@code f_norm_rms_eps} of every RMS norm of the layer. */
@@ -204,14 +252,26 @@ public final class Dsv4Blocks {
         final RopeParams attnParams;
         /** RoPE of the compressed rows (CSA, HCA and indexer compressors). */
         final RopeParams compressParams;
-        /** Indexer heads, head size, plane width and top-k; 0 on non-CSA layers. */
+        /** The rotation of {@link #compressParams} as a kernel spec, null on a window-only layer. */
+        final RopeSpec compressRope;
+        /** RoPE of the V4.1 index key derived from a compressed row, or null without one. */
+        final RopeParams indexerParams;
+        /** Indexer heads, head size, plane width and top-k; 0 on layers without one. */
         final int idxHeads;
         final int idxDim;
         final int idxStateWidth;
         final int topK;
-        /** Indexer configuration inputs (CSA layers only, else null / NaN). */
+        /** Indexer configuration inputs (top-k source layers only, else null / NaN). */
         private final float idxWeightScale;
         private final RopeSpec indexerRope;
+        /** The DeepSeek-V4.1 sharing facet, or null for a DeepSeek-V4 layer. */
+        final Dsv41Spec v41;
+        /** Row width of a V4.1 compressed cache: the compressed KV plus the index key stored beside it. */
+        final int compWidth;
+        /** True when this layer writes its compressed rows (V4 always; V4.1 KV source layers only). */
+        final boolean ownsCompressed;
+        /** True when this layer computes the indexer top-k (V4 always on a selected layer; V4.1 indexer sources). */
+        final boolean computesTopk;
 
         private Dsv4Layout(LayerSpec layer, ModelSpec spec, ShapeSource shapes) {
             checkVariant(layer);
@@ -249,6 +309,14 @@ public final class Dsv4Blocks {
                     : rope(type, nRot, nope, base.freqBase(), 1.0f, 0.0f, 0.0f, 0.0f, 0);
             this.attnParams = params(attnRope);
             this.compressParams = compressed != null ? params(compressed) : null;
+            this.compressRope = compressed;
+
+            this.v41 = v4.dsv41();
+            this.computesTopk = v4.indexer() != null;
+            this.ownsCompressed = ratio != 0 && (v41 == null || v41.ownsCompressed());
+            this.compWidth = headDim + (v41 != null ? v41.indexerHeadDim() : 0);
+            this.attnMode = v41 != null && ratio != 0 ? CompMode.SELECTED : mode;
+            Dsv4Kernels.checkRowWidth(compWidth);
 
             matrix(shapes, WQ_A, nEmbd, qLora);
             vector(shapes, Q_A_NORM, qLora);
@@ -260,23 +328,39 @@ public final class Dsv4Blocks {
             if (sinks) {
                 vector(shapes, SINKS, nHead);
             }
-            if (ratio != 0) {
+            int idxHeads = 0;
+            int idxDim = 0;
+            int idxStateWidth = 0;
+            int topK = 0;
+            float idxWeightScale = Float.NaN;
+            RopeSpec idxRope = null;
+            if (ratio != 0 && ownsCompressed) {
                 matrix(shapes, COMP_WKV, nEmbd, stateWidth);
-                matrix(shapes, COMP_WGATE, nEmbd, stateWidth);
-                matrix(shapes, COMP_APE, stateWidth, ratio);
+                if (ratio > 1) {
+                    matrix(shapes, COMP_WGATE, nEmbd, stateWidth);
+                }
                 vector(shapes, COMP_NORM, headDim);
+                if (v41 == null) {
+                    matrix(shapes, COMP_APE, stateWidth, ratio);
+                } else {
+                    idxDim = v41.indexerHeadDim();
+                    matrix(shapes, IDX_K, headDim, idxDim);
+                    vector(shapes, IDX_K_NORM, idxDim);
+                    idxRope = rope(type, nRot, idxDim - nRot, compressed.freqBase(), compressed.freqScale(),
+                            compressed.extFactor(), compressed.betaFast(), compressed.betaSlow(),
+                            compressed.nCtxOrig());
+                }
             }
-            if (mode == CompMode.SELECTED) {
+            if (computesTopk) {
                 DsaSpec dsa = v4.indexer();
-                this.idxHeads = dsa.indexerHeads();
-                this.idxDim = dsa.indexerHeadDim();
-                this.idxStateWidth = Dsv4Kernels.stateWidth(Dsv4Spec.RATIO_CSA, idxDim);
-                this.topK = dsa.topK();
-                this.idxWeightScale = dsa.weightScale();
+                idxHeads = dsa.indexerHeads();
+                idxDim = dsa.indexerHeadDim();
+                topK = dsa.topK();
+                idxWeightScale = dsa.weightScale();
                 Dsv4Kernels.checkRowWidth(idxDim);
                 if (!dsa.full() || dsa.kpool() != 0) {
-                    throw new IllegalStateException(where + ": every DeepSeek-V4 CSA layer scores its own unpooled"
-                            + " indexer rows (deepseek4.cpp:590-660), the spec says full=" + dsa.full() + ", kpool="
+                    throw new IllegalStateException(where + ": every DeepSeek-V4 indexer source scores its own"
+                            + " unpooled rows (deepseek4.cpp:590-660), the spec says full=" + dsa.full() + ", kpool="
                             + dsa.kpool());
                 }
                 if (dsa.indexerRopeDim() != nRot || dsa.ropeType() != type || !dsa.ropeTail() || nRot > idxDim) {
@@ -285,22 +369,40 @@ public final class Dsv4Blocks {
                             + " (deepseek4.cpp:600-616), its spec says " + dsa.indexerRopeDim() + " dims of "
                             + dsa.ropeType() + (dsa.ropeTail() ? " at the tail" : " at the head"));
                 }
-                this.indexerRope = rope(type, nRot, idxDim - nRot, compressed.freqBase(), compressed.freqScale(),
+                idxRope = rope(type, nRot, idxDim - nRot, compressed.freqBase(), compressed.freqScale(),
                         compressed.extFactor(), compressed.betaFast(), compressed.betaSlow(), compressed.nCtxOrig());
                 matrix(shapes, IDX_Q_B, qLora, (long) idxHeads * idxDim);
                 matrix(shapes, IDX_PROJ, nEmbd, idxHeads);
-                matrix(shapes, IDX_COMP_WKV, nEmbd, idxStateWidth);
-                matrix(shapes, IDX_COMP_WGATE, nEmbd, idxStateWidth);
-                matrix(shapes, IDX_COMP_APE, idxStateWidth, Dsv4Spec.RATIO_CSA);
-                vector(shapes, IDX_COMP_NORM, idxDim);
-            } else {
-                this.idxHeads = 0;
-                this.idxDim = 0;
-                this.idxStateWidth = 0;
-                this.topK = 0;
-                this.idxWeightScale = Float.NaN;
-                this.indexerRope = null;
+                if (v41 == null) {
+                    idxStateWidth = Dsv4Kernels.stateWidth(Dsv4Spec.RATIO_CSA, idxDim);
+                    matrix(shapes, IDX_COMP_WKV, nEmbd, idxStateWidth);
+                    matrix(shapes, IDX_COMP_WGATE, nEmbd, idxStateWidth);
+                    matrix(shapes, IDX_COMP_APE, idxStateWidth, Dsv4Spec.RATIO_CSA);
+                    vector(shapes, IDX_COMP_NORM, idxDim);
+                }
+            } else if (v41 != null) {
+                idxHeads = v41.indexerHeads();
+                idxDim = v41.indexerHeadDim();
+                topK = v41.indexerTopK();
             }
+            if (v41 != null) {
+                idxHeads = idxHeads == 0 ? v41.indexerHeads() : idxHeads;
+                idxDim = idxDim == 0 ? v41.indexerHeadDim() : idxDim;
+                topK = topK == 0 ? v41.indexerTopK() : topK;
+                if (idxHeads != v41.indexerHeads() || idxDim != v41.indexerHeadDim() || topK != v41.indexerTopK()
+                        || compWidth != headDim + idxDim) {
+                    throw new IllegalStateException(where + ": the indexer tensors and the V4.1 facet disagree: tensors "
+                            + idxHeads + " x " + idxDim + " top " + topK + " beside " + (compWidth - headDim)
+                            + ", facet " + v41);
+                }
+            }
+            this.idxHeads = idxHeads;
+            this.idxDim = idxDim;
+            this.idxStateWidth = idxStateWidth;
+            this.topK = topK;
+            this.idxWeightScale = idxWeightScale;
+            this.indexerRope = idxRope;
+            this.indexerParams = idxRope != null ? params(idxRope) : null;
         }
 
         /**
@@ -329,6 +431,16 @@ public final class Dsv4Blocks {
             }
         }
 
+        /** The kernel spec of the compressed-row rotation, or null on a window-only layer. */
+        RopeSpec compressRope() {
+            return compressRope;
+        }
+
+        /** The kernel spec of the V4.1 index-key rotation, or null without an index key. */
+        RopeSpec indexerRope() {
+            return indexerRope;
+        }
+
         /**
          * The lightning-indexer configuration of a CSA layer (deepseek4.cpp:590-660): the indexer heads, top-k and
          * {@code 1 / sqrt(idx_dim * idx_heads)} weight scale of its {@link DsaSpec}, the compress-base RoPE on the
@@ -339,16 +451,17 @@ public final class Dsv4Blocks {
          * @throws IllegalStateException on a non-CSA layer
          */
         IndexerConfig indexerConfig(int lidRotBlock) {
-            if (mode != CompMode.SELECTED) {
-                throw new IllegalStateException(where + ": only CSA layers (ratio " + Dsv4Spec.RATIO_CSA
-                        + ") have a lightning indexer");
+            if (!computesTopk) {
+                throw new IllegalStateException(where + ": only indexer source layers have a lightning indexer");
             }
+            // V4.1 index keys sit inside the compressed rows and carry no Hadamard rotation
+            int rot = v41 != null ? 0 : lidRotBlock;
             return IndexerConfig.builder()
                     .heads(idxHeads, idxDim)
                     .topK(topK)
                     .weightScale(idxWeightScale)
                     .rope(indexerRope, idxDim - nRot)
-                    .rotationBlock(lidRotBlock)
+                    .rotationBlock(rot)
                     .keyNormEps(rmsEps)
                     .mask(KvWindow.FULL_CAUSAL)
                     .build();
@@ -399,6 +512,20 @@ public final class Dsv4Blocks {
          * @throws IllegalStateException otherwise
          */
         void checkCompressedPlan(CompressedKvPlan p, KvDType rawType) {
+            if (v41 != null) {
+                if (p.kind() == CompressedKvPlan.Kind.INDEXER) {
+                    throw new IllegalStateException(where + ": DeepSeek-V4.1 stores the index key inside the"
+                            + " compressed row, an indexer cache is not planned");
+                }
+                if (p.ratio() != ratio || p.width() != compWidth || p.dtype() != rawType || p.overlap()
+                        || p.stateRows() != Dsv4Kernels.stateRows(ratio)
+                        || p.stateWidth() != Dsv4Kernels.stateWidth(ratio, headDim)) {
+                    throw new IllegalStateException(where + ": the " + p.kind() + " cache must have ratio " + ratio
+                            + ", rows of " + compWidth + " " + rawType + " values, a non-overlapping " + ratio + " x "
+                            + headDim + " compressor plane, got " + p);
+                }
+                return;
+            }
             boolean indexer = p.kind() == CompressedKvPlan.Kind.INDEXER;
             int r = indexer ? Dsv4Spec.RATIO_CSA : ratio;
             int width = indexer ? idxDim : headDim;

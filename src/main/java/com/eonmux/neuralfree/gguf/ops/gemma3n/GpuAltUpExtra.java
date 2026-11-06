@@ -116,6 +116,12 @@ public final class GpuAltUpExtra implements GpuLayerExtra {
     private GpuBuffer boundX;
     private int boundXOff;
 
+    /** The predict, correct and merge passes transform whole rows of x and the streams, exact over any step layout. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
     @Override
     public void bind(GpuForwardContext ctx, LayerSpec layer) {
         Objects.requireNonNull(ctx, "ctx");
@@ -418,6 +424,12 @@ public final class GpuAltUpExtra implements GpuLayerExtra {
         private ScratchSlot normed;
         private ScratchSlot low;
         private ScratchSlot out;
+
+        /** The low-rank residual is per row of x and the attention-norm output, exact over any step layout. */
+        @Override
+        public String batchRefusal() {
+            return null;
+        }
 
         @Override
         public void bind(GpuForwardContext ctx, LayerSpec layer) {

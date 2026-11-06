@@ -49,12 +49,16 @@ public final class HcSubBlock {
     static final String TEMP_MIXES = "hc.mixes";
     /** Scratch temporary: pre coefficients ({@code ubatch * hc}). */
     static final String TEMP_PRE = "hc.pre";
+    /** Scratch temporary: DeepSeek-V4.1 pre-mix of the previous sub-block, shared by the layer extras ({@code ubatch * hc}). */
+    static final String TEMP_PREVIOUS_PRE = "hc.previous.pre";
     /** Scratch temporary: post coefficients or qwen4exp inject logits ({@code ubatch * hc}). */
     static final String TEMP_POST = "hc.post";
     /** Scratch temporary: Sinkhorn comb ({@code ubatch * hc * hc}). */
     static final String TEMP_COMB = "hc.comb";
     /** Scratch temporary: low-rank gate activations ({@code ubatch * rank}). */
     static final String TEMP_LOW_RANK = "hc.lowrank";
+    /** Scratch temporary: merged {@code hc_*_down_inject} output rows before the split ({@code ubatch * (rank + hc)}). */
+    static final String TEMP_MERGED_DOWN = "hc.merged_down";
     /** Scratch temporary: per-element gate logits ({@code ubatch * hc * n_embd}). */
     static final String TEMP_GATE = "hc.gate";
     /** Scratch temporary: collapsed head rows ({@code ubatch * n_embd}). */
@@ -117,13 +121,15 @@ public final class HcSubBlock {
     private final TensorRef down;
     private final TensorRef up;
     private final TensorRef inject;
+    /** Merged {@code [hc_*_down | hc_*_inject]} weight; null unless the GATED variant reads one. */
+    private final TensorRef downInject;
     private final CoefficientParams coefficients;
     private final PreParams pre;
     private final PostParams post;
 
     private HcSubBlock(Kind kind, String site, int il, int hc, int nEmbd, float normEps, TensorRef fn,
                        TensorRef scale, TensorRef base, TensorRef norm, TensorRef down, TensorRef up, TensorRef inject,
-                       CoefficientParams coefficients, PreParams pre, PostParams post) {
+                       TensorRef downInject, CoefficientParams coefficients, PreParams pre, PostParams post) {
         this.kind = kind;
         this.site = site;
         this.il = il;
@@ -137,6 +143,7 @@ public final class HcSubBlock {
         this.down = down;
         this.up = up;
         this.inject = inject;
+        this.downInject = downInject;
         this.coefficients = coefficients;
         this.pre = pre;
         this.post = post;
@@ -167,6 +174,18 @@ public final class HcSubBlock {
         TensorCatalog tc = spec.tensors();
         String stack = layer.stack();
         int wl = layer.weightLayer();
+        // the converter's merged [down | inject] weight wins over the separate pair (qwen4exp.cpp:233-248)
+        TensorRef downInject = tc.layer(stack, wl, TensorNames.weight(ffn ? TensorNames.HC_FFN_DOWN_INJECT
+                : TensorNames.HC_ATTN_DOWN_INJECT));
+        if (downInject != null) {
+            TensorRef norm = tc.require(stack, wl, TensorNames.weight(ffn ? TensorNames.HC_FFN_NORM
+                    : TensorNames.HC_ATTN_NORM));
+            TensorRef up = tc.require(stack, wl, TensorNames.weight(ffn ? TensorNames.HC_FFN_UP
+                    : TensorNames.HC_ATTN_UP));
+            checkMergedGated(arch, layer.il(), hc, nEmbd, norm, downInject, up);
+            return new HcSubBlock(Kind.GATED, site, layer.il(), hc, nEmbd, hp.normRmsEps(), null, null, null, norm,
+                    null, up, null, downInject, null, PreParams.gated(hc), PostParams.gatedInjectPreScaled(hc));
+        }
         TensorRef inject = tc.layer(stack, wl, TensorNames.weight(ffn ? TensorNames.HC_FFN_INJECT
                 : TensorNames.HC_ATTN_INJECT));
         if (inject != null) {
@@ -179,7 +198,7 @@ public final class HcSubBlock {
             checkGated(arch, layer.il(), hc, nEmbd, norm, down, up);
             requireShape(arch, layer.il(), inject, (long) hc * nEmbd, hc);
             return new HcSubBlock(Kind.GATED, site, layer.il(), hc, nEmbd, hp.normRmsEps(), null, null, null, norm,
-                    down, up, inject, null, PreParams.gated(hc), PostParams.gatedInject(hc));
+                    down, up, inject, null, null, PreParams.gated(hc), PostParams.gatedInject(hc));
         }
         TensorRef fn = tc.require(stack, wl, TensorNames.weight(ffn ? TensorNames.HC_FFN_FN : TensorNames.HC_ATTN_FN));
         TensorRef scale = tc.require(stack, wl, TensorNames.weight(ffn ? TensorNames.HC_FFN_SCALE
@@ -206,7 +225,7 @@ public final class HcSubBlock {
         }
         checkProjected(arch, layer.il(), hc, nEmbd, fn, scale, base, coef);
         return new HcSubBlock(kind, site, layer.il(), hc, nEmbd, hp.normRmsEps(), fn, scale, base, null, null, null,
-                null, coef, PreParams.weights(), post);
+                null, null, coef, PreParams.weights(), post);
     }
 
     /**
@@ -249,7 +268,7 @@ public final class HcSubBlock {
             }
             checkProjected(arch, -1, hc, nEmbd, fn, scale, base, coef);
             return new HcSubBlock(Kind.HEAD_WEIGHTS, "head", -1, hc, nEmbd, hp.normRmsEps(), fn, scale, base, null,
-                    null, null, null, coef, PreParams.weights(), null);
+                    null, null, null, null, coef, PreParams.weights(), null);
         }
         TensorRef down = tc.get(TensorNames.weight(TensorNames.HC_HEAD_DOWN));
         if (down != null) {
@@ -257,10 +276,10 @@ public final class HcSubBlock {
             TensorRef up = tc.require(TensorNames.weight(TensorNames.HC_HEAD_UP));
             checkGated(arch, -1, hc, nEmbd, norm, down, up);
             return new HcSubBlock(Kind.HEAD_GATED, "head", -1, hc, nEmbd, hp.normRmsEps(), null, null, null, norm,
-                    down, up, null, null, PreParams.gated(hc), null);
+                    down, up, null, null, null, PreParams.gated(hc), null);
         }
         return new HcSubBlock(Kind.HEAD_MEAN, "head", -1, hc, nEmbd, hp.normRmsEps(), null, null, null, null, null,
-                null, null, null, PreParams.mean(hc), null);
+                null, null, null, null, PreParams.mean(hc), null);
     }
 
     /**
@@ -292,7 +311,7 @@ public final class HcSubBlock {
         TensorRef up = tc.require(stack, wl, TensorNames.weight(TensorNames.NEXTN_HC_HEAD_UP));
         checkGated(arch, block.il(), hc, nEmbd, norm, down, up);
         return new HcSubBlock(Kind.HEAD_GATED, "head", block.il(), hc, nEmbd, spec.hparams().normRmsEps(), null, null,
-                null, norm, down, up, null, null, PreParams.gated(hc), null);
+                null, norm, down, up, null, null, null, PreParams.gated(hc), null);
     }
 
     private static void checkProjected(String arch, int il, int hc, int nEmbd, TensorRef fn, TensorRef scale,
@@ -328,6 +347,25 @@ public final class HcSubBlock {
                     + ", rank], got " + down);
         }
         requireShape(arch, il, up, down.rows(), streamWidth);
+    }
+
+    /**
+     * The merged gated form: {@code hc_*_down_inject} is {@code [hc*n_embd, rank + hc]}, the {@code hc_*_down} rows
+     * followed by the {@code hc}-row inject tail (qwen4exp.cpp:253-259, 368-374), and {@code up} is
+     * {@code [rank, hc*n_embd]}.
+     */
+    private static void checkMergedGated(String arch, int il, int hc, int nEmbd, TensorRef norm,
+                                         TensorRef downInject, TensorRef up) {
+        long streamWidth = (long) hc * nEmbd;
+        if (norm.numElements() != streamWidth) {
+            throw new IllegalArgumentException(where(arch, il) + norm.name() + " must hold " + streamWidth
+                    + " gammas ([" + nEmbd + ", " + hc + "] or flattened), got " + norm);
+        }
+        if (downInject.cols() != streamWidth || downInject.rows() <= hc) {
+            throw new IllegalArgumentException(where(arch, il) + downInject.name() + " must be [" + streamWidth
+                    + ", rank + " + hc + "] with rank >= 1, got " + downInject);
+        }
+        requireShape(arch, il, up, downInject.rows() - hc, streamWidth);
     }
 
     private static void requireShape(String arch, int il, TensorRef t, long cols, long rows) {
@@ -376,17 +414,28 @@ public final class HcSubBlock {
      */
     public TensorRef norm() { return norm; }
 
-    /** Low-rank down projection {@code [hc*n_embd, rank]}; null unless {@link Kind#gated()}. */
+    /** Low-rank down projection {@code [hc*n_embd, rank]}; null unless the separate gated form. */
     public TensorRef down() { return down; }
 
     /** Low-rank up projection {@code [rank, hc*n_embd]}; null unless {@link Kind#gated()}. */
     public TensorRef up() { return up; }
 
-    /** Inject projection {@code [hc*n_embd, hc]}; null unless {@link Kind#GATED}. */
+    /** Inject projection {@code [hc*n_embd, hc]}; null unless the separate gated form. */
     public TensorRef inject() { return inject; }
 
+    /**
+     * Merged {@code [hc*n_embd, rank + hc]} weight holding the {@code hc_*_down} rows and then the
+     * {@code hc_*_inject} rows (qwen4exp.cpp:363-380); null unless the merged gated form.
+     */
+    public TensorRef downInject() { return downInject; }
+
     /** Low-rank width; 0 unless {@link Kind#gated()}. */
-    public int lowRank() { return down == null ? 0 : (int) down.rows(); }
+    public int lowRank() {
+        if (down != null) {
+            return (int) down.rows();
+        }
+        return downInject == null ? 0 : (int) (downInject.rows() - hc);
+    }
 
     /** Scale applied to the low-rank activations before the SiLU: {@code 1/hc} (qwen4exp.cpp:332). */
     public float lowRankScale() { return 1.0f / hc; }
@@ -406,6 +455,6 @@ public final class HcSubBlock {
     @Override
     public String toString() {
         return "HcSubBlock{" + kind + ", " + site + (il >= 0 ? " " + il : "") + ", hc=" + hc + ", nEmbd=" + nEmbd
-                + (down != null ? ", rank=" + lowRank() : "") + '}';
+                + (kind.gated() && lowRank() > 0 ? ", rank=" + lowRank() : "") + '}';
     }
 }

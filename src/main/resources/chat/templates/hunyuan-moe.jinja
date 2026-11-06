@@ -1,0 +1,11 @@
+{#- llama.cpp hunyuan-moe chat template (src/llama-chat.cpp:808-819): no generation prompt. -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- '<|startoftext|>' ~ content ~ '<|extra_4|>' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- content ~ '<|eos|>' -}}
+    {%- else -%}
+        {{- '<|startoftext|>' ~ content ~ '<|extra_0|>' -}}
+    {%- endif -%}
+{%- endfor -%}

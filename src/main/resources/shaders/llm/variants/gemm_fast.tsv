@@ -1,0 +1,113 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Int8 MMQ GEMM of the llama.cpp MMQ weight types, its split-K twin and the small-token-tile _S
+# twins (kernels/llm/matmul_mmq.cl via kernels/llm/common/matmul_mmq_family.h), the MMQ activation
+# staging (kernels/llm/quant_mmq_q8_1.cl),
+# the cooperative-matrix GEMM of the dense 16-bit weight types (kernels/llm/matmul_mma.cl via
+# kernels/llm/common/matmul_mma_family.h), the quantized-weight cooperative-matrix GEMM and its
+# split-K twin (shaders/llm/matmul_mmq_cm.comp; their portable scalar rows are kernels/llm/matmul_cm.cl)
+# and the split-K reduce (kernels/llm/split_k_reduce.cl).
+LLM_Quant_MMQ_Q8_1	quant_mmq.comp
+LLM_Quant_MMQ_Int8Static	quant_mmq.comp	NF_Q8_OP=1
+LLM_Quant_MMQ_Int8Row	quant_mmq.comp	NF_Q8_OP=2	sg
+LLM_Quant_MMQ_Int8Group128	quant_mmq.comp	NF_Q8_OP=3	sg
+LLM_Quant_MMQ_Int8Asym	quant_mmq.comp	NF_Q8_OP=4
+Q4_0_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q4_0
+Q4_1_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q4_1
+Q5_0_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q5_0
+Q5_1_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q5_1
+Q8_0_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q8_0
+Q2_K_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q2_K
+Q3_K_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q3_K
+Q4_K_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q4_K
+Q5_K_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q5_K
+Q6_K_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_Q6_K
+IQ1_S_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ1_S
+IQ2_XXS_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ2_XXS
+IQ2_XS_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ2_XS
+IQ2_S_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ2_S
+IQ3_XXS_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ3_XXS
+IQ3_S_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ3_S
+IQ4_NL_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ4_NL
+IQ4_XS_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_IQ4_XS
+I8_B128_MatMul_MMQ	matmul_mmq.comp	QTYPE=QT_I8_B128
+Q4_0_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q4_0
+Q4_1_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q4_1
+Q5_0_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q5_0
+Q5_1_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q5_1
+Q8_0_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q8_0
+Q2_K_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q2_K
+Q3_K_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q3_K
+Q4_K_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q4_K
+Q5_K_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q5_K
+Q6_K_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_Q6_K
+IQ1_S_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ1_S
+IQ2_XXS_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ2_XXS
+IQ2_XS_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ2_XS
+IQ2_S_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ2_S
+IQ3_XXS_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ3_XXS
+IQ3_S_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ3_S
+IQ4_NL_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ4_NL
+IQ4_XS_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_IQ4_XS
+I8_B128_MatMul_MMQ_S	matmul_mmq.comp	QTYPE=QT_I8_B128
+Q4_0_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_0
+Q4_1_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_1
+Q5_0_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_0
+Q5_1_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_1
+Q8_0_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q8_0
+Q2_K_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q2_K
+Q3_K_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q3_K
+Q4_K_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_K
+Q5_K_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_K
+Q6_K_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_Q6_K
+IQ1_S_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ1_S
+IQ2_XXS_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ2_XXS
+IQ2_XS_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ2_XS
+IQ2_S_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ2_S
+IQ3_XXS_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ3_XXS
+IQ3_S_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ3_S
+IQ4_NL_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ4_NL
+IQ4_XS_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_IQ4_XS
+I8_B128_MatMul_MMQ_KSplit	matmul_mmq.comp	NF_SPLIT_K=1 QTYPE=QT_I8_B128
+Q4_0_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q4_0	sg
+Q4_1_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q4_1	sg
+Q5_0_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q5_0	sg
+Q5_1_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q5_1	sg
+Q8_0_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q8_0	sg
+Q2_K_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q2_K	sg
+Q3_K_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q3_K	sg
+Q4_K_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q4_K	sg
+Q5_K_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q5_K	sg
+Q6_K_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_Q6_K	sg
+IQ1_S_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ1_S	sg
+IQ2_XXS_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ2_XXS	sg
+IQ2_XS_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ2_XS	sg
+IQ2_S_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ2_S	sg
+IQ3_XXS_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ3_XXS	sg
+IQ3_S_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ3_S	sg
+IQ4_NL_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ4_NL	sg
+IQ4_XS_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_IQ4_XS	sg
+I8_B128_MatMul_CM	matmul_mmq_cm.comp	QTYPE=QT_I8_B128	sg
+Q4_0_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_0	sg
+Q4_1_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_1	sg
+Q5_0_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_0	sg
+Q5_1_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_1	sg
+Q8_0_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q8_0	sg
+Q2_K_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q2_K	sg
+Q3_K_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q3_K	sg
+Q4_K_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q4_K	sg
+Q5_K_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q5_K	sg
+Q6_K_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_Q6_K	sg
+IQ1_S_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ1_S	sg
+IQ2_XXS_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ2_XXS	sg
+IQ2_XS_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ2_XS	sg
+IQ2_S_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ2_S	sg
+IQ3_XXS_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ3_XXS	sg
+IQ3_S_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ3_S	sg
+IQ4_NL_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ4_NL	sg
+IQ4_XS_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_IQ4_XS	sg
+I8_B128_MatMul_CM_KSplit	matmul_mmq_cm.comp	NF_SPLIT_K=1 QTYPE=QT_I8_B128	sg
+F16_MatMul_MMA	matmul_mma.comp		sg
+BF16_MatMul_MMA	matmul_mma.comp	NF_MMA_BF16=1	sg
+F16_MatMul_MMA_KSplit	matmul_mma.comp	NF_SPLIT_K=1	sg
+BF16_MatMul_MMA_KSplit	matmul_mma.comp	NF_MMA_BF16=1 NF_SPLIT_K=1	sg
+LLM_SplitK_Reduce	split_k_reduce.comp

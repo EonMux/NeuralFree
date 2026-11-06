@@ -79,7 +79,7 @@ public final class Json {
         public static final Limits PYTHON = STRICT.withDuplicateKeys(DuplicateKeys.LAST_WINS);
 
         /**
-         * Caps for input from outside the trust boundary (§3.6): depth 128, 16 MiB, 4 Mi values, 8 Mi UTF-16 chars
+         * Caps for input from outside the trust boundary: depth 128, 16 MiB, 4 Mi values, 8 Mi UTF-16 chars
          * per string, 1 Mi members per container; duplicate keys are rejected and NaN, Infinity, -Infinity too.
          */
         public static final Limits UNTRUSTED = new Limits(128, 4_194_304L, 8_388_608, DuplicateKeys.REJECT,
@@ -95,7 +95,7 @@ public final class Json {
 
         /**
          * Bounds with the bytes, members and constants fields unbounded, so the constants built above and every
-         * existing caller keep HF.md's behaviour.
+         * existing caller keep their behaviour.
          *
          * @param maxDepth       deepest nesting of objects and arrays (the outermost container is depth 1)
          * @param maxValues      most values in a document, containers included and object keys excluded
@@ -232,10 +232,13 @@ public final class Json {
      * precedes the decode. Positions are byte offsets for encoding errors and character offsets into the decoded
      * text otherwise.
      *
+     * @throws IllegalArgumentException when {@code bytes} is null or {@code [off, off+len)} is not inside it
      * @throws JsonException when the range is too large, is not UTF-8 or is not a valid document within {@code limits}
      */
     public static Object parse(byte[] bytes, int off, int len, Limits limits) {
-        Objects.requireNonNull(bytes, "bytes");
+        if (bytes == null) {
+            throw new IllegalArgumentException("bytes must not be null");
+        }
         Objects.requireNonNull(limits, "limits");
         if (off < 0 || len < 0 || off > bytes.length - len) {
             throw new IllegalArgumentException(

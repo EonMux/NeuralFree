@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hparams.hooks;
 
+import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.GatingFunc;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
@@ -84,6 +85,31 @@ public final class MoeHooksMla {
         MoeHooksSupport.requireExpertsAfterLead(b, "deepseek2", b.nLayerAll());           // tensors :128-133
     }
 
+    /**
+     * vLLM's {@code AXK1ForCausalLM} (AXK1.py): the deepseek2 MLA and routed-expert hparams with the llama 4 query
+     * temperature ({@code attention.temperature_scale}/{@code _length}, offset 0), an optional Q LoRA rank (0 when
+     * the checkpoint has no {@code q_a_proj}) and sigmoid routing by default, vLLM's AXK1 scoring. The sparse layers
+     * are the contiguous block after the dense lead; their extra post-MLP norm arrives as {@code post_ffw_norm}.
+     */
+    public static void axk1(ModelHparamsBuilder b, GgufKv kv) {
+        rmsEps(b, kv);
+        b.nLayerDenseLead(kv.u32(GgufKeys.LEADING_DENSE_BLOCK_COUNT, b.nLayerDenseLead()));
+        b.nLoraQ(kv.u32(GgufKeys.ATTENTION_Q_LORA_RANK, 0));
+        b.nLoraKv(kv.u32Required(GgufKeys.ATTENTION_KV_LORA_RANK));
+        readMlaHeads(b, kv, false);
+        HparamsSupport.readExpertFfLength(b, kv, true);
+        b.nExpertShared(kv.u32Required(GgufKeys.EXPERT_SHARED_COUNT));
+        b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, b.expertWeightsScale()));
+        b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, b.expertWeightsNorm()));
+        b.gating(gating(kv, GatingFunc.SIGMOID));
+        readYarnLogMul(b, kv);
+        b.attnTempScale(kv.f32(GgufKeys.ATTENTION_TEMPERATURE_SCALE, b.attnTempScale()));
+        b.attnTempFloorScale(kv.u32(GgufKeys.ATTENTION_TEMPERATURE_LENGTH, b.attnTempFloorScale()));
+        b.attnTempOffset(0.0f);
+        requireQkNope(b, "axk1");
+        MoeHooksSupport.requireExpertsAfterLead(b, "axk1", b.nLayerAll());
+    }
+
     /** models/deepseek2ocr.cpp:3-15 (the deepseek2 graph without MLA). */
     public static void deepseek2ocr(ModelHparamsBuilder b, GgufKv kv) {
         rmsEps(b, kv);                                                                    // :5
@@ -124,6 +150,30 @@ public final class MoeHooksMla {
      * index and is applied by the model loader, not here.
      */
     public static void deepseek4(ModelHparamsBuilder b, GgufKv kv) {
+        deepseek4Core(b, kv, false);
+    }
+
+    /**
+     * models/deepseek41.cpp:27-132: the DeepSeek-V4 hparams plus the V4.1 cross-layer sharing and Engram layers.
+     * Compressed layers use ratios 2 (selected) and 1 (dense); each reads the latest KV source at or before it
+     * ({@code attention.kv_source_layers}) and the latest indexer source ({@code attention.indexer.source_layers}),
+     * which must be at or after the KV source and share its ratio. The optional candidate selection names an index
+     * source plus its block size and block count. Engram layers hash n-grams through one shared token table. No
+     * hyper-connection head: the final stream collapses with the last FFN's pre-mix.
+     */
+    public static void deepseek41(ModelHparamsBuilder b, GgufKv kv) {
+        deepseek4Core(b, kv, true);
+        b.nEmbdOutImpl(b.nEmbd());                                                        // :30
+        if (b.indexerTopK() <= 0) {
+            throw new GgufFormatException("DeepSeek-V4.1 requires '" + kv.key(GgufKeys.ATTENTION_INDEXER_TOP_K)
+                    + "' > 0, got " + b.indexerTopK());
+        }
+        readDsv41Sources(b, kv);                                                          // :35-86
+        readEngram(b, kv);                                                                // :88-131
+    }
+
+    /** The DeepSeek-V4 hparams shared by {@link #deepseek4} and {@link #deepseek41}. */
+    private static void deepseek4Core(ModelHparamsBuilder b, GgufKv kv, boolean v41) {
         rmsEps(b, kv);                                                                    // :28
         b.nLoraQ(kv.u32Required(GgufKeys.ATTENTION_Q_LORA_RANK));                         // :29
         b.nSwa(kv.u32Required(GgufKeys.ATTENTION_SLIDING_WINDOW));                        // :30
@@ -144,7 +194,7 @@ public final class MoeHooksMla {
         b.dsv4HcEps(kv.f32Required(GgufKeys.HYPER_CONNECTION_EPSILON));                   // :50
         b.dsv4HashLayerCount(kv.u32Required(GgufKeys.HASH_LAYER_COUNT));                  // :51
         b.nEmbdOutImpl(b.dsv4HcMult() * b.nEmbd());                                       // :53
-        readCompressRatios(b, kv);                                                        // :55-61
+        readCompressRatios(b, kv, v41);                                                   // :55-61
         GatingFunc g = requiredGating(kv);                                                // :63
         if (g != GatingFunc.SQRT_SOFTPLUS) {                                              // :64-66
             throw new GgufFormatException("deepseek4: expected sqrtsoftplus MoE scoring, got " + g);
@@ -156,6 +206,168 @@ public final class MoeHooksMla {
         for (int il = b.nLayer(); il < b.nLayerAll(); il++) {                             // :72-74
             b.isSwa(il, true);
         }
+    }
+
+    /**
+     * DeepSeek-V4.1 compressed-cache sharing and candidate selection (models/deepseek41.cpp:35-86).
+     */
+    private static void readDsv41Sources(ModelHparamsBuilder b, GgufKv kv) {
+        int[] kvSrc = requiredU32Array(kv, GgufKeys.ATTENTION_KV_SOURCE_LAYERS);
+        int[] idxSrc = requiredU32Array(kv, GgufKeys.ATTENTION_INDEXER_SOURCE_LAYERS);
+        int nLayer = b.nLayer();
+        for (int il : kvSrc) {
+            if (il < 0 || il >= nLayer) {
+                throw new GgufFormatException("deepseek41: attention.kv_source_layers lists layer " + il
+                        + ", outside [0, " + nLayer + ")");
+            }
+        }
+        for (int il : idxSrc) {
+            if (il < 0 || il >= nLayer) {
+                throw new GgufFormatException("deepseek41: attention.indexer.source_layers lists layer " + il
+                        + ", outside [0, " + nLayer + ")");
+            }
+        }
+        int lastKv = -1;
+        int lastIdx = -1;
+        for (int il = 0; il < nLayer; il++) {
+            int ratio = b.compressRatio(il);
+            boolean isKv = contains(kvSrc, il);
+            boolean isIdx = contains(idxSrc, il);
+            if ((isKv || isIdx) && ratio == 0) {
+                throw new GgufFormatException("deepseek41: layer " + il + " is listed in '"
+                        + kv.key(GgufKeys.ATTENTION_KV_SOURCE_LAYERS) + "' or '"
+                        + kv.key(GgufKeys.ATTENTION_INDEXER_SOURCE_LAYERS) + "' but has compress ratio 0");
+            }
+            lastKv = isKv ? il : lastKv;
+            lastIdx = isIdx ? il : lastIdx;
+            if (ratio == 0) {
+                continue;
+            }
+            if (lastKv < 0 || lastIdx < lastKv || b.compressRatio(lastKv) != ratio
+                    || b.compressRatio(lastIdx) != ratio) {
+                throw new GgufFormatException("deepseek41: layer " + il + " has compress ratio " + ratio
+                        + " without a matching source in '" + kv.key(GgufKeys.ATTENTION_KV_SOURCE_LAYERS) + "' and '"
+                        + kv.key(GgufKeys.ATTENTION_INDEXER_SOURCE_LAYERS) + "' (kv " + lastKv + ", indexer "
+                        + lastIdx + ")");
+            }
+            b.dsv41KvSource(il, lastKv);
+            b.dsv41TopkSource(il, lastIdx);
+        }
+
+        int cand = kv.u32(GgufKeys.ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, -1);
+        if (cand >= 0) {
+            int topKBlocks = kv.u32Required(GgufKeys.ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS);
+            int blockSize = kv.u32Required(GgufKeys.ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE);
+            if (cand >= nLayer || b.dsv41TopkSource(cand) != cand || topKBlocks <= 0 || blockSize <= 0) {
+                throw new GgufFormatException("deepseek41: invalid '"
+                        + kv.key(GgufKeys.ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER) + "' (the source must be an"
+                        + " index source and '" + kv.key(GgufKeys.ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS) + "'/'"
+                        + kv.key(GgufKeys.ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE) + "' must be > 0; got source "
+                        + cand + " x " + topKBlocks + "/" + blockSize + ")");
+            }
+            for (int il = cand + 1; il < nLayer; il++) {
+                if (b.dsv41TopkSource(il) == il && b.compressRatio(il) != b.compressRatio(cand)) {
+                    throw new GgufFormatException("deepseek41: candidate consumer layer " + il + " must share the"
+                            + " compress ratio of '" + kv.key(GgufKeys.ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER)
+                            + "' layer " + cand);
+                }
+            }
+            b.dsv41CandidateSourceLayer(cand);
+            b.dsv41CandidateTopKBlocks(topKBlocks);
+            b.dsv41CandidateBlockSize(blockSize);
+        }
+    }
+
+    /**
+     * DeepSeek-V4.1 Engram metadata (models/deepseek41.cpp:88-131): {@code ple.layers} names the Engram layers in
+     * order; each layer owns one set of {@code ngram} hash multipliers and {@code (ngram - 1) * heads_per_ngram}
+     * hash heads, stored back to back across the layers.
+     */
+    private static void readEngram(ModelHparamsBuilder b, GgufKv kv) {
+        int nPle = Math.max(0, kv.arrayLength(GgufKeys.PLE_LAYERS));
+        if (nPle == 0) {
+            return;
+        }
+        int[] layers = requiredU32Array(kv, GgufKeys.PLE_LAYERS);
+        int nGram = kv.u32Required(GgufKeys.PLE_NGRAM_SIZE);
+        int perGram = kv.u32Required(GgufKeys.PLE_HEADS_PER_NGRAM);
+        int headDim = kv.u32Required(GgufKeys.EMBEDDING_LENGTH_PER_LAYER);
+        long[] mult = requiredU64Array(kv, GgufKeys.PLE_LAYER_MULTIPLIERS);
+        long[] offsets = requiredU64Array(kv, GgufKeys.PLE_HEAD_OFFSETS);
+        long[] vocab = requiredU64Array(kv, GgufKeys.PLE_HEAD_VOCAB_SIZES);
+        int padId = kv.u32Required(GgufKeys.ENGRAM_PAD_TOKEN_ID);
+        int[] tokenMap = requiredU32Array(kv, GgufKeys.ENGRAM_TOKEN_MAP);
+        long nColsLong = nGram >= 2 ? (long) (nGram - 1) * perGram : 0;
+        if (nColsLong <= 0 || nColsLong > Integer.MAX_VALUE || headDim <= 0
+                || mult.length != (long) nPle * nGram
+                || offsets.length != nPle * nColsLong || vocab.length != nPle * nColsLong
+                || padId < 0 || padId >= tokenMap.length) {
+            throw new GgufFormatException("deepseek41: Engram metadata in '" + kv.key(GgufKeys.PLE_LAYERS) + "', '"
+                    + kv.key(GgufKeys.PLE_NGRAM_SIZE) + "', '" + kv.key(GgufKeys.PLE_HEADS_PER_NGRAM) + "', '"
+                    + kv.key(GgufKeys.EMBEDDING_LENGTH_PER_LAYER) + "', '" + kv.key(GgufKeys.PLE_LAYER_MULTIPLIERS)
+                    + "', '" + kv.key(GgufKeys.PLE_HEAD_OFFSETS) + "', '" + kv.key(GgufKeys.PLE_HEAD_VOCAB_SIZES)
+                    + "', '" + kv.key(GgufKeys.ENGRAM_PAD_TOKEN_ID) + "' and '" + kv.key(GgufKeys.ENGRAM_TOKEN_MAP)
+                    + "' is inconsistent (layers " + nPle + ", ngram " + nGram + ", heads/ngram " + perGram
+                    + ", head dim " + headDim + ", multipliers " + mult.length + ", offsets " + offsets.length
+                    + ", vocab " + vocab.length + ", pad " + padId + " of " + tokenMap.length + ")");
+        }
+        if ((long) nColsLong * headDim != b.nEmbd()) {
+            throw new GgufFormatException("deepseek41: " + nColsLong + " Engram heads of " + headDim
+                    + " do not span n_embd " + b.nEmbd());
+        }
+        int nCols = (int) nColsLong;
+        for (int e = 0; e < nPle; e++) {
+            int il = layers[e];
+            if (il < 0 || il >= b.nLayer() || (e > 0 && il <= layers[e - 1])) {
+                throw new GgufFormatException("deepseek41: '" + kv.key(GgufKeys.PLE_LAYERS) + "' lists Engram layer "
+                    + il + " outside [0, " + b.nLayer() + ") or out of order");
+            }
+            b.isPleLayer(il, true);
+        }
+        long heads = (long) nPle * nCols;
+        for (long c = 0; c < heads; c++) {
+            if (vocab[(int) c] < 2 || offsets[(int) c] < 0 || vocab[(int) c] > Integer.MAX_VALUE
+                    || offsets[(int) c] > Integer.MAX_VALUE
+                    || vocab[(int) c] > Integer.MAX_VALUE - offsets[(int) c]) {
+                throw new GgufFormatException("deepseek41: Engram head " + c + " bucket range does not fit the"
+                        + " int32 row index");
+            }
+        }
+        b.pleNgramSize(nGram);
+        b.pleHeadsPerNgram(perGram);
+        b.pleNHeads(nCols);
+        b.pleHeadDim(headDim);
+        b.nEmbdPerLayer(headDim);
+        b.pleLayerMultipliers(mult);
+        b.pleHeadOffsets(offsets);
+        b.pleHeadVocabSizes(vocab);
+        b.engramPadTokenId(padId);
+        b.engramTokenMap(tokenMap);
+    }
+
+    private static boolean contains(int[] values, int v) {
+        for (int value : values) {
+            if (value == v) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int[] requiredU32Array(GgufKv kv, String keyFmt) {
+        int[] v = kv.u32Array(keyFmt);
+        if (v == null) {
+            throw new GgufFormatException("required metadata key '" + kv.key(keyFmt) + "' is missing");
+        }
+        return v;
+    }
+
+    private static long[] requiredU64Array(GgufKv kv, String keyFmt) {
+        long[] v = kv.u64Array(keyFmt);
+        if (v == null) {
+            throw new GgufFormatException("required metadata key '" + kv.key(keyFmt) + "' is missing");
+        }
+        return v;
     }
 
     /** models/glm4-moe.cpp:3-18. MoE layers are {@code il >= n_layer_dense_lead}, NextN blocks included (:70). */
@@ -282,9 +494,90 @@ public final class MoeHooksMla {
         b.moeLayers(MoeHooksSupport.layersWhere(b, il -> experts && il < nLayer && il >= lead)); // tensors :117
     }
 
+    /**
+     * models/mistral-large4.cpp:6-56. MLA with the DSA lightning indexer on the full-indexer layers (the
+     * {@code attention.indexer_types} array or all layers, layer 0 always full), SSMax attention temperature
+     * ({@code s * log(pos + 1) + b} per head), learned LeRoPE factors and per-layer rope patterns
+     * ({@code attention.rope_pattern}), layers without their own KV reading the cache of
+     * {@code attention.kv_source_map[il]}. The indexer layer norms carry biases and use the LayerNorm epsilon
+     * (:9). The Q LoRA is optional; MoE layers follow the leading dense blocks.
+     */
+    public static void mistralLarge4(ModelHparamsBuilder b, GgufKv kv) {
+        HparamsSupport.readExpertFfLength(b, kv, true);                                   // :7
+        rmsEps(b, kv);                                                                    // :8
+        b.normEps(kv.f32Required(GgufKeys.ATTENTION_LAYERNORM_EPS));                      // :9
+        b.nExpertShared(kv.u32Required(GgufKeys.EXPERT_SHARED_COUNT));                    // :12
+        b.nLayerDenseLead(kv.u32(GgufKeys.LEADING_DENSE_BLOCK_COUNT, b.nLayerDenseLead())); // :13
+        b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, b.expertWeightsScale())); // :14
+        b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, b.expertWeightsNorm())); // :15
+        b.gating(requiredGating(kv));                                                     // :16
+        b.nLoraQ(kv.u32(GgufKeys.ATTENTION_Q_LORA_RANK, b.nLoraQ()));                     // :19
+        b.nLoraKv(kv.u32Required(GgufKeys.ATTENTION_KV_LORA_RANK));                       // :20
+        readMlaHeads(b, kv, true);                                                        // :21-22
+        readIndexer(b, kv);                                                               // :25-27
+        boolean[] full = MoeHooksSupport.keyOrArrFlags(kv, GgufKeys.ATTENTION_INDEXER_TYPES,   // :29-30
+                b.nLayer(), allTrue(b.nLayer()), false);
+        if (!full[0]) {                                                                   // :31-33
+            throw new GgufFormatException("mistral-large4: the first layer must have a full indexer");
+        }
+        b.isIndexerFullArray(full);
+        b.ropeEnabledArray(MoeHooksSupport.overlayFlags(kv, GgufKeys.ATTENTION_ROPE_PATTERN,     // :35
+                b.ropeEnabledArray(), false));
+        readKvSourceMap(b, kv);                                                           // :36-42
+        b.finalSoftcap(kv.f32(GgufKeys.FINAL_LOGIT_SOFTCAPPING, 0.0f));                   // :44-45
+        readYarnLogMul(b, kv);                                                            // :46
+        b.attnTempFloorScale(1);                                                          // :48-51
+        b.attnTempScale(1.0f);
+        b.attnTempOffset(0.0f);
+        requireMla(b, "mistral-large4");                                                  // tensors :61-63
+    }
+
+    /** Every layer flags true, the default of the mistral-large4 indexer types and rope pattern. */
+    private static boolean[] allTrue(int n) {
+        boolean[] all = new boolean[n];
+        java.util.Arrays.fill(all, true);
+        return all;
+    }
+
+    /**
+     * The optional {@code attention.kv_source_map}: an entry holds the layer whose KV cache layer {@code il}
+     * reads, an absent or self entry means the layer owns its cache ({@code has_kv}). The source must not be
+     * later, must own a cache and must share the layer's rope pattern (mistral-large4.cpp:37-42).
+     */
+    private static void readKvSourceMap(ModelHparamsBuilder b, GgufKv kv) {
+        int[] src = kv.keyOrArr(GgufKeys.ATTENTION_KV_SOURCE_MAP, b.nLayer(), -1);
+        int[] owners = new int[b.nLayerAll()];
+        for (int il = 0; il < owners.length; il++) {
+            owners[il] = il;
+        }
+        boolean mapped = false;
+        for (int il = 0; il < b.nLayer(); il++) {
+            if (src[il] < 0 || src[il] == il) {
+                continue;
+            }
+            int source = src[il];
+            if (source > il) {
+                throw new GgufFormatException("mistral-large4: invalid KV source layer " + source + " for layer "
+                        + il + "; a source cannot be later");
+            }
+            if (source >= b.nLayer() || owners[source] != source) {
+                throw new GgufFormatException("mistral-large4: invalid KV source layer " + source + " for layer "
+                        + il + "; the source must own its own cache");
+            }
+            if (b.ropeEnabled(source) != b.ropeEnabled(il)) {
+                throw new GgufFormatException("mistral-large4: invalid KV source layer " + source + " for layer "
+                        + il + "; the source must share the layer's rope pattern");
+            }
+            owners[il] = source;
+            mapped = true;
+        }
+        if (mapped) {
+            b.kvOwnerLayers(owners);
+        }
+    }
+
     /** models/minimax-m3.cpp:13-33: MoE with the block-sparse MiniMax indexer (positive block size required). */
-    public static void minimaxM3(ModelHparamsBuilder b, GgufKv kv) {
-        rmsEps(b, kv);                                                                    // :14
+    public static void minimaxM3(ModelHparamsBuilder b, GgufKv kv) {        rmsEps(b, kv);                                                                    // :14
         b.nLayerDenseLead(kv.u32(GgufKeys.LEADING_DENSE_BLOCK_COUNT, b.nLayerDenseLead())); // :15
         HparamsSupport.readExpertFfLength(b, kv, true);                                   // :16
         b.nExpertShared(kv.u32Required(GgufKeys.EXPERT_SHARED_COUNT));                    // :17
@@ -298,6 +591,50 @@ public final class MoeHooksMla {
     }
 
     // ---- shared readers ----
+
+    /**
+     * vLLM's longcat_flash.py: MLA attention with Q and KV LoRA, a dense SwiGLU FFN on every physical block and the
+     * shortcut-connected routed experts on every first (even) block. The routed-expert pool holds
+     * {@code expert_zero_count} identity slots after the real experts. The n-gram variant also reads the fused
+     * input-embedding hash parameters.
+     */
+    public static void longcatFlash(ModelHparamsBuilder b, GgufKv kv) {
+        rmsEps(b, kv);
+        b.nLoraQ(kv.u32Required(GgufKeys.ATTENTION_Q_LORA_RANK));
+        b.nLoraKv(kv.u32Required(GgufKeys.ATTENTION_KV_LORA_RANK));
+        readMlaHeads(b, kv, true);
+        b.nExpertZero(kv.u32(GgufKeys.EXPERT_ZERO_COUNT, 0));
+        b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, b.expertWeightsScale()));
+        b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, false));
+        b.gating(GatingFunc.SOFTMAX);
+        readYarnLogMul(b, kv);
+        // the trunk holds two physical blocks per logical layer; a NextN block (block_count - nLayer) is appended
+        int physical = b.nLayer();
+        if (physical % 2 != 0) {
+            throw new GgufFormatException("longcat-flash: block_count " + physical + " is not two blocks per"
+                    + " logical layer");
+        }
+        if (b.nExpert() <= 0) {
+            throw new GgufFormatException("longcat-flash: expert_count must be positive");
+        }
+        requireMla(b, "longcat-flash");
+        requireQkNope(b, "longcat-flash");
+        if (b.arch() == Arch.LONGCAT_FLASH_NGRAM) {
+            readNgram(b, kv);
+        }
+    }
+
+    /** The n-gram input embedding's hash parameters ({@code ngram_vocab_size_ratio}, {@code emb_*} of the config). */
+    private static void readNgram(ModelHparamsBuilder b, GgufKv kv) {
+        b.ngramVocabSize(kv.u32Required(GgufKeys.NGRAM_BASE_TABLE_SIZE));
+        b.ngramNeighborCount(kv.u32Required(GgufKeys.NGRAM_NEIGHBOR_COUNT));
+        b.ngramSplitCount(kv.u32Required(GgufKeys.NGRAM_SPLIT_COUNT));
+        b.ngramEosTokenId((int) kv.u32Required(GgufKeys.NGRAM_EOS_TOKEN_ID));
+        if (b.ngramNeighborCount() < 2 || b.ngramSplitCount() < 1) {
+            throw new GgufFormatException("longcat-flash-ngram: ngram.neighbor_count must be at least 2 and"
+                    + " ngram.split_count at least 1, got " + b.ngramNeighborCount() + " and " + b.ngramSplitCount());
+        }
+    }
 
     /** {@code attention.key_length_mla} / {@code value_length_mla} into the MLA head sizes. */
     private static void readMlaHeads(ModelHparamsBuilder b, GgufKv kv, boolean required) {
@@ -326,9 +663,10 @@ public final class MoeHooksMla {
 
     /**
      * {@code attention.compress_ratios}: at least {@code n_layer_all} entries and at most
-     * {@link ModelHparams#MAX_LAYERS} (models/deepseek4.cpp:55-61); the first {@code n_layer_all} are used.
+     * {@link ModelHparams#MAX_LAYERS} (models/deepseek4.cpp:55-61); the first {@code n_layer_all} are used. A
+     * DeepSeek-V4.1 file uses ratios 0, 2 (selected) and 1 (dense) instead of 0, 4 and 128.
      */
-    private static void readCompressRatios(ModelHparamsBuilder b, GgufKv kv) {
+    private static void readCompressRatios(ModelHparamsBuilder b, GgufKv kv, boolean v41) {
         String key = GgufKeys.ATTENTION_COMPRESS_RATIOS;
         int[] ratios = kv.u32Array(key);
         if (ratios == null) {
@@ -344,8 +682,11 @@ public final class MoeHooksMla {
         int[] perLayer = new int[b.nLayerAll()];
         System.arraycopy(ratios, 0, perLayer, 0, perLayer.length);
         for (int ratio : perLayer) {                                                      // tensors :133-153
-            if (ratio != 0 && ratio != 4 && ratio != 128) {
-                throw new GgufFormatException("DeepSeek-V4 loader only supports compression ratios 0, 4, and 128, got "
+            boolean ok = v41 ? ratio == 0 || ratio == 2 || ratio == 1
+                    : ratio == 0 || ratio == 4 || ratio == 128;
+            if (!ok) {
+                throw new GgufFormatException("DeepSeek-V4" + (v41 ? ".1" : "") + " loader only supports compression"
+                        + " ratios " + (v41 ? "0, 2 and 1" : "0, 4 and 128") + " in '" + kv.key(key) + "', got "
                         + ratio);
             }
         }

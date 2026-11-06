@@ -284,7 +284,10 @@ public class GradientClippingTest {
                 }
                 owned.clear();
             } finally {
-                session.close();
+                // setUp may have failed before the session opened; only its own failure is reported then.
+                if (session != null) {
+                    session.close();
+                }
             }
         }
 

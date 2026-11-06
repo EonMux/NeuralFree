@@ -3,7 +3,12 @@ package com.eonmux.neuralfree.gguf;
 import com.eonmux.neuralfree.gguf.chat.ChatFormatter;
 import com.eonmux.neuralfree.gguf.chat.ChatMessages;
 import com.eonmux.neuralfree.gguf.chat.ChatRequest;
+import com.eonmux.neuralfree.gguf.chat.ChatTemplateDetector;
 import com.eonmux.neuralfree.gguf.chat.ChatTemplateSource;
+import com.eonmux.neuralfree.gguf.chat.TemplateCaps;
+import com.eonmux.neuralfree.gguf.chat.autoparser.AutoParser;
+import com.eonmux.neuralfree.gguf.chat.autoparser.AutoParserAnalysis;
+import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.tokenizer.BpeTokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.Gemma4Tokenizer;
 import com.eonmux.neuralfree.gguf.tokenizer.IncrementalDetokenizer;
@@ -23,6 +28,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -52,6 +58,19 @@ public final class GGUFTokenizer {
      * ({@code llama_model_chat_template(model, "rerank")}, src/llama-model.cpp:3750-3767).
      */
     public static final String KEY_RERANK_TEMPLATE = ChatTemplateSource.KEY_DEFAULT + ".rerank";
+    /**
+     * The speech chat template key: {@code tokenizer.chat_template.tts} ({@code
+     * llama_model_chat_template(model, "tts")}). An LFM3-Audio checkpoint carries it; its rendered prompt ends in
+     * the audio start token, which opens the speech pipeline's fresh turn. The chat-template override property
+     * does not replace it.
+     */
+    public static final String KEY_TTS_TEMPLATE = ChatTemplateSource.KEY_DEFAULT + ".tts";
+    /**
+     * The decision models' systemone template key: {@code tokenizer.chat_template.systemone} ({@code
+     * llama_model_chat_template(model, "systemone")}). The vllm-decision2 and clef decision heads carry it; the
+     * server renders their joint prompt through it.
+     */
+    public static final String KEY_SYSTEMONE_TEMPLATE = ChatTemplateSource.KEY_DEFAULT + ".systemone";
 
     private static final Logger LOGGER = LogManager.getLogger(GGUFTokenizer.class);
     private static final byte[] EMPTY = new byte[0];
@@ -60,6 +79,8 @@ public final class GGUFTokenizer {
     private final SpecialTokens special;
     private final TokenizerAlgorithm algorithm;
     private final ChatFormatter chat;
+    /** The {@code tts} template's formatter, or null when the model carries no speech chat template. */
+    private final ChatFormatter ttsChat;
     /** Lazily filled per-token output bytes; idempotent writes make concurrent fills benign. */
     private final byte[][] visibleBytesCache;
     private final String[] decodedStringCache;
@@ -72,17 +93,69 @@ public final class GGUFTokenizer {
     public GGUFTokenizer(TokenizerVocab vocab) {
         if (vocab == null) throw new IllegalArgumentException("vocabulary is null");
         this.vocab = vocab;
-        this.special = SpecialTokens.of(vocab);
+        String template = templateSource(vocab);
+        this.special = SpecialTokens.of(vocab, preservedMarkers(template));
         this.algorithm = algorithmFor(vocab, special);
-        String template = ChatTemplateSource.resolve(templateMetadata(vocab, ChatTemplateSource.KEY_DEFAULT),
-                templateMetadata(vocab, ChatTemplateSource.KEY_TOOL_USE));
         this.chat = new ChatFormatter(template, special.bos() >= 0 ? vocab.text(special.bos()) : "",
                 special.eos() >= 0 ? vocab.text(special.eos()) : "", vocab.addBos(), vocab.addEos(),
-                vocab.architecture());
+                vocab.architecture(), ChatFormatter.preserveReasoningFromProperties(),
+                ChatFormatter.contentFormatFromProperties());
+        String tts = templateMetadata(vocab, KEY_TTS_TEMPLATE);
+        this.ttsChat = tts == null || tts.isBlank() ? null
+                : new ChatFormatter(ChatTemplateSource.resolve(tts, null),
+                        special.bos() >= 0 ? vocab.text(special.bos()) : "",
+                        special.eos() >= 0 ? vocab.text(special.eos()) : "", vocab.addBos(), vocab.addEos(),
+                        vocab.architecture(), ChatFormatter.preserveReasoningFromProperties(),
+                        ChatFormatter.contentFormatFromProperties());
         this.visibleBytesCache = new byte[vocab.size()][];
         this.decodedStringCache = new String[vocab.size()];
         LOGGER.info("tokenizer: model={} pre={} vocab={} bos={} eos={} eog={}", vocab.model(), vocab.pre(),
                 vocab.size(), special.bos(), special.eos(), special.eogIds().size());
+    }
+
+    /**
+     * The markers the differential autoparser derives from the template, for the tokenizer to match as tokens
+     * ({@link SpecialTokens#of(TokenizerVocab, java.util.List)}); empty when the template does not analyse.
+     */
+    private static List<String> preservedMarkers(String template) {
+        AutoParserAnalysis analysis = AutoParser.analyze(template);
+        return analysis == null ? Collections.<String>emptyList() : analysis.preservedTokens();
+    }
+
+    /**
+     * The template source prompts are rendered with: the override properties when set, else the
+     * model's metadata — unless the {@link ChatTemplateSource#JINJA_PROPERTY} switch sends rendering
+     * onto the non-Jinja route.
+     */
+    private static String templateSource(TokenizerVocab vocab) {
+        if (!ChatTemplateSource.jinjaFromProperties()) return legacySource(vocab);
+        String override = ChatTemplateSource.fromProperties();
+        return override != null ? override
+                : ChatTemplateSource.resolve(templateMetadata(vocab, ChatTemplateSource.KEY_DEFAULT),
+                        templateMetadata(vocab, ChatTemplateSource.KEY_TOOL_USE));
+    }
+
+    /**
+     * llama.cpp's non-Jinja route: the template's text, kept raw from the override or the model's
+     * {@code tokenizer.chat_template}, is read as one of llama.cpp's known templates and replaced
+     * by that built-in template's source, as {@code common_chat_templates_init} keeps the text and
+     * {@code llm_chat_detect_template} guesses from it (src/llama-chat.cpp:89-240). A template no
+     * style fits is refused the way llama.cpp's {@code common_chat_verify_template} refuses it
+     * without {@code --jinja} (common/arg.cpp:940-946).
+     */
+    private static String legacySource(TokenizerVocab vocab) {
+        String raw = ChatTemplateSource.rawFromProperties();
+        String template = raw != null ? raw : templateMetadata(vocab, ChatTemplateSource.KEY_DEFAULT);
+        String toolUse = raw != null ? null : templateMetadata(vocab, ChatTemplateSource.KEY_TOOL_USE);
+        String legacy = ChatTemplateSource.legacyTemplate(template, toolUse);
+        String detected = ChatTemplateDetector.detect(legacy);
+        if (detected == null) {
+            throw new IllegalArgumentException("--no-jinja (" + ChatTemplateSource.JINJA_PROPERTY
+                    + "=false): " + ChatTemplateDetector.refusal(legacy));
+        }
+        String source = ChatTemplateSource.detectedSource(detected);
+        LOGGER.info("chat template: {} (guessed from the model's template for the non-Jinja route)", detected);
+        return source;
     }
 
     /** A chat template metadata string, or null when the key is absent or not a string. */
@@ -131,21 +204,120 @@ public final class GGUFTokenizer {
      * ({@link ChatTemplateSource#resolve}). Never null.
      */
     public String chatTemplate() { return chat.source(); }
+
+    /** The capabilities of {@link #chatTemplate()}, probed as llama.cpp probes them ({@link TemplateCaps}). */
+    public TemplateCaps chatTemplateCaps() { return chat.caps(); }
+
+    /**
+     * The capabilities {@code request} renders with: its {@code chat_template} override's when it carries one,
+     * else those of {@link #chatTemplateCaps()} ({@link ChatFormatter#caps(ChatRequest)}).
+     */
+    public TemplateCaps chatTemplateCaps(ChatRequest request) { return chat.caps(request); }
     public String architecture() { return vocab.architecture(); }
 
     /**
-     * The rerank prompt ({@value #KEY_RERANK_TEMPLATE}) with {@code {query}} and {@code {document}} placeholders, as
-     * the converter writes it for Qwen3 rerankers; null when the model has none.
+     * The rerank prompt ({@value #KEY_RERANK_TEMPLATE}) with {@code {query}}, {@code {document}} and the score
+     * request's {@code {instruction}} placeholders, as the converter writes it for Qwen3 rerankers; null when the
+     * model has none.
      *
      * @throws IllegalStateException when the metadata value is not a string
      */
     public String rerankTemplate() {
-        Object value = vocab.metadata(KEY_RERANK_TEMPLATE);
+        return stringMetadata(KEY_RERANK_TEMPLATE);
+    }
+
+    /**
+     * The decision models' systemone chat template ({@value #KEY_SYSTEMONE_TEMPLATE}): the joint prompt of the
+     * vllm-decision2 and clef decision heads, rendered with the {@code state}, {@code questions}, {@code images},
+     * {@code sep}, {@code mark_question} and {@code mark_option} variables; null when the model carries none.
+     *
+     * @throws IllegalStateException when the metadata value is not a string
+     */
+    public String systemoneTemplate() {
+        return stringMetadata(KEY_SYSTEMONE_TEMPLATE);
+    }
+
+    /**
+     * The speech chat template's resolved source ({@code tokenizer.chat_template.tts}, resolved like
+     * {@link ChatTemplateSource#resolve(String)} resolves the default), or null when the model carries none: the
+     * speech pipeline's prompts render through it, and a model without it has no speech prompt to render
+     * ({@code llama_model_chat_template(model, "tts")}). The chat-template override property does not replace it.
+     */
+    public String ttsTemplate() {
+        return ttsChat == null ? null : ttsChat.source();
+    }
+
+    /**
+     * Renders {@code request} through the model's conversation template ({@link #chatTemplate()}) with the speech
+     * variables bound ({@link ChatFormatter#formatSpeech}): the omni chat route's prompt, which the generator
+     * continues with the asked mode's switch token.
+     *
+     * @throws IllegalArgumentException for malformed messages or a template override that does not render
+     */
+    public String formatSpeechChat(ChatRequest request, String language, String voice) {
+        return chat.formatSpeech(request, language, voice);
+    }
+
+    /**
+     * Renders the plain speech text as one user message through the speech chat template, with the request's
+     * {@code language} and {@code voice} bound (common_chat_get_tts_prompt, common/chat.cpp:859-868): the speech
+     * pipeline's fresh turn speaks the render, which ends in the audio start token.
+     *
+     * @throws UnsupportedOperationException when the model carries no {@code tts} template
+     */
+    public String formatTtsPrompt(String text, String language, String voice) {
+        if (ttsChat == null) {
+            throw new UnsupportedOperationException("the model has no " + KEY_TTS_TEMPLATE
+                    + " chat template to render the speech text with");
+        }
+        return ttsChat.formatTtsPrompt(text, language, voice);
+    }
+
+    /**
+     * The token ids appended to every rerank prompt ({@link GgufKeys#NF_RERANK_SUFFIX_IDS}, the jina_vl score token);
+     * empty when the model has none.
+     *
+     * @throws IllegalStateException when the metadata value is not an array of ids inside the vocabulary
+     */
+    public int[] rerankSuffix() {
+        Object value = vocab.metadata(GgufKeys.NF_RERANK_SUFFIX_IDS);
+        if (value == null) {
+            return new int[0];
+        }
+        if (!(value instanceof java.util.List)) {
+            throw new IllegalStateException("GGUF metadata '" + GgufKeys.NF_RERANK_SUFFIX_IDS + "' is a "
+                    + value.getClass().getSimpleName() + ", not an array of token ids");
+        }
+        java.util.List<?> ids = (java.util.List<?>) value;
+        int[] out = new int[ids.size()];
+        for (int i = 0; i < out.length; i++) {
+            Object id = ids.get(i);
+            if (!(id instanceof Number) || ((Number) id).longValue() < 0 || ((Number) id).longValue() >= vocab.size()) {
+                throw new IllegalStateException("GGUF metadata '" + GgufKeys.NF_RERANK_SUFFIX_IDS + "[" + i + "]' = "
+                        + id + " is not a token id of the " + vocab.size() + "-token vocabulary");
+            }
+            out[i] = ((Number) id).intValue();
+        }
+        return out;
+    }
+
+    /**
+     * The checkpoint's response template ({@value GgufKeys#TOKENIZER_RESPONSE_TEMPLATE}), the JSON text vLLM's
+     * {@code hf} and {@code beam} parsers read the assistant message with; null when the model has none.
+     *
+     * @throws IllegalStateException when the metadata value is not a string
+     */
+    public String responseTemplate() {
+        return stringMetadata(GgufKeys.TOKENIZER_RESPONSE_TEMPLATE);
+    }
+
+    private String stringMetadata(String key) {
+        Object value = vocab.metadata(key);
         if (value == null || value instanceof String) {
             return (String) value;
         }
-        throw new IllegalStateException("GGUF metadata '" + KEY_RERANK_TEMPLATE + "' is a "
-                + value.getClass().getSimpleName() + ", not a string");
+        throw new IllegalStateException("GGUF metadata '" + key + "' is a " + value.getClass().getSimpleName()
+                + ", not a string");
     }
     /** End-of-generation token ids. */
     public Set<Integer> stopTokenIds() { return special.eogIds(); }
@@ -217,6 +389,15 @@ public final class GGUFTokenizer {
                 : new String(visibleBytes(tokenId), StandardCharsets.UTF_8);
         decodedStringCache[tokenId] = cached;
         return cached;
+    }
+
+    /**
+     * The raw bytes of one token as llama.cpp's {@code token_to_piece(id, lstrip = 0, special = true)} renders
+     * them: control, unknown and user-defined tokens give their text, whatever role the token plays (BOS, EOS);
+     * an out-of-range id gives no bytes. The token dumps of the tools print this piece.
+     */
+    public byte[] pieceWithSpecial(int tokenId) {
+        return algorithm.piece(tokenId).clone();
     }
 
     /** Whether decoding goes through a context-dependent overlay (decoder chain or clean-up). */
@@ -318,6 +499,29 @@ public final class GGUFTokenizer {
      */
     public String formatChat(ChatRequest request) {
         return chat.format(request);
+    }
+
+    /**
+     * {@link #formatChat(ChatRequest)} with the autoparser's analysis: a continued final message is written
+     * around the derived reasoning markers ({@link ChatFormatter#format(ChatRequest, boolean,
+     * AutoParserAnalysis)}).
+     */
+    public String formatChat(ChatRequest request, AutoParserAnalysis continuation) {
+        return chat.format(request, false, continuation);
+    }
+
+    /**
+     * {@link #formatChat(ChatRequest)} for the multimodal prompt path: with {@code mediaMarkers} set, image and
+     * audio content parts render as {@link ChatMessages#MEDIA_MARKER} instead of being refused
+     * ({@link ChatFormatter#format(ChatRequest, boolean)}).
+     */
+    public String formatChat(ChatRequest request, boolean mediaMarkers) {
+        return chat.format(request, mediaMarkers);
+    }
+
+    /** {@link #formatChat(ChatRequest, boolean)} over the autoparser's analysis. */
+    public String formatChat(ChatRequest request, boolean mediaMarkers, AutoParserAnalysis continuation) {
+        return chat.format(request, mediaMarkers, continuation);
     }
 
     private static Map<String, Object> message(String role, String content) {

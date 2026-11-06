@@ -1,0 +1,70 @@
+/* cert_screen.comp - int8 screen logits of the certified exact-argmax head. GLSL twin of
+ * LLM_CertScreen in kernels/llm/cert_argmax.cl. Requires: common/nf_common.glsl.
+ *
+ * Variants row:
+ *     LLM_CertScreen	cert_screen.comp	OP=OP_CERT_SCREEN
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   OP_CERT_SCREEN  (i vocab, i cols, i n_rows, R int8 codes, R float scales, R float hidden,
+ *                    W float screen_out)
+ *              screen_out[row * vocab + v] = scales[v] * dot(codes[v, :], hidden[row, :]), one
+ *              workgroup per (row, token): global = n_rows * vocab rounded up to L. codes holds
+ *              vocab rows of cols rounded int8 codes, scales the per-row absmax scales.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#define OP_CERT_SCREEN 132
+
+#if !defined(OP) || OP != OP_CERT_SCREEN
+#error "cert_screen.comp requires OP=OP_CERT_SCREEN"
+#endif
+
+layout(std430, binding = 0) readonly buffer NfCsCodes { uint8_t codes_u8[]; };
+layout(std430, binding = 1) readonly buffer NfCsScales { float scales_in[]; };
+layout(std430, binding = 2) readonly buffer NfCsHidden { float hidden_in[]; };
+layout(std430, binding = 3) writeonly buffer NfCsScreen { float screen_out[]; };
+layout(push_constant) uniform NfCsParams { int vocab; int cols; int n_rows; } pc;
+
+shared float nf_cs_scratch[gl_WorkGroupSize.x];
+
+void main() {
+    const uint row = nf_wg_id() / uint(pc.vocab);
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const uint v = nf_wg_id() - row * uint(pc.vocab);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint n4 = uint(pc.cols) & ~3u;
+    const uint qbase = v * uint(pc.cols);
+    const uint xbase = row * uint(pc.cols);
+
+    float ps = 0.0;
+    for (uint j = lid * 4u; j < n4; j += lsize * 4u) {
+        const vec4 qv = vec4(float(nf_i8(uint(codes_u8[qbase + j]))), float(nf_i8(uint(codes_u8[qbase + j + 1u]))),
+                             float(nf_i8(uint(codes_u8[qbase + j + 2u]))), float(nf_i8(uint(codes_u8[qbase + j + 3u]))));
+        const vec4 xv = vec4(hidden_in[xbase + j], hidden_in[xbase + j + 1u],
+                             hidden_in[xbase + j + 2u], hidden_in[xbase + j + 3u]);
+        ps += dot(xv, qv);
+    }
+    for (uint j = n4 + lid; j < uint(pc.cols); j += lsize) {
+        ps += hidden_in[xbase + j] * float(nf_i8(uint(codes_u8[qbase + j])));
+    }
+
+    /* Reduction order does not matter for the certificate (the bound is a norm product), and a
+     * local-memory tree reduces any L exactly. */
+    nf_cs_scratch[lid] = ps;
+    barrier();
+    for (uint s = gl_WorkGroupSize.x >> 1; s > 0u; s >>= 1) {
+        if (lid < s) {
+            nf_cs_scratch[lid] += nf_cs_scratch[lid + s];
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        screen_out[nf_wg_id()] = scales_in[v] * nf_cs_scratch[0];
+    }
+}

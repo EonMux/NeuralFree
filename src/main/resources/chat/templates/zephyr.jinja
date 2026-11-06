@@ -1,0 +1,8 @@
+{#- llama.cpp zephyr chat template (src/llama-chat.cpp:362-369). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|' ~ message['role'] ~ '|>\n' ~ content ~ '<|endoftext|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|assistant|>\n' -}}
+{%- endif -%}

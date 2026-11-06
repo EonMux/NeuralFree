@@ -70,4 +70,14 @@ public class ScratchWidthsTest {
         assertEquals(8L, ScratchWidths.rows(8, 0));
         assertEquals(24L, ScratchWidths.rows(8, 3));
     }
+
+    @Test
+    public void dualChunkAttentionWidensTheQuerySlotToItsFivePlanes() throws IOException {
+        SyntheticModels.Config c = SyntheticModels.Config.qwen2();
+        ModelSpec spec = build(SyntheticModels.qwen2DualChunk(c, 8, 2, 4));
+        AttentionSpec a = spec.layers().get(0).attention();
+        assertNotNull(a.dualChunk());
+        assertEquals(5L * a.qDim(), a.qRopeDim());
+        assertEquals(5L * a.qDim(), ScratchWidths.of(spec).query());
+    }
 }

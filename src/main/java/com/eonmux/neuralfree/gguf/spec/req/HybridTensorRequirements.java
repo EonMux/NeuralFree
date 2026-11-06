@@ -123,6 +123,17 @@ public final class HybridTensorRequirements {
         }
 
         /**
+         * Model-level tensors (full names) required only when the trigger tensor exists, e.g. an MTP file's reduced
+         * (FR-Spec) head, which ships only alongside its {@code d2t} table (qwen4exp.cpp:296).
+         */
+        Builder modelWhenPresent(String trigger, String... names) {
+            for (String n : names) {
+                out.add(TensorRequirement.model(n).ifPresent(trigger));
+            }
+            return this;
+        }
+
+        /**
          * Untied output head: optional {@code output.weight}, falling back to the duplicated
          * {@code token_embd.weight} (the common {@code if (output == NULL)} block).
          */
@@ -192,6 +203,12 @@ public final class HybridTensorRequirements {
             layer(ALL, "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight");
             return layerOptional(ALL, "nextn.embed_tokens.weight", "nextn.shared_head_head.weight",
                     "nextn.shared_head_norm.weight");
+        }
+
+        /** A prebuilt entry, such as a layer-scoped requirement over another stack. */
+        Builder entry(TensorRequirement r) {
+            out.add(Objects.requireNonNull(r, "requirement"));
+            return this;
         }
 
         /** The accumulated list, unmodifiable. */

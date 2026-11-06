@@ -1,0 +1,12 @@
+{#- llama.cpp granite chat template (src/llama-chat.cpp:631-643). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|start_of_role|>' ~ message['role'] ~ '<|end_of_role|>' -}}
+    {%- if message['role'] == 'assistant_tool_call' -%}
+        {{- '<|tool_call|>' -}}
+    {%- endif -%}
+    {{- content ~ '<|end_of_text|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|start_of_role|>assistant<|end_of_role|>' -}}
+{%- endif -%}

@@ -41,7 +41,7 @@ public final class HcBlocks {
         @Override
         public GpuLayerExtra create(LayerSpec layer) {
             requireHyperConnections(layer);
-            return new GpuHcExtra();
+            return isDsv41(layer) ? new GpuDsv41HcExtra() : new GpuHcExtra();
         }
 
         @Override
@@ -77,7 +77,7 @@ public final class HcBlocks {
         @Override
         public CpuLayerExtra create(LayerSpec layer) {
             requireHyperConnections(layer);
-            return new CpuHcExtra();
+            return isDsv41(layer) ? new CpuDsv41HcExtra() : new CpuHcExtra();
         }
 
         @Override
@@ -131,7 +131,6 @@ public final class HcBlocks {
     public static List<GpuLayerExtraFactory> gpuExtras() {
         return Collections.unmodifiableList(Arrays.asList(GPU_HC, GPU_ATTN_RES));
     }
-
     /** The {@code hc} and {@code attn_res} CPU layer extras (unmodifiable). */
     public static List<CpuLayerExtraFactory> cpuExtras() {
         return Collections.unmodifiableList(Arrays.asList(CPU_HC, CPU_ATTN_RES));
@@ -139,12 +138,17 @@ public final class HcBlocks {
 
     /** A fresh, unbound hyper-connection head collapse for one model (unmodifiable list). */
     public static List<GpuHeadPreprocessor> gpuHeadPreprocessors() {
-        return Collections.singletonList(new GpuHcHeadCollapse());
+        return Collections.unmodifiableList(Arrays.asList(new GpuDsv41HeadCollapse(), new GpuHcHeadCollapse()));
     }
 
     /** A fresh, unbound hyper-connection head collapse for one model (unmodifiable list). */
     public static List<CpuHeadPreprocessor> cpuHeadPreprocessors() {
-        return Collections.singletonList(new CpuHcHeadCollapse());
+        return Collections.unmodifiableList(Arrays.asList(new CpuDsv41HeadCollapse(), new CpuHcHeadCollapse()));
+    }
+
+    /** True for a DeepSeek-V4.1 layer, whose hyper-connections lag one sub-block and have no head weights. */
+    private static boolean isDsv41(LayerSpec layer) {
+        return layer.dsv4() != null && layer.dsv4().dsv41() != null;
     }
 
     /**

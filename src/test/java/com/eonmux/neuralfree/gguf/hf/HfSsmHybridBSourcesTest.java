@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The LFM2-family HK-H1 fixtures ({@code LFM2ForCausalLM}, {@code Lfm2MoeForCausalLM}, {@code D1Model} and
+ * The LFM2-family fixtures ({@code LFM2ForCausalLM}, {@code Lfm2MoeForCausalLM}, {@code D1Model} and
  * {@code D1OmniModel}) build through the registered entries of {@code HfArchTableHybridSsm}: {@link ModelSpecBuilder}
  * succeeds and every catalog tensor is claimed ({@code TensorClaims}), the done-getting-tensors check of the
  * converter's tensor plan.

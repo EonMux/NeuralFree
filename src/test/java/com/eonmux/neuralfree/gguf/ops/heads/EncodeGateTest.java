@@ -109,12 +109,13 @@ public class EncodeGateTest {
     }
 
     @Test
-    public void rerankNeedsRankPooling() {
+    public void rerankNeedsASequenceClassifier() {
         EncodeGate.checkRerank(spec(Arch.QWEN3, PoolingKind.RANK));
         EncodeGate.checkRerank(spec(Arch.BERT, PoolingKind.RANK));
         UnsupportedOperationException e = assertThrows(UnsupportedOperationException.class,
                 () -> EncodeGate.checkRerank(spec(Arch.QWEN3, PoolingKind.LAST)));
-        assertEquals("reranking needs RANK pooling; qwen3 pools by LAST", e.getMessage());
+        assertEquals("reranking needs a sequence classifier (RANK pooling or a pooled classifier); qwen3 pools by"
+                + " LAST", e.getMessage());
     }
 
     private static void assertDecision(ThrowingRunnable call, String what, Arch arch) {

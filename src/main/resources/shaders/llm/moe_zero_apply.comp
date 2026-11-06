@@ -1,0 +1,30 @@
+/* moe_zero_apply.comp - LLM_MoE_ZeroApply: adds LongCat-Flash's identity-expert contribution to a routed output.
+ * GLSL twin of LLM_MoE_ZeroApply in kernels/llm/moe.cl. Requires: common/nf_common.glsl.
+ *
+ *     LLM_MoE_ZeroApply	moe_zero_apply.comp
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_embd, i x_off, i dst_off, R float x, R float zero_weights, float dst)
+ *   dst[t][c] += x[t][c] * zero_weights[t] (vLLM fused_moe.py:1051-1126); x and dst may name the same buffer.
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n_tokens * n_embd rounded up to L (folding-aware).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfMzx { float x[]; };
+layout(std430, binding = 1) readonly buffer NfMzw { float zero_weights[]; };
+layout(std430, binding = 2) buffer NfMzd { float dst[]; };
+layout(push_constant) uniform NfMzParams { int n_tokens; int n_embd; int x_off; int dst_off; } pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint n_embd = uint(pc.n_embd);
+    if (gid >= uint(pc.n_tokens) * n_embd) {
+        return;
+    }
+    const uint t = gid / n_embd;
+    dst[uint(pc.dst_off) + gid] += x[uint(pc.x_off) + gid] * zero_weights[t];
+}

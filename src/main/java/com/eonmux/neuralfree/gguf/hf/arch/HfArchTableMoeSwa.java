@@ -17,7 +17,7 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Hugging Face architecture entries of the Appendix A table HK-MS: the sliding-window and attention-sink MoE
+ * Hugging Face architecture entries: the sliding-window and attention-sink MoE
  * converter classes — Afmoe, Kolibri-1, Laguna, Flint, Beam, Cohere-2 MoE, ExaoneMoE, the Gemma 4 rows, GPT-OSS, the
  * Granite SWA rows, Maple, Mellum, MiMo-V2, Muse-Spark, SmallThinker and Step3.5 (LC conversion classes
  * afmoe.py:17, laguna.py:17, flint.py:9, beam.py:14, command_r.py:67, exaone.py:132, gemma.py:634/:936, gpt_oss.py:15,
@@ -97,14 +97,20 @@ final class HfArchTableMoeSwa {
                 HfArchEntry.of(Collections.singletonList("MellumForCausalLM"), HfArchResolver.of(Arch.MELLUM),
                                 HfMoeSwaHooksC::mellumMeta, HfMoeSwaHooksC::mellumTensors, HfMoeSwaHooksA::gpt2Vocab)
                         .withIndexedBlockCount(HfMoeSwaHooksC::mellumBlocks)
-                        .withExtra(HfMoeSwaHooksC::mellumExtra),
+                        .withExtra(HfMoeSwaHooksC::mellumExtra)
+                        .withMtpExport(true)
+                        .withMtpOnlyRootKeep(HfMtpRoots.COMMON)
+                        .withMtpOnlyGuard(cfg -> cfg.findInt(0, "num_nextn_predict_layers",
+                                "num_mtp_layers") > 0),
                 HfArchEntry.of(Arrays.asList("MiMoV2FlashForCausalLM", "MiMoV2ForCausalLM"),
                                 HfArchResolver.of(Arch.MIMO2), HfMoeSwaHooksB::mimoMeta, HfMoeSwaHooksB::mimoTensors,
                                 HfMoeSwaHooksA::gpt2Vocab)
                         .withIndex(HfMoeSwaHooksB::mimoIndex)
                         .withIndexedBlockCount(HfMoeSwaHooksB::mimoBlocks)
                         .withNameFilter(HfMoeSwaHooksB.MIMO_FILTER)
-                        .withExtra(HfMoeSwaHooksB::mimoExtra),
+                        .withExtra(HfMoeSwaHooksB::mimoExtra)
+                        .withMtpExport(true)
+                        .withMtpOnlyRootKeep(HfMtpRoots.COMMON),
                 HfArchEntry.of(Collections.singletonList("MuseSparkForConditionalGeneration"),
                                 HfArchResolver.of(Arch.MUSE_SPARK), HfMoeSwaHooksD::museSparkMeta,
                                 HfMoeSwaHooksD::museSparkTensors, HfMoeSwaHooksD::museSparkVocab),
@@ -112,11 +118,15 @@ final class HfArchTableMoeSwa {
                                 HfArchResolver.of(Arch.SMALLTHINKER), HfMoeSwaHooksC::smallthinkerMeta,
                                 HfMoeSwaHooksC::smallthinkerTensors, HfMoeSwaHooksA::gpt2Vocab)
                         .withExtra(HfMoeSwaHooksC::smallthinkerExtra),
-                HfArchEntry.of(Arrays.asList("Step3p5ForCausalLM", "Step3p7ForConditionalGeneration"),
+                // Step3p5MTP is the draft-model view of the same checkpoint: its MTP layers are the appended NextN
+                // blocks this entry keeps (the num_nextn_predict_layers of the text model).
+                HfArchEntry.of(Arrays.asList("Step3p5ForCausalLM", "Step3p7ForConditionalGeneration", "Step3p5MTP"),
                                 HfArchResolver.of(Arch.STEP35), HfMoeSwaHooksD::step35Meta,
                                 HfMoeSwaHooksD::step35Tensors, HfMoeSwaHooksA::gpt2Vocab)
                         .withIndexedBlockCount(HfMoeSwaHooksD::step35Blocks)
                         .withNameFilter(HfMoeSwaHooksD.STEP35_FILTER)
-                        .withExtra(HfMoeSwaHooksD::step35Extra)));
+                        .withExtra(HfMoeSwaHooksD::step35Extra)
+                        .withMtpExport(true)
+                        .withMtpOnlyRootKeep(HfMtpRoots.COMMON)));
     }
 }

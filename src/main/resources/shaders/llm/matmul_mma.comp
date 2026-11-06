@@ -1,0 +1,193 @@
+/* matmul_mma.comp - cooperative-matrix (tensor-core) GEMM over the dense 16-bit weight types, the
+ * Vulkan twin of NF_MMA_GEMM and NF_MMA_GEMM_KSPLIT (kernels/llm/common/matmul_mma_family.h,
+ * instantiated in kernels/llm/matmul_mma.cl). Requires: common/nf_common.glsl.
+ *
+ * Variant rows (sg so a dispatch of the full workgroup runs the __sg module with
+ * REQUIRE_FULL_SUBGROUPS):
+ *     F16_MatMul_MMA         matmul_mma.comp                  sg
+ *     BF16_MatMul_MMA        matmul_mma.comp  NF_MMA_BF16=1   sg
+ *     F16_MatMul_MMA_KSplit  matmul_mma.comp  NF_SPLIT_K=1    sg
+ *     BF16_MatMul_MMA_KSplit matmul_mma.comp  NF_MMA_BF16=1 NF_SPLIT_K=1  sg
+ * NF_MMA_BF16=1 reads bfloat16 weight bits and converts them to fp16 tiles, so results carry the
+ * bf16 -> fp16 rounding of the staged tiles on top of the fp16 products and weights beyond the fp16
+ * range saturate. A native bf16 cooperative-matrix twin (VK_KHR_shader_bfloat16, llama.cpp
+ * coopmat_bf16_support) is the parity form; its GLSL module needs GL_EXT_shader_bfloat16, which the
+ * build's glslc / glslangValidator do not support yet. The dispatch
+ * (gguf.gpu.forward.GpuOps) therefore serves BF16 weights on Vulkan with the exact tiled GEMM, and
+ * these rows complete the kernel inventory of the backend (BF16 runs on the bfloat16 mma instruction
+ * of CUDA sm_80+).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   plain:  (i M, i K, i N, i x_stride, i x_off, i y_stride, i y_off, R uint16 weight, R float x,
+ *            W float y)
+ *   ksplit: (i M, i K, i N, i x_stride, i x_off, i k_slice, R uint16 weight, R float x,
+ *            W float partial)
+ *   y[y_off + t*y_stride + r] = sum_{k < K} W[r][k] * x[x_off + t*x_stride + k],  r < M, t < N; the
+ *   split-K twin writes partial[(slice * N + t) * M + r] for k in slice * k_slice .. +k_slice, slice
+ *   taken from the work-group id, and LLM_SplitK_Reduce sums the planes into the output.
+ * The weight is row-major [M x K] (IEEE-half, or bfloat16 bits under NF_MMA_BF16).
+ *
+ * Compute: 16x16x16 f16*f16 -> f32 cooperative matrices per subgroup (VK_KHR_cooperative_matrix).
+ * A workgroup of 256 invocations computes 64 weight rows x 32 tokens in 16-deep stages. The 8 output
+ * blocks of 16 rows x 16 tokens are distributed cyclically over the workgroup's subgroups, so the
+ * kernel is correct for every full-subgroup size that divides 256. Products are computed in fp16 and
+ * accumulated in fp32, so results differ from the scalar paths by f16 rounding, as in llama.cpp
+ * ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp (COOPMAT). Rows past M, tokens past N and depths
+ * past K load 0; the stage stores to a shared staging tile and copy out bounds-checked.
+ *
+ * Dispatch: 2-D (never folded), global = {ceil(M / 64) * 256 * split, ceil(N / 32), 1}, local =
+ * {256, 1, 1}. Requires VK_KHR_cooperative_matrix, shaderFloat16, full subgroups and
+ * vulkanMemoryModel (glslang declares the Vulkan memory model for every cooperative-matrix module;
+ * the dispatch picker checks the device features before selecting this kernel; see
+ * DeviceFeature.COOPERATIVE_MATRIX).
+ * Shared memory: a 64 x 24 half tile, a 32 x 40 half tile and 8 * 16 * 16 stage floats.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfMmaWeight { uint16_t w_u16[]; };
+layout(std430, binding = 1) readonly buffer NfMmaInput { float x_in[]; };
+#ifdef NF_SPLIT_K
+layout(std430, binding = 2) writeonly buffer NfMmaPartial { float partial_out[]; };
+layout(push_constant) uniform NfMmaParams {
+    int M; int K; int N; int x_stride; int x_off; int k_slice;
+} pc;
+#define NF_MMA_OUT partial_out
+#else
+layout(std430, binding = 2) writeonly buffer NfMmaOutput { float y_out[]; };
+layout(push_constant) uniform NfMmaParams {
+    int M; int K; int N; int x_stride; int x_off; int y_stride; int y_off;
+} pc;
+#define NF_MMA_OUT y_out
+#endif
+
+#define NF_MMA_TM 64                          /* weight rows per workgroup tile */
+#define NF_MMA_TN 32                          /* tokens per workgroup tile */
+#define NF_MMA_TK 16                          /* reduction depth of one stage */
+#define NF_MMA_CM 16                          /* cooperative-matrix edge (M = K = N = 16) */
+#define NF_MMA_AS 24                          /* padded half stride of a weight-tile row */
+#define NF_MMA_BS 40                          /* padded half stride of an activation-tile row */
+#define NF_MMA_BLOCKS ((NF_MMA_TM / NF_MMA_CM) * (NF_MMA_TN / NF_MMA_CM)) /* 4 row blocks x 2 token blocks */
+
+#ifdef NF_MMA_BF16
+/* bfloat16 bits -> float16_t (llama.cpp mul_mm.comp converts DATA_A_BF16 into the fp16 tiles). */
+float16_t nf_mma_w(uint idx) {
+    return float16_t(unpackHalf2x16(uint(w_u16[idx]) << 16u).x);
+}
+#else
+float16_t nf_mma_w(uint idx) {
+    return float16_t(unpackHalf2x16(uint(w_u16[idx])).x);
+}
+#endif
+
+shared float16_t nf_mma_a[NF_MMA_TM * NF_MMA_AS];
+shared float16_t nf_mma_b[NF_MMA_TN * NF_MMA_BS];
+shared float nf_mma_stage[NF_MMA_BLOCKS * NF_MMA_CM * NF_MMA_CM];
+
+void main() {
+    const int M = pc.M;
+    const int K = pc.K;
+    const int N = pc.N;
+#ifdef NF_SPLIT_K
+    const int rtiles = (M + NF_MMA_TM - 1) / NF_MMA_TM;
+    const int slice = int(gl_WorkGroupID.x) / rtiles;
+    const int m0 = (int(gl_WorkGroupID.x) - slice * rtiles) * NF_MMA_TM;
+    const int kb = slice * pc.k_slice;
+    const int ke = min(kb + pc.k_slice, K);
+#else
+    const int m0 = int(gl_WorkGroupID.x) * NF_MMA_TM;
+    const int kb = 0;
+    const int ke = K;
+#endif
+    const int n0 = int(gl_WorkGroupID.y) * NF_MMA_TN;
+    const uint lid = gl_LocalInvocationID.x;
+    const uint sgid = gl_SubgroupID;
+    const uint nsg = gl_NumSubgroups;
+
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ca =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(float16_t(0.0));
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> cb =
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(float16_t(0.0));
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NF_MMA_BLOCKS];
+    for (uint b = 0u; b < uint(NF_MMA_BLOCKS); ++b) {
+        acc[b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
+#ifdef NF_SPLIT_K
+    for (int k0 = kb; k0 < ke; k0 += NF_MMA_TK) {
+#else
+    for (int k0 = 0; k0 < K; k0 += NF_MMA_TK) {
+#endif
+        /* stage the weight rows: invocation lid of a 16-row-lane x 16-depth-lane grid */
+        {
+            const uint tx = lid & 15u, ty = lid >> 4;
+            for (uint q = 0u; q < 4u; ++q) {
+                const int r = m0 + int(tx) + 16 * int(q);
+                const int k = k0 + int(ty);
+                const bool ok = r < M && k < K;
+                nf_mma_a[(tx + 16u * q) * uint(NF_MMA_AS) + ty] =
+                    ok ? nf_mma_w(uint(r) * uint(K) + uint(k)) : float16_t(0.0);
+            }
+            for (uint j = 0u; j < 2u; ++j) {
+                const int t = n0 + int(ty) + 16 * int(j);
+                const int k = k0 + int(tx);
+                const bool ok = t < N && k < K;
+                nf_mma_b[(ty + 16u * j) * uint(NF_MMA_BS) + tx] =
+                    ok ? float16_t(x_in[uint(pc.x_off) + uint(t) * uint(pc.x_stride) + uint(k)])
+                       : float16_t(0.0);
+            }
+        }
+        barrier();
+        for (uint i = 0u; i < uint(NF_MMA_BLOCKS); ++i) {
+            const uint b = sgid + i * nsg;
+            if (b >= uint(NF_MMA_BLOCKS)) {
+                break;
+            }
+            const uint br = b >> 1, bc = b & 1u;
+            coopMatLoad(ca, nf_mma_a, br * uint(NF_MMA_CM) * uint(NF_MMA_AS), uint(NF_MMA_AS),
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(cb, nf_mma_b, bc * uint(NF_MMA_CM) * uint(NF_MMA_BS), uint(NF_MMA_BS),
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            acc[i] = coopMatMulAdd(ca, cb, acc[i]);
+        }
+        barrier();
+    }
+
+    /* stage and copy out, bounds-checked per element */
+    for (uint i = 0u; i < uint(NF_MMA_BLOCKS); ++i) {
+        const uint b = sgid + i * nsg;
+        if (b >= uint(NF_MMA_BLOCKS)) {
+            break;
+        }
+        const int br = int(b >> 1), bc = int(b & 1u);
+        coopMatStore(acc[i], nf_mma_stage, b * uint(NF_MMA_CM * NF_MMA_CM), uint(NF_MMA_CM),
+                     gl_CooperativeMatrixLayoutRowMajor);
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared,
+                       gl_SemanticsAcquireRelease);
+        const uint lane = gl_SubgroupInvocationID;
+        for (uint e = lane; e < uint(NF_MMA_CM * NF_MMA_CM); e += gl_SubgroupSize) {
+            const int r = m0 + br * 16 + int(e >> 4);
+#ifdef NF_SPLIT_K
+            const int t = n0 + bc * 16 + int(e & 15u);
+            if (r < M && t < N) {
+                NF_MMA_OUT[(uint(slice) * uint(N) + uint(t)) * uint(M) + uint(r)] =
+                    nf_mma_stage[b * 256u + e];
+            }
+#else
+            const int t = n0 + bc * 16 + int(e & 15u);
+            if (r < M && t < N) {
+                NF_MMA_OUT[uint(pc.y_off) + uint(t) * uint(pc.y_stride) + uint(r)] =
+                    nf_mma_stage[b * 256u + e];
+            }
+#endif
+        }
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared,
+                       gl_SemanticsAcquireRelease);
+    }
+}

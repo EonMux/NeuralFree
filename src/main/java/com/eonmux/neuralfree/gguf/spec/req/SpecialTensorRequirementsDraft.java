@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.arch.TensorRequirement.LayerCondition;
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement.LayerSpan;
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement.ModelCondition;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
+import com.eonmux.neuralfree.gguf.spec.TensorNames;
 
 import java.util.List;
 
@@ -48,16 +49,79 @@ public final class SpecialTensorRequirementsDraft {
     private SpecialTensorRequirementsDraft() {
     }
 
-    /** eagle3.cpp:38-101; {@code enc.output_norm.weight} is required when {@code norm_before_fc} is set (:60-62). */
+    /**
+     * eagle3.cpp:38-101; {@code enc.output_norm.weight} is required when {@code norm_before_fc} is set (:60-62). The
+     * optional entries carry the draft layouts of vLLM's further EAGLE-3 families: the per-head Q/K norms of Qwen3
+     * attention ({@code attn_q_norm} / {@code attn_k_norm}), the Q/K/V biases of {@code attention_bias} checkpoints
+     * and the per-tap encoder norms of {@code fc_norm} checkpoints ({@code fc_norm.<part>.weight}, one per target
+     * tap).
+     *
+     * <p>A draft whose hparams carry MLA ({@code isMla()}, the {@code Eagle3DeepseekV2ForCausalLM} layout) replaces
+     * the GQA projections with the MLA ones: the low-rank query path ({@code attn_q_a} -> {@code attn_q_a_norm} ->
+     * {@code attn_q_b}, or {@code attn_q} when the checkpoint has no query LoRA) and the latent KV path
+     * ({@code attn_kv_a_mqa} -> {@code attn_kv_a_norm}), with the decompression of {@code kv_b_proj} stored either
+     * absorbed ({@code attn_k_b} / {@code attn_v_b}) or decompressed ({@code attn_kv_b}).
+     */
     public static List<TensorRequirement> eagle3() {
+        LayerCondition mla = (hp, il) -> hp.isMla();
+        LayerCondition gqa = (hp, il) -> !hp.isMla();
+        LayerCondition qLora = (hp, il) -> hp.isMla() && hp.nLoraQ() > 0;
+        LayerCondition qDirect = (hp, il) -> hp.isMla() && hp.nLoraQ() == 0;
         return SpecialTensorRequirements.builder()
                 .modelOptional("d2t")
                 .model("fc.weight")
+                .modelOptional(TensorNames.fcNorm(0), TensorNames.fcNorm(1), TensorNames.fcNorm(2))
                 .modelWhen(ModelHparams::normBeforeFc, "enc.output_norm.weight")
                 .model("output_norm.weight")
                 .modelOptional("output.weight", "token_embd.weight")
-                .layer("attn_norm.weight", "attn_norm_2.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-                        "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight", "ffn_down.weight", "ffn_up.weight")
+                .layer("attn_norm.weight", "attn_norm_2.weight", "attn_output.weight", "ffn_norm.weight",
+                        "ffn_gate.weight", "ffn_down.weight", "ffn_up.weight")
+                .layerWhen(gqa, "attn_q.weight", "attn_k.weight", "attn_v.weight")
+                .layerWhen(qLora, "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight")
+                .layerWhen(qDirect, "attn_q.weight")
+                .layerWhen(mla, "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight")
+                .layerAnyOf(mla, new String[]{"attn_k_b.weight", "attn_v_b.weight"},
+                        new String[]{"attn_kv_b.weight"})
+                .layerOptional("attn_q_norm.weight", "attn_k_norm.weight")
+                .layerOptional("attn_q.bias", "attn_k.bias", "attn_v.bias")
+                .ropeFreqsOptional()
+                .build();
+    }
+
+    /**
+     * The concat-fc drafters (vLLM {@code EagleMistralLarge3ForCausalLM}, {@code EagleLlama4ForCausalLM},
+     * {@code EagleMiniCPMForCausalLM} and {@code EagleCohereForCausalLM}): the fusion projection over
+     * {@code [embedding | target hidden]}, one or more standard decoder layers, the output norm and the drafter's own
+     * or the target's embedding and LM head. The fusion input norms ({@code enc.input_norm1} /
+     * {@code enc.input_norm2}, MiniCPM) are present only in the checkpoints that keep them, and a {@code d2t} map
+     * only when the draft reduces its vocabulary. The Mistral Large 3 draft runs MLA, so its layer carries the
+     * DeepSeek projections instead of the GQA ones; the Cohere draft has no FFN input norm (its parallel block
+     * reuses the attention norm).
+     */
+    public static List<TensorRequirement> eagleFc(boolean mla, boolean parallelBlock) {
+        LayerCondition mlaLayer = (hp, il) -> hp.isMla();
+        LayerCondition gqa = (hp, il) -> !hp.isMla();
+        LayerCondition qLora = (hp, il) -> hp.isMla() && hp.nLoraQ() > 0;
+        LayerCondition qDirect = (hp, il) -> hp.isMla() && hp.nLoraQ() == 0;
+        SpecialTensorRequirements.Builder b = SpecialTensorRequirements.builder()
+                .modelOptional("d2t")
+                .model("fc.weight")
+                .modelOptional("fc.bias")
+                .modelOptional(TensorNames.ENC_INPUT_NORM1 + ".weight", TensorNames.ENC_INPUT_NORM2 + ".weight")
+                .modelOptional("output_norm.weight")
+                .modelOptional("output.weight", "token_embd.weight")
+                .layer("attn_norm.weight", "attn_output.weight", "ffn_gate.weight", "ffn_down.weight",
+                        "ffn_up.weight")
+                .layerWhen(gqa, "attn_q.weight", "attn_k.weight", "attn_v.weight")
+                .layerWhen(qLora, "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight")
+                .layerWhen(qDirect, "attn_q.weight")
+                .layerWhen(mlaLayer, "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight")
+                .layerAnyOf(mlaLayer, new String[]{"attn_k_b.weight", "attn_v_b.weight"},
+                        new String[]{"attn_kv_b.weight"});
+        if (!parallelBlock) {
+            b.layer("ffn_norm.weight");
+        }
+        return b.layerOptional("attn_q.bias", "attn_k.bias", "attn_v.bias", "attn_q_norm.weight", "attn_k_norm.weight")
                 .ropeFreqsOptional()
                 .build();
     }
@@ -106,7 +170,7 @@ public final class SpecialTensorRequirementsDraft {
                         "selector_successor.weight")
                 .addAll(lilicorrHead())
                 .model("fc.weight")
-                .modelOptional("fc.scale")
+                .modelOptional("fc.scale", "fc.input_scale")
                 .model("enc.output_norm.weight", "output_norm.weight")
                 .modelOptional("output.weight")
                 .addAll(dflashDsv4Stages())

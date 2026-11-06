@@ -290,7 +290,10 @@ public final class HfQwenLinearHooks {
             }
         }
 
-        /** Dim 0 from entry {@code from} on, {@code nV} heads of {@code headDim} entries, reordered. */
+        /**
+         * Dim 0 from entry {@code from} on, {@code nV} heads of {@code headDim} entries, reordered; the stored rows
+         * stay traceable for online quantization, which tiles in vLLM's stored order.
+         */
         RowSource rows(RowSource src, long from, int headDim) {
             long[] shape = src.shape();
             long n = (long) nV * headDim;
@@ -298,11 +301,7 @@ public final class HfQwenLinearHooks {
                 throw new GgufFormatException("tensor '" + name + "' of shape " + Arrays.toString(shape)
                         + " does not hold " + nV + " value heads of " + headDim + " after " + from + " entries");
             }
-            if (from == 0) {
-                return RowTransforms.gatherRows(src, headDim, order);
-            }
-            RowSource heads = RowTransforms.gatherRows(RowTransforms.sliceRows(src, from, n), headDim, order);
-            return RowTransforms.concatRows(Arrays.asList(RowTransforms.sliceRows(src, 0, from), heads));
+            return RowTransforms.permuteRowGroups(src, from, headDim, order);
         }
 
         /** The innermost dimension, {@code nV} groups of {@code groupWidth} columns, reordered. */

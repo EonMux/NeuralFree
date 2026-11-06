@@ -21,8 +21,8 @@ import java.util.zip.Inflater;
 
 /**
  * A {@code torch.save} zip container (a {@code pytorch_model*.bin} / {@code .pt} / {@code .pth} file): its
- * central-directory entries and positional reads of entry bytes, nothing extracted up front. Untrusted input
- * (§3.6): the central directory, the local headers and the deflate streams of a downloaded file are parsed with
+ * central-directory entries and positional reads of entry bytes, nothing extracted up front. Untrusted input:
+ * the central directory, the local headers and the deflate streams of a downloaded file are parsed with
  * explicit caps ({@link #MAX_ENTRIES}, {@link #MAX_DIRECTORY_BYTES}, {@link #MAX_INFLATED_BYTES}), the classic and
  * the ZIP64 end-of-central-directory forms are read as torch writes them, and encrypted entries and compression
  * methods beyond stored and deflated are refused with a named error rather than trusted.
@@ -418,7 +418,7 @@ public final class TorchZipReader implements AutoCloseable {
         }
         ByteBuffer header = ByteBuffer.allocate(LOCAL_RECORD_FIXED);
         readFully(ch, header, localOffset);
-        if (header.getInt(0) != LOCAL_RECORD) {
+        if (intAt(header.array(), 0) != LOCAL_RECORD) {
             throw invalid(file, "entry '" + name + "' has no local header at " + localOffset);
         }
         int nameLen = shortAt(header.array(), 26) & 0xFFFF;

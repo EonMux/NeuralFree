@@ -12,6 +12,7 @@ import java.util.Arrays;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -78,13 +79,18 @@ public class RowTransformsTest {
 
     /** {@code s} as if stored unchanged at virtual offset {@code offset}. */
     static RowSource direct(RowSource s, long offset) {
-        return new Wrapped(s, offset, null, null, null, null, null);
+        return new Wrapped(s, offset, null, null, null, null, null, null);
     }
 
     /** {@code s} carrying the given sibling values. */
     static RowSource withSiblings(RowSource s, float[] outputScale, float[] inputScale, int[] zeroPoint, int[] perm,
                                   ActQuantScheme scheme) {
-        return new Wrapped(s, -1, outputScale, inputScale, zeroPoint, perm, scheme);
+        return withSiblings(s, outputScale, inputScale, zeroPoint, perm, scheme, null);
+    }
+
+    static RowSource withSiblings(RowSource s, float[] outputScale, float[] inputScale, int[] zeroPoint, int[] perm,
+                                  ActQuantScheme scheme, float[] inputPreScale) {
+        return new Wrapped(s, -1, outputScale, inputScale, zeroPoint, perm, scheme, inputPreScale);
     }
 
     private static final class Wrapped implements RowSource {
@@ -95,8 +101,10 @@ public class RowTransformsTest {
         private final int[] zp;
         private final int[] perm;
         private final ActQuantScheme scheme;
+        private final float[] pre;
 
-        Wrapped(RowSource s, long direct, float[] os, float[] is, int[] zp, int[] perm, ActQuantScheme scheme) {
+        Wrapped(RowSource s, long direct, float[] os, float[] is, int[] zp, int[] perm, ActQuantScheme scheme,
+                float[] pre) {
             this.s = s;
             this.direct = direct;
             this.os = os;
@@ -104,6 +112,7 @@ public class RowTransformsTest {
             this.zp = zp;
             this.perm = perm;
             this.scheme = scheme;
+            this.pre = pre;
         }
 
         @Override
@@ -170,6 +179,11 @@ public class RowTransformsTest {
         public ActQuantScheme actQuant() {
             return scheme;
         }
+
+        @Override
+        public float[] inputPreScale() {
+            return pre == null ? null : pre.clone();
+        }
     }
 
     /** {@code w.reshape(n, 2, d0 / n / 2, cols).swapaxes(1, 2).reshape(d0, cols)} written out with explicit loops. */
@@ -223,6 +237,53 @@ public class RowTransformsTest {
         assertArrayEquals(llamaPermute(values(w), 8, 2, 2), values(RowTransforms.reversePermute(w, 4, 2)), 0f);
         assertArrayEquals(llamaPermute(values(w), 8, 2, 4), values(RowTransforms.reversePermute(w, 4, 4)), 0f);
         assertArrayEquals(llamaPermute(values(w), 8, 2, 2), values(RowTransforms.rotateHalfUnpermute(w, 2)), 0f);
+    }
+
+    @Test
+    public void storedRowsTraceThroughPermutesAndRowGroupReorders() throws IOException {
+        RowSource w = seq(8, 2);
+        assertSame(w, RowTransforms.storedSource(w));
+        assertEquals(5, RowTransforms.storedRow(w, 5));
+        RowSource p = RowTransforms.permuteQk(w, 2, 2);
+        RowSource g = RowTransforms.permuteRowGroups(p, 2, 2, new int[]{2, 0, 1});
+        assertArrayEquals(new float[]{0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 8, 9, 10, 11},
+                values(RowTransforms.permuteRowGroups(w, 2, 2, new int[]{2, 0, 1})), 0f);
+        float[] stored = values(w);
+        for (RowSource s : new RowSource[]{p, g}) {
+            assertSame(s.describe(), w, RowTransforms.storedSource(s));
+            float[] got = values(s);
+            for (int r = 0; r < 8; r++) {
+                long at = RowTransforms.storedRow(s, r);
+                assertArrayEquals(s.describe() + " row " + r,
+                        new float[]{stored[(int) (2 * at)], stored[(int) (2 * at + 1)]},
+                        new float[]{got[2 * r], got[2 * r + 1]}, 0f);
+            }
+        }
+        assertEquals("the pair swap's row 1 is stored row 2", 2, RowTransforms.storedRow(p, 1));
+        assertEquals(RowTransforms.storedRow(p, 6), RowTransforms.storedRow(g, 2));
+    }
+
+    @Test
+    public void untracedReordersAreTheirOwnStoredSource() {
+        RowSource w = seq(12);
+        RowSource neox = RowTransforms.normalToNeoxPartial(w, 2, 6, 4);
+        assertSame(neox, RowTransforms.storedSource(neox));
+        assertEquals(1, RowTransforms.storedRow(neox, 1));
+        RowSource gathered = RowTransforms.gatherRows(seq(4, 2), 1, new int[]{3, 1});
+        assertSame(gathered, RowTransforms.storedSource(gathered));
+    }
+
+    @Test
+    public void permuteRowGroupsRefusesNonPermutationsAndPartialUnits() {
+        RowSource w = seq(8, 2);
+        assertThrows(IllegalArgumentException.class,
+                () -> RowTransforms.permuteRowGroups(w, 2, 2, new int[]{0, 0, 1}));
+        assertThrows(IllegalArgumentException.class,
+                () -> RowTransforms.permuteRowGroups(w, 2, 2, new int[]{0, 3, 1}));
+        assertThrows(IllegalArgumentException.class,
+                () -> RowTransforms.permuteRowGroups(w, 0, 2, new int[]{1, 0, 2}));
+        assertThrows(IllegalArgumentException.class,
+                () -> RowTransforms.permuteRowGroups(w, 2, 0, new int[]{}));
     }
 
     @Test

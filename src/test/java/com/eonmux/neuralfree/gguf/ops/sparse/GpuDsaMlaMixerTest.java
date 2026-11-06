@@ -349,9 +349,9 @@ public class GpuDsaMlaMixerTest {
         assertEquals(IDX_HEADS, score.intArg(2));
         assertEquals(IDX_DIM, score.intArg(3));
         assertEquals(1, score.intArg(4));
-        assertSame(idx.keys, score.bufferArg(9));
-        assertSame(memory.steps.qPos, score.bufferArg(10));
-        assertSame(memory.steps.kvPos, score.bufferArg(11));
+        assertSame(idx.keys, score.bufferArg(SparseKernels.ARG_SCORE_KEYS));
+        assertSame(memory.steps.qPos, score.bufferArg(SparseKernels.ARG_SCORE_Q_POS));
+        assertSame(memory.steps.kvPos, score.bufferArg(SparseKernels.ARG_SCORE_KV_POS));
 
         Dispatch topK = only(ds, SparseKernels.TOPK_ROWS);
         assertArrayEquals(new int[]{1, 6, TOP_K}, new int[]{topK.intArg(0), topK.intArg(1), topK.intArg(2)});
@@ -418,10 +418,10 @@ public class GpuDsaMlaMixerTest {
         assertSame(idx.keys, store.bufferArg(7));
         Dispatch score = only(ds, SparseKernels.indexerScore(type));
         assertEquals(IDX_DIM, score.intArg(3));
-        assertSame(idx.keys, score.bufferArg(9));
+        assertSame(idx.keys, score.bufferArg(SparseKernels.ARG_SCORE_KEYS));
         assertEquals(2, all(ds, HadamardSpec.KERNEL).size());
         for (KvDType other : KvDType.values()) {
-            if (other != type) {
+            if (other != type && other.hasSparseKernel()) {
                 assertFalse(names(ds).contains(SparseKernels.indexerScore(other)));
             }
         }
@@ -533,9 +533,7 @@ public class GpuDsaMlaMixerTest {
         GpuBuffer selection = only(full, SparseKernels.TOPK_ROWS).bufferArg(4);
         List<Dispatch> shared = decode(ms.get(1), 9);
 
-        for (KvDType type : KvDType.values()) {
-            assertFalse(names(shared).contains(SparseKernels.indexerScore(type)));
-        }
+        assertFalse(names(shared).stream().anyMatch(n -> n.startsWith(SparseKernels.DSA_INDEXER_SCORE_PREFIX)));
         assertFalse(names(shared).contains(SparseKernels.TOPK_ROWS));
         assertFalse(names(shared).contains(RopeKernels.kvStore(KvDType.F16)));
         Dispatch sparse = only(shared, SparseKernels.sparseDecode(KvDType.F32));

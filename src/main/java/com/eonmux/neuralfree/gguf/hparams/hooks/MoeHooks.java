@@ -123,6 +123,24 @@ public final class MoeHooks {
     }
 
     /**
+     * The InternS1-Pro text backbone (vLLM interns1_pro.py, reusing the Qwen3-VL MoE text model): deepstack count,
+     * MoE FFN width, RMS epsilon and softmax routing whose weight normalization follows the checkpoint's
+     * {@code norm_topk_prob}, and FoPE required, since the architecture's rotation is defined by its learned
+     * coefficients.
+     */
+    public static void internS1Pro(ModelHparamsBuilder b, GgufKv kv) {
+        b.nDeepstackLayers(kv.u32(GgufKeys.NUM_DEEPSTACK_LAYERS, b.nDeepstackLayers()));
+        HparamsSupport.readExpertFfLength(b, kv, false);
+        rmsEps(b, kv);
+        MoeHooksSupport.requireExperts(b, "interns1-pro");
+        b.gating(GatingFunc.SOFTMAX).expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, true));
+        if (!b.ropeFope()) {
+            throw new GgufFormatException("metadata key '" + kv.key(GgufKeys.ROPE_FOPE_USE) + "': interns1-pro"
+                    + " rotates with the Fourier position embedding and cannot run without it");
+        }
+    }
+
+    /**
      * models/phimoe.cpp:3-4. No sliding window is configured (the phi3 SWA branch is not part of the phimoe
      * loader). Graph (phi3 template, models/phi3.cpp:160-162): softmax, normalized.
      */
@@ -209,6 +227,73 @@ public final class MoeHooks {
         b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, b.expertWeightsScale())); // :8
         b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, b.expertWeightsNorm())); // :9
         b.gating(requiredGating(kv));                                                     // :10
+    }
+
+    /**
+     * vLLM's Step3 text trunk (step3_text.py): the shared query projection's RMS post-norm width
+     * ({@code attention.q_lora_rank}), a dense lead and then routed plus one plain shared expert. The class routes
+     * with softmax, renormalizes only when the file sets {@code expert_weights_norm} and applies no weight scale.
+     * A block is MoE exactly when its {@code ffn_gate_inp} is present.
+     */
+    public static void step3Text(ModelHparamsBuilder b, GgufKv kv) {
+        rmsEps(b, kv);
+        b.nLoraQ(kv.u32Required(GgufKeys.ATTENTION_Q_LORA_RANK));
+        HparamsSupport.readExpertFfLength(b, kv, true);
+        b.nFfShexp(kv.u32(GgufKeys.EXPERT_SHARED_FEED_FORWARD_LENGTH, b.nFfShexp()));
+        b.nExpertShared(kv.u32(GgufKeys.EXPERT_SHARED_COUNT, b.nExpertShared()));
+        b.gating(gating(kv, GatingFunc.SOFTMAX));
+        b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, b.expertWeightsNorm()));
+        b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, b.expertWeightsScale()));
+    }
+
+    /**
+     * vLLM's openPangu MoE trunk without MLA or sink attention: the pangu-embedded attention, a dense lead and
+     * then routed plus shared experts. The class routes with sigmoid scores in one group, scales the routed
+     * output by {@code routed_scaling_factor} and renormalizes when {@code norm_topk_prob} is set; the values
+     * come from the file and default to sigmoid, scale 1 and no normalization.
+     */
+    public static void panguMoe(ModelHparamsBuilder b, GgufKv kv) {
+        rmsEps(b, kv);
+        HparamsSupport.readExpertFfLength(b, kv, true);
+        b.nFfShexp(kv.u32(GgufKeys.EXPERT_SHARED_FEED_FORWARD_LENGTH, b.nFfShexp()));
+        b.nLayerDenseLead(kv.u32(GgufKeys.LEADING_DENSE_BLOCK_COUNT, b.nLayerDenseLead()));
+        b.nExpertShared(kv.u32Required(GgufKeys.EXPERT_SHARED_COUNT));
+        b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, b.expertWeightsScale()));
+        b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, b.expertWeightsNorm()));
+        b.gating(gating(kv, GatingFunc.SIGMOID));
+        if (!HparamsSupport.readSlidingWindowPerLayer(b, kv, SwaType.STANDARD)) {
+            HparamsSupport.readSlidingWindow(b, kv, false);
+            if (b.nSwa() > 0) {
+                b.swaType(SwaType.STANDARD);
+                HparamsSupport.loadSwaPattern(b, kv, 0, false);
+            }
+        }
+        panguRopeType(b, kv);
+        b.sinkTokenCount(kv.u32(GgufKeys.ATTENTION_SINK_TOKEN_COUNT, b.sinkTokenCount()));
+        MoeHooksSupport.requireExpertsAfterLead(b, "pangu-moe", b.nLayer());
+    }
+
+    /**
+     * The rotary variant of the openPangu attention when the converter writes {@code rope.type}: the pangu-embedded
+     * attention is NEOX, the static sink attention rotates consecutive pairs over the first
+     * {@code qk_rope_dim} values (vLLM {@code OpenPanguSinkAttention._init_rotary_emb}, {@code
+     * is_neox_style=False}).
+     *
+     * @throws GgufFormatException for any value other than {@code norm} or {@code neox}
+     */
+    private static void panguRopeType(ModelHparamsBuilder b, GgufKv kv) {
+        String type = kv.str(GgufKeys.ROPE_TYPE, null);
+        if (type == null) {
+            return;
+        }
+        if ("norm".equals(type)) {
+            b.ropeType(com.eonmux.neuralfree.gguf.arch.RopeType.NORM);
+        } else if ("neox".equals(type)) {
+            b.ropeType(com.eonmux.neuralfree.gguf.arch.RopeType.NEOX);
+        } else {
+            throw new GgufFormatException("metadata key '" + kv.key(GgufKeys.ROPE_TYPE) + "' is '" + type
+                    + "'; the openPangu attention uses 'norm' or 'neox'");
+        }
     }
 
     /**

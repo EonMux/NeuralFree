@@ -12,15 +12,16 @@ import java.util.Objects;
  * llama.cpp and vLLM chat requests into and {@code GGUFTokenizer.formatChat(ChatRequest)} takes
  * ({@code ChatFormatter#format}): the {@code messages}, the {@code tools} (JSON-schema function
  * definitions, {@link ChatTool}), the {@code tool_choice}, the template variables
- * ({@code chat_template_kwargs}, {@code enable_thinking}, {@code reasoning_effort}) and the
- * generation-prompt controls ({@code add_generation_prompt}, {@code continue_final_message}) —
+ * ({@code chat_template_kwargs}, {@code enable_thinking}, {@code reasoning_effort}), the
+ * generation-prompt controls ({@code add_generation_prompt}, {@code continue_final_message}) and
+ * the per-request template override ({@code chat_template}) with its {@code documents} —
  * the inputs common_chat_template rendering takes in llama.cpp (common/chat.cpp apply_jinja,
  * server-chat.cpp:593).
  *
  * <p>Immutable. The builder copies the message list and every JSON-valued field in, and the
- * getters hand out unmodifiable views, so neither a caller nor a renderer can mutate a request
- * (§3.1: request descriptors are immutable and copy arrays in and out). Rendering happens on the
- * request thread (§3.3); one request formats one prompt.</p>
+ * getters hand out unmodifiable views, so neither a caller nor a renderer can mutate a request:
+ * request descriptors are immutable and copy arrays in and out. Rendering happens on the
+ * request thread; one request formats one prompt.</p>
  */
 public final class ChatRequest {
 
@@ -32,6 +33,8 @@ public final class ChatRequest {
     private final boolean continueFinalMessage;
     private final String reasoningEffort;
     private final Boolean enableThinking;
+    private final String chatTemplate;
+    private final List<Map<String, Object>> documents;
 
     private ChatRequest(Builder b) {
         this.messages = b.messages;
@@ -42,6 +45,8 @@ public final class ChatRequest {
         this.continueFinalMessage = b.continueFinalMessage;
         this.reasoningEffort = b.reasoningEffort;
         this.enableThinking = b.enableThinking;
+        this.chatTemplate = b.chatTemplate;
+        this.documents = b.documents;
     }
 
     /** A new builder: an empty conversation, no tools and no kwargs, generation prompt on. */
@@ -71,6 +76,20 @@ public final class ChatRequest {
         return Collections.unmodifiableMap(templateKwargs);
     }
 
+    /**
+     * The template variables this request sets, as the template sees them: {@code reasoning_effort} and
+     * {@code enable_thinking} when set, then every {@code chat_template_kwargs} entry over them (the order
+     * {@code ChatFormatter} binds them in). The request-dependent reasoning parsers read their switches here
+     * ({@code ReasoningFilter#forRequest}). Unmodifiable.
+     */
+    public Map<String, Object> templateVariables() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (reasoningEffort != null) out.put("reasoning_effort", reasoningEffort);
+        if (enableThinking != null) out.put("enable_thinking", enableThinking);
+        out.putAll(templateKwargs);
+        return Collections.unmodifiableMap(out);
+    }
+
     /** Whether the template adds the assistant generation prompt after the messages. */
     public boolean addGenerationPrompt() { return addGenerationPrompt; }
 
@@ -93,6 +112,54 @@ public final class ChatRequest {
      */
     public Boolean enableThinking() { return enableThinking; }
 
+    /**
+     * The per-request Jinja template that replaces the model's resolved template for this
+     * rendering only (vLLM {@code chat_template}); null renders with the model's own.
+     */
+    public String chatTemplate() { return chatTemplate; }
+
+    /**
+     * The documents a retrieval template renders into its context (vLLM {@code documents}); each
+     * is a JSON object, deep-copied. Empty when none were given, leaving the variable undefined.
+     */
+    public List<Map<String, Object>> documents() {
+        return Collections.unmodifiableList(documents);
+    }
+
+    /**
+     * This request over configured default template variables (vLLM's {@code --default-chat-template-kwargs},
+     * llama.cpp's {@code --chat-template-kwargs}), as vLLM's {@code ChatParams.with_defaults} merges them: a
+     * default applies unless the request sets that variable itself, through {@code chat_template_kwargs} or the
+     * top-level {@code enable_thinking} and {@code reasoning_effort}. A request kwarg that is null or
+     * {@code "auto"} counts as unset (vLLM's {@code merge_kwargs}), so the default replaces it. The applied
+     * defaults lead the kwargs, the request's own follow.
+     *
+     * @param defaults the default variables; null or empty leaves the request as it is
+     * @return this request when no default applies, else a new request
+     * @throws IllegalArgumentException when a default value is not a JSON value tree
+     */
+    public ChatRequest withDefaultTemplateKwargs(Map<String, ?> defaults) {
+        if (defaults == null || defaults.isEmpty()) return this;
+        Map<String, Object> merged = new LinkedHashMap<>();
+        for (Map.Entry<String, ?> e : defaults.entrySet()) {
+            if (!setsVariable(e.getKey())) merged.put(e.getKey(), e.getValue());
+        }
+        if (merged.isEmpty()) return this;
+        for (Map.Entry<String, Object> e : templateKwargs.entrySet()) {
+            if (!merged.containsKey(e.getKey())) merged.put(e.getKey(), e.getValue());
+        }
+        return toBuilder().templateKwargs(merged).build();
+    }
+
+    /** Whether this request sets template variable {@code name} to a value a default must not replace. */
+    private boolean setsVariable(String name) {
+        if ("enable_thinking".equals(name) && enableThinking != null) return true;
+        if ("reasoning_effort".equals(name) && reasoningEffort != null) return true;
+        if (!templateKwargs.containsKey(name)) return false;
+        Object value = templateKwargs.get(name);
+        return value != null && !"auto".equals(value);
+    }
+
     /** A new builder with this request's values. */
     public Builder toBuilder() {
         Builder b = new Builder();
@@ -104,6 +171,8 @@ public final class ChatRequest {
         b.continueFinalMessage = continueFinalMessage;
         b.reasoningEffort = reasoningEffort;
         b.enableThinking = enableThinking;
+        b.chatTemplate = chatTemplate;
+        b.documents = documents;
         return b;
     }
 
@@ -112,7 +181,9 @@ public final class ChatRequest {
         return "ChatRequest(" + messages.size() + " messages, " + tools.size() + " tools, toolChoice="
                 + toolChoice + ", kwargs=" + templateKwargs.keySet() + ", addGenerationPrompt="
                 + addGenerationPrompt + ", continueFinalMessage=" + continueFinalMessage
-                + ", reasoningEffort=" + reasoningEffort + ", enableThinking=" + enableThinking + ")";
+                + ", reasoningEffort=" + reasoningEffort + ", enableThinking=" + enableThinking
+                + ", chatTemplate=" + (chatTemplate == null ? "null" : chatTemplate.length() + " chars")
+                + ", documents=" + documents.size() + ")";
     }
 
     /** Builder of an immutable {@link ChatRequest}. */
@@ -126,6 +197,8 @@ public final class ChatRequest {
         private boolean continueFinalMessage = false;
         private String reasoningEffort = null;
         private Boolean enableThinking = null;
+        private String chatTemplate = null;
+        private List<Map<String, Object>> documents = new ArrayList<>();
 
         private Builder() {}
 
@@ -222,6 +295,47 @@ public final class ChatRequest {
         /** Sets {@code enable_thinking} of thinking templates; null leaves the variable unset. */
         public Builder enableThinking(Boolean enableThinking) {
             this.enableThinking = enableThinking;
+            return this;
+        }
+
+        /**
+         * Sets the per-request template override (vLLM {@code chat_template}).
+         *
+         * @throws IllegalArgumentException when the template is empty
+         */
+        public Builder chatTemplate(String chatTemplate) {
+            if (chatTemplate != null && chatTemplate.isEmpty()) {
+                throw new IllegalArgumentException("chat_template override is empty");
+            }
+            this.chatTemplate = chatTemplate;
+            return this;
+        }
+
+        /**
+         * Sets the documents a retrieval template renders into its context; each is validated (a
+         * JSON object) and deep-copied, as {@link #templateKwargs} copies its values.
+         *
+         * @throws IllegalArgumentException for a null list, a null document or a non-object document
+         */
+        public Builder documents(List<? extends Map<String, ?>> documents) {
+            if (documents == null) {
+                this.documents = new ArrayList<>();
+                return this;
+            }
+            List<Map<String, Object>> copy = new ArrayList<>(documents.size());
+            for (int i = 0; i < documents.size(); i++) {
+                Map<String, ?> document = documents.get(i);
+                if (document == null) {
+                    throw new IllegalArgumentException("document " + i + " is null");
+                }
+                Map<String, Object> entry = new LinkedHashMap<>();
+                for (Map.Entry<String, ?> e : document.entrySet()) {
+                    entry.put(String.valueOf(e.getKey()),
+                            ChatMessages.copyValue(e.getValue(), "document " + i + " key '" + e.getKey() + "'"));
+                }
+                copy.add(entry);
+            }
+            this.documents = copy;
             return this;
         }
 

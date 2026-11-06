@@ -4,15 +4,19 @@ import com.eonmux.neuralfree.gguf.ops.heads.LoraAdapter;
 
 /**
  * One runtime adapter of a {@link LoraRegistry}: its registry name, its loaded {@link LoraAdapter}, the scale the
- * requests use and its adapter identity — the content digest of §5.5.1 N-2 (the canonical view metadata, the tensor
+ * requests use and its adapter identity — the content digest (the canonical view metadata, the tensor
  * table and the tensor bytes under the exact-bytes rule) as the persistent identity of (digest, scale bits) in the
- * cache contexts, and the in-process revision of the held state. PC-0 mounts the N-2 epoch ids ({@code LoadIds}) on
- * the revision: every mutation — a reload, a static {@code setScale} also back at an earlier value, a slot change —
+ * cache contexts, and the in-process revision of the held state: every mutation — a reload, a static {@code setScale}
+ * also back at an earlier value, a slot change —
  * creates a new revision; two loads never share one, so no context of an earlier state is recreated by value.
- * A scale change of a per-request adapter rewrites no held state (LR-2 keys its slots by adapter and scale).
+ * A scale change of a per-request adapter rewrites no held state ({@link LoraSlotKey} keys the slots by adapter and scale).
+ *
+ * <p>A startup adapter ({@link #startup()}, llama.cpp {@code --lora} / {@code --lora-scaled}) is held by the model's
+ * attachment in slot 0 at its startup scale, which stays its default: the rows of requests that select no adapter
+ * run it; a request selects it at another scale, or leaves it out, through a slot of its own.</p>
  *
  * <p>Mutable: the registry and the attachment it serves mutate {@code scale}, {@code revision} and {@code holds} on
- * the engine thread, like {@code Sampler} (§3.1); the registry never hands a handle out while an event runs. The
+ * the engine thread, like {@code Sampler}; the registry never hands a handle out while an event runs. The
  * adapter's content is immutable; the revision and the hold count do not distinguish two loads of the same
  * name (use a different name for that).</p>
  * */
@@ -20,14 +24,25 @@ public final class LoraHandle {
 
     private final String name;
     private final LoraAdapter adapter;
+    private final boolean startup;
     private long revision;
     private float scale;
     private int holds;
 
     LoraHandle(String name, LoraAdapter adapter, float scale) {
+        this(name, adapter, scale, false);
+    }
+
+    LoraHandle(String name, LoraAdapter adapter, float scale, boolean startup) {
         this.name = name;
         this.adapter = adapter;
         this.scale = scale;
+        this.startup = startup;
+    }
+
+    /** True for a startup adapter of the model's configuration, held in slot 0 for the model's lifetime. */
+    public boolean startup() {
+        return startup;
     }
 
     /** The registry name of the adapter (unique among the residents). */
@@ -50,12 +65,12 @@ public final class LoraHandle {
         return scale;
     }
 
-    /** The revision of the held state: 0 at load, raised by every new epoch (PC-0 mounts {@code LoadIds}). */
+    /** The revision of the held state: 0 at load, raised by every mutation that opens a new epoch. */
     public long revision() {
         return revision;
     }
 
-    /** The content digest of the adapter (§5.5.1 N-2), as 64 lowercase hex characters. */
+    /** The content digest of the adapter, as 64 lowercase hex characters. */
     public String digest() {
         return adapter.digest();
     }
@@ -80,8 +95,8 @@ public final class LoraHandle {
     }
 
     /**
-     * Sets the scale of a per-request adapter without an epoch of held state: LR-2's slots key each request side by
-     * the adapter and this scale.
+     * Sets the scale of a per-request adapter without an epoch of held state: the per-request slots key each
+     * request side by the adapter and this scale.
      */
     public void useDefaultScale(float scale) {
         this.scale = scale;
@@ -103,6 +118,6 @@ public final class LoraHandle {
     @Override
     public String toString() {
         return "LoraHandle{" + name + ", " + adapter.path() + ", scale=" + scale + ", rev=" + revision + ", holds="
-                + holds + "}";
+                + holds + (startup ? ", startup" : "") + "}";
     }
 }

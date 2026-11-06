@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.gpu.block;
 
+import com.eonmux.neuralfree.acceleration.GpuModelUnsupportedException;
 import com.eonmux.neuralfree.gguf.arch.FfnKind;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
@@ -17,7 +18,7 @@ import java.util.Objects;
  * Resolves the GPU mixer, FFN block and layer extras of each layer from registered factories: one factory per
  * {@link MixerKind}, per {@link FfnKind} and per extra feature id.
  *
- * <p>Immutable. A layer whose kind or extra has no factory fails with {@link UnsupportedOperationException} naming the
+ * <p>Immutable. A layer whose kind or extra has no factory fails with {@link GpuModelUnsupportedException} naming the
  * kind, the layer and the architecture, so a model the GPU path cannot run is rejected at load time by
  * {@link #validate(ModelSpec)}.</p>
  */
@@ -68,6 +69,9 @@ public final class GpuBlockRegistry {
         this.extras = Collections.unmodifiableMap(em);
     }
 
+    private FfnDecorator ffnDecorator;
+    private MixerDecorator mixerDecorator;
+
     /** True when a factory serves this mixer kind. */
     public boolean hasMixer(MixerKind k) {
         return mixers.containsKey(k);
@@ -86,8 +90,8 @@ public final class GpuBlockRegistry {
     /**
      * An unbound mixer for the layer.
      *
-     * @throws IllegalArgumentException      when the layer has no mixer ({@link MixerKind#NONE})
-     * @throws UnsupportedOperationException when no factory serves the layer's mixer kind
+     * @throws IllegalArgumentException            when the layer has no mixer ({@link MixerKind#NONE})
+     * @throws GpuModelUnsupportedException when no factory serves the layer's mixer kind
      */
     public GpuMixer mixer(LayerSpec layer) {
         MixerKind k = layer.mixerKind();
@@ -96,16 +100,17 @@ public final class GpuBlockRegistry {
         }
         GpuMixerFactory f = mixers.get(k);
         if (f == null) {
-            throw new UnsupportedOperationException("no GPU mixer for " + k + " (layer " + describe(layer) + ")");
+            throw new GpuModelUnsupportedException("no GPU mixer for " + k + " (layer " + describe(layer) + ")");
         }
-        return Objects.requireNonNull(f.create(layer), "mixer factory for " + k + " returned null");
+        GpuMixer block = Objects.requireNonNull(f.create(layer), "mixer factory for " + k + " returned null");
+        return mixerDecorator != null ? mixerDecorator.mixer(layer, block) : block;
     }
 
     /**
      * An unbound FFN block for the layer.
      *
-     * @throws IllegalArgumentException      when the layer has no FFN ({@link FfnKind#NONE})
-     * @throws UnsupportedOperationException when no factory serves the layer's FFN kind
+     * @throws IllegalArgumentException            when the layer has no FFN ({@link FfnKind#NONE})
+     * @throws GpuModelUnsupportedException when no factory serves the layer's FFN kind
      */
     public GpuFfnBlock ffn(LayerSpec layer) {
         FfnKind k = layer.ffnKind();
@@ -114,15 +119,68 @@ public final class GpuBlockRegistry {
         }
         GpuFfnFactory f = ffns.get(k);
         if (f == null) {
-            throw new UnsupportedOperationException("no GPU FFN block for " + k + " (layer " + describe(layer) + ")");
+            throw new GpuModelUnsupportedException("no GPU FFN block for " + k + " (layer " + describe(layer) + ")");
         }
-        return Objects.requireNonNull(f.create(layer), "FFN factory for " + k + " returned null");
+        GpuFfnBlock block = Objects.requireNonNull(f.create(layer), "FFN factory for " + k + " returned null");
+        return ffnDecorator != null ? ffnDecorator.ffn(layer, block) : block;
+    }
+
+    /**
+     * This registry with the given decorator over its FFN blocks: {@code ffn(layer)} creates the kind's factory
+     * block, lets an already installed decorator replace it and then lets {@code decorator} replace that result, so
+     * successive calls compose (a row split over a hybrid load, say). The mixers and extras are shared.
+     */
+    public GpuBlockRegistry withFfnDecorator(FfnDecorator decorator) {
+        Objects.requireNonNull(decorator, "decorator");
+        FfnDecorator previous = ffnDecorator;
+        GpuBlockRegistry copy = new GpuBlockRegistry(mixersList(), ffnsList(), extrasList());
+        copy.ffnDecorator = previous == null
+                ? decorator
+                : (layer, block) -> decorator.ffn(layer, previous.ffn(layer, block));
+        copy.mixerDecorator = mixerDecorator;
+        return copy;
+    }
+
+    /**
+     * This registry with the given decorator over its mixers: {@code mixer(layer)} creates the kind's factory block
+     * and lets the decorator replace it per layer. A host-KV load replaces the attention mixer of the device layers
+     * whose KV cache stays in host RAM this way. The FFN blocks and extras are shared.
+     */
+    public GpuBlockRegistry withMixerDecorator(MixerDecorator decorator) {
+        GpuBlockRegistry copy = new GpuBlockRegistry(mixersList(), ffnsList(), extrasList());
+        copy.mixerDecorator = Objects.requireNonNull(decorator, "decorator");
+        copy.ffnDecorator = ffnDecorator;
+        return copy;
+    }
+
+    /** Replaces the FFN block a layer's kind factory created with one of its own. */
+    @FunctionalInterface
+    public interface FfnDecorator {
+        GpuFfnBlock ffn(LayerSpec layer, GpuFfnBlock deviceBlock);
+    }
+
+    /** Replaces the mixer a layer's kind factory created with one of its own. */
+    @FunctionalInterface
+    public interface MixerDecorator {
+        GpuMixer mixer(LayerSpec layer, GpuMixer deviceBlock);
+    }
+
+    private List<GpuMixerFactory> mixersList() {
+        return new ArrayList<>(mixers.values());
+    }
+
+    private List<GpuFfnFactory> ffnsList() {
+        return new ArrayList<>(ffns.values());
+    }
+
+    private List<GpuLayerExtraFactory> extrasList() {
+        return new ArrayList<>(extras.values());
     }
 
     /**
      * Unbound extras of the layer, in {@code LayerSpec.extras()} order.
      *
-     * @throws UnsupportedOperationException when no factory serves one of the layer's extras
+     * @throws GpuModelUnsupportedException when no factory serves one of the layer's extras
      */
     public List<GpuLayerExtra> extras(LayerSpec layer) {
         List<GpuLayerExtra> out = new ArrayList<>(layer.extras().size());
@@ -130,7 +188,7 @@ public final class GpuBlockRegistry {
             for (String id : layer.extras()) {
                 GpuLayerExtraFactory f = extras.get(id);
                 if (f == null) {
-                    throw new UnsupportedOperationException("no GPU layer extra for '" + id + "' (layer "
+                    throw new GpuModelUnsupportedException("no GPU layer extra for '" + id + "' (layer "
                             + describe(layer) + ")");
                 }
                 out.add(Objects.requireNonNull(f.create(layer), "layer-extra factory for '" + id + "' returned null"));
@@ -154,7 +212,7 @@ public final class GpuBlockRegistry {
      * next to the mixer (T5 decoder self-attention beside {@link MixerKind#CROSS_ATTENTION_T5}, falcon-h1
      * {@link LayerSpec#parallelAttention() parallel attention}).
      *
-     * @throws UnsupportedOperationException naming the architecture and the first missing kind or feature
+     * @throws GpuModelUnsupportedException naming the architecture and the first missing kind or feature
      */
     public void validate(ModelSpec spec) {
         List<LayerSpec> all = new ArrayList<>(spec.layers());
@@ -163,22 +221,22 @@ public final class GpuBlockRegistry {
         String arch = spec.arch().ggufName();
         for (LayerSpec l : all) {
             if (l.mixerKind() != MixerKind.NONE && !mixers.containsKey(l.mixerKind())) {
-                throw new UnsupportedOperationException(arch + ": no GPU mixer for " + l.mixerKind() + " (layer "
+                throw new GpuModelUnsupportedException(arch + ": no GPU mixer for " + l.mixerKind() + " (layer "
                         + describe(l) + ")");
             }
             boolean attentionBranch = l.mixerKind() == MixerKind.CROSS_ATTENTION_T5
                     || (l.mixerKind() != MixerKind.NONE && l.parallelAttention());
             if (attentionBranch && !mixers.containsKey(MixerKind.ATTENTION)) {
-                throw new UnsupportedOperationException(arch + ": no GPU mixer for the ATTENTION branch beside "
+                throw new GpuModelUnsupportedException(arch + ": no GPU mixer for the ATTENTION branch beside "
                         + l.mixerKind() + " (layer " + describe(l) + ")");
             }
             if (l.ffnKind() != FfnKind.NONE && !ffns.containsKey(l.ffnKind())) {
-                throw new UnsupportedOperationException(arch + ": no GPU FFN block for " + l.ffnKind() + " (layer "
+                throw new GpuModelUnsupportedException(arch + ": no GPU FFN block for " + l.ffnKind() + " (layer "
                         + describe(l) + ")");
             }
             for (String id : l.extras()) {
                 if (!extras.containsKey(id)) {
-                    throw new UnsupportedOperationException(arch + ": no GPU layer extra for '" + id + "' (layer "
+                    throw new GpuModelUnsupportedException(arch + ": no GPU layer extra for '" + id + "' (layer "
                             + describe(l) + ")");
                 }
             }

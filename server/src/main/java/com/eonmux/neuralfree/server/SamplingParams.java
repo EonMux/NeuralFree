@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.server;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
+import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 import com.eonmux.neuralfree.utils.json.JsonException;
 import com.eonmux.neuralfree.utils.json.JsonView;
 
@@ -29,8 +30,18 @@ final class SamplingParams {
     private SamplingParams() {
     }
 
-    /** The sampler of {@code body} over the engine defaults. */
+    /** The sampler of {@code body} over the engine defaults, unwatermarked. */
     static SamplerConfig of(JsonView body) {
+        return of(body, null);
+    }
+
+    /**
+     * The sampler of {@code body} over the engine defaults, with the engine's watermark ({@code engineWatermark},
+     * null when the engine serves none) unless the request's {@code watermarking} field is false. A request that asks
+     * for watermarking ({@code true}) while the engine serves none refuses with 400 naming the missing engine
+     * configuration, as an unsupported input.
+     */
+    static SamplerConfig of(JsonView body, WatermarkConfig engineWatermark) {
         SamplerConfig.Builder s = GenerationRequest.defaults().sampler().toBuilder();
         try {
             basic(body, s);
@@ -41,10 +52,33 @@ final class SamplingParams {
                     s.seed(seed);
                 }
             }
+            WatermarkConfig watermark = watermarking(body, engineWatermark);
+            if (watermark != null) {
+                s.watermark(watermark);
+            }
             return s.build();
         } catch (IllegalArgumentException | JsonException e) {
             throw ServerJson.badRequest("invalid sampling parameters: " + e.getMessage());
         }
+    }
+
+    /** The watermark {@code body} asks for: the engine's by default, none when the field is false. */
+    private static WatermarkConfig watermarking(JsonView body, WatermarkConfig engineWatermark) {
+        Object raw = body.raw("watermarking");
+        if (raw == null) {
+            return engineWatermark;
+        }
+        if (!(raw instanceof Boolean requested)) {
+            throw ServerJson.badRequest("watermarking must be a boolean");
+        }
+        if (!requested) {
+            return null;
+        }
+        if (engineWatermark == null) {
+            throw ServerJson.badRequest("watermarking: the server serves no watermark; start it with"
+                    + " --watermark-config (or " + WatermarkConfig.PROP_CONFIG + ")");
+        }
+        return engineWatermark;
     }
 
     /** The OpenAI and vLLM fields. */

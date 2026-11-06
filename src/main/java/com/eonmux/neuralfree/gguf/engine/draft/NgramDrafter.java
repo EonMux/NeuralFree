@@ -1,9 +1,7 @@
 package com.eonmux.neuralfree.gguf.engine.draft;
 
-import com.eonmux.neuralfree.gguf.engine.DraftModel;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
-import com.eonmux.neuralfree.gguf.memory.SequenceState;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -19,12 +17,16 @@ import java.util.Objects;
  * {@code ngram-simple}, {@code ngram-map-k}, {@code ngram-map-k4v}, {@code ngram-mod} and {@code ngram-cache}
  * speculative types).
  *
- * <p>Every {@link #draft} call reads the target memory's stored tokens, appends the just-sampled token and looks the
+ * <p>Every {@link #draft} call reads the stored tokens of the sequence it is bound to (the target memory's, or a
+ * {@link TokenHistory} of one batch sequence, {@link #bindHistory}), appends the just-sampled token and looks the
  * resulting n-grams up:
  * <ul>
- *   <li>{@link Kind#SIMPLE}: searches the history backwards for the pattern of the last {@code sizeN - 1} history
- *       tokens plus the sampled token (the {@code n_draft_min} n-gram) and proposes the up to {@code sizeM}
- *       ({@code size_mgram}) tokens that followed the match, at least {@code sizeN} of them or none at all.</li>
+ *   <li>{@link Kind#SIMPLE}: prompt lookup ({@link PromptLookup}). With one lookup size, llama.cpp's search: the
+ *       history is searched backwards for the pattern of the last {@code sizeN - 1} history tokens plus the sampled
+ *       token, and the up to {@code sizeM} ({@code size_mgram}) tokens that followed the match are proposed, at
+ *       least {@code sizeN} of them or none at all. With a range {@code sizeNMin < sizeN} (vLLM
+ *       {@code prompt_lookup_min} / {@code prompt_lookup_max}), vLLM's search: the longest matching suffix in the
+ *       range, at its earliest occurrence, proposes the up to {@code sizeM} tokens that follow it.</li>
  *   <li>{@link Kind#MAP_K}: llama.cpp's n-gram map, keys only: the most recent key n-gram hit proposes the
  *       {@code sizeM} tokens that followed it.</li>
  *   <li>{@link Kind#MAP_K4V}: the map, keys and values: per key n-gram it keeps up to {@value #MAP_MAX_VALUES} value
@@ -35,8 +37,10 @@ import java.util.Objects;
  *       most {@code sizeM} of them.</li>
  *   <li>{@link Kind#CACHE}: llama.cpp's cache chain. The context part ({@code nc_context}) is built from the
  *       generation's committed tokens, the dynamic part ({@code nc_dynamic}) from an optional preloaded
- *       {@link NgramCache} and the generation's committed tokens, and the static part ({@code nc_static}) from an
- *       optional preloaded {@link NgramCache} ({@code NgramCacheFile#load}) together with the optional
+ *       {@link NgramCache}, which the context n-grams of every history join only in
+ *       {@link #learnedDynamicCache()} (llama.cpp merges them when the drafter ends), and the static part
+ *       ({@code nc_static}) from an optional preloaded {@link NgramCache} ({@code NgramCacheFile#load}) together
+ *       with the optional
  *       {@link NgramCorpus}, which is shared read-only with the other drafters and refreshed when the corpus
  *       revision moves. Every step offers the context candidates over {@code ngramMin}..{@code ngramMax}-grams with
  *       llama.cpp's lax sample-size and percentage thresholds, the dynamic ones with the strict thresholds (static
@@ -52,7 +56,7 @@ import java.util.Objects;
  * run beside each other and with the hidden-fed drafters through {@link DrafterChain}. Not thread-safe: it runs on the
  * target's forward thread.
  */
-public final class NgramDrafter implements DraftModel {
+public final class NgramDrafter implements HistoryDrafter {
 
     /** Which lookup the drafter drafts with ({@link NgramDrafter} class doc). Immutable per drafter. */
     public enum Kind {
@@ -74,23 +78,35 @@ public final class NgramDrafter implements DraftModel {
     /** Hash constant of {@code common_ngram_mod::idx}. */
     static final long MOD_HASH_FACTOR = 6364136223846793005L;
     /** N-gram size of the static-cache candidate and fallback ({@code LLAMA_NGRAM_STATIC}). */
-    static final int CACHE_STATIC_NGRAM = 2;
+    public static final int CACHE_STATIC_NGRAM = 2;
     /** llama.cpp's cache draft thresholds, indexed by n-gram size - 1 (common/ngram-cache.cpp). */
     static final int[] CACHE_MIN_SAMPLE_LAX = {2, 2, 1, 1};
     static final int[] CACHE_MIN_PERCENT_LAX = {66, 50, 50, 50};
     static final int[] CACHE_MIN_SAMPLE_STRICT = {4, 3, 2, 2};
     static final int[] CACHE_MIN_PERCENT_STRICT = {75, 66, 66, 66};
 
-    /** Defaults the drafter's sizes fall back to. */
-    public static final int DEFAULT_SIZE_N = 3;
-    public static final int DEFAULT_SIZE_M = 8;
+    /** Default key n-gram of {@link Kind#SIMPLE} and the map kinds (llama.cpp {@code ngram_map.size_n}). */
+    public static final int DEFAULT_SIZE_N = 12;
+    /** Default proposal m-gram of {@link Kind#SIMPLE} and the map kinds (llama.cpp {@code ngram_map.size_m}). */
+    public static final int DEFAULT_SIZE_M = 48;
+    /** Default hashed n-gram of {@link Kind#MOD} (llama.cpp {@code ngram_mod.n_match}). */
+    public static final int DEFAULT_MOD_N_MATCH = 24;
+    /** Default longest draft of {@link Kind#MOD} (llama.cpp {@code ngram_mod.n_max}). */
+    public static final int DEFAULT_MOD_N_MAX = 64;
+    /** Default shortest draft of {@link Kind#MOD} (llama.cpp {@code ngram_mod.n_min}). */
+    public static final int DEFAULT_MOD_N_MIN = 48;
+    /** Default proposal cap of {@link Kind#CACHE} (llama.cpp {@code create_state_ngram_cache}'s {@code n_draft}). */
+    public static final int DEFAULT_CACHE_DRAFT = 8;
     public static final int DEFAULT_MIN_HITS = 1;
-    public static final int DEFAULT_MOD_TABLE_SIZE = 1 << 20;
+    /** Entries of the {@link Kind#MOD} hash table (llama.cpp's {@code common_ngram_mod(n_match, 4 * 1024 * 1024)}). */
+    public static final int DEFAULT_MOD_TABLE_SIZE = 4 * 1024 * 1024;
     public static final int DEFAULT_NGRAM_MIN = 1;
     public static final int DEFAULT_NGRAM_MAX = 4;
 
-    private static final int MAX_SIZE_N = 64;
-    private static final int MAX_SIZE_M = 128;
+    /** Largest key n-gram size. */
+    public static final int MAX_SIZE_N = 64;
+    /** Largest proposal size. */
+    public static final int MAX_SIZE_M = 128;
     private static final int MAX_MOD_TABLE = 1 << 28;
     private static final int EMPTY = -1;
 
@@ -98,6 +114,7 @@ public final class NgramDrafter implements DraftModel {
     public static final class Options {
         final Kind kind;
         final int sizeN;
+        final int sizeNMin;
         final int sizeM;
         final int minHits;
         final int ngramMin;
@@ -108,9 +125,10 @@ public final class NgramDrafter implements DraftModel {
         final NgramCache staticCache;
         final NgramCorpus corpus;
 
-        private Options(Builder b) {
+        private Options(Builder b, int sizeNMin) {
             this.kind = b.kind;
             this.sizeN = b.sizeN;
+            this.sizeNMin = sizeNMin;
             this.sizeM = b.sizeM;
             this.minHits = b.minHits;
             this.ngramMin = b.ngramMin;
@@ -126,11 +144,17 @@ public final class NgramDrafter implements DraftModel {
             return new Builder(kind);
         }
 
-        /** This option set restated as a {@link Builder}. */
+        /**
+         * This option set restated as a {@link Builder}; a {@link Kind#CACHE} set keeps its key size unset, and a
+         * single lookup size keeps {@code sizeNMin} unset, so it follows a later {@code sizeN}.
+         */
         public Builder toBuilder() {
-            return new Builder(kind).sizeN(sizeN).sizeM(sizeM).minHits(minHits).ngramMin(ngramMin)
+            Builder b = new Builder(kind).sizeM(sizeM).minHits(minHits).ngramMin(ngramMin)
                     .ngramMax(ngramMax).modTableSize(modTableSize).draftMin(draftMin)
                     .dynamicCache(dynamicCache).staticCache(staticCache).corpus(corpus);
+            b.sizeN = sizeN;
+            b.sizeNMin = sizeNMin == sizeN ? -1 : sizeNMin;
+            return b;
         }
 
         public Kind kind() { return kind; }
@@ -138,6 +162,16 @@ public final class NgramDrafter implements DraftModel {
         /** The key n-gram size: the search n-gram of {@link Kind#SIMPLE}, the key size of the map kinds, the hashed
          * n-gram size of {@link Kind#MOD}; unused by {@link Kind#CACHE}. */
         public int sizeN() { return sizeN; }
+
+        /**
+         * The smallest lookup n-gram of {@link Kind#SIMPLE} (vLLM {@code prompt_lookup_min}): equal to
+         * {@link #sizeN()} for llama.cpp's single lookup size, below it for vLLM's range search. Equal to
+         * {@link #sizeN()} for the other kinds.
+         */
+        public int sizeNMin() { return sizeNMin; }
+
+        /** Whether {@link Kind#SIMPLE} searches a size range ({@link #sizeNMin()} below {@link #sizeN()}). */
+        public boolean lookupRange() { return sizeNMin < sizeN; }
 
         /** The proposal size: the m-gram of {@link Kind#SIMPLE} and the map kinds, the proposal cap of
          * {@link Kind#MOD} and {@link Kind#CACHE}. */
@@ -156,7 +190,8 @@ public final class NgramDrafter implements DraftModel {
 
         @Override
         public String toString() {
-            return "NgramOptions{kind=" + kind + ", sizeN=" + sizeN + ", sizeM=" + sizeM + ", minHits=" + minHits
+            return "NgramOptions{kind=" + kind + ", sizeN=" + sizeN
+                    + (lookupRange() ? ", sizeNMin=" + sizeNMin : "") + ", sizeM=" + sizeM + ", minHits=" + minHits
                     + (kind == Kind.CACHE ? ", ngram=[" + ngramMin + ", " + ngramMax + "]" : "")
                     + ", draftMin=" + draftMin
                     + (dynamicCache != null ? ", dynamicCache=" + dynamicCache.ngrams() + " n-grams" : "")
@@ -169,7 +204,8 @@ public final class NgramDrafter implements DraftModel {
     public static final class Builder {
         private final Kind kind;
         private int sizeN = -1;
-        private int sizeM = DEFAULT_SIZE_M;
+        private int sizeNMin = -1;
+        private int sizeM;
         private int minHits = DEFAULT_MIN_HITS;
         private int ngramMin = DEFAULT_NGRAM_MIN;
         private int ngramMax = DEFAULT_NGRAM_MAX;
@@ -181,16 +217,36 @@ public final class NgramDrafter implements DraftModel {
 
         private Builder(Kind kind) {
             this.kind = Objects.requireNonNull(kind, "kind");
+            this.sizeM = kind == Kind.MOD ? DEFAULT_MOD_N_MAX : kind == Kind.CACHE ? DEFAULT_CACHE_DRAFT
+                    : DEFAULT_SIZE_M;
+            this.draftMin = kind == Kind.MOD ? DEFAULT_MOD_N_MIN : 0;
         }
 
-        /** The key n-gram size ({@code sizeN}); defaults to {@value NgramDrafter#DEFAULT_SIZE_N}. */
+        /**
+         * The key n-gram size ({@code sizeN}); defaults to {@value NgramDrafter#DEFAULT_SIZE_N}, and to
+         * {@value NgramDrafter#DEFAULT_MOD_N_MATCH} for {@link Kind#MOD}.
+         */
         public Builder sizeN(int v) {
             requireInRange(v, 1, MAX_SIZE_N, "sizeN");
             this.sizeN = v;
             return this;
         }
 
-        /** The proposal size ({@code sizeM}); defaults to {@value NgramDrafter#DEFAULT_SIZE_M}. */
+        /**
+         * The smallest lookup n-gram of {@link Kind#SIMPLE} (vLLM {@code prompt_lookup_min}); unset, it equals
+         * {@code sizeN} (llama.cpp's single lookup size).
+         */
+        public Builder sizeNMin(int v) {
+            requireInRange(v, 1, MAX_SIZE_N, "sizeNMin");
+            this.sizeNMin = v;
+            return this;
+        }
+
+        /**
+         * The proposal size ({@code sizeM}); defaults to {@value NgramDrafter#DEFAULT_SIZE_M}, to
+         * {@value NgramDrafter#DEFAULT_MOD_N_MAX} for {@link Kind#MOD} and to
+         * {@value NgramDrafter#DEFAULT_CACHE_DRAFT} for {@link Kind#CACHE}.
+         */
         public Builder sizeM(int v) {
             requireInRange(v, 1, MAX_SIZE_M, "sizeM");
             this.sizeM = v;
@@ -229,7 +285,12 @@ public final class NgramDrafter implements DraftModel {
             return this;
         }
 
-        /** Proposals shorter than this return an empty draft (default 0). */
+        /**
+         * Proposals shorter than this return an empty draft, as llama.cpp's {@code ngram_mod.n_min}: checked
+         * before the round's draft cap truncates them, and a proposal of the full {@code sizeM} is kept even when
+         * {@code sizeM} is below this floor (default 0, and {@value NgramDrafter#DEFAULT_MOD_N_MIN} for
+         * {@link Kind#MOD}).
+         */
         public Builder draftMin(int v) {
             if (v < 0) {
                 throw new IllegalArgumentException("draftMin must not be negative, got " + v);
@@ -263,23 +324,32 @@ public final class NgramDrafter implements DraftModel {
         }
 
         /**
-         * Builds the options. {@link Kind#SIMPLE} needs {@code sizeN >= 2} (a pattern of a history token plus the
-         * sampled token) and the {@link Kind#CACHE} pair needs {@code ngramMin <= ngramMax}.
+         * Builds the options. A single {@link Kind#SIMPLE} lookup size needs {@code sizeN >= 2} (a pattern of a
+         * history token plus the sampled token), a range needs {@code sizeNMin <= sizeN}, and the
+         * {@link Kind#CACHE} pair needs {@code ngramMin <= ngramMax}.
          *
-         * @throws IllegalArgumentException for out-of-range sizes
+         * @throws IllegalArgumentException for out-of-range sizes, or {@code sizeNMin} set on another kind
          */
         public Options build() {
             if (sizeN == -1 && kind != Kind.CACHE) {
-                sizeN = DEFAULT_SIZE_N;
+                sizeN = kind == Kind.MOD ? DEFAULT_MOD_N_MATCH : DEFAULT_SIZE_N;
             }
-            if (kind == Kind.SIMPLE && sizeN < 2) {
+            if (sizeNMin != -1 && kind != Kind.SIMPLE) {
+                throw new IllegalArgumentException(kind + " has no lookup size range; sizeNMin applies to "
+                        + Kind.SIMPLE + " only");
+            }
+            int min = sizeNMin == -1 ? sizeN : sizeNMin;
+            if (kind == Kind.SIMPLE && min > sizeN) {
+                throw new IllegalArgumentException(kind + ": sizeNMin " + min + " exceeds sizeN " + sizeN);
+            }
+            if (kind == Kind.SIMPLE && min == sizeN && sizeN < 2) {
                 throw new IllegalArgumentException(kind + " needs a lookup of at least 2 tokens (a history token"
                         + " plus the sampled token), got sizeN=" + sizeN);
             }
             if (kind == Kind.CACHE && ngramMin > ngramMax) {
                 throw new IllegalArgumentException("ngramMin " + ngramMin + " exceeds ngramMax " + ngramMax);
             }
-            return new Options(this);
+            return new Options(this, min);
         }
     }
 
@@ -341,13 +411,20 @@ public final class NgramDrafter implements DraftModel {
 
     private final Kind kind;
     private final Options options;
-    private EngineModel target;
-    private ForwardBackend backend;
+    /** What the drafter is bound to, for messages; null while unbound. */
+    private String boundTo;
+    private TokenHistory history;
     private MapState map;
     private int[] modTable;
     private NgramCache cacheContext;
     private NgramCache cacheDynamic;
     private NgramCache cacheStatic;
+    /** The context n-grams of the histories drafted over before the current one, kept for the dynamic cache. */
+    private NgramCache learned;
+    /** {@link #learnedDynamicCache()} as it stood when the drafter closed. */
+    private NgramCache closedDynamic;
+    /** {@link #historyNgrams()} as it stood when the drafter closed. */
+    private NgramCache closedHistory;
     private long corpusRevision;
     private int lastHistoryLength = -1;
     private boolean closed;
@@ -380,17 +457,34 @@ public final class NgramDrafter implements DraftModel {
     @Override
     public void bindTarget(EngineModel target) {
         Objects.requireNonNull(target, "target");
-        requireOpen();
-        if (this.target != null) {
-            throw new IllegalStateException("the n-gram drafter is already bound to a target");
-        }
+        requireUnbound();
         ForwardBackend fb = target.forwardBackend();
         if (fb == null || fb.memory() == null) {
             throw new IllegalArgumentException("an n-gram drafter needs a target with model memory; "
                     + target.name() + " (" + target.architecture() + ") has none");
         }
-        this.target = target;
-        this.backend = fb;
+        bind(target.name(), () -> fb.memory().sequence().tokens());
+    }
+
+    /** @throws IllegalStateException when the drafter is closed or already bound */
+    @Override
+    public void bindHistory(TokenHistory history) {
+        Objects.requireNonNull(history, "history");
+        requireUnbound();
+        bind("a sequence history", history);
+    }
+
+    private void requireUnbound() {
+        requireOpen();
+        if (history != null) {
+            throw new IllegalStateException("the n-gram drafter is already bound to " + boundTo);
+        }
+    }
+
+    /** Binds the drafter to {@code history} and builds the state of its kind. */
+    private void bind(String name, TokenHistory history) {
+        this.boundTo = name;
+        this.history = history;
         if (kind == Kind.MAP_K || kind == Kind.MAP_K4V) {
             this.map = new MapState(options);
         } else if (kind == Kind.MOD) {
@@ -398,8 +492,11 @@ public final class NgramDrafter implements DraftModel {
             Arrays.fill(modTable, EMPTY);
         } else if (kind == Kind.CACHE) {
             this.cacheContext = new NgramCache();
-            this.cacheDynamic = copied(options.dynamicCache);
-            this.cacheStatic = copied(options.staticCache);
+            // the preloaded caches are only read while drafting, so drafters of one option set share them; a
+            // corpus adds its sequences to a static cache of the drafter's own
+            this.cacheDynamic = options.dynamicCache;
+            this.learned = options.dynamicCache != null ? new NgramCache() : null;
+            this.cacheStatic = options.corpus == null ? options.staticCache : copied(options.staticCache);
             addCorpusToStatic();
         }
     }
@@ -436,13 +533,10 @@ public final class NgramDrafter implements DraftModel {
         if (n <= 0 || lastToken < 0) {
             return new int[0];
         }
-        SequenceState seq = backend.memory().sequence();
-        int len = seq.nPast();
+        int[] tokens = history.tokens();
+        int len = tokens.length;
         // llama.cpp's inp: the history and then the just-sampled token.
-        int[] inp = new int[len + 1];
-        for (int i = 0; i < len; i++) {
-            inp[i] = seq.token(i);
-        }
+        int[] inp = Arrays.copyOf(tokens, len + 1);
         inp[len] = lastToken;
 
         if (len < lastHistoryLength) {
@@ -450,7 +544,7 @@ public final class NgramDrafter implements DraftModel {
         }
         int[] proposal;
         if (kind == Kind.SIMPLE) {
-            proposal = simpleDraft(inp, len);
+            proposal = PromptLookup.draft(inp, len, options.sizeNMin, options.sizeN, options.sizeM);
         } else if (kind == Kind.MAP_K || kind == Kind.MAP_K4V) {
             proposal = mapDraft(inp, len);
         } else if (kind == Kind.MOD) {
@@ -461,48 +555,12 @@ public final class NgramDrafter implements DraftModel {
             throw new IllegalStateException("unknown kind " + kind);
         }
         lastHistoryLength = len;
-        if (proposal.length > n) {
-            proposal = Arrays.copyOf(proposal, n);
-        }
-        if (proposal.length < options.draftMin) {
+        // the kind's own floor applies to the whole proposal, before the round's cap; a proposal of the full
+        // sizeM is kept even below it (llama.cpp ngram_mod checks n_min only where the chain breaks)
+        if (proposal.length < Math.min(options.draftMin, options.sizeM)) {
             return new int[0];
         }
-        return proposal;
-    }
-
-    /** llama.cpp {@code common_ngram_simple_draft} over {@code inp} ({@code cur_len} = {@code len}, sampled last). */
-    private int[] simpleDraft(int[] inp, int len) {
-        int sizeN = options.sizeN;
-        int sizeM = options.sizeM;
-        if (len <= sizeN + sizeM + 1) {
-            return new int[0];
-        }
-        int[] pattern = new int[sizeN];
-        for (int j = 0; j < sizeN - 1; j++) {
-            pattern[j] = inp[len - sizeN + 1 + j];
-        }
-        pattern[sizeN - 1] = inp[len];
-
-        // Search backwards, skipping the current (rightmost) match: position 0 means no match.
-        int matchPos = 0;
-        for (int j = len - sizeN - 1; j > 0; j--) {
-            if (matchesKey(inp, j, pattern, sizeN)) {
-                matchPos = j;
-                break;
-            }
-        }
-        if (matchPos == 0) {
-            return new int[0];
-        }
-        int copyMax = Math.min(sizeM, len - (matchPos + sizeN));
-        if (copyMax < sizeN) {
-            return new int[0];
-        }
-        int[] out = new int[copyMax];
-        for (int j = 0; j < copyMax; j++) {
-            out[j] = inp[matchPos + sizeN + j];
-        }
-        return out;
+        return proposal.length > n ? Arrays.copyOf(proposal, n) : proposal;
     }
 
     /**
@@ -769,21 +827,56 @@ public final class NgramDrafter implements DraftModel {
             }
             corpusRevision = options.corpus.revision();
         }
-        NgramCache ncStatic = cacheStatic;
-        NgramCache ncContext = cacheContext;
-        int[] proposed = new int[Math.min(options.sizeM, MAX_SIZE_M)];
+        return draftCache(inp, options.sizeM, options.ngramMin, options.ngramMax, cacheContext, cacheDynamic,
+                cacheStatic);
+    }
+
+    /**
+     * llama.cpp {@code common_ngram_cache_draft} over explicit caches: the tokens {@code inp} drafted so far (its
+     * last token being the sampled one) continue with the up to {@code maxDraft} tokens the context cache offers
+     * over {@code ngramMin}..{@code ngramMax}-grams (lax thresholds), then the dynamic cache offers (strict), then
+     * the static 2-gram's best token; the static part validates every context and dynamic candidate by its counts.
+     * Unlike the drafter, this method keeps no history and updates no cache. A null cache holds nothing.
+     *
+     * @param inp        the tokens drafted so far, ending with the sampled token
+     * @param maxDraft   the largest proposal; a non-positive value proposes nothing
+     * @param ngramMin   the smallest context and dynamic n-gram, in {@code [1, 4]}
+     * @param ngramMax   the largest context and dynamic n-gram, in {@code [ngramMin, 4]}
+     * @param context    the context cache, or null
+     * @param dynamic    the dynamic cache, or null
+     * @param staticCache the static cache the candidates are validated against and whose 2-gram is the fallback,
+     *                    or null
+     * @return the proposals, at most {@code maxDraft}
+     * @throws IllegalArgumentException for an out-of-range n-gram size pair or a negative token id
+     */
+    public static int[] draftCache(int[] inp, int maxDraft, int ngramMin, int ngramMax, NgramCache context,
+                                   NgramCache dynamic, NgramCache staticCache) {
+        Objects.requireNonNull(inp, "inp");
+        if (ngramMin < 1 || ngramMax > NgramCache.MAX_KEY || ngramMin > ngramMax) {
+            throw new IllegalArgumentException("n-gram sizes must be in [1, " + NgramCache.MAX_KEY + "] with min <= "
+                    + "max, got [" + ngramMin + ", " + ngramMax + "]");
+        }
+        if (maxDraft <= 0) {
+            return new int[0];
+        }
+        for (int token : inp) {
+            if (token < 0) {
+                throw new IllegalArgumentException("the drafted tokens hold a negative token id " + token);
+            }
+        }
+        int[] proposed = new int[Math.min(maxDraft, MAX_SIZE_M)];
         int count = 0;
         while (count < proposed.length) {
-            if (len + 1 + count < CACHE_STATIC_NGRAM) {
+            if (inp.length + count < CACHE_STATIC_NGRAM) {
                 break;
             }
             NgramCache.Key keyStatic = combinedKey(inp, proposed, count, CACHE_STATIC_NGRAM);
-            int token = tryDraft(ncContext, ncStatic, keyStatic, inp, proposed, count, true);
+            int token = tryDraft(context, staticCache, keyStatic, inp, proposed, count, ngramMin, ngramMax, true);
             if (token < 0) {
-                token = tryDraft(cacheDynamic, ncStatic, keyStatic, inp, proposed, count, false);
+                token = tryDraft(dynamic, staticCache, keyStatic, inp, proposed, count, ngramMin, ngramMax, false);
             }
             if (token < 0) {
-                token = tryStatic(ncStatic, keyStatic);
+                token = tryStatic(staticCache, keyStatic);
             }
             if (token < 0) {
                 break;
@@ -797,17 +890,17 @@ public final class NgramDrafter implements DraftModel {
      * llama.cpp {@code try_draft} against one primary cache: every candidate's weight compares
      * {@code count * staticWeight} ({@code 100 * count} in the static cache, 1 when absent); the best token is
      * drafted when the part's sample reaches the threshold and dominates by the percentage. Iterates n-gram sizes
-     * from largest to smallest, as llama.cpp does, with the thresholds indexed by size (llama.cpp indexes its lists
-     * from {@code ngram_min}, equal for the default {@code ngram_min = 1}).
+     * from largest to smallest, as llama.cpp does, with the thresholds indexed from {@code ngramMin}
+     * (llama.cpp's {@code ngrams_primary} order).
      */
     private static int tryDraft(NgramCache primary, NgramCache ncStatic, NgramCache.Key keyStatic,
-                                int[] inp, int[] proposed, int count, boolean lax) {
+                                int[] inp, int[] proposed, int count, int ngramMin, int ngramMax, boolean lax) {
         if (primary == null) {
             return -1;
         }
         int[] minSample = lax ? CACHE_MIN_SAMPLE_LAX : CACHE_MIN_SAMPLE_STRICT;
         int[] minPercent = lax ? CACHE_MIN_PERCENT_LAX : CACHE_MIN_PERCENT_STRICT;
-        for (int size = NgramCache.MAX_KEY; size >= 1; size--) {
+        for (int size = ngramMax; size >= ngramMin; size--) {
             NgramCache.Key key = combinedKey(inp, proposed, count, size);
             if (key == null || !primary.hasPart(key)) {
                 continue;
@@ -830,10 +923,10 @@ public final class NgramDrafter implements DraftModel {
                 }
                 sum += c;
             }
-            if (sum < minSample[size - 1]) {
+            if (sum < minSample[size - ngramMin]) {
                 continue;
             }
-            if (100L * maxCount < (long) minPercent[size - 1] * sum) {
+            if (100L * maxCount < (long) minPercent[size - ngramMin] * sum) {
                 continue;
             }
             return maxToken;
@@ -899,7 +992,10 @@ public final class NgramDrafter implements DraftModel {
         rebuild();
     }
 
-    /** Drops every per-history state: a new or shrunk history rebuilds the stateful kinds. */
+    /**
+     * Drops every per-history state: a new or shrunk history rebuilds the stateful kinds. With a dynamic cache the
+     * dropped context n-grams are kept for {@link #learnedDynamicCache()}.
+     */
     private void rebuild() {
         if (map != null) {
             map = new MapState(options);
@@ -908,9 +1004,53 @@ public final class NgramDrafter implements DraftModel {
             Arrays.fill(modTable, EMPTY);
         }
         if (cacheContext != null) {
+            if (learned != null) {
+                learned.merge(cacheContext);
+            }
             cacheContext = new NgramCache();
         }
         lastHistoryLength = -1;
+    }
+
+    /**
+     * The {@link Kind#CACHE} drafter's dynamic cache as llama.cpp saves it at the drafter's end
+     * ({@code ~common_speculative_impl_ngram_cache}, the {@code --lookup-cache-dynamic} file): the preloaded
+     * dynamic cache with the context n-grams of every history the drafter drafted over merged in. A new cache on
+     * each call, also after {@link #close()}.
+     *
+     * @throws IllegalStateException when the drafter was built without a dynamic cache or never bound
+     */
+    public NgramCache learnedDynamicCache() {
+        if (closedDynamic != null) {
+            return copied(closedDynamic);
+        }
+        if (learned == null) {
+            throw new IllegalStateException("the n-gram drafter keeps no dynamic cache: it is not a bound "
+                    + Kind.CACHE + " drafter built with one");
+        }
+        NgramCache out = copied(cacheDynamic);
+        out.merge(historyNgrams());
+        return out;
+    }
+
+    /**
+     * The context n-grams of every history the drafter drafted over, without the preloaded dynamic cache: what
+     * {@link #learnedDynamicCache()} adds to it. Drafters of several sequences over one dynamic file merge their
+     * history n-grams into the file's preloaded cache once. A new cache on each call, also after {@link #close()}.
+     *
+     * @throws IllegalStateException when the drafter was built without a dynamic cache or never bound
+     */
+    public NgramCache historyNgrams() {
+        if (closedHistory != null) {
+            return copied(closedHistory);
+        }
+        if (learned == null) {
+            throw new IllegalStateException("the n-gram drafter keeps no dynamic cache: it is not a bound "
+                    + Kind.CACHE + " drafter built with one");
+        }
+        NgramCache out = copied(learned);
+        out.merge(cacheContext);
+        return out;
     }
 
     private void requireOpen() {
@@ -921,27 +1061,33 @@ public final class NgramDrafter implements DraftModel {
 
     private void requireBound() {
         requireOpen();
-        if (target == null) {
+        if (history == null) {
             throw new IllegalStateException("the n-gram drafter is not bound to a target");
         }
     }
 
     @Override
     public void close() {
+        if (learned != null && closedDynamic == null) {
+            closedHistory = historyNgrams();
+            closedDynamic = learnedDynamicCache();
+        }
         closed = true;
-        target = null;
-        backend = null;
+        boundTo = null;
+        history = null;
         map = null;
         modTable = null;
         cacheContext = null;
         cacheDynamic = null;
         cacheStatic = null;
+        learned = null;
     }
 
     @Override
     public String toString() {
-        return "NgramDrafter{" + kind.name().toLowerCase(Locale.ROOT) + ", sizeN=" + options.sizeN + ", sizeM="
+        return "NgramDrafter{" + kind.name().toLowerCase(Locale.ROOT) + ", sizeN=" + options.sizeN
+                + (options.lookupRange() ? ", sizeNMin=" + options.sizeNMin : "") + ", sizeM="
                 + options.sizeM + (options.draftMin > 0 ? ", draftMin=" + options.draftMin : "")
-                + (target != null ? ", bound to " + target.name() : "") + '}';
+                + (boundTo != null ? ", bound to " + boundTo : "") + '}';
     }
 }

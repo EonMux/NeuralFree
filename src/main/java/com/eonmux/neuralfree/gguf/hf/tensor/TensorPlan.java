@@ -8,10 +8,12 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The GGUF tensors planned for a Hugging Face checkpoint, in plan order, with the metadata tensor hooks derived, the
@@ -72,6 +74,53 @@ public final class TensorPlan implements HfPlanView {
     /** Checkpoint tensor name to the reason it is left out, in record order. */
     public Map<String, String> dropped() {
         return dropped;
+    }
+
+    /**
+     * The plan of the two planning passes {@code first} and {@code second}: the tensors, activation entries, metadata
+     * keys and dropped names of both, the first pass's first. A tensor name, activation entry or metadata key both
+     * passes hold is refused: the passes' tensor hooks plan disjoint name spaces, so an overlap is a broken pairing.
+     *
+     * @throws IllegalArgumentException when a planned tensor name, an activation-quantization entry or a metadata key
+     *                                  is recorded by both passes
+     */
+    public static TensorPlan merge(TensorPlan first, TensorPlan second) {
+        Objects.requireNonNull(first, "first");
+        Objects.requireNonNull(second, "second");
+        List<PlannedTensor> tensors = new ArrayList<>(first.tensors);
+        Set<String> tensorNames = new HashSet<>();
+        for (PlannedTensor t : tensors) {
+            tensorNames.add(t.ggufName());
+        }
+        Map<String, ActQuantScheme> actQuant = new LinkedHashMap<>(first.actQuant);
+        for (Map.Entry<String, ActQuantScheme> e : second.actQuant.entrySet()) {
+            if (actQuant.putIfAbsent(e.getKey(), e.getValue()) != null) {
+                throw new IllegalArgumentException("the activation quantization of '" + e.getKey()
+                        + "' is recorded by both passes");
+            }
+        }
+        List<KvEntry> kv = new ArrayList<>(first.kv);
+        Set<String> kvKeys = new HashSet<>();
+        for (KvEntry e : kv) {
+            kvKeys.add(e.key());
+        }
+        for (KvEntry e : second.kv) {
+            if (!kvKeys.add(e.key())) {
+                throw new IllegalArgumentException("the metadata key '" + e.key() + "' is recorded by both passes");
+            }
+            kv.add(e);
+        }
+        for (PlannedTensor t : second.tensors) {
+            if (!tensorNames.add(t.ggufName())) {
+                throw new IllegalArgumentException("tensor '" + t.ggufName() + "' is planned by both passes");
+            }
+            tensors.add(t);
+        }
+        Map<String, String> dropped = new LinkedHashMap<>(first.dropped);
+        for (Map.Entry<String, String> e : second.dropped.entrySet()) {
+            dropped.putIfAbsent(e.getKey(), e.getValue());
+        }
+        return new TensorPlan(tensors, actQuant, kv, dropped);
     }
 
     @Override

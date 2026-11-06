@@ -1,13 +1,14 @@
-/* common/kv_quant.glsl - KV cache stores: F32 / F16 / BF16 values and the ggml reference quantizers of the KV block types. Requires: common/nf_common.glsl, common/rope_common.glsl, common/kv_types.glsl */
+/* common/kv_quant.glsl - KV cache stores: F32 / F16 / BF16 / FP8 values and the ggml reference quantizers of the KV block types. Requires: common/nf_common.glsl, common/rope_common.glsl, common/kv_types.glsl */
 /* Portions derived from llama.cpp/ggml (MIT License); see THIRD-PARTY-NOTICES.md. */
 /*
  * GLSL twin of the stores of kernels/llm/common/kv_types.h (the semantic reference, with the llama.cpp references of
- * each quantizer). F16 rounds to nearest even (nf_rope_f16_bits), BF16 as ggml_compute_fp32_to_bf16.
+ * each quantizer). F16 rounds to nearest even (nf_rope_f16_bits), BF16 as ggml_compute_fp32_to_bf16, FP8 as the RNE
+ * saturating codes of Fp8Codec (the FP8 store kernels divide by the cache's per-head KV scale before the encode).
  *
  * nf_kv_encode_block(x, t, w) encodes the 32 values x of one block of type t as the 16-bit little-endian words
  * w[0, n) of the block's bytes and returns n (block bytes / 2). NF_KV_STORES(name), after
  * NF_BUFFER_VIEWS_RW(binding, name), defines
- *     void name_kv_store1(uint e, float v, int t)          value e of an F32, F16 or BF16 cache
+ *     void name_kv_store1(uint e, float v, int t)          value e of an F32, F16, BF16 or FP8 cache
  *     void name_kv_store_block(uint e, float x[32], int t)  the block holding value e (e % 32 == 0) of a block
  *                                                           cache, written as 16-bit words (every block starts at
  *                                                           an even byte)
@@ -181,12 +182,91 @@ uint nf_kv_encode_block(float x[32], int t, out uint w[NF_KV_MAX_WORDS]) {
     return nf_kv_encode_iq4_nl(x, w);
 }
 
+/*
+ * RNE saturating FP8 encodes of Fp8Codec.E4M3FN.encode / .E5M2.encode (nf_kv_fp8_e4m3_bits / nf_kv_fp8_e5m2_bits of
+ * kernels/llm/common/kv_types.h): NaN to the NaN code with its sign, magnitudes at the largest finite value and
+ * above (the infinities included) saturate to it, subnormals carry the smallest normal's exponent, the mantissa
+ * units round to nearest even with the carry into the exponent (roundEven).
+ */
+uint nf_kv_fp8_e4m3_bits(float v) {
+    const uint sign = (floatBitsToUint(v) >> 24) & 0x80u;
+    const float m = abs(v);
+    if (isnan(m)) {
+        return sign | 0x7Fu;
+    }
+    if (m >= 448.0) {
+        return sign | 0x7Eu;
+    }
+    if (m == 0.0) {
+        return sign;
+    }
+    const int ex0 = max(int((floatBitsToUint(m) >> 23) & 0xFFu) - 127, -6);
+    int units = int(roundEven(ldexp(m, 3 - ex0)));
+    int ex = ex0;
+    if (units < 8) {
+        return sign | uint(units);
+    }
+    if (units == 16) {
+        units = 8;
+        ex++;
+    }
+    return sign | uint(min(((ex + 7) << 3) | (units - 8), 0x7E));
+}
+
+uint nf_kv_fp8_e5m2_bits(float v) {
+    const uint sign = (floatBitsToUint(v) >> 24) & 0x80u;
+    const float m = abs(v);
+    if (isnan(m)) {
+        return sign | 0x7Eu;
+    }
+    if (m >= 57344.0) {
+        return sign | 0x7Bu;
+    }
+    if (m == 0.0) {
+        return sign;
+    }
+    const int ex0 = max(int((floatBitsToUint(m) >> 23) & 0xFFu) - 127, -14);
+    int units = int(roundEven(ldexp(m, 2 - ex0)));
+    int ex = ex0;
+    if (units < 4) {
+        return sign | uint(units);
+    }
+    if (units == 8) {
+        units = 4;
+        ex++;
+    }
+    return sign | uint(min(((ex + 15) << 2) | (units - 4), 0x7B));
+}
+
+uint nf_kv_fp8_bits(float v, int t) {
+    return t == NF_KV_FP8_E4M3 ? nf_kv_fp8_e4m3_bits(v) : nf_kv_fp8_e5m2_bits(v);
+}
+
+/* Round-to-nearest-even code of a value already divided by its per-(token, head) scale. */
+uint nf_kv_pt_encode(int t, float v) {
+    if (t == NF_KV_FP8_PER_TOKEN_HEAD) return nf_kv_fp8_e4m3_bits(v);
+    if (t == NF_KV_INT8_PER_TOKEN_HEAD) return uint(int(roundEven(clamp(v, -127.0, 127.0)))) & 0xFFu;
+    return uint(int(roundEven(clamp(v, -7.0, 7.0)))) & 0xFu;
+}
+
 #define NF_KV_STORES(name) \
+    void name##_kv_pt_store1(uint e, float v, int t) { \
+        const uint c = nf_kv_pt_encode(t, v); \
+        if (t == NF_KV_INT4_PER_TOKEN_HEAD) { \
+            const uint b = e >> 1u; \
+            const uint old = uint(name##_u8[b]); \
+            name##_u8[b] = (e & 1u) == 0u ? uint8_t((old & 0xF0u) | c) : uint8_t((old & 0x0Fu) | (c << 4u)); \
+        } else { \
+            name##_u8[e] = uint8_t(c); \
+        } \
+    } \
     void name##_kv_store1(uint e, float v, int t) { \
         if (t == NF_KV_F16) { \
             name##_u16[e] = uint16_t(nf_rope_f16_bits(v)); \
         } else if (t == NF_KV_BF16) { \
             name##_u16[e] = uint16_t(nf_kv_bf16_bits(v)); \
+        } else if (t == NF_KV_FP8_E4M3 || t == NF_KV_FP8_E5M2) { \
+            name##_u8[e] = uint8_t(nf_kv_fp8_bits(v, t)); \
         } else { \
             name##_u32[e] = floatBitsToUint(v); \
         } \

@@ -15,6 +15,7 @@ import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.ops.hc.HcKernels.CoefficientParams;
 import com.eonmux.neuralfree.gguf.ops.hc.HcKernels.PostParams;
 import com.eonmux.neuralfree.gguf.ops.hc.HcKernels.PreParams;
+import com.eonmux.neuralfree.gguf.ops.fused.FusedKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
@@ -62,6 +63,8 @@ public final class GpuHcSite implements AutoCloseable {
     private final GpuWeight down;
     private final GpuWeight up;
     private final GpuWeight inject;
+    /** Merged {@code [down | inject]} weight; null unless the merged gated form. */
+    private final GpuWeight downInject;
 
     private final ScratchSlot flat;
     private final ScratchSlot mixes;
@@ -69,11 +72,15 @@ public final class GpuHcSite implements AutoCloseable {
     private final ScratchSlot post;
     private final ScratchSlot comb;
     private final ScratchSlot lowRank;
+    /** Merged {@code [down | inject]} output rows before the split; null unless the merged gated form. */
+    private final ScratchSlot merged;
     private final ScratchSlot gate;
 
     private final PreparedDispatch coefficients;
     private final PreparedDispatch collapse;
     private final PreparedDispatch expand;
+    /** Fused {@code LLM_HcPostNorm} (expand then the leading norm of the next site); null when unused. */
+    private final PreparedDispatch expandNorm;
 
     /**
      * @param ctx     model context
@@ -101,9 +108,10 @@ public final class GpuHcSite implements AutoCloseable {
         GpuWeight scale = kind.projected() ? vector(weights, arch, il, block.scale()) : null;
         GpuWeight base = kind.projected() ? vector(weights, arch, il, block.base()) : null;
         this.norm = kind.gated() ? vector(weights, arch, il, block.norm()) : null;
-        this.down = kind.gated() ? resident(weights, arch, il, block.down()) : null;
+        this.down = block.down() != null ? resident(weights, arch, il, block.down()) : null;
         this.up = kind.gated() ? resident(weights, arch, il, block.up()) : null;
         this.inject = block.inject() != null ? resident(weights, arch, il, block.inject()) : null;
+        this.downInject = block.downInject() != null ? resident(weights, arch, il, block.downInject()) : null;
 
         boolean needsFlat = kind.projected() || kind.gated();
         this.flat = needsFlat ? scratch.temp(HcSubBlock.TEMP_FLAT, rows(streamWidth)) : null;
@@ -115,11 +123,14 @@ public final class GpuHcSite implements AutoCloseable {
         boolean hasComb = block.post() != null && block.post().hasComb();
         this.comb = hasComb ? scratch.temp(HcSubBlock.TEMP_COMB, rows(hc * hc)) : null;
         this.lowRank = kind.gated() ? scratch.temp(HcSubBlock.TEMP_LOW_RANK, rows(block.lowRank())) : null;
+        this.merged = downInject != null
+                ? scratch.temp(HcSubBlock.TEMP_MERGED_DOWN, rows(block.lowRank() + hc)) : null;
         this.gate = kind.gated() ? scratch.temp(HcSubBlock.TEMP_GATE, rows(streamWidth)) : null;
 
         PreparedDispatch c = null;
         PreparedDispatch p = null;
         PreparedDispatch e = null;
+        PreparedDispatch n = null;
         try {
             if (kind.projected()) {
                 c = prepareCoefficients(block.coefficients(), scale, base, ph);
@@ -127,14 +138,148 @@ public final class GpuHcSite implements AutoCloseable {
             p = prepareCollapse(block.pre(), ph);
             if (kind.expands()) {
                 e = prepareExpand(block.post(), ph);
+                n = prepareExpandNorm(block.post(), ph);
             }
         } catch (RuntimeException ex) {
-            Closeables.close(p, Closeables.close(c, ex));
+            Closeables.close(n, Closeables.close(e, Closeables.close(p, Closeables.close(c, ex))));
             throw ex;
         }
         this.coefficients = c;
         this.collapse = p;
         this.expand = e;
+        this.expandNorm = n;
+    }
+
+    /**
+     * The fused expansion and norm of the consuming site's leading row norm ({@link FusedKernels#HC_POST_NORM}),
+     * or null when the backend lacks the kernel, the stream count is outside its bound, or the site does not expand.
+     * The norm weight and its row count are bound by {@link #expandNorm} per call.
+     */
+    private PreparedDispatch prepareExpandNorm(PostParams p, GpuPlaceholders ph) {
+        if (!block.kind().expands() || !FusedKernels.hcPostNormUsable(hc)
+                || !ops.fused(FusedKernels.HC_POST_NORM)) {
+            return null;
+        }
+        Object[] a = FusedKernels.hcPostNormArgs(ubatch, nEmbd, hc, p.hasComb(), p.postAct(), p.postInScale(),
+                p.postMag(), block.normEps(), 0, normScope(), 0, 0, post.offset(), p.hasComb() ? comb.offset() : 0,
+                0, 0,
+                ph.readOnlyFloats(), ph.readOnlyFloats(), post.buffer(),
+                p.hasComb() ? comb.buffer() : ph.readOnlyFloats(), ph.readOnlyFloats(), ph.readOnlyFloats(),
+                ph.readOnlyFloats());
+        return ops.prepare(FusedKernels.HC_POST_NORM, new long[]{FusedKernels.hcPostNormGlobal(ubatch, local)},
+                new long[]{local}, a);
+    }
+
+    /** Whether this site's expansion has a fused expand-and-norm launch. */
+    public boolean canExpandNorm() {
+        return expandNorm != null;
+    }
+
+    /** Whether this site's collapse starts with a row norm over the stream that {@link #collapseNormed} skips. */
+    public boolean hasLeadingNorm() {
+        return flat != null && (block.kind().projected() || block.kind().gated());
+    }
+
+    /** The stream-norm temporaries of this site (the buffer the leading norm writes). */
+    public GpuBuffer flatBuffer() {
+        return flat == null ? null : flat.buffer();
+    }
+
+    /** First element of the leading-norm rows in {@link #flatBuffer()}; 0 when absent. */
+    public int flatOffset() {
+        return flat == null ? 0 : flat.offset();
+    }
+
+    /** The per-head gamma buffer of this site's leading norm, or null for a weightless norm. */
+    public GpuBuffer normGamma() {
+        return norm == null ? null : norm.shard(0);
+    }
+
+    /** Weight rows of {@link #normGamma()} ({@code hc}), or 0 for a weightless norm. */
+    public int normGammaRows() {
+        return norm == null ? 0 : hc;
+    }
+
+    /** Epsilon of this site's leading row norm. */
+    public float normEps() {
+        return block.normEps();
+    }
+
+    /** Norm axis of this site's leading row norm: 0 per stream row (gated), 1 per token (projected). */
+    public int normScope() {
+        return block.kind().gated() ? 0 : 1;
+    }
+
+    /**
+     * Runs the fused expand and leading norm: {@code xout} receives the expanded stream and {@code normOut} the
+     * row-normed stream rows, both in one launch. The norm weight is {@code gamma} of {@code gammaRows} rows of
+     * {@code n_embd} values; {@code gammaRows == 0} runs the weightless norm.
+     *
+     * @throws IllegalStateException when the site has no fused expansion
+     */
+    public void expandNorm(int nTokens, GpuBuffer y, int yOff, GpuBuffer x, int xOff, GpuBuffer xout, int xoutOff,
+                           GpuBuffer gamma, int gammaRows, int scope, float eps, GpuBuffer normOut, int normOff) {
+        if (expandNorm == null) {
+            throw new IllegalStateException("hyper-connection " + block + " has no fused expansion");
+        }
+        checkTokens(nTokens);
+        HcKernels.PostParams p = block.post();
+        expandNorm.setInt(FusedKernels.HC_ARG_N_TOKENS, nTokens);
+        expandNorm.setInt(FusedKernels.HC_ARG_HAS_W, gammaRows > 0 ? 1 : 0);
+        expandNorm.setInt(FusedKernels.HC_ARG_W_ROWS, Math.max(1, gammaRows));
+        expandNorm.setInt(FusedKernels.HC_ARG_SCOPE, scope);
+        expandNorm.setFloat(FusedKernels.HC_ARG_EPS, eps);
+        expandNorm.setBuffer(FusedKernels.HC_ARG_Y, y);
+        expandNorm.setBuffer(FusedKernels.HC_ARG_X, x);
+        expandNorm.setBuffer(FusedKernels.HC_ARG_XOUT, xout);
+        expandNorm.setBuffer(FusedKernels.HC_ARG_XN, normOut);
+        expandNorm.setBuffer(FusedKernels.HC_ARG_GAMMA,
+                gamma != null ? gamma : placeholders.readOnlyFloats());
+        expandNorm.setInt(FusedKernels.HC_ARG_Y_OFF, yOff);
+        expandNorm.setInt(FusedKernels.HC_ARG_X_OFF, xOff);
+        expandNorm.setInt(FusedKernels.HC_ARG_XOUT_OFF, xoutOff);
+        expandNorm.setInt(FusedKernels.HC_ARG_XN_OFF, normOff);
+        expandNorm.setInt(FusedKernels.HC_ARG_COMB_OFF, p.hasComb() ? comb.offset() : 0);
+        expandNorm.setGlobal(FusedKernels.hcPostNormGlobal(nTokens, local));
+        expandNorm.dispatch();
+    }
+
+    /**
+     * The steps of {@link #collapse} after its leading row norm, which the caller produced into {@link #flatBuffer()}
+     * through {@link #expandNorm}.
+     *
+     * @throws IllegalArgumentException when {@code nTokens} is outside {@code [1, ubatch]}
+     * @throws IllegalStateException    when this site's collapse has no leading norm
+     */
+    public void collapseNormed(int nTokens, GpuBuffer stream, int streamOff, GpuBuffer out, int outOff) {
+        if (!hasLeadingNorm()) {
+            throw new IllegalStateException("hyper-connection " + block + " has no leading row norm");
+        }
+        checkTokens(nTokens);
+        HcSubBlock.Kind kind = block.kind();
+        if (kind.projected()) {
+            ops.matmul(fn, flat.buffer(), flat.offset(), mixes.buffer(), mixes.offset(), nTokens);
+            coefficients.setInt(HcKernels.COEF_ARG_N_TOKENS, nTokens);
+            coefficients.setGlobal(HcKernels.perTokenGlobal(nTokens, local));
+            coefficients.dispatch();
+        } else if (kind.gated()) {
+            int rank = block.lowRank();
+            if (downInject != null) {
+                mergedGate(nTokens);
+            } else {
+                ops.matmul(down, flat.buffer(), flat.offset(), lowRank.buffer(), lowRank.offset(), nTokens);
+                ops.scale(lowRank.buffer(), lowRank.offset(), nTokens * rank, block.lowRankScale());
+                ops.unary(ActOp.SILU, ActParams.NONE, lowRank.buffer(), lowRank.offset(), lowRank.buffer(),
+                        lowRank.offset(), nTokens * rank);
+                ops.matmul(up, lowRank.buffer(), lowRank.offset(), gate.buffer(), gate.offset(), nTokens);
+            }
+        }
+        dispatchCollapse(nTokens, stream, streamOff,
+                kind.projected() ? pre.buffer() : gate.buffer(),
+                kind.projected() ? pre.offset() : gate.offset(), out, outOff);
+        if (inject != null) {
+            ops.matmul(inject, flat.buffer(), flat.offset(), post.buffer(), post.offset(), nTokens);
+        }
     }
 
     private PreparedDispatch prepareCoefficients(CoefficientParams p, GpuWeight scale, GpuWeight base,
@@ -221,7 +366,73 @@ public final class GpuHcSite implements AutoCloseable {
     }
 
     /**
-     * Collapses {@code nTokens} stream rows ({@code stream[streamOff + t*S ...]}, {@code S = hc*n_embd}) into
+     * Computes the pre, post and comb coefficients of the last {@code nTokens} stream rows without collapsing them
+     * ({@code LLM_HC_PrePostComb}); {@link #collapseWithPre} then collapses with the pre values.
+     *
+     * @throws IllegalStateException    when the site is not projected (the gated and mean variants have no mixes)
+     * @throws IllegalArgumentException when {@code nTokens} is outside {@code [1, ubatch]}
+     */
+    public void computeCoefficients(int nTokens, GpuBuffer stream, int streamOff) {
+        if (!block.kind().projected()) {
+            throw new IllegalStateException("hyper-connection " + block + " projects no mixes");
+        }
+        checkTokens(nTokens);
+        ops.norm(NormKind.RMS, null, null, block.normEps(), stream, streamOff, flat.buffer(), flat.offset(), nTokens,
+                streamWidth);
+        ops.matmul(fn, flat.buffer(), flat.offset(), mixes.buffer(), mixes.offset(), nTokens);
+        coefficients.setInt(HcKernels.COEF_ARG_N_TOKENS, nTokens);
+        coefficients.setGlobal(HcKernels.perTokenGlobal(nTokens, local));
+        coefficients.dispatch();
+    }
+
+    /** The pre coefficients of the last collapse or {@link #computeCoefficients}. */
+    public GpuBuffer preBuffer() {
+        if (pre == null) {
+            throw new IllegalStateException("hyper-connection " + block + " has no pre coefficients");
+        }
+        return pre.buffer();
+    }
+
+    /** First element of the pre coefficients in {@link #preBuffer()}. */
+    public int preOffset() {
+        if (pre == null) {
+            throw new IllegalStateException("hyper-connection " + block + " has no pre coefficients");
+        }
+        return pre.offset();
+    }
+
+    /**
+     * Collapses {@code nTokens} stream rows with pre coefficients {@code pre[preOff ..]}, as a mix computed by
+     * {@link #computeCoefficients} on another sub-block would.
+     *
+     * @throws IllegalArgumentException when {@code nTokens} is outside {@code [1, ubatch]}
+     */
+    public void collapseWithPre(int nTokens, GpuBuffer stream, int streamOff, GpuBuffer pre, int preOff,
+                                GpuBuffer out, int outOff) {
+        if (!block.kind().projected()) {
+            throw new IllegalStateException("hyper-connection " + block + " collapses with its own mixes");
+        }
+        checkTokens(nTokens);
+        Objects.requireNonNull(pre, "pre");
+        dispatchCollapse(nTokens, stream, streamOff, pre, preOff, out, outOff);
+    }
+
+    private void dispatchCollapse(int nTokens, GpuBuffer x, int xOff, GpuBuffer w, int wOff, GpuBuffer out,
+                                  int outOff) {
+        HcSubBlock.Kind kind = block.kind();
+        collapse.setInt(HcKernels.PRE_ARG_N_TOKENS, nTokens);
+        collapse.setGlobal(HcKernels.elementGlobal(nTokens, nEmbd, local));
+        collapse.setBuffer(HcKernels.PRE_ARG_X, kind.gated() ? flat.buffer() : x);
+        collapse.setInt(HcKernels.PRE_ARG_X_OFF, kind.gated() ? flat.offset() : xOff);
+        collapse.setBuffer(HcKernels.PRE_ARG_W_OR_GATE, w);
+        collapse.setInt(HcKernels.PRE_ARG_W_OFF, wOff);
+        collapse.setBuffer(HcKernels.PRE_ARG_OUT, out);
+        collapse.setInt(HcKernels.PRE_ARG_OUT_OFF, outOff);
+        collapse.dispatch();
+    }
+
+    /**
+     * Collapses {@code nTokens} stream rows ({@code stream[streamOff + t*S ...]}) into
      * {@code out[outOff + t*n_embd ...]} and computes the post coefficients {@link #expand} uses. {@code out} must
      * not overlap the stream.
      *
@@ -243,24 +454,40 @@ public final class GpuHcSite implements AutoCloseable {
             ops.enqueue(GpuOps.ROW_NORM, new long[]{(long) nRows * local}, new long[]{local},
                     NormKernels.rowNormArgs(NormKind.RMS, block.normEps(), nRows, nEmbd, nEmbd, stream, streamOff,
                             flat.buffer(), flat.offset(), norm.shard(0), null, hc, placeholders.readOnlyFloats()));
-            ops.matmul(down, flat.buffer(), flat.offset(), lowRank.buffer(), lowRank.offset(), nTokens);
-            ops.scale(lowRank.buffer(), lowRank.offset(), nTokens * rank, block.lowRankScale());
-            ops.unary(ActOp.SILU, ActParams.NONE, lowRank.buffer(), lowRank.offset(), lowRank.buffer(),
-                    lowRank.offset(), nTokens * rank);
-            ops.matmul(up, lowRank.buffer(), lowRank.offset(), gate.buffer(), gate.offset(), nTokens);
+            if (downInject != null) {
+                mergedGate(nTokens);
+            } else {
+                ops.matmul(down, flat.buffer(), flat.offset(), lowRank.buffer(), lowRank.offset(), nTokens);
+                ops.scale(lowRank.buffer(), lowRank.offset(), nTokens * rank, block.lowRankScale());
+                ops.unary(ActOp.SILU, ActParams.NONE, lowRank.buffer(), lowRank.offset(), lowRank.buffer(),
+                        lowRank.offset(), nTokens * rank);
+                ops.matmul(up, lowRank.buffer(), lowRank.offset(), gate.buffer(), gate.offset(), nTokens);
+            }
         }
-        collapse.setInt(HcKernels.PRE_ARG_N_TOKENS, nTokens);
-        collapse.setGlobal(HcKernels.elementGlobal(nTokens, nEmbd, local));
-        if (!kind.gated()) {
-            collapse.setBuffer(HcKernels.PRE_ARG_X, stream);
-            collapse.setInt(HcKernels.PRE_ARG_X_OFF, streamOff);
-        }
-        collapse.setBuffer(HcKernels.PRE_ARG_OUT, out);
-        collapse.setInt(HcKernels.PRE_ARG_OUT_OFF, outOff);
-        collapse.dispatch();
+        dispatchCollapse(nTokens, stream, streamOff, kind.projected() ? pre.buffer() : kind.gated() ? gate.buffer()
+                        : placeholders.readOnlyFloats(), kind.projected() ? pre.offset() : kind.gated() ? gate.offset()
+                        : 0, out, outOff);
         if (inject != null) {
             ops.matmul(inject, flat.buffer(), flat.offset(), post.buffer(), post.offset(), nTokens);
         }
+    }
+
+    /**
+     * The merged qwen4exp gated mix (qwen4exp.cpp:363-380): one matmul with the {@code [hc_*_down |
+     * hc_*_inject]} weight, the {@code 1/hc} scale of the whole output before the split, SiLU on the low-rank
+     * rows, then the up projection; the inject rows land in {@code post} pre-scaled, so the post map skips the
+     * scale ({@code PostParams#gatedInjectPreScaled}).
+     */
+    private void mergedGate(int nTokens) {
+        int rank = block.lowRank();
+        int rowW = rank + hc;
+        ops.matmul(downInject, flat.buffer(), flat.offset(), merged.buffer(), merged.offset(), nTokens);
+        ops.scale(merged.buffer(), merged.offset(), nTokens * rowW, block.lowRankScale());
+        ops.copy2d(merged.buffer(), merged.offset() + rank, rowW, post.buffer(), post.offset(), hc, nTokens, hc);
+        ops.copy2d(merged.buffer(), merged.offset(), rowW, lowRank.buffer(), lowRank.offset(), rank, nTokens, rank);
+        ops.unary(ActOp.SILU, ActParams.NONE, lowRank.buffer(), lowRank.offset(), lowRank.buffer(),
+                lowRank.offset(), nTokens * rank);
+        ops.matmul(up, lowRank.buffer(), lowRank.offset(), gate.buffer(), gate.offset(), nTokens);
     }
 
     /**
@@ -323,7 +550,8 @@ public final class GpuHcSite implements AutoCloseable {
     /** Releases the prepared dispatches; the scratch temporaries and weights stay with their owners. */
     @Override
     public void close() {
-        RuntimeException first = Closeables.closeAll(Arrays.asList(coefficients, collapse, expand), null);
+        RuntimeException first = Closeables.closeAll(Arrays.asList(coefficients, collapse, expand, expandNorm),
+                null);
         if (first != null) {
             throw first;
         }

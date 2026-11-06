@@ -48,53 +48,77 @@ public interface CpuLayerExtra extends AutoCloseable {
     }
 
     /**
-     * Why this extra has no batched hooks over {@link StepLayout#contiguousSingle()} == false, or null when it
-     * supports them. Default: refused, today's extras run the contiguous step only.
+     * Why this extra has no batched hooks over a step that is not {@link StepLayout#contiguousSingle()}, or null
+     * when its hooks are exact over any layout (a row-wise extra's hooks are: every row transforms on its own, so
+     * the segments' sequences and positions cannot change the result). Default: refused; an extra whose hooks are
+     * row-wise overrides this to null, an extra with layout-dependent math overrides the batched hooks themselves.
      */
     default String batchRefusal() {
         return getClass().getSimpleName() + " has no multi-sequence step";
     }
 
-    /** Batched form of {@link #beforeBlock}: the contiguous step delegates with {@code pos0 = s.pos0(0)}. */
+    /**
+     * Batched form of {@link #beforeBlock}: the contiguous step delegates with {@code pos0 = s.pos0(0)}; a
+     * batch-capable extra ({@link #batchRefusal()} null) runs the same hook over the whole step's rows, which is
+     * exact for the row-wise hooks, over paged and multi-segment layouts alike.
+     *
+     * @throws UnsupportedOperationException when the step is not contiguous-un-paged and {@link #batchRefusal()}
+     *                                       answers a reason
+     */
     default void beforeBlock(StepLayout s, float[] x) {
-        if (s.contiguousSingle()) {
-            beforeBlock(s.pos0(0), s.nTokens(), x);
-            return;
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        beforeBlock(s.pos0(0), s.nTokens(), x);
     }
 
     /**
-     * Batched form of {@link #afterMixer}: the contiguous step delegates with {@code pos0 = s.pos0(0)}.
+     * Batched form of {@link #afterMixer}: the contiguous step delegates with {@code pos0 = s.pos0(0)}; a
+     * batch-capable extra runs the same hook over the whole step's rows.
      *
      * @return true when this extra has added (or mixed) {@code branch} into {@code x} itself
+     * @throws UnsupportedOperationException as {@link #beforeBlock(StepLayout, float[])}
      */
     default boolean afterMixer(StepLayout s, float[] x, float[] branch) {
-        if (s.contiguousSingle()) {
-            return afterMixer(s.pos0(0), s.nTokens(), x, branch);
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        return afterMixer(s.pos0(0), s.nTokens(), x, branch);
     }
 
     /**
-     * Batched form of {@link #afterFfn}: the contiguous step delegates with {@code pos0 = s.pos0(0)}.
+     * Batched form of {@link #afterFfn}: the contiguous step delegates with {@code pos0 = s.pos0(0)}; a
+     * batch-capable extra runs the same hook over the whole step's rows.
      *
      * @return true when this extra has added (or mixed) {@code branch} into {@code x} itself
+     * @throws UnsupportedOperationException as {@link #beforeBlock(StepLayout, float[])}
      */
     default boolean afterFfn(StepLayout s, float[] x, float[] branch) {
-        if (s.contiguousSingle()) {
-            return afterFfn(s.pos0(0), s.nTokens(), x, branch);
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        return afterFfn(s.pos0(0), s.nTokens(), x, branch);
     }
 
-    /** Batched form of {@link #afterBlock}: the contiguous step delegates with {@code pos0 = s.pos0(0)}. */
+    /**
+     * Batched form of {@link #afterBlock}: the contiguous step delegates with {@code pos0 = s.pos0(0)}; a
+     * batch-capable extra runs the same hook over the whole step's rows.
+     *
+     * @throws UnsupportedOperationException as {@link #beforeBlock(StepLayout, float[])}
+     */
     default void afterBlock(StepLayout s, float[] x) {
-        if (s.contiguousSingle()) {
-            afterBlock(s.pos0(0), s.nTokens(), x);
-            return;
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        afterBlock(s.pos0(0), s.nTokens(), x);
+    }
+
+    /** The refusal {@link #batchRefusal()} answers, thrown for a non-contiguous step. */
+    default void refuseBatch() {
+        String why = batchRefusal();
+        if (why != null) {
+            throw new UnsupportedOperationException(why);
+        }
     }
 
     /** Releases what {@link #bind} created; the context's shared resources stay. */

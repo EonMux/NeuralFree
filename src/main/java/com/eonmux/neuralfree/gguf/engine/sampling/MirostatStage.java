@@ -9,6 +9,13 @@ import com.eonmux.neuralfree.gguf.engine.Sampler.Candidates;
  * candidate selected, and adapts {@code mu} toward the target by the learning rate {@code eta}. It replaces the chain's
  * dist stage, as llama.cpp builds it ({@code temp + mirostat}, common/sampling.cpp:408-413).
  *
+ * <p>{@code mu} adapts on accepted tokens: apply keeps its final candidate set, and {@link #accept} moves {@code mu}
+ * by the accepted token's surprise in that set, once per apply. Plain decoding accepts the token apply selected, which
+ * is llama.cpp's in-apply update; speculative verification reads rows ahead of their confirmation, and a row whose
+ * draft token is rejected never moves {@code mu}. A token outside the kept set (one apply never offered) leaves
+ * {@code mu} as it is. {@link #saveState} keeps {@code mu} with the pending set, so a restored stage adapts on the
+ * next accepted token as it would have when the state was saved.
+ *
  * <p>v1 ({@code mirostat = 1}, {@code m = 100}) estimates the tail exponent {@code s_hat} over the first {@code m - 1}
  * probabilities, cuts the set to max(1, int(k)) candidates via llama.top_k_impl with k from mu and the vocabulary size,
  * then draws; the vocabulary size comes from the first candidate set (llama.cpp reads it from the vocabulary at chain
@@ -24,6 +31,8 @@ public final class MirostatStage extends SamplerStage {
     private final long seed;
     private int vocabSize;
     private float mu;
+    /** The final candidate set of the last apply that no accepted token has adapted {@code mu} with, or null. */
+    private Offer pending;
     private final Mt19937 rng;
 
     public MirostatStage(int version, float tau, float eta, long seed) {
@@ -89,10 +98,7 @@ public final class MirostatStage extends SamplerStage {
         float[] probs = probs(candidates);
         int idx = rng.distDraw(probs);
         candidates.select(idx);
-
-        float observedSurprise = -log2f(candidates.prob(idx));
-        float e = observedSurprise - tau;
-        mu = mu - eta * e;
+        pending = Offer.of(candidates, probs);
     }
 
     private void applyV2(Candidates candidates) {
@@ -120,10 +126,7 @@ public final class MirostatStage extends SamplerStage {
         float[] probs = probs(candidates);
         int idx = rng.distDraw(probs);
         candidates.select(idx);
-
-        float observedSurprise = -log2f(candidates.prob(idx));
-        float e = observedSurprise - tau;
-        mu = mu - eta * e;
+        pending = Offer.of(candidates, probs);
     }
 
     private static float log2f(float v) {
@@ -139,9 +142,93 @@ public final class MirostatStage extends SamplerStage {
         return probs;
     }
 
+    /**
+     * Adapts {@code mu} toward the target by the surprise of {@code token} in the last apply's candidate set
+     * (llama.cpp's {@code mu = mu - eta * (-log2(p) - tau)}); nothing without a pending apply or for a token that
+     * set did not keep.
+     */
+    @Override
+    public void accept(int token) {
+        Offer offer = pending;
+        pending = null;
+        if (offer == null) {
+            return;
+        }
+        float p = offer.probOf(token);
+        if (p > 0f) {
+            float observedSurprise = -log2f(p);
+            float e = observedSurprise - tau;
+            mu = mu - eta * e;
+        }
+    }
+
     @Override
     public void reset() {
         mu = 2.0f * tau;
+        pending = null;
         rng.seed(seed);
+    }
+
+    /**
+     * {@code mu}, the vocabulary size the first apply measured and the pending candidate set; the draw's random
+     * stream is not part of the state.
+     */
+    @Override
+    public Object saveState() {
+        return new State(mu, vocabSize, pending);
+    }
+
+    @Override
+    public void restoreState(Object state) {
+        if (!(state instanceof State)) {
+            throw new IllegalArgumentException("not a mirostat stage state: " + state);
+        }
+        State s = (State) state;
+        mu = s.mu;
+        vocabSize = s.vocabSize;
+        pending = s.pending;
+    }
+
+    /** A saved stage state ({@link #saveState}). */
+    private static final class State {
+        final float mu;
+        final int vocabSize;
+        final Offer pending;
+
+        State(float mu, int vocabSize, Offer pending) {
+            this.mu = mu;
+            this.vocabSize = vocabSize;
+            this.pending = pending;
+        }
+    }
+
+    /** The token ids and probabilities of one apply's final candidate set; immutable. */
+    private static final class Offer {
+        private final int[] ids;
+        private final float[] probs;
+
+        private Offer(int[] ids, float[] probs) {
+            this.ids = ids;
+            this.probs = probs;
+        }
+
+        /** The set of {@code candidates}, whose probabilities are {@code probs} (owned by the new offer). */
+        static Offer of(Candidates candidates, float[] probs) {
+            int[] ids = new int[candidates.size()];
+            for (int i = 0; i < ids.length; i++) {
+                ids[i] = candidates.id(i);
+            }
+            return new Offer(ids, probs);
+        }
+
+        /** The probability of {@code token} in the set, 0 when the set does not hold it. */
+        float probOf(int token) {
+            for (int i = 0; i < ids.length; i++) {
+                if (ids[i] == token) {
+                    return probs[i];
+                }
+            }
+            return 0f;
+        }
     }
 }

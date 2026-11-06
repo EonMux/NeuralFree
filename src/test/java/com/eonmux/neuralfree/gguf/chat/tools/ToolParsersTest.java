@@ -29,6 +29,7 @@ public class ToolParsersTest {
     private static final String DS_CALL = "<｜tool▁call▁begin｜>";
     private static final String DS_CALL_END = "<｜tool▁call▁end｜>";
     private static final String DS_SEP = "<｜tool▁sep｜>";
+    private static final String MM = "]<]minimax[>[";
 
     /** get_weather(city: string, days: integer), the schema the XML formats type values by. */
     private static final List<ChatTool> TOOLS = Collections.singletonList(ChatTool.builder("get_weather")
@@ -146,7 +147,89 @@ public class ToolParsersTest {
                 new Sample("lfm2", "<|tool_call_start|>[f(a=\"x\")]<|tool_call_end|>Done.", "Done.",
                         new String[]{"f", "{\"a\":\"x\"}", null}),
                 new Sample("olmo3", "<function_calls>\nf(a=1)\ng(b='x')\n</function_calls>", "",
-                        new String[]{"f", "{\"a\":1}", null}, new String[]{"g", "{\"b\":\"x\"}", null}));
+                        new String[]{"f", "{\"a\":1}", null}, new String[]{"g", "{\"b\":\"x\"}", null}),
+                new Sample("dots", "Sure.\n<dots_function_call>\n<invoke name=\"get_weather\">\n"
+                        + "<parameter name=\"city\">Oslo</parameter>\n</invoke>\n<invoke name=\"noop\">\n</invoke>\n"
+                        + "</dots_function_call>", "Sure.",
+                        new String[]{"get_weather", "{\"city\":\"Oslo\"}", null}, new String[]{"noop", "{}", null}),
+                new Sample("granite-20b-fc", "<function_call> {\"name\": \"get_weather\", \"arguments\": "
+                        + "{\"city\": \"Paris\"}}\n<function_call>{\"name\": \"noop\", \"arguments\": {}}", "",
+                        new String[]{"get_weather", "{\"city\": \"Paris\"}", null}, new String[]{"noop", "{}", null}),
+                new Sample("gigachat3", "The weather:<|message_sep|>\n\nfunction call<|role_sep|>\n"
+                        + "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}", "The weather:",
+                        new String[]{"get_weather", "{\"city\": \"Paris\"}", null}),
+                new Sample("minicpm5", "Checking.\n<function name=\"get_weather\">\n"
+                        + "<param name=\"city\">Rome</param>\n<param name=\"days\">2</param>\n</function>", "Checking.",
+                        new String[]{"get_weather", "{\"city\":\"Rome\",\"days\":2}", null}),
+                new Sample("apertus", "I will check. <|tools_prefix|>[{\"get_weather\": {\"city\": \"Paris\"}}]"
+                        + "<|tools_suffix|>", "I will check.",
+                        new String[]{"get_weather", "{\"city\": \"Paris\"}", null}),
+                new Sample("deepseek_v32", "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n"
+                        + "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n"
+                        + "<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n"
+                        + "</｜DSML｜invoke>\n</｜DSML｜function_calls>", "",
+                        new String[]{"get_weather", "{\"city\":\"Paris\",\"days\":2}", null}),
+                new Sample("deepseek_v4", "<｜DSML｜tool_calls><｜DSML｜invoke name=\"noop\">\n"
+                        + "</｜DSML｜invoke><｜DSML｜invoke name=\"get_weather\">\n"
+                        + "<｜DSML｜parameter name=\"city\" string=\"true\">Oslo</｜DSML｜parameter>\n"
+                        + "</｜DSML｜invoke></｜DSML｜tool_calls>", "",
+                        new String[]{"noop", "{}", null}, new String[]{"get_weather", "{\"city\":\"Oslo\"}", null}),
+                new Sample("deepseek_v41", "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">\n"
+                        + "<｜DSML｜ parameter name=\"city\" string=\"true\">Lima</｜DSML｜ parameter>\n"
+                        + "</｜DSML｜ invoke></｜DSML｜ calls>", "",
+                        new String[]{"get_weather", "{\"city\":\"Lima\"}", null}),
+                new Sample("kimi_k3", "<|open|>response<|sep|>Sunny in Paris.<|close|>response<|sep|>"
+                        + "<|open|>tools<|sep|>"
+                        + "<|open|>call tool=\"get_weather\" index=\"1\"<|sep|>"
+                        + "<|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|>"
+                        + "<|close|>call<|sep|>"
+                        + "<|close|>tools<|sep|>", "Sunny in Paris.",
+                        new String[]{"get_weather", "{\"city\":\"Paris\"}", null}),
+                new Sample("k2_horizon", "<ifm|tool_calls>\n<ifm|tool_call>get_weather<ifm|arg_key>city</ifm|arg_key>"
+                        + "<ifm|arg_value>Paris</ifm|arg_value><ifm|arg_key>days</ifm|arg_key>"
+                        + "<ifm|arg_value>3</ifm|arg_value></ifm|tool_call>\n<ifm|tool_call>noop</ifm|tool_call>\n"
+                        + "</ifm|tool_calls>", "",
+                        new String[]{"get_weather", "{\"city\":\"Paris\",\"days\":3}", null},
+                        new String[]{"noop", "{}", null}),
+                new Sample("minimax_m3", "Hi." + MM + "<tool_call>" + MM + "<invoke name=\"get_weather\">"
+                        + MM + "<city>Paris" + MM + "</city>" + MM + "</invoke>" + MM + "</tool_call>", "Hi.",
+                        new String[]{"get_weather", "{\"city\":\"Paris\"}", null}),                new Sample("step3", "<｜tool_calls_begin｜>\n<｜tool_call_begin｜>function<｜tool_sep｜>"
+                        + "<steptml:invoke name=\"get_weather\">\n<steptml:parameter name=\"city\"> Paris </steptml:parameter>\n"
+                        + "</steptml:invoke><｜tool_call_end｜>\n<｜tool_calls_end｜>", "",
+                        new String[]{"get_weather", "{\"city\":\"Paris\"}", null}),
+                new Sample("plamo3", "<|plamo:begin_tool_requests:plamo|><|plamo:begin_tool_request:plamo|>"
+                        + "<|plamo:begin_tool_name:plamo|>get_weather<|plamo:end_tool_name:plamo|>"
+                        + "<|plamo:begin_tool_arguments:plamo|><|plamo:constrain|>json<|plamo:msg|>"
+                        + "{\"city\": \"Paris\"}<|plamo:end_tool_arguments:plamo|>"
+                        + "<|plamo:end_tool_request:plamo|><|plamo:end_tool_requests:plamo|>", "",
+                        new String[]{"get_weather", "{\"city\": \"Paris\"}", null}),
+                new Sample("hy_v3", "<tool_calls><tool_call>get_weather<tool_sep><arg_key>city</arg_key>"
+                        + "<arg_value>Paris</arg_value></tool_call><tool_call>noop<tool_sep></tool_call>"
+                        + "</tool_calls>", "",
+                        new String[]{"get_weather", "{\"city\":\"Paris\"}", null}, new String[]{"noop", "{}", null}),
+                new Sample("hy_v4", "<tool_calls><tool_call>get_weather<arg_key>city</arg_key>"
+                        + "<arg_value>Paris</arg_value></tool_call></tool_calls>", "",
+                        new String[]{"get_weather", "{\"city\":\"Paris\"}", null}),
+                new Sample("functiongemma", "<start_function_call>call:get_weather{city:<escape>Paris<escape>,"
+                        + "days:<escape>3<escape>}<end_function_call><start_function_call>call:noop{}"
+                        + "<end_function_call>", "",
+                        new String[]{"get_weather", "{\"city\":\"Paris\",\"days\":3}", null},
+                        new String[]{"noop", "{}", null}),
+                new Sample("gemma4", "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>,days:3}<tool_call|>"
+                        + "<|tool_call>call:noop{}<tool_call|>", "",
+                        new String[]{"get_weather", "{\"location\":\"Paris\",\"days\":3}", null},
+                        new String[]{"noop", "{}", null}),
+                new Sample("inkling", "<|message_model|><|content_text|>Sunny.<|end_message|>"
+                        + "<|message_model|><|content_invoke_tool_json|>{\"name\": \"get_weather\", "
+                        + "\"args\": {\"city\": \"Paris\"}}<|end_message|>", "Sunny.",
+                        new String[]{"get_weather", "{\"city\": \"Paris\"}", null}),
+                new Sample("cohere_command3", "<|START_RESPONSE|>Sunny in Paris.<|END_RESPONSE|>"
+                        + "<|START_ACTION|>[{\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", "
+                        + "\"parameters\": {\"city\": \"Paris\"}}]<|END_ACTION|>", "Sunny in Paris.",
+                        new String[]{"get_weather", "{\"city\": \"Paris\"}", "0"}),
+                new Sample("functionary_v3_2", ">>>all\nLet me check.\n>>>get_weather\n{\"city\": \"Paris\"}"
+                        + "\n>>>noop\n{}", "Let me check.",
+                        new String[]{"get_weather", "{\"city\": \"Paris\"}", null}, new String[]{"noop", "{}", null}));
     }
 
     private static ToolParser parser(String format) {
@@ -236,6 +319,22 @@ public class ToolParsersTest {
     }
 
     @Test
+    public void hunyuanTemplatesSpellingTheirSuffixThroughHytkParseSuffixedCalls() {
+        String template = "{%- set HYTK = ':opensource' %}\n"
+                + "{%- set toolcalls_begin_token = '<tool_calls{}>'.format(HYTK) %}"
+                + "{%- set think_begin_token = '<think{}>'.format(HYTK) %}"
+                + "{%- set tool_sep_token = '<tool_sep{}>'.format(HYTK) %}{{ '<arg_key' }}";
+        ToolParser.Factory f = ToolParserRegistry.detect(template);
+        assertEquals("hy_v3", f.name());
+        ToolParse p = f.create(null).parse("<tool_calls:opensource><tool_call:opensource>get_weather"
+                + "<tool_sep:opensource><arg_key:opensource>city</arg_key:opensource><arg_value:opensource>SF"
+                + "</arg_value:opensource></tool_call:opensource></tool_calls:opensource>", false);
+        assertEquals(1, p.calls().size());
+        assertEquals("get_weather", p.calls().get(0).name());
+        assertTrue(p.calls().get(0).arguments(), p.calls().get(0).arguments().contains("SF"));
+    }
+
+    @Test
     public void templatesSelectTheirFormat() {
         assertEquals("qwen3_coder", detect("{{ '<tool_call>\\n<function=' + name + '>\\n<parameter=' }}"));
         assertEquals("hermes", detect("<tool_call>\\n{\"name\": ...}\\n</tool_call>"));
@@ -243,11 +342,33 @@ public class ToolParsersTest {
         assertEquals("ernie45", detect("<tool_call>{{ call }}</tool_call><response>{{ content }}</response>"));
         assertEquals("glm45", detect("<tool_call>{{ name }}<arg_key>k</arg_key>"));
         assertEquals("minimax_m2", detect("<minimax:tool_call><invoke name=\"x\">"));
+        assertEquals("minimax_m3", detect("]<]minimax[>[<tool_call><invoke"));
         assertEquals("seed_oss", detect("<seed:tool_call><function="));
         assertEquals("mistral", detect("[TOOL_CALLS]"));
         assertEquals("kimi_k2", detect("<|tool_calls_section_begin|><|tool_call_begin|>"));
         assertEquals("deepseek_v31", detect(DS_CALL + "name" + DS_SEP));
         assertEquals("deepseek_v3", detect(DS_CALL + "function" + DS_SEP + "name\n```json"));
+        assertEquals("deepseek_v32", detect("<｜DSML｜function_calls><｜DSML｜invoke name="));
+        assertEquals("deepseek_v4", detect("<｜DSML｜tool_calls>"));
+        assertEquals("deepseek_v41", detect("<｜DSML｜ invoke name="));
+        assertEquals("step3", detect("<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜>"));
+        assertEquals("kimi_k3", detect("<|open|>tools<|sep|>"));
+        assertEquals("k2_horizon", detect("<ifm|tool_calls><ifm|tool_call>"));
+        assertEquals("hy_v3", detect("<tool_calls:6124c78e><tool_call:6124c78e><tool_sep:6124c78e>"
+                + "<arg_key:6124c78e>"));
+        assertEquals("hy_v4", detect("<tool_calls:6124c78e><tool_call:6124c78e><arg_key:6124c78e>"));
+        assertEquals("plamo3", detect("<|plamo:begin_tool_requests:plamo|>"));
+        assertEquals("inkling", detect("<|content_text|>...<|end_message|>"));
+        assertEquals("cohere_command3", detect("<|START_RESPONSE|>...<|START_ACTION|>"));
+        assertEquals("cohere_command4", detect("<|START_TEXT|>...<|START_ACTION|>"));
+        assertEquals("apertus", detect("<|tools_prefix|>[{{ calls }}]<|tools_suffix|>"));
+        assertEquals("functiongemma", detect("<start_function_call>call:{{ name }}"));
+        assertEquals("gemma4", detect("<|tool_call>call:{{ name }}{...}<tool_call|>"));
+        assertEquals("dots", detect("<dots_function_call><invoke name="));
+        assertEquals("gigachat3", detect("<|message_sep|>function call<|role_sep|>"));
+        assertEquals("granite-20b-fc", detect("<function_call>{\"name\""));
+        assertEquals("minicpm5", detect("<function name=\"f\"><param name=\"k\">"));
+        assertEquals("functionary_v3_2", detect("<|start_header_id|>assistant<|end_header_id|>\\n>>>"));
         assertEquals("llama3_json", detect("<|python_tag|>"));
         assertEquals("lfm2", detect("<|tool_call_start|>["));
         assertEquals("granite", detect("<|tool_call|>"));
@@ -259,8 +380,129 @@ public class ToolParsersTest {
     public void aliasesAndSpellingsSelectTheSameFormat() {
         assertEquals(ToolParserRegistry.forName("qwen3_coder"), ToolParserRegistry.forName("Qwen3-XML"));
         assertEquals(ToolParserRegistry.forName("glm45"), ToolParserRegistry.forName("glm47"));
+        assertEquals("ling3 and poolside_v1 write the GLM arg-key syntax",
+                ToolParserRegistry.forName("glm45"), ToolParserRegistry.forName("ling3"));
+        assertEquals(ToolParserRegistry.forName("glm45"), ToolParserRegistry.forName("poolside_v1"));
+        assertEquals("step3p5 and step5 write the qwen3-coder syntax",
+                ToolParserRegistry.forName("qwen3_coder"), ToolParserRegistry.forName("step3p5"));
+        assertEquals(ToolParserRegistry.forName("qwen3_coder"), ToolParserRegistry.forName("step5"));
+        assertEquals("granite4 writes hermes tool calls",
+                ToolParserRegistry.forName("hermes"), ToolParserRegistry.forName("granite4"));
+        assertEquals("ministral3 writes the mistral syntax",
+                ToolParserRegistry.forName("mistral"), ToolParserRegistry.forName("ministral3"));
         assertTrue(ToolParserRegistry.names().contains("hermes"));
         assertNull(ToolParserRegistry.forName("no-such-parser"));
+    }
+
+    @Test
+    public void dsmlStringAttributeTypesTheValues() {
+        ToolParse p = parser("deepseek_v32").parse("<｜DSML｜invoke name=\"get_weather\">\n"
+                + "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n"
+                + "<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n"
+                + "<｜DSML｜parameter name=\"unit\">celsius</｜DSML｜parameter>\n"
+                + "</｜DSML｜invoke>", false);
+        assertEquals("{\"city\":\"Paris\",\"days\":2,\"unit\":\"celsius\"}", p.calls().get(0).arguments());
+    }
+
+    @Test
+    public void anInvokeWithoutItsSectionIsRead() {
+        ToolParse p = parser("deepseek_v32").parse("Sure. <｜DSML｜invoke name=\"noop\">\n</｜DSML｜invoke>", false);
+        assertEquals("Sure.", p.content());
+        assertEquals(1, p.calls().size());
+        assertEquals("noop", p.calls().get(0).name());
+    }
+
+    @Test
+    public void k2HorizonReadsTypeTagsAndJsonBodies() {
+        ToolParse typed = parser("k2_horizon").parse("<ifm|tool_calls><ifm|tool_call>get_weather"
+                + "<ifm|arg_key>city</ifm|arg_key><ifm|arg_type>string</ifm|arg_type>"
+                + "<ifm|arg_value>3</ifm|arg_value></ifm|tool_call></ifm|tool_calls>", false);
+        assertEquals("an explicit string type keeps the text", "{\"city\":\"3\"}", typed.calls().get(0).arguments());
+        ToolParse json = parser("k2_horizon").parse("<ifm|tool_calls><ifm|tool_call>"
+                + "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}</ifm|tool_call>"
+                + "</ifm|tool_calls>", false);
+        assertEquals(1, json.calls().size());
+        assertEquals("get_weather", json.calls().get(0).name());
+        assertEquals("{\"city\": \"Rome\"}", json.calls().get(0).arguments());
+    }
+
+    @Test
+    public void hyTemplateSuffixBakesIntoTheMarkers() {
+        ToolParser.Factory f = ToolParserRegistry.detect("<tool_calls:6124c78e><tool_sep:6124c78e><arg_key:6124c78e>");
+        assertEquals("hy_v3", f.name());
+        ToolParse p = f.create(TOOLS).parse("<tool_calls:6124c78e><tool_call:6124c78e>get_weather<tool_sep:6124c78e>"
+                + "<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e>"
+                + "</tool_call:6124c78e></tool_calls:6124c78e>", false);
+        assertEquals(1, p.calls().size());
+        assertEquals("{\"city\":\"Paris\"}", p.calls().get(0).arguments());
+    }
+
+    @Test
+    public void gemma4ReadsNestedContainersAndBareJsonValues() {
+        ToolParse p = parser("gemma4").parse("<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>,"
+                + "where:{city:<|\"|>Oslo<|\"|>},days:[<|\"|>mon<|\"|>,<|\"|>tue<|\"|>],"
+                + "raining:true,confidence:0.5}<tool_call|>", false);
+        assertEquals("{\"location\":\"Paris\",\"where\":{\"city\":\"Oslo\"},"
+                + "\"days\":[\"mon\",\"tue\"],\"raining\":true,\"confidence\":0.5}", p.calls().get(0).arguments());
+    }
+
+    @Test
+    public void minimaxM3ReadsNestedElementsAndRepeats() {
+        ToolParse p = parser("minimax_m3").parse("Hi." + MM + "<tool_call>" + MM + "<invoke name=\"get_weather\">"
+                + MM + "<city>Paris" + MM + "</city>"
+                + MM + "<days>" + MM + "<from>1" + MM + "</from>" + MM + "<to>3" + MM + "</to>" + MM + "</days>"
+                + MM + "<day>mon" + MM + "</day>" + MM + "<day>tue" + MM + "</day>"
+                + MM + "</invoke>" + MM + "</tool_call>", false);
+        assertEquals("{\"city\":\"Paris\",\"days\":{\"from\":\"1\",\"to\":\"3\"},\"day\":[\"mon\",\"tue\"]}",
+                p.calls().get(0).arguments());
+    }
+
+    @Test
+    public void inklingKeepsThinkingOutOfTheContentAndReadsTextBlocks() {
+        ToolParse p = parser("inkling").parse("<|message_model|><|content_thinking|>let me think<|end_message|>"
+                + "<|message_model|><|content_text|>Sunny.<|end_message|>"
+                + "<|message_model|><|content_invoke_tool_json|>{\"name\": \"noop\", \"args\": {}}<|end_message|>",
+                false);
+        assertEquals("Sunny.", p.content());
+        assertEquals(1, p.calls().size());
+        assertEquals("noop", p.calls().get(0).name());
+    }
+
+    @Test
+    public void kimiK3UnescapesAttributeValuesAndDefaultsToStringArguments() {
+        ToolParse p = parser("kimi_k3").parse("<|open|>response<|sep|>Hi<|close|>response<|sep|>"
+                + "<|open|>tools<|sep|>"
+                + "<|open|>call tool=\"a&quot;b\" index=\"1\"<|sep|>"
+                + "<|open|>argument key=\"n\"<|sep|>42<|close|>argument<|sep|>"
+                + "<|close|>call<|sep|>"
+                + "<|close|>tools<|sep|>", false);
+        assertEquals("a\"b", p.calls().get(0).name());
+        assertEquals("{\"n\":\"42\"}", p.calls().get(0).arguments());
+    }
+
+    @Test
+    public void mimoKeepsEveryValueVerbatim() {
+        ToolParse p = parser("mimo").parse("<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n"
+                + "</function>\n</tool_call>", false);
+        assertEquals("the integer-typed parameter stays its text", "{\"days\":\"3\"}", p.calls().get(0).arguments());
+    }
+
+    @Test
+    public void functionGemmaAcceptsACallTheOutputEndsInsideOf() {
+        ToolParse p = parser("functiongemma").parse("Hi <start_function_call>call:get_weather{city:<escape>Paris",
+                false);
+        assertEquals("Hi", p.content());
+        assertEquals(1, p.calls().size());
+        assertEquals("{\"city\":\"Paris\"}", p.calls().get(0).arguments());
+    }
+
+    @Test
+    public void cohereCommand4AlsoUnwrapsTextBlocks() {
+        ToolParser command4 = ToolParserRegistry.forName("cohere_command4").create(TOOLS);
+        ToolParse p = command4.parse("<|START_TEXT|>Sunny.<|END_TEXT|><|START_ACTION|>"
+                + "[{\"tool_call_id\": \"7\", \"tool_name\": \"noop\", \"parameters\": {}}]<|END_ACTION|>", false);
+        assertEquals("Sunny.", p.content());
+        assertEquals("7", p.calls().get(0).id());
     }
 
     @Test

@@ -2,21 +2,30 @@ package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
+import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.weights.LayerWeightSource;
+import com.eonmux.neuralfree.gguf.gpu.weights.MoeExpertCache;
+import com.eonmux.neuralfree.gguf.gpu.weights.MoeExpertPrefetch;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
+import com.eonmux.neuralfree.gguf.ops.moe.EplbLoadWindow;
+import com.eonmux.neuralfree.gguf.ops.moe.MoeExpertHeat;
+import com.eonmux.neuralfree.gguf.ops.moe.MoeExpertRemap;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 
 import java.util.Objects;
+import java.util.function.IntPredicate;
 
 /**
  * Everything a GPU block needs to enqueue its work: the backend and queue, the kernel library, the dispatch helpers,
  * scratch, weights, recurrent/KV memory, the model spec, the placeholder buffers bound to absent optional kernel
- * arguments, the hidden-state tap and the projection deltas (LoRA) of the model's layers.
+ * arguments, the hidden-state tap, the projection deltas (LoRA) of the model's layers, the MoE expert cache of the
+ * host-resident routed experts and its prefill expert prefetch pool, the MoE expert-heat recorder ({@code null} without a profile save) and, when a
+ * placement rule keeps tensors in RAM, the host view of the model's tensors.
  *
  * <p>Immutable and shared by every block of one model. The context does not own its parts: the forward backend that
  * builds it closes them. {@link #memory()} is absent for models without memory (encoders, embedding models).
@@ -39,6 +48,14 @@ public final class GpuForwardContext {
     private final ExecutionObserver observer;
     private final HiddenTap hiddenTap;
     private final GpuProjectionDeltas projectionDeltas;
+    private final MoeExpertCache moeExpertCache;
+    private final CpuWeights hostWeights;
+    private final MoeExpertPrefetch moeExpertPrefetch;
+    private final int moeTailSkipRank;
+    private final MoeExpertHeat heat;
+    private final EplbLoadWindow moeLoadWindow;
+    private final MoeExpertRemap moeExpertRemap;
+    private final IntPredicate hostKv;
 
     private GpuForwardContext(Builder b) {
         this.backend = b.kernels.backend();
@@ -54,6 +71,14 @@ public final class GpuForwardContext {
         this.observer = b.observer;
         this.hiddenTap = b.hiddenTap;
         this.projectionDeltas = b.projectionDeltas != null ? b.projectionDeltas : new GpuProjectionDeltas();
+        this.moeExpertCache = b.moeExpertCache;
+        this.hostWeights = b.hostWeights;
+        this.moeExpertPrefetch = b.moeExpertPrefetch;
+        this.moeTailSkipRank = b.moeTailSkipRank;
+        this.heat = b.heat;
+        this.moeLoadWindow = b.moeLoadWindow;
+        this.moeExpertRemap = b.moeExpertRemap;
+        this.hostKv = b.hostKv;
     }
 
     /**
@@ -85,6 +110,39 @@ public final class GpuForwardContext {
     public HiddenTap hiddenTap() { return hiddenTap; }
     /** Additive deltas (LoRA) on the layers' projections, shared by the blocks that apply and register them. */
     public GpuProjectionDeltas projectionDeltas() { return projectionDeltas; }
+    /** The MoE expert cache of the host-resident routed experts, or null when none is configured. */
+    public MoeExpertCache moeExpertCache() { return moeExpertCache; }
+    /**
+     * Host view of the model's tensors, set when a placement rule keeps tensors in RAM ({@code --cpu-moe},
+     * {@code --n-cpu-moe}, {@code -ot}, {@code neuralfree.moe.cache}); the MoE blocks read their hosted routed
+     * experts from it. Null otherwise.
+     */
+    public CpuWeights hostWeights() { return hostWeights; }
+    /** The prefill expert prefetch pool of the cache, or null when prefill prefetch is off. */
+    public MoeExpertPrefetch moeExpertPrefetch() { return moeExpertPrefetch; }
+
+    /**
+     * The hosted tail-skip rank of the MoE expert cache ({@code neuralfree.moe.cache.tail.skip}): a missed expert
+     * that every token of a step routes only at this 0-based top-k position or lower is not computed. 0 keeps every
+     * miss. The MoE blocks apply it to trunk layers only.
+     */
+    public int moeTailSkipRank() { return moeTailSkipRank; }
+
+    /** The MoE expert-heat recorder the routed blocks note their selections into; null without a profile save. */
+    public MoeExpertHeat heat() { return heat; }
+
+    /** The live routed-row window the runtime expert rearrangement reads; null without one. */
+    public EplbLoadWindow moeLoadWindow() { return moeLoadWindow; }
+
+    /** The routed experts' logical-to-physical replica mapping; null when the experts keep their logical ids. */
+    public MoeExpertRemap moeExpertRemap() { return moeExpertRemap; }
+
+    /**
+     * True for a trunk layer whose KV cache lives in host RAM and whose attention runs on the host over it
+     * ({@code neuralfree.kv.offload=false}, llama.cpp {@code -nkvo}); such a layer's device mixer binds without a
+     * device cache. False for every layer by default.
+     */
+    public boolean hostKv(int il) { return hostKv.test(il); }
 
     /** True when the model has KV or recurrent memory. */
     public boolean hasMemory() {
@@ -117,6 +175,14 @@ public final class GpuForwardContext {
         b.observer = observer;
         b.hiddenTap = hiddenTap;
         b.projectionDeltas = projectionDeltas;
+        b.moeExpertCache = moeExpertCache;
+        b.hostWeights = hostWeights;
+        b.moeExpertPrefetch = moeExpertPrefetch;
+        b.moeTailSkipRank = moeTailSkipRank;
+        b.heat = heat;
+        b.moeLoadWindow = moeLoadWindow;
+        b.moeExpertRemap = moeExpertRemap;
+        b.hostKv = hostKv;
         return b;
     }
 
@@ -137,6 +203,14 @@ public final class GpuForwardContext {
         private ExecutionObserver observer = ExecutionObserver.NONE;
         private HiddenTap hiddenTap = HiddenTap.NONE;
         private GpuProjectionDeltas projectionDeltas;
+        private MoeExpertCache moeExpertCache;
+        private CpuWeights hostWeights;
+        private MoeExpertPrefetch moeExpertPrefetch;
+        private int moeTailSkipRank;
+        private MoeExpertHeat heat;
+        private EplbLoadWindow moeLoadWindow;
+        private MoeExpertRemap moeExpertRemap;
+        private IntPredicate hostKv = il -> false;
 
         private Builder(LlmKernels kernels, GpuOps ops, GpuWeights weights, ModelSpec spec) {
             this.kernels = Objects.requireNonNull(kernels, "kernels");
@@ -148,6 +222,15 @@ public final class GpuForwardContext {
         /** Streams per-layer weights through this source instead of the resident weights. */
         public Builder weightSource(LayerWeightSource v) {
             this.weightSource = Objects.requireNonNull(v, "weightSource");
+            return this;
+        }
+
+        /**
+         * Host view of the model's tensors for the MoE blocks that compute hosted routed experts on the CPU; not
+         * owned (the loader closes it). Null leaves the blocks without the hosted path.
+         */
+        public Builder hostWeights(CpuWeights v) {
+            this.hostWeights = v;
             return this;
         }
 
@@ -165,6 +248,50 @@ public final class GpuForwardContext {
         /** Observer of the residual stream at layer inputs; defaults to {@link HiddenTap#NONE}. */
         public Builder hiddenTap(HiddenTap v) {
             this.hiddenTap = Objects.requireNonNull(v, "hiddenTap");
+            return this;
+        }
+
+        /** The MoE expert cache of the host-resident routed experts; leave unset when there is none. */
+        public Builder moeExpertCache(MoeExpertCache v) {
+            this.moeExpertCache = Objects.requireNonNull(v, "moeExpertCache");
+            return this;
+        }
+
+        /** The prefill expert prefetch pool of the cache; null keeps prefill prefetch off. */
+        public Builder moeExpertPrefetch(MoeExpertPrefetch v) {
+            this.moeExpertPrefetch = v;
+            return this;
+        }
+
+        /** The hosted tail-skip rank of the expert cache; 0 (the default) keeps every miss. */
+        public Builder moeTailSkipRank(int v) {
+            this.moeTailSkipRank = v;
+            return this;
+        }
+
+        /**
+         * The trunk layers whose KV cache lives in host RAM and whose attention runs on the host; none by default.
+         */
+        public Builder hostKv(IntPredicate v) {
+            this.hostKv = Objects.requireNonNull(v, "hostKv");
+            return this;
+        }
+
+        /** The routed experts' logical-to-physical replica mapping; null (the default) keeps logical ids. */
+        public Builder moeExpertRemap(MoeExpertRemap v) {
+            this.moeExpertRemap = v;
+            return this;
+        }
+
+        /** The MoE expert-heat recorder the routed blocks note their selections into; null (the default) skips it. */
+        public Builder heat(MoeExpertHeat v) {
+            this.heat = v;
+            return this;
+        }
+
+        /** The live routed-row window of the runtime expert rearrangement; null (the default) skips it. */
+        public Builder moeLoadWindow(EplbLoadWindow v) {
+            this.moeLoadWindow = v;
             return this;
         }
 

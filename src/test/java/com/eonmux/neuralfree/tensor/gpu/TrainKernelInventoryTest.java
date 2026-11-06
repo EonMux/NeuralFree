@@ -132,7 +132,7 @@ public class TrainKernelInventoryTest {
     }
 
     @Test
-    public void everyVariantRowNamesAPortableKernel() throws IOException {
+    public void everyVariantRowNamesAnInventoryKernel() throws IOException {
         assertNoViolations("variant rows without a kernel", inventory().orphanVariantRowViolations(OPENCL_ONLY));
     }
 

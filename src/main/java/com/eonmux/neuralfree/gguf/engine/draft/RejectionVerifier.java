@@ -11,6 +11,10 @@ package com.eonmux.neuralfree.gguf.engine.draft;
  * without probabilities) stays lossless with the confirmation probability {@code p(d)}. A greedy target chain
  * degenerates: one-hot {@code p} accepts only the argmax, exactly {@link VerifyMode#MATCH}'s rule.
  *
+ * <p>Under a watermark the replacement is the round's keyed residual draw ({@link Round#resample}) and the bonus is
+ * the chain's watermarked own draw, both under the target role, while confirmed draft tokens stay the drafts' key-A
+ * draws (vLLM's watermarked rejection sampler).
+ *
  * <p>Uniforms are drawn in position order, then one for the replacement or bonus. A drafter that proposed a token
  * with a zero {@code q} entry is a drafter fault ({@link IllegalStateException}), as vLLM's {@code draft_prob > 0}
  * guard.
@@ -41,7 +45,7 @@ public final class RejectionVerifier implements Verifier {
                 }
                 continue;
             }
-            if (round.emit(Verifier.residual(round, p, q, 1.0, 1.0)) != null) {
+            if (round.emit(round.resample(p, q, 1.0, 1.0)) != null) {
                 return;
             }
             return;

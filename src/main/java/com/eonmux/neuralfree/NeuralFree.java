@@ -31,9 +31,12 @@ import java.util.Objects;
 public class NeuralFree {
 
     /**
-     * System property naming the API the training framework runs on: {@code auto}, {@code opencl}, {@code cuda} or
-     * {@code vulkan} (default {@code auto}). Pass it to the JVM as {@code -Dneuralfree.backend=<api>}; the
-     * {@code runDemos} Gradle task forwards {@code -Pneuralfree.backend=<api>} as this property.
+     * System property naming the API the training framework runs on: {@code auto}, one of the built-in APIs
+     * ({@code opencl}, {@code cuda}, {@code vulkan}, {@code hip}, {@code metal}) or an accelerator API served by an
+     * installed backend provider ({@code sycl}, {@code xpu}, {@code cann}, {@code hexagon}, {@code openvino},
+     * {@code webgpu}, {@code musa}, {@code zdnn}, {@code zendnn}); default {@code auto}. Pass it to the JVM as
+     * {@code -Dneuralfree.backend=<api>}; the {@code runDemos} Gradle task forwards
+     * {@code -Pneuralfree.backend=<api>} as this property.
      */
     public static final String BACKEND_PROPERTY = "neuralfree.backend";
 
@@ -118,27 +121,34 @@ public class NeuralFree {
     }
 
     /**
-     * The acceleration mode named by {@code value}: {@code auto}, {@code opencl}, {@code cuda} or {@code vulkan},
-     * case-insensitive and trimmed.
+     * The acceleration mode named by {@code value}: {@code auto}, a built-in API or an accelerator API
+     * ({@link BackendType#acceptedApiNames()}), case-insensitive and trimmed.
      *
      * @throws IllegalArgumentException when {@code value} is null or names no GPU API
      */
     public static ACCELERATION_MODE parseBackend(String value) {
+        String accepted = "auto, " + BackendType.acceptedApiNames();
         if (value == null) {
-            throw new IllegalArgumentException("backend must not be null; use auto, opencl, cuda or vulkan");
+            throw new IllegalArgumentException("backend must not be null; use " + accepted);
         }
         String name = value.trim().toUpperCase(Locale.ROOT);
-        for (ACCELERATION_MODE mode : ACCELERATION_MODE.values()) {
-            if (mode.name().equals(name)) {
-                return mode;
-            }
+        if ("AUTO".equals(name)) {
+            return ACCELERATION_MODE.AUTO;
         }
         if ("CPU".equals(name)) {
             throw new IllegalArgumentException("backend '" + value + "' is invalid here: the training framework runs "
                     + "its tensors on a GPU backend and takes its CPU path per op when the train kernels are "
-                    + "unavailable; use auto, opencl, cuda or vulkan");
+                    + "unavailable; use " + accepted);
         }
-        throw new IllegalArgumentException("backend '" + value + "' is invalid; use auto, opencl, cuda or vulkan");
+        if ("TPU".equals(name)) {
+            throw new IllegalArgumentException("backend '" + value + "' is not supported: vLLM's TPU platform runs "
+                    + "through JAX/torch_xla, which a Java inference engine cannot drive; use " + accepted);
+        }
+        try {
+            return ACCELERATION_MODE.valueOf(BackendType.fromApiName(value).name());
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("backend '" + value + "' is invalid; use " + accepted);
+        }
     }
 
     /**
@@ -253,7 +263,14 @@ public class NeuralFree {
                 return hw.getCUDevices().size();
             case VULKAN:
                 return hw.getVkDevices().size();
+            case HIP:
+                return hw.getHipDevices().size();
+            case METAL:
+                return hw.getMetalDevices().size();
             default:
+                if (api.isAccelerator()) {
+                    return hw.getAcceleratorDevices(api).size();
+                }
                 throw new IllegalArgumentException("Unknown backend type: " + api);
         }
     }

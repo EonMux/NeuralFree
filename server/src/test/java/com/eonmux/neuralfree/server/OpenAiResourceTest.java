@@ -1,8 +1,6 @@
 package com.eonmux.neuralfree.server;
 
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
-import com.eonmux.neuralfree.gguf.memory.KvDType;
-import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import com.eonmux.neuralfree.utils.json.Json;
 import com.eonmux.neuralfree.utils.json.JsonView;
@@ -20,12 +18,15 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
+import static com.eonmux.neuralfree.server.ServerTestSupport.errorOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The OpenAI-compatible HTTP surface over the real service (PARITY P2): the synthetic two-layer llama opens on a
+ * The OpenAI-compatible HTTP surface over the real service: the synthetic two-layer llama opens on a
  * paged {@code parallel = 2} config and the resources answer every protocol form — the model list, non-streamed
  * completions and chat completions with usage and finish reasons, SSE streams ending in {@code data: [DONE]},
  * guided_choice through the grammar route, the named refusals (out-of-range {@code n}, {@code logit_bias} and
@@ -42,11 +43,9 @@ public class OpenAiResourceTest {
     @BeforeAll
     static void open() throws IOException {
         Path model = SyntheticModels.llama().writeTempFile();
-        EngineConfig config = EngineConfig.builder()
-                .memory(MemoryConfig.builder()
-                        .nCtx(64).ubatch(8).parallel(2).typeK(KvDType.F32).typeV(KvDType.F32).build())
-                .build();
-        service = new EngineService(model.toString(), config);
+        EngineConfig config = ServerTestSupport.pagedConfig(64, 2);
+        service = new EngineService(model.toString(), config,
+                ServerOptions.defaults().withTrustRequestChatTemplate(true));
         unloaded = new EngineService(null, config);
         resource = new OpenAiResource(service);
         llama = new LlamaCppResource(service);
@@ -60,7 +59,7 @@ public class OpenAiResourceTest {
 
     @Test
     void theModelListNamesTheServedModel() {
-        Response response = resource.models();
+        Response response = resource.models(null);
         assertEquals(200, response.getStatus());
         JsonView body = view(response.getEntity());
         assertEquals("list", body.str("object"));
@@ -116,24 +115,28 @@ public class OpenAiResourceTest {
     void completionLogprobsUseTheLegacyArrays() {
         Response response = resource.completions("""
                 {"prompt": "hello", "max_tokens": 3, "temperature": 0, "logprobs": 2, "echo": true}""");
-        JsonView choice = firstChoice(view(response.getEntity()));
+        JsonView body = view(response.getEntity());
+        JsonView choice = firstChoice(body);
         JsonView logprobs = JsonView.of(choice.raw("logprobs"), "logprobs");
         List<?> tokens = (List<?>) logprobs.raw("tokens");
         List<?> tokenLogprobs = (List<?>) logprobs.raw("token_logprobs");
         List<?> tops = (List<?>) logprobs.raw("top_logprobs");
         List<?> offsets = (List<?>) logprobs.raw("text_offset");
-        assertEquals(3, tokens.size(), "one entry per generated token");
-        assertEquals(3, tokenLogprobs.size());
-        assertEquals(3, tops.size());
-        assertEquals("hello".length(), ((Number) offsets.get(0)).longValue(), "offsets count the echoed prompt");
-        for (int i = 0; i < 3; i++) {
+        long promptTokens = body.obj("usage").i64("prompt_tokens");
+        assertEquals(promptTokens + 3, tokens.size(),
+                "the echoed prompt's entries come before the generated ones (vLLM's merge)");
+        assertEquals(promptTokens + 3, tokenLogprobs.size());
+        assertEquals(promptTokens + 3, tops.size());
+        assertNull(tokenLogprobs.get(0), "no row predicts the first prompt token");
+        assertNull(tops.get(0), "no alternatives for the first prompt token");
+        assertEquals(0L, ((Number) offsets.get(0)).longValue(), "the merged arrays open at offset 0");
+        for (int i = 1; i < tokens.size(); i++) {
             Map<?, ?> top = (Map<?, ?>) tops.get(i);
-            assertTrue(top.size() >= 1 && top.size() <= 2, "at most the requested alternatives");
-            assertTrue(top.containsKey(tokens.get(i)), "greedy's token is among the most likely");
-            if (i > 0) {
-                long step = ((Number) offsets.get(i)).longValue() - ((Number) offsets.get(i - 1)).longValue();
-                assertEquals(((String) tokens.get(i - 1)).length(), step, "offsets advance by the token text");
-            }
+            assertTrue(top.size() >= 1 && top.size() <= 3, "the token and at most the requested alternatives");
+            assertEquals(tokens.get(i), top.keySet().iterator().next(), "every entry lists its own token first");
+            assertNotNull(tokenLogprobs.get(i), "every scored position carries its logprob");
+            long step = ((Number) offsets.get(i)).longValue() - ((Number) offsets.get(i - 1)).longValue();
+            assertEquals(((String) tokens.get(i - 1)).length(), step, "offsets advance by the token text");
         }
     }
 
@@ -231,6 +234,64 @@ public class OpenAiResourceTest {
     }
 
     @Test
+    void guidedRegexWithShorthandClassesConstrainsTheAnswer() {
+        for (String constraint : List.of("\"guided_regex\": \"\\\\d{3}-\\\\d{4}\"",
+                "\"structured_outputs\": {\"regex\": \"\\\\d{3}-\\\\d{4}\"}")) {
+            Response response = resource.completions("{\"prompt\": \"call\", \"max_tokens\": 16,"
+                    + " \"temperature\": 0, " + constraint + "}");
+            assertEquals(200, response.getStatus());
+            JsonView choice = firstChoice(view(response.getEntity()));
+            String text = choice.str("text");
+            assertTrue(text.matches("[0-9]{3}-[0-9]{4}"), constraint + " forces the pattern, got " + text);
+            assertEquals("stop", choice.str("finish_reason"), "the full match ends the output");
+        }
+    }
+
+    @Test
+    void aLarkGuidedGrammarConstrainsTheAnswerAsVllmDetectsIt() {
+        String lark = "start: \\\"id-\\\" DIGIT DIGIT\\nDIGIT: /[0-9]/";
+        for (String constraint : List.of("\"guided_grammar\": \"" + lark + "\"",
+                "\"structured_outputs\": {\"grammar\": \"" + lark + "\"}")) {
+            Response response = resource.completions("{\"prompt\": \"name\", \"max_tokens\": 16,"
+                    + " \"temperature\": 0, " + constraint + "}");
+            assertEquals(200, response.getStatus());
+            JsonView choice = firstChoice(view(response.getEntity()));
+            String text = choice.str("text");
+            assertTrue(text.matches("id-[0-9]{2}"), constraint + " forces the grammar, got " + text);
+            assertEquals("stop", choice.str("finish_reason"), "the full match ends the output");
+        }
+        String broken = "{\"prompt\": \"x\", \"max_tokens\": 4, \"guided_grammar\": \"start: missing\"}";
+        assertEquals(400, statusOf(() -> resource.completions(broken)));
+        String message = errorOf(() -> resource.completions(broken));
+        assertTrue(message.contains("unknown name 'missing' (line 1, column 8)"), message);
+    }
+
+    @Test
+    void anUnsupportedGuidedRegexIsRefusedNamingTheConstruct() {
+        String request = "{\"prompt\": \"x\", \"max_tokens\": 4, \"guided_regex\": \"\\\\bfoo\"}";
+        assertEquals(400, statusOf(() -> resource.completions(request)));
+        String message = errorOf(() -> resource.completions(request));
+        assertTrue(message.contains("regex constraint") && message.contains("word boundary assertion: \\b"),
+                message);
+    }
+
+    @Test
+    void aStructuralTagResponseFormatInXgrammarsFormConstrainsTheAnswer() {
+        Response response = resource.completions("""
+                {"prompt": "pick one", "max_tokens": 8, "temperature": 0,
+                 "response_format": {"type": "structural_tag", "format": {"type": "or", "elements": [
+                   {"type": "const_string", "value": "yes"}, {"type": "const_string", "value": "no"}]}}}""");
+        assertEquals(200, response.getStatus());
+        String text = firstChoice(view(response.getEntity())).str("text");
+        assertTrue(text.equals("yes") || text.equals("no"), "the tag forces one choice, got " + text);
+        // the deprecated qwen_xml_parameter format is the qwen_xml style, so it compiles and serves
+        Response qwen = resource.completions("""
+                {"prompt": "x", "max_tokens": 8, "temperature": 0, "response_format":
+                 {"type": "structural_tag", "format": {"type": "qwen_xml_parameter", "json_schema": {}}}}""");
+        assertEquals(200, qwen.getStatus());
+    }
+
+    @Test
     void refusalsCarryTheGapByName() {
         assertEquals(400, statusOf(() -> resource.completions(
                 "{\"prompt\": \"x\", \"n\": 0}")));
@@ -262,7 +323,7 @@ public class OpenAiResourceTest {
         assertEquals(400, statusOf(() -> resource.chatCompletions(
                 "{\"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"image_url\","
                         + " \"image_url\": {\"url\": \"data:,\"}}]}]}")), "media parts on the text path");
-        WebApplicationException unloadedModels = waeOf(() -> new OpenAiResource(unloaded).models());
+        WebApplicationException unloadedModels = waeOf(() -> new OpenAiResource(unloaded).models(null));
         assertEquals(503, unloadedModels.getResponse().getStatus());
     }
 
@@ -278,10 +339,49 @@ public class OpenAiResourceTest {
     @Test
     void healthAndPropsReportTheServingSetup() {
         assertEquals("ok", view(llama.health().getEntity()).str("status"));
-        JsonView props = view(llama.props().getEntity());
+        JsonView props = view(llama.props(null, null).getEntity());
         assertTrue(props.str("model_path").endsWith(".gguf"));
         assertEquals(2L, props.i64("total_slots"));
         assertEquals(64L, JsonView.of(props.raw("default_generation_settings"), "d").i64("n_ctx"));
+        // the built-in ChatML template: string content only, no tools and no tool calls
+        JsonView caps = JsonView.of(props.raw("chat_template_caps"), "chat_template_caps");
+        assertEquals(Boolean.TRUE, caps.raw("supports_string_content"));
+        assertEquals(Boolean.FALSE, caps.raw("supports_tool_calls"));
+        assertEquals(Boolean.FALSE, caps.raw("supports_tools"));
+        assertFalse(service.defaultParallelToolCalls(), "a template that renders no tool calls fails llama.cpp's"
+                + " parallel probe, so parallel_tool_calls defaults to one call");
+    }
+
+    // ------------------------------------------------------------------ per-request controls
+
+    @Test
+    void anUnknownReasoningFormatIsRefusedByName() {
+        assertEquals(400, statusOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"reasoning_format\": \"sql\"}")));
+        assertTrue(errorOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"reasoning_format\": \"sql\"}"))
+                .contains("deepseek-legacy"));
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": \"x\", \"max_tokens\": 1, \"reasoning_format\": \"sql\"}")),
+                "the native completion takes the same field");
+        assertEquals(200, statusOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"max_tokens\": 1,"
+                        + " \"reasoning_format\": \"none\"}")));
+    }
+
+    @Test
+    void malformedDocumentsAndOverridesAreRefusedByName() {
+        assertEquals(400, statusOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"documents\": \"doc\"}")));
+        assertTrue(errorOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"documents\": [\"doc\"]}"))
+                .contains("documents[0]"));
+        assertEquals(400, statusOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"chat_template\": 3}")));
+        assertEquals(400, statusOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}],"
+                        + " \"chat_template\": \"{{ messages[ }}\"}")),
+                "an override that does not parse");
     }
 
     // ------------------------------------------------------------------ helpers

@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-MC part A converter classes: {@code Llama4Model}, {@code DbrxModel},
+ * Synthetic checkpoints of the converter classes: {@code Llama4Model}, {@code DbrxModel},
  * {@code GrokModel} and {@code ArcticModel}. Two layers, a hidden size of 8, two query heads, one key/value head, an
  * MoE of two experts and the exact tensor names and configuration keys of the converter sources.
  */

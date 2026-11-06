@@ -1,0 +1,46 @@
+/* dsa_restrict_blocks.comp - LLM_DSA_RestrictBlocks: level two of the DeepSeek-V4.1 candidate selection.
+ * GLSL twin of kernels/llm/sparse/dsa.cl (which documents the mask). Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_kv, i block_size, i blocks_off, i blocks_stride, R int blocks, W scores)
+ * Every row of scores [n_tokens][n_kv] whose block is not one of token t's
+ * blocks[blocks_off + t * blocks_stride, +blocks_stride) becomes -INF.
+ *
+ * Dispatch: 1-D, global = n_tokens * n_kv, any local size.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(push_constant) uniform NfDsaRestrictParams {
+    int n_tokens;
+    int n_kv;
+    int block_size;
+    int blocks_off;
+    int blocks_stride;
+} pc;
+
+layout(std430, binding = 0) readonly buffer NfDsaRestrictBlocks { int blocks[]; };
+layout(std430, binding = 1)          buffer NfDsaRestrictScores { float scores[]; };
+
+void main() {
+    const uint gid = nf_global_id();
+    if (gid >= uint(pc.n_tokens) * uint(pc.n_kv)) {
+        return;
+    }
+    const int t = int(gid) / pc.n_kv;
+    const int row = int(gid) - t * pc.n_kv;
+    const int b = row / pc.block_size;
+    const int base = pc.blocks_off + t * pc.blocks_stride;
+    bool keep = false;
+    for (int j = 0; j < pc.blocks_stride; ++j) {
+        if (blocks[base + j] == b) {
+            keep = true;
+            break;
+        }
+    }
+    if (!keep) {
+        scores[gid] = -NF_INF;
+    }
+}

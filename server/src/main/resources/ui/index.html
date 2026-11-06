@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeuralFree</title>
+<meta name="description" content="Chat with the models the NeuralFree server serves.">
+<meta name="color-scheme" content="dark light">
+<link rel="manifest" href="/ui/manifest.webmanifest">
+<link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/ui/app.css">
+<script defer src="/ui/markdown.js"></script>
+<script defer src="/ui/app.js"></script>
+</head>
+<body>
+<div id="app" class="app">
+  <aside id="sidebar" class="sidebar" aria-label="Conversations">
+    <div class="sidebar-head">
+      <span class="brand"><img src="/ui/favicon.svg" alt="" class="brand-mark">NeuralFree</span>
+      <button id="new-chat" class="btn primary" title="New chat (Ctrl/Cmd+O)">＋ New chat</button>
+    </div>
+    <input id="search" class="search" type="search" placeholder="Search conversations"
+           aria-label="Search conversations" autocomplete="off">
+    <nav id="conversation-list" class="conversation-list"></nav>
+    <div class="sidebar-foot">
+      <button id="import-btn" class="btn" title="Import conversations from a JSON file">Import</button>
+      <button id="export-btn" class="btn" title="Export every conversation as JSON">Export</button>
+      <button id="settings-btn" class="btn" title="Open settings">Settings</button>
+      <input id="import-file" type="file" accept="application/json,.json" hidden>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button id="toggle-sidebar" class="icon-btn" title="Toggle sidebar (Ctrl/Cmd+B)" aria-label="Toggle sidebar">☰</button>
+      <select id="model-select" class="model-select" aria-label="Model"></select>
+      <button id="model-load" class="btn" hidden>Load</button>
+      <span id="server-status" class="status-dot off" title="Server status"></span>
+      <span class="topbar-spacer"></span>
+      <button id="server-info-btn" class="btn" title="Server properties">Server</button>
+      <button id="slots-btn" class="btn" title="Processing slots">Slots</button>
+    </header>
+
+    <section id="welcome" class="welcome">
+      <h1>NeuralFree</h1>
+      <p id="welcome-note">A conversation with the model the server serves.</p>
+    </section>
+
+    <section id="messages" class="messages" aria-live="polite"></section>
+
+    <footer class="composer">
+      <div id="composer-error" class="composer-error" hidden></div>
+      <div id="attachments" class="attachments"></div>
+      <div class="composer-row">
+        <button id="attach-btn" class="icon-btn" title="Attach files" aria-label="Attach files">📎</button>
+        <input id="file-input" type="file" multiple hidden>
+        <textarea id="input" class="input" rows="1" placeholder="Send a message…"
+                  aria-label="Message" autocomplete="off"></textarea>
+        <button id="send" class="btn primary send">Send</button>
+        <button id="stop" class="btn danger send" hidden>Stop</button>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<dialog id="settings-dialog" class="dialog" aria-label="Settings">
+  <form id="settings-form" method="dialog">
+    <h2>Settings</h2>
+    <label>API key
+      <input id="setting-api-key" type="password" placeholder="sent as Authorization: Bearer" autocomplete="off">
+    </label>
+    <label>Theme
+      <select id="setting-theme">
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
+        <option value="system">System</option>
+      </select>
+    </label>
+    <label>System prompt
+      <textarea id="setting-system" rows="3" placeholder="Sent as the first message of every chat"></textarea>
+    </label>
+    <div class="field-row">
+      <label>Temperature
+        <input id="setting-temperature" type="number" step="0.01" min="0" max="2" placeholder="server default">
+      </label>
+      <label>Top P
+        <input id="setting-top-p" type="number" step="0.01" min="0" max="1" placeholder="server default">
+      </label>
+    </div>
+    <div class="field-row">
+      <label>Max tokens
+        <input id="setting-max-tokens" type="number" step="1" min="1" placeholder="server default">
+      </label>
+      <label>Seed
+        <input id="setting-seed" type="number" step="1" placeholder="server default">
+      </label>
+    </div>
+    <p class="hint">Empty sampling fields leave the parameter out and the server default applies.</p>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn">Close</button>
+      <button id="settings-save" value="save" class="btn primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="server-dialog" class="dialog" aria-label="Server properties">
+  <h2>Server</h2>
+  <div id="server-info" class="kv-table"><p class="hint">Loading…</p></div>
+  <div class="dialog-actions">
+    <button id="server-refresh" class="btn" type="button">Refresh</button>
+    <button class="btn" method="dialog">Close</button>
+  </div>
+</dialog>
+
+<dialog id="slots-dialog" class="dialog" aria-label="Processing slots">
+  <h2>Slots</h2>
+  <div id="slots-info" class="kv-table"><p class="hint">Loading…</p></div>
+  <div class="dialog-actions">
+    <button id="slots-refresh" class="btn" type="button">Refresh</button>
+    <button class="btn" method="dialog">Close</button>
+  </div>
+</dialog>
+</body>
+</html>

@@ -12,8 +12,10 @@ import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtra;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.FusedMode;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuOpsFixture;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.head.GpuHeadPreprocessor;
@@ -23,6 +25,7 @@ import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
+import com.eonmux.neuralfree.gguf.ops.fused.FusedKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.spec.EmbeddingSpec;
 import com.eonmux.neuralfree.gguf.spec.HeadSpec;
@@ -46,6 +49,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
@@ -77,20 +81,29 @@ public class GpuHcExtraTest {
 
     @After
     public void tearDown() throws Exception {
+        closeRig();
+    }
+
+    private void closeRig() throws Exception {
         for (int i = closeables.size() - 1; i >= 0; i--) {
             closeables.get(i).close();
         }
+        closeables.clear();
         if (ops != null) {
             ops.close();
+            ops = null;
         }
         if (placeholders != null) {
             placeholders.close();
+            placeholders = null;
         }
         if (scratch != null) {
             scratch.close();
+            scratch = null;
         }
         if (backend != null) {
             backend.close();
+            backend = null;
         }
     }
 
@@ -157,6 +170,37 @@ public class GpuHcExtraTest {
         }
     }
 
+    /**
+     * {@code afterMixer} of a deepseek4 layer expands the branch into the hc streams and normalizes them: two
+     * launches on the unfused path ({@code LLM_HC_Post} then {@code LLM_RowNorm}), one {@code LLM_HcPostNorm}
+     * otherwise. The collapse that follows is the same in both modes.
+     */
+    @Test
+    public void fusedExpandNormLaunchesOneKernel() throws Exception {
+        List<String> unfused = afterMixerLaunches(FusedMode.OFF);
+        List<String> fused = afterMixerLaunches(FusedMode.ON);
+        assertEquals(5, unfused.size());
+        assertEquals(Arrays.asList(HcKernels.HC_POST, GpuOps.ROW_NORM), unfused.subList(0, 2));
+        assertEquals(4, fused.size());
+        assertEquals(FusedKernels.HC_POST_NORM, fused.get(0));
+        assertEquals(unfused.subList(2, 5), fused.subList(1, 4));
+    }
+
+    /** The kernels of one {@code afterMixer} of the deepseek4 layer under {@code mode}. */
+    private List<String> afterMixerLaunches(FusedMode mode) throws Exception {
+        ModelSpec spec = hcModel(Arch.DEEPSEEK4, mhcLayerTensors(0), true);
+        GpuForwardContext ctx = context(spec, STREAM, mode);
+        GpuHcExtra extra = bindHc(ctx, spec.layers().get(0));
+        ScratchSlot x = scratch.slot(ScratchSlots.X);
+        ScratchSlot branch = scratch.slot(ScratchSlots.BRANCH);
+        List<String> names = new ArrayList<>();
+        for (Dispatch d : run(() -> extra.afterMixer(0, 3, x, branch))) {
+            names.add(d.kernelName());
+        }
+        closeRig();
+        return names;
+    }
+
     @Test
     public void hcHeadCollapsesWithPreOnlyCoefficients() {
         Map<String, long[]> tensors = mhcLayerTensors(0);
@@ -165,9 +209,8 @@ public class GpuHcExtraTest {
         tensors.put(TensorNames.weight(TensorNames.HC_HEAD_BASE), new long[]{HC});
         ModelSpec spec = hcModel(Arch.DEEPSEEK4, tensors, true);
         GpuForwardContext ctx = context(spec, STREAM);
-        GpuHeadPreprocessor head = HcBlocks.gpuHeadPreprocessors().get(0);
+        GpuHeadPreprocessor head = applicableHead(HcBlocks.gpuHeadPreprocessors(), spec);
         closeables.add(head);
-        assertTrue(head.appliesTo(spec));
         head.bind(ctx);
         ScratchSlot hidden = scratch.slot(ScratchSlots.X);
 
@@ -256,6 +299,56 @@ public class GpuHcExtraTest {
         assertSame(placeholders.readOnlyFloats(), post.bufferArg(HcKernels.POST_ARG_COMB));
     }
 
+    /**
+     * The merged {@code hc_*_down_inject} weight (qwen4exp.cpp:363-380): one projection, the 1/hc scale of all its
+     * rows, the split into the post weights and the low-rank rows, and no inject projection after the collapse; the
+     * post map reads the pre-scaled weights.
+     */
+    @Test
+    public void mergedDownInjectSplitsOneProjection() {
+        int rowW = LOW_RANK + HC;
+        Map<String, long[]> tensors = new HashMap<>();
+        for (String site : new String[]{"attn", "ffn"}) {
+            tensors.put("blk.0.hc_" + site + "_norm.weight", new long[]{N_EMBD, HC});
+            tensors.put("blk.0.hc_" + site + "_down_inject.weight", new long[]{STREAM, rowW});
+            tensors.put("blk.0.hc_" + site + "_up.weight", new long[]{LOW_RANK, STREAM});
+        }
+        ModelSpec spec = hcModel(Arch.QWEN4EXP, tensors, false);
+        GpuForwardContext ctx = context(spec, STREAM);
+        GpuHcExtra extra = bindHc(ctx, spec.layers().get(0));
+        ScratchSlot x = scratch.slot(ScratchSlots.X);
+
+        List<Dispatch> ds = run(() -> extra.beforeBlock(0, 2, x));
+        assertEquals(Arrays.asList(GpuOps.ROW_NORM, HcKernels.HC_PRE), landmarks(ds));
+        int iNorm = index(ds, GpuOps.ROW_NORM);
+        int iPre = index(ds, HcKernels.HC_PRE);
+        assertEquals("nothing follows the collapse", ds.size() - 1, iPre);
+        List<Dispatch> copies = new ArrayList<>();
+        for (Dispatch d : ds.subList(iNorm, iPre)) {
+            if (d.kernelName().equals(GpuOps.COPY2D)) {
+                copies.add(d);
+            }
+        }
+        assertEquals(2, copies.size());
+        Dispatch toPost = copies.get(0);
+        Dispatch toLowRank = copies.get(1);
+        assertArrayEquals(new int[]{2, HC, rowW}, new int[]{toPost.intArg(0), toPost.intArg(1), toPost.intArg(2)});
+        assertArrayEquals(new int[]{2, LOW_RANK, rowW},
+                new int[]{toLowRank.intArg(0), toLowRank.intArg(1), toLowRank.intArg(2)});
+        assertSame(toPost.bufferArg(6), toLowRank.bufferArg(6));
+        assertEquals("the inject rows follow the low-rank rows", toLowRank.intArg(3) + LOW_RANK, toPost.intArg(3));
+
+        ScratchSlot branch = scratch.slot(ScratchSlots.BRANCH);
+        List<Dispatch> mixer = run(() -> extra.afterMixer(0, 2, x, branch));
+        Dispatch post = mixer.get(0);
+        assertEquals(HcKernels.HC_POST, post.kernelName());
+        assertEquals(HcKernels.POST_ACT_SIGMOID, post.intArg(HcKernels.POST_ARG_POST_ACT));
+        assertEquals("the merged inject rows carry the 1/hc scale already", 1.0f,
+                post.floatArg(HcKernels.POST_ARG_POST_IN_SCALE), 0f);
+        assertSame(toPost.bufferArg(7), post.bufferArg(HcKernels.POST_ARG_POST));
+        assertEquals(toPost.intArg(5), post.intArg(HcKernels.POST_ARG_POST_OFF));
+    }
+
     // ------------------------------------------------------------------ kimi-k3 attention residuals
 
     @Test
@@ -331,6 +424,28 @@ public class GpuHcExtraTest {
     }
 
     // ------------------------------------------------------------------ fixtures
+
+    /**
+     * The one registered head preprocessor whose {@code appliesTo} accepts {@code spec}. The registry holds the
+     * DeepSeek-V4.1 variant, which reuses the last FFN pre-mix and applies to that architecture only, beside the
+     * generic collapse that reads {@code output_hc_*} weights, so selection must not depend on list position.
+     */
+    private static GpuHeadPreprocessor applicableHead(List<GpuHeadPreprocessor> all, ModelSpec spec) {
+        GpuHeadPreprocessor found = null;
+        for (GpuHeadPreprocessor p : all) {
+            if (p.appliesTo(spec)) {
+                if (found != null) {
+                    throw new AssertionError("head preprocessors " + found + " and " + p + " both apply to "
+                            + spec.arch().ggufName());
+                }
+                found = p;
+            }
+        }
+        if (found == null) {
+            throw new AssertionError("no head preprocessor applies to " + spec.arch().ggufName());
+        }
+        return found;
+    }
 
     private GpuHcExtra bindHc(GpuForwardContext ctx, LayerSpec layer) {
         GpuLayerExtra e = factory(HcBlocks.gpuExtras(), LayerSpec.Extras.HC).create(layer);
@@ -411,6 +526,11 @@ public class GpuHcExtraTest {
 
     /** Opens the fake device with X and BRANCH slots of {@code xWidth} floats per token and resident F32 weights. */
     private GpuForwardContext context(ModelSpec spec, int xWidth) {
+        return context(spec, xWidth, FusedMode.OFF);
+    }
+
+    /** {@link #context(ModelSpec, int)} with an explicit fused-kernel selection. */
+    private GpuForwardContext context(ModelSpec spec, int xWidth, FusedMode mode) {
         backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
         scratch = GpuScratch.builder(backend, UBATCH)
                 .slot(ScratchSlots.X, (long) UBATCH * xWidth)
@@ -418,7 +538,7 @@ public class GpuHcExtraTest {
                 .build();
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
         LlmKernels kernels = LlmKernels.open(backend);
-        ops = new GpuOps(backend.computeQueue(), kernels, scratch, placeholders);
+        ops = GpuOpsFixture.withFusedMode(backend.computeQueue(), kernels, scratch, placeholders, mode);
         Map<String, GpuWeight> resident = new HashMap<>();
         for (String name : spec.tensors().names()) {
             long[] ne = spec.tensors().get(name).ne();

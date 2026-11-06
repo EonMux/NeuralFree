@@ -17,7 +17,13 @@
  *     out may alias b element for element (same buffer, out_off == b_off): each work-item reads its
  *     own b element before writing it. a must not overlap out.
  *
- * Dispatch: 1-D, one work-item per element, global = roundUp(n, L) (Copy2D: n = rows*cols),
+ * LLM_MuddMix(i n_tokens, i n_embd, i n_taps, i bank_off, i bank_stride, R bank, R w, R<int> taps,
+ *             W cur, W resid)
+ *     cur[t][i]  = sum_j w[t][j]         * bank[bank_off + taps[j]*bank_stride + t*n_embd + i],
+ *     resid[t][i]= sum_j w[t][n_taps+j]  * bank[bank_off + taps[j]*bank_stride + t*n_embd + i],
+ *     j < n_taps, i < n_embd: the MUDD dense cross-layer mix of limite (models/limite.cpp:100-140).
+ *
+ * Dispatch: 1-D, one work-item per element, global = roundUp(n, L) (MuddMix: n = n_tokens*n_embd),
  * local = {L}. The host keeps n below 2^31; addresses are formed in nf_i64. No barriers.
  */
 
@@ -54,4 +60,32 @@ NF_KERNEL void LLM_Axpby_F32(
     const float av = alpha != 0.0f ? alpha * a[(nf_i64)a_off + i] : 0.0f;
     const float bv = beta != 0.0f ? beta * b[(nf_i64)b_off + i] : 0.0f;
     out[(nf_i64)out_off + i] = av + bv;
+}
+
+NF_KERNEL void LLM_MuddMix(
+    const int n_tokens,
+    const int n_embd,
+    const int n_taps,
+    const int bank_off,
+    const int bank_stride,
+    NF_GLOBAL const float* NF_RESTRICT bank,
+    NF_GLOBAL const float* NF_RESTRICT w,
+    NF_GLOBAL const int* NF_RESTRICT taps,
+    NF_GLOBAL float* cur,
+    NF_GLOBAL float* resid)
+{
+    const nf_i64 idx = (nf_i64)get_global_id(0);
+    if (n_embd <= 0 || idx >= (nf_i64)n_tokens * n_embd) return;
+    const nf_i64 t = idx / n_embd;
+    const nf_i64 i = idx - t * n_embd;
+    const nf_i64 w_base = t * (nf_i64)2 * n_taps;
+    float c = 0.0f;
+    float r = 0.0f;
+    for (int j = 0; j < n_taps; j++) {
+        const nf_i64 h = bank[(nf_i64)bank_off + (nf_i64)taps[j] * bank_stride + t * n_embd + i];
+        c += w[w_base + j] * h;
+        r += w[w_base + n_taps + j] * h;
+    }
+    cur[idx] = c;
+    resid[idx] = r;
 }

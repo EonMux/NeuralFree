@@ -102,7 +102,7 @@ public class BlockDecodersTest {
             assertEquals(t.toString(), !removed, CpuBlockDecoders.supports(t));
             assertEquals(t.toString(), !removed, BlockLayout.isDefined(t));
         }
-        assertEquals(41, CpuBlockDecoders.supportedTypes().size());
+        assertEquals(48, CpuBlockDecoders.supportedTypes().size());
         try {
             CpuBlockDecoders.forType(GGMLType.UNKNOWN);
             fail("UNKNOWN must not have a decoder");

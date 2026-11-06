@@ -14,7 +14,7 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * PT-1 fixtures of the dense families: Llama and Qwen2, each in its F32 and BF16 weight form. Every expected GGUF
+ * Fixtures of the dense families: Llama and Qwen2, each in its F32 and BF16 weight form. Every expected GGUF
  * value and tensor here is hand-derived from the converter rules the ports cite — never read back from NeuralFree:
  *
  * <ul>
@@ -79,7 +79,8 @@ public final class ParityFixturesDense {
     }
 
     /** Writes the shared tokenizer keys of the {@link SyntheticHf#GPT2_TOKENIZER} fixture. The {@code pre} name is
-     * the converter's chkhsh lookup result for that vocab (a miss raises in llama.cpp, base.py:2132-2140). */
+     * the converter's chkhsh lookup result for that vocab (a miss raises in llama.cpp, base.py:2132-2140); the
+     * {@code clean_spaces} key is tokenizer_config's {@code clean_up_tokenization_spaces} (vocab.py:372-375). */
     public static void tokenizerKv(GgufTestWriter w, List<String> tokens, int[] types, String pre) {
         w.str("tokenizer.ggml.model", "gpt2");
         w.str("tokenizer.ggml.pre", pre);
@@ -89,6 +90,7 @@ public final class ParityFixturesDense {
         w.u32("tokenizer.ggml.bos_token_id", 0);
         w.u32("tokenizer.ggml.eos_token_id", 1);
         w.bool("tokenizer.ggml.add_bos_token", false);
+        w.bool("tokenizer.ggml.clean_spaces", false);
     }
 
     /**

@@ -24,10 +24,10 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Expert-shard plumbing of the MoE blocks: the {@code expert_base, expert_count} arguments of the three id-matvec
- * kernels (after {@code has_scale}), the partition comparison that decides whether separate gate and up shards can
- * share one {@code {T}_MatVecIdGateUp} dispatch, and the CPU expert product over a host tensor whose row shards split
- * an expert.
+ * Expert-shard plumbing of the MoE blocks: the {@code expert_base, expert_count} arguments of the range-based
+ * id-matvec kernels (after {@code has_scale}), the partition comparison that decides whether separate gate and up
+ * shards can share one {@code {T}_MatVecIdGateUp} dispatch, and the CPU expert product over a host tensor whose row
+ * shards split an expert.
  */
 public class MoeExpertShardsTest {
 

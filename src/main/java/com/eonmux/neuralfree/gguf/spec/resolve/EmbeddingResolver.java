@@ -16,6 +16,10 @@ import java.util.Objects;
  * muse-spark and muse-glimmer (talkie.cpp:50-51, muse-spark.cpp:86-87, muse-glimmer.cpp:69), the deepstack input
  * width and the per-layer embedding tables.
  *
+ * <p>{@link EmbeddingSpec#inputProjection()} maps the token rows of a table narrower than {@code n_embd} before the
+ * position addition (OPT {@code word_embed_proj_dim}); {@link EmbeddingSpec#posOffset()} shifts the learned position
+ * lookup by the graph's padding rows (OPT's {@code + 2}).
+ *
  * <p>The input scale is {@code attention.embedding_scale} when set (applied in {@code build_inp_embd},
  * llama-graph.cpp:2761-2772: granite, grok, hrm_text, ...) times the graph's own factor: {@code sqrt(n_embd)} for
  * gemma, gemma2, gemma3, gemma3n, gemma4, gemma-embedding(2) and afmoe; 12 for minicpm3 (models/minicpm3.cpp:66).
@@ -53,16 +57,22 @@ public final class EmbeddingResolver {
             tok = tc.get(TensorNames.weight(TensorNames.OUTPUT));
         }
         EmbeddingSpec.Builder b = EmbeddingSpec.builder(tok, hp.nEmbd())
+                .inputProjection(tc.get(TensorNames.weight(TensorNames.PROJECT_IN)))
                 .posEmbd(tc.get(TensorNames.weight(TensorNames.POS_EMBD)))
+                .posOffset(positionOffset())
                 .embdScale(embeddingScale())
                 .nEmbdInp(hp.nEmbdInp());
         if (addsInputTokenTypes(hp.traits())) {
             b.tokenTypes(tc.get(TensorNames.weight(TensorNames.TOKEN_TYPES)));
         }
-        if (arch != Arch.LFM2 && arch != Arch.LFM2MOE) {
+        if (arch != Arch.LFM2 && arch != Arch.LFM2MOE && arch != Arch.INKLING) {
             b.tokenEmbdNorm(tc.get(TensorNames.weight(TensorNames.TOKEN_EMBD_NORM)));
         }
         b.inputRmsNorm(arch == Arch.TALKIE || arch == Arch.MUSE_SPARK || arch == Arch.MUSE_GLIMMER);
+        if (arch == Arch.INKLING) {
+            // Inkling's embed_norm is a weighted RMS norm over the gathered row (vLLM embed_rmsnorm).
+            b.inputRmsNormWeight(tc.get(TensorNames.weight(TensorNames.TOKEN_EMBD_NORM)));
+        }
         TensorRef ple = tc.get(TensorNames.weight(TensorNames.PER_LAYER_TOKEN_EMBD));
         if (ple != null) {
             b.perLayer(ple, tc.get(TensorNames.weight(TensorNames.PER_LAYER_MODEL_PROJ)),
@@ -73,6 +83,11 @@ public final class EmbeddingResolver {
             if (ple == null) {
                 b.perLayer(null, null, null, perLayerWidth());
             }
+        }
+        if (hp.ngramVocabSize() > 0) {
+            b.ngram(tc.require(TensorNames.weight(TensorNames.NGRAM_EMBD)),
+                    tc.require(TensorNames.weight(TensorNames.NGRAM_PROJ)),
+                    hp.ngramVocabSize(), hp.ngramSplitCount(), hp.ngramNeighborCount(), hp.ngramEosTokenId());
         }
         return b.build();
     }
@@ -94,6 +109,14 @@ public final class EmbeddingResolver {
         return arch == Arch.GEMMA3N ? hp.nEmbdAltup() : hp.nEmbdPerLayer();
     }
 
+    /**
+     * Padding rows the learned position table reserves before the sequence start: OPT's embedding adds two
+     * ({@code OPTLearnedPositionalEmbedding}, vLLM opt.py:56-66); every other graph indexes it directly.
+     */
+    private int positionOffset() {
+        return arch == Arch.OPT ? 2 : 0;
+    }
+
     /** Multiplier on the token embeddings; 1 when the graph applies none. */
     public float embeddingScale() {
         float scale = hp.embeddingScale() != 0f ? hp.embeddingScale() : 1.0f;
@@ -106,6 +129,7 @@ public final class EmbeddingResolver {
             case GEMMA_EMBEDDING:
             case GEMMA_EMBEDDING2:
             case AFMOE:
+            case RNJ1:
                 return scale * (float) Math.sqrt((float) hp.nEmbd());
             case MINICPM3:
                 return scale * MINICPM3_EMBD_SCALE;

@@ -1,0 +1,9 @@
+{#- llama.cpp chatglm4 chat template (src/llama-chat.cpp:504-512). -#}
+{{- '[gMASK]<sop>' -}}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|' ~ message['role'] ~ '|>\n' ~ content -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|assistant|>\n' -}}
+{%- endif -%}

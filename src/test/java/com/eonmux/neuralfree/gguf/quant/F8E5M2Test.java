@@ -30,7 +30,8 @@ public class F8E5M2Test {
         assertTrue(F8_E5M2.isQuantized());
         assertTrue(F8_E5M2.isExtension());
         assertEquals(F8_E5M2, GGMLType.fromId(1006));
-        assertEquals("the next extension id stays unassigned", GGMLType.UNKNOWN, GGMLType.fromId(1007));
+        assertEquals("the id after the last extension row is unassigned", GGMLType.UNKNOWN,
+                GGMLType.fromId(ExtBlockDecodersTest.nextExtensionId()));
         assertTrue(F8_E5M2 + " has a layout", BlockLayout.isDefined(F8_E5M2));
         assertEquals(32, BlockLayout.of(F8_E5M2).blockBytes());
         assertEquals(32, BlockLayout.of(F8_E5M2).blockElements());
@@ -66,11 +67,12 @@ public class F8E5M2Test {
     @Test
     public void everyCodeDecodesAgainstTheIeeeHalfHighByte() {
         final int codes = 256;
-        ByteBuffer b = blocks(1);
+        final int nBlocks = codes / F8_E5M2.getBlockSize();
+        ByteBuffer b = blocks(nBlocks);
         for (int c = 0; c < codes; c++) {
             b.put(c, (byte) c);
         }
-        float[] y = decode(b, 1);
+        float[] y = decode(b, nBlocks);
         for (int c = 0; c < codes; c++) {
             float expected = e5m2HighByte(c);
             if (!Float.isNaN(expected)) {
@@ -79,17 +81,19 @@ public class F8E5M2Test {
                 assertTrue("code 0x" + Integer.toHexString(c) + " decodes to NaN", Float.isNaN(y[c]));
             }
         }
-        // spot checks of the format's anchors
+        // spot checks of the format's anchors (torch.float8_e5m2: the high byte of the IEEE half)
         assertEquals(0.0f, y[0x00], 0f);
         assertEquals(-0.0f, y[0x80], 0f);
         assertEquals((float) Math.scalb(1f, -16), y[0x01], 0f);
-        assertEquals(1.0f, y[0x38], 0f);
-        assertEquals(7.5f, y[0x7B], 0f);
+        assertEquals(1.0f, y[0x3C], 0f);
+        assertEquals(0.5f, y[0x38], 0f);
+        assertEquals(7.0f, y[0x47], 0f);
         assertEquals(57344f, y[0x7B], 0f);
         assertEquals(Float.POSITIVE_INFINITY, y[0x7C], 0f);
         assertEquals(Float.NEGATIVE_INFINITY, y[0xFC], 0f);
-        assertEquals(4.0f, y[0x40], 0f);
-        assertEquals(-2.25f, y[0xC7], 0f);
+        assertEquals(4.0f, y[0x44], 0f);
+        assertEquals(2.0f, y[0x40], 0f);
+        assertEquals(-7.0f, y[0xC7], 0f);
     }
 
     /** Random blocks decode the same way; the tensor's {@code .scale} is not part of the block data. */
@@ -113,7 +117,8 @@ public class F8E5M2Test {
             }
         }
         try {
-            CpuBlockDecoders.decode(F8_E5M2, ByteBuffer.allocate(F8_E5M2.getTypeSize() * 2), 0, new float[32], 0, 3);
+            CpuBlockDecoders.decode(F8_E5M2, ByteBuffer.allocate(F8_E5M2.getTypeSize() * 2), 0,
+                    new float[3 * F8_E5M2.getBlockSize()], 0, 3);
             fail("a partial block fails");
         } catch (IndexOutOfBoundsException expected) {
             assertTrue(expected.getMessage(), expected.getMessage().contains("limit"));

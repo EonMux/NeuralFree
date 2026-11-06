@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 
+import static com.eonmux.neuralfree.server.ServerTestSupport.errorOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -28,8 +29,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * The Anthropic Messages surface over the real service: the message body's shape (content blocks, stop reasons,
  * the usage counts), the system prompt and multipart text blocks reaching the template, {@code max_tokens}
  * required as Anthropic documents, the named refusals (a non-text content block, a bad role, a body without
- * {@code max_tokens}), the token-count route, and the stream's event sequence from {@code message_start} to
- * {@code message_stop}.
+ * {@code max_tokens}), the token-count route, the stream's event sequence from {@code message_start} to
+ * {@code message_stop}, the usage's prompt split ({@code cache_read_input_tokens} the prefix cache served, in the
+ * body and both ends of a stream), the {@code cache_control} breakpoints accepted or refused by name, and the
+ * {@code kv_transfer_params} shapes refused by name.
  */
 public class AnthropicResourceTest {
 
@@ -71,7 +74,9 @@ public class AnthropicResourceTest {
         JsonView usage = JsonView.of(body.raw("usage"), "usage");
         assertTrue(usage.i64("input_tokens") >= 1, "input tokens count the rendered prompt");
         assertTrue(usage.i64("output_tokens") >= 1, "output tokens count the generation");
-        assertEquals(0L, usage.i64("cache_read_input_tokens"));
+        assertEquals(0L, usage.i64("cache_creation_input_tokens"), "there is no explicit cache write");
+        assertEquals(renderedTokens("Say hello"), usage.i64("input_tokens") + usage.i64("cache_read_input_tokens"),
+                "the uncached and the cached tokens add up to the rendered prompt");
         assertNull(body.raw("timings"), "the Anthropic body carries no timings");
     }
 
@@ -134,6 +139,16 @@ public class AnthropicResourceTest {
     }
 
     @Test
+    void kvTransferParamsRefuseTheirBadShapesByName() {
+        assertTrue(errorOf(() -> resource.messages("""
+                {"model": "test", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}],
+                 "kv_transfer_params": 1}""")).contains("kv_transfer_params"));
+        assertTrue(errorOf(() -> resource.messages("""
+                {"model": "test", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}],
+                 "kv_transfer_params": {"rank": 0}}""")).contains("kv_transfer_params.rank"));
+    }
+
+    @Test
     void countTokensCountsTheRenderedPrompt() {
         Response response = resource.countTokens("""
                 {"model": "test", "max_tokens": 4,
@@ -164,6 +179,90 @@ public class AnthropicResourceTest {
         assertTrue(events.contains("\"stop_reason\":\"end_turn\"") || events.contains("\"stop_reason\":\"max_tokens\""),
                 "the stop reason is named");
         assertTrue(events.contains("event: message_stop\n"), "the stream closes with message_stop");
+    }
+
+    @Test
+    void aRepeatedMessageReadsItsPromptFromThePrefixCache() {
+        String body = """
+                {"model": "test", "max_tokens": 3, "temperature": 0,
+                 "messages": [{"role": "user", "content": "a message the cache keeps for its repeat"}]}""";
+        long total = renderedTokens("a message the cache keeps for its repeat");
+        JsonView first = JsonView.of(view(resource.messages(body).getEntity()).raw("usage"), "usage");
+        assertEquals(total, first.i64("input_tokens") + first.i64("cache_read_input_tokens"));
+        JsonView again = JsonView.of(view(resource.messages(body).getEntity()).raw("usage"), "usage");
+        assertEquals(total - 1, again.i64("cache_read_input_tokens"),
+                "the repeat reads every prompt token but the last from the cache");
+        assertEquals(1L, again.i64("input_tokens"), "only the last prompt token is computed");
+        assertEquals(0L, again.i64("cache_creation_input_tokens"));
+    }
+
+    @Test
+    void aStreamReportsTheCachedTokensInItsStartAndFinalUsage() throws Exception {
+        String body = """
+                {"model": "test", "max_tokens": 3, "temperature": 0, "stream": %s,
+                 "messages": [{"role": "user", "content": "a streamed message read back from the cache"}]}""";
+        long total = renderedTokens("a streamed message read back from the cache");
+        resource.messages(body.formatted("false"));
+        StreamingOutput stream = (StreamingOutput) resource.messages(body.formatted("true")).getEntity();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        stream.write(out);
+        JsonView start = null;
+        JsonView delta = null;
+        for (String line : out.toString(StandardCharsets.UTF_8).split("\n")) {
+            if (!line.startsWith("data: ")) {
+                continue;
+            }
+            JsonView event = view(line.substring("data: ".length()));
+            if ("message_start".equals(event.str("type"))) {
+                start = JsonView.of(event.obj("message").raw("usage"), "usage");
+            } else if ("message_delta".equals(event.str("type"))) {
+                delta = JsonView.of(event.raw("usage"), "usage");
+            }
+        }
+        assertNotNull(start, "the stream opens with message_start");
+        assertNotNull(delta, "the stream ends with message_delta");
+        assertEquals(total - 1, start.i64("cache_read_input_tokens"), "message_start reads the cached prompt");
+        assertEquals(1L, start.i64("input_tokens"));
+        assertEquals(0L, start.i64("cache_creation_input_tokens"));
+        assertEquals(0L, start.i64("output_tokens"));
+        assertEquals(total - 1, delta.i64("cache_read_input_tokens"), "the final usage repeats the prompt split");
+        assertEquals(1L, delta.i64("input_tokens"));
+        assertTrue(delta.i64("output_tokens") >= 1, "the final usage counts the generation");
+    }
+
+    @Test
+    void cacheControlBreakpointsAreAcceptedAndMalformedOnesRefusedByName() {
+        Response marked = resource.messages("""
+                {"model": "test", "max_tokens": 2,
+                 "system": [{"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}}],
+                 "tools": [{"name": "lookup", "input_schema": {"type": "object"},
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+                 "messages": [{"role": "user", "content": [
+                     {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "ttl": "5m"}}]}]}""");
+        assertEquals(200, marked.getStatus());
+        String persistent = """
+                {"model": "test", "max_tokens": 2, "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "persistent"}}]}]}""";
+        assertEquals(400, statusOf(() -> resource.messages(persistent)));
+        assertTrue(errorOf(() -> resource.messages(persistent)).contains("cache_control"));
+        String ttl = """
+                {"model": "test", "max_tokens": 2, "system": [{"type": "text", "text": "x",
+                    "cache_control": {"type": "ephemeral", "ttl": "2h"}}],
+                 "messages": [{"role": "user", "content": "hi"}]}""";
+        assertEquals(400, statusOf(() -> resource.messages(ttl)));
+        assertTrue(errorOf(() -> resource.messages(ttl)).contains("cache_control.ttl"));
+        String tool = """
+                {"model": "test", "max_tokens": 2, "tools": [{"name": "t", "cache_control": "yes"}],
+                 "messages": [{"role": "user", "content": "hi"}]}""";
+        assertTrue(errorOf(() -> resource.messages(tool)).contains("cache_control of tools[0]"));
+    }
+
+    /** The rendered prompt's token count for a single user message ({@code count_tokens}). */
+    private long renderedTokens(String userText) {
+        Response response = resource.countTokens("""
+                {"model": "test", "max_tokens": 4, "messages": [{"role": "user", "content": "%s"}]}"""
+                .formatted(userText));
+        return view(response.getEntity()).i64("input_tokens");
     }
 
     private long plainInputTokens() {

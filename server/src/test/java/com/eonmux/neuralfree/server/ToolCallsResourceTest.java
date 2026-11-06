@@ -158,6 +158,30 @@ public class ToolCallsResourceTest {
     }
 
     @Test
+    void aNonBooleanStrictIsRefusedByName() {
+        String body = "{\"messages\": [{\"role\": \"user\", \"content\": \"Weather?\"}], \"max_tokens\": 4,"
+                + " \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\","
+                + " \"strict\": \"yes\"}}], \"tool_choice\": \"required\"}";
+        assertTrue(errorOf(() -> openAi.chatCompletions(body)).contains("strict"));
+    }
+
+    @Test
+    void aToolThatDeclinesStrictKeepsFreeArgumentsInsideTheForcedEnvelope() {
+        String body = "{\"messages\": [{\"role\": \"user\", \"content\": \"Weather?\"}], \"max_tokens\": "
+                + FORCED_BUDGET + ", \"temperature\": 0, \"tool_choice\": \"required\","
+                + " \"parallel_tool_calls\": false, \"tools\": [{\"type\": \"function\", \"function\":"
+                + " {\"name\": \"get_weather\", \"strict\": false, \"parameters\": {\"type\": \"object\","
+                + " \"properties\": {\"city\": {\"type\": \"string\", \"enum\": [\"Paris\", \"Rome\"]}},"
+                + " \"required\": [\"city\"], \"additionalProperties\": false}}}]}";
+        JsonView choice = at(view(openAi.chatCompletions(body).getEntity()), "choices", 0);
+        assertEquals("tool_calls", choice.str("finish_reason"));
+        JsonView call = at(choice.obj("message"), "tool_calls", 0);
+        assertEquals("get_weather", call.obj("function").str("name"));
+        Object args = Json.parse(call.obj("function").str("arguments"), Json.Limits.UNTRUSTED);
+        assertTrue(args instanceof Map<?, ?>, "the free arguments are still an object: " + args);
+    }
+
+    @Test
     void historyCallsAndResultsRender() {
         String body = """
                 {"messages": [{"role": "user", "content": "Weather?"},

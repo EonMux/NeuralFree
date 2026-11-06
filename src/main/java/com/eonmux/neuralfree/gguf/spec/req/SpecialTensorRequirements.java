@@ -114,6 +114,15 @@ public final class SpecialTensorRequirements {
             return at(BLK, true, when, suffixes);
         }
 
+        /**
+         * Required layer entry satisfied by any one group of {@code blk.%d.<suffix>} names on the layers selected
+         * by {@code when}.
+         */
+        Builder layerAnyOf(LayerCondition when, String[]... suffixGroups) {
+            out.add(TensorRequirement.layerAnyOf(when, suffixGroups));
+            return this;
+        }
+
         /** Optional {@code blk.%d.<suffix>} tensors on the layers selected by {@code when}. */
         Builder layerOptionalWhen(LayerCondition when, String... suffixes) {
             return at(BLK, false, when, suffixes);

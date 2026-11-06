@@ -2,14 +2,15 @@ package com.eonmux.neuralfree.gguf.ops.moe;
 
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
-import com.eonmux.neuralfree.gguf.arch.FfnGating;
 import com.eonmux.neuralfree.gguf.arch.FfnKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuFfnBlock;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuMatmulTap;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
@@ -17,11 +18,12 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
+import com.eonmux.neuralfree.gguf.gpu.weights.MoeExpertCache;
 import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
-import com.eonmux.neuralfree.gguf.spec.FfnSpec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
+import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.MoeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.utils.Closeables;
@@ -50,12 +52,19 @@ import java.util.function.IntFunction;
  *       {@code LLM_GLU}; an ungated set runs {@code {T}_MatVecId} up and {@code LLM_Unary}. Then
  *       {@code {T}_MatVecId} down, {@code LLM_AddId} down bias, the post-expert norm
  *       ({@code LLM_MulRowScale}, {@code LLM_RowNorm}) and {@code LLM_MoE_WeightedSum}. Several tokens:
- *       {@code LLM_MoE_Bucketize}, then {@code {T}_BatchMatMulId} for gate, up (or fused gate_up) and down, with the
- *       same bias, activation and norm steps. llama4 weights the inputs first ({@code LLM_MoE_ScaleInput}) and sums
- *       unweighted. An expert tensor held in several device shards of whole experts (a tensor above one binding,
- *       {@link MoeExpertWeights.Shard}) runs each of these products as one dispatch per shard with that shard's
+ *       the expert sort ({@link GpuGroupedRows}: {@code LLM_MoE_Bucketize}, or its multi-work-group phases on
+ *       large steps), then either the grouped GEMM ({@code LLM_MoE_AlignBlocks} + {@code {T}_GroupedGemm}, the
+ *       expert-sorted tiled GEMM over the block-aligned rows, {@code {T}_GroupedGemmMma} on CUDA or Vulkan tensor
+ *       cores, whenever the device runs the tiled GEMM kernels and every expert dimension is a multiple of the
+ *       weight types' block sizes) or
+ *       {@code {T}_BatchMatMulId}, for gate, up (or fused gate_up) and down, with the same bias, activation and norm
+ *       steps. llama4 weights the inputs first ({@code LLM_MoE_ScaleInput}) and sums unweighted. An expert tensor
+ *       held in several device shards of whole experts (a tensor above one binding, {@link MoeExpertWeights.Shard})
+ *       runs each of these products as one dispatch per shard with that shard's
  *       {@code expert_base, expert_count}; the shards write disjoint (pair, row) outputs, so nothing is cleared or
- *       combined, and a single-shard tensor is one dispatch.</li>
+ *       combined, and a single-shard tensor is one dispatch. When the shards cover only part of the expert set
+ *       (expert parallel), the pairs of the missing experts are zeroed before the products, whose id dispatches skip
+ *       experts outside the bound range, so the block's output is that rank's summand for the group all-reduce.</li>
  *   <li><b>Latent</b> experts run between {@code ffn_latent_down/up} or {@code ffn_routed_down/up}, with the optional
  *       {@code ffn_pre_exp_norm} (muse-spark.cpp:175-179) and {@code ffn_routed_norm} (kimi-k3.cpp:597-602).</li>
  *   <li><b>Chunk experts</b> (grovemoe.cpp:154-171) route again on the same logits with divided ids, read the routed
@@ -66,6 +75,17 @@ import java.util.function.IntFunction;
  *       cohere2moe.cpp:242-243).</li>
  *   <li><b>Parallel dense FFN</b> per {@link MoeBlocks.Combine}.</li>
  * </ol>
+ *
+ * <p>When a placement rule keeps a layer's routed expert stacks in RAM ({@code --cpu-moe}, {@code --n-cpu-moe},
+ * {@code -ot}, {@code neuralfree.moe.cache}), the routed pass runs over the MoE expert cache
+ * ({@link GpuCachedMoePass}): the cached experts are computed on the device from the cache banks, the misses on the
+ * host; the layer kinds the hosted path does not build are refused by {@link #checkSupported} (the host-expert FFN
+ * decorator serves them under a hybrid layer split).</p>
+ *
+ * <p>When the context carries a {@link MoeExpertHeat} recorder (a ranking profile save is configured), each router's
+ * selected ids are read back asynchronously after its kernels and counted per weight layer as the reads complete
+ * (at most {@link GpuRouterHeat#PENDING} stay pending; close drains them); a hosted layer's ids are counted by
+ * {@link GpuCachedMoePass} from the read it already makes.</p>
  *
  * <p>Every weight product adds the {@link GpuProjectionDeltas} registered on its tensor (LoRA) right after the
  * product and before any bias: {@code build_lora_mm} for the router, latent, shared-gate and dense products, with
@@ -97,21 +117,25 @@ public final class GpuMoeFfn implements GpuFfnBlock {
     static final String T_UP = "moe.up";
     static final String T_ACT = "moe.act";
     static final String T_EXPERT_OUT = "moe.expert_out";
-    static final String T_COUNTS = "moe.counts";
-    static final String T_OFFSETS = "moe.offsets";
-    static final String T_ROW_TOKEN = "moe.row_token";
-    static final String T_ROW_SLOT = "moe.row_slot";
+    /** Scratch prefix of the expert sort ({@link GpuGroupedRows}). */
+    static final String T_ROWS = "moe";
     static final String T_CHUNK_OUT = "moe.chunk_out";
     static final String T_SUM = "moe.sum";
-    static final String T_FFN_GATE = "moe.ffn_gate";
-    static final String T_FFN_UP = "moe.ffn_up";
-    static final String T_FFN_OUT = "moe.ffn_out";
     static final String T_SHEXP_GATE = "moe.shexp_gate";
     /**
      * Prefix of the interleaved gate/up expert scales ({@code SCALE_GATE_UP_PAIRS}), one temporary per gate tensor
      * name, written once at bind and never shared with another tensor.
      */
     static final String T_SCALE_PAIRS = "moe.scale_pairs.";
+    /** Per-token weight sum of the selected identity experts. */
+    static final String T_ZERO_WEIGHTS = "moe.zero_weights";
+    /** Physical replica ids the expert kernels address when the layer remaps its routed experts. */
+    static final String T_EXPERT_IDS = "moe.expert_ids";
+
+    /** {@code x} of {@code LLM_MoE_ZeroApply}. */
+    private static final int ARG_ZERO_X = 4;
+    /** {@code dst} of {@code LLM_MoE_ZeroApply}. */
+    private static final int ARG_ZERO_DST = 6;
 
     /** {@code x} of {@code LLM_MoE_ScaleInput(i n_tokens, i n_embd, i k, R x, R weights, W out)}. */
     private static final int ARG_SCALE_INPUT_X = 3;
@@ -150,6 +174,15 @@ public final class GpuMoeFfn implements GpuFfnBlock {
     private ScratchSlot layerInput;
     private Router router;
     private Router chunkRouter;
+    /** Identity-expert masking of the routed selection; null without zero experts. */
+    private ScratchSlot zeroWeights;
+    private PreparedDispatch zeroMask;
+    private PreparedDispatch zeroApply;
+    private int zeroN = -1;
+    private int zeroApplyN = -1;
+    private GpuBuffer zeroX;
+    private int zeroXOff = -1;
+    private GpuBuffer zeroDst;
 
     private GpuWeight expertNorm;
     private ScratchSlot moeIn;
@@ -160,15 +193,29 @@ public final class GpuMoeFfn implements GpuFfnBlock {
     private ScratchSlot latentIn;
     private ScratchSlot latentSum;
 
-    private ExpertPass routed;
-    private ExpertPass chunk;
-    private ScratchSlot chunkOut;
+    /**
+     * The routed (or chunk) expert set of one step: the products and the weighted sum into the destination. The
+     * routed experts of a hosted layer run over the expert cache through {@link GpuCachedMoePass}; resident ones
+     * through {@link ExpertPass}.
+     */
+    private interface Routed extends AutoCloseable {
+        void run(int n, GpuBuffer x, int xOff, GpuBuffer dst, int flags);
+    }
 
-    private DenseFfn shared;
+    /** The routed experts' logical-to-physical replica mapping of this layer, or null. */
+    private MoeExpertRemap.Layer layerRemap;
+
+    private Routed routed;
+    private Routed chunk;
+    private ScratchSlot chunkOut;
+    /** Whether a decode step reads the routed ids (and a hosted layer's input rows) back to the host. */
+    private boolean decodeReadsHost = true;
+
+    private GpuDenseFfn shared;
     private GpuWeight sharedGateInp;
     private ScratchSlot sharedGate;
     private PreparedDispatch sharedSum;
-    private DenseFfn parallel;
+    private GpuDenseFfn parallel;
     private GpuWeight postNorm1;
     private GpuWeight postNorm2;
 
@@ -207,27 +254,48 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         this.rmsEps = ctx.spec().hparams().normRmsEps();
         this.wiring = MoeBlocks.Wiring.of(ctx.spec().arch(), kind, layer);
         GpuWeights w = ctx.weightSource().weightsFor(layer.weightLayer());
+        boolean hosted = !expertsOnDevice(w, layer) && hostHasExperts(ctx, layer);
+        if (hosted) {
+            checkSupported(ctx.spec(), layer);
+        }
+        decodeReadsHost = hosted || ctx.heat() != null;
 
         gateInp = w.layer(layer, TensorNames.weight(TensorNames.FFN_GATE_INP));
-        if (gateInp.rank() != 2 || gateInp.rows() != spec.nExpert() || gateInp.hasScale()) {
+        if (gateInp.rank() != 2 || gateInp.rows() != spec.nRouterExpert() || gateInp.hasScale()) {
             throw new IllegalStateException("layer " + layer.il() + ": " + gateInp.name() + " must be [n_embd, "
-                    + spec.nExpert() + "] without an output scale, got " + gateInp);
+                    + spec.nRouterExpert() + "] without an output scale, got " + gateInp);
         }
         nEmbd = Math.toIntExact(gateInp.cols());
         gateInpDeltas = ctx.projectionDeltas().serve(layer, TensorNames.weight(TensorNames.FFN_GATE_INP), gateInp);
-        bindRouter(w, scratch);
+        this.layerRemap = ctx.moeExpertRemap() != null && ctx.moeExpertRemap().covers(layer.weightLayer())
+                ? ctx.moeExpertRemap().layer(layer.weightLayer()) : null;
+        bindRouter(w, scratch, hosted ? null : ctx.heat());
+        if (spec.zeroExperts() > 0) {
+            bindZeroExperts(scratch);
+        }
         bindExpertInput(w, scratch);
         int expertDim = spec.latent() ? spec.latentSize() : nEmbd;
-        routed = new ExpertPass(MoeExpertWeights.routed(spec, expertDim), w, router, spec.weightBeforeFfn(),
-                spec.postExpertNorm() ? w.layer(layer, TensorNames.weight(TensorNames.FFN_POST_EXP_NORM)) : null,
-                ctx.spec().hparams().postNormEps());
+        MoeExpertWeights expertPlan = MoeExpertWeights.routed(spec, expertDim,
+                layerRemap != null ? layerRemap.physical() : spec.nExpert());
+        if (hosted) {
+            MoeExpertCache cache = ctx.moeExpertCache();
+            routed = new CachedRouted(new GpuCachedMoePass(ctx, layer, expertPlan, router,
+                    cache != null && cache.serves(layer.weightLayer()) ? cache : null, w,
+                    ctx.scratch().ubatch(), spec.weightBeforeFfn(),
+                    spec.postExpertNorm() ? w.layer(layer, TensorNames.weight(TensorNames.FFN_POST_EXP_NORM)) : null,
+                    ctx.spec().hparams().postNormEps(), ctx.moeExpertPrefetch(), ctx.moeTailSkipRank()));
+        } else {
+            routed = new ExpertPass(expertPlan, w, router, spec.weightBeforeFfn(),
+                    spec.postExpertNorm() ? w.layer(layer, TensorNames.weight(TensorNames.FFN_POST_EXP_NORM)) : null,
+                    ctx.spec().hparams().postNormEps());
+        }
         if (spec.chunked()) {
-            chunkRouter = new Router(MoeRouting.Params.forChunks(spec), w, false, false);
+            chunkRouter = new Router(MoeRouting.Params.forChunks(spec), w, false, false, ctx.heat(), false, null);
             chunk = new ExpertPass(MoeExpertWeights.chunks(spec, nEmbd), w, chunkRouter, false, null, 0f);
             chunkOut = scratch.temp(T_CHUNK_OUT, rows(nEmbd));
         }
         if (spec.sharedExpert() != null) {
-            shared = new DenseFfn(spec.sharedExpert(), w);
+            shared = new GpuDenseFfn(ctx, w, layer, spec.sharedExpert(), nEmbd);
             if (spec.sharedExpertGated()) {
                 sharedGateInp = w.layer(layer, TensorNames.weight(TensorNames.FFN_GATE_INP_SHEXP));
                 if (sharedGateInp.rows() != 1 || sharedGateInp.cols() != nEmbd) {
@@ -240,7 +308,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             }
         }
         if (kind == FfnKind.MOE_PARALLEL_DENSE) {
-            parallel = new DenseFfn(layer.ffn(), w);
+            parallel = new GpuDenseFfn(ctx, w, layer, layer.ffn(), nEmbd);
             if (wiring.combine == MoeBlocks.Combine.NORMED_SUM) {
                 if (shared != null || chunk != null) {
                     throw new UnsupportedOperationException("layer " + layer.il() + ": the normed parallel combine"
@@ -254,19 +322,25 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         if (shared != null && spec.sharedExpertGated()) {
             sharedSum = ops.prepare(MoeKernels.WEIGHTED_SUM, MoeKernels.elementGlobal(nEmbd, ops.local()),
                     local1(), MoeKernels.weightedSumArgs(1, nEmbd, 1, MoeKernels.WSUM_ACCUMULATE,
-                            shared.out.buffer(), sharedGate.buffer(), sum.buffer()));
+                            shared.out().buffer(), sharedGate.buffer(), sum.buffer()));
             sharedSumN = 1;
             sharedSumDst = sum.buffer();
         }
     }
 
-    private void bindRouter(GpuWeights w, GpuScratch scratch) {
-        logits = scratch.temp(T_LOGITS, rows(spec.nExpert()));
+    /**
+     * Binds the router logits and the router; {@code heat} is the recorder its selections are read back into, null
+     * when a hosted pass counts them from its own ids read or no profile records.
+     */
+    private void bindRouter(GpuWeights w, GpuScratch scratch, MoeExpertHeat heat) {
+        logits = scratch.temp(T_LOGITS, rows(spec.nRouterExpert()));
         if (spec.routerBias()) {
-            GpuWeight bias = f32Vector(w.layer(layer, TensorNames.bias(TensorNames.FFN_GATE_INP)), spec.nExpert());
-            routerBias = ops.prepare(MoeKernels.ADD_ID, MoeKernels.elementGlobal((long) spec.nExpert(), ops.local()),
-                    local1(), MoeKernels.addIdArgs(1, spec.nExpert(), zeroIds(scratch).buffer(), bias.shard(0),
-                            logits.buffer()));
+            GpuWeight bias = f32Vector(w.layer(layer, TensorNames.bias(TensorNames.FFN_GATE_INP)),
+                    spec.nRouterExpert());
+            routerBias = ops.prepare(MoeKernels.ADD_ID,
+                    MoeKernels.elementGlobal((long) spec.nRouterExpert(), ops.local()),
+                    local1(), MoeKernels.addIdArgs(1, spec.nRouterExpert(), zeroIds(scratch).buffer(),
+                            bias.shard(0), logits.buffer()));
             routerBiasN = 1;
         }
         if (wiring.router == MoeBlocks.RouterInput.SCALED_RESIDUAL) {
@@ -283,9 +357,78 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             }
             layerInput = scratch.temp(MoeBlocks.LAYER_INPUT_TEMP, MoeBlocks.layerInputFloats(ubatch, ctx.spec()));
         }
-        router = wiring.selection == MoeBlocks.Selection.BIASED_LOGITS
-                ? new Router(MoeRouting.Params.preselected(spec), w, false, true)
-                : new Router(MoeRouting.Params.forExperts(spec), w, spec.probBias(), false);
+        boolean biasedLogits = wiring.selection == MoeBlocks.Selection.BIASED_LOGITS;
+        if (biasedLogits && spec.mediaRouting()) {
+            throw new UnsupportedOperationException("layer " + layer.il() + ": embedding-row routing over the"
+                    + " logits + exp_probs_b selection has no llama.cpp graph");
+        }
+        router = biasedLogits
+                ? new Router(MoeRouting.Params.preselected(spec), w, false, true, heat, false, layerRemap)
+                : new Router(MoeRouting.Params.forExperts(spec), w, spec.probBias(), false, heat,
+                        spec.mediaRouting(), layerRemap);
+    }
+
+    /**
+     * Prepares the identity-expert post-processing: the mask over the routed ids and weights, and the per-token
+     * identity contribution added to the routed output.
+     */
+    private void bindZeroExperts(GpuScratch scratch) {
+        zeroWeights = scratch.temp(T_ZERO_WEIGHTS, ubatch);
+        zeroMask = ops.prepare(MoeKernels.ZERO_EXPERTS,
+                MoeKernels.elementGlobal(ubatch, ops.local()), local1(),
+                MoeKernels.zeroExpertsArgs(1, router.params.k(), spec.nExpert(), router.ids.buffer(),
+                        router.weights.buffer(), zeroWeights.buffer()));
+        zeroApply = ops.prepare(MoeKernels.ZERO_APPLY,
+                MoeKernels.elementGlobal((long) ubatch * nEmbd, ops.local()), local1(),
+                MoeKernels.zeroApplyArgs(1, nEmbd, 0, 0, ctx.placeholders().readOnlyFloats(), zeroWeights.buffer(),
+                        ctx.placeholders().readOnlyFloats()));
+        zeroN = 1;
+        zeroApplyN = 1;
+    }
+
+    /** {@code zero_weights}: takes the identity experts out of the routing result of {@code n} tokens. */
+    private void maskZeroExperts(int n) {
+        if (zeroMask == null) {
+            return;
+        }
+        if (zeroN != n) {
+            zeroMask.setInt(MoeKernels.ARG_N_TOKENS, n);
+            zeroMask.setGlobal(MoeKernels.elementGlobal(n, ops.local()));
+            zeroN = n;
+        }
+        zeroMask.dispatch();
+    }
+
+    /** {@code dst += zero_weights[t] * x[t]}: the identity experts' contribution to the routed output. */
+    private void applyZeroExperts(int n, GpuBuffer x, int xOff, GpuBuffer dst) {
+        if (zeroApply == null) {
+            return;
+        }
+        if (zeroApplyN != n) {
+            zeroApply.setInt(MoeKernels.ARG_N_TOKENS, n);
+            zeroApply.setGlobal(MoeKernels.elementGlobal((long) n * nEmbd, ops.local()));
+            zeroApplyN = n;
+        }
+        if (x != zeroX) {
+            zeroApply.setBuffer(ARG_ZERO_X, x);
+            zeroX = x;
+        }
+        if (xOff != zeroXOff) {
+            zeroApply.setInt(2, xOff);
+            zeroXOff = xOff;
+        }
+        if (dst != zeroDst) {
+            zeroApply.setBuffer(ARG_ZERO_DST, dst);
+            zeroDst = dst;
+        }
+        zeroApply.dispatch();
+    }
+
+    /** The embedding rows' selection bias: {@code exp_probs_b_vl} as one F32 buffer, or a placeholder for none. */
+    private GpuBuffer mediaBias(GpuWeights w) {
+        return spec.mediaProbBias()
+                ? f32Vector(w.layer(layer, TensorNames.bias(TensorNames.FFN_EXP_PROBS_B_VL)), spec.nExpert()).shard(0)
+                : ctx.placeholders().readOnlyFloats();
     }
 
     /**
@@ -306,7 +449,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         if (b == null) {
             b = w.layer(layer, TensorNames.FFN_EXP_PROBS_B);
         }
-        return f32Vector(b, spec.nExpert()).shard(0);
+        return f32Vector(b, spec.nRouterExpert()).shard(0);
     }
 
     private void bindExpertInput(GpuWeights w, GpuScratch scratch) {
@@ -385,6 +528,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             latentUpDeltas.applyRows(nTokens, latentSum.buffer(), latentSum.offset(), dst, 0);
         } else {
             routed.run(nTokens, xBuf, xOff, dst, 0);
+            applyZeroExperts(nTokens, xBuf, xOff, dst);
         }
         if (chunk != null) {
             chunkRouter.run(nTokens);
@@ -400,6 +544,15 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         if (dst != out.buffer()) {
             ops.copy(dst, 0, out.buffer(), out.offset(), nx);
         }
+    }
+
+    /**
+     * False when a decode step reads back to the host: a hosted layer's expert pass reads the routed ids and the
+     * expert input rows every step, and a heat profile reads the ids of a resident routing too.
+     */
+    @Override
+    public boolean capturableDecode() {
+        return !decodeReadsHost;
     }
 
     /**
@@ -442,6 +595,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             routerBias.dispatch();
         }
         router.run(n);
+        maskZeroExperts(n);
     }
 
     /** {@code logits = ffn_gate_inp . x} plus its deltas ({@code build_lora_mm}, llama-graph.cpp:2223). */
@@ -450,14 +604,13 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         gateInpDeltas.applyRows(n, x, xOff, logits.buffer(), logits.offset());
     }
 
-    /**
-     * {@code dst += shared(x)}, gated or plain, then {@code dst *= sharedCombineScale} when that scale is not 1
+    /** {@code dst += shared(x)}, gated or plain, then {@code dst *= sharedCombineScale} when that scale is not 1
      * ({@code ggml_add} then {@code ggml_scale}, cohere2moe.cpp:242-243 and the MTP block at :396-397).
      */
     private void addShared(int n, ScratchSlot in, GpuBuffer dst) {
         shared.run(n, in.buffer(), in.offset());
         if (sharedSum == null) {
-            ops.add(dst, 0, shared.out.buffer(), shared.out.offset(), dst, 0, n * nEmbd);
+            ops.add(dst, 0, shared.out().buffer(), shared.out().offset(), dst, 0, n * nEmbd);
         } else {
             addGatedShared(n, in, dst);
         }
@@ -488,8 +641,8 @@ public final class GpuMoeFfn implements GpuFfnBlock {
     private void combineParallel(int n, ScratchSlot in, GpuBuffer dst) {
         int nx = n * nEmbd;
         parallel.run(n, in.buffer(), in.offset());
-        GpuBuffer ffn = parallel.out.buffer();
-        int ffnOff = parallel.out.offset();
+        GpuBuffer ffn = parallel.out().buffer();
+        int ffnOff = parallel.out().offset();
         switch (wiring.combine) {
             case SUM:
                 ops.add(dst, 0, ffn, ffnOff, dst, 0, nx);
@@ -512,9 +665,60 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         return ctx.scratch().slot(ScratchSlots.X);
     }
 
+    /** True when the layer's routed expert tensors are on the device; a host placement runs the cached pass. */
+    private static boolean expertsOnDevice(GpuWeights w, LayerSpec layer) {
+        return w.find(layer.tensorName(TensorNames.weight(TensorNames.FFN_UP_EXPS))) != null
+                || w.find(layer.tensorName(TensorNames.weight(TensorNames.FFN_GATE_UP_EXPS))) != null;
+    }
+
+    /** True when the context's host view holds the layer's routed experts, so the cached pass can run them. */
+    private static boolean hostHasExperts(GpuForwardContext ctx, LayerSpec layer) {
+        com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights host = ctx.hostWeights();
+        return host != null
+                && (host.has(layer.tensorName(TensorNames.weight(TensorNames.FFN_UP_EXPS)))
+                || host.has(layer.tensorName(TensorNames.weight(TensorNames.FFN_GATE_UP_EXPS))));
+    }
+
+    /**
+     * Whether a layer can run its routed experts as a hosted block (the routed experts in RAM, the misses computed
+     * on the host while the cached pairs run on the device): the refusals checked before the weights resolve, so a
+     * load fails with the flag in the message instead of at the first forward pass. Latent or chunk experts, hash
+     * routing and biased-logit selection keep their expert set on the device and their layer runs the host-expert
+     * FFN decorator when a hybrid layer split hosts it.
+     *
+     * @throws UnsupportedOperationException for a layer kind, routing or wiring the hosted path does not build
+     */
+    public static void checkSupported(ModelSpec spec, LayerSpec layer) {
+        MoeBlocks.Wiring wiring = MoeBlocks.Wiring.of(spec.arch(), layer.ffnKind(), layer);
+        MoeSpec moe = layer.moe();
+        String where = spec.arch().ggufName() + " layer " + layer.il() + ": ";
+        if (moe.latent() || moe.chunked()) {
+            throw new UnsupportedOperationException(where + "latent or chunk experts stay on the device;"
+                    + " neuralfree.cpu-moe / neuralfree.n-cpu-moe / neuralfree.override-tensor /"
+                    + " neuralfree.moe.cache host the plain routed experts only");
+        }
+        if (moe.hashRouting()) {
+            throw new UnsupportedOperationException(where + "hash routing (ffn_gate_tid2eid) runs on one device;"
+                    + " the hosted path routes with the MoE spec");
+        }
+        if (wiring.selection != MoeBlocks.Selection.SPEC) {
+            throw new UnsupportedOperationException(where + "biased-logit selection runs on one device;"
+                    + " the hosted path routes with the MoE spec");
+        }
+        if (wiring.router != MoeBlocks.RouterInput.FFN_INPUT || wiring.experts != MoeBlocks.ExpertInput.FFN_INPUT) {
+            throw new UnsupportedOperationException(where + "the hosted path routes and reads the experts on the"
+                    + " normalized FFN input; this architecture routes on " + wiring.router + " and reads "
+                    + wiring.experts);
+        }
+        if (moe.weightBeforeFfn()) {
+            throw new UnsupportedOperationException(where + "weight-before-FFN experts (llama4) are not part of"
+                    + " the hosted path");
+        }
+    }
+
     @Override
     public void close() {
-        closeAll(router, chunkRouter, routed, chunk, routerBias, routerScale, sharedSum);
+        closeAll(router, chunkRouter, routed, chunk, routerBias, routerScale, sharedSum, zeroMask, zeroApply);
     }
 
     @Override
@@ -560,10 +764,6 @@ public final class GpuMoeFfn implements GpuFfnBlock {
     }
 
     /** Work-group size of the one-group kernels ({@code LLM_MoE_Bucketize}): a power of two. */
-    private long[] groupLocal() {
-        return new long[]{floorPow2(ops.local())};
-    }
-
     // ================================================================== expert shards
 
     /**
@@ -627,19 +827,52 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         }
     }
 
+    // ================================================================== routed experts over the cache
+
+    /** The routed experts computed over a {@link MoeExpertCache}; the block owns the pass's lifetime. */
+    private static final class CachedRouted implements Routed {
+        private final GpuCachedMoePass pass;
+
+        CachedRouted(GpuCachedMoePass pass) {
+            this.pass = pass;
+        }
+
+        @Override
+        public void run(int n, GpuBuffer x, int xOff, GpuBuffer dst, int flags) {
+            pass.run(n, x, xOff, dst, flags);
+        }
+
+        @Override
+        public void close() {
+            pass.close();
+        }
+
+        @Override
+        public String toString() {
+            return pass.toString();
+        }
+    }
+
     // ================================================================== router
 
     /**
      * {@code LLM_MoE_Router} over the shared logits, preceded on deepseek4 hash layers by {@code LLM_MoE_HashIds}
      * and for {@link MoeBlocks.Selection#BIASED_LOGITS} by a raw-logit top-k over {@code logits + exp_probs_b}
      * (a copy of the logits, {@code LLM_AddId}, {@code LLM_MoE_Router} with {@code sel_mode} 1); in both cases the
-     * final router call takes the ids as given ({@code sel_mode} 3) and computes their weights.
+     * final router call takes the ids as given ({@code sel_mode} 3) and computes their weights. On a
+     * {@link MoeSpec#mediaRouting()} layer the step's embedding rows then take the {@link GpuMediaRouter} selection.
      */
-    private final class Router implements AutoCloseable {
+    final class Router implements AutoCloseable {
         final MoeRouting.Params params;
         final ScratchSlot ids;
         final ScratchSlot weights;
+        final MoeExpertRemap.Layer remap;
+        final ScratchSlot physicalIds;
+        PreparedDispatch remapDispatch;
+        int lastRemapN = -1;
         final int routerLocal;
+        final GpuRouterHeat heat;
+        GpuMediaRouter media;
         PreparedDispatch hash;
         ScratchSlot selection;
         PreparedDispatch selectionBias;
@@ -650,12 +883,21 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         /**
          * @param probBias     bind {@code exp_probs_b} as the PROBS selection bias of {@code params}
          * @param biasedLogits pick the ids by {@code logits + exp_probs_b} first; {@code params} must be preselected
+         * @param heat         recorder the selected ids are read back into asynchronously, or null for none
+         * @param mediaRows    route the step's embedding rows by the layer's media routing ({@link GpuMediaRouter})
          */
-        Router(MoeRouting.Params params, GpuWeights w, boolean probBias, boolean biasedLogits) {
+        Router(MoeRouting.Params params, GpuWeights w, boolean probBias, boolean biasedLogits, MoeExpertHeat heat,
+               boolean mediaRows, MoeExpertRemap.Layer remap) {
             this.params = params;
+            this.remap = remap;
             GpuScratch scratch = ctx.scratch();
             this.ids = scratch.temp(T_IDS, rows(params.k()));
             this.weights = scratch.temp(T_WEIGHTS, rows(params.k()));
+            this.physicalIds = remap == null ? null : scratch.temp(T_EXPERT_IDS, rows(params.k()));
+            EplbLoadWindow window = ctx.moeLoadWindow();
+            this.heat = heat != null || window != null
+                    ? new GpuRouterHeat(ctx.queue(), heat, window, layer.weightLayer(), layer.il())
+                    : null;
             int needed = ceilPow2((params.nExpert() + 31) / 32);
             int preferred = floorPow2(Math.max(ops.local(), MoeKernels.MIN_ROUTER_LOCAL));
             this.routerLocal = Math.min(MoeKernels.MAX_LOCAL, Math.max(needed, preferred));
@@ -674,6 +916,16 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                 select = ops.prepare(MoeKernels.ROUTER, MoeKernels.routerGlobal(1, routerLocal),
                         new long[]{routerLocal}, MoeKernels.routerArgs(params, 1, logits.buffer(), bias,
                                 ids.buffer(), weights.buffer()));
+                if (remap != null) {
+                    remapDispatch = ops.prepare(MoeKernels.EPLB_MAP, MoeKernels.elementGlobal(params.k(), ops.local()),
+                            local1(), MoeKernels.eplbMapArgs(1, params.k(), remap.logical(), remap.maxReplicas(),
+                                    ids.buffer(), remap.replicaCount(), remap.logicalToPhysical(),
+                                    physicalIds.buffer()));
+                }
+                if (mediaRows) {
+                    media = new GpuMediaRouter(ctx, MoeRouting.Params.forMedia(spec), logits, mediaBias(w), ids,
+                            weights, routerLocal);
+                }
             } catch (RuntimeException e) {
                 throw Closeables.close(this, e);
             }
@@ -687,7 +939,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             selectionBias = ops.prepare(MoeKernels.ADD_ID, MoeKernels.elementGlobal(nExpert, ops.local()), local1(),
                     MoeKernels.addIdArgs(1, nExpert, zeroIds(scratch).buffer(), expProbsB(w), selection.buffer()));
             MoeRouting.Params raw = new MoeRouting.Params(nExpert, params.k(), params.gating(), 1, 1, false, 1.0f,
-                    false, MoeKernels.SEL_RAW_LOGITS, 0);
+                    false, MoeKernels.SEL_RAW_LOGITS, 0, false);
             preselect = ops.prepare(MoeKernels.ROUTER, MoeKernels.routerGlobal(1, routerLocal),
                     new long[]{routerLocal}, MoeKernels.routerArgs(raw, 1, selection.buffer(),
                             ctx.placeholders().readOnlyFloats(), ids.buffer(), weights.buffer()));
@@ -746,11 +998,39 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                 preselect.dispatch();
             }
             select.dispatch();
+            if (media != null) {
+                media.apply(n);
+            }
+            if (remapDispatch != null) {
+                if (lastRemapN != n) {
+                    remapDispatch.setInt(MoeKernels.ARG_EPLB_N_PAIRS, n * params.k());
+                    remapDispatch.setGlobal(MoeKernels.elementGlobal((long) n * params.k(), ops.local()));
+                    lastRemapN = n;
+                }
+                remapDispatch.dispatch();
+            }
+            if (heat != null) {
+                heat.note(ids, n * params.k());
+            }
+        }
+
+        /** The routed pair ids the expert kernels address: physical replica slots, or the logical ids. */
+        GpuBuffer expertIds() {
+            return remap == null ? ids.buffer() : physicalIds.buffer();
         }
 
         @Override
         public void close() {
-            closeAll(hash, selectionBias, preselect, select);
+            RuntimeException failure = heat != null ? heat.drain() : null;
+            failure = Closeables.close(media, failure);
+            failure = Closeables.close(hash, failure);
+            failure = Closeables.close(selectionBias, failure);
+            failure = Closeables.close(preselect, failure);
+            failure = Closeables.close(select, failure);
+            failure = Closeables.close(remapDispatch, failure);
+            if (failure != null) {
+                throw failure;
+            }
         }
     }
 
@@ -758,10 +1038,11 @@ public final class GpuMoeFfn implements GpuFfnBlock {
 
     /**
      * One expert set over the ids and weights of a {@link Router}: the one-token path ({@code {T}_MatVecId*}) and
-     * the batched path ({@code LLM_MoE_Bucketize} + {@code {T}_BatchMatMulId}), each a fixed list of prepared
-     * dispatches whose token counts, global sizes, input view and destination are re-set per step.
+     * the batched path ({@code LLM_MoE_Bucketize}, then {@code {T}_GroupedGemm} over the aligned rows of
+     * {@code LLM_MoE_AlignBlocks} when {@link #grouped} holds, else {@code {T}_BatchMatMulId}), each a fixed list of
+     * prepared dispatches whose token counts, global sizes, input view and destination are re-set per step.
      */
-    private final class ExpertPass implements AutoCloseable {
+    private final class ExpertPass implements Routed {
         final MoeExpertWeights plan;
         final MoeExpertWeights.Gpu w;
         final Router src;
@@ -770,15 +1051,23 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         final int idLocal;
         final GpuWeight postNorm;
         final float postEps;
+        /** Batched path over the aligned tiles ({@code {T}_GroupedGemm}) instead of {@code {T}_BatchMatMulId}. */
+        final boolean grouped;
+        final int nTiles;
+        /** The expert sort of the batched path, and its aligned rows when {@link #grouped}. */
+        final GpuGroupedRows rows;
         final ScratchSlot gate;
         final ScratchSlot up;
         final ScratchSlot act;
         final ScratchSlot expertOut;
         final ScratchSlot weightedIn;
         final ScratchSlot input0;
-        final ScratchSlot rowToken;
-        final ScratchSlot rowSlot;
         final boolean gateUpKernel;
+        /**
+         * True when the expert shards cover only part of the expert set (expert parallel): the pairs of the other
+         * ranks' experts are then zeroed before the products, whose id dispatches skip experts outside the shard.
+         */
+        final boolean zeroSkippedExperts;
         final GpuProjectionDeltas.ExpertSite gateSite;
         final GpuProjectionDeltas.ExpertSite upSite;
         final GpuProjectionDeltas.ExpertSite gateUpSite;
@@ -806,10 +1095,14 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             this.idLocal = idLocal(w.gate, w.up, w.gateUp, w.down);
             this.gateUpKernel = plan.gated && !w.hasBiases() && (plan.fused || (w.gate.type() == w.up.type()
                     && MoeExpertWeights.samePartition(w.gateShards, w.upShards)));
+            this.zeroSkippedExperts = !w.coversEveryExpert();
             checkLocal(w.gate);
             checkLocal(w.up);
             checkLocal(w.gateUp);
             checkLocal(w.down);
+            /* Batch invariance keeps the sorted per-pair product for every row count; the grouped expert GEMM
+             * tiles K with its own split, so it would change a row's reduction order with the batch. */
+            this.grouped = !BatchInvariance.enabled() && groupedUsable();
             checkGrid();
             GpuScratch scratch = ctx.scratch();
             long pairs = rows(k);
@@ -819,20 +1112,37 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             this.expertOut = scratch.temp(T_EXPERT_OUT, pairs * plan.outDim);
             this.weightedIn = weightBefore ? scratch.temp(T_WEIGHTED_IN, pairs * plan.inDim) : null;
             this.input0 = weightBefore ? scratch.temp(T_INPUT, rows(plan.inDim)) : null;
-            this.rowToken = scratch.temp(T_ROW_TOKEN, pairs);
-            this.rowSlot = scratch.temp(T_ROW_SLOT, pairs);
-            PreparedDispatch bk = null;
+            GpuGroupedRows r = null;
             Path d = null;
             try {
-                bk = ops.prepare(MoeKernels.BUCKETIZE, groupLocal(), groupLocal(), MoeKernels.bucketizeArgs(1, k,
-                        plan.nExpert, src.ids.buffer(), scratch.temp(T_COUNTS, plan.nExpert).buffer(),
-                        scratch.temp(T_OFFSETS, plan.nExpert).buffer(), rowToken.buffer(), rowSlot.buffer()));
-                d = new Path(false, null);
-                this.batch = new Path(true, bk);
+                r = new GpuGroupedRows(ops, scratch, ctx.kernels(), T_ROWS, ubatch, k, plan.nExpert,
+                        src.expertIds(), grouped);
+                this.nTiles = grouped ? r.nTiles() : 1;
+                this.rows = r;
+                d = new Path(false);
+                this.batch = new Path(true);
             } catch (RuntimeException e) {
-                throw Closeables.close(bk, Closeables.close(d, e));
+                throw Closeables.close(r, Closeables.close(d, e));
             }
             this.decode = d;
+        }
+
+        /**
+         * Whether the batched products can run as the grouped GEMM: the align kernel and both grid dimensions are
+         * available ({@link GpuGroupedRows#alignUsable}) and every expert tensor passes
+         * {@link GpuGroupedRows#groupedUsable}. Anything else keeps {@code {T}_BatchMatMulId}.
+         */
+        private boolean groupedUsable() {
+            if (!GpuGroupedRows.alignUsable(ctx.kernels(), Math.toIntExact(rows(k)), plan.nExpert,
+                    Math.max(plan.gateUpRows(), plan.outDim))) {
+                return false;
+            }
+            return tensorGrouped(w.gate, plan.inDim) && tensorGrouped(w.up, plan.inDim)
+                    && tensorGrouped(w.gateUp, plan.inDim) && tensorGrouped(w.down, plan.nFf);
+        }
+
+        private boolean tensorGrouped(GpuWeight t, int kDim) {
+            return t == null || GpuGroupedRows.groupedUsable(ctx.kernels(), t.type(), kDim);
         }
 
         /**
@@ -872,8 +1182,11 @@ public final class GpuMoeFfn implements GpuFfnBlock {
          * Experts over {@code n} tokens whose rows of {@code in_dim} start at {@code x[xOff]}; the weighted sum goes
          * to {@code dst} from element 0 with {@code flags}.
          */
-        void run(int n, GpuBuffer x, int xOff, GpuBuffer dst, int flags) {
-            Path p = n == 1 ? decode : batch;
+        @Override
+        public void run(int n, GpuBuffer x, int xOff, GpuBuffer dst, int flags) {
+            /* Batch invariance pins every row count to the sorted batch path: the one-token matvec path is a
+             * different kernel, and a row's value must not depend on its neighbours. */
+            Path p = n == 1 && !BatchInvariance.enabled() ? decode : batch;
             p.update(n);
             GpuBuffer in = x;
             int inOff = xOff;
@@ -902,13 +1215,12 @@ public final class GpuMoeFfn implements GpuFfnBlock {
 
         @Override
         public void close() {
-            closeAll(decode, batch);
+            closeAll(decode, batch, rows);
         }
 
         /** The prepared dispatches of one path (one token, or several). */
         private final class Path implements AutoCloseable {
             final boolean batched;
-            final PreparedDispatch bucket;
             PreparedDispatch scaleInput;
             ShardedDispatch gateUp;
             ShardedDispatch gateMm;
@@ -926,9 +1238,8 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             int lastFlags;
             int lastN;
 
-            Path(boolean batched, PreparedDispatch bucket) {
+            Path(boolean batched) {
                 this.batched = batched;
-                this.bucket = bucket;
                 try {
                     build();
                 } catch (RuntimeException e) {
@@ -976,9 +1287,9 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             }
 
             /**
-             * The separate gate and up products ({@code {T}_MatVecId} or {@code {T}_BatchMatMulId}) and their bias
-             * additions: the batched path, and the one-token path without the fused gate-up kernel or, beside it, for
-             * the steps that run with gate/up deltas.
+             * The separate gate and up products ({@code {T}_MatVecId}, {@code {T}_BatchMatMulId} or
+             * {@code {T}_GroupedGemm}) and their bias additions: the batched path, and the one-token path without
+             * the fused gate-up kernel or, beside it, for the steps that run with gate/up deltas.
              */
             private void buildSplitGateUp() {
                 GpuBuffer x0 = weightBefore ? weightedIn.buffer() : ctx.placeholders().readOnlyFloats();
@@ -1006,7 +1317,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             private ShardedDispatch gateUpShards(GGMLType type, boolean fused, int scaleMode,
                                                  List<MoeExpertWeights.Shard> gates, List<MoeExpertWeights.Shard> ups,
                                                  GpuBuffer x0, int xStride, GpuBuffer scales) {
-                GpuBuffer ids = src.ids.buffer();
+                GpuBuffer ids = src.expertIds();
                 return prepareShards(gates.size(), i -> {
                     MoeExpertWeights.Shard g = gates.get(i);
                     return ops.prepare(MoeKernels.matVecIdGateUp(type), idGlobal(plan.nFf), idLocal2(),
@@ -1017,8 +1328,8 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             }
 
             /**
-             * {@code {T}_MatVecId} (one token) or {@code {T}_BatchMatMulId} into {@code out} from element 0, one
-             * dispatch per expert shard of {@code t}.
+             * {@code {T}_MatVecId} (one token), {@code {T}_BatchMatMulId} or {@code {T}_GroupedGemm} (several) into
+             * {@code out} from element 0, one dispatch per expert shard of {@code t}.
              */
             private ShardedDispatch project(GpuWeight t, List<MoeExpertWeights.Shard> shards, GpuWeight scale,
                                             int outDim, int inDim, int xStride, int xDiv, GpuBuffer x0,
@@ -1028,15 +1339,22 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                 return prepareShards(shards.size(), i -> {
                     MoeExpertWeights.Shard sh = shards.get(i);
                     if (batched) {
+                        if (grouped) {
+                            return ops.prepare(GpuGroupedRows.groupedKernel(ops, t.type(), false),
+                                    MoeKernels.groupedGemmGlobal(outDim, nTiles), MoeKernels.groupedGemmLocal(),
+                                    MoeKernels.groupedGemmArgs(outDim, inDim, nTiles, xDiv, inDim, 0, 0, scaled,
+                                            sh.expertBase, sh.expertCount, rows.gemmToken(), rows.gemmSlot(),
+                                            sh.buffer, x0, s, out.buffer()));
+                        }
                         return ops.prepare(MoeKernels.batchMatMulId(t.type()),
                                 MoeKernels.batchMatMulIdGlobal(outDim, k, idLocal), idLocal2(),
                                 MoeKernels.batchMatMulIdArgs(outDim, inDim, k, xDiv, 0, scaled, sh.expertBase,
-                                        sh.expertCount, rowToken.buffer(), rowSlot.buffer(), sh.buffer, x0, s,
+                                        sh.expertCount, rows.rowToken(), rows.rowSlot(), sh.buffer, x0, s,
                                         out.buffer()));
                     }
                     return ops.prepare(MoeKernels.matVecId(t.type()), idGlobal(outDim), idLocal2(),
                             MoeKernels.matVecIdArgs(outDim, inDim, k, xStride, 0, 0, scaled, sh.expertBase,
-                                    sh.expertCount, src.ids.buffer(), sh.buffer, x0, s, out.buffer()));
+                                    sh.expertCount, src.expertIds(), sh.buffer, x0, s, out.buffer()));
                 });
             }
 
@@ -1045,7 +1363,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                     return null;
                 }
                 return ops.prepare(MoeKernels.ADD_ID, MoeKernels.elementGlobal((long) k * dim, ops.local()), local1(),
-                        MoeKernels.addIdArgs(k, dim, src.ids.buffer(), bias.shard(0), data.buffer()));
+                        MoeKernels.addIdArgs(k, dim, src.expertIds(), bias.shard(0), data.buffer()));
             }
 
             private long[] idGlobal(int outDim) {
@@ -1065,14 +1383,16 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                     throw new IllegalStateException("one-token expert path run with " + n + " tokens");
                 }
                 int pairs = n * k;
-                bucket.setInt(MoeKernels.ARG_N_TOKENS, n);
+                rows.update(n);
                 if (scaleInput != null) {
                     scaleInput.setInt(MoeKernels.ARG_N_TOKENS, n);
                     scaleInput.setGlobal(MoeKernels.elementGlobal((long) pairs * plan.inDim, ops.local()));
                 }
-                setRows(gateMm, plan.gateUpRows(), pairs);
-                setRows(upMm, plan.nFf, pairs);
-                setRows(down, plan.outDim, pairs);
+                if (!grouped) {
+                    setRows(gateMm, plan.gateUpRows(), pairs);
+                    setRows(upMm, plan.nFf, pairs);
+                    setRows(down, plan.outDim, pairs);
+                }
                 setPairs(gateBias, plan.gateUpRows(), pairs);
                 setPairs(upBias, plan.nFf, pairs);
                 setPairs(downBias, plan.outDim, pairs);
@@ -1123,8 +1443,12 @@ public final class GpuMoeFfn implements GpuFfnBlock {
 
             private void setInput(ShardedDispatch d, GpuBuffer x, int xOff) {
                 if (d != null) {
-                    d.setBuffer(batched ? MoeKernels.ARG_BMM_INPUT : MoeKernels.ARG_ID_INPUT, x);
-                    d.setInt(batched ? MoeKernels.ARG_BMM_IN_OFF : MoeKernels.ARG_ID_IN_OFF, xOff);
+                    int inArg = !batched ? MoeKernels.ARG_ID_INPUT : grouped ? MoeKernels.ARG_GG_INPUT
+                            : MoeKernels.ARG_BMM_INPUT;
+                    int offArg = !batched ? MoeKernels.ARG_ID_IN_OFF : grouped ? MoeKernels.ARG_GG_IN_OFF
+                            : MoeKernels.ARG_BMM_IN_OFF;
+                    d.setBuffer(inArg, x);
+                    d.setInt(offArg, xOff);
                 }
             }
 
@@ -1140,14 +1464,31 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                 }
             }
 
-            /** Enqueues the path for {@code n} tokens ({@code n * k} pairs). */
+            /**
+             * Enqueues the path for {@code n} tokens ({@code n * k} pairs). With a {@link GpuMatmulTap} that wants an
+             * expert tensor of the layer, the routed ids and the inputs of the gate/up and down products are read
+             * back and reported per routed pair.
+             */
             void dispatch(int n) {
                 int pairs = n * k;
+                if (zeroSkippedExperts) {
+                    // the pairs of experts another rank holds take no product here: their summand is zero
+                    ops.fill(expertOut.buffer(), expertOut.offset() * Float.BYTES,
+                            (long) pairs * plan.outDim * Float.BYTES, 0);
+                }
                 if (batched) {
-                    bucket.dispatch();
+                    rows.dispatch();
                 }
                 if (scaleInput != null) {
                     scaleInput.dispatch();
+                }
+                int[] routed = tappedIds(pairs);
+                if (routed != null) {
+                    int rows = weightBefore ? pairs : n;
+                    for (GpuWeight t : new GpuWeight[]{w.gate, w.up, w.gateUp}) {
+                        GpuMatmulTap.experts(ctx.queue(), t, plan.nExpert, routed, k, lastIn, lastInOff, rows,
+                                plan.inDim, weightBefore);
+                    }
                 }
                 boolean gateUpDeltas = gateUpDeltas();
                 if (gateUp != null && !gateUpDeltas) {
@@ -1165,6 +1506,10 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                     run(upBias);
                     activate(pairs);
                 }
+                if (routed != null) {
+                    GpuMatmulTap.experts(ctx.queue(), w.down, plan.nExpert, routed, k, act.buffer(), act.offset(),
+                            pairs, plan.nFf, true);
+                }
                 down.dispatch();
                 addDeltas(downSite, n, act.buffer(), act.offset(), false, expertOut);
                 run(downBias);
@@ -1174,6 +1519,15 @@ public final class GpuMoeFfn implements GpuFfnBlock {
                             expertOut.buffer(), expertOut.offset(), pairs, plan.outDim);
                 }
                 wsum.dispatch();
+            }
+
+            /** The routed expert of every pair when the tap wants an expert tensor of the layer, else null. */
+            private int[] tappedIds(int pairs) {
+                if (!GpuMatmulTap.wantsExperts(w.gate) && !GpuMatmulTap.wantsExperts(w.up)
+                        && !GpuMatmulTap.wantsExperts(w.gateUp) && !GpuMatmulTap.wantsExperts(w.down)) {
+                    return null;
+                }
+                return GpuMatmulTap.readInts(ctx.queue(), src.ids.buffer(), src.ids.offset(), pairs);
             }
 
             /** {@code LLM_GLU} or {@code LLM_Unary} of the projected rows into {@link #act}. */
@@ -1201,7 +1555,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
             private void addDeltas(GpuProjectionDeltas.ExpertSite site, int n, GpuBuffer x, int xOff,
                                    boolean tokenRows, ScratchSlot out) {
                 if (site != null && !site.isEmpty()) {
-                    site.apply(n, k, src.ids.buffer(), x, xOff, tokenRows, out.buffer(), out.offset());
+                    site.apply(n, k, src.expertIds(), x, xOff, tokenRows, out.buffer(), out.offset());
                 }
             }
 
@@ -1213,8 +1567,7 @@ public final class GpuMoeFfn implements GpuFfnBlock {
 
             @Override
             public void close() {
-                closeAll(scaleInput, gateBias, upBias, downBias, postScale, wsum, gateUp, gateMm, upMm, down,
-                        batched ? bucket : null);
+                closeAll(scaleInput, gateBias, upBias, downBias, postScale, wsum, gateUp, gateMm, upMm, down);
             }
         }
 
@@ -1240,105 +1593,4 @@ public final class GpuMoeFfn implements GpuFfnBlock {
         }
     }
 
-    // ================================================================== dense FFN
-
-    /**
-     * A dense FFN ({@code build_ffn}, llama-graph.cpp:1923-2140) through {@link GpuOps}: the shared experts and the
-     * parallel dense FFN. Per-tensor {@code w_s} scales are applied by {@link GpuOps} from {@link GpuWeight#scale()};
-     * a product with deltas runs unscaled, adds them and then applies {@code w_s}, as {@code build_ffn} scales after
-     * {@code build_lora_mm} (llama-graph.cpp:1979-2010).
-     */
-    private final class DenseFfn {
-        final FfnSpec f;
-        final GpuWeight gate;
-        final GpuWeight up;
-        final GpuWeight down;
-        final GpuProjectionDeltas.Site gateSite;
-        final GpuProjectionDeltas.Site upSite;
-        final GpuProjectionDeltas.Site downSite;
-        /** The weights without {@code w_s}, for the products with deltas. */
-        final GpuWeight gatePlain;
-        final GpuWeight upPlain;
-        final GpuWeight downPlain;
-        final ScratchSlot g;
-        final ScratchSlot u;
-        final ScratchSlot out;
-
-        DenseFfn(FfnSpec f, GpuWeights w) {
-            this.f = Objects.requireNonNull(f, "ffn");
-            if (f.activationSparsityStdMul() != 0f) {
-                throw new UnsupportedOperationException("layer " + layer.il() + ": " + f.role()
-                        + " FFN with activation sparsity is not part of a MoE graph");
-            }
-            if (f.gating() == FfnGating.SEQ && f.gated()) {
-                throw new UnsupportedOperationException("layer " + layer.il() + ": sequentially gated " + f.role()
-                        + " FFN is not built by the MoE graphs");
-            }
-            int nFf = f.nFf();
-            boolean fused = f.gating() == FfnGating.FUSED_UP;
-            this.gate = f.gating() == FfnGating.PAR ? w.layer(layer, f.gateWeight()) : null;
-            this.up = w.layer(layer, f.upWeight());
-            this.down = w.layer(layer, f.downWeight());
-            long upRows = fused ? 2L * nFf : nFf;
-            if (up.cols() != nEmbd || up.rows() != upRows || down.cols() != nFf || down.rows() != nEmbd
-                    || (gate != null && (gate.cols() != nEmbd || gate.rows() != nFf))) {
-                throw new IllegalStateException("layer " + layer.il() + ": " + f.role() + " FFN tensors " + gate + ", "
-                        + up + ", " + down + " do not match n_embd " + nEmbd + " and n_ff " + nFf);
-            }
-            GpuProjectionDeltas deltas = ctx.projectionDeltas();
-            this.gateSite = gate != null ? deltas.serve(layer, f.gateWeight(), gate) : null;
-            this.upSite = deltas.serve(layer, f.upWeight(), up);
-            this.downSite = deltas.serve(layer, f.downWeight(), down);
-            this.gatePlain = plain(gate);
-            this.upPlain = plain(up);
-            this.downPlain = plain(down);
-            GpuScratch scratch = ctx.scratch();
-            this.g = gate != null || fused ? scratch.temp(T_FFN_GATE, rows(upRows)) : null;
-            this.u = scratch.temp(T_FFN_UP, rows(nFf));
-            this.out = scratch.temp(T_FFN_OUT, rows(nEmbd));
-        }
-
-        /** {@link #out} = FFN of {@code n} rows at {@code x[xOff]}. */
-        void run(int n, GpuBuffer x, int xOff) {
-            int nFf = f.nFf();
-            switch (f.gating()) {
-                case PAR:
-                    project(up, upPlain, upSite, x, xOff, u, n);
-                    project(gate, gatePlain, gateSite, x, xOff, g, n);
-                    ops.glu(f.glu(), f.params(), g.buffer(), g.offset(), nFf, u.buffer(), u.offset(), nFf,
-                            u.buffer(), u.offset(), nFf, n, nFf);
-                    break;
-                case FUSED_UP:
-                    project(up, upPlain, upSite, x, xOff, g, n);
-                    ops.glu(f.glu(), f.params(), g.buffer(), g.offset(), 2 * nFf, g.buffer(), g.offset() + nFf,
-                            2 * nFf, u.buffer(), u.offset(), nFf, n, nFf);
-                    break;
-                case SEQ:
-                    project(up, upPlain, upSite, x, xOff, u, n);
-                    ops.unary(f.act(), f.params(), u.buffer(), u.offset(), u.buffer(), u.offset(), n * nFf);
-                    break;
-                default:
-                    throw new IllegalStateException("unhandled FFN gating " + f.gating());
-            }
-            project(down, downPlain, downSite, u.buffer(), u.offset(), out, n);
-        }
-
-        private GpuWeight plain(GpuWeight w) {
-            return w != null && w.hasScale() ? w.withScale(1.0f) : w;
-        }
-
-        /** {@code y = (W x + deltas) * w_s} over {@code n} rows; {@code plain} is {@code w} without {@code w_s}. */
-        private void project(GpuWeight w, GpuWeight plain, GpuProjectionDeltas.Site site, GpuBuffer x, int xOff,
-                             ScratchSlot y, int n) {
-            if (site.isEmpty()) {
-                ops.matmul(w, x, xOff, y.buffer(), y.offset(), n);
-                return;
-            }
-            ops.matmul(plain, x, xOff, y.buffer(), y.offset(), n);
-            site.applyRows(n, x, xOff, y.buffer(), y.offset());
-            if (w.hasScale()) {
-                ops.scale(y.buffer(), y.offset(), Math.toIntExact((long) n * w.rows()), w.scale());
-            }
-        }
-    }
 }

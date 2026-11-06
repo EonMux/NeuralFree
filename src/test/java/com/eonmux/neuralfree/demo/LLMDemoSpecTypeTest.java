@@ -8,6 +8,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
@@ -16,9 +17,9 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * {@code --spec-type} (llama.cpp common/arg.cpp {@code --spec-type}): auto, draft-mtp and draft-simple reach the
- * engine configuration, draft-mtp without {@code --draft} drafts with the target's own NextN / MTP head, and
- * contradictory or unknown values are usage errors.
+ * {@code --spec-type} (llama.cpp common/arg.cpp {@code --spec-type}): auto, draft-mtp, draft-simple and the draftless
+ * n-gram and suffix types reach the engine configuration, draft-mtp without {@code --draft} drafts with the target's
+ * own NextN / MTP head, and contradictory, detected-only or unknown values are usage errors.
  */
 public class LLMDemoSpecTypeTest {
 
@@ -75,9 +76,19 @@ public class LLMDemoSpecTypeTest {
     }
 
     @Test
+    public void draftlessTypesReachTheConfiguration() throws UsageException {
+        assertEquals(List.of(DraftType.NGRAM_CACHE), engine("--spec-type", "ngram-cache").draftTypes());
+        assertEquals(List.of(DraftType.NGRAM), engine("--spec-type", "ngram-simple").draftTypes());
+        assertEquals(List.of(DraftType.SUFFIX), engine("--spec-type", "suffix").draftTypes());
+        assertEquals(DraftType.AUTO, engine("--spec-type", "suffix").draftType());
+    }
+
+    @Test
     public void unknownOrContradictoryTypesAreUsageErrors() {
-        UsageException unknown = assertThrows(UsageException.class, () -> engine("--spec-type", "ngram-cache"));
+        UsageException unknown = assertThrows(UsageException.class, () -> engine("--spec-type", "lookahead"));
         assertTrue(unknown.getMessage(), unknown.getMessage().startsWith("--spec-type"));
+        UsageException detected = assertThrows(UsageException.class, () -> engine("--spec-type", "draft-eagle3"));
+        assertTrue(detected.getMessage(), detected.getMessage().startsWith("--spec-type"));
         assertThrows(UsageException.class, () -> engine("--spec-type"));
         assertThrows(UsageException.class, () -> engine("--mtp", "--spec-type", "draft-simple"));
     }

@@ -16,14 +16,16 @@ import java.nio.file.Path;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The longest-prefix cache over the paged memory (PARITY P3): a second request whose prompt extends a cached
- * prefix reuses the shared pages (its {@code reusedPrefix} counts the copied tokens, at least the last prompt
- * token prefills), computes the same tokens and text as the uncached run, keeps working across LRU evictions on
- * a one-slot memory, and the {@code neuralfree.prefix.reuse=false} switch disables the whole route. The cache
- * never changes a result: same tokens, same logits, same sampling.
+ * The prefix cache's block pool over the paged memory: a second request whose prompt extends a
+ * cached prefix reuses the shared pages (its {@code reusedPrefix} counts the adopted tokens, at least the last
+ * prompt token prefills), computes the same tokens and text as the uncached run, keeps working across LRU
+ * evictions on a one-slot memory, and the {@code neuralfree.prefix.reuse=false} switch disables the whole route.
+ * A model larger than the physical RAM turns an unset cache off (Avalon server-context.cpp:1550-1566), an
+ * explicit setting stands. The cache never changes a result: same tokens, same logits, same sampling.
  */
 public class BatchPrefixCacheTest {
 
@@ -139,26 +141,38 @@ public class BatchPrefixCacheTest {
         }
     }
 
+    /**
+     * Cached blocks outlive their sequence's slot and give way only to pool pressure: on a one-slot memory of
+     * four pages, a long unrelated prompt needs every page, so the free blocks of the first prompt evict (least
+     * recent first) and the first prompt prefills whole again, then is cached again for the round after.
+     */
     @Test
-    public void aOneSlotMemoryEvictsTheOldestCachedPrefixForANewGeneration() throws IOException, InterruptedException {
+    public void aOneSlotMemoryEvictsTheCachedBlocksANewGenerationNeeds() throws IOException {
+        EngineConfig oneSlot = EngineConfig.builder().memory(MemoryConfig.builder().nCtx(64).ubatch(8)
+                .kvPaged(true).parallel(1).typeK(KvDType.F32).typeV(KvDType.F32).prefixReuse(true).build()).build();
         Path model = SyntheticModels.llama().writeTempFile();
-        try (GGUFModel m = new GGUFModel(model.toString(), config(true, true).build());
-             BatchEngine engine = BatchEngine.forModel(m, config(true, true).build())) {
-            engine.submit(prompt(3, 0), request(N_NEW), (com.eonmux.neuralfree.gguf.TokenCallback) null);
-            engine.drain();
-            // the second run needs the one slot: the first run's cached prefix evicts (LRU)
-            engine.submit(prompt(4, 0), request(N_NEW), (com.eonmux.neuralfree.gguf.TokenCallback) null);
-            engine.drain();
-            // the evicted prefix no longer matches
-            BatchSequence again = engine.submit(prompt(3, 0), request(N_NEW),
+        try (GGUFModel m = new GGUFModel(model.toString(), oneSlot);
+             BatchEngine engine = BatchEngine.forModel(m, oneSlot)) {
+            BatchSequence first = engine.submit(longPrompt(3), request(3),
                     (com.eonmux.neuralfree.gguf.TokenCallback) null);
-            engine.drain();
-            assertEquals("the evicted prefix is gone", 0, again.reusedPrefix());
-            // and it is cached again for the next round
-            BatchSequence onceMore = engine.submit(prompt(3, 0), request(N_NEW),
+            pumpUntilFinished(engine, first);
+            BatchSequence repeat = engine.submit(longPrompt(3), request(3),
                     (com.eonmux.neuralfree.gguf.TokenCallback) null);
-            engine.drain();
-            assertTrue(onceMore.reusedPrefix() > 0);
+            pumpUntilFinished(engine, repeat);
+            assertEquals("the blocks outlive the retired slot", LONG - 1, repeat.reusedPrefix());
+            BatchSequence other = engine.submit(longPrompt(4), request(3),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, other);
+            assertEquals(0, other.reusedPrefix());
+            BatchSequence again = engine.submit(longPrompt(3), request(3),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, again);
+            assertEquals("the evicted blocks are gone", 0, again.reusedPrefix());
+            assertArrayEquals(first.result().tokens(), again.result().tokens());
+            BatchSequence onceMore = engine.submit(longPrompt(3), request(3),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, onceMore);
+            assertEquals("and cached again for the next round", LONG - 1, onceMore.reusedPrefix());
         }
     }
 
@@ -173,6 +187,49 @@ public class BatchPrefixCacheTest {
                     (com.eonmux.neuralfree.gguf.TokenCallback) null);
             engine.drain();
             assertEquals("neuralfree.prefix.reuse=false caches nothing", 0, second.reusedPrefix());
+        }
+    }
+
+    /** The paged memory of {@link #config}, without the prefix-reuse switch. */
+    private static MemoryConfig.Builder pagedMemory() {
+        return MemoryConfig.builder().nCtx(64).ubatch(8).typeK(KvDType.F32).typeV(KvDType.F32).kvPaged(true);
+    }
+
+    @Test
+    public void thePrefixCachePolicyMirrorsAvalon() {
+        MemoryConfig unset = MemoryConfig.defaults();
+        assertFalse(BatchEngine.prefixReuseForHostRam(unset, 2, 1));
+        assertTrue(BatchEngine.prefixReuseForHostRam(unset, 1, 2));
+        assertTrue("an unknown RAM keeps the default", BatchEngine.prefixReuseForHostRam(unset, 2, -1));
+        assertTrue("an explicit neuralfree.prefix.reuse=true stands beside any host",
+                BatchEngine.prefixReuseForHostRam(MemoryConfig.builder().prefixReuse(true).build(), 2, 1));
+        assertFalse(BatchEngine.prefixReuseForHostRam(MemoryConfig.builder().prefixReuse(false).build(), 1, 2));
+    }
+
+    @Test
+    public void aModelLargerThanRamDisablesTheCacheUnlessSetExplicitly() throws IOException, InterruptedException {
+        // the 1-byte host makes the synthetic model "larger than RAM"
+        Path model = SyntheticModels.llama().writeTempFile();
+        EngineConfig unset = EngineConfig.builder().memory(pagedMemory().build()).build();
+        try (GGUFModel m = new GGUFModel(model.toString(), unset);
+             BatchEngine engine = BatchEngine.forModel(m, unset, 1)) {
+            engine.submit(prompt(5, 0), request(N_NEW), (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            BatchSequence second = engine.submit(prompt(5, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            assertEquals("a larger-than-RAM model caches no prefix", 0, second.reusedPrefix());
+        }
+        EngineConfig forced = EngineConfig.builder().memory(pagedMemory().prefixReuse(true).build()).build();
+        try (GGUFModel m = new GGUFModel(model.toString(), forced);
+             BatchEngine engine = BatchEngine.forModel(m, forced, 1)) {
+            engine.submit(prompt(5, 0), request(N_NEW), (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            BatchSequence second = engine.submit(prompt(5, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            assertEquals("an explicit neuralfree.prefix.reuse=true keeps the cache", N_TOKENS - 1,
+                    second.reusedPrefix());
         }
     }
 
@@ -248,10 +305,157 @@ public class BatchPrefixCacheTest {
             BatchSequence second = engine.submit(longPrompt(1), request(3),
                     (com.eonmux.neuralfree.gguf.TokenCallback) null);
             pumpUntilFinished(engine, first, second);
-            assertEquals("the copy adopts the cached prompt, all but its last token", LONG - 1,
+            // the two copies outgrow the 64 shared cells: the copy is preempted or requeued, and its retry adopts
+            // the whole cached blocks of the prompt that survive the evictions making room for it
+            assertTrue("the copy adopts the cached prompt's whole blocks, got " + second.reusedPrefix(),
+                    second.reusedPrefix() >= 3 * MemoryConfig.DEFAULT_PAGE_SIZE
+                            && second.reusedPrefix() <= LONG - 1);
+            assertArrayEquals(first.result().tokens(), second.result().tokens());
+            assertTrue(engine.idle());
+        }
+    }
+
+    /**
+     * A request admitted while an identical twin still decodes forks off the twin's committed pages
+     * ({@code PagedSequences.copy}, whole pages shared) instead of prefilling the prompt again: its
+     * {@code reusedPrefix} covers all but the last prompt token and both decode the same tokens.
+     */
+    @Test
+    public void aPromptAdmittedWhileItsTwinRunsForksOffItsCommittedPages() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel m = new GGUFModel(model.toString(), twoSlots());
+             BatchEngine engine = BatchEngine.forModel(m, twoSlots())) {
+            BatchSequence first = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.pump(); // admits and prefills the first request
+            BatchSequence second = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, first, second);
+            assertEquals(0, first.reusedPrefix());
+            assertEquals("the fork copies the twin's committed prefix pages", N_TOKENS - 1,
                     second.reusedPrefix());
             assertArrayEquals(first.result().tokens(), second.result().tokens());
             assertTrue(engine.idle());
+        }
+    }
+
+    /** The server's n-choices pattern: identical prompts decode side by side over one shared prefill. */
+    @Test
+    public void threeChoicesShareOnePrefillOfTheirCommonPrompt() throws IOException {
+        MemoryConfig mc = MemoryConfig.builder().nCtx(128).ubatch(8).kvPaged(true).parallel(3)
+                .typeK(KvDType.F32).typeV(KvDType.F32).build();
+        EngineConfig config = EngineConfig.builder().memory(mc).build();
+        Path model = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel m = new GGUFModel(model.toString(), config);
+             BatchEngine engine = BatchEngine.forModel(m, config)) {
+            BatchSequence first = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.pump();
+            BatchSequence second = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            BatchSequence third = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, first, second, third);
+            assertEquals(0, first.reusedPrefix());
+            assertEquals(N_TOKENS - 1, second.reusedPrefix());
+            assertEquals(N_TOKENS - 1, third.reusedPrefix());
+            assertArrayEquals(first.result().tokens(), second.result().tokens());
+            assertArrayEquals(first.result().tokens(), third.result().tokens());
+            assertTrue(engine.idle());
+        }
+    }
+
+    /**
+     * The n choices of one HTTP request arrive together, before the first pump admits anything: the first choice
+     * prefills, the queued copies wait as forks on it and prefill only their tails once its prompt committed —
+     * the same one shared prefill, with the donors' prefill still pending at admission time.
+     */
+    @Test
+    public void choicesSubmittedTogetherWaitForTheFirstPrefillAndForkOffIt() throws IOException {
+        MemoryConfig mc = MemoryConfig.builder().nCtx(128).ubatch(8).kvPaged(true).parallel(3)
+                .typeK(KvDType.F32).typeV(KvDType.F32).build();
+        EngineConfig config = EngineConfig.builder().memory(mc).build();
+        Path model = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel m = new GGUFModel(model.toString(), config);
+             BatchEngine engine = BatchEngine.forModel(m, config)) {
+            BatchSequence first = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            BatchSequence second = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            BatchSequence third = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, first, second, third);
+            assertEquals(0, first.reusedPrefix());
+            assertEquals(N_TOKENS - 1, second.reusedPrefix());
+            assertEquals(N_TOKENS - 1, third.reusedPrefix());
+            assertArrayEquals(first.result().tokens(), second.result().tokens());
+            assertArrayEquals(first.result().tokens(), third.result().tokens());
+            assertTrue(engine.idle());
+        }
+    }
+
+    /**
+     * The cache's token budget evicts the least recently used entries once their combined tokens pass it: a
+     * two-slot engine whose second cached entry pushes the first over the budget leaves the first prompt without
+     * a match (its pages freed) while the newest entry still serves its prefix. Every offer trims, so a request
+     * served later in submit order keeps its prefix only while it is the cache's newest.
+     */
+    /**
+     * More identical prompts arrive together than the engine has sequence slots (the server's {@code best_of}
+     * candidates): the overflow waits in the queue and admits as slots retire, forking off or adopting the cached
+     * prompt, and every one of them finishes with the same greedy tokens. The longest prompt fills the shared
+     * cells with its two new tokens, so a fork and its donor cannot both write the page they share: the youngest
+     * — the fork — yields to its donor instead of the donor being preempted for it over and over.
+     */
+    @Test
+    public void moreIdenticalConcurrentPromptsThanSlotsAllFinish() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        for (int length : new int[]{12, 40, 62}) {
+            int[] prompt = new int[length];
+            for (int i = 0; i < length; i++) {
+                prompt[i] = 4 + (i * 13) % 250;
+            }
+            for (int copies = 3; copies <= 4; copies++) {
+                try (GGUFModel m = new GGUFModel(model.toString(), twoSlots());
+                     BatchEngine engine = BatchEngine.forModel(m, twoSlots())) {
+                    BatchSequence[] handles = new BatchSequence[copies];
+                    for (int c = 0; c < copies; c++) {
+                        handles[c] = engine.submit(prompt, unbounded(2),
+                                (com.eonmux.neuralfree.gguf.TokenCallback) null);
+                    }
+                    pumpUntilFinished(engine, handles);
+                    for (BatchSequence h : handles) {
+                        assertArrayEquals("length " + length + ", " + copies + " copies: same greedy tokens",
+                                handles[0].result().tokens(), h.result().tokens());
+                    }
+                    assertTrue("length " + length + ", " + copies + " copies: the engine drains", engine.idle());
+                }
+            }
+        }
+    }
+
+    @Test
+    public void theBudgetEvictsTheLeastRecentlyUsedCachedPrefixes() throws IOException {
+        MemoryConfig mc = MemoryConfig.builder().nCtx(64).ubatch(8).kvPaged(true).parallel(2)
+                .typeK(KvDType.F32).typeV(KvDType.F32).prefixCacheBudget(20).build();
+        EngineConfig config = EngineConfig.builder().memory(mc).build();
+        Path model = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel m = new GGUFModel(model.toString(), config);
+             BatchEngine engine = BatchEngine.forModel(m, config)) {
+            BatchSequence one = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.pump();
+            BatchSequence two = engine.submit(prompt(9, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, one, two);
+            BatchSequence keeper = engine.submit(prompt(9, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            assertEquals("the newest entry stays", N_TOKENS - 1, keeper.reusedPrefix());
+            BatchSequence again = engine.submit(prompt(1, 0), request(N_NEW),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.drain();
+            assertEquals("the budget evicted the oldest entry", 0, again.reusedPrefix());
         }
     }
 

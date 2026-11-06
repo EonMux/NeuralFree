@@ -9,7 +9,8 @@ import java.util.Objects;
  * CPU reference of {@link TensorOps}' elementwise ops: broadcasting arithmetic, unary functions and activations,
  * compares, {@code where}, GLU/GeGLU, activation backwards, the dropout mask-scale and the in-place updates. Every
  * formula is Java float arithmetic in the order the train kernels mirror ({@code kernels/train/eltwise.cl}).
- * Results never require grad, whatever the inputs' flags.
+ * Results never require grad, whatever the inputs' flags. The arithmetic and the unary functions take FLOAT64
+ * operands to {@link CpuFloat64}.
  */
 final class CpuElementwise {
 
@@ -37,18 +38,30 @@ final class CpuElementwise {
     // ------------------------------------------------------------------ binary (broadcasting)
 
     static Tensor add(Tensor a, Tensor b) {
+        if (CpuFloat64.applies("add", a, b)) {
+            return CpuFloat64.binary(a, b, (x, y) -> x + y);
+        }
         return binary(a, b, (x, y) -> x + y);
     }
 
     static Tensor sub(Tensor a, Tensor b) {
+        if (CpuFloat64.applies("sub", a, b)) {
+            return CpuFloat64.binary(a, b, (x, y) -> x - y);
+        }
         return binary(a, b, (x, y) -> x - y);
     }
 
     static Tensor mul(Tensor a, Tensor b) {
+        if (CpuFloat64.applies("mul", a, b)) {
+            return CpuFloat64.binary(a, b, (x, y) -> x * y);
+        }
         return binary(a, b, (x, y) -> x * y);
     }
 
     static Tensor div(Tensor a, Tensor b) {
+        if (CpuFloat64.applies("div", a, b)) {
+            return CpuFloat64.binary(a, b, (x, y) -> x / y);
+        }
         return binary(a, b, (x, y) -> x / y);
     }
 
@@ -69,82 +82,142 @@ final class CpuElementwise {
     // ------------------------------------------------------------------ unary
 
     static Tensor neg(Tensor a) {
+        if (CpuFloat64.applies("neg", a)) {
+            return CpuFloat64.map(a, x -> -x);
+        }
         return map(a, x -> -x);
     }
 
     static Tensor abs(Tensor a) {
+        if (CpuFloat64.applies("abs", a)) {
+            return CpuFloat64.map(a, Math::abs);
+        }
         return map(a, Math::abs);
     }
 
     static Tensor sqrt(Tensor a) {
+        if (CpuFloat64.applies("sqrt", a)) {
+            return CpuFloat64.map(a, Math::sqrt);
+        }
         return map(a, x -> (float) Math.sqrt(x));
     }
 
     static Tensor exp(Tensor a) {
+        if (CpuFloat64.applies("exp", a)) {
+            return CpuFloat64.map(a, Math::exp);
+        }
         return map(a, x -> (float) Math.exp(x));
     }
 
     static Tensor log(Tensor a) {
+        if (CpuFloat64.applies("log", a)) {
+            return CpuFloat64.map(a, Math::log);
+        }
         return map(a, x -> (float) Math.log(x));
     }
 
     static Tensor pow(Tensor a, float exponent) {
+        if (CpuFloat64.applies("pow", a)) {
+            return CpuFloat64.map(a, x -> Math.pow(x, exponent));
+        }
         return map(a, x -> (float) Math.pow(x, exponent));
     }
 
     static Tensor clamp(Tensor a, float min, float max) {
+        if (CpuFloat64.applies("clamp", a)) {
+            return CpuFloat64.map(a, x -> Math.max(min, Math.min(max, x)));
+        }
         return map(a, x -> Math.max(min, Math.min(max, x)));
     }
 
     static Tensor addScalar(Tensor a, float scalar) {
+        if (CpuFloat64.applies("addScalar", a)) {
+            return CpuFloat64.map(a, x -> x + scalar);
+        }
         return map(a, x -> x + scalar);
     }
 
     static Tensor mulScalar(Tensor a, float scalar) {
+        if (CpuFloat64.applies("mulScalar", a)) {
+            return CpuFloat64.map(a, x -> x * scalar);
+        }
         return map(a, x -> x * scalar);
     }
 
     static Tensor relu(Tensor a) {
+        if (CpuFloat64.applies("relu", a)) {
+            return CpuFloat64.map(a, x -> Math.max(0.0, x));
+        }
         return map(a, x -> Math.max(0.0f, x));
     }
 
     static Tensor gelu(Tensor a) {
+        if (CpuFloat64.applies("gelu", a)) {
+            return CpuFloat64.map(a, CpuFloat64::gelu);
+        }
         return map(a, CpuElementwise::geluOf);
     }
 
     static Tensor silu(Tensor a) {
+        if (CpuFloat64.applies("silu", a)) {
+            return CpuFloat64.map(a, x -> x * CpuFloat64.sigmoid(x));
+        }
         return map(a, x -> x * sigmoidOf(x));
     }
 
     static Tensor sigmoid(Tensor a) {
+        if (CpuFloat64.applies("sigmoid", a)) {
+            return CpuFloat64.map(a, CpuFloat64::sigmoid);
+        }
         return map(a, CpuElementwise::sigmoidOf);
     }
 
     static Tensor tanh(Tensor a) {
+        if (CpuFloat64.applies("tanh", a)) {
+            return CpuFloat64.map(a, Math::tanh);
+        }
         return map(a, x -> (float) Math.tanh(x));
     }
 
     static Tensor sin(Tensor a) {
+        if (CpuFloat64.applies("sin", a)) {
+            return CpuFloat64.map(a, Math::sin);
+        }
         return map(a, x -> (float) Math.sin(x));
     }
 
     static Tensor cos(Tensor a) {
+        if (CpuFloat64.applies("cos", a)) {
+            return CpuFloat64.map(a, Math::cos);
+        }
         return map(a, x -> (float) Math.cos(x));
     }
 
     static Tensor leakyRelu(Tensor a, float negativeSlope) {
+        if (CpuFloat64.applies("leakyRelu", a)) {
+            return CpuFloat64.map(a, x -> x > 0 ? x : negativeSlope * x);
+        }
         return map(a, x -> x > 0 ? x : negativeSlope * x);
     }
 
     static Tensor elu(Tensor a, float alpha) {
+        if (CpuFloat64.applies("elu", a)) {
+            return CpuFloat64.map(a, x -> x > 0 ? x : alpha * (Math.exp(x) - 1));
+        }
         return map(a, x -> x > 0 ? x : alpha * ((float) Math.exp(x) - 1));
     }
 
     static Tensor softplus(Tensor a) {
+        if (CpuFloat64.applies("softplus", a)) {
+            return CpuFloat64.map(a, CpuFloat64::softplus);
+        }
         return map(a, CpuElementwise::softplusOf);
     }
 
     static Tensor mish(Tensor a) {
+        if (CpuFloat64.applies("mish", a)) {
+            return CpuFloat64.map(a, x -> x * Math.tanh(CpuFloat64.softplus(x)));
+        }
         return map(a, x -> x * (float) Math.tanh(softplusOf(x)));
     }
 
@@ -423,7 +496,7 @@ final class CpuElementwise {
      * Row-major walk of a broadcast result: {@link #locate} sets the element indices of both operands for one
      * result element (the operands' row-major positions under their broadcast strides).
      */
-    private static final class BroadcastWalk {
+    static final class BroadcastWalk {
         private final int[] dims;
         private final long[] stridesA;
         private final long[] stridesB;

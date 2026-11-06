@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-MS part D converter classes and the gpt-oss row: {@code Step35Model}
+ * Synthetic checkpoints of the converter classes and the gpt-oss row: {@code Step35Model}
  * (step3.py:102-341, the per-layer arrays and MTP), {@code MuseSparkModel} (muse_spark.py:39-182, the
  * residual gates and the fused experts) and {@code GptOssModel} (gpt_oss.py:15-130, the BF16 and MXFP4
  * expert forms and the attention sinks). Two layers, a hidden size of 8, two query heads, one key/value

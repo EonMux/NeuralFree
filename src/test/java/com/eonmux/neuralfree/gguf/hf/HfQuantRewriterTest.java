@@ -1,11 +1,13 @@
 package com.eonmux.neuralfree.gguf.hf;
 
+import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader;
 import com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig;
+import com.eonmux.neuralfree.gguf.hf.config.HfQuantMethod;
 import com.eonmux.neuralfree.gguf.hf.config.QuantArgs;
 import com.eonmux.neuralfree.gguf.hf.config.QuantFormat;
 import com.eonmux.neuralfree.gguf.hf.quant.HadamardTransforms.HadamardPlan;
@@ -32,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
@@ -143,6 +146,19 @@ public class HfQuantRewriterTest {
     }
 
     private static final String FP8_CONFIG = "{'quant_method':'fp8','activation_scheme':'dynamic'}";
+
+    @Test
+    public void theDeepseekV41EngramTableIsNotABlockFp8Module() throws IOException {
+        String json = "{'architectures':['DeepseekV41ForCausalLM'],'model_type':'deepseek_v41','hidden_size':64,"
+                + "'num_hidden_layers':2,'quantization_config':{'quant_method':'fp8','scale_fmt':'ue8m0',"
+                + "'weight_block_size':[128,128],'activation_scheme':'dynamic'}}";
+        HfConfig cfg = HfConfigLoader.fromJson(tmp.getRoot().toPath(), json.replace('\'', '"'));
+        HfQuantConfig q = HfQuantConfig.of(cfg);
+        assertSame(HfQuantMethod.DEEPSEEK_V4_FP8, q.method());
+        assertFalse(q.argsFor("layers.0.engram.embed").isPresent());
+        assertFalse(q.argsFor("model.layers.0.engram.embed").isPresent());
+        assertTrue(q.argsFor("layers.0.attn.wq_a").isPresent());
+    }
 
     // ------------------------------------------------------------------ module grouping
 
@@ -294,6 +310,28 @@ public class HfQuantRewriterTest {
         assertTrue(r.kvScales().isEmpty());
         assertEquals(Collections.singletonList(L0 + "self_attn.o_proj"), new ArrayList<>(r.moduleArgs().keySet()));
         assertEquals(QuantFormat.FP8, r.moduleArgs().get(L0 + "self_attn.o_proj").format());
+    }
+
+    @Test
+    public void quarkNvfp4TwoLevelSpecsRewriteFromTheirScaleTensors() throws IOException {
+        HfConfig cfg = config("{'quant_method':'quark','global_quant_config':{'weight':[{'dtype':'fp4',"
+                + "'qscheme':'per_group','group_size':16,'is_dynamic':false},{'dtype':'fp8_e4m3',"
+                + "'qscheme':'per_tensor','is_dynamic':false}],'input_tensors':[{'dtype':'fp4',"
+                + "'qscheme':'per_group','group_size':16,'is_dynamic':true},{'dtype':'fp8_e4m3',"
+                + "'qscheme':'per_tensor','is_dynamic':false}]}}");
+        String q = L0 + "self_attn.q_proj";
+        HfTensorIndex in = index(q + ".weight", new Shaped(StDType.U8, 64, 32),
+                q + ".weight_scale", new Shaped(StDType.F8_E4M3, 64, 4),
+                q + ".weight_scale_2", RopeTensors.fromFloats(new long[]{}, new float[]{0.5f}),
+                q + ".input_scale_2", RopeTensors.fromFloats(new long[]{}, new float[]{2f}));
+        HfQuantRewriter.Result r = rewrite(cfg, in, ActivationQuant.CHECKPOINT);
+        assertEquals(Collections.singletonList(q + ".weight"), r.index().names());
+        assertEquals(QuantFormat.NVFP4_QUARK, r.moduleArgs().get(q).format());
+        RowSource w = r.index().get(q + ".weight");
+        assertEquals(GGMLType.NVFP4, w.format().ggmlType());
+        assertArrayEquals(new long[]{64, 64}, w.shape());
+        assertArrayEquals(new float[]{0.5f}, w.outputScale(), 0f);
+        assertArrayEquals(new float[]{2f}, w.inputScale(), 0f);
     }
 
     @Test

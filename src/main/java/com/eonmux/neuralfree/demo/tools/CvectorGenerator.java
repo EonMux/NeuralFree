@@ -40,12 +40,12 @@ import java.util.Properties;
 import java.util.SplittableRandom;
 
 /**
- * {@code nftool cvector}: the cvector-generator (PARITY.md WP LR-4, llama.cpp {@code tools/cvector-generator}): the
+ * {@code nftool cvector}: the cvector-generator (llama.cpp {@code tools/cvector-generator}): the
  * control-vector training data of the engine.
  *
- * <p>LR-4 owns the data side TL-4 drives; the serving loop that opens a model, tokenizes the prompt entries with their
+ * <p>The class is the data side; the serving loop that opens a model, tokenizes the prompt entries with their
  * pad token, prefill rows and drives a tap per side (llama.cpp {@code get_hidden_layers} over each pair,
- * cvector-generator.cpp:344-352, over the padded pair of {@code tokenized_prompt}) is TL-4's. This class holds
+ * cvector-generator.cpp:344-352, over the padded pair of {@code tokenized_prompt}) is {@link #run}'s. This class holds
  * everything around that loop:
  * <ul>
  *   <li>{@link #entries}: the positive and negative prompt files, one entry per line, empty lines skipped and the
@@ -58,13 +58,13 @@ import java.util.SplittableRandom;
  *       over the forward context's hidden tap — tap point {@code L} is the residual stream entering layer {@code L},
  *       so the rows that arrive under {@code L} leave layer {@code L - 1}, exactly llama.cpp's layer-input taps; fed on
  *       the GPU through {@link EventTap}, an {@link ExecutionObserver} of {@code Stage.LAYER} ends, which sits in the
- *       backend's declared {@link Observers} (§5.5.1 O-1 step 3, so no prompt row of any request is skipped by a reuse
+ *       backend's declared {@link Observers} (so no prompt row of any request is skipped by a reuse
  *       path) and reads the layer result slot between enqueues, the profiler's licence.</li>
  *   <li>{@link #train}: one direction per collected layer — the top principal component of the layer's diff rows by
  *       power iteration ({@code Pca.component}: iterate {@code v = (X^T X) v}, normalized by the vector's Euclidean
  *       norm, stop under the tolerance, llama.cpp pca.hpp) or the rows' mean ({@code Mean.of}, llama.cpp mean.hpp: the
  *       mean, then normalized to unit length).</li>
- *   <li>{@link #export}: the GGUF through GW-1's write path ({@link GgufTensorSink} and {@link GgufEncoder}, the exact
+ *   <li>{@link #export}: the GGUF through {@code GgufWriter}'s write path ({@link GgufTensorSink} and {@link GgufEncoder}, the exact
  *       bytes {@code GgufWriter} routes its exports through): {@code general.architecture = controlvector}, {@code
  *       controlvector.model_hint}, {@code controlvector.layer_count} and {@code general.alignment}, and the directions
  *       as F32 tensors {@code direction.<i + 1>} in collected order — the llama.cpp {@code export_gguf} key set and
@@ -76,7 +76,7 @@ import java.util.SplittableRandom;
  * where llama.cpp seeds with {@code time(0)}; the PCA sign ambiguity llama.cpp documents unresolved stays unresolved
  * (pca.hpp: "The output vector is randomly inverted"). The serving loop ({@link #generate}) opens the model on the
  * CPU engine, whose hidden tap feeds {@link HiddenDiffTap}; the GPU event-tap route of {@link EventTap} stays open
- * (GAPS.md).</p>
+ * beside it.</p>
  */
 public final class CvectorGenerator {
 
@@ -597,7 +597,7 @@ public final class CvectorGenerator {
      * The collected per-layer differences of the prompt pairs (llama.cpp {@code callback_data} and
      * {@code train_context}). One pair is {@link #beginPair()}, a positive side then a negative side of tap chunks,
      * and {@link #endPair()}; {@link #train(Differences, Options)} reduces the collected rows afterwards. Mutable,
-     * owned by the thread that drives the taps (the forward engine thread, §3.3).
+     * owned by the thread that drives the taps (the forward engine thread).
      */
     public static final class Differences {
 
@@ -621,7 +621,7 @@ public final class CvectorGenerator {
 
         /**
          * A collector over tracked graph layers {@code layers} (ascending; llama.cpp tracks the layer outputs whose
-         * {@code l_out} node fires — one per decoder layer except the last; TL-4 passes that list) of rows
+         * {@code l_out} node fires — one per decoder layer except the last; {@code run} passes that list) of rows
          * {@code width} floats wide.
          */
         public Differences(int[] layers, int width) {
@@ -1146,7 +1146,7 @@ public final class CvectorGenerator {
     // ------------------------------------------------------------------ the export
 
     /**
-     * Writes {@code directions} (the {@link #train} result, per tracked layer) to the GGUF at {@code out}, GW-1's write
+     * Writes {@code directions} (the {@link #train} result, per tracked layer) to the GGUF at {@code out}, the {@code GgufWriter} write
      * path ({@link GgufTensorSink}/{@link GgufEncoder}): the metadata keys of llama.cpp {@code export_gguf},
      * {@code general.architecture = controlvector}, {@code controlvector.model_hint}, {@code
      * controlvector.layer_count} and {@code general.alignment}, then each direction as the F32 one-D tensor {@code

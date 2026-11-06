@@ -5,7 +5,7 @@ import com.eonmux.neuralfree.gguf.testutil.SyntheticHf;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-MS part B converter classes: {@code MimoV2Model} (mimo.py:18-403, the FP8
+ * Synthetic checkpoints of the converter classes: {@code MimoV2Model} (mimo.py:18-403, the FP8
  * qkv dequant and TP regroup, the hybrid attention pattern) and {@code BeamModel} (beam.py:14-141, the layer
  * types and the per-head gate bias). Two layers, a hidden size of 8, two query heads, one key/value head and
  * the checkpoint's real names and config keys.

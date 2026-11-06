@@ -279,3 +279,97 @@ NF_KERNEL void LLM_MulRowScale(
     const uint c = idx % (uint)row_len;
     x[idx] = x[idx] * scale[scale_len == 1 ? 0u : c];
 }
+
+/* ADD or SCALED residual combination of one element, as LLM_ResidualMix modes 0 and 1: a + c, a + s*c. */
+NF_INLINE float nf_rmn_mix(float a, float c, int mix_mode, float s) {
+    return mix_mode == NF_MIX_SCALED ? a + s * c : a + c;
+}
+
+/*
+ * The residual combination of LLM_ResidualMix (modes ADD and SCALED) and the row norm of LLM_RowNorm in
+ * one workgroup per row: row r of the residual stream is rewritten with x = mix(x, addend) at
+ * x[x_off + r*row_len], and its norm is written to y[y_off + r*row_len] with the same modes, scale, weight
+ * and bias as LLM_RowNorm. A layer that adds a branch to the stream and normalizes the sum therefore
+ * needs one launch instead of the residual mix's and the norm's. x and y must not overlap; addend may
+ * coincide with neither. Every element is written by the work-item that read it, so the reductions only
+ * need the workgroup barriers of nf_wg_sum.
+ * Dispatch: global = {n_rows * L}, local = {L}; workgroup r handles row r.
+ */
+NF_KERNEL void LLM_ResidualMixNorm(
+    const int n_rows,
+    const int row_len,
+    const int mode,
+    const float eps,
+    const int flags,
+    const int w_rows,
+    const int mix_mode,
+    const float mix_s,
+    const int x_off,
+    const int add_off,
+    const int y_off,
+    NF_GLOBAL float* x,
+    NF_GLOBAL const float* NF_RESTRICT addend,
+    NF_GLOBAL const float* NF_RESTRICT w,
+    NF_GLOBAL const float* NF_RESTRICT b,
+    NF_GLOBAL float* y)
+{
+    const int row = get_group_id(0);
+    if (row >= n_rows) return;
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    NF_LOCAL float partial[LLM_DIMX];
+
+    const nf_i64 xb = (nf_i64)x_off + (nf_i64)row * row_len;
+    const nf_i64 ab = (nf_i64)add_off + (nf_i64)row * row_len;
+    const nf_i64 yb = (nf_i64)y_off + (nf_i64)row * row_len;
+    const float n = (float)row_len;
+
+    float sum = 0.0f;
+    float ss = 0.0f;
+    for (int i = lid; i < row_len; i += lsize) {
+        const float v = nf_rmn_mix(x[xb + i], addend[ab + i], mix_mode, mix_s);
+        x[xb + i] = v;
+        sum += v;
+        ss += v * v;
+    }
+
+    float mean = 0.0f;
+    float scale;
+    float post = 1.0f;
+    if (mode == NF_NORM_EXT_LAYER) {
+        mean = nf_wg_sum(partial, sum) / n;
+        float dev = 0.0f;
+        for (int i = lid; i < row_len; i += lsize) {
+            const float d = x[xb + i] - mean;
+            dev += d * d;
+        }
+        scale = rsqrt(nf_wg_sum(partial, dev) / n + eps);
+    } else {
+        const float tss = nf_wg_sum(partial, ss);
+        if (mode == NF_NORM_EXT_L2_CLAMP) {
+            scale = 1.0f / fmax(sqrt(tss), eps);
+        } else if (mode == NF_NORM_EXT_L2_GDN) {
+            scale = rsqrt(tss / n + eps / n);
+            post = rsqrt(n);
+        } else {
+            scale = rsqrt(tss / n + eps);
+        }
+    }
+
+    const int has_w = (flags & NF_NORM_EXT_HAS_W) != 0;
+    const int has_b = (flags & NF_NORM_EXT_HAS_B) != 0;
+    const nf_i64 wb = (nf_i64)(w_rows > 1 ? row % w_rows : 0) * row_len;
+    for (int i = lid; i < row_len; i += lsize) {
+        float v = (x[xb + i] - mean) * scale;
+        if (mode == NF_NORM_EXT_L2_GDN) {
+            v *= post;
+        }
+        if (has_w) {
+            v *= w[wb + i];
+        }
+        if (has_b) {
+            v += b[wb + i];
+        }
+        y[yb + i] = v;
+    }
+}

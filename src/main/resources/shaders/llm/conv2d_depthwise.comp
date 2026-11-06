@@ -1,0 +1,65 @@
+/* conv2d_depthwise.comp - LLM_Conv2dDepthwise, the depthwise 2D convolution of the convolutional vision
+ * encoders. GLSL twin of kernels/llm/vision.cl (the semantic reference). Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i W, i H, i OW, i OH, i C, i K, i SY, i SX, i PY, i PX, i x_off, i y_off,
+ *    R float x, R float w, R float b, W float y)
+ *     x[(iy*W + ix)*C + c], w[(c*K + ky)*K + kx], y[(oy*OW + ox)*C + c]:
+ *     y = (sum_{ky, kx asc, oy*SY + ky - PY and ox*SX + kx - PX inside} w[...] * x[...]) + b[c],
+ *     taps outside the map reading zero (ggml_conv_2d_dw).
+ *
+ * Dispatch: 1-D, one invocation per output element, local = {L, 1, 1}, global = OW*OH*C rounded up to L;
+ * folded group counts are recovered by nf_global_id(). No barriers.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) restrict readonly buffer NfDwX { float x_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfDwW { float w_in[]; };
+layout(std430, binding = 2) restrict readonly buffer NfDwB { float b_in[]; };
+layout(std430, binding = 3) restrict writeonly buffer NfDwY { float y_out[]; };
+
+layout(push_constant) uniform NfDwParams {
+    int W;
+    int H;
+    int OW;
+    int OH;
+    int C;
+    int K;
+    int SY;
+    int SX;
+    int PY;
+    int PX;
+    int x_off;
+    int y_off;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.OW) * uint(pc.OH) * uint(pc.C)) {
+        return;
+    }
+    const uint c = idx % uint(pc.C);
+    const uint rest = idx / uint(pc.C);
+    const uint ox = rest % uint(pc.OW);
+    const uint oy = rest / uint(pc.OW);
+    const uint w_row = c * uint(pc.K) * uint(pc.K);
+    float acc = 0.0;
+    for (int ky = 0; ky < pc.K; ++ky) {
+        const int iy = int(oy) * pc.SY + ky - pc.PY;
+        if (iy < 0 || iy >= pc.H) {
+            continue;
+        }
+        for (int kx = 0; kx < pc.K; ++kx) {
+            const int ix = int(ox) * pc.SX + kx - pc.PX;
+            if (ix < 0 || ix >= pc.W) {
+                continue;
+            }
+            acc += w_in[w_row + uint(ky * pc.K + kx)]
+                    * x_in[uint(pc.x_off) + (uint(iy) * uint(pc.W) + uint(ix)) * uint(pc.C) + c];
+        }
+    }
+    y_out[uint(pc.y_off) + idx] = acc + b_in[c];
+}

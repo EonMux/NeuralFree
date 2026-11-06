@@ -1,0 +1,196 @@
+/* penalties.comp - per-row pre-top-k logit edits of a truncated sampler chain. GLSL twin of
+ * LLM_LogitsPrefilter in kernels/llm/sampling_topk.cl. Requires: common/nf_common.glsl.
+ *
+ * Variants row:
+ *     LLM_LogitsPrefilter	penalties.comp
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i vocab, i n_rows, RW float logits, R int meta, R float fcfg, R int bias_ids, R float bias_vals,
+ *    R int tokens, R int br_meta, R int br_tails)
+ * Applies the fixed logit-bias stage, the repetition/presence/frequency penalties and DRY to every row's
+ * whole vocabulary row in the chain's order, before the row top-k readout.
+ *
+ * Dispatch: global = {n_rows * L}, local = {L, 1, 1}, L a power of two <= LLM_DIMX; n_rows stays far below
+ * maxComputeWorkGroupCount[0], so the dispatch is never folded and nf_wg_id() is the row. The DRY window is
+ * at most NF_PF_DRY_MAX tokens.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) buffer NfPfLogits { float logits[]; };
+layout(std430, binding = 1) readonly buffer NfPfMeta { int meta[]; };
+layout(std430, binding = 2) readonly buffer NfPfCfg { float fcfg[]; };
+layout(std430, binding = 3) readonly buffer NfPfBiasIds { int bias_ids[]; };
+layout(std430, binding = 4) readonly buffer NfPfBiasVals { float bias_vals[]; };
+layout(std430, binding = 5) readonly buffer NfPfTokens { int tokens[]; };
+layout(std430, binding = 6) readonly buffer NfPfBrMeta { int br_meta[]; };
+layout(std430, binding = 7) readonly buffer NfPfBrTails { int br_tails[]; };
+layout(push_constant) uniform NfPfParams { int vocab; int n_rows; } pc;
+
+#define NF_PF_META     16
+#define NF_PF_FCFG      8
+#define NF_PF_BR        4
+#define NF_PF_DRY_MAX 256
+
+shared int nf_pf_lens[NF_PF_DRY_MAX];
+shared int nf_pf_rep;
+
+/* Penalties over the row's distinct window tokens: every distinct token once, with its window count. */
+void nf_pf_penalties(const int lid, const int lsize, const int logit_off, const int tok_off, const int count,
+                     const float repeat, const float frequency, const float presence) {
+    for (int i = lid; i < count; i += lsize) {
+        const int id = tokens[tok_off + i * 2];
+        const int n = tokens[tok_off + i * 2 + 1];
+        float l = logits[logit_off + id];
+        l = l <= 0.0f ? l * repeat : l / repeat;
+        logits[logit_off + id] = l - (float(n) * frequency + presence);
+    }
+    barrier();
+}
+
+/* True when one of the token's restart sequences carries an empty tail. */
+bool nf_pf_single_token_breaker(const int br_off, const int br_cnt, const int token) {
+    for (int b = 0; b < br_cnt; b++) {
+        if (br_meta[(br_off + b) * NF_PF_BR] == token && br_meta[(br_off + b) * NF_PF_BR + 2] == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* DRY over the row's window (rat(i) = window[N - 1 - i]). */
+void nf_pf_dry(const int lid, const int lsize, const int logit_off, const int tok_off, const int n_tok,
+               const int allowed, const int br_off, const int br_cnt,
+               const float multiplier, const float base) {
+    if (lid == 0) {
+        int limit = n_tok;
+        for (int i = 0; i < n_tok; i++) {
+            const int head = tokens[tok_off + (n_tok - 1 - i)];
+            int longest = -1;
+            for (int b = 0; b < br_cnt; b++) {
+                const int bm = (br_off + b) * NF_PF_BR;
+                if (br_meta[bm] != head) {
+                    continue;
+                }
+                const int tail_len = br_meta[bm + 2];
+                if (tail_len > longest && tail_len <= i) {
+                    const int tail_off = br_meta[bm + 1];
+                    bool match = true;
+                    for (int o = 0; o < tail_len; o++) {
+                        if (br_tails[tail_off + o] != tokens[tok_off + (n_tok - 1 - (i - o - 1))]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        longest = tail_len;
+                    }
+                }
+            }
+            if (longest >= 0) {
+                limit = i - longest;
+                break;
+            }
+        }
+        nf_pf_rep = limit;
+    }
+    barrier();
+
+    for (int k = 1 + lid; k < n_tok; k += lsize) {
+        const int lim = n_tok - k;
+        int z = 0;
+        while (z < lim && tokens[tok_off + (n_tok - 1 - z)] == tokens[tok_off + (n_tok - 1 - (z + k))]) {
+            z++;
+        }
+        if (z > nf_pf_rep) {
+            z = nf_pf_rep;
+        }
+        nf_pf_lens[k] = z;
+    }
+    barrier();
+
+    if (lid == 0) {
+        const int limit = nf_pf_rep;
+        if (limit >= allowed) {
+            float max_exponent_float = 0.0f;
+            if (base > 1.000001f) {
+                max_exponent_float = 88.7228391f / log(base);
+            }
+            const int max_exponent = max_exponent_float >= 2147483648.0f ? 2147483647
+                    : (max_exponent_float > 0.0f ? int(max_exponent_float) : 0);
+            for (int k = 1; k < n_tok; k++) {
+                const int len = nf_pf_lens[k];
+                if (len < allowed) {
+                    continue;
+                }
+                const int token = tokens[tok_off + (n_tok - k)];
+                bool is_max = true;
+                for (int k2 = 1; k2 < n_tok; k2++) {
+                    if (k2 != k && tokens[tok_off + (n_tok - k2)] == token
+                            && (nf_pf_lens[k2] > len || (nf_pf_lens[k2] == len && k2 < k))) {
+                        is_max = false;
+                        break;
+                    }
+                }
+                if (!is_max || nf_pf_single_token_breaker(br_off, br_cnt, token)) {
+                    continue;
+                }
+                int repeat_exp = len - allowed;
+                if (max_exponent > 0 && repeat_exp > max_exponent) {
+                    repeat_exp = max_exponent;
+                }
+                logits[logit_off + token] -= multiplier * pow(base, float(repeat_exp));
+            }
+        }
+    }
+    barrier();
+}
+
+void main() {
+    const int row = int(gl_WorkGroupID.x);
+    if (row >= pc.n_rows) {
+        return;
+    }
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int vocab = pc.vocab;
+    const int base_off = row * vocab;
+    const int mb = row * NF_PF_META;
+    const int fb = row * NF_PF_FCFG;
+
+    const int bias_off = meta[mb + 0];
+    const int bias_cnt = meta[mb + 1];
+    const int pen_off = meta[mb + 2];
+    const int pen_cnt = meta[mb + 3];
+    const int pen_active = meta[mb + 4];
+    const int dry_off = meta[mb + 5];
+    const int dry_cnt = meta[mb + 6];
+    const int dry_allowed = meta[mb + 7];
+    const int dry_active = meta[mb + 8];
+    const int br_off = meta[mb + 9];
+    const int br_cnt = meta[mb + 10];
+    const int penalties_first = meta[mb + 11];
+
+    for (int i = lid; i < bias_cnt; i += lsize) {
+        const int id = bias_ids[bias_off + i];
+        if (id < 0 || id >= vocab) {
+            continue;
+        }
+        const float b = bias_vals[bias_off + i];
+        logits[base_off + id] = isnan(b) ? -NF_INF : logits[base_off + id] + b;
+    }
+    barrier();
+
+    if (pen_active != 0 && penalties_first != 0) {
+        nf_pf_penalties(lid, lsize, base_off, pen_off, pen_cnt, fcfg[fb + 0], fcfg[fb + 1], fcfg[fb + 2]);
+    }
+    if (dry_active != 0) {
+        nf_pf_dry(lid, lsize, base_off, dry_off, dry_cnt, dry_allowed, br_off, br_cnt,
+                fcfg[fb + 3], fcfg[fb + 4]);
+    }
+    if (pen_active != 0 && penalties_first == 0) {
+        nf_pf_penalties(lid, lsize, base_off, pen_off, pen_cnt, fcfg[fb + 0], fcfg[fb + 1], fcfg[fb + 2]);
+    }
+}

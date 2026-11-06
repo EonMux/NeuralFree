@@ -11,5 +11,7 @@ public enum StopReason {
     /** The context was full and could not be shifted. */
     CONTEXT_FULL,
     /** The request's cancellation hook asked generation to stop. */
-    CANCELLED
+    CANCELLED,
+    /** The output ended in a token pattern repeated as the request's {@link RepetitionDetection} describes. */
+    REPETITION
 }

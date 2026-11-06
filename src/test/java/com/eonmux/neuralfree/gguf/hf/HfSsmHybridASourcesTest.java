@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The first-half HK-H1 hybrid fixtures ({@code FalconH1ForCausalLM}, {@code JambaForCausalLM},
+ * The first-half hybrid fixtures ({@code FalconH1ForCausalLM}, {@code JambaForCausalLM},
  * {@code Plamo2ForCausalLM}, {@code BambaForCausalLM}, {@code NemotronHForCausalLM} and
  * {@code NemotronHPuzzleForCausalLM}) build through the registered entries of
  * {@code HfArchTableHybridSsm}: {@link ModelSpecBuilder} succeeds and every catalog tensor is claimed

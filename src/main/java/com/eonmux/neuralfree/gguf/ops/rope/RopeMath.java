@@ -68,6 +68,166 @@ public final class RopeMath {
         return new float[]{Math.max(0f, start), Math.min(nDims - 1, end)};
     }
 
+    // ------------------------------------------------------------------ NTK scaling
+
+    /**
+     * RoPE base of vLLM's dynamic NTK scaling with a scaling factor
+     * ({@code DynamicNTKScalingRotaryEmbedding._compute_cos_sin_cache}): {@code base * ratio^(nDims / (nDims - 2))}
+     * with {@code ratio = factor * extendedContext / trainedContext - (factor - 1)}. The engine calls it with the
+     * model's context length as {@code extendedContext}, so a context length equal to the trained length leaves the
+     * base unchanged.
+     *
+     * @param base             trained frequency base ({@code rope_theta})
+     * @param factor           scaling factor of the {@code dynamic} rope type
+     * @param extendedContext  context length the factors are evaluated at ({@code max_position_embeddings})
+     * @param trainedContext   length the model trained on ({@code max_trained_positions}
+     *                         / {@code original_max_position_embeddings})
+     * @param nDims            rotary width of the layer
+     * @throws IllegalArgumentException for a non-positive or infinite value, or a dim count of 2 or less
+     */
+    public static float dynamicNtkBase(float base, float factor, int extendedContext, int trainedContext, int nDims) {
+        if (!(factor > 0f) || Float.isInfinite(factor)) {
+            throw new IllegalArgumentException("dynamic NTK scaling needs a positive finite factor, got " + factor);
+        }
+        if (extendedContext <= 0 || trainedContext <= 0) {
+            throw new IllegalArgumentException("dynamic NTK scaling needs positive context lengths, got "
+                    + extendedContext + " / " + trainedContext);
+        }
+        final double ratio = (double) factor * extendedContext / trainedContext - (factor - 1.0);
+        return ntkScaledBase(base, ratio, nDims, "dynamic NTK scaling");
+    }
+
+    /**
+     * RoPE base of vLLM's dynamic NTK scaling with an alpha
+     * ({@code DynamicNTKAlphaRotaryEmbedding._compute_cos_sin_cache}): {@code base * alpha^(nDims / (nDims - 2))}.
+     *
+     * @param alpha  NTK-aware alpha of the {@code dynamic} rope type (HunYuan, XDRoPE)
+     * @param nDims  rotary width of the layer
+     * @throws IllegalArgumentException for a non-positive or infinite alpha, or a dim count of 2 or less
+     */
+    public static float dynamicAlphaBase(float base, float alpha, int nDims) {
+        if (!(alpha > 0f) || Float.isInfinite(alpha)) {
+            throw new IllegalArgumentException("dynamic NTK alpha must be positive and finite, got " + alpha);
+        }
+        return ntkScaledBase(base, alpha, nDims, "dynamic NTK alpha");
+    }
+
+    /**
+     * Per-pair angle divisors of vLLM's fixed and mixed NTK scaling
+     * ({@code NTKScalingRotaryEmbedding._compute_inv_freq}, rotary_embedding/ntk_scaling_rope.py), so that a pair's
+     * angle is {@code position * theta_scale^i / divisor[i]}:
+     * <ul>
+     *   <li>fixed ({@code mixedB} not finite): the base is multiplied by {@code factor} and every frequency is
+     *       divided by {@code factor^(2/nDims)}, so {@code divisor[i] = factor^(2(i+1)/nDims)};</li>
+     *   <li>mixed ({@code mixedB} finite): the base is unchanged and every frequency is divided by
+     *       {@code lambda_(i+1) = exp(a * (i+1)^mixedB)} with {@code a = ln(factor) / (nDims/2)^mixedB}.</li>
+     * </ul>
+     *
+     * @param factor the scaling factor ({@code rope_parameters.factor})
+     * @param mixedB the mixed exponent {@code mixed_b}, or {@link Float#NaN} for the fixed form
+     * @param nDims  rotary width of the layer
+     * @return {@code nDims / 2} divisors, indexed by pair
+     * @throws IllegalArgumentException for a non-positive or infinite factor, a dim count of 2 or less, or an
+     *                                  infinite mixed exponent
+     */
+    public static float[] ntkFactors(float factor, float mixedB, int nDims) {
+        if (!(factor > 0f) || Float.isInfinite(factor)) {
+            throw new IllegalArgumentException("NTK scaling needs a positive finite factor, got " + factor);
+        }
+        if (nDims <= 2 || nDims % 2 != 0) {
+            throw new IllegalArgumentException("NTK scaling needs an even rotary width above 2, got " + nDims);
+        }
+        final int pairs = nDims / 2;
+        final float[] out = new float[pairs];
+        if (Float.isNaN(mixedB)) {
+            final double exponent = 2.0 / nDims;
+            for (int i = 0; i < pairs; i++) {
+                out[i] = (float) Math.pow(factor, exponent * (i + 1));
+            }
+            return out;
+        }
+        if (Float.isInfinite(mixedB)) {
+            throw new IllegalArgumentException("mixed NTK scaling needs a finite mixed_b, got " + mixedB);
+        }
+        final double a = Math.log(factor) / Math.pow(pairs, mixedB);
+        for (int i = 0; i < pairs; i++) {
+            out[i] = (float) Math.exp(a * Math.pow(i + 1, mixedB));
+        }
+        return out;
+    }
+
+    /**
+     * Frequencies the Fourier position embedding projects ({@code FourierRotaryEmbedding._compute_inv_freq}):
+     * {@code 1 / base^(2i/rotaryDim)} for {@code i < rotaryDim/2}, keeping the first {@code numInvFreq} when that is
+     * positive, else the ones above {@code 2 pi / maxPositions}.
+     *
+     * @param base          frequency base ({@code rope_theta})
+     * @param rotaryDim     rotary width the full frequency list is derived from
+     * @param numInvFreq    number of frequencies kept, or 0 to select by the longest period
+     * @param maxPositions  model context length used by the selection
+     * @return the kept frequencies, in increasing pair order
+     * @throws IllegalArgumentException for a non-positive base, an even or non-positive width, an out-of-range
+     *                                  count, a non-positive context length, or a selection that keeps nothing
+     */
+    public static float[] fopeInvFreq(float base, int rotaryDim, int numInvFreq, int maxPositions) {
+        if (!(base > 0f) || Float.isInfinite(base)) {
+            throw new IllegalArgumentException("FoPE needs a positive finite base, got " + base);
+        }
+        if (rotaryDim <= 0 || rotaryDim % 2 != 0) {
+            throw new IllegalArgumentException("FoPE needs an even positive rotary width, got " + rotaryDim);
+        }
+        final int half = rotaryDim / 2;
+        if (numInvFreq < 0 || numInvFreq > half) {
+            throw new IllegalArgumentException("FoPE num_inv_freq must be in [0, " + half + "], got " + numInvFreq);
+        }
+        if (maxPositions <= 0) {
+            throw new IllegalArgumentException("FoPE needs a positive context length, got " + maxPositions);
+        }
+        final float threshold = (float) (2.0 * Math.PI / maxPositions);
+        final float[] full = new float[half];
+        for (int i = 0; i < half; i++) {
+            full[i] = (float) Math.pow(base, -2.0 * i / rotaryDim);
+        }
+        if (numInvFreq > 0) {
+            return java.util.Arrays.copyOf(full, numInvFreq);
+        }
+        final int[] kept = new int[half];
+        int n = 0;
+        for (int i = 0; i < half; i++) {
+            if (full[i] > threshold) {
+                kept[n++] = i;
+            }
+        }
+        if (n == 0) {
+            throw new IllegalArgumentException("FoPE keeps no frequency above 2 pi / " + maxPositions
+                    + " for base " + base + " and rotary width " + rotaryDim);
+        }
+        final float[] out = new float[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = full[kept[i]];
+        }
+        return out;
+    }
+
+    /** {@code base * multiplier^(nDims / (nDims - 2))}, the NTK-aware base growth of a rotary width. */
+    private static float ntkScaledBase(float base, double multiplier, int nDims, String what) {
+        if (!(base > 0f)) {
+            throw new IllegalArgumentException(what + " needs a positive frequency base, got " + base);
+        }
+        if (nDims <= 2) {
+            throw new IllegalArgumentException(what + " needs a rotary width above 2, got " + nDims);
+        }
+        if (!(multiplier > 0.0) || Double.isInfinite(multiplier)) {
+            throw new IllegalArgumentException(what + " needs a positive finite scale, got " + multiplier);
+        }
+        final double scaled = base * Math.pow(multiplier, nDims / (double) (nDims - 2));
+        if (!(scaled > 0.0) || Double.isInfinite(scaled)) {
+            throw new IllegalArgumentException(what + " produced a base outside the positive finite range: "
+                    + scaled);
+        }
+        return (float) scaled;
+    }
+
     // ------------------------------------------------------------------ YaRN rotation
 
     /** {@code rope_yarn_ramp}: {@code 1 - min(1, max(0, (i - lo) / max(0.001, hi - lo)))} for pair index {@code i}. */
@@ -177,9 +337,12 @@ public final class RopeMath {
         return type == RopeType.MROPE || type == RopeType.IMROPE || type == RopeType.VISION;
     }
 
-    /** Positions per token in the kernel's position buffer: 4 for multi-section modes, else 1. */
+    /**
+     * Positions per token in the kernel's position buffer: 4 for multi-section modes, else 1; the rope-less NONE
+     * takes the single position its layers (if any) store, without a rotation.
+     */
     public static int positionsPerToken(RopeType type) {
-        return multiSection(requireRotary(type)) ? MropeTextPositions.SECTIONS : 1;
+        return multiSection(Objects.requireNonNull(type, "type")) ? MropeTextPositions.SECTIONS : 1;
     }
 
     /** Rotation pairs per head: {@code nDims} for VISION, {@code nDims / 2} otherwise. */

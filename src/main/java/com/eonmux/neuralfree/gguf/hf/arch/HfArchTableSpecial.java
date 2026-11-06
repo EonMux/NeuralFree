@@ -16,10 +16,10 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Hugging Face architecture entries of Appendix A table HK-SP, the encoders and embedding models
+ * Hugging Face architecture entries, the encoders and embedding models
  * (LC/conversion/{bert,clef,gemma,llama,t5,vllm_decision2}.py): the BERT family with its RoBERTa/XLM-R
- * variant rows, the ModernBert/Nomic/Neo/Euro/Jina classes, the EmbeddingGemma embedders on the HK-B2 hooks,
- * the Qwen3 decision heads and the T5 classes. {@code LlamaEmbedNemotronModel} composes the HK-0 Llama hooks
+ * variant rows, the ModernBert/Nomic/Neo/Euro/Jina classes, the EmbeddingGemma embedders on the Gemma hooks,
+ * the Qwen3 decision heads and the T5 classes. {@code LlamaEmbedNemotronModel} composes the Llama hooks
  * on the LLAMA_EMBED arch. {@link HfArchRegistry} merges this table with the other tables; a Hugging Face
  * name appears in exactly one table per {@link HfArchEntry.Kind}.
  */
@@ -41,7 +41,7 @@ final class HfArchTableSpecial {
                                 "DistilBertModel"), HfArchResolver.of(Arch.BERT),
                         HfBertVariantHooks::distilMeta, HfBertHooks::tensors, HfBertVariantHooks::distilVocab)
                         .withNameFilter(HfBertVariantHooks::distilFilter),
-                // EmbeddingGemma2Model (gemma.py:815): GEMMA_EMBEDDING2 on the HK-B2 Gemma 4 hooks
+                // EmbeddingGemma2Model (gemma.py:815): GEMMA_EMBEDDING2 on the Gemma 4 hooks
                 HfArchEntry.of(Collections.singletonList("EmbeddingGemma2Model"),
                                 HfArchResolver.of(Arch.GEMMA_EMBEDDING2), HfEncoderHooks::embeddingGemma2Meta,
                                 HfGemma4Hooks::tensors, HfGemmaHooks::vocab)
@@ -53,7 +53,7 @@ final class HfArchTableSpecial {
                                 HfArchResolver.of(Arch.EUROBERT), HfBertVariantHooks::euroMeta,
                                 HfBertHooks::tensors, HfBertVariantHooks::euroVocab)
                         .withNameFilter(HfBertVariantHooks::euroFilter),
-                // EmbeddingGemma (gemma.py:186): GEMMA_EMBEDDING on the HK-B2 Gemma hooks
+                // EmbeddingGemma (gemma.py:186): GEMMA_EMBEDDING on the Gemma hooks
                 HfArchEntry.of(Collections.singletonList("Gemma3TextModel"),
                                 HfArchResolver.of(Arch.GEMMA_EMBEDDING), HfEncoderHooks::embeddingGemmaMeta,
                                 HfGemmaHooks::tensors, HfGemmaHooks::vocab)
@@ -63,7 +63,7 @@ final class HfArchTableSpecial {
                                 HfArchResolver.of(Arch.JINA_BERT_V2), HfBertHooks::meta, HfBertHooks::tensors,
                                 HfBertVariantHooks::jinaV2Vocab)
                         .withNameFilter(HfBertHooks.FILTER),
-                // LlamaEmbedNemotronModel (llama.py:422): LLAMA_EMBED on the HK-0 Llama hooks
+                // LlamaEmbedNemotronModel (llama.py:422): LLAMA_EMBED on the Llama hooks
                 HfArchEntry.of(Collections.singletonList("LlamaBidirectionalModel"),
                                 HfArchResolver.of(Arch.LLAMA_EMBED), HfLlamaHooks::meta, HfLlamaHooks::tensors,
                                 HfLlamaHooks::vocab)
@@ -106,7 +106,7 @@ final class HfArchTableSpecial {
                 // T5EncoderModel (t5.py:158): T5ENCODER
                 HfArchEntry.of(Collections.singletonList("T5EncoderModel"), HfArchResolver.of(Arch.T5ENCODER),
                                 HfT5Hooks::encoderMeta, HfT5Hooks::encoderTensors, HfT5Hooks::vocab),
-                // VllmDecision2Model (vllm_decision2.py:38): VLLM_DECISION2 on the HK-B1 Qwen3 hooks
+                // VllmDecision2Model (vllm_decision2.py:38): VLLM_DECISION2 on the Qwen3 hooks
                 HfArchEntry.of(Collections.singletonList("VllmDecision2Model"),
                                 HfArchResolver.of(Arch.VLLM_DECISION2), HfEncoderHooks::vllmDecision2Meta,
                                 HfEncoderHooks::vllmDecision2Tensors, HfQwenHooks::qwen3Vocab)
@@ -114,8 +114,9 @@ final class HfArchTableSpecial {
                         .withIndex(HfEncoderHooks::vllmDecision2Index)
                         .withForceType(HfEncoderHooks::decisionHeadForceType),
                 // ClefModel (clef.py:34): CLEF on the Qwen3.5 metadata hooks; a Clef checkpoint keeps the
-                // tokenizer of the Qwen family, whose set_vocab is HfQwenHooks::qwen3Vocab
-                HfArchEntry.of(Collections.singletonList("ClefModel"), HfArchResolver.of(Arch.CLEF),
+                // tokenizer of the Qwen family, whose set_vocab is HfQwenHooks::qwen3Vocab. vLLM names the same
+                // checkpoint ClefFlashForJointSchema (clef_flash.py).
+                HfArchEntry.of(Arrays.asList("ClefModel", HfEncoderHooks.CLEF_FLASH), HfArchResolver.of(Arch.CLEF),
                                 HfEncoderHooks::clefMeta, HfEncoderHooks::clefTensors, HfQwenHooks::qwen3Vocab)
                         .withConfigFixup(HfEncoderHooks::clefFixup)
                         .withIndex(HfEncoderHooks::clefIndex)

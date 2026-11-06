@@ -9,7 +9,7 @@ import java.util.Arrays;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 
-/** The named transforms of the HK-D1 part E hooks that run without a load: the OpenELM divisible FFN widths and
+/** The named transforms of {@code HfDenseClassicHooksE} that run without a load: the OpenELM divisible FFN widths and
  *  the GraniteSwitch derived weight-layer block count. The per-hook transforms run through the sources tests. */
 public class HfDenseClassicHooksETest {
 

@@ -35,6 +35,7 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Random;
 
 import static org.junit.Assert.assertEquals;
@@ -63,6 +64,10 @@ public class CpuMoeFfnTest {
         final int nEmbd;
 
         Fixture(float combineScale) throws IOException {
+            this(combineScale, null);
+        }
+
+        Fixture(float combineScale, MoeExpertHeat heat) throws IOException {
             SyntheticModels.Config config = SyntheticModels.Config.qwen3next().toBuilder().nLayer(1).build();
             this.path = SyntheticModels.qwen3next(config).writeTempFile();
             this.parser = new GGUFFileParser(path.toString());
@@ -86,7 +91,9 @@ public class CpuMoeFfnTest {
                     .memoryKind(MemoryKind.NONE)
                     .build();
             this.weights = CpuWeights.open(parser);
-            this.ctx = CpuForwardContext.builder(spec, weights, CpuScratch.forModel(spec, UBATCH)).build();
+            this.ctx = CpuForwardContext.builder(spec, weights, CpuScratch.forModel(spec, UBATCH))
+                    .heat(heat)
+                    .build();
         }
 
         float[] run(int n, float[] in) {
@@ -209,6 +216,34 @@ public class CpuMoeFfnTest {
             for (int i = 0; i < nx; i++) {
                 assertEquals("[" + i + "]", 0.5f * plain[i], halved[i], 0f);
             }
+        }
+    }
+
+    /** The routed rows of a step count into the context's expert heat, the same experts the reference routes. */
+    @Test
+    public void theRoutedRowsCountIntoTheExpertHeat() throws IOException {
+        try (Fixture f = new Fixture(1.0f, new MoeExpertHeat())) {
+            float[] in = input(f.nEmbd, 2L);
+            f.run(UBATCH, in);
+            float[] logits = new float[UBATCH * N_EXPERT];
+            f.ctx.matVec().matmul(f.tensor(TensorNames.FFN_GATE_INP), in, 0, logits, 0, UBATCH);
+            MoeRouting.Selection sel = MoeRouting.route(MoeRouting.Params.forExperts(f.layer.moe()), logits,
+                    UBATCH, null);
+            int[] expected = new int[N_EXPERT];
+            for (int id : sel.ids()) {
+                expected[id]++;
+            }
+            List<RankedExpert> snapshot = f.ctx.heat().snapshot();
+            int routedExperts = 0;
+            for (int e : expected) {
+                routedExperts += e > 0 ? 1 : 0;
+            }
+            assertEquals("one entry per routed expert of layer 0", routedExperts, snapshot.size());
+            for (RankedExpert entry : snapshot) {
+                assertEquals("layer 0", 0, entry.layer());
+                assertEquals("routed rows of expert " + entry.expert(), expected[entry.expert()], entry.heat());
+            }
+            assertEquals("every routed row counted", UBATCH * K, sel.ids().length);
         }
     }
 }

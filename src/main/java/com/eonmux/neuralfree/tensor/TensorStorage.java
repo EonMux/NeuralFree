@@ -203,6 +203,25 @@ public final class TensorStorage implements AutoCloseable {
         return writeFloats(elementOffset * DType.FLOAT32.byteSize(), src, queue);
     }
 
+    /**
+     * Writes {@code src}, in native byte order, starting {@code elementOffset * 8} bytes past the storage start.
+     *
+     * @throws IllegalArgumentException when the range is outside the storage
+     */
+    public GpuEvent copyFromHostDouble(double[] src, long elementOffset, ComputeQueue queue) {
+        ensureOpen();
+        Objects.requireNonNull(src, "Source array cannot be null");
+        Objects.requireNonNull(queue, "Queue cannot be null");
+        if (elementOffset < 0 || (elementOffset + src.length) * DType.FLOAT64.byteSize() > lengthBytes) {
+            throw new IllegalArgumentException("Source array of " + src.length + " doubles at element "
+                + elementOffset + " exceeds storage capacity (" + lengthBytes + " bytes)");
+        }
+        ByteBuffer bytes = ByteBuffer.allocate(Math.multiplyExact(src.length, DType.FLOAT64.byteSize()))
+            .order(ByteOrder.nativeOrder());
+        bytes.asDoubleBuffer().put(src);
+        return writeBytes(elementOffset * DType.FLOAT64.byteSize(), bytes.array(), queue);
+    }
+
     public TensorStorage slice(long offsetElements, long lengthElements) {
         ensureOpen();
 

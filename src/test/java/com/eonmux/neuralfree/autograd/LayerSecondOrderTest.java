@@ -19,6 +19,7 @@ import com.eonmux.neuralfree.nn.norm.GroupNorm;
 import com.eonmux.neuralfree.nn.norm.LayerNorm;
 import com.eonmux.neuralfree.nn.norm.RMSNorm;
 import com.eonmux.neuralfree.tensor.DType;
+import com.eonmux.neuralfree.tensor.GpuOptimizerOps;
 import com.eonmux.neuralfree.tensor.Shape;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorOps;
@@ -56,9 +57,12 @@ import static org.junit.Assert.fail;
  * reductions, and of conv, pool and norm. <b>Kinks.</b> LeakyReLU and max pooling have kinks; their cases draw the
  * critic input from successive seeds until every LeakyReLU input lies at least {@link #KINK_MARGIN} from zero and every
  * max-pool window's maximum exceeds its runner-up by at least {@link #KINK_MARGIN}, far above what a finite-difference
- * step of {@link #EPSILON} on one parameter element can move them, so no perturbation crosses a kink. The other cases
- * use tanh and smooth pooling and need no margin. Normalization weights start at one and biases at zero, as the modules
- * initialize them; inputs lie in {@code [-1, 1)}.</p>
+ * step of {@link #EPSILON} on one parameter element can move them, so no perturbation crosses a kink. A training-mode
+ * batch norm centers its values, so the batch-norm cases keep its output clear of the LeakyReLU kink by sizing gamma
+ * and beta as {@code VisionGradCheckTest} does ({@link #GAMMA_MIN}, {@link #BETA_FLOOR}), with beta's sign alternating
+ * over the channels so both LeakyReLU slopes are on the penalty's path. The other cases use tanh and
+ * smooth pooling and need no margin. Normalization weights start at one and biases at zero, as the modules initialize
+ * them, except the batch-norm parameters of the kink-free setup.</p>
  */
 @RunWith(Parameterized.class)
 public class LayerSecondOrderTest {
@@ -69,6 +73,15 @@ public class LayerSecondOrderTest {
     private static final float KINK_MARGIN = 0.05f;
     private static final int SEED_ATTEMPTS = 200;
     private static final long MODULE_SEED = 20261023L;
+    /** Batch-norm gamma range of the kink-free setup (the rule of {@code VisionGradCheckTest}). */
+    private static final float GAMMA_MIN = 0.2f;
+    private static final float GAMMA_MAX = 0.3f;
+    /**
+     * Beta floor of the kink-free setup: {@code GAMMA_MAX * sqrt(maxCount - 1)} bounds a training-mode normalized
+     * value for the {@code maxCount = 3 * 4 * 4} values per channel of these critics, so every normalized value
+     * stays at least {@code 0.5} away from zero on the side of its channel's beta, far more than {@link #KINK_MARGIN}.
+     */
+    private static final float BETA_FLOOR = (float) (GAMMA_MAX * Math.sqrt(48 - 1)) + 0.5f;
 
     @Parameterized.Parameters(name = "{0}")
     public static Collection<Object[]> data() {
@@ -365,7 +378,30 @@ public class LayerSecondOrderTest {
     private BatchNorm2d batchNorm2d(int channels) {
         BatchNorm2d norm = new BatchNorm2d(channels);
         norm.initialize(backend);
+        // A training-mode batch norm centers its values, so their scale cannot keep the LeakyReLU input clear of
+        // its kink; gamma and beta sized as in VisionGradCheckTest do.
+        store(norm.weight(), TrainParity.uniform(MODULE_SEED + 11, channels, GAMMA_MIN, GAMMA_MAX));
+        store(norm.bias(), alternatingBeta(channels));
         return norm;
+    }
+
+    /**
+     * Batch-norm betas of magnitude in {@code [BETA_FLOOR, BETA_FLOOR + 0.25)}, positive on even channels and
+     * negative on odd ones, so the LeakyReLU after the norm runs both its unit and its negative slope.
+     */
+    private static float[] alternatingBeta(int channels) {
+        float[] beta = TrainParity.uniform(MODULE_SEED + 12, channels, BETA_FLOOR, BETA_FLOOR + 0.25f);
+        for (int c = 1; c < channels; c += 2) {
+            beta[c] = -beta[c];
+        }
+        return beta;
+    }
+
+    /** Overwrites a parameter's values; an assignment, so it runs under {@code noGrad} (in-place guard). */
+    private static void store(Parameter p, float[] values) {
+        try (ComputationGraph.NoGradScope noGrad = ComputationGraph.noGrad()) {
+            GpuOptimizerOps.storeFloats(p.tensor(), values);
+        }
     }
 
     private Linear linear(int in, int out) {

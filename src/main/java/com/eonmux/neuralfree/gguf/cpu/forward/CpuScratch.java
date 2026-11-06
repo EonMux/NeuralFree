@@ -168,7 +168,7 @@ public final class CpuScratch {
         m.put(X, ScratchWidths.rows(ubatch, w.stream()));
         m.put(BRANCH, ScratchWidths.rows(ubatch, w.stream()));
         m.put(NORMED, ScratchWidths.rows(ubatch, w.stream()));
-        m.put(Q, ScratchWidths.rows(ubatch, w.projection()));
+        m.put(Q, ScratchWidths.rows(ubatch, w.query()));
         m.put(K, ScratchWidths.rows(ubatch, w.projection()));
         m.put(V, ScratchWidths.rows(ubatch, w.projection()));
         m.put(ATTN_OUT, ScratchWidths.rows(ubatch, w.projection()));

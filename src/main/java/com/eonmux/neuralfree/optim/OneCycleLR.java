@@ -115,11 +115,18 @@ public class OneCycleLR extends LRScheduler {
         super.step();
     }
 
+    /**
+     * The rate at {@code pct} of the way from {@code start} to {@code end}, linear or cosine. It is computed in double
+     * precision, as PyTorch's Python-float schedule is, so a phase ends at {@code end} exactly rather than within a
+     * float rounding of {@code start}.
+     */
     private float anneal(float start, float end, double pct) {
+        double startD = start;
+        double endD = end;
         if (LINEAR.equals(annealStrategy)) {
-            return (float) (start + (end - start) * pct);
+            return (float) (startD + (endD - startD) * pct);
         }
-        return (float) (end + (start - end) / 2.0 * (Math.cos(Math.PI * pct) + 1.0));
+        return (float) (endD + (startD - endD) / 2.0 * (Math.cos(Math.PI * pct) + 1.0));
     }
 
     public float maxLr() {

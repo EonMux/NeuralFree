@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-MC part C converter classes: {@code OlmoeModel} (olmo.py:74-124), the Qwen3-VL and
+ * Synthetic checkpoints of the converter classes: {@code OlmoeModel} (olmo.py:74-124), the Qwen3-VL and
  * Omni MoE text models (qwen3vl.py:303-372) and {@code InternLM3Model} (internlm.py:175-234, an LLAMA row without
  * experts). Two layers, a hidden size of 8, two query heads, one key/value head, an MoE of two experts and the
  * checkpoint's real names and config keys.

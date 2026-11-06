@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-MS part D fixtures (the Step3.5, MuseSpark and\n * gpt-oss rows) build through the registered entries: {@link ModelSpecBuilder} succeeds and every
+ * The fixtures (the Step3.5, MuseSpark and\n * gpt-oss rows) build through the registered entries: {@link ModelSpecBuilder} succeeds and every
  * catalog tensor is claimed ({@code TensorClaims}), which is the done-getting-tensors check of the
  * converter's tensor plan.
  */

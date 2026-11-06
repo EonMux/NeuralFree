@@ -18,6 +18,13 @@ public interface CpuVecDot {
     float dotRow(CpuTensorRef w, long row, QuantizedActivations x);
 
     /**
+     * Returns {@code sum_j row[off + j] * x[j]} over the {@code x.length()} elements of one weight row held
+     * packed in a byte array, as {@link CpuVecDotRows} hands it to the row loops. Implementations perform the
+     * shape checks of {@link #dotRow(CpuTensorRef, long, QuantizedActivations)} in their row loops and not here.
+     */
+    float dotRowBytes(byte[] row, int off, QuantizedActivations x);
+
+    /**
      * Writes {@code dotRow(w, rowStart + r, x)} to {@code y[yOff + r]} for {@code r} in {@code [0, rowCount)}.
      * Implementations may override this to hoist per-call work out of the row loop.
      */
@@ -25,6 +32,66 @@ public interface CpuVecDot {
         for (int r = 0; r < rowCount; r++) {
             y[yOff + r] = dotRow(w, rowStart + r, x);
         }
+    }
+
+    /**
+     * Writes {@code y[yOff + t*yStride + r] = dotRow(w, rowStart + r, x[t])} for every row {@code r} of the
+     * range and every token {@code t}, the batched product of a prefill: each weight row is read from the
+     * tensor once and dotted with every token's activations, instead of once per token. An implementation
+     * that overrides {@link #dotRowBytes} shares the row the same way.
+     */
+    default void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations[] x, int nTokens,
+                         float[] y, int yOff, int yStride) {
+        if (nTokens == 0) {
+            return;
+        }
+        checkCompatible(w, x[0]);
+        for (int t = 1; t < nTokens; t++) {
+            checkCompatible(w, x[t]);
+        }
+        CpuVecDotRows.forEachRowTokens(w, rowStart, rowCount, this, x, nTokens, y, yOff, yStride);
+    }
+
+    /**
+     * The prefill product of {@code rowCount} weight rows with {@code nTokens} activation rows, writing the
+     * same values as {@link #dotRows(CpuTensorRef, long, int, QuantizedActivations[], int, float[], int, int)}.
+     * <p>
+     * Implementations that can reuse work across rows override this to multiply an RM x RN register tile of
+     * weight rows and tokens: a decoded weight block then serves RN tokens and a widened activation block
+     * serves RM rows, where the plain row loop decodes the weight block once per RN tokens and reloads the
+     * activation lanes for every row. The tile size is the implementation's own kernel-shape decision; the
+     * default keeps the row loop.
+     */
+    default void dotTiles(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations[] x, int nTokens,
+                          float[] y, int yOff, int yStride) {
+        dotRows(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
+    }
+
+    /**
+     * Validates the arguments of {@link #dotTiles}: the activation array and its tokens, every token's
+     * compatibility with {@code w} and output range, and the row stride.
+     *
+     * @throws IllegalArgumentException  when the activation array, a token or {@code y} is null, a token has
+     *                                   the wrong type or length, or the stride is too small
+     * @throws IndexOutOfBoundsException when {@code nTokens} exceeds the array or a range is out of bounds
+     */
+    default void checkTiles(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations[] x, int nTokens,
+                            float[] y, int yOff, int yStride) {
+        CpuVecDotRows.checkTokens(w, rowStart, rowCount, x, nTokens, y, yOff, yStride);
+        for (int t = 0; t < nTokens; t++) {
+            checkCompatible(w, x[t]);
+        }
+    }
+
+    /**
+     * Validates that {@code x} may feed this kernel over {@code w}: the activation type must be the one
+     * {@link CpuActivationQuantizer#activationType} pairs with {@code w}'s type, and hold {@code w.cols()}
+     * values.
+     *
+     * @throws IllegalArgumentException naming the expected and actual type and length
+     */
+    default void checkCompatible(CpuTensorRef w, QuantizedActivations x) {
+        x.requireCompatible(w, CpuActivationQuantizer.activationType(w.type()));
     }
 
     /**

@@ -23,9 +23,10 @@ import java.util.Properties;
  *
  * <p>Which metadata keys the options write, when they are set:
  * <ul>
- *   <li>{@code rope.scaling.type} STRING ({@code none}, {@code linear}, {@code long} or {@code yarn});</li>
- *   <li>{@code rope.scaling.factor} FLOAT32 ({@code --rope-freq-scale} and its llama.cpp alias
- *       {@code --rope-scale});</li>
+ *   <li>{@code rope.scaling.type} STRING ({@code none}, {@code linear}, {@code long}, {@code yarn} or
+ *       {@code dynamic});</li>
+ *   <li>{@code rope.scaling.factor} FLOAT32: the context scaling factor of {@code --rope-scale N}, or {@code 1 / N}
+ *       for {@code --rope-freq-scale N}, as llama.cpp reads the two flags;</li>
  *   <li>{@code rope.freq_base} FLOAT32;</li>
  *   <li>{@code rope.scaling.attn_factor}, {@code rope.scaling.yarn_ext_factor},
  *       {@code rope.scaling.yarn_beta_fast} and {@code rope.scaling.yarn_beta_slow} FLOAT32;</li>
@@ -55,14 +56,22 @@ public final class RopeOverrides {
         /** LongLoRA's logarithmic interpolation. */
         LONG,
         /** YaRN (extended yarn interpolation, the llama.cpp of the yarn family). */
-        YARN;
+        YARN,
+        /** NTK-aware scaling by a factor or alpha (vLLM's {@code dynamic} rope type). */
+        DYNAMIC,
+        /** Fixed and mixed NTK scaling by a factor (vLLM's {@code ntk} rope type). */
+        NTK;
 
         /**
+         * The type named by {@code value}, matched case-insensitively with {@code -} read as {@code _} but
+         * otherwise exactly, as llama.cpp's {@code --rope-scaling} matches it: surrounding whitespace is
+         * part of the value, not trimmed.
+         *
          * @throws IllegalArgumentException naming {@value #PROP_ROPE_SCALING} for an unknown name
          */
         public static ScalingType parse(String value) {
             Objects.requireNonNull(value, PROP_ROPE_SCALING);
-            String s = value.trim().toUpperCase(Locale.ROOT).replace('-', '_');
+            String s = value.toUpperCase(Locale.ROOT).replace('-', '_');
             StringBuilder valid = new StringBuilder();
             for (ScalingType t : ScalingType.values()) {
                 if (t.name().equals(s)) {
@@ -75,7 +84,7 @@ public final class RopeOverrides {
     }
 
     private final ScalingType scalingType;
-    private final Float freqScale;
+    private final Float scalingFactor;
     private final Float freqBase;
     private final Float yarnExtFactor;
     private final Float yarnAttnFactor;
@@ -85,7 +94,7 @@ public final class RopeOverrides {
 
     private RopeOverrides(Builder b) {
         this.scalingType = b.scalingType;
-        this.freqScale = b.freqScale;
+        this.scalingFactor = b.scalingFactor;
         this.freqBase = b.freqBase;
         this.yarnExtFactor = b.yarnExtFactor;
         this.yarnAttnFactor = b.yarnAttnFactor;
@@ -114,7 +123,7 @@ public final class RopeOverrides {
         }
         v = value(p, PROP_ROPE_SCALE);
         if (v != null) {
-            b.freqScale(parseFloat(PROP_ROPE_SCALE, v));
+            b.scalingFactor(parseFloat(PROP_ROPE_SCALE, v));
         }
         v = value(p, PROP_ROPE_FREQ_BASE);
         if (v != null) {
@@ -149,13 +158,13 @@ public final class RopeOverrides {
 
     /** Whether every override is unset. */
     public boolean isEmpty() {
-        return scalingType == null && freqScale == null && freqBase == null && yarnExtFactor == null
+        return scalingType == null && scalingFactor == null && freqBase == null && yarnExtFactor == null
                 && yarnAttnFactor == null && yarnBetaFast == null && yarnBetaSlow == null && yarnOrigCtx == null;
     }
 
     public ScalingType scalingType() { return scalingType; }
-    /** The rope scaling factor ({@code rope.scaling.factor}); null when unset. */
-    public Float freqScale() { return freqScale; }
+    /** The rope context scaling factor ({@code rope.scaling.factor}); null when unset. */
+    public Float scalingFactor() { return scalingFactor; }
     /** The rope frequency base ({@code rope.freq_base}); null when the model's own applies. */
     public Float freqBase() { return freqBase; }
     public Float yarnExtFactor() { return yarnExtFactor; }
@@ -167,7 +176,7 @@ public final class RopeOverrides {
     public Builder toBuilder() {
         Builder b = builder();
         b.scalingType = scalingType;
-        b.freqScale = freqScale;
+        b.scalingFactor = scalingFactor;
         b.freqBase = freqBase;
         b.yarnExtFactor = yarnExtFactor;
         b.yarnAttnFactor = yarnAttnFactor;
@@ -191,9 +200,10 @@ public final class RopeOverrides {
             out.add(new MetadataOverrides.Override(String.format(Locale.ROOT, GgufKeys.ROPE_SCALING_TYPE, arch),
                     GGUFValueType.STRING, scalingType.name().toLowerCase(Locale.ROOT)));
         }
-        if (freqScale != null) {
+        if (scalingFactor != null) {
             out.add(new MetadataOverrides.Override(
-                    String.format(Locale.ROOT, GgufKeys.ROPE_SCALING_FACTOR, arch), GGUFValueType.FLOAT32, freqScale));
+                    String.format(Locale.ROOT, GgufKeys.ROPE_SCALING_FACTOR, arch), GGUFValueType.FLOAT32,
+                    scalingFactor));
         }
         if (freqBase != null) {
             out.add(new MetadataOverrides.Override(
@@ -236,7 +246,7 @@ public final class RopeOverrides {
             return false;
         }
         RopeOverrides that = (RopeOverrides) o;
-        return scalingType == that.scalingType && Objects.equals(freqScale, that.freqScale)
+        return scalingType == that.scalingType && Objects.equals(scalingFactor, that.scalingFactor)
                 && Objects.equals(freqBase, that.freqBase) && Objects.equals(yarnExtFactor, that.yarnExtFactor)
                 && Objects.equals(yarnAttnFactor, that.yarnAttnFactor)
                 && Objects.equals(yarnBetaFast, that.yarnBetaFast) && Objects.equals(yarnBetaSlow, that.yarnBetaSlow)
@@ -245,7 +255,7 @@ public final class RopeOverrides {
 
     @Override
     public int hashCode() {
-        return Objects.hash(scalingType, freqScale, freqBase, yarnExtFactor, yarnAttnFactor, yarnBetaFast,
+        return Objects.hash(scalingType, scalingFactor, freqBase, yarnExtFactor, yarnAttnFactor, yarnBetaFast,
                 yarnBetaSlow, yarnOrigCtx);
     }
 
@@ -257,8 +267,8 @@ public final class RopeOverrides {
             s.append("scaling=").append(scalingType.name().toLowerCase(Locale.ROOT));
             sep = ", ";
         }
-        if (freqScale != null) {
-            s.append(sep).append("freqScale=").append(freqScale);
+        if (scalingFactor != null) {
+            s.append(sep).append("scalingFactor=").append(scalingFactor);
             sep = ", ";
         }
         if (freqBase != null) {
@@ -319,7 +329,7 @@ public final class RopeOverrides {
     /** Unset everywhere; set what the CLI flags and properties name. */
     public static final class Builder {
         private ScalingType scalingType;
-        private Float freqScale;
+        private Float scalingFactor;
         private Float freqBase;
         private Float yarnExtFactor;
         private Float yarnAttnFactor;
@@ -336,13 +346,23 @@ public final class RopeOverrides {
         }
 
         /**
-         * {@code --rope-freq-scale} / its llama.cpp alias {@code --rope-scale}.
+         * {@code --rope-scale N}: the context scales by {@code N} ({@code rope.scaling.factor = N}).
          *
-         * @throws IllegalArgumentException when {@code v} is not finite ({@link Float} keeps llama.cpp's float
-         *                                  parameter width)
+         * @throws IllegalArgumentException when {@code v} is not finite and positive
+         */
+        public Builder scalingFactor(float v) {
+            this.scalingFactor = positive(PROP_ROPE_SCALE, v);
+            return this;
+        }
+
+        /**
+         * {@code --rope-freq-scale N}: the rotation frequencies scale by {@code N}, so the context scales by
+         * {@code 1 / N} ({@code rope.scaling.factor = 1 / N}), as llama.cpp's {@code rope_freq_scale}.
+         *
+         * @throws IllegalArgumentException when {@code v} is not finite and positive
          */
         public Builder freqScale(float v) {
-            this.freqScale = finite(PROP_ROPE_FREQ_SCALE, v);
+            this.scalingFactor = 1.0f / positive(PROP_ROPE_FREQ_SCALE, v);
             return this;
         }
 
@@ -391,6 +411,13 @@ public final class RopeOverrides {
         private static float finite(String what, float v) {
             if (!Float.isFinite(v)) {
                 throw new IllegalArgumentException(what + " must be a finite float, got " + v);
+            }
+            return v;
+        }
+
+        private static float positive(String what, float v) {
+            if (!(finite(what, v) > 0f)) {
+                throw new IllegalArgumentException(what + " must be a positive float, got " + v);
             }
             return v;
         }

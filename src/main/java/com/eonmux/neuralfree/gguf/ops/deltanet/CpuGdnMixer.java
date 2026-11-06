@@ -5,13 +5,16 @@ import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixer;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.cpu.block.CpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
+import com.eonmux.neuralfree.gguf.cpu.forward.CpuRecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuScratch;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
+import com.eonmux.neuralfree.gguf.engine.RecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
 import com.eonmux.neuralfree.gguf.ops.ssm.CpuSsmConv;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmKernels;
@@ -31,10 +34,12 @@ import java.util.Objects;
  * V ({@code z}) and ATTN_OUT (scan output; first the legacy {@code ssm_in} rows) plus bind-time temporaries. Not
  * thread-safe.
  */
-public final class CpuGdnMixer implements CpuMixer {
+public final class CpuGdnMixer implements CpuMixer, CpuRecurrentTreeMixer {
 
     private CpuMatVec mv;
+    private CpuScratch scratch;
     private int ubatch;
+    private int width;
     private int nK;
     private int nV;
     private int headK;
@@ -43,7 +48,10 @@ public final class CpuGdnMixer implements CpuMixer {
     private int valDim;
     private int convCh;
     private int dConv;
+    private int convFloats;
+    private int scanFloats;
     private boolean legacy;
+    private boolean mergedQkvGate;
     private float l2Eps;
     private float rmsEps;
     private CpuGatedDeltaNet.ScanShape scanShape;
@@ -51,6 +59,8 @@ public final class CpuGdnMixer implements CpuMixer {
 
     private CpuTensorRef wQkv;
     private CpuTensorRef wGate;
+    /** Merged linear-attention input {@code attn_qkv_gate}; null unless the spec says so. */
+    private CpuTensorRef wQkvGate;
     private CpuTensorRef wIn;
     private CpuTensorRef wBa;
     private CpuTensorRef wAlpha;
@@ -59,6 +69,7 @@ public final class CpuGdnMixer implements CpuMixer {
     /** LoRA deltas of the projections ({@code build_lora_mm}, models/qwen35.cpp, models/qwen3next.cpp). */
     private CpuProjectionDeltas.Site qkvDeltas;
     private CpuProjectionDeltas.Site gateDeltas;
+    private CpuProjectionDeltas.Site qkvGateDeltas;
     private CpuProjectionDeltas.Site inDeltas;
     private CpuProjectionDeltas.Site baDeltas;
     private CpuProjectionDeltas.Site alphaDeltas;
@@ -73,6 +84,8 @@ public final class CpuGdnMixer implements CpuMixer {
     private float[] conv;
     private float[] z;
     private float[] o;
+    /** Merged {@code attn_qkv_gate} rows before the split into {@code x} and {@code z}; null unless merged. */
+    private float[] qkvGate;
     private float[] g;
     private float[] beta;
     private CpuGatedDeltaNet.Rows qRows;
@@ -101,16 +114,18 @@ public final class CpuGdnMixer implements CpuMixer {
         }
         DeltaNetBlocks.checkKind(MixerKind.GDN, layer);
         RecurrentSpec r = layer.recurrent();
-        bindShape(ctx, r);
+        bindShape(ctx, layer, r);
         bindWeights(ctx, layer, r);
         bindScratch(ctx, layer, r);
         bound = true;
     }
 
     /** Head geometry, conv shape and epsilons of the layer. */
-    private void bindShape(CpuForwardContext ctx, RecurrentSpec r) {
+    private void bindShape(CpuForwardContext ctx, LayerSpec layer, RecurrentSpec r) {
         mv = ctx.matVec();
+        scratch = ctx.scratch();
         ubatch = ctx.scratch().ubatch();
+        width = DeltaNetBlocks.mixerWidth(layer);
         scanShape = CpuGatedDeltaNet.ScanShape.of(r);
         gateShape = CpuGatedDeltaNet.GateShape.of(r);
         nK = r.nKHeads();
@@ -121,9 +136,11 @@ public final class CpuGdnMixer implements CpuMixer {
         valDim = nV * headV;
         convCh = r.convChannels();
         legacy = r.legacySsmIn();
+        mergedQkvGate = r.mergedQkvGate();
         dConv = r.dConv();
         SsmKernels.checkConvShape(convCh, dConv);
-        l2Eps = DeltaNetBlocks.l2Eps(ctx.spec());
+        convFloats = DeltaNetBlocks.toInt(r.convStateFloats(), "conv state of the GDN layer");
+        scanFloats = DeltaNetBlocks.toInt(r.stateFloats(), "scan state of the GDN layer");        l2Eps = DeltaNetBlocks.l2Eps(ctx.spec());
         rmsEps = DeltaNetBlocks.rmsEps(ctx.spec());
     }
 
@@ -134,12 +151,16 @@ public final class CpuGdnMixer implements CpuMixer {
         if (legacy) {
             long perKh = 2L * headK + 2L * (nV / nK) * headV;
             wIn = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.SSM_IN, nEmbd, nK * perKh);
+        } else if (r.mergedQkvGate()) {
+            wQkvGate = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.ATTN_QKV_GATE, nEmbd, convCh + valDim);
         } else {
             wQkv = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.ATTN_QKV, nEmbd, convCh);
             wGate = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.ATTN_GATE, nEmbd, valDim);
         }
         if (r.fusedBetaAlpha()) {
             wBa = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.SSM_BETA_ALPHA, nEmbd, 2L * nV);
+        } else if (r.concatBetaAlpha()) {
+            wBa = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.SSM_BETA_ALPHA_CAT, nEmbd, 2L * nV);
         } else {
             wAlpha = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.SSM_ALPHA, nEmbd, nV);
             wBeta = DeltaNetBlocks.cpuMatrix(ws, layer, TensorNames.SSM_BETA, nEmbd, nV);
@@ -148,12 +169,15 @@ public final class CpuGdnMixer implements CpuMixer {
         CpuProjectionDeltas deltas = ctx.projectionDeltas();
         if (legacy) {
             inDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_IN), wIn, mv);
+        } else if (wQkvGate != null) {
+            qkvGateDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_QKV_GATE), wQkvGate, mv);
         } else {
             qkvDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_QKV), wQkv, mv);
             gateDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_GATE), wGate, mv);
         }
         if (wBa != null) {
-            baDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_BETA_ALPHA), wBa, mv);
+            baDeltas = deltas.serve(layer, TensorNames.weight(r.concatBetaAlpha() ? TensorNames.SSM_BETA_ALPHA_CAT
+                    : TensorNames.SSM_BETA_ALPHA), wBa, mv);
         } else {
             alphaDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_ALPHA), wAlpha, mv);
             betaDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_BETA), wBeta, mv);
@@ -172,9 +196,11 @@ public final class CpuGdnMixer implements CpuMixer {
         conv = slot(scratch, CpuScratch.K, convCh);
         z = slot(scratch, CpuScratch.V, valDim);
         o = slot(scratch, CpuScratch.ATTN_OUT, legacy ? DeltaNetBlocks.toInt(wIn.rows(), "ssm_in rows") : valDim);
-        int abStride = r.fusedBetaAlpha() ? 2 * nV : nV;
+        qkvGate = mergedQkvGate ? scratch.temp(DeltaNetBlocks.TEMP_QKV_GATE, ubatch * (convCh + valDim)) : null;
+        boolean fused = r.fusedBetaAlpha() || r.concatBetaAlpha();
+        int abStride = fused ? 2 * nV : nV;
         float[] aArr = scratch.temp(GpuGdnMixer.TEMP_A, ubatch * abStride);
-        float[] bArr = r.fusedBetaAlpha() ? aArr : scratch.temp(GpuGdnMixer.TEMP_B, ubatch * nV);
+        float[] bArr = fused ? aArr : scratch.temp(GpuGdnMixer.TEMP_B, ubatch * nV);
         g = scratch.temp(DeltaNetBlocks.TEMP_G, ubatch * nV);
         beta = scratch.temp(DeltaNetBlocks.TEMP_BETA, ubatch * nV);
         qRows = new CpuGatedDeltaNet.Rows(conv, 0, convCh);
@@ -184,7 +210,8 @@ public final class CpuGdnMixer implements CpuMixer {
         aRows = new CpuGatedDeltaNet.Rows(aArr, 0, abStride);
         bRows = new CpuGatedDeltaNet.Rows(bArr, 0, abStride);
         states = DeltaNetBlocks.CpuStates.bind(ctx, layer, r.convStateFloats(), r.stateFloats());
-        working = new float[][]{x, conv, z, o, aArr, bArr, g, beta};
+        working = qkvGate != null ? new float[][]{x, conv, z, o, qkvGate, aArr, bArr, g, beta}
+                : new float[][]{x, conv, z, o, aArr, bArr, g, beta};
     }
 
     private float[] slot(CpuScratch scratch, String name, int width) {
@@ -199,15 +226,59 @@ public final class CpuGdnMixer implements CpuMixer {
 
     @Override
     public void decode(int pos, float[] in, float[] out) {
-        run(1, in, out);
+        run(1, 0, 0, 0, in, out);
     }
 
     @Override
     public void prefill(int pos0, int n, float[] in, float[] out) {
-        run(n, in, out);
+        run(n, 0, 0, 0, in, out);
     }
 
-    private void run(int n, float[] in, float[] out) {
+    /**
+     * One batched step over the rows of {@code s}: one segment runs whole ({@link #run} at its sequence's state
+     * rows), several segments run one at a time through a scratch relay, each with its own sequence's conv and scan
+     * state rows. The tokens of one segment share one state; segments of different sequences are independent, so
+     * the per-segment runs compute the same states and outputs as the same rows run one sequence at a time.
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        if (s.nSeg() == 1) {
+            run(s.nTokens(), 0, 0, s.seq(0), in, out);
+            return;
+        }
+        if (!bound) {
+            throw new IllegalStateException("GDN mixer is not bound");
+        }
+        int w = width;
+        float[] buf = scratch.temp(TEMP_SEGMENT, Math.multiplyExact(ubatch, w));
+        float[] bufOut = scratch.temp(TEMP_SEGMENT_OUT, Math.multiplyExact(ubatch, w));
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            int len = s.len(seg);
+            System.arraycopy(in, start * w, buf, 0, len * w);
+            run(len, 0, 0, s.seq(seg), buf, bufOut);
+            System.arraycopy(bufOut, 0, out, start * w, len * w);
+        }
+    }
+
+    private static final String TEMP_SEGMENT = "CpuGdnMixer.segmentIn";
+    private static final String TEMP_SEGMENT_OUT = "CpuGdnMixer.segmentOut";
+
+    private void run(int n, int inOff, int outOff, int seq, float[] in, float[] out) {
+        if (!bound) {
+            throw new IllegalStateException("GDN mixer is not bound");
+        }
+        states.clearTransient();
+        runState(n, inOff, outOff, in, out, states.conv, states.convBase(seq), states.scan, states.scanBase(seq));
+    }
+
+    /**
+     * The step against explicit state: the committed rows for a decode step ({@link #run}), one stack slot of the
+     * tree round for a verify row ({@link #treeStep}). Identical arithmetic on both sides, so a replayed row
+     * reproduces the state the verify step used bit for bit.
+     */
+    private void runState(int n, int inOff, int outOff, float[] in, float[] out,
+                          float[] convState, int convBase, float[] scanState, int scanBase) {
         if (!bound) {
             throw new IllegalStateException("GDN mixer is not bound");
         }
@@ -217,10 +288,9 @@ public final class CpuGdnMixer implements CpuMixer {
             throw new IllegalArgumentException("GDN step of " + n + " tokens is outside [1, " + ubatch + "]");
         }
         DeltaNetBlocks.checkStepArrays("GDN mixer", in, out, working);
-        states.clearTransient();
-        project(n, in);
+        project(n, inOff, in);
         CpuSsmConv.forward(convCh, dConv, n, SsmKernels.CONV_FLAG_SILU, x, 0, convCh, convW, null,
-                states.conv, 0, 0, conv, 0, convCh);
+                convState, convBase, 0, conv, 0, convCh);
         CpuParallel.parallelFor(n, 1, (t0, t1) -> {
             for (int t = t0; t < t1; t++) {
                 int off = t * convCh;
@@ -229,32 +299,46 @@ public final class CpuGdnMixer implements CpuMixer {
         });
         CpuGatedDeltaNet.gatePrep(gateShape, n, aRows, bRows, dtBias, ssmA, g, 0, beta, 0);
         CpuParallel.parallelFor(nV, 1, (h0, h1) -> CpuGatedDeltaNet.scanHeads(scanShape, n, qRows, kRows, vRows,
-                g, 0, beta, 0, states.scan, 0, oRows, h0, h1));
+                g, 0, beta, 0, scanState, scanBase, oRows, h0, h1));
         CpuOps.norm(NormKind.RMS, rmsEps, o, 0, o, 0, n * nV, headV, normW, null);
         CpuOps.gluRows(GluOp.SWIGLU, ActParams.NONE, n, valDim, z, 0, valDim, o, 0, valDim, o, 0, valDim);
-        mv.matmul(wOut, o, 0, out, 0, n);
-        outDeltas.applyRows(n, o, 0, out, 0);
+        mv.matmul(wOut, o, 0, out, outOff, n);
+        outDeltas.applyRows(n, o, 0, out, outOff);
     }
 
-    private void project(int n, float[] in) {
+    private void project(int n, int inOff, float[] in) {
         if (legacy) {
-            mv.matmul(wIn, in, 0, o, 0, n);
-            inDeltas.applyRows(n, in, 0, o, 0);
+            mv.matmul(wIn, in, inOff, o, 0, n);
+            inDeltas.applyRows(n, in, inOff, o, 0);
             deinterleave(n);
+        } else if (mergedQkvGate) {
+            mv.matmul(wQkvGate, in, 0, qkvGate, 0, n);
+            qkvGateDeltas.applyRows(n, in, 0, qkvGate, 0);
+            splitQkvGate(n);
         } else {
-            mv.matmul(wQkv, in, 0, x, 0, n);
-            qkvDeltas.applyRows(n, in, 0, x, 0);
-            mv.matmul(wGate, in, 0, z, 0, n);
-            gateDeltas.applyRows(n, in, 0, z, 0);
+            mv.matmul(wQkv, in, inOff, x, 0, n);
+            qkvDeltas.applyRows(n, in, inOff, x, 0);
+            mv.matmul(wGate, in, inOff, z, 0, n);
+            gateDeltas.applyRows(n, in, inOff, z, 0);
         }
         if (wBa != null) {
-            mv.matmul(wBa, in, 0, aRows.data(), 0, n);
-            baDeltas.applyRows(n, in, 0, aRows.data(), 0);
+            mv.matmul(wBa, in, inOff, aRows.data(), 0, n);
+            baDeltas.applyRows(n, in, inOff, aRows.data(), 0);
         } else {
-            mv.matmul(wAlpha, in, 0, aRows.data(), 0, n);
-            alphaDeltas.applyRows(n, in, 0, aRows.data(), 0);
-            mv.matmul(wBeta, in, 0, bRows.data(), 0, n);
-            betaDeltas.applyRows(n, in, 0, bRows.data(), 0);
+            mv.matmul(wAlpha, in, inOff, aRows.data(), 0, n);
+            alphaDeltas.applyRows(n, in, inOff, aRows.data(), 0);
+            mv.matmul(wBeta, in, inOff, bRows.data(), 0, n);
+            betaDeltas.applyRows(n, in, inOff, bRows.data(), 0);
+        }
+    }
+
+    /** Splits the merged {@code attn_qkv_gate} rows into the conv input {@code x} and the gate {@code z}. */
+    private void splitQkvGate(int n) {
+        int rowW = convCh + valDim;
+        for (int t = 0; t < n; t++) {
+            int s = t * rowW;
+            System.arraycopy(qkvGate, s, x, t * convCh, convCh);
+            System.arraycopy(qkvGate, s + convCh, z, t * valDim, valDim);
         }
     }
 
@@ -276,8 +360,58 @@ public final class CpuGdnMixer implements CpuMixer {
     }
 
     @Override
+    public String treeStepRefusal() {
+        return null;
+    }
+
+    @Override
+    public int treeRowWidth() {
+        return width;
+    }
+
+    @Override
+    public void treeStep(CpuRecurrentTreeRound round, float[] in, float[] out) {
+        if (!bound) {
+            throw new IllegalStateException("GDN mixer is not bound");
+        }
+        long[] mask = round.mask();
+        int realRows = round.realRows();
+        float[] convStack = round.convStack();
+        float[] scanStack = round.scanStack();
+        // a memory-less layer zeroes its state at every step, the committed rows it sees are the zeroed ones
+        states.clearTransient();
+        for (int row = 0; row < realRows; row++) {
+            int depth = RecurrentTreeRound.depth(mask[row]);
+            if (depth < 0) {
+                throw new IllegalArgumentException("the tree step's row " + row + " is padding, the mixer runs the"
+                        + " computed rows");
+            }
+            int parent = RecurrentTreeRound.parentRow(mask[row], row);
+            seedSlot(convFloats, convStack, row, depth, parent, states.conv, states.convBase(0));
+            seedSlot(scanFloats, scanStack, row, depth, parent, states.scan, states.scanBase(0));
+            runState(1, row * width, row * width, in, out,
+                    convStack, row * convFloats, scanStack, row * scanFloats);
+        }
+    }
+
+    /** Fills the row's stack slot: the committed state at the root, else the parent row's slot. */
+    private static void seedSlot(int floats, float[] stack, int row, int depth, int parent, float[] committed,
+                                 int committedBase) {
+        if (floats == 0) {
+            return;
+        }
+        if (depth == 0) {
+            System.arraycopy(committed, committedBase, stack, row * floats, floats);
+        } else {
+            System.arraycopy(stack, parent * floats, stack, row * floats, floats);
+        }
+    }
+
+    @Override
     public String toString() {
         return "CpuGdnMixer{" + (bound ? nK + "k/" + nV + "v heads, " + headK + "x" + headV
-                + (legacy ? ", ssm_in" : "") + (wBa != null ? ", ssm_ba" : "") : "unbound") + '}';
+                + (legacy ? ", ssm_in" : "") + (wQkvGate != null ? ", attn_qkv_gate" : "")
+                + (wBa != null ? ", " + (gateShape.layout() == DeltaNetKernels.LAYOUT_CONCAT_BA
+                        ? "ssm_beta_alpha" : "ssm_ba") : "") : "unbound") + '}';
     }
 }

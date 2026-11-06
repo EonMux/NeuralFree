@@ -2,23 +2,30 @@ package com.eonmux.neuralfree.gguf.testutil;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
 
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.List;
+import static com.eonmux.neuralfree.gguf.testutil.SyntheticText.blk;
+import static com.eonmux.neuralfree.gguf.testutil.SyntheticText.requirePositive;
+
 import java.util.Objects;
-import java.util.Set;
 
 /**
- * Tiny, structurally faithful GGUF fixtures for llama, gemma2 (sliding-window attention),
- * qwen3next (hybrid gated-delta-net + attention + MoE), mamba2 and bert.
+ * Tiny, structurally faithful GGUF fixtures for the decoder and encoder architectures the engine runs, in the shape
+ * the llama.cpp converters write and its loader reads. The builders live with their model families, which this class
+ * aggregates: dense attention decoders in {@link SyntheticDenseModels}, routed experts in
+ * {@link SyntheticMoeModels}, attention/SSM and attention/convolution hybrids in {@link SyntheticHybridModels}, SSM
+ * decoders in {@link SyntheticRecurrentModels}, latent-attention and DSA-indexer models in
+ * {@link SyntheticMlaDsaModels}, encoders in {@link SyntheticEncoderModels}, decision readouts in
+ * {@link SyntheticDecisionModels} and {@link SyntheticD1Models}, the audio and drafting fixtures in
+ * {@link SyntheticAudioModels} and the classifier heads in {@link SyntheticClassifiers}. The per-family classes
+ * beyond this package's core are gemma ({@link SyntheticGemmaModels}), HF-converted checkpoints ({@link SyntheticHf}),
+ * speculative drafting ({@link SyntheticEagle}, {@link SyntheticDflash}, {@link SyntheticGemma4Assistant}) and the
+ * MTP, routed-expert and newer MLA families ({@link SyntheticMtpArchModels}, {@link SyntheticRoutedModels},
+ * {@link SyntheticQwen4ExpModels}, {@link SyntheticMlaModels}).
  *
- * <p>Each builder returns a fresh {@link GgufTestWriter} holding the metadata keys and value types
- * the llama.cpp converters write and every tensor the llama.cpp loader requires, with the loader's
- * shapes ({@code ne[0]} first). Tests may edit the writer before writing it, e.g. to drop a tensor
- * or to replace a key with an array. Sources: llama.cpp src/models/{llama,gemma2,qwen3next,mamba2,bert}.cpp
- * {@code load_arch_hparams}/{@code load_arch_tensors}, llama.cpp src/llama-model.cpp
- * {@code load_hparams}/{@code create_tensor_qkv}/{@code create_tensor_gate_up_exps}, and llama.cpp
- * gguf-py/gguf/gguf_writer.py for value types.
+ * <p>This class keeps the shared fixture vocabulary every family uses: the entry points tests call, the token-type
+ * and pooling constants, the chat templates, and the {@link Config} and {@link Tensors} kernel the builders share.
+ * Each builder returns a fresh {@link GgufTestWriter} holding the metadata keys and value types the llama.cpp
+ * converters write and every tensor the llama.cpp loader requires, with the loader's shapes ({@code ne[0]} first).
+ * Tests may edit the writer before writing it, e.g. to drop a tensor or to replace a key with an array.
  *
  * <p>Values are deterministic per (config seed, tensor name). Projection matrices use
  * {@link Config#weightType()}: random values when the writer can encode floats into that type,
@@ -37,495 +44,598 @@ public final class SyntheticModels {
 
     /** llama.cpp {@code LLAMA_POOLING_TYPE_MEAN}, written for the bert fixture. */
     public static final int POOLING_MEAN = 1;
+    /** llama.cpp {@code LLAMA_POOLING_TYPE_RANK}, written for the rank fixture. */
+    public static final int POOLING_RANK = 4;
     /** Token type count written for the bert fixture ("sequence A" / "sequence B"). */
     public static final int BERT_TOKEN_TYPES = 2;
 
-    private static final String SPM_SPACE = "▁";
-    private static final String BPE_SPACE = "Ġ";
+    /** The t5 fixture's decoder start token, its {@code <pad>} (as the T5 checkpoints declare it). */
+    public static final int T5_DECODER_START = 0;
+
+    /** Geometry of {@link #wavtokenizer(int, int, int, int, int)}: the fixed test shape. */
+    public static final int WAVTOK_E = 4;
+    public static final int WAVTOK_C = 8;
+    public static final int WAVTOK_FF = 16;
+    public static final int WAVTOK_OUT = 10;
+    public static final int WAVTOK_CODES = 260;
+    public static final int WAVTOK_POSNET = 6;
+    public static final int WAVTOK_CONVNEXT = 2;
+
+    /**
+     * The systemone template of the vllm-decision2 checkpoints (vllm_decision2.py:75-100), as the converter
+     * writes it into {@code tokenizer.chat_template.systemone} (HfEncoderHooks.TEMPLATE_DECISION2).
+     */
+    public static final String VLLM_DECISION2_TEMPLATE =
+            "{% for q in questions %}{% set d = o.description if o is defined else none %}"
+            + "Context:\n{{ state | tojson }}\n\nTask type: {{ q.type }}\nQuestion:\n"
+            + "{{ q.instructions | tojson }}\nOptions:"
+            + "{% for o in q.options %}{{ sep }}\n<option>\n{{ sep }}{{ mark_option }}"
+            + "{{ {'description': o.description, 'key': o.key} | tojson }}\n</option>{% endfor %}"
+            + "{{ sep }}{{ mark_question }}\n\nSelect the single option best supported by the context and"
+            + " instructions.\nDecision:{% endfor %}";
+
+    /**
+     * The systemone template of the label-family fixture: one question per prompt, its options with their labels,
+     * and the answer cue the last prompt token ends on.
+     */
+    public static final String LABEL_TEMPLATE =
+            "{{ type }}|{{ instructions }}|"
+                    + "{% for o in options %}{{ o.label }}{{ o.key }}:{{ o.description }};{% endfor %}"
+                    + "|{{ state }}|Answer:";
+
+    /**
+     * The kev systemone template: one question per prompt over a flattened state, every option ended on the
+     * {@code <|box_end|>} token whose hidden state the kev read scores at (llama.cpp's {@code token_marker}).
+     */
+    public static final String KEV_TEMPLATE =
+            "{{ type }}|{{ instructions }}|"
+                    + "{% for o in options %}{{ o.key }}:{{ o.description }}<|box_end|>;{% endfor %}"
+                    + "|{{ state }}|Answer:";
+
+    /** The laya systemone template (bert.py:694-713): [cls] type question [sep] ([mask] option)* [sep] state [sep]. */
+    public static final String LAYA_TEMPLATE =
+            "[CLS]{{ type }} question: {{ instructions | tojson }}[SEP]"
+                    + "{% for o in options %}[MASK] {% if type == 'choice' %}{{ o.key }}"
+                    + "{% if o.description %}: {{ o.description | tojson }}{% endif %}"
+                    + "{% elif type == 'score' %}level {{ o.key }}: {{ o.description | tojson }}"
+                    + "{% else %}{{ o.key }}: {% if o.description %}{{ o.description | tojson }}"
+                    + "{% elif o.key == 'true' %}yes, the statement holds"
+                    + "{% else %}no, the statement does not hold{% endif %}{% endif %}{% endfor %}"
+                    + "[SEP]{{ state | tojson }}[SEP]";
+
+    /** The lfm2-d1 systemone template: the state, the question, the labelled options and the answer cue. */
+    public static final String LFM2_D1_TEMPLATE =
+            "<|startoftext|><|im_start|>user\n{{ state }}\n\nQUESTION:\n{{ instructions }}"
+                    + "\n\nOptions:\n{% for o in options %}{{ o.label }} {{ o.key }}"
+                    + "{% if o.description %}: {{ o.description }}{% endif %}\n{% endfor %}"
+                    + "\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n";
+
+    /**
+     * The lfm2-d1-omni systemone template (D1OmniModel._systemone_template, lfm2.py:212-239, prompt.py of the model
+     * repo): the media first, then the state, the question and the options, each marked piece cut to its token
+     * budget by the server.
+     */
+    public static final String LFM2_D1_OMNI_TEMPLATE =
+            "{% set ns = namespace(criteria=false) %}"
+                    + "{% for o in options %}{% if o.description is not none %}{% set ns.criteria = true %}{% endif %}"
+                    + "{% endfor %}"
+                    + "{% for image in images %}{{ image }}{% endfor %}{{ sep }}"
+                    + "<|startoftext|><|reserved_7|>{{ sep }}{{ mark_state }}"
+                    + "{% if state is string %}{{ state }}{% elif state is not none %}{{ state | tojson }}"
+                    + "{% elif audio %}{}{% endif %}"
+                    + "{{ sep }}{{ mark_question }}<|reserved_8|>"
+                    + "{{ instructions if instructions is string else instructions | tojson }}"
+                    + "{% for o in options %}{{ sep }}<|reserved_9|><|mask|>{{ sep }}{{ mark_option }} "
+                    + "{% if type == 'choice' and audio %}option_{% if loop.index0 < 10 %}00"
+                    + "{% elif loop.index0 < 100 %}0{% endif %}{{ loop.index0 }}: "
+                    + "{% if o.description is not none and o.description != '' %}"
+                    + "{{ o.description if o.description is string else o.description | tojson }}{% else %}{{ o.key }}"
+                    + "{% endif %}"
+                    + "{% elif type == 'choice' %}{{ o.key }}{% if o.description is not none and o.description"
+                    + " != '' %}: {{ o.description if o.description is string else o.description | tojson }}"
+                    + "{% endif %}"
+                    + "{% elif type == 'score' %}level {{ o.key }}: "
+                    + "{{ o.description if o.description is string else o.description | tojson }}"
+                    + "{% elif audio %}{{ o.key }}: {{ 'yes' if o.key == 'true' else 'no' }}"
+                    + "{% else %}{{ o.key }}: {% if o.description is not none and o.description != '' %}"
+                    + "{{ o.description if o.description is string else o.description | tojson }}"
+                    + "{% elif images and not ns.criteria %}{{ 'yes' if o.key == 'true' else 'no' }}"
+                    + "{% elif o.key == 'true' %}yes, the statement holds"
+                    + "{% else %}no, the statement does not hold{% endif %}{% endif %}"
+                    + "{{ sep }}<|reserved_10|>{% endfor %}{{ sep }}<|reserved_11|>";
+
+    /**
+     * The h2o-lightning systemone template (h2o_lightning.py:62-80): the record, the question and the options of one
+     * prompt in a chat turn, the option descriptions following the question type, the user turn trimmed by the
+     * template, the answer following the "Answer:" prefill.
+     */
+    public static final String H2O_LIGHTNING_TEMPLATE =
+            "<|im_start|>system\n<|im_end|>\n"
+                    + "<|im_start|>user\n{% for image in images %}{{ image }}{% endfor %}"
+                    + "{% set user %}record: {{ state }}\n"
+                    + "question: {{ instructions if instructions else 'Answer the question below.' }}\n"
+                    + "options:{% for o in options %}\n{{ o.label | trim }}) {{ o.key }}: "
+                    + "{% if type == 'noul' %}{% if o.description %}{{ o.description }}"
+                    + "{% elif o.key == 'true' %}the statement holds{% else %}it does not{% endif %}"
+                    + "{% elif o.description is none %}{{ o.key }}{% else %}{{ o.description }}{% endif %}"
+                    + "{% endfor %}{% endset %}{{ user | trim }}<|im_end|>\n"
+                    + "<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer:";
+
+    /** The minicpm-ocr-jev systemone template (MiniCPMOCRSeqClsModel._systemone_template, qwen.py:726-736): the
+     * fixed OCR consistency question over the original image, the OCR text and its rendering. */
+    public static final String MINICPM_OCR_JEV_TEMPLATE = "<|im_start|>user\n{{ images[0] }}\nOCR文本：\n{{ state }}\n"
+            + "{{ images[1] }}\n第一张图是原图，第二张图是上述 OCR 文本渲染得到的图片。\n"
+            + "请判断该 OCR 文本及其对应渲染图是否与原图内容一致。\n这是一个二分类任务：一致标为 1，不一致标为 0。"
+            + "{{ '<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}";
 
     private SyntheticModels() {
     }
 
-    // ================================================================== llama
+    // ================================================================== dense decoders
 
+    /** LLM_ARCH_LLAMA: dense GQA attention + SwiGLU FFN, SPM tokenizer; see {@link SyntheticDenseModels#llama()}. */
     public static GgufTestWriter llama() {
-        return llama(Config.llama());
+        return SyntheticDenseModels.llama();
     }
 
-    /** LLM_ARCH_LLAMA: dense GQA attention + SwiGLU FFN, SPM tokenizer. */
+    /** {@link #llama()} over {@code c}; see {@link SyntheticDenseModels#llama(SyntheticModels.Config)}. */
     public static GgufTestWriter llama(Config c) {
-        requireAttention(c, "llama");
-        if (c.nRot() != c.headDim()) {
-            throw new IllegalArgumentException("llama requires rope.dimension_count == head dim (llama-model.cpp "
-                    + "load_hparams n_rot check), got " + c.nRot() + " vs " + c.headDim());
-        }
-        GgufTestWriter w = base("llama", c);
-        attentionKeys(w, c, false);
-        w.u32(w.archKey("rope.dimension_count"), c.nRot());
-        w.f32(w.archKey("rope.freq_base"), c.ropeFreqBase());
-        w.f32(w.archKey("attention.layer_norm_rms_epsilon"), c.normEps());
-        spmVocab(w, c.nVocab(), new String[] {"<unk>", "<s>", "</s>"},
-                new int[] {TOKEN_TYPE_UNKNOWN, TOKEN_TYPE_CONTROL, TOKEN_TYPE_CONTROL});
-        w.u32("tokenizer.ggml.unknown_token_id", 0).u32("tokenizer.ggml.bos_token_id", 1)
-                .u32("tokenizer.ggml.eos_token_id", 2).bool("tokenizer.ggml.add_bos_token", true)
-                .bool("tokenizer.ggml.add_eos_token", false);
-
-        Tensors t = new Tensors(w, c);
-        t.matrix("token_embd.weight", c.nEmbd(), c.nVocab());
-        for (int il = 0; il < c.nLayer(); il++) {
-            t.ones(blk(il, "attn_norm.weight"), c.nEmbd());
-            t.qkvo(il, c.nHead() * c.headDim());
-            t.ones(blk(il, "ffn_norm.weight"), c.nEmbd());
-            t.gatedFfn(il, c.nFf());
-        }
-        t.ones("output_norm.weight", c.nEmbd());
-        if (!c.tiedOutput()) {
-            t.matrix("output.weight", c.nEmbd(), c.nVocab());
-        }
-        return w;
+        return SyntheticDenseModels.llama(c);
     }
 
-    // ================================================================== gemma2
+    /**
+     * {@link #llama(Config)} with its scored pieces rotated by {@code pieceShift} ids, so the file describes a
+     * token-level-incompatible vocabulary; see
+     * {@link SyntheticDenseModels#llamaRotatedVocab(SyntheticModels.Config, int)}.
+     */
+    public static GgufTestWriter llamaRotatedVocab(Config c, int pieceShift) {
+        return SyntheticDenseModels.llamaRotatedVocab(c, pieceShift);
+    }
 
+    /**
+     * LLM_ARCH_QWEN2 with optional MiMo MTP {@code nextn} blocks; see
+     * {@link SyntheticDenseModels#qwen2Mtp(SyntheticModels.Config, int)}.
+     */
+    public static GgufTestWriter qwen2Mtp(Config c, int nextn) {
+        return SyntheticDenseModels.qwen2Mtp(c, nextn);
+    }
+
+    /**
+     * LLM_ARCH_QWEN2 running Qwen2.5-1M dual-chunk attention.
+     *
+     * @param chunkSize   {@code chunk_size} of the block
+     * @param localSize   {@code local_size} (the chunk length is {@code chunk_size - local_size})
+     * @param originalMax {@code original_max_position_embeddings}; 0 disables the logit scaling
+     * @see SyntheticDenseModels#qwen2DualChunk(SyntheticModels.Config, int, int, int)
+     */
+    public static GgufTestWriter qwen2DualChunk(Config c, int chunkSize, int localSize, int originalMax) {
+        return SyntheticDenseModels.qwen2DualChunk(c, chunkSize, localSize, originalMax);
+    }
+
+    /** {@link #qwen2DualChunk(Config, int, int, int)} with the sparse-attention switch set. */
+    public static GgufTestWriter qwen2DualChunk(Config c, int chunkSize, int localSize, int originalMax,
+                                                boolean sparseEnabled) {
+        return SyntheticDenseModels.qwen2DualChunk(c, chunkSize, localSize, originalMax, sparseEnabled);
+    }
+
+    /** LLM_ARCH_GEMMA2: sandwich norms, logit soft-capping, SWA pattern 2, tied head; see {@link SyntheticDenseModels}. */
     public static GgufTestWriter gemma2() {
-        return gemma2(Config.gemma2());
+        return SyntheticDenseModels.gemma2();
     }
 
-    /**
-     * LLM_ARCH_GEMMA2: sandwich norms, attention/final logit soft-capping and the default SWA
-     * pattern 2 (even layers sliding, odd layers global). The output head is always tied, as in
-     * the llama.cpp loader.
-     */
+    /** {@link #gemma2()} over {@code c}; see {@link SyntheticDenseModels#gemma2(SyntheticModels.Config)}. */
     public static GgufTestWriter gemma2(Config c) {
-        requireAttention(c, "gemma2");
-        requirePositive("gemma2 sliding window", c.slidingWindow());
-        GgufTestWriter w = base("gemma2", c);
-        attentionKeys(w, c, true);
-        w.f32(w.archKey("rope.freq_base"), c.ropeFreqBase());
-        w.f32(w.archKey("attention.layer_norm_rms_epsilon"), c.normEps());
-        w.f32(w.archKey("attn_logit_softcapping"), c.attnLogitSoftcap());
-        w.f32(w.archKey("final_logit_softcapping"), c.finalLogitSoftcap());
-        w.u32(w.archKey("attention.sliding_window"), c.slidingWindow());
-        spmVocab(w, c.nVocab(),
-                new String[] {"<pad>", "<eos>", "<bos>", "<unk>", "<start_of_turn>", "<end_of_turn>"},
-                new int[] {TOKEN_TYPE_CONTROL, TOKEN_TYPE_CONTROL, TOKEN_TYPE_CONTROL, TOKEN_TYPE_UNKNOWN,
-                        TOKEN_TYPE_CONTROL, TOKEN_TYPE_CONTROL});
-        w.u32("tokenizer.ggml.padding_token_id", 0).u32("tokenizer.ggml.eos_token_id", 1)
-                .u32("tokenizer.ggml.bos_token_id", 2).u32("tokenizer.ggml.unknown_token_id", 3)
-                .bool("tokenizer.ggml.add_bos_token", true).bool("tokenizer.ggml.add_eos_token", false)
-                .bool("tokenizer.ggml.add_space_prefix", false);
-
-        Tensors t = new Tensors(w, c);
-        t.matrix("token_embd.weight", c.nEmbd(), c.nVocab());
-        for (int il = 0; il < c.nLayer(); il++) {
-            t.ones(blk(il, "attn_norm.weight"), c.nEmbd());
-            t.qkvo(il, c.nHead() * c.headDim());
-            t.ones(blk(il, "post_attention_norm.weight"), c.nEmbd());
-            t.ones(blk(il, "ffn_norm.weight"), c.nEmbd());
-            t.gatedFfn(il, c.nFf());
-            t.ones(blk(il, "post_ffw_norm.weight"), c.nEmbd());
-        }
-        t.ones("output_norm.weight", c.nEmbd());
-        return w;
+        return SyntheticDenseModels.gemma2(c);
     }
 
-    // ================================================================== qwen3next
+    /** LLM_ARCH_QWEN2VL: the qwen2 tensor set with the four M-RoPE sections; see {@link SyntheticDenseModels}. */
+    public static GgufTestWriter qwen2vl() {
+        return SyntheticDenseModels.qwen2vl();
+    }
 
+    /** {@link #qwen2vl()} over {@code c}; see {@link SyntheticDenseModels#qwen2vl(SyntheticModels.Config)}. */
+    public static GgufTestWriter qwen2vl(Config c) {
+        return SyntheticDenseModels.qwen2vl(c);
+    }
+
+    /**
+     * LLM_ARCH_LIMITE: value embeddings, XSA with per-head alphas, learned residual scales, MUDD connections and the
+     * sigmoid logit cap; see {@link SyntheticDenseModels#limite(SyntheticModels.Config)}.
+     */
+    public static GgufTestWriter limite() {
+        return SyntheticDenseModels.limite();
+    }
+
+    /** {@link #limite()} over {@code c}; see {@link SyntheticDenseModels#limite(SyntheticModels.Config)}. */
+    public static GgufTestWriter limite(Config c) {
+        return SyntheticDenseModels.limite(c);
+    }
+
+    // ================================================================== routed experts
+
+    /**
+     * LLM_ARCH_GLM4_MOE: one leading dense block, sigmoid-gated experts with a selection bias and a shared expert,
+     * then {@code nextn} NextN / MTP blocks; see {@link SyntheticMoeModels#glm4moe(SyntheticModels.Config, int)}.
+     */
+    public static GgufTestWriter glm4moe(Config c, int nextn) {
+        return SyntheticMoeModels.glm4moe(c, nextn);
+    }
+
+    /** LLM_ARCH_QWEN3MOE: GQA attention over softmax-gated, renormalized experts; see {@link SyntheticMoeModels}. */
+    public static GgufTestWriter qwen3moe() {
+        return SyntheticMoeModels.qwen3moe();
+    }
+
+    /** {@link #qwen3moe()} over {@code c}; see {@link SyntheticMoeModels#qwen3moe(SyntheticModels.Config)}. */
+    public static GgufTestWriter qwen3moe(Config c) {
+        return SyntheticMoeModels.qwen3moe(c);
+    }
+
+    // ================================================================== hybrids
+
+    /**
+     * LLM_ARCH_QWEN3NEXT: hybrid gated-delta-net + attention + MoE; see
+     * {@link SyntheticHybridModels#qwen3next(SyntheticModels.Config)}.
+     */
     public static GgufTestWriter qwen3next() {
-        return qwen3next(Config.qwen3next());
+        return SyntheticHybridModels.qwen3next();
     }
 
-    /**
-     * LLM_ARCH_QWEN3NEXT: layer {@code il} is full attention when
-     * {@code (il + 1) % full_attention_interval == 0}, else a gated delta net in the
-     * {@code attn_qkv}/{@code attn_gate} layout. Attention layers have a gated Q projection
-     * ({@code 2 * n_head * head_dim} rows) and per-head Q/K norms. Every layer has a routed MoE with
-     * a sigmoid-gated shared expert. GDN dims: head_k = head_v = {@code ssm.state_size},
-     * k heads = {@code ssm.group_count}, v heads = {@code ssm.time_step_rank}.
-     */
+    /** {@link #qwen3next()} over {@code c}; see {@link SyntheticHybridModels#qwen3next(SyntheticModels.Config)}. */
     public static GgufTestWriter qwen3next(Config c) {
-        requireAttention(c, "qwen3next");
-        requirePositive("qwen3next expert count", c.nExpert());
-        if (c.nExpertUsed() <= 0 || c.nExpertUsed() > c.nExpert()) {
-            throw new IllegalArgumentException("qwen3next expert_used_count must be in [1, " + c.nExpert() + "], got "
-                    + c.nExpertUsed());
-        }
-        requirePositive("qwen3next expert feed-forward length", c.nFfExp());
-        requirePositive("qwen3next shared expert feed-forward length", c.nFfShexp());
-        requirePositive("qwen3next full attention interval", c.fullAttentionInterval());
-        requireSsm(c, "qwen3next");
-        if (c.ssmDtRank() % c.ssmGroups() != 0) {
-            throw new IllegalArgumentException("qwen3next value heads (" + c.ssmDtRank()
-                    + ") must be a multiple of key heads (" + c.ssmGroups() + ")");
-        }
-        if (c.nRot() <= 0 || c.nRot() > c.headDim() || c.nRot() % 2 != 0) {
-            throw new IllegalArgumentException("qwen3next rope dimension must be even and in (0, head dim], got "
-                    + c.nRot());
-        }
-        long headK = c.ssmState();
-        long headV = c.ssmState();
-        long keyDim = headK * c.ssmGroups();
-        long valueDim = headV * c.ssmDtRank();
-        long convDim = keyDim * 2 + valueDim;
-
-        GgufTestWriter w = base("qwen3next", c);
-        attentionKeys(w, c, true);
-        w.u32(w.archKey("rope.dimension_count"), c.nRot());
-        w.f32(w.archKey("rope.freq_base"), c.ropeFreqBase());
-        w.f32(w.archKey("attention.layer_norm_rms_epsilon"), c.normEps());
-        w.u32(w.archKey("expert_count"), c.nExpert());
-        w.u32(w.archKey("expert_used_count"), c.nExpertUsed());
-        w.u32(w.archKey("expert_feed_forward_length"), c.nFfExp());
-        w.u32(w.archKey("expert_shared_feed_forward_length"), c.nFfShexp());
-        w.u32(w.archKey("ssm.conv_kernel"), c.ssmConv());
-        w.u32(w.archKey("ssm.state_size"), c.ssmState());
-        w.u32(w.archKey("ssm.group_count"), c.ssmGroups());
-        w.u32(w.archKey("ssm.time_step_rank"), c.ssmDtRank());
-        w.u32(w.archKey("ssm.inner_size"), valueDim);
-        w.u32(w.archKey("full_attention_interval"), c.fullAttentionInterval());
-        bpeVocab(w, c.nVocab(), "qwen2", new String[] {"<|endoftext|>", "<|im_start|>", "<|im_end|>"});
-        w.u32("tokenizer.ggml.bos_token_id", 0).u32("tokenizer.ggml.padding_token_id", 0)
-                .u32("tokenizer.ggml.eos_token_id", 2).bool("tokenizer.ggml.add_bos_token", false);
-
-        Tensors t = new Tensors(w, c);
-        t.matrix("token_embd.weight", c.nEmbd(), c.nVocab());
-        for (int il = 0; il < c.nLayer(); il++) {
-            t.ones(blk(il, "attn_norm.weight"), c.nEmbd());
-            t.ones(blk(il, "post_attention_norm.weight"), c.nEmbd());
-            if ((il + 1) % c.fullAttentionInterval() == 0) {
-                t.qkvo(il, 2L * c.nHead() * c.headDim());
-                t.ones(blk(il, "attn_q_norm.weight"), c.headDim());
-                t.ones(blk(il, "attn_k_norm.weight"), c.headDim());
-            } else {
-                t.matrix(blk(il, "attn_qkv.weight"), c.nEmbd(), convDim);
-                t.matrix(blk(il, "attn_gate.weight"), c.nEmbd(), valueDim);
-                t.random(blk(il, "ssm_conv1d.weight"), -0.3f, 0.3f, c.ssmConv(), convDim);
-                t.random(blk(il, "ssm_dt.bias"), -0.5f, 0.5f, c.ssmDtRank());
-                t.random(blk(il, "ssm_a"), -1.5f, -0.5f, c.ssmDtRank());
-                t.matrix(blk(il, "ssm_ba.weight"), c.nEmbd(), 2L * c.ssmDtRank());
-                t.ones(blk(il, "ssm_norm.weight"), headV);
-                t.matrix(blk(il, "ssm_out.weight"), valueDim, c.nEmbd());
-            }
-            t.random(blk(il, "ffn_gate_inp.weight"), -0.1f, 0.1f, c.nEmbd(), c.nExpert());
-            t.matrix(blk(il, "ffn_gate_exps.weight"), c.nEmbd(), c.nFfExp(), c.nExpert());
-            t.matrix(blk(il, "ffn_up_exps.weight"), c.nEmbd(), c.nFfExp(), c.nExpert());
-            t.matrix(blk(il, "ffn_down_exps.weight"), c.nFfExp(), c.nEmbd(), c.nExpert());
-            t.random(blk(il, "ffn_gate_inp_shexp.weight"), -0.1f, 0.1f, c.nEmbd());
-            t.matrix(blk(il, "ffn_gate_shexp.weight"), c.nEmbd(), c.nFfShexp());
-            t.matrix(blk(il, "ffn_up_shexp.weight"), c.nEmbd(), c.nFfShexp());
-            t.matrix(blk(il, "ffn_down_shexp.weight"), c.nFfShexp(), c.nEmbd());
-        }
-        t.ones("output_norm.weight", c.nEmbd());
-        if (!c.tiedOutput()) {
-            t.matrix("output.weight", c.nEmbd(), c.nVocab());
-        }
-        return w;
+        return SyntheticHybridModels.qwen3next(c);
     }
 
-    // ================================================================== mamba2
+    /**
+     * LLM_ARCH_LFM3: gated SWA attention alternating with short convolutions, causal by default; see
+     * {@link SyntheticHybridModels#lfm3(SyntheticModels.Config, boolean)}.
+     */
+    public static GgufTestWriter lfm3() {
+        return SyntheticHybridModels.lfm3();
+    }
 
+    /** {@link #lfm3()} over {@code c} with the causal switch; see {@link SyntheticHybridModels}. */
+    public static GgufTestWriter lfm3(Config c, boolean causal) {
+        return SyntheticHybridModels.lfm3(c, causal);
+    }
+
+    /**
+     * LLM_ARCH_LFM2: short convolutions alternating with attention, tied head by default; see
+     * {@link SyntheticHybridModels#lfm2(SyntheticModels.Config)}.
+     */
+    public static GgufTestWriter lfm2() {
+        return SyntheticHybridModels.lfm2();
+    }
+
+    /** {@link #lfm2()} over {@code c}; see {@link SyntheticHybridModels#lfm2(SyntheticModels.Config)}. */
+    public static GgufTestWriter lfm2(Config c) {
+        return SyntheticHybridModels.lfm2(c);
+    }
+
+    /** LLM_ARCH_PLAMO2: alternating PLaMo-2 Mamba and fused-QKV attention layers; see {@link SyntheticHybridModels}. */
+    public static GgufTestWriter plamo2() {
+        return SyntheticHybridModels.plamo2();
+    }
+
+    /** {@link #plamo2()} over {@code c}; see {@link SyntheticHybridModels#plamo2(SyntheticModels.Config)}. */
+    public static GgufTestWriter plamo2(Config c) {
+        return SyntheticHybridModels.plamo2(c);
+    }
+
+    /**
+     * LLM_ARCH_KIMI_LINEAR: alternating KDA and absorbed-MLA layers over sigmoid-routed experts; see
+     * {@link SyntheticHybridModels#kimiLinear(SyntheticModels.Config)}.
+     */
+    public static GgufTestWriter kimiLinear() {
+        return SyntheticHybridModels.kimiLinear();
+    }
+
+    /** {@link #kimiLinear()} over {@code c}; see {@link SyntheticHybridModels#kimiLinear(SyntheticModels.Config)}. */
+    public static GgufTestWriter kimiLinear(Config c) {
+        return SyntheticHybridModels.kimiLinear(c);
+    }
+
+    // ================================================================== SSM decoders
+
+    /** LLM_ARCH_MAMBA2: attention-free SSD blocks; see {@link SyntheticRecurrentModels#mamba2(SyntheticModels.Config)}. */
     public static GgufTestWriter mamba2() {
-        return mamba2(Config.mamba2());
+        return SyntheticRecurrentModels.mamba2();
     }
 
-    /**
-     * LLM_ARCH_MAMBA2: attention-free SSD blocks. {@code conv_dim = d_inner + 2*n_group*d_state},
-     * {@code ssm_in} rows {@code = d_inner + conv_dim + n_heads} with n_heads =
-     * {@code ssm.time_step_rank}; head dim {@code = d_inner / n_heads}.
-     */
+    /** {@link #mamba2()} over {@code c}; see {@link SyntheticRecurrentModels#mamba2(SyntheticModels.Config)}. */
     public static GgufTestWriter mamba2(Config c) {
-        requireSsm(c, "mamba2");
-        requirePositive("mamba2 inner size", c.ssmInner());
-        if (c.ssmInner() % c.ssmDtRank() != 0 || c.ssmInner() % c.ssmGroups() != 0
-                || c.ssmDtRank() % c.ssmGroups() != 0) {
-            throw new IllegalArgumentException("mamba2 needs d_inner (" + c.ssmInner() + ") divisible by heads ("
-                    + c.ssmDtRank() + ") and groups (" + c.ssmGroups() + "), and heads divisible by groups");
-        }
-        long convDim = c.ssmInner() + 2L * c.ssmGroups() * c.ssmState();
-        long inProj = c.ssmInner() + convDim + c.ssmDtRank();
-
-        GgufTestWriter w = base("mamba2", c);
-        w.u32(w.archKey("feed_forward_length"), 0);
-        w.u32(w.archKey("attention.head_count"), 0);
-        w.u32(w.archKey("ssm.conv_kernel"), c.ssmConv());
-        w.u32(w.archKey("ssm.inner_size"), c.ssmInner());
-        w.u32(w.archKey("ssm.state_size"), c.ssmState());
-        w.u32(w.archKey("ssm.time_step_rank"), c.ssmDtRank());
-        w.u32(w.archKey("ssm.group_count"), c.ssmGroups());
-        w.f32(w.archKey("attention.layer_norm_rms_epsilon"), c.normEps());
-        bpeVocab(w, c.nVocab(), "gpt-2", new String[] {"<|endoftext|>"});
-        w.u32("tokenizer.ggml.bos_token_id", 0).u32("tokenizer.ggml.eos_token_id", 0)
-                .bool("tokenizer.ggml.add_bos_token", false);
-
-        Tensors t = new Tensors(w, c);
-        t.matrix("token_embd.weight", c.nEmbd(), c.nVocab());
-        for (int il = 0; il < c.nLayer(); il++) {
-            t.ones(blk(il, "attn_norm.weight"), c.nEmbd());
-            t.matrix(blk(il, "ssm_in.weight"), c.nEmbd(), inProj);
-            t.random(blk(il, "ssm_conv1d.weight"), -0.3f, 0.3f, c.ssmConv(), convDim);
-            t.random(blk(il, "ssm_conv1d.bias"), -0.02f, 0.02f, convDim);
-            t.random(blk(il, "ssm_dt.bias"), -0.5f, 0.5f, c.ssmDtRank());
-            t.random(blk(il, "ssm_a"), -1.5f, -0.5f, 1, c.ssmDtRank());
-            t.ones(blk(il, "ssm_d"), 1, c.ssmDtRank());
-            t.ones(blk(il, "ssm_norm.weight"), c.ssmInner() / c.ssmGroups(), c.ssmGroups());
-            t.matrix(blk(il, "ssm_out.weight"), c.ssmInner(), c.nEmbd());
-        }
-        t.ones("output_norm.weight", c.nEmbd());
-        if (!c.tiedOutput()) {
-            t.matrix("output.weight", c.nEmbd(), c.nVocab());
-        }
-        return w;
+        return SyntheticRecurrentModels.mamba2(c);
     }
 
-    // ================================================================== bert
+    /** LLM_ARCH_MAMBA: selective-scan blocks in the Mamba-1 layout; see {@link SyntheticRecurrentModels}. */
+    public static GgufTestWriter mamba() {
+        return SyntheticRecurrentModels.mamba();
+    }
 
-    public static GgufTestWriter bert() {
-        return bert(Config.bert());
+    /** {@link #mamba()} over {@code c}; see {@link SyntheticRecurrentModels#mamba(SyntheticModels.Config)}. */
+    public static GgufTestWriter mamba(Config c) {
+        return SyntheticRecurrentModels.mamba(c);
+    }
+
+    // ================================================================== latent attention and DSA
+
+    /** LLM_ARCH_DEEPSEEK2: MLA with the q_lora path and a dense lead block; see {@link SyntheticMlaDsaModels}. */
+    public static GgufTestWriter deepseek2() {
+        return SyntheticMlaDsaModels.deepseek2();
+    }
+
+    /** {@link #deepseek2()} over {@code c}; see {@link SyntheticMlaDsaModels#deepseek2(SyntheticModels.Config)}. */
+    public static GgufTestWriter deepseek2(Config c) {
+        return SyntheticMlaDsaModels.deepseek2(c);
+    }
+
+    /** LLM_ARCH_DEEPSEEK32: the deepseek2 layers plus the DSA lightning indexer; see {@link SyntheticMlaDsaModels}. */
+    public static GgufTestWriter deepseek32() {
+        return SyntheticMlaDsaModels.deepseek32();
+    }
+
+    /** {@link #deepseek32()} over {@code c}; see {@link SyntheticMlaDsaModels#deepseek32(SyntheticModels.Config)}. */
+    public static GgufTestWriter deepseek32(Config c) {
+        return SyntheticMlaDsaModels.deepseek32(c);
     }
 
     /**
-     * LLM_ARCH_BERT: non-causal encoder with learned positions, token-type embeddings, post-norm
-     * LayerNorm blocks with biases and mean pooling. Requires {@code n_head_kv == n_head} and
-     * {@code n_head * head_dim == n_embd}; there is no output head.
+     * LLM_ARCH_MISTRAL_LARGE4: MLA (no Q LoRA) with the DSA indexer, SSMax and a KV source map; see
+     * {@link SyntheticMlaDsaModels#mistralLarge4(SyntheticModels.Config)}.
      */
+    public static GgufTestWriter mistralLarge4() {
+        return SyntheticMlaDsaModels.mistralLarge4();
+    }
+
+    /** {@link #mistralLarge4()} over {@code c}; see {@link SyntheticMlaDsaModels#mistralLarge4(SyntheticModels.Config)}. */
+    public static GgufTestWriter mistralLarge4(Config c) {
+        return SyntheticMlaDsaModels.mistralLarge4(c);
+    }
+
+    /**
+     * A mistral-large4 file whose layer 0 rotates and whose other layers are NoPE ({@code attention.rope_pattern});
+     * see {@link SyntheticMlaDsaModels#mistralLarge4NoPe(SyntheticModels.Config)}.
+     */
+    public static GgufTestWriter mistralLarge4NoPe(Config c) {
+        return SyntheticMlaDsaModels.mistralLarge4NoPe(c);
+    }
+
+    // ================================================================== encoders
+
+    /** LLM_ARCH_BERT: non-causal encoder with learned positions and mean pooling; see {@link SyntheticEncoderModels}. */
+    public static GgufTestWriter bert() {
+        return SyntheticEncoderModels.bert();
+    }
+
+    /** {@link #bert()} over {@code c}; see {@link SyntheticEncoderModels#bert(SyntheticModels.Config)}. */
     public static GgufTestWriter bert(Config c) {
-        requireAttention(c, "bert");
-        if (c.nHeadKv() != c.nHead() || (long) c.nHead() * c.headDim() != c.nEmbd()) {
-            throw new IllegalArgumentException("bert requires n_head_kv == n_head and n_head * head_dim == n_embd");
-        }
-        GgufTestWriter w = base("bert", c);
-        w.u32(w.archKey("feed_forward_length"), c.nFf());
-        w.u32(w.archKey("attention.head_count"), c.nHead());
-        w.f32(w.archKey("attention.layer_norm_epsilon"), c.normEps());
-        w.bool(w.archKey("attention.causal"), false);
-        w.u32(w.archKey("pooling_type"), POOLING_MEAN);
-        wpmVocab(w, c.nVocab());
-        w.u32("tokenizer.ggml.token_type_count", BERT_TOKEN_TYPES)
-                .u32("tokenizer.ggml.padding_token_id", 0).u32("tokenizer.ggml.unknown_token_id", 1)
-                .u32("tokenizer.ggml.cls_token_id", 2).u32("tokenizer.ggml.seperator_token_id", 3)
-                .u32("tokenizer.ggml.mask_token_id", 4);
-
-        Tensors t = new Tensors(w, c);
-        t.matrix("token_embd.weight", c.nEmbd(), c.nVocab());
-        t.random("token_types.weight", -0.1f, 0.1f, c.nEmbd(), BERT_TOKEN_TYPES);
-        t.random("position_embd.weight", -0.1f, 0.1f, c.nEmbd(), c.nCtxTrain());
-        t.layerNorm("token_embd_norm", c.nEmbd());
-        for (int il = 0; il < c.nLayer(); il++) {
-            for (String p : new String[] {"attn_q", "attn_k", "attn_v", "attn_output"}) {
-                t.matrix(blk(il, p + ".weight"), c.nEmbd(), c.nEmbd());
-                t.bias(blk(il, p + ".bias"), c.nEmbd());
-            }
-            t.layerNorm(blk(il, "attn_output_norm"), c.nEmbd());
-            t.matrix(blk(il, "ffn_up.weight"), c.nEmbd(), c.nFf());
-            t.bias(blk(il, "ffn_up.bias"), c.nFf());
-            t.matrix(blk(il, "ffn_down.weight"), c.nFf(), c.nEmbd());
-            t.bias(blk(il, "ffn_down.bias"), c.nEmbd());
-            t.layerNorm(blk(il, "layer_output_norm"), c.nEmbd());
-        }
-        return w;
+        return SyntheticEncoderModels.bert(c);
     }
 
-    // ================================================================== shared metadata
-
-    private static GgufTestWriter base(String arch, Config c) {
-        GgufTestWriter w = new GgufTestWriter().architecture(arch);
-        w.str("general.name", "synthetic-" + arch);
-        w.u32(w.archKey("vocab_size"), c.nVocab());
-        w.u32(w.archKey("context_length"), c.nCtxTrain());
-        w.u32(w.archKey("embedding_length"), c.nEmbd());
-        w.u32(w.archKey("block_count"), c.nLayer());
-        return w;
+    /** LLM_ARCH_T5: encoder-decoder with relative-position bias and cross-attention; see {@link SyntheticEncoderModels}. */
+    public static GgufTestWriter t5() {
+        return SyntheticEncoderModels.t5();
     }
 
-    /** Head counts and FFN length; key/value lengths when forced or when they differ from n_embd/n_head. */
-    private static void attentionKeys(GgufTestWriter w, Config c, boolean alwaysHeadDim) {
-        w.u32(w.archKey("feed_forward_length"), c.nFf());
-        w.u32(w.archKey("attention.head_count"), c.nHead());
-        w.u32(w.archKey("attention.head_count_kv"), c.nHeadKv());
-        if (alwaysHeadDim || (long) c.nHead() * c.headDim() != c.nEmbd()) {
-            w.u32(w.archKey("attention.key_length"), c.headDim());
-            w.u32(w.archKey("attention.value_length"), c.headDim());
+    /** {@link #t5()} over {@code c}; see {@link SyntheticEncoderModels#t5(SyntheticModels.Config)}. */
+    public static GgufTestWriter t5(Config c) {
+        return SyntheticEncoderModels.t5(c);
+    }
+
+    // ================================================================== decision readouts
+
+    /** LLM_ARCH_VLLM_DECISION2 with the systemone template and calibration keys; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter vllmDecision2() {
+        return SyntheticDecisionModels.vllmDecision2();
+    }
+
+    /** {@link #vllmDecision2()} over {@code c}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter vllmDecision2(Config c) {
+        return SyntheticDecisionModels.vllmDecision2(c);
+    }
+
+    /** {@link #vllmDecision2(Config)} with {@code systemoneTemplate}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter vllmDecision2(Config c, String systemoneTemplate) {
+        return SyntheticDecisionModels.vllmDecision2(c, systemoneTemplate);
+    }
+
+    /** A label decision readout over a qwen2 trunk; see {@link SyntheticDecisionModels#decisionLabels(String)}. */
+    public static GgufTestWriter decisionLabels(String type) {
+        return SyntheticDecisionModels.decisionLabels(type);
+    }
+
+    /** {@link #decisionLabels(String)} over {@code c}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter decisionLabels(String type, Config c) {
+        return SyntheticDecisionModels.decisionLabels(type, c);
+    }
+
+    /** {@link #decisionLabels(String)} with {@code systemoneTemplate}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter decisionLabels(String type, Config c, String systemoneTemplate) {
+        return SyntheticDecisionModels.decisionLabels(type, c, systemoneTemplate);
+    }
+
+    /** The kev decision readout with its {@code <|box_end|>} marker token; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter decisionKev() {
+        return SyntheticDecisionModels.decisionKev();
+    }
+
+    /** {@link #decisionKev()} over {@code c}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter decisionKev(Config c) {
+        return SyntheticDecisionModels.decisionKev(c);
+    }
+
+    /** {@link #decisionKev(Config)} with {@code systemoneTemplate}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter decisionKev(Config c, String systemoneTemplate) {
+        return SyntheticDecisionModels.decisionKev(c, systemoneTemplate);
+    }
+
+    /** The modern-bert decision fixture with the laya readout; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter modernBertDecision() {
+        return SyntheticDecisionModels.modernBertDecision();
+    }
+
+    /** {@link #modernBertDecision()} over {@code c}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter modernBertDecision(Config c) {
+        return SyntheticDecisionModels.modernBertDecision(c);
+    }
+
+    /** The h2o-lightning fixture: the label readout over {@code decision.labels}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter h2oLightning() {
+        return SyntheticDecisionModels.h2oLightning();
+    }
+
+    /** {@link #h2oLightning()} over {@code c}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter h2oLightning(Config c) {
+        return SyntheticDecisionModels.h2oLightning(c);
+    }
+
+    /** The minicpm-ocr-jev fixture: the pooled two-class readout; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter minicpmOcrJev() {
+        return SyntheticDecisionModels.minicpmOcrJev();
+    }
+
+    /** {@link #minicpmOcrJev()} over {@code c}; see {@link SyntheticDecisionModels}. */
+    public static GgufTestWriter minicpmOcrJev(Config c) {
+        return SyntheticDecisionModels.minicpmOcrJev(c);
+    }
+
+    // ================================================================== d1 decision readouts
+
+    /** The lfm2-d1 fixture: the plain LFM2 trunk with the d1 decision type; see {@link SyntheticD1Models}. */
+    public static GgufTestWriter lfm2Decision() {
+        return SyntheticD1Models.lfm2Decision();
+    }
+
+    /** {@link #lfm2Decision()} over {@code c}; see {@link SyntheticD1Models#lfm2Decision(SyntheticModels.Config)}. */
+    public static GgufTestWriter lfm2Decision(Config c) {
+        return SyntheticD1Models.lfm2Decision(c);
+    }
+
+    /** The lfm2-d1-omni fixture: the mask-marker read over one decision block; see {@link SyntheticD1Models}. */
+    public static GgufTestWriter lfm2D1Omni() {
+        return SyntheticD1Models.lfm2D1Omni();
+    }
+
+    /** {@link #lfm2D1Omni()} over {@code c}; see {@link SyntheticD1Models#lfm2D1Omni(SyntheticModels.Config)}. */
+    public static GgufTestWriter lfm2D1Omni(Config c) {
+        return SyntheticD1Models.lfm2D1Omni(c);
+    }
+
+    /** The lfm3-d1 fixture: the non-causal LFM3 trunk with the d1 readout; see {@link SyntheticD1Models}. */
+    public static GgufTestWriter lfm3D1() {
+        return SyntheticD1Models.lfm3D1();
+    }
+
+    /** {@link #lfm3D1()} over {@code c}; see {@link SyntheticD1Models#lfm3D1(SyntheticModels.Config)}. */
+    public static GgufTestWriter lfm3D1(Config c) {
+        return SyntheticD1Models.lfm3D1(c);
+    }
+
+    /** The lfm3-d1-omni fixture: the d1 readout with the think marker; see {@link SyntheticD1Models}. */
+    public static GgufTestWriter lfm3D1Omni() {
+        return SyntheticD1Models.lfm3D1Omni();
+    }
+
+    /** {@link #lfm3D1Omni()} over {@code c}; see {@link SyntheticD1Models#lfm3D1Omni(SyntheticModels.Config)}. */
+    public static GgufTestWriter lfm3D1Omni(Config c) {
+        return SyntheticD1Models.lfm3D1Omni(c);
+    }
+
+    // ================================================================== audio and drafting
+
+    /** The WavTokenizer decoder fixture; see {@link SyntheticAudioModels#wavtokenizer}. */
+    public static GgufTestWriter wavtokenizer(int sampleRate, int nFft, int hopLength) {
+        return SyntheticAudioModels.wavtokenizer(sampleRate, nFft, hopLength);
+    }
+
+    /** The DFlash drafter fixture; see {@link SyntheticAudioModels#dflashDrafter}. */
+    public static GgufTestWriter dflashDrafter(Config c, int[] targetLayers, int blockSize) {
+        return SyntheticAudioModels.dflashDrafter(c, targetLayers, blockSize);
+    }
+
+    /** {@link #dflashDrafter(Config, int[], int)} with the causal flag and an interleaved sliding window. */
+    public static GgufTestWriter dflashDrafter(Config c, int[] targetLayers, int blockSize, boolean causal, int nSwa,
+                                               boolean[] swaPattern) {
+        return SyntheticAudioModels.dflashDrafter(c, targetLayers, blockSize, causal, nSwa, swaPattern);
+    }
+
+    /** {@link #dflashDrafter(Config, int[], int)} as a DFlash2 drafter. */
+    public static GgufTestWriter dflashDrafter(Config c, int[] targetLayers, int blockSize, boolean causal, int nSwa,
+                                               boolean[] swaPattern, Dflash2 dflash2) {
+        return SyntheticAudioModels.dflashDrafter(c, targetLayers, blockSize, causal, nSwa, swaPattern, dflash2);
+    }
+
+    /**
+     * The DFlash2 settings of a drafter fixture: conv kernel and group sizes and selector rank and top-k
+     * (dflash.cpp:152-177).
+     */
+    public static final class Dflash2 {
+        final int convKernel;
+        final int convGroup;
+        final int selectorRank;
+        final int selectorTopK;
+
+        public Dflash2(int convKernel, int convGroup, int selectorRank, int selectorTopK) {
+            this.convKernel = convKernel;
+            this.convGroup = convGroup;
+            this.selectorRank = selectorRank;
+            this.selectorTopK = selectorTopK;
         }
     }
 
-    private static String blk(int il, String suffix) {
-        return "blk." + il + "." + suffix;
+    // ================================================================== classifier heads
+
+    /** The RANK classifier fixture; see {@link SyntheticClassifiers#rank}. */
+    public static GgufTestWriter rank(String... labels) {
+        return SyntheticClassifiers.rank(labels);
     }
 
-    private static void requireAttention(Config c, String arch) {
-        if (c.nHead() <= 0 || c.nHeadKv() <= 0 || c.headDim() <= 0 || c.nFf() <= 0) {
-            throw new IllegalArgumentException(arch + " needs positive head count, kv head count, head dim and"
-                    + " feed-forward length");
-        }
-        if (c.nHead() % c.nHeadKv() != 0) {
-            throw new IllegalArgumentException(arch + ": n_head (" + c.nHead() + ") must be a multiple of n_head_kv ("
-                    + c.nHeadKv() + ")");
-        }
+    /** The per-token classifier fixture; see {@link SyntheticClassifiers#tokenClassifier}. */
+    public static GgufTestWriter tokenClassifier(String... labels) {
+        return SyntheticClassifiers.tokenClassifier(labels);
     }
 
-    private static void requireSsm(Config c, String arch) {
-        requirePositive(arch + " ssm conv kernel", c.ssmConv());
-        requirePositive(arch + " ssm state size", c.ssmState());
-        requirePositive(arch + " ssm group count", c.ssmGroups());
-        requirePositive(arch + " ssm time step rank", c.ssmDtRank());
+    /** The reward-model fixture; see {@link SyntheticClassifiers#reward}. */
+    public static GgufTestWriter reward() {
+        return SyntheticClassifiers.reward();
     }
 
-    private static void requirePositive(String what, long v) {
-        if (v <= 0) {
-            throw new IllegalArgumentException(what + " must be positive, got " + v);
-        }
+    /** The process-reward fixture; see {@link SyntheticClassifiers#processReward}. */
+    public static GgufTestWriter processReward() {
+        return SyntheticClassifiers.processReward();
+    }
+
+    /** The sequence-classifier fixture; see {@link SyntheticClassifiers#sequenceClassify}. */
+    public static GgufTestWriter sequenceClassify(String... labels) {
+        return SyntheticClassifiers.sequenceClassify(labels);
+    }
+
+    /** The ColBERT late-interaction fixture; see {@link SyntheticClassifiers#colbert}. */
+    public static GgufTestWriter colbert() {
+        return SyntheticClassifiers.colbert();
+    }
+
+    /** The SPLADE sparse-embedding fixture; see {@link SyntheticClassifiers#splade}. */
+    public static GgufTestWriter splade(String kind) {
+        return SyntheticClassifiers.splade(kind);
+    }
+
+    /** The BGE-M3 multi-output fixture; see {@link SyntheticClassifiers#bgeM3}. */
+    public static GgufTestWriter bgeM3() {
+        return SyntheticClassifiers.bgeM3();
     }
 
     // ================================================================== tokenizers
 
-    /** SPM vocab: specials, the 256 {@code <0xNN>} byte tokens, then scored pieces. */
-    private static void spmVocab(GgufTestWriter w, int nVocab, String[] specials, int[] specialTypes) {
-        int fixed = specials.length + 256;
-        requireVocab("SPM", nVocab, fixed + 1);
-        List<String> tokens = new ArrayList<>(nVocab);
-        float[] scores = new float[nVocab];
-        int[] types = new int[nVocab];
-        for (int i = 0; i < specials.length; i++) {
-            tokens.add(specials[i]);
-            types[i] = specialTypes[i];
-        }
-        for (int b = 0; b < 256; b++) {
-            types[tokens.size()] = TOKEN_TYPE_BYTE;
-            tokens.add(String.format("<0x%02X>", b));
-        }
-        List<String> pieces = letterPieces(nVocab - fixed, SPM_SPACE, true);
-        for (int i = 0; i < pieces.size(); i++) {
-            scores[tokens.size()] = -i;
-            types[tokens.size()] = TOKEN_TYPE_NORMAL;
-            tokens.add(pieces.get(i));
-        }
-        w.str("tokenizer.ggml.model", "llama").str("tokenizer.ggml.pre", "default")
-                .strArray("tokenizer.ggml.tokens", tokens).f32Array("tokenizer.ggml.scores", scores)
-                .i32Array("tokenizer.ggml.token_type", types);
-    }
-
-    /** Byte-level BPE vocab: specials, the 256 GPT-2 byte symbols, then two-symbol merges. */
-    private static void bpeVocab(GgufTestWriter w, int nVocab, String pre, String[] specials) {
-        int fixed = specials.length + 256;
-        requireVocab("BPE", nVocab, fixed + 1);
-        List<String> tokens = new ArrayList<>(nVocab);
-        int[] types = new int[nVocab];
-        for (String s : specials) {
-            types[tokens.size()] = TOKEN_TYPE_CONTROL;
-            tokens.add(s);
-        }
-        for (int cp : gpt2ByteSymbols()) {
-            types[tokens.size()] = TOKEN_TYPE_NORMAL;
-            tokens.add(new String(Character.toChars(cp)));
-        }
-        List<String> merges = new ArrayList<>();
-        for (String first : bpeFirstSymbols()) {
-            for (char second = 'a'; second <= 'z' && tokens.size() < nVocab; second++) {
-                types[tokens.size()] = TOKEN_TYPE_NORMAL;
-                tokens.add(first + second);
-                merges.add(first + " " + second);
-            }
-        }
-        if (tokens.size() != nVocab) {
-            throw new IllegalArgumentException("BPE fixture vocab supports at most " + tokens.size() + " tokens, asked "
-                    + nVocab);
-        }
-        w.str("tokenizer.ggml.model", "gpt2").str("tokenizer.ggml.pre", pre)
-                .strArray("tokenizer.ggml.tokens", tokens).i32Array("tokenizer.ggml.token_type", types)
-                .strArray("tokenizer.ggml.merges", merges);
-    }
-
-    /** WordPiece vocab in llama.cpp phantom-space form: words carry U+2581, "##" continuations are bare. */
-    private static void wpmVocab(GgufTestWriter w, int nVocab) {
-        String[] specials = {"[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"};
-        requireVocab("WPM", nVocab, specials.length + 1);
-        List<String> tokens = new ArrayList<>(nVocab);
-        int[] types = new int[nVocab];
-        for (String s : specials) {
-            types[tokens.size()] = TOKEN_TYPE_CONTROL;
-            tokens.add(s);
-        }
-        for (String piece : letterPieces(nVocab - specials.length, SPM_SPACE, false)) {
-            types[tokens.size()] = TOKEN_TYPE_NORMAL;
-            tokens.add(piece);
-        }
-        w.str("tokenizer.ggml.model", "bert").str("tokenizer.ggml.pre", "default")
-                .strArray("tokenizer.ggml.tokens", tokens).i32Array("tokenizer.ggml.token_type", types);
-    }
-
-    private static void requireVocab(String kind, int nVocab, int min) {
-        if (nVocab < min) {
-            throw new IllegalArgumentException(kind + " fixture vocab needs at least " + min + " tokens, got " + nVocab);
-        }
-    }
-
-    /**
-     * {@code count} distinct pieces over a-z by increasing length, each as "{space}word" and as the
-     * bare continuation "word"; the lone space marker comes first when requested.
-     */
-    private static List<String> letterPieces(int count, String space, boolean includeLoneSpace) {
-        Set<String> out = new LinkedHashSet<>();
-        if (includeLoneSpace && count > 0) {
-            out.add(space);
-        }
-        for (int len = 1; out.size() < count; len++) {
-            int combos = (int) Math.pow(26, len);
-            for (int k = 0; k < combos && out.size() < count; k++) {
-                StringBuilder word = new StringBuilder();
-                for (int p = 0, v = k; p < len; p++, v /= 26) {
-                    word.insert(0, (char) ('a' + v % 26));
-                }
-                out.add(space + word);
-                if (out.size() < count) {
-                    out.add(word.toString());
-                }
-            }
-        }
-        return new ArrayList<>(out);
-    }
-
-    /** First symbols of the BPE merges: the GPT-2 space symbol, then a-z. */
-    private static List<String> bpeFirstSymbols() {
-        List<String> out = new ArrayList<>();
-        out.add(BPE_SPACE);
-        for (char ch = 'a'; ch <= 'z'; ch++) {
-            out.add(String.valueOf(ch));
-        }
-        return out;
-    }
-
-    /** Code points of GPT-2 {@code bytes_to_unicode} in its listing order (llama.cpp gguf-py/gguf/vocab.py). */
-    private static int[] gpt2ByteSymbols() {
-        List<Integer> bs = new ArrayList<>();
-        for (int b = '!'; b <= '~'; b++) {
-            bs.add(b);
-        }
-        for (int b = 0xA1; b <= 0xAC; b++) {
-            bs.add(b);
-        }
-        for (int b = 0xAE; b <= 0xFF; b++) {
-            bs.add(b);
-        }
-        List<Integer> cs = new ArrayList<>(bs);
-        int n = 0;
-        for (int b = 0; b < 256; b++) {
-            if (!bs.contains(b)) {
-                bs.add(b);
-                cs.add(256 + n);
-                n++;
-            }
-        }
-        int[] out = new int[cs.size()];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = cs.get(i);
-        }
-        return out;
+    /** The SPM vocab of the llama fixture; see {@link SyntheticText#spm}. */
+    public static void spm(GgufTestWriter w, int nVocab) {
+        SyntheticText.spm(w, nVocab);
     }
 
     // ================================================================== tensor emission
 
     /** Adds tensors to one writer with values derived from the config seed and the tensor name. */
-    private static final class Tensors {
+    static final class Tensors {
         private final GgufTestWriter w;
         private final Config c;
 
@@ -597,6 +707,7 @@ public final class SyntheticModels {
         private final int nHeadKv;
         private final int headDim;
         private final int nRot;
+        private final int kvLora;
         private final int nFf;
         private final int nCtxTrain;
         private final float normEps;
@@ -614,9 +725,11 @@ public final class SyntheticModels {
         private final int ssmState;
         private final int ssmGroups;
         private final int ssmDtRank;
+        private final int kdaHeadDim;
         private final GGMLType weightType;
         private final long seed;
         private final boolean tiedOutput;
+        private final boolean expertBiases;
 
         private Config(Builder b) {
             this.nVocab = b.nVocab;
@@ -626,6 +739,7 @@ public final class SyntheticModels {
             this.nHeadKv = b.nHeadKv;
             this.headDim = b.headDim;
             this.nRot = b.nRot;
+            this.kvLora = b.kvLora;
             this.nFf = b.nFf;
             this.nCtxTrain = b.nCtxTrain;
             this.normEps = b.normEps;
@@ -643,9 +757,11 @@ public final class SyntheticModels {
             this.ssmState = b.ssmState;
             this.ssmGroups = b.ssmGroups;
             this.ssmDtRank = b.ssmDtRank;
+            this.kdaHeadDim = b.kdaHeadDim;
             this.weightType = b.weightType;
             this.seed = b.seed;
             this.tiedOutput = b.tiedOutput;
+            this.expertBiases = b.expertBiases;
         }
 
         /** 2 layers, n_embd 64, 4 heads / 2 KV heads of dim 16, FFN 128, vocab 320, F32. */
@@ -666,15 +782,71 @@ public final class SyntheticModels {
                     .ssmGroups(2).ssmDtRank(4).build();
         }
 
+        /** 2 layers of plain GQA attention with the Qwen2 biases, FFN 128, RMS eps 1e-6. */
+        public static Config qwen2() {
+            return attentionDefaults().nLayer(2).nRot(16).normEps(1e-6f).build();
+        }
+
+        /** 2 layers of plain GQA attention over a routed MoE (4 experts, 2 used, FFN 32). */
+        public static Config qwen3moe() {
+            return attentionDefaults().nLayer(2).nRot(16).normEps(1e-6f).ropeFreqBase(1.0e7f).nExpert(4)
+                    .nExpertUsed(2).nFfExp(32).build();
+        }
+
         /** 2 layers, d_inner 128, d_state 16, 1 group, 8 heads of dim 16, conv 4. */
         public static Config mamba2() {
             return new Builder().nLayer(2).nHead(0).nHeadKv(0).headDim(0).nRot(0).nFf(0).normEps(1e-5f)
                     .ssmConv(4).ssmInner(128).ssmState(16).ssmGroups(1).ssmDtRank(8).build();
         }
 
+        /** 2 layers, d_inner 128 (= 2 * n_embd), d_state 16, dt rank 8, conv 4; the Mamba-1 layout, no groups. */
+        public static Config mamba() {
+            return new Builder().nLayer(2).nHead(0).nHeadKv(0).headDim(0).nRot(0).nFf(0).normEps(1e-5f)
+                    .ssmConv(4).ssmInner(128).ssmState(16).ssmDtRank(8).build();
+        }
+
+        /** 4 layers (Mamba, attention, Mamba, attention), 4 heads of dim 16, FFN 128, d_inner 128 in 4 heads. */
+        public static Config plamo2() {
+            return attentionDefaults().nLayer(4).nHeadKv(4).normEps(1e-6f).ssmConv(4).ssmInner(128).ssmState(16)
+                    .ssmDtRank(4).build();
+        }
+
+        /** 4 layers (KDA, MLA, KDA, MLA), MLA head 32 (nope-only) over latent 32, KDA head 16, 4 experts / 2 used. */
+        public static Config kimiLinear() {
+            return attentionDefaults().nLayer(4).nHeadKv(4).headDim(32).nRot(0).normEps(1e-6f).nExpert(4)
+                    .nExpertUsed(2).nFfExp(32).ssmConv(4).kdaHeadDim(16).build();
+        }
+
+        /** 4 layers (SWA attention, convolution, full attention, convolution), l_cache 4, window 32. */
+        public static Config lfm3() {
+            return attentionDefaults().nLayer(4).nRot(16).normEps(1e-6f).slidingWindow(32).ssmConv(4)
+                    .tiedOutput(true).build();
+        }
+
+        /** 4 layers (convolution, attention, convolution, attention), l_cache 4, tied output head. */
+        public static Config lfm2() {
+            return attentionDefaults().nLayer(4).nRot(16).normEps(1e-6f).ssmConv(4).tiedOutput(true).build();
+        }
+
+        /** 2 layers (SWA attention with the ve gate, full attention with the output gate), mudd width 32. */
+        public static Config limite() {
+            return attentionDefaults().nLayer(2).nRot(16).normEps(1e-6f).slidingWindow(16).nFfExp(32).build();
+        }
+
+        /** 2 layers, 4 heads of MLA dim 32 (16 rotary), 4 experts of width 48, layer 1 MoE. */
+        public static Config mistralLarge4() {
+            return attentionDefaults().nLayer(2).headDim(32).nRot(16).nFf(128).nFfExp(48).nExpert(4).normEps(1e-6f)
+                    .build();
+        }
+
         /** 2 layers, 4 heads of dim 16 (MHA), FFN 128, 128 positions, LayerNorm eps 1e-12. */
         public static Config bert() {
             return attentionDefaults().nLayer(2).nHeadKv(4).nCtxTrain(128).normEps(1e-12f).build();
+        }
+
+        /** 2 encoder and 2 decoder layers, 4 heads of dim 16 (MHA), FFN 128, RMS eps 1e-6. */
+        public static Config t5() {
+            return attentionDefaults().nLayer(2).nHeadKv(4).normEps(1e-6f).build();
         }
 
         private static Builder attentionDefaults() {
@@ -692,6 +864,8 @@ public final class SyntheticModels {
         public int nHeadKv() { return nHeadKv; }
         public int headDim() { return headDim; }
         public int nRot() { return nRot; }
+        /** Rank of the DeepSeek MLA latent rows; the absorbed cache stores {@code kvLora + nRot} values per row. */
+        public int kvLora() { return kvLora; }
         public int nFf() { return nFf; }
         public int nCtxTrain() { return nCtxTrain; }
         public float normEps() { return normEps; }
@@ -709,9 +883,12 @@ public final class SyntheticModels {
         public int ssmState() { return ssmState; }
         public int ssmGroups() { return ssmGroups; }
         public int ssmDtRank() { return ssmDtRank; }
+        /** Head width of the KDA layers; unrelated to the attention head dim. */
+        public int kdaHeadDim() { return kdaHeadDim; }
         public GGMLType weightType() { return weightType; }
         public long seed() { return seed; }
         public boolean tiedOutput() { return tiedOutput; }
+        public boolean expertBiases() { return expertBiases; }
 
         /** Mutable builder for {@link Config}; {@link #build()} validates the shared fields. */
         public static final class Builder {
@@ -722,6 +899,7 @@ public final class SyntheticModels {
             private int nHeadKv;
             private int headDim;
             private int nRot;
+            private int kvLora = SyntheticMlaDsaModels.KV_LORA;
             private int nFf;
             private int nCtxTrain = 256;
             private float normEps = 1e-5f;
@@ -739,9 +917,11 @@ public final class SyntheticModels {
             private int ssmState;
             private int ssmGroups;
             private int ssmDtRank;
+            private int kdaHeadDim;
             private GGMLType weightType = GGMLType.F32;
             private long seed = 42L;
             private boolean tiedOutput;
+            private boolean expertBiases;
 
             public Builder() {
             }
@@ -771,9 +951,11 @@ public final class SyntheticModels {
                 ssmState = c.ssmState;
                 ssmGroups = c.ssmGroups;
                 ssmDtRank = c.ssmDtRank;
+                kdaHeadDim = c.kdaHeadDim;
                 weightType = c.weightType;
                 seed = c.seed;
                 tiedOutput = c.tiedOutput;
+                expertBiases = c.expertBiases;
             }
 
             public Builder nVocab(int v) { nVocab = v; return this; }
@@ -783,6 +965,7 @@ public final class SyntheticModels {
             public Builder nHeadKv(int v) { nHeadKv = v; return this; }
             public Builder headDim(int v) { headDim = v; return this; }
             public Builder nRot(int v) { nRot = v; return this; }
+            public Builder kvLora(int v) { kvLora = v; return this; }
             public Builder nFf(int v) { nFf = v; return this; }
             public Builder nCtxTrain(int v) { nCtxTrain = v; return this; }
             public Builder normEps(float v) { normEps = v; return this; }
@@ -800,9 +983,12 @@ public final class SyntheticModels {
             public Builder ssmState(int v) { ssmState = v; return this; }
             public Builder ssmGroups(int v) { ssmGroups = v; return this; }
             public Builder ssmDtRank(int v) { ssmDtRank = v; return this; }
+            public Builder kdaHeadDim(int v) { kdaHeadDim = v; return this; }
             public Builder weightType(GGMLType v) { weightType = Objects.requireNonNull(v, "weightType"); return this; }
             public Builder seed(long v) { seed = v; return this; }
             public Builder tiedOutput(boolean v) { tiedOutput = v; return this; }
+            /** Writes the per-expert {@code ffn_{gate,up,down}_exps.bias} rows of every MoE layer. */
+            public Builder expertBiases(boolean v) { expertBiases = v; return this; }
 
             public Config build() {
                 requirePositive("vocab size", nVocab);

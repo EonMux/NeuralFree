@@ -25,7 +25,7 @@ import static org.junit.Assert.assertTrue;
 /**
  * {@link HfChatTemplates}: the transformers precedence (template files, tokenizer_config.json, processor_config.json,
  * chat_template.json, then the writer's fallback), the GGUF keys of named templates, the bundled templates and the
- * Mistral community template choice.
+ * Mistral community template choice, and the tokenizer_config response template carried beside them.
  */
 public class HfChatTemplatesTest {
 
@@ -51,6 +51,23 @@ public class HfChatTemplatesTest {
         m.put("name", name);
         m.put("template", template);
         return m;
+    }
+
+    // ------------------------------------------------------------------ response template
+
+    @Test
+    public void theTokenizerConfigResponseTemplateRidesAlongAsCompactJson() throws IOException {
+        Path dir = dir("tokenizer_config.json", "{'chat_template':'CONFIG','response_template':"
+                + "{'start_anchor':'<a>','fields':{'content':{'close':'</é>'}}}}");
+        Map<String, Object> md = resolve(dir, null);
+        assertEquals("CONFIG", md.get(GgufKeys.TOKENIZER_CHAT_TEMPLATE));
+        assertEquals("{\"start_anchor\":\"<a>\",\"fields\":{\"content\":{\"close\":\"</é>\"}}}",
+                md.get(GgufKeys.TOKENIZER_RESPONSE_TEMPLATE));
+        assertEquals("a response template without any chat template still rides along",
+                Collections.singleton(GgufKeys.TOKENIZER_RESPONSE_TEMPLATE),
+                resolve(dir("tokenizer_config.json", "{'response_template':{'fields':{}}}"), null).keySet());
+        assertFalse("a non-object response template is ignored", resolve(dir("tokenizer_config.json",
+                "{'chat_template':'C','response_template':'text'}"), null).containsKey(GgufKeys.TOKENIZER_RESPONSE_TEMPLATE));
     }
 
     // ------------------------------------------------------------------ precedence

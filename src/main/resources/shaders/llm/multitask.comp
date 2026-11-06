@@ -1,0 +1,349 @@
+/* multitask.comp - LLM_MultiTask, the persistent multi-task kernel of the decode path (GLSL twin of
+ * kernels/llm/multitask.cl, the semantic reference). Requires: common/nf_common.glsl, common/reduce.glsl,
+ * common/act.glsl, common/rope_common.glsl.
+ *
+ * One workgroup takes a block index of one recorded task and runs that task's body, so independent small kernels
+ * of one decode step cost one launch. Descriptor layout: one record of 48 floats per task, at most four tasks.
+ *   word 0          task kind (float bits of the int)
+ *   words 2..12     buffer slot of the task's buffer arguments
+ *   words 14..33    integer parameters 0..19 (float bits)
+ *   words 34..41    float parameters 0..7
+ *
+ * Task kinds and their slots (integer parameters are i0.., float parameters f0..):
+ *   ROW_NORM    buffers x, w, b, y;   i0 rows_per_token, i1 row_len, i2 row_stride, i3 mode, i4 flags,
+ *                                     i5 w_rows, i6 x_off, i7 y_off; f0 eps
+ *   NORM_ROPE   buffers pos, ff, w, b, x, y;
+ *                                     i0 n_heads, i1 head_stride, i2 row_stride, i3 row_len, i4 mode, i5 n_dims,
+ *                                     i6 n_offs, i7 has_ff, i8 flags, i9 w_rows, i10..13 sections,
+ *                                     i14 x_off, i15 y_off; f0 eps, f1 theta_scale, f2 freq_scale,
+ *                                     f3 ext_factor, f4 attn_factor, f5 corr_lo, f6 corr_hi
+ *   GATE_PREP   buffers a_in, b_in, dt_bias, ssm_a, g_out, beta_out;
+ *                                     i0 n_v_heads, i1 n_k_heads, i2 layout, i3 kda_mode, i4 head_dim,
+ *                                     i5 a_stride, i6 a_off, i7 b_stride, i8 b_off; f0 lb
+ *   MATVEC_F32  buffers w, x, out;    i0 rows, i1 cols, i2 x_stride, i3 x_off, i4 out_stride, i5 out_off
+ *
+ * Dispatch: 1-D, local = L (the row-reduce local size), blocks_per_task = B, global = n_tasks*B*L. A workgroup's
+ * task is (group_id / B) and its block index within the task is (group_id % B). Every barrier is reached by all
+ * invocations of a live workgroup: the task kind, the row counts and the loops around the reductions are uniform
+ * per workgroup.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+#include "common/act.glsl"
+#include "common/rope_common.glsl"
+
+#define NF_MT_MAX_TASKS 4
+#define NF_MT_WORDS     48
+
+#define NF_MT_ROW_NORM   1
+#define NF_MT_NORM_ROPE  2
+#define NF_MT_GATE_PREP  3
+#define NF_MT_MATVEC_F32 4
+
+#define NF_MT_HAS_W 1
+#define NF_MT_HAS_B 2
+
+layout(std430, binding = 0) buffer NfMtDesc { float desc[]; };
+layout(std430, binding = 1) buffer NfMtB0 { float b0[]; };
+layout(std430, binding = 2) buffer NfMtB1 { float b1[]; };
+layout(std430, binding = 3) buffer NfMtB2 { float b2[]; };
+layout(std430, binding = 4) buffer NfMtB3 { float b3[]; };
+layout(std430, binding = 5) buffer NfMtB4 { float b4[]; };
+layout(std430, binding = 6) buffer NfMtB5 { float b5[]; };
+layout(std430, binding = 7) buffer NfMtB6 { float b6[]; };
+layout(std430, binding = 8) buffer NfMtB7 { float b7[]; };
+layout(std430, binding = 9) buffer NfMtB8 { float b8[]; };
+layout(std430, binding = 10) buffer NfMtB9 { float b9[]; };
+layout(std430, binding = 11) buffer NfMtB10 { float b10[]; };
+
+layout(push_constant) uniform NfMtParams {
+    int n_tokens;
+    int n_tasks;
+    int blocks_per_task;
+} pc;
+
+/* Integer word k of a task record (words 14..33). */
+int mt_i(int rec, int k) {
+    return floatBitsToInt(desc[rec + 14 + k]);
+}
+
+/* Buffer slot k of a task record. */
+int mt_slot(int rec, int k) {
+    return floatBitsToInt(desc[rec + 2 + k]);
+}
+
+float mt_get(int slot, int i) {
+    switch (slot) {
+        case 0:  return b0[i];
+        case 1:  return b1[i];
+        case 2:  return b2[i];
+        case 3:  return b3[i];
+        case 4:  return b4[i];
+        case 5:  return b5[i];
+        case 6:  return b6[i];
+        case 7:  return b7[i];
+        case 8:  return b8[i];
+        case 9:  return b9[i];
+        default: return b10[i];
+    }
+}
+
+void mt_set(int slot, int i, float v) {
+    switch (slot) {
+        case 0:  b0[i] = v; break;
+        case 1:  b1[i] = v; break;
+        case 2:  b2[i] = v; break;
+        case 3:  b3[i] = v; break;
+        case 4:  b4[i] = v; break;
+        case 5:  b5[i] = v; break;
+        case 6:  b6[i] = v; break;
+        case 7:  b7[i] = v; break;
+        case 8:  b8[i] = v; break;
+        case 9:  b9[i] = v; break;
+        default: b10[i] = v; break;
+    }
+}
+
+/* One RMS/L2_GDN row of a ROW_NORM task. */
+void mt_row_norm(int rec, int row, int lid, int lsize) {
+    const int row_len = mt_i(rec, 1);
+    const int row_stride = mt_i(rec, 2);
+    const int mode = mt_i(rec, 3);
+    const int flags = mt_i(rec, 4);
+    const int w_rows = mt_i(rec, 5);
+    const float eps = desc[rec + 34];
+    const int xs = mt_slot(rec, 0);
+    const int ws = mt_slot(rec, 1);
+    const int bs = mt_slot(rec, 2);
+    const int ys = mt_slot(rec, 3);
+
+    const int xb = mt_i(rec, 6) + row * row_stride;
+    const int yb = mt_i(rec, 7) + row * row_stride;
+    float ss = 0.0;
+    for (int i = lid; i < row_len; i += lsize) {
+        const float v = mt_get(xs, xb + i);
+        ss += v * v;
+    }
+    const float sum = nf_wg_sum(ss);
+    float scale;
+    float post = 1.0;
+    if (mode == 3) {
+        scale = inversesqrt(sum / float(row_len) + eps / float(row_len));
+        post = inversesqrt(float(row_len));
+    } else {
+        scale = inversesqrt(sum / float(row_len) + eps);
+    }
+    const bool has_w = (flags & NF_MT_HAS_W) != 0;
+    const bool has_b = (flags & NF_MT_HAS_B) != 0;
+    const int wb = (w_rows > 1 ? row % w_rows : 0) * row_len;
+    for (int i = lid; i < row_len; i += lsize) {
+        float v = mt_get(xs, xb + i) * scale;
+        if (mode == 3) {
+            v *= post;
+        }
+        if (has_w) {
+            v *= mt_get(ws, wb + i);
+        }
+        if (has_b) {
+            v += mt_get(bs, wb + i);
+        }
+        mt_set(ys, yb + i, v);
+    }
+}
+
+/* One NORM_ROPE row: RMS-normalize (token t, head h) into y, then rotate it in place. The barrier between the
+ * phases fences the normalized values written by the workgroup's other invocations. */
+void mt_norm_rope(int rec, int t, int h, int pos_stride, int lid, int lsize) {
+    const int ps = mt_slot(rec, 0);
+    const int fs = mt_slot(rec, 1);
+    const int ws = mt_slot(rec, 2);
+    const int bs = mt_slot(rec, 3);
+    const int xs = mt_slot(rec, 4);
+    const int ys = mt_slot(rec, 5);
+    const int head_stride = mt_i(rec, 1);
+    const int row_stride = mt_i(rec, 2);
+    const int row_len = mt_i(rec, 3);
+    const int mode = mt_i(rec, 4);
+    const int n_dims = mt_i(rec, 5);
+    const int n_offs = mt_i(rec, 6);
+    const int has_ff = mt_i(rec, 7);
+    const int flags = mt_i(rec, 8);
+    const int w_rows = mt_i(rec, 9);
+    const int s0 = mt_i(rec, 10);
+    const int s1 = mt_i(rec, 11);
+    const int s2 = mt_i(rec, 12);
+    const int s3 = mt_i(rec, 13);
+    const int x_off = mt_i(rec, 14);
+    const int y_off = mt_i(rec, 15);
+    const float eps = desc[rec + 34];
+    const float theta_scale = desc[rec + 35];
+    const float freq_scale = desc[rec + 36];
+    const float ext_factor = desc[rec + 37];
+    const float attn_factor = desc[rec + 38];
+    const float corr_lo = desc[rec + 39];
+    const float corr_hi = desc[rec + 40];
+
+    const int xb = x_off + t * row_stride + h * head_stride;
+    const int yb = y_off + t * row_stride + h * head_stride;
+    float ss = 0.0;
+    for (int i = lid; i < row_len; i += lsize) {
+        const float v = mt_get(xs, xb + i);
+        ss += v * v;
+    }
+    const float rstd = inversesqrt(nf_wg_sum(ss) / float(row_len) + eps);
+    const bool has_w = (flags & NF_MT_HAS_W) != 0;
+    const bool has_b = (flags & NF_MT_HAS_B) != 0;
+    const int wrow = (w_rows > 1 ? h % w_rows : 0) * row_len;
+    for (int i = lid; i < row_len; i += lsize) {
+        float v = mt_get(xs, xb + i) * rstd;
+        if (has_w) {
+            v *= mt_get(ws, wrow + i);
+        }
+        if (has_b) {
+            v += mt_get(bs, wrow + i);
+        }
+        mt_set(ys, yb + i, v);
+    }
+    barrier();
+
+    const int pairs = nf_rope_pairs(mode, n_dims);
+    for (int i = lid; i < pairs; i += lsize) {
+        const int sec = nf_rope_section(mode, i, s0, s1, s2, s3);
+        const int e = nf_rope_theta_exp(mode, i, sec, s0, s1, s2, s3);
+        const int p = floatBitsToInt(mt_get(ps, t + sec * pos_stride));
+        const float f = has_ff != 0 ? mt_get(fs, i) : 1.0;
+        const vec2 cs = nf_rope_cs(p, e, theta_scale, f, freq_scale, ext_factor, attn_factor, corr_lo, corr_hi,
+                                   i);
+        const int a = yb + n_offs + nf_rope_first(mode, i);
+        const int c = a + nf_rope_span(mode, n_dims);
+        const float y0 = mt_get(ys, a);
+        const float y1 = mt_get(ys, c);
+        mt_set(ys, a, y0 * cs.x - y1 * cs.y);
+        mt_set(ys, c, y0 * cs.y + y1 * cs.x);
+    }
+}
+
+/* One GATE_PREP element (global index gid). */
+void mt_gate_prep(int rec, int gid) {
+    const int as = mt_slot(rec, 0);
+    const int bs = mt_slot(rec, 1);
+    const int dts = mt_slot(rec, 2);
+    const int sas = mt_slot(rec, 3);
+    const int gs = mt_slot(rec, 4);
+    const int betas = mt_slot(rec, 5);
+    const int n_v_heads = mt_i(rec, 0);
+    const int n_k_heads = mt_i(rec, 1);
+    const int buf_layout = mt_i(rec, 2);
+    const int kda_mode = mt_i(rec, 3);
+    const int head_dim = mt_i(rec, 4);
+    const int a_stride = mt_i(rec, 5);
+    const int a_off = mt_i(rec, 6);
+    const int b_stride = mt_i(rec, 7);
+    const int b_off = mt_i(rec, 8);
+    const float lb = desc[rec + 34];
+    const int per_head = kda_mode < 0 ? 1 : head_dim;
+    if (gid >= pc.n_tokens * n_v_heads * per_head) {
+        return;
+    }
+    const int d = gid % per_head;
+    const int th = gid / per_head;
+    const int h = th % n_v_heads;
+    const int t = th / n_v_heads;
+    int a_idx;
+    int b_idx;
+    if (buf_layout == 1) {
+        const int R = n_v_heads / n_k_heads;
+        const int kh = h / R;
+        const int r = h - kh * R;
+        b_idx = kh * 2 * R + r;
+        a_idx = b_idx + R;
+    } else if (buf_layout == 2) {
+        b_idx = h;
+        a_idx = n_v_heads + h;
+    } else {
+        a_idx = kda_mode < 0 ? h : h * head_dim + d;
+        b_idx = h;
+    }
+    const int j = kda_mode < 0 ? h : h * head_dim + d;
+    const float xv = mt_get(as, a_off + t * a_stride + a_idx) + mt_get(dts, j);
+    const float A = mt_get(sas, h);
+    float gv;
+    if (kda_mode == 1) {
+        gv = lb * nf_sigmoid(-(A * xv));
+    } else if (kda_mode == 2) {
+        gv = lb * nf_sigmoid(A * xv);
+    } else {
+        gv = nf_softplus(xv) * A;
+    }
+    mt_set(gs, gid, gv);
+    if (d == 0) {
+        mt_set(betas, th, nf_sigmoid(mt_get(bs, b_off + t * b_stride + b_idx)));
+    }
+}
+
+/* One row of a MATVEC_F32 task: out row r of token t is the dot of weight row r with input row t. */
+void mt_matvec_f32(int rec, int row, int t, int lid, int lsize) {
+    const int ws = mt_slot(rec, 0);
+    const int xs = mt_slot(rec, 1);
+    const int os = mt_slot(rec, 2);
+    const int cols = mt_i(rec, 1);
+    const int x_stride = mt_i(rec, 2);
+    const int x_off = mt_i(rec, 3);
+    const int out_stride = mt_i(rec, 4);
+    const int out_off = mt_i(rec, 5);
+    const int wb = row * cols;
+    const int xb = x_off + t * x_stride;
+    float acc = 0.0;
+    for (int k = lid; k < cols; k += lsize) {
+        acc += mt_get(ws, wb + k) * mt_get(xs, xb + k);
+    }
+    acc = nf_wg_sum(acc);
+    if (lid == 0) {
+        mt_set(os, out_off + t * out_stride + row, acc);
+    }
+}
+
+void main() {
+    const int group = int(nf_wg_id());
+    const int bpt = pc.blocks_per_task;
+    const int task = group / bpt;
+    if (task >= pc.n_tasks || task >= NF_MT_MAX_TASKS) {
+        return;
+    }
+    const int tb = group - task * bpt;
+    const int lid = int(gl_LocalInvocationID.x);
+    const int lsize = int(gl_WorkGroupSize.x);
+    const int rec = task * NF_MT_WORDS;
+    const int kind = floatBitsToInt(desc[rec]);
+    if (kind == NF_MT_ROW_NORM) {
+        const int rows = pc.n_tokens * mt_i(rec, 0);
+        for (int row = tb; row < rows; row += bpt) {
+            mt_row_norm(rec, row, lid, lsize);
+        }
+    } else if (kind == NF_MT_NORM_ROPE) {
+        const int n_heads = mt_i(rec, 0);
+        const int rows = pc.n_tokens * n_heads;
+        for (int cell = tb; cell < rows; cell += bpt) {
+            const int h = cell % n_heads;
+            const int t = cell / n_heads;
+            mt_norm_rope(rec, t, h, pc.n_tokens, lid, lsize);
+        }
+    } else if (kind == NF_MT_GATE_PREP) {
+        const int per_head = mt_i(rec, 3) < 0 ? 1 : mt_i(rec, 4);
+        const int n = pc.n_tokens * mt_i(rec, 0) * per_head;
+        for (int gid = tb * lsize + lid; gid < n; gid += bpt * lsize) {
+            mt_gate_prep(rec, gid);
+        }
+    } else if (kind == NF_MT_MATVEC_F32) {
+        const int rows = mt_i(rec, 0);
+        const int total = pc.n_tokens * rows;
+        for (int cell = tb; cell < total; cell += bpt) {
+            const int r = cell % rows;
+            const int t = cell / rows;
+            mt_matvec_f32(rec, r, t, lid, lsize);
+        }
+    }
+}

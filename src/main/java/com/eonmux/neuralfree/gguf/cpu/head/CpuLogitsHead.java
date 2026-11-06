@@ -7,8 +7,11 @@ import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuScratch;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec.Transforms;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
+import com.eonmux.neuralfree.gguf.engine.CertifiedArgmaxMode;
+import com.eonmux.neuralfree.gguf.engine.CertifiedArgmaxTuning;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.HeadSpec;
@@ -37,6 +40,8 @@ import java.util.Objects;
  *       (olmo.cpp, talkie.cpp:137), except the hierarchical schedule, whose output is {@code zH} itself
  *       (hrm-text.cpp:198-203). The {@link HeadSpec#embeddingProjection()} with its LoRA deltas then maps the rows to
  *       {@link #hiddenWidth()} (gemma-embedding2.cpp:206-212). The result is llama.cpp's {@code t_embd};</li>
+ *   <li>{@code h = project_out · h} when {@link HeadSpec#outputProjection()} is present (OPT's
+ *       {@code word_embed_proj_dim != hidden_size});</li>
  *   <li>{@code logits = output · h} ({@code token_embd} when tied), {@code + scale * B (A h)} of the LoRA deltas
  *       registered on {@code output.weight} ({@code build_lora_mm}, llama-graph.cpp:1629-1667; a tied head serves
  *       the same name, so a {@code token_embd} adapter adapts only the lookup), {@code + output.bias}, then the
@@ -45,6 +50,10 @@ import java.util.Objects;
  *       grok.cpp:212), then the final softcap {@code cap * tanh(logits * (1 / cap))} (grok.cpp:214-218,
  *       gemma2.cpp), then {@code -FLT_MAX} over the masked logit range of every row (chameleon.cpp:186-198).</li>
  * </ol>
+ * A plain head whose stored type the certified lane serves ({@link #certifiesArgmax}) can skip the
+ * logits row entirely: {@link #argmaxCertified} decides the greedy ids from the weight's INT8 screen,
+ * its error bound and the exact rescore of the certified candidates ({@code CpuCertArgmax}), falling
+ * back to this list for rows whose candidate count exceeds the cap.
  * Logit rows are {@link #vocabRows()} wide and are written to {@link CpuScratch#LOGITS}, row-major. Not thread-safe;
  * one forward pass at a time. A call allocates nothing.
  */
@@ -52,6 +61,7 @@ public final class CpuLogitsHead implements AutoCloseable {
 
     private static final String TEMP_ROWS = "CpuLogitsHead.rows";
     private static final String TEMP_EMBD = "CpuLogitsHead.embd";
+    private static final String TEMP_PROJECTED = "CpuLogitsHead.projectOut";
 
     private final CpuScratch scratch;
     private final CpuMatVec matVec;
@@ -68,15 +78,28 @@ public final class CpuLogitsHead implements AutoCloseable {
     private final CpuTensorRef projection;
     /** LoRA deltas of the embedding projection, or null without one. */
     private final CpuProjectionDeltas.Site projectionDeltas;
+    private final CpuTensorRef outputProjection;
+    /** LoRA deltas of the output projection, or null without one. */
+    private final CpuProjectionDeltas.Site outputProjectionDeltas;
     private final int hiddenWidth;
     private final float[] embd;
+    /** Floats per LM head input row: {@link HeadSpec#headInputWidth(int)}. */
+    private final int lmWidth;
+    /** {@link #outputProjection}'s output rows, or null without one. */
+    private final float[] projectedRows;
     private final CpuTensorRef output;
     private final float[] outputBias;
+    /** Per-vocabulary logit multiplier applied after the projection; null when absent. */
+    private final float[] logitScaleVector;
     /** LoRA deltas of the output head, or null without an LM head. */
     private final CpuProjectionDeltas.Site outputDeltas;
     private final int vocab;
     private final ActParams softcap;
     private final float[] rows;
+    /** The head passes every check of {@link #certifiesArgmax()}; the screen builds on first use. */
+    private final boolean certifiable;
+    /** The certified readout, built by the first certified call; null until then. */
+    private CpuCertArgmax certArgmax;
     private boolean closed;
 
     /**
@@ -121,13 +144,21 @@ public final class CpuLogitsHead implements AutoCloseable {
         }
         this.projectionDeltas = projection != null ? ctx.projectionDeltas().serveModel(
                 TensorNames.weight(TensorNames.OUTPUT), projection, matVec) : null;
+        this.lmWidth = head.headInputWidth(nEmbd);
+        this.outputProjection = head.outputProjection() != null ? weights.get(head.outputProjection()) : null;
+        if (outputProjection != null && (outputProjection.cols() != nEmbd || outputProjection.rows() != lmWidth)) {
+            throw new IllegalArgumentException("project_out is " + outputProjection.cols() + " x "
+                    + outputProjection.rows() + ", expected " + nEmbd + " x " + lmWidth);
+        }
+        this.outputProjectionDeltas = outputProjection != null ? ctx.projectionDeltas().serveModel(
+                head.outputProjection().name(), outputProjection, matVec) : null;
         this.embd = projection != null
                 ? scratch.temp(TEMP_EMBD, Math.multiplyExact(scratch.ubatch(), hiddenWidth)) : null;
 
         this.output = head.output() != null ? weights.get(head.output()) : null;
-        if (output != null && output.cols() != nEmbd) {
-            throw new IllegalArgumentException("LM head rows hold " + output.cols() + " values, expected n_embd "
-                    + nEmbd);
+        if (output != null && output.cols() != lmWidth) {
+            throw new IllegalArgumentException("LM head rows hold " + output.cols() + " values, expected "
+                    + (lmWidth == nEmbd ? "n_embd " + nEmbd : "the head input width " + lmWidth));
         }
         this.vocab = (int) head.vocabRows();
         if (output != null && output.rows() != head.vocabRows()) {
@@ -143,17 +174,45 @@ public final class CpuLogitsHead implements AutoCloseable {
         }
         this.softcap = head.finalSoftcap() > 0f
                 ? ActParams.builder().softcap(head.finalSoftcap(), 1.0f).build() : null;
+        this.logitScaleVector = head.logitScaleVector() != null ? weights.floats(head.logitScaleVector()) : null;
+        if (logitScaleVector != null && logitScaleVector.length != vocab) {
+            throw new IllegalArgumentException("logit scale vector has " + logitScaleVector.length + " values,"
+                    + " expected the vocabulary size " + vocab);
+        }
         if (head.maskedLogitsEnd() > vocab) {
             throw new IllegalArgumentException("masked logit range ends at " + head.maskedLogitsEnd() + ", the head has "
                     + vocab + " rows");
         }
         this.rows = scratch.temp(TEMP_ROWS, Math.multiplyExact(scratch.ubatch(), maxStreamWidth));
+        this.projectedRows = outputProjection != null
+                ? scratch.temp(TEMP_PROJECTED, Math.multiplyExact(scratch.ubatch(), lmWidth)) : null;
         this.preprocessors = bind(ctx, spec, preprocessors);
         if (lastWidth != nEmbd && this.preprocessors.isEmpty()) {
             close();
             throw new IllegalArgumentException(spec.arch().ggufName() + ": the final stream has " + lastWidth
                     + " values per token but no head preprocessor collapses it to n_embd " + nEmbd);
         }
+        this.certifiable = initCertifiable();
+    }
+
+    /**
+     * Whether this head carries nothing the certified lane cannot certify by name: a mode that serves
+     * the stored type on the CPU path ({@link CertifiedArgmaxMode}, the measured types under
+     * {@code auto} and every supported type under {@code on}), an exact plain head (no LoRA deltas,
+     * bias, logit scale vector, softcap, sigmoid cap or masked range) and no input transform or output
+     * scale on the weight. The hidden-side stages (output norm, head preprocessors, embedding projection
+     * and its deltas, the head input projection and its deltas) shape the hidden rows both paths read,
+     * so they certify implicitly.
+     */
+    private boolean initCertifiable() {
+        if (output == null || !CertifiedArgmaxMode.configured().permitsCpuScreen(output.type())) {
+            return false;
+        }
+        if ((outputDeltas != null && !outputDeltas.isEmpty()) || outputBias != null || logitScaleVector != null
+                || head.logitScale() != 1.0f || softcap != null || head.sigmoidCapped() || head.masksLogits()) {
+            return false;
+        }
+        return matVec.transformsOf(output) == Transforms.NONE;
     }
 
     private float[] checkWidth(float[] v, String what) {
@@ -234,7 +293,7 @@ public final class CpuLogitsHead implements AutoCloseable {
             System.arraycopy(x, src * streamWidth, rows, r * streamWidth, streamWidth);
         }
         for (CpuHeadPreprocessor p : preprocessors) {
-            p.apply(nRows, rows);
+            p.apply(nRows, rows, rowIdx);
         }
         if (outputNorm) {
             if (normGroups > 1) {
@@ -268,8 +327,9 @@ public final class CpuLogitsHead implements AutoCloseable {
         }
         float[] logits = scratch.slot(CpuScratch.LOGITS);
         int n = Math.multiplyExact(nRows, vocab);
-        matVec.matmul(output, rows, 0, logits, 0, nRows);
-        outputDeltas.applyRows(nRows, rows, 0, logits, 0);
+        float[] headRows = headInput(nRows);
+        matVec.matmul(output, headRows, 0, logits, 0, nRows);
+        outputDeltas.applyRows(nRows, headRows, 0, logits, 0);
         if (outputBias != null) {
             CpuOps.addRowBias(logits, 0, nRows, vocab, outputBias, 0);
         }
@@ -277,8 +337,25 @@ public final class CpuLogitsHead implements AutoCloseable {
         if (scale != 1.0f) {
             CpuOps.scale(logits, 0, n, head.logitScaleDivides() ? 1.0f / scale : scale);
         }
+        if (logitScaleVector != null) {
+            for (int r = 0; r < nRows; r++) {
+                int base = r * vocab;
+                for (int v = 0; v < vocab; v++) {
+                    logits[base + v] *= logitScaleVector[v];
+                }
+            }
+        }
         if (softcap != null) {
             CpuOps.unary(ActOp.SOFTCAP, softcap, logits, 0, logits, 0, n);
+        }
+        if (head.sigmoidCapped()) {
+            CpuOps.unary(ActOp.SCALE_BIAS, ActParams.builder()
+                            .scaleBias(1.0f / head.sigmoidCapTemperature(), head.sigmoidCapShift()
+                                    / head.sigmoidCapTemperature()).build(),
+                    logits, 0, logits, 0, n);
+            CpuOps.unary(ActOp.SIGMOID, ActParams.NONE, logits, 0, logits, 0, n);
+            CpuOps.unary(ActOp.SCALE_BIAS, ActParams.builder().scaleBias(head.sigmoidCapScale(), 0.0f).build(),
+                    logits, 0, logits, 0, n);
         }
         if (head.masksLogits()) {
             for (int r = 0; r < nRows; r++) {
@@ -287,6 +364,59 @@ public final class CpuLogitsHead implements AutoCloseable {
             }
         }
         return logits;
+    }
+
+    /**
+     * Head input rows of the last {@link #hidden} call: {@code rows}, or the head input projection's
+     * output (with its deltas) when the head has one. {@code nRows} rows of {@code lmWidth} floats,
+     * packed — exactly the rows {@link #logits} feeds to the output weight.
+     */
+    private float[] headInput(int nRows) {
+        if (outputProjection == null) {
+            return rows;
+        }
+        matVec.matmul(outputProjection, rows, 0, projectedRows, 0, nRows);
+        outputProjectionDeltas.applyRows(nRows, rows, 0, projectedRows, 0);
+        return projectedRows;
+    }
+
+    /**
+     * Whether {@link #argmaxCertified} serves this head: the configured {@link CertifiedArgmaxMode}
+     * serves the stored type on the CPU path ({@link CertifiedArgmaxTuning}, the measured types under
+     * {@code auto} and F16 and BF16 under {@code on}) and the head carries none of the per-logit
+     * transforms the lane cannot certify (LoRA deltas, output bias, logit scale or vector, softcap,
+     * sigmoid cap, masked range, a non-identity weight transform).
+     */
+    public boolean certifiesArgmax() {
+        return certifiable;
+    }
+
+    /**
+     * Certified greedy ids of the rows the last {@link #hidden} call prepared: every committed id is the
+     * argmax of the exact logits row ({@link #argmax} over the full {@link #logits} result), decided by
+     * the INT8 screen, its error bound, the exact rescore of the candidates and the full-head fallback.
+     * The first call builds the screen (one full decode of the head weight).
+     *
+     * @param nRows the row count passed to {@link #hidden}
+     * @return {@code nRows} ids, one per prepared row
+     * @throws UnsupportedOperationException when {@link #certifiesArgmax()} is false
+     * @throws IllegalArgumentException      for a row count outside {@code [1, maxRows()]}
+     */
+    public int[] argmaxCertified(int nRows) {
+        checkOpen();
+        if (!certifiable) {
+            throw new UnsupportedOperationException("this head does not certify argmax: the certified lane does"
+                    + " not serve this stored type under the configured mode, or the head carries a per-logit"
+                    + " transform; evaluate the logits rows instead");
+        }
+        requireLmHead();
+        if (nRows < 1 || nRows > scratch.ubatch()) {
+            throw new IllegalArgumentException("logits of " + nRows + " rows outside [1, " + scratch.ubatch() + "]");
+        }
+        if (certArgmax == null) {
+            certArgmax = CpuCertArgmax.of(matVec, output, CertifiedArgmaxTuning.kmax());
+        }
+        return certArgmax.argmax(headInput(nRows), 0, nRows);
     }
 
     /**

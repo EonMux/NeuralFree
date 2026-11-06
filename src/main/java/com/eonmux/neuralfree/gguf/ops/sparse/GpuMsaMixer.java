@@ -85,6 +85,7 @@ public final class GpuMsaMixer implements GpuMixer {
     private int posLimit;
     private int rotK;
     private int rotV;
+    private int inWidth;
     private float rmsEps;
     private RopeSpec rope;
     private KvLayout kvLayout;
@@ -245,6 +246,7 @@ public final class GpuMsaMixer implements GpuMixer {
 
     private void bindWeights(GpuForwardContext ctx, GpuWeights ws, LayerSpec layer) {
         int nEmbd = MsaBlocks.mixerWidth(layer);
+        inWidth = nEmbd;
         wQkv = MsaBlocks.gpuMatrixOrNull(ws, layer, TensorNames.ATTN_QKV, nEmbd, qDim + 2L * kDim);
         if (wQkv == null) {
             wQ = MsaBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_Q, nEmbd, qDim);
@@ -370,6 +372,75 @@ public final class GpuMsaMixer implements GpuMixer {
         run(pos0, nTokens, in, out);
     }
 
+    /**
+     * The cache writes of a step: the K and V projections with their biases, the K norm and RoPE, the indexer's keys
+     * and their store, the K and V rotations and both stores. The Q path, the indexer's queries, the block selection,
+     * the attention and the output projection do not run.
+     */
+    @Override
+    public void prefillKV(int pos0, int n, ScratchSlot in) {
+        if (!bound || closed) {
+            throw new IllegalStateException("MSA mixer is not bound or already closed");
+        }
+        Objects.requireNonNull(in, "in");
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("MSA step of " + n + " tokens is outside [1, " + ubatch + "]");
+        }
+        int nPos = pos0 + n;
+        if (pos0 < 0 || nPos > posLimit) {
+            throw new IllegalArgumentException("MSA step at positions [" + pos0 + ", " + nPos + ") exceeds the "
+                    + posLimit + " cached positions");
+        }
+        // The input and indexer-key projections of a single-token step all read this row, so its Q8_1 blocks
+        // are quantized once.
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(in.offset(), inWidth)
+                ? ops.shareQ8Activations(in.buffer(), in.offset(), inWidth) : null;
+        try {
+            projectKV(n, in);
+            ops.norm(NormKind.RMS, kNorm, null, rmsEps, k.buffer(), 0, k.buffer(), 0, n * nKv, hd);
+            MsaBlocks.runRope(ropeK, rope, n, nKv, n, local);
+
+            ops.matmul(wIk, in.buffer(), in.offset(), ik.buffer(), 0, n);
+            ikDeltas.applyRows(n, in.buffer(), in.offset(), ik.buffer(), 0);
+            ops.norm(NormKind.RMS, ikNorm, null, rmsEps, ik.buffer(), 0, ik.buffer(), 0, n, idx);
+            MsaBlocks.runRope(ropeIk, rope, n, 1, n, local);
+            MsaBlocks.runStore(storeIk, msaPlan.dtype(), n, idx, local);
+
+            MsaBlocks.rotate(ops, rotK, k.buffer(), n, kDim);
+            MsaBlocks.rotate(ops, rotV, v.buffer(), n, kDim);
+            MsaBlocks.runStore(storeK, kvLayout.dtypeK(), n, kDim, local);
+            MsaBlocks.runStore(storeV, kvLayout.dtypeV(), n, kDim, local);
+        } finally {
+            if (share != null) {
+                share.close();
+            }
+        }
+    }
+
+    @Override
+    public String kvRefusal() {
+        return null;
+    }
+
+    /** The K and V products and biases; the Q product and its bias do not run. Every part of a fused product runs. */
+    private void projectKV(int n, ScratchSlot in) {
+        if (wQkv != null) {
+            int qkvW = qDim + 2 * kDim;
+            ops.matmul(wQkv, in.buffer(), in.offset(), qkv.buffer(), 0, n);
+            qkvDeltas.applyRows(n, in.buffer(), in.offset(), qkv.buffer(), 0);
+            MsaBlocks.runBiasAdd(biasQkv, n);
+            ops.copy2d(qkv.buffer(), qDim, qkvW, k.buffer(), 0, kDim, n, kDim);
+            ops.copy2d(qkv.buffer(), qDim + kDim, qkvW, v.buffer(), 0, kDim, n, kDim);
+        } else {
+            ops.matmul(wK, in.buffer(), in.offset(), k.buffer(), 0, n);
+            kDeltas.applyRows(n, in.buffer(), in.offset(), k.buffer(), 0);
+            ops.matmul(wV, in.buffer(), in.offset(), v.buffer(), 0, n);
+            vDeltas.applyRows(n, in.buffer(), in.offset(), v.buffer(), 0);
+        }
+        MsaBlocks.runBiasAdd(biasK, n);
+        MsaBlocks.runBiasAdd(biasV, n);
+    }
+
     private void run(int pos0, int n, ScratchSlot in, ScratchSlot out) {
         if (!bound || closed) {
             throw new IllegalStateException("MSA mixer is not bound or already closed");
@@ -384,39 +455,49 @@ public final class GpuMsaMixer implements GpuMixer {
             throw new IllegalArgumentException("MSA step at positions [" + pos0 + ", " + nPos + ") exceeds the "
                     + posLimit + " cached positions");
         }
-        project(n, in);
-        ops.norm(NormKind.RMS, qNorm, null, rmsEps, q.buffer(), 0, q.buffer(), 0, n * nHead, hd);
-        ops.norm(NormKind.RMS, kNorm, null, rmsEps, k.buffer(), 0, k.buffer(), 0, n * nKv, hd);
-        MsaBlocks.runRope(ropeQ, rope, n, nHead, n, local);
-        MsaBlocks.runRope(ropeK, rope, n, nKv, n, local);
+        // The input and indexer projections of a single-token step all read this row, so its Q8_1 blocks
+        // are quantized once.
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(in.offset(), inWidth)
+                ? ops.shareQ8Activations(in.buffer(), in.offset(), inWidth) : null;
+        try {
+            project(n, in);
+            ops.norm(NormKind.RMS, qNorm, null, rmsEps, q.buffer(), 0, q.buffer(), 0, n * nHead, hd);
+            ops.norm(NormKind.RMS, kNorm, null, rmsEps, k.buffer(), 0, k.buffer(), 0, n * nKv, hd);
+            MsaBlocks.runRope(ropeQ, rope, n, nHead, n, local);
+            MsaBlocks.runRope(ropeK, rope, n, nKv, n, local);
 
-        ops.matmul(wIq, in.buffer(), in.offset(), iq.buffer(), 0, n);
-        iqDeltas.applyRows(n, in.buffer(), in.offset(), iq.buffer(), 0);
-        ops.matmul(wIk, in.buffer(), in.offset(), ik.buffer(), 0, n);
-        ikDeltas.applyRows(n, in.buffer(), in.offset(), ik.buffer(), 0);
-        ops.norm(NormKind.RMS, iqNorm, null, rmsEps, iq.buffer(), 0, iq.buffer(), 0, n * nKv, idx);
-        ops.norm(NormKind.RMS, ikNorm, null, rmsEps, ik.buffer(), 0, ik.buffer(), 0, n, idx);
-        MsaBlocks.runRope(ropeIq, rope, n, nKv, n, local);
-        MsaBlocks.runRope(ropeIk, rope, n, 1, n, local);
-        MsaBlocks.runStore(storeIk, msaPlan.dtype(), n, idx, local);
+            ops.matmul(wIq, in.buffer(), in.offset(), iq.buffer(), 0, n);
+            iqDeltas.applyRows(n, in.buffer(), in.offset(), iq.buffer(), 0);
+            ops.matmul(wIk, in.buffer(), in.offset(), ik.buffer(), 0, n);
+            ikDeltas.applyRows(n, in.buffer(), in.offset(), ik.buffer(), 0);
+            ops.norm(NormKind.RMS, iqNorm, null, rmsEps, iq.buffer(), 0, iq.buffer(), 0, n * nKv, idx);
+            ops.norm(NormKind.RMS, ikNorm, null, rmsEps, ik.buffer(), 0, ik.buffer(), 0, n, idx);
+            MsaBlocks.runRope(ropeIq, rope, n, nKv, n, local);
+            MsaBlocks.runRope(ropeIk, rope, n, 1, n, local);
+            MsaBlocks.runStore(storeIk, msaPlan.dtype(), n, idx, local);
 
-        MsaBlocks.rotate(ops, rotK, q.buffer(), n, qDim);
-        MsaBlocks.rotate(ops, rotK, k.buffer(), n, kDim);
-        MsaBlocks.rotate(ops, rotV, v.buffer(), n, kDim);
-        MsaBlocks.runStore(storeK, kvLayout.dtypeK(), n, kDim, local);
-        MsaBlocks.runStore(storeV, kvLayout.dtypeV(), n, kDim, local);
+            MsaBlocks.rotate(ops, rotK, q.buffer(), n, qDim);
+            MsaBlocks.rotate(ops, rotK, k.buffer(), n, kDim);
+            MsaBlocks.rotate(ops, rotV, v.buffer(), n, kDim);
+            MsaBlocks.runStore(storeK, kvLayout.dtypeK(), n, kDim, local);
+            MsaBlocks.runStore(storeV, kvLayout.dtypeV(), n, kDim, local);
 
-        int nblk = MsaKernels.blockCount(nPos, blk);
-        blockScore.setInt(MsaKernels.ARG_BS_N_TOKENS, n);
-        blockScore.setInt(MsaKernels.ARG_BS_N_POS, nPos);
-        blockScore.setGlobal(MsaKernels.blockScoreGlobal(n, nPos, blk, blockScoreLocal));
-        blockScore.dispatch();
-        MsaBlocks.runTopK(topKRows, n * nKv, nblk);
-        MsaBlocks.runGather(gather, n, nHead);
+            int nblk = MsaKernels.blockCount(nPos, blk);
+            blockScore.setInt(MsaKernels.ARG_BS_N_TOKENS, n);
+            blockScore.setInt(MsaKernels.ARG_BS_N_POS, nPos);
+            blockScore.setGlobal(MsaKernels.blockScoreGlobal(n, nPos, blk, blockScoreLocal));
+            blockScore.dispatch();
+            MsaBlocks.runTopK(topKRows, n * nKv, nblk);
+            MsaBlocks.runGather(gather, n, nHead);
 
-        MsaBlocks.rotate(ops, rotV, att.buffer(), n, qDim);
-        ops.matmul(wO, att.buffer(), 0, out.buffer(), out.offset(), n);
-        oDeltas.applyRows(n, att.buffer(), 0, out.buffer(), out.offset());
+            MsaBlocks.rotate(ops, rotV, att.buffer(), n, qDim);
+            ops.matmul(wO, att.buffer(), 0, out.buffer(), out.offset(), n);
+            oDeltas.applyRows(n, att.buffer(), 0, out.buffer(), out.offset());
+        } finally {
+            if (share != null) {
+                share.close();
+            }
+        }
     }
 
     /** Q, K and V of {@code build_qkv} into the compact {@code msa.q/k/v} rows, biases included. */

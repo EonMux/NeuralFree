@@ -155,8 +155,8 @@ public final class SwitchedLoraExtra implements GpuLayerExtra {
             upload.reserve(ubatch);
             this.registry = ctx.projectionDeltas();
             for (Projection p : Projection.values()) {
-                GpuProjectionDeltas.Delta d = (n, x, xOff, xStride, y, yOff, yStride) ->
-                        addDelta(p, n, x, xOff, xStride, y, yOff, yStride);
+                GpuProjectionDeltas.Delta d = (scale, n, x, xOff, xStride, y, yOff, yStride) ->
+                        addDelta(p, scale, n, x, xOff, xStride, y, yOff, yStride);
                 registry.register(layer, TensorNames.weight(p.base()), d);
                 registered.put(p, d);
             }
@@ -238,15 +238,15 @@ public final class SwitchedLoraExtra implements GpuLayerExtra {
     }
 
     /**
-     * {@code y[t] += B[s_t] (A[s_t] x[t])} for the {@code nTokens} rows of the current step after projection
-     * {@code p}'s base product: row {@code t} of {@code x} at {@code xOff + t*xStride}, of {@code y} at
-     * {@code yOff + t*yStride} (floats).
+     * {@code y[t] += scale * B[s_t] (A[s_t] x[t])} for the {@code nTokens} rows of the current step after
+     * projection {@code p}'s base product: row {@code t} of {@code x} at {@code xOff + t*xStride}, of {@code y} at
+     * {@code yOff + t*yStride} (floats); {@code scale} is the factor the delta's slot runs the factors at.
      */
-    public void addDelta(Projection p, int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff,
-                         int yStride) {
+    public void addDelta(Projection p, float scale, int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y,
+                         int yOff, int yStride) {
         ensureBound();
-        deltas.get(Objects.requireNonNull(p, "projection")).add(nTokens, slots.buffer(), x, xOff, xStride, y, yOff,
-                yStride);
+        deltas.get(Objects.requireNonNull(p, "projection")).add(scale, nTokens, slots.buffer(), x, xOff, xStride, y,
+                yOff, yStride);
     }
 
     private void ensureBound() {
@@ -339,10 +339,11 @@ public final class SwitchedLoraExtra implements GpuLayerExtra {
         private static final int ARG_Y_STRIDE = 8;
         private static final int ARG_Y_OFF = 9;
         private static final int ARG_TMP_OFF = 10;
-        private static final int ARG_SLOTS = 11;
-        private static final int ARG_X = 14;
-        private static final int ARG_TMP = 15;
-        private static final int ARG_Y = 16;
+        private static final int ARG_SCALE = HeadsKernels.ARG_LORA_SCALE;
+        private static final int ARG_SLOTS = 12;
+        private static final int ARG_X = 15;
+        private static final int ARG_TMP = 16;
+        private static final int ARG_Y = 17;
 
         private final GpuOps ops;
         private final int inDim;
@@ -379,7 +380,7 @@ public final class SwitchedLoraExtra implements GpuLayerExtra {
 
         private Object[] args(int stage, int nSlots, ScratchSlot tmp, GpuBuffer slots, GpuBuffer a, GpuBuffer b,
                               GpuBuffer ph) {
-            return new Object[]{1, inDim, outDim, rank, stage, nSlots, inDim, 0, outDim, 0, tmp.offset(),
+            return new Object[]{1, inDim, outDim, rank, stage, nSlots, inDim, 0, outDim, 0, tmp.offset(), 1.0f,
                     slots, a, b, ph, tmp.buffer(), ph};
         }
 
@@ -426,21 +427,38 @@ public final class SwitchedLoraExtra implements GpuLayerExtra {
             return buf;
         }
 
-        /** {@link #add(int, GpuBuffer, GpuBuffer, int, int, GpuBuffer, int, int)} of a one-slot adapter delta. */
+        /** {@link #add(float, int, GpuBuffer, GpuBuffer, int, int, GpuBuffer, int, int)} at scale 1. */
         public void add(int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff, int yStride) {
+            add(1.0f, nTokens, x, xOff, xStride, y, yOff, yStride);
+        }
+
+        /** {@link #add(float, int, GpuBuffer, GpuBuffer, int, int, GpuBuffer, int, int)} of a one-slot adapter delta. */
+        public void add(float scale, int nTokens, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff,
+                        int yStride) {
             if (zeroSlots == null) {
                 throw new IllegalStateException("a switched delta needs the step's slot buffer");
             }
-            add(nTokens, zeroSlots, x, xOff, xStride, y, yOff, yStride);
+            add(scale, nTokens, zeroSlots, x, xOff, xStride, y, yOff, yStride);
+        }
+
+        /** {@link #add(float, int, GpuBuffer, GpuBuffer, int, int, GpuBuffer, int, int)} at scale 1. */
+        public void add(int nTokens, GpuBuffer slots, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff,
+                        int yStride) {
+            add(1.0f, nTokens, slots, x, xOff, xStride, y, yOff, yStride);
         }
 
         /**
-         * Enqueues both stages for {@code nTokens} rows with the slot ids in {@code slots} (ints from element 0).
+         * Enqueues both stages for {@code nTokens} rows with the slot ids in {@code slots} (ints from element 0),
+         * the up stage multiplying its accumulation by {@code scale} (1.0 adds the uploaded factors as uploaded).
          *
-         * @throws IllegalArgumentException for a row count outside {@code [1, ubatch]} or strides below the widths
+         * @throws IllegalArgumentException for a row count outside {@code [1, ubatch]}, strides below the widths
+         *                                  or a non-finite scale
          */
-        public void add(int nTokens, GpuBuffer slots, GpuBuffer x, int xOff, int xStride, GpuBuffer y, int yOff,
-                        int yStride) {
+        public void add(float scale, int nTokens, GpuBuffer slots, GpuBuffer x, int xOff, int xStride, GpuBuffer y,
+                        int yOff, int yStride) {
+            if (!Float.isFinite(scale)) {
+                throw new IllegalArgumentException("LoRA delta needs a finite scale, got " + scale);
+            }
             if (nTokens < 1 || nTokens > ubatch) {
                 throw new IllegalArgumentException("LoRA delta of " + nTokens + " rows, ubatch is " + ubatch);
             }
@@ -459,6 +477,8 @@ public final class SwitchedLoraExtra implements GpuLayerExtra {
                     d.setBuffer(ARG_TMP, tmp.buffer());
                 }
             }
+            down.setFloat(ARG_SCALE, 1.0f);
+            up.setFloat(ARG_SCALE, scale);
             stage(down, HeadsKernels.LORA_STAGE_DOWN, nTokens, slots, x, xOff, xStride, y, yOff, yStride);
             stage(up, HeadsKernels.LORA_STAGE_UP, nTokens, slots, x, xOff, xStride, y, yOff, yStride);
         }

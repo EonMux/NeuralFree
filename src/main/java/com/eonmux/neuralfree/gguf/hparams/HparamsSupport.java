@@ -74,6 +74,42 @@ public final class HparamsSupport {
         return true;
     }
 
+    /**
+     * Reads {@code attention.sliding_window_per_layer} (one window per block, 0 = full attention; NeuralFree
+     * extension) and marks the layers with a positive window as SWA layers. The model-wide
+     * {@link ModelHparamsBuilder#nSwa()} becomes the largest window, so ring sizing stays valid.
+     *
+     * @param type the mask type of the windowed layers
+     * @return true when the key is present
+     * @throws GgufFormatException when the array does not hold one entry per block or every entry is 0
+     */
+    public static boolean readSlidingWindowPerLayer(ModelHparamsBuilder b, GgufKv kv, SwaType type) {
+        String key = GgufKeys.ATTENTION_SLIDING_WINDOW_PER_LAYER;
+        if (!kv.isArray(key)) {
+            return false;
+        }
+        int[] windows = kv.u32Array(key);
+        int n = b.nLayerAll();
+        if (windows.length != n) {
+            throw new GgufFormatException("metadata key '" + kv.key(key) + "' has " + windows.length
+                    + " entries; one per block (" + n + ") is required");
+        }
+        boolean[] flags = new boolean[n];
+        int largest = 0;
+        for (int il = 0; il < n; il++) {
+            flags[il] = windows[il] > 0;
+            largest = Math.max(largest, windows[il]);
+        }
+        if (largest == 0) {
+            throw new GgufFormatException("metadata key '" + kv.key(key) + "' has no positive window");
+        }
+        b.swaType(type);
+        b.nSwa(largest);
+        b.nSwaArray(windows);
+        b.isSwaArray(flags);
+        return true;
+    }
+
     /** Enables sliding-window attention with the given mask type and window. */
     public static void enableSwa(ModelHparamsBuilder b, SwaType type, int nSwa) {
         if (type == SwaType.NONE || nSwa <= 0) {
@@ -172,19 +208,19 @@ public final class HparamsSupport {
 
     /**
      * Direction in which {@code logit_scale} is applied. Multiplying archs scale logits by the factor
-     * (command-r/cohere graphs, grok, talkie, muse-*, dflash, and minicpm3's {@code n_embd_base / n_embd} LM-head
-     * scale, minicpm3.cpp:241-242); dividing archs use the granite graph
+     * (command-r/cohere graphs, grok, talkie, muse-*, dflash, hyperclovax's MuP {@code logits_scaling}, and minicpm3's
+     * {@code n_embd_base / n_embd} LM-head scale, minicpm3.cpp:241-242); dividing archs use the granite graph
      * {@code logits * (1 / f_logit_scale)} (granite.cpp:198, minicpm.cpp).
      */
     public static final class ScalingDefaults {
 
         private static final Set<Arch> MULTIPLIES = Collections.unmodifiableSet(EnumSet.of(
                 Arch.COMMAND_R, Arch.COHERE2, Arch.COHERE2MOE, Arch.GROK, Arch.DFLASH, Arch.TALKIE,
-                Arch.MUSE_GLIMMER, Arch.MUSE_SPARK, Arch.MINICPM3));
+                Arch.MUSE_GLIMMER, Arch.MUSE_SPARK, Arch.MINICPM3, Arch.HYPERCLOVAX));
 
         private static final Set<Arch> DIVIDES = Collections.unmodifiableSet(EnumSet.of(
                 Arch.GRANITE, Arch.GRANITE_MOE, Arch.GRANITE_HYBRID, Arch.GRANITE_SWITCH, Arch.GRANITE_SWA,
-                Arch.MINICPM));
+                Arch.MINICPM, Arch.INKLING));
 
         private ScalingDefaults() {
         }

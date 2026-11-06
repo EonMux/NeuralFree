@@ -1,4 +1,5 @@
-/* attn_ext.comp - LLM_AttnTempScale and LLM_AttnOutGate (GLSL twin of kernels/llm/attn_ext.cl).
+/* attn_ext.comp - LLM_AttnTempScale, LLM_AttnSsmaxScale, LLM_AttnOutGate, LLM_InklingQueryScale,
+ * LLM_InklingRelLogits, LLM_LoopAttnMix, LLM_AttnValueEmbd and LLM_AttnXsa (GLSL twin of kernels/llm/attn_ext.cl).
  * Requires: common/nf_common.glsl, common/act.glsl.
  *
  * A variants row selects OP:
@@ -7,6 +8,10 @@
  *       q[q_off + t*row_stride + h*head_dim + d] *= factor(pos[t]) with
  *       pow form  exp(temp_scale * log1p((p + offset) / floor_scale))
  *       log form  log(floor((p + offset) / floor_scale) + 1) * temp_scale + 1   (llama-graph.cpp:213-238)
+ *   OP_ATTN_SSMAX_SCALE (i n_tokens, i n_heads, i head_dim, i head_stride, i row_stride, i x_off,
+ *                        R float scale, R float bias, R int pos, float x)
+ *       x[x_off + t*row_stride + h*head_stride + d] *= scale[h] * log(pos[t] + 1) + bias[h]
+ *       (mistral-large4's SSMax per-head query temperature, models/mistral-large4.cpp:181-190, 381, 240)
  *   OP_ATTN_OUT_GATE    (i n_tokens, i n_head, i head_dim, i attn_stride, i attn_off, i gate_stride,
  *                        i gate_off, i kind, i has_bias, R float gate, R float bias, float attn)
  *       attn[attn_off + t*attn_stride + h*head_dim + d] *= act(g + (has_bias ? bias[h] : 0)),
@@ -14,13 +19,30 @@
  *       1 (softplus) and 5 (base-2 softplus softplus(g * ln 2) * (1 / ln 2), models/k2-horizon.cpp:283-288),
  *       g = gate[gate_off + t*gate_stride + h] for the per-head kinds 2 and 3 (sigmoid) and 4 (softplus);
  *       kind = gguf.arch.AttnGateKind ordinal minus 2.
+ *   OP_ATTN_INKLING_QSCALE (i n_tokens, i n_heads, i head_dim, i row_stride, i q_off, i log_floor,
+ *                        f log_alpha, R int pos, float q)
+ *       q[q_off + t*row_stride + h*head_dim + d] *= tau(pos[t]),
+ *       tau = 1 + alpha * log(max(1, (p + 1) / floor)), 1 when floor <= 0 (vLLM compute_log_scaling_tau).
+ *   OP_ATTN_INKLING_REL (i n_tokens, i n_heads, i d_rel, i rel_extent, i log_floor, f log_alpha,
+ *                        R float r, R float proj, R int pos, float out)
+ *       out[(t*n_heads + h)*rel_extent + e] = tau(pos[t]) * sum_j r[t][h][j] * proj[j*rel_extent + e]
+ *       (vLLM qkvr_rel_proj).
+ *   OP_ATTN_VALUE_EMBD  (i n_tokens, i v_dim, i n_head_kv, i head_dim, i has_gate,
+ *                        R float ve, R float gate, float v)
+ *       v[t][h][d] += ve[t][h][d] * (has_gate ? sigmoid(gate[t][h]) : 1); the dense rows are
+ *       [n_tokens][n_head_kv * head_dim] and gate is [n_tokens][n_head_kv]
+ *       (limite value embeddings, models/limite.cpp:87-89, 149-155)
+ *   OP_ATTN_XSA         (i n_tokens, i n_head_kv, i n_group, i head_dim, i v_dim, f eps,
+ *                        R float alpha, R float v, float attn)
+ *       u = v[t][h] / max(||v[t][h]||, eps); attn[t][h][g] -= u * alpha[h*n_group + g] * (attn[t][h][g] . u)
+ *       over one work-item per (token, KV head) (limite exclusive self attention, models/limite.cpp:177-191)
  * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. The
- * in-place operand (q, attn) carries no memory qualifiers.
+ * in-place operand (q, attn, v) carries no memory qualifiers.
  *
  * Dispatch: one invocation per element of the [n_tokens][n_heads * head_dim] view over the flattened
  * index gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x):
  * 1-D global = roundUp(n_tokens * n_heads * head_dim, L), local = {L, 1, 1}; folded 1-D group counts
- * map to the same index.
+ * map to the same index. LLM_AttnXsa launches one invocation per (token, KV head) pair instead.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -29,7 +51,13 @@
 #include "common/act.glsl"
 
 #define OP_ATTN_TEMP_SCALE 1
-#define OP_ATTN_OUT_GATE   2
+#define OP_ATTN_SSMAX_SCALE 2
+#define OP_ATTN_OUT_GATE   3
+#define OP_ATTN_INKLING_QSCALE 4
+#define OP_ATTN_INKLING_REL    5
+#define OP_ATTN_LOOP_MIX   6
+#define OP_ATTN_VALUE_EMBD 7
+#define OP_ATTN_XSA        8
 
 #if !defined(OP)
 #error "attn_ext.comp requires OP"
@@ -60,6 +88,34 @@ layout(push_constant) uniform NfAteParams {
     float temp_scale;
     float offset;
 } pc;
+#elif OP == OP_ATTN_SSMAX_SCALE
+layout(std430, binding = 0) readonly buffer NfAteSsmaxS { float ssmax_s[]; };
+layout(std430, binding = 1) readonly buffer NfAteSsmaxB { float ssmax_b[]; };
+layout(std430, binding = 2) readonly buffer NfAteSsmaxPos { int ssmax_pos[]; };
+layout(std430, binding = 3) buffer NfAteSsmaxX { float ssmax_x[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int n_heads;
+    int head_dim;
+    int head_stride;
+    int row_stride;
+    int x_off;
+} pc;
+#elif OP == OP_ATTN_LOOP_MIX
+layout(std430, binding = 0) readonly buffer NfAteLoopQ { float loop_q[]; };
+layout(std430, binding = 1) readonly buffer NfAteLoopW { float loop_w[]; };
+layout(std430, binding = 2) readonly buffer NfAteLoopB { float loop_b[]; };
+layout(std430, binding = 3) readonly buffer NfAteLoopG { float loop_g[]; };
+layout(std430, binding = 4) buffer NfAteLoopL { float loop_l[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int n_heads;
+    int head_dim;
+    int q_stride;
+    int q_off;
+    int attn_stride;
+    int attn_off;
+} pc;
 #elif OP == OP_ATTN_OUT_GATE
 layout(std430, binding = 0) readonly buffer NfAteGate { float gate[]; };
 layout(std430, binding = 1) readonly buffer NfAteBias { float bias[]; };
@@ -74,6 +130,54 @@ layout(push_constant) uniform NfAteParams {
     int gate_off;
     int kind;
     int has_bias;
+} pc;
+#elif OP == OP_ATTN_INKLING_QSCALE
+layout(std430, binding = 0) readonly buffer NfAteIqPos { int iq_pos[]; };
+layout(std430, binding = 1) buffer NfAteIq { float iq_q[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int n_heads;
+    int head_dim;
+    int row_stride;
+    int q_off;
+    int log_floor;
+    float log_alpha;
+} pc;
+#elif OP == OP_ATTN_INKLING_REL
+layout(std430, binding = 0) readonly buffer NfAteIrR { float ir_r[]; };
+layout(std430, binding = 1) readonly buffer NfAteIrProj { float ir_proj[]; };
+layout(std430, binding = 2) readonly buffer NfAteIrPos { int ir_pos[]; };
+layout(std430, binding = 3) buffer NfAteIrOut { float ir_out[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int n_heads;
+    int d_rel;
+    int rel_extent;
+    int log_floor;
+    float log_alpha;
+} pc;
+#elif OP == OP_ATTN_VALUE_EMBD
+layout(std430, binding = 0) readonly buffer NfAteVe { float ve[]; };
+layout(std430, binding = 1) readonly buffer NfAteVeGate { float ve_gate[]; };
+layout(std430, binding = 2) buffer NfAteVeV { float ve_v[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int v_dim;
+    int n_head_kv;
+    int head_dim;
+    int has_gate;
+} pc;
+#elif OP == OP_ATTN_XSA
+layout(std430, binding = 0) readonly buffer NfAteXsaAlpha { float xsa_alpha[]; };
+layout(std430, binding = 1) readonly buffer NfAteXsaV { float xsa_v[]; };
+layout(std430, binding = 2) buffer NfAteXsaAttn { float xsa_attn[]; };
+layout(push_constant) uniform NfAteParams {
+    int n_tokens;
+    int n_head_kv;
+    int n_group;
+    int head_dim;
+    int v_dim;
+    float eps;
 } pc;
 #else
 #error "attn_ext.comp: OP is not an attention-extra op"
@@ -128,6 +232,17 @@ float nf_attn_ext_temperature(int p) {
 }
 #endif
 
+#if OP == OP_ATTN_INKLING_QSCALE || OP == OP_ATTN_INKLING_REL
+/* Inkling's per-token log factor (C nf_attn_ext_inkling_tau): 1 when the floor is not positive. */
+float nf_attn_ext_inkling_tau(int p, int floorv, float alpha) {
+    if (floorv <= 0) {
+        return 1.0;
+    }
+    const float x = float(p + 1) / float(floorv);
+    return 1.0 + alpha * log(max(x, 1.0));
+}
+#endif
+
 void main() {
     const uint idx = nf_attn_ext_linear_id();
 #if OP == OP_ATTN_TEMP_SCALE
@@ -140,7 +255,45 @@ void main() {
     const float f = nf_attn_ext_temperature(pos[t]);
     const uint a = uint(pc.q_off) + t * uint(pc.row_stride) + e;
     q[a] = q[a] * f;
-#else
+#elif OP == OP_ATTN_SSMAX_SCALE
+    const uint width = uint(pc.n_heads) * uint(pc.head_dim);
+    if (width == 0u || idx >= uint(pc.n_tokens) * width) {
+        return;
+    }
+    const uint t = idx / width;
+    const uint e = idx - t * width;
+    const uint h = e / uint(pc.head_dim);
+    const uint d = e - h * uint(pc.head_dim);
+    const float f = ssmax_s[h] * log(float(ssmax_pos[t]) + 1.0) + ssmax_b[h];
+    const uint a = uint(pc.x_off) + t * uint(pc.row_stride) + h * uint(pc.head_stride) + d;
+    ssmax_x[a] = ssmax_x[a] * f;
+#elif OP == OP_ATTN_INKLING_QSCALE
+    const uint width = uint(pc.n_heads) * uint(pc.head_dim);
+    if (width == 0u || idx >= uint(pc.n_tokens) * width) {
+        return;
+    }
+    const uint t = idx / width;
+    const uint e = idx - t * width;
+    const float tau = nf_attn_ext_inkling_tau(iq_pos[t], pc.log_floor, pc.log_alpha);
+    const uint a = uint(pc.q_off) + t * uint(pc.row_stride) + e;
+    iq_q[a] = iq_q[a] * tau;
+#elif OP == OP_ATTN_INKLING_REL
+    const uint extent = uint(pc.rel_extent);
+    const uint n_heads = uint(pc.n_heads);
+    if (extent == 0u || idx >= uint(pc.n_tokens) * n_heads * extent) {
+        return;
+    }
+    const uint t = idx / (n_heads * extent);
+    const uint rest = idx - t * (n_heads * extent);
+    const uint h = rest / extent;
+    const uint e = rest - h * extent;
+    float acc = 0.0;
+    for (int j = 0; j < pc.d_rel; j++) {
+        acc += ir_r[(t * n_heads + h) * uint(pc.d_rel) + uint(j)] * ir_proj[uint(j) * extent + e];
+    }
+    const float tau = nf_attn_ext_inkling_tau(ir_pos[t], pc.log_floor, pc.log_alpha);
+    ir_out[(t * n_heads + h) * extent + e] = acc * tau;
+#elif OP == OP_ATTN_OUT_GATE
     const uint head_dim = uint(pc.head_dim);
     const uint width = uint(pc.n_head) * head_dim;
     if (width == 0u || idx >= uint(pc.n_tokens) * width) {
@@ -158,5 +311,63 @@ void main() {
     const float s = nf_attn_ext_gate_act(pc.kind, g);
     const uint a = uint(pc.attn_off) + t * uint(pc.attn_stride) + e;
     attn[a] = attn[a] * s;
+#elif OP == OP_ATTN_LOOP_MIX
+    /* IQuestLoopCoder's gated mixed attention (C LLM_LoopAttnMix). */
+    const uint width = uint(pc.n_heads) * uint(pc.head_dim);
+    if (width == 0u || idx >= uint(pc.n_tokens) * width) {
+        return;
+    }
+    const uint t = idx / width;
+    const uint e = idx - t * width;
+    const uint h = e / uint(pc.head_dim);
+    const int qb = pc.q_off + int(t) * pc.q_stride + int(h) * pc.head_dim;
+    float sum = loop_b[h];
+    for (int i = 0; i < pc.head_dim; ++i) {
+        sum += loop_q[qb + i] * loop_w[h * pc.head_dim + i];
+    }
+    const float g = nf_sigmoid(sum);
+    const int a = pc.attn_off + int(t) * pc.attn_stride + int(e);
+    loop_l[a] = loop_l[a] * (1.0 - g) + loop_g[a] * g;
+#elif OP == OP_ATTN_VALUE_EMBD
+    if (pc.v_dim <= 0 || idx >= uint(pc.n_tokens) * uint(pc.v_dim)) {
+        return;
+    }
+    const uint t = idx / uint(pc.v_dim);
+    const uint e = idx - t * uint(pc.v_dim);
+    float g = 1.0;
+    if (pc.has_gate != 0) {
+        g = nf_sigmoid(ve_gate[t * uint(pc.n_head_kv) + e / uint(pc.head_dim)]);
+    }
+    ve_v[idx] += ve[idx] * g;
+#elif OP == OP_ATTN_XSA
+    if (pc.n_head_kv <= 0 || pc.head_dim <= 0 || idx >= uint(pc.n_tokens) * uint(pc.n_head_kv)) {
+        return;
+    }
+    const uint t = idx / uint(pc.n_head_kv);
+    const uint kvh = idx - t * uint(pc.n_head_kv);
+    const uint head_dim = uint(pc.head_dim);
+    const uint v_base = t * uint(pc.v_dim) + kvh * head_dim;
+    const uint out_stride = uint(pc.n_head_kv) * uint(pc.n_group) * head_dim;
+    float sum = 0.0;
+    for (uint d = 0u; d < head_dim; d++) {
+        const float u = xsa_v[v_base + d];
+        sum += u * u;
+    }
+    const float norm = max(sqrt(sum), pc.eps);
+    for (uint g = 0u; g < uint(pc.n_group); g++) {
+        const uint head = kvh * uint(pc.n_group) + g;
+        const uint a_base = t * out_stride + head * head_dim;
+        float proj = 0.0;
+        for (uint d = 0u; d < head_dim; d++) {
+            proj += xsa_attn[a_base + d] * (xsa_v[v_base + d] / norm);
+        }
+        proj *= xsa_alpha[head];
+        for (uint d = 0u; d < head_dim; d++) {
+            xsa_attn[a_base + d] -= (xsa_v[v_base + d] / norm) * proj;
+        }
+    }
+#else
+#error "attn_ext.comp: OP is not an attention-extra op"
 #endif
 }
+

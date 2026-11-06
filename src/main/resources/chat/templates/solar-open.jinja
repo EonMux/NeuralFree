@@ -1,0 +1,8 @@
+{#- llama.cpp solar-open chat template (src/llama-chat.cpp:932-939). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|begin|>' ~ message['role'] ~ '<|content|>' ~ content ~ '<|end|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|begin|>assistant' -}}
+{%- endif -%}

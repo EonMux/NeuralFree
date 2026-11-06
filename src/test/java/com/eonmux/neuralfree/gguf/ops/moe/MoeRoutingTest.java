@@ -10,6 +10,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -26,7 +27,7 @@ public class MoeRoutingTest {
     }
 
     private static MoeRouting.Params params(int n, int k, GatingFunc g, boolean norm, float scale, int sel) {
-        return new MoeRouting.Params(n, k, g, 1, 1, norm, scale, false, sel, 0);
+        return new MoeRouting.Params(n, k, g, 1, 1, norm, scale, false, sel, 0, false);
     }
 
     /** Mixtral-style softmax top-2 with normalization: weights are the renormalized probabilities. */
@@ -130,6 +131,41 @@ public class MoeRoutingTest {
         for (int j = 0; j < 8; j++) {
             assertEquals("weight " + j, probs[j] / sum * 2.5, s.weight(0, j), EPS);
         }
+    }
+
+    /**
+     * InternS1-Pro's per-group router: each group contributes k / n_groups of its own best experts, groups in
+     * index order, so a group cannot take another group's slot.
+     */
+    @Test
+    public void perGroupTopKSelectsInsideEveryGroup() {
+        float[] logits = {9f, 8f, 0f, 0f, 1f, 0f, 7f, 6f, 0f, 0f, 5f, 4f};
+        MoeRouting.Params p = new MoeRouting.Params(12, 3, GatingFunc.SOFTMAX_WEIGHT, 3, 3, false, 1f, false,
+                MoeKernels.SEL_PROBS, 0, true);
+        MoeRouting.Selection s = MoeRouting.route(p, logits, 1, null);
+        assertEquals(1, s.nTokens());
+        // groups {0,1,2,3}, {4,5,6,7}, {8,9,10,11}: one pick from each, groups in index order
+        assertEquals(0, s.id(0, 0));
+        assertEquals(6, s.id(0, 1));
+        assertEquals(10, s.id(0, 2));
+    }
+
+    /** The global top-k would pick {0,1,6,10}; per-group takes at most one from each group before repeating. */
+    @Test
+    public void perGroupTopKDoesNotLetOneGroupTakeAnothersSlot() {
+        // group 0 holds the four best scores, group 1 the rest; k = 4 over two groups picks two per group
+        float[] sel = {4f, 3f, 2f, 1f, 0.1f, 0.2f, 0.3f, 0.4f};
+        int[] pick = new int[4];
+        MoeRouting.topKPerGroup(sel, 2, 2, pick);
+        assertArrayEquals(new int[]{0, 1, 7, 6}, pick);
+    }
+
+    @Test
+    public void perGroupTopKRejectsUnusableCounts() {
+        assertThrows(IllegalArgumentException.class, () -> new MoeRouting.Params(8, 3, GatingFunc.SOFTMAX, 2, 2,
+                false, 1f, false, MoeKernels.SEL_PROBS, 0, true));
+        assertThrows(IllegalArgumentException.class, () -> new MoeRouting.Params(8, 4, GatingFunc.SOFTMAX, 8, 8,
+                false, 1f, false, MoeKernels.SEL_PROBS, 0, true));
     }
 
     /** Two groups with equal top-2 sums: the lower group is kept. */
@@ -335,19 +371,26 @@ public class MoeRoutingTest {
         assertArrayEquals(new float[]{31f, 41f, 11f, 21f}, data, 0f);
     }
 
-    /** Every weight type has the three id-matvec kernels, with the family's threads-per-block. */
+    /** Every weight type has the id-matvec kernels (the transposed read included), with the family's threads-per-block. */
     @Test
     public void kernelNamesCoverAllWeightTypes() {
-        assertEquals(35, MoeKernels.weightTypes().size());
+        assertEquals(41, MoeKernels.weightTypes().size());
         assertEquals("Q4_K_MatVecIdGateUp", MoeKernels.matVecIdGateUp(GGMLType.Q4_K));
         assertEquals("NVFP4_BatchMatMulId", MoeKernels.batchMatMulId(GGMLType.NVFP4));
         assertEquals("BF16_MatVecId", MoeKernels.matVecId(GGMLType.BF16));
         assertEquals("F8_E4M3_MatVecId", MoeKernels.matVecId(GGMLType.F8_E4M3));
+        assertEquals("IQ3_K_MatVecId", MoeKernels.matVecId(GGMLType.IQ3_K));
+        assertEquals("IQ3_KS_BatchMatMulId", MoeKernels.batchMatMulId(GGMLType.IQ3_KS));
+        assertEquals("Q8_0_MatVecIdT", MoeKernels.matVecIdT(GGMLType.Q8_0));
+        assertEquals("F32_MatVecIdT", MoeKernels.matVecIdT(GGMLType.F32));
         assertEquals(16, MoeKernels.threadsPerBlock(GGMLType.Q1_0));
         assertEquals(32, MoeKernels.threadsPerBlock(GGMLType.IQ4_XS));
+        assertEquals(32, MoeKernels.threadsPerBlock(GGMLType.IQ3_K));
+        assertEquals(32, MoeKernels.threadsPerBlock(GGMLType.IQ3_KS));
         assertEquals(4, MoeKernels.threadsPerBlock(GGMLType.MXFP4));
         assertEquals(4, MoeKernels.threadsPerBlock(GGMLType.F8_E4M3));
         assertEquals(4, MoeKernels.threadsPerBlock(GGMLType.MXFP8));
+        assertEquals(4, MoeKernels.threadsPerBlock(GGMLType.F8_E4M3_B32));
         assertEquals(8, MoeKernels.threadsPerBlock(GGMLType.NF4));
         assertEquals(8, MoeKernels.threadsPerBlock(GGMLType.FP4_BNB));
         assertEquals(16, MoeKernels.threadsPerBlock(GGMLType.F8_E4M3_B128));

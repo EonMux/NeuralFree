@@ -8,15 +8,16 @@ import com.eonmux.neuralfree.gguf.hparams.HparamsSupport;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 
 /**
- * Hparams hooks of the Gated DeltaNet hybrids: qwen3next, qwen35, qwen35moe and qwen4exp. Linear-attention
- * (recurrent) layers alternate with gated full-attention layers per {@code attention.recurrent_layers} or
- * {@code full_attention_interval} (default 4). The GDN mixer has {@code ssm.group_count} K heads of size
- * {@code ssm.state_size} and {@code ssm.time_step_rank} V heads of size {@code ssm.inner_size / V heads}.
+ * Hparams hooks of the Gated DeltaNet hybrids: qwen3next, qwen35, qwen35moe, qwen4exp and olmo-hybrid.
+ * Linear-attention (recurrent) layers alternate with gated full-attention layers per
+ * {@code attention.recurrent_layers} or {@code full_attention_interval} (default 4). The GDN mixer has
+ * {@code ssm.group_count} K heads of size {@code ssm.state_size} and {@code ssm.time_step_rank} V heads of size
+ * {@code ssm.inner_size / V heads}.
  *
- * <p>When V heads outnumber K heads the K heads are broadcast: qwen3next repeats each K head over a
- * contiguous group of V heads ({@link GdnHeadMap#GROUPED}, qwen3next.cpp:513-530); qwen35, qwen35moe and
- * qwen4exp tile the K heads ({@link GdnHeadMap#TILED}, {@code ggml_repeat_4d}: qwen35.cpp:450-453,
- * qwen35moe.cpp:460-463, qwen4exp.cpp:1126-1129).
+ * <p>When V heads outnumber K heads the K heads are broadcast: qwen3next and olmo-hybrid repeat each K head over a
+ * contiguous group of V heads ({@link GdnHeadMap#GROUPED}, qwen3next.cpp:513-530, the vLLM repeat_interleave);
+ * qwen35, qwen35moe and qwen4exp tile the K heads ({@link GdnHeadMap#TILED}, {@code ggml_repeat_4d}:
+ * qwen35.cpp:450-453, qwen35moe.cpp:460-463, qwen4exp.cpp:1126-1129).
  *
  * <p>Whether a qwen3next recurrent layer uses the fused {@code ssm_ba} / {@code attn_qkv} projections or
  * the legacy {@code ssm_in} projection is a tensor fact, resolved into {@code RecurrentSpec.legacySsmIn()} and
@@ -104,6 +105,30 @@ public final class HybridHooksGdn {
     private static void routedSoftmaxNormalized(ModelHparamsBuilder b) {
         b.gating(GatingFunc.SOFTMAX);
         b.expertWeightsNorm(true);
+    }
+
+    /**
+     * OLMo Hybrid (vLLM {@code olmo_hybrid.py}): a dense decoder whose linear-attention layers are Gated DeltaNet
+     * and whose full-attention layers are OLMo2 post-norm attention. The delta rule normalizes Q and K per head
+     * (epsilon 1e-6 in FLA), using {@code ssm.group_count} key heads of size {@code ssm.state_size} and
+     * {@code ssm.time_step_rank} value heads, and multiplies the update rate by {@code ssm.beta_scale} when the
+     * checkpoint sets {@code linear_allow_neg_eigval}. The delta-rule output norm epsilon comes from
+     * {@code ssm.norm_eps} when the file carries one. Attention layers follow the file's
+     * {@code attention.rope_pattern}; released checkpoints rotate nothing.
+     */
+    public static void olmoHybrid(ModelHparamsBuilder b, GgufKv kv) {
+        HybridHooks.readRmsEps(b, kv);
+        // The attention layers' branch post norms are the same RMS norm as the block norms.
+        b.postNormEps(b.normRmsEps());
+        HybridHooks.readSsm(b, kv, true);
+        b.ssmNormEps(kv.f32(GgufKeys.SSM_NORM_EPS, 0f));
+        b.ssmBetaScale(kv.f32(GgufKeys.SSM_BETA_SCALE, 1f));
+        HybridHooks.readRecurrentLayers(b, kv, DEFAULT_FULL_ATTENTION_INTERVAL);
+        b.ropeEnabledArray(MoeHooksSupport.overlayFlags(kv, GgufKeys.ATTENTION_ROPE_PATTERN,
+                b.ropeEnabledArray(), false));
+        b.gdnHeadMap(GdnHeadMap.GROUPED);
+        requireGdnHeads(b);
+        HybridHooks.requireEqualHeadSizes(b, "olmo_hybrid.py");
     }
 
     /**

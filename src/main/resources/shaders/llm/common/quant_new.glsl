@@ -159,19 +159,6 @@ float qt_elem(uint ws, uint rbase, uint i) {
 #define QT_TPS 8
 const uint NF_NQ_X1 = 8u;
 
-/* UE4M3 scale byte to float, halved for the doubled E2M1 codebook (llama.cpp ggml-impl.h:514
- * ggml_ue4m3_to_fp32): 0 and 0x7F give 0; otherwise (e ? 8 + m : m) * 2^(max(e,1) - 11), exact. */
-float nf_nq_ue4m3_half(uint x) {
-    if (x == 0u || x == 0x7Fu) {
-        return 0.0;
-    }
-    const uint e = (x >> 3) & 0xFu;
-    const uint m = x & 7u;
-    const float mant = float(e == 0u ? m : 8u + m);
-    const uint ex = e == 0u ? 1u : e;
-    return mant * uintBitsToFloat((ex + 116u) << 23);
-}
-
 vec4 nf_nq_fp4x4(uvec4 n) {
     return vec4(nf_kvalue_fp4(n.x), nf_kvalue_fp4(n.y), nf_kvalue_fp4(n.z), nf_kvalue_fp4(n.w));
 }
@@ -183,7 +170,7 @@ void nf_nq_w8(uint ws, uint bp, uint ltid, out vec4 w0, out vec4 w1) {
 }
 
 float nf_nq_scale(uint ws, uint bp, uint ltid) {
-    return nf_nq_ue4m3_half(nf_w_u8(ws, bp + (ltid >> 1)));
+    return nf_ue4m3_half(nf_w_u8(ws, bp + (ltid >> 1)));
 }
 
 uint nf_nq_xo(uint ltid) {
@@ -196,7 +183,7 @@ float qt_elem(uint ws, uint rbase, uint i) {
     const uint s = e >> 4, t = e & 15u;
     const uint q = nf_w_u8(ws, bp + 4u + s * 8u + (t & 7u));
     const uint nib = t < 8u ? (q & 0xFu) : (q >> 4);
-    return float(nf_kvalue_fp4(nib)) * nf_nq_ue4m3_half(nf_w_u8(ws, bp + s));
+    return float(nf_kvalue_fp4(nib)) * nf_ue4m3_half(nf_w_u8(ws, bp + s));
 }
 
 #elif QTYPE == QT_Q1_0

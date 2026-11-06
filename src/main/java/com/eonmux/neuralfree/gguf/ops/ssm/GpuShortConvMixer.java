@@ -14,6 +14,7 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuRecurrentState;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
@@ -65,6 +66,10 @@ public final class GpuShortConvMixer implements GpuMixer {
     private ScratchSlot k;
     private ScratchSlot v;
     private PreparedDispatch conv;
+    /** The conv kernel's state-row routing buffer; a batched step re-points it per segment. */
+    private GpuBuffer stateRows;
+    /** Whether the memory holds per-sequence state rows a batched step routes through. */
+    private boolean routeState;
     private boolean bound;
     private boolean closed;
 
@@ -137,9 +142,12 @@ public final class GpuShortConvMixer implements GpuMixer {
             }
             int stateStride = (int) SsmBlocks.stateFloats(state.tensors(), LayerMemoryPlan.STATE_CONV,
                     (long) (width - 1) * nEmbd, layer);
+            this.stateRows = memory.stepInputs().stateRows();
+            routeState = memory instanceof com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory
+                    && memory.pagedSequences() != null;
             Object[] args = {nEmbd, width, 1, 0, nEmbd, k.offset(), nEmbd, v.offset(), 0, stateStride,
                 k.buffer(), w, ctx.placeholders().readOnlyFloats(), state.tensor(LayerMemoryPlan.STATE_CONV),
-                memory.stepInputs().stateRows(), v.buffer()};
+                stateRows, v.buffer()};
             checkCount(SsmKernels.SSM_CONV, args, SsmKernels.CONV_ARG_COUNT);
             conv = ops.prepare(SsmKernels.SSM_CONV, new long[]{SsmKernels.elementwiseGlobal(nEmbd, EL_LOCAL)},
                     new long[]{EL_LOCAL}, args);
@@ -164,40 +172,71 @@ public final class GpuShortConvMixer implements GpuMixer {
 
     @Override
     public void decode(int pos, ScratchSlot in, ScratchSlot out) {
-        forward(1, in, out);
+        forward(1, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
     }
 
     @Override
     public void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
-        forward(nTokens, in, out);
+        forward(nTokens, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
     }
 
-    private void forward(int t, ScratchSlot in, ScratchSlot out) {
+    /** Why this mixer runs a batched step: every sequence's rows dispatch as its own contiguous step. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
+    /**
+     * One batched step: every segment of {@code s} dispatches its rows as the contiguous step, reading and
+     * writing its sequence's recurrent-state row (the conv re-points the kernels' state-row routing per segment)
+     * and reading its rows at their place in the step's input and output.
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        if (s.contiguousSingle()) {
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        long n = (long) s.nTokens() * nEmbd;
+        in.require(n);
+        out.require(n);
+        checkExternal(in);
+        checkExternal(out);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            forward(s.len(seg), in.buffer(), in.offset() + start * nEmbd, out.buffer(),
+                    out.offset() + start * nEmbd, s.seq(seg));
+        }
+    }
+
+    private void forward(int t, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff, int stateRow) {
         if (!bound || closed) {
             throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
         }
         if (t < 1 || t > ubatch) {
             throw new IllegalArgumentException(kind + " step of " + t + " tokens is outside [1, " + ubatch + "]");
         }
-        long n = (long) t * nEmbd;
-        in.require(n);
-        out.require(n);
-        checkExternal(in);
-        checkExternal(out);
+        if (routeState) {
+            GpuMixer.routeStateRow(stateRow, stateRows, ops.queue());
+        }
         int stride = 3 * nEmbd;
-        ops.matmul(inProj, in.buffer(), in.offset(), q.buffer(), q.offset(), t);
-        inDeltas.applyRows(t, in.buffer(), in.offset(), q.buffer(), q.offset());
+        ops.matmul(inProj, inBuf, inOff, q.buffer(), q.offset(), t);
+        inDeltas.applyRows(t, inBuf, inOff, q.buffer(), q.offset());
         ops.glu(GluOp.MUL, ActParams.NONE, q.buffer(), q.offset(), stride, q.buffer(), q.offset() + 2 * nEmbd, stride,
                 k.buffer(), k.offset(), nEmbd, t, nEmbd);
         conv.setInt(kind == MixerKind.SHORTCONV ? SsmKernels.ARG_CONV_N_TOKENS : SsmKernels.ARG_CENTERED_N_TOKENS, t);
         if (kind == MixerKind.SHORTCONV_CENTERED) {
-            conv.setGlobal(SsmKernels.elementwiseGlobal(n, EL_LOCAL));
+            conv.setGlobal(SsmKernels.elementwiseGlobal((long) t * nEmbd, EL_LOCAL));
         }
         conv.dispatch();
         ops.glu(GluOp.MUL, ActParams.NONE, q.buffer(), q.offset() + nEmbd, stride, v.buffer(), v.offset(), nEmbd,
                 v.buffer(), v.offset(), nEmbd, t, nEmbd);
-        ops.matmul(outProj, v.buffer(), v.offset(), out.buffer(), out.offset(), t);
-        outDeltas.applyRows(t, v.buffer(), v.offset(), out.buffer(), out.offset());
+        ops.matmul(outProj, v.buffer(), v.offset(), outBuf, outOff, t);
+        outDeltas.applyRows(t, v.buffer(), v.offset(), outBuf, outOff);
     }
 
     /** Rejects a caller view living in one of this mixer's working buffers. */

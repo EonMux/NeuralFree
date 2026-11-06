@@ -29,6 +29,11 @@ public final class TensorNames {
     public static final String STACK_ENC = "enc.blk";
     /** T5 decoder stack prefix ({@code dec.blk.N.}). */
     public static final String STACK_DEC = "dec.blk";
+    /**
+     * Zamba2 shared transformer blocks: the bare attention/MLP blocks every hybrid layer of a block index reads
+     * ({@code shared_blk.<block>.*}). Model-level names, so they stay resident in a streamed GPU load.
+     */
+    public static final String STACK_SHARED_BLK = "shared_blk";
     /** WavTokenizer position-network stack prefix ({@code posnet.N.}). */
     public static final String STACK_POSNET = "posnet";
     /** WavTokenizer ConvNeXt stack prefix ({@code convnext.N.}). */
@@ -50,14 +55,28 @@ public final class TensorNames {
     public static final String OUTPUT_NORM = "output_norm";
     public static final String OUTPUT_NORM_LFM2 = "token_embd_norm";
     public static final String OUTPUT = "output";
+    /** Per-vocabulary logit multiplier applied after the output projection (Dory's {@code lm_head.logit_scale}). */
+    public static final String OUTPUT_LOGIT_SCALE = "output_logit_scale";
     public static final String ROPE_FREQS = "rope_freqs";
+    /** FoPE cosine coefficient matrix of the model's rotation, {@code [n_inv, n_inv, n_kv]}. */
+    public static final String ROPE_COS_COEF = "rope_cos_coef";
+    /** FoPE sine coefficient matrix of the model's rotation, the same shape. */
+    public static final String ROPE_SIN_COEF = "rope_sin_coef";
     public static final String HRM_Z_L_INIT = "hrm.z_l_init";
     public static final String POS_EMBD = "position_embd";
+    /** Input projection of the token table to the block width (OPT {@code word_embed_proj_dim != hidden_size}). */
+    public static final String PROJECT_IN = "project_in";
+    /** Output projection of the final hidden row to the LM head width (OPT {@code word_embed_proj_dim} differs). */
+    public static final String PROJECT_OUT = "project_out";
     public static final String TOKEN_EMBD_NORM = "token_embd_norm";
     public static final String TOKEN_TYPES = "token_types";
     public static final String CLS = "cls";
     public static final String CLS_OUT = "cls.output";
     public static final String CLS_NORM = "cls.norm";
+    /** Per-token embedding projection of a multi-output model (vLLM's BGE-M3 {@code colbert_linear}). */
+    public static final String CLS_COLBERT = "cls.colbert";
+    /** Per-token score projection of a multi-output model (vLLM's BGE-M3 {@code sparse_linear}). */
+    public static final String CLS_SPARSE = "cls.sparse";
     public static final String DECISION_HIDDEN_NORM = "decision.hidden_norm";
     public static final String DECISION_PROJ_MEMORY = "decision.proj_memory";
     public static final String DECISION_PROJ_QUESTION = "decision.proj_question";
@@ -77,6 +96,9 @@ public final class TensorNames {
     public static final String DECISION_OPTION_MLP = "decision.option_mlp";
     public static final String DECISION_QUERY_MLP = "decision.query_mlp";
     public static final String ENC_OUTPUT_NORM = "enc.output_norm";
+    /** Fusion-part norms of a concat-fc drafter: the token embedding and the target hidden before {@code fc}. */
+    public static final String ENC_INPUT_NORM1 = "enc.input_norm1";
+    public static final String ENC_INPUT_NORM2 = "enc.input_norm2";
     public static final String ROPE_FACTORS_LONG = "rope_factors_long";
     public static final String ROPE_FACTORS_SHORT = "rope_factors_short";
     public static final String OUTPUT_RES_SCORE = "output_res_score";
@@ -89,6 +111,10 @@ public final class TensorNames {
     public static final String PER_LAYER_TOKEN_EMBD = "per_layer_token_embd";
     public static final String PER_LAYER_MODEL_PROJ = "per_layer_model_proj";
     public static final String PER_LAYER_PROJ_NORM = "per_layer_proj_norm";
+    /** LongCat-Flash-Lite's concatenated n-gram hash tables. */
+    public static final String NGRAM_EMBD = "ngram_embd";
+    /** LongCat-Flash-Lite's stacked per-embedder n-gram projections. */
+    public static final String NGRAM_PROJ = "ngram_proj";
     public static final String ALTUP_UNEMBD_PROJ = "altup_unembd_proj";
     public static final String ALTUP_PROJ = "altup_proj";
     public static final String DENSE_2_OUT = "dense_2";
@@ -100,6 +126,18 @@ public final class TensorNames {
     public static final String MASKED_EMBD_CENTROIDS = "masked_embd_centroids";
     public static final String MASKED_EMBD_ORDERING = "masked_embd_ordering";
     public static final String FC = "fc";
+    /**
+     * Embedding-side input norm of the fusion projection: the {@code enorm} of a DeepSeek-MTP-shaped EAGLE draft,
+     * applied to the token embedding before {@code fc}.
+     */
+    public static final String ENC_ENORM = "enc.enorm";
+    /**
+     * Target-hidden-side input norm of the fusion projection: the {@code hnorm} of a DeepSeek-MTP-shaped EAGLE draft,
+     * applied to the target hidden row before {@code fc}.
+     */
+    public static final String ENC_HNORM = "enc.hnorm";
+    /** Per-chunk encoder norm of an EAGLE-3 drafter that normalizes each target tap before the fusion. */
+    public static final String FC_NORM = "fc_norm";
     public static final String D2T = "d2t";
     public static final String DSPARK_MARKOV_W1 = "markov_w1";
     public static final String DSPARK_MARKOV_W2 = "markov_w2";
@@ -140,8 +178,22 @@ public final class TensorNames {
     public static final String ATTN_Q_NORM = "attn_q_norm";
     public static final String ATTN_K_NORM = "attn_k_norm";
     public static final String ATTN_GATE = "attn_gate";
-    public static final String ATTN_RESID_ALPHA = "attn_resid_alpha";
-    public static final String ATTN_RESID_BETA = "attn_resid_beta";
+    /** Per-head gate of IQuestLoopCoder's mixed global/local attention; weight {@code [n_head][head_dim]}, bias per head. */
+    public static final String ATTN_LOOP_GATE = "attn_loop_gate";
+    /** qwen4exp linear-attention layers: the {@code [attn_qkv | attn_gate]} rows the converter merges. */
+    public static final String ATTN_QKV_GATE = "attn_qkv_gate";
+    public static final String ATTN_VE_GATE = "attn_ve_gate";
+    public static final String ATTN_XSA_ALPHA = "attn_xsa_alpha";
+    public static final String ATTN_RESID_SCALE = "attn_resid_scale";
+    public static final String FFN_RESID_SCALE = "ffn_resid_scale";
+    public static final String MUDD_DOWN = "mudd_down";
+    public static final String MUDD_UP = "mudd_up";
+    public static final String ATTN_SSMAX = "attn_ssmax";
+    public static final String INDEXER_SSMAX = "indexer.ssmax";
+    public static final String VALUE_EMBD = "value_embd";
+    public static final String ATTN_RESID_ALPHA = "attn_resid_alpha";    public static final String ATTN_RESID_BETA = "attn_resid_beta";
+    /** Dory slerp-residual alpha of the attention sub-block. */
+    public static final String ATTN_SLERP_ALPHA = "attn_slerp_alpha";
     public static final String FFN_POST_NORM = "post_ffw_norm";
     public static final String FFN_POST_NORM_1 = "post_ffw_norm_1";
     public static final String FFN_POST_NORM_2 = "post_ffw_norm_2";
@@ -159,6 +211,8 @@ public final class TensorNames {
     public static final String FFN_POST_EXP_NORM = "ffn_post_exp_norm";
     public static final String FFN_RESID_ALPHA = "ffn_resid_alpha";
     public static final String FFN_RESID_BETA = "ffn_resid_beta";
+    /** Dory slerp-residual alpha of the MLP sub-block. */
+    public static final String FFN_SLERP_ALPHA = "ffn_slerp_alpha";
     public static final String ATTN_NORM_2 = "attn_norm_2";
     public static final String ATTN_QKV = "attn_qkv";
     public static final String LAYER_OUT_NORM = "layer_output_norm";
@@ -170,6 +224,8 @@ public final class TensorNames {
     public static final String SSM_CONV1D = "ssm_conv1d";
     public static final String SSM_DT = "ssm_dt";
     public static final String SSM_BETA_ALPHA = "ssm_ba";
+    /** qwen4exp linear-attention layers: the {@code [ssm_beta | ssm_alpha]} rows the converter merges. */
+    public static final String SSM_BETA_ALPHA_CAT = "ssm_beta_alpha";
     public static final String SSM_ALPHA = "ssm_alpha";
     public static final String SSM_IN = "ssm_in";
     public static final String SSM_NORM = "ssm_norm";
@@ -214,10 +270,14 @@ public final class TensorNames {
     public static final String HC_ATTN_DOWN = "hc_attn_down";
     public static final String HC_ATTN_UP = "hc_attn_up";
     public static final String HC_ATTN_INJECT = "hc_attn_inject";
+    /** qwen4exp: the {@code [hc_attn_down | hc_attn_inject]} rows the converter merges. */
+    public static final String HC_ATTN_DOWN_INJECT = "hc_attn_down_inject";
     public static final String HC_FFN_NORM = "hc_ffn_norm";
     public static final String HC_FFN_DOWN = "hc_ffn_down";
     public static final String HC_FFN_UP = "hc_ffn_up";
     public static final String HC_FFN_INJECT = "hc_ffn_inject";
+    /** qwen4exp: the {@code [hc_ffn_down | hc_ffn_inject]} rows the converter merges. */
+    public static final String HC_FFN_DOWN_INJECT = "hc_ffn_down_inject";
     public static final String PLE_KEY = "ple_key";
     public static final String PLE_VALUE = "ple_value";
     public static final String PLE_NORM_KEY = "ple_norm_key";
@@ -290,9 +350,27 @@ public final class TensorNames {
     public static final String TIME_MIX_K_A = "time_mix_k_a";
     public static final String TIME_MIX_R_K = "time_mix_r_k";
     public static final String ATTN_SINKS = "attn_sinks";
+    /** Static sink keys of the openPangu sink attention: {@code [n_sink * n_head_kv, head_dim]}. */
+    public static final String ATTN_SINK_K = "attn_sink_k";
+    /** Static sink values of the openPangu sink attention: {@code [n_sink * n_head_kv, head_dim_v]}; zeros accepted. */
+    public static final String ATTN_SINK_V = "attn_sink_v";
     public static final String SHORTCONV_CONV = "shortconv.conv";
     public static final String SHORTCONV_INPROJ = "shortconv.in_proj";
     public static final String SHORTCONV_OUTPROJ = "shortconv.out_proj";
+    /**
+     * Inkling relative-attention tensors: the query-side relative projection {@code attn_rel} (one
+     * {@code d_rel * n_head}-wide row block, its optional bias from {@code config.q_bias}),
+     * the per-head {@code [d_rel, rel_extent]} table {@code attn_rel_proj}, the four depthwise short-convolution
+     * kernels ({@code attn_sconv_k}, {@code attn_sconv_v}, {@code attn_sconv}, {@code ffn_sconv}; one
+     * {@code [channels, conv_width]} matrix each) and the optional dense-MLP output scale {@code ffn_global_scale}.
+     */
+    public static final String ATTN_REL = "attn_rel";
+    public static final String ATTN_REL_PROJ = "attn_rel_proj";
+    public static final String ATTN_SCONV_K = "attn_sconv_k";
+    public static final String ATTN_SCONV_V = "attn_sconv_v";
+    public static final String ATTN_SCONV = "attn_sconv";
+    public static final String FFN_SCONV = "ffn_sconv";
+    public static final String FFN_GLOBAL_SCALE = "ffn_global_scale";
     public static final String FFN_GATE_CHEXPS = "ffn_gate_chexps";
     public static final String FFN_DOWN_CHEXPS = "ffn_down_chexps";
     public static final String FFN_UP_CHEXPS = "ffn_up_chexps";
@@ -302,6 +380,8 @@ public final class TensorNames {
     public static final String VISEXP_FFN_DOWN = "vis_down";
     public static final String VISEXP_FFN_UP = "vis_up";
     public static final String INDEXER_K_NORM = "indexer.k_norm";
+    /** Step5 region-summary weight projection ({@code sparse_indexer_z}). */
+    public static final String INDEXER_Z = "indexer.z";
     public static final String INDEXER_PROJ = "indexer.proj";
     public static final String INDEXER_ATTN_K = "indexer.attn_k";
     public static final String INDEXER_ATTN_Q_B = "indexer.attn_q_b";
@@ -312,6 +392,9 @@ public final class TensorNames {
     public static final String INDEXER_COMPRESSOR_WGATE = "indexer_compressor_gate";
     public static final String INDEXER_COMPRESSOR_APE = "indexer_compressor_ape";
     public static final String INDEXER_COMPRESSOR_NORM = "indexer_compressor_norm";
+    /** DeepSeek-V4.1 Engram layer tensors (models/deepseek41.cpp:204-207). */
+    public static final String ENGRAM_KV = "engram_kv";
+    public static final String ENGRAM_GATE = "engram_gate";
     public static final String INDEXER_KPOOL_GATE = "indexer_compressor_gate";
     public static final String INDEXER_KPOOL_APE = "indexer_compressor_ape";
     public static final String FFN_GATE_TID2EID = "ffn_gate_tid2eid";
@@ -426,6 +509,14 @@ public final class TensorNames {
     /** {@code base.bias}. */
     public static String bias(String base) {
         return base + "." + BIAS;
+    }
+
+    /** {@code fc_norm.<part>.weight}, the encoder norm of target tap {@code part} of an EAGLE-3 drafter. */
+    public static String fcNorm(int part) {
+        if (part < 0) {
+            throw new IllegalArgumentException("fc_norm part " + part + " is negative");
+        }
+        return FC_NORM + "." + part + "." + WEIGHT;
     }
 
     /** {@code base.scale}. */

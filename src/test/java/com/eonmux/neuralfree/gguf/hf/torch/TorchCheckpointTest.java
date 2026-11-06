@@ -355,10 +355,10 @@ public class TorchCheckpointTest {
         Path bin = write("pytorch_model.bin", new Bin()
                 .entry("archive/data.pkl", statePickle(
                         "t", "FloatStorage", "s", 0L, new long[]{4, 2}, new long[]{2, 1}))
-                .entry("archive/data/s", f32(1, 2, 3, 4)) // 8 bytes for a 16 byte view and its offset
+                .entry("archive/data/s", f32(1, 2, 3, 4)) // 16 bytes for a 32 byte view (4 x 2 floats)
                 .build());
         IOException e = assertThrows(IOException.class, () -> TorchCheckpoint.open(bin, dir(), false));
-        assertTrue(e.getMessage(), e.getMessage().contains("spans bytes [0, 32) of storage 's' of 8 bytes"));
+        assertTrue(e.getMessage(), e.getMessage().contains("spans bytes [0, 32) of storage 's' of 16 bytes"));
     }
 
     @Test
@@ -431,17 +431,17 @@ public class TorchCheckpointTest {
         assertTrue(e.getMessage(), e.getMessage().contains("which does not exist"));
     }
 
-    // ------------------------------------------------------------------ the factory and HF.md's rule 6
+    // ------------------------------------------------------------------ the factory and rule 6
 
     @Test
     public void factoryAcceptsThePicklesWithSafetensorsWinning() throws IOException {
         // No files: no factory.
         Path other = tmp.newFolder("thin").toPath();
         assertNull(CheckpointContainers.forFile(other));
-        // A directory with the pickle files and no safetensors: FX-1's factory.
+        // A directory with the pickle files and no safetensors: the registered factory.
         writeLlamaBin(dir());
         assertSame(TorchCheckpointFactory.FACTORY, CheckpointContainers.forFile(dir()));
-        // Safetensors next to the pickle: the registry's first factory wins (HF.md's rule order).
+        // Safetensors next to the pickle: the registry's first factory wins.
         SafetensorsWriter.builder()
                 .add("x", StDType.F32, new long[]{2}, f32(1, 2))
                 .build()
@@ -456,7 +456,7 @@ public class TorchCheckpointTest {
         ModelSourceOptions options = ModelSourceOptions.builder()
                 .cacheDir(tmp.newFolder("cache").toPath()).build();
         try (ModelSource hf = ModelSources.open(dir().toString(), options, null)) {
-            assertTrue(hf instanceof HfModelSource); // HF.md's rule 6 reached the registered factory
+            assertTrue(hf instanceof HfModelSource); // rule 6 reached the registered factory
             assertEquals("llama", hf.getString(GgufKeys.GENERAL_ARCHITECTURE));
         }
     }

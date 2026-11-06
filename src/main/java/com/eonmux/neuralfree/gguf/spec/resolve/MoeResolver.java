@@ -73,10 +73,12 @@ public final class MoeResolver {
         long nFfExp = gu.nFf();
         TensorRef gateInp = tc.require(il, TensorNames.weight(TensorNames.FFN_GATE_INP));
         TensorRef down = tc.require(il, TensorNames.weight(TensorNames.FFN_DOWN_EXPS));
-        checkShapes(il, gateInp, down, nExpert, nFfExp);
+        int zeroExperts = zeroExperts(il, gateInp, nExpert);
+        checkShapes(il, down, nExpert, nFfExp);
 
         MoeSpec.Builder b = MoeSpec.builder()
                 .experts(toInt(nExpert, il), hp.nExpertUsed(il), toInt(nFfExp, il))
+                .zeroExperts(zeroExperts)
                 .gating(gating())
                 .selectionMode(selectionMode())
                 .routerBias(tc.hasLayer(il, TensorNames.bias(TensorNames.FFN_GATE_INP)))
@@ -85,10 +87,10 @@ public final class MoeResolver {
                 .weightBeforeFfn(hp.arch() == Arch.LLAMA4)
                 .postExpertNorm(tc.hasLayer(il, TensorNames.weight(TensorNames.FFN_POST_EXP_NORM)));
         if (hp.nExpertGroups() > 1) {
-            b.groups(hp.nExpertGroups(), hp.nGroupUsed());
+            b.groups(hp.nExpertGroups(), hp.nGroupUsed()).perGroupTopK(hp.moePerGroupTopK());
         }
         boolean hash = hashRouted(il);
-        b.hashRouting(hash).probBias(!hash && hasProbBias(il));
+        b.hashRouting(hash).probBias(!hash && hasProbBias(il)).mediaProbBias(mediaProbBias(il));
         expertOp(b, il, gu);
         b.expertScales(expertScales(il, gu, nExpert));
         b.expertBiases(gu.gateUpBias() != null || gu.gateBias() != null || gu.upBias() != null
@@ -123,6 +125,7 @@ public final class MoeResolver {
             case GRANITE:
             case GRANITE_HYBRID:
             case HY_V3:
+            case STEP3_TEXT:
             case STEP35:
             case PHI3:
             case QWEN35:
@@ -176,6 +179,15 @@ public final class MoeResolver {
                 || tc.hasLayer(il, TensorNames.FFN_EXP_PROBS_B);
     }
 
+    /**
+     * deepseek4 trunk layers with {@code exp_probs_b_vl} select an embedding row's experts with it
+     * (deepseek4.cpp:1293-1296); the MTP block keeps {@code exp_probs_b} (deepseek4.cpp:1461-1466).
+     */
+    private boolean mediaProbBias(int il) {
+        return (hp.arch() == Arch.DEEPSEEK4 || hp.arch() == Arch.DEEPSEEK41) && il < hp.nLayer()
+                && tc.hasLayer(il, TensorNames.bias(TensorNames.FFN_EXP_PROBS_B_VL));
+    }
+
     /** deepseek4 layers below {@code hash_layer_count} take ids from {@code ffn_gate_tid2eid[token]} (deepseek4.cpp:1297-1299). */
     private boolean hashRouted(int il) {
         if (hp.arch() != Arch.DEEPSEEK4 || il >= hp.dsv4HashLayerCount()) {
@@ -227,6 +239,7 @@ public final class MoeResolver {
         switch (hp.arch()) {
             case MAPLE:
             case DEEPSEEK4:
+            case DEEPSEEK41:
             case GLM5_NEXT:
             case HY_V4:
                 return true;
@@ -343,11 +356,23 @@ public final class MoeResolver {
         }
     }
 
-    private void checkShapes(int il, TensorRef gateInp, TensorRef down, long nExpert, long nFfExp) {
-        if (gateInp.ne(1) != nExpert) {
+    /**
+     * The identity slots the router appends after the real experts: {@code expert_zero_count} of the hparams, which
+     * the router's own width must confirm.
+     *
+     * @throws IllegalStateException when the router, the expert tensors and the declared count disagree
+     */
+    private int zeroExperts(int il, TensorRef gateInp, long nExpert) {
+        int zero = hp.nExpertZero();
+        if (gateInp.ne(1) != nExpert + zero) {
             throw new IllegalStateException(arch() + ": " + gateInp.name() + " routes " + gateInp.ne(1)
-                    + " experts but the expert tensors hold " + nExpert);
+                    + " experts but the expert tensors hold " + nExpert + " and the hparams declare " + zero
+                    + " zero experts");
         }
+        return zero;
+    }
+
+    private void checkShapes(int il, TensorRef down, long nExpert, long nFfExp) {
         if (down.ne(0) != nFfExp || down.ne(2) != nExpert) {
             throw new IllegalStateException(arch() + ": " + down.name() + " is " + down.ne(0) + " x " + down.ne(1) + " x "
                     + down.ne(2) + ", expected n_ff_exp " + nFfExp + " and " + nExpert + " experts");

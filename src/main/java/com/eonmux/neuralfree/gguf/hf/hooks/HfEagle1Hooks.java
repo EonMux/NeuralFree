@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.arch.HfNameFilter;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader;
+import com.eonmux.neuralfree.gguf.hf.meta.HfGenericMetadata;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadataBuilder;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfPlanView;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
@@ -25,22 +26,27 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * The EAGLE-1 draft hooks (PARITY WP SP-4a): the HF-side load of the {@code Eagle*ForCausalLM} and
+ * The EAGLE-1 draft hooks: the HF-side load of the {@code Eagle*ForCausalLM} and
  * {@code EagleDeepSeekMTPModel} checkpoints vLLM serves with {@code sglang srt/models/llama_eagle.py} — the fused
  * {@code cnets} drafter of one decoder layer over the target's last hidden row, the layout the GGUF-side
  * {@code ArchTableDraft} row of {@link com.eonmux.neuralfree.gguf.arch.Arch#EAGLE} loads. The draft routes to
  * {@link com.eonmux.neuralfree.gguf.engine.DraftRoute#HEAD} beside its target, exactly as {@code eagle3} and
- * {@code gemma4-assistant} do ({@code LLMModelFactory.draftRoute}); DR-1 already delivered that routing and the
- * engine-side {@code Eagle1DraftModel}, which the GGUF metadata this class writes feeds.
+ * {@code gemma4-assistant} do ({@code LLMModelFactory.draftRoute}); the engine-side {@code Eagle1DraftModel} runs
+ * the GGUF metadata this class writes.
  *
- * <p>The configuration keys and tensor names follow llama_eagle.py:42-115 ({@code cnets.py:427}): the draft layer
- * applies no input norm — the attention runs on the {@code fc} output directly, the target hidden row is the
- * residual, and the FFN keeps its {@code ffn_norm} — so the metadata's {@code norm_before_residual} and
- * {@code norm_before_fc} are always false. The target serves the converter's {@code --target-model-dir}
- * ({@link HfLoadContext#targetPath()}): its Hugging Face {@code config.json} is read without being converted, and a
- * GGUF target keeps its {@code tokenizer.*} metadata. The draft vocabulary is the target's (there is no d2t), so the
- * vocabulary dispatch reads the target like {@code HfEagle3Hooks.vocab} does; a load without a target is refused
- * there, as {@link HfDraftHooks} refuses every draft without one.</p>
+ * <p>The {@code EagleDeepSeekMTPModel} name is shared: a checkpoint that declares DeepSeek multi-head latent
+ * attention ({@link HfEagleMlaHooks#isMla}) is vLLM's {@code deepseek_eagle.EagleDeepseekV3ForCausalLM} and converts
+ * through {@link HfEagleMlaHooks}, while the llama- and mistral-shaped drafts keep the mapping below.</p>
+ *
+ * <p>The configuration keys and tensor names follow llama_eagle.py:42-115 ({@code cnets.py:427}) and
+ * mistral_eagle.py:51-129: the drafter applies no norm around the {@code fc} fusion — the attention runs on the
+ * {@code fc} output directly (the llama shape) or on its norm (mistral_eagle.py keeps {@code input_layernorm}),
+ * the target hidden row is the residual, and the FFN keeps its {@code ffn_norm} — so the metadata's
+ * {@code norm_before_residual} and {@code norm_before_fc} are always false. The target serves the converter's
+ * {@code --target-model-dir} ({@link HfLoadContext#targetPath()}): its Hugging Face {@code config.json} is read
+ * without being converted, and a GGUF target keeps its {@code tokenizer.*} metadata. The draft vocabulary is the
+ * target's (there is no d2t), so the vocabulary dispatch reads the target like {@code HfEagle3Hooks.vocab} does; a
+ * load without a target is refused there, as {@link HfDraftHooks} refuses every draft without one.</p>
  */
 public final class HfEagle1Hooks {
 
@@ -58,9 +64,11 @@ public final class HfEagle1Hooks {
      * {@code __init__}'s configuration fixes: a checkpoint's {@code architectures[0]} alias name
      * ({@code EagleModel}, {@code LlamaEagleForCausalLM}, ...) becomes the class name the converter's key and name
      * tables resolve ({@code EagleForCausalLM}); {@code num_hidden_layers} then names the drafter's one decoder
-     * layer, so a missing count reads as 1.
+     * layer, so a missing count reads as 1. A DeepSeek-MTP-shaped checkpoint is checked for the MLA geometry its
+     * mapping writes ({@link HfEagleMlaHooks#check}).
      *
-     * @throws GgufFormatException when {@code num_hidden_layers} is present but is not a positive int32
+     * @throws GgufFormatException when {@code num_hidden_layers} is present but is not a positive int32, or an MLA
+     *                             draft is missing its head geometry
      */
     public static HfConfig fixup(HfConfig cfg) {
         if (!"EagleForCausalLM".equals(cfg.architecture())) {
@@ -74,6 +82,9 @@ public final class HfEagle1Hooks {
             }
         } else {
             cfg = cfg.withFlat(Collections.singletonMap("num_hidden_layers", 1));
+        }
+        if (HfEagleMlaHooks.isMla(cfg)) {
+            HfEagleMlaHooks.check(cfg);
         }
         return cfg;
     }
@@ -90,9 +101,34 @@ public final class HfEagle1Hooks {
     // ------------------------------------------------------------------ metadata
 
     /**
+     * The metadata of the standard llama-family keys ({@link HfGenericMetadata#apply} over the draft's own
+     * configuration, then {@link HfLlamaHooks#llamaKv} for the vocabulary size and the RoPE dimensions) followed by
+     * the EAGLE-1 keys of llama_eagle.py:64-115, read from the draft's own {@code config.json} and its target:
+     * {@code target_layers} is the target's last hidden layer — the single layer whose hidden rows the engine's
+     * target feed records (llama_eagle.py:64-69, exactly one entry, which the {@code ArchTableDraft} hparams
+     * require) — {@code target_hidden_size} is the target's hidden size, the fusion input the {@code fc} weight is
+     * built for, and {@code norm_before_residual} and {@code norm_before_fc} are false because the drafter applies
+     * no norm around the fc fusion (llama_eagle.py:42-61, cnets.py:427).
+     *
+     * @throws IOException         when the target cannot be opened
+     * @throws GgufFormatException when the target lacks its hidden size or layer count, or the draft configuration
+     *                             misses a standard key
+     */
+    public static void meta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan)
+            throws IOException {
+        if (HfEagleMlaHooks.isMla(ctx.config())) {
+            HfEagleMlaHooks.meta(ctx, kv, plan);
+            return;
+        }
+        HfGenericMetadata.apply(ctx, kv);
+        HfLlamaHooks.llamaKv(ctx, kv, true);
+        targetKeys(ctx, kv);
+    }
+
+    /**
      * The EAGLE-1 keys of llama_eagle.py:64-115, read from the draft's own {@code config.json} and its target:
-     * {@code target_layers} is the target's last hidden layer — the single layer whose row {@code DrafterFeed} reads
-     * (llama_eagle.py:64-69, exactly one entry, which the {@code ArchTableDraft} hparams require) —
+     * {@code target_layers} is the target's last hidden layer — the single layer whose hidden rows the engine's
+     * target feed records (exactly one entry, which the {@code ArchTableDraft} hparams require) —
      * {@code target_hidden_size} is the target's hidden size, the fusion input the {@code fc} weight is built for,
      * and {@code norm_before_residual} and {@code norm_before_fc} are false because the drafter applies no norm
      * around the fc fusion (llama_eagle.py:42-61, cnets.py:427).
@@ -100,8 +136,7 @@ public final class HfEagle1Hooks {
      * @throws IOException         when the target cannot be opened
      * @throws GgufFormatException when the target lacks its hidden size or layer count
      */
-    public static void meta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan)
-            throws IOException {
+    static void targetKeys(HfLoadContext ctx, HfMetadataBuilder kv) throws IOException {
         Target target = target(ctx);
         int last = target.numLayers - 1;
         ctx.log("EAGLE-1: target_layers = [" + last + "] (target model has " + target.numLayers + " layers)");
@@ -121,11 +156,17 @@ public final class HfEagle1Hooks {
      * layer without an input norm, whose optional {@code attn_norm.weight}, {@code attn_norm_2.weight} and
      * {@code output_norm.weight} map as EAGLE-3's do — go through {@link HfLlamaHooks#llamaTensor}. The block
      * indices of the checkpoint name their GGUF blocks one to one, so {@code layers.0.*} lands at {@code blk.0.*}.
+     * A DeepSeek-MTP-shaped checkpoint maps through {@link HfEagleMlaHooks}.
      *
+     * @throws IOException         when an expert tensor or the target cannot be read
      * @throws GgufFormatException when a tensor name has no mapping
      */
-    public static void tensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out) {
+    public static void tensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out) throws IOException {
         if (out.isConsumed(hfName)) {
+            return;
+        }
+        if (HfEagleMlaHooks.isMla(ctx.config())) {
+            HfEagleMlaHooks.tensors(ctx, hfName, src, out);
             return;
         }
         if (hfName.equals(FC_WEIGHT)) {
@@ -133,6 +174,17 @@ public final class HfEagle1Hooks {
             return;
         }
         HfLlamaHooks.llamaTensor(ctx, hfName, hfName, src, out);
+    }
+
+    /**
+     * {@code prepare_tensors}' completeness checks of a DeepSeek-MTP-shaped draft: every routed-expert set that was
+     * started must have been stacked ({@link HfEagleMlaHooks#extra}). A llama-shaped draft generates no extra
+     * tensors.
+     */
+    public static void extra(HfLoadContext ctx, TensorSink out) {
+        if (HfEagleMlaHooks.isMla(ctx.config())) {
+            HfEagleMlaHooks.extra(ctx, out);
+        }
     }
 
     // ------------------------------------------------------------------ vocabulary

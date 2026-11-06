@@ -10,15 +10,15 @@ import java.util.Objects;
 
 /**
  * The row parts of a {@link com.eonmux.neuralfree.gguf.memory.MemoryPlan}'s KV groups (the row-part rule, prefix
- * cache design T-8): every datum a group's cell index addresses is part of its row, and every copy, move, seal,
+ * cache design): every datum a group's cell index addresses is part of its row, and every copy, move, seal,
  * restore or comparison of the rows iterates these parts, never only K and V. The parts are derived from two
  * declarations, never handed-listed:
  * <ul>
  *   <li>every {@code LayerMemoryPlan} buffer declares its {@link LayerMemoryPlan.Addressing addressing}: a KV group's
  *       cell index ({@code CELL}: the K and V or latent rows, the cross-attention K/V, the DSA indexer keys and the
  *       MSA keys), a recurrent slot ({@code SLOT}) or neither ({@code NEITHER}: the DSV4 compressed caches);</li>
- *   <li>every {@link KvDType} declares the per-row planes it stores outside the row ({@link KvDType#sidePlanes()},
- *       empty for every type of today's set).</li>
+ *   <li>every {@link KvDType} declares the per-row planes it stores outside the row ({@link KvDType#sidePlanes()}:
+ *       the per-(token, KV head) scale plane of the per-token-head types, empty for the others).</li>
  * </ul>
  * {@code kv_pos} is never a copied row part: an operation writes it from the row's position. Stateless and
  * thread-safe.
@@ -92,10 +92,10 @@ public final class RowParts {
                 continue;
             }
             addBuffer(out, g, "K", l.kv().dtypeK(), l.kv().widthK());
-            addSidePlanes(out, g, l.kv().dtypeK());
+            addSidePlanes(out, g, l.kv().dtypeK(), l.kv().widthK(), l.kv().nHeadKv());
             if (!l.kv().vAliasesK()) {
                 addBuffer(out, g, "V", l.kv().dtypeV(), l.kv().widthV());
-                addSidePlanes(out, g, l.kv().dtypeV());
+                addSidePlanes(out, g, l.kv().dtypeV(), l.kv().widthV(), l.kv().nHeadKv());
             }
             if (l.indexer() != null && l.indexer().addressing() == LayerMemoryPlan.Addressing.CELL) {
                 addBuffer(out, g, "indexer", l.indexer().dtype(), l.indexer().width());
@@ -127,11 +127,11 @@ public final class RowParts {
         out.add(new RowPart(group, name, dtype, width));
     }
 
-    private static void addSidePlanes(List<RowPart> out, int group, KvDType dtype) {
+    private static void addSidePlanes(List<RowPart> out, int group, KvDType dtype, int width, int heads) {
         int i = 0;
         for (KvDType.SidePlane plane : dtype.sidePlanes()) {
             out.add(new RowPart(group, "side:" + plane.name() + (i++ == 0 ? "" : ":" + i), plane.dtype(),
-                    plane.width()));
+                    plane.widthFor(width, heads)));
         }
     }
 

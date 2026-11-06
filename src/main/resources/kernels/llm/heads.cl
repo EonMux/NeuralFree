@@ -4,9 +4,10 @@
  * strides are in float elements; addresses are formed in nf_i64. Java: gguf.ops.heads.HeadsKernels.
  *
  * LLM_SwitchedLoraAdd(i n_tokens, i in_dim, i out_dim, i rank, i stage, i n_slots, i x_stride, i x_off,
- *                     i y_stride, i y_off, i tmp_off, R<int> slots, R A, R B, R x, RWn tmp, RWn y)
- *     y[t] += B[s_t] (A[s_t] x[t]) per token (models/granite-switch.cpp build_switched_lora_delta, two
- *     ggml_mul_mat_id with the adapter slot as expert id, then ggml_add onto the base projection):
+ *                     i y_stride, i y_off, i tmp_off, f scale, R<int> slots, R A, R B, R x, RWn tmp, RWn y)
+ *     y[t] += scale * B[s_t] (A[s_t] x[t]) per token (models/granite-switch.cpp build_switched_lora_delta, two
+ *     ggml_mul_mat_id with the adapter slot as expert id, then ggml_add onto the base projection; scale multiplies
+ *     the up stage, so a delta can run at a factor of the uploaded B, 1.0 for the plain delta):
  *       s_t = clamp(slots[t], 0, n_slots-1)   (ggml_clamp(slot, 0, n_adapters); n_slots = n_adapters+1,
  *                                              slot 0 is the base model's zero delta)
  *       A   = lora_a {in_dim, rank, n_slots}:  A[s][r][i] at (s*rank + r)*in_dim + i
@@ -15,7 +16,7 @@
  *              one workgroup per (t, r): group g = t*rank + r, the work-items stride over i and the
  *              partial sums are reduced with nf_wg_sum. global = n_tokens*rank*L, local = {L}, L a power of
  *              two in [32, LLM_DIMX].
- *     stage 1: y[y_off + t*y_stride + o] += sum_r B[s_t][o][r] * tmp[tmp_off + t*rank + r], r ascending
+ *     stage 1: y[y_off + t*y_stride + o] += scale * sum_r B[s_t][o][r] * tmp[tmp_off + t*rank + r], r ascending
  *              one work-item per (t, o): global = roundUp(n_tokens*out_dim, L), local = {L}.
  *     The host enqueues stage 0 then stage 1 on one queue. tmp and y may live in shared scratch buffers
  *     (no restrict); x, tmp and y must not overlap one another.
@@ -38,6 +39,7 @@ NF_KERNEL void LLM_SwitchedLoraAdd(
     const int y_stride,
     const int y_off,
     const int tmp_off,
+    const float scale,
     NF_GLOBAL const int* NF_RESTRICT slots,
     NF_GLOBAL const float* NF_RESTRICT A,
     NF_GLOBAL const float* NF_RESTRICT B,
@@ -76,6 +78,6 @@ NF_KERNEL void LLM_SwitchedLoraAdd(
             acc += B[b_row + r] * tmp[t_row + r];
         }
         const nf_i64 yi = (nf_i64)y_off + (nf_i64)t * y_stride + o;
-        y[yi] = y[yi] + acc;
+        y[yi] = y[yi] + scale * acc;
     }
 }

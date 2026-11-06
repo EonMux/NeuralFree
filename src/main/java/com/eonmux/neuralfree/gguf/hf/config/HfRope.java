@@ -25,9 +25,13 @@ import java.util.Set;
  *       {@code default} and requires {@code mrope_section}; {@code telechat3-yarn} becomes {@code yarn} with
  *       {@code attention_factor = 0.07 * ln(factor) + 1};</li>
  *   <li>when not nested by {@code full_attention}/{@code sliding_attention}, the global theta, local theta (as
- *       {@code sliding_attention.rope_theta}), partial rotary factor and {@code original_max_position_embeddings}
- *       found among the configuration aliases are mirrored into the parameters when absent there.</li>
+ *       {@code sliding_attention.rope_theta}), partial rotary factor, trained length ({@code max_trained_positions})
+ *       and {@code original_max_position_embeddings} found among the configuration aliases are mirrored into the
+ *       parameters when absent there.</li>
  * </ul>
+ * Configurations NeuralFree cannot run are refused by name: the Fourier position embedding keys ({@code use_fope},
+ * {@code fope_sep_head}, {@code num_inv_freq}, {@code fope_init_factor}) on architectures other than InternS1-Pro.
+ * Dual-chunk attention ({@code dual_chunk_attention_config}) is read by {@link HfDualChunk}.
  * {@link #global()} is {@code full_attention} when present, else the whole parameter object, as the converter
  * reads it.
  */
@@ -42,6 +46,18 @@ public final class HfRope {
     /** Partial rotary factor aliases, first present wins. */
     public static final List<String> PARTIAL_ROTARY_ALIASES = List.of("partial_rotary_factor", "rope_pct",
             "rope_percent", "rotary_pct", "rotary_emb_fraction");
+    /** Dynamic NTK trained-length aliases, first present wins. */
+    public static final List<String> MAX_TRAINED_ALIASES = List.of("max_trained_positions");
+
+    /**
+     * RoPE parameters that select the Fourier position embedding: {@code use_fope} and the three tuning keys vLLM's
+     * InternS1-Pro reads ({@code fope_sep_head}, {@code num_inv_freq}, {@code fope_init_factor}).
+     */
+    private static final List<String> FOPE_KEYS = List.of("use_fope", "fope_sep_head", "num_inv_freq",
+            "fope_init_factor");
+
+    /** The tuning keys alone: any of them selects FoPE, an explicit {@code use_fope: false} does not. */
+    private static final List<String> FOPE_TUNING_KEYS = List.of("fope_sep_head", "num_inv_freq", "fope_init_factor");
 
     /** Keys of a parameter object nested by layer type (transformers ALLOWED_LAYER_TYPES plus DeepSeek-V4). */
     static final Set<String> LAYER_TYPES = Set.of("full_attention", "sliding_attention", "chunked_attention",
@@ -88,9 +104,51 @@ public final class HfRope {
             }
             mirror(params, "rope_theta", first(flat, THETA_ALIASES));
             mirror(params, "partial_rotary_factor", first(flat, PARTIAL_ROTARY_ALIASES));
+            mirror(params, "max_trained_positions", first(flat, MAX_TRAINED_ALIASES));
             mirror(params, "original_max_position_embeddings", flat.get("original_max_position_embeddings"));
         }
+        requireSupported(flat, params, source);
         return new HfRope(HfConfig.freeze(params), nested, source);
+    }
+
+    /**
+     * Refuses configurations whose RoPE is computed in a form NeuralFree does not run: the Fourier position
+     * embedding of the {@code use_fope}/{@code fope_*} parameters on any architecture but InternS1-Pro, the only
+     * vLLM model whose graph reads its learned coefficients.
+     *
+     * @throws GgufFormatException naming the configuration key
+     */
+    private static void requireSupported(Map<String, Object> flat, Map<String, Object> params, String source) {
+        if (internS1Pro(flat)) {
+            return;
+        }
+        for (String key : FOPE_KEYS) {
+            Object topLevel = params.get(key);
+            if (topLevel != null) {
+                throw new GgufFormatException(source + ": 'rope_parameters." + key + "' is not supported:"
+                        + " NeuralFree loads the Fourier position embedding coefficients only for InternS1-Pro");
+            }
+            Object full = params.get("full_attention");
+            if (full instanceof Map && ((Map<?, ?>) full).get(key) != null) {
+                throw new GgufFormatException(source + ": 'rope_parameters.full_attention." + key
+                        + "' is not supported: NeuralFree loads the Fourier position embedding coefficients only"
+                        + " for InternS1-Pro");
+            }
+        }
+    }
+
+    /** Whether the flattened configuration names the InternS1-Pro family. */
+    private static boolean internS1Pro(Map<String, Object> flat) {
+        Object archs = flat.get("architectures");
+        if (!(archs instanceof List)) {
+            return false;
+        }
+        for (Object a : (List<?>) archs) {
+            if (a instanceof String && ((String) a).contains("InternS1Pro")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void mirror(Map<String, Object> params, String key, Object value) {
@@ -301,6 +359,53 @@ public final class HfRope {
 
         /** Dynamic NTK {@code alpha} (HunYuan). */
         public OptionalDouble alpha() { return number("alpha"); }
+
+        /** Fixed/mixed NTK {@code mixed_b} exponent; absent selects the fixed form. */
+        public OptionalDouble mixedB() { return number("mixed_b"); }
+
+        /**
+         * Whether the Fourier position embedding is selected: {@code use_fope} unless it is explicitly false, or any
+         * of the three tuning keys vLLM's InternS1-Pro reads (interns1_pro.py:383-392).
+         *
+         * @throws GgufFormatException when {@code use_fope} is not a boolean
+         */
+        public boolean useFope() {
+            Object explicit = map.get("use_fope");
+            if (explicit != null && !(explicit instanceof Boolean)) {
+                throw new GgufFormatException(source + ": '" + path + ".use_fope' must be a boolean");
+            }
+            if (Boolean.TRUE.equals(explicit)) {
+                return true;
+            }
+            for (String key : FOPE_TUNING_KEYS) {
+                if (map.get(key) != null) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** Per-KV-head FoPE coefficients ({@code fope_sep_head}). */
+        public Optional<Boolean> fopeSepHead() {
+            Object v = map.get("fope_sep_head");
+            if (v != null && !(v instanceof Boolean)) {
+                throw new GgufFormatException(source + ": '" + path + ".fope_sep_head' must be a boolean");
+            }
+            return Optional.ofNullable((Boolean) v);
+        }
+
+        /** Frequencies the FoPE coefficients project ({@code num_inv_freq}). */
+        public OptionalInt fopeNumInvFreq() {
+            OptionalInt n = integer("num_inv_freq");
+            if (n.isPresent() && n.getAsInt() <= 0) {
+                throw new GgufFormatException(source + ": '" + path + ".num_inv_freq' = " + n.getAsInt()
+                        + " selects no frequency; omit it to keep every frequency above 2*pi/max_position_embeddings");
+            }
+            return n;
+        }
+
+        /** FoPE initialization factor ({@code fope_init_factor}). */
+        public OptionalDouble fopeInitFactor() { return number("fope_init_factor"); }
 
         /** {@code mrope_section}, else the legacy {@code xdrope_section}, of this object. */
         public Optional<List<Integer>> mropeSection() {

@@ -1,0 +1,14 @@
+{#- llama.cpp dots1 chat template (src/llama-chat.cpp:793-807): detection-only, dots.llm1.inst has no name-table entry. -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- '<|system|>' ~ content ~ '<|endofsystem|>' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '<|userprompt|>' ~ content ~ '<|endofuserprompt|>' -}}
+    {%- else -%}
+        {{- '<|response|>' ~ content ~ '<|endofresponse|>' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|response|>' -}}
+{%- endif -%}

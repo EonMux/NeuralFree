@@ -106,6 +106,16 @@ public class TensorClaimsTest {
                 TensorClaims.unclaimed(hparams(Arch.LLAMA, 1, 0), tc, tensors(Arch.LLAMA)));
     }
 
+    /** dflash creates the optional fc scales, {@code fc.input_scale} included (dflash.cpp:276-278). */
+    @Test
+    public void dflashClaimsBothFcScales() {
+        TensorCatalog tc = TensorCatalog.of("dflash", Arrays.asList(t("fc.weight", 3 * N_EMBD, N_EMBD),
+                t("fc.scale", 1), t("fc.input_scale", 1), t("enc.output_norm.weight", N_EMBD),
+                t("output_norm.weight", N_EMBD)));
+        assertEquals(Collections.emptyList(),
+                TensorClaims.unclaimed(hparams(Arch.DFLASH, 1, 0), tc, tensors(Arch.DFLASH)));
+    }
+
     @Test
     public void nextnBlocksClaimTheirDecoderLayerOnlyForMtpArchitectures() {
         String p = "blk.2.";
@@ -123,6 +133,14 @@ public class TensorClaimsTest {
 
         TensorCatalog llama = TensorCatalog.of("llama", ts);
         assertEquals(ts.size(), TensorClaims.unclaimed(hparams(Arch.LLAMA, 3, 1), llama, tensors(Arch.LLAMA)).size());
+    }
+
+    /** The FR-Spec draft head of an MTP-only qwen4exp file: {@code d2t} is the model-level table of the cut head. */
+    @Test
+    public void qwen4expClaimsTheReducedMtpHeadTable() {
+        TensorCatalog tc = TensorCatalog.of("qwen4exp", Collections.singletonList(t("d2t", 65_536)));
+        assertEquals(Collections.emptyList(),
+                TensorClaims.unclaimed(hparams(Arch.QWEN4EXP, 2, 1), tc, tensors(Arch.QWEN4EXP)));
     }
 
     private static List<GGUFTensorInfo> nextnHead(int il) {
@@ -317,12 +335,12 @@ public class TensorClaimsTest {
     }
 
     @Test
-    public void modernBertWithoutDecisionLayersLeavesTheScorerBiasesUnclaimed() {
+    public void modernBertWithoutDecisionLayersLeavesTheTokenTypesUnclaimed() {
         ModelHparams hp = hparams(Arch.MODERN_BERT, 1, 0);
         TensorCatalog tc = TensorCatalog.of("modern-bert", Arrays.asList(t("cls.weight", N_EMBD, N_EMBD),
                 t("cls.bias", N_EMBD), t("cls.norm.weight", N_EMBD), t("cls.norm.bias", N_EMBD),
                 t("token_types.weight", N_EMBD, 4)));
-        assertEquals(Arrays.asList("cls.bias", "cls.norm.bias", "token_types.weight"),
+        assertEquals(Collections.singletonList("token_types.weight"),
                 TensorClaims.unclaimed(hp, tc, tensors(Arch.MODERN_BERT)));
     }
 

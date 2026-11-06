@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuKvLayer;
 import com.eonmux.neuralfree.gguf.memory.cpu.HeapModelMemory;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
+import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
 import org.junit.Test;
 
 import java.util.Arrays;
@@ -42,7 +43,7 @@ public class CpuKvLayerTest {
 
     private static CpuKvLayer layer(KvDType t, int nHeadKv, int headDim) {
         int width = nHeadKv * headDim;
-        KvLayout l = KvLayout.of(4, false, width, width, t, t, KvWindow.FULL_CAUSAL);
+        KvLayout l = KvLayout.of(4, false, width, width, t, t, KvWindow.FULL_CAUSAL).withHeads(nHeadKv);
         return CpuKvLayer.allocate(0, l, 0, nHeadKv, headDim, headDim);
     }
 
@@ -83,6 +84,148 @@ public class CpuKvLayerTest {
             assertEquals(FpBlockDecoders.roundToFp16(x[i]), back[i], 0f);
         }
         assertTrue(Float.isInfinite(back[5]));
+    }
+
+    /** FP8 rows store one saturating code per value: round trip through the {@link Fp8Codec} reference, magnitude
+     * saturation at the largest finite value, and rows of {@code width} bytes. */
+    @Test
+    public void fp8RowsStoreSaturatingCodes() {
+        float[] x = random(64, 5);
+        for (KvDType t : Arrays.asList(KvDType.FP8_E4M3, KvDType.FP8_E5M2)) {
+            Fp8Codec codec = t == KvDType.FP8_E4M3 ? Fp8Codec.E4M3FN : Fp8Codec.E5M2;
+            CpuKvLayer c = layer(t, 2, 32);
+            assertEquals(64, c.layout().rowBytesK());
+            float[] row = Arrays.copyOf(x, x.length);
+            row[0] = 1e6f;
+            row[1] = -1e6f;
+            c.writeK(2, row, 0);
+            float[] back = readRow(c, 2, false);
+            assertEquals(codec.maxFinite(), back[0], 0f);
+            assertEquals(-codec.maxFinite(), back[1], 0f);
+            for (int i = 2; i < x.length; i++) {
+                assertEquals(codec.decode(codec.encode(x[i])), back[i], 0f);
+            }
+            assertEquals(0f, readRow(c, 0, false)[7], 0f);
+        }
+    }
+
+    /**
+     * Per-token-head rows store {@code round(x / scale)} with {@code scale = absmax / qmax} per head, so a head's
+     * round-trip error is at most half its quantization step, and heads scale independently.
+     */
+    @Test
+    public void perTokenHeadRowsRoundTripWithinOneHeadStep() {
+        long seed = 11;
+        for (KvDType t : Arrays.asList(KvDType.FP8_PER_TOKEN_HEAD, KvDType.INT8_PER_TOKEN_HEAD,
+                KvDType.INT4_PER_TOKEN_HEAD)) {
+            int heads = 2;
+            int hd = 32;
+            CpuKvLayer c = layer(t, heads, hd);
+            float[] x = random(heads * hd, seed++);
+            // the heads differ by orders of magnitude: each gets its own scale
+            for (int i = hd; i < x.length; i++) {
+                x[i] *= 64.0f;
+            }
+            c.writeK(1, x, 0);
+            float[] back = readRow(c, 1, false);
+            for (int h = 0; h < heads; h++) {
+                float amax = 0f;
+                for (int e = 0; e < hd; e++) {
+                    amax = Math.max(amax, Math.abs(x[h * hd + e]));
+                }
+                float scale = Math.max(amax / KvBlockCodec.perTokenHeadQmax(t), 1e-6f);
+                for (int e = 0; e < hd; e++) {
+                    int i = h * hd + e;
+                    float tolerance = t == KvDType.FP8_PER_TOKEN_HEAD
+                            ? Math.max(scale * 0.5f, Math.abs(x[i]) * 0.0625f) : scale * 0.5f + 1e-5f;
+                    assertEquals(t + " value " + i, x[i], back[i], tolerance);
+                }
+            }
+            // an untouched row reads zero
+            assertEquals(0f, readRow(c, 0, false)[7], 0f);
+        }
+    }
+
+    @Test
+    public void perTokenHeadZeroRowsStoreZeroCodes() {
+        for (KvDType t : Arrays.asList(KvDType.FP8_PER_TOKEN_HEAD, KvDType.INT8_PER_TOKEN_HEAD,
+                KvDType.INT4_PER_TOKEN_HEAD)) {
+            CpuKvLayer c = layer(t, 2, 32);
+            c.writeK(0, new float[64], 0);
+            assertArrayEquals(new float[64], readRow(c, 0, false), 0f);
+        }
+    }
+
+    /** A slice write reuses the row's stored per-head scale, so a shift keeps the scale of the untouched values. */
+    @Test
+    public void perTokenHeadSliceWritesKeepTheRowScales() {
+        for (KvDType t : Arrays.asList(KvDType.FP8_PER_TOKEN_HEAD, KvDType.INT8_PER_TOKEN_HEAD,
+                KvDType.INT4_PER_TOKEN_HEAD)) {
+            CpuKvLayer c = layer(t, 1, 32);
+            float[] x = random(32, 21);
+            c.writeK(0, x, 0);
+            float[] before = readRow(c, 0, false);
+            float[] part = Arrays.copyOfRange(before, 8, 16);
+            for (int i = 0; i < part.length; i++) {
+                part[i] *= 0.5f;
+            }
+            c.writeKSlice(0, 8, 8, part, 0);
+            float[] after = readRow(c, 0, false);
+            float amax = 0f;
+            for (float v : x) {
+                amax = Math.max(amax, Math.abs(v));
+            }
+            float scale = Math.max(amax / KvBlockCodec.perTokenHeadQmax(t), 1e-6f);
+            for (int i = 0; i < 8; i++) {
+                assertEquals(before[i], after[i], 0f);
+            }
+            for (int i = 8; i < 16; i++) {
+                assertEquals(t + " slice value " + i, part[i - 8], after[i], scale * 0.5f + 1e-5f);
+            }
+            for (int i = 16; i < 32; i++) {
+                assertEquals(before[i], after[i], 0f);
+            }
+        }
+    }
+
+    /** Row copies (page privatization, context shift) carry the per-(row, head) scales with the codes. */
+    @Test
+    public void perTokenHeadRowCopiesCarryTheScales() {
+        for (KvDType t : Arrays.asList(KvDType.FP8_PER_TOKEN_HEAD, KvDType.INT8_PER_TOKEN_HEAD,
+                KvDType.INT4_PER_TOKEN_HEAD)) {
+            CpuKvLayer c = layer(t, 2, 32);
+            float[] x = random(64, 31);
+            c.writeK(1, x, 0);
+            c.writeV(3, x, 0);
+            float[] k = readRow(c, 1, false);
+            float[] v = readRow(c, 3, true);
+            c.copyRows(1, 2, 1);
+            c.copyRows(3, 0, 1);
+            assertArrayEquals(k, readRow(c, 2, false), 0f);
+            assertArrayEquals(v, readRow(c, 0, true), 0f);
+        }
+    }
+
+    /** The side plane crosses the host transfer as little-endian F32 rows, one per (row, KV head). */
+    @Test
+    public void perTokenHeadSidePlanesCrossTheHostTransfer() {
+        CpuKvLayer c = layer(KvDType.INT8_PER_TOKEN_HEAD, 2, 32);
+        assertEquals(1, c.sidePlaneCount(false));
+        assertEquals(8, c.sidePlaneRowBytes(false, 0));
+        float[] x = random(64, 41);
+        c.writeK(1, x, 0);
+        byte[] bytes = new byte[8];
+        c.readSideBytes(false, 0, 1, 1, bytes);
+        for (int h = 0; h < 2; h++) {
+            int bits = (bytes[4 * h] & 0xFF) | (bytes[4 * h + 1] & 0xFF) << 8 | (bytes[4 * h + 2] & 0xFF) << 16
+                    | (bytes[4 * h + 3] & 0xFF) << 24;
+            float scale = Float.intBitsToFloat(bits);
+            float amax = 0f;
+            for (int e = 0; e < 32; e++) {
+                amax = Math.max(amax, Math.abs(x[h * 32 + e]));
+            }
+            assertEquals(Math.max(amax / 127f, 1e-6f), scale, 1e-9f);
+        }
     }
 
     /** {@code d = amax / 127 = 1}: x * id lands exactly on .5 values, which round away from zero. */
@@ -175,6 +318,9 @@ public class CpuKvLayerTest {
     @Test
     public void sliceWritesKeepTheRestOfTheRow() {
         for (KvDType t : KvDType.all()) {
+            if (t.perTokenHead() || t.vendorFormat()) {
+                continue; // per-token-head and vendor rows are covered by their own store tests
+            }
             CpuKvLayer c = layer(t, 1, 96);
             float[] x = random(96, 20 + t.code());
             c.writeK(1, x, 0);

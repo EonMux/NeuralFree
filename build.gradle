@@ -1,6 +1,7 @@
 plugins {
     id 'java-library'
     id 'maven-publish'
+    id 'application'
 }
 
 repositories {
@@ -78,6 +79,16 @@ dependencies {
     // Abacus Util (float streams): https://github.com/landawn/AbacusUtil
     implementation 'com.landawn:abacus-util:2.1.5'
 
+    // JeroMQ (pure-Java ZMQ, the transport of the KV cache events, vLLM's ZmqEventPublisher):
+    // https://github.com/zeromq/jeromq
+    project.ext.jeromqVersion = '0.6.0'
+    implementation "org.zeromq:jeromq:$jeromqVersion"
+
+    // msgpack-java core (the msgpack encoding of the KV cache event batches, vLLM's msgspec layout):
+    // https://github.com/msgpack/msgpack-java
+    project.ext.msgpackVersion = '0.9.9'
+    implementation "org.msgpack:msgpack-core:$msgpackVersion"
+
     // JUnit 4
     testImplementation 'junit:junit:4.13.2'
 
@@ -105,6 +116,9 @@ dependencies {
     // JOCL (OpenCL)
     implementation 'org.jocl:jocl:2.0.6'
 
+    // JNA: calls the OpenCL extension functions JOCL does not bind (cl_khr_command_buffer)
+    implementation 'net.java.dev.jna:jna:5.6.0'
+
     // LWJGL Vulkan
     project.ext.lwjglVersion = "3.4.1"
 
@@ -123,6 +137,40 @@ version = '1.0.0-SNAPSHOT'
 java {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
+}
+
+// The installable CLI distribution: ./gradlew installDist produces build/install/neuralfree with the
+// bin/neuralfree start scripts and the launcher's jars under lib/, plus the HTTP server's packaged
+// uber-jar under server/ (not lib/, so the runner's copy of the classes stays off the launcher
+// classpath) for 'neuralfree serve' to launch (see ServeCommand). Every command is a subcommand of
+// the one entry point, as llama.cpp's app binary routes its tools. The server jar is wired after
+// evaluation: the root project configures before :server registers its Quarkus tasks.
+application {
+    applicationName = 'neuralfree'
+    mainClass = 'com.eonmux.neuralfree.cli.Launcher'
+    applicationDefaultJvmArgs = ['-Xmx4g', '--add-opens=java.base/java.util=ALL-UNNAMED']
+}
+
+gradle.projectsEvaluated {
+    def quarkusBuild = project(':server').tasks.findByName('quarkusBuild')
+    if (quarkusBuild != null) {
+        distributions {
+            main {
+                contents {
+                    duplicatesStrategy = 'EXCLUDE'
+                    into('server') {
+                        // only the runner jar: the Quarkus task also emits build metadata the
+                        // distribution must not carry, and its outputs list the jar twice
+                        from quarkusBuild
+                        include '*-runner.jar'
+                    }
+                }
+            }
+        }
+        tasks.named('installDist').configure { dependsOn quarkusBuild }
+        tasks.named('distZip').configure { dependsOn quarkusBuild }
+        tasks.named('distTar').configure { dependsOn quarkusBuild }
+    }
 }
 
 publishing {
@@ -155,10 +203,51 @@ publishing {
 }
 
 // Test sources compile against the main classes only, so compiling them does not build the GPU kernels
-// that processResources merges; the test runtime classpath still holds every main resource.
+// that processResources merges; the test runtime classpath still holds every main resource. GpuHipToolkit
+// (buildSrc/src/main/java, plain Java without the Gradle API) is compiled by buildSrc's own build, and
+// GpuHipToolkitTest verifies the exact HIP command lines and output texts the kernel build tasks run with.
+// Gradle does not expose buildSrc output as a project dependency, so this one path names it: the test
+// source set carries the classes, and compileTestJava and Test take their classpaths from that source set.
+def gpuHipToolkitClasses = files('buildSrc/build/classes/java/main')
 sourceSets {
     test {
-        compileClasspath = sourceSets.main.output.classesDirs + configurations.testCompileClasspath
+        compileClasspath = sourceSets.main.output.classesDirs + configurations.testCompileClasspath + gpuHipToolkitClasses
+        runtimeClasspath += gpuHipToolkitClasses
+    }
+}
+
+// The Vector API SIMD kernels (CpuSimd / SimdKernels): compiled to Java 17 bytecode against the incubator
+// module of the running JDK and packed into the plain jar. The classes are loaded reflectively only, so a
+// Java 11 runtime never links them (the discovery falls back to the scalar kernels), and an older Gradle JVM
+// skips the source set entirely. --release cannot compile the incubator API (it is not part of any historical
+// platform), so this one compile uses -source/-target instead.
+def vectorUsable = JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_17)
+
+sourceSets {
+    vector {
+        java.srcDirs = vectorUsable ? ['src/vector/java'] : []
+    }
+}
+
+if (vectorUsable) {
+    sourceSets.vector.compileClasspath = sourceSets.main.output.classesDirs + configurations.compileClasspath
+
+    // the kernels ride with every application run and test of this project (the test JVM must resolve the
+    // incubator module for CpuSimd to find them; without the flag the scalar kernels run)
+    sourceSets.main.runtimeClasspath += sourceSets.vector.output
+    tasks.withType(Test).configureEach {
+        classpath += sourceSets.vector.output
+        jvmArgs '--add-modules=jdk.incubator.vector'
+    }
+    // Gradle-launched programs (run, runApp, the demos) also resolve the module, so the CPU kernels are active
+    // there. The packaged start scripts and java -jar do not pass it, because they may run on Java 11; the
+    // launcher adds it by relaunching itself on Java 17 or later (JvmVectorModule).
+    tasks.withType(JavaExec).configureEach {
+        jvmArgs '--add-modules=jdk.incubator.vector'
+    }
+
+    jar {
+        from(sourceSets.vector.output)
     }
 }
 
@@ -175,6 +264,16 @@ tasks.withType(JavaCompile).configureEach {
     options.release = 11
 }
 
+if (vectorUsable) {
+    // after the release = 11 rule above, so this compile's own toolchain options win
+    tasks.named('compileVectorJava', JavaCompile).configure {
+        options.release.set(null)
+        sourceCompatibility = '17'
+        targetCompatibility = '17'
+        options.compilerArgs += ['--add-modules', 'jdk.incubator.vector']
+    }
+}
+
 // Every application run forwards neuralfree.* system properties (-D) and project properties (-P) to the JVM, and
 // logs through src/main/config/log4j2.xml (INFO and above to the console).
 tasks.withType(JavaExec).configureEach {
@@ -185,8 +284,35 @@ tasks.withType(JavaExec).configureEach {
     }
 }
 
+// The opt-in measurement tests read neuralfree.test.* system properties; Gradle does not forward them to test JVMs.
+// Uploading real-model weights to a device stages them through direct buffers, so the run that turns the
+// measurement on also widens the direct-memory ceiling its model loads need.
+def measureProperties = System.properties.findAll { it.key.startsWith('neuralfree.test.') }
+tasks.withType(Test).configureEach {
+    systemProperties measureProperties
+    if (measureProperties.get('neuralfree.test.certargmax.measure') == 'true') {
+        jvmArgs '-XX:MaxDirectMemorySize=8g', '-Xmx4g'
+    }
+    if (measureProperties.get('neuralfree.test.smallbatch.measure') == 'true') {
+        jvmArgs '-XX:MaxDirectMemorySize=8g', '-Xmx6g'
+    }
+}
+
 test {
     useJUnit()
+
+    // the tests forward neuralfree.* system properties (-D) like the JavaExec tasks: the opt-in benchmarks and
+    // the GPU selectors take theirs from the command line, since the environment rides the daemon
+    systemProperties System.properties.findAll { it.key.startsWith('neuralfree.') }
+
+    // the worker's default 512 MiB heap caps its direct buffers at the same 512 MiB, and the engine's closed
+    // models release their buffers on collection only — one benchmark variant's tail outran the default, and the
+    // OpenCL host paths of the 4B benchmark pair hold more pinned copies than the CUDA ones
+    jvmArgs '-XX:MaxDirectMemorySize=1g', '-Xmx2g'
+
+    // The doc-drift tests under gguf.mm read these files directly; declaring them reruns the tests when a doc
+    // changes, so a stale Contents list cannot pass on an up-to-date build.
+    inputs.files(file('USAGE.md'), file('README.md'), file('LLM-INFERENCE.md'))
 
     testLogging {
         events = ["passed", "skipped", "failed"]
@@ -245,6 +371,44 @@ task runLLMDemo(type: JavaExec) {
     }
 }
 
+task runBatchedDemo(type: JavaExec) {
+    description = 'Decodes one prompt into parallel sequences over the batch engine (llama.cpp examples/batched)'
+    group = 'application'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.eonmux.neuralfree.demo.BatchedDemo'
+
+    jvmArgs '-Xmx4096m', '--add-opens=java.base/java.util=ALL-UNNAMED'
+    if (project.hasProperty('args')) {
+        // Parse args respecting quoted strings (single or double quotes), as runLLMDemo does
+        def parsed = []
+        def matcher = (project.args =~ /(?:"([^"]*)")|(?:'([^']*)')|(\S+)/)
+        while (matcher.find()) {
+            parsed << (matcher.group(1) ?: matcher.group(2) ?: matcher.group(3))
+        }
+        args parsed
+    }
+}
+
+task runParallelDemo(type: JavaExec) {
+    description = 'Simulates concurrent clients over the batch engine (llama.cpp examples/parallel)'
+    group = 'application'
+
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.eonmux.neuralfree.demo.ParallelDemo'
+
+    jvmArgs '-Xmx4096m', '--add-opens=java.base/java.util=ALL-UNNAMED'
+    if (project.hasProperty('args')) {
+        // Parse args respecting quoted strings (single or double quotes), as runLLMDemo does
+        def parsed = []
+        def matcher = (project.args =~ /(?:"([^"]*)")|(?:'([^']*)')|(\S+)/)
+        while (matcher.find()) {
+            parsed << (matcher.group(1) ?: matcher.group(2) ?: matcher.group(3))
+        }
+        args parsed
+    }
+}
+
 task runNfTool(type: JavaExec) {
     description = 'Runs the nftool CLI (export, and the tools of the later tool work packages)'
     group = 'application'
@@ -264,6 +428,24 @@ task runNfTool(type: JavaExec) {
     }
 }
 
+// The application plugin's run task is the multi-call launcher (the same main the start scripts
+// run): -Pargs forwards its arguments with the quoting runLLMDemo and runNfTool use, and the
+// project version rides in as the version property the manifest carries in the packaged jar.
+run {
+    description = 'Runs the neuralfree multi-call launcher'
+    jvmArgs '-Xmx4096m', '--add-opens=java.base/java.util=ALL-UNNAMED'
+    systemProperty 'neuralfree.version', project.version
+    if (project.hasProperty('args')) {
+        // Parse args respecting quoted strings (single or double quotes), as runNfTool does
+        def parsed = []
+        def matcher = (project.args =~ /(?:"([^"]*)")|(?:'([^']*)')|(\S+)/)
+        while (matcher.find()) {
+            parsed << (matcher.group(1) ?: matcher.group(2) ?: matcher.group(3))
+        }
+        args parsed
+    }
+}
+
 task runDemos(type: JavaExec) {
     description = 'Runs the NeuralFree demo suite'
     group = 'application'
@@ -274,10 +456,14 @@ task runDemos(type: JavaExec) {
     jvmArgs '-Xmx4096m', '--add-opens=java.base/java.util=ALL-UNNAMED'
 }
 
-// The jar carries the licence, the notices and the commercial licence summary under META-INF.
+// The jar is the multi-call entry point ('java -jar' routes like the start scripts do) and carries
+// the licence, the notices and the commercial licence summary under META-INF; the manifest's
+// Implementation-Version is the version '--version' prints when no property overrides it.
 jar {
     manifest {
-        attributes('Main-Class': 'com.eonmux.neuralfree.NeuralFree')
+        attributes('Main-Class': 'com.eonmux.neuralfree.cli.Launcher',
+                   'Implementation-Title': 'NeuralFree',
+                   'Implementation-Version': project.version)
     }
     from(rootDir) {
         include 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md', 'COMMERCIAL-LICENSE.md'
@@ -287,6 +473,7 @@ jar {
 
 apply from: 'gradle/gpu-kernels.gradle'
 apply from: 'gradle/hf-tables.gradle'
+apply from: 'gradle/vllm-tables.gradle'
 
 // GPU kernel artifacts are generated under build/generated/gpu and merged here; GLSL sources, shared GLSL
 // includes and the shader variant tables of every kernel library are build inputs only. The OpenCL kernel
@@ -297,6 +484,8 @@ tasks.named('processResources', ProcessResources) {
     from(tasks.named('compileShaders'))
     from(tasks.named('compileTestShaders'))
     from(tasks.named('compileCudaKernels'))
+    from(tasks.named('compileHipKernels'))
+    from(tasks.named('compileMetalShaders'))
     dependsOn 'inventoryCheck'
     mustRunAfter 'updateKernelInventory'
     exclude 'shaders/**/*.comp', '**/*.glsl', 'shaders/*/variants/**'

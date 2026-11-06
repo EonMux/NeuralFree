@@ -1,0 +1,14 @@
+{#- llama.cpp grok-2 chat template (src/llama-chat.cpp:889-902): system and user messages trimmed. -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- 'System: ' ~ (content | trim(' \t\n\v\f\r')) ~ '<|separator|>\n\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- 'Human: ' ~ (content | trim(' \t\n\v\f\r')) ~ '<|separator|>\n\n' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- 'Assistant: ' ~ content ~ '<|separator|>\n\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- 'Assistant:' -}}
+{%- endif -%}

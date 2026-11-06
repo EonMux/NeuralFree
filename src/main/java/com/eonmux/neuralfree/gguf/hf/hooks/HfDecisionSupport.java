@@ -368,6 +368,16 @@ public final class HfDecisionSupport {
                 "Reply with only the code of the best option.");
 
         static final String OPENJEV = openjev();
+
+        /**
+         * {@code MiniCPMOCRSeqClsModel._systemone_template} (qwen.py:726-736): the fixed OCR consistency prompt over
+         * the original image, the OCR text and the image rendered from it; the trailing assistant turn is a Jinja
+         * expression so its newlines are kept.
+         */
+        static final String MINICPM_OCR_JEV = "<|im_start|>user\n{{ images[0] }}\nOCR文本：\n{{ state }}\n"
+                + "{{ images[1] }}\n第一张图是原图，第二张图是上述 OCR 文本渲染得到的图片。\n"
+                + "请判断该 OCR 文本及其对应渲染图是否与原图内容一致。\n这是一个二分类任务：一致标为 1，不一致标为 0。"
+                + "{{ '<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}";
         static final String LEV = lev();
         static final String KEV = kev();
         static final String NIMBLE = nimble();

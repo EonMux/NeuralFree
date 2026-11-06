@@ -11,6 +11,8 @@ import java.util.Objects;
  *   <li>causal: masked when {@code k > q};</li>
  *   <li>STANDARD: masked when {@code q - k >= nSwa}, so the first visible key is {@code q - nSwa + 1};</li>
  *   <li>CHUNKED: masked when {@code k < (q / nSwa) * nSwa} (chunk start);</li>
+ *   <li>CHUNKED_LOOKBACK: masked when {@code k < ((q / nSwa) - 1) * nSwa}, so the query sees its own aligned
+ *       chunk and the one before it;</li>
  *   <li>SYMMETRIC: masked when {@code |q - k| > nSwa / 2}.</li>
  * </ul>
  * Immutable.
@@ -59,6 +61,8 @@ public final class KvWindow {
                 return Math.max(0, pos - nSwa + 1);
             case CHUNKED:
                 return (pos / nSwa) * nSwa;
+            case CHUNKED_LOOKBACK:
+                return (int) Math.max(0L, ((long) (pos / nSwa) - 1L) * nSwa);
             case SYMMETRIC:
                 return Math.max(0, pos - nSwa / 2);
             default:
@@ -93,6 +97,8 @@ public final class KvWindow {
                 return (long) q - k < nSwa;
             case CHUNKED:
                 return k >= (q / nSwa) * nSwa;
+            case CHUNKED_LOOKBACK:
+                return (long) k >= ((long) (q / nSwa) - 1L) * nSwa;
             case SYMMETRIC:
                 return Math.abs((long) q - k) <= nSwa / 2;
             default:
@@ -101,10 +107,18 @@ public final class KvWindow {
     }
 
     /**
+     * This window with the causal rule disabled (llama.cpp {@code llama_set_causal_attn(false)}): the window type
+     * and span stay, keys after the query become visible.
+     */
+    public KvWindow nonCausal() {
+        return causal ? new KvWindow(type, nSwa, false) : this;
+    }
+
+    /**
      * Number of consecutive key positions that must stay cached so that the queries {@code [pos, pos + nTokens)}
      * see every visible key: {@code nSwa + nTokens - 1} for STANDARD and CHUNKED (keys from
-     * {@code pos - nSwa + 1} through {@code pos + nTokens - 1}), {@code 2 * (nSwa / 2) + nTokens} for SYMMETRIC,
-     * and {@link Long#MAX_VALUE} without a window.
+     * {@code pos - nSwa + 1} through {@code pos + nTokens - 1}), {@code 2 * nSwa + nTokens - 1} for
+     * CHUNKED_LOOKBACK, {@code 2 * (nSwa / 2) + nTokens} for SYMMETRIC, and {@link Long#MAX_VALUE} without a window.
      */
     public long retainedPositions(int nTokens) {
         if (nTokens <= 0) {
@@ -114,6 +128,8 @@ public final class KvWindow {
             case STANDARD:
             case CHUNKED:
                 return (long) nSwa + nTokens - 1;
+            case CHUNKED_LOOKBACK:
+                return 2L * nSwa + nTokens - 1;
             case SYMMETRIC:
                 return (long) (nSwa / 2) * 2 + nTokens;
             default:

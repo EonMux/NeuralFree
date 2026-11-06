@@ -368,7 +368,7 @@ public final class RwkvBlocks {
                 block = block.withHadamard(w.hadamard());
             }
             if (w.inputTransform() != null) {
-                block = block.withInputTransform(w.inputTransform(), w.inputPerm());
+                block = block.withInputTransform(w.inputTransform(), w.inputPerm(), w.inputPreScale());
             }
             return w.hasScale() ? block.withScale(w.scale()) : block;
         }
@@ -402,7 +402,12 @@ public final class RwkvBlocks {
 
         /** Temporary of {@code ubatch} rows of {@code width} floats at element 0 of its buffer. */
         ScratchSlot temp(String name, long width) {
-            ScratchSlot s = ctx.scratch().temp(name, Math.multiplyExact((long) ubatch, width));
+            return temp(name, width, 1);
+        }
+
+        /** {@link #temp(String, long)} with {@code slots} sequence rows of the working rows. */
+        ScratchSlot temp(String name, long width, int slots) {
+            ScratchSlot s = ctx.scratch().temp(name, Math.multiplyExact((long) slots * ubatch, width));
             if (s.offset() != 0) {
                 throw new IllegalStateException(where + ": temporary " + s + " must start at element 0");
             }
@@ -513,9 +518,14 @@ public final class RwkvBlocks {
         }
 
         void runShift(PreparedDispatch d, int nTokens, int nEmbd, ScratchSlot in) {
+            runShift(d, nTokens, nEmbd, in.buffer(), in.offset());
+        }
+
+        /** {@link #runShift} over a caller view given by buffer and element offset. */
+        void runShift(PreparedDispatch d, int nTokens, int nEmbd, GpuBuffer in, int inOff) {
             d.setInt(RwkvKernels.ARG_SHIFT_N_TOKENS, nTokens);
-            d.setInt(ARG_SHIFT_CUR_OFF, in.offset());
-            d.setBuffer(ARG_SHIFT_CUR, in.buffer());
+            d.setInt(ARG_SHIFT_CUR_OFF, inOff);
+            d.setBuffer(ARG_SHIFT_CUR, in);
             d.setGlobal(RwkvKernels.tokenShiftGlobalSize(nTokens, nEmbd));
             d.dispatch();
         }
@@ -707,7 +717,7 @@ public final class RwkvBlocks {
             return ctx.scratch().temp(name, Math.multiplyExact(ubatch, width));
         }
 
-        /** Recurrent tensor {@code name} of this layer (live array, single sequence from index 0). */
+        /** Recurrent tensor {@code name} of this layer (live array, one row of {@link #stateRow} per slot). */
         float[] state(String name) {
             if (!ctx.hasMemory()) {
                 throw new IllegalStateException(where + ": the RWKV blocks need recurrent memory");
@@ -721,6 +731,21 @@ public final class RwkvBlocks {
                 throw new IllegalStateException(where + ": recurrent memory has no '" + name + "' tensor");
             }
             return s;
+        }
+
+        /** Floats of one state slot of tensor {@code name} (sequence {@code seq}'s row starts at {@code seq * n}). */
+        int stateRow(String name) {
+            state(name);
+            return ctx.memory().recurrent(layer.il()).slotFloats(name);
+        }
+
+        /** The state slots the memory keeps (one row per slot per tensor). */
+        int stateSlots() {
+            if (!ctx.hasMemory()) {
+                throw new IllegalStateException(where + ": the RWKV blocks need recurrent memory");
+            }
+            RecurrentStateAccessor rs = ctx.memory().recurrent(layer.il());
+            return rs == null ? 1 : rs.slots();
         }
 
         /** Projection {@code out[t] = W in[t] (+ b)} into rows from index 0 of {@code out}. */

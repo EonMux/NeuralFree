@@ -1,0 +1,26 @@
+/* elu.comp - LLM_ELU: y[i] = x[i] > 0 ? x[i] : exp(x[i]) - 1, the pockettts SEANet activation.
+ * GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n, R x, W y). Dispatch: 1-D, one invocation per element, global = roundUp(n, L),
+ * local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfEluX { float x_in[]; };
+layout(std430, binding = 1) writeonly buffer NfEluY { float y_out[]; };
+
+layout(push_constant) uniform NfEluParams {
+    int n;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.n)) {
+        return;
+    }
+    const float v = x_in[idx];
+    y_out[idx] = v > 0.0 ? v : exp(v) - 1.0;
+}

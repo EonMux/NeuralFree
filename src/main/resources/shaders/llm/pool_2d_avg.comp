@@ -1,0 +1,49 @@
+/* pool_2d_avg.comp - LLM_Pool2dAvg, the average pool of the convolutional vision encoders. GLSL twin of
+ * kernels/llm/vision.cl (the semantic reference). Requires: common/nf_common.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i W, i H, i OW, i OH, i C, i KY, i KX, i x_off, i y_off, R float x, W float y)
+ *     y[(oy*OW + ox)*C + c] = (sum_{dy < KY, dx < KX} x[((oy*KY + dy)*W + ox*KX + dx)*C + c]) / (KY*KX),
+ *     whole KY x KX windows at stride KY, KX, no padding (ggml_pool_2d AVG).
+ *
+ * Dispatch: 1-D, one invocation per output element, local = {L, 1, 1}, global = OW*OH*C rounded up to L;
+ * folded group counts are recovered by nf_global_id(). No barriers.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) restrict readonly buffer NfPoolX { float x_in[]; };
+layout(std430, binding = 1) restrict writeonly buffer NfPoolY { float y_out[]; };
+
+layout(push_constant) uniform NfPoolParams {
+    int W;
+    int H;
+    int OW;
+    int OH;
+    int C;
+    int KY;
+    int KX;
+    int x_off;
+    int y_off;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.OW) * uint(pc.OH) * uint(pc.C)) {
+        return;
+    }
+    const uint c = idx % uint(pc.C);
+    const uint rest = idx / uint(pc.C);
+    const uint ox = rest % uint(pc.OW);
+    const uint oy = rest / uint(pc.OW);
+    float acc = 0.0;
+    for (int dy = 0; dy < pc.KY; ++dy) {
+        for (int dx = 0; dx < pc.KX; ++dx) {
+            acc += x_in[uint(pc.x_off)
+                    + (uint(oy * pc.KY + dy) * uint(pc.W) + uint(ox * pc.KX + dx)) * uint(pc.C) + c];
+        }
+    }
+    y_out[uint(pc.y_off) + idx] = acc / float(pc.KY * pc.KX);
+}

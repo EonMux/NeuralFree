@@ -1,0 +1,219 @@
+/* moe_gemm.comp - MoE grouped GEMM (expert-sorted tiled GEMM) over a QT_DECODE_ELEM weight decoder.
+ * GLSL twin of NF_GEMM_GROUPED (kernels/llm/common/matmul_grouped_family.h, instantiated in
+ * kernels/llm/moe_gemm.cl), which is the semantic reference. Requires: common/nf_common.glsl,
+ * common/quant_blocks.glsl, common/iq_tables.glsl and the decoder file that serves QTYPE (dense
+ * F32/F16/BF16 decoders live in quant_blocks.glsl).
+ *
+ * A variants row selects QTYPE=QT_<T>, and IND=1 for the expert-cache form; its kernel name is the
+ * OpenCL name, e.g.
+ *     Q4_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q4_K
+ *     Q4_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q4_K IND=1
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i out_dim, i in_dim, i n_tiles, i x_div, i x_stride, i in_off, i out_off, i has_scale,
+ *    i expert_base, i expert_count, R int gemm_token, R int gemm_slot, R weight, R float input,
+ *    R float scales, W float output)
+ * The aligned layout of the two int buffers, the expert shard range, has_scale and the per-pair
+ * output positions: kernels/llm/common/matmul_grouped_family.h. The weight binding holds the experts
+ * [expert_base, expert_base + expert_count); byte offsets are 32-bit, which every shard satisfies
+ * because shards stay below maxStorageBufferRange.
+ *
+ * With IND=1 (T_GroupedGemmInd) the arguments are
+ *   (i out_dim, i in_dim, i n_tiles, i x_div, i x_stride, i in_off, i out_off, i has_scale,
+ *    R int gemm_token, R int gemm_slot, R int map, R weight, R float input, R float scales,
+ *    W float output)
+ * and the weight binding is an expert cache bank: the tile of expert e reads local expert map[e], and
+ * a tile with map[e] < 0 returns (the host computes those pairs), as T_GroupedGemmInd of
+ * kernels/llm/common/matmul_grouped_family.h.
+ *
+ * Tiling equals matmul_tiled.comp: a workgroup of 256 invocations computes 64 weight rows of the
+ * tile's expert x 32 aligned positions in 16-deep stages. Dispatch: 2-D (never folded), global =
+ * {ceil(out_dim / 64) * 256, n_tiles, 1}, local = {256, 1, 1}; n_tiles is the host's worst-case
+ * bound, and the tiles past the aligned count hold only -1 fillers, so their workgroups return at
+ * the slot read. Shared memory: 6272 bytes of tiles plus the IQ grid of the selected QTYPE (at most
+ * 8 KB).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#ifndef QTYPE
+#error "moe_gemm.comp requires QTYPE"
+#endif
+
+layout(std430, binding = 0) readonly buffer NfMgToken { int gemm_token[]; };
+layout(std430, binding = 1) readonly buffer NfMgSlot { int gemm_slot[]; };
+#ifdef IND
+layout(std430, binding = 2) readonly buffer NfMgMap { int map[]; };
+NF_BUFFER_VIEWS(3, w)
+layout(std430, binding = 4) readonly buffer NfMgInput { float x_in[]; };
+layout(std430, binding = 5) readonly buffer NfMgScales { float scales[]; };
+layout(std430, binding = 6) writeonly buffer NfMgOutput { float y_out[]; };
+layout(push_constant) uniform NfMgParams {
+    int out_dim; int in_dim; int n_tiles; int x_div; int x_stride; int in_off; int out_off;
+    int has_scale;
+} pc;
+#else
+NF_BUFFER_VIEWS(2, w)
+layout(std430, binding = 3) readonly buffer NfMgInput { float x_in[]; };
+layout(std430, binding = 4) readonly buffer NfMgScales { float scales[]; };
+layout(std430, binding = 5) writeonly buffer NfMgOutput { float y_out[]; };
+layout(push_constant) uniform NfMgParams {
+    int out_dim; int in_dim; int n_tiles; int x_div; int x_stride; int in_off; int out_off;
+    int has_scale; int expert_base; int expert_count;
+} pc;
+#endif
+
+#include "common/quant_blocks.glsl"
+#include "common/iq_tables.glsl"
+#include "common/quant_legacy.glsl"
+#include "common/quant_k.glsl"
+#include "common/quant_iq.glsl"
+#include "common/quant_new.glsl"
+#include "common/quant_ext.glsl"
+
+#if !defined(QT_DECODE_ELEM) || !defined(QT_BS) || !defined(QT_BB)
+#error "moe_gemm.comp: no QT_DECODE_ELEM decoder serves QTYPE"
+#endif
+
+#define NF_GEMM_TM 64                          /* weight rows per workgroup tile */
+#define NF_GEMM_TN 32                          /* aligned positions per workgroup tile */
+#define NF_GEMM_TK 16                          /* reduction depth per shared-memory stage */
+#define NF_GEMM_RM 4                           /* rows per invocation */
+#define NF_GEMM_RN 2                           /* positions per invocation */
+#define NF_GEMM_TX (NF_GEMM_TM / NF_GEMM_RM)   /* 16 row lanes */
+#define NF_GEMM_AS (NF_GEMM_TM + 1)            /* padded depth-row stride of the weight tile */
+#define NF_GEMM_BS (NF_GEMM_TN + 1)            /* padded depth-row stride of the activation tile */
+
+#ifndef IND
+/* True when expert e lies in the bound shard [expert_base, expert_base + expert_count). */
+bool nf_mg_in_shard(int e) {
+    return e >= pc.expert_base && e - pc.expert_base < pc.expert_count;
+}
+#endif
+
+shared float nf_mg_a[NF_GEMM_TK * NF_GEMM_AS];
+shared float nf_mg_b[NF_GEMM_TK * NF_GEMM_BS];
+
+void main() {
+    nf_iq_init_shared();
+
+    const uint lid = gl_LocalInvocationID.x;
+    const int out_dim = pc.out_dim;
+    const int in_dim = pc.in_dim;
+    const int tile = int(gl_WorkGroupID.y);
+    const int e = gemm_slot[tile * NF_GEMM_TN];
+    const int m0 = int(gl_WorkGroupID.x) * NF_GEMM_TM;
+    const uint tx = lid % uint(NF_GEMM_TX);
+    const uint ty = lid / uint(NF_GEMM_TX);
+    const uint lk = lid % uint(NF_GEMM_TK);
+    const uint lr = lid / uint(NF_GEMM_TK);
+
+    if (e < 0) {
+        /* Tiles of pairs whose id was out of range: the base dispatch writes 0. Depends only on the
+         * workgroup id, so the return is uniform. */
+#ifndef IND
+        if (pc.expert_base != 0) {
+            return;
+        }
+#endif
+        for (int j = 0; j < NF_GEMM_RN; ++j) {
+            const int pos = tile * NF_GEMM_TN + int(ty) + NF_GEMM_TX * j;
+            const int p = gemm_token[pos];
+            if (p < 0) {
+                continue;
+            }
+            for (int i = 0; i < NF_GEMM_RM; ++i) {
+                const int r = m0 + int(tx) + NF_GEMM_TX * i;
+                if (r < out_dim) {
+                    y_out[uint(pc.out_off) + uint(p) * uint(out_dim) + uint(r)] = 0.0;
+                }
+            }
+        }
+        return;
+    }
+    /* The slot is the workgroup's, so the shard-range (or map) return is uniform too. */
+#ifdef IND
+    const int we = map[e];
+    if (we < 0) {
+        return;
+    }
+#else
+    if (!nf_mg_in_shard(e)) {
+        return;
+    }
+    const int we = e - pc.expert_base;
+#endif
+
+    const uint row_bytes = uint(in_dim / QT_BS) * uint(QT_BB);
+    const uint wbase = uint(we) * uint(out_dim) * row_bytes;
+
+    uint wrow[NF_GEMM_RM];
+    bool wok[NF_GEMM_RM];
+    [[unroll]] for (int q = 0; q < NF_GEMM_RM; ++q) {
+        const int r = m0 + int(lr) + NF_GEMM_TX * q;
+        wok[q] = r < out_dim;
+        wrow[q] = wbase + (wok[q] ? uint(r) * row_bytes : 0u);
+    }
+    uint xrow[NF_GEMM_RN];
+    bool xok[NF_GEMM_RN];
+    [[unroll]] for (int q = 0; q < NF_GEMM_RN; ++q) {
+        const int pos = tile * NF_GEMM_TN + int(lr) + NF_GEMM_TX * q;
+        const int p = gemm_token[pos];
+        xok[q] = p >= 0;
+        xrow[q] = uint(pc.in_off) + (xok[q] ? uint(p / pc.x_div) * uint(pc.x_stride) : 0u);
+    }
+
+    float acc[NF_GEMM_RM][NF_GEMM_RN];
+    [[unroll]] for (int i = 0; i < NF_GEMM_RM; ++i) {
+        [[unroll]] for (int j = 0; j < NF_GEMM_RN; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (int k0 = 0; k0 < in_dim; k0 += NF_GEMM_TK) {
+        const int k = k0 + int(lk);
+        const bool kok = k < in_dim;
+        [[unroll]] for (int q = 0; q < NF_GEMM_RM; ++q) {
+            nf_mg_a[lk * uint(NF_GEMM_AS) + lr + uint(NF_GEMM_TX * q)] =
+                (wok[q] && kok) ? qt_elem(NF_WS_A, wrow[q], uint(k)) : 0.0;
+        }
+        [[unroll]] for (int q = 0; q < NF_GEMM_RN; ++q) {
+            nf_mg_b[lk * uint(NF_GEMM_BS) + lr + uint(NF_GEMM_TX * q)] =
+                (xok[q] && kok) ? x_in[xrow[q] + uint(k)] : 0.0;
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0u; kk < uint(NF_GEMM_TK); ++kk) {
+            float a[NF_GEMM_RM];
+            float b[NF_GEMM_RN];
+            [[unroll]] for (int i = 0; i < NF_GEMM_RM; ++i) {
+                a[i] = nf_mg_a[kk * uint(NF_GEMM_AS) + tx + uint(NF_GEMM_TX * i)];
+            }
+            [[unroll]] for (int j = 0; j < NF_GEMM_RN; ++j) {
+                b[j] = nf_mg_b[kk * uint(NF_GEMM_BS) + ty + uint(NF_GEMM_TX * j)];
+            }
+            [[unroll]] for (int i = 0; i < NF_GEMM_RM; ++i) {
+                [[unroll]] for (int j = 0; j < NF_GEMM_RN; ++j) {
+                    acc[i][j] += a[i] * b[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (int j = 0; j < NF_GEMM_RN; ++j) {
+        const int pos = tile * NF_GEMM_TN + int(ty) + NF_GEMM_TX * j;
+        const int p = gemm_token[pos];
+        if (p < 0) {
+            continue;
+        }
+        for (int i = 0; i < NF_GEMM_RM; ++i) {
+            const int r = m0 + int(tx) + NF_GEMM_TX * i;
+            if (r < out_dim) {
+                y_out[uint(pc.out_off) + uint(p) * uint(out_dim) + uint(r)] =
+                    pc.has_scale != 0 ? acc[i][j] * scales[e] : acc[i][j];
+            }
+        }
+    }
+}

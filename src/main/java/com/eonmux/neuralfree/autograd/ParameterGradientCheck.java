@@ -18,19 +18,53 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 /**
- * The parameter gradient check behind {@link GradientCheckUtil#gradCheckParameters}: parameter validation, the loss
- * evaluations with buffer restoration, the gradient-slot stash and the element comparison. Its contract is the one
- * {@code gradCheckParameters} documents.
+ * The parameter gradient checks behind {@link GradientCheckUtil#gradCheckParameters} and
+ * {@link GradientCheckUtil#gradCheckParametersFloat64}: parameter validation, the loss evaluations with buffer
+ * restoration, the gradient-slot stash and the element comparison. Their contracts are the ones those methods
+ * document; the two differ only in the numerical side ({@link NumericalSide}).
  */
 final class ParameterGradientCheck {
 
     private ParameterGradientCheck() {
     }
 
+    /**
+     * The numerical gradient of the sampled elements: the central difference for row-major element {@code element}
+     * of checked parameter {@code parameter} (its index in the checked list). Called under {@code noGrad}.
+     */
+    @FunctionalInterface
+    interface NumericalSide {
+        float centralDifference(int parameter, int element);
+    }
+
     /** {@link GradientCheckUtil#gradCheckParameters}: see its contract. */
     static GradientCheckResult run(Supplier<Tensor> loss, Module module, List<Parameter> params, float epsilon,
                                    float tolerance, int maxElementsPerParameter) {
-        validateParameterCheck(loss, params, epsilon, tolerance, maxElementsPerParameter);
+        validateParameterCheck(loss, params, tolerance, maxElementsPerParameter);
+        if (!(epsilon > 0.0f) || Float.isInfinite(epsilon)) {
+            throw new IllegalArgumentException("Epsilon must be positive and finite, got " + epsilon);
+        }
+        return run(loss, module, params, tolerance, maxElementsPerParameter, null, epsilon);
+    }
+
+    /**
+     * {@link GradientCheckUtil#gradCheckParametersFloat64}: see its contract. {@code reference} is bound to
+     * {@code params} in order and carries the finite-difference step.
+     */
+    static GradientCheckResult runFloat64(Supplier<Tensor> loss, Module module, List<Parameter> params,
+                                          Float64Reference.Parameters reference, float tolerance,
+                                          int maxElementsPerParameter) {
+        validateParameterCheck(loss, params, tolerance, maxElementsPerParameter);
+        return run(loss, module, params, tolerance, maxElementsPerParameter, reference, Float.NaN);
+    }
+
+    /**
+     * The check with {@code numerical} as the numerical side, or, when it is null, central differences of
+     * {@code loss} itself with step {@code epsilon}.
+     */
+    private static GradientCheckResult run(Supplier<Tensor> loss, Module module, List<Parameter> params,
+                                           float tolerance, int maxElementsPerParameter, NumericalSide numerical,
+                                           float epsilon) {
         List<CheckedParameter> checked = checkedParameters(params);
         BufferSnapshot buffers = BufferSnapshot.take(module);
         GradientStash stash = GradientStash.take(module, params);
@@ -47,11 +81,15 @@ final class ParameterGradientCheck {
             if (analytical == null) {
                 return new GradientCheckResult(false, Float.NaN, Float.NaN, "Loss supplier returned null");
             }
+            NumericalSide side = numerical != null ? numerical : (i, j) -> {
+                CheckedParameter p = checked.get(i);
+                long address = elementAddress(p.leaf.shape().dims(), p.strides, j);
+                return evaluator.centralDifference(p.leaf, address, p.values[j], epsilon);
+            };
             Comparison comparison = new Comparison(tolerance);
             try (ComputationGraph.NoGradScope noGrad = ComputationGraph.noGrad()) {
                 for (int i = 0; i < checked.size(); i++) {
-                    compareParameter(evaluator, checked.get(i), i, analytical[i], epsilon, maxElementsPerParameter,
-                        comparison);
+                    compareParameter(side, checked.get(i), i, analytical[i], maxElementsPerParameter, comparison);
                 }
             }
             return comparison.result();
@@ -63,16 +101,18 @@ final class ParameterGradientCheck {
         }
     }
 
-    private static void validateParameterCheck(Supplier<Tensor> loss, List<Parameter> params, float epsilon,
-                                               float tolerance, int maxElementsPerParameter) {
+    /**
+     * The argument checks the parameter checks share.
+     *
+     * @throws IllegalArgumentException as {@link GradientCheckUtil#gradCheckParameters} documents
+     */
+    static void validateParameterCheck(Supplier<Tensor> loss, List<Parameter> params, float tolerance,
+                                       int maxElementsPerParameter) {
         if (loss == null) {
             throw new IllegalArgumentException("Loss supplier cannot be null");
         }
         if (params == null || params.isEmpty()) {
             throw new IllegalArgumentException("Parameters cannot be null or empty");
-        }
-        if (!(epsilon > 0.0f) || Float.isInfinite(epsilon)) {
-            throw new IllegalArgumentException("Epsilon must be positive and finite, got " + epsilon);
         }
         if (!(tolerance >= 0.0f)) {
             throw new IllegalArgumentException("Tolerance must be non-negative, got " + tolerance);
@@ -110,7 +150,7 @@ final class ParameterGradientCheck {
     }
 
     /** The tensor of {@code p}, which must be its leaf: no substitution is open. */
-    private static Tensor requireLeaf(Parameter p, String label) {
+    static Tensor requireLeaf(Parameter p, String label) {
         Tensor t = p.tensor();
         if (!t.requiresGrad() || t.gradFn() != null) {
             throw new IllegalStateException("Parameter " + label + " does not read its own leaf (a substitution is"
@@ -120,7 +160,7 @@ final class ParameterGradientCheck {
     }
 
     /** {@code t}'s strides, after checking that no element is addressed more than once. */
-    private static Strides requireDistinctElements(Tensor t, String label) {
+    static Strides requireDistinctElements(Tensor t, String label) {
         Strides strides = t.strides();
         int[] dims = t.shape().dims();
         for (int k = 0; k < dims.length; k++) {
@@ -132,7 +172,7 @@ final class ParameterGradientCheck {
         return strides;
     }
 
-    private static String label(Parameter p, int index) {
+    static String label(Parameter p, int index) {
         return p.name() != null ? "'" + p.name() + "'" : "#" + index;
     }
 
@@ -140,13 +180,10 @@ final class ParameterGradientCheck {
      * Adds the finite-difference comparison of the sampled elements of {@code p} to {@code comparison}; runs under
      * {@code noGrad}.
      */
-    private static void compareParameter(Evaluator evaluator, CheckedParameter p, int index, float[] analytical,
-                                         float epsilon, int maxElements, Comparison comparison) {
-        int[] dims = p.leaf.shape().dims();
+    private static void compareParameter(NumericalSide side, CheckedParameter p, int index, float[] analytical,
+                                         int maxElements, Comparison comparison) {
         for (int j : sampledElements(p.values.length, maxElements)) {
-            long address = elementAddress(dims, p.strides, j);
-            float numerical = evaluator.centralDifference(p.leaf, address, p.values[j], epsilon);
-            comparison.add(p.label, j, analytical[j], numerical);
+            comparison.add(p.label, j, analytical[j], side.centralDifference(index, j));
         }
     }
 
@@ -161,7 +198,7 @@ final class ParameterGradientCheck {
     }
 
     /** The storage element of row-major element {@code index} of a view with {@code dims} and {@code strides}. */
-    private static long elementAddress(int[] dims, Strides strides, int index) {
+    static long elementAddress(int[] dims, Strides strides, int index) {
         long address = strides.offset();
         long rest = index;
         for (int k = dims.length - 1; k >= 0; k--) {
@@ -182,12 +219,12 @@ final class ParameterGradientCheck {
         }
     }
 
-    private static <T> Set<T> identitySet() {
+    static <T> Set<T> identitySet() {
         return Collections.newSetFromMap(new IdentityHashMap<>());
     }
 
     /** Adds {@code e} to {@code primary} when there is one; otherwise to {@code first}, which it returns. */
-    private static RuntimeException collect(RuntimeException primary, RuntimeException first, RuntimeException e) {
+    static RuntimeException collect(RuntimeException primary, RuntimeException first, RuntimeException e) {
         if (primary != null) {
             primary.addSuppressed(e);
             return first;

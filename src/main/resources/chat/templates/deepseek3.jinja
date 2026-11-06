@@ -1,0 +1,14 @@
+{#- llama.cpp deepseek3 chat template (src/llama-chat.cpp:548-562). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- content ~ '\n\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '<｜User｜>' ~ content -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- '<｜Assistant｜>' ~ content ~ '<｜end▁of▁sentence｜>' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<｜Assistant｜>' -}}
+{%- endif -%}

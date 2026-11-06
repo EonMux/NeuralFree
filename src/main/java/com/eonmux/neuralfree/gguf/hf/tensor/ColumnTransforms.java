@@ -153,9 +153,17 @@ public final class ColumnTransforms {
         return single(src, what, n, srcEntry, contiguous);
     }
 
-    /** A 1-D source padded to {@code n} elements of {@code fill}. */
-    static RowSource padCols(RowSource src, long n, float fill) {
+    /**
+     * {@code torch.nn.functional.pad(src, (0, n - inner))}: the innermost dimension padded to {@code n} columns with
+     * {@code fill} (Limite's attention-gate weights, limite.py:111-113).
+     *
+     * @throws IllegalArgumentException when {@code n} is smaller than the innermost dimension
+     */
+    public static RowSource padCols(RowSource src, long n, float fill) {
         long inner = inner(src);
+        if (n < inner) {
+            throw new IllegalArgumentException(src.describe() + ": cannot pad " + inner + " columns to " + n);
+        }
         ColIndex index = new ColIndex() {
             @Override
             public int part(long c) {

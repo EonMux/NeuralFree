@@ -180,7 +180,7 @@ public final class HfMoeMlaHooksA {
      */
     public static void glm4MoeLiteMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) {
         HfDeepseekHooks.meta(ctx, kv, plan);
-        if (!glm4MoeLiteSkipMtp(ctx.config())) {
+        if (ctx.options().includeMtp() && !glm4MoeLiteSkipMtp(ctx.config())) {
             kv.set(GgufKeys.NEXTN_PREDICT_LAYERS, nextnLayers(ctx.config()));
         }
     }
@@ -351,7 +351,8 @@ public final class HfMoeMlaHooksA {
         List<Boolean> swa = new ArrayList<>();
         List<Boolean> indexerFull = new ArrayList<>();
         for (int bid = 0; bid < ctx.blockCount(); bid++) {
-            boolean s = isSwaLayer(cfg, bid);
+            // the NextN/MTP block uses the sliding-attention MLA (dots3.py:69-73, dots3note.cpp:75)
+            boolean s = isSwaLayer(ctx, bid);
             swa.add(s);
             if (bid < nLayer) {
                 indexerFull.add(!s);

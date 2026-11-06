@@ -6,8 +6,9 @@ import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
 
 /**
- * The deepseek2 graph's YaRN-corrected attention scale, shared by its MLA layers and deepseek2-ocr's plain
- * multi-head attention (models/deepseek2.cpp:427-437, 484-486).
+ * The deepseek2 graph's YaRN-corrected attention scale, shared by its MLA layers, deepseek2-ocr's plain
+ * multi-head attention and LongCat-Flash's DeepSeek-V2 MLA (models/deepseek2.cpp:427-437, 484-486;
+ * deepseek_v2.py:1130-1136).
  */
 final class DeepseekScale {
 
@@ -29,10 +30,14 @@ final class DeepseekScale {
                     + headK);
         }
         RopeScalingType scaling = hp.ropeScalingType();
-        float freqScale = scaling == RopeScalingType.NONE ? 1.0f : hp.ropeFreqScale();
+        float freqScale = scaling == RopeScalingType.NONE || scaling == RopeScalingType.DYNAMIC
+                ? 1.0f : hp.ropeFreqScale();
         float extFactor = hp.yarnExtFactor() >= 0f ? hp.yarnExtFactor() : RopeMath.defaultExtFactor(scaling);
         float attnFactor = RopeMath.yarnAttnFactor(hp.yarnAttnFactor(), extFactor, freqScale, hp.yarnLogMul(),
-                hp.arch() == Arch.DEEPSEEK2, hp.ropeAttnFactor());
+                hp.arch() == Arch.DEEPSEEK2 || hp.arch() == Arch.AXK1 || hp.arch() == Arch.EAGLE
+                        || hp.arch() == Arch.EAGLE3 || hp.arch() == Arch.EAGLE_MISTRAL_LARGE3
+                        || hp.arch() == Arch.LONGCAT_FLASH || hp.arch() == Arch.LONGCAT_FLASH_NGRAM,
+                hp.ropeAttnFactor());
         float mscale = RopeMath.deepseekKqMscale(attnFactor, freqScale, hp.yarnLogMul());
         return mscale * mscale / (float) Math.sqrt(headK);
     }

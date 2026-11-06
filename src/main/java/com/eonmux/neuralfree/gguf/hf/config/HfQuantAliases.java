@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hf.config;
 
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 
 import java.util.Collections;
@@ -15,6 +16,9 @@ import java.util.Objects;
  * reasons. Names are compared after {@link #normalize}.
  */
 public final class HfQuantAliases {
+
+    /** vLLM's bare online method, whose quantization_config selects the layers and their methods. */
+    public static final String ONLINE = "online";
 
     private static final Map<String, HfQuantMethod> METHODS;
     private static final Map<String, String> REJECTED;
@@ -57,13 +61,13 @@ public final class HfQuantAliases {
         m.put("hqq", HfQuantMethod.HQQ);
         m.put("fp_quant", HfQuantMethod.FP_QUANT);
         m.put("w4afp8", HfQuantMethod.W4AFP8);
-        for (String online : new String[]{"experts_int8", "quark_int4fp8_moe", "mxfp_w4a8", "ptpc_fp8", "online",
+        m.put("torchao", HfQuantMethod.TORCHAO);
+        for (String online : new String[]{"experts_int8", "quark_int4fp8_moe", "mxfp_w4a8", "ptpc_fp8", ONLINE,
                 "fp8_per_tensor", "fp8_per_block", "fp8_per_channel", "int8_per_channel_weight_only",
                 "nvfp4_per_token", "nvfp4_online"}) {
             m.put(online, HfQuantMethod.ONLINE);
         }
         Map<String, String> r = new LinkedHashMap<>();
-        r.put("torchao", "torchao tensor subclasses are not supported");
         r.put("modelslim", "Ascend ModelSlim checkpoints are not supported");
         for (String removed : new String[]{"aqlm", "eetq", "vptq", "spqr", "higgs", "quanto"}) {
             r.put(removed, "the method is deprecated or removed in vLLM and is not supported");
@@ -134,6 +138,36 @@ public final class HfQuantAliases {
     /** Whether {@code raw} names a method that quantizes float weights at load. */
     public static boolean isOnline(String raw) {
         return METHODS.get(normalize(raw)) == HfQuantMethod.ONLINE;
+    }
+
+    /**
+     * The online-quantization target the normalized method name quantizes at load with: the online shorthands of
+     * vLLM's {@code --quantization} ({@code fp8_per_tensor}, {@code fp8_per_block}, {@code fp8_per_channel},
+     * {@code ptpc_fp8}, {@code int8_per_channel_weight_only}, {@code nvfp4_per_token}, {@code nvfp4_online} and
+     * {@code experts_int8}). Null for the names with no single target: bare {@code online} quantizes as its
+     * quantization_config selects ({@link HfQuantConfig#onlineConfig()}), and {@code quark_int4fp8_moe} and
+     * {@code mxfp_w4a8} have no online int4 target. {@code mxfp4} and {@code mxfp8} name checkpoint methods.
+     */
+    public static ModelSourceOptions.OnlineQuant onlineTarget(String normalized) {
+        Objects.requireNonNull(normalized, "normalized");
+        switch (normalized) {
+            case "fp8_per_tensor":
+                return ModelSourceOptions.OnlineQuant.FP8_PER_TENSOR;
+            case "fp8_per_block":
+                return ModelSourceOptions.OnlineQuant.FP8_PER_BLOCK;
+            case "fp8_per_channel":
+            case "ptpc_fp8":
+                return ModelSourceOptions.OnlineQuant.FP8_PER_CHANNEL;
+            case "int8_per_channel_weight_only":
+                return ModelSourceOptions.OnlineQuant.INT8_PER_CHANNEL_WEIGHT_ONLY;
+            case "nvfp4_per_token":
+            case "nvfp4_online":
+                return ModelSourceOptions.OnlineQuant.NVFP4_PER_TOKEN;
+            case "experts_int8":
+                return ModelSourceOptions.OnlineQuant.EXPERTS_INT8;
+            default:
+                return null;
+        }
     }
 
     /** Every recognized normalized name with its method, in table order. */

@@ -13,6 +13,7 @@ import java.util.function.Function;
  *   <li>DeepSeek V3.1: {@code <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>NAME<｜tool▁sep｜>ARGS<｜tool▁call▁end｜>...<｜tool▁calls▁end｜>};</li>
  *   <li>Kimi K2: {@code <|tool_calls_section_begin|><|tool_call_begin|>functions.NAME:IDX<|tool_call_argument_begin|>ARGS<|tool_call_end|>...<|tool_calls_section_end|>},
  *       the {@code functions.NAME:IDX} text being the call id.</li>
+ *   <li>PLaMo 3: {@code <|plamo:begin_tool_requests:plamo|><|plamo:begin_tool_request:plamo|><|plamo:begin_tool_name:plamo|>NAME<|plamo:end_tool_name:plamo|><|plamo:begin_tool_arguments:plamo|><|plamo:constrain|>json<|plamo:msg|>ARGS<|plamo:end_tool_arguments:plamo|><|plamo:end_tool_request:plamo|>...<|plamo:end_tool_requests:plamo|>}.</li>
  * </ul>
  *
  * A call may also appear without its section (llama.cpp's DeepSeek parser accepts both).
@@ -34,7 +35,9 @@ final class NameArgsToolParser extends BlockToolParser {
     private final String sectionClose;
     private final String callOpen;
     private final String typePrefix;
+    private final String nameOpen;
     private final String nameEnd;
+    private final String argsOpen;
     private final String callClose;
     private final Function<String, Named> naming;
 
@@ -43,18 +46,22 @@ final class NameArgsToolParser extends BlockToolParser {
      * @param sectionClose the section closer, or null
      * @param callOpen     the call opener
      * @param typePrefix   text skipped after the call opener when present (DeepSeek V3's {@code function<｜tool▁sep｜>}), or null
+     * @param nameOpen     the name's opener, skipped after the call opener (PLaMo 3's {@code <|plamo:begin_tool_name:plamo|>}), or null
      * @param nameEnd      the text ending the name
+     * @param argsOpen     the arguments' opener, skipped after the name (PLaMo 3's arguments marker chain), or null
      * @param callClose    the call closer
      * @param naming       the name and id of the written name text
      */
-    NameArgsToolParser(String sectionOpen, String sectionClose, String callOpen, String typePrefix, String nameEnd,
-                       String callClose, Function<String, Named> naming) {
+    NameArgsToolParser(String sectionOpen, String sectionClose, String callOpen, String typePrefix, String nameOpen,
+                       String nameEnd, String argsOpen, String callClose, Function<String, Named> naming) {
         super(sectionOpen == null ? Arrays.asList(callOpen) : Arrays.asList(sectionOpen, callOpen));
         this.sectionOpen = sectionOpen;
         this.sectionClose = sectionClose;
         this.callOpen = callOpen;
         this.typePrefix = typePrefix;
+        this.nameOpen = nameOpen;
         this.nameEnd = nameEnd;
+        this.argsOpen = argsOpen;
         this.callClose = callClose;
         this.naming = naming;
     }
@@ -78,7 +85,7 @@ final class NameArgsToolParser extends BlockToolParser {
     }
 
     @Override
-    Block readBlock(String text, int at, String opener, boolean partial) {
+    protected Block readBlock(String text, int at, String opener, boolean partial) {
         List<ToolCall> calls = new ArrayList<>();
         if (opener.equals(callOpen)) {
             Call c = readCall(text, at, partial);
@@ -141,6 +148,15 @@ final class NameArgsToolParser extends BlockToolParser {
                 return new Call(null, -1, false);
             }
         }
+        if (nameOpen != null) {
+            if (text.startsWith(nameOpen, i)) {
+                i = JsonScan.skipWs(text, i + nameOpen.length());
+            } else if (prefixOf(text, i, nameOpen) && partial) {
+                return new Call(null, -1, false);
+            } else {
+                return new Call(null, -1, true);
+            }
+        }
         int ne = text.indexOf(nameEnd, i);
         if (ne < 0) {
             int stray = text.indexOf(callClose, i);
@@ -155,6 +171,15 @@ final class NameArgsToolParser extends BlockToolParser {
         }
         Named named = naming.apply(written);
         int a = JsonScan.skipWs(text, ne + nameEnd.length());
+        if (argsOpen != null) {
+            if (text.startsWith(argsOpen, a)) {
+                a = JsonScan.skipWs(text, a + argsOpen.length());
+            } else if (partial && prefixOf(text, a, argsOpen)) {
+                return new Call(new ToolCall(named.name, "", named.id, false), -1, false);
+            } else {
+                return new Call(null, -1, true);
+            }
+        }
         boolean fence = false;
         if (text.startsWith("```", a)) {
             fence = true;

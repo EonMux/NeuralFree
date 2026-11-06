@@ -1,0 +1,18 @@
+# Step5 sparse region attention shaders (kernels/llm/sparse/step5.cl): the dtype roundings, the region-summary
+# ring and update, the weighted-ReLU region scorer, the region selection, and sparse/windowed gather attention over a
+# K/V cache of any type (the KV define selects the element type).
+LLM_Step5_Cast	step5_cast.comp
+LLM_Step5_Summary	step5_summary.comp
+LLM_Step5_RegionScores	step5_region_scores.comp
+LLM_Step5_SelectRegions	step5_select_regions.comp
+LLM_Step5_Attn_F32	step5_attn.comp	KV=NF_KV_F32
+LLM_Step5_Attn_F16	step5_attn.comp	KV=NF_KV_F16
+LLM_Step5_Attn_Q8_0	step5_attn.comp	KV=NF_KV_Q8_0
+LLM_Step5_Attn_BF16	step5_attn.comp	KV=NF_KV_BF16
+LLM_Step5_Attn_Q4_0	step5_attn.comp	KV=NF_KV_Q4_0
+LLM_Step5_Attn_Q4_1	step5_attn.comp	KV=NF_KV_Q4_1
+LLM_Step5_Attn_IQ4_NL	step5_attn.comp	KV=NF_KV_IQ4_NL
+LLM_Step5_Attn_Q5_0	step5_attn.comp	KV=NF_KV_Q5_0
+LLM_Step5_Attn_Q5_1	step5_attn.comp	KV=NF_KV_Q5_1
+LLM_Step5_Attn_FP8_E4M3	step5_attn.comp	KV=NF_KV_FP8_E4M3
+LLM_Step5_Attn_FP8_E5M2	step5_attn.comp	KV=NF_KV_FP8_E5M2

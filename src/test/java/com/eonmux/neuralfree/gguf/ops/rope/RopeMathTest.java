@@ -6,6 +6,8 @@ import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -96,6 +98,7 @@ public class RopeMathTest {
         assertEquals(4, RopeMath.positionsPerToken(RopeType.IMROPE));
         assertEquals(4, RopeMath.positionsPerToken(RopeType.VISION));
         assertEquals(1, RopeMath.positionsPerToken(RopeType.NEOX));
+        assertEquals(1, RopeMath.positionsPerToken(RopeType.NONE));
     }
 
     /** qwen3vl IMROPE sections [24, 20, 20, 0]; ops.cpp:6338-6347. */
@@ -157,5 +160,148 @@ public class RopeMathTest {
         } catch (IllegalArgumentException expected) {
             // expected
         }
+    }
+
+    // ------------------------------------------------------------------ dynamic NTK scaling
+
+    /** vLLM dynamic_ntk_scaling_rope.py: base * ((factor * max_pos / max_trained) - (factor - 1))^(d / (d - 2)). */
+    @Test
+    public void dynamicNtkFactorBaseMatchesVllm() {
+        float base = 10000f;
+        float factor = 4f;
+        int extended = 16384;
+        int trained = 8192;
+        int dims = 128;
+        double ratio = (double) factor * extended / trained - (factor - 1.0);
+        float expected = (float) (base * Math.pow(ratio, dims / (double) (dims - 2)));
+        assertEquals(expected, RopeMath.dynamicNtkBase(base, factor, extended, trained, dims), expected * 1e-6f);
+
+        // the extended length is four times the trained length in the reference formula above
+        assertEquals(5.0, ratio, 0.0);
+        // at the trained length the factor cancels, so the base is the trained one
+        assertEquals(base, RopeMath.dynamicNtkBase(base, factor, trained, trained, dims), 1e-3f);
+        // a factor of 1 scales by the extension ratio alone
+        float byRatio = (float) (base * Math.pow(4.0, dims / (double) (dims - 2)));
+        assertEquals(byRatio, RopeMath.dynamicNtkBase(base, 1f, 4 * trained, trained, dims), byRatio * 1e-6f);
+    }
+
+    /** vLLM dynamic_ntk_alpha_rope.py: base * alpha^(d / (d - 2)). */
+    @Test
+    public void dynamicAlphaBaseMatchesVllm() {
+        float base = 10000f;
+        float alpha = 1000f;
+        int dims = 128;
+        float expected = (float) (base * Math.pow(alpha, dims / (double) (dims - 2)));
+        assertEquals(expected, RopeMath.dynamicAlphaBase(base, alpha, dims), expected * 1e-6f);
+        // a head dim of 64 grows by a smaller power of the same alpha
+        float d64 = (float) (base * Math.pow(alpha, 64.0 / 62.0));
+        assertEquals(d64, RopeMath.dynamicAlphaBase(base, alpha, 64), d64 * 1e-6f);
+    }
+
+    @Test
+    public void dynamicNtkRejectsUnusableParameters() {
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.dynamicNtkBase(10000f, 0f, 8192, 4096, 128));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.dynamicNtkBase(10000f, 4f, 0, 4096, 128));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.dynamicNtkBase(10000f, 4f, 8192, 0, 128));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.dynamicNtkBase(10000f, 4f, 8192, 4096, 2));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.dynamicAlphaBase(10000f, 0f, 128));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.dynamicAlphaBase(10000f, 1000f, 2));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.dynamicAlphaBase(0f, 1000f, 128));
+    }
+
+    // ------------------------------------------------------------------ fixed / mixed NTK scaling
+
+    /**
+     * vLLM ntk_scaling_rope.py fixed form: {@code base *= factor}, then every frequency is divided by
+     * {@code factor^(2/rotary_dim)}. Relative to the trained {@code theta_scale^i}, the divisor of pair {@code i} is
+     * {@code factor^(2(i+1)/rotary_dim)}.
+     */
+    @Test
+    public void fixedNtkFactorsMatchVllm() {
+        float factor = 8f;
+        int dims = 64;
+        float[] f = RopeMath.ntkFactors(factor, Float.NaN, dims);
+        assertEquals(dims / 2, f.length);
+        for (int i = 0; i < f.length; i++) {
+            float expected = (float) Math.pow(factor, 2.0 * (i + 1) / dims);
+            assertEquals("pair " + i, expected, f[i], expected * 1e-6f);
+        }
+        // the reference chain: inv_freq from the scaled base, then divided by factor^(2/d)
+        float base = 10000f;
+        float theta = RopeMath.thetaScale(base, dims);
+        float scaled = RopeMath.thetaScale(base * factor, dims);
+        for (int i = 0; i < f.length; i++) {
+            double reference = Math.pow(scaled, i) / Math.pow(factor, 2.0 / dims);
+            assertEquals("pair " + i, reference, Math.pow(theta, i) / f[i], reference * 1e-6);
+        }
+    }
+
+    /** vLLM ntk_scaling_rope.py mixed form: {@code a = ln(factor)/(d/2)^b}, divisor {@code exp(a * (i+1)^b)}. */
+    @Test
+    public void mixedNtkFactorsMatchVllm() {
+        float factor = 4f;
+        float mixedB = 0.25f;
+        int dims = 128;
+        float[] f = RopeMath.ntkFactors(factor, mixedB, dims);
+        assertEquals(dims / 2, f.length);
+        double a = Math.log(factor) / Math.pow(dims / 2.0, mixedB);
+        for (int i = 0; i < f.length; i++) {
+            double expected = Math.exp(a * Math.pow(i + 1, mixedB));
+            assertEquals("pair " + i, expected, f[i], expected * 1e-6);
+        }
+        // mixed_b 1 divides pair i+1 by factor^((i+1)/(d/2))
+        float[] linear = RopeMath.ntkFactors(factor, 1f, dims);
+        for (int i = 0; i < linear.length; i++) {
+            double expected = Math.pow(factor, (i + 1) / (dims / 2.0));
+            assertEquals("pair " + i, expected, linear[i], expected * 1e-6);
+        }
+    }
+
+    @Test
+    public void ntkFactorsRejectUnusableParameters() {
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.ntkFactors(0f, Float.NaN, 128));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.ntkFactors(Float.POSITIVE_INFINITY, Float.NaN,
+                128));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.ntkFactors(2f, Float.NaN, 2));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.ntkFactors(2f, Float.NaN, 7));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.ntkFactors(2f, Float.POSITIVE_INFINITY, 8));
+    }
+
+    // ------------------------------------------------------------------ Fourier position embedding
+
+    /** vLLM fope.py {@code _compute_inv_freq}: the first {@code num_inv_freq} frequencies of the full list. */
+    @Test
+    public void fopeInvFreqKeepsTheLeadingFrequencies() {
+        float base = 10000f;
+        int rotary = 128;
+        float[] f = RopeMath.fopeInvFreq(base, rotary, 8, 4096);
+        assertEquals(8, f.length);
+        for (int i = 0; i < 8; i++) {
+            assertEquals((float) Math.pow(base, -2.0 * i / rotary), f[i], 1e-9f);
+        }
+    }
+
+    /** Without {@code num_inv_freq} the frequencies above {@code 2 pi / max_position} are kept. */
+    @Test
+    public void fopeInvFreqSelectsByPeriod() {
+        float base = 10000f;
+        int rotary = 128;
+        int context = 4096;
+        float[] f = RopeMath.fopeInvFreq(base, rotary, 0, context);
+        float threshold = (float) (2.0 * Math.PI / context);
+        int expected = 0;
+        for (int i = 0; i < rotary / 2; i++) {
+            if (Math.pow(base, -2.0 * i / rotary) > threshold) {
+                expected++;
+            }
+        }
+        assertEquals(expected, f.length);
+        for (int i = 0; i < f.length; i++) {
+            assertTrue("frequency " + i + " is above the threshold", f[i] > threshold);
+        }
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.fopeInvFreq(base, rotary, rotary, context));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.fopeInvFreq(base, 7, 1, context));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.fopeInvFreq(0f, rotary, 1, context));
+        assertThrows(IllegalArgumentException.class, () -> RopeMath.fopeInvFreq(base, rotary, 1, 0));
     }
 }

@@ -8,10 +8,10 @@ import java.util.Map;
 /**
  * One Responses item as chat messages (llama.cpp's {@code server_chat_convert_responses_to_chatcmpl} item cases):
  * an input message ({@code user}, {@code system}, {@code developer}; string or {@code input_text} /
- * {@code input_image} parts), an output message ({@code assistant}; {@code output_text} or {@code refusal} parts), a
- * {@code function_call}, a {@code function_call_output} and a {@code reasoning} item. Assistant-side items extend the
- * previous message when it is the assistant's, so one turn's reasoning, text and calls render as one message.
- * Stateless.
+ * {@code input_image} / {@code input_audio} parts), an output message ({@code assistant}; {@code output_text} or
+ * {@code refusal} parts), a {@code function_call}, a {@code function_call_output} and a {@code reasoning} item.
+ * Assistant-side items extend the previous message when it is the assistant's, so one turn's reasoning, text and
+ * calls render as one message. Stateless.
  */
 final class ResponsesItems {
 
@@ -75,7 +75,9 @@ final class ResponsesItems {
 
     /**
      * Chat content parts of a Responses {@code content}: a string is one text part; {@code input_text} and
-     * {@code output_text} are text, {@code input_image} an image URL, and an assistant's {@code refusal} its text.
+     * {@code output_text} are text, {@code input_image} an image URL, {@code input_audio} the chat audio part, and an
+     * assistant's {@code refusal} its text. A media part's {@code uuid} (vLLM's media cache key) carries over, and
+     * with it the media value may be absent.
      */
     private static List<Object> parts(Object content, String where, boolean assistant) {
         List<Object> out = new ArrayList<>();
@@ -111,19 +113,47 @@ final class ResponsesItems {
             return textPart(refusal);
         }
         if (!assistant && "input_image".equals(type)) {
-            if (!(part.get("image_url") instanceof String url)) {
-                throw ServerJson.badRequest(at + " requires 'image_url'");
+            if (part.get("file_id") != null && part.get("image_url") == null) {
+                throw ServerJson.badRequest(at + ".file_id is refused: this server has no Files API; pass the image"
+                        + " as image_url (an http(s) or data URL)");
             }
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("type", "image_url");
-            out.put("image_url", Map.of("url", url));
-            return out;
+            if (part.get("image_url") instanceof String url) {
+                out.put("image_url", Map.of("url", url));
+            } else if (part.get("image_url") != null || part.get("uuid") == null) {
+                throw ServerJson.badRequest(at + " requires 'image_url'");
+            }
+            return withUuid(out, part);
         }
-        if ("input_file".equals(type) || "input_audio".equals(type)) {
-            throw ServerJson.badRequest(at + ": '" + type + "' is not supported");
+        if (!assistant && "input_audio".equals(type)) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("type", "input_audio");
+            if (part.get("input_audio") instanceof Map<?, ?> audio && audio.get("data") instanceof String data) {
+                Map<String, Object> inner = new LinkedHashMap<>();
+                inner.put("data", data);
+                if (audio.get("format") instanceof String format) {
+                    inner.put("format", format);
+                }
+                out.put("input_audio", inner);
+            } else if (part.get("input_audio") != null || part.get("uuid") == null) {
+                throw ServerJson.badRequest(at + " requires 'input_audio' with base64 'data'");
+            }
+            return withUuid(out, part);
+        }
+        if ("input_file".equals(type)) {
+            throw ServerJson.badRequest(at + ": 'input_file' is not supported: this server has no Files API");
         }
         throw ServerJson.badRequest(at + ".type must be one of "
-                + (assistant ? "output_text or refusal" : "input_text or input_image"));
+                + (assistant ? "output_text or refusal" : "input_text, input_image or input_audio"));
+    }
+
+    /** {@code out} with the {@code uuid} of the source {@code part}, when it has one (checked where it is used). */
+    private static Map<String, Object> withUuid(Map<String, Object> out, Map<?, ?> part) {
+        if (part.get("uuid") != null) {
+            out.put("uuid", part.get("uuid"));
+        }
+        return out;
     }
 
     private static Map<String, Object> textPart(String text) {

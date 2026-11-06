@@ -31,6 +31,8 @@ public final class CudaCapabilitiesBuilder {
     private static final int MIN_CC_FLOAT16 = 53;
     /** {@code dp4a} packed integer dot products need compute capability 6.1. */
     private static final int MIN_CC_DP4A = 61;
+    /** Tensor-core {@code mma.sync} matrix instructions need compute capability 8.0. */
+    private static final int MIN_CC_MMA = 80;
 
     private static final Set<String> ACTIVATION_FUNCTIONS = new HashSet<>(Arrays.asList(
             "SIGMOID", "RELU", "TANH", "LEAKY_RELU", "ELU", "SOFTPLUS", "SOFTSIGN",
@@ -115,6 +117,10 @@ public final class CudaCapabilitiesBuilder {
         }
         if (cc >= MIN_CC_DP4A) {
             features.add(DeviceFeature.INTEGER_DOT_PRODUCT);
+        }
+        if (cc >= MIN_CC_MMA) {
+            features.add(DeviceFeature.COOPERATIVE_MATRIX);
+            features.add(DeviceFeature.BF16_COOPERATIVE_MATRIX);
         }
         return features;
     }

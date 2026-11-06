@@ -17,9 +17,11 @@ public final class OclGpuEvent implements GpuEvent {
     private boolean closed = false;
     private final OclReadCompletion readCompletion;
     private final boolean profiled;
+    /** The backend whose queue issued the event, or null for a standalone queue; notified on close. */
+    private final OclComputeBackend owner;
 
     public OclGpuEvent(cl_event event) {
-        this(event, null, false);
+        this(event, null, false, null);
     }
 
     /**
@@ -28,12 +30,27 @@ public final class OclGpuEvent implements GpuEvent {
      * @param profiled       true when the issuing queue was created with {@code CL_QUEUE_PROFILING_ENABLE}
      */
     OclGpuEvent(cl_event event, OclReadCompletion readCompletion, boolean profiled) {
+        this(event, readCompletion, profiled, null);
+    }
+
+    /**
+     * @param event          the OpenCL event; owned by this object
+     * @param readCompletion completion of a read's host copy, or null for other commands
+     * @param profiled       true when the issuing queue was created with {@code CL_QUEUE_PROFILING_ENABLE}
+     * @param owner          the backend whose queue issued the event, or null for a standalone queue;
+     *                       it stops counting the event when this object closes it
+     */
+    OclGpuEvent(cl_event event, OclReadCompletion readCompletion, boolean profiled, OclComputeBackend owner) {
         if (event == null) {
             throw new IllegalArgumentException("cl_event cannot be null");
         }
         this.event = event;
         this.readCompletion = readCompletion;
         this.profiled = profiled;
+        this.owner = owner;
+        if (owner != null) {
+            owner.onEventCreated(this);
+        }
     }
 
     /**
@@ -118,9 +135,12 @@ public final class OclGpuEvent implements GpuEvent {
     @Override
     public void close() {
         if (!closed) {
-            clReleaseEvent(event);
+            OclErrors.check("clReleaseEvent", null, () -> clReleaseEvent(event));
             event = null;
             closed = true;
+            if (owner != null) {
+                owner.onEventClosed(this);
+            }
         }
     }
 

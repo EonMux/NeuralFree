@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -114,10 +115,13 @@ public final class GGUFFileParser implements ModelSource {
     private final long alignment;
     private final long dataOffset;
 
-    private final Map<String, Object> metadata = new HashMap<>();
+    /** Metadata of the opened file in file order: an export reproduces the key/value section in that order. */
+    private final Map<String, Object> metadata = new LinkedHashMap<>();
     private final Map<String, Object> metadataView = Collections.unmodifiableMap(metadata);
     private final Map<String, GGUFValueType> valueTypes = new HashMap<>();
     private final Map<String, GGUFValueType> arrayElementTypes = new HashMap<>();
+    /** File offset of the key-length field of every key/value pair of the opened file. */
+    private final Map<String, Long> keyOffsets = new HashMap<>();
     private final List<GGUFTensorInfo> tensors = new ArrayList<>();
     private final List<GGUFTensorInfo> tensorsView = Collections.unmodifiableList(tensors);
     private final Map<String, Integer> tensorNameToIndex = new HashMap<>();
@@ -147,7 +151,9 @@ public final class GGUFFileParser implements ModelSource {
             this.kvCount = header.kvCount;
 
             for (long i = 0; i < kvCount; i++) {
-                reader.readKVPair(i, metadata, valueTypes, arrayElementTypes);
+                long offset = reader.position();
+                String key = reader.readKVPair(i, metadata, valueTypes, arrayElementTypes);
+                keyOffsets.put(key, offset);
             }
 
             this.alignment = parseAlignment(path, metadata.get(KEY_ALIGNMENT), valueTypes.get(KEY_ALIGNMENT));
@@ -159,6 +165,7 @@ public final class GGUFFileParser implements ModelSource {
             }
 
             this.dataOffset = alignUp(reader.position(), alignment);
+            resolveAvalonTypeIds(path, tensors, alignment, dataOffset, raf.length());
             validateDataSection(path, tensors, alignment, dataOffset, raf.length());
 
             for (int i = 0; i < tensors.size(); i++) {
@@ -280,6 +287,7 @@ public final class GGUFFileParser implements ModelSource {
                 result.add(info);
             }
             long shardDataOffset = alignUp(reader.position(), align);
+            resolveAvalonTypeIds(shardPath, result, align, shardDataOffset, shardFile.length());
             validateDataSection(shardPath, result, align, shardDataOffset, shardFile.length());
             return new ShardHeader(result, shardDataOffset);
         }
@@ -373,7 +381,7 @@ public final class GGUFFileParser implements ModelSource {
     @Override
     public ModelFormat format() { return ModelFormat.GGUF; }
 
-    /** The metadata of the opened file (unmodifiable). */
+    /** The metadata of the opened file in file order (unmodifiable). */
     @Override
     public Map<String, Object> getMetadata() { return metadataView; }
 
@@ -441,6 +449,15 @@ public final class GGUFFileParser implements ModelSource {
     @Override
     public GGUFValueType getValueType(String key) {
         return valueTypes.get(key);
+    }
+
+    /**
+     * File offset of the key-length field of the key/value pair {@code key} in the file this parser was opened
+     * with, or null when the file has no such key. The metadata of a split model lives in its first file, which is
+     * the file the parser is opened with.
+     */
+    public Long getKeyOffset(String key) {
+        return key == null ? null : keyOffsets.get(key);
     }
 
     /** Element type of an array metadata value, or null when the key is absent or not an array. */
@@ -737,6 +754,56 @@ public final class GGUFFileParser implements ModelSource {
             }
             expected = alignUp(expected + bytes, alignment);
         }
+    }
+
+    /**
+     * Re-reads the ggml type ids that two type families share, from the layout of the data section. Avalon
+     * (ggml/include/ggml.h:433-434) places IQ3_K at id 43 and IQ3_KS at id 44; mainline llama.cpp assigns
+     * id 43 to its F8_E4M3 (the per-element format NF reads as {@link GGMLType#F8_E4M3FN}, which NF's own
+     * files carry) and assigns nothing to id 44. {@link GGMLType#fromId} resolves id 43 to F8_E4M3FN, so a
+     * tensor whose slot in the data section holds the Avalon block format (110 bytes per 256 elements)
+     * instead of 1 byte per element is re-read as IQ3_K. A tensor of id 44 whose slot holds 1 byte per
+     * element but not the IQ3_KS block format is rejected naming the collision: neither reading decodes it.
+     * Must run before {@link #validateDataSection}, whose offset checks use the resolved sizes.
+     */
+    private static void resolveAvalonTypeIds(String path, List<GGUFTensorInfo> infos, long alignment,
+                                             long dataOffset, long fileLength) throws IOException {
+        String prefix = "Invalid GGUF file '" + path + "': ";
+        for (int i = 0; i < infos.size(); i++) {
+            GGUFTensorInfo t = infos.get(i);
+            if (t.type() != GGMLType.F8_E4M3FN && t.type() != GGMLType.IQ3_KS) {
+                continue;
+            }
+            long room = slotBytes(infos, i, dataOffset, fileLength);
+            if (room < 0) {
+                continue; // the tensor starts at or past the file end: the data-section validation reports it
+            }
+            long elements = t.numElements();
+            boolean perElement = elements <= room && room < elements + alignment;
+            GGMLType avalon = t.type() == GGMLType.F8_E4M3FN ? GGMLType.IQ3_K : t.type();
+            long blockBytes = avalon.getBytesForElements(elements);
+            boolean blockFormat = blockBytes <= room && room < blockBytes + alignment;
+            if (t.type() == GGMLType.F8_E4M3FN) {
+                if (!perElement && blockFormat && t.dim(0) % GGMLType.IQ3_K.getBlockSize() == 0) {
+                    GGUFTensorInfo iq3k = new GGUFTensorInfo(t.name(), t.dims(), GGMLType.IQ3_K, t.offset());
+                    GGUFTensorInfo.validate(invalidFilePrefix(path), iq3k);
+                    infos.set(i, iq3k);
+                }
+            } else if (!blockFormat && perElement) {
+                throw new IOException(prefix + "tensor '" + t.name() + "' declares ggml type id 44 (IQ3_KS) but"
+                        + " its data is laid out at 1 byte per element, the layout of mainline llama.cpp's type"
+                        + " id 43 (F8_E4M3). Mainline ggml assigns no type to id 44, and NF reads id 44 as the"
+                        + " Avalon IQ3_KS block format of 104 bytes per 256 elements, which does not fit this"
+                        + " data; convert the file with the writer of the library that produced it");
+            }
+        }
+    }
+
+    /** Bytes of the data section from the start of tensor {@code index} to the next tensor or the file end. */
+    private static long slotBytes(List<GGUFTensorInfo> infos, int index, long dataOffset, long fileLength) {
+        long start = dataOffset + infos.get(index).offset();
+        long end = index + 1 < infos.size() ? dataOffset + infos.get(index + 1).offset() : fileLength;
+        return end - start;
     }
 
     /** The prefix of every container error of the file at {@code path}. */

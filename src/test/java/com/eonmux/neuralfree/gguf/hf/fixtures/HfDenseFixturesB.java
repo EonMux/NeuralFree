@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-D2 part B converter classes: {@code ApertusModel}, {@code ArceeModel}, {@code
+ * Synthetic checkpoints of the converter classes: {@code ApertusModel}, {@code ArceeModel}, {@code
  * OlmoModel}, {@code Olmo2Model}, {@code Phi3MiniModel} and {@code Qwen3MoeModel}. Two layers, a hidden size of 8, two
  * query heads, one key/value head, an FFN of {@code 2 * dim} and the exact tensor names and configuration keys of the
  * converter sources.

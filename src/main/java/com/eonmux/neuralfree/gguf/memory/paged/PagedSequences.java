@@ -16,15 +16,16 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * The bookkeeping half of the paged {@link SequenceMemory} (PARITY MS-2): page pools per KV group
+ * The bookkeeping half of the paged {@link SequenceMemory}: page pools per KV group
  * ({@link PagePool}), per-sequence page lists ({@link PageList}) and the copy-on-write discipline for every row some
- * other holder can still read (invariant 7: a page with {@code refCount > 1} is never written in place; every
+ * other holder can still read: a page with {@code refCount > 1} is never written in place; every
  * mutation first replaces it in the mutating sequence's list by a private {@link PageCopy} - a write in prepare, the
- * removal of part of a page, an {@code add} re-rotation, the SWA trim of a page and the copy over a shared partial
- * page; the recurrent-slot and checkpoint restores of later work packages go through the same helpers).
+ * removal of part of a page, an {@code add} re-rotation and the copy over a shared partial page; the SWA trim leaves
+ * a shared page's rows alone). Holders outside the sequences keep pages alive: the prefix cache's blocks
+ * ({@link #holdPages}) and the windows of context checkpoints ({@link #holdWindow}), which a later sequence adopts.
  *
  * <p><b>Ownership and threading.</b> Mutable, used by the engine thread that runs this memory's steps, one thread at
- * a time (as every {@code ForwardBackend}); not thread-safe. The device side (MS-3) uploads what prepare, the step
+ * a time (as every {@code ForwardBackend}); not thread-safe. The device side uploads what prepare, the step
  * tables and the row reports address.
  *
  * <p><b>Model.</b> A KV group's rows live in a pool of pages of {@link #pageSize()} rows. Logical slot {@code j} of a
@@ -37,7 +38,7 @@ import java.util.Objects;
  *
  * <p><b>Reservation.</b> {@link #prepare} is pure: it validates the whole step and picks every page it needs with
  * {@link PagePool#peek} without mutating a pool, and throws {@link MemoryFullException} before any state changed
- * (all-or-nothing reservation, T-4). {@link #commit} applies the reservation exactly once per prepare; if the pools
+ * (all-or-nothing reservation). {@link #commit} applies the reservation exactly once per prepare; if the pools
  * changed in between it fails loudly instead of reusing wrong pages.
  */
 public final class PagedSequences implements SequenceMemory {
@@ -55,10 +56,25 @@ public final class PagedSequences implements SequenceMemory {
     private final int[] posMinArr;
     private final int[] posMaxArr;
     private final SequenceState[] states;
-    private final boolean[] swaGroup;   // [group]: groups whose sequences trim (the widest reader window, M-2)
+    private final boolean[] swaGroup;   // [group]: groups whose sequences trim (the widest reader window)
     private final int[] windowWidth;    // [group]: W_g of a trimming group
     private final List<PageCopy> pendingCopies = new ArrayList<>();
+    private final List<RowMove> pendingRowMoves = new ArrayList<>();
     private final List<RowReport> pendingReports = new ArrayList<>();
+    /** The block-holder and copy operations over this memory's tables. */
+    private final PageSharing sharing;
+
+    // DEBUG temp: an op history for the invariant dump
+    static final java.util.ArrayDeque<String> debugHistory = new java.util.ArrayDeque<>();
+
+    private void debugNote(String op, int seq, int g) {
+        if (debugHistory.size() > 60) {
+            debugHistory.poll();
+        }
+        debugHistory.add("@" + Integer.toHexString(System.identityHashCode(this)) + " " + op + " seq" + seq
+                + " g" + g + " -> slots " + slots[g][seq] + " listLen " + lists[seq][g].size());
+    }
+    private int clears;
 
     /**
      * Builds the bookkeeping over a paged plan: one {@link PagePool} per KV group over its {@code pages} pages of
@@ -117,12 +133,14 @@ public final class PagedSequences implements SequenceMemory {
         for (int s = 0; s < parallel; s++) {
             posMinArr[s] = -1;
             posMaxArr[s] = -1;
-            states[s] = new SequenceState(cap);
+            // one record entry per stored row: media rows sharing a position can outnumber the positions
+            states[s] = new SequenceState(cap, maxPages * pageSize);
         }
+        this.sharing = new PageSharing(this);
     }
 
     /**
-     * The group's trim kind (M-2 readers): the widest window over every layer reading the group, with differing
+     * The group's trim kind: the widest window over every layer reading the group, with differing
      * window types or any window-less reader making it a full-attention group. Only windowed (same-type) groups trim.
      */
     private void describeGroupWindow(int g) {
@@ -159,9 +177,9 @@ public final class PagedSequences implements SequenceMemory {
         return pageSize;
     }
 
-    /** Pages of each group's pool. */
+    /** Pages of the largest group's pool; the page ids of every group stay below it. */
     public int pageCount() {
-        return plan.groups().isEmpty() ? 0 : plan.group(0).pages();
+        return plan.maxGroupPages();
     }
 
     /** Page table entries per sequence per group ({@code ceil(cap / pageSize)}). */
@@ -205,14 +223,29 @@ public final class PagedSequences implements SequenceMemory {
                 throw new IllegalStateException("page copy " + c + " is not pending on this memory");
             }
             pendingCopies.remove(i);
-            unref(true, c.group(), c.srcPage());
+            sharing.unref(true, c.group(), c.srcPage());
         }
+    }
+
+    /**
+     * The row moves a shifted sequence's compaction queued and the backend has not carried yet
+     * ({@link RowMove}): the keys and values of the moved cells follow them. The consumer runs the moves on its
+     * layers and empties the queue with {@link #clearRowMoves()}.
+     */
+    public List<RowMove> pendingRowMoves() {
+        return new ArrayList<>(pendingRowMoves);
+    }
+
+    /** Consumes the row moves that {@link #pendingRowMoves()} returned. */
+    public void clearRowMoves() {
+        pendingRowMoves.clear();
     }
 
     /**
      * Row {@code kv_pos} changes applied on the host besides a step's own writes: the rows a removal or a trim
      * cleared ({@link RowReport#values()} all -1, absolute), a shift moved ({@link RowReport#delta()} carries the
-     * RoPE shift, {@code LLM_KV_RopeShift_*}) or a shared partial copy mirrored ({@link RowReport#sets absolute}).
+     * RoPE shift, {@code LLM_KV_RopeShift_*}), a division re-positioned ({@link RowReport#rowDelta(int)} carries
+     * each row's own shift) or a shared partial copy mirrored ({@link RowReport#sets absolute}).
      * The device applies them between steps; the consumer consumes the list with {@link #clearReports()}.
      */
     public List<RowReport> pendingReports() {
@@ -225,10 +258,10 @@ public final class PagedSequences implements SequenceMemory {
     }
 
     /**
-     * Updates the token record of {@code seq} with the tokens whose rows a committed step wrote (the engine's
-     * partner of {@link #commit}; the reserved step carries addressing only).
+     * Extends the token record of {@code seq} with text rows a committed step wrote at the positions following the
+     * record's last one (the engine's partner of {@link #commit}; the reserved step carries addressing only).
      *
-     * @throws IllegalStateException     when the record would overflow the sequence's context cap
+     * @throws IllegalStateException     when the record would overflow the sequence's row capacity
      * @throws IndexOutOfBoundsException when {@code seq} is outside the sequences
      */
     public void appendTokens(int seq, int[] tokens) {
@@ -237,11 +270,30 @@ public final class PagedSequences implements SequenceMemory {
         states[seq].append(tokens, 0, tokens.length);
     }
 
+    /**
+     * Extends the token record of {@code seq} with {@code n} rows of a committed step, one entry per row stored at
+     * {@code positions[off + i]}: a token row ({@code tokens[off + i] >= 0}) records its id and an embedding row
+     * (negative) {@code embeddingToken}, the id its model gives it, as llama.cpp's cells keep {@code ext.tok}; media
+     * rows that share one M-RoPE position each keep their own entry.
+     *
+     * @param embeddingToken the id an embedding row records: {@code -1} for none, or its model's stand-in
+     * @throws IllegalArgumentException  when a range is outside its array or a position descends
+     * @throws IllegalStateException     when the record would overflow the sequence's row capacity
+     * @throws IndexOutOfBoundsException when {@code seq} is outside the sequences
+     */
+    public void appendRows(int seq, int[] tokens, int[] positions, int off, int n, int embeddingToken) {
+        checkSeq(seq);
+        Objects.requireNonNull(tokens, "tokens");
+        Objects.requireNonNull(positions, "positions");
+        states[seq].appendRows(tokens, positions, off, n, embeddingToken);
+    }
+
     // ------------------------------------------------------------------ prepare / commit
 
     /**
      * Plans the step over {@code layout} without touching any pool: page ids are picked with {@link PagePool#peek}
      * in the exact order {@link #commit} takes them, so the pooled pages are known before anything is reserved.
+     * Every row stores the position {@code segPos0(s) + t} of its segment.
      *
      * @throws IllegalArgumentException when the layout is null or names a sequence twice
      * @throws IllegalStateException    when a step of a sequence does not append in stored order, or the page
@@ -250,13 +302,36 @@ public final class PagedSequences implements SequenceMemory {
      *                                  cap hold
      */
     public PagedStep prepare(StepLayout layout) {
+        return prepare(layout, null);
+    }
+
+    /**
+     * {@link #prepare(StepLayout)} with explicit stored positions: {@code rowPos[i]} is the position the row's KV
+     * cells take in every group, in step-row order. Rows of a media segment share the segment's base position, so
+     * the values are non-decreasing per segment and a segment's first value appends strictly above the sequence's
+     * highest stored position (an empty sequence starts at 0). Text steps pass positions equal to
+     * {@code segPos0(s) + t} and behave like {@link #prepare(StepLayout)}.
+     *
+     * @param rowPos stored position of every row, or null for the layout's consecutive positions
+     * @throws IllegalArgumentException when the layout is null, {@code rowPos} holds another value than the layout
+     *                                  has rows, a value is negative or a segment's values descend
+     * @throws IllegalStateException    when a step of a sequence does not append above its stored positions
+     * @throws MemoryFullException      when the step needs more pages or positions than the pools or the sequence
+     *                                  cap hold
+     */
+    public PagedStep prepare(StepLayout layout, int[] rowPos) {
         Objects.requireNonNull(layout, "layout");
         int n = layout.nTokens();
         int nSeg = layout.nSeg();
+        if (rowPos != null && rowPos.length != n) {
+            throw new IllegalArgumentException("row positions hold " + rowPos.length + " values, the layout runs "
+                    + n + " rows");
+        }
         int[] segSeq = new int[nSeg];
         int[] segStart = new int[nSeg];
         int[] segLen = new int[nSeg];
         int[] segPos0 = new int[nSeg];
+        int[] segPosMax = new int[nSeg];
         for (int s = 0; s < nSeg; s++) {
             int seq = layout.seq(s);
             checkSeq(seq);
@@ -271,31 +346,44 @@ public final class PagedSequences implements SequenceMemory {
             segStart[s] = layout.tokStart(s);
             segLen[s] = len;
             segPos0[s] = p0;
+            int pMax = p0 + len - 1;
+            if (rowPos != null) {
+                pMax = PageChecks.checkRowPos(segStart[s], len, rowPos, seq, posMaxArr[seq]);
+            }
             if (posMaxArr[seq] < 0) {
                 if (p0 != 0) {
                     throw new IllegalStateException("sequence " + seq + " stores nothing, so its step starts at"
                             + " position 0, got " + p0);
                 }
-            } else if (p0 != posMaxArr[seq] + 1) {
-                throw new IllegalStateException("sequence " + seq + " stores positions from " + posMinArr[seq]
-                        + " to " + posMaxArr[seq] + ", so its step starts at " + (posMaxArr[seq] + 1)
-                        + ", got " + p0);
+            } else if (p0 < posMaxArr[seq]) {
+                // a media segment's rows can share the stored base position, so the step appends at or above it;
+                // below it would rewrite committed rows
+                throw new IllegalStateException("sequence " + seq + " stores positions up to " + posMaxArr[seq]
+                        + ", so its step starts at or above it, got " + p0);
             }
-            if ((long) p0 + len > cap) {
-                throw new MemoryFullException(p0 + len, cap, n, freeCells());
+            if (pMax + 1 > cap) {
+                throw new MemoryFullException(pMax + 1, cap, n, freeCells());
             }
+            if (states[seq].nPast() + len > states[seq].capacity()) {
+                // the token record keeps one entry per row; refuse before any page is reserved
+                throw new MemoryFullException(states[seq].nPast() + len, states[seq].capacity(), n, freeCells());
+            }
+            segPosMax[s] = pMax;
         }
         // all-or-nothing: the exact page count of every group, no pool touched yet
         for (int g = 0; g < groupsCount(); g++) {
-            if (needPages(g, segSeq, segLen) > pools[g].free()) {
+            if (sharing.needPages(g, segSeq, segLen) > pools[g].free()) {
                 throw new MemoryFullException(cap, cap, n, freeCells());
             }
         }
         // build the step; same page order per (group, segment) that commit takes
-        PagedStep.Builder b = PagedStep.builder(this, n).segments(segSeq, segStart, segLen, segPos0);
-        int[][] cells = new int[groupsCount()][n];
+        PagedStep.Builder b = PagedStep.builder(this, n).segments(segSeq, segStart, segLen, segPos0)
+                .segPosMax(segPosMax);
+        int[][] kvRows = new int[groupsCount()][n];
+        int[][] kvValues = new int[groupsCount()][n];
+        int[] kvFill = new int[groupsCount()];
         for (int g = 0; g < groupsCount(); g++) {
-            int[] peek = pools[g].peek(needPages(g, segSeq, segLen));
+            int[] peek = pools[g].peek(sharing.needPages(g, segSeq, segLen));
             int next = 0;
             for (int s = 0; s < nSeg; s++) {
                 int seq = segSeq[s];
@@ -305,8 +393,14 @@ public final class PagedSequences implements SequenceMemory {
                 PageList list = lists[seq][g];
                 int listLen = list.size();
                 if (listLen != (slot0 + pageSize - 1) / pageSize && !(listLen == 0 && slot0 == 0)) {
+                    StringBuilder hist = new StringBuilder();
+                    for (String op : debugHistory) {
+                        hist.append("\n  ").append(op);
+                    }
+                    // DEBUG temp
                     throw new IllegalStateException("page list of sequence " + seq + " group " + g + " covers "
-                            + listLen + " pages for " + slot0 + " slots");
+                            + listLen + " pages for " + slot0 + " slots (pageSize " + pageSize + ", posMax "
+                            + posMaxArr[seq] + ", nPast " + states[seq].nPast() + ")" + hist);
                 }
                 int[] table = new int[maxPages];
                 Arrays.fill(table, -1);
@@ -316,7 +410,7 @@ public final class PagedSequences implements SequenceMemory {
                     int page = list.page(k);
                     if (pools[g].refCount(page) > 1) {
                         int dst = peek[next++];
-                        b.copy(PageCopy.of(g, page, dst, pageSize));
+                        b.copy(PageCopy.of(g, page, dst, ownRows(g, seq, k)));
                         table[k] = dst;
                     }
                 }
@@ -339,46 +433,25 @@ public final class PagedSequences implements SequenceMemory {
                     int page = table[slot / pageSize];
                     int cell = page * pageSize + (slot & (pageSize - 1));
                     b.cell(g, segStart[s] + t, cell);
-                    cells[g][segStart[s] + t] = cell;
+                    kvRows[g][kvFill[g]] = cell;
+                    kvValues[g][kvFill[g]] = rowPos != null ? rowPos[segStart[s] + t] : segPos0[s] + t;
+                    kvFill[g]++;
                 }
-                int[] rows = new int[len];
-                int[] values = new int[len];
-                for (int t = 0; t < len; t++) {
-                    rows[t] = cells[g][segStart[s] + t];
-                    values[t] = segPos0[s] + t;
-                }
-                b.kvPos(g, rows, values);
             }
+            // one kv_pos write per group over all segments' rows, in ubatch row order; an explicit rowPos
+            // carries the stored positions (a media segment's rows share the chunk's base position)
+            b.kvPos(g, Arrays.copyOf(kvRows[g], kvFill[g]), Arrays.copyOf(kvValues[g], kvFill[g]));
         }
         return b.build();
     }
 
-    /** Existing shared pages of each write span plus new tail pages, in the commit allocation order, one group. */
-    private int needPages(int g, int[] segSeq, int[] segLen) {
-        int need = 0;
-        for (int s = 0; s < segSeq.length; s++) {
-            int seq = segSeq[s];
-            int slot0 = slots[g][seq];
-            int end = slot0 + segLen[s];
-            PageList list = lists[seq][g];
-            int listLen = list.size();
-            int spanLast = (end - 1) / pageSize;
-            for (int k = slot0 / pageSize; k <= spanLast && k < listLen; k++) {
-                if (pools[g].refCount(list.page(k)) > 1) {
-                    need++;
-                }
-            }
-            int newPages = (end + pageSize - 1) / pageSize - listLen;
-            if (newPages > 0) {
-                need += newPages;
-            }
-        }
-        return need;
-    }
 
     /**
      * Applies a reserved step: takes its pages in the prepare order, swaps privatized pages into the lists, applies
-     * the new {@code kv_pos} values of every group, then trims the SWA pages of the touched sequences.
+     * the new {@code kv_pos} values of every group, then trims the SWA pages of the touched sequences. The commit
+     * runs before the step's layers, so each sequence trims to the window of its segment's first row: every row of
+     * the step still reads its whole window, as llama.cpp frees a SWA cell only once it is masked for the first token
+     * of the ubatch ({@code seq_pos_max + 1} before the ubatch, llama-kv-cache.cpp:1104-1110).
      *
      * @throws IllegalStateException when a step of another memory was committed, or the pools changed between
      *                               prepare and commit
@@ -406,7 +479,7 @@ public final class PagedSequences implements SequenceMemory {
                         if (dst != step.pageTableEntry(g, seq, k)) {
                             throw new IllegalStateException("the pages changed between prepare and commit");
                         }
-                        mirroredPageRows(g, src, dst);
+                        mirroredPageRows(g, src, dst, ownRows(g, seq, k));
                         list.set(k, dst);
                     }
                 }
@@ -419,6 +492,7 @@ public final class PagedSequences implements SequenceMemory {
                     list.append(page);
                 }
                 slots[g][seq] = end;
+                debugNote("commit len" + len, seq, g);
             }
             int[] rows = step.kvPosRows(g);
             int[] values = step.kvPosValues(g);
@@ -450,33 +524,65 @@ public final class PagedSequences implements SequenceMemory {
         }
         for (int s = 0; s < nSeg; s++) {
             int seq = step.segSeq(s);
-            int end = step.segPos0(s) + step.segLen(s) - 1;
+            int end = step.segPosMax(s);
             posMaxArr[seq] = Math.max(posMaxArr[seq], end);
             if (posMinArr[seq] < 0) {
                 posMinArr[seq] = step.segPos0(s);
             }
         }
         pendingCopies.addAll(step.pageCopies());
+        // the step's queries still read their windows (the trunk runs after commit): its first one bounds the trim
         for (int s = 0; s < nSeg; s++) {
-            trimSequence(step.segSeq(s));
+            trimSequence(step.segSeq(s), step.segPos0(s) + 1);
         }
     }
 
     /**
-     * Moves the sequence's reference of {@code src} onto the fresh private page {@code dst} (the source's reference
-     * stays on the pending copy until its completion releases it) and mirrors the host {@code kv_pos} of the copy.
+     * Rows of the page at list index {@code k} that sequence {@code seq} owns in group {@code g}: the slots below
+     * its append cursor. Rows at or above the cursor of a shared page belong to the holders it shares the page with.
      */
-    private void mirroredPageRows(int g, int src, int dst) {
-        System.arraycopy(kvPos[g], src * pageSize, kvPos[g], dst * pageSize, pageSize);
+    private int ownRows(int g, int seq, int k) {
+        return Math.min(Math.max(slots[g][seq] - k * pageSize, 0), pageSize);
+    }
+
+    /**
+     * Moves the sequence's reference of {@code src} onto the fresh private page {@code dst} (the source's reference
+     * stays on the pending copy until its completion releases it), mirrors the host {@code kv_pos} of the copy's
+     * first {@code rows} rows (the privatizing sequence's own; the rest of {@code dst} stays empty), counting the
+     * mirrored live rows into the group's used rows and reporting them, so the device mirror holds the private
+     * page's positions before the next step reads it.
+     */
+    private void mirroredPageRows(int g, int src, int dst, int rows) {
+        System.arraycopy(kvPos[g], src * pageSize, kvPos[g], dst * pageSize, rows);
+        int base = dst * pageSize;
+        int[] rowIds = new int[rows];
+        int[] values = new int[rows];
+        int n = 0;
+        for (int r = 0; r < rows; r++) {
+            int pos = kvPos[g][base + r];
+            if (pos >= 0) {
+                usedRows[g]++;
+                rowIds[n] = base + r;
+                values[n] = pos;
+                n++;
+            }
+        }
+        if (n > 0) {
+            pendingReports.add(RowReport.sets(g, Arrays.copyOf(rowIds, n), Arrays.copyOf(values, n)));
+        }
     }
 
     // ------------------------------------------------------------------ copy-on-write mutation paths
 
     /**
      * Invariant 7's private helper: when the page of {@code (seq, group, listIndex)} has {@code refCount > 1}, it
-     * allocates a page, emits a {@link PageCopy} of the whole page, swaps the page in the sequence's list and moves
-     * the sequence's reference on the source to the pending copy. The caller mutates the private copy only. A page
-     * with {@code refCount == 1} is left alone and mutated in place.
+     * allocates a page, emits a {@link PageCopy} of the rows the sequence owns on it ({@link #ownRows}), swaps the
+     * page in the sequence's list and moves the sequence's reference on the source to the pending copy. The caller
+     * mutates the private copy only. A page with {@code refCount == 1} is left alone and mutated in place.
+     *
+     * @throws MemoryFullException when the pools hold no free page for the private copy ({@code prepare} and
+     *                             {@code copy} pre-count theirs, so only a caller that skipped that count lands
+     *                             here)
      */
     private void privatize(int g, int seq, int listIndex) {
         PageList list = lists[seq][g];
@@ -485,8 +591,12 @@ public final class PagedSequences implements SequenceMemory {
             return;
         }
         int dst = pools[g].alloc();
-        PageCopy copy = PageCopy.of(g, src, dst, pageSize);
-        mirroredPageRows(g, src, dst);
+        if (dst < 0) {
+            throw new MemoryFullException(pageSize, 0, pageSize, 0);
+        }
+        int own = Math.max(ownRows(g, seq, listIndex), 1);
+        PageCopy copy = PageCopy.of(g, src, dst, own);
+        mirroredPageRows(g, src, dst, own);
         pendingCopies.add(copy);
         list.set(listIndex, dst);
     }
@@ -510,20 +620,24 @@ public final class PagedSequences implements SequenceMemory {
             throw new UnsupportedOperationException(refusal);
         }
         int lo = p0;
-        int hi = normalizeRange(seq, p0, p1);
+        int hi = sharing.normalizeRange(seq, p0, p1);
         int max = posMaxArr[seq];
         if (max < 0 || lo >= hi || lo > max) {
             return;
         }
+        dropRowMoves(seq); // the removal frees the rows the queued moves would read
         hi = Math.min(hi, max + 1);
         boolean tail = hi == max + 1;
         for (int g = 0; g < groupsCount(); g++) {
-            int firstCleared = removeGroup(g, seq, lo, hi);
-            if (tail && firstCleared >= 0 && slots[g][seq] > firstCleared) {
-                // a tail removal that partially clears a page strands its dead rows below the cursor: the next
-                // append continues at the first dead slot, so the page addressing stays dense and attention reads
-                // the fresh rows. An interior removal keeps the cursor: live rows sit above its holes.
-                slots[g][seq] = firstCleared;
+            removeGroup(g, seq, lo, hi);
+            if (tail) {
+                // the cursor follows the live rows: a row move (a verify commit's compaction) unmaps its source
+                // before the removal runs, so the range can hold no live row at all and the dead slots it leaves
+                // must not hold the next append above them. The fresh slots then start at the first slot past the
+                // live rows, where the stored positions equal the slots, as the paged attention's fresh-window
+                // rule (a fresh row indexes its tree mask bits by kv_pos - (kv_end - n_fresh)) requires. An
+                // interior removal keeps the cursor: live rows sit above its holes.
+                slots[g][seq] = highestLiveSlot(g, seq) + 1;
             }
             if (lists[seq][g].isEmpty()) {
                 // an emptied list holds no rows: the counter drops with it (the armed-but-unfed token's slot
@@ -531,31 +645,62 @@ public final class PagedSequences implements SequenceMemory {
                 slots[g][seq] = 0;
             }
         }
-        if (hi == max + 1 && posMinArr[seq] == 0) {
-            states[seq].truncate(Math.min(states[seq].nPast(), hi - lo));
-        } else {
-            // an interior or non-aligned removal leaves no reusable token prefix
-            states[seq].clear();
-        }
+        states[seq].removePositions(lo, hi);
         recomputePos(seq);
+        debugNote("remove " + lo + ".." + hi, seq, 0);
     }
 
     /**
-     * Removes one group's rows in {@code [lo, hi)} and returns the slot of the first cleared row of a partially
-     * cleared page, or -1 when every touched page left whole (the cursor then needs no pull-down). The walk runs
-     * from the back so every whole page in the range leaves through {@code removeBack}: a page that is wholly in
-     * the range always sits above the pages still to visit, so it is the last entry when the walk reaches it and
-     * no interior tombstone can ever stay behind in the list.
+     * The paged rows' removal never rewrites the per-sequence recurrent state rows ({@code remove} keeps them, the
+     * tree verify's replay re-derives them), so the keep-recurrent drop runs the plain suffix removal.
      */
-    private int removeGroup(int g, int seq, int lo, int hi) {
+    @Override
+    public String removeKeepRecurrentRefusal(int seq, int p0) {
+        return removeRefusal(seq, p0, -1);
+    }
+
+    @Override
+    public void removeKeepRecurrent(int seq, int p0) {
+        remove(seq, p0, -1);
+    }
+
+    /**
+     * The highest slot of {@code seq} in KV group {@code g} whose cell holds a row (its kv_pos is set), or -1 when
+     * every own slot is dead. The walk runs from the back over the sequence's own rows only: rows of a shared page
+     * above the cursor belong to another holder.
+     */
+    private int highestLiveSlot(int g, int seq) {
         PageList list = lists[seq][g];
-        int firstCleared = -1;
+        int ownSlots = Math.min(slots[g][seq], list.size() * pageSize);
+        for (int k = list.size() - 1; k >= 0; k--) {
+            int base = list.page(k) * pageSize;
+            int ownRows = Math.min(Math.max(ownSlots - k * pageSize, 0), pageSize);
+            for (int r = ownRows - 1; r >= 0; r--) {
+                if (kvPos[g][base + r] >= 0) {
+                    return k * pageSize + r;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Removes one group's rows in {@code [lo, hi)}. The walk runs from the back so every whole page in the range
+     * leaves through {@code removeBack}: a page that is wholly in the range always sits above the pages still to
+     * visit, so it is the last entry when the walk reaches it and no interior tombstone can ever stay behind in
+     * the list. A shared page counts only the rows of the removing sequence's own slots: rows above its cursor
+     * belong to the holder it shares the page with and stay untouched.
+     */
+    private void removeGroup(int g, int seq, int lo, int hi) {
+        PageList list = lists[seq][g];
+        int ownSlots = Math.min(slots[g][seq], list.size() * pageSize);
         for (int k = list.size() - 1; k >= 0; k--) {
             int page = list.page(k);
             int base = page * pageSize;
+            int ownRows = Math.min(Math.max(ownSlots - k * pageSize, 0), pageSize);
             int live = 0;
             int liveIn = 0;
-            for (int r = 0; r < pageSize; r++) {
+            for (int r = 0; r < ownRows; r++) {
                 int pos = kvPos[g][base + r];
                 if (pos < 0) {
                     continue;
@@ -568,15 +713,17 @@ public final class PagedSequences implements SequenceMemory {
             if (live == 0 || liveIn == live) {
                 // the whole page leaves the sequence
                 if (k == list.size() - 1) {
-                    slots[g][seq] = Math.max(0, slots[g][seq] - live);
+                    // every own cell of the back page ends dead, so the cursor pulls to the page's logical
+                    // start; a page whose own cells lie past the cursor leaves it alone
+                    slots[g][seq] = Math.min(slots[g][seq], k * pageSize);
                     list.removeBack(1);
-                    unref(true, g, page);
+                    sharing.unref(true, g, page);
                     continue;
                 }
                 if (k == 0) {
                     list.removeFront(1);
                     slots[g][seq] = Math.max(0, slots[g][seq] - pageSize);
-                    unref(true, g, page);
+                    sharing.unref(true, g, page);
                     continue;
                 }
                 // defensive middle case (a contiguous range cannot reach it): the rows empty and the page stays
@@ -590,20 +737,9 @@ public final class PagedSequences implements SequenceMemory {
             }
             if (liveIn > 0) {
                 privatize(g, seq, k);
-                int base2 = lists[seq][g].page(k) * pageSize;
-                clearRowsIn(g, base2, lo, hi);
-                for (int r = 0; r < pageSize; r++) {
-                    if (kvPos[g][base2 + r] == -1) {
-                        // the cursor is a logical slot of the sequence (list index * P + row), not a pool cell
-                        int slot = k * pageSize + r;
-                        if (firstCleared < 0 || slot < firstCleared) {
-                            firstCleared = slot;
-                        }
-                    }
-                }
+                clearRowsIn(g, lists[seq][g].page(k) * pageSize, lo, hi);
             }
         }
-        return firstCleared;
     }
 
     /** Sets the rows of {@code base} whose position is selected empty and reports any position that was dropped. */
@@ -626,149 +762,140 @@ public final class PagedSequences implements SequenceMemory {
     }
 
     @Override
-    public String copyRefusal() {
+    public String moveRowsRefusal(int seq, int[] srcPos, int[] dstPos) {
+        String structural = checkMoveRows(srcPos, dstPos);
+        if (structural != null) {
+            return structural;
+        }
+        checkSeq(seq);
         return null;
     }
 
     @Override
-    public void copy(int src, int dst, int p0, int p1) {
-        checkSeq(src);
-        checkSeq(dst);
-        if (src == dst) {
-            throw new IllegalArgumentException("copy needs two different sequences, got " + src);
-        }
-        int lo = p0;
-        int hi = normalizeRange(src, p0, p1);
-        int srcMax = posMaxArr[src];
-        if (lo < 0) {
-            throw new IllegalArgumentException("copy starts before the source: position " + lo);
-        }
-        if (srcMax < 0 || hi <= lo || lo > srcMax) {
-            throw new IllegalArgumentException("copy range [" + lo + ", " + hi + ") holds nothing of sequence "
-                    + src + " (" + posMinArr[src] + ".." + srcMax + ")");
-        }
-        if (posMaxArr[dst] >= 0) {
-            throw new IllegalStateException("copy shares pages with sequence " + dst + ", which stores positions "
-                    + posMinArr[dst] + ".." + posMaxArr[dst] + "; the shared rows keep the source positions, so the"
-                    + " destination must be empty");
-        }
-        // all-or-nothing: count the private leading pages first, no pool touched
-        for (int g = 0; g < groupsCount(); g++) {
-            int need = 0;
-            PageList from = lists[src][g];
-            for (int k = 0; k < from.size(); k++) {
-                if (copyShareKind(g, from.page(k), lo, hi) == 2) {
-                    need++;
-                }
-            }
-            if (need > pools[g].free()) {
-                throw new MemoryFullException(hi - lo, cap, hi - lo, freeCells());
-            }
+    public void moveRows(int seq, int[] srcPos, int[] dstPos) {
+        String refusal = moveRowsRefusal(seq, srcPos, dstPos);
+        if (refusal != null) {
+            throw new UnsupportedOperationException(refusal);
         }
         for (int g = 0; g < groupsCount(); g++) {
-            copyGroup(g, src, dst, lo, hi);
+            moveGroupRows(g, seq, srcPos, dstPos);
         }
-        posMinArr[dst] = lo;
-        posMaxArr[dst] = hi - 1;
+        debugNote("moveRows " + srcPos.length, seq, 0);
     }
 
-    /** Part of {@code page} in the copy range: 0 none, 1 the whole in-range part (share it), 2 a leading partial. */
-    private int copyShareKind(int g, int page, int lo, int hi) {
-        int base = page * pageSize;
-        boolean liveInRange = false;
-        boolean liveBefore = false;
-        for (int r = 0; r < pageSize; r++) {
-            int pos = kvPos[g][base + r];
-            if (pos < 0) {
-                continue;
+    /** The ordering contract of a compaction: equal lengths, sources above their destinations, both ascending. */
+    private static String checkMoveRows(int[] srcPos, int[] dstPos) {
+        if (srcPos == null || dstPos == null) {
+            throw new IllegalArgumentException("a row compaction names sources and destinations");
+        }
+        if (srcPos.length != dstPos.length) {
+            return "the compaction names " + srcPos.length + " sources and " + dstPos.length + " destinations";
+        }
+        for (int i = 0; i < srcPos.length; i++) {
+            if (srcPos[i] <= dstPos[i]) {
+                return "the compaction moves position " + srcPos[i] + " down onto " + dstPos[i] + ", which is not"
+                        + " below its source";
             }
-            if (pos >= lo && pos < hi) {
-                liveInRange = true;
-            } else if (pos < lo) {
-                liveBefore = true;
+            if (i > 0 && (srcPos[i] <= srcPos[i - 1] || dstPos[i] <= dstPos[i - 1])) {
+                return "the compaction's positions must ascend strictly, got " + srcPos[i] + "/" + dstPos[i]
+                        + " after " + srcPos[i - 1] + "/" + dstPos[i - 1];
             }
         }
-        if (!liveInRange) {
-            return 0;
-        }
-        return liveBefore ? 2 : 1;
-    }
-
-    private void copyGroup(int g, int src, int dst, int lo, int hi) {
-        PageList from = lists[src][g];
-        PageList to = lists[dst][g];
-        int first = 0;
-        while (first < from.size() && copyShareKind(g, from.page(first), lo, hi) == 0) {
-            first++; // leading pages outside the range are neither shared nor copied
-        }
-        for (int k = first; k < from.size(); k++) {
-            int page = from.page(k);
-            int kind = copyShareKind(g, page, lo, hi);
-            if (kind == 0) {
-                break;
-            }
-            if (kind == 1) {
-                pools[g].ref(page);
-                to.append(page);
-                continue;
-            }
-            // rows before the range stay on the source alone: the destination gets a private page and copies only
-            // its in-range rows into rows [firstRow, lastRowPlusOne)
-            int pageBase = page * pageSize;
-            int row0 = pageSize;
-            int lastRowPlusOne = 0;
-            for (int r = 0; r < pageSize; r++) {
-                int pos = kvPos[g][pageBase + r];
-                if (pos >= lo && pos < hi) {
-                    row0 = Math.min(row0, r);
-                    lastRowPlusOne = Math.max(lastRowPlusOne, r + 1);
-                }
-            }
-            int priv = pools[g].alloc();
-            pendingCopies.add(PageCopy.ofRange(g, page, priv, row0, lastRowPlusOne - row0));
-            to.append(priv);
-            int[] rows = new int[lastRowPlusOne - row0];
-            int[] values = new int[rows.length];
-            int n = 0;
-            for (int r = row0; r < lastRowPlusOne; r++) {
-                int pos = kvPos[g][pageBase + r];
-                kvPos[g][priv * pageSize + r] = pos;
-                if (pos >= 0) {
-                    usedRows[g]++;
-                    rows[n] = priv * pageSize + r;
-                    values[n] = pos;
-                    n++;
-                }
-            }
-            if (n > 0) {
-                // the device applies the copy besides the step's writes: it needs the copied rows' positions
-                pendingReports.add(RowReport.sets(g, Arrays.copyOf(rows, n), Arrays.copyOf(values, n)));
-            }
-        }
-        // the copied rows end inside the last page (a page fully covered by the range ends whole): the next append
-        // continues there and privatizes the last page first when it is shared
-        slots[g][dst] = slotsOfList(to, g, lo, hi);
+        return null;
     }
 
     /**
-     * Slots the copied list covers: a page per shorter page plus the in-range rows of the last one, so the next
-     * append continues on the last copied row. Appends that reach a shared partial tail page privatize it first.
+     * One group's gather: maps every position to its slot, privatizes the destination pages (a shared page is
+     * never written in place), then moves the cells and mirrors them. The queue the moves join runs in order, so a
+     * move that overwrites an earlier move's source lands after it.
      */
-    private int slotsOfList(PageList list, int g, int lo, int hi) {
-        if (list.isEmpty()) {
-            return 0;
-        }
-        int last = list.size() - 1;
-        int base = list.page(last) * pageSize;
-        int count = 0;
-        for (int r = 0; r < pageSize; r++) {
-            int pos = kvPos[g][base + r];
-            if (pos >= lo && pos < hi) {
-                count = r + 1;
+    private void moveGroupRows(int g, int seq, int[] srcPos, int[] dstPos) {
+        PageList list = lists[seq][g];
+        int cursor = slots[g][seq];
+        int[] srcSlot = new int[srcPos.length];
+        int[] dstSlot = new int[dstPos.length];
+        for (int s = 0; s < cursor; s++) {
+            int pos = kvPos[g][cellOf(list, s)];
+            for (int i = 0; i < srcPos.length; i++) {
+                if (pos == srcPos[i]) {
+                    srcSlot[i] = s + 1;
+                }
+                if (pos == dstPos[i]) {
+                    dstSlot[i] = s + 1;
+                }
             }
         }
-        return last * pageSize + count;
+        for (int i = 0; i < srcPos.length; i++) {
+            if (srcSlot[i] == 0) {
+                throw new UnsupportedOperationException("the compaction moves position " + srcPos[i]
+                        + ", which the sequence holds no row for");
+            }
+            if (dstSlot[i] == 0) {
+                throw new UnsupportedOperationException("the compaction's destination position " + dstPos[i]
+                        + " holds no row to overwrite");
+            }
+        }
+        // the destination pages privatize before any cell moves: a page replaced itself in the list, so the cells
+        // re-address afterwards
+        int lastListIndex = -1;
+        for (int i = 0; i < dstSlot.length; i++) {
+            int listIndex = dstSlot[i] - 1;
+            int k = listIndex / pageSize;
+            if (k != lastListIndex) {
+                privatize(g, seq, k);
+                lastListIndex = k;
+            }
+        }
+        list = lists[seq][g];
+        // a cell can be one move's source and a later move's destination: report every touched cell by its final
+        // state, the destinations' positions as sets and the sources that stayed empty as clears
+        int[] touched = new int[2 * srcPos.length];
+        int[] finals = new int[2 * srcPos.length];
+        int moved = 0;
+        for (int i = 0; i < srcPos.length; i++) {
+            int src = cellOf(list, srcSlot[i] - 1);
+            int dst = cellOf(list, dstSlot[i] - 1);
+            if (src == dst) {
+                continue;
+            }
+            if (kvPos[g][dst] < 0) {
+                usedRows[g]++;
+            }
+            kvPos[g][src] = -1;
+            kvPos[g][dst] = dstPos[i];
+            pendingRowMoves.add(RowMove.of(seq, g, src, dst, 1));
+            touched[moved] = src;
+            finals[moved] = -1;
+            moved++;
+            touched[moved] = dst;
+            finals[moved] = dstPos[i];
+            moved++;
+        }
+        if (moved > 0) {
+            reportTouched(g, touched, finals, moved);
+        }
     }
+
+    @Override
+    public String copyRefusal() {
+        return null;
+    }
+
+    /** Whether any page of {@code seq} has a reference count over 1 (another holder keeps it too). */
+    @Override
+    public boolean sharesPages(int seq) {
+        checkSeq(seq);
+        for (int g = 0; g < groupsCount(); g++) {
+            PageList list = lists[seq][g];
+            for (int k = 0; k < list.size(); k++) {
+                if (pools[g].refCount(list.page(k)) > 1) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
 
     @Override
     public void keep(int seq) {
@@ -785,13 +912,207 @@ public final class PagedSequences implements SequenceMemory {
         for (int s = 0; s < parallel; s++) {
             dropSequence(s);
         }
+        clears++;
+    }
+
+    /**
+     * How many times {@link #clear()} emptied the memory. A clear comes with a reset of the memory's row mirrors,
+     * so a holder of pages outside the sequences ({@link #holdPages}) compares the count to learn that the rows of
+     * its pages no longer serve attention.
+     */
+    public int clears() {
+        return clears;
+    }
+
+    // ------------------------------------------------------------------ block holders and copies (PageSharing)
+
+    /** KV groups of the memory: a block's pages hold one page per group. */
+    public int groups() {
+        return sharing.groups();
+    }
+
+    /** The fewest idle pages of any KV group: 0 when some group could not allocate a page now. */
+    public int minFreePages() {
+        return sharing.minFreePages();
+    }
+
+    /** The pages of block {@code block} of {@code seq}, one per KV group; see {@link PageSharing#blockPages}. */
+    public int[] blockPages(int seq, int block, int rows) {
+        return sharing.blockPages(seq, block, rows);
+    }
+
+    /** {@link #blockPages(int, int, int)} for rows that store explicit positions. */
+    public int[] blockPages(int seq, int block, int rows, int[] positions) {
+        return sharing.blockPages(seq, block, rows, positions);
+    }
+
+    /** Takes a holder's reference on each page of {@code pages}; see {@link PageSharing#holdPages}. */
+    public void holdPages(int[] pages) {
+        sharing.holdPages(pages);
+    }
+
+    /** Takes one idle page per KV group for rows imported from the host. */
+    public int[] importPages(int[] positions) {
+        return sharing.importPages(positions);
+    }
+
+    /** The positions page rows {@code [0, rows)} of {@code page} store in KV group {@code group}. */
+    public int[] pagePositions(int group, int page, int rows) {
+        return sharing.pagePositions(group, page, rows);
+    }
+
+    /** Drops a holder's reference on each page of {@code pages}. */
+    public void releasePages(int[] pages) {
+        sharing.releasePages(pages);
+    }
+
+    /** Whether a page of {@code pages} has more than one reference. */
+    public boolean pagesShared(int[] pages) {
+        return sharing.pagesShared(pages);
+    }
+
+    /** Idle pages of KV group {@code g}. */
+    public int freePages(int g) {
+        return sharing.freePages(g);
+    }
+
+    /** The pages a write of {@code rows} rows by {@code seq} takes in KV group {@code g}. */
+    public int pagesToWrite(int seq, int g, int rows) {
+        return sharing.pagesToWrite(seq, g, rows);
+    }
+
+    /** Pages of {@code window} that only its holder references. */
+    public int windowOnlyPages(PageWindow window) {
+        return sharing.windowOnlyPages(window);
+    }
+
+    /** Whether KV group {@code g} trims a sliding window. */
+    public boolean trims(int g) {
+        return sharing.trims(g);
+    }
+
+    /** The widest reader window of a trimming group {@code g}; 0 for a full-attention group. */
+    public int windowWidth(int g) {
+        return sharing.windowWidth(g);
+    }
+
+    /** Takes a holder's reference on the window of sequence {@code seq} in group {@code g} at {@code rows} rows. */
+    public PageWindow holdWindow(int seq, int g, int rows) {
+        return sharing.holdWindow(seq, g, rows);
+    }
+
+    /** Drops a holder's reference on every page of {@code window}. */
+    public void releaseWindow(PageWindow window) {
+        sharing.releaseWindow(window);
+    }
+
+    /** Gives the empty sequence {@code seq} the held pages of consecutive blocks as its positions from 0. */
+    public void adoptPages(int seq, int[][] blocks, int lastRows, int[] tokens) {
+        sharing.adoptPages(seq, blocks, lastRows, tokens);
+    }
+
+    /** {@link #adoptPages(int, int[][], int, int[])} for a model whose embedding rows record no token. */
+    public void adoptPages(int seq, int[][] blocks, int lastRows, int[] tokens, int[] positions) {
+        sharing.adoptPages(seq, blocks, lastRows, tokens, positions);
+    }
+
+    /** {@link #adoptPages(int, int[][], int, int[])} for rows that store explicit positions. */
+    public void adoptPages(int seq, int[][] blocks, int lastRows, int[] tokens, int[] positions,
+                           int embeddingToken) {
+        sharing.adoptPages(seq, blocks, lastRows, tokens, positions, embeddingToken);
+    }
+
+    /** {@link #adoptPages(int, int[][], int, int[], int[], int)} for a memory with trimming groups. */
+    public void adoptPages(int seq, int[][] blocks, int lastRows, int[] tokens, int[] positions,
+                           PageWindow[] windows, int embeddingToken) {
+        sharing.adoptPages(seq, blocks, lastRows, tokens, positions, windows, embeddingToken);
+    }
+
+    @Override
+    public void copy(int src, int dst, int p0, int p1) {
+        sharing.copy(src, dst, p0, p1);
+    }
+
+    /**
+     * Re-appends the held rows of cached pages at the append cursor of sequence {@code seq} (llama.cpp server's KV
+     * chunk reuse): the run of {@code rows} rows starts at source row {@code srcRow0} of run page 0 of
+     * {@code srcPages} (one page per KV group per run page, the cache blocks') and lands at the sequence's own
+     * slots, at the positions {@code [pos0, pos0 + rows)} its prompt rows take — the sequence's next position.
+     * Copied rows re-rotate by the uniform {@code delta} between a source row's stored position and its new one
+     * ({@link RowReport#shift}, the re-rotation {@link #pendingReports()} names); a {@code delta} 0 run whose rows
+     * meet the cursor page-aligned shares whole cached pages instead of copying them. The token record takes one
+     * entry per row ({@code tokens[r]}, an embedding row negative, recording {@code embeddingToken}).
+     * All-or-nothing: the new tail pages and the private copies of every written shared page are counted per group
+     * and refused as a whole before any pool changes.
+     *
+     * @throws IllegalArgumentException      for a run outside the pages, a token count or position mismatch, or
+     *                                       source rows the cache does not hold
+     * @throws IllegalStateException         when the sequence's groups disagree on the cursor or a group's page list
+     *                                       does not cover its cursor
+     * @throws MemoryFullException           when the run needs pages or rows the pools or the sequence lack
+     * @throws UnsupportedOperationException for a trimming group (chunk reuse needs a full-attention memory)
+     */
+    public void reusePages(int seq, int[][] srcPages, int srcRow0, int pos0, int rows, int delta,
+                           int[] tokens, int embeddingToken) {
+        sharing.reusePages(seq, srcPages, srcRow0, pos0, rows, delta, tokens, embeddingToken);
+    }
+
+    // ------------------------------------------------------------------ PageSharing accessors
+
+    PagePool[] pools() {
+        return pools;
+    }
+
+    PageList[][] lists() {
+        return lists;
+    }
+
+    int[][] kvPos() {
+        return kvPos;
+    }
+
+    int[][] slots() {
+        return slots;
+    }
+
+    int[] usedRows() {
+        return usedRows;
+    }
+
+    int[] posMinArr() {
+        return posMinArr;
+    }
+
+    int[] posMaxArr() {
+        return posMaxArr;
+    }
+
+    boolean[] swaGroups() {
+        return swaGroup;
+    }
+
+    int[] windowWidths() {
+        return windowWidth;
+    }
+
+    int cap() {
+        return cap;
+    }
+
+    List<PageCopy> pendingCopyList() {
+        return pendingCopies;
+    }
+
+    List<RowReport> pendingReportList() {
+        return pendingReports;
     }
 
     private void dropSequence(int seq) {
+        dropRowMoves(seq);
         for (int g = 0; g < groupsCount(); g++) {
             PageList list = lists[seq][g];
             while (!list.isEmpty()) {
-                unref(true, g, list.page(list.size() - 1));
+                sharing.unref(true, g, list.page(list.size() - 1));
                 list.removeBack(1);
             }
             slots[g][seq] = 0;
@@ -802,9 +1123,82 @@ public final class PagedSequences implements SequenceMemory {
         posMaxArr[seq] = -1;
     }
 
+    /** Drops the queued row moves of {@code seq}: its rows leave, so their moves would read freed cells. */
+    private void dropRowMoves(int seq) {
+        pendingRowMoves.removeIf(m -> m.seq() == seq);
+    }
+
     @Override
     public String shiftRefusal() {
         return null;
+    }
+
+    @Override
+    public String divRefusal() {
+        return null;
+    }
+
+    @Override
+    public void div(int seq, int p0, int p1, int d) {
+        checkSeq(seq);
+        if (d < 2) {
+            throw new IllegalArgumentException("position division needs a divisor of at least 2, got " + d);
+        }
+        int lo = p0;
+        if (lo < 0) {
+            throw new IllegalArgumentException("division starts before the sequence: position " + lo);
+        }
+        int hi = sharing.normalizeRange(seq, p0, p1);
+        if (hi <= lo) {
+            return;
+        }
+        for (int g = 0; g < groupsCount(); g++) {
+            divGroup(g, seq, lo, hi, d);
+        }
+        states[seq].divPositions(lo, hi, d);
+        recomputePos(seq);
+    }
+
+    /**
+     * Divides one group's row positions in {@code [lo, hi)}: every page with a row in the range privatizes first
+     * (a shared page is never written in place), then each of its rows takes {@code pos / d} and reports the
+     * per-row RoPE shift {@code pos - pos / d} the backend re-rotates its key by. Rows keep their cells, so the
+     * slot cursor and the page lists do not move.
+     */
+    private void divGroup(int g, int seq, int lo, int hi, int d) {
+        PageList list = lists[seq][g];
+        for (int k = 0; k < list.size(); k++) {
+            int base = list.page(k) * pageSize;
+            boolean mutates = false;
+            for (int r = 0; r < pageSize && !mutates; r++) {
+                int pos = kvPos[g][base + r];
+                mutates = pos >= lo && pos < hi;
+            }
+            if (!mutates) {
+                continue;
+            }
+            privatize(g, seq, k);
+            int privBase = lists[seq][g].page(k) * pageSize;
+            int[] rows = new int[pageSize];
+            int[] values = new int[pageSize];
+            int[] deltas = new int[pageSize];
+            int n = 0;
+            for (int r = 0; r < pageSize; r++) {
+                int pos = kvPos[g][privBase + r];
+                if (pos >= lo && pos < hi) {
+                    int divided = pos / d;
+                    kvPos[g][privBase + r] = divided;
+                    rows[n] = privBase + r;
+                    values[n] = divided;
+                    deltas[n] = pos - divided;
+                    n++;
+                }
+            }
+            if (n > 0) {
+                pendingReports.add(RowReport.reposition(g, Arrays.copyOf(rows, n), Arrays.copyOf(values, n),
+                        Arrays.copyOf(deltas, n)));
+            }
+        }
     }
 
     @Override
@@ -814,7 +1208,7 @@ public final class PagedSequences implements SequenceMemory {
             return;
         }
         int lo = p0;
-        int hi = normalizeRange(seq, p0, p1);
+        int hi = sharing.normalizeRange(seq, p0, p1);
         if (lo < 0) {
             throw new IllegalArgumentException("shift starts before the sequence: position " + lo);
         }
@@ -824,7 +1218,121 @@ public final class PagedSequences implements SequenceMemory {
         for (int g = 0; g < groupsCount(); g++) {
             addGroup(g, seq, lo, hi, delta);
         }
+        states[seq].shiftPositions(lo, hi, delta);
         recomputePos(seq);
+        if (delta < 0) {
+            compact(seq);
+        }
+    }
+
+    /**
+     * Slides the sequence's live rows down over the dead slots below them: a context shift's interior removal
+     * strands the removed slots under the live tail, and an append cursor that keeps them would grow every later
+     * append past the pages the plan sized. The rows' positions and the token record stay; the cells move, their
+     * {@code kv_pos} mirrors and the device reports with them, and the backend carries the keys and values through
+     * the queued {@link RowMove}s. Pages the destinations touch privatize first (a shared page is
+     * never written in place).
+     */
+    private void compact(int seq) {
+        for (int g = 0; g < groupsCount(); g++) {
+            compactGroup(g, seq);
+        }
+    }
+
+    /** The slide of one KV group: count the dead slots, privatize the destination pages, then move row by row. */
+    private void compactGroup(int g, int seq) {
+        PageList list = lists[seq][g];
+        int cursor = slots[g][seq];
+        int slide = 0;
+        int firstMoved = -1;
+        for (int s = 0; s < cursor; s++) {
+            if (kvPos[g][cellOf(list, s)] < 0) {
+                slide++;
+            } else if (slide > 0 && firstMoved < 0) {
+                firstMoved = s - slide;
+            }
+        }
+        if (slide == 0) {
+            return;
+        }
+        int lastDst = cursor - slide;
+        for (int k = Math.max(firstMoved / pageSize, 0); k * pageSize < lastDst && k < list.size(); k++) {
+            privatize(g, seq, k);
+            list = lists[seq][g]; // a privatized page replaced itself in the list
+        }
+        list = lists[seq][g];
+        // a cell can be one move's source and a later move's destination: report every touched cell by its
+        // final state, the destinations' positions as sets and the sources that stayed empty as clears
+        int[] touched = new int[2 * (cursor - firstMoved)];
+        int[] finals = new int[2 * (cursor - firstMoved)];
+        int moved = 0;
+        for (int s = firstMoved; s < cursor; s++) {
+            int src = cellOf(list, s);
+            int pos = kvPos[g][src];
+            if (pos < 0) {
+                continue;
+            }
+            int dst = s - slide;
+            int target = cellOf(list, dst);
+            kvPos[g][src] = -1;
+            kvPos[g][target] = pos;
+            pendingRowMoves.add(RowMove.of(seq, g, src, target, 1));
+            touched[moved] = src;
+            finals[moved] = -1;
+            moved++;
+            touched[moved] = target;
+            finals[moved] = pos;
+            moved++;
+        }
+        slots[g][seq] = cursor - slide;
+        reportTouched(g, touched, finals, moved);
+        // the vacated tail slots leave: whole dead pages drop from the list, a page with a live row keeps
+        while (!list.isEmpty()) {
+            int page = list.page(list.size() - 1);
+            int base = page * pageSize;
+            int lastLive = -1;
+            for (int r = pageSize - 1; r >= 0; r--) {
+                if (kvPos[g][base + r] >= 0) {
+                    lastLive = r;
+                    break;
+                }
+            }
+            if (lastLive >= 0) {
+                return;
+            }
+            sharing.unref(false, g, page);
+            list.removeBack(1);
+        }
+    }
+
+    /**
+     * Reports one mirror entry per touched cell, by its final value: a set per live cell (its position), a clear
+     * per empty one, deduplicating the cells several moves touched.
+     */
+    private void reportTouched(int g, int[] touched, int[] finals, int count) {
+        for (int i = 0; i < count; i++) {
+            int cell = touched[i];
+            boolean later = false;
+            for (int j = i + 1; j < count; j++) {
+                if (touched[j] == cell) {
+                    later = true;
+                    break;
+                }
+            }
+            if (later) {
+                continue;
+            }
+            if (finals[i] < 0) {
+                pendingReports.add(RowReport.clears(g, new int[] {cell}));
+            } else {
+                pendingReports.add(RowReport.sets(g, new int[] {cell}, new int[] {finals[i]}));
+            }
+        }
+    }
+
+    /** The cell of slot {@code s} of the list (page table entry {@code s / pageSize}, row {@code s % pageSize}). */
+    private int cellOf(PageList list, int s) {
+        return list.page(s / pageSize) * pageSize + (s % pageSize);
     }
 
     private void addGroup(int g, int seq, int lo, int hi, int delta) {
@@ -865,20 +1373,41 @@ public final class PagedSequences implements SequenceMemory {
 
     /**
      * Trims the SWA pages of {@code seq}: whole pages whose rows all lie below the window leave the sequence, and
-     * the leading page's rows below the window go empty on a private page only (invariant 7). Committed is the
-     * sequence's committed element count, so trimming follows {@code committed - W_g} with W_g the group's widest
-     * reader window (M-2). The prefix cache's completion order (O-3) is a later work package's concern.
+     * the leading page's rows below the window go empty when the sequence alone holds the page. A page another
+     * holder shares (a context checkpoint's window, a fork) is never written: a whole one leaves the
+     * sequence by dropping its reference, a straddling one keeps its rows below the window, which the SWA mask
+     * hides from every query of the sequence. So a trim never allocates a page. Committed is the sequence's
+     * committed element count, so trimming follows {@code committed - W_g} with W_g the group's widest reader
+     * window: the window of the sequence's next position.
      */
     public void trim(int seq) {
         checkSeq(seq);
-        trimSequence(seq);
+        trimSequence(seq, Integer.MAX_VALUE);
     }
 
-    private void trimSequence(int seq) {
+    /**
+     * Ends a committed step once the trunk ran over it: its queries read no more, so each of its sequences trims
+     * to the window of its next position ({@link #trim}) and the window rows below it leave before the next step
+     * reserves pages.
+     */
+    public void finish(PagedStep step) {
+        Objects.requireNonNull(step, "step");
+        for (int s = 0; s < step.nSeg(); s++) {
+            trim(step.segSeq(s));
+        }
+    }
+
+    /**
+     * Trims {@code seq}: the rows below {@code min(committed, reader) - W_g} leave.
+     *
+     * @param reader one past the earliest position that still reads the rows (the first row of a step
+     *               {@link #commit} applies), {@code Integer.MAX_VALUE} for the sequence's next position
+     */
+    private void trimSequence(int seq, int reader) {
         if (posMaxArr[seq] < 0) {
             return;
         }
-        int committed = posMaxArr[seq] + 1;
+        int committed = Math.min(posMaxArr[seq] + 1, reader);
         for (int g = 0; g < groupsCount(); g++) {
             if (swaGroup[g]) {
                 trimGroup(g, seq, committed - windowWidth[g]);
@@ -907,58 +1436,27 @@ public final class PagedSequences implements SequenceMemory {
                     }
                 }
             }
+            boolean shared = pools[g].refCount(page) > 1;
             if (lastLive >= 0 && kvPos[g][base + lastLive] >= threshold) {
-                // straddling page: the rows below the window go empty, the page stays
-                if (hasBelow) {
-                    privatize(g, seq, 0);
-                    clearRowsIn(g, lists[seq][g].page(0) * pageSize, 0, threshold);
+                // straddling page: the rows below the window go empty on a page the sequence alone holds
+                if (hasBelow && !shared) {
+                    clearRowsIn(g, base, 0, threshold);
                 }
                 return;
             }
-            // the whole page lies below the window (or has no live row): drop it
-            if (pools[g].refCount(page) > 1) {
-                // one PageCopy: the trim is written on the private page, whose rows go empty, then the page leaves
-                privatize(g, seq, 0);
-                int priv = list.page(0);
-                clearRowsIn(g, priv * pageSize, Integer.MIN_VALUE, Integer.MAX_VALUE);
-                unref(false, g, priv);
-                list.removeFront(1);
-            } else {
+            // the whole page lies below the window (or has no live row): it leaves the sequence; a shared page
+            // keeps its rows for the other holders
+            if (!shared) {
                 clearRowsIn(g, base, Integer.MIN_VALUE, Integer.MAX_VALUE);
-                unref(false, g, page);
-                list.removeFront(1);
             }
+            sharing.unref(false, g, page);
+            list.removeFront(1);
             slots[g][seq] = Math.max(0, slots[g][seq] - pageSize);
         }
     }
 
     // ------------------------------------------------------------------ pool helpers
 
-    /**
-     * Drops one reference of {@code page} in {@code g}. A page freed to 0 goes back to the pool with its rows empty;
-     * {@code rowReported} reports that emptiness to the device ({@link #pendingReports()}), skipping rows an
-     * operation already emptied.
-     */
-    private void unref(boolean rowReported, int g, int page) {
-        boolean freed = pools[g].refCount(page) == 1;
-        pools[g].unref(page);
-        if (!freed) {
-            return;
-        }
-        int base = page * pageSize;
-        int[] rows = new int[pageSize];
-        int n = 0;
-        for (int r = 0; r < pageSize; r++) {
-            if (kvPos[g][base + r] >= 0) {
-                kvPos[g][base + r] = -1;
-                usedRows[g]--;
-                rows[n++] = base + r;
-            }
-        }
-        if (rowReported && n > 0) {
-            pendingReports.add(RowReport.clears(g, Arrays.copyOf(rows, n)));
-        }
-    }
 
     private void recountUsed(int g) {
         usedRows[g] = 0;
@@ -975,6 +1473,7 @@ public final class PagedSequences implements SequenceMemory {
         }
     }
 
+    /** The stored range of {@code seq} from its own rows (a shared page's rows above its cursor are another's). */
     private void recomputePos(int seq) {
         int min = -1;
         int max = -1;
@@ -982,7 +1481,8 @@ public final class PagedSequences implements SequenceMemory {
             PageList list = lists[seq][g];
             for (int k = 0; k < list.size(); k++) {
                 int base = list.page(k) * pageSize;
-                for (int r = 0; r < pageSize; r++) {
+                int own = ownRows(g, seq, k);
+                for (int r = 0; r < own; r++) {
                     int pos = kvPos[g][base + r];
                     if (pos < 0) {
                         continue;
@@ -996,18 +1496,6 @@ public final class PagedSequences implements SequenceMemory {
         posMaxArr[seq] = max;
     }
 
-    private int normalizeRange(int seq, int p0, int p1) {
-        if (p0 < 0) {
-            throw new IllegalArgumentException("range starts before the sequence: position " + p0);
-        }
-        if (p1 < -1) {
-            throw new IllegalArgumentException("range end " + p1 + " is below -1");
-        }
-        if (p1 == -1) {
-            return posMaxArr[seq] < 0 ? p0 : posMaxArr[seq] + 1;
-        }
-        return Math.max(p0, p1);
-    }
 
     // ------------------------------------------------------------------ SequenceMemory
 
@@ -1036,11 +1524,7 @@ public final class PagedSequences implements SequenceMemory {
 
     @Override
     public int freeCells() {
-        int free = 0;
-        for (int g = 0; g < groupsCount(); g++) {
-            free += plan.group(g).rows() - usedRows[g];
-        }
-        return free;
+        return sharing.freeCells();
     }
 
     @Override
@@ -1052,7 +1536,7 @@ public final class PagedSequences implements SequenceMemory {
         return total;
     }
 
-    private void checkSeq(int seq) {
+    void checkSeq(int seq) {
         if (seq < 0 || seq >= parallel) {
             throw new IndexOutOfBoundsException("sequence " + seq + " outside [0, " + parallel + ")");
         }
@@ -1062,82 +1546,5 @@ public final class PagedSequences implements SequenceMemory {
     public String toString() {
         return "PagedSequences{parallel=" + parallel + ", pageSize=" + pageSize + ", groups=" + groupsCount()
                 + ", " + freeCells() + "/" + totalCells() + " free rows}";
-    }
-
-    /**
-     * One host-side {@code kv_pos} change the device must apply besides a step's own row writes: the rows of one
-     * KV group together with their target values. Absolute reports ({@code values[i]}) set
-     * {@code kv_pos[rows[i]] = values[i]}; a relative ({@code delta != 0}) report instead adds {@code delta}
-     * ({@code LLM_KV_RopeShift_*}), with {@code values[i]} carrying the host's expected post-shift position.
-     * Immutable; rows are ascending.
-     */
-    public static final class RowReport {
-
-        private final int group;
-        private final int[] rows;
-        private final int[] values;
-        private final int delta;
-
-        private RowReport(int group, int[] rows, int[] values, int delta) {
-            this.group = group;
-            this.rows = rows;
-            this.values = values;
-            this.delta = delta;
-        }
-
-        /** Clearing rows: {@code kv_pos[rows[i]] = -1}. */
-        public static RowReport clears(int group, int[] rowsAscending) {
-            if (rowsAscending.length == 0) {
-                throw new IllegalArgumentException("clears carry at least one row");
-            }
-            int[] values = new int[rowsAscending.length];
-            Arrays.fill(values, -1);
-            return new RowReport(group, rowsAscending.clone(), values, 0);
-        }
-
-        /** Shifting rows: {@code kv_pos[rows[i]] += delta}, the kernel's RoPE-shift inputs. */
-        public static RowReport shift(int group, int[] rowsAscending, int[] newPositions, int delta) {
-            if (rowsAscending.length == 0 || rowsAscending.length != newPositions.length) {
-                throw new IllegalArgumentException("shift rows and new positions share one non-empty length");
-            }
-            return new RowReport(group, rowsAscending.clone(), newPositions.clone(), delta);
-        }
-
-        /** Setting rows: {@code kv_pos[rows[i]] = values[i]} (the host's mirror of a partial page copy). */
-        public static RowReport sets(int group, int[] rowsAscending, int[] values) {
-            if (rowsAscending.length == 0 || rowsAscending.length != values.length) {
-                throw new IllegalArgumentException("sets carry rows and values of one non-empty length");
-            }
-            return new RowReport(group, rowsAscending.clone(), values.clone(), 0);
-        }
-
-        /** KV group of the rows. */
-        public int group() { return group; }
-
-        /** Rows, ascending. */
-        public int[] rows() { return rows.clone(); }
-
-        /**
-         * Target values: -1 for a cleared row, the new position for a shifted or set one. {@code delta} 0 applies
-         * these as absolute values.
-         */
-        public int[] values() { return values.clone(); }
-
-        /**
-         * The RoPE shift amount ({@code delta != 0} means relative: the device adds it instead of setting);
-         * 0 for an absolute report.
-         */
-        public int delta() { return delta; }
-
-        /** True when the device sets {@code values[]}; false when it adds {@code delta}. */
-        public boolean absolute() {
-            return delta == 0;
-        }
-
-        @Override
-        public String toString() {
-            return "RowReport{group=" + group + ", rows=" + rows.length
-                    + (absolute() ? ", absolute" : ", delta=" + delta) + "}";
-        }
     }
 }

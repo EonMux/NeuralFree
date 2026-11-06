@@ -26,10 +26,10 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Hugging Face architecture entries for the classic dense decoder families of Appendix A table HK-D1 (the
- * {@code TextModel} classes of {@code BaichuanModel} … {@code XverseModel}) and of HK-0's {@code GraniteModel},
+ * Hugging Face architecture entries for the classic dense decoder families (the
+ * {@code TextModel} classes of {@code BaichuanModel} … {@code XverseModel}) and of {@code GraniteModel},
  * registered through {@link HfArchRegistry} with the compatible hook parts A to E. {@code GraniteMoeModel} is
- * registered on HK-MC's table. The Hugging Face names are exactly the Appendix A rows.
+ * registered on the classic-MoE table. The Hugging Face names are exactly this table's rows.
  */
 final class HfArchTableDenseClassic {
 
@@ -79,8 +79,9 @@ final class HfArchTableDenseClassic {
                         .withConfigFixup(HfDenseClassicHooksB::deciFixup)
                         .withExtra(HfDenseClassicHooksB::deciExtra),
                 HfArchEntry.of(Collections.singletonList("Exaone4_5_ForConditionalGeneration"),
-                                HfArchResolver.of(Arch.EXAONE4), HfDenseClassicHooksB::exaone4Meta,
+                                HfArchResolver.of(Arch.EXAONE4), HfDenseClassicHooksB::exaone45Meta,
                                 HfDenseClassicHooksB::exaone45Tensors, HfDenseClassicHooksB::exaone4Vocab)
+                        .withBlockCount(HfDenseClassicHooksB::exaone45Blocks)
                         .withExtra(HfDenseClassicHooksB::exaone4Extra),
                 HfArchEntry.of(Collections.singletonList("Exaone4ForCausalLM"), HfArchResolver.of(Arch.EXAONE4),
                                 HfDenseClassicHooksB::exaone4Meta, HfTensorHook.DEFAULT,
@@ -111,13 +112,13 @@ final class HfArchTableDenseClassic {
                 HfArchEntry.of(Collections.singletonList("GlmOcrForConditionalGeneration"),
                                 HfArchResolver.of(Arch.GLM4), HfDenseClassicHooksC::glmOcrMeta,
                                 HfDenseClassicHooksC::glm4Tensors, HfArchTableDenseClassic::glm4Vocab),
-                // ---- HK-0: GraniteModel
+                // ---- GraniteModel
                 HfArchEntry.of(Collections.singletonList("GraniteForCausalLM"), HfArchResolver.of(Arch.GRANITE),
                                 HfGraniteHooks::meta, HfLlamaHooks::tensors, HfLlamaHooks::vocab)
                         .withConfigFixup(HfLlamaHooks::fixup)
                         .withNameFilter(HfGraniteHooks.FILTER)
                         .withExtra(HfLlamaHooks::extra),
-                // GraniteSwitchModel composes the HK-0 GraniteMoe hooks over the switch adapters (granite.py:238).
+                // GraniteSwitchModel composes the GraniteMoe hooks over the switch adapters (granite.py:238).
                 HfArchEntry.of(Collections.singletonList("GraniteSwitchForCausalLM"),
                                 HfArchResolver.of(Arch.GRANITE_SWITCH), HfDenseClassicHooksF::graniteSwitchMeta,
                                 HfDenseClassicHooksF::graniteSwitchTensors, HfLlamaHooks::vocab)
@@ -156,7 +157,9 @@ final class HfArchTableDenseClassic {
                 HfArchEntry.of(Collections.singletonList("NemotronForCausalLM"), HfArchResolver.of(Arch.NEMOTRON),
                                 HfDenseClassicHooksD::nemotronMeta, HfDenseClassicHooksD::nemotronTensors,
                                 HfDenseClassicHooksD::nemotronVocab),
-                HfArchEntry.of(Collections.singletonList("MuseGlimmerForConditionalGeneration"),
+                // vLLM serves MuseGlimmerForConditionalGeneration and its text-only MuseGlimmerForCausalLM with
+                // one class (muse_glimmer.py).
+                HfArchEntry.of(Arrays.asList("MuseGlimmerForConditionalGeneration", "MuseGlimmerForCausalLM"),
                                 HfArchResolver.of(Arch.MUSE_GLIMMER), HfArchTableDenseClassic::museGlimmerMeta,
                                 HfDenseClassicHooksD::museGlimmerTensors, HfDenseClassicHooksD::museGlimmerVocab),
                 // ---- part E: Mpt … Xverse

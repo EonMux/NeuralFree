@@ -1,0 +1,7 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# The convolutional vision encoders: the depthwise 2D convolution and the average pool of the yasa2
+# ConvNeXt and the gemma3nv MobileNetV5, and the DeepSeek-OCR SAM relative-position attention
+# (kernels/llm/vision.cl).
+LLM_Conv2dDepthwise	conv2d_depthwise.comp
+LLM_Pool2dAvg	pool_2d_avg.comp
+LLM_RelPosAttn	rel_pos_attn.comp		sg

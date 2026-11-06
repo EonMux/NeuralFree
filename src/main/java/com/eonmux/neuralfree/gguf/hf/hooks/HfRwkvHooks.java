@@ -15,7 +15,6 @@ import com.eonmux.neuralfree.gguf.hf.tensor.RowTransforms;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
-import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfChatTemplates;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfVocabWriters;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.PreNameResolver;
@@ -78,6 +77,8 @@ public final class HfRwkvHooks {
     private static final String LERP_STATE = "rwkv.lerpParts";
     private static final String TRANSPOSE_STATE = "rwkv7.loraTranspose";
     private static final String WEIGHT = ".weight";
+    /** Converter tensor name ({@code MODEL_TENSOR}) of the fused token-shift lerp weights. */
+    private static final String TIME_MIX_LERP_FUSED = "TIME_MIX_LERP_FUSED";
 
     private HfRwkvHooks() {
     }
@@ -338,8 +339,10 @@ public final class HfRwkvHooks {
             }
             List<RowSource> stack = lerp.ordered(bid, RWKV6_LERP);
             lerp.clear(bid);
-            out.add(ctx.names().ggufName(TensorNames.TIME_MIX_LERP_FUSED, bid, WEIGHT),
-                    RowTransforms.concatRows(stack));
+            // torch.stack([w.unsqueeze(0) for w in squeezed], dim=0).unsqueeze(1): [5, 1, 1, n_embd] (rwkv.py:79)
+            long inner = innerTotal(stack.get(0));
+            out.add(ctx.names().ggufName(TIME_MIX_LERP_FUSED, bid, WEIGHT),
+                    stacked(stack, 1, 1, inner));
             return true;
         }
     }
@@ -425,8 +428,8 @@ public final class HfRwkvHooks {
                 }
                 List<RowSource> stack = lerp.ordered(bid, groups);
                 lerp.clear(bid);
-                out.add(ctx.names().ggufName(TensorNames.TIME_MIX_LERP_FUSED, bid, WEIGHT),
-                        RowTransforms.concatRows(stack));
+                // torch.stack of the unsqueezed x_<g> tensors, dim 0 (rwkv.py:235)
+                out.add(ctx.names().ggufName(TIME_MIX_LERP_FUSED, bid, WEIGHT), stacked(stack, src.shape()));
             }
             return;
         }
@@ -440,7 +443,22 @@ public final class HfRwkvHooks {
         long inner = innerTotal(src) / nRows;
         RowSource fused = ElementTransforms.reshape(src, nRows, 1, 1, inner);
         int bid = HfHookSupport.layerOf(name);
-        out.add(ctx.names().ggufName(TensorNames.TIME_MIX_LERP_FUSED, bid, WEIGHT), fused);
+        out.add(ctx.names().ggufName(TIME_MIX_LERP_FUSED, bid, WEIGHT), fused);
+    }
+
+    /**
+     * {@code torch.stack(parts, dim=0)} of equally shaped parts whose own shape is {@code partShape}: the parts'
+     * elements in order, shaped {@code [parts.size(), partShape...]}.
+     */
+    private static RowSource stacked(List<RowSource> parts, long... partShape) {
+        List<RowSource> flat = new ArrayList<>(parts.size());
+        for (RowSource p : parts) {
+            flat.add(ElementTransforms.reshape(p, innerTotal(p)));
+        }
+        long[] shape = new long[partShape.length + 1];
+        shape[0] = parts.size();
+        System.arraycopy(partShape, 0, shape, 1, partShape.length);
+        return ElementTransforms.reshape(RowTransforms.concatRows(flat), shape);
     }
 
     /** The element count of {@code src}. */

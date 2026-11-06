@@ -1,4 +1,4 @@
-/* matvec_iq4_xs.cl - IQ4_XS matvec, fused gate/up, logits, batch matmul and embedding kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/quant_blocks.h */
+/* matvec_iq4_xs.cl - IQ4_XS matvec, fused gate/up, logits, batch matmul, embedding and Q8_1-activation matvec kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/quant_blocks.h, common/q8_dot.h, common/quant_decode_legacy_q8.h, common/matvec_family.h */
 /*
  * IQ4_XS super-block (ggml block_iq4_xs, 256 elements, 136 bytes): d (f16) at 0, scales_h (u16) at 2,
  * scales_l[4] at 4, qs[128] at 8. Sub-block sb (32 elements) has scale iq4xs_sub_scale(bp, sb) =
@@ -232,3 +232,6 @@ NF_KERNEL void IQ4_XS_BatchMatMul_2D(
                                input + (nf_i64)s * in_dim, nsb));
     if (get_local_id(0) == 0) output[(nf_i64)s * out_dim + row] = acc;
 }
+
+/* Q8_1-activation forms (integer dots over the split nibble layout, common/quant_decode_legacy_q8.h). */
+IQ_ALL_KERNELS_Q8(IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BLOCK_BYTES, IQ4_XS_THREADS_PER_SUPER)

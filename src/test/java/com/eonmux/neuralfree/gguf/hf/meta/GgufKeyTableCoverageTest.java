@@ -26,8 +26,9 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The key registry and the key table agree: every {@link GgufKeys} constant the Hugging Face path uses has a type,
- * every key of {@code gguf_keys.tsv} has a constant, and every alias row is typed as the key table types its key.
+ * The key registry and the key table agree: every {@link GgufKeys} key the Hugging Face path uses has a type (and
+ * every key namespace it uses, such as {@code tokenizer.}, prefixes typed keys), every key of {@code gguf_keys.tsv}
+ * has a constant, and every alias row is typed as the key table types its key.
  */
 public class GgufKeyTableCoverageTest {
 
@@ -77,7 +78,11 @@ public class GgufKeyTableCoverageTest {
         for (String name : used) {
             String value = constants.get(name);
             assertNotNull("GgufKeys." + name + " is not a public String constant", value);
-            if (GgufKeyTable.type(value) == null) {
+            if (value.endsWith(".")) {
+                // a key namespace such as "tokenizer.", never a key itself: it must prefix typed keys
+                assertTrue("GgufKeys." + name + " = " + value + " prefixes no typed key",
+                        GgufKeyTable.templates().stream().anyMatch(t -> t.startsWith(value)));
+            } else if (GgufKeyTable.type(value) == null) {
                 untyped.add(name + " = " + value);
             }
         }
@@ -106,7 +111,7 @@ public class GgufKeyTableCoverageTest {
                 missing.add(tsv + " (" + javaTemplate(tsv) + ")");
             }
         }
-        assertEquals(389, rows);
+        assertEquals(453, rows);
         assertEquals("gguf_keys.tsv keys without a GgufKeys constant", new ArrayList<String>(), missing);
     }
 
@@ -133,7 +138,7 @@ public class GgufKeyTableCoverageTest {
 
     @Test
     public void aliasRowsAreTypedAsTheirKeys() {
-        assertEquals(43, HfHparamAliases.rows().size());
+        assertEquals(51, HfHparamAliases.rows().size());
         int writes = 0;
         for (HfHparamAliases.Row r : HfHparamAliases.rows()) {
             if (r.template() != null) {
@@ -143,6 +148,6 @@ public class GgufKeyTableCoverageTest {
                 assertEquals(r.toString(), t.toString(), r.type().toString());
             }
         }
-        assertEquals(32, writes);
+        assertEquals(39, writes);
     }
 }

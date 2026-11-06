@@ -27,7 +27,7 @@ import java.util.Map;
 import java.util.function.UnaryOperator;
 
 /**
- * Hooks of the llama.cpp classic-dense converter classes of Appendix A table HK-D1, part A: {@code BaichuanModel}
+ * Hooks of the llama.cpp classic-dense converter classes, part A: {@code BaichuanModel}
  * (LC/conversion/baichuan.py:13-60), {@code BitnetModel} (bitnet.py:13-50), {@code BloomModel} (bloom.py:17-68),
  * {@code ChameleonModel} (chameleon.py:17-60), {@code ChatGLMModel} (chatglm.py:13-168) and {@code CodeShellModel}
  * (codeshell.py:8-22). {@code CogVLMModel} (cogvlm.py:34) overrides no method and the table registers it on the

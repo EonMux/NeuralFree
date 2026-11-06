@@ -100,7 +100,9 @@ public final class SingleSequenceMemoryTest {
         // drop from position p to the end
         assertNull(sequences.removeRefusal(0, 3, -1));
         sequences.remove(0, 3, -1);
-        assertEquals(2, sequences.sequence(0).nPast()); // positions [3, posMax] dropped: 5 - 3 = 2 rollbacks
+        // positions [3, posMax] dropped: 5 - 3 = 2 rollbacks, positions [0, 3) kept
+        assertEquals(3, sequences.sequence(0).nPast());
+        assertEquals(2, sequences.posMax(0));
         assertEquals(2, memory.rollbacks.get());
         // dropping the whole range is a reset
         assertNull(sequences.removeRefusal(0, 0, -1));
@@ -132,6 +134,8 @@ public final class SingleSequenceMemoryTest {
         assertThrows(UnsupportedOperationException.class, () -> sequences.copy(0, 0, 0, -1));
         assertTrue(sequences.shiftRefusal(), sequences.shiftRefusal().contains("shiftContext"));
         assertThrows(UnsupportedOperationException.class, () -> sequences.add(0, 2, -1, -3));
+        assertTrue(sequences.divRefusal(), sequences.divRefusal().contains("paged memory"));
+        assertThrows(UnsupportedOperationException.class, () -> sequences.div(0, 0, -1, 2));
     }
 
     @Test

@@ -1,0 +1,39 @@
+/* moe_zero_experts.comp - LLM_MoE_ZeroExperts: takes LongCat-Flash's identity experts out of a routing result.
+ * GLSL twin of LLM_MoE_ZeroExperts in kernels/llm/moe.cl. Requires: common/nf_common.glsl.
+ *
+ *     LLM_MoE_ZeroExperts	moe_zero_experts.comp
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i k, i n_real_experts, W int ids, W float weights, W float zero_weights)
+ *   A slot whose id is >= n_real_experts selects no expert FFN: its weight joins the token's zero_weights and the
+ *   slot becomes id 0 weight 0, so the expert kernels never see it (vLLM router/zero_expert_router.py:86-95).
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n_tokens rounded up to L (folding-aware).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) buffer NfMzIds { int ids[]; };
+layout(std430, binding = 1) buffer NfMzWeights { float weights[]; };
+layout(std430, binding = 2) writeonly buffer NfMzZero { float zero_weights[]; };
+layout(push_constant) uniform NfMzParams { int n_tokens; int k; int n_real_experts; } pc;
+
+void main() {
+    const uint t = nf_global_id();
+    if (t >= uint(pc.n_tokens)) {
+        return;
+    }
+    const uint k = uint(pc.k);
+    float zero = 0.0;
+    for (uint j = 0u; j < k; ++j) {
+        const uint p = t * k + j;
+        if (ids[p] >= pc.n_real_experts) {
+            zero += weights[p];
+            ids[p] = 0;
+            weights[p] = 0.0;
+        }
+    }
+    zero_weights[t] = zero;
+}

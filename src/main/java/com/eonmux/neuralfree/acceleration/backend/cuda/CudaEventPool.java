@@ -28,6 +28,7 @@ public final class CudaEventPool implements AutoCloseable {
     private static final Logger LOGGER = LoggingUtil.getLogger(CudaEventPool.class);
 
     private final CudaContext context;
+    private final int flags;
     private final ArrayDeque<CUevent> free = new ArrayDeque<>();
     private final Set<CUevent> created = Collections.newSetFromMap(new IdentityHashMap<>());
     private boolean closed;
@@ -36,10 +37,20 @@ public final class CudaEventPool implements AutoCloseable {
      * @throws IllegalArgumentException when {@code context} is null
      */
     public CudaEventPool(CudaContext context) {
+        this(context, false);
+    }
+
+    /**
+     * @param timingEnabled true for events {@code cuEventElapsedTime} works on; the default pool
+     *                      trades the timing counters for a cheaper record
+     * @throws IllegalArgumentException when {@code context} is null
+     */
+    public CudaEventPool(CudaContext context, boolean timingEnabled) {
         if (context == null) {
             throw new IllegalArgumentException("CUDA context must not be null");
         }
         this.context = context;
+        this.flags = timingEnabled ? CUevent_flags.CU_EVENT_DEFAULT : CUevent_flags.CU_EVENT_DISABLE_TIMING;
     }
 
     /** Records a pooled event on {@code stream}; the event has no owning queue. */
@@ -71,8 +82,8 @@ public final class CudaEventPool implements AutoCloseable {
     }
 
     /**
-     * Takes an event from the free list, creating one ({@code CU_EVENT_DISABLE_TIMING}) when
-     * it is empty.
+     * Takes an event from the free list, creating one ({@code CU_EVENT_DISABLE_TIMING}, or
+     * {@code CU_EVENT_DEFAULT} on a timing-enabled pool) when it is empty.
      *
      * @throws IllegalStateException when the pool is closed
      * @throws RuntimeException      the translated driver failure of {@code cuEventCreate}
@@ -87,7 +98,7 @@ public final class CudaEventPool implements AutoCloseable {
         }
         context.makeCurrent();
         CUevent event = new CUevent();
-        CudaErrors.check("cuEventCreate", () -> cuEventCreate(event, CUevent_flags.CU_EVENT_DISABLE_TIMING));
+        CudaErrors.check("cuEventCreate", () -> cuEventCreate(event, flags));
         synchronized (this) {
             if (closed) {
                 destroyAfterClose(event);
@@ -132,14 +143,19 @@ public final class CudaEventPool implements AutoCloseable {
     @Override
     public void close() {
         CUevent[] all;
+        int outstanding;
         synchronized (this) {
             if (closed) {
                 return;
             }
             closed = true;
+            outstanding = created.size() - free.size();
             all = created.toArray(new CUevent[0]);
             created.clear();
             free.clear();
+        }
+        if (outstanding > 0) {
+            LOGGER.warn("Releasing {} event(s) left open by callers of the CUDA backend at close", outstanding);
         }
         if (all.length == 0) {
             return;

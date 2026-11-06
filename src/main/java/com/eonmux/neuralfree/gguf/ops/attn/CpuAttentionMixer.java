@@ -2,36 +2,53 @@ package com.eonmux.neuralfree.gguf.ops.attn;
 
 import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.AttnGateKind;
+import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.arch.QkNormKind;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
+import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixer;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuScratch;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuInt8Fusion;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
+import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
+import com.eonmux.neuralfree.gguf.memory.KvWindow;
+import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.RotationPlan;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.HeapModelMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
+import com.eonmux.neuralfree.gguf.memory.cpu.KvInt8Rows;
+import com.eonmux.neuralfree.gguf.memory.cpu.RecurrentStateAccessor;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.ops.encdec.T5RelativeBias;
+import com.eonmux.neuralfree.gguf.ops.ssm.CpuSsmConv;
+import com.eonmux.neuralfree.gguf.ops.act.ActMath;
+import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
 import com.eonmux.neuralfree.gguf.ops.rope.CpuRope;
+import com.eonmux.neuralfree.gguf.ops.rope.DualChunkRope;
+import com.eonmux.neuralfree.gguf.ops.rope.FopeWeights;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeFreqTable;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeKernels;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
+import com.eonmux.neuralfree.gguf.spec.DualChunkSpec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
+import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
+import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
+import com.eonmux.neuralfree.gguf.spec.resolve.TensorClaims;
 
 import java.util.Arrays;
 import java.util.Objects;
@@ -53,15 +70,31 @@ import java.util.function.IntUnaryOperator;
  * <p>Every projection adds the {@link CpuProjectionDeltas} registered on it (LoRA) right after its base product and
  * before its bias, as {@link GpuAttentionMixer} does.</p>
  *
+ * <p>Over paged memory a batched step may hold one segment per sequence (a cross-sequence ubatch): every segment
+ * stores its rows through the step's cells and attends through its sequence's page-table slice only, the unified
+ * multi-sequence ubatch of llama.cpp (src/llama-kv-cache.cpp:761).</p>
+ *
  * <p>Working arrays are the {@code Q}, {@code K}, {@code V} and {@code ATTN_OUT} slots plus {@code attn.*}
  * temporaries reserved at bind for the ubatch; a step allocates no per-token arrays. Not thread-safe.</p>
  */
 public final class CpuAttentionMixer implements CpuMixer {
 
     private static final String T_QKV = "attn.qkv";
+    private static final String T_QLAT = "attn.qlat";
     private static final String T_QGATE = "attn.qgate";
     private static final String T_GATE = "attn.gate";
     private static final String T_SHIFT = "attn.shift";
+    private static final String T_VE = "attn.ve";
+    private static final String T_VE_GATE = "attn.ve_gate";
+    private static final String T_ADAPTER = "attn.adapter_rank";
+    private static final String T_ADAPTER_OUT = "attn.adapter_out";
+    private static final String T_REL_OUT = "attn.rel_out";
+    private static final String T_REL_TABLE = "attn.rel_table";
+    private static final String T_CONV = "attn.sconv";
+    private static final String T_DUAL = "attn.dual";
+    private static final String T_LOOP_GATE = "attn.loop_gate";
+    /** Elements per parallel task of the element-wise loops. */
+    private static final int ELEMENT_GRAIN = 1 << 15;
 
     private CpuForwardContext ctx;
     private CpuScratch scratch;
@@ -74,11 +107,19 @@ public final class CpuAttentionMixer implements CpuMixer {
     private boolean closed;
 
     private CpuTensorRef wq;
+    private CpuTensorRef wqUp;
     private CpuTensorRef wk;
     private CpuTensorRef wv;
     private CpuTensorRef wqkv;
     private CpuTensorRef wgate;
     private CpuTensorRef wo;
+    /** Per-use Q/K/V adapters of a shared attention block (Zamba2); null without them. */
+    private CpuTensorRef wqAdapterA;
+    private CpuTensorRef wqAdapterB;
+    private CpuTensorRef wkAdapterA;
+    private CpuTensorRef wkAdapterB;
+    private CpuTensorRef wvAdapterA;
+    private CpuTensorRef wvAdapterB;
     private float[] qkvBias;
     private float[] qBias;
     private float[] kBias;
@@ -96,10 +137,12 @@ public final class CpuAttentionMixer implements CpuMixer {
     private CpuValueExperts valueExperts;
 
     private NormStep qNorm;
+    private NormStep qLatentNorm;
     private NormStep kNorm;
     private NormStep vNorm;
     private NormStep subNorm;
     private NormStep outHeadNorm;
+    private NormStep outNormStep;
     private RopeFreqTable ropeTable;
     private RopeFreqTable shiftTable;
     private int gateWidth;
@@ -107,10 +150,63 @@ public final class CpuAttentionMixer implements CpuMixer {
 
     private KvAccessor kv;
     private IntUnaryOperator rowPos;
+    /** Raw int8 view of the layer's cache when the fused int8 attention serves it; null otherwise. */
+    private KvInt8Rows int8Kv;
+    private HostKvAttention hostKvAttention;
+    private KvAccessor dualKv;
+    private IntUnaryOperator dualRowPos;
+    private HostKvAttention dualAttention;
+    private CpuAttentionCore.Params localParams;
+    private CpuAttentionCore.Params localNonCausalParams;
+    private float[] loopGateW;
+    private float[] loopGateB;
     private CpuQuantizedKvRotation rotation;
+    /** The K/V half of {@link #rotation}, for the cache-write-only step. */
+    private CpuQuantizedKvRotation storeRotation;
     private int shiftRotK;
     private CpuAttentionCore.Params params;
+    private CpuAttentionCore.Params nonCausalParams;
+
+    /** Dual-chunk attention of the layer (Qwen2.5-1M), or null. */
+    private DualChunkSpec dualChunk;
+    /** Five query-rotation position arrays for one step, {@code [5][ubatch]}. */
+    private int[] dcPositions;
+    private float[] dcScratchOut;
+    private float[] dcScratchLse;
+    private float[] dcMergeLse;
     private PagedStep pagedStep;
+    private CpuTensorRef valueEmbd;
+    private CpuTensorRef veGateW;
+    private float[] xsaAlpha;
+    private int nEmbd;
+    /** Per-KV-head FP8 cache scales of the layer's cache, null without an FP8 cache ({@link #bindKvScales}). */
+    private float[] kScale;
+    private float[] vScale;
+    /** Normalized static sink keys and values of the openPangu sink attention; null without sink tokens. */
+    private float[] sinkK;
+    private float[] sinkV;
+    /** Scratch the {@link #pagedPageTable} slice of one segment's sequence is built in. */
+    private int[] pagedSlice;
+
+    /** Inkling's query-side relative projection and the short convolutions of the K/V streams. */
+    private boolean inkling;
+    private CpuTensorRef wr;
+    private CpuProjectionDeltas.Site rSite;
+    private float[] rBias;
+    private int relDim;
+    private int relExtent;
+    private int logFloor;
+    private float logAlpha;
+    /** The shared {@code [dRel][relExtent]} relative projection. */
+    private float[] relProj;
+    private float[] relOut;
+    private float[] relTable;
+    private float[] convKw;
+    private float[] convKvWeight;
+    private float[] convTmp;
+    private float[] convState;
+    private int convRow;
+    private int stateSlots;
 
     /** An unbound mixer; {@link #bind} reads the layer's attention spec. */
     public CpuAttentionMixer() {
@@ -133,6 +229,7 @@ public final class CpuAttentionMixer implements CpuMixer {
         this.scratch = ctx.scratch();
         this.matVec = ctx.matVec();
         this.ubatch = scratch.ubatch();
+        this.nEmbd = ctx.spec().hparams().nEmbd();
         CpuWeights w = ctx.weights();
         this.proj = QkvProjection.of(layer, s -> w.layerOrNull(layer, s) != null, ctx.spec().arch());
         this.spec = layer.attention();
@@ -146,7 +243,7 @@ public final class CpuAttentionMixer implements CpuMixer {
     }
 
     private void bindAttention(CpuWeights w) {
-        requireSlot(CpuScratch.Q, (long) ubatch * spec.qDim());
+        requireSlot(CpuScratch.Q, (long) ubatch * spec.qRopeDim());
         requireSlot(CpuScratch.ATTN_OUT, (long) ubatch * spec.outDim());
         if (proj.projectsKv()) {
             requireSlot(CpuScratch.K, (long) ubatch * spec.kDim());
@@ -160,6 +257,33 @@ public final class CpuAttentionMixer implements CpuMixer {
         bindProjections(w);
         bindNorms(w);
         bindRope(w);
+        if (spec.valueEmbeddings()) {
+            valueEmbd = w.get(TensorNames.weight(TensorNames.VALUE_EMBD));
+            if (valueEmbd == null) {
+                throw new MissingTensorException(ctx.spec().arch().ggufName(),
+                        layer.il(), TensorNames.weight(TensorNames.VALUE_EMBD));
+            }
+            if (valueEmbd.cols() != spec.vDim()) {
+                throw new IllegalArgumentException("layer " + layer.il() + ": " + TensorNames.weight(TensorNames.VALUE_EMBD)
+                        + " holds rows of " + valueEmbd.cols() + " values, V is " + spec.vDim() + " wide");
+            }
+            if (spec.valueEmbeddingGate()) {
+                veGateW = w.layer(layer, TensorNames.weight(TensorNames.ATTN_VE_GATE));
+                if (veGateW.cols() != nEmbd || veGateW.rows() != spec.nHeadKv()) {
+                    throw new IllegalArgumentException("layer " + layer.il() + ": "
+                            + TensorNames.weight(TensorNames.ATTN_VE_GATE) + " must be [" + nEmbd
+                            + ", " + spec.nHeadKv() + "]");
+                }
+            }
+        }
+        if (spec.xsaEps() > 0f) {
+            xsaAlpha = w.layerFloatsOrNull(layer, TensorNames.weight(TensorNames.ATTN_XSA_ALPHA));
+            if (xsaAlpha == null || xsaAlpha.length != spec.nHead()) {
+                throw new IllegalArgumentException("layer " + layer.il() + ": "
+                        + TensorNames.weight(TensorNames.ATTN_XSA_ALPHA) + " must hold " + spec.nHead() + " values, got "
+                        + (xsaAlpha == null ? 0 : xsaAlpha.length));
+            }
+        }
         if (spec.usesMemory()) {
             if (!ctx.hasMemory()) {
                 throw new IllegalStateException("layer " + layer.il() + " attends through a KV cache but the model "
@@ -176,10 +300,90 @@ public final class CpuAttentionMixer implements CpuMixer {
             RotationPlan rot = memory.plan().layer(kv.layer()).rotation();
             rotation = CpuQuantizedKvRotation.of(rot, spec.qDim(), proj.projectsKv() ? spec.kDim() : 0,
                     proj.projectsKv() ? spec.vDim() : 0, spec.outDim());
-            shiftRotK = kv.layout().dtypeK().quantized() && rot.rotateK() ? rot.nRotK() : 0;
+            storeRotation = proj.projectsKv()
+                    ? CpuQuantizedKvRotation.forStore(rot, spec.kDim(), spec.vDim()) : null;
+             shiftRotK = kv.layout().dtypeK().quantized() && rot.rotateK() ? rot.nRotK() : 0;
         }
-        params = CpuAttentionCore.Params.of(spec, sinks(w), relBias(w));
+        if (kv != null) {
+            bindKvScales(w, kv.layout());
+            int8Kv = CpuInt8Fusion.enabled() ? kv.int8Rows() : null;
+            hostKvAttention = new HostKvAttention(kv, rowPos, spec.qDim(), spec.kDim(), spec.vDim(), spec.outDim(),
+                    spec.headDimK(), spec.headDimV(), kScale, vScale, int8Kv);
+        }
+        bindStaticSinks(w);
+        if (layer.mixerKind() == MixerKind.INKLING) {
+            bindInkling(w);
+        }
+        params = CpuAttentionCore.Params.of(spec, sinks(w), relBias(w), kScale, vScale, sinkK, sinkV);
+        nonCausalParams = params.nonCausal();
+        bindDualChunk();
+        bindDualAttention(w);
         bindOutput(w);
+    }
+
+    /**
+     * Allocates the dual-chunk workforce of the layer: the five query planes live in the widened {@code Q} slot, and
+     * a chunk never holds more than {@code min(ubatch, chunkLength)} rows, which bounds the per-stage scratch.
+     */
+    private void bindDualChunk() {
+        dualChunk = spec.dualChunk();
+        if (dualChunk == null) {
+            return;
+        }
+        if (kv == null) {
+            throw new IllegalStateException("layer " + layer.il() + " runs dual-chunk attention without a KV cache");
+        }
+        int rows = Math.min(ubatch, dualChunk.chunkLength());
+        dcPositions = new int[DualChunkRope.VARIANTS * ubatch];
+        dcScratchOut = new float[rows * spec.outDim()];
+        dcScratchLse = new float[rows * spec.nHead()];
+        dcMergeLse = new float[rows * spec.nHead()];
+    }
+
+    /**
+     * Loads the per-KV-head FP8 cache scales of the layer's cache from {@code blk.N.attn_k.kv_scale} /
+     * {@code blk.N.attn_v.kv_scale} (a {@code [1]} scale repeated), or null when the cache dtype is not
+     * checkpoint-scaled (an FP8 type or NVFP4): vLLM consumes the checkpoint scales of an FP8 cache only and
+     * enforces 1.0 for every other (vllm/model_executor/layers/quantization/kv_cache.py
+     * process_weights_after_loading). No tensor with such a cache scales by 1.0, as vLLM does; NVFP4 follows the
+     * same store/attention rule (vllm csrc/nvfp4_kv_cache_kernels.cu takes the checkpoint scale as its global
+     * scale).
+     *
+     * @throws IllegalArgumentException when a scale tensor holds other than 1 or {@code n_head_kv} values or a
+     *                                 non-finite or non-positive value
+     */
+    private void bindKvScales(CpuWeights w, KvLayout layout) {
+        this.kScale = kvScaleValues(w, TensorNames.ATTN_K + "." + TensorClaims.KV_SCALE, layout.dtypeK());
+        this.vScale = kvScaleValues(w, TensorNames.ATTN_V + "." + TensorClaims.KV_SCALE, layout.dtypeV());
+    }
+
+    /** The scale values of {@code suffix}, or null without a checkpoint-scaled cache or without the tensor. */
+    private float[] kvScaleValues(CpuWeights w, String suffix, KvDType type) {
+        if (!type.checkpointScaled()) {
+            return null;
+        }
+        float[] v = w.layerFloatsOrNull(layer, suffix);
+        if (v == null) {
+            float[] ones = new float[spec.nHeadKv()];
+            Arrays.fill(ones, 1.0f);
+            return ones;
+        }
+        if (v.length != 1 && v.length != spec.nHeadKv()) {
+            throw new IllegalArgumentException("layer " + layer.il() + ": " + suffix + " holds " + v.length
+                    + " values; a KV-cache scale holds 1 or " + spec.nHeadKv() + " (one per KV head)");
+        }
+        for (float value : v) {
+            if (!Float.isFinite(value) || value <= 0f) {
+                throw new IllegalArgumentException("layer " + layer.il() + ": " + suffix + " holds " + value
+                        + "; KV-cache scales must be finite and positive");
+            }
+        }
+        if (v.length == spec.nHeadKv()) {
+            return v;
+        }
+        float[] out = new float[spec.nHeadKv()];
+        Arrays.fill(out, v[0]);
+        return out;
     }
 
     private void checkCache(KvLayout layout) {
@@ -209,6 +413,17 @@ public final class CpuAttentionMixer implements CpuMixer {
             wq = w.layer(layer, proj.qWeight());
             QkvProjection.checkShape(proj.qWeight(), wq.cols(), wq.rows(), wq.cols(), qw);
             qSite = serveDeltas(proj.qWeight(), wq);
+            if (proj.qLatentDim() > 0) {
+                wqUp = w.layer(layer, proj.qUpWeight());
+                QkvProjection.checkShape(proj.qUpWeight(), wqUp.cols(), wqUp.rows(), proj.qLatentDim(), spec.qDim());
+                float[] qn = w.layerFloatsOrNull(layer, proj.qNormWeight());
+                if (qn == null || qn.length != proj.qLatentDim()) {
+                    throw new IllegalArgumentException("layer " + layer.il() + ": " + proj.qNormWeight()
+                            + " must hold " + proj.qLatentDim() + " values, got " + (qn == null ? 0 : qn.length));
+                }
+                qLatentNorm = new NormStep(NormKind.RMS, rmsEps(), 1, proj.qLatentDim(), qn, null, 1);
+                scratch.temp(T_QLAT, ubatch * proj.qLatentDim());
+            }
             if (proj.projectsKv()) {
                 wk = w.layer(layer, proj.kWeight());
                 QkvProjection.checkShape(proj.kWeight(), wk.cols(), wk.rows(), wq.cols(), spec.kDim());
@@ -247,6 +462,59 @@ public final class CpuAttentionMixer implements CpuMixer {
             gateSite = serveDeltas(proj.gateWeight(), wgate);
             scratch.temp(T_GATE, ubatch * gateWidth);
         }
+        bindAdapters(w);
+    }
+
+    /**
+     * The per-use Q/K/V adapters of a shared attention block: {@code blk.<qkvAdapterLayer>.attn_{q,k,v}_adapter_a}
+     * maps the block input to the adapter rank and {@code _b} back to the projection width; their product is added
+     * to the base projections before RoPE (vLLM {@code Zamba2LoRA}).
+     *
+     * @throws IllegalArgumentException when an adapter has the wrong shape
+     */
+    private void bindAdapters(CpuWeights w) {
+        int rank = spec.qkvAdapterRank();
+        if (rank <= 0) {
+            return;
+        }
+        int il = spec.qkvAdapterLayer();
+        int in = (int) wq.cols();
+        wqAdapterA = adapter(w, il, "attn_q_adapter_a", in, rank);
+        wqAdapterB = adapter(w, il, "attn_q_adapter_b", rank, spec.qDim());
+        wkAdapterA = adapter(w, il, "attn_k_adapter_a", in, rank);
+        wkAdapterB = adapter(w, il, "attn_k_adapter_b", rank, spec.kDim());
+        wvAdapterA = adapter(w, il, "attn_v_adapter_a", in, rank);
+        wvAdapterB = adapter(w, il, "attn_v_adapter_b", rank, spec.vDim());
+        scratch.temp(T_ADAPTER, ubatch * rank);
+    }
+
+    private CpuTensorRef adapter(CpuWeights w, int il, String base, long cols, long rows) {
+        CpuTensorRef a = w.layer(il, TensorNames.weight(base));
+        QkvProjection.checkShape(a.toString(), a.cols(), a.rows(), cols, rows);
+        return a;
+    }
+
+    /** Adds the per-use adapter products to the projected Q, K and V rows of the step. */
+    private void applyAdapters(int n, float[] in, float[] q, float[] k, float[] v) {
+        if (wqAdapterA == null) {
+            return;
+        }
+        if (q != null) {
+            applyAdapter(wqAdapterA, wqAdapterB, n, in, q, spec.qDim());
+        }
+        if (k != null) {
+            applyAdapter(wkAdapterA, wkAdapterB, n, in, k, spec.kDim());
+            applyAdapter(wvAdapterA, wvAdapterB, n, in, v, spec.vDim());
+        }
+    }
+
+    private void applyAdapter(CpuTensorRef a, CpuTensorRef b, int n, float[] in, float[] target, int width) {
+        int rank = spec.qkvAdapterRank();
+        float[] rankRows = scratch.temp(T_ADAPTER, ubatch * rank);
+        matVec.matmul(a, in, 0, rankRows, 0, n);
+        float[] delta = scratch.temp(T_ADAPTER_OUT, ubatch * width);
+        matVec.matmul(b, rankRows, 0, delta, 0, n);
+        CpuOps.add(target, 0, delta, 0, target, 0, n * width);
     }
 
     private void bindNorms(CpuWeights w) {
@@ -311,11 +579,61 @@ public final class CpuAttentionMixer implements CpuMixer {
         if (rope == null || spec.noRope() || rope.type() == RopeType.NONE) {
             return;
         }
+        if (spec.hasDualChunk()) {
+            ropeTable = RopeFreqTable.forDualChunk(rope);
+            return;
+        }
         float[] ff = rope.freqFactors() != null ? w.floats(rope.freqFactors()) : null;
-        ropeTable = RopeFreqTable.of(rope, ff);
+        FopeWeights fope = null;
+        if (rope.fope() != null) {
+            fope = FopeWeights.of(rope.fope(), w.floats(rope.fope().cosCoef()), w.floats(rope.fope().sinCoef()));
+        }
+        ropeTable = RopeFreqTable.of(rope, ff, fope);
         if (spec.usesMemory() && !spec.sharesKv(layer.il()) && GpuContextShift.refusal(ctx.spec(), layer) == null) {
             shiftTable = RopeFreqTable.forShift(rope, ff);
         }
+    }
+
+    /**
+     * Binds the gated mixed attention of IQuestLoopCoder: the first pass's cache of the same block layer, read
+     * read-only over a full causal window, its own cache over a sliding window, and the per-head gate projection.
+     */
+    private void bindDualAttention(CpuWeights w) {
+        if (!spec.dual()) {
+            return;
+        }
+        if (kv == null) {
+            throw new IllegalStateException("layer " + layer.il() + " mixes two attentions but owns no KV cache");
+        }
+        CpuMemory memory = ctx.memory();
+        dualKv = memory.kv(spec.dualReadLayer());
+        if (dualKv == null) {
+            throw new IllegalStateException("layer " + layer.il() + " reads the cache of layer "
+                    + spec.dualReadLayer() + ", which the memory plan does not hold");
+        }
+        if (dualKv == kv) {
+            throw new IllegalStateException("layer " + layer.il() + " reads its own cache as the global attention");
+        }
+        checkCache(dualKv.layout());
+        final int group = dualKv.group();
+        dualRowPos = r -> memory.positionOfRow(group, r);
+        dualAttention = new HostKvAttention(dualKv, dualRowPos, spec.qDim(), 0, 0, spec.outDim(), spec.headDimK(),
+                spec.headDimV(), null, null);
+        KvWindow window = KvWindow.of(SwaType.STANDARD, spec.dualWindow(), true);
+        localParams = params.withWindow(window);
+        localNonCausalParams = nonCausalParams.withWindow(window);
+        String gateW = TensorNames.weight(TensorNames.ATTN_LOOP_GATE);
+        loopGateW = w.layerFloatsOrNull(layer, gateW);
+        if (loopGateW == null) {
+            throw new MissingTensorException(ctx.spec().arch().ggufName(), layer.il(), gateW);
+        }
+        QkvProjection.checkLength(gateW, loopGateW.length, (long) spec.nHead() * spec.headDimK());
+        String gateB = TensorNames.bias(TensorNames.ATTN_LOOP_GATE);
+        loopGateB = w.layerFloatsOrNull(layer, gateB);
+        if (loopGateB == null) {
+            throw new MissingTensorException(ctx.spec().arch().ggufName(), layer.il(), gateB);
+        }
+        QkvProjection.checkLength(gateB, loopGateB.length, spec.nHead());
     }
 
     private void bindOutput(CpuWeights w) {
@@ -324,6 +642,9 @@ public final class CpuAttentionMixer implements CpuMixer {
         }
         if (spec.gate() != AttnGateKind.NONE) {
             gateBias = vector(w, proj.gateBias(), spec.nHead());
+        }
+        if (spec.outNormKind() != null) {
+            outNormStep = new NormStep(spec.outNormKind(), spec.outNormEps(), 1, spec.outDim(), null, null, 1);
         }
         if (proj.subNormWeight() != null) {
             NormKind kind = layer.norm().kind();
@@ -346,11 +667,167 @@ public final class CpuAttentionMixer implements CpuMixer {
     }
 
     /**
+     * Loads the learned static sink tokens of the openPangu sink attention: the {@code [n_sink * n_head_kv,
+     * head_dim]} keys, normalized per KV head by the layer's K norm ({@code k_layernorm}) as vLLM's
+     * {@code OpenPanguSinkAttention.post_weight_load} does and left un-rotated, and the matching values (zeros when
+     * the checkpoint omits {@code attn_sink_v}, vLLM's non-persistent zero buffer).
+     *
+     * @throws MissingTensorException   when the sink keys are absent
+     * @throws IllegalArgumentException when a sink tensor has the wrong size or the K norm weight is not a head row
+     */
+    private void bindStaticSinks(CpuWeights w) {
+        int n = spec.sinkTokens();
+        if (n == 0) {
+            return;
+        }
+        int heads = spec.nHeadKv();
+        int dK = spec.headDimK();
+        int dV = spec.headDimV();
+        float[] rawKeys = w.layerFloatsOrNull(layer, TensorNames.weight(TensorNames.ATTN_SINK_K));
+        if (rawKeys == null) {
+            throw new MissingTensorException(ctx.spec().arch().ggufName(), layer.il(),
+                    TensorNames.weight(TensorNames.ATTN_SINK_K));
+        }
+        QkvProjection.checkLength(TensorNames.weight(TensorNames.ATTN_SINK_K), rawKeys.length,
+                (long) n * heads * dK);
+        float[] weight = w.layerFloatsOrNull(layer, TensorNames.weight(TensorNames.ATTN_K_NORM));
+        if (weight != null) {
+            QkvProjection.checkLength(TensorNames.weight(TensorNames.ATTN_K_NORM), weight.length, dK);
+        }
+        sinkK = new float[n * heads * dK];
+        NormMath.rowNorm(NormKind.RMS, rmsEps(), n * heads, dK, dK, 1, rawKeys, 0, weight, null, sinkK, 0);
+        float[] rawValues = w.layerFloatsOrNull(layer, TensorNames.weight(TensorNames.ATTN_SINK_V));
+        if (rawValues == null) {
+            sinkV = new float[n * heads * dV];
+        } else {
+            QkvProjection.checkLength(TensorNames.weight(TensorNames.ATTN_SINK_V), rawValues.length,
+                    (long) n * heads * dV);
+            sinkV = rawValues;
+        }
+    }
+
+    /**
      * The T5 relative-position bias table of the stack's bias layer ({@link T5RelativeBias#host}: F32
-     * {@code [n_buckets][n_head]}), or null without a T5 bias.
+     * {@code [n_buckets][n_head]}), or null without a T5 bias; the layer's relative-logit table for the Inkling bias
+     * mode, which {@link #projectRel} fills every step.
      */
     private float[] relBias(CpuWeights w) {
+        if (spec.biasMode() == AttentionSpec.BiasMode.INKLING) {
+            return relTable;
+        }
         return T5RelativeBias.uses(spec) ? T5RelativeBias.host(w, layer, spec) : null;
+    }
+
+    /**
+     * Inkling's query-side tensors: the {@code attn_rel} projection and its {@code [dRel][relExtent]} table, and the
+     * short-convolution kernels of the K and V streams with the layer's conv state (vLLM
+     * {@code InklingAttention.k_sconv}/{@code v_sconv} over the {@code conv_owner} cache).
+     *
+     * @throws IllegalArgumentException when a tensor's shape differs from the layer geometry
+     * @throws IllegalStateException    when the layer has no recurrent state for the convolutions
+     */
+    private void bindInkling(CpuWeights w) {
+        ModelHparams hp = ctx.spec().hparams();
+        inkling = true;
+        relDim = hp.inklingRelDim();
+        relExtent = spec.relBiasExtent();
+        logFloor = hp.inklingLogScalingFloor();
+        logAlpha = hp.inklingLogScalingAlpha();
+        long rWidth = (long) spec.nHead() * relDim;
+        wr = w.layer(layer, TensorNames.weight(TensorNames.ATTN_REL));
+        QkvProjection.checkShape(TensorNames.weight(TensorNames.ATTN_REL), wr.cols(), wr.rows(), nEmbd, rWidth);
+        rSite = serveDeltas(TensorNames.weight(TensorNames.ATTN_REL), wr);
+        rBias = w.layerOrNull(layer, TensorNames.bias(TensorNames.ATTN_REL)) != null
+                ? vector(w, TensorNames.bias(TensorNames.ATTN_REL), rWidth) : null;
+        relProj = w.layerFloatsOrNull(layer, TensorNames.weight(TensorNames.ATTN_REL_PROJ));
+        QkvProjection.checkLength(TensorNames.weight(TensorNames.ATTN_REL_PROJ),
+                relProj == null ? 0 : relProj.length, (long) relDim * relExtent);
+        relOut = scratch.temp(T_REL_OUT, (int) ((long) ubatch * rWidth));
+        relTable = scratch.temp(T_REL_TABLE, (int) ((long) ubatch * spec.nHead() * relExtent));
+        int kvDim = spec.nHeadKv() * spec.headDimK();
+        convKw = convWeights(w, TensorNames.ATTN_SCONV_K, kvDim);
+        convKvWeight = convWeights(w, TensorNames.ATTN_SCONV_V, kvDim);
+        convTmp = scratch.temp(T_CONV, (int) ((long) ubatch * Math.max(kvDim, spec.vDim())));
+        RecurrentStateAccessor state = ctx.memory().recurrent(layer.il());
+        if (state == null) {
+            throw new IllegalStateException("layer " + layer.il() + " runs Inkling short convolutions but has no"
+                    + " recurrent state");
+        }
+        convState = state.tensor(LayerMemoryPlan.STATE_CONV);
+        convRow = state.slotFloats(LayerMemoryPlan.STATE_CONV);
+        stateSlots = state.slots();
+    }
+
+    /** The {@code [channels][convWidth]} kernel of one short-convolution stream. */
+    private float[] convWeights(CpuWeights w, String base, int channels) {
+        float[] v = w.layerFloatsOrNull(layer, TensorNames.weight(base));
+        int width = layer.recurrent().dConv();
+        QkvProjection.checkLength(TensorNames.weight(base), v == null ? 0 : v.length, (long) channels * width);
+        return v;
+    }
+
+    /** {@code attn_rel @ x}: the query-side relative output of every token row into {@link #relOut}. */
+    private void projectRel(int n, float[] in) {
+        int width = (int) wr.rows();
+        matVec.matmul(wr, in, 0, relOut, 0, n);
+        rSite.applyRows(n, in, 0, relOut, 0);
+        if (rBias != null) {
+            CpuOps.addRowBias(relOut, 0, n, width, rBias, 0);
+        }
+    }
+
+    /**
+     * The K and V short convolutions of the step (vLLM {@code fused_qkvr_prep}): the raw projections feed each
+     * stream's conv state and the convolution adds back into the projection, so {@code kv = conv(kv) + kv}. A paged
+     * step runs one segment at a time, each over its own sequence's state row.
+     */
+    private void convKv(int n, float[] k, float[] v) {
+        if (pagedStep == null) {
+            convSegment(0, n, k, 0, v, 0);
+            return;
+        }
+        for (int seg = 0; seg < pagedStep.nSeg(); seg++) {
+            int start = pagedStep.segStart(seg);
+            int len = pagedStep.segLen(seg);
+            convSegment(pagedStep.segSeq(seg), len, k, start * spec.kDim(), v, start * spec.vDim());
+        }
+    }
+
+    private void convSegment(int seq, int len, float[] k, int kOff, float[] v, int vOff) {
+        if (len < 1) {
+            return;
+        }
+        if (seq < 0 || seq >= stateSlots) {
+            throw new UnsupportedOperationException("layer " + layer.il() + " runs Inkling sequence " + seq
+                    + ", the memory keeps " + stateSlots + " state slots");
+        }
+        int base = seq * convRow;
+        int kvDim = spec.nHeadKv() * spec.headDimK();
+        convStream(k, kOff, spec.kDim(), kvDim, convKw, base, RecurrentSpec.INKLING_K, len);
+        convStream(v, vOff, spec.vDim(), spec.nHeadKv() * spec.headDimV(), convKvWeight, base,
+                RecurrentSpec.INKLING_V, len);
+    }
+
+    /** One stream: {@code x = conv(x) + x} over the stream's conv state. */
+    private void convStream(float[] x, int off, int stride, int channels, float[] weight, int stateBase, int stream,
+                            int len) {
+        int width = layer.recurrent().dConv();
+        CpuSsmConv.forward(channels, width, len, 0, x, off, stride, weight, null, convState, stateBase,
+                layer.recurrent().inklingStreamOffset(stream), convTmp, 0, channels);
+        for (int t = 0; t < len; t++) {
+            int xb = off + t * stride;
+            int cb = t * channels;
+            for (int c = 0; c < channels; c++) {
+                x[xb + c] += convTmp[cb + c];
+            }
+        }
+    }
+
+    /** The relative-logit table of the step's tokens ({@link InklingMath#relLogits}), scaled on a full layer. */
+    private void inklingRelTable(int n, int[] pos) {
+        boolean scaled = !spec.isSwaLayer();
+        InklingMath.relLogits(n, spec.nHead(), relDim, relExtent, relOut, relProj, pos, 0,
+                scaled ? logFloor : 0, logAlpha, relTable);
     }
 
     /** A layer vector ({@code suffix}, null for none) decoded to F32 and checked to hold {@code n} values. */
@@ -394,19 +871,103 @@ public final class CpuAttentionMixer implements CpuMixer {
     }
 
     /**
+     * The cache writes of a step: the K and V projections (every part of a fused product, so the K/V rows are the
+     * ones the whole step writes), their biases, clamps, norms and RoPE, the store rotation and the store. The Q
+     * projection, its norms and RoPE, the attention, the output and the output projection do not run.
+     */
+    @Override
+    public void prefillKV(int pos0, int n, float[] in) {
+        ensureBound();
+        Objects.requireNonNull(in, "in");
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException("layer " + layer.il() + ": step of " + n + " tokens outside [1, "
+                    + ubatch + "]");
+        }
+        if (pos0 < 0) {
+            throw new IllegalArgumentException("layer " + layer.il() + ": negative position " + pos0);
+        }
+        if (proj.source() == QkvProjection.Source.NONE || kv == null || !proj.projectsKv()) {
+            return;
+        }
+        pagedStep = ctx.hasMemory() ? ctx.memory().currentPagedStep() : null;
+        float[] k = scratch.slot(CpuScratch.K);
+        float[] v = scratch.slot(CpuScratch.V);
+        int[] pos = scratch.ints(CpuScratch.POS);
+        if (pagedStep == null && singlePosition && pos[0] != pos0) {
+            throw new IllegalStateException("layer " + layer.il() + " runs position " + pos0 + " but the "
+                    + CpuScratch.POS + " slot starts at " + pos[0]);
+        }
+        projectKV(n, in, k, v);
+        if (valueEmbd != null) {
+            applyValueEmbeddings(n, in, v);
+        }
+        if (inkling) {
+            convKv(n, k, v);
+        }
+        if (!spec.qkNormAfterRope()) {
+            normalizeK(n, k);
+        }
+        if (vNorm != null) {
+            vNorm.apply(n, v);
+        }
+        if (ropeTable != null) {
+            RopeSpec rope = layer.rope();
+            if (dualChunk != null) {
+                DualChunkRope.applyKey(ropeTable, dualChunk, k, n, spec.nHeadKv(), spec.headDimK(), spec.kDim(),
+                        rope.nOffs(), pos, 0, dcPositions);
+            } else {
+                CpuRope.apply(ropeTable, k, 0, n, spec.nHeadKv(), spec.headDimK(), spec.kDim(), rope.nOffs(), pos, 0,
+                        n);
+            }
+        }
+        if (spec.qkNormAfterRope()) {
+            normalizeK(n, k);
+        }
+        if (dualChunk != null) {
+            scaleDualChunk(n, pos0, pos, null, k);
+        }
+        if (storeRotation != null) {
+            storeRotation.beforeStoreKV(n, k, v);
+        }
+        if (pagedStep != null) {
+            storePaged(pagedStep, n, pos, k, v);
+        } else {
+            hostKvAttention.store(n, pos, k, v);
+        }
+    }
+
+    @Override
+    public String kvRefusal() {
+        ensureBound();
+        return null;
+    }
+
+    /**
      * One step over the rows of {@code s}: the contiguous step at {@code s.pos0(0)} when the step is contiguous —
      * decode for one token with memory, prefill otherwise — the paged step through the memory's
      * {@code CpuMemory.currentPagedStep} otherwise (the memory carries the page tables, whose {@link #run} reads;
-     * the step's own layout only picks the branch).
+     * the step's own layout only picks the branch). An un-paged step over several sequences is refused: the
+     * contiguous key span cannot address more than one sequence. A paged step with several segments runs its store
+     * and attend per segment, each against its sequence's page table; the token-wise phases (projections, norms,
+     * RoPE) run over the whole step once, since no phase mixes rows.
      */
     @Override
     public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
         boolean paged = ctx.hasMemory() && ctx.memory().currentPagedStep() != null;
+        if (!paged && !s.contiguousSingle()) {
+            throw new UnsupportedOperationException(batchRefusal());
+        }
         if (s.nTokens() == 1 && ctx.hasMemory() && !paged) {
             decode(s.pos0(0), in, out);
         } else {
             run(s.pos0(0), s.nTokens(), in, out);
         }
+    }
+
+    /** The mixer mixes a multi-sequence step only over paged memory (a paged step the memory holds). */
+    @Override
+    public String batchRefusal() {
+        return "attention mixes several sequences per step only over paged memory (a currentPagedStep)";
     }
 
     private void run(int pos0, int n, float[] in, float[] out) {
@@ -420,6 +981,35 @@ public final class CpuAttentionMixer implements CpuMixer {
         if (pos0 < 0) {
             throw new IllegalArgumentException("layer " + layer.il() + ": negative position " + pos0);
         }
+        // the backend flags a media chunk's step non-causal (llama_set_causal_attn(false)); the window type and
+        // span stay
+        CpuAttentionCore.Params stepParams = ctx.stepNonCausal() ? nonCausalParams : params;
+        if (dualChunk != null && ctx.stepNonCausal()) {
+            throw new UnsupportedOperationException("layer " + layer.il() + " runs dual-chunk attention, which"
+                    + " needs a causal step");
+        }
+        // a tree verify's step: the rows rope at their depth positions, store at their row slots and see only
+        // their ancestors within the fresh rows
+        final CpuAttentionCore.TreeMask tree = treeMask(n);
+        if (tree != null) {
+            if (dualChunk != null) {
+                throw new UnsupportedOperationException("layer " + layer.il() + " runs dual-chunk attention, which"
+                        + " takes no tree mask");
+            }
+            if (spec.dual()) {
+                throw new UnsupportedOperationException("layer " + layer.il() + " runs dual-attention layers, which"
+                        + " take no tree mask");
+            }
+            com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode mode = spec.biasMode();
+            if (mode == com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode.T5_CAUSAL
+                    || mode == com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode.T5_BIDIR
+                    || mode == com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode.INKLING) {
+                throw new UnsupportedOperationException("layer " + layer.il() + " runs " + mode + " position bias,"
+                        + " which reads a relative table over the position rules a tree mask replaces");
+            }
+        }
+        int[] stepStore = ctx.stepStorePositions();
+        final int[] storeAt = stepStore != null ? java.util.Arrays.copyOf(stepStore, n) : null;
         pagedStep = ctx.hasMemory() ? ctx.memory().currentPagedStep() : null;
         if (proj.source() == QkvProjection.Source.NONE) {
             matVec.matmul(wo, in, 0, out, 0, n);
@@ -432,11 +1022,18 @@ public final class CpuAttentionMixer implements CpuMixer {
         float[] attn = scratch.slot(CpuScratch.ATTN_OUT);
         float[] gate = gateWidth > 0 ? scratch.temp(T_GATE, ubatch * gateWidth) : null;
         int[] pos = scratch.ints(CpuScratch.POS);
-        if (singlePosition && pos[0] != pos0) {
+        if (pagedStep == null && singlePosition && pos[0] != pos0) {
             throw new IllegalStateException("layer " + layer.il() + " runs position " + pos0 + " but the "
                     + CpuScratch.POS + " slot starts at " + pos[0]);
         }
         project(n, in, q, k, v, gate);
+        if (valueEmbd != null) {
+            applyValueEmbeddings(n, in, v);
+        }
+        if (inkling) {
+            projectRel(n, in);
+            convKv(n, k, v);
+        }
         if (!spec.qkNormAfterRope()) {
             normalizeQk(n, q, k);
         }
@@ -445,10 +1042,19 @@ public final class CpuAttentionMixer implements CpuMixer {
         }
         if (ropeTable != null) {
             RopeSpec rope = layer.rope();
-            CpuRope.apply(ropeTable, q, 0, n, spec.nHead(), spec.headDimK(), spec.qDim(), rope.nOffs(), pos, 0, n);
-            if (k != null) {
-                CpuRope.apply(ropeTable, k, 0, n, spec.nHeadKv(), spec.headDimK(), spec.kDim(), rope.nOffs(), pos, 0,
-                        n);
+            if (dualChunk != null) {
+                DualChunkRope.applyQuery(ropeTable, dualChunk, q, ubatch * spec.qDim(), n, spec.nHead(),
+                        spec.headDimK(), spec.qDim(), rope.nOffs(), pos, 0, dcPositions);
+                if (k != null) {
+                    DualChunkRope.applyKey(ropeTable, dualChunk, k, n, spec.nHeadKv(), spec.headDimK(), spec.kDim(),
+                            rope.nOffs(), pos, 0, dcPositions);
+                }
+            } else {
+                CpuRope.apply(ropeTable, q, 0, n, spec.nHead(), spec.headDimK(), spec.qDim(), rope.nOffs(), pos, 0, n);
+                if (k != null) {
+                    CpuRope.apply(ropeTable, k, 0, n, spec.nHeadKv(), spec.headDimK(), spec.kDim(), rope.nOffs(), pos,
+                            0, n);
+                }
             }
         }
         if (spec.qkNormAfterRope()) {
@@ -458,34 +1064,63 @@ public final class CpuAttentionMixer implements CpuMixer {
             AttnExtMath.applyTemperature(spec.temperature(), n, spec.nHead(), spec.headDimK(), pos, 0, q, 0,
                     spec.qDim());
         }
+        if (inkling) {
+            // vLLM scales the normed queries and the relative logits of a full layer by the token's log factor.
+            if (!spec.isSwaLayer()) {
+                InklingMath.scaleQueries(n, spec.nHead(), spec.headDimK(), spec.qDim(), q, 0, pos, 0, logFloor,
+                        logAlpha);
+            }
+            inklingRelTable(n, pos);
+        }
+        if (dualChunk != null) {
+            scaleDualChunk(n, pos0, pos, q, k);
+        }
         if (rotation != null) {
-            rotation.beforeStore(n, q, k, v);
+            if (dualChunk != null) {
+                rotation.beforeStorePlanes(n, q, DualChunkRope.VARIANTS, ubatch * spec.qDim(), k, v);
+            } else {
+                rotation.beforeStore(n, q, k, v);
+            }
         }
         if (kv != null) {
-            if (k != null) {
+            if (dualChunk != null) {
                 if (pagedStep != null) {
-                    storePaged(pagedStep, n, pos, k, v);
+                    if (k != null) {
+                        storePaged(pagedStep, n, pos, k, v);
+                    }
+                    attendDualChunkPaged(stepParams, q, pos, attn);
                 } else {
-                    store(n, pos, k, v);
+                    hostKvAttention.store(n, storeAt != null ? storeAt : pos, k, v);
+                    attendDualChunkContiguous(stepParams, pos0, n, q, pos, attn);
                 }
-            }
-            if (pagedStep != null) {
-                int keys = pagedSlots(pagedStep, kv.group());
-                CpuAttentionCore.attendRows(params, n, q, 0, spec.qDim(), pos, 0, kv, rowPos,
-                        pagedPageShift(pagedStep), pagedPageTable(pagedStep, kv.group()), 0, keys, attn, 0,
-                        spec.outDim());
+            } else if (spec.dual()) {
+                if (pagedStep != null) {
+                    throw new UnsupportedOperationException(dualPagedRefusal());
+                }
+                hostKvAttention.store(n, storeAt != null ? storeAt : pos, k, v);
+                dualAttend(stepParams, pos0, n, q, pos, attn);
+            } else if (pagedStep != null) {
+                if (k != null) {
+                    storePaged(pagedStep, n, pos, k, v);
+                }
+                attendPaged(stepParams, q, pos, attn, kv.group(), tree);
             } else {
-                int keys = Math.min(kv.layout().rows(), pos0 + n);
-                CpuAttentionCore.attendRows(params, n, q, 0, spec.qDim(), pos, 0, kv, rowPos, 0, keys, attn, 0,
-                        spec.outDim());
+                hostKvAttention.run(stepParams, pos0, n, pos, storeAt != null ? storeAt : pos, q, k, v, attn, tree);
             }
         } else {
+            if (tree != null) {
+                throw new UnsupportedOperationException("layer " + layer.il() + " attends a cacheless dense batch,"
+                        + " which takes no tree mask");
+            }
             CpuAttentionCore.DenseKv batch = CpuAttentionCore.DenseKv.of(k, 0, spec.kDim(), spec.headDimK(), v, 0,
                     spec.vDim(), spec.headDimV(), spec.nHeadKv(), spec.headDimK(), spec.headDimV(), pos, 0);
-            CpuAttentionCore.attendRows(params, n, q, 0, spec.qDim(), pos, 0, batch, 0, n, attn, 0, spec.outDim());
+            CpuAttentionCore.attendRows(stepParams, n, q, 0, spec.qDim(), pos, 0, batch, 0, n, attn, 0, spec.outDim());
         }
         if (rotation != null) {
             rotation.afterAttention(n, attn);
+        }
+        if (xsaAlpha != null) {
+            applyXsa(n, v, attn);
         }
         if (outHeadNorm != null) {
             outHeadNorm.apply(n, attn);
@@ -493,6 +1128,9 @@ public final class CpuAttentionMixer implements CpuMixer {
         if (gate != null) {
             AttnExtMath.applyOutGate(spec.gate(), n, spec.nHead(), spec.headDimV(), attn, 0, spec.outDim(), gate, 0,
                     gateWidth, gateBias, 0);
+        }
+        if (outNormStep != null) {
+            outNormStep.apply(n, attn);
         }
         if (subNorm != null) {
             subNorm.apply(n, attn);
@@ -507,9 +1145,76 @@ public final class CpuAttentionMixer implements CpuMixer {
         }
     }
 
+    /**
+     * limite value embeddings (limite.cpp:87-89, 149-155): each token's {@code value_embd} row, gated per KV head
+     * by {@code sigmoid(attn_ve_gate @ x)} when the layer carries the gate, adds to V.
+     */
+    private void applyValueEmbeddings(int n, float[] in, float[] v) {
+        int[] ids = scratch.ints(CpuScratch.TOKEN_IDS);
+        int vDim = spec.vDim();
+        int nHeadKv = spec.nHeadKv();
+        int dV = spec.headDimV();
+        float[] ve = scratch.temp(T_VE, ubatch * vDim);
+        float[] gate = veGateW != null ? scratch.temp(T_VE_GATE, ubatch * nHeadKv) : null;
+        if (gate != null) {
+            matVec.matmul(veGateW, in, 0, nEmbd, gate, 0, nHeadKv, n);
+        }
+        CpuParallel.parallelFor(n, Math.max(1, ELEMENT_GRAIN / Math.max(1, vDim)), (from, to) -> {
+            for (int t = from; t < to; t++) {
+                valueEmbd.decodeRow(ids[t], ve, t * vDim);
+                float g = 1f;
+                for (int h = 0; h < nHeadKv; h++) {
+                    if (gate != null) {
+                        g = ActMath.sigmoid(gate[t * nHeadKv + h]);
+                    }
+                    for (int d = 0; d < dV; d++) {
+                        int i = t * vDim + h * dV + d;
+                        v[i] += ve[i] * g;
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * limite exclusive self attention (limite.cpp:177-191): each query head loses its projection on the token's
+     * own L2-normalized value, scaled by the head's {@code attn_xsa_alpha}.
+     */
+    private void applyXsa(int n, float[] v, float[] attn) {
+        int dV = spec.headDimV();
+        int vDim = spec.vDim();
+        int outDim = spec.outDim();
+        int nG = spec.gqaRatio();
+        float eps = spec.xsaEps();
+        CpuParallel.parallelFor(n, Math.max(1, ELEMENT_GRAIN / Math.max(1, outDim)), (from, to) -> {
+            for (int t = from; t < to; t++) {
+                for (int kvh = 0; kvh < spec.nHeadKv(); kvh++) {
+                    int vBase = t * vDim + kvh * dV;
+                    float sum = 0f;
+                    for (int d = 0; d < dV; d++) {
+                        sum += v[vBase + d] * v[vBase + d];
+                    }
+                    float norm = Math.max((float) Math.sqrt(sum), eps);
+                    for (int g = 0; g < nG; g++) {
+                        int aBase = t * outDim + (kvh * nG + g) * dV;
+                        float proj = 0f;
+                        for (int d = 0; d < dV; d++) {
+                            proj += attn[aBase + d] * (v[vBase + d] / norm);
+                        }
+                        proj *= xsaAlpha[kvh * nG + g];
+                        for (int d = 0; d < dV; d++) {
+                            attn[aBase + d] -= (v[vBase + d] / norm) * proj;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     private void project(int n, float[] in, float[] q, float[] k, float[] v, float[] gate) {
         int qw = proj.qProjWidth();
         float[] qProj = proj.interleavedGate() ? scratch.temp(T_QGATE, ubatch * qw) : q;
+        float[] qLatent = wqUp != null ? scratch.temp(T_QLAT, ubatch * qw) : qProj;
         if (wqkv != null) {
             int fw = proj.fusedWidth();
             float[] qkv = scratch.temp(T_QKV, ubatch * fw);
@@ -532,8 +1237,8 @@ public final class CpuAttentionMixer implements CpuMixer {
             }
         } else {
             int cols = (int) wq.cols();
-            matVec.matmul(wq, in, 0, qProj, 0, n);
-            addDeltas(qSite, n, in, cols, qProj, 0, qw);
+            matVec.matmul(wq, in, 0, qLatent, 0, n);
+            addDeltas(qSite, n, in, cols, qLatent, 0, qw);
             if (wk != null) {
                 matVec.matmul(wk, in, 0, k, 0, n);
                 addDeltas(kSite, n, in, cols, k, 0, spec.kDim());
@@ -547,8 +1252,13 @@ public final class CpuAttentionMixer implements CpuMixer {
                 }
             }
         }
+        applyAdapters(n, in, q, k, v);
         if (qBias != null) {
             CpuOps.addRowBias(qProj, 0, n, qw, qBias, 0);
+        }
+        if (wqUp != null) {
+            qLatentNorm.apply(n, qLatent);
+            matVec.matmul(wqUp, qLatent, 0, q, 0, n);
         }
         if (kBias != null) {
             CpuOps.addRowBias(k, 0, n, spec.kDim(), kBias, 0);
@@ -594,21 +1304,68 @@ public final class CpuAttentionMixer implements CpuMixer {
         return ctx.projectionDeltas().serve(layer, weight, refusal);
     }
 
+    /**
+     * The base products the cache writes need: every part of a fused projection (its K and V rows are read from the
+     * fused rows, so the product runs whole), otherwise K and V alone. The Q product, the gate and their deltas do
+     * not run.
+     */
+    private void projectKV(int n, float[] in, float[] k, float[] v) {
+        if (wqkv != null) {
+            int fw = proj.fusedWidth();
+            float[] qkv = scratch.temp(T_QKV, ubatch * fw);
+            int cols = (int) wqkv.cols();
+            matVec.matmul(wqkv, in, 0, qkv, 0, n);
+            addDeltas(qkvSite, n, in, cols, qkv, 0, fw);
+            addDeltas(kSite, n, in, cols, qkv, proj.kOffset(), fw);
+            addDeltas(vSite, n, in, cols, qkv, proj.vOffset(), fw);
+            if (qkvBias != null) {
+                CpuOps.addRowBias(qkv, 0, n, fw, qkvBias, 0);
+            }
+            for (int t = 0; t < n; t++) {
+                int row = t * fw;
+                System.arraycopy(qkv, row + proj.kOffset(), k, t * spec.kDim(), spec.kDim());
+                System.arraycopy(qkv, row + proj.vOffset(), v, t * spec.vDim(), spec.vDim());
+            }
+        } else {
+            int cols = (int) wq.cols();
+            if (wk != null) {
+                matVec.matmul(wk, in, 0, k, 0, n);
+                addDeltas(kSite, n, in, cols, k, 0, spec.kDim());
+                if (wv != null) {
+                    matVec.matmul(wv, in, 0, v, 0, n);
+                    addDeltas(vSite, n, in, cols, v, 0, spec.vDim());
+                } else if (valueExperts != null) {
+                    valueExperts.run(n, in, v);
+                } else {
+                    System.arraycopy(k, 0, v, 0, n * spec.kDim());
+                }
+            }
+        }
+        applyAdapters(n, in, null, k, v);
+        if (kBias != null) {
+            CpuOps.addRowBias(k, 0, n, spec.kDim(), kBias, 0);
+        }
+        if (vBias != null) {
+            CpuOps.addRowBias(v, 0, n, spec.vDim(), vBias, 0);
+        }
+        if (clamp != null) {
+            CpuOps.unary(ActOp.CLAMP, clamp, k, 0, k, 0, n * spec.kDim());
+            CpuOps.unary(ActOp.CLAMP, clamp, v, 0, v, 0, n * spec.vDim());
+        }
+    }
+
+    private void normalizeK(int n, float[] k) {
+        if (kNorm != null) {
+            kNorm.apply(n, k);
+        }
+    }
+
     private void normalizeQk(int n, float[] q, float[] k) {
         if (qNorm != null) {
             qNorm.apply(n, q);
         }
         if (kNorm != null) {
             kNorm.apply(n, k);
-        }
-    }
-
-    private void store(int n, int[] pos, float[] k, float[] v) {
-        KvLayout layout = kv.layout();
-        for (int t = 0; t < n; t++) {
-            int row = layout.rowOf(pos[t]);
-            kv.writeK(row, k, t * spec.kDim());
-            kv.writeV(row, v, t * spec.vDim());
         }
     }
 
@@ -620,33 +1377,236 @@ public final class CpuAttentionMixer implements CpuMixer {
     private void storePaged(PagedStep step, int n, int[] pos, float[] k, float[] v) {
         int[] cells = step.cellIdx(kv.group());
         for (int t = 0; t < n; t++) {
+            HostKvAttention.divideByScales(k, t * spec.kDim(), spec.kDim(), spec.headDimK(), kScale);
+            HostKvAttention.divideByScales(v, t * spec.vDim(), spec.vDim(), spec.headDimV(), vScale);
             kv.writeK(cells[t], k, t * spec.kDim());
             kv.writeV(cells[t], v, t * spec.vDim());
         }
     }
 
+    // ================================================================== dual-chunk attention
+
     /**
-     * The page-table slice of the step's one sequence (a SEQ-mode split ubatch), the single-sequence table
-     * {@code CpuAttentionCore.attendRows}' paged form indexes ({@code PagedStep.pageTable[g][seq * maxPages + k]}).
-     *
-     * @throws IllegalArgumentException when the step holds several segments (the ubatch is not SEQ-split)
+     * The original-context logit scaling of a step (vLLM scales the new K rows before caching and, on a decode, the
+     * query too). A contiguous step scales its one sequence; a paged step scales each segment by its sequence's slot
+     * count.
      */
-    private int[] pagedPageTable(PagedStep step, int group) {
-        if (step.nSeg() != 1) {
-            throw new IllegalArgumentException("layer " + layer.il() + ": a paged attention step holds one sequence,"
-                    + " got " + step.nSeg() + " segments");
+    private void scaleDualChunk(int n, int pos0, int[] pos, float[] q, float[] k) {
+        if (pagedStep != null) {
+            int[] slots = pagedStep.seqSlots(kv.group());
+            for (int seg = 0; seg < pagedStep.nSeg(); seg++) {
+                int seq = pagedStep.segSeq(seg);
+                int start = pagedStep.segStart(seg);
+                int len = pagedStep.segLen(seg);
+                scaleDualChunkRows(dualChunk.scalingFactor(slots[seq]), q, k, start, len);
+            }
+            return;
         }
-        int seq = step.segSeq(0);
-        int[] full = step.pageTable(group);
-        int[] slice = new int[step.maxPages()];
-        System.arraycopy(full, seq * step.maxPages(), slice, 0, step.maxPages());
-        return slice;
+        int seqLen = n == 1 ? pos0 + 1 : pos0 + n;
+        scaleDualChunkRows(dualChunk.scalingFactor(seqLen), q, k, 0, n);
     }
 
-    /** Slots the paged step's sequence of this cache's group holds, the attend span (contiguous slot space). */
-    private int pagedSlots(PagedStep step, int group) {
-        int seq = step.segSeq(0);
+    /** Scales rows {@code [start, start + len)} of K and of the three used query planes by {@code factor}. */
+    private void scaleDualChunkRows(float factor, float[] q, float[] k, int start, int len) {
+        if (factor == 1.0f || len <= 0) {
+            return;
+        }
+        if (k != null) {
+            CpuOps.scale(k, start * spec.kDim(), len * spec.kDim(), factor);
+        }
+        if (q != null) {
+            int planeStride = ubatch * spec.qDim();
+            for (int plane = 0; plane < 3; plane++) {
+                CpuOps.scale(q, plane * planeStride + start * spec.qDim(), len * spec.qDim(), factor);
+            }
+        }
+    }
+
+    /** Dual-chunk attention of a contiguous step over the layer's cache rows {@code [0, pos0 + n)}. */
+    private void attendDualChunkContiguous(CpuAttentionCore.Params causal, int pos0, int n, float[] q, int[] pos,
+                                           float[] attn) {
+        final int keys = Math.min(kv.layout().rows(), pos0 + n);
+        CpuDualChunkAttention.KeySpan span = new CpuDualChunkAttention.KeySpan() {
+            @Override public int keys() { return keys; }
+
+            @Override
+            public void attend(CpuAttentionCore.Params p, int rows, float[] qa, int qOff, int qRowStride,
+                               int[] qPos, int qPosOff, int keyStart, int keyEnd, float[] out, int outOff,
+                               float[] lse, int lseOff) {
+                CpuAttentionCore.attendRowsLse(p, rows, qa, qOff, qRowStride, qPos, qPosOff, kv, rowPos, keyStart,
+                        keyEnd, out, outOff, spec.outDim(), lse, lseOff, spec.nHead());
+            }
+        };
+        CpuDualChunkAttention.attend(dualChunk, spec, causal, nonCausalParams, span, n, q, ubatch * spec.qDim(),
+                spec.qDim(), 0, pos, 0, attn, 0, spec.outDim(), dcScratchOut, dcScratchLse, dcMergeLse);
+    }
+
+    /** Dual-chunk attention of a paged step, segment by segment through its sequence's page table. */
+    private void attendDualChunkPaged(CpuAttentionCore.Params causal, float[] q, int[] pos, float[] attn) {
+        int shift = pagedPageShift(pagedStep);
+        int group = kv.group();
+        for (int seg = 0; seg < pagedStep.nSeg(); seg++) {
+            final int seq = pagedStep.segSeq(seg);
+            final int start = pagedStep.segStart(seg);
+            final int len = pagedStep.segLen(seg);
+            final int slots = pagedSlots(pagedStep, group, seq);
+            final int[] table = pagedPageTable(pagedStep, group, seq);
+            CpuDualChunkAttention.KeySpan span = new CpuDualChunkAttention.KeySpan() {
+                @Override public int keys() { return slots; }
+
+                @Override
+                public void attend(CpuAttentionCore.Params p, int rows, float[] qa, int qOff, int qRowStride,
+                                   int[] qPos, int qPosOff, int keyStart, int keyEnd, float[] out, int outOff,
+                                   float[] lse, int lseOff) {
+                    CpuAttentionCore.attendRowsLse(p, rows, qa, qOff, qRowStride, qPos, qPosOff, kv, rowPos, shift,
+                            table, keyStart, keyEnd, out, outOff, spec.outDim(), lse, lseOff, spec.nHead());
+                }
+            };
+            CpuDualChunkAttention.attend(dualChunk, spec, causal, nonCausalParams, span, len, q,
+                    ubatch * spec.qDim(), spec.qDim(), start, pos, start, attn, start * spec.outDim(),
+                    spec.outDim(), dcScratchOut, dcScratchLse, dcMergeLse);
+        }
+    }
+
+    /** Why the gated mixed attention refuses an input: it reads its two caches over contiguous rows. */
+    private String dualPagedRefusal() {
+        return "layer " + layer.il() + " mixes a global and a local attention; NeuralFree runs that pair over the"
+                + " contiguous KV cache only, not over paged memory";
+    }
+
+    /**
+     * The gated mixed attention of IQuestLoopCoder: the local attention over the layer's own cache with a sliding
+     * window, the global attention read-only over the first pass's cache with a full causal window, then the per-head
+     * gate {@code sigmoid(dot(q_head, w_head) + b_head)} mixing them.
+     */
+    private void dualAttend(CpuAttentionCore.Params stepParams, int pos0, int n, float[] q, int[] pos, float[] attn) {
+        CpuAttentionCore.Params local = ctx.stepNonCausal() ? localNonCausalParams : localParams;
+        int keys = Math.min(kv.layout().rows(), pos0 + n);
+        CpuAttentionCore.attendRows(local, n, q, 0, spec.qDim(), pos, 0, kv, rowPos, 0, keys, attn, 0, spec.outDim());
+        float[] global = scratch.temp(T_DUAL, ubatch * spec.outDim());
+        int globalKeys = Math.min(dualKv.layout().rows(), pos0 + n);
+        CpuAttentionCore.attendRows(stepParams, n, q, 0, spec.qDim(), pos, 0, dualKv, dualRowPos, 0, globalKeys,
+                global, 0, spec.outDim());
+        float[] gate = scratch.temp(T_LOOP_GATE, ubatch * spec.nHead());
+        int headDim = spec.headDimK();
+        int valueDim = spec.headDimV();
+        for (int t = 0; t < n; t++) {
+            for (int h = 0; h < spec.nHead(); h++) {
+                float sum = loopGateB[h];
+                for (int d = 0; d < headDim; d++) {
+                    sum += q[t * spec.qDim() + h * headDim + d] * loopGateW[h * headDim + d];
+                }
+                gate[t * spec.nHead() + h] = ActMath.sigmoid(sum);
+            }
+        }
+        for (int t = 0; t < n; t++) {
+            for (int h = 0; h < spec.nHead(); h++) {
+                float g = gate[t * spec.nHead() + h];
+                int base = t * spec.outDim() + h * valueDim;
+                for (int d = 0; d < valueDim; d++) {
+                    float localValue = attn[base + d];
+                    attn[base + d] = localValue * (1.0f - g) + global[base + d] * g;
+                }
+            }
+        }
+    }
+
+    /**
+     * Paged attention of every segment's rows: segment {@code seg} attends through its sequence's page-table slice
+     * and slot count (the unified multi-sequence ubatch, llama.cpp src/llama-kv-cache.cpp:761, whose kernel reads
+     * {@code kv_pos[nf_kv_row(...)]}), so the rows of one sequence never see another's keys. The mixer rows follow
+     * the ubatch order, so a segment's rows sit at {@code [segStart, segStart + segLen)}. {@code stepParams}
+     * carries the step's mask rule (a non-causal media chunk flags its step).
+     */
+    private void attendPaged(CpuAttentionCore.Params stepParams, float[] q, int[] pos, float[] attn, int group,
+                             CpuAttentionCore.TreeMask tree) {
+        int shift = pagedPageShift(pagedStep);
+        for (int seg = 0; seg < pagedStep.nSeg(); seg++) {
+            int seq = pagedStep.segSeq(seg);
+            int start = pagedStep.segStart(seg);
+            int len = pagedStep.segLen(seg);
+            if (singlePosition && pos[start] != pagedStep.segPos0(seg)) {
+                throw new IllegalStateException("layer " + layer.il() + " runs segment " + seg + " (sequence " + seq
+                        + ") at position " + pos[start] + ", the step says " + pagedStep.segPos0(seg));
+            }
+            int[] pageTable = pagedPageTable(pagedStep, group, seq);
+            int slots = pagedSlots(pagedStep, group, seq);
+            /* A tree verify's fresh-row visibility is the mask, which the fused int8 kernel takes no part in; the
+             * dequantized core below serves the same cache. */
+            if (int8Kv != null && tree == null && stepParams.sinkTokens() == 0) {
+                CpuInt8Attention.attendRows(stepParams, len, q, start * spec.qDim(), spec.qDim(), pos, start, int8Kv,
+                        rowPos, pagedRowOf(shift, pageTable), 0, slots, attn, start * spec.outDim(), spec.outDim());
+                continue;
+            }
+            if (tree == null) {
+                CpuAttentionCore.attendRows(stepParams, len, q, start * spec.qDim(), spec.qDim(), pos, start, kv,
+                        rowPos, shift, pageTable, 0, slots, attn, start * spec.outDim(), spec.outDim());
+            } else {
+                // the step's bits name the ubatch's rows; the segment's call sees its own rows shifted local
+                CpuAttentionCore.attendRows(stepParams, len, q, start * spec.qDim(), spec.qDim(), pos, start, kv,
+                        rowPos, shift, pageTable, 0, slots, attn, start * spec.outDim(), spec.outDim(),
+                        segmentTreeMask(tree, start, len));
+            }
+        }
+    }
+
+    /**
+     * The step's tree mask relativized to one segment's rows: the segment's rows are the call's fresh rows, its
+     * queries sit at {@code [start, start + len)} and the core indexes the mask by the call's absolute query row,
+     * so the segment's shifted bits land at {@code [start, start + len)} of the slice (the masked batch never
+     * splits over ubatches — at most 64 rows — and a sequence's rows hold one contiguous segment, so the shift is
+     * exact).
+     */
+    private static CpuAttentionCore.TreeMask segmentTreeMask(CpuAttentionCore.TreeMask tree, int start, int len) {
+        long[] bits = tree.mask();
+        long[] rel = new long[start + len];
+        for (int t = 0; t < len; t++) {
+            rel[start + t] = bits[start + t] >>> start;
+        }
+        return new CpuAttentionCore.TreeMask(rel, len);
+    }
+
+    /**
+     * The running step's tree mask over {@code n} rows, or null: the backend set one per ubatch row and the fresh
+     * rows are the ubatch's {@code n} rows (a batched tree verify step's masked pieces and plain rows alike).
+     */
+    private CpuAttentionCore.TreeMask treeMask(int n) {
+        long[] bits = ctx.stepTreeMask();
+        int fresh = ctx.stepTreeFresh();
+        if (bits == null) {
+            return null;
+        }
+        if (n != fresh) {
+            throw new IllegalStateException("layer " + layer.il() + " runs " + n + " rows but the step's tree mask"
+                    + " covers " + fresh + " fresh rows");
+        }
+        return new CpuAttentionCore.TreeMask(java.util.Arrays.copyOf(bits, n), fresh);
+    }
+
+    /**
+     * The page-table slice of {@code seq} ({@code PagedStep.pageTable[g][seq * maxPages + k]}), the table
+     * {@code CpuAttentionCore.attendRows}' paged form indexes, built in a scratch reused across the segments.
+     */
+    private int[] pagedPageTable(PagedStep step, int group, int seq) {
+        if (pagedSlice == null || pagedSlice.length != step.maxPages()) {
+            pagedSlice = new int[step.maxPages()];
+        }
+        System.arraycopy(step.pageTable(group), seq * step.maxPages(), pagedSlice, 0, step.maxPages());
+        return pagedSlice;
+    }
+
+    /** The slots {@code seq} holds in this cache's group, the attend span (contiguous slot space). */
+    private static int pagedSlots(PagedStep step, int group, int seq) {
         return step.seqSlots(group)[seq];
+    }
+
+    /**
+     * The slot-to-row map of a page table ({@code nf_kv_row}): slot {@code s} is the physical row
+     * {@code (pageTable[s >> shift] << shift) | (s & ((1 << shift) - 1))}, the view {@link CpuInt8Attention} reads.
+     */
+    private static IntUnaryOperator pagedRowOf(int shift, int[] pageTable) {
+        final int pageMask = (1 << shift) - 1;
+        return slot -> (pageTable[slot >> shift] << shift) | (slot & pageMask);
     }
 
     /** {@code log2(pageSize)}: slot {@code s} sits in page {@code s >> shift} (the kernel's page-table shift). */
@@ -689,6 +1649,17 @@ public final class CpuAttentionMixer implements CpuMixer {
         }
         int[] delta = ((HeapModelMemory) ctx.memory()).shiftDelta()[kv.group()];
         shiftRows(delta);
+    }
+
+    /** {@link CpuMixer#applyShiftDeltas}: the paged shift's row moves already happened, rotate by the deltas. */
+    @Override
+    public void applyShiftDeltas() {
+        ensureBound();
+        if (kv == null || proj.source() == QkvProjection.Source.NONE || shiftTable == null
+                || !GpuContextShift.shifts(layer)) {
+            return;
+        }
+        shiftRows(((HeapModelMemory) ctx.memory()).shiftDelta()[kv.group()]);
     }
 
     /**

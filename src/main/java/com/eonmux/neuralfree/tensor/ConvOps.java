@@ -33,7 +33,8 @@ import java.util.Collections;
  * com.eonmux.neuralfree.tensor.gpu numerical contract}): convolutions and weight gradients in the reduction class, max
  * pooling and its backward bit-identical or single-rounding, average and adaptive average pooling in the division class
  * and their backward in the division (or, for overlapping windows, reduction) class. The CPU path reads every operand
- * to the host, so its operands must be FLOAT32.</p>
+ * to the host, so its operands must be FLOAT32; the six forward ops also take operands that are all FLOAT64, which
+ * they compute in double precision on the host and return as FLOAT64 (the backward primitives are FLOAT32-only).</p>
  */
 public final class ConvOps {
 

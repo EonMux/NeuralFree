@@ -1,14 +1,15 @@
 /* common/quant_ext.glsl - QT_DECODE_* decoders for the NeuralFree extension weight types F8_E5M2,
- * F8_E4M3, F8_E4M3_B128, MXFP8, MXFP6_E2M3, MXFP6_E3M2, I8_B128, NF4 and FP4_BNB. GLSL twin of
+ * F8_E4M3, F8_E4M3_B128, F8_E4M3_B32, MXFP8, MXFP6_E2M3, MXFP6_E3M2, I8_B128, NF4 and FP4_BNB. GLSL twin of
  * kernels/llm/common/quant_decode_ext.h (the semantic reference). Requires: common/quant_blocks.glsl.
  *
  * Decoder interface and include contract: common/quant_blocks.glsl. Weights are read only through
  * nf_w_*(ws, off) and activations only through qt_x/qt_x4.
  *
- * Block layouts (little-endian; Java GGMLType ids 1000-1008, BlockLayout offsets):
+ * Block layouts (little-endian; Java GGMLType ids 1000-1009, BlockLayout offsets):
  *   F8_E5M2       32 B: qs[32] (E5M2) @0                y[j] = e5m2(qs[j])
  *   F8_E4M3       32 B: qs[32] (E4M3FN) @0              y[j] = e4m3(qs[j])
  *   F8_E4M3_B128 132 B: d (f32) @0, qs[128] (E4M3FN) @4  y[j] = d * e4m3(qs[j])
+ *   F8_E4M3_B32   36 B: d (f32) @0, qs[32] (E4M3FN) @4   y[j] = d * e4m3(qs[j])
  *   MXFP8         33 B: e (E8M0) @0, qs[32] (E4M3FN) @1  y[j] = 2^(e - 127) * e4m3(qs[j])
  *   MXFP6_E2M3    25 B: e (E8M0) @0, qs[24] @1 (32 packed 6-bit codes)
  *   MXFP6_E3M2    25 B: e (E8M0) @0, qs[24] @1 (32 packed 6-bit codes)
@@ -23,7 +24,7 @@
  *
  * Work split (equal to the OpenCL triples): every invocation of a block owns the NF_QE_EPT = 8
  * consecutive elements [8*ltid, 8*ltid + 8), in two runs of 4:
- *   F8_E5M2, F8_E4M3, MXFP8                    QT_TPS = 4  qs bytes 8*ltid .. +7
+ *   F8_E5M2, F8_E4M3, F8_E4M3_B32, MXFP8       QT_TPS = 4  qs bytes 8*ltid .. +7
  *   MXFP6_E2M3, MXFP6_E3M2                     QT_TPS = 4  the 48 bits: qs bytes 6*ltid .. 6*ltid + 5
  *   F8_E4M3_B128, I8_B128                      QT_TPS = 16  qs bytes 8*ltid .. +7
  *   NF4, FP4_BNB                               QT_TPS = 8   low nibbles of qs bytes 8*ltid .. +7 (ltid < 4), high
@@ -37,7 +38,7 @@
  * _Hw kernels convert the code pairs in hardware).
  *
  * Alignment: block offsets (bp, rbase) are multiples of QT_BB from the start of a 4-byte aligned
- * binding. F8_E5M2 and F8_E4M3 (32), F8_E4M3_B128 and I8_B128 (132), NF4 and FP4_BNB (36) blocks are
+ * binding. F8_E5M2 and F8_E4M3 (32), F8_E4M3_B128 and I8_B128 (132), F8_E4M3_B32, NF4 and FP4_BNB (36) blocks are
  * 4-aligned and read their f32 scale and code words with nf_w_f32 / nf_w_u32; MXFP8 (33) and the MXFP6
  * types (25) read bytes (nf_w_u8 / nf_w_u32_any).
  */
@@ -49,7 +50,8 @@
 #endif
 
 #ifdef QTYPE
-#if QTYPE == QT_F8_E5M2 || QTYPE == QT_F8_E4M3 || QTYPE == QT_F8_E4M3_B128 || QTYPE == QT_MXFP8 \
+#if QTYPE == QT_F8_E5M2 || QTYPE == QT_F8_E4M3 || QTYPE == QT_F8_E4M3_B128 || QTYPE == QT_F8_E4M3_B32 \
+ || QTYPE == QT_MXFP8 \
  || QTYPE == QT_MXFP6_E2M3 || QTYPE == QT_MXFP6_E3M2 \
  || QTYPE == QT_I8_B128 || QTYPE == QT_NF4 || QTYPE == QT_FP4_BNB
 
@@ -138,6 +140,27 @@ float qt_elem(uint ws, uint rbase, uint i) {
 #define QT_BS  NF_F8_E4M3_B128_BS
 #define QT_BB  NF_F8_E4M3_B128_BB
 #define QT_TPS 16
+
+void nf_qe_w8(uint ws, uint bp, uint ltid, out vec4 w0, out vec4 w1) {
+    const uint q = bp + 4u + NF_QE_EPT * ltid;
+    w0 = nf_qe_e4m3x4(nf_qe_bytes(nf_w_u32(ws, q)));
+    w1 = nf_qe_e4m3x4(nf_qe_bytes(nf_w_u32(ws, q + 4u)));
+}
+
+float nf_qe_scale(uint ws, uint bp) {
+    return nf_w_f32(ws, bp);
+}
+
+float qt_elem(uint ws, uint rbase, uint i) {
+    const uint bp = rbase + (i / uint(QT_BS)) * uint(QT_BB);
+    return nf_w_f32(ws, bp) * nf_qe_e4m3(nf_w_u8(ws, bp + 4u + i % uint(QT_BS)));
+}
+
+#elif QTYPE == QT_F8_E4M3_B32
+/* ---- F8_E4M3_B32: d (f32) @0, qs[32] @4 ---- */
+#define QT_BS  NF_F8_E4M3_B32_BS
+#define QT_BB  NF_F8_E4M3_B32_BB
+#define QT_TPS 4
 
 void nf_qe_w8(uint ws, uint bp, uint ltid, out vec4 w0, out vec4 w1) {
     const uint q = bp + 4u + NF_QE_EPT * ltid;

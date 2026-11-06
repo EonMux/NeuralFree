@@ -36,7 +36,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Rewrites bitsandbytes modules into the §1.5 targets.
+ * Rewrites bitsandbytes modules into their GGUF targets.
  * <ul>
  *   <li>4-bit NF4/FP4: the weight is U8 {@code [ceil(N*K/2), 1]}, the row-major flattened codes with the even element
  *       in the high nibble, with {@code weight.absmax} per {@code blocksize} elements (U8 codes of a second-level

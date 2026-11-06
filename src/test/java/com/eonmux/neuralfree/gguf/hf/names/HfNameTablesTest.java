@@ -46,11 +46,11 @@ public class HfNameTablesTest {
 
     @Test
     public void tableViewsMatchTheirRows() {
-        assertEquals(618, HfNameTables.tensorNames().size());
+        assertEquals(652, HfNameTables.tensorNames().size());
         assertEquals("token_embd", HfNameTables.tensorNames().get("TOKEN_EMBD"));
         assertEquals("blk.{bid}.ffn_gate_inp", HfNameTables.tensorNames().get("FFN_GATE_INP"));
         assertEquals(42, HfNameTables.globalPatterns().size());
-        assertEquals(443, HfNameTables.blockPatterns().size());
+        assertEquals(445, HfNameTables.blockPatterns().size());
         assertEquals(Arrays.asList("gpt_neox.final_layer_norm", "transformer.ln_f", "model.norm"),
                 HfNameTables.globalPatterns().get("OUTPUT_NORM").subList(0, 3));
         assertEquals(Arrays.asList("model.layers.{bid}.self_attn.q_proj", "model.layers.{bid}.attention.q_proj",
@@ -67,6 +67,22 @@ public class HfNameTablesTest {
         assertEquals(Collections.singletonList("model.layers.{bid}.residual_layernorm"),
                 HfNameTables.blockOverrides("arctic").get("FFN_NORM"));
         assertTrue(HfNameTables.blockOverrides("llama").isEmpty());
+    }
+
+    @Test
+    public void locallyDefinedArchitecturesCarryTheirTensorRows() {
+        // Architectures llama.cpp's converter does not list, added by HfNameTables itself.
+        assertTrue(HfNameTables.archTensors("step1").contains("ATTN_QKV"));
+        assertTrue(HfNameTables.archTensors("step3text").contains("ATTN_Q_A"));
+        assertTrue(HfNameTables.archTensors("pangu-moe").contains("FFN_EXP_PROBS_B"));
+        assertTrue(HfNameTables.archTensors("interns1-pro").contains("ATTN_Q_NORM"));
+        // The EAGLE-1 drafter row holds both the llama-shaped and the DeepSeek-MTP-shaped tensors.
+        assertEquals(Arrays.asList("TOKEN_EMBD", "OUTPUT", "OUTPUT_NORM", "FC", "ENC_OUTPUT_NORM", "ROPE_FREQS",
+                "ATTN_NORM", "ATTN_NORM_2", "ATTN_Q", "ATTN_K", "ATTN_V", "ATTN_OUT", "ATTN_Q_A", "ATTN_Q_A_NORM",
+                "ATTN_Q_B", "ATTN_KV_A_MQA", "ATTN_KV_A_NORM", "ATTN_K_B", "ATTN_V_B", "ATTN_KV_B", "FFN_NORM",
+                "FFN_GATE", "FFN_UP", "FFN_DOWN", "FFN_GATE_INP", "FFN_GATE_EXP", "FFN_UP_EXP", "FFN_DOWN_EXP",
+                "FFN_GATE_SHEXP", "FFN_UP_SHEXP", "FFN_DOWN_SHEXP", "FFN_EXP_PROBS_B"),
+                Arrays.asList(HfNameTables.archTensors("eagle").toArray()));
     }
 
     @Test
@@ -92,7 +108,7 @@ public class HfNameTablesTest {
         HfNameTables.FilterRule r = HfNameTables.filters(HfNameTables.FilterKind.RENAME_SUFFIX).get(0);
         assertEquals("e_score_correction_bias", r.value());
         assertEquals("e_score_correction.bias", r.replacement());
-        assertEquals("base.py:588", r.source());
+        assertEquals("base.py:763", r.source());
     }
 
     @Test
@@ -107,6 +123,45 @@ public class HfNameTablesTest {
         assertFalse(f32.test("blk.x.ffn_gate_inp.weight"));
         assertFalse(f32.test("blk.0.ffn_up.weight"));
         assertFalse(f32.test("xposition_embd.weight"));
+    }
+
+    @Test
+    public void ternaryKeptF16NamesTheEmbeddingAndOutputWeightsOnly() {
+        Predicate<String> f16 = HfNameTables.ternaryKeptF16();
+        assertTrue(f16.test("token_embd.weight"));
+        assertTrue(f16.test("per_layer_token_embd.weight"));
+        assertTrue(f16.test("output.weight"));
+        assertTrue(f16.test("blk.0.altup_router.weight"));
+        assertTrue(f16.test("blk.41.laurel_l.weight"));
+        assertTrue(f16.test("blk.41.laurel_r.weight"));
+        assertFalse(f16.test("token_embd_norm.weight"));
+        assertFalse(f16.test("blk.0.altup_router.bias"));
+        assertFalse(f16.test("blk.0.attn_q.weight"));
+        assertFalse(f16.test("v.token_embd.weight"));
+        assertFalse(f16.test("blk.0.ffn_up.weight"));
+    }
+
+    @Test
+    public void supportedNamesListTheConvertibleEntriesSorted() {
+        List<String> text = HfArchRegistry.supportedNames(HfArchEntry.Kind.TEXT);
+        assertTrue(text.contains("LlamaForCausalLM"));
+        List<String> sorted = new java.util.ArrayList<>(text);
+        Collections.sort(sorted);
+        assertEquals(sorted, text);
+        for (String name : text) {
+            assertTrue(name, HfArchRegistry.has(name, HfArchEntry.Kind.TEXT));
+        }
+        HfArchEntry projector = HfArchEntry.of(List.of("ZzProjectorForTest"), HfArchResolver.of(Arch.LLAMA),
+                HfMetadataHook.GENERIC, HfTensorHook.DEFAULT, (ctx, pre) -> Collections.emptyMap())
+                .withKind(HfArchEntry.Kind.MMPROJ);
+        HfArchEntry refused = HfArchEntry.rejected(List.of("ZzRefusedForTest"), "refused for the test");
+        try (HfArchRegistry.Overlay ignored = HfArchRegistry.withExtraForTest(List.of(projector, refused))) {
+            assertTrue(HfArchRegistry.supportedNames(HfArchEntry.Kind.MMPROJ).contains("ZzProjectorForTest"));
+            assertTrue(HfArchRegistry.has("ZzRefusedForTest", HfArchEntry.Kind.TEXT));
+            assertFalse("a rejected entry is not convertible",
+                    HfArchRegistry.supportedNames(HfArchEntry.Kind.TEXT).contains("ZzRefusedForTest"));
+        }
+        assertFalse(HfArchRegistry.supportedNames(HfArchEntry.Kind.MMPROJ).contains("ZzProjectorForTest"));
     }
 
     @Test
@@ -127,8 +182,8 @@ public class HfNameTablesTest {
                 () -> HfNameTables.read("tensor_names.tsv", "tensor", "gguf_name"));
         assertTrue(columns.getMessage(), columns.getMessage().startsWith("hf/tensor_names.tsv:2: "));
         HfNameTables.Tsv t = HfNameTables.read("tensor_names.tsv", "tensor", "gguf_template");
-        assertEquals("a37cc4610", t.commit());
-        assertEquals(618, t.rows().size());
+        assertEquals("dde879bc4", t.commit());
+        assertEquals(652, t.rows().size());
         assertEquals(3, t.rows().get(0).line());
         assertEquals("TOKEN_EMBD", t.rows().get(0).get(0));
         assertTrue(HfNameTables.isNone("-"));
@@ -276,7 +331,7 @@ public class HfNameTablesTest {
         assertFalse(granite.get().hasClass());
         assertTrue(HfArchNames.row("GlmasrModel", HfArchEntry.Kind.MMPROJ).isPresent());
         assertFalse(HfArchNames.row("GlmasrModel", HfArchEntry.Kind.TEXT).isPresent());
-        assertEquals(375, HfArchNames.rows(HfArchEntry.Kind.TEXT).size()
+        assertEquals(392, HfArchNames.rows(HfArchEntry.Kind.TEXT).size()
                 + HfArchNames.rows(HfArchEntry.Kind.MMPROJ).size());
     }
 
@@ -306,11 +361,9 @@ public class HfNameTablesTest {
                 () -> HfArchRegistry.resolve(config("NoSuchModelForCausalLM"), HfArchEntry.Kind.MMPROJ));
         assertEquals("Hugging Face architecture 'NoSuchModelForCausalLM' has no projector conversion: llama.cpp's"
                 + " converter does not know it as a vision/audio projector", mmproj.getMessage());
-        GgufFormatException known = assertThrows(GgufFormatException.class,
-                () -> HfArchRegistry.resolve(config("GlmasrModel"), HfArchEntry.Kind.MMPROJ));
-        assertEquals("Hugging Face projector architecture 'GlmasrModel' (llama.cpp converter class"
-                + " GlmASRWhisperEncoderModel, ultravox.py:24) has no projector conversion in NeuralFree",
-                known.getMessage());
+        HfArchEntry glmasr = HfArchRegistry.resolve(config("GlmasrModel"), HfArchEntry.Kind.MMPROJ);
+        assertSame(Arch.CLIP, glmasr.arch().resolve(config("GlmasrModel"), HfTensorIndex.of(new LinkedHashMap<>())));
+        assertEquals(Collections.singletonList("GlmasrModel"), glmasr.hfNames());
     }
 
     @Test

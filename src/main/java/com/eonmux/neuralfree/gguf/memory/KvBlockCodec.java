@@ -2,12 +2,14 @@ package com.eonmux.neuralfree.gguf.memory;
 
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
 import com.eonmux.neuralfree.gguf.quant.QuantTables;
+import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
 
 import java.nio.ByteBuffer;
 
 /**
- * Element conversions of the KV cache types: the BF16 store and the 32-value blocks of Q8_0, Q4_0, Q4_1, IQ4_NL,
- * Q5_0 and Q5_1 (CPU twin of kernels/llm/common/kv_types.h). Block layouts (little-endian, ggml-common.h):
+ * Element conversions of the KV cache types: the BF16 store, the one-code FP8 values and the 32-value blocks of
+ * Q8_0, Q4_0, Q4_1, IQ4_NL, Q5_0 and Q5_1 (CPU twin of kernels/llm/common/kv_types.h). Block layouts
+ * (little-endian, ggml-common.h):
  * <pre>
  *   Q8_0    34 B  d(f16) @0, qs[32] int8 @2                       value j = qs[j] * d
  *   Q4_0    18 B  d @0, qs[16] @2                                 value j = (nib_j - 8) * d
@@ -20,7 +22,11 @@ import java.nio.ByteBuffer;
  * j of qh (dequantize_row_*, llama.cpp ggml-quants.c:328-548, 2726-2743). The quantizers are the ggml reference
  * quantizers ggml_set_rows stores with (from_float of llama.cpp ggml-cpu/ggml-cpu.c type traits): quantize_row_q8_0_ref
  * (llama.cpp ggml-quants.c:276-299), _q4_0_ref (:113-147), _q4_1_ref (:149-182), _q5_0_ref (:184-222), _q5_1_ref
- * (:224-260) and quantize_row_iq4_nl_ref (:5072-5085 with quantize_row_iq4_nl_impl :4938-5047, ntry = -1).
+ * (:224-260) and quantize_row_iq4_nl_ref (:5072-5085 with quantize_row_iq4_nl_impl :4938-5047, ntry = -1). The FP8
+ * values are one OCP FP8 code each ({@link #fp8Code} / {@link #fp8Value}). The per-token-head types store one code per
+ * value under a scale computed from the values of the (token, KV head) row ({@link #perTokenHeadScale},
+ * {@link #perTokenHeadCode} / {@link #perTokenHeadValue}): an E4M3FN code (qmax 448), a signed byte (qmax 127) or two
+ * signed nibbles per byte (qmax 7, first value in the low nibble).
  */
 public final class KvBlockCodec {
 
@@ -58,6 +64,38 @@ public final class KvBlockCodec {
         return (int) (v < 0 ? -a : a);
     }
 
+    // ------------------------------------------------------------------ FP8
+
+    /** The OCP FP8 codec of the FP8 KV type {@code t}. */
+    private static Fp8Codec fp8Codec(KvDType t) {
+        switch (t) {
+            case FP8_E4M3:
+                return Fp8Codec.E4M3FN;
+            case FP8_E5M2:
+                return Fp8Codec.E5M2;
+            default:
+                throw new IllegalArgumentException(t + " is not an FP8 KV type");
+        }
+    }
+
+    /**
+     * The FP8 code of {@code value} under the FP8 KV store of {@code t}: {@link Fp8Codec#encode} of the magnitude
+     * clamped to the largest finite value, as the device encoders of kernels/llm/common/kv_types.h give for every
+     * finite value and the infinities (vLLM cvt_float_to_fp8 SATFINITE). A cache row of type {@code t} holds the
+     * code of {@code value / kvScale} (the layer's checkpoint KV scale), so the code decodes back to
+     * {@code fp8Value * kvScale}.
+     */
+    public static int fp8Code(KvDType t, float value) {
+        Fp8Codec c = fp8Codec(t);
+        float max = c.maxFinite();
+        return c.encode(Math.max(-max, Math.min(max, value)));
+    }
+
+    /** The exact value of an FP8 KV code of type {@code t} ({@code Fp8Codec.decode}); codes are unsigned bytes. */
+    public static float fp8Value(KvDType t, int code) {
+        return fp8Codec(t).decode(code & 0xFF);
+    }
+
     /** Index of the IQ4_NL value nearest {@code x} ({@code best_index_int8}, llama.cpp ggml-quants.c:28-37). */
     static int iq4nlIndex(float x) {
         if (x <= QuantTables.kvalueIq4nl(0)) {
@@ -77,6 +115,82 @@ public final class KvBlockCodec {
             }
         }
         return x - QuantTables.kvalueIq4nl(mu - 1) < QuantTables.kvalueIq4nl(mu) - x ? mu - 1 : mu;
+    }
+
+    // ------------------------------------------------------------------ per-token-head
+
+    /** Smallest scale of a per-token-head row (vLLM clamps the absmax-derived scale at 1e-6). */
+    public static final float PER_TOKEN_HEAD_EPS = 1e-6f;
+
+    /**
+     * The scale of the values {@code x[xOff, xOff + n)} of one (token, KV head) row: {@code max(absmax / qmax, 1e-6)}
+     * ({@link #perTokenHeadQmax}): the store divides by it and attention multiplies the decoded codes by it.
+     *
+     * @throws IllegalArgumentException for a non-per-token-head type or a non-positive count
+     */
+    public static float perTokenHeadScale(KvDType t, float[] x, int xOff, int n) {
+        float qmax = perTokenHeadQmax(t);
+        if (n <= 0) {
+            throw new IllegalArgumentException("per-token-head scale needs a positive head width, got " + n);
+        }
+        float amax = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float a = Math.abs(x[xOff + i]);
+            amax = amax > a ? amax : a;
+        }
+        float s = amax / qmax;
+        return s > PER_TOKEN_HEAD_EPS ? s : PER_TOKEN_HEAD_EPS;
+    }
+
+    /** The largest code magnitude of a per-token-head type: 448 (FP8 E4M3), 127 (INT8) or 7 (INT4). */
+    public static float perTokenHeadQmax(KvDType t) {
+        switch (t) {
+            case FP8_PER_TOKEN_HEAD:
+                return Fp8Codec.E4M3FN.maxFinite();
+            case INT8_PER_TOKEN_HEAD:
+                return 127.0f;
+            case INT4_PER_TOKEN_HEAD:
+                return 7.0f;
+            default:
+                throw new IllegalArgumentException(t + " is not a per-token-head KV type");
+        }
+    }
+
+    /**
+     * The code of {@code value} under {@code scale}: round-to-nearest-even of {@code value / scale} clamped to
+     * {@code [-qmax, qmax]} for INT8 and INT4, or the saturating E4M3FN code for FP8. Codes are unsigned bytes for
+     * FP8 and INT8 (an INT8 code is its two's-complement byte) and the low nibble of an INT4 code.
+     */
+    public static int perTokenHeadCode(KvDType t, float value, float scale) {
+        float scaled = value / scale;
+        switch (t) {
+            case FP8_PER_TOKEN_HEAD:
+                return fp8Code(KvDType.FP8_E4M3, scaled);
+            case INT8_PER_TOKEN_HEAD:
+                return (int) Math.rint(Math.max(-127.0f, Math.min(127.0f, scaled))) & 0xFF;
+            case INT4_PER_TOKEN_HEAD:
+                return (int) Math.rint(Math.max(-7.0f, Math.min(7.0f, scaled))) & 0xF;
+            default:
+                throw new IllegalArgumentException(t + " is not a per-token-head KV type");
+        }
+    }
+
+    /**
+     * The unscaled value of a per-token-head code: the E4M3FN value, the signed INT8 byte or the signed INT4 nibble
+     * (two's complement). Attention multiplies it by the row's per-head scale.
+     */
+    public static float perTokenHeadValue(KvDType t, int code) {
+        switch (t) {
+            case FP8_PER_TOKEN_HEAD:
+                return fp8Value(KvDType.FP8_E4M3, code);
+            case INT8_PER_TOKEN_HEAD:
+                return (byte) code;
+            case INT4_PER_TOKEN_HEAD:
+                int n = code & 0xF;
+                return (n & 0x8) != 0 ? n - 16 : n;
+            default:
+                throw new IllegalArgumentException(t + " is not a per-token-head KV type");
+        }
     }
 
     // ------------------------------------------------------------------ blocks

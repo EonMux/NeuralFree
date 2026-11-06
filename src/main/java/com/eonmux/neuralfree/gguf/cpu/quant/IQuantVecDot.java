@@ -13,12 +13,16 @@ import java.util.Set;
 
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.shortAt;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.intAt;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.longAt;
 
 /**
  * CPU vec-dot of the importance-matrix types against quantized activations: IQ2_XXS, IQ2_XS, IQ2_S,
- * IQ3_XXS, IQ3_S, IQ1_S, IQ1_M and IQ4_XS against Q8_K, and IQ4_NL against Q8_0. Each kernel is a port of
- * the matching {@code ggml_vec_dot_<type>_q8_*_generic} function of llama.cpp ggml/src/ggml-cpu/quants.c with the
- * same integer sums and the same float accumulation order, so results equal ggml's reference path.
+ * IQ3_XXS, IQ3_S, IQ3_K, IQ3_KS, IQ1_S, IQ1_M and IQ4_XS against Q8_K, and IQ4_NL against Q8_0. Each kernel is a
+ * port of the matching {@code ggml_vec_dot_<type>_q8_*_generic} function of llama.cpp ggml/src/ggml-cpu/quants.c
+ * (IQ3_K and IQ3_KS of Avalon ggml/src/ggml-cpu/quants.c:1254-1324) with the same integer sums and the same float
+ * accumulation order, so results equal ggml's reference path.
  * <p>
  * Weights are read in place from the row buffers of a {@link CpuTensorRef} with absolute little-endian
  * reads; activations come from {@link CpuActivationQuantizer}. Instances are immutable, thread-safe and
@@ -34,18 +38,20 @@ public final class IQuantVecDot implements CpuVecDot {
     public static final IQuantVecDot IQ2_S = new IQuantVecDot(GGMLType.IQ2_S, IQuantVecDot::dotIq2S);
     public static final IQuantVecDot IQ3_XXS = new IQuantVecDot(GGMLType.IQ3_XXS, IQuantVecDot::dotIq3Xxs);
     public static final IQuantVecDot IQ3_S = new IQuantVecDot(GGMLType.IQ3_S, IQuantVecDot::dotIq3S);
+    public static final IQuantVecDot IQ3_K = new IQuantVecDot(GGMLType.IQ3_K, IQuantVecDot::dotIq3K);
+    public static final IQuantVecDot IQ3_KS = new IQuantVecDot(GGMLType.IQ3_KS, IQuantVecDot::dotIq3Ks);
     public static final IQuantVecDot IQ1_S = new IQuantVecDot(GGMLType.IQ1_S, IQuantVecDot::dotIq1S);
     public static final IQuantVecDot IQ1_M = new IQuantVecDot(GGMLType.IQ1_M, IQuantVecDot::dotIq1M);
     public static final IQuantVecDot IQ4_NL = new IQuantVecDot(GGMLType.IQ4_NL, IQuantVecDot::dotIq4Nl);
     public static final IQuantVecDot IQ4_XS = new IQuantVecDot(GGMLType.IQ4_XS, IQuantVecDot::dotIq4Xs);
 
     private static final Map<GGMLType, IQuantVecDot> BY_TYPE = index(
-            IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_NL, IQ4_XS);
+            IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ3_K, IQ3_KS, IQ1_S, IQ1_M, IQ4_NL, IQ4_XS);
 
     /** One row kernel: {@code nb} weight blocks starting at absolute index {@code off} of {@code b}. */
     @FunctionalInterface
     private interface RowKernel {
-        float dot(ByteBuffer b, int off, QuantizedActivations x, int nb);
+        float dot(byte[] b, int off, QuantizedActivations x, int nb);
     }
 
     private final GGMLType type;
@@ -105,14 +111,18 @@ public final class IQuantVecDot implements CpuVecDot {
     @Override
     public float dotRow(CpuTensorRef w, long row, QuantizedActivations x) {
         check(w, x);
-        return kernel.dot(w.rowBuffer(row), w.rowOffset(row), x, (int) (w.cols() / blockElements));
+        return kernel.dot(CpuVecDotRows.copyRow(w, row), 0, x, (int) (w.cols() / blockElements));
+    }
+
+    @Override
+    public float dotRowBytes(byte[] row, int off, QuantizedActivations x) {
+        return kernel.dot(row, off, x, x.n / blockElements);
     }
 
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        final int nb = (int) (w.cols() / blockElements);
-        CpuVecDotRows.forEachRow(w, rowStart, rowCount, y, yOff, (b, off) -> kernel.dot(b, off, x, nb));
+        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
     }
 
     private void check(CpuTensorRef w, QuantizedActivations x) {
@@ -165,7 +175,7 @@ public final class IQuantVecDot implements CpuVecDot {
     // ------------------------------------------------------------------ kernels
 
     /** {@code ggml_vec_dot_iq2_xxs_q8_K_generic} (llama.cpp ggml-cpu/quants.c:906-946). */
-    private static float dotIq2Xxs(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq2Xxs(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         int o = 0;
@@ -175,7 +185,7 @@ public final class IQuantVecDot implements CpuVecDot {
             int q2 = off + IQ2_XXS_QS;
             int bsum = 0;
             for (int ib32 = 0; ib32 < QK_K / 32; ++ib32, q2 += 8) {
-                final long aux = b.getLong(q2);
+                final long aux = longAt(b, q2);
                 final int aux0 = (int) aux;
                 final int aux1 = (int) (aux >>> 32);
                 final int ls = 2 * (aux1 >>> 28) + 1;
@@ -192,7 +202,7 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /** {@code ggml_vec_dot_iq2_xs_q8_K_generic} (llama.cpp ggml-cpu/quants.c:948-996). */
-    private static float dotIq2Xs(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq2Xs(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         int o = 0;
@@ -202,10 +212,10 @@ public final class IQuantVecDot implements CpuVecDot {
             int q2 = off + IQ2_XS_QS;
             int bsum = 0;
             for (int ib32 = 0; ib32 < QK_K / 32; ++ib32, q2 += 8) {
-                final int sc = b.get(off + IQ2_XS_SCALES + ib32) & 0xFF;
+                final int sc = b[off + IQ2_XS_SCALES + ib32] & 0xFF;
                 final int ls1 = 2 * (sc & 0xf) + 1;
                 final int ls2 = 2 * (sc >>> 4) + 1;
-                final long q4 = b.getLong(q2);
+                final long q4 = longAt(b, q2);
                 int sumi = 0;
                 for (int l = 0; l < 2; ++l, o += 8) {
                     final int q = (int) (q4 >>> (16 * l)) & 0xFFFF;
@@ -225,7 +235,7 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /** {@code ggml_vec_dot_iq2_s_q8_K_generic} (llama.cpp ggml-cpu/quants.c:998-1048). */
-    private static float dotIq2S(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq2S(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         int o = 0;
@@ -236,12 +246,12 @@ public final class IQuantVecDot implements CpuVecDot {
             int signs = off + IQ2_S_SIGNS;
             int bsum = 0;
             for (int ib32 = 0; ib32 < QK_K / 32; ++ib32, qs += 4, signs += 4) {
-                final int sc = b.get(off + IQ2_S_SCALES + ib32) & 0xFF;
+                final int sc = b[off + IQ2_S_SCALES + ib32] & 0xFF;
                 final int ls1 = 1 + 2 * (sc & 0xf);
                 final int ls2 = 1 + 2 * (sc >>> 4);
-                final int qh = b.get(off + IQ2_S_QH + ib32) & 0xFF;
-                final int q4 = b.getInt(qs);
-                final int s4 = b.getInt(signs);
+                final int qh = b[off + IQ2_S_QH + ib32] & 0xFF;
+                final int q4 = intAt(b, qs);
+                final int s4 = intAt(b, signs);
                 int sumi1 = 0;
                 int sumi2 = 0;
                 for (int l = 0; l < 2; ++l, o += 8) {
@@ -260,7 +270,7 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /** {@code ggml_vec_dot_iq3_xxs_q8_K_generic} (llama.cpp ggml-cpu/quants.c:1050-1092). */
-    private static float dotIq3Xxs(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq3Xxs(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         int o = 0;
@@ -271,9 +281,9 @@ public final class IQuantVecDot implements CpuVecDot {
             int gas = off + IQ3_XXS_SAS;
             int bsum = 0;
             for (int ib32 = 0; ib32 < QK_K / 32; ++ib32, q3 += 8, gas += 4) {
-                final int aux32 = b.getInt(gas);
+                final int aux32 = intAt(b, gas);
                 final int ls = 2 * (aux32 >>> 28) + 1;
-                final long idx8 = b.getLong(q3);
+                final long idx8 = longAt(b, q3);
                 int sumi = 0;
                 for (int l = 0; l < 4; ++l, o += 8) {
                     final int grid1 = QuantTables.iq3xxsGrid((int) (idx8 >>> (16 * l)) & 0xFF);
@@ -289,7 +299,7 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /** {@code ggml_vec_dot_iq3_s_q8_K_generic} (llama.cpp ggml-cpu/quants.c:1094-1148). */
-    private static float dotIq3S(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq3S(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         int o = 0;
@@ -301,14 +311,14 @@ public final class IQuantVecDot implements CpuVecDot {
             final int qh = off + IQ3_S_QH;
             int bsum = 0;
             for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-                final int sc = b.get(off + IQ3_S_SCALES + ib32 / 2) & 0xFF;
+                final int sc = b[off + IQ3_S_SCALES + ib32 / 2] & 0xFF;
                 final int ls1 = 2 * (sc & 0xf) + 1;
                 final int ls2 = 2 * (sc >>> 4) + 1;
-                bsum += iq3sHalf(b.getLong(qs), b.get(qh + ib32) & 0xFF, b.getInt(signs), q8, o) * ls1;
+                bsum += iq3sHalf(longAt(b, qs), b[qh + ib32] & 0xFF, intAt(b, signs), q8, o) * ls1;
                 qs += 8;
                 signs += 4;
                 o += 32;
-                bsum += iq3sHalf(b.getLong(qs), b.get(qh + ib32 + 1) & 0xFF, b.getInt(signs), q8, o) * ls2;
+                bsum += iq3sHalf(longAt(b, qs), b[qh + ib32 + 1] & 0xFF, intAt(b, signs), q8, o) * ls2;
                 qs += 8;
                 signs += 4;
                 o += 32;
@@ -338,10 +348,80 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /**
+     * {@code ggml_vec_dot_iq3_k_q8_K_generic} (Avalon ggml-cpu/quants.c:1254-1288): the 3-bit grid codes of
+     * {@code dotIq3K} summed against Q8_K, per 16-element half scaled by its {@code 2*ls + 1} scale and sign.
+     */
+    private static float dotIq3K(byte[] b, int off, QuantizedActivations x, int nb) {
+        final byte[] q8 = x.qs;
+        final float[] yd = x.d;
+        int o = 0;
+        float sumf = 0;
+        for (int ibl = 0; ibl < nb; ++ibl, off += IQ3_K_BYTES, o += QK_K) {
+            final int qh = off + IQ3_K_QH;
+            final int scalesH = shortAt(b, off + IQ3_K_SCALES_H) & 0xFFFF;
+            final int extra = shortAt(b, off + IQ3_K_EXTRA) & 0xFFFF;
+            int sumi = 0;
+            for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                final int qs = off + IQ3_K_QS + 32 * (ib32 / 4);
+                final int q8o = o + 32 * ib32;
+                final int shiftL = 2 * (ib32 % 4);
+                final int shiftH = ib32 % 8;
+                final int sl = b[off + IQ3_K_SCALES_L + ib32] & 0xFF;
+                for (int h = 0; h < 2; ++h) {
+                    final int ib = 2 * ib32 + h;
+                    final int ls = (2 * ((sl >>> (4 * h)) & 0xf) + 1) * ((scalesH >>> ib & 1) != 0 ? -1 : 1);
+                    final int grid = (extra >>> ib & 1) != 0 ? 8 : 0;
+                    int s16 = 0;
+                    for (int j = 16 * h; j < 16 * h + 16; ++j) {
+                        s16 += QuantTables.iq3NlValue(((b[qs + j] & 0xFF) >> shiftL & 3)
+                                | ((b[qh + j] & 0xFF) >> shiftH & 1) << 2 | grid) * q8[q8o + j];
+                    }
+                    sumi += ls * s16;
+                }
+            }
+            sumf += fp16At(b, off + IQ3_K_D) * yd[ibl] * sumi;
+        }
+        return sumf;
+    }
+
+    /**
+     * {@code ggml_vec_dot_iq3_ks_q8_K_generic} (Avalon ggml-cpu/quants.c:1291-1324): the same codes with one
+     * signed 5-bit scale per 32-element sub-block.
+     */
+    private static float dotIq3Ks(byte[] b, int off, QuantizedActivations x, int nb) {
+        final byte[] q8 = x.qs;
+        final float[] yd = x.d;
+        int o = 0;
+        float sumf = 0;
+        for (int ibl = 0; ibl < nb; ++ibl, off += IQ3_KS_BYTES, o += QK_K) {
+            final int qh = off + IQ3_KS_QH;
+            final int extra = shortAt(b, off + IQ3_KS_EXTRA) & 0xFFFF;
+            int sumi = 0;
+            for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                final int qs = off + IQ3_KS_QS + 32 * (ib32 / 4);
+                final int q8o = o + 32 * ib32;
+                final int shiftL = 2 * (ib32 % 4);
+                final int shiftH = ib32 % 8;
+                final int ls = ((((b[off + IQ3_KS_SCALES + ib32 % 4] & 0xFF) >>> (4 * (ib32 / 4))) & 0xf)
+                        | ((extra >>> ib32 & 1) << 4)) - 16;
+                final int grid = (extra >>> (8 + ib32) & 1) != 0 ? 8 : 0;
+                int s32 = 0;
+                for (int j = 0; j < 32; ++j) {
+                    s32 += QuantTables.iq3NlValue(((b[qs + j] & 0xFF) >> shiftL & 3)
+                            | ((b[qh + j] & 0xFF) >> shiftH & 1) << 2 | grid) * q8[q8o + j];
+                }
+                sumi += ls * s32;
+            }
+            sumf += fp16At(b, off + IQ3_KS_D) * yd[ibl] * sumi;
+        }
+        return sumf;
+    }
+
+    /**
      * {@code ggml_vec_dot_iq1_s_q8_K_generic} (llama.cpp ggml-cpu/quants.c:1150-1191): the {@code ±IQ1S_DELTA}
      * offset term uses the Q8_K {@code bsums} of each 32-element group.
      */
-    private static float dotIq1S(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq1S(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         final short[] bsums = x.bsums;
@@ -353,10 +433,10 @@ public final class IQuantVecDot implements CpuVecDot {
             int sumi = 0;
             int sumi1 = 0;
             for (int ib = 0; ib < QK_K / 32; ++ib, qs += 4) {
-                final int qh = b.getShort(off + IQ1_S_QH + 2 * ib) & 0xFFFF;
+                final int qh = shortAt(b, off + IQ1_S_QH + 2 * ib) & 0xFFFF;
                 final int ls = 2 * ((qh >>> 12) & 7) + 1;
                 final int delta = (qh & 0x8000) != 0 ? -1 : 1;
-                final int q4 = b.getInt(qs);
+                final int q4 = intAt(b, qs);
                 int lsum = 0;
                 for (int l = 0; l < 4; ++l, o += 8) {
                     final int idx = ((q4 >>> (8 * l)) & 0xFF) | (((qh >>> (3 * l)) & 7) << 8);
@@ -375,7 +455,7 @@ public final class IQuantVecDot implements CpuVecDot {
      * {@code IQ1M_DELTA} offset from {@code qh}, two 3-bit sub-scales per 32 elements, and the super-block
      * half scale assembled from the top nibbles of the four {@code scales} words.
      */
-    private static float dotIq1M(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq1M(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         int o = 0;
@@ -388,13 +468,13 @@ public final class IQuantVecDot implements CpuVecDot {
             int sumi1 = 0;
             int sumi2 = 0;
             for (int ib = 0; ib < QK_K / 32; ++ib, qs += 4, qh += 2) {
-                final int q4 = b.getInt(qs);
+                final int q4 = intAt(b, qs);
                 int sum1Lo = 0;
                 int sum1Hi = 0;
                 int sum2Lo = 0;
                 int sum2Hi = 0;
                 for (int l = 0; l < 4; ++l, o += 8) {
-                    final int h = b.get(qh + l / 2) & 0xFF;
+                    final int h = b[qh + l / 2] & 0xFF;
                     final int idx = ((q4 >>> (8 * l)) & 0xFF) | ((h << (8 - 4 * (l % 2))) & 0x700);
                     final int lsum1 = signedLaneDot8(QuantTables.iq1sGrid(idx), q8, o);
                     final int lsum2 = laneSum8(q8, o);
@@ -407,7 +487,7 @@ public final class IQuantVecDot implements CpuVecDot {
                         sum2Hi += lsum2 * delta;
                     }
                 }
-                final int s16 = b.getShort(sc + 2 * (ib / 2)) & 0xFFFF;
+                final int s16 = shortAt(b, sc + 2 * (ib / 2)) & 0xFFFF;
                 final int ls1 = 2 * ((s16 >>> (6 * (ib % 2))) & 0x7) + 1;
                 final int ls2 = 2 * ((s16 >>> (6 * (ib % 2) + 3)) & 0x7) + 1;
                 sumi1 += sum1Lo * ls1 + sum1Hi * ls2;
@@ -428,7 +508,7 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /** {@code ggml_vec_dot_iq4_nl_q8_0_generic} (llama.cpp ggml-cpu/quants.c:1254-1281). */
-    private static float dotIq4Nl(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq4Nl(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         final int half = QK4_NL / 2;
@@ -439,7 +519,7 @@ public final class IQuantVecDot implements CpuVecDot {
             int sumi1 = 0;
             int sumi2 = 0;
             for (int j = 0; j < half; ++j) {
-                final int q = b.get(qs + j) & 0xFF;
+                final int q = b[qs + j] & 0xFF;
                 sumi1 += q8[o + j] * QuantTables.kvalueIq4nl(q & 0xf);
                 sumi2 += q8[o + j + half] * QuantTables.kvalueIq4nl(q >>> 4);
             }
@@ -449,17 +529,17 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /** {@code ggml_vec_dot_iq4_xs_q8_K_generic} (llama.cpp ggml-cpu/quants.c:1283-1327). */
-    private static float dotIq4Xs(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotIq4Xs(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         int o = 0;
         float sumf = 0;
         for (int ibl = 0; ibl < nb; ++ibl, off += IQ4_XS_BYTES) {
             final float d4d8 = fp16At(b, off + IQ4_XS_D) * yd[ibl];
-            int h = b.getShort(off + IQ4_XS_SCALES_H) & 0xFFFF;
+            int h = shortAt(b, off + IQ4_XS_SCALES_H) & 0xFFFF;
             int qs = off + IQ4_XS_QS;
             for (int ib = 0; ib < QK_K / 32; ib += 2) {
-                final int sl = b.get(off + IQ4_XS_SCALES_L + ib / 2) & 0xFF;
+                final int sl = b[off + IQ4_XS_SCALES_L + ib / 2] & 0xFF;
                 final int ls1 = (sl & 0xf) | ((h << 4) & 0x30);
                 final int ls2 = (sl >>> 4) | ((h << 2) & 0x30);
                 h >>>= 4;
@@ -477,11 +557,11 @@ public final class IQuantVecDot implements CpuVecDot {
     }
 
     /** {@code sumi1 + sumi2} of one 32-element IQ4_XS sub-block: 16 bytes of split nibbles. */
-    private static int iq4Sub(ByteBuffer b, int qs, byte[] q8, int o) {
+    private static int iq4Sub(byte[] b, int qs, byte[] q8, int o) {
         int sumi1 = 0;
         int sumi2 = 0;
         for (int j = 0; j < 16; ++j) {
-            final int q = b.get(qs + j) & 0xFF;
+            final int q = b[qs + j] & 0xFF;
             sumi1 += q8[o + j] * QuantTables.kvalueIq4nl(q & 0xf);
             sumi2 += q8[o + j + 16] * QuantTables.kvalueIq4nl(q >>> 4);
         }

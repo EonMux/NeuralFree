@@ -1,0 +1,41 @@
+/* moe_eplb_map.comp - LLM_MoE_EplbMap: maps logical routed ids to physical replica slots (EPLB).
+ * GLSL twin of LLM_MoE_EplbMap in kernels/llm/moe.cl. Requires: common/nf_common.glsl.
+ *
+ *     LLM_MoE_EplbMap	moe_eplb_map.comp
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_pairs, i k, i n_logical, i map_stride, R int ids, R int replica_count, R int logical_to_physical,
+ *    W int out)
+ *   out[p] = logical_to_physical[e * map_stride + hash(t) % replica_count[e]] for the logical expert e = ids[p] of
+ *   pair p = t * k + j, or -1 for an id outside [0, n_logical). The reference's Knuth multiplicative hash picks one
+ *   of an expert's physical replicas, so exactly one rank computes each pair
+ *   (vllm/model_executor/layers/fused_moe/eplb_triton.py eplb_map_and_record).
+ *
+ * Dispatch: 1-D, local = {L, 1, 1}, global = n_pairs rounded up to L (folding-aware).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfEplbIds { int ids[]; };
+layout(std430, binding = 1) readonly buffer NfEplbReplicas { int replica_count[]; };
+layout(std430, binding = 2) readonly buffer NfEplbMap { int logical_to_physical[]; };
+layout(std430, binding = 3) writeonly buffer NfEplbOut { int out_ids[]; };
+layout(push_constant) uniform NfEplbParams { int n_pairs; int k; int n_logical; int map_stride; } pc;
+
+void main() {
+    const uint p = nf_global_id();
+    if (p >= uint(pc.n_pairs)) {
+        return;
+    }
+    const int e = ids[p];
+    if (e < 0 || e >= pc.n_logical) {
+        out_ids[p] = -1;
+        return;
+    }
+    const uint token = p / uint(pc.k);
+    const uint hashed = token * 2654435769u;
+    const int slot = int(hashed % uint(replica_count[e]));
+    out_ids[p] = logical_to_physical[e * pc.map_stride + slot];
+}

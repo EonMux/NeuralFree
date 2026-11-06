@@ -1,13 +1,14 @@
 package com.eonmux.neuralfree.gguf.ops.moe;
 
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
  * CPU twins of the MoE helper kernels in {@code kernels/llm/moe.cl}, with the same index formulas and
  * accumulation order (pair index {@code p = t * k + j}):
  * {@code LLM_MoE_HashIds} ({@link #hashIds}), {@code LLM_MoE_WeightedSum} ({@link #weightedSum}),
- * {@code LLM_AddId} ({@link #addId}), {@code LLM_MoE_Bucketize} ({@link #bucketize}) and
- * {@code LLM_MoE_ScaleInput} ({@link #scaleInput}).
+ * {@code LLM_AddId} ({@link #addId}), {@code LLM_MoE_Bucketize} ({@link #bucketize}),
+ * {@code LLM_MoE_AlignBlocks} ({@link #alignBlocks}) and {@code LLM_MoE_ScaleInput} ({@link #scaleInput}).
  */
 public final class MoeCombine {
 
@@ -191,6 +192,88 @@ public final class MoeCombine {
             rowSlot[pos] = b < nExpert ? b : -1;
         }
         return new Buckets(counts, offsets, rowToken, rowSlot);
+    }
+
+    /** The aligned layout {@code LLM_MoE_AlignBlocks} writes for the grouped GEMM. */
+    public static final class Aligned {
+        private final int[] gemmToken;
+        private final int[] gemmSlot;
+        private final int tiles;
+
+        private Aligned(int[] gemmToken, int[] gemmSlot, int tiles) {
+            this.gemmToken = gemmToken;
+            this.gemmSlot = gemmSlot;
+            this.tiles = tiles;
+        }
+
+        /** Pair of the real row at each aligned position; -1 for a tile-padding filler. */
+        public int[] gemmToken() { return gemmToken.clone(); }
+        /** Expert of each aligned position; -1 for a filler and for the out-of-range-id bucket. */
+        public int[] gemmSlot() { return gemmSlot.clone(); }
+        /** Tiles that hold at least one real row; the bound is {@code MoeKernels.groupedTiles}. */
+        public int tiles() { return tiles; }
+    }
+
+    /**
+     * Block-aligned copy of the sorted rows for the grouped GEMM ({@code LLM_MoE_AlignBlocks}; the layout of vLLM
+     * moe_align_block_size): from {@link #bucketize}'s counts, offsets and sorted rows, bucket {@code b}'s rows keep
+     * their order at {@code tileBase[b] * MoeKernels.ALIGN_TILE}, tileBase being the exclusive prefix sum of the
+     * buckets' {@code ceil(count / MoeKernels.ALIGN_TILE)} tile counts, and the bucket's tile padding holds -1 in
+     * both arrays. Every tile's first position is a real row, so tile {@code q}'s expert is
+     * {@code gemmSlot[q * MoeKernels.ALIGN_TILE]}.
+     *
+     * @throws IllegalArgumentException when a count or offset does not match the sorted rows
+     */
+    public static Aligned alignBlocks(int nTokens, int k, int nExpert, int[] counts, int[] offsets, int[] rowToken,
+                                      int[] rowSlot) {
+        positive("k", k);
+        positive("n_expert", nExpert);
+        if (nExpert > MoeKernels.MAX_EXPERTS) {
+            throw new IllegalArgumentException("align supports at most " + MoeKernels.MAX_EXPERTS + " experts, got "
+                    + nExpert);
+        }
+        int nRows = nTokens * k;
+        if (counts.length != nExpert || offsets.length != nExpert) {
+            throw new IllegalArgumentException("counts and offsets must hold " + nExpert + " entries, got "
+                    + counts.length + " and " + offsets.length);
+        }
+        if (rowToken.length != nRows || rowSlot.length != nRows) {
+            throw new IllegalArgumentException("the sorted rows must hold " + nRows + " entries, got "
+                    + rowToken.length + " and " + rowSlot.length);
+        }
+        int nb = nExpert + 1;
+        int validTotal = nExpert > 0 ? offsets[nExpert - 1] + counts[nExpert - 1] : 0;
+        if (validTotal < 0 || validTotal > nRows) {
+            throw new IllegalArgumentException("offsets + counts end at " + validTotal + " rows, outside [0, "
+                    + nRows + "]");
+        }
+        int[] tileCounts = new int[nb];
+        int tiles = 0;
+        for (int b = 0; b < nb; b++) {
+            int c = b < nExpert ? counts[b] : nRows - validTotal;
+            if (c < 0) {
+                throw new IllegalArgumentException("bucket " + b + " holds " + c + " rows");
+            }
+            tileCounts[b] = (c + MoeKernels.ALIGN_TILE - 1) / MoeKernels.ALIGN_TILE;
+            tiles += tileCounts[b];
+        }
+        int[] base = new int[nb];
+        for (int b = 0; b < nb; b++) {
+            base[b] = b == 0 ? 0 : base[b - 1] + tileCounts[b - 1];
+        }
+        int[] gemmToken = new int[tiles * MoeKernels.ALIGN_TILE];
+        int[] gemmSlot = new int[tiles * MoeKernels.ALIGN_TILE];
+        Arrays.fill(gemmToken, -1);
+        Arrays.fill(gemmSlot, -1);
+        for (int i = 0; i < nRows; i++) {
+            int b = rowSlot[i];
+            int bi = b < 0 ? nb - 1 : b;
+            int start = b < 0 ? validTotal : offsets[b];
+            int pos = base[bi] * MoeKernels.ALIGN_TILE + (i - start);
+            gemmToken[pos] = rowToken[i];
+            gemmSlot[pos] = b;
+        }
+        return new Aligned(gemmToken, gemmSlot, tiles);
     }
 
     private static int bucket(int id, int nExpert) {

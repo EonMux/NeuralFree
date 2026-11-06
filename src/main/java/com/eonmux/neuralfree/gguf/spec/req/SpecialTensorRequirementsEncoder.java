@@ -39,7 +39,10 @@ public final class SpecialTensorRequirementsEncoder {
         return hp.nLayer() - hp.nLayerDecision();
     }
 
-    /** bert.cpp:23-62. */
+    /**
+     * bert.cpp:23-62. The SPLADE sparse head adds the masked-LM LayerNorm {@code cls.norm} (vLLM bert.py:577) and
+     * the ColBERT head the {@code dense_2} projection (bert.py:753); both load when their converter wrote them.
+     */
     public static List<TensorRequirement> bert() {
         return SpecialTensorRequirements.builder()
                 .model("token_embd.weight")
@@ -47,6 +50,10 @@ public final class SpecialTensorRequirementsEncoder {
                 .model("position_embd.weight")
                 .modelWeightBiasOptional("cls")
                 .modelWeightBiasOptional("cls.output")
+                .modelOptional("cls.norm.weight", "cls.norm.bias")
+                .modelOptional("dense_2.weight", "dense_2.bias")
+                .modelWeightBiasOptional("cls.colbert")
+                .modelWeightBiasOptional("cls.sparse")
                 .modelWeightBias("token_embd_norm")
                 .qkv()
                 .layer("attn_output.weight")
@@ -117,12 +124,13 @@ public final class SpecialTensorRequirementsEncoder {
                 .build();
     }
 
-    /** jina-bert-v3.cpp:13-44. */
+    /** jina-bert-v3.cpp:13-44; the ColBERT head's {@code dense_2} projection loads when present (bert.py:753). */
     public static List<TensorRequirement> jinaBertV3() {
         return SpecialTensorRequirements.builder()
                 .model("token_embd.weight")
                 .modelOptional("token_types.weight")
                 .modelWeightBias("token_embd_norm")
+                .modelOptional("dense_2.weight", "dense_2.bias")
                 .qkv()
                 .layer("attn_output.weight")
                 .layerOptional("attn_output.bias")
@@ -151,7 +159,8 @@ public final class SpecialTensorRequirementsEncoder {
                 .at(blk, true, MODERN_ENC, "attn_qkv.weight", "attn_output.weight", "ffn_up.weight",
                         "ffn_down.weight", "ffn_norm.weight")
                 .modelWeightBiasOptional("cls.output")
-                .modelOptional("cls.weight", "cls.norm.weight")
+                .modelOptional("cls.weight", "cls.bias", "cls.norm.weight", "cls.norm.bias",
+                        "dense_2.weight", "dense_2.bias")
                 .weightBias(blk, true, MODERN_DECISION, "attn_norm", "attn_qkv", "attn_output", "ffn_norm",
                         "ffn_up", "ffn_down")
                 .modelWhen(hp -> hp.nLayerDecision() > 0, "token_types.weight", "cls.bias", "cls.norm.bias",

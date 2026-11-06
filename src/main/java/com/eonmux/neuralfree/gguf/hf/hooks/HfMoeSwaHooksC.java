@@ -30,7 +30,7 @@ import java.util.regex.Pattern;
 /**
  * Hooks of the sliding-window / sink MoE converter classes, part C, the long tail: {@code LagunaModel}
  * (LC/conversion/laguna.py:17-208), {@code MapleModel} (maple.py:15-129), {@code MellumModel}
- * (mellum.py:15-131), {@code ExaoneMoEModel} (LC/conversion/exaone.py:132-229, composed on the HK-B2 Exaone4 hooks)
+ * (mellum.py:15-131), {@code ExaoneMoEModel} (LC/conversion/exaone.py:132-229, composed on the Exaone4 hooks)
  * and {@code SmallThinkerModel} (smallthinker.py:15-83). The Flint/Afmoe/Kolibri-1 and Cohere-2/Granite rows are
  * in {@link HfMoeSwaHooksA}, the MimoV2/Beam classes in {@link HfMoeSwaHooksB} and the Step3.5/MuseSpark classes
  * in {@link HfMoeSwaHooksD}.
@@ -379,9 +379,10 @@ public final class HfMoeSwaHooksC {
         Object window = cfg.find("sliding_window").orElse(null);
         boolean useSliding = useSwa == null || Boolean.TRUE.equals(useSwa);
         // the reference reads the MTP count from the config (mellum.py:26), the expanded
-        // block-count difference as the fallback
-        int nextn = cfg.findInt(0, "num_nextn_predict_layers", "num_mtp_layers");
-        if (nextn == 0) {
+        // block-count difference as the fallback; --no-nextn drops the MTP blocks entirely
+        int nextn = ctx.options().includeMtp()
+                ? cfg.findInt(0, "num_nextn_predict_layers", "num_mtp_layers") : 0;
+        if (nextn == 0 && ctx.options().includeMtp()) {
             nextn = Math.max(0, ctx.blockCount() - cfg.blockCount());
         }
         if (useSliding && window instanceof Number) {
@@ -437,7 +438,7 @@ public final class HfMoeSwaHooksC {
     }
 
     /**
-     * {@code ExaoneMoEModel.set_gguf_parameters} (exaone.py:142-157) after the HK-B2 Exaone4 metadata: the shared and
+     * {@code ExaoneMoEModel.set_gguf_parameters} (exaone.py:142-157) after the Exaone4 metadata: the shared and
      * routed expert widths, the routing scale/norm, the dense lead, NextN and plain RoPE scaling.
      */
     public static void exaoneMoeMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) {
@@ -464,7 +465,7 @@ public final class HfMoeSwaHooksC {
     }
 
     /**
-     * {@code ExaoneMoEModel.modify_tensors} (exaone.py:159-229, on the HK-B2 Exaone4 hooks): the MTP tensors are
+     * {@code ExaoneMoEModel.modify_tensors} (exaone.py:159-229, on the Exaone4 hooks): the MTP tensors are
      * renamed into the appended layer slots and the shared fc/norm/head tensors are replicated into
      * <em>every</em> NextN block (having the shared head so a draft has a head per block, exaone.py:181-199).
      */

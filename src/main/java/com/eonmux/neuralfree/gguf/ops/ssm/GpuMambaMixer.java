@@ -1,12 +1,16 @@
 package com.eonmux.neuralfree.gguf.ops.ssm;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
+import com.eonmux.neuralfree.gguf.engine.RecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.gpu.block.GpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuRecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
@@ -15,6 +19,7 @@ import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuRecurrentState;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
@@ -64,7 +69,7 @@ import java.util.Objects;
  * {@code s[(h*head_dim + p)*d_state + n]}, both in row {@code stateRows[0]} of the layer's recurrent state. Not
  * thread-safe.</p>
  */
-public final class GpuMambaMixer implements GpuMixer {
+public final class GpuMambaMixer implements GpuMixer, GpuRecurrentTreeMixer {
 
     /** Temporary holding the dt projection. */
     static final String TEMP_DT = "ssm.dt";
@@ -99,6 +104,18 @@ public final class GpuMambaMixer implements GpuMixer {
     private GpuProjectionDeltas.Site xDeltas;
     private GpuProjectionDeltas.Site dtDeltas;
     private GpuProjectionDeltas.Site outDeltas;
+    /** The kernels' state-row routing buffer; a batched step re-points it per segment. */
+    private GpuBuffer stateRows;
+    /** The layer's committed conv-state rows, the seed the tree step's stack slot 0 copies. */
+    private GpuBuffer convState;
+    /** The layer's committed scan-state rows, the seed the tree step's stack slot 0 copies. */
+    private GpuBuffer scanState;
+    /** Floats of one conv-state row; the stride the conv kernel indexes a stack slot with. */
+    private int convFloats;
+    /** Floats of one scan-state row; the stride the scan kernel indexes a stack slot with. */
+    private int scanFloats;
+    /** Whether the memory holds per-sequence state rows a batched step routes through. */
+    private boolean routeState;
 
     private ScratchSlot q;
     private ScratchSlot k;
@@ -177,9 +194,13 @@ public final class GpuMambaMixer implements GpuMixer {
         int convStride = (int) SsmBlocks.stateFloats(state.tensors(), LayerMemoryPlan.STATE_CONV,
                 (long) (r.dConv() - 1) * convCh, layer);
         SsmBlocks.stateFloats(state.tensors(), LayerMemoryPlan.STATE_SCAN, geo.stateFloats(), layer);
-        GpuBuffer convState = state.tensor(LayerMemoryPlan.STATE_CONV);
-        GpuBuffer scanState = state.tensor(LayerMemoryPlan.STATE_SCAN);
-        GpuBuffer stateRows = memory.stepInputs().stateRows();
+        this.convState = state.tensor(LayerMemoryPlan.STATE_CONV);
+        this.scanState = state.tensor(LayerMemoryPlan.STATE_SCAN);
+        this.convFloats = convStride;
+        this.scanFloats = (int) geo.stateFloats();
+        this.stateRows = memory.stepInputs().stateRows();
+        routeState = memory instanceof com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory
+                && memory.pagedSequences() != null;
         GpuBuffer ph = ctx.placeholders().readOnlyFloats();
 
         q = slot(scratch, ScratchSlots.Q, Math.max(inWidth, Math.max(xdbWidth, dInner)));
@@ -497,41 +518,86 @@ public final class GpuMambaMixer implements GpuMixer {
 
     @Override
     public void decode(int pos, ScratchSlot in, ScratchSlot out) {
-        forward(1, in, out);
+        forward(1, in.buffer(), in.offset(), out.buffer(), out.offset());
     }
 
     @Override
     public void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
-        forward(nTokens, in, out);
+        forward(nTokens, in.buffer(), in.offset(), out.buffer(), out.offset());
+    }
+
+    /** Why this mixer runs a batched step: every sequence's rows dispatch as its own contiguous step. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
+    /**
+     * One batched step: every segment of {@code s} dispatches its rows as the contiguous step, reading and
+     * writing its sequence's recurrent-state row (the kernels route through the state-row buffer the mixer
+     * re-points per segment) and reading its rows at their place in the step's input and output.
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        if (s.contiguousSingle()) {
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        long n = (long) s.nTokens() * nEmbd;
+        in.require(n);
+        out.require(n);
+        checkExternal(in);
+        checkExternal(out);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            forward(s.len(seg), in.buffer(), in.offset() + start * nEmbd, out.buffer(),
+                    out.offset() + start * nEmbd, s.seq(seg));
+        }
     }
 
     private void forward(int nTokens, ScratchSlot in, ScratchSlot out) {
+        forward(nTokens, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
+    }
+
+    private void forward(int nTokens, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff) {
+        forward(nTokens, inBuf, inOff, outBuf, outOff, 0);
+    }
+
+    private void forward(int nTokens, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff, int stateRow) {
         if (!bound || closed) {
             throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
         }
         if (nTokens < 1 || nTokens > ubatch) {
             throw new IllegalArgumentException(kind + " step of " + nTokens + " tokens is outside [1, " + ubatch + "]");
         }
-        long n = (long) nTokens * nEmbd;
-        in.require(n);
-        out.require(n);
-        checkExternal(in);
-        checkExternal(out);
+        route(stateRow);
         switch (kind) {
             case MAMBA1:
-                stepMamba1(nTokens, in, out);
+                stepMamba1(nTokens, inBuf, inOff, outBuf, outOff);
                 break;
             case MAMBA2:
-                stepMamba2(nTokens, in, out);
+                stepMamba2(nTokens, inBuf, inOff, outBuf, outOff);
                 break;
             default:
-                stepPlamo2(nTokens, in, out);
+                stepPlamo2(nTokens, inBuf, inOff, outBuf, outOff);
                 break;
         }
     }
 
-    private void stepMamba1(int t, ScratchSlot in, ScratchSlot out) {
-        projectIn(t, in);
+    /** Points the kernels' state-row routing at {@code stateRow} before the segment's dispatches. */
+    private void route(int stateRow) {
+        if (!routeState) {
+            return;
+        }
+        GpuMixer.routeStateRow(stateRow, stateRows, ops.queue());
+    }
+
+    private void stepMamba1(int t, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff) {
+        projectIn(t, inBuf, inOff);
         runTokens(conv, SsmKernels.ARG_CONV_N_TOKENS, t);
         ops.matmul(ssmX, k.buffer(), k.offset(), v.buffer(), v.offset(), t);
         xDeltas.applyRows(t, k.buffer(), k.offset(), v.buffer(), v.offset());
@@ -543,11 +609,11 @@ public final class GpuMambaMixer implements GpuMixer {
         projectDt(t, v, attnOut);
         runTokens(scan, SsmKernels.ARG_SCAN_N_TOKENS, t);
         runElements(gate, t * dInner);
-        projectOut(t, v, out);
+        projectOut(t, v.buffer(), v.offset(), outBuf, outOff);
     }
 
-    private void stepMamba2(int t, ScratchSlot in, ScratchSlot out) {
-        projectIn(t, in);
+    private void stepMamba2(int t, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff) {
+        projectIn(t, inBuf, inOff);
         runTokens(conv, SsmKernels.ARG_CONV_N_TOKENS, t);
         runTokens(scan, SsmKernels.ARG_SCAN_N_TOKENS, t);
         runElements(gate, t * dInner);
@@ -556,11 +622,11 @@ public final class GpuMambaMixer implements GpuMixer {
             groupNorm.setGlobal(NormKernels.reduceGlobal(NormKernels.groupRmsGroups(t, nGroup), reduceLocal));
             groupNorm.dispatch();
         }
-        projectOut(t, v, out);
+        projectOut(t, v.buffer(), v.offset(), outBuf, outOff);
     }
 
-    private void stepPlamo2(int t, ScratchSlot in, ScratchSlot out) {
-        projectIn(t, in);
+    private void stepPlamo2(int t, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff) {
+        projectIn(t, inBuf, inOff);
         int rows = t * nHead;
         ops.copy2d(q.buffer(), q.offset() + headDim, 2 * headDim, k.buffer(), k.offset(), headDim, rows, headDim);
         ops.copy2d(q.buffer(), q.offset(), 2 * headDim, v.buffer(), v.offset(), headDim, rows, headDim);
@@ -573,19 +639,19 @@ public final class GpuMambaMixer implements GpuMixer {
         projectDt(t, q, k);
         runTokens(scan, SsmKernels.ARG_SCAN_N_TOKENS, t);
         runElements(gate, t * dInner);
-        projectOut(t, q, out);
+        projectOut(t, q.buffer(), q.offset(), outBuf, outOff);
     }
 
     /** {@code ssm_in} of the step's rows into {@code q}, plus its deltas. */
-    private void projectIn(int t, ScratchSlot in) {
-        ops.matmul(ssmIn, in.buffer(), in.offset(), q.buffer(), q.offset(), t);
-        inDeltas.applyRows(t, in.buffer(), in.offset(), q.buffer(), q.offset());
+    private void projectIn(int t, GpuBuffer inBuf, int inOff) {
+        ops.matmul(ssmIn, inBuf, inOff, q.buffer(), q.offset(), t);
+        inDeltas.applyRows(t, inBuf, inOff, q.buffer(), q.offset());
     }
 
     /** {@code ssm_out} of the gated rows {@code y} into {@code out}, plus its deltas. */
-    private void projectOut(int t, ScratchSlot y, ScratchSlot out) {
-        ops.matmul(ssmOut, y.buffer(), y.offset(), out.buffer(), out.offset(), t);
-        outDeltas.applyRows(t, y.buffer(), y.offset(), out.buffer(), out.offset());
+    private void projectOut(int t, GpuBuffer yBuf, int yOff, GpuBuffer outBuf, int outOff) {
+        ops.matmul(ssmOut, yBuf, yOff, outBuf, outOff, t);
+        outDeltas.applyRows(t, yBuf, yOff, outBuf, outOff);
     }
 
     /**
@@ -619,6 +685,64 @@ public final class GpuMambaMixer implements GpuMixer {
         d.setInt(SsmKernels.ARG_GATE_N, n);
         d.setGlobal(SsmKernels.elementwiseGlobal(n, EL_LOCAL));
         d.dispatch();
+    }
+
+    @Override
+    public String treeStepRefusal() {
+        return null;
+    }
+
+    @Override
+    public int treeRowWidth() {
+        return nEmbd;
+    }
+
+    @Override
+    public void treeStep(GpuRecurrentTreeRound round, ScratchSlot in, ScratchSlot out) {
+        if (!bound || closed) {
+            throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
+        }
+        long[] mask = round.mask();
+        int realRows = round.realRows();
+        GpuBuffer convStack = round.convStack();
+        GpuBuffer scanStack = round.scanStack();
+        // the stateful kernels read the round's stack slots instead of the committed rows for the step; the
+        // per-row routing still rides the live routing buffer, so every dispatch addresses its slot
+        conv.setBuffer(SsmKernels.CONV_ARG_STATE, convStack);
+        scan.setBuffer(SsmKernels.SCAN_ARG_STATE, scanStack);
+        try {
+            for (int row = 0; row < realRows; row++) {
+                int depth = RecurrentTreeRound.depth(mask[row]);
+                if (depth < 0) {
+                    throw new IllegalArgumentException("the tree step's row " + row + " is padding, the mixer runs"
+                            + " the computed rows");
+                }
+                int parent = RecurrentTreeRound.parentRow(mask[row], row);
+                seedStack(round.queue(), convStack, row, depth, parent, convFloats, convState);
+                seedStack(round.queue(), scanStack, row, depth, parent, scanFloats, scanState);
+                forward(1, in.buffer(), in.offset() + row * nEmbd, out.buffer(), out.offset() + row * nEmbd, row);
+            }
+        } finally {
+            conv.setBuffer(SsmKernels.CONV_ARG_STATE, convState);
+            scan.setBuffer(SsmKernels.SCAN_ARG_STATE, scanState);
+        }
+    }
+
+    /**
+     * Enqueues the copy that fills the row's stack slot: the committed rows at the root, else the parent row's
+     * slot.
+     */
+    private static void seedStack(ComputeQueue queue, GpuBuffer stack, int row, int depth, int parent, int stride,
+                                  GpuBuffer committed) {
+        if (stride == 0) {
+            return;
+        }
+        long bytes = (long) stride * Float.BYTES;
+        if (depth == 0) {
+            queue.enqueueCopyBuffer(committed, 0, stack, (long) row * bytes, bytes);
+        } else {
+            queue.enqueueCopyBuffer(stack, (long) parent * bytes, stack, (long) row * bytes, bytes);
+        }
     }
 
     /** Rejects a caller view living in one of this mixer's working buffers. */

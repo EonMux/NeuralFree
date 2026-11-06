@@ -3,15 +3,19 @@
  *
  * A variants row selects the cache type with KV=NF_KV_<type> (common/kv_types.glsl).
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
- *   (i n_tokens, i row_elems, i src_row_stride, i src_off, i dst_row_stride, R float src, R int cell_idx, W dst)
+ *   F32/F16/BF16/FP8 (i n_tokens, i row_elems, i src_row_stride, i src_off, i dst_row_stride,
+ *                     [, i head_elems (FP8)] R float src, R int cell_idx, [, R float kv_scale (FP8)] W dst)
+ *   per-token-head   (i n_tokens, i row_elems, i src_row_stride, i src_off, i dst_row_stride, i head_elems,
+ *                     i v_side, R float src, R int cell_idx, W dst, W float scales)
  * ggml_set_rows (llama-kv-cache.cpp:1353): row cell_idx[t] of dst <- elements [0, row_elems) of the src
  * row at src[src_off + t*src_row_stride]; a negative cell skips the token. dst element e of row r is cache
  * element r*dst_row_stride + e: F32 as is, F16 / BF16 rounded to nearest even, block types quantized by the
- * reference quantizer of the type (common/kv_quant.glsl) and written as 16-bit words.
+ * reference quantizer of the type and written as 16-bit words, FP8 as the RNE saturating code of value /
+ * kv_scale[e / head_elems] (the cache's per-head KV scale, vLLM reshape_and_cache_fp8).
  *
- * Dispatch: 1-D; F32/F16/BF16 one invocation per element (g = t*row_elems + e), block types one per 32-element
- * block (g = t*(row_elems/32) + b); global rounded up to L, local = {L, 1, 1}; folded group counts are recovered
- * by nf_global_id(). No barriers.
+ * Dispatch: 1-D; F32/F16/BF16/FP8 one invocation per element (g = t*row_elems + e), block types one per 32-element
+ * block (g = t*(row_elems/32) + b), per-token-head one per (token, KV head) (g = t*heads + h); global rounded up to
+ * L, local = {L, 1, 1}; folded group counts are recovered by nf_global_id(). No barriers.
  */
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -25,9 +29,21 @@
 #error "kv_store.comp requires KV"
 #endif
 
+#define NF_KVS_FP8 (KV == NF_KV_FP8_E4M3 || KV == NF_KV_FP8_E5M2)
+#define NF_KVS_PT (KV == NF_KV_FP8_PER_TOKEN_HEAD || KV == NF_KV_INT8_PER_TOKEN_HEAD \
+    || KV == NF_KV_INT4_PER_TOKEN_HEAD)
+#define NF_KVS_VENDOR (KV >= NF_KV_NVFP4)
+
 layout(std430, binding = 0) readonly buffer NfKvsSrc { float src[]; };
 layout(std430, binding = 1) readonly buffer NfKvsCell { int cell_idx[]; };
-#if KV == NF_KV_F32
+#if NF_KVS_PT
+NF_BUFFER_VIEWS_RW(2, dst)
+NF_KV_STORES(dst)
+layout(std430, binding = 3) writeonly buffer NfKvsScales { float scales[]; };
+#elif NF_KVS_FP8
+layout(std430, binding = 2) readonly buffer NfKvsScale { float kv_scale[]; };
+layout(std430, binding = 3) writeonly buffer NfKvsDst { uint8_t dst[]; };
+#elif KV == NF_KV_F32
 layout(std430, binding = 2) writeonly buffer NfKvsDst { float dst[]; };
 #elif KV == NF_KV_F16 || KV == NF_KV_BF16
 layout(std430, binding = 2) writeonly buffer NfKvsDst { uint16_t dst[]; };
@@ -36,6 +52,10 @@ layout(std430, binding = 2) writeonly buffer NfKvsDst { uint16_t dst[]; };
 #define NF_KVS_BLOCKS 1
 NF_BUFFER_VIEWS_RW(2, dst)
 NF_KV_STORES(dst)
+#elif NF_KVS_VENDOR
+layout(std430, binding = 2) readonly buffer NfKvsScale { float kv_scale[]; };
+NF_BUFFER_VIEWS_RW(3, dst)
+NF_BUFFER_VIEWS_RW(4, side)
 #else
 #error "kv_store.comp: KV is not a KV cache type"
 #endif
@@ -46,11 +66,260 @@ layout(push_constant) uniform NfKvsParams {
     int src_row_stride;
     int src_off;
     int dst_row_stride;
+#if NF_KVS_FP8 || NF_KVS_PT || NF_KVS_VENDOR
+    int head_elems;
+#endif
+#if NF_KVS_VENDOR
+    int plane_stride;
+    int plane_off;
+#endif
+#if NF_KVS_PT
+    int v_side;
+#endif
 } pc;
+
+#if NF_KVS_VENDOR
+/* In-place normalized Sylvester Hadamard transform of a private row of n values (kernels/llm/common/hadamard.h). */
+void nf_kvs_fwht(inout float buf[NF_KV_TQ_MAX_DIM], uint n) {
+    for (uint h = 1u; h < n; h <<= 1u) {
+        for (uint p = 0u; p < (n >> 1u); ++p) {
+            const uint i = ((p & ~(h - 1u)) << 1u) | (p & (h - 1u));
+            const float a = buf[i];
+            const float c = buf[i + h];
+            buf[i] = a + c;
+            buf[i + h] = a - c;
+        }
+    }
+    const float scale = 1.0 / sqrt(float(n));
+    for (uint k = 0u; k < n; ++k) {
+        buf[k] *= scale;
+    }
+}
+
+/* Squared reconstruction error of one NVFP4 group under scale sf (KvVendorCodec.reconstructionError). */
+float nf_kvs_nvfp4_error(float x[NF_KV_NVFP4_GROUP], float sf) {
+    const float out_scale = sf != 0.0 ? 1.0 / sf : 0.0;
+    const float dequant = out_scale != 0.0 ? 1.0 / out_scale : 0.0;
+    float err = 0.0;
+    for (uint i = 0u; i < NF_KV_NVFP4_GROUP; ++i) {
+        const float q = nf_kv_e2m1_value(nf_kv_e2m1_code(x[i] * out_scale)) * dequant;
+        const float d = q - x[i];
+        err += d * d;
+    }
+    return err;
+}
+
+/* Index of y among the sorted Lloyd-Max centroids (KvVendorCodec.centroidIndex). */
+uint nf_kvs_centroid_index(float y, uint levels, uint ctr_off) {
+    uint lo = 0u;
+    uint hi = levels - 1u;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1u;
+        const float c0 = uintBitsToFloat(side_u32[ctr_off + mid]);
+        const float c1 = uintBitsToFloat(side_u32[ctr_off + mid + 1u]);
+        if (y >= 0.5 * (c0 + c1)) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* Stores the head_elems values x[0, head_elems) of KV head h of one vendor cache row (kv_cache.cl). */
+void nf_kvs_store_head(float x[NF_KV_VENDOR_MAX_ROW], uint head_elems, uint heads, uint cell, uint in_row, uint h,
+                       float kv_scale) {
+    const uint row_bytes = nf_kv_vendor_row_bytes(KV, uint(pc.dst_row_stride));
+    const uint dbase = cell * row_bytes;
+    const uint pbase = nf_kv_side_plane_base(heads) + cell * uint(pc.plane_stride) + uint(pc.plane_off);
+    const uint ctr_off = 2u * heads;
+    if (KV == NF_KV_NVFP4 || KV == NF_KV_NVFP4_4OVER6) {
+        const uint groups = head_elems / NF_KV_NVFP4_GROUP;
+        const float scale = kv_scale != 0.0 ? kv_scale : 1.0;
+        for (uint g = 0u; g < groups; ++g) {
+            float grp[NF_KV_NVFP4_GROUP];
+            float amax = 0.0;
+            for (uint i = 0u; i < NF_KV_NVFP4_GROUP; ++i) {
+                grp[i] = x[g * NF_KV_NVFP4_GROUP + i] / scale;
+                amax = max(amax, abs(grp[i]));
+            }
+            uint code = nf_kv_fp8_e4m3_bits(amax / 6.0);
+            if (KV == NF_KV_NVFP4_4OVER6) {
+                const uint code4 = nf_kv_fp8_e4m3_bits(amax / 4.0);
+                if (nf_kvs_nvfp4_error(grp, nf_kv_e4m3(code4)) < nf_kvs_nvfp4_error(grp, nf_kv_e4m3(code))) {
+                    code = code4;
+                }
+            }
+            side_u8[pbase + h * groups + g] = uint8_t(code);
+            const float sf = nf_kv_e4m3(code);
+            const float inv = sf != 0.0 ? 1.0 / sf : 0.0;
+            for (uint i = 0u; i < NF_KV_NVFP4_GROUP; i += 2u) {
+                const uint lo = nf_kv_e2m1_code(grp[i] * inv);
+                const uint hi = nf_kv_e2m1_code(grp[i + 1u] * inv);
+                dst_u8[dbase + (in_row >> 1u) + g * (NF_KV_NVFP4_GROUP / 2u) + (i >> 1u)] = uint8_t(lo | (hi << 4u));
+            }
+        }
+        return;
+    }
+    if (KV == NF_KV_TQ_K8_KEYS) {
+        for (uint i = 0u; i < head_elems; ++i) {
+            dst_u8[dbase + in_row + i] = uint8_t(nf_kv_fp8_e4m3_bits(x[i]));
+        }
+        return;
+    }
+    const uint bits = uint(nf_kv_tq_bits(KV));
+    const uint code_bytes = head_elems * bits / 8u;
+    if (KV == NF_KV_TQ_4BIT_VALUES || KV == NF_KV_TQ_3BIT_VALUES) {
+        const uint levels = (1u << bits) - 1u;
+        float vmin = x[0];
+        float vmax = x[0];
+        for (uint i = 1u; i < head_elems; ++i) {
+            vmin = min(vmin, x[i]);
+            vmax = max(vmax, x[i]);
+        }
+        float s = (vmax - vmin) / float(levels);
+        s = s > 1e-8 ? s : 1e-8;
+        side_u16[(pbase >> 1u) + h] = uint16_t(nf_rope_f16_bits(s));
+        side_u16[(pbase >> 1u) + heads + h] = uint16_t(nf_rope_f16_bits(vmin));
+        const uint bbase = dbase + h * code_bytes;
+        for (uint i = 0u; i < head_elems; ++i) {
+            const uint q = uint(clamp(int((x[i] - vmin) / s + 0.5), 0, int(levels)));
+            const uint bit = i * bits;
+            const uint at = bbase + (bit >> 3u);
+            const uint sh = bit & 7u;
+            if (bits == 4u) {
+                const uint old = uint(dst_u8[at]);
+                dst_u8[at] = (i & 1u) == 0u ? uint8_t((old & 0xF0u) | q) : uint8_t((old & 0x0Fu) | (q << 4u));
+            } else {
+                /* one work-item owns the whole head, so the 3-byte groups never interleave */
+                uint raw = uint(dst_u8[at]);
+                if (sh > 5u) raw |= uint(dst_u8[at + 1u]) << 8;
+                raw = (raw & ~(7u << sh)) | (q << sh);
+                dst_u8[at] = uint8_t(raw & 0xFFu);
+                if (sh > 5u) dst_u8[at + 1u] = uint8_t((raw >> 8u) & 0xFFu);
+            }
+        }
+        return;
+    }
+    if (KV == NF_KV_TQ_4BIT_KEYS || KV == NF_KV_TQ_3BIT_KEYS) {
+        const uint levels = 1u << bits;
+        float sum = 0.0;
+        for (uint i = 0u; i < head_elems; ++i) {
+            sum += x[i] * x[i];
+        }
+        const float norm = sqrt(sum);
+        float rot[NF_KV_TQ_MAX_DIM];
+        for (uint i = 0u; i < head_elems; ++i) {
+            rot[i] = x[i] / (norm + 1e-8);
+        }
+        nf_kvs_fwht(rot, head_elems);
+        side_u16[(pbase >> 1u) + h] = uint16_t(nf_rope_f16_bits(norm));
+        const uint bbase = dbase + h * code_bytes;
+        for (uint i = 0u; i < head_elems; ++i) {
+            const uint q = nf_kvs_centroid_index(rot[i], levels, ctr_off);
+            const uint bit = i * bits;
+            const uint at = bbase + (bit >> 3u);
+            const uint sh = bit & 7u;
+            if (bits == 4u) {
+                const uint old = uint(dst_u8[at]);
+                dst_u8[at] = (i & 1u) == 0u ? uint8_t((old & 0xF0u) | q) : uint8_t((old & 0x0Fu) | (q << 4u));
+            } else {
+                uint raw = uint(dst_u8[at]);
+                if (sh > 5u) raw |= uint(dst_u8[at + 1u]) << 8;
+                raw = (raw & ~(7u << sh)) | (q << sh);
+                dst_u8[at] = uint8_t(raw & 0xFFu);
+                if (sh > 5u) dst_u8[at + 1u] = uint8_t((raw >> 8u) & 0xFFu);
+            }
+        }
+        return;
+    }
+    if (KV == NF_KV_FP8_DS_MLA) {
+        for (uint t = 0u; t < NF_KV_DS_MLA_NOPE / NF_KV_DS_MLA_TILE; ++t) {
+            const uint base = t * NF_KV_DS_MLA_TILE;
+            float amax = 0.0;
+            for (uint i = 0u; i < NF_KV_DS_MLA_TILE; ++i) {
+                amax = max(amax, abs(x[base + i]));
+            }
+            const float sc = exp2(ceil(log2(max(amax / 448.0, 1e-4))));
+            side_u32[(pbase >> 2u) + t] = floatBitsToUint(sc);
+            for (uint i = 0u; i < NF_KV_DS_MLA_TILE; ++i) {
+                dst_u8[dbase + base + i] = uint8_t(nf_kv_fp8_e4m3_bits(x[base + i] / sc));
+            }
+        }
+        for (uint i = 0u; i < NF_KV_DS_MLA_ROPE; ++i) {
+            const uint b = nf_kv_bf16_bits(x[NF_KV_DS_MLA_NOPE + i]);
+            dst_u16[(dbase + NF_KV_DS_MLA_NOPE) / 2u + i] = uint16_t(b);
+        }
+        return;
+    }
+    for (uint g = 0u; g < NF_KV_DS_MLA_NOPE / NF_KV_NVFP4_GROUP; ++g) {
+        float grp[NF_KV_NVFP4_GROUP];
+        float amax = 0.0;
+        for (uint i = 0u; i < NF_KV_NVFP4_GROUP; ++i) {
+            grp[i] = x[g * NF_KV_NVFP4_GROUP + i];
+            amax = max(amax, abs(grp[i]));
+        }
+        const uint code = nf_kv_fp8_e4m3_bits(max(amax / 6.0, 0.001953125));
+        side_u8[pbase + g] = uint8_t(code);
+        const float sf = nf_kv_e4m3(code);
+        const float inv = sf != 0.0 ? 1.0 / sf : 0.0;
+        for (uint i = 0u; i < NF_KV_NVFP4_GROUP; i += 2u) {
+            const uint lo = nf_kv_e2m1_code(grp[i] * inv);
+            const uint hi = nf_kv_e2m1_code(grp[i + 1u] * inv);
+            dst_u8[dbase + g * (NF_KV_NVFP4_GROUP / 2u) + (i >> 1u)] = uint8_t(lo | (hi << 4u));
+        }
+    }
+    for (uint i = 0u; i < NF_KV_DS_MLA_ROPE; ++i) {
+        dst_u8[dbase + NF_KV_DS_MLA_NOPE / 2u + i] = uint8_t(nf_kv_fp8_e4m3_bits(x[NF_KV_DS_MLA_NOPE + i]));
+    }
+}
+#endif
 
 void main() {
     const uint gid = nf_global_id();
     const uint row_elems = uint(max(pc.row_elems, 0));
+#if NF_KVS_VENDOR
+    const uint heads = pc.head_elems > 0 ? row_elems / uint(pc.head_elems) : 0u;
+    if (heads == 0u || gid >= uint(pc.n_tokens) * heads) {
+        return;
+    }
+    const uint t = gid / heads;
+    const uint h = gid - t * heads;
+    const int cell = cell_idx[t];
+    if (cell < 0) {
+        return;
+    }
+    float x[NF_KV_VENDOR_MAX_ROW];
+    const uint srow = uint(pc.src_off) + t * uint(pc.src_row_stride) + h * uint(pc.head_elems);
+    for (uint e = 0u; e < uint(pc.head_elems); ++e) {
+        x[e] = src[srow + e];
+    }
+    nf_kvs_store_head(x, uint(pc.head_elems), heads, uint(cell), h * uint(pc.head_elems), h,
+                      kv_scale[min(h, 2047u)]);
+#elif NF_KVS_PT
+    const uint heads = pc.head_elems > 0 ? row_elems / uint(pc.head_elems) : 0u;
+    if (heads == 0u || gid >= uint(pc.n_tokens) * heads) {
+        return;
+    }
+    const uint t = gid / heads;
+    const uint h = gid - t * heads;
+    const int cell = cell_idx[t];
+    if (cell < 0) {
+        return;
+    }
+    const uint srow = uint(pc.src_off) + t * uint(pc.src_row_stride) + h * uint(pc.head_elems);
+    float amax = 0.0;
+    for (uint e = 0u; e < uint(pc.head_elems); ++e) {
+        amax = max(amax, abs(src[srow + e]));
+    }
+    const int kv_type = KV;
+    const float scale = max(amax / nf_kv_pt_qmax(kv_type), 1e-6);
+    scales[(uint(cell) * 2u + uint(pc.v_side)) * heads + h] = scale;
+    const uint dbase = uint(cell) * uint(pc.dst_row_stride) + h * uint(pc.head_elems);
+    for (uint e = 0u; e < uint(pc.head_elems); ++e) {
+        dst_kv_pt_store1(dbase + e, src[srow + e] / scale, kv_type);
+    }
+#else
 #if defined(NF_KVS_BLOCKS)
     const uint per_token = row_elems / NF_KV_BLOCK;
 #else
@@ -67,7 +336,10 @@ void main() {
     }
     const uint srow = uint(pc.src_off) + t * uint(pc.src_row_stride);
 
-#if KV == NF_KV_F32
+#if NF_KVS_FP8
+    dst[uint(cell) * uint(pc.dst_row_stride) + j] =
+        uint8_t(nf_kv_fp8_bits(src[srow + j] / kv_scale[j / uint(max(pc.head_elems, 1))], KV));
+#elif KV == NF_KV_F32
     dst[uint(cell) * uint(pc.dst_row_stride) + j] = src[srow + j];
 #elif KV == NF_KV_F16
     dst[uint(cell) * uint(pc.dst_row_stride) + j] = uint16_t(nf_rope_f16_bits(src[srow + j]));
@@ -80,5 +352,6 @@ void main() {
         x[k] = src[xb + k];
     }
     dst_kv_store_block(uint(cell) * uint(pc.dst_row_stride) + j * NF_KV_BLOCK, x, KV);
+#endif
 #endif
 }

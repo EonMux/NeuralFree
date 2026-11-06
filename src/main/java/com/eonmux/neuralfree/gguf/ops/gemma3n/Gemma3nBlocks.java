@@ -5,11 +5,13 @@ import com.eonmux.neuralfree.gguf.cpu.block.CpuFfnFactory;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuLayerExtra;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixerFactory;
+import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuFfnFactory;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtra;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuLayerExtraFactory;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixerFactory;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
+import com.eonmux.neuralfree.gguf.memory.SequenceState;
 import com.eonmux.neuralfree.gguf.ops.hc.HcKernels;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -183,9 +185,22 @@ public final class Gemma3nBlocks {
      * (gemma3n.cpp:320-373, gemma4.cpp:182-190 and 480-533, gemma-embedding2.cpp:219-232). Layer {@code il} reads the
      * {@code [n_tokens][width]} view at offset {@code il*width} with row stride {@code n_layer*width}. The width is
      * {@code n_embd_altup} for gemma3n and {@code n_embd_per_layer} otherwise; gemma-embedding2 has no token table.
-     * Immutable.
+     * An embedding row ({@code prompt_embeds}, a media row) has no token, so its {@code per_layer_token_embd} row is
+     * the padding token's, row {@link #EMBEDDING_ROW_TOKEN} (gemma3n.cpp:329-349, gemma4.cpp:490-509), and the
+     * projection and scales run as for tokens. Immutable.
      */
     static final class PleLayout {
+        /** The token whose {@code per_layer_token_embd} row an embedding row reads: the padding token, id 0. */
+        static final int EMBEDDING_ROW_TOKEN = 0;
+
+        /**
+         * The {@code per_layer_token_embd} row of step id {@code id}: the id of a token row, or
+         * {@link #EMBEDDING_ROW_TOKEN} for an embedding row, whose step id is the null token (negative).
+         */
+        static int tableRow(int id) {
+            return id < 0 ? EMBEDDING_ROW_TOKEN : id;
+        }
+
         private final String arch;
         private final int nEmbd;
         private final int nLayer;
@@ -333,6 +348,7 @@ public final class Gemma3nBlocks {
         private final int nHeads;
         private final int headDim;
         private final int eos;
+        private final int standIn;
         private final long[] multipliers;
         private final long[] offsets;
         private final long[] vocab;
@@ -340,7 +356,7 @@ public final class Gemma3nBlocks {
         private final float eps;
 
         private NgramLayout(String arch, int hc, int nEmbd, int nGram, int perGram, int nHeads, int headDim, int eos,
-                            long[] multipliers, long[] offsets, long[] vocab, int kernel, float eps) {
+                            int standIn, long[] multipliers, long[] offsets, long[] vocab, int kernel, float eps) {
             this.arch = arch;
             this.hc = hc;
             this.nEmbd = nEmbd;
@@ -349,6 +365,7 @@ public final class Gemma3nBlocks {
             this.nHeads = nHeads;
             this.headDim = headDim;
             this.eos = eos;
+            this.standIn = standIn;
             this.multipliers = multipliers;
             this.offsets = offsets;
             this.vocab = vocab;
@@ -421,7 +438,7 @@ public final class Gemma3nBlocks {
             requireElements(arch, tc.require(stack, wl, TensorNames.weight(TensorNames.PLE_NORM_CONV)), d);
             requireShape(arch, tc.require(stack, wl, TensorNames.weight(TensorNames.PLE_CONV1D)), kernel, d);
             return new NgramLayout(arch, hc, nEmbd, nGram, perGram, nHeads, headDim, hp.pleEosTokenId(),
-                    Arrays.copyOf(mult, nGram), Arrays.copyOf(off, nHeads), Arrays.copyOf(voc, nHeads), kernel,
+                    EmbeddingRowSupport.ngramStandIn(hp), Arrays.copyOf(mult, nGram), Arrays.copyOf(off, nHeads), Arrays.copyOf(voc, nHeads), kernel,
                     hp.normRmsEps());
         }
 
@@ -444,11 +461,54 @@ public final class Gemma3nBlocks {
         float scoreScale() { return 1.0f / (float) Math.sqrt((float) nEmbd); }
         /** Positions before the step that the hash reads: {@code ngram - 1}. */
         int lookBehind() { return nGram - 1; }
+        /** The id an embedding row hashes and records ({@link EmbeddingRowSupport#ngramStandIn}). */
+        int standIn() { return standIn; }
+
+        /**
+         * Completes the hash window of one segment of {@code n} rows of one sequence whose first row sits at
+         * position {@code pos0}, its tokens already at {@code window[lookBehind() ..]} ({@code -1} for an embedding
+         * row): an embedding row becomes {@link #standIn()} (qwen4exp.cpp:1326-1335), and {@code window[w]} for
+         * {@code w < lookBehind()} takes the record's token at or before position {@code pos0 - lookBehind() + w}
+         * ({@code -1} before position 0 or before the first entry). Row {@code t}'s predecessor {@code d} rows back
+         * is thereby the segment's row {@code t - d} while that exists and the token at or before position
+         * {@code pos0 + t - d} otherwise: llama.cpp {@code get_prev_tokens} (llama-kv-cache.cpp:1859-1920) by ubatch
+         * order, which embedding and mixed ubatches use because media rows can share one M-RoPE position. Rows that
+         * share a position are media rows of one stand-in, so the row itself holds the token llama.cpp's
+         * nearest-cell lookup reads, and for text rows at consecutive positions the order equals its by-position
+         * lookup.
+         *
+         * @param record     the sequence's token record before this step
+         * @param contiguous whether {@code record} is the contiguous record, which holds exactly the positions
+         *                   before {@code pos0}; a paged record stores positions per entry
+         * @throws IllegalStateException when the record cannot hold the predecessors: a contiguous record shorter
+         *                               than {@code pos0}, or an empty paged record of a sequence past position 0
+         */
+        void completeWindow(SequenceState record, boolean contiguous, int pos0, int n, int[] window) {
+            int back = lookBehind();
+            if (n < 0 || window.length < back + n) {
+                throw new IllegalArgumentException("a window of " + window.length + " cannot hold " + n
+                        + " rows after " + back + " predecessors");
+            }
+            if (pos0 > 0 && (contiguous ? record.nPast() < pos0 : record.nPast() == 0)) {
+                throw new IllegalStateException("n-gram PLE at position " + pos0 + " needs the tokens before it in "
+                        + "the sequence record, which holds " + record.nPast());
+            }
+            for (int w = 0; w < back; w++) {
+                int pos = pos0 - back + w;
+                window[w] = pos < 0 ? -1 : record.tokenAtOrBefore(pos);
+            }
+            for (int t = back; t < back + n; t++) {
+                if (window[t] < 0) {
+                    window[t] = standIn;
+                }
+            }
+        }
 
         /**
          * The n-gram row indices of {@code nTokens} tokens (qwen4exp.cpp:1240-1290). {@code window[w]} holds the
-         * token at position {@code pos0 - lookBehind() + w}, or a negative value when that position has no token
-         * (before the sequence start); token {@code i} of the step is {@code window[i + lookBehind()]}. For each
+         * predecessor {@code lookBehind() - w} rows before the step ({@link #completeWindow}), or a negative value
+         * when there is none (before the sequence start); token {@code i} of the step is
+         * {@code window[i + lookBehind()]}. For each
          * token the context {@code ctx[0] = token}, {@code ctx[s]} = the token {@code s} positions back, is cut at the
          * first missing or EOS predecessor (every later entry reads as EOS); for {@code n = 2 .. ngram} the hash
          * {@code mixed = XOR_{j<n} ctx[j]*mult[j]} (unsigned 64-bit) selects, for each of the {@code per_ngram} heads
@@ -485,7 +545,7 @@ public final class Gemma3nBlocks {
         @Override
         public String toString() {
             return "NgramLayout{" + arch + ", hc=" + hc + ", ngram=" + nGram + ", heads=" + nHeads + "x" + headDim
-                    + ", conv=" + kernel + '}';
+                    + ", conv=" + kernel + ", stand-in=" + standIn + '}';
         }
     }
 }

@@ -49,52 +49,71 @@ public interface GpuLayerExtra extends AutoCloseable {
 
     /**
      * Why this extra has no batched hooks over {@link StepLayout#contiguousSingle()} == false, or null when it
-     * supports them. Default: refused, today's extras run the contiguous step only.
+     * supports them. Default: refused, the extra runs the contiguous step only.
      */
     default String batchRefusal() {
         return getClass().getSimpleName() + " has no multi-sequence step";
     }
 
-    /** Batched form of {@link #beforeBlock}: the contiguous step delegates with {@code pos0 = s.pos0(0)}. */
+    /**
+     * Batched form of {@link #beforeBlock}: the contiguous step delegates with {@code pos0 = s.pos0(0)}; a
+     * batch-capable extra ({@link #batchRefusal()} null) runs the same hook over the whole step's rows, which is
+     * exact for the row-wise hooks, over paged and multi-segment layouts alike.
+     *
+     * @throws UnsupportedOperationException when the step is not contiguous-single and {@link #batchRefusal()}
+     *                                       answers a reason
+     */
     default void beforeBlock(StepLayout s, ScratchSlot x) {
-        if (s.contiguousSingle()) {
-            beforeBlock(s.pos0(0), s.nTokens(), x);
-            return;
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        beforeBlock(s.pos0(0), s.nTokens(), x);
     }
 
     /**
-     * Batched form of {@link #afterMixer}: the contiguous step delegates with {@code pos0 = s.pos0(0)}.
+     * Batched form of {@link #afterMixer}, delegating as {@link #beforeBlock(StepLayout, ScratchSlot)} does.
      *
      * @return true when this extra has added (or mixed) {@code branch} into {@code x} itself
+     * @throws UnsupportedOperationException as {@link #beforeBlock(StepLayout, ScratchSlot)}
      */
     default boolean afterMixer(StepLayout s, ScratchSlot x, ScratchSlot branch) {
-        if (s.contiguousSingle()) {
-            return afterMixer(s.pos0(0), s.nTokens(), x, branch);
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        return afterMixer(s.pos0(0), s.nTokens(), x, branch);
     }
 
     /**
-     * Batched form of {@link #afterFfn}: the contiguous step delegates with {@code pos0 = s.pos0(0)}.
+     * Batched form of {@link #afterFfn}, delegating as {@link #beforeBlock(StepLayout, ScratchSlot)} does.
      *
      * @return true when this extra has added (or mixed) {@code branch} into {@code x} itself
+     * @throws UnsupportedOperationException as {@link #beforeBlock(StepLayout, ScratchSlot)}
      */
     default boolean afterFfn(StepLayout s, ScratchSlot x, ScratchSlot branch) {
-        if (s.contiguousSingle()) {
-            return afterFfn(s.pos0(0), s.nTokens(), x, branch);
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        return afterFfn(s.pos0(0), s.nTokens(), x, branch);
     }
 
-    /** Batched form of {@link #afterBlock}: the contiguous step delegates with {@code pos0 = s.pos0(0)}. */
+    /**
+     * Batched form of {@link #afterBlock}, delegating as {@link #beforeBlock(StepLayout, ScratchSlot)} does.
+     *
+     * @throws UnsupportedOperationException as {@link #beforeBlock(StepLayout, ScratchSlot)}
+     */
     default void afterBlock(StepLayout s, ScratchSlot x) {
-        if (s.contiguousSingle()) {
-            afterBlock(s.pos0(0), s.nTokens(), x);
-            return;
+        if (!s.contiguousSingle()) {
+            refuseBatch();
         }
-        throw new UnsupportedOperationException(batchRefusal());
+        afterBlock(s.pos0(0), s.nTokens(), x);
+    }
+
+    /** The refusal {@link #batchRefusal()} answers, thrown for a step that is not contiguous-single. */
+    default void refuseBatch() {
+        String why = batchRefusal();
+        if (why != null) {
+            throw new UnsupportedOperationException(why);
+        }
     }
 
     /** Releases what {@link #bind} created; the context's shared resources stay. */

@@ -1,5 +1,11 @@
 package com.eonmux.neuralfree.gguf.hf.torch;
 
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoPickle;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoPickle.AttributeObject;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoPickle.EnumValue;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoPickle.TensorObject;
+import com.eonmux.neuralfree.gguf.hf.torchao.TorchaoPickle.WrapperView;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -10,32 +16,37 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The restricted unpickler of PyTorch pickles (FX-1, §3.6): a stack machine over torch's {@code data.pkl}
+ * The restricted unpickler of PyTorch pickles: a stack machine over torch's {@code data.pkl}
  * bytecode that accepts opcodes and globals by allow-list and refuses everything else with a named error. It
  * plays the role the Python {@code Unpickler} plays for {@code torch.load}, but:
  * <ul>
  *   <li>{@code ObjectInputStream} and reflection-based deserialization are never used, so nothing is executed;
  *       values are built from the allow-listed opcodes only;</li>
- *   <li>{@code GLOBAL} is restricted to {@code torch._utils._rebuild_tensor_v2}, {@code
- *       torch._utils._rebuild_parameter}, the plain {@code torch.*Storage} classes (the closed set {@link
- *       TorchStorage} maps), {@code torch.storage.UntypedStorage} and {@code collections.OrderedDict}; any other
- *       global is refused;</li>
- *   <li>the opcode allow-list is the plan's: {@code PROTO} (protocols 2-5, the first opcode), {@code FRAME},
- *       containers and their fills (dicts, lists, tuples, {@code SETITEM(S)}), the integer and unicode pushes,
+ *   <li>{@code GLOBAL} is restricted to torch's tensor rebuild functions ({@code _rebuild_tensor_v2}, {@code
+ *       _rebuild_tensor_v3}, {@code _rebuild_parameter}, {@code _rebuild_wrapper_subclass}, {@code
+ *       _rebuild_from_type_v2}), the plain {@code torch.*Storage} classes (the closed set {@link
+ *       TorchStorage} maps), {@code torch.storage.UntypedStorage}, {@code torch.device}, {@code torch.Size},
+ *       {@code torch.serialization._get_layout}, {@code collections.OrderedDict}, torch's dtype constants, and the
+ *       torchao tensor subclasses with their serialized attribute and enum classes
+ *       ({@link com.eonmux.neuralfree.gguf.hf.torchao.TorchaoPickle}); any other global is refused;</li>
+ *   <li>the opcode allow-list is explicit: {@code PROTO} (protocols 2-5, the first opcode), {@code FRAME},
+ *       containers and their fills (dicts, lists, tuples, {@code SETITEM(S)}), the integer, float and unicode
+ *       pushes,
  *       {@code BINPERSID} (the persistent ids), {@code REDUCE}/{@code BUILD}/{@code NEWOBJ} of the allowed
  *       globals, {@code STOP} and the memo ops, plus the plain stack ops ({@code MARK}, {@code POP},
  *       {@code POP_MARK}, {@code DUP}). The constants pushes and stack plumbing a real torch pickle needs — the
  *       boolean constants, {@code EMPTY_LIST}/{@code APPEND(S)}, {@code LONG1}/{@code LONG4} (storage offsets of
  *       tensors with more than 2^31 elements), {@code NONE} — build nothing on their own, so allowing them keeps
  *       the restriction whole;</li>
- *   <li>every input is capped, the explicit limits §3.6 asks for PyTorch pickles: pickle size, opcode count,
+ *   <li>every input is capped: pickle size, opcode count,
  *       stack depth, memo slots and string length.</li>
  * </ul>
  *
- * <p>The built value graph holds {@link String}, {@link Long}, {@link Boolean}, {@code Object[]} (tuples),
- * {@code List<Object>} (lists), {@code LinkedHashMap} (dicts and {@code collections.OrderedDict}), the {@link
- * TensorView} {@code torch._utils._rebuild_tensor_v2} reduced to (its storage through the persistent loader) and
- * plain {@code None} values. Nothing is mapped, nothing is executed, nothing is trusted beyond this graph.</p>
+ * <p>The built value graph holds {@link String}, {@link Long}, {@link Boolean}, {@link Double}, {@code Object[]}
+ * (tuples), {@code List<Object>} (lists), {@code LinkedHashMap} (dicts and {@code collections.OrderedDict}), the
+ * {@link TensorView} a tensor rebuild reduces to (its storage through the persistent loader), the torchao {@code
+ * TensorObject}, {@code WrapperView}, {@code AttributeObject} and {@code EnumValue} descriptors, and plain {@code
+ * None} values. Nothing is mapped, nothing is executed, nothing is trusted beyond this graph.</p>
  */
 public final class RestrictedUnpickler {
 
@@ -81,6 +92,7 @@ public final class RestrictedUnpickler {
     private static final int BININT2 = 0x4d;
     private static final int LONG1 = 0x8a;
     private static final int LONG4 = 0x8b;
+    private static final int BINFLOAT = 0x47;
     private static final int PUT = 0x70;
     private static final int BINPUT = 0x71;
     private static final int LONG_BINPUT = 0x72;
@@ -93,6 +105,15 @@ public final class RestrictedUnpickler {
     private static final int POP = 0x30;
     private static final int POP_MARK = 0x31;
     private static final int DUP = 0x32;
+
+    /** Prefix of a stack value that names an allowed reducer function. */
+    private static final String CALLABLE = "c:";
+    /** Prefix of a stack value that names an allowed class (a torchao attribute dataclass). */
+    private static final String CLASS = "k:";
+    /** Prefix of a stack value that names an allowed enum class. */
+    private static final String ENUM = "e:";
+    /** Prefix of a stack value that is a torch constant (a dtype, a device, a layout). */
+    private static final String VALUE = "v:";
 
     /** The persistent-id resolver ({@code BINPERSID}), asked by the checkpoint that runs the unpickler. */
     public interface PersistentLoader {
@@ -115,13 +136,20 @@ public final class RestrictedUnpickler {
         private final long[] size;
         private final long[] stride;
         private final boolean requiresGrad;
+        private final String dtype;
 
         TensorView(Object storage, long storageOffset, long[] size, long[] stride, boolean requiresGrad) {
+            this(storage, storageOffset, size, stride, requiresGrad, null);
+        }
+
+        TensorView(Object storage, long storageOffset, long[] size, long[] stride, boolean requiresGrad,
+                   String dtype) {
             this.storage = storage;
             this.storageOffset = storageOffset;
             this.size = size.clone();
             this.stride = stride.clone();
             this.requiresGrad = requiresGrad;
+            this.dtype = dtype;
         }
 
         /** The loader's resolved value (a torch checkpoint's is a {@link TorchStorage}). */
@@ -147,6 +175,12 @@ public final class RestrictedUnpickler {
         /** The pickled {@code requires_grad} flag (never used when reading). */
         public boolean requiresGrad() {
             return requiresGrad;
+        }
+
+        /** The torch dtype marker of a {@code _rebuild_tensor_v3} view (for example {@code torch.float8_e4m3fn}),
+         *  or null for a typed-storage v2 view. */
+        public String dtype() {
+            return dtype;
         }
     }
 
@@ -290,6 +324,15 @@ public final class RestrictedUnpickler {
                     demandsProtocol();
                     int v = (byte1() & 0xFF) | ((byte1() & 0xFF) << 8);
                     stack.add((long) v);
+                    return;
+                }
+                case BINFLOAT: {
+                    demandsProtocol();
+                    long bits = 0;
+                    for (int i = 0; i < 8; i++) {
+                        bits = (bits << 8) | (byte1() & 0xFFL);
+                    }
+                    stack.add(Double.longBitsToDouble(bits));
                     return;
                 }
                 case LONG1:
@@ -493,8 +536,16 @@ public final class RestrictedUnpickler {
                     if (!(callable instanceof String)) {
                         throw pickle("REDUCE builds from " + classify(callable) + " instead of an allowed global");
                     }
-                    Object[] t = argTuple(callable.toString(), args);
-                    stack.add(reduce(callable.toString(), t));
+                    String marker = (String) callable;
+                    Object[] t = argTuple(marker, args);
+                    if (marker.startsWith(ENUM)) {
+                        stack.add(enumValue(marker.substring(ENUM.length()), t));
+                    } else if (marker.startsWith(CALLABLE)) {
+                        stack.add(reduce(marker.substring(CALLABLE.length()), t));
+                    } else {
+                        throw pickle("REDUCE builds from " + describe(callable) + ", which is not an allowed"
+                                + " function or enum");
+                    }
                     return;
                 }
                 case NEWOBJ: {
@@ -520,6 +571,24 @@ public final class RestrictedUnpickler {
                     demandsProtocol();
                     Object state = takeOne();
                     Object target = takeOne();
+                    if (target instanceof AttributeObject) {
+                        if (!(state instanceof Map)) {
+                            throw pickle("BUILD updates a torchao attribute with the " + classify(state)
+                                    + " state");
+                        }
+                        @SuppressWarnings("unchecked")
+                        Map<Object, Object> raw = (Map<Object, Object>) state;
+                        Map<String, Object> fields = new java.util.LinkedHashMap<>();
+                        for (Map.Entry<Object, Object> e : raw.entrySet()) {
+                            if (!(e.getKey() instanceof String)) {
+                                throw pickle("BUILD gives a torchao attribute a non-string field name");
+                            }
+                            fields.put((String) e.getKey(), e.getValue());
+                        }
+                        ((AttributeObject) target).putState(fields);
+                        stack.add(target);
+                        return;
+                    }
                     if (!(target instanceof Map)) {
                         throw pickle("BUILD updates the " + classify(target) + " instead of a dict or an"
                                 + " OrderedDict");
@@ -552,6 +621,7 @@ public final class RestrictedUnpickler {
                 case BINPERSID: {
                     demandsProtocol();
                     Object id = takeOne();
+                    @SuppressWarnings("unchecked")
                     List<Object> l = id instanceof Object[] ? new ArrayList<>(Arrays.asList((Object[]) id))
                             : id instanceof List ? (List<Object>) id
                             : null;
@@ -571,6 +641,17 @@ public final class RestrictedUnpickler {
             }
         }
 
+        /** An enum member a torchao attribute names: its class and member. */
+        private Object enumValue(String type, Object[] t) throws IOException {
+            if (!TorchaoPickle.isEnumClass(type)) {
+                throw pickle("the enum class " + describe(type) + " is not an allowed torchao enum");
+            }
+            if (t.length != 1 || !(t[0] instanceof String)) {
+                throw pickle("enum " + type + " is built from " + t.length + " arguments instead of a member name");
+            }
+            return new EnumValue(type, (String) t[0]);
+        }
+
         /** The functions the reducers of the allowed globals build. */
         private Object reduce(String callable, Object[] t) throws IOException {
             if ("collections.OrderedDict".equals(callable)) {
@@ -578,42 +659,58 @@ public final class RestrictedUnpickler {
                 fillDict(out, t, callable);
                 return out;
             }
+            if ("torch.Size".equals(callable)) {
+                if (t.length != 1 || !(t[0] instanceof Object[])) {
+                    throw pickle("torch.Size is built from " + t.length + " arguments instead of a tuple");
+                }
+                Object[] sizes = (Object[]) t[0];
+                Long[] out = new Long[sizes.length];
+                for (int i = 0; i < sizes.length; i++) {
+                    if (!(sizes[i] instanceof Long)) {
+                        throw pickle("torch.Size carries " + classify(sizes[i]) + " instead of an integer");
+                    }
+                    out[i] = (Long) sizes[i];
+                }
+                return out;
+            }
+            if ("torch.device".equals(callable)) {
+                if (t.length < 1 || t.length > 2 || !(t[0] instanceof String)) {
+                    throw pickle("torch.device is built from " + describe(t.length == 1 ? t[0] : t)
+                            + " instead of a device string");
+                }
+                String device = (String) t[0];
+                if (t.length == 2) {
+                    if (!(t[1] instanceof Long) || (Long) t[1] < 0) {
+                        throw pickle("torch.device takes a non-negative index, the pickle passes " + describe(t[1]));
+                    }
+                    device = device + ":" + t[1];
+                }
+                if (!device.matches("[A-Za-z0-9_.:-]+")) {
+                    throw pickle("torch.device names '" + device + "', which is not a device string");
+                }
+                return device;
+            }
+            if ("torch.serialization._get_layout".equals(callable)) {
+                if (t.length != 1 || !"torch.strided".equals(t[0])) {
+                    throw pickle("_get_layout is built for " + describe(t.length == 1 ? t[0] : t)
+                            + " instead of the strided layout");
+                }
+                return "torch.strided";
+            }
             if ("torch._utils._rebuild_tensor_v2".equals(callable)) {
                 if (t.length != 6) {
                     throw pickle("_rebuild_tensor_v2 takes 6 arguments, the pickle passes " + t.length);
                 }
-                if (t[0] == null) {
-                    throw pickle("_rebuild_tensor_v2 rebuilds from nothing: the persistent id resolved to"
-                            + " nothing");
+                return tensorView(t, "_rebuild_tensor_v2", 6, null);
+            }
+            if ("torch._utils._rebuild_tensor_v3".equals(callable)) {
+                if (t.length < 7 || t.length > 8) {
+                    throw pickle("_rebuild_tensor_v3 takes 7 or 8 arguments, the pickle passes " + t.length);
                 }
-                if (!(t[1] instanceof Long)) {
-                    throw pickle("_rebuild_tensor_v2 takes an integer storage offset, the pickle passes "
-                            + classify(t[1]));
+                if (!(t[6] instanceof String) || !((String) t[6]).startsWith(VALUE)) {
+                    throw pickle("_rebuild_tensor_v3 takes a dtype, the pickle passes " + describe(t[6]));
                 }
-                if ((Long) t[1] < 0) {
-                    throw pickle("_rebuild_tensor_v2 takes a storage offset of " + t[1]
-                            + ", which is negative");
-                }
-                long[] size = ints(t, 2, "_rebuild_tensor_v2", "shape");
-                long[] stride = ints(t, 3, "_rebuild_tensor_v2", "strides");
-                if (size.length != stride.length) {
-                    throw pickle("_rebuild_tensor_v2 takes a shape of length " + size.length + " and strides of"
-                            + " length " + stride.length);
-                }
-                for (long d : size) {
-                    if (d < 0) {
-                        throw pickle("_rebuild_tensor_v2 takes shape " + Arrays.toString(size) + ", which has a"
-                                + " negative dimension");
-                    }
-                }
-                if (!(t[4] instanceof Boolean)) {
-                    throw pickle("_rebuild_tensor_v2 takes a requires_grad flag, the pickle passes "
-                            + classify(t[4]));
-                }
-                if (!(t[5] instanceof Map) && !(t[5] instanceof List) && !(t[5] instanceof Object[])) {
-                    throw pickle("_rebuild_tensor_v2 takes backward hooks, the pickle passes " + classify(t[5]));
-                }
-                return new TensorView(t[0], (Long) t[1], size, stride, (Boolean) t[4]);
+                return tensorView(t, "_rebuild_tensor_v3", 7, (String) t[6]);
             }
             if ("torch._utils._rebuild_parameter".equals(callable)) {
                 if (t.length < 3 || t.length > 5) {
@@ -628,17 +725,155 @@ public final class RestrictedUnpickler {
                 }
                 return t[0];
             }
+            if ("torch._utils._rebuild_wrapper_subclass".equals(callable)) {
+                return wrapperView(t);
+            }
+            if ("torch._tensor._rebuild_from_type_v2".equals(callable)) {
+                return fromTypeV2(t);
+            }
             throw pickle("REDUCE builds from " + describe(callable) + ", which is not an allowed global");
         }
 
-        private Object newObj(Object callable, Object args, boolean fromEx) throws IOException {
-            if (!"collections.OrderedDict".equals(callable)) {
-                throw pickle((fromEx ? "NEWOBJ_EX" : "NEWOBJ") + " builds from " + describe(callable)
-                        + " instead of collections.OrderedDict");
+        private TensorView tensorView(Object[] t, String callable, int args, String dtype) throws IOException {
+            if (t[0] == null) {
+                throw pickle(callable + " rebuilds from nothing: the persistent id resolved to nothing");
             }
-            LinkedHashMap<Object, Object> out = new LinkedHashMap<>();
-            fillDict(out, argTuple("collections.OrderedDict", args), "collections.OrderedDict");
-            return out;
+            if (!(t[1] instanceof Long)) {
+                throw pickle(callable + " takes an integer storage offset, the pickle passes " + classify(t[1]));
+            }
+            if ((Long) t[1] < 0) {
+                throw pickle(callable + " takes a storage offset of " + t[1] + ", which is negative");
+            }
+            long[] size = ints(t, 2, callable, "shape");
+            long[] stride = ints(t, 3, callable, "strides");
+            if (size.length != stride.length) {
+                throw pickle(callable + " takes a shape of length " + size.length + " and strides of length "
+                        + stride.length);
+            }
+            for (long d : size) {
+                if (d < 0) {
+                    throw pickle(callable + " takes shape " + Arrays.toString(size) + ", which has a negative"
+                            + " dimension");
+                }
+            }
+            if (!(t[4] instanceof Boolean)) {
+                throw pickle(callable + " takes a requires_grad flag, the pickle passes " + classify(t[4]));
+            }
+            if (!(t[5] instanceof Map) && !(t[5] instanceof List) && !(t[5] instanceof Object[])) {
+                throw pickle(callable + " takes backward hooks, the pickle passes " + classify(t[5]));
+            }
+            return new TensorView(t[0], (Long) t[1], size, stride, (Boolean) t[4], dtype);
+        }
+
+        /** The wrapper {@code _rebuild_wrapper_subclass(cls, dtype, size, stride, offset, layout, device, grad)}
+         *  rebuilds. */
+        private WrapperView wrapperView(Object[] t) throws IOException {
+            if (t.length != 8) {
+                throw pickle("_rebuild_wrapper_subclass takes 8 arguments, the pickle passes " + t.length);
+            }
+            if (!(t[0] instanceof String) || !((String) t[0]).startsWith(CLASS)
+                    || !TorchaoPickle.isTensorClass(((String) t[0]).substring(CLASS.length()))) {
+                throw pickle("_rebuild_wrapper_subclass rebuilds " + describe(t[0])
+                        + ", which is not an allowed torchao tensor subclass");
+            }
+            if (!(t[1] instanceof String) || !((String) t[1]).startsWith(VALUE)) {
+                throw pickle("_rebuild_wrapper_subclass takes a dtype, the pickle passes " + describe(t[1]));
+            }
+            long[] size = ints(t, 2, "_rebuild_wrapper_subclass", "shape");
+            long[] stride = ints(t, 3, "_rebuild_wrapper_subclass", "strides");
+            if (size.length != stride.length) {
+                throw pickle("_rebuild_wrapper_subclass takes a shape of length " + size.length + " and strides"
+                        + " of length " + stride.length);
+            }
+            for (long d : size) {
+                if (d < 0) {
+                    throw pickle("_rebuild_wrapper_subclass takes shape " + Arrays.toString(size)
+                            + ", which has a negative dimension");
+                }
+            }
+            if (!(t[4] instanceof Long) || (Long) t[4] < 0) {
+                throw pickle("_rebuild_wrapper_subclass takes a non-negative storage offset, the pickle passes "
+                        + describe(t[4]));
+            }
+            if (!(t[5] instanceof String) || !"torch.strided".equals(t[5])) {
+                throw pickle("_rebuild_wrapper_subclass takes the strided layout, the pickle passes " + describe(t[5]));
+            }
+            if (!(t[6] instanceof String)) {
+                throw pickle("_rebuild_wrapper_subclass takes a device, the pickle passes " + describe(t[6]));
+            }
+            if (!(t[7] instanceof Boolean)) {
+                throw pickle("_rebuild_wrapper_subclass takes a requires_grad flag, the pickle passes "
+                        + describe(t[7]));
+            }
+            String cls = ((String) t[0]).substring(CLASS.length());
+            String dtype = ((String) t[1]).substring(VALUE.length());
+            if (TorchaoPickle.dtype(dtype) == null && !dtype.endsWith("float4_e2m1fn_x2")) {
+                throw pickle("_rebuild_wrapper_subclass takes the unknown dtype '" + dtype + "'");
+            }
+            return new WrapperView(cls, dtype, size, stride, (Long) t[4], (String) t[5], (String) t[6],
+                    (Boolean) t[7]);
+        }
+
+        /** The tensor subclass {@code _rebuild_from_type_v2(func, type, args, state)} rebuilds. */
+        private TensorObject fromTypeV2(Object[] t) throws IOException {
+            if (t.length != 4) {
+                throw pickle("_rebuild_from_type_v2 takes 4 arguments, the pickle passes " + t.length);
+            }
+            if (!(t[0] instanceof String) || !((String) t[0]).equals(
+                    CALLABLE + "torch._utils._rebuild_wrapper_subclass")) {
+                throw pickle("_rebuild_from_type_v2 rebuilds with " + describe(t[0])
+                        + " instead of torch._utils._rebuild_wrapper_subclass");
+            }
+            if (!(t[2] instanceof Object[])) {
+                throw pickle("_rebuild_from_type_v2 takes the wrapper arguments as a tuple, the pickle passes "
+                        + classify(t[2]));
+            }
+            WrapperView view = wrapperView((Object[]) t[2]);
+            if (!(t[1] instanceof String) || !((String) t[1]).startsWith(CLASS)
+                    || !TorchaoPickle.isTensorClass(((String) t[1]).substring(CLASS.length()))) {
+                throw pickle("_rebuild_from_type_v2 takes " + describe(t[1]) + " instead of the wrapper's"
+                        + " torchao tensor subclass");
+            }
+            String type = ((String) t[1]).substring(CLASS.length());
+            if (!type.equals(view.className())) {
+                throw pickle("_rebuild_from_type_v2 rebuilds " + view.className() + " as " + type);
+            }
+            if (!(t[3] instanceof Map)) {
+                throw pickle("_rebuild_from_type_v2 takes a state dict, the pickle passes " + classify(t[3]));
+            }
+            @SuppressWarnings("unchecked")
+            Map<Object, Object> raw = (Map<Object, Object>) t[3];
+            Map<String, Object> state = new java.util.LinkedHashMap<>();
+            for (Map.Entry<Object, Object> e : raw.entrySet()) {
+                if (!(e.getKey() instanceof String)) {
+                    throw pickle("_rebuild_from_type_v2 gives the tensor a non-string state field");
+                }
+                state.put((String) e.getKey(), e.getValue());
+            }
+            return new TensorObject(type, view, state);
+        }
+
+        private Object newObj(Object callable, Object args, boolean fromEx) throws IOException {
+            if (!(callable instanceof String)) {
+                throw pickle((fromEx ? "NEWOBJ_EX" : "NEWOBJ") + " builds from " + describe(callable)
+                        + " instead of an allowed global");
+            }
+            String marker = (String) callable;
+            Object[] t = argTuple(marker, args);
+            if ((CALLABLE + "collections.OrderedDict").equals(marker)) {
+                LinkedHashMap<Object, Object> out = new LinkedHashMap<>();
+                fillDict(out, t, "collections.OrderedDict");
+                return out;
+            }
+            if (marker.startsWith(CLASS) && TorchaoPickle.isAttributeClass(marker.substring(CLASS.length()))) {
+                if (t.length != 0) {
+                    throw pickle("torchao attribute " + marker.substring(CLASS.length()) + " is built with "
+                            + t.length + " constructor arguments");
+                }
+                return new AttributeObject(marker.substring(CLASS.length()), new java.util.LinkedHashMap<>());
+            }
+            throw pickle((fromEx ? "NEWOBJ_EX" : "NEWOBJ") + " builds from " + describe(callable)
+                    + " instead of collections.OrderedDict or an allowed torchao attribute class");
         }
 
         private void fillDict(LinkedHashMap<Object, Object> out, Object[] t, String callable) throws IOException {
@@ -648,6 +883,7 @@ public final class RestrictedUnpickler {
             if (t.length != 1) {
                 throw pickle(callable + " takes 0 or 1 argument, the pickle passes " + t.length);
             }
+            @SuppressWarnings("unchecked")
             List<Object> list = t[0] instanceof Object[] ? Arrays.asList((Object[]) t[0])
                     : t[0] instanceof List ? (List<Object>) t[0]
                     : null;
@@ -665,16 +901,27 @@ public final class RestrictedUnpickler {
 
         /** The GLOBAL allow-list (see the class javadoc). */
         private void global(String module, String name) throws IOException {
-            if ("torch._utils".equals(module) && "_rebuild_tensor_v2".equals(name)) {
-                stack.add("torch._utils._rebuild_tensor_v2");
+            String fq = module + "." + name;
+            if ("torch._utils".equals(module) && ("_rebuild_tensor_v2".equals(name)
+                    || "_rebuild_tensor_v3".equals(name) || "_rebuild_parameter".equals(name)
+                    || "_rebuild_wrapper_subclass".equals(name))) {
+                stack.add(CALLABLE + fq);
                 return;
             }
-            if ("torch._utils".equals(module) && "_rebuild_parameter".equals(name)) {
-                stack.add("torch._utils._rebuild_parameter");
+            if ("torch._tensor".equals(module) && "_rebuild_from_type_v2".equals(name)) {
+                stack.add(CALLABLE + fq);
+                return;
+            }
+            if ("torch.serialization".equals(module) && "_get_layout".equals(name)) {
+                stack.add(CALLABLE + fq);
+                return;
+            }
+            if ("torch".equals(module) && ("device".equals(name) || "Size".equals(name))) {
+                stack.add(CALLABLE + fq);
                 return;
             }
             if ("collections".equals(module) && "OrderedDict".equals(name)) {
-                stack.add("collections.OrderedDict");
+                stack.add(CALLABLE + "collections.OrderedDict");
                 return;
             }
             if ("torch".equals(module) && name.endsWith("Storage")
@@ -686,9 +933,26 @@ public final class RestrictedUnpickler {
                 stack.add("torch.storage.UntypedStorage");
                 return;
             }
-            throw pickle("the global " + describe(module + "." + name) + " is not on the allowed list (torch._utils"
-                    + "._rebuild_tensor_v2, torch._utils._rebuild_parameter, torch's storage classes,"
-                    + " torch.storage.UntypedStorage, collections.OrderedDict)");
+            if ("torch".equals(module) && TorchaoPickle.isDtypeName(name)) {
+                stack.add(VALUE + fq);
+                return;
+            }
+            if (TorchaoPickle.isTensorClass(fq)) {
+                stack.add(CLASS + fq);
+                return;
+            }
+            if (TorchaoPickle.isAttributeClass(fq)) {
+                stack.add(CLASS + fq);
+                return;
+            }
+            if (TorchaoPickle.isEnumClass(fq)) {
+                stack.add(ENUM + fq);
+                return;
+            }
+            throw pickle("the global " + describe(fq) + " is not on the allowed list (torch's tensor rebuild"
+                    + " functions, its plain storage classes, torch.storage.UntypedStorage, torch.device,"
+                    + " torch.Size, its dtype constants, collections.OrderedDict, and the torchao tensor subclasses"
+                    + " with their attribute and enum classes)");
         }
 
         // ------------------------------------------------------------------ stack plumbing
@@ -835,6 +1099,18 @@ public final class RestrictedUnpickler {
             if (value instanceof TensorView) {
                 Object s = ((TensorView) value).storage();
                 return "saved tensor of '" + (s instanceof TorchStorage ? ((TorchStorage) s).key() : "?") + "'";
+            }
+            if (value instanceof WrapperView) {
+                return "wrapper subclass " + ((WrapperView) value).className();
+            }
+            if (value instanceof TensorObject) {
+                return "torchao tensor " + ((TensorObject) value).type();
+            }
+            if (value instanceof AttributeObject) {
+                return "torchao attribute " + ((AttributeObject) value).type();
+            }
+            if (value instanceof EnumValue) {
+                return "torchao enum " + value;
             }
             return "value the restricted unpickler cannot name";
         }

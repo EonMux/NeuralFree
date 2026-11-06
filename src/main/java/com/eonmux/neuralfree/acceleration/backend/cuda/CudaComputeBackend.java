@@ -8,9 +8,11 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
 import com.eonmux.neuralfree.acceleration.backend.KernelArtifact;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.backend.KernelSignature;
+import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.acceleration.backend.WorkSizes;
 import com.eonmux.neuralfree.acceleration.cache.CacheKey;
 import com.eonmux.neuralfree.acceleration.cache.KernelCache;
@@ -29,6 +31,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 import static jcuda.driver.JCudaDriver.cuMemGetInfo;
@@ -51,7 +54,10 @@ import static jcuda.driver.JCudaDriver.cuStreamCreate;
  *       arguments.</li>
  *   <li><b>Queues.</b> Two backend-owned non-blocking streams (compute and transfer);
  *       {@link #createComputeQueue()} adds caller-owned ones, which {@link #close()} releases
- *       when they are still open. CUDA does not report {@code CONCURRENT_QUEUES_PROFITABLE}.</li>
+ *       when they are still open. CUDA does not report {@code CONCURRENT_QUEUES_PROFITABLE}.
+ *       A queue captures its commands into a CUDA graph ({@code beginCapture}/{@code endCapture})
+ *       for per-shape replay, and hands out {@link CudaKernelBatch}es that submit independent
+ *       small kernels as one launch.</li>
  *   <li><b>Memory.</b> Allocations are rounded up to 256 bytes and served by a stream-ordered
  *       caching pool ({@link CudaBufferPool}): closing a buffer records an event on every open
  *       queue's stream and keeps the block for reuse once those events complete, so it never
@@ -89,10 +95,13 @@ public final class CudaComputeBackend implements ComputeBackend {
     private final KernelCache kernelCache;
     private final CudaModuleCache moduleCache;
     private final CudaEventPool eventPool;
+    private final CudaEventPool timingEvents;
     private final CudaComputeQueue computeQueue;
     private final CudaComputeQueue transferQueue;
     private final CudaBufferPool bufferPool;
     private final Set<CudaComputeQueue> openQueues = new CopyOnWriteArraySet<>();
+    /** Host-mapped buffers still open, freed by {@link #close()}. */
+    private final Set<CudaHostMappedBuffer> hostMappedBuffers = ConcurrentHashMap.newKeySet();
     private volatile boolean closed;
 
     /**
@@ -110,6 +119,7 @@ public final class CudaComputeBackend implements ComputeBackend {
         this.context = CudaContext.retainPrimary(cuDevice.getDeviceId());
         CudaModuleCache modules = null;
         CudaEventPool events = null;
+        CudaEventPool timedEvents = null;
         CudaComputeQueue compute = null;
         CudaComputeQueue transfer = null;
         try {
@@ -121,6 +131,8 @@ public final class CudaComputeBackend implements ComputeBackend {
             this.moduleCache = modules;
             events = new CudaEventPool(context);
             this.eventPool = events;
+            timedEvents = profiling() ? new CudaEventPool(context, true) : null;
+            this.timingEvents = timedEvents;
             this.bufferPool = new CudaBufferPool(new CudaDeviceMemory(this));
             compute = new CudaComputeQueue(this, newStream(), ComputeQueue.QueueType.COMPUTE, true);
             this.computeQueue = compute;
@@ -130,7 +142,7 @@ public final class CudaComputeBackend implements ComputeBackend {
             openQueues.add(transfer);
             CudaSharedPools.register(context.context(), bufferPool);
         } catch (RuntimeException e) {
-            closeQuietly(transfer, compute, events, modules, e);
+            closeQuietly(transfer, compute, timedEvents, events, modules, e);
             throw e;
         }
 
@@ -194,6 +206,31 @@ public final class CudaComputeBackend implements ComputeBackend {
     @Override
     public GpuBuffer allocateBuffer(long sizeInBytes) {
         return allocateBuffer(sizeInBytes, false);
+    }
+
+    /**
+     * Allocates page-locked host memory mapped into the device address space
+     * ({@link CudaHostMappedBuffer}); the device reads it over the interconnect, with no copy and no
+     * device allocation.
+     */
+    @Override
+    public boolean supportsHostMappedBuffers() {
+        return true;
+    }
+
+    @Override
+    public HostMappedBuffer allocateHostMappedBuffer(long sizeInBytes) {
+        enter();
+        CudaHostMappedBuffer buffer = new CudaHostMappedBuffer(this, sizeInBytes);
+        hostMappedBuffers.add(buffer);
+        LOGGER.trace("Allocated CUDA host-mapped buffer: {} bytes", sizeInBytes);
+        return buffer;
+    }
+
+    /** Called by {@link CudaHostMappedBuffer#close()}: frees the host allocation. */
+    void releaseHostAllocation(CudaHostMappedBuffer buffer) {
+        hostMappedBuffers.remove(buffer);
+        buffer.free();
     }
 
     /**
@@ -392,14 +429,37 @@ public final class CudaComputeBackend implements ComputeBackend {
         failure = runStep("close transfer queue", transferQueue::closeInternal, failure);
         long stillOpen = bufferPool.inUseBytes();
         failure = runStep("free buffer pool", bufferPool::close, failure);
+        failure = freeHostMappedBuffers(failure);
         failure = runStep("clear kernel cache", kernelCache::clear, failure);
         failure = runStep("unload modules", moduleCache::close, failure);
+        if (timingEvents != null) {
+            failure = runStep("destroy timing event pool", timingEvents::close, failure);
+        }
         failure = runStep("destroy event pool", eventPool::close, failure);
         failure = runStep("release primary context", context::release, failure);
         if (failure != null) {
             throw failure;
         }
         LOGGER.debug("CUDA backend closed - freed {} bytes of buffers that were still open", stillOpen);
+    }
+
+    /** Frees every host-mapped buffer still open; each failure is logged and the first is rethrown. */
+    private RuntimeException freeHostMappedBuffers(RuntimeException failure) {
+        RuntimeException first = failure;
+        for (CudaHostMappedBuffer buffer : new ArrayList<>(hostMappedBuffers)) {
+            hostMappedBuffers.remove(buffer);
+            try {
+                buffer.free();
+            } catch (RuntimeException e) {
+                LOGGER.warn("CUDA backend close: failed to free host-mapped buffer {}: {}", buffer, e.getMessage());
+                if (first == null) {
+                    first = e;
+                } else {
+                    first.addSuppressed(e);
+                }
+            }
+        }
+        return first;
     }
 
     /** The device this backend runs on. */
@@ -420,6 +480,19 @@ public final class CudaComputeBackend implements ComputeBackend {
     /** Pool of timing-disabled events shared by every queue of this backend. */
     public CudaEventPool eventPool() {
         return eventPool;
+    }
+
+    /**
+     * The pool of timing-enabled events the queues record dispatch pairs into while
+     * {@code -Dneuralfree.gpu.profile=true} is set, else null.
+     */
+    public CudaEventPool timingEvents() {
+        return timingEvents;
+    }
+
+    /** True when {@code -Dneuralfree.gpu.profile=true} asks the queues to time their dispatches. */
+    public static boolean profiling() {
+        return Boolean.parseBoolean(System.getProperty(KernelTiming.PROFILE_PROPERTY, "false"));
     }
 
     /** Module cache holding every loaded module of this backend. */
@@ -552,14 +625,17 @@ public final class CudaComputeBackend implements ComputeBackend {
         }
     }
 
-    private void closeQuietly(CudaComputeQueue transfer, CudaComputeQueue compute, CudaEventPool events,
-                              CudaModuleCache modules, RuntimeException cause) {
+    private void closeQuietly(CudaComputeQueue transfer, CudaComputeQueue compute, CudaEventPool timed,
+                              CudaEventPool events, CudaModuleCache modules, RuntimeException cause) {
         RuntimeException failure = cause;
         if (transfer != null) {
             failure = runStep("close transfer queue", transfer::closeInternal, failure);
         }
         if (compute != null) {
             failure = runStep("close compute queue", compute::closeInternal, failure);
+        }
+        if (timed != null) {
+            failure = runStep("destroy timing event pool", timed::close, failure);
         }
         if (events != null) {
             failure = runStep("destroy event pool", events::close, failure);

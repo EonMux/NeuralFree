@@ -87,6 +87,11 @@ public class KernelSourceAssemblerTest {
         for (KernelManifest.Entry e : m.entries()) {
             String marker = "#line 1 \"" + e.path() + "\"\n";
             int at = source.indexOf(marker);
+            if (e.cudaOnly()) {
+                // the CUDA-only sources are absent from the OpenCL program
+                assertTrue("cuda-only " + e.path() + " must not be assembled", at < 0);
+                continue;
+            }
             assertTrue("missing marker for " + e.path(), at >= 0);
             assertEquals("marker for " + e.path() + " appears once", at, source.lastIndexOf(marker));
             assertTrue(e.path() + " out of manifest order", at > last);
@@ -297,11 +302,20 @@ public class KernelSourceAssemblerTest {
     }
 
     @Test
-    public void defaultsRegisterBothLibrariesOnEveryBackendType() {
+    public void defaultsRegisterBothLibrariesOnEveryBuiltInBackendType() {
         KernelLibraries.ensureDefaults();
-        for (ComputeBackend.BackendType type : ComputeBackend.BackendType.values()) {
+        ComputeBackend.BackendType[] builtIns = {ComputeBackend.BackendType.OPENCL, ComputeBackend.BackendType.CUDA,
+                ComputeBackend.BackendType.VULKAN, ComputeBackend.BackendType.HIP,
+                ComputeBackend.BackendType.METAL};
+        for (ComputeBackend.BackendType type : builtIns) {
             for (String id : new String[]{KernelLibraries.LLM, KernelLibraries.TRAIN}) {
                 assertTrue(id + " on " + type, KernelLibraryRegistry.global().get(id, type).isPresent());
+            }
+        }
+        for (ComputeBackend.BackendType type : ComputeBackend.BackendType.values()) {
+            if (type.isAccelerator()) {
+                assertFalse(type + " gets its libraries from its provider",
+                        KernelLibraryRegistry.global().get(KernelLibraries.LLM, type).isPresent());
             }
         }
         assertTrue(KernelLibraryRegistry.global().libraryIds().containsAll(

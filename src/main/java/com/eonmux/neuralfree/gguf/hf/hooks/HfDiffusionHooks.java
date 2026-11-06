@@ -21,10 +21,10 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * The masked-diffusion and recurrent-depth hooks of Appendix A table HK-SG: LC/conversion/dream.py
+ * The masked-diffusion and recurrent-depth hooks: LC/conversion/dream.py
  * {@code DreamModel} (:13-73), LC/conversion/llada.py {@code LLaDAModel} (:15-118) and — for the Qwen-MoE tensor
  * steps the converter copies from {@code Qwen2MoeModel} — {@code LLaDAMoEModel}; LC/conversion/qwen.py
- * {@code RND1Model} (:449-461) and LC/conversion/nanbeige.py {@code NanbeigeModel} on the HK-0 Llama hooks;
+ * {@code RND1Model} (:449-461) and LC/conversion/nanbeige.py {@code NanbeigeModel} on the Llama hooks;
  * LC/conversion/hrm_text.py {@code HrmTextModel} (:15-79).
  *
  * <p>The diffusion models run bidirectionally, so every entry writes {@code attention.causal} false; the audio

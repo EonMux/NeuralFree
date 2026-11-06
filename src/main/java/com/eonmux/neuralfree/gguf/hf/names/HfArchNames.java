@@ -63,7 +63,10 @@ public final class HfArchNames {
         /** The class's {@code file:line} in LC/conversion, or null without a class. */
         public String source() { return source; }
 
-        /** The class's static architecture, or null when it is chosen at runtime ({@link #dynamicArchs()}). */
+        /**
+         * The class's registered {@code model_arch}, or null when it has none; {@link #dynamicArchs()} lists the
+         * architectures its {@code __init__} may assign instead.
+         */
         public Arch arch() { return arch; }
 
         /** {@code own} when the class defines {@code modify_tensors}, else the class it inherits it from, or null. */

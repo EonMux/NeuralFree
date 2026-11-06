@@ -44,6 +44,15 @@ public interface Verifier {
         /** One uniform draw in {@code [0, 1)} from the round's RNG. */
         double uniform();
 
+        /**
+         * The token a rejection emits: the chain's keyed draw of the residual {@code max(0, a·p − b·q)} when the
+         * chain carries a watermark and the position's context is new (vLLM's watermarked resample), otherwise
+         * {@link Verifier#residual} with one {@link #uniform()} draw.
+         */
+        default int resample(Distribution p, Distribution q, double a, double b) {
+            return Verifier.residual(this, p, q, a, b);
+        }
+
         /** Emits draft token {@code position} as confirmed; returns the stop reason, or null to continue. */
         StopReason confirm(int position);
 

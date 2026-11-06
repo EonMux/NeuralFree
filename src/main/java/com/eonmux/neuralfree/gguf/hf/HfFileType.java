@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.hf;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.hf.tensor.PlannedTensor;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorPlan;
 
@@ -16,12 +17,21 @@ import java.util.Objects;
  * (LC/gguf-py/gguf/constants.py:6295-6337) of the tensor type that holds the most bytes among the planned weights of
  * rank 2 or more ({@code .weight} tensors; every tensor of rank 2 or more when no such weight exists, every tensor when
  * none has rank 2). {@link #ALL_F32} when that type is F32, and {@link #GUESSED} when the type has no file type
- * (NF extension types, integer and intermediate block types). Ties go to the type planned first.
+ * (NF extension types, integer and intermediate block types). Ties go to the type planned first. A float-dominant
+ * view with preserved FP8 weights ({@code GGMLType.F8_E4M3FN}) is {@link #MOSTLY_F8_E4M3}, as the converter sets
+ * MOSTLY_F8_E4M3 over its f16/bf16/f32 guess (LC/conversion/base.py:1600-1604). A conversion with an explicit output
+ * type writes that type's file type instead ({@link #forOutType}); FP8 weights are only preserved under AUTO.
  */
 public final class HfFileType {
 
     /** {@code LlamaFileType.ALL_F32}. */
     public static final int ALL_F32 = 0;
+    /** {@code LlamaFileType.MOSTLY_F16}. */
+    private static final int F16 = 1;
+    /** {@code LlamaFileType.MOSTLY_BF16}. */
+    private static final int BF16 = 32;
+    /** {@code LlamaFileType.MOSTLY_F8_E4M3} (llama.cpp include/llama.h:161): FP8 E4M3 weights. */
+    public static final int MOSTLY_F8_E4M3 = 42;
     /** {@code LlamaFileType.GUESSED}: not specified by the model file. */
     public static final int GUESSED = 1024;
 
@@ -57,6 +67,7 @@ public final class HfFileType {
         m.put(GGMLType.NVFP4, 39);
         m.put(GGMLType.Q1_0, 40);
         m.put(GGMLType.Q2_0, 41);
+        m.put(GGMLType.F8_E4M3FN, MOSTLY_F8_E4M3);
         FILE_TYPES = Collections.unmodifiableMap(m);
     }
 
@@ -79,13 +90,71 @@ public final class HfFileType {
         if (dominant == null) {
             dominant = dominant(tensors, false, false);
         }
-        return dominant == null ? ALL_F32 : of(dominant);
+        if (dominant == null) {
+            return ALL_F32;
+        }
+        int type = of(dominant);
+        // The converter sets MOSTLY_F8_E4M3 over a float guess whenever it preserved FP8 weights
+        // (LC/conversion/base.py:1600-1604); a quantized dominant type keeps its own file type.
+        if ((type == ALL_F32 || type == F16 || type == BF16) && preservesF8E4m3(tensors)) {
+            return MOSTLY_F8_E4M3;
+        }
+        return type;
+    }
+
+    /** True when a planned weight carries the preserved FP8 codes ({@code GGMLType.F8_E4M3FN}). */
+    private static boolean preservesF8E4m3(List<PlannedTensor> tensors) {
+        for (PlannedTensor t : tensors) {
+            if (t.type() == GGMLType.F8_E4M3FN && t.ggufName().endsWith(".weight")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The file type a conversion with {@code outType} writes: the requested type's {@code LlamaFileType} for an
+     * explicit {@code --outtype} (F32, F16, BF16, Q8_0, TQ1_0, TQ2_0), as the converter writes
+     * {@code add_file_type(self.ftype)} whatever types its forced-F32 and F16-kept tensors take; {@link #guess} of
+     * {@code plan} for SOURCE and AUTO, which name no single type.
+     */
+    public static int forOutType(ModelSourceOptions.OutType outType, TensorPlan plan) {
+        Objects.requireNonNull(outType, "outType");
+        switch (outType) {
+            case F32:
+                return ALL_F32;
+            case F16:
+                return of(GGMLType.F16);
+            case BF16:
+                return of(GGMLType.BF16);
+            case Q8_0:
+                return of(GGMLType.Q8_0);
+            case TQ1_0:
+                return of(GGMLType.TQ1_0);
+            case TQ2_0:
+                return of(GGMLType.TQ2_0);
+            default:
+                return guess(plan);
+        }
     }
 
     /** The {@code LlamaFileType} of a model whose weights are mostly {@code type}. */
     public static int of(GGMLType type) {
         Integer id = FILE_TYPES.get(Objects.requireNonNull(type, "type"));
         return id == null ? GUESSED : id;
+    }
+
+    /**
+     * The tensor type {@code fileType} names ({@code LlamaFileType} {@code ALL_F32} / {@code MOSTLY_<type>}), or
+     * null for {@link #GUESSED} and an id without a type.
+     */
+    public static GGMLType typeOf(long fileType) {
+        for (Map.Entry<GGMLType, Integer> e : FILE_TYPES.entrySet()) {
+            if (e.getValue() == fileType) {
+                return e.getKey();
+            }
+        }
+        return null;
     }
 
     /** The type with the most bytes among the tensors that pass the filters, or null when none passes. */

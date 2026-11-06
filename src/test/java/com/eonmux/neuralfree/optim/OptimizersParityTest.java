@@ -266,7 +266,9 @@ public class OptimizersParityTest {
                 }
                 owned.clear();
             } finally {
-                session.close();
+                if (session != null) {
+                    session.close();
+                }
             }
         }
 

@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf;
 
+import com.eonmux.neuralfree.gguf.hf.config.OnlineQuantConfig;
 import com.eonmux.neuralfree.gguf.load.MetadataOverrides;
 import com.eonmux.neuralfree.gguf.load.RopeOverrides;
+import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.utils.json.Json;
 import com.eonmux.neuralfree.utils.json.JsonException;
 
@@ -29,12 +31,24 @@ import java.util.Properties;
  *       2G.</li>
  *   <li>{@value #PROP_CACHE_DIR}: parent of the per-process directories of derived tensors written to disk; default
  *       {@code ${user.home}/.cache/neuralfree/hf}.</li>
- *   <li>{@value #PROP_OUTTYPE}: source | auto | f32 | f16 | bf16 | q8_0, the type of float tensors (the converter's
- *       {@code --outtype}, with source keeping each tensor's stored type); default source.</li>
- *   <li>{@value #PROP_ONLINE_QUANT}: none | q8_0 | q4_0 | q4_1 | q5_0 | q5_1 | iq4_nl, online quantization of float
- *       matmul weights; default none.</li>
+ *   <li>{@value #PROP_OUTTYPE}: source | auto | f32 | f16 | bf16 | q8_0 | tq1_0 | tq2_0, the type of float
+ *       tensors (the converter's {@code --outtype}, with source keeping each tensor's stored type); default
+ *       source.</li>
+ *   <li>{@value #PROP_ONLINE_QUANT}: none | q8_0 | q4_0 | q4_1 | q5_0 | q5_1 | iq4_nl | fp8_per_tensor |
+ *       fp8_per_block | fp8_per_channel | int8_per_channel_weight_only | experts_int8 | nvfp4_per_token | mxfp8 |
+ *       mxfp4 | online (with the aliases fp8, ptpc_fp8 and nvfp4_online), online quantization of float matmul
+ *       weights; default none.</li>
+ *   <li>{@value #PROP_QUANT_CONFIG}: vLLM's {@code --quantization-config}, a JSON object of {@code linear},
+ *       {@code moe}, {@code ignore} and {@code targets} ({@link OnlineQuantConfig}) composed over the
+ *       {@value #PROP_ONLINE_QUANT} shorthand, or alone the bare {@code online} method; default none.</li>
+ *   <li>{@value #PROP_ONLINE_OUTPUT}: whether online quantization also quantizes {@code output.weight}
+ *       (llama-quantize's {@code quantize_output_tensor}); default true, and false is
+ *       {@code --leave-output-tensor}.</li>
  *   <li>{@value #PROP_EXACT_QUANT}: prefer bit-exact weight types over close repacks; default false.</li>
  *   <li>{@value #PROP_MTP}: keep MTP / NextN layers (the converter's {@code --no-mtp} sets false); default true.</li>
+ *   <li>{@value #PROP_DRAFT}: the converter's draft selection, none | mtp | no-nextn | dspark
+ *       ({@link DraftMode}); default none. {@code mtp} exports only the NextN / MTP head and {@code no-nextn} the
+ *       target without it; {@code dspark} converts the checkpoint's DSpark draft as a DFLASH model.</li>
  *   <li>{@value #PROP_ST_DENSE}: include sentence-transformers dense heads; default true.</li>
  *   <li>{@value #PROP_OVERRIDES}: a JSON object merged into {@code config.json} before conversion; default none.</li>
  *   <li>{@value #PROP_TOKENIZER}: a directory whose tokenizer files replace the model's, or a GGUF file whose
@@ -51,6 +65,8 @@ import java.util.Properties;
  *   <li>{@value #PROP_LOAD_FORMAT}: full | dummy, seeded random weights instead of the file's (dummy loads have
  *       no content inputs, so nothing under one persists); default full.</li>
  *   <li>{@value #PROP_WARMUP}: run the load's warmup decode and reset; default true.</li>
+ *   <li>{@value #PROP_REMOTE_CONCURRENCY}: the objects of an object-store checkpoint ({@code s3://}, {@code gs://},
+ *       {@code az://}) downloaded at once when it is mirrored into the cache; default 8.</li>
  * </ul>
  * The tensor read mode is not here: it stays with {@link TensorReadMode}, whose property set every reader of
  * tensor bytes consults. Enum values ignore case and treat {@code -} and {@code _} alike. Immutable.
@@ -62,8 +78,11 @@ public final class ModelSourceOptions {
     public static final String PROP_CACHE_DIR = "neuralfree.hf.cache.dir";
     public static final String PROP_OUTTYPE = "neuralfree.hf.outtype";
     public static final String PROP_ONLINE_QUANT = "neuralfree.quant.online";
+    public static final String PROP_ONLINE_OUTPUT = "neuralfree.quant.online.output";
+    public static final String PROP_QUANT_CONFIG = "neuralfree.quant.config";
     public static final String PROP_EXACT_QUANT = "neuralfree.hf.quant.exact";
     public static final String PROP_MTP = "neuralfree.hf.mtp";
+    public static final String PROP_DRAFT = "neuralfree.hf.draft";
     public static final String PROP_ST_DENSE = "neuralfree.hf.st.dense";
     public static final String PROP_OVERRIDES = "neuralfree.hf.overrides";
     public static final String PROP_TOKENIZER = "neuralfree.hf.tokenizer";
@@ -73,6 +92,12 @@ public final class ModelSourceOptions {
     public static final String PROP_CHECK_TENSORS = "neuralfree.check.tensors";
     public static final String PROP_LOAD_FORMAT = "neuralfree.load.format";
     public static final String PROP_WARMUP = "neuralfree.warmup";
+    public static final String PROP_REMOTE_CONCURRENCY = "neuralfree.remote.concurrency";
+
+    /** Default {@link #remoteConcurrency()}: 8 objects at once. */
+    public static final int DEFAULT_REMOTE_CONCURRENCY = 8;
+    /** Highest accepted {@link #remoteConcurrency()}. */
+    public static final int MAX_REMOTE_CONCURRENCY = 256;
 
     /** Default {@link #memoryBudget()}: 2 GiB. */
     public static final long DEFAULT_MEMORY_BUDGET = 2L << 30;
@@ -107,7 +132,11 @@ public final class ModelSourceOptions {
         F16,
         BF16,
         /** Q8_0, quantized at load. */
-        Q8_0;
+        Q8_0,
+        /** TQ1_0, the BitNet 1.58-bit ternary type, quantized at load. */
+        TQ1_0,
+        /** TQ2_0, the ternary type, quantized at load. */
+        TQ2_0;
 
         /** @throws IllegalArgumentException for an unknown name, naming {@value ModelSourceOptions#PROP_OUTTYPE} */
         public static OutType parse(String value) {
@@ -115,7 +144,15 @@ public final class ModelSourceOptions {
         }
     }
 
-    /** Online quantization of float matmul weights at load. */
+    /**
+     * Online quantization of float matmul weights at load. The legacy block types carry llama-quantize's targets
+     * and eligibility; the rest are vLLM's online quantization methods, which quantize the linear layers and routed
+     * experts but never the embeddings or LM heads: fp8 per tensor, per 128x128 block or per output channel into
+     * F8_E4M3_B128 (F8_E4M3_B32 for rows of no whole 128-value block), mxfp8 into MXFP8 and mxfp4 into MXFP4 on
+     * both, int8 per output channel into I8_B128 and
+     * nvfp4_per_token into NVFP4 on the routed experts only, and the bare online method, whose quantization config
+     * ({@value ModelSourceOptions#PROP_QUANT_CONFIG}) chooses per layer.
+     */
     public enum OnlineQuant {
         NONE,
         Q8_0,
@@ -123,13 +160,114 @@ public final class ModelSourceOptions {
         Q4_1,
         Q5_0,
         Q5_1,
-        IQ4_NL;
+        IQ4_NL,
+        /** E4M3 weights with one scale per tensor (per expert of a stacked tensor). */
+        FP8_PER_TENSOR,
+        /** E4M3 weights with one scale per 128x128 block (per expert of a stacked tensor). */
+        FP8_PER_BLOCK,
+        /** E4M3 weights with one scale per output channel. */
+        FP8_PER_CHANNEL,
+        /** Int8 weights with one scale per output channel; routed experts only. */
+        INT8_PER_CHANNEL_WEIGHT_ONLY,
+        /** vLLM's {@code experts_int8} method: the routed-expert int8 of {@link #INT8_PER_CHANNEL_WEIGHT_ONLY}. */
+        EXPERTS_INT8,
+        /** NVFP4 weights with a per-expert global scale and an E4M3 scale per 16 elements; routed experts only. */
+        NVFP4_PER_TOKEN,
+        /** E4M3 weights with one power-of-two scale per 32 elements. */
+        MXFP8,
+        /** E2M1 weights with one power-of-two scale per 32 elements. */
+        MXFP4,
+        /** vLLM's bare {@code online} method: the quantization config chooses each layer's method. */
+        ONLINE;
+
+        /** The accepted aliases of the vLLM method names ({@code --quantization}). */
+        private static final Map<String, OnlineQuant> ALIASES;
+
+        static {
+            Map<String, OnlineQuant> m = new LinkedHashMap<>();
+            m.put("FP8", FP8_PER_TENSOR);
+            m.put("PTPC_FP8", FP8_PER_CHANNEL);
+            m.put("NVFP4_ONLINE", NVFP4_PER_TOKEN);
+            ALIASES = Collections.unmodifiableMap(m);
+        }
+
+        /** Whether this is one of vLLM's online methods rather than a llama-quantize block type or NONE. */
+        public boolean isVllm() {
+            switch (this) {
+                case NONE: case Q8_0: case Q4_0: case Q4_1: case Q5_0: case Q5_1: case IQ4_NL:
+                    return false;
+                default:
+                    return true;
+            }
+        }
 
         /**
+         * A constant by name, case-insensitive, with {@code -} and {@code _} alike, or one of {@link #ALIASES}.
+         *
          * @throws IllegalArgumentException for an unknown name, naming {@value ModelSourceOptions#PROP_ONLINE_QUANT}
          */
         public static OnlineQuant parse(String value) {
-            return parseEnum(OnlineQuant.class, PROP_ONLINE_QUANT, value);
+            Objects.requireNonNull(value, PROP_ONLINE_QUANT);
+            String s = value.trim().toUpperCase(Locale.ROOT).replace('-', '_');
+            for (OnlineQuant q : OnlineQuant.values()) {
+                if (q.name().equals(s)) {
+                    return q;
+                }
+            }
+            OnlineQuant alias = ALIASES.get(s);
+            if (alias != null) {
+                return alias;
+            }
+            StringBuilder valid = new StringBuilder("none");
+            for (OnlineQuant q : values()) {
+                if (q != NONE) {
+                    valid.append(" | ").append(q.name().toLowerCase(Locale.ROOT));
+                }
+            }
+            for (String a : ALIASES.keySet()) {
+                valid.append(" | ").append(a.toLowerCase(Locale.ROOT));
+            }
+            throw new IllegalArgumentException(PROP_ONLINE_QUANT + "=" + value + " is invalid; use " + valid);
+        }
+    }
+
+    /**
+     * Which part of a checkpoint with multi-token prediction tensors a conversion exports (the converter's
+     * {@code --mtp}, {@code --no-nextn} and {@code --dspark}). The three are mutually exclusive.
+     */
+    public enum DraftMode {
+        /** The checkpoint's own view, MTP / NextN blocks included. */
+        NONE,
+        /** {@code --mtp}: only the NextN / MTP head, with the tensors it shares with the target. */
+        MTP_ONLY,
+        /** {@code --no-nextn} ({@code --no-mtp}): the target without its NextN / MTP tensors. */
+        NO_NEXTN,
+        /** {@code --dspark}: the checkpoint's DSpark draft, as the draft converter's DFLASH model. */
+        DSPARK;
+
+        /**
+         * A constant by name, case-insensitive, with {@code -} and {@code _} alike; {@code no-mtp} is the alias of
+         * {@code no-nextn}.
+         *
+         * @throws IllegalArgumentException for an unknown name, naming {@value ModelSourceOptions#PROP_DRAFT}
+         */
+        public static DraftMode parse(String value) {
+            Objects.requireNonNull(value, PROP_DRAFT);
+            String s = value.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+            if (s.equals("none")) {
+                return NONE;
+            }
+            if (s.equals("mtp")) {
+                return MTP_ONLY;
+            }
+            if (s.equals("no-nextn") || s.equals("no-mtp")) {
+                return NO_NEXTN;
+            }
+            if (s.equals("dspark")) {
+                return DSPARK;
+            }
+            throw new IllegalArgumentException(PROP_DRAFT + "=" + value + " is invalid; use none, mtp, no-nextn"
+                    + " or dspark");
         }
     }
 
@@ -155,18 +293,22 @@ public final class ModelSourceOptions {
     private final Path cacheDir;
     private final OutType outType;
     private final OnlineQuant onlineQuant;
+    private final boolean quantizeOutputTensor;
+    private final OnlineQuantConfig quantConfig;
     private final boolean exactQuant;
-    private final boolean includeMtp;
+    private final DraftMode draftMode;
     private final boolean stDenseModules;
     private final Map<String, Object> configOverrides;
     private final Path tokenizerDir;
     private final Path loraBaseConfig;
+    private final TensorCatalog loraVisionCatalog;
     private final Path baseDir;
     private final List<MetadataOverrides.Override> metadataOverrides;
     private final RopeOverrides ropeOverrides;
     private final boolean checkTensors;
     private final LoadFormat loadFormat;
     private final boolean warmup;
+    private final int remoteConcurrency;
 
     private ModelSourceOptions(Builder b) {
         this.materialize = b.materialize;
@@ -174,18 +316,22 @@ public final class ModelSourceOptions {
         this.cacheDir = b.cacheDir;
         this.outType = b.outType;
         this.onlineQuant = b.onlineQuant;
+        this.quantizeOutputTensor = b.quantizeOutputTensor;
+        this.quantConfig = b.quantConfig;
         this.exactQuant = b.exactQuant;
-        this.includeMtp = b.includeMtp;
+        this.draftMode = b.draftMode;
         this.stDenseModules = b.stDenseModules;
         this.configOverrides = b.configOverrides;
         this.tokenizerDir = b.tokenizerDir;
         this.loraBaseConfig = b.loraBaseConfig;
+        this.loraVisionCatalog = b.loraVisionCatalog;
         this.baseDir = b.baseDir;
         this.metadataOverrides = b.metadataOverrides;
         this.ropeOverrides = b.ropeOverrides;
         this.checkTensors = b.checkTensors;
         this.loadFormat = b.loadFormat;
         this.warmup = b.warmup;
+        this.remoteConcurrency = b.remoteConcurrency;
     }
 
     /** Defaults: auto materialization within 2 GiB, the user cache directory, stored types, no overrides. */
@@ -230,13 +376,36 @@ public final class ModelSourceOptions {
         if (v != null) {
             b.onlineQuant(OnlineQuant.parse(v));
         }
+        v = value(p, PROP_ONLINE_OUTPUT);
+        if (v != null) {
+            b.quantizeOutputTensor(parseBoolean(PROP_ONLINE_OUTPUT, v));
+        }
+        v = value(p, PROP_QUANT_CONFIG);
+        if (v != null) {
+            b.quantConfigJson(v);
+        }
         v = value(p, PROP_EXACT_QUANT);
         if (v != null) {
             b.exactQuant(parseBoolean(PROP_EXACT_QUANT, v));
         }
+        DraftMode draft = null;
+        v = value(p, PROP_DRAFT);
+        if (v != null) {
+            draft = DraftMode.parse(v);
+        }
         v = value(p, PROP_MTP);
         if (v != null) {
-            b.includeMtp(parseBoolean(PROP_MTP, v));
+            boolean include = parseBoolean(PROP_MTP, v);
+            if (!include && (draft == DraftMode.MTP_ONLY || draft == DraftMode.DSPARK)) {
+                throw new IllegalArgumentException(PROP_MTP + "=false (no NextN) conflicts with "
+                        + PROP_DRAFT + "=" + (draft == DraftMode.MTP_ONLY ? "mtp" : "dspark"));
+            }
+            if (!include) {
+                draft = DraftMode.NO_NEXTN;
+            }
+        }
+        if (draft != null) {
+            b.draftMode(draft);
         }
         v = value(p, PROP_ST_DENSE);
         if (v != null) {
@@ -278,6 +447,10 @@ public final class ModelSourceOptions {
         if (v != null) {
             b.warmup(parseBoolean(PROP_WARMUP, v));
         }
+        v = value(p, PROP_REMOTE_CONCURRENCY);
+        if (v != null) {
+            b.remoteConcurrency(parseConcurrency(v));
+        }
         return b.build();
     }
 
@@ -291,10 +464,23 @@ public final class ModelSourceOptions {
     public OutType outType() { return outType; }
     /** Online quantization of float matmul weights. */
     public OnlineQuant onlineQuant() { return onlineQuant; }
+    /** Whether online quantization also quantizes {@code output.weight} (llama-quantize's choice; default true). */
+    public boolean quantizeOutputTensor() { return quantizeOutputTensor; }
+    /** vLLM's online quantization config ({@value #PROP_QUANT_CONFIG}), or null for none. */
+    public OnlineQuantConfig quantConfig() { return quantConfig; }
     /** Whether bit-exact weight types are preferred over close repacks. */
     public boolean exactQuant() { return exactQuant; }
-    /** Whether MTP / NextN layers are kept. */
-    public boolean includeMtp() { return includeMtp; }
+    /** The converter's draft selection ({@value #PROP_DRAFT}). */
+    public DraftMode draftMode() { return draftMode; }
+
+    /** Whether MTP / NextN layers are kept: false only for {@link DraftMode#NO_NEXTN}. */
+    public boolean includeMtp() { return draftMode != DraftMode.NO_NEXTN; }
+
+    /** True for {@link DraftMode#MTP_ONLY}: export only the NextN / MTP head. */
+    public boolean mtpOnly() { return draftMode == DraftMode.MTP_ONLY; }
+
+    /** True for {@link DraftMode#DSPARK}: export the checkpoint's DSpark draft as a DFLASH model. */
+    public boolean dspark() { return draftMode == DraftMode.DSPARK; }
     /** Whether sentence-transformers dense heads are included. */
     public boolean stDenseModules() { return stDenseModules; }
 
@@ -309,6 +495,15 @@ public final class ModelSourceOptions {
     public Path tokenizerDir() { return tokenizerDir; }
     /** Hugging Face configuration of a LoRA adapter's GGUF base, or null. */
     public Path loraBaseConfig() { return loraBaseConfig; }
+
+    /**
+     * The tensor table of the mmproj file opened beside the model, or null: a LoRA adapter target absent from the
+     * base model may then resolve against it and becomes a
+     * {@link com.eonmux.neuralfree.gguf.ops.heads.LoraAdapter.Side#VISION} pair of the vision encoder and its
+     * connector.
+     */
+    public TensorCatalog loraVisionCatalog() { return loraVisionCatalog; }
+
     /** Local copy of the base model a decision-LoRA checkpoint merges, or null. */
     public Path baseDir() { return baseDir; }
 
@@ -330,6 +525,9 @@ public final class ModelSourceOptions {
     /** Whether the load runs its warmup decode and reset ({@code --no-warmup} turns it off). */
     public boolean warmup() { return warmup; }
 
+    /** How many objects of an object-store checkpoint are downloaded at once ({@value #PROP_REMOTE_CONCURRENCY}). */
+    public int remoteConcurrency() { return remoteConcurrency; }
+
     public Builder toBuilder() {
         Builder b = builder();
         b.materialize = materialize;
@@ -337,18 +535,22 @@ public final class ModelSourceOptions {
         b.cacheDir = cacheDir;
         b.outType = outType;
         b.onlineQuant = onlineQuant;
+        b.quantizeOutputTensor = quantizeOutputTensor;
+        b.quantConfig = quantConfig;
         b.exactQuant = exactQuant;
-        b.includeMtp = includeMtp;
+        b.draftMode = draftMode;
         b.stDenseModules = stDenseModules;
         b.configOverrides = configOverrides;
         b.tokenizerDir = tokenizerDir;
         b.loraBaseConfig = loraBaseConfig;
+        b.loraVisionCatalog = loraVisionCatalog;
         b.baseDir = baseDir;
         b.metadataOverrides = metadataOverrides;
         b.ropeOverrides = ropeOverrides;
         b.checkTensors = checkTensors;
         b.loadFormat = loadFormat;
         b.warmup = warmup;
+        b.remoteConcurrency = remoteConcurrency;
         return b;
     }
 
@@ -363,36 +565,44 @@ public final class ModelSourceOptions {
         ModelSourceOptions other = (ModelSourceOptions) o;
         return materialize == other.materialize && memoryBudget == other.memoryBudget
                 && cacheDir.equals(other.cacheDir) && outType == other.outType && onlineQuant == other.onlineQuant
-                && exactQuant == other.exactQuant && includeMtp == other.includeMtp
-                && stDenseModules == other.stDenseModules
+                && quantizeOutputTensor == other.quantizeOutputTensor
+                && Objects.equals(quantConfig, other.quantConfig) && exactQuant == other.exactQuant
+                && draftMode == other.draftMode && stDenseModules == other.stDenseModules
                 && configOverrides.equals(other.configOverrides)
                 && Objects.equals(tokenizerDir, other.tokenizerDir)
-                && Objects.equals(loraBaseConfig, other.loraBaseConfig) && Objects.equals(baseDir, other.baseDir)
+                && Objects.equals(loraBaseConfig, other.loraBaseConfig)
+                && Objects.equals(loraVisionCatalog, other.loraVisionCatalog) && Objects.equals(baseDir, other.baseDir)
                 && metadataOverrides.equals(other.metadataOverrides) && ropeOverrides.equals(other.ropeOverrides)
                 && checkTensors == other.checkTensors && loadFormat == other.loadFormat
-                && warmup == other.warmup;
+                && warmup == other.warmup && remoteConcurrency == other.remoteConcurrency;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(materialize, memoryBudget, cacheDir, outType, onlineQuant, exactQuant, includeMtp,
-                stDenseModules, configOverrides, tokenizerDir, loraBaseConfig, baseDir, metadataOverrides,
-                ropeOverrides, checkTensors, loadFormat, warmup);
+        return Objects.hash(materialize, memoryBudget, cacheDir, outType, onlineQuant, quantizeOutputTensor,
+                quantConfig, exactQuant, draftMode, stDenseModules, configOverrides, tokenizerDir, loraBaseConfig,
+                loraVisionCatalog, baseDir, metadataOverrides, ropeOverrides, checkTensors, loadFormat, warmup,
+                remoteConcurrency);
     }
 
     @Override
     public String toString() {
         return "ModelSourceOptions{materialize=" + materialize + ", memoryBudget=" + memoryBudget + ", cacheDir="
-                + cacheDir + ", outType=" + outType + ", onlineQuant=" + onlineQuant + ", exactQuant=" + exactQuant
-                + ", includeMtp=" + includeMtp + ", stDenseModules=" + stDenseModules
+                + cacheDir + ", outType=" + outType + ", onlineQuant=" + onlineQuant
+                + (quantizeOutputTensor ? "" : ", leave output tensor")
+                + (quantConfig == null ? "" : ", quantConfig=" + quantConfig) + ", exactQuant=" + exactQuant
+                + ", draft=" + draftMode.name().toLowerCase(Locale.ROOT) + ", stDenseModules=" + stDenseModules
                 + (configOverrides.isEmpty() ? "" : ", overrides=" + Json.toString(configOverrides, Json.Style.CANONICAL))
                 + (metadataOverrides.isEmpty() ? "" : ", kv=" + MetadataOverrides.toString(metadataOverrides))
                 + (ropeOverrides.isEmpty() ? "" : ", rope=" + ropeOverrides)
                 + (checkTensors ? ", checkTensors" : "")
                 + (loadFormat == LoadFormat.FULL ? "" : ", loadFormat=" + loadFormat.name().toLowerCase(Locale.ROOT))
                 + (warmup ? "" : ", no warmup")
+                + (remoteConcurrency == DEFAULT_REMOTE_CONCURRENCY ? "" : ", remoteConcurrency=" + remoteConcurrency)
                 + (tokenizerDir != null ? ", tokenizer=" + tokenizerDir : "")
                 + (loraBaseConfig != null ? ", loraBaseConfig=" + loraBaseConfig : "")
+                + (loraVisionCatalog != null ? ", loraVisionCatalog=" + loraVisionCatalog.archName() + "/"
+                        + loraVisionCatalog.size() + " tensors" : "")
                 + (baseDir != null ? ", baseDir=" + baseDir : "") + '}';
     }
 
@@ -454,6 +664,26 @@ public final class ModelSourceOptions {
         }
     }
 
+    /**
+     * A download concurrency in {@code [1, MAX_REMOTE_CONCURRENCY]}.
+     *
+     * @throws IllegalArgumentException naming {@value #PROP_REMOTE_CONCURRENCY} when the value is not an integer or is
+     *                                  out of range
+     */
+    private static int parseConcurrency(String value) {
+        int parsed;
+        try {
+            parsed = Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(PROP_REMOTE_CONCURRENCY + "=" + value + " is not an integer", e);
+        }
+        if (parsed < 1 || parsed > MAX_REMOTE_CONCURRENCY) {
+            throw new IllegalArgumentException(PROP_REMOTE_CONCURRENCY + "=" + value + " is outside [1, "
+                    + MAX_REMOTE_CONCURRENCY + "]");
+        }
+        return parsed;
+    }
+
     private static boolean parseBoolean(String property, String value) {
         String s = value.trim().toLowerCase(Locale.ROOT);
         if (s.equals("true")) {
@@ -491,6 +721,29 @@ public final class ModelSourceOptions {
         @SuppressWarnings("unchecked")
         Map<String, Object> object = (Map<String, Object>) parsed;
         return immutableObject(object, "");
+    }
+
+    /**
+     * The online quantization config in {@code text}, parsed with {@link Json.Limits#STRICT}.
+     *
+     * @throws IllegalArgumentException naming {@value #PROP_QUANT_CONFIG} when the text is not one JSON object or
+     *                                  not a valid configuration
+     */
+    private static OnlineQuantConfig parseQuantConfig(String text) {
+        Object parsed;
+        try {
+            parsed = Json.parse(text);
+        } catch (JsonException e) {
+            throw new IllegalArgumentException(PROP_QUANT_CONFIG + "=" + text + " is not valid JSON: "
+                    + e.getMessage(), e);
+        }
+        if (!(parsed instanceof Map)) {
+            throw new IllegalArgumentException(PROP_QUANT_CONFIG + "=" + text + " is not a JSON object; use"
+                    + " {\"linear\": ..., \"moe\": ..., \"ignore\": [...], \"targets\": {...}}");
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> object = (Map<String, Object>) parsed;
+        return OnlineQuantConfig.parse(object, PROP_QUANT_CONFIG, false);
     }
 
     /** A deep unmodifiable copy of a JSON object; integers widen to Long and Float to Double. */
@@ -543,18 +796,22 @@ public final class ModelSourceOptions {
         private Path cacheDir = defaultCacheDir();
         private OutType outType = OutType.SOURCE;
         private OnlineQuant onlineQuant = OnlineQuant.NONE;
+        private boolean quantizeOutputTensor = true;
+        private OnlineQuantConfig quantConfig;
         private boolean exactQuant;
-        private boolean includeMtp = true;
+        private DraftMode draftMode = DraftMode.NONE;
         private boolean stDenseModules = true;
         private Map<String, Object> configOverrides = Collections.emptyMap();
         private Path tokenizerDir;
         private Path loraBaseConfig;
+        private TensorCatalog loraVisionCatalog;
         private Path baseDir;
         private List<MetadataOverrides.Override> metadataOverrides = Collections.emptyList();
         private RopeOverrides ropeOverrides = RopeOverrides.defaults();
         private boolean checkTensors;
         private LoadFormat loadFormat = LoadFormat.FULL;
         private boolean warmup = true;
+        private int remoteConcurrency = DEFAULT_REMOTE_CONCURRENCY;
 
         private Builder() {
         }
@@ -574,8 +831,40 @@ public final class ModelSourceOptions {
             return this;
         }
 
+        /** Whether online quantization also quantizes {@code output.weight} (default true). */
+        public Builder quantizeOutputTensor(boolean v) { this.quantizeOutputTensor = v; return this; }
+
+        /** vLLM's online quantization config; null removes it. */
+        public Builder quantConfig(OnlineQuantConfig v) {
+            this.quantConfig = v;
+            return this;
+        }
+
+        /**
+         * vLLM's online quantization config as the text of a JSON object (the {@value #PROP_QUANT_CONFIG} form);
+         * null or blank removes it.
+         *
+         * @throws IllegalArgumentException naming {@value #PROP_QUANT_CONFIG} when the text is not one JSON object
+         *                                  or not a valid configuration
+         */
+        public Builder quantConfigJson(String v) {
+            this.quantConfig = v == null || v.trim().isEmpty() ? null : parseQuantConfig(v.trim());
+            return this;
+        }
+
         public Builder exactQuant(boolean v) { this.exactQuant = v; return this; }
-        public Builder includeMtp(boolean v) { this.includeMtp = v; return this; }
+
+        /** The converter's draft selection; null keeps {@link DraftMode#NONE}. */
+        public Builder draftMode(DraftMode v) {
+            this.draftMode = v == null ? DraftMode.NONE : v;
+            return this;
+        }
+
+        /** Whether MTP / NextN layers are kept: false selects {@link DraftMode#NO_NEXTN}, true {@link DraftMode#NONE}. */
+        public Builder includeMtp(boolean v) {
+            this.draftMode = v ? DraftMode.NONE : DraftMode.NO_NEXTN;
+            return this;
+        }
         public Builder stDenseModules(boolean v) { this.stDenseModules = v; return this; }
 
         /**
@@ -603,6 +892,12 @@ public final class ModelSourceOptions {
         public Builder tokenizerDir(Path v) { this.tokenizerDir = v; return this; }
         /** The LoRA base configuration; null removes it. */
         public Builder loraBaseConfig(Path v) { this.loraBaseConfig = v; return this; }
+
+        /**
+         * The tensor table of the mmproj file beside the model, against which a LoRA adapter target absent from the
+         * base model resolves as a vision-encoder pair; null removes it.
+         */
+        public Builder loraVisionCatalog(TensorCatalog v) { this.loraVisionCatalog = v; return this; }
         /** The decision-LoRA base directory; null removes it. */
         public Builder baseDir(Path v) { this.baseDir = v; return this; }
 
@@ -651,7 +946,14 @@ public final class ModelSourceOptions {
             return ropeOverrides(b);
         }
 
-        /** {@code --rope-freq-scale} / its alias {@code --rope-scale}. */
+        /** {@code --rope-scale N}: the context scaling factor ({@code rope.scaling.factor = N}). */
+        public Builder ropeScale(float v) {
+            RopeOverrides.Builder b = ropeOverrides.toBuilder();
+            b.scalingFactor(v);
+            return ropeOverrides(b);
+        }
+
+        /** {@code --rope-freq-scale N}: the frequency scale, a context scaling factor of {@code 1 / N}. */
         public Builder ropeFreqScale(float v) {
             RopeOverrides.Builder b = ropeOverrides.toBuilder();
             b.freqScale(v);
@@ -694,10 +996,26 @@ public final class ModelSourceOptions {
 
         public Builder warmup(boolean v) { this.warmup = v; return this; }
 
-        /** @throws IllegalArgumentException for a negative memory budget */
+        /** How many objects of an object-store checkpoint are downloaded at once; checked by {@link #build()}. */
+        public Builder remoteConcurrency(int v) { this.remoteConcurrency = v; return this; }
+
+        /**
+         * @throws IllegalArgumentException for a negative memory budget, a download concurrency outside
+         *                                  {@code [1, MAX_REMOTE_CONCURRENCY]}, or a quantization config with a
+         *                                  llama-quantize {@value #PROP_ONLINE_QUANT} type
+         */
         public ModelSourceOptions build() {
             if (memoryBudget < 0) {
                 throw new IllegalArgumentException(PROP_MEMORY_MAX + " must not be negative, got " + memoryBudget);
+            }
+            if (remoteConcurrency < 1 || remoteConcurrency > MAX_REMOTE_CONCURRENCY) {
+                throw new IllegalArgumentException(PROP_REMOTE_CONCURRENCY + " must be in [1, "
+                        + MAX_REMOTE_CONCURRENCY + "], got " + remoteConcurrency);
+            }
+            if (quantConfig != null && onlineQuant != OnlineQuant.NONE && !onlineQuant.isVllm()) {
+                throw new IllegalArgumentException(PROP_QUANT_CONFIG + " configures vLLM's online quantization; "
+                        + PROP_ONLINE_QUANT + "=" + onlineQuant.name().toLowerCase(Locale.ROOT)
+                        + " is a llama-quantize type");
             }
             return new ModelSourceOptions(this);
         }

@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfBaseDenseHooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfGraniteHooks;
+import com.eonmux.neuralfree.gguf.hf.hooks.HfInternS1ProHooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfLlamaHooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfMiniMaxHooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfMoeClassicHooksA;
@@ -18,7 +19,7 @@ import java.util.List;
 import java.util.function.ToIntFunction;
 
 /**
- * Hugging Face architecture entries for the classic mixture-of-experts converter classes (Appendix A table HK-MC).
+ * Hugging Face architecture entries for the classic mixture-of-experts converter classes.
  * {@link HfArchRegistry} merges this table with the other tables; a Hugging Face name appears in exactly one table per
  * {@link HfArchEntry.Kind}. {@code UltravoxModel} is a named rejection: the converter raises for it as a text model
  * (LC/conversion/ultravox.py:17-19) because the class only builds the audio encoder plus projector.
@@ -101,7 +102,9 @@ final class HfArchTableMoeClassic {
                                 HfMoeClassicHooksA::gpt2Vocab)
                         .withLoadNameFilter(HfMoeClassicHooksC::hyV3Filter)
                         .withIndexedBlockCount(HfMoeClassicHooksC::hyV3BlockCount)
-                        .withExtra(HfMoeClassicHooksC::hyV3Extra),
+                        .withExtra(HfMoeClassicHooksC::hyV3Extra)
+                        .withMtpExport(true)
+                        .withMtpOnlyRootKeep(HfMtpRoots.COMMON),
                 HfArchEntry.of(Collections.singletonList("InternLM3ForCausalLM"), HfArchResolver.of(Arch.LLAMA),
                                 HfMoeClassicHooksD::internLm3Meta, HfMoeClassicHooksD::internLm3Tensors,
                                 HfMoeClassicHooksD::internLm3Vocab)
@@ -149,6 +152,15 @@ final class HfArchTableMoeClassic {
                                 HfMoeClassicHooksD::qwen3VlMoeMeta, HfMoeClassicHooksD::qwen3VlMoeTensors,
                                 HfQwenMoeHooks::qwen3MoeVocab)
                         .withNameFilter(HfMoeClassicHooksD.THINKER_FILTER)
+                        .withExtra(HfQwenMoeHooks::qwen2MoeExtra),
+                // InternS1ProForConditionalGeneration (interns1_pro.py): the Qwen3-VL MoE text backbone with the
+                // Fourier position embedding, whose coefficient matrices become model-level tensors.
+                HfArchEntry.of(Collections.singletonList("InternS1ProForConditionalGeneration"),
+                                HfArchResolver.of(Arch.INTERN_S1_PRO),
+                                HfInternS1ProHooks::meta, HfInternS1ProHooks::tensors,
+                                HfQwenMoeHooks::qwen3MoeVocab)
+                        .withConfigFixup(HfInternS1ProHooks::fixup)
+                        .withForceType(HfInternS1ProHooks::forceType)
                         .withExtra(HfQwenMoeHooks::qwen2MoeExtra),
                 HfArchEntry.of(Collections.singletonList("Sarashina2VisionForCausalLM"), HfArchResolver.of(Arch.LLAMA),
                                 HfLlamaHooks::meta, HfLlamaHooks::tensors, HfLlamaHooks::vocab)

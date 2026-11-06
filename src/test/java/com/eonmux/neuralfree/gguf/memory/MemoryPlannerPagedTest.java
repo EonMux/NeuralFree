@@ -16,7 +16,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Paged rows of {@link MemoryPlanner} (PARITY MS-2): a paged setting ({@code neuralfree.parallel > 1} or
+ * Paged rows of {@link MemoryPlanner}: a paged setting ({@code neuralfree.parallel > 1} or
  * {@code neuralfree.kv.paged}) replaces the rings with page pools of {@code neuralfree.kv.page.size} rows — full
  * attention keeps {@code roundUp(nCtx, P)}, SWA keeps
  * {@code min(roundUp(nCtx, P), parallel x (roundUp(window + nUbatch, P) + P))}, recurrent state keeps
@@ -73,6 +73,16 @@ public class MemoryPlannerPagedTest {
                 paged(16, 4).toBuilder().swaFull(true).build(), 8192);
         assertEquals(4160, swaFull.group(0).rows());
         assertFalse(swaFull.group(0).ring());
+
+        // the checkpoint reserve adds its pages to the SWA pool, still capped by the context
+        MemoryPlan reserved = MemoryPlanner.planForContext(gemma3(),
+                paged(16, 4).toBuilder().swaCheckpointReserve(8).build(), 8192);
+        assertEquals(4160 + 8 * 16, reserved.group(0).rows());
+        assertEquals(260 + 8, reserved.group(0).pages());
+        assertEquals(8192, reserved.group(1).rows());
+        MemoryPlan capped = MemoryPlanner.planForContext(gemma3(),
+                paged(16, 4).toBuilder().swaCheckpointReserve(4096).build(), 8192);
+        assertEquals(8192, capped.group(0).rows());
     }
 
     @Test
@@ -90,7 +100,9 @@ public class MemoryPlannerPagedTest {
         }
         assertEquals(3 * plain.stateBytes(), three.stateBytes());
         assertEquals(0, three.kvBytes());
-        assertEquals(0, three.positionBytes());
+        // the pure-recurrent plan keeps one bookkeeping group (pages no cache reads) whose position mirror tracks
+        // the sequences for the paged memory: ceil(nCtx / pageSize) x pageSize rows of one int each
+        assertEquals((4096 + 15) / 16 * 16 * Integer.BYTES, three.positionBytes());
         assertTotalsMatchLayers(three);
 
         // the rollback snapshots come per sequence, as llama.cpp puts n_rs_seq rows into the recurrent cache
@@ -104,7 +116,7 @@ public class MemoryPlannerPagedTest {
         }
         assertEquals(12 * plain.stateBytes(), rolled.stateBytes());
         assertTotalsMatchLayers(rolled);
-        // the PC-2 checkpoint slots stay 0 until PC-2: the plan counts only parallel x (1 + snapshots) slots
+        // context checkpoints add no slots of their own: the plan counts only parallel x (1 + snapshots) slots
     }
 
     @Test

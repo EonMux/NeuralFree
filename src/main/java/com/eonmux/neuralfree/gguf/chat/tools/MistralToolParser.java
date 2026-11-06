@@ -21,7 +21,7 @@ final class MistralToolParser extends BlockToolParser {
     }
 
     @Override
-    Block readBlock(String text, int at, String opener, boolean partial) {
+    protected Block readBlock(String text, int at, String opener, boolean partial) {
         int i = JsonScan.skipWs(text, at + opener.length());
         if (i >= text.length()) {
             return partial ? Block.incomplete(new ArrayList<>(), at) : Block.malformed(text.length());

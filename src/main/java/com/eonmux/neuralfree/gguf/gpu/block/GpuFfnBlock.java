@@ -19,6 +19,15 @@ public interface GpuFfnBlock extends AutoCloseable {
     /** Runs the block over {@code nTokens} rows. */
     void forward(int nTokens, ScratchSlot in, ScratchSlot out);
 
+    /**
+     * Whether the block's decode step enqueues only kernel dispatches, so the decode-step replay can record it.
+     * A block that reads step results back to the host (a hosted MoE expert pass reading the routed ids and the
+     * expert input rows) returns false; its steps run directly.
+     */
+    default boolean capturableDecode() {
+        return true;
+    }
+
     /** Releases what {@link #bind} created; the context's shared resources stay. */
     @Override
     default void close() {

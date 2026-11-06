@@ -22,5 +22,10 @@ public enum QkNormKind {
      * {@code n_head_kv * head_dim} for K), eps {@code f_norm_eps}: the BERT graph (jina-bert-v2, models/bert.cpp:115-129)
      * and mpt (models/mpt.cpp:106-118).
      */
-    LN_FULL
+    LN_FULL,
+    /**
+     * Weightless L2 norm over each head, {@code x * rsqrt(sum(x^2) + eps)} with eps {@code f_norm_rms_eps}
+     * ({@link NormKind#L2_GDN}): Dory's {@code justnorm}. An optional per-head weight scales the normalized head.
+     */
+    L2_HEAD
 }

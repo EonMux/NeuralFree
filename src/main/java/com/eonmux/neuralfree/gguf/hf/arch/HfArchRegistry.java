@@ -18,10 +18,10 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Registry of the Hugging Face architectures NeuralFree converts at load time: the merge of the twelve
+ * Registry of the Hugging Face architectures NeuralFree converts at load time: the merge of the thirteen
  * {@code HfArchTable*} tables and the rejected entries this class owns (the names llama.cpp's converter lists as text
  * models without registering a class for them), plus the rows operator-installed plugin jars contribute through
- * {@link Plugins#load(HfArchProvider.class)} (AX-0). Built once on first use; a Hugging Face name registered twice for
+ * {@link Plugins#load(HfArchProvider.class)}. Built once on first use; a Hugging Face name registered twice for
  * one {@link HfArchEntry.Kind} fails the build with {@link IllegalStateException}, and a plugin row whose name collides
  * with a built-in row or with the row of another plugin is rejected there with both sources named.
  *
@@ -54,7 +54,9 @@ public final class HfArchRegistry {
                     HfArchTableSpecial.entries(),
                     HfArchTableSpecialGen.entries(),
                     HfArchTableMmproj.entries(),
-                    HfArchTableDrafts.entries()));
+                    HfArchTableDrafts.entries(),
+                    HfArchTableGgufOnly.entries(),
+                    HfArchTableVllm.entries()));
             return mergeProviders(builtIn, Plugins.load(HfArchProvider.class));
         }
     }
@@ -101,9 +103,68 @@ public final class HfArchRegistry {
                 + " converter does not know it");
     }
 
+    /**
+     * The DSpark draft entry of the target checkpoint configured by {@code cfg} (the converter's {@code --dspark}):
+     * {@code DeepseekV4ForCausalLM} converts as {@code DeepseekV4DSparkModel}, {@code DeepseekV41ForCausalLM} as
+     * {@code DeepseekV41DSparkModel} and {@code MistralLarge4ForConditionalGeneration} as
+     * {@code MistralLarge4DSparkModel}. The target's own architecture selects the draft; the checkpoint's
+     * {@code architectures} never name the draft.
+     *
+     * @throws GgufFormatException with the converter's message for a target it does not support
+     */
+    public static HfArchEntry resolveDspark(HfConfig cfg) {
+        Objects.requireNonNull(cfg, "cfg");
+        String target = cfg.architecture();
+        String draft;
+        if ("DeepseekV41ForCausalLM".equals(target)) {
+            draft = "DeepseekV41DSparkModel";
+        } else if ("DeepseekV4ForCausalLM".equals(target)) {
+            draft = "DeepseekV4DSparkModel";
+        } else if ("MistralLarge4ForConditionalGeneration".equals(target)) {
+            draft = "MistralLarge4DSparkModel";
+        } else {
+            throw new GgufFormatException("--dspark is only supported for DeepseekV4ForCausalLM,"
+                    + " DeepseekV41ForCausalLM and Mistral Large 4");
+        }
+        HfArchEntry e = lookup(HfArchEntry.Kind.TEXT, draft);
+        if (e == null || e.isRejected()) {
+            throw new GgufFormatException("the DSpark draft of '" + target + "' (" + draft
+                    + ") has no conversion in NeuralFree");
+        }
+        return e;
+    }
+
     /** True when a table registers {@code hfName} for {@code kind}. */
     public static boolean has(String hfName, HfArchEntry.Kind kind) {
         return lookup(kind, hfName) != null;
+    }
+
+    /** True when a table registers {@code hfName} for {@code kind} as a rejected entry ({@link HfArchEntry#isRejected}). */
+    public static boolean isRejected(String hfName, HfArchEntry.Kind kind) {
+        HfArchEntry e = lookup(kind, hfName);
+        return e != null && e.isRejected();
+    }
+
+    /**
+     * The Hugging Face architecture names the tables and providers register for {@code kind} without a rejection,
+     * sorted: what {@code nftool export --print-supported-models} lists (the converter's
+     * {@code print_registered_models}). A test overlay's entries are listed as {@link #resolve} sees them.
+     */
+    public static List<String> supportedNames(HfArchEntry.Kind kind) {
+        Map<String, HfArchEntry> entries = new LinkedHashMap<>(Holder.ENTRIES.get(Objects.requireNonNull(kind,
+                "kind")));
+        Map<HfArchEntry.Kind, Map<String, HfArchEntry>> overlay = OVERLAY.get();
+        if (overlay != null) {
+            entries.putAll(overlay.get(kind));
+        }
+        List<String> out = new ArrayList<>();
+        for (Map.Entry<String, HfArchEntry> e : entries.entrySet()) {
+            if (!e.getValue().isRejected()) {
+                out.add(e.getKey());
+            }
+        }
+        Collections.sort(out);
+        return Collections.unmodifiableList(out);
     }
 
     /**

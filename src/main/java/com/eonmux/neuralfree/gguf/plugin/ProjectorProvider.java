@@ -11,7 +11,9 @@ import java.util.List;
  * compile-package later than this SPI, so the interface carries it as its type parameter; the registry loads
  * the rows with {@link Plugins#load(Class)} and casts each provider to {@code ProjectorProvider<ProjectorEntry>}.
  * A row whose name collides with a built-in row or with a row of another provider is rejected when
- * the registry builds its table, with both sources named: providers never replace built-ins.
+ * the registry builds its table, with both sources named: providers never replace built-ins. A vision row may
+ * declare the image preprocessing of its key ({@code ProjectorEntry.keyed} with a {@code VisionPreprocessing}),
+ * which fixes how its images are prepared and how many image tokens each prepared tile yields.
  *
  * @param <R> the projector registry's row type
  */

@@ -92,6 +92,32 @@ class ResponsesRequestsTest {
     }
 
     @Test
+    void aStructuralTagFormatPassesThroughAsTheChatResponseFormat() {
+        Map<String, Object> chat = chat("""
+                {"input": "x", "text": {"format": {"type": "structural_tag",
+                  "format": {"type": "const_string", "value": "ok"}}}}""");
+        Map<?, ?> format = (Map<?, ?>) chat.get("response_format");
+        assertEquals("structural_tag", format.get("type"));
+        assertEquals(Map.of("type", "const_string", "value", "ok"), format.get("format"));
+
+        Map<String, Object> legacy = chat("""
+                {"input": "x", "text": {"format": {"type": "structural_tag", "triggers": ["<f"],
+                  "structures": [{"begin": "<f>", "schema": {}, "end": "</f>"}]}}}""");
+        Map<?, ?> legacyFormat = (Map<?, ?>) legacy.get("response_format");
+        assertEquals(List.of("<f"), legacyFormat.get("triggers"));
+        assertEquals(1, ((List<?>) legacyFormat.get("structures")).size());
+    }
+
+    @Test
+    void aStructuralTagFormatWithoutAPayloadIsRefusedByName() {
+        WebApplicationException e = assertThrows(WebApplicationException.class,
+                () -> chat("{\"input\": \"x\", \"text\": {\"format\": {\"type\": \"structural_tag\"}}}"));
+        assertEquals(400, e.getResponse().getStatus());
+        assertTrue(String.valueOf(e.getResponse().getEntity()).contains("structural_tag requires 'format'"),
+                String.valueOf(e.getResponse().getEntity()));
+    }
+
+    @Test
     void malformedInputsRefuse() {
         for (String json : new String[]{
                 "{}",

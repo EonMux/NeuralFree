@@ -20,8 +20,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * PT-1, HfArchRegistryCoverageTest: static coverage of the delivered tables (PT-1 spec, HF.md §5.6 the updateHfTables
- * invariants, and the {@link HfArchNames} validation contract).
+ * Static coverage of the delivered tables (the {@link HfArchNames} validation contract).
  *
  * <ul>
  *   <li>{@link HfArchRegistry#unmapped(HfArchEntry.Kind)} is empty for {@code TEXT} — every {@code archs.tsv} TEXT
@@ -48,14 +47,22 @@ public class HfRegistryCoverageTest {
         Path dir = Files.createTempDirectory("hf-registry");
         try {
             for (HfArchNames.Row row : HfArchNames.rows(HfArchEntry.Kind.TEXT)) {
-                if (row.hasClass()) {
+                if (row.hasClass() && HfArchRegistry.isRejected(row.hfName(), HfArchEntry.Kind.TEXT)) {
+                    // A registered rejection (a class whose __init__ raises for the name as a text model, as
+                    // UltravoxModel's does, or a converter class NeuralFree refuses by name, HfArchTableGgufOnly)
+                    // throws naming the architecture before any file is read.
+                    GgufFormatException e = assertThrows(GgufFormatException.class, () -> resolve(dir, row.hfName()));
+                    assertTrue(row + ": " + e.getMessage(), e.getMessage().contains(row.hfName()));
+                } else if (row.hasClass()) {
                     // resolve() only reads the name; a registered entry returns without touching files.
                     HfArchEntry entry = resolve(dir, row.hfName());
                     assertNotNull(row.toString(), entry);
                     assertTrue(entry.hfNames().contains(row.hfName()));
-                    if (row.arch() != null) {
-                        // The static row's resolver result equals the row's gguf_arch (PT-1 spec); the delivered
-                        // tables resolve static rows through HfArchResolver.of, a fixed answer.
+                    if (row.arch() != null && row.dynamicArchs().isEmpty()) {
+                        // The static row's resolver result equals the row's gguf_arch; the delivered
+                        // tables resolve static rows through HfArchResolver.of, a fixed answer. A class that
+                        // reassigns model_arch in __init__ (dynamic_archs.tsv) answers from the configuration, and
+                        // HfDynamicArchCoverageTest checks each of its conditions.
                         assertEquals(row.toString(),
                                 row.arch(), entry.arch().resolve(
                                         com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader.fromJson(dir,
@@ -83,17 +90,27 @@ public class HfRegistryCoverageTest {
 
     @Test
     public void aProjectorNameResolvedAsTextRejectsNamed() {
-        // The first MMPROJ row of the tables, resolved as TEXT, rejects with the openProjector note this package
-        // spans on every projector checkpoint (HfArchRegistry.resolve, the "vision/audio projector" arm).
+        // The first MMPROJ row of the tables whose name the converter registers for no TEXT class, resolved as
+        // TEXT, rejects with the openProjector note this package spans on every projector checkpoint
+        // (HfArchRegistry.resolve, the "vision/audio projector" arm). Rows that carry both a text and a
+        // projector class (AudioFlamingo3, CogVLM and friends) open as text models, like the converter's.
         List<HfArchNames.Row> mmproj = HfArchNames.rows(HfArchEntry.Kind.MMPROJ);
         assertFalse("the delivered tables register MMPROJ rows", mmproj.isEmpty());
-        String name = mmproj.get(0).hfName();
+        String name = null;
+        for (HfArchNames.Row row : mmproj) {
+            if (!HfArchNames.row(row.hfName(), HfArchEntry.Kind.TEXT).isPresent()) {
+                name = row.hfName();
+                break;
+            }
+        }
+        assertTrue("the tables register a projector-only name", name != null);
         try {
             Path dir = Files.createTempDirectory("hf-registry-mmproj");
             //noinspection resource
             dir.toFile().deleteOnExit();
-            GgufFormatException e = assertThrows(GgufFormatException.class, () -> resolve(dir, name));
-            assertTrue(e.getMessage(), e.getMessage().contains(name));
+            String projector = name;
+            GgufFormatException e = assertThrows(GgufFormatException.class, () -> resolve(dir, projector));
+            assertTrue(e.getMessage(), e.getMessage().contains(projector));
             assertTrue(e.getMessage(), e.getMessage().contains("projector"));
         } catch (IOException e) {
             throw new RuntimeException(e);

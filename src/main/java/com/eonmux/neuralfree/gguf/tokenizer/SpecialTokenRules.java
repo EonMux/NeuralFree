@@ -239,6 +239,7 @@ final class SpecialTokenRules {
         for (int id = 0; id < n; id++) {
             if (isMapped(v, id) && RENDERED_MARKERS.contains(v.text(id))) attrs[id] = TokenizerVocab.ATTR_USER_DEFINED;
         }
+        if (preType.eosIsEog() && ids[EOS] != NULL) eog.add(ids[EOS]);
         String[] names = {"special_eos_id", "special_eot_id", "special_eom_id"};
         int[] slots = {EOS, EOT, EOM};
         for (int k = 0; k < slots.length; k++) {

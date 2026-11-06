@@ -16,8 +16,12 @@ import java.util.function.Supplier;
  *       which the backend uses as its program-cache key, so the source is built
  *       once per program.</li>
  *   <li>{@link Kind#CUDA_IMAGE}: a classpath fatbin, cubin or PTX resource.</li>
+ *   <li>{@link Kind#HIP_IMAGE}: a classpath HIP code object (hipcc-built, per gfx target).</li>
  *   <li>{@link Kind#SPIRV}: a classpath SPIR-V module with specialisation
  *       constants and the build-time {@link KernelSignature}.</li>
+ *   <li>{@link Kind#METAL_SOURCE}: a classpath Metal Shading Language file
+ *       (supplied lazily and memoised) plus the build-time {@link KernelSignature}.
+ *       The Metal backend compiles it with the Metal framework.</li>
  * </ul>
  *
  * <p>For the binary kinds the program key is the resource path.</p>
@@ -28,7 +32,9 @@ public final class KernelArtifact {
     public enum Kind {
         OPENCL_SOURCE,
         CUDA_IMAGE,
-        SPIRV
+        HIP_IMAGE,
+        SPIRV,
+        METAL_SOURCE
     }
 
     private final Kind kind;
@@ -82,6 +88,18 @@ public final class KernelArtifact {
     }
 
     /**
+     * A HIP kernel in a prebuilt code object on the classpath.
+     *
+     * @param resourcePath classpath path of the hipcc-built {@code .hsaco}, {@code .co} or
+     *                     {@code .hipfb} file that covers the device's gfx target
+     */
+    public static KernelArtifact hipImage(String kernelName, String resourcePath) {
+        requireText(resourcePath, "resourcePath");
+        return new KernelArtifact(Kind.HIP_IMAGE, kernelName, resourcePath, null, "", resourcePath,
+                emptySpecs(), null);
+    }
+
+    /**
      * A Vulkan kernel in a SPIR-V module on the classpath.
      *
      * @param resourcePath  classpath path of the {@code .spv} file
@@ -108,6 +126,27 @@ public final class KernelArtifact {
                 Collections.unmodifiableSortedMap(specs), signature);
     }
 
+    /**
+     * A kernel in a Metal Shading Language source file on the classpath.
+     *
+     * @param resourcePath classpath path of the {@code .metal} file; also the program cache key
+     * @param source       supplier of the MSL text; evaluated at most once
+     * @param options      Metal compile options ({@code -DNAME=VALUE} tokens); null means none
+     * @param signature    build-time argument signature of the kernel; required
+     */
+    public static KernelArtifact metalSource(String kernelName, String resourcePath, Supplier<String> source,
+                                             String options, KernelSignature signature) {
+        requireText(resourcePath, "resourcePath");
+        if (source == null) {
+            throw new IllegalArgumentException("Metal source supplier for " + kernelName + " must not be null");
+        }
+        if (signature == null) {
+            throw new IllegalArgumentException("Metal artifact " + kernelName + " requires a kernel signature");
+        }
+        return new KernelArtifact(Kind.METAL_SOURCE, kernelName, resourcePath, new Memoized(source, kernelName),
+                options == null ? "" : options, resourcePath, emptySpecs(), signature);
+    }
+
     public Kind kind() {
         return kind;
     }
@@ -122,23 +161,24 @@ public final class KernelArtifact {
     }
 
     /**
-     * The OpenCL program source, computed on first call and memoised.
+     * The program source of a source artifact ({@link Kind#OPENCL_SOURCE} or
+     * {@link Kind#METAL_SOURCE}), computed on first call and memoised.
      *
-     * @throws IllegalStateException when this is not an {@link Kind#OPENCL_SOURCE} artifact
+     * @throws IllegalStateException when this is a binary artifact
      */
     public String sourceCode() {
-        if (kind != Kind.OPENCL_SOURCE) {
+        if (kind != Kind.OPENCL_SOURCE && kind != Kind.METAL_SOURCE) {
             throw new IllegalStateException(kind + " artifact " + kernelName + " has no source code");
         }
         return source.get();
     }
 
-    /** OpenCL build options; empty for the binary kinds. */
+    /** Compiler options of a source artifact; empty for the binary kinds. */
     public String buildOptions() {
         return buildOptions;
     }
 
-    /** Classpath resource of a binary artifact, or null for OpenCL source. */
+    /** Classpath resource of a binary or Metal artifact, or null for OpenCL source. */
     public String resourcePath() {
         return resourcePath;
     }
@@ -148,7 +188,7 @@ public final class KernelArtifact {
         return specConstants;
     }
 
-    /** Build-time argument signature; non-null for SPIR-V, null otherwise. */
+    /** Build-time argument signature; non-null for SPIR-V and Metal artifacts, null otherwise. */
     public KernelSignature signature() {
         return signature;
     }

@@ -1,0 +1,186 @@
+/* step5_attn.comp - LLM_Step5_Attn_<KV>: Step5 sparse/windowed GQA with the per-head sigmoid gate.
+ * GLSL twin of kernels/llm/sparse/step5.cl (the semantic reference).
+ *
+ * KV (a variants-row define: an NF_KV_* code of common/kv_types.glsl) selects the element type of the K/V caches.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_head, i n_kv, i head_dim, i region_block, i slot_count, i mode, i window, f scale,
+ *    i kv_rows, i k_row_stride, i v_row_stride, R float q, R <KV> k_cache, R <KV> v_cache, R int kv_pos,
+ *    R int sel, R int q_pos, R float gate, W float out)
+ * mode 0 attends the tokens of the selected regions up to the query position; mode 1 attends the last window
+ * positions (the whole causal history when window <= 0). Position p lives in row p % kv_rows when kv_pos[row] == p.
+ * The arithmetic is vLLM's: base-2 softmax, BF16 softmax weights, F32 value accumulation and
+ * bf16(bf16(acc * sum^-1) * sigmoid(gate)). Dispatch: 1-D, one work-item per (token, query head).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/kv_types.glsl"
+#include "common/attn_common.glsl"
+
+#ifndef KV
+#error "step5_attn.comp needs KV=NF_KV_<type>"
+#endif
+
+#define NF_STEP5_LOG2E 1.4426950408889634f
+
+layout(std430, binding = 0) readonly buffer NfStep5Q { float q[]; };
+NF_ATTN_KV_VIEWS(1, k_cache)
+NF_ATTN_KV_VIEWS(2, v_cache)
+layout(std430, binding = 3) readonly buffer NfStep5KvPos { int kv_pos[]; };
+layout(std430, binding = 4) readonly buffer NfStep5Sel { int sel[]; };
+layout(std430, binding = 5) readonly buffer NfStep5AttnPos { int q_pos[]; };
+layout(std430, binding = 6) readonly buffer NfStep5Gate { float gate[]; };
+layout(std430, binding = 7) buffer NfStep5Out { float outv[]; };
+layout(push_constant) uniform NfStep5AttnParams {
+    int n_tokens;
+    int n_head;
+    int n_kv;
+    int head_dim;
+    int region_block;
+    int slot_count;
+    int mode;
+    int window;
+    float scale;
+    int kv_rows;
+    int k_row_stride;
+    int v_row_stride;
+} pc;
+
+uint nf_step5_bf16_bits(float f) {
+    const uint u = floatBitsToUint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return (u >> 16) | 64u;
+    }
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+
+float nf_step5_bf16(float f) {
+    return uintBitsToFloat(nf_step5_bf16_bits(f) << 16);
+}
+
+/* Score of one query head against position p, -INF when the position is not held. */
+float nf_step5_dot_at(uint qh, int group, int p) {
+    const int row = p % pc.kv_rows;
+    if (kv_pos[row] != p) {
+        return -NF_INF;
+    }
+    const uint base = uint(row) * uint(pc.k_row_stride) + uint(group) * uint(pc.head_dim);
+    float dot = 0.0;
+    for (int d = 0; d < pc.head_dim; ++d) {
+        dot += q[qh + uint(d)] * k_cache_load1(base + uint(d));
+    }
+    return dot * pc.scale * NF_STEP5_LOG2E;
+}
+
+float nf_step5_value_at(int group, int d, int p) {
+    const int row = p % pc.kv_rows;
+    if (kv_pos[row] != p) {
+        return 0.0;
+    }
+    const uint e = uint(row) * uint(pc.v_row_stride) + uint(group) * uint(pc.head_dim) + uint(d);
+    return v_cache_load1(e);
+}
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint total = uint(pc.n_tokens) * uint(pc.n_head);
+    if (gid >= total) {
+        return;
+    }
+    const int h = int(gid % uint(pc.n_head));
+    const int t = int(gid / uint(pc.n_head));
+    const int pos = q_pos[t];
+    const int group = h / (pc.n_head / pc.n_kv);
+    const uint gbase = uint(t * pc.n_kv + group) * uint(pc.slot_count);
+    const uint qh = (uint(t) * uint(pc.n_head) + uint(h)) * uint(pc.head_dim);
+    const uint oh = qh;
+
+    float maxs = -NF_INF;
+    if (pc.mode == 0) {
+        for (int s = 0; s < pc.slot_count; ++s) {
+            const int region = sel[gbase + uint(s)];
+            if (region < 0) {
+                continue;
+            }
+            const int first = region * pc.region_block;
+            const int last = min(first + pc.region_block - 1, pos);
+            for (int p = first; p <= last; ++p) {
+                maxs = max(maxs, nf_step5_dot_at(qh, group, p));
+            }
+        }
+    } else {
+        const int first = pc.window > 0 ? max(0, pos - pc.window + 1) : 0;
+        for (int p = first; p <= pos; ++p) {
+            maxs = max(maxs, nf_step5_dot_at(qh, group, p));
+        }
+    }
+
+    float sum = 0.0;
+    if (pc.mode == 0) {
+        for (int s = 0; s < pc.slot_count; ++s) {
+            const int region = sel[gbase + uint(s)];
+            if (region < 0) {
+                continue;
+            }
+            const int first = region * pc.region_block;
+            const int last = min(first + pc.region_block - 1, pos);
+            for (int p = first; p <= last; ++p) {
+                const float sc = nf_step5_dot_at(qh, group, p);
+                if (sc > -NF_INF) {
+                    sum += exp2(sc - maxs);
+                }
+            }
+        }
+    } else {
+        const int first = pc.window > 0 ? max(0, pos - pc.window + 1) : 0;
+        for (int p = first; p <= pos; ++p) {
+            const float sc = nf_step5_dot_at(qh, group, p);
+            if (sc > -NF_INF) {
+                sum += exp2(sc - maxs);
+            }
+        }
+    }
+
+    for (int d = 0; d < pc.head_dim; ++d) {
+        outv[oh + uint(d)] = 0.0;
+    }
+    if (pc.mode == 0) {
+        for (int s = 0; s < pc.slot_count; ++s) {
+            const int region = sel[gbase + uint(s)];
+            if (region < 0) {
+                continue;
+            }
+            const int first = region * pc.region_block;
+            const int last = min(first + pc.region_block - 1, pos);
+            for (int p = first; p <= last; ++p) {
+                const float sc = nf_step5_dot_at(qh, group, p);
+                if (sc > -NF_INF) {
+                    const float weight = nf_step5_bf16(exp2(sc - maxs));
+                    for (int d = 0; d < pc.head_dim; ++d) {
+                        outv[oh + uint(d)] += weight * nf_step5_value_at(group, d, p);
+                    }
+                }
+            }
+        }
+    } else {
+        const int first = pc.window > 0 ? max(0, pos - pc.window + 1) : 0;
+        for (int p = first; p <= pos; ++p) {
+            const float sc = nf_step5_dot_at(qh, group, p);
+            if (sc > -NF_INF) {
+                const float weight = nf_step5_bf16(exp2(sc - maxs));
+                for (int d = 0; d < pc.head_dim; ++d) {
+                    outv[oh + uint(d)] += weight * nf_step5_value_at(group, d, p);
+                }
+            }
+        }
+    }
+
+    const float inverse = sum > 0.0 ? 1.0 / max(sum, 1e-30) : 0.0;
+    const float gateValue = nf_step5_bf16(1.0 / (1.0 + exp(-gate[t * pc.n_head + h])));
+    for (int d = 0; d < pc.head_dim; ++d) {
+        outv[oh + uint(d)] = nf_step5_bf16(nf_step5_bf16(outv[oh + uint(d)] * inverse) * gateValue);
+    }
+}

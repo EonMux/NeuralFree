@@ -25,6 +25,9 @@ import java.util.Objects;
  * prints its {@link Stats} to the sink; with {@link Config#dumpEnabled()} it also appends the full values to
  * {@link Config#dumpFile()}. Every read waits for the queue, so observed steps run serialized.</p>
  *
+ * <p>Every report names the device the stage ran on when one is given ({@code device=...}): a layer split binds one
+ * diagnostics per device, each on its device's queue, so the lines of every stage carry their own device.</p>
+ *
  * <p>Not thread-safe. Messages go to the sink given at construction (standard error by default), one line per
  * report, prefixed with a tag naming the check.</p>
  */
@@ -44,6 +47,7 @@ public final class GpuDiagnostics implements ExecutionObserver {
     private final ComputeQueue queue;
     private final Config config;
     private final PrintStream out;
+    private final String device;
     private int step;
 
     /** Diagnostics on {@code queue}, reporting to standard error. */
@@ -53,9 +57,24 @@ public final class GpuDiagnostics implements ExecutionObserver {
 
     /** Diagnostics on {@code queue}, reporting to {@code out}. */
     public GpuDiagnostics(ComputeQueue queue, Config config, PrintStream out) {
+        this(queue, config, out, null);
+    }
+
+    /**
+     * Diagnostics on {@code queue}, the queue of device {@code device}, reporting to {@code out}.
+     *
+     * @param device the device name every report carries, or null for none
+     */
+    public GpuDiagnostics(ComputeQueue queue, Config config, PrintStream out, String device) {
         this.queue = Objects.requireNonNull(queue, "queue");
         this.config = Objects.requireNonNull(config, "config");
         this.out = Objects.requireNonNull(out, "out");
+        this.device = device == null || device.trim().isEmpty() ? null : device.trim();
+    }
+
+    /** The device name the reports carry, or null. */
+    public String device() {
+        return device;
     }
 
     public Config config() {
@@ -81,18 +100,25 @@ public final class GpuDiagnostics implements ExecutionObserver {
         }
         long n = (long) nRows * width;
         if (n <= 0 || n > Integer.MAX_VALUE - 8) {
-            out.println("[DIAG] " + stageLabel(stage, layer) + ": " + nRows + " x " + width + " values not read");
+            out.println("[DIAG] " + devicePart() + stageLabel(stage, layer) + ": " + nRows + " x " + width
+                    + " values not read");
             return;
         }
         float[] v = read(result.buffer(), result.offset(), (int) n);
         Stats s = Stats.of(v, 0, (int) n);
-        out.println("[DIAG] step=" + step + " " + stageLabel(stage, layer) + " [" + nRows + " x " + width + "] " + s
-                + " head=" + head(v, 0, (int) n));
+        out.println("[DIAG] step=" + step + " " + devicePart() + stageLabel(stage, layer) + " [" + nRows + " x "
+                + width + "] " + s + " head=" + head(v, 0, (int) n));
         if (config.dumpEnabled()) {
             for (int r = 0; r < nRows; r++) {
-                appendText(stageLabel(stage, layer) + (nRows > 1 ? "#" + r : ""), v, r * width, width);
+                appendText(stageLabel(stage, layer) + (nRows > 1 ? "#" + r : "") + (device != null
+                        ? " @" + device : ""), v, r * width, width);
             }
         }
+    }
+
+    /** {@code device=<name> } when the diagnostics name a device, else empty. */
+    private String devicePart() {
+        return device != null ? "device=" + device + " " : "";
     }
 
     private static String stageLabel(Stage stage, int layer) {

@@ -1,9 +1,11 @@
 package com.eonmux.neuralfree.gguf.ops.flow;
 
+import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuBlockRegistry;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
+import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuBlockRegistry;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
@@ -44,7 +46,7 @@ public abstract class MtpHead implements AutoCloseable {
     public enum Source {
         /** The target model (NextN/MTP blocks, shared embeddings and LM head). */
         TARGET,
-        /** The drafter file (eagle3, gemma4-assistant, an MTP draft file of the target's model). */
+        /** The drafter file (eagle, eagle3, gemma4-assistant, an MTP draft file of the target's model). */
         DRAFT
     }
 
@@ -69,6 +71,24 @@ public abstract class MtpHead implements AutoCloseable {
         }
     }
 
+    /** Where rows live on the device: the buffer and this head's element offset into it. */
+    public static final class Region {
+        /** The buffer holding the rows. */
+        public final GpuBuffer buffer;
+        /** Element offset of the rows inside {@link #buffer}. */
+        public final long offset;
+
+        Region(GpuBuffer buffer, long offset) {
+            this.buffer = buffer;
+            this.offset = offset;
+        }
+
+        @Override
+        public String toString() {
+            return "Region{+" + offset + '}';
+        }
+    }
+
     /** Layers run in order over a residual stream held in {@link Rows}, stepping one {@link Memory}. */
     public interface Stack extends AutoCloseable {
 
@@ -77,6 +97,18 @@ public abstract class MtpHead implements AutoCloseable {
          * and its output afterwards.
          */
         void run(int pos0, int n, int[] tokens, Rows x);
+
+        /**
+         * Runs every layer's attention part only over {@code n} tokens at positions {@code pos0 ..} (the cache
+         * writes: the attention norm, the mixer and its residual): a prompt batch of a drafter that reads these
+         * caches but no row of the stack output. {@code x} holds the stack input on entry and is left mid-layer;
+         * it must not be read afterwards.
+         *
+         * @throws UnsupportedOperationException when the stack cannot skip the FFN part
+         */
+        default void runKV(int pos0, int n, int[] tokens, Rows x) {
+            throw new UnsupportedOperationException("this stack cannot run its cache writes without the FFN part");
+        }
 
         @Override
         void close();
@@ -143,10 +175,14 @@ public abstract class MtpHead implements AutoCloseable {
             }
             int drop = nPast - pos0;
             if (drop > 0) {
-                if (!m.canRollback(drop)) {
+                if (m.canRollback(drop)) {
+                    m.rollback(drop);
+                } else if (m.plan().hasOnlyPositionalState()) {
+                    // Step5 region state: the rows the step writes re-evaluate it, so it needs no restore
+                    m.dropRecomputed(drop);
+                } else {
                     throw new IllegalStateException("draft caches cannot drop their last " + drop + " positions");
                 }
-                m.rollback(drop);
             }
         }
 
@@ -217,6 +253,15 @@ public abstract class MtpHead implements AutoCloseable {
     /** True when the source holds tensor {@code name} (full GGUF name). */
     public abstract boolean has(Source s, String name);
 
+    /**
+     * The stored GGUF name of a host weight this head's operations multiply ({@code CpuMatVec} inputs), from the
+     * drafter file's weights or the target's; null when neither holds it. A head on the device multiplies no host
+     * weight and names none.
+     */
+    public String hostWeightName(CpuTensorRef weight) {
+        return null;
+    }
+
     /** Dimensions {@code ne} of a tensor. */
     public abstract long[] shape(Source s, String name);
 
@@ -228,6 +273,22 @@ public abstract class MtpHead implements AutoCloseable {
 
     /** Writes {@code nRows} rows from {@code src[0 ..]}. */
     public abstract void write(Rows dst, float[] src, int nRows);
+
+    /**
+     * Copies {@code n} rows of {@code src} from row {@code srcRow} into {@code dst} at row {@code dstRow}, where
+     * both were made by this head: one device-side copy (GpuMtpHead), an array copy (CpuMtpHead).
+     */
+    public abstract void copyRows(Rows src, int srcRow, Rows dst, int dstRow, int n);
+
+    /** The device region rows this head made live in; a host head has none ({@code region} throws there). */
+    public Region region(Rows rows) {
+        return null;
+    }
+
+    /** The target GPU context this head runs on, or null on a host head (CpuMtpHead). */
+    public GpuForwardContext gpuContext() {
+        return null;
+    }
 
     /** Reads rows {@code [0, nRows)} into {@code dst[0 ..]}. */
     public abstract void read(Rows src, int nRows, float[] dst);

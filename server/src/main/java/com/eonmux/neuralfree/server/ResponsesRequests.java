@@ -191,7 +191,11 @@ final class ResponsesRequests {
                 + " {\"type\": \"function\", \"name\": ...}");
     }
 
-    /** {@code text.format}: {@code text}, {@code json_object} or {@code json_schema} as chat's response_format. */
+    /**
+     * {@code text.format}: {@code text}, {@code json_object}, {@code json_schema} or {@code structural_tag} as chat's
+     * response_format; a structural tag passes through whole (its {@code format} tree or the legacy
+     * {@code structures} and {@code triggers}), as chat's {@code response_format} of that type takes it.
+     */
     private static Map<String, Object> responseFormat(JsonView text) {
         if (!text.has("format")) {
             return null;
@@ -216,9 +220,16 @@ final class ResponsesRequests {
                 out.put("json_schema", spec);
                 return out;
             }
+            case "structural_tag": {
+                if (!format.has("format") && !format.has("structures")) {
+                    throw ServerJson.badRequest("text.format of type structural_tag requires 'format'"
+                            + " (or the legacy 'structures' and 'triggers')");
+                }
+                return OpenAiRequests.stringKeys((Map<?, ?>) text.raw("format"));
+            }
             default:
                 throw ServerJson.badRequest("text.format type '" + type
-                        + "' is not one of text, json_object, json_schema");
+                        + "' is not one of text, json_object, json_schema, structural_tag");
         }
     }
 

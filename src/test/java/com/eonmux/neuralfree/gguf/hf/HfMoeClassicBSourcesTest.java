@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-MC part B fixtures (BailingMoe and BailingMoeV2 with NextN, Dots1 and Ernie4.5-MoE with its dropped MTP
+ * The fixtures (BailingMoe and BailingMoeV2 with NextN, Dots1 and Ernie4.5-MoE with its dropped MTP
  * tensors) build through the registered entries: {@link ModelSpecBuilder} succeeds and every catalog tensor is
  * claimed (the done-getting-tensors check of the tensor plan).
  */

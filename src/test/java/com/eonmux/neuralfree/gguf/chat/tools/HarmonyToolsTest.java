@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.chat.tools;
 
 import com.eonmux.neuralfree.gguf.chat.ChatRequest;
 import com.eonmux.neuralfree.gguf.chat.ChatTool;
+import com.eonmux.neuralfree.gguf.chat.ParallelToolCalls;
 import com.eonmux.neuralfree.gguf.chat.HarmonyDialect;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
 import com.eonmux.neuralfree.gguf.grammar.CompiledConstraint;
@@ -79,7 +80,8 @@ public class HarmonyToolsTest {
 
     @Test
     public void museToolMessagesBecomeCallsWithTypedValues() {
-        ToolRouting r = ToolRouting.plan(museChat(), "auto", MUSE_TEMPLATE, ReasoningFilter.harmony(), null, true);
+        ToolRouting r = ToolRouting.plan(museChat(), "auto", MUSE_TEMPLATE, ReasoningFilter.harmony(), null,
+                ParallelToolCalls.PARALLEL);
         assertNull("auto adds no grammar", r.constraint());
         ToolOutput out = r.newOutput(() -> "call_m");
         ToolTestSupport.Recorder rec = new ToolTestSupport.Recorder();
@@ -111,7 +113,8 @@ public class HarmonyToolsTest {
     }
 
     private static CompiledConstraint forcing(ChatRequest.ToolChoice choice, String template, String prompt) {
-        ToolRouting r = ToolRouting.plan(chat(choice), "auto", template, ReasoningFilter.harmony(), prompt, true);
+        ToolRouting r = ToolRouting.plan(chat(choice), "auto", template, ReasoningFilter.harmony(), prompt,
+                ParallelToolCalls.PARALLEL);
         assertTrue(r.active());
         return GbnfBuilder.compile(r.constraint());
     }

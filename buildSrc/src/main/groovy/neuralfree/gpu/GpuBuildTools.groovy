@@ -49,13 +49,13 @@ class GpuBuildTools {
         return null
     }
 
-    /** Identity of a tool for up-to-date checks: its path and version output, or "absent". */
+    /**
+     * Identity of a tool for up-to-date and build-cache checks: its executable name and version output, or
+     * "absent". The absolute path is deliberately left out, so a checkout at another path produces the same
+     * fingerprint and can reuse kernel artifacts from the build cache.
+     */
     static String fingerprint(File tool) {
-        if (tool == null) {
-            return 'absent'
-        }
-        Map r = run([tool.absolutePath, '--version'], null)
-        return tool.absolutePath + ' ' + ((String) r.output).trim()
+        return GpuToolFingerprint.of(tool)
     }
 
     /** Runs a command to completion; returns [exit, output (stdout and stderr), command]. */

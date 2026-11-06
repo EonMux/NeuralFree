@@ -38,7 +38,7 @@ final class JsonToolParser extends BlockToolParser {
     }
 
     @Override
-    int bareStart(String text, boolean partial) {
+    protected int bareStart(String text, boolean partial) {
         if (!bare) {
             return -1;
         }
@@ -57,7 +57,7 @@ final class JsonToolParser extends BlockToolParser {
     }
 
     @Override
-    Block readBlock(String text, int at, String opener, boolean partial) {
+    protected Block readBlock(String text, int at, String opener, boolean partial) {
         int i = JsonScan.skipWs(text, at + opener.length());
         int fenced = skipFence(text, i);
         if (fenced == UNDECIDED || fenced >= text.length()) {

@@ -6,15 +6,17 @@ import java.util.Map;
 
 /**
  * Tool calls written as JSON objects — {@code {"name": ..., "arguments": {...}}}, with {@code parameters} for
- * {@code arguments} (Llama 3) and the OpenAI {@code {"type": "function", "function": {...}}} nesting — and JSON
- * arrays of them. The arguments keep their source text, so a call cut off inside its arguments reports a prefix of
- * the text the finished call carries; arguments written as a JSON string (a stringified object) are read once the
- * string closes.
+ * {@code arguments} (Llama 3), {@code args} (Inkling), {@code tool_name}/{@code parameters}/{@code tool_call_id}
+ * (Cohere Command) and the OpenAI {@code {"type": "function", "function": {...}}} nesting — and JSON arrays of
+ * them. The first key of each role that the object carries wins. The arguments keep their source text, so a call
+ * cut off inside its arguments reports a prefix of the text the finished call carries; arguments written as a JSON
+ * string (a stringified object) are read once the string closes.
  */
 final class JsonCalls {
 
-    private static final String[] NAME_KEYS = {"name"};
-    private static final String[] ARGUMENT_KEYS = {"arguments", "parameters"};
+    private static final String[] NAME_KEYS = {"name", "tool_name"};
+    private static final String[] ARGUMENT_KEYS = {"arguments", "parameters", "args"};
+    private static final String[] ID_KEYS = {"id", "tool_call_id"};
 
     private JsonCalls() {
     }
@@ -116,7 +118,13 @@ final class JsonCalls {
     }
 
     private static String idOf(String text, List<JsonScan.Member> members) {
-        JsonScan.Member m = find(members, "id");
+        JsonScan.Member m = null;
+        for (String k : ID_KEYS) {
+            m = find(members, k);
+            if (m != null) {
+                break;
+            }
+        }
         if (m == null || !m.complete()) {
             return null;
         }

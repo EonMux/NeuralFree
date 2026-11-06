@@ -55,6 +55,12 @@ public final class MoeBlocks {
     private MoeBlocks() {
     }
 
+    /** True when {@code kind} is one of the routed mixture-of-experts kinds the factories above build blocks for. */
+    public static boolean isMoeKind(FfnKind kind) {
+        return kind == FfnKind.MOE || kind == FfnKind.MOE_LATENT || kind == FfnKind.MOE_CHUNKED
+                || kind == FfnKind.MOE_PARALLEL_DENSE;
+    }
+
     public static List<GpuMixerFactory> gpuMixers() {
         return Collections.emptyList();
     }

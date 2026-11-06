@@ -20,11 +20,11 @@ import java.util.Objects;
  * a layer at the end of the block, batched and contiguous alike (the {@code afterBlock(StepLayout, float[])} override).
  * The layer's sum comes from the set's current {@link ControlVector.Snapshot}: the extra refreshes against the set's
  * revision per step, so a load, an unload or a scale change takes effect between two steps, on the engine thread (the
- * {@link ControlVector} listener delivery is synchronous on the same thread, §3.3), and a step is never computed half
+ * {@link ControlVector} listener delivery is synchronous on the same thread), and a step is never computed half
  * against one revision. The sum is computed once per change, per layer, in F32 — the bounded host shadow of the GPU
  * extra's buffer rewrite.</p>
  *
- * <p>Mutable, owned by the engine thread like every extra (§3.1). Must be used only from the forward pass that
+ * <p>Mutable, owned by the engine thread like every extra. Must be used only from the forward pass that
  * bound it; {@link #bind} refuses twice.</p>
  */
 public final class CpuControlVectorExtra implements CpuLayerExtra {
@@ -94,7 +94,25 @@ public final class CpuControlVectorExtra implements CpuLayerExtra {
         addRows(s.nTokens(), x, 0, v);
     }
 
-    /** The add needs no per-sequence layout, so batching is supported (the batched {@code afterBlock} runs). */
+    /**
+     * The add touches only the end of the block (the {@code afterBlock} hooks), and both are layout independent, so
+     * the batched forms of the earlier hooks are the no-ops the contiguous forms delegate to.
+     */
+    @Override
+    public void beforeBlock(StepLayout s, float[] x) {
+    }
+
+    @Override
+    public boolean afterMixer(StepLayout s, float[] x, float[] branch) {
+        return false;
+    }
+
+    @Override
+    public boolean afterFfn(StepLayout s, float[] x, float[] branch) {
+        return false;
+    }
+
+    /** The add needs no per-sequence layout, so batching is supported (the batched hooks run). */
     @Override
     public String batchRefusal() {
         return null;

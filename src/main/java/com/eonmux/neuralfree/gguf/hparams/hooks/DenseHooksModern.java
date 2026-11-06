@@ -280,6 +280,19 @@ public final class DenseHooksModern {
         }
     }
 
+    /**
+     * HyperCLOVAX: the RMS epsilon and the MuP attention, embedding, residual and logit multipliers the metadata
+     * carries; the logits are multiplied, the residual branch is scaled, and every sub-layer output passes the
+     * post norm whose tensors the file lists.
+     */
+    public static void hyperclovax(ModelHparamsBuilder b, GgufKv kv) {
+        DenseHooks.readRmsEps(b, kv);
+        b.attentionScale(kv.f32(GgufKeys.ATTENTION_SCALE, b.attentionScale()));
+        b.embeddingScale(kv.f32(GgufKeys.EMBEDDING_SCALE, b.embeddingScale()));
+        b.residualScale(kv.f32(GgufKeys.RESIDUAL_SCALE, b.residualScale()));
+        b.logitScale(kv.f32(GgufKeys.LOGIT_SCALE, b.logitScale()));
+    }
+
     // ---- helpers ----
 
     /** Optional Granite residual, embedding and attention scales (granite.cpp:8-10, granite-switch.cpp:8-10). */

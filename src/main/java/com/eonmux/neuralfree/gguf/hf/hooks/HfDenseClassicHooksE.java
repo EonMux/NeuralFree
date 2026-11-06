@@ -24,7 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Hooks of the llama.cpp classic-dense converter classes of Appendix A table HK-D1, part E: {@code InternLM2Model} (LC/conversion/internlm.py:18-118), {@code OrionModel} (orion.py:8-36), {@code OpenELMModel} (openelm.py:13-83), {@code PlamoModel} (plamo.py:17-71) and {@code Plamo3Model} (plamo.py:154-221), {@code PanguEmbeddedModel} (pangu.py:15-63) and {@code Phi2Model} (phi.py:18-39); the tail of part E (from {@code Spark2_5Model} to {@code GraniteSwitchModel}) lives in {@link HfDenseClassicHooksF}. <p>Every method is a public static hook reference that the table composes and subclasses reuse where the converter calls {@code super()}.</p> */
+/** Hooks of the llama.cpp classic-dense converter classes, part E: {@code InternLM2Model} (LC/conversion/internlm.py:18-118), {@code OrionModel} (orion.py:8-36), {@code OpenELMModel} (openelm.py:13-83), {@code PlamoModel} (plamo.py:17-71) and {@code Plamo3Model} (plamo.py:154-221), {@code PanguEmbeddedModel} (pangu.py:15-63) and {@code Phi2Model} (phi.py:18-39); the tail of part E (from {@code Spark2_5Model} to {@code GraniteSwitchModel}) lives in {@link HfDenseClassicHooksF}. <p>Every method is a public static hook reference that the table composes and subclasses reuse where the converter calls {@code super()}.</p> */
 public final class HfDenseClassicHooksE {
 
     private HfDenseClassicHooksE() {

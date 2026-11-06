@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-MS part C fixtures (the Laguna, Maple, Mellum,\n * Exaone-MoE and SmallThinker rows) build through the registered entries: {@link ModelSpecBuilder} succeeds and every
+ * The fixtures (the Laguna, Maple, Mellum,\n * Exaone-MoE and SmallThinker rows) build through the registered entries: {@link ModelSpecBuilder} succeeds and every
  * catalog tensor is claimed ({@code TensorClaims}), which is the done-getting-tensors check of the
  * converter's tensor plan.
  */

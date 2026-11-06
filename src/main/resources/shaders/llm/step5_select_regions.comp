@@ -1,0 +1,52 @@
+/* step5_select_regions.comp - LLM_Step5_SelectRegions: the per-row region selection layout.
+ * GLSL twin of kernels/llm/sparse/step5.cl (the semantic reference).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_rows, i k, i n_kv, i region_block, i regions, R int topk, R int q_pos, W int sel)
+ * Row r = t * n_kv + g of the LLM_TopK_Rows output holds kk = min(k, closed) region ids of token t. The row's
+ * selection is rewritten as CpuStep5Sparse.selectRegions emits it: k slots holding -1 padding then the ascending
+ * closed region ids, and slot k holding the open region (the closed count). One work-item per row.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfStep5TopK { int topk[]; };
+layout(std430, binding = 1) readonly buffer NfStep5SelectPos { int q_pos[]; };
+layout(std430, binding = 2) buffer NfStep5Sel { int sel[]; };
+layout(push_constant) uniform NfStep5SelectParams {
+    int n_rows;
+    int k;
+    int n_kv;
+    int region_block;
+    int regions;
+} pc;
+
+void main() {
+    const uint row = nf_global_id();
+    if (row >= uint(pc.n_rows)) {
+        return;
+    }
+    const int closed = min(q_pos[row / uint(pc.n_kv)] / pc.region_block, pc.regions);
+    const int kk = min(pc.k, closed);
+    const uint outBase = row * uint(pc.k + 1);
+    for (int i = 0; i < pc.k; ++i) {
+        sel[outBase + uint(i)] = -1;
+    }
+    const int first = pc.k - kk;
+    for (int i = 0; i < kk; ++i) {
+        sel[outBase + uint(first + i)] = topk[row * uint(pc.k) + uint(i)];
+    }
+    /* insertion sort: the selected ids ascending */
+    for (int i = 1; i < kk; ++i) {
+        const int v = sel[outBase + uint(first + i)];
+        int j = i - 1;
+        while (j >= 0 && sel[outBase + uint(first + j)] > v) {
+            sel[outBase + uint(first + j + 1)] = sel[outBase + uint(first + j)];
+            --j;
+        }
+        sel[outBase + uint(first + j + 1)] = v;
+    }
+    sel[outBase + uint(pc.k)] = closed;
+}

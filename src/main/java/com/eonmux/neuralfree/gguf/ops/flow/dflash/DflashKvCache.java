@@ -24,7 +24,7 @@ import java.util.function.IntUnaryOperator;
  * rotate the attention output back (llama-graph.cpp:3498-3560, and :3593-3631 for a cache whose V is its K row).
  * Not thread-safe.
  */
-final class DflashKvCache {
+final class DflashKvCache implements DflashCache {
 
     private final CpuKvLayer[] layers;
     private final int[][] rowPos;
@@ -108,7 +108,7 @@ final class DflashKvCache {
             return KvLayout.latent(rows, false, headDim, headDim, dtype, window);
         }
         final int width = nHeadKv * headDim;
-        return KvLayout.of(rows, false, width, width, dtype, dtype, window);
+        return KvLayout.of(rows, false, width, width, dtype, dtype, window).withHeads(nHeadKv);
     }
 
     /**
@@ -126,8 +126,8 @@ final class DflashKvCache {
         return layers.length;
     }
 
-    /** Positions a full-attention layer can hold. */
-    int capacity() {
+    @Override
+    public int capacity() {
         return capacity;
     }
 
@@ -184,13 +184,13 @@ final class DflashKvCache {
         rowEnd[il] = Math.max(rowEnd[il], row + 1);
     }
 
-    /** True when positions {@code [0, pos + n)} fit the full-attention layers. */
-    boolean fits(int pos, int n) {
+    @Override
+    public boolean fits(int pos, int n) {
         return pos >= 0 && (long) pos + n <= capacity;
     }
 
-    /** Forgets every stored position {@code >= pos}. */
-    void trim(int pos) {
+    @Override
+    public void trim(int pos) {
         for (int il = 0; il < rowPos.length; il++) {
             final int[] p = rowPos[il];
             final int end = rowEnd(il);
@@ -206,8 +206,8 @@ final class DflashKvCache {
         }
     }
 
-    /** Forgets every position. */
-    void clear() {
+    @Override
+    public void clear() {
         trim(0);
     }
 

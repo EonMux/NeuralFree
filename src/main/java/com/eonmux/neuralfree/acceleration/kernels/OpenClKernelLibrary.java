@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.KernelArtifact;
+import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
 
 import java.util.Collections;
 import java.util.List;
@@ -15,13 +16,16 @@ import java.util.Set;
 /**
  * OpenCL side of a kernel library: the program is the manifest concatenation, compiled at run time.
  *
- * <p>One program exists per (library, subgroup flag, {@code NF_FA_SMEM_FLOATS}):
- * {@code programKey = libraryId + (sg ? "__sg" : "") + "#" + smem}. Build options are the library's
+ * <p>One program exists per (library, subgroup flag, {@code NF_FA_SMEM_FLOATS}, MMQ tile):
+ * {@code programKey = libraryId + (sg ? "__sg" : "") + "#" + smem + tile}. Build options are the library's
  * {@link KernelLibraryConfig#openClOptions()} ({@link #BASE_OPTIONS} for the LLM library) plus
  * {@code -DNF_FA_SMEM_FLOATS=<n>}, plus {@code -DUSE_SUBGROUPS=1} when the library has subgroup variants
  * ({@link KernelLibraryConfig#subgroupVariants()}) and the device has subgroup reductions. The
  * {@code NF_FA_SMEM_FLOATS} define sizes the LLM flash-attention tiles; sources that do not reference it
- * are unaffected. No finite-math or fast-relaxed-math option is used: the kernels rely on IEEE infinities
+ * are unaffected. A device whose {@link MmqConfig} is not the packed-dot default also gets
+ * {@code -DNF_MMQ_TM} / {@code -DNF_MMQ_TN} / {@code -DNF_MMQ_TK} ({@link MmqConfig#kernelDefines}),
+ * which sizes the MMQ GEMM tile; the default tile is built into the kernel header, so its options stay
+ * unchanged. No finite-math or fast-relaxed-math option is used: the kernels rely on IEEE infinities
  * as reduction and masking sentinels.</p>
  *
  * <p>The assembled source is computed once per library and shared by every artifact.</p>
@@ -53,17 +57,36 @@ public final class OpenClKernelLibrary implements KernelLibrary {
      * @throws IllegalArgumentException when {@code faSmemFloats} is not positive
      */
     public static String buildOptions(String libraryOptions, boolean subgroups, int faSmemFloats) {
+        return buildOptions(libraryOptions, subgroups, faSmemFloats, "");
+    }
+
+    /**
+     * Build options of a program variant with further defines (the MMQ tile of
+     * {@link com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig#kernelDefines}): the library's static
+     * options, the flash shared-memory size, the subgroup define and then {@code extraDefines}.
+     *
+     * @throws IllegalArgumentException when {@code faSmemFloats} is not positive
+     */
+    public static String buildOptions(String libraryOptions, boolean subgroups, int faSmemFloats,
+                                      String extraDefines) {
         Objects.requireNonNull(libraryOptions, "library options must not be null");
+        Objects.requireNonNull(extraDefines, "extra defines must not be null");
         if (faSmemFloats <= 0) {
             throw new IllegalArgumentException("NF_FA_SMEM_FLOATS must be positive: " + faSmemFloats);
         }
-        String defines = "-DNF_FA_SMEM_FLOATS=" + faSmemFloats + (subgroups ? " -DUSE_SUBGROUPS=1" : "");
+        String defines = "-DNF_FA_SMEM_FLOATS=" + faSmemFloats + (subgroups ? " -DUSE_SUBGROUPS=1" : "")
+                + (extraDefines.isEmpty() ? "" : " " + extraDefines);
         return libraryOptions.isEmpty() ? defines : libraryOptions + " " + defines;
     }
 
     /** Program cache key of a program variant. */
     public static String programKey(String libraryId, boolean subgroups, int faSmemFloats) {
-        return libraryId + (subgroups ? "__sg" : "") + "#" + faSmemFloats;
+        return programKey(libraryId, subgroups, faSmemFloats, "");
+    }
+
+    /** Program cache key of a program variant with the MMQ tile suffix of {@code tileKey}. */
+    public static String programKey(String libraryId, boolean subgroups, int faSmemFloats, String tileKey) {
+        return libraryId + (subgroups ? "__sg" : "") + "#" + faSmemFloats + tileKey;
     }
 
     /**
@@ -128,8 +151,9 @@ public final class OpenClKernelLibrary implements KernelLibrary {
         DeviceCapabilities caps = backend.capabilities();
         boolean sg = config.subgroupVariants() && useSubgroups(caps);
         int smem = FaSmem.faSmemFloats(ComputeBackend.BackendType.OPENCL, caps);
-        return KernelArtifact.openClSource(kernelName, programKey(libraryId(), sg, smem), this::source,
-                buildOptions(config.openClOptions(), sg, smem));
+        MmqConfig mmq = MmqConfig.forDevice(ComputeBackend.BackendType.OPENCL, caps.getComputeCapability());
+        return KernelArtifact.openClSource(kernelName, programKey(libraryId(), sg, smem, mmq.kernelKey(false)),
+                this::source, buildOptions(config.openClOptions(), sg, smem, mmq.kernelDefines(false)));
     }
 
     /**

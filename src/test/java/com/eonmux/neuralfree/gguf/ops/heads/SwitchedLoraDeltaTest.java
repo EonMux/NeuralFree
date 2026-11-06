@@ -106,12 +106,13 @@ public class SwitchedLoraDeltaTest {
                 Dispatch d = ds.get(stage);
                 assertArrayEquals(new int[]{3, N_EMBD, out, rank, stage, nSlots, N_EMBD, 0, out, 0, tmp.offset()},
                         ints(d, 0, 11));
-                assertSame(slots, d.bufferArg(11));
-                assertSame(a, d.bufferArg(12));
-                assertSame(b, d.bufferArg(13));
-                assertSame(x, d.bufferArg(14));
-                assertSame(tmp.buffer(), d.bufferArg(15));
-                assertSame(y, d.bufferArg(16));
+                assertEquals(1.0f, d.floatArg(11), 0f);
+                assertSame(slots, d.bufferArg(12));
+                assertSame(a, d.bufferArg(13));
+                assertSame(b, d.bufferArg(14));
+                assertSame(x, d.bufferArg(15));
+                assertSame(tmp.buffer(), d.bufferArg(16));
+                assertSame(y, d.bufferArg(17));
                 assertArrayEquals(new long[]{HeadsKernels.loraGlobal(stage, 3, rank, out)}, d.global());
                 assertArrayEquals(new long[]{HeadsKernels.LORA_LOCAL}, d.local());
                 assertEquals(FakeComputeBackend.COMPUTE_QUEUE, d.queue());
@@ -135,7 +136,7 @@ public class SwitchedLoraDeltaTest {
             small.add(1, slots, x, 0, N_EMBD, y, 0, out);
 
             for (Dispatch d : backend.dispatches()) {
-                assertSame(grown, d.bufferArg(15));
+                assertSame(grown, d.bufferArg(16));
             }
             assertEquals(2, backend.dispatches().size());
             large.add(1, slots, x, 0, N_EMBD, y, 0, out);
@@ -221,6 +222,8 @@ public class SwitchedLoraDeltaTest {
         GpuBuffer y = floats((long) UBATCH * out);
         scratch.temp(SwitchedLoraExtra.GpuDelta.TEMP_TMP, (long) UBATCH * rank);
         int liveBefore = backend.liveBuffers().size();
+        // open() zero-fills the four placeholders; count only the fills the delta itself issues
+        backend.clearLog();
         SwitchedLoraExtra.GpuDelta delta = SwitchedLoraExtra.GpuDelta.ofAdapter(ops,
                 lora.delta("blk.0.attn_q.weight", 0.5f));
         try {
@@ -232,9 +235,9 @@ public class SwitchedLoraDeltaTest {
             assertEquals(Arrays.asList(HeadsKernels.SWITCHED_LORA_ADD, HeadsKernels.SWITCHED_LORA_ADD), names(ds));
             for (Dispatch d : ds) {
                 assertEquals(1, d.intArg(5));
-                assertSame(ds.get(0).bufferArg(11), d.bufferArg(11));
                 assertSame(ds.get(0).bufferArg(12), d.bufferArg(12));
                 assertSame(ds.get(0).bufferArg(13), d.bufferArg(13));
+                assertSame(ds.get(0).bufferArg(14), d.bufferArg(14));
             }
         } finally {
             delta.close();

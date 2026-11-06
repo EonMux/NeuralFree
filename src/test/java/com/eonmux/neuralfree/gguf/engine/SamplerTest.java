@@ -3,6 +3,8 @@ package com.eonmux.neuralfree.gguf.engine;
 import org.junit.Test;
 
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.SplittableRandom;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -126,6 +128,30 @@ public class SamplerTest {
         assertFalse(Sampler.create(off().greedy(true).build(), new int[]{4}).argmaxOnly());
         assertTrue(Sampler.create(off().topK(1).build()).argmaxOnly());
         assertFalse(Sampler.create(off().topK(1).build(), new int[]{4}).argmaxOnly());
+    }
+
+    /**
+     * A {@code logit_bias} entry edits the logits the on-device argmax must see, so the sparse argmax path is not
+     * the chain's selection: the greedy fast path would return the unedited argmax (llama.cpp's logit-bias sampler
+     * and Avalon's {@code greedy_argmax} carry the sparse biases).
+     */
+    @Test
+    public void argmaxOnlyRefusesLogitBiasChains() {
+        Map<Integer, Float> positive = new HashMap<>();
+        positive.put(0, 5f);
+        assertFalse(Sampler.create(off().greedy(true).build(), new int[0], positive).argmaxOnly());
+
+        Map<Integer, Float> negative = new HashMap<>();
+        negative.put(3, -2f);
+        assertFalse(Sampler.create(off().greedy(true).build(), new int[0], negative).argmaxOnly());
+
+        Map<Integer, Float> zero = new HashMap<>();
+        zero.put(3, 0f);
+        assertFalse("a zero bias still rides the readback", Sampler.create(off().greedy(true).build(),
+                new int[0], zero).argmaxOnly());
+
+        assertTrue(Sampler.create(off().greedy(true).build(), new int[0], new HashMap<Integer, Float>())
+                .argmaxOnly());
     }
 
     @Test

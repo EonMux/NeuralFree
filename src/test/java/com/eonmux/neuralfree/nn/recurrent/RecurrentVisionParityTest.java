@@ -300,10 +300,18 @@ public class RecurrentVisionParityTest {
                     (m, b) -> ((BottleneckBlock) m).initialize(b, new Random(WEIGHT_SEED)), VISION_TOL, 2, 8, 6, 6);
         }
 
+        /**
+         * ResNet-18 on {@code [2, 3, 64, 64]}, so its last stage runs on 2x2 maps and every training-mode batch norm
+         * normalizes at least 8 values per channel. With 1x1 maps a channel holds only the 2 batch values, whose
+         * normalized value {@code (a - b) / sqrt((a - b)^2 + 4 eps)} multiplies an input difference by up to
+         * {@code 1 / (2 sqrt(eps))} (about 158) as {@code a - b} nears 0, and still by about 90 at
+         * {@code |a - b| = 1.3 sqrt(eps)}: a one-ulp convolution difference then exceeds the composite bound after two
+         * such norms, on a correct backend.
+         */
         @Test
         public void resnet18Classifier() {
             compare("ResNet-18", () -> ResNet.resnet18(10), (m, b) -> ((ResNet) m).initialize(b,
-                    new Random(WEIGHT_SEED)), VISION_TOL, 2, 3, 32, 32);
+                    new Random(WEIGHT_SEED)), VISION_TOL, 2, 3, 64, 64);
         }
 
         /** Builds the module on the host and the GPU from the same seeds and compares one forward pass. */

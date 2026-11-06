@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot.QuantizedActivations;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.quant.InputTransform;
+import com.eonmux.neuralfree.gguf.quant.TapProduct;
 
 import java.util.Collections;
 import java.util.EnumMap;
@@ -20,13 +21,17 @@ import java.util.Set;
  *
  * <p>Per call, each token's activation row is
  * <ol>
- *   <li>transformed by the weight's input transform ({@link InputTransform}) when it has one, in the §AQ-1 order
+ *   <li>transformed by the weight's input transform ({@link InputTransform}) when it has one, in the order
  *       HADAMARD (the PRISM or compressed-tensors rotation, {@code build_hadamard_input},
  *       llama-graph.cpp:1598-1626, through {@link CpuHadamard}) → ACT_QUANT (the checkpoint's
  *       fake-quantization, {@link com.eonmux.neuralfree.gguf.quant.ActFakeQuant}) → PERMUTE (the act-order gather
  *       {@code y[k] = x[perm[k]]});</li>
  *   <li>quantized once into the weight type's {@code vec_dot_type} ({@link CpuActivationQuantizer});</li>
- *   <li>dotted with every requested weight row by the type's {@link CpuVecDot};</li>
+ *   <li>dotted with every requested weight row by the type's {@link CpuVecDot} — the {@link CpuSimd} kernel when
+ *       this JVM offers one, or a weight's {@link MatvecPlan} when the instance's {@link KernelSource} has one
+ *       ({@code CpuWeights} binds repacked weights there); a product of several tokens goes through
+ *       {@link CpuVecDot#dotTiles}, so a kernel that multiplies a register tile of rows and tokens reuses each
+ *       decoded weight block and each widened activation block across the tile;</li>
  * </ol>
  * and the outputs are multiplied by the weight's output scale {@code w_s} when it has one (per tensor, or per expert
  * for 3-D expert tensors; llama-graph.cpp:1643-1645, 1722-1729). Work is sharded on weight rows over
@@ -52,7 +57,7 @@ public final class CpuMatVec {
     /** Instance that applies no input transform and no output scale. */
     public static final CpuMatVec PLAIN = new CpuMatVec(w -> Transforms.NONE);
 
-    /** Observes the matmul activations of one call: the CPU tap channel the imatrix tool collects through (TL-3). */
+    /** Observes the matmul activations of one call: the CPU tap channel the imatrix tool collects through. */
     @FunctionalInterface
     public interface InputObserver {
 
@@ -68,6 +73,16 @@ public final class CpuMatVec {
          */
         void observe(CpuTensorRef weight, long rowStart, int rows, int experts, float[] x, int xOff, int xStride,
                      int cols, int nTokens);
+
+        /**
+         * The ask made once per product before its rows are observed (llama.cpp's imatrix callback with
+         * {@code ask = true}): whether the inputs of {@code weight} in a product of {@code rows} input rows are
+         * collected; {@code indirect} for a routed expert product ({@code MUL_MAT_ID}), else a dense one
+         * ({@code MUL_MAT}). The default collects every product.
+         */
+        default boolean wants(CpuTensorRef weight, boolean indirect, int rows) {
+            return true;
+        }
     }
 
     /**
@@ -88,11 +103,35 @@ public final class CpuMatVec {
         return globalObserver;
     }
 
+    /**
+     * The global tap when one is installed and {@link InputObserver#wants wants} the product of {@code weight}
+     * over {@code rows} input rows, else null. An open {@link TapProduct} scope makes the product the scope's dense
+     * one.
+     */
+    public static InputObserver askedObserver(CpuTensorRef weight, boolean indirect, int rows) {
+        InputObserver o = globalObserver;
+        if (o == null || !o.wants(weight, TapProduct.indirect(indirect), TapProduct.rows(rows))) {
+            return null;
+        }
+        return o;
+    }
+
     private final TransformSource transforms;
+    private final KernelSource kernels;
 
     /** A matvec that resolves each weight's transforms through {@code transforms}. */
     public CpuMatVec(TransformSource transforms) {
+        this(transforms, null);
+    }
+
+    /**
+     * A matvec that resolves each weight's transforms through {@code transforms} and, when {@code kernels}
+     * offers a plan for a weight, runs that weight's product over the plan's kernel and view instead of the
+     * type's default kernel over {@code w} itself ({@code CpuWeights} binds repacked weights here).
+     */
+    public CpuMatVec(TransformSource transforms, KernelSource kernels) {
         this.transforms = Objects.requireNonNull(transforms, "transforms");
+        this.kernels = kernels;
     }
 
     // ------------------------------------------------------------------ transforms
@@ -102,6 +141,37 @@ public final class CpuMatVec {
     public interface TransformSource {
         /** The transforms of {@code w}; {@link Transforms#NONE} for a weight without any. Never null. */
         Transforms of(CpuTensorRef w);
+    }
+
+    /**
+     * The kernel and weight view one weight's products run with, when they differ from the type's default
+     * kernel over the weight itself ({@link CpuMatVec#PLAIN} and plain instances have no source). Immutable.
+     */
+    public static final class MatvecPlan {
+
+        /** The view the kernel reads; same shape ({@code rows}, {@code cols}, {@code rowBytes}) as {@code w}. */
+        public final CpuTensorRef weight;
+
+        /** The kernel of {@link #weight}'s layout, with the vec-dot type of the weight's own ggml type. */
+        public final CpuVecDot kernel;
+
+        /** The plan of {@code weight} run with {@code kernel}. */
+        public MatvecPlan(CpuTensorRef weight, CpuVecDot kernel) {
+            this.weight = Objects.requireNonNull(weight, "weight");
+            this.kernel = Objects.requireNonNull(kernel, "kernel");
+        }
+
+        @Override
+        public String toString() {
+            return "MatvecPlan{" + kernel + "}";
+        }
+    }
+
+    /** Resolves the plan a weight's products run with, or null for the default kernel over {@code w}. */
+    @FunctionalInterface
+    public interface KernelSource {
+        /** The plan of {@code w}, or null. Must return the same plan for the same weight. */
+        MatvecPlan planOf(CpuTensorRef w);
     }
 
     /**
@@ -208,7 +278,7 @@ public final class CpuMatVec {
     // ------------------------------------------------------------------ kernels
 
     private static Map<GGMLType, CpuVecDot> buildVecDots() {
-        EnumMap<GGMLType, CpuVecDot> m = new EnumMap<>(GGMLType.class);
+        Map<GGMLType, CpuVecDot> m = new EnumMap<>(GGMLType.class);
         for (GGMLType t : LegacyVecDot.supportedTypes()) {
             put(m, t, LegacyVecDot.forType(t));
         }
@@ -256,11 +326,16 @@ public final class CpuMatVec {
     }
 
     /**
-     * The vec-dot kernel of a weight type.
+     * The vec-dot kernel of a weight type: the {@link CpuSimd} kernel when this JVM offers one for the type,
+     * else the scalar kernel.
      *
      * @throws UnsupportedOperationException when the CPU has no kernel for the type
      */
     public static CpuVecDot vecDot(GGMLType type) {
+        CpuVecDot simd = CpuSimd.vecDot(type);
+        if (simd != null) {
+            return simd;
+        }
         CpuVecDot dot = type == null ? null : VEC_DOTS.get(type);
         if (dot == null) {
             throw new UnsupportedOperationException("no CPU matmul kernel for ggml type " + type
@@ -334,7 +409,7 @@ public final class CpuMatVec {
             throw new IllegalArgumentException("expert " + expert + " is outside [0, " + nExpert + ")");
         }
         long perExpert = w3d.rows() / nExpert;
-        run(w3d, expert * perExpert, toInt(perExpert, w3d), x, xOff, 0, y, yOff, 0, 1, false);
+        run(w3d, expert * perExpert, toInt(perExpert, w3d), x, xOff, 0, y, yOff, 0, 1, false, nExpert);
     }
 
     /** {@link #matmul(CpuTensorRef, float[], int, int, float[], int, int, int)} over densely packed rows. */
@@ -356,6 +431,15 @@ public final class CpuMatVec {
 
     private void run(CpuTensorRef w, long rowStart, int rowCount, float[] x, int xOff, int xStride,
                      float[] y, int yOff, int yStride, int nTokens, boolean accumulate) {
+        run(w, rowStart, rowCount, x, xOff, xStride, y, yOff, yStride, nTokens, accumulate, 0);
+    }
+
+    /**
+     * The product over rows {@code [rowStart, rowStart + rowCount)}; {@code nExpert > 0} is the caller's expert
+     * count of a 3-D weight, which the {@link InputObserver} receives when the transforms know none.
+     */
+    private void run(CpuTensorRef w, long rowStart, int rowCount, float[] x, int xOff, int xStride,
+                     float[] y, int yOff, int yStride, int nTokens, boolean accumulate, int nExpert) {
         Objects.requireNonNull(w, "weight");
         Objects.requireNonNull(x, "x");
         Objects.requireNonNull(y, "y");
@@ -367,33 +451,47 @@ public final class CpuMatVec {
         if (rowCount == 0 || nTokens == 0) {
             return;
         }
-        CpuVecDot dot = vecDot(w.type());
+        MatvecPlan plan = kernels != null ? kernels.planOf(w) : null;
+        final CpuTensorRef wv = plan != null ? plan.weight : w;
+        final CpuVecDot dot = plan != null ? plan.kernel : vecDot(w.type());
         Transforms t = transformsOf(w);
         InputTransform transform = t.transform();
         long perExpert = t.experts() > 0 ? w.rows() / t.experts() : 0L;
         InputTransform.ActQuant actQuant = transform.actQuant();
+        float[] preScale = transform.preScale();
+        boolean actPerExpert = actQuant != null && actQuant.entries() > 1;
+        boolean prePerExpert = preScale != null && preScale.length > cols;
+        if (prePerExpert && perExpert == 0) {
+            throw new IllegalArgumentException(w + ": " + preScale.length + " activation pre-scale values for "
+                    + cols + " columns of a weight without experts");
+        }
         int actExpert = 0;
-        if (perExpert > 0 && actQuant != null && actQuant.entries() > 1) {
+        if (perExpert > 0 && (actPerExpert || prePerExpert)) {
             if (rowCount > perExpert || rowStart / perExpert != (rowStart + rowCount - 1) / perExpert) {
                 throw new IllegalArgumentException("rows [" + rowStart + ", " + (rowStart + rowCount)
                         + ") span several of the " + t.experts() + " experts of " + w
-                        + "; its activation scheme fake-quantizes the input per expert");
+                        + "; its activation pre-scale or scheme applies per expert");
             }
             actExpert = (int) (rowStart / perExpert);
         }
-        QuantizedActivations[] acts = prepare(w, rowStart, rowCount, t.experts(), w.type(), transform, actExpert, x,
-                xOff, xStride, cols, nTokens);
+        int observedExperts = t.experts() > 0 ? t.experts() : nExpert;
+        QuantizedActivations[] acts = prepare(w, rowStart, rowCount, observedExperts, nExpert > 0, w.type(),
+                transform, actExpert, x, xOff, xStride, cols, nTokens);
         int grain = (int) Math.max(1L, MIN_TASK_WORK / ((long) cols * nTokens));
         CpuParallel.parallelFor(rowCount, grain, (from, to) -> {
             int n = to - from;
-            float[] tmp = accumulate || t.hasScale() ? new float[n] : null;
+            if (!accumulate && !t.hasScale()) {
+                if (nTokens == 1) {
+                    dot.dotRows(wv, rowStart + from, n, acts[0], y, yOff + from);
+                } else {
+                    dot.dotTiles(wv, rowStart + from, n, acts, nTokens, y, yOff + from, yStride);
+                }
+                return;
+            }
+            float[] tmp = new float[n];
             for (int tok = 0; tok < nTokens; tok++) {
                 int yBase = yOff + tok * yStride + from;
-                if (tmp == null) {
-                    dot.dotRows(w, rowStart + from, n, acts[tok], y, yBase);
-                    continue;
-                }
-                dot.dotRows(w, rowStart + from, n, acts[tok], tmp, 0);
+                dot.dotRows(wv, rowStart + from, n, acts[tok], tmp, 0);
                 for (int i = 0; i < n; i++) {
                     float v = tmp[i] * rowScale(t, perExpert, rowStart + from + i);
                     y[yBase + i] = accumulate ? y[yBase + i] + v : v;
@@ -403,28 +501,39 @@ public final class CpuMatVec {
     }
 
     /**
-     * Applies the input transform (§AQ-1: HADAMARD → ACT_QUANT → PERMUTE) when it is not
+     * Applies the input transform (PRE_SCALE → HADAMARD → ACT_QUANT → PERMUTE) when it is not
      * {@link InputTransform#isIdentity() identity} and quantizes each token's row for the weight type. The identity
      * and HADAMARD-alone paths are today's unchanged code path: a model without the transform tensors and keys runs
-     * exactly the code the PRISM support ran. The ACT_QUANT fake-quantization (per token row, in runs of the
-     * scheme) and the PERMUTE gather of that row both read this call's scratch, never the caller's input.
-     * The global {@link InputObserver}, when installed, sees the rows with their transform applied and before the
-     * first quantization act, once per call (the unchanged branch) or once per token row (the transform paths). */
-    private static QuantizedActivations[] prepare(CpuTensorRef w, long rowStart, int rows, int experts, GGMLType type,
-                                                   InputTransform transform, int actExpert, float[] x, int xOff,
-                                                   int xStride, int cols, int nTokens) {
-        InputObserver observer = globalObserver;
+     * exactly the code the PRISM support ran. The activation pre-scale (before the rotation and the quantization),
+     * the ACT_QUANT fake-quantization (per token row, in runs of the scheme) and the PERMUTE gather of that row all
+     * read this call's scratch, never the caller's input.
+     * The global {@link InputObserver}, when installed and it wants the product ({@code indirect} for one expert
+     * of a routed product, else a dense product of {@code nTokens} rows), sees the rows with their transform applied
+     * and before the first quantization act, once per call (the unchanged branch) or once per token row (the
+     * transform paths). */
+    private static QuantizedActivations[] prepare(CpuTensorRef w, long rowStart, int rows, int experts,
+                                                   boolean indirect, GGMLType type, InputTransform transform,
+                                                   int actExpert, float[] x, int xOff, int xStride, int cols,
+                                                   int nTokens) {
+        InputObserver observer = askedObserver(w, indirect, nTokens);
         float[] src = x;
         int srcOff = xOff;
         int srcStride = xStride;
+        boolean preScaled = transform.hasPreScale();
+        if (preScaled) {
+            src = copyRows(x, xOff, xStride, nTokens, cols);
+            srcOff = 0;
+            srcStride = cols;
+            transform.applyPreScale(src, 0, nTokens, cols, actExpert);
+        }
         HadamardSpec hadamard = transform.hadamard();
         if (hadamard != null) {
             float[] rotated = new float[Math.multiplyExact(nTokens, cols)];
-            if (nTokens == 1 || xStride == cols) {
-                CpuHadamard.apply(hadamard, x, xOff, rotated, 0, nTokens, cols);
+            if (nTokens == 1 || srcStride == cols) {
+                CpuHadamard.apply(hadamard, src, srcOff, rotated, 0, nTokens, cols);
             } else {
                 for (int tok = 0; tok < nTokens; tok++) {
-                    CpuHadamard.apply(hadamard, x, xOff + tok * xStride, rotated, tok * cols, 1, cols);
+                    CpuHadamard.apply(hadamard, src, srcOff + tok * srcStride, rotated, tok * cols, 1, cols);
                 }
             }
             src = rotated;
@@ -434,12 +543,15 @@ public final class CpuMatVec {
                 observer.observe(w, rowStart, rows, experts, rotated, 0, cols, cols, nTokens);
                 observer = null;
             }
+        } else if (preScaled && observer != null) {
+            observer.observe(w, rowStart, rows, experts, src, srcOff, cols, cols, nTokens);
+            observer = null;
         }
         InputTransform.ActQuant actQuant = transform.actQuant();
         int[] perm = transform.perm();
         if (actQuant == null && perm == null) {
             if (observer != null) {
-                observer.observe(w, rowStart, rows, experts, x, xOff, xStride, cols, nTokens);
+                observer.observe(w, rowStart, rows, experts, src, srcOff, srcStride, cols, nTokens);
             }
             return quantizeRows(type, src, srcOff, srcStride, cols, nTokens);
         }

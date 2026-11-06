@@ -10,10 +10,16 @@
  *                         llama_hparams::is_masked_swa; raw_pos is the layer's kv_pos buffer, -1 for empty rows)
  *   compressed rows       comp_mode 0 (window-only layer): none
  *                         comp_mode 1 (HCA, dense): rows c < n_comp
- *                         comp_mode 2 (CSA, lightning-indexer selection): rows sel[t*sel_stride + j], j < n_comp,
- *                           negative entries skipped; the entries of one token must be distinct (LLM_TopK_Rows)
+ *                         comp_mode 2 (CSA, lightning-indexer selection): rows sel[sel_off + t*sel_stride + j],
+ *                           j < n_comp, negative entries skipped; the entries of one token must be distinct
+ *                           (LLM_TopK_Rows). sel_off locates the first token of the launch inside the step-global
+ *                           selection plane (DeepSeek-V4.1 packs the selections of its paged segments at
+ *                           {@code t0 * k}; DeepSeek-V4 passes 0)
  *                         a compressed row c is visible when c < (p + 1) / ratio (n_visible of the comp plan,
  *                         llama-graph.cpp:834-870; the top-k mask adds that mask, deepseek4.cpp:686-712)
+ *                         A compressed row holds comp_stride values and the key occupies its first head_dim: DeepSeek-V4
+ *                         stores head_dim values, DeepSeek-V4.1 stores the compressed latent beside the index key
+ *                         (models/deepseek41.cpp:480-505).
  * With s_k = (q_rot . k_k) * kq_scale over visible keys and sink = sinks[h] when has_sinks (ggml soft_max with
  * sinks, ops.cpp:5978-5993):
  *   m = max(max_k s_k, sink), l = sum_k e^(s_k - m) + e^(sink - m), o = (1/l) sum_k e^(s_k - m) k_k
@@ -40,7 +46,7 @@ NF_KERNEL void LLM_DSV4_CompressedAttn(
     int comp_mode, int n_comp, int comp_type, int ratio, int sel_stride,
     int has_sinks, float kq_scale, int rot_block,
     int n_rot, int rope_mode, float theta_scale, float freq_scale, float ext_factor, float attn_factor,
-    float corr_lo, float corr_hi,
+    float corr_lo, float corr_hi, int sel_off, int comp_stride,
     NF_GLOBAL const float* NF_RESTRICT q,
     NF_GLOBAL const uchar* NF_RESTRICT raw_k,
     NF_GLOBAL const int* NF_RESTRICT raw_pos,
@@ -103,7 +109,8 @@ NF_KERNEL void LLM_DSV4_CompressedAttn(
             }
         } else if (j < n_keys) {
             const int jc = j - n_raw;
-            const int c = (comp_mode == NF_DSV4_COMP_SELECTED) ? sel[(nf_i64)t * sel_stride + jc] : jc;
+            const int c = (comp_mode == NF_DSV4_COMP_SELECTED)
+                    ? sel[sel_off + (nf_i64)t * sel_stride + jc] : jc;
             if (c >= 0 && c < n_vis_c) {
                 code = -(c + 2);
             }
@@ -117,7 +124,7 @@ NF_KERNEL void LLM_DSV4_CompressedAttn(
         if (code != -1) {
             NF_GLOBAL const uchar* base = code >= 0 ? raw_k : comp_k;
             const int ktype = code >= 0 ? raw_type : comp_type;
-            const nf_i64 e0 = (nf_i64)(code >= 0 ? code : -code - 2) * hd;
+            const nf_i64 e0 = code >= 0 ? (nf_i64)code * hd : (nf_i64)(-code - 2) * comp_stride;
             for (int d = 0; d < hd; d += 4) {
                 const float4 k4 = nf_kv_load4(base, e0 + d, ktype);
                 for (int g = 0; g < G; ++g) {
@@ -152,7 +159,7 @@ NF_KERNEL void LLM_DSV4_CompressedAttn(
                     continue;
                 }
                 const float v = cj >= 0 ? nf_kv_load1(raw_k, (nf_i64)cj * hd + d, raw_type)
-                                        : nf_kv_load1(comp_k, (nf_i64)(-cj - 2) * hd + d, comp_type);
+                                        : nf_kv_load1(comp_k, (nf_i64)(-cj - 2) * comp_stride + d, comp_type);
                 for (int g = 0; g < G; ++g) {
                     a[g] += pw[g * lsize + jj] * v;
                 }

@@ -6,6 +6,9 @@ import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.kernels.KernelLibraries;
 import com.eonmux.neuralfree.acceleration.kernels.KernelLibraryRequirement;
+import com.eonmux.neuralfree.cli.CacheListing;
+import com.eonmux.neuralfree.cli.DeviceListing;
+import com.eonmux.neuralfree.cli.Launcher;
 import com.eonmux.neuralfree.demo.LLMDemoOptions.Mode;
 import com.eonmux.neuralfree.demo.LLMDemoOptions.UsageException;
 import com.eonmux.neuralfree.gguf.GGUFModel;
@@ -17,24 +20,41 @@ import com.eonmux.neuralfree.gguf.LLMModel;
 import com.eonmux.neuralfree.gguf.ModelSource;
 import com.eonmux.neuralfree.gguf.ModelSources;
 import com.eonmux.neuralfree.gguf.TensorReadMode;
+import com.eonmux.neuralfree.gguf.hub.HubCache;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.PoolingKind;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
+import com.eonmux.neuralfree.gguf.audio.AudioClip;
+import com.eonmux.neuralfree.gguf.audio.AudioDecoder;
+import com.eonmux.neuralfree.gguf.audio.SpeechFormat;
+import com.eonmux.neuralfree.gguf.audio.WavWriter;
+import com.eonmux.neuralfree.gguf.chat.ChatTemplateSource;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.GenerationLoop;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
+import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
+import com.eonmux.neuralfree.gguf.speech.Lfm3aGenClip;
+import com.eonmux.neuralfree.gguf.speech.Lfm3aSpeechGenerator;
+import com.eonmux.neuralfree.gguf.speech.PocketTtsClip;
+import com.eonmux.neuralfree.gguf.speech.PocketTtsSpeechGenerator;
+import com.eonmux.neuralfree.gguf.speech.Qwen3TtsClip;
+import com.eonmux.neuralfree.gguf.speech.Qwen3TtsSpeechGenerator;
+import com.eonmux.neuralfree.gguf.speech.SpeechOptions;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
+import com.eonmux.neuralfree.gguf.engine.LookaheadDecoder;
 import com.eonmux.neuralfree.gguf.engine.PocketTtsSession;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
-import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.SamplingDefaults;
 import com.eonmux.neuralfree.gguf.engine.SpeculativeDecoder;
 import com.eonmux.neuralfree.gguf.engine.SpeculativeSession;
+import com.eonmux.neuralfree.gguf.gpu.pipeline.GpuDevices;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
+import com.eonmux.neuralfree.gguf.mm.MmprojSources;
 import com.eonmux.neuralfree.gguf.ops.heads.ClassifierHead;
 import com.eonmux.neuralfree.gguf.ops.heads.DecisionScorer;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -51,17 +71,15 @@ import java.io.BufferedOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
-import java.util.Scanner;
 import java.util.Set;
 
 /**
@@ -94,6 +112,36 @@ public final class LLMDemo {
             }
             return;
         }
+        if (opts.version) {
+            System.out.println(Launcher.versionLine());
+            return;
+        }
+        if (opts.listDevices) {
+            DeviceListing.print(System.out);
+            return;
+        }
+        if (opts.cacheList) {
+            try {
+                CacheListing.print(System.out, new HubCache(HubCache.defaultRoot()));
+            } catch (IOException | IllegalStateException | IllegalArgumentException e) {
+                System.err.println("Error: " + e.getMessage());
+                System.exit(1);
+            }
+            return;
+        }
+        if (opts.serverBase != null) {
+            // Client mode: the server holds the model; nothing loads here.
+            try {
+                int code = RemoteChat.run(opts);
+                if (code != 0) {
+                    System.exit(code);
+                }
+            } catch (Exception e) {
+                System.err.println("Error: " + e.getMessage());
+                System.exit(1);
+            }
+            return;
+        }
         String modelPath = resolveModelPath(opts);
         if (modelPath == null) {
             System.err.println("No model specified.");
@@ -121,10 +169,26 @@ public final class LLMDemo {
             }
         }
         if (opts.noMmap) {
-            System.setProperty(TensorReadMode.PROP_DISABLE_MMAP, "true");
+            // turns the configured mode into its non-mapped form, keeping a --mlock pin (mmap+mlock -> mlock)
+            System.setProperty(TensorReadMode.PROP_READ_MODE,
+                    TensorReadMode.current().withMmap(false).flagName());
+        }
+        if (opts.noJinja) {
+            System.setProperty(ChatTemplateSource.JINJA_PROPERTY, "false");
         }
         if (opts.engine.deviceFilter() != null) {
             System.setProperty(EngineConfig.PROP_DEVICE, opts.engine.deviceFilter());
+        }
+
+        // the projector resolves (and downloads) before the model opens, whose media turns need paged memory
+        java.nio.file.Path projector = resolveProjector(opts, Paths.get(modelPath));
+        if (projector != null) {
+            System.out.println("mmproj: " + projector);
+            if (System.getProperty(MemoryConfig.PROP_KV_PAGED) == null) {
+                System.setProperty(MemoryConfig.PROP_KV_PAGED, "true");
+                System.out.println("Media turns run the batch engine; enabling paged memory ("
+                        + MemoryConfig.PROP_KV_PAGED + "=true)");
+            }
         }
 
         System.out.println("=== LLM Demo - NeuralFree GGUF Inference ===");
@@ -134,7 +198,7 @@ public final class LLMDemo {
         System.out.println();
 
         try {
-            runSession(modelPath, opts);
+            runSession(modelPath, opts, projector);
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             String m = e.getMessage();
@@ -157,7 +221,7 @@ public final class LLMDemo {
     }
 
     /**
-     * The model path: the {@code -hf} Hugging Face Hub download (PARITY TL-7: the file the Hub cache
+     * The model path: the {@code -hf} Hugging Face Hub download (the file the Hub cache
      * holds for the repo expression), else the command line, else {@code -Dneuralfree.model}, else
      * {@code NEURALFREE_MODEL}; null when none of them gives one.
      */
@@ -195,6 +259,48 @@ public final class LLMDemo {
         System.err.println("  -Dneuralfree.model=<path>");
     }
 
+    /**
+     * The projector of a local multimodal run, llama.cpp's sources in order (common/arg.cpp): the explicit
+     * {@code --mmproj}, the {@code --mmproj-url} download into the hub cache, or the {@code --mmproj-auto}
+     * sibling — for a {@code -hf} model the repository's mmproj sidecar llama.cpp downloads with the model,
+     * else the {@code *mmproj*.gguf} beside the model file. Null when only the automatic search ran and found
+     * none, which is a text-only run; media files with no projector anywhere end the run naming the flags. The
+     * audio mode keeps {@code --mmproj} for its speech generator and resolves nothing.
+     */
+    private static java.nio.file.Path resolveProjector(LLMDemoOptions opts, java.nio.file.Path modelPath) {
+        if (opts.mode == Mode.AUDIO) {
+            // the audio mode keeps --mmproj for its speech generator; the projector sources configure a
+            // text model's media run
+            return null;
+        }
+        java.nio.file.Path resolved = null;
+        try {
+            resolved = MmprojSources.resolve("--mmproj", opts.mmproj, opts.mmprojUrl, !opts.noMmproj, modelPath,
+                    HubCache.defaultRoot());
+            if (resolved == null && !opts.noMmproj && opts.mmproj == null && opts.mmprojUrl == null
+                    && opts.hfRepo != null) {
+                resolved = com.eonmux.neuralfree.demo.tools.DownloadCommand.downloadMmproj(
+                        opts.hfRepo, opts.hfFile);
+            }
+        } catch (java.io.IOException | InterruptedException | RuntimeException e) {
+            System.err.println("Error: " + e.getMessage());
+            System.exit(1);
+            return null;
+        } catch (com.eonmux.neuralfree.demo.tools.DownloadCommand.UsageException e) {
+            System.err.println("Error: " + e.getMessage());
+            System.exit(2);
+            return null;
+        }
+        if (resolved == null && !opts.media.isEmpty()) {
+            System.err.println("Error: --image/--audio/--video need the projector of a multimodal model; give"
+                    + " --mmproj or --mmproj-url, or let --mmproj-auto (the default) find the mmproj GGUF beside"
+                    + " the model file or in the -hf repository (--no-mmproj turns the projector off)");
+            System.exit(1);
+            return null;
+        }
+        return resolved;
+    }
+
     // ================================================================== export
 
     /**
@@ -215,18 +321,21 @@ public final class LLMDemo {
 
     // ================================================================== session
 
-    private static void runSession(String modelPath, LLMDemoOptions opts) throws IOException {
+    private static void runSession(String modelPath, LLMDemoOptions opts, java.nio.file.Path projector)
+            throws IOException {
         Mode mode = resolveMode(modelPath, opts);
         EngineConfig cfg = opts.engineConfig(mode);
         HWAcceleration hw = null;
         ComputeBackend backend = null;
-        if (cfg.backend().usesGpu()) {
+        // a layer split opens a backend per device itself and reports its stages; it shares no backend
+        if (cfg.backend().usesGpu() && !cfg.split()) {
             ACCELERATION_MODE accel = cfg.backend().toAccelerationMode();
             System.out.println("Initializing GPU backend...");
             try {
                 Config.setAccelerationMode(accel);
                 hw = HWAcceleration.forMode(accel);
-                backend = hw.createBackend(accel, KernelLibraryRequirement.of(KernelLibraries.LLM));
+                backend = cfg.picksMainGpu() ? GpuDevices.openMainGpu(hw, cfg).backend()
+                        : hw.createBackend(accel, KernelLibraryRequirement.of(KernelLibraries.LLM));
                 System.out.println("Backend: " + backend.backendType() + " (" + backend.capabilities().getDeviceClass() + ")");
                 System.out.println("Device: " + backend.capabilities().getDeviceName());
                 System.out.println("VRAM: " + (backend.capabilities().getTotalVramBytes() / (1024 * 1024)) + " MB");
@@ -251,13 +360,14 @@ public final class LLMDemo {
             }
             describeModel(modelPath, model, cfg, backend);
             if (opts.memoryReportOnly) {
+                printFittedArguments(model);
                 return;
             }
             if (opts.benchmark || opts.benchStreaming) {
                 runBenchmark(model, opts);
                 return;
             }
-            dispatch(model, mode == Mode.AUTO ? autoMode(model.spec(), opts) : mode, opts, cfg);
+            dispatch(model, mode == Mode.AUTO ? autoMode(model.spec(), opts) : mode, opts, cfg, projector);
         } finally {
             if (hw != null) {
                 hw.shutdown();
@@ -266,15 +376,15 @@ public final class LLMDemo {
     }
 
     /**
-     * {@code --mode}, or for AUTO the mode of the model ({@link #autoMode}, read from its metadata), so the pooled
-     * modes get their ubatch before the model loads.
+     * {@code --mode}, or for AUTO the mode of the model ({@link #autoMode}, read from its metadata, with the
+     * {@code --pooling} override applied), so the pooled modes get their ubatch before the model loads.
      */
     private static Mode resolveMode(String modelPath, LLMDemoOptions opts) {
         if (opts.mode != Mode.AUTO) {
             return opts.mode;
         }
         try {
-            ModelSpec spec = LLMModelFactory.inspect(modelPath, opts.engine.memory());
+            ModelSpec spec = LLMModelFactory.inspect(modelPath, opts.engine);
             return autoMode(spec, opts);
         } catch (IOException | RuntimeException e) {
             System.err.println("Cannot read the model's architecture ahead of loading (" + e.getMessage()
@@ -286,8 +396,9 @@ public final class LLMDemo {
     /**
      * The AUTO mode of a model, as the llama.cpp tools pick their output from the head rather than the architecture:
      * a decision head classifies; RANK pooling reranks {@code --document} against the prompt, or classifies the
-     * prompt without a document; any other pooling type set by the GGUF embeds (llama.cpp embeddings of any model,
-     * such as a qwen3 embedding model with LAST pooling); otherwise the architecture's support class decides.
+     * prompt without a document; any other pooling type set by the GGUF or {@code --pooling} embeds (llama.cpp
+     * embeddings of any model, such as a qwen3 embedding model with LAST pooling); otherwise the architecture's
+     * support class decides.
      */
     static Mode autoMode(ModelSpec spec, LLMDemoOptions opts) {
         if (DecisionScorer.present(spec)) {
@@ -318,9 +429,24 @@ public final class LLMDemo {
         }
     }
 
-    private static void dispatch(EngineModel model, Mode mode, LLMDemoOptions opts, EngineConfig cfg)
-            throws IOException {
-        System.out.println("Mode: " + mode.name().toLowerCase(Locale.ROOT));
+    private static void dispatch(EngineModel model, Mode mode, LLMDemoOptions opts, EngineConfig cfg,
+                                 java.nio.file.Path projector) throws IOException {
+        String modeName = mode.name().toLowerCase(Locale.ROOT);
+        if (mode != Mode.GENERATE && opts.promptCache != null) {
+            // an AUTO mode that resolves away from generate reaches here; the explicit ones parse-refused
+            throw new IllegalArgumentException("--prompt-cache runs the generate mode; the model resolves to "
+                    + modeName + ", which holds no sequence to cache");
+        }
+        if (mode != Mode.GENERATE) {
+            // only the text generation mode runs the request's sampler chain
+            opts.requireNoDecodingConstraints("--mode " + modeName);
+        }
+        if (mode != Mode.GENERATE && opts.multimodalInputGiven()) {
+            // an AUTO mode that resolves away from generate reaches here; the explicit ones parse-refused
+            throw new IllegalArgumentException("--mode " + modeName + " reads text only; --mmproj, --mmproj-url"
+                    + " and --image/--audio/--video belong to the generate mode");
+        }
+        System.out.println("Mode: " + modeName);
         System.out.println();
         switch (mode) {
             case EMBED:
@@ -339,7 +465,7 @@ public final class LLMDemo {
                 runAudio(model, opts, cfg);
                 break;
             default:
-                runGenerate(model, opts, cfg);
+                runGenerate(model, opts, cfg, projector);
                 break;
         }
     }
@@ -363,6 +489,8 @@ public final class LLMDemo {
         if (gpu && backend != null) {
             logStats("Backend: " + backend.backendType() + " (" + backend.capabilities().getDeviceClass() + ")");
             logStats("Device: " + backend.capabilities().getDeviceName());
+        } else if (!gpu && model.gpuFallbackReason() != null) {
+            logStats("GPU fallback: " + model.gpuFallbackReason());
         }
         logStats("Support class: " + model.supportClass());
         logModelInfo(model);
@@ -436,6 +564,28 @@ public final class LLMDemo {
         System.out.printf(Locale.ROOT, "  %-20s %10.1f MiB%s%n", label, bytes / MIB, note.isEmpty() ? "" : "  " + note);
     }
 
+    /**
+     * The reusable arguments of the load that just ran ({@code --vram-budget}, llama.cpp's
+     * {@code llama_params_fit} output): a GPU load's fitted context and placement ({@link
+     * GGUFModelGPU#fittedArguments}), or, on the CPU engine, a context fitted below the training one. A load
+     * that needed no fitting prints nothing.
+     */
+    private static void printFittedArguments(EngineModel model) {
+        String args = null;
+        if (model instanceof GGUFModelGPU) {
+            args = ((GGUFModelGPU) model).fittedArguments();
+        } else if (model instanceof GGUFModel) {
+            int train = model.spec().hparams().nCtxTrain();
+            int nCtx = ((GGUFModel) model).forwardBackend().memory().plan().nCtx();
+            if (train > 0 && nCtx < train) {
+                args = "-c " + nCtx;
+            }
+        }
+        if (args != null) {
+            System.out.println("Fitted arguments: " + args);
+        }
+    }
+
     private static void runBenchmark(EngineModel model, LLMDemoOptions opts) {
         if (!(model instanceof GGUFModelGPU)) {
             throw new UnsupportedOperationException("--benchmark and --bench-streaming profile the GPU engine;"
@@ -453,27 +603,43 @@ public final class LLMDemo {
 
     // ================================================================== generation
 
-    /** One way of generating: the engine loop, a speculative session, or a model's own generate. */
-    private interface Generator {
-        GenerationResult generate(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
-                                  String renderedPrompt) throws IOException;
-
-        /** The request {@link #generate} runs for {@code request}, with the model's sampling defaults applied. */
-        GenerationRequest effective(GenerationRequest request);
-
-        void reset();
-    }
-
-    private static void runGenerate(EngineModel model, LLMDemoOptions opts, EngineConfig cfg) throws IOException {
+    private static void runGenerate(EngineModel model, LLMDemoOptions opts, EngineConfig cfg,
+                                    java.nio.file.Path projector) throws IOException {
+        boolean chatTemplate = !opts.raw && model.supportClass() != SupportClass.ENC_DEC;
+        String prompt = opts.prompt != null ? opts.prompt
+                : opts.nonInteractive && !opts.completionInteractive() ? readStdin() : null;
+        if (projector != null) {
+            // the media turns run the batch engine over the projector's context (mtmd-cli's single prompt and
+            // chat loop); the text-only turn generator and the prompt cache play no part
+            try (LocalMedia media = LocalMedia.open(model, cfg, opts, projector)) {
+                media.printBanner(System.out);
+                System.out.println();
+                if (prompt != null) {
+                    runMediaPrompt(model, media, prompt, opts, chatTemplate);
+                } else {
+                    LocalMedia.run(media, opts, LLMDemo::logStats);
+                }
+            }
+            return;
+        }
+        PromptCache cache = PromptCache.open(model, opts);
         SpeculativeSession session = cfg.speculative() ? LLMModelFactory.speculate(model, cfg) : null;
+        LookaheadDecoder lookahead = cfg.lookaheadOptions().enabled() ? LookaheadDecoder.forModel(model, cfg) : null;
         try {
-            Generator generator;
-            if (session != null) {
+            TurnGenerator generator;
+            if (lookahead != null) {
+                System.out.println("Lookahead decoding: window " + lookahead.window() + ", n-gram "
+                        + lookahead.ngramSize() + ", max n-grams " + lookahead.maxNgrams() + " ("
+                        + lookahead.sequences() + " sequences)");
+                logStats("Lookahead: window " + lookahead.window() + ", n-gram " + lookahead.ngramSize()
+                        + ", max n-grams " + lookahead.maxNgrams());
+                generator = TurnGenerator.lookahead(model, lookahead);
+            } else if (session != null) {
                 SamplingDefaults defaults = SamplingDefaults.forModel(model, cfg);
                 System.out.println("Speculative decoding: " + session.drafterKind() + " drafter, draft max "
                         + session.draftMax() + ", min " + session.draftMin() + ", p_min " + cfg.draftPMin());
                 logStats("Speculative: " + session.drafterKind() + ", draft max " + session.draftMax());
-                generator = new Generator() {
+                generator = new TurnGenerator() {
                     @Override
                     public GenerationResult generate(int[] prompt, GenerationRequest request,
                                                      ReasoningFilter.Sink sink, String rendered) {
@@ -491,18 +657,23 @@ public final class LLMDemo {
                     }
                 };
             } else {
-                generator = loopGenerator(model, LLMModelFactory.effectiveConfig(model, cfg));
+                generator = TurnGenerator.loop(model, LLMModelFactory.effectiveConfig(model, cfg));
             }
-            boolean chatTemplate = !opts.raw && model.supportClass() != SupportClass.ENC_DEC;
-            String prompt = opts.prompt != null ? opts.prompt : opts.nonInteractive ? readStdin() : null;
-            if (prompt != null) {
+            if (cache != null) {
+                generator = cache.wrap(generator);
+            }
+            if (opts.completionInteractive()) {
+                CompletionRepl.run(model, generator, opts);
+            } else if (prompt != null) {
                 runSinglePrompt(model, generator, prompt, opts, chatTemplate);
             } else {
-                runConsoleChat(model, generator, opts.systemPrompt, opts.generation, opts.debugPrompt,
-                        opts.thinking, opts.showAllChannels);
+                LocalChat.run(model, generator, opts, LLMDemo::logStats);
             }
             if (session != null && session.lastStats() != null) {
                 printSpeculativeStats(session.lastStats());
+            }
+            if (lookahead != null && lookahead.lastStats() != null) {
+                printLookaheadStats(lookahead.lastStats());
             }
         } finally {
             if (session != null) {
@@ -511,47 +682,11 @@ public final class LLMDemo {
         }
     }
 
-    private static Generator loopGenerator(EngineModel model, EngineConfig effective) {
-        GenerationLoop loop = GenerationLoop.forModel(model, effective);
-        return new Generator() {
-            @Override
-            public GenerationResult generate(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
-                                             String rendered) {
-                return loop.generate(prompt, request, sink, rendered);
-            }
-
-            @Override
-            public GenerationRequest effective(GenerationRequest request) {
-                return request.withModelDefaults(loop.samplingDefaults());
-            }
-
-            @Override
-            public void reset() {
-                model.resetKVCache();
-            }
-        };
-    }
-
-    /** A model's own {@link LLMModel#generate(int[], GenerationRequest, com.eonmux.neuralfree.gguf.TokenCallback)}. */
-    private static Generator modelGenerator(LLMModel model) {
-        return new Generator() {
-            @Override
-            public GenerationResult generate(int[] prompt, GenerationRequest request, ReasoningFilter.Sink sink,
-                                             String rendered) throws IOException {
-                return model.generate(prompt, request,
-                        (id, text) -> sink.accept(ReasoningFilter.Channel.CONTENT, id, text));
-            }
-
-            @Override
-            public GenerationRequest effective(GenerationRequest request) {
-                return request;
-            }
-
-            @Override
-            public void reset() {
-                model.resetKVCache();
-            }
-        };
+    private static void printLookaheadStats(LookaheadDecoder.Stats s) {
+        String line = String.format(Locale.ROOT, "Lookahead: %d steps, %d emitted, %d accepted (%.2f per step)",
+                s.rounds(), s.emitted(), s.accepted(), s.acceptanceRate());
+        System.out.println("[" + line + "]");
+        logStats(line);
     }
 
     private static void printSpeculativeStats(SpeculativeDecoder.Stats s) {
@@ -579,205 +714,86 @@ public final class LLMDemo {
         return prompt;
     }
 
-    /**
-     * Prints routed output: content as is, and with {@code showAll} the reasoning and tool-call channels under a
-     * header at each channel change. Collects the content for the chat history.
-     */
-    private static final class ChannelPrinter implements ReasoningFilter.Sink {
-        private final boolean showAll;
-        private final boolean trace;
-        private final StringBuilder content = new StringBuilder();
-        private ReasoningFilter.Channel current = ReasoningFilter.Channel.CONTENT;
-        private int pieces;
-
-        ChannelPrinter(boolean showAll, boolean trace) {
-            this.showAll = showAll;
-            this.trace = trace;
-        }
-
-        @Override
-        public void accept(ReasoningFilter.Channel channel, int tokenId, String text) {
-            pieces++;
-            if (trace) {
-                System.err.println("[GEN] piece=" + pieces + " channel=" + channel + " id=" + tokenId + " text='"
-                        + text.replace("\n", "\\n") + "'");
-            }
-            if (channel == ReasoningFilter.Channel.CONTENT) {
-                content.append(text);
-            } else if (!showAll) {
-                return;
-            }
-            if (channel != current) {
-                System.out.print("\n[" + channel.name().toLowerCase(Locale.ROOT).replace('_', ' ') + "]\n");
-                current = channel;
-            }
-            System.out.print(text);
+    /** One prompt, one answer; with {@code -o} the turn is also written to the transcript. */
+    private static void runSinglePrompt(EngineModel model, TurnGenerator generator, String prompt,
+                                        LLMDemoOptions opts, boolean chatTemplate) throws IOException {
+        Transcript transcript = opts.outFile == null ? null : Transcript.open(opts.outFile);
+        try {
+            System.out.println("Prompt: " + prompt);
+            System.out.print("Generating: ");
             System.out.flush();
-        }
-
-        String content() {
-            return content.toString();
-        }
-    }
-
-    private static void runSinglePrompt(EngineModel model, Generator generator, String prompt, LLMDemoOptions opts,
-                                        boolean chatTemplate) throws IOException {
-        System.out.println("Prompt: " + prompt);
-        System.out.print("Generating: ");
-        System.out.flush();
-
-        GGUFTokenizer tokenizer = model.tokenizer();
-        String fullPrompt = chatTemplate ? tokenizer.formatChat(opts.systemPrompt, prompt, opts.thinking) : prompt;
-        int[] promptTokens = tokenizer.encode(fullPrompt);
-        if (opts.debugPrompt) {
-            printDebugPrompt(fullPrompt, promptTokens, tokenizer);
-        }
-        ChannelPrinter printer = new ChannelPrinter(opts.showAllChannels, opts.debugPrompt);
-        GenerationResult result = generator.generate(promptTokens, opts.generation, printer, fullPrompt);
-        System.out.println();
-        System.out.println();
-        String statLine = statLine(promptTokens.length, result);
-        System.out.println("[" + statLine + "]");
-        logStats(statLine);
-        logStats("  Prompt: " + prompt);
-        logStats("  Response: " + printer.content());
-        logStats("");
-    }
-
-    /** Prompt size, generated tokens, stop reason and the prefill / decode rates of one generation. */
-    private static String statLine(int promptTokens, GenerationResult result) {
-        GenerationResult.Timings t = result.timings();
-        double totalSec = t.totalNanos() / 1e9;
-        double totalSpeed = totalSec > 0 ? result.tokenCount() / totalSec : 0;
-        if (!t.split()) {
-            return String.format(Locale.ROOT, "Prompt: %d tokens | Generated: %d tokens (%s) | Total: %.2fs (%.2f tok/s)",
-                    promptTokens, result.tokenCount(), result.stopReason(), totalSec, totalSpeed);
-        }
-        double prefillSec = t.promptNanos() / 1e9;
-        double decodeSec = t.generationNanos() / 1e9;
-        return String.format(Locale.ROOT,
-                "Prompt: %d tokens (%d evaluated) | Generated: %d tokens (%s) | Prefill: %.2fs (%.2f tok/s)"
-                        + " | Decode: %.2fs (%.2f tok/s) | Total: %.2fs (%.2f tok/s)",
-                promptTokens, t.promptTokens(), result.tokenCount(), result.stopReason(), prefillSec,
-                rate(t.promptTokensPerSecond()), decodeSec, rate(t.generationTokensPerSecond()), totalSec, totalSpeed);
-    }
-
-    private static double rate(double r) {
-        return Double.isNaN(r) ? 0 : r;
-    }
-
-    private static void runConsoleChat(LLMModel model, Generator generator, String systemPrompt,
-                                       GenerationRequest request, boolean debugPrompt,
-                                       boolean enableThinking, boolean showAllChannels) throws IOException {
-        Scanner scanner = new Scanner(System.in, StandardCharsets.UTF_8.name());
-        GGUFTokenizer tokenizer = model.tokenizer();
-        List<Map<String, String>> conversationHistory = new ArrayList<>();
-        GenerationRequest shown = generator.effective(request);
-        SamplerConfig sampler = shown.sampler();
-
-        System.out.println("Chat ready. Type your message (or 'quit' to exit, 'clear' to reset):");
-        System.out.println(String.format(Locale.ROOT,
-                "Settings: temperature=%.2f, top_p=%.2f, top_k=%d, min_p=%.3f, typical_p=%.2f, max_tokens=%d,"
-                        + " repeat_penalty=%.2f, presence_penalty=%.2f, frequency_penalty=%.2f, repeat_last_n=%d,"
-                        + " seed=%d%s%s",
-                sampler.temperature(), sampler.topP(), sampler.topK(), sampler.minP(), sampler.typicalP(),
-                shown.maxNewTokens(), sampler.repeatPenalty(), sampler.presencePenalty(),
-                sampler.frequencyPenalty(), sampler.penaltyLastN(), sampler.seed(),
-                shown.ignoreEos() ? ", ignore_eos" : "",
-                shown.stopStrings().isEmpty() ? "" : ", stop=" + shown.stopStrings()));
-        System.out.println();
-
-        while (true) {
-            System.out.print("You: ");
-            System.out.flush();
-            if (!scanner.hasNextLine()) {
-                break;
-            }
-            String input = scanner.nextLine().trim();
-            if (input.equalsIgnoreCase("quit") || input.equalsIgnoreCase("exit")) {
-                System.out.println("Goodbye!");
-                break;
-            }
-            if (input.equalsIgnoreCase("clear") || input.equalsIgnoreCase("reset")) {
-                generator.reset();
-                conversationHistory.clear();
-                System.out.println("Conversation reset.\n");
-                continue;
-            }
-            if (input.isEmpty()) {
-                continue;
-            }
-
-            Map<String, String> sysMsg = message("system", systemPrompt);
-            Map<String, String> userMsg = message("user", input);
-            String fullPrompt = tokenizer.formatChat(conversation(sysMsg, conversationHistory, userMsg), enableThinking);
+            GGUFTokenizer tokenizer = model.tokenizer();
+            String fullPrompt = chatTemplate ? LocalChat.singleTurnPrompt(tokenizer, opts.systemPrompt, prompt,
+                    opts.thinking, opts.templateKwargs) : prompt;
             int[] promptTokens = tokenizer.encode(fullPrompt);
-            if (promptTokens.length >= model.kvCacheContext()) {
-                System.out.println("[Context full: " + promptTokens.length + " tokens >= "
-                        + model.kvCacheContext() + " KV cache capacity. Trimming oldest turns.]");
-                while (promptTokens.length >= model.kvCacheContext() && conversationHistory.size() >= 2) {
-                    conversationHistory.remove(0);
-                    conversationHistory.remove(0);
-                    fullPrompt = tokenizer.formatChat(conversation(sysMsg, conversationHistory, userMsg),
-                            enableThinking);
-                    promptTokens = tokenizer.encode(fullPrompt);
-                }
-                if (promptTokens.length >= model.kvCacheContext()) {
-                    System.out.println("[Still too long after trimming. Starting fresh turn.]");
-                    conversationHistory.clear();
-                    fullPrompt = tokenizer.formatChat(systemPrompt, input, enableThinking);
-                    promptTokens = tokenizer.encode(fullPrompt);
-                }
-            }
-            if (debugPrompt) {
+            if (opts.debugPrompt) {
                 printDebugPrompt(fullPrompt, promptTokens, tokenizer);
             }
-
-            System.out.print("Assistant: ");
-            System.out.flush();
-            ChannelPrinter printer = new ChannelPrinter(showAllChannels, debugPrompt);
+            ChannelPrinter printer = new ChannelPrinter(System.out, opts.showAllChannels, opts.debugPrompt);
+            GenerationRequest request = chatTemplate
+                    ? LocalChat.templated(opts.generation, opts.thinking, opts.templateKwargs) : opts.generation;
             GenerationResult result = generator.generate(promptTokens, request, printer, fullPrompt);
             System.out.println();
             System.out.println();
-
-            conversationHistory.add(message("user", input));
-            conversationHistory.add(message("assistant", printer.content()));
-
-            String statLine = statLine(promptTokens.length, result);
+            String statLine = LocalChat.statLine(promptTokens.length, result);
             System.out.println("[" + statLine + "]");
-            System.out.println();
             logStats(statLine);
-            String truncInput = input.length() > 50 ? input.substring(0, 50) + "..." : input;
-            String resp = printer.content();
-            String truncResp = resp.length() > 100 ? resp.substring(0, 100) + "..." : resp;
-            logStats("  Input: " + truncInput);
-            logStats("  Output: " + truncResp);
+            logStats("  Prompt: " + prompt);
+            logStats("  Response: " + printer.content());
             logStats("");
+            if (transcript != null) {
+                transcript.userTurn(prompt);
+                transcript.assistant(printer.content(), printer.reasoning());
+            }
+        } finally {
+            if (transcript != null) {
+                transcript.close();
+            }
         }
-    }
-
-    private static Map<String, String> message(String role, String content) {
-        Map<String, String> m = new LinkedHashMap<>();
-        m.put("role", role);
-        m.put("content", content);
-        return m;
     }
 
     /**
-     * The messages of one chat turn; an empty system prompt adds no system message, as llama.cpp's CLI adds one only
-     * for a non-empty {@code --system-prompt} (tools/cli/cli-context.cpp:279).
+     * One media prompt, one answer (mtmd-cli's single shot): the chat template renders the turn, the media
+     * backend splices the {@code --image}/{@code --audio}/{@code --video} files into the rendered markers, and
+     * the batch engine generates over the whole prompt.
      */
-    private static List<Map<String, String>> conversation(Map<String, String> system,
-                                                          List<Map<String, String>> history,
-                                                          Map<String, String> user) {
-        List<Map<String, String>> messages = new ArrayList<>(history.size() + 2);
-        String systemContent = system.get("content");
-        if (systemContent != null && !systemContent.isEmpty()) {
-            messages.add(system);
+    private static void runMediaPrompt(EngineModel model, LocalMedia media, String prompt, LLMDemoOptions opts,
+                                       boolean chatTemplate) throws IOException {
+        Transcript transcript = opts.outFile == null ? null : Transcript.open(opts.outFile);
+        try {
+            System.out.println("Prompt: " + prompt);
+            System.out.print("Generating: ");
+            System.out.flush();
+            GGUFTokenizer tokenizer = model.tokenizer();
+            String fullPrompt = chatTemplate ? LocalChat.singleTurnPrompt(tokenizer, opts.systemPrompt, prompt,
+                    opts.thinking, opts.templateKwargs) : prompt;
+            if (opts.debugPrompt) {
+                System.out.println("--- rendered prompt ---");
+                System.out.println(fullPrompt);
+                System.out.println("--- end ---");
+                System.out.println();
+            }
+            ChannelPrinter printer = new ChannelPrinter(System.out, opts.showAllChannels, opts.debugPrompt);
+            GenerationRequest request = chatTemplate
+                    ? LocalChat.templated(opts.generation, opts.thinking, opts.templateKwargs) : opts.generation;
+            GenerationResult result = media.turn(fullPrompt, request, printer);
+            System.out.println();
+            System.out.println();
+            String statLine = LocalChat.statLine(result.timings().promptTokens(), result);
+            System.out.println("[" + statLine + "]");
+            logStats(statLine);
+            logStats("  Prompt: " + prompt);
+            logStats("  Response: " + printer.content());
+            logStats("");
+            if (transcript != null) {
+                transcript.userTurn(prompt);
+                transcript.assistant(printer.content(), printer.reasoning());
+            }
+        } finally {
+            if (transcript != null) {
+                transcript.close();
+            }
         }
-        messages.addAll(history);
-        messages.add(user);
-        return messages;
     }
 
     // ================================================================== embeddings, classifiers, reranking
@@ -920,7 +936,8 @@ public final class LLMDemo {
                     + " input)");
         }
         GGUFTokenizer tokenizer = model.tokenizer();
-        String fullPrompt = opts.raw ? prompt : tokenizer.formatChat(opts.systemPrompt, prompt, opts.thinking);
+        String fullPrompt = opts.raw ? prompt
+                : LocalChat.singleTurnPrompt(tokenizer, opts.systemPrompt, prompt, opts.thinking, opts.templateKwargs);
         int[] tokens = tokenizer.encode(fullPrompt);
         if (opts.debugPrompt) {
             printDebugPrompt(fullPrompt, tokens, tokenizer);
@@ -948,20 +965,36 @@ public final class LLMDemo {
     }
 
     /**
-     * Audio models: WavTokenizer decodes codes to spectral features (waveform synthesis by iSTFT is not part of the
-     * engine), pockettts returns its backbone hidden states, and token-generating speech models (qwen3tts) generate
-     * codec tokens from the raw prompt.
+     * Audio models: WavTokenizer decodes codes to spectral features, which a {@code --audio-out} file ending in
+     * {@code .wav} turns into the synthesized waveform (the model's declared speech geometry, the
+     * {@code --audio-fft/--audio-hop/--audio-rate} overrides filling what the model does not declare); any other
+     * {@code --audio-out} name keeps the float32 feature rows. Pockettts returns its backbone hidden states, or,
+     * with {@code --mmproj}, speaks the prompt through the flow network and mimi decoder of its generator file.
+     * An lfm3a backbone speaks the prompt through the MaskGIT depthformer and liquid-codec decoder of its
+     * generator file. Token-generating speech models (qwen3tts) generate codec tokens from the raw prompt.
      */
     private static void runAudio(EngineModel model, LLMDemoOptions opts, EngineConfig cfg) throws IOException {
         Arch arch = model.spec().arch();
         if (arch == Arch.WAVTOKENIZER_DEC) {
             int[] codes = opts.audioCodes != null ? opts.audioCodes.clone() : parseCodes(opts.prompt);
             long t0 = System.nanoTime();
+            boolean wave = opts.audioOut != null && opts.audioOut.toLowerCase(Locale.ROOT).endsWith(".wav");
+            if (wave) {
+                AudioClip clip = synthesize(model, opts, codes);
+                long dt = (System.nanoTime() - t0) / 1_000_000L;
+                System.out.println("Codes: " + codes.length);
+                System.out.println("Waveform: " + clip.length() + " samples @ " + clip.sampleRate() + " Hz  time="
+                        + dt + "ms");
+                WavWriter.write(Path.of(opts.audioOut), clip.samples(), clip.sampleRate());
+                System.out.println("Wrote " + opts.audioOut + " (16-bit PCM mono WAV)");
+                logStats("wavtokenizer: " + codes.length + " codes -> " + clip.length() + " samples, " + dt + "ms");
+                return;
+            }
             float[][] features = model.decodeAudioCodes(codes);
             long dt = (System.nanoTime() - t0) / 1_000_000L;
             System.out.println("Codes: " + codes.length);
             System.out.println("Features: " + features.length + " frames x " + (features.length > 0 ? features[0].length : 0)
-                    + "  time=" + dt + "ms (spectral features; no iSTFT waveform synthesis)");
+                    + "  time=" + dt + "ms (spectral frames; name --audio-out *.wav for the waveform)");
             if (features.length > 0) {
                 System.out.println("  frame 0 = " + preview(features[0], opts.embedPreview));
             }
@@ -969,7 +1002,19 @@ public final class LLMDemo {
             writeRows(opts.audioOut, features);
             return;
         }
+        if (arch == Arch.QWEN3TTS) {
+            runQwen3Tts(model, opts, cfg);
+            return;
+        }
+        if (arch == Arch.LFM3) {
+            runLfm3a(model, opts, cfg);
+            return;
+        }
         if (arch == Arch.POCKETTTS) {
+            if (opts.mmproj != null) {
+                runPocketTts(model, opts, cfg);
+                return;
+            }
             String text = promptOrSample(opts, "pockettts");
             int[] tokens = model.tokenizer().encode(text);
             try (PocketTtsSession session = PocketTtsSession.open(model)) {
@@ -1002,9 +1047,142 @@ public final class LLMDemo {
         }
         System.out.println("Generated " + ids.length + " codec tokens (" + result.stopReason() + "): [" + sb
                 + (ids.length > 32 ? ", ..." : "") + "]");
-        String line = statLine(tokens.length, result);
+        String line = LocalChat.statLine(tokens.length, result);
         System.out.println("[" + line + "]");
         logStats(line);
+    }
+
+    /**
+     * The reference waveform of {@code --audio-speaker}, decoded through the shared audio decoder; null without the
+     * flag.
+     */
+    private static AudioClip readSpeakerReference(LLMDemoOptions opts) throws IOException {
+        if (opts.audioSpeaker == null) {
+            return null;
+        }
+        return AudioDecoder.decode(Files.readAllBytes(Path.of(opts.audioSpeaker)), opts.audioSpeaker);
+    }
+
+    /**
+     * qwen3tts: speaks the prompt through the generator file's code predictor and code2wav decoder, the pipeline
+     * of llama.cpp's mtmd helper ({@code --mode audio} on a qwen3tts backbone). The {@code --audio-out} file
+     * receives the waveform as 16-bit PCM mono WAV; the command's sampler settings (seed, top-k, top-p) drive the
+     * codec sampling.
+     */
+    private static void runQwen3Tts(EngineModel model, LLMDemoOptions opts, EngineConfig cfg) throws IOException {
+        String text = opts.prompt != null ? opts.prompt : opts.nonInteractive ? readStdin() : null;
+        if (text == null || text.trim().isEmpty()) {
+            throw new IllegalArgumentException("--mode audio on " + model.architecture()
+                    + " needs --prompt with the text to speak");
+        }
+        if (opts.mmproj == null) {
+            throw new IllegalArgumentException("qwen3tts text-to-speech needs --mmproj <generator.gguf>: the code"
+                    + " predictor and code2wav decoder that turn the backbone's codes into audio");
+        }
+        SamplerConfig sampler = opts.generation.sampler();
+        SpeechOptions speech = SpeechOptions.defaults()
+                .withLanguage(opts.audioLang)
+                .withVoice(opts.voice)
+                .withSpeakerReference(readSpeakerReference(opts))
+                .withSeed(sampler.seed())
+                .withTopK(sampler.topK() > 0 ? sampler.topK() : SpeechOptions.DEFAULT_TOP_K)
+                .withTopP(sampler.topP());
+        long t0 = System.nanoTime();
+        AudioClip clip;
+        try (Qwen3TtsClip generatorFile = Qwen3TtsClip.open(opts.mmproj, cfg.sourceOptions());
+             Qwen3TtsSpeechGenerator generator = Qwen3TtsSpeechGenerator.open(model, generatorFile)) {
+            clip = generator.synthesize(text, speech);
+        }
+        long dt = (System.nanoTime() - t0) / 1_000_000L;
+        System.out.println("Text: " + text.length() + " chars");
+        System.out.println("Waveform: " + clip.length() + " samples @ " + clip.sampleRate() + " Hz  time=" + dt
+                + "ms");
+        if (opts.audioOut != null) {
+            WavWriter.write(Path.of(opts.audioOut), clip.samples(), clip.sampleRate());
+            System.out.println("Wrote " + opts.audioOut + " (16-bit PCM mono WAV)");
+        } else {
+            System.out.println("Name --audio-out <file>.wav to write the waveform");
+        }
+        logStats("qwen3tts: " + text.length() + " chars -> " + clip.length() + " samples, " + dt + "ms");
+    }
+
+    /**
+     * pockettts: speaks the prompt through the generator file's flow network and mimi decoder, the pipeline of
+     * llama.cpp's mtmd helper ({@code --mode audio} with {@code --mmproj} on a pockettts backbone). The
+     * {@code --audio-out} file receives the waveform as 16-bit PCM mono WAV; the seed drives the flow noise and
+     * the local pack's temperature, while top-k/top-p do not apply because the decoder is continuous.
+     */
+    private static void runPocketTts(EngineModel model, LLMDemoOptions opts, EngineConfig cfg) throws IOException {
+        String text = opts.prompt != null ? opts.prompt : opts.nonInteractive ? readStdin() : null;
+        if (text == null || text.trim().isEmpty()) {
+            throw new IllegalArgumentException("--mode audio on " + model.architecture()
+                    + " needs --prompt with the text to speak");
+        }
+        SamplerConfig sampler = opts.generation.sampler();
+        SpeechOptions speech = SpeechOptions.defaults()
+                .withLanguage(opts.audioLang)
+                .withVoice(opts.voice)
+                .withSpeakerReference(readSpeakerReference(opts))
+                .withSeed(sampler.seed())
+                .withTopK(sampler.topK() > 0 ? sampler.topK() : SpeechOptions.DEFAULT_TOP_K)
+                .withTopP(sampler.topP());
+        long t0 = System.nanoTime();
+        AudioClip clip;
+        try (PocketTtsClip generatorFile = PocketTtsClip.open(opts.mmproj, cfg.sourceOptions());
+             PocketTtsSpeechGenerator generator = PocketTtsSpeechGenerator.open(model, generatorFile)) {
+            clip = generator.synthesize(text, speech);
+        }
+        long dt = (System.nanoTime() - t0) / 1_000_000L;
+        System.out.println("Text: " + text.length() + " chars");
+        System.out.println("Waveform: " + clip.length() + " samples @ " + clip.sampleRate() + " Hz  time=" + dt
+                + "ms");
+        if (opts.audioOut != null) {
+            WavWriter.write(Path.of(opts.audioOut), clip.samples(), clip.sampleRate());
+            System.out.println("Wrote " + opts.audioOut + " (16-bit PCM mono WAV)");
+        } else {
+            System.out.println("Name --audio-out <file>.wav to write the waveform");
+        }
+        logStats("pockettts: " + text.length() + " chars -> " + clip.length() + " samples, " + dt + "ms");
+    }
+
+    /**
+     * lfm3a: speaks the prompt through the generator file's MaskGIT depthformer and liquid-codec decoder, the
+     * pipeline of llama.cpp's mtmd helper ({@code --mode audio} on an lfm3a backbone). The {@code --audio-out}
+     * file receives the waveform as 16-bit PCM mono WAV. The sampling uses the generator file's model defaults;
+     * the command's seed drives the draws and --audio-lang/--voice fill the tts template.
+     */
+    private static void runLfm3a(EngineModel model, LLMDemoOptions opts, EngineConfig cfg) throws IOException {
+        String text = opts.prompt != null ? opts.prompt : opts.nonInteractive ? readStdin() : null;
+        if (text == null || text.trim().isEmpty()) {
+            throw new IllegalArgumentException("--mode audio on " + model.architecture()
+                    + " needs --prompt with the text to speak");
+        }
+        if (opts.mmproj == null) {
+            throw new IllegalArgumentException("lfm3a text-to-speech needs --mmproj <generator.gguf>: the MaskGIT"
+                    + " depthformer and liquid-codec decoder that turn the backbone's hidden states into audio");
+        }
+        SpeechOptions speech = SpeechOptions.defaults()
+                .withLanguage(opts.audioLang)
+                .withVoice(opts.voice)
+                .withSpeakerReference(readSpeakerReference(opts))
+                .withSeed(opts.generation.sampler().seed());
+        long t0 = System.nanoTime();
+        AudioClip clip;
+        try (Lfm3aGenClip generatorFile = Lfm3aGenClip.open(opts.mmproj, cfg.sourceOptions());
+             Lfm3aSpeechGenerator generator = Lfm3aSpeechGenerator.open(model, generatorFile)) {
+            clip = generator.synthesize(text, speech);
+        }
+        long dt = (System.nanoTime() - t0) / 1_000_000L;
+        System.out.println("Text: " + text.length() + " chars");
+        System.out.println("Waveform: " + clip.length() + " samples @ " + clip.sampleRate() + " Hz  time=" + dt
+                + "ms");
+        if (opts.audioOut != null) {
+            WavWriter.write(Path.of(opts.audioOut), clip.samples(), clip.sampleRate());
+            System.out.println("Wrote " + opts.audioOut + " (16-bit PCM mono WAV)");
+        } else {
+            System.out.println("Name --audio-out <file>.wav to write the waveform");
+        }
+        logStats("lfm3a: " + text.length() + " chars -> " + clip.length() + " samples, " + dt + "ms");
     }
 
     private static int[] parseCodes(String text) {
@@ -1022,6 +1200,30 @@ public final class LLMDemo {
             }
         }
         return codes;
+    }
+
+    /**
+     * The waveform of {@code codes}: the model's declared speech geometry
+     * ({@link EngineModel#speechFormat()}, the GGUF keys {@code audio.sample_rate}, {@code audio.n_fft} and
+     * {@code audio.hop_length}) with the {@code --audio-fft/--audio-hop/--audio-rate} flags filling what the
+     * model does not declare; a missing piece refuses naming both sources.
+     */
+    private static AudioClip synthesize(EngineModel model, LLMDemoOptions opts, int[] codes) throws IOException {
+        SpeechFormat declared = model.speechFormat();
+        if (declared == null && (opts.audioFft == 0 || opts.audioHop == 0 || opts.audioRate == 0)) {
+            throw new IllegalArgumentException("the model declares no speech decoding geometry: give the GGUF keys"
+                    + " audio.sample_rate, audio.n_fft and audio.hop_length (all three), or the flags"
+                    + " --audio-rate, --audio-fft and --audio-hop");
+        }
+        if (declared == null) {
+            return new SpeechFormat(opts.audioRate, opts.audioFft, opts.audioHop).decode(model.decodeAudioCodes(codes));
+        }
+        int rate = opts.audioRate > 0 ? opts.audioRate : declared.sampleRate();
+        int fft = opts.audioFft > 0 ? opts.audioFft : declared.nFft();
+        int hop = opts.audioHop > 0 ? opts.audioHop : declared.hopLength();
+        SpeechFormat format = rate == declared.sampleRate() && fft == declared.nFft() && hop == declared.hopLength()
+                ? declared : new SpeechFormat(rate, fft, hop);
+        return format.decode(model.decodeAudioCodes(codes));
     }
 
     /** Writes {@code rows} row-major as little-endian float32 to {@code path}; nothing when the path is null. */
@@ -1059,26 +1261,7 @@ public final class LLMDemo {
     }
 
     private static void printDebugPrompt(String fullPrompt, int[] tokens, GGUFTokenizer tokenizer) {
-        System.out.println();
-        System.out.println("=== DEBUG: Formatted Prompt ===");
-        System.out.println(fullPrompt);
-        System.out.println("=== END Formatted Prompt ===");
-        System.out.println("Prompt length: " + fullPrompt.length() + " chars, " + tokens.length + " tokens");
-        int show = Math.min(40, tokens.length);
-        System.out.println("First " + show + " tokens:");
-        for (int i = 0; i < show; i++) {
-            System.out.println("  [" + i + "] id=" + tokens[i] + " raw='" + tokenizer.getToken(tokens[i]) + "'");
-        }
-        if (tokens.length > 40) {
-            System.out.println("  ...");
-        }
-        int lastStart = Math.max(show, tokens.length - 20);
-        if (lastStart > show) {
-            System.out.println("Last " + (tokens.length - lastStart) + " tokens:");
-            for (int i = lastStart; i < tokens.length; i++) {
-                System.out.println("  [" + i + "] id=" + tokens[i] + " raw='" + tokenizer.getToken(tokens[i]) + "'");
-            }
-        }
+        PromptDebug.print(System.out, fullPrompt, tokens, tokenizer);
         int startId = tokenizer.getTokenId("<|start|>");
         int messageId = tokenizer.getTokenId("<|message|>");
         int endId = tokenizer.getTokenId("<|end|>");
@@ -1133,13 +1316,13 @@ public final class LLMDemo {
         } catch (UsageException e) {
             throw new IllegalArgumentException(e.getMessage(), e);
         }
-        Generator generator;
+        TurnGenerator generator;
         if (model instanceof EngineModel) {
             EngineModel em = (EngineModel) model;
-            generator = loopGenerator(em, LLMModelFactory.effectiveConfig(em, opts.engine));
+            generator = TurnGenerator.loop(em, LLMModelFactory.effectiveConfig(em, opts.engine));
         } else {
-            generator = modelGenerator(model);
+            generator = TurnGenerator.ofModel(model);
         }
-        runConsoleChat(model, generator, opts.systemPrompt, opts.generation, false, false, true);
+        LocalChat.run(model, generator, opts, LLMDemo::logStats);
     }
 }

@@ -6,8 +6,8 @@ import java.util.Map;
 
 /**
  * Model architectures, one constant per llama.cpp {@code LLM_ARCH_NAMES} entry in the same order
- * (llama.cpp src/llama-arch.cpp:8-172), each carrying the string stored in
- * {@code general.architecture}.
+ * (llama.cpp src/llama-arch.cpp:8-172), followed by the vLLM-only architectures that have no llama.cpp
+ * conversion, each carrying the string stored in {@code general.architecture}.
  *
  * <p>The per-architecture behaviour lives in {@link ArchRegistry}; this enum holds only the name and
  * the intrinsic llama.cpp classifications ({@code llm_arch_is_recurrent}, {@code llm_arch_is_hybrid},
@@ -53,6 +53,7 @@ public enum Arch {
     CLEF("clef"),
     VLLM_DECISION2("vllm-decision2"),
     QWEN4EXP("qwen4exp"),
+    INTERN_S1_PRO("interns1-pro"),
     PHI2("phi2"),
     PHI3("phi3"),
     PHIMOE("phimoe"),
@@ -75,6 +76,7 @@ public enum Arch {
     STARCODER2("starcoder2"),
     MAMBA("mamba"),
     MAMBA2("mamba2"),
+    ZAMBA2("zamba2"),
     MAPLE("maple"),
     JAMBA("jamba"),
     FALCON_H1("falcon-h1"),
@@ -85,6 +87,7 @@ public enum Arch {
     DBRX("dbrx"),
     OLMO("olmo"),
     OLMO2("olmo2"),
+    OLMO_HYBRID("olmo-hybrid"),
     OLMOE("olmoe"),
     MUSE_GLIMMER("muse-glimmer"),
     MUSE_SPARK("muse-spark"),
@@ -95,6 +98,7 @@ public enum Arch {
     DEEPSEEK2OCR("deepseek2-ocr"),
     DEEPSEEK32("deepseek32"),
     DEEPSEEK4("deepseek4"),
+    DEEPSEEK41("deepseek41"),
     CHATGLM("chatglm"),
     GLM4("glm4"),
     GLM4_MOE("glm4moe"),
@@ -141,6 +145,7 @@ public enum Arch {
     OPENAI_MOE("gpt-oss"),
     LFM2("lfm2"),
     LFM2MOE("lfm2moe"),
+    LFM3("lfm3"),
     DREAM("dream"),
     SMALLTHINKER("smallthinker"),
     LLADA("llada"),
@@ -150,25 +155,36 @@ public enum Arch {
     APERTUS("apertus"),
     MINIMAX_01("minimax-01"),
     HRM_TEXT("hrm_text"),
+    LIMITE("limite"),
     MINIMAX_M2("minimax-m2"),
     MINIMAX_M3("minimax-m3"),
     COGVLM("cogvlm"),
     RND1("rnd1"),
     PANGU_EMBED("pangu-embedded"),
+    PANGU_MOE("pangu-moe"),
     MISTRAL3("mistral3"),
     EAGLE("eagle"),
     EAGLE3("eagle3"),
+    EAGLE_MISTRAL_LARGE3("eagle-mistral-large3"),
+    EAGLE_LLAMA4("eagle-llama4"),
+    EAGLE_MINICPM("eagle-minicpm"),
+    EAGLE_COHERE("eagle-cohere"),
     DFLASH("dflash"),
     MISTRAL4("mistral4"),
+    MISTRAL_LARGE4("mistral-large4"),
     PADDLEOCR("paddleocr"),
     MIMO2("mimo2"),
+    STEP1("step1"),
+    STEP3_TEXT("step3text"),
     STEP35("step35"),
+    STEP5("step5"),
     SPARK2_5("spark2_5"),
     LLAMA_EMBED("llama-embed"),
     MAINCODER("maincoder"),
     MAION_CODER("maion-coder"),
     KIMI_LINEAR("kimi-linear"),
     KIMI_K3("kimi-k3"),
+    ALICE_AI("alice-ai"),
     GLM5_NEXT("glm5-next"),
     TALKIE("talkie"),
     MELLUM("mellum"),
@@ -178,6 +194,18 @@ public enum Arch {
     K2_HORIZON("k2-horizon"),
     BEAM("beam"),
     KOLIBRI1("kolibri1"),
+    HYPERCLOVAX("hyperclovax"),
+    DOMYN_EDGE("domyn-edge"),
+    RNJ1("rnj1"),
+    AXK1("axk1"),
+    /** vLLM's {@code InklingForCausalLM}: relative-position attention over short-convolution K/V streams. */
+    INKLING("inkling"),
+    DORY("dory"),
+    IQUEST_LOOPCODER("iquest-loopcoder"),
+    OPT("opt"),
+    LONGCAT_FLASH("longcat-flash"),
+    LONGCAT_FLASH_NGRAM("longcat-flash-ngram"),
+    BAILINGMOE_V25("bailingmoe-v25"),
     UNKNOWN("(unknown)");
 
     private static final Map<String, Arch> BY_GGUF_NAME;
@@ -219,6 +247,7 @@ public enum Arch {
         switch (this) {
             case MAMBA:
             case MAMBA2:
+            case ZAMBA2:
             case RWKV6:
             case RWKV6QWEN2:
             case RWKV7:
@@ -241,15 +270,21 @@ public enum Arch {
             case NEMOTRON_H:
             case NEMOTRON_H_MOE:
             case QWEN3NEXT:
+            case OLMO_HYBRID:
             case KIMI_LINEAR:
             case BAILINGMOE3:
             case KIMI_K3:
+            case ALICE_AI:
             case GLM5_NEXT:
             case QWEN35:
             case QWEN35MOE:
             case QWEN4EXP:
             case DEEPSEEK4:
+            case DEEPSEEK41:
+            case LFM3:
             case MINIMAX_01:
+            case ZAMBA2:
+            case BAILINGMOE_V25:
                 return true;
             default:
                 return false;

@@ -10,7 +10,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The contiguous-reuse frontier {@code SequenceState.reusable} before PC-9 turns reuse on (PARITY §5.5.1 E-2): it
+ * The contiguous-reuse frontier {@code SequenceState.reusable} behind the engine's prefix reuse: it
  * is the length of the stored prefix whose rows were computed with exactly that prefix, so it rises only by
  * contiguous appends, falls on every rewrite ({@link SequenceState#truncate}, {@link SequenceState#capReusable},
  * the context shift), resets on {@link SequenceState#clear}, and {@link SequenceState#commonPrefix} never reports
@@ -35,7 +35,8 @@ public class SequenceStateReuseTest {
         s.append(new int[] {3, 4}, 0, 2);
         assertEquals(5, s.nPast());
         assertEquals(5, s.reusable());
-        assertEquals(2, s.commonPrefix(new int[] {0, 1, 2, 3, 4, 9}));
+        assertEquals(5, s.commonPrefix(new int[] {0, 1, 2, 3, 4, 9}));
+        assertEquals(2, s.commonPrefix(new int[] {0, 1, 9, 3, 4}));
         assertEquals(0, s.commonPrefix(new int[] {9, 9}));
     }
 

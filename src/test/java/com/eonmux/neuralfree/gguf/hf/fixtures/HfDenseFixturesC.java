@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-D2 part C converter classes: {@code HunYuanModel}, {@code
+ * Synthetic checkpoints of the converter classes: {@code HunYuanModel}, {@code
  * HunyuanVLTextModel}, {@code Mistral3Model} (the Ministral 3 text branch) and {@code VoxtralRealtimeModel}. Two layers,
  * a hidden size of 8, two query heads, one key/value head, an FFN of {@code 2 * dim} and the exact tensor names and
  * configuration keys of the converter sources.

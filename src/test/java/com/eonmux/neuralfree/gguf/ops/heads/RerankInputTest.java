@@ -119,4 +119,27 @@ public class RerankInputTest {
         assertThrows(UnsupportedOperationException.class,
                 () -> ClassifierHead.rerankInput(tok, new int[]{3}, new int[]{4}));
     }
+
+    @Test
+    public void instructionFillsItsPlaceholderFirst() {
+        GGUFTokenizer tok = tokenizer("i:{instruction}|q:{query}|d:{document}", false);
+        int[] input = ClassifierHead.rerankInput(tok, "ab", "cd", "find X");
+        assertArrayEquals(tok.encode("i:find X|q:ab|d:cd", false), input);
+    }
+
+    @Test
+    public void withoutAnInstructionThePlaceholderStaysAsWritten() {
+        GGUFTokenizer tok = tokenizer("i:{instruction}|q:{query}", false);
+        int[] input = ClassifierHead.rerankInput(tok, "ab", "cd", null);
+        assertArrayEquals(tok.encode("i:{instruction}|q:ab", false), input);
+        assertArrayEquals(ClassifierHead.rerankInput(tok, "ab", "cd"),
+                ClassifierHead.rerankInput(tok, "ab", "cd", null));
+    }
+
+    @Test
+    public void instructionIsReplacedBeforeTheSideTexts() {
+        GGUFTokenizer tok = tokenizer("i:{instruction}|q:{query}", false);
+        int[] input = ClassifierHead.rerankInput(tok, "{instruction}", "cd", "find X");
+        assertArrayEquals(tok.encode("i:find X|q:{instruction}", false), input);
+    }
 }

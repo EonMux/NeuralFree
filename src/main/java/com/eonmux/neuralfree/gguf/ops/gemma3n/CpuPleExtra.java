@@ -34,6 +34,12 @@ public final class CpuPleExtra implements CpuLayerExtra {
     private float[] inputs;
     private LayerGate gate;
 
+    /** The gate and the per-layer inputs are per-row, exact over any step layout. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
     @Override
     public void bind(CpuForwardContext ctx, LayerSpec layer) {
         Objects.requireNonNull(ctx, "ctx");
@@ -132,7 +138,8 @@ public final class CpuPleExtra implements CpuLayerExtra {
 
     /**
      * CPU twin of {@link GpuPleExtra.PerLayerInputs}: the per-layer inputs of a step into
-     * {@link GpuPleExtra#TEMP_INPUTS} ({@code [t][layer][width]}), token rows from {@link CpuScratch#TOKEN_IDS}.
+     * {@link GpuPleExtra#TEMP_INPUTS} ({@code [t][layer][width]}), token rows from {@link CpuScratch#TOKEN_IDS}; an
+     * embedding row, whose id there is the null token, reads the padding row ({@link PleLayout#tableRow}).
      */
     static final class PerLayerInputs {
         private final PleLayout layout;
@@ -191,7 +198,7 @@ public final class CpuPleExtra implements CpuLayerExtra {
             }
             int[] ids = scratch.ints(CpuScratch.TOKEN_IDS);
             for (int t = 0; t < n; t++) {
-                weights.embedRow(table, ids[t], tokens, t * stride);
+                weights.embedRow(table, PleLayout.tableRow(ids[t]), tokens, t * stride);
             }
             CpuOps.scale(tokens, 0, total, layout.tokenScale());
             CpuOps.add(inputs, 0, tokens, 0, inputs, 0, total);

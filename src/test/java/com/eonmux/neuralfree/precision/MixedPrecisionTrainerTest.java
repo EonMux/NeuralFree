@@ -696,7 +696,9 @@ public class MixedPrecisionTrainerTest {
 
         @After
         public void tearDown() {
-            session.close();
+            if (session != null) {
+                session.close();
+            }
         }
 
         @Test

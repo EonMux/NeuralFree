@@ -2,7 +2,11 @@ package com.eonmux.neuralfree.gguf.spec.req;
 
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement;
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement.LayerCondition;
+import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
+import com.eonmux.neuralfree.gguf.spec.TensorNames;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import static com.eonmux.neuralfree.gguf.arch.TensorRequirement.NEXTN;
@@ -88,6 +92,19 @@ public final class MoeTensorRequirements {
                 .build();
     }
 
+    /**
+     * The InternS1-Pro text backbone: the Qwen3-VL MoE tensors plus the model-level Fourier coefficient matrices its
+     * rotation reads ({@code rope_cos_coef}/{@code rope_sin_coef}, required exactly when hparams select FoPE).
+     */
+    public static List<TensorRequirement> internS1Pro() {
+        List<TensorRequirement> out = new ArrayList<>(qwen3vlmoe());
+        out.add(TensorRequirement.modelWhen(ModelHparams::ropeFope,
+                TensorNames.weight(TensorNames.ROPE_COS_COEF)));
+        out.add(TensorRequirement.modelWhen(ModelHparams::ropeFope,
+                TensorNames.weight(TensorNames.ROPE_SIN_COEF)));
+        return Collections.unmodifiableList(out);
+    }
+
     /** models/phimoe.cpp:12-45: biased norms and output head, LongRoPE factors. */
     public static List<TensorRequirement> phimoe() {
         return builder().embdAndOutputNorm().model("output_norm.bias", "output.weight", "output.bias")
@@ -170,6 +187,38 @@ public final class MoeTensorRequirements {
                 .layer("ffn_norm.weight")
                 .denseFfn(DENSE_LEAD)
                 .experts(AFTER_LEAD).probsBiasOptional(AFTER_LEAD).sharedExperts(AFTER_LEAD)
+                .build();
+    }
+
+    /**
+     * vLLM's openPangu MoE trunk without MLA: the pangu-embedded attention with optional projection biases, or its
+     * static sink attention ({@code attn_sink_k}/{@code attn_sink_v}) with the K norm it normalizes keys by; a dense
+     * lead layer and then routed plus shared experts with an optional router bias.
+     */
+    public static List<TensorRequirement> panguMoe() {
+        return builder().embdAndOutputNorm().outputOrTied()
+                .layer("attn_norm.weight").qkv().layer("attn_output.weight").layerOptional("attn_output.bias")
+                .layerOptional("attn_k_norm.weight", "attn_sink_k.weight", "attn_sink_v.weight")
+                .layer("ffn_norm.weight").layerOptional("post_attention_norm.weight", "post_ffw_norm.weight")
+                .denseFfn(DENSE_LEAD)
+                .experts(AFTER_LEAD).probsBiasOptional(AFTER_LEAD).sharedExperts(AFTER_LEAD)
+                .build();
+    }
+
+    /**
+     * vLLM's Step3 text trunk (step3_text.py): the low-rank query projections ({@code attn_q_a},
+     * {@code attn_q_a_norm}, {@code attn_q_b}) over plain K and V, a dense FFN where no router exists, and routed
+     * plus one shared expert where {@code ffn_gate_inp} is present.
+     */
+    public static List<TensorRequirement> step3Text() {
+        return builder().embdAndOutputNorm().outputRequired()
+                .layer("attn_norm.weight", "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                        "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_norm.weight")
+                .denseFfnOptional(TRUNK)
+                .layerOptional("ffn_gate_inp.weight")
+                .withTrigger("ffn_gate_inp.weight", TRUNK,
+                        "ffn_gate_exps.weight", "ffn_down_exps.weight", "ffn_up_exps.weight",
+                        "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")
                 .build();
     }
 

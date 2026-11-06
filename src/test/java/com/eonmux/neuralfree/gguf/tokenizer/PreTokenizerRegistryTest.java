@@ -28,7 +28,7 @@ public class PreTokenizerRegistryTest {
     @Test
     public void allLlamaCppPreTypesAreDeclaredInOrder() {
         PreTokenizerType[] types = PreTokenizerType.values();
-        assertEquals(63, types.length);
+        assertEquals(67, types.length);
         for (int i = 0; i < types.length; i++) assertEquals(i, types[i].code());
         assertEquals(PreTokenizerPatterns.DEFAULT, PreTokenizerType.LLAMA4.regexes());
         assertFalse(PreTokenizerType.GEMMA4.byteEncode());
@@ -38,7 +38,7 @@ public class PreTokenizerRegistryTest {
 
     @Test
     public void everyNameCompilesAndSplits() {
-        assertEquals(94, PreTokenizerRegistry.names().size());
+        assertEquals(98, PreTokenizerRegistry.names().size());
         String sample = "The QUICK brown fox's 1234567 你好 été!\n\n  done\r\n";
         for (String name : PreTokenizerRegistry.names()) {
             List<String> words = PreTokenizerRegistry.forName(name).split(sample);
@@ -91,10 +91,66 @@ public class PreTokenizerRegistryTest {
         assertEquals(Boolean.FALSE, PreTokenizerRegistry.forName("whitespace").normalizerLowercase());
         assertSame(PreTokenizerType.GPT2, PreTokenizerRegistry.forName("exaone4").type());
         assertSame(PreTokenizerType.GPT4O, PreTokenizerRegistry.forName("llama4").type());
-        assertSame(PreTokenizerType.LLAMA3, PreTokenizerRegistry.forName("pixtral").type());
+        assertSame(PreTokenizerType.TEKKEN, PreTokenizerRegistry.forName("pixtral").type());
         assertTrue(PreTokenizerRegistry.forName("megrez").cleanSpaces());
         assertFalse(PreTokenizerRegistry.forName("qwen2").cleanSpaces());
         assertNull(PreTokenizerRegistry.forName("qwen2").addBos());
+    }
+
+    /** The names and flags llama.cpp added after a37cc4610 (src/llama-vocab.cpp:2458-2800). */
+    @Test
+    public void namesAddedSinceTheLastSyncFollowTheNameTable() {
+        PreTokenizerRegistry.PreTokenizer pixtral = PreTokenizerRegistry.forName("pixtral");
+        assertFalse(pixtral.cleanSpaces());
+        assertTrue(pixtral.ignoreMerges());
+        assertEquals(Boolean.TRUE, pixtral.addBos());
+
+        PreTokenizerRegistry.PreTokenizer num3 = PreTokenizerRegistry.forName("tekken-num3");
+        assertSame(PreTokenizerType.TEKKEN_NUM3, num3.type());
+        assertFalse(num3.cleanSpaces());
+        assertTrue(num3.ignoreMerges());
+        assertEquals(Boolean.TRUE, num3.addBos());
+
+        PreTokenizerRegistry.PreTokenizer domyn = PreTokenizerRegistry.forName("domyn-small");
+        assertSame(PreTokenizerType.DOMYN_SMALL, domyn.type());
+        assertTrue(domyn.escapeWhitespaces());
+        assertTrue(domyn.cleanSpaces());
+        assertFalse(domyn.byteEncode());
+
+        PreTokenizerRegistry.PreTokenizer nemotron = PreTokenizerRegistry.forName("nemotron-3.5-embed");
+        assertSame(PreTokenizerType.NEMOTRON_3_5_EMBD, nemotron.type());
+        assertEquals(PreTokenizerPatterns.TEKKEN, nemotron.regexes());
+        assertTrue(nemotron.ignoreMerges());
+        assertEquals(Boolean.TRUE, nemotron.addBos());
+        assertTrue(nemotron.cleanSpaces());
+
+        PreTokenizerRegistry.PreTokenizer soprano = PreTokenizerRegistry.forName("soprano");
+        assertSame(PreTokenizerType.SOPRANO, soprano.type());
+        assertFalse(soprano.byteEncode());
+        assertTrue(soprano.cleanSpaces());
+        assertFalse(soprano.ignoreMerges());
+        assertNull(soprano.addBos());
+
+        PreTokenizerRegistry.PreTokenizer lfm2 = PreTokenizerRegistry.forName("lfm2");
+        assertSame(PreTokenizerType.LLAMA3, lfm2.type());
+        assertTrue(lfm2.ignoreMerges());
+        assertEquals(Boolean.TRUE, lfm2.addBos());
+        for (String name : Arrays.asList("lfm2", "minicpm5", "gemma4", "granite-embed-multi-311m", "dbrx",
+                "chatglm-bpe", "glm4", "glm5", "exaone4", "mellum2")) {
+            assertFalse(name, PreTokenizerRegistry.forName(name).cleanSpaces());
+        }
+    }
+
+    @Test
+    public void tekkenNum3GroupsDigitsInRightAlignedTriples() {
+        assertEquals(Arrays.asList("1", "234", "567"), split("tekken-num3", "1234567"));
+        assertEquals(Arrays.asList("12", " ", "345"), split("tekken-num3", "12 345"));
+        assertEquals(Arrays.asList("1", "2", "3"), split("tekken", "123"));
+    }
+
+    @Test
+    public void sopranoIsolatesDigitsThenSplitsWordAndSymbolRuns() {
+        assertEquals(Arrays.asList("hello", " ", "world_x", "!?", " ", "1", "2"), split("soprano", "hello world_x!? 12"));
     }
 
     /** LLAMA3 is one regex served by {@code unicode_regex_split_custom_llama3}: digits in triples. */

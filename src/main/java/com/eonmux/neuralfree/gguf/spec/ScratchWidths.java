@@ -38,14 +38,16 @@ public final class ScratchWidths {
     private final long stream;
     private final long input;
     private final long projection;
+    private final long query;
     private final long gateUp;
     private final long ffnOut;
     private final long logits;
 
-    private ScratchWidths(long stream, long input, long projection, long gateUp, long ffnOut, long logits) {
+    private ScratchWidths(long stream, long input, long projection, long query, long gateUp, long ffnOut, long logits) {
         this.stream = stream;
         this.input = input;
         this.projection = projection;
+        this.query = query;
         this.gateUp = gateUp;
         this.ffnOut = ffnOut;
         this.logits = logits;
@@ -75,6 +77,13 @@ public final class ScratchWidths {
             input = Math.max(stream, Math.multiplyExact((long) embd.nEmbdPerLayer(), layers.size()));
         }
         long proj = Math.max(stream, projectionWidth(spec.tensors(), embd, head));
+        long query = proj;
+        for (LayerSpec l : layers) {
+            AttentionSpec a = l.attention();
+            if (a != null && a.hasDualChunk()) {
+                query = Math.max(query, a.qRopeDim());
+            }
+        }
         long gateUp = Math.multiplyExact(2L, proj);
         long ffnOut = proj;
         for (LayerSpec l : layers) {
@@ -87,7 +96,7 @@ public final class ScratchWidths {
             gateUp = Math.max(gateUp, Math.addExact(Math.multiplyExact(2L * m.nUsed(), expertFf), shared));
             ffnOut = Math.max(ffnOut, Math.multiplyExact((long) m.nUsed(), Math.max(stream, m.latentSize())));
         }
-        return new ScratchWidths(stream, input, proj, gateUp, ffnOut, logitsWidth(head));
+        return new ScratchWidths(stream, input, proj, query, gateUp, ffnOut, logitsWidth(head));
     }
 
     /** Elements of a slot of {@code width} per token for {@code ubatch} tokens (a width below 1 counts as 1). */
@@ -108,6 +117,11 @@ public final class ScratchWidths {
     /** Widest projection. */
     public long projection() {
         return projection;
+    }
+
+    /** Width of the {@code Q} slot: {@link #projection()}, widened to the five dual-chunk query planes. */
+    public long query() {
+        return query;
     }
 
     /** FFN gate-and-up width. */

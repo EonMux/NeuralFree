@@ -274,6 +274,45 @@ public class CpuGatedDeltaNetTest {
     }
 
     @Test
+    public void gatePrepConcatBetaAlphaLayoutEqualsTheSeparateProjections() {
+        // qwen4exp ssm_beta_alpha: per token [beta(n_v) | alpha(n_v)] (qwen4exp.cpp:1131-1138), two tokens.
+        Random rnd = new Random(13);
+        int nV = 4;
+        int nT = 2;
+        float[] betas = random(rnd, nT * nV, 3f);
+        float[] alphas = random(rnd, nT * nV, 3f);
+        float[] merged = new float[nT * 2 * nV];
+        for (int t = 0; t < nT; t++) {
+            System.arraycopy(betas, t * nV, merged, t * 2 * nV, nV);
+            System.arraycopy(alphas, t * nV, merged, t * 2 * nV + nV, nV);
+        }
+        float[] dt = random(rnd, nV, 0.5f);
+        float[] ssmA = random(rnd, nV, 2f);
+
+        float[] gSep = new float[nT * nV];
+        float[] betaSep = new float[nT * nV];
+        CpuGatedDeltaNet.gatePrep(new GateShape(nV, 2, DeltaNetKernels.LAYOUT_SEPARATE, DecayGate.GDN, 0, 0f), nT,
+                new Rows(alphas, 0, nV), new Rows(betas, 0, nV), dt, ssmA, gSep, 0, betaSep, 0);
+        float[] gCat = new float[nT * nV];
+        float[] betaCat = new float[nT * nV];
+        Rows rows = new Rows(merged, 0, 2 * nV);
+        CpuGatedDeltaNet.gatePrep(new GateShape(nV, 2, DeltaNetKernels.LAYOUT_CONCAT_BA, DecayGate.GDN, 0, 0f), nT,
+                rows, rows, dt, ssmA, gCat, 0, betaCat, 0);
+        assertArrayEquals(gSep, gCat, 0f);
+        assertArrayEquals(betaSep, betaCat, 0f);
+    }
+
+    @Test
+    public void theMergedBetaAlphaLayoutsAreGdnOnly() {
+        try {
+            new GateShape(2, 2, DeltaNetKernels.LAYOUT_CONCAT_BA, DecayGate.SOFTPLUS, 2, 0f);
+            fail("a KDA gate has no merged beta/alpha layout");
+        } catch (IllegalArgumentException expected) {
+            assertEquals(true, expected.getMessage().contains("only for gated delta-net"));
+        }
+    }
+
+    @Test
     public void gatePrepKdaModes() {
         int d = 2;
         float[] f = {0.3f, -0.7f, 1.1f, 0.2f};

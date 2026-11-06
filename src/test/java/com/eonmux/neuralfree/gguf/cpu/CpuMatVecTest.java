@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuActivationQuantizer;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuVecDot;
+import com.eonmux.neuralfree.gguf.cpu.quant.ExtVecDot;
 import com.eonmux.neuralfree.gguf.cpu.quant.Fp16VecDot;
 import com.eonmux.neuralfree.gguf.cpu.quant.Fp4VecDot;
 import com.eonmux.neuralfree.gguf.cpu.quant.IQuantVecDot;
@@ -418,11 +419,11 @@ public class CpuMatVecTest {
     }
 
     @Test
-    public void kernelTableIsTheDisjointUnionOfTheEightFamilies() {
+    public void kernelTableIsTheDisjointUnionOfTheNineFamilies() {
         List<Set<GGMLType>> families = Arrays.asList(
                 LegacyVecDot.supportedTypes(), Q8VecDot.supportedTypes(), Fp4VecDot.supportedTypes(),
                 KQuantVecDot.supportedTypes(), IQuantVecDot.supportedTypes(), TernaryVecDot.supportedTypes(),
-                NewFpVecDot.supportedTypes(), Fp16VecDot.supportedTypes());
+                NewFpVecDot.supportedTypes(), Fp16VecDot.supportedTypes(), ExtVecDot.supportedTypes());
         Set<GGMLType> union = EnumSet.noneOf(GGMLType.class);
         int total = 0;
         for (Set<GGMLType> f : families) {
@@ -433,7 +434,8 @@ public class CpuMatVecTest {
         assertEquals("families overlap", union.size(), total);
         assertEquals(union, CpuMatVec.supportedTypes());
         for (GGMLType t : new GGMLType[]{GGMLType.F32, GGMLType.F16, GGMLType.BF16, GGMLType.Q4_0, GGMLType.Q8_0,
-                GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.IQ4_XS, GGMLType.TQ2_0, GGMLType.MXFP4}) {
+                GGMLType.Q4_K, GGMLType.Q6_K, GGMLType.IQ4_XS, GGMLType.TQ2_0, GGMLType.MXFP4,
+                GGMLType.F8_E4M3FN}) {
             assertTrue(t + " is supported", CpuMatVec.supports(t));
         }
     }

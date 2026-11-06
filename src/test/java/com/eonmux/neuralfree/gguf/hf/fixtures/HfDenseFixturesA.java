@@ -7,10 +7,11 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-D2 part A converter classes: {@code Gemma3Model}, {@code Gemma3NModel},
- * {@code SenseNovaU1Model}, {@code Qwen2VLModel}, {@code Qwen3VLTextModel} and {@code Qwen3ASRTextModel}. Two layers, a
- * hidden size of 8, two query heads, one key/value head, an FFN of {@code 2 * dim} and the exact tensor names and
- * configuration keys of the converter sources.
+ * Synthetic checkpoints of the converter classes: {@code Gemma3Model}, {@code Gemma3NModel},
+ * {@code SenseNovaU1Model}, {@code Qwen2VLModel}, {@code Qwen3VLTextModel}, {@code Qwen3ASRTextModel} and the
+ * {@code Qwen3ASRForcedAlignerForTokenClassification} head. Two layers, a hidden size of 8, two query heads, one
+ * key/value head, an FFN of {@code 2 * dim} and the exact tensor names and configuration keys of the converter
+ * sources.
  */
 public final class HfDenseFixturesA {
 
@@ -20,6 +21,8 @@ public final class HfDenseFixturesA {
     private static final int FFN = 2 * DIM;
     private static final int VOCAB = 8;
     private static final int HEAD_DIM = 4;
+    /** The forced aligner's time bins. */
+    private static final int CLASSIFY_NUM = 4;
 
     private HfDenseFixturesA() {
     }
@@ -143,6 +146,41 @@ public final class HfDenseFixturesA {
         return b;
     }
 
+    /**
+     * {@code Qwen3ASRForcedAlignerForTokenClassification} (qwen3_asr_forced_aligner.py:30): the same text tower under
+     * the {@code thinker.} prefix, its time-bin head at {@code thinker.lm_head.weight}, and one tensor of each
+     * generation and audio branch the converter drops.
+     */
+    public static SyntheticHf.Builder qwen3AsrForcedAligner() {
+        SyntheticHf.Builder b = builder("{'architectures': ['Qwen3ASRForcedAlignerForTokenClassification'],"
+                + " 'model_type': 'qwen3_asr',"
+                + " 'hidden_size': 8, 'intermediate_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1,"
+                + " 'num_hidden_layers': 2, 'max_position_embeddings': 64, 'rms_norm_eps': 1e-06, 'rope_theta': 10000.0,"
+                + " 'vocab_size': 8, 'rope_scaling': {'rope_type': 'mrope', 'mrope_section': [1, 1, 0]}}");
+        String p = "thinker.model.";
+        b.bf16(p + "embed_tokens.weight", VOCAB, DIM);
+        for (int l = 0; l < LAYERS; l++) {
+            String q = p + "layers." + l + ".";
+            b.bf16(q + "input_layernorm.weight", DIM);
+            b.bf16(q + "self_attn.q_proj.weight", DIM, DIM);
+            b.bf16(q + "self_attn.k_proj.weight", KV, DIM);
+            b.bf16(q + "self_attn.v_proj.weight", KV, DIM);
+            b.bf16(q + "self_attn.o_proj.weight", DIM, DIM);
+            b.bf16(q + "self_attn.q_norm.weight", HEAD_DIM);
+            b.bf16(q + "self_attn.k_norm.weight", HEAD_DIM);
+            b.bf16(q + "post_attention_layernorm.weight", DIM);
+            b.bf16(q + "mlp.gate_proj.weight", FFN, DIM);
+            b.bf16(q + "mlp.up_proj.weight", FFN, DIM);
+            b.bf16(q + "mlp.down_proj.weight", DIM, FFN);
+        }
+        b.bf16(p + "norm.weight", DIM);
+        b.bf16("thinker.lm_head.weight", CLASSIFY_NUM, DIM);
+        b.bf16("audio_tower.conv1.weight", 8, DIM);
+        b.bf16("talker.model.embed_tokens.weight", VOCAB, DIM);
+        b.bf16("code2wav.conv.weight", 8, DIM);
+        return b;
+    }
+
     /** The Gemma 1/2/3/3n common layout under {@code model.}. */
     private static void gemma(SyntheticHf.Builder b) {
         b.bf16("model.embed_tokens.weight", VOCAB, DIM);
@@ -224,6 +262,7 @@ public final class HfDenseFixturesA {
                 named("NEOChatModel", HfDenseFixturesA::senseNovaU1),
                 named("Qwen2VLForConditionalGeneration", HfDenseFixturesA::qwen2Vl),
                 named("Qwen3ASRForConditionalGeneration", HfDenseFixturesA::qwen3AsrText),
+                named("Qwen3ASRForcedAlignerForTokenClassification", HfDenseFixturesA::qwen3AsrForcedAligner),
                 named("Qwen3VLForConditionalGeneration", HfDenseFixturesA::qwen3VlText));
     }
 }

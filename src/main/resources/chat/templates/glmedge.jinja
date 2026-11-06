@@ -1,0 +1,8 @@
+{#- llama.cpp glmedge chat template (src/llama-chat.cpp:513-520). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|' ~ message['role'] ~ '|>\n' ~ content -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|assistant|>' -}}
+{%- endif -%}

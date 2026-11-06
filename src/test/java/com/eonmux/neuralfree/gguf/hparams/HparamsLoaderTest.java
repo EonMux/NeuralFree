@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.gguf.arch.ArchRegistry;
 import com.eonmux.neuralfree.gguf.arch.ArchTraits;
 import com.eonmux.neuralfree.gguf.arch.GatingFunc;
 import com.eonmux.neuralfree.gguf.arch.MemoryKind;
+import com.eonmux.neuralfree.gguf.arch.PoolerAct;
 import com.eonmux.neuralfree.gguf.arch.PoolingKind;
 import com.eonmux.neuralfree.gguf.arch.RopeScalingType;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
@@ -36,9 +37,13 @@ public class HparamsLoaderTest {
 
     private static ArchEntry entry(Arch arch, SupportClass support, RopeType rope, boolean mropeWhenSections,
                                    ArchHparamsHook hook) {
-        ArchTraits t = ArchTraits.builder(arch).ropeType(rope).memoryKind(MemoryKind.KV).support(support)
-                .mropeWhenSections(mropeWhenSections).build();
-        return ArchEntry.of(t, hook);
+        return ArchEntry.of(traits(arch, support, rope, mropeWhenSections).build(), hook);
+    }
+
+    private static ArchTraits.Builder traits(Arch arch, SupportClass support, RopeType rope,
+                                             boolean mropeWhenSections) {
+        return ArchTraits.builder(arch).ropeType(rope).memoryKind(MemoryKind.KV).support(support)
+                .mropeWhenSections(mropeWhenSections);
     }
 
     private static Map<String, Object> base(String arch, int blocks) {
@@ -229,8 +234,13 @@ public class HparamsLoaderTest {
         Map<String, Object> nb = base("nomic-bert-moe", 4);
         nb.put("nomic-bert-moe.expert_count", 4);
         nb.put("nomic-bert-moe.expert_used_count", 2);
-        ModelHparams nomic = load(nb, entry(Arch.NOMIC_BERT_MOE, SupportClass.EMBED, RopeType.NEOX, false, everyTwo));
+        // the registry's traits carry the bert graph family the rule keys on
+        ModelHparams nomic = load(nb, ArchEntry.of(ArchRegistry.get(Arch.NOMIC_BERT_MOE).traits(), everyTwo));
         assertArrayEquals(new boolean[] {false, true, false, true}, nomic.moeArray());
+
+        // the same arch outside the bert graph ignores the rule, as k2-horizon does
+        ModelHparams ownGraph = load(nb, entry(Arch.NOMIC_BERT_MOE, SupportClass.EMBED, RopeType.NEOX, false, everyTwo));
+        assertArrayEquals(new boolean[] {true, true, true, true}, ownGraph.moeArray());
     }
 
     @Test
@@ -290,6 +300,61 @@ public class HparamsLoaderTest {
     }
 
     @Test
+    public void thePoolerAndSparseClassifierKeysParse() {
+        Map<String, Object> m = base("bert", 2);
+        m.put("bert.pooling_type", 0);
+        m.put("bert.pooling.normalize", true);
+        m.put("bert.classifier.scope", "token");
+        m.put("bert.classifier.pooler_activation", "sigmoid");
+        m.put("bert.classifier.token_direct", true);
+        m.put("bert.classifier.sparse", "log1p_relu_sum");
+        m.put("bert.classifier.sparse_cls_token", 2);
+        m.put("bert.classifier.sparse_sep_token", 3);
+        ModelHparams hp = load(m, entry(Arch.BERT, SupportClass.EMBED, RopeType.NONE, false, ArchHparamsHook.NONE));
+        assertEquals(PoolerAct.SIGMOID, hp.poolerActivation());
+        assertTrue(hp.classifierTokenDirect());
+        assertEquals("log1p_relu_sum", hp.classifierSparse());
+        assertEquals(2, hp.sparseClsToken());
+        assertEquals(3, hp.sparseSepToken());
+        assertTrue(hp.poolingNormalize());
+    }
+
+    @Test
+    public void theTanhPoolerActivationParses() {
+        Map<String, Object> m = base("bert", 2);
+        m.put("bert.classifier.pooler_activation", "tanh");
+        ModelHparams hp = load(m, entry(Arch.BERT, SupportClass.EMBED, RopeType.NONE, false, ArchHparamsHook.NONE));
+        assertEquals(PoolerAct.TANH, hp.poolerActivation());
+    }
+
+    @Test
+    public void thePoolerAndSparseClassifierKeysDefaultToTheirNeutralValues() {
+        ModelHparams hp = load(base("bert", 2),
+                entry(Arch.BERT, SupportClass.EMBED, RopeType.NONE, false, ArchHparamsHook.NONE));
+        assertNull(hp.poolerActivation());
+        assertFalse(hp.classifierTokenDirect());
+        assertNull(hp.classifierSparse());
+        assertEquals(101, hp.sparseClsToken());
+        assertEquals(102, hp.sparseSepToken());
+        assertFalse(hp.poolingNormalize());
+    }
+
+    @Test
+    public void anUnknownPoolerActivationOrSparseKindRefusesByName() {
+        Map<String, Object> act = base("bert", 2);
+        act.put("bert.classifier.pooler_activation", "relu");
+        GgufFormatException a = assertThrows(GgufFormatException.class, () -> load(act,
+                entry(Arch.BERT, SupportClass.EMBED, RopeType.NONE, false, ArchHparamsHook.NONE)));
+        assertTrue(a.getMessage(), a.getMessage().contains("relu"));
+
+        Map<String, Object> sparse = base("bert", 2);
+        sparse.put("bert.classifier.sparse", "log1p");
+        GgufFormatException s = assertThrows(GgufFormatException.class, () -> load(sparse,
+                entry(Arch.BERT, SupportClass.EMBED, RopeType.NONE, false, ArchHparamsHook.NONE)));
+        assertTrue(s.getMessage(), s.getMessage().contains("log1p"));
+    }
+
+    @Test
     public void unsupportedArchitecturesAreRejected() {
         Map<String, Object> clip = base("clip", 2);
         UnsupportedArchException e = assertThrows(UnsupportedArchException.class,
@@ -307,6 +372,91 @@ public class HparamsLoaderTest {
         assertThrows(GgufFormatException.class, () -> load(base("qwen2", 2), entry(Arch.LLAMA, ArchHparamsHook.NONE)));
     }
 
+    // ------------------------------------------------------------------ NTK and FoPE keys
+
+    @Test
+    public void ntkScalingReadsTheFactorAndMixedB() {
+        Map<String, Object> m = base("llama", 1);
+        m.put("llama.rope.scaling.type", "ntk");
+        m.put("llama.rope.scaling.factor", 4.0f);
+        m.put("llama.rope.scaling.mixed_b", 0.25f);
+        ModelHparams hp = load(m, entry(Arch.LLAMA, ArchHparamsHook.NONE));
+        assertEquals(RopeScalingType.NTK, hp.ropeScalingType());
+        assertEquals(4.0f, hp.ropeScalingFactor(), 0f);
+        assertEquals(0.25f, hp.ropeScalingMixedB(), 0f);
+        // the divisors carry the scale: freq_scale stays 1
+        assertEquals(1.0f, hp.ropeFreqScale(), 0f);
+    }
+
+    @Test
+    public void ntkScalingWithoutFactorIsRefused() {
+        Map<String, Object> m = base("llama", 1);
+        m.put("llama.rope.scaling.type", "ntk");
+        GgufFormatException e = assertThrows(GgufFormatException.class,
+                () -> load(m, entry(Arch.LLAMA, ArchHparamsHook.NONE)));
+        assertTrue(e.getMessage(), e.getMessage().contains("llama.rope.scaling.factor"));
+    }
+
+    @Test
+    public void fopeKeysLoad() {
+        Map<String, Object> m = base("llama", 1);
+        m.put("llama.rope.fope.use", true);
+        m.put("llama.rope.fope.sep_head", true);
+        m.put("llama.rope.fope.num_inv_freq", 16);
+        m.put("llama.rope.fope.init_factor", 0.1f);
+        ModelHparams hp = load(m, entry(Arch.LLAMA, ArchHparamsHook.NONE));
+        assertTrue(hp.ropeFope());
+        assertTrue(hp.ropeFopeSepHead());
+        assertEquals(16, hp.ropeFopeNumInvFreq());
+        assertEquals(0.1f, hp.ropeFopeInitFactor(), 0f);
+        // the tuning keys without the use flag are a malformed file
+        Map<String, Object> bad = base("llama", 1);
+        bad.put("llama.rope.fope.sep_head", true);
+        GgufFormatException e = assertThrows(GgufFormatException.class,
+                () -> load(bad, entry(Arch.LLAMA, ArchHparamsHook.NONE)));
+        assertTrue(e.getMessage(), e.getMessage().contains("llama.rope.fope.use"));
+    }
+
+    @Test
+    public void perGroupTopKFlagLoads() {
+        Map<String, Object> m = grouped("llama");
+        m.put("llama.expert_group_used_count", 2);
+        m.put("llama.expert_per_group_top_k", true);
+        ModelHparams hp = load(m, entry(Arch.LLAMA, ArchHparamsHook.NONE));
+        assertTrue(hp.moePerGroupTopK());
+        assertEquals(2, hp.nGroupUsed());
+    }
+
+    /** Every group contributes, so a file without a kept-group count keeps all of them. */
+    @Test
+    public void perGroupTopKDefaultsTheKeptGroupsToAllOfThem() {
+        Map<String, Object> m = grouped("llama");
+        m.put("llama.expert_per_group_top_k", true);
+        ModelHparams hp = load(m, entry(Arch.LLAMA, ArchHparamsHook.NONE));
+        assertEquals(2, hp.nExpertGroups());
+        assertEquals(2, hp.nGroupUsed());
+    }
+
+    @Test
+    public void perGroupTopKWithoutGroupsIsRefused() {
+        Map<String, Object> m = base("llama", 1);
+        m.put("llama.expert_count", 4);
+        m.put("llama.expert_used_count", 2);
+        m.put("llama.expert_per_group_top_k", true);
+        GgufFormatException e = assertThrows(GgufFormatException.class,
+                () -> load(m, entry(Arch.LLAMA, ArchHparamsHook.NONE)));
+        assertTrue(e.getMessage(), e.getMessage().contains("llama.expert_per_group_top_k"));
+    }
+
+    /** The expert keys of a two-group router over four experts. */
+    private static Map<String, Object> grouped(String arch) {
+        Map<String, Object> m = base(arch, 1);
+        m.put(arch + ".expert_count", 4);
+        m.put(arch + ".expert_used_count", 2);
+        m.put(arch + ".expert_group_count", 2);
+        return m;
+    }
+
     @Test
     public void mropeTextPositionsLayout() {
         int[] dst = new int[8];
@@ -314,5 +464,67 @@ public class HparamsLoaderTest {
         assertArrayEquals(new int[] {5, 6, 5, 6, 5, 6, 0, 0}, dst);
         MropeTextPositions.P000.fill(5, 2, dst);
         assertArrayEquals(new int[] {5, 6, 0, 0, 0, 0, 0, 0}, dst);
+    }
+
+    @Test
+    public void decisionTypeTemperaturesAndScoreBiasParse() {
+        Map<String, Object> m = base("vllm-decision2", 2);
+        m.put("vllm-decision2.decision.type", "vllm-decision2");
+        m.put("vllm-decision2.decision.temperature.choice", 0.6f);
+        m.put("vllm-decision2.decision.temperature.choice.3_5", 0.7f);
+        m.put("vllm-decision2.decision.temperature.score", 0.5f);
+        m.put("vllm-decision2.decision.score_bias.4.0", -1.0f);
+        m.put("vllm-decision2.decision.score_bias.4.3", 1.0f);
+        ModelHparams hp = load(m, entry(Arch.VLLM_DECISION2, SupportClass.CLS, RopeType.NEOX, false,
+                ArchHparamsHook.NONE));
+        assertEquals("vllm-decision2", hp.decisionType());
+        assertEquals(3, hp.decisionTemperatures().size());
+        assertEquals(0.7f, hp.decisionTemperatures().get("choice.3_5"), 1e-6f);
+        assertEquals(1, hp.decisionScoreBias().size());
+        assertArrayEquals(new float[] {-1.0f, 0.0f, 0.0f, 1.0f}, hp.decisionScoreBias().get(4), 1e-6f);
+    }
+
+    @Test
+    public void decisionHeadMetadataDefaultsToEmptyAndNull() {
+        ModelHparams hp = load(base("bert", 2),
+                entry(Arch.BERT, SupportClass.EMBED, RopeType.NONE, false, ArchHparamsHook.NONE));
+        assertNull(hp.decisionType());
+        assertTrue(hp.decisionTemperatures().isEmpty());
+        assertTrue(hp.decisionScoreBias().isEmpty());
+    }
+
+    @Test
+    public void decisionHeadMetadataIsImmutable() {
+        Map<String, Object> m = base("vllm-decision2", 2);
+        m.put("vllm-decision2.decision.temperature.choice", 0.6f);
+        m.put("vllm-decision2.decision.score_bias.3.0", 0.25f);
+        ModelHparams hp = load(m, entry(Arch.VLLM_DECISION2, SupportClass.CLS, RopeType.NEOX, false,
+                ArchHparamsHook.NONE));
+        assertThrows(UnsupportedOperationException.class, () -> hp.decisionTemperatures().put("noul", 1.0f));
+        assertThrows(UnsupportedOperationException.class, () -> hp.decisionScoreBias().put(3, new float[3]));
+    }
+
+    @Test
+    public void anInvalidDecisionTemperatureRefusesNamingTheKey() {
+        Map<String, Object> m = base("vllm-decision2", 2);
+        m.put("vllm-decision2.decision.temperature.choice", 0.0f);
+        GgufFormatException e = assertThrows(GgufFormatException.class,
+                () -> load(m, entry(Arch.VLLM_DECISION2, SupportClass.CLS, RopeType.NEOX, false,
+                        ArchHparamsHook.NONE)));
+        assertTrue(e.getMessage(), e.getMessage().contains("invalid decision temperature"));
+        assertTrue(e.getMessage(), e.getMessage().contains("vllm-decision2.decision.temperature.choice"));
+    }
+
+    @Test
+    public void invalidDecisionScoreBiasKeysRefuseNamingTheKey() {
+        for (String bad : new String[] {"decision.score_bias.4.4", "decision.score_bias.1.0",
+                "decision.score_bias.256.0", "decision.score_bias.x.0", "decision.score_bias.4"}) {
+            Map<String, Object> m = base("vllm-decision2", 2);
+            m.put("vllm-decision2." + bad, 1.0f);
+            GgufFormatException e = assertThrows(GgufFormatException.class,
+                    () -> load(m, entry(Arch.VLLM_DECISION2, SupportClass.CLS, RopeType.NEOX, false,
+                            ArchHparamsHook.NONE)));
+            assertTrue(bad, e.getMessage().contains("invalid decision score bias: vllm-decision2." + bad));
+        }
     }
 }

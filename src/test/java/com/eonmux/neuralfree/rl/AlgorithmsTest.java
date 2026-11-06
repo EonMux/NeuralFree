@@ -50,7 +50,7 @@ public class AlgorithmsTest {
             .build();
         
         assertNotNull(dqn);
-        assertEquals(4, dqn.backend().capabilities().getComputeUnits());
+        assertSame("the agent runs on the backend it was given", backend, dqn.backend());
         assertEquals(1.0f, dqn.epsilon(), 0.0f);
         dqn.close();
     }

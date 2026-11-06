@@ -3,10 +3,13 @@ package com.eonmux.neuralfree.gguf.ops.moe;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
+import com.eonmux.neuralfree.gguf.cpu.quant.ImatrixCollector;
+import com.eonmux.neuralfree.gguf.quant.write.ImatrixFile;
 import org.junit.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Random;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -17,7 +20,7 @@ import static org.junit.Assert.assertThrows;
  * {@link CpuExpertMatmul} against per-pair {@link CpuMatVec#matvecExpert} products: the counting-sort grouping, and
  * bit-identical outputs for token-row and pair-row inputs, experts with more pairs than one tile block and more rows
  * than one row tile, duplicate ids, per-expert output scales and a weight split into row shards that cut through an
- * expert.
+ * expert; and the input observer's per-pair rows.
  */
 public class CpuExpertMatmulTest {
 
@@ -117,6 +120,36 @@ public class CpuExpertMatmulTest {
     // ------------------------------------------------------------------ products
 
     /**
+     * Explicit source rows: a compacted host pair list of a hybrid step reads its token rows through
+     * {@code srcRows}; the grouped product matches one {@link CpuMatVec#matvecExpert} per pair over the same rows,
+     * for repeated rows (pairs of one token) and a non-contiguous subset.
+     */
+    @Test
+    public void explicitSourceRowsMatchThePerPairProducts() {
+        CpuMatVec mv = CpuMatVec.PLAIN;
+        int nExpert = 4;
+        int cols = 64;
+        CpuTensorRef w = f32(nExpert * 32, cols, 17L);
+        int tokens = 6;
+        float[] x = random(tokens * cols, 5L);
+        // pairs (token, expert) of a step with k = 2, of which the host keeps a non-contiguous subset
+        int[] srcRows = {0, 0, 3, 3, 3, 5};
+        int[] ids = {1, 2, 2, 0, 3, 1};
+        int pairs = ids.length;
+        int perExpert = 32;
+        float[] y = new float[pairs * perExpert];
+        CpuExpertMatmul.Groups g = CpuExpertMatmul.Groups.of(ids, pairs, nExpert);
+        new CpuExpertMatmul(mv).run(w, nExpert, g, x, 0, srcRows, y, 0);
+        for (int p = 0; p < pairs; p++) {
+            float[] ref = new float[perExpert];
+            mv.matvecExpert(w, ids[p], nExpert, x, srcRows[p] * cols, ref, 0);
+            assertArrayEquals(ref, Arrays.copyOfRange(y, p * perExpert, (p + 1) * perExpert), 1e-4f);
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> new CpuExpertMatmul(mv).run(w, nExpert, g, x, 0, (int[]) null, new float[pairs * perExpert], 0));
+    }
+
+    /**
      * Token-row input (k = 2) on a sharded Q8_0 tensor with per-expert scales: expert 0 takes 20 pairs (two pair
      * blocks) and every expert has 70 rows (two row tiles), with shard cuts inside experts 1 and 3.
      */
@@ -165,6 +198,44 @@ public class CpuExpertMatmulTest {
         int[] ids = {6, 1, 4};
         float[] x = random(cols, 13L);
         assertArrayEquals(perPair(mv, w, nExpert, ids, 3, x, 3), grouped(mv, w, nExpert, ids, 3, x, 3), 0f);
+    }
+
+    // ------------------------------------------------------------------ input observer
+
+    /**
+     * The installed {@link CpuMatVec.InputObserver} sees the grouped product's inputs exactly as it sees the per-pair
+     * {@link CpuMatVec#matvecExpert} calls: one row per (token, slot) pair with its expert, so an imatrix collection
+     * gets the same per-expert statistics on either path.
+     */
+    @Test
+    public void theObserverSeesEveryPairAsThePerPairProductsReportIt() {
+        CpuMatVec mv = CpuMatVec.PLAIN;
+        int nExpert = 4;
+        int cols = 64;
+        CpuTensorRef w = f32(nExpert * 16, cols, 29L);
+        int[] ids = {2, 0, 2, 3, 1, 2};
+        float[] x = random(3 * cols, 31L);
+        ImatrixCollector perPair = new ImatrixCollector(t -> "w");
+        CpuMatVec.observeGlobally(perPair);
+        try {
+            perPair(mv, w, nExpert, ids, ids.length, x, 2);
+        } finally {
+            CpuMatVec.observeGlobally(null);
+        }
+        ImatrixCollector grouped = new ImatrixCollector(t -> "w");
+        CpuMatVec.observeGlobally(grouped);
+        try {
+            grouped(mv, w, nExpert, ids, ids.length, x, 2);
+        } finally {
+            CpuMatVec.observeGlobally(null);
+        }
+        ImatrixFile.Entry a = perPair.entries().get(0);
+        ImatrixFile.Entry b = grouped.entries().get(0);
+        assertEquals(nExpert, b.nMat());
+        assertArrayEquals(new long[]{1, 1, 3, 1}, b.counts());
+        assertArrayEquals(a.counts(), b.counts());
+        assertArrayEquals(a.sumSq(), b.sumSq(), 0f);
+        assertArrayEquals(a.sums(), b.sums(), 0f);
     }
 
     // ------------------------------------------------------------------ validation

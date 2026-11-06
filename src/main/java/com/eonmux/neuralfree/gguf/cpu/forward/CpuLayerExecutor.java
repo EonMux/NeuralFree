@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.gguf.cpu.block.CpuFfnBlock;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuLayerExtra;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixer;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.cpu.block.CpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
@@ -84,6 +85,8 @@ public final class CpuLayerExecutor implements AutoCloseable {
     private static final String TEMP_FFN = "CpuLayerExecutor.ffnBranch";
     private static final String TEMP_ADA_HIDDEN = "CpuLayerExecutor.adaHidden";
     private static final String TEMP_ADA = "CpuLayerExecutor.ada";
+    private static final String TEMP_SLERP_A = "CpuLayerExecutor.slerpA";
+    private static final String TEMP_SLERP_B = "CpuLayerExecutor.slerpB";
     /** Elements per parallel task of the row-wise residual mixes. */
     private static final int ELEMENT_GRAIN = 1 << 15;
 
@@ -118,6 +121,13 @@ public final class CpuLayerExecutor implements AutoCloseable {
     private final float[] adaCond;
     private final float[] adaHidden;
     private final float[] adaVector;
+    /** SLERP residual: {@code |alpha * scale|} of each sub-block and its complement; null without SLERP. */
+    private final float[] attnSlerpLr;
+    private final float[] attnSlerpOneMinus;
+    private final float[] ffnSlerpLr;
+    private final float[] ffnSlerpOneMinus;
+    private final float[] slerpA;
+    private final float[] slerpB;
 
     private final float[] normed;
     private final float[] branch;
@@ -195,6 +205,21 @@ public final class CpuLayerExecutor implements AutoCloseable {
         this.adaCond = ada != null ? AdaNormMath.timeCondition(norm.ffnAdaDelay(), width) : null;
         this.adaHidden = ada != null ? scratch.temp(TEMP_ADA_HIDDEN, ada.hidden()) : null;
         this.adaVector = ada != null ? scratch.temp(TEMP_ADA, width) : null;
+        if (res.kind() == ResidualKind.SLERP) {
+            this.attnSlerpLr = slerpLr(res.attnSlerp());
+            this.attnSlerpOneMinus = complement(attnSlerpLr);
+            this.ffnSlerpLr = slerpLr(res.ffnSlerp());
+            this.ffnSlerpOneMinus = complement(ffnSlerpLr);
+            this.slerpA = scratch.temp(TEMP_SLERP_A, rows(ubatch, width));
+            this.slerpB = scratch.temp(TEMP_SLERP_B, rows(ubatch, width));
+        } else {
+            this.attnSlerpLr = null;
+            this.attnSlerpOneMinus = null;
+            this.ffnSlerpLr = null;
+            this.ffnSlerpOneMinus = null;
+            this.slerpA = null;
+            this.slerpB = null;
+        }
 
         Blocks b = new Blocks();
         try {
@@ -542,6 +567,11 @@ public final class CpuLayerExecutor implements AutoCloseable {
         return width;
     }
 
+    /** The layer's mixer, or null when the layer has none. */
+    public CpuMixer mixer() {
+        return mixer;
+    }
+
     // ------------------------------------------------------------------ step
 
     /**
@@ -564,6 +594,75 @@ public final class CpuLayerExecutor implements AutoCloseable {
                     + (long) n * streamWidth);
         }
         forward(batchLayout(pos0, n), x);
+    }
+
+    /**
+     * Runs the layer's cache writes alone: the extras' pre-block hooks, the attention norm and the mixer's
+     * cache-write-only step ({@link CpuMixer#prefillKV}). A layer whose mixer has no such step runs its whole
+     * attention part instead ({@link #mixerBlock}), so its caches are written either way. A step whose stack output
+     * no reader consumes thus stops at the K/V projections and the store; {@code x} is left mid-layer.
+     *
+     * @throws IllegalArgumentException as {@link #forward(int, int, float[])}
+     * @throws IllegalStateException    when the hyper-connection residual was not consumed by its extra
+     */
+    public void forwardKV(int pos0, int n, float[] x) {
+        Objects.requireNonNull(x, "x");
+        checkOpen();
+        int ubatch = ctx.scratch().ubatch();
+        if (n < 1 || n > ubatch) {
+            throw new IllegalArgumentException(describe() + ": step of " + n + " tokens outside [1, " + ubatch + "]");
+        }
+        if ((long) n * streamWidth > x.length) {
+            throw new IllegalArgumentException(describe() + ": residual stream holds " + x.length + " floats, need "
+                    + (long) n * streamWidth);
+        }
+        if (layerIn != null) {
+            System.arraycopy(x, 0, layerIn, 0, n * streamWidth);
+        }
+        for (CpuLayerExtra e : extras) {
+            e.beforeBlock(pos0, n, x);
+        }
+        mixerBlockKV(pos0, n, x);
+    }
+
+    /**
+     * The cache-write-only form of steps 3-6: the attention norm and the mixer's {@link CpuMixer#prefillKV}. The
+     * branch norms, the extras' mixer hooks, the residual and the post-LN steps are skipped, since no reader consumes
+     * the layer output. A layer whose mixer has no cache-write-only step, or that feeds its mixer another norm,
+     * falls back to {@link #mixerBlock}, whose attention part writes the same caches.
+     */
+    private void mixerBlockKV(int pos0, int n, float[] x) {
+        if (mixer == null) {
+            return;
+        }
+        if (!kvOnlyCapable()) {
+            if (attnNorm != null) {
+                attnNorm.apply(x, normed, n, width);
+            }
+            mixerBlock(pos0, n, x);
+            return;
+        }
+        float[] in = x;
+        if (attnNorm != null) {
+            attnNorm.apply(x, normed, n, width);
+            in = normed;
+        }
+        mixer.prefillKV(pos0, n, in);
+        if (parallelAttention != null) {
+            parallelAttention.prefillKV(pos0, n, in);
+        }
+    }
+
+    /**
+     * Whether this layer's whole attention part can be reduced to its cache writes: the mixer and any parallel
+     * attention have a cache-write-only step, and none of the T5 self/cross attention, falcon's second norm or a
+     * branch norm feeds the mixer.
+     */
+    private boolean kvOnlyCapable() {
+        return mixer.kvRefusal() == null
+                && (parallelAttention == null || parallelAttention.kvRefusal() == null)
+                && selfAttention == null && mixerNorm2 == null && attnOutNorm == null && postAttnNorm == null
+                && postLnAttn == null;
     }
 
     /** The {@link StepLayout} of one contiguous segment at {@code pos0}, the layout {@link #forward} runs. */
@@ -647,7 +746,9 @@ public final class CpuLayerExecutor implements AutoCloseable {
             crossNorm.apply(x, normed, n, width);
             in = normed;
         }
-        run(mixer, pos0, n, in, branch);
+        if (!mixerTreeStep(n, in)) {
+            run(mixer, pos0, n, in, branch);
+        }
         if (parallelAttention != null) {
             run(parallelAttention, pos0, n, in, aux);
             CpuOps.add(aux, 0, branch, 0, branch, 0, n * width);
@@ -695,7 +796,9 @@ public final class CpuLayerExecutor implements AutoCloseable {
             crossNorm.apply(x, normed, n, width);
             in = normed;
         }
-        mixer.batch(s, in, branch);
+        if (!mixerTreeStep(n, in)) {
+            mixer.batch(s, in, branch);
+        }
         if (parallelAttention != null) {
             parallelAttention.batch(s, in, aux);
             CpuOps.add(aux, 0, branch, 0, branch, 0, n * width);
@@ -813,6 +916,23 @@ public final class CpuLayerExecutor implements AutoCloseable {
     }
 
     /**
+     * The recurrent tree step of the running round: captures the step's mixer-input rows for the round's replay,
+     * then runs every computed row through the mixer against its stack slot (the rows of a padding tail stay
+     * uncomputed — no reader consumes them). False when no round runs or this layer's mixer keeps no recurrent
+     * tree step, so the normal batched step runs instead; the layer's other sub-blocks (a hybrid layer's parallel
+     * attention, the norms, the residual) always run their normal step, which the tree mask makes per-path correct.
+     */
+    private boolean mixerTreeStep(int n, float[] in) {
+        CpuRecurrentTreeRound round = ctx.stepTreeRound();
+        if (round == null || !(mixer instanceof CpuRecurrentTreeMixer)) {
+            return false;
+        }
+        round.captureInput(layer.il(), in, n);
+        ((CpuRecurrentTreeMixer) mixer).treeStep(round, in, branch);
+        return true;
+    }
+
+    /**
      * Sequential residual of one sub-block: {@code normedIn} is that sub-block's normed input, {@code ffn} tells the
      * FFN sub-block from the mixer.
      */
@@ -831,9 +951,60 @@ public final class CpuLayerExecutor implements AutoCloseable {
                 CpuOps.scale(x, 0, n * width, res.streamScale(ffn));
                 mix(MixMode.SCALED, res.branchScale(ffn), n, x, br, x);
                 break;
+            case SLERP:
+                slerp(n, x, br, normedIn, ffn);
+                break;
             default:
                 throw new IllegalStateException(describe() + ": no sequential residual for " + res.kind());
         }
+    }
+
+    /**
+     * Dory's slerp residual: {@code justNorm(justNorm(a) + lr * (justNorm(b) - justNorm(a)))} with
+     * {@code lr = |alpha * slerpScale|} of the sub-block. The stream {@code a} is the sub-block's input
+     * ({@code normedIn}).
+     */
+    private void slerp(int n, float[] x, float[] br, float[] normedIn, boolean ffn) {
+        float[] lr = ffn ? ffnSlerpLr : attnSlerpLr;
+        float[] oneMinus = ffn ? ffnSlerpOneMinus : attnSlerpOneMinus;
+        if (lr == null) {
+            throw new IllegalStateException(describe() + ": no slerp alpha for the " + (ffn ? "FFN" : "mixer")
+                    + " sub-block");
+        }
+        float eps = norm.eps();
+        CpuOps.norm(NormKind.L2_GDN, eps, normedIn, 0, slerpA, 0, n, width, null, null);
+        CpuOps.norm(NormKind.L2_GDN, eps, br, 0, slerpB, 0, n, width, null, null);
+        NormMath.residualMix(MixMode.ALPHA_BETA, n * width, 1.0f, slerpA, 0, slerpB, 0, oneMinus, lr, width, x, 0);
+        CpuOps.norm(NormKind.L2_GDN, eps, x, 0, x, 0, n, width, null, null);
+    }
+
+    /** {@code |alpha[i] * slerpScale|} of a slerp alpha tensor, or null without the tensor. */
+    private float[] slerpLr(TensorRef ref) {
+        if (ref == null) {
+            return null;
+        }
+        float[] alpha = ctx.weights().floats(ref);
+        if (alpha.length != width) {
+            throw new IllegalArgumentException(describe() + ": " + ref.name() + " has " + alpha.length
+                    + " values, expected " + width);
+        }
+        float scale = res.slerpScale();
+        float[] lr = new float[width];
+        for (int i = 0; i < width; i++) {
+            lr[i] = Math.abs(alpha[i] * scale);
+        }
+        return lr;
+    }
+
+    private static float[] complement(float[] v) {
+        if (v == null) {
+            return null;
+        }
+        float[] out = new float[v.length];
+        for (int i = 0; i < v.length; i++) {
+            out[i] = 1.0f - v[i];
+        }
+        return out;
     }
 
     private void requireConsumed(String block) {
@@ -877,6 +1048,21 @@ public final class CpuLayerExecutor implements AutoCloseable {
         CpuMixer owner = cacheMixer();
         if (owner != null) {
             owner.shiftContext(nKeep, nDiscard);
+        }
+    }
+
+    /**
+     * Re-rotates this layer's cached keys by the paged shift deltas its memory records, after a
+     * {@code HeapModelMemory#shiftSequence} moved the rows: the same re-rotation a whole-context shift runs, keyed
+     * by row instead of by keep/discard counts. Layers without a KV cache do nothing.
+     *
+     * @throws UnsupportedOperationException when that mixer cannot shift its memory
+     */
+    public void applyShiftDeltas() {
+        checkOpen();
+        CpuMixer owner = cacheMixer();
+        if (owner != null) {
+            owner.applyShiftDeltas();
         }
     }
 

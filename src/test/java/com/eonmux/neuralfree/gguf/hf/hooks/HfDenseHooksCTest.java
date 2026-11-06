@@ -39,7 +39,7 @@ import static org.junit.Assert.fail;
  * (LC/conversion/olmo.py:18-39), the Olmo 2 sliding window and its olmo-2 period (olmo.py:51-69), the Apertus xIELU
  * per-layer parameter arrays (llama.py:434-469, with the entry's {@code withUndoPermute(false)}), the HunYuan NTK-alpha
  * dynamic RoPE base (hunyuan.py:248-283) and the Hunyuan-VL XD-RoPE fixup and metadata (hunyuan.py:332-360), plus the
- * table rows of {@link HfArchTableDense} under Appendix A.
+ * table rows of {@link HfArchTableDense}.
  */
 public class HfDenseHooksCTest {
 
@@ -259,7 +259,7 @@ public class HfDenseHooksCTest {
 
     // ------------------------------------------------------------------ the registered table rows
 
-    /** Every Appendix A table HK-D2 name resolves to its row's architecture. */
+    /** Every {@link HfArchTableDense} name resolves to its row's architecture. */
     @Test
     public void everyTableHkD2NameResolvesToItsArch() {
         HfTensorIndex empty = HfTensorIndex.of(new HashMap<>());
@@ -275,7 +275,7 @@ public class HfDenseHooksCTest {
         }
     }
 
-    /** The HK-D2 rows: HF name to the table's architecture, in Appendix A order. */
+    /** The table's rows: HF name to the row's architecture, in table order. */
     private static Object[][] tableNames() {
         return new Object[][] {
                 {"NEOChatModel", Arch.SENSENOVA_U1},

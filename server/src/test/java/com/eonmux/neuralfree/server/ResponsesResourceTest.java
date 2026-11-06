@@ -100,6 +100,15 @@ class ResponsesResourceTest {
     }
 
     @Test
+    void aStructuralTagTextFormatHoldsTheOutputToItsFormat() {
+        JsonView r = create("""
+                {"input": "hi", "max_output_tokens": 32, "temperature": 0, "store": false,
+                 "text": {"format": {"type": "structural_tag", "format": {"type": "tag", "begin": "<a>",
+                   "content": {"type": "json_schema", "json_schema": {"enum": [1, 2]}}, "end": "</a>"}}}}""");
+        assertTrue(outputText(r).matches("<a>[12]</a>"), "the format holds the output: " + outputText(r));
+    }
+
+    @Test
     void aNamedFunctionBecomesAFunctionCallItem() {
         JsonView r = create("""
                 {"input": "Weather in Paris?", "max_output_tokens": 600, "temperature": 0,

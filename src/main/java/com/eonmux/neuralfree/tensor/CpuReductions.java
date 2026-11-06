@@ -18,12 +18,19 @@ final class CpuReductions {
 
     // ------------------------------------------------------------------ sum, mean, max, min
 
-    /** Sum over {@code dims}; no dims sums every element into a scalar. */
+    /**
+     * Sum over {@code dims}; no dims sums every element into a scalar. The terms accumulate in double and the total
+     * rounds to float once, as ggml's CPU sums do ({@code ggml_vec_sum_f32}): the result carries one float rounding of
+     * a double total rather than one float rounding per term.
+     */
     static Tensor sum(Tensor a, int... dims) {
         return sumOrMean(a, dims, ReductionOp.SUM);
     }
 
-    /** Mean over {@code dims} (the sum, then one division); no dims averages every element into a scalar. */
+    /**
+     * Mean over {@code dims} (the double-accumulated sum of {@link #sum}, then one division); no dims averages every
+     * element into a scalar.
+     */
     static Tensor mean(Tensor a, int... dims) {
         return sumOrMean(a, dims, ReductionOp.MEAN);
     }
@@ -39,13 +46,16 @@ final class CpuReductions {
     private static Tensor sumOrMean(Tensor a, int[] dims, ReductionOp op) {
         Shape shape = a.shape();
         int[] normalizedDims = normalizeDims(dims, shape.rank());
+        if (CpuFloat64.applies(op == ReductionOp.MEAN ? "mean" : "sum", a)) {
+            return CpuFloat64.sumOrMean(a, dims.length == 0 ? dims : normalizedDims, op == ReductionOp.MEAN);
+        }
         float[] data = a.toFloatArray();
         if (dims.length == 0) {
-            float total = 0.0f;
+            double total = 0.0;
             for (float v : data) {
                 total += v;
             }
-            float value = op == ReductionOp.MEAN ? total / data.length : total;
+            float value = (float) (op == ReductionOp.MEAN ? total / data.length : total);
             return CpuShapeOps.floats(a.backend(), Shape.scalar(), new float[]{value}, false);
         }
         Shape resultShape = BroadcastEngine.reduceShape(shape, normalizedDims, false);
@@ -237,12 +247,12 @@ final class CpuReductions {
      * {@code t} more are summed. When no dim is summed, {@code target} must have {@code t}'s element count and the
      * result is a copy of {@code t}'s elements. Always a new tensor.
      *
-     * @throws IllegalArgumentException when the shapes are not broadcast-compatible, or {@code target} neither
-     *                                  broadcasts to {@code t}'s shape nor has its element count
+     * @throws IllegalArgumentException when {@code target} neither broadcasts to {@code t}'s shape nor has its
+     *                                  element count
      */
     static Tensor sumToShape(Tensor t, Shape target) {
         Shape shape = t.shape();
-        if (!shape.equals(target) && BroadcastEngine.broadcastShape(target, shape).equals(shape)) {
+        if (!shape.equals(target) && BroadcastEngine.broadcastsTo(target, shape)) {
             int[] axes = broadcastAxes(target, shape);
             if (axes.length > 0) {
                 try (Tensor summed = sum(t, axes)) {
@@ -339,6 +349,7 @@ final class CpuReductions {
             resultSize *= d;
         }
         float[] result = initResultArray(resultSize, op);
+        double[] totals = op == ReductionOp.SUM || op == ReductionOp.MEAN ? new double[resultSize] : null;
 
         int[] indices = new int[rank];
         for (long i = 0; i < shape.numElements(); i++) {
@@ -368,16 +379,21 @@ final class CpuReductions {
                 }
             }
 
-            applyReduction(result, resultLinearIdx, data[(int) i], op);
+            if (totals != null) {
+                totals[resultLinearIdx] += data[(int) i];
+            } else {
+                applyReduction(result, resultLinearIdx, data[(int) i], op);
+            }
         }
 
-        if (op == ReductionOp.MEAN) {
+        if (totals != null) {
             long reductionSize = 1;
             for (int d : dims) {
                 reductionSize *= shape.dim(d);
             }
+            double divisor = op == ReductionOp.MEAN ? reductionSize : 1.0;
             for (int i = 0; i < result.length; i++) {
-                result[i] /= reductionSize;
+                result[i] = (float) (totals[i] / divisor);
             }
         }
 
@@ -394,12 +410,9 @@ final class CpuReductions {
         return result;
     }
 
+    /** Folds {@code value} into {@code result[idx]} for MAX or MIN; SUM and MEAN accumulate in double instead. */
     private static void applyReduction(float[] result, int idx, float value, ReductionOp op) {
         switch (op) {
-            case SUM:
-            case MEAN:
-                result[idx] += value;
-                break;
             case MAX:
                 result[idx] = Math.max(result[idx], value);
                 break;

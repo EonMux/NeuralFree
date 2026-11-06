@@ -48,6 +48,21 @@ NF_INLINE float4 nf_kq_bits4(NF_GLOBAL const uchar* p, uint sh, uint mask) {
                  (float)(((uint)b.z >> sh) & mask), (float)(((uint)b.w >> sh) & mask));
 }
 
+/* nf_kq_bits4 over a four-byte aligned (nf_kq_bits4a) or two-byte aligned (nf_kq_bits4w) word: one
+ * load, or two 16-bit loads, instead of the four byte loads vload4 lowers to on CUDA. */
+NF_INLINE float4 nf_kq_unpack4(uint b, uint sh, uint mask) {
+    return NF_F4((float)((b >> (8 * 0) >> sh) & mask), (float)((b >> (8 * 1) >> sh) & mask),
+                 (float)((b >> (8 * 2) >> sh) & mask), (float)((b >> (8 * 3) >> sh) & mask));
+}
+
+NF_INLINE float4 nf_kq_bits4a(NF_GLOBAL const uchar* p, uint sh, uint mask) {
+    return nf_kq_unpack4(nf_read_u32(p), sh, mask);
+}
+
+NF_INLINE float4 nf_kq_bits4w(NF_GLOBAL const uchar* p, uint sh, uint mask) {
+    return nf_kq_unpack4(nf_read_u32_u16(p), sh, mask);
+}
+
 /* f16 field at byte offset off of block bp. */
 NF_INLINE float nf_kq_half(NF_GLOBAL const uchar* bp, int off) {
     return vload_half(0, (NF_GLOBAL const NF_HALF*)(bp + off));
@@ -90,8 +105,8 @@ NF_INLINE void nf_q2k_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4
     const float ml = nf_kq_half(bp, NF_Q2K_DMIN) * (float)(sc >> 4);
     const uint shift = (uint)((ltid & 15) >> 2) * 2u;
     NF_GLOBAL const uchar* q = bp + NF_Q2K_QS + (ltid >> 4) * 32 + ((ltid >> 1) & 1) * 16 + (ltid & 1) * 8;
-    *w0 = dl * nf_kq_bits4(q, shift, 3u) - ml;
-    *w1 = dl * nf_kq_bits4(q + 4, shift, 3u) - ml;
+    *w0 = dl * nf_kq_bits4a(q, shift, 3u) - ml;
+    *w1 = dl * nf_kq_bits4a(q + 4, shift, 3u) - ml;
 }
 NF_KQ_DOT_PAIR(Q2_K, nf_q2k_w8)
 NF_INLINE float Q2_K_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, int i) {
@@ -121,8 +136,8 @@ NF_INLINE void nf_q3k_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4
     const uint shift = (uint)j * 2u, mbit = (uint)(hf * 4 + j);
     NF_GLOBAL const uchar* q = bp + NF_Q3K_QS + hf * 32 + ((ltid >> 1) & 1) * 16 + (ltid & 1) * 8;
     NF_GLOBAL const uchar* hm = bp + NF_Q3K_HMASK + (ltid & 3) * 8;
-    *w0 = dl * (nf_kq_bits4(q, shift, 3u) + 4.0f * nf_kq_bits4(hm, mbit, 1u) - 4.0f);
-    *w1 = dl * (nf_kq_bits4(q + 4, shift, 3u) + 4.0f * nf_kq_bits4(hm + 4, mbit, 1u) - 4.0f);
+    *w0 = dl * (nf_kq_bits4w(q, shift, 3u) + 4.0f * nf_kq_bits4w(hm, mbit, 1u) - 4.0f);
+    *w1 = dl * (nf_kq_bits4w(q + 4, shift, 3u) + 4.0f * nf_kq_bits4w(hm + 4, mbit, 1u) - 4.0f);
 }
 NF_KQ_DOT_PAIR(Q3_K, nf_q3k_w8)
 NF_INLINE float Q3_K_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, int i) {
@@ -145,8 +160,8 @@ NF_INLINE void nf_q4k_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4
     const float ml = nf_kq_half(bp, NF_Q4K_DMIN) * sm.y;
     const uint sh = (uint)(si & 1) * 4u;
     NF_GLOBAL const uchar* q = bp + NF_Q4K_QS + (si >> 1) * 32 + (ltid & 3) * 8;
-    *w0 = dl * nf_kq_bits4(q, sh, 0xFu) - ml;
-    *w1 = dl * nf_kq_bits4(q + 4, sh, 0xFu) - ml;
+    *w0 = dl * nf_kq_bits4a(q, sh, 0xFu) - ml;
+    *w1 = dl * nf_kq_bits4a(q + 4, sh, 0xFu) - ml;
 }
 NF_KQ_DOT_PAIR(Q4_K, nf_q4k_w8)
 NF_INLINE float Q4_K_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, int i) {
@@ -168,8 +183,8 @@ NF_INLINE void nf_q5k_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4
     const uint sh = (uint)(si & 1) * 4u;
     NF_GLOBAL const uchar* q = bp + NF_Q5K_QS + (si >> 1) * 32 + (ltid & 3) * 8;
     NF_GLOBAL const uchar* qh = bp + NF_Q5K_QH + (ltid & 3) * 8;
-    *w0 = dl * (nf_kq_bits4(q, sh, 0xFu) + 16.0f * nf_kq_bits4(qh, (uint)si, 1u)) - ml;
-    *w1 = dl * (nf_kq_bits4(q + 4, sh, 0xFu) + 16.0f * nf_kq_bits4(qh + 4, (uint)si, 1u)) - ml;
+    *w0 = dl * (nf_kq_bits4a(q, sh, 0xFu) + 16.0f * nf_kq_bits4a(qh, (uint)si, 1u)) - ml;
+    *w1 = dl * (nf_kq_bits4a(q + 4, sh, 0xFu) + 16.0f * nf_kq_bits4a(qh + 4, (uint)si, 1u)) - ml;
 }
 NF_KQ_DOT_PAIR(Q5_K, nf_q5k_w8)
 NF_INLINE float Q5_K_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, int i) {
@@ -194,8 +209,8 @@ NF_INLINE void nf_q6k_w8(NF_GLOBAL const uchar* bp, int ltid, float4* w0, float4
     const uint qlsh = (uint)(t >> 1) * 4u, qhsh = (uint)t * 2u;
     NF_GLOBAL const uchar* ql = bp + NF_Q6K_QL + hf * 64 + (t & 1) * 32 + l0;
     NF_GLOBAL const uchar* qh = bp + NF_Q6K_QH + hf * 32 + l0;
-    *w0 = dl * (nf_kq_bits4(ql, qlsh, 0xFu) + 16.0f * nf_kq_bits4(qh, qhsh, 3u) - 32.0f);
-    *w1 = dl * (nf_kq_bits4(ql + 4, qlsh, 0xFu) + 16.0f * nf_kq_bits4(qh + 4, qhsh, 3u) - 32.0f);
+    *w0 = dl * (nf_kq_bits4w(ql, qlsh, 0xFu) + 16.0f * nf_kq_bits4w(qh, qhsh, 3u) - 32.0f);
+    *w1 = dl * (nf_kq_bits4w(ql + 4, qlsh, 0xFu) + 16.0f * nf_kq_bits4w(qh + 4, qhsh, 3u) - 32.0f);
 }
 NF_KQ_DOT_PAIR(Q6_K, nf_q6k_w8)
 NF_INLINE float Q6_K_decode_elem(NF_GLOBAL const uchar* w, int dim, int tok, int i) {

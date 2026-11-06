@@ -67,6 +67,13 @@ public final class ResidualResolver {
             int i = 2 * (il + 1);
             b.depthScales(beamBranchScale(i), beamStreamScale(i), beamBranchScale(i + 1), beamStreamScale(i + 1));
         }
+        if (kind == ResidualKind.SLERP) {
+            if (arch != Arch.DORY) {
+                throw new IllegalStateException(arch.ggufName() + ": no slerp-residual schedule");
+            }
+            b.slerp(weight(il, TensorNames.ATTN_SLERP_ALPHA), weight(il, TensorNames.FFN_SLERP_ALPHA),
+                    hp.slerpAlphaScale());
+        }
         if (arch == Arch.DECI) {
             b.discardLayerOutput(hp.nFf(il) == 0);
             b.mixerResidual(hp.nHead(il) != 0);

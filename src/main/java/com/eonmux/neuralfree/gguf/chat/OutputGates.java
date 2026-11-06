@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.chat;
 
+import com.eonmux.neuralfree.gguf.chat.response.ResponseTemplate;
+import com.eonmux.neuralfree.gguf.chat.response.TemplateParsing;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
 import com.eonmux.neuralfree.gguf.grammar.ConstraintGate;
 import com.eonmux.neuralfree.gguf.grammar.GrammarTriggers;
@@ -13,6 +15,9 @@ import java.util.Arrays;
  *
  * <ul>
  *   <li>a thinking-tag model whose rendered prompt leaves reasoning open: after its reasoning end tag;</li>
+ *   <li>a response-template model ({@code hf}, {@code beam}) whose reasoning is not over at the prompt's end
+ *       ({@link TemplateParsing#reasoningEnded}): after its thinking region's literal closer; a closer only a pattern
+ *       spells, or a repeating thinking region, cannot gate and is refused by name;</li>
  *   <li>gpt-oss: after the {@code <|channel|>final} header, an optional {@code <|constrain|>} type included;</li>
  *   <li>Muse: after the header of the message addressed to the user;</li>
  *   <li>otherwise none: the constraint holds from the first token.</li>
@@ -33,6 +38,9 @@ public final class OutputGates {
     public static ConstraintGate forChat(ReasoningFilter reasoning, String renderedPrompt, String chatTemplate) {
         switch (reasoning.mode()) {
             case THINK_TAGS:
+                if (reasoning.responseTemplate() != null) {
+                    return templateGate(reasoning.responseTemplate(), renderedPrompt);
+                }
                 return opensReasoning(reasoning, renderedPrompt)
                         ? ConstraintGate.afterWords(reasoning.endTags()) : null;
             case HARMONY_CHANNELS:
@@ -40,6 +48,25 @@ public final class OutputGates {
             default:
                 return null;
         }
+    }
+
+    /**
+     * The gate of a response-template model: none without reasoning parsing or once its reasoning is over, else its
+     * thinking closer.
+     *
+     * @throws IllegalArgumentException when the thinking region repeats or closes only with a pattern
+     */
+    private static ConstraintGate templateGate(TemplateParsing parsing, String renderedPrompt) {
+        if (!parsing.parsesReasoning() || parsing.reasoningEnded(renderedPrompt)) {
+            return null;
+        }
+        ResponseTemplate.Field thinking = parsing.template().field(ResponseTemplate.THINKING);
+        if (thinking.repeats() || thinking.closeLiterals() == null) {
+            throw new IllegalArgumentException("an output constraint after the reasoning needs the response_template's"
+                    + " thinking region to close once with a literal closer; the " + parsing.name() + " parser's"
+                    + " thinking region " + (thinking.repeats() ? "repeats" : "closes with a pattern"));
+        }
+        return ConstraintGate.afterWords(thinking.closeLiterals());
     }
 
     /** Whether the rendered prompt leaves a thinking-tag model inside its reasoning block. */

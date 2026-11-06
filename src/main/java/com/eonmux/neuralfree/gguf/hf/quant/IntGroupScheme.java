@@ -4,7 +4,10 @@ import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.config.QuantArgs;
 import com.eonmux.neuralfree.gguf.hf.config.QuantFormat;
+import com.eonmux.neuralfree.gguf.hf.quant.IntPacking.CodeTable;
 import com.eonmux.neuralfree.gguf.hf.quant.IntPacking.Layout;
+import com.eonmux.neuralfree.gguf.hf.quant.IntPacking.ParamTable;
+import com.eonmux.neuralfree.gguf.hf.quant.IntWeightSpec.Formula;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfTensorIndex;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
@@ -35,6 +38,10 @@ import java.util.List;
  *   <li>Quark int4 ({@link QuantFormat#INT_QUARK}): {@code weight} I32 {@code [K, N/8]} in AWQ order under
  *       {@code pack_method: reorder}, else sequential; symmetric ({@code int4}) codes and zero points are signed
  *       nibbles, so {@code nibble XOR 8} is the offset code; {@code weight_scale} {@code [G, N]}.</li>
+ *   <li>torchao ({@link QuantFormat#INT4_TORCHAO}, {@code Int4WeightOnlyConfig}): {@code weight} U8 or I8 holding
+ *       two signed int4 values per byte (element {@code 2j} in the low nibble), {@code weight_scale}
+ *       {@code [G, N]}, optional {@code weight_zero_point} {@code [G, N]}, and {@code w = q*s + z} with the codes
+ *       offset by 8 for the shared engine.</li>
  * </ul>
  *
  * <p>Targets, chosen per module from the stored values: with every zero point at {@code 2^(b-1)} (symmetric),
@@ -60,7 +67,7 @@ public final class IntGroupScheme {
     /** True for the formats this scheme rewrites. */
     public static boolean handles(QuantFormat f) {
         return f == QuantFormat.INT_GPTQ || f == QuantFormat.INT_PACKED_CT || f == QuantFormat.INT_AWQ
-                || f == QuantFormat.INT_QUARK;
+                || f == QuantFormat.INT_QUARK || f == QuantFormat.INT4_TORCHAO;
     }
 
     /**
@@ -82,6 +89,8 @@ public final class IntGroupScheme {
                 return IntRewriteBatch.rewrite(args, modules, cfg, in, o, IntGroupScheme::packed, "weight_packed");
             case INT_AWQ:
                 return IntRewriteBatch.rewrite(args, modules, cfg, in, o, (b, m) -> nibbles(b, m, false), "qweight");
+            case INT4_TORCHAO:
+                return IntRewriteBatch.rewrite(args, modules, cfg, in, o, IntGroupScheme::torchaoInt4, "weight");
             default:
                 return IntRewriteBatch.rewrite(args, modules, cfg, in, o, (b, m) -> nibbles(b, m, true), "weight");
         }
@@ -193,6 +202,74 @@ public final class IntGroupScheme {
             }
         }
         return new long[]{v[0], v[1]};
+    }
+
+    // ------------------------------------------------------------------ torchao int4
+
+    /**
+     * torchao {@link QuantFormat#INT4_TORCHAO}: {@code weight} U8 holds two signed int4 values per byte (element
+     * {@code 2j} in the low nibble), {@code weight_scale} is a float per group in {@code [G, N]} order and
+     * {@code weight_zero_point} the float zero point {@code z} of {@code w = q*s + z}. Codes are offset to
+     * {@code q + 8} so the shared engine sees 0..15; an absent zero point is the symmetric {@code z = 0}.
+     */
+    private static RowSource torchaoInt4(IntRewriteBatch b, IntModuleTensors m) throws IOException {
+        if (b.args().bits() != 4) {
+            throw b.unsupported(b.args().bits() + "-bit torchao weights");
+        }
+        RowSource w = m.take("weight");
+        m.requireDtype(w, "weight", StDType.U8, StDType.I8);
+        int experts = m.experts(w, 2, "weight");
+        long[] ws = m.tail(w, experts, 2, "weight");
+        long n = ws[0];
+        int k = m.width(ws[1] * 2, "weight");
+        int g = b.groupSize(k);
+        int groups = IntWeightSpec.groupCount(k, g);
+        RowSource sc = m.take("weight_scale");
+        IntWeightSpec.Builder s = IntWeightSpec.builder(m, experts, n, k, 4, g, groups);
+        s.codes = torchaoNibbles(w, n, k);
+        s.scaleDtype = m.requireFloat(sc, "weight_scale");
+        ParamTable scales = m.groupMajor(sc, experts, n, groups, "weight_scale");
+        s.scales = scales;
+        RowSource zp = m.takeOptional("weight_zero_point");
+        s.formula = Formula.MUL_ADD;
+        if (zp != null) {
+            m.requireFloat(zp, "weight_zero_point");
+            ParamTable zeros = m.groupMajor(zp, experts, n, groups, "weight_zero_point");
+            s.zeros = new ParamTable(false, (e, n0, count, out) -> {
+                scales.read(e, n0, count, out);
+                float[] z = new float[count * groups];
+                zeros.read(e, n0, count, z);
+                for (int i = 0; i < out.length; i++) {
+                    out[i] = z[i] - 8.0f * out[i];
+                }
+            });
+        } else {
+            // No stored zero point: the affine bias of the offset codes is -8 * scale.
+            s.zeros = new ParamTable(false, (e, n0, count, out) -> {
+                scales.read(e, n0, count, out);
+                for (int i = 0; i < out.length; i++) {
+                    out[i] = -8.0f * out[i];
+                }
+            });
+        }
+        IntWeightSpec spec = s.build();
+        float[] pre = w.inputPreScale();
+        if (pre != null) {
+            return b.finishPreScaled(m, spec, pre, "activation pre-scale");
+        }
+        return b.finish(m, spec);
+    }
+
+    /** Two signed int4 per U8 byte, element {@code 2j} in the low nibble; code {@code nibble XOR 8}. */
+    private static CodeTable torchaoNibbles(RowSource w, long n, int k) {
+        return new CodeTable(true, (e, n0, count, out) -> {
+            java.nio.ByteBuffer buf = IntPacking.rows(w, e * n + n0, count);
+            for (int i = 0; i < count * k; i += 2) {
+                int v = buf.get(i / 2) & 0xFF;
+                out[i] = (byte) ((v & 0xF) ^ 0x8);
+                out[i + 1] = (byte) (((v >>> 4) & 0xF) ^ 0x8);
+            }
+        });
     }
 
     // ------------------------------------------------------------------ AWQ and Quark int4

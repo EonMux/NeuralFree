@@ -63,7 +63,7 @@ public class GpuLoraDeltasTest {
 
     // ------------------------------------------------------------------ emulated kernels
 
-    /** LLM_SwitchedLoraAdd (heads.cl): stage 0 {@code tmp = A[s] x}, stage 1 {@code y += B[s] tmp}. */
+    /** LLM_SwitchedLoraAdd (heads.cl): stage 0 {@code tmp = A[s] x}, stage 1 {@code y += scale * B[s] tmp}. */
     private static void switchedLoraAdd(Dispatch d) {
         int n = d.intArg(0);
         int in = d.intArg(1);
@@ -76,12 +76,13 @@ public class GpuLoraDeltasTest {
         int yStride = d.intArg(8);
         int yOff = d.intArg(9);
         int tmpOff = d.intArg(10);
-        FakeGpuBuffer slots = d.bufferArg(11);
-        FakeGpuBuffer a = d.bufferArg(12);
-        FakeGpuBuffer b = d.bufferArg(13);
-        FakeGpuBuffer x = d.bufferArg(14);
-        FakeGpuBuffer tmp = d.bufferArg(15);
-        FakeGpuBuffer y = d.bufferArg(16);
+        float scale = d.floatArg(11);
+        FakeGpuBuffer slots = d.bufferArg(12);
+        FakeGpuBuffer a = d.bufferArg(13);
+        FakeGpuBuffer b = d.bufferArg(14);
+        FakeGpuBuffer x = d.bufferArg(15);
+        FakeGpuBuffer tmp = d.bufferArg(16);
+        FakeGpuBuffer y = d.bufferArg(17);
         for (int t = 0; t < n; t++) {
             int s = Math.max(0, Math.min(nSlots - 1, slots.getInt(t)));
             if (stage == HeadsKernels.LORA_STAGE_DOWN) {
@@ -95,11 +96,11 @@ public class GpuLoraDeltasTest {
             } else {
                 for (int o = 0; o < out; o++) {
                     long at = yOff + (long) t * yStride + o;
-                    float acc = y.getFloat(at);
+                    float sum = 0f;
                     for (int r = 0; r < rank; r++) {
-                        acc += b.getFloat(((long) s * out + o) * rank + r) * tmp.getFloat(tmpOff + (long) t * rank + r);
+                        sum += b.getFloat(((long) s * out + o) * rank + r) * tmp.getFloat(tmpOff + (long) t * rank + r);
                     }
-                    y.putFloat(at, acc);
+                    y.putFloat(at, y.getFloat(at) + scale * sum);
                 }
             }
         }
@@ -191,7 +192,7 @@ public class GpuLoraDeltasTest {
         FakeGpuBuffer yb = floats(y0);
         try (AutoCloseable delta = GpuLoraDeltas.of(ops, a.delta(Q, 0.5f))) {
             backend.clearLog();
-            ((GpuProjectionDeltas.Delta) delta).add(n, xb, xOff, xStride, yb, yOff, yStride);
+            ((GpuProjectionDeltas.Delta) delta).add(1.0f, n, xb, xOff, xStride, yb, yOff, yStride);
             assertEquals(Arrays.asList(HeadsKernels.SWITCHED_LORA_ADD, HeadsKernels.SWITCHED_LORA_ADD), dispatched());
             assertArrayEquals(expected, yb.getFloats(0, expected.length), EPS);
         }
@@ -219,7 +220,7 @@ public class GpuLoraDeltasTest {
         FakeGpuBuffer yb = floats(y0);
         try (AutoCloseable delta = GpuLoraDeltas.of(ops, a.delta(UP_EXPS, 1.0f))) {
             backend.clearLog();
-            ((GpuProjectionDeltas.ExpertDelta) delta).add(nTokens, k, ints(ids), xb, xOff, true, yb, 0);
+            ((GpuProjectionDeltas.ExpertDelta) delta).add(1.0f, nTokens, k, ints(ids), 0, xb, xOff, true, yb, 0);
             assertEquals(Arrays.asList(GpuOps.COPY2D, GpuOps.COPY2D, HeadsKernels.SWITCHED_LORA_ADD,
                     HeadsKernels.SWITCHED_LORA_ADD), dispatched());
             assertEquals(pairs, backend.dispatchesOf(HeadsKernels.SWITCHED_LORA_ADD).get(0).intArg(0));
@@ -245,7 +246,7 @@ public class GpuLoraDeltasTest {
         FakeGpuBuffer yb = floats(y0);
         try (AutoCloseable delta = GpuLoraDeltas.of(ops, a.delta(UP_EXPS, 0.5f))) {
             backend.clearLog();
-            ((GpuProjectionDeltas.ExpertDelta) delta).add(1, k, ints(ids), floats(x), 0, true, yb, 0);
+            ((GpuProjectionDeltas.ExpertDelta) delta).add(1.0f, 1, k, ints(ids), 0, floats(x), 0, true, yb, 0);
             assertEquals(Arrays.asList(HeadsKernels.SWITCHED_LORA_ADD, HeadsKernels.SWITCHED_LORA_ADD), dispatched());
             assertEquals(0, backend.dispatchesOf(HeadsKernels.SWITCHED_LORA_ADD).get(0).intArg(6));
             assertArrayEquals(expected, yb.getFloats(0, expected.length), EPS);
@@ -271,7 +272,7 @@ public class GpuLoraDeltasTest {
         FakeGpuBuffer yb = floats(y0);
         try (AutoCloseable delta = GpuLoraDeltas.of(ops, a.delta(UP_EXPS, 1.0f))) {
             backend.clearLog();
-            ((GpuProjectionDeltas.ExpertDelta) delta).add(pairs / k, k, ints(ids), floats(x), 0, false, yb, 0);
+            ((GpuProjectionDeltas.ExpertDelta) delta).add(1.0f, pairs / k, k, ints(ids), 0, floats(x), 0, false, yb, 0);
             assertEquals(Arrays.asList(HeadsKernels.SWITCHED_LORA_ADD, HeadsKernels.SWITCHED_LORA_ADD), dispatched());
             assertArrayEquals(expected, yb.getFloats(0, expected.length), EPS);
         }
@@ -295,7 +296,7 @@ public class GpuLoraDeltasTest {
         FakeGpuBuffer yb = floats(y0);
         try (AutoCloseable delta = GpuLoraDeltas.of(ops, a.delta(EMBD, 2.0f))) {
             backend.clearLog();
-            ((GpuProjectionDeltas.EmbeddingDelta) delta).add(ids.length, ints(ids), yb, yOff, yStride);
+            ((GpuProjectionDeltas.EmbeddingDelta) delta).add(1.0f, ids.length, ints(ids), 0, yb, yOff, yStride);
             assertEquals(Arrays.asList(FlowKernels.GATHER_ROWS, HeadsKernels.SWITCHED_LORA_ADD), dispatched());
             assertEquals(HeadsKernels.LORA_STAGE_UP, backend.dispatchesOf(HeadsKernels.SWITCHED_LORA_ADD).get(0)
                     .intArg(HeadsKernels.ARG_LORA_STAGE));

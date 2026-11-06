@@ -110,6 +110,21 @@ public class ElementTransformsTest {
     }
 
     @Test
+    public void squeezeDimRemovesOnlyTheNamedSingletonAxis() throws IOException {
+        RowSource x = seq(4, 1, 3);
+        RowSource middle = ElementTransforms.squeezeDim(x, 1);
+        assertArrayEquals(new long[]{4, 3}, middle.shape());
+        assertArrayEquals(values(seq(4, 3)), values(middle), 0f);
+        RowSource trailing = ElementTransforms.squeezeDim(seq(4, 3, 1), -1);
+        assertArrayEquals(new long[]{4, 3}, trailing.shape());
+        assertArrayEquals(values(seq(4, 3)), values(trailing), 0f);
+        RowSource kept = ElementTransforms.squeezeDim(seq(4, 3), 0);
+        assertArrayEquals("a non-singleton axis is left alone", new long[]{4, 3}, kept.shape());
+        assertThrows(IllegalArgumentException.class, () -> ElementTransforms.squeezeDim(x, 3));
+        assertThrows(IllegalArgumentException.class, () -> ElementTransforms.squeezeDim(x, -4));
+    }
+
+    @Test
     public void rowAndColumnScaling() throws IOException {
         RowSource rows = ElementTransforms.mulRowsBy(seq(2, 2, 2), new float[]{1f, -2f});
         assertArrayEquals(new float[]{0, 1, -4, -6, 4, 5, -12, -14}, values(rows), 0f);

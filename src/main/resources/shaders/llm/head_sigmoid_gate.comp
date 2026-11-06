@@ -1,0 +1,36 @@
+/* head_sigmoid_gate.comp - LLM_HeadSigmoidGate: per-head sigmoid gate over a block of rows. GLSL twin of
+ * kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n_rows, i n_head, i d_head, R x, R gate, W y).
+ *   y[r][h][d] = x[r][h][d] * sigmoid(gate[r][h])
+ * x and y [n_rows][n_head*d_head], gate [n_rows][n_head]; x and y must not overlap.
+ * Dispatch: 1-D, one invocation per (row, head), global = roundUp(n_rows*n_head, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfHgX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfHgG { float gate_in[]; };
+layout(std430, binding = 2) writeonly buffer NfHgY { float y_out[]; };
+
+layout(push_constant) uniform NfHgParams {
+    int n_rows;
+    int n_head;
+    int d_head;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.n_rows) * uint(pc.n_head)) {
+        return;
+    }
+    const uint r = idx / uint(pc.n_head);
+    const uint h = idx - r * uint(pc.n_head);
+    const float g = 1.0 / (1.0 + exp(-gate_in[idx]));
+    const uint base = (r * uint(pc.n_head) + h) * uint(pc.d_head);
+    for (int d = 0; d < pc.d_head; ++d) {
+        y_out[base + uint(d)] = x_in[base + uint(d)] * g;
+    }
+}

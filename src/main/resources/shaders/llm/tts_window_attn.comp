@@ -1,0 +1,87 @@
+/* tts_window_attn.comp - LLM_TtsWindowAttn: banded causal attention of a decoded window over the persisted
+ * key/value prefix followed by the window's rows. GLSL twin of kernels/llm/speech.cl.
+ * Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n_q, i n_head, i n_head_kv, i d_head, i prefix, i window, i base,
+ *             R q, R keys, R values, W out).
+ * Query i attends to key j when 0 <= prefix + i - j < window and j - prefix + base >= 0.
+ * q[n_q][n_head*d_head], keys[prefix+n_q][n_head_kv*d_head], out[n_q][n_head*d_head].
+ * Dispatch: 1-D, one invocation per (query row, head), global = roundUp(n_q*n_head, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfWinQ { float q_in[]; };
+layout(std430, binding = 1) readonly buffer NfWinK { float keys_in[]; };
+layout(std430, binding = 2) readonly buffer NfWinV { float values_in[]; };
+layout(std430, binding = 3) writeonly buffer NfWinO { float out_data[]; };
+
+layout(push_constant) uniform NfWinParams {
+    int n_q;
+    int n_head;
+    int n_head_kv;
+    int d_head;
+    int prefix;
+    int window;
+    int base;
+} pc;
+
+bool nf_win_valid(const int i, const int j) {
+    const int key_pos = j - pc.prefix + pc.base;
+    const int diff = pc.prefix + i - j;
+    return key_pos >= 0 && diff >= 0 && diff < pc.window;
+}
+
+float nf_win_dot(const uint q_off, const uint k_off) {
+    float dot = 0.0;
+    for (int d = 0; d < pc.d_head; ++d) {
+        dot += q_in[q_off + uint(d)] * keys_in[k_off + uint(d)];
+    }
+    return dot;
+}
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.n_q) * uint(pc.n_head)) {
+        return;
+    }
+    const int i = int(idx / uint(pc.n_head));
+    const uint h = idx - uint(i) * uint(pc.n_head);
+    const uint heads_per_kv = uint(pc.n_head / pc.n_head_kv);
+    const uint kv_head = h / heads_per_kv;
+    const uint kv_ch = uint(pc.n_head_kv) * uint(pc.d_head);
+    const int total = pc.prefix + pc.n_q;
+    const uint q_off = uint(i) * uint(pc.n_head) * uint(pc.d_head) + h * uint(pc.d_head);
+    const float scale = 1.0 / sqrt(float(pc.d_head));
+
+    float mx = -3.402823466e+38;
+    for (int j = 0; j < total; ++j) {
+        if (!nf_win_valid(i, j)) {
+            continue;
+        }
+        const float score = nf_win_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
+        mx = max(mx, score);
+    }
+    float sum = 0.0;
+    for (int j = 0; j < total; ++j) {
+        if (!nf_win_valid(i, j)) {
+            continue;
+        }
+        const float score = nf_win_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
+        sum += exp(score - mx);
+    }
+    const float inv = sum > 0.0 ? 1.0 / sum : 0.0;
+    for (int d = 0; d < pc.d_head; ++d) {
+        float acc = 0.0;
+        for (int j = 0; j < total; ++j) {
+            if (!nf_win_valid(i, j)) {
+                continue;
+            }
+            const float score = nf_win_dot(q_off, uint(j) * kv_ch + kv_head * uint(pc.d_head)) * scale;
+            acc += exp(score - mx) * values_in[uint(j) * kv_ch + kv_head * uint(pc.d_head) + uint(d)];
+        }
+        out_data[q_off + uint(d)] = acc * inv;
+    }
+}

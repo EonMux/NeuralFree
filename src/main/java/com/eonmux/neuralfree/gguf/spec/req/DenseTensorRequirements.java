@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.spec.req;
 
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement;
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement.LayerCondition;
+import com.eonmux.neuralfree.gguf.arch.TensorRequirement.ModelCondition;
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement.Scope;
 
 import java.util.ArrayList;
@@ -25,6 +26,10 @@ public final class DenseTensorRequirements {
     static final LayerCondition MOE_FFN = (hp, il) -> il < hp.nLayer() && hp.nExpert() > 0;
     /** MoE trunk layers with a shared expert ({@code n_ff_shexp > 0}). */
     static final LayerCondition MOE_SHARED_FFN = (hp, il) -> il < hp.nLayer() && hp.nExpert() > 0 && hp.nFfShexp() > 0;
+    /** Trunk layers that are attention blocks (Dory's {@code layer_types} is not "mlp"). */
+    static final LayerCondition ATTENTION_ONLY = (hp, il) -> il < hp.nLayer() && !hp.isMlpLayer(il);
+    /** Trunk layers that are MLP-only blocks (Dory's {@code layer_types} entry "mlp"). */
+    static final LayerCondition MLP_ONLY = (hp, il) -> il < hp.nLayer() && hp.isMlpLayer(il);
 
     private static final String LAYER_PREFIX = "blk.%d.";
 
@@ -55,6 +60,14 @@ public final class DenseTensorRequirements {
         Builder modelOptional(String... names) {
             for (String n : names) {
                 out.add(TensorRequirement.modelOptional(n));
+            }
+            return this;
+        }
+
+        /** Model-level tensors required only when {@code cond} holds for the loaded hparams. */
+        Builder modelWhen(ModelCondition cond, String... names) {
+            for (String n : names) {
+                out.add(TensorRequirement.modelWhen(cond, n));
             }
             return this;
         }

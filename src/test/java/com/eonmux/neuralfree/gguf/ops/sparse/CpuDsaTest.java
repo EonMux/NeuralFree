@@ -237,9 +237,17 @@ public class CpuDsaTest {
         SparseKernels.checkIndexerCache(KvDType.F16, 100);
         SparseKernels.checkIndexerCache(KvDType.F32, 7);
         expectFailure(() -> SparseKernels.checkIndexerCache(KvDType.Q8_0, 80));
-        assertEquals(1 + 3 * KvDType.all().size(), SparseKernels.ALL.size());
-        for (KvDType t : KvDType.all()) {
-            assertTrue(SparseKernels.ALL.contains(SparseKernels.indexerScore(t)));
+        long sparse = KvDType.kernelTypes().stream().filter(t -> !t.perTokenHead() && t.hasSparseKernel())
+                .count();
+        assertEquals(3 + 3 * sparse, SparseKernels.ALL.size());
+        for (KvDType t : KvDType.kernelTypes()) {
+            if (!t.hasSparseKernel()) {
+                // vendor formats: the sparse family refuses them by name and carries no variant for them
+                expectFailure(() -> SparseKernels.indexerScore(t));
+                assertFalse(SparseKernels.ALL.contains(t.kernel(SparseKernels.DSA_INDEXER_SCORE_PREFIX)));
+            } else {
+                assertEquals(!t.perTokenHead(), SparseKernels.ALL.contains(SparseKernels.indexerScore(t)));
+            }
         }
         assertEquals("LLM_DSA_IndexerScore_Q5_0", SparseKernels.indexerScore(KvDType.Q5_0));
         expectFailure(() -> SparseKernels.checkIndexerCache(KvDType.Q4_1, 80));

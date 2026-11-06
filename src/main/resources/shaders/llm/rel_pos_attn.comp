@@ -1,0 +1,107 @@
+/* rel_pos_attn.comp - LLM_RelPosAttn, the windowed softmax attention with the decomposed
+ * relative-position bias of the DeepSeek-OCR SAM backbone. GLSL twin of kernels/llm/vision.cl (the
+ * semantic reference). Requires: common/nf_common.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i groups, i side, i n_head, i dh, f scale, i q_stride, i kv_stride, i out_stride,
+ *    i q_off, i kv_off, i out_off, R q, R k, R v, R rw, R rh, W out)
+ *     groups attention groups of side*side token rows; the score of query tq of group g against key tk
+ *     (qx = tq % side, qy = tq / side, kx, ky alike), head h reading the h-th dh-wide slice of every
+ *     row, is q . k * scale + q . rw[qx - kx + side - 1] + q . rh[qy - ky + side - 1]; then the softmax
+ *     over the group's keys and the weighted value sum.
+ *
+ * Dispatch: one workgroup per (group, head, query), global = groups*n_head*side*side (exact),
+ * local = {L, 1, 1}, L a power of two <= LLM_DIMX. The probabilities of one query's keys are staged in
+ * the shared array below (NF_VISION_T_MAX floats), so side*side must not exceed it. The early return
+ * takes whole workgroups, so every reached barrier stays uniform.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/reduce.glsl"
+
+#define NF_VISION_T_MAX 4096
+
+layout(std430, binding = 0) restrict readonly buffer NfRelQ { float q_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfRelK { float k_in[]; };
+layout(std430, binding = 2) restrict readonly buffer NfRelV { float v_in[]; };
+layout(std430, binding = 3) restrict readonly buffer NfRelW { float rw_in[]; };
+layout(std430, binding = 4) restrict readonly buffer NfRelH { float rh_in[]; };
+layout(std430, binding = 5) restrict writeonly buffer NfRelOut { float out_buf[]; };
+
+layout(push_constant) uniform NfRelParams {
+    int groups;
+    int side;
+    int n_head;
+    int dh;
+    float scale;
+    int q_stride;
+    int kv_stride;
+    int out_stride;
+    int q_off;
+    int kv_off;
+    int out_off;
+} pc;
+
+shared float probs[NF_VISION_T_MAX];
+
+void main() {
+    const uint T = uint(pc.side) * uint(pc.side);
+    if (gl_WorkGroupID.x >= uint(pc.groups) * uint(pc.n_head) * T) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint gid = gl_WorkGroupID.x;
+    const uint g = gid / (uint(pc.n_head) * T);
+    const uint h = gid / T % uint(pc.n_head);
+    const uint tq = gid % T;
+    const uint qx = tq % uint(pc.side);
+    const uint qy = tq / uint(pc.side);
+    const uint q_row = uint(pc.q_off) + (g * T + tq) * uint(pc.q_stride) + h * uint(pc.dh);
+
+    float my_max = -NF_INF;
+    for (uint tk = lid; tk < T; tk += lsize) {
+        const uint kx = tk % uint(pc.side);
+        const uint ky = tk / uint(pc.side);
+        const uint k_row = uint(pc.kv_off) + (g * T + tk) * uint(pc.kv_stride) + h * uint(pc.dh);
+        float dot_kv = 0.0;
+        float dot_w = 0.0;
+        float dot_h = 0.0;
+        const int dx = int(qx) - int(kx) + pc.side - 1;
+        const int dy = int(qy) - int(ky) + pc.side - 1;
+        for (int d = 0; d < pc.dh; ++d) {
+            const float qv = q_in[q_row + uint(d)];
+            dot_kv += qv * k_in[k_row + uint(d)];
+            dot_w += qv * rw_in[uint(dx) * uint(pc.dh) + uint(d)];
+            dot_h += qv * rh_in[uint(dy) * uint(pc.dh) + uint(d)];
+        }
+        const float s = dot_kv * pc.scale + dot_w + dot_h;
+        probs[tk] = s;
+        my_max = max(my_max, s);
+    }
+    const float row_max = nf_wg_max(my_max);
+
+    float my_sum = 0.0;
+    for (uint tk = lid; tk < T; tk += lsize) {
+        const float e = exp(probs[tk] - row_max);
+        probs[tk] = e;
+        my_sum += e;
+    }
+    const float inv_sum = 1.0 / nf_wg_sum(my_sum);
+
+    for (uint tk = lid; tk < T; tk += lsize) {
+        probs[tk] *= inv_sum;
+    }
+    barrier();
+
+    for (uint d = lid; d < uint(pc.dh); d += lsize) {
+        float acc = 0.0;
+        for (uint tk = 0u; tk < T; ++tk) {
+            acc += probs[tk] * v_in[uint(pc.kv_off) + (g * T + tk) * uint(pc.kv_stride)
+                    + h * uint(pc.dh) + d];
+        }
+        out_buf[uint(pc.out_off) + (g * T + tq) * uint(pc.out_stride) + h * uint(pc.dh) + d] = acc;
+    }
+}

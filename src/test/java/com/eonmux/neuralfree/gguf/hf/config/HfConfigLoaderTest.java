@@ -294,8 +294,9 @@ public class HfConfigLoaderTest {
 
     @Test
     public void detectorNamesKeepTheConverterOrder() {
-        assertEquals(List.of("OpenJev", "ModernBertDecision", "Clef", "H2OLightning", "Lev", "Kev", "Nimble", "D1",
-                "D1Omni", "PocketTTS", "PplxDecider", "VllmD3", "VllmDecision2"), HfCheckpointDetectors.names());
+        assertEquals(List.of("OpenJev", "ModernBertDecision", "Clef", "H2OLightning", "Lev", "Kev", "Nimble",
+                "Lfm3D1", "D1", "D1Omni", "PocketTTS", "PplxDecider", "Soprano", "VllmD3", "VllmDecision2"),
+                HfCheckpointDetectors.names());
     }
 
     @Test
@@ -332,6 +333,38 @@ public class HfConfigLoaderTest {
         Path plain = dir();
         write(plain.resolve("config.json"), "{'architectures':['LlamaForCausalLM']}");
         assertEquals(Optional.empty(), HfCheckpointDetectors.match(plain));
+    }
+
+    @Test
+    public void sopranoCheckpointsConvertTheirQwen3BackboneAsSopranoText() throws IOException {
+        String tokens = "{'added_tokens':[{'id':0,'content':'[UNK]'},{'id':1,'content':'[TEXT]'},"
+                + "{'id':2,'content':'[START]'},{'id':3,'content':'[STOP]'}]}";
+        String config = "{'architectures':['Qwen3ForCausalLM'],'model_type':'qwen3','bos_token_id':3,"
+                + "'eos_token_id':3,'num_hidden_layers':2}";
+        Path soprano = dir();
+        write(soprano.resolve("decoder.pth"), "");
+        write(soprano.resolve("tokenizer.json"), tokens);
+        write(soprano.resolve("config.json"), config);
+        HfConfig cfg = assertDetected(soprano, "Soprano", "SopranoTextModel");
+        assertEquals(List.of("SopranoModel"), cfg.raw().raw("architectures"));
+        assertEquals(2, cfg.blockCount());
+
+        Path noDecoder = dir();
+        write(noDecoder.resolve("tokenizer.json"), tokens);
+        write(noDecoder.resolve("config.json"), config);
+        assertEquals(Optional.empty(), HfCheckpointDetectors.match(noDecoder));
+
+        Path otherIds = dir();
+        write(otherIds.resolve("decoder.pth"), "");
+        write(otherIds.resolve("tokenizer.json"), tokens);
+        write(otherIds.resolve("config.json"), config.replace("'eos_token_id':3", "'eos_token_id':2"));
+        assertEquals(Optional.empty(), HfCheckpointDetectors.match(otherIds));
+
+        Path otherTokens = dir();
+        write(otherTokens.resolve("decoder.pth"), "");
+        write(otherTokens.resolve("tokenizer.json"), tokens.replace("[STOP]", "[END]"));
+        write(otherTokens.resolve("config.json"), config);
+        assertEquals(Optional.empty(), HfCheckpointDetectors.match(otherTokens));
     }
 
     @Test

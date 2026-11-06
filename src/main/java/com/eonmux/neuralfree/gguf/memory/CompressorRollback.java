@@ -40,6 +40,28 @@ public final class CompressorRollback {
         return snapshots;
     }
 
+    /** The tokens of the step whose rollback snapshots the planes hold. */
+    public int lastStepTokens() {
+        return lastStepTokens;
+    }
+
+    /** Whether the state stood after a rollback (no new step had run since). */
+    public boolean pending() {
+        return pending;
+    }
+
+    /**
+     * Restores the record a {@link CompressedStateCopy} carried, so a sequence that resumes from a context
+     * checkpoint rolls back exactly as the captured state allowed.
+     */
+    public void restoreFrom(int lastStepTokens, boolean pending) {
+        if (lastStepTokens < 0) {
+            throw new IllegalArgumentException("a rollback record's last step is non-negative, got " + lastStepTokens);
+        }
+        this.lastStepTokens = lastStepTokens;
+        this.pending = pending;
+    }
+
     /** Records a step of {@code nTokens} tokens: its snapshots replace the previous ones and any rollback is done. */
     public void onStep(int nTokens) {
         if (nTokens < 1) {

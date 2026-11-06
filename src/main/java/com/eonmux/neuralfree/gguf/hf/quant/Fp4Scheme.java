@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.hf.quant;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.GgufCompatConverter;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig;
@@ -31,19 +32,22 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * Rewrites the 4-bit and 6-bit float formats into the §1.5 targets:
+ * Rewrites the 4-bit and 6-bit float formats into their GGUF targets:
  * <ul>
  *   <li>NVFP4 (compressed-tensors {@code weight_packed}/{@code weight_global_scale}, ModelOpt and petit
- *       {@code weight}/{@code weight_scale_2}): NVFP4 blocks when {@code K % 64 == 0}, with the global multiplier as
- *       the output scale (compressed-tensors stores its divisor) and the activation global scale as the input
- *       multiplier; otherwise the float fallback.</li>
+ *       {@code weight}/{@code weight_scale_2}, Quark {@code weight}/{@code weight_scale_2}/{@code input_scale_2}):
+ *       NVFP4 blocks when {@code K % 64 == 0}, with the global multiplier as the output scale (compressed-tensors
+ *       stores its divisor) and the activation global scale as the input multiplier; otherwise the float
+ *       fallback.</li>
  *   <li>MXFP4 (compressed-tensors and Quark {@code weight_packed}/{@code weight} with E8M0 {@code weight_scale},
  *       DeepSeek-V4 experts with {@code scale}, gpt-oss {@code _blocks}/{@code _scales}): MXFP4 blocks, the E8M0
  *       byte copied.</li>
  *   <li>MXFP6 (Quark OCP-MX E2M3 or E3M2, four 6-bit codes per three bytes): MXFP6_E2M3 / MXFP6_E3M2 blocks,
  *       a zero-copy repack of the codes (the codes carry the OCP-MX element order, so 24 bytes per 32-element
  *       block copy unchanged) with the E8M0 scale of each block as its header byte; {@code e == 0xFF} is the
- *       NaN reservation and is rejected at load. A GGUF COMPAT export converts to BF16 (GgufCompatConverter).
+ *       NaN reservation and is rejected at load, as is an exponent above 252 (E2M3) or 250 (E3M2), whose largest
+ *       block value overflows f32 on decode (and which a quantizer of f32 or bf16 values never chooses). A GGUF
+ *       COMPAT export converts to BF16 (GgufCompatConverter).
  *       A gpt-oss-style blocks/scales layout is not defined for FP6: Quark's {@code weight}/{@code weight_scale}
  *       keeps the only mapping.</li>
  * </ul>
@@ -63,7 +67,8 @@ public final class Fp4Scheme {
     /** True for the NVFP4, MXFP4 and MXFP6 formats. */
     public static boolean handles(QuantFormat f) {
         switch (f) {
-            case NVFP4_CT: case NVFP4_MODELOPT: case MXFP4_CT: case MXFP4_DSV4: case MXFP4_GPTOSS: case MXFP6:
+            case NVFP4_CT: case NVFP4_MODELOPT: case NVFP4_QUARK: case MXFP4_CT: case MXFP4_DSV4: case MXFP4_GPTOSS:
+            case MXFP6:
                 return true;
             default:
                 return false;
@@ -101,6 +106,7 @@ public final class Fp4Scheme {
             switch (args.format()) {
                 case NVFP4_CT: nvfp4(ctx, m, true); break;
                 case NVFP4_MODELOPT: nvfp4(ctx, m, false); break;
+                case NVFP4_QUARK: nvfp4Quark(ctx, m); break;
                 case MXFP4_CT: mxfp4(ctx, m, "weight_scale", "weight_packed", "weight"); break;
                 case MXFP4_DSV4: mxfp4(ctx, m, "scale", "weight"); break;
                 case MXFP4_GPTOSS: gptOss(ctx, m); break;
@@ -193,7 +199,25 @@ public final class Fp4Scheme {
     // ------------------------------------------------------------------ NVFP4
 
     private static void nvfp4(Ctx ctx, Module m, boolean ct) throws IOException {
-        String wSuffix = ct ? "weight_packed" : "weight";
+        nvfp4(ctx, m, ct ? "weight_packed" : "weight", ct ? "weight_global_scale" : "weight_scale_2", ct,
+                ct ? "input_global_scale" : "input_scale");
+    }
+
+    /** Quark NVFP4: the same weight and global weight scale names as ModelOpt, with {@code input_scale_2}. */
+    private static void nvfp4Quark(Ctx ctx, Module m) throws IOException {
+        nvfp4(ctx, m, "weight", "weight_scale_2", false, "input_scale_2");
+    }
+
+    /**
+     * The NVFP4 rewrite shared by its checkpoint families.
+     *
+     * @param wSuffix      the packed weight tensor suffix
+     * @param globalSuffix the global weight scale tensor suffix
+     * @param invert       true when the global scales store divisors (compressed-tensors), false when multipliers
+     * @param inputScales  the activation global scale suffixes, first present wins
+     */
+    private static void nvfp4(Ctx ctx, Module m, String wSuffix, String globalSuffix, boolean invert,
+                              String... inputScales) throws IOException {
         RowSource w = packedWeight(ctx, m, wSuffix, "weight_scale");
         if (w == null) {
             return;
@@ -211,11 +235,10 @@ public final class Fp4Scheme {
         RowSource s = ctx.in.get(sName);
         checkScaleDtype(s, sName, StDType.F8_E4M3, StDType.U8);
         g.checkRows(s, sName, g.k / NV_SUB);
-        String globalSuffix = ct ? "weight_global_scale" : "weight_scale_2";
         RowSource global = m.require(globalSuffix);
         String gName = m.name(globalSuffix);
         float[] stored = Fp4Packing.readPerExpert(global, gName, g.experts);
-        float[] mult = ct ? Fp4Packing.reciprocal(stored, gName) : stored;
+        float[] mult = invert ? Fp4Packing.reciprocal(stored, gName) : stored;
         Bytes packed = (f, c) -> Fp4Packing.readRows(w, f, c);
         Bytes scales = (f, c) -> Fp4Packing.readRows(s, f, c);
         boolean rowLocal = w.rowLocal() && s.rowLocal();
@@ -233,8 +256,7 @@ public final class Fp4Scheme {
             src = nvfp4Floats(ctx.describe(m, fb), g, packed, scales, sName, mult, fb, rowLocal);
         }
         String out = m.outputName(wSuffix);
-        ctx.rw.put(out, Fp4Packing.activation(ctx.args, m, ctx.in, ctx.rw, src, g.experts, ct,
-                ct ? "input_global_scale" : "input_scale"));
+        ctx.rw.put(out, Fp4Packing.activation(ctx.args, m, ctx.in, ctx.rw, src, g.experts, invert, inputScales));
         if (!wName.equals(out)) {
             ctx.rw.consume(wName);
         }
@@ -413,7 +435,9 @@ public final class Fp4Scheme {
             throw new GgufFormatException("MXFP6 weight " + wName + " must be packed U8");
         }
         final boolean e2m3 = ctx.fp6E2m3();
-        GGMLType target = e2m3 ? GGMLType.MXFP6_E2M3 : GGMLType.MXFP6_E3M2;
+        final GGMLType target = e2m3 ? GGMLType.MXFP6_E2M3 : GGMLType.MXFP6_E3M2;
+        final int maxExp = e2m3 ? GgufCompatConverter.MXFP6_E2M3_MAX_EXPONENT
+                : GgufCompatConverter.MXFP6_E3M2_MAX_EXPONENT;
         Geometry g = Geometry.packed(w.shape(), 3, 4, wName);
         if (g.k % MX != 0) {
             throw new GgufFormatException("MXFP6 weight " + wName + " has K = " + g.k + ", not a multiple of 32");
@@ -432,7 +456,13 @@ public final class Fp4Scheme {
                         long row = first + i;
                         for (int b = 0; b < sc; b++) {
                             // the E8M0 scale becomes the block's header byte; 0xFF is the NaN reservation
-                            dst.put((byte) Fp4Packing.checkE8m0(e[i * sc + b], sName, row, b));
+                            int exp = Fp4Packing.checkE8m0(e[i * sc + b], sName, row, b);
+                            if (exp > maxExp) {
+                                throw new IOException("tensor " + sName + " row " + row + " block " + b
+                                        + ": E8M0 exponent " + exp + " overflows f32 for " + target
+                                        + " (at most " + maxExp + ")");
+                            }
+                            dst.put((byte) exp);
                             // the codes carry the OCP-MX element order: the 24 block bytes copy unchanged
                             dst.put(p, i * kb + b * 24, 24);
                         }

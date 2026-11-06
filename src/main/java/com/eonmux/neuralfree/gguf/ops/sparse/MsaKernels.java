@@ -66,8 +66,8 @@ public final class MsaKernels {
         List<String> all = new ArrayList<>();
         all.add(MSA_BLOCK_SCORE);
         all.add(MSA_GATHER_ATTN);
-        all.addAll(KvDType.kernelVariants(QSA_KPOOL_UPDATE_PREFIX));
-        all.addAll(KvDType.kernelVariants(QSA_KPOOL_SCORE_PREFIX));
+        all.addAll(KvDType.kernelVariants(QSA_KPOOL_UPDATE_PREFIX, t -> !t.perTokenHead() && t.hasSparseKernel()));
+        all.addAll(KvDType.kernelVariants(QSA_KPOOL_SCORE_PREFIX, t -> !t.perTokenHead() && t.hasSparseKernel()));
         ALL = Collections.unmodifiableList(all);
     }
 

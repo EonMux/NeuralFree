@@ -15,7 +15,6 @@ import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
-import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfVocabWriters;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.PreNameResolver;
 
@@ -262,11 +261,11 @@ public final class HfBailingV3Hooks {
                 throw new GgufFormatException("unexpected f_proj on full-attention layer " + bid
                         + " (tensor '" + name + "')");
             }
-            out.add(ctx.names().ggufName(TensorNames.SSM_F_A, bid, WEIGHT), s);
+            out.add(ctx.names().ggufName("SSM_F_A", bid, WEIGHT), s);
             return;
         } else if (name.endsWith(".attention.g_proj.weight")) {
             int bid = HfHookSupport.layerOf(name);
-            String tensor = isFullAttention(cfg, bid) ? TensorNames.ATTN_GATE : TensorNames.SSM_G_A;
+            String tensor = isFullAttention(cfg, bid) ? "ATTN_GATE" : "SSM_G_A";
             out.add(ctx.names().ggufName(tensor, bid, WEIGHT), s);
             return;
         } else if (name.contains(".mlp.experts.")) {
@@ -301,8 +300,8 @@ public final class HfBailingV3Hooks {
                     + qkNope + " key and " + vHead + " value rows: " + e.getMessage(), e);
         }
         int bid = HfHookSupport.layerOf(hfName);
-        out.add(ctx.names().ggufName(TensorNames.ATTN_K_B, bid, WEIGHT), kvB[0]);
-        out.add(ctx.names().ggufName(TensorNames.ATTN_V_B, bid, WEIGHT), kvB[1]);
+        out.add(ctx.names().ggufName("ATTN_K_B", bid, WEIGHT), kvB[0]);
+        out.add(ctx.names().ggufName("ATTN_V_B", bid, WEIGHT), kvB[1]);
     }
 
     /** {@code bailingmoe3.py:156-172}: one collector per load buffers the experts of each layer. */

@@ -360,7 +360,10 @@ public final class SidecarDirectory implements AutoCloseable {
             this.size = size;
         }
 
-        /** The file. */
+        /**
+         * The file's name in the run directory. Where {@code DELETE_ON_CLOSE} unlinks the name as the file opens (the
+         * JDK on Unix), the name no longer exists and the file is reachable only through this sidecar.
+         */
         public Path path() {
             return path;
         }

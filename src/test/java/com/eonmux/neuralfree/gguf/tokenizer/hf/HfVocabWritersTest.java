@@ -163,6 +163,38 @@ public class HfVocabWritersTest {
                 md.get(GgufKeys.NF_TOKENIZER_TOKEN_ATTRS));
     }
 
+    /** A Metaspace BPE tokenizer.json with the given {@code prepend_scheme}. */
+    private static String metaspaceTokenizer(String scheme) {
+        return "{'added_tokens':[{'id':0,'content':'<s>','special':true},{'id':1,'content':'</s>','special':true}],"
+                + "'normalizer':null,"
+                + "'pre_tokenizer':{'type':'Metaspace','replacement':'\u2581','prepend_scheme':'" + scheme + "',"
+                + "'split':false},"
+                + "'post_processor':null,"
+                + "'decoder':{'type':'Metaspace','replacement':'\u2581','prepend_scheme':'" + scheme + "','split':false},"
+                + "'model':{'type':'BPE','unk_token':null,'byte_fallback':false,'ignore_merges':false,"
+                + "'vocab':{'<s>':0,'</s>':1,'\u2581':2,'a':3,'\u2581a':4},'merges':['\u2581 a']}}";
+    }
+
+    @Test
+    public void theMetaspaceSchemeIsWrittenAndANamedPreTokenizerKeepsTheSpecForAlways() throws IOException {
+        Path first = dir("tokenizer.json", metaspaceTokenizer("first"), "tokenizer_config.json", "{}");
+        Map<String, Object> firstMd = HfVocabWriters.gpt2(input(first, "{'vocab_size':5}"),
+                new CapturingResolver("domyn-small"));
+        assertEquals("first", firstMd.get(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME));
+        assertFalse(firstMd.containsKey(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER));
+        assertEquals(PreTokenizerSpec.PrependScheme.FIRST,
+                TokenizerVocab.fromMetadata(firstMd).metaspacePrependScheme());
+
+        Path always = dir("tokenizer.json", metaspaceTokenizer("always"), "tokenizer_config.json", "{}");
+        Map<String, Object> alwaysMd = HfVocabWriters.gpt2(input(always, "{'vocab_size':5}"),
+                new CapturingResolver("domyn-small"));
+        assertEquals("domyn-small", alwaysMd.get(GgufKeys.TOKENIZER_PRE));
+        assertEquals("always", alwaysMd.get(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME));
+        assertTrue("the exact spec applies the scheme", alwaysMd.containsKey(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER));
+        assertEquals(PreTokenizerSpec.PrependScheme.NEVER,
+                TokenizerVocab.fromMetadata(alwaysMd).metaspacePrependScheme());
+    }
+
     @Test
     public void addedTokensAreRoundTrippedThroughTheDecoder() throws IOException {
         Path dir = dir("tokenizer.json", GPT2_TOKENIZER, "tokenizer_config.json", GPT2_CONFIG);
@@ -303,6 +335,30 @@ public class HfVocabWritersTest {
         assertEquals(true, md.get(GgufKeys.TOKENIZER_NORMALIZER_LOWERCASE));
         assertEquals("WordPiece keeps the clean-up", true, md.get(GgufKeys.NF_TOKENIZER_CLEAN_SPACES));
         assertArrayEquals(new int[]{2, 4, 3}, pre.encoder.apply("hello"));
+    }
+
+    @Test
+    public void wordPieceFingerprintEncodesUnmatchedWordsWithTheModelUnkToken() throws IOException {
+        // No special-token file names [UNK], so the converter writes no unknown_token_id; its fingerprint encode
+        // (HF tokenizers) still maps an unmatched word to the WordPiece model's unk_token.
+        Path dir = dir("tokenizer.json", "{'added_tokens':[],'normalizer':null,'pre_tokenizer':null,"
+                + "'post_processor':null,'decoder':null,'model':{'type':'WordPiece','unk_token':'[UNK]',"
+                + "'continuing_subword_prefix':'##','max_input_chars_per_word':100,"
+                + "'vocab':{'[PAD]':0,'[UNK]':1,'a':2,'##x':3}}}");
+        CapturingResolver pre = new CapturingResolver(null);
+        Map<String, Object> md = HfVocabWriters.bertWpm(input(dir, "{'vocab_size':4}"), pre);
+        assertFalse(md.containsKey(GgufKeys.TOKENIZER_UNK_ID));
+        assertArrayEquals(new int[]{2, 3}, pre.encoder.apply("ax"));
+        assertArrayEquals(new int[]{1}, pre.encoder.apply("zzz"));
+    }
+
+    @Test
+    public void wordPieceVocabTxtFingerprintUsesTheBertTokenizerUnkDefault() throws IOException {
+        Path dir = dir("vocab.txt", "[PAD]\n[UNK]\na\n##x\n");
+        CapturingResolver pre = new CapturingResolver(null);
+        Map<String, Object> md = HfVocabWriters.bertWpm(input(dir, "{'vocab_size':4}"), pre);
+        assertFalse(md.containsKey(GgufKeys.TOKENIZER_UNK_ID));
+        assertArrayEquals(new int[]{1}, pre.encoder.apply("zzz"));
     }
 
     // ------------------------------------------------------------------ SentencePiece
@@ -466,8 +522,16 @@ public class HfVocabWritersTest {
         assertEquals(HfChatTemplates.bundled("llama-cpp-rwkv-world.jinja"), md.get(GgufKeys.TOKENIZER_CHAT_TEMPLATE));
     }
 
+    /** The split pattern of the tekken.json fixtures. */
+    private static final String TEKKEN_PATTERN = "\\p{L}+|\\s+";
+
     /** A tekken.json with {@code numSpecial} default special tokens, the 256 bytes and {@code extra} tokens. */
     private static String tekken(String version, int numSpecial, String... extra) {
+        return tekkenWithPattern(TEKKEN_PATTERN, version, numSpecial, extra);
+    }
+
+    /** As {@link #tekken}, with {@code pattern} as {@code config.pattern}. */
+    private static String tekkenWithPattern(String pattern, String version, int numSpecial, String... extra) {
         StringBuilder vocab = new StringBuilder();
         for (int i = 0; i < 256 + extra.length; i++) {
             byte[] bytes = i < 256 ? new byte[]{(byte) i} : extra[i - 256].getBytes(StandardCharsets.UTF_8);
@@ -475,7 +539,8 @@ public class HfVocabWritersTest {
             vocab.append("{\"rank\":").append(i).append(",\"token_bytes\":\"")
                     .append(Base64.getEncoder().encodeToString(bytes)).append("\",\"token_str\":null}");
         }
-        return "{\"config\":{\"pattern\":\"\\\\p{L}+|\\\\s+\",\"num_vocab_tokens\":" + (256 + extra.length)
+        String patternJson = pattern.replace("\\", "\\\\");
+        return "{\"config\":{\"pattern\":\"" + patternJson + "\",\"num_vocab_tokens\":" + (256 + extra.length)
                 + ",\"default_vocab_size\":" + (numSpecial + 256 + extra.length)
                 + ",\"default_num_special_tokens\":" + numSpecial + ",\"version\":\"" + version + "\"},"
                 + "\"vocab\":[" + vocab + "]}";
@@ -516,6 +581,17 @@ public class HfVocabWritersTest {
         assertEquals("[SYSTEM_PROMPT]S[/SYSTEM_PROMPT][INST]U1[/INST]A1</s>[INST]U2[/INST]",
                 formatter.format(Arrays.asList(msg("system", "S"), msg("user", "U1"), msg("assistant", "A1"),
                         msg("user", "U2")), false));
+    }
+
+    @Test
+    public void aTekkenPatternWithRightAlignedDigitTriplesSelectsTekkenNum3() throws IOException {
+        Path dir = dir();
+        write(dir, "tekken.json", tekkenWithPattern(
+                "\\p{L}+|\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))|\\p{N}{1,2}|\\s+", "v7", 20, "ab"));
+        HfVocabWriters.Input in = input(dir, "{'vocab_size':277}").withGgufArch("llama");
+        Map<String, Object> md = HfVocabWriters.mistral(in, new CapturingResolver(null));
+        assertEquals("tekken-num3", md.get(GgufKeys.TOKENIZER_PRE));
+        assertEquals(Collections.singletonList("a b"), md.get(GgufKeys.TOKENIZER_MERGES));
     }
 
     @Test

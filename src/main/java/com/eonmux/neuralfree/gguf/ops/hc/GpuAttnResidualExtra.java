@@ -101,7 +101,9 @@ public final class GpuAttnResidualExtra implements GpuLayerExtra {
         float eps = ctx.spec().hparams().normRmsEps();
 
         GpuWeights weights = ctx.weightSource().weightsFor(layer.weightLayer());
-        GpuWeight attnScore = scoreWeight(weights.layer(layer, TensorNames.weight(TensorNames.ATTN_RES_SCORE)));
+        // Layer 0 never mixes an attention score: its input is the only residual source.
+        GpuWeight attnScore = ckptBefore > 0
+                ? scoreWeight(weights.layer(layer, TensorNames.weight(TensorNames.ATTN_RES_SCORE))) : null;
         GpuWeight ffnScore = scoreWeight(weights.layer(layer, TensorNames.weight(TensorNames.FFN_RES_SCORE)));
         GpuWeight outScore = last ? scoreWeight(ctx.weights().get(TensorNames.weight(TensorNames.OUTPUT_RES_SCORE)))
                 : null;
@@ -114,7 +116,7 @@ public final class GpuAttnResidualExtra implements GpuLayerExtra {
         PreparedDispatch sf = null;
         PreparedDispatch so = null;
         try {
-            sa = prepareScore(attnScore, eps, ph);
+            sa = attnScore != null ? prepareScore(attnScore, eps, ph) : null;
             sf = prepareScore(ffnScore, eps, ph);
             so = outScore != null ? prepareScore(outScore, eps, ph) : null;
             this.mix = prepareMix(ph);

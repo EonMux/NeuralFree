@@ -123,7 +123,7 @@ public final class HfLlamaHooks {
         HfGenericMetadata.apply(ctx, kv);
         llamaKv(ctx, kv, true);
         if (ctx.arch() == Arch.EAGLE3) {
-            HfEagle3Hooks.meta(ctx, kv);
+            HfEagle3Hooks.meta(ctx, kv, plan);
         }
     }
 

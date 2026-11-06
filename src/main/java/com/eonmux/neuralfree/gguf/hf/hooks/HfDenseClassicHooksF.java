@@ -28,10 +28,10 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Hooks of the llama.cpp classic-dense converter classes of Appendix A table HK-D1, part F: the tail of the former
+ * Hooks of the llama.cpp classic-dense converter classes, part F: the tail of the former
  * part E over {@code Spark2_5Model} (spark2_5.py:14-64), {@code Phi2Model} (phi.py:18-39), {@code StarCoder2Model}
  * (LC/conversion/starcoder.py:24-27), {@code TalkieModel} (talkie.py:15-53), {@code XverseModel} (xverse.py:15-86)
- * and {@code GraniteSwitchModel} (granite.py:232-359), which composes the HK-0 {@link HfGraniteHooks} GraniteMoe
+ * and {@code GraniteSwitchModel} (granite.py:232-359), which composes the {@link HfGraniteHooks} GraniteMoe
  * hooks read-only. The leading classes of part E (from {@code InternLM2Model} to {@code PanguEmbeddedModel}) stay in
  * {@link HfDenseClassicHooksE}. <p>Every method is a public static hook reference that the table composes and
  * subclasses reuse where the converter calls {@code super()}.</p>

@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.load;
 import com.eonmux.neuralfree.gguf.GGUFValueType;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -25,8 +26,16 @@ import java.util.Objects;
  *       rejected naming the entry instead of being truncated);</li>
  *   <li>{@code float} &rarr; FLOAT32, a finite decimal literal.</li>
  * </ul>
+ * The wider scalar types of the GGUF store are accepted by name too, for the tools that edit a file's key/value
+ * store: {@code uint8}, {@code int8}, {@code uint16}, {@code int16}, {@code uint32}, {@code int64} and
+ * {@code float64}, each stored as the type its name says with its value range checked.
  * Parsers reject an entry without {@code type:value}, an unknown type, or a value of the wrong form, naming the
  * entry (and, in a CLI such as {@code LLMDemoOptions} with its own {@code --override-kv} flag, the flag).
+ *
+ * <p>The {@code --metadata} file of the converters ({@link ConverterMetadata}) builds overrides the
+ * {@code key=type:value} grammar cannot carry: UINT32, INT64 and FLOAT64 scalars ({@link Override#scalar}) and
+ * ARRAY values with an element type ({@link Override#array}). Those render informatively in
+ * {@link Override#toString()} but do not round-trip through {@link #parse(String, String)}.</p>
  */
 public final class MetadataOverrides {
 
@@ -41,12 +50,93 @@ public final class MetadataOverrides {
 
         private final String key;
         private final GGUFValueType type;
+        /** The element type of an ARRAY override, null for every scalar type. */
+        private final GGUFValueType elementType;
         private final Object value;
 
         Override(String key, GGUFValueType type, Object value) {
+            this(key, type, null, value);
+        }
+
+        private Override(String key, GGUFValueType type, GGUFValueType elementType, Object value) {
+            if (key == null || key.isEmpty()) {
+                throw new IllegalArgumentException("an override needs a key");
+            }
+            if (type == GGUFValueType.ARRAY) {
+                if (elementType == null || elementType == GGUFValueType.ARRAY) {
+                    throw new IllegalArgumentException("override of key '" + key + "': an ARRAY override needs a"
+                            + " scalar element type");
+                }
+                if (!(value instanceof List)) {
+                    throw new IllegalArgumentException("override of key '" + key + "': an ARRAY override needs a"
+                            + " list of values");
+                }
+                for (Object e : (List<?>) value) {
+                    requireRepresentation(key, elementType, e);
+                }
+            } else if (elementType != null) {
+                throw new IllegalArgumentException("override of key '" + key + "': only an ARRAY override takes an"
+                        + " element type, " + type + " takes none");
+            } else {
+                requireRepresentation(key, type, value);
+            }
             this.key = key;
             this.type = type;
+            this.elementType = elementType;
             this.value = value;
+        }
+
+        /**
+         * A scalar override of {@code type} (STRING, BOOL, INT32, UINT32, INT64, FLOAT32 or FLOAT64) whose value is
+         * the type's decoded representation: String, Boolean, Integer (INT32 and UINT32), Long, Float or Double.
+         *
+         * @throws IllegalArgumentException naming the key for another type or a value of another representation
+         */
+        public static Override scalar(String key, GGUFValueType type, Object value) {
+            return new Override(key, Objects.requireNonNull(type, "type"), null, value);
+        }
+
+        /**
+         * An ARRAY override of {@code elementType}; {@code value} is the unmodifiable copy of the element list in
+         * file order, each element in the representation {@link #scalar} takes.
+         *
+         * @throws IllegalArgumentException for an element type that is not scalar, or an element of another
+         *                                  representation
+         * @throws NullPointerException     for a null list or a null element
+         */
+        public static Override array(String key, GGUFValueType elementType, List<?> value) {
+            Objects.requireNonNull(value, "value");
+            List<Object> copy = new ArrayList<>(value.size());
+            for (Object e : value) {
+                copy.add(Objects.requireNonNull(e, "element"));
+            }
+            return new Override(key, GGUFValueType.ARRAY, elementType, Collections.unmodifiableList(copy));
+        }
+
+        /** Refuses a value that is not the decoded representation of the scalar {@code type}. */
+        private static void requireRepresentation(String key, GGUFValueType type, Object value) {
+            Class<?> expected;
+            switch (type) {
+                case STRING: expected = String.class; break;
+                case BOOL: expected = Boolean.class; break;
+                case UINT8:
+                case INT8:
+                case UINT16:
+                case INT16:
+                case INT32:
+                case UINT32: expected = Integer.class; break;
+                case INT64: expected = Long.class; break;
+                case FLOAT32: expected = Float.class; break;
+                case FLOAT64: expected = Double.class; break;
+                default:
+                    throw new IllegalArgumentException("override of key '" + key + "': " + type
+                            + " is not an override type");
+            }
+            if (!expected.isInstance(value)) {
+                throw new IllegalArgumentException("override of key '" + key + "': a " + type + " value is a "
+                        + expected.getSimpleName() + ", not " + (value == null ? "null"
+                        : value.getClass().getSimpleName()));
+            }
         }
 
         /** The metadata key, written as given (it may itself carry {@code :}). */
@@ -54,12 +144,17 @@ public final class MetadataOverrides {
             return key;
         }
 
-        /** The GGUF metadata type the override stores. */
+        /** The GGUF metadata type the override stores: ARRAY when it carries an element type. */
         public GGUFValueType type() {
             return type;
         }
 
-        /** The value in the decoded representation of {@link #type()}. */
+        /** The element type of an ARRAY override, null for every scalar type. */
+        public GGUFValueType elementType() {
+            return elementType;
+        }
+
+        /** The value in the decoded representation of {@link #type()}; the element list for an ARRAY override. */
         public Object value() {
             return value;
         }
@@ -73,28 +168,45 @@ public final class MetadataOverrides {
                 return false;
             }
             Override that = (Override) o;
-            return key.equals(that.key) && type == that.type && value.equals(that.value);
+            return key.equals(that.key) && type == that.type && elementType == that.elementType
+                    && value.equals(that.value);
         }
 
         @java.lang.Override
         public int hashCode() {
-            return Objects.hash(key, type, value);
+            return Objects.hash(key, type, elementType, value);
         }
 
-        /** The parsed form: {@code key=type:value}. */
+        /**
+         * The parsed form {@code key=type:value} of a scalar override, or the informative
+         * {@code key=array(type):[values]} of an ARRAY override (that form does not round-trip through
+         * {@link #parse(String, String)}).
+         */
         @java.lang.Override
         public String toString() {
-            StringBuilder s = new StringBuilder(key).append('=').append(typeName()).append(':');
+            StringBuilder s = new StringBuilder(key).append('=');
+            if (type == GGUFValueType.ARRAY) {
+                s.append("array(").append(typeName(elementType)).append("):");
+                return s.append(value).toString();
+            }
+            s.append(typeName(type)).append(':');
             return s.append(value).toString();
         }
 
-        private String typeName() {
-            switch (type) {
+        private String typeName(GGUFValueType t) {
+            switch (t) {
                 case STRING: return "str";
                 case BOOL: return "bool";
+                case UINT8: return "uint8";
+                case INT8: return "int8";
+                case UINT16: return "uint16";
+                case INT16: return "int16";
                 case INT32: return "int";
+                case UINT32: return "uint32";
+                case INT64: return "int64";
                 case FLOAT32: return "float";
-                default: throw new IllegalStateException(type + " is not an override type");
+                case FLOAT64: return "float64";
+                default: throw new IllegalStateException(t + " is not an override type");
             }
         }
     }
@@ -110,8 +222,8 @@ public final class MetadataOverrides {
         Objects.requireNonNull(text, what);
         String cur = text.trim();
         int eq = cur.indexOf('=');
-        if (eq <= 0) {
-            throw bad(what, cur, "there is no '=' between the key and the type");
+        if (eq < 0) {
+            throw bad(what, cur, "expected type:value after the key (" + TYPE_HELP + ")");
         }
         String key = cur.substring(0, eq).trim();
         if (key.isEmpty()) {
@@ -122,7 +234,7 @@ public final class MetadataOverrides {
         String typeName = colon < 0 ? "" : rest.substring(0, colon).trim().toLowerCase(Locale.ROOT);
         String value = colon < 0 ? "" : rest.substring(colon + 1);
         if (colon < 0) {
-            throw bad(what, cur, "expected type:value after the key (str, bool, int or float)");
+            throw bad(what, cur, "expected type:value after the key (" + TYPE_HELP + ")");
         }
         GGUFValueType type;
         Object parsed;
@@ -168,10 +280,73 @@ public final class MetadataOverrides {
                 parsed = (Object) f;
                 break;
             }
+            case "uint8":
+                type = GGUFValueType.UINT8;
+                parsed = (Object) (int) bounded(what, cur, value, 0L, 0xFFL);
+                break;
+            case "int8":
+                type = GGUFValueType.INT8;
+                parsed = (Object) (int) bounded(what, cur, value, Byte.MIN_VALUE, Byte.MAX_VALUE);
+                break;
+            case "uint16":
+                type = GGUFValueType.UINT16;
+                parsed = (Object) (int) bounded(what, cur, value, 0L, 0xFFFFL);
+                break;
+            case "int16":
+                type = GGUFValueType.INT16;
+                parsed = (Object) (int) bounded(what, cur, value, Short.MIN_VALUE, Short.MAX_VALUE);
+                break;
+            case "uint32": {
+                type = GGUFValueType.UINT32;
+                long u = bounded(what, cur, value, 0L, 0xFFFF_FFFFL);
+                parsed = (Object) (int) u;
+                break;
+            }
+            case "int64": {
+                type = GGUFValueType.INT64;
+                try {
+                    parsed = (Object) Long.valueOf(Long.parseLong(value.trim()));
+                } catch (NumberFormatException e) {
+                    throw bad(what, cur, "int64 is not an integer");
+                }
+                break;
+            }
+            case "float64": {
+                type = GGUFValueType.FLOAT64;
+                double d;
+                try {
+                    d = Double.parseDouble(value.trim());
+                } catch (NumberFormatException e) {
+                    throw bad(what, cur, "float64 is not a number");
+                }
+                if (!Double.isFinite(d)) {
+                    throw bad(what, cur, "float64 is not finite");
+                }
+                parsed = (Object) Double.valueOf(d);
+                break;
+            }
             default:
-                throw bad(what, cur, "the type '" + typeName + "' is unknown; use str, bool, int or float");
+                throw bad(what, cur, "the type '" + typeName + "' is unknown; use " + TYPE_HELP);
         }
         return new Override(key, type, parsed);
+    }
+
+    /** The {@code type} names {@link #parse} accepts, for its error messages. */
+    private static final String TYPE_HELP =
+            "str, bool, int, float, uint8, int8, uint16, int16, uint32, int64 or float64";
+
+    /** A decimal integer literal in {@code [lo, hi]}. */
+    private static long bounded(String what, String entry, String text, long lo, long hi) {
+        long v;
+        try {
+            v = Long.parseLong(text.trim());
+        } catch (NumberFormatException e) {
+            throw bad(what, entry, "the value is not an integer in [" + lo + ", " + hi + "]");
+        }
+        if (v < lo || v > hi) {
+            throw bad(what, entry, "the value " + v + " is outside [" + lo + ", " + hi + "]");
+        }
+        return v;
     }
 
     /**
@@ -192,7 +367,7 @@ public final class MetadataOverrides {
         int begin = 0;
         while (true) {
             int end = entries.indexOf(';', begin);
-            String entry = (end < 0 ? entries : entries.substring(begin, end)).trim();
+            String entry = (end < 0 ? entries.substring(begin) : entries.substring(begin, end)).trim();
             if (entry.isEmpty()) {
                 throw new IllegalArgumentException(what + " holds an empty entry between ';'");
             }

@@ -56,6 +56,12 @@ public final class HfLinearHooksB {
         MTP_EXTRA = Collections.unmodifiableMap(names);
     }
 
+    /** Converter tensor names ({@code MODEL_TENSOR}) of the tensors the Qwen4Exp hook builds itself. */
+    private static final String INDEXER_Q_PROJ = "INDEXER_Q_PROJ";
+    private static final String INDEXER_K_PROJ = "INDEXER_K_PROJ";
+    private static final String NEXTN_EH_PROJ = "NEXTN_EH_PROJ";
+    private static final String WEIGHT_SUFFIX = ".weight";
+
     private static final String PLE_SHARDS_STATE = "qwen4exp.pleShards";
     private static final String PLE_CONST_STATE = "qwen4exp.pleConstants";
     private static final String MTP_FC_STATE = "qwen4exp.mtpFc";
@@ -314,7 +320,7 @@ public final class HfLinearHooksB {
                 Collections.unmodifiableList(list));
     }
 
-    /** {@code Qwen4ExpTextModel.modify_tensors} (qwen4exp.py:130-171). */
+    /** {@code Qwen4ExpTextModel.modify_tensors} (qwen4exp.py:132-175). */
     public static void qwen4ExpTensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
         if (out.isConsumed(hfName)) {
@@ -348,9 +354,9 @@ public final class HfLinearHooksB {
                 throw new GgufFormatException("tensor '" + hfName + "' has " + src.rows()
                         + " rows: indexer_n_heads * indexer_head_dim = " + nQ + " Q rows and K rows must follow");
             }
-            out.add(ctx.names().ggufName(TensorNames.INDEXER_Q_PROJ, bid, TensorNames.WEIGHT),
+            out.add(ctx.names().ggufName(INDEXER_Q_PROJ, bid, WEIGHT_SUFFIX),
                     RowTransforms.sliceRows(src, 0, nQ));
-            out.add(ctx.names().ggufName(TensorNames.INDEXER_K_PROJ, bid, TensorNames.WEIGHT),
+            out.add(ctx.names().ggufName(INDEXER_K_PROJ, bid, WEIGHT_SUFFIX),
                     RowTransforms.sliceRows(src, nQ, src.rows() - nQ));
             return;
         }
@@ -365,11 +371,33 @@ public final class HfLinearHooksB {
         if (name.endsWith(".ple.conv1d.weight")) {
             s = ElementTransforms.squeezeConv(s);
         }
-        HfQwenLinearHooks.vReorderTensors(ctx, name, s, out);
+        HfQwenLinearHooks.vReorderTensors(ctx, name, s, HfSharedInputMerges.sink(ctx, name, out));
     }
 
     /**
-     * {@code place_ple_shard} (qwen4exp.py:175-202): the shards concatenate by index into one F32 tensor of
+     * {@code Qwen4ExpTextModel.prepare_tensors} (qwen4exp.py:250-262): neither MTP projection half, nor a merged
+     * weight half, nor a PLE shard may be left over once the checkpoint is planned.
+     */
+    public static void qwen4ExpExtra(HfLoadContext ctx, TensorSink out) {
+        Handoff fc = ctx.state(MTP_FC_STATE, Handoff.class, Handoff::new);
+        synchronized (fc) {
+            if (!fc.parts.isEmpty()) {
+                throw new GgufFormatException("MTP projection missing its other half: " + fc.parts.keySet());
+            }
+        }
+        HfSharedInputMerges.requireComplete(ctx);
+        Shards shards = ctx.state(PLE_SHARDS_STATE, Shards.class, Shards::new);
+        synchronized (shards) {
+            int nParts = ctx.config().findInt("split_ngram_parts").orElse(0);
+            if (!shards.byIndex.isEmpty() && shards.byIndex.size() != nParts) {
+                throw new GgufFormatException("got " + shards.byIndex.size() + " PLE embedding shards, expected "
+                        + nParts);
+            }
+        }
+    }
+
+    /**
+     * {@code place_ple_shard} (qwen4exp.py:212-239): the shards concatenate by index into one F32 tensor of
      * {@code per_layer_token_embd.weight}.
      */
     private static void placePleShard(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
@@ -434,7 +462,7 @@ public final class HfLinearHooksB {
         int rowDim;
     }
 
-    /** The two MTP projection halves buffered until both arrive (qwen4exp.py:146-151). */
+    /** The two MTP projection halves buffered until both arrive (qwen4exp.py:148-154). */
     private static final class Handoff {
         final Map<String, RowSource> parts = new LinkedHashMap<>();
 
@@ -451,7 +479,7 @@ public final class HfLinearHooksB {
             if (bid < 0) {
                 throw new GgufFormatException("tensor '" + hfName + "' has no layer number for its MTP head");
             }
-            out.add(ctx.names().ggufName(TensorNames.NEXTN_EH_PROJ, bid, TensorNames.WEIGHT), eh);
+            out.add(ctx.names().ggufName(NEXTN_EH_PROJ, bid, WEIGHT_SUFFIX), eh);
         }
     }
 }

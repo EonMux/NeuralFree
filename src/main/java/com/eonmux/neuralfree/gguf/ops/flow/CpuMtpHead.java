@@ -74,6 +74,14 @@ final class CpuMtpHead extends MtpHead {
         return draft;
     }
 
+    @Override
+    public String hostWeightName(CpuTensorRef weight) {
+        if (draft != null && draft.owns(weight)) {
+            return draft.describe(weight).name();
+        }
+        return ctx.weights().owns(weight) ? ctx.weights().describe(weight).name() : null;
+    }
+
     /** The target's configured kernels for its tensors, the drafter file's own for drafter tensors. */
     private CpuMatVec matVec(Source s) {
         return s == Source.TARGET ? ctx.matVec() : weights(s).matVec();
@@ -145,6 +153,19 @@ final class CpuMtpHead extends MtpHead {
         CpuRows d = cast(dst);
         checkRows(d, nRows, ubatch());
         System.arraycopy(src, 0, d.data, 0, nRows * d.width());
+    }
+
+    @Override
+    public void copyRows(Rows src, int srcRow, Rows dst, int dstRow, int n) {
+        CpuRows s = cast(src);
+        CpuRows d = cast(dst);
+        checkWidth(d, s.width(), "copy of " + s.name());
+        checkRows(s, srcRow + n, ubatch());
+        checkRows(d, dstRow + n, ubatch());
+        if (n < 1) {
+            throw new IllegalArgumentException("copy of " + n + " rows");
+        }
+        System.arraycopy(s.data, srcRow * s.width(), d.data, dstRow * d.width(), n * s.width());
     }
 
     @Override
@@ -380,6 +401,18 @@ final class CpuMtpHead extends MtpHead {
                 memory.begin(pos0, n, tokens);
                 for (CpuLayerExecutor ex : executors) {
                     ex.forward(pos0, n, r.data);
+                }
+                memory.end(pos0, n, tokens);
+            }
+
+            @Override
+            public void runKV(int pos0, int n, int[] tokens, Rows rows) {
+                CpuRows r = cast(rows);
+                checkRows(r, n, ubatch());
+                checkWidth(r, width, "draft stack");
+                memory.begin(pos0, n, tokens);
+                for (CpuLayerExecutor ex : executors) {
+                    ex.forwardKV(pos0, n, r.data);
                 }
                 memory.end(pos0, n, tokens);
             }

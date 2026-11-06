@@ -18,6 +18,9 @@ import org.lwjgl.vulkan.VkPhysicalDeviceLimits;
 import org.lwjgl.vulkan.VkPhysicalDeviceMaintenance3Properties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMaintenance4Properties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
+import org.lwjgl.vulkan.VkCooperativeMatrixPropertiesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceCooperativeMatrixFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderBfloat16FeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDevicePCIBusInfoPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
@@ -46,6 +49,13 @@ import static org.lwjgl.vulkan.AMDShaderCoreProperties2.VK_AMD_SHADER_CORE_PROPE
 import static org.lwjgl.vulkan.EXTPciBusInfo.VK_EXT_PCI_BUS_INFO_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTSubgroupSizeControl.VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_COMPONENT_TYPE_FLOAT16_KHR;
+import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_COMPONENT_TYPE_FLOAT32_KHR;
+import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+import static org.lwjgl.vulkan.KHRCooperativeMatrix.VK_SCOPE_SUBGROUP_KHR;
+import static org.lwjgl.vulkan.KHRCooperativeMatrix.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR;
+import static org.lwjgl.vulkan.KHRShaderBfloat16.VK_COMPONENT_TYPE_BFLOAT16_KHR;
+import static org.lwjgl.vulkan.KHRShaderBfloat16.VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRShaderIntegerDotProduct.VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
 import static org.lwjgl.vulkan.NVShaderSmBuiltins.VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME;
 import static org.lwjgl.vulkan.VK10.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
@@ -103,10 +113,17 @@ public final class VkPhysicalDeviceInfo {
         SHADER_FLOAT16,
         TIMELINE_SEMAPHORE,
         SUBGROUP_BROADCAST_DYNAMIC_ID,
+        VULKAN_MEMORY_MODEL,
         SUBGROUP_SIZE_CONTROL,
         COMPUTE_FULL_SUBGROUPS,
         MAINTENANCE4,
-        SHADER_INTEGER_DOT_PRODUCT
+        SHADER_INTEGER_DOT_PRODUCT,
+        COOPERATIVE_MATRIX,
+        /** {@code VkPhysicalDeviceShaderBfloat16FeaturesKHR.shaderBFloat16Type} ({@code VK_KHR_shader_bfloat16}). */
+        SHADER_BFLOAT16_TYPE,
+        /** {@code VK_KHR_shader_bfloat16} with {@code bfloat16CooperativeMatrix} and a bf16 x bf16 -> fp32
+         *  subgroup multiply-add (llama.cpp {@code coopmat_bf16_support}). */
+        SHADER_BFLOAT16_COOP_MATRIX
     }
 
     /** Immutable description of one queue family. */
@@ -702,11 +719,14 @@ public final class VkPhysicalDeviceInfo {
         }
     }
 
-    /** Features chain: Features2 → Vulkan11 → Vulkan12 → Vulkan13 (1.3) or the 1.2 extension structs. */
+    /** Features chain: Features2 → Vulkan11 → Vulkan12 → Vulkan13 (1.3) or the 1.2 extension structs,
+     *  plus the cooperative-matrix and shader-bfloat16 structs when the device lists their extensions. */
     private static void readFeatures2(Snapshot s, VkPhysicalDevice device, MemoryStack stack) {
         boolean v13 = Integer.compareUnsigned(s.apiVersion, VK_API_VERSION_1_3) >= 0;
         boolean sizeControlExt = !v13 && s.extensions.contains(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
         boolean dotProductExt = !v13 && s.extensions.contains(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+        boolean coopMatExt = s.extensions.contains(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        boolean bfloat16Ext = coopMatExt && s.extensions.contains(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
 
         VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default();
         VkPhysicalDeviceVulkan11Features v11 = VkPhysicalDeviceVulkan11Features.calloc(stack).sType$Default();
@@ -716,6 +736,10 @@ public final class VkPhysicalDeviceInfo {
                 VkPhysicalDeviceSubgroupSizeControlFeatures.calloc(stack).sType$Default();
         VkPhysicalDeviceShaderIntegerDotProductFeatures dot =
                 VkPhysicalDeviceShaderIntegerDotProductFeatures.calloc(stack).sType$Default();
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMat =
+                VkPhysicalDeviceCooperativeMatrixFeaturesKHR.calloc(stack).sType$Default();
+        VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16 =
+                VkPhysicalDeviceShaderBfloat16FeaturesKHR.calloc(stack).sType$Default();
 
         List<Struct<?>> chain = new ArrayList<>();
         chain.add(features2);
@@ -730,6 +754,12 @@ public final class VkPhysicalDeviceInfo {
         if (dotProductExt) {
             chain.add(dot);
         }
+        if (coopMatExt) {
+            chain.add(coopMat);
+        }
+        if (bfloat16Ext) {
+            chain.add(bfloat16);
+        }
         link(chain);
         vkGetPhysicalDeviceFeatures2(device, features2);
 
@@ -742,6 +772,7 @@ public final class VkPhysicalDeviceInfo {
         put(s, Feature.SHADER_FLOAT16, v12.shaderFloat16());
         put(s, Feature.TIMELINE_SEMAPHORE, v12.timelineSemaphore());
         put(s, Feature.SUBGROUP_BROADCAST_DYNAMIC_ID, v12.subgroupBroadcastDynamicId());
+        put(s, Feature.VULKAN_MEMORY_MODEL, v12.vulkanMemoryModel());
         if (v13) {
             put(s, Feature.SUBGROUP_SIZE_CONTROL, v13f.subgroupSizeControl());
             put(s, Feature.COMPUTE_FULL_SUBGROUPS, v13f.computeFullSubgroups());
@@ -755,6 +786,59 @@ public final class VkPhysicalDeviceInfo {
         if (dotProductExt) {
             put(s, Feature.SHADER_INTEGER_DOT_PRODUCT, dot.shaderIntegerDotProduct());
         }
+        put(s, Feature.COOPERATIVE_MATRIX,
+                coopMatExt && coopMat.cooperativeMatrix() && hasCoopMatF16MulAdd(device, stack));
+        put(s, Feature.SHADER_BFLOAT16_TYPE, bfloat16Ext && bfloat16.shaderBFloat16Type());
+        put(s, Feature.SHADER_BFLOAT16_COOP_MATRIX,
+                bfloat16Ext && bfloat16.shaderBFloat16CooperativeMatrix() && hasCoopMatBf16MulAdd(device, stack));
+    }
+
+    /**
+     * Whether the device supports a 16x16x16 subgroup cooperative-matrix multiply-add with the given
+     * operand and accumulator component types, not saturating (as llama.cpp ggml-vulkan.cpp:4690-4710
+     * checks before selecting its coopmat path).
+     */
+    private static boolean hasCoopMatMulAdd(VkPhysicalDevice device, MemoryStack stack, int aType, int bType) {
+        IntBuffer count = stack.mallocInt(1);
+        int rc = vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device, count, null);
+        if (rc != VK_SUCCESS || count.get(0) == 0) {
+            return false;
+        }
+        VkCooperativeMatrixPropertiesKHR.Buffer props =
+                VkCooperativeMatrixPropertiesKHR.calloc(count.get(0), stack);
+        rc = vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device, count, props);
+        if (rc != VK_SUCCESS) {
+            return false;
+        }
+        for (int i = 0; i < props.remaining(); i++) {
+            VkCooperativeMatrixPropertiesKHR p = props.get(i);
+            if (p.MSize() % 16 == 0 && p.NSize() % 16 == 0 && p.KSize() % 16 == 0
+                    && p.AType() == aType
+                    && p.BType() == bType
+                    && p.CType() == VK_COMPONENT_TYPE_FLOAT32_KHR
+                    && p.ResultType() == VK_COMPONENT_TYPE_FLOAT32_KHR
+                    && p.scope() == VK_SCOPE_SUBGROUP_KHR
+                    && !p.saturatingAccumulation()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the device supports the 16x16x16 subgroup cooperative-matrix multiply-add this engine's
+     * MMA kernels use: fp16 operands with an fp32 accumulator and result.
+     */
+    private static boolean hasCoopMatF16MulAdd(VkPhysicalDevice device, MemoryStack stack) {
+        return hasCoopMatMulAdd(device, stack, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR);
+    }
+
+    /**
+     * Whether the device supports the bfloat16 form (llama.cpp {@code coopmat_bf16_support}): bf16 x
+     * bf16 operands with an fp32 accumulator and result, under {@code VK_KHR_shader_bfloat16}.
+     */
+    private static boolean hasCoopMatBf16MulAdd(VkPhysicalDevice device, MemoryStack stack) {
+        return hasCoopMatMulAdd(device, stack, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR);
     }
 
     private static void readCoreFeatures(Snapshot s, VkPhysicalDevice device, MemoryStack stack) {

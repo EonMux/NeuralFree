@@ -85,8 +85,15 @@ NF_INLINE void nf_gemm_stage_fma(NF_LOCAL_PTR const float* a_tile, NF_LOCAL_PTR 
 
 /* ---- kernel generator ---- */
 
-#define NF_GEMM_TILED(T, ELEM, BS, BB) \
-NF_KERNEL void T##_MatMul_Tiled( \
+/*
+ * NF_GEMM_TILED_AS generates the same kernel under a caller-chosen name suffix (the {T}_MatMul_CM
+ * rows of kernels/llm/matmul_cm.cl share the body and numerics with the tiled rows); NF_GEMM_TILED
+ * is the {T}_MatMul_Tiled form.
+ */
+#define NF_GEMM_TILED(T, ELEM, BS, BB) NF_GEMM_TILED_AS(T, MatMul_Tiled, ELEM, BS, BB)
+
+#define NF_GEMM_TILED_AS(T, SUFFIX, ELEM, BS, BB) \
+NF_KERNEL void T##_##SUFFIX( \
     const int M, const int K, const int N, \
     const int x_stride, const int x_off, const int y_stride, const int y_off, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
@@ -138,6 +145,79 @@ NF_KERNEL void T##_MatMul_Tiled( \
         for (int i = 0; i < NF_GEMM_RM; i++) { \
             const int r = m0 + tx + NF_GEMM_TX * i; \
             if (r < M) y[ybase + r] = acc[i][j]; \
+        } \
+    } \
+}
+
+/*
+ * NF_GEMM_TILED_KSPLIT_AS defines the split-K twin of a named tiled row over the same tiles and
+ * arithmetic: the slice index comes from the work-group id ({ceil(M / 64) * split groups along
+ * dimension 0, slice = gid0 / ceil(M / 64)}), k runs in [slice * k_slice, min((slice + 1) * k_slice,
+ * K)) and the live [M x N] positions of the slice plane are written at
+ * partial[(slice * N + t) * M + r] (row stride M), so the host reduce (LLM_SplitK_Reduce,
+ * kernels/llm/split_k_reduce.cl) sums the planes into the strided output. The host
+ * (gguf.ops.gemm.SplitKGemmPlan) keeps k_slice a multiple of the stage depth (and, for block
+ * quantized types, of the block size, so every stage decodes whole blocks).
+ */
+#define NF_GEMM_TILED_KSPLIT_AS(T, SUFFIX, ELEM, BS, BB) \
+NF_KERNEL void T##_##SUFFIX##_KSplit( \
+    const int M, const int K, const int N, \
+    const int x_stride, const int x_off, const int k_slice, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const float* NF_RESTRICT x, \
+    NF_GLOBAL float* NF_RESTRICT partial) { \
+    NF_LOCAL float a_tile[NF_GEMM_TK * NF_GEMM_AS]; \
+    NF_LOCAL float b_tile[NF_GEMM_TK * NF_GEMM_BS]; \
+    const int lid = get_local_id(0); \
+    const int rtiles = (M + NF_GEMM_TM - 1) / NF_GEMM_TM; \
+    const int slice = (int)get_group_id(0) / rtiles; \
+    const int m0 = ((int)get_group_id(0) - slice * rtiles) * NF_GEMM_TM; \
+    const int n0 = (int)get_group_id(1) * NF_GEMM_TN; \
+    const int k0 = slice * k_slice; \
+    const int k1 = k0 + k_slice < K ? k0 + k_slice : K; \
+    const int tx = lid % NF_GEMM_TX, ty = lid / NF_GEMM_TX; \
+    const int lk = lid % NF_GEMM_TK, lr = lid / NF_GEMM_TK; \
+    const nf_i64 row_bytes = (nf_i64)(K / (BS)) * (BB); \
+    NF_GLOBAL const uchar* wrow[NF_GEMM_RM]; \
+    int wok[NF_GEMM_RM]; \
+    for (int q = 0; q < NF_GEMM_RM; q++) { \
+        const int r = m0 + lr + NF_GEMM_TX * q; \
+        wok[q] = r < M; \
+        wrow[q] = weight + (wok[q] ? (nf_i64)r * row_bytes : (nf_i64)0); \
+    } \
+    nf_i64 xrow[NF_GEMM_RN]; \
+    int xok[NF_GEMM_RN]; \
+    for (int q = 0; q < NF_GEMM_RN; q++) { \
+        const int t = n0 + lr + NF_GEMM_TX * q; \
+        xok[q] = t < N; \
+        xrow[q] = (nf_i64)x_off + (xok[q] ? (nf_i64)t * x_stride : (nf_i64)0); \
+    } \
+    float acc[NF_GEMM_RM][NF_GEMM_RN]; \
+    for (int i = 0; i < NF_GEMM_RM; i++) \
+        for (int j = 0; j < NF_GEMM_RN; j++) \
+            acc[i][j] = 0.0f; \
+    if (k0 < k1) { \
+        for (int ks = k0; ks < k1; ks += NF_GEMM_TK) { \
+            const int k = ks + lk; \
+            const int kok = k < k1; \
+            for (int q = 0; q < NF_GEMM_RM; q++) \
+                a_tile[lk * NF_GEMM_AS + lr + NF_GEMM_TX * q] = \
+                    (wok[q] && kok) ? ELEM(wrow[q], K, 0, k) : 0.0f; \
+            for (int q = 0; q < NF_GEMM_RN; q++) \
+                b_tile[lk * NF_GEMM_BS + lr + NF_GEMM_TX * q] = \
+                    (xok[q] && kok) ? x[xrow[q] + k] : 0.0f; \
+            barrier(CLK_LOCAL_MEM_FENCE); \
+            nf_gemm_stage_fma(a_tile, b_tile, tx, ty, acc); \
+            barrier(CLK_LOCAL_MEM_FENCE); \
+        } \
+    } \
+    for (int j = 0; j < NF_GEMM_RN; j++) { \
+        const int t = n0 + ty + NF_GEMM_TX * j; \
+        if (t >= N) continue; \
+        const nf_i64 ybase = (nf_i64)slice * M * N + (nf_i64)t * M; \
+        for (int i = 0; i < NF_GEMM_RM; i++) { \
+            const int r = m0 + tx + NF_GEMM_TX * i; \
+            if (r < M) partial[ybase + r] = acc[i][j]; \
         } \
     } \
 }

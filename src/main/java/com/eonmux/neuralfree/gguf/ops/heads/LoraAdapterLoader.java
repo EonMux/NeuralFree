@@ -25,13 +25,15 @@ import java.util.TreeMap;
  * <ul>
  *   <li>metadata: {@code general.type = adapter}, {@code general.architecture} equal to the base model's,
  *       {@code adapter.type = lora}, {@code adapter.lora.alpha} (0 when absent) and the jina task keys
- *       {@code adapter.lora.task_name} / {@code adapter.lora.prompt_prefix} (:203-242). An activated LoRA
- *       ({@code adapter.alora.invocation_tokens}, :225-241) is refused: its delta applies only to the tokens after
- *       an invocation sequence, a per-token mask the forward passes do not carry;</li>
+ *       {@code adapter.lora.task_name} / {@code adapter.lora.prompt_prefix} (:203-242), and the invocation
+ *       sequence of an activated LoRA ({@code adapter.alora.invocation_tokens}, :225-241), whose delta applies from
+ *       the sequence's last occurrence in a prompt on ({@code LoraPlan});</li>
  *   <li>tensors: {@code <base>.lora_a} and {@code <base>.lora_b} pairs; {@code *_norm.weight} entries are skipped and
  *       any other name is an error (:268-298); both halves must exist and the base tensor must exist (under its
  *       canonical name or a catalog alias) and not carry an input transform (PRISM Hadamard-folded, or any
- *       ACT_QUANT/PERMUTE input transform) (:323-340);</li>
+ *       ACT_QUANT/PERMUTE input transform) (:323-340). A target absent from the text model resolves against the
+ *       mmproj tensor table of {@link ModelSourceOptions#loraVisionCatalog()} instead, if one is set, and becomes a
+ *       {@link LoraAdapter.Side#VISION} pair the vision encoder and its connector apply;</li>
  *   <li>shapes (:361-375): a projection {@code W {in, out}} needs {@code A {in, r}} and {@code B {r, out}}; an expert
  *       tensor {@code W {in, out, n_expert}} needs {@code A {in, r, n_expert}} and {@code B {r, out, n_expert}}
  *       (llama.cpp checks {@code ne[0]} / {@code ne[1]} and lets {@code ggml_mul_mat_id} reject an expert-count
@@ -56,9 +58,8 @@ public final class LoraAdapterLoader {
      * {@link ModelSources#openAdapter} with {@code options}.
      *
      * @throws IOException         when the file cannot be read
-     * @throws GgufFormatException           when the metadata, the tensor names or the shapes do not form an adapter of
-     *                                       the base model
-     * @throws UnsupportedOperationException for an activated LoRA
+     * @throws GgufFormatException when the metadata, the tensor names or the shapes do not form an adapter of the
+     *                             base model
      */
     public static LoraAdapter load(String path, CpuWeights base, ModelSourceOptions options) throws IOException {
         Objects.requireNonNull(path, "path");
@@ -72,10 +73,6 @@ public final class LoraAdapterLoader {
                 throw new GgufFormatException(path + ": expect general.type to be 'adapter', but got: " + generalType);
             }
             String arch = kv.archName();
-            if (arch == null || !arch.equals(base.archName())) {
-                throw new GgufFormatException(path + ": model arch " + base.archName() + " and LoRA arch " + arch
-                        + " mismatch");
-            }
             String adapterType = kv.str(GgufKeys.ADAPTER_TYPE, "");
             if (!ADAPTER_TYPE_LORA.equals(adapterType)) {
                 throw new GgufFormatException(path + ": expect adapter.type to be 'lora', but got: " + adapterType);
@@ -88,16 +85,18 @@ public final class LoraAdapterLoader {
                             + GgufKeys.ADAPTER_ALORA_INVOCATION_TOKENS);
                 }
                 invocation = kv.u32Array(GgufKeys.ADAPTER_ALORA_INVOCATION_TOKENS);
-                if (invocation.length > 0) {
-                    throw new UnsupportedOperationException(path + ": activated LoRA ("
-                            + GgufKeys.ADAPTER_ALORA_INVOCATION_TOKENS + ", " + invocation.length + " tokens) is not"
-                            + " supported: its delta applies only after the invocation sequence, a per-token mask the"
-                            + " forward passes do not carry; use a plain LoRA adapter");
+                for (int t : invocation) {
+                    if (t < 0) {
+                        throw new GgufFormatException(path + ": " + GgufKeys.ADAPTER_ALORA_INVOCATION_TOKENS
+                                + " holds the token id " + Integer.toUnsignedString(t) + ", outside the vocabulary");
+                    }
                 }
             }
             String taskName = kv.str(GgufKeys.ADAPTER_LORA_TASK_NAME, null);
             String promptPrefix = kv.str(GgufKeys.ADAPTER_LORA_PROMPT_PREFIX, null);
-            Map<String, LoraAdapter.Pair> pairs = readPairs(path, source, base);
+            TensorCatalog vision = options.loraVisionCatalog();
+            Map<String, LoraAdapter.Pair> pairs = readPairs(path, source, base, vision);
+            requireArch(path, base, vision, arch, pairs);
             return new LoraAdapter(path, arch, alpha, taskName, promptPrefix, invocation, pairs, scalars(source));
         } finally {
             source.close();
@@ -116,8 +115,28 @@ public final class LoraAdapterLoader {
         return out;
     }
 
-    private static Map<String, LoraAdapter.Pair> readPairs(String path, ModelSource source, CpuWeights base)
-            throws IOException {
+    /**
+     * The adapter's architecture must be the text model's; an adapter whose every pair adapts the mmproj file may
+     * instead carry the mmproj file's architecture (the clip converter's name), so a tower-only adapter converts
+     * against the file it adapts.
+     */
+    private static void requireArch(String path, CpuWeights base, TensorCatalog vision, String arch,
+                                    Map<String, LoraAdapter.Pair> pairs) {
+        if (arch != null && arch.equals(base.archName())) {
+            return;
+        }
+        boolean allVision = !pairs.isEmpty() && arch != null && vision != null && arch.equals(vision.archName());
+        for (LoraAdapter.Pair p : pairs.values()) {
+            allVision &= p.side() == LoraAdapter.Side.VISION;
+        }
+        if (!allVision) {
+            throw new GgufFormatException(path + ": model arch " + base.archName() + " and LoRA arch " + arch
+                    + " mismatch");
+        }
+    }
+
+    private static Map<String, LoraAdapter.Pair> readPairs(String path, ModelSource source, CpuWeights base,
+                                                           TensorCatalog vision) throws IOException {
         Map<String, GGUFTensorInfo[]> halves = new LinkedHashMap<>();
         for (GGUFTensorInfo info : source.getTensors()) {
             String name = info.name();
@@ -139,24 +158,31 @@ public final class LoraAdapterLoader {
                     throw new GgufFormatException(path + ": LoRA tensor pair for '" + target
                             + "' is missing one component");
                 }
-                pairs.put(target, pair(path, target, a, b, base, adapter));
+                pairs.put(target, pair(path, target, a, b, base, adapter, vision));
             }
         }
         return pairs;
     }
 
     private static LoraAdapter.Pair pair(String path, String target, GGUFTensorInfo a, GGUFTensorInfo b,
-                                         CpuWeights base, CpuWeights adapter) {
+                                         CpuWeights base, CpuWeights adapter, TensorCatalog vision) {
         TensorRef model = resolve(base.catalog(), target);
+        LoraAdapter.Side side = LoraAdapter.Side.TEXT;
+        if (model == null && vision != null) {
+            model = vision.get(target);
+            side = LoraAdapter.Side.VISION;
+        }
         if (model == null) {
             throw new GgufFormatException(path + ": LoRA tensor '" + target
                     + "' does not exist in base model (hint: maybe wrong base model?)");
         }
-        CpuTensorRef view = base.get(model);
-        if (!base.of(view).transform().isIdentity() || base.inverseHadamard(view) != null) {
-            throw new GgufFormatException(path + ": LoRA tensor '" + target
-                    + "' targets a weight with an input transform (prism.hadamard or an input transform), which is"
-                    + " not supported");
+        if (side == LoraAdapter.Side.TEXT) {
+            CpuTensorRef view = base.get(model);
+            if (!base.of(view).transform().isIdentity() || base.inverseHadamard(view) != null) {
+                throw new GgufFormatException(path + ": LoRA tensor '" + target
+                        + "' targets a weight with an input transform (prism.hadamard or an input transform), which"
+                        + " is not supported");
+            }
         }
         boolean experts = model.rank() == 3;
         if (model.rank() != 2 && !experts) {
@@ -167,7 +193,8 @@ public final class LoraAdapterLoader {
             throw new GgufFormatException(path + ": LoRA tensors of '" + target + "' are " + a.rank() + "-D / "
                     + b.rank() + "-D, the base tensor is " + model.rank() + "-D (hint: maybe wrong base model?)");
         }
-        boolean embedding = target.endsWith(TensorNames.weight(TensorNames.TOKEN_EMBD));
+        boolean embedding = side == LoraAdapter.Side.TEXT
+                && target.endsWith(TensorNames.weight(TensorNames.TOKEN_EMBD));
         if (embedding && experts) {
             throw new GgufFormatException(path + ": LoRA tensor '" + target + "' is a 3-D token embedding table");
         }
@@ -198,14 +225,15 @@ public final class LoraAdapterLoader {
         LoraAdapter.Target kind = embedding ? LoraAdapter.Target.EMBEDDING
                 : experts ? LoraAdapter.Target.EXPERTS : LoraAdapter.Target.PROJECTION;
         int nExpert = experts ? HeadsBlocks.toInt(model.ne(2), target) : 1;
-        return new LoraAdapter.Pair(target, kind, in, out, rank, nExpert, decode(adapter, a), decode(adapter, b));
+        return new LoraAdapter.Pair(target, kind, side, in, out, rank, nExpert, decode(adapter, a),
+                decode(adapter, b));
     }
 
     /**
      * The base tensor an adapter name targets: the stored tensor or its model-level alias, else, for a main-stack
      * name {@code blk.<il>.<suffix>}, its Hugging Face layer alias; null when absent.
      */
-    static TensorRef resolve(TensorCatalog catalog, String target) {
+    public static TensorRef resolve(TensorCatalog catalog, String target) {
         TensorRef r = catalog.get(target);
         if (r != null) {
             return r;

@@ -26,14 +26,16 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 
 /**
  * Rewrites FP8 modules (fp8, DeepSeek-V4, compressed-tensors, ModelOpt, fbgemm, w8a8_fp8 and Quark FP8 rows) and
- * MXFP8 modules into the §1.5 targets:
+ * MXFP8 modules into their GGUF targets:
  * <ul>
- *   <li>E4M3 with a per-tensor or per-expert scale: the stored bytes as F8_E4M3 (zero-copy) with the scale as the
- *       output multiplier; folded into the weight it becomes F8_E4M3_B128.</li>
+ *   <li>E4M3 with a per-tensor or per-expert scale: the stored bytes as ggml's per-element F8_E4M3FN (llama.cpp
+ *       {@code GGML_TYPE_F8_E4M3}, zero-copy, any K) with the scale as the output multiplier; folded into the
+ *       weight it becomes F8_E4M3_B128.</li>
  *   <li>E4M3 with a per-channel scale, or block scales whose K block is a multiple of 128: F8_E4M3_B128 with the
  *       scale of each 128-run; E8M0 block scales with a K block of 32 (or a multiple): MXFP8.</li>
  *   <li>E5M2 with a per-tensor scale: F16 ({@code code << 8}) with the output multiplier.</li>
@@ -172,6 +174,18 @@ public final class Fp8Scheme {
         return t == StDType.F8_E4M3 || t == StDType.F8_E5M2 || t == StDType.F8_E4M3FNUZ || t == StDType.F8_E5M2FNUZ;
     }
 
+    /**
+     * The note of a {@code scheme} module stored unquantized: it loads as stored, unless the load's online
+     * quantization requantizes it.
+     */
+    private static String unquantizedNote(String scheme, ModelSourceOptions o) {
+        if (o.onlineQuant() == ModelSourceOptions.OnlineQuant.NONE) {
+            return scheme + " modules stored unquantized load as stored; --quant-online quantizes them";
+        }
+        return scheme + " modules stored unquantized load as stored where online quantization ("
+                + o.onlineQuant().name().toLowerCase(Locale.ROOT) + ") leaves them";
+    }
+
     private static boolean isFloat(StDType t) {
         return t == StDType.F32 || t == StDType.F16 || t == StDType.BF16;
     }
@@ -190,8 +204,7 @@ public final class Fp8Scheme {
             scaleSuffix = "scale";
         }
         if (isFloat(wt) && scaleSuffix == null && m.first(INPUT_SCALES) == null) {
-            ctx.notes.info("FP8 modules stored unquantized load as stored; --quant-online quantizes them",
-                    m.prefix());
+            ctx.notes.info(unquantizedNote("FP8", ctx.o), m.prefix());
             return;
         }
         if (!isF8(wt)) {
@@ -230,9 +243,9 @@ public final class Fp8Scheme {
                     m.prefix());
             return fallback(ctx, m, w, wName, wt, g, s, Fp4Packing.fallbackType(s.dtype, ctx.o));
         }
-        if (s.grid == Grid.TENSOR && g.k % MX == 0) {
+        if (s.grid == Grid.TENSOR) {
             Produced raw = Produced.of(Fp4Packing.describe(m.prefix(), a.format(), a.bits(), a.groupSize(),
-                    GGMLType.F8_E4M3), ElementFormat.of(GGMLType.F8_E4M3), g.shape, w.rowLocal(), w::readRows)
+                    GGMLType.F8_E4M3FN), ElementFormat.of(GGMLType.F8_E4M3FN), g.shape, w.rowLocal(), w::readRows)
                     .withDirect(w.directVirtualOffset());
             return raw.withOutputScale(s.perTensor(), () -> g.k % B128 == 0 ? b128(ctx, m, w, wName, g, s)
                     : foldedFallback(ctx, m, w, wName, wt, g, s));
@@ -471,8 +484,7 @@ public final class Fp8Scheme {
         StDType wt = Fp4Packing.dtype(w, wName);
         String sName = m.name("weight_scale");
         if (isFloat(wt) && sName == null) {
-            ctx.notes.info("MXFP8 modules stored unquantized load as stored; --quant-online quantizes them",
-                    m.prefix());
+            ctx.notes.info(unquantizedNote("MXFP8", ctx.o), m.prefix());
             return;
         }
         if (wt != StDType.F8_E4M3) {

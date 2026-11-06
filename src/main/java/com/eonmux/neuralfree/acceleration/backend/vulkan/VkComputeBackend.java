@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
 import com.eonmux.neuralfree.acceleration.backend.KernelArtifact;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.cache.CacheKey;
@@ -44,6 +45,7 @@ import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 import static org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 import static org.lwjgl.vulkan.VK10.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+import static org.lwjgl.vulkan.VK10.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 import static org.lwjgl.vulkan.VK10.VK_SUCCESS;
 import static org.lwjgl.vulkan.VK10.vkCreateDevice;
 import static org.lwjgl.vulkan.VK10.vkDestroyDevice;
@@ -242,6 +244,26 @@ public final class VkComputeBackend implements ComputeBackend {
     @Override
     public GpuBuffer allocateBuffer(long sizeInBytes) {
         return allocateBuffer(sizeInBytes, false);
+    }
+
+    /**
+     * Allocates a persistently mapped host-visible buffer a kernel reads in place, preferring
+     * device-local memory when the heap offers a host-visible device-local type (resizable BAR).
+     * Host-visible memory that is not device-local is read over the interconnect like CUDA mapped
+     * host memory.
+     */
+    @Override
+    public boolean supportsHostMappedBuffers() {
+        return true;
+    }
+
+    @Override
+    public HostMappedBuffer allocateHostMappedBuffer(long sizeInBytes) {
+        VkGpuBuffer buffer = allocator.createBuffer(sizeInBytes, DEVICE_BUFFER_USAGE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        LOGGER.trace("Allocated Vulkan host-mapped buffer: {} bytes (type {})", sizeInBytes,
+                buffer.memoryTypeIndex());
+        return buffer;
     }
 
     /**

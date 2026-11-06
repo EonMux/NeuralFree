@@ -41,7 +41,9 @@ final class TestOnlyLlamaEntry {
         return HfArchEntry.of(Collections.singletonList("LlamaForCausalLM"), HfArchResolver.of(Arch.LLAMA),
                         HfMetadataHook.GENERIC, HfTensorHook.DEFAULT, TestOnlyLlamaEntry::vocab)
                 .withLoadNameFilter(TestOnlyLlamaEntry::nameFilter)
-                .withIndexedBlockCount(TestOnlyLlamaEntry::blockCount);
+                .withIndexedBlockCount(TestOnlyLlamaEntry::blockCount)
+                .withMtpExport(true)
+                .withMtpOnlyRootKeep("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight");
     }
 
     private static Map<String, Object> vocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {

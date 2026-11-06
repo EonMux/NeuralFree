@@ -1,9 +1,10 @@
-/* common/quant_iq.glsl - QT_DECODE_* decoders for IQ3_XXS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S and
- * IQ1_M. GLSL twin of kernels/llm/common/quant_decode_iq.h. Requires: common/nf_common.glsl,
+/* common/quant_iq.glsl - QT_DECODE_* decoders for IQ3_XXS, IQ3_S, IQ3_K, IQ3_KS, IQ2_XXS, IQ2_XS, IQ2_S,
+ * IQ1_S and IQ1_M. GLSL twin of kernels/llm/common/quant_decode_iq.h. Requires: common/nf_common.glsl,
  * common/quant_blocks.glsl, common/iq_tables.glsl.
  *
  * Math: llama.cpp ggml/src/ggml-quants.c dequantize_row_iq2_xxs (2489), _iq2_xs (2517), _iq2_s (2544),
- * _iq3_xxs (2576), _iq3_s (2608), _iq1_s (2651) and _iq1_m (2676).
+ * _iq3_xxs (2576), _iq3_s (2608), _iq1_s (2651) and _iq1_m (2676); IQ3_K and IQ3_KS follow Avalon
+ * ggml/src/ggml-quants.c dequantize_row_iq3_k (5381) and _iq3_ks (5613).
  *
  * Work split (QT_TPS = 32): invocation ltid of a block owns the 8-element group ltid = 4*sb + grp,
  * sb in [0, 8) the 32-element sub-block and grp in [0, 4) the group inside it, i.e. block elements
@@ -12,6 +13,7 @@
  *                                        mag[j] = byte j of the grid bytes (lo: 0-3, hi: 4-7)
  *   ternary kinds (IQ1_*):               y[j] = dl * (val[j] + delta), val[j] in {-1, 0, 1} is the
  *                                        2-bit field j of the packed nf_iq1s grid entry
+ *   iq3nl kinds (IQ3_K, IQ3_KS):         y[j] = dl * iq3nl_values[code j], a 3-bit grid code
  * Weights are read only through nf_w_*(ws, off) (every block starts at an even byte offset, so
  * nf_w_u16 / nf_w_u32_even are used at even in-block offsets), activations through qt_x4, and
  * grids through the nf_iq* accessors of common/iq_tables.glsl.
@@ -29,6 +31,8 @@
 #define NF_IQD_TERNARY 1
 #elif QTYPE == QT_IQ3_XXS || QTYPE == QT_IQ3_S || QTYPE == QT_IQ2_XXS || QTYPE == QT_IQ2_XS || QTYPE == QT_IQ2_S
 #define NF_IQD_SIGNED 1
+#elif QTYPE == QT_IQ3_K || QTYPE == QT_IQ3_KS
+#define NF_IQD_KNL 1
 #endif
 
 /* ---- group descriptors ---- */
@@ -99,6 +103,52 @@ float nf_iqd_iq1_delta(bool negative) {
 }
 #endif /* NF_IQD_TERNARY */
 
+#ifdef NF_IQD_KNL
+struct NfIqdGroup {
+    float dl;     /* group scale */
+    uint lo;      /* base codes 0-3, code j at bits 3j */
+    uint hi;      /* base codes 4-7, code j at bits 3(j-4) */
+    uint grid;    /* 0 or 8: the shifted-grid offset of the group */
+};
+
+/* Values 0-3 of a packed base-code word, on the iq3nl grid at offset grid (0 or 8). */
+vec4 nf_iqd_kvals4(uint codes, uint grid) {
+    return vec4(nf_kvalue_iq3nl((codes & 7u) + grid),
+                nf_kvalue_iq3nl(((codes >> 3) & 7u) + grid),
+                nf_kvalue_iq3nl(((codes >> 6) & 7u) + grid),
+                nf_kvalue_iq3nl(((codes >> 9) & 7u) + grid));
+}
+
+/* Dot of a group with its activations x0 (elements 0-3) and x1 (elements 4-7). */
+float nf_iqd_dot(NfIqdGroup g, vec4 x0, vec4 x1) {
+    return g.dl * (dot(x0, nf_iqd_kvals4(g.lo, g.grid)) + dot(x1, nf_iqd_kvals4(g.hi, g.grid)));
+}
+
+/* Element e in [0, 8) of a group. */
+float nf_iqd_elem(NfIqdGroup g, uint e) {
+    const uint codes = e < 4u ? g.lo : g.hi;
+    return g.dl * float(nf_kvalue_iq3nl(((codes >> (3u * (e & 3u))) & 7u) + g.grid));
+}
+
+/* Base codes of the 8 elements grp*8+k of sub-block sb: two bits per element from qs byte
+ * 32*(sb/4) + grp*8 + k at shift 2*(sb%4), bit sb of qh byte grp*8 + k as the third. The caller
+ * stores the shifted-grid offset (0 or 8) in the group's grid field. */
+uvec2 nf_iqd_kcodes(uint ws, uint qs, uint qh, uint sb, uint grp) {
+    const uint shift_l = 2u * (sb & 3u);
+    const uint shift_h = sb & 7u;
+    uvec2 c = uvec2(0u);
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint c0 = ((nf_w_u8(ws, qs + k) >> shift_l) & 3u)
+                      | (((nf_w_u8(ws, qh + k) >> shift_h) & 1u) << 2);
+        const uint c1 = ((nf_w_u8(ws, qs + k + 4u) >> shift_l) & 3u)
+                      | (((nf_w_u8(ws, qh + k + 4u) >> shift_h) & 1u) << 2);
+        c.x |= c0 << (3u * k);
+        c.y |= c1 << (3u * k);
+    }
+    return c;
+}
+#endif /* NF_IQD_KNL */
+
 /* ---- per-type decoders: nf_iqd_group(ws, bp, sb, grp) = group grp of sub-block sb ---- */
 
 #if QTYPE == QT_IQ3_XXS
@@ -135,6 +185,51 @@ NfIqdGroup nf_iqd_group(uint ws, uint bp, uint sb, uint grp) {
     const uint i1 = (q >> 8) | ((qh << (7u - 2u * grp)) & 256u);
     return NfIqdGroup(nf_iq3s_scale(ws, bp, sb), nf_iq3s(i0), nf_iq3s(i1),
                       nf_w_u8(ws, bp + 74u + 4u * sb + grp));
+}
+#endif
+
+#if QTYPE == QT_IQ3_K
+#define QT_BS  NF_IQ3_K_BS
+#define QT_BB  NF_IQ3_K_BB
+#define QT_TPS 32
+#define QT_DECODE_DOT  1
+#define QT_DECODE_DUAL 1
+#define QT_DECODE_ELEM 1
+/* d(f16) | extra(u16 grid-select bits) | scales_h(u16 sign bits) | scales_l[8] | qs[64] | qh[32].
+ * The 16-element half h of sub-block sb (ib = 2*sb + h) has the scale 2*ls + 1 from nibble h of
+ * scales_l[sb], the sign bit ib of scales_h and the grid-select bit ib of extra
+ * (Avalon ggml-quants.c:5395-5406). */
+NfIqdGroup nf_iqd_group(uint ws, uint bp, uint sb, uint grp) {
+    const uint extra = nf_w_u16(ws, bp + 2u);
+    const uint sh = nf_w_u16(ws, bp + 4u);
+    const uint sl = nf_w_u8(ws, bp + 6u + sb);
+    const uint ib = 2u * sb + (grp >> 1u);
+    const float sgn = ((sh >> ib) & 1u) != 0u ? -1.0 : 1.0;
+    const float dl = nf_w_f16(ws, bp) * float(2u * ((sl >> (4u * (grp >> 1u))) & 0xFu) + 1u) * sgn;
+    const uvec2 c = nf_iqd_kcodes(ws, bp + 14u + 32u * (sb >> 2u) + 8u * grp,
+                                  bp + 78u + 8u * grp, sb, grp);
+    return NfIqdGroup(dl, c.x, c.y, ((extra >> ib) & 1u) != 0u ? 8u : 0u);
+}
+#endif
+
+#if QTYPE == QT_IQ3_KS
+#define QT_BS  NF_IQ3_KS_BS
+#define QT_BB  NF_IQ3_KS_BB
+#define QT_TPS 32
+#define QT_DECODE_DOT  1
+#define QT_DECODE_DUAL 1
+#define QT_DECODE_ELEM 1
+/* d(f16) | extra(u16: bits 0-7 the scales' bit 4, bits 8-15 the grid-select bits) | scales[4]
+ * | qs[64] | qh[32]. Sub-block sb has the signed 5-bit scale (nibble sb/4 of scales[sb%4] | bit sb
+ * of extra << 4) - 16 and the grid-select bit 8 + sb of extra (Avalon ggml-quants.c:5619-5629). */
+NfIqdGroup nf_iqd_group(uint ws, uint bp, uint sb, uint grp) {
+    const uint extra = nf_w_u16(ws, bp + 2u);
+    const uint ls = (((nf_w_u8(ws, bp + 4u + (sb & 3u)) >> (4u * (sb >> 2u))) & 0xFu)
+                   | (((extra >> sb) & 1u) << 4)) - 16u;
+    const uvec2 c = nf_iqd_kcodes(ws, bp + 8u + 32u * (sb >> 2u) + 8u * grp,
+                                  bp + 72u + 8u * grp, sb, grp);
+    return NfIqdGroup(nf_w_f16(ws, bp) * float(int(ls)), c.x, c.y,
+                      ((extra >> (8u + sb)) & 1u) != 0u ? 8u : 0u);
 }
 #endif
 
@@ -229,9 +324,10 @@ NfIqdGroup nf_iqd_group(uint ws, uint bp, uint sb, uint grp) {
 }
 #endif
 
-/* ---- decoder interface (common/quant_blocks.glsl) ---- */
-
-#if defined(NF_IQD_SIGNED) || defined(NF_IQD_TERNARY)
+/* ---- decoder interface (common/quant_blocks.glsl) ----
+ * A shader that only uses the group builders and its own qt_dot_q8 (common/quant_iq_q8.glsl) defines
+ * NF_IQD_NO_FLOAT_DOT before including this file, since it has no F32 activation readers. */
+#if (defined(NF_IQD_SIGNED) || defined(NF_IQD_TERNARY) || defined(NF_IQD_KNL)) && !defined(NF_IQD_NO_FLOAT_DOT)
 float qt_dot(uint ws, uint bp, uint xoff, uint blk, uint ltid) {
     const NfIqdGroup g = nf_iqd_group(ws, bp, ltid >> 2, ltid & 3u);
     const uint xi = xoff + blk * uint(QT_BS) + 8u * ltid;

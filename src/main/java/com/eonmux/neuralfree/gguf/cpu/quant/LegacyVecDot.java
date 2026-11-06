@@ -14,6 +14,8 @@ import static com.eonmux.neuralfree.gguf.cpu.quant.Q8VecDot.putLong;
 import static com.eonmux.neuralfree.gguf.cpu.quant.Q8VecDot.subtractBias;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.intAt;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.longAt;
 
 /**
  * CPU vec-dot of the legacy 32-element 4- and 5-bit weight types with 8-bit activations, ports of
@@ -117,14 +119,18 @@ public final class LegacyVecDot implements CpuVecDot {
     @Override
     public float dotRow(CpuTensorRef w, long row, QuantizedActivations x) {
         check(w, x);
-        return dot(w.rowBuffer(row), w.rowOffset(row), x, Q8VecDot.scratch().quants);
+        return dot(CpuVecDotRows.copyRow(w, row), 0, x, Q8VecDot.scratch().quants);
+    }
+
+    @Override
+    public float dotRowBytes(byte[] row, int off, QuantizedActivations x) {
+        return dot(row, off, x, Q8VecDot.scratch().quants);
     }
 
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        final byte[] aux = Q8VecDot.scratch().quants;
-        CpuVecDotRows.forEachRow(w, rowStart, rowCount, y, yOff, (b, off) -> dot(b, off, x, aux));
+        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
     }
 
     private void check(CpuTensorRef w, QuantizedActivations x) {
@@ -132,7 +138,7 @@ public final class LegacyVecDot implements CpuVecDot {
         x.requireCompatible(w, activationType);
     }
 
-    private float dot(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private float dot(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         switch (weightType) {
             case Q4_0:
                 return dotQ4_0(b, off, x, aux);
@@ -174,14 +180,14 @@ public final class LegacyVecDot implements CpuVecDot {
      * quants.c:242-258: {@code v0 = (qs[j] & 0x0F) - 8}, {@code v1 = (qs[j] >> 4) - 8} paired with
      * {@code y.qs[j]} and {@code y.qs[j + 16]}; {@code sumf += sumi * d_x * d_y}.
      */
-    private static float dotQ4_0(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dotQ4_0(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final int nb = x.n / QK4_0;
         float sumf = 0;
         for (int ib = 0; ib < nb; ib++, off += Q4_0_BYTES) {
             final int qs = off + Q4_0_QS;
-            unpackNibbles(b.getLong(qs), b.getLong(qs + 8), 0, 0, 0, 0, BIAS_8, true, aux);
+            unpackNibbles(longAt(b, qs), longAt(b, qs + 8), 0, 0, 0, 0, BIAS_8, true, aux);
             final int sumi = dotI8(aux, 0, yq, ib * QK4_0, QK4_0);
             sumf += sumi * fp16At(b, off + Q4_0_D) * yd[ib];
         }
@@ -192,7 +198,7 @@ public final class LegacyVecDot implements CpuVecDot {
      * quants.c:279-295: unsigned nibbles; {@code sumf += (d_x * d_y) * sumi + m_x * s_y}, where {@code s_y}
      * is the Q8_1 block sum term.
      */
-    private static float dotQ4_1(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dotQ4_1(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final float[] ys = x.s;
@@ -200,7 +206,7 @@ public final class LegacyVecDot implements CpuVecDot {
         float sumf = 0;
         for (int ib = 0; ib < nb; ib++, off += Q4_1_BYTES) {
             final int qs = off + Q4_1_QS;
-            unpackNibbles(b.getLong(qs), b.getLong(qs + 8), 0, 0, 0, 0, 0, false, aux);
+            unpackNibbles(longAt(b, qs), longAt(b, qs + 8), 0, 0, 0, 0, 0, false, aux);
             final int sumi = dotI8(aux, 0, yq, ib * QK4_1, QK4_1);
             sumf += (fp16At(b, off + Q4_1_D) * yd[ib]) * sumi + fp16At(b, off + Q4_1_M) * ys[ib];
         }
@@ -212,15 +218,15 @@ public final class LegacyVecDot implements CpuVecDot {
      * {@code x0 = ((qs[j] & 0x0F) | xh_0) - 16}, {@code x1 = ((qs[j] >> 4) | xh_1) - 16};
      * {@code sumf += (d_x * d_y) * sumi}.
      */
-    private static float dotQ5_0(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dotQ5_0(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final int nb = x.n / QK5_0;
         float sumf = 0;
         for (int ib = 0; ib < nb; ib++, off += Q5_0_BYTES) {
-            final int qh = b.getInt(off + Q5_0_QH);
+            final int qh = intAt(b, off + Q5_0_QH);
             final int qs = off + Q5_0_QS;
-            unpackNibbles(b.getLong(qs), b.getLong(qs + 8),
+            unpackNibbles(longAt(b, qs), longAt(b, qs + 8),
                     QH_SPREAD[qh & 0xFF], QH_SPREAD[(qh >>> 8) & 0xFF],
                     QH_SPREAD[(qh >>> 16) & 0xFF], QH_SPREAD[qh >>> 24], BIAS_16, true, aux);
             final int sumi = dotI8(aux, 0, yq, ib * QK5_0, QK5_0);
@@ -233,16 +239,16 @@ public final class LegacyVecDot implements CpuVecDot {
      * quants.c:424-448: unsigned 5-bit values {@code (qs[j] & 0xF) | xh_0} and {@code (qs[j] >> 4) | xh_1};
      * {@code sumf += (d_x * d_y) * sumi + m_x * s_y}.
      */
-    private static float dotQ5_1(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dotQ5_1(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final float[] ys = x.s;
         final int nb = x.n / QK5_1;
         float sumf = 0;
         for (int ib = 0; ib < nb; ib++, off += Q5_1_BYTES) {
-            final int qh = b.getInt(off + Q5_1_QH);
+            final int qh = intAt(b, off + Q5_1_QH);
             final int qs = off + Q5_1_QS;
-            unpackNibbles(b.getLong(qs), b.getLong(qs + 8),
+            unpackNibbles(longAt(b, qs), longAt(b, qs + 8),
                     QH_SPREAD[qh & 0xFF], QH_SPREAD[(qh >>> 8) & 0xFF],
                     QH_SPREAD[(qh >>> 16) & 0xFF], QH_SPREAD[qh >>> 24], 0, false, aux);
             final int sumi = dotI8(aux, 0, yq, ib * QK5_1, QK5_1);

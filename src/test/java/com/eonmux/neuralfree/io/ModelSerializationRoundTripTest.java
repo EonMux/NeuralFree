@@ -1,7 +1,7 @@
 package com.eonmux.neuralfree.io;
 
-import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
-import com.eonmux.neuralfree.acceleration.backend.*;
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.autograd.ComputationGraph;
 import com.eonmux.neuralfree.data.*;
 import com.eonmux.neuralfree.nn.Module;
 import com.eonmux.neuralfree.nn.Sequential;
@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.nn.loss.LossFunction;
 import com.eonmux.neuralfree.optim.Adam;
 import com.eonmux.neuralfree.tensor.Shape;
 import com.eonmux.neuralfree.tensor.Tensor;
+import com.eonmux.neuralfree.tensor.gpu.TrainParity;
 import com.eonmux.neuralfree.training.*;
 
 import org.junit.Before;
@@ -21,17 +22,15 @@ import org.junit.Test;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.Assert.*;
 
 public class ModelSerializationRoundTripTest {
 
-    private IntegrationTestBackend backend;
+    private ComputeBackend backend;
     private Path tempDir;
     private static final int IMG_SIZE = 28;
     private static final int NUM_CLASSES = 10;
@@ -40,12 +39,13 @@ public class ModelSerializationRoundTripTest {
 
     @Before
     public void setUp() throws IOException {
-        backend = new IntegrationTestBackend();
+        backend = TrainParity.hostBackend();
         tempDir = Files.createTempDirectory("model_roundtrip_test");
     }
 
     @After
     public void tearDown() throws IOException {
+        ComputationGraph.current().clear();
         if (backend != null) {
             backend.close();
         }
@@ -362,221 +362,5 @@ public class ModelSerializationRoundTripTest {
             .batchSize(BATCH_SIZE)
             .shuffle(true)
             .build();
-    }
-
-    private static class IntegrationTestBackend implements ComputeBackend {
-        private final AtomicLong bufferIdCounter = new AtomicLong(1);
-        private final Map<Long, float[]> bufferData = new HashMap<>();
-        private final IntegrationTestQueue computeQueue = new IntegrationTestQueue(bufferData);
-        private final IntegrationTestQueue transferQueue = new IntegrationTestQueue(bufferData);
-        private volatile boolean closed = false;
-
-        @Override
-        public BackendType backendType() {
-            return BackendType.OPENCL;
-        }
-
-        @Override
-        public DeviceCapabilities capabilities() {
-            return new DeviceCapabilities.Builder()
-                    .deviceName("IntegrationTestDevice")
-                    .totalVramBytes(1024L * 1024 * 1024)
-                    .computeUnits(8)
-                    .maxClockFrequencyMhz(1000)
-                    .maxWorkGroupSize(256)
-                    .supportsAsyncTransfer(true)
-                    .driverVersion("1.0")
-                    .build();
-        }
-
-        @Override
-        public ComputeQueue computeQueue() {
-            return computeQueue;
-        }
-
-        @Override
-        public ComputeQueue transferQueue() {
-            return transferQueue;
-        }
-
-        @Override
-        public GpuBuffer allocateBuffer(long sizeInBytes) {
-            long id = bufferIdCounter.getAndIncrement();
-            int numFloats = (int) (sizeInBytes / 4);
-            bufferData.put(id, new float[numFloats]);
-            return new MockGpuBuffer(id, sizeInBytes);
-        }
-
-        @Override
-        public GpuBuffer allocateBuffer(long sizeInBytes, boolean readOnly) {
-            return allocateBuffer(sizeInBytes);
-        }
-
-        @Override
-        public KernelHandle compileKernel(String kernelName, String kernelSource, String buildOptions) {
-            return new MockKernelHandle(kernelName);
-        }
-
-        /** Declines kernel artifacts so tensor ops take their CPU path. */
-        @Override
-        public boolean supportsArtifact(KernelArtifact.Kind kind) {
-            return false;
-        }
-
-        @Override
-        public KernelHandle loadKernel(KernelArtifact artifact) {
-            if (artifact == null) {
-                throw new IllegalArgumentException("kernel artifact must not be null");
-            }
-            throw new UnsupportedKernelException("mock backend declines " + artifact.kind()
-                    + " artifact for kernel " + artifact.kernelName());
-        }
-
-        @Override
-        public void close() {
-            closed = true;
-            bufferData.clear();
-        }
-    }
-
-    private static class IntegrationTestQueue implements ComputeQueue {
-        private final Map<Long, float[]> bufferData;
-        private volatile boolean closed = false;
-
-        IntegrationTestQueue(Map<Long, float[]> bufferData) {
-            this.bufferData = bufferData;
-        }
-
-        @Override
-        public QueueType getQueueType() {
-            return QueueType.TRANSFER;
-        }
-
-        @Override
-        public GpuEvent enqueueWriteBuffer(GpuBuffer dstBuffer, long dstOffset, long sizeInBytes, byte[] srcData, GpuEvent... waitOnEvents) {
-            float[] data = bufferData.get(dstBuffer.bufferId());
-            if (data != null) {
-                int floatOffset = (int) (dstOffset / 4);
-                ByteBuffer buffer = ByteBuffer.wrap(srcData).order(ByteOrder.nativeOrder());
-                for (int i = 0; i < srcData.length / 4 && floatOffset + i < data.length; i++) {
-                    data[floatOffset + i] = buffer.getFloat();
-                }
-            }
-            return new MockGpuEvent();
-        }
-
-        @Override
-        public GpuEvent enqueueWriteBuffer(GpuBuffer dstBuffer, long dstOffset, long sizeInBytes, float[] srcData, GpuEvent... waitOnEvents) {
-            float[] data = bufferData.get(dstBuffer.bufferId());
-            if (data != null) {
-                int floatOffset = (int) (dstOffset / 4);
-                System.arraycopy(srcData, 0, data, floatOffset, Math.min(srcData.length, data.length - floatOffset));
-            }
-            return new MockGpuEvent();
-        }
-
-        @Override
-        public GpuEvent enqueueReadBuffer(GpuBuffer srcBuffer, long srcOffset, long sizeInBytes, byte[] dstData, GpuEvent... waitOnEvents) {
-            float[] data = bufferData.get(srcBuffer.bufferId());
-            if (data != null) {
-                int floatOffset = (int) (srcOffset / 4);
-                ByteBuffer buffer = ByteBuffer.wrap(dstData).order(ByteOrder.nativeOrder());
-                for (int i = 0; i < dstData.length / 4 && floatOffset + i < data.length; i++) {
-                    buffer.putFloat(data[floatOffset + i]);
-                }
-            }
-            return new MockGpuEvent();
-        }
-
-        @Override
-        public GpuEvent enqueueReadBuffer(GpuBuffer srcBuffer, long srcOffset, long sizeInBytes, float[] dstData, GpuEvent... waitOnEvents) {
-            float[] data = bufferData.get(srcBuffer.bufferId());
-            if (data != null) {
-                int floatOffset = (int) (srcOffset / 4);
-                System.arraycopy(data, floatOffset, dstData, 0, Math.min(dstData.length, data.length - floatOffset));
-            }
-            return new MockGpuEvent();
-        }
-
-        @Override
-        public GpuEvent enqueueKernel(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize, Object[] args, GpuEvent... waitOnEvents) {
-            return new MockGpuEvent();
-        }
-
-        @Override
-        public void flush() {
-        }
-
-        @Override
-        public void finish() {
-        }
-
-        @Override
-        public void close() {
-            closed = true;
-        }
-    }
-
-    private static class MockGpuBuffer implements GpuBuffer {
-        private final long bufferId;
-        private final long sizeInBytes;
-        private volatile boolean closed = false;
-
-        MockGpuBuffer(long bufferId, long sizeInBytes) {
-            this.bufferId = bufferId;
-            this.sizeInBytes = sizeInBytes;
-        }
-
-        @Override
-        public long sizeInBytes() {
-            return sizeInBytes;
-        }
-
-        @Override
-        public long bufferId() {
-            return bufferId;
-        }
-
-        @Override
-        public void close() {
-            closed = true;
-        }
-    }
-
-    private static class MockGpuEvent implements GpuEvent {
-        private volatile boolean closed = false;
-
-        @Override
-        public void awaitCompletion() throws InterruptedException {
-        }
-
-        @Override
-        public boolean isComplete() {
-            return true;
-        }
-
-        @Override
-        public void close() {
-            closed = true;
-        }
-    }
-
-    private static class MockKernelHandle implements KernelHandle {
-        private final String kernelName;
-        private volatile boolean closed = false;
-
-        MockKernelHandle(String kernelName) {
-            this.kernelName = kernelName;
-        }
-
-        @Override
-        public String kernelName() {
-            return kernelName;
-        }
-
-        @Override
-        public void close() {
-            closed = true;
-        }
     }
 }

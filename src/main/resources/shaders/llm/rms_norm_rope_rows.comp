@@ -1,0 +1,54 @@
+/* rms_norm_rope_rows.comp - LLM_RmsNormRopeRows: per-head RMS norm followed by NEOX RoPE over a block of rows (the
+ * lfm3a depthformer and liquid codec q/k path). GLSL twin of kernels/llm/speech.cl.
+ * Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i rows, i n_heads, i head_dim, i pos_base, i off, f theta_scale, f eps, R x, R w, W y).
+ *   row r is normalized and rotated at position pos_base + r; half = head_dim/2,
+ *   angle = (pos_base + r) * theta_scale^i,
+ *   y[i] = a[i]*cos - a[i+half]*sin, y[i+half] = a[i]*sin + a[i+half]*cos.
+ * Dispatch: 1-D, one invocation per (row, head, pair), global = roundUp(rows*n_heads*half, L), local = {L, 1, 1}.
+ * The block starts at element `off`; x and y must not overlap.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfRnrX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfRnrW { float w_in[]; };
+layout(std430, binding = 2) writeonly buffer NfRnrY { float y_out[]; };
+
+layout(push_constant) uniform NfRnrParams {
+    int rows;
+    int n_heads;
+    int head_dim;
+    int pos_base;
+    int off;
+    float theta_scale;
+    float eps;
+} pc;
+
+void main() {
+    const uint d_half = uint(pc.head_dim / 2);
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.rows) * uint(pc.n_heads) * d_half) {
+        return;
+    }
+    const uint r = idx / (uint(pc.n_heads) * d_half);
+    const uint rem = idx - r * uint(pc.n_heads) * d_half;
+    const uint h = rem / d_half;
+    const uint i = rem - h * d_half;
+    const uint base = uint(pc.off) + (r * uint(pc.n_heads) + h) * uint(pc.head_dim);
+    float sum = 0.0;
+    for (int d = 0; d < pc.head_dim; ++d) {
+        sum += x_in[base + uint(d)] * x_in[base + uint(d)];
+    }
+    const float scale = 1.0 / sqrt(sum / float(pc.head_dim) + pc.eps);
+    const float x0 = x_in[base + i] * scale * w_in[i];
+    const float x1 = x_in[base + i + d_half] * scale * w_in[i + d_half];
+    const float angle = float(pc.pos_base + int(r)) * pow(pc.theta_scale, float(i));
+    const float cs = cos(angle);
+    const float sn = sin(angle);
+    y_out[base + i] = x0 * cs - x1 * sn;
+    y_out[base + i + d_half] = x0 * sn + x1 * cs;
+}

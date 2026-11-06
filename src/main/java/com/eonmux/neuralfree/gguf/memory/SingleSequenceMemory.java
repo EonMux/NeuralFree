@@ -84,6 +84,48 @@ public final class SingleSequenceMemory implements SequenceMemory {
     }
 
     @Override
+    public String removeKeepRecurrentRefusal(int seq, int p0) {
+        checkSeq(seq);
+        if (p0 < 0) {
+            return "remove starts before the sequence: position " + p0;
+        }
+        if (p0 == 0) {
+            // emptying the sequence zeroes the storage; the caller re-derives only the accepted tokens' state and
+            // cannot rebuild the rest
+            return "removeKeepRecurrent cannot empty the sequence: the re-derived state would not cover position 0";
+        }
+        return null;
+    }
+
+    @Override
+    public void removeKeepRecurrent(int seq, int p0) {
+        String refusal = removeKeepRecurrentRefusal(seq, p0);
+        if (refusal != null) {
+            throw new UnsupportedOperationException(refusal);
+        }
+        SequenceState state = memory.sequence();
+        if (state.nPast() == 0 || p0 > posMax(seq)) {
+            return;
+        }
+        memory.dropKeepRecurrent(posMax(seq) - p0 + 1);
+    }
+
+    @Override
+    public String moveRowsRefusal(int seq, int[] srcPos, int[] dstPos) {
+        checkSeq(seq);
+        return memory.movePositionRowsRefusal(srcPos, dstPos);
+    }
+
+    @Override
+    public void moveRows(int seq, int[] srcPos, int[] dstPos) {
+        String refusal = moveRowsRefusal(seq, srcPos, dstPos);
+        if (refusal != null) {
+            throw new UnsupportedOperationException(refusal);
+        }
+        memory.movePositionRows(srcPos, dstPos);
+    }
+
+    @Override
     public String copyRefusal() {
         return "contiguous single-sequence memory cannot copy between sequences";
     }
@@ -112,6 +154,17 @@ public final class SingleSequenceMemory implements SequenceMemory {
     @Override
     public void add(int seq, int p0, int p1, int delta) {
         throw new UnsupportedOperationException(shiftRefusal());
+    }
+
+    @Override
+    public String divRefusal() {
+        return "position division needs the paged memory; contiguous single-sequence memory re-rotates keys only"
+                + " through ForwardBackend.shiftContext";
+    }
+
+    @Override
+    public void div(int seq, int p0, int p1, int d) {
+        throw new UnsupportedOperationException(divRefusal());
     }
 
     @Override

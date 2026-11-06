@@ -40,14 +40,19 @@ public interface TokenizerAlgorithm {
     byte[] piece(int id);
 
     /**
-     * Shared {@code detokenize} for algorithms whose output is the concatenation of pieces. The
-     * leading space of the first piece is removed when encoding adds one: {@code add_space_prefix}
-     * set and the prepend scheme not {@code NEVER}.
+     * Shared {@code detokenize} for algorithms whose output is the concatenation of pieces
+     * (llama-vocab.cpp:4219-4300). The leading space of the first piece is removed when encoding
+     * adds one: {@code add_space_prefix} set and the prepend scheme not {@code NEVER}. A BPE
+     * vocabulary with the Metaspace {@code first} scheme ({@link TokenizerVocab#metaspacePrependScheme()})
+     * removes the leading space of the first rendered piece: the removal waits past UNKNOWN and
+     * CONTROL tokens, which render nothing.
      */
     static String detokenize(TokenizerAlgorithm algorithm, TokenizerVocab vocab, SpecialTokens special, int[] ids) {
         int start = 0;
         int end = ids.length;
         boolean removeSpace = vocab.addSpacePrefix() && vocab.prependScheme() != PreTokenizerSpec.PrependScheme.NEVER;
+        boolean removeFirstSpace = vocab.type() == TokenizerVocab.Type.BPE
+                && vocab.metaspacePrependScheme() == PreTokenizerSpec.PrependScheme.FIRST;
         if (vocab.addBos() && end > 0 && ids[0] == special.bos()) {
             removeSpace = false;
             start++;
@@ -60,10 +65,13 @@ public interface TokenizerAlgorithm {
             int id = ids[i];
             if (!special.isHidden(id)) {
                 byte[] p = algorithm.piece(id);
-                int from = removeSpace && p.length > 0 && p[0] == ' ' ? 1 : 0;
+                int from = (removeSpace || removeFirstSpace) && p.length > 0 && p[0] == ' ' ? 1 : 0;
                 out.write(p, from, p.length - from);
             }
             removeSpace = false;
+            if (!special.hasAttr(id, TokenizerVocab.ATTR_UNKNOWN | TokenizerVocab.ATTR_CONTROL)) {
+                removeFirstSpace = false;
+            }
         }
         byte[] raw = out.toArray();
         byte[] text = vocab.cleanSpaces() ? cleanSpaces(raw, raw.length) : raw;

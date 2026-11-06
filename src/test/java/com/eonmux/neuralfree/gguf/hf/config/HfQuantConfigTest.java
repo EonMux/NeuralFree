@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hf.config;
 
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.hf.config.QuantArgs.Strategy;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
@@ -72,6 +73,41 @@ public class HfQuantConfigTest {
     }
 
     @Test
+    public void onlyTheOnlineShorthandsQuantizeAtLoadByDefault() throws IOException {
+        HfQuantConfig channel = quant("'quantization_config':{'quant_method':'fp8_per_channel'}");
+        assertEquals(HfQuantMethod.ONLINE, channel.method());
+        assertFalse(channel.isQuantized());
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_CHANNEL, channel.onlineTarget());
+        assertEquals(ModelSourceOptions.OnlineQuant.NVFP4_PER_TOKEN,
+                quant("'quantization_config':{'quant_method':'nvfp4_per_token'}").onlineTarget());
+        assertNull("bare online needs linear / moe specs",
+                quant("'quantization_config':{'quant_method':'online'}").onlineTarget());
+        assertNull("a serialized FP8 checkpoint keeps its float modules", quant("'quantization_config':"
+                + "{'quant_method':'fp8','activation_scheme':'dynamic','weight_block_size':[128,128]}")
+                .onlineTarget());
+        assertNull(quant("").onlineTarget());
+    }
+
+    @Test
+    public void bareOnlineCarriesItsLayerSelection() throws IOException {
+        HfQuantConfig q = qc("{'quant_method':'online','moe':'mxfp4','ignore':['re:.*\\\\.gate$']}");
+        assertEquals(HfQuantMethod.ONLINE, q.method());
+        assertFalse(q.isQuantized());
+        assertNotNull(q.onlineConfig());
+        assertTrue(q.onlineConfig().quantizes(OnlineQuantConfig.LayerKind.MOE));
+        assertFalse(q.onlineConfig().quantizes(OnlineQuantConfig.LayerKind.LINEAR));
+        assertEquals(List.of("re:.*\\.gate$"), q.onlineConfig().ignore());
+        assertTrue(q.toString(), q.toString().contains("online=OnlineQuantConfig{"));
+        assertNull("a shorthand carries no layer selection", qc("{'quant_method':'mxfp8'}").onlineConfig());
+        assertNull(qc("{'quant_method':'fp8_per_block'}").onlineConfig());
+        assertNull(quant("").onlineConfig());
+        assertRejected("{'quant_method':'online','linear':{'weight':'fp8_per_block_static','activation':"
+                + "'fp8_per_token'}}", "config.json: quantization_config: linear.activation=fp8_per_token");
+        assertRejected("{'quant_method':'online','weight_block_size':[128,128]}", "unknown member"
+                + " 'weight_block_size'");
+    }
+
+    @Test
     public void sourcesAreSearchedInOrder() throws IOException {
         assertEquals(HfQuantMethod.AWQ, quant("'compression_config':{'quant_method':'awq','bits':4,'group_size':128}")
                 .method());
@@ -115,16 +151,227 @@ public class HfQuantConfigTest {
         assertThrows(GgufFormatException.class, () -> HfQuantConfig.of(cfg));
     }
 
+    @Test
+    public void mistralBlockQuantizationKeepsTheBlockShape() throws IOException {
+        Path d = tmp.newFolder().toPath();
+        HfConfigLoaderTest.write(d.resolve("params.json"), "{'dim':8,'quantization':{'qformat_weight':"
+                + "'fp8_e4m3','qscheme_weight':'BLOCK','block_size_out':128,'block_size_in':128}}");
+        QuantArgs a = args(HfQuantConfig.of(HfConfigLoader.load(d, (Map<String, Object>) null)), Q);
+        assertEquals(128, a.blockN());
+        assertEquals(128, a.blockK());
+        assertEquals(ActQuantScheme.FP8_GROUP128, a.actScheme());
+    }
+
+    @Test
+    public void mistralBlockQuantizationNeedsBothBlockSizes() throws IOException {
+        Path d = tmp.newFolder().toPath();
+        HfConfigLoaderTest.write(d.resolve("params.json"), "{'dim':8,'quantization':{'qformat_weight':"
+                + "'fp8_e4m3','qscheme_weight':'BLOCK','block_size_out':128}}");
+        HfConfig cfg = HfConfigLoader.load(d, (Map<String, Object>) null);
+        GgufFormatException e = assertThrows(GgufFormatException.class, () -> HfQuantConfig.of(cfg));
+        assertTrue(e.getMessage(), e.getMessage().contains("block_size_in"));
+    }
+
     // ------------------------------------------------------------------ names
 
     @Test
     public void unknownAndRejectedMethodsGiveTheirNamedErrors() {
         assertRejected("{'quant_method':'foo'}", "unsupported quant_method 'foo'");
-        assertRejected("{'quant_method':'torchao'}", "unsupported quant_method 'torchao': torchao");
+        assertRejected("{'quant_method':'torchao'}", "quant_type is missing");
+        assertRejected("{'quant_method':'torchao','quant_type':{'default':{'_type':'MysteryConfig'}}}",
+                "quant_type 'MysteryConfig'");
         assertRejected("{'quant_method':'modelslim'}", "unsupported quant_method 'modelslim': Ascend");
         for (String removed : new String[]{"aqlm", "eetq", "vptq", "spqr", "higgs", "quanto"}) {
             assertRejected("{'quant_method':'" + removed + "'}", "unsupported quant_method '" + removed + "'");
         }
+    }
+
+    @Test
+    public void torchaoConfigurationsMapOntoTheCheckpointLayouts() throws IOException {
+        QuantArgs int4 = args(qc(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'group_size':64}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, int4.format());
+        assertEquals(64, int4.groupSize());
+        assertEquals(4, int4.bits());
+
+        QuantArgs int4Tile = args(qc(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'group_size':128,"
+                + "'int4_packing_format':{'_type':'Int4PackingFormat','_data':'TILE_PACKED_TO_4D'}}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, int4Tile.format());
+
+        QuantArgs int4Preshuffled = args(qc(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'group_size':64,"
+                + "'int4_packing_format':{'_type':'Int4PackingFormat','_data':'PRESHUFFLED'}}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, int4Preshuffled.format());
+        assertEquals(64, int4Preshuffled.groupSize());
+
+        QuantArgs int4PlainInt32 = args(qc(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'group_size':32,"
+                + "'int4_packing_format':{'_type':'Int4PackingFormat','_data':'PLAIN_INT32'}}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, int4PlainInt32.format());
+        assertEquals(32, int4PlainInt32.groupSize());
+
+        QuantArgs int4Ntile16 = args(qc(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'group_size':128,"
+                + "'int4_packing_format':{'_type':'Int4PackingFormat','_data':'TILE_PACKED_TO_4D'},"
+                + "'int4_tile_packed_ntile':16}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, int4Ntile16.format());
+
+        QuantArgs fp8Int4 = args(qc(torchao("{'_type':'Float8DynamicActivationInt4WeightConfig','_data':{"
+                + "'int4_packing_format':{'_type':'Int4PackingFormat','_data':'PRESHUFFLED'}}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, fp8Int4.format());
+        assertEquals(128, fp8Int4.groupSize());
+        assertEquals(ActQuantScheme.FP8_TOKEN, fp8Int4.actScheme());
+
+        QuantArgs int8Static = args(qc(torchao("{'_type':'Int8StaticActivationInt8WeightConfig','_data':{"
+                + "'granularity':{'_type':'PerRow','_data':{'dim':-1}},"
+                + "'act_mapping_type':{'_type':'MappingType','_data':'ASYMMETRIC'}}}")), Q);
+        assertEquals(QuantFormat.INT8_CHANNEL, int8Static.format());
+        assertEquals(ActQuantScheme.INT8_STATIC_ASYM, int8Static.actScheme());
+
+        QuantArgs int8StaticSym = args(qc(torchao("{'_type':'Int8StaticActivationInt8WeightConfig',"
+                + "'_data':{}}")), Q);
+        assertEquals(ActQuantScheme.INT8_STATIC, int8StaticSym.actScheme());
+
+        QuantArgs int8StaticReduced = args(qc(torchao("{'_type':'Int8StaticActivationInt8WeightConfig',"
+                + "'_data':{'reduce_range':true}}")), Q);
+        assertNull(int8StaticReduced.actScheme());
+        assertTrue(int8StaticReduced.actUnemulated(),
+                int8StaticReduced.actUnemulated().contains("reduced-range"));
+
+        QuantArgs intx4 = args(qc(torchao("{'_type':'IntxWeightOnlyConfig','_data':{'weight_dtype':"
+                + "{'_type':'torch.dtype','_data':'int4'},'granularity':"
+                + "{'_type':'PerGroup','_data':{'group_size':32}}}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, intx4.format());
+        assertEquals(32, intx4.groupSize());
+
+        QuantArgs intx8 = args(qc(torchao("{'_type':'IntxWeightOnlyConfig','_data':{'weight_dtype':"
+                + "{'_type':'torch.dtype','_data':'int8'}}}")), Q);
+        assertEquals(QuantFormat.INT8_CHANNEL, intx8.format());
+
+        for (int bits : new int[]{1, 2, 3, 5, 6, 7}) {
+            QuantArgs narrow = args(qc(torchao("{'_type':'IntxWeightOnlyConfig','_data':{'weight_dtype':"
+                    + "{'_type':'torch.dtype','_data':'int" + bits + "'},'granularity':"
+                    + "{'_type':'PerGroup','_data':{'group_size':16}}}}")), Q);
+            assertEquals("int" + bits, QuantFormat.INT8_CHANNEL, narrow.format());
+            assertEquals("int" + bits, 16, narrow.groupSize());
+        }
+
+        QuantArgs intxDynamic = args(qc(torchao("{'_type':'Int8DynamicActivationIntxWeightConfig','_data':{"
+                + "'weight_dtype':{'_type':'torch.dtype','_data':'int4'},'weight_granularity':"
+                + "{'_type':'PerGroup','_data':{'group_size':64}}}}")), Q);
+        assertEquals(QuantFormat.INT4_TORCHAO, intxDynamic.format());
+        assertEquals(64, intxDynamic.groupSize());
+        assertEquals(ActQuantScheme.INT8_TOKEN, intxDynamic.actScheme());
+
+        QuantArgs intxAsym = args(qc(torchao("{'_type':'IntxWeightOnlyConfig','_data':{'weight_dtype':"
+                + "{'_type':'torch.dtype','_data':'int8'},'mapping_type':"
+                + "{'_type':'MappingType','_data':'ASYMMETRIC'}}}")), Q);
+        assertEquals(QuantFormat.INT8_CHANNEL, intxAsym.format());
+
+        QuantArgs int8 = args(qc(torchao("{'_type':'Int8WeightOnlyConfig','_data':{"
+                + "'granularity':{'_type':'PerRow','_data':{'dim':-1}}}}")), Q);
+        assertEquals(QuantFormat.INT8_CHANNEL, int8.format());
+        assertEquals(QuantArgs.CHANNEL, int8.groupSize());
+
+        QuantArgs int8Dynamic = args(qc(torchao(
+                "{'_type':'Int8DynamicActivationInt8WeightConfig','_data':{}}")), Q);
+        assertEquals(QuantFormat.INT8_CHANNEL, int8Dynamic.format());
+        assertEquals(ActQuantScheme.INT8_TOKEN, int8Dynamic.actScheme());
+        assertNull(int8Dynamic.actUnemulated());
+
+        QuantArgs int8DynamicRow = args(qc(torchao("{'_type':'Int8DynamicActivationInt8WeightConfig',"
+                + "'_data':{'granularity':[{'_type':'PerRow','_data':{'dim':-1}},"
+                + "{'_type':'PerRow','_data':{'dim':-1}}]}}")), Q);
+        assertEquals(QuantArgs.CHANNEL, int8DynamicRow.groupSize());
+        assertEquals(ActQuantScheme.INT8_TOKEN, int8DynamicRow.actScheme());
+
+        QuantArgs int8Tensor = args(qc(torchao("{'_type':'Int8DynamicActivationInt8WeightConfig','_data':{"
+                + "'granularity':{'_type':'PerTensor','_data':{}}}}")), Q);
+        assertEquals(QuantArgs.UNGROUPED, int8Tensor.groupSize());
+        assertNull(int8Tensor.actScheme());
+        assertTrue(int8Tensor.actUnemulated(), int8Tensor.actUnemulated().contains("PerTensor"));
+
+        QuantArgs float8 = args(qc(torchao("{'_type':'Float8WeightOnlyConfig','_data':{"
+                + "'granularity':{'_type':'PerRow','_data':{'dim':-1}}}}")), Q);
+        assertEquals(QuantFormat.FP8, float8.format());
+        assertEquals(QuantArgs.CHANNEL, float8.groupSize());
+
+        QuantArgs float8Group = args(qc(torchao("{'_type':'Float8WeightOnlyConfig','_data':{"
+                + "'granularity':{'_type':'PerGroup','_data':{'group_size':128}}}}")), Q);
+        assertEquals(Strategy.BLOCK, float8Group.strategy());
+        assertEquals(128, float8Group.blockK());
+
+        QuantArgs float8Dynamic = args(qc(torchao("{'_type':'Float8DynamicActivationFloat8WeightConfig',"
+                + "'_data':{'granularity':[{'_type':'PerRow','_data':{'dim':-1}},"
+                + "{'_type':'PerRow','_data':{'dim':-1}}]}}")), Q);
+        assertEquals(QuantFormat.FP8, float8Dynamic.format());
+        assertEquals(ActQuantScheme.FP8_TOKEN, float8Dynamic.actScheme());
+
+        QuantArgs float8DynamicDefault = args(qc(torchao(
+                "{'_type':'Float8DynamicActivationFloat8WeightConfig','_data':{}}")), Q);
+        assertEquals(QuantFormat.FP8, float8DynamicDefault.format());
+        assertEquals(QuantArgs.UNGROUPED, float8DynamicDefault.groupSize());
+        assertNull(float8DynamicDefault.actScheme());
+        assertTrue(float8DynamicDefault.actUnemulated(),
+                float8DynamicDefault.actUnemulated().contains("per-tensor"));
+
+        QuantArgs mxfp4 = args(qc(torchao("{'_type':'MXDynamicActivationMXWeightConfig','_data':{"
+                + "'weight_dtype':{'_type':'torch.dtype','_data':'float4_e2m1fn_x2'}}}")), Q);
+        assertEquals(QuantFormat.MXFP4_CT, mxfp4.format());
+        assertEquals(ActQuantScheme.MXFP4, mxfp4.actScheme());
+        assertEquals(32, mxfp4.groupSize());
+
+        QuantArgs mxfp8 = args(qc(torchao("{'_type':'MXDynamicActivationMXWeightConfig','_data':{"
+                + "'weight_dtype':{'_type':'torch.dtype','_data':'float8_e4m3fn'}}}")), Q);
+        assertEquals(QuantFormat.MXFP8, mxfp8.format());
+        assertEquals(ActQuantScheme.MXFP8, mxfp8.actScheme());
+
+        QuantArgs mxfp8Default = args(qc(torchao(
+                "{'_type':'MXDynamicActivationMXWeightConfig','_data':{}}")), Q);
+        assertEquals(QuantFormat.MXFP8, mxfp8Default.format());
+
+        QuantArgs nvfp4 = args(qc(torchao(
+                "{'_type':'NVFP4DynamicActivationNVFP4WeightConfig','_data':{}}")), Q);
+        assertEquals(QuantFormat.NVFP4_MODELOPT, nvfp4.format());
+        assertEquals(16, nvfp4.groupSize());
+        assertNull(nvfp4.actScheme());
+        assertTrue(nvfp4.actUnemulated(), nvfp4.actUnemulated().contains("dynamic per-tensor"));
+
+        QuantArgs nvfp4Static = args(qc(torchao("{'_type':'NVFP4DynamicActivationNVFP4WeightConfig',"
+                + "'_data':{'use_dynamic_per_tensor_scale':false}}")), Q);
+        assertEquals(ActQuantScheme.NVFP4, nvfp4Static.actScheme());
+    }
+
+    @Test
+    public void torchaoUnsupportedConfigurationsAreRefusedByName() {
+        assertRejected(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'int4_packing_format':"
+                + "{'_type':'Int4PackingFormat','_data':'MYSTERY'}}}"), "MYSTERY");
+        assertRejected(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'int4_packing_format':"
+                + "{'_type':'Int4PackingFormat','_data':'TILE_PACKED_TO_4D'},"
+                + "'int4_tile_packed_ntile':4}}"), "4");
+        assertRejected(torchao("{'_type':'IntxWeightOnlyConfig','_data':{'weight_dtype':"
+                + "{'_type':'torch.dtype','_data':'int9'}}}"), "int9");
+        assertRejected(torchao("{'_type':'IntxWeightOnlyConfig','_data':{'weight_dtype':"
+                + "{'_type':'torch.dtype','_data':'int0'}}}"), "int0");
+        assertRejected(torchao("{'_type':'IntxWeightOnlyConfig','_data':{'intx_packing_format':"
+                + "{'_type':'IntxPackingFormat','_data':'OPAQUE_TORCHAO_AUTO'}}}"), "OPAQUE_TORCHAO_AUTO");
+        assertRejected(torchao("{'_type':'MXDynamicActivationMXWeightConfig','_data':{'weight_dtype':"
+                + "{'_type':'torch.dtype','_data':'float8_e5m2'}}}"), "float8_e5m2");
+        assertRejected(torchao("{'_type':'Float8DynamicActivationFloat8WeightConfig','_data':{"
+                + "'packing_format':{'_type':'Float8PackingFormat','_data':'SPARSE'}}}"), "SPARSE");
+        assertRejected(torchao("{'_type':'UnknownConfig','_data':{}}"), "has no NeuralFree mapping");
+    }
+
+    @Test
+    public void torchaoPerModuleConfigurationsBecomeRules() throws IOException {
+        HfQuantConfig q = qc(torchao("{'_type':'Int4WeightOnlyConfig','_data':{'module_fqn_to_config':{"
+                + "'" + Q + "':{'_type':'Int8WeightOnlyConfig','_data':{}},"
+                + "'_default':{'_type':'Float8WeightOnlyConfig','_data':{}},"
+                + "'lm_head':null}}}"));
+        assertEquals(QuantFormat.INT8_CHANNEL, args(q, Q).format());
+        assertEquals(QuantFormat.FP8, args(q, DOWN).format());
+        assertFalse(q.argsFor("lm_head").isPresent());
+    }
+
+    /** A {@code quant_method: torchao} config whose {@code default} is {@code type}. */
+    private static String torchao(String type) {
+        return "{'quant_method':'torchao','quant_type':{'default':" + type + "}}";
     }
 
     @Test
@@ -511,6 +758,43 @@ public class HfQuantConfigTest {
         assertEquals(QuantArgs.ScaleFormat.E8M0, blockE8m0.scaleFormat());
         assertRejected("{'quant_method':'quark','global_quant_config':{'weight':[{'dtype':'int4'},"
                 + "{'dtype':'fp8_e4m3'}]}}", "unsupported quant_method 'quark'");
+    }
+
+    /** The two-level weight and input specs of V quark.py _is_nvfp4. */
+    private static final String NVFP4_WEIGHT = "[{'dtype':'fp4','qscheme':'per_group','group_size':16,"
+            + "'is_dynamic':false},{'dtype':'fp8_e4m3','qscheme':'per_tensor','is_dynamic':false}]";
+    private static final String NVFP4_INPUT = "[{'dtype':'fp4','qscheme':'per_group','group_size':16,"
+            + "'is_dynamic':true},{'dtype':'fp8_e4m3','qscheme':'per_tensor','is_dynamic':false}]";
+
+    @Test
+    public void quarkNvfp4TwoLevelSpecs() throws IOException {
+        HfQuantConfig q = qc("{'quant_method':'quark','exclude':['lm_head'],'global_quant_config':{'weight':"
+                + NVFP4_WEIGHT + ",'input_tensors':" + NVFP4_INPUT + "}}");
+        QuantArgs a = args(q, Q);
+        assertEquals(QuantFormat.NVFP4_QUARK, a.format());
+        assertEquals(4, a.bits());
+        assertEquals(16, a.groupSize());
+        assertEquals(Strategy.GROUP, a.strategy());
+        assertEquals(QuantArgs.ScaleFormat.E4M3, a.scaleFormat());
+        assertEquals(ActQuantScheme.NVFP4, a.actScheme());
+        assertEquals(HfQuantMethod.QUARK, q.method());
+        assertTrue(q.isIgnored("lm_head"));
+
+        QuantArgs single = args(qc("{'quant_method':'quark','global_quant_config':{'weight':[{'dtype':'int4',"
+                + "'qscheme':'per_group','group_size':128}]}}"), Q);
+        assertEquals(QuantFormat.INT_QUARK, single.format());
+        assertEquals(128, single.groupSize());
+
+        assertRejected("{'quant_method':'quark','global_quant_config':{'weight':" + NVFP4_WEIGHT
+                + ",'input_tensors':{'dtype':'fp8_e4m3','qscheme':'per_tensor'}}}", "only supported for NVFP4");
+        assertRejected("{'quant_method':'quark','global_quant_config':{'weight':[{'dtype':'int4'},"
+                + "{'dtype':'fp8_e4m3'}],'input_tensors':" + NVFP4_INPUT + "}}", "only supported for NVFP4");
+        assertRejected("{'quant_method':'quark','global_quant_config':{'weight':[{'dtype':'fp4',"
+                + "'qscheme':'per_group','group_size':32},{'dtype':'fp8_e4m3','qscheme':'per_tensor'}],"
+                + "'input_tensors':" + NVFP4_INPUT + "}}", "only supported for NVFP4");
+        assertRejected("{'quant_method':'quark','global_quant_config':{'weight':" + NVFP4_WEIGHT
+                + ",'input_tensors':[{'dtype':'fp4','qscheme':'per_group','group_size':16},"
+                + "{'dtype':'fp8_e4m3','qscheme':'per_tensor'}]}}", "only supported for NVFP4");
     }
 
     @Test

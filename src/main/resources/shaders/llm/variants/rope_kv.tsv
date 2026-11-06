@@ -2,6 +2,7 @@
 # RoPE (kernels/llm/rope.cl) and KV cache store / context-shift kernels (kernels/llm/kv_cache.cl).
 # rope.cl
 LLM_RoPE_Ext	rope.comp
+LLM_RoPE_FoPE	fope_rope.comp
 # kv_cache.cl
 LLM_KV_Store_F32	kv_store.comp	KV=NF_KV_F32
 LLM_KV_Store_F16	kv_store.comp	KV=NF_KV_F16
@@ -12,6 +13,21 @@ LLM_KV_Store_Q4_1	kv_store.comp	KV=NF_KV_Q4_1
 LLM_KV_Store_IQ4_NL	kv_store.comp	KV=NF_KV_IQ4_NL
 LLM_KV_Store_Q5_0	kv_store.comp	KV=NF_KV_Q5_0
 LLM_KV_Store_Q5_1	kv_store.comp	KV=NF_KV_Q5_1
+LLM_KV_Store_FP8_E4M3	kv_store.comp	KV=NF_KV_FP8_E4M3
+LLM_KV_Store_FP8_E5M2	kv_store.comp	KV=NF_KV_FP8_E5M2
+LLM_KV_Store_FP8_PER_TOKEN_HEAD	kv_store.comp	KV=NF_KV_FP8_PER_TOKEN_HEAD
+LLM_KV_Store_INT8_PER_TOKEN_HEAD	kv_store.comp	KV=NF_KV_INT8_PER_TOKEN_HEAD
+LLM_KV_Store_INT4_PER_TOKEN_HEAD	kv_store.comp	KV=NF_KV_INT4_PER_TOKEN_HEAD
+LLM_KV_Store_NVFP4	kv_store.comp	KV=NF_KV_NVFP4
+LLM_KV_Store_NVFP4_4OVER6	kv_store.comp	KV=NF_KV_NVFP4_4OVER6
+LLM_KV_Store_TQ_K8_KEYS	kv_store.comp	KV=NF_KV_TQ_K8_KEYS
+LLM_KV_Store_TQ_4BIT_KEYS	kv_store.comp	KV=NF_KV_TQ_4BIT_KEYS
+LLM_KV_Store_TQ_3BIT_KEYS	kv_store.comp	KV=NF_KV_TQ_3BIT_KEYS
+LLM_KV_Store_TQ_4BIT_VALUES	kv_store.comp	KV=NF_KV_TQ_4BIT_VALUES
+LLM_KV_Store_TQ_3BIT_VALUES	kv_store.comp	KV=NF_KV_TQ_3BIT_VALUES
+LLM_KV_Store_FP8_DS_MLA	kv_store.comp	KV=NF_KV_FP8_DS_MLA
+LLM_KV_Store_NVFP4_DS_MLA	kv_store.comp	KV=NF_KV_NVFP4_DS_MLA
+LLM_KvTqRotateQ	kv_tq_rotate.comp
 LLM_KV_RopeShift_F32	kv_shift.comp	KV=NF_KV_F32
 LLM_KV_RopeShift_F16	kv_shift.comp	KV=NF_KV_F16
 LLM_KV_RopeShift_Q8_0	kv_shift.comp	KV=NF_KV_Q8_0
@@ -21,3 +37,8 @@ LLM_KV_RopeShift_Q4_1	kv_shift.comp	KV=NF_KV_Q4_1
 LLM_KV_RopeShift_IQ4_NL	kv_shift.comp	KV=NF_KV_IQ4_NL
 LLM_KV_RopeShift_Q5_0	kv_shift.comp	KV=NF_KV_Q5_0
 LLM_KV_RopeShift_Q5_1	kv_shift.comp	KV=NF_KV_Q5_1
+LLM_KV_RopeShift_FP8_E4M3	kv_shift.comp	KV=NF_KV_FP8_E4M3
+LLM_KV_RopeShift_FP8_E5M2	kv_shift.comp	KV=NF_KV_FP8_E5M2
+LLM_KV_RopeShift_FP8_PER_TOKEN_HEAD	kv_shift.comp	KV=NF_KV_FP8_PER_TOKEN_HEAD
+LLM_KV_RopeShift_INT8_PER_TOKEN_HEAD	kv_shift.comp	KV=NF_KV_INT8_PER_TOKEN_HEAD
+LLM_KV_RopeShift_INT4_PER_TOKEN_HEAD	kv_shift.comp	KV=NF_KV_INT4_PER_TOKEN_HEAD

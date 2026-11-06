@@ -8,6 +8,7 @@ import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfHookSupport;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadataBuilder;
 import com.eonmux.neuralfree.gguf.hf.tensor.ElementFormat;
+import com.eonmux.neuralfree.gguf.hf.tensor.ElementTransforms;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfPlanView;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
@@ -262,7 +263,7 @@ public final class HfKdaHooksB {
      * The elementwise product of two equal-sized tensors computed in f32 (kimi_k3.py:261
      * {@code norm.float().flatten() * proj.float().flatten()}): one row at a time, chunk-local, immutable.
      */
-    private static final class ResidualProduct implements RowSource {
+    static final class ResidualProduct implements RowSource {
         private final RowSource norm;
         private final RowSource proj;
         private final long[] shape;
@@ -274,7 +275,8 @@ public final class HfKdaHooksB {
                 throw new IllegalArgumentException("fused residual tensors' shapes differ: " + a.describe() + " of "
                         + Arrays.toString(sa) + " and " + b.describe() + " of " + Arrays.toString(sb));
             }
-            return new ResidualProduct(a, b, sa);
+            return new ResidualProduct(ElementTransforms.convert(a, GGMLType.F32),
+                    ElementTransforms.convert(b, GGMLType.F32), sa);
         }
 
         private ResidualProduct(RowSource norm, RowSource proj, long[] shape) {

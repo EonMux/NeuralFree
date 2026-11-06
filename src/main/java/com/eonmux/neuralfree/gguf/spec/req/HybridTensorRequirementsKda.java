@@ -14,7 +14,7 @@ import static com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirements.and;
 import static com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirements.not;
 
 /**
- * Tensor lists of the Kimi delta attention (KDA) + MLA hybrids: kimi-linear, kimi-k3, bailingmoe3 and
+ * Tensor lists of the Kimi delta attention (KDA) hybrids: kimi-linear, kimi-k3, alice-ai, bailingmoe3 and
  * glm5-next. KDA layers hold depthwise Q/K/V convolutions ({@code ssm_conv1d_q/k/v}, created 4-D or, after
  * quantization, 3-D under the same name), the decay gate ({@code ssm_f_a} [+ {@code ssm_f_b}],
  * {@code ssm_dt.bias}, {@code ssm_a}), {@code ssm_beta}, the output gate and the gated output norm.
@@ -23,6 +23,13 @@ public final class HybridTensorRequirementsKda {
 
     /** Cross-layer attention residuals enabled: {@code attn_res_block_size > 0} (kimi-k3.cpp:73). */
     private static final LayerCondition ATTN_RES = (hp, il) -> hp.attnResBlockSize() > 0;
+    /**
+     * Attention-residual score of a layer after the first: layer 0 always runs on the raw embedding as the only
+     * source, so it has no attention score projection (vLLM alice_ai.py AliceAIDecoderBlock).
+     */
+    private static final LayerCondition ATTN_RES_AFTER_FIRST = (hp, il) -> hp.attnResBlockSize() > 0 && il > 0;
+    /** Gated shared expert: a positive shared-expert FFN width. */
+    private static final LayerCondition SHARED_EXPERT = (hp, il) -> hp.nFfShexp() > 0;
     /** Latent routed experts: {@code n_expert_latent > 0} (kimi-k3.cpp:154). */
     private static final LayerCondition LATENT_EXPERTS = (hp, il) -> hp.nExpertLatent() > 0;
     /** Low-rank MLA query: {@code q_lora_rank > 0} (bailingmoe3.cpp:90). */
@@ -82,6 +89,34 @@ public final class HybridTensorRequirementsKda {
         b.layer(latent, "ffn_routed_down.weight", "ffn_routed_up.weight");
         b.layerOptional(latent, "ffn_routed_norm.weight");
         b.layerOptional(AFTER_DENSE_LEAD, "ffn_gate_shexp.weight", "ffn_down_shexp.weight", "ffn_up_shexp.weight");
+        return b.build();
+    }
+
+    /**
+     * AliceAI (vLLM models/alice_ai.py): KDA layers carry the low-rank decay and output gates
+     * ({@code ssm_f_a}/{@code ssm_f_b}, {@code ssm_g_a}/{@code ssm_g_b}), the attention layers the Qwen3-Next
+     * interleaved Q gate and its per-head Q/K norms, and every layer the sigmoid-routed experts with a gated shared
+     * expert. The cross-layer attention residuals add {@code attn_res_score} from layer 1 on (layer 0 has no
+     * attention score projection), {@code ffn_res_score} on every layer and the model-level
+     * {@code output_res_score}.
+     */
+    public static List<TensorRequirement> aliceAi() {
+        HybridTensorRequirements.Builder b = HybridTensorRequirements.builder();
+        b.model("token_embd.weight", "output_norm.weight");
+        b.outputOrTied();
+        b.modelWhen(hp -> hp.attnResBlockSize() > 0, "output_res_score.weight");
+        b.layer(ALL, "attn_norm.weight", "ffn_norm.weight");
+        b.layer(ATTN_RES, "ffn_res_score.weight");
+        b.layer(ATTN_RES_AFTER_FIRST, "attn_res_score.weight");
+        kdaConvAndQkv(b);
+        b.qkv(ATTENTION);
+        b.layer(RECURRENT, "ssm_f_a.weight", "ssm_f_b.weight", "ssm_beta.weight", "ssm_a", "ssm_dt.bias",
+                "ssm_g_a.weight", "ssm_g_b.weight", "ssm_norm.weight", "attn_output.weight");
+        b.layer(ATTENTION, "attn_q_norm.weight", "attn_k_norm.weight", "attn_output.weight");
+        b.layer(ALL, "ffn_gate_inp.weight", "exp_probs_b.bias", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                "ffn_down_exps.weight");
+        b.layer(SHARED_EXPERT, "ffn_gate_inp_shexp.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight");
         return b.build();
     }
 

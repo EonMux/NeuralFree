@@ -188,16 +188,20 @@ public class CLDeviceRankingTest {
         // legitimate place to run this suite, but a host that has one must prove
         // the probe works, because every multi-GPU decision rests on it.
         HWAcceleration hw = new HWAcceleration();
-        List<CLDevice> devices = hw.getCLDevices();
-        Assume.assumeFalse("no OpenCL device on this host", devices.isEmpty());
+        try {
+            List<CLDevice> devices = hw.getCLDevices();
+            Assume.assumeFalse("no OpenCL device on this host", devices.isEmpty());
 
-        double gflops = CLDeviceRanking.probe(devices.get(0));
-        assertTrue("probe returned " + gflops + " GFLOP/s, which is not a rate",
-                gflops > 0 && !Double.isInfinite(gflops));
+            double gflops = CLDeviceRanking.probe(devices.get(0));
+            assertTrue("probe returned " + gflops + " GFLOP/s, which is not a rate",
+                    gflops > 0 && !Double.isInfinite(gflops));
 
-        // fastest() must agree with itself across calls, or a run could end up
-        // split across two devices.
-        assertEquals(CLDeviceRanking.fastest(devices), CLDeviceRanking.fastest(devices));
+            // fastest() must agree with itself across calls, or a run could end up
+            // split across two devices.
+            assertEquals(CLDeviceRanking.fastest(devices), CLDeviceRanking.fastest(devices));
+        } finally {
+            hw.shutdown();
+        }
     }
 
     private static void restore(String key, String previous) {

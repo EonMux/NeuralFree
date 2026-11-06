@@ -22,8 +22,8 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-D1 part E fixtures ({@code OpenELMModel}, {@code Phi2Model}, {@code StarCoder2Model}, {@code Spark2_5Model},
- * {@code TalkieModel} and the GraniteSwitch HK-0 composition) build through the registered entries:
+ * The fixtures ({@code OpenELMModel}, {@code Phi2Model}, {@code StarCoder2Model}, {@code Spark2_5Model},
+ * {@code TalkieModel} and the GraniteSwitch composition) build through the registered entries:
  * {@link ModelSpecBuilder} succeeds and every catalog tensor is claimed ({@code TensorClaims}), which is the
  * done-getting-tensors check of the converter's tensor plan.
  */

@@ -1,9 +1,9 @@
 /* moe_matvec.cl - matvec_id_family instantiations for every weight type (MoE expert matvecs). Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/quant_blocks.h, common/iq_tables.h, common/quant_decode_legacy.h, common/quant_decode_k.h, common/quant_decode_iq.h, common/quant_decode_new.h, common/quant_decode_ext.h, common/matvec_id_family.h */
 /*
- * Each NF_MOE_ID_KERNELS line generates T_MatVecId, T_MatVecIdGateUp and T_BatchMatMulId with the
- * arguments and launch contract of common/matvec_id_family.h, for the 38 supported weight types.
- * Threads per block (TPS): dense 1; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, Q8_0, MXFP4, F8_E5M2, F8_E4M3,
- * MXFP8, MXFP6_E2M3, MXFP6_E3M2 4; NVFP4, Q2_0, NF4, FP4_BNB 8; Q1_0, F8_E4M3_B128, I8_B128 16; IQ4_XS, the K-quants, the
+ * Each NF_MOE_ID_KERNELS line generates T_MatVecId, T_MatVecIdT, T_MatVecIdGateUp and T_BatchMatMulId
+ * with the arguments and launch contract of common/matvec_id_family.h, for the 41 supported weight
+ * types. Threads per block (TPS): dense 1; Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, Q8_0, MXFP4, F8_E5M2, F8_E4M3,
+ * F8_E4M3_B32, MXFP8, MXFP6_E2M3, MXFP6_E3M2 4; NVFP4, Q2_0, NF4, FP4_BNB 8; Q1_0, F8_E4M3_B128, I8_B128 16; IQ4_XS, the K-quants, the
  * I-quants, TQ1_0 and TQ2_0 32. The local size must be a power of two and a multiple of TPS
  * (Java: MoeKernels.threadsPerBlock).
  */
@@ -34,6 +34,8 @@ NF_MOE_ID_KERNELS(Q8_K, Q8_K, Q8_K_BLOCK_SIZE, Q8_K_BLOCK_BYTES, NF_KQ_TPS)
 /* ---- I-quant super-blocks (common/quant_decode_iq.h) ---- */
 NF_MOE_ID_KERNELS(IQ3_XXS, IQ3_XXS, IQ3_XXS_BLOCK_SIZE, IQ3_XXS_BLOCK_BYTES, NF_IQD_TPS)
 NF_MOE_ID_KERNELS(IQ3_S,   IQ3_S,   IQ3_S_BLOCK_SIZE,   IQ3_S_BLOCK_BYTES,   NF_IQD_TPS)
+NF_MOE_ID_KERNELS(IQ3_K,   IQ3_K,   IQ3_K_BLOCK_SIZE,   IQ3_K_BLOCK_BYTES,   NF_IQD_TPS)
+NF_MOE_ID_KERNELS(IQ3_KS,  IQ3_KS,  IQ3_KS_BLOCK_SIZE,  IQ3_KS_BLOCK_BYTES,  NF_IQD_TPS)
 NF_MOE_ID_KERNELS(IQ2_XXS, IQ2_XXS, IQ2_XXS_BLOCK_SIZE, IQ2_XXS_BLOCK_BYTES, NF_IQD_TPS)
 NF_MOE_ID_KERNELS(IQ2_XS,  IQ2_XS,  IQ2_XS_BLOCK_SIZE,  IQ2_XS_BLOCK_BYTES,  NF_IQD_TPS)
 NF_MOE_ID_KERNELS(IQ2_S,   IQ2_S,   IQ2_S_BLOCK_SIZE,   IQ2_S_BLOCK_BYTES,   NF_IQD_TPS)
@@ -51,6 +53,7 @@ NF_MOE_ID_KERNELS(Q2_0,  Q2_0,  Q2_0_BLOCK_SIZE,  Q2_0_BLOCK_BYTES,  Q2_0_TPS)
 NF_MOE_ID_KERNELS(F8_E5M2,       F8_E5M2,       F8_E5M2_BLOCK_SIZE,       F8_E5M2_BLOCK_BYTES,       F8_E5M2_TPS)
 NF_MOE_ID_KERNELS(F8_E4M3,      F8_E4M3,      F8_E4M3_BLOCK_SIZE,      F8_E4M3_BLOCK_BYTES,      F8_E4M3_TPS)
 NF_MOE_ID_KERNELS(F8_E4M3_B128, F8_E4M3_B128, F8_E4M3_B128_BLOCK_SIZE, F8_E4M3_B128_BLOCK_BYTES, F8_E4M3_B128_TPS)
+NF_MOE_ID_KERNELS(F8_E4M3_B32,  F8_E4M3_B32,  F8_E4M3_B32_BLOCK_SIZE,  F8_E4M3_B32_BLOCK_BYTES,  F8_E4M3_B32_TPS)
 NF_MOE_ID_KERNELS(MXFP8,        MXFP8,        MXFP8_BLOCK_SIZE,        MXFP8_BLOCK_BYTES,        MXFP8_TPS)
 NF_MOE_ID_KERNELS(MXFP6_E2M3,   MXFP6_E2M3,   MXFP6_E2M3_BLOCK_SIZE,   MXFP6_E2M3_BLOCK_BYTES,   MXFP6_E2M3_TPS)
 NF_MOE_ID_KERNELS(MXFP6_E3M2,   MXFP6_E3M2,   MXFP6_E3M2_BLOCK_SIZE,   MXFP6_E3M2_BLOCK_BYTES,   MXFP6_E3M2_TPS)

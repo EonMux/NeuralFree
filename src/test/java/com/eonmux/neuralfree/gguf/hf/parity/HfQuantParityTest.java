@@ -44,7 +44,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
 /**
- * PT-1, HfQuantParityTest: every quantized source form the WP lists is rebuilt as a tiny planned tensor of the raw
+ * Every quantized source form the converter rules cover is rebuilt as a tiny planned tensor of the raw
  * format, decoded through the exact CPU entry the repository serves those types with
  * ({@link CpuBlockDecoders#dequantize(byte[], GGMLType, long)} for the block formats) and compared element-wise with
  * the hand-computed reference dequantization — the format's own formula {@code (q - z) * s} or {@code code * block
@@ -174,7 +174,7 @@ public class HfQuantParityTest {
         RowSource w = Fp8Scheme.rewriteModules(QuantArgs.builder(QuantFormat.FP8).block(128, 128).build(),
                 List.of(M), cfg(), f.index(), ModelSourceOptions.defaults()).get(M + ".weight");
         // per-tensor E4M3 rides as raw codes plus the output multiplier; folded it becomes F8_E4M3_B128
-        assertEquals(GGMLType.F8_E4M3, w.format().ggmlType());
+        assertEquals(GGMLType.F8_E4M3FN, w.format().ggmlType());
         assertArrayEquals(new float[]{0.375f}, w.outputScale(), 0f);
         RowSource b128 = w.foldOutputScale();
         assertEquals(GGMLType.F8_E4M3_B128, b128.format().ggmlType());

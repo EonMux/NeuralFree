@@ -24,17 +24,27 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * The Hugging Face Hub over {@link HttpClient} with TLS verification on (PARITY.md WP TL-7), the
+ * The Hugging Face Hub over {@link HttpClient} with TLS verification on, the
  * mirror of llama.cpp's {@code common/hf-cache.cpp} and {@code common/download.cpp}: the refs and
  * tree APIs give the repository's files, and the resolve endpoint downloads them into
  * {@link HubCache} with the Hub's ETag check and {@code Range} resume, where every LFS download is
- * verified against its sha256 pointer before it enters the snapshot tree. Access is the
- * {@code HF_TOKEN} environment value in its valid form, carried in the {@code Authorization} header
- * only: never logged, never printed, never in an error message. {@code HF_HUB_OFFLINE} is the
+ * verified against its sha256 pointer before it enters the snapshot tree, and {@link #readRange} reads
+ * a byte span of one file without downloading it, which is how a model slice takes single tensors.
+ * Access is the token in
+ * its valid form, carried in the {@code Authorization} header only: never logged, never printed, never
+ * in an error message. The token resolves as huggingface_hub's {@code get_token}: the explicit value
+ * first, then the {@code HF_TOKEN} environment value, then the file {@code HF_TOKEN_PATH} names, then
+ * {@code HF_HOME/token} (HF_HOME defaulting to {@code XDG_CACHE_HOME/huggingface}, then
+ * {@code ~/.cache/huggingface}) — the file {@code hf auth login} writes — while
+ * {@code HF_HUB_DISABLE_IMPLICIT_TOKEN} turns the implicit sources off. {@code HF_HUB_OFFLINE} is the
  * offline mode whose callers read {@link HubCache} instead. The responses, the paths they name and
- * the oids they carry are untrusted input (§3.6): JSON is parsed under {@link Json.Limits#UNTRUSTED},
+ * the oids they carry are untrusted input: JSON is parsed under {@link Json.Limits#UNTRUSTED},
  * repository paths are confined by {@link HubCache#snapshotPath}, and an oid is hex before anything
  * else in the cache reads it. Immutable; safe over concurrent threads.
  */
@@ -112,8 +122,32 @@ public final class HubClient {
     private final String endpoint;
     private final String token;
 
-    /** A client over the cache {@code cache}, the default endpoint and the {@code HF_TOKEN} token. */
+    /** A client over the cache {@code cache}, the default endpoint and the environment's token. */
     public HubClient(HubCache cache) {
+        this(cache, null);
+    }
+
+    /**
+     * A client over the cache {@code cache} and the default endpoint, carrying {@code token} when it is a valid
+     * llama.cpp token form and the environment's token otherwise.
+     */
+    public HubClient(HubCache cache, String token) {
+        this(cache, token, null);
+    }
+
+    /**
+     * A client over the cache {@code cache} and the endpoint {@code endpoint} ({@code HF_ENDPOINT}'s form,
+     * trailing slash optional; null keeps the environment's endpoint), carrying {@code token} when it is a valid
+     * llama.cpp token form and the environment's token otherwise. An explicit endpoint is what a
+     * test serves a repository from.
+     */
+    public HubClient(HubCache cache, String token, String endpoint) {
+        this(cache, token, endpoint, System::getenv);
+    }
+
+    /** A client whose environment values the lookup {@code env} answers, which a test serves a temporary
+     * {@code HF_HOME} or {@code HF_TOKEN_PATH} through. */
+    HubClient(HubCache cache, String token, String endpoint, Function<String, String> env) {
         this.cache = cache;
         // TLS verification stays on: the default SSLContext verifies every certificate and host name,
         // as llama.cpp's http backend and the plan's TLS-on rule both fix
@@ -121,19 +155,111 @@ public final class HubClient {
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .connectTimeout(TIMEOUT)
                 .build();
-        this.endpoint = endpoint();
-        this.token = token();
+        this.endpoint = endpoint == null ? endpoint() : normalizeEndpoint(endpoint);
+        this.token = resolveToken(token, env);
     }
 
-    /** The {@code HF_TOKEN} environment value in llama.cpp's valid form, or null. */
-    static String token() {
-        // llama.cpp is_valid_hf_token: "hf_" and then 34..253 alphanumerics; an invalid token means
-        // anonymous access and the value itself is never echoed back, logged or thrown
-        String t = System.getenv("HF_TOKEN");
-        if (t == null) {
+    /** The endpoint in the trailing-slash form every URL of this class is built from. */
+    private static String normalizeEndpoint(String endpoint) {
+        String v = Objects.requireNonNull(endpoint, "endpoint").trim();
+        if (v.isEmpty()) {
+            throw new IllegalArgumentException("the hub endpoint is empty");
+        }
+        return v.endsWith("/") ? v : v + "/";
+    }
+
+    /**
+     * The token to carry: the explicit value when it is a valid llama.cpp token form, else the environment's
+     * implicit resolution, huggingface_hub's {@code get_token}: the {@code HF_TOKEN} value, then the file
+     * {@code HF_TOKEN_PATH} names, then {@code HF_HOME/token} (HF_HOME defaulting to
+     * {@code XDG_CACHE_HOME/huggingface}, then {@code ~/.cache/huggingface}), the file {@code hf auth login}
+     * writes. {@code HF_HUB_DISABLE_IMPLICIT_TOKEN} (1, on, yes or true) turns the implicit sources off, so
+     * only an explicit token reaches the header then. The first source that carries a non-blank value decides:
+     * a value of another form than {@link #validToken} accepts is anonymous access, never a fall-through to a
+     * lower source. The value itself is never logged, printed or thrown.
+     */
+    static String resolveToken(String explicit, Function<String, String> env) {
+        String own = validToken(explicit);
+        if (own != null) {
+            return own;
+        }
+        if (implicitTokenDisabled(env)) {
             return null;
         }
-        String trimmed = t.trim();
+        String envToken = env.apply("HF_TOKEN");
+        if (envToken != null && !envToken.trim().isEmpty()) {
+            return validToken(envToken);
+        }
+        Path file = tokenFile(env);
+        return file == null ? null : fileToken(file);
+    }
+
+    /** The token this client carries in its {@code Authorization} header, or null for anonymous access. */
+    String tokenValue() {
+        return token;
+    }
+
+    /** Whether {@code HF_HUB_DISABLE_IMPLICIT_TOKEN} is set in huggingface_hub's form: 1, on, yes or true. */
+    static boolean implicitTokenDisabled(Function<String, String> env) {
+        String up = trimmedEnv("HF_HUB_DISABLE_IMPLICIT_TOKEN", env).toUpperCase(Locale.ROOT);
+        return up.equals("1") || up.equals("ON") || up.equals("YES") || up.equals("TRUE");
+    }
+
+    /**
+     * The file whose token the environment falls back to: {@code HF_TOKEN_PATH}, else {@code HF_HOME/token}
+     * (HF_HOME defaulting to {@code XDG_CACHE_HOME/huggingface}, then {@code ~/.cache/huggingface}); null
+     * when even the home directory is unknown. One file only: an {@code HF_TOKEN_PATH} that is missing or
+     * empty replaces the default, as huggingface_hub's {@code HF_TOKEN_PATH} constant does.
+     */
+    static Path tokenFile(Function<String, String> env) {
+        String named = trimmedEnv("HF_TOKEN_PATH", env);
+        if (!named.isEmpty()) {
+            return Paths.get(named);
+        }
+        String hfHome = trimmedEnv("HF_HOME", env);
+        if (!hfHome.isEmpty()) {
+            return Paths.get(hfHome).resolve("token");
+        }
+        String xdgCache = trimmedEnv("XDG_CACHE_HOME", env);
+        if (!xdgCache.isEmpty()) {
+            return Paths.get(xdgCache).resolve("huggingface").resolve("token");
+        }
+        String home = homeDirectory(env);
+        return home == null ? null
+                : Paths.get(home).resolve(".cache").resolve("huggingface").resolve("token");
+    }
+
+    /** The home directory {@code os.path.expanduser} would expand to: {@code HOME}, then the user.home
+     * property; null when neither names a directory. */
+    private static String homeDirectory(Function<String, String> env) {
+        String home = trimmedEnv("HOME", env);
+        if (!home.isEmpty()) {
+            return home;
+        }
+        String property = System.getProperty("user.home");
+        return property == null || property.trim().isEmpty() ? null : property.trim();
+    }
+
+    /** The trimmed token of the file {@code file}, or null when it is missing, unreadable or blank. */
+    static String fileToken(Path file) {
+        try {
+            String value = new String(Files.readAllBytes(file), StandardCharsets.UTF_8).trim();
+            return value.isEmpty() ? null : validToken(value);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * A token in llama.cpp's valid form, or null. llama.cpp {@code is_valid_hf_token}: {@code hf_} and then
+     * 34..253 alphanumerics; an invalid token means anonymous access and the value itself is never echoed back,
+     * logged or thrown.
+     */
+    public static String validToken(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
         if (trimmed.length() < 37 || trimmed.length() > 256 || !trimmed.startsWith("hf_")) {
             return null;
         }
@@ -167,7 +293,12 @@ public final class HubClient {
 
     /** An environment value, or the empty string instead of null. */
     private static String trimmedEnv(String name) {
-        String v = System.getenv(name);
+        return trimmedEnv(name, System::getenv);
+    }
+
+    /** The value {@code env} answers for {@code name}, trimmed, or the empty string instead of null. */
+    private static String trimmedEnv(String name, Function<String, String> env) {
+        String v = env.apply(name);
         return v == null ? "" : v.trim();
     }
 
@@ -179,25 +310,40 @@ public final class HubClient {
     // ================================================================== hub API
 
     /**
-     * The commit {@code ref} resolves to online: llama.cpp's get_repo_commit over the refs API, which
-     * writes the branch's commit into the cache's refs as it resolves. Main wins; entries whose name
-     * is no valid ref name or whose commit is no 40-hex hash are skipped, and a repository with no
-     * valid branch is a refusal because the snapshot layout is keyed on the commit.
+     * The commit {@code ref} resolves to online: a 40-hex revision is itself, an explicit branch name
+     * selects that branch, and otherwise main wins; llama.cpp's get_repo_commit over the refs API
+     * writes the branch's commit into the cache's refs as it resolves. Entries whose name is no
+     * valid ref name or whose commit is no 40-hex hash are skipped, and a repository with no valid
+     * branch is a refusal because the snapshot layout is keyed on the commit.
      */
     public String resolveCommit(HubRef ref) throws IOException, InterruptedException {
-        Object parsed = apiGet(endpoint + "api/models/" + ref.repository() + "/refs");
-        if (!(parsed instanceof List)) {
+        String requested = ref.revision();
+        if (requested != null && HubCache.isValidOid(requested, 40)) {
+            return requested.toLowerCase(Locale.ROOT);
+        }
+        Object parsed = apiGet(endpoint + "api/" + ref.type().apiSegment() + "/" + ref.repository() + "/refs");
+        // a model's refs answer is a list; a dataset's is an object whose "branches" carry the commits
+        Object branches = parsed;
+        if (parsed instanceof Map) {
+            branches = ((Map<?, ?>) parsed).get("branches");
+        }
+        if (!(branches instanceof List)) {
             throw new IOException("the refs response of '" + ref + "' on " + endpoint
-                    + " is not a list");
+                    + " carries no branch list");
         }
         String commit = null;
         String branch = null;
-        for (Object o : (List<?>) parsed) {
+        for (Object o : (List<?>) branches) {
             String name = stringOf(o, "name");
             String target = stringOf(o, "targetCommit");
             if (name == null || target == null || !HubCache.isValidOid(target, 40)
                     || !isValidRefName(name)) {
                 continue;
+            }
+            if (requested != null && name.equals(requested)) {
+                commit = target;
+                branch = name;
+                break;
             }
             if (name.equals("main")) {
                 commit = target;
@@ -225,8 +371,8 @@ public final class HubClient {
     public List<RepoFile> listFiles(HubRef ref, String commit)
             throws IOException, InterruptedException {
         String hex = HubCache.validOid(commit, "commit");
-        Object parsed = apiGet(endpoint + "api/models/" + ref.repository() + "/tree/" + hex
-                + "?recursive=true");
+        Object parsed = apiGet(endpoint + "api/" + ref.type().apiSegment() + "/" + ref.repository()
+                + "/tree/" + hex + "?recursive=true");
         if (!(parsed instanceof List)) {
             throw new IOException("the tree response of '" + ref + "' on " + endpoint
                     + " is not a list");
@@ -247,15 +393,16 @@ public final class HubClient {
             if (oid != null && !HubCache.isSha256Oid(oid) && !HubCache.isValidOid(oid, 40)) {
                 continue;
             }
-            out.add(new RepoFile(ref.repository(), path, oid, resolveUrl(endpoint, ref.repository(),
-                    hex, path), sizeOf(o)));
+            out.add(new RepoFile(ref.repository(), path, oid, resolveUrl(endpoint, ref, hex, path),
+                    sizeOf(o)));
         }
         return out;
     }
 
     /** The resolve URL of one repository file at {@code commit}, its path percent-encoded per segment. */
-    static String resolveUrl(String endpoint, String repoId, String commit, String path) {
-        return endpoint + encodePath(repoId) + "/resolve/" + commit + "/" + encodePath(path);
+    static String resolveUrl(String endpoint, HubRef ref, String commit, String path) {
+        return endpoint + ref.type().resolvePrefix() + encodePath(ref.repository()) + "/resolve/"
+                + commit + "/" + encodePath(path);
     }
 
     // ================================================================== downloads
@@ -274,7 +421,7 @@ public final class HubClient {
         expectFile(ref, hex, file);
         Path snapshot = cache.snapshotPath(ref, hex, file.path());
         String url = file.url().isEmpty()
-                ? resolveUrl(endpoint, ref.repository(), hex, file.path()) : file.url();
+                ? resolveUrl(endpoint, ref, hex, file.path()) : file.url();
         // llama.cpp: an LFS object's bytes land in blobs/<oid>, and the snapshot path links to it
         Path local = file.oid() != null ? cache.blobPath(ref, file.oid()) : snapshot;
         if (!isInside(cache.root(), local)) {
@@ -352,11 +499,12 @@ public final class HubClient {
         throw failure != null ? failure : new IOException("download of '" + file.path() + "' failed");
     }
 
-    /** The output of one repository HEAD request: status, ETag and whether ranges are served. */
+    /** The output of one repository HEAD request: status, ETag, whether ranges are served and the body length. */
     private static final class Head {
         int status;
         String etag;
         boolean ranges;
+        long length = -1L;
     }
 
     /** One HEAD carrying the token and the Hub user agent, without retries (llama.cpp carries none). */
@@ -369,7 +517,244 @@ public final class HubClient {
         head.status = r.statusCode();
         head.etag = r.headers().firstValue("etag").orElse(null);
         head.ranges = !"none".equals(r.headers().firstValue("accept-ranges").orElse(""));
+        String length = r.headers().firstValue("content-length").orElse(null);
+        if (length != null) {
+            try {
+                head.length = Long.parseLong(length.trim());
+            } catch (NumberFormatException e) {
+                head.length = -1L;
+            }
+        }
         return head;
+    }
+
+    // ================================================================== ranged reads
+
+    /**
+     * Receives the bytes of a ranged read in order. {@code rangeOffset} is the byte's position within the
+     * requested range, so a retried range rewrites the same positions instead of appending them again.
+     */
+    public interface RangeSink {
+
+        /** Writes the {@code length} bytes at {@code bytes[offset]}, the first of them {@code rangeOffset} into
+         * the range. */
+        void write(long rangeOffset, byte[] bytes, int offset, int length) throws IOException;
+    }
+
+    /**
+     * Streams bytes {@code [start, endInclusive]} of one repository file of {@code commit} into {@code sink},
+     * as the model slicer reads a tensor without downloading its shard: a {@code Range} request answered with
+     * {@code 206 Partial Content} whose {@code Content-Range} names exactly the requested span (a server that
+     * ignores the header and answers the whole file is accepted when the range starts at byte 0), retried on a
+     * failed or short response and final on a 4xx. Every byte is delivered exactly once, at its offset in the
+     * range; a retry overwrites the prefix a failed attempt had written.
+     */
+    public void readRange(HubRef ref, String commit, RepoFile file, long start, long endInclusive, RangeSink sink)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(file, "file");
+        Objects.requireNonNull(sink, "sink");
+        if (start < 0 || endInclusive < start) {
+            throw new IllegalArgumentException("the byte range [" + start + ", " + endInclusive + "] of '"
+                    + file.path() + "' is not a range with 0 <= start <= end");
+        }
+        if (file.size() >= 0 && endInclusive >= file.size()) {
+            throw new IllegalArgumentException("the byte range [" + start + ", " + endInclusive + "] of '"
+                    + file.path() + "' runs past the file's " + file.size() + " bytes");
+        }
+        read(ref, commit, file, start, endInclusive, Long.MAX_VALUE, sink);
+    }
+
+    /**
+     * The bytes {@code [start, endInclusive]} of one repository file of {@code commit}, in a new array; the
+     * range must fit a Java array.
+     */
+    public byte[] readRange(HubRef ref, String commit, RepoFile file, long start, long endInclusive)
+            throws IOException, InterruptedException {
+        long span = endInclusive - start;
+        if (span < 0 || span >= Integer.MAX_VALUE - 8) {
+            throw new IllegalArgumentException("the byte range [" + start + ", " + endInclusive + "] of '"
+                    + file.path() + "' does not fit one array");
+        }
+        byte[] out = new byte[(int) (span + 1)];
+        readRange(ref, commit, file, start, endInclusive, (rangeOffset, bytes, offset, length) -> {
+            if (rangeOffset > out.length - length) {
+                throw new IOException("the range of '" + file.path() + "' delivered bytes past its end");
+            }
+            System.arraycopy(bytes, offset, out, (int) rangeOffset, length);
+        });
+        return out;
+    }
+
+    /**
+     * The whole bytes of one repository file of {@code commit}, at most {@code maxBytes}; a listing that carries
+     * no size is headed first, so the range is always bounded.
+     */
+    public byte[] readAll(HubRef ref, String commit, RepoFile file, long maxBytes)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(file, "file");
+        if (maxBytes < 0) {
+            throw new IllegalArgumentException("the byte limit must be >= 0, got " + maxBytes);
+        }
+        long size = file.size() >= 0 ? file.size() : contentLength(ref, commit, file);
+        if (size > maxBytes) {
+            throw new IOException("the file '" + file.path() + "' is " + size + " bytes, over the "
+                    + maxBytes + "-byte limit");
+        }
+        return size == 0 ? new byte[0] : readRange(ref, commit, file, 0, size - 1);
+    }
+
+    /** The length of one repository file from a HEAD request, for a listing that carried no size. */
+    public long contentLength(HubRef ref, String commit, RepoFile file)
+            throws IOException, InterruptedException {
+        String hex = HubCache.validOid(commit, "commit");
+        expectFile(ref, hex, file);
+        String url = file.url().isEmpty() ? resolveUrl(endpoint, ref, hex, file.path()) : file.url();
+        Head head = head(url);
+        if (head.status < 200 || head.status >= 300) {
+            throw new IOException("HEAD over the Hub answered HTTP " + head.status + " for '"
+                    + file.path() + "'");
+        }
+        if (head.length < 0) {
+            throw new IOException("HEAD over the Hub gave no length for '" + file.path() + "'");
+        }
+        return head.length;
+    }
+
+    /**
+     * One ranged read with the downloader's retry budget: a 4xx is final, a failed or short response retries, and a
+     * response that contradicts the span it announces is final too.
+     */
+    private void read(HubRef ref, String commit, RepoFile file, long start, long endInclusive, long maxBytes,
+                      RangeSink sink) throws IOException, InterruptedException {
+        String hex = HubCache.validOid(commit, "commit");
+        expectFile(ref, hex, file);
+        String url = file.url().isEmpty() ? resolveUrl(endpoint, ref, hex, file.path()) : file.url();
+        String range = "bytes=" + start + "-" + endInclusive;
+        IOException failure = null;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            if (attempt > 0) {
+                // llama.cpp: 2s, then doubled per further attempt
+                Thread.sleep(1000L << attempt);
+            }
+            HttpRequest request = requestBuilder(url).header("Range", range).GET().build();
+            HttpResponse<InputStream> response;
+            try {
+                response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
+            } catch (IOException e) {
+                failure = e;
+                continue;
+            }
+            int status = response.statusCode();
+            if (status == 206 || (status == 200 && start == 0)) {
+                try (InputStream body = response.body()) {
+                    copyRange(body, response, file, start, endInclusive, status == 200, maxBytes, sink);
+                    return;
+                } catch (InvalidRangeResponse e) {
+                    // a span the server announced and then contradicted will not change on a retry
+                    throw e;
+                } catch (IOException e) {
+                    failure = e;
+                    continue;
+                }
+            }
+            closeQuietly(response.body());
+            IOException refused = new IOException("the range " + range + " of '" + file.path()
+                    + "' answered HTTP " + status);
+            if (status >= 400 && status < 500) {
+                throw refused;
+            }
+            failure = refused;
+        }
+        throw failure != null ? failure
+                : new IOException("the range " + range + " of '" + file.path() + "' failed");
+    }
+
+    /**
+     * Copies a range response body into {@code sink}, checking the span it announces and delivering exactly the
+     * requested bytes.
+     */
+    private static void copyRange(InputStream body, HttpResponse<?> response, RepoFile file, long start,
+                                  long endInclusive, boolean wholeFile, long maxBytes, RangeSink sink)
+            throws IOException {
+        long end = endInclusive;
+        long listed = file.size();
+        if (!wholeFile) {
+            long[] span = contentRange(response, file);
+            if (span[0] != start) {
+                throw new InvalidRangeResponse("the range response of '" + file.path() + "' starts at byte "
+                        + span[0] + ", not the requested " + start);
+            }
+            if (span[1] != endInclusive) {
+                throw new InvalidRangeResponse("the range response of '" + file.path() + "' ends at byte "
+                        + span[1] + ", not the requested " + endInclusive);
+            }
+            if (listed >= 0 && span[2] != listed) {
+                throw new InvalidRangeResponse("the range response of '" + file.path() + "' reports a "
+                        + span[2] + "-byte file, but the repository lists " + listed + " bytes");
+            }
+            end = span[1];
+        }
+        long expected = end - start + 1;
+        if (expected > maxBytes) {
+            throw new InvalidRangeResponse("the range " + start + "-" + end + " of '" + file.path() + "' is "
+                    + expected + " bytes, over the " + maxBytes + "-byte limit");
+        }
+        byte[] buf = new byte[64 * 1024];
+        long position = 0L;
+        while (position < expected) {
+            int want = (int) Math.min((long) buf.length, expected - position);
+            int n = body.read(buf, 0, want);
+            if (n < 0) {
+                break;
+            }
+            if (n == 0) {
+                continue;
+            }
+            sink.write(position, buf, 0, n);
+            position += n;
+        }
+        if (position != expected) {
+            throw new IOException("the range response of '" + file.path() + "' delivered " + position + " of "
+                    + expected + " bytes");
+        }
+    }
+
+    /**
+     * The byte span one 206 response announces: {@code Content-Range: bytes <start>-<end>/<total>}. A response
+     * without a well-formed span, or with an unknown total, is refused.
+     */
+    private static long[] contentRange(HttpResponse<?> response, RepoFile file) throws IOException {
+        String value = response.headers().firstValue("content-range").orElse(null);
+        Matcher m = value == null ? null : CONTENT_RANGE.matcher(value.trim());
+        if (m == null || !m.matches()) {
+            throw new InvalidRangeResponse("the range response of '" + file.path()
+                    + "' carries no well-formed Content-Range");
+        }
+        return new long[]{Long.parseLong(m.group(1)), Long.parseLong(m.group(2)),
+                Long.parseLong(m.group(3))};
+    }
+
+    /** A ranged response that contradicts the span it announces; retrying it cannot help. */
+    private static final class InvalidRangeResponse extends IOException {
+
+        private static final long serialVersionUID = 1L;
+
+        InvalidRangeResponse(String message) {
+            super(message);
+        }
+    }
+
+    /** {@code Content-Range} of a 206 response. */
+    private static final Pattern CONTENT_RANGE =
+            Pattern.compile("bytes ([0-9]+)-([0-9]+)/([0-9]+)");
+
+    /** Closes {@code body}, ignoring a failure to close it. */
+    private static void closeQuietly(InputStream body) {
+        try {
+            body.close();
+        } catch (IOException ignored) {
+            // a body that fails to close has nothing left worth reporting
+        }
     }
 
     /** One GET over the resolve endpoint, appended to the partial body from {@code offset}. */
@@ -456,7 +841,7 @@ public final class HubClient {
      * {@link RepoFile} whose URL does not name it is refused before it can fetch another one.
      */
     private void expectFile(HubRef ref, String commit, RepoFile file) {
-        String expected = resolveUrl(endpoint, ref.repository(), commit, file.path());
+        String expected = resolveUrl(endpoint, ref, commit, file.path());
         if (!expected.equals(file.url())) {
             throw new IllegalArgumentException("the registered URL of '" + file.path()
                     + "' does not name it");

@@ -5,7 +5,7 @@
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_tokens, i n_head, i head_dim, i g_tile, i q_off, i out_off, i n_raw, i raw_type, i n_swa, i comp_mode,
  *    i n_comp, i comp_type, i ratio, i sel_stride, i has_sinks, f kq_scale, i rot_block, i n_rot, i rope_mode,
- *    f theta_scale, f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi,
+ *    f theta_scale, f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi, i sel_off, i comp_stride,
  *    R q, R<KV> raw_k, R<int> raw_pos, R<KV> comp_k, R<int> sel, R sinks, R<int> q_pos, W out)
  * Dispatch: 1-D, local L (power of two in [32, LLM_DIMX]), one work-group per (token, head tile):
  * groups = n_tokens * ceil(n_head / g_tile), with g_tile * (2 * head_dim + L) <= NF_FA_SMEM_FLOATS.
@@ -50,6 +50,8 @@ layout(push_constant) uniform NfDsv4AttnParams {
     float attn_factor;
     float corr_lo;
     float corr_hi;
+    int sel_off;
+    int comp_stride;
 } pc;
 
 layout(std430, binding = 0) readonly buffer NfDsv4Q      { float q_in[]; };
@@ -72,7 +74,7 @@ NF_KV_LOADERS(comp_k)
 float dsv4_key(int code, int d) {
     const uint hd = uint(pc.head_dim);
     return code >= 0 ? raw_k_kv_load1(uint(code) * hd + uint(d), pc.raw_type)
-                     : comp_k_kv_load1(uint(-code - 2) * hd + uint(d), pc.comp_type);
+                     : comp_k_kv_load1(uint(-code - 2) * uint(pc.comp_stride) + uint(d), pc.comp_type);
 }
 
 /* Hadamard transform and partial-RoPE row rotation over smem (C nf_fwht_local, nf_dsv4_rope_rows). */
@@ -128,7 +130,8 @@ void main() {
             }
         } else if (j < n_keys) {
             const int jc = j - pc.n_raw;
-            const int c = (pc.comp_mode == DSV4_COMP_SELECTED) ? sel[t * pc.sel_stride + jc] : jc;
+            const int c = (pc.comp_mode == DSV4_COMP_SELECTED)
+                    ? sel[pc.sel_off + t * pc.sel_stride + jc] : jc;
             if (c >= 0 && c < n_vis_c) {
                 code = -(c + 2);
             }

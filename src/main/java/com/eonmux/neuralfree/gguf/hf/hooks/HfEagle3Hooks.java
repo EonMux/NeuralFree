@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.gguf.hf.meta.GgufKeyTable;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadataBuilder;
 import com.eonmux.neuralfree.gguf.hf.tensor.ElementFormat;
 import com.eonmux.neuralfree.gguf.hf.tensor.ElementTransforms;
+import com.eonmux.neuralfree.gguf.hf.tensor.HfPlanView;
 import com.eonmux.neuralfree.gguf.hf.tensor.RopeTensors;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
@@ -42,6 +43,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * The EAGLE-3 draft parts of llama.cpp's {@code LlamaModel} (LC/conversion/llama.py:49-104, 106-113, 208-253,
@@ -59,6 +62,11 @@ import java.util.OptionalInt;
  * {@code norm_before_fc} (V/v1/worker/gpu_model_runner.py:5236-5250, V/model_executor/models/llama_eagle3.py:179-187),
  * and a draft without {@code draft_vocab_size} has its {@code vocab_size} as draft vocabulary
  * (llama_eagle3.py:312-316).</p>
+ *
+ * <p>vLLM's {@code fc_norm} layout adds one RMSNorm per target tap before the fusion projection
+ * (llama_eagle3.py:231-240). Its tensors keep the {@code fc_norm.<part>.weight} names the {@code Eagle3DraftModel}
+ * reads, and the draft's {@code fc_norm} flag decides whether they exist, so the metadata hook checks the two
+ * against each other.</p>
  */
 public final class HfEagle3Hooks {
 
@@ -85,6 +93,12 @@ public final class HfEagle3Hooks {
     private static final String T2D = "t2d";
     /** The parallel-drafting mask of PEagle drafts, used only for parallel drafting (llama_eagle3.py:431-442). */
     private static final String MASK_HIDDEN = "mask_hidden";
+    /** A per-tap encoder norm of the vLLM {@code fc_norm} layout ({@code fc_norm.<part>.weight}). */
+    private static final Pattern FC_NORM = Pattern.compile("^fc_norm\\.(\\d{1,3})\\.weight$");
+    /** The configuration flag that creates the {@code fc_norm} modules (llama_eagle3.py:231). */
+    private static final String FC_NORM_FLAG = "fc_norm";
+    /** EAGLE-3 fuses exactly three target layers (eagle3.cpp:9-11). */
+    private static final int EAGLE3_TARGET_LAYERS = 3;
     /** vLLM's nested EAGLE-3 settings object. */
     private static final String EAGLE_CONFIG = "eagle_config";
     private static final String AUX_LAYER_IDS = "eagle_aux_hidden_state_layer_ids";
@@ -154,12 +168,14 @@ public final class HfEagle3Hooks {
      * {@code config.json}: {@code target_layers} ({@code eagle_aux_hidden_state_layer_ids} of the root, else of
      * {@code eagle_config}, else {@code [2, n // 2, n - 3]} for the target's {@code n} layers),
      * {@code target_hidden_size} (the draft's, else the target's hidden size), {@code norm_before_residual} and
-     * {@code norm_before_fc} (the root's, else {@code eagle_config}'s; default false).
+     * {@code norm_before_fc} (the root's, else {@code eagle_config}'s; default false). The planned tensors must agree
+     * with the draft's {@code fc_norm} flag ({@link #checkFcNorm}).
      *
      * @throws IOException         when the target cannot be opened
-     * @throws GgufFormatException when a value has the wrong type or the target lacks what the keys need
+     * @throws GgufFormatException when a value has the wrong type, the target lacks what the keys need, or the
+     *                             {@code fc_norm} flag and the planned per-tap norms disagree
      */
-    public static void meta(HfLoadContext ctx, HfMetadataBuilder kv) throws IOException {
+    public static void meta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) throws IOException {
         JsonView raw = ctx.config().raw();
         Target target = target(ctx);
         List<Integer> layers = auxLayers(raw);
@@ -178,6 +194,48 @@ public final class HfEagle3Hooks {
         kv.set(GgufKeys.NORM_BEFORE_RESIDUAL, flag(raw, "norm_before_residual"));
         JsonView fcSource = raw.raw("norm_before_fc") != null ? raw : eagleConfig(raw);
         kv.set(GgufKeys.NORM_BEFORE_FC, flag(fcSource, "norm_before_fc"));
+        checkFcNorm(ctx.config(), plan);
+    }
+
+    /**
+     * vLLM creates the per-tap {@code fc_norm} modules from the draft configuration's {@code fc_norm} flag, not from
+     * the checkpoint's tensors (llama_eagle3.py:231-240, qwen3_eagle3.py:216-225), so the two must agree: the flag
+     * needs all {@link #EAGLE3_TARGET_LAYERS} planned norms, and planned norms need the flag. A GGUF drafter applies
+     * the norms whenever the tensors are present, so a checkpoint that disagrees would run differently here.
+     *
+     * @throws GgufFormatException when the flag and the planned {@code fc_norm.<part>.weight} tensors disagree
+     */
+    private static void checkFcNorm(HfConfig cfg, HfPlanView plan) {
+        if (plan == null) {
+            return;
+        }
+        boolean declared = flag(cfg.raw(), FC_NORM_FLAG);
+        boolean planned = plan.has(TensorNames.fcNorm(0));
+        if (declared != planned) {
+            String reason = declared ? "sets '" + FC_NORM_FLAG + "' but the checkpoint holds no "
+                    + TensorNames.fcNorm(0)
+                    : "holds " + TensorNames.fcNorm(0) + " but does not set '" + FC_NORM_FLAG + "'";
+            throw new GgufFormatException(cfg.source() + ": " + cfg.architecture() + " " + reason);
+        }
+        if (!declared) {
+            return;
+        }
+        for (int k = 0; k < EAGLE3_TARGET_LAYERS; k++) {
+            if (!plan.has(TensorNames.fcNorm(k))) {
+                throw new GgufFormatException(cfg.source() + ": " + cfg.architecture() + " sets '" + FC_NORM_FLAG
+                        + "' but the checkpoint holds no " + TensorNames.fcNorm(k));
+            }
+        }
+    }
+
+    /**
+     * The target layers the draft configuration fuses ({@link #auxLayers}), or an empty list when it names none.
+     *
+     * @throws GgufFormatException when the value is not a list of layer indices
+     */
+    public static List<Integer> declaredAuxLayers(HfConfig cfg) {
+        List<Integer> ids = auxLayers(cfg.raw());
+        return ids == null ? Collections.emptyList() : ids;
     }
 
     /**
@@ -252,17 +310,26 @@ public final class HfEagle3Hooks {
     /**
      * The EAGLE-3 tensors of {@code LlamaModel.modify_tensors} (llama.py:235-253) that bypass the Llama mapping:
      * {@code fc.weight} kept as {@code fc.weight}, {@code input_norm.weight} as {@code ENC_OUTPUT_NORM},
-     * {@code *.hidden_norm.weight} as {@code ATTN_NORM_2} of its block, {@code d2t} as the absolute I64 token map
-     * ({@link #d2t}), {@code t2d} and the PEagle {@code mask_hidden} dropped. Returns false for any other tensor.
+     * {@code *.hidden_norm.weight} as {@code ATTN_NORM_2} of its block, {@code fc_norm.<part>.weight} as the
+     * per-tap encoder norm of the {@code fc_norm} layout, {@code d2t} as the absolute I64 token map ({@link #d2t}),
+     * {@code t2d} and the PEagle {@code mask_hidden} dropped. Returns false for any other tensor.
      *
      * @param hfName the index name of the tensor
      * @param name   the name after {@link #rename}
      * @throws IOException         when {@code d2t} or the target cannot be read
-     * @throws GgufFormatException when {@code d2t} is invalid
+     * @throws GgufFormatException when {@code d2t} is invalid or an {@code fc_norm} part is beyond the three taps
      */
     public static boolean tensor(HfLoadContext ctx, String hfName, String name, RowSource src, TensorSink out)
             throws IOException {
-        if (name.equals(FC_WEIGHT)) {
+        Matcher fcNorm = FC_NORM.matcher(name);
+        if (fcNorm.matches()) {
+            int part = Integer.parseInt(fcNorm.group(1));
+            if (part >= EAGLE3_TARGET_LAYERS) {
+                throw new GgufFormatException("tensor '" + hfName + "' names fc_norm part " + part
+                        + "; the EAGLE-3 fusion has " + EAGLE3_TARGET_LAYERS + " target taps");
+            }
+            out.add(TensorNames.fcNorm(part), src);
+        } else if (name.equals(FC_WEIGHT)) {
             out.add(ctx.names().ggufName("FC", -1, ".weight"), src);
         } else if (name.equals(INPUT_NORM_WEIGHT)) {
             out.add(ctx.names().ggufName("ENC_OUTPUT_NORM", -1, ".weight"), src);

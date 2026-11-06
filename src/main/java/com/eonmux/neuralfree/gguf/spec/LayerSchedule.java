@@ -17,15 +17,30 @@ package com.eonmux.neuralfree.gguf.spec;
  *       weights {@code [0, lps)}, high passes {@code [lps, 2 * lps)}. Streams start as {@code zH = embeddings},
  *       {@code zL = hrm.z_l_init}; a pass reads {@code zH + zL} at its first slot, ends with a weightless RMS norm
  *       after its last slot and writes {@code zL} (low) or {@code zH} (high). The trunk output is {@code zH}.</li>
+ *   <li>{@link Kind#REPEAT} (Dory, IQuestLoopCoder): the trunk is {@code nInput} plain layers, then the block
+ *       {@code [nInput, nInput + nRecurrent)} run {@code nLoops} times, then {@code nOutput} plain layers. Every
+ *       pass of the repeated block is a slot with its own KV cache, so iteration {@code i} of block layer {@code j}
+ *       is slot {@code nInput + i * nRecurrent + j}. {@link #loopCombine()} optionally normalizes the stream at the
+ *       pass boundaries: a pass starts from {@code justNorm(state + input)} and ends by writing
+ *       {@code state = justNorm(x)} (Dory); {@link LoopCombine#NONE} carries the stream unchanged (IQuestLoopCoder).
+ *       </li>
  * </ul>
  */
 public final class LayerSchedule {
 
     /** Schedule shape. */
-    public enum Kind { LINEAR, LOOPED, HRM }
+    public enum Kind { LINEAR, LOOPED, HRM, REPEAT }
 
     /** Residual stream a hierarchical pass writes. */
     public enum Stream { LOW, HIGH }
+
+    /** Stream combination at the boundaries of a {@link Kind#REPEAT} pass. */
+    public enum LoopCombine {
+        /** Carry the stream unchanged into the next pass. */
+        NONE,
+        /** A pass starts from {@code justNorm(state + input)}; its result becomes {@code state = justNorm(x)}. */
+        JUSTNORM
+    }
 
     private final Kind kind;
     private final int slots;
@@ -35,9 +50,15 @@ public final class LayerSchedule {
     private final int layersPerStack;
     private final int hCycles;
     private final int lCycles;
+    private final int nInput;
+    private final int nRecurrent;
+    private final int nOutput;
+    private final LoopCombine loopCombine;
+    private final float loopEps;
 
     private LayerSchedule(Kind kind, int slots, int nPhysical, int nLoops, boolean loopNorm, int layersPerStack,
-                          int hCycles, int lCycles) {
+                          int hCycles, int lCycles, int nInput, int nRecurrent, int nOutput, LoopCombine loopCombine,
+                          float loopEps) {
         this.kind = kind;
         this.slots = slots;
         this.nPhysical = nPhysical;
@@ -46,6 +67,11 @@ public final class LayerSchedule {
         this.layersPerStack = layersPerStack;
         this.hCycles = hCycles;
         this.lCycles = lCycles;
+        this.nInput = nInput;
+        this.nRecurrent = nRecurrent;
+        this.nOutput = nOutput;
+        this.loopCombine = loopCombine;
+        this.loopEps = loopEps;
     }
 
     /** One slot per physical layer. */
@@ -53,7 +79,7 @@ public final class LayerSchedule {
         if (nLayer <= 0) {
             throw new IllegalArgumentException("layer count must be positive, got " + nLayer);
         }
-        return new LayerSchedule(Kind.LINEAR, nLayer, nLayer, 1, false, 0, 0, 0);
+        return new LayerSchedule(Kind.LINEAR, nLayer, nLayer, 1, false, 0, 0, 0, 0, 0, 0, LoopCombine.NONE, 0f);
     }
 
     /**
@@ -62,7 +88,7 @@ public final class LayerSchedule {
      * blocks {@code [0, n_layer_nextn)}, models/gemma4-assistant.cpp:47, 133).
      */
     public static LayerSchedule empty() {
-        return new LayerSchedule(Kind.LINEAR, 0, 0, 1, false, 0, 0, 0);
+        return new LayerSchedule(Kind.LINEAR, 0, 0, 1, false, 0, 0, 0, 0, 0, 0, LoopCombine.NONE, 0f);
     }
 
     /**
@@ -81,7 +107,8 @@ public final class LayerSchedule {
         if (slots > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("looped schedule has too many slots: " + slots);
         }
-        return new LayerSchedule(Kind.LOOPED, (int) slots, nPhysical, nLoops, nLoops > 1 && !skipLoopFinalNorm, 0, 0, 0);
+        return new LayerSchedule(Kind.LOOPED, (int) slots, nPhysical, nLoops, nLoops > 1 && !skipLoopFinalNorm, 0, 0, 0,
+                0, 0, 0, LoopCombine.NONE, 0f);
     }
 
     /**
@@ -100,7 +127,41 @@ public final class LayerSchedule {
         if (slots > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("HRM schedule has too many slots: " + slots);
         }
-        return new LayerSchedule(Kind.HRM, (int) slots, 2 * layersPerStack, 0, false, layersPerStack, hCycles, lCycles);
+        return new LayerSchedule(Kind.HRM, (int) slots, 2 * layersPerStack, 0, false, layersPerStack, hCycles, lCycles,
+                0, 0, 0, LoopCombine.NONE, 0f);
+    }
+
+    /**
+     * A trunk that runs {@code nInput} plain layers, then the block of {@code nRecurrent} layers {@code nLoops}
+     * times, then {@code nOutput} plain layers. Every pass of the repeated block is a slot with its own KV cache.
+     *
+     * @param nPhysical  physical weight layers, equal to {@code nInput + nRecurrent + nOutput}
+     * @param nInput     layers before the repeated block
+     * @param nRecurrent layers in the repeated block
+     * @param nLoops     passes over the repeated block, at least 1
+     * @param nOutput    layers after the repeated block
+     * @param combine    stream combination at the pass boundaries
+     * @param eps        justnorm epsilon of {@link LoopCombine#JUSTNORM}; ignored for {@link LoopCombine#NONE}
+     */
+    public static LayerSchedule repeat(int nPhysical, int nInput, int nRecurrent, int nLoops, int nOutput,
+                                       LoopCombine combine, float eps) {
+        if (nInput < 0 || nRecurrent <= 0 || nOutput < 0 || nLoops < 1) {
+            throw new IllegalArgumentException("repeat schedule needs nInput >= 0, nRecurrent > 0, nOutput >= 0 and"
+                    + " nLoops >= 1, got " + nInput + "/" + nRecurrent + "/" + nOutput + "/" + nLoops);
+        }
+        if ((long) nInput + nRecurrent + nOutput != nPhysical) {
+            throw new IllegalArgumentException("repeat schedule ranges " + nInput + " + " + nRecurrent + " + "
+                    + nOutput + " do not cover the " + nPhysical + " physical layers");
+        }
+        if (combine == LoopCombine.JUSTNORM && (!(eps > 0f) || Float.isInfinite(eps))) {
+            throw new IllegalArgumentException("justnorm loop combination needs a positive finite eps, got " + eps);
+        }
+        long slots = (long) nInput + (long) nRecurrent * nLoops + nOutput;
+        if (slots > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("repeat schedule has too many slots: " + slots);
+        }
+        return new LayerSchedule(Kind.REPEAT, (int) slots, nPhysical, nLoops, false, 0, 0, 0, nInput, nRecurrent,
+                nOutput, combine, combine == LoopCombine.JUSTNORM ? eps : 0f);
     }
 
     public Kind kind() { return kind; }
@@ -108,11 +169,54 @@ public final class LayerSchedule {
     public int slots() { return slots; }
     /** Number of physical weight layers. */
     public int nPhysical() { return nPhysical; }
-    /** Loop passes (LOOPED); 1 for LINEAR, 0 for HRM. */
+    /** Loop passes (LOOPED / REPEAT); 1 for LINEAR, 0 for HRM. */
     public int nLoops() { return nLoops; }
     public int layersPerStack() { return layersPerStack; }
     public int hCycles() { return hCycles; }
     public int lCycles() { return lCycles; }
+    /** REPEAT: plain layers before the repeated block. */
+    public int nInputLayers() { return nInput; }
+    /** REPEAT: layers of the repeated block. */
+    public int nRecurrentLayers() { return nRecurrent; }
+    /** REPEAT: plain layers after the repeated block. */
+    public int nOutputLayers() { return nOutput; }
+    /** REPEAT: stream combination at the pass boundaries. */
+    public LoopCombine loopCombine() { return loopCombine; }
+    /** REPEAT: justnorm epsilon of {@link LoopCombine#JUSTNORM}; 0 otherwise. */
+    public float loopEps() { return loopEps; }
+    /** First slot after the input layers ({@code nInput}). */
+    public int recurrentStart() { return nInput; }
+    /** First slot after the repeated block ({@code nInput + nRecurrent * nLoops}). */
+    public int recurrentEnd() { return nInput + nRecurrent * nLoops; }
+
+    /**
+     * Pass index of {@code slot}: {@code slot / nPhysical} for LOOPED, {@code (slot - nInput) / nRecurrent} inside
+     * the repeated block of REPEAT, -1 for the plain layers of a REPEAT schedule and every slot of the other kinds.
+     */
+    public int loopIndex(int slot) {
+        check(slot);
+        switch (kind) {
+            case LOOPED:
+                return slot / nPhysical;
+            case REPEAT:
+                return slot < nInput || slot >= recurrentEnd() ? -1 : (slot - nInput) / nRecurrent;
+            default:
+                return -1;
+        }
+    }
+
+    /** REPEAT: this slot opens a pass of the repeated block (a pass reads the carried state here). */
+    public boolean loopStart(int slot) {
+        check(slot);
+        return kind == Kind.REPEAT && slot >= nInput && slot < recurrentEnd() && (slot - nInput) % nRecurrent == 0;
+    }
+
+    /** REPEAT: this slot closes a pass of the repeated block (its result becomes the carried state). */
+    public boolean loopEnd(int slot) {
+        check(slot);
+        return kind == Kind.REPEAT && slot >= nInput && slot < recurrentEnd()
+                && (slot - nInput + 1) % nRecurrent == 0;
+    }
 
     /** Physical layer whose tensors slot {@code slot} uses. */
     public int weightLayer(int slot) {
@@ -120,6 +224,14 @@ public final class LayerSchedule {
         switch (kind) {
             case LOOPED:
                 return slot % nPhysical;
+            case REPEAT:
+                if (slot < nInput) {
+                    return slot;
+                }
+                if (slot < recurrentEnd()) {
+                    return nInput + (slot - nInput) % nRecurrent;
+                }
+                return nInput + nRecurrent + (slot - recurrentEnd());
             case HRM:
                 return stream(slot) == Stream.HIGH ? layersPerStack + slot % layersPerStack : slot % layersPerStack;
             default:
@@ -178,6 +290,9 @@ public final class LayerSchedule {
                 return "LayerSchedule{LOOPED " + nPhysical + " x " + nLoops + (loopNorm ? ", loop norm" : "") + '}';
             case HRM:
                 return "LayerSchedule{HRM lps=" + layersPerStack + ", H=" + hCycles + ", L=" + lCycles + ", slots=" + slots + '}';
+            case REPEAT:
+                return "LayerSchedule{REPEAT " + nInput + " + " + nRecurrent + " x " + nLoops + " + " + nOutput
+                        + (loopCombine == LoopCombine.JUSTNORM ? ", justnorm " + loopEps : "") + ", slots=" + slots + '}';
             default:
                 return "LayerSchedule{LINEAR " + slots + '}';
         }

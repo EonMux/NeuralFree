@@ -4,21 +4,24 @@
  *
  * A variants row selects the cache type with KV=NF_KV_<type> (common/kv_types.glsl).
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
- *   F32/F16/BF16 (i n_cells, i n_heads, i head_stride, i row_stride, i n_dims, i n_offs, i mode, i has_ff,
+ *   F32/F16/BF16/FP8 (i n_cells, i n_heads, i head_stride, i row_stride, i n_dims, i n_offs, i mode, i has_ff,
  *                 f theta_scale, f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi,
  *                 R int delta, R float ff, k_cache)
  *   block types  the same scalars, then i rot_k; the same buffers
  * Context shift (llama-kv-cache.cpp:1945-1993): every cell c, delta 0 included (llama-kv-cache.cpp:1545-1556),
  * rotates dims [n_offs, n_offs + n_dims) of each head (row c at c*row_stride, head h at h*head_stride) by RoPE at
  * position delta[c]: NORM (mode 0) pairs (2i, 2i+1), every other mode NEOX pairs (i, i + n_dims/2) with exponent i.
- * has_ff != 0 divides pair i's angle by ff[i]. F32/F16/BF16 rotate in place (F16 and BF16 round to nearest even).
+ * has_ff != 0 divides pair i's angle by ff[i]. F32/F16/BF16/FP8 rotate in place (F16 and BF16 round to nearest even,
+ * FP8 re-encodes each result; the rotation is linear, so it moves the stored, scale-divided FP8 values exactly).
+ * Per-token-head caches rotate each head's stored codes in place and re-encode them under the row's unchanged scale.
  * Block types work on the window [w0, w1): the rotated dims widened to multiples of rot_k (rot_k > 0) or of the
  * 32-element block (nf_kvr_w0 / nf_kvr_w1); the window is dequantized into shared memory, each rot_k chunk is
  * un-rotated with the normalized Hadamard transform when rot_k > 1, rotated, re-rotated, and each 32-element block
  * is requantized by the reference quantizer of the type (common/kv_quant.glsl).
  *
- * Dispatch: 1-D. F32/F16/BF16: one invocation per pair, g = (c*n_heads + h)*(n_dims/2) + i, global rounded up
- * to L, local = {L, 1, 1}, no barriers. Block types: one workgroup per (cell, head), linear group
+ * Dispatch: 1-D. F32/F16/BF16/FP8: one invocation per pair, g = (c*n_heads + h)*(n_dims/2) + i, global rounded up
+ * to L, local = {L, 1, 1}, no barriers. Per-token-head: one invocation per (cell, head), global = n_cells*n_heads,
+ * local = {1, 1, 1}, no barriers. Block types: one workgroup per (cell, head), linear group
  * g = c*n_heads + h (nf_wg_id()), global = n_cells*n_heads*L, local = {L, 1, 1}; host preconditions as
  * kernels/llm/kv_cache.cl.
  */
@@ -35,9 +38,21 @@
 #error "kv_shift.comp requires KV"
 #endif
 
+#define NF_KVR_FP8 (KV == NF_KV_FP8_E4M3 || KV == NF_KV_FP8_E5M2)
+#define NF_KVR_PT (KV == NF_KV_FP8_PER_TOKEN_HEAD || KV == NF_KV_INT8_PER_TOKEN_HEAD \
+    || KV == NF_KV_INT4_PER_TOKEN_HEAD)
+
 layout(std430, binding = 0) readonly buffer NfKvrDelta { int delta[]; };
 layout(std430, binding = 1) readonly buffer NfKvrFf { float ff[]; };
-#if KV == NF_KV_F32
+#if NF_KVR_PT
+NF_BUFFER_VIEWS_RW(2, k_cache)
+NF_KV_LOADERS(k_cache)
+NF_KV_STORES(k_cache)
+#elif NF_KVR_FP8
+NF_BUFFER_VIEWS_RW(2, k_cache)
+NF_KV_LOADERS(k_cache)
+NF_KV_STORES(k_cache)
+#elif KV == NF_KV_F32
 layout(std430, binding = 2) buffer NfKvrCache { float k_cache[]; };
 #elif KV == NF_KV_F16 || KV == NF_KV_BF16
 layout(std430, binding = 2) buffer NfKvrCache { uint16_t k_cache[]; };
@@ -163,6 +178,32 @@ void main() {
     }
 }
 
+#elif NF_KVR_PT
+
+/* One work-item per (cell, head): the head's pairs rotate sequentially, so an INT4 value's two nibbles (a byte) are
+ * written by one item. Dispatch: 1-D, global = n_cells * n_heads, local = {1, 1, 1}. */
+void main() {
+    const uint heads = uint(max(pc.n_heads, 1));
+    const uint gid = nf_global_id();
+    if (gid >= uint(pc.n_cells) * heads) {
+        return;
+    }
+    const uint c = gid / heads;
+    const uint h = gid - c * heads;
+    const int p = delta[c];
+    const int m = nf_kvr_mode();
+    const uint e0 = c * uint(pc.row_stride) + h * uint(pc.head_stride);
+    for (int i = 0; i < (pc.n_dims >> 1); ++i) {
+        const vec2 cs = nf_kvr_cs(p, i);
+        const uint a = e0 + uint(pc.n_offs) + uint(nf_rope_first(m, i));
+        const uint b = a + uint(nf_rope_span(m, pc.n_dims));
+        const float x0 = k_cache_kv_load1(a, KV);
+        const float x1 = k_cache_kv_load1(b, KV);
+        k_cache_kv_pt_store1(a, x0 * cs.x - x1 * cs.y, KV);
+        k_cache_kv_pt_store1(b, x0 * cs.y + x1 * cs.x, KV);
+    }
+}
+
 #else
 
 void main() {
@@ -190,6 +231,11 @@ void main() {
     const float x1 = nf_half(uint(k_cache[b]));
     k_cache[a] = uint16_t(nf_rope_f16_bits(x0 * cs.x - x1 * cs.y));
     k_cache[b] = uint16_t(nf_rope_f16_bits(x0 * cs.y + x1 * cs.x));
+#elif NF_KVR_FP8
+    const float x0 = k_cache_kv_load1(a, KV);
+    const float x1 = k_cache_kv_load1(b, KV);
+    k_cache_kv_store1(a, x0 * cs.x - x1 * cs.y, KV);
+    k_cache_kv_store1(b, x0 * cs.y + x1 * cs.x, KV);
 #else
     const float x0 = nf_bf16(uint(k_cache[a]));
     const float x1 = nf_bf16(uint(k_cache[b]));

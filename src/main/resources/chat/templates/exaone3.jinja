@@ -1,0 +1,17 @@
+{#- llama.cpp exaone3 chat template (src/llama-chat.cpp:568-583). -#}
+{%- set tool_role = false -%}
+{%- for message in messages -%}
+    {%- set content = (message['content'] if message['content'] is string else '') | trim(' \t\n\v\f\r') -%}
+    {%- if message['role'] == 'system' -%}
+        {{- '[|system|]' ~ content ~ '[|endofturn|]\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '[|user|]' ~ content ~ '\n' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- '[|assistant|]' ~ content ~ '[|endofturn|]\n' -}}
+    {%- elif message['role'] == 'tool' and tool_role -%}
+        {{- '[|tool|]' ~ content ~ '[|endofturn|]\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '[|assistant|]' -}}
+{%- endif -%}

@@ -20,48 +20,61 @@ import java.util.Map;
  * The bodies of llama.cpp's native completion ({@code server_task_result_cmpl_final/_partial::to_json_non_oaicompat},
  * {@code tools/server/server-task.cpp}): the final object with {@code content}, {@code tokens}, {@code stop_type},
  * {@code generation_settings} and {@code timings}, the streamed partial chunks, and {@code completion_probabilities}
- * when {@code n_probs} asks for them. {@code response_fields} selects nested fields of the final object.
+ * when {@code n_probs} asks for them. The probabilities are the model's own ({@code logprob}, {@code top_logprobs})
+ * unless {@code post_sampling_probs} asks for the sampler chain's ({@code prob}, {@code top_probs}, tokens the
+ * chain removed left out). The final object lists the generated token ids under {@code tokens} only with
+ * {@code return_tokens}; a streamed chunk always carries its token. {@code response_fields} selects nested fields
+ * of the final object.
  */
 final class LlamaCompletionBodies {
 
     private final EngineService service;
     private final String model;
     private final int nProbs;
+    private final boolean postSampling;
+    private final boolean returnTokens;
     private final List<String> fields;
 
     /**
-     * @param nProbs alternatives per token in {@code completion_probabilities}, 0 for none
-     * @param fields the {@code response_fields} paths ({@code a/b}), empty for the whole object
+     * @param nProbs       alternatives per token in {@code completion_probabilities}, 0 for none
+     * @param postSampling whether the captures score the sampler chain's distribution
+     *                     ({@code post_sampling_probs}), rendered as probabilities
+     * @param returnTokens whether the final object lists the generated token ids ({@code return_tokens})
+     * @param fields       the {@code response_fields} paths ({@code a/b}), empty for the whole object
      */
-    LlamaCompletionBodies(EngineService service, String model, int nProbs, List<String> fields) {
+    LlamaCompletionBodies(EngineService service, String model, int nProbs, boolean postSampling,
+                          boolean returnTokens, List<String> fields) {
         this.service = service;
         this.model = model;
         this.nProbs = nProbs;
+        this.postSampling = postSampling;
+        this.returnTokens = returnTokens;
         this.fields = List.copyOf(fields);
     }
 
     /**
      * The final object of choice {@code index}; under {@code streamed} its content and tokens are empty, since the
-     * partial chunks carried them.
+     * partial chunks carried them, and without {@code return_tokens} its tokens are empty too. A media prompt counts its media rows as evaluated and decodes its text tokens.
      */
-    Map<String, Object> finalBody(int index, int[] prompt, GenerationRequest request, GenerationResult result,
+    Map<String, Object> finalBody(int index, LlamaPrompts.Prompt prompt, GenerationRequest request,
+                                  GenerationResult result,
                                   BatchSequence sequence, boolean streamed) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("index", index);
         out.put("content", streamed ? "" : result.text());
-        out.put("tokens", streamed ? List.of() : ids(result.tokens()));
+        out.put("tokens", streamed || !returnTokens ? List.of() : ids(result.tokens()));
         out.put("id_slot", sequence == null ? -1 : sequence.seq());
         out.put("stop", true);
         out.put("model", model);
         out.put("tokens_predicted", result.tokens().length);
-        out.put("tokens_evaluated", prompt.length);
-        out.put("generation_settings", settings(request, streamed, nProbs));
-        out.put("prompt", service.decode(prompt));
+        out.put("tokens_evaluated", prompt.rows());
+        out.put("generation_settings", settings(request, streamed, nProbs, postSampling));
+        out.put("prompt", service.decode(prompt.tokens()));
         out.put("has_new_line", result.text().indexOf('\n') >= 0);
-        out.put("truncated", false);
+        out.put("truncated", sequence != null && sequence.truncated());
         out.put("stop_type", stopType(result.stopReason()));
         out.put("stopping_word", result.stopString() == null ? "" : result.stopString());
-        out.put("tokens_cached", prompt.length + result.tokens().length);
+        out.put("tokens_cached", prompt.rows() + result.tokens().length);
         out.put("timings", timings(result, sequence == null ? 0 : sequence.reusedPrefix()));
         if (!streamed && nProbs > 0 && !result.logprobs().isEmpty()) {
             List<Object> probs = new ArrayList<>();
@@ -89,7 +102,10 @@ final class LlamaCompletionBodies {
         return out;
     }
 
-    /** llama.cpp's {@code stop_type}: eos, word (a stop string) or limit (the budget or the context). */
+    /**
+     * llama.cpp's {@code stop_type}: eos, word (a stop string) or limit (the budget, the context, or a detected
+     * repetition, as llama.cpp reports its own heuristic early stops).
+     */
     static String stopType(StopReason reason) {
         switch (reason) {
             case EOS:
@@ -98,13 +114,15 @@ final class LlamaCompletionBodies {
                 return "word";
             case MAX_TOKENS:
             case CONTEXT_FULL:
+            case REPETITION:
                 return "limit";
             default:
                 return "none";
         }
     }
 
-    private static Map<String, Object> settings(GenerationRequest request, boolean streamed, int nProbs) {
+    private static Map<String, Object> settings(GenerationRequest request, boolean streamed, int nProbs,
+                                                boolean postSampling) {
         SamplerConfig s = request.sampler();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("seed", s.seed());
@@ -145,7 +163,7 @@ final class LlamaCompletionBodies {
             samplers.add(kind.label());
         }
         out.put("samplers", samplers);
-        out.put("post_sampling_probs", false);
+        out.put("post_sampling_probs", postSampling);
         return out;
     }
 
@@ -168,16 +186,22 @@ final class LlamaCompletionBodies {
         return out;
     }
 
-    /** One token's entry: the sampled token and its {@link #nProbs} most likely alternatives. */
+    /**
+     * One token's entry: the sampled token and its {@link #nProbs} most likely alternatives; post-sampling, the
+     * alternatives stop at the first the chain removed (zero probability), as llama.cpp filters them.
+     */
     private Map<String, Object> probability(TokenScore[] step) {
         Map<String, Object> entry = scoreEntry(step[0]);
         TokenScore[] ranked = step.clone();
         Arrays.sort(ranked, Comparator.comparingDouble((TokenScore t) -> t.logprob()).reversed());
         List<Object> top = new ArrayList<>();
         for (int i = 0; i < Math.min(nProbs, ranked.length); i++) {
+            if (postSampling && Math.exp(ranked[i].logprob()) == 0.0) {
+                break;
+            }
             top.add(scoreEntry(ranked[i]));
         }
-        entry.put("top_logprobs", top);
+        entry.put(postSampling ? "top_probs" : "top_logprobs", top);
         return entry;
     }
 
@@ -192,7 +216,11 @@ final class LlamaCompletionBodies {
         out.put("token", text);
         out.put("bytes", bytes);
         double lp = t.logprob();
-        out.put("logprob", Double.isFinite(lp) ? lp : OpenAiBodies.FLOOR_LOGPROB);
+        if (postSampling) {
+            out.put("prob", Math.exp(lp));
+        } else {
+            out.put("logprob", Double.isFinite(lp) ? lp : OpenAiBodies.FLOOR_LOGPROB);
+        }
         return out;
     }
 

@@ -13,10 +13,21 @@
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_tokens, i n_head, i n_head_kv, i d_k, i d_v, i bq, i bk, i g_tile, i n_split, i split_len,
  *    i kv_start, i kv_end, i q_row_stride, i out_row_stride, i k_row_stride, i k_head_stride,
- *    i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias, i causal, i swa_type, i n_swa,
- *    i bias_mode, i n_buckets, i max_distance, i has_sinks, i direct_out, i q_off, i out_off,
- *    R q, R k, R v, R<int> q_pos, R<int> kv_pos, R sinks, R rel_bias, W out, W partial
- *    | PAGED: i page_shift, i pt_off, R<int> page_table[, i kv_types (KV_MIXED)])
+ *    i v_row_stride, i v_head_stride, f scale, f softcap, f max_bias, i flags, i swa_type, i n_swa,
+ *    i bias_mode, i n_buckets, i max_distance, i q_off, i out_off,
+ *    R q, R k, R v, R<int> q_pos, R<int> kv_pos, R sinks, R rel_bias, W out, W partial, R kv_scales,
+ *    R<uvec2> tree_mask | PAGED: i page_shift, i pt_off, R<int> page_table, R kv_scales,
+ *    R<uvec2> tree_mask[, i kv_types (KV_MIXED)])
+ * tree_mask holds one uvec2 per query row (low 32 bits, high 32), the row's ancestor-or-self bitmask over the
+ * step's fresh slots; under flags bit 4 (NF_ATTN_FLAG_TREE) the last n_fresh slots of the key range take their
+ * visibility from it (common/attn_common.glsl nf_attn_tree_visible), and every other slot keeps the position
+ * rules; n_fresh rides in flags bits 5-31 (nf_attn_flag_fresh) and is 0 without the flag.
+ * kv_scales holds the FP8 KV-cache scales as n_head_kv K values then n_head_kv V values (all 1.0 without an FP8
+ * cache): the K tile loads multiply by kv_scales[kvh] and the V tile loads by kv_scales[n_head_kv + kvh]
+ * (the .cl twin nf_fa_run). A per-token-head cache stores its per-(row, KV head) scales interleaved in the same
+ * buffer ([row0 K heads, row0 V heads, ...]).
+ * flags packs causal (bit 0), has_sinks (bit 1), direct_out (bit 2), the tree mask (bit 4) and n_fresh
+ * (bits 5-31) (common/attn_common.glsl NF_ATTN_FLAG_*, nf_attn_flag_fresh).
  * Dispatch: the 3-D grid of the base rows, local {128, 1, 1}. The __sg variant needs full subgroups; 128 is a
  * multiple of every subgroup size.
  */
@@ -32,8 +43,18 @@
 #error "flash_prefill.comp requires exactly one of KV and KV_MIXED"
 #endif
 
-layout(std430, binding = 0) readonly buffer NfFaQ { float q_in[]; };
+/* A vendor variant (KV >= NF_KV_NVFP4) and the mixed one decode through the packed side planes and the centroid
+ * table, so their cache views are byte views and the side data rides the kv_scales binding. */
 #if defined(KV_MIXED)
+#define NF_FA_VENDOR 1
+#elif KV >= NF_KV_NVFP4
+#define NF_FA_VENDOR 1
+#else
+#define NF_FA_VENDOR 0
+#endif
+
+layout(std430, binding = 0) readonly buffer NfFaQ { float q_in[]; };
+#if NF_FA_VENDOR
 NF_BUFFER_VIEWS(1, kc)
 NF_KV_LOADERS(kc)
 NF_BUFFER_VIEWS(2, vc)
@@ -50,6 +71,25 @@ layout(std430, binding = 7) writeonly buffer NfFaOut { float dst[]; };
 layout(std430, binding = 8) writeonly buffer NfFaPartial { float partial[]; };
 #if defined(PAGED)
 layout(std430, binding = 9) readonly buffer NfFaPages { int page_table[]; };
+layout(std430, binding = 10) readonly buffer NfFaKvScales { float kv_scales[]; };
+layout(std430, binding = 11) readonly buffer NfFaTreeMask { uvec2 tree_mask[]; };
+#if NF_FA_VENDOR
+layout(std430, binding = 10) readonly buffer NfFaKvScales8 { uint8_t kvs_u8[]; };
+#endif
+#else
+layout(std430, binding = 9) readonly buffer NfFaKvScales { float kv_scales[]; };
+layout(std430, binding = 10) readonly buffer NfFaTreeMask { uvec2 tree_mask[]; };
+#if NF_FA_VENDOR
+layout(std430, binding = 9) readonly buffer NfFaKvScales8 { uint8_t kvs_u8[]; };
+#endif
+#endif
+
+#if defined(KV_MIXED)
+#define NF_FA_K_TYPE nf_attn_kv_type_k(pc.kv_types)
+#define NF_FA_V_TYPE nf_attn_kv_type_v(pc.kv_types)
+#else
+#define NF_FA_K_TYPE KV
+#define NF_FA_V_TYPE KV
 #endif
 
 layout(push_constant) uniform NfFaParams {
@@ -59,9 +99,9 @@ layout(push_constant) uniform NfFaParams {
     int q_row_stride; int out_row_stride;
     int k_row_stride; int k_head_stride; int v_row_stride; int v_head_stride;
     float scale; float softcap; float max_bias;
-    int causal; int swa_type; int n_swa;
+    int flags; int swa_type; int n_swa;
     int bias_mode; int n_buckets; int max_distance;
-    int has_sinks; int direct_out; int q_off; int out_off;
+    int q_off; int out_off;
 #if defined(PAGED)
     int page_shift; int pt_off;
 #endif
@@ -76,12 +116,62 @@ bool nf_fa_types_ok() {
     return nf_attn_kv_type_ok(nf_attn_kv_type_k(pc.kv_types)) && nf_attn_kv_type_ok(nf_attn_kv_type_v(pc.kv_types));
 }
 
-vec4 kc_load4(uint e) { return kc_kv_load4(e, nf_attn_kv_type_k(pc.kv_types)); }
-vec4 vc_load4(uint e) { return vc_kv_load4(e, nf_attn_kv_type_v(pc.kv_types)); }
 #else
 bool nf_fa_types_ok() {
     return true;
 }
+#endif
+
+#if NF_FA_VENDOR
+NF_KV_VENDOR_DECODE(kc, kc, kvs, kv_scales)
+NF_KV_VENDOR_DECODE(vc, vc, kvs, kv_scales)
+
+/* V of a latent cache reads the K row (flags bit NF_ATTN_FLAG_V_ALIAS) and therefore the K side planes. */
+bool nf_fa_v_alias() { return (pc.flags & NF_ATTN_FLAG_V_ALIAS) != 0; }
+
+/* Bytes of one row of the K / V packed side planes of a vendor cache side, 0 for a side without planes. */
+uint nf_fa_k_plane() {
+    return nf_kv_is_vendor(NF_FA_K_TYPE)
+        ? nf_kv_vendor_plane_bytes(NF_FA_K_TYPE, uint(pc.k_row_stride), uint(pc.n_head_kv)) : 0u;
+}
+uint nf_fa_v_plane() {
+    return !nf_fa_v_alias() && nf_kv_is_vendor(NF_FA_V_TYPE)
+        ? nf_kv_vendor_plane_bytes(NF_FA_V_TYPE, uint(pc.v_row_stride), uint(pc.n_head_kv)) : 0u;
+}
+
+/* Byte offset of the first plane row of the side in the kv_scales binding, and the bytes between two rows. */
+uint nf_fa_plane_base(bool v) {
+    return nf_kv_side_plane_base(uint(pc.n_head_kv)) + (v && !nf_fa_v_alias() ? nf_fa_k_plane() : 0u);
+}
+uint nf_fa_plane_stride() { return nf_fa_k_plane() + nf_fa_v_plane(); }
+
+/* Four values e .. e + 3 of the K cache row `row`, decoded through the row's side planes when it is a vendor row. */
+vec4 nf_fa_k4(uint e, int row) {
+    return nf_kv_is_vendor(NF_FA_K_TYPE)
+        ? kc_vendor_load4(e, row, NF_FA_K_TYPE, uint(pc.k_row_stride), uint(pc.k_head_stride),
+                          nf_fa_plane_base(false), nf_fa_plane_stride())
+        : kc_kv_load4(e, NF_FA_K_TYPE);
+}
+
+/* Four values e .. e + 3 of the V cache row `row`. */
+vec4 nf_fa_v4(uint e, int row) {
+    return nf_kv_is_vendor(NF_FA_V_TYPE)
+        ? vc_vendor_load4(e, row, NF_FA_V_TYPE, uint(pc.v_row_stride), uint(pc.v_head_stride),
+                          nf_fa_plane_base(true), nf_fa_plane_stride())
+        : vc_kv_load4(e, NF_FA_V_TYPE);
+}
+
+/* norm / |centroids| of a TurboQuant key row, else 1. */
+float nf_fa_tq_score(uint e_head, int row) {
+    return nf_kv_is_vendor(NF_FA_K_TYPE)
+        ? kc_vendor_tq_score(e_head, row, NF_FA_K_TYPE, uint(pc.k_row_stride), uint(pc.k_head_stride),
+                             nf_fa_plane_base(false), nf_fa_plane_stride())
+        : 1.0;
+}
+#else
+vec4 nf_fa_k4(uint e, int row) { return kc_load4(e); }
+vec4 nf_fa_v4(uint e, int row) { return vc_load4(e); }
+float nf_fa_tq_score(uint e_head, int row) { return 1.0; }
 #endif
 
 #include "common/reduce.glsl"
@@ -98,19 +188,30 @@ bool nf_fa_plan_ok() {
         && pc.d_k > 0 && pc.d_v > 0 && (pc.d_k & 3) == 0 && (pc.d_v & 3) == 0 && pc.n_split >= 1 && pc.split_len > 0
         && rows * NF_FA_CHUNK + pc.bk * NF_FA_CHUNK + rows * pc.bk + 3 * rows <= NF_FA_SMEM_FLOATS
         && rows * pc.d_v <= NF_FA_WG * NF_FA_ACC_MAX
-        && (pc.direct_out == 0 || pc.n_split == 1)
+        && ((pc.flags & NF_ATTN_FLAG_DIRECT) == 0 || pc.n_split == 1)
         && gl_WorkGroupSize.x == uint(NF_FA_WG);
 }
 
-/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h); slope = ALiBi slope of h. */
-float nf_fa_bias(int h, int p_q, int p_k, float slope) {
+/* Position bias of head h (nf_attn_bias of kernels/llm/common/attn_common.h); slope = ALiBi slope of h,
+ * q_row = the query token's row in the step. */
+float nf_fa_bias(int h, int p_q, int p_k, float slope, int q_row) {
     if (pc.bias_mode == NF_ATTN_BIAS_ALIBI) {
         return slope * (-float(abs(p_q - p_k)));
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) {
+        return p_k <= p_q ? slope * (-sqrt(float(p_q - p_k))) : 0.0;
     }
     if (pc.bias_mode == NF_ATTN_BIAS_T5_CAUSAL || pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR) {
         const int bucket = nf_t5_bucket(p_k, p_q, pc.n_buckets, pc.max_distance,
                                         pc.bias_mode == NF_ATTN_BIAS_T5_BIDIR ? 1 : 0);
         return rel_bias[bucket * pc.n_head + h];
+    }
+    if (pc.bias_mode == NF_ATTN_BIAS_INKLING) {
+        const int dist = p_q - p_k;
+        if (dist < 0 || dist >= pc.n_buckets) {
+            return 0.0;
+        }
+        return rel_bias[(q_row * pc.n_head + h) * pc.n_buckets + dist];
     }
     return 0.0;
 }
@@ -118,8 +219,8 @@ float nf_fa_bias(int h, int p_q, int p_k, float slope) {
 #if defined(PAGED)
 /* The physical row and page validity of a key slot (GLSL cannot pass the table as a parameter, so the caller
  * dereferences it: nf_kv_row / nf_kv_page_ok of kernels/llm/common/attn_common.h). The page table, kv_start /
- * kv_end and n_tokens are validated on the host before the launch (MS-2, section 5.5.1), so slot < kv_end always
- * reads page_table in bounds; a page id below 0 is masked, never required (section 5.5.1 O-2). */
+ * kv_end and n_tokens are validated on the host before the launch, so slot < kv_end always
+ * reads page_table in bounds; a page id below 0 is masked, never required. */
 int nf_fa_page_id(int slot) {
     return page_table[uint(pc.pt_off + (slot >> pc.page_shift))];
 }
@@ -155,7 +256,7 @@ void nf_fa_poison() {
         return;
     }
     const uint lid = gl_LocalInvocationID.x;
-    if (pc.direct_out != 0) {
+    if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
         const uint n = uint(pc.n_head * pc.d_v);
         for (int t = 0; t < pc.n_tokens; t++) {
             for (uint i = lid; i < n; i += gl_WorkGroupSize.x) {
@@ -211,7 +312,7 @@ void main() {
         nf_fa_smem[a_s + r] = 0.0;
     }
     if (lid < g_tile) {
-        nf_fa_slope[lid] = (pc.bias_mode == NF_ATTN_BIAS_ALIBI && lid < g_cnt)
+        nf_fa_slope[lid] = ((pc.bias_mode == NF_ATTN_BIAS_ALIBI || pc.bias_mode == NF_ATTN_BIAS_ALIBI_SQRT) && lid < g_cnt)
                            ? nf_alibi_slope(h0 + lid, pc.n_head, pc.max_bias) : 1.0;
     }
 
@@ -230,6 +331,7 @@ void main() {
 
     const uint k_head = uint(kvh * pc.k_head_stride);
     const uint v_head = uint(kvh * pc.v_head_stride);
+    /* The KV-cache scales of this KV head (the .cl twin nf_fa_run; 1.0 without a scaled cache). */
     for (int kt = k_begin; kt < k_stop; kt += bk) {
         const int nk = min(bk, k_stop - kt);
 
@@ -240,8 +342,10 @@ void main() {
             const int tq = t0 + i;
             const int slot = kt + idx - i * nk;
             if (tq < pc.n_tokens && nf_fa_page_ok(slot)
-                && nf_attn_visible(q_pos[tq], kv_pos[nf_fa_row(slot)],
-                                   pc.causal, pc.swa_type, pc.n_swa) != 0) {
+                && nf_attn_tree_visible(kv_pos[nf_fa_row(slot)], tree_mask[tq], pc.kv_end,
+                                        nf_attn_flag_fresh(pc.flags),
+                                        q_pos[tq], (pc.flags & NF_ATTN_FLAG_CAUSAL),
+                                        pc.swa_type, pc.n_swa) != 0) {
                 any_vis = 1.0;
             }
         }
@@ -280,7 +384,10 @@ void main() {
                 const int d = c + 4 * c4;
                 vec4 val = vec4(0.0);
                 if (kk < nk && d < d_k) {
-                    val = kc_load4(uint(nf_fa_row(kt + kk)) * uint(pc.k_row_stride) + k_head + uint(d));
+                    const uint krow = uint(nf_fa_row(kt + kk));
+                    const float ks = nf_kv_is_per_token_head(NF_FA_K_TYPE)
+                        ? kv_scales[(krow * 2u) * uint(pc.n_head_kv) + uint(kvh)] : kv_scales[kvh];
+                    val = nf_fa_k4(krow * uint(pc.k_row_stride) + k_head + uint(d), int(krow)) * ks;
                 }
                 const int b = kvc + kk * NF_FA_CHUNK + 4 * c4;
                 nf_fa_smem[b] = val.x;
@@ -317,9 +424,14 @@ void main() {
                 const int p_q = q_pos[tq];
                 const int p_k = kv_pos[nf_fa_row(slot)];
                 if (nf_fa_page_ok(slot)
-                    && nf_attn_visible(p_q, p_k, pc.causal, pc.swa_type, pc.n_swa) != 0) {
-                    s = nf_attn_score(nf_fa_smem[sc + idx], pc.scale, pc.softcap)
-                      + nf_fa_bias(h0 + g, p_q, p_k, nf_fa_slope[g]);
+                    && nf_attn_tree_visible(p_k, tree_mask[tq], pc.kv_end, nf_attn_flag_fresh(pc.flags),
+                                            p_q, (pc.flags & NF_ATTN_FLAG_CAUSAL), pc.swa_type,
+                                            pc.n_swa) != 0) {
+                    const uint krow = uint(nf_fa_row(slot));
+                    const float dotv = nf_fa_smem[sc + idx]
+                        * nf_fa_tq_score(krow * uint(pc.k_row_stride) + k_head, int(krow));
+                    s = nf_attn_score(dotv, pc.scale, pc.softcap)
+                      + nf_fa_bias(h0 + g, p_q, p_k, nf_fa_slope[g], tq);
                 }
             }
             nf_fa_smem[sc + idx] = s;
@@ -365,7 +477,11 @@ void main() {
                 const int d = c + 4 * c4;
                 vec4 val = vec4(0.0);
                 if (kk < nk && d < d_v) {
-                    val = vc_load4(uint(nf_fa_row(kt + kk)) * uint(pc.v_row_stride) + v_head + uint(d));
+                    const uint vrow = uint(nf_fa_row(kt + kk));
+                    const float vs = nf_kv_is_per_token_head(NF_FA_V_TYPE)
+                        ? kv_scales[(vrow * 2u + 1u) * uint(pc.n_head_kv) + uint(kvh)]
+                        : kv_scales[uint(pc.n_head_kv) + kvh];
+                    val = nf_fa_v4(vrow * uint(pc.v_row_stride) + v_head + uint(d), int(vrow)) * vs;
                 }
                 const int b = kvc + kk * NF_FA_CHUNK + 4 * c4;
                 nf_fa_smem[b] = val.x;
@@ -403,8 +519,8 @@ void main() {
             const int h = h0 + g;
             const float m = nf_fa_smem[m_s + r];
             const float l = nf_fa_smem[l_s + r];
-            if (pc.direct_out != 0) {
-                const vec2 fl = pc.has_sinks != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
+            if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
+                const vec2 fl = (pc.flags & NF_ATTN_FLAG_SINKS) != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
                 dst[uint(pc.out_off + tq * pc.out_row_stride + h * d_v + d)] = fl.y > 0.0 ? o[i] * fl.x / fl.y : 0.0;
             } else {
                 const uint pb = uint(((tq * pc.n_head + h) * pc.n_split + split) * (d_v + 2));

@@ -30,6 +30,7 @@ public class GGUFHeaderReaderExtensionTypesTest {
 
     private static final GGMLType[] EXTENSION_TYPES = {
         GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB,
+        GGMLType.F8_E4M3_B32,
     };
 
     @Rule
@@ -56,6 +57,14 @@ public class GGUFHeaderReaderExtensionTypesTest {
             assertEquals("Invalid GGUF file '" + path + "': tensor '" + WEIGHT + "' uses NeuralFree extension type "
                     + type + " but the file lacks neuralfree.extension_types", e.getMessage());
         }
+    }
+
+    @Test
+    public void aDeviceOnlyTypeIsRejectedEvenWithTheMarker() throws IOException {
+        String path = write(withTensor(GGMLType.W12).bool(GgufKeys.NF_EXTENSION_TYPES, true));
+        IOException e = assertThrows(IOException.class, () -> new GGUFFileParser(path));
+        assertEquals("Invalid GGUF file '" + path + "': tensor '" + WEIGHT + "' has type W12, a device-resident form"
+                + " that GGUF files never store", e.getMessage());
     }
 
     @Test
@@ -89,6 +98,15 @@ public class GGUFHeaderReaderExtensionTypesTest {
     }
 
     @Test
+    public void theUpstreamF8E4M3TypeLoadsWithoutAnyMarker() throws IOException {
+        String path = write(withTensor(GGMLType.F8_E4M3FN));
+        try (GGUFFileParser parser = new GGUFFileParser(path)) {
+            assertEquals(GGMLType.F8_E4M3FN, parser.getTensor(WEIGHT).type());
+            assertFalse(parser.getMetadata().containsKey(GgufKeys.NF_EXTENSION_TYPES));
+        }
+    }
+
+    @Test
     public void markedFileMayMixGgmlAndExtensionTypes() throws IOException {
         GgufTestWriter w = withTensor(GGMLType.I8_B128).bool(GgufKeys.NF_EXTENSION_TYPES, true)
                 .tensorZeros("plain.weight", GGMLType.Q4_0, 64, 2);
@@ -99,7 +117,7 @@ public class GGUFHeaderReaderExtensionTypesTest {
         }
     }
 
-    /** Id 1006 lies in the extension range but names no type, so it fails as any unknown ggml type does. */
+    /** Id 1010 lies in the extension range but names no type, so it fails as any unknown ggml type does. */
     @Test
     public void unassignedExtensionIdKeepsTheUnknownTypeRejection() throws IOException {
         for (boolean marked : new boolean[]{true, false}) {
@@ -107,7 +125,7 @@ public class GGUFHeaderReaderExtensionTypesTest {
             if (marked) {
                 w.bool(GgufKeys.NF_EXTENSION_TYPES, true);
             }
-            String path = write(withRawTypeId(w.toByteArray(), 1006));
+            String path = write(withRawTypeId(w.toByteArray(), GGMLType.EXTENSION_ID_MAX));
             IOException e = assertThrows(IOException.class, () -> new GGUFFileParser(path));
             assertTrue(e.getMessage(), e.getMessage().contains("unknown or was removed from ggml"));
             assertFalse(e.getMessage(), e.getMessage().contains("extension type"));

@@ -20,7 +20,7 @@ public class ConstraintGateTest {
 
     @Test
     public void aPrintedGrammarParsesToTheSameRules() {
-        String source = "root ::= (\"ab\" [c-eX] | [^\\n\\\"]+ item{2,3})? . <[5]> !<[6]>\n"
+        String source = "root ::= (\"ab\" [c-eX] | [^\\n\\\"]+ item{2,3})? . <[5]> !<[6]> <[7],[8]> !<[1],[2]>*\n"
                 + "item ::= \"[\" [0-9]* \"]\" |\n";
         Grammar g = GbnfParser.parse(source);
         String printed = "root ::= " + GbnfPrinter.ruleName(g, g.rootRuleIndex(), "p-") + "\n"

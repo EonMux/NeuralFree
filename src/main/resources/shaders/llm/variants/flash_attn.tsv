@@ -9,6 +9,20 @@ LLM_FlashDecode_Q4_1	flash_decode.comp	KV=NF_KV_Q4_1	sg
 LLM_FlashDecode_IQ4_NL	flash_decode.comp	KV=NF_KV_IQ4_NL	sg
 LLM_FlashDecode_Q5_0	flash_decode.comp	KV=NF_KV_Q5_0	sg
 LLM_FlashDecode_Q5_1	flash_decode.comp	KV=NF_KV_Q5_1	sg
+LLM_FlashDecode_FP8_E4M3	flash_decode.comp	KV=NF_KV_FP8_E4M3	sg
+LLM_FlashDecode_FP8_E5M2	flash_decode.comp	KV=NF_KV_FP8_E5M2	sg
+LLM_FlashDecode_FP8_PER_TOKEN_HEAD	flash_decode.comp	KV=NF_KV_FP8_PER_TOKEN_HEAD	sg
+LLM_FlashDecode_INT8_PER_TOKEN_HEAD	flash_decode.comp	KV=NF_KV_INT8_PER_TOKEN_HEAD	sg
+LLM_FlashDecode_INT4_PER_TOKEN_HEAD	flash_decode.comp	KV=NF_KV_INT4_PER_TOKEN_HEAD	sg
+LLM_FlashDecode_NVFP4	flash_decode.comp	KV=NF_KV_NVFP4	sg
+LLM_FlashDecode_NVFP4_4OVER6	flash_decode.comp	KV=NF_KV_NVFP4_4OVER6	sg
+LLM_FlashDecode_TQ_K8_KEYS	flash_decode.comp	KV=NF_KV_TQ_K8_KEYS	sg
+LLM_FlashDecode_TQ_4BIT_KEYS	flash_decode.comp	KV=NF_KV_TQ_4BIT_KEYS	sg
+LLM_FlashDecode_TQ_3BIT_KEYS	flash_decode.comp	KV=NF_KV_TQ_3BIT_KEYS	sg
+LLM_FlashDecode_TQ_4BIT_VALUES	flash_decode.comp	KV=NF_KV_TQ_4BIT_VALUES	sg
+LLM_FlashDecode_TQ_3BIT_VALUES	flash_decode.comp	KV=NF_KV_TQ_3BIT_VALUES	sg
+LLM_FlashDecode_FP8_DS_MLA	flash_decode.comp	KV=NF_KV_FP8_DS_MLA	sg
+LLM_FlashDecode_NVFP4_DS_MLA	flash_decode.comp	KV=NF_KV_NVFP4_DS_MLA	sg
 LLM_FlashDecode_Mixed	flash_decode.comp	KV_MIXED=1	sg
 LLM_FlashAttn_F32	flash_prefill.comp	KV=NF_KV_F32	sg
 LLM_FlashAttn_F16	flash_prefill.comp	KV=NF_KV_F16	sg
@@ -19,8 +33,26 @@ LLM_FlashAttn_Q4_1	flash_prefill.comp	KV=NF_KV_Q4_1	sg
 LLM_FlashAttn_IQ4_NL	flash_prefill.comp	KV=NF_KV_IQ4_NL	sg
 LLM_FlashAttn_Q5_0	flash_prefill.comp	KV=NF_KV_Q5_0	sg
 LLM_FlashAttn_Q5_1	flash_prefill.comp	KV=NF_KV_Q5_1	sg
+LLM_FlashAttn_FP8_E4M3	flash_prefill.comp	KV=NF_KV_FP8_E4M3	sg
+LLM_FlashAttn_FP8_E5M2	flash_prefill.comp	KV=NF_KV_FP8_E5M2	sg
+LLM_FlashAttn_FP8_PER_TOKEN_HEAD	flash_prefill.comp	KV=NF_KV_FP8_PER_TOKEN_HEAD	sg
+LLM_FlashAttn_INT8_PER_TOKEN_HEAD	flash_prefill.comp	KV=NF_KV_INT8_PER_TOKEN_HEAD	sg
+LLM_FlashAttn_INT4_PER_TOKEN_HEAD	flash_prefill.comp	KV=NF_KV_INT4_PER_TOKEN_HEAD	sg
+LLM_FlashAttn_NVFP4	flash_prefill.comp	KV=NF_KV_NVFP4	sg
+LLM_FlashAttn_NVFP4_4OVER6	flash_prefill.comp	KV=NF_KV_NVFP4_4OVER6	sg
+LLM_FlashAttn_TQ_K8_KEYS	flash_prefill.comp	KV=NF_KV_TQ_K8_KEYS	sg
+LLM_FlashAttn_TQ_4BIT_KEYS	flash_prefill.comp	KV=NF_KV_TQ_4BIT_KEYS	sg
+LLM_FlashAttn_TQ_3BIT_KEYS	flash_prefill.comp	KV=NF_KV_TQ_3BIT_KEYS	sg
+LLM_FlashAttn_TQ_4BIT_VALUES	flash_prefill.comp	KV=NF_KV_TQ_4BIT_VALUES	sg
+LLM_FlashAttn_TQ_3BIT_VALUES	flash_prefill.comp	KV=NF_KV_TQ_3BIT_VALUES	sg
+LLM_FlashAttn_FP8_DS_MLA	flash_prefill.comp	KV=NF_KV_FP8_DS_MLA	sg
+LLM_FlashAttn_NVFP4_DS_MLA	flash_prefill.comp	KV=NF_KV_NVFP4_DS_MLA	sg
 LLM_FlashAttn_Mixed	flash_prefill.comp	KV_MIXED=1	sg
 LLM_FlashAttn_Combine	flash_combine.comp
+LLM_FlashAttn_Lse	flash_combine.comp	NF_FC_LSE=1
+LLM_AttnCpMerge	cp_merge.comp
+LLM_AttnStaticSinkPartial	flash_combine.comp	NF_STATIC_SINK_PARTIAL=1
+LLM_DualChunkMerge	dual_chunk_merge.comp
 LLM_FlashDecodePaged_F32	flash_decode.comp	KV=NF_KV_F32 PAGED=1	sg
 LLM_FlashDecodePaged_F16	flash_decode.comp	KV=NF_KV_F16 PAGED=1	sg
 LLM_FlashDecodePaged_Q8_0	flash_decode.comp	KV=NF_KV_Q8_0 PAGED=1	sg
@@ -30,6 +62,20 @@ LLM_FlashDecodePaged_Q4_1	flash_decode.comp	KV=NF_KV_Q4_1 PAGED=1	sg
 LLM_FlashDecodePaged_IQ4_NL	flash_decode.comp	KV=NF_KV_IQ4_NL PAGED=1	sg
 LLM_FlashDecodePaged_Q5_0	flash_decode.comp	KV=NF_KV_Q5_0 PAGED=1	sg
 LLM_FlashDecodePaged_Q5_1	flash_decode.comp	KV=NF_KV_Q5_1 PAGED=1	sg
+LLM_FlashDecodePaged_FP8_E4M3	flash_decode.comp	KV=NF_KV_FP8_E4M3 PAGED=1	sg
+LLM_FlashDecodePaged_FP8_E5M2	flash_decode.comp	KV=NF_KV_FP8_E5M2 PAGED=1	sg
+LLM_FlashDecodePaged_FP8_PER_TOKEN_HEAD	flash_decode.comp	KV=NF_KV_FP8_PER_TOKEN_HEAD PAGED=1	sg
+LLM_FlashDecodePaged_INT8_PER_TOKEN_HEAD	flash_decode.comp	KV=NF_KV_INT8_PER_TOKEN_HEAD PAGED=1	sg
+LLM_FlashDecodePaged_INT4_PER_TOKEN_HEAD	flash_decode.comp	KV=NF_KV_INT4_PER_TOKEN_HEAD PAGED=1	sg
+LLM_FlashDecodePaged_NVFP4	flash_decode.comp	KV=NF_KV_NVFP4 PAGED=1	sg
+LLM_FlashDecodePaged_NVFP4_4OVER6	flash_decode.comp	KV=NF_KV_NVFP4_4OVER6 PAGED=1	sg
+LLM_FlashDecodePaged_TQ_K8_KEYS	flash_decode.comp	KV=NF_KV_TQ_K8_KEYS PAGED=1	sg
+LLM_FlashDecodePaged_TQ_4BIT_KEYS	flash_decode.comp	KV=NF_KV_TQ_4BIT_KEYS PAGED=1	sg
+LLM_FlashDecodePaged_TQ_3BIT_KEYS	flash_decode.comp	KV=NF_KV_TQ_3BIT_KEYS PAGED=1	sg
+LLM_FlashDecodePaged_TQ_4BIT_VALUES	flash_decode.comp	KV=NF_KV_TQ_4BIT_VALUES PAGED=1	sg
+LLM_FlashDecodePaged_TQ_3BIT_VALUES	flash_decode.comp	KV=NF_KV_TQ_3BIT_VALUES PAGED=1	sg
+LLM_FlashDecodePaged_FP8_DS_MLA	flash_decode.comp	KV=NF_KV_FP8_DS_MLA PAGED=1	sg
+LLM_FlashDecodePaged_NVFP4_DS_MLA	flash_decode.comp	KV=NF_KV_NVFP4_DS_MLA PAGED=1	sg
 LLM_FlashDecodePaged_Mixed	flash_decode.comp	KV_MIXED=1 PAGED=1	sg
 LLM_FlashAttnPaged_F32	flash_prefill.comp	KV=NF_KV_F32 PAGED=1	sg
 LLM_FlashAttnPaged_F16	flash_prefill.comp	KV=NF_KV_F16 PAGED=1	sg
@@ -40,4 +86,18 @@ LLM_FlashAttnPaged_Q4_1	flash_prefill.comp	KV=NF_KV_Q4_1 PAGED=1	sg
 LLM_FlashAttnPaged_IQ4_NL	flash_prefill.comp	KV=NF_KV_IQ4_NL PAGED=1	sg
 LLM_FlashAttnPaged_Q5_0	flash_prefill.comp	KV=NF_KV_Q5_0 PAGED=1	sg
 LLM_FlashAttnPaged_Q5_1	flash_prefill.comp	KV=NF_KV_Q5_1 PAGED=1	sg
+LLM_FlashAttnPaged_FP8_E4M3	flash_prefill.comp	KV=NF_KV_FP8_E4M3 PAGED=1	sg
+LLM_FlashAttnPaged_FP8_E5M2	flash_prefill.comp	KV=NF_KV_FP8_E5M2 PAGED=1	sg
+LLM_FlashAttnPaged_FP8_PER_TOKEN_HEAD	flash_prefill.comp	KV=NF_KV_FP8_PER_TOKEN_HEAD PAGED=1	sg
+LLM_FlashAttnPaged_INT8_PER_TOKEN_HEAD	flash_prefill.comp	KV=NF_KV_INT8_PER_TOKEN_HEAD PAGED=1	sg
+LLM_FlashAttnPaged_INT4_PER_TOKEN_HEAD	flash_prefill.comp	KV=NF_KV_INT4_PER_TOKEN_HEAD PAGED=1	sg
+LLM_FlashAttnPaged_NVFP4	flash_prefill.comp	KV=NF_KV_NVFP4 PAGED=1	sg
+LLM_FlashAttnPaged_NVFP4_4OVER6	flash_prefill.comp	KV=NF_KV_NVFP4_4OVER6 PAGED=1	sg
+LLM_FlashAttnPaged_TQ_K8_KEYS	flash_prefill.comp	KV=NF_KV_TQ_K8_KEYS PAGED=1	sg
+LLM_FlashAttnPaged_TQ_4BIT_KEYS	flash_prefill.comp	KV=NF_KV_TQ_4BIT_KEYS PAGED=1	sg
+LLM_FlashAttnPaged_TQ_3BIT_KEYS	flash_prefill.comp	KV=NF_KV_TQ_3BIT_KEYS PAGED=1	sg
+LLM_FlashAttnPaged_TQ_4BIT_VALUES	flash_prefill.comp	KV=NF_KV_TQ_4BIT_VALUES PAGED=1	sg
+LLM_FlashAttnPaged_TQ_3BIT_VALUES	flash_prefill.comp	KV=NF_KV_TQ_3BIT_VALUES PAGED=1	sg
+LLM_FlashAttnPaged_FP8_DS_MLA	flash_prefill.comp	KV=NF_KV_FP8_DS_MLA PAGED=1	sg
+LLM_FlashAttnPaged_NVFP4_DS_MLA	flash_prefill.comp	KV=NF_KV_NVFP4_DS_MLA PAGED=1	sg
 LLM_FlashAttnPaged_Mixed	flash_prefill.comp	KV_MIXED=1 PAGED=1	sg

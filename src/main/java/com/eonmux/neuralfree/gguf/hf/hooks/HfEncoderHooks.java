@@ -41,13 +41,13 @@ import java.util.function.UnaryOperator;
 
 /**
  * Hooks of the encoder checkpoints that are not BERT sub-families (LC/conversion/{gemma,llama,clef,
- * vllm_decision2}.py): the EmbeddingGemma embedders on the HK-B2 Gemma hooks ({@code EmbeddingGemma},
+ * vllm_decision2}.py): the EmbeddingGemma embedders on the Gemma hooks ({@code EmbeddingGemma},
  * gemma.py:186-256, and {@code EmbeddingGemma2Model}, gemma.py:813-832), the sentence-transformers
  * {@code 2_Dense}/{@code 3_Dense} side files both include when the load option
- * {@code st_dense_modules} is on (NF default on, llama.cpp converter flag default off — recorded in
- * LLAMACPP-PARITY), and the Qwen3 decision heads: {@code VllmDecision2Model} (vllm_decision2.py:15-107) and
+ * {@code st_dense_modules} is on (NF default on, llama.cpp converter flag default off), and the Qwen3 decision
+ * heads: {@code VllmDecision2Model} (vllm_decision2.py:15-107) and
  * {@code ClefModel} (clef.py:19-145). {@code LlamaEmbedNemotronModel} (llama.py:420-423) needs no hooks of
- * its own: it is the HK-0 Llama hooks on the LLAMA_EMBED arch.
+ * its own: it is the Llama hooks on the LLAMA_EMBED arch.
  */
 public final class HfEncoderHooks {
 
@@ -65,6 +65,10 @@ public final class HfEncoderHooks {
     private static final String UNPACK_CONFIG = "config.json";
     private static final String SCORE_BIAS_CONFIG = "score_bias.json";                          // vllm_decision2.py:31
     private static final String JOINT_HEAD_CONFIG = "joint_head_config.json";                   // clef.py:20
+    /** The configuration key vLLM stores the joint head configuration under (model_arch_config_convertor.py). */
+    private static final String INLINE_JOINT_HEAD_CONFIG = "joint_head_config";
+    /** vLLM's name of the Clef-Flash checkpoints (V/model_executor/models/clef_flash.py). */
+    public static final String CLEF_FLASH = "ClefFlashForJointSchema";
     private static final String JOINT_HEAD_CONFIG_TENSORS = "joint_head.safetensors";
     private static final String DECISION_HEAD_TENSORS = "decision_head.safetensors";            // vllm_decision2.py:61
     /** The layer-norm epsilon of the decision heads (clef.py:44, vllm_decision2.py:42). */
@@ -120,7 +124,7 @@ public final class HfEncoderHooks {
     /**
      * The sentence-transformers dense side files of an EmbeddingGemma checkpoint (gemma.py:191-214,
      * :216-228): when the load option {@code st_dense_modules} is on (NF default on, llama.cpp's
-     * {@code --sentence-transformers-modules-dense} flag default off — recorded in LLAMACPP-PARITY), the
+     * {@code --sentence-transformers-modules-dense} flag default off), the
      * {@code 2_Dense}/{@code 3_Dense} model files become the {@code dense_2}/{@code dense_3} input tensors.
      *
      * @throws IOException when a side file cannot be read or its shape is invalid
@@ -251,7 +255,7 @@ public final class HfEncoderHooks {
     }
 
     /**
-     * {@code VllmDecision2Model.set_gguf_parameters} (vllm_decision2.py:102-107) after the HK-B1 Qwen3
+     * {@code VllmDecision2Model.set_gguf_parameters} (vllm_decision2.py:102-107) after the Qwen3
      * metadata: the decision head type, the layer-norm epsilon of the head, and one score-bias key per token.
      */
     public static void vllmDecision2Meta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan)
@@ -331,7 +335,7 @@ public final class HfEncoderHooks {
 
     /**
      * {@code VllmDecision2Model}'s modify path: the {@code decision_head.} names keep theirs and rely on the
-     * converter map, the backbone tensors follow the HK-B1 Qwen3 step.
+     * converter map, the backbone tensors follow the Qwen3 step.
      */
     public static void vllmDecision2Tensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
@@ -360,10 +364,12 @@ public final class HfEncoderHooks {
     /**
      * {@code _load_clef_hparams} (clef.py:23-30): the joint head configuration is stored as {@code decision};
      * everything else stays. NeuralFree resolves the checkpoint by the root {@code config.json} naming
-     * {@code ClefModel}.
+     * {@code ClefModel}, or vLLM's {@value #CLEF_FLASH} (clef_flash.py), whose configuration may carry the joint head
+     * configuration inline as {@code joint_head_config} (transformers_utils/model_arch_config_convertor.py) when
+     * {@code joint_head_config.json} is absent.
      */
     public static HfConfig clefFixup(HfConfig cfg) {
-        if (!"ClefModel".equals(cfg.architecture())) {
+        if (!"ClefModel".equals(cfg.architecture()) && !CLEF_FLASH.equals(cfg.architecture())) {
             return cfg;
         }
         try {
@@ -375,14 +381,25 @@ public final class HfEncoderHooks {
     }
 
     private static HfConfig clefFixupChecked(HfConfig cfg) throws IOException {
-        if (!"ClefModel".equals(cfg.architecture())) {
-            return cfg;
-        }
         Path headConfig = cfg.sideFile(JOINT_HEAD_CONFIG);
-        if (!Files.isRegularFile(headConfig)) {
-            throw new GgufFormatException(cfg.source() + ": the Clef checkpoint has no " + JOINT_HEAD_CONFIG);
+        Map<String, Object> decision;
+        if (Files.isRegularFile(headConfig)) {
+            decision = readObject(headConfig);
+        } else if (CLEF_FLASH.equals(cfg.architecture()) && cfg.flat().get(INLINE_JOINT_HEAD_CONFIG) != null) {
+            Object inline = cfg.flat().get(INLINE_JOINT_HEAD_CONFIG);
+            if (!(inline instanceof Map)) {
+                throw new GgufFormatException(cfg.source() + ": '" + INLINE_JOINT_HEAD_CONFIG
+                        + "' must be an object");
+            }
+            decision = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) inline).entrySet()) {
+                decision.put(String.valueOf(e.getKey()), e.getValue());
+            }
+        } else {
+            throw new GgufFormatException(cfg.source() + ": the Clef checkpoint has no " + JOINT_HEAD_CONFIG
+                    + (CLEF_FLASH.equals(cfg.architecture()) ? " and no inline '" + INLINE_JOINT_HEAD_CONFIG + "'"
+                    : ""));
         }
-        Map<String, Object> decision = readObject(headConfig);
         Map<String, Object> merged = new LinkedHashMap<>(cfg.flat());
         merged.put("decision", decision);
         return cfg.withFlat(merged);

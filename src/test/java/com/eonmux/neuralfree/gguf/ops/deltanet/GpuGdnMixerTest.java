@@ -12,20 +12,25 @@ import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixerFactory;
+import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.FusedMode;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuOpsFixture;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
+import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuRecurrentState;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
+import com.eonmux.neuralfree.gguf.ops.fused.FusedKernels;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmKernels;
 import com.eonmux.neuralfree.gguf.spec.EmbeddingSpec;
 import com.eonmux.neuralfree.gguf.spec.HeadSpec;
@@ -82,12 +87,18 @@ public class GpuGdnMixerTest {
     private GpuOps ops;
     private LlmKernels kernels;
     private GpuMixer mixer;
+    private GpuForwardContext ctx;
     private final Map<String, GpuWeight> tensors = new HashMap<>();
     private GpuBuffer convState;
     private GpuBuffer scanState;
     private GpuBuffer stateRows;
 
+    /** Opens a rig whose kernels are those of the unfused path (the traces below check those arguments). */
     private void open() {
+        open(FusedMode.OFF);
+    }
+
+    private void open(FusedMode mode) {
         backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
         GpuScratch.Builder sb = GpuScratch.builder(backend, UBATCH);
         for (String s : Arrays.asList(ScratchSlots.NORMED, ScratchSlots.BRANCH)) {
@@ -99,26 +110,35 @@ public class GpuGdnMixerTest {
         scratch = sb.build();
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
         kernels = LlmKernels.open(backend);
-        ops = new GpuOps(backend.computeQueue(), kernels, scratch, placeholders);
+        ops = GpuOpsFixture.withFusedMode(backend.computeQueue(), kernels, scratch, placeholders, mode);
+    }
+
+    private void closeRig() {
+        if (mixer != null) {
+            mixer.close();
+            mixer = null;
+        }
+        if (ops != null) {
+            ops.close();
+            ops = null;
+        }
+        if (placeholders != null) {
+            placeholders.close();
+            placeholders = null;
+        }
+        if (scratch != null) {
+            scratch.close();
+            scratch = null;
+        }
+        if (backend != null) {
+            backend.close();
+            backend = null;
+        }
     }
 
     @After
     public void tearDown() {
-        if (mixer != null) {
-            mixer.close();
-        }
-        if (ops != null) {
-            ops.close();
-        }
-        if (placeholders != null) {
-            placeholders.close();
-        }
-        if (scratch != null) {
-            scratch.close();
-        }
-        if (backend != null) {
-            backend.close();
-        }
+        closeRig();
     }
 
     // ------------------------------------------------------------------ fixtures
@@ -214,7 +234,8 @@ public class GpuGdnMixerTest {
             }
         }
         mixer = f.create(layer);
-        mixer.bind(context(model(arch, layer), withMemory ? memory(layer) : null), layer);
+        ctx = context(model(arch, layer), withMemory ? memory(layer) : null);
+        mixer.bind(ctx, layer);
         return mixer;
     }
 
@@ -341,6 +362,62 @@ public class GpuGdnMixerTest {
         assertSame(out.buffer(), ds.get(10).bufferArg(4));
     }
 
+    /**
+     * One token of the qwen35 layer: the unfused path launches the four projections, the convolution, the L2 norm,
+     * the gate preparation, the scan, the output norm and gate, and the output projection (11 kernels); the fused
+     * path launches the projections as one persistent multi-task kernel, the L2 norm with the gate preparation as a
+     * second, and the output norm with the gate as one kernel (6).
+     */
+    @Test
+    public void fusedDecodeLaunchesFewerKernels() {
+        List<Dispatch> fused = qwen35Decode(FusedMode.ON);
+        assertEquals(Arrays.asList(
+                FusedKernels.MULTI_TASK, CONV, FusedKernels.MULTI_TASK, SCAN, FusedKernels.GDN_NORM_GATE, MV),
+                names(fused));
+        // The two launches of the step must not share their descriptor: each is read when it runs.
+        assertNotSame(fused.get(0).bufferArg(3), fused.get(2).bufferArg(3));
+        List<Dispatch> unfused = qwen35Decode(FusedMode.OFF);
+        assertEquals(Arrays.asList(MV, MV, MV, MV, CONV, NORM, GATE, SCAN, NORM, GLU, MV), names(unfused));
+    }
+
+    /**
+     * The forward backends register adapters after every block is bound, and a delta registered then applies from
+     * the next step: the fused projection launch must give way to the matmul path, which applies the delta, and come
+     * back once the delta is removed.
+     */
+    @Test
+    public void aDeltaRegisteredAfterBindingTurnsTheFusedProjectionsOff() {
+        open(FusedMode.ON);
+        LayerSpec layer = qwen35Layer();
+        bind(MixerKind.GDN, Arch.QWEN35, layer, true);
+        Runnable step = () -> mixer.decode(7, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH));
+        assertEquals(FusedKernels.MULTI_TASK, names(run(step)).get(0));
+
+        int[] applied = {0};
+        GpuProjectionDeltas.Delta delta = (scale, n, x, xOff, xStride, y, yOff, yStride) -> applied[0] += n;
+        String qkv = layer.tensorName(TensorNames.weight(TensorNames.ATTN_QKV));
+        ctx.projectionDeltas().register(qkv, delta);
+        List<String> withDelta = names(run(step));
+        assertEquals("the projections run unfused while a delta is registered: " + withDelta, MV, withDelta.get(0));
+        assertEquals(1, applied[0]);
+
+        ctx.projectionDeltas().unregister(qkv, delta);
+        assertEquals(FusedKernels.MULTI_TASK, names(run(step)).get(0));
+        assertEquals(1, applied[0]);
+        closeRig();
+    }
+
+    /** The dispatches of one qwen35 decode step under {@code mode}. */
+    private List<Dispatch> qwen35Decode(FusedMode mode) {
+        open(mode);
+        LayerSpec layer = qwen35Layer();
+        bind(MixerKind.GDN, Arch.QWEN35, layer, true);
+        List<Dispatch> ds = run(() -> mixer.decode(7, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        assertEquals(mode + " launches " + names(ds), mode == FusedMode.ON ? 6 : 11, ds.size());
+        closeRig();
+        return ds;
+    }
+
     @Test
     public void qwen35PrefillCompactsQkAndReusesPreparedDispatches() {
         open();
@@ -423,6 +500,53 @@ public class GpuGdnMixerTest {
         assertSame(gate.bufferArg(DeltaNetKernels.GATE_ARG_A_IN), gate.bufferArg(DeltaNetKernels.GATE_ARG_B_IN));
         assertSame(ds.get(5).bufferArg(4), gate.bufferArg(DeltaNetKernels.GATE_ARG_A_IN));
         assertEquals(GdnHeadMap.GROUPED.code(), ds.get(9).intArg(DeltaNetKernels.SCAN_ARG_KV_HEAD_MODE));
+    }
+
+    // ------------------------------------------------------------------ qwen4exp (attn_qkv_gate, ssm_beta_alpha)
+
+    @Test
+    public void qwen4expMergedProjectionsDecodeTrace() {
+        open();
+        int rowW = CONV_CH + VAL;
+        tensor("blk.0.attn_qkv_gate.weight", N_EMBD, rowW);
+        tensor("blk.0.ssm_beta_alpha.weight", N_EMBD, 2L * NV);
+        tensor("blk.0.ssm_conv1d.weight", D_CONV, CONV_CH);
+        tensor("blk.0.ssm_dt.bias", NV);
+        tensor("blk.0.ssm_a", NV);
+        tensor("blk.0.ssm_norm.weight", HV);
+        tensor("blk.0.ssm_out.weight", VAL, N_EMBD);
+        LayerSpec layer = layer(MixerKind.GDN, RecurrentSpec.builder(MixerKind.GDN).gdnHeads(NK, NV, HK, HV)
+                .dConv(D_CONV).headMap(GdnHeadMap.TILED).mergedQkvGate(true).concatBetaAlpha(true).build());
+        bind(MixerKind.GDN, Arch.QWEN4EXP, layer, true);
+        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+
+        String cp = GpuOps.COPY2D;
+        assertEquals(Arrays.asList(MV, cp, cp, MV, CONV, NORM, GATE, SCAN, NORM, GLU, MV), names(ds));
+        assertSame(buf("blk.0.attn_qkv_gate.weight"), ds.get(0).bufferArg(2));
+        GpuBuffer merged = ds.get(0).bufferArg(4);
+
+        // [qkv | gate] rows: the first CONV_CH columns feed the conv, the last VAL columns are z
+        Dispatch toX = ds.get(1);
+        int mergedOff = toX.intArg(3);
+        assertArrayEquals(new int[]{1, CONV_CH, rowW, mergedOff, CONV_CH}, ints(toX, 0, 5));
+        assertSame(merged, toX.bufferArg(6));
+        assertSame(slot(ScratchSlots.Q).buffer(), toX.bufferArg(7));
+        Dispatch toZ = ds.get(2);
+        assertArrayEquals(new int[]{1, VAL, rowW, mergedOff + CONV_CH, VAL}, ints(toZ, 0, 5));
+        assertSame(merged, toZ.bufferArg(6));
+        assertSame(slot(ScratchSlots.V).buffer(), toZ.bufferArg(7));
+        assertSame(slot(ScratchSlots.Q).buffer(), ds.get(4).bufferArg(10));
+
+        assertSame(buf("blk.0.ssm_beta_alpha.weight"), ds.get(3).bufferArg(2));
+        Dispatch gate = ds.get(6);
+        assertArrayEquals(new int[]{1, NV, NK, DeltaNetKernels.LAYOUT_CONCAT_BA, -1}, ints(gate, 0, 5));
+        int[] strides = ints(gate, 7, 11);
+        assertEquals(2 * NV, strides[0]);
+        assertEquals(2 * NV, strides[2]);
+        assertEquals("beta and alpha share the merged rows", strides[1], strides[3]);
+        assertSame(gate.bufferArg(DeltaNetKernels.GATE_ARG_A_IN), gate.bufferArg(DeltaNetKernels.GATE_ARG_B_IN));
+        assertSame(ds.get(3).bufferArg(4), gate.bufferArg(DeltaNetKernels.GATE_ARG_A_IN));
+        assertEquals("GpuGdnMixer{2k/4v heads, 16x16, attn_qkv_gate, ssm_beta_alpha}", mixer.toString());
     }
 
     @Test

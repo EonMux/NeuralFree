@@ -58,6 +58,8 @@ public final class HfQwenHooks {
     public static final String INTERN_S1 = "InternS1ForConditionalGeneration";
     /** The {@code tokenizer_class} of the HybridDNA tokenizer (base.py:2176-2181). */
     public static final String HYBRID_DNA_TOKENIZER = "HybridDNATokenizer";
+    /** The pre-tokenizer of the Soprano text backbone (soprano.py:41-42). */
+    public static final String SOPRANO_PRE = "soprano";
 
     /** The Qwen3 reranker chat template (qwen.py:232-237). */
     static final String RERANK_TEMPLATE = "<|im_start|>system\nJudge whether the Document meets the requirements"
@@ -188,7 +190,7 @@ public final class HfQwenHooks {
         Optional<String> activation = cfg.findString("classifier_activation");
         if (activation.isPresent()) {
             String a = activation.get();
-            if (!a.equals("gelu") && !a.equals("silu") && !a.equals("tanh")) {
+            if (!a.equals("gelu") && !a.equals("silu") && !a.equals("tanh") && !a.equals("relu")) {
                 throw new GgufFormatException(cfg.source() + ": unsupported classifier_activation: " + a);
             }
             kv.set(GgufKeys.CLASSIFIER_ACTIVATION, a);
@@ -295,6 +297,17 @@ public final class HfQwenHooks {
             return HfVocabWriters.internS1(HfHookSupport.vocabInput(ctx), pre);
         }
         return qwen2Vocab(ctx, pre);
+    }
+
+    /**
+     * {@code SopranoTextModel.set_vocab} (soprano.py:37-46): the {@link #qwen3Vocab} vocabulary with the
+     * {@value #SOPRANO_PRE} pre-tokenizer in place of the hash lookup ({@code get_vocab_base_pre}) and the
+     * unknown token at id 0.
+     */
+    public static Map<String, Object> sopranoVocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {
+        Map<String, Object> md = new LinkedHashMap<>(qwen3Vocab(ctx, (tj, encode) -> SOPRANO_PRE));
+        md.put(GgufKeys.TOKENIZER_UNK_ID, 0);
+        return md;
     }
 
     /**

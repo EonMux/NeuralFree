@@ -64,6 +64,21 @@ public final class ScheduleResolver {
         if (trunk == 0 && nextn > 0) {
             return LayerSchedule.empty();
         }
+        if (hp.repeatLoops() > 0) {
+            if (nextn > 0) {
+                throw new IllegalStateException(arch + ": repeat-block schedules with NextN blocks are not built");
+            }
+            int nIn = hp.repeatInputLayers();
+            int nRec = hp.repeatRecurrentLayers();
+            int nOut = hp.repeatOutputLayers();
+            if ((long) nIn + nRec + nOut != trunk) {
+                throw new IllegalStateException(arch + ": repeat-block ranges " + nIn + " + " + nRec + " + " + nOut
+                        + " do not cover the " + trunk + " trunk layers");
+            }
+            return LayerSchedule.repeat(trunk, nIn, nRec, hp.repeatLoops(), nOut,
+                    hp.repeatJustNorm() ? LayerSchedule.LoopCombine.JUSTNORM : LayerSchedule.LoopCombine.NONE,
+                    hp.repeatJustNormEps());
+        }
         int loops = hp.numLoops();
         if (loops > 1) {
             if (trunk % loops != 0) {

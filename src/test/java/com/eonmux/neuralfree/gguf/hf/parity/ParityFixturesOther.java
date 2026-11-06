@@ -14,7 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PT-1 fixtures of the other architectures: Gemma 3 (stored-minus-one norms, the padded token embedding cut to the
+ * Fixtures of the other architectures: Gemma 3 (stored-minus-one norms, the padded token embedding cut to the
  * vocabulary, the sliding window), Phi-3 Mini (LongRoPE factors and the attention factor), Mamba-2 (the SSM sizes,
  * the conv squeeze, the unsuffixed F32 A/D names, the grouped SSM norm) and BERT (the bert. renames and pooler
  * drop, the forced-F32 position and token-type embeddings, the phantom-space WordPiece vocabulary). Every expected
@@ -299,7 +299,7 @@ public final class ParityFixturesOther {
             g.tensorFromFloats(b + "ssm_a", GGMLType.F32, new long[]{1, 4, 1},
                     negExp(aLogValues()));
             seed++; // D: stored under the unsuffixed F32 name blk.<l>.ssm_d with the +1 dim appended
-            g.tensorFromFloats(b + "ssm_d", GGMLType.F32, new long[]{16, 1}, dValues());
+            g.tensorFromFloats(b + "ssm_d", GGMLType.F32, new long[]{1, 16}, dValues());
             int norm = seed++;
             g.tensorFromFloats(b + "ssm_norm.weight", GGMLType.F32, new long[]{16, 1},
                     ParityFixturesDense.valuesAt(norm, 16));
@@ -333,7 +333,8 @@ public final class ParityFixturesOther {
                 .config(SyntheticHf.json("{'architectures':['BertForMaskedLM'],'model_type':'bert',"
                         + "'hidden_size':16,'intermediate_size':32,'num_hidden_layers':2,"
                         + "'num_attention_heads':2,'max_position_embeddings':8,'type_vocab_size':2,"
-                        + "'vocab_size':12,'torch_dtype':'" + ParityFixturesDense.torchDtype(dtype) + "'}"))
+                        + "'layer_norm_eps':1e-5,'vocab_size':12,"
+                        + "'torch_dtype':'" + ParityFixturesDense.torchDtype(dtype) + "'}"))
                 .tokenizerJson(WORDPIECE_TOKENIZER)
                 .tokenizerConfigJson(null);
         b.floats(dtype, "bert.embeddings.word_embeddings.weight", 12, 16);
@@ -368,8 +369,9 @@ public final class ParityFixturesOther {
         g.u32("bert.feed_forward_length", 32);
         g.u32("bert.attention.head_count", 2);
         g.bool("bert.attention.causal", false);
-        g.u32("bert.vocab_size", 12);
-        g.f32("bert.attention.layer_norm_epsilon", 1e-5f);
+        // BertModel writes no {arch}.vocab_size (only the classes that call add_vocab_size do); the tokenizer keys
+        // carry the vocabulary size
+        g.f32("bert.attention.layer_norm_epsilon", 1e-5f); // layer_norm_eps (base.py:1917-1918)
         bertVocabKv(g);
 
         int seed = 0;
@@ -403,7 +405,7 @@ public final class ParityFixturesOther {
 
     /**
      * The phantom-space WordPiece tokens (bert.py:40-67): base tokens prefixed with U+2581, {@code ##x} stripped to
-     * {@code x}; the unused ids become {@code [PAD<i>]} UNUSED. No tokenizer.ggml.scores for the WordPiece class,
+     * {@code x}; the unused ids become U+2581-prefixed {@code [PAD<i>]} UNUSED. No tokenizer.ggml.scores for the WordPiece class,
      * plus the {@code tokenizer.ggml.token_type_count} of the WordPiece tokenizer and the fingerprint default
      * {@code tokenizer.ggml.pre}.
      */
@@ -418,7 +420,7 @@ public final class ParityFixturesOther {
             types.add(1); // NORMAL: a base token, not an added one
         }
         for (int i = base.length; i < 12; i++) {
-            tokens.add("[PAD" + i + "]");
+            tokens.add(metaspace + "[PAD" + i + "]"); // phantom() prefixes every type but CONTROL
             types.add(5); // UNUSED
         }
         g.str("tokenizer.ggml.model", "bert");

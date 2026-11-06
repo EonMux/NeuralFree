@@ -14,7 +14,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * Named, bounded corpora of token sequences the prompt-lookup drafters draft from: SGLang's external n-gram
  * corpora ({@code srt/speculative/external_corpus_manager.py}, backed by its sam-defined ngram workers). A corpus is
  * an ordered, append-only (evicting-oldest-when-full) list of token sequences under one name; the server exposes the
- * manager's {@code add}, {@code remove} and {@code list} operations (SV-8).
+ * manager's {@code add}, {@code remove} and {@code list} operations.
  *
  * <p>Drafters share one corpus <em>read-only</em>: {@link #sequences} hands out copies, so callers never write
  * stored arrays, and drafters that built their own caches or trees from the corpus refresh them when

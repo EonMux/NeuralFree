@@ -40,9 +40,14 @@ public final class KernelSet {
 
     /** Preferred row-reduce work-group size on OpenCL. */
     private static final int OPENCL_MATVEC_LOCAL = 256;
-    /** Preferred row-reduce work-group size on CUDA (two warps). */
+    /** Preferred matvec work-group size on CUDA (two warps). */
     private static final int CUDA_MATVEC_LOCAL = 64;
-    /** Smallest preferred row-reduce work-group size on Vulkan. */
+    /**
+     * Work-group size of the row-reduce kernels (row norms and their fused forms): {@code LLM_DIMX}, the
+     * largest local size those kernels reduce over.
+     */
+    private static final int ROW_REDUCE_LOCAL = 256;
+    /** Smallest preferred matvec work-group size on Vulkan. */
     private static final int VULKAN_MIN_MATVEC_LOCAL = 64;
 
     private final ComputeBackend backend;
@@ -50,6 +55,7 @@ public final class KernelSet {
     private final int faSmemFloats;
     private final boolean subgroups;
     private final int preferredMatvecLocal;
+    private final int preferredRowReduceLocal;
     private final Map<String, KernelHandle> handles = new ConcurrentHashMap<>();
     private final Map<String, UnsupportedKernelException> failures = new ConcurrentHashMap<>();
     private final Set<String> reportedOptional = ConcurrentHashMap.newKeySet();
@@ -62,6 +68,7 @@ public final class KernelSet {
         this.faSmemFloats = FaSmem.faSmemFloats(backend.backendType(), caps);
         this.subgroups = subgroupVariants(library) && subgroups(backend.backendType(), caps);
         this.preferredMatvecLocal = preferredMatvecLocal(backend.backendType(), caps);
+        this.preferredRowReduceLocal = preferredRowReduceLocal(caps);
     }
 
     /**
@@ -211,20 +218,29 @@ public final class KernelSet {
     /**
      * Whether the kernels use subgroup reductions. Never for a library without subgroup variants
      * ({@link KernelLibraryConfig#subgroupVariants()}); otherwise always on CUDA, on OpenCL when the program
-     * is built with {@code USE_SUBGROUPS}, and on Vulkan when the device reports subgroup arithmetic (kernels
-     * with an {@code __sg} module then use it).
+     * is built with {@code USE_SUBGROUPS}, and on Vulkan and Metal when the device reports subgroup
+     * arithmetic (kernels with an {@code __sg} module then use it; Metal SIMD groups always do).
      */
     public boolean subgroups() {
         return subgroups;
     }
 
     /**
-     * Preferred work-group size of row-reduce (matvec) kernels: OpenCL 256, CUDA 64, Vulkan
-     * {@code max(64, 2 * subgroupSize)}, each capped at the largest power of two not above the device's
-     * maximum work-group size.
+     * Preferred work-group size of row-reduce (matvec) kernels: OpenCL 256, CUDA and HIP 64, Vulkan and
+     * Metal {@code max(64, 2 * subgroupSize)}, each capped at the largest power of two not above the
+     * device's maximum work-group size.
      */
     public int preferredMatvecLocal() {
         return preferredMatvecLocal;
+    }
+
+    /**
+     * Work-group size of the row-reduce norm kernels ({@code LLM_RowNorm} and its fused forms): {@code LLM_DIMX},
+     * 256, capped at the largest power of two not above the device's maximum work-group size. The norms measure
+     * faster at a full workgroup than at {@link #preferredMatvecLocal()}, so they take their size separately.
+     */
+    public int rowReduceLocal() {
+        return preferredRowReduceLocal;
     }
 
     public ComputeBackend backend() {
@@ -268,20 +284,34 @@ public final class KernelSet {
         if (library instanceof VulkanKernelLibrary) {
             return ((VulkanKernelLibrary) library).config().subgroupVariants();
         }
+        if (library instanceof HipKernelLibrary) {
+            return ((HipKernelLibrary) library).config().subgroupVariants();
+        }
+        if (library instanceof MetalKernelLibrary) {
+            return ((MetalKernelLibrary) library).config().subgroupVariants();
+        }
         return true;
     }
 
-    /** Whether a library with subgroup variants uses them on a backend type and device. */
+    /**
+     * Whether a library with subgroup variants uses them on a backend type and device. An accelerator
+     * backend uses them when its device reports {@link DeviceFeature#SUBGROUP_ARITHMETIC}, as Vulkan does.
+     */
     static boolean subgroups(ComputeBackend.BackendType type, DeviceCapabilities caps) {
         switch (type) {
             case CUDA:
+            case HIP:
                 return true;
             case OPENCL:
                 return OpenClKernelLibrary.useSubgroups(caps);
             case VULKAN:
+            case METAL:
                 return caps.hasFeature(DeviceFeature.SUBGROUP_ARITHMETIC);
             default:
-                throw new IllegalArgumentException("unknown backend type " + type);
+                if (!type.isAccelerator()) {
+                    throw new IllegalArgumentException("unknown backend type " + type);
+                }
+                return caps.hasFeature(DeviceFeature.SUBGROUP_ARITHMETIC);
         }
     }
 
@@ -292,17 +322,33 @@ public final class KernelSet {
                 preferred = OPENCL_MATVEC_LOCAL;
                 break;
             case CUDA:
+            case HIP:
                 preferred = CUDA_MATVEC_LOCAL;
                 break;
             case VULKAN:
+            case METAL:
                 preferred = Math.max(VULKAN_MIN_MATVEC_LOCAL, 2 * Math.max(0, caps.getSubgroupSize()));
                 break;
             default:
-                throw new IllegalArgumentException("unknown backend type " + type);
+                if (!type.isAccelerator()) {
+                    throw new IllegalArgumentException("unknown backend type " + type);
+                }
+                preferred = Math.max(VULKAN_MIN_MATVEC_LOCAL, 2 * Math.max(0, caps.getSubgroupSize()));
+                break;
         }
+        return capByMaxWorkGroup(preferred, caps);
+    }
+
+    /** The work-group size of the row-reduce kernels: {@link #ROW_REDUCE_LOCAL}, capped by the device maximum. */
+    static int preferredRowReduceLocal(DeviceCapabilities caps) {
+        return capByMaxWorkGroup(ROW_REDUCE_LOCAL, caps);
+    }
+
+    /** {@code preferred} rounded down to a power of two when the device allows fewer work-items per group. */
+    private static int capByMaxWorkGroup(int preferred, DeviceCapabilities caps) {
         long maxWg = caps.getMaxWorkGroupSize();
         if (maxWg > 0 && maxWg < preferred) {
-            preferred = Integer.highestOneBit((int) maxWg);
+            return Integer.highestOneBit((int) maxWg);
         }
         return preferred;
     }

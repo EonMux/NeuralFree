@@ -6,6 +6,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.Locale;
 import java.util.Objects;
+import java.util.function.IntPredicate;
 
 /**
  * Chooses the context length of a model from its memory budget:
@@ -46,35 +47,73 @@ public final class ContextFitter {
 
     /** {@link #fit(ModelSpec, MemoryConfig, long, Companion)} without a companion model. */
     public static int fit(ModelSpec spec, MemoryConfig cfg, long budgetBytes) {
-        return fit(spec, cfg, budgetBytes, Companion.NONE);
+        return fit(spec, cfg, budgetBytes, Companion.NONE, WHOLE_PLAN);
+    }
+
+    /** {@link #fit(ModelSpec, MemoryConfig, long, Companion, PlanBytes)} with the default sizer. */
+    public static int fit(ModelSpec spec, MemoryConfig cfg, long budgetBytes, Companion companion) {
+        return fit(spec, cfg, budgetBytes, companion, WHOLE_PLAN);
     }
 
     /**
-     * The context length to plan with, leaving room for {@code companion} at every candidate context.
+     * The context length to plan with, leaving room for {@code companion} at every candidate context, where a
+     * candidate's size is what {@code sizer} reads from its plan instead of the plan's whole byte total. A hybrid
+     * load sizes only the layers it places on its device this way.
      *
-     * @param budgetBytes bytes the memory plan, the NextN draft memory and the companion may occupy together;
+     * @param budgetBytes bytes the sized plan, the NextN draft memory and the companion may occupy together;
      *                    {@link #UNLIMITED} for no limit
      * @throws IllegalArgumentException when the budget is negative or the model has no positive training context
      *                                  while the context is automatic
      * @throws ContextBudgetException   when the user's context, or every automatic context, exceeds the budget
      */
-    public static int fit(ModelSpec spec, MemoryConfig cfg, long budgetBytes, Companion companion) {
+    public static int fit(ModelSpec spec, MemoryConfig cfg, long budgetBytes, Companion companion, PlanBytes sizer) {
+        return fit(spec, cfg, budgetBytes, companion, sizer, null);
+    }
+
+    /**
+     * The context length whose plan over the layers {@code layerFilter} accepts (their {@code il}) fits
+     * {@code budgetBytes}: the per-device fit of a layer split, where each device holds only its own layers' caches
+     * ({@link MemoryPlanner#planForContext(ModelSpec, MemoryConfig, int, IntPredicate)}), with the NextN / MTP
+     * draft memory when {@code cfg} reserves it. No logging per candidate; the caller logs the chosen context.
+     *
+     * @throws IllegalArgumentException when the budget is negative or the model has no positive training context
+     *                                  while the context is automatic
+     * @throws ContextBudgetException   when the user's context, or every automatic context, exceeds the budget
+     */
+    public static int fitLayers(ModelSpec spec, MemoryConfig cfg, long budgetBytes, IntPredicate layerFilter) {
+        return fitLayers(spec, cfg, budgetBytes, layerFilter, Companion.NONE);
+    }
+
+    /**
+     * {@link #fitLayers(ModelSpec, MemoryConfig, long, IntPredicate)} leaving room for {@code companion} at every
+     * candidate context: the device of a layer split that also holds a drafter (the main GPU of a split with a
+     * draft model).
+     */
+    public static int fitLayers(ModelSpec spec, MemoryConfig cfg, long budgetBytes, IntPredicate layerFilter,
+                                Companion companion) {
+        Objects.requireNonNull(layerFilter, "layerFilter");
+        return fit(spec, cfg, budgetBytes, companion, WHOLE_PLAN, layerFilter);
+    }
+
+    private static int fit(ModelSpec spec, MemoryConfig cfg, long budgetBytes, Companion companion, PlanBytes sizer,
+                           IntPredicate layerFilter) {
         Objects.requireNonNull(spec, "spec");
         Objects.requireNonNull(cfg, "cfg");
         Objects.requireNonNull(companion, "companion");
+        Objects.requireNonNull(sizer, "sizer");
         if (budgetBytes < 0) {
             throw new IllegalArgumentException("memory budget must be >= 0 bytes, got " + budgetBytes);
         }
         String name = spec.arch().ggufName();
         int train = spec.hparams().nCtxTrain();
         if (!cfg.autoContext()) {
-            return checkUserContext(spec, cfg, budgetBytes, train, companion);
+            return checkUserContext(spec, cfg, budgetBytes, train, companion, sizer, layerFilter);
         }
         if (train <= 0) {
             throw new IllegalArgumentException(name + " has no positive training context (n_ctx_train = " + train
                     + "); set " + MemoryConfig.PROP_CTX + " explicitly");
         }
-        Sized full = size(spec, cfg, train, companion);
+        Sized full = size(spec, cfg, train, companion, sizer, layerFilter);
         if (full.bytes() <= budgetBytes) {
             return train;
         }
@@ -82,7 +121,7 @@ public final class ContextFitter {
         if (maxSteps == 0) {
             throw new ContextBudgetException(name, train, full, budgetBytes);
         }
-        Sized smallest = size(spec, cfg, CONTEXT_STEP, companion);
+        Sized smallest = size(spec, cfg, CONTEXT_STEP, companion, sizer, layerFilter);
         if (smallest.bytes() > budgetBytes) {
             throw new ContextBudgetException(name, CONTEXT_STEP, smallest, budgetBytes);
         }
@@ -90,7 +129,7 @@ public final class ContextFitter {
         int hi = maxSteps;
         while (lo < hi) {
             int mid = lo + (hi - lo + 1) / 2;
-            if (size(spec, cfg, mid * CONTEXT_STEP, companion).bytes() <= budgetBytes) {
+            if (size(spec, cfg, mid * CONTEXT_STEP, companion, sizer, layerFilter).bytes() <= budgetBytes) {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -105,19 +144,43 @@ public final class ContextFitter {
 
     /** {@link #requiredBytes(ModelSpec, MemoryConfig, int, Companion)} without a companion model. */
     public static long requiredBytes(ModelSpec spec, MemoryConfig cfg, int nCtx) {
-        return requiredBytes(spec, cfg, nCtx, Companion.NONE);
+        return requiredBytes(spec, cfg, nCtx, Companion.NONE, WHOLE_PLAN);
+    }
+
+    /** {@link #requiredBytes(ModelSpec, MemoryConfig, int, Companion, PlanBytes)} with the default sizer. */
+    public static long requiredBytes(ModelSpec spec, MemoryConfig cfg, int nCtx, Companion companion) {
+        return requiredBytes(spec, cfg, nCtx, companion, WHOLE_PLAN);
     }
 
     /**
-     * Bytes a context of {@code nCtx} needs: its memory plan ({@link MemoryPlan#totalBytes()}) plus, with
+     * Bytes a context of {@code nCtx} needs as {@code sizer} reads it from its plan, plus, with
      * {@link MemoryConfig#nextnMemory()}, the NextN / MTP draft memory, plus the memory of {@code companion} at that
      * context.
      *
      * @throws IllegalArgumentException for a non-positive context or a spec that cannot be planned
      */
-    public static long requiredBytes(ModelSpec spec, MemoryConfig cfg, int nCtx, Companion companion) {
+    public static long requiredBytes(ModelSpec spec, MemoryConfig cfg, int nCtx, Companion companion, PlanBytes sizer) {
         Objects.requireNonNull(companion, "companion");
-        return size(spec, cfg, nCtx, companion).bytes();
+        return size(spec, cfg, nCtx, companion, sizer, null).bytes();
+    }
+
+    /**
+     * Bytes a context of {@code nCtx} needs over the layers {@code layerFilter} accepts (their {@code il}): the
+     * per-device size of a layer split ({@link #fitLayers}), with the NextN / MTP draft memory when {@code cfg}
+     * reserves it. No companion model.
+     *
+     * @throws IllegalArgumentException for a non-positive context or a spec that cannot be planned
+     */
+    public static long requiredLayerBytes(ModelSpec spec, MemoryConfig cfg, int nCtx, IntPredicate layerFilter) {
+        return requiredLayerBytes(spec, cfg, nCtx, layerFilter, Companion.NONE);
+    }
+
+    /** {@link #requiredLayerBytes(ModelSpec, MemoryConfig, int, IntPredicate)} plus {@code companion}'s memory. */
+    public static long requiredLayerBytes(ModelSpec spec, MemoryConfig cfg, int nCtx, IntPredicate layerFilter,
+                                          Companion companion) {
+        Objects.requireNonNull(layerFilter, "layerFilter");
+        Objects.requireNonNull(companion, "companion");
+        return size(spec, cfg, nCtx, companion, WHOLE_PLAN, layerFilter).bytes();
     }
 
     /**
@@ -132,22 +195,36 @@ public final class ContextFitter {
         Objects.requireNonNull(cfg, "cfg");
         Objects.requireNonNull(plan, "plan");
         Objects.requireNonNull(companion, "companion");
-        return new Sized(spec, cfg, plan, companion).reservedBytes();
+        return new Sized(spec, cfg, plan, companion, WHOLE_PLAN).reservedBytes();
     }
 
-    private static Sized size(ModelSpec spec, MemoryConfig cfg, int nCtx, Companion companion) {
-        return new Sized(spec, cfg, MemoryPlanner.planQuietly(spec, cfg, nCtx), companion);
+    private static Sized size(ModelSpec spec, MemoryConfig cfg, int nCtx, Companion companion, PlanBytes sizer,
+                              IntPredicate layerFilter) {
+        MemoryPlan plan = layerFilter != null ? MemoryPlanner.planQuietly(spec, cfg, nCtx, layerFilter)
+                : MemoryPlanner.planQuietly(spec, cfg, nCtx);
+        return new Sized(spec, cfg, plan, companion, sizer);
     }
+
+    /** Sizes a candidate plan for the fit; the whole model's byte total by default. */
+    @FunctionalInterface
+    public interface PlanBytes {
+        long of(MemoryPlan plan);
+    }
+
+    /** The default {@link PlanBytes}: the plan's whole byte total. */
+    public static final PlanBytes WHOLE_PLAN = MemoryPlan::totalBytes;
 
     /** A plan with the bytes of the NextN draft memory and of the companion reserved beside it. */
     private static final class Sized {
         final MemoryPlan plan;
+        final PlanBytes sizer;
         final long nextnBytes;
         final long companionBytes;
         final String companionName;
 
-        Sized(ModelSpec spec, MemoryConfig cfg, MemoryPlan plan, Companion companion) {
+        Sized(ModelSpec spec, MemoryConfig cfg, MemoryPlan plan, Companion companion, PlanBytes sizer) {
             this.plan = plan;
+            this.sizer = sizer;
             this.nextnBytes = cfg.nextnMemory() ? MemoryPlanner.nextnBytes(spec, plan) : 0L;
             this.companionBytes = companion.bytes(plan);
             this.companionName = companion.name();
@@ -158,18 +235,18 @@ public final class ContextFitter {
         }
 
         long bytes() {
-            return Math.addExact(plan.totalBytes(), reservedBytes());
+            return Math.addExact(sizer.of(plan), reservedBytes());
         }
     }
 
     private static int checkUserContext(ModelSpec spec, MemoryConfig cfg, long budgetBytes, int train,
-                                        Companion companion) {
+                                        Companion companion, PlanBytes sizer, IntPredicate layerFilter) {
         String name = spec.arch().ggufName();
         int nCtx = cfg.nCtx();
         if (nCtx <= 0) {
             throw new IllegalArgumentException(MemoryConfig.PROP_CTX + " must be positive, got " + nCtx);
         }
-        Sized sized = size(spec, cfg, nCtx, companion);
+        Sized sized = size(spec, cfg, nCtx, companion, sizer, layerFilter);
         if (sized.bytes() > budgetBytes) {
             throw new ContextBudgetException(name, nCtx, sized, budgetBytes);
         }
@@ -188,9 +265,10 @@ public final class ContextFitter {
      * The memory of a second model that shares the device and whose context follows this model's context, so the two
      * are fitted together (llama.cpp {@code common_fit_extra_model}, common/fit.h:14-22, measured again at every
      * candidate context, common/fit.cpp:203-258): a speculative drafter. At a candidate plan it takes its fixed bytes
-     * (the weights it places on the device), its step bytes for every token of the plan's ubatch (its forward
-     * scratch) and, for a drafter with caches of its own, the bytes of those caches at the candidate's context and
-     * ubatch. Immutable.
+     * (the weights it places on the device), its step bytes for every token of its step ubatch (its forward scratch,
+     * the draft ubatch set with {@link #withStepUbatch} when one is set, else the plan's ubatch) and, for a drafter
+     * with caches of its own, the bytes of those caches at the candidate's context and ubatch (the draft ubatch of
+     * the cache settings when one is set). Immutable.
      */
     public static final class Companion {
 
@@ -204,21 +282,24 @@ public final class ContextFitter {
         }
 
         /** No companion model. */
-        public static final Companion NONE = new Companion("no companion", 0L, 0L, null, null);
+        public static final Companion NONE = new Companion("no companion", 0L, 0L, null, null, 0);
 
         private final String name;
         private final long fixedBytes;
         private final long bytesPerStepToken;
         private final CacheBytes caches;
         private final String cacheOwner;
+        /** The ubatch the step bytes are counted over; 0 follows the target plan's ubatch. */
+        private final int stepUbatch;
 
         private Companion(String name, long fixedBytes, long bytesPerStepToken, CacheBytes caches,
-                          String cacheOwner) {
+                          String cacheOwner, int stepUbatch) {
             this.name = name;
             this.fixedBytes = fixedBytes;
             this.bytesPerStepToken = bytesPerStepToken;
             this.caches = caches;
             this.cacheOwner = cacheOwner;
+            this.stepUbatch = stepUbatch;
         }
 
         /**
@@ -231,12 +312,13 @@ public final class ContextFitter {
          */
         public static Companion of(String name, long fixedBytes, long bytesPerStepToken) {
             check(name, fixedBytes, bytesPerStepToken);
-            return new Companion(name.trim(), fixedBytes, bytesPerStepToken, null, null);
+            return new Companion(name.trim(), fixedBytes, bytesPerStepToken, null, null, 0);
         }
 
         /**
          * A companion with caches of its own: {@code drafter} planned with {@code memory} at the target plan's
-         * context and ubatch.
+         * context and ubatch, with the draft ubatch of {@code memory} when one is set
+         * ({@link MemoryConfig#draftUbatchOr}).
          *
          * @throws IllegalArgumentException for a blank name, negative sizes, or a drafter that cannot be planned
          *                                  with {@code memory}
@@ -246,7 +328,7 @@ public final class ContextFitter {
             Objects.requireNonNull(drafter, "drafter");
             Objects.requireNonNull(memory, "memory");
             CacheBytes planned = (nCtx, ubatch) -> MemoryPlanner.planQuietly(drafter,
-                    memory.toBuilder().nCtx(nCtx).ubatch(ubatch).build(), nCtx).totalBytes();
+                    memory.toBuilder().nCtx(nCtx).ubatch(memory.draftUbatchOr(ubatch)).build(), nCtx).totalBytes();
             return sized(name, fixedBytes, bytesPerStepToken, planned, drafter.arch().ggufName(),
                     Math.min(memory.ubatch(), CONTEXT_STEP));
         }
@@ -267,11 +349,53 @@ public final class ContextFitter {
             return sized(name, fixedBytes, bytesPerStepToken, caches, owner.trim(), 1);
         }
 
+        /**
+         * A companion counting its step bytes over {@code ubatch} tokens instead of the target plan's ubatch: the
+         * step size a draft context runs its forward passes with (llama.cpp {@code -ubd}, whose 0 keeps the target's
+         * {@code -ub}). 0 keeps this companion's rule.
+         */
+        public Companion withStepUbatch(int ubatch) {
+            if (ubatch < 0) {
+                throw new IllegalArgumentException(name + ": step ubatch must be >= 0, got " + ubatch);
+            }
+            if (ubatch == 0 || ubatch == stepUbatch) {
+                return this;
+            }
+            return new Companion(name, fixedBytes, bytesPerStepToken, caches, cacheOwner, ubatch);
+        }
+
         private static Companion sized(String name, long fixedBytes, long bytesPerStepToken, CacheBytes caches,
                                        String owner, int probeUbatch) {
             check(name, fixedBytes, bytesPerStepToken);
-            Companion c = new Companion(name.trim(), fixedBytes, bytesPerStepToken, caches, owner);
+            Companion c = new Companion(name.trim(), fixedBytes, bytesPerStepToken, caches, owner, 0);
             c.cacheBytes(CONTEXT_STEP, probeUbatch);
+            return c;
+        }
+
+        /**
+         * A companion carrying both sides' sizes: {@code this} plus {@code other} — the fixed bytes and the
+         * per-step bytes summed, caches combined (each sized for the context, the sums kept), the narrower step
+         * ubatch rule kept ({@code 0} follows the target plan). {@link #NONE} returns the other side unchanged,
+         * so an absent companion adds nothing.
+         */
+        public Companion plus(Companion other) {
+            Objects.requireNonNull(other, "other");
+            if (this == NONE) {
+                return other;
+            }
+            if (other == NONE) {
+                return this;
+            }
+            String joined = name + " + " + other.name;
+            CacheBytes both = caches == null ? other.caches
+                    : other.caches == null ? caches
+                    : (nCtx, ubatch) -> Math.addExact(caches.at(nCtx, ubatch), other.caches.at(nCtx, ubatch));
+            String owner = cacheOwner == null ? other.cacheOwner
+                    : other.cacheOwner == null ? cacheOwner : cacheOwner + " and " + other.cacheOwner;
+            int stepUbatch = this.stepUbatch != 0 ? this.stepUbatch : other.stepUbatch;
+            Companion c = new Companion(joined, Math.addExact(fixedBytes, other.fixedBytes),
+                    Math.addExact(bytesPerStepToken, other.bytesPerStepToken), both, owner, stepUbatch);
+            c.cacheBytes(CONTEXT_STEP, 1);
             return c;
         }
 
@@ -303,7 +427,8 @@ public final class ContextFitter {
         /** Bytes the companion takes beside a target plan. */
         public long bytes(MemoryPlan targetPlan) {
             Objects.requireNonNull(targetPlan, "targetPlan");
-            long b = Math.addExact(fixedBytes, Math.multiplyExact(bytesPerStepToken, (long) targetPlan.ubatch()));
+            int stepTokens = stepUbatch > 0 ? stepUbatch : targetPlan.ubatch();
+            long b = Math.addExact(fixedBytes, Math.multiplyExact(bytesPerStepToken, (long) stepTokens));
             return caches == null ? b : Math.addExact(b, cacheBytes(targetPlan.nCtx(), targetPlan.ubatch()));
         }
 

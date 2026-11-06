@@ -71,9 +71,10 @@ public final class CpuAttnResidualExtra implements CpuLayerExtra {
         this.ckptFinal = HcKernels.checkpointCount(nLayer, blockSize);
         this.last = il == nLayer - 1;
 
-        this.attnScore = scoreWeight(arch, weights.layerFloatsOrNull(layer,
+        // Layer 0 never mixes an attention score: its input is the only residual source.
+        this.attnScore = ckptBefore > 0 ? scoreWeight(arch, weights.layerFloatsOrNull(layer,
                 TensorNames.weight(TensorNames.ATTN_RES_SCORE)), layer.tensorName(TensorNames.weight(
-                TensorNames.ATTN_RES_SCORE)));
+                TensorNames.ATTN_RES_SCORE))) : null;
         this.ffnScore = scoreWeight(arch, weights.layerFloatsOrNull(layer,
                 TensorNames.weight(TensorNames.FFN_RES_SCORE)), layer.tensorName(TensorNames.weight(
                 TensorNames.FFN_RES_SCORE)));
@@ -103,6 +104,12 @@ public final class CpuAttnResidualExtra implements CpuLayerExtra {
                     + " floats exceeds a Java array; lower neuralfree.ubatch");
         }
         return (int) floats;
+    }
+
+    /** Every hook mixes whole rows of x with its saved prefix, exact over any step layout. */
+    @Override
+    public String batchRefusal() {
+        return null;
     }
 
     @Override

@@ -1,0 +1,3 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Persistent decode-path multi-task kernel (kernels/llm/multitask.cl).
+LLM_MultiTask	multitask.comp

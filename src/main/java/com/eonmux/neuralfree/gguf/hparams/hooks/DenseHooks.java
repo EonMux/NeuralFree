@@ -127,6 +127,16 @@ public final class DenseHooks {
         b.clampKqv(kv.f32(GgufKeys.ATTENTION_CLAMP_KQV, b.clampKqv()));
     }
 
+    /**
+     * vLLM's Step1 decoder: no rotary position, RMS epsilon and vLLM's square-root ALiBi with the fixed maximum
+     * bias 8 ({@code _get_step_alibi_slopes}), the one key the exported file carries.
+     */
+    public static void step1(ModelHparamsBuilder b, GgufKv kv) {
+        readRmsEps(b, kv);
+        b.maxAlibiBias(kv.f32(GgufKeys.ATTENTION_MAX_ALIBI_BIAS, FIXED_ALIBI_BIAS));
+        b.alibiSqrt(true);
+    }
+
     /** jais.cpp:3-13: LayerNorm epsilon (:4) and optional ALiBi bias (:5). */
     public static void jais(ModelHparamsBuilder b, GgufKv kv) {
         readLayerNormEps(b, kv);

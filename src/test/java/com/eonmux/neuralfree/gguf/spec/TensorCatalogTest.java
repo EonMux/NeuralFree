@@ -86,6 +86,16 @@ public class TensorCatalogTest {
     }
 
     @Test
+    public void totalBytesSumsTheStorageOfEveryTensor() {
+        TensorCatalog c = catalog(
+                info("token_embd.weight", GGMLType.F16, 64, 1000),
+                info("blk.0.attn_q.weight", GGMLType.F16, 64, 64),
+                info("output_norm.weight", GGMLType.F32, 64));
+        assertEquals(128000 + 8192 + 256, c.totalBytes());
+        assertEquals(0, TensorCatalog.of("llama", java.util.Collections.emptyList()).totalBytes());
+    }
+
+    @Test
     public void fusedQkvWithFusedBias() {
         TensorCatalog c = catalog(
                 info("blk.0.attn_qkv.weight", GGMLType.Q8_0, 64, 64 + 32 + 32),

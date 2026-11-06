@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.hf.hooks;
 
 import com.eonmux.neuralfree.gguf.arch.Arch;
+import com.eonmux.neuralfree.gguf.arch.PoolingKind;
 import com.eonmux.neuralfree.io.safetensors.SafetensorsFile;
 import com.eonmux.neuralfree.io.safetensors.StTensor;
 import com.eonmux.neuralfree.gguf.hf.arch.HfArchResolver;
@@ -20,14 +21,17 @@ import com.eonmux.neuralfree.gguf.hf.tensor.RowTransforms;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
+import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfVocabWriters;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.PreNameResolver;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -37,7 +41,7 @@ import java.util.Set;
 /**
  * The Qwen3.5 decision-model classes (LC/conversion): {@code PplxDeciderModel} (pplx_decider.py:18-105),
  * {@code VllmD3Model} (vllm_d3.py:12-60), {@code OpenJevModel} (qwen.py:684-742), {@code H2OLightningModel}
- * (h2o_lightning.py:13-96) and the plain-LoRA adapters {@code LevModel}, {@code KevModel} and {@code NimbleModel}
+ * (h2o_lightning.py:13-96), {@code MiniCPMOCRSeqClsModel} (qwen.py:712-757) and the plain-LoRA adapters {@code LevModel}, {@code KevModel} and {@code NimbleModel}
  * (lev.py:17-280). Every class is architecture QWEN35 and builds through the {@link HfQwenLinearHooks} Qwen3.5
  * chain; its own part is the decision type, the per-type temperatures and labels, the systemone chat template,
  * and the readout:
@@ -50,13 +54,24 @@ import java.util.Set;
  *       of {@code serve_config.json};</li>
  *   <li>the LoRA classes: the adapter merges at load as {@code W + (alpha/r)·B·A} over the local base checkpoint
  *       (never a download; {@code ctx.resources()} keeps it open), and Kev's pointer head is {@code cat(q, k)} of
- *       its training head, a {@code torch} pickle {@code head.pt} that NeuralFree does not unpickle (PAR FX-1).</li>
+ *       its training head, a {@code torch} pickle {@code head.pt} that NeuralFree does not unpickle.</li>
  * </ul>
  */
 public final class HfDecisionHooks {
 
+    /** vLLM's name of the Decision 3.0 checkpoints (V/model_executor/models/d3.py). */
+    public static final String D3_SEQUENCE_CLASSIFICATION = "D3ForSequenceClassification";
+    private static final String DECISION_CONFIG = "decision_config.json";
+    /** The configuration key vLLM stores {@value #DECISION_CONFIG} under (model_arch_config_convertor.py). */
+    private static final String INLINE_DECISION_CONFIG = "decision_config";
     private static final String SYSTEMONE = "systemone";
     private static final String[] TEMPERATURE_TYPES = {"choice", "score", "noul"};
+    /** The decision type of MiniCPM-OCR-Jev (constants.py DecisionType.MINICPM_OCR_JEV). */
+    static final String MINICPM_OCR_JEV_TYPE = "openbmb-minicpm-ocr-jev";
+    /** The MiniCPM-OCR-Jev class labels in {@code cls.output} row order (qwen.py:719). */
+    static final List<String> MINICPM_OCR_LABELS = List.of("inconsistent", "consistent");
+    /** The MiniCPM-OCR-Jev value head. */
+    private static final String MINICPM_OCR_SCORE = "score.weight";
 
     private HfDecisionHooks() {
     }
@@ -138,6 +153,51 @@ public final class HfDecisionHooks {
         kv.set(GgufKeys.ATTENTION_CAUSAL, false);
     }
 
+    /**
+     * The decision configuration of vLLM's {@value #D3_SEQUENCE_CLASSIFICATION} (d3.py), the name a Decision 3.0
+     * configuration carries once vLLM has recognized it (model_arch_config_convertor.py): {@code decision_config.json}
+     * when present, else the configuration's inline {@code decision_config}, stored as {@code decision} as the
+     * checkpoint detector stores it for {@code VllmD3Model}. A configuration that has {@code decision} already is
+     * unchanged.
+     *
+     * @throws GgufFormatException when neither source exists, the inline value is not an object, or the side file is
+     *                             invalid
+     */
+    public static HfConfig vllmD3Fixup(HfConfig cfg) {
+        if (cfg.flat().get("decision") != null) {
+            return cfg;
+        }
+        Map<String, Object> decision;
+        try {
+            Path file = cfg.sideFile(DECISION_CONFIG);
+            if (Files.isRegularFile(file)) {
+                decision = HfDecisionSupport.JsonObjects.readJsonObject(file);
+            } else {
+                decision = inlineDecisionConfig(cfg);
+            }
+        } catch (IOException e) {
+            throw new GgufFormatException(cfg.source() + ": " + DECISION_CONFIG + " cannot be read: "
+                    + e.getMessage(), e);
+        }
+        return cfg.withFlat(Collections.singletonMap("decision", decision));
+    }
+
+    private static Map<String, Object> inlineDecisionConfig(HfConfig cfg) {
+        Object inline = cfg.flat().get(INLINE_DECISION_CONFIG);
+        if (inline == null) {
+            throw new GgufFormatException(cfg.source() + ": the Decision 3.0 checkpoint has no " + DECISION_CONFIG
+                    + " and no inline '" + INLINE_DECISION_CONFIG + "'");
+        }
+        if (!(inline instanceof Map)) {
+            throw new GgufFormatException(cfg.source() + ": '" + INLINE_DECISION_CONFIG + "' must be an object");
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : ((Map<?, ?>) inline).entrySet()) {
+            out.put(String.valueOf(e.getKey()), e.getValue());
+        }
+        return out;
+    }
+
     public static void vllmD3Tensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
         readoutTensors(ctx, hfName, src, out);
@@ -188,6 +248,56 @@ public final class HfDecisionHooks {
     public static void h2oTensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
             throws IOException {
         openjevTensors(ctx, hfName, src, out);
+    }
+
+    // ------------------------------------------------------------------ MiniCPMOCRSeqClsModel
+
+    /**
+     * {@code MiniCPMOCRSeqClsModel.set_gguf_parameters} (qwen.py:738-749): the Qwen3.5 metadata, then the value head
+     * read at the last token: LAST pooling, one output per class of {@link #MINICPM_OCR_LABELS}, the class labels
+     * and the decision type {@value #MINICPM_OCR_JEV_TYPE}.
+     *
+     * @throws GgufFormatException when the checkpoint has no {@code score.weight} classification head
+     */
+    public static void miniCpmOcrJevMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) throws IOException {
+        if (!plan.has(TensorNames.weight(TensorNames.CLS_OUT))) {
+            throw new GgufFormatException(ctx.config().source() + ": the checkpoint has no score.weight"
+                    + " classification head");
+        }
+        HfQwenLinearHooks.qwen35Meta(ctx, kv, plan);
+        kv.set(GgufKeys.POOLING_TYPE, PoolingKind.LAST.ggufCode());
+        kv.set(GgufKeys.EMBEDDING_LENGTH_OUT, (long) MINICPM_OCR_LABELS.size());
+        kv.set(GgufKeys.CLASSIFIER_OUTPUT_LABELS, MINICPM_OCR_LABELS);
+        kv.set(GgufKeys.DECISION_TYPE, MINICPM_OCR_JEV_TYPE);
+    }
+
+    /**
+     * {@code MiniCPMOCRSeqClsModel.modify_tensors} (qwen.py:751-757): {@code score.weight}, one row per class,
+     * becomes {@code cls.output.weight}; every other tensor follows the Qwen3.5 chain.
+     *
+     * @throws GgufFormatException when {@code score.weight} does not hold one row per class
+     */
+    public static void miniCpmOcrJevTensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
+            throws IOException {
+        if (out.isConsumed(hfName)) {
+            return;
+        }
+        if (MINICPM_OCR_SCORE.equals(hfName)) {
+            long[] shape = src.shape();
+            if (shape.length == 0 || shape[0] != MINICPM_OCR_LABELS.size()) {
+                throw new GgufFormatException(ctx.config().source() + ": " + MINICPM_OCR_SCORE + " must have "
+                        + MINICPM_OCR_LABELS.size() + " rows, got " + (shape.length == 0 ? "a scalar"
+                        : shape[0] + " rows"));
+            }
+            out.add(TensorNames.weight(TensorNames.CLS_OUT), src);
+            return;
+        }
+        HfQwenLinearHooks.vReorderTensors(ctx, hfName, src, out);
+    }
+
+    /** {@code MiniCPMOCRSeqClsModel.set_vocab} (qwen.py:722-724): the systemone template of the fixed task. */
+    public static Map<String, Object> miniCpmOcrJevVocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {
+        return withSystemone(ctx, pre, HfDecisionSupport.Templates.MINICPM_OCR_JEV);
     }
 
     // ------------------------------------------------------------------ LevModel / KevModel / NimbleModel

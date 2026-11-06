@@ -172,6 +172,30 @@ final class GpuMtpHead extends MtpHead {
     }
 
     @Override
+    public void copyRows(Rows src, int srcRow, Rows dst, int dstRow, int n) {
+        GpuRows s = cast(src);
+        GpuRows d = cast(dst);
+        checkWidth(d, s.width(), "copy of " + s.name());
+        checkRows(s, srcRow + n, ubatch());
+        checkRows(d, dstRow + n, ubatch());
+        if (n < 1) {
+            throw new IllegalArgumentException("copy of " + n + " rows");
+        }
+        ops.copy(s.buf(), s.off() + srcRow * s.width(), d.buf(), d.off() + dstRow * d.width(), n * s.width());
+    }
+
+    @Override
+    public Region region(Rows rows) {
+        GpuRows r = cast(rows);
+        return new Region(r.buf(), r.off());
+    }
+
+    @Override
+    public GpuForwardContext gpuContext() {
+        return ctx;
+    }
+
+    @Override
     public void read(Rows src, int nRows, float[] dst) {
         GpuRows r = cast(src);
         checkRows(r, nRows, ubatch());
@@ -461,6 +485,17 @@ final class GpuMtpHead extends MtpHead {
                 ex.run(pos0, n, n == 1 ? GpuLayerExecutor.StepMode.DECODE : GpuLayerExecutor.StepMode.PREFILL,
                         GpuLayerExecutor.TapSink.NONE);
                 ops.copy(x.buffer(), x.offset(), r.buf(), r.off(), n * width);
+                memory.end(pos0, n, tokens);
+            }
+
+            @Override
+            public void runKV(int pos0, int n, int[] tokens, Rows rows) {
+                GpuRows r = cast(rows);
+                checkRows(r, n, ubatch());
+                checkWidth(r, width, "draft stack");
+                memory.begin(pos0, n, tokens);
+                ops.copy(r.buf(), r.off(), x.buffer(), x.offset(), n * width);
+                ex.runKV(pos0, n, n == 1 ? GpuLayerExecutor.StepMode.DECODE : GpuLayerExecutor.StepMode.PREFILL);
                 memory.end(pos0, n, tokens);
             }
 

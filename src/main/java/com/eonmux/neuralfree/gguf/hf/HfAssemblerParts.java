@@ -4,19 +4,16 @@ import com.eonmux.neuralfree.gguf.DataSegment;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.GGUFValueType;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
-import com.eonmux.neuralfree.gguf.hf.arch.HfForceType;
 import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.names.HfTensorFilters;
 import com.eonmux.neuralfree.gguf.hf.config.QuantArgs;
 import com.eonmux.neuralfree.gguf.hf.quant.Fp4Scheme;
 import com.eonmux.neuralfree.gguf.hf.st.CheckpointContainer;
-import com.eonmux.neuralfree.gguf.hf.tensor.DtypePolicy;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfTensorIndex;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorPlan;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorPlanBuilder;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
-import com.eonmux.neuralfree.gguf.quant.RequantPolicy;
 import com.eonmux.neuralfree.io.safetensors.SafetensorsFile;
 import com.eonmux.neuralfree.io.safetensors.StTensor;
 
@@ -29,23 +26,24 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.regex.Pattern;
 
 /**
  * The package-visible parts of the {@link HfSourceAssembler} steps: the {@code --no-mtp} drop behind
- * {@link HfSourceAssembler#filter}, the QZ-1 requantization and its recording sink behind
- * {@link HfSourceAssembler#plan}, the {@code prec_a4} flags, and the checkpoint wrapper that hides the
- * sentence-transformers dense side files.
+ * {@link HfSourceAssembler#filter}, the recording sink behind {@link HfSourceAssembler#plan}, the {@code prec_a4}
+ * flags, and the checkpoint wrapper that hides the sentence-transformers dense side files.
  */
 final class HfAssemblerParts {
 
     private HfAssemblerParts() {
     }
 
-    /** The {@code --no-mtp} drop: layers past the base block count and the {@code mtp}/{@code nextn} tensors. */
+    /**
+     * The {@code --no-mtp} drop and the {@code --mtp} selection: layers past the base block count and the
+     * {@code mtp}/{@code nextn} tensors.
+     */
     static final class MtpFilter {
         private MtpFilter() {
         }
@@ -60,12 +58,30 @@ final class HfAssemblerParts {
             return remove.isEmpty() ? index : index.withReplaced(Collections.emptyMap(), remove);
         }
 
+        /**
+         * The {@code --mtp} view of {@code index}: the MTP tensors and {@code rootKeep}, every other tensor dropped.
+         */
+        static HfTensorIndex only(HfTensorIndex index, Set<String> rootKeep, int baseBlocks) {
+            Set<String> remove = new LinkedHashSet<>();
+            for (String name : index.names()) {
+                if (!keepForMtpOnly(name, rootKeep, baseBlocks)) {
+                    remove.add(name);
+                }
+            }
+            return remove.isEmpty() ? index : index.withReplaced(Collections.emptyMap(), remove);
+        }
+
+        /** Whether a {@code --mtp} export keeps {@code name}: a shared root tensor, or an MTP tensor. */
+        static boolean keepForMtpOnly(String name, Set<String> rootKeep, int baseBlocks) {
+            return rootKeep.contains(name) || isMtp(name, baseBlocks);
+        }
+
         static boolean isMtp(String name, int baseBlocks) {
             if (name.startsWith("mtp.") || name.contains(".mtp.")) {
                 return true;
             }
             for (String part : name.split("\\.")) {
-                if (part.contains("nextn")) {
+                if (part.equals("mtp") || part.startsWith("mtp_") || part.contains("nextn")) {
                     return true;
                 }
             }
@@ -73,44 +89,17 @@ final class HfAssemblerParts {
         }
     }
 
-    /** The QZ-1 requantization decisions of one planning pass: the policy types and the option's quantizer. */
-    static final class Requant {
-        private final HfForceType forceType;
-        private final DtypePolicy policy;
-        private final ModelSourceOptions.OnlineQuant target;
-
-        Requant(HfForceType forceType, DtypePolicy policy, ModelSourceOptions.OnlineQuant target) {
-            this.forceType = Objects.requireNonNull(forceType, "forceType");
-            this.policy = Objects.requireNonNull(policy, "policy");
-            this.target = Objects.requireNonNull(target, "target");
-        }
-
-        /**
-         * The source {@code ggufName} is planned from: requantized only when the source is a plain float, the
-         * architecture forces no type on the tensor (its {@code tensor_force_quant} wins) and the planned type makes
-         * {@link RequantPolicy#replace} eligible.
-         */
-        RowSource at(String ggufName, RowSource src) {
-            if (!src.format().isFloat()) {
-                return src;
-            }
-            GGMLType forced = forceType.force(ggufName, Math.max(1, src.shape().length), src.format(),
-                    policy.outType());
-            if (forced != null) {
-                return src;
-            }
-            return RequantPolicy.replace(ggufName, src, policy.typeFor(ggufName, src, null), target);
-        }
-    }
-
-    /** A sink that forwards to the plan builder and records the GGUF tensors each checkpoint tensor adds. */
+    /**
+     * A sink that forwards to the plan builder, through the pass's online requantization when there is one, and
+     * records the GGUF tensors each checkpoint tensor adds. {@link #flush} ends the pass.
+     */
     static final class RecordingSink implements TensorSink {
         private final TensorPlanBuilder b;
-        private final Requant requant;
+        private final HfOnlineRequant requant;
         private final Map<String, List<String>> added = new LinkedHashMap<>();
         private String current;
 
-        RecordingSink(TensorPlanBuilder b, Requant requant) {
+        RecordingSink(TensorPlanBuilder b, HfOnlineRequant requant) {
             this.b = b;
             this.requant = requant;
         }
@@ -125,9 +114,20 @@ final class HfAssemblerParts {
 
         @Override
         public void add(String ggufName, RowSource src) {
-            b.add(ggufName, requant == null ? src : requant.at(ggufName, src));
+            if (requant == null) {
+                b.add(ggufName, src);
+            } else {
+                requant.add(b, current, ggufName, src);
+            }
             if (current != null) {
                 added.computeIfAbsent(current, k -> new ArrayList<>()).add(ggufName);
+            }
+        }
+
+        /** Adds the tensors the requantization still holds ({@link HfOnlineRequant#flush}). */
+        void flush() {
+            if (requant != null) {
+                requant.flush(b);
             }
         }
 

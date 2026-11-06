@@ -27,6 +27,10 @@ public class GGMLTypeTest {
         assertEquals(GGMLType.NVFP4, GGMLType.fromId(40));
         assertEquals(GGMLType.Q1_0, GGMLType.fromId(41));
         assertEquals(GGMLType.Q2_0, GGMLType.fromId(42));
+        // id 43 is shared between F8_E4M3FN (mainline llama.cpp's F8_E4M3, NF's own reading) and IQ3_K
+        // (Avalon's numbering); fromId resolves it to F8_E4M3FN and GGUFFileParser re-reads it from the layout.
+        assertEquals(GGMLType.F8_E4M3FN, GGMLType.fromId(43));
+        assertEquals(GGMLType.IQ3_KS, GGMLType.fromId(44));
     }
 
     @Test
@@ -93,6 +97,22 @@ public class GGMLTypeTest {
         assertEquals(36L, GGMLType.Q2_0.getBytesForElements(128));
         assertTrue(GGMLType.NVFP4.isQuantized());
         assertTrue(GGMLType.Q1_0.isQuantized());
+    }
+
+    @Test
+    public void byteAccountingForIq3KTypes() {
+        // block_iq3_k: d(f16) + extra(u16) + scales_h(u16) + scales_l[8] + qs[64] + qh[32]
+        // = 110 bytes per 256 elements (3.4375 bpw, Avalon ggml-common.h).
+        assertEquals(110L, GGMLType.IQ3_K.getBytesForElements(256));
+        assertEquals(220L, GGMLType.IQ3_K.getBytesForElements(512));
+        assertEquals(256, GGMLType.IQ3_K.getBlockSize());
+        assertTrue(GGMLType.IQ3_K.isQuantized());
+        // block_iq3_ks: d(f16) + extra(u16) + scales[4] + qs[64] + qh[32] = 104 bytes per 256
+        // elements (3.25 bpw).
+        assertEquals(104L, GGMLType.IQ3_KS.getBytesForElements(256));
+        assertEquals(208L, GGMLType.IQ3_KS.getBytesForElements(512));
+        assertEquals(256, GGMLType.IQ3_KS.getBlockSize());
+        assertTrue(GGMLType.IQ3_KS.isQuantized());
     }
 
     @Test

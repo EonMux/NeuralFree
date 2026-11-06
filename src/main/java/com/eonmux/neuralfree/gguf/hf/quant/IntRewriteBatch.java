@@ -176,6 +176,19 @@ final class IntRewriteBatch {
      * the activation siblings of the module.
      */
     RowSource finish(IntModuleTensors m, IntWeightSpec spec) throws IOException {
+        return finish(m, spec, null, null);
+    }
+
+    /**
+     * {@link #finish(IntModuleTensors, IntWeightSpec)} with the per-column activation pre-scale {@code preScale}, which
+     * the runtime applies to the matmul input before its quantization ({@link RowSource#inputPreScale()}).
+     */
+    RowSource finish(IntModuleTensors m, IntWeightSpec spec, float[] preScale) throws IOException {
+        return finish(m, spec, preScale, null);
+    }
+
+    /** {@code act} when the caller already resolved the activation siblings, else they are read here. */
+    private RowSource finish(IntModuleTensors m, IntWeightSpec spec, float[] preScale, Act act) throws IOException {
         int[] perm = null;
         String reason = null;
         if (spec.gidx != null) {
@@ -196,9 +209,9 @@ final class IntRewriteBatch {
         if (c.reason != null) {
             warn("float fallback " + c.target + ": " + c.reason, m.name());
         }
-        Act act = activation(m, spec.experts);
-        return new IntGroupSource(spec, c.target, fallback, c.target.isQuantized() ? perm : null, act,
-                cfg.dir().toString());
+        Act a = act != null ? act : activation(m, spec.experts);
+        return new IntGroupSource(spec, c.target, fallback, c.target.isQuantized() ? perm : null, a,
+                cfg.dir().toString(), null, preScale);
     }
 
     /** The float fallback type: F32 under exact quantization, else the scales' float type, else BF16. */
@@ -207,6 +220,29 @@ final class IntRewriteBatch {
             return GGMLType.F32;
         }
         return scaleDtype == StDType.F16 ? GGMLType.F16 : GGMLType.BF16;
+    }
+
+    /**
+     * The source of a weight carrying a per-column activation pre-scale. Without activation quantization the scale
+     * is folded into an F32 weight, for which {@code q * s + z} times the column multiplier is exact. With an
+     * activation scheme the weight keeps its own quantization and the pre-scale travels as
+     * {@link RowSource#inputPreScale()}, because the reference scales the activation before quantizing it
+     * (torchao's linear multiplies {@code activation_tensor * act_pre_scale} and then quantizes).
+     */
+    RowSource finishPreScaled(IntModuleTensors m, IntWeightSpec spec, float[] preScale, String reason)
+            throws IOException {
+        long want = Math.multiplyExact(Math.max(1, spec.experts), spec.k);
+        if (preScale.length != spec.k && preScale.length != want) {
+            throw new GgufFormatException(args.format() + " module " + m.name() + ": " + preScale.length
+                    + " activation pre-scale values for " + spec.k + " columns");
+        }
+        Act act = activation(m, spec.experts);
+        if (act.scheme != null || act.scale() != null || act.zeroPoint() != null) {
+            return finish(m, spec, preScale, act);
+        }
+        warn("float fallback " + GGMLType.F32 + ": " + reason, m.name());
+        return new IntGroupSource(spec, GGMLType.F32, GGMLType.F32, null, Act.NONE, cfg.dir().toString(),
+                preScale);
     }
 
     private Choice choose(IntWeightSpec s, Stats st, int[] perm) {

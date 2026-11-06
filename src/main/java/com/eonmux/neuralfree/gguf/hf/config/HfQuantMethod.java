@@ -17,6 +17,7 @@ import java.util.regex.Pattern;
 
 import static com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig.firstOf;
 import static com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig.nullableObject;
+import static com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig.object;
 import static com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig.optObject;
 import static com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig.strings;
 
@@ -29,7 +30,11 @@ import static com.eonmux.neuralfree.gguf.hf.config.HfQuantConfig.strings;
 public enum HfQuantMethod {
     /** Not quantized. */
     NONE,
-    /** A method that stores float weights and quantizes at load in vLLM/SGLang; weights load as stored. */
+    /**
+     * A method that stores float weights and quantizes at load in vLLM/SGLang: the vLLM online shorthands
+     * ({@link HfQuantConfig#onlineTarget()}) and bare {@code online} with its layer selection
+     * ({@link HfQuantConfig#onlineConfig()}) quantize at load, the other names load their weights as stored.
+     */
     ONLINE,
     /** {@code fp8}: FP8 E4M3 per-tensor or block weights. */
     FP8,
@@ -71,6 +76,12 @@ public enum HfQuantMethod {
     FP_QUANT,
     /** SGLang {@code w4afp8}: int4 expert weights with FP8 activations, FP8 block linears. */
     W4AFP8,
+    /**
+     * torchao, whose checkpoints store torchao tensor subclasses (safetensors tensor-data descriptors, or
+     * {@code _rebuild_wrapper_subclass} wrappers in a PyTorch pickle). The configuration is read into the group
+     * size, weight scale format and activation quantization of the layouts the containers decode.
+     */
+    TORCHAO,
     /** A known method that is not supported; {@link HfQuantAliases.Resolution#reason()} says why. */
     REJECTED;
 
@@ -118,6 +129,7 @@ public enum HfQuantMethod {
             case HQQ: hqq(a); break;
             case FP_QUANT: fpQuant(a); break;
             case W4AFP8: w4afp8(a); break;
+            case TORCHAO: torchao(a); break;
             default: throw new IllegalStateException("unhandled quantization method " + this);
         }
     }
@@ -169,6 +181,9 @@ public enum HfQuantMethod {
             throw new GgufFormatException(cfg.source() + ": unsupported DeepSeek-V4 expert_dtype '" + expertDtype
                     + "'; expected fp4 or fp8");
         }
+        // DeepSeek-V4.1 Engram tables are E4M3 rows with one E8M0 scale per 32 elements, not block-FP8 linears:
+        // deepseek41.py:181-193 dequantizes them itself and keeps the stored tensors out of the rewrite
+        a.rules.add(QuantRule.exclude(ModuleMatcher.regex("(?:.*\\.)?layers\\.\\d+\\.engram\\.embed$")));
         a.all(blockFp8(block));
     }
 
@@ -607,6 +622,388 @@ public enum HfQuantMethod {
         a.rules.add(QuantRule.of(ModuleMatcher.regex(EXPERTS), QuantArgs.builder(QuantFormat.INT4_IN_INT8)
                 .group(QuantArgs.intOr(a.q, "group_size", 128, a.where)).actScheme(ActQuantScheme.FP8_STATIC).build()));
         a.all(blockFp8(new int[]{128, 128}));
+    }
+
+    /**
+     * transformers {@code TorchAoConfig} (V torchao.py TorchAOConfig.from_config): {@code modules_to_not_convert}
+     * skips modules; {@code quant_type} holds exactly one {@code "default"} entry whose {@code _type} names the
+     * torchao configuration and whose {@code _data} carries its arguments. A {@code module_fqn_to_config} inside
+     * that entry gives per-module configurations (exact names or {@code re:} full-match patterns, with
+     * {@code _default}), as V torchao.py does. The supported configurations map onto the checkpoint layouts the
+     * readers decode ({@link QuantFormat#INT4_TORCHAO}, {@link QuantFormat#INT8_CHANNEL},
+     * {@link QuantFormat#FP8}, {@link QuantFormat#MXFP4_CT}, {@link QuantFormat#MXFP8},
+     * {@link QuantFormat#NVFP4_MODELOPT}); any other configuration is refused by name.
+     */
+    private static void torchao(Assembly a) {
+        a.ignore(a.q.get("modules_to_not_convert"), "modules_to_not_convert", ModuleMatcher::component);
+        Object quantType = a.q.get("quant_type");
+        if (quantType == null) {
+            throw new GgufFormatException(a.where + ".quant_type is missing; torchao needs the quant_type to apply");
+        }
+        Map<String, Object> byName = optObject(quantType, a.where + ".quant_type");
+        if (byName.size() != 1 || !byName.containsKey("default")) {
+            throw new GgufFormatException(a.where + ".quant_type must hold exactly the 'default' entry, got "
+                    + byName.keySet());
+        }
+        Map<String, Object> type = optObject(byName.get("default"), a.where + ".quant_type.default");
+        String name = QuantArgs.strOr(type, "_type", "", a.where + ".quant_type.default");
+        if (name.isEmpty()) {
+            throw new GgufFormatException(a.where + ".quant_type.default has no '_type' naming its torchao"
+                    + " configuration");
+        }
+        Map<String, Object> data = optObject(type.get("_data"), a.where + ".quant_type.default._data");
+        Map<String, Object> perModule = nullableObject(data.get("module_fqn_to_config"),
+                a.where + ".quant_type.default._data.module_fqn_to_config");
+        if (perModule == null || perModule.isEmpty()) {
+            a.all(torchaoArgs(name, data, a.where + ".quant_type.default"));
+            return;
+        }
+        for (Map.Entry<String, Object> e : perModule.entrySet()) {
+            String fqn = e.getKey();
+            if (fqn.equals("_default")) {
+                continue;
+            }
+            if (fqn.isEmpty() || fqn.equals("re:")) {
+                throw new GgufFormatException(a.where + ".quant_type.default._data.module_fqn_to_config: '" + fqn
+                        + "' is not a module name or a 're:' pattern");
+            }
+            ModuleMatcher matcher = fqn.startsWith("re:")
+                    ? ModuleMatcher.regex("(?:" + fqn.substring(3) + ")\\Z")
+                    : ModuleMatcher.exact(fqn);
+            if (e.getValue() == null) {
+                a.rules.add(QuantRule.exclude(matcher));
+            } else {
+                Map<String, Object> cfg = object(e.getValue(), a.where + ".module_fqn_to_config['" + fqn + "']");
+                a.rules.add(QuantRule.of(matcher, torchaoArgs(requiredType(cfg, a.where + ".module_fqn_to_config['"
+                        + fqn + "']"), optObject(cfg.get("_data"), a.where + "." + fqn + "._data"),
+                        a.where + ".module_fqn_to_config['" + fqn + "']")));
+            }
+        }
+        Object dflt = perModule.get("_default");
+        if (dflt != null) {
+            Map<String, Object> cfg = object(dflt, a.where + ".module_fqn_to_config._default");
+            a.rules.add(QuantRule.of(ModuleMatcher.regex(".*"), torchaoArgs(requiredType(cfg, a.where
+                    + ".module_fqn_to_config._default"), optObject(cfg.get("_data"), a.where + "._default._data"),
+                    a.where + ".module_fqn_to_config._default")));
+        }
+    }
+
+    private static String requiredType(Map<String, Object> cfg, String where) {
+        String type = QuantArgs.strOr(cfg, "_type", "", where);
+        if (type.isEmpty()) {
+            throw new GgufFormatException(where + " has no '_type' naming its torchao configuration");
+        }
+        return type;
+    }
+
+    /**
+     * The storage arguments of one torchao configuration (V quant_api.py and the prototype MX configs). The
+     * checkpoint's serialized tensor subclass is authoritative for the packing layout; the configuration supplies
+     * the group size, the weight scale format and the activation quantization.
+     */
+    private static QuantArgs torchaoArgs(String type, Map<String, Object> d, String where) {
+        switch (type) {
+            case "Int4WeightOnlyConfig": {
+                int group = QuantArgs.intOr(d, "group_size", 128, where);
+                if (group <= 0) {
+                    throw new GgufFormatException(where + ": Int4WeightOnlyConfig group_size must be positive, got "
+                            + group);
+                }
+                String packing = serializedValue(d.get("int4_packing_format"));
+                if (packing != null) {
+                    String format = packing.toUpperCase(Locale.ROOT);
+                    if (!format.equals("PLAIN") && !format.equals("PRESHUFFLED")
+                            && !format.equals("PLAIN_INT32") && !format.equals("TILE_PACKED_TO_4D")) {
+                        throw new GgufFormatException(where + ": Int4WeightOnlyConfig int4_packing_format '" + packing
+                                + "' has no NeuralFree mapping; PLAIN, PRESHUFFLED, PLAIN_INT32 and"
+                                + " TILE_PACKED_TO_4D are supported");
+                    }
+                    if (format.equals("TILE_PACKED_TO_4D")) {
+                        int ntile = QuantArgs.intOr(d, "int4_tile_packed_ntile", 8, where);
+                        if (ntile != 8 && ntile != 16) {
+                            throw new GgufFormatException(where + ": Int4WeightOnlyConfig int4_tile_packed_ntile "
+                                    + ntile + " has no NeuralFree mapping; 8 (CUDA) and 16 (ROCm) are supported");
+                        }
+                    }
+                }
+                return QuantArgs.builder(QuantFormat.INT4_TORCHAO).group(group).build();
+            }
+            case "Float8DynamicActivationInt4WeightConfig": {
+                String packing = serializedValue(d.get("int4_packing_format"));
+                if (packing != null && !packing.equalsIgnoreCase("preshuffled")
+                        && !packing.equalsIgnoreCase("plain")) {
+                    throw new GgufFormatException(where + ": Float8DynamicActivationInt4WeightConfig"
+                            + " int4_packing_format '" + packing + "' has no NeuralFree mapping; preshuffled and"
+                            + " plain are supported");
+                }
+                return QuantArgs.builder(QuantFormat.INT4_TORCHAO).group(128)
+                        .actScheme(ActQuantScheme.FP8_TOKEN).build();
+            }
+            case "Int8WeightOnlyConfig":
+                return QuantArgs.builder(QuantFormat.INT8_CHANNEL).group(weightGroup(d.get("granularity"), where))
+                        .build();
+            case "Int8StaticActivationInt8WeightConfig": {
+                List<Object> granularities = granularityList(d.get("granularity"));
+                Object weightGranularity = granularities.isEmpty() ? null
+                        : granularities.get(granularities.size() == 1 ? 0 : 1);
+                QuantArgs.Builder b = QuantArgs.builder(QuantFormat.INT8_CHANNEL)
+                        .group(weightGroup(weightGranularity, where));
+                if (Boolean.TRUE.equals(d.get("reduce_range"))) {
+                    b.actUnemulated("torchao reduced-range int8 activations");
+                } else {
+                    String mapping = serializedValue(d.get("act_mapping_type"));
+                    b.actScheme(mapping != null && !mapping.equals("SYMMETRIC")
+                            ? ActQuantScheme.INT8_STATIC_ASYM : ActQuantScheme.INT8_STATIC);
+                }
+                return b.build();
+            }
+            case "IntxWeightOnlyConfig": {
+                return intx(d, where, false);
+            }
+            case "Int8DynamicActivationIntxWeightConfig": {
+                return intx(d, where, true);
+            }
+            case "Int8DynamicActivationInt8WeightConfig": {
+                List<Object> granularities = granularityList(d.get("granularity"));
+                Object actGranularity = granularities.isEmpty() ? null : granularities.get(0);
+                Object weightGranularity = granularities.isEmpty() ? null
+                        : granularities.get(granularities.size() == 1 ? 0 : 1);
+                QuantArgs.Builder b = QuantArgs.builder(QuantFormat.INT8_CHANNEL)
+                        .group(weightGroup(weightGranularity, where));
+                String mapping = serializedValue(d.get("act_mapping_type"));
+                if (Boolean.TRUE.equals(d.get("reduce_range"))) {
+                    b.actUnemulated("torchao reduced-range int8 activations");
+                } else if (mapping != null && !mapping.equals("SYMMETRIC")) {
+                    b.actUnemulated("torchao " + mapping + " int8 activations");
+                } else if (actGranularity != null && !isPerRow(actGranularity)) {
+                    b.actUnemulated("torchao int8 activations at " + granularityName(actGranularity)
+                            + " granularity");
+                } else {
+                    b.actScheme(ActQuantScheme.INT8_TOKEN);
+                }
+                return b.build();
+            }
+            case "Float8WeightOnlyConfig": {
+                return fp8Builder(weightGroup(d.get("granularity"), where)).build();
+            }
+            case "Float8DynamicActivationFloat8WeightConfig": {
+                String packing = serializedValue(d.get("packing_format"));
+                if (packing != null && !packing.equals("PLAIN")) {
+                    throw new GgufFormatException(where + ": Float8DynamicActivationFloat8WeightConfig"
+                            + " packing_format '" + packing + "' (a sparse tensor subclass) is not supported;"
+                            + " PLAIN is");
+                }
+                List<Object> granularities = granularityList(d.get("granularity"));
+                boolean defaults = granularities.isEmpty();
+                Object actGranularity = defaults ? null : granularities.get(0);
+                Object weightGranularity = defaults ? null
+                        : granularities.get(granularities.size() == 1 ? 0 : 1);
+                QuantArgs.Builder b = fp8Builder(defaults ? QuantArgs.UNGROUPED : weightGroup(weightGranularity,
+                        where));
+                String actDtype = serializedValue(d.get("activation_dtype"));
+                if (actDtype != null && !actDtype.equals("float8_e4m3fn")) {
+                    b.actUnemulated("torchao " + actDtype + " activations, which NeuralFree does not quantize");
+                } else if (actGranularity == null) {
+                    b.actUnemulated("torchao FP8 per-tensor dynamic activations, whose scale is computed from the"
+                            + " whole activation tensor");
+                } else if (isPerRow(actGranularity)) {
+                    b.actScheme(ActQuantScheme.FP8_TOKEN);
+                } else {
+                    b.actUnemulated("torchao FP8 activations at " + granularityName(actGranularity)
+                            + " granularity");
+                }
+                return b.build();
+            }
+            case "MXDynamicActivationMXWeightConfig": {
+                int block = QuantArgs.intOr(d, "block_size", 32, where);
+                if (block != 32) {
+                    throw new GgufFormatException(where + ": MXDynamicActivationMXWeightConfig block_size must be"
+                            + " 32, got " + block);
+                }
+                String dtype = serializedValue(d.get("weight_dtype"));
+                if (dtype == null) {
+                    dtype = "float8_e4m3fn";
+                }
+                if ("float4_e2m1fn_x2".equals(dtype)) {
+                    return QuantArgs.builder(QuantFormat.MXFP4_CT).actScheme(ActQuantScheme.MXFP4).build();
+                }
+                if ("float8_e4m3fn".equals(dtype)) {
+                    return QuantArgs.builder(QuantFormat.MXFP8).actScheme(ActQuantScheme.MXFP8).build();
+                }
+                if ("float8_e5m2".equals(dtype)) {
+                    throw new GgufFormatException(where + ": MXDynamicActivationMXWeightConfig weight_dtype"
+                            + " 'float8_e5m2' has no MXFP8 GGML mapping; only float8_e4m3fn does");
+                }
+                throw new GgufFormatException(where + ": MXDynamicActivationMXWeightConfig weight_dtype '" + dtype
+                        + "' has no NeuralFree mapping; float4_e2m1fn_x2 and float8_e4m3fn do");
+            }
+            case "NVFP4DynamicActivationNVFP4WeightConfig": {
+                QuantArgs.Builder b = QuantArgs.builder(QuantFormat.NVFP4_MODELOPT);
+                if (QuantArgs.boolOr(d, "use_dynamic_per_tensor_scale", true, where)) {
+                    b.actUnemulated("torchao NVFP4 dynamic per-tensor activations, whose global scale is computed"
+                            + " from the whole activation tensor");
+                } else {
+                    b.actScheme(ActQuantScheme.NVFP4);
+                }
+                return b.build();
+            }
+            default:
+                throw new GgufFormatException("unsupported quant_method 'torchao': quant_type '" + type
+                        + "' has no NeuralFree mapping; supported configurations are Int4WeightOnlyConfig (PLAIN,"
+                        + " PRESHUFFLED, PLAIN_INT32, TILE_PACKED_TO_4D), Float8DynamicActivationInt4WeightConfig,"
+                        + " Int8WeightOnlyConfig, Int8DynamicActivationInt8WeightConfig,"
+                        + " Int8StaticActivationInt8WeightConfig, IntxWeightOnlyConfig,"
+                        + " Int8DynamicActivationIntxWeightConfig, Float8WeightOnlyConfig,"
+                        + " Float8DynamicActivationFloat8WeightConfig, MXDynamicActivationMXWeightConfig and"
+                        + " NVFP4DynamicActivationNVFP4WeightConfig");
+        }
+    }
+
+    /**
+     * The storage arguments of an {@code IntxWeightOnlyConfig} or {@code Int8DynamicActivationIntxWeightConfig}.
+     * The unpacked-to-int8 format stores one code per byte. An int4 target packs into nibbles ({@link
+     * QuantFormat#INT4_TORCHAO}); every other target width keeps its int8 bytes, which the int8 channel scheme
+     * carries exactly with the group scale and zero point ({@link QuantFormat#INT8_CHANNEL}).
+     */
+    private static QuantArgs intx(Map<String, Object> d, String where, boolean dynamic) {
+        String packing = serializedValue(d.get("intx_packing_format"));
+        if (packing != null && !packing.equalsIgnoreCase("UNPACKED_TO_INT8")) {
+            throw new GgufFormatException(where + ": intx_packing_format '" + packing + "' is an opaque packed"
+                    + " tensor; only UNPACKED_TO_INT8 is decoded");
+        }
+        int bits = weightBits(d.get("weight_dtype"), where);
+        Object granularity = d.get("weight_granularity");
+        if (granularity == null) {
+            granularity = d.get("granularity");
+        }
+        QuantArgs.Builder b = bits == 4
+                ? QuantArgs.builder(QuantFormat.INT4_TORCHAO)
+                : QuantArgs.builder(QuantFormat.INT8_CHANNEL);
+        b.group(weightGroup(granularity, where));
+        if (dynamic) {
+            String mapping = serializedValue(d.get("act_mapping_type"));
+            if (mapping != null && !mapping.equals("SYMMETRIC")) {
+                b.actUnemulated("torchao " + mapping + " intx activations");
+            } else {
+                b.actScheme(ActQuantScheme.INT8_TOKEN);
+            }
+        }
+        return b.build();
+    }
+
+    /** The bits of a torch {@code int1}..{@code int8} dtype marker; 8 when absent. */
+    private static int weightBits(Object v, String where) {
+        String dtype = serializedValue(v);
+        if (dtype == null) {
+            return 8;
+        }
+        if (!dtype.startsWith("int") || dtype.length() <= 3) {
+            throw new GgufFormatException(where + ": weight_dtype '" + dtype + "' is not a torch.int1..int8 dtype");
+        }
+        try {
+            int bits = Integer.parseInt(dtype.substring(3));
+            if (bits < 1 || bits > 8) {
+                throw new GgufFormatException(where + ": weight_dtype '" + dtype + "' is out of int1..int8");
+            }
+            return bits;
+        } catch (NumberFormatException e) {
+            throw new GgufFormatException(where + ": weight_dtype '" + dtype + "' is not a torch.int1..int8 dtype");
+        }
+    }
+
+    /** The {@code _type} of a serialized torchao enum, dataclass or dtype marker; null when absent. */
+    private static String nestedName(Object v) {
+        if (!(v instanceof Map)) {
+            return null;
+        }
+        Object type = ((Map<?, ?>) v).get("_type");
+        return type instanceof String ? (String) type : null;
+    }
+
+    /**
+     * The value a serialized torchao enum or dtype marker names: its string {@code _data}
+     * ({@code {"_type":"Int4PackingFormat","_data":"PRESHUFFLED"}}), else its {@code _type} (a dataclass such as
+     * {@code PerRow}, whose {@code _data} is an object).
+     */
+    private static String serializedValue(Object v) {
+        if (!(v instanceof Map)) {
+            return null;
+        }
+        Map<?, ?> m = (Map<?, ?>) v;
+        Object data = m.get("_data");
+        if (data instanceof String) {
+            return (String) data;
+        }
+        return nestedName(v);
+    }
+
+    /** A granularity value or list of granularity values; one entry when a single gap is given. */
+    private static List<Object> granularityList(Object v) {
+        if (v instanceof List) {
+            return new ArrayList<>((List<?>) v);
+        }
+        List<Object> one = new ArrayList<>();
+        if (v != null) {
+            one.add(v);
+        }
+        return one;
+    }
+
+    private static String granularityName(Object v) {
+        String type = nestedName(v);
+        return type == null ? "an unknown granularity" : type;
+    }
+
+    private static boolean isPerRow(Object v) {
+        if (!(v instanceof Map) || !"PerRow".equals(nestedName(v))) {
+            return false;
+        }
+        Map<String, Object> data = optObject(((Map<?, ?>) v).get("_data"), "granularity");
+        Object dim = data.get("dim");
+        return dim == null || (dim instanceof Number && ((Number) dim).longValue() == -1L);
+    }
+
+    /** FP8 per-tensor ({@link QuantArgs#UNGROUPED}), per-channel or per-group (a 1x group block) weight scales. */
+    private static QuantArgs.Builder fp8Builder(int group) {
+        QuantArgs.Builder b = QuantArgs.builder(QuantFormat.FP8);
+        return group > 0 ? b.block(1, group) : b.group(group);
+    }
+
+    /** The weight group size of a torchao granularity: per row (channel), per tensor or a group size. */
+    private static int weightGroup(Object v, String where) {
+        if (v == null) {
+            return QuantArgs.CHANNEL;
+        }
+        String type = nestedName(v);
+        if (type == null) {
+            throw new GgufFormatException(where + ": granularity must be a torchao PerRow, PerTensor or PerGroup"
+                    + " object, got " + HfConfig.typeName(v));
+        }
+        Map<String, Object> data = optObject(((Map<?, ?>) v).get("_data"), where + ".granularity");
+        switch (type) {
+            case "PerRow":
+                if (!isPerRow(v)) {
+                    throw new GgufFormatException(where + ": weight PerRow granularity must use dim -1");
+                }
+                return QuantArgs.CHANNEL;
+            case "PerTensor":
+                return QuantArgs.UNGROUPED;
+            case "PerAxis":
+                if (QuantArgs.intOr(data, "axis", 0, where + ".granularity") != 0) {
+                    throw new GgufFormatException(where + ": intx PerAxis granularity must use axis 0");
+                }
+                return QuantArgs.CHANNEL;
+            case "PerGroup": {
+                int group = QuantArgs.intOr(data, "group_size", 0, where + ".granularity");
+                if (group <= 0) {
+                    throw new GgufFormatException(where + ": PerGroup granularity needs a positive group_size, got "
+                            + group);
+                }
+                return group;
+            }
+            default:
+                throw new GgufFormatException(where + ": granularity '" + type + "' has no NeuralFree mapping");
+        }
     }
 
     /** V/SG {@code lm_head_quantized}: {@code lm_head} stays unquantized unless the config sets {@code lm_head: true}. */

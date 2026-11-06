@@ -69,6 +69,8 @@ public final class TokenizerVocab {
     public static final String KEY_PRECOMPILED_CHARSMAP = "tokenizer.ggml.precompiled_charsmap";
     public static final String KEY_ADD_SPACE_PREFIX = "tokenizer.ggml.add_space_prefix";
     public static final String KEY_REMOVE_EXTRA_WS = "tokenizer.ggml.remove_extra_whitespaces";
+    public static final String KEY_CLEAN_SPACES = "tokenizer.ggml.clean_spaces";
+    public static final String KEY_METASPACE_PREPEND_SCHEME = "tokenizer.ggml.metaspace.prepend_scheme";
     public static final String KEY_ADD_BOS = "tokenizer.ggml.add_bos_token";
     public static final String KEY_ADD_EOS = "tokenizer.ggml.add_eos_token";
     public static final String KEY_ADD_SEP = "tokenizer.ggml.add_sep_token";
@@ -121,6 +123,7 @@ public final class TokenizerVocab {
     private final Normalizer normalizer;
     private final TokenDecoder decoder;
     private final PreTokenizerSpec.PrependScheme prependScheme;
+    private final PreTokenizerSpec.PrependScheme metaspacePrependScheme;
     private final int[] prefixIds;
     private final int[] suffixIds;
     private final int[] extraEogIds;
@@ -162,6 +165,7 @@ public final class TokenizerVocab {
         this.normalizer = l.normalizer;
         this.decoder = l.decoder;
         this.prependScheme = l.prependScheme;
+        this.metaspacePrependScheme = l.metaspacePrependScheme;
         this.prefixIds = l.prefixIds;
         this.suffixIds = l.suffixIds;
         this.extraEogIds = l.extraEogIds;
@@ -273,7 +277,8 @@ public final class TokenizerVocab {
     public boolean removeExtraWhitespaces() { return removeExtraWhitespaces; }
     public boolean escapeWhitespaces() { return escapeWhitespaces; }
     /**
-     * llama.cpp {@code clean_spaces}, applied by detokenization; false whenever
+     * llama.cpp {@code clean_spaces}, applied by detokenization: the default of the pre-tokenizer
+     * name or vocabulary type, overridden by {@link #KEY_CLEAN_SPACES}; false whenever
      * {@link #cleanUpTokenizationSpaces()} is present, since the Hugging Face clean-up then
      * replaces it.
      */
@@ -310,6 +315,15 @@ public final class TokenizerVocab {
      * {@code NEVER} not at all.
      */
     public PreTokenizerSpec.PrependScheme prependScheme() { return prependScheme; }
+
+    /**
+     * The {@link #KEY_METASPACE_PREPEND_SCHEME} a BPE vocabulary applies: {@code FIRST} puts U+2581
+     * before the first fragment of the input unless it starts with one, and detokenization drops
+     * the leading space of the first rendered piece; {@code NEVER} otherwise, which is also the
+     * value for the other vocabulary types and for a BPE vocabulary whose
+     * {@link GgufKeys#NF_TOKENIZER_PRE_TOKENIZER} spec carries its own Metaspace step.
+     */
+    public PreTokenizerSpec.PrependScheme metaspacePrependScheme() { return metaspacePrependScheme; }
 
     /**
      * The post-processor ids put before the text in place of BOS when special tokens are added
@@ -423,6 +437,8 @@ public final class TokenizerVocab {
         Normalizer normalizer = Normalizer.identity();
         TokenDecoder decoder;
         PreTokenizerSpec.PrependScheme prependScheme = PreTokenizerSpec.PrependScheme.ALWAYS;
+        PreTokenizerSpec.PrependScheme metaspacePrependScheme = PreTokenizerSpec.PrependScheme.NEVER;
+        boolean preTokenizerSpecOverlay;
         int[] prefixIds;
         int[] suffixIds;
         int[] extraEogIds = new int[0];
@@ -458,9 +474,13 @@ public final class TokenizerVocab {
             if (asp != null) addSpacePrefix = asp;
             Boolean rew = bool(KEY_REMOVE_EXTRA_WS);
             if (rew != null) removeExtraWhitespaces = rew;
+            Boolean clean = bool(KEY_CLEAN_SPACES);
+            if (clean != null) cleanSpaces = clean;
             loadTokens();
             applySpecialFlags();
+            String scheme = metaspaceScheme();
             applyOverlays();
+            applyMetaspaceScheme(scheme);
             return this;
         }
 
@@ -491,7 +511,7 @@ public final class TokenizerVocab {
                 metadata.put(k, frozen(e.getValue()));
             }
             String vocabSizeKey = architecture + ".vocab_size";
-            for (String k : new String[]{KEY_ARCHITECTURE, KEY_NAME, vocabSizeKey}) {
+            for (String k : new String[]{KEY_ARCHITECTURE, KEY_NAME, vocabSizeKey, GgufKeys.NF_RERANK_SUFFIX_IDS}) {
                 if (md.containsKey(k)) metadata.put(k, frozen(md.get(k)));
             }
         }
@@ -778,6 +798,7 @@ public final class TokenizerVocab {
             } else {
                 String spec = str(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER);
                 if (spec != null) {
+                    preTokenizerSpecOverlay = true;
                     preTokenizer = parsed(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER,
                             () -> PreTokenizerRegistry.fromSpec(PreTokenizerSpec.fromCanonicalJson(spec)));
                 }
@@ -831,6 +852,35 @@ public final class TokenizerVocab {
                     throw new GgufFormatException(GgufKeys.NF_TOKENIZER_PREPEND_SCHEME + " is '" + value
                             + "'; expected always, first or never");
             }
+        }
+
+        /**
+         * {@link #KEY_METASPACE_PREPEND_SCHEME} (llama-vocab.cpp:3022-3038): absent, never, first or
+         * always, any other value failing the load; {@code always} on a BPE vocabulary fails it too
+         * unless a {@link GgufKeys#NF_TOKENIZER_PRE_TOKENIZER} spec is present, which {@link
+         * #applyMetaspaceScheme} learns after the overlays. Null when absent.
+         */
+        private String metaspaceScheme() {
+            String scheme = str(KEY_METASPACE_PREPEND_SCHEME);
+            if (scheme == null || scheme.equals("never") || scheme.equals("first") || scheme.equals("always")) {
+                return scheme;
+            }
+            throw new IllegalArgumentException("unknown metaspace prepend_scheme: '" + scheme + "' ("
+                    + KEY_METASPACE_PREPEND_SCHEME + ")");
+        }
+
+        /**
+         * The scheme a BPE vocabulary applies; the other types ignore the key, as llama.cpp does. A
+         * {@link GgufKeys#NF_TOKENIZER_PRE_TOKENIZER} spec splits with its own Metaspace step, so the
+         * key does not apply on top of it.
+         */
+        private void applyMetaspaceScheme(String scheme) {
+            if (type != Type.BPE || scheme == null || preTokenizerSpecOverlay) return;
+            if (scheme.equals("always")) {
+                throw new IllegalArgumentException("metaspace prepend_scheme 'always' is not supported for BPE vocab ("
+                        + KEY_METASPACE_PREPEND_SCHEME + ")");
+            }
+            if (scheme.equals("first")) metaspacePrependScheme = PreTokenizerSpec.PrependScheme.FIRST;
         }
 
         /** Builds an overlay value; a malformed one fails the load naming its key. */

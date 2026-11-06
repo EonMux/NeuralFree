@@ -1,0 +1,80 @@
+# Expected codes of vLLM's online quantization (commit 8530a778f) on a one-layer Qwen2MoeForCausalLM checkpoint:
+# hidden 256, 4 heads, 1 KV head, moe_intermediate 192, shared_expert_intermediate 160, 2 experts, all BF16.
+# Computed by vLLM's own reference functions, run on CUDA: fp8_per_tensor weight_amax over the fused weight
+# (q|k|v, shared gate|up; routed w13 per expert), scale amax / 448, codes clamp(x * (1 / scale)) to E4M3;
+# fp8_per_block per_block_cast_to_fp8 over the concatenated fused rows (routed w13: gate and up each padded to
+# 256 rows with zeros); mxfp4 the Triton downcast_to_mxfp per weight; nvfp4_per_token ref_nvfp4_quant per expert
+# with global scale 2688 / amax over w13 (gate|up) and w2.
+# Inputs: each HF weight [rows, cols] (name, rows, cols, seed, base) from a 32-bit LCG s = s * 1664525 + 1013904223,
+# two draws a, b per element: e = (a >>> 24) & 7, minus 2 when >= 6, or 6 + ((b >>> 21) & 1) when (b >>> 22) == 0;
+# bf16 bits (a >>> 31) << 15 | (base + e) << 7 | (a >>> 8) & 0x7F.
+# Weights under model.layers.0.: self_attn.q_proj 256 256 11 118, self_attn.k_proj 64 256 12 121,
+# self_attn.v_proj 64 256 13 116, self_attn.o_proj 256 256 14 119, mlp.experts.0.gate_proj 192 256 21 117,
+# mlp.experts.0.up_proj 192 256 22 120, mlp.experts.0.down_proj 256 192 23 117, mlp.experts.1.gate_proj 192 256 24 121,
+# mlp.experts.1.up_proj 192 256 25 118, mlp.experts.1.down_proj 256 192 26 119, mlp.shared_expert.gate_proj 160 256
+# 31 117, mlp.shared_expert.up_proj 160 256 32 120, mlp.shared_expert.down_proj 256 160 33 118.
+# Columns: method, GGUF tensor, digest kind, SHA-256 (or the weight_scale_2 bits per expert for 'global').
+# codes: one byte per element, row-major, experts first (F8: the E4M3 byte; FP4: the E2M1 code, NVFP4's -0 as 0).
+# scales: per row, per block in order (F8: the f32 scale little-endian per 128 columns; MXFP4: the E8M0 byte per
+# 32; NVFP4: the E4M3 byte per 16).
+fp8_per_tensor blk.0.attn_q.weight codes badd37875f2dfa780a476e5bde422168fa75dbf6d2bbfd9079df9ccb87ca66e9
+fp8_per_tensor blk.0.attn_q.weight scales cb022326196338053ff0b65bdf28de5a095a810f83d7e85b4aec5f5d499d0c82
+fp8_per_tensor blk.0.attn_k.weight codes fd462ec773693c6d1ff5a0ec2190666577757cfe7f2729fd7780c2c439522f5e
+fp8_per_tensor blk.0.attn_k.weight scales cc469487e5e59fe37fb35a62b8fcc56de5e4cac76de092dafa55cfa7f0fbd686
+fp8_per_tensor blk.0.attn_v.weight codes 913b97e06bdf68290a0b4c0ef4e165e401a5b8ead9ffe40cf99b78da1d09fee4
+fp8_per_tensor blk.0.attn_v.weight scales cc469487e5e59fe37fb35a62b8fcc56de5e4cac76de092dafa55cfa7f0fbd686
+fp8_per_tensor blk.0.attn_output.weight codes 2875e836307e5ce92cad168cc2e89830a8e859cc7bb156b9e37c205e8e3c4b2d
+fp8_per_tensor blk.0.attn_output.weight scales e8b95557e91b1eebd593c45d975fd66882c40014da9b27b19d2cead47b2108f4
+fp8_per_tensor blk.0.ffn_gate_shexp.weight codes ae6a4c5912a60ebe51e31bdb37678e6c8bc6de0b232d12296381bf60ed3d4f34
+fp8_per_tensor blk.0.ffn_gate_shexp.weight scales 062a3883af7125146ce338899dded590f34b3948eb646d5565465f8583ebd9b3
+fp8_per_tensor blk.0.ffn_up_shexp.weight codes ef22be25021b39f05448e252e2004a0b2efb6ba8687dca762eb7e589e7129e46
+fp8_per_tensor blk.0.ffn_up_shexp.weight scales 062a3883af7125146ce338899dded590f34b3948eb646d5565465f8583ebd9b3
+fp8_per_tensor blk.0.ffn_gate_exps.weight codes 40a277940a98e91ab4343759354b1a367d9dd931aafe23cf4976cf9c15b865f6
+fp8_per_tensor blk.0.ffn_gate_exps.weight scales bffbdd860511438fab86969794a942c058fc319a5e6c72fd7ef3b42833222713
+fp8_per_tensor blk.0.ffn_up_exps.weight codes 2076f97667b9fa98a6ddc8db34537fd3fcd4c0ae3265947a132b3906b2389a6e
+fp8_per_tensor blk.0.ffn_up_exps.weight scales bffbdd860511438fab86969794a942c058fc319a5e6c72fd7ef3b42833222713
+fp8_per_block blk.0.attn_q.weight codes c8e7c5d4fca71b6e033014932008b91f0bae8a1317ff11edbf3c84b4c371ffe7
+fp8_per_block blk.0.attn_q.weight scales 6f36c37a7734ba8633737fce61aa6c29a2294728a86a01bbb666275237c3d0dc
+fp8_per_block blk.0.attn_k.weight codes 64ab777b058fb99934a66f6f4c57117d279f5f0c972bf48c59b6bd745842f1d1
+fp8_per_block blk.0.attn_k.weight scales 88c36cb6b6ffed28c25d1d2647a91d36e69d33b5953e9345ece46bbf228054e2
+fp8_per_block blk.0.attn_v.weight codes 12e334265a67bd852df6213646c1b6cbe246794a82e3f430d4880c546053b10e
+fp8_per_block blk.0.attn_v.weight scales 88c36cb6b6ffed28c25d1d2647a91d36e69d33b5953e9345ece46bbf228054e2
+fp8_per_block blk.0.attn_output.weight codes 7d97e98d227af166de75ede71e075895182dce63c02d7bdfe81e57e0c1075ac6
+fp8_per_block blk.0.attn_output.weight scales df5a00b8551efc9d02257c44fc8fd56b51964fb61b73cc4eece1eda88a2c592d
+fp8_per_block blk.0.ffn_gate_shexp.weight codes 7cba9ab0818f3648ad35d39cccd281cef20095fc5172de79f931193b886df296
+fp8_per_block blk.0.ffn_gate_shexp.weight scales c78a5adb75387b16592a8fcb44d00262cc698da2323e1e5504162006d2aecb7f
+fp8_per_block blk.0.ffn_up_shexp.weight codes 02ae511025fd4cfd40f8ef38fbf9197eb9a6b6b241807f7f29b33df76969ed01
+fp8_per_block blk.0.ffn_up_shexp.weight scales 4f0834f1f5ae28df81ae44c45d73f9500cbb3b274676e042f4ffdf491bb17e0d
+fp8_per_block blk.0.ffn_gate_exps.weight codes 98db14b9fbc9a8b1d00c12cca693de6924b7a3cc4d31f1709d803c8cedd36ce4
+fp8_per_block blk.0.ffn_gate_exps.weight scales a1b0bf12192f9c3dcb8f609278ccdfefab5719016be847245bf39804b1c922fe
+fp8_per_block blk.0.ffn_up_exps.weight codes 1965a730b050df02fff129ebaf73062ecaab5955068b4bca771d6e0f139096af
+fp8_per_block blk.0.ffn_up_exps.weight scales bffd1fa4327fe4abfaa22c089d8eac5c848fe5d8366d2a56d1af88f675103161
+mxfp4 blk.0.attn_q.weight codes 4622593c6ffcd5cdd0a7934e869bcc8a351b37f70890c04ca9fe2f3c5b379bb9
+mxfp4 blk.0.attn_q.weight scales 02c6e875dca12813a8793422b1ff2dc76b3459d496c6d48f6e6e3dabe5b088ca
+mxfp4 blk.0.attn_k.weight codes 3effc9c0baee1ea774d0a5ce270e1d08c9d2d703cd4e4a94b28300267285fa0b
+mxfp4 blk.0.attn_k.weight scales 6cace81421ac612e73adc48b1882632eb35a1984c6ae99b6c61a853e5df0c8df
+mxfp4 blk.0.attn_v.weight codes eace7685087ec218de68b21734ea04806c34e5ced9dd7b023f474d68acb395d3
+mxfp4 blk.0.attn_v.weight scales 683effe0396382d065f97563c459370f3dffc2af118fee4cd4c9019579a0ec95
+mxfp4 blk.0.attn_output.weight codes 45129a4477c98b638b3684f8a13966336feee764f54bd446bc9868bc47fea8b8
+mxfp4 blk.0.attn_output.weight scales ec781f3502e4969e0a324f869649e47ff749e3fa61c7296bf4b3fe3a2533a68f
+mxfp4 blk.0.ffn_gate_shexp.weight codes fca1d76d080a2682bcfcb91c1a1cd5bf6e1949c0d00ff046a7cfe3af1873f6e3
+mxfp4 blk.0.ffn_gate_shexp.weight scales ad6d979fc241ddfed91ce31045a6390f6ae26fa6e0d81304f45c0b58b1d55af2
+mxfp4 blk.0.ffn_up_shexp.weight codes e70a7fec9cd29887a3773a25185725cf97ea2942c87abea34984f65371b9de31
+mxfp4 blk.0.ffn_up_shexp.weight scales e52ba999ba12404a81236e7d3725901df55805fa7ebfe1f64556d87170fe30a9
+mxfp4 blk.0.ffn_down_shexp.weight codes 4064921e2152223a6980e004dd8c2408eb69c99b8c4586b7e9092a0f624b9bd6
+mxfp4 blk.0.ffn_down_shexp.weight scales 84edc99b61aa3e22bf6d39add07ea398b8e0a46b5767c933b2ad5d3d5f82525b
+mxfp4 blk.0.ffn_gate_exps.weight codes e491bc9d556d50b7e8ec377e689f0ed4164a6284032a4ed1e223074f57acb4d1
+mxfp4 blk.0.ffn_gate_exps.weight scales 650f066dada57a8898cef13b154f58a3163b74ec86bde09ecb0037fe1b4250fa
+mxfp4 blk.0.ffn_up_exps.weight codes a88f01a7bf640f0e450c768d02af7b9837bb23c1d5861360fdfb931747a3ecd7
+mxfp4 blk.0.ffn_up_exps.weight scales c55b7042ef08512fa5870e1feabdb7f165bbcb10d4bc26353158d1cd228bf5c9
+mxfp4 blk.0.ffn_down_exps.weight codes ea82475b043e2605bc85dff18a68b04774648dd4b96436e599d51eb346a0e1ea
+mxfp4 blk.0.ffn_down_exps.weight scales c32764174d5d5708812ff6db129fb76e010b7c241abd3bc8529c42a9805cbee7
+nvfp4_per_token blk.0.ffn_gate_exps.weight codes 6e812265b7fe49ea5012ea693b55f002adfbbfc526c3b9155e3f85d0c3300bf3
+nvfp4_per_token blk.0.ffn_gate_exps.weight scales f3d72cafab13e5ccf911229bea479a0d4b912ae73b8b4cf01bc1403547c10e94
+nvfp4_per_token blk.0.ffn_gate_exps.weight global 3a40c30c 3abcf3d0
+nvfp4_per_token blk.0.ffn_up_exps.weight codes 191883b4bc798880cf3d91346e1765c8d5a7895a54b2f179136ddfaf6c06ab54
+nvfp4_per_token blk.0.ffn_up_exps.weight scales 95e3311c9a2865c885d0afec4e59803323e9768072fd1bd07690848bbf04d7b2
+nvfp4_per_token blk.0.ffn_up_exps.weight global 3a40c30c 3abcf3d0
+nvfp4_per_token blk.0.ffn_down_exps.weight codes 43bc35d79b5f0c458b389c2881de71bedccd63615cfdb9e3481d2663b1293733
+nvfp4_per_token blk.0.ffn_down_exps.weight scales 29e535d25caa44529ebcf5fc40fed82b3806c49dc9c117bacc7ff541b7db1664
+nvfp4_per_token blk.0.ffn_down_exps.weight global 38b9e79f 39b18618

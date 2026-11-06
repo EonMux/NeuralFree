@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hf.config;
 
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import org.junit.Test;
 
@@ -55,6 +56,7 @@ public class HfQuantAliasesTest {
         assertRow("blockwise_int8", HfQuantMethod.BLOCKWISE_INT8);
         assertRow("hqq", HfQuantMethod.HQQ);
         assertRow("fp_quant", HfQuantMethod.FP_QUANT);
+        assertRow("torchao", HfQuantMethod.TORCHAO);
     }
 
     @Test
@@ -68,8 +70,28 @@ public class HfQuantAliasesTest {
     }
 
     @Test
+    public void theVllmOnlineShorthandsNameTheirTargets() {
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_TENSOR, HfQuantAliases.onlineTarget("fp8_per_tensor"));
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_BLOCK, HfQuantAliases.onlineTarget("fp8_per_block"));
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_CHANNEL, HfQuantAliases.onlineTarget("fp8_per_channel"));
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_CHANNEL, HfQuantAliases.onlineTarget("ptpc_fp8"));
+        assertEquals(ModelSourceOptions.OnlineQuant.INT8_PER_CHANNEL_WEIGHT_ONLY,
+                HfQuantAliases.onlineTarget("int8_per_channel_weight_only"));
+        assertEquals(ModelSourceOptions.OnlineQuant.EXPERTS_INT8, HfQuantAliases.onlineTarget("experts_int8"));
+        assertEquals(ModelSourceOptions.OnlineQuant.NVFP4_PER_TOKEN, HfQuantAliases.onlineTarget("nvfp4_per_token"));
+        assertEquals(ModelSourceOptions.OnlineQuant.NVFP4_PER_TOKEN, HfQuantAliases.onlineTarget("nvfp4_online"));
+        for (String none : new String[]{"online", "quark_int4fp8_moe", "mxfp_w4a8", "fp8", "mxfp8"}) {
+            assertNull(none, HfQuantAliases.onlineTarget(none));
+        }
+        for (String m : new String[]{"fp8_per_tensor", "fp8_per_block", "fp8_per_channel",
+                "int8_per_channel_weight_only", "nvfp4_per_token"}) {
+            assertRow(m, HfQuantMethod.ONLINE);
+        }
+    }
+
+    @Test
     public void rejectedNamesCarryAReason() {
-        for (String m : new String[]{"torchao", "modelslim", "aqlm", "eetq", "vptq", "spqr", "higgs", "quanto"}) {
+        for (String m : new String[]{"modelslim", "aqlm", "eetq", "vptq", "spqr", "higgs", "quanto"}) {
             HfQuantAliases.Resolution r = HfQuantAliases.resolve(m);
             assertEquals(m, HfQuantMethod.REJECTED, r.method());
             assertNotNull(m, r.reason());

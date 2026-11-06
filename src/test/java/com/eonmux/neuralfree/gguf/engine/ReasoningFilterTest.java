@@ -6,11 +6,14 @@ import java.util.EnumMap;
 import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Template dispatch and streaming splits mirror llama.cpp's chat parsers (tests/test-chat.cpp): Muse Spark and
- * Muse Glimmer recipients, Apriel 1.6 forced-open reasoning, and OpenAI harmony channels.
+ * Muse Glimmer recipients, Apriel 1.6 forced-open reasoning, and OpenAI harmony channels, with the raw harmony
+ * variant of {@code reasoning_format none} (reasoning inline in the content, tool calls still routed).
  */
 public class ReasoningFilterTest {
 
@@ -29,6 +32,9 @@ public class ReasoningFilterTest {
             + "{{ '\\n<|begin_assistant|>\\n' + reasoning_asst_turn_start }}";
     private static final String APRIEL_15_TEMPLATE =
             "provide the final solution in the following format: [BEGIN FINAL RESPONSE] ... [END FINAL RESPONSE].";
+    private static final String GPT_OSS_TEMPLATE = "{{ '<|start|>assistant<|channel|>final<|message|>' }}";
+    private static final String GPT_OSS_PROMPT = "<|start|>user<|message|>Hi<|end|><|start|>assistant";
+
     private static final String APRIEL_PROMPT = "<|begin_user|>\nHi\n<|begin_assistant|>\nHere are my reasoning steps:\n";
 
     /** Text routed per channel. */
@@ -140,5 +146,122 @@ public class ReasoningFilterTest {
                 + "<|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?";
         assertSplit(run(f, "<|start|>user<|message|>Hi<|end|><|start|>assistant", output, 3),
                 "I'm\nthinking", "Hello, world!\nWhat's up?", "");
+    }
+
+    // ------------------------------------------------------------------ raw harmony (reasoning_format none)
+
+    @Test
+    public void rawGptOssKeepsTheAnalysisMessageInlineInTheContent() {
+        // llama.cpp tests/test-chat.cpp gpt-oss: reasoning_format NONE expects exactly this content
+        ReasoningFilter f = ReasoningFilter.forChatTemplate(GPT_OSS_TEMPLATE).asRaw();
+        String output = "<|channel|>analysis<|message|>I'm\nthinking<|end|>"
+                + "<|start|>assistant<|channel|>final<|message|>Hello, world!\nWhat's up?";
+        for (int chunk : new int[] {1, 3, 7, output.length()}) {
+            assertSplit(run(f, GPT_OSS_PROMPT, output, chunk), "",
+                    "<|channel|>analysis<|message|>I'm\nthinking<|end|>Hello, world!\nWhat's up?", "");
+        }
+    }
+
+    @Test
+    public void rawGptOssStillRoutesToolCalls() {
+        ReasoningFilter f = ReasoningFilter.forChatTemplate(GPT_OSS_TEMPLATE).asRaw();
+        String output = "<|channel|>analysis<|message|>Need the weather.<|end|>"
+                + "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json"
+                + "<|message|>{\"city\": \"Paris\"}<|call|>";
+        StringBuilder recipients = new StringBuilder();
+        Map<ReasoningFilter.Channel, StringBuilder> acc = new EnumMap<>(ReasoningFilter.Channel.class);
+        for (ReasoningFilter.Channel c : ReasoningFilter.Channel.values()) acc.put(c, new StringBuilder());
+        ReasoningFilter.State state = f.newState(new ReasoningFilter.Sink() {
+            @Override public void accept(ReasoningFilter.Channel channel, int tokenId, String text) {
+                acc.get(channel).append(text);
+            }
+
+            @Override public void toolCallStarted(String recipient) {
+                recipients.append(recipient).append(';');
+            }
+        }, GPT_OSS_PROMPT);
+        for (int i = 0; i < output.length(); i += 2) {
+            state.onToken(i, output.substring(i, Math.min(output.length(), i + 2)));
+        }
+        state.finish();
+        assertEquals("functions.get_weather;", recipients.toString());
+        assertEquals("<|channel|>analysis<|message|>Need the weather.<|end|>",
+                acc.get(ReasoningFilter.Channel.CONTENT).toString());
+        assertEquals("{\"city\": \"Paris\"}", acc.get(ReasoningFilter.Channel.TOOL_CALL).toString());
+        assertEquals("", acc.get(ReasoningFilter.Channel.REASONING).toString());
+    }
+
+    @Test
+    public void rawGptOssDropsThePreambleAndFinalHeadersButKeepsAStrayCommentaryPrefix() {
+        // llama.cpp: preamble and final messages are content without headers; the analysis rule wraps the
+        // optional "<|channel|>commentary to=assistant" prefix into the content with the analysis header
+        ReasoningFilter f = ReasoningFilter.forChatTemplate(GPT_OSS_TEMPLATE).asRaw();
+        String output = "<|channel|>commentary<|message|>Working.<|end|>"
+                + "<|start|>assistant<|channel|>commentary to=assistant<|channel|>analysis<|message|>T<|end|>"
+                + "<|start|>assistant<|channel|>final<|message|>Done.";
+        assertSplit(run(f, GPT_OSS_PROMPT, output, 5), "",
+                "Working.<|channel|>commentary to=assistant<|channel|>analysis<|message|>T<|end|>Done.", "");
+    }
+
+    @Test
+    public void rawGptOssMatchesTagTokensById() {
+        ReasoningFilter f = ReasoningFilter.forChatTemplate(GPT_OSS_TEMPLATE).withTagTokens(t -> {
+            switch (t) {
+                case "<|channel|>": return 800;
+                case "<|message|>": return 801;
+                case "<|end|>": return 802;
+                case "<|start|>": return 803;
+                default: return -1;
+            }
+        }).asRaw();
+        assertTrue(f.reasoningInline());
+        StringBuilder content = new StringBuilder();
+        StringBuilder reasoning = new StringBuilder();
+        ReasoningFilter.State state = f.newState((channel, id, text) -> {
+            if (channel == ReasoningFilter.Channel.CONTENT) content.append(text);
+            if (channel == ReasoningFilter.Channel.REASONING) reasoning.append(text);
+        }, GPT_OSS_PROMPT);
+        state.onToken(800, "");
+        state.onToken(1, "analysis");
+        state.onToken(801, "");
+        state.onToken(2, "T");
+        assertTrue("an inline analysis body is still reasoning for budgets and gates", state.inReasoning());
+        state.onToken(802, "");
+        assertFalse(state.inReasoning());
+        state.onToken(803, "");
+        state.onToken(3, "assistant");
+        state.onToken(800, "");
+        state.onToken(4, "final");
+        state.onToken(801, "");
+        state.onToken(5, "A");
+        state.finish();
+        assertEquals("<|channel|>analysis<|message|>T<|end|>A", content.toString());
+        assertEquals("", reasoning.toString());
+    }
+
+    @Test
+    public void rawMuseRoutesTheSelfBodyToContent() {
+        // llama.cpp muse-spark.cpp with extract_reasoning false: the to=self body becomes content, its header and
+        // terminator are consumed
+        ReasoningFilter f = ReasoningFilter.forChatTemplate(MUSE_SPARK_TEMPLATE).asRaw();
+        String output = " to=self<|message|>Thinking.<|eom|>"
+                + "<|start|>assistant to=special_function<|message|><atem:function_calls></atem:function_calls>";
+        assertSplit(run(f, MUSE_PROMPT, output, 3), "", "Thinking.", "<atem:function_calls></atem:function_calls>");
+    }
+
+    @Test
+    public void asRawKeepsHarmonyParsingAndFlattensTagFilters() {
+        ReasoningFilter harmony = ReasoningFilter.forChatTemplate(GPT_OSS_TEMPLATE);
+        assertFalse(harmony.reasoningInline());
+        ReasoningFilter raw = harmony.withTagTokens(t -> "<|end|>".equals(t) ? 7 : -1).asRaw();
+        assertEquals(ReasoningFilter.Mode.HARMONY_CHANNELS, raw.mode());
+        assertTrue(raw.reasoningInline());
+        assertEquals("<|end|>", raw.tagTokens().get(7));
+        ReasoningFilter textOnly = raw.withoutTagTokens();
+        assertTrue("dropping the token ids keeps the raw variant", textOnly.reasoningInline());
+        assertTrue(textOnly.tagTokens().isEmpty());
+        ReasoningFilter think = ReasoningFilter.thinkTags().asRaw();
+        assertEquals(ReasoningFilter.Mode.NONE, think.mode());
+        assertFalse(think.reasoningInline());
     }
 }

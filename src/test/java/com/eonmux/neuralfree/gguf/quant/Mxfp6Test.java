@@ -19,7 +19,7 @@ import static org.junit.Assert.fail;
  * 32 packed 6-bit codes, element {@code j} = code {@code j}, four codes per three bytes little-endian),
  * the exact decode of every code against the OCP-MX arithmetic of {@link FpBlockDecoders#e2m3ToFp32} /
  * {@link FpBlockDecoders#e3m2ToFp32} ({@code 2^(e - 127)} scales included), and the load-time rejection of
- * the NaN E8M0 reservation {@code e == 0xFF} (ExtBlockDecoders, QN-3's spec).
+ * the NaN E8M0 reservation {@code e == 0xFF} (ExtBlockDecoders, the OCP-MX spec).
  * The vec-dot integration with the other extension types is covered by the cpu/quant tests
  * ({@code ExtVecDot} registers both types with Q8_0 activations), the GPU kernels by the
  * {@code ExtTypeFastPath} KV and the shader twins of common/quant_ext.glsl.
@@ -41,7 +41,8 @@ public class Mxfp6Test {
         assertTrue(E3M2.isExtension() && E2M3.isExtension());
         assertEquals(E3M2, GGMLType.fromId(1007));
         assertEquals(E2M3, GGMLType.fromId(1008));
-        assertEquals("the next extension id stays unassigned", GGMLType.UNKNOWN, GGMLType.fromId(1009));
+        assertEquals(GGMLType.F8_E4M3_B32, GGMLType.fromId(1009));
+        assertEquals("the next extension id stays unassigned", GGMLType.UNKNOWN, GGMLType.fromId(1010));
         assertTrue("128 elements of E3M2 fill 100 bytes (4 blocks of 25)", E3M2.getBytesForElements(128) == 100);
         assertTrue(CpuBlockDecoders.supports(E3M2) && CpuBlockDecoders.supports(E2M3));
         assertTrue("the CPU vec-dot registers both rows", ExtVecDot.supports(E3M2) && ExtVecDot.supports(E2M3));
@@ -92,7 +93,7 @@ public class Mxfp6Test {
      * A block with {@code element j = code j} (the distinct codes <code>(i + j + 1) % 64</code> per block
      * {@code i}, so the 6-bit packing order is exercised end to end) decodes through
      * {@code CpuBlockDecoders}, package-private {@link ExtBlockDecoders#decodeMxfp6} and the kernel
-     * element order of the WP: value {@code 2^(e - 127) * fp6(code)} per element.
+     * element order: value {@code 2^(e - 127) * fp6(code)} per element.
      */
     @Test
     public void blocksDecodeWithTheSixBitOrderByFourCodesPerThreeBytes() throws Exception {
@@ -136,16 +137,18 @@ public class Mxfp6Test {
         assertEquals(0f, FpBlockDecoders.e3m2ToFp32(0x00), 0f);
         assertEquals(-0f, FpBlockDecoders.e3m2ToFp32(0x20), 0f);
         assertEquals(Math.scalb(1f, -4), FpBlockDecoders.e3m2ToFp32(0x01), 0f);
-        assertEquals(1f, FpBlockDecoders.e3m2ToFp32(0x14), 0f);   // e=5, m=0: 4 * 2^(5-5) = 1
+        assertEquals(1f, FpBlockDecoders.e3m2ToFp32(0x0C), 0f);   // e=3, m=0: 4 * 2^(3-5) = 1
+        assertEquals(4f, FpBlockDecoders.e3m2ToFp32(0x14), 0f);   // e=5, m=0: 4 * 2^(5-5) = 4
         assertEquals(16f, FpBlockDecoders.e3m2ToFp32(0x1C), 0f);  // e=7, m=0: 4 * 2^(7-5) = 16
         assertEquals(28f, FpBlockDecoders.e3m2ToFp32(0x1F), 0f);  // e=7, m=3: 7 * 2^(7-5) = 28
-        assertEquals(28f, FpBlockDecoders.e3m2ToFp32(0x3F), 0f);
+        assertEquals(-28f, FpBlockDecoders.e3m2ToFp32(0x3F), 0f); // the sign bit 0x20 is set
         assertEquals(0f, FpBlockDecoders.e2m3ToFp32(0x00), 0f);
         assertEquals(-0f, FpBlockDecoders.e2m3ToFp32(0x20), 0f);
         assertEquals(Math.scalb(1f, -3), FpBlockDecoders.e2m3ToFp32(0x01), 0f);
-        assertEquals(1f, FpBlockDecoders.e2m3ToFp32(0x18), 0f);   // e=3, m=0: 8 * 2^(3-4) = 1
+        assertEquals(1f, FpBlockDecoders.e2m3ToFp32(0x08), 0f);   // e=1, m=0: 8 * 2^(1-4) = 1
+        assertEquals(4f, FpBlockDecoders.e2m3ToFp32(0x18), 0f);   // e=3, m=0: 8 * 2^(3-4) = 4
         assertEquals(7.5f, FpBlockDecoders.e2m3ToFp32(0x1F), 0f); // e=3, m=7: 15 * 2^(3-4) = 7.5
-        assertEquals(7.5f, FpBlockDecoders.e2m3ToFp32(0x3F), 0f);
+        assertEquals(-7.5f, FpBlockDecoders.e2m3ToFp32(0x3F), 0f); // the sign bit 0x20 is set
         for (int c = 0; c < 64; c++) {
             assertTrue("FP6 has no infinities", Float.isFinite(FpBlockDecoders.e3m2ToFp32(c)));
             assertTrue("FP6 has no NaNs", !Float.isNaN(FpBlockDecoders.e3m2ToFp32(c)));
@@ -174,7 +177,8 @@ public class Mxfp6Test {
                 assertTrue(expected.getMessage(), expected.getMessage().contains("0xFF"));
             }
             try {
-                CpuBlockDecoders.decode(t, ByteBuffer.allocate(t.getTypeSize() * 2), 0, new float[32], 0, 3);
+                CpuBlockDecoders.decode(t, ByteBuffer.allocate(t.getTypeSize() * 2), 0,
+                        new float[3 * t.getBlockSize()], 0, 3);
                 fail("a partial block fails");
             } catch (IndexOutOfBoundsException expected) {
                 assertTrue(expected.getMessage().contains("limit"));

@@ -1,0 +1,67 @@
+/* conv_transpose1d_depthwise_causal.comp - LLM_ConvTranspose1dDepthwiseCausal: the mimi decoder's depthwise causal
+ * transposed convolution. GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n, i c_n, i k, i stride, R x, R w, R b, R state, W y, W nstate).
+ *   trim = K - stride, emit = n * stride
+ *   y[i][c] = b[c] + full[i][c] + (i < trim ? state[i][c] : 0)
+ *   nstate[i][c] = full[emit + i][c] for i < trim
+ * x[n][C], w[C][K] (ggml {K, 1, C}), b[C], state[trim][C], y[emit][C], nstate[trim][C].
+ * Dispatch: 1-D, one invocation per output or state element, global = roundUp(max(emit*C, trim*C), L),
+ * local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfDwtX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfDwtW { float w_in[]; };
+layout(std430, binding = 2) readonly buffer NfDwtB { float b_in[]; };
+layout(std430, binding = 3) readonly buffer NfDwtS { float state_in[]; };
+layout(std430, binding = 4) writeonly buffer NfDwtY { float y_out[]; };
+layout(std430, binding = 5) writeonly buffer NfDwtN { float nstate_out[]; };
+
+layout(push_constant) uniform NfDwtParams {
+    int n;
+    int c_n;
+    int k;
+    int stride;
+} pc;
+
+float nf_dwt_at(const int i, const int c) {
+    float acc = 0.0;
+    for (int j = 0; j < pc.k; ++j) {
+        if (i < j || (i - j) % pc.stride != 0) {
+            continue;
+        }
+        const int t = (i - j) / pc.stride;
+        if (t >= pc.n) {
+            continue;
+        }
+        acc += w_in[uint(c) * uint(pc.k) + uint(j)] * x_in[uint(t) * uint(pc.c_n) + uint(c)];
+    }
+    return acc;
+}
+
+void main() {
+    const uint idx = nf_global_id();
+    const uint c_n = uint(pc.c_n);
+    const int emit = pc.n * pc.stride;
+    const int trim = pc.k - pc.stride;
+    const uint out_n = uint(emit) * c_n;
+    if (idx < out_n) {
+        const int i = int(idx / c_n);
+        const int c = int(idx - uint(i) * c_n);
+        float acc = b_in[uint(c)] + nf_dwt_at(i, c);
+        if (i < trim) {
+            acc += state_in[uint(i) * c_n + uint(c)];
+        }
+        y_out[idx] = acc;
+    }
+    const uint state_n = uint(trim) * c_n;
+    if (idx < state_n) {
+        const int i = int(idx / c_n);
+        const int c = int(idx - uint(i) * c_n);
+        nstate_out[idx] = nf_dwt_at(emit + i, c);
+    }
+}

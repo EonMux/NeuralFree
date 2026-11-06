@@ -4,6 +4,7 @@ import java.nio.ByteBuffer;
 
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.intAt;
 
 /**
  * CPU decoders for the 256-element K-quant super-blocks Q2_K, Q3_K, Q4_K, Q5_K, Q6_K and Q8_K, plus the
@@ -40,6 +41,21 @@ public final class KQuantBlockDecoders {
         return sc | (m << 8);
     }
 
+    /** {@link #scaleMinK4(int, ByteBuffer, int)} over a little-endian byte array. */
+    public static int scaleMinK4(int j, byte[] le, int scalesOff) {
+        final int sc;
+        final int m;
+        if (j < 4) {
+            sc = le[scalesOff + j] & 63;
+            m = le[scalesOff + j + 4] & 63;
+        } else {
+            final int qj4 = le[scalesOff + j + 4] & 0xFF;
+            sc = (qj4 & 0xF) | (((le[scalesOff + j - 4] & 0xFF) >>> 6) << 4);
+            m = (qj4 >>> 4) | (((le[scalesOff + j] & 0xFF) >>> 6) << 4);
+        }
+        return sc | (m << 8);
+    }
+
     /**
      * Unpacks the sixteen signed 6-bit Q3_K scales, as {@code dequantize_row_q3_K} does
      * (llama.cpp ggml-quants.c:1324-1329). {@code out[k]} receives the raw value; the caller subtracts 32.
@@ -48,9 +64,15 @@ public final class KQuantBlockDecoders {
      * @param out       destination of length at least 16
      */
     public static void q3kScales(ByteBuffer le, int scalesOff, byte[] out) {
-        final int a0 = le.getInt(scalesOff);
-        final int a1 = le.getInt(scalesOff + 4);
-        final int tmp = le.getInt(scalesOff + 8);
+        unpackScales(le.getInt(scalesOff), le.getInt(scalesOff + 4), le.getInt(scalesOff + 8), out);
+    }
+
+    /** {@link #q3kScales(ByteBuffer, int, byte[])} over a little-endian byte array. */
+    public static void q3kScales(byte[] le, int scalesOff, byte[] out) {
+        unpackScales(intAt(le, scalesOff), intAt(le, scalesOff + 4), intAt(le, scalesOff + 8), out);
+    }
+
+    private static void unpackScales(int a0, int a1, int tmp, byte[] out) {
         final int w2 = ((a0 >>> 4) & KMASK2) | (((tmp >>> 4) & KMASK1) << 4);
         final int w3 = ((a1 >>> 4) & KMASK2) | (((tmp >>> 6) & KMASK1) << 4);
         final int w0 = (a0 & KMASK2) | ((tmp & KMASK1) << 4);

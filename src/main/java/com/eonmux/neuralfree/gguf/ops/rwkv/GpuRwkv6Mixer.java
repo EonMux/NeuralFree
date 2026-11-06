@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
@@ -61,6 +62,8 @@ public final class GpuRwkv6Mixer implements GpuMixer {
     private RwkvBlocks.GpuKit kit;
     private GpuOps ops;
     private boolean closed;
+    /** Whether the memory holds per-sequence state rows a batched step routes through. */
+    private boolean routeState;
 
     private int nEmbd;
     private int headSize;
@@ -151,6 +154,9 @@ public final class GpuRwkv6Mixer implements GpuMixer {
             throw e;
         }
         kit = k0;
+        routeState = kit.ctx.hasMemory()
+                && kit.ctx.memory() instanceof com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory
+                && kit.ctx.memory().pagedSequences() != null;
         ops = ctx.ops();
     }
 
@@ -271,6 +277,36 @@ public final class GpuRwkv6Mixer implements GpuMixer {
         prefill(pos, 1, in, out);
     }
 
+    /** Why this mixer runs a batched step: every sequence's rows dispatch as its own contiguous step. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
+    /**
+     * One batched step: every segment of {@code s} dispatches its rows as the contiguous step, reading and
+     * writing its sequence's shift and WKV state (the kernels re-point their state-row routing per segment) and
+     * reading its rows at their place in the step's input and output.
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        if (s.contiguousSingle()) {
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        int c = nEmbd;
+        kit.checkStep(s.nTokens(), in, out, c, working);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            run(s.len(seg), in.buffer(), in.offset() + start * c, out.buffer(), out.offset() + start * c,
+                    s.seq(seg));
+        }
+    }
+
     /**
      * Runs the time mix over {@code nTokens} rows of {@code in} into {@code out} and advances the layer's shift and
      * WKV state.
@@ -281,17 +317,22 @@ public final class GpuRwkv6Mixer implements GpuMixer {
      */
     @Override
     public void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
+        run(nTokens, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
+    }
+
+    private void run(int t, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff, int stateRow) {
         if (closed || kit == null) {
             throw new IllegalStateException("RWKV6 time mix is " + (closed ? "closed" : "not bound"));
         }
         int c = nEmbd;
-        int t = nTokens;
-        kit.checkStep(t, in, out, c, working);
-        kit.runShift(shiftX, t, c, in);
+        if (routeState) {
+            GpuMixer.routeStateRow(stateRow, kit.stateRows(), ops.queue());
+        }
+        kit.runShift(shiftX, t, c, inBuf, inOff);
         ops.matmul(w1, xy.buffer(), 0, h.buffer(), 0, t);
         kit.runUnary(tanhH, t, N_MIX * extra);
         mixPlanes(t, c);
-        kit.runShift(shiftLora, t, c, in);
+        kit.runShift(shiftLora, t, c, inBuf, inOff);
         int plane = t * c;
         GpuBuffer x = planes.buffer();
         project(wr, rDeltas, rBias, x, PLANE_R * plane, r.buffer(), t);
@@ -316,8 +357,8 @@ public final class GpuRwkv6Mixer implements GpuMixer {
             kit.runGroupNorm(groupNorm, t, nHead);
         }
         kit.runGlu(gate, t, c);
-        ops.matmul(wo, xy.buffer(), 0, out.buffer(), out.offset(), t);
-        oDeltas.applyRows(t, xy.buffer(), 0, out.buffer(), out.offset());
+        ops.matmul(wo, xy.buffer(), 0, outBuf, outOff, t);
+        oDeltas.applyRows(t, xy.buffer(), 0, outBuf, outOff);
     }
 
     /** {@code out[t] = W in[t] + deltas (+ b)} into rows at element 0 of {@code out}. */

@@ -9,10 +9,14 @@ public enum MixerKind {
     NONE,
     MLA,
     DSA_MLA,
+    /** Step5 sparse region attention: GQA with a per-head gate and an indexer over 8-token region summaries. */
+    STEP5,
     MSA,
     DSV4,
     MAMBA1,
     MAMBA2,
+    /** Zamba2 layer: a Mamba-2 mixer whose input also carries the output of a shared attention/MLP block. */
+    ZAMBA2,
     PLAMO2_MAMBA,
     SHORTCONV,
     SHORTCONV_CENTERED,
@@ -22,5 +26,10 @@ public enum MixerKind {
     GDN,
     KDA,
     LIGHTNING,
-    CROSS_ATTENTION_T5
+    CROSS_ATTENTION_T5,
+    /**
+     * Inkling softmax attention: no RoPE, per-head Q/K RMS norms, relative-distance logits added to the scores,
+     * short convolutions on the K/V streams, and the per-layer conv state that carries those streams.
+     */
+    INKLING
 }

@@ -19,7 +19,7 @@ import java.util.Map;
  * Architecture table for the encoder, classifier, diffusion, drafter, audio, encoder-decoder and looped architectures.
  * {@link ArchRegistry} merges it with the other tables; an architecture appears in exactly one table.
  *
- * <p>{@link Arch#CLIP}, {@link Arch#GPTJ} and {@link Arch#UNKNOWN} are registered by {@link ArchRegistry}
+ * <p>{@link Arch#CLIP} and {@link Arch#UNKNOWN} are registered by {@link ArchRegistry}
  * itself as rejected entries and must not appear here.
  *
  * <p>This class holds the encoder and classifier rows; {@link ArchTableSpecialGen} holds the diffusion,
@@ -142,10 +142,14 @@ public final class ArchTableSpecial {
                 ArchEntry.of(encoder(Arch.T5ENCODER, RopeType.NONE).forcedNonCausal(true).ffnAct(ActOp.GELU_TANH)
                                 .graphFamily(Arch.T5).build(),
                         SpecialHooksEncoder.T5ENCODER, SpecialTensorRequirementsEncoder.t5Encoder()),
-                // models.h:195-203: llama hparams, tensors and the cache-less embedding graph (llama.cpp:113-119)
+                // models.h:195-203: llama hparams, tensors and the cache-less embedding graph (llama.cpp:113-119);
+                // vLLM's LlamaBidirectionalForSequenceClassification stores the score projection as cls.output
+                // (llama.py:574, as_seq_cls_model)
                 derived(bases, encoder(Arch.LLAMA_EMBED, RopeType.NORM).causalDefault(true).graphFamily(Arch.LLAMA)
                                 .build(), Arch.LLAMA,
-                        ArchHparamsHook.NONE, Collections.<TensorRequirement>emptyList()),
+                        ArchHparamsHook.NONE,
+                        Arrays.asList(TensorRequirement.modelOptional("cls.output.weight"),
+                                TensorRequirement.modelOptional("cls.output.bias"))),
                 // vllm-decision2.cpp:8-39: qwen3 backbone with a per-option decision head
                 derived(bases, ArchTraits.builder(Arch.VLLM_DECISION2).ropeType(RopeType.NEOX)
                                 .memoryKind(MemoryKind.KV).support(SupportClass.CLS).graphFamily(Arch.QWEN3).build(),

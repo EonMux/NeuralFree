@@ -117,6 +117,11 @@ public final class HfSsmHybridHooksB {
     /** The decision checkpoints' systemone chat template fields (the D1 trunk prompt, lfm2.py:97). */
     private static final String D1_SYSTEMONE = yesNoTemplate();
 
+    /** {@code D1Model._systemone_template} (lfm2.py:99-129), reused by the LFM3 d1 vocabulary. */
+    static String d1Systemone() {
+        return D1_SYSTEMONE;
+    }
+
     /** The D1 Alexandre head blocks come after the trunk; their per-block share is added, lfm2.py:172-179. */
     private static final long D1_MAX_LENGTH = 16384;
     private static final long D1_IMAGE_TEXT_LENGTH = 896;

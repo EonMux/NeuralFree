@@ -202,6 +202,41 @@ boolean ok = r.passed();   // maxDifference(), relativeError(), message()
 
 `gradGradCheck` checks second-order gradients. `gradCheckParameters(loss, module, params, eps, tol, maxElementsPerParameter)` checks a module's parameters against a loss supplier and restores its buffers and gradient slots.
 
+**Float64 reference.** A float32 finite difference resolves a loss change only to the float spacing of the loss, divided by `2 * eps`. For deep networks, such as ResNet-18 with many training-mode batch norms over tiny maps, that noise exceeds any useful tolerance. That is why PyTorch's `gradcheck` asks for double inputs.
+
+The float64 checks keep the analytical side, the real FLOAT32 backward pass on the backend under test, and take the numerical side from a FLOAT64 evaluation of the same function. The step is added, the forward ops run and the loss is summed in double precision on the host.
+
+```java
+// A function of its arguments alone: it also serves as its own FLOAT64 reference.
+GradientCheckUtil.GradientCheckResult r = GradientCheckUtil.gradCheckFloat64(
+        in -> TensorOps.tanh(TensorOps.matmul(in.get(0), in.get(1))),
+        List.of(a, b), 1e-3, 1e-2);
+
+// A module: build a second instance of the same architecture holding its state in FLOAT64.
+ResNet reference = ResNet.resnet18(5);
+reference.initialize(hostBackend);
+reference.loadStateDict(model.stateDict(), true);
+reference.to(DType.FLOAT64);
+reference.train();
+Tensor x64 = x.to(DType.FLOAT64);   // and every other tensor the loss reads
+GradientCheckUtil.GradientCheckResult p = GradientCheckUtil.gradCheckParametersFloat64(
+        () -> lossOf(model.forward(x)), model, model.parameters(),
+        () -> lossOf(reference.forward(x64)), reference,
+        1e-3, 1e-2, /* maxElementsPerParameter */ 3);
+```
+
+- **`gradCheckFloat64(fn, reference, inputs, eps, tol)`** applies `reference` to FLOAT64 copies of the FLOAT32 `inputs`. Use it when `fn` reads a module or constant tensors, so that `reference` can read FLOAT64 copies of them.
+- **`gradCheckParametersFloat64`** first checks that `reference` holds `module`'s state: the same parameter and buffer names, shapes and values, compared exactly. It then perturbs the reference parameter with the same dotted name as each checked parameter, and restores the reference's buffers after every evaluation. `module`'s buffers and gradient slots are preserved as in `gradCheckParameters`.
+- **Backends.** The reference can live on any backend; a host backend is fastest. It must return a FLOAT64 tensor.
+- **FLOAT64 ops.** These forward ops take operands that are all FLOAT64 and compute them on the host in double precision:
+  - arithmetic and the unary functions and activations
+  - `sum`, `mean`, `matmul`, `bmm`, `cat`
+  - `ConvOps` convolutions and pooling
+  - `NormOps.batchNorm`
+
+  Mixing FLOAT64 with another dtype in one of these ops throws `IllegalArgumentException` naming the op. Backward primitives and all other ops are FLOAT32-only.
+- **New helpers:** `Tensor.fromArray(backend, double[])` and `Tensor.toDoubleArray()` move FLOAT64 values to and from the host.
+
 ## Parameters
 
 A `Parameter` owns a tensor that is always an autograd leaf, plus its gradient slot. `new Parameter(tensor)` and `new Parameter(tensor, name)` take the tensor over; use `parameter.tensor()` afterwards.
@@ -620,7 +655,7 @@ try (Tensor sample = Tensor.randn(backend, Shape.of(1, 3, 224, 224))) {
 }
 ```
 
-`inference` also holds `SpeculativeDecoder`, `GraphOptimizer` and the configs `QuantizationConfig`, `KVCacheConfig` and `InferenceConfig`. Batched serving of LLMs is not a separate class here: it is the GGUF engine's `ForwardBackend.forwardBatch` contract (`gguf/engine/ForwardBackend`), which backends refuse until they implement it (see LLM-INFERENCE.md).
+`inference` also holds `SpeculativeDecoder`, `GraphOptimizer` and the configs `QuantizationConfig`, `KVCacheConfig` and `InferenceConfig`. Batched serving of LLMs is not a separate class here: it is the GGUF engine's `ForwardBackend.forwardBatch` contract (`gguf/engine/ForwardBackend`), which the CPU and GPU backends implement and a backend without it refuses by name (see LLM-INFERENCE.md).
 
 ### Post-training quantization
 

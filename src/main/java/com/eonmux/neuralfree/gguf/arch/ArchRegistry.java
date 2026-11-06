@@ -17,8 +17,8 @@ import java.util.Set;
 /**
  * Registry of every architecture: the merge of {@link ArchTableDense}, {@link ArchTableMoe},
  * {@link ArchTableHybrid}, {@link ArchTableSpecial} and the rejected entries for {@link Arch#CLIP},
- * {@link Arch#GPTJ} and {@link Arch#UNKNOWN}, which this class owns, plus the rows operator-installed plugin
- * jars contribute through {@link Plugins#load(ArchProvider.class)} (AX-0). Built once on first use; a duplicate
+ * {@link Arch#UNKNOWN}, which this class owns, plus the rows operator-installed plugin
+ * jars contribute through {@link Plugins#load(ArchProvider.class)}. Built once on first use; a duplicate
  * row fails the build, a missing row fails the lookup, and a plugin row whose architecture collides with a
  * built-in row or with the row of another plugin is rejected there with both sources named.
  */
@@ -146,11 +146,13 @@ public final class ArchRegistry {
 
     /** Architectures llama.cpp cannot run as a text model. */
     static List<ArchEntry> rejectedEntries() {
-        List<ArchEntry> out = new ArrayList<>(3);
-        out.add(rejected(Arch.CLIP, "architecture 'clip' is a vision/audio projector without a text model"
-                + " (llama.cpp loads no hparams for clip); load the language model GGUF instead"));
-        out.add(rejected(Arch.GPTJ, "architecture 'gptj' has no model implementation in llama.cpp and is not"
-                + " supported"));
+        List<ArchEntry> out = new ArrayList<>(2);
+        out.add(rejected(Arch.CLIP, "architecture 'clip' is a vision/audio projector without a text model;"
+                + " open its GGUF beside a text model with"
+                + " com.eonmux.neuralfree.gguf.mm.MmprojModel.open (openVisionEncoder for the image towers,"
+                + " openAudioEncoder for the audio towers) and the language model GGUF through"
+                + " ModelSources.open; a CLIP two-tower embedding file (no projector) opens through"
+                + " com.eonmux.neuralfree.gguf.mm.ClipDualEncoder.open"));
         out.add(rejected(Arch.UNKNOWN, "unknown architecture: general.architecture does not name a llama.cpp"
                 + " architecture"));
         return out;

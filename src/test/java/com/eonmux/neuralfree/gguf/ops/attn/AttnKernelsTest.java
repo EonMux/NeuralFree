@@ -19,9 +19,10 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * Kernel selection of {@link AttnKernels} for K and V caches of equal and of different types: the same-type variants
- * for equal types, the mixed kernels with the packed {@code kv_types} argument otherwise, and the argument positions
- * of the mixed kernels against their signatures in {@code kernels/llm/flash_decode.cl} and {@code flash_prefill.cl}
- * (read from the source tree, as the Gradle test working directory is the project directory).
+ * for equal types, the mixed kernels with the packed {@code kv_types} argument otherwise, the packed {@code flags}
+ * value of a tree verify step, and the argument positions of the mixed kernels against their signatures in
+ * {@code kernels/llm/flash_decode.cl} and {@code flash_prefill.cl} (read from the source tree, as the Gradle test
+ * working directory is the project directory).
  */
 public class AttnKernelsTest {
 
@@ -29,7 +30,7 @@ public class AttnKernelsTest {
 
     @Test
     public void equalTypesSelectTheTypeVariants() {
-        for (KvDType t : KvDType.values()) {
+        for (KvDType t : KvDType.kernelTypes()) {
             assertEquals(AttnKernels.flashDecode(t), AttnKernels.flashDecode(t, t));
             assertEquals(AttnKernels.flashAttn(t), AttnKernels.flashAttn(t, t));
         }
@@ -59,6 +60,25 @@ public class AttnKernelsTest {
                 assertEquals(0, packed >> (2 * AttnKernels.KV_TYPE_BITS));
             }
         }
+    }
+
+    /** The fresh-row count of a tree verify step rides in flags bits 5-31 next to the tree bit. */
+    @Test
+    public void treeFlagsPacksTheFreshRowCountBesideTheTreeBit() {
+        int base = AttnKernels.attnFlags(true, true, false) | AttnKernels.FLAG_V_ALIAS;
+        int flags = AttnKernels.treeFlags(base, 31);
+        assertEquals(base | AttnKernels.FLAG_TREE | (31 << AttnKernels.FLAG_FRESH_SHIFT), flags);
+        assertEquals(31, AttnKernels.flagFresh(flags));
+        // a step without fresh rows packs 0, and without the tree bit no count is read at all
+        assertEquals(base | AttnKernels.FLAG_TREE, AttnKernels.treeFlags(base, 0));
+        assertEquals(0, AttnKernels.flagFresh(base));
+        // the count fills exactly bits 5-31: the 33 fresh rows of a width-32 verify step pack, while larger
+        // counts, negative ones and stale bits do not fit
+        assertEquals(33, AttnKernels.flagFresh(AttnKernels.treeFlags(base, 33)));
+        assertThrows(IllegalArgumentException.class, () -> AttnKernels.treeFlags(base, 1 << 27));
+        assertThrows(IllegalArgumentException.class, () -> AttnKernels.treeFlags(base, -1));
+        assertThrows(IllegalArgumentException.class,
+                () -> AttnKernels.treeFlags(base | (7 << AttnKernels.FLAG_FRESH_SHIFT), 2));
     }
 
     @Test

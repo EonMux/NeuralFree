@@ -1,0 +1,78 @@
+/* conv_transpose1d_causal.comp - LLM_ConvTranspose1dCausal: LFM/Qwen decoder ConvTranspose1d whose overlap tail is
+ * carried across windows. GLSL twin of kernels/llm/speech.cl (the semantic reference).
+ * Requires: common/nf_common.glsl.
+ *
+ * Layout: token-major F32, element (t, c) at v[t*channels + c]. The full transposed convolution has
+ * emit + trim rows (emit = n*stride, trim = K - stride); the kernel emits the first emit rows with the previous
+ * tail added and keeps the new tail.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n, i ic, i oc, i k, i stride, R x, R w, R b, R state, W y, W nstate)
+ *   y[i][oc]      = b[oc] + full[i][oc] + (i < trim ? state[i][oc] : 0)
+ *   nstate[i][oc] = full[emit + i][oc] for i < trim
+ *   full[i][oc]   = sum_{c,j: i>=j, (i-j)%stride == 0, t=(i-j)/stride < n} w[(c*OC + oc)*K + j] * x[t][c]
+ *
+ * Dispatch: 1-D, one invocation per output or state element, global = roundUp(max(emits, states), L),
+ * local = {L, 1, 1}. Folded group counts are recovered by nf_global_id().
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) restrict readonly buffer NfTrX { float x_in[]; };
+layout(std430, binding = 1) restrict readonly buffer NfTrW { float w_in[]; };
+layout(std430, binding = 2) restrict readonly buffer NfTrB { float b_in[]; };
+layout(std430, binding = 3) restrict readonly buffer NfTrS { float state_in[]; };
+layout(std430, binding = 4) restrict writeonly buffer NfTrY { float y_out[]; };
+layout(std430, binding = 5) restrict writeonly buffer NfTrN { float nstate_out[]; };
+
+layout(push_constant) uniform NfTrParams {
+    int n;
+    int ic;
+    int oc;
+    int k;
+    int stride;
+} pc;
+
+float nf_transpose_at(const int i, const uint oc) {
+    const uint ic_n = uint(pc.ic);
+    const uint oc_n = uint(pc.oc);
+    float acc = 0.0;
+    for (int j = 0; j < pc.k; ++j) {
+        if (i < j || (i - j) % pc.stride != 0) {
+            continue;
+        }
+        const int t = (i - j) / pc.stride;
+        if (t >= pc.n) {
+            continue;
+        }
+        for (uint c = 0u; c < ic_n; ++c) {
+            acc += w_in[(c * oc_n + oc) * uint(pc.k) + uint(j)] * x_in[uint(t) * ic_n + c];
+        }
+    }
+    return acc;
+}
+
+void main() {
+    const uint idx = nf_global_id();
+    const uint oc_n = uint(pc.oc);
+    const int emit = pc.n * pc.stride;
+    const int trim = pc.k - pc.stride;
+    const uint out_n = uint(emit) * oc_n;
+    if (idx < out_n) {
+        const int i = int(idx / oc_n);
+        const uint oc = idx - uint(i) * oc_n;
+        float acc = b_in[oc] + nf_transpose_at(i, oc);
+        if (i < trim) {
+            acc += state_in[uint(i) * oc_n + oc];
+        }
+        y_out[idx] = acc;
+    }
+    const uint state_n = uint(trim) * oc_n;
+    if (idx < state_n) {
+        const int i = int(idx / oc_n);
+        const uint oc = idx - uint(i) * oc_n;
+        nstate_out[idx] = nf_transpose_at(emit + i, oc);
+    }
+}

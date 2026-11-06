@@ -143,16 +143,18 @@ public final class LayerWeightSet {
         private final long[] shardRows;
         private final InputTransform inputTransform;
         private final TensorRef inputPerm;
+        private final TensorRef inputPreScale;
         private final TensorRef scale;
 
         Entry(TensorRef source, GGMLType uploadType, long uploadRowBytes, long[] shardRows,
-              InputTransform inputTransform, TensorRef inputPerm, TensorRef scale) {
+              InputTransform inputTransform, TensorRef inputPerm, TensorRef inputPreScale, TensorRef scale) {
             this.source = source;
             this.uploadType = uploadType;
             this.uploadRowBytes = uploadRowBytes;
             this.shardRows = shardRows;
             this.inputTransform = inputTransform;
             this.inputPerm = inputPerm;
+            this.inputPreScale = inputPreScale;
             this.scale = scale;
         }
 
@@ -194,6 +196,12 @@ public final class LayerWeightSet {
          * buffer), or null.
          */
         public TensorRef inputPerm() { return inputPerm; }
+
+        /**
+         * The {@code <base>.input_pre_scale} tensor of a PRE_SCALE part (read by the streamed upload into a device
+         * float buffer), or null.
+         */
+        public TensorRef inputPreScale() { return inputPreScale; }
         /**
          * The scalar {@code <base>.scale} tensor holding the output scale {@code w_s} of this {@code <base>.weight}
          * (llama-model.cpp:1724-1790, applied at llama-graph.cpp:1643-1645), or null. Expert
@@ -237,14 +245,7 @@ public final class LayerWeightSet {
     public static List<LayerWeightSet> forTrunk(ModelSpec spec, Options options) {
         Objects.requireNonNull(spec, "spec");
         Objects.requireNonNull(options, "options");
-        TreeMap<Integer, String> stacks = new TreeMap<>();
-        for (LayerSpec l : spec.layers()) {
-            String prev = stacks.put(l.weightLayer(), l.stack());
-            if (prev != null && !prev.equals(l.stack())) {
-                throw new IllegalArgumentException(spec.arch().ggufName() + ": weight layer " + l.weightLayer()
-                        + " is used by stacks " + prev + " and " + l.stack());
-            }
-        }
+        TreeMap<Integer, String> stacks = stacksByWeightLayer(spec);
         List<LayerWeightSet> out = new ArrayList<>(stacks.size());
         for (Map.Entry<Integer, String> e : stacks.entrySet()) {
             LayerWeightSet set = of(spec.tensors(), e.getValue(), e.getKey(), options);
@@ -253,6 +254,23 @@ public final class LayerWeightSet {
             }
         }
         return Collections.unmodifiableList(out);
+    }
+
+    /**
+     * The trunk's physical weight layers mapped to their stack, ascending; the unit a placement is decided per.
+     *
+     * @throws IllegalArgumentException when two trunk layers share a weight layer but not a stack
+     */
+    static TreeMap<Integer, String> stacksByWeightLayer(ModelSpec spec) {
+        TreeMap<Integer, String> stacks = new TreeMap<>();
+        for (LayerSpec l : spec.layers()) {
+            String prev = stacks.put(l.weightLayer(), l.stack());
+            if (prev != null && !prev.equals(l.stack())) {
+                throw new IllegalArgumentException(spec.arch().ggufName() + ": weight layer " + l.weightLayer()
+                        + " is used by stacks " + prev + " and " + l.stack());
+            }
+        }
+        return stacks;
     }
 
     /**
@@ -330,7 +348,7 @@ public final class LayerWeightSet {
         }
         long[] shardRows = WeightShards.shardRows(ref.rows(), unit, unitBytes, limit);
         return new Entry(ref, upload, rowBytes, shardRows, inputTransform(options, ref),
-                permOf(catalog, options, ref), scale);
+                permOf(catalog, options, ref), preScaleOf(catalog, options, ref), scale);
     }
 
     /** The input transform of {@code ref} among the options' input transforms, or null for identity. */
@@ -348,6 +366,39 @@ public final class LayerWeightSet {
         }
         String permName = GpuWeight.permNameOf(ref.name());
         return catalog.has(permName) ? catalog.get(permName) : null;
+    }
+
+    /** The stored {@code <base>.input_pre_scale} tensor of {@code ref}'s transform's PRE_SCALE part, or null. */
+    private static TensorRef preScaleOf(TensorCatalog catalog, Options options, TensorRef ref) {
+        InputTransform it = inputTransform(options, ref);
+        if (it == null || !it.hasPreScale()) {
+            return null;
+        }
+        String preScaleName = GpuWeight.preScaleNameOf(ref.name());
+        return catalog.has(preScaleName) ? catalog.get(preScaleName) : null;
+    }
+
+    /**
+     * This set with only the entries {@code keep} accepts, in file order; used to give one layer's tensors to
+     * several tiers (for example the routed experts to host-mapped memory and the rest to the device).
+     *
+     * @throws IllegalArgumentException when no entry is kept
+     */
+    public LayerWeightSet retaining(Predicate<Entry> keep) {
+        Objects.requireNonNull(keep, "keep");
+        List<Entry> out = new ArrayList<>();
+        for (Entry e : entries) {
+            if (keep.test(e)) {
+                out.add(e);
+            }
+        }
+        if (out.isEmpty()) {
+            throw new IllegalArgumentException(stack + "." + weightLayer + ": no tensor of the set is retained");
+        }
+        if (out.size() == entries.size()) {
+            return this;
+        }
+        return new LayerWeightSet(stack, weightLayer, out);
     }
 
     /** Stack prefix of the layer's tensors. */

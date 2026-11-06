@@ -61,10 +61,10 @@ public class FlashAttnTilingPagedTest {
     public void decodePagedSplitsFollowAPerSequenceKeyCount() {
         FlashAttnTiling t = FlashAttnTiling.decodePaged(4, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU);
         assertEquals(MAX_KV, t.keyCapacity());
-        assertSplit(t.decodeSplit(0), 1, 128);
-        assertSplit(t.decodeSplit(128), 1, 128);
-        assertSplit(t.decodeSplit(1000), 8, 128);
-        assertSplit(t.decodeSplit(MAX_KV), 10, 224);
+        assertSplit(t.decodeSplit(0), 1, 32);
+        assertSplit(t.decodeSplit(128), 2, 64);
+        assertSplit(t.decodeSplit(1000), 3, 352);
+        assertSplit(t.decodeSplit(MAX_KV), 3, 704);
         // A step may never exceed the per-sequence slot range a sequence is planned over.
         assertThrows(IllegalArgumentException.class, () -> t.decodeSplit(MAX_KV + 1));
         assertThrows(IllegalArgumentException.class, () -> t.decodeSplit(-1));
@@ -73,7 +73,8 @@ public class FlashAttnTilingPagedTest {
     @Test
     public void decodePagedGlobalFoldsTheSequenceInFrontOfTheKvHeads() {
         FlashAttnTiling t = FlashAttnTiling.decodePaged(6, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU);
-        // 32/8 = 4 query heads per KV head planned as g_tile = 4: one head tile per KV head.
+        // One query head per workgroup: the 32/8 = 4 heads per KV head planned as four one-head tiles.
+        assertEquals(1, t.gTile());
         assertEquals(4, t.groupTiles());
         long[] global = t.decodePagedGlobal(6, 9);
         assertArrayEquals(new long[]{9L * FlashAttnTiling.WG, 6L * 8 * t.groupTiles()}, global);
@@ -120,7 +121,7 @@ public class FlashAttnTilingPagedTest {
 
     @Test
     public void pagedKernelsFollowTheSameTypeAndMixedSelection() {
-        for (KvDType t : KvDType.values()) {
+        for (KvDType t : KvDType.kernelTypes()) {
             assertEquals("LLM_FlashDecodePaged_" + t.kernelSuffix(), AttnKernels.flashDecodePaged(t));
             assertEquals(AttnKernels.flashDecodePaged(t), AttnKernels.flashDecodePaged(t, t));
             assertEquals("LLM_FlashAttnPaged_" + t.kernelSuffix(), AttnKernels.flashAttnPaged(t));
@@ -130,7 +131,7 @@ public class FlashAttnTilingPagedTest {
         assertSame(AttnKernels.FLASH_ATTN_PAGED_MIXED, AttnKernels.flashAttnPaged(KvDType.Q8_0, KvDType.BF16));
         // Every paged kernel is in the family list, for LlmKernels.prewarm.
         List<String> all = AttnKernels.all();
-        for (KvDType t : KvDType.values()) {
+        for (KvDType t : KvDType.kernelTypes()) {
             assertTrue(all.contains(AttnKernels.flashDecodePaged(t)));
             assertTrue(all.contains(AttnKernels.flashAttnPaged(t)));
         }
@@ -161,10 +162,11 @@ public class FlashAttnTilingPagedTest {
 
     @Test
     public void pagedKernelSignaturesMatchTheArgumentIndices() throws IOException {
-        // Signature parity of the 20 paged entry points against the ARG_FDP_* / ARG_FAP_* tables (the .cl
-        // declaration of the decode twins expands its run-args macro, The checkKernel below expands it).
+        // Signature parity of the 20 paged entry points against the ARG_FDP_* / ARG_FAP_* tables. The typed
+        // kernels are instantiated by generator macros and the decode ones declare their parameters through the
+        // run-args macro; parameters() resolves both.
         String decodeSrc = new String(Files.readAllBytes(KERNELS.resolve("flash_decode.cl")), StandardCharsets.UTF_8);
-        for (KvDType t : KvDType.values()) {
+        for (KvDType t : KvDType.kernelTypes()) {
             checkKernel(decodeSrc, AttnKernels.flashDecodePaged(t), AttnKernels.FDP_ARG_COUNT,
                     AttnKernels.FDP_SCALAR_COUNT);
         }
@@ -172,7 +174,7 @@ public class FlashAttnTilingPagedTest {
                 AttnKernels.FDP_MIXED_SCALAR_COUNT);
         String prefillSrc = new String(Files.readAllBytes(KERNELS.resolve("flash_prefill.cl")),
                 StandardCharsets.UTF_8);
-        for (KvDType t : KvDType.values()) {
+        for (KvDType t : KvDType.kernelTypes()) {
             checkKernel(prefillSrc, AttnKernels.flashAttnPaged(t), AttnKernels.FAP_ARG_COUNT,
                     AttnKernels.FAP_SCALAR_COUNT);
         }
@@ -183,14 +185,14 @@ public class FlashAttnTilingPagedTest {
     /** The paged argument lists extend the base lists in order: the page scalars shift the buffers, then add theirs. */
     @Test
     public void pagedArgumentListIsTheBaseListPlusThePageGeometry() {
-        // Paged decode: 27 base + 5 page scalars, then the 8 base buffers (shifted by 5) and 3 sequence buffers.
+        // Paged decode: 25 base + 5 page scalars, then the 8 base buffers (shifted by 5) and 3 sequence buffers.
         assertEquals(AttnKernels.FD_SCALAR_COUNT + 5, AttnKernels.FDP_SCALAR_COUNT);
         assertEquals(AttnKernels.FD_ARG_COUNT + 8, AttnKernels.FDP_ARG_COUNT);
         assertEquals(AttnKernels.ARG_FD_BUF_Q + 5, AttnKernels.ARG_FDP_BUF_Q);
         assertEquals(AttnKernels.ARG_FD_BUF_PARTIAL + 5, AttnKernels.ARG_FDP_BUF_PARTIAL);
         assertEquals(AttnKernels.ARG_FDP_BUF_PARTIAL + 1, AttnKernels.ARG_FDP_BUF_PAGE_TABLE);
         assertEquals(AttnKernels.ARG_FDP_BUF_PAGE_TABLE + 2, AttnKernels.ARG_FDP_BUF_Q_POS_SEQ);
-        // Paged prefill: 31 base + 2 page scalars, then the 9 base buffers (shifted by 2) and the page table.
+        // Paged prefill: 29 base + 2 page scalars, then the 9 base buffers (shifted by 2) and the page table.
         assertEquals(AttnKernels.FA_SCALAR_COUNT + 2, AttnKernels.FAP_SCALAR_COUNT);
         assertEquals(AttnKernels.FA_ARG_COUNT + 3, AttnKernels.FAP_ARG_COUNT);
         assertEquals(AttnKernels.ARG_FA_BUF_Q + 2, AttnKernels.ARG_FAP_BUF_Q);
@@ -226,28 +228,89 @@ public class FlashAttnTilingPagedTest {
         assertEquals(kernel + " scalar parameters", scalars, nScalars);
     }
 
-    /** The parameter list of {@code LLM_FlashDecodePaged_*}'s signature, with its run-args macro expanded. */
+    /** The parameter list of {@code kernel}'s signature, with the decode run-args macro expanded. */
     private static List<String> parameters(String src, String kernel) {
-        String head = "NF_KERNEL void " + kernel + "(";
-        int open = src.indexOf(head);
-        assertTrue(kernel + " is declared in the kernel sources", open >= 0);
-        int close = src.indexOf(')', open);
-        String inner = src.substring(open + head.length(), close);
-        final String RUN_ARGS = "NF_FLASH_DECODE_PAGED_RUN_ARGS_PAGED(";
-        int mac = inner.indexOf(RUN_ARGS);
+        String inner = declaredParameters(src, kernel);
+        final String runArgs = "NF_FLASH_DECODE_PAGED_RUN_ARGS_PAGED";
+        int mac = inner.indexOf(runArgs + "(");
         if (mac >= 0) {
-            int closeParen = inner.indexOf(')', mac);
-            String type = inner.substring(mac + RUN_ARGS.length(), closeParen);
-            inner = macroBody(src, RUN_ARGS.substring(0, RUN_ARGS.length() - 1))
-                    .replace("KV_T", type) + inner.substring(closeParen + 1);
+            int open = mac + runArgs.length();
+            int close = closingParen(inner, open);
+            String type = inner.substring(open + 1, close).trim();
+            inner = inner.substring(0, mac) + withKvType(macroBody(src, runArgs), type) + inner.substring(close + 1);
         }
         List<String> params = new ArrayList<>();
         for (String p : inner.split(",")) {
-            if (!p.isEmpty()) {
+            if (!p.trim().isEmpty()) {
                 params.add(p.trim());
             }
         }
         return params;
+    }
+
+    /**
+     * The text between the parentheses of {@code kernel}'s declaration: a literal {@code NF_KERNEL void kernel(...)},
+     * or the declaration a kernel-generating macro {@code #define NAME(SFX, KV_T, KV_CODE)} instantiates for
+     * {@code NAME(<suffix>, <type>, <code>)}, with {@code KV_T} replaced by the instantiation's type.
+     */
+    private static String declaredParameters(String src, String kernel) {
+        String head = "NF_KERNEL void " + kernel + "(";
+        int open = src.indexOf(head);
+        if (open >= 0) {
+            int paren = open + head.length() - 1;
+            return src.substring(paren + 1, closingParen(src, paren));
+        }
+        final String generated = "##SFX(";
+        for (int at = src.indexOf(generated); at >= 0; at = src.indexOf(generated, at + 1)) {
+            int decl = src.lastIndexOf("NF_KERNEL void ", at);
+            if (decl < 0) {
+                continue;
+            }
+            String prefix = src.substring(decl + "NF_KERNEL void ".length(), at);
+            if (!kernel.startsWith(prefix)) {
+                continue;
+            }
+            int def = src.lastIndexOf("#define ", at);
+            String macro = src.substring(def + "#define ".length(), src.indexOf('(', def));
+            String[] args = instantiation(src, macro, kernel.substring(prefix.length()));
+            if (args == null) {
+                continue;
+            }
+            String body = macroBody(src, macro);
+            int paren = body.indexOf("NF_KERNEL void " + prefix + generated) + ("NF_KERNEL void " + prefix).length()
+                    + generated.length() - 1;
+            return withKvType(body.substring(paren + 1, closingParen(body, paren)), args[1].trim());
+        }
+        throw new AssertionError(kernel + " is declared in the kernel sources");
+    }
+
+    /** The arguments of the line {@code macro(suffix, ...)} at the start of a line, or null when none instantiates it. */
+    private static String[] instantiation(String src, String macro, String suffix) {
+        for (String line : src.split("\n", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith(macro + "(" + suffix + ",") && trimmed.endsWith(")")) {
+                return trimmed.substring(macro.length() + 1, trimmed.length() - 1).split(",");
+            }
+        }
+        return null;
+    }
+
+    /** The index of the parenthesis closing the one at {@code open}. */
+    private static int closingParen(String s, int open) {
+        int depth = 0;
+        for (int i = open; i < s.length(); i++) {
+            if (s.charAt(i) == '(') {
+                depth++;
+            } else if (s.charAt(i) == ')' && --depth == 0) {
+                return i;
+            }
+        }
+        throw new AssertionError("unbalanced parentheses after index " + open);
+    }
+
+    /** {@code text} with the macro parameter {@code KV_T} replaced by {@code type}. */
+    private static String withKvType(String text, String type) {
+        return text.replaceAll("\\bKV_T\\b", java.util.regex.Matcher.quoteReplacement(type));
     }
 
     /** The function-macro body of {@code name} in {@code src}, its line continuations joined with spaces. */

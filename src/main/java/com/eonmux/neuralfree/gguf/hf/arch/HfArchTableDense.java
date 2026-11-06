@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.hf.hooks.HfDenseHooksB;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfDenseHooksC;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfGemmaHooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfLlamaHooks;
+import com.eonmux.neuralfree.gguf.hf.hooks.HfLimiteHooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfMistral3Hooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfQwenHooks;
 import com.eonmux.neuralfree.gguf.hf.hooks.HfQwenMoeHooks;
@@ -16,12 +17,12 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Hugging Face architecture entries for the modern dense decoder families (Appendix A table HK-D2, the 26 converter
- * classes of mistral3.py, gemma.py, olmo.py, llama.py's SmolLM3/Arcee/Apertus, hunyuan.py, qwen.py, qwenvl.py,
- * qwen3vl.py, step3.py, ernie.py, phi.py and sensenova_u1.py). {@link HfArchRegistry} merges this table with the
- * others; a Hugging Face name appears in exactly one table per {@link HfArchEntry.Kind}. The HK-B1 (Qwen2, Qwen3,
- * Qwen3Moe) and HK-B2 (Gemma3, Ernie4_5, Phi3Mini) hook classes compose the rows their converters inherit; the
- * classes of this work package only extend them.
+ * Hugging Face architecture entries for the modern dense decoder families (the converter classes of mistral3.py,
+ * gemma.py, olmo.py, llama.py's SmolLM3/Arcee/Apertus, hunyuan.py, qwen.py, qwenvl.py, qwen3vl.py, step3.py,
+ * ernie.py, phi.py, sensenova_u1.py and limite.py). {@link HfArchRegistry} merges this table with the others; a
+ * Hugging Face name appears in exactly one table per {@link HfArchEntry.Kind}. The hook classes of the Qwen rows
+ * (Qwen2, Qwen3, Qwen3Moe) and of the Gemma3, Ernie4_5 and Phi3Mini rows compose the rows their converters inherit;
+ * the classes of this table only extend them.
  */
 final class HfArchTableDense {
 
@@ -114,8 +115,18 @@ final class HfArchTableDense {
                                 HfArchResolver.of(Arch.QWEN3VL),
                                 HfDenseHooksB::asrMeta, HfQwenHooks::qwen3Tensors, HfDenseHooksB::asrVocab)
                         .withNameFilter(HfDenseHooksB.THINKER_FILTER),
+                // LimiteModel (limite.py:15): value embeddings, the exclusive self attention, the learned residual
+                // scales and the MUDD connections.
+                HfArchEntry.of(Collections.singletonList("LimiteForCausalLM"), HfLimiteHooks::arch,
+                                HfLimiteHooks::meta, HfLimiteHooks::tensors, HfLimiteHooks::vocab)
+                        .withConfigFixup(HfLimiteHooks::fixup)
+                        .withForceType(HfLimiteHooks::forceType),
                 HfArchEntry.of(Arrays.asList("Qwen3ForCausalLM", "Qwen3Model"), HfArchResolver.of(Arch.QWEN3),
                                 HfQwenHooks::qwen3Meta, HfQwenHooks::qwen3Tensors, HfQwenHooks::qwen3Vocab),
+                // SopranoTextModel (soprano.py:37): the Qwen3 backbone of the Soprano TTS checkpoints, named by the
+                // Soprano checkpoint detector; the decoder.pth Vocos weights belong to the projector file.
+                HfArchEntry.of(Collections.singletonList("SopranoTextModel"), HfArchResolver.of(Arch.QWEN3),
+                                HfQwenHooks::qwen3Meta, HfQwenHooks::qwen3Tensors, HfQwenHooks::sopranoVocab),
                 HfArchEntry.of(Collections.singletonList("Qwen3MoeForCausalLM"), HfArchResolver.of(Arch.QWEN3MOE),
                                 HfQwenMoeHooks::qwen2MoeMeta, HfQwenMoeHooks::qwen2MoeTensors,
                                 HfQwenMoeHooks::qwen3MoeVocab)

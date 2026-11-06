@@ -36,7 +36,7 @@ public final class TernaryVecDot implements CpuVecDot {
     /** One row kernel: {@code nb} weight blocks starting at absolute index {@code off} of {@code b}. */
     @FunctionalInterface
     private interface RowKernel {
-        float dot(ByteBuffer b, int off, QuantizedActivations x, int nb);
+        float dot(byte[] b, int off, QuantizedActivations x, int nb);
     }
 
     private final GGMLType type;
@@ -96,14 +96,18 @@ public final class TernaryVecDot implements CpuVecDot {
     @Override
     public float dotRow(CpuTensorRef w, long row, QuantizedActivations x) {
         check(w, x);
-        return kernel.dot(w.rowBuffer(row), w.rowOffset(row), x, (int) (w.cols() / blockElements));
+        return kernel.dot(CpuVecDotRows.copyRow(w, row), 0, x, (int) (w.cols() / blockElements));
+    }
+
+    @Override
+    public float dotRowBytes(byte[] row, int off, QuantizedActivations x) {
+        return kernel.dot(row, off, x, x.n / blockElements);
     }
 
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        final int nb = (int) (w.cols() / blockElements);
-        CpuVecDotRows.forEachRow(w, rowStart, rowCount, y, yOff, (b, off) -> kernel.dot(b, off, x, nb));
+        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
     }
 
     private void check(CpuTensorRef w, QuantizedActivations x) {
@@ -140,7 +144,7 @@ public final class TernaryVecDot implements CpuVecDot {
      * give 5 trits each to {@code q8[160 + l*16 + m]}, and the 4 {@code qh} bytes give 4 trits each to
      * {@code q8[240 + l*4 + j]}; trit {@code l} uses multiplier {@code 3^l}.
      */
-    private static float dotTq1_0(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotTq1_0(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         final short[] bsums = x.bsums;
@@ -150,20 +154,20 @@ public final class TernaryVecDot implements CpuVecDot {
             final int qs = off + TQ1_0_QS;
             int sum = 0;
             for (int m = 0; m < full; ++m) {
-                final int v = b.get(qs + m) & 0xFF;
+                final int v = b[qs + m] & 0xFF;
                 final int y0 = o + m;
                 sum += trit(v, 1) * q8[y0] + trit(v, 3) * q8[y0 + 32] + trit(v, 9) * q8[y0 + 64]
                         + trit(v, 27) * q8[y0 + 96] + trit(v, 81) * q8[y0 + 128];
             }
             for (int m = 0; m < TQ1_0_QS_BYTES - full; ++m) {
-                final int v = b.get(qs + full + m) & 0xFF;
+                final int v = b[qs + full + m] & 0xFF;
                 final int y0 = o + full * 5 + m;
                 sum += trit(v, 1) * q8[y0] + trit(v, 3) * q8[y0 + 16] + trit(v, 9) * q8[y0 + 32]
                         + trit(v, 27) * q8[y0 + 48] + trit(v, 81) * q8[y0 + 64];
             }
             final int qh = off + TQ1_0_QH;
             for (int j = 0; j < TQ1_0_QH_BYTES; ++j) {
-                final int v = b.get(qh + j) & 0xFF;
+                final int v = b[qh + j] & 0xFF;
                 final int y0 = o + TQ1_0_QS_BYTES * 5 + j;
                 sum += trit(v, 1) * q8[y0] + trit(v, 3) * q8[y0 + TQ1_0_QH_BYTES]
                         + trit(v, 9) * q8[y0 + 2 * TQ1_0_QH_BYTES] + trit(v, 27) * q8[y0 + 3 * TQ1_0_QH_BYTES];
@@ -178,7 +182,7 @@ public final class TernaryVecDot implements CpuVecDot {
      * {@code ggml_vec_dot_tq2_0_q8_K_generic} (llama.cpp ggml-cpu/quants.c:533-563): byte {@code j + k} of each
      * 32-byte chunk {@code j} holds the 2-bit codes of {@code q8[4j + 32l + k]} at bits {@code 2l}.
      */
-    private static float dotTq2_0(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotTq2_0(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         final short[] bsums = x.bsums;
@@ -190,7 +194,7 @@ public final class TernaryVecDot implements CpuVecDot {
             for (int j = 0; j < qsBytes; j += 32) {
                 final int y0 = o + j * 4;
                 for (int k = 0; k < 32; ++k) {
-                    final int v = b.get(qs + j + k) & 0xFF;
+                    final int v = b[qs + j + k] & 0xFF;
                     sumi += (v & 3) * q8[y0 + k] + ((v >>> 2) & 3) * q8[y0 + 32 + k]
                             + ((v >>> 4) & 3) * q8[y0 + 64 + k] + (v >>> 6) * q8[y0 + 96 + k];
                 }

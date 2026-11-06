@@ -28,7 +28,8 @@ import java.util.Objects;
 /**
  * CPU twin of {@link GpuNgramPleExtra}: the qwen4exp n-gram per-layer embedding ({@code LayerSpec.Extras.NGRAM_PLE},
  * qwen4exp.cpp:1203-1420) in {@link #beforeBlock} of the PLE layer. The step's tokens come from
- * {@link CpuScratch#TOKEN_IDS}, their predecessors from the memory's {@link SequenceState}; the score is the
+ * {@link CpuScratch#TOKEN_IDS} (an embedding row hashes the stand-in id), their predecessors from the memory's
+ * {@link SequenceState} ({@link NgramLayout#completeWindow}); the score is the
  * {@code ggml_sum_rows} of the products in double precision ({@code ggml_vec_sum_f32}), the gate
  * {@code sigmoid(sgn(s) * sqrtf(clamp(|s|, 1e-6, inf)))} element-wise, and the dilated causal convolution
  * {@link CpuSsmConv#forward} over the same dense kernel as the GPU form (tap {@code k} at {@code k*ngram}, zeros
@@ -57,6 +58,9 @@ public final class CpuNgramPleExtra implements CpuLayerExtra {
     private float[] normConv;
     private float[] dense;
     private float[] state;
+    /** Floats of one state slot and the slots the memory keeps ({@code RecurrentStateAccessor}). */
+    private int stateRow;
+    private int stateSlots;
     private int[] window;
     private int[] ids;
     private float[] emb;
@@ -95,11 +99,14 @@ public final class CpuNgramPleExtra implements CpuLayerExtra {
         int d = l.streamWidth();
         int e = l.nEmbd();
         int hist = l.history();
-        float[] st = rs.tensor(LayerMemoryPlan.STATE_PLE_CONV);
-        if (st.length != (long) hist * d) {
+        state = rs.tensor(LayerMemoryPlan.STATE_PLE_CONV);
+        stateRow = rs.slotFloats(LayerMemoryPlan.STATE_PLE_CONV);
+        if (stateRow != (long) hist * d) {
             throw new IllegalStateException(arch + " layer " + layer.il() + ": state " + LayerMemoryPlan.STATE_PLE_CONV
-                    + " holds " + st.length + " floats, expected (K-1)*ngram*hc*n_embd = " + ((long) hist * d));
+                    + " holds " + stateRow + " floats per sequence, expected (K-1)*ngram*hc*n_embd = "
+                    + ((long) hist * d));
         }
+        stateSlots = rs.slots();
         CpuWeights w = ctx.weights();
         CpuScratch s = ctx.scratch();
         int u = s.ubatch();
@@ -124,7 +131,7 @@ public final class CpuNgramPleExtra implements CpuLayerExtra {
         this.il = layer.il();
         this.ubatch = u;
         this.width = d;
-        this.state = st;
+        this.state = state;
         this.window = new int[u + l.lookBehind()];
         this.ids = new int[Math.multiplyExact(u, l.nHeads())];
         this.emb = s.temp(GpuNgramPleExtra.TEMP_EMB, u * e);
@@ -156,16 +163,53 @@ public final class CpuNgramPleExtra implements CpuLayerExtra {
 
     @Override
     public void beforeBlock(int pos0, int n, float[] x) {
+        checkBound();
+        GpuPleExtra.checkTokens(n, ubatch, "n-gram PLE");
+        CpuPleExtra.requireLength(x, (long) n * width, "residual stream");
+        runSegment(pos0, n, 0, scratch.ints(CpuScratch.TOKEN_IDS), 0, 0, memory.sequence(), true, x);
+    }
+
+    /**
+     * One batched step: the score, gate and convolution of every row read that row's predecessors and update that
+     * row's sequence's history, so the segments run one at a time, each against its own sequence's state row and
+     * token record (the paged memory's per-sequence record, positions per entry). Every segment's rows sit at its
+     * {@code tokStart} offset of {@code x}, its tokens at the same offset of {@code CpuScratch#TOKEN_IDS}.
+     */
+    @Override
+    public void beforeBlock(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] x) {
+        checkBound();
+        GpuPleExtra.checkTokens(s.nTokens(), ubatch, "n-gram PLE");
+        CpuPleExtra.requireLength(x, (long) s.nTokens() * width, "residual stream");
+        int[] step = scratch.ints(CpuScratch.TOKEN_IDS);
+        boolean paged = memory.pagedSequences() != null;
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int seq = s.seq(seg);
+            SequenceState record = paged ? memory.pagedSequences().sequence(seq) : memory.sequence();
+            runSegment(s.pos0(seg), s.len(seg), s.tokStart(seg) * width, step, s.tokStart(seg), seq, record, !paged,
+                    x);
+        }
+    }
+
+    private void checkBound() {
         if (matVec == null) {
             throw new IllegalStateException("n-gram PLE extra is not bound");
         }
-        GpuPleExtra.checkTokens(n, ubatch, "n-gram PLE");
+    }
+
+    /**
+     * One segment of {@code n} rows at {@code x[xOff]} whose tokens are {@code step[tokOff ..]}: the predecessors
+     * come from sequence {@code seq}'s token record {@code record} ({@code contiguous}: the contiguous record), the
+     * convolution updates sequence {@code seq}'s history row.
+     */
+    private void runSegment(int pos0, int n, int xOff, int[] step, int tokOff, int seq, SequenceState record,
+                            boolean contiguous, float[] x) {
         int d = width;
         int e = layout.nEmbd();
         int hc = layout.hc();
         int len = n * d;
-        CpuPleExtra.requireLength(x, len, "residual stream");
-        fillWindow(pos0, n);
+        int base = stateSlot(seq) * stateRow;
+        System.arraycopy(step, tokOff, window, layout.lookBehind(), n);
+        layout.completeWindow(record, contiguous, pos0, n, window);
         layout.hash(window, n, ids);
         int nIds = n * layout.nHeads();
         int hd = layout.headDim();
@@ -179,7 +223,7 @@ public final class CpuNgramPleExtra implements CpuLayerExtra {
         int rows = n * hc;
         float eps = layout.eps();
         NormMath.rowNorm(NormKind.RMS, eps, rows, e, e, hc, keys, 0, normKey, null, keys, 0);
-        NormMath.rowNorm(NormKind.RMS, eps, rows, e, e, hc, x, 0, normQuery, null, query, 0);
+        NormMath.rowNorm(NormKind.RMS, eps, rows, e, e, hc, x, xOff, normQuery, null, query, 0);
         float scale = layout.scoreScale();
         CpuParallel.parallelFor(rows, ROW_GRAIN, (from, to) -> {
             for (int r = from; r < to; r++) {
@@ -199,9 +243,24 @@ public final class CpuNgramPleExtra implements CpuLayerExtra {
         });
         NormMath.rowNorm(NormKind.RMS, eps, rows, e, e, hc, gated, 0, normConv, null, normed, 0);
         CpuSsmConv.forward(d, layout.history() + 1, n, SsmKernels.CONV_FLAG_SILU, normed, 0, d, dense, null,
-                state, 0, 0, conv, 0, d);
+                state, base, 0, conv, 0, d);
         CpuOps.add(gated, 0, conv, 0, conv, 0, len);
-        CpuOps.add(x, 0, conv, 0, x, 0, len);
+        CpuOps.add(x, xOff, conv, 0, x, xOff, len);
+    }
+
+    /** The state slot of {@code seq}, validated against the memory's slots. */
+    private int stateSlot(int seq) {
+        if (seq < 0 || seq >= stateSlots) {
+            throw new UnsupportedOperationException("n-gram PLE runs sequence " + seq + ", the memory keeps "
+                    + stateSlots + " state slots");
+        }
+        return seq;
+    }
+
+    /** The hooks run per segment over the real rows, so batching is supported. */
+    @Override
+    public String batchRefusal() {
+        return null;
     }
 
     /** {@code sum_i (key[i] * query[i])}: products rounded to float, summed in double (ggml_vec_sum_f32). */
@@ -218,27 +277,6 @@ public final class CpuNgramPleExtra implements CpuLayerExtra {
         float sgn = s > 0f ? 1f : (s < 0f ? -1f : 0f);
         float mag = (float) Math.sqrt(Math.max(Math.abs(s), GpuNgramPleExtra.MIN_MAGNITUDE));
         return ActMath.sigmoid(sgn * mag);
-    }
-
-    /**
-     * Tokens of positions {@code [pos0 - (ngram-1), pos0 + n)} into {@link #window}: predecessors from the sequence
-     * record (-1 before position 0), the step's own tokens from {@link CpuScratch#TOKEN_IDS}.
-     *
-     * @throws IllegalStateException when the record does not reach {@code pos0}
-     */
-    private void fillWindow(int pos0, int n) {
-        int back = layout.lookBehind();
-        SequenceState seq = memory.sequence();
-        if (pos0 > 0 && seq.nPast() < pos0) {
-            throw new IllegalStateException("n-gram PLE at position " + pos0 + " needs the tokens before it in the "
-                    + "sequence record, which holds " + seq.nPast());
-        }
-        for (int w = 0; w < back; w++) {
-            int pos = pos0 - back + w;
-            window[w] = pos < 0 ? -1 : seq.token(pos);
-        }
-        int[] step = scratch.ints(CpuScratch.TOKEN_IDS);
-        System.arraycopy(step, 0, window, back, n);
     }
 
     @Override

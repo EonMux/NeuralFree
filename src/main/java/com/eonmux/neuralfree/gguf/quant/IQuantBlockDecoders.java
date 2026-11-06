@@ -5,10 +5,11 @@ import java.nio.ByteBuffer;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16ToFp32;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.shortAt;
 
 /**
  * CPU decoders for the importance-matrix types IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M,
- * IQ4_NL and IQ4_XS, using the grids and codebooks of {@link QuantTables}.
+ * IQ3_K, IQ3_KS, IQ4_NL and IQ4_XS, using the grids and codebooks of {@link QuantTables}.
  * <p>
  * Kernels are package-private: they expect a little-endian buffer and a range already validated by
  * {@link CpuBlockDecoders}.
@@ -30,10 +31,17 @@ public final class IQuantBlockDecoders {
      * @param scalesOff absolute index of the 8-byte {@code scales} field
      */
     public static float iq1mSuperScale(ByteBuffer le, int scalesOff) {
-        final int sc0 = le.getShort(scalesOff) & 0xFFFF;
-        final int sc1 = le.getShort(scalesOff + 2) & 0xFFFF;
-        final int sc2 = le.getShort(scalesOff + 4) & 0xFFFF;
-        final int sc3 = le.getShort(scalesOff + 6) & 0xFFFF;
+        return iq1mSuperScale(le.getShort(scalesOff) & 0xFFFF, le.getShort(scalesOff + 2) & 0xFFFF,
+                le.getShort(scalesOff + 4) & 0xFFFF, le.getShort(scalesOff + 6) & 0xFFFF);
+    }
+
+    /** {@link #iq1mSuperScale(ByteBuffer, int)} over a little-endian byte array. */
+    public static float iq1mSuperScale(byte[] le, int scalesOff) {
+        return iq1mSuperScale(shortAt(le, scalesOff) & 0xFFFF, shortAt(le, scalesOff + 2) & 0xFFFF,
+                shortAt(le, scalesOff + 4) & 0xFFFF, shortAt(le, scalesOff + 6) & 0xFFFF);
+    }
+
+    private static float iq1mSuperScale(int sc0, int sc1, int sc2, int sc3) {
         final int u16 = (sc0 >>> 12) | ((sc1 >>> 8) & 0x00f0) | ((sc2 >>> 4) & 0x0f00) | (sc3 & 0xf000);
         return fp16ToFp32(u16);
     }
@@ -167,6 +175,71 @@ public final class IQuantBlockDecoders {
             yOff += 8;
         }
         return yOff;
+    }
+
+    /**
+     * {@code dequantize_row_iq3_k} (Avalon ggml-quants.c:5381-5410): 3-bit codes on the {@code iq3nl_values}
+     * grid, one 4-bit scale and sign bit per 16-element half of a 32-element sub-block, and one grid-select
+     * bit per half in {@code extra}.
+     */
+    static void decodeIq3K(ByteBuffer b, int off, float[] y, int yOff, int nb) {
+        for (int i = 0; i < nb; i++, off += IQ3_K_BYTES) {
+            final float d = fp16At(b, off + IQ3_K_D);
+            final int qs = off + IQ3_K_QS;
+            final int qh = off + IQ3_K_QH;
+            int sh = b.getShort(off + IQ3_K_SCALES_H) & 0xFFFF;
+            int extra = b.getShort(off + IQ3_K_EXTRA) & 0xFFFF;
+            for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                final int sl = b.get(off + IQ3_K_SCALES_L + ib32) & 0xFF;
+                final float dl1 = d * (2 * (sl & 0xf) + 1) * ((sh & 1) != 0 ? -1f : 1f);
+                final float dl2 = d * (2 * (sl >>> 4) + 1) * ((sh & 2) != 0 ? -1f : 1f);
+                sh >>>= 2;
+                final int grid1 = (extra & 1) != 0 ? 8 : 0;
+                final int grid2 = (extra & 2) != 0 ? 8 : 0;
+                extra >>>= 2;
+                final int shiftL = 2 * (ib32 % 4);
+                final int shiftH = ib32 % 8;
+                final int qsBase = qs + 32 * (ib32 / 4);
+                for (int j = 0; j < 16; ++j) {
+                    y[yOff + j] = dl1 * QuantTables.iq3NlValue(
+                            ((b.get(qsBase + j) & 0xFF) >> shiftL & 3)
+                                    | ((b.get(qh + j) & 0xFF) >> shiftH & 1) << 2 | grid1);
+                    y[yOff + j + 16] = dl2 * QuantTables.iq3NlValue(
+                            ((b.get(qsBase + j + 16) & 0xFF) >> shiftL & 3)
+                                    | ((b.get(qh + j + 16) & 0xFF) >> shiftH & 1) << 2 | grid2);
+                }
+                yOff += 32;
+            }
+        }
+    }
+
+    /**
+     * {@code dequantize_row_iq3_ks} (Avalon ggml-quants.c:5613-5632): the IQ3_K codes on the same grid with
+     * a signed 5-bit scale per 32-element sub-block ({@code extra} bits 0-7 are the scales' bit 4, bits 8-15
+     * the grid-select bits).
+     */
+    static void decodeIq3Ks(ByteBuffer b, int off, float[] y, int yOff, int nb) {
+        for (int i = 0; i < nb; i++, off += IQ3_KS_BYTES) {
+            final float d = fp16At(b, off + IQ3_KS_D);
+            final int extra = b.getShort(off + IQ3_KS_EXTRA) & 0xFFFF;
+            final int qs = off + IQ3_KS_QS;
+            final int qh = off + IQ3_KS_QH;
+            for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                final int ls = ((((b.get(off + IQ3_KS_SCALES + ib32 % 4) & 0xFF) >>> (4 * (ib32 / 4))) & 0xf)
+                        | (((extra >>> ib32) & 1) << 4)) - 16;
+                final float dl = d * ls;
+                final int grid = ((extra >>> (8 + ib32)) & 1) != 0 ? 8 : 0;
+                final int shiftL = 2 * (ib32 % 4);
+                final int shiftH = ib32 % 8;
+                final int qsBase = qs + 32 * (ib32 / 4);
+                for (int j = 0; j < 32; ++j) {
+                    y[yOff + j] = dl * QuantTables.iq3NlValue(
+                            ((b.get(qsBase + j) & 0xFF) >> shiftL & 3)
+                                    | ((b.get(qh + j) & 0xFF) >> shiftH & 1) << 2 | grid);
+                }
+                yOff += 32;
+            }
+        }
     }
 
     /** {@code dequantize_row_iq1_s} (llama.cpp ggml-quants.c:2651-2674): {@code y = dl * (grid + delta)}. */

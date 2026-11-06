@@ -2,8 +2,8 @@ package com.eonmux.neuralfree.gguf.memory.paged;
 
 /**
  * Page pool of one KV group: {@code nPages} physical pages of {@code pageSize} rows each, with a reference count per
- * page and a LIFO free list. This is the backing store behind {@link PagedSequences} and, from PC-1 on, the radix
- * cache and every other holder of a page (the reference-counted page rule T-4: a page is reused for other data only
+ * page and a LIFO free list. This is the backing store behind {@link PagedSequences} and every other holder of a
+ * page (the reference-counted page rule: a page is reused for other data only
  * at reference count 0, and {@link #ref} only takes a reference on a page some holder already owns, so no holder can
  * revive a freed page).
  *
@@ -77,7 +77,7 @@ public final class PagePool {
 
     /**
      * The first {@code n} page ids {@link #alloc} would hand out, in {@code alloc} order. The reservation planner of
-     * {@link PagedSequences#prepare} uses it to plan an all-or-nothing step without mutating the pool (T-4): the
+     * {@link PagedSequences#prepare} uses it to plan an all-or-nothing step without mutating the pool: the
      * caller must {@link #alloc} in the same order before anything else touches the pool, which the single engine
      * thread guarantees.
      *

@@ -53,6 +53,23 @@ public final class DenseTensorRequirementsSandwich {
     }
 
     /**
+     * RNJ-1: the Gemma 3 block with one pre-norm, one sandwich norm per sub-layer output and per-head Q/K norms.
+     * The output head is the tied token table or a separate {@code output.weight}.
+     */
+    public static List<TensorRequirement> rnj1() {
+        return DenseTensorRequirements.builder()
+                .tokenEmbd()
+                .model("output_norm.weight")
+                .outputOrTied()
+                .layer("attn_norm.weight")
+                .qkv()
+                .layer("attn_output.weight", "post_attention_norm.weight", "attn_k_norm.weight",
+                        "attn_q_norm.weight", "ffn_norm.weight", "ffn_gate.weight", "ffn_up.weight",
+                        "ffn_down.weight", "post_ffw_norm.weight")
+                .build();
+    }
+
+    /**
      * gemma3n.cpp:21-76: the Gemma-3 block plus AltUp, LAuReL and per-layer embedding tensors.
      * {@code per_layer_model_proj} and {@code per_layer_proj_norm} carry no layer index.
      */

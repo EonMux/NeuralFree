@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-D2 part C fixtures ({@code HunYuanModel}, {@code HunyuanVLTextModel}, {@code Mistral3Model} on the Ministral 3
+ * The fixtures ({@code HunYuanModel}, {@code HunyuanVLTextModel}, {@code Mistral3Model} on the Ministral 3
  * text branch, {@code VoxtralRealtimeModel}) build through the registered entries: {@link ModelSpecBuilder} succeeds
  * and every catalog tensor is claimed ({@code TensorClaims}), which is the done-getting-tensors check of the
  * converter's tensor plan.

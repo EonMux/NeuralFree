@@ -1,0 +1,55 @@
+/* dual_chunk_merge.comp - LLM_DualChunkMerge (GLSL twin of kernels/llm/dual_chunk_merge.cl; the merge formula,
+ * layouts and the absent-stage convention are documented there). Requires: common/nf_common.glsl,
+ * common/attn_common.glsl.
+ *
+ * Variants row:
+ *   LLM_DualChunkMerge	dual_chunk_merge.comp	(no defines, no subgroups)
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_rows, i n_head, i d_v, i out_row_stride, i out_off, R p0, R p1, R p2, W out)
+ *   Dispatch: 1-D, global {n_rows * n_head * 128}, local {128, 1, 1}; one workgroup per (row, head), folded group
+ *   counts are recovered by nf_wg_id(). No barriers, so any local size is valid.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/attn_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfDcmP0 { float p0[]; };
+layout(std430, binding = 1) readonly buffer NfDcmP1 { float p1[]; };
+layout(std430, binding = 2) readonly buffer NfDcmP2 { float p2[]; };
+layout(std430, binding = 3) writeonly buffer NfDcmOut { float dst[]; };
+
+layout(push_constant) uniform NfDcmParams {
+    int n_rows; int n_head; int d_v; int out_row_stride; int out_off;
+} pc;
+
+void main() {
+    const uint row = nf_wg_id();
+    if (pc.n_rows <= 0 || pc.n_head <= 0 || pc.d_v <= 0 || row >= uint(pc.n_rows * pc.n_head)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint d_v = uint(pc.d_v);
+    const uint t = row / uint(pc.n_head);
+    const uint h = row - t * uint(pc.n_head);
+    const uint at = row * (d_v + 2u);
+
+    const float m = max(max(p0[at + d_v], p1[at + d_v]), p2[at + d_v]);
+    const uint ob = uint(pc.out_off) + t * uint(pc.out_row_stride) + h * d_v;
+    if (m == -NF_INF) {
+        for (uint d = lid; d < d_v; d += gl_WorkGroupSize.x) {
+            dst[ob + d] = 0.0;
+        }
+        return;
+    }
+    const float w0 = nf_attn_rescale(p0[at + d_v], m);
+    const float w1 = nf_attn_rescale(p1[at + d_v], m);
+    const float w2 = nf_attn_rescale(p2[at + d_v], m);
+    const float l = p0[at + d_v + 1u] * w0 + p1[at + d_v + 1u] * w1 + p2[at + d_v + 1u] * w2;
+    for (uint d = lid; d < d_v; d += gl_WorkGroupSize.x) {
+        const float o = p0[at + d] * w0 + p1[at + d] * w1 + p2[at + d] * w2;
+        dst[ob + d] = l > 0.0 ? o / l : 0.0;
+    }
+}

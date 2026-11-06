@@ -1,4 +1,5 @@
 # kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
-# Activation fake-quantization and input column permutation of matmul inputs (kernels/llm/act_quant.cl).
+# Activation fake-quantization, input column permutation and activation pre-scale of matmul inputs (kernels/llm/act_quant.cl).
 LLM_ActFakeQuant	act_quant.comp	OP=OP_ACT_FAKE_QUANT	sg
 LLM_PermuteCols	act_quant.comp	OP=OP_PERMUTE_COLS
+LLM_ScaleCols	act_quant.comp	OP=OP_SCALE_COLS

@@ -16,6 +16,7 @@ import com.eonmux.neuralfree.gguf.tokenizer.hf.PreNameResolver;
 import com.eonmux.neuralfree.utils.json.JsonView;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -57,6 +58,30 @@ public final class HfMistralMoeHooks {
      * @throws GgufFormatException when {@code yarn.factor} or {@code yarn.original_max_position_embeddings} is missing
      */
     public static HfConfig fixup(HfConfig cfg) {
+        HfConfig mapped = remap(cfg);
+        JsonView root = cfg.raw();
+        if (root.raw("yarn") != null) {
+            JsonView yarn = root.obj("yarn");
+            Map<String, Object> rope = new LinkedHashMap<>();
+            rope.put("rope_type", "yarn");
+            rope.put("factor", yarn.f64("factor"));
+            rope.put("beta_fast", yarn.f64("beta"));
+            rope.put("beta_slow", yarn.f64("alpha"));
+            rope.put("original_max_position_embeddings", yarn.f64("original_max_position_embeddings"));
+            return mapped.withFlat(Collections.singletonMap("rope_parameters", rope));
+        }
+        return mapped;
+    }
+
+    /**
+     * The hparam remap of {@code MistralMoeModel.__init__} (mistral.py:129-168) without the yarn bridge: the
+     * top-level and {@code moe} keys remap to their DeepseekV2 names, the defaults fill the missing ones, and MoE
+     * routing takes {@code topk_method = None}, {@code norm_topk_prob = True} and {@code scoring_func = softmax}.
+     * Subclasses that do not read the yarn block, such as Mistral Large 4, compose this step.
+     *
+     * @throws GgufFormatException when the {@code moe} block is not an object
+     */
+    public static HfConfig remap(HfConfig cfg) {
         Map<String, Object> fix = new LinkedHashMap<>();
         putIfPresent(fix, "hidden_size", cfg, "dim");
         putIfPresent(fix, "rms_norm_eps", cfg, "norm_eps");
@@ -68,10 +93,9 @@ public final class HfMistralMoeHooks {
         putDefault(fix, "hidden_act", cfg, "activation", "silu");
         putDefault(fix, "tie_word_embeddings", cfg, "tied_embeddings", false);
         Object maxPos = cfg.flat().get("max_position_embeddings");
-        fix.put("max_seq_len", maxPos != null ? maxPos : 128_000L);
-        if (maxPos == null) {
-            fix.put("max_position_embeddings", 128_000L);
-        }
+        Object maxSeq = cfg.flat().get("max_seq_len");
+        fix.put("max_seq_len", maxSeq != null ? maxSeq : maxPos != null ? maxPos : 128_000L);
+        fix.put("max_position_embeddings", maxPos != null ? maxPos : 128_000L);
         Object moe = cfg.flat().get("moe");
         if (moe instanceof Map) {
             Map<String, Object> moeCfg = (Map<String, Object>) moe;
@@ -88,17 +112,6 @@ public final class HfMistralMoeHooks {
         fix.put("topk_method", null);
         fix.put("norm_topk_prob", true);
         fix.put("scoring_func", "softmax");
-        JsonView root = cfg.raw();
-        if (root.raw("yarn") != null) {
-            JsonView yarn = root.obj("yarn");
-            Map<String, Object> rope = new LinkedHashMap<>();
-            rope.put("rope_type", "yarn");
-            rope.put("factor", yarn.f64("factor"));
-            rope.put("beta_fast", yarn.f64("beta"));
-            rope.put("beta_slow", yarn.f64("alpha"));
-            rope.put("original_max_position_embeddings", yarn.f64("original_max_position_embeddings"));
-            fix.put("rope_parameters", rope);
-        }
         return cfg.withFlat(fix);
     }
 
@@ -172,8 +185,9 @@ public final class HfMistralMoeHooks {
 
     /**
      * {@code MistralMoeModel.set_gguf_parameters} (mistral.py:173-182): the DeepseekV2 metadata, then the Mistral
-     * yarn configuration ({@code set_mistral_config}, mistral.py:96-107), the attention temperature length from the
-     * yarn block's original context, and the constant yarn log multiplier {@code 0.1}.
+     * yarn configuration and the {@code llama_4_scaling.beta} attention temperature scale ({@code set_mistral_config},
+     * mistral.py:96-111), the attention temperature length from the yarn block's original context, and the constant
+     * yarn log multiplier {@code 0.1}.
      *
      * @throws GgufFormatException when the yarn block lacks a value or the base metadata misses one
      */
@@ -190,6 +204,9 @@ public final class HfMistralMoeHooks {
             kv.set(GgufKeys.ROPE_SCALING_YARN_LOG_MUL, 0.1);
             kv.set(GgufKeys.ROPE_SCALING_ORIG_CTX_LEN, yarn.i64("original_max_position_embeddings"));
             kv.set(GgufKeys.ATTENTION_TEMPERATURE_LENGTH, yarn.i64("original_max_position_embeddings"));
+        }
+        if (root.raw("llama_4_scaling") != null) {
+            kv.set(GgufKeys.ATTENTION_TEMPERATURE_SCALE, root.obj("llama_4_scaling").f64("beta"));
         }
     }
 

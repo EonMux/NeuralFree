@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.hparams.hooks;
 
 import com.eonmux.neuralfree.gguf.arch.GatingFunc;
+import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
 import com.eonmux.neuralfree.gguf.hparams.HparamsSupport;
@@ -112,9 +113,9 @@ public final class HybridHooksSsm {
     /**
      * nemotron-h.cpp:5-29 (nemotron_h_moe reuses it, models.h:1685-1689). A trunk layer is a Mamba-2 layer
      * when it has neither KV heads nor an FFN, an attention layer when it has KV heads and no FFN, and an FFN
-     * layer otherwise (nemotron-h.cpp:85-147); FFN layers are MoE when experts exist, and NextN blocks always
-     * carry the MoE sub-layer (nemotron-h.cpp:149-190). Routing uses sigmoid gating regardless of metadata
-     * (nemotron-h.cpp:324).
+     * layer otherwise (nemotron-h.cpp:85-147); FFN layers are MoE when experts exist, and a MoE build's NextN blocks
+     * carry the MoE sub-layer while a dense build's NextN block is attention only (nemotron-h.cpp:149-190, vLLM
+     * {@code NemotronHMTPModel}). Routing uses sigmoid gating regardless of metadata (nemotron-h.cpp:324).
      */
     public static void nemotronH(ModelHparamsBuilder b, GgufKv kv) {
         HybridHooks.readSsm(b, kv, true);                             // nemotron-h.cpp:6-10
@@ -139,10 +140,14 @@ public final class HybridHooksSsm {
             }
         }
         b.moeLayers(moe);
-        for (int il = b.nLayer(); il < b.nLayerAll(); il++) {
-            if (b.nFfExp(il) == 0 && b.nExpertUsed(il) == 0) {        // nemotron-h.cpp:157-160
-                throw HybridHooks.invalid(b, "NextN layer " + il + " declares neither expert_feed_forward_length"
-                        + " nor expert_used_count, cannot determine the expert FFN size");
+        if (b.nExpert() > 0) {
+            // an MoE build folds an expert FFN into every NextN block (nemotron-h.cpp:157-160); a dense build's
+            // NextN block is attention only (vLLM NemotronHMTPModel, mtp_hybrid_override_pattern "*")
+            for (int il = b.nLayer(); il < b.nLayerAll(); il++) {
+                if (b.nFfExp(il) == 0 && b.nExpertUsed(il) == 0) {
+                    throw HybridHooks.invalid(b, "NextN layer " + il + " declares neither expert_feed_forward_length"
+                            + " nor expert_used_count, cannot determine the expert FFN size");
+                }
             }
         }
         requireMamba2Heads(b);
@@ -155,6 +160,91 @@ public final class HybridHooksSsm {
             throw HybridHooks.invalid(b, "ssm.inner_size " + b.ssmDInner() + " must be twice the embedding length "
                     + b.nEmbd() + "; only an expansion factor of 2 is supported (" + where + ")");
         }
+    }
+
+    /**
+     * Zamba2 (vLLM {@code Zamba2ForCausalLM}): every block runs a Mamba-2 mixer, and the blocks the
+     * {@code shared_blocks.hybrid_layers} array marks also run a shared attention/MLP block first. The hybrid layers
+     * take the shared blocks cyclically ({@code hybrid_ordinal % shared_blocks.count}, vLLM
+     * {@code Zamba2Model.__init__}), and each use adds its own adapters. RoPE applies to the hybrid layers only when
+     * {@code shared_blocks.memory_rope} is set ({@code use_mem_rope}).
+     */
+    public static void zamba2(ModelHparamsBuilder b, GgufKv kv) {
+        HybridHooks.readSsm(b, kv, true);
+        HybridHooks.readRmsEps(b, kv);
+        requireMamba2Heads(b);
+        int n = b.nLayerAll();
+        boolean[] hybrid = HybridHooks.readLayerFlags(kv, GgufKeys.SHARED_BLOCKS_HYBRID_LAYERS, n);
+        if (hybrid == null) {
+            throw new GgufFormatException("required metadata key '" + kv.key(GgufKeys.SHARED_BLOCKS_HYBRID_LAYERS)
+                    + "' is missing");
+        }
+        int memBlocks = kv.u32Required(GgufKeys.SHARED_BLOCKS_COUNT);
+        int rank = kv.u32Required(GgufKeys.SHARED_BLOCKS_ADAPTER_RANK);
+        boolean attentionAdapter = kv.bool(GgufKeys.SHARED_BLOCKS_ATTENTION_ADAPTER, false);
+        boolean memoryRope = kv.bool(GgufKeys.SHARED_BLOCKS_MEMORY_ROPE, false);
+        int hybridCount = 0;
+        for (boolean h : hybrid) {
+            hybridCount += h ? 1 : 0;
+        }
+        if (hybridCount == 0) {
+            throw HybridHooks.invalid(b, "metadata key '" + kv.key(GgufKeys.SHARED_BLOCKS_HYBRID_LAYERS)
+                    + "' marks no hybrid layer; a Zamba2 model needs at least one shared transformer block");
+        }
+        if (memBlocks < 1 || memBlocks > hybridCount) {
+            throw HybridHooks.invalid(b, "shared_blocks.count " + memBlocks + " must be in [1, " + hybridCount
+                    + "], the number of hybrid layers (vLLM Zamba2Model cycles the blocks over them)");
+        }
+        if (rank < 1) {
+            throw HybridHooks.invalid(b, "shared_blocks.adapter_rank " + rank + " must be positive; the shared"
+                    + " MLP always adds its per-use adapter");
+        }
+        int nHead = b.nHead(0);
+        int headK = b.headKFull();
+        if (nHead <= 0 || headK != 2L * b.nEmbd() / nHead || (2L * b.nEmbd()) % nHead != 0) {
+            throw HybridHooks.invalid(b, "attention.key_length " + headK + " must be 2 * embedding_length / "
+                    + "attention.head_count (" + (2L * b.nEmbd()) + " / " + nHead + "), the shared attention's"
+                    + " per-head width (vLLM Zamba2Config.attention_head_dim)");
+        }
+        if (headK % 2 != 0) {
+            throw HybridHooks.invalid(b, "attention.key_length " + headK + " must be even: the shared attention"
+                    + " scales by (head_dim / 2) ** -0.5 and rotates whole heads");
+        }
+        if (b.headVFull() != headK) {
+            throw HybridHooks.invalid(b, "attention.value_length " + b.headVFull() + " must equal attention.key_length "
+                    + headK + "; the shared attention has one width per head");
+        }
+        for (int il = 0; il < n; il++) {
+            if (hybrid[il] && b.nHeadKv(il) != nHead) {
+                throw HybridHooks.invalid(b, "layer " + il + " attention.head_count_kv " + b.nHeadKv(il)
+                        + " must equal attention.head_count " + nHead + ": the shared attention's q/k/v adapters"
+                        + " and projections all have 2 * embedding_length outputs (vLLM Zamba2Attention)");
+            }
+        }
+        if (memoryRope && b.nRotFull() != headK) {
+            throw HybridHooks.invalid(b, "rope.dimension_count " + b.nRotFull() + " must be attention.key_length "
+                    + headK + "; the shared attention rotates the whole head (use_mem_rope)");
+        }
+        boolean[] recr = new boolean[n];
+        Arrays.fill(recr, true);
+        b.isRecurrentArray(recr);
+        boolean[] rope = new boolean[n];
+        Arrays.fill(rope, memoryRope);
+        b.ropeEnabledArray(rope);
+        int[] blocks = new int[n];
+        Arrays.fill(blocks, -1);
+        int ordinal = 0;
+        for (int il = 0; il < n; il++) {
+            if (hybrid[il]) {
+                blocks[il] = ordinal++ % memBlocks;
+            }
+        }
+        b.isHybridLayerArray(hybrid);
+        b.zamba2SharedBlockArray(blocks);
+        b.zamba2MemBlocks(memBlocks);
+        b.zamba2AdapterRank(rank);
+        b.zamba2AttentionAdapter(attentionAdapter);
+        b.zamba2MemoryRope(memoryRope);
     }
 
     /**

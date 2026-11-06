@@ -81,6 +81,10 @@ public final class CpuRwkv7Mixer implements CpuMixer {
 
     private float[] shift;
     private float[] state;
+    /** Floats of one state slot and the slots the memory keeps ({@code RecurrentStateAccessor}). */
+    private int shiftRow;
+    private int stateRow;
+    private int stateSlots;
 
     private float[] planes;
     private float[] r;
@@ -170,6 +174,9 @@ public final class CpuRwkv7Mixer implements CpuMixer {
     private void bindWorking(RwkvBlocks.CpuKit kt, int c, int loraDim) {
         shift = kt.state(LayerMemoryPlan.STATE_SHIFT);
         state = kt.state(LayerMemoryPlan.STATE_SCAN);
+        shiftRow = kt.stateRow(LayerMemoryPlan.STATE_SHIFT);
+        stateRow = kt.stateRow(LayerMemoryPlan.STATE_SCAN);
+        stateSlots = kt.stateSlots();
         CpuWkv.checkRows("RWKV7 shift state", shift, 0, 1, c);
         CpuWkv.checkRows("RWKV7 WKV state", state, 0, nHead * headSize, headSize);
         planes = kt.temp("rwkv7.planes", nMix * c);
@@ -190,7 +197,7 @@ public final class CpuRwkv7Mixer implements CpuMixer {
 
     @Override
     public void decode(int pos, float[] in, float[] out) {
-        prefill(pos, 1, in, out);
+        forward(1, 0, 0, 0, in, out);
     }
 
     /**
@@ -202,14 +209,59 @@ public final class CpuRwkv7Mixer implements CpuMixer {
      */
     @Override
     public void prefill(int pos0, int n, float[] in, float[] out) {
+        forward(n, 0, 0, 0, in, out);
+    }
+
+    /**
+     * One batched step over the rows of {@code s}: one segment runs whole ({@link #forward} at its sequence's state
+     * rows), several segments run one at a time through a scratch relay, each with its own sequence's shift and WKV
+     * state rows.
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        if (s.nSeg() == 1) {
+            forward(s.nTokens(), 0, 0, s.seq(0), in, out);
+            return;
+        }
+        if (closed || kit == null) {
+            throw new IllegalStateException("RWKV7 time mix is " + (closed ? "closed" : "not bound"));
+        }
+        int c = nEmbd;
+        float[] buf = kit.temp(TEMP_SEGMENT, c);
+        float[] bufOut = kit.temp(TEMP_SEGMENT_OUT, c);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            int len = s.len(seg);
+            System.arraycopy(in, start * c, buf, 0, len * c);
+            forward(len, 0, 0, s.seq(seg), buf, bufOut);
+            System.arraycopy(bufOut, 0, out, start * c, len * c);
+        }
+    }
+
+    private static final String TEMP_SEGMENT = "rwkv7.segmentIn";
+    private static final String TEMP_SEGMENT_OUT = "rwkv7.segmentOut";
+
+    /** The state slot of {@code seq}, validated against the memory's slots. */
+    private int stateSlot(int seq) {
+        if (seq < 0 || seq >= stateSlots) {
+            throw new UnsupportedOperationException("RWKV7 time mix runs sequence " + seq + ", the memory keeps "
+                    + stateSlots + " state slots");
+        }
+        return seq;
+    }
+
+    private void forward(int n, int inOff, int outOff, int seq, float[] in, float[] out) {
         if (closed || kit == null) {
             throw new IllegalStateException("RWKV7 time mix is " + (closed ? "closed" : "not bound"));
         }
         int c = nEmbd;
         kit.checkStep(n, in, out, c);
+        int base = stateSlot(seq);
+        int sb = base * shiftRow;
+        int kb = base * stateRow;
         int plane = n * c;
-        CpuRwkvMix.tokenShiftLerp(n, c, nMix, RwkvKernels.SHIFT_MODE_LERP, in, 0, shift, 0, null, lerpFused, planes,
-                0);
+        CpuRwkvMix.tokenShiftLerp(n, c, nMix, RwkvKernels.SHIFT_MODE_LERP, in, inOff, shift, sb, null, lerpFused,
+                planes, 0);
         mv.matmul(wr, planes, PLANE_R * plane, r, 0, n);
         rDeltas.applyRows(n, planes, PLANE_R * plane, r, 0);
         mv.matmul(w1, planes, PLANE_W * plane, lora, 0, n);
@@ -230,7 +282,7 @@ public final class CpuRwkv7Mixer implements CpuMixer {
         kit.project(a2, a0, lora, 0, a, n);
         CpuOps.unary(ActOp.SIGMOID, ActParams.NONE, a, 0, a, 0, plane);
         CpuRwkvMix.kkPrep(n, nHead, headSize, k, 0, kK, kA, a, 0, tmp, 0, tmp2, 0, aa, 0, bb, 0);
-        CpuWkv.wkv7(n, c, nHead, r, 0, w, 0, tmp2, 0, v, 0, aa, 0, bb, 0, state, 0, y, 0);
+        CpuWkv.wkv7(n, c, nHead, r, 0, w, 0, tmp2, 0, v, 0, aa, 0, bb, 0, state, kb, y, 0);
         if (ln != null) {
             NormMath.rowNorm(NormKind.LAYER, RwkvBlocks.GROUP_NORM_EPS, n * nHead, headSize, headSize, nHead, y, 0,
                     ln, lnB, y, 0);
@@ -239,8 +291,8 @@ public final class CpuRwkv7Mixer implements CpuMixer {
         if (gating) {
             CpuOps.glu(GluOp.MUL, ActParams.NONE, y, 0, g, 0, y, 0, plane);
         }
-        mv.matmul(wo, y, 0, out, 0, n);
-        oDeltas.applyRows(n, y, 0, out, 0);
+        mv.matmul(wo, y, 0, out, outOff, n);
+        oDeltas.applyRows(n, y, 0, out, outOff);
     }
 
     /** Layer 0 stores {@code v}; later layers compute {@code v += (v_first - v) * sigmoid(V2 V1 x_v + v0)}. */

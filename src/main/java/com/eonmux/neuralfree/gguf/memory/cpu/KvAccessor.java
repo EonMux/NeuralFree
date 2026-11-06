@@ -34,6 +34,24 @@ public interface KvAccessor {
     void readK(int row, int head, float[] dst, int off);
 
     /**
+     * Dequantizes K values {@code [from, from + n)} of row {@code row} into {@code dst[off, off + n)}, a view of part
+     * of a stored row (for example the compressed KV of a DeepSeek-V4.1 row that also holds the index key).
+     *
+     * <p>The default serves a whole single-head row and refuses a partial range; a cache that stores several value
+     * groups in one row overrides it.</p>
+     *
+     * @throws IndexOutOfBoundsException     for a row, range or destination range outside the cache
+     * @throws UnsupportedOperationException for a partial range on an accessor without a slice reader
+     */
+    default void readKSlice(int row, int from, int n, float[] dst, int off) {
+        if (from != 0 || n != headDimK()) {
+            throw new UnsupportedOperationException("partial K rows [" + from + ", " + (from + n)
+                    + ") are not readable from " + getClass().getSimpleName());
+        }
+        readK(row, 0, dst, off);
+    }
+
+    /**
      * Dequantizes V head {@code head} of row {@code row} into {@code dst[off, off + headDimV)}.
      *
      * @throws IndexOutOfBoundsException for a row, head or destination range outside the cache
@@ -59,6 +77,15 @@ public interface KvAccessor {
      * @throws UnsupportedOperationException for a latent cache, whose V is part of the K row
      */
     void writeV(int row, float[] src, int off);
+
+    /**
+     * The raw int8 view of this cache, or null when its K and V rows are not both {@code INT8_PER_TOKEN_HEAD}. The
+     * fused int8 attention reads a key or value row in its stored format through the view instead of dequantizing it
+     * first.
+     */
+    default KvInt8Rows int8Rows() {
+        return null;
+    }
 
     /**
      * Moves {@code n} whole rows starting at {@code srcRow} to the same-width run starting at {@code dstRow}

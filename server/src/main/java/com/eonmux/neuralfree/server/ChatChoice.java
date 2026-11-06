@@ -12,25 +12,37 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * One chat choice on its way to the client: reasoning text, content run through the request's {@link ToolOutput}
+ * One chat choice on its way to the client: reasoning text (dropped when the request set
+ * {@code include_reasoning} false), content run through the request's {@link ToolOutput}
  * and the tool calls it reads. Each event yields the OpenAI {@code delta} objects it adds ({@link #drain}); the
  * logprobs capture of a piece rides its first delta, or an empty delta when the tool parser held the text back.
- * {@link #finish} closes the output and returns the final message parts. Not thread-safe: one choice, one
+ * {@link #finish} closes the output and returns the final message parts. Reasoning carries both vLLM's
+ * {@code reasoning} and llama.cpp's {@code reasoning_content}. A content fallback (the reasoning released
+ * again as the content of an answer without one) streams both copies, while the assembled message keeps the
+ * reasoning as its content only ({@link #messageReasoning}), as vLLM's non-streamed swap does. Not thread-safe: one choice, one
  * thread.
  */
 final class ChatChoice implements ToolCallStream.Listener {
 
-    /** One streamed delta and the logprobs capture it carries, or null. */
-    record Delta(Map<String, Object> delta, TokenScore[] logprobs) { }
+    /** One streamed delta, the logprobs capture it carries (or null) and its token id (or null). */
+    record Delta(Map<String, Object> delta, TokenScore[] logprobs, Integer tokenId) {
+
+        Delta(Map<String, Object> delta, TokenScore[] logprobs) {
+            this(delta, logprobs, null);
+        }
+    }
 
     private final ToolOutput tools;
+    private final boolean includeReasoning;
     private final StringBuilder reasoning = new StringBuilder();
     private final List<TokenScore[]> logprobs = new ArrayList<>();
     private final List<Delta> pending = new ArrayList<>();
     private ToolParse result;
+    private boolean contentFallback;
 
-    ChatChoice(ToolOutput tools) {
+    ChatChoice(ToolOutput tools, boolean includeReasoning) {
         this.tools = tools;
+        this.includeReasoning = includeReasoning;
     }
 
     /** Routes one event of the choice; its deltas wait in {@link #drain}. */
@@ -39,27 +51,42 @@ final class ChatChoice implements ToolCallStream.Listener {
             tools.toolCallStarted(r.recipient(), this);
             return;
         }
+        if (event instanceof GenerationBatch.ContentFallback) {
+            contentFallback = true;
+            return;
+        }
         if (!(event instanceof GenerationBatch.Text t)) {
             return;
         }
         int before = pending.size();
         switch (t.channel()) {
             case REASONING -> {
-                reasoning.append(t.text());
-                if (!t.text().isEmpty()) {
-                    pending.add(new Delta(Map.of("reasoning_content", t.text()), null));
+                if (includeReasoning) {
+                    reasoning.append(t.text());
+                    if (!t.text().isEmpty()) {
+                        pending.add(new Delta(reasoningDelta(t.text()), null, t.tokenId()));
+                    }
                 }
+                // include_reasoning false: the reasoning never reaches the response (vLLM drops it);
+                // the token's logprobs capture below still rides its empty delta
             }
             case TOOL_CALL -> tools.toolCallText(t.text(), this);
-            default -> tools.content(t.text(), this);
+            default -> {
+                int at = pending.size();
+                tools.content(t.text(), this);
+                if (pending.size() > at) {
+                    Delta first = pending.get(at);
+                    pending.set(at, new Delta(first.delta(), first.logprobs(), t.tokenId()));
+                }
+            }
         }
         if (t.logprobs() != null) {
             logprobs.add(t.logprobs());
             if (pending.size() > before) {
                 Delta first = pending.get(before);
-                pending.set(before, new Delta(first.delta(), t.logprobs()));
+                pending.set(before, new Delta(first.delta(), t.logprobs(), first.tokenId()));
             } else {
-                pending.add(new Delta(Map.of(), t.logprobs()));
+                pending.add(new Delta(Map.of(), t.logprobs(), t.tokenId()));
             }
         }
     }
@@ -79,9 +106,27 @@ final class ChatChoice implements ToolCallStream.Listener {
         return out;
     }
 
-    /** The reasoning text. */
+    /** The reasoning text, as streamed. */
     String reasoning() {
         return reasoning.toString();
+    }
+
+    /** The delta carrying {@code text} as vLLM's {@code reasoning} and llama.cpp's {@code reasoning_content}. */
+    static Map<String, Object> reasoningDelta(String text) {
+        Map<String, Object> delta = new LinkedHashMap<>();
+        delta.put("reasoning_content", text);
+        delta.put("reasoning", text);
+        return delta;
+    }
+
+    /** The reasoning of the assembled message: empty when it became the content (a content fallback). */
+    String messageReasoning() {
+        return contentFallback ? "" : reasoning.toString();
+    }
+
+    /** Whether the reasoning was released again as the content. */
+    boolean contentFallback() {
+        return contentFallback;
     }
 
     /** Every logprobs capture, in token order. */

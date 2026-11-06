@@ -1,10 +1,16 @@
 package com.eonmux.neuralfree.gguf;
 
+import com.eonmux.neuralfree.gguf.audio.AudioClip;
+import com.eonmux.neuralfree.gguf.audio.SpeechFormat;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
+import com.eonmux.neuralfree.gguf.engine.ClassifierOutput;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.DiffusionConfig;
+import com.eonmux.neuralfree.gguf.engine.EmbedsPrompt;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
+import com.eonmux.neuralfree.gguf.engine.MediaPrompt;
+import com.eonmux.neuralfree.gguf.engine.PagedEvaluations;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -15,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Common interface for LLM model implementations (CPU and GPU).
@@ -121,7 +128,7 @@ public interface LLMModel extends Closeable {
         MEAN,  // average across sequence
         CLS,   // use first token only (BERT-style)
         LAST,  // use last token (some retrieval models)
-        RANK   // ranking head (not supported)
+        RANK   // ranking classifier over the pooled row
     }
 
     /**
@@ -164,6 +171,31 @@ public interface LLMModel extends Closeable {
                         + "this is a decoder-only model (" + architecture() + ")");
     }
 
+    /**
+     * The pooled output row of every token sequence of {@code sequences} (MEAN / CLS / LAST pooling, the RANK
+     * classifier scores), through the dense projections: llama.cpp's parallel-sequence embedding batch, one output
+     * row per sequence in order, each sequence embedded from position 0 on its own. The default embeds the sequences
+     * one after another through {@link #encode(int[])}; an implementation over a paged memory runs them as
+     * multi-sequence forwards packed to the memory's sequences ({@code neuralfree.parallel}) and context.
+     *
+     * @throws UnsupportedOperationException for NONE pooling, whose output is one embedding per token with no row
+     *                                       per sequence ({@link #encodeTokens(int[])})
+     * @throws IllegalArgumentException      when the batch or one of its sequences is empty
+     * @throws IOException                   when the model fails to encode
+     */
+    default float[][] encodeBatch(int[][] sequences) throws IOException {
+        PagedEvaluations.checkSequences(sequences);
+        if (poolingType() == PoolingType.NONE) {
+            throw new UnsupportedOperationException("batched encode pools one row per sequence; "
+                    + architecture() + " pools by NONE and embeds per token");
+        }
+        float[][] out = new float[sequences.length][];
+        for (int i = 0; i < sequences.length; i++) {
+            out[i] = encode(sequences[i]);
+        }
+        return out;
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Engine API
     // ---------------------------------------------------------------------------------------------
@@ -204,7 +236,9 @@ public interface LLMModel extends Closeable {
      *                                       encoder-decoder source exceeds {@link #contextLength()}
      * @throws UnsupportedOperationException when the request needs typical-p, presence or frequency penalties, a
      *                                       repetition penalty below 1, a fixed seed for non-greedy sampling,
-     *                                       ignore-eos or cancellation, which the legacy API cannot express
+     *                                       ignore-eos, cancellation, {@code stop_token_ids},
+     *                                       {@code allowed_token_ids}, {@code skip_special_tokens} false or
+     *                                       {@code repetition_detection}, which the legacy API cannot express
      */
     default GenerationResult generate(int[] prompt, GenerationRequest request, TokenCallback callback)
             throws IOException {
@@ -278,6 +312,24 @@ public interface LLMModel extends Closeable {
     }
 
     /**
+     * Generates new tokens after the precomputed embedding rows of {@code promptEmbeds} as described by
+     * {@code request}, streaming decoded text to {@code callback} (may be null): one row per context position
+     * (vLLM completions {@code prompt_embeds}), each of the model's {@code n_embd} values. The rows replace the
+     * token-table lookup; no prompt token enters the penalty history, since none carries an id.
+     *
+     * @return the generated tokens, their text, the stop reason and timings
+     * @throws ContextFullException          when the rows exceed the context
+     * @throws UnsupportedOperationException when this model cannot take embedding rows (the legacy generate API
+     *                                       without an engine backend, or a backend without an embedding-row
+     *                                       prefill)
+     */
+    default GenerationResult generateEmbeds(float[][] promptEmbeds, GenerationRequest request, TokenCallback callback)
+            throws IOException {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " (" + architecture()
+                + ") does not take precomputed prompt embeddings; generate from token ids instead");
+    }
+
+    /**
      * {@link #encode(int[])} with BERT segment ids.
      *
      * <p>The default accepts only all-zero (or null) token types, which is what {@link #encode(int[])} applies.
@@ -339,9 +391,142 @@ public interface LLMModel extends Closeable {
                 "classification not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
     }
 
+    /**
+     * Classifier outputs of one input for a decision head that reads an order (vllm-decision2, clef): output
+     * row {@code i} holds the score of the {@code i}-th option span of {@code order} (llama's decision
+     * forward, {@code llama_batch_ext_set_decision_order}); a head given an order it cannot use answers NaN.
+     * The implementations are {@code GGUFModel} and {@code GGUFModelGPU}.
+     *
+     * @param order one decision code per token ({@code ClassifierHead.DecisionOrder}), or null
+     * @throws UnsupportedOperationException when the model has no decision head
+     * @throws IllegalArgumentException      when {@code order}'s length differs from the token count
+     */
+    default float[] classify(int[] tokens, int[] order) throws IOException {
+        throw new UnsupportedOperationException(
+                "decision classification not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+    }
+
+    /**
+     * Per-token classifier scores of one input ({@code cls} / {@code cls.output} applied to every token): one row
+     * per token, one score per classifier output (vLLM's {@code token_classify}).
+     *
+     * @throws UnsupportedOperationException when the model has no token classifier
+     */
+    default float[][] tokenClassify(int[] tokens) throws IOException {
+        throw new UnsupportedOperationException(
+                "token classification not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+    }
+
+    /**
+     * The classifier output of one input: the sequence classifier's scores with their labels and the head's
+     * normalized flag ({@code ClassifierOutput}). Decision models refuse; their per-token scores come from
+     * {@link #classify(int[])}.
+     *
+     * @throws UnsupportedOperationException when the model has no sequence classifier, or is a decision model
+     */
+    default ClassifierOutput classifyOutput(int[] tokens) throws IOException {
+        throw new UnsupportedOperationException(
+                "classification not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+    }
+
+    /**
+     * {@link #classifyOutput(int[])} with the classifier's final probability activation applied or skipped, as
+     * vLLM's pooler applies or skips it per request ({@code use_activation}); {@code false} answers the raw head
+     * output, which is not normalized.
+     *
+     * @throws UnsupportedOperationException when the model has no sequence classifier, or is a decision model
+     */
+    default ClassifierOutput classifyOutput(int[] tokens, boolean activation) throws IOException {
+        if (!activation) {
+            throw new UnsupportedOperationException(
+                    "classification not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+        }
+        return classifyOutput(tokens);
+    }
+
+    /**
+     * The pooled output of one media prompt (MEAN / CLS / LAST pooling, the sequence classifier scores): the prompt's
+     * text and media rows pool as one sequence, the media rows where the projector placed them (vLLM's pooling
+     * runners over a multimodal prompt). A paged memory runs the chunks as consecutive batch forwards; any other
+     * memory refuses by name.
+     *
+     * @throws UnsupportedOperationException when the model does not pool media prompts (the implementations:
+     *                                       {@code GGUFModel}, {@code GGUFModelGPU})
+     */
+    default float[] encodeMedia(MediaPrompt prompt) throws IOException {
+        throw new UnsupportedOperationException(
+                "media prompts not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+    }
+
+    /**
+     * The classifier output of one media prompt: the sequence classifier's scores over the pooled row of the prompt's
+     * text and media rows (vLLM's {@code JinaVLForSequenceClassification} reranker over a media prompt). The same
+     * memory rule as {@link #encodeMedia(MediaPrompt)}.
+     *
+     * @throws UnsupportedOperationException when the model has no sequence classifier over media prompts
+     */
+    default ClassifierOutput classifyOutputMedia(MediaPrompt prompt) throws IOException {
+        throw new UnsupportedOperationException(
+                "media prompts not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+    }
+
+    /**
+     * {@link #classifyOutputMedia(MediaPrompt)} with the classifier's final probability activation applied or
+     * skipped, as vLLM's pooler applies or skips it per request ({@code use_activation}); {@code false} answers
+     * the raw head output, which is not normalized.
+     *
+     * @throws UnsupportedOperationException when the model has no RANK classifier over media prompts
+     */
+    default ClassifierOutput classifyOutputMedia(MediaPrompt prompt, boolean activation) throws IOException {
+        if (!activation) {
+            throw new UnsupportedOperationException(
+                    "media prompts not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+        }
+        return classifyOutputMedia(prompt);
+    }
+
     /** Classifier output labels ({@code classifier.output_labels}); empty when the model has none. */
     default String[] classLabels() {
         return new String[0];
+    }
+
+    /**
+     * The next-token logits over the whole vocabulary after {@code tokens} (one prompt of a generative decoder),
+     * as vLLM's generative scoring reads them.
+     *
+     * @throws UnsupportedOperationException when the model does not generate token logits
+     */
+    default float[] nextLogits(int[] tokens) throws IOException {
+        throw new UnsupportedOperationException(
+                "next-token logits not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
+    }
+
+    /**
+     * The next-token logits over the whole vocabulary after the last row of a media {@code prompt}: the prompt's
+     * text and media rows run as consecutive forwards and the last row's logits are read (a decision read over
+     * images or video). The memory must be paged.
+     *
+     * @throws UnsupportedOperationException when the model does not generate token logits, or the memory is not
+     *                                       paged
+     */
+    default float[] nextLogits(MediaPrompt prompt) throws IOException {
+        throw new UnsupportedOperationException(
+                "media next-token logits not supported by " + getClass().getSimpleName() + " (" + architecture()
+                        + ")");
+    }
+
+    /**
+     * Classifier outputs of one media prompt for a decision head that reads an order (the vllm-decision2 and clef
+     * heads, and the modern-bert / lfm2 decision blocks): the prompt's text and media rows run as consecutive
+     * forwards and the head reads the resulting hidden rows. The memory must be paged.
+     *
+     * @param order one decision code per prompt row, or null
+     * @throws UnsupportedOperationException when the model has no decision head, or the memory is not paged
+     */
+    default float[] classifyMedia(MediaPrompt prompt, int[] order) throws IOException {
+        throw new UnsupportedOperationException(
+                "media decision classification not supported by " + getClass().getSimpleName() + " ("
+                        + architecture() + ")");
     }
 
     /**
@@ -387,6 +572,72 @@ public interface LLMModel extends Closeable {
                 "audio code decoding not supported by " + getClass().getSimpleName() + " (" + architecture() + ")");
     }
 
+    /**
+     * The speech decoding geometry the model declares: {@code n_fft}, {@code hop_length} and the sample rate of
+     * its spectral frames ({@link SpeechFormat}); null when the model cannot turn its features into a waveform.
+     */
+    default SpeechFormat speechFormat() {
+        return null;
+    }
+
+    /**
+     * Synthesizes the waveform of audio codec codes: the spectral features of {@link #decodeAudioCodes} through
+     * the model's declared speech geometry ({@link #speechFormat}).
+     *
+     * @throws UnsupportedOperationException when the model is not a speech decoder or declares no geometry
+     * @throws IllegalArgumentException      when a code is outside the codebook
+     */
+    default AudioClip synthesizeSpeech(int[] codes) {
+        throw new UnsupportedOperationException("speech synthesis not supported by " + getClass().getSimpleName()
+                + " (" + architecture() + ")");
+    }
+
+    /**
+     * The speech decoding geometry, refusing like {@link #synthesizeSpeech(int[])} when the model has none: a
+     * caller that needs the sample rate before it decodes (a streaming route writes its WAV header first) reads
+     * it here and receives the same refusal a synthesis would.
+     *
+     * @throws UnsupportedOperationException when the model is not a speech decoder or declares no geometry
+     */
+    default SpeechFormat requireSpeechFormat() {
+        SpeechFormat format = speechFormat();
+        if (format == null) {
+            throw new UnsupportedOperationException("speech synthesis not supported by "
+                    + getClass().getSimpleName() + " (" + architecture() + ")");
+        }
+        return format;
+    }
+
+    /**
+     * {@link #synthesizeSpeech(int[])} delivered in chunks: every clip holds consecutive samples of the one-shot
+     * result at the same rate, and concatenating them gives that result. The default delivers the one-shot clip.
+     *
+     * @throws UnsupportedOperationException as {@link #synthesizeSpeech(int[])}
+     * @throws IllegalArgumentException      as {@link #synthesizeSpeech(int[])}
+     */
+    default void synthesizeSpeech(int[] codes, Consumer<AudioClip> sink) {
+        Objects.requireNonNull(sink, "sink");
+        sink.accept(synthesizeSpeech(codes));
+    }
+
+    /** The per-request token controls the legacy generate API has no parameter for, by request field. */
+    private static List<String> legacyUnsupportedTokenControls(GenerationRequest request) {
+        List<String> out = new ArrayList<>();
+        if (request.stopTokenIds().length > 0) {
+            out.add("stop_token_ids");
+        }
+        if (request.allowedTokenIds().length > 0) {
+            out.add("allowed_token_ids");
+        }
+        if (!request.skipSpecialTokens()) {
+            out.add("skip_special_tokens false");
+        }
+        if (request.repetitionDetection().enabled()) {
+            out.add("repetition_detection");
+        }
+        return out;
+    }
+
     /** Request features the legacy generate API has no parameter for. */
     private static List<String> legacyUnsupported(GenerationRequest request) {
         SamplerConfig s = request.sampler();
@@ -409,6 +660,7 @@ public interface LLMModel extends Closeable {
         if (request.cancellable()) {
             out.add("cancellation");
         }
+        out.addAll(legacyUnsupportedTokenControls(request));
         return out;
     }
 }

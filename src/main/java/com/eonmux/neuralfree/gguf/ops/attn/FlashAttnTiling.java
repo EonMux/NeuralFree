@@ -5,13 +5,13 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 /**
  * Tile plan of the flash-attention kernels for one attention shape on one device. Immutable.
  *
- * <p>{@link #decode} plans {@code LLM_FlashDecode_*}: {@code g_tile} query heads per workgroup (GQA packing, each K/V
- * row read once per tile). The split over keys is chosen per step from the live key count ({@link #decodeSplit}), as
+ * <p>{@link #decode} plans {@code LLM_FlashDecode_*}: one query head per workgroup, so a launch holds
+ * {@code n_head} workgroups before splitting (the GQA group's K/V rows come from L2 across the concurrently running
+ * workgroups). The split over keys is chosen per step from the live key count ({@link #decodeSplit}), as
  * llama.cpp sizes {@code parallel_blocks} from the live KV length and the SM count
  * (ggml-cuda/fattn-common.cuh:1141-1214): a step over {@code n} keys aims at two workgroups per compute unit, with
  * {@code split_len} between {@link #minSplitLen()} and {@link #maxSplitLen()}. Shared memory holds
- * {@code g_tile * (d_k + split_len) <= g_tile * (d_k + maxSplitLen)} floats; the output accumulators hold
- * {@code g_tile * d_v <= 128 * 32} values.
+ * {@code d_k + split_len + PASS2_GROUPS * d_v} floats; the output accumulators hold {@code d_v <= 128 * 32} values.
  *
  * <p>{@link #prefill} plans {@code LLM_FlashAttn_*}: {@code R = bq * g_tile} query rows per workgroup, key tiles of
  * {@code bk}, head dimension staged in chunks of {@value #CHUNK}. Shared memory holds
@@ -36,6 +36,8 @@ public final class FlashAttnTiling {
         DECODE,
         /** {@code LLM_FlashAttn_*} over many query rows. */
         TILED,
+        /** {@code LLM_FlashAttnMma_*} over many query rows on a tensor-core backend. */
+        MMA,
         /** Prefill through {@code LLM_FlashDecode_*}, one call per query row (tiled budget infeasible). */
         PER_ROW_DECODE
     }
@@ -54,7 +56,10 @@ public final class FlashAttnTiling {
         public int count() { return count; }
         /** {@code split_len}. */
         public int length() { return length; }
-        /** True when one split covers the range, so the kernel writes the output itself ({@code direct_out = 1}). */
+        /**
+         * True when one split covers the range, so the kernel writes the output itself ({@link AttnKernels#FLAG_DIRECT}
+         * set).
+         */
         public boolean direct() { return count == 1; }
 
         @Override
@@ -69,24 +74,45 @@ public final class FlashAttnTiling {
     public static final int CHUNK = 64;
     /** Largest head dim for which a plan is guaranteed. */
     public static final int MAX_HEAD_DIM = 1024;
-    /** Output accumulators of one workgroup ({@code NF_FA_WG * NF_FA_ACC_MAX}). */
+    /** Output accumulators of one workgroup ({@code NF_FA_WG * NF_FA_ACC_MAX}); the tiled and MMA kernels' pair bound. */
     public static final int ACC_PER_GROUP = LlmKernelConstants.FA_WG * LlmKernelConstants.FA_ACC_MAX;
+    /**
+     * Output pairs of one decode workgroup ({@code (NF_FA_WG / (NF_FA_WG / 32)) * NF_FA_ACC_MAX}): the value pass
+     * spreads the {@code g_tile * d_v} pairs over each lane group's 32 items (pair pi at lane {@code pi % 32},
+     * accumulator {@code pi / 32}), so every lane group can hold the full accumulator for its key stream.
+     */
+    public static final int DECODE_ACC_PER_GROUP = (LlmKernelConstants.FA_WG / (LlmKernelConstants.FA_WG / 32))
+            * LlmKernelConstants.FA_ACC_MAX;
     /** Largest {@code g_tile} ({@code NF_FD_MAX_G}). */
     public static final int MAX_G_TILE = LlmKernelConstants.FD_MAX_G;
 
     /** Decode splits are multiples of this many keys. */
     static final int SPLIT_QUANTUM = 32;
     /**
-     * Decode splits are at least this long when shared memory allows: one key per work-item, the granularity of
-     * llama.cpp's vector decode kernel ({@code nbatch_fa = D}, 128 for the common head dim, fattn-vec.cuh:543).
+     * Decode splits are at least this long when shared memory allows: the split quantum, so short contexts
+     * still split over several workgroups (llama.cpp picks {@code parallel_blocks} from the live key count the
+     * same way, fattn-common.cuh:1141-1214).
      */
-    static final int MIN_SPLIT = LlmKernelConstants.FA_WG;
+    static final int MIN_SPLIT = SPLIT_QUANTUM;
+    /**
+     * Lane groups of one decode workgroup ({@code NF_FA_WG / 32}) that share the value pass's key loop;
+     * their accumulators occupy this many times {@code g_tile * d_v} shared floats.
+     */
+    public static final int PASS2_GROUPS = LlmKernelConstants.FA_WG / 32;
     /** Upper bound of prefill splits per call. */
     static final int MAX_PREFILL_SPLITS = 16;
     /** A prefill split covers at least this many key tiles. */
     static final int MIN_TILES_PER_SPLIT = 4;
     private static final int[] BQ_CHOICES = {32, 16, 8, 4, 2, 1};
     private static final int[] BK_CHOICES = {32, 16};
+    /** Query rows per mma work-group ({@code NF_FM_BM}); {@code bq * g_tile == MMA_ROWS} always. */
+    public static final int MMA_ROWS = 64;
+    /** Keys per mma tile ({@code NF_FM_BN}). */
+    public static final int MMA_BK = 32;
+    /** Largest mma head dim (d_k and d_v multiples of 16 of at most this). */
+    public static final int MMA_MAX_HEAD_DIM = 128;
+    /** Head tiles of the mma plan: at most this many query heads per work-group. */
+    public static final int MMA_MAX_G_TILE = 8;
 
     private final Plan plan;
     private final int nHead;
@@ -184,6 +210,38 @@ public final class FlashAttnTiling {
     }
 
     /**
+     * Tensor-core prefill plan ({@link Plan#MMA}, kernel {@code LLM_FlashAttnMma_*}): the mma work-group carries
+     * {@value MMA_ROWS} query rows ({@code bq * g_tile == MMA_ROWS}, {@code g_tile <= MMA_MAX_G_TILE}) over key
+     * tiles of {@value MMA_BK}; the head dims must be positive multiples of 16 of at most {@value
+     * #MMA_MAX_HEAD_DIM} and the staged tiles must fit {@code smemFloats}. Null when the shape does not support
+     * the mma kernel, so the caller keeps the {@link #prefill} plan.
+     *
+     * @throws IllegalArgumentException for shapes that fail the shared validation (a supported shape never does)
+     */
+    public static FlashAttnTiling mma(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
+                                      int computeUnits) {
+        validate(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
+        if (dK > MMA_MAX_HEAD_DIM || dV > MMA_MAX_HEAD_DIM || dK % 16 != 0 || dV % 16 != 0
+                || mmaSmemFloats(dK, dV) > smemFloats) {
+            return null;
+        }
+        int g0 = nHead / nHeadKv;
+        int gTile = Math.min(Math.min(g0, MMA_MAX_G_TILE), MMA_ROWS);
+        while (MMA_ROWS % gTile != 0) {
+            gTile--;
+        }
+        int bq = MMA_ROWS / gTile;
+        return new FlashAttnTiling(Plan.MMA, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
+                gTile, nKvMax, 0, 0, 0, 0, bq, MMA_BK);
+    }
+
+    /** Shared-memory floats the mma kernel stages for d_k and d_v (kernels/llm/flash_mma.cl nf_fm_smem_floats). */
+    public static long mmaSmemFloats(int dK, int dV) {
+        long halves = (long) MMA_ROWS * (dK + 8) + (long) MMA_BK * (dK + 8) + (long) dV * (MMA_BK + 8);
+        return (halves + 2 * MMA_BK + WG) / 2;
+    }
+
+    /**
      * Decode plan over a batch's paged decode sequences one launch: the plan constraints of {@link #decode}, with
      * the split length chosen over {@code maxKvLen}, the largest per-sequence slot range any step scans (the
      * longest {@code seq_kv_len}; {@link #decodeSplit} sizes each step from that sequence's live length, and every
@@ -208,23 +266,18 @@ public final class FlashAttnTiling {
     private static FlashAttnTiling planDecode(Plan plan, int nHead, int nHeadKv, int dK, int dV, int nKvMax,
                                               int smemFloats, int computeUnits) {
         int g0 = nHead / nHeadKv;
-        int g = 0;
-        // Largest balanced head tile whose queries take at most half the shared floats, leaving the rest for scores.
-        for (int cap = Math.min(g0, MAX_G_TILE); cap >= 1 && g == 0; cap--) {
-            int balanced = ceilDiv(g0, ceilDiv(g0, cap));
-            if ((long) balanced * dK * 2 <= smemFloats && decodeFits(balanced, dK, dV, smemFloats)) {
-                g = balanced;
-            }
-        }
-        if (g == 0 && decodeFits(1, dK, dV, smemFloats)) {
-            g = 1;
-        }
-        if (g == 0) {
+        // One query head per work-group: the most work-groups per launch (llama.cpp's fattn-decode shape,
+        // where every query head is its own row over key splits). Short-key decode attention is bound by
+        // outstanding memory requests, not bandwidth, and the GQA group's K/V rows still come from L2
+        // across the concurrently running work-groups of one KV head.
+        if (!decodeFits(1, dK, dV, smemFloats)) {
+            // maxSplitLen shrinks as g grows, so no head tile fits either.
             throw new IllegalArgumentException("no flash-attention plan for d_k=" + dK + ", d_v=" + dV + " with "
-                    + smemFloats + " shared floats: one head needs d_k + " + SPLIT_QUANTUM
-                    + " floats and d_v <= " + ACC_PER_GROUP);
+                    + smemFloats + " shared floats: one head needs d_k + " + PASS2_GROUPS + " * d_v + "
+                    + SPLIT_QUANTUM + " floats and d_v <= " + DECODE_ACC_PER_GROUP);
         }
-        int maxLen = maxSplitLen(g, dK, smemFloats);
+        int g = 1;
+        int maxLen = maxSplitLen(g, dK, dV, smemFloats);
         int minLen = Math.min(maxLen, MIN_SPLIT);
         long groups = (long) nHeadKv * ceilDiv(g0, g);
         int wanted = (int) Math.max(1L, ceilDiv(2L * computeUnits, groups));
@@ -236,12 +289,15 @@ public final class FlashAttnTiling {
     }
 
     private static boolean decodeFits(int g, int dK, int dV, int smemFloats) {
-        return (long) g * dV <= ACC_PER_GROUP && maxSplitLen(g, dK, smemFloats) >= SPLIT_QUANTUM;
+        return (long) g * dV <= DECODE_ACC_PER_GROUP && maxSplitLen(g, dK, dV, smemFloats) >= SPLIT_QUANTUM;
     }
 
-    /** Longest decode split for {@code g} heads: {@code roundDown32((smem - g*d_k) / g)}. */
-    private static int maxSplitLen(int g, int dK, int smemFloats) {
-        long free = (long) smemFloats - (long) g * dK;
+    /**
+     * Longest decode split for {@code g} heads: {@code roundDown32((smem - g*d_k - PASS2_GROUPS*g*d_v) / g)} —
+     * the scores share the workgroup's floats with the pass-2 lane-group partials.
+     */
+    private static int maxSplitLen(int g, int dK, int dV, int smemFloats) {
+        long free = (long) smemFloats - (long) g * dK - (long) PASS2_GROUPS * g * dV;
         if (free <= 0) {
             return 0;
         }
@@ -290,16 +346,22 @@ public final class FlashAttnTiling {
     public int maxSplitLen() { return maxSplitLen; }
     /** Most decode splits any step over at most {@link #keyCapacity()} keys uses; 0 for {@link Plan#TILED}. */
     public int maxSplits() { return maxSplits; }
-    /** Query tokens per workgroup ({@code bq}); 0 unless {@link Plan#TILED}. */
+    /** Query tokens per workgroup ({@code bq}); 0 unless the plan is tiled or mma. */
     public int bq() { return bq; }
-    /** Keys per tile ({@code bk}); 0 unless {@link Plan#TILED}. */
+    /** Keys per tile ({@code bk}); 0 unless the plan is tiled or mma. */
     public int bk() { return bk; }
-    /** Query rows per workgroup: {@code bq * g_tile} for {@link Plan#TILED}, {@code g_tile} otherwise. */
-    public int rows() { return plan == Plan.TILED ? bq * gTile : gTile; }
+    /** Query rows per workgroup: {@code bq * g_tile} for {@link Plan#TILED} and {@link Plan#MMA}, {@code g_tile} otherwise. */
+    public int rows() { return plan == Plan.TILED || plan == Plan.MMA ? bq * gTile : gTile; }
 
     /** Most shared floats the plan uses (excluding the kernels' fixed reduction and statistics arrays). */
     public long smemUsed() {
-        return plan == Plan.TILED ? tiledSmem(bq * gTile, bk) : (long) gTile * (dK + maxSplitLen);
+        if (plan == Plan.MMA) {
+            return mmaSmemFloats(dK, dV);
+        }
+        if (plan == Plan.TILED) {
+            return tiledSmem(bq * gTile, bk);
+        }
+        return (long) gTile * (dK + maxSplitLen) + (long) PASS2_GROUPS * gTile * dV;
     }
 
     /**
@@ -312,7 +374,7 @@ public final class FlashAttnTiling {
      * @throws IllegalArgumentException when {@code nKeys} is negative or exceeds {@link #keyCapacity()}
      */
     public Split decodeSplit(int nKeys) {
-        if (plan == Plan.TILED) {
+        if (plan == Plan.TILED || plan == Plan.MMA) {
             throw new IllegalStateException("decodeSplit needs a decode plan, this is " + plan);
         }
         if (nKeys < 0 || nKeys > keyCapacity) {
@@ -344,7 +406,7 @@ public final class FlashAttnTiling {
      * @throws IllegalArgumentException when {@code nSeq} is not positive
      */
     public long[] decodePagedGlobal(int nSeq, int nSplit) {
-        if (plan == Plan.TILED) {
+        if (plan == Plan.TILED || plan == Plan.MMA) {
             throw new IllegalStateException("decodePagedGlobal needs a decode plan, this is " + plan);
         }
         if (nSeq <= 0) {
@@ -360,7 +422,7 @@ public final class FlashAttnTiling {
 
     /** Partial-buffer floats of one decode query row at {@link #maxSplits()}: {@code n_head * maxSplits * (d_v + 2)}. */
     public long decodePartialFloats() {
-        if (plan == Plan.TILED) {
+        if (plan == Plan.TILED || plan == Plan.MMA) {
             throw new IllegalStateException("decodePartialFloats needs a decode plan, this is " + plan);
         }
         return partialFloats(nHead, maxSplits, dV);
@@ -374,7 +436,7 @@ public final class FlashAttnTiling {
      * @throws IllegalStateException for a {@link Plan#TILED} plan
      */
     public long decodePagedPartialFloats(int nSeq) {
-        if (plan == Plan.TILED) {
+        if (plan == Plan.TILED || plan == Plan.MMA) {
             throw new IllegalStateException("decodePagedPartialFloats needs a decode plan, this is " + plan);
         }
         if (nSeq <= 0) {
@@ -389,12 +451,12 @@ public final class FlashAttnTiling {
      * {@code partialCapacityFloats} ({@code n_tokens * n_head * n_split * (d_v + 2)}). A split call needs dense
      * output rows ({@code out_row_stride == n_head * d_v}), because the combine writes rows contiguously.
      *
-     * @throws IllegalStateException    unless the plan is {@link Plan#TILED}
+     * @throws IllegalStateException    unless the plan is {@link Plan#TILED} or {@link Plan#MMA}
      * @throws IllegalArgumentException for a non-positive token count or negative key count or capacity
      */
     public Split prefillSplit(int nTokens, int nKeys, long partialCapacityFloats) {
-        if (plan != Plan.TILED) {
-            throw new IllegalStateException("prefillSplit needs a TILED plan, this is " + plan);
+        if (plan != Plan.TILED && plan != Plan.MMA) {
+            throw new IllegalStateException("prefillSplit needs a TILED or MMA plan, this is " + plan);
         }
         if (nTokens <= 0 || nKeys < 0 || partialCapacityFloats < 0) {
             throw new IllegalArgumentException("prefill split needs positive tokens and non-negative keys and capacity, got "
@@ -417,8 +479,8 @@ public final class FlashAttnTiling {
 
     /** Global size of a tiled prefill call: {@code {ceil(n_tokens / bq) * 128, n_head_kv * groupTiles, n_split}}. */
     public long[] prefillGlobal(int nTokens, int nSplit) {
-        if (plan != Plan.TILED) {
-            throw new IllegalStateException("prefillGlobal needs a TILED plan, this is " + plan);
+        if (plan != Plan.TILED && plan != Plan.MMA) {
+            throw new IllegalStateException("prefillGlobal needs a TILED or MMA plan, this is " + plan);
         }
         return new long[]{(long) ceilDiv(nTokens, bq) * WG, (long) nHeadKv * groupTiles(), nSplit};
     }
@@ -460,7 +522,7 @@ public final class FlashAttnTiling {
     public String toString() {
         String head = "FlashAttnTiling{" + plan + ", heads=" + nHead + "/" + nHeadKv + ", d=" + dK + "/" + dV
                 + ", g_tile=" + gTile;
-        if (plan == Plan.TILED) {
+        if (plan == Plan.TILED || plan == Plan.MMA) {
             return head + ", bq=" + bq + ", bk=" + bk + ", smem=" + smemUsed() + "/" + smemFloats + '}';
         }
         return head + ", split_len=" + minSplitLen + ".." + maxSplitLen + ", wanted_splits=" + wantedSplits

@@ -22,7 +22,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-H1 plain-Socket fixtures ({@code MambaForCausalLM}, {@code Mamba2ForCausalLM}) build through the
+ * The plain SSM fixtures ({@code MambaForCausalLM}, {@code Mamba2ForCausalLM}) build through the
  * registered entries of {@code HfArchTableHybridSsm}: {@link ModelSpecBuilder} succeeds on the builtin pad-8
  * GPT-NeoX vocabulary of Mamba and the pad-16 GPT-2 vocabulary of Mamba-2, and every catalog tensor is claimed
  * ({@code TensorClaims}, mamba.cpp:47-80 / mamba2.cpp:49-83), which is the done-getting-tensors check of the

@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-D1 part E converter classes: {@code OpenELMModel}, {@code Phi2Model},
+ * Synthetic checkpoints of the converter classes: {@code OpenELMModel}, {@code Phi2Model},
  * {@code StarCoder2Model}, {@code Spark2_5Model}, {@code TalkieModel} and {@code GraniteSwitchModel}. Two layers,
  * a hidden size of 8, the exact tensor names and configuration keys of the converter sources. The SentencePiece
  * backends of {@code InternLM2Model}, {@code OrionModel}, {@code PlamoModel} and {@code PanguEmbeddedModel} need a

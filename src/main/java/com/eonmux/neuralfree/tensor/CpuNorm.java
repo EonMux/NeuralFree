@@ -106,7 +106,8 @@ final class CpuNorm {
      * running_mean + momentum * mean} and {@code running_var = (1 - momentum) * running_var + momentum * var * n /
      * (n - 1)} (the unbiased batch variance, {@code n = B * prod(*)}, see {@link #runningVarWeight}), and written
      * back with {@link GpuOptimizerOps#storeFloats}; in evaluation mode the running statistics normalize it.
-     * {@code gamma} and {@code beta} are given together or not at all.
+     * {@code gamma} and {@code beta} are given together or not at all. FLOAT64 operands are normalized by
+     * {@link CpuFloat64Conv#batchNorm}.
      *
      * @throws IllegalArgumentException in training mode when a channel has a single value ({@link
      *                                  #requireBatchStatistics})
@@ -122,6 +123,9 @@ final class CpuNorm {
         }
         if (training) {
             requireBatchStatistics(inputShape, batchSize, spatialSize);
+        }
+        if (CpuFloat64.applies("batchNorm", input, gamma, beta, runningMean, runningVar)) {
+            return CpuFloat64Conv.batchNorm(input, gamma, beta, runningMean, runningVar, training, momentum, epsilon);
         }
         boolean affine = gamma != null;
 

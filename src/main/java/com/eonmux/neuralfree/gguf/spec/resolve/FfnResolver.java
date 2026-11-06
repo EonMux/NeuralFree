@@ -101,6 +101,9 @@ public final class FfnResolver {
         if (tc.hasLayer(il, TensorNames.weight(TensorNames.CHANNEL_MIX_KEY))) {
             return new Result(FfnKind.RWKV_CHANNEL_MIX, channelMix(il), null);
         }
+        if (isLongcatBlock(il)) {
+            return longcatBlock(il);
+        }
         if (moe.isMoeLayer(il)) {
             return moeLayer(il);
         }
@@ -155,6 +158,35 @@ public final class FfnResolver {
         }
         FfnKind kind = spec.latent() ? FfnKind.MOE_LATENT : spec.chunked() ? FfnKind.MOE_CHUNKED : FfnKind.MOE;
         return new Result(kind, null, spec);
+    }
+
+    /**
+     * True for the trunk block of a LongCat-Flash layer. The GGUF stores its two physical blocks per logical layer:
+     * the even block carries the layer's dual attention and MLP structure with the shortcut MoE, the odd block the
+     * second attention and MLP. A NextN block ({@code il >= nLayer}) is a plain dense FFN.
+     */
+    private boolean isLongcatBlock(int il) {
+        return (hp.arch() == Arch.LONGCAT_FLASH || hp.arch() == Arch.LONGCAT_FLASH_NGRAM) && il < hp.nLayer();
+    }
+
+    /**
+     * The FFN of a LongCat-Flash trunk block (vLLM longcat_flash.py {@code FlashDecoderLayer.forward}): the even
+     * block runs the dense SwiGLU MLP and the routed experts on the same normalized input, the odd block the second
+     * dense MLP with the experts' output added to it.
+     *
+     * @throws IllegalStateException when the router sits on an odd block or a block lacks its dense MLP
+     */
+    private Result longcatBlock(int il) {
+        FfnSpec denseFfn = buildFfn(hp, tc, FfnSpec.Role.DENSE, TensorNames.STACK_BLK, il, denseOp(true),
+                FfnGating.PAR, 0f);
+        if (il % 2 != 0) {
+            if (tc.hasLayer(il, TensorNames.weight(TensorNames.FFN_GATE_INP))) {
+                throw new IllegalStateException(arch() + ": layer " + il + " is the second block of a LongCat layer"
+                        + " and must not carry ffn_gate_inp");
+            }
+            return new Result(FfnKind.SHORTCUT_ADD, denseFfn, null);
+        }
+        return new Result(FfnKind.MOE_SHORTCUT, denseFfn, moe.resolve(il));
     }
 
     /**
@@ -346,7 +378,8 @@ public final class FfnResolver {
         long nFf = down.ne(0);
         checkScales(tc, stack, il, role);
         FfnSpec.Builder b = FfnSpec.builder(role).nFf(toInt(nFf, il)).activationSparsityStdMul(sparsity)
-                .biases(!UnusedBiases.ffnUnused(hp.arch()));
+                .biases(!UnusedBiases.ffnUnused(hp.arch()))
+                .justNorm(hp.arch() == Arch.DORY);
         boolean fusedShape = up.ne(1) == 2 * nFf;
         if (op.fused() || (!gated && fusedShape)) {
             if (gated) {
@@ -430,6 +463,7 @@ public final class FfnResolver {
     static boolean shexpClampArch(ModelHparams hp) {
         switch (hp.arch()) {
             case DEEPSEEK4:
+            case DEEPSEEK41:
             case GLM5_NEXT:
                 return true;
             case DFLASH:

@@ -27,6 +27,7 @@ import com.eonmux.neuralfree.gguf.memory.KvLayout;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan.IndexerPlan;
 import com.eonmux.neuralfree.gguf.memory.RotationPlan;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeKernels;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
@@ -42,6 +43,7 @@ import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.utils.Closeables;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -740,6 +742,57 @@ public final class MsaBlocks {
         }
     }
 
+    /**
+     * The position &rarr; row map of a contiguous (un-ring) cache: {@code rowOfPos[p] = layout.rowOf(p)} when that row
+     * of the group holds {@code p}, -1 otherwise, for {@code p < nPos}.
+     */
+    static void fillContiguousRows(CpuMemory memory, int group, KvLayout layout, int nPos, int[] rowOfPos) {
+        for (int p = 0; p < nPos; p++) {
+            int row = layout.rowOf(p);
+            rowOfPos[p] = memory.positionOfRow(group, row) == p ? row : -1;
+        }
+    }
+
+    /**
+     * The position &rarr; cell map of sequence {@code seq} in a paged step (llama.cpp
+     * {@code llama_kv_cache_msa_context::set_input_pos_slot}): every cell of the sequence's slots, through its page
+     * table ({@code PagedStep.seqCells}), at the position the group mirror records for it; -1 for the positions the
+     * sequence does not hold.
+     *
+     * @param cells scratch of at least the sequence's slot count
+     * @return the positions the map spans: the sequence's highest position + 1, 0 when it holds none
+     * @throws UnsupportedOperationException when two cells of the sequence hold one position (the shared positions of
+     *                                       a media chunk), which a position-addressed block selection cannot tell
+     *                                       apart
+     * @throws IllegalStateException         when a position lies beyond the map
+     */
+    static int fillSequenceRows(CpuMemory memory, int group, PagedStep step, int seq, int[] cells, int[] rowOfPos,
+                                String where) {
+        int slots = step.seqCells(group, seq, cells);
+        int nPos = 0;
+        for (int j = 0; j < slots; j++) {
+            nPos = Math.max(nPos, memory.positionOfRow(group, cells[j]) + 1);
+        }
+        if (nPos > rowOfPos.length) {
+            throw new IllegalStateException(where + ": sequence " + seq + " holds position " + (nPos - 1)
+                    + ", beyond the " + rowOfPos.length + " positions the sparse selection maps");
+        }
+        Arrays.fill(rowOfPos, 0, nPos, -1);
+        for (int j = 0; j < slots; j++) {
+            int p = memory.positionOfRow(group, cells[j]);
+            if (p < 0) {
+                continue;
+            }
+            if (rowOfPos[p] >= 0) {
+                throw new UnsupportedOperationException(where + ": sequence " + seq + " holds position " + p
+                        + " in two cells (a media chunk sharing positions); the sparse block selection addresses one"
+                        + " cell per position");
+            }
+            rowOfPos[p] = cells[j];
+        }
+        return nPos;
+    }
+
     /** Writes {@code qPos[t] = pos0 + t} for {@code t < nTokens}. */
     static void fillQueryPositions(int pos0, int nTokens, int[] qPos) {
         for (int t = 0; t < nTokens; t++) {
@@ -796,7 +849,8 @@ public final class MsaBlocks {
     static PreparedDispatch prepareStore(GpuForwardContext ctx, KvDType type, int rowElems, int srcRowStride,
                                          int dstRowStride, GpuBuffer src, GpuBuffer cellIdx, GpuBuffer dst) {
         RopeKernels.validateKvStore(type, ctx.scratch().ubatch(), rowElems, srcRowStride, 0, dstRowStride);
-        Object[] args = RopeKernels.kvStoreArgs(type, 1, rowElems, srcRowStride, 0, dstRowStride, src, cellIdx, dst);
+        Object[] args = RopeKernels.kvStoreArgs(type, 1, rowElems, srcRowStride, 0, dstRowStride, rowElems, src,
+                cellIdx, ctx.placeholders().kvScalesOnes(), dst);
         int local = ctx.ops().local();
         return ctx.ops().prepare(RopeKernels.kvStore(type),
                 new long[]{RopeKernels.roundUp(RopeKernels.kvStoreWorkItems(type, 1, rowElems), local)},

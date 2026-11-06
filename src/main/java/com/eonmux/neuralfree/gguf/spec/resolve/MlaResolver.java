@@ -15,7 +15,8 @@ import java.util.Objects;
 /**
  * Resolves multi-head latent attention (deepseek2 family, deepseek32, glm-dsa, kimi-linear, kimi-k3, bailingmoe3,
  * glm5-next, dots3note, hy-v4, minicpm3, plm) into an {@link MlaSpec}. A layer uses MLA when it carries
- * {@code attn_kv_a_mqa} ({@code [n_embd, kv_lora_rank + n_rot]}, deepseek2.cpp:106).
+ * {@code attn_kv_a_mqa} ({@code [n_embd, kv_lora_rank + n_rot]}, deepseek2.cpp:106) or, for a layer whose KV cache is
+ * shared from an earlier one, when that source layer carries it (mistral-large4).
  *
  * <p>Shapes: {@code head_k_rope = n_rot}, {@code head_k_nope = n_embd_head_k_mla - n_rot}, {@code head_v =
  * n_embd_head_v_mla} (deepseek2.cpp:69-74); dots3note SWA and NextN layers use the {@code *_swa} MLA sizes
@@ -43,7 +44,18 @@ public final class MlaResolver {
     /** True when main-stack layer {@code il} runs MLA attention. */
     public boolean isMlaLayer(int il) {
         checkLayer(il);
-        return tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_KV_A_MQA));
+        return tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_KV_A_MQA))
+                || tc.hasLayer(kvSource(il), TensorNames.weight(TensorNames.ATTN_KV_A_MQA));
+    }
+
+    /**
+     * The layer that stores the KV cache read by {@code il}: {@code il} itself when it owns one, else the earlier
+     * layer its attention points at ({@code attention.kv_source_map}). A layer without {@code attn_kv_a_mqa} runs
+     * MLA when that source layer does (mistral-large4's shared-KV layers, mistral-large4.cpp:152-153, 392-394).
+     */
+    private int kvSource(int il) {
+        int owner = hp.kvOwnerLayer(il);
+        return owner >= 0 && owner < hp.nLayerAll() ? owner : il;
     }
 
     /**
@@ -63,11 +75,14 @@ public final class MlaResolver {
         int headKMla = swaDims ? hp.headKMlaSwa() : hp.headKMla();
         int headVMla = swaDims ? hp.headVMlaSwa() : hp.headVMla();
         int nRot = hp.nRot(0);                                   // hparams.n_rot(): the layer-0 rotary dims
+        // a NoPE layer of a per-layer rope pattern (mistral-large4) keeps the roped cache layout but applies
+        // no rotation; its mixer pads the rope dims with zeros
+        boolean layerRope = nRot > 0 && hp.ropeType() != RopeType.NONE && hp.ropeEnabled(il);
 
-        TensorRef kvA = tc.require(il, TensorNames.weight(TensorNames.ATTN_KV_A_MQA));
-        if (kvA.ne(1) != (long) kvLora + nRot) {
+        TensorRef kvA = tc.require(kvSource(il), TensorNames.weight(TensorNames.ATTN_KV_A_MQA));
+        if (kvA.ne(1) != (long) kvLora + (layerRope ? nRot : 0)) {
             throw new IllegalStateException(arch() + ": " + kvA.name() + " has " + kvA.ne(1)
-                    + " rows, expected kv_lora_rank " + kvLora + " + n_rot " + nRot);
+                    + " rows, expected kv_lora_rank " + kvLora + " + " + (layerRope ? "n_rot " + nRot : "no rope"));
         }
         boolean absorbed = tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_K_B))
                 && tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_V_B));
@@ -84,7 +99,7 @@ public final class MlaResolver {
                 .headV(headVMla)
                 .absorbed(absorbed)
                 .latentCache(latentCache(il, absorbed))
-                .ropeApplied(hp.ropeType() != RopeType.NONE && nRot > 0)
+                .ropeApplied(layerRope)
                 .kqScale(kqScale(headKMla))
                 .build();
     }
@@ -108,9 +123,18 @@ public final class MlaResolver {
     float kqScale(int headKMla) {
         switch (hp.arch()) {
             case DEEPSEEK2:
+            case AXK1:
             case MISTRAL4:
             case DEEPSEEK32:
             case GLM_DSA:
+            case EAGLE:
+            case EAGLE3:
+            case EAGLE_MISTRAL_LARGE3:
+            case LONGCAT_FLASH:
+            case LONGCAT_FLASH_NGRAM:
+                // the EAGLE drafter, the Mistral Large 3 drafter over a DeepSeek target and LongCat-Flash run the
+                // deepseek2 MLA graph; LongCat's DeepseekV2MLAAttention multiplies its scale by mscale^2 for the
+                // deepseek_yarn rope type (deepseek_v2.py:1100-1107, 1130-1136)
                 return DeepseekScale.yarnKqScale(hp, headKMla);
             case KIMI_LINEAR:
             case KIMI_K3:
@@ -118,6 +142,8 @@ public final class MlaResolver {
             case DOTS3NOTE:
             case HY_V4:
             case BAILINGMOE3:
+            case BAILINGMOE_V25:
+            case MISTRAL_LARGE4:
                 return 1.0f / (float) Math.sqrt(headKMla);
             case MINICPM3:
             case PLM:

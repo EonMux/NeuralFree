@@ -45,11 +45,16 @@ public class LlmInventoryResourceTest {
     }
 
     @Test
-    public void everyEntryHasSixColumnsAndNamesAPortableKernelSource() {
-        Set<String> portableUnits = new HashSet<>();
+    public void everyEntryHasSixColumnsAndNamesABuiltKernelSource() {
+        Set<String> units = new HashSet<>();
         for (String path : KernelManifest.load(loader(), ROOT).portablePaths()) {
             if (path.endsWith(".cl")) {
-                portableUnits.add(path);
+                units.add(path);
+            }
+        }
+        for (String path : KernelManifest.load(loader(), ROOT).cudaOnlyPaths()) {
+            if (path.endsWith(".cl")) {
+                units.add(path);
             }
         }
         List<String> violations = new ArrayList<>();
@@ -62,9 +67,9 @@ public class LlmInventoryResourceTest {
             String[] cols = line.split("\t", -1);
             if (cols.length != 6) {
                 violations.add((i + 1) + ": " + cols.length + " columns, expected 6");
-            } else if (!portableUnits.contains(cols[1])) {
+            } else if (!units.contains(cols[1])) {
                 violations.add((i + 1) + ": " + cols[0] + " names source " + cols[1]
-                        + ", which is not an untagged .cl manifest entry");
+                        + ", which is not a .cl manifest entry of the CUDA build");
             }
         }
         assertTrue("classpath:" + PATH + ":\n  " + String.join("\n  ", violations), violations.isEmpty());
@@ -76,5 +81,22 @@ public class LlmInventoryResourceTest {
         Availability complete = KernelManifest.inventoryCoverage(loader(), KernelLibraries.LLM_CONFIG.libraryId(),
                 ROOT, names, "the inventory itself");
         assertTrue(complete.reason(), complete.available());
+    }
+
+    @Test
+    public void portableCoverageExemptsOnlyTheCudaOnlyKernels() {
+        Set<String> names = KernelManifest.inventory(loader(), ROOT).orElseThrow(AssertionError::new);
+        Set<String> cudaOnly = KernelManifest.cudaOnlyInventoryKernels(loader(), ROOT);
+        assertTrue("the tensor-core flash attention kernels build only for CUDA: " + cudaOnly,
+                cudaOnly.contains("LLM_FlashAttnMma_F16") && cudaOnly.contains("LLM_FlashAttnMmaPaged_F16"));
+        Set<String> portable = new HashSet<>(names);
+        portable.removeAll(cudaOnly);
+        Availability vulkan = KernelManifest.portableInventoryCoverage(loader(), KernelLibraries.LLM_CONFIG.libraryId(),
+                ROOT, portable, "the portable kernels");
+        assertTrue(vulkan.reason(), vulkan.available());
+        Set<String> missingOne = new HashSet<>(portable);
+        missingOne.remove(portable.iterator().next());
+        assertFalse(KernelManifest.portableInventoryCoverage(loader(), KernelLibraries.LLM_CONFIG.libraryId(),
+                ROOT, missingOne, "the portable kernels").available());
     }
 }

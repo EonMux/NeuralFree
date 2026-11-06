@@ -23,11 +23,13 @@ This guide takes a fresh clone to a running GGUF model and a trained model, in s
 | OpenCL | OpenCL 1.2 or newer on a GPU | Nothing more | Work-groups of at least 256 items |
 | Vulkan | Vulkan 1.2 with timeline semaphores and a compute queue | 8-bit and 16-bit storage | Work-groups of at least 256 items |
 | CUDA | An NVIDIA driver | A device of compute capability 7.5 or newer (with the default kernel build), and a driver new enough for the built modules | The same as the GGUF kernels |
+| HIP | The ROCm runtime (5.5 or newer) and the HIP JNI shim (`libhipshim.so`) | Code objects built with hipcc for the device's `gfx` target | The same |
 
 The GGUF engine also runs on the CPU, without any GPU. The training framework needs a GPU backend of one of these APIs; on a backend that cannot run the `train` kernels, each op computes on the CPU.
 
-**Optional build tools.** OpenCL needs none, because the driver compiles the kernel sources at run time. CUDA and Vulkan run kernels built ahead of time:
+**Optional build tools.** OpenCL needs none, because the driver compiles the kernel sources at run time. CUDA, Vulkan and HIP run kernels built ahead of time:
 - `nvcc` from the CUDA Toolkit builds the CUDA kernels;
+- `hipcc` from the ROCm toolkit builds the HIP code objects and the JNI shim;
 - `glslc` (or `glslangValidator`) with `spirv-dis` from the Vulkan SDK builds the Vulkan kernels; `spirv-opt` and `spirv-val` optimize and validate them when present;
 - `clang` syntax-checks the OpenCL kernels and checks the kernel inventories against the kernel sources.
 
@@ -36,6 +38,7 @@ What happens without them:
 | Missing | Effect |
 |---|---|
 | `nvcc` | The build warns, and the CUDA backend reports both kernel libraries unavailable |
+| `hipcc` | The build warns, and the HIP backend reports both kernel libraries unavailable |
 | `glslc` or `spirv-dis` | The build warns, and the Vulkan backend reports both kernel libraries unavailable |
 | `clang` | The OpenCL syntax check is skipped; the inventory checks use nvcc's preprocessor instead |
 | `clang` and `nvcc` | The build warns that the checked-in kernel inventories were not checked against the kernel sources; OpenCL and Vulkan still run both libraries |
@@ -44,7 +47,7 @@ When a backend reports a kernel library unavailable:
 - **the GGUF engine's AUTO** skips that backend and uses the next one;
 - **the training framework's AUTO** prefers a backend that runs the `train` kernels; on a backend that does not, every op takes its CPU path.
 
-Tools are found through their `-P` property, then the usual install directories (`$CUDA_HOME/bin`, `$VULKAN_SDK/bin`, ...), then `PATH`; [USAGE.md](USAGE.md#gpu-kernel-tools-all-optional) lists them. To make a missing tool fail the build instead of warning, pass `-Pneuralfree.requireCuda=true` or `-Pneuralfree.requireShaders=true`.
+Tools are found through their `-P` property, then the usual install directories (`$CUDA_HOME/bin`, `$VULKAN_SDK/bin`, ...), then `PATH`; [USAGE.md](USAGE.md#gpu-kernel-tools-all-optional) lists them. To make a missing tool fail the build instead of warning, pass `-Pneuralfree.requireCuda=true`, `-Pneuralfree.requireHip=true` or `-Pneuralfree.requireShaders=true`.
 
 ## 2. Clone and build
 
@@ -76,10 +79,10 @@ Buffer round-trip test PASSED - data verified correctly
 
 `Train kernels: unavailable (tensor ops take their CPU path): <reason>` means the backend works but the training ops compute on the CPU; the reason names what is missing, usually kernels the build could not produce (see [Troubleshooting](#7-troubleshooting)). `No GPU backend available` means no API found a usable GPU.
 
-AUTO picks the device first, then tries Vulkan, CUDA and OpenCL on it, in that order. To choose:
+AUTO picks the device first, then tries Vulkan, CUDA, OpenCL and HIP on it, in that order. To choose:
 
 ```bash
-./gradlew runApp -Pneuralfree.backend=opencl          # auto, opencl, cuda or vulkan
+./gradlew runApp -Pneuralfree.backend=opencl          # auto, opencl, cuda, vulkan or hip
 ./gradlew runApp -Pneuralfree.device=4090             # the GPU whose name contains "4090"
 ./gradlew runApp -Pneuralfree.backend.order=cuda,opencl,vulkan
 ```
@@ -90,7 +93,7 @@ The Gradle run tasks forward every `neuralfree.*` property given with `-P` or `-
 
 ```bash
 ./gradlew runDemos
-./gradlew runDemos --args="--backend cuda"     # auto, opencl, cuda or vulkan
+./gradlew runDemos --args="--backend cuda"     # auto, opencl, cuda, vulkan or hip
 ```
 
 `runDemos` runs the MLP, CNN, GPU matmul, transformer, GNN, autograd and inference demos on one shared backend, and prints whether the `train` kernels run on it. `--backend` takes precedence over `-Pneuralfree.backend`. `cpu` is refused, because the framework's tensors live on a GPU backend.
@@ -214,8 +217,8 @@ System.out.println(NeuralFree.describeTrainKernels(backend));   // "available", 
 // hw.shutdown();
 ```
 
-- **`AUTO`** picks the device first, then tries Vulkan, CUDA and OpenCL on it. With `AUTO`, `createTrainingBackend` selects a backend on which the `train` kernels run; when none does, it logs a warning with the reason per API and returns the backend plain AUTO picks.
-- **`OPENCL`, `CUDA` or `VULKAN`** forces one API; the same warning is logged when the `train` kernels do not run there.
+- **`AUTO`** picks the device first, then tries Vulkan, CUDA, OpenCL and HIP on it. With `AUTO`, `createTrainingBackend` selects a backend on which the `train` kernels run; when none does, it logs a warning with the reason per API and returns the backend plain AUTO picks.
+- **`OPENCL`, `CUDA`, `VULKAN` or `HIP`** forces one API; the same warning is logged when the `train` kernels do not run there.
 - **`hw.createBackend(mode)`** returns a backend without the `train` requirement.
 - `createTrainingBackend` throws `NoBackendAvailableException` when no GPU backend can be created at all.
 
@@ -407,12 +410,11 @@ try (EngineModel llm = LLMModelFactory.open("/path/to/model.gguf", cfg)) {
 - **Windows GPU timeouts.** Windows resets a GPU whose work runs longer than its timeout detection delay, two seconds by default, and long kernels on a slow or busy GPU can exceed it. [USAGE.md](USAGE.md#troubleshooting) shows how to raise the delay.
 - **No log output.** Run through the Gradle tasks, or pass `-Dlog4j2.configurationFile=src/main/config/log4j2.xml` to `java` (see [step 6](#6-use-neuralfree-from-java)).
 
-[USAGE.md](USAGE.md#troubleshooting) covers more cases, and [GAPS.md](GAPS.md) lists the known limitations.
+[USAGE.md](USAGE.md#troubleshooting) covers more cases.
 
 ## Next steps
 
 - [TRAINING.md](TRAINING.md): the training framework's API in full.
 - [USAGE.md](USAGE.md): the build, backends, how the framework uses a GPU backend, and the complete LLMDemo reference.
 - [LLM-INFERENCE.md](LLM-INFERENCE.md): the GGUF engine and its Java API.
-- [GAPS.md](GAPS.md): known limitations.
 - [LICENSE](LICENSE) and [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md): the licence terms, including when a commercial licence is required (above USD 20 million in revenue).

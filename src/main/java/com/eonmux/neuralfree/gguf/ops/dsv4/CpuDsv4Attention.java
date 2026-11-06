@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.ops.dsv4;
 
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
+import com.eonmux.neuralfree.gguf.ops.sparse.CpuDsaIndexer.RowReader;
 
 import java.util.Arrays;
 import java.util.Objects;
@@ -60,6 +61,24 @@ public final class CpuDsv4Attention {
          */
         public static Layer of(int nHead, int headDim, float kqScale, int nSwa, int ratio, int rotBlock,
                                Dsv4Kernels.RopeParams derope, float[] sinks) {
+            return build(nHead, headDim, kqScale, nSwa, Dsv4Kernels.CompMode.forRatio(ratio), ratio, rotBlock,
+                    derope, sinks);
+        }
+
+        /**
+         * A compressed layer that attends only its selected compressed rows whatever its compress ratio: DeepSeek-V4.1
+         * selects the top-k rows of both ratio-2 and ratio-1 layers (deepseek41.cpp:520-744).
+         */
+        public static Layer ofSelected(int nHead, int headDim, float kqScale, int nSwa, int ratio, int rotBlock,
+                                       Dsv4Kernels.RopeParams derope, float[] sinks) {
+            if (ratio < 1) {
+                throw new IllegalArgumentException("a selected compressed layer needs a positive ratio, got " + ratio);
+            }
+            return build(nHead, headDim, kqScale, nSwa, Dsv4Kernels.CompMode.SELECTED, ratio, rotBlock, derope, sinks);
+        }
+
+        private static Layer build(int nHead, int headDim, float kqScale, int nSwa, Dsv4Kernels.CompMode mode,
+                                   int ratio, int rotBlock, Dsv4Kernels.RopeParams derope, float[] sinks) {
             if (nHead < 1) {
                 throw new IllegalArgumentException("attention needs at least one head, got " + nHead);
             }
@@ -67,7 +86,6 @@ public final class CpuDsv4Attention {
             if (nSwa < 1) {
                 throw new IllegalArgumentException("raw window must be positive, got " + nSwa);
             }
-            Dsv4Kernels.CompMode mode = Dsv4Kernels.CompMode.forRatio(ratio);
             Dsv4Kernels.checkRotBlock(rotBlock, headDim);
             Dsv4Kernels.checkRope(derope, headDim);
             if (sinks != null && sinks.length < nHead) {
@@ -94,19 +112,21 @@ public final class CpuDsv4Attention {
         }
     }
 
-    /** Compressed keys of one step: the cache, its row count and, for {@code SELECTED}, the per-token selection. */
+    /** Compressed keys of one step: their reader, row count and, for {@code SELECTED}, the per-token selection. */
     public static final class Compressed {
 
-        private static final Compressed NONE = new Compressed(null, 0, null, 0, 0);
+        private static final Compressed NONE = new Compressed(null, 0, 0, null, 0, 0);
 
-        private final KvAccessor cache;
+        private final RowReader reader;
+        private final int nRows;
         private final int nComp;
         private final int[] sel;
         private final int selOff;
         private final int selStride;
 
-        private Compressed(KvAccessor cache, int nComp, int[] sel, int selOff, int selStride) {
-            this.cache = cache;
+        private Compressed(RowReader reader, int nRows, int nComp, int[] sel, int selOff, int selStride) {
+            this.reader = reader;
+            this.nRows = nRows;
             this.nComp = nComp;
             this.sel = sel;
             this.selOff = selOff;
@@ -118,28 +138,44 @@ public final class CpuDsv4Attention {
             return NONE;
         }
 
-        /** Rows {@code [0, nComp)} of {@code cache} (HCA). */
+        /** Rows {@code [0, nComp)} of a reader of {@code nRows} rows (HCA). */
+        public static Compressed dense(RowReader reader, int nRows, int nComp) {
+            checkRange(reader, nRows, nComp);
+            return new Compressed(reader, nRows, nComp, null, 0, 0);
+        }
+
+        /** Rows {@code [0, nComp)} of {@code cache} (HCA); the reader takes the whole K row of {@code headDimK} values. */
         public static Compressed dense(KvAccessor cache, int nComp) {
             Objects.requireNonNull(cache, "compressed cache");
-            if (nComp < 0 || nComp > cache.layout().rows()) {
-                throw new IllegalArgumentException("dense compressed rows " + nComp + " outside [0, "
-                        + cache.layout().rows() + "]");
-            }
-            return new Compressed(cache, nComp, null, 0, 0);
+            return dense(RowReader.ofKeys(cache), cache.layout().rows(), nComp);
         }
 
         /**
-         * Rows {@code sel[selOff + t * selStride + j]}, {@code j < nComp}, of {@code cache} for token {@code t} (CSA);
-         * negative entries are padding.
+         * Rows {@code sel[selOff + t * selStride + j]}, {@code j < nComp}, of a reader of {@code nRows} rows for token
+         * {@code t} (CSA); negative entries are padding.
          */
+        public static Compressed selected(RowReader reader, int nRows, int nComp, int[] sel, int selOff,
+                                          int selStride) {
+            checkRange(reader, nRows, nComp);
+            Objects.requireNonNull(sel, "selection");
+            if (selOff < 0 || selStride < nComp) {
+                throw new IllegalArgumentException("selection needs offset >= 0 and stride >= n_comp, got "
+                        + selOff + "/" + selStride);
+            }
+            return new Compressed(reader, nRows, nComp, sel, selOff, selStride);
+        }
+
+        /** {@link #selected(RowReader, int, int, int[], int, int)} over the whole K row of {@code cache}. */
         public static Compressed selected(KvAccessor cache, int nComp, int[] sel, int selOff, int selStride) {
             Objects.requireNonNull(cache, "compressed cache");
-            Objects.requireNonNull(sel, "selection");
-            if (nComp < 0 || selOff < 0 || selStride < nComp) {
-                throw new IllegalArgumentException("selection needs n_comp >= 0, offset >= 0 and stride >= n_comp, got "
-                        + nComp + "/" + selOff + "/" + selStride);
+            return selected(RowReader.ofKeys(cache), cache.layout().rows(), nComp, sel, selOff, selStride);
+        }
+
+        private static void checkRange(RowReader reader, int nRows, int nComp) {
+            Objects.requireNonNull(reader, "compressed reader");
+            if (nRows < 0 || nComp < 0 || nComp > nRows) {
+                throw new IllegalArgumentException("compressed rows " + nComp + " outside [0, " + nRows + "]");
             }
-            return new Compressed(cache, nComp, sel, selOff, selStride);
         }
     }
 
@@ -152,7 +188,20 @@ public final class CpuDsv4Attention {
      */
     public static void attend(Layer layer, int nTokens, float[] q, int qOff, int[] qPos, KvAccessor raw, int nRaw,
                               int[] rawPos, Compressed comp, float[] out, int outOff) {
+        attend(layer, nTokens, q, qOff, qPos, raw, null, nRaw, rawPos, comp, out, outOff);
+    }
+
+    /**
+     * {@link #attend(Layer, int, float[], int, int[], KvAccessor, int, int[], Compressed, float[], int)} over the raw
+     * rows {@code rawRows[0, nRaw)} (the cells of one paged sequence), raw key {@code i} at position
+     * {@code rawPos[i]}; a null {@code rawRows} reads rows {@code [0, nRaw)}.
+     *
+     * @throws IllegalArgumentException when the inputs do not match the layer or each other
+     */
+    public static void attend(Layer layer, int nTokens, float[] q, int qOff, int[] qPos, KvAccessor raw,
+                              int[] rawRows, int nRaw, int[] rawPos, Compressed comp, float[] out, int outOff) {
         checkInputs(layer, nTokens, q, qOff, qPos, raw, nRaw, rawPos, comp, out, outOff);
+        checkRawRows(raw, rawRows, nRaw);
         CpuParallel.parallelFor(nTokens, 1, (from, to) -> {
             final int hd = layer.headDim;
             float[] keys = new float[(nRaw + comp.nComp) * hd];
@@ -160,7 +209,7 @@ public final class CpuDsv4Attention {
             float[] o = new float[hd];
             float[] s = new float[nRaw + comp.nComp];
             for (int t = from; t < to; t++) {
-                int nKeys = gatherKeys(layer, t, qPos[t], raw, nRaw, rawPos, comp, keys);
+                int nKeys = gatherKeys(layer, t, qPos[t], raw, rawRows, nRaw, rawPos, comp, keys);
                 for (int h = 0; h < layer.nHead; h++) {
                     int row = (t * layer.nHead + h) * hd;
                     System.arraycopy(q, qOff + row, qh, 0, hd);
@@ -172,14 +221,14 @@ public final class CpuDsv4Attention {
     }
 
     /** Dequantized visible key rows of token {@code t} into {@code keys}, raw rows first; returns their count. */
-    private static int gatherKeys(Layer layer, int t, int p, KvAccessor raw, int nRaw, int[] rawPos, Compressed comp,
-                                  float[] keys) {
+    private static int gatherKeys(Layer layer, int t, int p, KvAccessor raw, int[] rawRows, int nRaw, int[] rawPos,
+                                  Compressed comp, float[] keys) {
         final int hd = layer.headDim;
         int n = 0;
         for (int r = 0; r < nRaw; r++) {
             int kp = rawPos[r];
             if (kp >= 0 && kp <= p && p - kp < layer.nSwa) {
-                raw.readK(r, 0, keys, n * hd);
+                raw.readK(rawRows == null ? r : rawRows[r], 0, keys, n * hd);
                 n++;
             }
         }
@@ -190,11 +239,11 @@ public final class CpuDsv4Attention {
         for (int j = 0; j < comp.nComp; j++) {
             int c = layer.mode == Dsv4Kernels.CompMode.SELECTED ? comp.sel[comp.selOff + t * comp.selStride + j] : j;
             if (c >= 0 && c < nVis) {
-                if (c >= comp.cache.layout().rows()) {
-                    throw new IllegalArgumentException("compressed row " + c + " exceeds the cache's "
-                            + comp.cache.layout().rows() + " rows");
+                if (c >= comp.nRows) {
+                    throw new IllegalArgumentException("compressed row " + c + " exceeds the reader's "
+                            + comp.nRows + " rows");
                 }
-                comp.cache.readK(c, 0, keys, n * hd);
+                comp.reader.read(c, keys, n * hd);
                 n++;
             }
         }
@@ -244,6 +293,21 @@ public final class CpuDsv4Attention {
         CpuDsv4Compressor.rope(o, 0, hd, layer.derope, p, true);
     }
 
+    private static void checkRawRows(KvAccessor raw, int[] rawRows, int nRaw) {
+        if (rawRows == null) {
+            return;
+        }
+        if (rawRows.length < nRaw) {
+            throw new IllegalArgumentException(rawRows.length + " raw rows cannot serve " + nRaw + " keys");
+        }
+        int rows = raw.layout().rows();
+        for (int i = 0; i < nRaw; i++) {
+            if (rawRows[i] < 0 || rawRows[i] >= rows) {
+                throw new IllegalArgumentException("raw row " + rawRows[i] + " outside the cache's " + rows + " rows");
+            }
+        }
+    }
+
     private static void checkInputs(Layer layer, int nTokens, float[] q, int qOff, int[] qPos, KvAccessor raw,
                                     int nRaw, int[] rawPos, Compressed comp, float[] out, int outOff) {
         Objects.requireNonNull(layer, "layer");
@@ -269,10 +333,9 @@ public final class CpuDsv4Attention {
         if (layer.mode == Dsv4Kernels.CompMode.NONE) {
             return;
         }
-        if (comp.cache == null) {
+        if (comp.reader == null) {
             throw new IllegalArgumentException("layer " + layer + " needs a compressed cache");
         }
-        CpuDsv4Compressor.checkKeyCache(comp.cache, layer.headDim, "compressed cache");
         if ((comp.sel != null) != (layer.mode == Dsv4Kernels.CompMode.SELECTED)) {
             throw new IllegalArgumentException("layer mode " + layer.mode + " does not match the compressed keys");
         }

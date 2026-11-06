@@ -44,6 +44,9 @@ public final class ResidualSpec {
     private final float mixerStreamScale;
     private final float ffnBranchScale;
     private final float ffnStreamScale;
+    private final TensorRef attnSlerp;
+    private final TensorRef ffnSlerp;
+    private final float slerpScale;
 
     private ResidualSpec(Builder b) {
         this.kind = b.kind;
@@ -65,6 +68,9 @@ public final class ResidualSpec {
         this.mixerStreamScale = b.mixerStreamScale;
         this.ffnBranchScale = b.ffnBranchScale;
         this.ffnStreamScale = b.ffnStreamScale;
+        this.attnSlerp = b.attnSlerp;
+        this.ffnSlerp = b.ffnSlerp;
+        this.slerpScale = b.slerpScale;
     }
 
     /**
@@ -105,6 +111,12 @@ public final class ResidualSpec {
     public float branchScale(boolean ffn) { return ffn ? ffnBranchScale : mixerBranchScale; }
     /** DEPTH_SCALED multiplier of the stream before the FFN ({@code ffn}) or mixer branch is added; 1 otherwise. */
     public float streamScale(boolean ffn) { return ffn ? ffnStreamScale : mixerStreamScale; }
+    /** SLERP alpha of the mixer sub-block ({@code attn_slerp_alpha}); null when absent. */
+    public TensorRef attnSlerp() { return attnSlerp; }
+    /** SLERP alpha of the FFN sub-block ({@code ffn_slerp_alpha}); null when absent. */
+    public TensorRef ffnSlerp() { return ffnSlerp; }
+    /** SLERP alpha multiplier ({@code ngpt_alpha_init / initializer_range}). */
+    public float slerpScale() { return slerpScale; }
 
     /** True when muse-spark style alpha/beta residuals are present. */
     public boolean alphaBeta() { return attnAlpha != null || ffnAlpha != null; }
@@ -138,6 +150,9 @@ public final class ResidualSpec {
         private float mixerStreamScale = 1.0f;
         private float ffnBranchScale = 1.0f;
         private float ffnStreamScale = 1.0f;
+        private TensorRef attnSlerp;
+        private TensorRef ffnSlerp;
+        private float slerpScale = 1.0f;
 
         private Builder(ResidualKind kind, int nEmbd) {
             this.kind = Objects.requireNonNull(kind, "kind");
@@ -178,6 +193,14 @@ public final class ResidualSpec {
             return this;
         }
 
+        /** SLERP residual: the per-element alpha vectors of the two sub-blocks and their multiplier. */
+        public Builder slerp(TensorRef attnAlpha, TensorRef ffnAlpha, float scale) {
+            this.attnSlerp = attnAlpha;
+            this.ffnSlerp = ffnAlpha;
+            this.slerpScale = scale;
+            return this;
+        }
+
         /** @throws IllegalArgumentException on inconsistent hyper-connection, scale or alpha/beta settings */
         public ResidualSpec build() {
             if (nEmbd <= 0) {
@@ -209,6 +232,17 @@ public final class ResidualSpec {
             }
             if ((attnAlpha == null) != (attnBeta == null) || (ffnAlpha == null) != (ffnBeta == null)) {
                 throw new IllegalArgumentException("residual alpha and beta tensors come in pairs");
+            }
+            boolean slerp = kind == ResidualKind.SLERP;
+            if (slerp != (attnSlerp != null || ffnSlerp != null)) {
+                throw new IllegalArgumentException(kind + " residual " + (slerp ? "needs" : "takes no")
+                        + " slerp alpha tensors");
+            }
+            if (slerp && (!(slerpScale > 0f) || Float.isInfinite(slerpScale))) {
+                throw new IllegalArgumentException("slerp residual scale must be positive and finite, got " + slerpScale);
+            }
+            if (slerp && (attnAlpha != null || ffnAlpha != null)) {
+                throw new IllegalArgumentException("slerp and alpha/beta residuals are mutually exclusive");
             }
             return new ResidualSpec(this);
         }

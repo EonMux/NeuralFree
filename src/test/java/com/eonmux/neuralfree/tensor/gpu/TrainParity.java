@@ -81,18 +81,23 @@ public final class TrainParity {
                 throw new IllegalArgumentException("unknown API " + api);
         }
         HWAcceleration hw = new HWAcceleration(EnumSet.of(api.type));
-        HardwareDevice device = firstDevice(hw, api);
-        if (device == null) {
+        try {
+            HardwareDevice device = firstDevice(hw, api);
+            if (device == null) {
+                Assume.assumeTrue("no " + api + " device enumerated", false);
+            }
+            ComputeBackend backend = hw.createBackend(device);
+            Availability a = TrainGpu.availability(backend);
+            if (!a.available()) {
+                Assume.assumeTrue("train kernels unavailable on " + api + ": " + a.reason(), false);
+            }
+            return new Session(hw, backend);
+        } catch (RuntimeException | Error e) {
+            // A failing open must not leak the enumeration (its OpenCL context and queue), or a run of
+            // many sessions in one JVM accumulates them until the device is exhausted.
             hw.shutdown();
-            Assume.assumeTrue("no " + api + " device enumerated", false);
+            throw e;
         }
-        ComputeBackend backend = hw.createBackend(device);
-        Availability a = TrainGpu.availability(backend);
-        if (!a.available()) {
-            hw.shutdown();
-            Assume.assumeTrue("train kernels unavailable on " + api + ": " + a.reason(), false);
-        }
-        return new Session(hw, backend);
     }
 
     /** A CPU reference backend: host memory buffers, every kernel artifact declined, so tensor ops take their CPU path. */
@@ -164,8 +169,11 @@ public final class TrainParity {
     public static void assertBitIdentical(String what, float[] ref, float[] gpu) {
         assertEquals(what + ": length", ref.length, gpu.length);
         for (int i = 0; i < ref.length; i++) {
-            if (Float.floatToRawIntBits(ref[i]) != Float.floatToRawIntBits(gpu[i])) {
-                fail(what + ": element " + i + " differs: ref " + ref[i] + ", gpu " + gpu[i]);
+            int refBits = Float.floatToRawIntBits(ref[i]);
+            int gpuBits = Float.floatToRawIntBits(gpu[i]);
+            if (refBits != gpuBits) {
+                fail(what + ": element " + i + " differs: ref " + ref[i] + " (0x" + Integer.toHexString(refBits)
+                        + "), gpu " + gpu[i] + " (0x" + Integer.toHexString(gpuBits) + ")");
             }
         }
     }

@@ -302,14 +302,23 @@ public final class GgufKeyTable {
         put(m, GgufKeys.NF_TOKENIZER_PREPEND_SCHEME, GGUFValueType.STRING, nf);
         putArray(m, GgufKeys.NF_TOKENIZER_PREFIX_IDS, GGUFValueType.INT32, nf);
         putArray(m, GgufKeys.NF_TOKENIZER_SUFFIX_IDS, GGUFValueType.INT32, nf);
+        putArray(m, GgufKeys.NF_RERANK_SUFFIX_IDS, GGUFValueType.INT32, nf);
         putArray(m, GgufKeys.NF_TOKENIZER_EXTRA_EOG_IDS, GGUFValueType.INT32, nf);
         put(m, GgufKeys.NF_TOKENIZER_CLEAN_SPACES, GGUFValueType.BOOL, nf);
         put(m, GgufKeys.NF_TOKENIZER_BPE_UNK_FUSE, GGUFValueType.BOOL, nf);
         put(m, GgufKeys.NF_TOKENIZER_BPE_IGNORE_MERGES, GGUFValueType.BOOL, nf);
         put(m, GgufKeys.NF_TOKENIZER_BPE_ADD_PREFIX_SPACE, GGUFValueType.BOOL, nf);
         put(m, GgufKeys.NF_TOKENIZER_BPE_BYTE_FALLBACK, GGUFValueType.BOOL, nf);
+        put(m, GgufKeys.ATTENTION_INDEXER_ROPE_DIM, GGUFValueType.UINT32, "Step5");
+        put(m, GgufKeys.ATTENTION_INDEXER_GROUP_COUNT, GGUFValueType.UINT32, "Step5");
+        put(m, GgufKeys.FP32_RESIDUAL_CONNECTION, GGUFValueType.BOOL, "Step5");
+        put(m, GgufKeys.ZERO_CENTERED_NORMS, GGUFValueType.BOOL, "Step5");
+        putArray(m, GgufKeys.MOE_LAYER_MASK, GGUFValueType.BOOL, "Step5");
         put(m, GgufKeys.NF_TOKENIZER_BPE_CONTINUING_SUBWORD_PREFIX, GGUFValueType.STRING, nf);
         put(m, GgufKeys.NF_TOKENIZER_BPE_END_OF_WORD_SUFFIX, GGUFValueType.STRING, nf);
+        putArray(m, GgufKeys.ATTENTION_SLIDING_WINDOW_PER_LAYER, GGUFValueType.UINT32, nf);
+        put(m, GgufKeys.ATTENTION_SINK_TOKEN_COUNT, GGUFValueType.UINT32, nf);
+        put(m, GgufKeys.ROPE_TYPE, GGUFValueType.STRING, nf);
 
         put(m, GgufKeys.ADAPTER_TYPE, GGUFValueType.STRING, "convert_lora_to_gguf.py:427");
         put(m, GgufKeys.ADAPTER_LORA_ALPHA, GGUFValueType.FLOAT32, "convert_lora_to_gguf.py:431");
@@ -326,8 +335,22 @@ public final class GgufKeyTable {
         }
         put(m, GgufKeys.TOKENIZER_HF_JSON, GGUFValueType.STRING, "gguf_writer.add_string");
         put(m, GgufKeys.TOKENIZER_RWKV, GGUFValueType.STRING, "gguf_writer.add_string");
+        put(m, GgufKeys.TOKENIZER_RESPONSE_TEMPLATE, GGUFValueType.STRING, "tokenizer_config.json response_template");
         put(m, GgufKeys.GENERAL_SOURCE_HF_REPO, GGUFValueType.STRING, "gguf_writer.add_string");
         put(m, GgufKeys.ROPE_SCALE_LINEAR, GGUFValueType.FLOAT32, "llama-model.cpp (float)");
+        put(m, GgufKeys.CLASSIFIER_SCOPE, GGUFValueType.STRING, "vLLM pooling-model heads (bert.py, qwen2_rm.py)");
+        put(m, GgufKeys.OUTPUT_HIDDEN_SCALE, GGUFValueType.FLOAT32, nf);
+        put(m, GgufKeys.ATTENTION_USE_QK_NORM, GGUFValueType.BOOL, nf);
+        put(m, GgufKeys.SHARED_BLOCKS_COUNT, GGUFValueType.UINT32, nf);
+        put(m, GgufKeys.SHARED_BLOCKS_ADAPTER_RANK, GGUFValueType.UINT32, nf);
+        put(m, GgufKeys.SHARED_BLOCKS_ATTENTION_ADAPTER, GGUFValueType.BOOL, nf);
+        put(m, GgufKeys.SHARED_BLOCKS_MEMORY_ROPE, GGUFValueType.BOOL, nf);
+        putArray(m, GgufKeys.SHARED_BLOCKS_HYBRID_LAYERS, GGUFValueType.BOOL, nf);
+        put(m, GgufKeys.EXPERT_ZERO_COUNT, GGUFValueType.UINT32, "vLLM longcat_flash.py zero_expert_num");
+        put(m, GgufKeys.NGRAM_BASE_TABLE_SIZE, GGUFValueType.UINT32, "vLLM longcat_flash_ngram.py");
+        put(m, GgufKeys.NGRAM_NEIGHBOR_COUNT, GGUFValueType.UINT32, "vLLM longcat_flash_ngram.py");
+        put(m, GgufKeys.NGRAM_SPLIT_COUNT, GGUFValueType.UINT32, "vLLM longcat_flash_ngram.py");
+        put(m, GgufKeys.NGRAM_EOS_TOKEN_ID, GGUFValueType.UINT32, "vLLM longcat_flash_ngram.py");
         return m;
     }
 

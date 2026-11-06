@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.cpu.quant;
 
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.quant.TapProduct;
 import com.eonmux.neuralfree.gguf.quant.write.ImatrixFile;
 import org.junit.Test;
 
@@ -10,14 +11,16 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
  * {@link ImatrixCollector} on direct observer calls: the dense accumulation (one matrix, per-token rows summed
  * column-wise, one count per activation row), the per-expert matrices of a 3-D expert tensor over its dispatches,
- * the namer refusals and the reset. An engine-level run over a synthetic llama model covers the collection the
- * running matmuls produce.
+ * the namer refusals and the reset, llama.cpp's ask (every routed product, dense products of 16 rows over kept names)
+ * and the CPU tap's ask per product, including a {@link TapProduct} scope over several calls. An engine-level run
+ * over a synthetic llama model covers the collection the running matmuls produce.
  */
 public class ImatrixCollectorTest {
 
@@ -95,6 +98,86 @@ public class ImatrixCollectorTest {
         CpuTensorRef w3 = weight(new float[16 * 4], 16, 4);
         assertThrows(IllegalStateException.class,
                 () -> bounded.observe(w3, 16L, 4, 4, new float[]{1, 1, 1, 1}, 0, 4, 4, 1));
+    }
+
+    @Test
+    public void theAskTakesEveryIndirectProductAndDenseOnesOfSixteenRowsOverKeptNames() {
+        // llama.cpp collect_imatrix (ask): MUL_MAT_ID always, MUL_MAT only with src1->ne[1] >= 16 and a kept name
+        ImatrixCollector c = new ImatrixCollector(w -> "unused", name -> name.startsWith("blk."),
+                ImatrixCollector.LLAMA_MIN_DENSE_ROWS);
+        assertTrue(c.wants("blk.0.attn_q.weight", false, 16));
+        assertFalse("fewer than 16 rows", c.wants("blk.0.attn_q.weight", false, 15));
+        assertFalse("a refused name", c.wants("output.weight", false, 512));
+        assertTrue("indirect products skip both rules", c.wants("blk.0.ffn_up_exps.weight", true, 1));
+        assertTrue("indirect products skip the names too", c.wants("output.weight", true, 1));
+
+        ImatrixCollector every = new ImatrixCollector(w -> "unused");
+        assertTrue("the one-argument collector takes every product", every.wants("output.weight", false, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ImatrixCollector(w -> "x", name -> true, 0));
+    }
+
+    @Test
+    public void theCpuTapAsksOncePerProductWithItsRowsAndKind() {
+        CpuTensorRef dense = weight(ramp(8 * 4), 8, 4);
+        CpuTensorRef experts = weight(ramp(16 * 4), 16, 4); // 4 experts of 4 rows
+        ImatrixCollector c = new ImatrixCollector(
+                w -> w == dense ? "blk.0.attn_q.weight" : "blk.0.ffn_up_exps.weight", name -> true,
+                ImatrixCollector.LLAMA_MIN_DENSE_ROWS);
+        CpuMatVec.observeGlobally(c);
+        try {
+            float[] x = ramp(16 * 4);
+            float[] y = new float[16 * 8];
+            CpuMatVec.PLAIN.matmul(dense, x, 0, y, 0, 15);
+            assertEquals("a 15-row dense product is declined", 0L, c.count("blk.0.attn_q.weight", 0));
+            CpuMatVec.PLAIN.matmul(dense, x, 0, y, 0, 16);
+            assertEquals(16L, c.count("blk.0.attn_q.weight", 0));
+
+            CpuMatVec.PLAIN.matvecExpert(experts, 2, 4, x, 0, y, 0);
+            assertEquals("one routed pair is collected", 1L, c.count("blk.0.ffn_up_exps.weight", 2));
+
+            // one dense product of 8 rows run as per-row expert-slot calls: declined as a whole
+            try (TapProduct p = TapProduct.dense(8)) {
+                for (int t = 0; t < 8; t++) {
+                    CpuMatVec.PLAIN.matvecExpert(experts, t % 4, 4, x, t * 4, y, 0);
+                }
+            }
+            assertEquals(1L, c.count("blk.0.ffn_up_exps.weight", 2));
+            assertEquals(0L, c.count("blk.0.ffn_up_exps.weight", 0));
+            try (TapProduct p = TapProduct.dense(16)) {
+                for (int t = 0; t < 16; t++) {
+                    CpuMatVec.PLAIN.matvec(dense, x, t * 4, y, 0);
+                }
+            }
+            assertEquals("sixteen one-row calls of one product", 32L, c.count("blk.0.attn_q.weight", 0));
+        } finally {
+            CpuMatVec.observeGlobally(null);
+        }
+    }
+
+    @Test
+    public void tapProductScopesNestAndCloseInnermostFirst() {
+        assertEquals(3, TapProduct.rows(3));
+        assertTrue(TapProduct.indirect(true));
+        try (TapProduct outer = TapProduct.dense(32)) {
+            assertEquals(32, TapProduct.rows(3));
+            assertFalse("a dense scope makes every call dense", TapProduct.indirect(true));
+            TapProduct inner = TapProduct.dense(4);
+            assertEquals(4, TapProduct.rows(3));
+            assertThrows(IllegalStateException.class, outer::close);
+            inner.close();
+            assertEquals(32, TapProduct.rows(3));
+        }
+        assertEquals(3, TapProduct.rows(3));
+        assertThrows(IllegalArgumentException.class, () -> TapProduct.dense(0));
+    }
+
+    private static float[] ramp(int n) {
+        float[] v = new float[n];
+        for (int i = 0; i < n; i++) {
+            v[i] = 0.01f * (i % 17) - 0.05f;
+        }
+        return v;
     }
 
     /** {@code entry}'s matrix {@code m} against {@code expected}, entry-major order. */

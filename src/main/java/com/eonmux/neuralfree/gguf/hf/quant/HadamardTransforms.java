@@ -96,7 +96,7 @@ public final class HadamardTransforms {
                 copy.put(width, v.clone());
             }
             Objects.requireNonNull(weightNames, "weightNames");
-            if (weightNames.isEmpty() || weightNames.contains(null)
+            if (weightNames.isEmpty() || weightNames.stream().anyMatch(Objects::isNull)
                     || new LinkedHashSet<>(weightNames).size() != weightNames.size()) {
                 throw new IllegalArgumentException("Hadamard weight names must be non-empty and distinct: "
                         + weightNames);

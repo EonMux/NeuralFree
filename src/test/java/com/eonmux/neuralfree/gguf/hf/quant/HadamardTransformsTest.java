@@ -255,6 +255,18 @@ public class HadamardTransformsTest {
     }
 
     @Test
+    public void weightNamesMustBeNonEmptyNonNullAndDistinct() {
+        for (List<String> bad : List.of(Collections.<String>emptyList(), Arrays.asList(Q + ".weight", null),
+                List.of(Q + ".weight", Q + ".weight"))) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> HadamardPlan.of(64, Collections.emptyMap(), bad));
+            assertTrue(e.getMessage(), e.getMessage().startsWith("Hadamard weight names must be non-empty"));
+        }
+        assertEquals(List.of(Q + ".weight", D + ".weight"),
+                HadamardPlan.of(64, Collections.emptyMap(), List.of(Q + ".weight", D + ".weight")).weightNames());
+    }
+
+    @Test
     public void anInputTransformWithoutItsWeightIsNamed() throws IOException {
         HfTensorIndex in = fixture().f32(Q + ".t_input.weight", new long[]{32, 32}, signedSylvester(ones(32)))
                 .index();

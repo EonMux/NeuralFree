@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Synthetic checkpoints of the HK-MC part B converter classes: {@code BailingMoeModel} and its V2/Sarvam variants
+ * Synthetic checkpoints of the converter classes: {@code BailingMoeModel} and its V2/Sarvam variants
  * (bailingmoe.py:15-219), {@code Dots1Model} (dots1.py:15-33) and {@code Ernie4_5MoeModel} (ernie.py:78-157). Two
  * layers, a hidden size of 8, two query heads, one key/value head, an MoE of two experts and the checkpoint's real
  * names and config keys.

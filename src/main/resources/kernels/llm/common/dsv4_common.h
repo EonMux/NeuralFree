@@ -10,15 +10,17 @@
 #define NF_DSV4_MAX_WIDTH 1024     /* largest compressed row / head dim held in local memory (floats) */
 
 /* Cache element types: gguf.memory.KvDType (Dsv4Kernels.kvTypeCode), the NF_KV_* codes of common/kv_types.h. */
-#define NF_DSV4_KV_F32    NF_KV_F32
-#define NF_DSV4_KV_F16    NF_KV_F16
-#define NF_DSV4_KV_Q8_0   NF_KV_Q8_0
-#define NF_DSV4_KV_BF16   NF_KV_BF16
-#define NF_DSV4_KV_Q4_0   NF_KV_Q4_0
-#define NF_DSV4_KV_Q4_1   NF_KV_Q4_1
-#define NF_DSV4_KV_IQ4_NL NF_KV_IQ4_NL
-#define NF_DSV4_KV_Q5_0   NF_KV_Q5_0
-#define NF_DSV4_KV_Q5_1   NF_KV_Q5_1
+#define NF_DSV4_KV_F32      NF_KV_F32
+#define NF_DSV4_KV_F16      NF_KV_F16
+#define NF_DSV4_KV_Q8_0     NF_KV_Q8_0
+#define NF_DSV4_KV_BF16     NF_KV_BF16
+#define NF_DSV4_KV_Q4_0     NF_KV_Q4_0
+#define NF_DSV4_KV_Q4_1     NF_KV_Q4_1
+#define NF_DSV4_KV_IQ4_NL   NF_KV_IQ4_NL
+#define NF_DSV4_KV_Q5_0     NF_KV_Q5_0
+#define NF_DSV4_KV_Q5_1     NF_KV_Q5_1
+#define NF_DSV4_KV_FP8_E4M3 NF_KV_FP8_E4M3
+#define NF_DSV4_KV_FP8_E5M2 NF_KV_FP8_E5M2
 
 /* RoPE modes: ggml GGML_ROPE_TYPE_NORMAL / GGML_ROPE_TYPE_NEOX (gguf.arch.RopeType.ggmlMode()). */
 #define NF_DSV4_ROPE_NORM NF_ROPE_NORM

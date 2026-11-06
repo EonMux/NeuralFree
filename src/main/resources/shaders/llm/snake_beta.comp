@@ -1,0 +1,31 @@
+/* snake_beta.comp - LLM_SnakeBeta: y[t][c] = x[t][c] + sin(alpha[c]*x[t][c])^2 * beta[c], the DAC decoder's
+ * activation over token-major rows. GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n, i channels, R x, R alpha, R beta, W y). Dispatch: 1-D, one invocation per element,
+ * global = roundUp(n, L), local = {L, 1, 1}. Reads and writes only the caller's own element, so in place is exact.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfSnakeX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfSnakeA { float alpha_in[]; };
+layout(std430, binding = 2) readonly buffer NfSnakeB { float beta_in[]; };
+layout(std430, binding = 3) writeonly buffer NfSnakeY { float y_out[]; };
+
+layout(push_constant) uniform NfSnakeParams {
+    int n;
+    int channels;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.n)) {
+        return;
+    }
+    const uint c = idx % uint(pc.channels);
+    const float v = x_in[idx];
+    const float s = sin(alpha_in[c] * v);
+    y_out[idx] = v + s * s * beta_in[c];
+}

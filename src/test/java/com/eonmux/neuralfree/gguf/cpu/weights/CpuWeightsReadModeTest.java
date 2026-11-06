@@ -20,8 +20,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 
 /**
- * {@link CpuWeights} in both {@link TensorReadMode}s: tensors read into direct buffers ({@code --no-mmap}) decode
- * to the same values as memory-mapped ones, and the mode property parses strictly.
+ * {@link CpuWeights} in every {@link TensorReadMode}: tensors read into direct buffers ({@code --no-mmap}), mapped
+ * and pinned ({@code mmap+mlock}) or read and pinned ({@code mlock}) decode to the same values as memory-mapped
+ * ones, and the mode property parses strictly.
  */
 public class CpuWeightsReadModeTest {
 
@@ -49,12 +50,18 @@ public class CpuWeightsReadModeTest {
         try {
             source = ModelSources.open(path.toString(), ModelSourceOptions.defaults());
             TensorCatalog catalog = TensorCatalog.of(source);
-            try (CpuWeights mapped = CpuWeights.open(source, catalog, null, TensorReadMode.MMAP);
-                 CpuWeights read = CpuWeights.open(source, catalog, null, TensorReadMode.READ)) {
+            TensorReadMode[] modes = {TensorReadMode.MMAP, TensorReadMode.READ,
+                    TensorReadMode.MMAP_MLOCK, TensorReadMode.MLOCK};
+            try (CpuWeights mapped = CpuWeights.open(source, catalog, null, TensorReadMode.MMAP)) {
                 assertEquals(TensorReadMode.MMAP, mapped.readMode());
-                assertEquals(TensorReadMode.READ, read.readMode());
-                for (String name : NAMES) {
-                    assertArrayEquals(name, decodeAll(mapped, name), decodeAll(read, name), 0f);
+                for (TensorReadMode mode : modes) {
+                    try (CpuWeights weights = CpuWeights.open(source, catalog, null, mode)) {
+                        assertEquals(mode, weights.readMode());
+                        for (String name : NAMES) {
+                            assertArrayEquals(mode + " " + name, decodeAll(mapped, name), decodeAll(weights, name),
+                                    0f);
+                        }
+                    }
                 }
             }
         } finally {

@@ -1,0 +1,23 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Speech-generator primitives (kernels/llm/speech.cl): causal 1-D convolutions with their left context, SnakeBeta,
+# ELU, the code predictor's head norm + RoPE and attention, and the RVQ / LM-head row primitives.
+LLM_Conv1dCausal	conv1d_causal.comp	OP=OP_CONV1D_CAUSAL
+LLM_Conv1dDepthwiseCausal	conv1d_causal.comp	OP=OP_CONV1D_DW_CAUSAL
+LLM_ConvTranspose1dCausal	conv_transpose1d_causal.comp
+LLM_ConvTranspose1dDepthwiseCausal	conv_transpose1d_depthwise_causal.comp
+LLM_SnakeBeta	snake_beta.comp
+LLM_ELU	elu.comp
+LLM_HeadRmsNormRope	head_norm_rope.comp
+LLM_TtsCausalAttn	tts_causal_attn.comp
+LLM_TtsWindowAttn	tts_window_attn.comp
+LLM_RvqSumRows	rvq_sum_rows.comp
+LLM_MatVecRowsF32	matvec_rows_f32.comp
+LLM_RmsNormRopeRows	rms_norm_rope_rows.comp
+LLM_NormalRopeRows	normal_rope_rows.comp
+LLM_TtsFullAttn	tts_full_attn.comp
+LLM_HeadSigmoidGate	head_sigmoid_gate.comp
+LLM_RowScaleAdd	row_scale_add.comp
+LLM_RowAffine	row_affine.comp
+LLM_AdaInModulate	adain_modulate.comp
+LLM_RmsNormUnbiased	rms_norm_unbiased.comp
+LLM_RepeatRows	repeat_rows.comp

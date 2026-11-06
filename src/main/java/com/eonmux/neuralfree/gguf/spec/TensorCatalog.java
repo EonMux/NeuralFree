@@ -102,6 +102,15 @@ public final class TensorCatalog {
         return refs.size();
     }
 
+    /** Storage bytes of every tensor in the file: the model size the host and its page cache hold. */
+    public long totalBytes() {
+        long total = 0;
+        for (GGUFTensorInfo info : infos.values()) {
+            total += info.sizeInBytes();
+        }
+        return total;
+    }
+
     /** All tensor names in file order (unmodifiable). */
     public Set<String> names() {
         return refs.keySet();

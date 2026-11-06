@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hf.config;
 
+import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.hf.config.QuantRule.ModuleMatcher;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.utils.json.JsonException;
@@ -28,7 +29,8 @@ import java.util.function.Function;
  * <p>Sources, first present wins: {@code quantization_config}; {@code compression_config};
  * {@code text_config.quantization_config}; {@code hf_quant_config.json} (ModelOpt &lt;= 0.29); an MLX
  * {@code quantization} (only {@code bits}, {@code group_size}, {@code mode} and per-module entries, no
- * {@code quant_method}); the {@code quantization} block of Mistral native {@code params.json}. A
+ * {@code quant_method}); the {@code quantization} block of a Mistral checkpoint, in either its native
+ * {@code params.json} or its Hugging Face layout. A
  * {@code quantization_config} of MLX shape is MLX as well, at every bit width. A ModelOpt MIXED_PRECISION config
  * without {@code quantized_layers} defers to {@code hf_quant_config.json} when that file is ModelOpt's.</p>
  *
@@ -53,6 +55,7 @@ public final class HfQuantConfig {
     private final List<ModuleMatcher> ignore;
     private final List<QuantRule> rules;
     private final HfTransformConfig transforms;
+    private final OnlineQuantConfig onlineConfig;
 
     private HfQuantConfig(Assembly a) {
         this.method = a.method;
@@ -63,6 +66,7 @@ public final class HfQuantConfig {
         this.ignore = Collections.unmodifiableList(new ArrayList<>(a.ignore));
         this.rules = Collections.unmodifiableList(new ArrayList<>(a.rules));
         this.transforms = a.transforms;
+        this.onlineConfig = a.onlineConfig;
     }
 
     /** An unquantized checkpoint. */
@@ -104,6 +108,23 @@ public final class HfQuantConfig {
     /** Whether weights are stored quantized (not {@link HfQuantMethod#NONE} or {@link HfQuantMethod#ONLINE}). */
     public boolean isQuantized() { return method != HfQuantMethod.NONE && method != HfQuantMethod.ONLINE; }
 
+    /**
+     * The online-quantization target a configuration naming one of vLLM's online shorthands quantizes float
+     * weights at load with ({@link HfQuantAliases#onlineTarget(String)}), or null. A serialized method keeps its
+     * float modules as stored ({@code fp8} and {@code mxfp8} name FP8 and ModelOpt MXFP8 checkpoints, as in vLLM),
+     * and an explicit {@code --quant-online} wins over this default.
+     */
+    public ModelSourceOptions.OnlineQuant onlineTarget() {
+        return method == HfQuantMethod.ONLINE ? HfQuantAliases.onlineTarget(methodName) : null;
+    }
+
+    /**
+     * The layer selection of a configuration whose quant_method is vLLM's bare {@code online}: its
+     * {@code linear}, {@code moe}, {@code ignore} and {@code targets} ({@link OnlineQuantConfig}), which quantize
+     * float weights at load unless {@code --quant-online} names another method; null for every other configuration.
+     */
+    public OnlineQuantConfig onlineConfig() { return onlineConfig; }
+
     /** The configured ignore entries, as written. */
     public List<String> ignoreList() { return ignoreList; }
 
@@ -139,7 +160,8 @@ public final class HfQuantConfig {
     @Override
     public String toString() {
         return "HfQuantConfig{" + method + (methodName.isEmpty() ? "" : " '" + methodName + "'")
-                + (modelOptAlgo == null ? "" : " " + modelOptAlgo) + ", ignore=" + ignoreList + ", rules=" + rules + "}";
+                + (modelOptAlgo == null ? "" : " " + modelOptAlgo) + ", ignore=" + ignoreList + ", rules=" + rules
+                + (onlineConfig == null ? "" : ", online=" + onlineConfig) + "}";
     }
 
     // ------------------------------------------------------------------ discovery
@@ -210,14 +232,14 @@ public final class HfQuantConfig {
         return mixed && m.get("quantized_layers") == null && in.get("quantized_layers") == null;
     }
 
-    /** The top-level {@code quantization} block: Mistral native or MLX; null when it is neither or absent. */
+    /** The top-level {@code quantization} block: Mistral (native or HF layout) or MLX; null when it is neither. */
     private static Found quantizationBlock(HfConfig cfg) {
         Object q = cfg.raw().raw("quantization");
         if (q == null) {
             return null;
         }
         Map<String, Object> qm = object(q, cfg.source() + ": quantization");
-        if (cfg.mistralNative()) {
+        if (cfg.mistralNative() || qm.containsKey("qformat_weight")) {
             return mistralNative(cfg, qm);
         }
         String mlx = mlxName(qm);
@@ -288,13 +310,23 @@ public final class HfQuantConfig {
         }
         String where = cfg.source() + ": quantization";
         if ("fp8_e4m3".equals(q.get("qformat_weight"))) {
-            Object act = q.get("qscheme_act");
-            if (act != null && !"NO_SCALES".equals(act) && !"TENSOR".equals(act)) {
-                throw new GgufFormatException(where + ": qscheme_act '" + act + "' is not NO_SCALES or TENSOR");
-            }
             Map<String, Object> fp8 = new LinkedHashMap<>();
             fp8.put("quant_method", "fp8");
-            fp8.put("activation_scheme", "NO_SCALES".equals(act) ? "dynamic" : "static");
+            Object scheme = q.get("qscheme_weight");
+            if ("BLOCK".equals(scheme)) {
+                fp8.put("weight_block_size", blockShape(q, where));
+                fp8.put("activation_scheme", "dynamic");
+            } else {
+                if (scheme != null && !"TENSOR".equals(scheme)) {
+                    throw new GgufFormatException(where + ": qscheme_weight '" + scheme
+                            + "' is not TENSOR or BLOCK");
+                }
+                Object act = q.get("qscheme_act");
+                if (act != null && !"NO_SCALES".equals(act) && !"TENSOR".equals(act)) {
+                    throw new GgufFormatException(where + ": qscheme_act '" + act + "' is not NO_SCALES or TENSOR");
+                }
+                fp8.put("activation_scheme", "NO_SCALES".equals(act) ? "dynamic" : "static");
+            }
             return new Found(JsonView.of(fp8, cfg.source(), "quantization"), null);
         }
         Object qm = q.get("quant_method");
@@ -302,6 +334,17 @@ public final class HfQuantConfig {
             return new Found(JsonView.of(q, cfg.source(), "quantization"), "compressed-tensors");
         }
         throw new GgufFormatException(where + ": unsupported Mistral quantization " + q);
+    }
+
+    /** The {@code [block_size_out, block_size_in]} of a block-scaled Mistral weight quantization. */
+    private static List<Object> blockShape(Map<String, Object> q, String where) {
+        Object out = q.get("block_size_out");
+        Object in = q.get("block_size_in");
+        if (!(out instanceof Number) || !(in instanceof Number)) {
+            throw new GgufFormatException(where + ": qscheme_weight 'BLOCK' needs numeric 'block_size_out' and"
+                    + " 'block_size_in', got " + out + " and " + in);
+        }
+        return List.of(out, in);
     }
 
     // ------------------------------------------------------------------ assembly
@@ -318,6 +361,7 @@ public final class HfQuantConfig {
         final List<ModuleMatcher> ignore = new ArrayList<>();
         final List<QuantRule> rules = new ArrayList<>();
         HfTransformConfig transforms;
+        OnlineQuantConfig onlineConfig;
 
         Assembly(HfQuantMethod method, String name, JsonView view) {
             this.method = method;
@@ -358,12 +402,25 @@ public final class HfQuantConfig {
             throw new GgufFormatException("unsupported quant_method '" + raw + "': " + r.reason());
         }
         if (r.method() == HfQuantMethod.ONLINE) {
-            logOnline(raw);
+            if (r.name().equals(HfQuantAliases.ONLINE)) {
+                a.onlineConfig = onlineConfig(a);
+            } else if (HfQuantAliases.onlineTarget(r.name()) == null) {
+                logOnline(raw);
+            }
         } else if (r.method() == HfQuantMethod.FP8 && DEEPSEEK_V4_TYPES.contains(cfg.modelType())) {
             a.method = HfQuantMethod.DEEPSEEK_V4_FP8;
         }
         a.method.read(cfg, a);
         return a;
+    }
+
+    /** The {@link OnlineQuantConfig} of a quant_method {@code online} configuration. */
+    private static OnlineQuantConfig onlineConfig(Assembly a) {
+        try {
+            return OnlineQuantConfig.parse(a.q, a.where, true);
+        } catch (IllegalArgumentException e) {
+            throw new GgufFormatException(e.getMessage(), e);
+        }
     }
 
     static void logOnline(String raw) {

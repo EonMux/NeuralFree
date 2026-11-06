@@ -26,13 +26,15 @@
 #define MXFP4_THREADS_PER_BLOCK 4
 #define MXFP4_BYTES_PER_THREAD 4  /* 4 nibble-bytes = 8 elements */
 
-/* ---- NeuralFree extension blocks (GGMLType ids 1000-1008, gguf.quant.BlockLayout), little-endian ---- */
+/* ---- NeuralFree extension blocks (GGMLType ids 1000-1009, gguf.quant.BlockLayout), little-endian ---- */
 #define F8_E4M3_BLOCK_SIZE 32
 #define F8_E4M3_BLOCK_BYTES 32        /* qs[32](e4m3fn) */
 #define F8_E5M2_BLOCK_SIZE 32
 #define F8_E5M2_BLOCK_BYTES 32        /* qs[32](e5m2, IEEE half high bytes) */
 #define F8_E4M3_B128_BLOCK_SIZE 128
 #define F8_E4M3_B128_BLOCK_BYTES 132  /* d(f32) qs[128](e4m3fn) */
+#define F8_E4M3_B32_BLOCK_SIZE 32
+#define F8_E4M3_B32_BLOCK_BYTES 36    /* d(f32) qs[32](e4m3fn) */
 #define MXFP8_BLOCK_SIZE 32
 #define MXFP8_BLOCK_BYTES 33          /* e(e8m0) qs[32](e4m3fn) */
 #define MXFP6_E2M3_BLOCK_SIZE 32
@@ -51,6 +53,8 @@
 #define NF_F8_E5M2_QS      0
 #define NF_F8_E4M3_B128_D  0
 #define NF_F8_E4M3_B128_QS 4
+#define NF_F8_E4M3_B32_D   0
+#define NF_F8_E4M3_B32_QS  4
 #define NF_MXFP8_E         0
 #define NF_MXFP8_QS        1
 #define NF_MXFP6_E         0
@@ -87,6 +91,10 @@
 #define IQ3_XXS_BLOCK_BYTES 98    /* d(f16) qs[96] */
 #define IQ3_S_BLOCK_SIZE 256
 #define IQ3_S_BLOCK_BYTES 110     /* d(f16) qs[64] qh[8] signs[32] scales[4] */
+#define IQ3_K_BLOCK_SIZE 256
+#define IQ3_K_BLOCK_BYTES 110     /* d(f16) extra(u16) scales_h(u16) scales_l[8] qs[64] qh[32] */
+#define IQ3_KS_BLOCK_SIZE 256
+#define IQ3_KS_BLOCK_BYTES 104    /* d(f16) extra(u16) scales[4] qs[64] qh[32] */
 #define IQ2_XXS_BLOCK_SIZE 256
 #define IQ2_XXS_BLOCK_BYTES 66    /* d(f16) qs[32 x u16] */
 #define IQ2_XS_BLOCK_SIZE 256
@@ -120,10 +128,24 @@ NF_TABLE(float, MXFP4_KVALUES, 16) = {
     0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
 };
 
+/* The same E2M1 codebook as int8 codes for the integer-dot decoders of MXFP4 and NVFP4. */
+NF_TABLE(nf_i8, NF_FP4_CODES, 16) = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12
+};
+
 /* IQ4_NL / IQ4_XS non-linear 4-bit values (ggml kvalues_iq4nl). */
 NF_TABLE(float, IQ4_NL_KVALUES, 16) = {
     -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
        1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f
+};
+
+/* IQ3_K / IQ3_KS non-linear 3-bit values (ggml iq3nl_values: the base grid of 8, then the same values
+ * shifted by one grid position, chosen by a block's grid-select bit; codes 0-7 map to entries 0-7 and
+ * codes 8-15 to entries 8-15). */
+NF_TABLE(float, IQ3NL_KVALUES, 16) = {
+    -63.0f, -40.0f, -23.0f, -10.0f, 1.0f, 13.0f, 28.0f, 47.0f,
+    -59.0f, -36.0f, -19.0f,  -6.0f, 5.0f, 17.0f, 32.0f, 51.0f
 };
 
 /* E4M3FN code -> value (torch.float8_e4m3fn, utils.numeric.Fp8Codec.E4M3FN): bias 7, subnormal m * 2^-9,
@@ -208,6 +230,46 @@ NF_INLINE float half_bits_to_float(uint h) {
 /* Little-endian u32 from byte storage (safe for unaligned block offsets). */
 NF_INLINE uint read_u32_le(NF_GLOBAL const uchar* p) {
     return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
+}
+
+/*
+ * Little-endian u16/u32 words from an address the block layout proves aligned to the word size. One
+ * load instead of the four byte loads read_u32_le issues; a block whose byte size is not a multiple of
+ * four is only two-byte aligned, so its four-byte fields read as two u16 words (nf_read_u32_u16).
+ */
+NF_INLINE uint nf_read_u16(NF_GLOBAL const uchar* p) {
+    return (uint)(*(NF_GLOBAL const ushort*)p);
+}
+
+NF_INLINE uint nf_read_u32(NF_GLOBAL const uchar* p) {
+    return *(NF_GLOBAL const uint*)p;
+}
+
+NF_INLINE uint nf_read_u32_u16(NF_GLOBAL const uchar* p) {
+    return nf_read_u16(p) | (nf_read_u16(p + 2) << 16);
+}
+
+/*
+ * Four consecutive floats: one 128-bit load at a 16-byte aligned address, per-element loads where the
+ * caller's row base is not (the CUDA vector load faults on a misaligned address, so the alignment is
+ * checked per call). The check is uniform across the lanes of a block, whose per-lane offsets keep the
+ * low 4 bits of the address, and the OpenCL form needs no alignment.
+ */
+NF_INLINE float4 nf_read_float4(NF_GLOBAL const float* p) {
+#ifdef NF_CUDA
+    if ((((uintptr_t)p) & 15u) == 0u) {
+        return *(const float4*)__builtin_assume_aligned(p, 16);
+    }
+    return make_float4(p[0], p[1], p[2], p[3]);
+#else
+    return vload4(0, p);
+#endif
+}
+
+/* The four signed bytes of a word as floats, byte k (two's complement) giving component k. */
+NF_INLINE float4 nf_i8x4_to_float4(uint b) {
+    return NF_F4((float)(int)(nf_i8)(b & 0xFFu), (float)(int)(nf_i8)((b >> 8) & 0xFFu),
+                 (float)(int)(nf_i8)((b >> 16) & 0xFFu), (float)(int)(nf_i8)((b >> 24) & 0xFFu));
 }
 
 /* 6-bit scale/min pair j of a Q4_K/Q5_K block (ggml get_scale_min_k4). */

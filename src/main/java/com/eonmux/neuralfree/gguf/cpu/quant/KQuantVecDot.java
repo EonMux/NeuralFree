@@ -16,6 +16,8 @@ import static com.eonmux.neuralfree.gguf.cpu.quant.Q8VecDot.putLong;
 import static com.eonmux.neuralfree.gguf.cpu.quant.Q8VecDot.subtractBias;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.intAt;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.longAt;
 
 /**
  * CPU vec-dot of the K-quant super-block types with Q8_K activations, ports of llama.cpp ggml/src/ggml-cpu/quants.c:
@@ -114,14 +116,18 @@ public final class KQuantVecDot implements CpuVecDot {
     @Override
     public float dotRow(CpuTensorRef w, long row, QuantizedActivations x) {
         check(w, x);
-        return dot(w.rowBuffer(row), w.rowOffset(row), x, Q8VecDot.scratch());
+        return dot(CpuVecDotRows.copyRow(w, row), 0, x, Q8VecDot.scratch());
+    }
+
+    @Override
+    public float dotRowBytes(byte[] row, int off, QuantizedActivations x) {
+        return dot(row, off, x, Q8VecDot.scratch());
     }
 
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        final Q8VecDot.Scratch scratch = Q8VecDot.scratch();
-        CpuVecDotRows.forEachRow(w, rowStart, rowCount, y, yOff, (b, off) -> dot(b, off, x, scratch));
+        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
     }
 
     private void check(CpuTensorRef w, QuantizedActivations x) {
@@ -129,7 +135,7 @@ public final class KQuantVecDot implements CpuVecDot {
         x.requireCompatible(w, GGMLType.Q8_K);
     }
 
-    private float dot(ByteBuffer b, int off, QuantizedActivations x, Q8VecDot.Scratch scratch) {
+    private float dot(byte[] b, int off, QuantizedActivations x, Q8VecDot.Scratch scratch) {
         switch (weightType) {
             case Q2_K:
                 return dotQ2_K(b, off, x, scratch.quants);
@@ -151,7 +157,7 @@ public final class KQuantVecDot implements CpuVecDot {
      * {@code summs = sum_g bsums[g] * (scales[g] >> 4)}, {@code isum = sum_g (scales[g] & 0xF) * sum q8 * q2},
      * {@code sumf += (d_y * d) * isum - (d_y * dmin) * summs}.
      */
-    private static float dotQ2_K(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dotQ2_K(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final short[] bsums = x.bsums;
@@ -161,14 +167,14 @@ public final class KQuantVecDot implements CpuVecDot {
             for (int k = 0; k < QK_K / 128; k++) {
                 final int q2 = off + Q2_K_QS + 32 * k;
                 for (int t = 0; t < 4; t++) {
-                    final long v = b.getLong(q2 + 8 * t);
+                    final long v = longAt(b, q2 + 8 * t);
                     for (int s = 0; s < 4; s++) {
                         putLong(aux, 128 * k + 32 * s + 8 * t, (v >>> (2 * s)) & LOW_PAIRS);
                     }
                 }
             }
-            final long sc0 = b.getLong(off + Q2_K_SCALES);
-            final long sc1 = b.getLong(off + Q2_K_SCALES + 8);
+            final long sc0 = longAt(b, off + Q2_K_SCALES);
+            final long sc1 = longAt(b, off + Q2_K_SCALES + 8);
             final int xo = i * QK_K;
             final int bo = i * BSUMS_PER_BLOCK;
             int summs = 0;
@@ -192,7 +198,7 @@ public final class KQuantVecDot implements CpuVecDot {
      * ({@link KQuantBlockDecoders#q3kScales}). Per super-block:
      * {@code sumf += (d * d_y) * sum_g (scales[g] - 32) * sum q8 * a}.
      */
-    private static float dotQ3_K(ByteBuffer b, int off, QuantizedActivations x, byte[] aux, byte[] scales) {
+    private static float dotQ3_K(byte[] b, int off, QuantizedActivations x, byte[] aux, byte[] scales) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final int nb = x.n / QK_K;
@@ -202,8 +208,8 @@ public final class KQuantVecDot implements CpuVecDot {
             for (int c = 0; c < QK_K / 128; c++) {
                 final int q3 = off + Q3_K_QS + 32 * c;
                 for (int t = 0; t < 4; t++) {
-                    final long v = b.getLong(q3 + 8 * t);
-                    final long h = b.getLong(hm + 8 * t);
+                    final long v = longAt(b, q3 + 8 * t);
+                    final long h = longAt(b, hm + 8 * t);
                     for (int s = 0; s < 4; s++) {
                         final long low = (v >>> (2 * s)) & LOW_PAIRS;
                         final long high = ((h >>> (4 * c + s)) & BYTE_ONES) << 2;
@@ -234,10 +240,10 @@ public final class KQuantVecDot implements CpuVecDot {
      *
      * @param out receives the scales in {@code out[0 .. 8)} and the mins in {@code out[8 .. 16)}
      */
-    private static void unpackScalesMins(ByteBuffer b, int scalesOff, byte[] out) {
-        final int u0 = b.getInt(scalesOff);
-        final int u1 = b.getInt(scalesOff + 4);
-        final int u2 = b.getInt(scalesOff + 8);
+    static void unpackScalesMins(byte[] b, int scalesOff, byte[] out) {
+        final int u0 = intAt(b, scalesOff);
+        final int u1 = intAt(b, scalesOff + 4);
+        final int u2 = intAt(b, scalesOff + 8);
         final int mins4to7 = ((u2 >>> 4) & KMASK2) | (((u1 >>> 6) & KMASK3) << 4);
         final int mins0to3 = u1 & KMASK1;
         final int scales4to7 = (u2 & KMASK2) | (((u0 >>> 6) & KMASK3) << 4);
@@ -290,7 +296,7 @@ public final class KQuantVecDot implements CpuVecDot {
      * This equals {@code sum_e (d * sc * q_e - dmin * m) * (d_y * q8_e)} of {@code dequantize_row_q4_K}
      * (llama.cpp ggml-quants.c:1530-1552) because {@code bsums} are the exact 16-quant sums of the activations.
      */
-    private static float dotQ4_K(ByteBuffer b, int off, QuantizedActivations x, byte[] aux, byte[] sm) {
+    private static float dotQ4_K(byte[] b, int off, QuantizedActivations x, byte[] aux, byte[] sm) {
         final int nb = x.n / QK_K;
         float sumf = 0;
         float sums = 0;
@@ -298,7 +304,7 @@ public final class KQuantVecDot implements CpuVecDot {
             for (int j = 0; j < QK_K / 64; j++) {
                 final int q4 = off + Q4_K_QS + 32 * j;
                 for (int t = 0; t < 4; t++) {
-                    final long v = b.getLong(q4 + 8 * t);
+                    final long v = longAt(b, q4 + 8 * t);
                     putLong(aux, 64 * j + 8 * t, v & LOW_NIBBLES);
                     putLong(aux, 64 * j + 32 + 8 * t, (v >>> 4) & LOW_NIBBLES);
                 }
@@ -319,7 +325,7 @@ public final class KQuantVecDot implements CpuVecDot {
      * {@code qh[l] & (1 << 2j)} and of element {@code 64j + 32 + l} from {@code qh[l] & (1 << (2j + 1))},
      * each adding 16.
      */
-    private static float dotQ5_K(ByteBuffer b, int off, QuantizedActivations x, byte[] aux, byte[] sm) {
+    private static float dotQ5_K(byte[] b, int off, QuantizedActivations x, byte[] aux, byte[] sm) {
         final int nb = x.n / QK_K;
         float sumf = 0;
         float sums = 0;
@@ -328,8 +334,8 @@ public final class KQuantVecDot implements CpuVecDot {
             for (int j = 0; j < QK_K / 64; j++) {
                 final int q4 = off + Q5_K_QS + 32 * j;
                 for (int t = 0; t < 4; t++) {
-                    final long v = b.getLong(q4 + 8 * t);
-                    final long h = b.getLong(qh + 8 * t);
+                    final long v = longAt(b, q4 + 8 * t);
+                    final long h = longAt(b, qh + 8 * t);
                     final long hLow = ((h >>> (2 * j)) & BYTE_ONES) << 4;
                     final long hHigh = ((h >>> (2 * j + 1)) & BYTE_ONES) << 4;
                     putLong(aux, 64 * j + 8 * t, (v & LOW_NIBBLES) | hLow);
@@ -355,7 +361,7 @@ public final class KQuantVecDot implements CpuVecDot {
      * {@code a[l + 96] = (ql[l + 32] >> 4 | ((qh[l] >> 6) & 3) << 4) - 32}. 16-element group {@code g} has the
      * signed 8-bit scale {@code scales[g]}; {@code sums += (d * d_y) * sum_g scales[g] * sum q8 * a}.
      */
-    private static float dotQ6_K(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dotQ6_K(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final int nb = x.n / QK_K;
@@ -366,9 +372,9 @@ public final class KQuantVecDot implements CpuVecDot {
                 final int qh = off + Q6_K_QH + 32 * c;
                 final int a = 128 * c;
                 for (int t = 0; t < 4; t++) {
-                    final long lo = b.getLong(ql + 8 * t);
-                    final long hi = b.getLong(ql + 32 + 8 * t);
-                    final long h = b.getLong(qh + 8 * t);
+                    final long lo = longAt(b, ql + 8 * t);
+                    final long hi = longAt(b, ql + 32 + 8 * t);
+                    final long h = longAt(b, qh + 8 * t);
                     putLong(aux, a + 8 * t,
                             subtractBias((lo & LOW_NIBBLES) | ((h & LOW_PAIRS) << 4), BIAS_32));
                     putLong(aux, a + 32 + 8 * t,
@@ -383,7 +389,7 @@ public final class KQuantVecDot implements CpuVecDot {
             final int xo = i * QK_K;
             int isum = 0;
             for (int g = 0; g < 16; g++) {
-                isum += b.get(sc + g) * dotI8(aux, 16 * g, yq, xo + 16 * g, 16);
+                isum += b[sc + g] * dotI8(aux, 16 * g, yq, xo + 16 * g, 16);
             }
             final float d = fp16At(b, off + Q6_K_D) * yd[i];
             sumf += d * isum;

@@ -21,7 +21,7 @@ import java.nio.file.Path;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The HK-MC part C fixtures (InternLM3 as a dense LLAMA row, Olmoe, the Qwen3-VL and Omni MoE text models with
+ * The fixtures (InternLM3 as a dense LLAMA row, Olmoe, the Qwen3-VL and Omni MoE text models with
  * thinker-prefixed transposed experts) build through the registered entries: {@link ModelSpecBuilder} succeeds and
  * every catalog tensor is claimed (the done-getting-tensors check of the tensor plan).
  */

@@ -23,8 +23,9 @@ import static org.lwjgl.vulkan.VK12.VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
  *       maxBufferSize when Vulkan 1.3, largest device-local heap)}, further capped by the
  *       allocator's limit when one is given, so a tensor larger than one binding can address
  *       is split by the caller.</li>
- *   <li>{@code computeUnits}: shader cores when the driver reports them, else 0; the clock is 0
- *       (Vulkan does not report it).</li>
+ *   <li>{@code computeUnits}: shader cores when the driver reports them, else
+ *       {@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS} (0), which keeps the split-K heuristic on
+ *       one slice; the clock is 0 (Vulkan does not report it).</li>
  *   <li>{@code maxWorkGroupSize}: {@code min(maxComputeWorkGroupInvocations, maxComputeWorkGroupSize[0])}.</li>
  *   <li>{@code supportsAsyncTransfer}: a dedicated transfer family exists, or the compute family has
  *       two or more queues.</li>

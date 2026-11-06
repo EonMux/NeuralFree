@@ -18,13 +18,12 @@ import static org.junit.Assert.fail;
 
 /**
  * {@link HubRef} parsing, the filename and format parsing of {@link HubCache.GgufFilename}, and the
- * path confinement of {@link HubCache} (PARITY.md WP TL-7): the {@code user/repo[:quant][@revision]}
+ * path confinement of {@link HubCache}: the {@code user/repo[:quant][@revision]}
  * grammar and its rejections, the llama.cpp GGUF filename grammar
  * ({@code <prefix>[-<tag>][-NNNNN-of-NNNNN].gguf}) and the model/sidecar split, the snapshot paths an
  * untrusted repository path may take ({@code ..} and absolute paths rejected), the cache's ref,
  * commit and listing round trip over the Hub layout, and the oids the cache accepts. No network
- * starts here: the download client is never constructed in a test, TL-7 wires it and the plan runs it
- * nowhere.
+ * starts here: the download client is never constructed in a test, so nothing runs.
  */
 public class HubRefTest {
 

@@ -5,14 +5,16 @@ import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
+import com.eonmux.neuralfree.gguf.ops.moe.MoeExpertHeat;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 
 import java.util.Objects;
 
 /**
  * Everything a CPU block needs to run: the model spec, its in-place weights, the matvec bound to the weights'
- * transforms, the preallocated scratch, the KV / recurrent memory, the hidden-state tap and the projection deltas
- * (LoRA) of the model's layers. Row-wise and element-wise math is
+ * transforms, the preallocated scratch, the KV / recurrent memory, the hidden-state tap, the projection deltas
+ * (LoRA) of the model's layers and the MoE expert-heat recorder ({@code null} without a profile save). Row-wise and
+ * element-wise math is
  * {@code CpuOps} (static) and threading is {@code CpuParallel}, so neither is held here.
  *
  * <p>Immutable and shared by every block of one model; the twin of {@code GpuForwardContext}. The context does not
@@ -30,6 +32,8 @@ public final class CpuForwardContext {
     private final CpuMemory memory;
     private final HiddenTap hiddenTap;
     private final CpuProjectionDeltas projectionDeltas;
+    private final CpuForwardStepState stepState;
+    private final MoeExpertHeat heat;
 
     private CpuForwardContext(Builder b) {
         this.spec = b.spec;
@@ -39,6 +43,8 @@ public final class CpuForwardContext {
         this.memory = b.memory;
         this.hiddenTap = b.hiddenTap;
         this.projectionDeltas = b.projectionDeltas != null ? b.projectionDeltas : new CpuProjectionDeltas();
+        this.stepState = b.stepState != null ? b.stepState : new CpuForwardStepState();
+        this.heat = b.heat;
     }
 
     /** Builder over the model spec, its weights and the scratch sized for it. */
@@ -91,6 +97,64 @@ public final class CpuForwardContext {
         return projectionDeltas;
     }
 
+    /**
+     * The per-step flags of the running forward pass: the backend sets them before it runs the slots and clears
+     * them after. Shared by every context derived from this one.
+     */
+    CpuForwardStepState stepState() {
+        return stepState;
+    }
+
+    /** Whether the running step attends without the causal mask (a media chunk's rows). */
+    public boolean stepNonCausal() {
+        return stepState.nonCausal();
+    }
+
+    /** Flags the running step non-causal or causal; the backend sets it around the step. */
+    public void stepNonCausal(boolean nonCausal) {
+        stepState.nonCausal(nonCausal);
+    }
+
+    /** The running step's tree mask ({@code fresh} fresh rows), or null when the step carries none. */
+    public long[] stepTreeMask() {
+        return stepState.treeMask();
+    }
+
+    /** The running step's fresh tree rows, or -1 when the step carries no tree mask. */
+    public int stepTreeFresh() {
+        return stepState.treeFresh();
+    }
+
+    /** Sets the running step's tree mask; the backend sets it around a tree verify's step. */
+    public void stepTreeMask(long[] mask, int fresh) {
+        stepState.treeMask(mask, fresh);
+    }
+
+    /** The running step's recurrent tree round, or null when the step runs no recurrent tree step. */
+    public CpuRecurrentTreeRound stepTreeRound() {
+        return stepState.treeRound();
+    }
+
+    /** Sets the running step's recurrent tree round; the backend sets it around a recurrent target's tree step. */
+    public void stepTreeRound(CpuRecurrentTreeRound round) {
+        stepState.treeRound(round);
+    }
+
+    /** The running step's KV store positions, or null when the rows store at their POS positions. */
+    public int[] stepStorePositions() {
+        return stepState.storePositions();
+    }
+
+    /** Sets the running step's KV store positions; the backend sets it around a contiguous tree step. */
+    public void stepStorePositions(int[] positions) {
+        stepState.storePositions(positions);
+    }
+
+    /** The MoE expert-heat recorder the routed blocks note their selections into; null without a profile save. */
+    public MoeExpertHeat heat() {
+        return heat;
+    }
+
     /** This context with another hidden-state tap ({@link HiddenTap#NONE} to stop tapping). */
     public CpuForwardContext withHiddenTap(HiddenTap tap) {
         Builder b = new Builder(spec, weights, scratch);
@@ -98,6 +162,8 @@ public final class CpuForwardContext {
         b.memory = memory;
         b.hiddenTap = Objects.requireNonNull(tap, "hiddenTap");
         b.projectionDeltas = projectionDeltas;
+        b.stepState = stepState;
+        b.heat = heat;
         return new CpuForwardContext(b);
     }
 
@@ -116,6 +182,8 @@ public final class CpuForwardContext {
         private CpuMemory memory;
         private HiddenTap hiddenTap = HiddenTap.NONE;
         private CpuProjectionDeltas projectionDeltas;
+        private CpuForwardStepState stepState;
+        private MoeExpertHeat heat;
 
         private Builder(ModelSpec spec, CpuWeights weights, CpuScratch scratch) {
             this.spec = Objects.requireNonNull(spec, "spec");
@@ -138,6 +206,12 @@ public final class CpuForwardContext {
         /** Observer of the residual stream at layer inputs; defaults to {@link HiddenTap#NONE}. */
         public Builder hiddenTap(HiddenTap v) {
             this.hiddenTap = Objects.requireNonNull(v, "hiddenTap");
+            return this;
+        }
+
+        /** The MoE expert-heat recorder the routed blocks note their selections into; null (the default) skips it. */
+        public Builder heat(MoeExpertHeat v) {
+            this.heat = v;
             return this;
         }
 

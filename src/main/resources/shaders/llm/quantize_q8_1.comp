@@ -1,0 +1,66 @@
+/* quantize_q8_1.comp - F32 activation row to Q8_1 blocks (LLM_QuantizeQ8_1).
+ * GLSL twin of LLM_QuantizeQ8_1 (kernels/llm/quantize_q8_1.cl). Requires: common/nf_common.glsl,
+ * common/rope_common.glsl (nf_rope_f16_bits: f16 rounded to nearest even, as vstore_half).
+ *
+ * Variants row:
+ *     LLM_QuantizeQ8_1	quantize_q8_1.comp	OP=OP_QUANTIZEQ8_1
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i size, R float input, W uchar output)
+ * For each 32-element block b of input[0, size): amax = max|x|, d = amax / 127, id = d != 0 ? 1/d
+ * : 0, output block b (36 bytes at 36*b) = f16(d), f16(d * sum(qs)), qs[k] = roundf(x[k] * id),
+ * equal to quantize_row_q8_1_ref (llama.cpp ggml-quants.c:302-335), so the bits match the CPU
+ * quantizer.
+ *
+ * Dispatch: 1-D with any global and local size; each invocation quantizes blocks
+ * nf_global_id(), nf_global_id() + total invocations, ... .
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+
+/* Op id of this shader; distinct from every template and sibling-shader op id. */
+#define OP_QUANTIZEQ8_1 192
+
+#if !defined(OP) || OP != OP_QUANTIZEQ8_1
+#error "quantize_q8_1.comp requires OP=OP_QUANTIZEQ8_1"
+#endif
+
+layout(std430, binding = 0) readonly buffer NfQ81Input { float x_in[]; };
+/* Q8_1 output as 16-bit words: each block is 18 words (36 bytes, always at an even offset). */
+layout(std430, binding = 1) writeonly buffer NfQ81Output { uint16_t q_out[]; };
+layout(push_constant) uniform NfQ81Params { int size; } pc;
+
+const uint NF_Q81_BS = 32u;     /* elements per Q8_1 block */
+const uint NF_Q81_WORDS = 18u;  /* 16-bit words per Q8_1 block */
+
+/* int8 quant of v (|v| <= 127 by construction), as the block sum needs the signed value. */
+int nf_q81_code(float v) {
+    return clamp(int(nf_roundf(v)), -127, 127);
+}
+
+void main() {
+    const uint blocks = uint(pc.size) / NF_Q81_BS;
+    const uint stride = gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_WorkGroupSize.x;
+    for (uint b = nf_global_id(); b < blocks; b += stride) {
+        const uint xb = b * NF_Q81_BS;
+        float amax = 0.0;
+        [[unroll]] for (uint j = 0u; j < NF_Q81_BS; ++j) {
+            amax = max(amax, abs(x_in[xb + j]));
+        }
+        const float d = amax / 127.0;
+        const float id = d != 0.0 ? 1.0 / d : 0.0;
+        int sum = 0;
+        const uint ob = b * NF_Q81_WORDS;
+        q_out[ob] = uint16_t(nf_rope_f16_bits(d));
+        [[unroll]] for (uint j = 0u; j < NF_Q81_BS; j += 2u) {
+            const int lo = nf_q81_code(x_in[xb + j] * id);
+            const int hi = nf_q81_code(x_in[xb + j + 1u] * id);
+            sum += lo + hi;
+            q_out[ob + 2u + j / 2u] = uint16_t((uint(lo) & 0xFFu) | ((uint(hi) & 0xFFu) << 8));
+        }
+        q_out[ob + 1u] = uint16_t(nf_rope_f16_bits(float(sum) * d));
+    }
+}

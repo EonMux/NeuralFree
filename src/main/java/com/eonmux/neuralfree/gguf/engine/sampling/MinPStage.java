@@ -6,7 +6,8 @@ import com.eonmux.neuralfree.gguf.engine.Sampler.Candidates;
  * llama.cpp's min-p sampler (llama_sampler_min_p_apply): candidates whose logit is within {@code log(minP)} of the
  * maximum logit. A {@code minP <= 0} applies nothing. Over an unsorted set it moves the kept candidates to the front
  * in their current (vocabulary) order; {@code minKeep} candidates or more make that pass the result (llama.cpp's
- * {@code filtered_tokens}), otherwise llama.cpp's sorted fallback runs: a full descending sort and a prefix scan that
+ * {@code filtered_tokens}), otherwise the set is left untouched and llama.cpp's sorted fallback runs over all of it:
+ * a full descending sort and a prefix scan that
  * only stops once {@code minKeep} candidates are past ({@code i >= min_keep}). The sorted set keeps its order.
  */
 public final class MinPStage extends SamplerStage {
@@ -32,13 +33,19 @@ public final class MinPStage extends SamplerStage {
         if (!candidates.sorted()) {
             float max = candidates.maxLogit();
             float minLogit = max + (float) Math.log(minP);
-            int kept = 0;
+            int passing = 0;
             for (int i = 0; i < candidates.size(); i++) {
                 if (candidates.logit(i) >= minLogit) {
-                    candidates.move(i, kept++);
+                    passing++;
                 }
             }
-            if (kept > 0 && kept >= minKeep) {
+            if (passing > 0 && passing >= minKeep) {
+                int kept = 0;
+                for (int i = 0; i < candidates.size(); i++) {
+                    if (candidates.logit(i) >= minLogit) {
+                        candidates.move(i, kept++);
+                    }
+                }
                 candidates.truncate(kept);
                 return;
             }

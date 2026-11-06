@@ -1,0 +1,1493 @@
+# weights_mappers.tsv - Generated from vLLM 8530a778f7 by gradle/vllmgen/vllm_mappers.py; do not edit. Rows: 1491
+# architecture	kind	match	replacement	shard
+AfmoeForCausalLM	stacked	.q_proj	.qkv_proj	q
+AfmoeForCausalLM	stacked	.k_proj	.qkv_proj	k
+AfmoeForCausalLM	stacked	.v_proj	.qkv_proj	v
+AfmoeForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+AfmoeForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+AfmoeForCausalLM	stacked	.shared_experts.gate_proj	.shared_experts.gate_up_proj	0
+AfmoeForCausalLM	stacked	.shared_experts.up_proj	.shared_experts.gate_up_proj	1
+AfmoeForCausalLM	suffix	.router.gate.weight	.gate.weight	
+AliceAIForCausalLM	prefix	mtp.	<drop>	
+Alpamayo2Super	prefix	vlm.model.visual.	visual.	
+Alpamayo2Super	prefix	vlm.lm_head.	language_model.lm_head.	
+Alpamayo2Super	prefix	vlm.model.language_model.	language_model.model.	
+Alpamayo2Super	prefix	expert.	<drop>	
+ApertusForCausalLM	stacked	.q_proj	.qkv_proj	q
+ApertusForCausalLM	stacked	.k_proj	.qkv_proj	k
+ApertusForCausalLM	stacked	.v_proj	.qkv_proj	v
+AriaForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+AriaForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+AriaForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+AriaForConditionalGeneration	prefix	language_model.model	language_model	
+AriaForConditionalGeneration	prefix	language_model.lm_head	lm_head	
+AriaForConditionalGeneration	suffix	router.weight	router_weight	
+BagelForConditionalGeneration	prefix	vit_pos_embed.pos_embed	<drop>	
+BailingMoeV3ForCausalLM	substr	.attention.	.self_attn.	
+BailingMoeV3ForCausalLM	prefix	attention.	self_attn.	
+BailingMoeV3MTPModel	substr	.attention.	.self_attn.	
+BailingMoeV3MTPModel	prefix	attention.	self_attn.	
+BailingMoeV3VLForConditionalGeneration	substr	.attention.	.self_attn.	
+BailingMoeV3VLForConditionalGeneration	prefix	attention.	self_attn.	
+BailingMoeV3VLForConditionalGeneration	prefix	model.visual	visual	
+BailingMoeV3VLForConditionalGeneration	prefix	model.linear_proj	linear_proj	
+BailingMoeV3VLForConditionalGeneration	prefix	linear_proj.0	linear_proj.linear_fc1	
+BailingMoeV3VLForConditionalGeneration	prefix	linear_proj.2	linear_proj.linear_fc2	
+BailingMoeV3VLForConditionalGeneration	prefix	lm_head	language_model.lm_head	
+BailingMoeV3VLForConditionalGeneration	prefix	model.	language_model.model.	
+BeamForCausalLM	substr	.self_attn.gate_proj	.self_attn.output_gate_proj	
+BeamForCausalLM	stacked	.self_attn.q_proj	.self_attn.qkv_proj	q
+BeamForCausalLM	stacked	.self_attn.k_proj	.self_attn.qkv_proj	k
+BeamForCausalLM	stacked	.self_attn.v_proj	.self_attn.qkv_proj	v
+BeamForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+BeamForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+BeeForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+BeeForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+BeeForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+BeeForConditionalGeneration	prefix	model.image_newline	image_newline	
+BeeForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+BertForMaskedLM	substr	cls.seq_relationship	<drop>	
+BertForMaskedLM	substr	cls.predictions.decoder.bias	<drop>	
+BertForMaskedLM	substr	cls.predictions.transform.LayerNorm.gamma	mlm_head.layer_norm.weight	
+BertForMaskedLM	substr	cls.predictions.transform.LayerNorm.beta	mlm_head.layer_norm.bias	
+BertForMaskedLM	substr	cls.predictions.transform.LayerNorm	mlm_head.layer_norm	
+BertForMaskedLM	substr	cls.predictions.transform.dense	mlm_head.dense	
+BertForMaskedLM	substr	cls.predictions.decoder	mlm_head.decoder	
+BertForMaskedLM	substr	cls.predictions.bias	mlm_head.decoder.bias	
+BertModel	prefix	bert.	model.	
+BertModel	prefix	roberta.	model.	
+BertModel	prefix	encoder.	model.encoder.	
+BertModel	prefix	embeddings.	model.embeddings.	
+BertSpladeSparseEmbeddingModel	prefix	bert.	model.	
+BertSpladeSparseEmbeddingModel	prefix	roberta.	model.	
+BertSpladeSparseEmbeddingModel	prefix	encoder.	model.encoder.	
+BertSpladeSparseEmbeddingModel	prefix	embeddings.	model.embeddings.	
+BgeM3EmbeddingModel	prefix	bert.	model.	
+BgeM3EmbeddingModel	prefix	roberta.	model.	
+BgeM3EmbeddingModel	prefix	encoder.	model.encoder.	
+BgeM3EmbeddingModel	prefix	embeddings.	model.embeddings.	
+CLIPModel	substr	.position_ids	<drop>	
+CanaryForConditionalGeneration	regex	(decoder\.layers\.\d+\.\w+_attn)\.o_proj\.	\1.out_projection.	
+CanaryForConditionalGeneration	regex	(decoder\.layers\.\d+\.mlp)\.fc1\.	\1.dense_in.	
+CanaryForConditionalGeneration	regex	(decoder\.layers\.\d+\.mlp)\.fc2\.	\1.dense_out.	
+CanaryForConditionalGeneration	regex	\.num_batches_tracked$	<drop>	
+ClefFlashForJointSchema	prefix	model.visual.	visual.	
+ClefFlashForJointSchema	prefix	lm_head.	language_model.lm_head.	
+ClefFlashForJointSchema	prefix	model.language_model.	language_model.model.	
+ClefFlashForJointSchema	prefix	mtp.	<drop>	
+ClefOmniForJointSchema	prefix	thinker.lm_head.	language_model.lm_head.	
+ClefOmniForJointSchema	prefix	thinker.model.	language_model.model.	
+ClefOmniForJointSchema	prefix	thinker.		
+ClefOmniForJointSchema	prefix	talker.	<drop>	
+ClefOmniForJointSchema	prefix	code2wav.	<drop>	
+ClefOmniForJointSchema	prefix	model.	language_model.model.	
+ClefOmniForJointSchema	prefix	lm_head.	language_model.lm_head.	
+Cohere2ForCausalLM	substr	_quantizer.	<drop>	
+Cohere2ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Cohere2ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Cohere2ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Cohere2ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Cohere2ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Cohere2ForCausalLM	prefix	lm_head	<drop>	
+Cohere2MoeForCausalLM	stacked	.q_proj	.qkv_proj	q
+Cohere2MoeForCausalLM	stacked	.k_proj	.qkv_proj	k
+Cohere2MoeForCausalLM	stacked	.v_proj	.qkv_proj	v
+Cohere2MoeForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+Cohere2MoeForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+Cohere2MoeForCausalLM	stacked	.shared_experts.gate_proj	.shared_experts.gate_up_proj	0
+Cohere2MoeForCausalLM	stacked	.shared_experts.up_proj	.shared_experts.gate_up_proj	1
+Cohere2MoeForCausalLM	prefix	lm_head.	<drop>	
+Cohere2VisionForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+Cohere2VisionForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+Cohere2VisionForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+CohereAsrForConditionalGeneration	substr	.fc1.	.mlp.fc1.	
+CohereAsrForConditionalGeneration	substr	.fc2.	.mlp.fc2.	
+CohereAsrForConditionalGeneration	substr	model.conv.batch_norm.num_batches_tracked	<drop>	
+CohereAsrForConditionalGeneration	prefix	model.preprocessor.featurizer.fb	<drop>	
+CohereAsrForConditionalGeneration	prefix	model.preprocessor.featurizer.window	<drop>	
+CohereCompassForConditionalGeneration	prefix	model.visual.	visual.	
+CohereCompassForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+CohereCompassForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+CohereForCausalLM	substr	_quantizer.	<drop>	
+CohereForCausalLM	stacked	.q_proj	.qkv_proj	q
+CohereForCausalLM	stacked	.k_proj	.qkv_proj	k
+CohereForCausalLM	stacked	.v_proj	.qkv_proj	v
+CohereForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+CohereForCausalLM	stacked	.up_proj	.gate_up_proj	1
+CohereForCausalLM	prefix	lm_head	<drop>	
+ColModernVBertForRetrieval	prefix	model.text_model.layers.	text_layers.	
+ColModernVBertForRetrieval	prefix	model.text_model.embeddings.	text_embeddings.	
+ColModernVBertForRetrieval	prefix	model.text_model.final_norm.	text_final_norm.	
+ColModernVBertForRetrieval	prefix	model.connector.modality_projection.	connector.proj.	
+ColModernVBertForRetrieval	prefix	model.custom_text_proj.	custom_text_proj.	
+ColModernVBertForRetrieval	prefix	model.vision_model.vision_model.	vision_model.vision_model.	
+ColModernVBertForRetrieval	prefix	model.		
+ColPaliForRetrieval	prefix	vlm.vision_tower.	vision_tower.	
+ColPaliForRetrieval	prefix	vlm.language_model.	language_model.	
+ColPaliForRetrieval	prefix	vlm.multi_modal_projector.	multi_modal_projector.	
+ColPaliForRetrieval	prefix	model.vision_tower.	vision_tower.	
+ColPaliForRetrieval	prefix	model.language_model.	language_model.	
+ColPaliForRetrieval	prefix	model.multi_modal_projector.	multi_modal_projector.	
+ColPaliForRetrieval	prefix	lm_head.	language_model.lm_head.	
+ColQwen3	prefix	vlm.model.visual.	visual.	
+ColQwen3	prefix	vlm.lm_head.	language_model.lm_head.	
+ColQwen3	prefix	vlm.model.language_model.	language_model.model.	
+ColQwen3	prefix	model.visual.	visual.	
+ColQwen3	prefix	lm_head.	language_model.lm_head.	
+ColQwen3	prefix	model.language_model.model.	language_model.model.	
+ColQwen3	prefix	model.language_model.	language_model.model.	
+ColQwen3_5	prefix	language_model.	language_model.model.	
+ColQwen3_5	prefix	mtp.	<drop>	
+ColUltraVBertForRetrieval	prefix	vision_model.vision_model.	vision_model.vision_model.	
+ColUltraVBertForRetrieval	prefix	vision_model.	vision_model.vision_model.	
+Cosmos3EdgeForConditionalGeneration	unresolved	for physical_idx in range(28):		
+Cosmos3ForConditionalGeneration	regex	^(layers\.|embed_tokens\.|norm\.)(.+)$	language_model.model.\1\2	
+Cosmos3ForConditionalGeneration	regex	^(blocks\.|merger\.|patch_embed\.|pos_embed\.|deepstack_merger_list\.)	visual.\1	
+Cosmos3ForConditionalGeneration	regex	^audio_modality_embed(?:\..*)?$	<drop>	
+Cosmos3ForConditionalGeneration	regex	^action_modality_embed(?:\..*)?$	<drop>	
+Cosmos3ForConditionalGeneration	substr	_moe_gen	<drop>	
+Cosmos3ForConditionalGeneration	substr	.add_q_proj.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.add_k_proj.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.add_v_proj.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.to_add_out.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.norm_added_q.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.norm_added_k.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.to_q.	.q_proj.	
+Cosmos3ForConditionalGeneration	substr	.to_k.	.k_proj.	
+Cosmos3ForConditionalGeneration	substr	.to_v.	.v_proj.	
+Cosmos3ForConditionalGeneration	substr	.to_out.	.o_proj.	
+Cosmos3ForConditionalGeneration	substr	.norm_q.	.q_norm.	
+Cosmos3ForConditionalGeneration	substr	.norm_k.	.k_norm.	
+Cosmos3ForConditionalGeneration	substr	.input_quantizer.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.weight_quantizer.	<drop>	
+Cosmos3ForConditionalGeneration	substr	.output_quantizer.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	proj_in.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	proj_out.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	time_embedder.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	audio_proj_in.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	audio_proj_out.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	action_proj_in.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	action_proj_out.	<drop>	
+Cosmos3ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+D3ForSequenceClassification	prefix	language_model.	language_model.model.	
+D3ForSequenceClassification	prefix	mtp.	<drop>	
+DFlash2DraftModel	stacked	.q_proj	.qkv_proj	q
+DFlash2DraftModel	stacked	.k_proj	.qkv_proj	k
+DFlash2DraftModel	stacked	.v_proj	.qkv_proj	v
+DFlash2DraftModel	stacked	.gate_proj	.gate_up_proj	0
+DFlash2DraftModel	stacked	.up_proj	.gate_up_proj	1
+DFlashDraftModel	stacked	.q_proj	.qkv_proj	q
+DFlashDraftModel	stacked	.k_proj	.qkv_proj	k
+DFlashDraftModel	stacked	.v_proj	.qkv_proj	v
+DFlashDraftModel	stacked	.gate_proj	.gate_up_proj	0
+DFlashDraftModel	stacked	.up_proj	.gate_up_proj	1
+DFlashMuseGlimmerAssistantModel	stacked	.q_proj	.qkv_proj	q
+DFlashMuseGlimmerAssistantModel	stacked	.k_proj	.qkv_proj	k
+DFlashMuseGlimmerAssistantModel	stacked	.v_proj	.qkv_proj	v
+DFlashMuseGlimmerAssistantModel	stacked	.gate_proj	.gate_up_proj	0
+DFlashMuseGlimmerAssistantModel	stacked	.up_proj	.gate_up_proj	1
+DFlashQwen3XPressModel	stacked	.q_proj	.qkv_proj	q
+DFlashQwen3XPressModel	stacked	.k_proj	.qkv_proj	k
+DFlashQwen3XPressModel	stacked	.v_proj	.qkv_proj	v
+DFlashQwen3XPressModel	stacked	.gate_proj	.gate_up_proj	0
+DFlashQwen3XPressModel	stacked	.up_proj	.gate_up_proj	1
+DSparkMiniMaxDraftModel	stacked	.q_proj	.qkv_proj	q
+DSparkMiniMaxDraftModel	stacked	.k_proj	.qkv_proj	k
+DSparkMiniMaxDraftModel	stacked	.v_proj	.qkv_proj	v
+DSparkMiniMaxDraftModel	stacked	.gate_proj	.gate_up_proj	0
+DSparkMiniMaxDraftModel	stacked	.up_proj	.gate_up_proj	1
+DeciLMForCausalLM	stacked	.q_proj	.qkv_proj	q
+DeciLMForCausalLM	stacked	.k_proj	.qkv_proj	k
+DeciLMForCausalLM	stacked	.v_proj	.qkv_proj	v
+DeciLMForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+DeciLMForCausalLM	stacked	.up_proj	.gate_up_proj	1
+DeepseekOCR2ForCausalLM	prefix	model.embed_tokens.	language_model.model.embed_tokens.	
+DeepseekOCR2ForCausalLM	prefix	model.layers.	language_model.model.layers.	
+DeepseekOCR2ForCausalLM	prefix	model.norm.	language_model.model.norm.	
+DeepseekOCR2ForCausalLM	prefix	lm_head.	language_model.lm_head.	
+DeepseekOCR2ForCausalLM	prefix	model.		
+DeepseekOCRForCausalLM	prefix	model.embed_tokens.	language_model.model.embed_tokens.	
+DeepseekOCRForCausalLM	prefix	model.layers.	language_model.model.layers.	
+DeepseekOCRForCausalLM	prefix	model.norm.	language_model.model.norm.	
+DeepseekOCRForCausalLM	prefix	lm_head.	language_model.lm_head.	
+DeepseekOCRForCausalLM	prefix	model.		
+DeepseekV4ForCausalLM	regex	(\.experts\.\d+\.w[123]\.base_layer)\.scale$	\1.weight_scale	
+DeepseekV4ForCausalLM	regex	(\.experts\.\d+\.w[123])\.scale$	\1.weight_scale	
+DeepseekV4ForCausalLM	regex	\.scale$	.weight_scale_inv	
+DeepseekV4ForCausalLM	substr	.shared_experts.w2	.shared_experts.down_proj	
+DeepseekV4ForCausalLM	substr	mtp.	<drop>	
+DeepseekV4ForCausalLM	prefix	layers.	model.layers.	
+DeepseekV4ForCausalLM	prefix	embed.	model.embed.	
+DeepseekV4ForCausalLM	prefix	norm.	model.norm.	
+DeepseekV4ForCausalLM	prefix	hc_head	model.hc_head	
+DeepseekV4ForCausalLM	prefix	mtp.	model.mtp.	
+DeepseekV4ForCausalLM	suffix	head.weight	lm_head.weight	
+DeepseekV4ForCausalLM	suffix	embed.weight	embed_tokens.weight	
+DeepseekV4ForCausalLM	suffix	.ffn.gate.bias	.ffn.gate.e_score_correction_bias	
+DeepseekVLV2ForCausalLM	prefix	language.	language_model.	
+DiffusionGemmaForBlockDiffusion	prefix	model.decoder.self_conditioning.	self_conditioning.	
+DiffusionGemmaForBlockDiffusion	prefix	model.decoder.	model.	
+DiffusionGemmaForBlockDiffusion	prefix	model.encoder.language_model.	model.	
+DiffusionGemmaForBlockDiffusion	prefix	model.encoder.vision_tower.	vision_tower.	
+DiffusionGemmaForBlockDiffusion	prefix	model.encoder.embed_vision.	embed_vision.	
+Dots3NoteForCausalLM	prefix	model.	language_model.model.	
+Dots3NoteForCausalLM	prefix	lm_head.	language_model.lm_head.	
+Dots3NoteForCausalLM	prefix	mtp.	language_model.mtp.	
+Dots3NoteForCausalLM	prefix	vision_encoder.	visual.	
+Dots3NoteForCausalLM	prefix	audio_encoder.	audio_tower.	
+DotsOCRForCausalLM	substr	.attn.qkv_proj.	.attn.qkv.	
+DotsOCRForCausalLM	substr	.attn.out_proj.	.attn.proj.	
+DotsOCRForCausalLM	stacked	.fc1.	.fc13.	0
+DotsOCRForCausalLM	stacked	.fc3.	.fc13.	1
+DotsOCRForCausalLM	prefix	lm_head.	language_model.lm_head.	
+DotsOCRForCausalLM	prefix	model.	language_model.model.	
+Eagle3Qwen3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Eagle3Qwen3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Eagle3Qwen3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Eagle3Qwen3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Eagle3Qwen3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+EagleCohereForCausalLM	substr	_quantizer.	<drop>	
+EagleCohereForCausalLM	stacked	.q_proj	.qkv_proj	q
+EagleCohereForCausalLM	stacked	.k_proj	.qkv_proj	k
+EagleCohereForCausalLM	stacked	.v_proj	.qkv_proj	v
+EagleCohereForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+EagleCohereForCausalLM	stacked	.up_proj	.gate_up_proj	1
+EagleCohereForCausalLM	prefix	lm_head	<drop>	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention_norm\.weight\Z	model.layers.\1.input_layernorm.weight	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wq_a\.(\w+)\Z	model.layers.\1.self_attn.q_a_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.q_a_norm\.weight\Z	model.layers.\1.self_attn.q_a_layernorm.weight	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wq_b\.(\w+)\Z	model.layers.\1.self_attn.q_b_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wkv_a_with_mqa\.(\w+)\Z	model.layers.\1.self_attn.kv_a_proj_with_mqa.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.kv_a_norm\.weight\Z	model.layers.\1.self_attn.kv_a_layernorm.weight	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wkv_b\.(\w+)\Z	model.layers.\1.self_attn.kv_b_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wo\.(\w+)\Z	model.layers.\1.self_attn.o_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.ffn_norm\.weight\Z	model.layers.\1.post_attention_layernorm.weight	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.feed_forward\.w1\.(\w+)\Z	model.layers.\1.mlp.gate_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.feed_forward\.w2\.(\w+)\Z	model.layers.\1.mlp.down_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.feed_forward\.w3\.(\w+)\Z	model.layers.\1.mlp.up_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.gate\.weight\Z	model.layers.\1.mlp.gate.weight	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.shared_experts\.w1\.(\w+)\Z	model.layers.\1.mlp.shared_experts.gate_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.shared_experts\.w2\.(\w+)\Z	model.layers.\1.mlp.shared_experts.down_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.shared_experts\.w3\.(\w+)\Z	model.layers.\1.mlp.shared_experts.up_proj.\2	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.experts\.(\d+)\.w1\.(\w+)\Z	model.layers.\1.mlp.experts.\2.gate_proj.\3	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.experts\.(\d+)\.w2\.(\w+)\Z	model.layers.\1.mlp.experts.\2.down_proj.\3	
+EagleMistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.experts\.(\d+)\.w3\.(\w+)\Z	model.layers.\1.mlp.experts.\2.up_proj.\3	
+EagleMistralLarge3ForCausalLM	regex	\Anorm\.weight\Z	model.norm.weight	
+EagleMistralLarge3ForCausalLM	regex	\Atok_embeddings\.weight\Z	model.embed_tokens.weight	
+EagleMistralLarge3ForCausalLM	regex	\Aoutput\.weight\Z	lm_head.weight	
+EagleMistralLarge3ForCausalLM	regex	\Aeagle_linear\.weight\Z	model.fc.weight	
+EagleMistralLarge3ForCausalLM	regex	\Aeagle_linear\.qscale_act\Z	model.fc.input_scale	
+EagleMistralLarge3ForCausalLM	regex	\Aeagle_linear\.qscale_weight\Z	model.fc.weight_scale	
+EagleMistralLarge3ForCausalLM	suffix	.qscale_act	.input_scale	
+EagleMistralLarge3ForCausalLM	suffix	.qscale_weight	.weight_scale	
+EmbeddingGemma2Model	stacked	.self_attn.q_proj.weight	.self_attn.qkv_proj.weight	q
+EmbeddingGemma2Model	stacked	.self_attn.k_proj.weight	.self_attn.qkv_proj.weight	k
+EmbeddingGemma2Model	stacked	.self_attn.v_proj.weight	.self_attn.qkv_proj.weight	v
+EmbeddingGemma2Model	stacked	.self_attn.q_proj.bias	.self_attn.qkv_proj.bias	q
+EmbeddingGemma2Model	stacked	.self_attn.k_proj.bias	.self_attn.qkv_proj.bias	k
+EmbeddingGemma2Model	stacked	.self_attn.v_proj.bias	.self_attn.qkv_proj.bias	v
+EmbeddingGemma2Model	stacked	.mlp.gate_proj.weight	.mlp.gate_up_proj.weight	0
+EmbeddingGemma2Model	stacked	.mlp.up_proj.weight	.mlp.gate_up_proj.weight	1
+EmbeddingGemma2Model	stacked	.mlp.gate_proj.bias	.mlp.gate_up_proj.bias	0
+EmbeddingGemma2Model	stacked	.mlp.up_proj.bias	.mlp.gate_up_proj.bias	1
+Ernie4_5ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Ernie4_5ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Ernie4_5ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Ernie4_5ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Ernie4_5ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Ernie4_5_VLMoeForConditionalGeneration	substr	spatial_linear.0.	spatial_linear1.	
+Ernie4_5_VLMoeForConditionalGeneration	substr	spatial_linear.2.	spatial_linear2.	
+Ernie4_5_VLMoeForConditionalGeneration	substr	spatial_linear.3.	spatial_norm.	
+Ernie4_5_VLMoeForConditionalGeneration	substr	temporal_linear.0.	temporal_linear1.	
+Ernie4_5_VLMoeForConditionalGeneration	substr	temporal_linear.2.	temporal_linear2.	
+Ernie4_5_VLMoeForConditionalGeneration	substr	temporal_linear.3.	temporal_norm.	
+Ernie4_5_VLMoeForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Ernie4_5_VLMoeForConditionalGeneration	prefix	model.	language_model.model.	
+Ernie4_5_VLMoeForConditionalGeneration	prefix	language_model.model.resampler_model.	resampler_model.	
+Exaone4ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Exaone4ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Exaone4ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Exaone4ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Exaone4ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Exaone4_5_ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Exaone4_5_ForConditionalGeneration	prefix	model.visual.	visual.	
+Exaone4_5_ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Exaone4_5_ForConditionalGeneration	prefix	model.	language_model.model.	
+Exaone4_5_ForConditionalGeneration	prefix	mtp.	<drop>	
+ExaoneForCausalLM	stacked	.q_proj	.qkv_proj	q
+ExaoneForCausalLM	stacked	.k_proj	.qkv_proj	k
+ExaoneForCausalLM	stacked	.v_proj	.qkv_proj	v
+ExaoneForCausalLM	stacked	.c_fc_0	.gate_up_proj	0
+ExaoneForCausalLM	stacked	.c_fc_1	.gate_up_proj	1
+ExaoneMoEForCausalLM	stacked	.q_proj	.qkv_proj	q
+ExaoneMoEForCausalLM	stacked	.k_proj	.qkv_proj	k
+ExaoneMoEForCausalLM	stacked	.v_proj	.qkv_proj	v
+ExaoneMoEForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+ExaoneMoEForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+ExaoneMoEForCausalLM	stacked	.shared_experts.gate_proj	.shared_experts.gate_up_proj	0
+ExaoneMoEForCausalLM	stacked	.shared_experts.up_proj	.shared_experts.gate_up_proj	1
+ExaoneMoEForCausalLM	prefix	mtp.	<drop>	
+ExaoneMoeForCausalLM	stacked	.q_proj	.qkv_proj	q
+ExaoneMoeForCausalLM	stacked	.k_proj	.qkv_proj	k
+ExaoneMoeForCausalLM	stacked	.v_proj	.qkv_proj	v
+ExaoneMoeForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+ExaoneMoeForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+ExaoneMoeForCausalLM	stacked	.shared_experts.gate_proj	.shared_experts.gate_up_proj	0
+ExaoneMoeForCausalLM	stacked	.shared_experts.up_proj	.shared_experts.gate_up_proj	1
+ExaoneMoeForCausalLM	prefix	mtp.	<drop>	
+FalconH1ForCausalLM	substr	A_log	A	
+FalconH1ForCausalLM	substr	mamba	mamba.mamba	
+FalconH1ForCausalLM	stacked	.q_proj	.qkv_proj	q
+FalconH1ForCausalLM	stacked	.k_proj	.qkv_proj	k
+FalconH1ForCausalLM	stacked	.v_proj	.qkv_proj	v
+FalconH1ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+FalconH1ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+FalconMambaForCausalLM	substr	.A_log	.A	
+FireRedASR2ForConditionalGeneration	substr	llm.	model.decoder.	
+FireRedASR2ForConditionalGeneration	substr	encoder.	model.encoder.audio_encoder.	
+FireRedASR2ForConditionalGeneration	substr	encoder_projector.	model.encoder_projector.	
+FireRedASR2ForConditionalGeneration	substr	net.0	pre_layer_norm	
+FireRedASR2ForConditionalGeneration	substr	net.1	linear_expand	
+FireRedASR2ForConditionalGeneration	substr	net.4	linear_project	
+FireRedASR2ForConditionalGeneration	prefix	model.encoder.audio_encoder.positional_encoding.pe	<drop>	
+FlintForCausalLM	stacked	.q_proj	.qkv_proj	q
+FlintForCausalLM	stacked	.k_proj	.qkv_proj	k
+FlintForCausalLM	stacked	.v_proj	.qkv_proj	v
+FlintForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+FlintForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+FlintForCausalLM	stacked	.shared_expert.gate_proj	.shared_expert.gate_up_proj	0
+FlintForCausalLM	stacked	.shared_expert.up_proj	.shared_expert.gate_up_proj	1
+FunASRForConditionalGeneration	substr	linear_q.	q_proj.	
+FunASRForConditionalGeneration	substr	linear_k.	k_proj.	
+FunASRForConditionalGeneration	substr	linear_v.	v_proj.	
+FunASRForConditionalGeneration	substr	linear_out.	out_proj.	
+FunASRForConditionalGeneration	substr	audio_adaptor.	model.encoder.audio_adaptor.	
+FunASRForConditionalGeneration	substr	audio_encoder.	model.encoder.audio_encoder.	
+FunASRForConditionalGeneration	substr	llm.model.	model.decoder.	
+FunASRForConditionalGeneration	substr	llm.lm_head	lm_head	
+FunAudioChatForConditionalGeneration	prefix	audio_invert_tower.	<drop>	
+GLM4VForCausalLM	substr	.word_embeddings		
+GLM4VForCausalLM	stacked	linear_proj.gate_proj	linear_proj.merged_proj	0
+GLM4VForCausalLM	stacked	linear_proj.dense_h_to_4h	linear_proj.merged_proj	1
+GPTJForCausalLM	substr	attn.bias	<drop>	
+GPTJForCausalLM	substr	attn.masked_bias	<drop>	
+GPTJForCausalLM	stacked	.q_proj	.qkv_proj	q
+GPTJForCausalLM	stacked	.k_proj	.qkv_proj	k
+GPTJForCausalLM	stacked	.v_proj	.qkv_proj	v
+Gemma2ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Gemma2ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Gemma2ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Gemma2ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Gemma2ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Gemma2Model	stacked	.q_proj	.qkv_proj	q
+Gemma2Model	stacked	.k_proj	.qkv_proj	k
+Gemma2Model	stacked	.v_proj	.qkv_proj	v
+Gemma2Model	stacked	.gate_proj	.gate_up_proj	0
+Gemma2Model	stacked	.up_proj	.gate_up_proj	1
+Gemma3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Gemma3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Gemma3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Gemma3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Gemma3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Gemma3ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Gemma3ForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+Gemma3ForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+Gemma3ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Gemma3TextModel	stacked	.q_proj	.qkv_proj	q
+Gemma3TextModel	stacked	.k_proj	.qkv_proj	k
+Gemma3TextModel	stacked	.v_proj	.qkv_proj	v
+Gemma3TextModel	stacked	.gate_proj	.gate_up_proj	0
+Gemma3TextModel	stacked	.up_proj	.gate_up_proj	1
+Gemma3nForCausalLM	substr	embed_audio.	<drop>	
+Gemma3nForCausalLM	substr	embed_vision.	<drop>	
+Gemma3nForCausalLM	substr	audio_tower.	<drop>	
+Gemma3nForCausalLM	substr	vision_tower.	<drop>	
+Gemma3nForConditionalGeneration	prefix	model.embed_audio.	embed_audio.	
+Gemma3nForConditionalGeneration	prefix	model.embed_vision.	embed_vision.	
+Gemma3nForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Gemma3nForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+Gemma3nForConditionalGeneration	prefix	model.audio_tower.	audio_tower.	
+Gemma3nForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+Gemma3nForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Gemma3nForConditionalGeneration	prefix	model	language_model.model	
+Gemma4DSparkModel	stacked	.q_proj	.qkv_proj	q
+Gemma4DSparkModel	stacked	.k_proj	.qkv_proj	k
+Gemma4DSparkModel	stacked	.v_proj	.qkv_proj	v
+Gemma4DSparkModel	stacked	.gate_proj	.gate_up_proj	0
+Gemma4DSparkModel	stacked	.up_proj	.gate_up_proj	1
+Gemma4ForCausalLM	substr	audio_tower.	<drop>	
+Gemma4ForCausalLM	substr	vision_tower.	<drop>	
+Gemma4ForCausalLM	substr	embed_audio.	<drop>	
+Gemma4ForCausalLM	substr	embed_vision.	<drop>	
+Gemma4ForCausalLM	prefix	model.language_model.	model.	
+Gemma4ForConditionalGeneration	prefix	model.vision_tower	vision_tower	
+Gemma4ForConditionalGeneration	prefix	model.embed_vision	embed_vision	
+Gemma4ForConditionalGeneration	prefix	model.audio_tower.	audio_tower.	
+Gemma4ForConditionalGeneration	prefix	model.embed_audio.	embed_audio.	
+Gemma4ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Gemma4ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Gemma4ForConditionalGeneration	prefix	model	language_model.model	
+Gemma4MTPModel	stacked	.gate_proj	.gate_up_proj	0
+Gemma4MTPModel	stacked	.up_proj	.gate_up_proj	1
+Gemma4MTPModel	prefix	pre_projection.	model.pre_projection.	
+Gemma4MTPModel	prefix	post_projection.	model.post_projection.	
+Gemma4UnifiedForConditionalGeneration	prefix	model.embed_audio.	embed_audio.	
+Gemma4UnifiedForConditionalGeneration	prefix	model.embed_vision.	embed_vision.	
+Gemma4UnifiedForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Gemma4UnifiedForConditionalGeneration	prefix	model.vision_embedder.	vision_embedder.	
+Gemma4UnifiedForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Gemma4UnifiedForConditionalGeneration	prefix	model	language_model.model	
+GemmaForCausalLM	stacked	.q_proj	.qkv_proj	q
+GemmaForCausalLM	stacked	.k_proj	.qkv_proj	k
+GemmaForCausalLM	stacked	.v_proj	.qkv_proj	v
+GemmaForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+GemmaForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Glm4vForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Glm4vForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Glm4vForConditionalGeneration	prefix	model.visual.	visual.	
+Glm4vMoeForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Glm4vMoeForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Glm4vMoeForConditionalGeneration	prefix	model.visual.	visual.	
+Glm5NextForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Glm5NextForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Glm5NextForConditionalGeneration	prefix	model.visual.	visual.	
+GlmAsrForConditionalGeneration	prefix	audio_tower.embed_positions	<drop>	
+GlmOcrForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+GlmOcrForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+GlmOcrForConditionalGeneration	prefix	model.visual.	visual.	
+GptOssForCausalLM	substr	.self_attn.	.attn.	
+GptOssForCausalLM	suffix	.embed_tokens.weight	.embedding.weight	
+GptOssForCausalLM	suffix	.gate_up_proj_blocks	.w13_weight	
+GptOssForCausalLM	suffix	.down_proj_blocks	.w2_weight	
+GptOssForCausalLM	suffix	.gate_up_proj_scales	.w13_weight_scale	
+GptOssForCausalLM	suffix	.down_proj_scales	.w2_weight_scale	
+GptOssForCausalLM	suffix	.gate_up_proj	.w13_weight	
+GptOssForCausalLM	suffix	.down_proj	.w2_weight	
+GptOssForCausalLM	suffix	.gate_up_proj_bias	.w13_bias	
+GptOssForCausalLM	suffix	.down_proj_bias	.w2_bias	
+GptOssForCausalLM	suffix	.gate_up_proj.weight	.w13_weight	
+GptOssForCausalLM	suffix	.gate_up_proj.weight_scale	.w13_weight_scale	
+GptOssForCausalLM	suffix	.gate_up_proj.bias	.w13_bias	
+GptOssForCausalLM	suffix	.gate_up_proj.input_scale	.w13_input_scale	
+GptOssForCausalLM	suffix	.down_proj.weight	.w2_weight	
+GptOssForCausalLM	suffix	.down_proj.weight_scale	.w2_weight_scale	
+GptOssForCausalLM	suffix	.down_proj.bias	.w2_bias	
+GptOssForCausalLM	suffix	.down_proj.input_scale	.w2_input_scale	
+Granite4VisionForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Granite4VisionForConditionalGeneration	prefix	model.layerwise_projectors.	layerwise_projectors.	
+Granite4VisionForConditionalGeneration	prefix	model.spatial_projectors.	spatial_projectors.	
+Granite4VisionForConditionalGeneration	prefix	model.image_newline	image_newline	
+Granite4VisionForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+Granite4VisionForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+GraniteForCausalLM	stacked	.q_proj	.qkv_proj	q
+GraniteForCausalLM	stacked	.k_proj	.qkv_proj	k
+GraniteForCausalLM	stacked	.v_proj	.qkv_proj	v
+GraniteForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+GraniteForCausalLM	stacked	.up_proj	.gate_up_proj	1
+GraniteSWAForCausalLM	stacked	.q_proj	.qkv_proj	q
+GraniteSWAForCausalLM	stacked	.k_proj	.qkv_proj	k
+GraniteSWAForCausalLM	stacked	.v_proj	.qkv_proj	v
+GraniteSWAForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+GraniteSWAForCausalLM	stacked	.up_proj	.gate_up_proj	1
+GraniteSpeechForConditionalGeneration	prefix	language_model.model.model.	language_model.model.	
+GraniteSpeechPlusForConditionalGeneration	prefix	language_model.model.model.	language_model.model.	
+GteModel	substr	layer	layers	
+GteModel	substr	attention.qkv_proj	attn.qkv_proj	
+GteModel	substr	attention.o_proj	attn.out_proj	
+GteNewModel	substr	new.		
+GteNewModel	substr	layer	layers	
+GteNewModel	substr	attention.qkv_proj	attn.qkv_proj	
+GteNewModel	substr	attention.o_proj	attn.out_proj	
+H2OVLChatModel	prefix	action_embed	<drop>	
+H2OVLChatModel	prefix	temporal_embed	<drop>	
+H2OVLChatModel	prefix	track_embed	<drop>	
+H2OVLChatModel	prefix	track_embed_decoder	<drop>	
+H2OVLChatModel	prefix	box_token	<drop>	
+H2OVLChatModel	prefix	cg_criterion	<drop>	
+H2OVLChatModel	prefix	cg_model	<drop>	
+H2OVLChatModel	prefix	loc_encoder	<drop>	
+H2OVLChatModel	prefix	loc_decoder	<drop>	
+H2OVLChatModel	prefix	sam	<drop>	
+H2OVLChatModel	prefix	temporal_token	<drop>	
+H2OVLChatModel	prefix	track_token	<drop>	
+HCXVisionV2ForCausalLM	substr	discrete_vision_model	<drop>	
+HCXVisionV2ForCausalLM	prefix	model.		
+HCXVisionV2ForCausalLM	prefix	vision_model.	visual.	
+HF_ColBERT	prefix	bert.	model.	
+HF_ColBERT	prefix	roberta.	model.	
+HF_ColBERT	prefix	encoder.	model.encoder.	
+HF_ColBERT	prefix	embeddings.	model.embeddings.	
+HYV4ForCausalLM	stacked	.q_a_proj	.fused_qkv_a_proj	0
+HYV4ForCausalLM	stacked	.kv_a_proj_with_mqa	.fused_qkv_a_proj	1
+HYV4ForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+HYV4ForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+HYV4ForCausalLM	stacked	.shared_experts.gate_proj	.shared_experts.gate_up_proj	0
+HYV4ForCausalLM	stacked	.shared_experts.up_proj	.shared_experts.gate_up_proj	1
+HYV4ForCausalLM	stacked	.indexer.weights_proj.	.indexer.wk_weights_proj.	1
+HrmTextForCausalLM	substr	.attn.	.self_attn.	
+HyperCLOVAXForCausalLM	stacked	.q_proj	.qkv_proj	q
+HyperCLOVAXForCausalLM	stacked	.k_proj	.qkv_proj	k
+HyperCLOVAXForCausalLM	stacked	.v_proj	.qkv_proj	v
+HyperCLOVAXForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+HyperCLOVAXForCausalLM	stacked	.up_proj	.gate_up_proj	1
+IQuestCoderForCausalLM	stacked	.q_proj	.qkv_proj	q
+IQuestCoderForCausalLM	stacked	.k_proj	.qkv_proj	k
+IQuestCoderForCausalLM	stacked	.v_proj	.qkv_proj	v
+IQuestCoderForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+IQuestCoderForCausalLM	stacked	.up_proj	.gate_up_proj	1
+InklingForCausalLM	substr	.w13_dn	.gate_up_proj	
+InklingForCausalLM	substr	.w2_md	.down_proj	
+InklingForCausalLM	stacked	.attn.wq_du.	.attn.qkvr.	0
+InklingForCausalLM	stacked	.attn.wk_dv.	.attn.qkvr.	1
+InklingForCausalLM	stacked	.attn.wv_dv.	.attn.qkvr.	2
+InklingForCausalLM	stacked	.attn.wr_du.	.attn.qkvr.	3
+InklingForCausalLM	prefix	model.llm.layers.	model.layers.	
+InklingForCausalLM	prefix	model.llm.embed_norm	model.embed_norm	
+InklingForCausalLM	prefix	model.llm.embed	model.embed_tokens	
+InklingForCausalLM	prefix	model.llm.norm	model.norm	
+InklingForCausalLM	prefix	model.llm.unembed	lm_head	
+InklingForCausalLM	prefix	language_model.layers.	model.layers.	
+InklingForCausalLM	prefix	language_model.lm_head.	lm_head.	
+InklingForCausalLM	suffix	.w13_weight.scale	.w13_weight_scale	
+InklingForCausalLM	suffix	.w13_weight.scale2	.w13_weight_scale_2	
+InklingForCausalLM	suffix	.w2_weight.scale	.w2_weight_scale	
+InklingForCausalLM	suffix	.w2_weight.scale2	.w2_weight_scale_2	
+InklingForCausalLM	suffix	.w13_weight.input_global_scale	.w13_input_global_scale	
+InklingForCausalLM	suffix	.w13_weight.weight_global_scale	.w13_weight_global_scale	
+InklingForCausalLM	suffix	.w13_weight.weight_packed	.w13_weight_packed	
+InklingForCausalLM	suffix	.w13_weight.weight_scale	.w13_weight_scale	
+InklingForCausalLM	suffix	.w2_weight.input_global_scale	.w2_input_global_scale	
+InklingForCausalLM	suffix	.w2_weight.weight_global_scale	.w2_weight_global_scale	
+InklingForCausalLM	suffix	.w2_weight.weight_packed	.w2_weight_packed	
+InklingForCausalLM	suffix	.w2_weight.weight_scale	.w2_weight_scale	
+InklingForConditionalGeneration	substr	.w13_dn	.gate_up_proj	
+InklingForConditionalGeneration	substr	.w2_md	.down_proj	
+InklingForConditionalGeneration	stacked	.attn.wq_du.	.attn.qkvr.	0
+InklingForConditionalGeneration	stacked	.attn.wk_dv.	.attn.qkvr.	1
+InklingForConditionalGeneration	stacked	.attn.wv_dv.	.attn.qkvr.	2
+InklingForConditionalGeneration	stacked	.attn.wr_du.	.attn.qkvr.	3
+InklingForConditionalGeneration	prefix	model.llm.layers.	model.layers.	
+InklingForConditionalGeneration	prefix	model.llm.embed_norm	model.embed_norm	
+InklingForConditionalGeneration	prefix	model.llm.embed	model.embed_tokens	
+InklingForConditionalGeneration	prefix	model.llm.norm	model.norm	
+InklingForConditionalGeneration	prefix	model.llm.unembed	lm_head	
+InklingForConditionalGeneration	prefix	language_model.layers.	model.layers.	
+InklingForConditionalGeneration	prefix	language_model.lm_head.	lm_head.	
+InklingForConditionalGeneration	prefix	model.audio.	audio.	
+InklingForConditionalGeneration	prefix	model.visual.	visual.vision_encoder.	
+InklingForConditionalGeneration	suffix	.w13_weight.scale	.w13_weight_scale	
+InklingForConditionalGeneration	suffix	.w13_weight.scale2	.w13_weight_scale_2	
+InklingForConditionalGeneration	suffix	.w2_weight.scale	.w2_weight_scale	
+InklingForConditionalGeneration	suffix	.w2_weight.scale2	.w2_weight_scale_2	
+InklingForConditionalGeneration	suffix	.w13_weight.input_global_scale	.w13_input_global_scale	
+InklingForConditionalGeneration	suffix	.w13_weight.weight_global_scale	.w13_weight_global_scale	
+InklingForConditionalGeneration	suffix	.w13_weight.weight_packed	.w13_weight_packed	
+InklingForConditionalGeneration	suffix	.w13_weight.weight_scale	.w13_weight_scale	
+InklingForConditionalGeneration	suffix	.w2_weight.input_global_scale	.w2_input_global_scale	
+InklingForConditionalGeneration	suffix	.w2_weight.weight_global_scale	.w2_weight_global_scale	
+InklingForConditionalGeneration	suffix	.w2_weight.weight_packed	.w2_weight_packed	
+InklingForConditionalGeneration	suffix	.w2_weight.weight_scale	.w2_weight_scale	
+InklingMTPModel	substr	.w13_dn	.gate_up_proj	
+InklingMTPModel	substr	.w2_md	.down_proj	
+InklingMTPModel	stacked	.attn.wq_du.	.attn.qkvr.	0
+InklingMTPModel	stacked	.attn.wk_dv.	.attn.qkvr.	1
+InklingMTPModel	stacked	.attn.wv_dv.	.attn.qkvr.	2
+InklingMTPModel	stacked	.attn.wr_du.	.attn.qkvr.	3
+InklingMTPModel	prefix	model.llm.layers.	model.layers.	
+InklingMTPModel	prefix	model.llm.embed_norm	model.embed_norm	
+InklingMTPModel	prefix	model.llm.embed	model.embed_tokens	
+InklingMTPModel	prefix	model.llm.norm	model.norm	
+InklingMTPModel	prefix	model.llm.unembed	lm_head	
+InklingMTPModel	prefix	language_model.layers.	model.layers.	
+InklingMTPModel	prefix	language_model.lm_head.	lm_head.	
+InklingMTPModel	prefix	model.mtp.	model.	
+InklingMTPModel	suffix	.w13_weight.scale	.w13_weight_scale	
+InklingMTPModel	suffix	.w13_weight.scale2	.w13_weight_scale_2	
+InklingMTPModel	suffix	.w2_weight.scale	.w2_weight_scale	
+InklingMTPModel	suffix	.w2_weight.scale2	.w2_weight_scale_2	
+InklingMTPModel	suffix	.w13_weight.input_global_scale	.w13_input_global_scale	
+InklingMTPModel	suffix	.w13_weight.weight_global_scale	.w13_weight_global_scale	
+InklingMTPModel	suffix	.w13_weight.weight_packed	.w13_weight_packed	
+InklingMTPModel	suffix	.w13_weight.weight_scale	.w13_weight_scale	
+InklingMTPModel	suffix	.w2_weight.input_global_scale	.w2_input_global_scale	
+InklingMTPModel	suffix	.w2_weight.weight_global_scale	.w2_weight_global_scale	
+InklingMTPModel	suffix	.w2_weight.weight_packed	.w2_weight_packed	
+InklingMTPModel	suffix	.w2_weight.weight_scale	.w2_weight_scale	
+InternLM2ForCausalLM	stacked	.w1	.gate_up_proj	0
+InternLM2ForCausalLM	stacked	.w3	.gate_up_proj	1
+InternLM2ForRewardModel	stacked	.w1	.gate_up_proj	0
+InternLM2ForRewardModel	stacked	.w3	.gate_up_proj	1
+InternLM3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+InternLM3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+InternLM3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+InternLM3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+InternLM3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+InternS1ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+InternS1ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+InternS1ForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+InternS1ForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+InternS1ProForConditionalGeneration	prefix	model.visual.	visual.	
+InternS1ProForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+InternS1ProForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+InternS2MobiusForConditionalGeneration	prefix	model.visual.	visual.	
+InternS2MobiusForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+InternS2MobiusForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+InternS2MobiusForConditionalGeneration	prefix	mtp.	<drop>	
+InternS2MobiusForConditionalGeneration	prefix	model.time_series.	<drop>	
+InternS2MobiusForConditionalGeneration	prefix	time_series.	<drop>	
+InternS2PreviewForConditionalGeneration	prefix	model.visual.	visual.	
+InternS2PreviewForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+InternS2PreviewForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+InternS2PreviewForConditionalGeneration	prefix	mtp.	<drop>	
+InternS2PreviewForConditionalGeneration	prefix	model.time_series.	<drop>	
+InternS2PreviewForConditionalGeneration	prefix	time_series.	<drop>	
+InternVLChatModel	prefix	action_embed	<drop>	
+InternVLChatModel	prefix	temporal_embed	<drop>	
+InternVLChatModel	prefix	track_embed	<drop>	
+InternVLChatModel	prefix	track_embed_decoder	<drop>	
+InternVLChatModel	prefix	box_token	<drop>	
+InternVLChatModel	prefix	cg_criterion	<drop>	
+InternVLChatModel	prefix	cg_model	<drop>	
+InternVLChatModel	prefix	loc_encoder	<drop>	
+InternVLChatModel	prefix	loc_decoder	<drop>	
+InternVLChatModel	prefix	sam	<drop>	
+InternVLChatModel	prefix	temporal_token	<drop>	
+InternVLChatModel	prefix	track_token	<drop>	
+InternVLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+InternVLForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+InternVLForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+InternVLForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+IsaacForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+IsaacForConditionalGeneration	prefix	model.text_model.lm_head.	language_model.lm_head.	
+IsaacForConditionalGeneration	prefix	model.text_model.	language_model.model.	
+IsaacForConditionalGeneration	prefix	model.vision_embedding.0	vision_embedding.transformer	
+IsaacForConditionalGeneration	prefix	model.vision_embedding.1	vision_embedding.linear_fc1	
+IsaacForConditionalGeneration	prefix	model.vision_embedding.2	vision_embedding.act	
+IsaacForConditionalGeneration	prefix	model.vision_embedding.3	vision_embedding.linear_fc2	
+IsaacForConditionalGeneration	prefix	model.vision_embedding.	vision_embedding.	
+IsaacForConditionalGeneration	prefix	model.lm_head.	language_model.lm_head.	
+IsaacForConditionalGeneration	prefix	model.	language_model.model.	
+JambaForCausalLM	substr	.self_attn.	.	
+JambaForCausalLM	substr	.A_log	.A	
+JambaForCausalLM	stacked	.q_proj	.qkv_proj	q
+JambaForCausalLM	stacked	.k_proj	.qkv_proj	k
+JambaForCausalLM	stacked	.v_proj	.qkv_proj	v
+JambaForCausalLM	stacked	.feed_forward.gate_proj	.feed_forward.gate_up_proj	0
+JambaForCausalLM	stacked	.feed_forward.up_proj	.feed_forward.gate_up_proj	1
+JambaForSequenceClassification	substr	.self_attn.	.	
+JambaForSequenceClassification	substr	.A_log	.A	
+JambaForSequenceClassification	stacked	.q_proj	.qkv_proj	q
+JambaForSequenceClassification	stacked	.k_proj	.qkv_proj	k
+JambaForSequenceClassification	stacked	.v_proj	.qkv_proj	v
+JambaForSequenceClassification	stacked	.feed_forward.gate_proj	.feed_forward.gate_up_proj	0
+JambaForSequenceClassification	stacked	.feed_forward.up_proj	.feed_forward.gate_up_proj	1
+JinaEmbeddingsV5Model	stacked	.q_proj	.qkv_proj	q
+JinaEmbeddingsV5Model	stacked	.k_proj	.qkv_proj	k
+JinaEmbeddingsV5Model	stacked	.v_proj	.qkv_proj	v
+JinaEmbeddingsV5Model	stacked	.gate_proj	.gate_up_proj	0
+JinaEmbeddingsV5Model	stacked	.up_proj	.gate_up_proj	1
+JinaEmbeddingsV5Model	prefix		model.	
+JinaForRanking	prefix	lm_head.	<drop>	
+JinaVLForRanking	prefix	model.language_model.	language_model.model.	
+JinaVLForRanking	prefix	model.visual.	visual.	
+JinaVLForRanking	prefix	lm_head.	language_model.lm_head.	
+JinaVLForRanking	prefix	model.	language_model.model.	
+K3DSparkModel	substr	confidence_head	<drop>	
+K3DSparkModel	substr	embed_tokens	<drop>	
+K3DSparkModel	substr	lm_head	<drop>	
+K3DSparkModel	stacked	.gate_proj	.gate_up_proj	0
+K3DSparkModel	stacked	.up_proj	.gate_up_proj	1
+K3DSparkModel	stacked	.q_a_proj	.fused_qkv_a_proj	0
+K3DSparkModel	stacked	.kv_a_proj_with_mqa	.fused_qkv_a_proj	1
+K3DSparkModel	prefix		model.	
+KimiK25ForConditionalGeneration	prefix	language_model.layers.	language_model.model.layers.	
+KimiK25ForConditionalGeneration	prefix	mm_projector.proj.0	mm_projector.linear_1	
+KimiK25ForConditionalGeneration	prefix	mm_projector.proj.2	mm_projector.linear_2	
+KimiK3ForConditionalGeneration	prefix	language_model.layers.	language_model.model.layers.	
+KimiK3ForConditionalGeneration	prefix	mm_projector.proj.0	mm_projector.linear_1	
+KimiK3ForConditionalGeneration	prefix	mm_projector.proj.2	mm_projector.linear_2	
+LLaMAForCausalLM	stacked	.q_proj	.qkv_proj	q
+LLaMAForCausalLM	stacked	.k_proj	.qkv_proj	k
+LLaMAForCausalLM	stacked	.v_proj	.qkv_proj	v
+LLaMAForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+LLaMAForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Lfm2BidirectionalModel	substr	.conv.	.short_conv.	
+Lfm2BidirectionalModel	stacked	.q_proj	.qkv_proj	q
+Lfm2BidirectionalModel	stacked	.k_proj	.qkv_proj	k
+Lfm2BidirectionalModel	stacked	.v_proj	.qkv_proj	v
+Lfm2BidirectionalModel	stacked	.w1	.w13	0
+Lfm2BidirectionalModel	stacked	.w3	.w13	1
+Lfm2ForCausalLM	substr	.conv.	.short_conv.	
+Lfm2ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Lfm2ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Lfm2ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Lfm2ForCausalLM	stacked	.w1	.w13	0
+Lfm2ForCausalLM	stacked	.w3	.w13	1
+Lfm2MoeForCausalLM	substr	.conv.	.short_conv.	
+Lfm2VlForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Lfm2VlForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Lfm2VlForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+Lfm2VlForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+LiLiCorrDraftModel	stacked	.q_proj	.qkv_proj	q
+LiLiCorrDraftModel	stacked	.k_proj	.qkv_proj	k
+LiLiCorrDraftModel	stacked	.v_proj	.qkv_proj	v
+LiLiCorrDraftModel	stacked	.gate_proj	.gate_up_proj	0
+LiLiCorrDraftModel	stacked	.up_proj	.gate_up_proj	1
+LightOnOCRForConditionalGeneration	prefix	model.vision_encoder.	vision_tower.	
+LightOnOCRForConditionalGeneration	prefix	model.vision_projection.	multi_modal_projector.	
+LightOnOCRForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+LightOnOCRForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Llama4ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Llama4ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Llama4ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Llama4ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Llama4ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+LlamaForCausalLM	stacked	.q_proj	.qkv_proj	q
+LlamaForCausalLM	stacked	.k_proj	.qkv_proj	k
+LlamaForCausalLM	stacked	.v_proj	.qkv_proj	v
+LlamaForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+LlamaForCausalLM	stacked	.up_proj	.gate_up_proj	1
+LlamaModel	stacked	.q_proj	.qkv_proj	q
+LlamaModel	stacked	.k_proj	.qkv_proj	k
+LlamaModel	stacked	.v_proj	.qkv_proj	v
+LlamaModel	stacked	.gate_proj	.gate_up_proj	0
+LlamaModel	stacked	.up_proj	.gate_up_proj	1
+LlamaNemotronVLForSequenceClassification	prefix	model.		
+LlamaNemotronVLForSequenceClassification	prefix	language_model.layers.	language_model.model.layers.	
+LlamaNemotronVLForSequenceClassification	prefix	language_model.embed_tokens.	language_model.model.embed_tokens.	
+LlamaNemotronVLForSequenceClassification	prefix	language_model.norm.	language_model.model.norm.	
+LlamaNemotronVLForSequenceClassification	prefix	vision_model.encoder.	vision_model.vision_model.encoder.	
+LlamaNemotronVLForSequenceClassification	prefix	vision_model.embeddings.	vision_model.vision_model.embeddings.	
+LlamaNemotronVLForSequenceClassification	prefix	vision_model.post_layernorm.	vision_model.vision_model.post_layernorm.	
+LlamaNemotronVLModel	prefix	language_model.layers.	language_model.model.layers.	
+LlamaNemotronVLModel	prefix	language_model.embed_tokens.	language_model.model.embed_tokens.	
+LlamaNemotronVLModel	prefix	language_model.norm.	language_model.model.norm.	
+LlamaNemotronVLModel	prefix	vision_model.encoder.	vision_model.vision_model.encoder.	
+LlamaNemotronVLModel	prefix	vision_model.embeddings.	vision_model.vision_model.embeddings.	
+LlamaNemotronVLModel	prefix	vision_model.post_layernorm.	vision_model.vision_model.post_layernorm.	
+Llama_Nemotron_Nano_VL	substr	norm_mean	<drop>	
+Llama_Nemotron_Nano_VL	substr	norm_std	<drop>	
+LlavaForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+LlavaForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+LlavaForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+LlavaForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+LlavaNextForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+LlavaNextForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+LlavaNextForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+LlavaNextForConditionalGeneration	prefix	model.image_newline	image_newline	
+LlavaNextForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+LlavaNextVideoForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+LlavaNextVideoForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+LlavaNextVideoForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+LlavaNextVideoForConditionalGeneration	prefix	model.image_newline	image_newline	
+LlavaNextVideoForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+LlavaOnevision2ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+LlavaOnevision2ForConditionalGeneration	prefix	model.visual.	visual.	
+LlavaOnevision2ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+LlavaOnevision2ForConditionalGeneration	prefix	model.	language_model.model.	
+LlavaOnevisionForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+LlavaOnevisionForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+LlavaOnevisionForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+LlavaOnevisionForConditionalGeneration	prefix	model.image_newline	image_newline	
+LlavaOnevisionForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+LongcatFlashNgramForCausalLM	prefix	model.mtp.	<drop>	
+Mamba2ForCausalLM	substr	.A_log	.A	
+MambaForCausalLM	substr	.A_log	.A	
+MiMoForCausalLM	prefix	model.mtp_layers.	<drop>	
+MiMoV2OmniForCausalLM	prefix	speech_embeddings.	audio_encoder.speech_embeddings.	
+MiMoV2OmniForCausalLM	prefix	model.language_model.	language_model.model.	
+MiMoV2OmniForCausalLM	prefix	model.visual.	visual.	
+MiMoV2OmniForCausalLM	prefix	lm_head.	language_model.lm_head.	
+MiMoV2OmniForCausalLM	prefix	model.	language_model.model.	
+MiMoV2OmniForCausalLM	prefix	audio_tokenizer.	<drop>	
+MingV3ASRForConditionalGeneration	prefix	model.audio.	audio_encoder.	
+MingV3ASRForConditionalGeneration	prefix	linear_proj_audio.	audio_projector.proj.	
+MingV3ASRForConditionalGeneration	prefix	model.visual.	<drop>	
+MingV3ASRForConditionalGeneration	prefix	linear_proj.	<drop>	
+MingV3ASRForConditionalGeneration	prefix	model.	language_model.model.	
+MingV3ASRForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+MiniCPMO	prefix	tts	<drop>	
+MiniCPMOcrForConditionalGeneration	stacked	.q_proj	.qkv_proj	q
+MiniCPMOcrForConditionalGeneration	stacked	.k_proj	.qkv_proj	k
+MiniCPMOcrForConditionalGeneration	stacked	.v_proj	.qkv_proj	v
+MiniCPMOcrForConditionalGeneration	prefix	model.vision_tower.vit_merger.	vit_merger.	
+MiniCPMOcrForConditionalGeneration	prefix	model.vision_tower.	vpm.	
+MiniCPMOcrForConditionalGeneration	prefix	model.vpm.	vpm.	
+MiniCPMOcrForConditionalGeneration	prefix	model.vit_merger.	vit_merger.	
+MiniCPMOcrForConditionalGeneration	prefix	model.merger.	merger.	
+MiniCPMOcrForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+MiniCPMOcrForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+MiniCPMOcrForConditionalGeneration	prefix	mtp.	<drop>	
+MiniCPMV4_6ForConditionalGeneration	stacked	.q_proj	.qkv_proj	q
+MiniCPMV4_6ForConditionalGeneration	stacked	.k_proj	.qkv_proj	k
+MiniCPMV4_6ForConditionalGeneration	stacked	.v_proj	.qkv_proj	v
+MiniCPMV4_6ForConditionalGeneration	prefix	model.vision_tower.vit_merger.	vit_merger.	
+MiniCPMV4_6ForConditionalGeneration	prefix	model.vision_tower.	vpm.	
+MiniCPMV4_6ForConditionalGeneration	prefix	model.vpm.	vpm.	
+MiniCPMV4_6ForConditionalGeneration	prefix	model.vit_merger.	vit_merger.	
+MiniCPMV4_6ForConditionalGeneration	prefix	model.merger.	merger.	
+MiniCPMV4_6ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+MiniCPMV4_6ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+MiniCPMV4_6ForConditionalGeneration	prefix	mtp.	<drop>	
+MiniCPMV4_7ForConditionalGeneration	stacked	.q_proj	.qkv_proj	q
+MiniCPMV4_7ForConditionalGeneration	stacked	.k_proj	.qkv_proj	k
+MiniCPMV4_7ForConditionalGeneration	stacked	.v_proj	.qkv_proj	v
+MiniCPMV4_7ForConditionalGeneration	prefix	model.vision_tower.vit_merger.	vit_merger.	
+MiniCPMV4_7ForConditionalGeneration	prefix	model.vision_tower.	vpm.	
+MiniCPMV4_7ForConditionalGeneration	prefix	model.vpm.	vpm.	
+MiniCPMV4_7ForConditionalGeneration	prefix	model.vit_merger.	vit_merger.	
+MiniCPMV4_7ForConditionalGeneration	prefix	model.merger.	merger.	
+MiniCPMV4_7ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+MiniCPMV4_7ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+MiniCPMV4_7ForConditionalGeneration	prefix	mtp.	<drop>	
+MiniMaxM2ForCausalLM	stacked	.q_proj	.qkv_proj	q
+MiniMaxM2ForCausalLM	stacked	.k_proj	.qkv_proj	k
+MiniMaxM2ForCausalLM	stacked	.v_proj	.qkv_proj	v
+MiniMaxM3SparseForConditionalGeneration	substr	.mlp.fc1.	.fc1.	
+MiniMaxM3SparseForConditionalGeneration	substr	.mlp.fc2.	.fc2.	
+MiniMaxM3SparseForConditionalGeneration	prefix	multi_modal_projector.	vision_tower.multi_modal_projector.	
+MiniMaxM3SparseForConditionalGeneration	prefix	patch_merge_mlp.	vision_tower.patch_merge_mlp.	
+Ministral3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Ministral3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Ministral3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Ministral3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Ministral3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Mistral3ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Mistral3ForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+Mistral3ForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+Mistral3ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Mistral3ForConditionalGeneration	prefix	model.	language_model.model.	
+Mistral3ForConditionalGeneration	suffix	.activation_scale	.input_scale	
+Mistral3ForConditionalGeneration	suffix	.weight_scale_inv	.weight_scale	
+MistralForCausalLM	stacked	.q_proj	.qkv_proj	q
+MistralForCausalLM	stacked	.k_proj	.qkv_proj	k
+MistralForCausalLM	stacked	.v_proj	.qkv_proj	v
+MistralForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+MistralForCausalLM	stacked	.up_proj	.gate_up_proj	1
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention_norm\.weight\Z	model.layers.\1.input_layernorm.weight	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wq_a\.(\w+)\Z	model.layers.\1.self_attn.q_a_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.q_a_norm\.weight\Z	model.layers.\1.self_attn.q_a_layernorm.weight	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wq_b\.(\w+)\Z	model.layers.\1.self_attn.q_b_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wkv_a_with_mqa\.(\w+)\Z	model.layers.\1.self_attn.kv_a_proj_with_mqa.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.kv_a_norm\.weight\Z	model.layers.\1.self_attn.kv_a_layernorm.weight	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wkv_b\.(\w+)\Z	model.layers.\1.self_attn.kv_b_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.attention\.wo\.(\w+)\Z	model.layers.\1.self_attn.o_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.ffn_norm\.weight\Z	model.layers.\1.post_attention_layernorm.weight	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.feed_forward\.w1\.(\w+)\Z	model.layers.\1.mlp.gate_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.feed_forward\.w2\.(\w+)\Z	model.layers.\1.mlp.down_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.feed_forward\.w3\.(\w+)\Z	model.layers.\1.mlp.up_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.gate\.weight\Z	model.layers.\1.mlp.gate.weight	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.shared_experts\.w1\.(\w+)\Z	model.layers.\1.mlp.shared_experts.gate_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.shared_experts\.w2\.(\w+)\Z	model.layers.\1.mlp.shared_experts.down_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.shared_experts\.w3\.(\w+)\Z	model.layers.\1.mlp.shared_experts.up_proj.\2	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.experts\.(\d+)\.w1\.(\w+)\Z	model.layers.\1.mlp.experts.\2.gate_proj.\3	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.experts\.(\d+)\.w2\.(\w+)\Z	model.layers.\1.mlp.experts.\2.down_proj.\3	
+MistralLarge3ForCausalLM	regex	\Alayers\.(\d+)\.experts\.(\d+)\.w3\.(\w+)\Z	model.layers.\1.mlp.experts.\2.up_proj.\3	
+MistralLarge3ForCausalLM	regex	\Anorm\.weight\Z	model.norm.weight	
+MistralLarge3ForCausalLM	regex	\Atok_embeddings\.weight\Z	model.embed_tokens.weight	
+MistralLarge3ForCausalLM	regex	\Aoutput\.weight\Z	lm_head.weight	
+MistralLarge3ForCausalLM	suffix	.qscale_act	.input_scale	
+MistralLarge3ForCausalLM	suffix	.qscale_weight	.weight_scale	
+MistralModel	stacked	.q_proj	.qkv_proj	q
+MistralModel	stacked	.k_proj	.qkv_proj	k
+MistralModel	stacked	.v_proj	.qkv_proj	v
+MistralModel	stacked	.gate_proj	.gate_up_proj	0
+MistralModel	stacked	.up_proj	.gate_up_proj	1
+MixtralForCausalLM	substr	.gate_proj.	.w1.	
+MixtralForCausalLM	substr	.up_proj.	.w3.	
+MixtralForCausalLM	substr	.down_proj.	.w2.	
+MixtralForCausalLM	stacked	.q_proj	.qkv_proj	q
+MixtralForCausalLM	stacked	.k_proj	.qkv_proj	k
+MixtralForCausalLM	stacked	.v_proj	.qkv_proj	v
+ModernBertForTokenClassification	prefix	drop	<drop>	
+ModernBertModel	prefix	model.layers.	encoder_layer.layers.	
+ModernBertModel	prefix	layers.	encoder_layer.layers.	
+ModernBertModel	prefix	model.		
+ModernVBertModel	prefix	model.text_model.layers.	text_layers.	
+ModernVBertModel	prefix	model.text_model.embeddings.	text_embeddings.	
+ModernVBertModel	prefix	model.text_model.final_norm.	text_final_norm.	
+ModernVBertModel	prefix	model.connector.modality_projection.	connector.proj.	
+ModernVBertModel	prefix	model.custom_text_proj.	custom_text_proj.	
+ModernVBertModel	prefix	model.vision_model.vision_model.	vision_model.vision_model.	
+ModernVBertModel	prefix	model.		
+Molmo2ForConditionalGeneration	substr	image_pooling_2d.wq	image_pooling_2d.q_proj	
+Molmo2ForConditionalGeneration	substr	image_pooling_2d.wk	image_pooling_2d.k_proj	
+Molmo2ForConditionalGeneration	substr	image_pooling_2d.wv	image_pooling_2d.v_proj	
+Molmo2ForConditionalGeneration	substr	image_pooling_2d.wo	image_pooling_2d.o_proj	
+Molmo2ForConditionalGeneration	substr	image_projector.w1	image_projector.gate_proj	
+Molmo2ForConditionalGeneration	substr	image_projector.w3	image_projector.up_proj	
+Molmo2ForConditionalGeneration	substr	image_projector.w2	image_projector.down_proj	
+Molmo2ForConditionalGeneration	substr	att_proj	qkv_proj	
+Molmo2ForConditionalGeneration	substr	attn_out	o_proj	
+Molmo2ForConditionalGeneration	substr	q_norm	q_norm	
+Molmo2ForConditionalGeneration	substr	k_norm	k_norm	
+Molmo2ForConditionalGeneration	substr	ff_proj	up_gate_proj	
+Molmo2ForConditionalGeneration	substr	ff_out	down_proj	
+Molmo2ForConditionalGeneration	substr	attn_norm	input_layernorm	
+Molmo2ForConditionalGeneration	substr	ff_norm	post_attention_layernorm	
+Molmo2ForConditionalGeneration	prefix	model.vision_backbone.	vision_backbone.	
+Molmo2ForConditionalGeneration	prefix	model.transformer.blocks.	model.layers.	
+Molmo2ForConditionalGeneration	prefix	model.transformer.ln_f.	model.norm.	
+MolmoForCausalLM	substr	image_projector.w1.	image_projector.gate_proj.	
+MolmoForCausalLM	substr	image_projector.w3.	image_projector.up_proj.	
+MolmoForCausalLM	substr	image_projector.w2.	image_projector.down_proj.	
+MolmoForCausalLM	substr	att_proj	self_attn.qkv_proj	
+MolmoForCausalLM	substr	attn_out	self_attn.o_proj	
+MolmoForCausalLM	substr	q_norm	self_attn.q_norm	
+MolmoForCausalLM	substr	k_norm	self_attn.k_norm	
+MolmoForCausalLM	substr	ff_proj	mlp.gate_up_proj	
+MolmoForCausalLM	substr	ff_out	mlp.down_proj	
+MolmoForCausalLM	substr	attn_norm	input_layernorm	
+MolmoForCausalLM	substr	ff_norm	post_attention_layernorm	
+MolmoForCausalLM	prefix	model.vision_backbone.	vision_backbone.	
+MolmoForCausalLM	prefix	model.transformer.blocks.	model.layers.	
+MolmoForCausalLM	prefix	model.transformer.ln_f.	model.norm.	
+MolmoForCausalLM	prefix	model.transformer.mlp.down_proj.	lm_head.	
+MoonshotKimiaForCausalLM	substr	.fc1.	.mlp.fc1.	
+MoonshotKimiaForCausalLM	substr	.fc2.	.mlp.fc2.	
+MoonshotKimiaForCausalLM	prefix	model.encoder.	audio_tower.	
+MoonshotKimiaForCausalLM	prefix	model.vq_adaptor.layers.0.	multi_modal_projector.vq_adaptor_layers_0.	
+MoonshotKimiaForCausalLM	prefix	model.vq_adaptor.layers.3.	multi_modal_projector.vq_adaptor_layers_3.	
+MoonshotKimiaForCausalLM	prefix	model.vq_adaptor.layers.4.	multi_modal_projector.vq_adaptor_layers_4.	
+MoonshotKimiaForCausalLM	prefix	model.layers.	language_model.model.layers.	
+MoonshotKimiaForCausalLM	prefix	model.embed_tokens.	language_model.model.embed_tokens.	
+MoonshotKimiaForCausalLM	prefix	model.norm.	language_model.model.norm.	
+MoonshotKimiaForCausalLM	prefix	lm_head.	language_model.lm_head.	
+MoonshotKimiaForCausalLM	prefix	model.	<drop>	
+MoonshotKimiaForCausalLM	prefix	mimo_layers.	<drop>	
+MoonshotKimiaForCausalLM	prefix	mimo_output.	<drop>	
+MoonshotKimiaForCausalLM	prefix	mimo_norm.	<drop>	
+MossAudioModel	stacked	.gate_proj	.gate_up_proj	0
+MossAudioModel	stacked	.up_proj	.gate_up_proj	1
+MossAudioModel	prefix	lm_head.	language_model.lm_head.	
+MossAudioModel	prefix	language_model.embed_tokens.	language_model.model.embed_tokens.	
+MossAudioModel	prefix	language_model.layers.	language_model.model.layers.	
+MossAudioModel	prefix	language_model.norm.	language_model.model.norm.	
+MossAudioModel	prefix	audio_encoder.embed_positions	<drop>	
+MossTranscribeDiarizeForConditionalGeneration	prefix	language_model.layers.	language_model.model.layers.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	language_model.embed_tokens.	language_model.model.embed_tokens.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	language_model.norm.	language_model.model.norm.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	model.language_model.model.	language_model.model.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	model.language_model.lm_head.	language_model.lm_head.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	model.whisper_encoder.	whisper_encoder.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	model.vq_adaptor.	vq_adaptor.	
+MossTranscribeDiarizeForConditionalGeneration	prefix	model.	<drop>	
+MuseGlimmerAssistantModel	stacked	.q_proj	.qkv_proj	q
+MuseGlimmerAssistantModel	stacked	.k_proj	.qkv_proj	k
+MuseGlimmerAssistantModel	stacked	.v_proj	.qkv_proj	v
+MuseGlimmerAssistantModel	stacked	.gate_proj	.gate_up_proj	0
+MuseGlimmerAssistantModel	stacked	.up_proj	.gate_up_proj	1
+MuseGlimmerForCausalLM	substr	model.vision_tower.patch_embedder.position_embedding_table.weight	model.vision_tower.positional_embedding_vlm	
+MuseGlimmerForCausalLM	substr	model.vision_tower.layers.	model.vision_tower.transformer.	
+MuseGlimmerForCausalLM	substr	.norm1.	.ln_1.	
+MuseGlimmerForCausalLM	substr	.norm2.	.ln_2.	
+MuseGlimmerForCausalLM	substr	.attn.proj.	.attn.o_proj.	
+MuseGlimmerForCausalLM	substr	.mlp.fc1.	.mlp.c_fc.	
+MuseGlimmerForCausalLM	substr	.mlp.fc2.	.mlp.c_proj.	
+MuseGlimmerForCausalLM	substr	.self_attn.gate_proj	.self_attn.output_gate_proj	
+MuseGlimmerForCausalLM	stacked	.q_proj	.qkv_proj	q
+MuseGlimmerForCausalLM	stacked	.k_proj	.qkv_proj	k
+MuseGlimmerForCausalLM	stacked	.v_proj	.qkv_proj	v
+MuseGlimmerForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+MuseGlimmerForCausalLM	stacked	.up_proj	.gate_up_proj	1
+MuseGlimmerForCausalLM	prefix	model.rotary_emb.	<drop>	
+MuseGlimmerForCausalLM	prefix	model.language_model.	model.	
+MuseGlimmerForCausalLM	prefix	language_model.	model.	
+MuseGlimmerForCausalLM	prefix	model.vision_tower.patch_embedder.patch_embedding.	model.vision_tower.conv1_linear.	
+MuseGlimmerForCausalLM	prefix	model.vision_tower.	vision_encoder.	
+MuseGlimmerForCausalLM	prefix	vision_tower.	vision_encoder.	
+MuseGlimmerForCausalLM	prefix	model.vision_encoder.	vision_encoder.	
+MuseGlimmerForCausalLM	prefix	model.vision_adapter.fc1.	model.vision_adapter.c_fc.	
+MuseGlimmerForCausalLM	prefix	model.vision_adapter.fc2.	model.vision_adapter.c_proj.	
+MuseGlimmerForCausalLM	prefix	model.vision_adapter.	vision_adapter.	
+MuseGlimmerForCausalLM	prefix	model.vision_projection.	vision_projection.	
+MuseGlimmerForCausalLM	prefix	model.perception_emb_norm.	perception_emb_norm.	
+MuseGlimmerForConditionalGeneration	substr	model.vision_tower.patch_embedder.position_embedding_table.weight	model.vision_tower.positional_embedding_vlm	
+MuseGlimmerForConditionalGeneration	substr	model.vision_tower.layers.	model.vision_tower.transformer.	
+MuseGlimmerForConditionalGeneration	substr	.norm1.	.ln_1.	
+MuseGlimmerForConditionalGeneration	substr	.norm2.	.ln_2.	
+MuseGlimmerForConditionalGeneration	substr	.attn.proj.	.attn.o_proj.	
+MuseGlimmerForConditionalGeneration	substr	.mlp.fc1.	.mlp.c_fc.	
+MuseGlimmerForConditionalGeneration	substr	.mlp.fc2.	.mlp.c_proj.	
+MuseGlimmerForConditionalGeneration	substr	.self_attn.gate_proj	.self_attn.output_gate_proj	
+MuseGlimmerForConditionalGeneration	stacked	.q_proj	.qkv_proj	q
+MuseGlimmerForConditionalGeneration	stacked	.k_proj	.qkv_proj	k
+MuseGlimmerForConditionalGeneration	stacked	.v_proj	.qkv_proj	v
+MuseGlimmerForConditionalGeneration	stacked	.gate_proj	.gate_up_proj	0
+MuseGlimmerForConditionalGeneration	stacked	.up_proj	.gate_up_proj	1
+MuseGlimmerForConditionalGeneration	prefix	model.rotary_emb.	<drop>	
+MuseGlimmerForConditionalGeneration	prefix	model.language_model.	model.	
+MuseGlimmerForConditionalGeneration	prefix	language_model.	model.	
+MuseGlimmerForConditionalGeneration	prefix	model.vision_tower.patch_embedder.patch_embedding.	model.vision_tower.conv1_linear.	
+MuseGlimmerForConditionalGeneration	prefix	model.vision_tower.	vision_encoder.	
+MuseGlimmerForConditionalGeneration	prefix	vision_tower.	vision_encoder.	
+MuseGlimmerForConditionalGeneration	prefix	model.vision_encoder.	vision_encoder.	
+MuseGlimmerForConditionalGeneration	prefix	model.vision_adapter.fc1.	model.vision_adapter.c_fc.	
+MuseGlimmerForConditionalGeneration	prefix	model.vision_adapter.fc2.	model.vision_adapter.c_proj.	
+MuseGlimmerForConditionalGeneration	prefix	model.vision_adapter.	vision_adapter.	
+MuseGlimmerForConditionalGeneration	prefix	model.vision_projection.	vision_projection.	
+MuseGlimmerForConditionalGeneration	prefix	model.perception_emb_norm.	perception_emb_norm.	
+MuseSparkDSparkModel	stacked	.self_attn.q_proj.	.self_attn.qkv_proj.	q
+MuseSparkDSparkModel	stacked	.self_attn.k_proj.	.self_attn.qkv_proj.	k
+MuseSparkDSparkModel	stacked	.self_attn.v_proj.	.self_attn.qkv_proj.	v
+MuseSparkDSparkModel	stacked	.self_attn.o_gate_proj.	.self_attn.qkv_proj.	o_gate
+MuseSparkDSparkModel	stacked	.feed_forward.gate_proj.	.feed_forward.gate_up_proj.	0
+MuseSparkDSparkModel	stacked	.feed_forward.up_proj.	.feed_forward.gate_up_proj.	1
+MuseSparkForConditionalGeneration	regex	^model\.language_model\.	model.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.input_layernorm\.	\1.self_attn.pre_qkv_proj_norm.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.post_attention_residual_gate\.	\1.add_attn.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.post_feedforward_residual_gate\.	\1.add_ffn.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.pre_feedforward_layernorm\.	\1.pre_ffn_norm.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.post_feedforward_layernorm\.	\1.post_ffn_norm.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.mlp\.experts\.post_expert_norm\.	\1.feed_forward.post_expert_norm.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.mlp\.gate\.e_score_correction_bias$	\1.feed_forward.expert_bias	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.mlp\.gate\.	\1.feed_forward.router.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.mlp\.pre_expert_proj\.	\1.feed_forward.pooler.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.mlp\.post_expert_proj\.	\1.feed_forward.unpooler.	
+MuseSparkForConditionalGeneration	regex	^(model\.layers\.\d+)\.mlp\.	\1.feed_forward.	
+MuseSparkForConditionalGeneration	regex	\.experts\.gate_up_proj_input_scale$	.experts.w13_input_scale	
+MuseSparkForConditionalGeneration	regex	\.experts\.gate_up_proj_weight_scale_2$	.experts.w13_weight_scale_2	
+MuseSparkForConditionalGeneration	regex	\.experts\.gate_up_proj_weight_scale$	.experts.w13_weight_scale	
+MuseSparkForConditionalGeneration	regex	\.experts\.down_proj_input_scale$	.experts.w2_input_scale	
+MuseSparkForConditionalGeneration	regex	\.experts\.down_proj_weight_scale_2$	.experts.w2_weight_scale_2	
+MuseSparkForConditionalGeneration	regex	\.experts\.down_proj_weight_scale$	.experts.w2_weight_scale	
+MuseSparkForConditionalGeneration	regex	\.experts\.gate_up_proj$	.experts.w13_weight	
+MuseSparkForConditionalGeneration	regex	\.experts\.down_proj$	.experts.w2_weight	
+MuseSparkForConditionalGeneration	regex	^model\.vision_adapter\.fc1\.	vision_model.adapter.c_fc.	
+MuseSparkForConditionalGeneration	regex	^model\.vision_adapter\.fc2\.	vision_model.adapter.c_proj.	
+MuseSparkForConditionalGeneration	regex	^model\.vision_tower\.patch_embedder\.patch_embedding\.	vision_model.conv1_linear.	
+MuseSparkForConditionalGeneration	regex	^model\.vision_tower\.patch_embedder\.position_embedding_table\.weight$	vision_model.positional_embedding_vlm	
+MuseSparkForConditionalGeneration	regex	^model\.vision_tower\.layers\.	vision_model.encoder.layers.	
+MuseSparkForConditionalGeneration	regex	^model\.vision_tower\.	vision_model.	
+MuseSparkForConditionalGeneration	regex	^model\.vision_projection\.	vision_projection.	
+MuseSparkForConditionalGeneration	regex	^(vision_model\.encoder\.layers\.\d+)\.attn\.proj\.	\1.attn.out_proj.	
+MuseSparkForConditionalGeneration	regex	^(vision_model\.encoder\.layers\.\d+)\.norm1\.	\1.ln_1.	
+MuseSparkForConditionalGeneration	regex	^(vision_model\.encoder\.layers\.\d+)\.norm2\.	\1.ln_2.	
+MuseSparkForConditionalGeneration	regex	^(vision_model\.encoder\.layers\.\d+)\.mlp\.fc1\.	\1.mlp.c_fc.	
+MuseSparkForConditionalGeneration	regex	^(vision_model\.encoder\.layers\.\d+)\.mlp\.fc2\.	\1.mlp.c_proj.	
+MuseSparkForConditionalGeneration	regex	^model\.audio_tower\.layers\.(\d+)\.conv_blocks\.0\.	audio_encoder.stages.\1.1.	
+MuseSparkForConditionalGeneration	regex	^model\.audio_tower\.layers\.(\d+)\.conv_blocks\.1\.	audio_encoder.stages.\1.2.	
+MuseSparkForConditionalGeneration	regex	^(audio_encoder\.stages\.\d+\.\d+)\.conv\.	\1.conv.conv.	
+MuseSparkForConditionalGeneration	regex	^(audio_encoder\.stages\.\d+\.\d+)\.mlp\.fc1\.	\1.linear1.	
+MuseSparkForConditionalGeneration	regex	^(audio_encoder\.stages\.\d+\.\d+)\.mlp\.fc2\.	\1.linear2.	
+MuseSparkForConditionalGeneration	regex	^model\.audio_tower\.layers\.(\d+)\.patch_embedder\.norm\.	audio_encoder.stages.\1.0.norm.	
+MuseSparkForConditionalGeneration	regex	^model\.audio_tower\.layers\.(\d+)\.patch_embedder\.proj\.	audio_encoder.stages.\1.0.linear.	
+MuseSparkForConditionalGeneration	regex	^model\.audio_tower\.post_proj_norm\.	audio_encoder.dual_norm.	
+MuseSparkForConditionalGeneration	regex	^model\.audio_tower\.proj\.	audio_encoder.o_proj.	
+MuseSparkForConditionalGeneration	regex	^model\.audio_tower\.norm\.	audio_encoder.norm.	
+MuseSparkForConditionalGeneration	stacked	.self_attn.q_proj.	.self_attn.qkv_proj.	q
+MuseSparkForConditionalGeneration	stacked	.self_attn.k_proj.	.self_attn.qkv_proj.	k
+MuseSparkForConditionalGeneration	stacked	.self_attn.v_proj.	.self_attn.qkv_proj.	v
+MuseSparkForConditionalGeneration	stacked	.self_attn.gate_proj.	.self_attn.qkv_proj.	o_gate
+MuseSparkForConditionalGeneration	stacked	.attn.q_proj.	.attn.qkv_proj.	q
+MuseSparkForConditionalGeneration	stacked	.attn.k_proj.	.attn.qkv_proj.	k
+MuseSparkForConditionalGeneration	stacked	.attn.v_proj.	.attn.qkv_proj.	v
+NVLM_D	prefix	action_embed	<drop>	
+NVLM_D	prefix	temporal_embed	<drop>	
+NVLM_D	prefix	track_embed	<drop>	
+NVLM_D	prefix	track_embed_decoder	<drop>	
+NVLM_D	prefix	box_token	<drop>	
+NVLM_D	prefix	cg_criterion	<drop>	
+NVLM_D	prefix	cg_model	<drop>	
+NVLM_D	prefix	loc_encoder	<drop>	
+NVLM_D	prefix	loc_decoder	<drop>	
+NVLM_D	prefix	sam	<drop>	
+NVLM_D	prefix	temporal_token	<drop>	
+NVLM_D	prefix	track_token	<drop>	
+Nemotron3_5TranscribeForConditionalGeneration	substr	.mixer._fp32_params.	.mixer.	
+Nemotron3_5TranscribeForConditionalGeneration	prefix	llm.model.norm.	language_model.model.norm_f.	
+Nemotron3_5TranscribeForConditionalGeneration	prefix	llm.model.	language_model.model.	
+Nemotron3_5TranscribeForConditionalGeneration	prefix	llm.lm_head.	language_model.lm_head.	
+Nemotron3_5TranscribeForConditionalGeneration	prefix	backbone.	language_model.model.	
+Nemotron3_5TranscribeForConditionalGeneration	prefix	lm_head	language_model.lm_head	
+Nemotron3_5TranscribeForConditionalGeneration	prefix	perception.	audio_tower.	
+Nemotron3_5TranscribeMTPModel	prefix	language_model.		
+NemotronForCausalLM	stacked	.q_proj	.qkv_proj	q
+NemotronForCausalLM	stacked	.k_proj	.qkv_proj	k
+NemotronForCausalLM	stacked	.v_proj	.qkv_proj	v
+NemotronHForCausalLM	substr	A_log	A	
+NemotronHForCausalLM	substr	embeddings	embed_tokens	
+NemotronHForCausalLM	stacked	.q_proj	.qkv_proj	q
+NemotronHForCausalLM	stacked	.k_proj	.qkv_proj	k
+NemotronHForCausalLM	stacked	.v_proj	.qkv_proj	v
+NemotronHForCausalLM	prefix	backbone	model	
+NemotronHForCausalLM	prefix	mtp	<drop>	
+NemotronHMTPModel	prefix	language_model.		
+NemotronHPuzzleForCausalLM	substr	A_log	A	
+NemotronHPuzzleForCausalLM	substr	embeddings	embed_tokens	
+NemotronHPuzzleForCausalLM	stacked	.q_proj	.qkv_proj	q
+NemotronHPuzzleForCausalLM	stacked	.k_proj	.qkv_proj	k
+NemotronHPuzzleForCausalLM	stacked	.v_proj	.qkv_proj	v
+NemotronHPuzzleForCausalLM	prefix	backbone	model	
+NemotronHPuzzleForCausalLM	prefix	mtp	<drop>	
+NemotronH_Nano_Omni_Reasoning_V3	prefix	language_model.backbone	language_model.model	
+NemotronH_Nano_VL_V2	prefix	language_model.backbone	language_model.model	
+NemotronH_Omni_Reasoning_V3	prefix	language_model.backbone	language_model.model	
+NemotronH_Super_Omni_Reasoning_V3	prefix	language_model.backbone	language_model.model	
+NomicBertModel	substr	emb_ln	embeddings.LayerNorm	
+NomicBertModel	substr	attn.Wqkv	attn.qkv_proj	
+NomicBertModel	substr	norm1	attn_ln	
+NomicBertModel	substr	mlp.fc1.	mlp.up_proj.	
+NomicBertModel	substr	mlp.fc11	mlp.up_proj	
+NomicBertModel	substr	mlp.fc12	mlp.gate_proj	
+NomicBertModel	substr	mlp.fc2	mlp.down_proj	
+NomicBertModel	substr	norm2	mlp_ln	
+NomicBertModel	substr	experts.mlp.		
+NomicBertModel	substr	experts.		
+NomicBertModel	substr	router.layer	router	
+OPTForCausalLM	stacked	.q_proj	.qkv_proj	q
+OPTForCausalLM	stacked	.k_proj	.qkv_proj	k
+OPTForCausalLM	stacked	.v_proj	.qkv_proj	v
+OPTForCausalLM	prefix	decoder.	model.decoder.	
+OpenAIPrivacyFilterForTokenClassification	substr	.self_attn.	.attn.	
+OpenAIPrivacyFilterForTokenClassification	suffix	.embed_tokens.weight	.embedding.weight	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj_blocks	.w13_weight	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj_blocks	.w2_weight	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj_scales	.w13_weight_scale	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj_scales	.w2_weight_scale	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj	.w13_weight	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj	.w2_weight	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj_bias	.w13_bias	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj_bias	.w2_bias	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj.weight	.w13_weight	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj.weight_scale	.w13_weight_scale	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj.bias	.w13_bias	
+OpenAIPrivacyFilterForTokenClassification	suffix	.gate_up_proj.input_scale	.w13_input_scale	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj.weight	.w2_weight	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj.weight_scale	.w2_weight_scale	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj.bias	.w2_bias	
+OpenAIPrivacyFilterForTokenClassification	suffix	.down_proj.input_scale	.w2_input_scale	
+OpenCUAForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+OpenCUAForConditionalGeneration	prefix	model.visual.	visual.	
+OpenCUAForConditionalGeneration	prefix	vision_tower.	visual.	
+OpenCUAForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+OpenCUAForConditionalGeneration	prefix	model.	language_model.model.	
+OpenPanguVLForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+OpenPanguVLForConditionalGeneration	prefix	model.visual.	visual.	
+OpenPanguVLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+OpenPanguVLForConditionalGeneration	prefix	model.	language_model.model.	
+OpsColQwen3Model	prefix	vlm.model.visual.	visual.	
+OpsColQwen3Model	prefix	vlm.lm_head.	language_model.lm_head.	
+OpsColQwen3Model	prefix	vlm.model.language_model.	language_model.model.	
+OpsColQwen3Model	prefix	model.visual.	visual.	
+OpsColQwen3Model	prefix	lm_head.	language_model.lm_head.	
+OpsColQwen3Model	prefix	model.language_model.model.	language_model.model.	
+OpsColQwen3Model	prefix	model.language_model.	language_model.model.	
+OrionForCausalLM	stacked	.q_proj	.qkv_proj	q
+OrionForCausalLM	stacked	.k_proj	.qkv_proj	k
+OrionForCausalLM	stacked	.v_proj	.qkv_proj	v
+OrionForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+OrionForCausalLM	stacked	.up_proj	.gate_up_proj	1
+PaddleOCRVLForConditionalGeneration	prefix	model.	language_model.model.	
+PaddleOCRVLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+PaliGemmaForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+PaliGemmaForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+PaliGemmaForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+PaliGemmaForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+ParseAuxMTPModel	prefix	decoder.embed_tokens.	model.embed_tokens.	
+ParseAuxMTPModel	prefix	decoder.extra_heads.0.	model.extra_head.	
+ParseAuxMTPModel	prefix	decoder.extra_proj.0.	model.extra_proj.	
+PeagleQwen3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+PeagleQwen3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+PeagleQwen3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+PeagleQwen3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+PeagleQwen3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Phi3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Phi3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Phi3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Phi3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Phi3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Phi3VForCausalLM	prefix	model.vision_embed_tokens.wte	embed_tokens	
+Phi3VForCausalLM	prefix	model.vision_embed_tokens.	vision_embed_tokens.	
+Phi3VForCausalLM	prefix	lm_head.	language_model.lm_head.	
+Phi3VForCausalLM	prefix	model.	language_model.model.	
+Phi4ForCausalLMV	prefix	model.vision_tower.vision_tower.vision_model.head.	<drop>	
+Phi4ForCausalLMV	prefix	model.vision_tower.vision_tower.	vision_tower.	
+Phi4ForCausalLMV	prefix	model.mm_projector.0.	multi_modal_projector.linear_1.	
+Phi4ForCausalLMV	prefix	model.mm_projector.2.	multi_modal_projector.linear_2.	
+Phi4ForCausalLMV	prefix	lm_head.	language_model.lm_head.	
+Phi4ForCausalLMV	prefix	model.	language_model.model.	
+Phi4MMForCausalLM	substr	base_layer.		
+Phi4MMForCausalLM	substr	lora	<drop>	
+Phi4MMForCausalLM	prefix	model.embed_tokens_extend.audio_embed.audio_projection.vision.	embed_tokens_extend.audio_projection_for_vision.	
+Phi4MMForCausalLM	prefix	model.embed_tokens_extend.audio_embed.audio_projection.speech.	embed_tokens_extend.audio_projection.	
+Phi4MMForCausalLM	prefix	model.embed_tokens_extend.audio_embed.	embed_tokens_extend.	
+Phi4MMForCausalLM	prefix	model.embed_tokens_extend.image_embed.	vision_encoder.	
+PhiMoEForCausalLM	stacked	.q_proj	.qkv_proj	q
+PhiMoEForCausalLM	stacked	.k_proj	.qkv_proj	k
+PhiMoEForCausalLM	stacked	.v_proj	.qkv_proj	v
+PixtralForConditionalGeneration	substr	.linear_1.	.w_in.	
+PixtralForConditionalGeneration	substr	.linear_2.	.w_out.	
+PixtralForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+PixtralForConditionalGeneration	prefix	model.vision_tower.	vision_encoder.	
+PixtralForConditionalGeneration	prefix	model.multi_modal_projector.	vision_language_adapter.	
+QianfanOCRForConditionalGeneration	prefix	action_embed	<drop>	
+QianfanOCRForConditionalGeneration	prefix	temporal_embed	<drop>	
+QianfanOCRForConditionalGeneration	prefix	track_embed	<drop>	
+QianfanOCRForConditionalGeneration	prefix	track_embed_decoder	<drop>	
+QianfanOCRForConditionalGeneration	prefix	box_token	<drop>	
+QianfanOCRForConditionalGeneration	prefix	cg_criterion	<drop>	
+QianfanOCRForConditionalGeneration	prefix	cg_model	<drop>	
+QianfanOCRForConditionalGeneration	prefix	loc_encoder	<drop>	
+QianfanOCRForConditionalGeneration	prefix	loc_decoder	<drop>	
+QianfanOCRForConditionalGeneration	prefix	sam	<drop>	
+QianfanOCRForConditionalGeneration	prefix	temporal_token	<drop>	
+QianfanOCRForConditionalGeneration	prefix	track_token	<drop>	
+Qwen2ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Qwen2ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Qwen2ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Qwen2ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Qwen2ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Qwen2ForProcessRewardModel	stacked	.q_proj	.qkv_proj	q
+Qwen2ForProcessRewardModel	stacked	.k_proj	.qkv_proj	k
+Qwen2ForProcessRewardModel	stacked	.v_proj	.qkv_proj	v
+Qwen2ForProcessRewardModel	stacked	.gate_proj	.gate_up_proj	0
+Qwen2ForProcessRewardModel	stacked	.up_proj	.gate_up_proj	1
+Qwen2ForRewardModel	stacked	.q_proj	.qkv_proj	q
+Qwen2ForRewardModel	stacked	.k_proj	.qkv_proj	k
+Qwen2ForRewardModel	stacked	.v_proj	.qkv_proj	v
+Qwen2ForRewardModel	stacked	.gate_proj	.gate_up_proj	0
+Qwen2ForRewardModel	stacked	.up_proj	.gate_up_proj	1
+Qwen2Model	stacked	.q_proj	.qkv_proj	q
+Qwen2Model	stacked	.k_proj	.qkv_proj	k
+Qwen2Model	stacked	.v_proj	.qkv_proj	v
+Qwen2Model	stacked	.gate_proj	.gate_up_proj	0
+Qwen2Model	stacked	.up_proj	.gate_up_proj	1
+Qwen2MoeForCausalLM	stacked	.q_proj	.qkv_proj	q
+Qwen2MoeForCausalLM	stacked	.k_proj	.qkv_proj	k
+Qwen2MoeForCausalLM	stacked	.v_proj	.qkv_proj	v
+Qwen2MoeForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+Qwen2MoeForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+Qwen2MoeForCausalLM	stacked	.shared_expert.gate_proj	.shared_expert.gate_up_proj	0
+Qwen2MoeForCausalLM	stacked	.shared_expert.up_proj	.shared_expert.gate_up_proj	1
+Qwen2VLForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen2VLForConditionalGeneration	prefix	model.visual.	visual.	
+Qwen2VLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen2VLForConditionalGeneration	prefix	model.	language_model.model.	
+Qwen2_5OmniForConditionalGeneration	prefix	thinker.lm_head.	language_model.lm_head.	
+Qwen2_5OmniForConditionalGeneration	prefix	thinker.model.	language_model.model.	
+Qwen2_5OmniForConditionalGeneration	prefix	thinker.		
+Qwen2_5OmniForConditionalGeneration	prefix	talker.	<drop>	
+Qwen2_5OmniForConditionalGeneration	prefix	token2wav.	<drop>	
+Qwen2_5OmniModel	prefix	thinker.lm_head.	language_model.lm_head.	
+Qwen2_5OmniModel	prefix	thinker.model.	language_model.model.	
+Qwen2_5OmniModel	prefix	thinker.		
+Qwen2_5OmniModel	prefix	talker.	<drop>	
+Qwen2_5OmniModel	prefix	token2wav.	<drop>	
+Qwen2_5_VLForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen2_5_VLForConditionalGeneration	prefix	model.visual.	visual.	
+Qwen2_5_VLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen2_5_VLForConditionalGeneration	prefix	model.	language_model.model.	
+Qwen3ASRForConditionalGeneration	prefix	thinker.lm_head.	language_model.lm_head.	
+Qwen3ASRForConditionalGeneration	prefix	thinker.model.	language_model.model.	
+Qwen3ASRForConditionalGeneration	prefix	thinker.		
+Qwen3ASRForConditionalGeneration	prefix	model.audio_tower.	audio_tower.	
+Qwen3ASRForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen3ASRForConditionalGeneration	prefix	model.multi_modal_projector.linear_1.	audio_tower.proj1.	
+Qwen3ASRForConditionalGeneration	prefix	model.multi_modal_projector.linear_2.	audio_tower.proj2.	
+Qwen3ASRForConditionalGeneration	prefix	talker.	<drop>	
+Qwen3ASRForConditionalGeneration	prefix	code2wav.	<drop>	
+Qwen3ASRForcedAlignerForTokenClassification	prefix	thinker.lm_head.	classifier.	
+Qwen3ASRForcedAlignerForTokenClassification	prefix	thinker.model.	language_model.model.	
+Qwen3ASRForcedAlignerForTokenClassification	prefix	thinker.		
+Qwen3ASRForcedAlignerForTokenClassification	prefix	talker.	<drop>	
+Qwen3ASRForcedAlignerForTokenClassification	prefix	code2wav.	<drop>	
+Qwen3ASRRealtimeGeneration	prefix	thinker.lm_head.	language_model.lm_head.	
+Qwen3ASRRealtimeGeneration	prefix	thinker.model.	language_model.model.	
+Qwen3ASRRealtimeGeneration	prefix	thinker.		
+Qwen3ASRRealtimeGeneration	prefix	model.audio_tower.	audio_tower.	
+Qwen3ASRRealtimeGeneration	prefix	model.language_model.	language_model.model.	
+Qwen3ASRRealtimeGeneration	prefix	model.multi_modal_projector.linear_1.	audio_tower.proj1.	
+Qwen3ASRRealtimeGeneration	prefix	model.multi_modal_projector.linear_2.	audio_tower.proj2.	
+Qwen3ASRRealtimeGeneration	prefix	talker.	<drop>	
+Qwen3ASRRealtimeGeneration	prefix	code2wav.	<drop>	
+Qwen3DSparkModel	stacked	.q_proj	.qkv_proj	q
+Qwen3DSparkModel	stacked	.k_proj	.qkv_proj	k
+Qwen3DSparkModel	stacked	.v_proj	.qkv_proj	v
+Qwen3DSparkModel	stacked	.gate_proj	.gate_up_proj	0
+Qwen3DSparkModel	stacked	.up_proj	.gate_up_proj	1
+Qwen3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Qwen3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Qwen3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Qwen3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Qwen3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Qwen3MoeForCausalLM	stacked	.q_proj	.qkv_proj	q
+Qwen3MoeForCausalLM	stacked	.k_proj	.qkv_proj	k
+Qwen3MoeForCausalLM	stacked	.v_proj	.qkv_proj	v
+Qwen3MoeForCausalLM	stacked	.mlp.gate_proj	.mlp.gate_up_proj	0
+Qwen3MoeForCausalLM	stacked	.mlp.up_proj	.mlp.gate_up_proj	1
+Qwen3MoeForCausalLM	stacked	.shared_expert.gate_proj	.shared_expert.gate_up_proj	0
+Qwen3MoeForCausalLM	stacked	.shared_expert.up_proj	.shared_expert.gate_up_proj	1
+Qwen3NextForCausalLM	prefix	mtp.	<drop>	
+Qwen3OmniDSparkModel	stacked	.q_proj	.qkv_proj	q
+Qwen3OmniDSparkModel	stacked	.k_proj	.qkv_proj	k
+Qwen3OmniDSparkModel	stacked	.v_proj	.qkv_proj	v
+Qwen3OmniDSparkModel	stacked	.gate_proj	.gate_up_proj	0
+Qwen3OmniDSparkModel	stacked	.up_proj	.gate_up_proj	1
+Qwen3OmniMoeForConditionalGeneration	prefix	thinker.lm_head.	language_model.lm_head.	
+Qwen3OmniMoeForConditionalGeneration	prefix	thinker.model.	language_model.model.	
+Qwen3OmniMoeForConditionalGeneration	prefix	thinker.		
+Qwen3OmniMoeForConditionalGeneration	prefix	talker.	<drop>	
+Qwen3OmniMoeForConditionalGeneration	prefix	code2wav.	<drop>	
+Qwen3OmniMoeForConditionalGeneration	prefix	model.	language_model.model.	
+Qwen3OmniMoeForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen3VLForConditionalGeneration	prefix	model.visual.	visual.	
+Qwen3VLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen3VLForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen3VLMoeForConditionalGeneration	prefix	model.visual.	visual.	
+Qwen3VLMoeForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen3VLMoeForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen3VLNemotronEmbedModel	prefix	vlm.model.visual.	visual.	
+Qwen3VLNemotronEmbedModel	prefix	vlm.lm_head.	language_model.lm_head.	
+Qwen3VLNemotronEmbedModel	prefix	vlm.model.language_model.	language_model.model.	
+Qwen3VLNemotronEmbedModel	prefix	model.visual.	visual.	
+Qwen3VLNemotronEmbedModel	prefix	lm_head.	language_model.lm_head.	
+Qwen3VLNemotronEmbedModel	prefix	model.language_model.model.	language_model.model.	
+Qwen3VLNemotronEmbedModel	prefix	model.language_model.	language_model.model.	
+Qwen3XPressModel	stacked	.q_proj	.qkv_proj	q
+Qwen3XPressModel	stacked	.k_proj	.qkv_proj	k
+Qwen3XPressModel	stacked	.v_proj	.qkv_proj	v
+Qwen3XPressModel	stacked	.gate_proj	.gate_up_proj	0
+Qwen3XPressModel	stacked	.up_proj	.gate_up_proj	1
+Qwen3_5ForCausalLM	prefix	model.language_model.	model.	
+Qwen3_5ForCausalLM	prefix	mtp.	<drop>	
+Qwen3_5ForConditionalGeneration	prefix	model.visual.	visual.	
+Qwen3_5ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen3_5ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen3_5ForConditionalGeneration	prefix	mtp.	<drop>	
+Qwen3_5MoeForCausalLM	prefix	model.language_model.	model.	
+Qwen3_5MoeForCausalLM	prefix	mtp.	<drop>	
+Qwen3_5MoeForConditionalGeneration	prefix	model.visual.	visual.	
+Qwen3_5MoeForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen3_5MoeForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen3_5MoeForConditionalGeneration	prefix	mtp.	<drop>	
+Qwen4ExpForCausalLM	prefix	model.language_model.	model.	
+Qwen4ExpForConditionalGeneration	prefix	model.visual.	visual.	
+Qwen4ExpForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Qwen4ExpForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Qwen4ExpForConditionalGeneration	prefix	mtp.	<drop>	
+RForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+RForConditionalGeneration	prefix	model.vision_tower.	vision_tower.	
+RForConditionalGeneration	prefix	model.multi_modal_projector.	multi_modal_projector.	
+RForConditionalGeneration	prefix	model.image_newline	image_newline	
+RForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Rnj1ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Rnj1ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Rnj1ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Rnj1ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Rnj1ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+RobertaForMaskedLM	prefix	bert.	model.	
+RobertaForMaskedLM	prefix	roberta.	model.	
+RobertaForMaskedLM	prefix	encoder.	model.encoder.	
+RobertaForMaskedLM	prefix	embeddings.	model.embeddings.	
+RobertaModel	prefix	bert.	model.	
+RobertaModel	prefix	roberta.	model.	
+RobertaModel	prefix	encoder.	model.encoder.	
+RobertaModel	prefix	embeddings.	model.embeddings.	
+SiglipModel	substr	.position_ids	<drop>	
+SkyworkR1VChatModel	prefix	action_embed	<drop>	
+SkyworkR1VChatModel	prefix	temporal_embed	<drop>	
+SkyworkR1VChatModel	prefix	track_embed	<drop>	
+SkyworkR1VChatModel	prefix	track_embed_decoder	<drop>	
+SkyworkR1VChatModel	prefix	box_token	<drop>	
+SkyworkR1VChatModel	prefix	cg_criterion	<drop>	
+SkyworkR1VChatModel	prefix	cg_model	<drop>	
+SkyworkR1VChatModel	prefix	loc_encoder	<drop>	
+SkyworkR1VChatModel	prefix	loc_decoder	<drop>	
+SkyworkR1VChatModel	prefix	sam	<drop>	
+SkyworkR1VChatModel	prefix	temporal_token	<drop>	
+SkyworkR1VChatModel	prefix	track_token	<drop>	
+SolarForCausalLM	stacked	.q_proj	.qkv_proj	q
+SolarForCausalLM	stacked	.k_proj	.qkv_proj	k
+SolarForCausalLM	stacked	.v_proj	.qkv_proj	v
+SolarForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+SolarForCausalLM	stacked	.up_proj	.gate_up_proj	1
+StableLmForCausalLM	stacked	.q_proj	.qkv_proj	q
+StableLmForCausalLM	stacked	.k_proj	.qkv_proj	k
+StableLmForCausalLM	stacked	.v_proj	.qkv_proj	v
+StableLmForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+StableLmForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Step1ForCausalLM	stacked	.q_proj	.qkv_proj	q
+Step1ForCausalLM	stacked	.k_proj	.qkv_proj	k
+Step1ForCausalLM	stacked	.v_proj	.qkv_proj	v
+Step1ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+Step1ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+Step3VLForConditionalGeneration	prefix	model.	language_model.model.	
+Step3VLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Step3p5ForCausalLM	substr	.share_expert.	.moe.share_expert.	
+Step3p7ForConditionalGeneration	substr	.attn.in_proj_weight	.attn.qkv_proj.weight	
+Step3p7ForConditionalGeneration	substr	.attn.in_proj_bias	.attn.qkv_proj.bias	
+Step3p7ForConditionalGeneration	substr	.mlp.c_fc	.mlp.fc1	
+Step3p7ForConditionalGeneration	substr	.mlp.c_proj	.mlp.fc2	
+Step3p7ForConditionalGeneration	prefix	model.vision_model.	vision_model.	
+Step3p7ForConditionalGeneration	prefix	model.vit_large_projector.	vit_large_projector.	
+Step3p7ForConditionalGeneration	prefix	model.vit_large_projector	vit_large_projector	
+Step3p7ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Step3p7ForConditionalGeneration	prefix	model.language_model	language_model.model	
+Step3p7ForConditionalGeneration	prefix	model.	language_model.model.	
+Step3p7ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Step3p7ForConditionalGeneration	prefix	lm_head	language_model.lm_head	
+Step5ForCausalLM	regex	^vit_large_projector\.weight$	<drop>	
+Step5ForCausalLM	regex	(?<!\.moe)\.share_expert\.	.moe.share_expert.	
+Step5ForConditionalGeneration	regex	(?<!\.moe)\.share_expert\.	.moe.share_expert.	
+Step5ForConditionalGeneration	substr	.attn.in_proj_weight	.attn.qkv_proj.weight	
+Step5ForConditionalGeneration	substr	.attn.in_proj_bias	.attn.qkv_proj.bias	
+Step5ForConditionalGeneration	substr	.mlp.c_fc	.mlp.fc1	
+Step5ForConditionalGeneration	substr	.mlp.c_proj	.mlp.fc2	
+Step5ForConditionalGeneration	prefix	model.vision_model.	vision_model.	
+Step5ForConditionalGeneration	prefix	model.vit_large_projector.	vit_large_projector.	
+Step5ForConditionalGeneration	prefix	model.vit_large_projector	vit_large_projector	
+Step5ForConditionalGeneration	prefix	model.language_model.	language_model.model.	
+Step5ForConditionalGeneration	prefix	model.language_model	language_model.model	
+Step5ForConditionalGeneration	prefix	model.	language_model.model.	
+Step5ForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+Step5ForConditionalGeneration	prefix	lm_head	language_model.lm_head	
+StepVLForConditionalGeneration	substr	.attn.in_proj_weight	.attn.qkv_proj.weight	
+StepVLForConditionalGeneration	substr	.attn.in_proj_bias	.attn.qkv_proj.bias	
+StepVLForConditionalGeneration	substr	.mlp.c_fc	.mlp.fc1	
+StepVLForConditionalGeneration	substr	.mlp.c_proj	.mlp.fc2	
+StepVLForConditionalGeneration	prefix	model.	language_model.model.	
+StepVLForConditionalGeneration	prefix	lm_head.	language_model.lm_head.	
+TeleChat2ForCausalLM	substr	.h.	.layers.	
+TeleChat2ForCausalLM	substr	.self_attention.	.self_attn.	
+TeleChat2ForCausalLM	substr	.word_embeddings.	.embed_tokens.	
+TeleChat2ForCausalLM	substr	.dense.	.o_proj.	
+TeleChat2ForCausalLM	substr	.ln_f.	.norm.	
+TeleChat2ForCausalLM	prefix	transformer.	model.	
+TeleChat3ForCausalLM	stacked	.q_proj	.qkv_proj	q
+TeleChat3ForCausalLM	stacked	.k_proj	.qkv_proj	k
+TeleChat3ForCausalLM	stacked	.v_proj	.qkv_proj	v
+TeleChat3ForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+TeleChat3ForCausalLM	stacked	.up_proj	.gate_up_proj	1
+TeleFLMForCausalLM	stacked	.q_proj	.qkv_proj	q
+TeleFLMForCausalLM	stacked	.k_proj	.qkv_proj	k
+TeleFLMForCausalLM	stacked	.v_proj	.qkv_proj	v
+TeleFLMForCausalLM	stacked	.gate_proj	.gate_up_proj	0
+TeleFLMForCausalLM	stacked	.up_proj	.gate_up_proj	1
+UltravoxModel	prefix	audio_tower.model.encoder.	audio_tower.	
+UltravoxModel	prefix	audio_tower.model.	<drop>	
+UltravoxModel	prefix	audio_tower.proj_out.	<drop>	
+UnlimitedOCRForCausalLM	prefix	model.embed_tokens.	language_model.model.embed_tokens.	
+UnlimitedOCRForCausalLM	prefix	model.layers.	language_model.model.layers.	
+UnlimitedOCRForCausalLM	prefix	model.norm.	language_model.model.norm.	
+UnlimitedOCRForCausalLM	prefix	lm_head.	language_model.lm_head.	
+UnlimitedOCRForCausalLM	prefix	model.		
+WhisperForConditionalGeneration	substr	.fc1.	.mlp.fc1.	
+WhisperForConditionalGeneration	substr	.fc2.	.mlp.fc2.	
+WhisperForConditionalGeneration	stacked	.self_attn.q_proj	.self_attn.qkv_proj	q
+WhisperForConditionalGeneration	stacked	.self_attn.k_proj	.self_attn.qkv_proj	k
+WhisperForConditionalGeneration	stacked	.self_attn.v_proj	.self_attn.qkv_proj	v
+WhisperForConditionalGeneration	stacked	.encoder_attn.k_proj	.encoder_attn.kv_proj	0
+WhisperForConditionalGeneration	stacked	.encoder_attn.v_proj	.encoder_attn.kv_proj	1
+WhisperForConditionalGeneration	prefix	proj_out.	<drop>	
+XLMRobertaModel	prefix	bert.	model.	
+XLMRobertaModel	prefix	roberta.	model.	
+XLMRobertaModel	prefix	encoder.	model.encoder.	
+XLMRobertaModel	prefix	embeddings.	model.embeddings.	
+Zamba2ForCausalLM	substr	A_log	A	
+Zamba2ForCausalLM	substr	0.weight	A.weight	
+Zamba2ForCausalLM	substr	1.weight	B.weight	
+Zamba2ForCausalLM	stacked	.self_attn.q_proj	.self_attn.qkv_proj	q
+Zamba2ForCausalLM	stacked	.self_attn.k_proj	.self_attn.qkv_proj	k
+Zamba2ForCausalLM	stacked	.self_attn.v_proj	.self_attn.qkv_proj	v

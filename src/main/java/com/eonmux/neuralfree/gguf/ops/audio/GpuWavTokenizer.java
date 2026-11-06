@@ -545,14 +545,12 @@ public final class GpuWavTokenizer implements WavTokenizerDecoder.Backend {
         fa[AttnKernels.ARG_FA_SCALE] = dec.attentionScale();
         fa[AttnKernels.ARG_FA_SOFTCAP] = 0.0f;
         fa[AttnKernels.ARG_FA_MAX_BIAS] = 0.0f;
-        fa[AttnKernels.ARG_FA_CAUSAL] = 0;
+        fa[AttnKernels.ARG_FA_FLAGS] = AttnKernels.attnFlags(false, false, direct);
         fa[AttnKernels.ARG_FA_SWA_TYPE] = SwaType.NONE.code();
         fa[AttnKernels.ARG_FA_N_SWA] = 0;
         fa[AttnKernels.ARG_FA_BIAS_MODE] = AttentionSpec.BiasMode.NONE.code();
         fa[AttnKernels.ARG_FA_N_BUCKETS] = 0;
         fa[AttnKernels.ARG_FA_MAX_DISTANCE] = 0;
-        fa[AttnKernels.ARG_FA_HAS_SINKS] = 0;
-        fa[AttnKernels.ARG_FA_DIRECT_OUT] = direct ? 1 : 0;
         fa[AttnKernels.ARG_FA_Q_OFF] = 0;
         fa[AttnKernels.ARG_FA_OUT_OFF] = 0;
         fa[AttnKernels.ARG_FA_BUF_Q] = q.buffer();
@@ -564,6 +562,7 @@ public final class GpuWavTokenizer implements WavTokenizerDecoder.Backend {
         fa[AttnKernels.ARG_FA_BUF_REL_BIAS] = placeholders.readOnlyFloats();
         fa[AttnKernels.ARG_FA_BUF_OUT] = tok.buffer();
         fa[AttnKernels.ARG_FA_BUF_PARTIAL] = direct ? placeholders.scratchFloats() : partials;
+        fa[AttnKernels.ARG_FA_BUF_KV_SCALES] = placeholders.kvScalesOnes();
         ops.enqueue(AttnKernels.flashAttn(KvDType.F32), plan.prefillGlobal(t, split.count()), FlashAttnTiling.prefillLocal(),
                 fa);
         if (direct) {

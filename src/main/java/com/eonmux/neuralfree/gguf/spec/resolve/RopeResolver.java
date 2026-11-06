@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.arch.RopeScalingType;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
+import com.eonmux.neuralfree.gguf.spec.FopeSpec;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
@@ -26,7 +27,9 @@ import java.util.Set;
  *   <li>an unset {@code yarn_ext_factor} becomes 1 for YaRN scaling, else 0 (:265-267);</li>
  *   <li>{@code yarn_attn_factor} is the effective factor of :269-306 ({@link RopeMath#yarnAttnFactor}); the kernel
  *       applies the {@code 1 + 0.1 ln(1/freq_scale)} magnitude itself;</li>
- *   <li>{@code n_ctx_orig} is {@code n_ctx_orig_yarn}, which the loader defaults to {@code n_ctx_train}.</li>
+ *   <li>{@code n_ctx_orig} is {@code n_ctx_orig_yarn}, which the loader defaults to {@code n_ctx_train};</li>
+ *   <li>scaling type DYNAMIC keeps {@code freq_scale = 1} and replaces the base of each layer with the NTK-aware
+ *       base {@link RopeMath#dynamicAlphaBase} or {@link RopeMath#dynamicNtkBase} of the layer's rotary width.</li>
  * </ul>
  * Per layer: the architectures that call {@code get_rope_freq_base/scale} (llama-model.cpp:2755-2761) use the SWA
  * base and scale on SWA layers; {@code get_rope_factors} (:2763-2776) picks {@code rope_freqs}, else
@@ -51,17 +54,24 @@ public final class RopeResolver {
     private static final Set<Arch> FULL_LAYER_FREQS_ARCHS = Collections.unmodifiableSet(EnumSet.of(
             Arch.GEMMA4, Arch.GEMMA4_ASSISTANT));
 
+    /** Graphs that read the learned model-level {@code rope_freqs} factors (lfm3.cpp:113, mistral-large4.cpp:90). */
+    private static final Set<Arch> LEARNED_FREQS_ARCHS = Collections.unmodifiableSet(EnumSet.of(
+            Arch.LFM3, Arch.MISTRAL_LARGE4));
+
     /** Graphs that use {@code get_rope_freq_base} and {@code get_rope_freq_scale} per layer. */
     private static final Set<Arch> PER_LAYER_BASE_SCALE = Collections.unmodifiableSet(EnumSet.of(
             Arch.AFMOE, Arch.BEAM, Arch.GEMMA2, Arch.GEMMA3, Arch.GEMMA3N, Arch.GEMMA4, Arch.GEMMA4_ASSISTANT,
-            Arch.GEMMA_EMBEDDING, Arch.GEMMA_EMBEDDING2, Arch.KOLIBRI1, Arch.LAGUNA, Arch.LLAMA4, Arch.MAPLE,
-            Arch.MAION_CODER, Arch.MELLUM, Arch.MIMO2, Arch.MODERN_BERT, Arch.MUSE_GLIMMER, Arch.MUSE_SPARK,
-            Arch.OPENAI_MOE, Arch.PLAMO3, Arch.SMALLTHINKER, Arch.SPARK2_5, Arch.STEP35));
+            Arch.GEMMA_EMBEDDING, Arch.GEMMA_EMBEDDING2, Arch.KOLIBRI1, Arch.LAGUNA, Arch.LFM3, Arch.LLAMA4,
+            Arch.MAPLE, Arch.MAION_CODER, Arch.MELLUM, Arch.MIMO2, Arch.MODERN_BERT, Arch.MUSE_GLIMMER,
+            Arch.MUSE_SPARK, Arch.OPENAI_MOE, Arch.PLAMO3, Arch.RNJ1, Arch.DORY, Arch.SMALLTHINKER,
+            Arch.SPARK2_5,
+            Arch.STEP35));
 
     private final ModelHparams hp;
     private final TensorCatalog tc;
     private final int nCtxSeq;
     private final Arch arch;
+    private final RopeScalingType scaling;
     private final float freqBase;
     private final float freqScale;
     private final float extFactor;
@@ -84,11 +94,13 @@ public final class RopeResolver {
         this.nCtxSeq = nCtxSeq;
         this.arch = hp.arch();
         RopeScalingType scaling = hp.ropeScalingType();
+        this.scaling = scaling;
         this.freqBase = hp.ropeFreqBase();
-        this.freqScale = scaling == RopeScalingType.NONE ? 1.0f : hp.ropeFreqScale();
+        this.freqScale = scaling == RopeScalingType.NONE || scaling == RopeScalingType.DYNAMIC
+                ? 1.0f : hp.ropeFreqScale();
         this.extFactor = hp.yarnExtFactor() < 0.0f ? RopeMath.defaultExtFactor(scaling) : hp.yarnExtFactor();
         this.attnFactor = RopeMath.yarnAttnFactor(hp.yarnAttnFactor(), extFactor, freqScale, hp.yarnLogMul(),
-                arch == Arch.DEEPSEEK2, hp.ropeAttnFactor());
+                arch == Arch.DEEPSEEK2 || arch == Arch.AXK1, hp.ropeAttnFactor());
         this.betaFast = hp.yarnBetaFast();
         this.betaSlow = hp.yarnBetaSlow();
         this.nCtxOrig = hp.nCtxOrigYarn() != 0 ? hp.nCtxOrigYarn() : hp.nCtxTrain();
@@ -111,8 +123,9 @@ public final class RopeResolver {
      * True when the layer's graph rotates Q and K: the model has a RoPE type and the layer is not a NoPE layer.
      * Beyond {@link ModelHparams#hasRope(int)} this applies the graph rules the hparams do not record: the plain
      * BERT graph never rotates (models/bert.cpp:131-138 rotate only nomic-bert, nomic-bert-moe and
-     * jina-bert-v3), starcoder uses learned positions (models/starcoder.cpp), and cohere2 rotates its SWA layers
-     * only (models/cohere2.cpp:89).
+     * jina-bert-v3), starcoder uses learned positions (models/starcoder.cpp), cohere2 rotates its SWA layers
+     * only (models/cohere2.cpp:89), and limite rotates its SWA layers only, the full-attention layers use no
+     * positional encoding (models/limite.cpp:163-170).
      */
     public boolean appliesRope(int il) {
         if (hp.ropeType() == RopeType.NONE || !hp.hasRope(il)) {
@@ -123,6 +136,7 @@ public final class RopeResolver {
             case STARCODER:
                 return false;
             case COHERE2:
+            case LIMITE:
                 return hp.isSwa(il);
             default:
                 return true;
@@ -150,7 +164,7 @@ public final class RopeResolver {
     }
 
     /**
-     * RoPE of the attention layer {@code il}, rotating {@link #nRot(int)} dims from offset 0.
+     * Rotary embedding of the attention layer {@code il}, rotating {@link #nRot(int)} dims from offset 0.
      *
      * @return the spec, or null when the layer applies no RoPE
      * @throws IllegalArgumentException when the resolved parameters are inconsistent
@@ -160,6 +174,22 @@ public final class RopeResolver {
             return null;
         }
         return forLayer(il, nRot(il), 0);
+    }
+
+    /**
+     * Rotary embedding of a lightning-attention layer over {@code nDims} dims of each head, the {@code is_neox_style}
+     * rotation vLLM builds for the linear-attention head ({@code get_rope(head_dim, is_neox_style=True, ...)}): NEOX
+     * with the context's frequency parameters and no learned frequency factors. The architecture's per-layer graph
+     * deviations do not apply.
+     *
+     * @return the spec, or null when {@code nDims == 0}
+     * @throws IllegalArgumentException when the dims or resolved parameters are inconsistent
+     */
+    public RopeSpec linearAttention(int il, int nDims) {
+        if (nDims <= 0) {
+            return null;
+        }
+        return build(il, nDims, 0, RopeType.NEOX, true);
     }
 
     /**
@@ -189,8 +219,18 @@ public final class RopeResolver {
         if (hp.ropeType() == RopeType.NONE) {
             throw new IllegalStateException(arch.ggufName() + ": the model has no rotary embedding (layer " + il + ")");
         }
-        boolean swa = hp.isSwa(il);
-        RopeType type = hp.ropeType();
+        return build(il, nDims, nOffs, hp.ropeType(), false);
+    }
+
+    /**
+     * The rotary parameters of layer {@code il} at one of the graph's {@code ggml_rope_ext} calls.
+     *
+     * @param type      the rotation layout
+     * @param plain     true for a rotation outside the attention graphs: the per-layer SWA and architecture
+     *                  deviations do not apply, the parameters are the context's
+     */
+    private RopeSpec build(int il, int nDims, int nOffs, RopeType type, boolean plain) {
+        boolean swa = !plain && hp.isSwa(il);
         float base = freqBase;
         float scale = freqScale;
         float ext = extFactor;
@@ -202,7 +242,8 @@ public final class RopeResolver {
             base = hp.ropeFreqBaseSwa();
             scale = hp.ropeFreqScaleSwa();
         }
-        switch (arch) {
+        if (!plain) {
+            switch (arch) {
             case OLMO2:
                 if (swa) {
                     scale = 1.0f;
@@ -260,6 +301,10 @@ public final class RopeResolver {
                 break;
             default:
                 break;
+            }
+        }
+        if (scaling == RopeScalingType.DYNAMIC) {
+            base = dynamicBase(base, nDims);
         }
         RopeSpec.Builder b = RopeSpec.builder(type)
                 .nDims(nDims)
@@ -268,7 +313,13 @@ public final class RopeResolver {
                 .freqScale(scale)
                 .yarn(ext, attn, bFast, bSlow)
                 .nCtxOrig(ctxOrig)
-                .freqFactors(freqFactors(il));
+                .freqFactors(plain ? null : freqFactors(il));
+        if (scaling == RopeScalingType.NTK) {
+            b.computedFreqFactors(RopeMath.ntkFactors(hp.ropeScalingFactor(), hp.ropeScalingMixedB(), nDims));
+        }
+        if (hp.ropeFope()) {
+            b.fope(fope(il, type, nDims, base));
+        }
         if (nDims > 0 && base > 0f) {
             b.thetaScale(RopeMath.thetaScale(base, nDims));
         }
@@ -281,13 +332,61 @@ public final class RopeResolver {
     }
 
     /**
+     * The NTK-scaled base of a layer when the scaling type is {@link RopeScalingType#DYNAMIC}: the alpha form when
+     * {@code rope.scaling.alpha} is positive (vLLM tries {@code alpha} before {@code factor}), else the factor form
+     * over the model's context length and its trained length.
+     *
+     * @throws IllegalArgumentException when the rotary width is 2 or less or the factor form lacks positive lengths
+     */
+    private float dynamicBase(float base, int nDims) {
+        if (hp.ropeScalingAlpha() > 0f) {
+            return RopeMath.dynamicAlphaBase(base, hp.ropeScalingAlpha(), nDims);
+        }
+        final int trained = hp.nCtxOrigYarn() != 0 ? hp.nCtxOrigYarn() : hp.nCtxTrain();
+        return RopeMath.dynamicNtkBase(base, hp.ropeScalingFactor(), hp.nCtxTrain(), trained, nDims);
+    }
+
+    /**
+     * The Fourier position embedding parameters of layer {@code il}: the coefficient tensors and the frequencies they
+     * project, the latter selected from the layer's base and rotary width over the model context length
+     * ({@link RopeMath#fopeInvFreq}, vLLM {@code FourierRotaryEmbedding._compute_inv_freq}).
+     *
+     * @param type the layer's rotation layout, which must be NEOX (the whole head rotates in halves)
+     * @throws IllegalStateException    when the model's coefficient tensors are absent from the file
+     * @throws java.util.NoSuchElementException when the catalog holds no such tensor
+     * @throws IllegalArgumentException when the rotation is not NEOX or the frequency selection is invalid
+     */
+    private FopeSpec fope(int il, RopeType type, int nDims, float base) {
+        if (type != RopeType.NEOX) {
+            throw new IllegalArgumentException(arch.ggufName() + ": the Fourier position embedding is a NEOX"
+                    + " rotation over the whole head, not " + type);
+        }
+        TensorRef cos = tc.get(TensorNames.weight(TensorNames.ROPE_COS_COEF));
+        TensorRef sin = tc.get(TensorNames.weight(TensorNames.ROPE_SIN_COEF));
+        if (cos == null || sin == null) {
+            throw new IllegalStateException(arch.ggufName() + ": the Fourier position embedding needs the model"
+                    + " tensors " + TensorNames.weight(TensorNames.ROPE_COS_COEF) + " and "
+                    + TensorNames.weight(TensorNames.ROPE_SIN_COEF));
+        }
+        final int context = hp.nCtxTrain() > 0 ? hp.nCtxTrain() : nCtxOrig;
+        final float[] inv = RopeMath.fopeInvFreq(base, nDims, hp.ropeFopeNumInvFreq(), context);
+        return FopeSpec.of(hp.nHeadKv(il), hp.ropeFopeSepHead(), inv, cos, sin);
+    }
+
+    /**
      * Frequency factors of layer {@code il} ({@code get_rope_factors}, llama-model.cpp:2763-2776), or null when the
-     * graph passes none. step35 skips them on SWA layers (models/step35.cpp:235); gemma4 and gemma4-assistant read
-     * {@code rope_freqs} on full-attention layers only; dflash always passes {@code rope_freqs}
-     * (models/dflash.cpp, {@code layers[0].rope_freqs}).
+     * graph passes none. lfm3 and mistral-large4 read the learned model-level {@code rope_freqs} (lfm3 skips them
+     * on SWA layers, lfm3.cpp:113); step35 skips them on SWA layers (models/step35.cpp:235); gemma4 and
+     * gemma4-assistant read {@code rope_freqs} on full-attention layers only; dflash always passes
+     * {@code rope_freqs} (models/dflash.cpp, {@code layers[0].rope_freqs}).
      */
     public TensorRef freqFactors(int il) {
         TensorRef freqs = tc.get(TensorNames.weight(TensorNames.ROPE_FREQS));
+        if (LEARNED_FREQS_ARCHS.contains(arch)) {
+            // lfm3 skips the learned factors on its SWA layers (lfm3.cpp:113); mistral-large4 passes them to
+            // the MLA and indexer rotations of every roped layer.
+            return arch == Arch.LFM3 && hp.isSwa(il) ? null : freqs;
+        }
         if (FULL_LAYER_FREQS_ARCHS.contains(arch)) {
             return hp.isSwa(il) ? null : freqs;
         }

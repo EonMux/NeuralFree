@@ -1,7 +1,9 @@
 package com.eonmux.neuralfree.gguf.arch;
 
 import com.eonmux.neuralfree.gguf.hparams.hooks.MoeHooksSwa;
+import com.eonmux.neuralfree.gguf.hparams.hooks.Step5Hooks;
 import com.eonmux.neuralfree.gguf.spec.req.MoeTensorRequirementsSwa;
+import com.eonmux.neuralfree.gguf.spec.req.Step5TensorRequirements;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -73,6 +75,10 @@ public final class ArchTableMoeSwa {
                 // block is MoE when its ffn_gate_inp is present.
                 ArchEntry.of(decoder(Arch.STEP35, RopeType.NEOX).defaultGating(GatingFunc.SIGMOID).build(),
                         MoeHooksSwa::step35, MoeTensorRequirementsSwa.step35()),
+                // vLLM models/step5. GQA attention with a per-head output gate, a sparse indexer over 8-token region
+                // summaries, zero-centered RMS norms and a dense or routed-plus-shared-expert FFN.
+                ArchEntry.of(decoder(Arch.STEP5, RopeType.NEOX).defaultGating(GatingFunc.SIGMOID).build(),
+                        Step5Hooks::step5, Step5TensorRequirements.step5()),
                 // llama-model.cpp:3593. Sandwich norms; latent MoE every interleave step; RoPE on SWA layers.
                 ArchEntry.of(decoder(Arch.MAION_CODER, RopeType.NEOX).postNormRole(PostNormRole.SANDWICH).build(),
                         MoeHooksSwa::maionCoder, MoeTensorRequirementsSwa.maionCoder()),

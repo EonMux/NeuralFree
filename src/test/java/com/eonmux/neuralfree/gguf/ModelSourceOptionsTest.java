@@ -42,8 +42,12 @@ public class ModelSourceOptionsTest {
         assertEquals(Paths.get(System.getProperty("user.home", ""), ".cache", "neuralfree", "hf"), o.cacheDir());
         assertEquals(ModelSourceOptions.OutType.SOURCE, o.outType());
         assertEquals(ModelSourceOptions.OnlineQuant.NONE, o.onlineQuant());
+        assertTrue("output.weight quantizes unless --leave-output-tensor", o.quantizeOutputTensor());
         assertFalse(o.exactQuant());
         assertTrue(o.includeMtp());
+        assertEquals(ModelSourceOptions.DraftMode.NONE, o.draftMode());
+        assertFalse(o.mtpOnly());
+        assertFalse(o.dspark());
         assertTrue(o.stDenseModules());
         assertTrue(o.configOverrides().isEmpty());
         assertNull(o.tokenizerDir());
@@ -60,6 +64,7 @@ public class ModelSourceOptionsTest {
         p.setProperty(ModelSourceOptions.PROP_CACHE_DIR, "/var/cache/nf");
         p.setProperty(ModelSourceOptions.PROP_OUTTYPE, "bf16");
         p.setProperty(ModelSourceOptions.PROP_ONLINE_QUANT, "iq4-nl");
+        p.setProperty(ModelSourceOptions.PROP_ONLINE_OUTPUT, "false");
         p.setProperty(ModelSourceOptions.PROP_EXACT_QUANT, "TRUE");
         p.setProperty(ModelSourceOptions.PROP_MTP, "false");
         p.setProperty(ModelSourceOptions.PROP_ST_DENSE, " false ");
@@ -73,6 +78,7 @@ public class ModelSourceOptionsTest {
         assertEquals(Paths.get("/var/cache/nf"), o.cacheDir());
         assertEquals(ModelSourceOptions.OutType.BF16, o.outType());
         assertEquals(ModelSourceOptions.OnlineQuant.IQ4_NL, o.onlineQuant());
+        assertFalse(o.quantizeOutputTensor());
         assertTrue(o.exactQuant());
         assertFalse(o.includeMtp());
         assertFalse(o.stDenseModules());
@@ -81,6 +87,42 @@ public class ModelSourceOptionsTest {
         assertEquals(Paths.get("/models/base/config.json"), o.loraBaseConfig());
         assertEquals(Paths.get("/models/base"), o.baseDir());
         assertEquals(o, o.toBuilder().build());
+    }
+
+    @Test
+    public void theDraftSelectionMapsTheConverterFlags() {
+        ModelSourceOptions mtp = parse(ModelSourceOptions.PROP_DRAFT, "mtp");
+        assertEquals(ModelSourceOptions.DraftMode.MTP_ONLY, mtp.draftMode());
+        assertTrue(mtp.includeMtp());
+        assertTrue(mtp.mtpOnly());
+        assertFalse(mtp.dspark());
+        assertEquals(ModelSourceOptions.DraftMode.DSPARK, parse(ModelSourceOptions.PROP_DRAFT, "DSpark").draftMode());
+        assertEquals(ModelSourceOptions.DraftMode.NO_NEXTN,
+                parse(ModelSourceOptions.PROP_DRAFT, "no-nextn").draftMode());
+        assertEquals("--no-mtp is the same exclusion", ModelSourceOptions.DraftMode.NO_NEXTN,
+                parse(ModelSourceOptions.PROP_DRAFT, "no_mtp").draftMode());
+        assertFalse(parse(ModelSourceOptions.PROP_DRAFT, "no-nextn").includeMtp());
+        assertEquals(ModelSourceOptions.DraftMode.NONE, parse(ModelSourceOptions.PROP_DRAFT, "none").draftMode());
+
+        assertEquals("neuralfree.hf.mtp=false keeps its --no-mtp meaning",
+                ModelSourceOptions.DraftMode.NO_NEXTN, parse(ModelSourceOptions.PROP_MTP, "false").draftMode());
+        assertEquals(ModelSourceOptions.DraftMode.NONE, parse(ModelSourceOptions.PROP_MTP, "true").draftMode());
+
+        Properties both = new Properties();
+        both.setProperty(ModelSourceOptions.PROP_DRAFT, "mtp");
+        both.setProperty(ModelSourceOptions.PROP_MTP, "false");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> ModelSourceOptions.fromProperties(both));
+        assertTrue(e.getMessage(), e.getMessage().contains(ModelSourceOptions.PROP_MTP)
+                && e.getMessage().contains(ModelSourceOptions.PROP_DRAFT));
+
+        assertRejected(ModelSourceOptions.PROP_DRAFT, "eagle", "use none, mtp, no-nextn or dspark");
+        assertEquals(ModelSourceOptions.DraftMode.MTP_ONLY,
+                ModelSourceOptions.builder().draftMode(ModelSourceOptions.DraftMode.MTP_ONLY).build().draftMode());
+        assertEquals(ModelSourceOptions.DraftMode.NO_NEXTN,
+                ModelSourceOptions.builder().includeMtp(false).build().draftMode());
+        assertEquals(ModelSourceOptions.DraftMode.NONE,
+                ModelSourceOptions.builder().includeMtp(true).build().draftMode());
     }
 
     @Test
@@ -94,6 +136,56 @@ public class ModelSourceOptionsTest {
         for (ModelSourceOptions.OnlineQuant q : ModelSourceOptions.OnlineQuant.values()) {
             assertEquals(q, parse(ModelSourceOptions.PROP_ONLINE_QUANT, q.name().toLowerCase(Locale.ROOT)).onlineQuant());
         }
+    }
+
+    @Test
+    public void onlineQuantAcceptsTheVllmNamesAndAliases() {
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_BLOCK, ModelSourceOptions.OnlineQuant.parse("fp8_per_block"));
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_CHANNEL,
+                ModelSourceOptions.OnlineQuant.parse(" FP8-Per-Channel "));
+        assertEquals("--quantization fp8 on an unquantized checkpoint is fp8_per_tensor",
+                ModelSourceOptions.OnlineQuant.FP8_PER_TENSOR, ModelSourceOptions.OnlineQuant.parse("fp8"));
+        assertEquals(ModelSourceOptions.OnlineQuant.FP8_PER_CHANNEL, ModelSourceOptions.OnlineQuant.parse("ptpc_fp8"));
+        assertEquals(ModelSourceOptions.OnlineQuant.NVFP4_PER_TOKEN,
+                ModelSourceOptions.OnlineQuant.parse("nvfp4_online"));
+        assertEquals(ModelSourceOptions.OnlineQuant.EXPERTS_INT8, ModelSourceOptions.OnlineQuant.parse("experts_int8"));
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> ModelSourceOptions.OnlineQuant.parse("fp8_per_row"));
+        assertTrue(e.getMessage(), e.getMessage().startsWith(ModelSourceOptions.PROP_ONLINE_QUANT + "=fp8_per_row"));
+        assertTrue(e.getMessage(), e.getMessage().contains("int8_per_channel_weight_only")
+                && e.getMessage().contains("ptpc_fp8"));
+        assertEquals(ModelSourceOptions.OnlineQuant.MXFP4, ModelSourceOptions.OnlineQuant.parse("mxfp4"));
+        assertEquals(ModelSourceOptions.OnlineQuant.ONLINE, ModelSourceOptions.OnlineQuant.parse("Online"));
+        assertTrue(ModelSourceOptions.OnlineQuant.ONLINE.isVllm());
+        assertTrue(ModelSourceOptions.OnlineQuant.MXFP4.isVllm());
+        assertFalse(ModelSourceOptions.OnlineQuant.NONE.isVllm());
+        assertFalse(ModelSourceOptions.OnlineQuant.IQ4_NL.isVllm());
+    }
+
+    @Test
+    public void theQuantizationConfigIsParsedAndKeptWithTheVllmMethods() {
+        ModelSourceOptions o = parse(ModelSourceOptions.PROP_QUANT_CONFIG,
+                " {\"linear\": \"fp8_per_block\", \"ignore\": [\"lm_head\"]} ");
+        assertEquals(Collections.singletonList("lm_head"), o.quantConfig().ignore());
+        assertEquals(ModelSourceOptions.OnlineQuant.NONE, o.onlineQuant());
+        assertTrue(o.toString(), o.toString().contains("quantConfig=OnlineQuantConfig{linear=fp8_per_block_static"));
+        assertEquals(o, o.toBuilder().build());
+        assertNotEquals(o, ModelSourceOptions.defaults());
+        assertNull(ModelSourceOptions.builder().quantConfigJson(" ").build().quantConfig());
+        assertEquals(ModelSourceOptions.OnlineQuant.MXFP4, ModelSourceOptions.builder()
+                .onlineQuant(ModelSourceOptions.OnlineQuant.MXFP4).quantConfigJson("{\"ignore\": [\"a\"]}").build()
+                .onlineQuant());
+        IllegalArgumentException legacy = assertThrows(IllegalArgumentException.class, () -> ModelSourceOptions
+                .builder().onlineQuant(ModelSourceOptions.OnlineQuant.Q4_0).quantConfigJson("{\"moe\": \"mxfp8\"}")
+                .build());
+        assertTrue(legacy.getMessage(), legacy.getMessage().contains("q4_0 is a llama-quantize type"));
+        IllegalArgumentException notObject = assertThrows(IllegalArgumentException.class,
+                () -> ModelSourceOptions.builder().quantConfigJson("[1]"));
+        assertTrue(notObject.getMessage(), notObject.getMessage().startsWith(ModelSourceOptions.PROP_QUANT_CONFIG));
+        IllegalArgumentException member = assertThrows(IllegalArgumentException.class,
+                () -> ModelSourceOptions.builder().quantConfigJson("{\"lienar\": \"mxfp8\"}"));
+        assertTrue(member.getMessage(), member.getMessage().contains(ModelSourceOptions.PROP_QUANT_CONFIG
+                + ": unknown member 'lienar'"));
     }
 
     @Test
@@ -121,6 +213,7 @@ public class ModelSourceOptionsTest {
         assertRejected(ModelSourceOptions.PROP_MEMORY_MAX, "9000000000000G", "overflows a 64-bit byte count");
         assertRejected(ModelSourceOptions.PROP_OUTTYPE, "fp8", "use source, auto, f32, f16, bf16, q8_0");
         assertRejected(ModelSourceOptions.PROP_ONLINE_QUANT, "q2_k", "is invalid");
+        assertRejected(ModelSourceOptions.PROP_ONLINE_OUTPUT, "yes", "is not a boolean");
         assertRejected(ModelSourceOptions.PROP_EXACT_QUANT, "yes", "is not a boolean");
         assertRejected(ModelSourceOptions.PROP_MTP, "1", "is not a boolean");
         assertRejected(ModelSourceOptions.PROP_ST_DENSE, "on", "is not a boolean");
@@ -168,6 +261,24 @@ public class ModelSourceOptionsTest {
         assertTrue(e.getMessage(), e.getMessage().contains(ModelSourceOptions.PROP_OVERRIDES));
         assertTrue(e.getMessage(), e.getMessage().contains("'p'"));
         assertTrue(ModelSourceOptions.builder().configOverrides(null).build().configOverrides().isEmpty());
+    }
+
+    @Test
+    public void remoteConcurrencyIsBounded() {
+        assertEquals(ModelSourceOptions.DEFAULT_REMOTE_CONCURRENCY,
+                ModelSourceOptions.defaults().remoteConcurrency());
+        Properties p = new Properties();
+        p.setProperty(ModelSourceOptions.PROP_REMOTE_CONCURRENCY, "16");
+        assertEquals(16, ModelSourceOptions.fromProperties(p).remoteConcurrency());
+        p.setProperty(ModelSourceOptions.PROP_REMOTE_CONCURRENCY, "16");
+        assertEquals(16, ModelSourceOptions.fromProperties(p).toBuilder().build().remoteConcurrency());
+        assertRejected(ModelSourceOptions.PROP_REMOTE_CONCURRENCY, "0", "outside");
+        assertRejected(ModelSourceOptions.PROP_REMOTE_CONCURRENCY, "257", "outside");
+        assertRejected(ModelSourceOptions.PROP_REMOTE_CONCURRENCY, "many", "not an integer");
+        assertThrows(IllegalArgumentException.class,
+                () -> ModelSourceOptions.builder().remoteConcurrency(0).build());
+        assertThrows(IllegalArgumentException.class,
+                () -> ModelSourceOptions.builder().remoteConcurrency(257).build());
     }
 
     @Test

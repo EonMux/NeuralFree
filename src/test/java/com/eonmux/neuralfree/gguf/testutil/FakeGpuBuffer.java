@@ -1,7 +1,10 @@
 package com.eonmux.neuralfree.gguf.testutil;
 
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.function.LongConsumer;
 
 /**
@@ -17,7 +20,7 @@ import java.util.function.LongConsumer;
  * <p>Element accessors take element indices (4 bytes for int/float, 2 bytes for short), not byte
  * offsets. Every access is bounds-checked and fails on a closed buffer.
  */
-public final class FakeGpuBuffer implements GpuBuffer {
+public final class FakeGpuBuffer implements GpuBuffer, HostMappedBuffer {
 
     /** Largest buffer whose contents can be read or written from the host. */
     public static final long MAX_CONTENT_BYTES = Integer.MAX_VALUE - 8L;
@@ -81,6 +84,21 @@ public final class FakeGpuBuffer implements GpuBuffer {
         if (release && releaseHook != null) {
             releaseHook.accept(sizeInBytes);
         }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws IllegalStateException    when the buffer is closed
+     * @throws IndexOutOfBoundsException when the range is outside the buffer
+     */
+    @Override
+    public synchronized ByteBuffer hostView(long offset, int length) {
+        if (length < 0) {
+            throw new IllegalArgumentException("host view length must not be negative, got " + length);
+        }
+        checkRange(offset, length);
+        return ByteBuffer.wrap(storage(), (int) offset, length).slice().order(ByteOrder.LITTLE_ENDIAN);
     }
 
     // ------------------------------------------------------------------ raw byte access

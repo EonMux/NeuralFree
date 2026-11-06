@@ -87,14 +87,19 @@ public final class LlmKernels {
         return set.subgroups();
     }
 
-    /** Preferred work-group size of row-reduce kernels on this backend. */
+    /** Preferred work-group size of matvec kernels on this backend. */
     public int preferredMatvecLocal() {
         return set.preferredMatvecLocal();
     }
 
-    /** Work-group size for row-reduce kernels: {@code min(LLM_DIMX, preferredMatvecLocal())}. */
+    /** Work-group size of the matvec kernels: {@code min(LLM_DIMX, preferredMatvecLocal())}. */
     public int matvecLocal() {
         return Math.min(LlmKernelConstants.LLM_DIMX, set.preferredMatvecLocal());
+    }
+
+    /** Work-group size of the row-norm kernels: {@code LLM_DIMX} ({@code min(LLM_DIMX, rowReduceLocal())}). */
+    public int rowReduceLocal() {
+        return Math.min(LlmKernelConstants.LLM_DIMX, set.rowReduceLocal());
     }
 
     public ComputeBackend backend() {

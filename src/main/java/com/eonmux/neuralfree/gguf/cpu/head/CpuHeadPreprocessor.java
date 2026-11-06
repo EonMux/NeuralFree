@@ -26,6 +26,15 @@ public interface CpuHeadPreprocessor extends AutoCloseable {
      */
     void apply(int nRows, float[] hidden);
 
+    /**
+     * {@link #apply(int, float[])} with the source rows of the step: {@code rowIdx[r]} is the row of the final
+     * residual stream that {@code hidden} row {@code r} was gathered from, for transforms that also read state the
+     * last layer kept at those rows (DeepSeek-V4.1's last pre-mix).
+     */
+    default void apply(int nRows, float[] hidden, int[] rowIdx) {
+        apply(nRows, hidden);
+    }
+
     /** Releases what {@link #bind} created. */
     @Override
     default void close() {

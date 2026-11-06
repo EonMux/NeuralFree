@@ -94,6 +94,21 @@ public class TensorOpsCpuReferenceTest {
         assertEquals(DType.INT32, keep(TensorOps.argmax(t, 0)).dtype());
     }
 
+    /**
+     * Sums and means accumulate in double and round once, as ggml's CPU sums do: a float running total starting at
+     * 2^24 drops every added 1 (half an ulp, rounded to even), while the double total keeps them.
+     */
+    @Test
+    public void sumAndMeanAccumulateInDouble() {
+        float big = 16777216f;
+        Tensor flat = floats(new float[]{big, 1f, 1f, 1f, 1f}, 5);
+        assertEquals(16777220f, keep(TensorOps.sum(flat)).toFloatArray()[0], 0f);
+        assertEquals(16777220f / 5f, keep(TensorOps.mean(flat)).toFloatArray()[0], 0f);
+        Tensor rows = floats(new float[]{big, 1f, 1f, 1f, 1f, 2f, 2f, 2f, 2f, 2f}, 2, 5);
+        assertArrayEquals(new float[]{16777220f, 10f}, keep(TensorOps.sum(rows, 1)).toFloatArray(), 0f);
+        assertArrayEquals(new float[]{16777220f / 5f, 2f}, keep(TensorOps.mean(rows, 1)).toFloatArray(), 0f);
+    }
+
     @Test
     public void sumToShapeSumsBroadcastDimsIntoANewTensor() {
         float[] x = TrainParity.uniform(3, 4 * 3 * 5, -1f, 1f);
@@ -114,6 +129,10 @@ public class TensorOpsCpuReferenceTest {
         assertArrayEquals(x, same.toFloatArray(), 0f);
         Tensor rearranged = keep(TensorOps.sumToShape(floats(new float[]{1f, 2f, 3f, 4f}, 1, 4), Shape.of(4, 1)));
         assertEquals(Shape.of(4, 1), rearranged.shape());
+        Tensor flattened = keep(TensorOps.sumToShape(t, Shape.of(6, 10)));
+        assertEquals("a target that does not broadcast but has the element count rearranges",
+                Shape.of(6, 10), flattened.shape());
+        assertArrayEquals(x, flattened.toFloatArray(), 0f);
         assertThrows(IllegalArgumentException.class, () -> TensorOps.sumToShape(t, Shape.of(7)));
     }
 

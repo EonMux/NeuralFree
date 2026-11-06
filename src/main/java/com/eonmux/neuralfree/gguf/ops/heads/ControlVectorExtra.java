@@ -27,11 +27,11 @@ import java.util.Objects;
  *
  * <p>The layer's sum lives in one writable F32 buffer the extra owns and rewrites in place between steps: the extra
  * follows its set as a {@link ControlVector.Listener} — the set delivers the events synchronously on the engine thread
- * the forward pass runs on (§3.3), so a load, an unload or a scale change rewrites {@code v} there, in the
- * {@code LoraDeltas.rescale} form (LR-1), and a later step runs entirely on the new epoch. {@link #afterBlock} also
+ * the forward pass runs on, so a load, an unload or a scale change rewrites {@code v} there, in the
+ * {@code LoraDeltas.rescale} form, and a later step runs entirely on the new epoch. {@link #afterBlock} also
  * rewrites when it first sees the set's revision move past the one the buffer was written for, which keeps a buffer
  * bound before a hot change correct without relying on event order. Mutable, owned by the engine thread like every
- * extra (§3.1); {@link #close} must not run while a step's queues still hold its dispatches.
+ * extra; {@link #close} must not run while a step's queues still hold its dispatches.
  */
 public final class ControlVectorExtra implements GpuLayerExtra, ControlVector.Listener {
 
@@ -126,7 +126,25 @@ public final class ControlVectorExtra implements GpuLayerExtra, ControlVector.Li
         afterBlock(s.pos0(0), s.nTokens(), x);
     }
 
-    /** The add needs no per-sequence layout, so batching is supported (the batched {@code afterBlock} runs). */
+    /**
+     * The add touches only the end of the block (the {@code afterBlock} hooks), and both are layout independent, so
+     * the batched forms of the earlier hooks are the no-ops the contiguous forms delegate to.
+     */
+    @Override
+    public void beforeBlock(StepLayout s, ScratchSlot x) {
+    }
+
+    @Override
+    public boolean afterMixer(StepLayout s, ScratchSlot x, ScratchSlot branch) {
+        return false;
+    }
+
+    @Override
+    public boolean afterFfn(StepLayout s, ScratchSlot x, ScratchSlot branch) {
+        return false;
+    }
+
+    /** The add needs no per-sequence layout, so batching is supported (the batched hooks run). */
     @Override
     public String batchRefusal() {
         return null;
@@ -148,7 +166,7 @@ public final class ControlVectorExtra implements GpuLayerExtra, ControlVector.Li
     }
 
     /**
-     * The {@link ControlVector} events, delivered synchronously on the engine thread (§3.3): rewrite {@code v} in
+     * The {@link ControlVector} events, delivered synchronously on the engine thread: rewrite {@code v} in
      * place for the new identity of the set. A loaded or unloaded vector outside this layer's range changes nothing
      * here, and the rewrite still refreshes the revision so no step runs on the old bytes by accident.
      */
@@ -179,7 +197,7 @@ public final class ControlVectorExtra implements GpuLayerExtra, ControlVector.Li
         writeVector();
     }
 
-    /** Uploads the layer's {@code held} sum into {@code vec} in place (LR-1's rescale form). */
+    /** Uploads the layer's {@code held} sum into {@code vec} in place (the rescale form). */
     private void writeVector() {
         float[] sum = held.layer(il);
         if (sum.length == 0) {

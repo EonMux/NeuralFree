@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.hf.meta;
 
+import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.GGUFValueType;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.hf.arch.HfArchEntry;
@@ -9,16 +10,27 @@ import com.eonmux.neuralfree.gguf.hf.arch.HfMetadataHook;
 import com.eonmux.neuralfree.gguf.hf.arch.HfTensorHook;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfigLoader;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
+import com.eonmux.neuralfree.gguf.hparams.GgufKv;
+import com.eonmux.neuralfree.gguf.hparams.HparamsLoader;
+import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
+import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
+import com.eonmux.neuralfree.gguf.spec.RopeSpec;
+import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
+import com.eonmux.neuralfree.gguf.spec.resolve.RopeResolver;
 import org.junit.Test;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 /**
  * {@link HfGenericMetadata} writes what {@code TextModel.set_gguf_parameters} writes (LC/conversion/base.py:1606-1720)
@@ -89,6 +101,41 @@ public class HfGenericMetadataTest {
     }
 
     @Test
+    public void dualChunkAttentionConfigWritesTheNeuralFreeKeys() {
+        HfMetadata m = generic(Arch.QWEN2, "Qwen2ForCausalLM", "'architectures': ['Qwen2ForCausalLM'],"
+                + " 'hidden_size': 896, 'intermediate_size': 4864, 'num_attention_heads': 14,"
+                + " 'num_key_value_heads': 2, 'num_hidden_layers': 24, 'max_position_embeddings': 1010000,"
+                + " 'rms_norm_eps': 1e-06, 'dual_chunk_attention_config': {'chunk_size': 16384,"
+                + " 'local_size': 2048, 'original_max_position_embeddings': 32768}");
+        List<String> keys = keys(m);
+        assertTrue(keys.toString(), keys.containsAll(Arrays.asList("qwen2.attention.dual_chunk.chunk_size",
+                "qwen2.attention.dual_chunk.local_size",
+                "qwen2.attention.dual_chunk.original_max_position_embeddings",
+                "qwen2.attention.dual_chunk.sparse_attention_enabled",
+                "qwen2.attention.dual_chunk.sparse_attention_threshold",
+                "qwen2.attention.dual_chunk.sparse_attention_last_q")));
+        assertEquals(16384, m.get("qwen2.attention.dual_chunk.chunk_size"));
+        assertEquals(GGUFValueType.UINT32, m.type("qwen2.attention.dual_chunk.chunk_size"));
+        assertEquals(2048, m.get("qwen2.attention.dual_chunk.local_size"));
+        assertEquals(32768, m.get("qwen2.attention.dual_chunk.original_max_position_embeddings"));
+        assertEquals(false, m.get("qwen2.attention.dual_chunk.sparse_attention_enabled"));
+        assertEquals(GGUFValueType.BOOL, m.type("qwen2.attention.dual_chunk.sparse_attention_enabled"));
+        assertEquals(32768, m.get("qwen2.attention.dual_chunk.sparse_attention_threshold"));
+        assertEquals(64, m.get("qwen2.attention.dual_chunk.sparse_attention_last_q"));
+    }
+
+    @Test
+    public void anEnabledSparseDualChunkConfigIsRefusedByKeyName() {
+        GgufFormatException e = assertThrows(GgufFormatException.class,
+                () -> generic(Arch.QWEN2, "Qwen2ForCausalLM", "'architectures': ['Qwen2ForCausalLM'],"
+                        + " 'hidden_size': 896, 'intermediate_size': 4864, 'num_attention_heads': 14,"
+                        + " 'num_key_value_heads': 2, 'num_hidden_layers': 24, 'max_position_embeddings': 32768,"
+                        + " 'rms_norm_eps': 1e-06, 'dual_chunk_attention_config':"
+                        + " {'sparse_attention_enabled': true}"));
+        assertTrue(e.getMessage(), e.getMessage().contains("sparse_attention_enabled"));
+    }
+
+    @Test
     public void qwen2YarnWritesTheYarnKeysInOrder() {
         HfMetadata m = generic(Arch.QWEN2, "Qwen2ForCausalLM", "'architectures': ['Qwen2ForCausalLM'],"
                 + " 'hidden_size': 896, 'intermediate_size': 4864, 'num_attention_heads': 14,"
@@ -142,7 +189,7 @@ public class HfGenericMetadataTest {
 
     @Test
     public void linearWithoutFactorAndDelegatedTypesWriteNoScaling() {
-        for (String scaling : Arrays.asList("{'rope_type': 'linear'}", "{'rope_type': 'dynamic', 'factor': 2.0}",
+        for (String scaling : Arrays.asList("{'rope_type': 'linear'}",
                 "{'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0, 'high_freq_factor': 4.0,"
                         + " 'original_max_position_embeddings': 8192}",
                 "{'rope_type': 'default'}")) {
@@ -150,6 +197,97 @@ public class HfGenericMetadataTest {
             assertFalse(scaling, m.has("llama.rope.scaling.type"));
             assertFalse(scaling, m.has("llama.rope.scaling.factor"));
         }
+    }
+
+    @Test
+    public void dynamicWritesTypeFactorAndTrainedAnchor() {
+        HfMetadata m = llama("'rope_scaling': {'type': 'dynamic', 'factor': 4.0, 'max_trained_positions': 8192}");
+        assertEquals("dynamic", m.get("llama.rope.scaling.type"));
+        assertEquals(GGUFValueType.STRING, m.type("llama.rope.scaling.type"));
+        assertEquals(4f, m.get("llama.rope.scaling.factor"));
+        assertEquals(GGUFValueType.FLOAT32, m.type("llama.rope.scaling.factor"));
+        assertFalse(m.has("llama.rope.scaling.alpha"));
+        assertEquals(8192, m.get("llama.rope.scaling.original_context_length"));
+        assertEquals(GGUFValueType.UINT32, m.type("llama.rope.scaling.original_context_length"));
+        List<String> k = keys(m);
+        assertEquals(k.indexOf("llama.rope.scaling.type") + 1, k.indexOf("llama.rope.scaling.factor"));
+        assertEquals(k.indexOf("llama.rope.scaling.factor") + 1,
+                k.indexOf("llama.rope.scaling.original_context_length"));
+    }
+
+    @Test
+    public void dynamicWritesTheAlphaAndMirrorsTheRootTrainedLength() {
+        HfMetadata m = llama("'max_trained_positions': 8192, 'rope_scaling': {'type': 'dynamic', 'alpha': 1000.0}");
+        assertEquals("dynamic", m.get("llama.rope.scaling.type"));
+        assertEquals(1000f, m.get("llama.rope.scaling.alpha"));
+        assertEquals(GGUFValueType.FLOAT32, m.type("llama.rope.scaling.alpha"));
+        assertFalse(m.has("llama.rope.scaling.factor"));
+        assertEquals(8192, m.get("llama.rope.scaling.original_context_length"));
+    }
+
+    @Test
+    public void dynamicWithoutAlphaOrFactorIsRejected() {
+        GgufFormatException e = assertThrows(GgufFormatException.class,
+                () -> llama("'rope_scaling': {'type': 'dynamic'}"));
+        assertEquals("config.json: rope_parameters: 'dynamic' rope scaling needs an 'alpha' or a 'factor'",
+                e.getMessage());
+    }
+
+    /** {@link HfMetadata} plus the {@code general.architecture} the assembler writes, as the loader reads it. */
+    private static ModelHparams loadHparams(HfMetadata m, Arch arch) {
+        Map<String, Object> values = new LinkedHashMap<>(m.values());
+        values.put("general.architecture", arch.ggufName());
+        return HparamsLoader.load(GgufKv.ofMap(values), arch);
+    }
+
+    @Test
+    public void dynamicMetadataResolvesToTheScaledBase() {
+        HfMetadata m = llama("'rope_scaling': {'type': 'dynamic', 'factor': 4.0, 'max_trained_positions': 2048}");
+        ModelHparams hp = loadHparams(m, Arch.LLAMA);
+        RopeSpec r = new RopeResolver(hp, TensorCatalog.of("llama", new ArrayList<GGUFTensorInfo>()), 4096)
+                .forLayer(0);
+        float expected = RopeMath.dynamicNtkBase(10000f, 4f, 4096, 2048, 128);
+        assertEquals(expected, r.freqBase(), expected * 1e-6f);
+        assertEquals(RopeMath.thetaScale(expected, 128), r.thetaScale(), 0f);
+    }
+
+    @Test
+    public void dynamicAlphaMetadataResolvesToTheScaledBase() {
+        HfMetadata m = llama("'rope_scaling': {'type': 'dynamic', 'alpha': 1000.0}");
+        ModelHparams hp = loadHparams(m, Arch.LLAMA);
+        RopeSpec r = new RopeResolver(hp, TensorCatalog.of("llama", new ArrayList<GGUFTensorInfo>()), 4096)
+                .forLayer(0);
+        float expected = RopeMath.dynamicAlphaBase(10000f, 1000f, 128);
+        assertEquals(expected, r.freqBase(), expected * 1e-6f);
+    }
+
+    @Test
+    public void ntkWritesTypeFactorAndMixedB() {
+        HfMetadata m = llama("'rope_scaling': {'type': 'ntk', 'factor': 4.0, 'mixed_b': 0.25}");
+        assertEquals("ntk", m.get("llama.rope.scaling.type"));
+        assertEquals(GGUFValueType.STRING, m.type("llama.rope.scaling.type"));
+        assertEquals(4f, m.get("llama.rope.scaling.factor"));
+        assertEquals(0.25f, m.get("llama.rope.scaling.mixed_b"));
+        assertEquals(GGUFValueType.FLOAT32, m.type("llama.rope.scaling.mixed_b"));
+        List<String> k = keys(m);
+        assertEquals(k.indexOf("llama.rope.scaling.type") + 1, k.indexOf("llama.rope.scaling.factor"));
+        assertEquals(k.indexOf("llama.rope.scaling.factor") + 1, k.indexOf("llama.rope.scaling.mixed_b"));
+    }
+
+    @Test
+    public void ntkWithoutFactorIsRejected() {
+        GgufFormatException e = assertThrows(GgufFormatException.class,
+                () -> llama("'rope_scaling': {'type': 'ntk'}"));
+        assertEquals("config.json: rope_parameters: 'ntk' rope scaling needs a 'factor'", e.getMessage());
+    }
+
+    @Test
+    public void ntkMetadataResolvesToTheComputedDivisors() {
+        HfMetadata m = llama("'rope_scaling': {'type': 'ntk', 'factor': 4.0, 'mixed_b': 0.5}");
+        ModelHparams hp = loadHparams(m, Arch.LLAMA);
+        RopeSpec r = new RopeResolver(hp, TensorCatalog.of("llama", new ArrayList<GGUFTensorInfo>()), 4096)
+                .forLayer(0);
+        assertArrayEquals(RopeMath.ntkFactors(4.0f, 0.5f, 128), r.computedFreqFactors(), 0f);
     }
 
     @Test

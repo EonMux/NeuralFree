@@ -14,6 +14,8 @@ import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuFfnFactory;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuOpsFixture;
+import com.eonmux.neuralfree.gguf.gpu.forward.FusedMode;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
@@ -78,6 +80,11 @@ public class GpuDenseFfnTest {
     private GpuDenseFfn block;
 
     private void open() {
+        open(FusedMode.OFF);
+    }
+
+    /** Opens the fake backend with an explicit fused-kernel mode; the traces pin the mode they exercise. */
+    private void open(FusedMode mode) {
         backend = FakeComputeBackend.builder().strictLlmArgs(true).build();
         scratch = GpuScratch.builder(backend, UBATCH)
                 .slot(ScratchSlots.NORMED, (long) UBATCH * N_EMBD)
@@ -85,7 +92,8 @@ public class GpuDenseFfnTest {
                 .slot(ScratchSlots.FFN_GATE_UP, 4L * UBATCH * N_FF)
                 .build();
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
-        ops = new GpuOps(backend.computeQueue(), LlmKernels.open(backend), scratch, placeholders);
+        ops = GpuOpsFixture.withFusedMode(backend.computeQueue(), LlmKernels.open(backend), scratch, placeholders,
+                mode);
         local = ops.local();
     }
 
@@ -249,6 +257,38 @@ public class GpuDenseFfnTest {
         assertArrayEquals(new long[]{roundUp(N_FF)}, glu.global());
         assertArrayEquals(new long[]{local}, glu.local());
         assertMatvec(ds.get(3), MATVEC, down, gateUp(), branch());
+    }
+
+    @Test
+    public void llamaDecodeFusesGateUpAndSwigluWhenSelected() {
+        open(FusedMode.ON);
+        GpuWeight gate = matrix("ffn_gate.weight", N_EMBD, N_FF);
+        GpuWeight upW = matrix("ffn_up.weight", N_EMBD, N_FF);
+        GpuWeight down = matrix("ffn_down.weight", N_FF, N_EMBD);
+        bind(Arch.LLAMA, layer(ffn().glu(FfnGating.PAR, GluOp.SWIGLU).build()));
+        List<Dispatch> ds = run(1);
+
+        assertEquals(Arrays.asList("Float_MatVecFusedGateUp", MATVEC), names(ds));
+        Dispatch fused = ds.get(0);
+        assertSame(gate.shard(0), fused.bufferArg(2));
+        assertSame(upW.shard(0), fused.bufferArg(3));
+        assertSame(normed(), fused.bufferArg(4));
+        assertSame(gateUp(), fused.bufferArg(5));
+        assertArrayEquals(new int[]{N_FF, N_EMBD}, ints(fused, 0, 2));
+        assertArrayEquals(new long[]{(long) N_FF * local}, fused.global());
+        assertMatvec(ds.get(1), MATVEC, down, gateUp(), branch());
+    }
+
+    @Test
+    public void gegluKeepsTheSeparateProjectionsUnderRequiredFusion() {
+        open(FusedMode.ON);
+        matrix("ffn_gate.weight", N_EMBD, N_FF);
+        matrix("ffn_up.weight", N_EMBD, N_FF);
+        matrix("ffn_down.weight", N_FF, N_EMBD);
+        bind(Arch.GEMMA, layer(ffn().glu(FfnGating.PAR, GluOp.GEGLU_TANH).build()));
+        List<Dispatch> ds = run(1);
+
+        assertEquals(Arrays.asList(MATVEC, MATVEC, ActKernels.GLU, MATVEC), names(ds));
     }
 
     @Test

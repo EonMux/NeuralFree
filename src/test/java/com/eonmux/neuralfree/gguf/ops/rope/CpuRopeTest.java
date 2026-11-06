@@ -1,27 +1,35 @@
 package com.eonmux.neuralfree.gguf.ops.rope;
 
+import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.hparams.MropeTextPositions;
 import com.eonmux.neuralfree.gguf.memory.KvBlockCodec;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
+import com.eonmux.neuralfree.gguf.spec.FopeSpec;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
+import com.eonmux.neuralfree.gguf.spec.TensorNames;
+import com.eonmux.neuralfree.gguf.spec.TensorRef;
+import com.eonmux.neuralfree.tensor.HalfFloats;
 import org.junit.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Random;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
  * Tests for {@link CpuRope}, {@link RopeFreqTable} and {@link RopePositions}: rotation layouts, full IMROPE sector
- * selection for text tokens, KV stores (F32, F16, BF16, the block types with C {@code roundf}), and context shifts that
- * compose with the original rotation, including Hadamard-rotated block-type caches.
+ * selection for text tokens, KV stores (F32, F16, BF16, the FP8 types with per-head checkpoint scales, the block
+ * types with C {@code roundf}), and context shifts that compose with the original rotation, including Hadamard-rotated
+ * block-type caches.
  */
 public class CpuRopeTest {
 
@@ -133,6 +141,58 @@ public class CpuRopeTest {
             assertEquals(0, half[e]);
             assertEquals(FpBlockDecoders.roundToFp16(src[8 + e]), FpBlockDecoders.fp16ToFp32(half[2 * 8 + e]), 0f);
         }
+    }
+
+    /**
+     * The FP8 store writes the code of {@code value / kvScale} per head (vLLM {@code reshape_and_cache_fp8}), so the
+     * decoded value times its head's scale is the stored value, and a shift of the stored codes composes with the
+     * rotation like F16 (the rotation is linear in the stored, scale-divided values).
+     */
+    @Test
+    public void fp8StoreScalesPerHeadAndShiftComposes() {
+        KvDType type = KvDType.FP8_E4M3;
+        float[] kScale = {1.0f, 4.0f};
+        RopeSpec spec = spec(RopeType.NEOX, 32);
+        RopeFreqTable table = RopeFreqTable.of(spec, null);
+        RopeFreqTable shift = RopeFreqTable.forShift(spec, null);
+        int nHeads = 2;
+        int width = nHeads * 32;
+        float[] x = random(2 * width, 7);
+        float[] rotated = x.clone();
+        CpuRope.apply(table, rotated, 0, 2, nHeads, 32, width, 0, new int[]{10, 11}, 0, 2);
+        byte[] cache = new byte[2 * width];
+        CpuRope.storeFp8(type, rotated, 0, width, 2, width, 32, new int[]{0, 1}, cache, width, kScale);
+        for (int h = 0; h < nHeads; h++) {
+            for (int d = 0; d < 32; d++) {
+                float stored = KvBlockCodec.fp8Value(type, cache[h * 32 + d]);
+                assertEquals(rotated[h * 32 + d], stored * kScale[h], fp8Tolerance(rotated[h * 32 + d]));
+            }
+        }
+        // the shift rotates the stored, quantized values: its reference is the rotation of the codes before it,
+        // re-encoded once (rope(x, a) shifted by d equals rope(x, a + d) up to that re-quantization)
+        byte[] before = cache.clone();
+        CpuRope.shiftFp8(type, shift, cache, 2, nHeads, 32, width, 0, new int[]{-4, 0});
+        float[] stored = new float[2 * width];
+        for (int e = 0; e < stored.length; e++) {
+            stored[e] = KvBlockCodec.fp8Value(type, before[e]);
+        }
+        CpuRope.apply(table, stored, 0, 2, nHeads, 32, width, 0, new int[]{-4, 0}, 0, 2);
+        for (int h = 0; h < nHeads; h++) {
+            for (int d = 0; d < 32; d++) {
+                float got = KvBlockCodec.fp8Value(type, cache[h * 32 + d]) * kScale[h];
+                float want = stored[h * 32 + d] * kScale[h];
+                assertEquals(want, got, fp8Tolerance(want));
+            }
+        }
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> CpuRope.storeFp8(KvDType.F16, rotated, 0, width, 1, width, 32, new int[]{0}, cache, width,
+                        kScale));
+        assertEquals("F16 is not an FP8 KV type", e.getMessage());
+    }
+
+    /** One FP8 step: 6.25% of a normal value's magnitude, and the smallest subnormal below it. */
+    private static float fp8Tolerance(float want) {
+        return Math.max(0.07f * Math.abs(want), 0.01f);
     }
 
     /** d = 127 / 127 = 1, so q = roundf(x): halfway cases round away from zero. */
@@ -343,17 +403,25 @@ public class CpuRopeTest {
         for (int b = 0; b < head / 32; b++) {
             KvBlockCodec.dequantize(KvDType.Q8_0, cache, b * 34, before, b * 32);
         }
+        byte[] outsideBefore = Arrays.copyOfRange(cache.array(), 0, 34);
         assertEquals(32, RopeKernels.shiftWindowStart(40, 0));
         assertEquals(64, RopeKernels.shiftWindowEnd(16, 40, 0));
         CpuRope.shiftBlocks(KvDType.Q8_0, shift, cache, 1, 1, head, head, 40, 0, new int[]{5});
 
+        // the block outside the window [32, 64) is never rewritten
+        assertArrayEquals(outsideBefore, Arrays.copyOfRange(cache.array(), 0, 34));
         float[] after = new float[head];
         for (int b = 0; b < head / 32; b++) {
             KvBlockCodec.dequantize(KvDType.Q8_0, cache, b * 34, after, b * 32);
         }
-        for (int i = 0; i < head; i++) {
+        // the window's block is requantized whole, as llama.cpp's cast-rope-copy K-shift of a quantized cache
+        // requantizes it: its unrotated dims keep their values up to the Q8_0 rounding of the new scale d, which is
+        // d / 2 plus 127 steps of the fp16 rounding of d (relative error 2^-11)
+        float d = HalfFloats.halfToFloat(cache.getShort(34) & 0xFFFF);
+        float bound = d / 2 + 127 * Math.abs(d) * 0x1p-11f;
+        for (int i = 32; i < head; i++) {
             if (i < 40 || i >= 56) {
-                assertEquals("dim " + i + " is outside the rotated dims", before[i], after[i], 0f);
+                assertEquals("dim " + i + " is outside the rotated dims", before[i], after[i], bound);
             }
         }
     }
@@ -400,5 +468,170 @@ public class CpuRopeTest {
         int[] single = new int[3];
         RopePositions.fill(RopeType.NEOX, MropeTextPositions.PPP0, new int[]{9, 3, 5}, 0, 3, single);
         assertArrayEquals(new int[]{9, 3, 5}, single);
+    }
+
+    // ------------------------------------------------------------------ fixed / mixed NTK scaling
+
+    /** A computed-divisor spec rotates pair {@code i} by {@code p * theta_scale^i / factors[i]}. */
+    @Test
+    public void computedFrequencyFactorsDivideTheAngles() {
+        int nDims = 8;
+        int pairs = nDims / 2;
+        float[] factors = RopeMath.ntkFactors(4f, Float.NaN, nDims);
+        RopeSpec spec = RopeSpec.builder(RopeType.NEOX).nDims(nDims).freqBase(10000f)
+                .computedFreqFactors(factors).build();
+        RopeFreqTable table = RopeFreqTable.of(spec, null);
+        float theta = RopeMath.thetaScale(10000f, nDims);
+        int p = 37;
+        float[] cs = new float[2 * pairs];
+        table.cosSin(p, cs);
+        for (int i = 0; i < pairs; i++) {
+            double angle = p * Math.pow(theta, i) / factors[i];
+            assertEquals("cos " + i, Math.cos(angle), cs[2 * i], 1e-6);
+            assertEquals("sin " + i, Math.sin(angle), cs[2 * i + 1], 1e-6);
+        }
+        // the shift table carries the same divisors
+        RopeFreqTable shift = RopeFreqTable.forShift(spec, null);
+        float[] scs = new float[2 * pairs];
+        shift.cosSin(3, scs);
+        for (int i = 0; i < pairs; i++) {
+            double angle = 3 * Math.pow(theta, i) / factors[i];
+            assertEquals("shift cos " + i, Math.cos(angle), scs[2 * i], 1e-6);
+        }
+    }
+
+    // ------------------------------------------------------------------ Fourier position embedding
+
+    private static RopeSpec fopeSpec(int nDims, int nKv, int numInvFreq, boolean sep) {
+        float[] inv = RopeMath.fopeInvFreq(10000f, nDims, numInvFreq, 4096);
+        TensorRef cos = TensorRef.of(TensorNames.weight(TensorNames.ROPE_COS_COEF), GGMLType.F32,
+                numInvFreq, numInvFreq, nKv);
+        TensorRef sin = TensorRef.of(TensorNames.weight(TensorNames.ROPE_SIN_COEF), GGMLType.F32,
+                numInvFreq, numInvFreq, nKv);
+        return RopeSpec.builder(RopeType.NEOX).nDims(nDims).freqBase(10000f)
+                .fope(FopeSpec.of(nKv, sep, inv, cos, sin)).build();
+    }
+
+    /**
+     * vLLM fope.py: pair {@code i < D} rotates by the coefficient projection of {@code cos/sin(p * inv_freq[d])},
+     * pairs at or above {@code D} by {@code (1, 1)}; a query head reads the row of its KV group.
+     */
+    @Test
+    public void fopeRotationMatchesVllm() {
+        int nDims = 8;
+        int nKv = 2;
+        int d = 3;
+        int pairs = nDims / 2;
+        RopeSpec spec = fopeSpec(nDims, nKv, d, true);
+        float[] cosCoef = random(nKv * d * d, 11);
+        float[] sinCoef = random(nKv * d * d, 12);
+        FopeWeights weights = FopeWeights.of(spec.fope(), cosCoef, sinCoef);
+        RopeFreqTable table = RopeFreqTable.of(spec, null, weights);
+
+        int nTokens = 3;
+        int nHeads = 2;
+        int[] pos = {0, 5, 41};
+        float[] x = random(nTokens * nHeads * nDims, 13);
+        float[] y = x.clone();
+        CpuRope.apply(table, y, 0, nTokens, nHeads, nDims, nHeads * nDims, 0, pos, 0, 1);
+
+        float[] inv = spec.fope().invFreq();
+        float[] expected = x.clone();
+        for (int t = 0; t < nTokens; t++) {
+            for (int h = 0; h < nHeads; h++) {
+                int row = h;
+                int base = (t * nHeads + h) * nDims;
+                for (int i = 0; i < pairs; i++) {
+                    float c = 1f;
+                    float s = 1f;
+                    if (i < d) {
+                        c = 0f;
+                        s = 0f;
+                        for (int k = 0; k < d; k++) {
+                            double angle = (double) pos[t] * inv[k];
+                            c += (float) Math.cos(angle) * cosCoef[(row * d + k) * d + i];
+                            s += (float) Math.sin(angle) * sinCoef[(row * d + k) * d + i];
+                        }
+                    }
+                    float x0 = expected[base + i];
+                    float x1 = expected[base + pairs + i];
+                    expected[base + i] = x0 * c - x1 * s;
+                    expected[base + pairs + i] = x0 * s + x1 * c;
+                }
+            }
+        }
+        assertArrayEquals(expected, y, 1e-6f);
+    }
+
+    /** A query wider than the KV heads reads the row of its group; the same stats every query head is an error. */
+    @Test
+    public void fopeMapsQueryHeadsToKeywordGroups() {
+        int nDims = 8;
+        int nKv = 2;
+        int d = 2;
+        RopeSpec spec = fopeSpec(nDims, nKv, d, true);
+        float[] cosCoef = random(nKv * d * d, 21);
+        float[] sinCoef = random(nKv * d * d, 22);
+        RopeFreqTable table = RopeFreqTable.of(spec, null, FopeWeights.of(spec.fope(), cosCoef, sinCoef));
+        int nHeads = 4;
+        int[] pos = {7};
+        float[] x = random(nHeads * nDims, 23);
+        float[] y = x.clone();
+        CpuRope.apply(table, y, 0, 1, nHeads, nDims, nHeads * nDims, 0, pos, 0, 1);
+
+        // head h reads row h / 2: heads 0,1 row 0 and heads 2,3 row 1
+        float[] inv = spec.fope().invFreq();
+        for (int h = 0; h < nHeads; h++) {
+            int row = h / 2;
+            int base = h * nDims;
+            for (int i = 0; i < d; i++) {
+                float c = 0f;
+                float s = 0f;
+                for (int k = 0; k < d; k++) {
+                    double angle = (double) pos[0] * inv[k];
+                    c += (float) Math.cos(angle) * cosCoef[(row * d + k) * d + i];
+                    s += (float) Math.sin(angle) * sinCoef[(row * d + k) * d + i];
+                }
+                float x0 = x[base + i];
+                float x1 = x[base + nDims / 2 + i];
+                assertEquals("head " + h + " cos " + i, x0 * c - x1 * s, y[base + i], 1e-6f);
+                assertEquals("head " + h + " sin " + i, x0 * s + x1 * c, y[base + nDims / 2 + i], 1e-6f);
+            }
+        }
+        // a head count that is not a multiple of the rows cannot map
+        assertThrows(IllegalArgumentException.class,
+                () -> CpuRope.apply(table, y, 0, 1, 3, nDims, 3 * nDims, 0, pos, 0, 1));
+    }
+
+    /** The coefficient projection replaces the NEOX pair angles; it has no NORM or multi-section form. */
+    @Test
+    public void fopeRequiresTheNeoxRotation() {
+        RopeSpec neox = fopeSpec(8, 2, 2, true);
+        FopeWeights w = FopeWeights.of(neox.fope(), random(8, 3), random(8, 4));
+        for (RopeType type : new RopeType[]{RopeType.NORM, RopeType.IMROPE}) {
+            RopeSpec spec = RopeSpec.builder(type).nDims(8).freqBase(10000f)
+                    .sections(new int[]{1, 1, 1, 1}).fope(neox.fope()).build();
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> RopeFreqTable.of(spec, null, w));
+            assertTrue(e.getMessage(), e.getMessage().contains("NEOX"));
+        }
+    }
+
+    @Test
+    public void fopeRefusesSharedRowsForMultipleHeadsWithoutSepHead() {
+        int nDims = 8;
+        RopeSpec spec = fopeSpec(nDims, 2, 2, false);
+        FopeWeights w = FopeWeights.of(spec.fope(), random(8, 1), random(8, 2));
+        RopeFreqTable table = RopeFreqTable.of(spec, null, w);
+        float[] cs = new float[nDims];
+        float[] basis = new float[w.basisSize()];
+        table.cosSin(new int[]{3}, 0, 0, 1, 3, 2, cs, basis);
+        // head 2 of 3 uses row 0 as well
+        float[] byHead = new float[nDims];
+        table.cosSin(new int[]{3}, 0, 0, 1, 3, 0, byHead, basis);
+        assertArrayEquals(byHead, cs, 0f);
+        assertThrows(IllegalStateException.class,
+                () -> table.cosSin(new int[]{3}, 0, 0, 1, cs));
+        assertThrows(IllegalArgumentException.class, () -> RopeFreqTable.forShift(spec, null));
     }
 }

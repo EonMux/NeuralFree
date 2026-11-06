@@ -1,13 +1,20 @@
 package com.eonmux.neuralfree.acceleration;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
 import com.eonmux.neuralfree.acceleration.vulkan.VkDevice;
 import org.junit.Assume;
 
+import java.util.EnumSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+/**
+ * Cached per-API device availability checks for GPU tests. Each check enumerates only its own API through an
+ * explicit API set, so it leaves the static {@link HWAcceleration#enableCuda} and {@link HWAcceleration#enableVulkan}
+ * flags alone, and shuts its enumeration down before returning.
+ */
 public final class GpuTestUtil {
 
     private static final AtomicBoolean openCLChecked = new AtomicBoolean(false);
@@ -97,7 +104,7 @@ public final class GpuTestUtil {
     private static void checkOpenCL() {
         HWAcceleration hwAccel = null;
         try {
-            hwAccel = new HWAcceleration();
+            hwAccel = new HWAcceleration(EnumSet.of(BackendType.OPENCL));
             if (!hwAccel.getCLDevices().isEmpty()) {
                 openCLAvailable.set(true);
                 CLDevice device = hwAccel.getCLDevices().get(0);
@@ -123,8 +130,7 @@ public final class GpuTestUtil {
     private static void checkCuda() {
         HWAcceleration hwAccel = null;
         try {
-            HWAcceleration.enableCuda = true;
-            hwAccel = new HWAcceleration();
+            hwAccel = new HWAcceleration(EnumSet.of(BackendType.CUDA));
             if (!hwAccel.getCUDevices().isEmpty()) {
                 cudaAvailable.set(true);
                 CUDevice device = hwAccel.getCUDevices().get(0);
@@ -149,8 +155,7 @@ public final class GpuTestUtil {
     private static void checkVulkan() {
         HWAcceleration hwAccel = null;
         try {
-            HWAcceleration.enableVulkan = true;
-            hwAccel = new HWAcceleration();
+            hwAccel = new HWAcceleration(EnumSet.of(BackendType.VULKAN));
             if (!hwAccel.getVkDevices().isEmpty()) {
                 vulkanAvailable.set(true);
                 VkDevice device = hwAccel.getVkDevices().get(0);

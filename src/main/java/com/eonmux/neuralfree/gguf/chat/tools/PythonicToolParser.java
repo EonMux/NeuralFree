@@ -40,7 +40,7 @@ final class PythonicToolParser extends BlockToolParser {
     }
 
     @Override
-    int bareStart(String text, boolean partial) {
+    protected int bareStart(String text, boolean partial) {
         if (!bare) {
             return -1;
         }
@@ -63,7 +63,7 @@ final class PythonicToolParser extends BlockToolParser {
     }
 
     @Override
-    Block readBlock(String text, int at, String opener, boolean partial) {
+    protected Block readBlock(String text, int at, String opener, boolean partial) {
         int i = JsonScan.skipWs(text, at + opener.length());
         List<ToolCall> calls = new ArrayList<>();
         if (bracketed) {

@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.memory.cpu;
 
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.RecurrentStateCopy;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -11,9 +12,10 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Heap recurrent state of one layer: one zeroed F32 array per state tensor (single sequence), updated in place by
- * the mixers. When allocated with snapshots, every array has a shadow of the same size: {@link #snapshot()} copies
- * the arrays into it with {@code System.arraycopy} and {@link #restore()} copies it back.
+ * Heap recurrent state of one layer: one F32 array per state tensor holding one row of
+ * {@code floats()} per slot ({@link #slots()}, single sequence), updated in place by the mixers. When allocated with
+ * snapshots, every array has a shadow of the same size: {@link #snapshot()} copies the arrays into it with
+ * {@code System.arraycopy} and {@link #restore()} copies it back.
  */
 public final class CpuRecurrentState implements RecurrentStateAccessor {
 
@@ -23,14 +25,16 @@ public final class CpuRecurrentState implements RecurrentStateAccessor {
     private final List<LayerMemoryPlan.StateTensor> tensors;
     private final Map<String, float[]> arrays;
     private final Map<String, float[]> shadows;
+    private final int slots;
     private boolean saved;
 
     private CpuRecurrentState(int layer, List<LayerMemoryPlan.StateTensor> tensors, Map<String, float[]> arrays,
-                              Map<String, float[]> shadows) {
+                              Map<String, float[]> shadows, int slots) {
         this.layer = layer;
         this.tensors = tensors;
         this.arrays = arrays;
         this.shadows = shadows;
+        this.slots = slots;
     }
 
     /**
@@ -43,8 +47,8 @@ public final class CpuRecurrentState implements RecurrentStateAccessor {
     }
 
     /**
-     * Allocates the zeroed state tensors of a layer and, with {@code snapshots}, a shadow of each for
-     * {@link #snapshot()} ({@code MemoryPlan#snapshotsReserved}).
+     * Allocates the zeroed state tensors of a layer — each holding its {@code slots()} rows — and, with
+     * {@code snapshots}, a shadow of each for {@link #snapshot()} ({@code MemoryPlan#snapshotsReserved}).
      *
      * @throws IllegalArgumentException for an empty list, duplicate names or a tensor larger than a Java array
      */
@@ -54,16 +58,21 @@ public final class CpuRecurrentState implements RecurrentStateAccessor {
         if (tensors.isEmpty()) {
             throw new IllegalArgumentException("layer " + layer + " has no recurrent state tensors");
         }
+        int slots = tensors.get(0).slots();
         Map<String, float[]> arrays = new LinkedHashMap<>();
         for (LayerMemoryPlan.StateTensor t : tensors) {
             if (arrays.containsKey(t.name())) {
                 throw new IllegalArgumentException("layer " + layer + " declares state tensor " + t.name() + " twice");
             }
-            if (t.floats() > MAX_ARRAY) {
-                throw new IllegalArgumentException("state tensor " + t.name() + " of layer " + layer + " holds "
-                        + t.floats() + " floats, more than a Java array can");
+            if (t.slots() != slots) {
+                throw new IllegalArgumentException("layer " + layer + " holds " + t.slots() + " slots of state tensor "
+                        + t.name() + ", its other tensors hold " + slots);
             }
-            arrays.put(t.name(), new float[(int) t.floats()]);
+            if (t.floats() * t.slots() > MAX_ARRAY) {
+                throw new IllegalArgumentException("state tensor " + t.name() + " of layer " + layer + " holds "
+                        + t.floats() * t.slots() + " floats, more than a Java array can");
+            }
+            arrays.put(t.name(), new float[(int) (t.floats() * t.slots())]);
         }
         Map<String, float[]> shadows = new LinkedHashMap<>();
         if (snapshots) {
@@ -71,7 +80,8 @@ public final class CpuRecurrentState implements RecurrentStateAccessor {
                 shadows.put(e.getKey(), new float[e.getValue().length]);
             }
         }
-        return new CpuRecurrentState(layer, Collections.unmodifiableList(new ArrayList<>(tensors)), arrays, shadows);
+        return new CpuRecurrentState(layer, Collections.unmodifiableList(new ArrayList<>(tensors)), arrays, shadows,
+                slots);
     }
 
     @Override
@@ -92,6 +102,83 @@ public final class CpuRecurrentState implements RecurrentStateAccessor {
                     + arrays.keySet() + ")");
         }
         return a;
+    }
+
+    /** The state slots every tensor holds ({@link RecurrentStateAccessor#slots()}). */
+    @Override
+    public int slots() {
+        return slots;
+    }
+
+    /**
+     * Zeroes slot {@code seq} of every state tensor (the sequence's live row); the other slots and any snapshot
+     * shadow stay.
+     *
+     * @throws IndexOutOfBoundsException when {@code seq} is outside the slots
+     */
+    public void clearSlot(int seq) {
+        if (seq < 0 || seq >= slots) {
+            throw new IndexOutOfBoundsException("state slot " + seq + " outside [0, " + slots + ")");
+        }
+        for (Map.Entry<String, float[]> e : arrays.entrySet()) {
+            int row = (int) rowFloatsOf(e.getKey());
+            Arrays.fill(e.getValue(), seq * row, (seq + 1) * row, 0f);
+        }
+    }
+
+    /**
+     * Copies slot {@code seq} of every state tensor, one row per tensor in {@link #tensors()} order.
+     *
+     * @throws IndexOutOfBoundsException when {@code seq} is outside the slots
+     */
+    public float[][] copySlot(int seq) {
+        if (seq < 0 || seq >= slots) {
+            throw new IndexOutOfBoundsException("state slot " + seq + " outside [0, " + slots + ")");
+        }
+        float[][] out = new float[tensors.size()][];
+        for (int i = 0; i < tensors.size(); i++) {
+            LayerMemoryPlan.StateTensor t = tensors.get(i);
+            int row = (int) t.floats();
+            out[i] = Arrays.copyOfRange(arrays.get(t.name()), seq * row, (seq + 1) * row);
+        }
+        return out;
+    }
+
+    /**
+     * Writes rows {@code [first, first + tensors().size())} of {@code copy} into slot {@code seq} of the state
+     * tensors, in {@link #tensors()} order; the other slots stay.
+     *
+     * @throws IndexOutOfBoundsException when {@code seq} is outside the slots or the copy holds too few rows
+     * @throws IllegalArgumentException  when a row's width differs from its tensor's slot width
+     */
+    public void restoreSlot(int seq, RecurrentStateCopy copy, int first) {
+        if (seq < 0 || seq >= slots) {
+            throw new IndexOutOfBoundsException("state slot " + seq + " outside [0, " + slots + ")");
+        }
+        if (first < 0 || first + tensors.size() > copy.rows()) {
+            throw new IndexOutOfBoundsException("state copy " + copy + " holds no rows [" + first + ", "
+                    + (first + tensors.size()) + ") for layer " + layer);
+        }
+        for (int i = 0; i < tensors.size(); i++) {
+            LayerMemoryPlan.StateTensor t = tensors.get(i);
+            if (copy.floats(first + i) != t.floats()) {
+                throw new IllegalArgumentException("state copy row " + (first + i) + " holds " + copy.floats(first + i)
+                        + " floats, state tensor " + t.name() + " of layer " + layer + " holds " + t.floats());
+            }
+        }
+        for (int i = 0; i < tensors.size(); i++) {
+            LayerMemoryPlan.StateTensor t = tensors.get(i);
+            copy.copyInto(first + i, arrays.get(t.name()), (int) (seq * t.floats()));
+        }
+    }
+
+    private long rowFloatsOf(String name) {
+        for (LayerMemoryPlan.StateTensor t : tensors) {
+            if (t.name().equals(name)) {
+                return t.floats();
+            }
+        }
+        throw new IllegalStateException("state tensor '" + name + "' left its tensors list");
     }
 
     /** Zeroes every state tensor and forgets the snapshot. */

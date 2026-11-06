@@ -521,6 +521,7 @@ public class CpuLayerExecutorTest {
             assertTrue("duplicate id " + factory.featureId(), ids.add(factory.featureId()));
         }
         assertEquals(new HashSet<>(Arrays.asList(LayerSpec.Extras.EMBD_SKIP, LayerSpec.Extras.RESID_ALPHA_BETA,
-                LayerSpec.Extras.LOOP_NORM)), ids);
+                LayerSpec.Extras.RESID_SCALE, LayerSpec.Extras.MUDD, LayerSpec.Extras.LOOP_NORM,
+                LayerSpec.Extras.INKLING_SCONV)), ids);
     }
 }

@@ -76,6 +76,22 @@ class ResponsesEventsTest {
     }
 
     @Test
+    void aContentFallbackLeavesTheReasoningItemsOutOfTheAssembledOutput() throws IOException {
+        ResponsesEvents kept = events();
+        kept.start();
+        kept.accept(List.of(new ChatChoice.Delta(Map.of("reasoning_content", "plan"), null), content("plan")));
+        List<?> both = (List<?>) kept.finish(result(), 3, 0, new ToolParse("plan", List.of()), false).get("output");
+        assertEquals(List.of("reasoning", "message"), both.stream().map(i -> ((Map<?, ?>) i).get("type")).toList());
+
+        ResponsesEvents swapped = events();
+        swapped.start();
+        swapped.accept(List.of(new ChatChoice.Delta(Map.of("reasoning_content", "plan"), null), content("plan")));
+        List<?> one = (List<?>) swapped.finish(result(), 3, 0, new ToolParse("plan", List.of()), true).get("output");
+        assertEquals(List.of("message"), one.stream().map(i -> ((Map<?, ?>) i).get("type")).toList(),
+                "the reasoning became the message, as vLLM's non-streamed swap");
+    }
+
+    @Test
     void theFinalOutputFollowsTheFinalParse() throws IOException {
         ResponsesEvents r = events();
         r.start();
@@ -83,7 +99,7 @@ class ResponsesEventsTest {
         // the final reading turned the streamed call into content
         Map<String, Object> response = r.finish(
                 result(),
-                3, 0, new ToolParse("<call>f</call>", List.of()));
+                3, 0, new ToolParse("<call>f</call>", List.of()), false);
         List<?> output = (List<?>) response.get("output");
         assertEquals(1, output.size());
         Map<?, ?> message = (Map<?, ?>) output.get(0);
@@ -96,7 +112,7 @@ class ResponsesEventsTest {
         s.accept(List.of(content("hi"), started(0, "call_b", "g"), arguments(0, "{\"x\":")));
         Map<String, Object> fixed = s.finish(
                 result(),
-                3, 0, new ToolParse("hi", List.of(new ToolCall("g", "{\"x\":2}", "call_b", true))));
+                3, 0, new ToolParse("hi", List.of(new ToolCall("g", "{\"x\":2}", "call_b", true))), false);
         List<?> items = (List<?>) fixed.get("output");
         assertEquals(2, items.size());
         Map<?, ?> call = (Map<?, ?>) items.get(1);

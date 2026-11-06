@@ -130,7 +130,7 @@ NF_INLINE int tr_e_gtz(const float x) {
 
 /* Java x < 0: negative denormals through -inf; false for zeros, positives and NaN. */
 NF_INLINE int tr_e_ltz(const float x) {
-    return tr_e_gtz(as_float(as_uint(x) ^ 0x80000000u));
+    return tr_e_gtz(nf_flip_sign(x));
 }
 
 /* Java a < b: false when either is NaN; -0 and +0 are equal. */
@@ -150,12 +150,12 @@ NF_INLINE int tr_e_eq(const float a, const float b) {
 
 /* Java -x: sign flip of the bit pattern. */
 NF_INLINE float tr_e_neg(const float x) {
-    return as_float(as_uint(x) ^ 0x80000000u);
+    return nf_flip_sign(x);
 }
 
 /* Java Math.abs(float): sign bit cleared. */
 NF_INLINE float tr_e_abs(const float x) {
-    return as_float(as_uint(x) & 0x7fffffffu);
+    return nf_clear_sign(x);
 }
 
 NF_INLINE float tr_e_tanh(const float x) {

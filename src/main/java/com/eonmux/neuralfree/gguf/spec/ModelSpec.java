@@ -81,8 +81,10 @@ public final class ModelSpec {
      * Why the context of this model cannot be shifted, or null when it can: llama.cpp {@code get_can_shift}
      * (src/llama-kv-cache.cpp:1213-1222) refuses step35 (per-layer RoPE dims) and models with more than one position
      * per token ({@code n_pos_per_embd > 1}: MROPE / IMROPE rope types, sensenova_u1 whose model rope type is MROPE,
-     * src/llama-model.cpp:3648-3651, and any layer whose RoPE reads several positions). Forward backends check it
-     * before the memory moves any row.
+     * src/llama-model.cpp:3648-3651, and any layer whose RoPE reads several positions), and layers whose rotation
+     * comes from the learned Fourier coefficients, which do not factor into a rotation of a position delta, or whose
+     * dual-chunk attention keeps its keys in position-defined chunks. Forward backends check it before the memory
+     * moves any row.
      */
     public String contextShiftRefusal() {
         String refusal = archShiftRefusal();
@@ -93,13 +95,20 @@ public final class ModelSpec {
             if (l.rope() != null && l.rope().positionsPerToken() > 1) {
                 return severalPositions() + " (layer " + l.il() + ")";
             }
+            if (l.rope() != null && l.rope().fope() != null) {
+                return fourierPositions() + " (layer " + l.il() + ")";
+            }
+            if (l.attention() != null && l.attention().hasDualChunk()) {
+                return dualChunkPositions(l);
+            }
         }
         return null;
     }
 
     /**
-     * {@link #contextShiftRefusal()} restricted to one layer: the model-wide refusals, or the layer's RoPE reading
-     * several positions per token; null when the layer's keys can be re-rotated.
+     * {@link #contextShiftRefusal()} restricted to one layer: the model-wide refusals, the layer's RoPE reading
+     * several positions per token, its Fourier embedding, or its dual-chunk attention; null when the layer's keys
+     * can be re-rotated.
      */
     public String contextShiftRefusal(LayerSpec layer) {
         Objects.requireNonNull(layer, "layer");
@@ -107,13 +116,40 @@ public final class ModelSpec {
         if (refusal == null && layer.rope() != null && layer.rope().positionsPerToken() > 1) {
             refusal = severalPositions();
         }
+        if (refusal == null && layer.rope() != null && layer.rope().fope() != null) {
+            refusal = fourierPositions();
+        }
+        if (refusal == null && layer.attention() != null && layer.attention().hasDualChunk()) {
+            refusal = dualChunkPositions(layer);
+        }
         return refusal;
+    }
+
+    /**
+     * Reason a FoPE layer's keys cannot be re-rotated by a position delta: the Fourier position embedding's cos/sin
+     * are learned projections of the basis at the stored position, and do not factor into a rotation of the delta.
+     */
+    private String fourierPositions() {
+        return arch().ggufName() + " uses the Fourier position embedding; its keys cannot be shifted by a delta";
+    }
+
+    /**
+     * Reason a dual-chunk layer's keys cannot be re-rotated by a position delta: the keys are rotated by
+     * {@code position % chunk_length}, so moving them would leave their chunk.
+     */
+    private String dualChunkPositions(LayerSpec layer) {
+        return "dual-chunk attention rotates its keys by position modulo the chunk length; a context shift would"
+                + " move the cached keys out of their chunk (layer " + layer.il() + ")";
     }
 
     private String archShiftRefusal() {
         Arch arch = arch();
         if (arch == Arch.STEP35) {
             return arch.ggufName() + " uses per-layer RoPE dims; the K shift assumes one n_rot";
+        }
+        if (arch == Arch.INKLING) {
+            return arch.ggufName() + " keeps short-convolution state indexed by position; a context shift would"
+                    + " leave the convolution window behind the moved rows";
         }
         if (arch == Arch.SENSENOVA_U1 || traits().ropeType().usesSections() || hparams.nPosPerEmbd() > 1) {
             return severalPositions();

@@ -16,6 +16,7 @@ import com.eonmux.neuralfree.gguf.hf.tensor.RopeTensors;
 import com.eonmux.neuralfree.gguf.hf.tensor.TensorSink;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
+import com.eonmux.neuralfree.gguf.tokenizer.hf.HfTokenizerFiles;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.HfVocabWriters;
 import com.eonmux.neuralfree.gguf.tokenizer.hf.PreNameResolver;
 
@@ -30,18 +31,24 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalDouble;
+import java.util.regex.Pattern;
 
 /**
- * Hooks of the llama.cpp classic-dense converter classes of Appendix A table HK-D1, part D: {@code Jais2Model}
+ * Hooks of the llama.cpp classic-dense converter classes, part D: {@code Jais2Model}
  * (LC/conversion/jais.py:16-34), {@code JaisModel} (jais.py:36-107), {@code StableLMModel}
  * (stablelm.py:15-97), {@code MPTModel} (mpt.py:13-48), {@code MaincoderModel} (maincoder.py:8-13),
- * {@code MiniCPMModel} (minicpm.py:18-62), {@code NemotronModel} (nemotron.py:366-402) and
+ * {@code MiniCPMModel} (minicpm.py:18-62), {@code NemotronModel} (nemotron.py:366-423) and
  * {@code MuseGlimmerModel} (muse_glimmer.py:28-95).
  *
  * <p>Every method is a public static hook reference that the table composes and subclasses reuse where the converter
  * calls {@code super()}.</p>
  */
 public final class HfDenseClassicHooksD {
+
+    /** A byte-fallback token of a SentencePiece-style BPE vocabulary (nemotron.py:378). */
+    private static final Pattern BYTE_TOKEN = Pattern.compile("<0x[0-9A-F]{2}>");
+    /** {@code gguf.TokenType.BYTE}. */
+    private static final int TOKEN_TYPE_BYTE = 6;
 
     private HfDenseClassicHooksD() {
     }
@@ -425,18 +432,43 @@ public final class HfDenseClassicHooksD {
 
     // ------------------------------------------------------------------ Nemotron
 
-    /** The SentencePiece vocabulary with the Nemotron sentinel ids (nemotron.py:368-373). */
+    /**
+     * {@code NemotronModel.set_vocab} (nemotron.py:370-385): with a {@code tokenizer.model}, the SentencePiece
+     * vocabulary with the Nemotron sentinel ids (pad 0, unk 1); without one, the SentencePiece-style BPE of
+     * {@code _set_vocab_gpt2} (Metaspace and byte fallback) with every {@code <0xXX>} token typed BYTE, so it renders
+     * its raw byte.
+     */
     public static Map<String, Object> nemotronVocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {
-        Map<String, Object> md = new LinkedHashMap<>(miniCPMVocab(ctx, pre));
-        md.put(GgufKeys.TOKENIZER_PAD_ID, 0);
-        md.put(GgufKeys.TOKENIZER_UNK_ID, 1);
-        return md;
+        if (ctx.tokenizerFiles().hasGgufTokenizer()
+                || ctx.tokenizerFiles().file(HfTokenizerFiles.TOKENIZER_MODEL) != null) {
+            Map<String, Object> md = new LinkedHashMap<>(miniCPMVocab(ctx, pre));
+            md.put(GgufKeys.TOKENIZER_PAD_ID, 0);
+            md.put(GgufKeys.TOKENIZER_UNK_ID, 1);
+            return Collections.unmodifiableMap(md);
+        }
+        Map<String, Object> md = new LinkedHashMap<>(HfVocabWriters.gpt2(HfHookSupport.vocabInput(ctx), pre));
+        md.put(GgufKeys.TOKENIZER_TOKEN_TYPE, byteTokenTypes(md));
+        return Collections.unmodifiableMap(md);
+    }
+
+    /** The token types of {@code md} with every {@code <0xXX>} token (upper-case hex) typed BYTE. */
+    private static List<Integer> byteTokenTypes(Map<String, Object> md) {
+        List<?> tokens = (List<?>) md.get(GgufKeys.TOKENIZER_LIST);
+        List<?> types = (List<?>) md.get(GgufKeys.TOKENIZER_TOKEN_TYPE);
+        List<Integer> out = new ArrayList<>(types.size());
+        for (int i = 0; i < types.size(); i++) {
+            Object token = tokens.get(i);
+            boolean isByte = token instanceof String && BYTE_TOKEN.matcher((String) token).matches();
+            out.add(isByte ? TOKEN_TYPE_BYTE : ((Number) types.get(i)).intValue());
+        }
+        return Collections.unmodifiableList(out);
     }
 
     /**
-     * {@code NemotronModel.set_gguf_parameters} (nemotron.py:375-390): the inherited keys, the exact
-     * {@code vocab_size}, the epsilon alias chain, the partial-rotary RoPE width, and the linear scaling when a
-     * {@code factor} is present (or the explicit none).
+     * {@code NemotronModel.set_gguf_parameters} (nemotron.py:387-411): the inherited keys, the exact
+     * {@code vocab_size}, the epsilon alias chain, the partial-rotary RoPE width over the head width ({@code head_dim},
+     * else {@code hidden_size / num_attention_heads}, so a non-standard grouped-query layout gets its own width), and
+     * the linear scaling with its factor when a {@code factor} is present (or the explicit none).
      */
     public static void nemotronMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) {
         HfGenericMetadata.apply(ctx, kv);
@@ -446,15 +478,28 @@ public final class HfDenseClassicHooksD {
                 "norm_epsilon", "norm_eps"));
         double partial = cfg.rope().global().partialRotaryFactor().orElseThrow(() ->
                 new GgufFormatException(cfg.source() + ": required key 'partial_rotary_factor' is missing"));
-        int width = cfg.findInt(cfg.requireInt("hidden_size"), "hidden_size", "n_embd");
-        int heads = cfg.findInt(cfg.requireInt("num_attention_heads"), "num_attention_heads", "n_head");
-        kv.set(GgufKeys.ROPE_DIMENSION_COUNT, (int) partial * width / heads);
-        OptionalDouble factor = cfg.rope().global().factor();
+        int width = cfg.requireInt("hidden_size", "n_embd");
+        int heads = cfg.requireInt("num_attention_heads", "n_head");
+        int headDim = cfg.findInt(0, "head_dim");
+        if (headDim == 0) {
+            headDim = width / heads;
+        }
+        kv.set(GgufKeys.ROPE_DIMENSION_COUNT, (int) (partial * headDim));
+        OptionalDouble factor = nonZero(cfg.findFloat("factor"));
+        if (!factor.isPresent()) {
+            factor = nonZero(cfg.rope().global().factor());
+        }
         if (factor.isPresent()) {
             kv.set(GgufKeys.ROPE_SCALING_TYPE, "linear");
+            kv.set(GgufKeys.ROPE_SCALING_FACTOR, factor.getAsDouble());
         } else {
             kv.set(GgufKeys.ROPE_SCALING_TYPE, "none");
         }
+    }
+
+    /** {@code v} unless it is zero, which Python's {@code or} skips. */
+    private static OptionalDouble nonZero(OptionalDouble v) {
+        return v.isPresent() && v.getAsDouble() == 0.0 ? OptionalDouble.empty() : v;
     }
 
     static double requireDoubleAlias(HfConfig cfg, String... aliases) {

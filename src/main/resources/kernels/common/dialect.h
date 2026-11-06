@@ -1,7 +1,8 @@
-/* common/dialect.h - dual-dialect layer: one kernel text compiles as OpenCL C 1.2 and as CUDA C++. Requires: none */
+/* common/dialect.h - dual-dialect layer: one kernel text compiles as OpenCL C 1.2 and as CUDA C++
+ * (nvcc) or its HIP dialect (hipcc). Requires: none */
 /*
- * Kernel sources use only the NF_* keywords below plus OpenCL builtin names; the CUDA branch supplies
- * every OpenCL builtin the LLM kernels use.
+ * Kernel sources use only the NF_* keywords below plus OpenCL builtin names; the CUDA/HIP branch
+ * supplies every OpenCL builtin the LLM kernels use.
  *
  * Keywords:
  *   NF_KERNEL      kernel entry point (OpenCL __kernel, CUDA extern "C" __global__)
@@ -15,18 +16,33 @@
  *   nf_i8 / nf_i64 / nf_u64   signed 8-bit, signed 64-bit, unsigned 64-bit integers on every host ABI
  *   NF_HALF        16-bit float storage type; only vload_half* / vstore_half* touch it
  *   NF_INF / NF_NAN, NF_U64C(x), NF_F4(a,b,c,d), NF_F2(a,b), NF_F4S(s)
+ *   nf_flip_sign(x) / nf_clear_sign(x)  float with its sign bit flipped / cleared, every other bit kept
+ *                  (NaN payloads included), on both dialects
  *
- * Capability switches: USE_SUBGROUPS (subgroup reductions; always on in CUDA) and NF_HAS_SG_SHUFFLE
- * (subgroup shuffle; CUDA only). Kernels must provide a local-memory path when NF_HAS_SG_SHUFFLE is
- * undefined.
+ * Capability switches: USE_SUBGROUPS (subgroup reductions; always on in CUDA and HIP) and
+ * NF_HAS_SG_SHUFFLE (subgroup shuffle; CUDA and HIP). Kernels must provide a local-memory path when
+ * NF_HAS_SG_SHUFFLE is undefined.
  */
 #ifndef NF_DIALECT_H
 #define NF_DIALECT_H
 
-#if defined(__CUDACC__)
-/* =============================== CUDA ================================= */
+#if defined(__CUDACC__) || defined(__HIP__)
+/* ============================= CUDA / HIP ============================= */
 #define NF_CUDA 1
+#if defined(__HIP__)
+/* hipcc runs the same branch in its host and device passes: __HIP__ is a language macro of both,
+ * while __CUDACC__ marks only the device pass (as __CUDA_ARCH__ does for nvcc). */
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+/* HIP names the lane shuffles without the sync suffix (llama.cpp vendors/hip.h maps the same way);
+ * the width defaults to the wave size, so every xor mask below 32 keeps both lanes inside their
+ * aligned 32-lane half (gfx9 waves hold 64 lanes, the logical subgroups below still see 32). */
+#define __shfl_xor_sync(mask, var, laneMask) __shfl_xor((var), (laneMask))
+#else
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#endif
 #include <stdint.h>
 
 typedef unsigned char      uchar;
@@ -156,6 +172,22 @@ NF_INLINE int    mad24(int a, int b, int c)         { return a * b + c; }
 NF_INLINE int    mul24(int a, int b)                { return a * b; }
 NF_INLINE uint   popcount(uint x)                   { return (uint)__popc(x); }
 NF_INLINE uint   clz(uint x)                        { return (uint)__clz((int)x); }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+/* Four signed-byte products of the packed words a and b added to c (dp4a). */
+NF_INLINE int nf_dp4a(int a, int b, int c) { return __dp4a(a, b, c); }
+#else
+/* Portable loop: nvcc below sm_61, and HIP (hip has no __dp4a; llama.cpp picks sdot4 per family
+ * where one exists, the plain integer arithmetic everywhere else). */
+NF_INLINE int nf_dp4a(int a, int b, int c) {
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        c += (int)(nf_i8)((a >> (8 * k)) & 0xFF) * (int)(nf_i8)((b >> (8 * k)) & 0xFF);
+    }
+    return c;
+}
+#endif
+/* Round to nearest even, as OpenCL convert_int_rte (quantized code points of MMQ). */
+NF_INLINE int    nf_rint_i(float x)                 { return __float2int_rn(x); }
 #define rsqrt(x) rsqrtf(x)
 
 /* ---- native_* (fast, reduced precision; used only where accuracy was considered) ---- */
@@ -177,6 +209,17 @@ NF_INLINE float  as_float(uint u) { return __uint_as_float(u); }
 NF_INLINE float  as_float(int i)  { return __int_as_float(i); }
 NF_INLINE uint   as_uint(float f) { return __float_as_uint(f); }
 NF_INLINE int    as_int(float f)  { return __float_as_int(f); }
+/* Sign-bit operations on the raw bits, NaN payloads included. The NVPTX backend folds the plain
+ * integer form into neg.f32 / abs.f32, whose NaN result the PTX ISA leaves unspecified, so the
+ * device passes of nvcc take the xor/and instructions; hipcc (and the host passes) take the
+ * portable form, which the AMD backend compiles to exact integer instructions. */
+#if defined(__CUDA_ARCH__)
+NF_INLINE float  nf_flip_sign(float x)  { uint r; asm("xor.b32 %0, %1, 0x80000000;" : "=r"(r) : "r"(__float_as_uint(x))); return __uint_as_float(r); }
+NF_INLINE float  nf_clear_sign(float x) { uint r; asm("and.b32 %0, %1, 0x7fffffff;" : "=r"(r) : "r"(__float_as_uint(x))); return __uint_as_float(r); }
+#else
+NF_INLINE float  nf_flip_sign(float x)  { return as_float(as_uint(x) ^ 0x80000000u); }
+NF_INLINE float  nf_clear_sign(float x) { return as_float(as_uint(x) & 0x7fffffffu); }
+#endif
 NF_INLINE uchar4 as_uchar4(char4 v) { return make_uchar4((uchar)v.x, (uchar)v.y, (uchar)v.z, (uchar)v.w); }
 NF_INLINE float4 convert_float4(char4 v)  { return make_float4((float)v.x, (float)v.y, (float)v.z, (float)v.w); }
 NF_INLINE float4 convert_float4(uchar4 v) { return make_float4((float)v.x, (float)v.y, (float)v.z, (float)v.w); }
@@ -258,6 +301,21 @@ typedef ulong nf_u64;
 #  endif
 #endif
 /* OpenCL 1.2 has no portable subgroup shuffle, so NF_HAS_SG_SHUFFLE stays undefined. */
+/* Round to nearest even, as CUDA __float2int_rn (quantized code points of MMQ). */
+#define nf_rint_i(x) ((int)convert_int_rte(x))
+NF_INLINE float nf_flip_sign(const float x)  { return as_float(as_uint(x) ^ 0x80000000u); }
+NF_INLINE float nf_clear_sign(const float x) { return as_float(as_uint(x) & 0x7fffffffu); }
+/* Four signed-byte products of the packed words a and b added to c (dp4a), in portable integer
+ * arithmetic where the device has no packed dot instruction. */
+NF_INLINE int nf_dp4a(int a, int b, int c) {
+    for (int k = 0; k < 4; k++) {
+        c += (int)(nf_i8)((a >> (8 * k)) & 0xFF) * (int)(nf_i8)((b >> (8 * k)) & 0xFF);
+    }
+    return c;
+}
 #endif /* dialect */
+
+/* Packed int8 dot product: sum of the four signed-byte products of a and b, added to c. */
+#define NF_DP4A(a, b, c) nf_dp4a((a), (b), (c))
 
 #endif /* NF_DIALECT_H */

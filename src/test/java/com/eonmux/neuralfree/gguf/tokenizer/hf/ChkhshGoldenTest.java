@@ -224,7 +224,7 @@ public class ChkhshGoldenTest {
     @Test
     public void bundledTableHoldsTheConverterRowsAndText() {
         ChkhshTable t = ChkhshTable.builtIn();
-        assertEquals(103, t.size());
+        assertEquals(104, t.size());
         assertEquals(CHKTXT, t.checkText());
         assertEquals("chatglm-bpe", t.rows().get(0).preName());
         assertEquals("THUDM/glm-4-9b-chat", t.rows().get(0).repo());

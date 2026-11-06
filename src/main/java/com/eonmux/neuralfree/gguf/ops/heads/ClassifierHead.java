@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.ops.heads;
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.Arch;
+import com.eonmux.neuralfree.gguf.arch.PoolerAct;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
@@ -22,16 +23,18 @@ import java.util.Objects;
  * The ranking classifier of RANK pooling (llama-graph.cpp:4146-4176 build_pooling) over one pooled vector of
  * {@link #inputs()} floats (the embedding row width, {@code HeadSpec.embeddingWidth}):
  * <pre>
- *   if cls:     x = act_cls(cls x + cls_b);  if cls_norm: x = LayerNorm(x) * cls_norm   (no bias, eps = f_norm_eps)
+ *   if cls:     x = act_cls(cls x + cls_b);  if cls_norm: x = LayerNorm(x, cls_norm.bias?)   (eps = f_norm_eps)
  *   if cls_out: x = cls_out x + cls_out_b
- *   qwen3 / qwen3vl: x = softmax(x)
+ *   pooler activation: softmax / sigmoid per {@code classifier.pooler_activation}
  * </pre>
  * with {@code act_cls} from {@code classifier.activation} (default tanh; modern-bert gelu_erf) and the labels from
- * {@code classifier.output_labels}. Without {@code cls} and {@code cls_out} the pooled vector is the output.
+ * {@code classifier.output_labels}. Without {@code cls} and {@code cls_out} the pooled vector is the output. The
+ * pooler activation defaults to the qwen3 / qwen3vl softmax and is otherwise unset (vLLM resolves it from the
+ * checkpoint's {@code problem_type} and writes the metadata key).
  *
- * <p>Also defines the rerank input ({@link #rerankInput}, with the token-level packing {@link #packRerank}) and the
- * decision order of the decision heads ({@link DecisionOrder}). Immutable after construction; {@link #apply}
- * allocates its result.</p>
+ * <p>{@link #apply} runs the chain over one pooled row (a sequence classifier); {@link #applyRows} runs the same
+ * chain over {@code nRows} packed rows (a token classifier, or vLLM's {@code token_classify}). Immutable after
+ * construction; the apply methods allocate their result.</p>
  */
 public final class ClassifierHead {
 
@@ -39,6 +42,8 @@ public final class ClassifierHead {
     public static final String RERANK_QUERY = "{query}";
     /** Placeholder of the document in a rerank prompt. */
     public static final String RERANK_DOCUMENT = "{document}";
+    /** Placeholder of the task instruction in a rerank prompt. */
+    public static final String RERANK_INSTRUCTION = "{instruction}";
 
     private final CpuMatVec mv;
     private final int nIn;
@@ -46,12 +51,14 @@ public final class ClassifierHead {
     private final float[] clsB;
     private final ActOp act;
     private final float[] clsNorm;
+    private final float[] clsNormB;
     private final float eps;
     private final CpuTensorRef clsOut;
     private final float[] clsOutB;
-    private final boolean softmax;
+    private final PoolerAct poolerAct;
     private final String[] labels;
     private final int nOut;
+    private final int clsWidth;
 
     private ClassifierHead(CpuWeights w, ModelHparams hp, Arch arch, int inputs) {
         this.mv = w.matVec();
@@ -60,22 +67,34 @@ public final class ClassifierHead {
         this.clsB = cls == null ? null : w.floatsOrNull(TensorNames.bias(TensorNames.CLS));
         this.act = hp.classifierActivation();
         this.clsNorm = cls == null ? null : w.floatsOrNull(TensorNames.weight(TensorNames.CLS_NORM));
+        this.clsNormB = clsNorm == null ? null : w.floatsOrNull(TensorNames.bias(TensorNames.CLS_NORM));
         this.eps = hp.normEps();
         this.clsOut = w.getOrNull(TensorNames.weight(TensorNames.CLS_OUT));
         this.clsOutB = clsOut == null ? null : w.floatsOrNull(TensorNames.bias(TensorNames.CLS_OUT));
-        this.softmax = arch == Arch.QWEN3 || arch == Arch.QWEN3VL;
+        this.poolerAct = hp.poolerActivation() != null ? hp.poolerActivation()
+                : arch == Arch.QWEN3 || arch == Arch.QWEN3VL ? PoolerAct.SOFTMAX : null;
         this.labels = hp.classifierLabels();
         int width = nIn;
+        int afterCls = nIn;
         if (cls != null) {
             width = checkInput(cls, width);
-            if (clsNorm != null && clsNorm.length != width) {
-                throw new IllegalArgumentException("cls.norm has " + clsNorm.length + " floats, cls outputs " + width);
+            afterCls = width;
+            if (clsNorm != null) {
+                if (clsNorm.length != width) {
+                    throw new IllegalArgumentException("cls.norm has " + clsNorm.length + " floats, cls outputs "
+                            + width);
+                }
+                if (clsNormB != null && clsNormB.length != width) {
+                    throw new IllegalArgumentException("cls.norm.bias has " + clsNormB.length + " floats, cls"
+                            + " outputs " + width);
+                }
             }
         }
         if (clsOut != null) {
             width = checkInput(clsOut, width);
         }
         this.nOut = width;
+        this.clsWidth = afterCls;
     }
 
     /**
@@ -108,9 +127,14 @@ public final class ClassifierHead {
         return nOut;
     }
 
-    /** True when the scores are probabilities (the qwen3 / qwen3vl softmax). */
+    /** True when the chain ends in a {@code cls.output} projection ({@link #applyOutputRows}). */
+    public boolean hasOutput() {
+        return clsOut != null;
+    }
+
+    /** True when the scores are probabilities (the pooler's softmax, vLLM's single-label default). */
     public boolean normalized() {
-        return softmax;
+        return poolerAct == PoolerAct.SOFTMAX;
     }
 
     /** {@code classifier.output_labels} (may be shorter than {@link #outputs()}). */
@@ -119,11 +143,24 @@ public final class ClassifierHead {
     }
 
     /**
-     * The classifier scores of the pooled vector {@code pooled[off .. off + inputs())}.
+     * The classifier scores of the pooled vector {@code pooled[off .. off + inputs())}, probabilities included
+     * ({@link #normalized()}).
      *
      * @throws IllegalArgumentException when the vector does not fit {@code pooled}
      */
     public float[] apply(float[] pooled, int off) {
+        return apply(pooled, off, true);
+    }
+
+    /**
+     * {@link #apply(float[], int)} with the head's final probability activation (the qwen3 / qwen3vl softmax)
+     * applied or skipped, as vLLM's pooler applies or skips it per request ({@code use_activation}); {@code
+     * false} answers the raw head output. The {@code cls} body's own {@code act_cls} always runs — it is part of
+     * the classifier, not the pooler activation.
+     *
+     * @throws IllegalArgumentException when the vector does not fit {@code pooled}
+     */
+    public float[] apply(float[] pooled, int off, boolean activation) {
         Objects.requireNonNull(pooled, "pooled");
         if (off < 0 || (long) off + nIn > pooled.length) {
             throw new IllegalArgumentException("pooled vector [" + off + ", " + ((long) off + nIn)
@@ -131,25 +168,95 @@ public final class ClassifierHead {
         }
         float[] x = new float[nIn];
         System.arraycopy(pooled, off, x, 0, nIn);
+        return applyRows(x, 1, activation);
+    }
+
+    /**
+     * The classifier scores of {@code nRows} packed input rows of {@link #inputs()} floats, returned packed
+     * {@code [nRows][outputs()]}. Sequence classifiers call it with one pooled row; token classifiers apply the
+     * same chain to every token.
+     *
+     * @throws IllegalArgumentException when {@code x} does not hold {@code nRows} rows
+     */
+    public float[] applyRows(float[] x, int nRows) {
+        return applyRows(x, nRows, true);
+    }
+
+    /**
+     * {@link #applyRows(float[], int)} with the head's final probability activation applied or skipped, as vLLM's
+     * pooler applies or skips it per request ({@code use_activation}); {@code false} answers the raw head output,
+     * which is not normalized.
+     *
+     * @throws IllegalArgumentException when {@code x} does not hold {@code nRows} rows
+     */
+    public float[] applyRows(float[] x, int nRows, boolean activation) {
+        Objects.requireNonNull(x, "x");
+        if (nRows < 0 || x.length < (long) nRows * nIn) {
+            throw new IllegalArgumentException(nRows + " classifier rows of " + nIn + " floats need "
+                    + (long) nRows * nIn + " values, got " + x.length);
+        }
+        float[] y = java.util.Arrays.copyOf(x, Math.multiplyExact(nRows, nIn));
         if (cls != null) {
-            x = HeadsBlocks.linear(mv, cls, clsB, x, 1);
-            HeadsBlocks.activate(act, x, x.length);
+            y = HeadsBlocks.linear(mv, cls, clsB, y, nRows);
+            HeadsBlocks.activate(act, y, y.length);
             if (clsNorm != null) {
-                HeadsBlocks.layerNorm(x, 1, x.length, clsNorm, null, eps);
+                HeadsBlocks.layerNorm(y, nRows, clsWidth, clsNorm, clsNormB, eps);
             }
         }
         if (clsOut != null) {
-            x = HeadsBlocks.linear(mv, clsOut, clsOutB, x, 1);
+            y = HeadsBlocks.linear(mv, clsOut, clsOutB, y, nRows);
         }
-        if (softmax) {
-            CpuOps.softmax(x, 0, x.length);
+        applyPoolerAct(y, nRows, activation);
+        return y;
+    }
+
+    /**
+     * {@link #applyRows(float[], int, boolean)} without the {@code cls} / {@code cls.norm} prediction head: the
+     * embedding rows go straight through {@code cls.output} (vLLM's {@code for_seq_cls} token_classify over a
+     * model whose classifier is a prediction head, which applies the final projection per row only).
+     *
+     * @throws IllegalStateException when the head has no {@code cls.output} projection
+     * @throws IllegalArgumentException when {@code x} does not hold {@code nRows} rows
+     */
+    public float[] applyOutputRows(float[] x, int nRows, boolean activation) {
+        Objects.requireNonNull(x, "x");
+        if (clsOut == null) {
+            throw new IllegalStateException("direct token classification needs the cls.output projection; "
+                    + "the head has none");
         }
-        return x;
+        if (nRows < 0 || x.length < (long) nRows * nIn) {
+            throw new IllegalArgumentException(nRows + " classifier rows of " + nIn + " floats need "
+                    + (long) nRows * nIn + " values, got " + x.length);
+        }
+        float[] y = HeadsBlocks.linear(mv, clsOut, clsOutB, x, nRows);
+        applyPoolerAct(y, nRows, activation);
+        return y;
+    }
+
+    /** The pooler-level activation over {@code nRows} packed rows of {@link #outputs()} scores. */
+    private void applyPoolerAct(float[] y, int nRows, boolean activation) {
+        if (!activation || poolerAct == null || poolerAct == PoolerAct.IDENTITY) {
+            return;
+        }
+        for (int t = 0; t < nRows; t++) {
+            if (poolerAct == PoolerAct.SOFTMAX) {
+                CpuOps.softmax(y, t * nOut, nOut);
+                continue;
+            }
+            for (int i = 0; i < nOut; i++) {
+                int at = t * nOut + i;
+                if (poolerAct == PoolerAct.TANH) {
+                    y[at] = (float) Math.tanh(y[at]);
+                } else {
+                    y[at] = 1.0f / (1.0f + (float) Math.exp(-y[at]));
+                }
+            }
+        }
     }
 
     /** {@link #apply} wrapped with the labels. */
     public ClassifierOutput output(float[] pooled, int off) {
-        return ClassifierOutput.of(apply(pooled, off), labels, softmax);
+        return ClassifierOutput.of(apply(pooled, off), labels, normalized());
     }
 
     // ================================================================== rerank input
@@ -159,7 +266,8 @@ public final class ClassifierHead {
      * <ul>
      *   <li>with a {@code tokenizer.chat_template.rerank} prompt ({@link GGUFTokenizer#rerankTemplate()}): the prompt
      *       with every {@code {query}} replaced by the query and then every {@code {document}} by the document
-     *       (string_replace_all, common/common.cpp:510-525), tokenized with special tokens parsed and none added;</li>
+     *       (string_replace_all, common/common.cpp:510-525), tokenized with special tokens parsed and none added,
+     *       then the {@link GGUFTokenizer#rerankSuffix()} ids (vLLM's {@code post_process_tokens});</li>
      *   <li>otherwise: the query and the document tokenized without added special tokens and without special-token
      *       parsing, and joined by {@link #packRerank}.</li>
      * </ul>
@@ -168,16 +276,39 @@ public final class ClassifierHead {
      *                               token the vocabulary lacks
      */
     public static int[] rerankInput(GGUFTokenizer tokenizer, String query, String document) {
+        return rerankInput(tokenizer, query, document, null);
+    }
+
+    /**
+     * {@link #rerankInput(GGUFTokenizer, String, String)} with the task instruction a score request carries: the
+     * prompt fills its {@code {instruction}} placeholder first, then {@code {query}} and {@code {document}}; the
+     * placeholder stays as written when no instruction is given.
+     */
+    public static int[] rerankInput(GGUFTokenizer tokenizer, String query, String document, String instruction) {
         Objects.requireNonNull(tokenizer, "tokenizer");
         Objects.requireNonNull(query, "query");
         Objects.requireNonNull(document, "document");
         String template = tokenizer.rerankTemplate();
         if (template != null) {
-            String prompt = template.replace(RERANK_QUERY, query).replace(RERANK_DOCUMENT, document);
-            return tokenizer.encode(prompt, false);
+            String prompt = template;
+            if (instruction != null) {
+                prompt = prompt.replace(RERANK_INSTRUCTION, instruction);
+            }
+            prompt = prompt.replace(RERANK_QUERY, query).replace(RERANK_DOCUMENT, document);
+            return withSuffix(tokenizer.encode(prompt, false), tokenizer.rerankSuffix());
         }
         return packRerank(tokenizer.encode(query, false, false), tokenizer.encode(document, false, false),
                 tokenizer.vocab(), tokenizer.specialTokens());
+    }
+
+    /** {@code prompt} followed by {@code suffix}. */
+    private static int[] withSuffix(int[] prompt, int[] suffix) {
+        if (suffix.length == 0) {
+            return prompt;
+        }
+        int[] out = java.util.Arrays.copyOf(prompt, prompt.length + suffix.length);
+        System.arraycopy(suffix, 0, out, prompt.length, suffix.length);
+        return out;
     }
 
     /**

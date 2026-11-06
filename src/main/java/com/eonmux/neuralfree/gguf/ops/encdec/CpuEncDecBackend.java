@@ -13,14 +13,21 @@ import com.eonmux.neuralfree.gguf.cpu.head.CpuEmbeddingStage;
 import com.eonmux.neuralfree.gguf.cpu.head.CpuHeadPreprocessor;
 import com.eonmux.neuralfree.gguf.cpu.head.CpuLogitsHead;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuOps;
+import com.eonmux.neuralfree.gguf.engine.BatchSplitter;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.SequenceEncoder;
+import com.eonmux.neuralfree.gguf.engine.UBatch;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.HeapModelMemory;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedSequences;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -47,16 +54,24 @@ import java.util.Objects;
  * the self-attention, {@code cross_attn_norm}, the cross-attention and the FFN), the tokens are appended to the
  * sequence and the head computes the requested rows. The hidden tap observes the decoder stack.</p>
  *
+ * <p>Over paged memory ({@code neuralfree.parallel > 1} or {@code neuralfree.kv.paged=true}) the backend runs several
+ * decoder sequences at once, each over the encoding of its own source ({@link SequenceEncoder}, llama.cpp's
+ * {@code cross.seq_ids_enc} and cross mask, llama-context.cpp:1776-1785 and llama-graph.cpp:1093-1105):
+ * {@link #encodeSequence} encodes a source into one sequence's cross caches, and {@link #forwardBatch} splits a batch
+ * of decoder rows into cross-sequence ubatches over the page tables, where the self-attention reads each sequence's
+ * own cells and the cross-attention each sequence's own encoder rows. The contiguous calls run sequence 0.</p>
+ *
  * <p>The package-level helpers shared by both encoder-decoder backends (model checks, the decoder start token, the
  * source limit) live here. The backend owns its executors and head; the context's weights, scratch and memory
  * belong to whoever built the context. One thread at a time.</p>
  */
-public final class CpuEncDecBackend implements ForwardBackend {
+public final class CpuEncDecBackend implements ForwardBackend, SequenceEncoder {
 
     private static final String TEMP_ROWS = "CpuEncDecBackend.rows";
     private static final String TEMP_OUTPUTS = "CpuEncDecBackend.outputs";
 
     private final ModelSpec spec;
+    private final CpuForwardContext ctx;
     private final CpuScratch scratch;
     private final CpuMemory memory;
     private final int ubatch;
@@ -76,7 +91,8 @@ public final class CpuEncDecBackend implements ForwardBackend {
     private final int[] singleToken = new int[1];
     private HiddenTap tap;
     private float[] lastLogits;
-    private boolean encoded;
+    /** Per sequence, whether its cross caches hold the encoding of a source (sequence 0 for the contiguous calls). */
+    private final boolean[] encoded;
     private boolean closed;
 
     /**
@@ -99,6 +115,7 @@ public final class CpuEncDecBackend implements ForwardBackend {
         Objects.requireNonNull(registry, "registry");
         Objects.requireNonNull(headPreprocessors, "headPreprocessors");
         this.spec = ctx.spec();
+        this.ctx = ctx;
         checkModel(spec);
         if (!ctx.hasMemory()) {
             throw new IllegalStateException(arch() + ": the decoder needs memory for its self-attention KV and"
@@ -118,6 +135,7 @@ public final class CpuEncDecBackend implements ForwardBackend {
         this.encoderNorm = encoderNorm(ctx, encoderWidth);
         this.encoderNormEps = spec.hparams().normRmsEps();
         this.sourceLimit = Math.min(scratch.ubatch(), crossRows(spec, memory.plan()));
+        this.encoded = new boolean[crossStreams(spec, memory.plan())];
         this.rowIdx = scratch.intTemp(TEMP_ROWS, scratch.ubatch());
         this.outputIdx = scratch.intTemp(TEMP_OUTPUTS, scratch.ubatch());
         this.embedding = new CpuEmbeddingStage(ctx);
@@ -257,6 +275,28 @@ public final class CpuEncDecBackend implements ForwardBackend {
     }
 
     /**
+     * Cross-attention streams every decoder layer keeps ({@link LayerMemoryPlan#crossStreams()}): the sequences
+     * that can hold an encoding at once.
+     *
+     * @throws IllegalStateException when the decoder layers plan different stream counts
+     */
+    static int crossStreams(ModelSpec spec, MemoryPlan plan) {
+        int streams = -1;
+        for (LayerSpec l : spec.layers()) {
+            if (l.crossAttention() == null) {
+                continue;
+            }
+            int n = plan.layer(l.il()).crossStreams();
+            if (streams >= 0 && n != streams) {
+                throw new IllegalStateException(spec.arch().ggufName() + ": decoder layer " + l.il() + " plans " + n
+                        + " cross-attention streams, an earlier layer " + streams);
+            }
+            streams = n;
+        }
+        return Math.max(streams, 1);
+    }
+
+    /**
      * Refuses a source longer than {@code limit} ({@code min(ubatch, cross cache rows)}) with
      * {@link ContextFullException}; when the ubatch is the bound, the cause says so (the encoder runs the whole
      * source in one ubatch, llama-context.cpp:1628).
@@ -296,14 +336,10 @@ public final class CpuEncDecBackend implements ForwardBackend {
         }
         checkSourceLength(source.length, scratch.ubatch(), sourceLimit);
         embedding.checkInputs(source, null, 0);
-        encoded = false;
+        Arrays.fill(encoded, false);
         memory.reset();
         try {
-            float[] enc = encode(source, null);
-            for (CpuCrossAttentionMixer m : crossMixers) {
-                m.encode(enc, 0, source.length);
-            }
-            encoded = true;
+            encodeInto(0, source);
             singleToken[0] = startToken;
             TapRows taps = TapRows.open(tap, 1, decoder.size());
             step(singleToken, 0, 1, 0, taps);
@@ -311,7 +347,7 @@ public final class CpuEncDecBackend implements ForwardBackend {
             deliver(taps);
             return logits;
         } catch (RuntimeException e) {
-            encoded = false;
+            Arrays.fill(encoded, false);
             try {
                 memory.reset();
             } catch (RuntimeException resetFailure) {
@@ -319,6 +355,39 @@ public final class CpuEncDecBackend implements ForwardBackend {
             }
             throw e;
         }
+    }
+
+    /**
+     * Encodes {@code source} into sequence {@code seq}'s cross caches (the decoder memory stays): the encoder pass,
+     * then every decoder layer's cross K/V. The sequence counts as encoded only once every layer holds the source.
+     *
+     * @throws IndexOutOfBoundsException when the memory keeps no cross caches for {@code seq}
+     * @throws ContextFullException      when the source is longer than {@link #maxSourceTokens()}; nothing changes
+     * @throws IllegalArgumentException  for an empty source or a token outside the vocabulary
+     */
+    @Override
+    public void encodeSequence(int seq, int[] source) {
+        checkOpen();
+        Objects.requireNonNull(source, "source");
+        if (seq < 0 || seq >= encoded.length) {
+            throw new IndexOutOfBoundsException(arch() + ": the memory keeps cross caches for " + encoded.length
+                    + " sequences, not sequence " + seq);
+        }
+        if (source.length == 0) {
+            throw new IllegalArgumentException("encoder source without tokens");
+        }
+        checkSourceLength(source.length, scratch.ubatch(), sourceLimit);
+        embedding.checkInputs(source, null, 0);
+        encodeInto(seq, source);
+    }
+
+    private void encodeInto(int seq, int[] source) {
+        encoded[seq] = false;
+        float[] enc = encode(source, null);
+        for (CpuCrossAttentionMixer m : crossMixers) {
+            m.encode(seq, enc, 0, source.length);
+        }
+        encoded[seq] = true;
     }
 
     /**
@@ -384,6 +453,153 @@ public final class CpuEncDecBackend implements ForwardBackend {
         return out;
     }
 
+    // ================================================================== batched decoder steps
+
+    /** Sequences the paged memory holds ({@code PagedSequences.maxSequences()}); 1 on the contiguous form. */
+    @Override
+    public int maxSequences() {
+        HeapModelMemory paged = pagedMemory();
+        return paged == null ? 1 : paged.pagedSequences().maxSequences();
+    }
+
+    /** Null over paged heap memory, which runs batches of several decoder sequences; the refusal otherwise. */
+    @Override
+    public String batchRefusal() {
+        return pagedMemory() != null ? null
+                : arch() + " batches several decoder sequences only over paged memory (neuralfree.parallel > 1 or"
+                        + " neuralfree.kv.paged=true)";
+    }
+
+    /** This backend over paged heap memory, where every sequence keeps its own encoding; null otherwise. */
+    @Override
+    public SequenceEncoder sequenceEncoder() {
+        return pagedMemory() != null ? this : null;
+    }
+
+    private HeapModelMemory pagedMemory() {
+        return memory instanceof HeapModelMemory && ((HeapModelMemory) memory).pagedSequences() != null
+                ? (HeapModelMemory) memory : null;
+    }
+
+    /**
+     * Decoder rows of several sequences over the paged memory, each sequence over its own encoding: the batch splits
+     * into cross-sequence ubatches (split_simple, llama-kv-cache.cpp:761); per ubatch the paged step reserves the
+     * cells, runs the owed page copies and commits, the embedding stage writes the rows at their batch positions,
+     * every decoder layer steps over the page tables (self-attention over the sequence's own cells, cross-attention
+     * over its own encoder rows), the tokens join their sequences and the head computes the ubatch's output rows. A
+     * non-causal batch flags its ubatches for the self-attention. Returns one logits row per output row, in batch
+     * order.
+     *
+     * @throws UnsupportedOperationException when the memory is not paged, the batch carries embedding rows, rope
+     *                                       sections or adapter slots other than 0
+     * @throws IllegalStateException         when a row's sequence holds no encoding ({@link #encodeSequence})
+     * @throws com.eonmux.neuralfree.gguf.memory.MemoryFullException (as {@link ContextFullException}) when a ubatch
+     *                                       cannot reserve its pages
+     */
+    @Override
+    public float[][] forwardBatch(ForwardBatch batch) {
+        checkOpen();
+        Objects.requireNonNull(batch, "batch");
+        HeapModelMemory mem = pagedMemory();
+        if (mem == null) {
+            throw new UnsupportedOperationException("forwardBatch: " + batchRefusal());
+        }
+        checkBatch(batch);
+        TapRows taps = TapRows.open(tap, batch.nTokens(), decoder.size());
+        float[][] out = new float[batch.outputRows().length][];
+        try {
+            for (UBatch u : new BatchSplitter(true).split(batch, ubatch, BatchSplitter.Mode.SIMPLE)) {
+                float[][] rows = pagedUbatch(batch, u, mem, taps);
+                int[] local = u.layout().outputRows();
+                for (int j = 0; j < local.length; j++) {
+                    int i = Arrays.binarySearch(batch.outputRows(), u.batchRow(local[j]));
+                    if (i < 0) {
+                        throw new IllegalStateException("ubatch output row " + u.batchRow(local[j])
+                                + " is not a batch output row");
+                    }
+                    out[i] = rows[j];
+                }
+            }
+        } finally {
+            ctx.stepNonCausal(false);
+        }
+        deliver(taps);
+        return out;
+    }
+
+    /** Refuses before any ubatch reserves pages: rows the decoder cannot take, or a sequence without an encoding. */
+    private void checkBatch(ForwardBatch batch) {
+        String slotRefusal = batch.adapterSlotRefusal(getClass().getSimpleName());
+        if (slotRefusal != null) {
+            throw new UnsupportedOperationException(slotRefusal);
+        }
+        if (batch.embeddings() != null) {
+            throw new UnsupportedOperationException(arch() + ": " + embeddingRowsRefusal());
+        }
+        if (batch.ropePositions() != null) {
+            throw new UnsupportedOperationException(arch() + " has no RoPE; a batch with rope sections does not fit");
+        }
+        int[] seqs = batch.seqIds();
+        for (int r = 0; r < batch.nTokens(); r++) {
+            int seq = seqs[r];
+            if (seq < 0 || seq >= encoded.length || !encoded[seq]) {
+                throw new IllegalStateException(arch() + ": decoder row " + r + " runs sequence " + seq
+                        + ", which holds no encoded source; call encodeSequence first");
+            }
+        }
+        embedding.checkInputs(batch.tokens(), null, 0);
+    }
+
+    /**
+     * One paged ubatch: open the paged step (reservation, page copies, commit, begin), embed the rows at their
+     * positions, run the decoder layers over the step layout, extend each sequence's token record, compute the output
+     * rows and end the step.
+     */
+    private float[][] pagedUbatch(ForwardBatch batch, UBatch u, HeapModelMemory mem, TapRows taps) {
+        int[] tokens = u.tokens();
+        PagedStep step = mem.openPagedStep(u.layout(), u.positions());
+        boolean nonCausal = batch.nonCausal();
+        try {
+            float[] x = scratch.slot(CpuScratch.X);
+            embedding.embedBatched(tokens, u.positions(), x);
+            if (nonCausal) {
+                ctx.stepNonCausal(true);
+            }
+            runDecoderBatched(u.layout(), x, taps, u.batchRows());
+            appendTokens(mem.pagedSequences(), step, tokens);
+            float[][] rows = new float[u.layout().outputRows().length][];
+            emitRows(u.layout().outputRows(), 0, tokens.length, rows);
+            return rows;
+        } finally {
+            if (nonCausal) {
+                ctx.stepNonCausal(false);
+            }
+            mem.endPagedStep();
+        }
+    }
+
+    /** Every decoder layer over the batched layout; the tap stores each ubatch row at its call row. */
+    private void runDecoderBatched(StepLayout layout, float[] x, TapRows taps, int[] callRows) {
+        for (int il = 0; il < decoder.size(); il++) {
+            CpuLayerExecutor e = decoder.get(il);
+            if (taps != null && taps.wants(il)) {
+                taps.captureRows(il, x, callRows, layout.nTokens(), e.streamWidth());
+            }
+            e.forward(layout, x);
+        }
+        if (taps != null && taps.wants(decoder.size())) {
+            taps.captureRows(decoder.size(), x, callRows, layout.nTokens(), decoderWidth);
+        }
+    }
+
+    /** Extends each of the step's sequences' token record with its segment's tokens (ubatch row order). */
+    private static void appendTokens(PagedSequences paged, PagedStep step, int[] tokens) {
+        for (int s = 0; s < step.nSeg(); s++) {
+            int start = step.segStart(s);
+            paged.appendTokens(step.segSeq(s), Arrays.copyOfRange(tokens, start, start + step.segLen(s)));
+        }
+    }
+
     /** One decoder step of {@code n} tokens: embedding, the step's memory rows, every decoder layer, bookkeeping. */
     private void step(int[] tokens, int off, int n, int pos0, TapRows taps) {
         float[] x = scratch.slot(CpuScratch.X);
@@ -437,7 +653,7 @@ public final class CpuEncDecBackend implements ForwardBackend {
     }
 
     private void requireEncoded() {
-        if (!encoded) {
+        if (!encoded[0]) {
             throw new IllegalStateException(arch() + ": the decoder runs over an encoded source; call prefill(source,"
                     + " 0) after every reset");
         }
@@ -547,11 +763,11 @@ public final class CpuEncDecBackend implements ForwardBackend {
 
     // ================================================================== memory
 
-    /** Empties the decoder memory and forgets the encoding; the next decoder call needs a new prefill. */
+    /** Empties the decoder memory and forgets every encoding; the next decoder call needs a new prefill. */
     @Override
     public void reset() {
         checkOpen();
-        encoded = false;
+        Arrays.fill(encoded, false);
         memory.reset();
     }
 
@@ -599,7 +815,7 @@ public final class CpuEncDecBackend implements ForwardBackend {
                 e.shiftContext(nKeep, nDiscard);
             }
         } catch (RuntimeException e) {
-            encoded = false;
+            Arrays.fill(encoded, false);
             try {
                 memory.reset();
             } catch (RuntimeException resetFailure) {
@@ -638,9 +854,9 @@ public final class CpuEncDecBackend implements ForwardBackend {
         return sourceLimit;
     }
 
-    /** True once a source is encoded and until the next reset. */
+    /** True once a source is encoded into sequence 0 and until the next reset. */
     public boolean encoded() {
-        return encoded;
+        return encoded[0];
     }
 
     private String arch() {
@@ -698,7 +914,7 @@ public final class CpuEncDecBackend implements ForwardBackend {
     @Override
     public String toString() {
         return "CpuEncDecBackend{" + arch() + ", encoder " + encoder.size() + " layers, decoder " + decoder.size()
-                + " layers, start " + startToken + ", ubatch " + ubatch + (encoded ? ", encoded" : "")
+                + " layers, start " + startToken + ", ubatch " + ubatch + (encoded[0] ? ", encoded" : "")
                 + (closed ? ", closed" : "") + '}';
     }
 
@@ -737,6 +953,19 @@ public final class CpuEncDecBackend implements ForwardBackend {
 
         /** Copies the step's {@code n} rows, which are rows {@code [off, off + n)} of the call. */
         void capture(int point, float[] x, int off, int n, int width) {
+            ensure(point, width);
+            System.arraycopy(x, 0, rows[point], off * width, n * width);
+        }
+
+        /** Copies the step's {@code n} rows, step row {@code r} to call row {@code callRows[r]}. */
+        void captureRows(int point, float[] x, int[] callRows, int n, int width) {
+            ensure(point, width);
+            for (int r = 0; r < n; r++) {
+                System.arraycopy(x, r * width, rows[point], callRows[r] * width, width);
+            }
+        }
+
+        private void ensure(int point, int width) {
             if (rows[point] == null) {
                 rows[point] = new float[Math.multiplyExact(total, width)];
                 widths[point] = width;
@@ -744,7 +973,6 @@ public final class CpuEncDecBackend implements ForwardBackend {
                 throw new IllegalStateException("tap point " + point + " changed width from " + widths[point]
                         + " to " + width + " within a call");
             }
-            System.arraycopy(x, 0, rows[point], off * width, n * width);
         }
 
         void deliver() {

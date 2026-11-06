@@ -34,10 +34,10 @@ public final class UBatch {
         int[] pos = batch.positions();
         for (int i = 1; i < n; i++) {
             if (seq[rows[i]] < seq[rows[i - 1]]
-                    || (seq[rows[i]] == seq[rows[i - 1]] && pos[rows[i]] <= pos[rows[i - 1]])) {
-                throw new IllegalArgumentException("ubatch rows are ordered by sequence then position: row "
-                        + rows[i] + " (" + seq[rows[i]] + ',' + pos[rows[i]] + ") after row " + rows[i - 1]
-                        + " (" + seq[rows[i - 1]] + ',' + pos[rows[i - 1]] + ")");
+                    || (seq[rows[i]] == seq[rows[i - 1]] && pos[rows[i]] < pos[rows[i - 1]])) {
+                throw new IllegalArgumentException("ubatch rows are ordered by sequence then non-decreasing"
+                        + " position: row " + rows[i] + " (" + seq[rows[i]] + ',' + pos[rows[i]] + ") after row "
+                        + rows[i - 1] + " (" + seq[rows[i - 1]] + ',' + pos[rows[i - 1]] + ")");
             }
         }
         int[] tokSeq = new int[n];
@@ -45,12 +45,23 @@ public final class UBatch {
         int[] len = new int[n];
         int[] pos0 = new int[n];
         int nSeg = 0;
-        int[] outputLocal = new int[0];
+        // output membership by batch row: the ubatch rows are ordered by sequence then position, which need
+        // not ascend in batch order across segments, so a per-row test replaces an order-dependent scan
+        boolean[] isOutput = new boolean[batch.nTokens()];
+        for (int output : batch.outputRows()) {
+            isOutput[output] = true;
+        }
+        int nOut = 0;
+        for (int i = 0; i < n; i++) {
+            if (isOutput[rows[i]]) {
+                nOut++;
+            }
+        }
+        int[] outputLocal = new int[nOut];
         {
             int prevSeq = -1;
             int prevPos = -1;
             int out = 0;
-            int[] outputs = batch.outputRows();
             for (int i = 0; i < n; i++) {
                 if (seq[rows[i]] != prevSeq) {
                     prevSeq = seq[rows[i]];
@@ -61,21 +72,16 @@ public final class UBatch {
                     pos0[nSeg] = pos[rows[i]];
                     nSeg++;
                 } else {
-                    if (pos[rows[i]] != prevPos + 1) {
+                    // rows of one media chunk share the chunk's base position; both continue the segment
+                    if (pos[rows[i]] != prevPos && pos[rows[i]] != prevPos + 1) {
                         throw new IllegalArgumentException("sequence " + prevSeq + " holed in the ubatch: position "
                                 + pos[rows[i]] + " after " + prevPos);
                     }
                     len[nSeg - 1]++;
                 }
                 prevPos = pos[rows[i]];
-                while (out < outputs.length && outputs[out] <= rows[i]) {
-                    if (outputs[out] == rows[i]) {
-                        int[] grown = new int[outputLocal.length + 1];
-                        System.arraycopy(outputLocal, 0, grown, 0, outputLocal.length);
-                        grown[outputLocal.length] = i;
-                        outputLocal = grown;
-                    }
-                    out++;
+                if (isOutput[rows[i]]) {
+                    outputLocal[out++] = i;
                 }
             }
         }

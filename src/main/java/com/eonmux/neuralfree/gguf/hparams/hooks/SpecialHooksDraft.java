@@ -12,24 +12,89 @@ import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 import java.util.Arrays;
 
 /**
- * Hooks of the speculative-decoding drafters eagle3, gemma4-assistant and dflash. Each transcribes
+ * Hooks of the speculative-decoding drafters eagle, eagle3, gemma4-assistant and dflash. Each transcribes
  * {@code llama_model_<arch>::load_arch_hparams}; line references are to llama.cpp src/models/.
  */
 public final class SpecialHooksDraft {
 
     /** EAGLE3 fuses exactly three target layers (eagle3.cpp:9-11). */
     private static final int EAGLE3_TARGET_LAYERS = 3;
+    /** Llama 4 chunked-local attention window and the temperature of its NoPE layers (models/llama4.cpp:13-17). */
+    private static final int LLAMA4_CHUNK = 8192;
+    private static final float LLAMA4_TEMPERATURE_SCALE = 0.1f;
 
+    public static final ArchHparamsHook EAGLE = SpecialHooksDraft::eagle;
     public static final ArchHparamsHook EAGLE3 = SpecialHooksDraft::eagle3;
+    public static final ArchHparamsHook EAGLE_MISTRAL_LARGE3 = (b, kv) -> eagleFc(b, kv, Fc.MISTRAL_LARGE3);
+    public static final ArchHparamsHook EAGLE_LLAMA4 = (b, kv) -> eagleFc(b, kv, Fc.LLAMA4);
+    public static final ArchHparamsHook EAGLE_MINICPM = (b, kv) -> eagleFc(b, kv, Fc.MINICPM);
+    public static final ArchHparamsHook EAGLE_COHERE = (b, kv) -> eagleFc(b, kv, Fc.COHERE);
     public static final ArchHparamsHook GEMMA4_ASSISTANT = SpecialHooksDraft::gemma4Assistant;
     public static final ArchHparamsHook DFLASH = SpecialHooksDraft::dflash;
 
     private SpecialHooksDraft() {
     }
 
-    /** eagle3.cpp:3-36: three target layers of width {@code target_hidden_size} feed the fusion projection. */
+    /**
+     * The EAGLE-1 drafter's row: one target layer of {@code target_hidden_size} fuses with the drafter's own
+     * embedding through {@code fc}. The llama- and mistral-shaped drafts normalize nothing around the fusion
+     * ({@code norm_before_residual} / {@code norm_before_fc} stay false); the DeepSeek-MTP-shaped drafts apply their
+     * two fusion input norms as tensors instead. A draft carrying the MLA ranks ({@code attention.kv_lora_rank}, a
+     * converted {@code EagleDeepSeekMTPModel} over a DeepSeek target) reads the MLA geometry, and one carrying
+     * routed experts reads the MoE keys.
+     *
+     * @throws GgufFormatException when the target-layer array is missing or does not hold exactly one layer, the
+     *                             fusion widths disagree, or an MLA or MoE key is inconsistent
+     */
+    private static void eagle(ModelHparamsBuilder b, GgufKv kv) {
+        b.normRmsEps(kv.f32Required(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS));
+        int[] targets = kv.i32Array(GgufKeys.TARGET_LAYERS);
+        if (targets == null || targets.length != 1) {
+            throw SpecialHooks.invalid(b, "EAGLE model requires exactly one entry in '"
+                    + kv.key(GgufKeys.TARGET_LAYERS) + "', the target's last hidden layer");
+        }
+        b.targetLayers(targets);
+        int nEmbdTarget = kv.u32Required(GgufKeys.TARGET_HIDDEN_SIZE);
+        b.targetHiddenSize(nEmbdTarget);
+        b.nEmbdInpEncImpl(targets.length * nEmbdTarget);
+        if (nEmbdTarget != b.nEmbd()) {
+            throw SpecialHooks.invalid(b, "EAGLE fuses a target hidden of " + nEmbdTarget
+                    + " floats with its own embeddings of " + b.nEmbd());
+        }
+        b.normBeforeResidual(false);
+        b.normBeforeFc(false);
+        if (kv.has(GgufKeys.ATTENTION_KV_LORA_RANK)) {
+            mlaGeometry(b, kv, "EAGLE");
+        }
+        if (b.nExpert() > 0) {
+            eagleMoe(b, kv);
+        }
+    }
+
+    /**
+     * The routed-expert keys of a DeepSeek-MTP-shaped EAGLE draft: the expert width, the dense lead (0 for a draft
+     * whose single layer is MoE), the shared-expert count, the routing scale and normalization and the gating
+     * function (softmax when absent, DeepSeek's default).
+     */
+    private static void eagleMoe(ModelHparamsBuilder b, GgufKv kv) {
+        HparamsSupport.readExpertFfLength(b, kv, true);
+        b.nExpertShared(kv.u32(GgufKeys.EXPERT_SHARED_COUNT, b.nExpertShared()));
+        b.nLayerDenseLead(kv.u32(GgufKeys.LEADING_DENSE_BLOCK_COUNT, b.nLayerDenseLead()));
+        b.expertWeightsScale(kv.f32(GgufKeys.EXPERT_WEIGHTS_SCALE, b.expertWeightsScale()));
+        b.expertWeightsNorm(kv.bool(GgufKeys.EXPERT_WEIGHTS_NORM, b.expertWeightsNorm()));
+        b.gating(HparamsSupport.readGating(kv, GatingFunc.SOFTMAX));
+    }
+
+    /**
+     * eagle3.cpp:3-36: three target layers of width {@code target_hidden_size} feed the fusion projection. The
+     * optional {@code logit_scale} carries the draft configurations of vLLM's {@code Eagle3*} families, whose logits
+     * processor scales the draft logits before the pick (0 when absent: no scaling). A drafter whose file carries
+     * the MLA ranks ({@code attention.kv_lora_rank}, e.g. a converted {@code Eagle3DeepseekV2ForCausalLM}) reads the
+     * MLA geometry too, so its single decoder layer resolves to multi-head latent attention.
+     */
     private static void eagle3(ModelHparamsBuilder b, GgufKv kv) {
         b.normRmsEps(kv.f32Required(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS));      // eagle3.cpp:4
+        b.logitScale(kv.f32(GgufKeys.LOGIT_SCALE, b.logitScale()));
         int[] targets = kv.i32Array(GgufKeys.TARGET_LAYERS);                       // eagle3.cpp:6-8
         if (targets == null) {
             throw SpecialHooks.invalid(b, "EAGLE3 model requires '" + kv.key(GgufKeys.TARGET_LAYERS)
@@ -45,6 +110,143 @@ public final class SpecialHooksDraft {
         b.nEmbdInpEncImpl(targets.length * nEmbdTarget);                           // eagle3.cpp:22
         b.normBeforeResidual(kv.bool(GgufKeys.NORM_BEFORE_RESIDUAL, false));       // eagle3.cpp:26
         b.normBeforeFc(kv.bool(GgufKeys.NORM_BEFORE_FC, false));                   // eagle3.cpp:33
+        if (kv.has(GgufKeys.ATTENTION_KV_LORA_RANK)) {
+            mlaGeometry(b, kv, "EAGLE3");
+        }
+    }
+
+    /**
+     * The MLA geometry of a drafter over a DeepSeek-style target, written by the EAGLE Hugging Face hooks: the query
+     * and KV LoRA ranks, the decompressed key and value head widths and the optional YaRN log multiplier the
+     * deepseek2 graph reads. {@code name} prefixes the error message. The shared rotary key keeps at least one
+     * non-rotary dimension.
+     */
+    private static void mlaGeometry(ModelHparamsBuilder b, GgufKv kv, String name) {
+        b.nLoraQ(kv.u32(GgufKeys.ATTENTION_Q_LORA_RANK, 0));
+        b.nLoraKv(kv.u32Required(GgufKeys.ATTENTION_KV_LORA_RANK));
+        b.headKMlaImpl(kv.u32Required(GgufKeys.ATTENTION_KEY_LENGTH_MLA));
+        b.headVMlaImpl(kv.u32Required(GgufKeys.ATTENTION_VALUE_LENGTH_MLA));
+        if (b.headKMlaImpl() <= b.nRotFull()) {
+            throw SpecialHooks.invalid(b, name + " MLA key head length " + b.headKMlaImpl()
+                    + " leaves no non-rotary dimension beside the " + b.nRotFull() + " rotary ones");
+        }
+        if (kv.has(GgufKeys.ROPE_SCALING_YARN_LOG_MUL)) {
+            b.yarnLogMul(kv.f32(GgufKeys.ROPE_SCALING_YARN_LOG_MUL, 0f) / 0.1f);
+        }
+    }
+
+    /** The four vLLM concat-fc drafter families ({@link com.eonmux.neuralfree.gguf.ops.flow.EagleFcDraftModel}). */
+    private enum Fc {
+        MISTRAL_LARGE3, LLAMA4, MINICPM, COHERE
+    }
+
+    /**
+     * The concat-fc drafters: {@code g = fc([embed(token) | target hidden])} over the target's post-output-norm
+     * hidden, followed by the family's decoder layers, its output norm and its LM head. Exactly one target tap (the
+     * target's final stream) feeds the fusion, of the drafter's own width; {@code logit_scale} multiplies the draft
+     * logits. The families differ in the geometry the specification resolves from these keys:
+     * <ul>
+     *   <li>{@code Mistral Large 3}: multi-head latent attention over the DeepSeek MLA geometry, a dense FFN and the
+     *       {@code llama_4_scaling} query temperature;</li>
+     *   <li>{@code Llama 4}: chunked local attention with the llama-4 weightless Q/K norm on RoPE layers and the
+     *       8192-token attention temperature on NoPE ones;</li>
+     *   <li>{@code MiniCPM}: {@code scale_emb} on the embedding, the {@code scale_depth} residual and the
+     *       {@code scale_width} division of the hidden state, with the two fusion input norms;</li>
+     *   <li>{@code Cohere}: LayerNorm blocks with the parallel residual and the draft's {@code logit_scale}.</li>
+     * </ul>
+     */
+    private static void eagleFc(ModelHparamsBuilder b, GgufKv kv, Fc family) {
+        String name = family.name().replace('_', ' ');
+        if (family == Fc.COHERE) {
+            b.normRmsEps(kv.f32(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS, 0f));
+            b.normEps(kv.f32(GgufKeys.ATTENTION_LAYERNORM_EPS, 0f));
+            if (b.normRmsEps() == 0f && b.normEps() == 0f) {
+                throw SpecialHooks.invalid(b, name + " model requires '"
+                        + kv.key(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS) + "' or '"
+                        + kv.key(GgufKeys.ATTENTION_LAYERNORM_EPS) + "'");
+            }
+        } else {
+            b.normRmsEps(kv.f32Required(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS));
+        }
+        b.logitScale(kv.f32(GgufKeys.LOGIT_SCALE, 0f));
+        int[] targets = kv.i32Array(GgufKeys.TARGET_LAYERS);
+        if (targets == null || targets.length != 1) {
+            throw SpecialHooks.invalid(b, name + " drafter requires exactly one entry in '"
+                    + kv.key(GgufKeys.TARGET_LAYERS) + "', the target's last hidden layer");
+        }
+        b.targetLayers(targets);
+        int nEmbdTarget = kv.u32Required(GgufKeys.TARGET_HIDDEN_SIZE);
+        b.targetHiddenSize(nEmbdTarget);
+        b.nEmbdInpEncImpl(2 * nEmbdTarget);
+        if (nEmbdTarget != b.nEmbd()) {
+            throw SpecialHooks.invalid(b, name + " fuses a target hidden of " + nEmbdTarget
+                    + " floats with its own embeddings of " + b.nEmbd());
+        }
+        b.normBeforeResidual(false);
+        b.normBeforeFc(false);
+        b.embeddingScale(kv.f32(GgufKeys.EMBEDDING_SCALE, 1f));
+        if (!(b.embeddingScale() > 0f)) {
+            throw SpecialHooks.invalid(b, name + " embedding scale must be positive, got " + b.embeddingScale());
+        }
+        switch (family) {
+            case MISTRAL_LARGE3:
+                if (kv.has(GgufKeys.ATTENTION_KV_LORA_RANK)) {
+                    mlaGeometry(b, kv, name);
+                }
+                b.attnTempScale(kv.f32(GgufKeys.ATTENTION_TEMPERATURE_SCALE, 0f));
+                b.attnTempFloorScale(kv.u32(GgufKeys.ATTENTION_TEMPERATURE_LENGTH, 0));
+                b.attnTempOffset(0.0f);
+                b.nLayerDenseLead(b.nLayer());
+                break;
+            case LLAMA4:
+                b.swaType(SwaType.CHUNKED);
+                b.nSwa(kv.u32(GgufKeys.ATTENTION_SLIDING_WINDOW, LLAMA4_CHUNK));
+                b.attnTempFloorScale(LLAMA4_CHUNK);
+                b.attnTempScale(LLAMA4_TEMPERATURE_SCALE);
+                b.attnTempOffset(1.0f);
+                b.useKqNorm(kv.bool(GgufKeys.ATTENTION_USE_QK_NORM, true));
+                b.isSwaArray(layerFlags(b, kv, GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN));
+                b.ropeEnabledArray(layerFlags(b, kv, GgufKeys.ATTENTION_ROPE_PATTERN));
+                break;
+            case MINICPM:
+                b.residualScale(kv.f32Required(GgufKeys.RESIDUAL_SCALE));
+                if (!(b.residualScale() > 0f)) {
+                    throw SpecialHooks.invalid(b, name + " residual scale must be positive, got " + b.residualScale());
+                }
+                b.outputHiddenScale(kv.f32Required(GgufKeys.OUTPUT_HIDDEN_SCALE));
+                if (!(b.outputHiddenScale() > 0f)) {
+                    throw SpecialHooks.invalid(b, name + " hidden scale must be positive, got "
+                            + b.outputHiddenScale());
+                }
+                break;
+            case COHERE:
+                b.useKqNorm(false);
+                break;
+            default:
+                throw new IllegalStateException("unhandled concat-fc family " + family);
+        }
+    }
+
+    /**
+     * A per-layer bool array of {@code key}, or every layer on when the file carries none. A scalar is read as a
+     * repeating period, as {@link HparamsSupport#loadSwaPattern} does.
+     */
+    private static boolean[] layerFlags(ModelHparamsBuilder b, GgufKv kv, String key) {
+        boolean[] flags = new boolean[b.nLayerAll()];
+        if (kv.isArray(key)) {
+            boolean[] stored = kv.boolArray(key);
+            System.arraycopy(stored, 0, flags, 0, Math.min(stored.length, flags.length));
+            return flags;
+        }
+        if (!kv.has(key)) {
+            Arrays.fill(flags, true);
+            return flags;
+        }
+        long period = kv.u32(key, 0);
+        for (int il = 0; il < flags.length; il++) {
+            flags[il] = period <= 0 || il % period != period - 1;
+        }
+        return flags;
     }
 
     /**

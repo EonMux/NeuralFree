@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * finished. Closing the backend frees the memory of every buffer still open, so closing a buffer
  * afterwards has nothing left to free. Ids are unique for the process and never reused.</p>
  */
-public final class CudaGpuBuffer implements GpuBuffer {
+public final class CudaGpuBuffer implements CudaBuffer {
 
     private static final Logger LOGGER = LoggingUtil.getLogger(CudaGpuBuffer.class);
     private static final AtomicLong NEXT_ID = new AtomicLong(1);
@@ -77,16 +77,19 @@ public final class CudaGpuBuffer implements GpuBuffer {
     }
 
     /** The backend that allocated this buffer. */
+    @Override
     public CudaComputeBackend backend() {
         return owner;
     }
 
     /** The device pointer, or null once the buffer is closed. */
+    @Override
     public CUdeviceptr getCUDevicePtr() {
         return devicePtr;
     }
 
     /** True once {@link #close()} has run. */
+    @Override
     public boolean isClosed() {
         return devicePtr == null;
     }

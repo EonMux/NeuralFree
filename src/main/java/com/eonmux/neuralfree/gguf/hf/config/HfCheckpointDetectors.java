@@ -33,8 +33,10 @@ import java.util.stream.Stream;
 /**
  * Checkpoints whose configuration is not a plain {@code config.json}, recognized by marker files and turned into a
  * synthesized configuration root, in the order of the llama.cpp converter's {@code _hparams_loaders}
- * (LC/conversion: qwen.py OpenJev, bert.py decision, clef.py, h2o_lightning.py, lev.py Lev/Kev/Nimble, lfm2.py
- * D1/D1-omni, pockettts.py, pplx_decider.py, vllm_d3.py, vllm_decision2.py). The first detector that matches wins.
+ * (LC/conversion: qwen.py OpenJev, bert.py decision, clef.py, h2o_lightning.py, lev.py Lev/Kev/Nimble,
+ * lfm3.py LFM3 d1, lfm2.py D1/D1-omni, pockettts.py, pplx_decider.py, soprano.py, vllm_d3.py,
+ * vllm_decision2.py). The first detector that
+ * matches wins.
  *
  * <p>LoRA-style decision checkpoints (Lev, Kev, Nimble) read the configuration of their base model, which must be
  * local: {@link ModelSourceOptions#baseDir()}, else {@code adapter_config.json} {@code base_model_name_or_path} when
@@ -51,6 +53,8 @@ public final class HfCheckpointDetectors {
     private static final Pattern POCKET_AUDIO_LAYER =
             Pattern.compile("mimi\\.encoder_transformer\\.transformer\\.layers\\.\\d+\\.norm1\\.weight");
     private static final String POCKET_MARKER = "flow_lm.bos_emb";
+    /** The added tokens 0 to 3 of a Soprano tokenizer (soprano.py:22-23). */
+    private static final List<String> SOPRANO_ADDED_TOKENS = List.of("[UNK]", "[TEXT]", "[START]", "[STOP]");
 
     private static final List<Detector> DETECTORS = List.of(
             new Detector("OpenJev", p -> p.isFile("helper/shim.py") && p.isFile(HfConfig.CONFIG_JSON),
@@ -67,6 +71,7 @@ public final class HfCheckpointDetectors {
             new Detector("Nimble", p -> p.isFile("adapter_config.json") && p.isFile("schema_config.json")
                     && "schema_candidate_classification_v2".equals(p.object("schema_config.json").get("task")),
                     p -> decisionLora(p, "NimbleModel")),
+            new Detector("Lfm3D1", HfCheckpointDetectors::isLfm3D1, HfCheckpointDetectors::lfm3D1),
             new Detector("D1", HfCheckpointDetectors::isD1, HfCheckpointDetectors::d1),
             new Detector("D1Omni", p -> p.isFile(HfConfig.CONFIG_JSON)
                     && "d1_omni".equals(p.object(HfConfig.CONFIG_JSON).get("model_type")),
@@ -75,6 +80,7 @@ public final class HfCheckpointDetectors {
             new Detector("PplxDecider", p -> p.isFile("decision_config.json") && p.isFile("readout.safetensors")
                     && p.isFile(HfConfig.CONFIG_JSON) && !p.object("decision_config.json").containsKey("format_id"),
                     p -> withDecision(plain(p, "PplxDeciderModel"), p, "decision_config.json")),
+            new Detector("Soprano", HfCheckpointDetectors::isSoprano, HfCheckpointDetectors::soprano),
             new Detector("VllmD3", p -> p.isFile("decision_config.json")
                     && "d3-code-readout-v1".equals(p.object("decision_config.json").get("format_id")),
                     p -> withDecision(plain(p, "VllmD3Model"), p, "decision_config.json")),
@@ -175,9 +181,40 @@ public final class HfCheckpointDetectors {
         if (!p.isFile(HfConfig.CONFIG_JSON)) {
             return false;
         }
-        Object autoMap = p.object(HfConfig.CONFIG_JSON).get("auto_map");
+        Map<String, Object> config = p.object(HfConfig.CONFIG_JSON);
+        Object modelType = config.get("model_type");
+        // d1 on LFM3 is converted by conversion/lfm3.py (lfm2.py:80)
+        if (modelType instanceof String && ((String) modelType).startsWith("lfm3")) {
+            return false;
+        }
+        Object autoMap = config.get("auto_map");
         Object autoModel = autoMap instanceof Map ? ((Map<?, ?>) autoMap).get("AutoModel") : null;
         return autoModel instanceof String && ((String) autoModel).endsWith(".D1Model");
+    }
+
+    /** lfm3.py _is_lfm3_d1_checkpoint: D1 architectures on an LFM3-VL or LFM3-Omni checkpoint. */
+    private static boolean isLfm3D1(Probe p) throws IOException {
+        if (!p.isFile(HfConfig.CONFIG_JSON)) {
+            return false;
+        }
+        Map<String, Object> config = p.object(HfConfig.CONFIG_JSON);
+        Object modelType = config.get("model_type");
+        return (("lfm3_vl".equals(modelType) || "lfm3_omni".equals(modelType))
+                && List.of("D1Model").equals(config.get("architectures")));
+    }
+
+    /**
+     * lfm3.py _load_lfm3_d1_hparams: the text model is the LFM3 d1 class, the root keeps the VL/Omni architecture for
+     * the projector, and the checkpoint's {@code model_type} names the decision type.
+     */
+    private static Detection lfm3D1(Probe p) throws IOException {
+        Map<String, Object> root = HfConfigLoader.readConfigJson(p.dir, p.dir);
+        String modelType = String.valueOf(root.get("model_type"));
+        root.put("d1_family", modelType);
+        root.put("architectures", architectures("lfm3_vl".equals(modelType)
+                ? "Lfm3VlForConditionalGeneration" : "Lfm3OmniForConditionalGeneration"));
+        textConfig(root, HfConfig.CONFIG_JSON).put("architectures", architectures("Lfm3D1Model"));
+        return new Detection(root, HfConfig.CONFIG_JSON, null);
     }
 
     /** lfm2.py _load_d1_hparams: the text model is D1, the vision projector stays LFM2-VL. */
@@ -316,7 +353,54 @@ public final class HfCheckpointDetectors {
         return candidate;
     }
 
+    /**
+     * soprano.py _is_soprano_checkpoint: a {@code decoder.pth} next to a Qwen3 {@code config.json} whose BOS and EOS
+     * ids are 3, and a {@code tokenizer.json} whose added tokens 0 to 3 are {@link #SOPRANO_ADDED_TOKENS}.
+     */
+    private static boolean isSoprano(Probe p) throws IOException {
+        if (!p.isFile("decoder.pth") || !p.isFile(HfConfig.CONFIG_JSON)) {
+            return false;
+        }
+        Map<String, Object> config = p.object(HfConfig.CONFIG_JSON);
+        if (!"qwen3".equals(config.get("model_type")) || !isNumber(config.get("bos_token_id"), 3)
+                || !isNumber(config.get("eos_token_id"), 3) || !p.isFile("tokenizer.json")) {
+            return false;
+        }
+        Map<Object, Object> added = new HashMap<>();
+        Object tokens = p.object("tokenizer.json").get("added_tokens");
+        if (tokens instanceof List) {
+            for (Object t : (List<?>) tokens) {
+                if (t instanceof Map) {
+                    Map<?, ?> m = (Map<?, ?>) t;
+                    Object id = m.get("id");
+                    added.put(id instanceof Number ? (Object) ((Number) id).longValue() : id, m.get("content"));
+                }
+            }
+        }
+        for (int i = 0; i < SOPRANO_ADDED_TOKENS.size(); i++) {
+            if (!SOPRANO_ADDED_TOKENS.get(i).equals(added.get((long) i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** soprano.py _load_soprano_hparams: the text model is SopranoTextModel, the projector holds the decoder. */
+    private static Detection soprano(Probe p) throws IOException {
+        Map<String, Object> root = HfConfigLoader.readConfigJson(p.dir, p.dir);
+        Map<String, Object> text = new LinkedHashMap<>();
+        text.put("architectures", architectures("SopranoTextModel"));
+        root.put("text_config", text);
+        root.put("architectures", architectures("SopranoModel"));
+        return new Detection(root, HfConfig.CONFIG_JSON, null);
+    }
+
     // ------------------------------------------------------------------ helpers
+
+    /** True when {@code v} is a JSON number equal to {@code expected} (Python {@code ==} on an int or float). */
+    private static boolean isNumber(Object v, long expected) {
+        return v instanceof Number && ((Number) v).doubleValue() == expected;
+    }
 
     private static List<Object> architectures(String arch) {
         List<Object> list = new ArrayList<>(1);

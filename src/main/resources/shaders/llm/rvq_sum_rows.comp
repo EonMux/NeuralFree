@@ -1,0 +1,35 @@
+/* rvq_sum_rows.comp - LLM_RvqSumRows: per-frame sum of one codebook group's embedding rows, the speech
+ * generators' RVQ dequantization step. GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i n_pages, i n_frames, i dim, R x, W y).
+ *   y[f][d] = sum_p x[p*n_frames + f][d]
+ * x[n_pages*n_frames][dim], y[n_frames][dim]. Dispatch: 1-D, one invocation per output element,
+ * global = roundUp(n_frames*dim, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfRvqX { float x_in[]; };
+layout(std430, binding = 1) writeonly buffer NfRvqY { float y_out[]; };
+
+layout(push_constant) uniform NfRvqParams {
+    int n_pages;
+    int n_frames;
+    int dim;
+} pc;
+
+void main() {
+    const uint idx = nf_global_id();
+    if (idx >= uint(pc.n_frames) * uint(pc.dim)) {
+        return;
+    }
+    const uint f = idx / uint(pc.dim);
+    const uint d = idx - f * uint(pc.dim);
+    float acc = 0.0;
+    for (int p = 0; p < pc.n_pages; ++p) {
+        acc += x_in[(uint(p) * uint(pc.n_frames) + f) * uint(pc.dim) + d];
+    }
+    y_out[idx] = acc;
+}

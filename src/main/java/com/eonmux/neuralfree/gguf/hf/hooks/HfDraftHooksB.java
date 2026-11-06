@@ -6,8 +6,10 @@ import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.arch.HfNameFilter;
 import com.eonmux.neuralfree.gguf.hf.arch.HfTensorHook;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
+import com.eonmux.neuralfree.gguf.hf.meta.HfGenericMetadata;
 import com.eonmux.neuralfree.gguf.hf.meta.HfMetadataBuilder;
 import com.eonmux.neuralfree.gguf.hf.tensor.ElementFormat;
+import com.eonmux.neuralfree.gguf.hf.tensor.ExpertTransforms;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfPlanView;
 import com.eonmux.neuralfree.gguf.hf.tensor.HfTensorIndex;
 import com.eonmux.neuralfree.gguf.hf.tensor.RopeTensors;
@@ -25,16 +27,19 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.UnaryOperator;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * The draft hooks of Appendix A table HK-SG part B: LC/conversion/deepseek.py {@code DeepseekV4DSparkModel}
- * (:929-1056) on the HK-B3 DeepSeek-V4 hooks, LC/conversion/nemotron.py {@code LiLiCorrDraftModel} (:19-117),
+ * The draft hooks, part B: LC/conversion/deepseek.py {@code DeepseekV4DSparkModel}
+ * (:929-1056) on the DeepSeek-V4 hooks, LC/conversion/nemotron.py {@code LiLiCorrDraftModel} (:19-117),
  * LC/conversion/gemma.py {@code Gemma4DSparkModel} (:836-950) and {@code Gemma4AssistantModel} (:957-961) on the
- * HK-B2 Gemma 4 hooks. DFlash, DSpark and MuseGlimmerAssistant are {@link HfDraftHooksA}; the shared target, mask
+ * Gemma 4 hooks. DFlash, DSpark and MuseGlimmerAssistant are {@link HfDraftHooksA}; the shared target, mask
  * and {@code dflash_config} helpers live in {@link HfDraftHooks}.
  */
 public final class HfDraftHooksB {
@@ -659,5 +664,423 @@ public final class HfDraftHooksB {
             return null;
         }
         return HfGemma4Hooks.filter(name, base);
+    }
+
+    // ------------------------------------------------------------------ DeepseekV41DSparkModel
+
+    /** The V4.1 DSpark model-level tensors, keyed by their filtered name (deepseek41.py:414-421). */
+    private static final Map<String, HfDeepseekV4Names.Mapped> V41_DSPARK_ROOT;
+    static {
+        Map<String, HfDeepseekV4Names.Mapped> m = new LinkedHashMap<>();
+        m.put("dspark.markov_head.embed.weight", new HfDeepseekV4Names.Mapped("DSPARK_MARKOV_W1", WEIGHT, true));
+        m.put("dspark.markov_head.head.weight", new HfDeepseekV4Names.Mapped("DSPARK_MARKOV_W2", WEIGHT, true));
+        m.put("dspark.confidence_head.proj.weight",
+                new HfDeepseekV4Names.Mapped("DSPARK_CONF_PROJ", WEIGHT, true));
+        V41_DSPARK_ROOT = Collections.unmodifiableMap(m);
+    }
+
+    /** The stage roots of a V4.1 draft: {@code layers.<stage>.main_proj|main_norm|norm}. */
+    private static final Pattern V41_DSPARK_STAGE_ROOT =
+            Pattern.compile("layers\\.(\\d+)\\.(main_proj|main_norm|norm)\\.weight");
+
+    /** The routed expert projections of a V4.1 draft stage, in the converter's write order. */
+    private static final Map<String, String> DSPARK_EXPERTS;
+    static {
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put("w1", "FFN_GATE_EXP");
+        m.put("w2", "FFN_DOWN_EXP");
+        m.put("w3", "FFN_UP_EXP");
+        DSPARK_EXPERTS = Collections.unmodifiableMap(m);
+    }
+
+    /**
+     * {@code DeepseekV41DSparkModel.__init__} (deepseek41.py:353-364): the V4.1 checks and the draft's empty
+     * compression and hash routing, with {@code num_nextn_predict_layers} and {@code dspark_block_size} required.
+     *
+     * @throws GgufFormatException naming the missing or unsupported key
+     */
+    public static HfConfig v41DsparkFixup(HfConfig cfg) {
+        HfConfig fixed = HfDeepseekV41Hooks.configFixup(cfg);
+        Map<String, Object> f = new LinkedHashMap<>();
+        f.put("compress_ratios", Collections.emptyList());
+        f.put("num_hash_layers", 0);
+        HfConfig out = fixed.withFlat(f);
+        int stages = out.findInt(-1, "num_nextn_predict_layers");
+        if (stages <= 0) {
+            throw new GgufFormatException(out.source() + ": a DeepSeek-V4.1 DSpark draft needs"
+                    + " num_nextn_predict_layers > 0, got " + stages);
+        }
+        if (!out.flat().containsKey("dspark_block_size")) {
+            throw new GgufFormatException(out.source() + ": a DeepSeek-V4.1 DSpark draft needs the dspark_* config"
+                    + " (dspark_block_size is missing)");
+        }
+        return out;
+    }
+
+    /** {@code num_nextn_predict_layers}: the draft's stage count (deepseek41.py:356). */
+    public static int v41DsparkBlockCount(HfLoadContext ctx) {
+        HfConfig cfg = ctx.config();
+        int stages = cfg.requireInt("num_nextn_predict_layers");
+        if (stages <= 0 || stages > HfConfig.MAX_LAYERS) {
+            throw new GgufFormatException(cfg.source() + ": num_nextn_predict_layers " + stages
+                    + " is outside [1, " + HfConfig.MAX_LAYERS + "]");
+        }
+        return stages;
+    }
+
+    /**
+     * {@code DeepseekV41DSparkModel.filter_tensors} (deepseek41.py:367-388): only {@code mtp.<stage>.*} survives;
+     * the Markov and confidence heads become {@code dspark.*} and everything else is re-keyed to the stage's own
+     * block, which the tensor hook maps back to the stage number.
+     */
+    public static HfNameFilter v41DsparkFilter(HfLoadContext ctx) {
+        int stages = ctx.config().requireInt("num_nextn_predict_layers");
+        return (name, base) -> {
+            if (!name.startsWith("mtp.")) {
+                return null;
+            }
+            String[] parts = name.split("\\.", 3);
+            if (parts.length < 3 || parts[2].isEmpty() || !isDigits(parts[1])) {
+                throw new GgufFormatException("Unexpected DeepSeek-V4.1 DSpark tensor '" + name + "'");
+            }
+            int stage = Integer.parseInt(parts[1]);
+            if (stage >= stages) {
+                throw new GgufFormatException("Unexpected DeepSeek-V4.1 DSpark stage " + stage + " (the checkpoint"
+                        + " declares " + stages + ")");
+            }
+            String rest = parts[2];
+            if (rest.startsWith("markov_head.") || rest.startsWith("confidence_head.")) {
+                return "dspark." + rest;
+            }
+            return "layers." + stage + "." + rest;
+        };
+    }
+
+    /**
+     * {@code DeepseekV41DSparkModel.modify_tensors} (deepseek41.py:424-436): the mtmd-only gate bias drops, the
+     * stage roots take their DFLASH tensors, and the rest maps through the V4.1 native names.
+     */
+    public static void v41DsparkTensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
+            throws IOException {
+        if (out.isConsumed(hfName)) {
+            return;
+        }
+        if (hfName.endsWith(".ffn.gate.bias_vl")) {
+            out.drop(hfName, "the mtmd-only gate bias variant is not part of the DFLASH arch");
+            return;
+        }
+        HfDeepseekV4Names.Mapped root = V41_DSPARK_ROOT.get(hfName);
+        if (root != null) {
+            out.add(ctx.names().ggufName(root.tensor(), -1, root.suffix()), src);
+            return;
+        }
+        Matcher stageRoot = V41_DSPARK_STAGE_ROOT.matcher(hfName);
+        if (stageRoot.matches()) {
+            String tensor = "main_proj".equals(stageRoot.group(2)) ? "FC"
+                    : "main_norm".equals(stageRoot.group(2)) ? "ENC_OUTPUT_NORM" : "OUTPUT_NORM";
+            out.add(ctx.names().ggufName(tensor, -1, WEIGHT), src);
+            return;
+        }
+        HfDeepseekV4Hooks.tensors(ctx, hfName, src, out, HfDeepseekV41Hooks.TABLE);
+    }
+
+    /**
+     * {@code DeepseekV41DSparkModel.set_gguf_parameters} (deepseek41.py:390-422): the draft's DFLASH dimensions,
+     * the V4.1 sparse-attention layout (no compression), the DSpark MoE, the hyper connections and the block
+     * protocol.
+     */
+    public static void v41DsparkMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) {
+        HfGenericMetadata.apply(ctx, kv);
+        HfConfig cfg = ctx.config();
+        int stages = ctx.blockCount();
+        int headDim = cfg.requireInt("head_dim");
+        kv.set(GgufKeys.ATTENTION_HEAD_COUNT_KV, 1);
+        kv.set(GgufKeys.ATTENTION_KEY_LENGTH, (long) headDim);
+        kv.set(GgufKeys.ATTENTION_VALUE_LENGTH, (long) headDim);
+        kv.set(GgufKeys.ROPE_DIMENSION_COUNT, (long) cfg.requireInt("qk_rope_head_dim"));
+        kv.set(GgufKeys.ROPE_FREQ_BASE, requireFloat(cfg, "rope_theta"));
+        kv.set(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS, requireFloat(cfg, "rms_norm_eps"));
+        kv.set(GgufKeys.ATTENTION_Q_LORA_RANK, cfg.requireInt("q_lora_rank"));
+        kv.set(GgufKeys.ATTENTION_SLIDING_WINDOW, cfg.requireInt("sliding_window"));
+        kv.set(GgufKeys.EXPERT_COUNT, cfg.requireInt("dspark_n_routed_experts"));
+        kv.set(GgufKeys.EXPERT_USED_COUNT, cfg.requireInt("dspark_num_experts_per_tok"));
+        kv.set(GgufKeys.EXPERT_FEED_FORWARD_LENGTH, cfg.requireInt("moe_intermediate_size"));
+        kv.set(GgufKeys.EXPERT_SHARED_COUNT, cfg.requireInt("n_shared_experts"));
+        kv.set(GgufKeys.EXPERT_WEIGHTS_SCALE, requireFloat(cfg, "routed_scaling_factor"));
+        kv.set(GgufKeys.EXPERT_WEIGHTS_NORM, cfg.findBool(false, "norm_topk_prob"));
+        kv.set(GgufKeys.EXPERT_GATING_FUNC, 4L);
+        List<Double> clamp = Collections.nCopies(stages, requireFloat(cfg, "swiglu_limit"));
+        kv.set(GgufKeys.SWIGLU_CLAMP_EXP, clamp);
+        kv.set(GgufKeys.SWIGLU_CLAMP_SHEXP, clamp);
+        kv.set(GgufKeys.ATTENTION_OUTPUT_GROUP_COUNT, cfg.requireInt("o_groups"));
+        kv.set(GgufKeys.ATTENTION_OUTPUT_LORA_RANK, cfg.requireInt("o_lora_rank"));
+        kv.set(GgufKeys.ATTENTION_COMPRESS_RATIOS, Collections.nCopies(stages, 0L));
+        kv.set(GgufKeys.HYPER_CONNECTION_COUNT, cfg.requireInt("hc_mult"));
+        kv.set(GgufKeys.HYPER_CONNECTION_SINKHORN_ITERATIONS, cfg.requireInt("hc_sinkhorn_iters"));
+        kv.set(GgufKeys.HYPER_CONNECTION_EPSILON, requireFloat(cfg, "hc_eps"));
+        kv.set(GgufKeys.HYPER_CONNECTION_SINGLE_PASS, true);
+        kv.set(GgufKeys.DFLASH_BLOCK_SIZE, cfg.requireInt("dspark_block_size"));
+        kv.set(GgufKeys.TARGET_LAYERS, requireIntList(cfg, "dspark_target_layer_ids"));
+        kv.set(GgufKeys.SAMPLE_FROM_ANCHOR, true);
+        kv.set(GgufKeys.HAS_CONFIDENCE_HEAD, true);
+    }
+
+    /**
+     * {@code DeepseekV41DSparkModel.tensor_force_quant} (deepseek41.py:438-442): the confidence projection stays
+     * F32; the rest follows the V4.1 rules.
+     */
+    public static GGMLType v41DsparkForceType(String ggufName, int nDims, ElementFormat source,
+                                              ModelSourceOptions.OutType outType) {
+        if ("conf_proj.weight".equals(ggufName)) {
+            return GGMLType.F32;
+        }
+        return HfDeepseekV41Hooks.forceType(ggufName, nDims, source, outType);
+    }
+
+    /**
+     * {@code DeepseekV41DSparkModel.set_vocab} (deepseek41.py:424-426): the V4.1 vocabulary plus
+     * {@code dspark_noise_token_id} as the mask.
+     */
+    public static Map<String, Object> v41DsparkVocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {
+        Map<String, Object> md = new LinkedHashMap<>(HfDeepseekV41Hooks.vocab(ctx, pre));
+        md.put(GgufKeys.TOKENIZER_MASK_ID, ctx.config().requireInt("dspark_noise_token_id"));
+        return Collections.unmodifiableMap(md);
+    }
+
+    /**
+     * {@code DeepseekV41DSparkModel.generate_extra_tensors} (deepseek41.py:430-441): the routed experts of every
+     * stage stacked in expert order with the draft's own expert count.
+     */
+    public static void v41DsparkExtra(HfLoadContext ctx, TensorSink out) {
+        HfConfig cfg = ctx.config();
+        int nExperts = cfg.requireInt("dspark_n_routed_experts");
+        int stages = ctx.blockCount();
+        for (int bid = 0; bid < stages; bid++) {
+            for (Map.Entry<String, String> e : DSPARK_EXPERTS.entrySet()) {
+                out.add(ctx.names().ggufName(e.getValue(), bid, WEIGHT),
+                        stackExperts(ctx, bid, e.getKey(), nExperts));
+            }
+        }
+    }
+
+    /** The routed experts of {@code proj} in stage block {@code bid}, stacked in expert order. */
+    private static RowSource stackExperts(HfLoadContext ctx, int bid, String proj, int nExperts) {
+        List<RowSource> parts = new ArrayList<>(nExperts);
+        for (int x = 0; x < nExperts; x++) {
+            String base = "layers." + bid + ".ffn.experts." + x + "." + proj;
+            if (!ctx.index().has(base + ".weight")) {
+                throw new GgufFormatException("Missing routed expert tensor " + base + ".weight");
+            }
+            parts.add(ctx.index().get(base + ".weight"));
+        }
+        try {
+            return ExpertTransforms.stack(parts);
+        } catch (IllegalArgumentException ex) {
+            throw new GgufFormatException("routed experts " + proj + " of stage " + bid + " do not stack: "
+                    + ex.getMessage(), ex);
+        }
+    }
+
+    // ------------------------------------------------------------------ MistralLarge4DSparkModel
+
+    /** The Mistral Large 4 DSpark model-level tensors, keyed without the {@code dspark.} prefix (mistral4.py:136-145). */
+    private static final Map<String, String> ML4_DSPARK_ROOT;
+    static {
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put("backbone.target_projection.weight", "FC");
+        m.put("backbone.target_norm.weight", "ENC_OUTPUT_NORM");
+        m.put("backbone.final_norm.weight", "OUTPUT_NORM");
+        m.put("backbone.mask_embedding", "DSPARK_MASK_EMBD");
+        m.put("autoregressive_head.embedding.weight", "DSPARK_MARKOV_W1");
+        m.put("autoregressive_head.output.weight", "DSPARK_MARKOV_W2");
+        m.put("autoregressive_head.joint_proj.weight", "DSPARK_JOINT_PROJ");
+        m.put("autoregressive_head.joint_proj.bias", "DSPARK_JOINT_PROJ");
+        ML4_DSPARK_ROOT = Collections.unmodifiableMap(m);
+    }
+
+    /** The derived keys the Mistral Large 4 draft reads from its {@code mtp} block. */
+    private static final String ML4_DSPARK_STAGES = "mistral_large4_dspark_stages";
+    private static final String ML4_DSPARK_DEPTH = "mistral_large4_dspark_depth";
+    private static final String ML4_DSPARK_WINDOW = "mistral_large4_dspark_window";
+    private static final String ML4_DSPARK_TARGETS = "mistral_large4_dspark_target_layers";
+
+    /**
+     * {@code MistralLarge4DSparkModel.__init__} (mistral4.py:147-164): the Mistral Large 4 layout over its
+     * {@code mtp.dspark} block, whose head, draft input, sliding window and stage geometry must match what the
+     * runtime implements.
+     *
+     * @throws GgufFormatException naming the missing or unsupported value
+     */
+    public static HfConfig ml4DsparkFixup(HfConfig cfg) {
+        HfConfig fixed = HfMistralLarge4Hooks.fixup(cfg);
+        Map<String, Object> mtp = object(fixed, fixed.flat().get("mtp"), "mtp");
+        Map<String, Object> dspark = object(fixed, mtp.get("dspark"), "mtp.dspark");
+        if (!"rnn".equals(dspark.get("head_type"))) {
+            throw new GgufFormatException(fixed.source() + ": Mistral Large 4 DSpark: unsupported head_type "
+                    + dspark.get("head_type") + ", only 'rnn' is supported (mistral4.py:153)");
+        }
+        if (!"position_specific".equals(dspark.get("draft_input"))) {
+            throw new GgufFormatException(fixed.source() + ": Mistral Large 4 DSpark: unsupported draft_input "
+                    + dspark.get("draft_input") + ", only 'position_specific' is supported (mistral4.py:154)");
+        }
+        Set<Integer> windows = windows(fixed, mtp.get("ragged_attention"));
+        if (windows.size() != 1) {
+            throw new GgufFormatException(fixed.source() + ": Mistral Large 4 DSpark: the layers must share one"
+                    + " sliding window, ragged_attention is " + mtp.get("ragged_attention") + " (mistral4.py:157)");
+        }
+        int stages = integer(fixed, mtp, "n_layers", "mtp.n_layers");
+        if (stages <= 0 || stages > HfConfig.MAX_LAYERS) {
+            throw new GgufFormatException(fixed.source() + ": mtp.n_layers " + stages + " is outside [1, "
+                    + HfConfig.MAX_LAYERS + "]");
+        }
+        int depth = integer(fixed, mtp, "depth", "mtp.depth");
+        if (depth <= 0) {
+            throw new GgufFormatException(fixed.source() + ": mtp.depth must be positive, got " + depth);
+        }
+        List<Integer> targets = commaSeparated(fixed, mtp.get("target_activation_layers"),
+                "mtp.target_activation_layers");
+        Map<String, Object> f = new LinkedHashMap<>();
+        f.put(ML4_DSPARK_STAGES, stages);
+        f.put(ML4_DSPARK_DEPTH, depth);
+        f.put(ML4_DSPARK_WINDOW, windows.iterator().next());
+        f.put(ML4_DSPARK_TARGETS, targets);
+        return fixed.withFlat(f);
+    }
+
+    /** {@code mtp.n_layers}: the draft's stage count. */
+    public static int ml4DsparkBlockCount(HfLoadContext ctx) {
+        return ctx.config().requireInt(ML4_DSPARK_STAGES);
+    }
+
+    /**
+     * {@code MistralLarge4DSparkModel.filter_tensors} (mistral4.py:166-174): only {@code mtp_dspark.*} survives;
+     * the backbone's blocks lose their {@code backbone.} prefix and every other tensor becomes {@code dspark.*}.
+     */
+    public static HfNameFilter ml4DsparkFilter(HfLoadContext ctx) {
+        return (name, base) -> {
+            if (!name.startsWith("mtp_dspark.")) {
+                return null;
+            }
+            String rest = name.substring("mtp_dspark.".length());
+            if (rest.startsWith("backbone.layers.")) {
+                String layer = rest.substring("backbone.".length());
+                if (layer.contains(".experts.")) {
+                    return "model." + layer.replace(".experts", ".mlp.experts")
+                            .replace(".w1.", ".gate_proj.").replace(".w2.", ".down_proj.")
+                            .replace(".w3.", ".up_proj.");
+                }
+                return layer;
+            }
+            return "dspark." + rest;
+        };
+    }
+
+    /**
+     * {@code MistralLarge4DSparkModel.modify_tensors} (mistral4.py:204-215): the draft's own head tensors map to
+     * their DFLASH names, the rest through the Mistral Large 4 MLA handling.
+     */
+    public static void ml4DsparkTensors(HfLoadContext ctx, String hfName, RowSource src, TensorSink out)
+            throws IOException {
+        if (out.isConsumed(hfName)) {
+            return;
+        }
+        if (hfName.startsWith("dspark.")) {
+            String key = hfName.substring("dspark.".length());
+            String tensor = ML4_DSPARK_ROOT.get(key);
+            if (tensor == null) {
+                throw new GgufFormatException("Unexpected DSpark tensor '" + hfName + "'");
+            }
+            String suffix = key.endsWith(".bias") ? ".bias" : WEIGHT;
+            out.add(ctx.names().ggufName(tensor, -1, suffix), src);
+            return;
+        }
+        HfMistralLarge4Hooks.tensors(ctx, hfName, src, out);
+    }
+
+    /**
+     * {@code MistralLarge4DSparkModel.set_gguf_parameters} (mistral4.py:181-202): the draft's MLA dimensions, the
+     * Mistral yarn and temperature configuration, the shared sliding window, the tanh cap and the block protocol.
+     */
+    public static void ml4DsparkMeta(HfLoadContext ctx, HfMetadataBuilder kv, HfPlanView plan) {
+        HfGenericMetadata.apply(ctx, kv);
+        HfConfig cfg = ctx.config();
+        int kvLora = cfg.requireInt("kv_lora_rank");
+        int rope = cfg.requireInt("qk_rope_head_dim");
+        kv.set(GgufKeys.ATTENTION_HEAD_COUNT_KV, 1);
+        kv.set(GgufKeys.ATTENTION_KEY_LENGTH, (long) kvLora + rope);
+        kv.set(GgufKeys.ATTENTION_VALUE_LENGTH, (long) kvLora);
+        kv.set(GgufKeys.ATTENTION_KEY_LENGTH_MLA, (long) cfg.requireInt("qk_nope_head_dim") + rope);
+        kv.set(GgufKeys.ATTENTION_VALUE_LENGTH_MLA, (long) cfg.requireInt("v_head_dim"));
+        kv.set(GgufKeys.ATTENTION_KV_LORA_RANK, kvLora);
+        kv.set(GgufKeys.ROPE_DIMENSION_COUNT, (long) rope);
+        kv.set(GgufKeys.ROPE_FREQ_BASE, requireFloat(cfg, "rope_theta"));
+        kv.set(GgufKeys.ATTENTION_LAYERNORM_RMS_EPS, requireFloat(cfg, "rms_norm_eps"));
+        HfMistralNativeHooks.mistralConfig(cfg, kv);
+        kv.set(GgufKeys.ATTENTION_SLIDING_WINDOW, cfg.requireInt(ML4_DSPARK_WINDOW));
+        kv.set(GgufKeys.FINAL_LOGIT_SOFTCAPPING, requireFloat(cfg, "softmax_tanh_gating"));
+        kv.set(GgufKeys.DFLASH_BLOCK_SIZE, cfg.requireInt(ML4_DSPARK_DEPTH));
+        kv.set(GgufKeys.TARGET_LAYERS, shiftByOne(ctx, requireIntList(cfg, ML4_DSPARK_TARGETS),
+                "mtp.target_activation_layers"));
+        kv.set(GgufKeys.SAMPLE_FROM_ANCHOR, true);
+        kv.set(GgufKeys.HAS_CONFIDENCE_HEAD, false);
+    }
+
+    /**
+     * {@code MistralLarge4DSparkModel.set_vocab} (mistral4.py:176-179): the Mistral vocabulary with mask token 0
+     * (the backbone's mask embedding carries the mask, the id is unused).
+     */
+    public static Map<String, Object> ml4DsparkVocab(HfLoadContext ctx, PreNameResolver pre) throws IOException {
+        Map<String, Object> md = new LinkedHashMap<>(HfVocabWriters.mistral(HfHookSupport.vocabInput(ctx), pre));
+        md.put(GgufKeys.TOKENIZER_MASK_ID, 0);
+        return Collections.unmodifiableMap(md);
+    }
+
+    /** A required nested object, named by {@code where}. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> object(HfConfig cfg, Object value, String where) {
+        if (!(value instanceof Map)) {
+            throw new GgufFormatException(cfg.source() + ": required key '" + where + "' must be an object, got "
+                    + value);
+        }
+        return (Map<String, Object>) value;
+    }
+
+    private static int integer(HfConfig cfg, Map<String, Object> map, String key, String where) {
+        Object v = map.get(key);
+        if (!(v instanceof Number) || v instanceof Boolean) {
+            throw new GgufFormatException(cfg.source() + ": required key '" + where + "' must be an integer, got "
+                    + v);
+        }
+        return ((Number) v).intValue();
+    }
+
+    /** The comma-separated integers of {@code value}. */
+    private static List<Integer> commaSeparated(HfConfig cfg, Object value, String where) {
+        if (!(value instanceof String)) {
+            throw new GgufFormatException(cfg.source() + ": required key '" + where + "' must be a comma-separated"
+                    + " string, got " + value);
+        }
+        List<Integer> out = new ArrayList<>();
+        for (String part : ((String) value).split(",", -1)) {
+            try {
+                out.add(Integer.parseInt(part.trim()));
+            } catch (NumberFormatException e) {
+                throw new GgufFormatException(cfg.source() + ": '" + where + "' holds '" + part
+                        + "', not an integer", e);
+            }
+        }
+        return out;
+    }
+
+    /** The distinct sliding windows of {@code mtp.ragged_attention}. */
+    private static Set<Integer> windows(HfConfig cfg, Object value) {
+        Set<Integer> out = new LinkedHashSet<>(commaSeparated(cfg, value, "mtp.ragged_attention"));
+        out.remove(0);
+        return out;
+    }
+
+    private static double requireFloat(HfConfig cfg, String key) {
+        return cfg.findFloat(key).orElseThrow(() -> new GgufFormatException(
+                cfg.source() + ": required key '" + key + "' is missing"));
     }
 }

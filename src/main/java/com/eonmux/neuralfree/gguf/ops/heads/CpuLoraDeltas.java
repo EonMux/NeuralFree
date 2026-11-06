@@ -6,10 +6,11 @@ import java.util.Objects;
 
 /**
  * Host deltas of one LoRA pair bound to its scale ({@link LoraAdapter.Delta}), as the three kinds of
- * {@link CpuProjectionDeltas}: a projection ({@link LoraAdapter.Delta#add}), the selected experts
- * ({@link LoraAdapter.Delta#addExperts}) and token-embedding rows ({@link LoraAdapter.Delta#addEmbedding}). Each delta
- * owns a scratch row grown on demand; one forward pass at a time, and the {@code LoraRegistry} of its attachment
- * rescales the bound scale in place between steps ({@link Rescalable#rescale}, LR-1) on the engine thread.
+ * {@link CpuProjectionDeltas}: a projection ({@link LoraAdapter.Delta#addScaled}), the selected experts
+ * ({@link LoraAdapter.Delta#addExpertsScaled}) and token-embedding rows ({@link LoraAdapter.Delta#addEmbeddingScaled}),
+ * each at the factor its slot's registration binds. Each delta owns a scratch row grown on demand; one forward pass
+ * at a time, and the {@code LoraRegistry} of its attachment rescales the bound scale in place between steps
+ * ({@link Rescalable#rescale}) on the engine thread.
  */
 public final class CpuLoraDeltas {
 
@@ -47,12 +48,12 @@ public final class CpuLoraDeltas {
         }
 
         @Override
-        public void add(int n, float[] x, int xOff, int xStride, float[] y, int yOff, int yStride) {
+        public void add(float scale, int n, float[] x, int xOff, int xStride, float[] y, int yOff, int yStride) {
             int need = n * delta.pair().rank();
             if (tmp.length < need) {
                 tmp = new float[need];
             }
-            delta.add(n, x, xOff, xStride, tmp, 0, y, yOff, yStride);
+            delta.addScaled(scale, n, x, xOff, xStride, tmp, 0, y, yOff, yStride);
         }
 
         @Override
@@ -72,8 +73,9 @@ public final class CpuLoraDeltas {
         }
 
         @Override
-        public void add(int pairs, int k, int[] ids, float[] x, int xOff, boolean tokenRows, float[] y, int yOff) {
-            delta.addExperts(pairs, k, ids, x, xOff, tokenRows, tmp, y, yOff);
+        public void add(float scale, int pairs, int k, int[] ids, float[] x, int xOff, boolean tokenRows, float[] y,
+                        int yOff) {
+            delta.addExpertsScaled(scale, pairs, k, ids, x, xOff, tokenRows, tmp, y, yOff);
         }
 
         @Override
@@ -91,8 +93,8 @@ public final class CpuLoraDeltas {
         }
 
         @Override
-        public void add(int n, int[] ids, int idsOff, float[] y, int yOff, int yStride) {
-            delta.addEmbedding(n, ids, idsOff, y, yOff, yStride);
+        public void add(float scale, int n, int[] ids, int idsOff, float[] y, int yOff, int yStride) {
+            delta.addEmbeddingScaled(scale, n, ids, idsOff, y, yOff, yStride);
         }
 
         @Override

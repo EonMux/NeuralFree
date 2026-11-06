@@ -1,19 +1,29 @@
 package com.eonmux.neuralfree.gguf.engine.sampling;
 
 import com.eonmux.neuralfree.gguf.engine.Sampler;
+import com.eonmux.neuralfree.gguf.grammar.ConstraintSpec;
+import com.eonmux.neuralfree.gguf.grammar.GrammarTriggers;
 import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The request-driven parity stages (PARITY P5): {@link MinTokensStage} bans the vocabulary's end-of-generation
+ * The request-driven sampling stages: {@link MinTokensStage} bans the vocabulary's end-of-generation
  * ids until the minimum is generated and releases them after, and {@link BadWordsStage} bans the token that
  * would continue a banned phrase from the accepted history — including a phrase spanning three tokens and a
- * single-token phrase banned everywhere — while a request without the stages bans nothing.
+ * single-token phrase banned everywhere — while a request without the stages bans nothing. The request's
+ * {@code constraint} builds a grammar stage ({@link GrammarStage}, or {@link TriggeredGrammarStage} behind a
+ * trigger) that masks every token the grammar rejects, carries through the request's builder round trip, and an
+ * unusable grammar refuses by name.
  */
 public class RequestStagesTest {
 
@@ -78,6 +88,23 @@ public class RequestStagesTest {
     }
 
     @Test
+    public void theMinTokensBanYieldsWhenOnlyEndOfGenerationRemains() {
+        SamplerVocab vocab = new ByteVocab();
+        SamplerStage grammar = RequestStages.constraintStage(ConstraintSpec.gbnf("root ::= \"a\""),
+                vocab::tokenize, vocab);
+        // the assembly order: the grammar masks first, the unspent min-tokens budget bans behind it
+        Sampler sampler = Sampler.create(
+                com.eonmux.neuralfree.gguf.engine.SamplerConfig.greedyDecoding(), new int[0],
+                List.of(grammar, new MinTokensStage(3, vocab)), vocab);
+        // while the word is open the grammar admits 'a', so the budget bans EOG (0) behind it
+        assertEquals('a', sample(sampler, logits(0, 9f, 'a', 8f)));
+        sampler.accept('a');
+        // the word is closed and the grammar leaves EOG alone in the set: the ban must not empty it —
+        // EOG stays selectable and outranks the grammar-rejected decoy
+        assertEquals(0, sample(sampler, logits('b', 8f, 0, 9f)));
+    }
+
+    @Test
     public void badWordsBanTheContinuationOfEveryBannedPhrase() {
         SamplerVocab vocab = new ByteVocab();
         // "no" spans two tokens; "x" is a single token banned everywhere
@@ -129,6 +156,30 @@ public class RequestStagesTest {
         }
     }
 
+    @Test
+    public void theRequestStagesBuildInTheConstraintsHeadOrder() {
+        SamplerVocab vocab = new ByteVocab();
+        com.eonmux.neuralfree.gguf.engine.GenerationRequest request =
+                com.eonmux.neuralfree.gguf.engine.GenerationRequest.builder()
+                        .maxNewTokens(8)
+                        .sampler(com.eonmux.neuralfree.gguf.engine.SamplerConfig.greedyDecoding())
+                        .minTokens(2)
+                        .badWord("x")
+                        .allowedTokenIds(5, 6)
+                        .build();
+        List<SamplerStage> stages = RequestStages.of(request, vocab);
+        assertEquals(3, stages.size());
+        // the head's masking order (vLLM applies the masks to the logits before sampling in this order): the
+        // allowed ids, then the bad words, then the min-tokens ban, which yields behind them
+        assertTrue(stages.get(0) instanceof AllowedTokensStage);
+        assertTrue(stages.get(1) instanceof BadWordsStage);
+        assertTrue(stages.get(2) instanceof MinTokensStage);
+        for (SamplerStage stage : stages) {
+            assertTrue("a request mask stage masks", stage.masks());
+            assertFalse("a request mask stage is no grammar", stage.constrains());
+        }
+    }
+
     private static com.eonmux.neuralfree.gguf.engine.GenerationRequest requestWithMinTokens(int n) {
         return com.eonmux.neuralfree.gguf.engine.GenerationRequest.builder()
                 .maxNewTokens(8)
@@ -146,5 +197,68 @@ public class RequestStagesTest {
             builder.badWord(word);
         }
         return builder.build();
+    }
+
+    // ================================================================== grammar constraints
+
+    @Test
+    public void aConstraintStageMasksTheTokensTheGrammarRejects() {
+        SamplerVocab vocab = new ByteVocab();
+        SamplerStage stage = RequestStages.constraintStage(ConstraintSpec.gbnf("root ::= \"ok\""),
+                vocab::tokenize, vocab);
+        Sampler sampler = Sampler.create(
+                com.eonmux.neuralfree.gguf.engine.SamplerConfig.greedyDecoding(), new int[0],
+                List.of(stage), vocab);
+        // only the grammar's first byte keeps its logit
+        assertEquals('o', sample(sampler, logits('x', 9f, 'o', 8f)));
+        sampler.accept('o');
+        assertEquals('k', sample(sampler, logits('x', 9f, 'k', 8f)));
+    }
+
+    @Test
+    public void aTriggerGatedConstraintRunsAsTheTriggeredStage() {
+        SamplerVocab vocab = new ByteVocab();
+        SamplerStage stage = RequestStages.constraintStage(
+                ConstraintSpec.gbnf("root ::= \"ok\"").withTriggers(GrammarTriggers.lazyWords(List.of("<t>"))),
+                vocab::tokenize, vocab);
+        assertTrue(stage instanceof TriggeredGrammarStage);
+        SamplerStage plain = RequestStages.constraintStage(ConstraintSpec.gbnf("root ::= \"ok\""),
+                vocab::tokenize, vocab);
+        assertTrue(plain instanceof GrammarStage);
+        assertNotEquals(plain.getClass(), stage.getClass());
+    }
+
+    @Test
+    public void noConstraintAndAnUnusableConstraint() {
+        SamplerVocab vocab = new ByteVocab();
+        assertNull(RequestStages.constraintStage(null, vocab::tokenize, vocab));
+        assertThrows(IllegalArgumentException.class,
+                () -> RequestStages.constraintStage(ConstraintSpec.gbnf("root ::= (unclosed"), vocab::tokenize,
+                        vocab));
+    }
+
+    @Test
+    public void aGrammarStageKeepsTheGreedyChainOffTheOnDeviceArgmax() {
+        SamplerVocab vocab = new ByteVocab();
+        SamplerStage grammar = RequestStages.constraintStage(ConstraintSpec.gbnf("root ::= \"ok\""),
+                vocab::tokenize, vocab);
+        Sampler constrained = Sampler.create(
+                com.eonmux.neuralfree.gguf.engine.SamplerConfig.greedyDecoding(), new int[0],
+                List.of(grammar), vocab);
+        assertFalse("the on-device argmax sees no grammar mask", constrained.argmaxOnly());
+        Sampler plain = Sampler.create(
+                com.eonmux.neuralfree.gguf.engine.SamplerConfig.greedyDecoding(), new int[0], vocab);
+        assertTrue(plain.argmaxOnly());
+    }
+
+    @Test
+    public void aRequestCarriesItsConstraintThroughTheBuilderRoundTrip() {
+        com.eonmux.neuralfree.gguf.engine.GenerationRequest request =
+                com.eonmux.neuralfree.gguf.engine.GenerationRequest.builder()
+                        .maxNewTokens(8)
+                        .constraint(ConstraintSpec.jsonSchema("{\"type\": \"object\"}", null))
+                        .build();
+        assertSame(request.constraint(), request.toBuilder().build().constraint());
+        assertNull(com.eonmux.neuralfree.gguf.engine.GenerationRequest.defaults().constraint());
     }
 }

@@ -22,6 +22,7 @@ import static org.lwjgl.vulkan.VK10.VK_ACCESS_SHADER_WRITE_BIT;
 import static org.lwjgl.vulkan.VK10.VK_ACCESS_TRANSFER_READ_BIT;
 import static org.lwjgl.vulkan.VK10.VK_ACCESS_TRANSFER_WRITE_BIT;
 import static org.lwjgl.vulkan.VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+import static org.lwjgl.vulkan.VK10.VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
 import static org.lwjgl.vulkan.VK10.VK_NULL_HANDLE;
 import static org.lwjgl.vulkan.VK10.VK_PIPELINE_BIND_POINT_COMPUTE;
 import static org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -158,6 +159,15 @@ public final class VkCommandBatch implements AutoCloseable {
      * @param computeStages true when the queue family runs compute shaders; false for a transfer-only family
      */
     public VkCommandBatch(VkCommandBuffer commandBuffer, VkDescriptorStrategy.Frame frame, boolean computeStages) {
+        this(commandBuffer, frame, computeStages, false);
+    }
+
+    /**
+     * @param replayable true begins the buffer with {@code SIMULTANEOUS_USE}, so a captured command
+     *                   graph can resubmit it; the buffer then belongs to the graph, not the queue
+     */
+    public VkCommandBatch(VkCommandBuffer commandBuffer, VkDescriptorStrategy.Frame frame, boolean computeStages,
+                          boolean replayable) {
         if (commandBuffer == null) {
             throw new IllegalArgumentException("command buffer must not be null");
         }
@@ -178,7 +188,8 @@ public final class VkCommandBatch implements AutoCloseable {
                 : VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         this.beginInfo = VkCommandBufferBeginInfo.calloc()
                 .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+                .flags(replayable ? VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT
+                        : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
         this.globalBarrier = VkMemoryBarrier.calloc(1);
         this.globalBarrier.get(0).sType(VK_STRUCTURE_TYPE_MEMORY_BARRIER)
                 .srcAccessMask(srcAccess)

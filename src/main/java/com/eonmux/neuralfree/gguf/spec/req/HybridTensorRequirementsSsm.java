@@ -2,6 +2,8 @@ package com.eonmux.neuralfree.gguf.spec.req;
 
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement;
 import com.eonmux.neuralfree.gguf.arch.TensorRequirement.LayerCondition;
+import com.eonmux.neuralfree.gguf.arch.TensorRequirement.Scope;
+import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 
 import java.util.List;
 
@@ -27,6 +29,10 @@ public final class HybridTensorRequirementsSsm {
     private static final LayerCondition NEMOTRON_ATTENTION = (hp, il) -> !hp.isRecurrent(il) && hp.nFf(il) == 0;
     /** Nemotron-H FFN layers (nemotron-h.cpp:103-111). */
     private static final LayerCondition NEMOTRON_FFN = (hp, il) -> !hp.isRecurrent(il) && hp.nFf(il) != 0;
+    /** Zamba2 hybrid layers: they run a shared attention/MLP block before the Mamba-2 mixer. */
+    private static final LayerCondition HYBRID = (hp, il) -> hp.isHybridLayer(il);
+    /** Zamba2 hybrid layers whose shared attention adds per-use q/k/v adapters. */
+    private static final LayerCondition ZAMBA2_ATTENTION_ADAPTER = (hp, il) -> hp.zamba2AttentionAdapter();
 
     private HybridTensorRequirementsSsm() {
     }
@@ -48,6 +54,28 @@ public final class HybridTensorRequirementsSsm {
     }
 
     /**
+     * Zamba2 (vLLM {@code Zamba2ForCausalLM}). Every block carries a Mamba-2 mixer and its input norm; hybrid blocks
+     * add {@code shared_linear} and one use of a shared attention/MLP block, whose weights are stored once per bare
+     * block under the {@code shared_blk} stack, and the per-use adapters of the block's projections.
+     */
+    public static List<TensorRequirement> zamba2() {
+        HybridTensorRequirements.Builder b = header();
+        b.layer(ALL, "attn_norm.weight", "ssm_in.weight", "ssm_conv1d.weight");
+        b.layerOptional(ALL, "ssm_conv1d.bias");
+        b.layer(ALL, "ssm_dt.bias", "ssm_a", "ssm_d", "ssm_norm.weight", "ssm_out.weight");
+        b.layer(HYBRID, "shared_linear.weight", "ffn_gate_up_adapter_a.weight", "ffn_gate_up_adapter_b.weight");
+        b.layer(and(HYBRID, ZAMBA2_ATTENTION_ADAPTER), "attn_q_adapter_a.weight", "attn_q_adapter_b.weight",
+                "attn_k_adapter_a.weight", "attn_k_adapter_b.weight", "attn_v_adapter_a.weight",
+                "attn_v_adapter_b.weight");
+        b.entry(TensorRequirement.of(Scope.LAYER, true, (hp, blk) -> true,
+                TensorRequirement.prefixed("shared_blk.%d.", new String[][] {{"attn_norm.weight", "attn_q.weight",
+                        "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_pre_ff_norm.weight",
+                        "ffn_gate_up.weight", "ffn_down.weight"}}))
+                .overLayers(ModelHparams::zamba2MemBlocks));
+        return b.build();
+    }
+
+    /**
      * jamba.cpp:33-100. A layer's FFN is routed when it has {@code ffn_gate_inp} and dense otherwise
      * (jamba.cpp:88-99), which {@code MoeResolver} applies per layer ({@code MoeSpec.isMoeLayer}).
      */
@@ -60,6 +88,7 @@ public final class HybridTensorRequirementsSsm {
         b.qkv(ATTENTION);
         b.layer(ATTENTION, "attn_output.weight");
         b.layer(ALL, "ffn_norm.weight");
+        b.modelOptional("cls.output.weight", "cls.output.bias");
         b.layerFirstOf(ALL,
                 new String[] {"ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight",
                         "ffn_up_exps.weight"},

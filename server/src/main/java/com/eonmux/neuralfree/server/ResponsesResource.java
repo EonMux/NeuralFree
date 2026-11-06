@@ -36,6 +36,10 @@ import java.util.Map;
  * returns at once and runs the generation detached from the client; {@code GET ?stream=true&starting_after=N}
  * replays its events, and {@code POST .../cancel} stops it. {@code POST /v1/responses/input_tokens} counts the
  * prompt tokens of a request.</p>
+ *
+ * <p>In router mode a creation takes the model from the body's {@code "model"} and stores on that model's own
+ * response store. The id routes take {@code ?model=}; without it they find the store that holds the id, so a
+ * response created on one model is retrieved from that model.</p>
  */
 @Path("/")
 public class ResponsesResource {
@@ -47,12 +51,47 @@ public class ResponsesResource {
     @Inject
     HttpServerRequest http;
 
+    /** The multi-model router; null in manual wiring, where requests serve on {@code service} directly. */
+    @Inject
+    ModelRouter router;
+
     /** Test and manual wiring: builds the resource over an explicit service. */
     public ResponsesResource(EngineService service) {
+        this(service, null);
+    }
+
+    /** Test and manual wiring over an explicit service and router. */
+    public ResponsesResource(EngineService service, ModelRouter router) {
         this.service = service;
+        this.router = router;
     }
 
     public ResponsesResource() {
+    }
+
+    /**
+     * The engine a stored response of {@code id} lives on: the {@code ?model=} entry in router mode, else the
+     * loaded entry whose store holds the id; without either, the wired service (its store answers the 404).
+     */
+    private EngineService storedOn(String id, String model, String autoload) {
+        if (router == null || !router.active()) {
+            return service;
+        }
+        if (model != null && !model.isBlank()) {
+            return ModelRouter.targetQuery(router, service, model, autoload);
+        }
+        for (ModelRouter.Entry entry : router.list()) {
+            EngineService open = entry.service();
+            if (entry.ready() && open != null && open.responses().get(id) != null) {
+                return open;
+            }
+        }
+        return service;
+    }
+
+    /** The engine a created response serves on: the body's {@code model} in router mode, else the wired service. */
+    private EngineService target(JsonView body) {
+        return ModelRouter.target(router, service, body, null);
     }
 
     @POST
@@ -60,8 +99,10 @@ public class ResponsesResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response create(String bodyText) {
-        ServerJson.requireLoaded(service);
-        return OpenAiResource.mapped(() -> createOf(ServerJson.parse(bodyText)));
+        JsonView body = ServerJson.parse(bodyText);
+        EngineService target = target(body);
+        ServerJson.requireLoaded(target);
+        return OpenAiResource.mapped(() -> createOf(body, target));
     }
 
     /** llama.cpp's unversioned alias. */
@@ -78,11 +119,12 @@ public class ResponsesResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response inputTokens(String bodyText) {
-        ServerJson.requireLoaded(service);
+        JsonView body = ServerJson.parse(bodyText);
+        EngineService target = target(body);
+        ServerJson.requireLoaded(target);
         return OpenAiResource.mapped(() -> {
-            JsonView body = ServerJson.parse(bodyText);
-            JsonView chat = JsonView.of(ResponsesRequests.chatBody(body, history(body)), "body");
-            return OpenAiResource.inputTokens(service, chat);
+            JsonView chat = JsonView.of(ResponsesRequests.chatBody(body, history(body, target)), "body");
+            return OpenAiResource.inputTokens(target, chat);
         });
     }
 
@@ -99,8 +141,19 @@ public class ResponsesResource {
     @Path("/v1/responses/{id}")
     @Produces(MediaType.APPLICATION_JSON)
     public Response retrieve(@PathParam("id") String id, @QueryParam("stream") boolean stream,
-                             @QueryParam("starting_after") Integer startingAfter) {
-        ResponseStore.Entry entry = stored(id);
+                             @QueryParam("starting_after") Integer startingAfter,
+                             @QueryParam("model") String model, @QueryParam("autoload") String autoload) {
+        return retrieveOf(id, stream, startingAfter, storedOn(id, model, autoload));
+    }
+
+    /** Test and manual wiring: the retrieval from the wired service, without a model query. */
+    Response retrieve(String id, boolean stream, Integer startingAfter) {
+        return retrieveOf(id, stream, startingAfter, service);
+    }
+
+    private static Response retrieveOf(String id, boolean stream, Integer startingAfter,
+                                       EngineService service) {
+        ResponseStore.Entry entry = stored(id, service);
         if (!stream) {
             return Response.ok(ServerJson.write(entry.response())).build();
         }
@@ -116,8 +169,19 @@ public class ResponsesResource {
     @Path("/v1/responses/{id}/input_items")
     @Produces(MediaType.APPLICATION_JSON)
     public Response inputItems(@PathParam("id") String id, @QueryParam("limit") Integer limit,
-                               @QueryParam("order") String order, @QueryParam("after") String after) {
-        ResponseStore.Entry entry = stored(id);
+                               @QueryParam("order") String order, @QueryParam("after") String after,
+                               @QueryParam("model") String model, @QueryParam("autoload") String autoload) {
+        return inputItemsOf(id, limit, order, after, storedOn(id, model, autoload));
+    }
+
+    /** Test and manual wiring: the input items of the wired service, without a model query. */
+    Response inputItems(String id, Integer limit, String order, String after) {
+        return inputItemsOf(id, limit, order, after, service);
+    }
+
+    private static Response inputItemsOf(String id, Integer limit, String order, String after,
+                                         EngineService service) {
+        ResponseStore.Entry entry = stored(id, service);
         int size = limit == null ? 20 : limit;
         if (size < 1 || size > 100) {
             throw ServerJson.badRequest("limit must be between 1 and 100, got " + size);
@@ -133,8 +197,18 @@ public class ResponsesResource {
     @DELETE
     @Path("/v1/responses/{id}")
     @Produces(MediaType.APPLICATION_JSON)
-    public Response delete(@PathParam("id") String id) {
-        ResponseStore.Entry entry = stored(id);
+    public Response delete(@PathParam("id") String id, @QueryParam("model") String model,
+                           @QueryParam("autoload") String autoload) {
+        return deleteOf(id, storedOn(id, model, autoload));
+    }
+
+    /** Test and manual wiring: the deletion from the wired service, without a model query. */
+    Response delete(String id) {
+        return deleteOf(id, service);
+    }
+
+    private static Response deleteOf(String id, EngineService service) {
+        ResponseStore.Entry entry = stored(id, service);
         entry.cancel();
         service.responses().remove(id);
         Map<String, Object> out = new LinkedHashMap<>();
@@ -147,8 +221,18 @@ public class ResponsesResource {
     @POST
     @Path("/v1/responses/{id}/cancel")
     @Produces(MediaType.APPLICATION_JSON)
-    public Response cancel(@PathParam("id") String id) {
-        ResponseStore.Entry entry = stored(id);
+    public Response cancel(@PathParam("id") String id, @QueryParam("model") String model,
+                           @QueryParam("autoload") String autoload) {
+        return cancelOf(id, storedOn(id, model, autoload));
+    }
+
+    /** Test and manual wiring: the cancellation on the wired service, without a model query. */
+    Response cancel(String id) {
+        return cancelOf(id, service);
+    }
+
+    private static Response cancelOf(String id, EngineService service) {
+        ResponseStore.Entry entry = stored(id, service);
         if (!entry.background()) {
             throw ServerJson.badRequest("Cannot cancel a synchronous response.");
         }
@@ -167,13 +251,16 @@ public class ResponsesResource {
 
     // ------------------------------------------------------------------ create
 
-    private Response createOf(JsonView body) {
+    private Response createOf(JsonView body, EngineService service) {
         if (body.has("conversation")) {
             throw ServerJson.badRequest("'conversation' is not supported; continue a response with"
                     + " previous_response_id");
         }
         if (body.has("prompt")) {
             throw ServerJson.badRequest("'prompt' (a stored prompt template) is not supported");
+        }
+        if (OpenAiRequests.beamSearch(body)) {
+            throw ServerJson.badRequest("use_beam_search is not supported by the Responses API");
         }
         ResponseStore store = service.responses();
         boolean background = body.optBool("background", false);
@@ -182,7 +269,7 @@ public class ResponsesResource {
             throw ServerJson.badRequest("background responses need the response store: start the server with -D"
                     + ServerOptions.RESPONSE_STORE_PROPERTY + "=<count> and keep store true");
         }
-        Map<String, Object> chatBody = ResponsesRequests.chatBody(body, history(body));
+        Map<String, Object> chatBody = ResponsesRequests.chatBody(body, history(body, service));
         ChatPlan plan = ChatPlan.of(service, JsonView.of(chatBody, "body"));
         String id = ResponsesEvents.newId("resp_");
         Map<String, Object> head = ResponsesEvents.head(body, id, plan.model(), System.currentTimeMillis() / 1000,
@@ -190,14 +277,14 @@ public class ResponsesResource {
         ResponsesRun run = new ResponsesRun(plan, head, new OpenAiBodies(service, plan.top(), plan.model()),
                 ResponsesRequests.wantsLogprobs(body), messages(chatBody));
         List<Object> inputItems = ResponsesPages.withIds(ResponsesRequests.inputItems(body));
-        GenerationBatch batch = GenerationBatch.start(service, plan.jobs(1), background ? null : http);
+        GenerationBatch batch = GenerationBatch.start(service, plan.jobs(), background ? null : http, id);
         if (background) {
-            return background(batch, run, id, head, inputItems, body.optBool("stream", false));
+            return background(batch, run, service, id, head, inputItems, body.optBool("stream", false));
         }
         if (body.optBool("stream", false)) {
             StreamingOutput out = o -> {
                 Map<String, Object> done = run.stream(batch, (type, data) -> ServerJson.event(o, type, data));
-                keep(stored, id, inputItems, done, run);
+                keep(stored, id, inputItems, done, run, service);
             };
             return Response.ok(out).type("text/event-stream").build();
         }
@@ -206,22 +293,25 @@ public class ResponsesResource {
             batch.result(0);
         }
         Map<String, Object> done = run.collect(batch);
-        keep(stored, id, inputItems, done, run);
+        keep(stored, id, inputItems, done, run, service);
         return Response.ok(ServerJson.write(done)).build();
     }
 
     /** Starts the detached generation of a background response; answers it queued, or its event stream. */
-    private Response background(GenerationBatch batch, ResponsesRun run, String id, Map<String, Object> head,
-                                List<Object> inputItems, boolean streamed) {
+    private Response background(GenerationBatch batch, ResponsesRun run, EngineService service, String id,
+                                Map<String, Object> head, List<Object> inputItems, boolean streamed) {
         ResponseStore.Entry entry = new ResponseStore.Entry(id, inputItems, ResponsesEvents.pending(head, "queued"),
                 batch);
         service.responses().put(entry);
+        // the queued answer is rendered before the generation starts: the detached run flips the stored state to
+        // in_progress as soon as it opens the response, and the create answer reports the queued state it started in
+        String queued = ServerJson.write(entry.response());
         Thread.ofVirtual().name("response-" + id).start(() -> runDetached(batch, run, entry, head));
         if (streamed) {
             StreamingOutput out = o -> replay(entry, -1, o);
             return Response.ok(out).type("text/event-stream").build();
         }
-        return Response.ok(ServerJson.write(entry.response())).build();
+        return Response.ok(queued).build();
     }
 
     /**
@@ -245,8 +335,8 @@ public class ResponsesResource {
     }
 
     /** Stores a finished response when the request asked for it. */
-    private void keep(boolean stored, String id, List<Object> inputItems, Map<String, Object> done,
-                      ResponsesRun run) {
+    private static void keep(boolean stored, String id, List<Object> inputItems, Map<String, Object> done,
+                             ResponsesRun run, EngineService service) {
         if (!stored) {
             return;
         }
@@ -256,7 +346,7 @@ public class ResponsesResource {
     }
 
     /** The conversation {@code previous_response_id} continues, or an empty list. */
-    private List<Map<String, Object>> history(JsonView body) {
+    private static List<Map<String, Object>> history(JsonView body, EngineService service) {
         Object prev = body.raw("previous_response_id");
         if (prev == null) {
             return List.of();
@@ -268,7 +358,7 @@ public class ResponsesResource {
             throw ServerJson.badRequest("previous_response_id needs the response store: start the server with -D"
                     + ServerOptions.RESPONSE_STORE_PROPERTY + "=<count>");
         }
-        ResponseStore.Entry entry = stored(id);
+        ResponseStore.Entry entry = stored(id, service);
         List<Map<String, Object>> conversation = entry.conversation();
         if (conversation == null) {
             throw ServerJson.badRequest("Response '" + id + "' is still in progress");
@@ -276,7 +366,7 @@ public class ResponsesResource {
         return conversation;
     }
 
-    private ResponseStore.Entry stored(String id) {
+    private static ResponseStore.Entry stored(String id, EngineService service) {
         ResponseStore.Entry entry = service.responses().get(id);
         if (entry == null) {
             throw ServerJson.error(404, "Response with id '" + id + "' not found.", "invalid_request_error");

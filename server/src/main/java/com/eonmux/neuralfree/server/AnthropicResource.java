@@ -1,13 +1,19 @@
 package com.eonmux.neuralfree.server;
 
 import com.eonmux.neuralfree.gguf.chat.ChatRequest;
+import com.eonmux.neuralfree.gguf.chat.OutputGates;
+import com.eonmux.neuralfree.gguf.chat.ParallelToolCalls;
+import com.eonmux.neuralfree.gguf.chat.response.BeamGrammar;
 import com.eonmux.neuralfree.gguf.chat.tools.ToolCall;
 import com.eonmux.neuralfree.gguf.chat.tools.ToolOutput;
 import com.eonmux.neuralfree.gguf.chat.tools.ToolParse;
 import com.eonmux.neuralfree.gguf.chat.tools.ToolRouting;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
+import com.eonmux.neuralfree.gguf.engine.MediaPrompt;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
+import com.eonmux.neuralfree.gguf.engine.lora.LoraSlotKey;
+import com.eonmux.neuralfree.gguf.grammar.ConstraintSpec;
 import com.eonmux.neuralfree.utils.json.Json;
 import com.eonmux.neuralfree.utils.json.JsonView;
 import io.vertx.core.http.HttpServerRequest;
@@ -28,6 +34,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
 
 /**
  * The Anthropic Messages API ({@code POST /v1/messages}, llama.cpp's {@code post_anthropic_messages}): the body
@@ -36,8 +43,15 @@ import java.util.concurrent.ThreadLocalRandom;
  * {@code top_p}, {@code top_k} and {@code stop_sequences} onto the engine, and the answer is the Anthropic message:
  * {@code thinking}, {@code text} and {@code tool_use} content blocks, {@code stop_reason} ({@code end_turn},
  * {@code max_tokens}, {@code stop_sequence} with the matched sequence, {@code tool_use}) and the token counts.
- * With {@code stream: true} the stream carries Anthropic's event sequence ({@link AnthropicStream}).
- * {@code POST /v1/messages/count_tokens} returns the rendered prompt's token count.
+ * The usage splits the prompt as Anthropic does: {@code cache_read_input_tokens} are the prompt rows the prefix
+ * cache served (the OpenAI routes' {@code prompt_tokens_details.cached_tokens}), {@code input_tokens} the rest, and
+ * {@code cache_creation_input_tokens} is 0 — the cache stores every computed prefix itself, with no explicit
+ * {@code cache_control} write. With {@code stream: true} the stream carries Anthropic's event sequence
+ * ({@link AnthropicStream}), its {@code message_start} written once the prompt is evaluated so its usage holds the
+ * cached count, and {@code message_delta} carrying the final usage.
+ * {@code POST /v1/messages/count_tokens} returns the rendered prompt's token count, the rows of its images
+ * included. Image blocks ({@code base64} and {@code url} sources) reach the projector as image parts, and a
+ * repeated image's rows read back from the prefix cache like text.
  */
 @Path("/")
 public class AnthropicResource {
@@ -51,9 +65,25 @@ public class AnthropicResource {
     @Inject
     HttpServerRequest http;
 
+    /** The multi-model router; null in manual wiring, where requests serve on {@code service} directly. */
+    @Inject
+    ModelRouter router;
+
     /** Test and manual wiring: builds the resource over an explicit service. */
     public AnthropicResource(EngineService service) {
+        this(service, null);
+    }
+
+    /** Test and manual wiring over an explicit service and router. */
+    public AnthropicResource(EngineService service, ModelRouter router) {
+        this(service, router, null);
+    }
+
+    /** A resource over an explicit service, router and request, so a delegated stream cancels on disconnect. */
+    public AnthropicResource(EngineService service, ModelRouter router, HttpServerRequest http) {
         this.service = service;
+        this.router = router;
+        this.http = http;
     }
 
     public AnthropicResource() {
@@ -64,8 +94,10 @@ public class AnthropicResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response messages(String bodyText) {
-        ServerJson.requireLoaded(service);
-        return OpenAiResource.mapped(() -> messagesOf(ServerJson.parse(bodyText)));
+        JsonView body = ServerJson.parse(bodyText);
+        EngineService target = ModelRouter.target(router, service, body, null);
+        ServerJson.requireLoaded(target);
+        return OpenAiResource.mapped(() -> messagesOf(target, body));
     }
 
     @POST
@@ -73,32 +105,59 @@ public class AnthropicResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response countTokens(String bodyText) {
-        ServerJson.requireLoaded(service);
+        JsonView body = ServerJson.parse(bodyText);
+        EngineService target = ModelRouter.target(router, service, body, null);
+        ServerJson.requireLoaded(target);
         return OpenAiResource.mapped(() -> {
-            ChatRequest chat = AnthropicRequests.chat(ServerJson.parse(bodyText));
-            int[] prompt = service.encode(service.formatChat(chat), false, true);
-            return Response.ok(ServerJson.write(Map.of("input_tokens", prompt.length))).build();
+            ChatRequest chat = AnthropicRequests.chat(body, target.options());
+            Supplier<LoraSlotKey> mediaLoras = ChatPlan.mediaLoras(target,
+                    target.loras().selection(body, target.loras().model(body)));
+            return Response.ok(ServerJson.write(Map.of("input_tokens",
+                            OpenAiResource.promptRows(target, chat, mediaLoras))))
+                    .build();
         });
     }
 
-    private Response messagesOf(JsonView body) {
-        String model = service.served().resolve(body);
-        ChatRequest chat = AnthropicRequests.chat(body);
-        GenerationRequest request = AnthropicRequests.request(body);
-        String rendered = service.formatChat(chat);
-        ToolRouting routing = service.toolRouting(chat, rendered, AnthropicRequests.parallelToolCalls(body));
+    private Response messagesOf(EngineService service, JsonView body) {
+        String model = service.loras().model(body);
+        ChatRequest chat = AnthropicRequests.chat(body, service.options());
+        GenerationRequest request = service.loras().apply(body, model,
+                AnthropicRequests.request(body, service.logitsProcessors(), service.options().watermark()));
+        Supplier<LoraSlotKey> mediaLoras = ChatPlan.mediaLoras(service, request.lora());
+        List<ChatMedia.Item> items = ChatPlan.mediaItems(service, chat, mediaLoras);
+        String rendered = service.formatChat(chat, !items.isEmpty());
+        ReasoningFilter reasoning = ReasoningFormats.forChat(service.reasoning(), chat);
+        // the explicit disable_parallel_tool_use alone refuses a guarantee; the template's one-call default
+        // (llama.cpp server-common.cpp:1447) still keeps the parsers to the first call
+        ParallelToolCalls parallelToolCalls = ParallelToolCalls.of(AnthropicRequests.parallelToolCalls(body),
+                service.defaultParallelToolCalls(chat));
+        ToolRouting routing = service.toolRouting(chat, rendered, parallelToolCalls, reasoning);
+        ConstraintSpec constraint = routing.constraint();
+        // another tool format's forcing grammar holds the output itself
+        BeamGrammar beam = constraint != null ? null : ChatPlan.beamGrammar(service, chat, rendered,
+                parallelToolCalls, null, reasoning, true);
+        if (beam != null) {
+            constraint = beam.fromMessageStart() ? beam.constraint() : beam.constraint()
+                    .withGate(OutputGates.forChat(reasoning, rendered, service.chatTemplate()));
+        }
         int[] prompt = service.encode(rendered, false, true);
+        MediaPrompt media = items.isEmpty() ? null
+                : ChatPlan.mediaPrompt(service, chat, rendered, items, mediaLoras);
+        int promptRows = media == null ? prompt.length : media.nTokens();
+        GenerationBatch.Job job = media == null
+                ? ChatPlan.textJob(service, chat, prompt, request, rendered, constraint, reasoning)
+                : GenerationBatch.Job.ofMedia(media, request, rendered, constraint, reasoning);
         ToolOutput tools = routing.newOutput(AnthropicResource::toolUseId);
         String id = "msg_" + System.nanoTime();
         boolean streamed = body.optBool("stream", false);
         GenerationBatch batch = GenerationBatch.start(service,
-                List.of(new GenerationBatch.Job(prompt, request, rendered, routing.constraint())), http);
+                List.of(job), http, id);
         if (streamed) {
-            StreamingOutput stream = out -> stream(out, batch, tools, id, model, prompt.length);
+            StreamingOutput stream = out -> stream(out, batch, tools, id, model, promptRows);
             return Response.ok(stream).type("text/event-stream").build();
         }
         batch.awaitAll();
-        ChatChoice choice = new ChatChoice(tools);
+        ChatChoice choice = new ChatChoice(tools, true);
         try {
             GenerationBatch.Event e;
             while ((e = batch.next(0)) != null) {
@@ -109,12 +168,28 @@ public class AnthropicResource {
             throw ServerJson.error(503, "request interrupted", "unavailable_error");
         }
         GenerationResult result = batch.result(0);
-        return Response.ok(ServerJson.write(messageBody(id, model, result, choice.reasoning(), choice.finish())))
-                .build();
+        Map<String, Object> usage = usage(promptRows, batch.cachedTokens(0), result.timings().generatedTokens());
+        return Response.ok(ServerJson.write(messageBody(id, model, result, choice.messageReasoning(), choice.finish(),
+                usage, batch.kvTransferParams(0)))).build();
+    }
+
+    /**
+     * Anthropic's usage over a prompt of {@code promptTokens} rows (tokens and media rows), {@code cached} of them
+     * served by the prefix cache: {@code input_tokens} the uncached rest, {@code cache_creation_input_tokens} 0 (no explicit cache
+     * write), {@code cache_read_input_tokens} the cached ones, and the generated {@code output_tokens}.
+     */
+    static Map<String, Object> usage(int promptTokens, long cached, int outputTokens) {
+        Map<String, Object> usage = new LinkedHashMap<>();
+        usage.put("input_tokens", Math.max(0, promptTokens - cached));
+        usage.put("cache_creation_input_tokens", 0);
+        usage.put("cache_read_input_tokens", cached);
+        usage.put("output_tokens", outputTokens);
+        return usage;
     }
 
     private Map<String, Object> messageBody(String id, String model, GenerationResult result, String reasoning,
-                                            ToolParse parse) {
+                                            ToolParse parse, Map<String, Object> usage,
+                                            Map<String, Object> kvTransfer) {
         List<Object> content = new ArrayList<>();
         if (!reasoning.isEmpty()) {
             Map<String, Object> thinking = new LinkedHashMap<>();
@@ -146,24 +221,33 @@ public class AnthropicResource {
         String stop = stopReason(result, !parse.calls().isEmpty());
         out.put("stop_reason", stop);
         out.put("stop_sequence", "stop_sequence".equals(stop) ? result.stopString() : null);
-        Map<String, Object> usage = new LinkedHashMap<>();
-        usage.put("input_tokens", result.timings().promptTokens());
-        usage.put("output_tokens", result.timings().generatedTokens());
-        usage.put("cache_read_input_tokens", 0);
         out.put("usage", usage);
+        if (kvTransfer != null) {
+            out.put("kv_transfer_params", kvTransfer);
+        }
         return out;
     }
 
+    /**
+     * Writes the message's event stream: {@code message_start} with the first generation event (the prompt is
+     * evaluated by then, so its usage holds the cached count), the content blocks, then {@code message_delta}
+     * with the stop reason, the final usage and a disaggregated transfer's {@code kv_transfer_params}, and
+     * {@code message_stop}.
+     */
     private void stream(OutputStream out, GenerationBatch batch, ToolOutput tools, String id, String model,
-                        int inputTokens) throws IOException {
+                        int promptTokens) throws IOException {
         try {
-            ServerJson.event(out, "message_start", Map.of("type", "message_start", "message",
-                    startMessage(id, model, inputTokens)));
             AnthropicStream blocks = new AnthropicStream(out);
+            boolean started = false;
             while (true) {
                 GenerationBatch.Event event = batch.next(50);
                 if (event == null) {
                     continue;
+                }
+                if (!started) {
+                    ServerJson.event(out, "message_start", Map.of("type", "message_start", "message",
+                            startMessage(id, model, usage(promptTokens, batch.cachedTokens(0), 0))));
+                    started = true;
                 }
                 if (event instanceof GenerationBatch.Done) {
                     break;
@@ -186,7 +270,11 @@ public class AnthropicResource {
             Map<String, Object> messageDelta = new LinkedHashMap<>();
             messageDelta.put("type", "message_delta");
             messageDelta.put("delta", delta);
-            messageDelta.put("usage", Map.of("output_tokens", result.timings().generatedTokens()));
+            messageDelta.put("usage", usage(promptTokens, batch.cachedTokens(0), result.timings().generatedTokens()));
+            Map<String, Object> transfer = batch.kvTransferParams(0);
+            if (transfer != null) {
+                messageDelta.put("kv_transfer_params", transfer);
+            }
             ServerJson.event(out, "message_delta", messageDelta);
             ServerJson.event(out, "message_stop", Map.of("type", "message_stop"));
         } catch (UncheckedIOException e) {
@@ -221,7 +309,7 @@ public class AnthropicResource {
         }
     }
 
-    private Map<String, Object> startMessage(String id, String model, int inputTokens) {
+    private Map<String, Object> startMessage(String id, String model, Map<String, Object> usage) {
         Map<String, Object> message = new LinkedHashMap<>();
         message.put("id", id);
         message.put("type", "message");
@@ -230,9 +318,6 @@ public class AnthropicResource {
         message.put("model", model);
         message.put("stop_reason", null);
         message.put("stop_sequence", null);
-        Map<String, Object> usage = new LinkedHashMap<>();
-        usage.put("input_tokens", inputTokens);
-        usage.put("output_tokens", 0);
         message.put("usage", usage);
         return message;
     }

@@ -61,29 +61,31 @@ public class VkComputeBackendIntegrationTest {
         ComputeQueue transferQueue = backend.transferQueue();
         ComputeQueue computeQueue = backend.computeQueue();
 
-        GpuEvent writeEvent = transferQueue.enqueueWriteBuffer(buffer, 0, bufferSize, data);
-        assertNotNull("Write event should not be null", writeEvent);
-
         Object[] kernelArgs = new Object[]{buffer, size};
         int blockSize = 256;
         int gridSize = (size + blockSize - 1) / blockSize;
-        GpuEvent kernelEvent = computeQueue.enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, kernelArgs, writeEvent);
-        assertNotNull("Kernel event should not be null", kernelEvent);
 
         float[] result = new float[size];
-        GpuEvent readEvent = computeQueue.enqueueReadBuffer(buffer, 0, bufferSize, result, kernelEvent);
-        assertNotNull("Read event should not be null", readEvent);
 
-        try {
-            readEvent.awaitCompletion();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            fail("Test interrupted");
-            return;
-        }
+        try (GpuEvent writeEvent = transferQueue.enqueueWriteBuffer(buffer, 0, bufferSize, data);
+             GpuEvent kernelEvent = computeQueue.enqueueKernel(
+                     kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, kernelArgs, writeEvent);
+             GpuEvent readEvent = computeQueue.enqueueReadBuffer(buffer, 0, bufferSize, result, kernelEvent)) {
+            assertNotNull("Write event should not be null", writeEvent);
+            assertNotNull("Kernel event should not be null", kernelEvent);
+            assertNotNull("Read event should not be null", readEvent);
 
-        for (int i = 0; i < Math.min(20, size); i++) {
-            assertEquals("Result mismatch at index " + i, expected[i], result[i], 1e-4f);
+            try {
+                readEvent.awaitCompletion();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("Test interrupted");
+                return;
+            }
+
+            for (int i = 0; i < Math.min(20, size); i++) {
+                assertEquals("Result mismatch at index " + i, expected[i], result[i], 1e-4f);
+            }
         }
 
         buffer.close();
@@ -122,18 +124,18 @@ public class VkComputeBackendIntegrationTest {
         }
 
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
-        computeQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        computeQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         computeQueue.finish();
 
         KernelHandle kernel = backend.compileKernel("increment", "shaders/test/increment.spv", null);
         Object[] args = new Object[]{buffer, size};
         int blockSize = 32;
         int gridSize = (size + blockSize - 1) / blockSize;
-        computeQueue.enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        computeQueue.enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         computeQueue.finish();
 
         float[] result = new float[size];
-        computeQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+        computeQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result).close();
         computeQueue.finish();
 
         for (int i = 0; i < size; i++) {
@@ -157,11 +159,11 @@ public class VkComputeBackendIntegrationTest {
 
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, writeData);
+        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, writeData).close();
         transferQueue.finish();
 
         float[] readData = new float[size];
-        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, readData);
+        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, readData).close();
         transferQueue.finish();
 
         for (int i = 0; i < size; i++) {
@@ -189,18 +191,18 @@ public class VkComputeBackendIntegrationTest {
 
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         transferQueue.finish();
 
         KernelHandle kernel = backend.compileKernel("increment", "shaders/test/increment.spv", null);
         Object[] args = new Object[]{buffer, size};
         int blockSize = 32;
         int gridSize = (size + blockSize - 1) / blockSize;
-        computeQueue.enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        computeQueue.enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         computeQueue.finish();
 
         float[] result = new float[size];
-        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result).close();
         transferQueue.finish();
 
         for (int i = 0; i < size; i++) {
@@ -247,29 +249,28 @@ public class VkComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("increment", "shaders/test/increment.spv", null);
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        GpuEvent writeEvent = backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
-
-        assertNotNull("Write event should not be null", writeEvent);
-
         Object[] args = new Object[]{buffer, size};
         int blockSize = 64;
         int gridSize = (size + blockSize - 1) / blockSize;
-        GpuEvent kernelEvent = backend.computeQueue().enqueueKernel(
-                kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args, writeEvent);
 
         float[] result = new float[size];
-        GpuEvent readEvent = backend.computeQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result, kernelEvent);
 
-        try {
-            readEvent.awaitCompletion();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            fail("Test interrupted");
-            return;
-        }
+        try (GpuEvent writeEvent = backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+             GpuEvent kernelEvent = backend.computeQueue().enqueueKernel(
+                     kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args, writeEvent);
+             GpuEvent readEvent = backend.computeQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result, kernelEvent)) {
+            assertNotNull("Write event should not be null", writeEvent);
+            try {
+                readEvent.awaitCompletion();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("Test interrupted");
+                return;
+            }
 
-        for (int i = 0; i < Math.min(10, size); i++) {
-            assertEquals("Event-synced result mismatch at index " + i, data[i] + 1.0f, result[i], 1e-4f);
+            for (int i = 0; i < Math.min(10, size); i++) {
+                assertEquals("Event-synced result mismatch at index " + i, data[i] + 1.0f, result[i], 1e-4f);
+            }
         }
 
         buffer.close();
@@ -287,21 +288,21 @@ public class VkComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("increment", "shaders/test/increment.spv", null);
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         backend.transferQueue().finish();
 
         int blockSize = 32;
         int gridSize = (size + blockSize - 1) / blockSize;
         
         Object[] args = new Object[]{buffer, size};
-        backend.computeQueue().enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        backend.computeQueue().enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         backend.computeQueue().finish();
 
-        backend.computeQueue().enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        backend.computeQueue().enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         backend.computeQueue().finish();
 
         float[] result = new float[size];
-        backend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+        backend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result).close();
         backend.transferQueue().finish();
 
         float expected = 1.0f + 1.0f + 1.0f;
@@ -332,7 +333,7 @@ public class VkComputeBackendIntegrationTest {
         backend.close();
 
         float[] data = new float[256];
-        backend.computeQueue().enqueueWriteBuffer(buffer, 0, 1024, data);
+        backend.computeQueue().enqueueWriteBuffer(buffer, 0, 1024, data).close();
     }
 
     @Test
@@ -364,11 +365,11 @@ public class VkComputeBackendIntegrationTest {
             data[i] = i % 100;
         }
 
-        backend.transferQueue().enqueueWriteBuffer(buffer, 0, bufferSize, data);
+        backend.transferQueue().enqueueWriteBuffer(buffer, 0, bufferSize, data).close();
         backend.transferQueue().finish();
 
         float[] result = new float[size];
-        backend.transferQueue().enqueueReadBuffer(buffer, 0, bufferSize, result);
+        backend.transferQueue().enqueueReadBuffer(buffer, 0, bufferSize, result).close();
         backend.transferQueue().finish();
 
         for (int i = 0; i < 100; i++) {
@@ -392,7 +393,7 @@ public class VkComputeBackendIntegrationTest {
             data[i] = i;
         }
 
-        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         backend.transferQueue().finish();
 
         buffer.close();

@@ -204,6 +204,16 @@ public class GgufWriterTest {
         return codes;
     }
 
+    /** The storage bytes of {@link #e4m3Codes(int)}. */
+    private static byte[] e4m3Bytes(int n) {
+        int[] codes = e4m3Codes(n);
+        byte[] b = new byte[codes.length];
+        for (int i = 0; i < b.length; i++) {
+            b[i] = (byte) codes[i];
+        }
+        return b;
+    }
+
     /** One F32 little-endian value. */
     private static int[] f32(float v) {
         int bits = Float.floatToRawIntBits(v);
@@ -338,6 +348,21 @@ public class GgufWriterTest {
     }
 
     @Test
+    public void aDeviceOnlyTensorIsRefusedByName() throws IOException {
+        TestHfSource src = new TestHfSource("synthetic://device-only");
+        src.kv(GgufKeys.GENERAL_ARCHITECTURE, GGUFValueType.STRING, "llama");
+        src.tensor("w", GGMLType.W12, new long[]{64}, new int[96]);
+        Path exported = out("device-only.gguf");
+        try {
+            GgufWriter.write(src, exported, new GgufWriter.Options(GgufWriter.Mode.NATIVE));
+            fail("a W12 tensor was written");
+        } catch (IllegalArgumentException e) {
+            assertEquals("tensor 'w' has type W12, a device-resident form that GGUF files never store",
+                    e.getMessage());
+        }
+    }
+
+    @Test
     public void optionsAlignmentIsWrittenWhenTheSourceHasNone() throws IOException {
         TestHfSource src = new TestHfSource("synthetic://no-alignment");
         src.kv(GgufKeys.GENERAL_ARCHITECTURE, GGUFValueType.STRING, "llama");
@@ -437,20 +462,17 @@ public class GgufWriterTest {
         GgufWriter.write(src, exported, new GgufWriter.Options(GgufWriter.Mode.COMPAT));
         try (GGUFFileParser parser = new GGUFFileParser(exported.toString())) {
             assertNull(parser.getValueType(GgufKeys.NF_EXTENSION_TYPES));
-            assertEquals(GGMLType.F16, parser.getTensor("blk.0.attn_q.weight").type());
+            // the F8_E4M3 codes pass through as llama.cpp's per-element F8_E4M3FN
+            assertEquals(GGMLType.F8_E4M3FN, parser.getTensor("blk.0.attn_q.weight").type());
             assertEquals(GGMLType.BF16, parser.getTensor("blk.1.attn_k.weight").type());
             assertEquals(GGMLType.Q8_0, parser.getTensor("blk.2.attn_v.weight").type());
             assertEquals(GGMLType.Q8_0, parser.getTensor("blk.3.attn_o.weight").type());
             assertEquals(GGMLType.F16, parser.getTensor("blk.4.attn_f.weight").type());
             assertEquals(GGMLType.F16, parser.getTensor("blk.5.attn_g.weight").type());
             assertEquals(GGMLType.F32, parser.getTensor("blk.0.attn_q.scale").type());
-            // the values of the exact F8_E4M3 → F16 row are the codes' values
-            byte[] f16Bytes = parser.readTensorData(parser.getTensor("blk.0.attn_q.weight"));
-            for (int i = 0; i < 32; i++) {
-                int h = (f16Bytes[2 * i] & 0xFF) | (f16Bytes[2 * i + 1] & 0xFF) << 8;
-                int code = (i % 30) + 0x08;
-                assertEquals("code " + code, FpBlockDecoders.fp32ToFp16(FpBlockDecoders.e4m3ToFp32(code)), h);
-            }
+            // the values of the pass-through row are the codes' bytes
+            assertArrayEquals(e4m3Bytes(32),
+                    parser.readTensorData(parser.getTensor("blk.0.attn_q.weight")));
             // the neuralfree.* keys stay, llama.cpp ignores them
             assertEquals("llama", parser.getString(GgufKeys.GENERAL_ARCHITECTURE));
             assertNotNull(parser.getValueType("neuralfree.hadamard.weight_names"));
@@ -483,7 +505,7 @@ public class GgufWriterTest {
             assertEquals(GGMLType.F32, parser.getTensor("blk.4.attn_f.weight").type());
             assertEquals(GGMLType.F32, parser.getTensor("blk.5.attn_g.weight").type());
             // the rows COMPAT keeps are still the COMPAT types
-            assertEquals(GGMLType.F16, parser.getTensor("blk.0.attn_q.weight").type());
+            assertEquals(GGMLType.F8_E4M3FN, parser.getTensor("blk.0.attn_q.weight").type());
             assertEquals(GGMLType.BF16, parser.getTensor("blk.1.attn_k.weight").type());
             // one lossy row exports as the exact floats of its blocks
             float[] v = parser.readTensorDataAsFloat(parser.getTensor("blk.3.attn_o.weight"));

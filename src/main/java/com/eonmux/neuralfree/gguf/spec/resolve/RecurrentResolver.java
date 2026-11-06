@@ -31,10 +31,19 @@ public final class RecurrentResolver {
 
     private final ModelHparams hp;
     private final TensorCatalog tc;
+    private final RopeResolver rope;
 
     public RecurrentResolver(ModelHparams hp, TensorCatalog tc) {
+        this(hp, tc, new RopeResolver(hp, tc, Math.max(1, hp.nCtxTrain())));
+    }
+
+    /**
+     * @param rope resolver of the lightning-attention rotary embedding
+     */
+    public RecurrentResolver(ModelHparams hp, TensorCatalog tc, RopeResolver rope) {
         this.hp = Objects.requireNonNull(hp, "hp");
         this.tc = Objects.requireNonNull(tc, "tc");
+        this.rope = Objects.requireNonNull(rope, "rope");
     }
 
     /** True when layer {@code il} runs a recurrent mixer. */
@@ -61,10 +70,13 @@ public final class RecurrentResolver {
             case NEMOTRON_H:
             case NEMOTRON_H_MOE:
                 return MixerKind.MAMBA2;
+            case ZAMBA2:
+                return MixerKind.ZAMBA2;
             case PLAMO2:
                 return MixerKind.PLAMO2_MAMBA;
             case LFM2:
             case LFM2MOE:
+            case LFM3:
                 return hp.causal() ? MixerKind.SHORTCONV : MixerKind.SHORTCONV_CENTERED;
             case RWKV6:
                 return MixerKind.RWKV6;
@@ -77,14 +89,17 @@ public final class RecurrentResolver {
             case QWEN35:
             case QWEN35MOE:
             case QWEN4EXP:
+            case OLMO_HYBRID:
             case CLEF:
                 return MixerKind.GDN;
             case KIMI_LINEAR:
             case KIMI_K3:
+            case ALICE_AI:
             case BAILINGMOE3:
             case GLM5_NEXT:
                 return MixerKind.KDA;
             case MINIMAX_01:
+            case BAILINGMOE_V25:
                 return MixerKind.LIGHTNING;
             default:
                 throw new IllegalStateException(arch() + ": architecture has no recurrent mixer");
@@ -109,6 +124,7 @@ public final class RecurrentResolver {
                 mamba1(b, il);
                 break;
             case MAMBA2:
+            case ZAMBA2:
                 mamba2(b, il);
                 break;
             case PLAMO2_MAMBA:
@@ -138,6 +154,29 @@ public final class RecurrentResolver {
         }
         RecurrentSpec spec = b.build();
         checkStateRows(spec, il);
+        return spec;
+    }
+
+    /**
+     * Inkling's packed convolutions of layer {@code il}: the K and V streams over the layer's KV heads and head dim
+     * (SWA-aware) and the attention-output and MLP-output streams over {@code n_embd}, each over
+     * {@code sconv_kernel_size - 1} steps.
+     */
+    public RecurrentSpec resolveInkling(int il) {
+        checkLayer(il);
+        if (hp.arch() != Arch.INKLING) {
+            throw new IllegalArgumentException(arch() + " has no Inkling convolutions");
+        }
+        RecurrentSpec spec = RecurrentSpec.builder(MixerKind.INKLING)
+                .nEmbd(hp.nEmbd())
+                .nHead(hp.nHeadKv(il))
+                .headDim(hp.headK(il))
+                .dConv(hp.inklingSconvKernel())
+                .build();
+        if (spec.convStateFloats() != hp.inklingConvStateFloats(il)) {
+            throw new IllegalStateException(arch() + ": layer " + il + " conv state holds " + spec.convStateFloats()
+                    + " floats but the hparams size it at " + hp.inklingConvStateFloats(il));
+        }
         return spec;
     }
 
@@ -188,7 +227,9 @@ public final class RecurrentResolver {
      * {@code ssm.state_size}, V head dim {@code ssm.inner_size / V heads} (qwen3next.cpp:505-515,
      * qwen35.cpp:355-360). The head map comes from the hparams hook (qwen3next GROUPED, qwen35 TILED; ADD A4).
      * Qwen3-Next checkpoints without {@code attn_qkv} project through the legacy {@code ssm_in}
-     * (qwen3next.cpp:85-87, 322-334); {@code ssm_ba} fuses the beta/alpha projections.
+     * (qwen3next.cpp:85-87, 322-334); {@code ssm_ba} fuses the beta/alpha projections. Qwen4-Exp reads the
+     * merged {@code attn_qkv_gate} / {@code ssm_beta_alpha} weights when they are present (qwen4exp.cpp:272-274,
+     * 1124-1138) and the separate ones otherwise.
      */
     private void gdn(RecurrentSpec.Builder b, int il) {
         int nK = hp.ssmNGroup();
@@ -197,24 +238,34 @@ public final class RecurrentResolver {
         if (map == null) {
             throw new IllegalStateException(arch() + ": gated DeltaNet needs a head map from the hparams");
         }
+        boolean mergedQkvGate = tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_QKV_GATE));
         boolean legacy = false;
-        if (!tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_QKV))) {
+        if (!mergedQkvGate && !tc.hasLayer(il, TensorNames.weight(TensorNames.ATTN_QKV))) {
             if (hp.arch() != Arch.QWEN3NEXT) {
                 tc.require(il, TensorNames.weight(TensorNames.ATTN_QKV));
             }
             tc.require(il, TensorNames.weight(TensorNames.SSM_IN));
             legacy = true;
         }
+        boolean concatBetaAlpha = tc.hasLayer(il, TensorNames.weight(TensorNames.SSM_BETA_ALPHA_CAT));
+        boolean fusedBetaAlpha = tc.hasLayer(il, TensorNames.weight(TensorNames.SSM_BETA_ALPHA));
+        if (fusedBetaAlpha && concatBetaAlpha) {
+            throw new IllegalStateException(arch() + ": layer " + il + " carries both ssm_ba and ssm_beta_alpha");
+        }
         b.dConv(hp.ssmDConv())
                 .gdnHeads(nK, nV, hp.ssmDState(), divide(hp.ssmDInner(), nV, "ssm.inner_size", "V heads"))
                 .headMap(map)
-                .fusedBetaAlpha(tc.hasLayer(il, TensorNames.weight(TensorNames.SSM_BETA_ALPHA)))
+                .fusedBetaAlpha(fusedBetaAlpha)
+                .concatBetaAlpha(concatBetaAlpha)
+                .mergedQkvGate(mergedQkvGate)
+                .betaScale(hp.ssmBetaScale())
                 .legacySsmIn(legacy);
     }
 
     /**
-     * Kimi delta attention: the decay gate is {@code softplus} for kimi-linear
-     * (kimi-linear.cpp), {@code lb * sigmoid(-(a (f + dt_b)))} for kimi-k3 / glm5-next with a finite lower bound
+     * Kimi delta attention: the decay gate is {@code softplus} for kimi-linear and alice-ai
+     * (kimi-linear.cpp, vLLM alice_ai.py), {@code lb * sigmoid(-(a (f + dt_b)))} for kimi-k3 / glm5-next with a finite
+     * lower bound
      * (kimi-k3.cpp:418-436) and {@code lb * sigmoid(a (f + dt_b))} for bailingmoe3 (bailingmoe3.cpp:270-276). The
      * gate projection form comes from the hparams: low-rank {@code ssm_g_a . ssm_g_b}, full {@code ssm_g}, or full
      * {@code ssm_g_a}.
@@ -239,13 +290,14 @@ public final class RecurrentResolver {
                 throw new IllegalStateException(arch() + ": unhandled KDA gate mode " + mode);
         }
         float lb = hp.kdaGateLowerBound();
-        b.nHead(hp.nHead(0)).headDim(hp.kdaHeadDim()).dConv(hp.ssmDConv()).kdaGateMode(mode)
+        b.nHead(hp.nHead(il)).headDim(hp.kdaHeadDim()).dConv(hp.ssmDConv()).kdaGateMode(mode)
                 .decayGate(decayGate(lb)).safeGate(hp.kdaSafeGate()).gateLowerBound(lb);
     }
 
     private RecurrentSpec.DecayGate decayGate(float lb) {
         switch (hp.arch()) {
             case KIMI_LINEAR:
+            case ALICE_AI:
                 return RecurrentSpec.DecayGate.SOFTPLUS;
             case KIMI_K3:
             case GLM5_NEXT:
@@ -257,15 +309,30 @@ public final class RecurrentResolver {
         }
     }
 
-    /** Lightning attention: per-head slopes {@code base[h] * (1 - il / (n_layer - 1) + 1e-5)} (minimax-01.cpp:98-103, 288). */
+    /**
+     * Lightning attention: per-head slopes {@code base[h] * (1 - il / (n_layer - 1) + 1e-5)}
+     * (minimax-01.cpp:98-103, 288; vLLM {@code MiniMaxText01LinearAttention._build_slope_tensor}). The MiniMax
+     * graph squares its fused Q/K/V through SiLU and rotates nothing; Bailing MoE V2.5 takes the SiLU, the per-head
+     * Q/K norms, the NEOX rotation and the {@code head_size^-0.5} Q scale from its metadata
+     * (vLLM {@code BailingMoELinearAttention}).
+     */
     private void lightning(RecurrentSpec.Builder b, int il) {
-        float[] base = HybridHooksLightning.lightningSlopes(hp);
-        float scale = HybridHooksLightning.lightningSlopeScale(hp, il);
+        boolean bailing = hp.arch() == Arch.BAILINGMOE_V25;
+        float[] base = bailing ? HybridHooksLightning.bailingSlopes(hp)
+                : HybridHooksLightning.lightningSlopes(hp);
+        float scale = bailing ? HybridHooksLightning.bailingSlopeScale(hp, il)
+                : HybridHooksLightning.lightningSlopeScale(hp, il);
         float[] slopes = new float[base.length];
         for (int h = 0; h < base.length; h++) {
             slopes[h] = base[h] * scale;
         }
-        b.nHead(hp.nHead(0)).headDim(hp.headLinearAttn()).slopes(slopes);
+        int headDim = hp.headLinearAttn();
+        b.nHead(hp.nHead(0)).headDim(headDim).slopes(slopes)
+                .linearSilu(hp.ssmLinearSilu())
+                .qkNorm(hp.ssmQkNorm())
+                .nNormGroups(hp.ssmGroupNormSize())
+                .qScale(hp.ssmQScale() ? 1.0f / (float) Math.sqrt(headDim) : 0f)
+                .rope(rope.linearAttention(il, hp.ssmRopeDims()));
     }
 
     private void checkStateRows(RecurrentSpec spec, int il) {

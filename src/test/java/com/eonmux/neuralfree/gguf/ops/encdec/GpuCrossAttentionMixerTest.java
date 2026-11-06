@@ -297,10 +297,10 @@ public class GpuCrossAttentionMixerTest {
         assertEquals(DIM, cross.intArg(AttnKernels.ARG_FD_K_ROW_STRIDE));
         assertEquals(HEAD_DIM, cross.intArg(AttnKernels.ARG_FD_K_HEAD_STRIDE));
         assertEquals(1.0f, cross.floatArg(AttnKernels.ARG_FD_SCALE), 0.0f);
-        assertEquals(0, cross.intArg(AttnKernels.ARG_FD_CAUSAL));
+        assertEquals(0, cross.intArg(AttnKernels.ARG_FD_FLAGS)
+                & (AttnKernels.FLAG_CAUSAL | AttnKernels.FLAG_SINKS));
         assertEquals(BiasMode.NONE.code(), cross.intArg(AttnKernels.ARG_FD_BIAS_MODE));
-        assertEquals(0, cross.intArg(AttnKernels.ARG_FD_HAS_SINKS));
-        assertEquals(nSplit == 1 ? 1 : 0, cross.intArg(AttnKernels.ARG_FD_DIRECT_OUT));
+        assertEquals(nSplit == 1 ? AttnKernels.FLAG_DIRECT : 0, cross.intArg(AttnKernels.ARG_FD_FLAGS));
         assertSame(slot(ScratchSlots.Q).buffer(), cross.bufferArg(AttnKernels.ARG_FD_BUF_Q));
         assertSame(crossKv.k(), cross.bufferArg(AttnKernels.ARG_FD_BUF_K));
         assertSame(crossKv.v(), cross.bufferArg(AttnKernels.ARG_FD_BUF_V));
@@ -335,7 +335,7 @@ public class GpuCrossAttentionMixerTest {
             assertEquals(N_ENC, cross.intArg(AttnKernels.ARG_FA_KV_END));
             assertEquals(DIM, cross.intArg(AttnKernels.ARG_FA_Q_ROW_STRIDE));
             assertEquals(DIM, cross.intArg(AttnKernels.ARG_FA_OUT_ROW_STRIDE));
-            assertEquals(0, cross.intArg(AttnKernels.ARG_FA_CAUSAL));
+            assertEquals(AttnKernels.FLAG_DIRECT, cross.intArg(AttnKernels.ARG_FA_FLAGS));
             assertEquals(BiasMode.NONE.code(), cross.intArg(AttnKernels.ARG_FA_BIAS_MODE));
             assertSame(steps().qPos(), cross.bufferArg(AttnKernels.ARG_FA_BUF_Q_POS));
             assertSame(steps().identityRows(), cross.bufferArg(AttnKernels.ARG_FA_BUF_KV_POS));
@@ -403,7 +403,7 @@ public class GpuCrossAttentionMixerTest {
         assertSame(cross.k(), fd.bufferArg(AttnKernels.ARG_FD_BUF_K));
         assertSame(cross.v(), fd.bufferArg(AttnKernels.ARG_FD_BUF_V));
         assertEquals(N_ENC, fd.intArg(AttnKernels.ARG_FD_KV_END));
-        assertEquals(0, fd.intArg(AttnKernels.ARG_FD_CAUSAL));
+        assertEquals(0, fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_CAUSAL);
         assertEquals(cross.rotation().rotateV() ? 1 : 0, named(ds, HadamardSpec.KERNEL).size());
     }
 

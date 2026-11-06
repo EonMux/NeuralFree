@@ -7,8 +7,10 @@ package com.eonmux.neuralfree.gguf.engine.draft;
  * the marginal probability that the first {@code i + 1} draft tokens are all accepted; the round then accepts
  * position {@code i} with the conditional rate {@code rates[i]/rates[i-1]} (one uniform per position, in position
  * order). A rejection at position {@code i} — or the bonus after a fully accepted block — emits the same token the
- * target chain itself sampled, so every emitted token stays a draw from the processed target distribution; the
- * rates only fake the speed-up. The mode changes no emission law: it is for throughput benchmarking with
+ * target chain itself sampled; the rates only fake the speed-up. A draft token the target chain excludes at its
+ * row (a {@code -inf} processed logit: a grammar mask, a ban, bad words, min-tokens, a truncation) is rejected
+ * whatever its uniform, so the output stays one the request's chain admits (vLLM trims the proposal to its
+ * grammar-valid prefix before verification). The mode changes no emission law: it is for throughput benchmarking with
  * calibrated acceptance rates, and {@code SpeculativeDecoder} refuses it unless
  * {@code neuralfree.spec.synthetic=true}.
  */
@@ -78,7 +80,8 @@ public final class SyntheticVerifier implements Verifier {
                 conditional = 1.0; // monotone rates keep this at 1.0; rounding may not
             }
             double u = round.uniform();
-            if (u <= conditional) {
+            Distribution p = round.target(i);
+            if (u <= conditional && p.logitOf(round.draftToken(i)) != Float.NEGATIVE_INFINITY) {
                 if (round.confirm(i) != null) {
                     return;
                 }
@@ -86,7 +89,7 @@ public final class SyntheticVerifier implements Verifier {
                 continue;
             }
             // the acceptance decision was synthetic: the replacement is a plain target draw.
-            if (round.emit(round.target(i).selectedToken()) != null) {
+            if (round.emit(p.selectedToken()) != null) {
                 return;
             }
             return;

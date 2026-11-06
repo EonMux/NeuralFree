@@ -111,7 +111,7 @@ public class JsonStreamWriterTest {
         JsonStreamWriter w = new JsonStreamWriter(out, Json.Style.API);
         assertThrows(IllegalArgumentException.class, () -> w.value(Double.NaN));
         assertThrows(IllegalArgumentException.class, () -> w.value(Double.NEGATIVE_INFINITY));
-        assertEquals("NaN", Json.toString(map("a", Double.NaN), Json.Style.CANONICAL)); // constants keep it
+        assertEquals("{\"a\":NaN}", Json.toString(map("a", Double.NaN), Json.Style.CANONICAL)); // constants keep it
         assertEquals("Infinity", Json.toString(Double.POSITIVE_INFINITY, Json.Style.PYTHON_DEFAULT));
     }
 
@@ -147,8 +147,13 @@ public class JsonStreamWriterTest {
         noValue.beginObject();
         noValue.name("k");
         assertThrows(IllegalStateException.class, () -> noValue.name("k2"));
-        assertThrows(IllegalStateException.class, () -> noValue.beginArray());
         assertThrows(IllegalStateException.class, () -> noValue.endObject());
+        noValue.beginArray(); // a container is the pending member's value, as writesTheSameBytesAsWrite nests them
+        noValue.endArray();
+        noValue.endObject();
+        JsonStreamWriter containerNoName = writer();
+        containerNoName.beginObject();
+        assertThrows(IllegalStateException.class, () -> containerNoName.beginArray()); // name due
         JsonStreamWriter wrongClose = writer();
         wrongClose.beginObject();
         assertThrows(IllegalStateException.class, () -> wrongClose.endArray());

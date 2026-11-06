@@ -14,7 +14,8 @@ import java.util.Objects;
  * The conversion of NeuralFree extension tensors ({@link GGMLType#isExtension()}) to the llama.cpp types a
  * COMPAT export writes, and the streaming conversion of their bytes. The rules are those of the export:
  * <ul>
- *   <li>F8_E4M3 → F16, exact; the tensor's {@code .scale} sibling is a separate tensor and stays.</li>
+ *   <li>F8_E4M3 → F8_E4M3FN (llama.cpp {@code GGML_TYPE_F8_E4M3}), byte for byte: 32-code blocks concatenate to
+ *       the same per-element code run, and the tensor's {@code .scale} sibling is a separate tensor and stays.</li>
  *   <li>F8_E5M2 → F16, exact: an E5M2 code is the high byte of an IEEE half, so the decoded value
  *       round-trips the F16 bits of {@code code &lt;&lt; 8}; the {@code .scale} sibling stays.</li>
  *   <li>MXFP8 → BF16 when every block's E8M0 exponent satisfies {@code e ∈ [3, 246]}, so that
@@ -29,12 +30,13 @@ import java.util.Objects;
  *       {@code e ≤ 252} (E2M3: {@code 7.5 × 2^125}); a larger exponent overflows f32 on decode too, so
  *       the export fails with an {@link IOException} naming the tensor (the Nan exponent 0xFF is
  *       rejected at the load of the source). The exponent bytes are scanned once from the store.</li>
- *   <li>F8_E4M3_B128 and I8_B128 → Q8_0 (lossy: a per-32 requantization of a per-128 scale; the scale is
- *       rounded to fp16 by the Q8_0 format itself).</li>
+ *   <li>F8_E4M3_B128, F8_E4M3_B32 and I8_B128 → Q8_0 (lossy: a per-32 requantization of the block scale; the
+ *       scale is rounded to fp16 by the Q8_0 format itself).</li>
  *   <li>NF4 and FP4_BNB → F16 (lossy: the codebook values round).</li>
  * </ul>
  * In {@link GgufWriter.Mode#COMPAT_EXACT} the lossy rows become F32 instead; only the MXFP8 rows are
- * shared with COMPAT, because their conversion is bit-exact either way. Decoding goes through
+ * shared with COMPAT, because their conversion is bit-exact either way. The F8_E4M3 pass-through shares its
+ * bytes unchanged. Decoding goes through
  * {@link CpuBlockDecoders}, which serves every storage type, extension and ggml alike, and the Q8_0
  * requantization through {@link KvBlockCodec#quantize(KvDType, float[], int, byte[], int)}.
  * <p>
@@ -62,21 +64,23 @@ public final class GgufCompatConverter {
     }
 
     /**
-     * Target ggml type of {@code t} in {@code mode}; the type itself when the tensor carries no extension
-     * type and so needs no conversion.
+     * Target ggml type of {@code t} in {@code mode}; the type itself in {@link GgufWriter.Mode#NATIVE}, which
+     * keeps every extension tensor, and for a tensor that carries no extension type and so needs no
+     * conversion.
      *
-     * @throws IOException naming the tensor for a tensor no llama.cpp consumer reads or for an MXFP8
-     *                     exponent byte the COMPAT types cannot represent
+     * @throws IOException naming the tensor, in the COMPAT modes, for a tensor no llama.cpp consumer reads
+     *                     or for an MXFP8 exponent byte the COMPAT types cannot represent
      */
     public static GGMLType targetType(GGUFTensorInfo t, WeightStore store, GgufWriter.Mode mode)
             throws IOException {
         GGMLType from = t.type();
-        if (!from.isExtension()) {
+        if (mode == GgufWriter.Mode.NATIVE || !from.isExtension()) {
             return from;
         }
         checkNoConsumer(t);
         switch (from) {
             case F8_E4M3:
+                return GGMLType.F8_E4M3FN;
             case F8_E5M2:
                 return GGMLType.F16;
             case MXFP8:
@@ -86,6 +90,7 @@ public final class GgufCompatConverter {
             case MXFP6_E2M3:
                 return mxfp6Target(t, store, MXFP6_E2M3_MAX_EXPONENT);
             case F8_E4M3_B128:
+            case F8_E4M3_B32:
             case I8_B128:
                 if (mode == GgufWriter.Mode.COMPAT_EXACT) {
                     return GGMLType.F32;
@@ -107,6 +112,7 @@ public final class GgufCompatConverter {
     public static boolean isLossy(GGMLType from, GGMLType to) {
         switch (from) {
             case F8_E4M3_B128:
+            case F8_E4M3_B32:
             case I8_B128:
             case NF4:
             case FP4_BNB:
@@ -225,6 +231,10 @@ public final class GgufCompatConverter {
         if (nElements == 0) {
             return;
         }
+        if (from == GGMLType.F8_E4M3 && to == GGMLType.F8_E4M3FN) {
+            copyCodes(src, store, enc, nElements);
+            return;
+        }
         BlockLayout srcLayout = BlockLayout.of(from);
         int srcBlockBytes = srcLayout.blockBytes();
         int srcBlockElements = srcLayout.blockElements();
@@ -251,11 +261,29 @@ public final class GgufCompatConverter {
     private static void checkConversion(String name, GGMLType from, GGMLType to) throws IOException {
         boolean bf16 = from == GGMLType.MXFP8 && (to == GGMLType.BF16 || to == GGMLType.F32)
                 || (from == GGMLType.MXFP6_E3M2 || from == GGMLType.MXFP6_E2M3) && to == GGMLType.BF16;
-        boolean ok = from.isExtension() && (bf16
+        boolean f8Codes = from == GGMLType.F8_E4M3 && to == GGMLType.F8_E4M3FN;
+        boolean ok = from.isExtension() && (bf16 || f8Codes
                 || (to == GGMLType.F16 || to == GGMLType.F32 || to == GGMLType.Q8_0)
-                && from != GGMLType.MXFP8 && from != GGMLType.MXFP6_E3M2 && from != GGMLType.MXFP6_E2M3);
+                && from != GGMLType.MXFP8 && from != GGMLType.MXFP6_E3M2 && from != GGMLType.MXFP6_E2M3
+                && from != GGMLType.F8_E4M3);
         if (!ok) {
             throw new IOException("tensor '" + name + "' has no COMPAT conversion from " + from + " to " + to);
+        }
+    }
+
+    /**
+     * Streams the F8_E4M3 codes of {@code src} unchanged: its 32-code blocks concatenate to the per-element code
+     * run llama.cpp's F8_E4M3FN stores, so the conversion is a copy of all {@code nElements} bytes.
+     */
+    private static void copyCodes(GGUFTensorInfo src, WeightStore store, GgufEncoder enc, long nElements)
+            throws IOException {
+        byte[] raw = new byte[(int) Math.min(CHUNK_BYTES, nElements)];
+        long done = 0;
+        while (done < nElements) {
+            int n = (int) Math.min(raw.length, nElements - done);
+            store.readTensor(src.offset() + done, n, raw, 0);
+            enc.writeData(raw, 0, n);
+            done += n;
         }
     }
 

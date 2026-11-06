@@ -1,0 +1,192 @@
+/* quant_mmq.comp - the MMQ activation quantization: stages every token row of a projection once,
+ * as 8-bit codes per chunk, shared by all row tiles of the int8 MMQ GEMM (llama.cpp
+ * quantize_mmq_q8_1), plus the forms that quantize with the checkpoint's activation scheme
+ * (gguf.quant.ActQuantScheme). GLSL twin of kernels/llm/quant_mmq_q8_1.cl. Requires:
+ * common/nf_common.glsl (and common/reduce.glsl for the per-run scheme forms).
+ *
+ * Variant rows select NF_Q8_OP:
+ *   LLM_Quant_MMQ_Q8_1          no define              the dynamic per-chunk quantization
+ *   LLM_Quant_MMQ_Int8Static    NF_Q8_OP=1             INT8_STATIC
+ *   LLM_Quant_MMQ_Int8Row       NF_Q8_OP=2             INT8_TOKEN
+ *   LLM_Quant_MMQ_Int8Group128  NF_Q8_OP=3             INT8_GROUP128
+ *   LLM_Quant_MMQ_Int8Asym      NF_Q8_OP=4             INT8_STATIC_ASYM
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   NF_Q8_OP 0/2/3: (i N, i K, i tk, i x_stride, i x_off, R float x, W uint q8)
+ *   NF_Q8_OP 1:     (i N, i K, i tk, i x_stride, i x_off, f scale, R float x, W uint q8)
+ *   NF_Q8_OP 4:     (i N, i K, i tk, i x_stride, i x_off, f scale, i zp, R float x, W uint q8)
+ * Record (t, c) at 32-bit unit index ((t * (K / tk)) + c) * (tk / 4 + 2 + tk / 16) of q8 holds tk / 4
+ * code ints (the code of depth k in byte k % 4, two's complement), the chunk scale d, the tk / 16 code
+ * sums of the 16-element halves and the zero point, exactly as the OpenCL/CUDA rows. tk is the MMQ stage depth
+ * (16 or 32) and divides K. Record values:
+ *   op 0  d = maxabs / 127 of the tk-deep chunk (1 for an all-zero chunk); codes round to nearest
+ *         even of x * (127 / maxabs), as llama.cpp quantize_row_q8_1.
+ *   op 1  d = scale; codes sat8(rne(x / scale)).
+ *   op 2  d = amax / 127 over the token row; codes sat8(rne(x * (127 / amax))). A row with amax 0
+ *         stages zero codes and d = 0.
+ *   op 3  per 128-element run, d = max(amax, 1e-10f) / 127; codes trunc(clamp(x / d, -128, 127)).
+ *   op 4  d = scale; codes sat8(rne(x * (1 / scale)) + zp); the record's last unit carries zp, which the
+ *         int8 GEMM subtracts per weight row.
+ * The scheme scales are those of gguf.quant.ActQuantScheme and gguf.quant.ActFakeQuant.
+ *
+ * Dispatch: 1-D. Op 0 and op 1: global = roundUp(N * (K / tk), L), local = {L, 1, 1}, one invocation
+ * per (token, chunk) record. Op 2: one workgroup per token row, global = N * L. Op 3: one workgroup
+ * per 128-element run, global = N * (K / 128) * L. Surplus groups exit uniformly before the
+ * reduction barriers.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+#ifndef NF_Q8_OP
+#define NF_Q8_OP 0
+#endif
+
+#define NF_Q8_DYNAMIC     0
+#define NF_Q8_INT8_STATIC 1
+#define NF_Q8_INT8_ROW    2
+#define NF_Q8_INT8_GROUP  3
+#define NF_Q8_INT8_ASYM   4
+
+#define NF_Q8_GROUP_EPS uintBitsToFloat(0x2EDBE6FFu)
+
+layout(std430, binding = 0) readonly buffer NfQuantInput { float x_in[]; };
+layout(std430, binding = 1) writeonly buffer NfQuantStaged { uint q8_out[]; };
+#if NF_Q8_OP == NF_Q8_INT8_STATIC
+layout(push_constant) uniform NfQuantParams {
+    int N; int K; int tk; int x_stride; int x_off; float scale;
+} pc;
+#elif NF_Q8_OP == NF_Q8_INT8_ASYM
+layout(push_constant) uniform NfQuantParams {
+    int N; int K; int tk; int x_stride; int x_off; float scale; int zp;
+} pc;
+#else
+layout(push_constant) uniform NfQuantParams {
+    int N; int K; int tk; int x_stride; int x_off;
+} pc;
+#endif
+
+#if NF_Q8_OP == NF_Q8_INT8_ROW || NF_Q8_OP == NF_Q8_INT8_GROUP
+#include "common/reduce.glsl"
+#endif
+
+/* Round to nearest even, as OpenCL convert_int_rte / CUDA __float2int_rn (the magic-number round of
+ * |x| < 2^21: adding 1.5 * 2^23 snaps to the integer scale with the IEEE default rounding). */
+int nf_quant_rint(float x) {
+    const float s = x < 0.0 ? -1.0 : 1.0;
+    float v = abs(x) + 12582912.0;
+    return int(s * (v - 12582912.0));
+}
+
+/* rne(v): round to nearest even, NaN read as 0 (vLLM's cvt.rni.sat), unclamped: the asymmetric form
+ * needs the rounded level itself, not its sat8 value. */
+float nf_quant_rne(float v) {
+    return (floatBitsToUint(v) & 0x7FFFFFFFu) > 0x7F800000u ? 0.0 : roundEven(v);
+}
+
+/* Code of one element: round to nearest even after the sat8 clamp for ops 0, 1 and 2, truncation
+ * toward zero after the clamp for op 3 (the Triton cast of the per-128-run scheme), and the rounded
+ * level shifted by the zero point for op 4 (the shift precedes the saturation). */
+int nf_quant_code(float v) {
+#if NF_Q8_OP == NF_Q8_INT8_GROUP
+    return int(clamp(v, -128.0, 127.0));
+#elif NF_Q8_OP == NF_Q8_INT8_ASYM
+    return int(clamp(nf_quant_rne(v) + float(pc.zp), -128.0, 127.0));
+#else
+    return nf_quant_rint(clamp(v, -128.0, 127.0));
+#endif
+}
+
+/* Writes the record of one chunk (tk codes from x at element base, scale d) at 32-bit unit rec. */
+void nf_quant_store(uint rec, uint base, int tk, float d, float mul) {
+    int zp = 0;
+#if NF_Q8_OP == NF_Q8_INT8_ASYM
+    zp = pc.zp;
+#endif
+    int sums[2];
+    sums[0] = 0;
+    sums[1] = 0;
+    for (int u = 0; u < tk / 4; ++u) {
+        uint packed = 0u;
+        for (int b = 0; b < 4; ++b) {
+            const int q = nf_quant_code(x_in[base + uint(4 * u + b)] * mul);
+            packed |= uint(q & 0xFF) << uint(8 * b);
+            sums[(4 * u + b) >> 4] += q;
+        }
+        q8_out[rec + uint(u)] = packed;
+    }
+    q8_out[rec + uint(tk / 4)] = floatBitsToUint(d);
+    for (int h = 0; h < tk / 16; ++h) {
+        q8_out[rec + uint(tk / 4 + 1 + h)] = uint(sums[h]);
+    }
+    q8_out[rec + uint(tk / 4 + 1 + tk / 16)] = uint(zp);   /* the asymmetric zero point */
+}
+
+void main() {
+    const int tk = pc.tk;
+    const uint recUnits = uint(tk / 4 + 2 + tk / 16);
+#if NF_Q8_OP == NF_Q8_INT8_ROW || NF_Q8_OP == NF_Q8_INT8_GROUP
+    const uint chunks = uint(pc.K) / uint(tk);
+#if NF_Q8_OP == NF_Q8_INT8_ROW
+    const uint run = nf_wg_id();
+    if (run >= uint(pc.N)) {
+        return;
+    }
+    const uint row = uint(pc.x_off) + run * uint(pc.x_stride);
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    float m = 0.0;
+    for (int k = int(lid); k < pc.K; k += int(lsize)) {
+        m = max(m, abs(x_in[row + uint(k)]));
+    }
+    const float amax = nf_wg_max(m);
+    const float d = amax / 127.0;
+    const float mul = amax == 0.0 ? 0.0 : 127.0 / amax;
+    for (uint c = lid; c < chunks; c += lsize) {
+        nf_quant_store((run * chunks + c) * recUnits, row + c * uint(tk), tk, d, mul);
+    }
+#else
+    const uint runsPerRow = uint(pc.K) / 128u;
+    const uint run = nf_wg_id();
+    if (run >= uint(pc.N) * runsPerRow) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint t = run / runsPerRow;
+    const uint r = run - t * runsPerRow;
+    const uint base = uint(pc.x_off) + t * uint(pc.x_stride) + r * 128u;
+    float m = 0.0;
+    for (uint i = lid; i < 128u; i += lsize) {
+        m = max(m, abs(x_in[base + i]));
+    }
+    const float amax = nf_wg_max(m);
+    const float d = max(amax, NF_Q8_GROUP_EPS) / 127.0;
+    const uint runChunks = 128u / uint(tk);
+    for (uint j = lid; j < runChunks; j += lsize) {
+        nf_quant_store((t * chunks + r * runChunks + j) * recUnits, base + j * uint(tk), tk, d, 1.0 / d);
+    }
+#endif
+#else
+    const uint i = gl_GlobalInvocationID.x;
+    const uint chunks = uint(pc.K) / uint(tk);
+    if (i >= uint(pc.N) * chunks) {
+        return;
+    }
+    const int t = int(i / chunks);
+    const int c = int(i % chunks);
+    const uint base = uint(pc.x_off) + uint(t) * uint(pc.x_stride) + uint(c) * uint(tk);
+#if NF_Q8_OP == NF_Q8_INT8_STATIC || NF_Q8_OP == NF_Q8_INT8_ASYM
+    nf_quant_store(i * recUnits, base, tk, pc.scale, pc.scale == 0.0 ? 0.0 : 1.0 / pc.scale);
+#else
+    float maxabs = 0.0;
+    for (int k = 0; k < tk; ++k) {
+        maxabs = max(maxabs, abs(x_in[base + uint(k)]));
+    }
+    const float id = maxabs > 0.0 ? 127.0 / maxabs : 0.0;
+    const float d = maxabs > 0.0 ? maxabs * (1.0 / 127.0) : 1.0;
+    nf_quant_store(i * recUnits, base, tk, d, id);
+#endif
+#endif
+}

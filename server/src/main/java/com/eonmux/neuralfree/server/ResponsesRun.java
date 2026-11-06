@@ -47,7 +47,7 @@ final class ResponsesRun {
     /** Streams the response to {@code sink}; a broken client stream cancels the generation. */
     Map<String, Object> stream(GenerationBatch batch, ResponsesEvents.Sink sink) throws IOException {
         try {
-            return drive(batch, sink, false);
+            return drive(batch, sink, false, false);
         } catch (IOException e) {
             batch.cancel();
             throw e;
@@ -60,7 +60,7 @@ final class ResponsesRun {
     /** The final response of a finished batch, its events dropped. */
     Map<String, Object> collect(GenerationBatch batch) {
         try {
-            return drive(batch, (type, data) -> { }, false);
+            return drive(batch, (type, data) -> { }, false, true);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         } catch (InterruptedException e) {
@@ -72,7 +72,7 @@ final class ResponsesRun {
     /** Runs a background response into {@code sink}, which does not fail; any error ends it {@code failed}. */
     Map<String, Object> detached(GenerationBatch batch, ResponsesEvents.Sink sink) {
         try {
-            return drive(batch, sink, true);
+            return drive(batch, sink, true, false);
         } catch (IOException | InterruptedException e) {
             // the store's sink neither fails nor waits, and drive answers an interruption itself when detached
             throw new IllegalStateException("background response " + head.get("id") + " ended abnormally", e);
@@ -91,11 +91,14 @@ final class ResponsesRun {
     /**
      * Drives the batch into one {@link ResponsesEvents}: a failure of the engine, the budget or the output mapping
      * cancels the generation and ends that same response {@code failed}, keeping its sequence numbers and the items
-     * already produced. An interruption ends a detached response failed and propagates otherwise.
+     * already produced. An interruption ends a detached response failed and propagates otherwise. An assembled
+     * (non-streamed) response whose reasoning came again as its content (a content fallback) keeps it as the
+     * message only, without the reasoning item, as vLLM's non-streamed swap does.
      */
-    private Map<String, Object> drive(GenerationBatch batch, ResponsesEvents.Sink sink, boolean detached)
+    private Map<String, Object> drive(GenerationBatch batch, ResponsesEvents.Sink sink, boolean detached,
+                                      boolean assembled)
             throws IOException, InterruptedException {
-        ChatChoice choice = new ChatChoice(plan.routing().newOutput());
+        ChatChoice choice = plan.newChoice();
         ResponsesEvents events = new ResponsesEvents(head, sink, bodies, logprobs);
         events.start();
         try {
@@ -116,7 +119,8 @@ final class ResponsesRun {
             if (failure != null) {
                 return events.fail(failure);
             }
-            return events.finish(batch.result(0), plan.tokens().length, ResponsesResource.cached(batch), parse);
+            return events.finish(batch.result(0), plan.promptRows(), ResponsesResource.cached(batch), parse,
+                    assembled && choice.contentFallback());
         } catch (InterruptedException e) {
             batch.cancel();
             if (!detached) {

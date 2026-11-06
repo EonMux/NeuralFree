@@ -187,7 +187,7 @@ final class DflashDsv4Backbone implements DflashStack {
                 .sinks(l.sinks)
                 .build();
         l.router = new MoeRouting.Params(spec.nExpert(), spec.nExpertUsed(il), GatingFunc.SQRT_SOFTPLUS, 1, 1,
-                spec.expertWeightsNorm(), spec.expertWeightsScale(), true, MoeKernels.SEL_PROBS, 0);
+                spec.expertWeightsNorm(), spec.expertWeightsScale(), true, MoeKernels.SEL_PROBS, 0, false);
         return l;
     }
 

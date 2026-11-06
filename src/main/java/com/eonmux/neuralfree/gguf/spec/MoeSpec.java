@@ -13,7 +13,9 @@ import java.util.Objects;
  *   <li>logits = {@code ffn_gate_inp · x} (+ {@code ffn_gate_inp.bias}); probs by {@link #gating()};</li>
  *   <li>selection scores per {@link #selectionMode()} (+ {@code exp_probs_b} when {@link #probBias()}), with
  *       group-limited selection when {@code nGroups > 1}; top {@link #nUsed()}; or hash ids from
- *       {@code ffn_gate_tid2eid} when {@link #hashRouting()};</li>
+ *       {@code ffn_gate_tid2eid} when {@link #hashRouting()}; an embedding row of a {@link #mediaRouting()} layer
+ *       routes through the router instead, its selection bias {@code exp_probs_b_vl} when
+ *       {@link #mediaProbBias()} (deepseek4.cpp:1290-1301);</li>
  *   <li>weights = probs of the selected experts, softmaxed for SOFTMAX_WEIGHT, normalized by their sum clamped to
  *       {@link #NORM_SUM_MIN} when {@link #normWeights()}, scaled by {@link #weightsScale()} when not 0 or 1;</li>
  *   <li>experts: gate/up (fused or separate, with {@code *_exps.scale}), GLU or activation, down; weighted sum,
@@ -51,6 +53,7 @@ public final class MoeSpec {
     }
 
     private final int nExpert;
+    private final int zeroExperts;
     private final int nUsed;
     private final int nFfExp;
     private final GatingFunc gating;
@@ -59,6 +62,7 @@ public final class MoeSpec {
     private final boolean routerBias;
     private final int nGroups;
     private final int nGroupUsed;
+    private final boolean perGroupTopK;
     private final boolean normWeights;
     private final float weightsScale;
     private final boolean gated;
@@ -74,6 +78,7 @@ public final class MoeSpec {
     private final int nFfChunk;
     private final float chunkScale;
     private final boolean hashRouting;
+    private final boolean mediaProbBias;
     private final boolean weightBeforeFfn;
     private final FfnSpec sharedExpert;
     private final boolean sharedExpertGated;
@@ -82,6 +87,7 @@ public final class MoeSpec {
 
     private MoeSpec(Builder b) {
         this.nExpert = b.nExpert;
+        this.zeroExperts = b.zeroExperts;
         this.nUsed = b.nUsed;
         this.nFfExp = b.nFfExp;
         this.gating = b.gating;
@@ -90,6 +96,7 @@ public final class MoeSpec {
         this.routerBias = b.routerBias;
         this.nGroups = b.nGroups;
         this.nGroupUsed = b.nGroupUsed;
+        this.perGroupTopK = b.perGroupTopK;
         this.normWeights = b.normWeights;
         this.weightsScale = b.weightsScale;
         this.gated = b.gated;
@@ -105,6 +112,7 @@ public final class MoeSpec {
         this.nFfChunk = b.nFfChunk;
         this.chunkScale = b.chunkScale;
         this.hashRouting = b.hashRouting;
+        this.mediaProbBias = b.mediaProbBias;
         this.weightBeforeFfn = b.weightBeforeFfn;
         this.sharedExpert = b.sharedExpert;
         this.sharedExpertGated = b.sharedExpertGated;
@@ -114,6 +122,44 @@ public final class MoeSpec {
 
     public static Builder builder() {
         return new Builder();
+    }
+
+    /** A builder holding every field of {@code of}, so a split can replace one dimension of the expert set. */
+    public static Builder builder(MoeSpec of) {
+        Objects.requireNonNull(of, "of");
+        Builder b = new Builder();
+        b.nExpert = of.nExpert;
+        b.zeroExperts = of.zeroExperts;
+        b.nUsed = of.nUsed;
+        b.nFfExp = of.nFfExp;
+        b.gating = of.gating;
+        b.selectionMode = of.selectionMode;
+        b.probBias = of.probBias;
+        b.routerBias = of.routerBias;
+        b.nGroups = of.nGroups;
+        b.nGroupUsed = of.nGroupUsed;
+        b.normWeights = of.normWeights;
+        b.weightsScale = of.weightsScale;
+        b.gated = of.gated;
+        b.fusedGateUp = of.fusedGateUp;
+        b.glu = of.glu;
+        b.act = of.act;
+        b.params = of.params;
+        b.expertScales = of.expertScales;
+        b.expertBiases = of.expertBiases;
+        b.latentSize = of.latentSize;
+        b.idDiv = of.idDiv;
+        b.nChunkExperts = of.nChunkExperts;
+        b.nFfChunk = of.nFfChunk;
+        b.chunkScale = of.chunkScale;
+        b.hashRouting = of.hashRouting;
+        b.mediaProbBias = of.mediaProbBias;
+        b.weightBeforeFfn = of.weightBeforeFfn;
+        b.sharedExpert = of.sharedExpert;
+        b.sharedExpertGated = of.sharedExpertGated;
+        b.postExpertNorm = of.postExpertNorm;
+        b.sharedCombineScale = of.sharedCombineScale;
+        return b;
     }
 
     /**
@@ -136,7 +182,19 @@ public final class MoeSpec {
         return hasGateInp;
     }
 
+    /** Real experts, the ones whose FFN weights the expert tensors hold. */
     public int nExpert() { return nExpert; }
+    /**
+     * Routed slots that compute the identity instead of an expert FFN, appended after the real experts (vLLM
+     * {@code zero_expert_num} of longcat_flash.py, {@code FusedMoE(zero_expert_type="identity")}). Their share of the
+     * routing weight multiplies the expert input, and the expert tensors hold only {@link #nExpert()} experts.
+     */
+    public int zeroExperts() { return zeroExperts; }
+    /**
+     * Experts the router chooses among: {@code nExpert + zeroExperts}. The router weight, its bias and every routing
+     * decision have this width.
+     */
+    public int nRouterExpert() { return nExpert + zeroExperts; }
     /** Experts per token ({@code n_expert_used}, per layer when the GGUF has an array). */
     public int nUsed() { return nUsed; }
     /** Expert FFN width ({@code n_ff_exp}). */
@@ -149,6 +207,12 @@ public final class MoeSpec {
     public boolean routerBias() { return routerBias; }
     public int nGroups() { return nGroups; }
     public int nGroupUsed() { return nGroupUsed; }
+    /**
+     * True when every group contributes {@code nUsed / nGroups} experts (vLLM's InternS1-Pro router); false for the
+     * llama.cpp group-limited selection that keeps the {@link #nGroupUsed()} best groups and takes the top
+     * {@link #nUsed()} of the rest.
+     */
+    public boolean perGroupTopK() { return perGroupTopK; }
     public boolean normWeights() { return normWeights; }
     /** Weight multiplier; 0 or 1 leaves the weights unscaled. */
     public float weightsScale() { return weightsScale; }
@@ -176,6 +240,13 @@ public final class MoeSpec {
     public float chunkScale() { return chunkScale; }
     /** Expert ids come from the {@code ffn_gate_tid2eid} token table (deepseek4 hash layers). */
     public boolean hashRouting() { return hashRouting; }
+    /** Embedding rows select experts with {@code exp_probs_b_vl} as the selection bias (deepseek4 vision files). */
+    public boolean mediaProbBias() { return mediaProbBias; }
+    /**
+     * Embedding rows route otherwise than token rows: through the router with {@code exp_probs_b_vl} or no bias on a
+     * hash layer, or with {@code exp_probs_b_vl} in place of {@code exp_probs_b} (deepseek4.cpp:1290-1301).
+     */
+    public boolean mediaRouting() { return hashRouting || mediaProbBias; }
     /** Router weights multiply the expert input instead of the output (llama4). */
     public boolean weightBeforeFfn() { return weightBeforeFfn; }
     /** Shared expert FFN; null when absent. */
@@ -192,15 +263,16 @@ public final class MoeSpec {
 
     @Override
     public String toString() {
-        return "MoeSpec{experts=" + nExpert + "/" + nUsed + ", nFfExp=" + nFfExp + ", gating=" + gating + ", sel="
+        return "MoeSpec{experts=" + nExpert + (zeroExperts > 0 ? " (" + zeroExperts + " zero)" : "") + "/" + nUsed + ", nFfExp=" + nFfExp + ", gating=" + gating + ", sel="
                 + selectionMode + ", groups=" + nGroups + "/" + nGroupUsed + ", norm=" + normWeights + ", scale="
                 + weightsScale + ", op=" + (glu != null ? glu : act) + ", fused=" + fusedGateUp + ", latent=" + latentSize
-                + ", chunks=" + nChunkExperts + ", hash=" + hashRouting + ", shared=" + (sharedExpert != null)
+                + ", chunks=" + nChunkExperts + ", hash=" + hashRouting + (mediaProbBias ? ", mediaBias" : "") + ", shared=" + (sharedExpert != null)
                 + (sharedCombineScale != 1.0f ? ", sharedCombineScale=" + sharedCombineScale : "") + '}';
     }
 
     public static final class Builder {
         private int nExpert;
+        private int zeroExperts;
         private int nUsed;
         private int nFfExp;
         private GatingFunc gating = GatingFunc.SOFTMAX;
@@ -209,6 +281,7 @@ public final class MoeSpec {
         private boolean routerBias;
         private int nGroups = 1;
         private int nGroupUsed = 1;
+        private boolean perGroupTopK;
         private boolean normWeights;
         private float weightsScale = 1.0f;
         private boolean gated = true;
@@ -224,6 +297,7 @@ public final class MoeSpec {
         private int nFfChunk;
         private float chunkScale = 1.0f;
         private boolean hashRouting;
+        private boolean mediaProbBias;
         private boolean weightBeforeFfn;
         private FfnSpec sharedExpert;
         private boolean sharedExpertGated;
@@ -240,6 +314,11 @@ public final class MoeSpec {
             return this;
         }
         public Builder gating(GatingFunc v) { this.gating = Objects.requireNonNull(v, "gating"); return this; }
+        /**
+         * Identity slots appended after the real experts: the router and its biases hold
+         * {@code nExpert + zeroExperts} entries while the expert tensors keep {@code nExpert}.
+         */
+        public Builder zeroExperts(int v) { this.zeroExperts = v; return this; }
         public Builder selectionMode(SelectionMode v) {
             this.selectionMode = Objects.requireNonNull(v, "selectionMode");
             return this;
@@ -249,6 +328,12 @@ public final class MoeSpec {
         public Builder groups(int nGroups, int nGroupUsed) {
             this.nGroups = nGroups;
             this.nGroupUsed = nGroupUsed;
+            return this;
+        }
+
+        /** Selection that takes {@code nUsed / nGroups} experts from every group (InternS1-Pro's router). */
+        public Builder perGroupTopK(boolean v) {
+            this.perGroupTopK = v;
             return this;
         }
         public Builder normWeights(boolean v) { this.normWeights = v; return this; }
@@ -280,6 +365,7 @@ public final class MoeSpec {
             return this;
         }
         public Builder hashRouting(boolean v) { this.hashRouting = v; return this; }
+        public Builder mediaProbBias(boolean v) { this.mediaProbBias = v; return this; }
         public Builder weightBeforeFfn(boolean v) { this.weightBeforeFfn = v; return this; }
         public Builder sharedExpert(FfnSpec ffn, boolean gatedByRouter) {
             this.sharedExpert = ffn;
@@ -291,13 +377,32 @@ public final class MoeSpec {
 
         /** @throws IllegalArgumentException for inconsistent expert counts, groups, chunks or op choice */
         public MoeSpec build() {
-            if (nExpert <= 0 || nUsed <= 0 || nUsed > nExpert || nFfExp <= 0) {
-                throw new IllegalArgumentException("MoE needs 0 < nUsed <= nExpert and nFfExp > 0, got " + nUsed + "/"
-                        + nExpert + ", nFfExp " + nFfExp);
+            if (nExpert <= 0 || nUsed <= 0 || nUsed > nExpert + zeroExperts || nFfExp <= 0) {
+                throw new IllegalArgumentException("MoE needs 0 < nUsed <= nExpert + zeroExperts and nFfExp > 0,"
+                        + " got " + nUsed + "/" + nExpert + " + " + zeroExperts + ", nFfExp " + nFfExp);
+            }
+            if (zeroExperts < 0 || zeroExperts > Integer.MAX_VALUE - nExpert) {
+                throw new IllegalArgumentException("MoE zero-expert count must be in [0, " + (Integer.MAX_VALUE - nExpert)
+                        + "], got " + zeroExperts);
+            }
+            if (zeroExperts > 0 && (nGroups > 1 || hashRouting || mediaProbBias)) {
+                throw new IllegalArgumentException("MoE zero experts select over the whole router width; grouped,"
+                        + " hash and embedding-row routing do not define their identity share: " + nExpert
+                        + " experts with " + zeroExperts + " zero");
+            }
+            if (zeroExperts > 0 && (latentSize > 0 || idDiv > 0 || weightBeforeFfn)) {
+                throw new IllegalArgumentException("MoE zero experts need the expert input as their identity"
+                        + " output, which the latent, chunked and input-weighted graphs do not define: " + nExpert
+                        + " experts with " + zeroExperts + " zero (latent " + latentSize + ", chunks " + idDiv
+                        + ", weightBefore " + weightBeforeFfn + ")");
             }
             if (nGroups < 1 || nGroupUsed < 1 || nGroupUsed > nGroups || nExpert % nGroups != 0) {
                 throw new IllegalArgumentException("MoE groups " + nGroupUsed + "/" + nGroups + " are invalid for "
                         + nExpert + " experts");
+            }
+            if (perGroupTopK && (nGroups <= 1 || nUsed % nGroups != 0 || nUsed / nGroups < 1)) {
+                throw new IllegalArgumentException("per-group top-k needs more than one group and a selected count"
+                        + " divisible by the group count, got " + nUsed + " of " + nGroups + " groups");
             }
             if (fusedGateUp && !gated) {
                 throw new IllegalArgumentException("fused gate_up experts must be gated");

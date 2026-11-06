@@ -1,0 +1,12 @@
+{#- llama.cpp hunyuan-vl chat template (src/llama-chat.cpp:846-861): only a first system message is kept; no generation prompt. -#}
+{{- '<｜hy_begin▁of▁sentence｜>' -}}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if loop.first and message['role'] == 'system' -%}
+        {{- content ~ '<｜hy_place▁holder▁no▁3｜>' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- content ~ '<｜hy_User｜>' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- content ~ '<｜hy_Assistant｜>' -}}
+    {%- endif -%}
+{%- endfor -%}

@@ -8,6 +8,8 @@ import com.eonmux.neuralfree.gguf.hparams.HparamsSupport;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 
+import java.util.Arrays;
+
 /**
  * Hparams hooks of the dense architectures with sliding-window attention: Gemma 2/3/3n, Command-R7B
  * (cohere2), OLMo-2/3, Muse Glimmer, EXAONE-4 and Spark-2.5. Each hook transcribes one llama.cpp
@@ -172,6 +174,99 @@ public final class DenseHooksSwa {
         b.isSwaArray(requiredSwaFlags(b, kv));
         copyRopeToSwa(b);
         HparamsSupport.readRopeFreqBaseSwa(b, kv, b.ropeFreqBaseSwa());
+    }
+
+    /**
+     * limite.cpp:7-28. RMS epsilon (:8), the required attention scale (:9), the optional XSA epsilon (:10) and
+     * the optional sigmoid logit capping {scale, shift, temperature} (:11). Standard SWA (:13) with the
+     * required window (:14) and the pattern array or the every-4th-layer default (:15). The optional MUDD
+     * dense connections carry a tap count, mixer width and the per-layer tap indices, -1 = no mixing (:17-22).
+     * The graph rotates the SWA layers only (limite.cpp:163-170), a resolver rule like cohere2's.
+     */
+    public static void limite(ModelHparamsBuilder b, GgufKv kv) {
+        DenseHooks.readRmsEps(b, kv);                                              // limite.cpp:8
+        b.attentionScale(kv.f32Required(GgufKeys.ATTENTION_SCALE));                // :9
+        b.xsaEps(kv.f32(GgufKeys.ATTENTION_XSA_EPS, 0f));                          // :10
+        float[] cap = kv.f32Array(GgufKeys.FINAL_LOGIT_SIGMOID_CAPPING);           // :11
+        if (cap != null) {
+            if (cap.length != 3) {
+                throw new GgufFormatException("metadata key '" + kv.key(GgufKeys.FINAL_LOGIT_SIGMOID_CAPPING)
+                        + "' must hold scale, shift and temperature, got " + cap.length + " values");
+            }
+            b.finalLogitSigmoidCapping(cap);
+        }
+        b.swaType(SwaType.STANDARD);                                               // :13
+        HparamsSupport.readSlidingWindow(b, kv, true);                             // :14
+        HparamsSupport.loadSwaPattern(b, kv, 4, false);                            // :15
+        int taps = kv.u32(GgufKeys.MUDD_TAP_COUNT, 0);                             // :18
+        if (taps > 0) {
+            b.muddTapCount(taps);
+            b.muddFf(kv.u32Required(GgufKeys.MUDD_FEED_FORWARD_LENGTH));           // :20
+            int[] idx = kv.i32Array(GgufKeys.MUDD_TAP_INDICES);                    // :21
+            if (idx == null) {
+                throw new GgufFormatException("required metadata key '" + kv.key(GgufKeys.MUDD_TAP_INDICES)
+                        + "' is missing");
+            }
+            if (idx.length < b.nLayer() * taps) {
+                throw new GgufFormatException("metadata key '" + kv.key(GgufKeys.MUDD_TAP_INDICES) + "' has "
+                        + idx.length + " entries, fewer than the " + b.nLayer() * taps + " the block count and "
+                        + taps + " taps need");
+            }
+            int[] flat = new int[b.nLayer() * taps];
+            Arrays.fill(flat, -1);
+            System.arraycopy(idx, 0, flat, 0, b.nLayer() * taps);
+            b.muddTapIdxArray(flat);
+        }
+    }
+
+    /**
+     * DomynEdge: the RMS epsilon, the per-layer sliding-window switches with their one shared window width, and
+     * the per-layer RoPE switches ({@code position_layers}); a NoPE layer rotates nothing.
+     */
+    public static void domynEdge(ModelHparamsBuilder b, GgufKv kv) {
+        DenseHooks.readRmsEps(b, kv);
+        int window = kv.u32(GgufKeys.ATTENTION_SLIDING_WINDOW, 0);
+        b.nSwa(window);
+        if (window > 0) {
+            b.swaType(SwaType.STANDARD);
+        }
+        b.isSwaArray(MoeHooksSupport.overlayFlags(kv, GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN,
+                b.isSwaArray(), false));
+        b.ropeEnabledArray(MoeHooksSupport.overlayFlags(kv, GgufKeys.ATTENTION_ROPE_PATTERN,
+                b.ropeEnabledArray(), false));
+    }
+
+    /**
+     * RNJ-1: the RMS epsilon, the required attention scale ({@code query_pre_attn_scalar**-0.5}), the optional
+     * final logit soft cap and the chunked local attention. A positive {@code attention.sliding_window} is the
+     * aligned chunk width; the layers whose {@code attention.sliding_window_pattern} flag is set see their own chunk
+     * and the one before it ({@link SwaType#CHUNKED_LOOKBACK}); the others attend the whole context.
+     */
+    public static void rnj1(ModelHparamsBuilder b, GgufKv kv) {
+        DenseHooks.readRmsEps(b, kv);
+        float scale = kv.f32Required(GgufKeys.ATTENTION_SCALE);
+        if (!(scale > 0f) || Float.isInfinite(scale)) {
+            throw new GgufFormatException("rnj1: attention.scale must be positive and finite, got " + scale);
+        }
+        b.attentionScale(scale);
+        b.finalSoftcap(kv.f32(GgufKeys.FINAL_LOGIT_SOFTCAPPING, 0.0f));
+        HparamsSupport.readRopeFreqBaseSwa(b, kv, b.ropeFreqBase());
+        int chunk = kv.u32(GgufKeys.ATTENTION_SLIDING_WINDOW, 0);
+        boolean[] flags = MoeHooksSupport.overlayFlags(kv, GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN,
+                b.isSwaArray(), false);
+        b.isSwaArray(flags);
+        if (chunk > 0) {
+            b.swaType(SwaType.CHUNKED_LOOKBACK);
+            b.nSwa(chunk);
+        } else {
+            for (boolean flag : flags) {
+                if (flag) {
+                    throw new GgufFormatException("rnj1: attention.sliding_window_pattern marks a chunked layer but"
+                            + " attention.sliding_window is missing or zero");
+                }
+            }
+            b.swaType(SwaType.NONE);
+        }
     }
 
     // ---- helpers ----

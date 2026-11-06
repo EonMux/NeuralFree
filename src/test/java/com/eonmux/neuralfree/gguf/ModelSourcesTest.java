@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf;
 
+import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.testutil.GgufTestWriter;
 import org.junit.Rule;
 import org.junit.Test;
@@ -237,11 +238,9 @@ public class ModelSourcesTest {
     }
 
     @Test
-    public void peftDirectoryOpensAsAnAdapterOnlyWithTheSafetensorsLoader() throws IOException {
+    public void peftDirectoryOpensAsAnAdapterThroughThePeftLoader() throws IOException {
         Path dir = peftDir();
-        UnsupportedOperationException e = assertThrows(UnsupportedOperationException.class,
-                () -> ModelSources.openAdapter(dir.toString(), BASE, OPTIONS));
-        assertEquals(ModelSources.PEFT_UNSUPPORTED, e.getMessage());
+        assertOpenedByThePeftLoader(dir);
     }
 
     @Test
@@ -260,9 +259,19 @@ public class ModelSourcesTest {
         assertEquals(ModelFormat.SAFETENSORS, ModelSources.detect(dir));
         IOException model = assertRejectedAsInvalidCheckpoint(() -> ModelSources.open(dir.toString(), OPTIONS));
         assertFalse(model.getMessage(), model.getMessage().contains("PEFT adapter"));
-        UnsupportedOperationException adapter = assertThrows(UnsupportedOperationException.class,
+        assertOpenedByThePeftLoader(dir);
+    }
+
+    /**
+     * Opens {@code dir} with {@link ModelSources#openAdapter}, which hands it to the PEFT adapter loader; the loader
+     * reads the placeholder {@code adapter_config.json} and refuses it, as {@code convert_lora_to_gguf.py} does, for
+     * naming no {@code peft_type} (PeftAdapterSourceTest covers real adapters).
+     */
+    private static void assertOpenedByThePeftLoader(Path dir) {
+        GgufFormatException e = assertThrows(GgufFormatException.class,
                 () -> ModelSources.openAdapter(dir.toString(), BASE, OPTIONS));
-        assertEquals(ModelSources.PEFT_UNSUPPORTED, adapter.getMessage());
+        assertMessageContains(e, "Invalid PEFT adapter '" + dir + "'");
+        assertMessageContains(e, "adapter_config.json has no peft_type");
     }
 
     @Test
@@ -286,24 +295,43 @@ public class ModelSourcesTest {
     // ------------------------------------------------------------------ refused and missing
 
     @Test
-    public void pickleOnlyDirectoryIsRefused() throws IOException {
+    public void pickleDirectoryOpensThroughTheTorchContainer() throws IOException {
         Path dir = tmp.newFolder().toPath();
-        touch(dir.resolve("pytorch_model.bin"), "pickle");
-        touch(dir.resolve("config.json"), "{}");
-        IOException e = assertThrows(IOException.class, () -> ModelSources.detect(dir));
-        assertFalse(e instanceof FileNotFoundException);
-        assertEquals("Invalid checkpoint '" + dir + "': PyTorch pickle checkpoints are not supported; use the"
-                + " model's safetensors files", e.getMessage());
+        Path pickle = touch(dir.resolve("pytorch_model.bin"), "pickle");
+        touch(dir.resolve("config.json"), "{\"architectures\": [\"LlamaForCausalLM\"]}");
+        assertEquals(ModelFormat.SAFETENSORS, ModelSources.detect(dir));
+        IOException e = assertRejectedAsInvalidCheckpoint(() -> ModelSources.open(dir.toString(), OPTIONS));
+        assertFalse(e.getMessage(), e.getMessage().contains("not supported"));
+        assertMessageContains(e, pickle.toString());
     }
 
     @Test
-    public void pickleFilesAreRefused() throws IOException {
+    public void pickleFilesOpenThroughTheTorchContainer() throws IOException {
         for (String name : new String[]{"pytorch_model-00001-of-00002.bin", "consolidated.00.pth", "model.pt"}) {
-            Path file = touch(tmp.getRoot().toPath().resolve(name), "pickle");
-            IOException e = assertThrows(IOException.class, () -> ModelSources.open(file.toString(), OPTIONS));
+            Path dir = tmp.newFolder().toPath();
+            Path file = touch(dir.resolve(name), "pickle");
+            assertEquals(name, ModelFormat.SAFETENSORS, ModelSources.detect(file));
+            IOException e = assertRejectedAsInvalidCheckpoint(() -> ModelSources.open(file.toString(), OPTIONS));
             assertFalse(name, e instanceof FileNotFoundException);
-            assertMessageContains(e, "PyTorch pickle checkpoints are not supported");
+            assertFalse(e.getMessage(), e.getMessage().contains("not supported"));
         }
+    }
+
+    @Test
+    public void aPickleNoContainerReadsIsRefused() throws IOException {
+        Path file = touch(tmp.newFolder().toPath().resolve("adapter_model.pth"), "pickle");
+        IOException e = assertThrows(IOException.class, () -> ModelSources.open(file.toString(), OPTIONS));
+        assertFalse(e instanceof FileNotFoundException);
+        assertEquals("Invalid checkpoint '" + file + "': PyTorch pickle checkpoints are not supported; use the"
+                + " model's safetensors files", e.getMessage());
+
+        Path dir = tmp.newFolder().toPath();
+        touch(dir.resolve("adapter_model.pt"), "pickle");
+        touch(dir.resolve("config.json"), "{}");
+        e = assertThrows(IOException.class, () -> ModelSources.detect(dir));
+        assertFalse(e instanceof FileNotFoundException);
+        assertEquals("Invalid checkpoint '" + dir + "': PyTorch pickle checkpoints are not supported; use the"
+                + " model's safetensors files", e.getMessage());
     }
 
     @Test
@@ -312,7 +340,7 @@ public class ModelSourcesTest {
         FileNotFoundException e = assertThrows(FileNotFoundException.class, () -> ModelSources.detect(dir));
         assertMessageContains(e, dir.toString());
         assertMessageContains(e, "GGUF");
-        assertMessageContains(e, "*.safetensors with config.json or params.json");
+        assertMessageContains(e, "*.safetensors or *.tensors with config.json or params.json");
         assertMessageContains(e, "adapter_config.json");
     }
 

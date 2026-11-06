@@ -9,7 +9,12 @@ import com.eonmux.neuralfree.gguf.load.MetadataOverrides;
 import com.eonmux.neuralfree.gguf.load.OverriddenSource;
 import com.eonmux.neuralfree.gguf.load.RopeOverrides;
 import com.eonmux.neuralfree.gguf.load.TensorChecker;
+import com.eonmux.neuralfree.gguf.packed.StandardExpertView;
 import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
+import com.eonmux.neuralfree.gguf.remote.ObjectStoreCheckpoints;
+import com.eonmux.neuralfree.gguf.remote.ObjectStoreUri;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedReader;
 import java.io.FileNotFoundException;
@@ -36,12 +41,14 @@ import java.util.regex.Pattern;
  * <ol>
  *   <li>a regular file starting with the GGUF magic, or named {@code *.gguf}: GGUF (split models open from their
  *       first split);</li>
- *   <li>a regular file named {@code *.safetensors}: a Hugging Face checkpoint of that file alone, configured by its
- *       directory; a file listed by a {@code *.safetensors.index.json} beside it is one shard of a sharded checkpoint
- *       and is refused with the directory to pass instead;</li>
- *   <li>a directory with {@code *.safetensors} files and {@code config.json}, {@code params.json} (Mistral
- *       native) or the marker files of a {@link HfCheckpointDetectors checkpoint detector}: a Hugging Face
- *       checkpoint;</li>
+ *   <li>a regular file named {@code *.safetensors} or {@code *.tensors}: a Hugging Face or vLLM checkpoint of that
+ *       file alone (the tensorizer formats read their own file), configured by its directory; a file listed by a
+ *       {@code *.safetensors.index.json} beside it is one shard of a sharded checkpoint and is refused with the
+ *       directory to pass instead;</li>
+ *   <li>a directory with {@code *.safetensors} files (including vLLM's per-rank
+ *       {@code model-rank-*.safetensors} shards) or {@code *.tensors} files and {@code config.json},
+ *       {@code params.json} (Mistral native) or the marker files of a {@link HfCheckpointDetectors checkpoint
+ *       detector}: a Hugging Face, {@code sharded_state} or {@code tensorizer} checkpoint;</li>
  *   <li>a directory without {@code *.safetensors} files holding exactly one {@code .gguf} file, or one split set
  *       {@code <prefix>-0000N-of-0000M.gguf}: that GGUF model (the vLLM / SGLang "gguf" load format);</li>
  *   <li>a directory with {@code adapter_config.json} and {@code adapter_model.safetensors}: a PEFT adapter, opened only
@@ -49,18 +56,23 @@ import java.util.regex.Pattern;
  *       model and the adapter is still opened by {@link #openAdapter}; so is a directory without
  *       {@code config.json} that a checkpoint detector recognizes, such as a decision-LoRA release);</li>
  *   <li>PyTorch pickle checkpoints ({@code pytorch_model*.bin}, {@code *.pt}, {@code *.pth}): asked at the
- *       checkpoint-container registry (HF.md rule 6, H-K); with a registered container — FX-1's restricted pickle
+ *       checkpoint-container registry (rule 6); with a registered container — the restricted pickle
  *       reader — they open like safetensors checkpoints, without one the pickle is refused (unpickling executes
  *       code);</li>
  *   <li>anything else is a {@link FileNotFoundException} naming what was looked for.</li>
  * </ol>
  * Directory entries and the given path may be symbolic links (the Hugging Face cache snapshot layout) and are
  * followed.
+ *
+ * <p>An object-store URI ({@code s3://}, {@code gs://}, {@code az://}, {@code azure://}) is resolved first: its
+ * mirror under {@link ModelSourceOptions#cacheDir()} is filled by {@link ObjectStoreCheckpoints} and then detected as
+ * a local checkpoint by the rules above. A CoreWeave tensorizer file ({@code *.tensors}) and a pre-sharded vLLM
+ * checkpoint (the {@code sharded_state} / {@code runai_streamer_sharded} file layout) are read by the checkpoint
+ * container registry, which maps their packed vLLM tensor names back to Hugging Face names.</p>
  */
 public final class ModelSources {
 
-    /** Legacy message of the S0 open of a PEFT adapter, kept for its metadata-check expectations. */
-    static final String PEFT_UNSUPPORTED = "PEFT adapters need the safetensors loader";
+    private static final Logger LOG = LogManager.getLogger(ModelSources.class);
 
     private static final String GGUF_SUFFIX = ".gguf";
     private static final String SAFETENSORS_SUFFIX = ".safetensors";
@@ -70,8 +82,9 @@ public final class ModelSources {
     private static final String ADAPTER_CONFIG = "adapter_config.json";
     private static final String ADAPTER_MODEL = "adapter_model.safetensors";
     private static final String PICKLE_PREFIX = "pytorch_model";
-    private static final String LOOKED_FOR = "looked for a GGUF file, *.safetensors with config.json or params.json,"
-            + " and adapter_config.json with adapter_model.safetensors";
+    private static final String TENSORIZER_SUFFIX = ".tensors";
+    private static final String LOOKED_FOR = "looked for a GGUF file, *.safetensors or *.tensors with config.json or"
+            + " params.json, and adapter_config.json with adapter_model.safetensors";
 
     /** A split GGUF file name ({@code llama_split_path}): prefix, split number, split count. */
     private static final Pattern SPLIT_NAME = Pattern.compile("(.+)-(\\d{5})-of-(\\d{5})\\.gguf");
@@ -113,7 +126,8 @@ public final class ModelSources {
      *
      * @throws FileNotFoundException when the path does not exist, cannot be read or holds no model
      * @throws IOException           when the model cannot be read or is invalid, or the path is one shard of a
-     *                               sharded checkpoint, a PEFT adapter or a PyTorch pickle checkpoint
+     *                               sharded checkpoint, a PEFT adapter or a PyTorch pickle no checkpoint
+     *                               container reads
      */
     public static ModelSource open(String path, ModelSourceOptions options) throws IOException {
         return open(path, options, null);
@@ -126,7 +140,8 @@ public final class ModelSources {
      * @param target the model the draft serves, or null when the model is not a draft
      * @throws FileNotFoundException when the path does not exist, cannot be read or holds no model
      * @throws IOException           when the model cannot be read or is invalid, or the path is one shard of a
-     *                               sharded checkpoint, a PEFT adapter or a PyTorch pickle checkpoint
+     *                               sharded checkpoint, a PEFT adapter or a PyTorch pickle no checkpoint
+     *                               container reads
      */
     public static ModelSource open(String path, ModelSourceOptions options, Path target) throws IOException {
         return open(path, options, target, ActivationQuant.WEIGHT_ONLY);
@@ -140,25 +155,27 @@ public final class ModelSources {
      * @param target the model the draft serves, or null when the model is not a draft
      * @throws FileNotFoundException when the path does not exist, cannot be read or holds no model
      * @throws IOException           when the model cannot be read or is invalid, or the path is one shard of a
-     *                               sharded checkpoint, a PEFT adapter or a PyTorch pickle checkpoint
+     *                               sharded checkpoint, a PEFT adapter or a PyTorch pickle no checkpoint
+     *                               container reads
      */
     public static ModelSource open(String path, ModelSourceOptions options, Path target, ActivationQuant actQuant)
             throws IOException {
         Objects.requireNonNull(path, "path");
         Objects.requireNonNull(options, "options");
         Objects.requireNonNull(actQuant, "actQuant");
-        Detection d = detectPath(path);
+        String local = localPath(path, options);
+        Detection d = detectPath(local);
         ModelSource source;
         switch (d.kind) {
             case GGUF:
                 source = new GGUFFileParser(d.path);
                 break;
             case SAFETENSORS_FILE:
-                rejectIndexedShard(path);
-                source = HfModelSource.open(Paths.get(path), options, target, actQuant);
+                rejectIndexedShard(local);
+                source = HfModelSource.open(Paths.get(d.path), options, target, actQuant);
                 break;
             case SAFETENSORS_DIR:
-                source = HfModelSource.open(Paths.get(path), options, target, actQuant);
+                source = HfModelSource.open(Paths.get(d.path), options, target, actQuant);
                 break;
             default:
                 throw new IOException("'" + path + "' is a PEFT adapter; load it with --lora on its base model");
@@ -167,8 +184,28 @@ public final class ModelSources {
     }
 
     /**
+     * The local path of the model {@code path}: the path itself for a local checkpoint, or the mirror directory of an
+     * object-store URI ({@code s3://}, {@code gs://}, {@code az://}), which {@link ObjectStoreCheckpoints} fills from
+     * the store under {@link ModelSourceOptions#cacheDir()}.
+     *
+     * @throws IOException when the object store cannot be listed or an object cannot be downloaded
+     */
+    private static String localPath(String path, ModelSourceOptions options) throws IOException {
+        if (!ObjectStoreCheckpoints.isRemote(path)) {
+            return path;
+        }
+        Path local = ObjectStoreCheckpoints.localize(path, options);
+        LOG.info("Opened object-store checkpoint {} from its local mirror {}", path, local);
+        return local.toString();
+    }
+
+    /**
      * The opened source with the loading extras of {@code options} applied to its GGUF view, in order:
      * <ol>
+     *   <li>the standard-layout view of an experts-packed model ({@code blk.N.ffn_exps_packed} tensors
+     *       with {@code avalon.experts_packed.blk.N} metadata, as Avalon's {@code pack-experts.py}
+     *       writes): it opens as its unpacked MoE form, so every later step sees the standard
+     *       {@code ffn_{up,gate,down}_exps} tensors;</li>
      *   <li>the rope overrides ({@code ModelSourceOptions#ropeOverrides()}, when set) fail with an
      *       {@link IllegalArgumentException} when the source names no {@code general.architecture} to write their
      *       {@code %s.rope.*} keys for, and become metadata overrides of its keys;</li>
@@ -198,7 +235,13 @@ public final class ModelSources {
             overrides.addAll(options.ropeOverrides().toOverrides(arch));
         }
         overrides.addAll(options.metadataOverrides());
-        ModelSource view = source;
+        ModelSource view;
+        try {
+            view = StandardExpertView.standardViewIfPacked(source);
+        } catch (IOException e) {
+            closeAfterFailure(source, e);
+            throw e;
+        }
         if (!overrides.isEmpty()) {
             view = new OverriddenSource(view, overrides);
         }
@@ -218,26 +261,38 @@ public final class ModelSources {
         return view;
     }
 
+    /** Closes {@code source} after its open failed with {@code failure}, keeping a close error as suppressed. */
+    private static void closeAfterFailure(ModelSource source, IOException failure) {
+        try {
+            source.close();
+        } catch (IOException | RuntimeException e) {
+            failure.addSuppressed(e);
+        }
+    }
+
     /**
-     * Opens the LoRA adapter at {@code path} for the model loaded from {@code base}: a GGUF adapter file (S0's
-     * parser), a PEFT adapter directory (LA-1's {@link PeftAdapterSource}), or a model directory that also holds a
+     * Opens the LoRA adapter at {@code path} for the model loaded from {@code base}: a GGUF adapter file, a
+     * PEFT adapter directory ({@link PeftAdapterSource}), or a model directory that also holds a
      * PEFT adapter's two files (the adapter of the model beside it).
      *
      * @throws FileNotFoundException when the path does not exist, cannot be read or holds no adapter
      * @throws IOException           when the adapter cannot be read or is invalid, or its base configuration does
      *                               not resolve
+     * @throws com.eonmux.neuralfree.gguf.hparams.GgufFormatException for a PEFT adapter the LoRA conversion refuses
+     *                               (see {@link PeftAdapterSource#open})
      */
     public static ModelSource openAdapter(String path, SourceOrigin base, ModelSourceOptions options)
             throws IOException {
         Objects.requireNonNull(path, "path");
         Objects.requireNonNull(base, "base");
         Objects.requireNonNull(options, "options");
-        Detection d = detectPath(path);
+        String local = localPath(path, options);
+        Detection d = detectPath(local);
         if (d.kind == Kind.GGUF) {
             return new GGUFFileParser(d.path);
         }
         if (d.kind == Kind.PEFT_ADAPTER
-                || (d.kind == Kind.SAFETENSORS_DIR && isPeftAdapter(regularFileNames(Paths.get(path))))) {
+                || (d.kind == Kind.SAFETENSORS_DIR && isPeftAdapter(regularFileNames(Paths.get(local))))) {
             return PeftAdapterSource.open(Paths.get(d.path), base, options);
         }
         throw new FileNotFoundException("'" + path + "' is not a LoRA adapter: looked for a GGUF adapter file"
@@ -268,7 +323,8 @@ public final class ModelSources {
      * directory.
      *
      * @throws FileNotFoundException when the path does not exist, cannot be read or holds no model
-     * @throws IOException           for a PyTorch pickle checkpoint, or when the path cannot be read
+     * @throws IOException           for a PyTorch pickle no checkpoint container reads, or when the path cannot be
+     *                               read
      */
     public static ModelFormat detect(Path path) throws IOException {
         Objects.requireNonNull(path, "path");
@@ -276,12 +332,21 @@ public final class ModelSources {
     }
 
     /**
-     * Checks that {@code path} names a readable regular file or directory, before anything is loaded.
+     * Checks that {@code path} names a readable regular file, a readable directory, or a well-formed object-store URI
+     * ({@code s3://}, {@code gs://}, {@code az://}). The URI is not fetched here; {@link #open} mirrors it.
      *
      * @throws FileNotFoundException when it does not
      */
     public static void requireOpenable(String path) throws FileNotFoundException {
         Objects.requireNonNull(path, "path");
+        if (ObjectStoreCheckpoints.isRemote(path)) {
+            try {
+                ObjectStoreUri.parse(path);
+            } catch (IllegalArgumentException e) {
+                throw new FileNotFoundException("model not found: " + e.getMessage());
+            }
+            return;
+        }
         Path p;
         try {
             p = Paths.get(path);
@@ -322,6 +387,10 @@ public final class ModelSources {
 
     private static Detection detectFile(Path file, String path) throws IOException {
         String name = file.getFileName().toString();
+        if (name.endsWith(TENSORIZER_SUFFIX)) {
+            // the checkpoint-container registry reads tensorizer files
+            return new Detection(Kind.SAFETENSORS_FILE, path);
+        }
         if (hasGgufMagic(file) || name.endsWith(GGUF_SUFFIX)) {
             return new Detection(Kind.GGUF, path);
         }
@@ -329,7 +398,7 @@ public final class ModelSources {
             return new Detection(Kind.SAFETENSORS_FILE, path);
         }
         if (isPickle(name)) {
-            // Detection rule 6: the checkpoint-container registry is asked (H-K); a registered container (FX-1
+            // Detection rule 6: the checkpoint-container registry is asked; a registered container (the
             // restricted pickle reader) reads the file through the safetensors open flow, without one the pickle
             // is refused.
             CheckpointContainers.Factory factory = CheckpointContainers.forFile(file);
@@ -338,8 +407,8 @@ public final class ModelSources {
             }
             return new Detection(Kind.SAFETENSORS_FILE, path);
         }
-        throw new FileNotFoundException("'" + path + "' is not a model file: looked for the GGUF magic, a .gguf name"
-                + " and a .safetensors name");
+        throw new FileNotFoundException("'" + path + "' is not a model file: looked for the GGUF magic, a .gguf name,"
+                + " a .safetensors name and a .tensors name");
     }
 
     /**
@@ -357,6 +426,7 @@ public final class ModelSources {
             return new Detection(Kind.SAFETENSORS_DIR, path);
         }
         int safetensors = 0;
+        int tensorizer = 0;
         int modelSafetensors = 0;
         List<String> ggufs = new ArrayList<>();
         boolean pickles = false;
@@ -368,6 +438,8 @@ public final class ModelSources {
                 }
             } else if (name.endsWith(GGUF_SUFFIX)) {
                 ggufs.add(name);
+            } else if (name.endsWith(TENSORIZER_SUFFIX)) {
+                tensorizer++;
             } else if (isPickle(name)) {
                 pickles = true;
             }
@@ -383,6 +455,14 @@ public final class ModelSources {
                     + safetensors + " .safetensors file(s) but neither " + CONFIG_JSON + " nor " + PARAMS_JSON
                     + ", and no checkpoint detector (" + String.join(", ", HfCheckpointDetectors.names())
                     + ") recognizes it");
+        }
+        if (tensorizer > 0) {
+            if (config) {
+                return new Detection(Kind.SAFETENSORS_DIR, path);
+            }
+            throw new FileNotFoundException("'" + path + "' holds " + tensorizer + " .tensors file(s) but neither "
+                    + CONFIG_JSON + " nor " + PARAMS_JSON + "; a tensorizer checkpoint needs its model configuration"
+                    + " beside it");
         }
         if (!ggufs.isEmpty()) {
             String model = singleGgufModel(ggufs);

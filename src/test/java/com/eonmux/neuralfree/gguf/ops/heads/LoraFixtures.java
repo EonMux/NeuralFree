@@ -37,6 +37,12 @@ public final class LoraFixtures {
                 random(seed, rank * in), random(seed + 1, out * rank));
     }
 
+    /** A projection pair of one vision-encoder or connector tensor (an mmproj name). */
+    public static LoraAdapter.Pair visionProjection(String target, int in, int out, int rank, long seed) {
+        return new LoraAdapter.Pair(target, LoraAdapter.Target.PROJECTION, LoraAdapter.Side.VISION, in, out, rank, 1,
+                random(seed, rank * in), random(seed + 1, out * rank));
+    }
+
     public static LoraAdapter.Pair experts(String target, int in, int out, int rank, int nExpert, long seed) {
         return new LoraAdapter.Pair(target, LoraAdapter.Target.EXPERTS, in, out, rank, nExpert,
                 random(seed, nExpert * rank * in), random(seed + 1, nExpert * out * rank));

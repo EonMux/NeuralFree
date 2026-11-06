@@ -14,6 +14,7 @@ import org.jocl.cl_mem;
 
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -35,6 +36,14 @@ import static org.jocl.CL.*;
  * <p><b>Dispatch.</b> A full argument list must match the kernel's {@code CL_KERNEL_NUM_ARGS}, and a
  * work-group may not exceed the kernel's {@code CL_KERNEL_WORK_GROUP_SIZE}; the driver applies the
  * remaining rules (divisibility, device limits).</p>
+ *
+ * <p><b>Graph capture.</b> On a device that reports {@link DeviceFeature#COMMAND_BUFFER},
+ * {@link #beginCapture()} records the queue's dispatches, copies and fills into a
+ * {@code cl_command_buffer_khr} through {@link OclCommandBufferApi} instead of executing them, and
+ * {@link #endCapture()} returns the {@link OclGraph}. The recorded commands are chained with sync
+ * points in capture order. A replay verifies the step body against the capture and updates changed
+ * scalar arguments in place when mutable dispatch is available; host transfers, reads, markers and
+ * synchronizations are refused while recording.</p>
  */
 @NotThreadSafe("OpenCL command queues are not thread-safe for concurrent enqueue operations. "
         + "Caller must synchronize access when using from multiple threads. "
@@ -42,14 +51,37 @@ import static org.jocl.CL.*;
 public final class OclComputeQueue implements ComputeQueue {
     private static final Logger LOGGER = LoggingUtil.getLogger(OclComputeQueue.class);
 
+    /** What the queue records instead of executing: nothing, a capture, or a replay's argument updates. */
+    private enum Capture {
+        NONE,
+        CAPTURING,
+        REPLAYING
+    }
+
     private cl_command_queue queue;
     private final QueueType queueType;
     private final boolean ownedByBackend;
     private final boolean profiled;
+    /** Per-command device time; non-null only on a queue created with profiling enabled. */
+    private final KernelTiming timing;
+    private final ArrayDeque<PendingTiming> pendingTiming = new ArrayDeque<>();
+    /** The backend that owns this queue, or null for a standalone queue; its events are tracked there. */
+    private final OclComputeBackend owner;
+    /** The device's {@code cl_khr_command_buffer} entry points, or null when capture is unsupported. */
+    private final OclCommandBufferApi commandBuffers;
     private boolean closed = false;
     /** Reads enqueued since the last finish; their callbacks run on a driver thread. */
     private final List<OclReadCompletion> pendingReads = new ArrayList<>();
     private final OclStagingPool staging = new OclStagingPool();
+
+    private Capture capture = Capture.NONE;
+    private long captureBuffer;
+    private int captureSyncPoint = OclCommandBufferApi.NO_SYNC_POINT;
+    private final List<OclGraph.Node> captureNodes = new ArrayList<>();
+    /** The kernel-dispatch position the next recorded kernel command takes, reset by {@code beginCapture}. */
+    private int captureKernelOrdinal;
+    private final List<OclGraph> graphs = new ArrayList<>();
+    private OclGraph replayGraph;
 
     // Reusable single-element arrays for clSetKernelArg scalar values.
     // clSetKernelArg copies the value immediately, so these are safe to reuse
@@ -63,9 +95,9 @@ public final class OclComputeQueue implements ComputeQueue {
     // Safe because enqueue calls are single-threaded per queue (OpenCL spec).
     private final cl_event[] singleClEventBuf = new cl_event[1];
 
-    /** A caller-owned queue without profiling; {@link #close()} releases it. */
+    /** A caller-owned queue without profiling and without command buffers; {@link #close()} releases it. */
     public OclComputeQueue(cl_command_queue queue, QueueType queueType) {
-        this(queue, queueType, false, false);
+        this(queue, queueType, false, false, null, null);
     }
 
     /**
@@ -76,6 +108,22 @@ public final class OclComputeQueue implements ComputeQueue {
      * @param profiled       true when the queue was created with {@code CL_QUEUE_PROFILING_ENABLE}
      */
     public OclComputeQueue(cl_command_queue queue, QueueType queueType, boolean ownedByBackend, boolean profiled) {
+        this(queue, queueType, ownedByBackend, profiled, null, null);
+    }
+
+    /**
+     * @param queue          the OpenCL command queue; released by this object
+     * @param queueType      compute or transfer
+     * @param ownedByBackend true for the backend's own queues: {@link #close()} then only finishes
+     *                       and the backend releases the queue through {@link #closeInternal()}
+     * @param profiled       true when the queue was created with {@code CL_QUEUE_PROFILING_ENABLE}
+     * @param owner          the backend that owns this queue, or null for a standalone queue; every
+     *                       event this queue issues is counted open there until its holder closes it
+     * @param commandBuffers the device's {@code cl_khr_command_buffer} entry points, or null when the
+     *                       device does not support capture
+     */
+    OclComputeQueue(cl_command_queue queue, QueueType queueType, boolean ownedByBackend, boolean profiled,
+                    OclComputeBackend owner, OclCommandBufferApi commandBuffers) {
         if (queue == null) {
             throw new IllegalArgumentException("cl_command_queue cannot be null");
         }
@@ -86,11 +134,19 @@ public final class OclComputeQueue implements ComputeQueue {
         this.queueType = queueType;
         this.ownedByBackend = ownedByBackend;
         this.profiled = profiled;
+        this.timing = profiled ? new KernelTiming() : null;
+        this.owner = owner;
+        this.commandBuffers = commandBuffers;
     }
 
     /** True for the queues returned by {@code computeQueue()} and {@code transferQueue()}. */
     public boolean isOwnedByBackend() {
         return ownedByBackend;
+    }
+
+    /** True once the queue has been released ({@link #closeInternal()}). */
+    boolean isReleased() {
+        return closed;
     }
 
     @Override
@@ -107,6 +163,7 @@ public final class OclComputeQueue implements ComputeQueue {
         }
         checkDeviceRange(dstBuffer, dstOffset, sizeInBytes, "write destination");
         checkHostRange(sizeInBytes, srcData.length, "write", "source byte array");
+        uncapturable("a write");
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
@@ -126,6 +183,7 @@ public final class OclComputeQueue implements ComputeQueue {
         checkDeviceRange(dstBuffer, dstOffset, sizeInBytes, "write destination");
         requireWholeFloats(sizeInBytes, "write");
         checkHostRange(sizeInBytes, (long) srcData.length * Float.BYTES, "write", "source float array");
+        uncapturable("a write");
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
@@ -147,6 +205,7 @@ public final class OclComputeQueue implements ComputeQueue {
         }
         checkDeviceRange(dstBuffer, dstOffset, sizeInBytes, "write destination");
         checkHostRange(sizeInBytes, srcData.capacity(), "write", "source ByteBuffer capacity");
+        uncapturable("a write");
         cl_mem mem = extractClMem(dstBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
@@ -168,6 +227,7 @@ public final class OclComputeQueue implements ComputeQueue {
         }
         checkDeviceRange(srcBuffer, srcOffset, sizeInBytes, "read source");
         checkHostRange(sizeInBytes, dstData.length, "read", "destination byte array");
+        uncapturable("a read");
         cl_mem mem = extractClMem(srcBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
@@ -189,6 +249,7 @@ public final class OclComputeQueue implements ComputeQueue {
         checkDeviceRange(srcBuffer, srcOffset, sizeInBytes, "read source");
         requireWholeFloats(sizeInBytes, "read");
         checkHostRange(sizeInBytes, (long) dstData.length * Float.BYTES, "read", "destination float array");
+        uncapturable("a read");
         cl_mem mem = extractClMem(srcBuffer);
         cl_event[] waitList = extractWaitList(waitOnEvents);
 
@@ -204,39 +265,164 @@ public final class OclComputeQueue implements ComputeQueue {
     @Override
     public void enqueueKernelNoEvent(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize,
                                       Object[] args, GpuEvent... waitOnEvents) {
-        ensureOpen();
-        OclKernelHandle handle = prepareDispatch(kernel, globalWorkSize, localWorkSize);
-        setKernelArgs(handle, args);
-        dispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, null);
+        dispatch(kernel, globalWorkSize, localWorkSize, args, waitOnEvents, false);
     }
 
     @Override
     public GpuEvent enqueueKernel(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize,
                                    Object[] args, GpuEvent... waitOnEvents) {
-        ensureOpen();
-        OclKernelHandle handle = prepareDispatch(kernel, globalWorkSize, localWorkSize);
-        setKernelArgs(handle, args);
-        cl_event event = new cl_event();
-        dispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, event);
-        return new OclGpuEvent(event, null, profiled);
+        return dispatch(kernel, globalWorkSize, localWorkSize, args, waitOnEvents, true);
     }
 
     @Override
     public void enqueueKernelPreBound(KernelHandle kernel, long[] globalWorkSize,
                                        long[] localWorkSize, GpuEvent... waitOnEvents) {
-        ensureOpen();
-        OclKernelHandle handle = prepareDispatch(kernel, globalWorkSize, localWorkSize);
-        dispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, null);
+        dispatch(kernel, globalWorkSize, localWorkSize, null, waitOnEvents, false);
     }
 
     @Override
     public GpuEvent enqueueKernelPreBoundWithEvent(KernelHandle kernel, long[] globalWorkSize,
                                                     long[] localWorkSize, GpuEvent... waitOnEvents) {
+        return dispatch(kernel, globalWorkSize, localWorkSize, null, waitOnEvents, true);
+    }
+
+    /**
+     * One kernel dispatch: launches it, records it into an open capture, or verifies it against the
+     * capture of a replay.
+     */
+    private GpuEvent dispatch(KernelHandle kernel, long[] globalWorkSize, long[] localWorkSize,
+                              Object[] args, GpuEvent[] waitOnEvents, boolean withEvent) {
         ensureOpen();
         OclKernelHandle handle = prepareDispatch(kernel, globalWorkSize, localWorkSize);
-        cl_event event = new cl_event();
-        dispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, event);
-        return new OclGpuEvent(event, null, profiled);
+        if (args != null && args.length > 0) {
+            setKernelArgs(handle, args);
+        }
+        boolean waitsOrEvent = withEvent || (waitOnEvents != null && waitOnEvents.length > 0);
+        if (capture == Capture.REPLAYING) {
+            if (waitsOrEvent) {
+                throw new GpuGraphMismatchException("command replay of " + replayGraph + ": "
+                        + handle.kernelName() + (withEvent ? " returns an event" : " waits on events")
+                        + ", which the captured command sequence does not contain");
+            }
+            replayGraph.dispatch(handle, globalWorkSize.clone(),
+                    localWorkSize == null ? null : localWorkSize.clone());
+            return null;
+        }
+        if (capture == Capture.CAPTURING) {
+            if (waitsOrEvent) {
+                extractWaitList(waitOnEvents);
+                throw new GpuUncapturableCommandException("a " + handle.kernelName() + " dispatch that "
+                        + (withEvent ? "returns an event" : "waits on events") + " cannot be captured: enqueue it"
+                        + " before beginCapture, or return no event and wait on this queue's order");
+            }
+            recordKernel(handle, globalWorkSize, localWorkSize);
+            return null;
+        }
+        if (withEvent) {
+            cl_event event = new cl_event();
+            enqueueClDispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, event);
+            trackTiming(timingKey(handle.kernelName(), globalWorkSize, localWorkSize), event, false);
+            return new OclGpuEvent(event, null, profiled, owner);
+        }
+        cl_event event = timing != null ? new cl_event() : null;
+        enqueueClDispatch(handle, globalWorkSize, localWorkSize, waitOnEvents, event);
+        trackTiming(timingKey(handle.kernelName(), globalWorkSize, localWorkSize), event, true);
+        return null;
+    }
+
+    /** The report key of a dispatch: its kernel name and grid so per-shape times stay separable. */
+    private static String timingKey(String name, long[] globalWorkSize, long[] localWorkSize) {
+        long local = localWorkSize == null || localWorkSize.length == 0 ? 0 : localWorkSize[0];
+        return name + "#" + globalWorkSize[0] + "x" + local;
+    }
+
+    /**
+     * Queues a dispatch's event for the timing report, which reads its profiling timestamps at the
+     * next {@link #finish()}; the queue releases the event unless a returned {@link OclGpuEvent}
+     * owns it.
+     */
+    private void trackTiming(String name, cl_event event, boolean releaseOnDrain) {
+        if (timing == null || event == null) {
+            return;
+        }
+        synchronized (pendingTiming) {
+            pendingTiming.addLast(new PendingTiming(name, event, releaseOnDrain));
+        }
+    }
+
+    /** Moves every event completed by the finished queue's work into the timing report. */
+    private void drainTiming() {
+        if (timing == null) {
+            return;
+        }
+        List<PendingTiming> batch;
+        synchronized (pendingTiming) {
+            if (pendingTiming.isEmpty()) {
+                return;
+            }
+            batch = new ArrayList<>(pendingTiming);
+            pendingTiming.clear();
+        }
+        long[] start = new long[1];
+        long[] end = new long[1];
+        for (PendingTiming pending : batch) {
+            RuntimeException failure = null;
+            try {
+                OclErrors.check("clGetEventProfilingInfo", "CL_PROFILING_COMMAND_START",
+                        () -> clGetEventProfilingInfo(pending.event(), CL_PROFILING_COMMAND_START,
+                                Sizeof.cl_ulong, Pointer.to(start), null));
+                OclErrors.check("clGetEventProfilingInfo", "CL_PROFILING_COMMAND_END",
+                        () -> clGetEventProfilingInfo(pending.event(), CL_PROFILING_COMMAND_END,
+                                Sizeof.cl_ulong, Pointer.to(end), null));
+                timing.add(pending.name(), end[0] - start[0]);
+            } catch (RuntimeException e) {
+                failure = e;
+            } finally {
+                if (pending.releaseOnDrain()) {
+                    releaseQuietly(pending.event());
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+
+    /** A completed-report entry: the command's name, its event and who releases the event. */
+    private static final class PendingTiming {
+        private final String name;
+        private final cl_event event;
+        private final boolean releaseOnDrain;
+
+        PendingTiming(String name, cl_event event, boolean releaseOnDrain) {
+            this.name = name;
+            this.event = event;
+            this.releaseOnDrain = releaseOnDrain;
+        }
+
+        String name() {
+            return name;
+        }
+
+        cl_event event() {
+            return event;
+        }
+
+        boolean releaseOnDrain() {
+            return releaseOnDrain;
+        }
+    }
+
+    /** Records one dispatch of a capture, taking the sync point the next command waits on. */
+    private void recordKernel(OclKernelHandle handle, long[] globalWorkSize, long[] localWorkSize) {
+        handle.args().requireComplete();
+        OclCommandBufferApi.Recorded recorded = commandBuffers.commandNDRangeKernel(captureBuffer,
+                queue.getNativePointer(), handle.getCLKernel().getNativePointer(), globalWorkSize.length,
+                globalWorkSize, localWorkSize, captureSyncPoint);
+        captureSyncPoint = recorded.syncPoint;
+        captureNodes.add(OclGraph.Node.kernel(recorded.mutableCommand, captureKernelOrdinal++, handle,
+                globalWorkSize.clone(), localWorkSize == null ? null : localWorkSize.clone(),
+                OclGraph.snapshot(handle.args())));
     }
 
     @Override
@@ -254,10 +440,26 @@ public final class OclComputeQueue implements ComputeQueue {
         }
         cl_mem srcMem = extractClMem(src);
         cl_mem dstMem = extractClMem(dst);
+        if (capture == Capture.REPLAYING) {
+            requireNoWaitsForReplay(waitOnEvents, "a device copy");
+            replayGraph.copy((OclGpuBuffer) src, srcOffset, (OclGpuBuffer) dst, dstOffset, sizeInBytes);
+            return;
+        }
+        if (capture == Capture.CAPTURING) {
+            requireNoWaitsForCapture(waitOnEvents, "a device copy");
+            captureSyncPoint = commandBuffers.commandCopyBuffer(captureBuffer, queue.getNativePointer(),
+                    srcMem.getNativePointer(), dstMem.getNativePointer(), srcOffset, dstOffset, sizeInBytes,
+                    captureSyncPoint);
+            captureNodes.add(OclGraph.Node.copy((OclGpuBuffer) src, srcOffset, (OclGpuBuffer) dst, dstOffset,
+                    sizeInBytes));
+            return;
+        }
         cl_event[] waitList = extractWaitList(waitOnEvents);
+        cl_event event = timing != null ? new cl_event() : null;
         OclErrors.check("clEnqueueCopyBuffer", sizeInBytes + " bytes",
                 () -> clEnqueueCopyBuffer(queue, srcMem, dstMem, srcOffset, dstOffset, sizeInBytes,
-                        waitList.length, waitList.length == 0 ? null : waitList, null));
+                        waitList.length, waitList.length == 0 ? null : waitList, event));
+        trackTiming("memcpy DtoD", event, true);
     }
 
     /**
@@ -280,16 +482,30 @@ public final class OclComputeQueue implements ComputeQueue {
                     + ") exceeds the buffer size of " + dst.sizeInBytes() + " bytes");
         }
         cl_mem mem = extractClMem(dst);
-        cl_event[] waitList = extractWaitList(waitOnEvents);
         if (sizeInBytes == 0) {
             return;
         }
+        if (capture == Capture.REPLAYING) {
+            requireNoWaitsForReplay(waitOnEvents, "a device fill");
+            replayGraph.fill((OclGpuBuffer) dst, dstOffset, sizeInBytes, pattern);
+            return;
+        }
+        if (capture == Capture.CAPTURING) {
+            requireNoWaitsForCapture(waitOnEvents, "a device fill");
+            captureSyncPoint = commandBuffers.commandFillBuffer(captureBuffer, queue.getNativePointer(),
+                    mem.getNativePointer(), pattern, dstOffset, sizeInBytes, captureSyncPoint);
+            captureNodes.add(OclGraph.Node.fill((OclGpuBuffer) dst, dstOffset, sizeInBytes, pattern));
+            return;
+        }
+        cl_event[] waitList = extractWaitList(waitOnEvents);
         byte[] patternBytes = {
                 (byte) pattern, (byte) (pattern >>> 8), (byte) (pattern >>> 16), (byte) (pattern >>> 24)
         };
+        cl_event event = timing != null ? new cl_event() : null;
         OclErrors.check("clEnqueueFillBuffer", sizeInBytes + " bytes",
                 () -> clEnqueueFillBuffer(queue, mem, Pointer.to(patternBytes), patternBytes.length,
-                        dstOffset, sizeInBytes, waitList.length, waitList.length == 0 ? null : waitList, null));
+                        dstOffset, sizeInBytes, waitList.length, waitList.length == 0 ? null : waitList, event));
+        trackTiming("memset", event, true);
     }
 
     /**
@@ -299,12 +515,13 @@ public final class OclComputeQueue implements ComputeQueue {
     @Override
     public GpuEvent enqueueMarker(GpuEvent... waitOnEvents) {
         ensureOpen();
+        uncapturable("a marker");
         cl_event[] waitList = extractWaitList(waitOnEvents);
         cl_event event = new cl_event();
         OclErrors.check("clEnqueueMarkerWithWaitList", null,
                 () -> clEnqueueMarkerWithWaitList(queue, waitList.length, waitList.length == 0 ? null : waitList,
                         event));
-        return new OclGpuEvent(event, null, profiled);
+        return new OclGpuEvent(event, null, profiled, owner);
     }
 
     /**
@@ -331,6 +548,293 @@ public final class OclComputeQueue implements ComputeQueue {
         setSingleKernelArg(handle, argIndex, arg);
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Graph capture
+    // ------------------------------------------------------------------------------------------
+
+    @Override
+    public boolean supportsGraphCapture() {
+        return commandBuffers != null;
+    }
+
+    /** True when a replayed dispatch can replace a scalar argument in place (mutable dispatch). */
+    boolean supportsMutableDispatch() {
+        return commandBuffers != null && commandBuffers.mutableArguments();
+    }
+
+    @Override
+    public boolean isCapturing() {
+        return capture == Capture.CAPTURING;
+    }
+
+    /**
+     * Starts recording this queue's commands into a {@code cl_command_buffer_khr}. Kernel
+     * dispatches, device copies and fills recorded from here on execute nothing until the
+     * resulting graph is launched; host transfers, reads, markers and synchronizations are
+     * refused while recording.
+     *
+     * @throws UnsupportedOperationException when the device does not support command buffers
+     * @throws IllegalStateException         when the queue is closed, already capturing or replaying
+     * @throws RuntimeException              the translated driver failure
+     */
+    @Override
+    public void beginCapture() {
+        enter();
+        requireCaptureSupport();
+        if (capture != Capture.NONE) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue is already " + (capture == Capture.CAPTURING ? "capturing" : "replaying")
+                    + " commands");
+        }
+        captureBuffer = commandBuffers.createCommandBuffer(queue.getNativePointer(),
+                commandBuffers.simultaneousUse(), commandBuffers.mutableArguments());
+        captureSyncPoint = OclCommandBufferApi.NO_SYNC_POINT;
+        captureNodes.clear();
+        captureKernelOrdinal = 0;
+        capture = Capture.CAPTURING;
+    }
+
+    /** Refuses a capture call, naming the missing extension, on a queue without command buffers. */
+    private void requireCaptureSupport() {
+        if (commandBuffers == null) {
+            throw new UnsupportedOperationException("OpenCL "
+                    + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue does not support graph capture: the device does not support "
+                    + "cl_khr_command_buffer");
+        }
+    }
+
+    /**
+     * Finalizes the recorded command buffer and returns its graph. The commands do not run until
+     * the graph is launched. An empty capture returns null after releasing the buffer.
+     *
+     * @throws IllegalStateException when the queue is closed or not capturing
+     * @throws RuntimeException      the translated driver failure; a failed capture is discarded
+     */
+    @Override
+    public GpuGraph endCapture() {
+        enter();
+        requireCaptureSupport();
+        if (capture == Capture.REPLAYING) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue: endCapture needs a capture, a replay of " + replayGraph + " is recording");
+        }
+        if (capture != Capture.CAPTURING) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue is not capturing a graph");
+        }
+        List<OclGraph.Node> nodes = new ArrayList<>(captureNodes);
+        long commandBuffer = captureBuffer;
+        stopRecording();
+        if (nodes.isEmpty()) {
+            commandBuffers.releaseCommandBuffer(commandBuffer);
+            return null;
+        }
+        try {
+            commandBuffers.finalizeCommandBuffer(commandBuffer);
+        } catch (RuntimeException e) {
+            try {
+                commandBuffers.releaseCommandBuffer(commandBuffer);
+            } catch (RuntimeException release) {
+                e.addSuppressed(release);
+            }
+            throw e;
+        }
+        OclGraph graph = new OclGraph(this, commandBuffers, commandBuffer, commandBuffers.simultaneousUse(), nodes);
+        graphs.add(graph);
+        return graph;
+    }
+
+    /**
+     * Ends an open capture and discards the recorded commands. Does nothing when the queue is not
+     * capturing, so a failure handler can call it unconditionally.
+     *
+     * @throws IllegalStateException when a replay is recording
+     * @throws RuntimeException      the translated driver failure
+     */
+    @Override
+    public void abortCapture() {
+        enter();
+        requireCaptureSupport();
+        if (capture == Capture.REPLAYING) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue: abortCapture needs a capture, a replay of " + replayGraph + " is recording");
+        }
+        if (capture != Capture.CAPTURING) {
+            return;
+        }
+        long commandBuffer = captureBuffer;
+        stopRecording();
+        commandBuffers.releaseCommandBuffer(commandBuffer);
+    }
+
+    /** Clears the recording state and returns the command buffer it held in {@link #captureBuffer}. */
+    private void stopRecording() {
+        capture = Capture.NONE;
+        captureBuffer = 0;
+        captureSyncPoint = OclCommandBufferApi.NO_SYNC_POINT;
+        captureNodes.clear();
+    }
+
+    /**
+     * Refuses a command the recorded sequence cannot hold: during a capture the command is refused
+     * before the driver sees it, and during a replay it reports the mismatch the caller
+     * re-captures from.
+     */
+    private void uncapturable(String op) {
+        if (capture == Capture.NONE) {
+            return;
+        }
+        if (capture == Capture.REPLAYING) {
+            throw new GpuGraphMismatchException("command replay of " + replayGraph + " hit " + op
+                    + ", which the captured commands do not contain");
+        }
+        throw new GpuUncapturableCommandException("a " + op + " cannot be captured: perform host transfers and"
+                + " reads before beginCapture, and read results only after the graph has been launched");
+    }
+
+    /** A recorded copy or fill carries no events, so a wait cannot be part of the capture. */
+    private void requireNoWaitsForCapture(GpuEvent[] waits, String what) {
+        if (waits != null && waits.length > 0) {
+            extractWaitList(waits);
+            throw new GpuUncapturableCommandException("a " + what + " that waits on events cannot be captured:"
+                    + " enqueue it"
+                    + " before beginCapture, or wait on this queue's order");
+        }
+    }
+
+    /** A replayed command must match the captured sequence, which carries no events. */
+    private void requireNoWaitsForReplay(GpuEvent[] waits, String what) {
+        if (waits != null && waits.length > 0) {
+            throw new GpuGraphMismatchException("command replay of " + replayGraph + ": " + what
+                    + " waits on events, which the captured command sequence does not contain");
+        }
+    }
+
+    /**
+     * A replay's step body: commands verify against the capture instead of executing.
+     *
+     * @throws IllegalStateException when the queue is closed, another recording is active or the
+     *                               graph does not belong to this queue
+     */
+    void beginGraphReplay(OclGraph graph) {
+        enter();
+        if (capture != Capture.NONE) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue is already " + (capture == Capture.CAPTURING ? "capturing" : "replaying")
+                    + " commands");
+        }
+        if (graph.isClosed()) {
+            throw new IllegalStateException(graph + " is closed");
+        }
+        if (!graphs.contains(graph)) {
+            throw new IllegalArgumentException(graph + " was not captured on this queue");
+        }
+        replayGraph = graph;
+        capture = Capture.REPLAYING;
+    }
+
+    /** The replay submission: mutable argument updates, then one enqueue of the command buffer. */
+    void submitGraphReplay(OclGraph graph) {
+        enter();
+        if (replayGraph != graph || capture != Capture.REPLAYING) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue: " + graph + " is not replaying");
+        }
+        graph.applyUpdates();
+        enqueueCommandBuffer(graph, EMPTY_CL_EVENTS);
+    }
+
+    /** Ends a replay's step body: a failed body leaves the device untouched. */
+    void endGraphReplay(OclGraph graph, boolean submitted) {
+        if (replayGraph != graph || capture != Capture.REPLAYING) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue: " + graph + " is not replaying");
+        }
+        replayGraph = null;
+        capture = Capture.NONE;
+        if (!submitted) {
+            LOGGER.debug("Command replay of {} did not reach its submission; the caller retries", graph);
+        }
+    }
+
+    /**
+     * One launch of a captured graph on {@code target}, with its recorded commands. The command
+     * buffer was created for this queue, so it runs only here.
+     *
+     * @throws IllegalArgumentException when {@code target} is another queue
+     * @throws IllegalStateException    when the queue or graph is closed, or another recording is active
+     */
+    GpuEvent launchGraph(OclGraph graph, ComputeQueue target, GpuEvent[] waitOnEvents) {
+        if (target != this) {
+            throw new IllegalArgumentException("OpenCL graph " + graph + " runs only on the queue that captured it,"
+                    + " not on " + (target == null ? "null" : target.toString()));
+        }
+        enter();
+        if (capture != Capture.NONE) {
+            throw new IllegalStateException("OpenCL " + queueType.name().toLowerCase(java.util.Locale.ROOT)
+                    + " queue is already " + (capture == Capture.CAPTURING ? "capturing" : "replaying")
+                    + " commands");
+        }
+        if (graph.isClosed()) {
+            throw new IllegalStateException(graph + " is closed");
+        }
+        if (!graphs.contains(graph)) {
+            throw new IllegalArgumentException(graph + " was not captured on this queue");
+        }
+        cl_event[] waitList = extractWaitList(waitOnEvents);
+        enqueueCommandBuffer(graph, waitList);
+        // the command buffer carries no event of its own; a read or finish on this in-order queue
+        // observes the submission
+        return null;
+    }
+
+    /** Drains the queue so the command buffer is not pending when its mutable commands are updated. */
+    void drainForGraphUpdate() {
+        ensureOpen();
+        OclErrors.check("clFinish", null, () -> clFinish(queue));
+    }
+
+    /** Enqueues the graph's command buffer after {@code waitList} (which the caller validated). */
+    private void enqueueCommandBuffer(OclGraph graph, cl_event[] waitList) {
+        long[] waits = new long[waitList.length];
+        for (int i = 0; i < waitList.length; i++) {
+            waits[i] = waitList[i].getNativePointer();
+        }
+        if (!graph.simultaneousUse()) {
+            // a command buffer without simultaneous use cannot be enqueued while it is pending
+            OclErrors.check("clFinish", null, () -> clFinish(queue));
+        }
+        commandBuffers.enqueueCommandBuffer(graph.commandBuffer(), queue.getNativePointer(), waits);
+    }
+
+    /** Drains the queue, then releases a graph's command buffer. */
+    void releaseGraph(OclGraph graph) {
+        enter();
+        if (!graphs.contains(graph)) {
+            throw new IllegalArgumentException(graph + " was not captured on this queue");
+        }
+        RuntimeException failure = null;
+        try {
+            OclErrors.check("clFinish", null, () -> clFinish(queue));
+        } catch (RuntimeException e) {
+            failure = e;
+        }
+        try {
+            graph.destroy();
+        } catch (RuntimeException e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
+            }
+        }
+        graphs.remove(graph);
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
     @Override
     public void flush() {
         ensureOpen();
@@ -347,7 +851,11 @@ public final class OclComputeQueue implements ComputeQueue {
     @Override
     public void finish() {
         ensureOpen();
+        uncapturable("a queue synchronization");
         OclErrors.check("clFinish", null, () -> clFinish(queue));
+        drainTiming();
+
+        // clFinish completes the device work, but JOCL runs each read's CL_COMPLETE callback on a
 
         // clFinish completes the device work, but JOCL runs each read's CL_COMPLETE callback on a
         // driver thread that may not have run yet. Every callback reads its staging buffer, so all
@@ -408,11 +916,13 @@ public final class OclComputeQueue implements ComputeQueue {
     /** Finishes and releases the queue; called by the owning backend. Idempotent. */
     void closeInternal() {
         if (!closed) {
+            discardRecording();
             try {
                 // clReleaseCommandQueue only decrements the reference count and does not wait for
                 // pending commands, so the queue is finished first.
                 finish();
             } finally {
+                releaseGraphs();
                 // The queue is released even when finish() reports a device error.
                 try {
                     clReleaseCommandQueue(queue);
@@ -430,8 +940,45 @@ public final class OclComputeQueue implements ComputeQueue {
         }
     }
 
+    /** Drops an open capture and replay state so a queue being closed can finish and release. */
+    private void discardRecording() {
+        long commandBuffer = captureBuffer;
+        boolean hadCapture = capture == Capture.CAPTURING;
+        capture = Capture.NONE;
+        replayGraph = null;
+        captureBuffer = 0;
+        captureSyncPoint = OclCommandBufferApi.NO_SYNC_POINT;
+        captureNodes.clear();
+        if (hadCapture && commandBuffer != 0) {
+            try {
+                commandBuffers.releaseCommandBuffer(commandBuffer);
+            } catch (RuntimeException e) {
+                LOGGER.warn("Releasing the OpenCL {} queue's open command buffer failed: {}", queueType,
+                        e.toString());
+            }
+        }
+    }
+
+    /** Releases every graph's command buffer; the queue has drained. */
+    private void releaseGraphs() {
+        for (OclGraph graph : new ArrayList<>(graphs)) {
+            try {
+                graph.destroy();
+            } catch (RuntimeException e) {
+                LOGGER.warn("Releasing an OpenCL command buffer of the {} queue failed: {}", queueType,
+                        e.toString());
+            }
+        }
+        graphs.clear();
+    }
+
     public cl_command_queue getCLQueue() {
         return queue;
+    }
+
+    @Override
+    public KernelTiming kernelTiming() {
+        return timing;
     }
 
     /** Enqueues a non-blocking write from a staging buffer and keeps the buffer in flight. */
@@ -447,7 +994,7 @@ public final class OclComputeQueue implements ComputeQueue {
             throw e;
         }
         staging.retain(buf);
-        return new OclGpuEvent(event, null, profiled);
+        return new OclGpuEvent(event, null, profiled, owner);
     }
 
     /**
@@ -481,7 +1028,7 @@ public final class OclComputeQueue implements ComputeQueue {
         synchronized (pendingReads) {
             pendingReads.add(completion);
         }
-        return new OclGpuEvent(event, completion, profiled);
+        return new OclGpuEvent(event, completion, profiled, owner);
     }
 
     /** Validates a dispatch and returns the open handle. */
@@ -495,13 +1042,18 @@ public final class OclComputeQueue implements ComputeQueue {
         return handle;
     }
 
-    private void dispatch(OclKernelHandle handle, long[] globalWorkSize, long[] localWorkSize,
-                          GpuEvent[] waitOnEvents, cl_event event) {
+    private void enqueueClDispatch(OclKernelHandle handle, long[] globalWorkSize, long[] localWorkSize,
+                                   GpuEvent[] waitOnEvents, cl_event event) {
         cl_kernel clKernel = handle.getCLKernel();
         cl_event[] waitList = extractWaitList(waitOnEvents);
         OclErrors.check("clEnqueueNDRangeKernel", handle.kernelName(),
                 () -> clEnqueueNDRangeKernel(queue, clKernel, globalWorkSize.length, null, globalWorkSize,
                         localWorkSize, waitList.length, waitList.length == 0 ? null : waitList, event));
+    }
+
+    /** Checks the queue is open before a public entry point acts. */
+    private void enter() {
+        ensureOpen();
     }
 
     private void ensureOpen() {
@@ -608,10 +1160,9 @@ public final class OclComputeQueue implements ComputeQueue {
             return;
         }
         handle.checkArgCount(args.length);
+        // The sticky store validates the whole list before any argument reaches the driver.
+        handle.args().setAll(args);
         for (int i = 0; i < args.length; i++) {
-            if (args[i] == null) {
-                throw new IllegalArgumentException("arg " + i + " of " + handle.kernelName() + " is null");
-            }
             setSingleKernelArg(handle, i, args[i]);
         }
     }
@@ -682,6 +1233,7 @@ public final class OclComputeQueue implements ComputeQueue {
         if (status != CL_SUCCESS) {
             throw OclErrors.translate(status, "clSetKernelArg", handle.kernelName() + " arg " + index, -1, thrown);
         }
+        handle.args().set(index, arg);
     }
 
     /**

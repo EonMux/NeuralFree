@@ -31,8 +31,8 @@ import java.util.TreeMap;
  *
  * <p>The library requires the device features of {@link KernelLibraryConfig#vulkanFeatures()} (for the
  * LLM library {@link DeviceFeature#STORAGE_8BIT}, {@link DeviceFeature#STORAGE_16BIT} and
- * {@link DeviceFeature#TIMELINE_SEMAPHORE}), plus the complete inventory when the configuration asks for
- * it. {@link #resolve} picks the {@code __sg} module only when the configuration has subgroup variants,
+ * {@link DeviceFeature#TIMELINE_SEMAPHORE}), plus, when the configuration asks for it, every inventory kernel
+ * except those of {@code [cuda]} manifest sources. {@link #resolve} picks the {@code __sg} module only when the configuration has subgroup variants,
  * the index lists the module and the device reports {@link DeviceFeature#SUBGROUP_ARITHMETIC}; the backend
  * applies the local-size rule at dispatch and binds the plain module when a dispatch does not meet it.
  * Specialisation constant {@value FaSmem#VULKAN_SPEC_ID} carries {@code NF_FA_SMEM_FLOATS} (a module that
@@ -100,7 +100,7 @@ public final class VulkanKernelLibrary implements KernelLibrary {
             return Availability.no("the Vulkan device does not enable " + String.join(", ", lacking));
         }
         if (config.requireCompleteInventory()) {
-            return KernelManifest.inventoryCoverage(classLoader, libraryId(), config.sourceRoot(),
+            return KernelManifest.portableInventoryCoverage(classLoader, libraryId(), config.sourceRoot(),
                     idx.kernels.keySet(), "the Vulkan shader index");
         }
         return Availability.ok();

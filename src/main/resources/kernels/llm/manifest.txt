@@ -3,15 +3,25 @@ common/config.h
 common/math.h
 common/reduce.h
 common/quant_blocks.h
+common/fp8_codec.h
 common/iq_tables.h
 common/quant_decode_legacy.h
 common/quant_decode_k.h
 common/quant_decode_iq.h
 common/quant_decode_new.h
 common/quant_decode_ext.h
+common/q8_dot.h
+common/quant_decode_k_q8.h
+common/quant_decode_legacy_q8.h
+common/quant_decode_iq_q8.h
+common/quant_decode_new_q8.h
 common/matvec_family.h
 common/matvec_id_family.h
 common/matmul_tiled_family.h
+common/matmul_grouped_family.h
+common/matmul_mmq_config.h
+common/matmul_mmq_family.h
+common/matmul_mma_family.h
 common/rope_common.h
 common/kv_types.h
 common/attn_common.h
@@ -19,6 +29,7 @@ common/hadamard.h
 common/dsv4_common.h
 matvec_f32.cl
 matvec_f16_bf16.cl
+matvec_w12.cl
 matvec_q8_0.cl
 matvec_mxfp4.cl
 matvec_iq4_xs.cl
@@ -31,6 +42,15 @@ hadamard.cl
 act_quant.cl
 moe_matvec.cl
 matmul_tiled.cl
+moe_gemm.cl
+quant_mmq_q8_1.cl
+quantize_q8_1.cl
+matmul_mmq.cl
+[cuda] matmul_fp8.cl
+matmul_mma.cl
+matmul_cm.cl
+split_k_reduce.cl
+[cuda] moe_gemm_mma.cl
 norm.cl
 norm_ext.cl
 eltwise.cl
@@ -41,10 +61,15 @@ attn_aux.cl
 attn_ext.cl
 mla.cl
 rope.cl
+fused.cl
+multitask.cl
 kv_cache.cl
 flash_decode.cl
 flash_prefill.cl
+[cuda] flash_mma.cl
 flash_combine.cl
+cp_merge.cl
+dual_chunk_merge.cl
 recurrent/ssm_conv.cl
 recurrent/ssm_scan.cl
 recurrent/rwkv.cl
@@ -56,12 +81,18 @@ sparse/topk_rows.cl
 sparse/sparse_mla.cl
 sparse/msa.cl
 sparse/qsa.cl
+sparse/step5.cl
 dsv4/compress.cl
 dsv4/attn.cl
+dsv4/engram.cl
 hc.cl
 gemma3n.cl
 heads.cl
 audio.cl
+speech.cl
 flow.cl
+dflash.cl
+vision.cl
 sampling.cl
 sampling_topk.cl
+cert_argmax.cl

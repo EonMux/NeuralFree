@@ -3,13 +3,13 @@
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   (i n_tokens, i in_dim, i out_dim, i rank, i stage, i n_slots, i x_stride, i x_off,
- *    i y_stride, i y_off, i tmp_off, R int slots, R float A, R float B, R float x, float tmp, float y)
+ *    i y_stride, i y_off, i tmp_off, f scale, R int slots, R float A, R float B, R float x, float tmp, float y)
  *   s_t = clamp(slots[t], 0, n_slots-1); A[s][r][i] at (s*rank + r)*in_dim + i;
  *   B[s][o][r] at (s*out_dim + o)*rank + r.
  *   stage 0: tmp[tmp_off + t*rank + r] = sum_i A[s_t][r][i] * x[x_off + t*x_stride + i]
  *            one workgroup per (t, r) (linear group g = t*rank + r), reduced with nf_wg_sum;
  *            global = n_tokens*rank*L invocations, local = {L, 1, 1} with L a power of two in [32, 256].
- *   stage 1: y[y_off + t*y_stride + o] += sum_r B[s_t][o][r] * tmp[tmp_off + t*rank + r], r ascending;
+ *   stage 1: y[y_off + t*y_stride + o] += scale * sum_r B[s_t][o][r] * tmp[tmp_off + t*rank + r], r ascending;
  *            one invocation per (t, o), global = n_tokens*out_dim rounded up to L.
  * Offsets and strides are in float elements. tmp and y carry no restrict qualifier (scratch views).
  *
@@ -42,6 +42,7 @@ layout(push_constant) uniform NfLoraParams {
     int y_stride;
     int y_off;
     int tmp_off;
+    float scale;
 } pc;
 
 uint lora_slot(uint t) {
@@ -84,6 +85,6 @@ void main() {
             acc += b_in[b_row + r] * tmp_io[t_row + r];
         }
         const uint yi = uint(pc.y_off) + t * uint(pc.y_stride) + o;
-        y_io[yi] = y_io[yi] + acc;
+        y_io[yi] = y_io[yi] + pc.scale * acc;
     }
 }

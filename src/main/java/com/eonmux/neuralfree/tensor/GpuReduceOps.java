@@ -166,8 +166,8 @@ public final class GpuReduceOps {
      * and {@code t} more are summed. When the shapes are equal, or {@code target} only rearranges {@code t}'s
      * elements, the result is a contiguous copy of {@code t} with shape {@code target}. Always a new tensor.
      *
-     * @throws IllegalArgumentException when the shapes are not broadcast-compatible, or {@code target} neither
-     *                                  broadcasts to {@code t}'s shape nor has its element count
+     * @throws IllegalArgumentException when {@code target} neither broadcasts to {@code t}'s shape nor has its
+     *                                  element count
      */
     public static Tensor sumToShape(Tensor t, Shape target) {
         Objects.requireNonNull(target, "target shape must not be null");
@@ -177,14 +177,17 @@ public final class GpuReduceOps {
         }
         Shape shape = t.shape();
         if (!shape.equals(target)) {
-            boolean[] reduced = BroadcastEngine.broadcastShape(target, shape).equals(shape)
+            boolean[] reduced = BroadcastEngine.broadcastsTo(target, shape)
                     ? broadcastAxes(target, shape) : new boolean[shape.rank()];
             for (boolean r : reduced) {
                 if (r) {
                     return reduce(g, t, reduced, TrainOps.TR_R_SUM, false, target);
                 }
             }
-            shape.reshape(target.dims());
+            if (shape.numElements() != target.numElements()) {
+                throw new IllegalArgumentException("target shape " + target + " neither broadcasts to " + shape
+                        + " nor has its " + shape.numElements() + " elements");
+            }
         }
         return produce(g, t, target, DType.FLOAT32, out -> {
             if (out.numElements() > 0) {

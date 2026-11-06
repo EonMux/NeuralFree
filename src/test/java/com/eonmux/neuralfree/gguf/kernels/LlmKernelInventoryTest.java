@@ -34,7 +34,8 @@ public class LlmKernelInventoryTest {
 
     /**
      * Manifest files whose kernels exist only in the OpenCL program; must equal the {@code [opencl]} entries.
-     * Empty: every LLM kernel is portable to CUDA and Vulkan.
+     * Every LLM kernel is portable: the multi-task kernel builds on CUDA and HIP through {@code common/dialect.h}
+     * and has its Vulkan variant in {@code multitask.tsv}.
      */
     private static final Set<String> OPENCL_ONLY = Collections.emptySet();
 
@@ -68,7 +69,7 @@ public class LlmKernelInventoryTest {
     }
 
     @Test
-    public void everyVariantRowNamesAPortableKernel() throws IOException {
+    public void everyVariantRowNamesAnInventoryKernel() throws IOException {
         assertNoViolations("variant rows without a kernel", inventory().orphanVariantRowViolations(OPENCL_ONLY));
     }
 

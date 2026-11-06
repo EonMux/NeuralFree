@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.tokenizer.hf;
 import com.eonmux.neuralfree.gguf.chat.ChatTemplateSource;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
+import com.eonmux.neuralfree.utils.json.Json;
 import com.eonmux.neuralfree.utils.json.JsonView;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -36,7 +37,8 @@ import java.util.regex.Pattern;
  * template as {@code tokenizer.chat_template}, every other named template as {@code tokenizer.chat_template.<name>}
  * with its name sanitized to ASCII letters, digits and {@code _}, and the names in {@code tokenizer.chat_templates}.
  * Unlike llama.cpp's converter, which prefers the tokenizer_config entry (vocab.py:340-348), the files win, as they
- * do for transformers.
+ * do for transformers. A tokenizer_config {@code response_template} object, the response-parsing metadata of vLLM's
+ * {@code hf} and {@code beam} parsers, rides along as {@value GgufKeys#TOKENIZER_RESPONSE_TEMPLATE} (its JSON text).
  */
 public final class HfChatTemplates {
 
@@ -46,6 +48,9 @@ public final class HfChatTemplates {
     private static final String BUNDLED_DIR = "/hf/templates/";
     private static final String DEFAULT_NAME = "default";
     private static final String KEY_CHAT_TEMPLATE = "chat_template";
+    private static final String KEY_RESPONSE_TEMPLATE = "response_template";
+    /** Compact JSON with non-ASCII text kept, in document order. */
+    private static final Json.Style COMPACT = new Json.Style(false, null, ",", ":", false);
     private static final Pattern NOT_NAME_CHAR = Pattern.compile("[^A-Za-z0-9]");
     private static final Pattern BUNDLED_FILE = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]*\\.jinja");
 
@@ -53,7 +58,8 @@ public final class HfChatTemplates {
 
     /**
      * The chat template keys of the checkpoint whose tokenizer files are {@code files}; {@code fallback} is used when
-     * no file names a template. Empty when there is no template at all.
+     * no file names a template. Empty when there is no template at all. The tokenizer_config response template joins
+     * them when present.
      *
      * @param files    the tokenizer files
      * @param fallback a template source to use when the checkpoint has none, or null
@@ -61,12 +67,34 @@ public final class HfChatTemplates {
      */
     public static Map<String, Object> resolve(HfTokenizerFiles files, String fallback) throws IOException {
         Objects.requireNonNull(files, "files");
+        JsonView tokenizerConfig = files.readTokenizerConfig();
         Object template = fileTemplates(files);
-        if (template == null) template = configTemplate(files.readTokenizerConfig());
+        if (template == null) template = configTemplate(tokenizerConfig);
         if (template == null) template = configTemplate(files.readProcessorConfig());
         if (template == null) template = configTemplate(files.readChatTemplateJson());
         if (template == null) template = fallback;
-        return template == null ? Collections.<String, Object>emptyMap() : toGguf(template);
+        String response = responseTemplate(tokenizerConfig);
+        if (response == null) {
+            return template == null ? Collections.<String, Object>emptyMap() : toGguf(template);
+        }
+        Map<String, Object> out = new LinkedHashMap<>(template == null ? Collections.emptyMap() : toGguf(template));
+        out.put(GgufKeys.TOKENIZER_RESPONSE_TEMPLATE, response);
+        return Collections.unmodifiableMap(out);
+    }
+
+    /**
+     * The {@code response_template} object of tokenizer_config.json as JSON text, or null when absent; a value that is
+     * not an object is ignored, as vLLM's {@code resolve_response_template} ignores it.
+     */
+    private static String responseTemplate(JsonView config) {
+        Object value = config.raw(KEY_RESPONSE_TEMPLATE);
+        if (value == null) return null;
+        if (!(value instanceof Map)) {
+            LOGGER.warn("bad type for {} ({}); ignoring it", config.where(KEY_RESPONSE_TEMPLATE),
+                    value.getClass().getSimpleName());
+            return null;
+        }
+        return Json.toString(value, COMPACT);
     }
 
     /**

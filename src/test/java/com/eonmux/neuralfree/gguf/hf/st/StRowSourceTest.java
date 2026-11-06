@@ -176,7 +176,7 @@ public class StRowSourceTest {
         assertEquals("Q8_0", q8.toString());
 
         ElementFormat fp8 = ElementFormat.of(StDType.F8_E4M3);
-        assertNull(fp8.ggmlType());
+        assertEquals("the codes are ggml's per-element F8_E4M3FN bytes", GGMLType.F8_E4M3FN, fp8.ggmlType());
         assertFalse(fp8.isFloat());
         assertEquals(5, fp8.rowBytes(5));
 

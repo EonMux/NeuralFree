@@ -25,16 +25,35 @@ final class IntGroupSource implements RowSource {
     private final GGMLType fallback;
     private final int[] perm;
     private final Act act;
+    private final float[] columnScale;
+    private final float[] inputPreScale;
     private final String checkpoint;
     private final ElementFormat format;
     private final long rowBytes;
 
     IntGroupSource(IntWeightSpec spec, GGMLType target, GGMLType fallback, int[] perm, Act act, String checkpoint) {
+        this(spec, target, fallback, perm, act, checkpoint, null);
+    }
+
+    IntGroupSource(IntWeightSpec spec, GGMLType target, GGMLType fallback, int[] perm, Act act, String checkpoint,
+                   float[] columnScale) {
+        this(spec, target, fallback, perm, act, checkpoint, columnScale, null);
+    }
+
+    /**
+     * @param columnScale   a per-column multiplier folded into the produced values, or null
+     * @param inputPreScale the per-column multiplier the runtime applies to the activation before its quantization
+     *                      ({@link RowSource#inputPreScale()}), or null
+     */
+    IntGroupSource(IntWeightSpec spec, GGMLType target, GGMLType fallback, int[] perm, Act act, String checkpoint,
+                   float[] columnScale, float[] inputPreScale) {
         this.spec = spec;
         this.target = target;
         this.fallback = fallback;
         this.perm = perm == null ? null : perm.clone();
         this.act = act;
+        this.columnScale = columnScale == null ? null : columnScale.clone();
+        this.inputPreScale = inputPreScale == null ? null : inputPreScale.clone();
         this.checkpoint = checkpoint;
         this.format = ElementFormat.of(target);
         this.rowBytes = format.rowBytes(spec.k);
@@ -91,11 +110,16 @@ final class IntGroupSource implements RowSource {
     }
 
     @Override
+    public float[] inputPreScale() {
+        return inputPreScale == null ? null : inputPreScale.clone();
+    }
+
+    @Override
     public RowSource foldInputPerm() {
         if (perm == null) {
             throw new UnsupportedOperationException(describe() + " has no input permutation to fold");
         }
-        return new IntGroupSource(spec, fallback, fallback, null, act, checkpoint);
+        return new IntGroupSource(spec, fallback, fallback, null, act, checkpoint, columnScale, inputPreScale);
     }
 
     @Override
@@ -162,11 +186,19 @@ final class IntGroupSource implements RowSource {
             float sc = scale(s, si + g, e, row, j);
             float zz = zero(z, si + g, e, row, j);
             float x = spec.formula == Formula.MUL_ADD ? q[j] * sc + zz : (q[j] - zz) * sc;
+            if (columnScale != null) {
+                x *= preScale(e, perm == null ? j : perm[j]);
+            }
             if (target == GGMLType.F16) {
                 fp16Field(x, "value", e, row, j);
             }
             IntPacking.putFloat(out, off, j, target, x);
         }
+    }
+
+    /** The per-column activation pre-scale of expert {@code e} at input column {@code col}. */
+    private float preScale(int e, int col) {
+        return columnScale.length == spec.k ? columnScale[col] : columnScale[e * spec.k + col];
     }
 
     private void encodeBlocks(int e, long row, int[] q, float[] s, float[] z, int si, ByteBuffer out, int off)

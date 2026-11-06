@@ -55,6 +55,8 @@ public final class CpuDenseFfn implements CpuFfnBlock {
     private Projection down;
     private float[] actScales;
     private float[] subNormWeight;
+    private boolean justNorm;
+    private float justNormEps;
     private boolean bound;
     private boolean closed;
 
@@ -123,6 +125,8 @@ public final class CpuDenseFfn implements CpuFfnBlock {
             }
             checkVector(subNormWeight, layout.nFf(), DenseLayout.SUB_NORM);
         }
+        this.justNorm = spec.justNorm();
+        this.justNormEps = ctx.spec().hparams().normRmsEps();
     }
 
     /** Drops every reference a failed bind may have left, so the block reads as unbound. */
@@ -220,6 +224,9 @@ public final class CpuDenseFfn implements CpuFfnBlock {
         }
         if (subNormWeight != null) {
             CpuOps.norm(NormKind.RMS, layout.subNormEps(), act, 0, act, 0, n, nFf, subNormWeight, null);
+        }
+        if (justNorm) {
+            CpuOps.norm(NormKind.L2_GDN, justNormEps, act, 0, act, 0, n, nFf, null, null);
         }
         down.run(n, act, out);
     }

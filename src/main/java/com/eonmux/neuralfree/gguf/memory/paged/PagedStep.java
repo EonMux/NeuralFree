@@ -25,10 +25,11 @@ public final class PagedStep {
     private final int[] segStart;     // [nSeg] first ubatch row of each segment
     private final int[] segLen;       // [nSeg] rows of each segment
     private final int[] segPos0;      // [nSeg] first position of each segment
+    private final int[] segPosMax;    // [nSeg] highest stored position of each segment
     private final int[][] cellIdx;    // [groups][nTokens] physical row per token
     private final int[][] pageTable;  // [groups][maxSequences * maxPages], -1 = this list element does not exist
     private final int[][] seqSlots;   // [groups][maxSequences] slots the sequence holds after commit
-    private final int[][] kvPosRows;  // [groups][rows written], rows ascending
+    private final int[][] kvPosRows;  // [groups][rows written], ascending within each segment, in segment order
     private final int[][] kvPosValues;// [groups][counts match kvPosRows], the positions they take
     private final List<PageCopy> pageCopies;
 
@@ -43,6 +44,7 @@ public final class PagedStep {
         this.segStart = s.segStart;
         this.segLen = s.segLen;
         this.segPos0 = s.segPos0;
+        this.segPosMax = s.segPosMax;
         this.cellIdx = s.cellIdx;
         this.pageTable = s.pageTable;
         this.seqSlots = s.seqSlots;
@@ -62,6 +64,7 @@ public final class PagedStep {
         int[] segStart;
         int[] segLen;
         int[] segPos0;
+        int[] segPosMax;
         int[][] cellIdx;
         int[][] pageTable;
         int[][] seqSlots;
@@ -117,6 +120,14 @@ public final class PagedStep {
     }
 
     /**
+     * Highest stored position of segment {@code seg}: the rows of a media segment can share their base position,
+     * so the maximum is not always {@code segPos0(seg) + segLen(seg) - 1}.
+     */
+    public int segPosMax(int seg) {
+        return segPosMax[seg];
+    }
+
+    /**
      * Physical cell of each token in group {@code g}: the row its K/V is stored in.
      *
      * @throws IndexOutOfBoundsException when {@code g} is outside {@link #groups()}
@@ -148,7 +159,8 @@ public final class PagedStep {
     }
 
     /**
-     * Rows of group {@code g} whose {@code kv_pos} the step writes, ascending (the rows the step fills).
+     * Rows of group {@code g} whose {@code kv_pos} the step writes (the rows the step fills, one segment's rows
+     * ascending, the segments in order).
      *
      * @throws IndexOutOfBoundsException when {@code g} is outside {@link #groups()}
      */
@@ -158,8 +170,7 @@ public final class PagedStep {
     }
 
     /**
-     * The new {@code kv_pos} values of {@link #kvPosRows(int)} ({@code kvPosValues[i]} pairs with
-     * {@code kvPosRows[i]}), the positions of the written rows.
+     * The positions the step writes: {@code kvPosValues[i]} pairs with {@code kvPosRows[i]}.
      *
      * @throws IndexOutOfBoundsException when {@code g} is outside {@link #groups()}
      */
@@ -168,7 +179,35 @@ public final class PagedStep {
         return kvPosValues[g].clone();
     }
 
-    /** The page copies the device executes before the step (one per privatization, PARITY invariant 7). */
+    /**
+     * Writes the physical cells of sequence {@code seq}'s slots in group {@code g} into {@code dst[0, slots)} in slot
+     * order: slot {@code j} lives in cell {@code pageTable[seq * maxPages + j / pageSize] * pageSize + j % pageSize},
+     * the addressing of the paged attention kernels. A sparse selection over one sequence's slots maps its selected
+     * slots to the cells the caches are read at this way.
+     *
+     * @return the slots the sequence holds after the commit ({@code seqSlots(g)[seq]})
+     * @throws IndexOutOfBoundsException when {@code g} or {@code seq} is outside the step
+     * @throws IllegalArgumentException  when {@code dst} is shorter than the sequence's slots
+     */
+    public int seqCells(int g, int seq, int[] dst) {
+        checkGroup(g);
+        if (seq < 0 || seq >= maxSequences) {
+            throw new IndexOutOfBoundsException("sequence " + seq + " outside [0, " + maxSequences + ")");
+        }
+        int slots = seqSlots[g][seq];
+        if (Objects.requireNonNull(dst, "dst").length < slots) {
+            throw new IllegalArgumentException("sequence " + seq + " holds " + slots + " slots in group " + g
+                    + ", the cell array " + dst.length);
+        }
+        int[] table = pageTable[g];
+        int base = seq * maxPages;
+        for (int j = 0; j < slots; j++) {
+            dst[j] = table[base + j / pageSize] * pageSize + j % pageSize;
+        }
+        return slots;
+    }
+
+    /** The page copies the device executes before the step (one per privatization). */
     public List<PageCopy> pageCopies() {
         return pageCopies;
     }
@@ -230,7 +269,8 @@ public final class PagedStep {
         }
 
         /**
-         * Segment metadata of the step (one segment per sequence), taken from the step layout.
+         * Segment metadata of the step (one segment per sequence), taken from the step layout; each segment's
+         * highest stored position is {@code pos0 + len - 1}.
          *
          * @throws IllegalArgumentException when the arrays differ in length or hold negative values
          */
@@ -242,16 +282,31 @@ public final class PagedStep {
             s.segStart = start.clone();
             s.segLen = len.clone();
             s.segPos0 = pos0.clone();
+            s.segPosMax = new int[seq.length];
+            for (int k = 0; k < seq.length; k++) {
+                s.segPosMax[k] = pos0[k] + len[k] - 1;
+            }
+            return this;
+        }
+
+        /** Overrides {@link #segments}' per-segment highest stored position with explicit values. */
+        Builder segPosMax(int[] posMax) {
+            if (posMax.length != s.segPosMax.length) {
+                throw new IllegalArgumentException("segment position maxima cover " + posMax.length
+                        + " segments, the step holds " + s.segPosMax.length);
+            }
+            s.segPosMax = posMax.clone();
             return this;
         }
 
         /**
-         * Cell of ubatch row {@code row} in group {@code g}.
+         * Cell of ubatch row {@code row} in group {@code g}. A cell of {@code -1} marks a row this memory does not
+         * store (a context-parallel page shard's foreign-page row); every store kernel skips negative cells.
          *
          * @throws IllegalStateException when the cell is out of range
          */
         Builder cell(int g, int row, int cell) {
-            if (cell < 0 || cell >= s.nPages * s.pageSize) {
+            if (cell < -1 || cell >= s.nPages * s.pageSize) {
                 throw new IllegalStateException("cell " + cell + " outside the " + s.nPages + "x" + s.pageSize
                         + " rows of group " + g);
             }
@@ -275,13 +330,28 @@ public final class PagedStep {
             return this;
         }
 
+        /**
+         * Appends the rows of one segment whose {@code kv_pos} the step writes (the rows and their positions, a
+         * segment's rows ascending); the step's arrays carry every segment's rows in segment order.
+         *
+         * @throws IllegalStateException when the arrays differ in length
+         */
         Builder kvPos(int g, int[] rows, int[] values) {
             if (rows.length != values.length) {
                 throw new IllegalStateException("kv_pos rows/values length mismatch");
             }
-            s.kvPosRows[g] = rows;
-            s.kvPosValues[g] = values;
+            s.kvPosRows[g] = concat(s.kvPosRows[g], rows);
+            s.kvPosValues[g] = concat(s.kvPosValues[g], values);
             return this;
+        }
+
+        private static int[] concat(int[] head, int[] tail) {
+            if (head.length == 0) {
+                return tail.clone();
+            }
+            int[] out = Arrays.copyOf(head, head.length + tail.length);
+            System.arraycopy(tail, 0, out, head.length, tail.length);
+            return out;
         }
 
         Builder copy(PageCopy c) {

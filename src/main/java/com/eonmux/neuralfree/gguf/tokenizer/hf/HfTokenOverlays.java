@@ -43,6 +43,8 @@ final class HfTokenOverlays {
     private static final String CLEAN_UP_BPE_FLAG =
             "clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output";
     private static final String CLEAN_UP = "clean_up_tokenization_spaces";
+    /** {@code BertTokenizer}'s default {@code unk_token} (tokenization_bert.py). */
+    private static final String WORD_PIECE_UNK = "[UNK]";
 
     private HfTokenOverlays() {}
 
@@ -245,6 +247,18 @@ final class HfTokenOverlays {
         if (prefix != null && !prefix.isEmpty()) md.put(GgufKeys.NF_TOKENIZER_BPE_CONTINUING_SUBWORD_PREFIX, prefix);
         String suffix = m.endOfWordSuffix();
         if (suffix != null && !suffix.isEmpty()) md.put(GgufKeys.NF_TOKENIZER_BPE_END_OF_WORD_SUFFIX, suffix);
+    }
+
+    /**
+     * Sets the unknown token id a Hugging Face WordPiece tokenizer encodes unmatched words with on a fingerprint
+     * candidate whose special tokens set none: tokenizer.json's {@code model.unk_token}, or without a tokenizer.json
+     * the {@code [UNK]} default of {@code BertTokenizer}. The converter fingerprints with that tokenizer but writes no
+     * such id, so only the candidate carries it. Nothing is set when the token is not in the vocabulary.
+     */
+    static void putWordPieceUnk(Map<String, Object> candidate, HfTokenizerJson tj, Map<String, Integer> tokenIds) {
+        String unkToken = tj != null ? tj.model().unkToken() : WORD_PIECE_UNK;
+        Integer unk = unkToken != null ? tokenIds.get(unkToken) : null;
+        if (unk != null) candidate.putIfAbsent(GgufKeys.TOKENIZER_UNK_ID, unk);
     }
 
     /** The canonical JSON of a tokenizer.json normalizer, or null when it is absent or the identity. */

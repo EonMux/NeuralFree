@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.TokenCallback;
+import com.eonmux.neuralfree.gguf.engine.draft.VerifyMode;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -83,6 +84,11 @@ public final class SpeculativeSession implements AutoCloseable {
         return decoder.draftMin();
     }
 
+    /** How the session verifies proposals ({@code neuralfree.draft.verify}). */
+    public VerifyMode verifyMode() {
+        return decoder.verifyMode();
+    }
+
     /** The reasoning parser of the target's chat template. */
     public ReasoningFilter reasoning() {
         return decoder.reasoning();
@@ -151,6 +157,7 @@ public final class SpeculativeSession implements AutoCloseable {
     @Override
     public String toString() {
         return "SpeculativeSession{" + target.name() + " + " + drafterKind + ", draftMax=" + decoder.draftMax()
-                + ", draftMin=" + decoder.draftMin() + (closed ? ", closed" : "") + '}';
+                + ", draftMin=" + decoder.draftMin() + ", verify=" + decoder.verifyMode() + (closed ? ", closed" : "")
+                + '}';
     }
 }

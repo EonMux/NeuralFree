@@ -18,12 +18,16 @@ import com.eonmux.neuralfree.gguf.engine.sampling.TopPStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TemperatureStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TypicalStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.XtcStage;
+import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
+import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkState;
+import com.eonmux.neuralfree.gguf.engine.watermark.Watermarker;
 import com.eonmux.neuralfree.gguf.tokenizer.SpecialTokens;
 import com.eonmux.neuralfree.gguf.tokenizer.TokenizerVocab;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -37,6 +41,13 @@ import java.util.concurrent.ThreadLocalRandom;
  * <ol>
  *   <li>the fixed bias stage: banned tokens ({@code tokenizer.ggml.suppress_tokens}, end-of-generation tokens under
  *       ignore-eos) get {@code -inf} (llama_sampler_logit_bias_apply);</li>
+ *   <li>the constraint head: the chain's constraining stages (the request's grammars) and masking stages
+ *       ({@code allowed_token_ids}, bad words, the min-tokens ban) mask the set before any configured stage,
+ *       in chain order — the grammars first, the yielding min-tokens ban behind the other masks — so the
+ *       truncating stages operate on the admitted set as llama.cpp's grammar-first resample (common/sampling.cpp
+ *       applies the grammar before the chain) and vLLM's pre-sampling logits processors (allowed_token_ids and
+ *       bad words before any sampling stage) keep them; an empty admitted set refuses with {@link
+ *       ConstraintDeadEndException};</li>
  *   <li>the configured stages, one per configured kind, applied in the order's sequence;
  *       a disabled stage (top-k 0, top-p 1, min-p 0, typical-p 1, penalties off, DRY with a 0 multiplier, top-n-sigma
  *       below 0, XTC with a probability of 0 or a threshold above 0.5) applies nothing exactly as llama.cpp skips it,
@@ -53,40 +64,144 @@ import java.util.concurrent.ThreadLocalRandom;
  * on top, they are additionally skipped when locally typical sampling is inactive, as llama.cpp's greedy sampler
  * only needs the argmax of such a set.
  *
+ * <p>A chain built with a watermark ({@link SamplerConfig#watermark}) replaces the categorical draw by the keyed
+ * Gumbel-max selection of {@link Watermarker} over the chain's final candidates, except under greedy decoding,
+ * which has no distribution to shift; the reported probabilities stay the ordinary softmax. The chain accepts a
+ * prompt through {@link #acceptPrompt}, which marks where the generated part starts for the repeated-context
+ * search.
+ *
  * <p>Candidates keep llama.cpp's {@code llama_token_data_array} semantics: the stages operate on the current
  * candidate set in its current order, and a {@code sorted} flag records whether it is in descending logit order.
  * Sorting is deterministic: equal logits keep their current relative order, so a vocabulary-ordered set breaks
  * ties by the lower token id.
  *
  * <p>A sampler is a mutable runtime object owned by one generation: it holds the chain stages (with the penalty
- * history), the RNG and reusable candidate buffers. Not thread-safe.
+ * history), the RNG and reusable candidate buffers. Its stages' state can be saved and restored ({@link #saveState})
+ * and a token sequence checked against its grammar stages ({@link #admittedPrefix}), which speculative verification
+ * uses to score draft rows ahead of their confirmation. Not thread-safe.
  */
 public final class Sampler {
 
     private static final int[] NO_TOKENS = new int[0];
 
+    /** Most distinct penalized tokens one device prefilter row carries; a wider window keeps the host path. */
+    public static final int MAX_PREFILTER_PENALTY_TOKENS = 16384;
+    /** Longest DRY window one device prefilter row carries. */
+    public static final int MAX_PREFILTER_DRY_WINDOW = 256;
+    /** Most restart sequences one device prefilter row carries. */
+    public static final int MAX_PREFILTER_DRY_BREAKERS = 8192;
+    /** Most restart-sequence tail tokens one device prefilter row carries. */
+    public static final int MAX_PREFILTER_DRY_TAIL_IDS = 16384;
+
     private final int[] banned;
     private final boolean penalties;
+    private final int minKeep;
+    private final float dryMultiplier;
     private final int topK;
+    private final float topP;
+    private final float minP;
     private final float typicalP;
+    private final float topNSigma;
+    private final float xtcProbability;
+    private final float xtcThreshold;
+    private final float dynatempRange;
     private final boolean greedy;
     private final long seed;
+    /** Candidates the fixed bias stage masks: the banned and the logit-biased tokens. */
+    private final int coneExtra;
+    /** Whether a logit bias raises a token, so no device cone contains the chain's keeps. */
+    private final boolean positiveBias;
     private final SamplerStage biasStage;
     private final List<SamplerStage> chain;
+    /**
+     * The chain's constraint stages ({@link SamplerStage#constrains}, {@link SamplerStage#masks}), the mask the
+     * chain applies first.
+     */
+    private List<SamplerStage> constraints;
+    /**
+     * The chain's device prefilter plan: the penalties and DRY stages a device readout reproduces before its
+     * top-k, the cone width it needs and the row it uploads ({@link LogitPrefilter}).
+     */
+    private final SamplerDeviceFilter deviceFilter;
     private final Candidates cur = new Candidates();
     private Mt19937 rng;
+    /** The watermark that replaces the categorical draw, or null for an ordinary chain. */
+    private final Watermarker watermarker;
+    /** The watermark's PRF context and repeated-context history, or null without a watermark. */
+    private final WatermarkState watermarkState;
+    /** The request's watermark configuration, or null. */
+    private final WatermarkConfig watermarkConfig;
 
     private Sampler(int[] banned, int[] biasedIds, float[] biases, SamplerConfig config, long seed, boolean greedy,
-                    SamplerVocab vocab) {
+                    SamplerVocab vocab, boolean speculativeTarget) {
         this.banned = banned;
         this.penalties = config.penaltiesEnabled();
+        this.minKeep = config.minKeep();
+        this.dryMultiplier = config.dryMultiplier();
         this.topK = config.topK();
+        this.topP = config.topP();
+        this.minP = config.minP();
         this.typicalP = config.typicalP();
+        this.topNSigma = config.topNSigma();
+        this.xtcProbability = config.xtcProbability();
+        this.xtcThreshold = config.xtcThreshold();
+        this.dynatempRange = config.dynatempRange();
         this.greedy = greedy;
         this.seed = seed;
+        this.coneExtra = banned.length + biasedIds.length;
+        boolean positive = false;
+        for (float bias : biases) {
+            positive |= bias > 0f;
+        }
+        this.positiveBias = positive;
         this.biasStage = new BiasStage(banned, biasedIds, biases);
         this.chain = buildChain(config, seed, vocab);
+        this.constraints = constraintsOf(chain);
+        this.deviceFilter = new SamplerDeviceFilter(this, chain, biasStage, banned, coneExtra, config);
+        this.deviceFilter.refresh();
         this.rng = new Mt19937(seed);
+        WatermarkConfig watermark = config.watermark();
+        if (watermark != null && (config.mirostat() != SamplerConfig.MIROSTAT_OFF
+                || config.order().contains(StageKind.ADAPTIVE_P))) {
+            // these stages select the token themselves, so the keyed draw would never run
+            throw new IllegalArgumentException("watermarking: a mirostat or adaptive_p chain selects tokens itself,"
+                    + " so the watermark's keyed draw would not apply; disable the watermark or the terminal"
+                    + " selector");
+        }
+        this.watermarker = watermark == null ? null
+                : speculativeTarget ? watermark.targetWatermarker() : Watermarker.create(watermark);
+        this.watermarkState = watermark == null ? null : new WatermarkState(watermark);
+        this.watermarkConfig = watermark;
+    }
+
+    /**
+     * The chain's constraint stages ({@link SamplerStage#constrains}, {@link SamplerStage#masks}) in chain
+     * order; empty when it has none.
+     */
+    private static List<SamplerStage> constraintsOf(List<SamplerStage> chain) {
+        List<SamplerStage> constraints = new ArrayList<>(1);
+        for (SamplerStage stage : chain) {
+            if (stage.constrains() || stage.masks()) {
+                constraints.add(stage);
+            }
+        }
+        return constraints.isEmpty() ? List.of() : Collections.unmodifiableList(constraints);
+    }
+
+    /** Whether the chain carries constraint stages (a grammar, the request's masks), which {@link #coneWidth}
+     * refuses: the head masks over the whole row, so a device cone carries no chain that has one. */
+    public boolean hasConstraints() {
+        return !constraints.isEmpty();
+    }
+
+    /** Index of the chain's first top-k stage, or -1. */
+    private int topKIndex() {
+        for (int i = 0; i < chain.size(); i++) {
+            if (chain.get(i).kind() == StageKind.TOP_K) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /** llama.cpp's chain construction (common/sampling.cpp:344-416). */
@@ -173,7 +288,7 @@ public final class Sampler {
             }
         }
         long seed = config.seeded() ? config.seed() : randomSeed();
-        return new Sampler(banned, new int[0], new float[0], config, seed, config.isGreedy(), vocab);
+        return new Sampler(banned, new int[0], new float[0], config, seed, config.isGreedy(), vocab, false);
     }
 
     /**
@@ -191,6 +306,22 @@ public final class Sampler {
     /** {@link #create(SamplerConfig, int[], Map)} with the vocabulary the DRY and infill stages read. */
     public static Sampler create(SamplerConfig config, int[] bannedTokens, Map<Integer, Float> logitBias,
                                  SamplerVocab vocab) {
+        return create(config, bannedTokens, logitBias, vocab, false);
+    }
+
+    /**
+     * The chain of a speculative target ({@link SpeculativeDecoder}, the batch engine's speculating sequences): as
+     * {@link #create(SamplerConfig, int[], Map, SamplerVocab)}, except that a configured watermark uses its target
+     * role ({@link WatermarkConfig#targetWatermarker()}) — key B of a dual-key configuration — because the target
+     * never routes: the draft role samples the proposals.
+     */
+    public static Sampler createForSpeculativeTarget(SamplerConfig config, int[] bannedTokens,
+                                                     Map<Integer, Float> logitBias, SamplerVocab vocab) {
+        return create(config, bannedTokens, logitBias, vocab, true);
+    }
+
+    private static Sampler create(SamplerConfig config, int[] bannedTokens, Map<Integer, Float> logitBias,
+                                  SamplerVocab vocab, boolean speculativeTarget) {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(bannedTokens, "bannedTokens");
         int[] ids = new int[logitBias == null ? 0 : logitBias.size()];
@@ -212,24 +343,33 @@ public final class Sampler {
             }
         }
         long seed = config.seeded() ? config.seed() : randomSeed();
-        return new Sampler(banned, ids, biases, config, seed, config.isGreedy(), vocab);
+        return new Sampler(banned, ids, biases, config, seed, config.isGreedy(), vocab, speculativeTarget);
     }
 
     /**
-     * {@link #create(SamplerConfig, int[], SamplerVocab)} with the Java-API custom {@code extra} stages applied, in
-     * their list order, immediately before the temperature stage (or directly before the dist stage when the order
-     * has no temperature kind), so a custom stage always runs, including under greedy decoding.
+     * {@link #create(SamplerConfig, int[], SamplerVocab)} with the Java-API custom {@code extra} stages applied,
+     * in their list order, immediately before the temperature stage (or directly before the dist stage when the
+     * order has no temperature kind), so a custom stage always runs, including under greedy decoding. A stage
+     * that constrains ({@link SamplerStage#constrains}, a grammar) or masks ({@link SamplerStage#masks},
+     * {@code allowed_token_ids}, bad words, the min-tokens ban) applies from the chain's constraint head
+     * instead, before every configured stage ({@link #apply}).
      *
-     * @throws IllegalArgumentException when {@code extra} or one of its entries is null
+     * @throws NullPointerException     when {@code extra} is null
+     * @throws IllegalArgumentException when one of the {@code extra} entries is null
      */
     public static Sampler create(SamplerConfig config, int[] bannedTokens, List<SamplerStage> extra) {
-        return create(config, bannedTokens, extra, null);
+        Objects.requireNonNull(extra, "extra stages");
+        Sampler sampler = create(config, bannedTokens, (SamplerVocab) null);
+        insertExtras(sampler, extra);
+        return sampler;
     }
 
     /**
      * {@link #create(SamplerConfig, int[], Map)} with the Java-API custom {@code extra} stages applied, in their
      * list order, immediately before the temperature stage (or directly before the dist stage when the order has
-     * no temperature kind), so a custom stage always runs, including under greedy decoding.
+     * no temperature kind), so a custom stage always runs, including under greedy decoding; a constraining one
+     * ({@link SamplerStage#constrains}) or a masking one ({@link SamplerStage#masks}) applies from the chain's
+     * constraint head instead ({@link #apply}).
      *
      * @throws IllegalArgumentException when {@code extra} or one of its entries is null
      */
@@ -258,20 +398,113 @@ public final class Sampler {
             insertAt = i + 1;
         }
         chain.addAll(insertAt, extra);
+        sampler.constraints = constraintsOf(chain);
+        sampler.deviceFilter.refresh();
+    }
+
+    /**
+     * Inserts {@code processors} at the head of {@code sampler}'s configured chain, after the constraint head's
+     * grammar and request masks and before penalties, top-k and the rest: vLLM applies custom logits processors to
+     * the logits after {@code allowed_token_ids} and bad words and before its sampling stages, so a processor sees
+     * (and may change) the whole candidate set. A processor that constrains or masks joins the constraint head after
+     * the request's own stages, so the grammar stays the first mask.
+     */
+    private static void insertLogitsProcessors(Sampler sampler, List<SamplerStage> processors) {
+        for (SamplerStage stage : processors) {
+            if (stage == null) {
+                throw new IllegalArgumentException("logits processor list contains a null stage");
+            }
+        }
+        if (processors.isEmpty()) {
+            return;
+        }
+        List<SamplerStage> chain = sampler.chain;
+        chain.addAll(0, processors);
+        List<SamplerStage> constraints = new ArrayList<>(sampler.constraints);
+        for (SamplerStage stage : processors) {
+            if (stage.constrains() || stage.masks()) {
+                constraints.add(stage);
+            }
+        }
+        sampler.constraints = constraints.isEmpty() ? List.of() : Collections.unmodifiableList(constraints);
+        sampler.deviceFilter.refresh();
     }
 
     /**
      * {@link #create(SamplerConfig, int[], SamplerVocab)} with the Java-API custom {@code extra} stages applied, in
      * their list order, immediately before the temperature stage (or directly before the dist stage when the order
-     * has no temperature kind), so a custom stage always runs, including under greedy decoding.
+     * has no temperature kind), so a custom stage always runs, including under greedy decoding; a constraining one
+     * ({@link SamplerStage#constrains}) or a masking one ({@link SamplerStage#masks}) applies from the chain's
+     * constraint head instead ({@link #apply}). The vocabulary is required here: request stages read it;
+     * {@link #create(SamplerConfig, int[], List)} builds without one.
      *
-     * @throws IllegalArgumentException when {@code extra} or one of its entries is null
+     * @throws NullPointerException     when {@code extra} or {@code vocab} is null
+     * @throws IllegalArgumentException when one of the {@code extra} entries is null
      */
     public static Sampler create(SamplerConfig config, int[] bannedTokens, List<SamplerStage> extra,
                                  SamplerVocab vocab) {
         Objects.requireNonNull(extra, "extra stages");
+        Objects.requireNonNull(vocab, "vocab");
         Sampler sampler = create(config, bannedTokens, vocab);
         insertExtras(sampler, extra);
+        return sampler;
+    }
+
+    /**
+     * {@link #create(SamplerConfig, int[], List)} with the custom logits processors {@code processors} applied at
+     * the head of the configured chain, so they run after the constraint head's grammar and request masks and
+     * before penalties, top-k, top-p, min-p and the rest; a processor that constrains ({@link
+     * SamplerStage#constrains}) or masks ({@link SamplerStage#masks}) joins the constraint head after the request's
+     * stages. They run under greedy decoding too, and any stage whose {@link SamplerStage#modifies} is true keeps
+     * the device argmax and cone paths from skipping them.
+     *
+     * @throws NullPointerException     when {@code extra} or {@code processors} is null
+     * @throws IllegalArgumentException when one of the entries is null
+     */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, List<SamplerStage> extra,
+                                 List<SamplerStage> processors) {
+        Objects.requireNonNull(extra, "extra stages");
+        Objects.requireNonNull(processors, "logits processors");
+        Sampler sampler = create(config, bannedTokens, extra);
+        insertLogitsProcessors(sampler, processors);
+        return sampler;
+    }
+
+    /**
+     * {@link #create(SamplerConfig, int[], Map, List, SamplerVocab)} with the custom logits processors
+     * {@code processors} at the chain head ({@link #create(SamplerConfig, int[], List, List)}).
+     *
+     * @throws NullPointerException     when {@code extra}, {@code processors} or {@code vocab} is null
+     * @throws IllegalArgumentException when one of the entries is null
+     */
+    public static Sampler create(SamplerConfig config, int[] bannedTokens, Map<Integer, Float> logitBias,
+                                 List<SamplerStage> extra, List<SamplerStage> processors, SamplerVocab vocab) {
+        Objects.requireNonNull(extra, "extra stages");
+        Objects.requireNonNull(processors, "logits processors");
+        Sampler sampler = create(config, bannedTokens, logitBias, extra, vocab);
+        insertLogitsProcessors(sampler, processors);
+        return sampler;
+    }
+
+    /** {@link #createForSpeculativeTarget(SamplerConfig, int[], Map, SamplerVocab)} with the {@code extra} stages. */
+    public static Sampler createForSpeculativeTarget(SamplerConfig config, int[] bannedTokens,
+                                                     Map<Integer, Float> logitBias, List<SamplerStage> extra,
+                                                     SamplerVocab vocab) {
+        Objects.requireNonNull(extra, "extra stages");
+        Objects.requireNonNull(vocab, "vocab");
+        Sampler sampler = create(config, bannedTokens, logitBias, vocab, true);
+        insertExtras(sampler, extra);
+        return sampler;
+    }
+
+    /** {@link #createForSpeculativeTarget(SamplerConfig, int[], Map, List, SamplerVocab)} with the processors. */
+    public static Sampler createForSpeculativeTarget(SamplerConfig config, int[] bannedTokens,
+                                                     Map<Integer, Float> logitBias, List<SamplerStage> extra,
+                                                     List<SamplerStage> processors, SamplerVocab vocab) {
+        Objects.requireNonNull(extra, "extra stages");
+        Objects.requireNonNull(processors, "logits processors");
+        Sampler sampler = createForSpeculativeTarget(config, bannedTokens, logitBias, extra, vocab);
+        insertLogitsProcessors(sampler, processors);
         return sampler;
     }
 
@@ -296,7 +529,7 @@ public final class Sampler {
         long s = seed == SamplerConfig.RANDOM_SEED ? randomSeed() : seed;
         SamplerConfig config = SamplerConfig.builder().topK(topK).topP(topP).minP(0f).typicalP(1f)
                 .temperature(temperature).penaltyLastN(0).seed(s).build();
-        return new Sampler(NO_TOKENS, new int[0], new float[0], config, s, false, null);
+        return new Sampler(NO_TOKENS, new int[0], new float[0], config, s, false, null, false);
     }
 
     /**
@@ -395,6 +628,12 @@ public final class Sampler {
         public int[] tokenize(String text) {
             return tokenizer.encode(text, false, false);
         }
+
+        /** detokenize semantics of the tag passes: special tokens named in the text resolve to their ids. */
+        @Override
+        public int[] tokenizeSpecial(String text) {
+            return tokenizer.encode(text, false, true);
+        }
     }
 
     /** A fresh non-negative seed for {@link SamplerConfig#RANDOM_SEED}. */
@@ -412,26 +651,81 @@ public final class Sampler {
         return greedy;
     }
 
+    /** The request's watermark configuration, or null for an ordinary chain. */
+    public WatermarkConfig watermarkConfig() {
+        return watermarkConfig;
+    }
+
+    /** Whether the chain selects its token with the watermark's keyed draw. */
+    public boolean watermarked() {
+        return watermarker != null;
+    }
+
+    /** The PRF context of the chain's next draw, oldest first ({@code -1} where the history is shorter). */
+    public int[] watermarkContext() {
+        if (watermarkState == null) {
+            throw new IllegalStateException("the chain carries no watermark");
+        }
+        return watermarkState.context();
+    }
+
+    /** Whether the context of the chain's next draw already occurred in the searched history. */
+    public boolean watermarkRepeatedContext() {
+        return watermarkState != null && watermarkState.repeatedContext();
+    }
+
     /**
-     * True when the chain reduces to the argmax of the raw logits: no banned tokens, no penalties, no enabled llama.cpp
-     * stage that edits or trims the set (dry, top-n-sigma, xtc, infill, a dynamic temperature range), no mirostat or
-     * adaptive-p terminal selector, and either greedy without typical-p or a top-k of 1 (llama.cpp common/sampling.cpp
-     * also replaces the draw by greedy for {@code top_k == 1}). A forward backend's on-device argmax then selects the
-     * same token.
+     * The watermark's keyed selection over an explicit candidate set — token ids with their scores — under the
+     * chain's current context. Speculative rejection sampling draws a rejected position's replacement from the
+     * residual distribution through this method, so the replacement carries the target key like the chain's own
+     * draws (vLLM's resample kernel).
+     *
+     * @throws IllegalStateException when the chain carries no watermark
+     * @throws IllegalArgumentException when the arrays disagree with {@code count}
+     */
+    public int watermarkedDraw(int[] tokenIds, float[] scores, int count) {
+        if (watermarker == null) {
+            throw new IllegalStateException("the chain carries no watermark");
+        }
+        return watermarker.sample(tokenIds, scores, count, watermarkState.context(),
+                rng::nextCanonicalDouble);
+    }
+
+    /**
+     * True when the chain reduces to the argmax of the raw logits: no banned tokens, no {@code logit_bias} entry,
+     * no penalties, no enabled llama.cpp stage that edits or trims the set (dry, top-n-sigma, xtc, infill, a dynamic
+     * temperature range), no mirostat or adaptive-p terminal selector, no Java-API custom stage whose
+     * {@link SamplerStage#modifies} is true, no watermark replacing the draw, and either greedy without typical-p or
+     * a top-k of 1 (llama.cpp common/sampling.cpp also replaces the draw by greedy for {@code top_k == 1}). A
+     * forward backend's on-device argmax then selects the same token.
      */
     public boolean argmaxOnly() {
-        if (banned.length != 0 || penalties || !(greedy && typicalP >= 1f) && topK != 1) {
+        return coneExtra == 0 && argmaxChain();
+    }
+
+    /**
+     * The stage conditions of {@link #argmaxOnly} without the sparse-edit one: a chain this holds for selects the
+     * argmax of its candidates whatever the fixed bias stage did to them, because every stage it carries either
+     * preserves the argmax or runs after the one candidate is left. With no positive bias the edits only lower a
+     * logit, so the winner lies among the largest {@code coneExtra + 1} raw logits ({@link #coneWidth}).
+     */
+    private boolean argmaxChain() {
+        if (watermarker != null && !greedy) {
+            // the watermark's selection is not the argmax; the device's greedy id would skip it
+            return false;
+        }
+        if (penalties || !(greedy && typicalP >= 1f) && topK != 1) {
             return false;
         }
         for (SamplerStage stage : chain) {
             StageKind kind = stage.kind();
-            if (kind == null || kind == StageKind.PENALTIES || kind == StageKind.TOP_K || kind == StageKind.TYPICAL_P
+            if (kind == StageKind.PENALTIES || kind == StageKind.TOP_K || kind == StageKind.TYPICAL_P
                     || kind == StageKind.TOP_P || kind == StageKind.MIN_P || kind == StageKind.TEMPERATURE) {
                 // the argmax cone (they preserve or are ignored by the argmax; penalties were checked)
                 continue;
             }
-            // dry, top_n_sigma, xtc, infill and the terminal selectors edit the set - but a dry or top-n-sigma or
-            // xtc stage whose llama.cpp disable gate is hit never does, keeping the argmin chain argmax.
+            // every other stage - a null-kind request stage (grammar, min-tokens, bad-words, reasoning-budget)
+            // included - must prove it leaves the argmax alone; the on-device argmax sees no mask
             if (stage.modifies()) {
                 return false;
             }
@@ -443,6 +737,9 @@ public final class Sampler {
     public void accept(int token) {
         for (SamplerStage stage : chain) {
             stage.accept(token);
+        }
+        if (watermarkState != null) {
+            watermarkState.accept(token);
         }
     }
 
@@ -457,19 +754,145 @@ public final class Sampler {
         }
     }
 
+    /**
+     * Accepts a prompt into the chain's history stages, marking where the generated part starts: the watermark's
+     * {@code single_turn} repeated-context search looks only at the tokens accepted after it. A chain without a
+     * watermark accepts the tokens exactly as {@link #accept(int[], int, int)} does.
+     */
+    public void acceptPrompt(int[] tokens, int off, int n) {
+        if (watermarkState == null) {
+            accept(tokens, off, n);
+            return;
+        }
+        watermarkState.startPrompt();
+        try {
+            accept(tokens, off, n);
+        } finally {
+            watermarkState.endPrompt();
+        }
+    }
+
     /** Forgets the chain's histories and restarts the RNG from {@link #seed()}. */
     public void reset() {
         for (SamplerStage stage : chain) {
             stage.reset();
         }
+        if (watermarkState != null) {
+            watermarkState.reset();
+        }
         rng = new Mt19937(seed);
+    }
+
+    /**
+     * A copy of the chain's state, every stage's {@link SamplerStage#saveState}, which
+     * {@link #restoreState} puts back; the random streams are not part of it. Speculative verification feeds draft
+     * tokens ahead of their confirmation and restores this state when a rejected one has to leave the history
+     * (vLLM's grammar rollback).
+     */
+    public Object saveState() {
+        Object[] states = new Object[chain.size()];
+        for (int i = 0; i < states.length; i++) {
+            states[i] = chain.get(i).saveState();
+        }
+        return new ChainState(this, states, watermarkState == null ? null : watermarkState.save());
+    }
+
+    /**
+     * Puts back a state {@link #saveState} returned on this sampler.
+     *
+     * @throws IllegalArgumentException for a state of another sampler or of another kind
+     */
+    public void restoreState(Object state) {
+        if (!(state instanceof ChainState) || ((ChainState) state).owner != this) {
+            throw new IllegalArgumentException("not a state of this sampler: " + state);
+        }
+        Object[] states = ((ChainState) state).states;
+        for (int i = 0; i < states.length; i++) {
+            chain.get(i).restoreState(states[i]);
+        }
+        WatermarkState.Snapshot watermark = ((ChainState) state).watermark;
+        if (watermark != null) {
+            watermarkState.restore(watermark);
+        }
+    }
+
+    /**
+     * The length of the longest prefix of {@code tokens} the chain's constraint stages ({@link
+     * SamplerStage#constrains}, the grammars) admit in order, each token judged after the ones before it (vLLM's
+     * {@code GrammarMatcher.validate_tokens}). {@code tokens.length} when the chain has no constraint; the chain's
+     * state is unchanged either way.
+     *
+     * @throws IllegalArgumentException for a negative token id
+     */
+    public int admittedPrefix(int[] tokens) {
+        Objects.requireNonNull(tokens, "tokens");
+        List<SamplerStage> constraints = new ArrayList<>();
+        for (SamplerStage stage : chain) {
+            if (stage.constrains()) {
+                constraints.add(stage);
+            }
+        }
+        if (constraints.isEmpty()) {
+            return tokens.length;
+        }
+        Object[] saved = new Object[constraints.size()];
+        for (int c = 0; c < saved.length; c++) {
+            saved[c] = constraints.get(c).saveState();
+        }
+        try {
+            for (int i = 0; i < tokens.length; i++) {
+                if (tokens[i] < 0) {
+                    throw new IllegalArgumentException("token " + i + " has negative id " + tokens[i]);
+                }
+                for (SamplerStage stage : constraints) {
+                    if (!stage.admits(tokens[i])) {
+                        return i;
+                    }
+                }
+                for (SamplerStage stage : constraints) {
+                    stage.accept(tokens[i]);
+                }
+            }
+            return tokens.length;
+        } finally {
+            for (int c = 0; c < saved.length; c++) {
+                constraints.get(c).restoreState(saved[c]);
+            }
+        }
+    }
+
+    /**
+     * {@code tokens} cut before its first token the chain's constraint stages refuse after the tokens before it
+     * ({@link #admittedPrefix}): the same array when every token is admitted, otherwise a copy of the admitted
+     * prefix. Speculative decoding verifies only this prefix of a proposal (vLLM's {@code validate_tokens}): no
+     * lossless verifier can confirm a refused token, and the rows after it have no grammar state to be scored under.
+     *
+     * @throws IllegalArgumentException for a negative token id
+     */
+    public int[] admitted(int[] tokens) {
+        int n = admittedPrefix(tokens);
+        return n == tokens.length ? tokens : Arrays.copyOf(tokens, n);
+    }
+
+    /** The per-stage states of one {@link #saveState} call, bound to the sampler that made it. */
+    private static final class ChainState {
+        final Sampler owner;
+        final Object[] states;
+        final WatermarkState.Snapshot watermark;
+
+        ChainState(Sampler owner, Object[] states, WatermarkState.Snapshot watermark) {
+            this.owner = owner;
+            this.states = states;
+            this.watermark = watermark;
+        }
     }
 
     /**
      * Runs the chain over {@code logits} and returns the selected token id. {@code logits} is not modified.
      *
-     * @throws IllegalArgumentException when the row is empty
-     * @throws IllegalStateException    when no candidate has a finite logit
+     * @throws IllegalArgumentException      when the row is empty
+     * @throws ConstraintDeadEndException    when the chain's constraints admit no candidate
+     * @throws IllegalStateException         when no candidate has a finite logit
      */
     public int sample(float[] logits) {
         return apply(logits).selectedId();
@@ -480,12 +903,20 @@ public final class Sampler {
      * selection (llama.cpp {@code cur_p} after {@code llama_sampler_apply}). The view stays valid until the next
      * call on this sampler. {@code logits} is not modified.
      *
+     * <p>The chain's constraint stages (the grammars, the request's hard masks — {@code allowed_token_ids},
+     * bad words, the min-tokens ban) mask the set first, before every configured stage (llama.cpp applies the
+     * grammar before the chain on its grammar-first resample, vLLM applies {@code allowed_token_ids} and bad
+     * words to the logits before any sampling stage), so the truncating stages (top-k, typical-p, top-p, min-p,
+     * XTC, top-n-sigma) operate on the admitted set and each keeps at least one of its candidates. The
+     * reasoning budget's forcing mask keeps its final say, applied behind them.
+     *
      * <p>A chain built with mirostat or with {@code adaptive_p} in the order ends in its terminal selector, which
      * selects the token itself, as llama.cpp's chain construction replaces the dist stage (common/sampling.cpp:344-416);
      * the fixed draw only runs when no terminal selector applied.
      *
-     * @throws IllegalArgumentException when the row is empty
-     * @throws IllegalStateException    when no candidate has a finite logit
+     * @throws IllegalArgumentException      when the row is empty
+     * @throws ConstraintDeadEndException    when the chain's constraints admit no candidate
+     * @throws IllegalStateException         when no candidate has a finite logit
      */
     public Candidates apply(float[] logits) {
         Objects.requireNonNull(logits, "logits");
@@ -494,9 +925,74 @@ public final class Sampler {
         }
         cur.load(logits);
         biasStage.apply(cur);
+        applyConstraints();
+        return runChain(false);
+    }
+
+    /**
+     * Runs the chain over a row's top candidates in rank order (larger logit first, the lower id on ties) and
+     * returns the selected token the chain picks over them — the same token it picks over the whole row when
+     * {@link #coneWidth()} covers the candidates ({@code RowTopK}, llama.cpp backend sampling {@code -bs} over a
+     * device top-k readback). The view stays valid until the next call on this sampler.
+     *
+     * @throws IllegalArgumentException when the arrays differ in length or hold fewer than one candidate
+     * @throws IllegalStateException    when the chain carries constraint stages — the head needs the whole row,
+     *                                  which {@link #coneWidth()} refuses — or no candidate has a finite logit
+     */
+    public Candidates applyTopK(int[] ids, float[] logits) {
+        return applyTopK(ids, logits, false);
+    }
+
+    /**
+     * The fixed bias stage over the ranked cone: its apply indexes the candidates by id, which only the
+     * vocabulary-ordered row is, so the bans and biases look their candidates up by token id here. A mask or a
+     * bias breaks the rank order, so the set re-sorts into the descending order the chain over the whole row
+     * carries from its first sort — the same candidates in the same order, ties by the lower token id.
+     */
+    private void applyBiasToRanked() {
+        if (coneExtra == 0) {
+            return;
+        }
+        for (int id : banned) {
+            int at = cur.indexOf(id);
+            if (at >= 0) {
+                cur.setLogit(at, Float.NEGATIVE_INFINITY);
+            }
+        }
+        if (biasStage instanceof BiasStage) {
+            BiasStage bias = (BiasStage) biasStage;
+            int[] ids = bias.biasedIds();
+            float[] values = bias.biases();
+            for (int i = 0; i < ids.length; i++) {
+                int at = cur.indexOf(ids[i]);
+                if (at >= 0) {
+                    if (values[i] <= -100f) {
+                        cur.setLogit(at, Float.NEGATIVE_INFINITY);
+                    } else {
+                        cur.setLogit(at, cur.logit(at) + values[i]);
+                    }
+                }
+            }
+        }
+        cur.sortDescendingById();
+    }
+
+    /**
+     * The chain over the loaded candidates, from the fixed bias stage to the draw. {@code prefiltered} marks a
+     * device readout that already applied the fixed bias stage and the chain's pre-top-k penalties and DRY.
+     */
+    private Candidates runChain(boolean prefiltered) {
         boolean terminal = false;
+        SamplerStage skipPenalties = deviceFilter.prefilteredPenalties();
+        SamplerStage skipDry = deviceFilter.prefilteredDry();
         for (SamplerStage stage : chain) {
+            if (prefiltered && (stage == skipPenalties || stage == skipDry)) {
+                continue;
+            }
             StageKind kind = stage.kind();
+            if (stage.constrains() || stage.masks()) {
+                continue; // the constraint head masked the set already
+            }
             if (greedy) {
                 if (kind == StageKind.TEMPERATURE) {
                     continue;
@@ -516,10 +1012,197 @@ public final class Sampler {
             // the terminal selector set the selected candidate already
         } else if (greedy) {
             selectArgmax();
+        } else if (watermarker != null) {
+            selectWatermarked();
         } else {
             drawDist();
         }
         return cur;
+    }
+
+    /**
+     * The constraint head: the chain's grammars and hard masks ({@code allowed_token_ids}, bad words, the
+     * min-tokens ban, in chain order) mask the set before every configured stage, so the truncating stages
+     * operate on the admitted set and cannot cut it to nothing (see {@link #apply}).
+     *
+     * @throws ConstraintDeadEndException when the mask leaves no candidate a finite logit: the admitted set is
+     *                                    empty (a grammar dead end, or the request's masks banning every id)
+     *                                    and the step has nothing to sample
+     */
+    private void applyConstraints() {
+        if (constraints.isEmpty()) {
+            return;
+        }
+        for (SamplerStage stage : constraints) {
+            stage.apply(cur);
+        }
+        if (cur.maxLogit() == Float.NEGATIVE_INFINITY) {
+            throw new ConstraintDeadEndException("the constraint head admits no candidate: every token's logit"
+                    + " is -inf under the request's constraints, so the step has nothing to sample");
+        }
+    }
+
+    /**
+     * Width of the chain's cone over a row's largest logits, or -1: when {@code k >= 1}, running the chain over
+     * exactly the {@code k} largest raw logits of a row — with the banned and biased tokens among them — selects
+     * the token the chain selects over the whole row, and for a truncated chain keeps and draws exactly the
+     * candidates it keeps and draws, so a device top-k readback of that width replaces the row (llama.cpp backend
+     * sampling {@code -bs}). Every stage that can keep a candidate outside the cone
+     * refuses it: penalties and DRY (they lower tokens behind unpenalized ones), a positive logit bias (it raises
+     * one past them), a typical, top-p, min-p, top-n-sigma or XTC stage before the chain's top-k (their statistics
+     * and keeps run over the whole row), a terminal selector, an infill stage, and a request stage that masks,
+     * constrains or forces (a grammar, {@code allowed_token_ids}, bad words, the min-tokens ban, a reasoning
+     * budget) — the constraint head masks over the whole row, so a cone carries no chain that has one.
+     *
+     * <p>Without a top-k stage the cone is the largest {@code coneExtra + 1} raw logits, when the chain selects
+     * the argmax ({@link #argmaxChain()}): every ban and non-positive bias only lowers a logit, so the raw argmax
+     * or one of the edited tokens wins, and at most {@code coneExtra} edited tokens can outrank the winner. A
+     * greedy chain with banned or biased tokens (llama.cpp's logit-bias sampler, Avalon's {@code greedy_argmax})
+     * therefore reads back only that prefix. A positive bias raises a token from anywhere in the row, so it keeps
+     * the whole-row path.</p>
+     */
+    public int coneWidth() {
+        if (positiveBias || !constraints.isEmpty()) {
+            return -1;
+        }
+        if (topK < 1) {
+            return argmaxChain() ? coneExtra + 1 : -1;
+        }
+        int topKAt = topKIndex();
+        if (topKAt < 0) {
+            return -1;
+        }
+        for (int i = 0; i < chain.size(); i++) {
+            SamplerStage stage = chain.get(i);
+            StageKind kind = stage.kind();
+            if (kind == null) {
+                // a null-kind request stage (grammar, min-tokens, bad-words, reasoning-budget): only one that
+                // leaves the chain's set alone keeps the cone
+                if (stage.modifies()) {
+                    return -1;
+                }
+                continue;
+            }
+            boolean beforeTopK = i < topKAt;
+            switch (kind) {
+                case TOP_K:
+                    break;
+                case TOP_P:
+                    if (beforeTopK && topP < 1f) {
+                        return -1;
+                    }
+                    break;
+                case MIN_P:
+                    if (beforeTopK && minP > 0f) {
+                        return -1;
+                    }
+                    break;
+                case TYPICAL_P:
+                    if (beforeTopK && typicalP < 1f) {
+                        return -1;
+                    }
+                    break;
+                case TOP_N_SIGMA:
+                    if (beforeTopK && topNSigma > 0f) {
+                        return -1;
+                    }
+                    break;
+                case XTC:
+                    if (beforeTopK && xtcProbability > 0f && xtcThreshold <= 0.5f) {
+                        return -1;
+                    }
+                    break;
+                case TEMPERATURE:
+                    if (beforeTopK && dynatempRange > 0f) {
+                        return -1;
+                    }
+                    break;
+                case PENALTIES:
+                    if (penalties) {
+                        return -1;
+                    }
+                    break;
+                case DRY:
+                    if (dryMultiplier != 0f) {
+                        return -1;
+                    }
+                    break;
+                case MIROSTAT:
+                case ADAPTIVE_P:
+                case INFILL:
+                    return -1;
+                default:
+                    break;
+            }
+        }
+        return Math.max(topK, minKeep) + coneExtra;
+    }
+
+    /**
+     * Width of the chain's cone over a device readout that first applies {@link #prefilterRow()} to the whole row
+     * (the logit bias, the penalties and DRY before the top-k), or -1 when such a readout serves the chain no
+     * better than the whole row. The bias and the pre-top-k penalties are baked into every row, so the readout
+     * carries exactly {@code max(top_k, min_keep)} candidates — no banned-or-biased extra — and a chain these
+     * edits cannot reproduce keeps its whole-row path.
+     *
+     * <p>The prefilter reproduces the same stages {@link #coneWidth()} refuses (penalties, DRY, a positive bias);
+     * the whole-row stages before the top-k that need row statistics (top-p, typical, min-p, top-n-sigma, XTC, a
+     * dynamic temperature) still refuse it, as do constraint stages, terminal selectors, infill, and a penalty or
+     * DRY window wider than the device row carries.</p>
+     */
+    public int deviceConeWidth() {
+        return deviceFilter.deviceConeWidth();
+    }
+
+    /** Whether this chain's cone needs a device prefilter (a bias, penalties or DRY) rather than the plain cone. */
+    public boolean prefilterRequired() {
+        return deviceFilter.required();
+    }
+
+    /**
+     * The pre-top-k edits this chain's device readout applies to one row: the fixed logit-bias table, the
+     * penalties and DRY that precede the top-k stage over the row's current history, and their chain order. A
+     * chain with no such edit yields an empty row.
+     */
+    public LogitPrefilter.Row prefilterRow() {
+        return deviceFilter.row();
+    }
+
+    /**
+     * {@link #prefilterRow()} with {@code pendingTokens} accepted first: the history a completing prefill will
+     * hold after the forward (the batch engine accepts a prompt's tokens once its last chunk has sampled). The
+     * chain's own state is unchanged.
+     */
+    public LogitPrefilter.Row prefilterRow(int[] pendingTokens) {
+        return deviceFilter.row(pendingTokens);
+    }
+
+    /**
+     * Runs the chain over a row's top candidates whose whole-row edits a device prefilter already applied
+     * ({@link #deviceConeWidth()}, {@link #prefilterRow()}): the fixed bias stage and the chain's pre-top-k
+     * penalties and DRY are skipped, and every other stage runs over the candidates exactly as it runs over the
+     * whole row.
+     *
+     * @throws IllegalArgumentException when the arrays differ in length or hold fewer than one candidate
+     * @throws IllegalStateException    when the chain carries constraint stages or no candidate has a finite logit
+     */
+    public Candidates applyTopK(int[] ids, float[] logits, boolean prefiltered) {
+        Objects.requireNonNull(ids, "ids");
+        Objects.requireNonNull(logits, "logits");
+        if (ids.length == 0 || ids.length != logits.length) {
+            throw new IllegalArgumentException("top-k candidates of " + ids.length + " ids and " + logits.length
+                    + " logits");
+        }
+        if (!constraints.isEmpty()) {
+            throw new IllegalStateException("top-k candidates cannot run the chain's constraint head (a grammar,"
+                    + " allowed_token_ids, bad words, the min-tokens ban masks by id over the whole row):"
+                    + " coneWidth() is -1 and the device path must read the row back");
+        }
+        cur.loadRanked(ids, logits);
+        if (!prefiltered) {
+            applyBiasToRanked();
+        }
+        return runChain(prefiltered);
     }
 
     // ------------------------------------------------------------------ fixed chain end
@@ -554,9 +1237,27 @@ public final class Sampler {
             cur.selected = rng.distDraw(new float[]{1f});
             return;
         }
+        float[] probs = softmaxDistribution();
+        cur.selected = rng.distDraw(probs);
+    }
+
+    /**
+     * The softmax over the current candidates, written into the set's probabilities and returned as a probability
+     * array of exactly the candidate count (the draw reads its length); a single candidate takes all the mass. Used
+     * by both the ordinary draw and a watermarked step, whose reported logprobs are the chain's ordinary
+     * distribution even though the token is drawn from the keyed one.
+     *
+     * @throws IllegalStateException when no candidate has a finite logit
+     */
+    private float[] softmaxDistribution() {
+        int n = cur.size;
         float max = cur.sorted ? cur.logits[0] : cur.maxLogit();
         if (max == Float.NEGATIVE_INFINITY) {
             throw new IllegalStateException("no candidate has a finite logit (all banned, -inf or NaN)");
+        }
+        if (n == 1) {
+            cur.probs[0] = 1f;
+            return new float[]{1f};
         }
         double sum = 0.0;
         for (int i = 0; i < n; i++) {
@@ -571,7 +1272,40 @@ public final class Sampler {
         for (int i = 0; i < n; i++) {
             probs[i] = cur.prob(i);
         }
-        cur.selected = rng.distDraw(probs);
+        return probs;
+    }
+
+    /**
+     * The watermarked selection ({@link Watermarker}): the candidates the chain kept are presented to the watermark,
+     * which picks the argmax of {@code logit + Gumbel(PRF(key, context, token))}; the set's probabilities are the
+     * chain's ordinary softmax either way. A context the repeated-context search already saw ({@link
+     * WatermarkState#repeatedContext}) falls back to the ordinary categorical draw, though a dual-key watermarker has
+     * already taken its routing draw.
+     *
+     * @throws IllegalStateException when no candidate has a finite logit
+     */
+    private void selectWatermarked() {
+        int n = cur.size;
+        float[] probs = softmaxDistribution();
+        boolean repeated = watermarkState.repeatedContext();
+        int[] tokenIds = new int[n];
+        float[] logits = new float[n];
+        for (int i = 0; i < n; i++) {
+            tokenIds[i] = cur.ids[i];
+            logits[i] = cur.logits[i];
+        }
+        int token = watermarker.sample(tokenIds, logits, n, watermarkState.context(),
+                rng::nextCanonicalDouble);
+        if (repeated) {
+            cur.selected = rng.distDraw(probs);
+        } else {
+            int at = cur.indexOf(token);
+            if (at < 0) {
+                throw new IllegalStateException("the watermark selected token " + token
+                        + ", which is not among the chain's candidates");
+            }
+            cur.selected = at;
+        }
     }
 
     /**
@@ -617,6 +1351,8 @@ public final class Sampler {
         private long[] sortKeys = new long[0];
         private int size;
         private boolean sorted;
+        /** Whether candidate {@code i}'s token id is {@code i} (a vocabulary-ordered row, not a ranked cone). */
+        private boolean indexedById;
         private int selected = -1;
 
         Candidates() {
@@ -642,7 +1378,40 @@ public final class Sampler {
             }
             size = n;
             sorted = false;
+            indexedById = true;
             selected = -1;
+        }
+
+        /** Candidates of a row's top tokens in rank order: larger logit first, the lower id on ties. */
+        void loadRanked(int[] tokens, float[] values) {
+            int n = tokens.length;
+            if (ids.length < n) {
+                ids = new int[n];
+                logits = new float[n];
+                probs = new float[n];
+                tmpIds = new int[n];
+                tmpLogits = new float[n];
+                tmpProbs = new float[n];
+                sortKeys = new long[n];
+            }
+            for (int i = 0; i < n; i++) {
+                ids[i] = tokens[i];
+                logits[i] = Float.isNaN(values[i]) ? Float.NEGATIVE_INFINITY : values[i];
+                probs[i] = 0f;
+            }
+            size = n;
+            sorted = true;
+            indexedById = false;
+            selected = -1;
+        }
+
+        /**
+         * Whether candidate {@code i}'s token id is {@code i}, so a stage may index the set by token id: true for
+         * a vocabulary-ordered row ({@link Sampler#apply}), false for a ranked cone ({@link
+         * Sampler#applyTopK}).
+         */
+        public boolean indexedByTokenId() {
+            return indexedById;
         }
 
         /** Largest logit of the current candidates (for stages that need the max over an unsorted set). */
@@ -656,6 +1425,16 @@ public final class Sampler {
             return max;
         }
 
+        /** Slot of candidate {@code token}, or -1 when the set does not carry it. */
+        int indexOf(int token) {
+            for (int i = 0; i < size; i++) {
+                if (ids[i] == token) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
         /** Reorders the first {@code n} candidates to {@code order[j]}'s low 32 bits (source index). */
         public void permute(long[] order, int n) {
             for (int j = 0; j < n; j++) {
@@ -667,6 +1446,7 @@ public final class Sampler {
             System.arraycopy(tmpIds, 0, ids, 0, n);
             System.arraycopy(tmpLogits, 0, logits, 0, n);
             System.arraycopy(tmpProbs, 0, probs, 0, n);
+            indexedById = false;
         }
 
         /** Moves candidate {@code from} to slot {@code to} (llama.cpp's compaction while filtering). */
@@ -675,6 +1455,7 @@ public final class Sampler {
                 ids[to] = ids[from];
                 logits[to] = logits[from];
                 probs[to] = probs[from];
+                indexedById = false;
             }
         }
 
@@ -769,6 +1550,30 @@ public final class Sampler {
         }
 
         /**
+         * Sorts all candidates in descending logit order, ties by ascending token id: the order the chain over the
+         * whole row carries after its first sort of a vocabulary-ordered set. A ranked readback loads candidates in
+         * raw rank order, whose position is not the token id, so the fixed bias stage re-sorts by id here to keep
+         * the ties of edited logits the whole-row chain would take.
+         */
+        public void sortDescendingById() {
+            long[] k = sortKeys(size);
+            for (int i = 0; i < size; i++) {
+                k[i] = descendingKey(logits[i], ids[i]);
+            }
+            Arrays.sort(k, 0, size);
+            for (int j = 0; j < size; j++) {
+                int at = indexOf((int) k[j]);
+                tmpIds[j] = ids[at];
+                tmpLogits[j] = logits[at];
+                tmpProbs[j] = probs[at];
+            }
+            System.arraycopy(tmpIds, 0, ids, 0, size);
+            System.arraycopy(tmpLogits, 0, logits, 0, size);
+            System.arraycopy(tmpProbs, 0, probs, 0, size);
+            sorted = true;
+        }
+
+        /**
          * Moves the {@code k} highest logits, in descending order, to the front, as a full sort of the primary part
          * (llama.cpp {@code llama_token_data_array_partial_sort_inplace}); the order of the rest is unspecified. The
          * full sort when {@code k} is close to the set size, as a partial sort costs no less then.
@@ -853,6 +1658,7 @@ public final class Sampler {
             checkIndex(i);
             ids[i] = id;
             logits[i] = logit;
+            indexedById = false;
         }
 
         /**

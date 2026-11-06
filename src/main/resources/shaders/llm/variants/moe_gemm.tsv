@@ -1,0 +1,85 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# MoE grouped GEMM for every weight type with expert kernels (kernels/llm/moe_gemm.cl via kernels/llm/common/matmul_grouped_family.h); the aligned-row layout comes from LLM_MoE_AlignBlocks (kernels/llm/moe.cl).
+F32_GroupedGemm	moe_gemm.comp	QTYPE=QT_F32
+F16_GroupedGemm	moe_gemm.comp	QTYPE=QT_F16
+BF16_GroupedGemm	moe_gemm.comp	QTYPE=QT_BF16
+Q4_0_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q4_0
+Q4_1_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q4_1
+Q5_0_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q5_0
+Q5_1_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q5_1
+Q8_0_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q8_0
+IQ4_NL_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ4_NL
+IQ4_XS_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ4_XS
+MXFP4_GroupedGemm	moe_gemm.comp	QTYPE=QT_MXFP4
+Q2_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q2_K
+Q3_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q3_K
+Q4_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q4_K
+Q5_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q5_K
+Q6_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q6_K
+Q8_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q8_K
+IQ3_XXS_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ3_XXS
+IQ3_S_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ3_S
+IQ3_K_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ3_K
+IQ3_KS_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ3_KS
+IQ2_XXS_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ2_XXS
+IQ2_XS_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ2_XS
+IQ2_S_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ2_S
+IQ1_S_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ1_S
+IQ1_M_GroupedGemm	moe_gemm.comp	QTYPE=QT_IQ1_M
+TQ1_0_GroupedGemm	moe_gemm.comp	QTYPE=QT_TQ1_0
+TQ2_0_GroupedGemm	moe_gemm.comp	QTYPE=QT_TQ2_0
+NVFP4_GroupedGemm	moe_gemm.comp	QTYPE=QT_NVFP4
+Q1_0_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q1_0
+Q2_0_GroupedGemm	moe_gemm.comp	QTYPE=QT_Q2_0
+F8_E5M2_GroupedGemm	moe_gemm.comp	QTYPE=QT_F8_E5M2
+F8_E4M3_GroupedGemm	moe_gemm.comp	QTYPE=QT_F8_E4M3
+F8_E4M3_B128_GroupedGemm	moe_gemm.comp	QTYPE=QT_F8_E4M3_B128
+F8_E4M3_B32_GroupedGemm	moe_gemm.comp	QTYPE=QT_F8_E4M3_B32
+MXFP8_GroupedGemm	moe_gemm.comp	QTYPE=QT_MXFP8
+MXFP6_E2M3_GroupedGemm	moe_gemm.comp	QTYPE=QT_MXFP6_E2M3
+MXFP6_E3M2_GroupedGemm	moe_gemm.comp	QTYPE=QT_MXFP6_E3M2
+I8_B128_GroupedGemm	moe_gemm.comp	QTYPE=QT_I8_B128
+NF4_GroupedGemm	moe_gemm.comp	QTYPE=QT_NF4
+FP4_BNB_GroupedGemm	moe_gemm.comp	QTYPE=QT_FP4_BNB
+# Expert-cache form (T_GroupedGemmInd): the same products over a cache bank through the per-layer map.
+F32_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_F32 IND=1
+F16_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_F16 IND=1
+BF16_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_BF16 IND=1
+Q4_0_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q4_0 IND=1
+Q4_1_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q4_1 IND=1
+Q5_0_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q5_0 IND=1
+Q5_1_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q5_1 IND=1
+Q8_0_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q8_0 IND=1
+IQ4_NL_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ4_NL IND=1
+IQ4_XS_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ4_XS IND=1
+MXFP4_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_MXFP4 IND=1
+Q2_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q2_K IND=1
+Q3_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q3_K IND=1
+Q4_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q4_K IND=1
+Q5_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q5_K IND=1
+Q6_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q6_K IND=1
+Q8_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q8_K IND=1
+IQ3_XXS_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ3_XXS IND=1
+IQ3_S_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ3_S IND=1
+IQ3_K_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ3_K IND=1
+IQ3_KS_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ3_KS IND=1
+IQ2_XXS_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ2_XXS IND=1
+IQ2_XS_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ2_XS IND=1
+IQ2_S_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ2_S IND=1
+IQ1_S_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ1_S IND=1
+IQ1_M_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_IQ1_M IND=1
+TQ1_0_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_TQ1_0 IND=1
+TQ2_0_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_TQ2_0 IND=1
+NVFP4_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_NVFP4 IND=1
+Q1_0_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q1_0 IND=1
+Q2_0_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_Q2_0 IND=1
+F8_E5M2_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_F8_E5M2 IND=1
+F8_E4M3_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_F8_E4M3 IND=1
+F8_E4M3_B128_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_F8_E4M3_B128 IND=1
+F8_E4M3_B32_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_F8_E4M3_B32 IND=1
+MXFP8_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_MXFP8 IND=1
+MXFP6_E2M3_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_MXFP6_E2M3 IND=1
+MXFP6_E3M2_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_MXFP6_E3M2 IND=1
+I8_B128_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_I8_B128 IND=1
+NF4_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_NF4 IND=1
+FP4_BNB_GroupedGemmInd	moe_gemm.comp	QTYPE=QT_FP4_BNB IND=1

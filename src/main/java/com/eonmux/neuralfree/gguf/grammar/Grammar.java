@@ -9,7 +9,7 @@ import java.util.TreeMap;
 /**
  * The parsed and validated GBNF rule set, the Java shape of llama.cpp's grammar model
  * ({@code llama_grammar_rules}, {@code src/llama-grammar.h:64-69}). The parser
- * ({@link GbnfParser}) produces it; the sampling runtime of SO-2 consumes it.
+ * ({@link GbnfParser}) produces it; the sampling runtime consumes it.
  *
  * <p>{@link GbnfParser#parse} performs the checks {@code llama_grammar_init_impl} runs on a
  * parsed grammar ({@code src/llama-grammar.cpp:1215-1267}): the rule set must not be empty, must
@@ -133,8 +133,8 @@ public final class Grammar {
                     break;
                 }
                 atRuleStart = true;
-            } else {
-                atRuleStart = false;
+            } else if (!GrammarElement.isBudget(element.type())) {
+                atRuleStart = false; // a budget element consumes nothing
             }
         }
 
@@ -151,7 +151,7 @@ public final class Grammar {
                 }
             } else if (isEndOfSequence(element)) {
                 recurseIntoNonterminal = true;
-            } else {
+            } else if (!GrammarElement.isBudget(element.type())) {
                 recurseIntoNonterminal = false;
             }
         }

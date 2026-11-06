@@ -1,0 +1,12 @@
+{#- llama.cpp yandex chat template (src/llama-chat.cpp:708-723): user and assistant turns only, system messages are left out. -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'user' -%}
+        {{- ' Пользователь: ' ~ content ~ '\n\n' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- ' Ассистент: ' ~ content ~ '\n\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- ' Ассистент:[SEP]' -}}
+{%- endif -%}

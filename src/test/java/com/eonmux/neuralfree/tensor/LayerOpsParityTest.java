@@ -51,11 +51,12 @@ public class LayerOpsParityTest {
 
     @Before
     public void setUp() {
+        host = TrainParity.hostBackend();
         session = TrainParity.open(api);
         gpu = session.backend();
-        host = TrainParity.hostBackend();
     }
 
+    /** Releases what setUp acquired; when setUp failed part way, only what it acquired, so its failure stands alone. */
     @After
     public void tearDown() {
         try {
@@ -64,7 +65,9 @@ public class LayerOpsParityTest {
             }
         } finally {
             try {
-                TrainGpu.release(host);
+                if (host != null) {
+                    TrainGpu.release(host);
+                }
             } finally {
                 if (session != null) {
                     session.close();

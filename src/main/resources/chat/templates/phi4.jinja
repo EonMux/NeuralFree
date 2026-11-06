@@ -1,0 +1,8 @@
+{#- llama.cpp phi4 chat template (src/llama-chat.cpp:345-352). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|im_start|>' ~ message['role'] ~ '<|im_sep|>' ~ content ~ '<|im_end|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|im_start|>assistant<|im_sep|>' -}}
+{%- endif -%}

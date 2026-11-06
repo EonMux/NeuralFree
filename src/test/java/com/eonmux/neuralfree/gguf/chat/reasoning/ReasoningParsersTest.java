@@ -96,6 +96,60 @@ public class ReasoningParsersTest {
         assertEquals(EngineConfig.PARSER_AUTO, EngineConfig.defaults().reasoningParser());
     }
 
+    @Test
+    public void theHfParserPairsOnlyWithHfAutoOrNone() {
+        // vLLM test_response_template_parser_rejects_other_parsers
+        IllegalArgumentException mixed = assertThrows(IllegalArgumentException.class,
+                () -> EngineConfig.builder().reasoningParser("hf").toolParser("hermes").build());
+        assertTrue(mixed.getMessage(), mixed.getMessage().contains("cannot be combined"));
+        assertTrue(mixed.getMessage(), mixed.getMessage().contains(EngineConfig.PROP_TOOL_PARSER));
+        assertThrows(IllegalArgumentException.class,
+                () -> EngineConfig.builder().reasoningParser("qwen3").toolParser("HF").build());
+        String[][] allowed = {{"hf", "hf"}, {"hf", "auto"}, {"hf", "none"}, {"auto", "hf"}, {"none", "hf"},
+                {"qwen3", "hermes"}};
+        for (String[] pair : allowed) {
+            EngineConfig c = EngineConfig.builder().reasoningParser(pair[0]).toolParser(pair[1]).build();
+            assertEquals(pair[0], c.reasoningParser());
+            assertEquals(pair[1], c.toolParser());
+        }
+    }
+
+    @Test
+    public void theResponseTemplateRowsNeedTheModel() {
+        for (String name : Arrays.asList("hf", "beam")) {
+            assertTrue(ReasoningParsers.names().contains(name));
+            IllegalStateException bare = assertThrows(IllegalStateException.class,
+                    () -> ReasoningParsers.forName(name).create());
+            assertTrue(bare.getMessage(), bare.getMessage().contains("create it with the model's tokenizer"));
+        }
+    }
+
+    @Test
+    public void aPrefilledStartTagEndingInWhitespaceOpensTheReasoning() {
+        // Gemma 4's thinking opener ends in a newline the prompt writes; the prompt's trailing whitespace and the
+        // tag's are both ignored
+        ReasoningFilter filter = ReasoningFilter.thinkTags(Collections.singletonList("<|channel>thought\n"),
+                Collections.singletonList("<channel|>"), Collections.<String>emptyList());
+        StringBuilder reasoning = new StringBuilder();
+        StringBuilder content = new StringBuilder();
+        ReasoningFilter.State st = filter.newState((channel, tokenId, text) ->
+                (channel == ReasoningFilter.Channel.REASONING ? reasoning : content).append(text),
+                "<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n");
+        assertTrue(st.inReasoning());
+        st.onToken(1, "plan");
+        st.onToken(2, "<channel|>");
+        st.onToken(3, "The answer.");
+        st.finish();
+        assertEquals("plan", reasoning.toString());
+        assertEquals("The answer.", content.toString());
+        assertTrue(filter.startsInReasoning("<|turn>model\n<|channel>thought\n  "));
+        assertTrue(filter.startsInReasoning("<|turn>model\n<|channel>thought"));
+        assertFalse(filter.startsInReasoning("<|turn>model\n"));
+        assertFalse("a tag of only whitespace never matches", ReasoningFilter.thinkTags(
+                Collections.singletonList("\n"), Collections.singletonList("</think>"),
+                Collections.<String>emptyList()).startsInReasoning("answer\n"));
+    }
+
     private static ReasoningFilter filter(String name) {
         return ReasoningParsers.forName(name).create();
     }

@@ -27,6 +27,9 @@ final class CpuShapeOps {
      * @param resultShape the concatenated shape
      */
     static Tensor cat(List<Tensor> tensors, int dim, Shape resultShape) {
+        if (CpuFloat64.applies("cat", tensors)) {
+            return CpuFloat64.cat(tensors, dim, resultShape);
+        }
         float[] result = new float[hostLength(resultShape.numElements())];
         int offset = 0;
         for (Tensor t : tensors) {

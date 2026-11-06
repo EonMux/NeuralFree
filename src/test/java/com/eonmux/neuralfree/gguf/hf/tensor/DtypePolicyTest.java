@@ -3,6 +3,8 @@ package com.eonmux.neuralfree.gguf.hf.tensor;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions.OutType;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
+import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
+import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
 import com.eonmux.neuralfree.io.safetensors.StDType;
 import org.junit.Test;
 
@@ -21,8 +23,8 @@ import static org.junit.Assert.assertTrue;
 /**
  * {@link DtypePolicy}: every step of the converter's type selection in order (kept integers, 1-D and norm tensors over
  * forced types, forced types over forced-F32 names and the weight-suffix rule, forced-F32 and non-weight names, the
- * output types including AUTO and the Q8_0 fallback, integer and no-GGUF-type rejections) and the value codec's
- * eight-bit float decoders.
+ * output types including AUTO, the ternary types with their F16 names and the whole-block fallbacks, integer and
+ * no-GGUF-type rejections) and the value codec's eight-bit float decoders and ternary encoders.
  */
 public class DtypePolicyTest {
 
@@ -120,11 +122,27 @@ public class DtypePolicyTest {
     }
 
     @Test
-    public void stepsFiveAndSixRejectTensorsWithoutAGgufType() {
+    public void autoPreservesE4m3FnWeightsAndTheNamedOutputTypesDequantizeThem() {
+        RowSource f8 = as(StDType.F8_E4M3, 4, 4);
+        assertEquals("the codes are ggml's per-element F8_E4M3FN bytes", GGMLType.F8_E4M3FN,
+                SOURCE.typeFor("blk.0.attn_q.weight", f8, null));
+        DtypePolicy auto = new DtypePolicy(n -> false, OutType.AUTO).resolveAuto(
+                HfTensorIndex.of(Map.of("a", as(StDType.F16, 4, 4))));
+        assertEquals(GGMLType.F8_E4M3FN, auto.typeFor("blk.0.attn_q.weight", f8, null));
+        assertSame("whole blocks of the same type pass through unchanged", f8,
+                auto.apply("blk.0.attn_q.weight", f8, null));
+        assertEquals(GGMLType.F16, new DtypePolicy(n -> false, OutType.F16).typeFor(
+                "blk.0.attn_q.weight", f8, null));
+        assertEquals(GGMLType.F32, new DtypePolicy(n -> false, OutType.F32).apply(
+                "blk.0.attn_q.weight", f8, null).format().ggmlType());
+    }
+
+    @Test
+    public void stepsFiveToSevenRejectTensorsWithoutAGgufType() {
         GgufFormatException i = assertThrows(GgufFormatException.class,
                 () -> SOURCE.typeFor("w.weight", as(StDType.I32, 4, 4), null));
         assertTrue(i.getMessage(), i.getMessage().contains("w.weight") && i.getMessage().contains("I32"));
-        for (StDType t : new StDType[]{StDType.F8_E4M3, StDType.U8, StDType.BOOL, StDType.U16}) {
+        for (StDType t : new StDType[]{StDType.F8_E5M2, StDType.U8, StDType.BOOL, StDType.U16}) {
             GgufFormatException e = assertThrows(GgufFormatException.class,
                     () -> SOURCE.typeFor("blk.0.attn_q.weight", as(t, 4, 4), null));
             assertTrue(e.getMessage(), e.getMessage().contains("blk.0.attn_q.weight")
@@ -149,5 +167,95 @@ public class DtypePolicyTest {
         assertEquals(1f, out[0], 0f);
         assertThrows(IllegalArgumentException.class,
                 () -> DtypePolicy.decode(ElementFormat.of(StDType.F6_E2M3), b, 0, out, 0, 1));
+    }
+
+    // ---------------------------------------------------------------- ternary output types
+
+    /** A whole-block F32 source of 256 columns with values in {-1, -0.75, ..., 1}. */
+    private static RowSource wholeBlocks() {
+        float[] v = new float[512];
+        for (int i = 0; i < v.length; i++) {
+            v[i] = ((i * 7 + 3) % 9 - 4) / 4f;
+        }
+        return RopeTensors.fromFloats(new long[]{2, 256}, v);
+    }
+
+    @Test
+    public void ternaryOutputTypesPlanTernaryBlocks() {
+        RowSource src = wholeBlocks();
+        assertEquals(GGMLType.TQ1_0, new DtypePolicy(n -> false, OutType.TQ1_0).typeFor("w.weight", src, null));
+        assertEquals(GGMLType.TQ2_0, new DtypePolicy(n -> false, OutType.TQ2_0).typeFor("w.weight", src, null));
+        assertEquals(GGMLType.TQ1_0, new DtypePolicy(n -> false, OutType.TQ1_0).apply("w.weight",
+                as(StDType.BF16, 2, 256), null).format().ggmlType());
+        assertEquals(GGMLType.TQ2_0, new DtypePolicy(n -> false, OutType.TQ2_0).apply("w.weight",
+                as(StDType.F32, 2, 256), null).format().ggmlType());
+    }
+
+    @Test
+    public void aTernaryTargetWithoutWholeBlocksFallsBackToF16() {
+        DtypePolicy tq1 = new DtypePolicy(n -> false, OutType.TQ1_0);
+        DtypePolicy tq2 = new DtypePolicy(n -> false, OutType.TQ2_0);
+        assertEquals(GGMLType.F16, tq1.apply("w.weight", as(StDType.BF16, 4, 128), null).format().ggmlType());
+        assertEquals(GGMLType.F16, tq2.apply("w.weight", as(StDType.BF16, 4, 100), null).format().ggmlType());
+        assertEquals(GGMLType.TQ2_0, tq2.apply("w.weight", as(StDType.BF16, 4, 512), null).format().ggmlType());
+        // the fallback stays on the outtype-driven targets: a forced ternary type passes through
+        assertEquals(GGMLType.TQ2_0, tq2.typeFor("w.weight", wholeBlocks(), GGMLType.TQ2_0));
+    }
+
+    @Test
+    public void ternaryOutputTypesKeepTheEmbeddingAndOutputNamesF16() {
+        DtypePolicy tq1 = new DtypePolicy(n -> false, OutType.TQ1_0);
+        DtypePolicy tq2 = new DtypePolicy(n -> false, OutType.TQ2_0);
+        RowSource src = wholeBlocks();
+        for (String name : new String[]{"token_embd.weight", "per_layer_token_embd.weight", "output.weight",
+                "blk.3.altup_router.weight", "blk.0.laurel_l.weight", "blk.9.laurel_r.weight"}) {
+            assertEquals(name, GGMLType.F16, tq1.typeFor(name, src, null));
+            assertEquals(name, GGMLType.F16, tq2.typeFor(name, src, null));
+        }
+        // the rule applies to nothing else, a norm name is F32 regardless, and an override wins over it
+        assertEquals(GGMLType.TQ1_0, tq1.typeFor("blk.0.attn_q.weight", src, null));
+        assertEquals(GGMLType.F32, tq1.typeFor("token_embd_norm.weight", src, null));
+        assertEquals(GGMLType.BF16, tq1.typeFor("token_embd.weight", src, GGMLType.BF16));
+    }
+
+    @Test
+    public void ternaryOutputTypesDequantizeE4m3FnWeightsLikeFloatWeights() {
+        DtypePolicy tq2 = new DtypePolicy(n -> false, OutType.TQ2_0);
+        RowSource f8 = as(StDType.F8_E4M3, 2, 256);
+        assertEquals(GGMLType.TQ2_0, tq2.typeFor("blk.0.attn_q.weight", f8, null));
+        assertEquals(GGMLType.TQ2_0, tq2.apply("blk.0.attn_q.weight", f8, null).format().ggmlType());
+        assertEquals("the ternary F16 names apply to dequantized FP8 weights", GGMLType.F16,
+                tq2.typeFor("token_embd.weight", f8, null));
+        assertEquals(GGMLType.F16, new DtypePolicy(n -> false, OutType.TQ1_0).apply("output.weight", f8, null)
+                .format().ggmlType());
+        assertEquals("rows that are not whole blocks of 256 fall back to F16", GGMLType.F16,
+                tq2.apply("blk.0.attn_q.weight", as(StDType.F8_E4M3, 4, 128), null).format().ggmlType());
+    }
+
+    @Test
+    public void encodeWritesTernaryBlocksTheDecodersReadBack() {
+        float[] v = new float[256];
+        for (int i = 0; i < v.length; i++) {
+            v[i] = ((i * 7 + 3) % 9 - 4) / 4f;
+        }
+        float amax = 0f;
+        for (float x : v) {
+            amax = Math.max(amax, Math.abs(x));
+        }
+        assertEquals(1f, amax, 0f);
+        for (GGMLType t : new GGMLType[]{GGMLType.TQ1_0, GGMLType.TQ2_0}) {
+            ByteBuffer out = ByteBuffer.allocate(t.getTypeSize()).order(ByteOrder.LITTLE_ENDIAN);
+            DtypePolicy.encode(t, v, 0, v.length, out);
+            float[] back = new float[256];
+            CpuBlockDecoders.decodeElements(t, out, 0, back, 0, 256);
+            float d = FpBlockDecoders.fp16ToFp32(FpBlockDecoders.fp32ToFp16(amax));
+            for (int i = 0; i < v.length; i++) {
+                int trit = (int) Math.floor(Math.abs(v[i]) + 0.5f) * (v[i] < 0 ? -1 : 1);
+                assertEquals("element " + i, trit * d, back[i], 0f);
+            }
+            ByteBuffer bad = ByteBuffer.allocate(t.getTypeSize()).order(ByteOrder.LITTLE_ENDIAN);
+            assertThrows(IllegalArgumentException.class,
+                    () -> DtypePolicy.encode(t, v, 0, 100, bad));
+        }
     }
 }

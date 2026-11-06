@@ -57,6 +57,11 @@ public final class SwitchedLoraBackend implements ForwardBackend {
         return routed(pos0, tokens, t -> delegate.forwardRows(t, pos0, outputRows));
     }
 
+    @Override
+    public int[] forwardRowsGreedy(int[] tokens, int pos0, int[] outputRows) {
+        return routed(pos0, tokens, t -> delegate.forwardRowsGreedy(t, pos0, outputRows));
+    }
+
     /**
      * The router is per model ({@link SwitchedLoraExtra} records tokens from one stream), so a batched backend
      * serves batches of one sequence by routing them like {@link #prefill} and refuses larger ones.
@@ -64,6 +69,12 @@ public final class SwitchedLoraBackend implements ForwardBackend {
     @Override
     public String batchRefusal() {
         return "graniteswitch routing is per model";
+    }
+
+    /** The router records token ids; an embedding row carries none, so no batch of embedding rows drives it. */
+    @Override
+    public String embeddingRowsRefusal() {
+        return "the graniteswitch router records token ids; embedding rows carry none";
     }
 
     @Override

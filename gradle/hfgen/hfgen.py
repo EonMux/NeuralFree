@@ -515,6 +515,51 @@ def generic_writers(cls: ast.ClassDef) -> Dict[str, str]:
 
 
 def writer_keys(mod: Module, consts: Constants) -> List[list]:
+    """The key rows of gguf-py's GGUFWriter plus the keys of NeuralFree's own layouts."""
+    return writer_key_rows(mod, consts) + NF_KEYS
+
+
+# Keys NeuralFree's own GGUF layouts write that llama.cpp's GGUFWriter does not define.
+NF_KEYS = [
+    ["add_ssm_norm_eps", "{arch}.ssm.norm_eps", "FLOAT32"],
+    ["add_ssm_beta_scale", "{arch}.ssm.beta_scale", "FLOAT32"],
+    ["add_ssm_group_norm_size", "{arch}.ssm.group_norm_size", "UINT32"],
+    ["add_ssm_linear_silu", "{arch}.ssm.linear_silu", "BOOL"],
+    ["add_ssm_qk_norm", "{arch}.ssm.qk_norm", "BOOL"],
+    ["add_ssm_q_scale", "{arch}.ssm.q_scale", "BOOL"],
+    ["add_ssm_rope_dimension_count", "{arch}.ssm.rope_dimension_count", "UINT32"],
+    ["add_inkling_relative_extent", "{arch}.inkling.relative_extent", "UINT32"],
+    ["add_inkling_relative_dim", "{arch}.inkling.relative_dim", "UINT32"],
+    ["add_inkling_sconv_kernel_size", "{arch}.inkling.sconv_kernel_size", "UINT32"],
+    ["add_inkling_log_scaling_n_floor", "{arch}.inkling.log_scaling_n_floor", "UINT32"],
+    ["add_inkling_log_scaling_alpha", "{arch}.inkling.log_scaling_alpha", "FLOAT32"],
+    ["add_mlp_layer_pattern", "{arch}.mlp_layer_pattern", "ARRAY:BOOL"],
+    ["add_recurrent_block_num_loops", "{arch}.recurrent_block.num_loops", "UINT32"],
+    ["add_recurrent_block_n_input_layers", "{arch}.recurrent_block.n_input_layers", "UINT32"],
+    ["add_recurrent_block_n_recurrent_layers", "{arch}.recurrent_block.n_recurrent_layers", "UINT32"],
+    ["add_recurrent_block_n_output_layers", "{arch}.recurrent_block.n_output_layers", "UINT32"],
+    ["add_recurrent_block_justnorm", "{arch}.recurrent_block.justnorm", "BOOL"],
+    ["add_recurrent_block_justnorm_epsilon", "{arch}.recurrent_block.justnorm_epsilon", "FLOAT32"],
+    ["add_recurrent_block_dual_attention", "{arch}.recurrent_block.dual_attention", "BOOL"],
+    ["add_recurrent_block_local_window", "{arch}.recurrent_block.local_window", "UINT32"],
+    ["add_attention_dual_chunk_chunk_size", "{arch}.attention.dual_chunk.chunk_size", "UINT32"],
+    ["add_attention_dual_chunk_local_size", "{arch}.attention.dual_chunk.local_size", "UINT32"],
+    ["add_attention_dual_chunk_original_max_position_embeddings",
+     "{arch}.attention.dual_chunk.original_max_position_embeddings", "UINT32"],
+    ["add_attention_dual_chunk_sparse_enabled", "{arch}.attention.dual_chunk.sparse_attention_enabled", "BOOL"],
+    ["add_attention_dual_chunk_sparse_threshold", "{arch}.attention.dual_chunk.sparse_attention_threshold", "UINT32"],
+    ["add_attention_dual_chunk_sparse_last_q", "{arch}.attention.dual_chunk.sparse_attention_last_q", "UINT32"],
+    ["add_slerp_alpha_scale", "{arch}.slerp_alpha_scale", "FLOAT32"],
+    ["add_rope_scaling_mixed_b", "{arch}.rope.scaling.mixed_b", "FLOAT32"],
+    ["add_rope_fope_use", "{arch}.rope.fope.use", "BOOL"],
+    ["add_rope_fope_sep_head", "{arch}.rope.fope.sep_head", "BOOL"],
+    ["add_rope_fope_num_inv_freq", "{arch}.rope.fope.num_inv_freq", "UINT32"],
+    ["add_rope_fope_init_factor", "{arch}.rope.fope.init_factor", "FLOAT32"],
+    ["add_expert_per_group_top_k", "{arch}.expert_per_group_top_k", "BOOL"],
+]
+
+
+def writer_key_rows(mod: Module, consts: Constants) -> List[list]:
     cls = class_def(mod.tree.body, "GGUFWriter", mod.rel)
     generic = generic_writers(cls)
     rows: List[list] = []
@@ -1300,6 +1345,7 @@ def filters_table(base: Module) -> List[list]:
         rows.extend([f"skip_{how}", v, NONE, f"{file_name}:{line}"] for v, line in values)
 
     prepare = method(class_def(base.tree.body, "ModelBase", base.rel), "prepare_tensors", base.rel)
+    model_base = class_def(base.tree.body, "ModelBase", base.rel)
     skips = [n for n in ast.walk(prepare) if isinstance(n, ast.If) and len(n.body) == 1
              and isinstance(n.body[0], ast.Continue) and isinstance(n.test, ast.Call)
              and isinstance(n.test.func, ast.Attribute) and dotted(n.test.func.value) == "name"]
@@ -1308,6 +1354,9 @@ def filters_table(base: Module) -> List[list]:
     how, values = name_test(skips[0].test, base.at(skips[0]))
     rows.extend([f"skip_{how}", v, NONE, f"{file_name}:{line}"] for v, line in values)
 
+    # The forced-F32 tensors: the MODEL_TENSOR tuples of prepare_tensors branches that assign
+    # data_qtype = F32 (base.py up to commit a37cc4610) and, since the rule moved out of
+    # prepare_tensors, the any() tuple returned by ModelBase._tensor_requires_f32.
     forced = []
     for n in ast.walk(prepare):
         if isinstance(n, ast.If) and any(isinstance(s, ast.Assign) and dotted(s.targets[0]) == "data_qtype"
@@ -1316,7 +1365,17 @@ def filters_table(base: Module) -> List[list]:
                       and t.elts and all(member(e, "gguf.MODEL_TENSOR") for e in t.elts)]
             forced.extend(e for t in tuples for e in t.elts)
     if not forced:
-        fail(base.at(prepare), "no forced-F32 MODEL_TENSOR tuple found in prepare_tensors")
+        requires_f32 = [n for n in model_base.body if isinstance(n, ast.FunctionDef)
+                        and n.name == "_tensor_requires_f32"]
+        if requires_f32:
+            for n in ast.walk(requires_f32[0]):
+                if isinstance(n, ast.Tuple) and n.elts and all(member(e, "gguf.MODEL_TENSOR") for e in n.elts):
+                    forced.extend(n.elts)
+    if not forced:
+        fail(base.at(prepare), "no forced-F32 MODEL_TENSOR tuple found in prepare_tensors or _tensor_requires_f32")
+    seen = set()
+    forced = [e for e in forced if not (member(e, "gguf.MODEL_TENSOR") in seen
+                                        or seen.add(member(e, "gguf.MODEL_TENSOR")))]
     rows.extend(["forced_f32", member(e, "gguf.MODEL_TENSOR"), NONE, f"{file_name}:{e.lineno}"] for e in forced)
     return rows
 

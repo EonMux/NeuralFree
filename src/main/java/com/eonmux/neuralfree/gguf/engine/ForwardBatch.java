@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.engine;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.Objects;
+import java.util.function.IntPredicate;
 
 /**
  * An immutable forward batch: the tokens or embedding rows of one step, each belonging to exactly one sequence
@@ -11,8 +12,10 @@ import java.util.Objects;
  * otherwise ({@code ForwardBackend.batchRefusal()}).
  *
  * <p>Built by {@link Builder#build()}, which validates the llama.cpp batch rules: at least one row, non-negative
- * positions and sequence ids, per-sequence positions consecutive from one row of the batch to the next, no mixing
- * of token and embedding rows in one batch and one embedding width per batch. Accessors return copies.</p>
+ * positions and sequence ids, per-sequence positions non-decreasing from one row of the batch to the next (rows of
+ * a media chunk share one position) and one embedding width per batch. Token rows and embedding rows may share a
+ * batch (vLLM V1 schedules {@code prompt_embeds} rows beside token rows, marking each row's kind); a backend writes
+ * each row's input by its kind. Accessors return copies.</p>
  */
 public final class ForwardBatch {
 
@@ -25,9 +28,12 @@ public final class ForwardBatch {
     private final int[][] ropeSection; // section-major M-RoPE positions ropeSection[k][row]; null when unset
     private final int[] adapterSlot;   // per-row adapter slot; null = every row runs in slot 0
     private final int[] kindBits;      // OutputKind bitmask per row
+    private final boolean nonCausal;   // rows attend each other without the causal mask
+    private final long[] treeMask;     // per-row ancestor-or-self bitmask over the rows; null when unset
 
     private ForwardBatch(int[] token, int[] pos, int[] seq, boolean[] output, int[] outputRows,
-            float[][] embd, int[][] ropeSection, int[] adapterSlot, int[] kindBits) {
+            float[][] embd, int[][] ropeSection, int[] adapterSlot, int[] kindBits, boolean nonCausal,
+            long[] treeMask) {
         this.token = token;
         this.pos = pos;
         this.seq = seq;
@@ -37,6 +43,8 @@ public final class ForwardBatch {
         this.ropeSection = ropeSection;
         this.adapterSlot = adapterSlot;
         this.kindBits = kindBits;
+        this.nonCausal = nonCausal;
+        this.treeMask = treeMask;
     }
 
     /**
@@ -53,10 +61,7 @@ public final class ForwardBatch {
         return token.length;
     }
 
-    /**
-     * Token id of every row; a batch carries all token rows or all embedding rows ({@link Builder#build()}
-     * rejects the mix), so {@code -1} appears on an embedding batch only.
-     */
+    /** Token id of every row; {@code -1} marks an embedding row ({@link #embeddingRow(int)} holds its values). */
     public int[] tokens() {
         return token.clone();
     }
@@ -82,8 +87,8 @@ public final class ForwardBatch {
     }
 
     /**
-     * Embedding rows, indexed as {@code embeddings()[row]} (each row a copy), or null when the batch is a token
-     * batch.
+     * Embedding rows, indexed as {@code embeddings()[row]} (each row a copy, null for a token row), or null when
+     * the batch holds token rows only.
      */
     public float[][] embeddings() {
         if (embd == null) {
@@ -127,9 +132,48 @@ public final class ForwardBatch {
         return out;
     }
 
-    /** Adapter slot of every row, or null when the batch does not set them (every row runs in slot 0, LR-2 fills). */
+    /**
+     * Adapter slot of every row, or null when the batch does not set them (every row runs in slot 0): slot 0 runs
+     * the base model with the adapters attached to every row, slot {@code s >= 1} also the per-request adapters a
+     * {@code LoraRegistry} opened in slot {@code s}.
+     */
     public int[] adapterSlots() {
         return adapterSlot == null ? null : adapterSlot.clone();
+    }
+
+    /**
+     * Null when every row runs in adapter slot 0, else the refusal of {@code backend}, which serves slot 0 alone
+     * (the startup adapters), naming the first row outside it.
+     */
+    public String adapterSlotRefusal(String backend) {
+        Objects.requireNonNull(backend, "backend");
+        if (adapterSlot != null) {
+            for (int i = 0; i < adapterSlot.length; i++) {
+                if (adapterSlot[i] != 0) {
+                    return "adapterSlots: row " + i + " runs in adapter slot " + adapterSlot[i] + ", " + backend
+                            + " serves slot 0 only (the startup adapters)";
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Null when every row runs in slot 0 or in a slot {@code holds} accepts (a slot holding a per-request adapter
+     * on the backend's model), else the refusal of {@code backend} naming the first row in an empty slot.
+     */
+    public String adapterSlotRefusal(String backend, IntPredicate holds) {
+        Objects.requireNonNull(backend, "backend");
+        Objects.requireNonNull(holds, "holds");
+        if (adapterSlot != null) {
+            for (int i = 0; i < adapterSlot.length; i++) {
+                if (adapterSlot[i] != 0 && !holds.test(adapterSlot[i])) {
+                    return "adapterSlots: row " + i + " runs in adapter slot " + adapterSlot[i] + ", which holds no"
+                            + " adapter on " + backend + " (a LoraRegistry opens a per-request adapter's slot)";
+                }
+            }
+        }
+        return null;
     }
 
     /** The output kinds row {@code row} produces (a fresh set; empty when the row is not an output row). */
@@ -153,6 +197,28 @@ public final class ForwardBatch {
     }
 
     /**
+     * True when the rows attend each other without the causal mask (a media chunk's rows, llama.cpp
+     * {@code llama_set_causal_attn(false)}). The rows still read the stored memory.
+     */
+    public boolean nonCausal() {
+        return nonCausal;
+    }
+
+    /**
+     * The tree-attention mask of a verify step, or null when the batch carries none: {@code treeMask()[i]} is the
+     * ancestor-or-self bitmask of row {@code i} over the batch's rows, bit {@code j} set when row {@code j} is
+     * row {@code i} itself or one of its ancestors (SpecPilot's {@code fill_triton_verify_mask}, sglang
+     * {@code srt/speculative/specpilot_tree.py}). Every masked row is a fresh KV row of one sequence (a tree
+     * verify's N nodes at the slots after the committed prefix); within those rows the mask replaces the position
+     * visibility rules — a node sees its ancestors and itself and no other fresh row — while the committed prefix
+     * stays visible by the ordinary rules. The RoPE positions the rows run at ({@link #ropePositions()}) are their
+     * depth positions, so sibling rows share one position and only the mask separates them.
+     */
+    public long[] treeMask() {
+        return treeMask == null ? null : treeMask.clone();
+    }
+
+    /**
      * Accumulates rows for one batched forward step. Not thread-safe; one caller drives a builder.
      *
      * @throws IllegalStateException when an optional per-row array is set twice or the batch overflows
@@ -166,13 +232,15 @@ public final class ForwardBatch {
         private int n;
         private float[][] embd;     // entry set per addEmbedding
         private int embdWidth = -1; // width of the embedding rows added so far, -1 = none yet
-        private int nEmbedding;
         private int[][] ropeSection;
         private int[] adapterSlot;
         private EnumSet<OutputKind> kinds; // kinds of the output rows; null = LOGITS
+        private long[] treeMask;    // entry set per row by treeMaskBit
         private boolean ropeSet;
         private boolean adapterSet;
         private boolean kindsSet;
+        private boolean nonCausal;
+        private boolean treeMaskSet;
 
         private Builder(int capacity) {
             if (capacity <= 0) {
@@ -223,7 +291,6 @@ public final class ForwardBatch {
             this.pos[n] = pos;
             this.seq[n] = seq;
             this.output[n] = output;
-            nEmbedding++;
             n++;
             return this;
         }
@@ -305,6 +372,68 @@ public final class ForwardBatch {
         }
 
         /**
+         * The rows attend each other without the causal mask ({@code llama_set_causal_attn(false)}): the mask rule
+         * of a media chunk's step. Optional; the default is causal.
+         *
+         * @throws IllegalStateException when set twice
+         */
+        public Builder nonCausal() {
+            if (nonCausal) {
+                throw new IllegalStateException("non-causal is set once");
+            }
+            nonCausal = true;
+            return this;
+        }
+
+        /**
+         * The tree-attention mask of a verify step: {@code masks[i]} is the ancestor-or-self bitmask of the row
+         * added so far at index {@code i} (a {@code -1} entry leaves that row unmasked, a padding row's form).
+         * Optional; the default is no mask. The bits name the batch's rows, so the batch holds at most 64 of them;
+         * bit {@code i} of {@code masks[i]} is set for a masked row (ancestor lists keep parents ahead of children,
+         * so no bit above the row's own is set), and every named row runs on the masking row's own sequence — a
+         * batched tree verify step carries one sequence's tree per contiguous row block, the pieces' masks
+         * piece-local.
+         *
+         * @throws IllegalArgumentException when the batch outgrows 64 rows, the array covers another row count, a
+         *                                  masked row misses its own bit, carries a bit above its index, or
+         *                                  {@link ForwardBatch#build()} finds a bit naming another sequence's row
+         * @throws IllegalStateException    when set twice
+         */
+        public Builder treeMask(long[] masks) {
+            if (treeMaskSet) {
+                throw new IllegalStateException("tree mask is set once");
+            }
+            Objects.requireNonNull(masks, "masks");
+            if (masks.length != n) {
+                throw new IllegalArgumentException("tree mask covers " + masks.length + " rows, the batch holds "
+                        + n);
+            }
+            if (n > 64) {
+                throw new IllegalArgumentException("a tree mask names the batch's rows, so the batch holds at"
+                        + " most 64 of them, got " + n);
+            }
+            for (int i = 0; i < n; i++) {
+                long m = masks[i];
+                if (m == -1L) {
+                    continue;
+                }
+                if ((m & (1L << i)) == 0L) {
+                    throw new IllegalArgumentException("tree mask row " + i + " misses its own bit");
+                }
+                // the last row's allow-set is every bit: 1L << 64 would wrap to 1 and wrongly reject it
+                long allowed = i == 63 ? -1L : (1L << (i + 1)) - 1L;
+                if ((m & ~allowed) != 0L) {
+                    throw new IllegalArgumentException("tree mask row " + i + " carries a bit above its own index:"
+                            + " ancestors precede descendants in a tree batch");
+                }
+            }
+            // a rejected call changes nothing: the set-once flag goes last, after the validation
+            treeMaskSet = true;
+            treeMask = masks.clone();
+            return this;
+        }
+
+        /**
          * Builds the batch, validating the llama.cpp batch rules.
          *
          * @throws IllegalArgumentException on every rule violation
@@ -314,16 +443,11 @@ public final class ForwardBatch {
             if (n <= 0) {
                 throw new IllegalStateException("a batch holds at least one row");
             }
-            if (nEmbedding > 0 && nEmbedding != n) {
-                throw new IllegalArgumentException("token and embedding rows are not mixed in one batch: "
-                        + nEmbedding + " embedding rows of " + n);
-            }
             int[] tokens = Arrays.copyOf(token, n);
-            if (nEmbedding == 0) {
-                for (int i = 0; i < n; i++) {
-                    if (tokens[i] < 0) {
-                        throw new IllegalArgumentException("row " + i + " carries no token id");
-                    }
+            for (int i = 0; i < n; i++) {
+                boolean embeddingRow = embd != null && embd[i] != null;
+                if (!embeddingRow && tokens[i] < 0) {
+                    throw new IllegalArgumentException("row " + i + " carries no token id");
                 }
             }
             int lastSeq = -1;
@@ -339,8 +463,9 @@ public final class ForwardBatch {
                     lastSeq = seq[i];
                     lastPos = pos[i] - 1;
                 }
-                if (pos[i] != lastPos + 1) {
-                    throw new IllegalArgumentException("sequence " + seq[i] + " positions are not consecutive from "
+                // rows of a media chunk share the chunk's base position; a later row never holds a smaller one
+                if (pos[i] < lastPos) {
+                    throw new IllegalArgumentException("sequence " + seq[i] + " positions are not ascending from "
                             + "one row of the batch to the next: row " + i + " holds " + pos[i] + " after "
                             + lastPos);
                 }
@@ -376,8 +501,39 @@ public final class ForwardBatch {
                 }
             }
 
+            long[] treeOut;
+            if (!treeMaskSet) {
+                treeOut = null;
+            } else {
+                if (nonCausal) {
+                    throw new IllegalArgumentException("a tree mask and a non-causal step are two different mask"
+                            + " rules; a tree verify's step runs causal with the mask");
+                }
+                // the fresh-row rule the mask replaces is per sequence: a row's bits name rows of its own sequence
+                // only (a batched tree verify step carries one sequence's tree per piece, bit 0 the sequence's
+                // first fresh row)
+                for (int i = 0; i < n; i++) {
+                    long m = treeMask[i];
+                    if (m == -1L) {
+                        continue;
+                    }
+                    for (int j = 0; j <= i; j++) {
+                        if ((m & (1L << j)) != 0L && seq[j] != seq[i]) {
+                            throw new IllegalArgumentException("tree mask row " + i + " names row " + j
+                                    + " of sequence " + seq[j] + ", but the row runs on sequence " + seq[i]
+                                    + ": a tree mask's bits stay within the row's sequence");
+                        }
+                    }
+                }
+                treeOut = new long[n];
+                for (int i = 0; i < n; i++) {
+                    treeOut[i] = treeMask[i] == -1L ? 0L : treeMask[i];
+                }
+            }
+
             return new ForwardBatch(tokens, Arrays.copyOf(pos, n), Arrays.copyOf(seq, n),
-                    Arrays.copyOf(output, n), outputRows, embdCopy, ropeSection, adapterSlot, bits);
+                    Arrays.copyOf(output, n), outputRows, embdCopy, ropeSection, adapterSlot, bits, nonCausal,
+                    treeOut);
         }
 
         private void reserve() {

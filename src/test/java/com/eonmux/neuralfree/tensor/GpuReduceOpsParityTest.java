@@ -409,9 +409,13 @@ public class GpuReduceOpsParityTest {
         Tensor rearranged = keep(GpuReduceOps.sumToShape(floats(gpu, row, 1, 4), Shape.of(4, 1)));
         assertEquals(Shape.of(4, 1), rearranged.shape());
         TrainParity.assertBitIdentical("sumToShape reshape", row, rearranged.toFloatArray());
+        Tensor flattened = keep(GpuReduceOps.sumToShape(dev, Shape.of(60)));
+        assertEquals("a target that does not broadcast but has the element count rearranges",
+                Shape.of(60), flattened.shape());
+        TrainParity.assertBitIdentical("sumToShape flatten", x, flattened.toFloatArray());
         try {
-            GpuReduceOps.sumToShape(dev, Shape.of(60));
-            fail("incompatible shapes must throw");
+            GpuReduceOps.sumToShape(dev, Shape.of(7));
+            fail("a target that neither broadcasts nor has the element count must throw");
         } catch (IllegalArgumentException expected) {
             assertNotNull(expected.getMessage());
         }

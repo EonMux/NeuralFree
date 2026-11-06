@@ -70,9 +70,12 @@ public class NamedChatTemplatesTest {
     }
 
     @Test
-    public void namesListChatmlThenTheMistralTemplates() {
-        assertEquals(Arrays.asList("chatml", "mistral-v1", "mistral-v3", "mistral-v3-tekken", "mistral-v7",
-                "mistral-v7-tekken"), Arrays.asList(ChatTemplateSource.names().toArray()));
+    public void namesListChatmlFirstAndTheMistralTemplatesInLlamaCppOrder() {
+        List<String> names = Arrays.asList(ChatTemplateSource.names().toArray(new String[0]));
+        assertEquals("chatml", names.get(0));
+        int v1 = names.indexOf("mistral-v1");
+        assertEquals(Arrays.asList("mistral-v1", "mistral-v3", "mistral-v3-tekken", "mistral-v7",
+                "mistral-v7-tekken"), names.subList(v1, v1 + 5));
         assertThrows(UnsupportedOperationException.class, () -> ChatTemplateSource.names().add("x"));
         assertTrue(ChatTemplateSource.isName("mistral-v3"));
         assertTrue(ChatTemplateSource.isName(ChatTemplateSource.CHATML_NAME));

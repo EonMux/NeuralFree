@@ -30,7 +30,7 @@ import java.util.OptionalDouble;
 import java.util.OptionalInt;
 
 /**
- * The draft hooks of Appendix A table HK-SG part A (LC/conversion/qwen.py {@code DFlashModel} :757-1029 with its
+ * The draft hooks, part A (LC/conversion/qwen.py {@code DFlashModel} :757-1029 with its
  * {@code DSparkModel} subclass :958-1046, and LC/conversion/muse_glimmer.py {@code MuseGlimmerAssistantModel}
  * :137-163). The shared target, mask and {@code dflash_config} helpers live in {@link HfDraftHooks}; the
  * DeepSeek-V4, LiLiCorr and Gemma 4 drafts are {@link HfDraftHooksB}.

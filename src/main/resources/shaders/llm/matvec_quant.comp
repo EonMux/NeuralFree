@@ -9,6 +9,9 @@
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   OP_MATVEC      (i out_dim, i in_dim, R weight, R float input, W float output)
+ *   OP_MATVEC2     same arguments and result, two rows per workgroup: global = ceil(out_dim / 2) * L,
+ *                  pair p covers rows 2p and 2p+1 (the tail pair of an odd out_dim repeats the last
+ *                  row's weights and drops its store)
  *   OP_MATVEC_ADD  (i out_dim, i in_dim, R weight, R float input, float addend_output)
  *                  addend_output[row] += dot(weight row, input)
  *   OP_LOGITS      (i vocab_size, i embed_dim, R weight, R float hidden, W float logits)
@@ -16,13 +19,17 @@
  *   OP_GATEUP_GELU (i out_dim, i in_dim, R gate_weight, R up_weight, R float input, W float output)
  *                  output[row] = act(dot(gate row, input)) * dot(up row, input),
  *                  act = SiLU (_SILU) or GELU, tanh approximation (_GELU)
+ *   OP_GATEUP2     same arguments and result as OP_GATEUP_SILU, two rows per workgroup:
+ *                  global = ceil(out_dim / 2) * L, pair p covers rows 2p and 2p+1 of both weights
+ *                  (the tail pair of an odd out_dim repeats the last row and drops its store)
  *   OP_BATCH       (i out_dim, i in_dim, i seq_len, R weight, R float input, W float output)
  *                  output[s * out_dim + row] = dot(weight row, input row s), s in [0, seq_len)
  *   OP_BATCH_2D    same arguments and result, one token per workgroup row
  * A weight row holds in_dim / QT_BS blocks of QT_BB bytes; input row s starts at s * in_dim.
  *
  * Dispatch: every op except OP_BATCH_2D is 1-D with global = rows * L and local = {L, 1, 1}, one
- * workgroup per output row (folded group counts are recovered by nf_wg_id()). OP_BATCH_2D uses
+ * workgroup per output row (folded group counts are recovered by nf_wg_id()); OP_MATVEC2 and
+ * OP_GATEUP2 use global = ceil(rows / 2) * L, one workgroup per row pair. OP_BATCH_2D uses
  * global = {out_dim * L, seq_len, 1} and local = {L, 1, 1}. Any L is reduced exactly; the engine
  * passes multiples of 32, for which the block/invocation mapping equals the OpenCL kernels'.
  */
@@ -35,7 +42,7 @@
 #error "matvec_quant.comp requires OP and QTYPE"
 #endif
 
-#if OP == OP_GATEUP_SILU || OP == OP_GATEUP_GELU
+#if OP == OP_GATEUP_SILU || OP == OP_GATEUP_GELU || OP == OP_GATEUP2
 #define NF_MV_GATEUP 1
 #define NF_WEIGHT_STREAMS 2
 NF_BUFFER_VIEWS(0, w)
@@ -43,7 +50,7 @@ NF_BUFFER_VIEWS(1, u)
 layout(std430, binding = 2) readonly buffer NfMvInput { float x_in[]; };
 layout(std430, binding = 3) writeonly buffer NfMvOutput { float y_out[]; };
 layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; } pc;
-#elif OP == OP_MATVEC || OP == OP_MATVEC_ADD || OP == OP_LOGITS
+#elif OP == OP_MATVEC || OP == OP_MATVEC2 || OP == OP_MATVEC_ADD || OP == OP_LOGITS
 NF_BUFFER_VIEWS(0, w)
 layout(std430, binding = 1) readonly buffer NfMvInput { float x_in[]; };
 #if OP == OP_MATVEC_ADD
@@ -146,6 +153,78 @@ void main() {
         const float acc = nf_wg_sum(nf_mv_row_partial(NF_WS_A, rbase, s * in_dim, nblk));
         if (lid == 0u) {
             y_out[s * out_dim + row] = acc;
+        }
+    }
+#elif OP == OP_MATVEC2
+    /* Two rows per workgroup (pair p covers rows 2p and 2p+1): the activations are read once per
+     * two weight rows. The tail pair of an odd row count repeats the last row's weights and drops
+     * its second store, so control flow stays uniform. With one weight stream both rows read the
+     * same binding, so the dual-block decode serves the row pair. */
+    const uint pair = nf_wg_id();
+    const uint row0 = pair * 2u;
+    if (row0 >= out_dim) {
+        return;
+    }
+    const uint row1 = min(row0 + 1u, out_dim - 1u);
+    const uint rbase0 = row0 * row_bytes;
+    const uint rbase1 = row1 * row_bytes;
+    float ps0 = 0.0;
+    float ps1 = 0.0;
+    const uint pairs = nblk * uint(QT_TPS);
+    for (uint t = lid; t < pairs; t += gl_WorkGroupSize.x) {
+        const uint b = t / uint(QT_TPS);
+        const uint ltid = t % uint(QT_TPS);
+        const uint bp0 = rbase0 + b * uint(QT_BB);
+        const uint bp1 = rbase1 + b * uint(QT_BB);
+#ifdef QT_DECODE_DUAL
+        qt_dot_dual(bp0, bp1, 0u, b, ltid, ps0, ps1);
+#else
+        ps0 += qt_dot(NF_WS_A, bp0, 0u, b, ltid);
+        ps1 += qt_dot(NF_WS_A, bp1, 0u, b, ltid);
+#endif
+    }
+    const float o0 = nf_wg_sum(ps0);
+    const float o1 = nf_wg_sum(ps1);
+    if (lid == 0u) {
+        y_out[row0] = o0;
+        if (row0 + 1u < out_dim) {
+            y_out[row1] = o1;
+        }
+    }
+#elif OP == OP_GATEUP2
+    /* Two rows per workgroup over both weights (pair p covers rows 2p and 2p+1): the activations are
+     * read once per two row pairs, the second dual decode's input loads hitting L1. The tail pair of
+     * an odd row count repeats the last row's weights and drops its second store, so control flow
+     * stays uniform. */
+    const uint pair = nf_wg_id();
+    const uint row0 = pair * 2u;
+    if (row0 >= out_dim) {
+        return;
+    }
+    const uint row1 = min(row0 + 1u, out_dim - 1u);
+    const uint rbase0 = row0 * row_bytes;
+    const uint rbase1 = row1 * row_bytes;
+    float gs0 = 0.0;
+    float us0 = 0.0;
+    float gs1 = 0.0;
+    float us1 = 0.0;
+    const uint pairs = nblk * uint(QT_TPS);
+    for (uint t = lid; t < pairs; t += gl_WorkGroupSize.x) {
+        const uint b = t / uint(QT_TPS);
+        const uint ltid = t % uint(QT_TPS);
+        const uint b0 = rbase0 + b * uint(QT_BB);
+        const uint b1 = rbase1 + b * uint(QT_BB);
+        qt_dot_dual(b0, b0, 0u, b, ltid, gs0, us0);
+        qt_dot_dual(b1, b1, 0u, b, ltid, gs1, us1);
+    }
+    const float gv0 = nf_wg_sum(gs0);
+    const float uv0 = nf_wg_sum(us0);
+    const float gv1 = nf_wg_sum(gs1);
+    const float uv1 = nf_wg_sum(us1);
+    if (lid == 0u) {
+        y_out[row0] = nf_silu(gv0) * uv0;
+        if (row0 + 1u < out_dim) {
+            y_out[row1] = nf_silu(gv1) * uv1;
         }
     }
 #elif defined(NF_MV_GATEUP)

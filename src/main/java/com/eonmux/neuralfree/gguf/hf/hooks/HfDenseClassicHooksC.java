@@ -27,7 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Hooks of the llama.cpp classic-dense converter classes of Appendix A table HK-D1, part C: {@code FalconModel}
+ * Hooks of the llama.cpp classic-dense converter classes, part C: {@code FalconModel}
  * (LC/conversion/falcon.py:15-59), {@code GPT2Model} and {@code RuGPT3XLModel} (gpt2.py:15-80),
  * {@code StarCoderModel} (starcoder.py:8-21), {@code GPTNeoXModel} (gptneox.py:17-64),
  * {@code RefactModel} (refact.py:13-67), {@code Glm4Model} (glm.py:19-81) and {@code GlmOCRModel} (glm.py:91-112).

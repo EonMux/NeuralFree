@@ -44,10 +44,43 @@ public final class ElementTransforms {
         return nonLinear(src, "exp", v -> (float) Math.exp(v));
     }
 
+    /** {@code torch.exp(-src)} (the LeRoPE factors of Mistral Large 4, mistral4.py:92-95). */
+    public static RowSource expNeg(RowSource src) {
+        return nonLinear(src, "exp(-x)", v -> (float) Math.exp(-v));
+    }
+
+    /** {@code torch.tanh(src)} (Limite's XSA alpha, limite.py:170-173). */
+    public static RowSource tanh(RowSource src) {
+        return nonLinear(src, "tanh", v -> (float) Math.tanh(v));
+    }
+
     /** {@code src.squeeze()}: every dimension of size 1 removed, keeping at least one (Mamba {@code conv1d}). */
     public static RowSource squeezeConv(RowSource src) {
         long[] shape = src.shape();
         long[] out = Arrays.stream(shape).filter(d -> d != 1).toArray();
+        return reshape(src, out.length == 0 ? new long[]{1} : out);
+    }
+
+    /**
+     * {@code src.squeeze(dim)}: the dimension {@code dim} (negative counts from the last) removed when it has one
+     * element, otherwise the source unchanged, as torch's one-dimension squeeze.
+     *
+     * @throws IllegalArgumentException when {@code dim} lies outside the shape
+     */
+    public static RowSource squeezeDim(RowSource src, int dim) {
+        long[] shape = src.shape();
+        int rank = shape.length;
+        int d = dim < 0 ? rank + dim : dim;
+        if (d < 0 || d >= rank) {
+            throw new IllegalArgumentException("cannot squeeze dimension " + dim + " of the rank-" + rank
+                    + " tensor " + src.describe());
+        }
+        if (shape[d] != 1) {
+            return src;
+        }
+        long[] out = new long[rank - 1];
+        System.arraycopy(shape, 0, out, 0, d);
+        System.arraycopy(shape, d + 1, out, d, rank - d - 1);
         return reshape(src, out.length == 0 ? new long[]{1} : out);
     }
 
@@ -93,14 +126,16 @@ public final class ElementTransforms {
         return affine(src, 1f, value);
     }
 
-    /** {@code src * factor}: a source with an output scale gets the scale multiplied, F8_E4M3 gets one, block
-     *  formats with per-block scales are scaled in place, other formats are computed element by element. */
+    /** {@code src * factor}: a source with an output scale gets the scale multiplied, the per-element and block
+     *  F8_E4M3 types get one, block formats with per-block scales are scaled in place, other formats are computed
+     *  element by element. */
     public static RowSource mulScalar(RowSource src, float factor) {
         if (src instanceof LoraFactorSource) {
             return LoraFactorOps.onB((LoraFactorSource) src, b -> mulScalar(b, factor));
         }
         float[] os = src.outputScale();
-        if (os != null || src.format().ggmlType() == GGMLType.F8_E4M3) {
+        GGMLType t = src.format().ggmlType();
+        if (os != null || t == GGMLType.F8_E4M3 || t == GGMLType.F8_E4M3FN) {
             float[] scaled = os == null ? new float[]{factor} : os.clone();
             if (os != null) {
                 for (int i = 0; i < scaled.length; i++) {
@@ -115,6 +150,27 @@ public final class ElementTransforms {
         return mapped(src, " * " + factor, false, (row, v, off, n) -> {
             for (int i = 0; i < n; i++) {
                 v[off + i] *= factor;
+            }
+        }, ExpertTransforms.Siblings.of(src));
+    }
+
+    /**
+     * {@code src - src.mean()}: each row minus the mean of its elements, the zero-mean router bias Sarvam's
+     * converter applies to {@code e_score_correction_bias} before the tensor is written (sarvam.py
+     * {@code _zero_mean_tensor}). For the one-dimensional bias vector the row is the whole tensor.
+     */
+    public static RowSource subtractRowMean(RowSource src) {
+        if (src instanceof LoraFactorSource) {
+            throw LoraFactorOps.unsupported(src, "the zero-mean map");
+        }
+        return mapped(src, " zero-mean", false, (row, v, off, n) -> {
+            float mean = 0.0f;
+            for (int i = 0; i < n; i++) {
+                mean += v[off + i];
+            }
+            mean /= n;
+            for (int i = 0; i < n; i++) {
+                v[off + i] -= mean;
             }
         }, ExpertTransforms.Siblings.of(src));
     }
@@ -191,13 +247,179 @@ public final class ElementTransforms {
         return ColumnTransforms.gather(src, index);
     }
 
+    // ------------------------------------------------------------------ layout producers
+
+    /**
+     * {@code src.permute(*order)}: the axes of the tensor in the given order, as the converter classes that reshape a
+     * patch embedding from a transformer layout into a convolution kernel do (LC/conversion/lfm2.py:391-392,
+     * phi.py:334-340). Values are computed in f32 and stored in the source's float format (BF16 as F32, as the
+     * converter hands such tensors to its hooks).
+     *
+     * @throws IllegalArgumentException when {@code order} is not a permutation of the tensor's axes
+     */
+    public static RowSource permuteDims(RowSource src, int... order) throws IOException {
+        long[] in = src.shape();
+        if (order.length != in.length) {
+            throw new IllegalArgumentException(src.describe() + ": permute order " + Arrays.toString(order)
+                    + " does not name all " + in.length + " axes");
+        }
+        boolean[] seen = new boolean[in.length];
+        long[] out = new long[in.length];
+        for (int i = 0; i < order.length; i++) {
+            int a = order[i];
+            if (a < 0 || a >= in.length || seen[a]) {
+                throw new IllegalArgumentException(src.describe() + ": permute order " + Arrays.toString(order)
+                        + " is not a permutation of its axes");
+            }
+            seen[a] = true;
+            out[i] = in[a];
+        }
+        float[] values = allFloats(src);
+        long[] inStride = strides(in);
+        float[] result = new float[values.length];
+        for (int o = 0; o < result.length; o++) {
+            long rem = o;
+            long at = 0;
+            for (int k = out.length - 1; k >= 0; k--) {
+                long c = rem % out[k];
+                rem /= out[k];
+                at += c * inStride[order[k]];
+            }
+            result[o] = values[(int) at];
+        }
+        return new ArraySource(src, " permuted " + Arrays.toString(order), out, result);
+    }
+
+    /**
+     * {@code src.sum(dim=axis)}: the converter's reduction of a patch embedding's temporal slabs
+     * (LC/conversion/muse_glimmer.py:117-119). Values are computed in f32 and stored in the source's float format.
+     *
+     * @throws IllegalArgumentException when {@code axis} is not an axis of the tensor
+     */
+    public static RowSource sumAxis(RowSource src, int axis) throws IOException {
+        long[] in = src.shape();
+        int d = RowTransforms.normalizeDim(src, axis);
+        long[] out = new long[in.length - 1];
+        for (int i = 0, j = 0; i < in.length; i++) {
+            if (i != d) {
+                out[j++] = in[i];
+            }
+        }
+        long groups = in[d];
+        float[] values = allFloats(src);
+        long[] inStride = strides(in);
+        long outer = 1;
+        for (int i = 0; i < d; i++) {
+            outer = Math.multiplyExact(outer, in[i]);
+        }
+        long inner = 1;
+        for (int i = d + 1; i < in.length; i++) {
+            inner = Math.multiplyExact(inner, in[i]);
+        }
+        long outSize = Math.multiplyExact(outer, inner);
+        if (outSize > Integer.MAX_VALUE - 8) {
+            throw new IllegalArgumentException(src.describe() + ": the summed tensor is too large");
+        }
+        float[] result = new float[(int) outSize];
+        for (long o = 0; o < outSize; o++) {
+            long outerIdx = o / inner;
+            long innerIdx = o % inner;
+            long base = outerIdx * groups * inner + innerIdx;
+            float sum = 0f;
+            for (long g = 0; g < groups; g++) {
+                sum += values[(int) (base + g * inner)];
+            }
+            result[(int) o] = sum;
+        }
+        return new ArraySource(src, " summed over axis " + d, out, result);
+    }
+
+    /**
+     * The bilinear resampling of a {@code [1, h, w, c]} tensor to {@code [1, toH, toW, c]} with
+     * {@code align_corners=True}, as the converter resamples a RADIO position table to the image grid
+     * (LC/conversion/nemotron.py:184-194). Values are computed in f32 and stored in the source's float format.
+     *
+     * @throws IllegalArgumentException when the source shape is not {@code [1, h, w, c]} or a target side is not
+     *                                  positive
+     */
+    public static RowSource resizeBilinear(RowSource src, int toH, int toW) throws IOException {
+        long[] in = src.shape();
+        if (in.length != 4 || in[0] != 1 || toH <= 0 || toW <= 0) {
+            throw new IllegalArgumentException(src.describe() + ": bilinear resampling needs a [1, h, w, c] tensor,"
+                    + " got " + Arrays.toString(in) + " to " + toH + "x" + toW);
+        }
+        int h = Math.toIntExact(in[1]);
+        int w = Math.toIntExact(in[2]);
+        int c = Math.toIntExact(in[3]);
+        long[] out = {1, toH, toW, c};
+        float[] values = allFloats(src);
+        float[] result = new float[Math.multiplyExact(Math.multiplyExact(toH, toW), c)];
+        for (int oy = 0; oy < toH; oy++) {
+            float y = toH > 1 ? oy * (h - 1f) / (toH - 1) : 0f;
+            int y0 = Math.min((int) y, Math.max(h - 1, 0));
+            int y1 = Math.min(y0 + 1, Math.max(h - 1, 0));
+            float wy = h > 1 ? y - y0 : 0f;
+            for (int ox = 0; ox < toW; ox++) {
+                float x = toW > 1 ? ox * (w - 1f) / (toW - 1) : 0f;
+                int x0 = Math.min((int) x, Math.max(w - 1, 0));
+                int x1 = Math.min(x0 + 1, Math.max(w - 1, 0));
+                float wx = w > 1 ? x - x0 : 0f;
+                for (int ch = 0; ch < c; ch++) {
+                    float v00 = values[((y0 * w) + x0) * c + ch];
+                    float v01 = values[((y0 * w) + x1) * c + ch];
+                    float v10 = values[((y1 * w) + x0) * c + ch];
+                    float v11 = values[((y1 * w) + x1) * c + ch];
+                    float top = v00 + (v01 - v00) * wx;
+                    float bottom = v10 + (v11 - v10) * wx;
+                    result[((oy * toW) + ox) * c + ch] = top + (bottom - top) * wy;
+                }
+            }
+        }
+        return new ArraySource(src, " resampled to " + toH + "x" + toW, out, result);
+    }
+
+    /** The row-major strides of {@code shape}. */
+    private static long[] strides(long[] shape) {
+        long[] s = new long[shape.length];
+        long step = 1;
+        for (int i = shape.length - 1; i >= 0; i--) {
+            s[i] = step;
+            step = Math.multiplyExact(step, shape[i]);
+        }
+        return s;
+    }
+
+    /** Every element of {@code src} as f32, row-major. */
+    private static float[] allFloats(RowSource src) throws IOException {
+        if (!DtypePolicy.decodes(src.format())) {
+            throw new IllegalArgumentException(src.describe() + ": no decoder for its format " + src.format());
+        }
+        long[] shape = src.shape();
+        long inner = shape.length == 0 ? 1 : shape[shape.length - 1];
+        long rows = src.rows();
+        long total = Math.multiplyExact(rows, inner);
+        if (rows > Integer.MAX_VALUE - 8 || total > Integer.MAX_VALUE - 8 || inner > Integer.MAX_VALUE - 8) {
+            throw new IllegalArgumentException(src.describe() + ": the tensor is too large to materialize");
+        }
+        if (total == 0) {
+            return new float[0];
+        }
+        ByteBuffer in = RowTransforms.readRows(src, 0, (int) rows);
+        float[] values = new float[(int) total];
+        int rowBytes = (int) src.rowBytes();
+        for (int r = 0; r < rows; r++) {
+            DtypePolicy.decode(src.format(), in, r * rowBytes, values, r * (int) inner, (int) inner);
+        }
+        return values;
+    }
+
     // ------------------------------------------------------------------ dtype conversion
 
     /**
-     * {@code src.to(target)} for F32, F16 and BF16 (round to nearest even) or Q8_0 (the reference quantizer,
-     * rounding half away from zero). Any float, integer, eight-bit float or ggml block source is decoded first;
-     * an output scale and the activation values are kept; IllegalArgumentException for another target or a
-     * source format without a decoder.
+     * {@code src.to(target)} for F32, F16 and BF16 (round to nearest even), Q8_0 (the reference quantizer,
+     * rounding half away from zero) or TQ1_0 / TQ2_0 (the reference ternary quantizers). Any float, integer,
+     * eight-bit float or ggml block source is decoded first; an output scale and the activation values are kept;
+     * IllegalArgumentException for another target or a source format without a decoder.
      */
     public static RowSource convert(RowSource src, GGMLType target) {
         Objects.requireNonNull(target, "target");
@@ -207,9 +429,10 @@ public final class ElementTransforms {
         if (src.format().ggmlType() == target) {
             return src;
         }
-        if (target != GGMLType.F32 && target != GGMLType.F16 && target != GGMLType.BF16 && target != GGMLType.Q8_0) {
+        if (target != GGMLType.F32 && target != GGMLType.F16 && target != GGMLType.BF16
+                && target != GGMLType.Q8_0 && target != GGMLType.TQ1_0 && target != GGMLType.TQ2_0) {
             throw new IllegalArgumentException(src.describe() + ": cannot convert to " + target
-                    + "; the targets are F32, F16, BF16 and Q8_0");
+                    + "; the targets are F32, F16, BF16, Q8_0, TQ1_0 and TQ2_0");
         }
         if (src instanceof DtypePolicy.Mapped && ((DtypePolicy.Mapped) src).widened()) {
             return ((DtypePolicy.Mapped) src).storedAs(target);
@@ -456,6 +679,7 @@ public final class ElementTransforms {
         m.put(GGMLType.TQ1_0, new int[][]{{BlockLayout.TQ1_0_D}, none});
         m.put(GGMLType.TQ2_0, new int[][]{{BlockLayout.TQ2_0_D}, none});
         m.put(GGMLType.F8_E4M3_B128, new int[][]{none, {BlockLayout.F8B128_D}});
+        m.put(GGMLType.F8_E4M3_B32, new int[][]{none, {BlockLayout.F8B32_D}});
         m.put(GGMLType.I8_B128, new int[][]{none, {BlockLayout.I8B128_D}});
         m.put(GGMLType.NF4, new int[][]{none, {BlockLayout.BNB4_D}});
         m.put(GGMLType.FP4_BNB, new int[][]{none, {BlockLayout.BNB4_D}});
@@ -690,6 +914,41 @@ public final class ElementTransforms {
                 }
                 done += c;
             }
+        }
+    }
+
+    /** A materialized float array in the source's float format (BF16 as F32). */
+    private static final class ArraySource extends RowTransforms.Derived {
+        private final float[] values;
+        private final GGMLType target;
+        private final int inner;
+
+        ArraySource(RowSource src, String what, long[] shape, float[] values) {
+            super(src.describe() + what, ElementFormat.of(targetOf(src.format())), shape,
+                    ExpertTransforms.Siblings.NONE);
+            this.target = targetOf(src.format());
+            this.values = values;
+            long expected = Math.multiplyExact(rows(), shape.length == 0 ? 1 : shape[shape.length - 1]);
+            if (expected != values.length) {
+                throw new IllegalArgumentException(describe() + ": " + values.length + " values do not fill "
+                        + expected + " elements");
+            }
+            this.inner = Math.toIntExact(shape.length == 0 ? 1 : shape[shape.length - 1]);
+        }
+
+        private static GGMLType targetOf(ElementFormat f) {
+            GGMLType t = floatOut(f);
+            return t == GGMLType.BF16 ? GGMLType.F32 : t;
+        }
+
+        @Override
+        public boolean rowLocal() {
+            return false;
+        }
+
+        @Override
+        void produce(long first, int count, ByteBuffer out) throws IOException {
+            DtypePolicy.encode(target, values, Math.toIntExact(first) * inner, count * inner, out);
         }
     }
 }

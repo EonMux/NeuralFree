@@ -1,0 +1,7 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Fused decode-path kernel pairs (kernels/llm/fused.cl).
+LLM_RmsNormRope	fused.comp	OP=OP_RMS_NORM_ROPE
+LLM_GdnNormGate	fused.comp	OP=OP_GDN_NORM_GATE
+LLM_HcPostNorm	fused.comp	OP=OP_HC_POST_NORM
+LLM_NormRopeStore	fused.comp	OP=OP_NORM_ROPE_STORE
+LLM_RopeStore	fused.comp	OP=OP_ROPE_STORE

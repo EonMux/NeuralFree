@@ -1,15 +1,19 @@
 package com.eonmux.neuralfree.gguf.hparams;
 
 import com.eonmux.neuralfree.gguf.arch.ActOp;
+import com.eonmux.neuralfree.gguf.arch.ClassifierScope;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.arch.ArchTraits;
 import com.eonmux.neuralfree.gguf.arch.GatingFunc;
 import com.eonmux.neuralfree.gguf.arch.GdnHeadMap;
 import com.eonmux.neuralfree.gguf.arch.KdaGateMode;
 import com.eonmux.neuralfree.gguf.arch.PoolingKind;
+import com.eonmux.neuralfree.gguf.arch.PoolerAct;
 import com.eonmux.neuralfree.gguf.arch.RopeScalingType;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
+
+import java.util.Map;
 
 /**
  * Model hyperparameters resolved from GGUF metadata: the NeuralFree counterpart of llama.cpp
@@ -40,6 +44,8 @@ public final class ModelHparams {
     public static final int NON_CAUSAL_SWA_ONLY = 1;
     /** {@link #nonCausalType()}: all layers non-causal, SWA not applied within the current ubatch. */
     public static final int NON_CAUSAL_SWA_FULL = 2;
+    /** {@link #nonCausalType()}: dense layers non-causal, SWA layers stay causal (lfm3 d1, llama-hparams.h:37). */
+    public static final int NON_CAUSAL_DENSE_ONLY = 3;
 
     private final ModelHparamsBuilder d;
     private final int nLayerAll;
@@ -97,6 +103,11 @@ public final class ModelHparams {
     /** True when layer {@code il} has a routed-expert FFN. */
     public boolean isMoeLayer(int il) {
         return moe[layer(il)];
+    }
+
+    /** True when layer {@code il} is an MLP-only block (Dory's {@code layer_types} entry "mlp"). */
+    public boolean isMlpLayer(int il) {
+        return d.isMlp(il);
     }
 
     /** Copy of the per-layer {@link #isMoeLayer(int)} values. */
@@ -230,6 +241,9 @@ public final class ModelHparams {
     public float maxAlibiBias() { return d.maxAlibiBias; }
     /** ALiBi enabled ({@code use_alibi}). */
     public boolean useAlibi() { return d.useAlibi; }
+
+    /** True when the ALiBi bias uses the negative square-root distance (vLLM {@code use_alibi_sqrt}). */
+    public boolean alibiSqrt() { return d.alibiSqrt; }
     /** T5 relative attention buckets ({@code n_rel_attn_bkts}). */
     public int nRelAttnBuckets() { return d.nRelAttnBuckets; }
     /** Attention temperature length ({@code attn_temp_length}). */
@@ -259,8 +273,19 @@ public final class ModelHparams {
 
     /** Sliding-window mask type ({@code swa_type}). */
     public SwaType swaType() { return d.swaType; }
-    /** Sliding window size, 0 = none ({@code n_swa}). */
+    /** Model-wide sliding window size, 0 = none ({@code n_swa}). */
     public int nSwa() { return d.nSwa; }
+
+    /**
+     * Sliding window of layer {@code il}: its entry of {@code attention.sliding_window_per_layer} when the file
+     * carries one (0 = full attention), else the model-wide {@link #nSwa()}.
+     */
+    public int nSwa(int il) {
+        return d.swaWindowArr.length == 0 ? d.nSwa : d.swaWindowArr[layer(il)];
+    }
+
+    /** Learned static sink tokens of the attention layers ({@code attention.sink_token_count}); 0 without them. */
+    public int sinkTokenCount() { return d.sinkTokenCount; }
 
     // ---- rope ----
 
@@ -280,12 +305,41 @@ public final class ModelHparams {
     public RopeScalingType ropeScalingType() { return d.ropeScalingType; }
     /** NTK alpha ({@code rope_scaling_alpha}). */
     public float ropeScalingAlpha() { return d.ropeScalingAlpha; }
+    /** Dynamic NTK scaling factor ({@code rope.scaling.factor}); 0 without one. */
+    public float ropeScalingFactor() { return d.ropeScalingFactor; }
+    /** Fixed/mixed NTK mixed exponent ({@code rope.scaling.mixed_b}); NaN without one (the fixed form). */
+    public float ropeScalingMixedB() { return d.ropeScalingMixedB; }
+    /** True when the layers use the Fourier position embedding ({@code rope.fope.use}). */
+    public boolean ropeFope() { return d.ropeFope; }
+    /** Per-KV-head FoPE coefficients ({@code rope.fope.sep_head}). */
+    public boolean ropeFopeSepHead() { return d.ropeFopeSepHead; }
+    /** Frequencies the FoPE coefficients project, 0 = select by period ({@code rope.fope.num_inv_freq}). */
+    public int ropeFopeNumInvFreq() { return d.ropeFopeNumInvFreq; }
+    /** FoPE initialization factor ({@code rope.fope.init_factor}). */
+    public float ropeFopeInitFactor() { return d.ropeFopeInitFactor; }
     /** RoPE attention factor ({@code rope_attn_factor}). */
     public float ropeAttnFactor() { return d.ropeAttnFactor; }
+    /** Router takes a fixed number of experts from every group ({@code expert_per_group_top_k}). */
+    public boolean moePerGroupTopK() { return d.moePerGroupTopK; }
     /** Original context of YaRN scaling ({@code n_ctx_orig_yarn}). */
     public int nCtxOrigYarn() { return d.nCtxOrigYarn; }
     /** {@code rope.scaling.finetuned}. */
     public boolean ropeFinetuned() { return d.ropeFinetuned; }
+
+    // ---- dual-chunk attention ----
+
+    /** True when the file configures dual-chunk attention ({@code attention.dual_chunk.chunk_size} > 0). */
+    public boolean hasDualChunkAttention() { return d.dualChunkChunkSize > 0; }
+    /** Dual-chunk {@code chunk_size}. */
+    public int dualChunkChunkSize() { return d.dualChunkChunkSize; }
+    /** Dual-chunk {@code local_size}. */
+    public int dualChunkLocalSize() { return d.dualChunkLocalSize; }
+    /** Dual-chunk {@code original_max_position_embeddings}; 0 disables the logit scaling. */
+    public int dualChunkOriginalMaxPositionEmbeddings() { return d.dualChunkOriginalMaxPositionEmbeddings; }
+    /** True when the config enables the (unsupported) vertical-slash sparse attention. */
+    public boolean dualChunkSparseEnabled() { return d.dualChunkSparseEnabled; }
+    public int dualChunkSparseThreshold() { return d.dualChunkSparseThreshold; }
+    public int dualChunkSparseLastQ() { return d.dualChunkSparseLastQ; }
     /** YaRN log multiplier ({@code rope_yarn_log_mul}). */
     public float yarnLogMul() { return d.yarnLogMul; }
     /** YaRN extrapolation factor, negative = derived ({@code yarn_ext_factor}). */
@@ -317,6 +371,20 @@ public final class ModelHparams {
     public int ssmNGroup() { return d.ssmNGroup; }
     /** RMS-normalize dt, B and C ({@code ssm_dt_b_c_rms}). */
     public boolean ssmDtBcRms() { return d.ssmDtBcRms; }
+    /** Epsilon of the delta-rule output norm; 0 when the block RMS epsilon applies. */
+    public float ssmNormEps() { return d.ssmNormEps; }
+    /** Multiplier of the delta-rule update rate ({@code ssm.beta_scale}). */
+    public float ssmBetaScale() { return d.ssmBetaScale; }
+    /** Group count of the lightning-attention output RMS norm ({@code ssm.group_norm_size}). */
+    public int ssmGroupNormSize() { return d.ssmGroupNormSize; }
+    /** Apply SiLU to the fused lightning-attention Q/K/V projection ({@code ssm.linear_silu}). */
+    public boolean ssmLinearSilu() { return d.ssmLinearSilu; }
+    /** Per-head RMS norm of the lightning-attention Q and K ({@code ssm.qk_norm}). */
+    public boolean ssmQkNorm() { return d.ssmQkNorm; }
+    /** Scale the lightning-attention Q by {@code head_size^-0.5} ({@code ssm.q_scale}). */
+    public boolean ssmQScale() { return d.ssmQScale; }
+    /** Rotary dims of the lightning-attention heads ({@code ssm.rope_dimension_count}). */
+    public int ssmRopeDims() { return d.ssmRopeDims; }
     /** Gated delta-net head mapping, null when not GDN. */
     public GdnHeadMap gdnHeadMap() { return d.gdnHeadMap; }
     /** MiniMax linear attention head size ({@code n_embd_head_la}). */
@@ -353,11 +421,47 @@ public final class ModelHparams {
     public int fullAttentionInterval() { return d.fullAttentionInterval; }
     /** Cross-layer attention residual block size ({@code attn_res_block_size}). */
     public int attnResBlockSize() { return d.attnResBlockSize; }
+    /** Inkling relative-logit distances of a full-attention layer ({@code rel_extent}); a local layer uses its window. */
+    public int inklingRelExtent() { return d.inklingRelExtent; }
+    /** Inkling width of the per-head relative projection ({@code d_rel}). */
+    public int inklingRelDim() { return d.inklingRelDim; }
+    /** Inkling short-convolution width ({@code sconv_kernel_size}); 0 without the convolutions. */
+    public int inklingSconvKernel() { return d.inklingSconvKernel; }
+    /** Inkling log-scaling floor ({@code log_scaling_n_floor}); 0 disables the per-token query scaling. */
+    public int inklingLogScalingFloor() { return d.inklingLogScalingFloor; }
+    /** Inkling log-scaling alpha ({@code log_scaling_alpha}). */
+    public float inklingLogScalingAlpha() { return d.inklingLogScalingAlpha; }
+
+    /**
+     * Floats of layer {@code il}'s Inkling conv state: the K and V streams ({@code n_head_kv * head_dim} channels each,
+     * SWA-aware) and the attention-output and MLP-output streams ({@code n_embd} channels each), over
+     * {@code sconv_kernel_size - 1} steps.
+     */
+    public long inklingConvStateFloats(int il) {
+        if (d.inklingSconvKernel <= 1) {
+            return 0;
+        }
+        long perStep = 2L * nHeadKv(il) * headK(il) + 2L * d.nEmbd;
+        return (d.inklingSconvKernel - 1) * perStep;
+    }
+
+    // ---- zamba2 shared transformer blocks ----
+
+    /** Number of shared attention/MLP blocks the hybrid layers cycle through ({@code num_mem_blocks}). */
+    public int zamba2MemBlocks() { return d.zamba2MemBlocks; }
+    /** Rank of the per-use LoRA adapters of the shared blocks ({@code adapter_rank}). */
+    public int zamba2AdapterRank() { return d.zamba2AdapterRank; }
+    /** True when the shared attention projections carry per-use Q/K/V adapters. */
+    public boolean zamba2AttentionAdapter() { return d.zamba2AttentionAdapter; }
+    /** True when the shared attention applies RoPE ({@code use_mem_rope}). */
+    public boolean zamba2MemoryRope() { return d.zamba2MemoryRope; }
 
     // ---- mixture of experts ----
 
     /** Expert count ({@code n_expert}). */
     public int nExpert() { return d.nExpert; }
+    /** Routed-expert slots whose FFN is the identity ({@code zero_expert_num}); 0 without them. */
+    public int nExpertZero() { return d.nExpertZero; }
     /** Shared expert count ({@code n_expert_shared}). */
     public int nExpertShared() { return d.nExpertShared; }
     /** Expert group count ({@code n_expert_groups}). */
@@ -409,6 +513,14 @@ public final class ModelHparams {
     public int indexerBlockSize() { return d.indexerBlockSize; }
     /** MSA local blocks ({@code indexer_local_blocks}). */
     public int indexerLocalBlocks() { return d.indexerLocalBlocks; }
+    /** Step5 rotary width of each 256-wide indexer head; 0 for other indexers. */
+    public int indexerRopeDim() { return d.indexerRopeDim; }
+    /** Step5 indexer provider group count (equal to the attention KV head count). */
+    public int indexerGroupCount() { return d.indexerGroupCount; }
+    /** Step5 residual accumulator kept in F32 while the block parameters round to BF16. */
+    public boolean fp32Residual() { return d.fp32Residual; }
+    /** Step5 RMS norm weights are stored as {@code 1 + weight}. */
+    public boolean zeroCenteredNorms() { return d.zeroCenteredNorms; }
     /** Output group count ({@code dsv4_o_group_count}). */
     public int dsv4OGroupCount() { return d.dsv4OGroupCount; }
     /** Output LoRA rank ({@code dsv4_o_lora_rank}). */
@@ -427,6 +539,24 @@ public final class ModelHparams {
     public int hcLowRank() { return d.hcLowRank; }
     /** Hyper-connection post-gate scale ({@code hc_magnitude}). */
     public float hcMagnitude() { return d.hcMagnitude; }
+    /** Layer {@code il}: compressed-KV source layer of DeepSeek-V4.1, -1 without compressed rows. */
+    public int dsv41KvSource(int il) { return d.dsv41KvSourceArr[layer(il)]; }
+    /** Copy of {@link #dsv41KvSource(int)} over every block. */
+    public int[] dsv41KvSourceArray() { return d.dsv41KvSourceArr.clone(); }
+    /** Layer {@code il}: indexer top-k source layer of DeepSeek-V4.1, -1 without compressed rows. */
+    public int dsv41TopkSource(int il) { return d.dsv41TopkSourceArr[layer(il)]; }
+    /** Copy of {@link #dsv41TopkSource(int)} over every block. */
+    public int[] dsv41TopkSourceArray() { return d.dsv41TopkSourceArr.clone(); }
+    /** Candidate-selection source layer of DeepSeek-V4.1, -1 without the two-level selection. */
+    public int dsv41CandidateSourceLayer() { return d.dsv41CandidateSourceLayer; }
+    /** Candidate blocks the source keeps per query, 0 without the selection. */
+    public int dsv41CandidateTopKBlocks() { return d.dsv41CandidateTopKBlocks; }
+    /** Consecutive compressed rows of one candidate block, 0 without the selection. */
+    public int dsv41CandidateBlockSize() { return d.dsv41CandidateBlockSize; }
+    /** {@code engram.pad_token_id}: index into {@link #engramTokenMap()}, -1 without Engram layers. */
+    public int engramPadTokenId() { return d.engramPadTokenId; }
+    /** {@code engram.token_map}: token id to hashed id, or -1 for a token outside the map. */
+    public int[] engramTokenMap() { return d.engramTokenMap.clone(); }
 
     // ---- per-layer embeddings and altup ----
 
@@ -444,6 +574,14 @@ public final class ModelHparams {
     public int pleEosTokenId() { return d.pleEosTokenId; }
     /** {@code ple_image_token_id}. */
     public int pleImageTokenId() { return d.pleImageTokenId; }
+    /** N-gram input embedding: base table size {@code ngram.vocab_size}; 0 without the embedding. */
+    public int ngramVocabSize() { return d.ngramVocabSize; }
+    /** N-gram input embedding: tokens hashed per order {@code ngram.neighbor_count}. */
+    public int ngramNeighborCount() { return d.ngramNeighborCount; }
+    /** N-gram input embedding: hash tables per order {@code ngram.split_count}. */
+    public int ngramSplitCount() { return d.ngramSplitCount; }
+    /** N-gram input embedding: the token id that ends a walk {@code ngram.eos_token_id}, -1 when unset. */
+    public int ngramEosTokenId() { return d.ngramEosTokenId; }
     /** N-gram hash multipliers ({@code ple_layer_multipliers}). */
     public long[] pleLayerMultipliers() { return d.pleLayerMultipliers.clone(); }
     /** Token-space head offsets ({@code ple_head_offsets}). */
@@ -469,6 +607,8 @@ public final class ModelHparams {
     public float residualScale() { return d.residualScale; }
     /** Embedding scale, 0 = none ({@code f_embedding_scale}). */
     public float embeddingScale() { return d.embeddingScale; }
+    /** Scale of the hidden state the drafter hands to its head and its next step, 0 = none. */
+    public float outputHiddenScale() { return d.outputHiddenScale; }
     /** SiTU beta ({@code situ_beta}). */
     public float situBeta() { return d.situBeta; }
     /** SiTU linear beta, 0 = none ({@code situ_linear_beta}). */
@@ -488,6 +628,22 @@ public final class ModelHparams {
     public int hrmLCycles() { return d.hrmLCycles; }
     /** {@code hrm_prefix_lm}. */
     public boolean hrmPrefixLm() { return d.hrmPrefixLm; }
+    /** Passes over the repeated block ({@code recurrent_block.num_loops}); 0 when the schedule is not a repeat. */
+    public int repeatLoops() { return d.repeatLoops; }
+    /** Plain layers before the repeated block ({@code recurrent_block.n_input_layers}). */
+    public int repeatInputLayers() { return d.repeatInputLayers; }
+    /** Layers of the repeated block ({@code recurrent_block.n_recurrent_layers}). */
+    public int repeatRecurrentLayers() { return d.repeatRecurrentLayers; }
+    /** Plain layers after the repeated block ({@code recurrent_block.n_output_layers}). */
+    public int repeatOutputLayers() { return d.repeatOutputLayers; }
+    /** The repeat schedule normalizes the stream at the pass boundaries with justnorm. */
+    public boolean repeatJustNorm() { return d.repeatJustNorm; }
+    /** Justnorm epsilon of the repeat schedule's pass boundaries. */
+    public float repeatJustNormEps() { return d.repeatJustNormEps; }
+    /** Dory's slerp-residual alpha scale ({@code ngpt_alpha_init / initializer_range}); 0 when unused. */
+    public float slerpAlphaScale() { return d.slerpAlphaScale; }
+    public boolean repeatDualAttention() { return d.repeatDualAttention; }
+    public int repeatLocalWindow() { return d.repeatLocalWindow; }
 
     // ---- heads, encoders and pooling ----
 
@@ -501,6 +657,20 @@ public final class ModelHparams {
     public String[] classifierLabels() { return d.classifierLabels.clone(); }
     /** Decision labels ({@code decision.labels}). */
     public String[] decisionLabels() { return d.decisionLabels.clone(); }
+    /** The decision head's type ({@code decision.type}), null when the model carries none. */
+    public String decisionType() { return d.decisionType; }
+    /** The question and options token budget of a marker-read decision head ({@code decision.max_head_tokens}). */
+    public int decisionMaxHeadTokens() { return d.decisionMaxHeadTokens; }
+    /**
+     * Per-type decision temperatures ({@code decision.temperature.<name>}, optionally bucketed like
+     * {@code choice.3_5}), unmodifiable; the calibration the answer softmax scales the head's logits with.
+     */
+    public Map<String, Float> decisionTemperatures() { return d.decisionTemperatures; }
+    /**
+     * Score-question logit offsets by level count ({@code decision.score_bias.<levels>.<level>}), unmodifiable
+     * with arrays the caller must not modify; applied before the answer softmax.
+     */
+    public Map<Integer, float[]> decisionScoreBias() { return d.decisionScoreBias; }
     /** {@code decision.routing_block_count}. */
     public int decisionRoutingLayers() { return d.decisionRoutingLayers; }
     /** {@code decision.block_count}. */
@@ -509,6 +679,33 @@ public final class ModelHparams {
     public int decisionHeadCount() { return d.decisionHeadCount; }
     /** Classifier head activation ({@code act_cls}). */
     public ActOp classifierActivation() { return d.classifierActivation; }
+    /** Pooler-level activation over the scores ({@code classifier.pooler_activation}); null keeps the arch default. */
+    public PoolerAct poolerActivation() { return d.poolerActivation; }
+    /**
+     * True when per-token classification applies only {@code cls.output} over the embedding rows, skipping the
+     * {@code cls} / {@code cls.norm} prediction head (vLLM's {@code for_seq_cls} token_classify;
+     * {@code classifier.token_direct}).
+     */
+    public boolean classifierTokenDirect() { return d.classifierTokenDirect; }
+    /**
+     * The sparse pooling over the per-token classifier scores ({@code classifier.sparse}): {@code log1p_relu_max}
+     * or {@code log1p_relu_sum}; null when the model has no sparse embedding output.
+     */
+    public String classifierSparse() { return d.classifierSparse; }
+    /** The token id whose leading row the sparse pooling drops ({@code classifier.sparse_cls_token}). */
+    public int sparseClsToken() { return d.sparseClsToken; }
+    /** The token id whose trailing row the sparse pooling drops ({@code classifier.sparse_sep_token}). */
+    public int sparseSepToken() { return d.sparseSepToken; }
+    /** The leading per-token row's boundary token id, -1 = none ({@code classifier.bos_token}). */
+    public int classifierBosToken() { return d.classifierBosToken; }
+    /** The trailing per-token row's boundary token id, -1 = none ({@code classifier.eos_token}). */
+    public int classifierEosToken() { return d.classifierEosToken; }
+    /** The default process-reward step filter, -1 = none ({@code classifier.step_tag_id}). */
+    public int classifierStepTagId() { return d.classifierStepTagId; }
+    /** True when the embedding rows are L2-normalized ({@code pooling.normalize}; vLLM's PoolerNormalize). */
+    public boolean poolingNormalize() { return d.poolingNormalize; }
+    /** Where the classifier runs ({@code classifier.scope}); null keeps llama.cpp's RANK-only classifier. */
+    public ClassifierScope classifierScope() { return d.classifierScope; }
     /** {@code hidden_activation} name, or null. */
     public String hiddenActivation() { return d.hiddenActivation; }
     /** Decoder start token, -1 = none ({@code dec_start_token_id}). */
@@ -603,6 +800,14 @@ public final class ModelHparams {
     public boolean isRecurrent(int il) { return d.recurrentArr[layer(il)]; }
     /** Copy of the per-layer {@link #isRecurrent(int)} values. */
     public boolean[] isRecurrentArray() { return d.recurrentArr.clone(); }
+    /** Layer {@code il} is a hybrid layer: it runs a shared transformer block before its Mamba-2 mixer. */
+    public boolean isHybridLayer(int il) { return d.hybridArr[layer(il)]; }
+    /** Copy of the per-layer {@link #isHybridLayer(int)} values. */
+    public boolean[] isHybridLayerArray() { return d.hybridArr.clone(); }
+    /** Layer {@code il}'s shared transformer block, or -1 for a Mamba-only layer. */
+    public int zamba2SharedBlock(int il) { return d.sharedBlockArr[layer(il)]; }
+    /** Copy of the per-layer {@link #zamba2SharedBlock(int)} values. */
+    public int[] zamba2SharedBlockArray() { return d.sharedBlockArr.clone(); }
     /** Layer {@code il}: full (not shared) sparse-attention indexer ({@code is_indexer_full_impl}). */
     public boolean isIndexerFull(int il) { return d.indexerFullArr[layer(il)]; }
     /** Copy of the per-layer {@link #isIndexerFull(int)} values. */
@@ -615,6 +820,16 @@ public final class ModelHparams {
     public int compressRatio(int il) { return d.compressRatioArr[layer(il)]; }
     /** Copy of the per-layer {@link #compressRatio(int)} values. */
     public int[] compressRatioArray() { return d.compressRatioArr.clone(); }
+    /** The limite MUDD tap of layer {@code il} at slot {@code tap}, -1 = no mixing ({@code mudd_tap_idx}). */
+    public int muddTapIdx(int il, int tap) { return d.muddTapIdx[il * d.muddTapCount + tap]; }
+    /** The {@code f_xsa_eps} of the exclusive self attention (0 = disabled). */
+    public float xsaEps() { return d.xsaEps; }
+    /** The limite MUDD mixer width ({@code n_mudd_ff}). */
+    public int muddFf() { return d.muddFf; }
+    /** The limite MUDD tap count ({@code n_mudd_taps}); 0 disables the dense connections. */
+    public int muddTapCount() { return d.muddTapCount; }
+    /** The {@code final_logit_sigmoid_capping} as {scale, shift, temperature}. */
+    public float[] finalLogitSigmoidCapping() { return d.finalLogitSigmoidCapping.clone(); }
     /** Layer {@code il}: deepstack embedding index, -1 = none ({@code deepstack_mapping_arr}). */
     public int deepstackMapping(int il) { return d.deepstackMappingArr[layer(il)]; }
     /** Copy of the per-layer {@link #deepstackMapping(int)} values. */
@@ -742,7 +957,7 @@ public final class ModelHparams {
             return (long) d.nEmbd * (d.shortconvLCache - 1);
         }
         if (d.kdaHeadDim != 0) {
-            long dInner = (long) nHead(0) * d.kdaHeadDim;
+            long dInner = (long) kdaHeadCount() * d.kdaHeadDim;
             return 3L * (d.ssmDConv > 0 ? d.ssmDConv - 1 : 3) * dInner;
         }
         return (long) (d.ssmDConv > 0 ? d.ssmDConv - 1 : 0) * (d.ssmDInner + 2L * d.ssmNGroup * d.ssmDState);
@@ -754,12 +969,26 @@ public final class ModelHparams {
             return (long) d.nEmbd * d.wkvHeadSize;
         }
         if (d.kdaHeadDim != 0) {
-            return (long) d.kdaHeadDim * d.kdaHeadDim * nHead(0);
+            return (long) d.kdaHeadDim * d.kdaHeadDim * kdaHeadCount();
         }
         if (d.headLinearAttn != 0) {
             return (long) d.headLinearAttn * d.headLinearAttn * nHead(0);
         }
         return (long) d.ssmDState * d.ssmDInner;
+    }
+
+    /**
+     * Query heads of the KDA (recurrent) layers: the first recurrent layer's head count, which the hooks keep equal
+     * across those layers. Unlike the attention head count of a hybrid file, this is the count the shared recurrent
+     * state rows are sized for (vLLM derives it from {@code linear_num_key_heads}).
+     */
+    private int kdaHeadCount() {
+        for (int il = 0; il < nLayerAll; il++) {
+            if (isRecurrent(il) && nHead(il) > 0) {
+                return nHead(il);
+            }
+        }
+        return nHead(0);
     }
 
     /** Per-layer-embedding convolution history rows, 0 without a PLE module ({@code ple_conv_state}). */

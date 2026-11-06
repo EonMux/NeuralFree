@@ -133,11 +133,22 @@ public final class PreTokenizerPatterns {
             " ?[^(\\s|.,!?\u2026\u3002\uFF0C\u3001\u0964\u06D4\u060C)]+",
             "\\p{N}");
 
-    /** {@code TEKKEN}. */
+    /** {@code TEKKEN}, {@code NEMOTRON_3_5_EMBD}. */
     public static final List<String> TEKKEN = seq(
             "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+|[^\\r\\n\\p"
                 + "{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\"
                 + "p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
+
+    /** {@code TEKKEN_NUM3}: {@link #TEKKEN} with numbers split into right-aligned groups of three digits. */
+    public static final List<String> TEKKEN_NUM3 = seq(
+            "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+|[^\\r\\n\\p"
+                + "{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*|\\p{N}{1,3}(?=(?:\\p{N}"
+                + "{3})*(?!\\p{N}))|\\p{N}{1,2}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
+
+    /** {@code SOPRANO}: single digits, then whitespace runs, word runs and symbol runs. */
+    public static final List<String> SOPRANO = seq(
+            "\\p{N}",
+            "\\s+|[\\p{L}\\p{N}_]+|[^\\p{L}\\p{N}_\\s]+");
 
     /** {@code CHAMELEON}. */
     public static final List<String> CHAMELEON = seq(
@@ -209,7 +220,7 @@ public final class PreTokenizerPatterns {
                 + "{M}*(?: \\p{L}\\p{M}*)*)+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]?|\\s*[\\r\\n]|\\s+(?!\\S)|\\"
                 + "s+");
 
-    /** {@code GEMMA4}, {@code SARVAM_MOE}, {@code MMBERT}: newline and non-newline runs. */
+    /** {@code GEMMA4}, {@code SARVAM_MOE}, {@code MMBERT}, {@code DOMYN_SMALL}: newline and non-newline runs. */
     public static final List<String> NEWLINE_RUNS = seq(
             "[^\\n]+|[\\n]+");
 

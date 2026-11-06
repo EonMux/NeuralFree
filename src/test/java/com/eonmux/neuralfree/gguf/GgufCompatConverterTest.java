@@ -20,7 +20,8 @@ import static org.junit.Assert.fail;
 /**
  * The MXFP8 exponent acceptance cases and the conversion proofs of {@link GgufCompatConverter}: an exponent
  * set wholly in {@code [3, 246]} exports as BF16, some exponent in {@code [0, 2]} makes the tensor F32, and
- * an exponent of {@code 247} or the reserved NaN byte fails naming the tensor. F8_E4M3 → F16 is exact, and
+ * an exponent of {@code 247} or the reserved NaN byte fails naming the tensor. F8_E4M3 passes through to
+ * llama.cpp's per-element F8_E4M3FN byte for byte, and
  * the Q8_0 requantization of the per-128 blocks matches the reference quantizer's bytes, cross-checked
  * through {@link GgufTestWriter#encodeFloats}. The tensor bytes are served by the same store double the
  * write tests use ({@code GgufWriterTest.TestWeightStore}'s shape, kept local for one-tensor scopes).
@@ -73,14 +74,23 @@ public class GgufCompatConverterTest {
     }
 
     @Test
-    public void theF8E4m3RowConvertsToF16Exactly() throws IOException {
-        byte[] raw = bytes(e4m3Codes(32));
-        byte[] out = convertTo(raw, new long[]{32}, GGMLType.F8_E4M3, GGMLType.F16);
-        for (int i = 0; i < 32; i++) {
-            int code = (i % 30) + 0x08;
-            int f16Bits = (out[2 * i] & 0xFF) | (out[2 * i + 1] & 0xFF) << 8;
-            assertEquals("code " + code,
-                    FpBlockDecoders.fp32ToFp16(FpBlockDecoders.e4m3ToFp32(code)), f16Bits);
+    public void theF8E4m3CodesPassThroughToF8E4M3FnByteForByte() throws IOException {
+        byte[] raw = bytes(e4m3Codes(96));
+        GgufWriterTest.TestHfSource src = new GgufWriterTest.TestHfSource("synthetic://f8");
+        int[] codes = new int[raw.length];
+        for (int i = 0; i < raw.length; i++) {
+            codes[i] = raw[i] & 0xFF;
+        }
+        src.tensor(NAME, GGMLType.F8_E4M3, new long[]{96}, codes);
+        assertEquals(GGMLType.F8_E4M3FN, GgufCompatConverter.targetType(src.getTensors().get(0),
+                src.createMappedStore(), GgufWriter.Mode.COMPAT));
+        assertArrayEquals("codes are llama.cpp's per-element F8_E4M3FN bytes", raw,
+                convertTo(raw, new long[]{96}, GGMLType.F8_E4M3, GGMLType.F8_E4M3FN));
+        try {
+            convertTo(raw, new long[]{96}, GGMLType.F8_E4M3, GGMLType.F16);
+            fail("F8_E4M3 now exports as F8_E4M3FN, not F16");
+        } catch (IOException expected) {
+            assertTrue(expected.getMessage().contains("no COMPAT conversion"));
         }
     }
 
@@ -235,6 +245,7 @@ public class GgufCompatConverterTest {
         try (WeightStore store = new OneTensorStore(raw)) {
             GgufCompatConverter.convert(source, target, store, enc);
         }
+        enc.flush();
         byte[] all = out.toByteArray();
         assertEquals("byte count of the " + to + " tensor", bytesFor(to, dims), all.length);
         return all;

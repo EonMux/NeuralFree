@@ -54,6 +54,7 @@ public class BatchStatsTest {
             assertEquals(2L, s.finished(StopReason.MAX_TOKENS));
             assertEquals(1L, s.finished(StopReason.CANCELLED));
             assertEquals(0L, s.failed());
+            assertEquals("a host backend reads every sampled row back", 0L, s.deviceSampledRows());
             assertTrue(s.decodeSteps() > 0);
             assertTrue(s.rowsPerDecode() >= 1.0 && s.rowsPerDecode() <= 2.0);
             assertTrue(s.promptSeconds() > 0 && s.decodeSeconds() > 0);
@@ -63,5 +64,67 @@ public class BatchStatsTest {
             assertTrue("the cached prefixes still hold rows", s.kvUsage() > 0 && s.kvUsage() <= 1);
             assertEquals(0L, s.preemptions());
         }
+    }
+
+    @Test
+    public void plusCombinesTwoSnapshots() {
+        BatchStats.Builder a = new BatchStats.Builder();
+        a.promptTokens = 5;
+        a.promptNanos = 1_000;
+        a.generatedTokens = 3;
+        a.deviceSampledRows = 5;
+        a.decodeSteps = 2;
+        a.decodeRows = 3;
+        a.finished[StopReason.MAX_TOKENS.ordinal()] = 1;
+        a.failed = 1;
+        a.specRounds = 4;
+        a.specDrafted = 9;
+        a.specAccepted = 6;
+        a.maxSequenceLength = 40;
+        a.running = 1;
+        a.queued = 2;
+        a.usedCells = 10;
+        a.totalCells = 100;
+        a.encoderCacheRows = 16;
+        a.encoderCacheHits = 3;
+        a.encoderCacheEvictions = 1;
+        BatchStats.Builder b = new BatchStats.Builder();
+        b.promptTokens = 7;
+        b.promptNanos = 500;
+        b.generatedTokens = 4;
+        b.deviceSampledRows = 2;
+        b.decodeSteps = 2;
+        b.decodeRows = 2;
+        b.finished[StopReason.MAX_TOKENS.ordinal()] = 2;
+        b.specRounds = 2;
+        b.specDrafted = 5;
+        b.specAccepted = 3;
+        b.maxSequenceLength = 60;
+        b.usedCells = 30;
+        b.totalCells = 100;
+        b.encoderCacheRows = 8;
+        b.encoderCacheHits = 2;
+        b.encoderCacheEvictions = 4;
+        BatchStats sum = a.build().plus(b.build());
+        assertEquals(12L, sum.promptTokens());
+        assertEquals(7L, sum.generatedTokens());
+        assertEquals(7L, sum.deviceSampledRows());
+        assertEquals(4L, sum.decodeSteps());
+        assertEquals(1.25, sum.rowsPerDecode(), 1e-9);
+        assertEquals(1500.0 / 1e9, sum.promptSeconds(), 1e-12);
+        assertEquals(3L, sum.finished(StopReason.MAX_TOKENS));
+        assertEquals(1L, sum.failed());
+        assertEquals(6L, sum.specRounds());
+        assertEquals(14L, sum.specDrafted());
+        assertEquals(9L, sum.specAccepted());
+        assertEquals(60, sum.maxSequenceLength());
+        assertEquals(1, sum.running());
+        assertEquals(2, sum.waiting());
+        assertEquals(0.2, sum.kvUsage(), 1e-9);
+        assertEquals("the replicas' encoder caches add", 24, sum.encoderCacheRows());
+        assertEquals(5L, sum.encoderCacheHits());
+        assertEquals(5L, sum.encoderCacheEvictions());
+        assertEquals(0L, BatchStats.EMPTY.plus(BatchStats.EMPTY).promptTokens());
+        assertEquals(0, BatchStats.EMPTY.plus(BatchStats.EMPTY).waiting());
     }
 }

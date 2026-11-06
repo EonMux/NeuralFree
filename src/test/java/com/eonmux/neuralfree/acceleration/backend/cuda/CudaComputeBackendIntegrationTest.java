@@ -9,6 +9,8 @@ import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.EnumSet;
+
 import static org.junit.Assert.*;
 
 public class CudaComputeBackendIntegrationTest {
@@ -178,8 +180,7 @@ public class CudaComputeBackendIntegrationTest {
     @Before
     public void setUp() {
         try {
-            HWAcceleration.enableCuda = true;
-            hwAccel = new HWAcceleration();
+            hwAccel = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
 
             if (!hwAccel.getCUDevices().isEmpty()) {
                 cuDevice = hwAccel.getCUDevices().get(0);
@@ -239,27 +240,26 @@ public class CudaComputeBackendIntegrationTest {
         ComputeQueue transferQueue = backend.transferQueue();
         ComputeQueue computeQueue = backend.computeQueue();
 
-        GpuEvent writeEventA = transferQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a);
-        GpuEvent writeEventB = transferQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b);
-
-        assertNotNull("Write event A should not be null", writeEventA);
-        assertNotNull("Write event B should not be null", writeEventB);
-
         Object[] kernelArgs = new Object[]{bufferA, bufferB, bufferC, size};
         int blockSize = 256;
         int gridSize = (size + blockSize - 1) / blockSize;
-        GpuEvent kernelEvent = computeQueue.enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, kernelArgs, writeEventA, writeEventB);
-
-        assertNotNull("Kernel event should not be null", kernelEvent);
 
         float[] result = new float[size];
-        GpuEvent readEvent = computeQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result, kernelEvent);
 
-        assertNotNull("Read event should not be null", readEvent);
-        computeQueue.finish();
+        try (GpuEvent writeEventA = transferQueue.enqueueWriteBuffer(bufferA, 0, bufferSize, a);
+             GpuEvent writeEventB = transferQueue.enqueueWriteBuffer(bufferB, 0, bufferSize, b);
+             GpuEvent kernelEvent = computeQueue.enqueueKernel(
+                     kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, kernelArgs, writeEventA, writeEventB);
+             GpuEvent readEvent = computeQueue.enqueueReadBuffer(bufferC, 0, bufferSize, result, kernelEvent)) {
+            assertNotNull("Write event A should not be null", writeEventA);
+            assertNotNull("Write event B should not be null", writeEventB);
+            assertNotNull("Kernel event should not be null", kernelEvent);
+            assertNotNull("Read event should not be null", readEvent);
+            computeQueue.finish();
 
-        for (int i = 0; i < Math.min(20, size); i++) {
-            assertEquals("Result mismatch at index " + i, expected[i], result[i], 1e-4f);
+            for (int i = 0; i < Math.min(20, size); i++) {
+                assertEquals("Result mismatch at index " + i, expected[i], result[i], 1e-4f);
+            }
         }
 
         bufferA.close();
@@ -307,16 +307,16 @@ public class CudaComputeBackendIntegrationTest {
         ComputeQueue tQueue = backend.transferQueue();
         ComputeQueue cQueue = backend.computeQueue();
 
-        tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A);
-        tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B);
+        tQueue.enqueueWriteBuffer(bufferA, 0, A.length * Float.BYTES, A).close();
+        tQueue.enqueueWriteBuffer(bufferB, 0, B.length * Float.BYTES, B).close();
         tQueue.finish();
 
         Object[] args = new Object[]{bufferA, bufferB, bufferC, M, K, N};
-        cQueue.enqueueKernel(kernel, new long[]{M, N}, new long[]{1, 1}, args);
+        cQueue.enqueueKernelNoEvent(kernel, new long[]{M, N}, new long[]{1, 1}, args);
         cQueue.finish();
 
         float[] result = new float[M * N];
-        cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result);
+        cQueue.enqueueReadBuffer(bufferC, 0, result.length * Float.BYTES, result).close();
         cQueue.finish();
 
         for (int i = 0; i < M * N; i++) {
@@ -365,17 +365,17 @@ public class CudaComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("scale", SCALE_PTX, null);
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        computeQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        computeQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         computeQueue.finish();
 
         Object[] args = new Object[]{buffer, 3.0f, size};
         int blockSize = 32;
         int gridSize = (size + blockSize - 1) / blockSize;
-        computeQueue.enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        computeQueue.enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         computeQueue.finish();
 
         float[] result = new float[size];
-        computeQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+        computeQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result).close();
         computeQueue.finish();
 
         for (int i = 0; i < size; i++) {
@@ -399,11 +399,11 @@ public class CudaComputeBackendIntegrationTest {
 
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, writeData);
+        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, writeData).close();
         transferQueue.finish();
 
         float[] readData = new float[size];
-        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, readData);
+        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, readData).close();
         transferQueue.finish();
 
         for (int i = 0; i < size; i++) {
@@ -431,18 +431,18 @@ public class CudaComputeBackendIntegrationTest {
 
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        transferQueue.enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         transferQueue.finish();
 
         KernelHandle kernel = backend.compileKernel("scale", SCALE_PTX, null);
         Object[] args = new Object[]{buffer, 2.0f, size};
         int blockSize = 32;
         int gridSize = (size + blockSize - 1) / blockSize;
-        computeQueue.enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        computeQueue.enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         computeQueue.finish();
 
         float[] result = new float[size];
-        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+        transferQueue.enqueueReadBuffer(buffer, 0, size * Float.BYTES, result).close();
         transferQueue.finish();
 
         for (int i = 0; i < size; i++) {
@@ -471,28 +471,29 @@ public class CudaComputeBackendIntegrationTest {
         ComputeQueue transferQueue = backend.transferQueue();
         ComputeQueue computeQueue = backend.computeQueue();
 
-        GpuEvent writeEventA = transferQueue.enqueueWriteBuffer(bufferA, 0, size * Float.BYTES, a);
-        GpuEvent writeEventB = transferQueue.enqueueWriteBuffer(bufferB, 0, size * Float.BYTES, b);
-
         Object[] args = new Object[]{bufferA, bufferB, bufferC, size};
         int blockSize = 256;
         int gridSize = (size + blockSize - 1) / blockSize;
-        GpuEvent kernelEvent = computeQueue.enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args, writeEventA, writeEventB);
 
         float[] result = new float[size];
-        GpuEvent readEvent = computeQueue.enqueueReadBuffer(bufferC, 0, size * Float.BYTES, result, kernelEvent);
 
-        try {
-            readEvent.awaitCompletion();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            fail("Test interrupted");
-            return;
-        }
+        try (GpuEvent writeEventA = transferQueue.enqueueWriteBuffer(bufferA, 0, size * Float.BYTES, a);
+             GpuEvent writeEventB = transferQueue.enqueueWriteBuffer(bufferB, 0, size * Float.BYTES, b);
+             GpuEvent kernelEvent = computeQueue.enqueueKernel(
+                     kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args, writeEventA, writeEventB);
+             GpuEvent readEvent = computeQueue.enqueueReadBuffer(bufferC, 0, size * Float.BYTES, result, kernelEvent)) {
+            try {
+                readEvent.awaitCompletion();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("Test interrupted");
+                return;
+            }
 
-        for (int i = 0; i < Math.min(50, size); i++) {
-            float expected = a[i] + b[i];
-            assertEquals("Dual stream result mismatch at index " + i, expected, result[i], 1e-4f);
+            for (int i = 0; i < Math.min(50, size); i++) {
+                float expected = a[i] + b[i];
+                assertEquals("Dual stream result mismatch at index " + i, expected, result[i], 1e-4f);
+            }
         }
 
         bufferA.close();
@@ -540,31 +541,30 @@ public class CudaComputeBackendIntegrationTest {
         GpuBuffer bufferB = backend.allocateBuffer(size * Float.BYTES);
         GpuBuffer bufferC = backend.allocateBuffer(size * Float.BYTES);
 
-        GpuEvent writeEventA = backend.transferQueue().enqueueWriteBuffer(bufferA, 0, size * Float.BYTES, a);
-        GpuEvent writeEventB = backend.transferQueue().enqueueWriteBuffer(bufferB, 0, size * Float.BYTES, b);
-
-        assertNotNull("Write event A should not be null", writeEventA);
-        assertNotNull("Write event B should not be null", writeEventB);
-
         Object[] args = new Object[]{bufferA, bufferB, bufferC, size};
         int blockSize = 64;
         int gridSize = (size + blockSize - 1) / blockSize;
-        GpuEvent kernelEvent = backend.computeQueue().enqueueKernel(
-                kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args, writeEventA, writeEventB);
 
         float[] result = new float[size];
-        GpuEvent readEvent = backend.computeQueue().enqueueReadBuffer(bufferC, 0, size * Float.BYTES, result, kernelEvent);
 
-        try {
-            readEvent.awaitCompletion();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            fail("Test interrupted");
-            return;
-        }
+        try (GpuEvent writeEventA = backend.transferQueue().enqueueWriteBuffer(bufferA, 0, size * Float.BYTES, a);
+             GpuEvent writeEventB = backend.transferQueue().enqueueWriteBuffer(bufferB, 0, size * Float.BYTES, b);
+             GpuEvent kernelEvent = backend.computeQueue().enqueueKernel(
+                     kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args, writeEventA, writeEventB);
+             GpuEvent readEvent = backend.computeQueue().enqueueReadBuffer(bufferC, 0, size * Float.BYTES, result, kernelEvent)) {
+            assertNotNull("Write event A should not be null", writeEventA);
+            assertNotNull("Write event B should not be null", writeEventB);
+            try {
+                readEvent.awaitCompletion();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("Test interrupted");
+                return;
+            }
 
-        for (int i = 0; i < Math.min(10, size); i++) {
-            assertEquals("Event-synced result mismatch at index " + i, a[i] + b[i], result[i], 1e-4f);
+            for (int i = 0; i < Math.min(10, size); i++) {
+                assertEquals("Event-synced result mismatch at index " + i, a[i] + b[i], result[i], 1e-4f);
+            }
         }
 
         bufferA.close();
@@ -584,22 +584,22 @@ public class CudaComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("scale", SCALE_PTX, null);
         GpuBuffer buffer = backend.allocateBuffer(size * Float.BYTES);
 
-        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         backend.transferQueue().finish();
 
         int blockSize = 32;
         int gridSize = (size + blockSize - 1) / blockSize;
         
         Object[] args = new Object[]{buffer, 2.0f, size};
-        backend.computeQueue().enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        backend.computeQueue().enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         backend.computeQueue().finish();
 
         args = new Object[]{buffer, 3.0f, size};
-        backend.computeQueue().enqueueKernel(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
+        backend.computeQueue().enqueueKernelNoEvent(kernel, new long[]{(long) gridSize * blockSize}, new long[]{blockSize}, args);
         backend.computeQueue().finish();
 
         float[] result = new float[size];
-        backend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result);
+        backend.transferQueue().enqueueReadBuffer(buffer, 0, size * Float.BYTES, result).close();
         backend.transferQueue().finish();
 
         float expected = 1.0f * 2.0f * 3.0f;
@@ -630,7 +630,7 @@ public class CudaComputeBackendIntegrationTest {
         backend.close();
 
         float[] data = new float[256];
-        backend.computeQueue().enqueueWriteBuffer(buffer, 0, 1024, data);
+        backend.computeQueue().enqueueWriteBuffer(buffer, 0, 1024, data).close();
     }
 
     @Test
@@ -662,11 +662,11 @@ public class CudaComputeBackendIntegrationTest {
             data[i] = i % 100;
         }
 
-        backend.transferQueue().enqueueWriteBuffer(buffer, 0, bufferSize, data);
+        backend.transferQueue().enqueueWriteBuffer(buffer, 0, bufferSize, data).close();
         backend.transferQueue().finish();
 
         float[] result = new float[size];
-        backend.transferQueue().enqueueReadBuffer(buffer, 0, bufferSize, result);
+        backend.transferQueue().enqueueReadBuffer(buffer, 0, bufferSize, result).close();
         backend.transferQueue().finish();
 
         for (int i = 0; i < 100; i++) {
@@ -690,7 +690,7 @@ public class CudaComputeBackendIntegrationTest {
             data[i] = i;
         }
 
-        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data);
+        backend.transferQueue().enqueueWriteBuffer(buffer, 0, size * Float.BYTES, data).close();
         backend.transferQueue().finish();
 
         buffer.close();
@@ -706,13 +706,13 @@ public class CudaComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("scale", SCALE_PTX, null);
         GpuBuffer buffer = backend.allocateBuffer(capacity * Float.BYTES);
         ComputeQueue queue = backend.computeQueue();
-        queue.enqueueWriteBuffer(buffer, 0, capacity * Float.BYTES, data);
+        queue.enqueueWriteBuffer(buffer, 0, capacity * Float.BYTES, data).close();
 
         // 1000 work-items in blocks of 256 launch 4 blocks; the kernel skips ids >= n.
         queue.enqueueKernelNoEvent(kernel, new long[]{n}, new long[]{256}, new Object[]{buffer, 2.0f, n});
 
         float[] result = new float[capacity];
-        queue.enqueueReadBuffer(buffer, 0, capacity * Float.BYTES, result);
+        queue.enqueueReadBuffer(buffer, 0, capacity * Float.BYTES, result).close();
         queue.finish();
 
         for (int i = 0; i < n; i++) {
@@ -735,11 +735,11 @@ public class CudaComputeBackendIntegrationTest {
         KernelHandle kernel = backend.compileKernel("scale", SCALE_PTX, null);
         GpuBuffer buffer = backend.allocateBuffer(n * Float.BYTES);
         ComputeQueue queue = backend.computeQueue();
-        queue.enqueueWriteBuffer(buffer, 0, n * Float.BYTES, data);
+        queue.enqueueWriteBuffer(buffer, 0, n * Float.BYTES, data).close();
         queue.enqueueKernelNoEvent(kernel, new long[]{n}, null, new Object[]{buffer, 2.0f, n});
 
         float[] result = new float[n];
-        queue.enqueueReadBuffer(buffer, 0, n * Float.BYTES, result);
+        queue.enqueueReadBuffer(buffer, 0, n * Float.BYTES, result).close();
         queue.finish();
 
         for (int i = 0; i < n; i++) {
@@ -767,21 +767,22 @@ public class CudaComputeBackendIntegrationTest {
         GpuBuffer raw = backend.allocateBuffer(n);
         ComputeQueue queue = backend.transferQueue();
 
-        GpuEvent floatWrite = queue.enqueueWriteBuffer(floats, 0, n * Float.BYTES, data);
-        java.util.Arrays.fill(data, -1.0f);
-        GpuEvent byteWrite = queue.enqueueWriteBuffer(raw, 0, n, bytes);
-        assertEquals("ByteBuffer position must be preserved", 17, bytes.position());
-        assertEquals("ByteBuffer limit must be preserved", 99, bytes.limit());
-        for (int i = 0; i < n; i++) {
-            bytes.put(i, (byte) 0);
+        try (GpuEvent floatWrite = queue.enqueueWriteBuffer(floats, 0, n * Float.BYTES, data);
+             GpuEvent byteWrite = queue.enqueueWriteBuffer(raw, 0, n, bytes)) {
+            java.util.Arrays.fill(data, -1.0f);
+            assertEquals("ByteBuffer position must be preserved", 17, bytes.position());
+            assertEquals("ByteBuffer limit must be preserved", 99, bytes.limit());
+            java.nio.ByteBuffer clobber = bytes.duplicate();
+            clobber.clear();
+            for (int i = 0; i < n; i++) {
+                clobber.put(i, (byte) 0);
+            }
         }
-        floatWrite.close();
-        byteWrite.close();
 
         float[] floatResult = new float[n];
         byte[] byteResult = new byte[n];
-        queue.enqueueReadBuffer(floats, 0, n * Float.BYTES, floatResult);
-        queue.enqueueReadBuffer(raw, 0, n, byteResult);
+        queue.enqueueReadBuffer(floats, 0, n * Float.BYTES, floatResult).close();
+        queue.enqueueReadBuffer(raw, 0, n, byteResult).close();
         queue.finish();
 
         for (int i = 0; i < n; i++) {
@@ -807,15 +808,13 @@ public class CudaComputeBackendIntegrationTest {
         queue.enqueueWriteBuffer(buffer, 0, (long) n * Float.BYTES, data).close();
 
         float[] result = new float[n];
-        GpuEvent read = queue.enqueueReadBuffer(buffer, 0, (long) n * Float.BYTES, result);
-        try {
+        try (GpuEvent read = queue.enqueueReadBuffer(buffer, 0, (long) n * Float.BYTES, result)) {
             read.awaitCompletion();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             fail("Test interrupted");
             return;
         }
-        read.close();
 
         assertArrayEquals("chunked round trip", data, result, 0f);
 
@@ -831,7 +830,7 @@ public class CudaComputeBackendIntegrationTest {
         queue.enqueueFillBuffer(buffer, 16 * Float.BYTES, 64 * Float.BYTES, Float.floatToIntBits(1.5f));
 
         float[] result = new float[n];
-        queue.enqueueReadBuffer(buffer, 0, n * Float.BYTES, result);
+        queue.enqueueReadBuffer(buffer, 0, n * Float.BYTES, result).close();
         queue.finish();
 
         for (int i = 0; i < n; i++) {
@@ -852,12 +851,12 @@ public class CudaComputeBackendIntegrationTest {
         GpuBuffer src = backend.allocateBuffer(n * Float.BYTES);
         GpuBuffer dst = backend.allocateBuffer(n * Float.BYTES);
         ComputeQueue queue = backend.computeQueue();
-        queue.enqueueWriteBuffer(src, 0, n * Float.BYTES, data);
+        queue.enqueueWriteBuffer(src, 0, n * Float.BYTES, data).close();
         queue.enqueueFillBuffer(dst, 0, n * Float.BYTES, 0);
         queue.enqueueCopyBuffer(src, 100 * Float.BYTES, dst, 10 * Float.BYTES, 200 * Float.BYTES);
 
         float[] result = new float[n];
-        queue.enqueueReadBuffer(dst, 0, n * Float.BYTES, result);
+        queue.enqueueReadBuffer(dst, 0, n * Float.BYTES, result).close();
         queue.finish();
 
         for (int i = 0; i < n; i++) {
@@ -891,13 +890,13 @@ public class CudaComputeBackendIntegrationTest {
         ComputeQueue transfer = backend.transferQueue();
         ComputeQueue compute = backend.computeQueue();
         transfer.enqueueWriteBuffer(buffer, 0, (long) n * Float.BYTES, data).close();
-        GpuEvent uploaded = transfer.enqueueMarker();
-
-        compute.enqueueKernelNoEvent(kernel, new long[]{n}, new long[]{256}, new Object[]{buffer, 0.5f, n}, uploaded);
-        uploaded.close();
+        try (GpuEvent uploaded = transfer.enqueueMarker()) {
+            compute.enqueueKernelNoEvent(kernel, new long[]{n}, new long[]{256},
+                    new Object[]{buffer, 0.5f, n}, uploaded);
+        }
 
         float[] result = new float[n];
-        compute.enqueueReadBuffer(buffer, 0, (long) n * Float.BYTES, result);
+        compute.enqueueReadBuffer(buffer, 0, (long) n * Float.BYTES, result).close();
         compute.finish();
 
         for (int i = 0; i < n; i += 4099) {
@@ -935,21 +934,17 @@ public class CudaComputeBackendIntegrationTest {
         transfer.setKernelArg(second, 2, n);
 
         compute.enqueueKernelPreBound(first, new long[]{n}, new long[]{128});
-        GpuEvent done = compute.enqueueKernelPreBoundWithEvent(second, new long[]{n}, new long[]{128});
-
         float[] resultA = new float[n];
         float[] resultB = new float[n];
-        compute.enqueueReadBuffer(a, 0, n * Float.BYTES, resultA, done);
-        GpuEvent readB = compute.enqueueReadBuffer(b, 0, n * Float.BYTES, resultB, done);
-        try {
+        try (GpuEvent done = compute.enqueueKernelPreBoundWithEvent(second, new long[]{n}, new long[]{128});
+             GpuEvent readA = compute.enqueueReadBuffer(a, 0, n * Float.BYTES, resultA, done);
+             GpuEvent readB = compute.enqueueReadBuffer(b, 0, n * Float.BYTES, resultB, done)) {
             readB.awaitCompletion();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             fail("Test interrupted");
             return;
         }
-        done.close();
-        readB.close();
 
         for (int i = 0; i < n; i++) {
             assertEquals("first clone element " + i, 5.0f, resultA[i], 0f);

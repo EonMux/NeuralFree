@@ -11,8 +11,9 @@ import java.util.Objects;
  * attention over the selected pools.
  *
  * <p>Pool {@code i} is positions {@code [i*kpool, (i+1)*kpool)} (one sequence from position 0, llama.cpp
- * src/llama-memory-hybrid-idx.cpp:389-474); position {@code p} lives in indexer row {@code p % kvRows} and the pooled
- * key of a pool is stored in its last member's row (:652, :852-854). The indexer cache is a one-head K-only accessor
+ * src/llama-memory-hybrid-idx.cpp:389-474); position {@code p} lives in indexer row {@code rows.row(p)} of the
+ * sequence's {@link PositionRows} map ({@code p % kvRows} for the forms taking {@code kvRows}, a contiguous cache) and
+ * the pooled key of a pool is stored in its last member's row (:652, :852-854). The indexer cache is a one-head K-only accessor
  * whose rows of {@code rowWidth = idxDim * kpoolRow} values hold {@code [key | gate | pooled]} (gated) or
  * {@code [raw key | pooled]} (mean), in the cache's element type (any KV type; block types with whole-block slots,
  * {@link MsaKernels#checkKpoolCache}).
@@ -56,28 +57,43 @@ public final class CpuQsa {
      */
     public static void kpoolPool(int nNew, int firstPool, int mode, int kpool, int idxDim, int gateOff, int kvRows,
                                  float[] ape, KvAccessor idx, float[] pooled) {
+        MsaKernels.checkKpool(kpool, idxDim, checkCache(idx), gateOff, checkCache(idx) - idxDim, kvRows, mode);
+        kpoolPool(nNew, firstPool, mode, kpool, idxDim, gateOff, contiguous(kvRows), ape, idx, pooled);
+    }
+
+    /**
+     * {@code LLM_QSA_KpoolUpdate} stage POOL over one sequence's rows: the formula of
+     * {@link #kpoolPool(int, int, int, int, int, int, int, float[], KvAccessor, float[])} with member rows
+     * {@code r_k = rows.row(i*kpool + k)}.
+     *
+     * @throws IllegalArgumentException for invalid shapes
+     * @throws IllegalStateException    when a member position of a pool is not cached
+     */
+    public static void kpoolPool(int nNew, int firstPool, int mode, int kpool, int idxDim, int gateOff,
+                                 PositionRows rows, float[] ape, KvAccessor idx, float[] pooled) {
         int rowWidth = checkCache(idx);
-        MsaKernels.checkKpool(kpool, idxDim, rowWidth, gateOff, rowWidth - idxDim, kvRows, mode);
+        MsaKernels.checkKpool(kpool, idxDim, rowWidth, gateOff, rowWidth - idxDim, kpool, mode);
         MsaKernels.checkKpoolCache(idx.layout().dtypeK(), idxDim, rowWidth, gateOff, rowWidth - idxDim, mode);
         checkNew(nNew, firstPool);
+        Objects.requireNonNull(rows, "rows");
         Objects.requireNonNull(pooled, "pooled");
         if (mode == MsaKernels.KPOOL_MODE_GATED) {
             Objects.requireNonNull(ape, "ape");
         }
         CpuParallel.parallelFor(nNew, 1, (from, to) -> {
-            float[] rows = new float[kpool * rowWidth];
+            float[] members = new float[kpool * rowWidth];
             float[] x = new float[kpool];
             for (int j = from; j < to; j++) {
-                long pos0 = ((long) firstPool + j) * kpool;
+                int pos0 = Math.multiplyExact(firstPool + j, kpool);
                 for (int k = 0; k < kpool; k++) {
-                    idx.readK((int) ((pos0 + k) % kvRows), 0, rows, k * rowWidth);
+                    idx.readK(memberRow(rows, pos0 + k), 0, members, k * rowWidth);
                 }
                 int o = j * idxDim;
                 for (int d = 0; d < idxDim; d++) {
                     if (mode == MsaKernels.KPOOL_MODE_GATED) {
                         float mx = Float.NEGATIVE_INFINITY;
                         for (int k = 0; k < kpool; k++) {
-                            x[k] = rows[k * rowWidth + gateOff + d] + ape[k * idxDim + d];
+                            x[k] = members[k * rowWidth + gateOff + d] + ape[k * idxDim + d];
                             mx = Math.max(mx, x[k]);
                         }
                         float sum = 0f;
@@ -87,13 +103,13 @@ public final class CpuQsa {
                         float inv = 1f / sum;
                         float acc = 0f;
                         for (int k = 0; k < kpool; k++) {
-                            acc += ((float) Math.exp(x[k] - mx) * inv) * rows[k * rowWidth + d];
+                            acc += ((float) Math.exp(x[k] - mx) * inv) * members[k * rowWidth + d];
                         }
                         pooled[o + d] = acc;
                     } else {
                         float acc = 0f;
                         for (int k = 0; k < kpool; k++) {
-                            acc += rows[k * rowWidth + d];
+                            acc += members[k * rowWidth + d];
                         }
                         pooled[o + d] = acc * (1f / kpool);
                     }
@@ -113,13 +129,28 @@ public final class CpuQsa {
      */
     public static void kpoolStore(int nNew, int firstPool, int kpool, int idxDim, int pooledOff, int kvRows,
                                   float[] pooled, KvAccessor idx) {
+        MsaKernels.checkKpool(kpool, idxDim, checkCache(idx), 0, pooledOff, kvRows, MsaKernels.KPOOL_MODE_MEAN);
+        kpoolStore(nNew, firstPool, kpool, idxDim, pooledOff, contiguous(kvRows), pooled, idx);
+    }
+
+    /**
+     * {@code LLM_QSA_KpoolUpdate} stage STORE over one sequence's rows: writes the pooled slot of the last member
+     * row {@code rows.row((firstPool + j + 1)*kpool - 1)}, as
+     * {@link #kpoolStore(int, int, int, int, int, int, float[], KvAccessor)} does.
+     *
+     * @throws IllegalArgumentException for invalid shapes
+     * @throws IllegalStateException    when a pool's last member is not cached
+     */
+    public static void kpoolStore(int nNew, int firstPool, int kpool, int idxDim, int pooledOff, PositionRows rows,
+                                  float[] pooled, KvAccessor idx) {
         int rowWidth = checkCache(idx);
-        MsaKernels.checkKpool(kpool, idxDim, rowWidth, 0, pooledOff, kvRows, MsaKernels.KPOOL_MODE_MEAN);
+        MsaKernels.checkKpool(kpool, idxDim, rowWidth, 0, pooledOff, kpool, MsaKernels.KPOOL_MODE_MEAN);
         MsaKernels.checkKpoolCache(idx.layout().dtypeK(), idxDim, rowWidth, 0, pooledOff, MsaKernels.KPOOL_MODE_MEAN);
         checkNew(nNew, firstPool);
         Objects.requireNonNull(pooled, "pooled");
+        Objects.requireNonNull(rows, "rows");
         for (int j = 0; j < nNew; j++) {
-            int rep = (int) ((((long) firstPool + j + 1) * kpool - 1) % kvRows);
+            int rep = memberRow(rows, Math.multiplyExact(firstPool + j + 1, kpool) - 1);
             idx.writeKSlice(rep, pooledOff, idxDim, pooled, j * idxDim);
         }
     }
@@ -140,15 +171,32 @@ public final class CpuQsa {
     public static void kpoolScore(int nTokens, int nPool, int nIdxHeads, int idxDim, int kpool, int pooledOff, int kvRows,
                                   float wScale, float[] iq, int iqOff, float[] w, int wOff, KvAccessor idx,
                                   int[] qPos, int[] kvPos, float[] scores) {
+        MsaKernels.checkKpoolScore(nIdxHeads, idxDim, kpool, checkCache(idx), pooledOff, kvRows, wScale, 1);
+        kpoolScore(nTokens, nPool, nIdxHeads, idxDim, kpool, pooledOff, wScale, iq, iqOff, w, wOff, idx, qPos,
+                PositionRows.ring(kvRows, Objects.requireNonNull(kvPos, "kvPos")), true, scores);
+    }
+
+    /**
+     * {@code LLM_QSA_KpoolScore} over one sequence's rows: the formula of
+     * {@link #kpoolScore(int, int, int, int, int, int, int, float, float[], int, float[], int, KvAccessor, int[],
+     * int[], float[])} with pool {@code i} read from row {@code rows.row(e)} when that position is cached; a
+     * non-causal step scores every cached pool ({@code e <= qPos[t]} is not required).
+     *
+     * @param causal whether a pool ending after the token's position is masked
+     * @throws IllegalArgumentException for invalid shapes
+     */
+    public static void kpoolScore(int nTokens, int nPool, int nIdxHeads, int idxDim, int kpool, int pooledOff,
+                                  float wScale, float[] iq, int iqOff, float[] w, int wOff, KvAccessor idx,
+                                  int[] qPos, PositionRows rows, boolean causal, float[] scores) {
         int rowWidth = checkCache(idx);
         if (nTokens < 1 || nPool < 1) {
             throw new IllegalArgumentException("QSA pool score needs nTokens and nPool >= 1, got " + nTokens + "/" + nPool);
         }
-        MsaKernels.checkKpoolScore(nIdxHeads, idxDim, kpool, rowWidth, pooledOff, kvRows, wScale, 1);
+        MsaKernels.checkKpoolScore(nIdxHeads, idxDim, kpool, rowWidth, pooledOff, kpool, wScale, 1);
         MsaKernels.checkKpoolCache(idx.layout().dtypeK(), idxDim, rowWidth, 0, pooledOff, MsaKernels.KPOOL_MODE_MEAN);
         Objects.requireNonNull(iq, "iq");
         Objects.requireNonNull(qPos, "qPos");
-        Objects.requireNonNull(kvPos, "kvPos");
+        Objects.requireNonNull(rows, "rows");
         Objects.requireNonNull(scores, "scores");
         float[] keys = new float[nPool * idxDim];
         boolean[] cached = new boolean[nPool];
@@ -158,9 +206,10 @@ public final class CpuQsa {
             for (int i = from; i < to; i++) {
                 int e = (int) (((long) i + 1) * kpool - 1);
                 last[i] = e;
-                cached[i] = kvPos[e % kvRows] == e;
+                int r = rows.row(e);
+                cached[i] = r >= 0;
                 if (cached[i]) {
-                    idx.readK(e % kvRows, 0, row, 0);
+                    idx.readK(r, 0, row, 0);
                     System.arraycopy(row, pooledOff, keys, i * idxDim, idxDim);
                 }
             }
@@ -168,7 +217,7 @@ public final class CpuQsa {
         CpuParallel.parallelFor(nTokens, 1, (from, to) -> {
             for (int t = from; t < to; t++) {
                 for (int i = 0; i < nPool; i++) {
-                    if (!cached[i] || last[i] > qPos[t]) {
+                    if (!cached[i] || (causal && last[i] > qPos[t])) {
                         scores[t * nPool + i] = Float.NEGATIVE_INFINITY;
                         continue;
                     }
@@ -182,6 +231,23 @@ public final class CpuQsa {
                 }
             }
         });
+    }
+
+    /** Rows {@code p % kvRows} of a contiguous cache, every position present. */
+    private static PositionRows contiguous(int kvRows) {
+        if (kvRows < 1) {
+            throw new IllegalArgumentException("QSA indexer cache needs kvRows >= 1, got " + kvRows);
+        }
+        return p -> p % kvRows;
+    }
+
+    /** The row of a pool member, which a completed pool always has cached. */
+    private static int memberRow(PositionRows rows, int p) {
+        int r = rows.row(p);
+        if (r < 0) {
+            throw new IllegalStateException("QSA pool member position " + p + " is not cached");
+        }
+        return r;
     }
 
     private static int checkCache(KvAccessor idx) {

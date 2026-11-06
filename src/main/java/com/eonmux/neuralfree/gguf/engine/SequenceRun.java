@@ -1,13 +1,14 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
+import com.eonmux.neuralfree.gguf.engine.draft.Verifier;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * The per-sequence token pipeline of one autoregressive generation (PARITY §BE-1): the stages llama.cpp runs inside
+ * The per-sequence token pipeline of one autoregressive generation: the stages llama.cpp runs inside
  * its completion token loop, shared by {@link GenerationLoop} and the batch engine that builds on it. Mutable, owned
  * by one thread at a time, never thread-safe.
  *
@@ -46,7 +47,7 @@ public final class SequenceRun {
     private long promptNanos;
     private long generationStart;
     private StopReason stopReason;
-    private final int logprobs;
+    private final LogprobCapture capture;
     /** Whether the current offer's capture already rode a routed piece (one capture per token). */
     private boolean logprobsRouted;
     private static final TokenScore[] EMPTY_LOGPROBS = new TokenScore[0];
@@ -58,7 +59,7 @@ public final class SequenceRun {
         this.stop = b.stop;
         this.sampler = b.sampler;
         this.sink = b.sink;
-        this.logprobs = Math.max(0, b.request.logprobs());
+        this.capture = LogprobCapture.of(b.request);
         this.session = stop.start(new ReasoningFilter.Sink() {
             @Override
             public void accept(ReasoningFilter.Channel channel, int tokenId, String text) {
@@ -74,6 +75,11 @@ public final class SequenceRun {
             public void stepped(int tokenId) {
                 sink.stepped(tokenId);
             }
+
+            @Override
+            public void contentFallback() {
+                sink.contentFallback();
+            }
         }, b.renderedPrompt);
         this.generationStart = System.nanoTime();
     }
@@ -88,18 +94,20 @@ public final class SequenceRun {
     /**
      * Runs the sampler chain over {@code logits} and accepts the selected token into the chain's history stages —
      * llama.cpp sample step and its sequence accept in one call. When the request asked for logprobs
-     * ({@code n_probs}), the step carries the post-chain distribution: the sampled token plus its top
-     * alternatives as log probabilities ({@link Step#logprobs()}).
+     * ({@code n_probs}, {@code logprob_token_ids}), the step carries the {@link LogprobCapture} of the row in the
+     * request's {@link LogprobsMode}: the sampled token first, then its best alternatives or the requested ids
+     * ({@link Step#logprobs()}).
      *
-     * @throws IllegalArgumentException when the row is empty
-     * @throws IllegalStateException    when no candidate has a finite logit
+     * @throws IllegalArgumentException      when the row is empty
+     * @throws ConstraintDeadEndException    when the chain's constraints admit no candidate
+     * @throws IllegalStateException         when no candidate has a finite logit
      */
     public int next(float[] logits) {
         int token;
-        if (logprobs > 0) {
+        if (capture.active()) {
             Sampler.Candidates candidates = sampler.apply(logits);
             token = candidates.selectedId();
-            pendingLogprobs = capture(candidates, token);
+            pendingLogprobs = capture.capture(logits, candidates, token);
         } else {
             token = sampler.sample(logits);
         }
@@ -107,86 +115,47 @@ public final class SequenceRun {
         return token;
     }
 
-    /** Whether the request's logprobs setting needs host-side logits every step (disables on-device greedy). */
-    public boolean wantsHostSampling() {
-        return logprobs > 0;
+    /**
+     * Runs the sampler chain over a row's device-read top candidates ({@link RowTopK}, the backend-sampled decode of
+     * a truncated chain) and returns the selected token; the caller accepts it with {@link #accept}, as with the
+     * {@link ForwardBackend#decodeGreedyOnDevice} fast path. Never called when the request captures logprobs.
+     *
+     * @throws IllegalArgumentException when the candidates disagree in length
+     * @throws IllegalStateException    when no candidate has a finite logit
+     */
+    public int sampleTopK(RowTopK top) {
+        return sampleTopK(top, 0);
     }
 
     /**
-     * The sampled token plus the top alternatives of the post-chain distribution as log probabilities: exactly
-     * {@code min(logprobs, candidates)} entries, the sampled token first (llama.cpp's {@code n_probs} array).
-     * The probabilities are the softmax over the chain's surviving candidates (a greedy chain skips its dist
-     * stage, so the capture softmaxes the finite logits itself).
+     * Returns the token the chain selects over row {@code row} of a device top-k readback; the caller accepts it with
+     * {@link #accept}, as with {@link #sampleTopK(RowTopK)}. A batched step samples every output row from the one
+     * readback this way.
+     *
+     * @throws IllegalArgumentException when {@code row} is outside the readback
+     * @throws IllegalStateException    when no candidate has a finite logit
      */
-    private TokenScore[] capture(Sampler.Candidates candidates, int sampledToken) {
-        int n = candidates.size();
-        int[] ids = new int[n];
-        float[] probs = new float[n];
-        int live = 0;
-        double sum = 0;
-        for (int i = 0; i < n; i++) {
-            float p = candidates.prob(i);
-            if (p <= 0f) {
-                continue; // a greedy chain never softmaxes: the pass below fills the probabilities
-            }
-            ids[live] = candidates.id(i);
-            probs[live] = p;
-            sum += p;
-            live++;
+    public int sampleTopK(RowTopK top, int row) {
+        return sampleTopK(top, row, false);
+    }
+
+    /**
+     * {@link #sampleTopK(RowTopK, int)} over a readout that applied the row's logit prefilter before its top-k
+     * (the device path of {@code Sampler#deviceConeWidth()}): the chain skips the fixed bias stage and the
+     * pre-top-k penalties and DRY it already reproduced ({@code Sampler#applyTopK(int[], float[], boolean)}).
+     */
+    public int sampleTopK(RowTopK top, int row, boolean prefiltered) {
+        Objects.requireNonNull(top, "top");
+        if (row < 0 || row >= top.rows()) {
+            throw new IllegalArgumentException("row " + row + " outside a top-k readback of " + top.rows() + " rows");
         }
-        if (live == 0 || Math.abs(sum - 1f) > 1e-3) {
-            // softmax over the surviving (finite) logits, as llama.cpp's get_probabilities does
-            live = 0;
-            sum = 0;
-            double max = -Double.MAX_VALUE;
-            for (int i = 0; i < n; i++) {
-                float logit = candidates.logit(i);
-                if (logit != Float.NEGATIVE_INFINITY) {
-                    max = Math.max(max, logit);
-                }
-            }
-            for (int i = 0; i < n; i++) {
-                float logit = candidates.logit(i);
-                if (logit == Float.NEGATIVE_INFINITY) {
-                    continue;
-                }
-                double e = Math.exp(logit - max);
-                ids[live] = candidates.id(i);
-                probs[live] = (float) e;
-                sum += e;
-                live++;
-            }
-            for (int i = 0; i < live; i++) {
-                probs[i] = (float) (probs[i] / sum);
-            }
-        }
-        int out = Math.min(logprobs, live);
-        TokenScore[] scores = new TokenScore[out];
-        boolean[] used = new boolean[live];
-        // the sampled token leads, wherever it ranks
-        int sampledIndex = -1;
-        for (int i = 0; i < live; i++) {
-            if (ids[i] == sampledToken) {
-                sampledIndex = i;
-                break;
-            }
-        }
-        scores[0] = new TokenScore(sampledToken,
-                (float) Math.log(sampledIndex >= 0 ? probs[sampledIndex] : 0f));
-        if (sampledIndex >= 0) {
-            used[sampledIndex] = true;
-        }
-        for (int k = 1; k < out; k++) {
-            int best = -1;
-            for (int i = 0; i < live; i++) {
-                if (!used[i] && (best < 0 || probs[i] > probs[best])) {
-                    best = i;
-                }
-            }
-            used[best] = true;
-            scores[k] = new TokenScore(ids[best], (float) Math.log(probs[best]));
-        }
-        return scores;
+        Sampler.Candidates candidates = sampler.applyTopK(top.ids(row), top.logits(row), prefiltered);
+        return candidates.id(candidates.selected());
+    }
+
+    /** Whether the request's logprobs setting needs host-side logits every step (disables on-device greedy). */
+    public boolean wantsHostSampling() {
+        return capture.active();
     }
 
     /**
@@ -233,6 +202,22 @@ public final class SequenceRun {
     }
 
     /**
+     * Offers a token a speculative verifier emitted ({@link VerifyRound}): the round already accepted it into the
+     * sampler, so this counts it, captures its logprobs from the verify row it was emitted at when the request
+     * asked for them, and runs {@link #offer}.
+     *
+     * @param row       the raw verify row the token was emitted at
+     * @param processed the row's chain distribution the verifier decided over
+     */
+    Step offerVerified(int token, float[] row, Verifier.Distribution processed) {
+        sampled++;
+        if (capture.active()) {
+            pendingLogprobs = capture.capture(row, processed, token);
+        }
+        return offer(token);
+    }
+
+    /**
      * Records a stop decision no sampled token produced: {@link StopReason#CANCELLED} when the request's
      * cancellation hook fired ({@link #cancelled()}), {@link StopReason#CONTEXT_FULL} when the context could not
      * make room for the next token. Token-level reasons come from {@link #offer} only.
@@ -241,7 +226,7 @@ public final class SequenceRun {
      */
     public Step stop(StopReason reason) {
         if (reason == null || reason == StopReason.EOS || reason == StopReason.STOP_STRING
-                || reason == StopReason.MAX_TOKENS) {
+                || reason == StopReason.MAX_TOKENS || reason == StopReason.REPETITION) {
             throw new IllegalArgumentException("token-level stop reasons come from offer(), got " + reason);
         }
         if (stopReason != null) {
@@ -300,7 +285,7 @@ public final class SequenceRun {
         return tokenLogprobs.isEmpty() ? result : result.withLogprobs(tokenLogprobs);
     }
 
-    /** The per-token log probabilities the run captured ({@code request.logprobs()} > 0), one entry per token. */
+    /** The per-token scores the run captured ({@link GenerationRequest#wantsLogprobs()}), one entry per token. */
     public List<TokenScore[]> tokenLogprobs() {
         return tokenLogprobs;
     }
@@ -315,7 +300,7 @@ public final class SequenceRun {
         if (recording && text != null && !text.isEmpty()) {
             delta.append(text);
         }
-        if (logprobs > 0) {
+        if (capture.active()) {
             // the capture rides the first piece the token releases; later pieces of the same offer carry none
             sink.accept(channel, tokenId, text, logprobsRouted ? EMPTY_LOGPROBS : pendingLogprobs);
             logprobsRouted = true;
@@ -363,8 +348,8 @@ public final class SequenceRun {
         }
 
         /**
-         * The sampled token plus its top alternatives of the post-chain distribution as log probabilities, when
-         * the request asked for them; empty otherwise.
+         * The step's {@link LogprobCapture}: the sampled token first, then its best alternatives or the requested
+         * token ids, when the request asked for them; empty otherwise.
          */
         public TokenScore[] logprobs() {
             return logprobs;

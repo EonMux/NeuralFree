@@ -1,0 +1,15 @@
+{#- llama.cpp vicuna-orca chat template (src/llama-chat.cpp:435-454). -#}
+{%- set orca = true -%}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- 'SYSTEM: ' ~ content ~ '\n' if orca else content ~ '\n\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- 'USER: ' ~ content ~ '\n' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- 'ASSISTANT: ' ~ content ~ '</s>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- 'ASSISTANT:' -}}
+{%- endif -%}

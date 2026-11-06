@@ -104,6 +104,36 @@ public class RecurrentResolverTest {
         assertFalse(spec.fusedBetaAlpha());
     }
 
+    /** The merged qwen4exp projections are read by name, whatever the GDN architecture (qwen4exp.cpp:272-281). */
+    @Test
+    public void mergedQkvGateAndBetaAlphaAreDetected() {
+        List<GGUFTensorInfo> ts = new ArrayList<>();
+        ts.add(t("blk.0.attn_qkv_gate.weight", N_EMBD, 192));
+        ts.add(t("blk.0.ssm_beta_alpha.weight", N_EMBD, 8));
+        RecurrentSpec spec = new RecurrentResolver(qwen3next(), TensorCatalog.of("qwen3next", ts)).resolve(0);
+        assertTrue(spec.mergedQkvGate());
+        assertTrue(spec.concatBetaAlpha());
+        assertFalse(spec.fusedBetaAlpha());
+        assertFalse("a merged attn_qkv_gate is not the legacy ssm_in", spec.legacySsmIn());
+
+        List<GGUFTensorInfo> separate = new ArrayList<>();
+        separate.add(t("blk.0.attn_qkv.weight", N_EMBD, 128));
+        RecurrentSpec plain = new RecurrentResolver(qwen3next(), TensorCatalog.of("qwen3next", separate)).resolve(0);
+        assertFalse(plain.mergedQkvGate());
+        assertFalse(plain.concatBetaAlpha());
+    }
+
+    @Test
+    public void bothBetaAlphaFormsInOneLayerAreRefused() {
+        List<GGUFTensorInfo> ts = new ArrayList<>();
+        ts.add(t("blk.0.attn_qkv.weight", N_EMBD, 128));
+        ts.add(t("blk.0.ssm_ba.weight", N_EMBD, 8));
+        ts.add(t("blk.0.ssm_beta_alpha.weight", N_EMBD, 8));
+        RecurrentResolver resolver = new RecurrentResolver(qwen3next(), TensorCatalog.of("qwen3next", ts));
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> resolver.resolve(0));
+        assertTrue(e.getMessage(), e.getMessage().endsWith("layer 0 carries both ssm_ba and ssm_beta_alpha"));
+    }
+
     @Test
     public void attentionLayerIsNotRecurrent() {
         RecurrentResolver resolver = new RecurrentResolver(qwen3next(), TensorCatalog.of("qwen3next", new ArrayList<>()));

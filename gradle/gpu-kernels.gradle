@@ -1,13 +1,20 @@
 /*
- * GPU kernel build: CUDA modules, Vulkan SPIR-V with argument signatures, the kernel inventory check and the
- * OpenCL syntax check of every kernel library. Applied from build.gradle; processResources merges every
- * generated directory.
+ * GPU kernel build: CUDA modules, HIP code objects, Vulkan SPIR-V with argument signatures, the kernel
+ * inventory check and the OpenCL syntax check of every kernel library. Applied from build.gradle;
+ * processResources merges every generated directory.
  *
  * This script holds the configuration and the task wiring. The helper classes live in buildSrc, package
- * neuralfree.gpu (buildSrc/src/main/groovy/neuralfree/gpu): GpuBuildTools (tool lookup, processes, parallel
- * jobs, files), GpuKernelSources (manifests, source assembly, kernel-signature scanning), GpuShaderVariants
- * (variant tables), GpuSpirvSignature (SPIR-V argument signatures), GpuKernelLibrary (one library's roots and
- * options), GpuInventory (inventory format, reading and coverage) and GpuCudaToolkit (nvcc release and archs).
+ * neuralfree.gpu (buildSrc/src/main/groovy/neuralfree/gpu, GpuHipToolkit under src/main/java): GpuBuildTools
+ * (tool lookup, processes, parallel jobs, files), GpuKernelSources (manifests, source assembly, kernel-signature
+ * scanning), GpuShaderVariants (variant tables), GpuSpirvSignature (SPIR-V argument signatures), GpuKernelLibrary
+ * (one library's roots and options), GpuInventory (inventory format, reading and coverage), GpuCudaToolkit
+ * (nvcc release and archs) and GpuHipToolkit (hipcc release, gfx targets, command lines, HIP index and
+ * build.properties texts).
+ *
+ * Build cache: compileCudaKernels, compileHipKernels, compileShaders, compileTestShaders, compileMetalShaders,
+ * buildHipShim and buildMetalShim declare
+ * relocatable inputs (relative source paths, path-free toolchain fingerprints) and are marked cacheable, so a second
+ * checkout of the same commit reuses their artifacts; gradle.properties sets org.gradle.caching=true.
  *
  * Kernel libraries (gpuLibraryDefinitions; KernelLibraries registers the same roots): llm, the GGUF engine
  * (fast-math CUDA, subgroup variants), and train, tensors, training and classical ML (precise CUDA math, no
@@ -41,9 +48,23 @@
  *                                 index.tsv (kernel_name<TAB>classpath resource of its module); build.properties
  *                                 (nvcc.version, cuda.toolkit, cuda.driver.min, sass.archs, ptx.archs, kernel.format,
  *                                 and fa.smem.floats for a library compiled with NF_FA_SMEM_FLOATS)
+ *   hip/kernels/<lib>/hip/        <stem>.hsaco, one multi-target code object per non-OpenCL-only .cl that defines
+ *                                 kernels under HIP (the same units as CUDA; the [cuda] mma sources are PTX-only
+ *                                 and compile to empty units, so the HIP index covers the portable kernels);
+ *                                 index.tsv (kernel_name<TAB>classpath resource); build.properties (hipcc.version,
+ *                                 hip.archs, kernel.format, and fa.smem.floats for a library compiled with
+ *                                 NF_FA_SMEM_FLOATS)
+ *   hip-shim/                     libhipshim.so, the JNI shim of native/hip/hipshim.c (buildHipShim; run with
+ *                                 -Dneuralfree.hip.shim.path=...)
+ *   metal-shim/                   libmetalshim.dylib, the JNI shim of native/metal/metalshim.m (buildMetalShim;
+ *                                 macOS only; run with -Dneuralfree.metal.shim.path=...)
  *   spv/shaders/<lib>/            <Kernel>.spv, <Kernel>__sg.spv for rows flagged sg, and index.properties
  *                                 (<Kernel>.buffers, .ro, .push, .sg; read by KernelSignature.parse)
  *   spv-test/shaders/test/        backend test shaders
+ *   metal/shaders/<lib>/metal/    <Kernel>.metal plus index.properties, generated from the same SPIR-V modules by
+ *                                 SPIRV-Cross (compileMetalShaders, via the build-only org.lwjgl:lwjgl-spvc
+ *                                 configuration); buffers bind at MSL buffer indices 0..n-1 and the push constants
+ *                                 are one constant buffer at n, matching MetalArgState
  *   check/opencl.stamp            written when checkOpenCLKernels passes
  *   check/inventory.stamp         written when inventoryCheck has compared the inventories with the sources
  *
@@ -54,21 +75,31 @@
  *   neuralfree.cuda.archs    comma-separated SM list (default 75,80,86,89,90,100,120), intersected with
  *                            nvcc --list-gpu-code; SASS for each, PTX for the lowest and the highest
  *   neuralfree.cuda.ptxOnly  emit PTX for the lowest arch only (nvcc --ptx), for a quick compile check
+ *   neuralfree.hipcc         path of hipcc (default: $ROCM_PATH/bin, $ROCM_HOME/bin, $HIP_PATH/bin,
+ *                            /opt/rocm/bin, /usr/bin, /usr/local/bin, PATH)
+ *   neuralfree.hip.archs     comma-separated gfx list (default gfx906,gfx908,gfx90a,gfx942,gfx1030,gfx1100,
+ *                            gfx1101,gfx1102,gfx1200,gfx1201), one --offload-arch per target of every unit;
+ *                            entries intersected with hipcc --print-supported-gpus when that listing works
  *   neuralfree.glslc         path of glslc (default: $VULKAN_SDK/bin, /usr/bin, /usr/local/bin, PATH;
  *                            glslangValidator is the fallback compiler)
  *   neuralfree.clang         path of clang (default: /usr/bin, /usr/local/bin, PATH)
- *   neuralfree.requireCuda, neuralfree.requireShaders
- *                            fail instead of warning when nvcc, or the shader compiler and spirv-dis, are missing
+ *   neuralfree.requireCuda, neuralfree.requireHip, neuralfree.requireShaders, neuralfree.requireMetal
+ *                            fail instead of warning when nvcc, hipcc, the shader compiler and spirv-dis,
+ *                            or the Metal shim's toolchain, are missing
  *   neuralfree.gpu.libraries comma-separated library ids (default: all) the kernel tasks build and check; for
  *                            developer speed only: the other libraries' artifacts are then missing from the build
  *
- * A missing nvcc, shader compiler or spirv-dis makes its compile task warn and produce nothing, so the
+ * A missing nvcc, hipcc, shader compiler or spirv-dis makes its compile task warn and produce nothing, so the
  * matching backend reports the kernel libraries unavailable at run time. A missing clang skips the OpenCL
- * syntax check and leaves the inventory tasks to nvcc's preprocessor.
+ * syntax check and leaves the inventory tasks to nvcc's preprocessor. The Metal sources need SPIRV-Cross
+ * (org.lwjgl:lwjgl-spvc and its native library, fetched from Maven Central once and resolved only by
+ * compileMetalShaders); when it is unavailable that task warns and produces nothing, so a Linux build without
+ * the artifact still works and the Metal library reports its sources as not built.
  */
 
 import neuralfree.gpu.GpuBuildTools
 import neuralfree.gpu.GpuCudaToolkit
+import neuralfree.gpu.GpuHipToolkit
 import neuralfree.gpu.GpuInventory
 import neuralfree.gpu.GpuKernelLibrary
 import neuralfree.gpu.GpuKernelSources
@@ -95,11 +126,64 @@ def gpuNvccCcbin = gpuProp('nvcc.ccbin')
 def gpuCudaArchs = gpuProp('neuralfree.cuda.archs') ?: '75,80,86,89,90,100,120'
 def gpuPtxOnly = GpuBuildTools.flag(gpuProp('neuralfree.cuda.ptxOnly'), 'neuralfree.cuda.ptxOnly')
 def gpuRequireCuda = GpuBuildTools.flag(gpuProp('neuralfree.requireCuda'), 'neuralfree.requireCuda')
+def gpuRequireHip = GpuBuildTools.flag(gpuProp('neuralfree.requireHip'), 'neuralfree.requireHip')
 def gpuRequireShaders = GpuBuildTools.flag(gpuProp('neuralfree.requireShaders'), 'neuralfree.requireShaders')
+def gpuRequireMetal = GpuBuildTools.flag(gpuProp('neuralfree.requireMetal'), 'neuralfree.requireMetal')
+def gpuHipccPath = gpuProp('neuralfree.hipcc')
+def gpuHipArchs = gpuProp('neuralfree.hip.archs') ?: GpuHipToolkit.DEFAULT_ARCHS
 def gpuGlslcPath = gpuProp('neuralfree.glslc')
 def gpuClangPath = gpuProp('neuralfree.clang')
 /** -DNF_FA_SMEM_FLOATS of the LLM CUDA modules (static shared memory of the flash kernels; FaSmem.MAX_FLOATS). */
 def gpuCudaSmemFloats = 11264
+
+// ---------------------------------------------------------------------------------------------------
+// Metal kernel sources (SPIRV-Cross)
+
+/**
+ * SPIRV-Cross is used only to generate the Metal kernel sources; it is a build-only dependency
+ * (LWJGL's spvc binding and its native library), never a dependency of the application or of buildSrc.
+ * The configuration is resolved only by compileMetalShaders, so a build that does not generate the
+ * Metal sources needs no repository access.
+ */
+def gpuSpvcVersion = lwjglVersion
+def gpuMetalNativesClassifier = { ->
+    String os = System.getProperty('os.name').toLowerCase(Locale.ROOT)
+    String arch = System.getProperty('os.arch').toLowerCase(Locale.ROOT)
+    boolean arm64 = arch.contains('aarch64') || arch.contains('arm64')
+    if (os.contains('linux')) {
+        return arm64 ? 'natives-linux-arm64' : (arch.contains('arm') ? 'natives-linux-arm32' : 'natives-linux')
+    }
+    if (os.contains('mac') || os.contains('darwin')) {
+        return arm64 ? 'natives-macos-arm64' : 'natives-macos'
+    }
+    if (os.contains('windows')) {
+        return arm64 ? 'natives-windows-arm64' : (arch.contains('64') ? 'natives-windows' : 'natives-windows-x86')
+    }
+    return null
+}
+def gpuMetalToolConfiguration = configurations.create('metalShaderTool') { c ->
+    c.canBeConsumed = false
+    c.canBeResolved = true
+    c.description = 'SPIRV-Cross (LWJGL spvc) and its native library, used only to generate the Metal kernel sources'
+}
+dependencies {
+    metalShaderTool "org.lwjgl:lwjgl-spvc:${gpuSpvcVersion}"
+    metalShaderTool "org.lwjgl:lwjgl:${gpuSpvcVersion}"
+    String classifier = gpuMetalNativesClassifier()
+    if (classifier != null) {
+        metalShaderTool "org.lwjgl:lwjgl-spvc:${gpuSpvcVersion}:${classifier}"
+        metalShaderTool "org.lwjgl:lwjgl:${gpuSpvcVersion}:${classifier}"
+    }
+}
+/** The resolved generator toolchain: jar names, or a reason the generation is skipped. */
+def gpuMetalTool = { ->
+    try {
+        return [jars: gpuMetalToolConfiguration.resolve().toList(), error: null]
+    } catch (Exception e) {
+        return [jars: [], error: e.message]
+    }
+}
+def gpuMetalToolFingerprint = { -> ((List<File>) gpuMetalTool().jars).collect { it.name }.sort().join(',') }
 
 /** Every kernel library, with the roots its KernelLibraries config registers. cudaFlags set the nvcc math mode;
  *  faSmemFloats adds -DNF_FA_SMEM_FLOATS to the library's CUDA units and records it in build.properties. */
@@ -147,14 +231,32 @@ def gpuSharedKernelSources = files({ ->
     gpuLibraries.collectMany { GpuKernelLibrary lib -> lib.manifest(gpuSharedKernelRoot).findAll { it.shared }.collect { (File) it.file } }.unique()
 })
 
+/**
+ * Every GLSL header a shader task can read through its include directories (shaders/<library> and shaders),
+ * including the shared shaders/common headers and the test shaders' own includes. The .comp entry sources are
+ * declared separately; this catches a header edit that leaves every entry source untouched.
+ */
+def gpuShaderIncludes = fileTree(gpuShaderRoot) { include '**/*.glsl' }
+
+/**
+ * Build-cache reason of the kernel artifact tasks: their declared inputs are relocatable (relative source
+ * paths and path-free toolchain fingerprints) and fully determine the generated artifacts.
+ */
+def gpuCacheReason = 'the declared relocatable inputs (sources, headers, flags, arch selections and toolchain identity) fully determine the artifacts'
+
 def gpuCudaDirs = { ->
     [System.getenv('CUDA_HOME'), System.getenv('CUDA_PATH')].findAll { it }.collect { new File(it, 'bin').path } +
             ['/opt/cuda/bin', '/usr/local/cuda/bin']
+}
+def gpuHipDirs = { ->
+    [System.getenv('ROCM_PATH'), System.getenv('ROCM_HOME'), System.getenv('HIP_PATH')].findAll { it }
+            .collect { new File(it, 'bin').path } + ['/opt/rocm/bin', '/usr/bin', '/usr/local/bin']
 }
 def gpuVulkanDirs = { ->
     [System.getenv('VULKAN_SDK')].findAll { it }.collect { new File(it, 'bin').path } + ['/usr/bin', '/usr/local/bin']
 }
 def gpuFindNvcc = { -> GpuBuildTools.find(gpuNvccPath, 'nvcc', 'nvcc', gpuCudaDirs()) }
+def gpuFindHipcc = { -> GpuBuildTools.find(gpuHipccPath, 'neuralfree.hipcc', 'hipcc', gpuHipDirs()) }
 def gpuFindClang = { -> GpuBuildTools.find(gpuClangPath, 'neuralfree.clang', 'clang', ['/usr/bin', '/usr/local/bin']) }
 
 /** Shader toolchain: [compiler, glslc (true) or glslangValidator, dis, opt, val]; absent tools are null. */
@@ -243,7 +345,7 @@ def gpuCudaUnits = { File nvcc, GpuKernelLibrary lib, List<Map> manifest, File t
             File tu = new File(tmp, stem + '.cu')
             GpuBuildTools.writeText(tu, GpuKernelSources.concatenate(headers + [unit]))
             File ii = new File(tmp, stem + '.ii')
-            List<Object> cmd = [nvcc, '-E', '-std=c++17'] + lib.cudaDefines()
+            List<Object> cmd = [nvcc, '-E', '-std=c++17', '-DNF_CUDA_PREPROCESS'] + lib.cudaDefines()
             if (gpuNvccCcbin) {
                 cmd.addAll(['-ccbin', gpuNvccCcbin])
             }
@@ -261,22 +363,55 @@ def gpuCudaUnits = { File nvcc, GpuKernelLibrary lib, List<Map> manifest, File t
 }
 
 /**
- * Generates a library's inventory text from its kernel sources, preprocessed with clang (OpenCL C) or, when
- * clang is absent, with nvcc (one CUDA unit per untagged .cl), after checking the argument limits and the
- * shader-variant coverage. Returns [text, kernels, openClOnly, preprocessor], or null when neither
- * preprocessor is found.
+ * The HIP twin of gpuCudaUnits: one HIP translation unit per non-OpenCL-only .cl (every non-OpenCL-only
+ * manifest header in manifest order, then the .cl), expanded with hipcc -E under NF_HIP_PREPROCESS and
+ * scanned for kernels. The [cuda] mma sources hold PTX-only bodies and compile to empty units on every
+ * HIP pass, so their units define no kernels and the HIP index covers the inventory's portable kernels
+ * only. Returns [unit, stem, tu, kernels] per unit; a kernel defined outside its .cl throws.
+ */
+def gpuHipUnits = { File hipcc, GpuKernelLibrary lib, List<Map> manifest, File tmp ->
+    List<Map> headers = manifest.findAll { !it.openClOnly && ((String) it.path).endsWith('.h') }
+    List<Map> units = manifest.findAll { !it.openClOnly && ((String) it.path).endsWith('.cl') }
+    Set<String> manifestPaths = manifest.collect { (String) it.path } as Set
+    List<Callable<Map>> jobs = units.collect { Map unit ->
+        ({ ->
+            String stem = GpuKernelSources.stem((String) unit.path)
+            File tu = new File(tmp, stem + '.cu')
+            GpuBuildTools.writeText(tu, GpuKernelSources.concatenate(headers + [unit]))
+            File ii = new File(tmp, stem + '.ii')
+            List<Object> cmd = GpuHipToolkit.preprocessCommand(hipcc.path, lib.cudaDefines(), tu.path, ii.path)
+            GpuBuildTools.runChecked(cmd, tmp, "preprocessing ${lib.kernelRootPath}/${unit.path} for HIP")
+            List<Map> found = GpuKernelSources.scanKernels(ii.getText('UTF-8')).findAll { manifestPaths.contains(it.file) }
+            List<Map> misplaced = found.findAll { it.file != unit.path }
+            if (!misplaced.isEmpty()) {
+                throw new GradleException("${lib.id}: kernels ${misplaced.collect { it.name + ' (' + it.file + ')' }} are defined outside a .cl file; headers hold only helpers, tables and macros")
+            }
+            [unit: unit.path, stem: stem, tu: tu, kernels: found]
+        }) as Callable<Map>
+    }
+    return GpuBuildTools.parallel(jobs, GpuBuildTools.CORES, "HIP preprocessing of ${lib.id}")
+}
+
+/**
+ * Generates a library's inventory text from its kernel sources: the OpenCL pass (clang, or nvcc when
+ * clang is absent) over the whole manifest, plus the CUDA pass (nvcc) for the kernels that only the
+ * CUDA dialect defines (guarded by __CUDACC__, e.g. the tensor-core mma family). The nvcc pass runs
+ * when nvcc exists; without it the CUDA-only kernels are missing from the generated text and the
+ * caller falls back to the checked-in file for them. Returns [text, kernels, openClOnly,
+ * preprocessor, cudaPass], or null when neither preprocessor is found.
  */
 def gpuGenerateInventory = { Task task, GpuKernelLibrary lib ->
     List<Map> manifest = lib.manifest(gpuSharedKernelRoot)
     Map<String, Boolean> openClOnly = manifest.collectEntries { [(it.path): it.openClOnly] }
     List<Map> kernels
     String preprocessor
+    boolean cudaPass = false
     File clang = gpuFindClang()
-    File nvcc = clang == null ? gpuFindNvcc() : null
+    File nvcc = gpuFindNvcc()
     if (clang != null) {
         File cl = new File(task.temporaryDir, "${lib.id}_kernels.cl")
         File ii = new File(task.temporaryDir, "${lib.id}_kernels.i")
-        GpuBuildTools.writeText(cl, GpuKernelSources.concatenate(manifest))
+        GpuBuildTools.writeText(cl, GpuKernelSources.concatenate(manifest.findAll { !it.cudaOnly }))
         GpuBuildTools.runChecked([clang, '-x', 'cl', '-cl-std=CL1.2', '-Xclang', '-finclude-default-header', '-E', cl, '-o', ii],
                 task.temporaryDir, "preprocessing the ${lib.id} OpenCL kernel sources")
         kernels = GpuKernelSources.scanKernels(ii.getText('UTF-8')).findAll { openClOnly.containsKey(it.file) }
@@ -285,28 +420,44 @@ def gpuGenerateInventory = { Task task, GpuKernelLibrary lib ->
             throw new GradleException("${lib.id}: kernels ${inHeaders.collect { it.name + ' (' + it.file + ')' }} are defined in headers; headers hold only helpers, tables and macros")
         }
         preprocessor = 'clang'
+        if (nvcc != null) {
+            File tmp = new File(task.temporaryDir, "units/${lib.id}-cuda")
+            GpuBuildTools.resetDir(tmp)
+            Set<String> seen = kernels.collect { (String) it.name } as Set
+            List<Map> cudaKernels = gpuCudaUnits(nvcc, lib, manifest, tmp)
+                    .collectMany { (List<Map>) it.kernels }
+                    .findAll { !seen.contains((String) it.name) }
+            kernels.addAll(cudaKernels)
+            cudaPass = true
+            preprocessor = 'clang+nvcc'
+        }
     } else if (nvcc != null) {
         task.logger.warn("WARNING: clang not found: ${lib.id} inventory taken from the CUDA preprocessor; OpenCL-only kernels are not checked")
         File tmp = new File(task.temporaryDir, "units/${lib.id}")
         GpuBuildTools.resetDir(tmp)
         kernels = gpuCudaUnits(nvcc, lib, manifest, tmp).collectMany { (List<Map>) it.kernels }
         preprocessor = 'nvcc'
+        cudaPass = true
     } else {
         return null
     }
     GpuKernelSources.requireUniqueKernels(lib.id, kernels)
 
+    Set<String> cudaOnlyKernels = kernels
+            .findAll { ((String) it.file) in (Set<String>) manifest.findAll { it.cudaOnly }.collect { (String) it.path } }
+            .collect { (String) it.name } as Set
     List<String> problems = []
     kernels.each { Map k ->
         GpuKernelSources.violations(k, openClOnly.get(k.file)).each { problems.add("${k.name} (${k.file}): ${it}") }
     }
     List<Map> inventory = kernels.findAll { !openClOnly.get(it.file) }.sort { it.name }
-    problems.addAll(GpuInventory.variantCoverageProblems(lib, inventory.collect { (String) it.name } as Set))
+    problems.addAll(GpuInventory.variantCoverageProblems(lib, inventory.collect { (String) it.name } as Set, cudaOnlyKernels))
     if (!problems.isEmpty()) {
         throw new GradleException("${lib.label} kernel inventory check failed:\n  " + problems.join('\n  '))
     }
     String text = GpuInventory.text(lib, inventory)
-    return [text: text, kernels: inventory.size(), openClOnly: kernels.size() - inventory.size(), preprocessor: preprocessor]
+    return [text: text, kernels: inventory.size(), openClOnly: kernels.size() - inventory.size(),
+            preprocessor: preprocessor, cudaPass: cudaPass]
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -316,15 +467,25 @@ tasks.register('compileCudaKernels') {
     group = 'build'
     description = 'Compiles every kernel library to CUDA modules with index.tsv and build.properties (build/generated/gpu/cuda)'
     def outDir = gpuOut.map { it.dir('cuda') }
+    // Every local file a unit reads: the library's manifest, headers and .cl sources, plus the [shared] headers.
     inputs.files(gpuKernelSources).withPropertyName('kernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.files(gpuSharedKernelSources).withPropertyName('sharedKernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    // Per-library math-mode flags, defines (NF_FA_SMEM_FLOATS) and classpath directories.
     inputs.property('libraries', gpuLibrariesFingerprint)
+    // Toolchain identity and every nvcc option that changes the modules.
     inputs.property('nvcc', providers.provider { GpuBuildTools.fingerprint(gpuFindNvcc()) })
     inputs.property('ccbin', gpuNvccCcbin ?: '')
+    // nvcc reads the host compiler and extra flags from the environment too; they change the modules as
+    // -ccbin and command-line flags do, so they belong in the cache key.
+    inputs.property('nvccEnvironment', providers.provider {
+        ['NVCC_CCBIN', 'NVCC_PREPEND_FLAGS', 'NVCC_APPEND_FLAGS']
+                .collect { String name -> name + '=' + (System.getenv(name) ?: '') }.join('\n')
+    })
     inputs.property('archs', gpuCudaArchs)
     inputs.property('ptxOnly', gpuPtxOnly)
     inputs.property('requireCuda', gpuRequireCuda)
     outputs.dir(outDir)
+    outputs.cacheIf(gpuCacheReason) { true }
     doLast { task ->
         File out = outDir.get().asFile
         GpuBuildTools.resetDir(out)
@@ -411,15 +572,116 @@ tasks.register('compileCudaKernels') {
     }
 }
 
+tasks.register('compileHipKernels') {
+    group = 'build'
+    description = 'Compiles every kernel library to HIP code objects with index.tsv and build.properties (build/generated/gpu/hip)'
+    def outDir = gpuOut.map { it.dir('hip') }
+    // Every local file a HIP unit reads: the library's manifest, headers and .cl sources, plus the [shared] headers.
+    inputs.files(gpuKernelSources).withPropertyName('kernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuSharedKernelSources).withPropertyName('sharedKernelSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    // Per-library defines (NF_FA_SMEM_FLOATS) and classpath directories.
+    inputs.property('libraries', gpuLibrariesFingerprint)
+    // Toolchain identity and every hipcc option that changes the code objects.
+    inputs.property('hipcc', providers.provider { GpuBuildTools.fingerprint(gpuFindHipcc()) })
+    // hipcc reads its extra compile flags and compiler location from the environment; both change the code
+    // objects, so they belong in the cache key.
+    inputs.property('hipEnvironment', providers.provider {
+        ['HIPCC_COMPILE_FLAGS_APPEND', 'HIP_CLANG_PATH']
+                .collect { String name -> name + '=' + (System.getenv(name) ?: '') }.join('\n')
+    })
+    inputs.property('archs', gpuHipArchs)
+    inputs.property('requireHip', gpuRequireHip)
+    outputs.dir(outDir)
+    outputs.cacheIf(gpuCacheReason) { true }
+    doLast { task ->
+        File out = outDir.get().asFile
+        GpuBuildTools.resetDir(out)
+        File hipcc = gpuFindHipcc()
+        if (hipcc == null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireHip, 'neuralfree.requireHip',
+                    "hipcc not found: HIP kernels of ${gpuLibraries} not built; the HIP backend reports those kernel libraries unavailable")
+            return
+        }
+        String version = GpuHipToolkit.parseVersion(GpuBuildTools.runChecked([hipcc, '--version'], null, 'hipcc --version'))
+        Set<String> supported = null
+        try {
+            List<String> gpus = GpuHipToolkit.parseSupportedGpus(GpuBuildTools.runChecked([hipcc, '--print-supported-gpus'], null, 'hipcc --print-supported-gpus'))
+            if (!gpus.isEmpty()) {
+                supported = gpus.toSet()
+            }
+        } catch (Exception ignored) {
+            task.logger.info('hipcc --print-supported-gpus unavailable: every requested HIP arch goes to hipcc as written')
+        }
+        GpuHipToolkit.ArchSelection archs = GpuHipToolkit.selectArchs(gpuHipArchs, supported)
+        if (!archs.dropped().isEmpty()) {
+            task.logger.warn("WARNING: hipcc ${version} does not support HIP archs ${archs.dropped()}; building ${archs.selected()}")
+        }
+
+        Map<GpuKernelLibrary, List<Map>> unitsByLibrary = new LinkedHashMap<>()
+        List<Callable<Object>> jobs = []
+        gpuLibraries.each { GpuKernelLibrary lib ->
+            File tmp = new File(task.temporaryDir, "units/${lib.id}")
+            GpuBuildTools.resetDir(tmp)
+            List<Map> units = gpuHipUnits(hipcc, lib, lib.manifest(gpuSharedKernelRoot), tmp)
+            GpuKernelSources.requireUniqueKernels(lib.id, units.collectMany { (List<Map>) it.kernels })
+            unitsByLibrary[lib] = units
+            File hipOut = new File(out, lib.hipDir)
+            hipOut.mkdirs()
+            units.each { Map unit ->
+                jobs.add(({ ->
+                    File module = new File(tmp, unit.stem + GpuHipToolkit.CODE_OBJECT_SUFFIX)
+                    List<Object> compile = GpuHipToolkit.compileCommand(hipcc.path, archs.selected(), lib.cudaDefines(),
+                            unit.tu.path, module.path)
+                    String log = GpuBuildTools.runChecked(compile, tmp, "hipcc ${lib.kernelRootPath}/${unit.unit}")
+                    if (!log.trim().isEmpty()) {
+                        task.logger.info("hipcc ${lib.kernelRootPath}/${unit.unit}:\n${log}")
+                    }
+                    if (!((List) unit.kernels).isEmpty()) {
+                        GpuBuildTools.copy(module, new File(hipOut, unit.stem + GpuHipToolkit.CODE_OBJECT_SUFFIX))
+                    }
+                    null
+                }) as Callable<Object>)
+            }
+        }
+        GpuBuildTools.parallel(jobs, Math.max(1, (int) (GpuBuildTools.CORES / 4)), 'HIP kernel compilation')
+
+        List<String> summary = []
+        unitsByLibrary.each { GpuKernelLibrary lib, List<Map> units ->
+            File hipOut = new File(out, lib.hipDir)
+            Map<String, String> index = new LinkedHashMap<>()
+            units.each { Map unit ->
+                String resource = lib.hipDir + '/' + unit.stem + GpuHipToolkit.CODE_OBJECT_SUFFIX
+                ((List<Map>) unit.kernels).each { index.put((String) it.name, resource) }
+            }
+            GpuBuildTools.writeText(new File(hipOut, 'index.tsv'), GpuHipToolkit.indexText(index))
+            List<String> properties = [
+                    "hipcc.version=${version}".toString(),
+                    "hip.archs=${archs.selected().join(',')}".toString(),
+                    "kernel.format=${GpuHipToolkit.CODE_OBJECT_SUFFIX.substring(1)}".toString()
+            ]
+            if (lib.faSmemFloats != null) {
+                properties.add("fa.smem.floats=${lib.faSmemFloats}".toString())
+            }
+            GpuBuildTools.writeText(new File(hipOut, 'build.properties'), GpuHipToolkit.buildPropertiesText(properties))
+            summary.add("${lib.id} ${index.size()} kernels in ${units.count { !((List) it.kernels).isEmpty() }} modules")
+        }
+        task.logger.lifecycle("compileHipKernels: ${summary.join(', ')} (hipcc ${version}; targets ${archs.selected()})")
+    }
+}
+
 tasks.register('compileShaders') {
     group = 'build'
     description = 'Compiles every kernel library\'s shader variants to SPIR-V (build/generated/gpu/spv)'
     def outDir = gpuOut.map { it.dir('spv') }
+    // The library .comp sources, the variant tables and every include they can reach.
     inputs.files(fileTree(gpuShaderRoot) { exclude 'test/**' }).withPropertyName('shaderSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuShaderIncludes).withPropertyName('shaderIncludes').withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.property('libraries', gpuLibrariesFingerprint)
+    // Compiler, disassembler, optimizer and validator identity: whether they exist changes the output.
     inputs.property('tools', providers.provider { gpuShaderToolsFingerprint() })
     inputs.property('requireShaders', gpuRequireShaders)
     outputs.dir(outDir)
+    outputs.cacheIf(gpuCacheReason) { true }
     doLast { task ->
         File out = outDir.get().asFile
         GpuBuildTools.resetDir(out)
@@ -492,10 +754,13 @@ tasks.register('compileTestShaders') {
     group = 'build'
     description = 'Compiles the backend test shaders shaders/test/*.comp to SPIR-V (build/generated/gpu/spv-test)'
     def outDir = gpuOut.map { it.dir('spv-test') }
+    // The test .comp sources and every include they can reach through the [shaders/test, shaders] include path.
     inputs.dir(gpuTestShaderDir).withPropertyName('testShaderSources').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(gpuShaderIncludes).withPropertyName('shaderIncludes').withPathSensitivity(PathSensitivity.RELATIVE)
     inputs.property('tools', providers.provider { gpuShaderToolsFingerprint() })
     inputs.property('requireShaders', gpuRequireShaders)
     outputs.dir(outDir)
+    outputs.cacheIf(gpuCacheReason) { true }
     doLast { task ->
         File out = outDir.get().asFile
         GpuBuildTools.resetDir(out)
@@ -507,6 +772,157 @@ tasks.register('compileTestShaders') {
         }
         List<File> sources = GpuBuildTools.listFiles(gpuTestShaderDir, '.comp', [])
         gpuCompileShaderTree(tools, sources, out, 'test shader compilation')
+    }
+}
+
+tasks.register('compileMetalShaders') {
+    group = 'build'
+    description = 'Generates the kernel libraries\' Metal Shading Language sources from their SPIR-V modules (build/generated/gpu/metal)'
+    def outRoot = gpuOut.map { it.dir('metal') }
+    def toolSourceDir = new File(projectDir, 'gradle/metal-tool/src/main/java')
+    // The SPIR-V modules, their index and the generator's sources and resolved toolchain decide the output.
+    inputs.files(tasks.named('compileShaders')).withPropertyName('spirv').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(fileTree(toolSourceDir) { include '**/*.java' }).withPropertyName('generatorSources')
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('libraries', gpuLibrariesFingerprint)
+    inputs.property('spvc', providers.provider { gpuMetalToolFingerprint() })
+    outputs.dir(outRoot)
+    outputs.cacheIf(gpuCacheReason) { true }
+    mustRunAfter 'updateKernelInventory'
+    doLast { task ->
+        File out = outRoot.get().asFile
+        GpuBuildTools.resetDir(out)
+        Map tool = gpuMetalTool()
+        if (tool.error != null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireShaders, 'neuralfree.requireShaders',
+                    "SPIRV-Cross (org.lwjgl:lwjgl-spvc:${gpuSpvcVersion}) is unavailable, so the Metal kernel "
+                            + "sources were not generated: ${tool.error}")
+            return
+        }
+        File javac = new File(new File(System.getProperty('java.home'), 'bin'),
+                GpuBuildTools.WINDOWS ? 'javac.exe' : 'javac')
+        File java = new File(javac.parentFile, GpuBuildTools.WINDOWS ? 'java.exe' : 'java')
+        if (!javac.isFile() || !java.isFile()) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireShaders, 'neuralfree.requireShaders',
+                    "no javac/java under ${System.getProperty('java.home')}: Metal kernel sources not generated")
+            return
+        }
+        File spvRoot = gpuOut.get().dir('spv').asFile
+        if (!spvRoot.isDirectory()) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireShaders, 'neuralfree.requireShaders',
+                    'the Vulkan shaders were not compiled: Metal kernel sources not generated')
+            return
+        }
+        String jars = ((List<File>) tool.jars).collect { it.absolutePath }.join(File.pathSeparator)
+        File classes = layout.buildDirectory.dir('tmp/metal-tool/classes').get().asFile
+        GpuBuildTools.resetDir(classes)
+        List<File> sources = GpuBuildTools.listFiles(toolSourceDir, '.java', [])
+        List<Object> compile = [javac, '-d', classes.absolutePath, '-cp', jars]
+        sources.each { File source -> compile.add(source.absolutePath) }
+        GpuBuildTools.runChecked(compile, null, 'compiling the Metal shader generator')
+        List<String> summary = []
+        gpuLibraries.each { GpuKernelLibrary lib ->
+            File spvDir = new File(spvRoot, lib.shaderRootPath)
+            if (!new File(spvDir, 'index.properties').isFile()) {
+                task.logger.warn("WARNING: ${lib.id} SPIR-V index is missing: Metal sources of ${lib.id} not generated")
+                return
+            }
+            File metalDir = new File(out, lib.shaderRootPath + '/metal')
+            List<Object> run = [java, '-cp', classes.absolutePath + File.pathSeparator + jars,
+                                'neuralfree.gpu.metal.MetalShaderGenerator',
+                                '--spv', spvDir.absolutePath, '--out', metalDir.absolutePath]
+            GpuBuildTools.runChecked(run, null, "generating the Metal shaders of ${lib.id}")
+            int count = (int) (metalDir.listFiles({ File f -> f.isFile() && f.name.endsWith('.metal') } as FileFilter)?.length ?: 0)
+            summary.add("${lib.id} ${count} kernels")
+        }
+        task.logger.lifecycle("compileMetalShaders: ${summary.join(', ')}")
+    }
+}
+
+/** The JNI headers of the running JDK that hipshim.c includes; absent when the JDK has no include tree. */
+def gpuJniHeaders = { ->
+    File include = new File(System.getProperty('java.home'), 'include')
+    [new File(include, 'jni.h'), new File(include, 'linux/jni_md.h')].findAll { it.isFile() }
+}
+
+tasks.register('buildHipShim') {
+    group = 'build'
+    description = 'Builds the HIP JNI shim libhipshim.so from native/hip/hipshim.c (build/generated/gpu/hip-shim)'
+    def outDir = gpuOut.map { it.dir('hip-shim') }
+    inputs.file(file('native/hip/hipshim.c')).withPropertyName('shimSource').withPathSensitivity(PathSensitivity.RELATIVE)
+    // The packed header changes the shim as much as the source does; the include directories stay relative.
+    inputs.files(providers.provider { gpuJniHeaders() }).withPropertyName('jniHeaders').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('hipcc', providers.provider { GpuBuildTools.fingerprint(gpuFindHipcc()) })
+    // hipcc reads its extra flags and compiler location from the environment, exactly as for the code objects.
+    inputs.property('hipEnvironment', providers.provider {
+        ['HIPCC_COMPILE_FLAGS_APPEND', 'HIP_CLANG_PATH']
+                .collect { String name -> name + '=' + (System.getenv(name) ?: '') }.join('\n')
+    })
+    inputs.property('requireHip', gpuRequireHip)
+    outputs.dir(outDir)
+    outputs.cacheIf(gpuCacheReason) { true }
+    doLast { task ->
+        File out = outDir.get().asFile
+        GpuBuildTools.resetDir(out)
+        File hipcc = gpuFindHipcc()
+        if (hipcc == null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireHip, 'neuralfree.requireHip',
+                    'hipcc not found: libhipshim.so not built; build it with native/hip/Makefile and point -Dneuralfree.hip.shim.path at it')
+            return
+        }
+        File include = new File(System.getProperty('java.home'), 'include')
+        File includeLinux = new File(include, 'linux')
+        if (!new File(include, 'jni.h').isFile() || !new File(includeLinux, 'jni_md.h').isFile()) {
+            task.logger.warn("WARNING: no JNI headers under ${include}: libhipshim.so not built (the shim needs a JDK's include tree)")
+            return
+        }
+        File so = new File(out, 'libhipshim.so')
+        GpuBuildTools.runChecked([hipcc, '-O2', '-fPIC', '-shared', '-Wall',
+                                  '-I' + include.path, '-I' + includeLinux.path,
+                                  file('native/hip/hipshim.c').path, '-o', so.path], null, 'building libhipshim.so')
+        task.logger.lifecycle("buildHipShim: ${so} (run the engine with -Dneuralfree.hip.shim.path=${so})")
+    }
+}
+
+tasks.register('buildMetalShim') {
+    group = 'build'
+    description = 'Builds the Metal JNI shim libmetalshim.dylib from native/metal/metalshim.m (build/generated/gpu/metal-shim; macOS only)'
+    def outDir = gpuOut.map { it.dir('metal-shim') }
+    inputs.file(file('native/metal/metalshim.m')).withPropertyName('shimSource').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(providers.provider { gpuJniHeaders() }).withPropertyName('jniHeaders').withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.property('clang', providers.provider { GpuBuildTools.fingerprint(gpuFindClang()) })
+    inputs.property('osName', providers.provider { System.getProperty('os.name') })
+    inputs.property('requireMetal', gpuRequireMetal)
+    outputs.dir(outDir)
+    outputs.cacheIf(gpuCacheReason) { true }
+    doLast { task ->
+        File out = outDir.get().asFile
+        GpuBuildTools.resetDir(out)
+        String os = System.getProperty('os.name', '').toLowerCase(Locale.ROOT)
+        if (!os.startsWith('mac')) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireMetal, 'neuralfree.requireMetal',
+                    'Metal exists only on macOS: libmetalshim.dylib not built'.toString())
+            return
+        }
+        File clang = gpuFindClang()
+        if (clang == null) {
+            GpuBuildTools.missingTool(task.logger, gpuRequireMetal, 'neuralfree.requireMetal',
+                    'clang not found: libmetalshim.dylib not built')
+            return
+        }
+        File include = new File(System.getProperty('java.home'), 'include')
+        File includeDarwin = new File(include, 'darwin')
+        if (!new File(include, 'jni.h').isFile() || !new File(includeDarwin, 'jni_md.h').isFile()) {
+            task.logger.warn("WARNING: no JNI headers under ${include}: libmetalshim.dylib not built (the shim needs a JDK's include tree)")
+            return
+        }
+        File dylib = new File(out, 'libmetalshim.dylib')
+        GpuBuildTools.runChecked([clang, '-O2', '-fPIC', '-dynamiclib', '-fno-objc-arc', '-Wall',
+                                  '-framework', 'Metal', '-framework', 'Foundation',
+                                  '-I' + include.path, '-I' + includeDarwin.path,
+                                  file('native/metal/metalshim.m').path, '-o', dylib.path], null,
+                'building libmetalshim.dylib')
+        task.logger.lifecycle("buildMetalShim: ${dylib} (run the engine with -Dneuralfree.metal.shim.path=${dylib})")
     }
 }
 
@@ -532,7 +948,7 @@ tasks.register('checkOpenCLKernels') {
         List<String> checked = []
         gpuLibraries.each { GpuKernelLibrary lib ->
             File cl = new File(task.temporaryDir, "${lib.id}_kernels.cl")
-            GpuBuildTools.writeText(cl, GpuKernelSources.concatenate(lib.manifest(gpuSharedKernelRoot)))
+            GpuBuildTools.writeText(cl, GpuKernelSources.concatenate(lib.manifest(gpuSharedKernelRoot).findAll { !it.cudaOnly }))
             List<List<String>> variants = lib.subgroupVariants ? [[], ['-DUSE_SUBGROUPS=1']] : [[]]
             variants.each { List<String> extra ->
                 jobs.add(({ ->
@@ -560,6 +976,11 @@ tasks.register('updateKernelInventory') {
             [(lib): g]
         }
         generated.each { GpuKernelLibrary lib, Map g ->
+            boolean cudaOnlyEntries = lib.manifest(gpuSharedKernelRoot).any { it.cudaOnly }
+            if (cudaOnlyEntries && !g.cudaPass) {
+                throw new GradleException("updateKernelInventory: ${lib.inventoryPath} covers CUDA-only kernels "
+                        + '(tagged [cuda] in the manifest), which the nvcc preprocessing pass generates; nvcc was not found')
+            }
             String current = lib.inventoryFile.isFile() ? lib.inventoryFile.getText('UTF-8').replace('\r\n', '\n') : null
             if (current == g.text) {
                 task.logger.lifecycle("updateKernelInventory: ${lib.inventoryPath} is up to date (${g.kernels} kernels, ${g.preprocessor})")
@@ -584,7 +1005,7 @@ tasks.register('inventoryCheck') {
     inputs.property('libraries', gpuLibrariesFingerprint)
     inputs.property('preprocessor', providers.provider {
         File clang = gpuFindClang()
-        clang != null ? GpuBuildTools.fingerprint(clang) : GpuBuildTools.fingerprint(gpuFindNvcc())
+        GpuBuildTools.fingerprint(clang) + ' | ' + GpuBuildTools.fingerprint(gpuFindNvcc())
     })
     outputs.file(stamp)
     // The stamp is written only after a comparison with the sources, so an unchecked run repeats its warning.
@@ -609,6 +1030,20 @@ tasks.register('inventoryCheck') {
             }
             String current = lib.inventoryFile.getText('UTF-8').replace('\r\n', '\n')
             if (current != generated.text) {
+                if (!generated.cudaPass) {
+                    // Without the nvcc pass the CUDA-only kernels of the checked-in file cannot be
+                    // re-derived: the OpenCL-visible lines must match and the extras are allowed.
+                    List<String> currentLines = current.split('\n').findAll { it.trim() as boolean }
+                    List<String> generatedLines = generated.text.split('\n').findAll { it.trim() as boolean }
+                    if (currentLines.containsAll(generatedLines)) {
+                        task.logger.warn("WARNING: nvcc not found: ${lib.inventoryPath} keeps "
+                                + (currentLines.size() - generatedLines.size())
+                                + ' CUDA-only kernel lines that were not checked against the sources')
+                        checked.add("${lib.inventoryPath} matches the kernel sources on the OpenCL-visible kernels"
+                                + " (${generated.kernels} kernels, ${generated.preprocessor})")
+                        return
+                    }
+                }
                 throw new GradleException("${lib.inventoryPath} is stale: it does not match the kernel sources "
                         + "(${GpuInventory.difference(current, (String) generated.text)}).\nRegenerate it with: ${gpuInventoryCommand}")
             }
@@ -623,17 +1058,23 @@ tasks.register('inventoryCheck') {
 
 tasks.register('verifyGpuKernels') {
     group = 'verification'
-    description = 'Builds every GPU kernel artifact and checks that CUDA and Vulkan cover every kernel library\'s inventory'
-    dependsOn 'checkOpenCLKernels', 'inventoryCheck', 'compileCudaKernels', 'compileShaders', 'compileTestShaders'
+    description = 'Builds every GPU kernel artifact and checks that CUDA, HIP, Vulkan and Metal cover every kernel library\'s inventory'
+    dependsOn 'checkOpenCLKernels', 'inventoryCheck', 'compileCudaKernels', 'compileHipKernels', 'compileShaders', 'compileTestShaders', 'compileMetalShaders'
     doLast { task ->
         File generatedRoot = gpuOut.get().asFile
         List<String> problems = []
         List<String> summary = []
         gpuLibraries.each { GpuKernelLibrary lib ->
             Map<String, Map> inventory = GpuInventory.read(lib, gpuInventoryCommand)
+            // Kernels of [cuda] manifest entries exist only in the CUDA fatbins; the HIP build and the Vulkan
+            // shader set never serve them and hosts select them through the COOPERATIVE_MATRIX feature.
+            Set<String> cudaOnlyPaths = lib.manifest(gpuSharedKernelRoot).findAll { it.cudaOnly }
+                    .collect { (String) it.path } as Set
+            Set<String> portableInventory = inventory.findAll { !(it.value.file in cudaOnlyPaths) }.keySet()
             List<String> covered = []
             Closure coverage = { String what, Set<String> built ->
-                List<String> missing = (inventory.keySet() - built).sort()
+                Set<String> required = what == 'CUDA' ? inventory.keySet() : portableInventory
+                List<String> missing = (required - built).sort()
                 List<String> extra = (built - inventory.keySet()).sort()
                 if (!missing.isEmpty()) {
                     problems.add("${lib.id}: ${what} index lacks ${missing.size()} kernels: ${missing.join(', ')}")
@@ -649,10 +1090,18 @@ tasks.register('verifyGpuKernels') {
             } else {
                 task.logger.warn("WARNING: ${lib.id} CUDA kernels were not built: CUDA coverage not checked")
             }
+            File hipIndex = new File(generatedRoot, 'hip/' + lib.hipDir + '/index.tsv')
+            if (hipIndex.isFile()) {
+                coverage('HIP', hipIndex.readLines('UTF-8').findAll { !it.isEmpty() }.collect { it.split('\t')[0] } as Set<String>)
+            } else {
+                task.logger.warn("WARNING: ${lib.id} HIP kernels were not built: HIP coverage not checked")
+            }
             File spvIndex = new File(generatedRoot, 'spv/' + lib.shaderRootPath + '/index.properties')
+            Properties spvProperties = null
             if (spvIndex.isFile()) {
                 Properties p = new Properties()
                 spvIndex.withInputStream { p.load(it) }
+                spvProperties = p
                 Set<String> spv = p.stringPropertyNames().findAll { it.endsWith('.buffers') }
                         .collect { it.substring(0, it.length() - '.buffers'.length()) } as Set
                 coverage('SPIR-V', spv)
@@ -669,6 +1118,31 @@ tasks.register('verifyGpuKernels') {
                 }
             } else {
                 task.logger.warn("WARNING: ${lib.id} SPIR-V was not built: Vulkan coverage not checked")
+            }
+            File metalIndex = new File(generatedRoot, 'metal/' + lib.shaderRootPath + '/metal/index.properties')
+            if (metalIndex.isFile()) {
+                Properties m = new Properties()
+                metalIndex.withInputStream { m.load(it) }
+                Set<String> metal = m.stringPropertyNames().findAll { it.endsWith('.buffers') }
+                        .collect { it.substring(0, it.length() - '.buffers'.length()) } as Set
+                coverage('Metal', metal)
+                metal.sort().each { String name ->
+                    File source = new File(metalIndex.parentFile, name + '.metal')
+                    if (!source.isFile()) {
+                        problems.add("${lib.id}: ${name}: the Metal index lists the kernel but ${source.name} is missing")
+                    } else if (!source.getText('UTF-8').contains('kernel void ' + name + '(')) {
+                        problems.add("${lib.id}: ${name}: ${source.name} does not define 'kernel void ${name}'")
+                    }
+                    if (spvProperties != null) {
+                        ['.buffers', '.ro', '.push'].each { String key ->
+                            if (m.getProperty(name + key) != spvProperties.getProperty(name + key)) {
+                                problems.add("${lib.id}: ${name}: Metal ${key} is ${m.getProperty(name + key)}, SPIR-V has ${spvProperties.getProperty(name + key)}")
+                            }
+                        }
+                    }
+                }
+            } else {
+                task.logger.warn("WARNING: ${lib.id} Metal sources were not generated: Metal coverage not checked")
             }
             summary.add("${lib.id} ${inventory.size()} kernels covered" + (covered ? ' (' + covered.join(', ') + ')' : ''))
         }

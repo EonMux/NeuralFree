@@ -1,0 +1,62 @@
+/*
+ * vLLM tables: data NeuralFree takes from vLLM's Python sources, as checked-in classpath resources under
+ * src/main/resources/vllm. Applied from build.gradle.
+ *
+ *   weights_mappers.tsv   every registered architecture's hf_to_vllm_mapper, which names the vLLM modules
+ *                         --quantization-config patterns match (VllmWeightsMapper)
+ *
+ * gradle/vllmgen/vllm_mappers.py generates it from a vLLM checkout by parsing its Python sources (standard library
+ * only, vLLM is never imported); its module docstring documents the columns.
+ *
+ * Tasks:
+ *   updateVllmTables   regenerates the tables from -Pvllm. Needs git and Python 3.9 or newer.
+ *
+ * Project properties (-P):
+ *   vllm                 the vLLM checkout updateVllmTables reads (required)
+ *   neuralfree.python    path of the Python interpreter (default: python3, then python, from PATH)
+ *   neuralfree.git       path of git (default: PATH)
+ */
+
+import neuralfree.gpu.GpuBuildTools
+import org.gradle.api.GradleException
+
+def vllmTablesDir = file('src/main/resources/vllm')
+def vllmGenerator = file('gradle/vllmgen/vllm_mappers.py')
+def vllmProp = { String name -> findProperty(name)?.toString() }
+
+tasks.register('updateVllmTables') {
+    group = 'build'
+    description = 'Regenerates the checked-in vLLM tables (src/main/resources/vllm) from a vLLM checkout (-Pvllm; needs git and Python 3.9+)'
+    doLast { task ->
+        String checkoutPath = vllmProp('vllm')
+        if (checkoutPath == null || checkoutPath.trim().isEmpty()) {
+            throw new GradleException('updateVllmTables needs the vLLM checkout to read: ./gradlew updateVllmTables -Pvllm=<vLLM checkout>')
+        }
+        File checkout = file(checkoutPath.trim())
+        if (!new File(checkout, 'vllm/model_executor/models/registry.py').isFile()) {
+            throw new GradleException("-Pvllm=${checkoutPath} is not a vLLM checkout (no vllm/model_executor/models/registry.py)")
+        }
+        File git = GpuBuildTools.find(vllmProp('neuralfree.git'), 'neuralfree.git', 'git', [])
+        if (git == null) {
+            throw new GradleException('updateVllmTables needs git to read the vLLM commit: none found on PATH (set -Pneuralfree.git)')
+        }
+        String commit = GpuBuildTools.runChecked([git, '-C', checkout, 'rev-parse', '--short', 'HEAD'], null,
+                "reading the commit of ${checkout}").trim()
+        String localChanges = GpuBuildTools.runChecked([git, '-C', checkout, 'status', '--porcelain', '--', 'vllm'],
+                null, "reading the status of ${checkout}").trim()
+        if (!localChanges.isEmpty()) {
+            task.logger.warn("WARNING: ${checkout} has local changes; the tables record commit ${commit} but are generated "
+                    + "from the working tree:\n${GpuBuildTools.clip(localChanges)}")
+        }
+        File python = GpuBuildTools.find(vllmProp('neuralfree.python'), 'neuralfree.python', 'python3', [])
+                ?: GpuBuildTools.find(null, 'neuralfree.python', 'python', [])
+        if (python == null) {
+            throw new GradleException('updateVllmTables needs Python 3.9 or newer: none found on PATH (set -Pneuralfree.python)')
+        }
+        vllmTablesDir.mkdirs()
+        String report = GpuBuildTools.runChecked([python, '-I', vllmGenerator, '--vllm', checkout, '--commit', commit,
+                                                 '--out', new File(vllmTablesDir, 'weights_mappers.tsv')], projectDir,
+                "vllm_mappers.py (generating the mapper table from ${checkout})")
+        task.logger.lifecycle("updateVllmTables: wrote src/main/resources/vllm/weights_mappers.tsv from vLLM ${commit}: ${report.trim()}")
+    }
+}

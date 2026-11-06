@@ -32,7 +32,7 @@ public class RopeOverridesTest {
     public void builderSetsEveryValue() {
         RopeOverrides rope = RopeOverrides.builder()
                 .scalingType(RopeOverrides.ScalingType.YARN)
-                .freqScale(4.0f)
+                .scalingFactor(4.0f)
                 .freqBase(10000.0f)
                 .yarnExtFactor(1.13f)
                 .yarnAttnFactor(1.4f)
@@ -42,7 +42,7 @@ public class RopeOverridesTest {
                 .build();
         assertTrue(!rope.isEmpty());
         assertEquals(RopeOverrides.ScalingType.YARN, rope.scalingType());
-        assertEquals(4.0f, rope.freqScale(), 0.0f);
+        assertEquals(4.0f, rope.scalingFactor(), 0.0f);
         assertEquals(10000.0f, rope.freqBase(), 0.0f);
         assertEquals(1.13f, rope.yarnExtFactor(), 0.0f);
         assertEquals(1.4f, rope.yarnAttnFactor(), 0.0f);
@@ -74,16 +74,17 @@ public class RopeOverridesTest {
                 () -> RopeOverrides.ScalingType.parse("yarn "));
         assertTrue(e.getMessage().contains(RopeOverrides.PROP_ROPE_SCALING));
         assertEquals(RopeOverrides.ScalingType.LONG, RopeOverrides.ScalingType.parse("long"));
+        assertEquals(RopeOverrides.ScalingType.DYNAMIC, RopeOverrides.ScalingType.parse("Dynamic"));
         assertEquals(RopeOverrides.ScalingType.NONE, RopeOverrides.ScalingType.parse("none"));
     }
 
     @Test
     public void buildersAreEqualAndRoundtrip() {
-        RopeOverrides a = RopeOverrides.builder().scalingType(RopeOverrides.ScalingType.LINEAR).freqScale(2.0f).build();
+        RopeOverrides a = RopeOverrides.builder().scalingType(RopeOverrides.ScalingType.LINEAR).scalingFactor(2.0f).build();
         RopeOverrides b = a.toBuilder().build();
         assertEquals(a, b);
         assertEquals(a.hashCode(), b.hashCode());
-        assertTrue(!a.equals(RopeOverrides.builder().freqScale(2.0f).freqBase(10000.0f).build()));
+        assertTrue(!a.equals(RopeOverrides.builder().scalingFactor(2.0f).freqBase(10000.0f).build()));
         assertTrue(a.toOverrides("llama").equals(b.toOverrides("llama")));
     }
 
@@ -102,7 +103,7 @@ public class RopeOverridesTest {
         p.setProperty(RopeOverrides.PROP_YARN_ORIG_CTX, "8192");
         RopeOverrides rope = RopeOverrides.fromProperties(p);
         assertEquals(RopeOverrides.ScalingType.YARN, rope.scalingType());
-        assertEquals(4.0f, rope.freqScale(), 0.0f);
+        assertEquals(4.0f, rope.scalingFactor(), 0.0f);
         assertEquals(10000.0f, rope.freqBase(), 0.0f);
         assertEquals(1.13f, rope.yarnExtFactor(), 0.0f);
         assertEquals(1.4f, rope.yarnAttnFactor(), 0.0f);
@@ -137,13 +138,37 @@ public class RopeOverridesTest {
         assertTrue(e.getMessage().contains(RopeOverrides.PROP_YARN_ORIG_CTX));
     }
 
+    @Test
+    public void freqScaleIsTheReciprocalOfTheScalingFactor() {
+        // llama.cpp: --rope-scale N sets rope_freq_scale = 1 / N, --rope-freq-scale N sets it to N
+        assertEquals(4.0f, RopeOverrides.builder().scalingFactor(4.0f).build().scalingFactor(), 0.0f);
+        assertEquals(4.0f, RopeOverrides.builder().freqScale(0.25f).build().scalingFactor(), 0.0f);
+        assertEquals(RopeOverrides.builder().scalingFactor(4.0f).build(),
+                RopeOverrides.builder().freqScale(0.25f).build());
+        Properties p = new Properties();
+        p.setProperty(RopeOverrides.PROP_ROPE_SCALE, "4.0");
+        Properties q = new Properties();
+        q.setProperty(RopeOverrides.PROP_ROPE_FREQ_SCALE, "0.25");
+        assertEquals(RopeOverrides.fromProperties(p), RopeOverrides.fromProperties(q));
+        assertEquals(4.0f, ModelSourceOptions.builder().ropeScale(4.0f).build().ropeOverrides().scalingFactor(), 0.0f);
+    }
+
+    @Test
+    public void nonPositiveScalesAreRejectedByName() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> RopeOverrides.builder().freqScale(0.0f));
+        assertTrue(e.getMessage().contains(RopeOverrides.PROP_ROPE_FREQ_SCALE));
+        e = assertThrows(IllegalArgumentException.class, () -> RopeOverrides.builder().scalingFactor(-1.0f));
+        assertTrue(e.getMessage().contains(RopeOverrides.PROP_ROPE_SCALE));
+    }
+
     // ---------------------------------------------------------------- the %s.rope.* metadata overrides
 
     @Test
     public void toOverridesWritesTheRopeKeysOfTheArchitecture() {
         RopeOverrides rope = RopeOverrides.builder()
                 .scalingType(RopeOverrides.ScalingType.YARN)
-                .freqScale(4.0f)
+                .scalingFactor(4.0f)
                 .freqBase(10000.0f)
                 .yarnAttnFactor(1.4f)
                 .yarnExtFactor(1.13f)
@@ -171,9 +196,9 @@ public class RopeOverridesTest {
 
         // a null arch is an error; only the set options are written
         assertThrows(NullPointerException.class, () -> rope.toOverrides(null));
-        assertTrue(RopeOverrides.builder().freqScale(2.0f).build().toOverrides("llama").size() == 1);
+        assertTrue(RopeOverrides.builder().scalingFactor(2.0f).build().toOverrides("llama").size() == 1);
         assertEquals(String.format(GgufKeys.ROPE_SCALING_FACTOR, "llama"),
-                RopeOverrides.builder().freqScale(2.0f).build().toOverrides("llama").get(0).key());
+                RopeOverrides.builder().scalingFactor(2.0f).build().toOverrides("llama").get(0).key());
     }
 
     // ---------------------------------------------------------------- ModelSourceOptions carries them
@@ -187,14 +212,14 @@ public class RopeOverridesTest {
                 .yarnOrigCtx(8192)
                 .build();
         assertEquals(RopeOverrides.ScalingType.YARN, o.ropeOverrides().scalingType());
-        assertEquals(4.0f, o.ropeOverrides().freqScale(), 0.0f);
+        assertEquals(0.25f, o.ropeOverrides().scalingFactor(), 0.0f);
         assertEquals(10000.0f, o.ropeOverrides().freqBase(), 0.0f);
         assertEquals(8192, (int) o.ropeOverrides().yarnOrigCtx());
 
         ModelSourceOptions replacing = ModelSourceOptions.builder().ropeFreqBase(10000.0f).build()
-                .toBuilder().ropeOverrides(RopeOverrides.builder().freqScale(2.0f)).build();
+                .toBuilder().ropeOverrides(RopeOverrides.builder().scalingFactor(2.0f)).build();
         assertTrue(replacing.ropeOverrides().freqBase() == null);
-        assertEquals(2.0f, replacing.ropeOverrides().freqScale(), 0.0f);
+        assertEquals(2.0f, replacing.ropeOverrides().scalingFactor(), 0.0f);
 
         assertEquals(ModelSourceOptions.builder().build().ropeOverrides(), RopeOverrides.defaults());
     }
@@ -207,7 +232,7 @@ public class RopeOverridesTest {
         p.setProperty(RopeOverrides.PROP_YARN_ORIG_CTX, "8192");
         ModelSourceOptions o = ModelSourceOptions.fromProperties(p);
         assertEquals(RopeOverrides.ScalingType.LINEAR, o.ropeOverrides().scalingType());
-        assertEquals(4.0f, o.ropeOverrides().freqScale(), 0.0f);
+        assertEquals(0.25f, o.ropeOverrides().scalingFactor(), 0.0f);
         assertEquals(8192, (int) o.ropeOverrides().yarnOrigCtx());
 
         assertTrue(ModelSourceOptions.fromProperties(new Properties()).ropeOverrides().isEmpty());

@@ -8,6 +8,7 @@ import com.eonmux.neuralfree.gguf.TensorReadMode;
 import com.eonmux.neuralfree.gguf.TensorRegions;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
+import com.eonmux.neuralfree.gguf.cpu.repack.CpuRepack;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
 import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
@@ -25,8 +26,11 @@ import com.eonmux.neuralfree.gguf.spec.TensorRef;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,7 +47,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li><b>Small vectors</b> (norm weights, biases, relative-position tables, scales) are decoded to F32 once by
  *       the {@code floats} lookups and cached. The returned arrays are shared and must not be modified.</li>
  *   <li><b>Transforms.</b> This class is the {@link CpuMatVec.TransformSource} of its {@link #matVec()}, which
- *       applies a weight's full input transform before the weight kernel, in the §AQ-1 order HADAMARD →
+ *       applies a weight's full input transform before the weight kernel, in the order HADAMARD →
  *       ACT_QUANT → PERMUTE ({@link InputTransform}): a weight folded by PRISM or compressed-tensors gets its
  *       input rotation (llama.cpp src/llama-graph.cpp:1598-1626), a checkpoint's activation fake-quantization and
  *       act-order input permutation ride along ({@link InputTransformLoader.Result#forward()}), a weight
@@ -53,6 +57,12 @@ import java.util.concurrent.ConcurrentHashMap;
  *       latent lookup table gets its inverse Hadamard for {@link #embedRow} (llama.cpp src/llama-graph.cpp:2683-2690).
  *       This class loads no transform itself: it only binds the {@link InputTransformLoader.Result} that {@code open}
  *       receives.</li>
+ *   <li><b>Repacking.</b> Matmul weights whose layout the Vector API kernels exploit are copied once into an
+ *       interleaved layout by {@link CpuRepack} (llama.cpp ggml-cpu/repack.cpp) when their first product asks for
+ *       it, and every later product runs over the copy; a tensor used as a lookup table ({@link #embedRow}) is
+ *       never copied, so its mapped rows keep serving it. {@value CpuRepack#PROP_REPACK} selects the types
+ *       ({@code auto} by default, {@code on}, {@code off}) and {@value CpuRepack#PROP_BUDGET} caps the copies,
+ *       which are also bounded by the free heap; a weight that does not fit stays on the plain kernels.</li>
  * </ul>
  *
  * <p>Lookups resolve aliases as {@link TensorCatalog} does. Required lookups throw {@link MissingTensorException}
@@ -84,6 +94,7 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
     private final TensorReadMode mode;
     private final SourceOrigin origin;
     private final InputTransformLoader.Result transforms;
+    private final CpuRepack repack;
     private final CpuMatVec matVec;
     private final Map<String, CpuTensorRef> views = new ConcurrentHashMap<>();
     private final Map<CpuTensorRef, Entry> entries = new ConcurrentHashMap<>();
@@ -98,7 +109,8 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
         this.mode = mode;
         this.origin = origin;
         this.transforms = transforms;
-        this.matVec = new CpuMatVec(this);
+        this.repack = new CpuRepack();
+        this.matVec = new CpuMatVec(this, repack::planFor);
     }
 
     /**
@@ -182,9 +194,14 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
         return catalog.archName();
     }
 
-    /** The matvec bound to this model's transforms. */
+    /** The matvec bound to this model's transforms; it runs repacked weights over their {@link CpuRepack} copies. */
     public CpuMatVec matVec() {
         return matVec;
+    }
+
+    /** The repacker this instance's matvec consults, holding one on-heap copy per repacked weight. */
+    public CpuRepack repack() {
+        return repack;
     }
 
     // ------------------------------------------------------------------ matrices
@@ -217,6 +234,11 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
     /** True when {@link #getOrNull(String)} finds the tensor. */
     public boolean has(String name) {
         return catalog.get(name) != null;
+    }
+
+    /** True when {@code w} is a view these weights created, so {@link #describe} names it. */
+    public boolean owns(CpuTensorRef w) {
+        return w != null && entries.containsKey(w);
     }
 
     /** The tensor a catalog reference names; null for a null reference. */
@@ -294,12 +316,14 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
 
     /**
      * Decodes row {@code row} of a lookup table (token, position or type embeddings) into
-     * {@code dst[dstOff .. dstOff + cols)}, then applies the table's inverse PRISM Hadamard when it has one.
+     * {@code dst[dstOff .. dstOff + cols)}, then applies the table's inverse PRISM Hadamard when it has one. The
+     * table stays in place: a repacked copy would not replace any of its mapped rows, which every lookup reads.
      *
      * @throws IndexOutOfBoundsException when the row is outside the table
      */
     public void embedRow(CpuTensorRef table, long row, float[] dst, int dstOff) {
         Entry e = entry(table);
+        repack.keepInPlace(table, "lookup table");
         table.decodeRow(row, dst, dstOff);
         if (e.inverse != null) {
             CpuHadamard.applyInPlace(e.inverse, dst, dstOff, 1, (int) table.cols());
@@ -406,7 +430,7 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
             try {
                 view = mapTensor(info, ref);
             } catch (IOException e) {
-                throw new UncheckedIOException("cannot " + (mode == TensorReadMode.MMAP ? "map" : "read")
+                throw new UncheckedIOException("cannot " + (mode.usesMmap() ? "map" : "read")
                         + " tensor " + info.name() + " of " + regions.description(), e);
             }
             int experts = ref.rank() >= 3 ? checkedInt(ref.ne(2), ref) : 0;
@@ -418,11 +442,71 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
                     "inverse");
             entries.put(view, new Entry(ref, CpuMatVec.Transforms.from(it, scale, experts), inv));
             views.put(ref.name(), view);
+            // A matmul weight is repacked when its first product asks for it, not here: only the product path can
+            // tell a matmul from a lookup table, and the first product runs once the KV cache is allocated.
             return view;
         }
     }
 
-    /** Maps (or reads) {@code rows x rowBytes} bytes in row-aligned regions of at most {@link #MAX_REGION_BYTES}. */
+    // ------------------------------------------------------------------ live updates
+
+    /**
+     * Writes updated contents over the loaded view of the tensor {@code name}: a live weight update (vLLM's
+     * in-process weight transfer). The new bytes become the view every later lookup returns; a forward pass running
+     * while the view swaps keeps the bytes it already read, the next one serves the update. The decoded small-vector
+     * cache of the tensor and its repacked copy drop, so a later product sees the new contents either way.
+     *
+     * @param name  the tensor's stored name, exactly as the model file holds it
+     * @param dtype element type the {@code data} bytes hold: the tensor's stored type — the CPU consumes weights as
+     *             stored, so F32 data is refused unless the tensor itself is F32
+     * @param ne    ggml shape of the update; must equal the model's
+     * @param data  the whole tensor, little-endian, row-major over {@code ne[1..]}
+     * @throws IllegalArgumentException      when the model has no tensor of that name, or the shape or dtype does
+     *                                       not match
+     * @throws UnsupportedOperationException when the tensor was never mapped (it serves nothing yet)
+     */
+    public void update(String name, GGMLType dtype, long[] ne, ByteBuffer data) {
+        Objects.requireNonNull(dtype, "dtype");
+        Objects.requireNonNull(data, "data");
+        synchronized (loadLock) {
+            ensureOpen();
+            GGUFTensorInfo info = catalog.info(Objects.requireNonNull(name, "name"));
+            if (info == null) {
+                throw new IllegalArgumentException(catalog.archName() + " has no tensor " + name + " to update");
+            }
+            CpuTensorRef old = views.get(info.name());
+            if (old == null) {
+                throw new UnsupportedOperationException("tensor " + name + " was never mapped; the CPU model"
+                        + " loads its tensors on first use and holds nothing to update");
+            }
+            if (!Arrays.equals(info.dims(), ne)) {
+                throw new IllegalArgumentException("tensor " + name + " has shape " + Arrays.toString(info.dims())
+                        + ", the update carries " + Arrays.toString(ne));
+            }
+            if (dtype != info.type()) {
+                throw new IllegalArgumentException("tensor " + name + " is stored and consumed as " + info.type()
+                        + "; " + (dtype == GGMLType.F32 ? "F32 update data would requantize it — send its stored "
+                        + info.type() + " bytes instead" : "updates arrive as the stored type, got " + dtype));
+            }
+            CpuTensorRef fresh = CpuTensorRef.of(info.type(),
+                    ByteBuffer.allocateDirect(data.remaining()).order(ByteOrder.LITTLE_ENDIAN).put(data.duplicate())
+                            .flip(),
+                    old.rows(), old.cols());
+            Entry e = entries.remove(old);
+            if (e == null) {
+                throw new IllegalStateException("tensor " + name + " has no bound entry in these weights");
+            }
+            entries.put(fresh, new Entry(TensorRef.of(info), e.transforms, e.inverse));
+            views.put(info.name(), fresh);
+            vectors.remove(info.name());
+            repack.discard(old);
+        }
+    }
+
+    /**
+     * Maps (or reads) {@code rows x rowBytes} bytes in row-aligned regions of at most {@link #MAX_REGION_BYTES},
+     * none crossing a boundary of the tensor's contiguous runs.
+     */
     private CpuTensorRef mapTensor(GGUFTensorInfo info, TensorRef ref) throws IOException {
         GGMLType type = info.type();
         long rows = ref.rows();
@@ -437,17 +521,39 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
             throw new GgufFormatException("tensor " + ref.name() + " has rows of " + rowBytes
                     + " bytes, larger than one mapped region");
         }
-        long rowsPerRegion = Math.max(1L, MAX_REGION_BYTES / rowBytes);
-        int count = (int) Math.max(1L, (rows + rowsPerRegion - 1) / rowsPerRegion);
-        ByteBuffer[] shards = new ByteBuffer[count];
-        long[] offsets = new long[count];
-        for (int s = 0; s < count; s++) {
-            long firstRow = s * rowsPerRegion;
-            long n = Math.min(rowsPerRegion, rows - firstRow);
-            offsets[s] = firstRow * rowBytes;
-            shards[s] = regions.region(info, offsets[s], n * rowBytes);
+        long rowsPerRun = runRows(info, rows, rowBytes, total);
+        long rowsPerRegion = Math.min(rowsPerRun, Math.max(1L, MAX_REGION_BYTES / rowBytes));
+        List<ByteBuffer> shards = new ArrayList<>();
+        List<Long> offsets = new ArrayList<>();
+        long firstRow = 0;
+        do {
+            long runEnd = (firstRow / rowsPerRun + 1) * rowsPerRun;
+            long end = Math.min(rows, Math.min(firstRow + rowsPerRegion, runEnd));
+            offsets.add(firstRow * rowBytes);
+            shards.add(regions.region(info, firstRow * rowBytes, (end - firstRow) * rowBytes));
+            firstRow = end;
+        } while (firstRow < rows);
+        long[] starts = new long[offsets.size()];
+        for (int i = 0; i < starts.length; i++) {
+            starts[i] = offsets.get(i);
         }
-        return new CpuTensorRef(type, shards, offsets, rows, cols, rowBytes);
+        return new CpuTensorRef(type, shards.toArray(new ByteBuffer[0]), starts, rows, cols, rowBytes);
+    }
+
+    /**
+     * Rows of one contiguous run of {@code info} ({@link TensorRegions#contiguousRunBytes}), so no mapped region
+     * crosses a run boundary and every region is served in place; the whole tensor when it is one run.
+     */
+    private long runRows(GGUFTensorInfo info, long rows, long rowBytes, long total) throws GgufFormatException {
+        long runBytes = regions.contiguousRunBytes(info);
+        if (runBytes >= total || rows == 0) {
+            return Math.max(1L, rows);
+        }
+        if (runBytes <= 0 || runBytes % rowBytes != 0) {
+            throw new GgufFormatException("tensor " + info.name() + " is stored in runs of " + runBytes
+                    + " bytes, not a positive multiple of its " + rowBytes + "-byte rows");
+        }
+        return runBytes / rowBytes;
     }
 
     /**
@@ -519,6 +625,15 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
                     + actQuant.entries() + " parameter set(s)" + (experts == 0 ? ", but the tensor is not an"
                             + " expert tensor" : ", but the tensor holds " + experts + " expert(s)"));
         }
+        float[] preScale = it.preScale();
+        if (preScale != null) {
+            int cols = checkedInt(ref.cols(), ref);
+            if (preScale.length != cols && (experts == 0 || preScale.length != experts * cols)) {
+                throw new GgufFormatException("activation pre-scale of tensor " + ref.name() + " has "
+                        + preScale.length + " values; expected " + cols
+                        + (experts > 0 ? " or " + experts * cols + " (one per expert)" : ""));
+            }
+        }
         return it;
     }
 
@@ -549,6 +664,7 @@ public final class CpuWeights implements CpuMatVec.TransformSource, AutoCloseabl
             views.clear();
             entries.clear();
             vectors.clear();
+            repack.clear();
             regions.close();
         }
     }

@@ -30,6 +30,8 @@ public final class DsaSpec {
     private final boolean kpoolByOrder;
     private final boolean kpoolSelectTail;
     private final float weightScale;
+    private final boolean ssmax;
+    private final boolean indexerQueryNorm;
 
     private DsaSpec(Builder b) {
         this.indexerHeads = b.indexerHeads;
@@ -46,6 +48,8 @@ public final class DsaSpec {
         this.kpoolByOrder = b.kpoolByOrder;
         this.kpoolSelectTail = b.kpoolSelectTail;
         this.weightScale = b.weightScale;
+        this.ssmax = b.ssmax;
+        this.indexerQueryNorm = b.indexerQueryNorm;
     }
 
     public static Builder builder() {
@@ -78,12 +82,22 @@ public final class DsaSpec {
     public boolean kpoolSelectTail() { return kpoolSelectTail; }
     /** Head-weight prescale {@code (indexerHeadDim * indexerHeads)^-0.5}. */
     public float weightScale() { return weightScale; }
+    /**
+     * Queries are scaled by {@code ssmax.weight[h] * log(pos + 1) + ssmax.bias[h]} per head: the main query by
+     * {@code attn_ssmax} and the indexer query by {@code indexer.ssmax} (mistral-large4).
+     */
+    public boolean ssmax() { return ssmax; }
+    /**
+     * Indexer queries are the layer-normed input ({@code indexer.q_norm} weight and bias over the layer input)
+     * followed by {@code indexer.attn_q_b}, instead of the {@code q_lora} row (mistral-large4).
+     */
+    public boolean indexerQueryNorm() { return indexerQueryNorm; }
 
     @Override
     public String toString() {
         return "DsaSpec{heads=" + indexerHeads + ", dim=" + indexerHeadDim + ", rope=" + indexerRopeDim + "/" + ropeType
                 + ", topK=" + topK + ", full=" + full + ", source=" + sourceLayer + ", hadamard=" + hadamard
-                + ", kpool=" + kpool + '}';
+                + ", kpool=" + kpool + ", ssmax=" + ssmax + ", qNorm=" + indexerQueryNorm + '}';
     }
 
     public static final class Builder {
@@ -101,6 +115,8 @@ public final class DsaSpec {
         private boolean kpoolByOrder;
         private boolean kpoolSelectTail;
         private float weightScale = Float.NaN;
+        private boolean ssmax;
+        private boolean indexerQueryNorm;
 
         private Builder() {
         }
@@ -122,6 +138,10 @@ public final class DsaSpec {
             return this;
         }
         public Builder weightScale(float v) { this.weightScale = v; return this; }
+        /** {@link DsaSpec#ssmax()}. */
+        public Builder ssmax(boolean v) { this.ssmax = v; return this; }
+        /** {@link DsaSpec#indexerQueryNorm()}. */
+        public Builder indexerQueryNorm(boolean v) { this.indexerQueryNorm = v; return this; }
 
         /**
          * Sets {@link #weightScale(float)} to {@code 1.0f / sqrtf(float(indexerHeadDim * indexerHeads))} in float

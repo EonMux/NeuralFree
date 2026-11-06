@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
+import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -27,6 +28,9 @@ import java.util.Set;
  * default, or a {@link Builder} {@code fallback*} setter). A model's sampling defaults replace only fallbacks
  * ({@link #withModelDefaults}), as llama.cpp applies {@code general.sampling.*} only to parameters the user did not set
  * ({@code common_params_sampling::user_sampling_config}, common/common.cpp:1088-1147).
+ *
+ * <p>The text watermark ({@link #watermark}) is not a chain setting: {@code neuralfree.watermark.config} carries a
+ * JSON watermark configuration ({@link WatermarkConfig}) whose keyed draw replaces the categorical one.
  */
 public final class SamplerConfig {
 
@@ -119,6 +123,7 @@ public final class SamplerConfig {
     private final float dynatempExponent;
     private final float adaptiveTarget;
     private final float adaptiveDecay;
+    private final WatermarkConfig watermark;
     private final Set<Setting> explicit;
 
     private SamplerConfig(Builder b) {
@@ -150,6 +155,7 @@ public final class SamplerConfig {
         this.dynatempExponent = b.dynatempExponent;
         this.adaptiveTarget = b.adaptiveTarget;
         this.adaptiveDecay = b.adaptiveDecay;
+        this.watermark = b.watermark;
         this.explicit = Collections.unmodifiableSet(EnumSet.copyOf(b.explicit));
     }
 
@@ -186,7 +192,7 @@ public final class SamplerConfig {
         floatProperty(p, PROP_PRESENCE_PENALTY, b::presencePenalty);
         floatProperty(p, PROP_FREQUENCY_PENALTY, b::frequencyPenalty);
         intProperty(p, PROP_PENALTY_LAST_N, b::penaltyLastN);
-        String samplers = EngineConfig.stringProperty(p, PROP_SAMPLERS);
+        String samplers = EngineProperties.stringProperty(p, PROP_SAMPLERS);
         if (samplers != null) {
             try {
                 b.samplers(StageKind.parseOrder(samplers));
@@ -221,8 +227,12 @@ public final class SamplerConfig {
         floatProperty(p, PROP_DYNATEMP_EXPONENT, b::dynatempExponent);
         floatProperty(p, PROP_ADAPTIVE_TARGET, b::adaptiveTarget);
         floatProperty(p, PROP_ADAPTIVE_DECAY, b::adaptiveDecay);
-        return b.seed(EngineConfig.longProperty(p, PROP_SEED, b.seed))
-                .greedy(EngineConfig.booleanProperty(p, PROP_GREEDY, b.greedy))
+        WatermarkConfig watermark = WatermarkConfig.fromProperties(p);
+        if (watermark != null) {
+            b.watermark(watermark);
+        }
+        return b.seed(EngineProperties.longProperty(p, PROP_SEED, b.seed))
+                .greedy(EngineProperties.booleanProperty(p, PROP_GREEDY, b.greedy))
                 .build();
     }
 
@@ -238,15 +248,15 @@ public final class SamplerConfig {
 
     /** Passes the value of {@code key} to {@code setter} when the property is set (non-blank). */
     private static void floatProperty(Properties p, String key, FloatSetter setter) {
-        if (EngineConfig.stringProperty(p, key) != null) {
-            setter.set(EngineConfig.floatProperty(p, key, 0f));
+        if (EngineProperties.stringProperty(p, key) != null) {
+            setter.set(EngineProperties.floatProperty(p, key, 0f));
         }
     }
 
     /** Passes the value of {@code key} to {@code setter} when the property is set (non-blank). */
     private static void intProperty(Properties p, String key, IntSetter setter) {
-        if (EngineConfig.stringProperty(p, key) != null) {
-            setter.set(EngineConfig.intProperty(p, key, 0));
+        if (EngineProperties.stringProperty(p, key) != null) {
+            setter.set(EngineProperties.intProperty(p, key, 0));
         }
     }
 
@@ -299,6 +309,11 @@ public final class SamplerConfig {
     public float adaptiveTarget() { return adaptiveTarget; }
     /** adaptive-p's EMA decay ({@code --adaptive-decay}). */
     public float adaptiveDecay() { return adaptiveDecay; }
+    /**
+     * The watermark the chain applies instead of an ordinary categorical draw, or null when the chain draws
+     * normally. Greedy chains never watermark (temperature 0 has no distribution to shift).
+     */
+    public WatermarkConfig watermark() { return watermark; }
 
     /** The settings given explicitly (unmodifiable); a model's sampling defaults never replace them. */
     public Set<Setting> explicit() { return explicit; }
@@ -354,6 +369,7 @@ public final class SamplerConfig {
         b.dynatempExponent = dynatempExponent;
         b.adaptiveTarget = adaptiveTarget;
         b.adaptiveDecay = adaptiveDecay;
+        b.watermark = watermark;
         b.explicit.addAll(explicit);
         return b;
     }
@@ -428,7 +444,8 @@ public final class SamplerConfig {
         return "SamplerConfig{" + (isGreedy() ? "greedy, " : "temp=" + temperature + ", ") + "topK=" + topK
                 + ", topP=" + topP + ", minP=" + minP + ", typicalP=" + typicalP + ", repeat=" + repeatPenalty
                 + ", presence=" + presencePenalty + ", frequency=" + frequencyPenalty + ", lastN=" + penaltyLastN
-                + ", seed=" + (seeded() ? String.valueOf(seed) : "random") + '}';
+                + ", seed=" + (seeded() ? String.valueOf(seed) : "random")
+                + (watermark == null ? "" : ", watermark=" + watermark) + '}';
     }
 
     /**
@@ -465,6 +482,7 @@ public final class SamplerConfig {
         private float dynatempExponent = 1.0f;
         private float adaptiveTarget = -1.0f;
         private float adaptiveDecay = 0.90f;
+        private WatermarkConfig watermark;
         private final EnumSet<Setting> explicit = EnumSet.noneOf(Setting.class);
 
         private Builder() {
@@ -516,6 +534,12 @@ public final class SamplerConfig {
         public Builder adaptiveTarget(float v) { this.adaptiveTarget = v; return this; }
         /** adaptive-p's EMA decay ({@code neuralfree.adaptive.decay}). */
         public Builder adaptiveDecay(float v) { this.adaptiveDecay = v; return this; }
+
+        /**
+         * The watermark the chain applies instead of an ordinary categorical draw ({@code neuralfree.watermark.config});
+         * null draws normally.
+         */
+        public Builder watermark(WatermarkConfig v) { this.watermark = v; return this; }
 
         /** {@link #mirostat(int)} leaving {@link Setting#MIROSTAT} a fallback for a model's default. */
         public Builder fallbackMirostat(int v) { this.mirostat = v; return unmark(Setting.MIROSTAT); }

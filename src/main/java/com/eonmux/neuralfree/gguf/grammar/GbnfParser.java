@@ -29,13 +29,20 @@ import java.util.TreeMap;
  *   <li>token references {@code <[id]>} and inverse {@code !<[id]>} ({@code :578-589}), and the
  *       name form {@code <token>} / {@code !<token>}, which resolves through a {@link GrammarVocab}
  *       to the one token its text tokenizes to; without a vocabulary the parser rejects the name
- *       form, as llama.cpp does with a null vocab ({@code :214-232}).</li>
+ *       form, as llama.cpp does with a null vocab ({@code :214-232}); the id form also takes a
+ *       comma-separated set, {@code <[a],[b]>} (either id) and {@code !<[a],[b]>} (any token but
+ *       those), which {@link GbnfPrinter} writes for {@link GrammarElement.Type#TOKEN_ALT}, and the empty
+ *       negated set {@code !<>} matches any one token ({@link GrammarElement.Type#TOKEN_ANY});</li>
+ *   <li>xgrammar's rule attributes {@code name[max_tokens=n] ::= …}, {@code name[max_chars=n] ::= …} and both
+ *       at once ({@code name[max_tokens=n, max_chars=m]}): the rule's text consumes at most {@code n} tokens or
+ *       code points ({@link GrammarElement.Type#TOKEN_BUDGET}, {@link GrammarElement.Type#CHAR_BUDGET} ahead of
+ *       a reference to a synthesized {@code name_<id>} rule holding the alternates).</li>
  * </ul>
  *
  * <p>After parsing, the undefined-rule validation of {@code llama_grammar_parser::parse}
  * ({@code :700-718}) and the start-rule check of {@code llama_grammar_init_impl}
  * ({@code :1233-1237}) run; {@link Grammar} construction performs the left-recursion check
- * ({@code :963-1014}). Untrusted input (§3.6) is bounded by {@link GrammarLimits}; violations
+ * ({@code :963-1014}). Untrusted input is bounded by {@link GrammarLimits}; violations
  * throw {@link GrammarException} with the 1-based line and column of the offending grammar
  * text.</p>
  */
@@ -156,12 +163,26 @@ public final class GbnfParser {
         int afterName = parseSpace(nameEnd, false);
         String name = src.substring(nameStart, nameEnd);
         int ruleId = acquireSymbolId(name, nameStart, false);
+        List<GrammarElement> budgets = new ArrayList<>(2);
+        if (peek(afterName) == '[') {
+            afterName = parseSpace(parseBudgets(afterName, budgets), false);
+        }
         if (!(peek(afterName) == ':' && peek(afterName + 1) == ':' && peek(afterName + 2) == '=')) {
             throw error("expecting '::='", afterName);
         }
         ruleLocations.put(ruleId, location(nameStart));
         pos = parseSpace(afterName + 3, true);
-        pos = parseAlternates(pos, name, ruleId, false);
+        if (budgets.isEmpty()) {
+            pos = parseAlternates(pos, name, ruleId, false);
+        } else {
+            int bodyId = generateSymbolId(name, pos);
+            pos = parseAlternates(pos, name, bodyId, false);
+            budgets.add(new GrammarElement(GrammarElement.Type.RULE_REF, bodyId));
+            budgets.add(end());
+            elementCount += budgets.size();
+            checkElementLimit(pos);
+            addRule(ruleId, budgets, pos);
+        }
         if (peek(pos) == '\r') {
             pos += peek(pos + 1) == '\n' ? 2 : 1;
         } else if (peek(pos) == '\n') {
@@ -170,6 +191,50 @@ public final class GbnfParser {
             throw error("expecting newline or end", pos);
         }
         return parseSpace(pos, true);
+    }
+
+    /**
+     * The rule attributes {@code [max_tokens=n, max_chars=m]} from the {@code '['} at {@code pos} into
+     * {@code budgets}; returns the position after the {@code ']'}. Each key at most once, each value a
+     * non-negative int.
+     */
+    private int parseBudgets(int pos, List<GrammarElement> budgets) {
+        pos = parseSpace(pos + 1, false);
+        while (true) {
+            int keyEnd = pos;
+            while (keyEnd < src.length() && (isWordChar(src.charAt(keyEnd)) || src.charAt(keyEnd) == '_')) {
+                keyEnd++;
+            }
+            String key = src.substring(pos, keyEnd);
+            GrammarElement.Type type = "max_tokens".equals(key) ? GrammarElement.Type.TOKEN_BUDGET
+                    : "max_chars".equals(key) ? GrammarElement.Type.CHAR_BUDGET : null;
+            if (type == null) {
+                throw error("unknown rule attribute '" + key + "'; expecting max_tokens or max_chars", pos);
+            }
+            for (GrammarElement b : budgets) {
+                if (b.type() == type) {
+                    throw error("rule attribute '" + key + "' given twice", pos);
+                }
+            }
+            pos = parseSpace(keyEnd, false);
+            if (peek(pos) != '=') {
+                throw error("expecting '=' after rule attribute '" + key + "'", pos);
+            }
+            pos = parseSpace(pos + 1, false);
+            Span value = parseInt(pos);
+            if (value.value > Integer.MAX_VALUE) {
+                throw error("rule attribute '" + key + "' is larger than " + Integer.MAX_VALUE, pos);
+            }
+            budgets.add(new GrammarElement(type, (int) value.value));
+            pos = parseSpace(value.nextPos, false);
+            if (peek(pos) == ']') {
+                return pos + 1;
+            }
+            if (peek(pos) != ',') {
+                throw error("expecting ',' or ']' in rule attributes", pos);
+            }
+            pos = parseSpace(pos + 1, false);
+        }
     }
 
     /** {@code llama_grammar_parser::parse_alternates} ({@code llama-grammar.cpp:439-454}). */
@@ -287,18 +352,61 @@ public final class GbnfParser {
         return parseSpace(pos + 1, isNested);
     }
 
-    /** Token element {@code <[id]>} or {@code !<[id]>} ({@code llama-grammar.cpp:578-589}). */
+    /**
+     * Token element {@code <[id]>} or {@code !<[id]>} ({@code llama-grammar.cpp:578-589}), or a token set
+     * {@code <[a],[b]>} / {@code !<[a],[b]>} whose further ids follow as {@link GrammarElement.Type#TOKEN_ALT}.
+     */
     private int parseTokenElement(int pos, List<GrammarElement> rule, boolean isNested, Sequence seq) {
         GrammarElement.Type type = GrammarElement.Type.TOKEN;
         if (peek(pos) == '!') {
             type = GrammarElement.Type.TOKEN_NOT;
             pos++;
         }
-        Span span = parseToken(pos);
         seq.lastSymStart = rule.size();
         seq.nPrevRules = 1;
+        if (peek(pos) == '<' && peek(pos + 1) == '>') {
+            if (type != GrammarElement.Type.TOKEN_NOT) {
+                throw error("the empty token set <> matches no token; write !<> for any token", pos);
+            }
+            addElement(rule, new GrammarElement(GrammarElement.Type.TOKEN_ANY, 0), pos);
+            return parseSpace(pos + 2, isNested);
+        }
+        if (peek(pos) == '<' && peek(pos + 1) == '[') {
+            return parseSpace(parseTokenIds(pos, rule, type), isNested);
+        }
+        Span span = parseToken(pos);
         addElement(rule, new GrammarElement(type, (int) span.value), pos);
         return parseSpace(span.nextPos, isNested);
+    }
+
+    /** The id form {@code <[a]>} or {@code <[a],[b],...>}: the first id as {@code type}, the rest as alternates. */
+    private int parseTokenIds(int pos, List<GrammarElement> rule, GrammarElement.Type type) {
+        pos++; // '<'
+        GrammarElement.Type next = type;
+        while (true) {
+            if (peek(pos) != '[') {
+                throw error("expecting '['", pos);
+            }
+            Span id = parseInt(pos + 1);
+            if (id.value > 0xFFFFFFFFL) {
+                throw error("parsed token id is too big", pos + 1);
+            }
+            pos = id.nextPos;
+            if (peek(pos) != ']') {
+                throw error("expecting ']'", pos);
+            }
+            addElement(rule, new GrammarElement(next, (int) id.value), pos);
+            next = GrammarElement.Type.TOKEN_ALT;
+            pos++;
+            if (peek(pos) == ',') {
+                pos++;
+                continue;
+            }
+            if (peek(pos) != '>') {
+                throw error("expecting '>'", pos);
+            }
+            return pos + 1;
+        }
     }
 
     /** Grouping {@code (...)}; nested alternates live in a synthesized rule ({@code :597-610}). */

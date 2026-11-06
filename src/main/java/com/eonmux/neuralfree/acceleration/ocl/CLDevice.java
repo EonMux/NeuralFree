@@ -52,6 +52,8 @@ public class CLDevice implements HardwareDevice {
     cl_context deviceContext;
     cl_command_queue deviceCommandQueue;
     DataMap<String, Object> deviceInfo;
+    /** True once {@link #release()} dropped the queue and context references. */
+    private boolean released;
 
     public CLDevice(cl_device_id deviceID, cl_context context, cl_command_queue deviceCommandQueue) {
         this.deviceInfo = new DataMap<>();
@@ -66,12 +68,22 @@ public class CLDevice implements HardwareDevice {
 
     }
 
+    /**
+     * Drops the enumeration's references: its command queue, then its context. Idempotent, so a repeated shutdown
+     * never releases a context reference another holder owns. Objects created on the context (a backend's queues,
+     * buffers and programs) keep it alive until they are released themselves.
+     */
     @Override
-    public void release() {
-        //Release the command queue
-        clReleaseCommandQueue(this.deviceCommandQueue);
-        //Then the device context
-        clReleaseContext(this.deviceContext);
+    public synchronized void release() {
+        if (released) {
+            return;
+        }
+        released = true;
+        try {
+            clReleaseCommandQueue(this.deviceCommandQueue);
+        } finally {
+            clReleaseContext(this.deviceContext);
+        }
     }
 
     @Override

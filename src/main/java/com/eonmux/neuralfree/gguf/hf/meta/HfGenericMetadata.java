@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.hf.meta;
 
 import com.eonmux.neuralfree.gguf.hf.arch.HfLoadContext;
 import com.eonmux.neuralfree.gguf.hf.config.HfConfig;
+import com.eonmux.neuralfree.gguf.hf.config.HfDualChunk;
 import com.eonmux.neuralfree.gguf.hf.config.HfRope;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
@@ -28,8 +29,10 @@ import java.util.regex.Pattern;
  * <p>The RoPE rows follow the converter: the parameters are {@code rope_parameters.full_attention} or the whole
  * {@code rope_parameters} ({@link HfRope#global()}). {@code linear} with a factor writes type and factor; {@code yarn}
  * with a factor writes type, factor, the required original context length and the optional truncate, extrapolation
- * factor, attention factor and beta fast/slow; {@code su}/{@code longrope} writes the type only; {@code dynamic} and
- * {@code llama3} write nothing; any other type logs a warning. {@code rope_parameters.mrope_section} is padded with
+ * factor, attention factor and beta fast/slow; {@code su}/{@code longrope} writes the type only; {@code dynamic}
+ * writes the type with its factor or alpha and, when the parameters state one, the trained-length anchor
+ * ({@code max_trained_positions} or {@code original_max_position_embeddings}); {@code ntk} writes the type, its
+ * required factor and the optional {@code mixed_b}; {@code llama3} writes nothing; any other type logs a warning. {@code rope_parameters.mrope_section} is padded with
  * zeros to four sections. The {@code mirror} rows are {@code TextModel.__init__}'s alias normalization, which
  * {@link HfRope} performs when the configuration is loaded; their aliases are checked against {@link HfRope}'s.</p>
  *
@@ -52,7 +55,7 @@ public final class HfGenericMetadata {
 
     /** The scaling a RoPE type selects in {@code set_gguf_parameters}. */
     private enum RopeBranch {
-        NONE, LINEAR, YARN, LONGROPE
+        NONE, LINEAR, YARN, LONGROPE, DYNAMIC, NTK
     }
 
     /** The locals of {@code set_gguf_parameters}. Mutable, one per call. */
@@ -107,6 +110,7 @@ public final class HfGenericMetadata {
                     throw r.defect("unhandled rule head " + r.head());
             }
         }
+        HfDualChunk.of(st.cfg).ifPresent(dc -> dc.writeTo(kv));
     }
 
     // ------------------------------------------------------------------ locals and mirrors
@@ -152,7 +156,21 @@ public final class HfGenericMetadata {
         if ("su".equals(type) || "longrope".equals(type)) {
             return RopeBranch.LONGROPE;
         }
-        if (!"dynamic".equals(type) && !"llama3".equals(type.toLowerCase(Locale.ROOT))) {
+        if ("dynamic".equals(type)) {
+            if (!hasFactor && !st.ropeParams.alpha().isPresent()) {
+                throw new GgufFormatException(st.cfg.source() + ": rope_parameters: 'dynamic' rope scaling needs"
+                        + " an 'alpha' or a 'factor'");
+            }
+            return RopeBranch.DYNAMIC;
+        }
+        if ("ntk".equals(type)) {
+            if (!hasFactor) {
+                throw new GgufFormatException(st.cfg.source() + ": rope_parameters: 'ntk' rope scaling needs a"
+                        + " 'factor'");
+            }
+            return RopeBranch.NTK;
+        }
+        if (!"llama3".equals(type.toLowerCase(Locale.ROOT))) {
             LOG.warn("{}: unknown RoPE type: {}", st.cfg.architecture(), type);
         }
         return RopeBranch.NONE;
@@ -176,6 +194,9 @@ public final class HfGenericMetadata {
                 break;
             case "rope_parameters.original_max_position_embeddings":
                 expected = List.of("original_max_position_embeddings");
+                break;
+            case "rope_parameters.max_trained_positions":
+                expected = HfRope.MAX_TRAINED_ALIASES;
                 break;
             default:
                 throw r.defect("unhandled mirror '" + r.target() + "'");
@@ -366,6 +387,8 @@ public final class HfGenericMetadata {
             case "yarn": return RopeBranch.YARN;
             case "su":
             case "longrope": return RopeBranch.LONGROPE;
+            case "dynamic": return RopeBranch.DYNAMIC;
+            case "ntk": return RopeBranch.NTK;
             default: throw r.defect("unhandled RoPE type literal '" + literal + "'");
         }
     }

@@ -183,4 +183,85 @@ public class HfRopeTest {
         assertEquals(2.0, r.theta().getAsDouble(), 0);
         assertEquals("linear", r.global().type().get());
     }
+
+    @Test
+    public void dualChunkAttentionConfigIsReadByHfDualChunk() {
+        HfConfig cfg = HfConfigLoader.fromJson(Path.of("."), ("{'architectures':['A'],"
+                + "'dual_chunk_attention_config':{'chunk_size':4096,'local_size':512,"
+                + "'original_max_position_embeddings':32768}}").replace('\'', '"'));
+        HfDualChunk dc = HfDualChunk.of(cfg).get();
+        assertEquals(4096, dc.chunkSize());
+        assertEquals(512, dc.localSize());
+        assertEquals(32768, dc.originalMaxPositionEmbeddings());
+        // the rope path itself no longer refuses the block
+        assertFalse(HfDualChunk.of(HfConfigLoader.fromJson(Path.of("."),
+                "{\"architectures\":[\"A\"],\"dual_chunk_attention_config\":null}")).isPresent());
+        // the sparse forms are refused by name; an explicit false is accepted
+        GgufFormatException enabled = assertThrows(GgufFormatException.class, () -> HfDualChunk.of(
+                HfConfigLoader.fromJson(Path.of("."),
+                        "{\"architectures\":[\"A\"],\"dual_chunk_attention_config\":{\"sparse_attention_enabled\":true}}")));
+        assertTrue(enabled.getMessage(), enabled.getMessage().contains("sparse_attention_enabled"));
+        GgufFormatException config = assertThrows(GgufFormatException.class, () -> HfDualChunk.of(
+                HfConfigLoader.fromJson(Path.of("."),
+                        "{\"architectures\":[\"A\"],\"dual_chunk_attention_config\":{\"sparse_attention_config\":{\"0\":[]}}}")));
+        assertTrue(config.getMessage(), config.getMessage().contains("sparse_attention_config"));
+        GgufFormatException type = assertThrows(GgufFormatException.class, () -> HfDualChunk.of(
+                HfConfigLoader.fromJson(Path.of("."),
+                        "{\"architectures\":[\"A\"],\"dual_chunk_attention_config\":"
+                                + "{\"sparse_attention_enabled\":\"true\"}}")));
+        assertTrue(type.getMessage(), type.getMessage().contains("sparse_attention_enabled"));
+        assertEquals(8192, HfDualChunk.of(HfConfigLoader.fromJson(Path.of("."),
+                "{\"architectures\":[\"A\"],\"dual_chunk_attention_config\":{\"sparse_attention_enabled\":false}}")).get().chunkSize());
+    }
+
+    private static HfRope ropeOf(String architecture, String members) {
+        return HfConfigLoader.fromJson(Path.of("."), ("{'architectures':['" + architecture + "']," + members + "}")
+                .replace('\'', '"')).rope();
+    }
+
+    /** The Fourier position embedding belongs to InternS1-Pro alone; every other architecture is refused by name. */
+    @Test
+    public void fourierPositionEmbeddingIsRefusedByName() {
+        for (String member : List.of("'use_fope':true", "'fope_sep_head':true", "'num_inv_freq':8",
+                "'fope_init_factor':0.1")) {
+            GgufFormatException e = assertThrows(member, GgufFormatException.class,
+                    () -> rope("'rope_scaling':{" + member + "}"));
+            assertTrue(e.getMessage(), e.getMessage().contains(member.split("'")[1]));
+        }
+        GgufFormatException nested = assertThrows(GgufFormatException.class,
+                () -> rope("'rope_parameters':{'full_attention':{'use_fope':true}}"));
+        assertTrue(nested.getMessage(), nested.getMessage().contains("rope_parameters.full_attention.use_fope"));
+    }
+
+    @Test
+    public void internS1ProAcceptsTheFourierPositionEmbedding() {
+        HfRope r = ropeOf("InternS1ProForConditionalGeneration",
+                "'rope_parameters':{'rope_type':'default','fope_init_factor':0.1,'fope_sep_head':true,"
+                        + "'num_inv_freq':16}");
+        assertTrue(r.global().useFope());
+        assertTrue(r.global().fopeSepHead().get());
+        assertEquals(16, r.global().fopeNumInvFreq().getAsInt());
+        assertEquals(0.1, r.global().fopeInitFactor().getAsDouble(), 0);
+        assertFalse(ropeOf("InternS1ProForConditionalGeneration", "'rope_parameters':{'rope_theta':1.0}")
+                .global().useFope());
+        // an explicit false is honoured, but a tuning key still selects the embedding, as vLLM's any() does
+        assertFalse(ropeOf("InternS1ProForConditionalGeneration", "'rope_parameters':{'use_fope':false}")
+                .global().useFope());
+        assertTrue(ropeOf("InternS1ProForConditionalGeneration",
+                "'rope_parameters':{'use_fope':false,'num_inv_freq':8}").global().useFope());
+        assertThrows(GgufFormatException.class, () -> ropeOf("InternS1ProForConditionalGeneration",
+                "'rope_parameters':{'use_fope':'yes'}").global().useFope());
+        // zero frequencies is vLLM's empty projection; the GGUF key reads 0 as "keep every fast frequency"
+        GgufFormatException zero = assertThrows(GgufFormatException.class,
+                () -> ropeOf("InternS1ProForConditionalGeneration",
+                        "'rope_parameters':{'use_fope':true,'num_inv_freq':0}").global().fopeNumInvFreq());
+        assertTrue(zero.getMessage(), zero.getMessage().contains("num_inv_freq"));
+    }
+
+    @Test
+    public void mixedBIsTyped() {
+        HfRope r = rope("'rope_scaling':{'rope_type':'ntk','factor':4.0,'mixed_b':0.25}");
+        assertEquals(0.25, r.global().mixedB().getAsDouble(), 0);
+        assertFalse(rope("'rope_scaling':{'rope_type':'ntk','factor':4.0}").global().mixedB().isPresent());
+    }
 }

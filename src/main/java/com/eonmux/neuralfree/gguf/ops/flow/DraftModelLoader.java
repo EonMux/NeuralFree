@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.engine.DraftModel;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
@@ -25,7 +26,8 @@ import java.util.Objects;
  *   <li>{@link #nextn(EngineModel, ModelSpec, MtpHead, Options)}: the NextN/MTP blocks of an MTP draft file of the
  *       target's model, with or without its trunk;</li>
  *   <li>{@link #fromFile}: a separate drafter model, dispatched on its architecture: eagle3
- *       ({@link Eagle3DraftModel}) and gemma4-assistant ({@link Gemma4AssistantDraftModel}).</li>
+ *       ({@link Eagle3DraftModel}), eagle ({@link Eagle1DraftModel}) and gemma4-assistant
+ *       ({@link Gemma4AssistantDraftModel}).</li>
  * </ul>
  * The caller supplies the {@link MtpHead} over the target's runtime ({@link MtpHead#gpu} or {@link MtpHead#cpu}),
  * carrying the drafter file's weights when there is one. The returned drafter is bound
@@ -33,7 +35,8 @@ import java.util.Objects;
  * target's hidden-state tap. When building fails, the head is closed before the exception propagates.
  *
  * <p>Also holds what every drafter shares: {@link Options}, the {@link TargetFeed} that collects the target's hidden
- * rows of each forward call, and the greedy draft pick ({@link #pick}).
+ * rows of each forward call on the host (a NextN drafter whose head shares the target's device keeps them there with
+ * a {@link TargetDeviceFeed} instead), and the greedy draft pick ({@link #pick}).
  */
 public final class DraftModelLoader {
 
@@ -127,7 +130,8 @@ public final class DraftModelLoader {
     /**
      * The drafter of a separate model file whose spec is {@code draft}.
      *
-     * @param memory memory settings for a drafter with caches of its own (eagle3); its context is the target's
+     * @param memory memory settings for a drafter with caches of its own (eagle3, eagle); its context is the
+     *               target's
      * @throws IllegalArgumentException      when the head does not run {@code target}, or the drafter is
      *                                       incompatible with it
      * @throws UnsupportedOperationException for a drafter architecture this loader does not build (dflash has its
@@ -154,6 +158,12 @@ public final class DraftModelLoader {
         if (arch == Arch.EAGLE3) {
             return new Eagle3DraftModel(head, draft, memory, options);
         }
+        if (arch == Arch.EAGLE) {
+            return new Eagle1DraftModel(head, draft, memory, options);
+        }
+        if (EagleFcDraftModel.isConcatFc(arch)) {
+            return new EagleFcDraftModel(head, draft, memory, options);
+        }
         if (arch == Arch.GEMMA4_ASSISTANT) {
             return new Gemma4AssistantDraftModel(head, draft, options);
         }
@@ -161,7 +171,8 @@ public final class DraftModelLoader {
             throw new UnsupportedOperationException("dflash drafts by block diffusion; it has its own drafter");
         }
         throw new UnsupportedOperationException(arch.ggufName() + " is not a draft model this loader builds"
-                + " (eagle3, gemma4-assistant)");
+                + " (eagle3, eagle, eagle-mistral-large3, eagle-llama4, eagle-minicpm, eagle-cohere,"
+                + " gemma4-assistant)");
     }
 
     private static void checkHead(EngineModel target, MtpHead head) {
@@ -195,15 +206,25 @@ public final class DraftModelLoader {
         public final int id;
         /** Its softmax probability over the top {@value #DRAFT_TOP_K} logits. */
         public final float p;
+        /**
+         * The distribution the token was drawn from when a draft watermark replaced the greedy pick, over the row's
+         * vocabulary; null for a greedy pick, whose proposal is one-hot.
+         */
+        public final float[] proposal;
 
         Pick(int id, float p) {
+            this(id, p, null);
+        }
+
+        Pick(int id, float p, float[] proposal) {
             this.id = id;
             this.p = p;
+            this.proposal = proposal;
         }
 
         @Override
         public String toString() {
-            return "Pick{" + id + ", p=" + p + '}';
+            return "Pick{" + id + ", p=" + p + (proposal == null ? "" : ", proposal") + '}';
         }
     }
 
@@ -237,6 +258,87 @@ public final class DraftModelLoader {
             sum += Math.exp((double) val[j] - val[0]);
         }
         return new Pick(top[0], (float) (1.0 / sum));
+    }
+
+    /**
+     * The draft token of a device top-k readback's {@code row}: the same greedy id and top-k probability as
+     * {@link #pick(float[], int)}, taken over the row's candidates in rank order instead of the whole vocabulary,
+     * so a drafter whose device selects its candidates reads {@value #DRAFT_TOP_K} values back per step instead of
+     * the full row. The readback ranks ties the way the host scan does (larger logit first, the lower id first),
+     * and candidates beyond the row's finite logits contribute nothing to the probability, as their skipped
+     * counterparts do not.
+     *
+     * @throws IllegalStateException when the row holds no finite candidate
+     */
+    public static Pick pick(RowTopK top, int row) {
+        float best = top.logit(row, 0);
+        if (Float.isNaN(best) || best == Float.NEGATIVE_INFINITY) {
+            throw new IllegalStateException("draft logits hold no finite value");
+        }
+        double sum = 0;
+        for (int j = 0; j < top.k(); j++) {
+            float v = top.logit(row, j);
+            if (Float.isNaN(v) || v == Float.NEGATIVE_INFINITY) {
+                continue;
+            }
+            sum += Math.exp((double) v - best);
+        }
+        return new Pick(top.id(row, 0), (float) (1.0 / sum));
+    }
+
+    /**
+     * A draft-vocabulary row scattered to the target vocabulary through {@code d2t}, every other target id
+     * {@code -inf} (vLLM's EAGLE {@code compute_logits}): the row a draft watermark draws from, so the keyed
+     * candidate ids are the target ids the detector scores.
+     *
+     * @throws IllegalArgumentException when {@code d2t} does not cover {@code count} entries
+     */
+    public static float[] scatter(float[] logits, int count, int[] d2t) {
+        Objects.requireNonNull(logits, "logits");
+        Objects.requireNonNull(d2t, "d2t");
+        if (count > d2t.length) {
+            throw new IllegalArgumentException("cannot scatter " + count + " logits through " + d2t.length
+                    + " draft ids");
+        }
+        int targetVocab = targetVocab(d2t);
+        float[] full = new float[targetVocab];
+        java.util.Arrays.fill(full, Float.NEGATIVE_INFINITY);
+        for (int i = 0; i < count; i++) {
+            if (d2t[i] >= 0) {
+                full[d2t[i]] = logits[i];
+            }
+        }
+        return full;
+    }
+
+    /** The target vocabulary size a {@code d2t} mapping covers: one past its largest target id. */
+    public static int targetVocab(int[] d2t) {
+        int targetVocab = 0;
+        for (int id : d2t) {
+            targetVocab = Math.max(targetVocab, id + 1);
+        }
+        return targetVocab;
+    }
+
+    /**
+     * The draft token of {@code logits[0 .. n)} under a draft watermark: the keyed Gumbel-max selection of
+     * {@link com.eonmux.neuralfree.gguf.engine.watermark.DraftWatermarker}, or the ordinary greedy pick when the
+     * watermarker is null. A keyed draw's {@link Pick#proposal} is the temperature-scaled distribution it was drawn
+     * from, so rejection sampling keeps its exact ratio and residual.
+     *
+     * @param temperature the request's sampling temperature, positive
+     * @param uniforms    the ordinary draws of a repeated context (one per draw), and the routing stream of a
+     *                    single-key draw (which reads none)
+     */
+    public static Pick pick(float[] logits, int n,
+                            com.eonmux.neuralfree.gguf.engine.watermark.DraftWatermarker watermark,
+                            float temperature, java.util.function.DoubleSupplier uniforms) {
+        if (watermark == null) {
+            return pick(logits, n);
+        }
+        com.eonmux.neuralfree.gguf.engine.watermark.DraftWatermarker.Draw draw =
+                watermark.draw(logits, n, temperature, uniforms);
+        return new Pick(draw.token(), draw.topProbability(), draw.proposal());
     }
 
     /** Places (id, v) at or before slot {@code last}, keeping {@code val} descending. */

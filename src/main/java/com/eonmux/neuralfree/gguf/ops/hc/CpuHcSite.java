@@ -42,6 +42,8 @@ public final class CpuHcSite {
     private final CpuTensorRef down;
     private final CpuTensorRef up;
     private final CpuTensorRef inject;
+    /** Merged {@code [down | inject]} weight; null unless the merged gated form. */
+    private final CpuTensorRef downInject;
 
     private final float[] flat;
     private final float[] mixes;
@@ -49,6 +51,8 @@ public final class CpuHcSite {
     private final float[] post;
     private final float[] comb;
     private final float[] lowRank;
+    /** Merged {@code [down | inject]} output rows before the split; null unless the merged gated form. */
+    private final float[] merged;
     private final float[] gate;
 
     /**
@@ -74,9 +78,10 @@ public final class CpuHcSite {
         this.base = kind.projected() ? vector(weights, arch, il, block.base(), block.coefficients().baseCount())
                 : null;
         this.norm = kind.gated() ? vector(weights, arch, il, block.norm(), hc * nEmbd) : null;
-        this.down = kind.gated() ? tensor(weights, arch, il, block.down()) : null;
+        this.down = block.down() != null ? tensor(weights, arch, il, block.down()) : null;
         this.up = kind.gated() ? tensor(weights, arch, il, block.up()) : null;
         this.inject = block.inject() != null ? tensor(weights, arch, il, block.inject()) : null;
+        this.downInject = block.downInject() != null ? tensor(weights, arch, il, block.downInject()) : null;
 
         boolean hasComb = block.post() != null && block.post().hasComb();
         this.flat = kind.projected() || kind.gated() ? scratch.temp(HcSubBlock.TEMP_FLAT, rows(streamWidth)) : null;
@@ -85,11 +90,53 @@ public final class CpuHcSite {
         this.post = kind.expands() ? scratch.temp(HcSubBlock.TEMP_POST, rows(hc)) : null;
         this.comb = hasComb ? scratch.temp(HcSubBlock.TEMP_COMB, rows(hc * hc)) : null;
         this.lowRank = kind.gated() ? scratch.temp(HcSubBlock.TEMP_LOW_RANK, rows(block.lowRank())) : null;
+        this.merged = downInject != null
+                ? scratch.temp(HcSubBlock.TEMP_MERGED_DOWN, rows(block.lowRank() + hc)) : null;
         this.gate = kind.gated() ? scratch.temp(HcSubBlock.TEMP_GATE, rows(streamWidth)) : null;
     }
 
     public HcSubBlock block() {
         return block;
+    }
+
+    /**
+     * Computes the pre, post and comb coefficients of the last {@code nTokens} stream rows without collapsing them
+     * ({@code LLM_HC_PrePostComb}); {@link #collapseWithPre} then collapses with the pre values.
+     *
+     * @throws IllegalStateException    when the site is not projected (the gated and mean variants have no mixes)
+     * @throws IllegalArgumentException when {@code nTokens} is outside {@code [1, ubatch]}
+     */
+    public void computeCoefficients(int nTokens, float[] stream, int streamOff) {
+        if (!block.kind().projected()) {
+            throw new IllegalStateException("hyper-connection " + block + " projects no mixes");
+        }
+        checkTokens(nTokens);
+        CpuOps.norm(NormKind.RMS, block.normEps(), stream, streamOff, flat, 0, nTokens, streamWidth, null, null);
+        matVec.matmul(fn, flat, 0, mixes, 0, nTokens);
+        final CoefficientParams coef = block.coefficients();
+        CpuParallel.parallelFor(nTokens, TOKEN_GRAIN, (from, to) -> CpuHyperConnections.coefficients(coef, from, to,
+                mixes, 0, scale, base, pre, 0, post, 0, comb, 0));
+    }
+
+    /**
+     * Collapses {@code nTokens} stream rows with pre coefficients {@code preValues[preOff ..]}, as a mix computed by
+     * {@link #computeCoefficients} on another sub-block would.
+     *
+     * @throws IllegalArgumentException when {@code nTokens} is outside {@code [1, ubatch]}
+     */
+    public void collapseWithPre(int nTokens, float[] stream, int streamOff, float[] preValues, int preOff,
+                                float[] out, int outOff) {
+        checkTokens(nTokens);
+        CpuHyperConnections.requireLength("pre", preValues, (long) preOff + (long) nTokens * hc);
+        CpuHyperConnections.pre(block.pre(), hc, nEmbd, nTokens, stream, streamOff, preValues, preOff, out, outOff);
+    }
+
+    /** The pre coefficients of the last collapse or {@link #computeCoefficients}. */
+    public float[] preCoefficients() {
+        if (pre == null) {
+            throw new IllegalStateException("hyper-connection " + block + " has no pre coefficients");
+        }
+        return pre;
     }
 
     /**
@@ -111,11 +158,15 @@ public final class CpuHcSite {
             CpuHyperConnections.pre(block.pre(), hc, nEmbd, nTokens, stream, streamOff, pre, 0, out, outOff);
         } else if (kind.gated()) {
             groupedNorm(nTokens, stream, streamOff);
-            int n = nTokens * block.lowRank();
-            matVec.matmul(down, flat, 0, lowRank, 0, nTokens);
-            CpuOps.scale(lowRank, 0, n, block.lowRankScale());
-            CpuOps.unary(ActOp.SILU, ActParams.NONE, lowRank, 0, lowRank, 0, n);
-            matVec.matmul(up, lowRank, 0, gate, 0, nTokens);
+            if (downInject != null) {
+                mergedGate(nTokens);
+            } else {
+                int n = nTokens * block.lowRank();
+                matVec.matmul(down, flat, 0, lowRank, 0, nTokens);
+                CpuOps.scale(lowRank, 0, n, block.lowRankScale());
+                CpuOps.unary(ActOp.SILU, ActParams.NONE, lowRank, 0, lowRank, 0, n);
+                matVec.matmul(up, lowRank, 0, gate, 0, nTokens);
+            }
             CpuHyperConnections.pre(block.pre(), hc, nEmbd, nTokens, flat, 0, gate, 0, out, outOff);
             if (inject != null) {
                 matVec.matmul(inject, flat, 0, post, 0, nTokens);
@@ -123,6 +174,26 @@ public final class CpuHcSite {
         } else {
             CpuHyperConnections.pre(block.pre(), hc, nEmbd, nTokens, stream, streamOff, null, 0, out, outOff);
         }
+    }
+
+    /**
+     * The merged qwen4exp gated mix (qwen4exp.cpp:363-380): one matmul with the {@code [hc_*_down |
+     * hc_*_inject]} weight, the {@code 1/hc} scale of the whole output before the split, SiLU on the low-rank
+     * rows, then the up projection; the inject rows land in {@code post} pre-scaled, so the post map skips the
+     * scale ({@code PostParams#gatedInjectPreScaled}).
+     */
+    private void mergedGate(int nTokens) {
+        int rank = block.lowRank();
+        int rowW = rank + hc;
+        matVec.matmul(downInject, flat, 0, merged, 0, nTokens);
+        CpuOps.scale(merged, 0, nTokens * rowW, block.lowRankScale());
+        for (int t = 0; t < nTokens; t++) {
+            int s = t * rowW;
+            System.arraycopy(merged, s + rank, post, t * hc, hc);
+            System.arraycopy(merged, s, lowRank, t * rank, rank);
+        }
+        CpuOps.unary(ActOp.SILU, ActParams.NONE, lowRank, 0, lowRank, 0, nTokens * rank);
+        matVec.matmul(up, lowRank, 0, gate, 0, nTokens);
     }
 
     /**

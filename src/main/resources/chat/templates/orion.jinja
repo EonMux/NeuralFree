@@ -1,0 +1,17 @@
+{#- llama.cpp orion chat template (src/llama-chat.cpp:401-420): system text joins the next user turn; no generation prompt. -#}
+{%- set ns = namespace(system_prompt='') -%}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {%- set ns.system_prompt = ns.system_prompt ~ content -%}
+    {%- elif message['role'] == 'user' -%}
+        {{- 'Human: ' -}}
+        {%- if ns.system_prompt != '' -%}
+            {{- ns.system_prompt ~ '\n\n' -}}
+            {%- set ns.system_prompt = '' -%}
+        {%- endif -%}
+        {{- content ~ '\n\nAssistant: </s>' -}}
+    {%- else -%}
+        {{- content ~ '</s>' -}}
+    {%- endif -%}
+{%- endfor -%}

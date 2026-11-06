@@ -7,11 +7,14 @@ import java.util.regex.Pattern
 
 /** Kernel manifest, source assembly and kernel-signature scanning of preprocessed dual-dialect sources. */
 class GpuKernelSources {
-    static final int MAX_BUFFERS = 12
+    /** Widest kernel: LLM_FlashAttnPaged_Mixed / LLM_FlashDecodePaged_* take 13 buffers (the tree mask is the 13th). */
+    static final int MAX_BUFFERS = 13
     /** Widest kernel as of MS-4: LLM_FlashAttnPaged_Mixed takes 34 scalars (31 + page_shift/pt_off + kv_types). */
     static final int MAX_SCALARS = 36
     /** Manifest tag of an OpenCL-only source. */
     static final String OPENCL_TAG = '[opencl]'
+    /** Manifest tag of a CUDA-only source. */
+    static final String CUDA_TAG = '[cuda]'
     /** Manifest tag of a header resolved against the shared root (KernelManifest.SHARED_TAG). */
     static final String SHARED_TAG = '[shared]'
 
@@ -28,8 +31,9 @@ class GpuKernelSources {
                                                              'float': 'f']
 
     /**
-     * Reads root/manifest.txt: ordered entries [path, openClOnly, shared, file]. "[opencl] <path>" is an
-     * OpenCL-only source under root; "[shared] <path>" is a header under sharedRoot (KernelManifest.SHARED_ROOT),
+     * Reads root/manifest.txt: ordered entries [path, openClOnly, cudaOnly, shared, file]. "[opencl] <path>" is an
+     * OpenCL-only source under root, "[cuda] <path>" a CUDA-only source (the OpenCL program excludes it; its
+     * kernels live only in the CUDA fatbins), "[shared] <path>" is a header under sharedRoot (KernelManifest.SHARED_ROOT),
      * and every shared entry precedes the library's own entries, so manifest order puts shared headers first in
      * every assembled program and CUDA unit. path is the #line label; file is the resolved source. Every listed
      * file must exist, and a path may be listed once whatever its tag.
@@ -49,16 +53,27 @@ class GpuKernelSources {
             }
             String where = "${mf}:${i + 1}"
             boolean openClOnly = false
+            boolean cudaOnly = false
             boolean shared = false
-            if (line.startsWith(OPENCL_TAG)) {
-                openClOnly = true
-                line = line.substring(OPENCL_TAG.length()).trim()
-            } else if (line.startsWith(SHARED_TAG)) {
-                shared = true
-                line = line.substring(SHARED_TAG.length()).trim()
+            for (;;) {
+                if (line.startsWith(OPENCL_TAG)) {
+                    openClOnly = true
+                    line = line.substring(OPENCL_TAG.length()).trim()
+                } else if (line.startsWith(CUDA_TAG)) {
+                    cudaOnly = true
+                    line = line.substring(CUDA_TAG.length()).trim()
+                } else if (line.startsWith(SHARED_TAG)) {
+                    shared = true
+                    line = line.substring(SHARED_TAG.length()).trim()
+                } else {
+                    break
+                }
+            }
+            if (openClOnly && cudaOnly) {
+                throw new GradleException("${where}: '${raw}': ${OPENCL_TAG} and ${CUDA_TAG} are mutually exclusive")
             }
             if (line.startsWith('[')) {
-                throw new GradleException("${where}: unknown or repeated tag in '${raw}'; an entry carries at most one of ${OPENCL_TAG} and ${SHARED_TAG}")
+                throw new GradleException("${where}: unknown or repeated tag in '${raw}'; an entry carries at most one of ${OPENCL_TAG}, ${CUDA_TAG} and ${SHARED_TAG}")
             }
             File base = shared ? sharedRoot : root
             if (line.isEmpty() || line.startsWith('/') || line.contains('..') || line.contains('\\')) {
@@ -84,7 +99,7 @@ class GpuKernelSources {
             if (!file.isFile()) {
                 throw new GradleException("${where}: ${file} does not exist")
             }
-            entries.add([path: line, openClOnly: openClOnly, shared: shared, file: file])
+            entries.add([path: line, openClOnly: openClOnly, cudaOnly: cudaOnly, shared: shared, file: file])
         }
         return entries
     }

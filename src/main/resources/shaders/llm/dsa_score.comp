@@ -6,7 +6,7 @@
  * indexer cache, which follows the context's type_k (llama-kv-cache-dsa.cpp:51).
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
- *   (i n_tokens, i n_kv, i n_idx_heads, i idx_dim, i causal, i swa_type, i n_swa,
+ *   (i n_tokens, i n_kv, i n_idx_heads, i idx_dim, i causal, i swa_type, i n_swa, i key_stride, i key_off,
  *    R float iq, R float w, R <KV> ik_cache, R int q_pos, R int kv_pos, W float scores)
  *     scores[t*n_kv + s] = sum_h max(iq[t][h] . ik[s], 0) * w[t][h] when row s is visible to token t,
  *                        = -INF otherwise
@@ -48,6 +48,8 @@ layout(push_constant) uniform NfDsaParams {
     int causal;
     int swa_type;
     int n_swa;
+    int key_stride;
+    int key_off;
 } pc;
 
 shared float nf_dsa_qs[NF_DSA_QSTAGE];
@@ -103,7 +105,7 @@ void main() {
     if (s < n_kv) {
         vis = nf_dsa_visible(kv_pos[s], q_pos[t]);
     }
-    const uint krow = (vis ? s : 0u) * idx_dim;
+    const uint krow = (vis ? s : 0u) * uint(pc.key_stride) + uint(pc.key_off);
     const uint qbase = t * n_heads * idx_dim;
     const uint wbase = t * n_heads;
     const uint hs = min(uint(NF_DSA_WSTAGE), uint(NF_DSA_QSTAGE) / idx_dim);

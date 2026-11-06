@@ -108,7 +108,20 @@ final class MoeExpertWeights {
      * the latent width of a latent MoE).
      */
     static MoeExpertWeights routed(MoeSpec spec, int dim) {
-        return new MoeExpertWeights(Set.ROUTED, spec.nExpert(), spec.nFfExp(), dim, dim, spec.gated(),
+        return routed(spec, dim, spec.nExpert());
+    }
+
+    /**
+     * The routed experts of a layer whose bank holds {@code nExpert} physical slots: the model's logical experts
+     * when the experts are not replicated, or the layer's physical slots (logical experts plus redundant replicas)
+     * when EPLB packs them. The spec's router width stays the logical expert count.
+     */
+    static MoeExpertWeights routed(MoeSpec spec, int dim, int nExpert) {
+        if (nExpert < spec.nExpert()) {
+            throw new IllegalArgumentException("the expert bank holds " + nExpert + " slot(s), the model has "
+                    + spec.nExpert() + " logical expert(s)");
+        }
+        return new MoeExpertWeights(Set.ROUTED, nExpert, spec.nFfExp(), dim, dim, spec.gated(),
                 spec.fusedGateUp(), spec.glu(), spec.act(), spec.params(), spec.expertScales(), spec.expertBiases());
     }
 
@@ -249,6 +262,29 @@ final class MoeExpertWeights {
 
         boolean hasBiases() {
             return gateBias != null || upBias != null || gateUpBias != null || downBias != null;
+        }
+
+        /**
+         * True when the shards cover every expert of the set: this device computes every routed pair itself. False
+         * under expert parallel, where a rank holds only its own whole experts and the pairs of the other ranks'
+         * experts contribute zero before the group all-reduce.
+         */
+        boolean coversEveryExpert() {
+            List<Shard> shards = downShards != null ? downShards : gateUpShards != null ? gateUpShards : gateShards;
+            if (shards == null) {
+                return true;
+            }
+            boolean[] seen = new boolean[plan.nExpert];
+            int covered = 0;
+            for (Shard s : shards) {
+                for (int e = s.expertBase; e < s.expertBase + s.expertCount; e++) {
+                    if (e >= 0 && e < seen.length && !seen[e]) {
+                        seen[e] = true;
+                        covered++;
+                    }
+                }
+            }
+            return covered == plan.nExpert;
         }
     }
 

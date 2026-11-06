@@ -91,7 +91,9 @@ public final class QkvLayouts {
     /**
      * Qwen3-Next {@code in_proj_qkvz} (LC/conversion/qwen.py:414-442): rows grouped per key head as
      * {@code [q (hk), k (hk), v (g*hv), z (g*hv)]} with {@code g = nVHeads / nKHeads}, regrouped to the fused
-     * {@code attn_qkv} rows {@code [all q; all k; all v]} and the {@code attn_gate} rows (all z).
+     * {@code attn_qkv} rows {@code [all q; all k; all v]} and the {@code attn_gate} rows (all z). Both parts keep
+     * their stored rows traceable ({@link RowTransforms#storedSource}): vLLM quantizes the fused weight in its
+     * stored, per-key-head order.
      *
      * @return {@code {qkv, z}}
      * @throws IllegalArgumentException when dim 0 does not hold the heads
@@ -110,7 +112,7 @@ public final class QkvLayouts {
                     + " key-head groups of " + w);
         }
         long qAll = nKHeads * hk;
-        RowSource qkv = part(src, "qkv", 2 * qAll + nKHeads * gv, e -> {
+        RowSource qkv = RowTransforms.reorderDim0(src, "qkv part", 2 * qAll + nKHeads * gv, e -> {
             if (e < qAll) {
                 return e / hk * w + e % hk;
             }
@@ -121,7 +123,7 @@ public final class QkvLayouts {
             long f = e - 2 * qAll;
             return f / gv * w + 2 * hk + f % gv;
         });
-        RowSource z = part(src, "z", nKHeads * gv, e -> e / gv * w + 2 * hk + gv + e % gv);
+        RowSource z = RowTransforms.reorderDim0(src, "z part", nKHeads * gv, e -> e / gv * w + 2 * hk + gv + e % gv);
         return new RowSource[]{qkv, z};
     }
 

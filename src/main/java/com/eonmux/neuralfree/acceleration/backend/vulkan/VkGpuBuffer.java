@@ -1,6 +1,11 @@
 package com.eonmux.neuralfree.acceleration.backend.vulkan;
 
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
+import org.lwjgl.system.MemoryUtil;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import static org.lwjgl.vulkan.VK10.VK_NULL_HANDLE;
 
@@ -13,8 +18,11 @@ import static org.lwjgl.vulkan.VK10.VK_NULL_HANDLE;
  * becomes unusable at once, and the allocator destroys the {@code VkBuffer} and takes the memory back
  * when the device work recorded before the close has completed. It has no effect once the allocator
  * itself is closed.</p>
+ *
+ * <p>A buffer whose allocation is host-visible is also a {@link HostMappedBuffer}: its mapping is
+ * the allocation's persistent one, and a kernel reads it in place.</p>
  */
-public final class VkGpuBuffer implements GpuBuffer {
+public final class VkGpuBuffer implements GpuBuffer, HostMappedBuffer {
 
     private final VkMemoryAllocator owner;
     private final long vkBuffer;
@@ -114,6 +122,38 @@ public final class VkGpuBuffer implements GpuBuffer {
     /** True when the buffer is persistently mapped. */
     public boolean isHostVisible() {
         return allocation.hostPtr() != 0;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws IllegalStateException when the buffer is not host-visible or is closed
+     */
+    @Override
+    public ByteBuffer hostView(long offset, int length) {
+        if (length < 0) {
+            throw new IllegalArgumentException("host view length must not be negative, got " + length);
+        }
+        if (offset < 0 || length > size - offset) {
+            throw new IllegalArgumentException("host view [" + offset + ", " + (offset + length)
+                    + ") is outside the buffer of " + size + " bytes");
+        }
+        if (!isHostVisible()) {
+            throw new IllegalStateException("Vulkan buffer " + this + " is not host-visible");
+        }
+        if (closed) {
+            throw new IllegalStateException("Vulkan buffer " + this + " is closed");
+        }
+        return MemoryUtil.memByteBuffer(hostPtr() + offset, length).order(ByteOrder.LITTLE_ENDIAN);
+    }
+
+    /** Makes host writes to the whole buffer visible to the device; no-op for coherent memory. */
+    @Override
+    public void flush() {
+        if (!isHostVisible()) {
+            throw new IllegalStateException("Vulkan buffer " + this + " is not host-visible");
+        }
+        owner.flush(this, 0, size);
     }
 
     /** True when host writes and device writes are visible without explicit flush or invalidate. */

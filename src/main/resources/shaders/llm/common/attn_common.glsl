@@ -9,8 +9,8 @@
  * binding and defines
  *     vec4  name_load4(uint e)   values e .. e + 3 (e % 4 == 0)
  *     float name_load1(uint e)   value e
- * with e counted in values from the start of the binding. F32, F16 and BF16 bindings are plain arrays; block
- * types read through the common/kv_types.glsl loaders.
+ * with e counted in values from the start of the binding. F32, F16 and BF16 bindings are plain arrays; block and
+ * FP8 types read through the common/kv_types.glsl loaders.
  */
 #ifndef NF_ATTN_COMMON_GLSL
 #define NF_ATTN_COMMON_GLSL
@@ -27,17 +27,49 @@
 #define NF_SWA_STANDARD  1
 #define NF_SWA_CHUNKED   2
 #define NF_SWA_SYMMETRIC 3
+#define NF_SWA_CHUNKED_LOOKBACK 4
 
 /* bias_mode codes == gguf.spec.AttentionSpec.BiasMode.code() */
 #define NF_ATTN_BIAS_NONE      0
 #define NF_ATTN_BIAS_ALIBI     1
 #define NF_ATTN_BIAS_T5_CAUSAL 2
 #define NF_ATTN_BIAS_T5_BIDIR  3
+#define NF_ATTN_BIAS_ALIBI_SQRT 4
+#define NF_ATTN_BIAS_INKLING   5
+
+/*
+ * flags argument of the flash attention shaders (flash_decode.comp, flash_prefill.comp): bit 0 causal masking, bit 1
+ * the sink logits of buffer sinks, bit 2 direct normalized output instead of (o, m, l) partials
+ * (gguf.ops.attn.AttnKernels.FLAG_CAUSAL / FLAG_SINKS / FLAG_DIRECT); the .cl twin common/attn_common.h.
+ * Bits 5-31 carry n_fresh next to the tree bit (see below).
+ */
+#define NF_ATTN_FLAG_CAUSAL 1
+#define NF_ATTN_FLAG_SINKS  2
+#define NF_ATTN_FLAG_DIRECT 4
+/* V of an MLA latent cache is read from the K rows, so it decodes through the K side planes. */
+#define NF_ATTN_FLAG_V_ALIAS 8
+/* A verify step's tree mask: the last n_fresh slots of [kv_start, kv_end) are the step's fresh rows, and query
+ * row t sees the fresh slots its tree_mask[t] bit names (a uvec2: .x the low 32 bits, .y the high 32; the .cl
+ * twin carries one ulong per row); the slots before them keep the position rules. */
+#define NF_ATTN_FLAG_TREE 16
+
+/*
+ * n_fresh rides in flags bits 5-31 next to NF_ATTN_FLAG_TREE (gguf.ops.attn.AttnKernels.treeFlags), keeping the
+ * fresh-row count out of the flash shaders' push constants: the count of the step's fresh rows when the tree bit
+ * is set, 0 otherwise.
+ */
+#define NF_ATTN_FLAG_FRESH_SHIFT 5
+
+/* The fresh-row count packed in flags: the bits 5-31 payload when the tree bit is set, 0 without it. */
+int nf_attn_flag_fresh(int flags) {
+    return (flags & NF_ATTN_FLAG_TREE) != 0 ? int(uint(flags) >> NF_ATTN_FLAG_FRESH_SHIFT) : 0;
+}
 
 /* Head-dimension chunk of the tiled prefill shader. */
 #define NF_FA_CHUNK 64
 
-/* Causal mask plus llama_hparams::is_masked_swa (llama-hparams.h:506-540); p_k < 0 is an empty cell. */
+/* Causal mask plus llama_hparams::is_masked_swa (llama-hparams.h:506-540) and the aligned-chunk look-back rule;
+ * p_k < 0 is an empty cell. */
 int nf_attn_visible(int p_q, int p_k, int causal, int swa_type, int n_swa) {
     if (p_k < 0) {
         return 0;
@@ -51,12 +83,33 @@ int nf_attn_visible(int p_q, int p_k, int causal, int swa_type, int n_swa) {
     if (swa_type == NF_SWA_CHUNKED) {
         return (p_k < (p_q / n_swa) * n_swa) ? 0 : 1;
     }
+    if (swa_type == NF_SWA_CHUNKED_LOOKBACK) {
+        return (p_k < ((p_q / n_swa) - 1) * n_swa) ? 0 : 1;
+    }
     if (swa_type == NF_SWA_SYMMETRIC) {
         const int half_n_swa = n_swa / 2;
         const int diff = p_q - p_k;
         return (diff < -half_n_swa || diff > half_n_swa) ? 0 : 1;
     }
     return 1;
+}
+
+/*
+ * Whether query row t of a tree-masked step sees KV slot t_kv: fresh slots (the last n_fresh of the step's key
+ * range) read the row's ancestor bitmask tree_bits, one bit per fresh slot; the slots before the fresh block keep
+ * the position rules (nf_attn_visible). A step without fresh rows (n_fresh = 0) takes no tree rule at all: a
+ * context-sharded cache counts kv_end over its own rows while its kv_pos holds global positions, so a plain
+ * slot's position can sit at or above kv_end without being a fresh slot.
+ * gguf.ops.attn.CpuAttentionCore.scoreBlock is the Java reference.
+ */
+int nf_attn_tree_visible(int t_kv, uvec2 tree_bits, int kv_end, int n_fresh, int q_pos,
+                         int causal, int swa_type, int n_swa) {
+    int fslot = n_fresh > 0 ? t_kv - (kv_end - n_fresh) : -1;
+    if (fslot >= 0) {
+        return fslot < 32 ? int((tree_bits.x >> uint(fslot)) & 1u)
+                          : int((tree_bits.y >> uint(fslot - 32)) & 1u);
+    }
+    return nf_attn_visible(q_pos, t_kv, causal, swa_type, n_swa);
 }
 
 /* Capped and scaled logit (ggml-cpu/ops.cpp:8997-8998, 9068-9072). */
@@ -133,7 +186,7 @@ int nf_kv_row(int t, int page_shift, int page_id) {
 
 /*
  * 1 when the page of slot t is valid: always on the identity path, otherwise the page id must be >= 0 (a page the
- * sequence never had; negative page ids are masked, never required: section 5.5.1 O-2).
+ * sequence never had; negative page ids are masked, never required).
  */
 bool nf_kv_page_ok(int page_shift, int page_id) {
     return page_shift < 0 || page_id >= 0;
@@ -147,9 +200,9 @@ bool nf_kv_page_ok(int page_shift, int page_id) {
 #define NF_ATTN_KV_TYPE_BITS 8
 #define NF_ATTN_KV_TYPE_MASK 0xFF
 
-/* True when t is a KV cache type code (NF_KV_F32 .. NF_KV_Q5_1). */
+/* True when t is a KV cache type code (NF_KV_F32 .. NF_KV_NVFP4_DS_MLA). */
 bool nf_attn_kv_type_ok(int t) {
-    return t >= NF_KV_F32 && t <= NF_KV_Q5_1;
+    return t >= NF_KV_F32 && t <= NF_KV_NVFP4_DS_MLA;
 }
 
 /* K cache type of a kv_types argument, or -1 (rejected by nf_attn_kv_type_ok) when kv_types is malformed. */
@@ -200,7 +253,9 @@ int nf_attn_kv_type_v(int kv_types) {
     float name##_load1(uint e) { return nf_bf16(uint(name##_u16[e])); }
 
 #elif KV == NF_KV_Q8_0 || KV == NF_KV_Q4_0 || KV == NF_KV_Q4_1 || KV == NF_KV_IQ4_NL || KV == NF_KV_Q5_0 \
-    || KV == NF_KV_Q5_1
+    || KV == NF_KV_Q5_1 || KV == NF_KV_FP8_E4M3 || KV == NF_KV_FP8_E5M2 \
+    || KV == NF_KV_FP8_PER_TOKEN_HEAD || KV == NF_KV_INT8_PER_TOKEN_HEAD || KV == NF_KV_INT4_PER_TOKEN_HEAD \
+    || (KV >= NF_KV_NVFP4 && KV <= NF_KV_NVFP4_DS_MLA)
 
 #define NF_ATTN_KV_VIEWS(binding_index, name) \
     NF_BUFFER_VIEWS(binding_index, name) \

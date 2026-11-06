@@ -68,10 +68,53 @@ final class ServerJson {
         return error(400, message, "invalid_request_error");
     }
 
-    /** A 503 when no model is loaded. */
-    static void requireLoaded(EngineService service) {
-        if (!service.loaded()) {
+    /**
+     * The probes' refusal ({@code /health}, {@code /ready}, {@code /ping}): 503 unavailable_error until a model is
+     * open ({@link EngineService#ready}). A sleeping engine stays ready and the probe does not wake it.
+     */
+    static void requireReady(EngineService service) {
+        if (!service.ready()) {
             throw error(503, NO_MODEL, "unavailable_error");
+        }
+    }
+
+    /**
+     * Refuses with 503 when the engine cannot serve, naming why: no model configured, an explicitly sleeping
+     * engine, or a pause that rejects new work. An idle-sleeping engine wakes first — llama.cpp's server reloads
+     * on the first task after sleeping.
+     */
+    static void requireLoaded(EngineService service) {
+        if (!service.loaded() && service.wakesOnRequest()) {
+            service.wakeAndWait();
+        }
+        if (!service.loaded() || service.servingRefusal() != null) {
+            String refusal = service.servingRefusal();
+            throw error(503, refusal != null ? refusal : NO_MODEL, "unavailable_error");
+        }
+    }
+
+    /** One engine control operation the dev and RL routes run, and the JSON body a success answers. */
+    interface Operation {
+        Map<String, Object> run() throws InterruptedException;
+    }
+
+    /**
+     * Runs one engine operation and writes its JSON body: a bad parameter or refusal names itself with 400, an
+     * engine that cannot serve answers 503, and an operation the model's placement cannot take answers 409. An
+     * interrupted wait answers 503 too and restores the flag.
+     */
+    static Response operate(Operation operation) {
+        try {
+            return Response.ok(write(operation.run())).build();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw error(503, "request interrupted", "unavailable_error");
+        } catch (IllegalArgumentException e) {
+            throw badRequest(e.getMessage());
+        } catch (UnsupportedOperationException e) {
+            throw error(409, e.getMessage(), "conflict_error");
+        } catch (IllegalStateException e) {
+            throw error(503, e.getMessage(), "unavailable_error");
         }
     }
 

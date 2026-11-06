@@ -15,13 +15,14 @@ import static org.junit.Assert.fail;
  * {@code tests/test-json-schema-to-grammar.cpp} golden cases: every expected grammar string is the
  * C++ test's expected grammar, translated to the exact output of this port (rule registry formatted
  * in name order, llama.cpp's {@code format_grammar}). The C++ case names are cited per test. Also
- * the alpha WP clause groups: the compact whitespace mode of row G8, the {@code choice} alternation
+ * the clause groups beyond the C++ cases: the compact whitespace mode, the {@code choice} alternation
  * of {@code ConstraintSpec}, and the refusals (remote {@code $ref}, unsupported and invalid
- * regexps, Lark {@code %}-imports). Pure logic; no model file required.
+ * regexps, Lark {@code %}-imports). Where vLLM's xgrammar backend differs from llama.cpp (a value
+ * {@code pattern} matches the whole value in the full regex dialect) the expectation follows xgrammar. Pure logic; no model file required.
  */
 public class JsonSchemaToGbnfTest {
 
-    /** llama.cpp {@code SPACE_RULE}, the flexible whitespace mode (row G8). */
+    /** llama.cpp {@code SPACE_RULE}, the flexible whitespace mode. */
     private static final String SPACE = "| \" \" | \"\\n\"{1,2} [ \\t]{0,20}";
 
     /** llama.cpp {@code PRIMITIVE_RULES} fragments, verbatim {@code common/json-schema-to-grammar.cpp:236-258}. */
@@ -188,8 +189,8 @@ public class JsonSchemaToGbnfTest {
                         + "{\"type\": \"array\", \"items\": {\"type\": \"number\"}}}"));
     }
 
-    // -------------------------------------------------- row G8: the compact mode (derived from LC
-    // "additional props": identical rules, the space rule becomes the empty alternate)
+    // -------------------------------------------------- the compact mode (derived from LC
+    // "additional props": identical rules, the space rule becomes the empty literal)
 
     @Test
     public void compactWhitespaceMode() {
@@ -202,11 +203,23 @@ public class JsonSchemaToGbnfTest {
                 line("number", NUMBER_RULE),
                 line("root", "\"{\" space  (additional-kv ( \",\" space additional-kv )* )? "
                         + "space \"}\""),
-                "space ::= ",
+                line("space", "\"\""),
                 line("string", STRING_RULE)),
                 JsonSchemaToGbnf.gbnf("{\"type\": \"object\", \"additionalProperties\": "
                         + "{\"type\": \"array\", \"items\": {\"type\": \"number\"}}}",
                         JsonSchemaToGbnf.WhitespaceMode.COMPACT));
+    }
+
+    @Test
+    public void compactGrammarsCompileAndAdmitNoWhitespace() {
+        Grammar object = GbnfBuilder.grammarOf(ConstraintSpec.jsonSchema("{\"type\": \"object\"}",
+                JsonSchemaToGbnf.WhitespaceMode.COMPACT));
+        assertTrue(GrammarMatcher.matches(object, "{\"a\":[1,{}]}"));
+        assertFalse(GrammarMatcher.matches(object, "{\"a\": 1}"));
+        assertFalse(GrammarMatcher.matches(object, "[1]"));
+        Grammar any = GbnfBuilder.grammarOf(ConstraintSpec.jsonObject(JsonSchemaToGbnf.WhitespaceMode.COMPACT));
+        assertTrue(GrammarMatcher.matches(any, "{\"a\":\"b\"}"));
+        assertFalse(GrammarMatcher.matches(any, "{ }"));
     }
 
     // -------------------------------------------------- LC test "mix of allOf, anyOf and $ref"
@@ -238,7 +251,7 @@ public class JsonSchemaToGbnfTest {
     }
 
     // -------------------------------------------------- LC test "empty schema (any value)" (:317-334)
-    // = the generic {@code json_object} grammar (row G3)
+    // = the generic {@code json_object} grammar
 
     @Test
     public void emptySchemaIsTheGenericJsonGrammar() {
@@ -259,8 +272,8 @@ public class JsonSchemaToGbnfTest {
                 JsonSchemaToGbnf.gbnf("{}", JsonSchemaToGbnf.WhitespaceMode.FLEXIBLE));
     }
 
-    // -------------------------------------------------- the choice constraint (WP clause group;
-    // no LC case: the alternation the spec clause states, "choice is an alternation of literals")
+    // -------------------------------------------------- the choice constraint
+    // (no LC case: a choice is an alternation of literals)
 
     @Test
     public void choiceConstraintIsAlternationOfEscapedLiterals() {
@@ -285,7 +298,7 @@ public class JsonSchemaToGbnfTest {
         assertEquals(2, alternates);
     }
 
-    // -------------------------------------------------- ConstraintSpec: structural tags (SO-4)
+    // -------------------------------------------------- ConstraintSpec: structural tags
 
     @Test
     public void structuralTagWithoutStructuresRefusesAndWithTriggersGates() {
@@ -303,8 +316,8 @@ public class JsonSchemaToGbnfTest {
         assertEquals(GrammarTriggers.Mode.DISPATCH, gated.triggers().mode());
     }
 
-    // -------------------------------------------------- refusal: remote $ref (WP spec clause;
-    // llama.cpp's _visit_ref helper refuses non-local pointers, no golden case in the LC tests)
+    // -------------------------------------------------- refusal: remote $ref
+    // (llama.cpp's _visit_ref helper refuses non-local pointers, no golden case in the LC tests)
 
     @Test
     public void remoteRefIsRefused() {
@@ -332,72 +345,66 @@ public class JsonSchemaToGbnfTest {
         }
     }
 
-    // -------------------------------------------------- LC test "unanchored regexp" (:1448-1461)
-    // an unanchored pattern degrades the property to the generic string rule
+    // -------------------------------------------------- LC test "unanchored regexp" (:1448-1461):
+    // llama.cpp degrades the property to any string; xgrammar (vLLM's backend) matches the whole
+    // value, so the unanchored pattern is translated like the anchored one
 
     @Test
-    public void unanchoredPatternDegradesToString() {
+    public void unanchoredPatternMatchesTheWholeValue() {
         assertEquals(lines(
-                line("char", CHAR_RULE),
-                line("root", "string"),
-                spaceLine(),
-                line("string", STRING_RULE)),
+                line("root", "\"\\\"\" ([0-9]+) \"\\\"\""),
+                spaceLine()),
                 flex("{\"type\": \"string\", \"pattern\": \"[0-9]+\"}"));
     }
 
     // -------------------------------------------------- LC test "regexp with unsupported shorthand"
-    // (:1464-1477): llama.cpp's comment — "the rules of the partial conversion (here "root-0")
-    // must not leak into the grammar"
+    // (:1464-1477): llama.cpp degrades it to any string; xgrammar reads \w as its class
 
     @Test
-    public void unsupportedShorthandDegradesWithoutLeakingPartialRules() {
-        String grammar = flex("{\"type\": \"string\", \"pattern\": \"^[0-9]{3}\\\\w$\"}");
+    public void shorthandClassTranslatesToItsCharacterSet() {
         assertEquals(lines(
-                line("char", CHAR_RULE),
-                line("root", "string"),
-                spaceLine(),
-                line("string", STRING_RULE)),
-                grammar);
-        assertFalse(grammar, grammar.contains("root-0"));
-        assertFalse(grammar, grammar.contains("root-1"));
+                line("root", "\"\\\"\" (root-1{3,3} [0-9A-Z_a-z]) \"\\\"\""),
+                line("root-1", "[0-9]"),
+                spaceLine()),
+                flex("{\"type\": \"string\", \"pattern\": \"^[0-9]{3}\\\\w$\"}"));
     }
 
     // -------------------------------------------------- LC test "unsupported regexp in a property"
-    // (:1517-1536): only the property with the bad pattern degrades ("^(?=a)a$", a lookahead)
-    // and it degrades to a rule of the property's own name
+    // (:1517-1536): llama.cpp degrades the property to any string; xgrammar refuses the
+    // lookahead, and so does the conversion, naming the pattern and the construct
 
     @Test
-    public void unsupportedLookaheadDegradesOnlyThatProperty() {
-        assertEquals(lines(
-                line("a", "string"),
-                line("a-kv", "\"\\\"a\\\"\" space \":\" space a"),
-                line("char", CHAR_RULE),
-                line("root", "\"{\" space a-kv space \"}\""),
-                spaceLine(),
-                line("string", STRING_RULE)),
-                flex("{\"type\": \"object\", "
-                        + "\"properties\": {\"a\": {\"type\": \"string\", "
-                        + "\"pattern\": \"^(?=a)a$\"}}, "
-                        + "\"required\": [\"a\"], \"additionalProperties\": false}"));
+    public void unsupportedLookaheadFailsTheConversion() {
+        try {
+            flex("{\"type\": \"object\", "
+                    + "\"properties\": {\"a\": {\"type\": \"string\", "
+                    + "\"pattern\": \"^(?=a)a$\"}}, "
+                    + "\"required\": [\"a\"], \"additionalProperties\": false}");
+            fail("a lookahead pattern must be refused");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains(
+                    "pattern ^(?=a)a$ is not supported: lookahead assertion: (?="));
+        }
     }
 
     // -------------------------------------------------- LC test "regexp with unbalanced parentheses"
-    // (:1506-1514, FAILURE): "a regexp that is invalid under any flavor is still an error"
+    // (:1506-1514, FAILURE): "a regexp that is invalid under any flavor is still an error" (the
+    // case's "^(a$" is refused for its anchor inside the group first, so the group stays open here)
 
     @Test
     public void invalidPatternFailsTheConversion() {
         try {
-            flex("{\"type\": \"string\", \"pattern\": \"^(a$\"}");
+            flex("{\"type\": \"string\", \"pattern\": \"^(a\"}");
             fail("an invalid pattern must be refused");
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             assertTrue(message, message.contains("JSON schema conversion failed:"));
-            assertTrue(message, message.contains("Invalid pattern ^(a$:"));
+            assertTrue(message, message.contains("Invalid pattern ^(a:"));
             assertTrue(message, message.contains("unbalanced parentheses"));
         }
     }
 
-    // -------------------------------------------------- Lark refusals (WP spec clause: Lark is refused
+    // -------------------------------------------------- Lark refusals (Lark is refused
     // where it uses %import): a %-directive is no GBNF rule line, so the parse refuses it
 
     @Test

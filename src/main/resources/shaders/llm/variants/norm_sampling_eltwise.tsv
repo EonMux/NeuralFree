@@ -13,6 +13,15 @@ LLM_Batch_LayerNorm	layernorm.comp	OP=OP_BATCH_LAYERNORM	sg
 # sampling.cl
 LLM_Softmax	softmax.comp	OP=OP_SOFTMAX	sg
 LLM_Argmax	argmax.comp	OP=OP_ARGMAX
+LLM_TreeAccept	argmax.comp	OP=OP_TREE_ACCEPT
+# sampling_topk.cl
+LLM_Row_TopK	row_topk.comp
+LLM_LogitsPrefilter	penalties.comp
+# dflash.cl
+LLM_DflashConv	dflash_conv.comp
+LLM_Dflash2Logits	dflash_selector.comp	OP=0
+LLM_Dflash2Score	dflash_selector.comp	OP=1
+LLM_Dflash2Pick	dflash_selector.comp	OP=2
 # eltwise.cl
 LLM_Add	eltwise.comp	OP=OP_ADD
 LLM_BiasAdd	eltwise.comp	OP=OP_BIASADD

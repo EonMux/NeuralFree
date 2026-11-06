@@ -42,6 +42,10 @@ public final class HfVocabWriters {
     private static final int RWKV_DEFAULT_VOCAB = 65536;
     private static final int RWKV_EOT = 261;
     private static final String RWKV_TEMPLATE = "llama-cpp-rwkv-world.jinja";
+    /** The Metaspace {@code prepend_scheme} that only a pre-tokenizer spec applies on a BPE vocabulary. */
+    private static final String METASPACE_ALWAYS = "always";
+    /** The tekken.json number split of the {@code tekken-num3} pre-tokenizer (base.py:2905-2906). */
+    private static final String TEKKEN_NUM3_DIGITS = "\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))";
 
     private HfVocabWriters() {}
 
@@ -253,6 +257,10 @@ public final class HfVocabWriters {
             if (pinnedPre == null && src.spec.addPrefixSpace()) {
                 md.put(GgufKeys.NF_TOKENIZER_BPE_ADD_PREFIX_SPACE, true);
             }
+            if (METASPACE_ALWAYS.equals(md.get(GgufKeys.TOKENIZER_METASPACE_PREPEND_SCHEME))) {
+                // A named BPE pre-tokenizer cannot apply the Metaspace 'always' scheme; the exact spec carries it.
+                md.put(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER, src.spec.toCanonicalJson());
+            }
         } else {
             md.put(GgufKeys.TOKENIZER_PRE, PreTokenizerRegistry.DEFAULT_NAME);
             md.put(GgufKeys.NF_TOKENIZER_PRE_TOKENIZER, src.spec.toCanonicalJson());
@@ -349,6 +357,7 @@ public final class HfVocabWriters {
         md.put(GgufKeys.NF_TOKENIZER_CLEAN_SPACES, HfTokenOverlays.cleanSpaces(tc, false));
         Map<String, Object> candidate = new LinkedHashMap<>(md);
         candidate.put(GgufKeys.TOKENIZER_PRE, PreTokenizerRegistry.DEFAULT_NAME);
+        HfTokenOverlays.putWordPieceUnk(candidate, tj, vocab);
         String name = pre.resolve(tj, HfTokenOverlays.encoder(candidate, HfTokenOverlays.postProcessorIds(tj)));
         md.put(GgufKeys.TOKENIZER_PRE, name != null ? name : PreTokenizerRegistry.DEFAULT_NAME);
         md.putAll(HfChatTemplates.resolve(files, in.fallbackChatTemplate()));
@@ -622,8 +631,10 @@ public final class HfVocabWriters {
     }
 
     /**
-     * {@code _set_vocab_mistral} (base.py:2635-2718): the mistral_common tokenizer ({@code tekken.json}, else the
-     * versioned SentencePiece model) with its bos/eos/unk/pad ids, add_bos true and add_eos false, and the chat
+     * {@code _set_vocab_mistral} (base.py:2877-2957): the mistral_common tokenizer ({@code tekken.json} under the
+     * {@code tekken-num3} pre-tokenizer when its pattern splits numbers into groups of three digits, else
+     * {@code tekken}; else the versioned SentencePiece model) with its bos/eos/unk/pad ids, add_bos true and add_eos
+     * false, and the chat
      * template of a Mistral-format checkpoint's {@code chat_template.jinja}, else the community template of
      * mistral.py:54-90 ({@link HfChatTemplates#mistralCommunity}).
      */
@@ -645,7 +656,7 @@ public final class HfVocabWriters {
             int pad = t.specialId("<pad>");
             ids = new int[]{requireSpecial(t, "<s>"), eos, requireSpecial(t, "<unk>"), pad < 0 ? eos : pad};
             md.put(GgufKeys.TOKENIZER_MODEL, "gpt2");
-            md.put(GgufKeys.TOKENIZER_PRE, "tekken");
+            md.put(GgufKeys.TOKENIZER_PRE, t.pattern().contains(TEKKEN_NUM3_DIGITS) ? "tekken-num3" : "tekken");
             md.put(GgufKeys.TOKENIZER_MERGES, Collections.unmodifiableList(HfVocabBase.tekkenMerges(t)));
         } else {
             SentencePieceModel sp = SentencePieceModel.read(file);

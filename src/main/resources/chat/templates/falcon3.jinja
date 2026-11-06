@@ -1,0 +1,8 @@
+{#- llama.cpp falcon3 chat template (src/llama-chat.cpp:353-361). -#}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {{- '<|' ~ message['role'] ~ '|>\n' ~ content ~ '\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|assistant|>\n' -}}
+{%- endif -%}

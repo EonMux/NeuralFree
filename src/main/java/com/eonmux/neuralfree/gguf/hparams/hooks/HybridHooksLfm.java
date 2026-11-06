@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.hparams.GgufKeys;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
 import com.eonmux.neuralfree.gguf.hparams.HparamsSupport;
+import com.eonmux.neuralfree.gguf.hparams.ModelHparams;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 
 /**
@@ -81,6 +82,38 @@ public final class HybridHooksLfm {
     }
 
     /**
+     * lfm3.cpp:4-31. Every layer without KV heads is a short-convolution layer, the others are attention
+     * layers; the attention layers mix full and {@link SwaType#STANDARD} sliding-window layers, and the file
+     * must carry the {@code attention.sliding_window_pattern} array. Full-attention layers rotate with the
+     * learned {@code rope_freqs} factors (lfm3.cpp:113). A non-causal file ({@code attention.causal} false) is
+     * the lfm3 d1 diffusion model: its dense layers read bidirectionally, its sliding-window layers stay
+     * causal (lfm3.cpp:22-25) and the graph runs without memory (llama-model.cpp:2816-2818).
+     */
+    public static void lfm3(ModelHparamsBuilder b, GgufKv kv) {
+        b.shortconvLCache(kv.u32Required(GgufKeys.SHORTCONV_L_CACHE));          // lfm3.cpp:5
+        HybridHooks.readRmsEps(b, kv);                                          // lfm3.cpp:6
+        HybridHooks.markRecurrentByKvHeads(b);                                  // lfm3.cpp:8-10
+        b.isSwaArray(MoeHooksSupport.overlayFlags(kv, GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN,
+                b.isSwaArray(), true));                                         // lfm3.cpp:12-13
+        boolean swaAny = false;
+        for (int il = 0; il < b.nLayer(); il++) {
+            swaAny |= b.isSwa(il);
+        }
+        if (!swaAny) {                                                          // lfm3.cpp:14-16
+            throw HybridHooks.invalid(b, "lfm3 requires sliding window attention layers: the pattern in '"
+                    + kv.key(GgufKeys.ATTENTION_SLIDING_WINDOW_PATTERN) + "' marks none");
+        }
+        b.swaType(SwaType.STANDARD);                                            // lfm3.cpp:17
+        b.nSwa(kv.u32Required(GgufKeys.ATTENTION_SLIDING_WINDOW));              // lfm3.cpp:18
+        b.ropeFreqBaseSwa(kv.f32Required(GgufKeys.ROPE_FREQ_BASE_SWA));         // lfm3.cpp:20
+        if (!b.causal()) {                                                      // lfm3.cpp:22-25
+            b.nonCausalType(ModelHparams.NON_CAUSAL_DENSE_ONLY);
+        }
+        requireLCache(b, kv);
+        requireEqualKvWidths(b);
+    }
+
+    /**
      * The short-convolution state keeps {@code l_cache - 1} rows, so the window must exceed 1
      * (lfm-base.cpp:21-22).
      */
@@ -107,6 +140,25 @@ public final class HybridHooksLfm {
             if (k != v) {
                 throw HybridHooks.invalid(b, "attention layer " + il + " has K width " + k + " and V width " + v
                         + "; they must be equal (lfm2.cpp:159)");
+            }
+        }
+    }
+
+    /**
+     * Attention layers need equal K and V widths per layer, {@code n_embd_k_gqa(il) == n_embd_v_gqa(il)}
+     * (lfm3.cpp:66-68); sliding-window layers use the SWA head sizes.
+     */
+    private static void requireEqualKvWidths(ModelHparamsBuilder b) {
+        for (int il = 0; il < b.nLayer(); il++) {
+            if (b.isRecurrent(il)) {
+                continue;
+            }
+            boolean swa = b.isSwa(il);
+            long k = (long) (swa ? b.headKSwa() : b.headKFull()) * b.nHeadKv(il);
+            long v = (long) (swa ? b.headVSwa() : b.headVFull()) * b.nHeadKv(il);
+            if (k != v) {
+                throw HybridHooks.invalid(b, "attention layer " + il + " has K width " + k + " and V width " + v
+                        + "; they must be equal (lfm3.cpp:66-68)");
             }
         }
     }

@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.heads;
 
+import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.arch.Arch;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
@@ -10,7 +11,8 @@ import java.util.Objects;
  * The host decision head of a model over its final hidden rows, shared by the GPU and CPU orchestrators:
  * vllm-decision2 ({@link VllmDecision2Head}) and clef ({@link ClefDecoder}) score one value per token from a decision
  * order; the modern-bert and lfm2 decision models ({@link DecisionBody}) score
- * {@link ModernBertDecisionHead#N_DECISION_TYPES} question types per token, flattened {@code [t][type]} row-major.
+ * {@link ModernBertDecisionHead#N_DECISION_TYPES} question types per token, flattened {@code [t][type]} row-major;
+ * kev ({@link KevScorer}) dots the last token's hidden state with every {@code <|box_end|>} option end's.
  * Immutable.
  */
 public final class DecisionScorer {
@@ -32,14 +34,22 @@ public final class DecisionScorer {
     }
 
     /**
-     * The decision head of {@code spec}, read from {@code weights}, or null when the model has none.
+     * The decision head of {@code spec}, read from {@code weights}, or null when the model has none. A kev-typed
+     * model takes its marker from {@code tokenizer}'s vocabulary.
      *
      * @throws com.eonmux.neuralfree.gguf.spec.MissingTensorException when a head tensor is absent
+     * @throws IllegalStateException                                  for a kev model whose vocabulary holds no
+     *                                                                single {@code <|box_end|>} token
      */
-    public static DecisionScorer forModel(ModelSpec spec, CpuWeights weights) {
+    public static DecisionScorer forModel(ModelSpec spec, CpuWeights weights, GGUFTokenizer tokenizer) {
         Objects.requireNonNull(spec, "spec");
         Objects.requireNonNull(weights, "weights");
+        Objects.requireNonNull(tokenizer, "tokenizer");
         String name = spec.arch().ggufName();
+        if ("kev".equals(spec.hparams().decisionType())) {
+            KevScorer h = KevScorer.of(spec, tokenizer);
+            return new DecisionScorer(name, (hidden, tokens, order) -> h.score(hidden, tokens), false);
+        }
         if (spec.arch() == Arch.VLLM_DECISION2) {
             VllmDecision2Head h = VllmDecision2Head.of(spec, weights);
             return new DecisionScorer(name, (hidden, tokens, order) -> h.score(hidden, order), true);
@@ -59,9 +69,13 @@ public final class DecisionScorer {
         return null;
     }
 
-    /** True when {@code spec} has a decision head: vllm-decision2, clef, or a modern-bert / lfm2 decision model. */
+    /**
+     * True when {@code spec} has a decision head: vllm-decision2, clef, a modern-bert / lfm2 decision model, or a
+     * model whose decision type is kev, whose markers score over its own hidden rows.
+     */
     public static boolean present(ModelSpec spec) {
-        return spec.arch() == Arch.VLLM_DECISION2 || spec.arch() == Arch.CLEF || DecisionBody.applies(spec);
+        return spec.arch() == Arch.VLLM_DECISION2 || spec.arch() == Arch.CLEF || DecisionBody.applies(spec)
+                || "kev".equals(spec.hparams().decisionType());
     }
 
     /** True when this head reads a decision order (vllm-decision2, clef). */

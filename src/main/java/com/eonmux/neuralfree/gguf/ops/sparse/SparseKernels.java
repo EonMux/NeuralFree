@@ -16,7 +16,12 @@ import java.util.Objects;
  * <p>Argument lists ({@code (dyn)} marks the per-step arguments with an {@code ARG_*} constant):
  * <pre>
  * LLM_DSA_IndexerScore_&lt;KV&gt; (i n_tokens(dyn), i n_kv(dyn), i n_idx_heads, i idx_dim, i causal, i swa_type,
- *                       i n_swa, R iq, R w, R&lt;KV&gt; ik_cache, R&lt;int&gt; q_pos, R&lt;int&gt; kv_pos, W scores)
+ *                       i n_swa, i key_stride, i key_off, R iq, R w, R&lt;KV&gt; ik_cache, R&lt;int&gt; q_pos,
+ *                       R&lt;int&gt; kv_pos, W scores)
+ * LLM_DSA_BlockScore   (i n_tokens(dyn), i n_kv(dyn), i block_size, i ratio, R&lt;int&gt; q_pos, R scores,
+ *                       W block_scores)
+ * LLM_DSA_RestrictBlocks (i n_tokens(dyn), i n_kv(dyn), i block_size, i blocks_off(dyn), i blocks_stride(dyn),
+ *                       R&lt;int&gt; blocks, RW scores)
  * LLM_TopK_Rows        (i n_rows(dyn), i n_cols(dyn), i k(dyn), R scores, W&lt;int&gt; idx_out)
  * LLM_MLA_SparseDecode_&lt;KV&gt; (i n_head, i kv_lora, i rope_dim, i n_sel(dyn), f kq_scale, f softcap,
  *                       i has_sinks, i q_off(dyn), R q_abs, R&lt;KV&gt; kv_cache, R&lt;int&gt; sel_idx, R sinks,
@@ -25,7 +30,8 @@ import java.util.Objects;
  *                       f softcap, i has_sinks, i q_stride, R q_abs, R&lt;KV&gt; kv_cache, R&lt;int&gt; sel_idx,
  *                       R sinks, W out_latent)
  * </pre>
- * {@code <KV>} ({@link KvDType#kernelSuffix()}, every KV type) is the latent cache's {@link KvDType}
+ * {@code <KV>} ({@link KvDType#kernelSuffix()}, every KV type with a sparse row decoder) is the latent cache's
+ * {@link KvDType}
  * ({@link #sparseDecode}, {@link #sparsePrefill}) or the indexer cache's ({@link #indexerScore}); both follow the
  * context's K type, as llama.cpp creates the indexer cache with {@code type_k} (llama.cpp
  * src/llama-kv-cache-dsa.cpp:51).
@@ -42,28 +48,59 @@ public final class SparseKernels {
     public static final String MLA_SPARSE_PREFILL_PREFIX = "LLM_MLA_SparsePrefill_";
 
     public static final String TOPK_ROWS = "LLM_TopK_Rows";
+    /** DeepSeek-V4.1 candidate blocks: each block's best row score. */
+    public static final String BLOCK_SCORE = "LLM_DSA_BlockScore";
+    /** DeepSeek-V4.1 candidate blocks: mask rows outside a token's blocks. */
+    public static final String RESTRICT_BLOCKS = "LLM_DSA_RestrictBlocks";
 
     /** Every kernel of this family. */
     public static final List<String> ALL;
 
     static {
-        List<String> all = new ArrayList<>(KvDType.kernelVariants(DSA_INDEXER_SCORE_PREFIX));
+        List<String> all = new ArrayList<>(KvDType.kernelVariants(DSA_INDEXER_SCORE_PREFIX, t -> !t.perTokenHead() && t.hasSparseKernel()));
         all.add(TOPK_ROWS);
-        all.addAll(KvDType.kernelVariants(MLA_SPARSE_DECODE_PREFIX));
-        all.addAll(KvDType.kernelVariants(MLA_SPARSE_PREFILL_PREFIX));
+        all.add(BLOCK_SCORE);
+        all.add(RESTRICT_BLOCKS);
+        all.addAll(KvDType.kernelVariants(MLA_SPARSE_DECODE_PREFIX, t -> !t.perTokenHead() && t.hasSparseKernel()));
+        all.addAll(KvDType.kernelVariants(MLA_SPARSE_PREFILL_PREFIX, t -> !t.perTokenHead() && t.hasSparseKernel()));
         ALL = Collections.unmodifiableList(all);
     }
 
     /** {@code LLM_DSA_IndexerScore}: argument count and per-step argument indices. */
-    public static final int SCORE_ARG_COUNT = 13;
+    public static final int SCORE_ARG_COUNT = 15;
     public static final int ARG_SCORE_N_TOKENS = 0;
     public static final int ARG_SCORE_N_KV = 1;
+    public static final int ARG_SCORE_CAUSAL = 4;
+    public static final int ARG_SCORE_KEY_STRIDE = 7;
+    public static final int ARG_SCORE_KEY_OFF = 8;
+    public static final int ARG_SCORE_IQ = 9;
+    public static final int ARG_SCORE_W = 10;
+    public static final int ARG_SCORE_KEYS = 11;
+    public static final int ARG_SCORE_Q_POS = 12;
+    public static final int ARG_SCORE_KV_POS = 13;
+
+    /** {@code LLM_DSA_BlockScore}: argument count and the per-step argument. */
+    public static final int BLOCK_SCORE_ARG_COUNT = 7;
+    public static final int ARG_BLOCK_SCORE_N_TOKENS = 0;
+    public static final int ARG_BLOCK_SCORE_N_KV = 1;
+    public static final int ARG_BLOCK_SCORE_Q_POS = 4;
+
+    /** {@code LLM_DSA_RestrictBlocks}: argument count and the per-step arguments. */
+    public static final int RESTRICT_ARG_COUNT = 7;
+    public static final int ARG_RESTRICT_N_TOKENS = 0;
+    public static final int ARG_RESTRICT_N_KV = 1;
+    public static final int ARG_RESTRICT_BLOCK_SIZE = 2;
+    public static final int ARG_RESTRICT_BLOCKS_OFF = 3;
+    public static final int ARG_RESTRICT_BLOCKS_STRIDE = 4;
+    public static final int ARG_RESTRICT_BLOCKS = 5;
 
     /** {@code LLM_TopK_Rows}: argument count and per-step argument indices. */
     public static final int TOPK_ARG_COUNT = 5;
     public static final int ARG_TOPK_N_ROWS = 0;
     public static final int ARG_TOPK_N_COLS = 1;
     public static final int ARG_TOPK_K = 2;
+    public static final int ARG_TOPK_SCORES = 3;
+    public static final int ARG_TOPK_OUT = 4;
 
     /** {@code LLM_MLA_SparseDecode}: argument count and per-step argument indices. */
     public static final int DECODE_ARG_COUNT = 13;
@@ -90,19 +127,43 @@ public final class SparseKernels {
     private SparseKernels() {
     }
 
-    /** Lightning-indexer score kernel for the indexer cache's element type. */
+    /**
+     * Lightning-indexer score kernel for the indexer cache's element type.
+     *
+     * @throws UnsupportedOperationException naming the type when it has no sparse row decoder (the vendor formats)
+     */
     public static String indexerScore(KvDType cache) {
-        return Objects.requireNonNull(cache, "indexer cache type").kernel(DSA_INDEXER_SCORE_PREFIX);
+        return requireSparse("indexer", cache).kernel(DSA_INDEXER_SCORE_PREFIX);
     }
 
-    /** Sparse MLA decode kernel for the latent cache's element type. */
+    /**
+     * Sparse MLA decode kernel for the latent cache's element type.
+     *
+     * @throws UnsupportedOperationException naming the type when it has no sparse row decoder (the vendor formats)
+     */
     public static String sparseDecode(KvDType latent) {
-        return Objects.requireNonNull(latent, "latent").kernel(MLA_SPARSE_DECODE_PREFIX);
+        return requireSparse("latent", latent).kernel(MLA_SPARSE_DECODE_PREFIX);
     }
 
-    /** Sparse MLA prefill kernel for the latent cache's element type. */
+    /**
+     * Sparse MLA prefill kernel for the latent cache's element type.
+     *
+     * @throws UnsupportedOperationException naming the type when it has no sparse row decoder (the vendor formats)
+     */
     public static String sparsePrefill(KvDType latent) {
-        return Objects.requireNonNull(latent, "latent").kernel(MLA_SPARSE_PREFILL_PREFIX);
+        return requireSparse("latent", latent).kernel(MLA_SPARSE_PREFILL_PREFIX);
+    }
+
+    /** The type of a sparse cache, refused by name when the family has no decoder for it. */
+    private static KvDType requireSparse(String cache, KvDType type) {
+        Objects.requireNonNull(type, cache + " cache type");
+        if (!type.hasSparseKernel()) {
+            throw new UnsupportedOperationException("the sparse MLA kernels decode their " + cache + " cache rows"
+                    + " themselves and have no " + type.name().toLowerCase(java.util.Locale.ROOT) + " variant; keep the"
+                    + " cache on a type with a sparse row decoder (f16, q8_0, ...), or run the model on the CPU"
+                    + " backend");
+        }
+        return type;
     }
 
     /** Number of cells the indexer selects: {@code min(nKv, topK)} (llama.cpp src/models/deepseek32.cpp:314). */
@@ -127,6 +188,35 @@ public final class SparseKernels {
         checkTopKLocal(local);
         checkPositive("top-k n_rows", nRows);
         return new long[]{(long) nRows * local};
+    }
+
+    /** Blocks of {@code nKv} rows, {@code ceil(nKv / blockSize)}. */
+    public static int blockCount(int nKv, int blockSize) {
+        if (blockSize < 1 || nKv < 0) {
+            throw new IllegalArgumentException("block selection needs a positive block size and non-negative rows,"
+                    + " got " + blockSize + " / " + nKv);
+        }
+        return (nKv + blockSize - 1) / blockSize;
+    }
+
+    /** 1-D global size of {@code LLM_DSA_BlockScore}: one work-item per (token, block). */
+    public static long[] blockScoreGlobal(int nTokens, int nKv, int blockSize, int local) {
+        if (local < 1) {
+            throw new IllegalArgumentException("block score local size must be positive, got " + local);
+        }
+        checkPositive("block score n_tokens", nTokens);
+        long n = (long) nTokens * blockCount(nKv, blockSize);
+        return new long[]{(n + local - 1) / local * local};
+    }
+
+    /** 1-D global size of {@code LLM_DSA_RestrictBlocks}: one work-item per (token, row). */
+    public static long[] restrictGlobal(int nTokens, int nKv, int local) {
+        if (local < 1) {
+            throw new IllegalArgumentException("block restriction local size must be positive, got " + local);
+        }
+        checkPositive("block restriction n_tokens", nTokens);
+        long n = (long) nTokens * nKv;
+        return new long[]{(n + local - 1) / local * local};
     }
 
     /** 1-D global size of {@code LLM_MLA_SparseDecode}: one work-group per head. */

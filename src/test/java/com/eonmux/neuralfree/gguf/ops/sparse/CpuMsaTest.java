@@ -538,7 +538,9 @@ public class CpuMsaTest {
 
     @Test
     public void kernelHelpersDescribeLayoutsAndGeometry() {
-        assertEquals(2 + 2 * KvDType.all().size(), MsaKernels.ALL.size());
+        long sparse = KvDType.kernelTypes().stream().filter(t -> !t.perTokenHead() && t.hasSparseKernel())
+                .count();
+        assertEquals(2 + 2 * sparse, MsaKernels.ALL.size());
         assertEquals(MsaKernels.KPOOL_MODE_GATED, MsaKernels.kpoolMode(3));
         assertEquals(MsaKernels.KPOOL_MODE_MEAN, MsaKernels.kpoolMode(2));
         assertEquals(64, MsaKernels.kpoolGateOffset(3, 64));
@@ -563,10 +565,12 @@ public class CpuMsaTest {
         assertEquals("LLM_QSA_KpoolScore_F32", MsaKernels.kpoolScore(KvDType.F32));
         assertEquals("LLM_QSA_KpoolScore_F16", MsaKernels.kpoolScore(KvDType.F16));
         assertEquals("LLM_QSA_KpoolScore_Q8_0", MsaKernels.kpoolScore(KvDType.Q8_0));
-        for (KvDType t : KvDType.all()) {
+        for (KvDType t : KvDType.kernelTypes()) {
             assertEquals(t.code(), MsaKernels.kvTypeCode(t));
-            assertTrue(MsaKernels.ALL.contains(MsaKernels.kpoolUpdate(t)));
-            assertTrue(MsaKernels.ALL.contains(MsaKernels.kpoolScore(t)));
+            assertEquals(!t.perTokenHead() && t.hasSparseKernel(),
+                    MsaKernels.ALL.contains(MsaKernels.kpoolUpdate(t)));
+            assertEquals(!t.perTokenHead() && t.hasSparseKernel(),
+                    MsaKernels.ALL.contains(MsaKernels.kpoolScore(t)));
         }
         assertEquals("LLM_QSA_KpoolUpdate_IQ4_NL", MsaKernels.kpoolUpdate(KvDType.IQ4_NL));
         MsaKernels.checkKpoolCache(KvDType.Q5_1, 64, 128, 0, 64, MsaKernels.KPOOL_MODE_MEAN);

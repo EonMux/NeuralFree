@@ -1,0 +1,76 @@
+/* step5_region_scores.comp - LLM_Step5_RegionScores: the weighted-ReLU scores over closed region summaries.
+ * GLSL twin of kernels/llm/sparse/step5.cl (the semantic reference).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_kv, i n_idx_heads, i heads_per_group, i proxy, i regions, i region_block,
+ *    R float iq, R float iw, R float summary, R int q_pos, W float scores)
+ *     scores[t][g][r] = sum_h max(iq[t][g][h] . summary[r], 0) * iw[t][g][h]
+ * for the closed regions (r < min(q_pos[t] / region_block, regions)), -INF for the rest. The four head
+ * accumulators are independent and summed left-associated, as the CPU scorer does.
+ * Dispatch: 1-D, one work-item per (token, KV group, region).
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfStep5Iq { float iq[]; };
+layout(std430, binding = 1) readonly buffer NfStep5Iw { float iw[]; };
+layout(std430, binding = 2) readonly buffer NfStep5Summaries { float summaries[]; };
+layout(std430, binding = 3) readonly buffer NfStep5ScorePos { int q_pos[]; };
+layout(std430, binding = 4) writeonly buffer NfStep5Scores { float scores[]; };
+layout(push_constant) uniform NfStep5ScoreParams {
+    int n_tokens;
+    int n_kv;
+    int n_idx_heads;
+    int heads_per_group;
+    int proxy;
+    int regions;
+    int region_block;
+} pc;
+
+void main() {
+    const uint gid = nf_global_id();
+    const uint total = uint(pc.n_tokens) * uint(pc.n_kv) * uint(pc.regions);
+    if (gid >= total) {
+        return;
+    }
+    const uint r = gid % uint(pc.regions);
+    const uint rest = gid / uint(pc.regions);
+    const uint g = rest % uint(pc.n_kv);
+    const uint t = rest / uint(pc.n_kv);
+    const int closed = min(q_pos[t] / pc.region_block, pc.regions);
+    float score;
+    if (int(r) >= closed) {
+        score = -NF_INF;
+    } else {
+        float a0 = 0.0;
+        float a1 = 0.0;
+        float a2 = 0.0;
+        float a3 = 0.0;
+        const uint proxy = uint(pc.proxy);
+        const uint sbase = r * proxy;
+        const uint qbase = (t * uint(pc.n_kv) + g) * uint(pc.heads_per_group) * proxy;
+        const uint wbase = t * uint(pc.n_idx_heads) + g * uint(pc.heads_per_group);
+        for (uint h = 0u; h < uint(pc.heads_per_group); ++h) {
+            float dot = 0.0;
+            const uint qh = qbase + h * proxy;
+            for (uint d = 0u; d < proxy; ++d) {
+                dot += iq[qh + d] * summaries[sbase + d];
+            }
+            const float v = max(dot, 0.0) * iw[wbase + h];
+            const uint lane = h & 3u;
+            if (lane == 0u) {
+                a0 += v;
+            } else if (lane == 1u) {
+                a1 += v;
+            } else if (lane == 2u) {
+                a2 += v;
+            } else {
+                a3 += v;
+            }
+        }
+        score = ((a0 + a1) + a2) + a3;
+    }
+    scores[gid] = score;
+}

@@ -11,6 +11,7 @@ import com.eonmux.neuralfree.gguf.hf.tensor.HfTensorIndex;
 import com.eonmux.neuralfree.gguf.hf.tensor.RowSource;
 import com.eonmux.neuralfree.gguf.hparams.GgufFormatException;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
+import com.eonmux.neuralfree.gguf.quant.BlockLayout;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
 import com.eonmux.neuralfree.io.safetensors.StDType;
 import org.junit.After;
@@ -31,8 +32,8 @@ import static org.junit.Assert.assertTrue;
 /**
  * {@link Fp4Scheme}: NVFP4 sub-scales, nibble order and global scales (compressed-tensors inverted, ModelOpt as
  * stored) with their fallback, MXFP4 from compressed-tensors and gpt-oss layouts (identical blocks), DeepSeek-V4
- * experts, E8M0 NaN rejection, and MXFP6 E2M3/E3M2 unpacking with the exponent limits. Values are checked exactly
- * against {@code code * scale} through the CPU block decoders.
+ * experts, E8M0 NaN rejection, and the MXFP6 E2M3/E3M2 repack to native blocks with the exponent limits. Values are
+ * checked exactly against {@code code * scale} through the CPU block decoders.
  */
 public class Fp4SchemeTest {
 
@@ -172,6 +173,33 @@ public class Fp4SchemeTest {
     }
 
     @Test
+    public void quarkNvfp4UsesScale2AndInputScale2AsStored() throws IOException {
+        int[] c = codes(2 * 64, 4);
+        byte[] s = subScales(2 * 64 / 16);
+        HfTensorIndex in = fixture().add(M + ".weight", StDType.U8, new long[]{2, 32}, packLowFirst(c))
+                .add(M + ".weight_scale", StDType.F8_E4M3, new long[]{2, 4}, s)
+                .f32(M + ".weight_scale_2", new long[]{}, 0.5f)
+                .f32(M + ".input_scale_2", new long[]{}, 2f).index();
+        QuantArgs a = QuantArgs.builder(QuantFormat.NVFP4_QUARK).actScheme(ActQuantScheme.NVFP4).build();
+        HfTensorIndex out = Fp4Scheme.rewriteModules(a, List.of(M), plain(), in, ModelSourceOptions.defaults());
+        RowSource w = out.get(M + ".weight");
+        assertEquals(GGMLType.NVFP4, w.format().ggmlType());
+        assertArrayEquals(new long[]{2, 64}, w.shape());
+        assertArrayEquals(new float[]{0.5f}, w.outputScale(), 0f);
+        assertArrayEquals(new float[]{2f}, w.inputScale(), 0f);
+        assertEquals(ActQuantScheme.NVFP4, w.actQuant());
+        for (String gone : new String[]{".weight_scale", ".weight_scale_2", ".input_scale_2"}) {
+            assertFalse(gone, out.has(M + gone));
+        }
+        assertFalse(Fp4Scheme.weightOnlyNvfp4(a));
+        float[] v = Fixture.values(w);
+        for (int i = 0; i < c.length; i++) {
+            assertEquals("element " + i, FpBlockDecoders.e2m1ToFp32(c[i])
+                    * FpBlockDecoders.e4m3ToFp32(s[i / 16]), v[i], 0f);
+        }
+    }
+
+    @Test
     public void nvfp4WithKNotAMultipleOf64FallsBackWithTheGlobalScaleFolded() throws IOException {
         int[] c = codes(2 * 32, 5);
         byte[] s = subScales(4);
@@ -253,7 +281,7 @@ public class Fp4SchemeTest {
     }
 
     @Test
-    public void mxfp6UnpacksExactlyToBf16WithinTheExponentLimits() throws IOException {
+    public void mxfp6RepacksExactlyToNativeBlocksWithinTheExponentLimits() throws IOException {
         for (boolean e2m3 : new boolean[]{true, false}) {
             int k = 64;
             int[] c = new int[2 * k];
@@ -265,11 +293,22 @@ public class Fp4SchemeTest {
             HfConfig cfg = quark(e2m3 ? "fp6_e2m3" : "fp6_e3m2", null);
             QuantArgs args = HfQuantConfig.of(cfg).argsFor(M).orElseThrow(AssertionError::new);
             assertEquals(QuantFormat.MXFP6, args.format());
-            HfTensorIndex in = fixture().add(M + ".weight", StDType.U8, new long[]{2, k / 4 * 3}, packFp6(c))
+            byte[] packed = packFp6(c);
+            HfTensorIndex in = fixture().add(M + ".weight", StDType.U8, new long[]{2, k / 4 * 3}, packed)
                     .add(M + ".weight_scale", StDType.U8, new long[]{2, 2}, e).index();
             RowSource w = Fp4Scheme.rewriteModules(args, List.of(M), cfg, in, ModelSourceOptions.defaults())
                     .get(M + ".weight");
-            assertEquals(StDType.BF16, w.format().stDType());
+            assertEquals(e2m3 ? GGMLType.MXFP6_E2M3 : GGMLType.MXFP6_E3M2, w.format().ggmlType());
+            assertArrayEquals(new long[]{2, k}, w.shape());
+            byte[] blocks = Fixture.bytes(w);
+            assertEquals(4 * BlockLayout.MXFP6_BYTES, blocks.length);
+            for (int b = 0; b < 4; b++) {
+                assertEquals("block " + b + " header", e[b], blocks[b * BlockLayout.MXFP6_BYTES + BlockLayout.MXFP6_E]);
+                for (int j = 0; j < 24; j++) {
+                    assertEquals("block " + b + " code byte " + j, packed[b * 24 + j],
+                            blocks[b * BlockLayout.MXFP6_BYTES + BlockLayout.MXFP6_QS + j]);
+                }
+            }
             float[] v = Fixture.values(w);
             for (int i = 0; i < c.length; i++) {
                 float code = e2m3 ? FpBlockDecoders.e2m3ToFp32(c[i]) : FpBlockDecoders.e3m2ToFp32(c[i]);

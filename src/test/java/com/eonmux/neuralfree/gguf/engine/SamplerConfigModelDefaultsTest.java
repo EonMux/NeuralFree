@@ -1,13 +1,15 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig.Setting;
+import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
 import org.junit.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Properties;
-import java.util.function.ToDoubleFunction;
+import java.util.function.Function;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -26,70 +28,91 @@ public class SamplerConfigModelDefaultsTest {
     /** A model default for every setting, each different from the llama.cpp default and the caller's value. */
     private static final SamplingDefaults MODEL = SamplingDefaults.builder().temp(0.3f).topK(7).topP(0.5f)
             .minP(0.2f).typicalP(0.6f).penaltyRepeat(1.3f).penaltyLastN(16).presencePenalty(0.7f)
-            .frequencyPenalty(0.4f).maxNewTokens(99).build();
+            .frequencyPenalty(0.4f).maxNewTokens(99).sequence("top_p;min_p").mirostat(2).mirostatTau(3.0f)
+            .mirostatEta(0.2f).xtcProbability(0.5f).xtcThreshold(0.2f).build();
 
     /** Gives one setting a value through a builder. */
     private interface Setter {
-        void set(SamplerConfig.Builder b, double v);
+        void set(SamplerConfig.Builder b, Object v);
     }
 
     /** One setting: its property, the caller's and the model's values, how it is set and read back. */
     private static final class Case {
         final Setting setting;
         final String property;
-        final double user;
-        final double model;
+        final String propertyValue;
+        final Object user;
+        final Object model;
         final Setter explicit;
         final Setter fallback;
-        final ToDoubleFunction<SamplerConfig> get;
+        final Function<SamplerConfig, Object> get;
 
-        Case(Setting setting, String property, double user, double model, Setter explicit, Setter fallback,
-             ToDoubleFunction<SamplerConfig> get) {
+        Case(Setting setting, String property, String propertyValue, Object user, Object model, Setter explicit,
+             Setter fallback, Function<SamplerConfig, Object> get) {
             this.setting = setting;
             this.property = property;
+            this.propertyValue = propertyValue;
             this.user = user;
             this.model = model;
             this.explicit = explicit;
             this.fallback = fallback;
             this.get = get;
         }
+    }
 
-        String propertyValue() {
-            return setting == Setting.TOP_K || setting == Setting.PENALTY_LAST_N
-                    ? String.valueOf((int) user) : String.valueOf((float) user);
-        }
+    @SuppressWarnings("unchecked")
+    private static List<StageKind> order(Object v) {
+        return (List<StageKind>) v;
     }
 
     private static List<Case> cases() {
         List<Case> c = new ArrayList<>();
-        c.add(new Case(Setting.TEMPERATURE, SamplerConfig.PROP_TEMPERATURE, 1.25, 0.3,
-                (b, v) -> b.temperature((float) v), (b, v) -> b.fallbackTemperature((float) v),
+        c.add(new Case(Setting.TEMPERATURE, SamplerConfig.PROP_TEMPERATURE, "1.25", 1.25f, 0.3f,
+                (b, v) -> b.temperature((Float) v), (b, v) -> b.fallbackTemperature((Float) v),
                 SamplerConfig::temperature));
-        c.add(new Case(Setting.TOP_K, SamplerConfig.PROP_TOP_K, 3, 7,
-                (b, v) -> b.topK((int) v), (b, v) -> b.fallbackTopK((int) v), SamplerConfig::topK));
-        c.add(new Case(Setting.TOP_P, SamplerConfig.PROP_TOP_P, 0.75, 0.5,
-                (b, v) -> b.topP((float) v), (b, v) -> b.fallbackTopP((float) v), SamplerConfig::topP));
-        c.add(new Case(Setting.MIN_P, SamplerConfig.PROP_MIN_P, 0.125, 0.2,
-                (b, v) -> b.minP((float) v), (b, v) -> b.fallbackMinP((float) v), SamplerConfig::minP));
-        c.add(new Case(Setting.TYPICAL_P, SamplerConfig.PROP_TYPICAL_P, 0.875, 0.6,
-                (b, v) -> b.typicalP((float) v), (b, v) -> b.fallbackTypicalP((float) v), SamplerConfig::typicalP));
-        c.add(new Case(Setting.REPEAT_PENALTY, SamplerConfig.PROP_REPEAT_PENALTY, 1.5, 1.3,
-                (b, v) -> b.repeatPenalty((float) v), (b, v) -> b.fallbackRepeatPenalty((float) v),
+        c.add(new Case(Setting.TOP_K, SamplerConfig.PROP_TOP_K, "3", 3, 7,
+                (b, v) -> b.topK((Integer) v), (b, v) -> b.fallbackTopK((Integer) v), SamplerConfig::topK));
+        c.add(new Case(Setting.TOP_P, SamplerConfig.PROP_TOP_P, "0.75", 0.75f, 0.5f,
+                (b, v) -> b.topP((Float) v), (b, v) -> b.fallbackTopP((Float) v), SamplerConfig::topP));
+        c.add(new Case(Setting.MIN_P, SamplerConfig.PROP_MIN_P, "0.125", 0.125f, 0.2f,
+                (b, v) -> b.minP((Float) v), (b, v) -> b.fallbackMinP((Float) v), SamplerConfig::minP));
+        c.add(new Case(Setting.TYPICAL_P, SamplerConfig.PROP_TYPICAL_P, "0.875", 0.875f, 0.6f,
+                (b, v) -> b.typicalP((Float) v), (b, v) -> b.fallbackTypicalP((Float) v), SamplerConfig::typicalP));
+        c.add(new Case(Setting.REPEAT_PENALTY, SamplerConfig.PROP_REPEAT_PENALTY, "1.5", 1.5f, 1.3f,
+                (b, v) -> b.repeatPenalty((Float) v), (b, v) -> b.fallbackRepeatPenalty((Float) v),
                 SamplerConfig::repeatPenalty));
-        c.add(new Case(Setting.PENALTY_LAST_N, SamplerConfig.PROP_PENALTY_LAST_N, 32, 16,
-                (b, v) -> b.penaltyLastN((int) v), (b, v) -> b.fallbackPenaltyLastN((int) v),
+        c.add(new Case(Setting.PENALTY_LAST_N, SamplerConfig.PROP_PENALTY_LAST_N, "32", 32, 16,
+                (b, v) -> b.penaltyLastN((Integer) v), (b, v) -> b.fallbackPenaltyLastN((Integer) v),
                 SamplerConfig::penaltyLastN));
-        c.add(new Case(Setting.PRESENCE_PENALTY, SamplerConfig.PROP_PRESENCE_PENALTY, 0.25, 0.7,
-                (b, v) -> b.presencePenalty((float) v), (b, v) -> b.fallbackPresencePenalty((float) v),
+        c.add(new Case(Setting.PRESENCE_PENALTY, SamplerConfig.PROP_PRESENCE_PENALTY, "0.25", 0.25f, 0.7f,
+                (b, v) -> b.presencePenalty((Float) v), (b, v) -> b.fallbackPresencePenalty((Float) v),
                 SamplerConfig::presencePenalty));
-        c.add(new Case(Setting.FREQUENCY_PENALTY, SamplerConfig.PROP_FREQUENCY_PENALTY, -0.5, 0.4,
-                (b, v) -> b.frequencyPenalty((float) v), (b, v) -> b.fallbackFrequencyPenalty((float) v),
+        c.add(new Case(Setting.FREQUENCY_PENALTY, SamplerConfig.PROP_FREQUENCY_PENALTY, "-0.5", -0.5f, 0.4f,
+                (b, v) -> b.frequencyPenalty((Float) v), (b, v) -> b.fallbackFrequencyPenalty((Float) v),
                 SamplerConfig::frequencyPenalty));
+        c.add(new Case(Setting.SEQUENCE, SamplerConfig.PROP_SAMPLERS, "top_k;temperature",
+                Arrays.asList(StageKind.TOP_K, StageKind.TEMPERATURE), Arrays.asList(StageKind.TOP_P, StageKind.MIN_P),
+                (b, v) -> b.samplers(order(v)), (b, v) -> b.fallbackSamplers(order(v)), SamplerConfig::order));
+        c.add(new Case(Setting.MIROSTAT, SamplerConfig.PROP_MIROSTAT, "1", 1, 2,
+                (b, v) -> b.mirostat((Integer) v), (b, v) -> b.fallbackMirostat((Integer) v),
+                SamplerConfig::mirostat));
+        c.add(new Case(Setting.MIROSTAT_TAU, SamplerConfig.PROP_MIROSTAT_TAU, "6.0", 6.0f, 3.0f,
+                (b, v) -> b.mirostatTau((Float) v), (b, v) -> b.fallbackMirostatTau((Float) v),
+                SamplerConfig::mirostatTau));
+        c.add(new Case(Setting.MIROSTAT_ETA, SamplerConfig.PROP_MIROSTAT_ETA, "0.3", 0.3f, 0.2f,
+                (b, v) -> b.mirostatEta((Float) v), (b, v) -> b.fallbackMirostatEta((Float) v),
+                SamplerConfig::mirostatEta));
+        c.add(new Case(Setting.XTC_PROBABILITY, SamplerConfig.PROP_XTC_PROBABILITY, "0.25", 0.25f, 0.5f,
+                (b, v) -> b.xtcProbability((Float) v), (b, v) -> b.fallbackXtcProbability((Float) v),
+                SamplerConfig::xtcProbability));
+        c.add(new Case(Setting.XTC_THRESHOLD, SamplerConfig.PROP_XTC_THRESHOLD, "0.3", 0.3f, 0.2f,
+                (b, v) -> b.xtcThreshold((Float) v), (b, v) -> b.fallbackXtcThreshold((Float) v),
+                SamplerConfig::xtcThreshold));
         return c;
     }
 
-    private static void assertValue(String what, double expected, Case c, SamplerConfig s) {
-        assertEquals(what + " " + c.setting, (float) expected, (float) c.get.applyAsDouble(s), 0f);
+    private static void assertValue(String what, Object expected, Case c, SamplerConfig s) {
+        assertEquals(what + " " + c.setting, expected, c.get.apply(s));
     }
 
     /** Every case other than {@code given} carries the model's value. */
@@ -137,7 +160,7 @@ public class SamplerConfigModelDefaultsTest {
     public void propertySettingsWinOverTheModel() {
         for (Case c : cases()) {
             Properties p = new Properties();
-            p.setProperty(c.property, c.propertyValue());
+            p.setProperty(c.property, c.propertyValue);
             SamplerConfig given = SamplerConfig.fromProperties(p);
             assertEquals(EnumSet.of(c.setting), given.explicit());
             SamplerConfig s = given.withModelDefaults(MODEL);

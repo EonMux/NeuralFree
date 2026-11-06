@@ -17,6 +17,7 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.Q8_0_BYTES;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.Q8_0_D;
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.Q8_0_QS;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.longAt;
 
 /**
  * CPU vec-dot of Q8_0 weights with Q8_0 activations, {@code ggml_vec_dot_q8_0_q8_0_generic}
@@ -84,14 +85,18 @@ public final class Q8VecDot implements CpuVecDot {
     @Override
     public float dotRow(CpuTensorRef w, long row, QuantizedActivations x) {
         check(w, x);
-        return dot(w.rowBuffer(row), w.rowOffset(row), x, scratch().quants);
+        return dot(CpuVecDotRows.copyRow(w, row), 0, x, scratch().quants);
+    }
+
+    @Override
+    public float dotRowBytes(byte[] row, int off, QuantizedActivations x) {
+        return dot(row, off, x, scratch().quants);
     }
 
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        final byte[] aux = scratch().quants;
-        CpuVecDotRows.forEachRow(w, rowStart, rowCount, y, yOff, (b, off) -> dot(b, off, x, aux));
+        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
     }
 
     private static void check(CpuTensorRef w, QuantizedActivations x) {
@@ -103,17 +108,17 @@ public final class Q8VecDot implements CpuVecDot {
      * {@code ggml_vec_dot_q8_0_q8_0_generic} (quants.c:451-479): per block
      * {@code sumf += sumi * (d_x * d_y)} with {@code sumi = sum_j x.qs[j] * y.qs[j]} over 32 quants.
      */
-    private static float dot(ByteBuffer b, int off, QuantizedActivations x, byte[] aux) {
+    private static float dot(byte[] b, int off, QuantizedActivations x, byte[] aux) {
         final byte[] yq = x.qs;
         final float[] yd = x.d;
         final int nb = x.n / QK8_0;
         float sumf = 0;
         for (int ib = 0; ib < nb; ib++, off += Q8_0_BYTES) {
             final int qs = off + Q8_0_QS;
-            putLong(aux, 0, b.getLong(qs));
-            putLong(aux, 8, b.getLong(qs + 8));
-            putLong(aux, 16, b.getLong(qs + 16));
-            putLong(aux, 24, b.getLong(qs + 24));
+            putLong(aux, 0, longAt(b, qs));
+            putLong(aux, 8, longAt(b, qs + 8));
+            putLong(aux, 16, longAt(b, qs + 16));
+            putLong(aux, 24, longAt(b, qs + 24));
             final int sumi = dotI8(aux, 0, yq, ib * QK8_0, QK8_0);
             sumf += sumi * (fp16At(b, off + Q8_0_D) * yd[ib]);
         }

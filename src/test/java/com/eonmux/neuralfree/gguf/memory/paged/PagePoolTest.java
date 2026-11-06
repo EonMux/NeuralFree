@@ -8,9 +8,9 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Reference accounting of {@link PagePool} (PARITY MS-2): every allocation, reference and release keeps the pool
+ * Reference accounting of {@link PagePool}: every allocation, reference and release keeps the pool
  * self-consistent, the free list is LIFO (the most recently freed page is handed out first), {@code ref} only adds
- * references a holder already owns ({@code refCount > 0}: only {@code alloc} takes a page from the free list, T-4)
+ * references a holder already owns ({@code refCount > 0}: only {@code alloc} takes a page from the free list)
  * and every argument is range-checked.
  */
 public class PagePoolTest {
@@ -101,7 +101,7 @@ public class PagePoolTest {
         PagePool pool = new PagePool(2, 2);
         int a = pool.alloc();
         pool.unref(a);
-        // only alloc moves a page from the free list (T-4): a consumer cannot revive a freed page
+        // only alloc moves a page from the free list: a consumer cannot revive a freed page
         IllegalStateException e = assertThrows(IllegalStateException.class, () -> pool.ref(a));
         assertTrue(e.getMessage(), e.getMessage().contains("use alloc"));
         IllegalStateException u = assertThrows(IllegalStateException.class, () -> pool.unref(a));

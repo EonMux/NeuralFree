@@ -19,6 +19,10 @@ import java.util.function.LongUnaryOperator;
  * elements of a 1-D bias. Whole entries are copied byte for byte, so every op is exact on every format, block types
  * included; a 1-D source is moved element by element through {@link ColumnTransforms}. Every producer is row-local.
  *
+ * <p>The converter's reorders of one stored tensor's rows that vLLM does not make (the Q/K rope permutes, the
+ * regrouping of fused GDN projections and their value heads) keep their {@link #storedSource stored rows}
+ * traceable, so online quantization can tile scales in vLLM's (stored) row order.</p>
+ *
  * <p>Sibling values of quantized sources follow the move: a per-tensor scale is kept, per-expert scales of a stack are
  * re-indexed with its experts, and the input-side values (input scale, zero point, act-order permutation, activation
  * scheme) are kept because the input dimension is unchanged. A low-rank factor pair ({@link LoraFactorSource}) is
@@ -122,11 +126,61 @@ public final class RowTransforms {
         }
         long headWidth = d0 / n;
         long half = headWidth / 2;
-        return mapDim0(src, what, d0, e -> {
+        return reorderDim0(src, what, d0, e -> {
             long h = e / headWidth;
             long w = e % headWidth;
             return h * headWidth + (w % 2) * half + w / 2;
         });
+    }
+
+    /**
+     * Dim 0 with the {@code order.length} units of {@code unit} entries from entry {@code from} on reordered:
+     * output unit {@code u} is input unit {@code order[u]}; the entries before {@code from} stay. The stored rows
+     * stay traceable ({@link #storedSource}).
+     *
+     * @throws IllegalArgumentException when the units do not fill dim 0 from {@code from} on, or {@code order} is
+     *                                  not a permutation
+     */
+    public static RowSource permuteRowGroups(RowSource src, long from, int unit, int[] order) {
+        long d0 = dim0(src);
+        int[] idx = order.clone();
+        boolean[] seen = new boolean[idx.length];
+        for (int i : idx) {
+            if (i < 0 || i >= idx.length || seen[i]) {
+                throw new IllegalArgumentException(src.describe() + ": " + Arrays.toString(order)
+                        + " is not a permutation of " + idx.length + " units");
+            }
+            seen[i] = true;
+        }
+        if (unit <= 0 || from < 0 || d0 - from != (long) idx.length * unit) {
+            throw new IllegalArgumentException(src.describe() + ": dim 0 (" + d0 + ") is not " + from + " entries and "
+                    + idx.length + " units of " + unit);
+        }
+        return reorderDim0(src, "permuteRowGroups(" + from + ", " + unit + ")", d0, e -> e < from ? e
+                : from + (long) idx[(int) ((e - from) / unit)] * unit + (e - from) % unit);
+    }
+
+    /**
+     * The tensor whose rows {@code src} reads through the converter's traceable row reorders
+     * ({@link #reorderDim0}): the source {@link #storedRow} indexes. A source with no such reorder is its own.
+     */
+    public static RowSource storedSource(RowSource src) {
+        RowSource s = Objects.requireNonNull(src, "src");
+        while (s instanceof RowMap && ((RowMap) s).stored) {
+            s = ((RowMap) s).parts.get(0);
+        }
+        return s;
+    }
+
+    /** The row of {@link #storedSource} that row {@code row} of {@code src} reads. */
+    public static long storedRow(RowSource src, long row) {
+        RowSource s = Objects.requireNonNull(src, "src");
+        long r = row;
+        while (s instanceof RowMap && ((RowMap) s).stored) {
+            r = ((RowMap) s).index.row(r);
+            s = ((RowMap) s).parts.get(0);
+        }
+        return r;
     }
 
     // ------------------------------------------------------------------ slices and splits
@@ -339,6 +393,90 @@ public final class RowTransforms {
                 null, ExpertTransforms.Siblings.concatDim0(ps));
     }
 
+    /**
+     * {@code torch.cat(parts, dim)} along any dimension. Parts must agree on format and on every dimension but
+     * {@code dim}; the innermost dimension is a column concatenation ({@link ColumnTransforms#concatCols}), dim 0 a
+     * row concatenation ({@link #concatRows}), and a middle dimension keeps whole rows.
+     *
+     * @param dim the dimension, negative values counting from the innermost ({@code -1})
+     * @throws IllegalArgumentException when the parts differ in format or other dimensions
+     */
+    public static RowSource concatDim(List<? extends RowSource> parts, int dim) {
+        List<RowSource> ps = new ArrayList<>(Objects.requireNonNull(parts, "parts"));
+        if (ps.isEmpty()) {
+            throw new IllegalArgumentException("concatDim needs at least one part");
+        }
+        RowSource first = ps.get(0);
+        int d = normalizeDim(first, dim);
+        if (d == 0) {
+            return concatRows(ps);
+        }
+        if (d == first.shape().length - 1) {
+            return ColumnTransforms.concatCols(ps);
+        }
+        long[] shape = first.shape();
+        long total = 0;
+        long[] offsets = new long[ps.size() + 1];
+        for (int i = 0; i < ps.size(); i++) {
+            RowSource p = ps.get(i);
+            long[] s = p.shape();
+            if (!p.format().equals(first.format()) || s.length != shape.length) {
+                throw new IllegalArgumentException("concatDim: " + p.describe() + " does not match the format and"
+                        + " rank of " + first.describe());
+            }
+            for (int k = 0; k < shape.length; k++) {
+                if (k != d && s[k] != shape[k]) {
+                    throw new IllegalArgumentException("concatDim: " + p.describe() + " does not match dimension "
+                            + k + " of " + first.describe());
+                }
+            }
+            total = Math.addExact(total, s[d]);
+            offsets[i + 1] = total;
+        }
+        long[] outShape = shape.clone();
+        outShape[d] = total;
+        // dimensions between d and the innermost one; the innermost is the row width, not a row dimension
+        long tail = 1;
+        for (int k = d + 1; k < shape.length - 1; k++) {
+            tail = Math.multiplyExact(tail, shape[k]);
+        }
+        long[] sizes = new long[ps.size()];
+        for (int i = 0; i < ps.size(); i++) {
+            sizes[i] = ps.get(i).shape()[d];
+        }
+        long block = Math.multiplyExact(total, tail);
+        long finalTail = tail;
+        int n = ps.size();
+        RowIndex index = new RowIndex() {
+            @Override
+            public int part(long r) {
+                long j = (r % block) / finalTail;
+                int lo = 0;
+                int hi = n - 1;
+                while (lo < hi) {
+                    int mid = (lo + hi + 1) >>> 1;
+                    if (offsets[mid] <= j) {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                return lo;
+            }
+
+            @Override
+            public long row(long r) {
+                long outer = r / block;
+                long j = (r % block) / finalTail;
+                long within = r % finalTail;
+                int p = part(r);
+                return (outer * sizes[p] + (j - offsets[p])) * finalTail + within;
+            }
+        };
+        return new RowMap("concatDim of " + n + " parts along dimension " + d + " starting with "
+                + first.describe(), ps, outShape, index, null, ExpertTransforms.Siblings.NONE);
+    }
+
     // ------------------------------------------------------------------ padding and truncation
 
     /**
@@ -427,8 +565,22 @@ public final class RowTransforms {
      * {@code srcEntry(e) == srcEntry(0) + e}, which keeps a tensor stored unchanged mapped in place.
      */
     static RowSource mapDim0(RowSource src, String what, long outD0, LongUnaryOperator srcEntry, boolean contiguous) {
+        return mapDim0(src, what, outD0, srcEntry, contiguous, false);
+    }
+
+    /**
+     * {@link #mapDim0(RowSource, String, long, LongUnaryOperator)} for a converter reorder or selection of the
+     * stored rows that vLLM does not make: the result keeps them traceable through {@link #storedSource}.
+     */
+    static RowSource reorderDim0(RowSource src, String what, long outD0, LongUnaryOperator srcEntry) {
+        return mapDim0(src, what, outD0, srcEntry, false, true);
+    }
+
+    private static RowSource mapDim0(RowSource src, String what, long outD0, LongUnaryOperator srcEntry,
+                                     boolean contiguous, boolean stored) {
         if (src instanceof LoraFactorSource) {
-            return LoraFactorOps.onDim0((LoraFactorSource) src, s -> mapDim0(s, what, outD0, srcEntry, contiguous));
+            return LoraFactorOps.onDim0((LoraFactorSource) src,
+                    s -> mapDim0(s, what, outD0, srcEntry, contiguous, stored));
         }
         long[] shape = src.shape();
         long d0 = dim0(src);
@@ -441,7 +593,7 @@ public final class RowTransforms {
         RowIndex index = r -> srcEntry.applyAsLong(r / rowsPerEntry) * rowsPerEntry + r % rowsPerEntry;
         ExpertTransforms.Siblings sib = ExpertTransforms.Siblings.of(src).remapDim0(src, outD0, srcEntry);
         RowMap map = new RowMap(src.describe() + " " + what, Collections.singletonList(src), outShape, index, null,
-                sib);
+                sib, -1, stored);
         long base = src.directVirtualOffset();
         if (contiguous && base >= 0 && outD0 > 0) {
             long offset = Math.addExact(base, Math.multiplyExact(srcEntry.applyAsLong(0) * rowsPerEntry,
@@ -625,14 +777,16 @@ public final class RowTransforms {
         private final byte[] fillRow;
         private final boolean rowLocal;
         private final long directOffset;
+        /** Every row reads a row of the one part, which {@link #storedSource} traces through. */
+        private final boolean stored;
 
         RowMap(String describe, List<RowSource> parts, long[] shape, RowIndex index, byte[] fillRow,
                ExpertTransforms.Siblings siblings) {
-            this(describe, parts, shape, index, fillRow, siblings, -1);
+            this(describe, parts, shape, index, fillRow, siblings, -1, false);
         }
 
         private RowMap(String describe, List<RowSource> parts, long[] shape, RowIndex index, byte[] fillRow,
-                       ExpertTransforms.Siblings siblings, long directOffset) {
+                       ExpertTransforms.Siblings siblings, long directOffset, boolean stored) {
             super(describe, parts.get(0).format(), shape, siblings);
             this.parts = Collections.unmodifiableList(new ArrayList<>(parts));
             this.index = index;
@@ -651,10 +805,15 @@ public final class RowTransforms {
             }
             this.rowLocal = local;
             this.directOffset = directOffset;
+            if (stored && (this.parts.size() != 1 || this.fillRow != null)) {
+                throw new IllegalArgumentException(describe + ": only a fill-free map of one part traces its stored"
+                        + " rows");
+            }
+            this.stored = stored;
         }
 
         RowMap withDirectOffset(long offset) {
-            return new RowMap(describe(), parts, shape(), index, fillRow, siblings(), offset);
+            return new RowMap(describe(), parts, shape(), index, fillRow, siblings(), offset, stored);
         }
 
         @Override

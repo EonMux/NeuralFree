@@ -17,21 +17,27 @@ public class BackendAutoDetectionTest {
     @Test
     public void testAllModesExistInEnum() {
         ACCELERATION_MODE[] modes = ACCELERATION_MODE.values();
-        assertEquals("Should have 4 modes", 4, modes.length);
-        
-        boolean hasAuto = false, hasCuda = false, hasOpencl = false, hasVulkan = false;
+        assertEquals("auto, the five built-in APIs and the nine accelerator APIs", 15, modes.length);
+
+        boolean hasAuto = false, hasCuda = false, hasOpencl = false, hasVulkan = false, hasHip = false;
+        boolean hasMetal = false;
         for (ACCELERATION_MODE mode : modes) {
             switch (mode) {
                 case AUTO: hasAuto = true; break;
                 case CUDA: hasCuda = true; break;
                 case OPENCL: hasOpencl = true; break;
                 case VULKAN: hasVulkan = true; break;
+                case HIP: hasHip = true; break;
+                case METAL: hasMetal = true; break;
+                default: break;
             }
         }
         assertTrue("Should have AUTO mode", hasAuto);
         assertTrue("Should have CUDA mode", hasCuda);
         assertTrue("Should have OPENCL mode", hasOpencl);
         assertTrue("Should have VULKAN mode", hasVulkan);
+        assertTrue("Should have HIP mode", hasHip);
+        assertTrue("Should have METAL mode", hasMetal);
     }
 
     @Test
@@ -98,18 +104,24 @@ public class BackendAutoDetectionTest {
         assertEquals(ACCELERATION_MODE.CUDA, ACCELERATION_MODE.valueOf("CUDA"));
         assertEquals(ACCELERATION_MODE.OPENCL, ACCELERATION_MODE.valueOf("OPENCL"));
         assertEquals(ACCELERATION_MODE.VULKAN, ACCELERATION_MODE.valueOf("VULKAN"));
+        assertEquals(ACCELERATION_MODE.HIP, ACCELERATION_MODE.valueOf("HIP"));
+        assertEquals(ACCELERATION_MODE.METAL, ACCELERATION_MODE.valueOf("METAL"));
     }
 
     @Test
     public void testBackendPriorityOrder() {
-        ACCELERATION_MODE[] expectedOrder = {
+        ACCELERATION_MODE[] actualOrder = ACCELERATION_MODE.values();
+        ACCELERATION_MODE[] builtIns = {
             ACCELERATION_MODE.AUTO,
             ACCELERATION_MODE.CUDA,
             ACCELERATION_MODE.OPENCL,
-            ACCELERATION_MODE.VULKAN
+            ACCELERATION_MODE.VULKAN,
+            ACCELERATION_MODE.HIP,
+            ACCELERATION_MODE.METAL
         };
-        
-        ACCELERATION_MODE[] actualOrder = ACCELERATION_MODE.values();
-        assertArrayEquals("Enum order should match expected priority", expectedOrder, actualOrder);
+        assertArrayEquals("the built-in priority keeps its order at the head of the enum",
+                builtIns, java.util.Arrays.copyOf(actualOrder, builtIns.length));
+        assertEquals("the accelerator APIs follow the built-in ones", ACCELERATION_MODE.SYCL,
+                actualOrder[builtIns.length]);
     }
 }

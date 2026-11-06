@@ -40,16 +40,19 @@ public class DraftRouteTest {
     private static final class File {
         final GgufKv kv;
         final TensorCatalog tc;
+        final List<GGUFTensorInfo> tensors;
 
         File(int nEmbd, int trunk, boolean mtpOnly) {
             this.kv = GgufKv.ofMap(NemotronNextnFixture.metadata(nEmbd, trunk, N_VOCAB));
             List<GGUFTensorInfo> full = NemotronNextnFixture.tensors(nEmbd, trunk, N_VOCAB);
+            this.tensors = full;
             this.tc = TensorCatalog.of(ARCH, mtpOnly ? NemotronNextnFixture.mtpOnly(full, trunk) : full);
         }
 
-        File(GgufKv kv, TensorCatalog tc) {
+        File(GgufKv kv, TensorCatalog tc, List<GGUFTensorInfo> tensors) {
             this.kv = kv;
             this.tc = tc;
+            this.tensors = tensors;
         }
 
         DraftRoute route(DraftType type) {
@@ -75,8 +78,8 @@ public class DraftRouteTest {
     }
 
     private static File noNextn() {
-        return new File(GgufKv.ofMap(NemotronNextnFixture.metadata()), TensorCatalog.of(ARCH,
-                NemotronNextnFixture.withoutNextn(NemotronNextnFixture.tensors(), TRUNK)));
+        List<GGUFTensorInfo> tensors = NemotronNextnFixture.withoutNextn(NemotronNextnFixture.tensors(), TRUNK);
+        return new File(GgufKv.ofMap(NemotronNextnFixture.metadata()), TensorCatalog.of(ARCH, tensors), tensors);
     }
 
     private static GGUFTensorInfo t(String name) {
@@ -140,14 +143,14 @@ public class DraftRouteTest {
         ModelSpec target = target();
         assertEquals(DraftRoute.DFLASH,
                 LLMModelFactory.draftRoute(Arch.DFLASH, any.kv, any.tc, target, DraftType.AUTO, PATH));
-        assertEquals(DraftRoute.HEAD,
-                LLMModelFactory.draftRoute(Arch.EAGLE3, any.kv, any.tc, target, DraftType.AUTO, PATH));
-        assertEquals(DraftRoute.HEAD,
-                LLMModelFactory.draftRoute(Arch.GEMMA4_ASSISTANT, any.kv, any.tc, target, DraftType.AUTO, PATH));
-        for (DraftType forced : new DraftType[] {DraftType.MTP, DraftType.MODEL}) {
-            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-                    () -> LLMModelFactory.draftRoute(Arch.EAGLE3, any.kv, any.tc, target, forced, PATH));
-            assertTrue(e.getMessage(), e.getMessage().contains("auto"));
+        for (Arch drafter : new Arch[] {Arch.EAGLE, Arch.EAGLE3, Arch.GEMMA4_ASSISTANT}) {
+            assertEquals(drafter + " drafts as itself", DraftRoute.HEAD,
+                    LLMModelFactory.draftRoute(drafter, any.kv, any.tc, target, DraftType.AUTO, PATH));
+            for (DraftType forced : new DraftType[] {DraftType.MTP, DraftType.MODEL}) {
+                IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                        () -> LLMModelFactory.draftRoute(drafter, any.kv, any.tc, target, forced, PATH));
+                assertTrue(e.getMessage(), e.getMessage().contains("auto"));
+            }
         }
     }
 
@@ -159,18 +162,22 @@ public class DraftRouteTest {
         String nextn = "blk." + TRUNK + ".nextn.eh_proj.weight";
         String embd = "token_embd.weight";
 
-        Predicate<GGUFTensorInfo> mtp = LLMModelFactory.deviceTensors(DraftRoute.MTP_FILE, own.kv, own.tc, draft);
+        Predicate<GGUFTensorInfo> mtp = LLMModelFactory.deviceTensors(DraftRoute.MTP_FILE, own.kv, own.tc, draft,
+                own.tensors, null);
         assertFalse(mtp.test(t(trunk)));
         assertTrue(mtp.test(t(nextn)));
         assertTrue(mtp.test(t(embd)));
 
-        Predicate<GGUFTensorInfo> model = LLMModelFactory.deviceTensors(DraftRoute.MODEL, own.kv, own.tc, draft);
+        Predicate<GGUFTensorInfo> model = LLMModelFactory.deviceTensors(DraftRoute.MODEL, own.kv, own.tc, draft,
+                own.tensors, null);
         assertTrue(model.test(t(trunk)));
         assertFalse(model.test(t(nextn)));
         assertFalse(model.test(t("blk." + TRUNK + ".attn_q.weight")));
         assertTrue(model.test(t(embd)));
 
-        assertFalse(LLMModelFactory.deviceTensors(DraftRoute.DFLASH, own.kv, own.tc, draft).test(t(embd)));
-        assertTrue(LLMModelFactory.deviceTensors(DraftRoute.HEAD, own.kv, own.tc, draft).test(t(trunk)));
+        assertFalse(LLMModelFactory.deviceTensors(DraftRoute.DFLASH, own.kv, own.tc, draft, own.tensors, null)
+                .test(t(embd)));
+        assertTrue(LLMModelFactory.deviceTensors(DraftRoute.HEAD, own.kv, own.tc, draft, own.tensors, null)
+                .test(t(trunk)));
     }
 }

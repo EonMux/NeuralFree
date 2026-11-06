@@ -27,10 +27,14 @@ import static org.junit.Assert.assertTrue;
 public class SessionFileTest {
 
     private static EngineConfig config() {
+        return config(KvDType.F32);
+    }
+
+    private static EngineConfig config(KvDType type) {
         return EngineConfig.builder()
                 .backend(EngineConfig.BackendMode.CPU)
                 .memory(MemoryConfig.builder().nCtx(64).ubatch(8)
-                        .typeK(KvDType.F32).typeV(KvDType.F32).build())
+                        .typeK(type).typeV(type).build())
                 .build();
     }
 
@@ -92,6 +96,39 @@ public class SessionFileTest {
             memory.loadSession(session);
             float[] logits = m.forwardBackend().decode(lastToken, lastPos);
             assertArrayEquals("the shifted rows land back where the shift put them", expected, logits, 1e-4f);
+        } finally {
+            Files.deleteIfExists(session);
+        }
+    }
+
+    /** A per-token-head session carries the per-(token, KV head) scales, also across a context shift. */
+    @Test
+    public void perTokenHeadSessionsRestoreTheRowScales() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        Path session = Files.createTempDirectory("nf-session-").resolve("per-token-head.nfst");
+        try {
+            for (KvDType type : new KvDType[]{KvDType.FP8_PER_TOKEN_HEAD, KvDType.INT8_PER_TOKEN_HEAD,
+                    KvDType.INT4_PER_TOKEN_HEAD}) {
+                EngineConfig cfg = config(type);
+                float[] expected;
+                int lastPos;
+                int lastToken = 102;
+                try (GGUFModel m = new GGUFModel(model.toString(), cfg)) {
+                    HeapModelMemory memory = memoryOf(m);
+                    m.forwardBackend().prefill(PROMPT, 0);
+                    m.forwardBackend().shiftContext(2, 4);
+                    m.forwardBackend().decode(101, memory.sequence().nPast());
+                    lastPos = memory.sequence().nPast() - 1;
+                    expected = m.forwardBackend().decode(lastToken, lastPos);
+                    memory.saveSession(session);
+                }
+                try (GGUFModel m = new GGUFModel(model.toString(), cfg)) {
+                    HeapModelMemory memory = memoryOf(m);
+                    memory.loadSession(session);
+                    float[] logits = m.forwardBackend().decode(lastToken, lastPos);
+                    assertArrayEquals(type + " scales and codes restore together", expected, logits, 1e-4f);
+                }
+            }
         } finally {
             Files.deleteIfExists(session);
         }

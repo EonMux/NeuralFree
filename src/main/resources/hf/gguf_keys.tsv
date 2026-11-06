@@ -1,4 +1,4 @@
-# gguf_keys.tsv - Generated from llama.cpp a37cc4610 by the updateHfTables Gradle task; do not edit. Rows: 389
+# gguf_keys.tsv - Generated from llama.cpp dde879bc4 by the updateHfTables Gradle task; do not edit. Rows: 453
 # writer_method	key_template	value_type
 add_shard_kv_data	split.no	UINT16
 add_shard_kv_data	split.count	UINT16
@@ -112,6 +112,7 @@ add_indexer_kpool_select_tail	{arch}.attention.indexer.kpool_select_tail	BOOL
 add_max_alibi_bias	{arch}.attention.max_alibi_bias	FLOAT32
 add_clamp_kqv	{arch}.attention.clamp_kqv	FLOAT32
 add_shared_kv_layers	{arch}.attention.shared_kv_layers	UINT32
+add_kv_source_map	{arch}.attention.kv_source_map	ARRAY:INT32
 add_sliding_window_pattern	{arch}.attention.sliding_window_pattern	ANY
 add_recurrent_layers	{arch}.attention.recurrent_layers	ARRAY:BOOL
 add_rope_pattern	{arch}.attention.rope_pattern	ARRAY:BOOL
@@ -121,6 +122,7 @@ add_logit_scale	{arch}.logit_scale	FLOAT32
 add_attn_logit_softcapping	{arch}.attn_logit_softcapping	FLOAT32
 add_router_logit_softcapping	{arch}.router_logit_softcapping	FLOAT32
 add_final_logit_softcapping	{arch}.final_logit_softcapping	FLOAT32
+add_final_logit_sigmoid_capping	{arch}.final_logit_sigmoid_capping	ANY
 add_expert_count	{arch}.expert_count	UINT32
 add_expert_used_count	{arch}.expert_used_count	ANY
 add_expert_shared_count	{arch}.expert_shared_count	UINT32
@@ -144,6 +146,9 @@ add_time_mix_extra_dim	{arch}.time_mix_extra_dim	UINT32
 add_time_decay_extra_dim	{arch}.time_decay_extra_dim	UINT32
 add_residual_scale	{arch}.residual_scale	FLOAT32
 add_embedding_scale	{arch}.embedding_scale	FLOAT32
+add_mudd_feed_forward_length	{arch}.mudd.feed_forward_length	UINT32
+add_mudd_tap_count	{arch}.mudd.tap_count	UINT32
+add_mudd_tap_indices	{arch}.mudd.tap_indices	ARRAY:INT32
 add_hrm_layers_per_stack	{arch}.hrm.layers_per_stack	UINT32
 add_hrm_h_cycles	{arch}.hrm.h_cycles	UINT32
 add_hrm_l_cycles	{arch}.hrm.l_cycles	UINT32
@@ -187,11 +192,19 @@ add_attention_output_group_count	{arch}.attention.output_group_count	UINT32
 add_attention_output_lora_rank	{arch}.attention.output_lora_rank	UINT32
 add_attention_compress_ratios	{arch}.attention.compress_ratios	ARRAY:INT32
 add_attention_compress_rope_freq_base	{arch}.attention.compress_rope_freq_base	FLOAT32
+add_attention_kv_source_layers	{arch}.attention.kv_source_layers	ARRAY:UINT32
+add_indexer_source_layers	{arch}.attention.indexer.source_layers	ARRAY:UINT32
+add_indexer_candidate_source_layer	{arch}.attention.indexer.candidate_source_layer	INT32
+add_indexer_candidate_top_k_blocks	{arch}.attention.indexer.candidate_top_k_blocks	UINT32
+add_indexer_candidate_block_size	{arch}.attention.indexer.candidate_block_size	UINT32
+add_engram_pad_token_id	{arch}.engram.pad_token_id	UINT32
+add_engram_token_map	{arch}.engram.token_map	ARRAY:INT32
 add_hyper_connection_count	{arch}.hyper_connection.count	UINT32
 add_hyper_connection_sinkhorn_iterations	{arch}.hyper_connection.sinkhorn_iterations	UINT32
 add_hyper_connection_epsilon	{arch}.hyper_connection.epsilon	FLOAT32
 add_hyper_connection_magnitude	{arch}.hyper_connection.magnitude	FLOAT32
 add_hyper_connection_low_rank	{arch}.hyper_connection.low_rank	UINT32
+add_hyper_connection_single_pass	{arch}.hyper_connection.single_pass	BOOL
 add_ple_layers	{arch}.ple.layers	ARRAY:INT32
 add_ple_ngram_size	{arch}.ple.ngram_size	UINT32
 add_ple_heads_per_ngram	{arch}.ple.heads_per_ngram	UINT32
@@ -202,6 +215,7 @@ add_ple_head_vocab_sizes	{arch}.ple.head_vocab_sizes	ARRAY:UINT64
 add_ple_eos_token_id	{arch}.ple.eos_token_id	UINT32
 add_ple_image_token_id	{arch}.ple.image_token_id	UINT32
 add_attention_scale	{arch}.attention.scale	FLOAT32
+add_xsa_eps	{arch}.attention.xsa_epsilon	FLOAT32
 add_attn_output_scale	{arch}.attention.output_scale	FLOAT32
 add_attn_value_scale	{arch}.attention.value_scale	FLOAT32
 add_attn_temperature_length	{arch}.attention.temperature_length	UINT32
@@ -268,6 +282,7 @@ add_add_sep_token	tokenizer.ggml.add_sep_token	BOOL
 add_dna_auto_tags	tokenizer.ggml.dna_auto_tags	BOOL
 add_add_space_prefix	tokenizer.ggml.add_space_prefix	BOOL
 add_remove_extra_whitespaces	tokenizer.ggml.remove_extra_whitespaces	BOOL
+add_clean_spaces	tokenizer.ggml.clean_spaces	BOOL
 add_precompiled_charsmap	tokenizer.ggml.precompiled_charsmap	ARRAY:UINT8
 add_chat_template	tokenizer.chat_template.{name}	STRING
 add_chat_template	tokenizer.chat_templates	ARRAY:STRING
@@ -276,11 +291,21 @@ add_suppress_tokens	tokenizer.ggml.suppress_tokens	ARRAY:INT32
 add_normalizer_nfc	tokenizer.ggml.normalizer.nfc	BOOL
 add_normalizer_lowercase	tokenizer.ggml.normalizer.lowercase	BOOL
 add_normalizer_strip_accents	tokenizer.ggml.normalizer.strip_accents	BOOL
+add_metaspace_prepend_scheme	tokenizer.ggml.metaspace.prepend_scheme	STRING
 add_eot_token_id	tokenizer.ggml.eot_token_id	UINT32
 add_eom_token_id	tokenizer.ggml.eom_token_id	UINT32
 add_classifier_output_labels	{arch}.classifier.output_labels	ARRAY:STRING
 add_classifier_pooling_type	{arch}.classifier.pooling_type	UINT32
 add_classifier_activation	{arch}.classifier.activation	STRING
+add_classifier_pooler_activation	{arch}.classifier.pooler_activation	STRING
+add_classifier_token_direct	{arch}.classifier.token_direct	BOOL
+add_classifier_sparse	{arch}.classifier.sparse	STRING
+add_classifier_sparse_cls_token	{arch}.classifier.sparse_cls_token	UINT32
+add_classifier_sparse_sep_token	{arch}.classifier.sparse_sep_token	UINT32
+add_classifier_bos_token	{arch}.classifier.bos_token	UINT32
+add_classifier_eos_token	{arch}.classifier.eos_token	UINT32
+add_classifier_step_tag_id	{arch}.classifier.step_tag_id	UINT32
+add_pooling_normalize	{arch}.pooling.normalize	BOOL
 add_decision_type	{arch}.decision.type	STRING
 add_decision_block_count	{arch}.decision.block_count	UINT32
 add_decision_routing_block_count	{arch}.decision.routing_block_count	UINT32
@@ -341,6 +366,7 @@ add_audio_embedding_length	clip.audio.embedding_length	UINT32
 add_audio_feed_forward_length	clip.audio.feed_forward_length	UINT32
 add_audio_block_count	clip.audio.block_count	UINT32
 add_audio_head_count	clip.audio.attention.head_count	UINT32
+add_audio_head_count_kv	clip.audio.attention.head_count_kv	UINT32
 add_audio_head_dim	clip.audio.attention.head_dim	UINT32
 add_audio_attention_layernorm_eps	clip.audio.attention.layer_norm_epsilon	FLOAT32
 add_audio_num_mel_bins	clip.audio.num_mel_bins	UINT32
@@ -367,6 +393,10 @@ add_gen_audio_projection_dim	clip.gen.audio.projection_dim	UINT32
 add_gen_audio_embedding_length	clip.gen.audio.embedding_length	UINT32
 add_gen_audio_feed_forward_length	clip.gen.audio.feed_forward_length	UINT32
 add_gen_audio_block_count	clip.gen.audio.block_count	UINT32
+add_gen_audio_sampling_temp	clip.gen.audio.sampling.temp	FLOAT32
+add_gen_audio_sampling_top_k	clip.gen.audio.sampling.top_k	INT32
+add_gen_audio_sampling_penalty_repeat	clip.gen.audio.sampling.penalty_repeat	FLOAT32
+add_gen_audio_sampling_penalty_last_n	clip.gen.audio.sampling.penalty_last_n	INT32
 add_gen_audio_head_count	clip.gen.audio.attention.head_count	UINT32
 add_gen_audio_head_count_kv	clip.gen.audio.attention.head_count_kv	UINT32
 add_gen_audio_attention_layernorm_eps	clip.gen.audio.attention.layer_norm_epsilon	FLOAT32
@@ -389,3 +419,37 @@ add_prism_hadamard_gdn_v_grouped	prism.hadamard.gdn_v_grouped	BOOL
 add_attention_value_expert_count	{arch}.attention.value_expert_count	UINT32
 add_attention_value_expert_used_count	{arch}.attention.value_expert_used_count	UINT32
 add_diffusion_shift_logits	diffusion.shift_logits	BOOL
+add_ssm_norm_eps	{arch}.ssm.norm_eps	FLOAT32
+add_ssm_beta_scale	{arch}.ssm.beta_scale	FLOAT32
+add_ssm_group_norm_size	{arch}.ssm.group_norm_size	UINT32
+add_ssm_linear_silu	{arch}.ssm.linear_silu	BOOL
+add_ssm_qk_norm	{arch}.ssm.qk_norm	BOOL
+add_ssm_q_scale	{arch}.ssm.q_scale	BOOL
+add_ssm_rope_dimension_count	{arch}.ssm.rope_dimension_count	UINT32
+add_inkling_relative_extent	{arch}.inkling.relative_extent	UINT32
+add_inkling_relative_dim	{arch}.inkling.relative_dim	UINT32
+add_inkling_sconv_kernel_size	{arch}.inkling.sconv_kernel_size	UINT32
+add_inkling_log_scaling_n_floor	{arch}.inkling.log_scaling_n_floor	UINT32
+add_inkling_log_scaling_alpha	{arch}.inkling.log_scaling_alpha	FLOAT32
+add_mlp_layer_pattern	{arch}.mlp_layer_pattern	ARRAY:BOOL
+add_recurrent_block_num_loops	{arch}.recurrent_block.num_loops	UINT32
+add_recurrent_block_n_input_layers	{arch}.recurrent_block.n_input_layers	UINT32
+add_recurrent_block_n_recurrent_layers	{arch}.recurrent_block.n_recurrent_layers	UINT32
+add_recurrent_block_n_output_layers	{arch}.recurrent_block.n_output_layers	UINT32
+add_recurrent_block_justnorm	{arch}.recurrent_block.justnorm	BOOL
+add_recurrent_block_justnorm_epsilon	{arch}.recurrent_block.justnorm_epsilon	FLOAT32
+add_recurrent_block_dual_attention	{arch}.recurrent_block.dual_attention	BOOL
+add_recurrent_block_local_window	{arch}.recurrent_block.local_window	UINT32
+add_attention_dual_chunk_chunk_size	{arch}.attention.dual_chunk.chunk_size	UINT32
+add_attention_dual_chunk_local_size	{arch}.attention.dual_chunk.local_size	UINT32
+add_attention_dual_chunk_original_max_position_embeddings	{arch}.attention.dual_chunk.original_max_position_embeddings	UINT32
+add_attention_dual_chunk_sparse_enabled	{arch}.attention.dual_chunk.sparse_attention_enabled	BOOL
+add_attention_dual_chunk_sparse_threshold	{arch}.attention.dual_chunk.sparse_attention_threshold	UINT32
+add_attention_dual_chunk_sparse_last_q	{arch}.attention.dual_chunk.sparse_attention_last_q	UINT32
+add_slerp_alpha_scale	{arch}.slerp_alpha_scale	FLOAT32
+add_rope_scaling_mixed_b	{arch}.rope.scaling.mixed_b	FLOAT32
+add_rope_fope_use	{arch}.rope.fope.use	BOOL
+add_rope_fope_sep_head	{arch}.rope.fope.sep_head	BOOL
+add_rope_fope_num_inv_freq	{arch}.rope.fope.num_inv_freq	UINT32
+add_rope_fope_init_factor	{arch}.rope.fope.init_factor	FLOAT32
+add_expert_per_group_top_k	{arch}.expert_per_group_top_k	BOOL

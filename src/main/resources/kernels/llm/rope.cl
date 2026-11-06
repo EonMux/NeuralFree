@@ -68,3 +68,70 @@ NF_KERNEL void LLM_RoPE_Ext(
     x[a] = x0 * cs.x - x1 * cs.y;
     x[b] = x0 * cs.y + x1 * cs.x;
 }
+
+/*
+ * LLM_RoPE_FoPE(i n_tokens, i n_heads, i head_stride, i row_stride, i n_dims, i x_off,
+ *               i n_inv, i n_coef_rows, i sep_head,
+ *               R<int> pos, R cos_coef, R sin_coef, R inv_freq, RWn x)
+ *
+ * Fourier position embedding (vLLM FourierRotaryEmbedding._compute_cos_sin_cache, rotary_embedding/fope.py):
+ * a NEOX rotation over the whole head whose cos/sin of pair i are the learned projections
+ *   cos_i = sum_d cos(pos * inv_freq[d]) * cos_coef[row, d, i],  sin_i = ... (sin_coef)
+ * for i < n_inv, and (1, 1) for the remaining pairs up to n_dims / 2. The coefficient matrix is stored in ggml ne
+ * order [n_inv, n_inv, n_coef_rows], so its index is row * n_inv^2 + d * n_inv + i. Head h reads row h / group with
+ * group = n_heads / n_coef_rows when sep_head, else row 0.
+ *
+ * Launch: 1-D, one work-item per (token, head), g = t * n_heads + h; global = roundUp(n_tokens*n_heads, L),
+ * local = L (any). No barriers; every pair of a head is owned by one work-item.
+ * GLSL twin: shaders/llm/fope_rope.comp.
+ */
+NF_KERNEL void LLM_RoPE_FoPE(
+    const int n_tokens,
+    const int n_heads,
+    const int head_stride,
+    const int row_stride,
+    const int n_dims,
+    const int x_off,
+    const int n_inv,
+    const int n_coef_rows,
+    const int sep_head,
+    NF_GLOBAL const int* NF_RESTRICT pos,
+    NF_GLOBAL const float* NF_RESTRICT cos_coef,
+    NF_GLOBAL const float* NF_RESTRICT sin_coef,
+    NF_GLOBAL const float* NF_RESTRICT inv_freq,
+    NF_GLOBAL float* x)
+{
+    const int pairs = n_dims >> 1;
+    const nf_i64 gid = (nf_i64)get_global_id(0);
+    if (pairs <= 0 || n_inv <= 0 || n_inv > pairs || n_coef_rows <= 0
+            || gid >= (nf_i64)n_tokens * n_heads) {
+        return;
+    }
+    const int h = (int)(gid % n_heads);
+    const int t = (int)(gid / n_heads);
+    const int group = sep_head ? (n_heads / n_coef_rows) : n_heads;
+    const int row = sep_head ? (h / group) : 0;
+    const nf_i64 row_off = (nf_i64)row * n_inv * n_inv;
+    const int p = pos[t];
+    const nf_i64 base = (nf_i64)x_off + (nf_i64)t * row_stride + (nf_i64)h * head_stride;
+    for (int i = 0; i < pairs; i++) {
+        float c = 1.0f;
+        float s = 1.0f;
+        if (i < n_inv) {
+            c = 0.0f;
+            s = 0.0f;
+            for (int d = 0; d < n_inv; d++) {
+                const float angle = (float)p * inv_freq[d];
+                const nf_i64 off = row_off + (nf_i64)d * n_inv + i;
+                c += cos(angle) * cos_coef[off];
+                s += sin(angle) * sin_coef[off];
+            }
+        }
+        const nf_i64 a = base + i;
+        const nf_i64 b = a + pairs;
+        const float x0 = x[a];
+        const float x1 = x[b];
+        x[a] = x0 * c - x1 * s;
+        x[b] = x0 * s + x1 * c;
+    }
+}

@@ -1,4 +1,4 @@
-# hparam_aliases.tsv - Generated from llama.cpp a37cc4610 by the updateHfTables Gradle task; do not edit. Rows: 43
+# hparam_aliases.tsv - Generated from llama.cpp dde879bc4 by the updateHfTables Gradle task; do not edit. Rows: 51
 # gguf_key_template	hf_aliases	value_type	rule
 -	rope_parameters,rope_scaling	-	local rope_parameters; default={}
 -	local_rope_theta,rope_local_theta,rope_theta_local,swa_rope_theta,rope_local_base_freq	-	mirror rope_parameters.sliding_attention.rope_theta; when 'full_attention' not in self.rope_parameters and 'sliding_attention' not in self.rope_parameters
@@ -6,6 +6,7 @@
 -	rope_parameters.type	-	mirror rope_parameters.rope_type; when 'full_attention' not in self.rope_parameters and 'sliding_attention' not in self.rope_parameters and 'rope_type' not in self.rope_parameters
 -	partial_rotary_factor,rope_pct,rope_percent	-	mirror rope_parameters.partial_rotary_factor; when 'full_attention' not in self.rope_parameters and 'sliding_attention' not in self.rope_parameters and 'partial_rotary_factor' not in self.rope_parameters
 -	original_max_position_embeddings	-	mirror rope_parameters.original_max_position_embeddings; when 'full_attention' not in self.rope_parameters and 'sliding_attention' not in self.rope_parameters and 'original_max_position_embeddings' not in self.rope_parameters
+-	max_trained_positions	-	mirror rope_parameters.max_trained_positions; when 'full_attention' not in self.rope_parameters and 'sliding_attention' not in self.rope_parameters and 'max_trained_positions' not in self.rope_parameters
 {arch}.block_count	n_layers,num_hidden_layers,n_layer,num_layers	UINT32	required
 {arch}.context_length	max_position_embeddings,n_ctx,n_positions,max_length,max_sequence_length,model_max_length	UINT32	optional
 {arch}.embedding_length	hidden_size,n_embd,dim	UINT32	optional
@@ -27,6 +28,13 @@
 {arch}.rope.scaling.yarn_beta_fast	rope_params.beta_fast	FLOAT32	optional; when rope_type is not None and not (rope_type == 'linear' and rope_factor is not None) and rope_type == 'yarn' and rope_factor is not None
 {arch}.rope.scaling.yarn_beta_slow	rope_params.beta_slow	FLOAT32	optional; when rope_type is not None and not (rope_type == 'linear' and rope_factor is not None) and rope_type == 'yarn' and rope_factor is not None
 {arch}.rope.scaling.type	-	STRING	always; when rope_type is not None and not (rope_type == 'linear' and rope_factor is not None) and not (rope_type == 'yarn' and rope_factor is not None) and (rope_type == 'su' or rope_type == 'longrope'); value gguf.RopeScalingType.LONGROPE
+{arch}.rope.scaling.type	-	STRING	always; when rope_type is not None and rope_type == 'dynamic'; value gguf.RopeScalingType.DYNAMIC
+{arch}.rope.scaling.factor	rope_params.factor	FLOAT32	optional; when rope_type is not None and rope_type == 'dynamic'
+{arch}.rope.scaling.alpha	rope_params.alpha	FLOAT32	optional; when rope_type is not None and rope_type == 'dynamic'
+{arch}.rope.scaling.original_context_length	rope_params.max_trained_positions,rope_params.original_max_position_embeddings	UINT32	optional; when rope_type is not None and rope_type == 'dynamic'
+{arch}.rope.scaling.type	-	STRING	always; when rope_type is not None and not (rope_type == 'linear' and rope_factor is not None) and not (rope_type == 'yarn' and rope_factor is not None) and rope_type == 'ntk'; value gguf.RopeScalingType.NTK
+{arch}.rope.scaling.factor	rope_params.factor	FLOAT32	optional; when rope_type is not None and rope_type == 'ntk'
+{arch}.rope.scaling.mixed_b	rope_params.mixed_b	FLOAT32	optional; when rope_type is not None and rope_type == 'ntk'
 {arch}.rope.dimension_sections	rope_parameters.mrope_section	ARRAY:INT32	required; when 'mrope_section' in self.rope_parameters; value mrope_section[:4]; after while len(mrope_section) < 4: mrope_section.append(0)
 {arch}.rope.freq_base	rope_params.rope_theta	FLOAT32	optional
 {arch}.rope.freq_base_swa	rope_parameters.sliding_attention.rope_theta	FLOAT32	optional

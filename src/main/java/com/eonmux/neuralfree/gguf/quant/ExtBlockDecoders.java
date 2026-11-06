@@ -6,7 +6,7 @@ import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 
 /**
  * CPU decoders for the NeuralFree extension block types ({@code GGMLType.isExtension()}): F8_E4M3, F8_E5M2,
- * F8_E4M3_B128, MXFP8, MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4 and FP4_BNB. These carry quantized checkpoint formats exactly, with every scale inside the
+ * F8_E4M3_B128, F8_E4M3_B32, MXFP8, MXFP6_E3M2, MXFP6_E2M3, I8_B128, NF4 and FP4_BNB. These carry quantized checkpoint formats exactly, with every scale inside the
  * block; the field offsets are the {@link BlockLayout} constants and the element codecs those of
  * {@link FpBlockDecoders} and {@link QuantTables}.
  * <p>
@@ -86,6 +86,17 @@ public final class ExtBlockDecoders {
             final float d = b.getFloat(off + F8B128_D);
             final int qs = off + F8B128_QS;
             for (int j = 0; j < QK_F8B128; j++) {
+                y[yOff + j] = d * E4M3[b.get(qs + j) & 0xFF];
+            }
+        }
+    }
+
+    /** F8_E4M3_B32 {@code {f32 d; u8 qs[32]}}: {@code y = d * e4m3(qs[j])}. */
+    static void decodeF8E4m3B32(ByteBuffer b, int off, float[] y, int yOff, int nb) {
+        for (int i = 0; i < nb; i++, off += F8B32_BYTES, yOff += QK_F8B32) {
+            final float d = b.getFloat(off + F8B32_D);
+            final int qs = off + F8B32_QS;
+            for (int j = 0; j < QK_F8B32; j++) {
                 y[yOff + j] = d * E4M3[b.get(qs + j) & 0xFF];
             }
         }

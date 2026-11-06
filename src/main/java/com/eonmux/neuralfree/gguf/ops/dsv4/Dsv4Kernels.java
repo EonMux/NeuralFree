@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.ops.dsv4;
 import com.eonmux.neuralfree.gguf.arch.RopeType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
+import com.eonmux.neuralfree.gguf.spec.Dsv41Spec;
 import com.eonmux.neuralfree.gguf.spec.Dsv4Spec;
 
 import java.util.ArrayList;
@@ -34,7 +35,8 @@ import java.util.Objects;
  * LLM_DSV4_CompressedAttn(i n_tokens(dyn), i n_head, i head_dim, i g_tile, i q_off(dyn), i out_off(dyn),
  *                         i n_raw(dyn), i raw_type, i n_swa, i comp_mode, i n_comp(dyn), i comp_type, i ratio,
  *                         i sel_stride(dyn), i has_sinks, f kq_scale, i rot_block, i n_rot, i rope_mode, f theta_scale,
- *                         f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi,
+ *                         f freq_scale, f ext_factor, f attn_factor, f corr_lo, f corr_hi, i sel_off(dyn),
+ *                         i comp_stride,
  *                         R q, R&lt;KV&gt; raw_k, R&lt;int&gt; raw_pos, R&lt;KV&gt; comp_k, R&lt;int&gt; sel, R sinks,
  *                         R&lt;int&gt; q_pos, W out)
  * </pre>
@@ -60,23 +62,29 @@ import java.util.Objects;
 public final class Dsv4Kernels {
 
     public static final String COMPRESS = "LLM_DSV4_Compress";
+    /** DeepSeek-V4.1 pooled latent of every completed block, as F32 rows (no rope, no cache rotation). */
+    public static final String COMPRESS_V41 = "LLM_DSV4_CompressV41";
     /** Name prefix of the {@code LLM_DSV4_LidUpdate_<KV>} variants. */
     public static final String LID_UPDATE_PREFIX = "LLM_DSV4_LidUpdate_";
     public static final String STATE_UPDATE = "LLM_DSV4_StateUpdate";
     public static final String STATE_SNAPSHOT = "LLM_DSV4_StateSnapshot";
     public static final String CACHE_STORE = "LLM_DSV4_CacheStore";
     public static final String COMPRESSED_ATTN = "LLM_DSV4_CompressedAttn";
+    /** The DeepSeek-V4.1 Engram gate and residual add. */
+    public static final String ENGRAM_ADD = "LLM_DSV4_EngramAdd";
 
     public static final List<String> ALL;
 
     static {
         List<String> all = new ArrayList<>();
         all.add(COMPRESS);
-        all.addAll(KvDType.kernelVariants(LID_UPDATE_PREFIX));
+        all.add(COMPRESS_V41);
+        all.addAll(KvDType.kernelVariants(LID_UPDATE_PREFIX, t -> !t.perTokenHead() && t.hasSparseKernel()));
         all.add(STATE_UPDATE);
         all.add(STATE_SNAPSHOT);
         all.add(CACHE_STORE);
         all.add(COMPRESSED_ATTN);
+        all.add(ENGRAM_ADD);
         ALL = Collections.unmodifiableList(all);
     }
 
@@ -85,18 +93,47 @@ public final class Dsv4Kernels {
     public static final int ARG_COMPRESS_N_TOKENS = 1;
     public static final int ARG_COMPRESS_CUR_KV_OFF = 15;
     public static final int ARG_COMPRESS_CUR_SCORE_OFF = 16;
+    public static final int ARG_COMPRESS_STATE_KV = 17;
+    public static final int ARG_COMPRESS_STATE_SCORE = 18;
+    public static final int ARG_COMPRESS_CACHE = 23;
 
     public static final int LID_ARG_COUNT = 22;
     public static final int ARG_LID_POS0 = 0;
     public static final int ARG_LID_N_TOKENS = 1;
     public static final int ARG_LID_CUR_KV_OFF = 13;
     public static final int ARG_LID_CUR_SCORE_OFF = 14;
+    public static final int ARG_LID_STATE_KV = 15;
+    public static final int ARG_LID_STATE_SCORE = 16;
+    public static final int ARG_LID_CACHE = 21;
+
+    public static final int V41_ARG_COUNT = 14;
+    public static final int ARG_V41_POS0 = 0;
+    public static final int ARG_V41_N_TOKENS = 1;
+    public static final int ARG_V41_CUR_KV_OFF = 5;
+    public static final int ARG_V41_CUR_SCORE_OFF = 6;
+    public static final int ARG_V41_STATE_KV = 7;
+    public static final int ARG_V41_STATE_SCORE = 8;
+    public static final int ARG_V41_OUT = 13;
+
+    /** {@code LLM_DSV4_EngramAdd}: argument count and the per-step arguments. */
+    public static final int ENGRAM_ARG_COUNT = 11;
+    public static final int ARG_ENGRAM_N_TOKENS = 0;
+    public static final int ARG_ENGRAM_HC = 2;
+    public static final int ARG_ENGRAM_X_OFF = 4;
+    public static final int ARG_ENGRAM_ACTIVE = 5;
+    public static final int ARG_ENGRAM_NORM_X = 6;
+    public static final int ARG_ENGRAM_NORM_KEY = 7;
+    public static final int ARG_ENGRAM_GATE_W = 8;
+    public static final int ARG_ENGRAM_KV_OUT = 9;
+    public static final int ARG_ENGRAM_X = 10;
 
     public static final int STATE_ARG_COUNT = 11;
     public static final int ARG_STATE_POS0 = 0;
     public static final int ARG_STATE_N_TOKENS = 1;
     public static final int ARG_STATE_CUR_KV_OFF = 4;
     public static final int ARG_STATE_CUR_SCORE_OFF = 5;
+    public static final int ARG_STATE_STATE_KV = 9;
+    public static final int ARG_STATE_STATE_SCORE = 10;
 
     public static final int SNAPSHOT_ARG_COUNT = 12;
     public static final int ARG_SNAPSHOT_POS0 = 0;
@@ -104,18 +141,28 @@ public final class Dsv4Kernels {
     public static final int ARG_SNAPSHOT_N_SNAP = 4;
     public static final int ARG_SNAPSHOT_CUR_KV_OFF = 5;
     public static final int ARG_SNAPSHOT_CUR_SCORE_OFF = 6;
+    public static final int ARG_SNAPSHOT_STATE_KV = 10;
+    public static final int ARG_SNAPSHOT_STATE_SCORE = 11;
 
     public static final int STORE_ARG_COUNT = 9;
     public static final int ARG_STORE_N_TOKENS = 0;
     public static final int ARG_STORE_SRC_OFF = 4;
+    public static final int ARG_STORE_CACHE = 8;
 
-    public static final int ATTN_ARG_COUNT = 33;
+    public static final int ATTN_ARG_COUNT = 35;
     public static final int ARG_ATTN_N_TOKENS = 0;
     public static final int ARG_ATTN_Q_OFF = 4;
     public static final int ARG_ATTN_OUT_OFF = 5;
     public static final int ARG_ATTN_N_RAW = 6;
     public static final int ARG_ATTN_N_COMP = 10;
     public static final int ARG_ATTN_SEL_STRIDE = 13;
+    /** First entry of the launch's selection in the step-global selection plane. */
+    public static final int ARG_ATTN_SEL_OFF = 25;
+    /** Values per compressed cache row; the key is its first {@code headDim}. */
+    public static final int ARG_ATTN_COMP_STRIDE = 26;
+    public static final int ARG_ATTN_RAW_POS = 29;
+    public static final int ARG_ATTN_COMP_K = 30;
+    public static final int ARG_ATTN_Q_POS = 33;
 
     /** Largest compressed row width / head dim a work-group holds in local memory ({@code NF_DSV4_MAX_WIDTH}). */
     public static final int MAX_WIDTH = 1024;
@@ -152,19 +199,19 @@ public final class Dsv4Kernels {
             return code;
         }
 
-        /** Mode of a layer with the given compress ratio (0, {@link Dsv4Spec#RATIO_CSA} or {@link Dsv4Spec#RATIO_HCA}). */
+        /** Mode of a layer with the given compress ratio: 0 window-only, 2/4 selected, 1/128 dense. */
         public static CompMode forRatio(int ratio) {
             if (ratio == 0) {
                 return NONE;
             }
-            if (ratio == Dsv4Spec.RATIO_CSA) {
+            if (ratio == Dsv4Spec.RATIO_CSA || ratio == Dsv41Spec.RATIO_SELECTED) {
                 return SELECTED;
             }
-            if (ratio == Dsv4Spec.RATIO_HCA) {
+            if (ratio == Dsv4Spec.RATIO_HCA || ratio == Dsv41Spec.RATIO_DENSE) {
                 return DENSE;
             }
-            throw new IllegalArgumentException("DeepSeek-V4 compress ratio must be 0, " + Dsv4Spec.RATIO_CSA + " or "
-                    + Dsv4Spec.RATIO_HCA + ", got " + ratio);
+            throw new IllegalArgumentException("DeepSeek-V4 compress ratio must be 0, 4, 128 (V4) or 2, 1 (V4.1),"
+                    + " got " + ratio);
         }
     }
 
@@ -362,6 +409,25 @@ public final class Dsv4Kernels {
         return new long[]{(long) nTokens * tiles * local};
     }
 
+    /** 1-D global size of {@code LLM_DSV4_EngramAdd}: one work-group per (token, stream). */
+    public static long[] engramGlobal(int nTokens, int hc, int local) {
+        checkLocal(local);
+        checkPositive("Engram n_tokens", nTokens);
+        checkPositive("Engram stream count", hc);
+        return new long[]{(long) nTokens * hc * local};
+    }
+
+    /**
+     * Checks one {@code LLM_DSV4_EngramAdd} configuration: a positive token count and width, a positive stream count
+     * and a local size the reduction supports.
+     */
+    public static void checkEngram(int nTokens, int nEmbd, int hc, int local) {
+        checkPositive("Engram n_tokens", nTokens);
+        checkPositive("Engram n_embd", nEmbd);
+        checkPositive("Engram stream count", hc);
+        checkLocal(local);
+    }
+
     /** Local size array {@code {local}}. */
     public static long[] local(int local) {
         return new long[]{local};
@@ -406,11 +472,15 @@ public final class Dsv4Kernels {
         }
     }
 
-    /** Checks a compress ratio: {@link Dsv4Spec#RATIO_CSA} or {@link Dsv4Spec#RATIO_HCA}. */
+    /**
+     * Checks a compress ratio: 4 or 128 of DeepSeek-V4, 2 or 1 of DeepSeek-V4.1.
+     */
     public static void checkRatio(int ratio) {
-        if (ratio != Dsv4Spec.RATIO_CSA && ratio != Dsv4Spec.RATIO_HCA) {
-            throw new IllegalArgumentException("DeepSeek-V4 compress ratio must be " + Dsv4Spec.RATIO_CSA + " or "
-                    + Dsv4Spec.RATIO_HCA + ", got " + ratio);
+        if (ratio != Dsv4Spec.RATIO_CSA && ratio != Dsv4Spec.RATIO_HCA
+                && ratio != Dsv41Spec.RATIO_SELECTED && ratio != Dsv41Spec.RATIO_DENSE) {
+            throw new IllegalArgumentException("DeepSeek-V4 compress ratio must be " + Dsv4Spec.RATIO_CSA + ", "
+                    + Dsv4Spec.RATIO_HCA + " (V4) or " + Dsv41Spec.RATIO_SELECTED + ", " + Dsv41Spec.RATIO_DENSE
+                    + " (V4.1), got " + ratio);
         }
     }
 

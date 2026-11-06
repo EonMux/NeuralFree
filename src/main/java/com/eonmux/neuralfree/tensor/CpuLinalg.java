@@ -5,6 +5,7 @@ import java.util.Arrays;
 /**
  * CPU reference of {@link TensorOps#matmul} and {@link TensorOps#bmm}: each output is the sum of its K separately
  * rounded products, added in ascending k from {@code 0.0f}. Results never require grad, whatever the operands' flags.
+ * FLOAT64 operands are multiplied by {@link CpuFloat64}.
  */
 final class CpuLinalg {
 
@@ -20,6 +21,9 @@ final class CpuLinalg {
      *                                  broadcast
      */
     static Tensor matmul(Tensor a, Tensor b) {
+        if (CpuFloat64.applies("matmul", a, b)) {
+            return CpuFloat64.matmul(a, b);
+        }
         Shape shapeA = a.shape();
         Shape shapeB = b.shape();
 
@@ -111,6 +115,9 @@ final class CpuLinalg {
      * @throws IllegalArgumentException when an operand is not rank 3 or the batches or inner dimensions differ
      */
     static Tensor bmm(Tensor a, Tensor b) {
+        if (CpuFloat64.applies("bmm", a, b)) {
+            return CpuFloat64.bmm(a, b);
+        }
         Shape shapeA = a.shape();
         Shape shapeB = b.shape();
 
@@ -186,7 +193,7 @@ final class CpuLinalg {
         }
     }
 
-    private static int[] getBatchDims(Shape shape) {
+    static int[] getBatchDims(Shape shape) {
         if (shape.rank() <= 2) {
             return new int[0];
         }
@@ -197,7 +204,7 @@ final class CpuLinalg {
         return batchDims;
     }
 
-    private static int[] broadcastBatchShapes(int[] batchDimsA, int[] batchDimsB) {
+    static int[] broadcastBatchShapes(int[] batchDimsA, int[] batchDimsB) {
         int maxLen = Math.max(batchDimsA.length, batchDimsB.length);
         int[] result = new int[maxLen];
 
@@ -215,7 +222,7 @@ final class CpuLinalg {
     }
 
     /** Matrix-count strides of an operand's batch dims over the broadcast batch dims (0 on broadcast dims). */
-    private static int[] computeBatchStrides(int[] batchDims, int[] broadcastDims) {
+    static int[] computeBatchStrides(int[] batchDims, int[] broadcastDims) {
         int[] strides = new int[broadcastDims.length];
         int offset = broadcastDims.length - batchDims.length;
 
@@ -237,7 +244,7 @@ final class CpuLinalg {
         return strides;
     }
 
-    private static int computeBatchOffset(int[] indices, int[] strides) {
+    static int computeBatchOffset(int[] indices, int[] strides) {
         int offset = 0;
         for (int i = strides.length - 1; i >= 0; i--) {
             if (strides[i] > 0) {

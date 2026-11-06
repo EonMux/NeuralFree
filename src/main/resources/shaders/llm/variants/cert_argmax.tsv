@@ -1,0 +1,7 @@
+# kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
+# Certified exact-argmax LM head (kernels/llm/cert_argmax.cl): the int8 screen of the stored rows and
+# the per-row candidate rescore; WT selects the rescore's stored weight layout.
+LLM_CertScreen	cert_screen.comp	OP=OP_CERT_SCREEN
+LLM_CertRescore_F16	cert_rescore.comp	OP=OP_CERT_RESCORE WT=WT_F16
+LLM_CertRescore_BF16	cert_rescore.comp	OP=OP_CERT_RESCORE WT=WT_BF16
+LLM_CertRescore_Q8_0	cert_rescore.comp	OP=OP_CERT_RESCORE WT=WT_Q8_0

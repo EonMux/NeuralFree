@@ -134,6 +134,20 @@ public final class PreparedDispatch implements AutoCloseable {
         return kernelName;
     }
 
+    /**
+     * The value currently bound to the argument at {@code argIndex}: the last value a setter took,
+     * which the next dispatch launches. A graph replay's patcher compares it against the value the
+     * patcher derives for the step.
+     */
+    public Object argValue(int argIndex) {
+        ensureOpen();
+        if (argIndex < 0 || argIndex >= args.length) {
+            throw new IllegalArgumentException(kernelName + " has no argument " + argIndex + " (" + args.length
+                    + " arguments)");
+        }
+        return args[argIndex];
+    }
+
     /** Number of kernel arguments. */
     public int argCount() {
         return args.length;

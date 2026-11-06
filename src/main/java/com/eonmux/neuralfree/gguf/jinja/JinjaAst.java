@@ -25,7 +25,16 @@ public final class JinjaAst {
 
         /** Renders this template with the given variables (converted by {@link JinjaValue#fromJava}). */
         public String render(Map<String, ?> context) {
-            return JinjaRuntime.render(body, context);
+            return JinjaRuntime.render(body, context, null);
+        }
+
+        /**
+         * {@link #render(Map)}, recording into {@code usage} which context values the template used; the
+         * statistics are recorded up to the point of failure when rendering raises.
+         */
+        public String render(Map<String, ?> context, JinjaUsage usage) {
+            if (usage == null) throw new IllegalArgumentException("usage statistics are null");
+            return JinjaRuntime.render(body, context, usage);
         }
     }
 
@@ -59,7 +68,11 @@ public final class JinjaAst {
             this.name = name;
         }
 
-        @Override Object eval(Scope scope) { return scope.resolve(name); }
+        @Override Object eval(Scope scope) {
+            Object v = scope.resolve(name);
+            if (scope.usage != null && v != JinjaValue.UNDEFINED) scope.usage.markUsed(v);
+            return v;
+        }
     }
 
     /** List, tuple or dict display; every evaluation yields a fresh container. */
@@ -193,7 +206,12 @@ public final class JinjaAst {
             this.name = name;
         }
 
-        @Override Object eval(Scope scope) { return JinjaValue.getAttr(target.eval(scope), name); }
+        @Override Object eval(Scope scope) {
+            Object t = target.eval(scope);
+            Object v = JinjaValue.getAttr(t, name);
+            if (scope.usage != null) scope.usage.access(t, name, v);
+            return v;
+        }
     }
 
     static final class Item extends Expr {
@@ -206,7 +224,13 @@ public final class JinjaAst {
             this.key = key;
         }
 
-        @Override Object eval(Scope scope) { return JinjaValue.getItem(target.eval(scope), key.eval(scope)); }
+        @Override Object eval(Scope scope) {
+            Object t = target.eval(scope);
+            Object k = key.eval(scope);
+            Object v = JinjaValue.getItem(t, k);
+            if (scope.usage != null) scope.usage.access(t, k, v);
+            return v;
+        }
     }
 
     /** {@code target[start:stop:step]}; absent bounds are null. */
@@ -296,6 +320,7 @@ public final class JinjaAst {
         }
 
         Object apply(Object input, Scope scope) {
+            if (scope.usage != null) scope.usage.filter(name, input);
             return JinjaFilters.apply(name, input, args.evalPositional(scope), args.evalKeywords(scope));
         }
     }
@@ -328,7 +353,9 @@ public final class JinjaAst {
         }
 
         @Override Object eval(Scope scope) {
-            boolean r = JinjaRuntime.test(name, input.eval(scope), args.evalPositional(scope));
+            Object v = input.eval(scope);
+            if (scope.usage != null) scope.usage.test(name, v);
+            boolean r = JinjaRuntime.test(name, v, args.evalPositional(scope));
             return negated != r;
         }
     }

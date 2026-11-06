@@ -1,0 +1,10 @@
+{#- llama.cpp exaone-moe chat template (src/llama-chat.cpp:600-615). -#}
+{%- for message in messages -%}
+    {%- set content = (message['content'] if message['content'] is string else '') | trim(' \t\n\v\f\r') -%}
+    {%- if message['role'] in ['system', 'user', 'assistant', 'tool'] -%}
+        {{- '<|' ~ message['role'] ~ '|>\n' ~ content ~ '<|endofturn|>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|assistant|>\n' -}}
+{%- endif -%}

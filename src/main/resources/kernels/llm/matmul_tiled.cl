@@ -1,6 +1,6 @@
 /* matmul_tiled.cl - matmul_tiled_family instantiations for every weight type (prefill GEMM). Requires: common/dialect.h, common/config.h, common/quant_blocks.h, common/iq_tables.h, common/quant_decode_legacy.h, common/quant_decode_k.h, common/quant_decode_iq.h, common/quant_decode_new.h, common/quant_decode_ext.h, common/matmul_tiled_family.h */
 /*
- * Generates T_MatMul_Tiled for the 36 supported weight types: F32, F16 and BF16 through the
+ * Generates T_MatMul_Tiled for the 39 supported weight types: F32, F16 and BF16 through the
  * dense loaders of common/matmul_tiled_family.h, every quantized type through its T_decode_elem
  * (common/quant_decode_*.h), and the _Hw hardware-FP8 fast-path rows of the four FP8 code types (their
  * element loaders equal the generic ones, see common/quant_decode_ext.h). Arguments, semantics and
@@ -34,6 +34,8 @@ NF_GEMM_TILED(Q8_K, Q8_K_decode_elem, Q8_K_BLOCK_SIZE, Q8_K_BLOCK_BYTES)
 /* ---- I-quants (common/quant_decode_iq.h) ---- */
 NF_GEMM_TILED(IQ3_XXS, IQ3_XXS_decode_elem, IQ3_XXS_BLOCK_SIZE, IQ3_XXS_BLOCK_BYTES)
 NF_GEMM_TILED(IQ3_S,   IQ3_S_decode_elem,   IQ3_S_BLOCK_SIZE,   IQ3_S_BLOCK_BYTES)
+NF_GEMM_TILED(IQ3_K,   IQ3_K_decode_elem,   IQ3_K_BLOCK_SIZE,   IQ3_K_BLOCK_BYTES)
+NF_GEMM_TILED(IQ3_KS,  IQ3_KS_decode_elem,  IQ3_KS_BLOCK_SIZE,  IQ3_KS_BLOCK_BYTES)
 NF_GEMM_TILED(IQ2_XXS, IQ2_XXS_decode_elem, IQ2_XXS_BLOCK_SIZE, IQ2_XXS_BLOCK_BYTES)
 NF_GEMM_TILED(IQ2_XS,  IQ2_XS_decode_elem,  IQ2_XS_BLOCK_SIZE,  IQ2_XS_BLOCK_BYTES)
 NF_GEMM_TILED(IQ2_S,   IQ2_S_decode_elem,   IQ2_S_BLOCK_SIZE,   IQ2_S_BLOCK_BYTES)
@@ -51,6 +53,7 @@ NF_GEMM_TILED(Q2_0,  Q2_0_decode_elem,  Q2_0_BLOCK_SIZE,  Q2_0_BLOCK_BYTES)
 NF_GEMM_TILED(F8_E5M2,      F8_E5M2_decode_elem,      F8_E5M2_BLOCK_SIZE,      F8_E5M2_BLOCK_BYTES)
 NF_GEMM_TILED(F8_E4M3,      F8_E4M3_decode_elem,      F8_E4M3_BLOCK_SIZE,      F8_E4M3_BLOCK_BYTES)
 NF_GEMM_TILED(F8_E4M3_B128, F8_E4M3_B128_decode_elem, F8_E4M3_B128_BLOCK_SIZE, F8_E4M3_B128_BLOCK_BYTES)
+NF_GEMM_TILED(F8_E4M3_B32,  F8_E4M3_B32_decode_elem,  F8_E4M3_B32_BLOCK_SIZE,  F8_E4M3_B32_BLOCK_BYTES)
 NF_GEMM_TILED(MXFP8,        MXFP8_decode_elem,        MXFP8_BLOCK_SIZE,        MXFP8_BLOCK_BYTES)
 NF_GEMM_TILED(MXFP6_E2M3,   MXFP6_E2M3_decode_elem,   MXFP6_E2M3_BLOCK_SIZE,   MXFP6_E2M3_BLOCK_BYTES)
 NF_GEMM_TILED(MXFP6_E3M2,   MXFP6_E3M2_decode_elem,   MXFP6_E3M2_BLOCK_SIZE,   MXFP6_E3M2_BLOCK_BYTES)

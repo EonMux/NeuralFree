@@ -99,6 +99,10 @@ public final class NormResolver {
         if (hp.arch() == Arch.COHERE2MOE) {
             k = hp.normRmsEps() == 0f ? NormKind.LAYER : NormKind.RMS;
         }
+        if (hp.arch() == Arch.EAGLE_COHERE) {
+            // vLLM's Cohere draft selects RMSNorm when the draft config has rms_norm_eps, else LayerNorm
+            k = hp.normRmsEps() == 0f ? NormKind.LAYER : NormKind.RMS;
+        }
         if (!k.isRowNorm()) {
             throw new IllegalStateException(hp.arch().ggufName() + ": block norm kind " + k + " is not a row norm");
         }
@@ -131,6 +135,11 @@ public final class NormResolver {
     public NormSpec resolve(String stack, int il) {
         Objects.requireNonNull(stack, "stack");
         boolean main = TensorNames.STACK_BLK.equals(stack);
+        if (main && arch == Arch.ZAMBA2) {
+            // A Zamba2 layer normalizes inside its mixer: the Mamba-2 input norm (attn_norm), the 2*n_embd shared
+            // block input norm and its pre-FF norm are steps of the composite mixer, not the layer executor's.
+            return NormSpec.builder(kind, eps).attnNorm(false).ffnNorm(false).build();
+        }
         boolean attnNorm = has(stack, il, TensorNames.ATTN_NORM);
         boolean ffnNorm = has(stack, il, TensorNames.FFN_NORM);
         boolean postAttn = has(stack, il, TensorNames.ATTN_POST_NORM);
@@ -153,6 +162,12 @@ public final class NormResolver {
         if (bertGraph) {
             return b.attnNorm(false).ffnNorm(false).postRole(PostNormRole.NONE)
                     .attnOutputNorm(attnOut).layerOutputNorm(layerOut).build();
+        }
+        // OPT's 350M variant applies both block norms after their residual adds; its converter writes them as
+        // attn_output_norm and layer_output_norm instead of the pre-LN attn_norm and ffn_norm (vLLM opt.py:129-165).
+        if (optPostLayerNorm(attnNorm, ffnNorm, attnOut, layerOut)) {
+            return b.attnNorm(false).ffnNorm(false).postRole(PostNormRole.NONE)
+                    .attnOutputNorm(true).layerOutputNorm(true).build();
         }
         if (arch == Arch.DBRX) {
             return b.attnNorm(attnNorm).ffnNorm(attnOut).postRole(PostNormRole.NONE).build();
@@ -188,6 +203,11 @@ public final class NormResolver {
         if (arch == Arch.MUSE_SPARK && main) {
             postAttn = true;
             b.postAttnWeightless(true).postFfnWeightFirst(postFfn);
+        }
+        if (arch == Arch.LFM3 && (postAttn != postFfn)) {
+            throw new IllegalStateException(arch.ggufName() + " layer " + il + ": lfm3 requires both post norms or"
+                    + " neither (lfm3.cpp:51-55), got post_attention_norm " + postAttn + " and post_ffw_norm "
+                    + postFfn);
         }
         if (postAttn || postFfn) {
             b.postRole(PostNormRole.SANDWICH).postAttnNorm(postAttn).postFfnNorm(postFfn).postEps(hp.postNormEps());
@@ -242,6 +262,15 @@ public final class NormResolver {
         return g;
     }
 
+    /**
+     * True for an OPT layer whose tensors place both norms after the residual adds: no pre-norms, and both
+     * {@code attn_output_norm} and {@code layer_output_norm} present. The pre-LN variant carries
+     * {@code attn_norm} and {@code ffn_norm} instead, so tensor presence selects the variant.
+     */
+    private boolean optPostLayerNorm(boolean attnNorm, boolean ffnNorm, boolean attnOut, boolean layerOut) {
+        return arch == Arch.OPT && !attnNorm && !ffnNorm && attnOut && layerOut;
+    }
+
     /** chameleon {@code swin_norm}: block norms on the branch outputs (models/chameleon.cpp:75, 132, 142, 157). */
     private boolean swinNorm() {
         return arch == Arch.CHAMELEON && hp.swinNorm();
@@ -276,6 +305,9 @@ public final class NormResolver {
         checkLayer(il);
         if (arch == Arch.SENSENOVA_U1) {
             return QkNormKind.RMS_SPLIT_HALF;
+        }
+        if (arch == Arch.DORY) {
+            return QkNormKind.L2_HEAD;
         }
         TensorRef q = tc.layer(il, TensorNames.weight(TensorNames.ATTN_Q_NORM));
         TensorRef k = tc.layer(il, TensorNames.weight(TensorNames.ATTN_K_NORM));
@@ -312,6 +344,9 @@ public final class NormResolver {
         if (qk == QkNormKind.NONE) {
             return false;
         }
+        if (arch == Arch.DORY) {
+            return true;
+        }
         if (QK_NORM_AFTER_ROPE.contains(arch)) {
             return true;
         }
@@ -334,7 +369,7 @@ public final class NormResolver {
         if (!hp.useKqNorm()) {
             return false;
         }
-        if (arch == Arch.LLAMA4) {
+        if (arch == Arch.LLAMA4 || arch == Arch.EAGLE_LLAMA4) {
             return hp.hasRope(il);
         }
         return arch == Arch.LLAMA || arch == Arch.LLAMA_EMBED;

@@ -425,6 +425,16 @@ public final class HcKernels {
             return new PostParams(false, POST_ACT_SIGMOID, 1.0f / hc, QWEN4EXP_INJECT_MAGNITUDE);
         }
 
+        /**
+         * {@link #gatedInject} for inject values that carry the {@code 1/hc} scale already: the merged
+         * {@code hc_*_down_inject} weight scales its whole output before the down/inject split
+         * (qwen4exp.cpp:366-374), so {@code Xout[dst] = y*2*sigmoid(inject[dst]) + X[dst]}.
+         */
+        public static PostParams gatedInjectPreScaled(int hc) {
+            validateStreams(hc);
+            return new PostParams(false, POST_ACT_SIGMOID, 1.0f, QWEN4EXP_INJECT_MAGNITUDE);
+        }
+
         public boolean hasComb() { return hasComb; }
 
         /** {@link #POST_ACT_NONE} or {@link #POST_ACT_SIGMOID}. */

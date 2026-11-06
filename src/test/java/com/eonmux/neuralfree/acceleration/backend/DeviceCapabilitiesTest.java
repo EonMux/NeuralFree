@@ -48,6 +48,23 @@ public class DeviceCapabilitiesTest {
     }
 
     @Test
+    public void computeUnitsAreUnknownUntilReported() {
+        DeviceCapabilities unreported = new DeviceCapabilities.Builder().deviceName("Intel").build();
+        assertEquals(DeviceCapabilities.UNKNOWN_COMPUTE_UNITS, unreported.getComputeUnits());
+        assertFalse(unreported.isComputeUnitsKnown());
+
+        DeviceCapabilities reported = new DeviceCapabilities.Builder().deviceName("RTX").computeUnits(60).build();
+        assertTrue(reported.isComputeUnitsKnown());
+
+        try {
+            new DeviceCapabilities.Builder().deviceName("bad").computeUnits(-1).build();
+            fail("Expected IllegalArgumentException for a negative compute-unit count");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("compute units"));
+        }
+    }
+
+    @Test
     public void testBuilderDefaults() {
         DeviceCapabilities caps = new DeviceCapabilities.Builder()
                 .deviceName("TestDevice")

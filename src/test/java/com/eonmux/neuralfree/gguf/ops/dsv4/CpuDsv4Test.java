@@ -194,6 +194,37 @@ public class CpuDsv4Test {
     }
 
     /**
+     * {@link CpuDsv4Compressor#compressUnroped} lays every completed block at its own offset: block {@code g} of the
+     * step equals the cache row the full compressor writes for that block. A step of three blocks catches a shared
+     * offset, which would leave blocks 1 and 2 zero.
+     */
+    @Test
+    public void compressUnropedWritesEachBlockAtItsOwnOffset() {
+        final int width = 4;
+        final int ratio = 2;
+        final int nTokens = 6;
+        CpuDsv4Compressor.Config cfg = CpuDsv4Compressor.Config.of(ratio, width, 1e-6f,
+                Dsv4Kernels.RopeParams.none(), 0);
+        Random rnd = new Random(17);
+        int sw = cfg.stateWidth();
+        float[] curKv = random(rnd, nTokens * sw);
+        float[] curScore = random(rnd, nTokens * sw);
+        float[] ape = random(rnd, ratio * sw);
+        float[] normW = random(rnd, width);
+        float[] stateKv = new float[cfg.stateRows() * sw];
+        float[] stateScore = new float[cfg.stateRows() * sw];
+        CpuDsv4Compressor.Step step = new CpuDsv4Compressor.Step(0, nTokens, curKv, 0, curScore, 0, ape);
+        F32Cache cache = new F32Cache(8, width);
+        CpuDsv4Compressor.compress(cfg, step, stateKv.clone(), stateScore.clone(), normW, cache);
+        float[] out = new float[nTokens / ratio * width];
+        CpuDsv4Compressor.compressUnroped(cfg, step, stateKv.clone(), stateScore.clone(), normW, out);
+        for (int g = 0; g < nTokens / ratio; g++) {
+            assertArrayEquals("block " + g, cache.row(g),
+                    Arrays.copyOfRange(out, g * width, (g + 1) * width), 1e-6f);
+        }
+    }
+
+    /**
      * The indexer (LID) cache has the context's K type (llama-kv-cache-dsv4.cpp:1308-1312): the rows the LID update
      * writes into an F16 or Q8_0 cache are the F32 rows rounded by that type (ggml_set_rows: fp32 to fp16, or
      * quantize_row_q8_0_ref per 32-value block).
@@ -365,7 +396,22 @@ public class CpuDsv4Test {
         checkAttention(0, true, 0);
     }
 
+    @Test
+    public void v41DenseAndSelectedRatiosAttendTheirSelectedRows() {
+        // DeepSeek-V4.1 selects the top-k rows of both ratio-2 (CSA-like) and ratio-1 (dense-like) layers
+        checkSelectedAttention(2, false, 0);
+        checkSelectedAttention(1, true, 16);
+    }
+
+    private static void checkSelectedAttention(int ratio, boolean sinks, int rotBlock) {
+        checkAttention(ratio, true, sinks, rotBlock);
+    }
+
     private static void checkAttention(int ratio, boolean sinks, int rotBlock) {
+        checkAttention(ratio, false, sinks, rotBlock);
+    }
+
+    private static void checkAttention(int ratio, boolean forceSelected, boolean sinks, int rotBlock) {
         final int nHead = 3;
         final int hd = 16;
         final int nSwa = 6;
@@ -375,8 +421,9 @@ public class CpuDsv4Test {
         Random rnd = new Random(6 + ratio);
         Dsv4Kernels.RopeParams derope = Dsv4Kernels.RopeParams.of(8, RopeType.NEOX, 10000f, 1f, 0f, 1f, 0f, 0f);
         float[] sinkV = sinks ? random(rnd, nHead) : null;
-        CpuDsv4Attention.Layer layer = CpuDsv4Attention.Layer.of(nHead, hd, 0.25f, nSwa, ratio, rotBlock, derope,
-                sinkV);
+        CpuDsv4Attention.Layer layer = forceSelected
+                ? CpuDsv4Attention.Layer.ofSelected(nHead, hd, 0.25f, nSwa, ratio, rotBlock, derope, sinkV)
+                : CpuDsv4Attention.Layer.of(nHead, hd, 0.25f, nSwa, ratio, rotBlock, derope, sinkV);
 
         F32Cache raw = new F32Cache(nRaw, hd);
         final int base = ratio == Dsv4Spec.RATIO_HCA ? 1000 : 40;
@@ -392,13 +439,15 @@ public class CpuDsv4Test {
         int nSel = 5;
         int[] sel = new int[nTokens * nSel];
         for (int t = 0; t < nTokens; t++) {
-            int[] row = {9, 3, -1, 8 - t, 12};
+            // ratio 1 sees every row, so the selected indices must stay inside the cache
+            int[] row = {9, 3, -1, 8 - t, forceSelected ? 7 : 12};
             System.arraycopy(row, 0, sel, t * nSel, nSel);
         }
+        boolean selected = forceSelected || ratio == Dsv4Spec.RATIO_CSA;
         CpuDsv4Attention.Compressed comp;
         if (ratio == 0) {
             comp = CpuDsv4Attention.Compressed.none();
-        } else if (ratio == Dsv4Spec.RATIO_CSA) {
+        } else if (selected) {
             comp = CpuDsv4Attention.Compressed.selected(compCache, nSel, sel, 0, nSel);
         } else {
             comp = CpuDsv4Attention.Compressed.dense(compCache, nCompRows);
@@ -417,8 +466,8 @@ public class CpuDsv4Test {
             }
             if (ratio != 0) {
                 int nVis = (p + 1) / ratio;
-                for (int j = 0; j < (ratio == Dsv4Spec.RATIO_CSA ? nSel : nCompRows); j++) {
-                    int c = ratio == Dsv4Spec.RATIO_CSA ? sel[t * nSel + j] : j;
+                for (int j = 0; j < (selected ? nSel : nCompRows); j++) {
+                    int c = selected ? sel[t * nSel + j] : j;
                     if (c >= 0 && c < nVis) {
                         keys.add(compCache.row(c));
                     }
@@ -468,7 +517,7 @@ public class CpuDsv4Test {
         assertEquals(1, Dsv4Kernels.blockCount(3, 1, 4));
         assertEquals(2, Dsv4Kernels.blockCount(3, 5, 4));
         assertEquals(1, Dsv4Kernels.firstBlock(7, 4));
-        assertEquals(2, Dsv4Kernels.visibleRows(11, 4));
+        assertEquals(3, Dsv4Kernels.visibleRows(11, 4));
         assertEquals(0, Dsv4Kernels.visibleRows(126, 128));
         assertEquals(8, Dsv4Kernels.stateRows(4));
         assertEquals(128, Dsv4Kernels.stateRows(128));
@@ -484,14 +533,16 @@ public class CpuDsv4Test {
         assertEquals(Dsv4Kernels.CompMode.NONE, Dsv4Kernels.CompMode.forRatio(0));
         assertEquals(KvDType.Q8_0.code(), Dsv4Kernels.kvTypeCode(KvDType.Q8_0));
         assertEquals(Dsv4Kernels.ROPE_NEOX, Dsv4Kernels.ropeModeCode(RopeType.NEOX));
-        assertEquals(5 + KvDType.all().size(), Dsv4Kernels.ALL.size());
+        long sparse = KvDType.kernelTypes().stream().filter(t -> !t.perTokenHead() && t.hasSparseKernel())
+                .count();
+        assertEquals(7 + sparse, Dsv4Kernels.ALL.size());
         assertTrue(Dsv4Kernels.ALL.contains(Dsv4Kernels.STATE_SNAPSHOT));
         assertEquals(12, Dsv4Kernels.SNAPSHOT_ARG_COUNT);
         assertEquals(24, Dsv4Kernels.COMPRESS_ARG_COUNT);
         assertEquals(22, Dsv4Kernels.LID_ARG_COUNT);
         assertEquals(11, Dsv4Kernels.STATE_ARG_COUNT);
         assertEquals(9, Dsv4Kernels.STORE_ARG_COUNT);
-        assertEquals(33, Dsv4Kernels.ATTN_ARG_COUNT);
+        assertEquals(35, Dsv4Kernels.ATTN_ARG_COUNT);
         assertEquals(13, Dsv4Kernels.ARG_ATTN_SEL_STRIDE);
     }
 
@@ -523,9 +574,11 @@ public class CpuDsv4Test {
         assertEquals("LLM_DSV4_LidUpdate_F32", Dsv4Kernels.lidUpdate(KvDType.F32));
         assertEquals("LLM_DSV4_LidUpdate_F16", Dsv4Kernels.lidUpdate(KvDType.F16));
         assertEquals("LLM_DSV4_LidUpdate_Q8_0", Dsv4Kernels.lidUpdate(KvDType.Q8_0));
-        for (KvDType t : KvDType.all()) {
+        for (KvDType t : KvDType.kernelTypes()) {
             assertEquals(t.code(), Dsv4Kernels.kvTypeCode(t));
-            assertTrue(Dsv4Kernels.ALL.contains(Dsv4Kernels.lidUpdate(t)));
+            if (!t.perTokenHead() && t.hasSparseKernel()) {
+                assertTrue(Dsv4Kernels.ALL.contains(Dsv4Kernels.lidUpdate(t)));
+            }
         }
         Dsv4Kernels.checkLidCache(KvDType.Q4_0, 128, 128);
         Dsv4Kernels.checkLidCache(KvDType.BF16, 4, 100);

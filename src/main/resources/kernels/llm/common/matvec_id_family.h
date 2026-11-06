@@ -26,6 +26,18 @@
  *     each slot its own row (down projection, weight-before-FFN inputs, MLA absorption).
  *     scales is the per-expert *_exps.scale vector (build_lora_mm_id, llama-graph.cpp:1724-1730).
  *
+ * {T}_MatVecIdT(out_dim, in_dim, n_sel, x_stride, in_off, out_off, has_scale, expert_base,
+ *              expert_count, slots, weight, input, scales, output)
+ *     The transposed slot read of {T}_MatVecId, for a slot block stored [in_dim x out_dim] row-major
+ *     (in_dim rows of out_dim elements): the same arguments, slot layout, shard range and scales, with
+ *     the dot taken over a column of the slot block per element of T_decode_elem
+ *     (common/matvec_family.h):
+ *         y = dot(weight_slot[:, r], input[in_off + s * x_stride + 0 .. in_dim))
+ *     x_stride = 0 broadcasts one input row to every slot. The deepseek2 decompressed cache over
+ *     absorbed weights runs it once per token (x_stride = 0, the heads as slots) as the per-head
+ *     k_nope[h][d] = sum_l kv_cmpr[l] * k_b[(h * kv_lora + l) * n_nope + d]
+ *     (kernels/llm/mla.cl LLM_MLA_AbsorbedKVDecomp).
+ *
  * {T}_MatVecIdGateUp(out_dim, in_dim, n_sel, x_stride, in_off, glu_op, limit, alpha, beta, fused,
  *                    has_scale, expert_base, expert_count, slots, gate_w, up_w, input, scales, output)
  *     For the slots whose expert lies in the bound range (gate_w and up_w bind the same experts),
@@ -53,9 +65,30 @@
  *     NF_MOE_BMM_ROWS consecutive sorted rows, which share their expert except at bucket boundaries,
  *     so the weight row stays in cache.
  *
+ * The _Ind variants read the routed experts of an expert cache bank (an expert-indexed indirection map
+ * instead of a contiguous expert range of one tensor, as the MoE expert cache of
+ * llama-moe-cache.cpp binds bank views through a per-layer slot map). `map` holds one entry per expert
+ * of the layer: the local expert index in the bound bank, or -1 for an expert not in the cache (those
+ * pairs are written by the host, which computes them). Scales stay indexed with the global expert e.
+ *
+ * {T}_MatVecIdInd(out_dim, in_dim, n_sel, x_stride, in_off, out_off, has_scale,
+ *                 slots, map, weight, input, scales, output)
+ *     for s < n_sel, r < out_dim, e = slots[s], l = map[e] with l >= 0:
+ *         output[out_off + s * out_dim + r] = has_scale ? dot(weight[l][r][:], ...) * scales[e] : dot(...)
+ *
+ * {T}_MatVecIdGateUpInd(..., glu_op, limit, alpha, beta, fused, has_scale,
+ *                 slots, map, gate_w, up_w, input, scales, output)
+ *     the {T}_MatVecIdGateUp product with the map in place of the expert range; fused and has_scale
+ *     as there (has_scale 2 reads scales[2e], scales[2e + 1] with the global expert e).
+ *
+ * {T}_BatchMatMulIdInd(out_dim, in_dim, n_rows, x_div, in_off, has_scale,
+ *                 row_token, row_slot, map, weight, input, scales, output)
+ *     the {T}_BatchMatMulId product with the map in place of the expert range; a row with e < 0
+ *     writes 0, a row with map[e] < 0 is skipped (the host writes that pair's output).
+ *
  * Launch contract: local = {L, 1}, L a power of two <= LLM_DIMX and a multiple of TPS (CUDA: of 32).
- *     {T}_MatVecId, {T}_MatVecIdGateUp: global = {out_dim * L, n_sel}
- *     {T}_BatchMatMulId:                global = {out_dim * L, ceil(n_rows / NF_MOE_BMM_ROWS)}
+ *     {T}_MatVecId, {T}_MatVecIdGateUp and their _Ind variants: global = {out_dim * L, n_sel}
+ *     {T}_BatchMatMulId and {T}_BatchMatMulIdInd: global = {out_dim * L, ceil(n_rows / NF_MOE_BMM_ROWS)}
  * The `row >= out_dim` style early returns depend only on group ids, and the expert-range returns
  * (and skipped sorted rows) only on the slot of the group, so they are uniform per workgroup and
  * every barrier inside nf_wg_sum is reached by all work-items of a live workgroup. Weight row offsets
@@ -98,6 +131,20 @@ NF_MOE_DENSE_PAIR(nf_moe_f32, nf_moe_f32_w)
 NF_MOE_DENSE_PAIR(nf_moe_f16, nf_moe_f16_w)
 NF_MOE_DENSE_PAIR(nf_moe_bf16, nf_moe_bf16_w)
 
+/* The T_decode_elem of the dense pairs (element i of row tok of a [rows x dim] weight), for
+ * {T}_MatVecIdT: one plain element per (tok, i) position, no block layout. */
+NF_INLINE float nf_moe_f32_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok, int i) {
+    return *(NF_GLOBAL const float*)(weight + ((nf_i64)tok * dim + i) * 4);
+}
+
+NF_INLINE float nf_moe_f16_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok, int i) {
+    return vload_half(0, (NF_GLOBAL const NF_HALF*)(weight + ((nf_i64)tok * dim + i) * 2));
+}
+
+NF_INLINE float nf_moe_bf16_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok, int i) {
+    return bf16_to_f32(*(NF_GLOBAL const ushort*)(weight + ((nf_i64)tok * dim + i) * 2));
+}
+
 /* True when expert e lies in the bound shard [base, base + count); never overflows for base >= 0. */
 NF_INLINE int nf_moe_in_shard(const int e, const int base, const int count) {
     return e >= base && e - base < count;
@@ -129,6 +176,33 @@ NF_KERNEL void N##_MatVecId( \
     float ps = 0.0f; \
     for (int b = gid; b < sblk; b += gpi) \
         ps += D##_decode(wrow + (nf_i64)b * (BB), x, 0, b, ltid); \
+    const float acc = nf_wg_sum(nf_moe_red, ps); \
+    if (lid == 0) \
+        output[out_off + (nf_i64)s * out_dim + row] = has_scale ? acc * scales[e] : acc; \
+}
+
+#define NF_MOE_ID_MATVEC_T(N, D, BS, BB, TPS) \
+NF_KERNEL void N##_MatVecIdT( \
+    const int out_dim, const int in_dim, const int n_sel, const int x_stride, \
+    const int in_off, const int out_off, const int has_scale, \
+    const int expert_base, const int expert_count, \
+    NF_GLOBAL const int* NF_RESTRICT slots, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const float* NF_RESTRICT input, \
+    NF_GLOBAL const float* NF_RESTRICT scales, \
+    NF_GLOBAL float* NF_RESTRICT output) { \
+    const int row = get_group_id(0), s = get_group_id(1); \
+    if (row >= out_dim || s >= n_sel) return; \
+    const int e = slots[s]; \
+    if (!nf_moe_in_shard(e, expert_base, expert_count)) return; \
+    NF_LOCAL float nf_moe_red[LLM_DIMX]; \
+    const int lid = get_local_id(0), lsize = get_local_size(0); \
+    const nf_i64 row_bytes = (nf_i64)(out_dim / (BS)) * (BB); \
+    NF_GLOBAL const uchar* wslot = weight + (nf_i64)(e - expert_base) * in_dim * row_bytes; \
+    NF_GLOBAL const float* x = input + in_off + (nf_i64)s * x_stride; \
+    float ps = 0.0f; \
+    for (int i = lid; i < in_dim; i += lsize) \
+        ps += D##_decode_elem(wslot, out_dim, i, row) * x[i]; \
     const float acc = nf_wg_sum(nf_moe_red, ps); \
     if (lid == 0) \
         output[out_off + (nf_i64)s * out_dim + row] = has_scale ? acc * scales[e] : acc; \
@@ -207,9 +281,122 @@ NF_KERNEL void N##_BatchMatMulId( \
     } \
 }
 
+#define NF_MOE_ID_MATVEC_IND(N, D, BS, BB, TPS) \
+NF_KERNEL void N##_MatVecIdInd( \
+    const int out_dim, const int in_dim, const int n_sel, const int x_stride, \
+    const int in_off, const int out_off, const int has_scale, \
+    NF_GLOBAL const int* NF_RESTRICT slots, \
+    NF_GLOBAL const int* NF_RESTRICT map, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const float* NF_RESTRICT input, \
+    NF_GLOBAL const float* NF_RESTRICT scales, \
+    NF_GLOBAL float* NF_RESTRICT output) { \
+    const int row = get_group_id(0), s = get_group_id(1); \
+    if (row >= out_dim || s >= n_sel) return; \
+    const int e = slots[s]; \
+    const int l = map[e]; \
+    if (l < 0) return; \
+    NF_LOCAL float nf_moe_red[LLM_DIMX]; \
+    const int lid = get_local_id(0), lsize = get_local_size(0); \
+    const int sblk = in_dim / (BS); \
+    NF_GLOBAL const uchar* wrow = weight \
+        + ((nf_i64)l * out_dim + row) * ((nf_i64)sblk * (BB)); \
+    NF_GLOBAL const float* x = input + in_off + (nf_i64)s * x_stride; \
+    const int gpi = lsize / (TPS), gid = lid / (TPS), ltid = lid % (TPS); \
+    float ps = 0.0f; \
+    for (int b = gid; b < sblk; b += gpi) \
+        ps += D##_decode(wrow + (nf_i64)b * (BB), x, 0, b, ltid); \
+    const float acc = nf_wg_sum(nf_moe_red, ps); \
+    if (lid == 0) \
+        output[out_off + (nf_i64)s * out_dim + row] = has_scale ? acc * scales[e] : acc; \
+}
+
+#define NF_MOE_ID_GATEUP_IND(N, D, BS, BB, TPS) \
+NF_KERNEL void N##_MatVecIdGateUpInd( \
+    const int out_dim, const int in_dim, const int n_sel, const int x_stride, const int in_off, \
+    const int glu_op, const float limit, const float alpha, const float beta, \
+    const int fused, const int has_scale, \
+    NF_GLOBAL const int* NF_RESTRICT slots, \
+    NF_GLOBAL const int* NF_RESTRICT map, \
+    NF_GLOBAL const uchar* gate_w, \
+    NF_GLOBAL const uchar* up_w, \
+    NF_GLOBAL const float* NF_RESTRICT input, \
+    NF_GLOBAL const float* NF_RESTRICT scales, \
+    NF_GLOBAL float* NF_RESTRICT output) { \
+    const int row = get_group_id(0), s = get_group_id(1); \
+    if (row >= out_dim || s >= n_sel) return; \
+    const int e = slots[s]; \
+    const int l = map[e]; \
+    if (l < 0) return; \
+    NF_LOCAL float nf_moe_red[LLM_DIMX]; \
+    const int lid = get_local_id(0), lsize = get_local_size(0); \
+    const int sblk = in_dim / (BS); \
+    const nf_i64 row_bytes = (nf_i64)sblk * (BB); \
+    const nf_i64 le = (nf_i64)l; \
+    const nf_i64 slot_rows = fused ? 2 * (nf_i64)out_dim : (nf_i64)out_dim; \
+    NF_GLOBAL const uchar* grow = gate_w + (le * slot_rows + row) * row_bytes; \
+    NF_GLOBAL const uchar* urow = up_w + (le * slot_rows + (fused ? out_dim : 0) + row) * row_bytes; \
+    NF_GLOBAL const float* x = input + in_off + (nf_i64)s * x_stride; \
+    const int gpi = lsize / (TPS), gid = lid / (TPS), ltid = lid % (TPS); \
+    float gs = 0.0f, us = 0.0f; \
+    for (int b = gid; b < sblk; b += gpi) \
+        D##_decode_dual(grow + (nf_i64)b * (BB), urow + (nf_i64)b * (BB), x, 0, b, ltid, &gs, &us); \
+    const float g = nf_wg_sum(nf_moe_red, gs); \
+    const float u = nf_wg_sum(nf_moe_red, us); \
+    if (lid == 0) { \
+        float sg = 1.0f, su = 1.0f; \
+        if (has_scale == 1) { sg = scales[e]; su = sg; } \
+        else if (has_scale == 2) { sg = scales[2 * e]; su = scales[2 * e + 1]; } \
+        output[(nf_i64)s * out_dim + row] = nf_glu(glu_op, g * sg, u * su, limit, alpha, alpha, beta); \
+    } \
+}
+
+#define NF_MOE_ID_BATCH_IND(N, D, BS, BB, TPS) \
+NF_KERNEL void N##_BatchMatMulIdInd( \
+    const int out_dim, const int in_dim, const int n_rows, const int x_div, \
+    const int in_off, const int has_scale, \
+    NF_GLOBAL const int* NF_RESTRICT row_token, \
+    NF_GLOBAL const int* NF_RESTRICT row_slot, \
+    NF_GLOBAL const int* NF_RESTRICT map, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const float* NF_RESTRICT input, \
+    NF_GLOBAL const float* NF_RESTRICT scales, \
+    NF_GLOBAL float* NF_RESTRICT output) { \
+    const int row = get_group_id(0); \
+    const int i0 = (int)get_group_id(1) * NF_MOE_BMM_ROWS; \
+    if (row >= out_dim || i0 >= n_rows) return; \
+    NF_LOCAL float nf_moe_red[LLM_DIMX]; \
+    const int lid = get_local_id(0), lsize = get_local_size(0); \
+    const int sblk = in_dim / (BS); \
+    const nf_i64 row_bytes = (nf_i64)sblk * (BB); \
+    const int gpi = lsize / (TPS), gid = lid / (TPS), ltid = lid % (TPS); \
+    const int i1 = min(i0 + NF_MOE_BMM_ROWS, n_rows); \
+    for (int i = i0; i < i1; i++) { \
+        const int p = row_token[i], e = row_slot[i]; \
+        const int l = e < 0 ? -1 : map[e]; \
+        if (l < 0) { \
+            if (lid == 0 && e < 0) \
+                output[(nf_i64)p * out_dim + row] = 0.0f; \
+            continue; \
+        } \
+        float ps = 0.0f; \
+        NF_GLOBAL const uchar* wrow = weight + ((nf_i64)l * out_dim + row) * row_bytes; \
+        NF_GLOBAL const float* x = input + in_off + (nf_i64)(p / x_div) * in_dim; \
+        for (int b = gid; b < sblk; b += gpi) \
+            ps += D##_decode(wrow + (nf_i64)b * (BB), x, 0, b, ltid); \
+        const float acc = nf_wg_sum(nf_moe_red, ps); \
+        if (lid == 0) \
+            output[(nf_i64)p * out_dim + row] = has_scale ? acc * scales[e] : acc; \
+    } \
+}
+
 #define NF_MOE_ID_KERNELS(N, D, BS, BB, TPS) \
     NF_MOE_ID_MATVEC(N, D, BS, BB, TPS) \
+    NF_MOE_ID_MATVEC_T(N, D, BS, BB, TPS) \
     NF_MOE_ID_GATEUP(N, D, BS, BB, TPS) \
-    NF_MOE_ID_BATCH(N, D, BS, BB, TPS)
+    NF_MOE_ID_BATCH(N, D, BS, BB, TPS) \
+    NF_MOE_ID_MATVEC_IND(N, D, BS, BB, TPS) \
+    NF_MOE_ID_GATEUP_IND(N, D, BS, BB, TPS) \
+    NF_MOE_ID_BATCH_IND(N, D, BS, BB, TPS)
 
 #endif /* NF_MATVEC_ID_FAMILY_H */

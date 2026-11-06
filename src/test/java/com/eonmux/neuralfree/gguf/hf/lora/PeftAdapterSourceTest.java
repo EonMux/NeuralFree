@@ -48,7 +48,7 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * A PEFT LoRA adapter directory of a synthetic Llama base, opened as the GGUF adapter view
- * ({@link PeftAdapterSource}, HF.md §LA-1): the PEFT branch of {@link ModelSources#openAdapter}; the metadata
+ * ({@link PeftAdapterSource}): the PEFT branch of {@link ModelSources#openAdapter}; the metadata
  * ({@code general.type = adapter}, {@code adapter.type = lora}, the rslora-adjusted {@code adapter.lora.alpha} and the
  * aLoRA invocation tokens of both configuration forms); the factor plan ({@code blk.<n>.attn_q.weight.lora_a} with ne
  * {@code {in, r}} and {@code .lora_b} with ne {@code {r, out}}, the transposed {@code token_embd} A, the skipped
@@ -248,7 +248,10 @@ public class PeftAdapterSourceTest {
                     s.plan().ne("blk.0.attn_q.weight.lora_a"));
             assertArrayEquals("a projection factor is ne {r, out}", new long[]{R, N_EMBD},
                     s.plan().ne("blk.0.attn_q.weight.lora_b"));
-            assertArrayEquals(new long[]{N_EMBD, KV_DIM}, s.plan().ne("blk.1.attn_k.weight.lora_a"));
+            // The k factors plan like the q ones: get_lora_A_B returns A (r, in) after the head permute keeps A
+            // and permutes only B's rows (LC/convert_lora_to_gguf.py LoraTorchTensor.permute, llama.py:261-265),
+            // so ne {in, r}; the {in, out} shape would need in*out values the stored A never had.
+            assertArrayEquals(new long[]{N_EMBD, R}, s.plan().ne("blk.1.attn_k.weight.lora_a"));
             assertArrayEquals(new long[]{R, KV_DIM}, s.plan().ne("blk.1.attn_k.weight.lora_b"));
             assertArrayEquals("the token-embedding A is planned transposed ({r, vocab}, not {vocab, r})",
                     new long[]{R, VOCAB}, s.plan().ne("token_embd.weight.lora_a"));

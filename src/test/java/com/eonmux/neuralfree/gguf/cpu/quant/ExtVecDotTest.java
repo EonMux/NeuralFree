@@ -24,7 +24,8 @@ import static org.junit.Assert.fail;
 public class ExtVecDotTest {
 
     private static final GGMLType[] EXT_TYPES = {
-        GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB
+        GGMLType.F8_E4M3, GGMLType.F8_E4M3_B128, GGMLType.F8_E4M3_B32, GGMLType.MXFP8, GGMLType.I8_B128,
+        GGMLType.NF4, GGMLType.FP4_BNB
     };
 
     /**
@@ -33,7 +34,7 @@ public class ExtVecDotTest {
      * do not sanitize).
      */
     private static final GGMLType[] REGISTRY_TYPES = {
-        GGMLType.F8_E4M3, GGMLType.F8_E5M2, GGMLType.F8_E4M3_B128, GGMLType.MXFP8,
+        GGMLType.F8_E4M3, GGMLType.F8_E5M2, GGMLType.F8_E4M3_B128, GGMLType.F8_E4M3_B32, GGMLType.MXFP8,
         GGMLType.MXFP6_E3M2, GGMLType.MXFP6_E2M3, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB
     };
 
@@ -53,6 +54,10 @@ public class ExtVecDotTest {
                 case F8_E4M3_B128:
                     b.putFloat(o + BlockLayout.F8B128_D, 0.01f + rnd.nextFloat() * 0.1f);
                     clearE4m3NaNs(raw, o + BlockLayout.F8B128_QS, BlockLayout.QK_F8B128);
+                    break;
+                case F8_E4M3_B32:
+                    b.putFloat(o + BlockLayout.F8B32_D, 0.01f + rnd.nextFloat() * 0.1f);
+                    clearE4m3NaNs(raw, o + BlockLayout.F8B32_QS, BlockLayout.QK_F8B32);
                     break;
                 case MXFP8:
                     raw[o + BlockLayout.MXFP8_E] = (byte) (118 + rnd.nextInt(14));
@@ -189,7 +194,8 @@ public class ExtVecDotTest {
             assertEquals(t.toString(), GGMLType.Q8_0, ExtVecDot.forType(t).activationType());
             assertEquals(t, ExtVecDot.forType(t).weightType());
             assertTrue(t.toString(), CpuMatVec.supports(t));
-            assertSame(ExtVecDot.forType(t), CpuMatVec.vecDot(t));
+            assertSame(t.toString(), CpuMatVec.vecDot(t), CpuSimd.supports(t)
+                    ? CpuSimd.vecDot(t) : ExtVecDot.forType(t));
         }
         try {
             ExtVecDot.forType(GGMLType.Q8_0);

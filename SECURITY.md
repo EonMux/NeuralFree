@@ -42,4 +42,4 @@ In scope:
 Out of scope:
 - **The documented properties of `TCPBackend`.** Its protocol is neither authenticated nor encrypted, by design, and is meant for trusted private networks only ([TRAINING.md](TRAINING.md#distributed-training)). Flaws beyond that, such as a crash of a rank caused by malformed traffic, are in scope.
 - **Vulnerabilities in dependencies** (JCuda, JOCL, LWJGL, Log4j and others) or in GPU drivers, unless NeuralFree uses them in a way that makes them exploitable. Report those to their maintainers.
-- **The limitations listed in [GAPS.md](GAPS.md)**, which are known and documented.
+- **The limitations the guides document**: what the engine refuses by name, or computes differently from llama.cpp and PyTorch by design, is known and documented in [USAGE.md](USAGE.md) and [LLM-INFERENCE.md](LLM-INFERENCE.md).

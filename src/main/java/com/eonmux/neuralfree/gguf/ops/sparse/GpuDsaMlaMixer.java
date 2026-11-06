@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.sparse;
 
+import com.eonmux.neuralfree.acceleration.GpuModelUnsupportedException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
@@ -9,6 +10,7 @@ import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuMatmulTap;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
@@ -21,14 +23,19 @@ import com.eonmux.neuralfree.gguf.memory.gpu.GpuIndexerCache;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuKvLayer;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
+import com.eonmux.neuralfree.gguf.ops.attn.AttnExtKernels;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeKernels;
+import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
 import com.eonmux.neuralfree.gguf.ops.sparse.SparseBlocks.DsaLayout;
 import com.eonmux.neuralfree.gguf.ops.sparse.SparseBlocks.IndexerConfig;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
+import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.utils.Closeables;
 
@@ -66,6 +73,19 @@ import java.util.Objects;
  * step (a full cache stores position {@code p} in row {@code p}, a ring has every row in use once it wraps), and
  * {@code k = n_sel = min(n_kv, topK)} (deepseek32.cpp:313-315).</p>
  *
+ * <p>mistral-large4 projects Q directly with {@code attn_q}, scales the assembled {@code qcur} by the SSMax per-head
+ * temperature {@code attn_ssmax[h] * log(pos + 1) + attn_ssmax.bias[h]} ({@code LLM_AttnSsmaxScale}), reads the
+ * learned {@code rope_freqs} factors in the MLA and indexer rotations, and its NoPE layers zero-pad the rope dims of Q
+ * and of the latent row (mistral-large4.cpp:181-197, 345-421).</p>
+ *
+ * <p>A paged multi-sequence step ({@link #batch}) runs the token-wise stages over every row of the step and stores
+ * the latent rows and indexer keys at the step's cells; every segment then selects among its own sequence's cells:
+ * the indexer scores all cells against the sequence's {@code kv_pos} ({@code GpuStepInputs.sequenceKvPos}, every
+ * other cell -1), as llama.cpp's KV mask hides other sequences' cells from the scores, so the top-k names the
+ * sequence's cells directly and the sparse attention reads them unchanged. The selection width is
+ * {@code k = min(cache rows, topK)} for every segment; a sequence with fewer visible rows pads its selection with -1,
+ * which the attention skips, so it selects the rows a sequence-local {@code min(slots, topK)} selects.</p>
+ *
  * <p>Working buffers are {@code GpuScratch} temporaries reserved at bind; the top-k buffer {@value #TEMP_TOPK} is
  * reserved by every DSA layer with the same size ({@code ubatch * topK}, model constants), so all of a model's DSA
  * layers share one buffer and a shared layer reads what its source layer wrote. Per step only scalars, global sizes
@@ -82,6 +102,7 @@ public final class GpuDsaMlaMixer implements GpuMixer {
     public static final String TEMP_GATE_WIDE = "dsa.gate.wide";
     public static final String TEMP_HEAD_SLOTS = "dsa.heads.";
     public static final String TEMP_TOPK = "dsa.topk";
+    public static final String TEMP_KV_PROJ = "dsa.kvproj";
 
     private final List<PreparedDispatch> prepared = new ArrayList<>();
 
@@ -97,15 +118,20 @@ public final class GpuDsaMlaMixer implements GpuMixer {
     private KvDType latentType;
     private GpuStepInputs steps;
 
+    private GpuWeight wq;
     private GpuWeight wqA;
     private GpuWeight wqB;
     private GpuWeight wkvA;
     private GpuWeight wo;
     private GpuWeight gateW;
+    /** The per-head {@code attn_k_b} and {@code attn_v_b} the id-matvec kernels multiply. */
+    private GpuWeight wkB;
+    private GpuWeight wvB;
     /**
      * LoRA deltas of the dense projections, after the product and its scale ({@code build_lora_mm},
      * llama-graph.cpp:1629-1667); the per-head absorbed {@code attn_k_b} / {@code attn_v_b} take none.
      */
+    private GpuProjectionDeltas.Site qDeltas;
     private GpuProjectionDeltas.Site qaDeltas;
     private GpuProjectionDeltas.Site qbDeltas;
     private GpuProjectionDeltas.Site kvaDeltas;
@@ -115,18 +141,31 @@ public final class GpuDsaMlaMixer implements GpuMixer {
     private ScratchSlot qr;
     private ScratchSlot q;
     private ScratchSlot kv;
+    private ScratchSlot kvProj;
     private ScratchSlot qcur;
     private ScratchSlot latent;
     private ScratchSlot gate;
     private ScratchSlot gateWide;
 
     private GpuDsaIndexer indexer;
+    /** SSMax per-head scale and bias ({@code attn_ssmax}); null when the query is not scaled. */
+    private GpuBuffer ssmaxScale;
+    private GpuBuffer ssmaxBias;
+    /** Per-pair divisors of the layer RoPE ({@code rope_freqs}) and whether the rope dispatches read them. */
+    private GpuBuffer ropeFactors;
+    private boolean hasRopeFactors;
+    /** The latent cache's KV group and the indexer key rows a paged step selects through. */
+    private int group;
+    private GpuBuffer indexerKeys;
+    /** The shared top-k buffer {@value #TEMP_TOPK}. */
+    private GpuBuffer selection;
 
     private PreparedDispatch qANorm;
     private PreparedDispatch kPeNorm;
     private PreparedDispatch kvANorm;
     private PreparedDispatch qRope;
     private PreparedDispatch kRope;
+    private PreparedDispatch querySsmax;
     private PreparedDispatch latentStore;
     private PreparedDispatch absorb;
     private PreparedDispatch sparseDecode;
@@ -178,26 +217,47 @@ public final class GpuDsaMlaMixer implements GpuMixer {
         steps = memory.stepInputs();
         GpuKvLayer cache = latentCache(memory, layer.il());
         kvRows = cache.layout().rows();
+        group = cache.group();
+        steps.reserveSequenceAddressing(group);
+        if (l.kvShared) {
+            GpuKvLayer src = memory.kv(l.kvSourceLayer);
+            if (src == null || src.group() != group || src.layout().rows() != kvRows) {
+                throw new IllegalStateException(l.where + ": reads the latent cache of layer " + l.kvSourceLayer
+                        + ", which must use the layer's KV group and rows (group " + group + ", " + kvRows
+                        + " rows)");
+            }
+        }
 
-        wqA = projection(weights.layer(layer, DsaLayout.WQ_A));
-        wqB = projection(weights.layer(layer, DsaLayout.WQ_B));
-        wkvA = projection(weights.layer(layer, DsaLayout.WKV_A));
+        wkvA = l.kvShared ? null : projection(weights.layer(layer, DsaLayout.WKV_A));
         wo = projection(outputWeight(layer, weights));
-        GpuWeight wkB = perHead(weights.layer(layer, DsaLayout.WK_B));
-        GpuWeight wvB = perHead(weights.layer(layer, DsaLayout.WV_B));
+        wkB = perHead(weights.layer(layer, DsaLayout.WK_B));
+        wvB = perHead(weights.layer(layer, DsaLayout.WV_B));
         checkWorkGroups(wkB, wvB);
+        if (l.qLora > 0) {
+            wqA = projection(weights.layer(layer, DsaLayout.WQ_A));
+            wqB = projection(weights.layer(layer, DsaLayout.WQ_B));
+        } else {
+            wq = projection(weights.layer(layer, DsaLayout.WQ));
+        }
 
-        qr = temp(TEMP_QR, l.qLora);
+        if (l.qLora > 0) {
+            qr = temp(TEMP_QR, l.qLora);
+        }
         q = temp(TEMP_Q, l.qBufferWidth());
         kv = temp(TEMP_KV, l.dK);
+        if (!l.ropeApplied) {
+            kvProj = temp(TEMP_KV_PROJ, l.kvLora);
+        }
         qcur = temp(TEMP_QCUR, (long) l.nHead * l.dK);
         latent = temp(TEMP_LATENT, (long) l.nHead * l.kvLora);
         ScratchSlot slots = headSlots();
         ScratchSlot topK = temp(TEMP_TOPK, l.topK);
+        selection = topK.buffer();
 
         prepareProjections(layer, weights, cache);
         prepareHeadProducts(wkB, wvB, slots);
         prepareSparse(layer, weights, cache, topK);
+        prepareSsmax(layer, weights);
         bindGate(layer, weights);
         bindDeltas(layer);
         if (l.full) {
@@ -222,28 +282,77 @@ public final class GpuDsaMlaMixer implements GpuMixer {
     private void prepareProjections(LayerSpec layer, GpuWeights weights, GpuKvLayer cache) {
         DsaLayout l = layout;
         GpuBuffer ph = ctx.placeholders().readOnlyFloats();
-        qANorm = prepareNorm(vector(weights.layer(layer, DsaLayout.Q_A_NORM), l.qLora), qr.buffer(), l.qLora,
-                l.qLora, 0);
+        if (l.qLora > 0) {
+            qANorm = prepareNorm(vector(weights.layer(layer, DsaLayout.Q_A_NORM), l.qLora), qr.buffer(), l.qLora,
+                    l.qLora, 0);
+        }
         if (l.kPeNorm) {
             kPeNorm = prepareNorm(vector(weights.layer(layer, DsaLayout.K_PE_NORM), l.rope), kv.buffer(), l.rope,
                     l.dK, l.kvLora);
         }
-        kvANorm = prepareNorm(vector(weights.layer(layer, DsaLayout.KV_A_NORM), l.kvLora), kv.buffer(), l.kvLora,
-                l.dK, 0);
+        if (!l.kvShared) {
+            kvANorm = prepareNorm(vector(weights.layer(layer, DsaLayout.KV_A_NORM), l.kvLora), kv.buffer(), l.kvLora,
+                    l.dK, 0);
+        }
         RopeSpec r = l.ropeSpec;
+        ropeFactors = bindRopeFactors(weights, r, layer.il());
+        hasRopeFactors = ropeFactors != null;
+        GpuBuffer ff = hasRopeFactors ? ropeFactors : ph;
         GpuBuffer ropePos = steps.ropePos();
-        qRope = prepare(RopeKernels.ROPE_EXT, ropeGlobal(r, ubatch, l.nHead), new long[]{local},
-                RopeKernels.ropeExtArgs(r, ubatch, l.nHead, l.headK, l.nHead * l.headK, l.nope, ubatch, 0, false,
-                        ropePos, ph, q.buffer()));
-        kRope = prepare(RopeKernels.ROPE_EXT, ropeGlobal(r, ubatch, 1), new long[]{local},
-                RopeKernels.ropeExtArgs(r, ubatch, 1, l.dK, l.dK, l.kvLora, ubatch, 0, false, ropePos, ph,
-                        kv.buffer()));
-        KvDType dtype = cache.layout().dtypeK();
-        latentType = dtype;
-        latentStore = prepare(RopeKernels.kvStore(dtype),
-                elementGlobal(RopeKernels.kvStoreWorkItems(dtype, ubatch, l.dK)), new long[]{local},
-                RopeKernels.kvStoreArgs(dtype, ubatch, l.dK, l.dK, 0, cache.layout().widthK(), kv.buffer(),
-                        steps.cellIdx(cache.group()), cache.k()));
+        if (r != null) {
+            qRope = prepare(RopeKernels.ROPE_EXT, ropeGlobal(r, ubatch, l.nHead), new long[]{local},
+                    RopeKernels.ropeExtArgs(r, ubatch, l.nHead, l.headK, l.nHead * l.headK, l.nope, ubatch, 0,
+                            hasRopeFactors, ropePos, ff, q.buffer()));
+        }
+        if (!l.kvShared) {
+            if (r != null) {
+                kRope = prepare(RopeKernels.ROPE_EXT, ropeGlobal(r, ubatch, 1), new long[]{local},
+                        RopeKernels.ropeExtArgs(r, ubatch, 1, l.dK, l.dK, l.kvLora, ubatch, 0, hasRopeFactors, ropePos,
+                                ff, kv.buffer()));
+            }
+            KvDType dtype = cache.layout().dtypeK();
+            latentType = dtype;
+            latentStore = prepare(RopeKernels.kvStore(dtype),
+                    elementGlobal(RopeKernels.kvStoreWorkItems(dtype, ubatch, l.dK)), new long[]{local},
+                    RopeKernels.kvStoreArgs(dtype, ubatch, l.dK, l.dK, 0, cache.layout().widthK(), l.dK, kv.buffer(),
+                            steps.cellIdx(cache.group()), ctx.placeholders().kvScalesOnes(), cache.k()));
+        }
+    }
+
+    /**
+     * The layer's frequency factors as one device buffer, or null when its RoPE has none.
+     *
+     * @throws MissingTensorException when the spec names factors that are not resident
+     * @throws IllegalStateException  when they are not one F32 buffer of at least {@code nDims / 2} values
+     */
+    private GpuBuffer bindRopeFactors(GpuWeights weights, RopeSpec rope, int il) {
+        if (rope == null || rope.freqFactors() == null) {
+            return null;
+        }
+        GpuWeight w = weights.getOrNull(rope.freqFactors().name());
+        if (w == null) {
+            throw new MissingTensorException(weights.archName(), il, rope.freqFactors().name());
+        }
+        int pairs = RopeMath.pairCount(rope.type(), rope.nDims());
+        if (w.type() != GGMLType.F32 || !w.isSingleShard() || w.rows() * w.cols() < pairs) {
+            throw new IllegalStateException(layout.where + ": " + w.name() + " must be one F32 buffer of at least "
+                    + pairs + " frequency factors, got " + w);
+        }
+        return w.shard(0);
+    }
+
+    /** The SSMax per-head query dispatch over the assembled {@code qcur} (mistral-large4.cpp:181-190, 381). */
+    private void prepareSsmax(LayerSpec layer, GpuWeights weights) {
+        DsaLayout l = layout;
+        if (!l.ssmax) {
+            return;
+        }
+        ssmaxScale = vector(weights.layer(layer, DsaLayout.SSMAX), l.nHead).shard(0);
+        ssmaxBias = vector(weights.layer(layer, DsaLayout.SSMAX_B), l.nHead).shard(0);
+        querySsmax = prepare(AttnExtKernels.SSMAX_SCALE,
+                AttnExtKernels.ssmaxGlobal(ubatch, l.nHead, l.dK, local), new long[]{local},
+                AttnExtKernels.ssmaxArgs(ubatch, l.nHead, l.dK, l.dK, l.nHead * l.dK, 0, ssmaxScale, ssmaxBias,
+                        steps.ropePos(), qcur.buffer()));
     }
 
     /** The per-head absorption {@code q_nope . W_k_b[h]} and decompression {@code W_v_b[h] . latent}. */
@@ -279,9 +388,13 @@ public final class GpuDsaMlaMixer implements GpuMixer {
     /** The LoRA delta sites of the dense projections. */
     private void bindDeltas(LayerSpec layer) {
         GpuProjectionDeltas deltas = ctx.projectionDeltas();
-        qaDeltas = deltas.serve(layer, DsaLayout.WQ_A, wqA);
-        qbDeltas = deltas.serve(layer, DsaLayout.WQ_B, wqB);
-        kvaDeltas = deltas.serve(layer, DsaLayout.WKV_A, wkvA);
+        if (layout.qLora > 0) {
+            qaDeltas = deltas.serve(layer, DsaLayout.WQ_A, wqA);
+            qbDeltas = deltas.serve(layer, DsaLayout.WQ_B, wqB);
+        } else {
+            qDeltas = deltas.serve(layer, DsaLayout.WQ, wq);
+        }
+        kvaDeltas = layout.kvShared ? null : deltas.serve(layer, DsaLayout.WKV_A, wkvA);
         outDeltas = deltas.serve(layer, DsaLayout.WO, wo);
         gateDeltas = gateW != null ? deltas.serve(layer, DsaLayout.GATE, gateW) : null;
     }
@@ -361,14 +474,28 @@ public final class GpuDsaMlaMixer implements GpuMixer {
         }
         IndexerConfig cfg = IndexerConfig.forLayer(layer, idx.plan().rotation(), cache.layout().window(), l.normEps);
         indexer = new GpuDsaIndexer(ctx, l.where, cfg);
+        RopeSpec rope = cfg.rope();
+        GpuBuffer factors = bindRopeFactors(weights, rope, layer.il());
         indexer.bindQueries(weights.layer(layer, DsaLayout.IDX_Q_B), weights.layer(layer, DsaLayout.IDX_PROJ),
-                steps.ropePos());
+                steps.ropePos(), factors);
+        if (l.indexerQueryNorm) {
+            indexer.bindQueryNorm(weights.layer(layer, DsaLayout.IDX_Q_NORM),
+                    weights.layer(layer, DsaLayout.IDX_Q_NORM_B));
+        }
+        if (l.indexerSsmax) {
+            indexer.bindSsmax(vector(weights.layer(layer, DsaLayout.IDX_SSMAX), l.idxHeads),
+                    vector(weights.layer(layer, DsaLayout.IDX_SSMAX_B), l.idxHeads), steps.ropePos());
+        }
         indexer.bindKeys(weights.layer(layer, DsaLayout.IDX_K),
                 l.idxKeyNorm ? weights.layer(layer, DsaLayout.IDX_K_NORM) : null,
                 l.idxKeyBias ? weights.layer(layer, DsaLayout.IDX_K_NORM_B) : null, steps.ropePos(),
                 steps.cellIdx(idx.group()), idx.keys(), idx.plan().dtype(), kvRows);
         indexer.bindSelection(idx.keys(), idx.plan().dtype(), kvRows, steps.kvPos(idx.group()), steps.qPos(), topK);
         indexer.bindDeltas(layer);
+        indexerKeys = idx.keys();
+        if (steps.pageShift() >= 0) {
+            indexer.enableSegments();
+        }
     }
 
     /** A shared layer's selection addresses the source layer's rows: both caches must use the same rows. */
@@ -395,6 +522,30 @@ public final class GpuDsaMlaMixer implements GpuMixer {
         forward(pos0, nTokens, in, out);
     }
 
+    /**
+     * One step over the rows of {@code s}: the contiguous step when no paged step is current, else the paged step
+     * through the memory's current {@code PagedStep} (see the class description). A non-causal step
+     * ({@code GpuStepInputs.stepNonCausal}) selects without the causal mask.
+     *
+     * @throws UnsupportedOperationException when the step is not contiguous and the memory holds no paged step
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        ensureBound();
+        Objects.requireNonNull(s, "s");
+        PagedStep step = steps.currentPagedStep();
+        if (step == null) {
+            GpuMixer.super.batch(s, in, out);
+            return;
+        }
+        forwardPaged(s, in, out);
+    }
+
+    @Override
+    public String batchRefusal() {
+        return "the DSA mixer mixes several sequences per step only over paged memory (a currentPagedStep)";
+    }
+
     private void forward(int pos0, int n, ScratchSlot in, ScratchSlot out) {
         ensureBound();
         DsaLayout l = layout;
@@ -403,37 +554,133 @@ public final class GpuDsaMlaMixer implements GpuMixer {
         int xOff = in.offset();
         int nKv = Math.min(kvRows, pos0 + n);
 
+        // The query, latent and gate projections and the indexer of a single-token step all read this row,
+        // so its Q8_1 blocks are quantized once.
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(xOff, l.nEmbd)
+                ? ops.shareQ8Activations(x, xOff, l.nEmbd) : null;
+        try {
+            if (l.qLora > 0) {
+                projectLowRankQuery(n, x, xOff);
+            }
+            int k;
+            if (indexer != null) {
+                indexer.queries(n, qr != null ? qr.buffer() : x, 0, x, xOff);
+                indexer.storeKeys(n, x, xOff);
+                k = indexer.select(n, nKv);
+            } else {
+                k = SparseKernels.selectedCount(nKv, l.topK);
+            }
+            attendAndProject(n, k, x, xOff, out);
+        } finally {
+            if (share != null) {
+                share.close();
+            }
+        }
+    }
+
+    /**
+     * The paged step: the token-wise stages and stores over the step's rows (positions and cells from the paged step
+     * inputs), then every segment's selection among its sequence's cells into its rows of the top-k buffer.
+     */
+    private void forwardPaged(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        DsaLayout l = layout;
+        int n = s.nTokens();
+        if (n < 1 || n > ubatch || steps.nTokens() != n) {
+            throw new IllegalArgumentException(l.where + ": paged DSA step of " + n + " tokens, the step inputs hold "
+                    + steps.nTokens() + " within [1, " + ubatch + "]");
+        }
+        long width = (long) n * l.nEmbd;
+        Objects.requireNonNull(in, "in").require(width);
+        Objects.requireNonNull(out, "out").require(width);
+        GpuBuffer x = in.buffer();
+        int xOff = in.offset();
+        // The query, latent and gate projections and the indexer of a single-token step all read this row,
+        // so its Q8_1 blocks are quantized once.
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(xOff, l.nEmbd)
+                ? ops.shareQ8Activations(x, xOff, l.nEmbd) : null;
+        try {
+            if (l.qLora > 0) {
+                projectLowRankQuery(n, x, xOff);
+            }
+            int k = SparseKernels.selectedCount(kvRows, l.topK);
+            if (indexer != null) {
+                indexer.queries(n, qr != null ? qr.buffer() : x, 0, x, xOff);
+                indexer.storeKeys(n, x, xOff);
+                boolean causal = indexer.config().mask().causal() && !steps.stepNonCausal();
+                for (int seg = 0; seg < s.nSeg(); seg++) {
+                    int t0 = s.tokStart(seg);
+                    indexer.selectRows(t0, s.len(seg), kvRows, indexerKeys, steps.sequenceKvPos(group, s.seq(seg)),
+                            causal, selection, (long) t0 * k);
+                }
+            }
+            attendAndProject(n, k, x, xOff, out);
+        } finally {
+            if (share != null) {
+                share.close();
+            }
+        }
+    }
+
+    /** {@code qr = RMS(W_q_a . x) * attn_q_a_norm}. */
+    private void projectLowRankQuery(int n, GpuBuffer x, int xOff) {
         ops.matmul(wqA, x, xOff, qr.buffer(), 0, n);
         qaDeltas.applyRows(n, x, xOff, qr.buffer(), 0);
         rowNorm(qANorm, n);
+    }
 
-        int k;
-        if (indexer != null) {
-            indexer.queries(n, qr.buffer(), 0, x, xOff);
-            indexer.storeKeys(n, x, xOff);
-            k = indexer.select(n, nKv);
+    /**
+     * Q and the latent rows (stored at the step's cells), the absorbed queries, the sparse attention over the
+     * {@code k} selected rows of every token, the decompression, the gate and {@code W_o}.
+     */
+    private void attendAndProject(int n, int k, GpuBuffer x, int xOff, ScratchSlot out) {
+        DsaLayout l = layout;
+        if (l.qLora > 0) {
+            ops.matmul(wqB, qr.buffer(), 0, q.buffer(), 0, n);
+            qbDeltas.applyRows(n, qr.buffer(), 0, q.buffer(), 0);
         } else {
-            k = SparseKernels.selectedCount(nKv, l.topK);
+            ops.matmul(wq, x, xOff, q.buffer(), 0, n);
+            qDeltas.applyRows(n, x, xOff, q.buffer(), 0);
         }
-
-        ops.matmul(wqB, qr.buffer(), 0, q.buffer(), 0, n);
-        qbDeltas.applyRows(n, qr.buffer(), 0, q.buffer(), 0);
-        ops.matmul(wkvA, x, xOff, kv.buffer(), 0, n);
-        kvaDeltas.applyRows(n, x, xOff, kv.buffer(), 0);
-        if (kPeNorm != null) {
-            rowNorm(kPeNorm, n);
+        if (!l.kvShared) {
+            // a shared-KV layer reads the source layer's rows and must not overwrite them (mistral-large4.cpp has_kv)
+            if (l.ropeApplied) {
+                ops.matmul(wkvA, x, xOff, kv.buffer(), 0, n);
+                kvaDeltas.applyRows(n, x, xOff, kv.buffer(), 0);
+                if (kPeNorm != null) {
+                    rowNorm(kPeNorm, n);
+                }
+                rope(qRope, n, l.nHead);
+                rope(kRope, n, 1);
+            } else {
+                // a NoPE layer projects the latent only; its roped cache columns stay zero (mistral-large4.cpp:415-416)
+                ops.matmul(wkvA, x, xOff, kvProj.buffer(), 0, n);
+                kvaDeltas.applyRows(n, x, xOff, kvProj.buffer(), 0);
+                ops.fill(kv.buffer(), 0, (long) n * l.dK * Float.BYTES, 0);
+                ops.copy2d(kvProj.buffer(), 0, l.kvLora, kv.buffer(), 0, l.dK, n, l.kvLora);
+            }
+            rowNorm(kvANorm, n);
+            latentStore.setInt(RopeKernels.ARG_N_TOKENS, n);
+            latentStore.setGlobal(elementGlobal(RopeKernels.kvStoreWorkItems(latentType, n, l.dK)));
+            latentStore.dispatch();
+        } else if (qRope != null) {
+            rope(qRope, n, l.nHead);
         }
-        rope(qRope, n, l.nHead);
-        rope(kRope, n, 1);
-        rowNorm(kvANorm, n);
-        latentStore.setInt(RopeKernels.ARG_N_TOKENS, n);
-        latentStore.setGlobal(elementGlobal(RopeKernels.kvStoreWorkItems(latentType, n, l.dK)));
-        latentStore.dispatch();
 
         int pairs = n * l.nHead;
+        GpuMatmulTap.heads(ops.queue(), wkB, l.nHead, q.buffer(), 0, l.headK, l.nope, n);
         idMatVec(absorb, n, l.kvLora, l.headK);
-        ops.copy2d(latent.buffer(), 0, l.kvLora, qcur.buffer(), 0, l.dK, pairs, l.kvLora);
-        ops.copy2d(q.buffer(), l.nope, l.headK, qcur.buffer(), l.kvLora, l.dK, pairs, l.rope);
+        if (l.ropeApplied) {
+            ops.copy2d(latent.buffer(), 0, l.kvLora, qcur.buffer(), 0, l.dK, pairs, l.kvLora);
+            ops.copy2d(q.buffer(), l.nope, l.headK, qcur.buffer(), l.kvLora, l.dK, pairs, l.rope);
+        } else {
+            ops.fill(qcur.buffer(), 0, (long) pairs * l.dK * Float.BYTES, 0);
+            ops.copy2d(latent.buffer(), 0, l.kvLora, qcur.buffer(), 0, l.dK, pairs, l.kvLora);
+        }
+        if (querySsmax != null) {
+            querySsmax.setInt(AttnExtKernels.ARG_SSMAX_N_TOKENS, n);
+            querySsmax.setGlobal(AttnExtKernels.ssmaxGlobal(n, l.nHead, l.dK, local));
+            querySsmax.dispatch();
+        }
 
         if (n == 1) {
             sparseDecode.setInt(SparseKernels.ARG_DECODE_N_SEL, k);
@@ -444,6 +691,7 @@ public final class GpuDsaMlaMixer implements GpuMixer {
             sparsePrefill.setGlobal(SparseKernels.sparsePrefillGlobal(n, l.nHead, sparseLocal));
             sparsePrefill.dispatch();
         }
+        GpuMatmulTap.heads(ops.queue(), wvB, l.nHead, latent.buffer(), 0, l.kvLora, l.kvLora, n);
         idMatVec(decompress, n, l.headV, l.kvLora);
 
         if (gateGlu != null) {
@@ -569,7 +817,7 @@ public final class GpuDsaMlaMixer implements GpuMixer {
 
     private GpuWeight projection(GpuWeight w) {
         if (!GpuOps.supportsWeightType(w.type())) {
-            throw new UnsupportedOperationException(layout.where + ": no GPU matvec kernels for " + w.name()
+            throw new GpuModelUnsupportedException(layout.where + ": no GPU matvec kernels for " + w.name()
                     + " of type " + w.type());
         }
         return w;

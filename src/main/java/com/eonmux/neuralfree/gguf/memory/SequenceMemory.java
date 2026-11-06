@@ -18,7 +18,10 @@ public interface SequenceMemory {
     /** Sequences the memory can hold simultaneously (llama.cpp {@code n_seq_max}). */
     int maxSequences();
 
-    /** The host token record of sequence {@code seq} (positions sit at {@code [posMin, posMax]}).
+    /**
+     * The host token record of sequence {@code seq} (positions sit at {@code [posMin, posMax]}). On paged memory the
+     * record follows the rows: {@link #remove}, {@link #copy} and {@link #add} drop, copy and move its entries as
+     * they do the rows' cells.
      *
      * @throws IndexOutOfBoundsException when {@code seq} is outside {@link #maxSequences()}
      */
@@ -50,12 +53,41 @@ public interface SequenceMemory {
      */
     void remove(int seq, int p0, int p1);
 
+    /**
+     * Why {@code removeKeepRecurrent(seq, p0)} would refuse, or null when it can run.
+     *
+     * @param seq the sequence
+     * @param p0  first position (inclusive); the range runs to {@code posMax(seq)}
+     */
+    String removeKeepRecurrentRefusal(int seq, int p0);
+
+    /**
+     * Removes the positions {@code [p0, posMax(seq)]} of sequence {@code seq} without touching the recurrent layer
+     * state, whose accepted-token values the caller re-derives right after: the recurrent tree verify's commit
+     * drops the round's dead rows and then replays the accepted path against the committed state. A plain
+     * {@link #remove} of these positions would refuse, or rewind state, because the memory could no longer pair
+     * its state with its sequence; this method's caller takes over that pairing. DSV4 compressor state and
+     * positional state the dropped rows feed are refused: the replay cannot re-derive them.
+     *
+     * @throws UnsupportedOperationException when {@link #removeKeepRecurrentRefusal(int, int)} answers a reason
+     */
+    void removeKeepRecurrent(int seq, int p0);
+
     /** Why {@code copy} would refuse on this memory, or null when it can copy between sequences. */
     String copyRefusal();
 
     /**
+     * Whether any page of {@code seq} is also held by another sequence, so a removal that cuts inside a shared
+     * page ({@code remove(seq, p0, p1)}) would copy that page on write. The paged memory answers from the page
+     * reference counts; the contiguous default answers false (no page is shared).
+     */
+    default boolean sharesPages(int seq) {
+        return false;
+    }
+
+    /**
      * Copies positions {@code [p0, p1)} (or up to {@code posMax(src)} for {@code p1 = -1}) of sequence {@code src}
-     * to the end of sequence {@code dst}: page sharing, not a byte copy (invariant 5).
+     * to the end of sequence {@code dst}: page sharing, not a byte copy.
      *
      * @throws UnsupportedOperationException when {@link #copyRefusal()} answers a reason
      */
@@ -81,6 +113,47 @@ public interface SequenceMemory {
      * @throws UnsupportedOperationException when {@link #shiftRefusal()} answers a reason
      */
     void add(int seq, int p0, int p1, int delta);
+
+    /** Why {@code div} (the position division with RoPE re-rotation) would refuse, or null when it can divide. */
+    String divRefusal();
+
+    /**
+     * Divides every stored position of sequence {@code seq} in {@code [p0, p1)} (or those at or above {@code p0}
+     * for {@code p1 = -1}) by {@code d >= 2}, re-rotating the stored keys by each row's own shift
+     * ({@code old - old / d}): llama.cpp's {@code llama_memory_seq_div}, the position compression of self-extend
+     * (group attention). Several rows can come to share one position.
+     *
+     * @throws IllegalArgumentException      when {@code p0} is negative or {@code d} is below 2
+     * @throws UnsupportedOperationException when {@link #divRefusal()} answers a reason
+     */
+    void div(int seq, int p0, int p1, int d);
+
+    /**
+     * Why {@code moveRows(seq, srcPos, dstPos)} would refuse, or null when it can run.
+     *
+     * @param seq    the sequence
+     * @param srcPos the stored position of each row's source cell, ascending strictly
+     * @param dstPos the position each row takes over, ascending strictly, every one below its source
+     */
+    String moveRowsRefusal(int seq, int[] srcPos, int[] dstPos);
+
+    /**
+     * Moves the row stored at {@code srcPos[i]} onto the cell of position {@code dstPos[i]}: the tree verify's
+     * commit compaction, which gathers an accepted path's KV rows from their verify slots onto the consecutive
+     * positions they occupy once committed (SpecPilot's KV slot permutation). The row's bytes move; its position
+     * becomes the destination's, so a row roped at its depth position lands exactly where a linear decode would
+     * have computed it and needs no re-rotation. The moves run in list order, each reading only cells no earlier
+     * move wrote: the sources ascend above their destinations, so an ascending list never reads a moved cell. The
+     * host token record is the caller's concern (it truncates the unaccepted tail and retokenizes the kept entries
+     * afterwards); the queue the moves join ({@code pendingRowMoves} on a paged memory) is byte-carried by
+     * {@code ForwardBackend#carryRowMoves}.
+     *
+     * @throws UnsupportedOperationException carrying {@link #moveRowsRefusal(int[], int[])} when the storage form
+     *                                        cannot move rows, or when a position is not stored
+     * @throws IllegalArgumentException            when the arrays are null, differ in length or break the ordering
+     *                                             contract
+     */
+    void moveRows(int seq, int[] srcPos, int[] dstPos);
 
     /**
      * Cells of the memory that hold no position, summed over its KV groups. For paged memories these are the free

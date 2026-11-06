@@ -4,7 +4,7 @@ import com.eonmux.neuralfree.gguf.hf.fixtures.HfSpecialFixturesBert;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticHf;
 
 /**
- * Synthetic checkpoint of the DistilBert row of Appendix A table HK-SP: {@code DistilBertModel} on the
+ * Synthetic checkpoint of the DistilBert row: {@code DistilBertModel} on the
  * {@code distil} hooks of {@link com.eonmux.neuralfree.gguf.hf.hooks.HfBertVariantHooks} over the shared
  * phantom-space WordPiece tokenizer. Two layers, hidden size 8, the exact tensor names and config keys of
  * LC/conversion/bert.py:243-264.

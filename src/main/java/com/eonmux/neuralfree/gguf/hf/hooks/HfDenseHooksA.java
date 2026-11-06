@@ -24,7 +24,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The hooks of three Gemma converter classes {@link HfGemmaHooks} (the Gemma 3 hooks of HK-B2) does not cover:
+ * The hooks of three Gemma converter classes {@link HfGemmaHooks} (the Gemma 3 hooks) does not cover:
  * {@code GemmaModel} (LC/conversion/gemma.py:20-70), {@code Gemma2Model} (:73-122) and {@code Gemma3NModel}
  * (:489-629): the class's own hand-written metadata, the +1 norm shift and {@code lm_head} filter of Gemma 1 and 2,
  * and the AltUp stacking, embedding padding and activation-sparsity keys Gemma 3n adds over the shared Gemma 3 path.

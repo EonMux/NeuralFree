@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf;
 import com.eonmux.neuralfree.gguf.jinja.JinjaAst;
 import com.eonmux.neuralfree.gguf.jinja.JinjaParser;
 import com.eonmux.neuralfree.gguf.jinja.JinjaRuntime;
+import com.eonmux.neuralfree.gguf.jinja.JinjaUsage;
 
 import java.util.Collections;
 import java.util.Map;
@@ -60,6 +61,16 @@ public final class MiniJinja {
         /** Renders with the given variables; null means no variables. Caller data is never mutated. */
         public String render(Map<String, ?> context) {
             return program.render(context == null ? Collections.<String, Object>emptyMap() : context);
+        }
+
+        /**
+         * Renders while collecting value-usage statistics into {@code usage} ({@link JinjaUsage}), the input of a
+         * chat-template capability probe. On a render error the statistics hold what ran before it.
+         *
+         * @throws IllegalArgumentException if {@code usage} is null
+         */
+        public String render(Map<String, ?> context, JinjaUsage usage) {
+            return program.render(context == null ? Collections.<String, Object>emptyMap() : context, usage);
         }
     }
 }

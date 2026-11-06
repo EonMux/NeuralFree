@@ -1,0 +1,41 @@
+/* split_k_reduce.comp - the split-K reduce: sums the slice planes of a split-K GEMM into the strided
+ * output, the Vulkan twin of LLM_SplitK_Reduce (kernels/llm/split_k_reduce.cl; llama.cpp
+ * mul_mat_split_k_reduce.comp). Requires: common/nf_common.glsl.
+ *
+ * Variant row:
+ *     LLM_SplitK_Reduce	split_k_reduce.comp
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i ne, i splits, i M, i y_stride, i y_off, R float partial, W float y)
+ *   y[y_off + (e / M) * y_stride + (e % M)] = sum_{s < splits} partial[s * ne + e],  e < ne
+ * `partial` holds `splits` consecutive planes of ne = M * N floats, plane element (t, r) at
+ * plane_start + t * M + r; the reduce scatters each summed element to its row of the strided output.
+ *
+ * Dispatch: 1-D, global = {roundUp(ceil(ne / 4), 256), 1, 1}, local = {256, 1, 1}; each invocation
+ * sums four consecutive elements, guarded past ne.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfSkPartial { float partial_in[]; };
+layout(std430, binding = 1) writeonly buffer NfSkOutput { float y_out[]; };
+layout(push_constant) uniform NfSkParams {
+    int ne; int splits; int M; int y_stride; int y_off;
+} pc;
+
+void main() {
+    const uint e0 = gl_GlobalInvocationID.x * 4u;
+    for (uint j = 0u; j < 4u; ++j) {
+        const uint e = e0 + j;
+        if (e >= uint(pc.ne)) {
+            return;
+        }
+        float sum = 0.0;
+        for (int s = 0; s < pc.splits; ++s) {
+            sum += partial_in[uint(s) * uint(pc.ne) + e];
+        }
+        y_out[uint(pc.y_off) + (e / uint(pc.M)) * uint(pc.y_stride) + (e % uint(pc.M))] = sum;
+    }
+}

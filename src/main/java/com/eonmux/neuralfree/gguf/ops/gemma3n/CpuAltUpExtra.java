@@ -39,6 +39,12 @@ public final class CpuAltUpExtra implements CpuLayerExtra {
     private float eps;
     private boolean first;
     private boolean last;
+
+    /** The predict and correct passes transform whole rows of x, exact over any step layout. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
     private CpuTensorRef router;
     private float[] routerNorm;
     private CpuTensorRef predictCoef;
@@ -240,6 +246,12 @@ public final class CpuAltUpExtra implements CpuLayerExtra {
         private float[] normed;
         private float[] low;
         private float[] out;
+
+        /** The low-rank residual is per row of x and the attention-norm output, exact over any step layout. */
+        @Override
+        public String batchRefusal() {
+            return null;
+        }
 
         @Override
         public void bind(CpuForwardContext ctx, LayerSpec layer) {

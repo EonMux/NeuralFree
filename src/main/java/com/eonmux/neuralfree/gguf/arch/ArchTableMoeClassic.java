@@ -48,6 +48,11 @@ public final class ArchTableMoeClassic {
                 // llama-model.cpp:3653-3659. Interleaved M-RoPE over the four position sections.
                 ArchEntry.of(decoder(Arch.QWEN3VLMOE, RopeType.IMROPE).build(),
                         MoeHooks::qwen3vlmoe, MoeTensorRequirements.qwen3vlmoe()),
+                // vLLM's interns1_pro.py: the Qwen3-VL MoE text block (graph models/qwen3vlmoe.cpp) with QK-norms
+                // before a whole-head NEOX rotation whose cos/sin come from the Fourier position embedding
+                // coefficients.
+                ArchEntry.of(decoder(Arch.INTERN_S1_PRO, RopeType.NEOX).graphFamily(Arch.QWEN3VLMOE).build(),
+                        MoeHooks::internS1Pro, MoeTensorRequirements.internS1Pro()),
                 // llama-model.cpp:3584. phi3 graph (models.h): RMS norms with bias tensors, LongRoPE factors.
                 ArchEntry.of(decoder(Arch.PHIMOE, RopeType.NEOX).graphFamily(Arch.PHI3).build(),
                         MoeHooks::phimoe, MoeTensorRequirements.phimoe()),
@@ -82,6 +87,15 @@ public final class ArchTableMoeClassic {
                 // llama-model.cpp:3613. A block is MoE when its ffn_gate_inp is present; sigmoid routing by default.
                 ArchEntry.of(decoder(Arch.HY_V3, RopeType.NEOX).defaultGating(GatingFunc.SIGMOID).build(),
                         MoeHooks::hyV3, MoeTensorRequirements.hyV3()),
+                // vLLM's openpangu.py without MLA or sink attention: the pangu-embedded attention over a dense lead
+                // and then routed plus shared experts, sigmoid routing in one group.
+                ArchEntry.of(decoder(Arch.PANGU_MOE, RopeType.NEOX).defaultGating(GatingFunc.SIGMOID).build(),
+                        MoeHooks::panguMoe, MoeTensorRequirements.panguMoe()),
+                // vLLM's step3_text.py: an RMS post-norm widens the shared query projection per head before RoPE,
+                // and every MoE layer adds a plain shared expert to the routed sum. A block is MoE when its
+                // ffn_gate_inp is present; routing is softmax.
+                ArchEntry.of(decoder(Arch.STEP3_TEXT, RopeType.NEOX).build(),
+                        MoeHooks::step3Text, MoeTensorRequirements.step3Text()),
                 // llama-model.cpp:3618. Routed experts plus scaled chunk experts per expert group.
                 ArchEntry.of(decoder(Arch.GROVEMOE, RopeType.NEOX).build(),
                         MoeHooks::grovemoe, MoeTensorRequirements.grovemoe()),

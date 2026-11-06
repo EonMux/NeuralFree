@@ -190,10 +190,162 @@ public class ChatFormatterTest {
         assertTrue(out, out.contains("# Instructions\n\nYou are a helpful assistant.<|end|>"));
     }
 
+    @Test
+    public void vllmReasoningRendersForTemplatesOfEitherName() {
+        String both = "{% for m in messages %}<{{ m.reasoning }}|{{ m.reasoning_content }}>{% endfor %}";
+        Map<String, String> assistant = new LinkedHashMap<>();
+        assistant.put("role", "assistant");
+        assistant.put("content", "");
+        assistant.put("reasoning", "why");
+        assertEquals("<why|why>", formatter(both, "llama").format(Collections.singletonList(assistant), false));
+    }
+
     @Test(expected = IllegalArgumentException.class)
     public void messagesWithoutRoleAreRejected() {
         Map<String, String> m = new LinkedHashMap<>();
         m.put("content", "x");
         formatter(ROLES, "llama").format(Collections.singletonList(m), false);
+    }
+
+    // ------------------------------------------------------------------ per-request overrides
+
+    @Test
+    public void aChatTemplateOverrideRendersInPlaceOfTheModelTemplate() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        ChatRequest request = ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U")))
+                .chatTemplate("<{% for m in messages %}{{ m['content'] }}{% endfor %}>")
+                .build();
+        assertEquals("<U>", f.format(request));
+        // without the override the model's template renders
+        assertEquals("[user]U", f.format(ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U"))).build()));
+    }
+
+    @Test
+    public void theOverrideIsProbedAndPreparedLikeTheModelTemplate() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        ChatRequest request = ChatRequest.builder()
+                .messages(Arrays.asList(msg("system", "Be brief."), msg("user", "Hi")))
+                .chatTemplate(GEMMA2)
+                .build();
+        assertEquals("<start_of_turn>user\nBe brief.\nHi<end_of_turn>\n<start_of_turn>model\n", f.format(request));
+    }
+
+    @Test
+    public void theOverrideCarriesTheTemplateKnobs() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        ChatRequest request = ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U")))
+                .chatTemplate("{% for m in messages %}{{ m['content'] }}{% endfor %}{{ reasoning_effort }}{{ kw }}")
+                .reasoningEffort("high")
+                .templateKwarg("kw", "K")
+                .build();
+        assertEquals("UhighK", f.format(request));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void anOverrideThatDoesNotParseIsRefusedByName() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        ChatRequest request = ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U")))
+                .chatTemplate("{{ messages[ }}")
+                .build();
+        f.format(request);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void anOverrideThatDoesNotRenderIsRefusedByName() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        ChatRequest request = ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U")))
+                .chatTemplate("{{ raise_exception('nope') }}")
+                .build();
+        f.format(request);
+    }
+
+    @Test
+    public void documentsAreBoundAsTheTemplateVariable() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        Map<String, String> document = new LinkedHashMap<>();
+        document.put("title", "T");
+        document.put("text", "X");
+        ChatRequest request = ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U")))
+                .chatTemplate("{{ documents[0]['title'] }}={{ documents[0]['text'] }}")
+                .documents(Collections.singletonList(document))
+                .build();
+        assertEquals("T=X", f.format(request));
+        ChatRequest without = ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U")))
+                .chatTemplate("{% if documents is defined %}D{% endif %}plain")
+                .build();
+        assertEquals("plain", f.format(without));
+    }
+
+    @Test
+    public void theTemplateKwargsBindAfterTheDocuments() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        Map<String, String> document = new LinkedHashMap<>();
+        document.put("d", "doc");
+        ChatRequest request = ChatRequest.builder()
+                .messages(Collections.singletonList(msg("user", "U")))
+                .chatTemplate("{{ d }}")
+                .documents(Collections.singletonList(document))
+                .templateKwarg("d", "kwarg")
+                .build();
+        assertEquals("kwarg", f.format(request));
+    }
+
+    // ------------------------------------------------------------------ media content parts
+
+    private static Map<String, Object> part(String type, String key, Object value) {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("type", type);
+        if (key != null) {
+            p.put(key, value);
+        }
+        return p;
+    }
+
+    private static ChatRequest mediaChat(Object... parts) {
+        Map<String, Object> user = new LinkedHashMap<>();
+        user.put("role", "user");
+        user.put("content", Arrays.asList(parts));
+        return ChatRequest.builder().messages(Collections.singletonList(user)).build();
+    }
+
+    @Test
+    public void mediaPartsRenderAsMarkersInPartOrderWhenTheCallerEncodesThem() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        ChatRequest chat = mediaChat(part("text", "text", "see "),
+                part(ChatMessages.PART_IMAGE, "image_url", Collections.singletonMap("url", "data:x")),
+                part(ChatMessages.PART_AUDIO, "input_audio", Collections.singletonMap("data", "AA==")),
+                part(ChatMessages.PART_AUDIO_URL, "audio_url", Collections.singletonMap("url", "http://h/a.wav")));
+        String m = ChatMessages.MEDIA_MARKER;
+        assertEquals("[user]see " + m + m + m, f.format(chat, true));
+    }
+
+    @Test
+    public void mediaPartsAreRefusedWhenThePromptRendersAsTextOnly() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        ChatRequest chat = mediaChat(part(ChatMessages.PART_IMAGE, "image_url",
+                Collections.singletonMap("url", "data:x")));
+        try {
+            f.format(chat);
+            throw new AssertionError("a media part rendered as text");
+        } catch (UnsupportedOperationException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("--mmproj"));
+        }
+    }
+
+    @Test
+    public void videoPartsRenderTheMediaMarkerLikeImagesAndAudio() {
+        ChatFormatter f = formatter(ROLES, "llama");
+        for (String type : Arrays.asList(ChatMessages.PART_VIDEO_URL, ChatMessages.PART_INPUT_VIDEO)) {
+            String rendered = f.format(mediaChat(part(type, type, Collections.singletonMap("url", "http://h/v.mp4"))),
+                    true);
+            assertTrue(type, rendered.contains(ChatMessages.MEDIA_MARKER));
+        }
     }
 }

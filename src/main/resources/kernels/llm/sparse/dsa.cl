@@ -1,7 +1,11 @@
 /* sparse/dsa.cl - LLM_DSA_IndexerScore_<KV> DeepSeek sparse-attention lightning indexer. Requires: common/dialect.h, common/config.h, common/kv_types.h, common/attn_common.h */
 /*
  * LLM_DSA_IndexerScore_<KV>(i n_tokens, i n_kv, i n_idx_heads, i idx_dim, i causal, i swa_type,
- *                      i n_swa, R iq, R w, R<KV> ik_cache, R<int> q_pos, R<int> kv_pos, W scores)
+ *                      i n_swa, i key_stride, i key_off, R iq, R w, R<KV> ik_cache, R<int> q_pos, R<int> kv_pos,
+ *                      W scores)
+ * LLM_DSA_BlockScore    (i n_tokens, i n_kv, i block_size, i ratio, R<int> q_pos, R scores, W block_scores)
+ * LLM_DSA_RestrictBlocks(i n_tokens, i n_kv, i block_size, i blocks_off, i blocks_stride, R<int> blocks,
+ *                      RW scores)
  *
  * Lightning-indexer score of query token t against indexer-cache row s (llama.cpp ggml-cpu/ops.cpp:12531-12614,
  * ggml_compute_forward_lightning_indexer; graph llama.cpp src/models/deepseek32.cpp:220-316):
@@ -10,10 +14,10 @@
  *                                                                      indexer kq mask)
  * Layouts: iq [n_tokens][n_idx_heads][idx_dim] (rotated, roped indexer queries), w [n_tokens][n_idx_heads]
  * (head weights, already prescaled by (idx_dim*n_idx_heads)^-0.5 as llama.cpp deepseek32.cpp:269 does),
- * ik_cache rows of idx_dim values in the kernel's KV element type (the indexer cache follows the context's
- * type_k, llama-kv-cache-dsa.cpp:51 and llama-kv-cache-dsv4.cpp:1308-1312; read through the
- * common/kv_types.h loaders), q_pos [n_tokens] and kv_pos [rows] (position held by each row, -1 when
- * empty). Visibility is the llama.cpp KV mask (llama-kv-cache.cpp:1664-1710): the row is not empty,
+ * ik_cache rows of key_stride values in the kernel's KV element type with the key at key_off (the indexer cache
+ * follows the context's type_k, llama-kv-cache-dsa.cpp:51 and llama-kv-cache-dsv4.cpp:1308-1312; read through the
+ * common/kv_types.h loaders; a DeepSeek-V4.1 compressed row is head_dim + indexer_head_size wide and the index key
+ * starts at head_dim), q_pos [n_tokens] and kv_pos [rows] (position held by each row, -1 when empty). Visibility is the llama.cpp KV mask (llama-kv-cache.cpp:1664-1710): the row is not empty,
  * kv <= q when causal, and llama_hparams::is_masked_swa (llama-hparams.h:506-540) is false for
  * swa_type (0 NONE, 1 STANDARD, 2 CHUNKED, 3 SYMMETRIC) and window n_swa.
  *
@@ -52,7 +56,7 @@ NF_INLINE int nf_dsa_visible(int causal, int swa_type, int n_swa, int p_kv, int 
  */
 NF_INLINE void nf_dsa_score(
     const int n_tokens, const int n_kv, const int n_idx_heads, const int idx_dim,
-    const int causal, const int swa_type, const int n_swa,
+    const int causal, const int swa_type, const int n_swa, const int key_stride, const int key_off,
     NF_GLOBAL const float* iq, NF_GLOBAL const float* w, NF_GLOBAL const uchar* ik_cache, const int kv_type,
     NF_GLOBAL const int* q_pos, NF_GLOBAL const int* kv_pos, NF_GLOBAL float* scores,
     NF_LOCAL_PTR float* qs, NF_LOCAL_PTR float* ws) {
@@ -69,7 +73,7 @@ NF_INLINE void nf_dsa_score(
     if (s < n_kv) {
         vis = nf_dsa_visible(causal, swa_type, n_swa, kv_pos[s], q_pos[t]);
     }
-    const nf_i64 krow = (nf_i64)(vis ? s : 0) * idx_dim;
+    const nf_i64 krow = (nf_i64)(vis ? s : 0) * key_stride + key_off;
     const nf_i64 qbase = (nf_i64)t * n_idx_heads * idx_dim;
     const nf_i64 wbase = (nf_i64)t * n_idx_heads;
     const int hs = min(NF_DSA_WSTAGE, NF_DSA_QSTAGE / idx_dim);
@@ -116,11 +120,12 @@ NF_INLINE void nf_dsa_score(
     }
 }
 
-/* LLM_DSA_IndexerScore_<KV>(7 scalars, 6 buffers); KV is a cache element type of common/kv_types.h. */
+/* LLM_DSA_IndexerScore_<KV>(9 scalars, 6 buffers); KV is a cache element type of common/kv_types.h. */
 #define NF_DSA_SCORE_KERNEL(SFX, KV_T, KV_CODE)                                                \
 NF_KERNEL void LLM_DSA_IndexerScore_##SFX(                                                     \
     const int n_tokens, const int n_kv, const int n_idx_heads, const int idx_dim,              \
-    const int causal, const int swa_type, const int n_swa,                                     \
+    const int causal, const int swa_type, const int n_swa, const int key_stride,               \
+    const int key_off,                                                                         \
     NF_GLOBAL const float* NF_RESTRICT iq,                                                     \
     NF_GLOBAL const float* NF_RESTRICT w,                                                      \
     NF_GLOBAL const KV_T* NF_RESTRICT ik_cache,                                                \
@@ -129,8 +134,9 @@ NF_KERNEL void LLM_DSA_IndexerScore_##SFX(                                      
     NF_GLOBAL float* NF_RESTRICT scores) {                                                     \
     NF_LOCAL float qs[NF_DSA_QSTAGE];                                                          \
     NF_LOCAL float ws[NF_DSA_WSTAGE];                                                          \
-    nf_dsa_score(n_tokens, n_kv, n_idx_heads, idx_dim, causal, swa_type, n_swa, iq, w,         \
-                 (NF_GLOBAL const uchar*)ik_cache, KV_CODE, q_pos, kv_pos, scores, qs, ws);    \
+    nf_dsa_score(n_tokens, n_kv, n_idx_heads, idx_dim, causal, swa_type, n_swa, key_stride,    \
+                 key_off, iq, w, (NF_GLOBAL const uchar*)ik_cache, KV_CODE, q_pos, kv_pos,     \
+                 scores, qs, ws);                                                              \
 }
 
 NF_DSA_SCORE_KERNEL(F32, float, NF_KV_F32)
@@ -142,3 +148,72 @@ NF_DSA_SCORE_KERNEL(Q4_1, uchar, NF_KV_Q4_1)
 NF_DSA_SCORE_KERNEL(IQ4_NL, uchar, NF_KV_IQ4_NL)
 NF_DSA_SCORE_KERNEL(Q5_0, uchar, NF_KV_Q5_0)
 NF_DSA_SCORE_KERNEL(Q5_1, uchar, NF_KV_Q5_1)
+NF_DSA_SCORE_KERNEL(FP8_E4M3, uchar, NF_KV_FP8_E4M3)
+NF_DSA_SCORE_KERNEL(FP8_E5M2, uchar, NF_KV_FP8_E5M2)
+
+/*
+ * LLM_DSA_BlockScore: level one of the DeepSeek-V4.1 two-level candidate selection (models/deepseek41.cpp:588-597).
+ * block_scores[t * n_blk + b] is the maximum row score of block b (rows [b*block_size, (b+1)*block_size) of n_kv),
+ * and the block holding the newest visible row, (n_visible - 1) / block_size with
+ * n_visible = (q_pos[t] + 1) / ratio, gets +1e30 so a partly filled block is always kept. n_blk is
+ * ceil(n_kv / block_size). One work-item per (token, block); the caller runs LLM_TopK_Rows over each token's n_blk
+ * block scores.
+ * Launch: 1-D, global = n_tokens * n_blk, any local size.
+ */
+NF_KERNEL void LLM_DSA_BlockScore(
+    int n_tokens, int n_kv, int block_size, int ratio,
+    NF_GLOBAL const int* NF_RESTRICT q_pos,
+    NF_GLOBAL const float* NF_RESTRICT scores,
+    NF_GLOBAL float* NF_RESTRICT block_scores) {
+    const int n_blk = (n_kv + block_size - 1) / block_size;
+    const nf_i64 gid = (nf_i64)get_global_id(0);
+    if (gid >= (nf_i64)n_tokens * n_blk) {
+        return;
+    }
+    const int t = (int)(gid / n_blk);
+    const int b = (int)(gid - (nf_i64)t * n_blk);
+    const int lo = b * block_size;
+    const int hi = min(n_kv, lo + block_size);
+    const nf_i64 row = (nf_i64)t * n_kv;
+    float m = -NF_INF;
+    for (int r = lo; r < hi; ++r) {
+        m = fmax(m, scores[row + r]);
+    }
+    const int p = q_pos[t];
+    const int n_vis = p < 0 ? 0 : (p + 1) / ratio;
+    if (n_vis > 0 && b == (n_vis - 1) / block_size) {
+        m += 1e30f;
+    }
+    block_scores[gid] = m;
+}
+
+/*
+ * LLM_DSA_RestrictBlocks: level two of the DeepSeek-V4.1 candidate selection (models/deepseek41.cpp:598-611):
+ * every row of scores [n_tokens][n_kv] whose block is not one of token t's blocks
+ * blocks[blocks_off + t * blocks_stride, +blocks_stride) becomes -INF. One work-item per (token, row) over the first
+ * n_tokens rows.
+ * Launch: 1-D, global = n_tokens * n_kv, any local size.
+ */
+NF_KERNEL void LLM_DSA_RestrictBlocks(
+    int n_tokens, int n_kv, int block_size, int blocks_off, int blocks_stride,
+    NF_GLOBAL const int* NF_RESTRICT blocks,
+    NF_GLOBAL float* NF_RESTRICT scores) {
+    const nf_i64 gid = (nf_i64)get_global_id(0);
+    if (gid >= (nf_i64)n_tokens * n_kv) {
+        return;
+    }
+    const int t = (int)(gid / n_kv);
+    const int row = (int)(gid - (nf_i64)t * n_kv);
+    const int b = row / block_size;
+    const int base = blocks_off + t * blocks_stride;
+    int keep = 0;
+    for (int j = 0; j < blocks_stride; ++j) {
+        if (blocks[base + j] == b) {
+            keep = 1;
+            break;
+        }
+    }
+    if (!keep) {
+        scores[gid] = -NF_INF;
+    }
+}

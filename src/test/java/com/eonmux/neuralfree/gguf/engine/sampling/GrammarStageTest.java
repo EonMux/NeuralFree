@@ -16,7 +16,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The grammar-constrained sampling stage (llama.cpp {@code llama-grammar.cpp} semantics, PARITY P2's guided_*
+ * The grammar-constrained sampling stage (llama.cpp {@code llama-grammar.cpp} semantics, the guided decoding
  * route): the stage masks every token the grammar cannot accept next, the accepted tokens advance its pushdown
  * stacks through alternations, repetitions, character ranges and multi-byte UTF-8 pieces split across tokens, a
  * completed rule admits the end-of-generation tokens again, the prompt history before the first apply leaves the
@@ -182,6 +182,23 @@ public class GrammarStageTest {
         assertEquals("then ! follows", 33, token);
         sampler.accept(token);
         assertEquals("rule complete: EOG survives", 0, sampler.sample(prefer('z', 0)));
+    }
+
+    @Test
+    public void everyAlternativeOfTheRootRuleStartsAParse() {
+        // llama_grammar_init_impl: one initial stack per root alternative, an empty one completing at once
+        Grammar grammar = GbnfBuilder.grammarOf(ConstraintSpec.gbnf("root ::= \"yes\" | \"no\" | \"maybe\""));
+        assertEquals("no", generate(grammar, new ByteVocab(), prefer('n', 'o', 'y', 0)));
+        assertEquals("maybe", generate(grammar, new ByteVocab(), prefer('m', 'a', 'y', 'b', 'e', 0)));
+        Grammar optional = GbnfBuilder.grammarOf(ConstraintSpec.gbnf("root ::= | \"a\""));
+        assertEquals("", generate(optional, new ByteVocab(), prefer(0, 'a')));
+        assertEquals("a", generate(optional, new ByteVocab(), prefer('a', 0)));
+        GrammarStage stage = new GrammarStage(grammar, new ByteVocab());
+        Sampler sampler = Sampler.create(com.eonmux.neuralfree.gguf.engine.SamplerConfig.greedyDecoding(),
+                new int[0], List.of(stage), new ByteVocab());
+        sampler.accept(sampler.sample(prefer('y', 0)));
+        stage.reset();
+        assertEquals("reset restores every root alternative", 'm', sampler.sample(prefer('m', 'y', 0)));
     }
 
     @Test

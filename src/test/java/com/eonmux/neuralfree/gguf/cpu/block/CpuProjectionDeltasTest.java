@@ -29,11 +29,11 @@ public class CpuProjectionDeltasTest {
 
     /** {@code y[t] += k * sum(x[t])} over two-wide rows. */
     private static CpuProjectionDeltas.Delta sumTimes(float k) {
-        return (n, x, xOff, xStride, y, yOff, yStride) -> {
+        return (scale, n, x, xOff, xStride, y, yOff, yStride) -> {
             for (int t = 0; t < n; t++) {
                 float s = x[xOff + t * xStride] + x[xOff + t * xStride + 1];
-                y[yOff + t * yStride] += k * s;
-                y[yOff + t * yStride + 1] += k * s;
+                y[yOff + t * yStride] += scale * k * s;
+                y[yOff + t * yStride + 1] += scale * k * s;
             }
         };
     }

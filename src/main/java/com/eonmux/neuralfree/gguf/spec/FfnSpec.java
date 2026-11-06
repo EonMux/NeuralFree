@@ -65,6 +65,7 @@ public final class FfnSpec {
     private final ActParams params;
     private final float activationSparsityStdMul;
     private final boolean biases;
+    private final boolean justNorm;
 
     private FfnSpec(Builder b) {
         this.role = b.role;
@@ -76,6 +77,7 @@ public final class FfnSpec {
         this.params = b.params;
         this.activationSparsityStdMul = b.activationSparsityStdMul;
         this.biases = b.biases;
+        this.justNorm = b.justNorm;
     }
 
     public static Builder builder(Role role) {
@@ -97,6 +99,8 @@ public final class FfnSpec {
     public float activationSparsityStdMul() { return activationSparsityStdMul; }
     /** The projections add {@code <base>.bias} when present; false when the graph ignores those tensors. */
     public boolean biases() { return biases; }
+    /** The activated rows pass through a weightless L2 norm before the down projection (Dory's {@code justnorm}). */
+    public boolean justNorm() { return justNorm; }
 
     /** True when the activation is a GLU of gate and up. */
     public boolean usesGlu() { return glu != null; }
@@ -123,6 +127,7 @@ public final class FfnSpec {
         private ActParams params = ActParams.NONE;
         private float activationSparsityStdMul;
         private boolean biases = true;
+        private boolean justNorm;
 
         private Builder(Role role) {
             this.role = role;
@@ -152,6 +157,8 @@ public final class FfnSpec {
         public Builder activationSparsityStdMul(float v) { this.activationSparsityStdMul = v; return this; }
         /** Whether the projections add their optional biases (default true). */
         public Builder biases(boolean v) { this.biases = v; return this; }
+        /** Weightless L2 norm of the activated rows before the down projection. */
+        public Builder justNorm(boolean v) { this.justNorm = v; return this; }
 
         /** @throws IllegalArgumentException for a non-positive width or an op that does not fit the gating */
         public FfnSpec build() {

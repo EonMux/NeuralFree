@@ -243,12 +243,13 @@ final class ResponsesEvents {
      * out ({@code max_output_tokens}), or {@code cancelled}. The final output follows {@code parse}, the tool
      * parser's reading of the whole text, as the chat route's message does ({@link ResponsesOutput}).
      *
-     * @param promptTokens the prompt's tokens
-     * @param cachedTokens the prompt tokens reused from the cache
+     * @param promptTokens  the prompt's tokens
+     * @param cachedTokens  the prompt tokens reused from the cache
+     * @param dropReasoning whether the final output leaves the reasoning items out (their text became the message)
      * @return the final response
      */
-    Map<String, Object> finish(GenerationResult result, int promptTokens, int cachedTokens, ToolParse parse)
-            throws IOException {
+    Map<String, Object> finish(GenerationResult result, int promptTokens, int cachedTokens, ToolParse parse,
+                               boolean dropReasoning) throws IOException {
         close();
         Map<String, Object> response = new LinkedHashMap<>(head);
         String status;
@@ -265,7 +266,11 @@ final class ResponsesEvents {
         response.put("completed_at", "completed".equals(status) ? System.currentTimeMillis() / 1000 : null);
         response.put("error", null);
         response.put("incomplete_details", incomplete);
-        response.put("output", ResponsesOutput.reconciled(output, parse));
+        List<Map<String, Object>> items = ResponsesOutput.reconciled(output, parse);
+        if (dropReasoning) {
+            items = items.stream().filter(item -> !"reasoning".equals(item.get("type"))).toList();
+        }
+        response.put("output", items);
         response.put("usage", usage(result, promptTokens, cachedTokens));
         emit("completed".equals(status) ? "response.completed" : "response.incomplete", Map.of("response", response));
         return response;

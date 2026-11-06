@@ -43,8 +43,8 @@ import java.util.Objects;
  *   x     = x + (gated + conv)
  * </pre>
  * The row ids are hashed on the host ({@link NgramLayout#hash}) from the step's tokens
- * ({@link GpuPleExtra.StepTokens}) and their {@code ngram-1} predecessors from the memory's {@link SequenceState}
- * (llama.cpp reads both from the KV cells after {@code apply_ubatch}).
+ * ({@link GpuPleExtra.StepTokens}; an embedding row hashes the stand-in id) and their {@code ngram-1} predecessors
+ * from the memory's {@link SequenceState} (llama.cpp reads both from the KV cells after {@code apply_ubatch}).
  *
  * <p>Kernel mapping: the per-stream dot product is a projection of {@code key*query} by a ones row (scaled by
  * {@code 1/sqrt(n_embd)}) over {@code T*hc} rows; {@code sgn(s)*sqrt(clamp(|s|, 1e-6))} is computed exactly with
@@ -424,23 +424,15 @@ public final class GpuNgramPleExtra implements GpuLayerExtra {
     }
 
     /**
-     * Tokens of positions {@code [pos0 - (ngram-1), pos0 + nTokens)} into {@link #window}: the predecessors from the
-     * sequence record (-1 before position 0), the step's own tokens from {@link GpuPleExtra.StepTokens}.
+     * The hash window of the step's {@code nTokens} rows ({@link NgramLayout#completeWindow}): their tokens from
+     * {@link GpuPleExtra.StepTokens} ({@code -1} for an embedding row, which hashes the stand-in id) and their
+     * predecessors from the contiguous sequence record.
      *
      * @throws IllegalStateException when the record does not reach {@code pos0}
      */
     private void fillWindow(int pos0, int nTokens) {
-        int back = layout.lookBehind();
-        SequenceState seq = memory.sequence();
-        if (pos0 > 0 && seq.nPast() < pos0) {
-            throw new IllegalStateException("n-gram PLE at position " + pos0 + " needs the tokens before it in the "
-                    + "sequence record, which holds " + seq.nPast());
-        }
-        for (int w = 0; w < back; w++) {
-            int pos = pos0 - back + w;
-            window[w] = pos < 0 ? -1 : seq.token(pos);
-        }
-        stepTokens.read(nTokens, window, back);
+        stepTokens.read(nTokens, window, layout.lookBehind());
+        layout.completeWindow(memory.sequence(), true, pos0, nTokens, window);
     }
 
     @Override

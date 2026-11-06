@@ -72,6 +72,13 @@ public final class TensorClaims {
     /** Suffix of the act-order input permutation of a projection (I32, one entry per input column). */
     public static final String INPUT_PERM = "input_perm";
 
+    /**
+     * Suffix of the activation pre-scale of a quantized projection (F32, one value per input column, or
+     * {@code E * K} for a stacked tensor's experts in expert-major order): the {@code act_pre_scale} that scales the
+     * matmul input before its activation quantization.
+     */
+    public static final String INPUT_PRE_SCALE = "input_pre_scale";
+
     /** Suffix of the FP8 KV-cache scale of {@code attn_k} and {@code attn_v}. */
     public static final String KV_SCALE = "kv_scale";
 
@@ -83,7 +90,7 @@ public final class TensorClaims {
 
     /** The sibling suffixes claimed next to each loaded scaled projection, in claim order. */
     private static final List<String> SIBLINGS = Collections.unmodifiableList(Arrays.asList(
-            SCALE, INPUT_SCALE, INPUT_ZERO_POINT, INPUT_PERM));
+            SCALE, INPUT_SCALE, INPUT_ZERO_POINT, INPUT_PERM, INPUT_PRE_SCALE));
 
     /** The optional KV-cache scale names of a layer slot, relative to {@code blk.N.}. */
     private static final List<String> KV_SCALES = Collections.unmodifiableList(Arrays.asList(

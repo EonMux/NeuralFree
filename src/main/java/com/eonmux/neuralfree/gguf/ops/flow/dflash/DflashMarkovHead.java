@@ -60,6 +60,53 @@ final class DflashMarkovHead {
     }
 
     /**
+     * {@code sigmoid(conf_proj . [t_embd row at tOff ; markov_w1[prev]] + bias)}: the confidence
+     * {@code apply} computes for the row whose bias reads {@code markov_w1[prev]}, without the logits.
+     *
+     * @throws IllegalStateException without a confidence head
+     */
+    float confidence(int prev, float[] tEmbd, int tOff) {
+        if (confProj == null) {
+            throw new IllegalStateException("DSpark draft has no confidence head");
+        }
+        float[] feat = new float[nEmbd + rank];
+        float[] c = new float[1];
+        System.arraycopy(tEmbd, tOff, feat, 0, nEmbd);
+        w1.row(prev, feat, nEmbd);
+        confProj.matvec(feat, 0, c, 0);
+        return ActMath.sigmoid(confBias != null ? c[0] + confBias[0] : c[0]);
+    }
+
+    /**
+     * Adds the Markov bias of one predecessor token to one full logits row: {@code logits[off + v] +=
+     * scatter_d2t(markov_w2 . markov_w1[prev])[v]}, the bias {@code apply} gives the row whose chain reaches
+     * {@code prev}, so a tree builder conditions a row on any predecessor, not only the greedy chain's.
+     *
+     * @param prev   predecessor token, in the target vocabulary
+     * @param logits full target-vocabulary row, modified in place
+     * @param off    offset of the row in {@code logits}
+     */
+    void addBias(int prev, float[] logits, int off) {
+        float[] w1Prev = new float[rank];
+        w1.row(prev, w1Prev, 0);
+        float[] bias = new float[w2.rows()];
+        w2.matvec(w1Prev, 0, bias, 0);
+        if (d2t == null) {
+            for (int v = 0; v < nVocab; v++) {
+                logits[off + v] += bias[v];
+            }
+            return;
+        }
+        float[] full = new float[nVocab];
+        for (int r = 0; r < d2t.length; r++) {
+            full[d2t[r]] = bias[r];
+        }
+        for (int v = 0; v < nVocab; v++) {
+            logits[off + v] += full[v];
+        }
+    }
+
+    /**
      * Biases {@code logits[i]} ({@code [nTokens][nVocab]}, target vocabulary) in place.
      *
      * @param tEmbd  {@code t_embd} rows {@code [nTokens][nEmbd]}

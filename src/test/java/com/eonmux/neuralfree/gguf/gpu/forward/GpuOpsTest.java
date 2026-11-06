@@ -1,15 +1,23 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
+import com.eonmux.neuralfree.acceleration.GpuModelUnsupportedException;
 import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
+import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
+import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
+import com.eonmux.neuralfree.gguf.ops.gemm.MmqMode;
+import com.eonmux.neuralfree.gguf.ops.gemm.SplitKGemmPlan;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
 import org.junit.After;
@@ -17,6 +25,7 @@ import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -26,6 +35,7 @@ import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * Dispatch traces of {@link GpuOps} against the host-only fake backend with strict LLM argument rules: kernel choice
@@ -229,6 +239,79 @@ public class GpuOpsTest {
         }
     }
 
+    /** A single-shard weight whose paired launch has at least {@link GpuOps#TWO_ROW_MIN_THREADS} threads. */
+    private GpuWeight q4kSingleOfRows(int rows) {
+        return q4kSingleOfRows(rows, "blk.0.big.weight");
+    }
+
+    private GpuWeight q4kSingleOfRows(int rows, String name) {
+        return GpuWeight.of(name, GGMLType.Q4_K, new long[]{COLS, rows},
+                backend.allocateBuffer(rows * Q4K_ROW_BYTES, true));
+    }
+
+    @Test
+    public void matvecOneTokenPairsRowsInTheTwoRowKernelAboveTheThreadFloor() {
+        open();
+        GpuWeight w = q4kSingleOfRows(1024);
+        GpuBuffer in = floats(COLS);
+        GpuBuffer out = floats(1024);
+        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+
+        assertEquals(Collections.singletonList("Q4_K_MatVec2"), names(ds));
+        Dispatch mv = ds.get(0);
+        assertArrayEquals(new long[]{512L * local}, mv.global());
+        assertArrayEquals(new long[]{local}, mv.local());
+        assertArrayEquals(new int[]{1024, COLS}, ints(mv, 0, 2));
+        assertSame(w.shard(0), mv.bufferArg(2));
+        assertSame(in, mv.bufferArg(3));
+        assertSame(out, mv.bufferArg(4));
+    }
+
+    @Test
+    public void matvecOneTokenBelowTheTwoRowThreadFloorKeepsTheSingleRowKernel() {
+        open();
+        GpuWeight w = q4kSingleOfRows(128);
+        GpuBuffer in = floats(COLS);
+        GpuBuffer out = floats(128);
+        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+
+        assertEquals(Collections.singletonList("Q4_K_MatVec"), names(ds));
+        assertArrayEquals(new long[]{128L * local}, ds.get(0).global());
+    }
+
+    @Test
+    public void fusedGateUpOneTokenPairsRowsInTheTwoRowKernelAboveTheThreadFloor() {
+        open();
+        GpuWeight gate = q4kSingleOfRows(1024, "blk.0.ffn_gate.weight");
+        GpuWeight up = q4kSingleOfRows(1024, "blk.0.ffn_up.weight");
+        GpuBuffer in = floats(COLS);
+        GpuBuffer out = floats(1024);
+        List<Dispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
+
+        assertEquals(Collections.singletonList("Q4_K_MatVec2FusedGateUp"), names(ds));
+        Dispatch fu = ds.get(0);
+        assertArrayEquals(new long[]{512L * local}, fu.global());
+        assertArrayEquals(new long[]{local}, fu.local());
+        assertArrayEquals(new int[]{1024, COLS}, ints(fu, 0, 2));
+        assertSame(gate.shard(0), fu.bufferArg(2));
+        assertSame(up.shard(0), fu.bufferArg(3));
+        assertSame(in, fu.bufferArg(4));
+        assertSame(out, fu.bufferArg(5));
+    }
+
+    @Test
+    public void fusedGateUpOneTokenBelowTheTwoRowThreadFloorKeepsTheSingleRowKernel() {
+        open();
+        GpuWeight gate = q4kSingleOfRows(128, "blk.0.ffn_gate.weight");
+        GpuWeight up = q4kSingleOfRows(128, "blk.0.ffn_up.weight");
+        GpuBuffer in = floats(COLS);
+        GpuBuffer out = floats(128);
+        List<Dispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
+
+        assertEquals(Collections.singletonList("Q4_K_MatVecFusedGateUp"), names(ds));
+        assertArrayEquals(new long[]{128L * local}, ds.get(0).global());
+    }
+
     @Test
     public void matvecFourTokensUsesTwoDimensionalBatchAndPerTokenRowOffsets() {
         open();
@@ -334,29 +417,400 @@ public class GpuOpsTest {
     }
 
     @Test
-    public void matmulUsesTiledGemmWithOffsetsAndStrides() {
+    public void matmulUsesMmqGemmWithOffsetsAndStrides() {
         open();
         GpuWeight w = q4kSharded();
         GpuBuffer in = floats(9L * COLS);
         GpuBuffer out = floats(9L * ROWS);
         List<Dispatch> ds = run(() -> ops.matmul(w, in, COLS, out, ROWS, 8));
 
-        assertEquals(Arrays.asList("Q4_K_MatMul_Tiled", "Q4_K_MatMul_Tiled", "Q4_K_MatMul_Tiled"), names(ds));
+        assertEquals("the input is staged once, then every shard's row tile reads the staged records",
+                Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ", "Q4_K_MatMul_MMQ", "Q4_K_MatMul_MMQ"),
+                names(ds));
+        Dispatch quant = ds.get(0);
+        assertArrayEquals("the staging pass reads the caller's input view",
+                new int[]{8, COLS, MmqConfig.PACKED_DOT.stageDepth(), COLS, COLS}, ints(quant, 0, 5));
+        assertSame(in, quant.bufferArg(5));
+        GpuBuffer staged = quant.bufferArg(6);
         for (int s = 0; s < 3; s++) {
-            Dispatch d = ds.get(s);
+            Dispatch d = ds.get(1 + s);
             assertArrayEquals(new long[]{GpuOps.TILED_WG, 1}, d.global());
             assertArrayEquals(new long[]{GpuOps.TILED_WG, 1}, d.local());
-            assertArrayEquals(new int[]{SHARD_ROWS, COLS, 8, COLS, COLS, ROWS, ROWS + s * SHARD_ROWS},
-                    ints(d, 0, 7));
+            assertArrayEquals(new int[]{SHARD_ROWS, COLS, 8, MmqConfig.PACKED_DOT.rowRecords(COLS), 0,
+                    ROWS, ROWS + s * SHARD_ROWS}, ints(d, 0, 7));
             assertSame(w.shard(s), d.bufferArg(7));
-            assertSame(in, d.bufferArg(8));
+            assertSame("every row tile reads the same staged records", staged, d.bufferArg(8));
             assertSame(out, d.bufferArg(9));
         }
     }
 
     @Test
-    public void matmulFallsBackToBatchedMatvecWithoutTiledKernel() {
-        open(FakeComputeBackend.builder().strictLlmArgs(true).unavailableKernels("Q4_K_MatMul_Tiled").build());
+    public void matmulOfAnMmqTypeFallsBackToTiledWithoutTheMmqKernel() {
+        open(FakeComputeBackend.builder().strictLlmArgs(true).unavailableKernels("Q4_K_MatMul_MMQ").build());
+        GpuWeight w = q4kSingle();
+        GpuBuffer in = floats(8L * COLS);
+        GpuBuffer out = floats(8L * ROWS);
+        List<Dispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 8));
+
+        assertEquals(Arrays.asList("Q4_K_MatMul_Tiled"), names(ds));
+    }
+
+    /**
+     * {@code neuralfree.gemm.mmq=off} serves the MMQ types with the exact tiled GEMM and skips the
+     * fast lane at prewarm; {@code on} and {@code auto} keep the MMQ kernel. The property binds once
+     * per GpuOps, and an unknown value fails the bind.
+     */
+    @Test
+    public void theMmqSwitchChoosesBetweenTheFastQuantLaneAndTheTiledGemm() {
+        System.setProperty(MmqMode.PROPERTY, "off");
+        try {
+            open();
+            GpuWeight w = q4kSingle();
+            GpuBuffer in = floats(8L * COLS);
+            GpuBuffer out = floats(8L * ROWS);
+            ops.prewarmWeightKernels(GGMLType.Q4_K, true, false);
+            assertFalse(backend.preparedKernels().toString(), backend.preparedKernels().contains("Q4_K_MatMul_MMQ"));
+            assertFalse(backend.preparedKernels().toString(),
+                    backend.preparedKernels().contains(GemmKernels.QUANT_MMQ_Q8_1));
+            assertTrue(backend.preparedKernels().toString(), backend.preparedKernels().contains("Q4_K_MatMul_Tiled"));
+            assertEquals(Arrays.asList("Q4_K_MatMul_Tiled"), names(run(() -> ops.matmul(w, in, 0, out, 0, 8))));
+        } finally {
+            System.clearProperty(MmqMode.PROPERTY);
+        }
+
+        System.setProperty(MmqMode.PROPERTY, "on");
+        try {
+            open();
+            GpuWeight w = q4kSingle();
+            GpuBuffer in = floats(8L * COLS);
+            GpuBuffer out = floats(8L * ROWS);
+            assertEquals(Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ"),
+                    names(run(() -> ops.matmul(w, in, 0, out, 0, 8))));
+        } finally {
+            System.clearProperty(MmqMode.PROPERTY);
+        }
+
+        System.setProperty(MmqMode.PROPERTY, "maybe");
+        try {
+            open();
+            fail("expected the unknown value to fail the bind");
+        } catch (IllegalArgumentException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains(MmqMode.PROPERTY));
+            assertTrue(e.getMessage(), e.getMessage().contains("maybe"));
+        } finally {
+            System.clearProperty(MmqMode.PROPERTY);
+        }
+    }
+
+    /**
+     * On a Vulkan device with cooperative matrices the fast quantized-weight GEMM runs the CM form,
+     * the switch turns the whole lane off, and F16 weights keep the MMA kernel the switch never
+     * touches.
+     */
+    @Test
+    public void vulkanCooperativeMatricesServeQuantWeightsThroughTheCmForm() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.VULKAN)
+                .strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.VULKAN, 32)).build());
+        GpuWeight q4k = q4kSingle();
+        GpuBuffer in = floats(8L * COLS);
+        GpuBuffer out = floats(8L * ROWS);
+        assertEquals(Arrays.asList("Q4_K_MatMul_CM"), names(run(() -> ops.matmul(q4k, in, 0, out, 0, 8))));
+
+        GpuWeight f16 = GpuWeight.of("blk.0.attn_q.weight", GGMLType.F16, new long[]{COLS, ROWS},
+                backend.allocateBuffer((long) ROWS * COLS * 2, true));
+        assertEquals(Arrays.asList("F16_MatMul_MMA"), names(run(() -> ops.matmul(f16, in, 0, out, 0, 8))));
+
+        System.setProperty(MmqMode.PROPERTY, "off");
+        try {
+            open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.VULKAN)
+                    .strictLlmArgs(true)
+                    .capabilities(tensorCores(ComputeBackend.BackendType.VULKAN, 32)).build());
+            GpuWeight q4kOff = q4kSingle();
+            GpuWeight f16Off = GpuWeight.of("blk.0.attn_q.weight", GGMLType.F16, new long[]{COLS, ROWS},
+                    backend.allocateBuffer((long) ROWS * COLS * 2, true));
+            GpuBuffer inOff = floats(8L * COLS);
+            GpuBuffer outOff = floats(8L * ROWS);
+            assertEquals(Arrays.asList("Q4_K_MatMul_Tiled"),
+                    names(run(() -> ops.matmul(q4kOff, inOff, 0, outOff, 0, 8))));
+            assertEquals("the MMA lane is not part of the switch",
+                    Arrays.asList("F16_MatMul_MMA"), names(run(() -> ops.matmul(f16Off, inOff, 0, outOff, 0, 8))));
+        } finally {
+            System.clearProperty(MmqMode.PROPERTY);
+        }
+
+        System.setProperty(MmqMode.PROPERTY, "on");
+        try {
+            open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.VULKAN)
+                    .strictLlmArgs(true)
+                    .capabilities(tensorCores(ComputeBackend.BackendType.VULKAN, 32)).build());
+            GpuWeight q4kOn = q4kSingle();
+            GpuBuffer inOn = floats(8L * COLS);
+            GpuBuffer outOn = floats(8L * ROWS);
+            assertEquals("on forces the int8 MMQ GEMM over the CM form",
+                    Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ"),
+                    names(run(() -> ops.matmul(q4kOn, inOn, 0, outOn, 0, 8))));
+        } finally {
+            System.clearProperty(MmqMode.PROPERTY);
+        }
+    }
+
+    /** BF16 weights keep the exact tiled GEMM on Vulkan, whose MMA twin stages fp16 tiles. */
+    @Test
+    public void bf16WeightsKeepTheTiledGemmOnVulkan() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.VULKAN)
+                .strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.VULKAN, 32)).build());
+        GpuWeight bf16 = GpuWeight.of("blk.0.attn_v.weight", GGMLType.BF16, new long[]{COLS, ROWS},
+                backend.allocateBuffer((long) ROWS * COLS * 2, true));
+        GpuBuffer in = floats(8L * COLS);
+        GpuBuffer out = floats(8L * ROWS);
+        assertEquals(Arrays.asList("BF16_MatMul_Tiled"), names(run(() -> ops.matmul(bf16, in, 0, out, 0, 8))));
+    }
+
+    /**
+     * The MMQ launch grid follows the device's tile config (llama.cpp's mmq-config tables): 64-token tiles on
+     * CUDA sm_80+ (the int8 tensor path) and 16-token tiles below it, so 40 tokens need one or three tile
+     * columns. The config and the grid it plans are pure geometry, so they are checked without loading the
+     * kernels for a faked device.
+     */
+    @Test
+    public void mmqGridsUseTheTileConfigOfTheDevice() {
+        assertEquals(MmqConfig.INT8_TENSOR, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 80));
+        assertEquals(MmqConfig.PACKED_DOT, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 75));
+        assertEquals("sm_120 uses the 64-token int8-tensor tile",
+                64, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 120).tileTokens());
+        assertEquals("sm_75 uses the 16-token packed-dot tile",
+                16, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 75).tileTokens());
+        int[][] cases = {{120, 1}, {80, 1}, {75, 3}};       /* compute capability, tile columns of 40 tokens */
+        for (int[] c : cases) {
+            MmqConfig config = MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, c[0]);
+            assertEquals("sm_" + c[0] + " tile columns", c[1], GpuOps.ceilDiv(40L, config.tileTokens()));
+        }
+    }
+
+    /** BF16 weights run the BF16 row of the MMA family on tensor-core devices. */
+    @Test
+    public void bf16WeightsRunTheMmaKernelOnTensorCoreDevices() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.CUDA)
+                .strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.CUDA, 32)).build());
+        GpuWeight bf16 = GpuWeight.of("blk.0.attn_v.weight", GGMLType.BF16, new long[]{COLS, ROWS},
+                backend.allocateBuffer((long) ROWS * COLS * 2, true));
+        GpuBuffer in = floats(8L * COLS);
+        GpuBuffer out = floats(8L * ROWS);
+        List<Dispatch> ds = run(() -> ops.matmul(bf16, in, 0, out, 0, 8));
+
+        assertEquals(Arrays.asList("BF16_MatMul_MMA"), names(ds));
+        for (Dispatch d : ds) {
+            assertEquals(ROWS, d.intArg(GemmKernels.ARG_Y_STRIDE));
+            assertEquals((long) ROWS * COLS * 2, d.bufferArg(GemmKernels.ARG_WEIGHT).sizeInBytes());
+        }
+    }
+
+    /**
+     * A tall-skinny MMA launch over a large K splits into {@code <T>_MatMul_MMA_KSplit} planes plus
+     * one {@code LLM_SplitK_Reduce}; a launch the heuristic does not split stays on the plain kernel.
+     */
+    @Test
+    public void tallSkinnyMmaLaunchesSplitKIntoPlanesAndAReduce() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.CUDA)
+                .strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.CUDA, 4)).build());
+        final int wideCols = 2048;
+        GpuWeight f16 = GpuWeight.of("blk.0.ffn_down.weight", GGMLType.F16, new long[]{wideCols, ROWS},
+                backend.allocateBuffer((long) ROWS * wideCols * 2, true));
+        GpuBuffer in = floats(8L * wideCols);
+        GpuBuffer out = floats(8L * ROWS);
+        List<Dispatch> ds = run(() -> ops.matmul(f16, in, 0, out, 0, 8));
+
+        assertEquals("two 64-row tiles x one token tile over 4 units split by the fill ratio", 2,
+                SplitKGemmPlan.splitsFor(4, 2, 1, wideCols));
+        assertEquals(Arrays.asList("F16_MatMul_MMA_KSplit", GemmKernels.SPLIT_K_REDUCE), names(ds));
+        Dispatch partial = ds.get(0);
+        assertArrayEquals(new int[]{ROWS, wideCols, 8, wideCols, 0, SplitKGemmPlan.sliceLength(wideCols, 2)},
+                ints(partial, 0, 6));
+        assertSame(f16.shard(0), partial.bufferArg(GemmKernels.KSPLIT_ARG_WEIGHT));
+        assertSame(in, partial.bufferArg(GemmKernels.KSPLIT_ARG_X));
+        Dispatch reduce = ds.get(1);
+        assertArrayEquals(new int[]{ROWS * 8, 2, ROWS, ROWS, 0}, ints(reduce, 0, 5));
+        assertSame(reduce.bufferArg(GemmKernels.REDUCE_ARG_PARTIAL), partial.bufferArg(GemmKernels.KSPLIT_ARG_PARTIAL));
+        assertSame(out, reduce.bufferArg(GemmKernels.REDUCE_ARG_Y));
+
+        GpuBuffer acc = floats(8L * ROWS);
+        List<Dispatch> accumulate = run(() -> ops.matvecAdd(f16, in, 0, acc, 0, 8));
+        assertEquals(Arrays.asList("F16_MatMul_MMA_KSplit", GemmKernels.SPLIT_K_REDUCE),
+                names(accumulate).subList(0, 2));
+        assertNotSame("the planes never alias the staged projection result",
+                accumulate.get(0).bufferArg(GemmKernels.KSPLIT_ARG_PARTIAL),
+                accumulate.get(1).bufferArg(GemmKernels.REDUCE_ARG_Y));
+
+        GpuWeight denseGrid = GpuWeight.of("blk.1.ffn_down.weight", GGMLType.F16, new long[]{wideCols, 512},
+                backend.allocateBuffer(512L * wideCols * 2, true));
+        GpuBuffer wideOut = floats(8L * 512);
+        assertEquals("a tile grid that fills the device stays on the plain kernel",
+                Arrays.asList("F16_MatMul_MMA"), names(run(() -> ops.matmul(denseGrid, in, 0, wideOut, 0, 8))));
+    }
+
+    /**
+     * A tall-skinny MMQ launch splits into {@code <T>_MatMul_MMQ_KSplit} planes plus one
+     * {@code LLM_SplitK_Reduce}, the slices covering whole weight blocks of the staged records.
+     */
+    @Test
+    public void tallSkinnyMmqLaunchesSplitKIntoPlanesAndAReduce() {
+        open(FakeComputeBackend.builder().strictLlmArgs(true).capabilities(capsWithUnits(4)).build());
+        final int wideCols = 2048;
+        GpuWeight q4k = GpuWeight.of("blk.0.ffn_down.weight", GGMLType.Q4_K, new long[]{wideCols, ROWS},
+                backend.allocateBuffer((long) ROWS / 16 * 144 * wideCols, true));
+        GpuBuffer in = floats(8L * wideCols);
+        GpuBuffer out = floats(8L * ROWS);
+        List<Dispatch> ds = run(() -> ops.matmul(q4k, in, 0, out, 0, 8));
+
+        assertEquals(2, SplitKGemmPlan.splitsFor(4, 2, 1, wideCols));
+        assertEquals(Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ_KSplit",
+                GemmKernels.SPLIT_K_REDUCE), names(ds));
+        Dispatch quant = ds.get(0);
+        assertSame(in, quant.bufferArg(5));
+        GpuBuffer staged = quant.bufferArg(6);
+        Dispatch partial = ds.get(1);
+        assertArrayEquals(new int[]{ROWS, wideCols, 8, MmqConfig.PACKED_DOT.rowRecords(wideCols), 0,
+                        SplitKGemmPlan.sliceLength(wideCols, 2, GGMLType.Q4_K.getBlockSize())},
+                ints(partial, 0, 6));
+        assertSame(q4k.shard(0), partial.bufferArg(GemmKernels.KSPLIT_ARG_WEIGHT));
+        assertSame(staged, partial.bufferArg(GemmKernels.KSPLIT_ARG_X));
+        Dispatch reduce = ds.get(2);
+        assertArrayEquals(new int[]{ROWS * 8, 2, ROWS, ROWS, 0}, ints(reduce, 0, 5));
+        assertSame(reduce.bufferArg(GemmKernels.REDUCE_ARG_PARTIAL), partial.bufferArg(GemmKernels.KSPLIT_ARG_PARTIAL));
+        assertSame(out, reduce.bufferArg(GemmKernels.REDUCE_ARG_Y));
+    }
+
+    /**
+     * A tall-skinny CM launch on a cooperative-matrix Vulkan device splits into
+     * {@code <T>_MatMul_CM_KSplit} planes plus one {@code LLM_SplitK_Reduce} over the unstaged
+     * activation view: the view's offset and stride travel into the partial kernel's arguments.
+     */
+    @Test
+    public void tallSkinnyCmLaunchesSplitKIntoPlanesAndAReduce() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.VULKAN)
+                .strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.VULKAN, 4)).build());
+        final int wideCols = 2048;
+        GpuWeight q4k = GpuWeight.of("blk.0.ffn_down.weight", GGMLType.Q4_K, new long[]{wideCols, ROWS},
+                backend.allocateBuffer((long) ROWS / 16 * 144 * wideCols, true));
+        GpuBuffer in = floats(9L * wideCols);
+        GpuBuffer out = floats(8L * ROWS);
+        List<Dispatch> ds = run(() -> ops.matmul(q4k, in, wideCols, out, 0, 8));
+
+        assertEquals(2, SplitKGemmPlan.splitsFor(4, 2, 1, wideCols));
+        assertEquals(Arrays.asList("Q4_K_MatMul_CM_KSplit", GemmKernels.SPLIT_K_REDUCE), names(ds));
+        Dispatch partial = ds.get(0);
+        assertArrayEquals(new int[]{ROWS, wideCols, 8, wideCols, wideCols,
+                        SplitKGemmPlan.sliceLength(wideCols, 2)},
+                ints(partial, 0, 6));
+        assertSame(q4k.shard(0), partial.bufferArg(GemmKernels.KSPLIT_ARG_WEIGHT));
+        assertSame("the CM lane reads the unstaged activation view", in,
+                partial.bufferArg(GemmKernels.KSPLIT_ARG_X));
+        Dispatch reduce = ds.get(1);
+        assertArrayEquals(new int[]{ROWS * 8, 2, ROWS, ROWS, 0}, ints(reduce, 0, 5));
+        assertSame(reduce.bufferArg(GemmKernels.REDUCE_ARG_PARTIAL), partial.bufferArg(GemmKernels.KSPLIT_ARG_PARTIAL));
+        assertSame(out, reduce.bufferArg(GemmKernels.REDUCE_ARG_Y));
+    }
+
+    /**
+     * A device that does not report its compute units (Vulkan without the shader-core extensions) never splits,
+     * whatever the lane or the grid: the plain kernel serves the launch instead of the pipeline failing in the
+     * heuristic. Only a reported count lets the fill ratio choose a split.
+     */
+    @Test
+    public void unknownComputeUnitsKeepTallSkinnyMmqOnThePlainKernel() {
+        open(FakeComputeBackend.builder().strictLlmArgs(true)
+                .capabilities(capsWithUnits(DeviceCapabilities.UNKNOWN_COMPUTE_UNITS)).build());
+        final int wideCols = 2048;
+        GpuWeight q4k = GpuWeight.of("blk.0.ffn_down.weight", GGMLType.Q4_K, new long[]{wideCols, ROWS},
+                backend.allocateBuffer((long) ROWS / 16 * 144 * wideCols, true));
+        GpuBuffer in = floats(8L * wideCols);
+        GpuBuffer out = floats(8L * ROWS);
+
+        assertEquals(Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ"),
+                names(run(() -> ops.matmul(q4k, in, 0, out, 0, 8))));
+    }
+
+    @Test
+    public void unknownComputeUnitsKeepTallSkinnyCmOnThePlainKernel() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.VULKAN)
+                .strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.VULKAN,
+                        DeviceCapabilities.UNKNOWN_COMPUTE_UNITS)).build());
+        final int wideCols = 2048;
+        GpuWeight q4k = GpuWeight.of("blk.0.ffn_down.weight", GGMLType.Q4_K, new long[]{wideCols, ROWS},
+                backend.allocateBuffer((long) ROWS / 16 * 144 * wideCols, true));
+        GpuBuffer in = floats(8L * wideCols);
+        GpuBuffer out = floats(8L * ROWS);
+
+        assertEquals(Arrays.asList("Q4_K_MatMul_CM"), names(run(() -> ops.matmul(q4k, in, 0, out, 0, 8))));
+    }
+
+    @Test
+    public void unknownComputeUnitsKeepTallSkinnyMmaOnThePlainKernel() {
+        open(FakeComputeBackend.builder().backendType(ComputeBackend.BackendType.CUDA)
+                .strictLlmArgs(true)
+                .capabilities(tensorCores(ComputeBackend.BackendType.CUDA,
+                        DeviceCapabilities.UNKNOWN_COMPUTE_UNITS)).build());
+        final int wideCols = 2048;
+        GpuWeight f16 = GpuWeight.of("blk.0.ffn_down.weight", GGMLType.F16, new long[]{wideCols, ROWS},
+                backend.allocateBuffer((long) ROWS * wideCols * 2, true));
+        GpuBuffer in = floats(8L * wideCols);
+        GpuBuffer out = floats(8L * ROWS);
+
+        assertEquals(Arrays.asList("F16_MatMul_MMA"), names(run(() -> ops.matmul(f16, in, 0, out, 0, 8))));
+    }
+
+    /** Device capabilities of the default fake device with the given compute-unit count. */
+    private static DeviceCapabilities capsWithUnits(int computeUnits) {
+        return new DeviceCapabilities.Builder()
+                .deviceName("StageDevice")
+                .totalVramBytes(8L << 30)
+                .maxAllocSizeBytes(2L << 30)
+                .computeUnits(computeUnits)
+                .maxClockFrequencyMhz(1500)
+                .maxWorkGroupSize(1024)
+                .driverVersion("fake-1.0")
+                .maxLocalMemoryBytes(48L * 1024)
+                .build();
+    }
+
+    /**
+     * Fake tensor-core device capabilities of a backend type: CUDA with sm_120, Vulkan with the LLM
+     * library's storage and timeline features, both with {@link DeviceFeature#COOPERATIVE_MATRIX}.
+     */
+    private static DeviceCapabilities tensorCores(ComputeBackend.BackendType type, int computeUnits) {
+        DeviceCapabilities.Builder b = new DeviceCapabilities.Builder()
+                .deviceName("TensorDevice")
+                .totalVramBytes(8L << 30)
+                .maxAllocSizeBytes(2L << 30)
+                .computeUnits(computeUnits)
+                .maxClockFrequencyMhz(1500)
+                .maxWorkGroupSize(1024)
+                .driverVersion("fake-1.0")
+                .supportsFloat16(true)
+                .supportsSubgroups(true)
+                .maxLocalMemoryBytes(48L * 1024)
+                .feature(DeviceFeature.COOPERATIVE_MATRIX);
+        if (type == ComputeBackend.BackendType.CUDA) {
+            // sm_80+ always reports both matrix features (CudaCapabilitiesBuilder), so the fake
+            // device mirrors what the CUDA backend builds for the compute capability below.
+            b.computeCapability(120).feature(DeviceFeature.BF16_COOPERATIVE_MATRIX);
+        } else {
+            b.feature(DeviceFeature.STORAGE_8BIT).feature(DeviceFeature.STORAGE_16BIT)
+                    .feature(DeviceFeature.TIMELINE_SEMAPHORE);
+        }
+        return b.build();
+    }
+
+    @Test
+    public void matmulFallsBackToBatchedMatvecWithoutAnyGemmKernel() {
+        open(FakeComputeBackend.builder().strictLlmArgs(true)
+                .unavailableKernels("Q4_K_MatMul_MMQ", "Q4_K_MatMul_Tiled").build());
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(8L * COLS);
         GpuBuffer out = floats(8L * ROWS);
@@ -366,11 +820,12 @@ public class GpuOpsTest {
     }
 
     @Test
-    public void tiledGemmAboveItsKernelLimitIsSkippedAtPrewarmAndMatmulFallsBack() {
-        openWithKernelLimit(GpuOps.TILED_WG / 2, "Q4_K_MatMul_Tiled");
+    public void gemmsAboveTheirKernelLimitAreSkippedAtPrewarmAndMatmulFallsBack() {
+        openWithKernelLimit(GpuOps.TILED_WG / 2, "Q4_K_MatMul_Tiled", "Q4_K_MatMul_MMQ");
         ops.prewarmWeightKernels(GGMLType.Q4_K, true, false);
         List<String> prepared = backend.preparedKernels();
         assertFalse(prepared.toString(), prepared.contains("Q4_K_MatMul_Tiled"));
+        assertFalse(prepared.toString(), prepared.contains("Q4_K_MatMul_MMQ"));
         assertTrue(prepared.toString(), prepared.contains("Q4_K_MatVec"));
 
         GpuWeight w = q4kSingle();
@@ -382,8 +837,8 @@ public class GpuOpsTest {
     }
 
     @Test
-    public void tiledGemmOfAWeightTypeNeverPrewarmedIsCheckedOnFirstUse() {
-        openWithKernelLimit(GpuOps.TILED_WG / 2, "Q4_K_MatMul_Tiled");
+    public void gemmOfAWeightTypeNeverPrewarmedIsCheckedOnFirstUse() {
+        openWithKernelLimit(GpuOps.TILED_WG / 2, "Q4_K_MatMul_Tiled", "Q4_K_MatMul_MMQ");
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(8L * COLS);
         GpuBuffer out = floats(8L * ROWS);
@@ -583,7 +1038,8 @@ public class GpuOpsTest {
 
         GpuWeight wide = GpuWeight.of("wide", GGMLType.F32, new long[]{2048, 1},
                 backend.allocateBuffer(2048L * Float.BYTES, true));
-        assertThrows(IllegalArgumentException.class, () -> wide.withHadamard(HadamardSpec.rotation(2048)));
+        // a transform the GPU Hadamard kernel limit refuses is a model the device cannot serve, not a bad argument
+        assertThrows(GpuModelUnsupportedException.class, () -> wide.withHadamard(HadamardSpec.rotation(2048)));
         assertEquals(1, q4kSharded().shardOfRow(SHARD_ROWS));
     }
 

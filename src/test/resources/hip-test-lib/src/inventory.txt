@@ -1,0 +1,1 @@
+nf_test_scale	test/eltwise.cl	1	2	f,i	Bfi

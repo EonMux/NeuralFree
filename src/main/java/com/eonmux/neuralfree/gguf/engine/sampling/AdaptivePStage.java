@@ -30,8 +30,10 @@ public final class AdaptivePStage extends SamplerStage {
     private float weightedSum;
     private float totalWeight;
     private float[] originalProbs = new float[0];
+    /** The token the last apply selected, -1 once accepted (or without an apply). */
     private int pendingTokenId = -1;
-    private int pendingTokenIdx = -1;
+    /** The original probability of {@link #pendingTokenId}. */
+    private float pendingProb;
 
     public AdaptivePStage(float target, float decay, long seed) {
         this.target = target;
@@ -84,7 +86,7 @@ public final class AdaptivePStage extends SamplerStage {
         int idx = rng.distDraw(used(candidates, candidates.size()));
         candidates.select(idx);
         pendingTokenId = candidates.id(idx);
-        pendingTokenIdx = idx;
+        pendingProb = originalProbs[idx];
     }
 
     /** The current probabilities (the llama_sample_dist iterator range over cur_p). */
@@ -99,11 +101,10 @@ public final class AdaptivePStage extends SamplerStage {
     @Override
     public void accept(int token) {
         if (pendingTokenId == token) {
-            weightedSum = originalProbs[pendingTokenIdx] + decay * weightedSum;
+            weightedSum = pendingProb + decay * weightedSum;
             totalWeight = 1.0f + decay * totalWeight;
         }
         pendingTokenId = -1;
-        pendingTokenIdx = -1;
     }
 
     @Override
@@ -111,7 +112,42 @@ public final class AdaptivePStage extends SamplerStage {
         weightedSum = target / (1.0f - decay);
         totalWeight = 1.0f / (1.0f - decay);
         pendingTokenId = -1;
-        pendingTokenIdx = -1;
         rng.seed(seed);
+    }
+
+    /**
+     * The running average of the selected tokens' original probabilities with the pending selection, so a restored
+     * stage folds the next accepted token as it would have when the state was saved.
+     */
+    @Override
+    public Object saveState() {
+        return new State(weightedSum, totalWeight, pendingTokenId, pendingProb);
+    }
+
+    @Override
+    public void restoreState(Object state) {
+        if (!(state instanceof State)) {
+            throw new IllegalArgumentException("not an adaptive-p stage state: " + state);
+        }
+        State s = (State) state;
+        weightedSum = s.weightedSum;
+        totalWeight = s.totalWeight;
+        pendingTokenId = s.pendingTokenId;
+        pendingProb = s.pendingProb;
+    }
+
+    /** A saved stage state ({@link #saveState}). */
+    private static final class State {
+        final float weightedSum;
+        final float totalWeight;
+        final int pendingTokenId;
+        final float pendingProb;
+
+        State(float weightedSum, float totalWeight, int pendingTokenId, float pendingProb) {
+            this.weightedSum = weightedSum;
+            this.totalWeight = totalWeight;
+            this.pendingTokenId = pendingTokenId;
+            this.pendingProb = pendingProb;
+        }
     }
 }

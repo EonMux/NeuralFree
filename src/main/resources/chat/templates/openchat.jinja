@@ -1,0 +1,13 @@
+{#- llama.cpp openchat chat template (src/llama-chat.cpp:421-434): the role's first letter upper-cased, ASCII-only as C's toupper. -#}
+{%- macro ascii_upper(text) -%}{{- text | replace('a', 'A') | replace('b', 'B') | replace('c', 'C') | replace('d', 'D') | replace('e', 'E') | replace('f', 'F') | replace('g', 'G') | replace('h', 'H') | replace('i', 'I') | replace('j', 'J') | replace('k', 'K') | replace('l', 'L') | replace('m', 'M') | replace('n', 'N') | replace('o', 'O') | replace('p', 'P') | replace('q', 'Q') | replace('r', 'R') | replace('s', 'S') | replace('t', 'T') | replace('u', 'U') | replace('v', 'V') | replace('w', 'W') | replace('x', 'X') | replace('y', 'Y') | replace('z', 'Z') -}}{%- endmacro -%}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- content ~ '<|end_of_turn|>' -}}
+    {%- else -%}
+        {{- 'GPT4 Correct ' ~ ascii_upper(message['role'][:1]) ~ message['role'][1:] ~ ': ' ~ content ~ '<|end_of_turn|>' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- 'GPT4 Correct Assistant:' -}}
+{%- endif -%}

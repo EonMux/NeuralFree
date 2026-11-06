@@ -16,7 +16,7 @@ import java.util.concurrent.ConcurrentMap;
 /**
  * Maps a GGUF {@code tokenizer.ggml.pre} name to its BPE pre-tokenizer: the
  * {@link PreTokenizerType} and the vocabulary flags llama.cpp sets for that name in
- * {@code llama_vocab::impl::load} (src/llama-vocab.cpp:2418-2699). An unknown name is an error,
+ * {@code llama_vocab::impl::load} (src/llama-vocab.cpp:2458-2800). An unknown name is an error,
  * as in llama.cpp; a missing name selects {@code default} with a quality warning.
  *
  * <p>Every name is a pre-built {@link PreTokenizerSpec} of its type's llama.cpp regex steps
@@ -100,16 +100,17 @@ public final class PreTokenizerRegistry {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Name table (src/llama-vocab.cpp:2418-2699, in source order)
+    // Name table (src/llama-vocab.cpp:2458-2800, in source order)
     // ---------------------------------------------------------------------------------------------
 
     private static Map<String, Entry> buildTable() {
         Map<String, Entry> m = new HashMap<>();
         put(m, e(PreTokenizerType.FLINT).noCleanSpaces(), "flint");
         put(m, e(PreTokenizerType.DEFAULT), "default");
-        put(m, e(PreTokenizerType.MINICPM5).ignoreMerges(), "minicpm5");
+        put(m, e(PreTokenizerType.MINICPM5).ignoreMerges().noCleanSpaces(), "minicpm5");
         put(m, e(PreTokenizerType.LLAMA3).ignoreMerges().addBos(), "llama3", "llama-v3", "llama-bpe", "falcon3",
-                "falcon-h1", "pixtral", "midm-2.0", "lfm2", "jina-v5-nano");
+                "falcon-h1", "midm-2.0", "jina-v5-nano");
+        put(m, e(PreTokenizerType.LLAMA3).ignoreMerges().addBos().noCleanSpaces(), "lfm2");
         put(m, e(PreTokenizerType.DEEPSEEK_LLM).noCleanSpaces(), "deepseek-llm");
         put(m, e(PreTokenizerType.DEEPSEEK_CODER).noCleanSpaces(), "deepseek-coder");
         put(m, e(PreTokenizerType.DEEPSEEK3_LLM).noCleanSpaces(), "deepseek-v3");
@@ -121,7 +122,7 @@ public final class PreTokenizerRegistry {
         put(m, e(PreTokenizerType.GPT2), "gpt-2", "phi-2", "jina-es", "jina-de", "gigachat", "jina-v2-es",
                 "jina-v2-de", "a.x-4.0", "mellum", "modern-bert");
         put(m, e(PreTokenizerType.JAIS2), "jais-2");
-        put(m, e(PreTokenizerType.GEMMA4).escapeWhitespaces(), "gemma4", "granite-embed-multi-311m");
+        put(m, e(PreTokenizerType.GEMMA4).escapeWhitespaces().noCleanSpaces(), "gemma4", "granite-embed-multi-311m");
         put(m, e(PreTokenizerType.MMBERT).escapeWhitespaces(), "mmbert");
         put(m, e(PreTokenizerType.SARVAM_MOE).escapeWhitespaces().noCleanSpaces(), "sarvam-moe");
         put(m, e(PreTokenizerType.GPT2).addSep(), "jina-v1-en", "jina-v2-code", "roberta-bpe");
@@ -132,23 +133,25 @@ public final class PreTokenizerRegistry {
         put(m, e(PreTokenizerType.QWEN35).noCleanSpaces(), "qwen35");
         put(m, e(PreTokenizerType.STABLELM2), "stablelm2");
         put(m, e(PreTokenizerType.OLMO), "olmo");
-        put(m, e(PreTokenizerType.DBRX), "dbrx");
+        put(m, e(PreTokenizerType.DBRX).noCleanSpaces(), "dbrx");
         put(m, e(PreTokenizerType.SMAUG), "smaug-bpe");
         put(m, e(PreTokenizerType.PORO).noCleanSpaces(), "poro-chat");
-        put(m, e(PreTokenizerType.CHATGLM4).suppressBos(), "chatglm-bpe");
-        put(m, e(PreTokenizerType.CHATGLM4).suppressBos().ignoreMerges(), "glm4", "glm5");
+        put(m, e(PreTokenizerType.CHATGLM4).suppressBos().noCleanSpaces(), "chatglm-bpe");
+        put(m, e(PreTokenizerType.CHATGLM4).suppressBos().ignoreMerges().noCleanSpaces(), "glm4", "glm5");
         put(m, e(PreTokenizerType.VIKING).noCleanSpaces(), "viking");
         put(m, e(PreTokenizerType.JAIS), "jais");
-        put(m, e(PreTokenizerType.TEKKEN).noCleanSpaces().ignoreMerges().addBos(), "tekken");
+        put(m, e(PreTokenizerType.TEKKEN).noCleanSpaces().ignoreMerges().addBos(), "tekken", "pixtral");
+        put(m, e(PreTokenizerType.TEKKEN_NUM3).noCleanSpaces().ignoreMerges().addBos(), "tekken-num3");
         put(m, e(PreTokenizerType.SMOLLM).noCleanSpaces(), "smollm");
         put(m, e(PreTokenizerType.CODESHELL), "codeshell");
         put(m, e(PreTokenizerType.BLOOM), "bloom");
         put(m, e(PreTokenizerType.GPT3_FINNISH), "gpt3-finnish");
         put(m, e(PreTokenizerType.EXAONE), "exaone");
-        put(m, e(PreTokenizerType.GPT2), "exaone4");
+        put(m, e(PreTokenizerType.GPT2).noCleanSpaces(), "exaone4");
         put(m, e(PreTokenizerType.EXAONE_MOE), "exaone-moe");
         put(m, e(PreTokenizerType.CHAMELEON).addBos().noCleanSpaces(), "chameleon");
         put(m, e(PreTokenizerType.MINERVA), "minerva-7b");
+        put(m, e(PreTokenizerType.DOMYN_SMALL).escapeWhitespaces(), "domyn-small");
         put(m, e(PreTokenizerType.QWEN2), "megrez");
         put(m, e(PreTokenizerType.GPT4O).noCleanSpaces(), "gpt-4o", "llama4", "kanana2", "talkie");
         put(m, e(PreTokenizerType.GRANITE_EMB_MULTI).noCleanSpaces().ignoreMerges(), "granite-embed-multi-97m");
@@ -169,8 +172,10 @@ public final class PreTokenizerRegistry {
         put(m, e(PreTokenizerType.LAGUNA).noCleanSpaces(), "laguna");
         put(m, e(PreTokenizerType.MINIMAX_M2).noCleanSpaces(), "minimax-m2");
         put(m, e(PreTokenizerType.SOLAR_OPEN).noCleanSpaces(), "solar-open");
-        put(m, e(PreTokenizerType.MELLUM2), "mellum2");
+        put(m, e(PreTokenizerType.MELLUM2).noCleanSpaces(), "mellum2");
         put(m, e(PreTokenizerType.K2_HORIZON).noCleanSpaces(), "k2-horizon");
+        put(m, e(PreTokenizerType.NEMOTRON_3_5_EMBD).ignoreMerges().addBos(), "nemotron-3.5-embed");
+        put(m, e(PreTokenizerType.SOPRANO), "soprano");
         return Collections.unmodifiableMap(m);
     }
 

@@ -1,12 +1,16 @@
 package com.eonmux.neuralfree.gguf.ops.deltanet;
 
+import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
+import com.eonmux.neuralfree.gguf.engine.RecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.gpu.block.GpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardContext;
+import com.eonmux.neuralfree.gguf.gpu.forward.GpuRecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuScratch;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
@@ -14,7 +18,10 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeights;
+import com.eonmux.neuralfree.gguf.ops.fused.FusedKernels;
+import com.eonmux.neuralfree.gguf.ops.fused.GpuMultiTask;
 import com.eonmux.neuralfree.gguf.ops.ssm.SsmKernels;
+import com.eonmux.neuralfree.gguf.memory.StepLayout;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
@@ -48,19 +55,22 @@ import java.util.Objects;
  * {@code s[h*S_v*S_k + col*S_k + i]}, row {@code stateRows[0]}. A model without memory runs on zeroed temporaries
  * (see {@link DeltaNetBlocks.GpuStates}). Not thread-safe.
  */
-public final class GpuGdnMixer implements GpuMixer {
+public final class GpuGdnMixer implements GpuMixer, GpuRecurrentTreeMixer {
 
     /** Temporary holding the compacted q|k columns of a batch. */
     static final String TEMP_QK = "gdn.qk";
-    /** Temporary holding the alpha logits (separate) or the fused {@code ssm_ba} rows. */
+    /** Temporary holding the alpha logits (separate), the fused {@code ssm_ba} or merged {@code ssm_beta_alpha} rows. */
     static final String TEMP_A = "gdn.a";
     /** Temporary holding the beta logits of the separate layout. */
     static final String TEMP_B = "gdn.b";
+    /** Temporary holding the merged {@code attn_qkv_gate} rows before the split. */
+    static final String TEMP_QKV_GATE = "gdn.qkv_gate";
 
     private final List<GpuBuffer> owned = new ArrayList<>();
     private final List<PreparedDispatch> prepared = new ArrayList<>();
 
     private GpuOps ops;
+    private int layerIndex;
     private int elLocal;
     private int nK;
     private int nV;
@@ -70,12 +80,15 @@ public final class GpuGdnMixer implements GpuMixer {
     private int valDim;
     private int convCh;
     private boolean legacy;
+    private boolean mergedQkvGate;
     private float l2Eps;
     private float rmsEps;
     private CpuGatedDeltaNet.GateShape gateShape;
 
     private GpuWeight wQkv;
     private GpuWeight wGate;
+    /** Merged linear-attention input {@code attn_qkv_gate}; null unless the spec says so. */
+    private GpuWeight wQkvGate;
     private GpuWeight wIn;
     private GpuWeight wBa;
     private GpuWeight wAlpha;
@@ -88,6 +101,7 @@ public final class GpuGdnMixer implements GpuMixer {
     /** LoRA deltas of the projections ({@code build_lora_mm}, models/qwen35.cpp, models/qwen3next.cpp). */
     private GpuProjectionDeltas.Site qkvDeltas;
     private GpuProjectionDeltas.Site gateDeltas;
+    private GpuProjectionDeltas.Site qkvGateDeltas;
     private GpuProjectionDeltas.Site inDeltas;
     private GpuProjectionDeltas.Site baDeltas;
     private GpuProjectionDeltas.Site alphaDeltas;
@@ -98,6 +112,8 @@ public final class GpuGdnMixer implements GpuMixer {
     private ScratchSlot conv;
     private ScratchSlot z;
     private ScratchSlot o;
+    /** Merged {@code attn_qkv_gate} rows before the split; null unless merged. */
+    private ScratchSlot qkvGate;
     private ScratchSlot qk;
     private ScratchSlot a;
     private ScratchSlot b;
@@ -110,8 +126,30 @@ public final class GpuGdnMixer implements GpuMixer {
     private PreparedDispatch gateDispatch;
     private PreparedDispatch scanOne;
     private PreparedDispatch scanBatch;
+    /** Fused output norm and gate; null when the backend has no such kernel. */
+    private Boolean fusedNormGate;
+    /** Launch of the L2 norm and gate preparation as one persistent multi-task dispatch; null when unused. */
+    private GpuMultiTask gateTaskDecode;
+    private GpuMultiTask gateTaskPrefill;
+    /** Launch of the input projections as one persistent multi-task dispatch, recorded on first use. */
+    private GpuMultiTask projectTask;
+    private GpuBuffer projectIn;
+    private int projectInOff;
+    /**
+     * Whether the projection weight set admits the multi-task path: all F32 single-buffer. Deltas register after the
+     * mixer is bound, so their absence is checked at each launch ({@link #projectTask}).
+     */
+    private boolean projectFusable;
 
     private boolean bound;
+    /** The layer's stream width: the rows the mixer reads and writes. */
+    private int rowWidth;
+    /** Floats of one conv-state row; the stride the conv kernel indexes a stack slot with. */
+    private int convStride;
+    /** Floats of one scan-state row; the stride the scan kernel indexes a stack slot with. */
+    private int scanStride;
+    /** Whether the memory holds per-sequence state rows a batched step routes through. */
+    private boolean routeState;
     private boolean closed;
 
     // ================================================================== bind
@@ -144,6 +182,7 @@ public final class GpuGdnMixer implements GpuMixer {
     }
 
     private void bindChecked(GpuForwardContext ctx, LayerSpec layer) {
+        layerIndex = layer.il();
         RecurrentSpec r = layer.recurrent();
         bindShape(ctx, r);
         bindWeights(ctx, layer, r);
@@ -164,30 +203,38 @@ public final class GpuGdnMixer implements GpuMixer {
         valDim = nV * headV;
         convCh = r.convChannels();
         legacy = r.legacySsmIn();
+        mergedQkvGate = r.mergedQkvGate();
         SsmKernels.checkConvShape(convCh, r.dConv());
+        convStride = DeltaNetBlocks.toInt(r.convStateFloats(), "conv state stride");
+        scanStride = DeltaNetBlocks.toInt(r.stateFloats(), "scan state stride");
         l2Eps = DeltaNetBlocks.l2Eps(ctx.spec());
         rmsEps = DeltaNetBlocks.rmsEps(ctx.spec());
     }
 
-    /** Projection matrices (legacy {@code ssm_in} or {@code attn_qkv} + {@code attn_gate}) and the F32 vectors. */
+    /** Projection matrices (legacy {@code ssm_in}, {@code attn_qkv} + {@code attn_gate} or the merged weights) and the F32 vectors. */
     private void bindWeights(GpuForwardContext ctx, LayerSpec layer, RecurrentSpec r) {
         int nEmbd = DeltaNetBlocks.mixerWidth(layer);
+        this.rowWidth = nEmbd;
         GpuWeights ws = ctx.weightSource().weightsFor(layer.weightLayer());
         if (legacy) {
             long perKh = 2L * headK + 2L * (nV / nK) * headV;
             wIn = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.SSM_IN, nEmbd, nK * perKh);
+        } else if (r.mergedQkvGate()) {
+            wQkvGate = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_QKV_GATE, nEmbd, convCh + valDim);
         } else {
             wQkv = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_QKV, nEmbd, convCh);
             wGate = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.ATTN_GATE, nEmbd, valDim);
         }
         if (r.fusedBetaAlpha()) {
             wBa = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.SSM_BETA_ALPHA, nEmbd, 2L * nV);
+        } else if (r.concatBetaAlpha()) {
+            wBa = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.SSM_BETA_ALPHA_CAT, nEmbd, 2L * nV);
         } else {
             wAlpha = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.SSM_ALPHA, nEmbd, nV);
             wBeta = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.SSM_BETA, nEmbd, nV);
         }
         wOut = DeltaNetBlocks.gpuMatrix(ws, layer, TensorNames.SSM_OUT, valDim, nEmbd);
-        bindDeltas(ctx.projectionDeltas(), layer);
+        bindDeltas(ctx.projectionDeltas(), layer, r);
         normW = DeltaNetBlocks.gpuNormWeight(ctx, ws.layer(layer, TensorNames.weight(TensorNames.SSM_NORM)), headV,
                 owned);
         convW = DeltaNetBlocks.gpuF32(ctx, ws.layer(layer, TensorNames.weight(TensorNames.SSM_CONV1D)),
@@ -197,15 +244,18 @@ public final class GpuGdnMixer implements GpuMixer {
     }
 
     /** The LoRA delta sites of the bound projections. */
-    private void bindDeltas(GpuProjectionDeltas deltas, LayerSpec layer) {
+    private void bindDeltas(GpuProjectionDeltas deltas, LayerSpec layer, RecurrentSpec r) {
         if (legacy) {
             inDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_IN), wIn);
+        } else if (wQkvGate != null) {
+            qkvGateDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_QKV_GATE), wQkvGate);
         } else {
             qkvDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_QKV), wQkv);
             gateDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_GATE), wGate);
         }
         if (wBa != null) {
-            baDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_BETA_ALPHA), wBa);
+            baDeltas = deltas.serve(layer, TensorNames.weight(r.concatBetaAlpha() ? TensorNames.SSM_BETA_ALPHA_CAT
+                    : TensorNames.SSM_BETA_ALPHA), wBa);
         } else {
             alphaDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_ALPHA), wAlpha);
             betaDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.SSM_BETA), wBeta);
@@ -221,14 +271,18 @@ public final class GpuGdnMixer implements GpuMixer {
         conv = scratch.slot(ScratchSlots.K).require((long) ubatch * convCh);
         z = scratch.slot(ScratchSlots.V).require((long) ubatch * valDim);
         o = scratch.slot(ScratchSlots.ATTN_OUT).require((long) ubatch * (legacy ? wIn.rows() : valDim));
+        qkvGate = mergedQkvGate ? scratch.temp(TEMP_QKV_GATE, (long) ubatch * (convCh + valDim)) : null;
         qk = scratch.temp(TEMP_QK, (long) ubatch * 2 * keyDim);
-        a = scratch.temp(TEMP_A, (long) ubatch * (r.fusedBetaAlpha() ? 2 * nV : nV));
-        b = r.fusedBetaAlpha() ? a : scratch.temp(TEMP_B, (long) ubatch * nV);
+        boolean fused = r.fusedBetaAlpha() || r.concatBetaAlpha();
+        a = scratch.temp(TEMP_A, (long) ubatch * (fused ? 2 * nV : nV));
+        b = fused ? a : scratch.temp(TEMP_B, (long) ubatch * nV);
         gSlot = DeltaNetBlocks.atZero(scratch.temp(DeltaNetBlocks.TEMP_G, (long) ubatch * nV),
                 DeltaNetKernels.GDN_GATE_PREP);
         betaSlot = DeltaNetBlocks.atZero(scratch.temp(DeltaNetBlocks.TEMP_BETA, (long) ubatch * nV),
                 DeltaNetKernels.GDN_GATE_PREP);
         states = DeltaNetBlocks.GpuStates.bind(ctx, layer, r.convStateFloats(), r.stateFloats());
+        routeState = ctx.hasMemory() && ctx.memory() instanceof com.eonmux.neuralfree.gguf.memory.gpu.DeviceModelMemory
+                && ctx.memory().pagedSequences() != null;
         working = new GpuBuffer[]{x.buffer(), conv.buffer(), z.buffer(), o.buffer(), qk.buffer(), a.buffer(),
                 b.buffer()};
     }
@@ -244,7 +298,8 @@ public final class GpuGdnMixer implements GpuMixer {
                         convCh, x.offset(), convCh, conv.offset(), 0, convStride,
                         x.buffer(), convW, ph, states.conv, states.rows, conv.buffer())));
 
-        int abStride = r.fusedBetaAlpha() ? 2 * nV : nV;
+        boolean fused = r.fusedBetaAlpha() || r.concatBetaAlpha();
+        int abStride = fused ? 2 * nV : nV;
         gateDispatch = keep(ops.prepare(DeltaNetKernels.GDN_GATE_PREP,
                 new long[]{DeltaNetKernels.gatePrepGlobal(1, nV, gateShape.kdaMode(), headV, elLocal)},
                 new long[]{elLocal}, DeltaNetBlocks.gatePrepArgs(gateShape, 1, abStride, a.offset(), abStride,
@@ -263,6 +318,107 @@ public final class GpuGdnMixer implements GpuMixer {
                 DeltaNetBlocks.scanArgs(scanShape, 1, 2 * keyDim, q0, 2 * keyDim, q0 + keyDim, convCh,
                         c0 + 2 * keyDim, valDim, o.offset(), qk.buffer(), qk.buffer(), conv.buffer(),
                         gSlot.buffer(), betaSlot.buffer(), states.scan, states.rows, o.buffer())));
+        prepareFused(r);
+    }
+
+    /**
+     * Binds the fused decode-path kernels the backend provides: the output norm + gate ({@link FusedKernels#GDN_NORM_GATE})
+     * and the persistent launch of the L2 norm with the gate preparation ({@link FusedKernels#MULTI_TASK}).
+     */
+    private void prepareFused(RecurrentSpec r) {
+        fusedNormGate = ops.fused(FusedKernels.GDN_NORM_GATE);
+        if (!ops.fused(FusedKernels.MULTI_TASK)) {
+            return;
+        }
+        GpuMultiTask decode = null;
+        try {
+            decode = buildGateTask(r, conv.buffer(), conv.offset());
+            gateTaskPrefill = buildGateTask(r, qk.buffer(), qk.offset());
+        } catch (RuntimeException e) {
+            throw Closeables.close(decode, e);
+        }
+        gateTaskDecode = decode;
+        projectFusable = projectionsFusable();
+    }
+
+    /** The L2 norm of the q|k columns and the gate preparation as one task pair. */
+    private GpuMultiTask buildGateTask(RecurrentSpec r, GpuBuffer normSource, int normOff) {
+        GpuMultiTask t = new GpuMultiTask(ops, ops.scratch().ubatch(), "gdn.gate." + layerIndex);
+        GpuBuffer none = ops.placeholders().readOnlyFloats();
+        t.rowNorm(2 * nK, headK, headK, NormKind.L2_GDN, 0, 1, normOff, normOff, l2Eps, normSource, none, none,
+                normSource);
+        boolean fused = r.fusedBetaAlpha() || r.concatBetaAlpha();
+        int abStride = fused ? 2 * nV : nV;
+        t.gatePrep(gateShape.nVHeads(), gateShape.nKHeads(), gateShape.layout(), gateShape.kdaMode(),
+                gateShape.headDim(), abStride, a.offset(), abStride, b.offset(), gateShape.lb(),
+                gateShape.betaScale(), a.buffer(), b.buffer(), dtBias, ssmA, gSlot.buffer(), betaSlot.buffer());
+        t.build();
+        return t;
+    }
+
+    /**
+     * Whether every input projection is a plain single-buffer F32 matrix, so the multi-task matvec body computes
+     * exactly what {@code ops.matmul} would for a projection without LoRA deltas.
+     */
+    private boolean projectionsFusable() {
+        if (legacy) {
+            return matvecFusable(wIn);
+        }
+        if (mergedQkvGate) {
+            return matvecFusable(wQkvGate) && (wBa == null || matvecFusable(wBa));
+        }
+        return matvecFusable(wQkv) && matvecFusable(wGate)
+                && (wBa != null ? matvecFusable(wBa) : matvecFusable(wAlpha) && matvecFusable(wBeta));
+    }
+
+    private boolean deltasEmpty() {
+        return empty(qkvDeltas) && empty(gateDeltas) && empty(qkvGateDeltas) && empty(inDeltas) && empty(baDeltas)
+                && empty(alphaDeltas) && empty(betaDeltas) && empty(outDeltas);
+    }
+
+    private static boolean empty(GpuProjectionDeltas.Site site) {
+        return site == null || site.isEmpty();
+    }
+
+    private static boolean matvecFusable(GpuWeight w) {
+        return w != null && w.type() == com.eonmux.neuralfree.gguf.GGMLType.F32 && w.isSingleShard()
+                && !w.hasInputTransform() && w.hadamard() == null && !w.hasScale()
+                && w.rows() <= Integer.MAX_VALUE && w.cols() <= Integer.MAX_VALUE;
+    }
+
+    /**
+     * The input projections as one multi-task launch for the first input view seen; null when the view changes
+     * (batched segments), the weights are not fusible, or a LoRA delta is registered on an input or output
+     * projection now, so the caller runs {@code ops.matmul} and applies the deltas.
+     */
+    private GpuMultiTask projectTask(GpuBuffer inBuf, int inOff) {
+        if (!projectFusable || !deltasEmpty()) {
+            return null;
+        }
+        if (projectTask == null) {
+            projectIn = inBuf;
+            projectInOff = inOff;
+            projectTask = new GpuMultiTask(ops, ops.scratch().ubatch(), "gdn.project." + layerIndex);
+            if (legacy) {
+                projectTask.matvecF32(wIn, inBuf, inOff, o.buffer(), o.offset());
+            } else if (mergedQkvGate) {
+                projectTask.matvecF32(wQkvGate, inBuf, inOff, qkvGate.buffer(), qkvGate.offset());
+                if (wBa != null) {
+                    projectTask.matvecF32(wBa, inBuf, inOff, a.buffer(), a.offset());
+                }
+            } else {
+                projectTask.matvecF32(wQkv, inBuf, inOff, x.buffer(), x.offset());
+                projectTask.matvecF32(wGate, inBuf, inOff, z.buffer(), z.offset());
+                if (wBa != null) {
+                    projectTask.matvecF32(wBa, inBuf, inOff, a.buffer(), a.offset());
+                } else {
+                    projectTask.matvecF32(wAlpha, inBuf, inOff, a.buffer(), a.offset());
+                    projectTask.matvecF32(wBeta, inBuf, inOff, b.buffer(), b.offset());
+                }
+            }
+            projectTask.build();
+        }
+        return projectTask != null && projectIn == inBuf && projectInOff == inOff ? projectTask : null;
     }
 
     private PreparedDispatch keep(PreparedDispatch d) {
@@ -274,78 +430,222 @@ public final class GpuGdnMixer implements GpuMixer {
 
     @Override
     public void decode(int pos, ScratchSlot in, ScratchSlot out) {
-        run(1, in, out);
+        run(1, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
     }
 
     @Override
     public void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out) {
-        run(nTokens, in, out);
+        run(nTokens, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
+    }
+
+    /** Why this mixer runs a batched step: every sequence's rows dispatch as its own contiguous step. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
+    /**
+     * One batched step: every segment of {@code s} dispatches its rows as the contiguous step, reading and
+     * writing its sequence's recurrent-state rows (the conv and scan re-point the kernels' state-row routing per
+     * segment) and reading its rows at their place in the step's input and output.
+     */
+    @Override
+    public void batch(StepLayout s, ScratchSlot in, ScratchSlot out) {
+        if (s.contiguousSingle()) {
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        long n = (long) s.nTokens() * rowWidth;
+        in.require(n);
+        out.require(n);
+        DeltaNetBlocks.checkStepViews("GDN mixer", in, out, working);
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            run(s.len(seg), in.buffer(), in.offset() + start * rowWidth, out.buffer(),
+                    out.offset() + start * rowWidth, s.seq(seg));
+        }
     }
 
     private void run(int n, ScratchSlot in, ScratchSlot out) {
+        run(n, in.buffer(), in.offset(), out.buffer(), out.offset(), 0);
+    }
+
+    private void run(int n, GpuBuffer inBuf, int inOff, GpuBuffer outBuf, int outOff, int stateRow) {
         if (!bound || closed) {
             throw new IllegalStateException("GDN mixer is not bound or already closed");
         }
-        Objects.requireNonNull(in, "in");
-        Objects.requireNonNull(out, "out");
         if (n < 1 || n > ops.scratch().ubatch()) {
             throw new IllegalArgumentException("GDN step of " + n + " tokens is outside [1, "
                     + ops.scratch().ubatch() + "]");
         }
-        DeltaNetBlocks.checkStepViews("GDN mixer", in, out, working);
+        if (routeState) {
+            GpuMixer.routeStateRow(stateRow, states.rows, ops.queue());
+        }
         states.clearTransient(ops);
-        project(n, in);
+        project(n, inBuf, inOff);
 
         convDispatch.setInt(SsmKernels.ARG_CONV_N_TOKENS, n);
         convDispatch.dispatch();
 
         PreparedDispatch scan;
+        GpuMultiTask gateTask = n == 1 ? gateTaskDecode : gateTaskPrefill;
         if (n == 1) {
-            ops.norm(NormKind.L2_GDN, null, null, l2Eps, conv.buffer(), conv.offset(), conv.buffer(), conv.offset(),
-                    2 * nK, headK);
+            if (gateTask != null) {
+                gateTask.run(1);
+            } else {
+                ops.norm(NormKind.L2_GDN, null, null, l2Eps, conv.buffer(), conv.offset(), conv.buffer(),
+                        conv.offset(), 2 * nK, headK);
+            }
             scan = scanOne;
         } else {
             ops.copy2d(conv.buffer(), conv.offset(), convCh, qk.buffer(), qk.offset(), 2 * keyDim, n, 2 * keyDim);
-            ops.norm(NormKind.L2_GDN, null, null, l2Eps, qk.buffer(), qk.offset(), qk.buffer(), qk.offset(),
-                    n * 2 * nK, headK);
+            if (gateTask != null) {
+                gateTask.run(n);
+            } else {
+                ops.norm(NormKind.L2_GDN, null, null, l2Eps, qk.buffer(), qk.offset(), qk.buffer(), qk.offset(),
+                        n * 2 * nK, headK);
+            }
             scan = scanBatch;
         }
 
-        gateDispatch.setInt(DeltaNetKernels.GATE_ARG_N_TOKENS, n);
-        gateDispatch.setGlobal(DeltaNetKernels.gatePrepGlobal(n, nV, gateShape.kdaMode(), headV, elLocal));
-        gateDispatch.dispatch();
+        if (gateTask == null) {
+            gateDispatch.setInt(DeltaNetKernels.GATE_ARG_N_TOKENS, n);
+            gateDispatch.setGlobal(DeltaNetKernels.gatePrepGlobal(n, nV, gateShape.kdaMode(), headV, elLocal));
+            gateDispatch.dispatch();
+        }
 
         scan.setInt(DeltaNetKernels.SCAN_ARG_N_TOKENS, n);
         scan.dispatch();
 
-        ops.norm(NormKind.RMS, normW, null, rmsEps, o.buffer(), o.offset(), o.buffer(), o.offset(), n * nV, headV);
-        ops.glu(GluOp.SWIGLU, ActParams.NONE, z.buffer(), z.offset(), valDim, o.buffer(), o.offset(), valDim,
-                o.buffer(), o.offset(), valDim, n, valDim);
-        ops.matmul(wOut, o.buffer(), o.offset(), out.buffer(), out.offset(), n);
-        outDeltas.applyRows(n, o.buffer(), o.offset(), out.buffer(), out.offset());
+        if (Boolean.TRUE.equals(fusedNormGate)) {
+            ops.gdnNormGate(n, nV, headV, valDim, normW, rmsEps, o.buffer(), o.offset(), z.buffer(), z.offset(),
+                    o.buffer(), o.offset());
+        } else {
+            ops.norm(NormKind.RMS, normW, null, rmsEps, o.buffer(), o.offset(), o.buffer(), o.offset(), n * nV,
+                    headV);
+            ops.glu(GluOp.SWIGLU, ActParams.NONE, z.buffer(), z.offset(), valDim, o.buffer(), o.offset(), valDim,
+                    o.buffer(), o.offset(), valDim, n, valDim);
+        }
+        ops.matmul(wOut, o.buffer(), o.offset(), outBuf, outOff, n);
+        outDeltas.applyRows(n, o.buffer(), o.offset(), outBuf, outOff);
     }
 
     /** Input projections: q|k|v into the conv input, z, and the beta/alpha logits. */
-    private void project(int n, ScratchSlot in) {
-        if (legacy) {
-            ops.matmul(wIn, in.buffer(), in.offset(), o.buffer(), o.offset(), n);
-            inDeltas.applyRows(n, in.buffer(), in.offset(), o.buffer(), o.offset());
-            deinterleave(n);
-        } else {
-            ops.matmul(wQkv, in.buffer(), in.offset(), x.buffer(), x.offset(), n);
-            qkvDeltas.applyRows(n, in.buffer(), in.offset(), x.buffer(), x.offset());
-            ops.matmul(wGate, in.buffer(), in.offset(), z.buffer(), z.offset(), n);
-            gateDeltas.applyRows(n, in.buffer(), in.offset(), z.buffer(), z.offset());
+    private void project(int n, GpuBuffer inBuf, int inOff) {
+        // A single-token step is one row per projection, the shape the multi-task matvec body serves; a prefill
+        // multiplies whole tiles and keeps the tiled GEMM.
+        GpuMultiTask mt = n == 1 ? projectTask(inBuf, inOff) : null;
+        if (mt != null) {
+            mt.run(n);
+            if (legacy) {
+                deinterleave(n);
+            } else if (mergedQkvGate) {
+                splitQkvGate(n);
+            }
+            return;
         }
-        if (wBa != null) {
-            ops.matmul(wBa, in.buffer(), in.offset(), a.buffer(), a.offset(), n);
-            baDeltas.applyRows(n, in.buffer(), in.offset(), a.buffer(), a.offset());
-        } else {
-            ops.matmul(wAlpha, in.buffer(), in.offset(), a.buffer(), a.offset(), n);
-            alphaDeltas.applyRows(n, in.buffer(), in.offset(), a.buffer(), a.offset());
-            ops.matmul(wBeta, in.buffer(), in.offset(), b.buffer(), b.offset(), n);
-            betaDeltas.applyRows(n, in.buffer(), in.offset(), b.buffer(), b.offset());
+        // Every input projection reads the same single row, so its Q8_1 blocks are quantized once.
+        int inWidth = (int) (legacy ? wIn.cols() : mergedQkvGate ? wQkvGate.cols() : wQkv.cols());
+        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(inOff, inWidth)
+                ? ops.shareQ8Activations(inBuf, inOff, inWidth) : null;
+        try {
+            if (legacy) {
+                ops.matmul(wIn, inBuf, inOff, o.buffer(), o.offset(), n);
+                inDeltas.applyRows(n, inBuf, inOff, o.buffer(), o.offset());
+                deinterleave(n);
+            } else if (mergedQkvGate) {
+                ops.matmul(wQkvGate, inBuf, inOff, qkvGate.buffer(), qkvGate.offset(), n);
+                qkvGateDeltas.applyRows(n, inBuf, inOff, qkvGate.buffer(), qkvGate.offset());
+                splitQkvGate(n);
+            } else {
+                ops.matmul(wQkv, inBuf, inOff, x.buffer(), x.offset(), n);
+                qkvDeltas.applyRows(n, inBuf, inOff, x.buffer(), x.offset());
+                ops.matmul(wGate, inBuf, inOff, z.buffer(), z.offset(), n);
+                gateDeltas.applyRows(n, inBuf, inOff, z.buffer(), z.offset());
+            }
+            if (wBa != null) {
+                ops.matmul(wBa, inBuf, inOff, a.buffer(), a.offset(), n);
+                baDeltas.applyRows(n, inBuf, inOff, a.buffer(), a.offset());
+            } else {
+                ops.matmul(wAlpha, inBuf, inOff, a.buffer(), a.offset(), n);
+                alphaDeltas.applyRows(n, inBuf, inOff, a.buffer(), a.offset());
+                ops.matmul(wBeta, inBuf, inOff, b.buffer(), b.offset(), n);
+                betaDeltas.applyRows(n, inBuf, inOff, b.buffer(), b.offset());
+            }
+        } finally {
+            if (share != null) {
+                share.close();
+            }
         }
+    }
+
+    @Override
+    public String treeStepRefusal() {
+        return null;
+    }
+
+    @Override
+    public int treeRowWidth() {
+        return rowWidth;
+    }
+
+    @Override
+    public void treeStep(GpuRecurrentTreeRound round, ScratchSlot in, ScratchSlot out) {
+        if (!bound || closed) {
+            throw new IllegalStateException("GDN mixer is not bound or already closed");
+        }
+        long[] mask = round.mask();
+        int realRows = round.realRows();
+        GpuBuffer convStack = round.convStack();
+        GpuBuffer scanStack = round.scanStack();
+        // the stateful kernels read the round's stack slots instead of the committed rows for the step; the
+        // per-row routing still rides the live routing buffer, so every dispatch addresses its slot
+        convDispatch.setBuffer(SsmKernels.CONV_ARG_STATE, convStack);
+        scanOne.setBuffer(DeltaNetKernels.SCAN_ARG_STATE, scanStack);
+        try {
+            for (int row = 0; row < realRows; row++) {
+                int depth = RecurrentTreeRound.depth(mask[row]);
+                if (depth < 0) {
+                    throw new IllegalArgumentException("the tree step's row " + row + " is padding, the mixer runs"
+                            + " the computed rows");
+                }
+                int parent = RecurrentTreeRound.parentRow(mask[row], row);
+                seedStack(round.queue(), convStack, row, depth, parent, convStride, states.conv);
+                seedStack(round.queue(), scanStack, row, depth, parent, scanStride, states.scan);
+                run(1, in.buffer(), in.offset() + row * rowWidth, out.buffer(), out.offset() + row * rowWidth, row);
+            }
+        } finally {
+            convDispatch.setBuffer(SsmKernels.CONV_ARG_STATE, states.conv);
+            scanOne.setBuffer(DeltaNetKernels.SCAN_ARG_STATE, states.scan);
+        }
+    }
+
+    /**
+     * Enqueues the copy that fills the row's stack slot: the committed rows at the root, else the parent row's
+     * slot.
+     */
+    private static void seedStack(ComputeQueue queue, GpuBuffer stack, int row, int depth, int parent, int stride,
+                                  GpuBuffer committed) {
+        if (stride == 0) {
+            return;
+        }
+        long bytes = (long) stride * Float.BYTES;
+        if (depth == 0) {
+            queue.enqueueCopyBuffer(committed, 0, stack, (long) row * bytes, bytes);
+        } else {
+            queue.enqueueCopyBuffer(stack, (long) parent * bytes, stack, (long) row * bytes, bytes);
+        }
+    }
+
+    /** Splits the merged {@code attn_qkv_gate} rows into the conv input {@code x} and the gate {@code z}. */
+    private void splitQkvGate(int n) {
+        int rowW = convCh + valDim;
+        ops.copy2d(qkvGate.buffer(), qkvGate.offset(), rowW, x.buffer(), x.offset(), convCh, n, convCh);
+        ops.copy2d(qkvGate.buffer(), qkvGate.offset() + convCh, rowW, z.buffer(), z.offset(), valDim, n, valDim);
     }
 
     /**
@@ -394,6 +694,10 @@ public final class GpuGdnMixer implements GpuMixer {
     private void release() {
         RuntimeException first = Closeables.closeAll(prepared, null);
         prepared.clear();
+        first = Closeables.closeAll(java.util.Arrays.asList(gateTaskDecode, gateTaskPrefill, projectTask), first);
+        gateTaskDecode = null;
+        gateTaskPrefill = null;
+        projectTask = null;
         first = Closeables.closeAll(owned, first);
         owned.clear();
         if (first != null) {
@@ -404,6 +708,8 @@ public final class GpuGdnMixer implements GpuMixer {
     @Override
     public String toString() {
         return "GpuGdnMixer{" + (bound ? nK + "k/" + nV + "v heads, " + headK + "x" + headV
-                + (legacy ? ", ssm_in" : "") + (wBa != null ? ", ssm_ba" : "") : "unbound") + '}';
+                + (legacy ? ", ssm_in" : "") + (wQkvGate != null ? ", attn_qkv_gate" : "")
+                + (wBa != null ? ", " + (gateShape.layout() == DeltaNetKernels.LAYOUT_CONCAT_BA
+                        ? "ssm_beta_alpha" : "ssm_ba") : "") : "unbound") + '}';
     }
 }

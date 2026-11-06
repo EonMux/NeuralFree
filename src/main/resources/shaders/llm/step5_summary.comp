@@ -1,0 +1,117 @@
+/* step5_summary.comp - LLM_Step5_Summary: the Step5 region-summary ring and its online-softmax update.
+ * GLSL twin of kernels/llm/sparse/step5.cl (the semantic reference).
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i region_block, i capacity, i proxy, R float key, R float z, R int q_pos,
+ *    W float ring, W float summary)
+ * Every token stores its [key | z] row, rounded to BF16, at ring[q_pos[t] % capacity]; the token closing its region
+ * rewrites summary[region][d] from the ring (one online softmax per proxy dimension, one maximum over all proxy
+ * dimensions per row), rounded through BF16 then E4M3. Dispatch: one workgroup per token, global = n_tokens*L.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/kv_types.glsl"
+
+layout(std430, binding = 0) readonly buffer NfStep5Key { float key[]; };
+layout(std430, binding = 1) readonly buffer NfStep5Z { float z[]; };
+layout(std430, binding = 2) readonly buffer NfStep5Pos { int q_pos[]; };
+layout(std430, binding = 3) buffer NfStep5Ring { float ring[]; };
+layout(std430, binding = 4) buffer NfStep5Summary { float summary[]; };
+layout(push_constant) uniform NfStep5SummaryParams {
+    int n_tokens;
+    int region_block;
+    int capacity;
+    int proxy;
+} pc;
+
+uint nf_step5_bf16_bits(float f) {
+    const uint u = floatBitsToUint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return (u >> 16) | 64u;
+    }
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+
+float nf_step5_bf16(float f) {
+    return uintBitsToFloat(nf_step5_bf16_bits(f) << 16);
+}
+
+uint nf_step5_e4m3_bits(float v) {
+    const uint sign = (floatBitsToUint(v) >> 24) & 0x80u;
+    const float m = abs(v);
+    if (isnan(m)) {
+        return sign | 0x7Fu;
+    }
+    if (m >= 448.0) {
+        return sign | 0x7Eu;
+    }
+    if (m == 0.0) {
+        return sign;
+    }
+    const int ex0 = max(int((floatBitsToUint(m) >> 23) & 0xFFu) - 127, -6);
+    int units = int(roundEven(ldexp(m, 3 - ex0)));
+    int ex = ex0;
+    if (units < 8) {
+        return sign | uint(units);
+    }
+    if (units == 16) {
+        units = 8;
+        ex++;
+    }
+    return sign | uint(min(((ex + 7) << 3) | (units - 8), 0x7E));
+}
+
+float nf_step5_e4m3(float x) {
+    if (isnan(x)) {
+        return x;
+    }
+    return nf_kv_e4m3(nf_step5_e4m3_bits(x));
+}
+
+void main() {
+    const int t = int(nf_wg_id());
+    if (t >= pc.n_tokens) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const int pos = q_pos[t];
+    if (pos < 0) {
+        return;
+    }
+    const uint proxy = uint(pc.proxy);
+    const uint base = uint(pos % pc.capacity) * 2u * proxy;
+    const uint kbase = uint(t) * proxy;
+    for (uint d = lid; d < proxy; d += lsize) {
+        ring[base + d] = nf_step5_bf16(key[kbase + d]);
+        ring[base + proxy + d] = nf_step5_bf16(z[kbase + d]);
+    }
+    barrier();
+    if ((pos + 1) % pc.region_block != 0) {
+        return;
+    }
+    const int region = pos / pc.region_block;
+    const int first = region * pc.region_block;
+    const uint outBase = uint(region) * proxy;
+    for (uint d = lid; d < proxy; d += lsize) {
+        float numerator = 0.0;
+        float denominator = 0.0;
+        float maximum = -NF_INF;
+        for (int p = first; p <= pos; ++p) {
+            const uint r = uint(p % pc.capacity) * 2u * proxy;
+            float updated = maximum;
+            for (uint j = 0u; j < proxy; ++j) {
+                updated = max(updated, ring[r + proxy + j]);
+            }
+            const float scale = denominator > 0.0 ? exp(maximum - updated) : 0.0;
+            const float weight = exp(ring[r + proxy + d] - updated);
+            numerator = numerator * scale + weight * ring[r + d];
+            denominator = denominator * scale + weight;
+            maximum = updated;
+        }
+        const float mean = numerator / max(denominator, 1e-20);
+        summary[outBase + d] = nf_step5_e4m3(nf_step5_bf16(mean));
+    }
+}

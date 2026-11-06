@@ -22,6 +22,8 @@ import java.util.Map;
  *       </atem:invoke></atem:function_calls>} (llama.cpp {@code common/parsers/muse-spark.cpp}).</li>
  *   <li>{@link Style#ARG_KEY} — GLM 4.5-4.7: {@code <tool_call>NAME\n<arg_key>KEY</arg_key>\n<arg_value>VALUE</arg_value>\n</tool_call>},
  *       one call per block.</li>
+ *   <li>{@link Style#PARAM_ATTR} — MiniCPM5: bare {@code <function name="NAME"><param name="KEY">VALUE</param>...</function>}
+ *       blocks, one call each.</li>
  * </ul>
  *
  * <p>Values are typed by the tool's parameter schema ({@link ToolSchemas}). While a call streams its arguments grow
@@ -32,7 +34,7 @@ import java.util.Map;
 final class XmlToolParser extends BlockToolParser {
 
     /** The tag dialect. */
-    enum Style { FUNCTION, INVOKE, ATEM, ARG_KEY }
+    enum Style { FUNCTION, INVOKE, ATEM, ARG_KEY, PARAM_ATTR }
 
     private final Style style;
     private final String wrapOpen;
@@ -58,7 +60,7 @@ final class XmlToolParser extends BlockToolParser {
      */
     XmlToolParser(Style style, String wrapOpen, String wrapClose, boolean trimNewlines, boolean bareFunction,
                   ToolSchemas schemas) {
-        super(bareFunction ? Arrays.asList(wrapOpen, "<function=") : Arrays.asList(wrapOpen));
+        super(openers(style, wrapOpen, bareFunction));
         this.style = style;
         this.wrapOpen = wrapOpen;
         this.wrapClose = wrapClose;
@@ -80,6 +82,13 @@ final class XmlToolParser extends BlockToolParser {
             paramOpen = "<parameter=";
             paramNameEnd = ">";
             paramClose = "</parameter>";
+        } else if (style == Style.PARAM_ATTR) {
+            funcOpen = "<function name=\"";
+            funcNameEnd = "\">";
+            funcClose = "</function>";
+            paramOpen = "<param name=\"";
+            paramNameEnd = "\">";
+            paramClose = "</param>";
         } else {
             funcOpen = null;
             funcNameEnd = null;
@@ -90,10 +99,21 @@ final class XmlToolParser extends BlockToolParser {
         }
     }
 
+    /** The openers of a style: a bare function is its own opener, else the block opener. */
+    private static List<String> openers(Style style, String wrapOpen, boolean bareFunction) {
+        if (style == Style.PARAM_ATTR) {
+            return Arrays.asList("<function name=\"");
+        }
+        return bareFunction ? Arrays.asList(wrapOpen, "<function=") : Arrays.asList(wrapOpen);
+    }
+
     @Override
-    Block readBlock(String text, int at, String opener, boolean partial) {
+    protected Block readBlock(String text, int at, String opener, boolean partial) {
         if (style == Style.ARG_KEY) {
             return argKeyBlock(text, at, partial);
+        }
+        if (style == Style.PARAM_ATTR) {
+            return paramAttrBlock(text, at, partial);
         }
         List<ToolCall> calls = new ArrayList<>();
         if (!opener.equals(wrapOpen)) {
@@ -188,6 +208,27 @@ final class XmlToolParser extends BlockToolParser {
             return Block.malformed(nameEnd);
         }
         Params p = readParams(text, nameEnd, name, wrapClose, partial);
+        if (p.end < 0) {
+            calls.add(new ToolCall(name, p.args(false), null, false));
+            return Block.incomplete(calls, at);
+        }
+        calls.add(new ToolCall(name, p.args(true), null, true));
+        return Block.complete(calls, p.end);
+    }
+
+    /** MiniCPM5: one bare {@code <function name="...">} block, its name in the opener and tagged parameters. */
+    private Block paramAttrBlock(String text, int at, boolean partial) {
+        int i = at + funcOpen.length();
+        int ne = text.indexOf(funcNameEnd, i);
+        if (ne < 0) {
+            return partial ? Block.incomplete(new ArrayList<ToolCall>(), at) : Block.malformed(text.length());
+        }
+        String name = text.substring(i, ne).trim();
+        if (name.isEmpty()) {
+            return Block.malformed(ne);
+        }
+        Params p = readParams(text, ne + funcNameEnd.length(), name, funcClose, partial);
+        List<ToolCall> calls = new ArrayList<>();
         if (p.end < 0) {
             calls.add(new ToolCall(name, p.args(false), null, false));
             return Block.incomplete(calls, at);

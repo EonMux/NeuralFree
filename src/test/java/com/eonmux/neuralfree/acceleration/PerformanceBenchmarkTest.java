@@ -62,6 +62,16 @@ public class PerformanceBenchmarkTest {
     private HWAcceleration hwAccel;
     private OclComputeBackend backend;
     private boolean gpuAvailable = false;
+    /** GpuEvents of the current test; each pins its queue and context until it is released in tearDown. */
+    private final java.util.List<GpuEvent> events = new java.util.ArrayList<>();
+
+    /** Registers an event for release in tearDown, so no cl_event outlives the test method. */
+    private GpuEvent track(GpuEvent event) {
+        if (event != null) {
+            events.add(event);
+        }
+        return event;
+    }
 
     @Before
     public void setUp() {
@@ -83,6 +93,13 @@ public class PerformanceBenchmarkTest {
 
     @After
     public void tearDown() {
+        for (GpuEvent event : events) {
+            try {
+                event.close();
+            } catch (RuntimeException ignored) {
+            }
+        }
+        events.clear();
         if (backend != null) {
             backend.close();
         }
@@ -248,45 +265,45 @@ public class PerformanceBenchmarkTest {
         GpuBuffer bufferA = backend.allocateBuffer((long) dataSize * Float.BYTES);
         GpuBuffer bufferB = backend.allocateBuffer((long) dataSize * Float.BYTES);
 
-        transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA);
-        transferQueue.enqueueWriteBuffer(bufferB, 0, (long) dataSize * Float.BYTES, dataB);
+        track(transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA));
+        track(transferQueue.enqueueWriteBuffer(bufferB, 0, (long) dataSize * Float.BYTES, dataB));
         transferQueue.finish();
 
         long serializedStart = System.nanoTime();
 
-        GpuEvent writeEvent1 = transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA);
+        GpuEvent writeEvent1 = track(transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA));
         writeEvent1.awaitCompletion();
 
         Object[] args = new Object[]{bufferA, iterations, dataSize};
-        GpuEvent computeEvent1 = computeQueue.enqueueKernel(kernel, new long[]{dataSize}, new long[]{256}, args);
+        GpuEvent computeEvent1 = track(computeQueue.enqueueKernel(kernel, new long[]{dataSize}, new long[]{256}, args));
         computeEvent1.awaitCompletion();
 
         float[] result1 = new float[dataSize];
-        GpuEvent readEvent1 = computeQueue.enqueueReadBuffer(bufferA, 0, (long) dataSize * Float.BYTES, result1);
+        GpuEvent readEvent1 = track(computeQueue.enqueueReadBuffer(bufferA, 0, (long) dataSize * Float.BYTES, result1));
         readEvent1.awaitCompletion();
 
         long serializedTime = System.nanoTime() - serializedStart;
         System.out.printf("SERIALIZED time: %.3f ms%n", serializedTime / 1_000_000.0);
 
         for (int warmup = 0; warmup < 2; warmup++) {
-            GpuEvent w1 = transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA);
+            GpuEvent w1 = track(transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA));
             Object[] wargs = new Object[]{bufferA, iterations, dataSize};
-            GpuEvent c1 = computeQueue.enqueueKernel(kernel, new long[]{dataSize}, new long[]{256}, wargs, w1);
+            GpuEvent c1 = track(computeQueue.enqueueKernel(kernel, new long[]{dataSize}, new long[]{256}, wargs, w1));
             float[] dummy = new float[dataSize];
-            GpuEvent r1 = computeQueue.enqueueReadBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dummy, c1);
+            GpuEvent r1 = track(computeQueue.enqueueReadBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dummy, c1));
             r1.awaitCompletion();
         }
 
         long overlappedStart = System.nanoTime();
 
-        GpuEvent writeEvent2 = transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA);
-        GpuEvent writeEventB = transferQueue.enqueueWriteBuffer(bufferB, 0, (long) dataSize * Float.BYTES, dataB);
+        GpuEvent writeEvent2 = track(transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, dataA));
+        GpuEvent writeEventB = track(transferQueue.enqueueWriteBuffer(bufferB, 0, (long) dataSize * Float.BYTES, dataB));
 
         Object[] args2 = new Object[]{bufferA, iterations, dataSize};
-        GpuEvent computeEvent2 = computeQueue.enqueueKernel(kernel, new long[]{dataSize}, new long[]{256}, args2, writeEvent2);
+        GpuEvent computeEvent2 = track(computeQueue.enqueueKernel(kernel, new long[]{dataSize}, new long[]{256}, args2, writeEvent2));
 
         float[] result2 = new float[dataSize];
-        GpuEvent readEvent2 = computeQueue.enqueueReadBuffer(bufferA, 0, (long) dataSize * Float.BYTES, result2, computeEvent2);
+        GpuEvent readEvent2 = track(computeQueue.enqueueReadBuffer(bufferA, 0, (long) dataSize * Float.BYTES, result2, computeEvent2));
 
         writeEventB.awaitCompletion();
         readEvent2.awaitCompletion();
@@ -323,7 +340,7 @@ public class PerformanceBenchmarkTest {
         GpuBuffer directBuffer = backend.allocateBuffer((long) bufferSize * Float.BYTES);
         for (int i = 0; i < numOperations; i++) {
             long start = System.nanoTime();
-            GpuEvent event = transferQueue.enqueueWriteBuffer(directBuffer, 0, (long) bufferSize * Float.BYTES, testData);
+            GpuEvent event = track(transferQueue.enqueueWriteBuffer(directBuffer, 0, (long) bufferSize * Float.BYTES, testData));
             event.awaitCompletion();
             long elapsed = System.nanoTime() - start;
             directTransferTotalNs += elapsed;
@@ -348,7 +365,7 @@ public class PerformanceBenchmarkTest {
 
         for (int i = 0; i < numOperations; i++) {
             long start = System.nanoTime();
-            GpuEvent event = prefetchMgr.beginPrefetch(1, testData, 0);
+            GpuEvent event = track(prefetchMgr.beginPrefetch(1, testData, 0));
             prefetchMgr.advance();
             if (event != null) {
                 event.awaitCompletion();
@@ -385,16 +402,16 @@ public class PerformanceBenchmarkTest {
         GpuBuffer bufferB = backend.allocateBuffer((long) dataSize * Float.BYTES);
         GpuBuffer bufferC = backend.allocateBuffer((long) dataSize * Float.BYTES);
 
-        GpuEvent writeEvent = transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, data);
+        GpuEvent writeEvent = track(transferQueue.enqueueWriteBuffer(bufferA, 0, (long) dataSize * Float.BYTES, data));
 
         Object[] scaleArgs = new Object[]{bufferA, 2.0f, dataSize};
-        GpuEvent scaleEvent = computeQueue.enqueueKernel(scaleKernel, new long[]{dataSize}, new long[]{256}, scaleArgs, writeEvent);
+        GpuEvent scaleEvent = track(computeQueue.enqueueKernel(scaleKernel, new long[]{dataSize}, new long[]{256}, scaleArgs, writeEvent));
 
         Object[] copyArgs = new Object[]{bufferA, bufferB, dataSize};
-        GpuEvent copyEvent = computeQueue.enqueueKernel(copyKernel, new long[]{dataSize}, new long[]{256}, copyArgs, scaleEvent);
+        GpuEvent copyEvent = track(computeQueue.enqueueKernel(copyKernel, new long[]{dataSize}, new long[]{256}, copyArgs, scaleEvent));
 
         float[] result = new float[dataSize];
-        GpuEvent readEvent = computeQueue.enqueueReadBuffer(bufferB, 0, (long) dataSize * Float.BYTES, result, copyEvent);
+        GpuEvent readEvent = track(computeQueue.enqueueReadBuffer(bufferB, 0, (long) dataSize * Float.BYTES, result, copyEvent));
 
         long start = System.nanoTime();
         readEvent.awaitCompletion();

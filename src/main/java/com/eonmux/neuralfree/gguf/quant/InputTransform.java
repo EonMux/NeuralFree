@@ -4,15 +4,19 @@ import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * The transform a projection applies to its input row before the unchanged weight kernel, made of up to three
+ * The transform a projection applies to its input row before the unchanged weight kernel, made of up to four
  * optional parts applied in this order:
  * <ol>
+ *   <li><b>PRE_SCALE</b>: the per-input-column multiplier of a quantized weight's {@code act_pre_scale}
+ *       ({@link #preScale()}), applied before the quantization so the fake-quantization sees the scaled input, as
+ *       torchao's linear does (torchao int8_tensor.py <i>activation_tensor = activation_tensor * act_pre_scale</i>
+ *       before the activation quantizer);</li>
  *   <li><b>HADAMARD</b>: the PRISM or compressed-tensors input rotation ({@link HadamardSpec});</li>
  *   <li><b>ACT_QUANT</b>: the checkpoint's activation fake-quantization ({@link ActQuant}, {@link ActFakeQuant});</li>
  *   <li><b>PERMUTE</b>: the act-order gather {@code y[k] = x[perm[k]]} of a weight stored in permuted input order
  *       ({@code <base>.input_perm}).</li>
  * </ol>
- * This is vLLM's order: the compressed-tensors input transform runs before the quantization method
+ * The quantization order is vLLM's: the compressed-tensors input transform runs before the quantization method
  * (vllm model_executor/layers/quantization/compressed_tensors/transform/linear.py:150-160), which quantizes the
  * activation and hands it to the act-order kernel that permutes K
  * (vllm model_executor/layers/quantization/utils/marlin_utils.py:780-799). A weight stored in permuted K order thus
@@ -21,16 +25,18 @@ import java.util.Objects;
 public final class InputTransform {
 
     /** No transform. */
-    public static final InputTransform IDENTITY = new InputTransform(null, null, null);
+    public static final InputTransform IDENTITY = new InputTransform(null, null, null, null);
 
     private final HadamardSpec hadamard;
     private final ActQuant actQuant;
     private final int[] perm;
+    private final float[] preScale;
 
-    private InputTransform(HadamardSpec hadamard, ActQuant actQuant, int[] perm) {
+    private InputTransform(HadamardSpec hadamard, ActQuant actQuant, int[] perm, float[] preScale) {
         this.hadamard = hadamard;
         this.actQuant = actQuant;
         this.perm = perm;
+        this.preScale = preScale;
     }
 
     /**
@@ -40,21 +46,33 @@ public final class InputTransform {
      * @throws IllegalArgumentException when {@code perm} is not a permutation of {@code [0, perm.length)}
      */
     public static InputTransform of(HadamardSpec hadamard, ActQuant actQuant, int[] perm) {
+        return of(hadamard, actQuant, perm, null);
+    }
+
+    /**
+     * The transform of the given parts, with the activation pre-scale; each may be null.
+     *
+     * @param preScale the per-input-column multiplier (copied): {@code K} values, or {@code E * K} for the experts of
+     *                 a stacked tensor in expert-major order
+     * @throws IllegalArgumentException when {@code perm} is not a permutation, or a pre-scale value is not finite
+     */
+    public static InputTransform of(HadamardSpec hadamard, ActQuant actQuant, int[] perm, float[] preScale) {
         int[] p = perm == null ? null : checkPermutation(perm.clone());
-        if (hadamard == null && actQuant == null && p == null) {
+        float[] ps = preScale == null ? null : checkPreScale(preScale);
+        if (hadamard == null && actQuant == null && p == null && ps == null) {
             return IDENTITY;
         }
-        return new InputTransform(hadamard, actQuant, p);
+        return new InputTransform(hadamard, actQuant, p, ps);
     }
 
     /** This transform with its HADAMARD part replaced ({@code null} removes it). */
     public InputTransform withHadamard(HadamardSpec h) {
-        return of(h, actQuant, perm);
+        return of(h, actQuant, perm, preScale);
     }
 
     /** This transform with its ACT_QUANT part replaced ({@code null} removes it). */
     public InputTransform withActQuant(ActQuant a) {
-        return of(hadamard, a, perm);
+        return of(hadamard, a, perm, preScale);
     }
 
     /**
@@ -63,17 +81,26 @@ public final class InputTransform {
      * @throws IllegalArgumentException when {@code p} is not a permutation
      */
     public InputTransform withPerm(int[] p) {
-        return of(hadamard, actQuant, p);
+        return of(hadamard, actQuant, p, preScale);
+    }
+
+    /**
+     * This transform with its PRE_SCALE part replaced ({@code null} removes it).
+     *
+     * @throws IllegalArgumentException when a pre-scale value is not finite
+     */
+    public InputTransform withPreScale(float[] p) {
+        return of(hadamard, actQuant, perm, p);
     }
 
     /** True when no part applies. */
     public boolean isIdentity() {
-        return hadamard == null && actQuant == null && perm == null;
+        return hadamard == null && actQuant == null && perm == null && preScale == null;
     }
 
     /** True when only a HADAMARD part (or nothing) applies. */
     public boolean isHadamardOnly() {
-        return actQuant == null && perm == null;
+        return actQuant == null && perm == null && preScale == null;
     }
 
     /** The input rotation, or null. */
@@ -97,9 +124,69 @@ public final class InputTransform {
     }
 
     /**
+     * The per-input-column multiplier applied before every other part ({@code act_pre_scale}), or null: {@code K}
+     * values, or {@code E * K} for the experts of a stacked tensor in expert-major order.
+     */
+    public float[] preScale() {
+        return preScale == null ? null : preScale.clone();
+    }
+
+    /** True when a per-input-column pre-scale applies. */
+    public boolean hasPreScale() {
+        return preScale != null;
+    }
+
+    /**
+     * The number of pre-scale value sets for rows of {@code cols} elements: 0 when there is none, 1 for a shared
+     * multiplier, or the number of experts of a stacked tensor.
+     *
+     * @throws IllegalArgumentException when the pre-scale does not cover whole rows
+     */
+    public int preScaleSets(int cols) {
+        if (preScale == null) {
+            return 0;
+        }
+        if (cols <= 0 || preScale.length % cols != 0) {
+            throw new IllegalArgumentException("activation pre-scale of " + preScale.length
+                    + " values does not cover whole rows of " + cols);
+        }
+        return preScale.length / cols;
+    }
+
+    /**
+     * Multiplies {@code rows} contiguous rows of {@code cols} elements at {@code x[off ..]} in place by the pre-scale
+     * of {@code expert} (0 when the values are shared), or leaves {@code x} unchanged when there is none.
+     *
+     * @throws IllegalArgumentException when the range lies outside {@code x}, or {@code expert} selects a value set
+     *                                  that does not exist
+     */
+    public void applyPreScale(float[] x, int off, int rows, int cols, int expert) {
+        if (preScale == null) {
+            return;
+        }
+        Objects.requireNonNull(x, "x");
+        if (rows < 0 || off < 0 || (long) off + (long) rows * cols > x.length) {
+            throw new IllegalArgumentException("activation range of " + rows + " rows of " + cols + " at " + off
+                    + " lies outside an array of " + x.length);
+        }
+        int sets = preScaleSets(cols);
+        if (expert < 0 || (sets > 1 && expert >= sets)) {
+            throw new IllegalArgumentException("expert " + expert + " is outside the " + sets
+                    + " activation pre-scale value set(s)");
+        }
+        int base = sets > 1 ? expert * cols : 0;
+        for (int r = 0; r < rows; r++) {
+            int row = off + r * cols;
+            for (int c = 0; c < cols; c++) {
+                x[row + c] *= preScale[base + c];
+            }
+        }
+    }
+
+    /**
      * Checks that every part fits input rows of {@code cols} elements: the permutation has {@code cols} entries (it is
-     * a permutation by construction), the rotation accepts the width ({@link HadamardSpec#checkWidth}) and the row
-     * splits into whole activation-quantization runs.
+     * a permutation by construction), the rotation accepts the width ({@link HadamardSpec#checkWidth}), the row
+     * splits into whole activation-quantization runs and the pre-scale covers whole rows.
      *
      * @return this transform
      * @throws IllegalArgumentException naming the part that does not fit
@@ -115,7 +202,19 @@ public final class InputTransform {
         if (actQuant != null) {
             actQuant.scheme().runLength(cols);
         }
+        preScaleSets(cols);
         return this;
+    }
+
+    private static float[] checkPreScale(float[] p) {
+        float[] out = p.clone();
+        for (int k = 0; k < out.length; k++) {
+            if (!Float.isFinite(out[k])) {
+                throw new IllegalArgumentException("activation pre-scale value " + out[k] + " at column " + k
+                        + " is not finite");
+            }
+        }
+        return out;
     }
 
     private static int[] checkPermutation(int[] p) {
@@ -141,12 +240,12 @@ public final class InputTransform {
         }
         InputTransform t = (InputTransform) o;
         return Objects.equals(hadamard, t.hadamard) && Objects.equals(actQuant, t.actQuant)
-                && Arrays.equals(perm, t.perm);
+                && Arrays.equals(perm, t.perm) && Arrays.equals(preScale, t.preScale);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(hadamard, actQuant, Arrays.hashCode(perm));
+        return Objects.hash(hadamard, actQuant, Arrays.hashCode(perm), Arrays.hashCode(preScale));
     }
 
     @Override
@@ -156,8 +255,12 @@ public final class InputTransform {
         }
         StringBuilder b = new StringBuilder("InputTransform{");
         String sep = "";
+        if (preScale != null) {
+            b.append("preScale[").append(preScale.length).append(']');
+            sep = ", ";
+        }
         if (hadamard != null) {
-            b.append("hadamard=").append(hadamard);
+            b.append(sep).append("hadamard=").append(hadamard);
             sep = ", ";
         }
         if (actQuant != null) {

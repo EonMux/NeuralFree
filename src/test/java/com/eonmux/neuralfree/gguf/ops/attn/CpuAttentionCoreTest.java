@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
+import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
@@ -8,7 +9,10 @@ import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Random;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -19,8 +23,9 @@ import static org.junit.Assert.assertTrue;
 /**
  * CPU attention core against an independent double-precision softmax reference: GQA head mapping, sinks, softcap,
  * ALiBi slopes, T5 buckets, causal and the three window kinds, fully masked rows, ring caches through
- * {@link KvAccessor}, MLA latent aliasing, the multi-row form, ranges spanning several key blocks and head chunks,
- * and the key splits of decode rows with their combine.
+ * {@link KvAccessor}, MLA latent aliasing, the multi-row form, the tree mask of a verify step against the reference
+ * and the rows' sequential root paths, ranges spanning several key blocks and head chunks, and the key splits of
+ * decode rows with their combine.
  */
 public class CpuAttentionCoreTest {
 
@@ -46,6 +51,8 @@ public class CpuAttentionCoreTest {
         int nBuckets;
         boolean bidir;
         float[] sinks;
+        float[] kScale;
+        float[] vScale;
     }
 
     @Test
@@ -57,6 +64,25 @@ public class CpuAttentionCoreTest {
         check(f, p, r, 6);
         check(f, p, r, 9);
         check(f, p, r, 0);
+    }
+
+    /** A scaled FP8 cache: every dequantized K row times kScale[kvh] and V row times vScale[kvh] (per KV head). */
+    @Test
+    public void fp8CacheScalesMultiplyTheDequantizedRows() {
+        Fixture f = new Fixture(5);
+        float[] kScale = {2.0f, 0.5f};
+        float[] vScale = {0.25f, 3.0f};
+        CpuAttentionCore.Params p = CpuAttentionCore.Params.builder(N_HEAD).scale(0.4f)
+                .kvScales(kScale, vScale).build();
+        Ref r = new Ref();
+        r.scale = 0.4f;
+        r.kScale = kScale;
+        r.vScale = vScale;
+        check(f, p, r, 6);
+        check(f, p, r, 9);
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> CpuAttentionCore.Params.builder(N_HEAD).kvScales(new float[]{1f, 0f}, null).build());
+        assertTrue(e.getMessage(), e.getMessage().contains("finite and positive"));
     }
 
     @Test
@@ -345,6 +371,43 @@ public class CpuAttentionCoreTest {
     }
 
     @Test
+    public void batchInvarianceKeepsAKeySplitFromDependingOnTheOtherRows() {
+        // One query head per KV head and 10240 keys: a call's split count is derived from its work units, so with
+        // two query rows an unpinned call could split differently from the single-row call. Batch invariance pins
+        // the count to one row's units, and row 0 keeps the exact values of its single-row run.
+        int nHead = 1;
+        int nHeadKv = 1;
+        int dK = 8;
+        int dV = 8;
+        int rows = 10240;
+        Random rnd = new Random(31);
+        float[] k = randomArray(rnd, rows * nHeadKv * dK);
+        float[] v = randomArray(rnd, rows * nHeadKv * dV);
+        int[] pos = new int[rows];
+        for (int i = 0; i < rows; i++) {
+            pos[i] = i;
+        }
+        CpuAttentionCore.DenseKv kv = CpuAttentionCore.DenseKv.of(k, 0, nHeadKv * dK, dK, v, 0, nHeadKv * dV, dV,
+                nHeadKv, dK, dV, pos, 0);
+        CpuAttentionCore.Params p = CpuAttentionCore.Params.builder(nHead).scale(0.25f).build();
+        int qDim = nHead * dK;
+        float[] q = randomArray(rnd, 2 * qDim);
+        int[] soloPos = {rows - 1};
+        float[] solo = new float[nHead * dV];
+        float[] both = new float[2 * nHead * dV];
+        BatchInvariance.setEnabled(true);
+        try {
+            CpuAttentionCore.attendRows(p, 1, q, 0, qDim, soloPos, 0, kv, 0, rows, solo, 0, nHead * dV);
+            CpuAttentionCore.attendRows(p, 2, q, 0, qDim, new int[]{rows - 1, rows - 2}, 0, kv, 0, rows, both, 0,
+                    nHead * dV);
+        } finally {
+            BatchInvariance.clearOverride();
+        }
+        assertArrayEquals("the first row of a two-row call equals its single-row run",
+                solo, Arrays.copyOf(both, nHead * dV), 0.0f);
+    }
+
+    @Test
     public void splitCountOccupiesIdleWorkersOnLongRanges() {
         assertEquals(1, CpuAttentionCore.splitCount(2, CpuAttentionCore.SPLIT_MIN_KEYS - 1, 16));
         assertEquals(1, CpuAttentionCore.splitCount(16, 4096, 16));
@@ -398,6 +461,118 @@ public class CpuAttentionCoreTest {
         }
     }
 
+    /**
+     * Learned static sink tokens: they precede the cached keys (their index is the query's position plus the sink
+     * count), take no cache dequantization scale, and obey the causal window. Single-pass and split-K launches must
+     * agree with the reference.
+     */
+    @Test
+    public void staticSinkTokensPrecedeTheCacheUnderTheWindow() {
+        int nSink = 3;
+        int rows = 900;
+        Random rnd = new Random(51);
+        float[] k = randomArray(rnd, rows * N_HEAD_KV * D_K);
+        float[] v = randomArray(rnd, rows * N_HEAD_KV * D_V);
+        int[] pos = new int[rows];
+        for (int i = 0; i < rows; i++) {
+            pos[i] = i;
+        }
+        float[] sinkK = randomArray(rnd, nSink * N_HEAD_KV * D_K);
+        float[] sinkV = randomArray(rnd, nSink * N_HEAD_KV * D_V);
+        float[] kScale = {2.0f, 0.5f};
+        float[] vScale = {0.25f, 3.0f};
+        CpuAttentionCore.DenseKv kv = CpuAttentionCore.DenseKv.of(k, 0, N_HEAD_KV * D_K, D_K, v, 0, N_HEAD_KV * D_V,
+                D_V, N_HEAD_KV, D_K, D_V, pos, 0);
+        for (KvWindow window : new KvWindow[]{KvWindow.FULL_CAUSAL, KvWindow.of(SwaType.STANDARD, 300, true)}) {
+            CpuAttentionCore.Params p = CpuAttentionCore.Params.builder(N_HEAD).scale(0.3f)
+                    .kvScales(kScale, vScale).sinkKv(sinkK, sinkV, nSink).window(window).build();
+            for (int qPos : new int[]{rows - 1, 700, 3, 0}) {
+                float[] q = randomArray(rnd, N_HEAD * D_K);
+                float[] one = new float[N_HEAD * D_V];
+                CpuAttentionCore.attend(p, q, 0, qPos, kv, 0, rows, one, 0, new CpuAttentionCore.Scratch());
+                double[] ref = staticSinkReference(q, qPos, k, v, rows, sinkK, sinkV, nSink, window, kScale,
+                        vScale);
+                for (int i = 0; i < one.length; i++) {
+                    assertEquals(window + " q " + qPos + " i " + i, ref[i], one[i], 1e-4);
+                }
+                for (int splits : new int[]{1, 2, 3, 5, 100}) {
+                    float[] split = new float[N_HEAD * D_V];
+                    CpuAttentionCore.attendRowsSplit(p, 1, q, 0, N_HEAD * D_K, new int[]{qPos}, 0, kv, 0, rows, split,
+                            0, N_HEAD * D_V, splits);
+                    for (int i = 0; i < one.length; i++) {
+                        assertEquals(window + " q " + qPos + " splits " + splits + " i " + i, one[i], split[i],
+                                SPLIT_TOL);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Double-precision reference of {@link #staticSinkTokensPrecedeTheCacheUnderTheWindow}. */
+    private static double[] staticSinkReference(float[] q, int qPos, float[] k, float[] v, int rows, float[] sinkK,
+                                                float[] sinkV, int nSink, KvWindow window, float[] kScale,
+                                                float[] vScale) {
+        double[] out = new double[N_HEAD * D_V];
+        int g0 = N_HEAD / N_HEAD_KV;
+        for (int h = 0; h < N_HEAD; h++) {
+            int kvh = h / g0;
+            double m = Double.NEGATIVE_INFINITY;
+            double[] sinkScore = new double[nSink];
+            for (int r = 0; r < nSink; r++) {
+                boolean visible = !window.causal() || window.visible(qPos + nSink, r);
+                if (!visible) {
+                    sinkScore[r] = Double.NEGATIVE_INFINITY;
+                    continue;
+                }
+                double dot = 0;
+                for (int d = 0; d < D_K; d++) {
+                    dot += (double) q[h * D_K + d] * sinkK[(r * N_HEAD_KV + kvh) * D_K + d];
+                }
+                sinkScore[r] = dot * 0.3;
+                m = Math.max(m, sinkScore[r]);
+            }
+            double[] cacheScore = new double[rows];
+            for (int r = 0; r < rows; r++) {
+                boolean visible = !window.causal() || window.visible(qPos, r);
+                if (!visible) {
+                    cacheScore[r] = Double.NEGATIVE_INFINITY;
+                    continue;
+                }
+                double dot = 0;
+                for (int d = 0; d < D_K; d++) {
+                    dot += (double) q[h * D_K + d] * k[r * N_HEAD_KV * D_K + kvh * D_K + d] * kScale[kvh];
+                }
+                cacheScore[r] = dot * 0.3;
+                m = Math.max(m, cacheScore[r]);
+            }
+            double l = 0;
+            for (int r = 0; r < nSink; r++) {
+                if (sinkScore[r] == Double.NEGATIVE_INFINITY) {
+                    continue;
+                }
+                double e = Math.exp(sinkScore[r] - m);
+                l += e;
+                for (int d = 0; d < D_V; d++) {
+                    out[h * D_V + d] += e * sinkV[(r * N_HEAD_KV + kvh) * D_V + d];
+                }
+            }
+            for (int r = 0; r < rows; r++) {
+                if (cacheScore[r] == Double.NEGATIVE_INFINITY) {
+                    continue;
+                }
+                double e = Math.exp(cacheScore[r] - m);
+                l += e;
+                for (int d = 0; d < D_V; d++) {
+                    out[h * D_V + d] += e * v[r * N_HEAD_KV * D_V + kvh * D_V + d] * vScale[kvh];
+                }
+            }
+            for (int d = 0; d < D_V; d++) {
+                out[h * D_V + d] /= l;
+            }
+        }
+        return out;
+    }
+
     @Test
     public void keySplitsOfAFullyMaskedRowOutputZeros() {
         int rows = 1024;
@@ -432,6 +607,164 @@ public class CpuAttentionCoreTest {
         assertThrows(NullPointerException.class, () -> CpuAttentionCore.Params.of(spec, null, null));
     }
 
+    /**
+     * A verify step's tree mask: five fresh rows — the pending root, two depth-1 siblings and two deeper nodes —
+     * after six committed prefix rows. Every row's masked output equals the independent reference over the rows its
+     * bitmask admits (prefix plus ancestors and itself, siblings excluded — which the store positions' causal rules
+     * would wrongly admit), and each node's output equals a sequential run over exactly its root path (the chain
+     * decode's rows, key order aside), on the dense, ring-accessor and paged forms alike.
+     */
+    @Test
+    public void treeMaskedRowsMatchTheReferenceAndTheSequentialPath() {
+        int nPrefix = 6;
+        int fresh = 5;
+        int rows = nPrefix + fresh;
+        Random rnd = new Random(61);
+        float[] k = randomArray(rnd, rows * N_HEAD_KV * D_K);
+        float[] v = randomArray(rnd, rows * N_HEAD_KV * D_V);
+        int[] pos = new int[rows];
+        for (int i = 0; i < rows; i++) {
+            pos[i] = i;   // the fresh rows store at their contiguous slots after the prefix
+        }
+        // fresh row 0 is the pending root, rows 1 and 2 are its depth-1 children (siblings), row 3 is row 1's
+        // depth-2 child and row 4 that node's depth-3 child
+        int[] parent = {-1, 0, 0, 1, 3};
+        long[] mask = new long[fresh];
+        for (int t = 0; t < fresh; t++) {
+            mask[t] = 1L << t;
+            for (int p = parent[t]; p >= 0; p = parent[p]) {
+                mask[t] |= 1L << p;
+            }
+        }
+        // the rows rope at their depth positions: the root at nPrefix, its two children sharing nPrefix + 1
+        int[] depth = new int[fresh];
+        depth[0] = nPrefix;
+        for (int t = 1; t < fresh; t++) {
+            depth[t] = depth[parent[t]] + 1;
+        }
+        CpuAttentionCore.DenseKv dense = CpuAttentionCore.DenseKv.of(k, 0, N_HEAD_KV * D_K, D_K, v, 0,
+                N_HEAD_KV * D_V, D_V, N_HEAD_KV, D_K, D_V, pos, 0);
+        CpuAttentionCore.Params p = CpuAttentionCore.Params.builder(N_HEAD).scale(0.35f).build();
+        CpuAttentionCore.TreeMask tree = new CpuAttentionCore.TreeMask(mask, fresh);
+        float[] q = randomArray(rnd, fresh * N_HEAD * D_K);
+        float[] many = new float[fresh * N_HEAD * D_V];
+        CpuAttentionCore.attendRows(p, fresh, q, 0, N_HEAD * D_K, depth, 0, dense, 0, rows, many, 0,
+                N_HEAD * D_V, tree);
+        for (int t = 0; t < fresh; t++) {
+            double[] ref = treeReference(q, t, depth[t], k, v, mask[t], nPrefix, rows, 0.35f);
+            for (int i = 0; i < N_HEAD * D_V; i++) {
+                assertEquals("row " + t + " element " + i, ref[i], many[t * N_HEAD * D_V + i], TOL);
+            }
+            // the sequential run of the row's root path: the prefix rows then the path rows in path order, so the
+            // causal rules alone admit exactly the masked call's key set
+            List<Integer> path = new ArrayList<>();
+            for (int n = t; n >= 0; n = parent[n]) {
+                path.add(n);
+            }
+            Collections.reverse(path);
+            HeapKv pathKv = new HeapKv(rows, N_HEAD_KV, D_K, D_V);
+            int[] pathPos = new int[rows];
+            float[] kRow = new float[N_HEAD_KV * D_K];
+            float[] vRow = new float[N_HEAD_KV * D_V];
+            int r = 0;
+            for (int slot = 0; slot < nPrefix; slot++, r++) {
+                System.arraycopy(k, slot * kRow.length, kRow, 0, kRow.length);
+                System.arraycopy(v, slot * vRow.length, vRow, 0, vRow.length);
+                pathKv.writeK(r, kRow, 0);
+                pathKv.writeV(r, vRow, 0);
+                pathPos[r] = slot;
+            }
+            for (int n : path) {
+                // fresh node n stores its K/V at the row after the prefix
+                System.arraycopy(k, (nPrefix + n) * kRow.length, kRow, 0, kRow.length);
+                System.arraycopy(v, (nPrefix + n) * vRow.length, vRow, 0, vRow.length);
+                pathKv.writeK(r, kRow, 0);
+                pathKv.writeV(r, vRow, 0);
+                pathPos[r] = r;
+                r++;
+            }
+            int pathEnd = r;
+            float[] walked = new float[N_HEAD * D_V];
+            CpuAttentionCore.attend(p, q, t * N_HEAD * D_K, pathEnd - 1, pathKv, s -> pathPos[s], 0, pathEnd,
+                    walked, 0, new CpuAttentionCore.Scratch());
+            for (int i = 0; i < walked.length; i++) {
+                assertEquals("row " + t + " path walk element " + i, walked[i], many[t * N_HEAD * D_V + i], TOL);
+            }
+        }
+        // the paged form: the fresh rows are the last slots of the span, over a page table that permutes the slots
+        int pageShift = 1;
+        int[] pageTable = {2, 1, 0, 3, 4, 5};   // slot s sits at physical row (pageTable[s >> 1] << 1) | (s & 1)
+        int[] logicalOf = new int[rows];        // physical row -> the logical row whose K/V it holds
+        HeapKv heap = new HeapKv(rows, N_HEAD_KV, D_K, D_V);
+        for (int slot = 0; slot < rows; slot++) {
+            int physical = (pageTable[slot >> pageShift] << pageShift) | (slot & ((1 << pageShift) - 1));
+            heap.writeK(physical, k, slot * N_HEAD_KV * D_K);
+            heap.writeV(physical, v, slot * N_HEAD_KV * D_V);
+            logicalOf[physical] = slot;
+        }
+        float[] paged = new float[fresh * N_HEAD * D_V];
+        CpuAttentionCore.attendRows(p, fresh, q, 0, N_HEAD * D_K, depth, 0, heap, pRow -> pos[logicalOf[pRow]],
+                pageShift, pageTable, 0, rows, paged, 0, N_HEAD * D_V, tree);
+        for (int i = 0; i < paged.length; i++) {
+            assertEquals("paged element " + i, many[i], paged[i], SPLIT_TOL);
+        }
+    }
+
+    /** Double-precision reference of one tree-masked query row: the mask admits the prefix and the named fresh rows. */
+    private static double[] treeReference(float[] q, int t, int qPos, float[] k, float[] v, long bits, int nPrefix,
+                                          int rows, float scale) {
+        double[] out = new double[N_HEAD * D_V];
+        int g0 = N_HEAD / N_HEAD_KV;
+        for (int h = 0; h < N_HEAD; h++) {
+            int kvh = h / g0;
+            double[] s = new double[rows];
+            double m = Double.NEGATIVE_INFINITY;
+            for (int row = 0; row < rows; row++) {
+                boolean visible = row < nPrefix ? row <= qPos : (bits >> (row - nPrefix) & 1) != 0;
+                if (!visible) {
+                    s[row] = Double.NEGATIVE_INFINITY;
+                    continue;
+                }
+                double dot = 0;
+                for (int d = 0; d < D_K; d++) {
+                    dot += (double) q[t * N_HEAD * D_K + h * D_K + d] * k[row * N_HEAD_KV * D_K + kvh * D_K + d];
+                }
+                s[row] = dot * scale;
+                m = Math.max(m, s[row]);
+            }
+            double l = 0;
+            double[] o = new double[D_V];
+            for (int row = 0; row < rows; row++) {
+                if (s[row] == Double.NEGATIVE_INFINITY) {
+                    continue;
+                }
+                double e = Math.exp(s[row] - m);
+                l += e;
+                for (int d = 0; d < D_V; d++) {
+                    o[d] += e * v[row * N_HEAD_KV * D_V + kvh * D_V + d];
+                }
+            }
+            for (int d = 0; d < D_V; d++) {
+                out[h * D_V + d] = o[d] / l;
+            }
+        }
+        return out;
+    }
+
+    @Test
+    public void aTreeMaskValidatesItsShape() {
+        long[] mask = {1L, 3L};
+        assertThrows(IllegalArgumentException.class, () -> new CpuAttentionCore.TreeMask(mask, 0));
+        assertThrows(IllegalArgumentException.class, () -> new CpuAttentionCore.TreeMask(mask, 65));
+        assertThrows(IllegalArgumentException.class, () -> new CpuAttentionCore.TreeMask(new long[1], 2));
+        assertThrows(NullPointerException.class, () -> new CpuAttentionCore.TreeMask(null, 1));
+        CpuAttentionCore.TreeMask tree = new CpuAttentionCore.TreeMask(mask, 2);
+        assertEquals(2, tree.freshRows());
+        assertArrayEquals(mask, tree.mask());
+        mask[1] = -1L;
+        assertArrayEquals("the constructor copies the mask", new long[] {1L, 3L}, tree.mask());
+    }
+
     // ------------------------------------------------------------------ fixtures and reference
 
     private static void check(Fixture f, CpuAttentionCore.Params p, Ref r, int qPos) {
@@ -462,7 +795,8 @@ public class CpuAttentionCoreTest {
                 }
                 double dot = 0;
                 for (int d = 0; d < D_K; d++) {
-                    dot += (double) f.q[h * D_K + d] * f.k[row * N_HEAD_KV * D_K + kvh * D_K + d];
+                    dot += (double) f.q[h * D_K + d] * f.k[row * N_HEAD_KV * D_K + kvh * D_K + d]
+                            * (r.kScale != null ? r.kScale[kvh] : 1.0);
                 }
                 double x = r.softcap > 0 ? r.softcap * Math.tanh(dot * r.scale / r.softcap) : dot * r.scale;
                 if (r.slopes != null) {
@@ -489,7 +823,8 @@ public class CpuAttentionCoreTest {
                 double e = Math.exp(s[row] - m);
                 l += e;
                 for (int d = 0; d < D_V; d++) {
-                    o[d] += e * f.v[row * N_HEAD_KV * D_V + kvh * D_V + d];
+                    o[d] += e * f.v[row * N_HEAD_KV * D_V + kvh * D_V + d]
+                            * (r.vScale != null ? r.vScale[kvh] : 1.0);
                 }
             }
             for (int d = 0; d < D_V; d++) {

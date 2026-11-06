@@ -6,35 +6,45 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * The immutable constraint of one generation request, the sum type row G3/G4/G8 and the PARITY
- * grammar epic request wiring pass around: {@code Gbnf | JsonSchema | JsonObject | Regex |
+ * The immutable constraint of one generation request, the sum type the request wiring passes
+ * around: {@code Gbnf | Lark | JsonSchema | JsonObject | Regex |
  * Choice | StructuralTag}. Each instance names its {@link Kind} and carries only that kind's
  * data; the conversion into a {@link Grammar} lives with {@link GbnfBuilder}, which dispatches
  * on the kind ({@link JsonSchemaToGbnf} for the schema kinds, {@link RegexToGbnf} for
- * {@link Kind#REGEX}, an alternation of literals for {@link Kind#CHOICE} and
- * {@link GbnfParser} for raw GBNF). Invalid or untranslatable requests surface as
+ * {@link Kind#REGEX}, an alternation of literals for {@link Kind#CHOICE}, {@link LarkGrammar}
+ * for Lark and {@link GbnfParser} for raw GBNF). Invalid or untranslatable requests surface as
  * {@link GrammarException} there, never here: construction only checks shape.
  *
- * <p>The {@link Kind#STRUCTURAL_TAG} variant carries the raw structural-tag text; its parsing
- * into begin/trigger/end segments and grammars is the SO-4 WP ({@code StructuralTag}), which
- * converts the segment fragments with this package's converters. SO-3 delivers the variant,
- * SO-4 the parser.</p>
+ * <p>The {@link Kind#STRUCTURAL_TAG} variant carries the raw structural-tag text in either form vLLM accepts:
+ * the legacy {@code structures}/{@code triggers} payload ({@link StructuralTag}) or xgrammar's
+ * {@code {"type": "structural_tag", "format": ...}} tree of formats ({@link StructuralTagFormat}).</p>
+ *
+ * <p>The {@link Kind#JSON_SCHEMA} and {@link Kind#JSON_OBJECT} variants carry the structured-output JSON options of
+ * vLLM's {@code StructuredOutputsParams}: the whitespace mode ({@link #whitespace}), an explicit
+ * {@code whitespace_pattern} regex ({@link #whitespacePattern}) and {@code disable_additional_properties}
+ * ({@link #disableAdditionalProperties}), applied together by {@link #withJsonOptions}.</p>
  */
 public final class ConstraintSpec {
 
     /** Which constraint kind this instance is. */
     public enum Kind {
-        /** A raw GBNF grammar text. */
+        /**
+         * A grammar text: GBNF, or Lark when it starts with llama.cpp's {@code %llguidance} header or has no line
+         * defining a {@code ::=} rule ({@link LarkGrammar#isLark}, vLLM's detection plus llama.cpp's header),
+         * translated by {@link LarkGrammar}.
+         */
         GBNF,
+        /** A Lark grammar text, the dialect vLLM's xgrammar backend compiles. */
+        LARK,
         /** A JSON schema text. */
         JSON_SCHEMA,
         /** The generic JSON-value grammar, no schema constraints. */
         JSON_OBJECT,
-        /** An anchored regex over the output. */
+        /** A regex the whole output must match (ECMAScript syntax, anchors optional). */
         REGEX,
         /** One of the given literal strings. */
         CHOICE,
-        /** A structural tag (begin/schema/end), parsed by SO-4. */
+        /** A structural tag: legacy structures, or xgrammar's format tree. */
         STRUCTURAL_TAG
     }
 
@@ -43,21 +53,31 @@ public final class ConstraintSpec {
     private final List<String> choices;
     private final boolean dotAll;
     private final JsonSchemaToGbnf.WhitespaceMode whitespace;
+    private final String whitespacePattern;
+    private final boolean disableAdditionalProperties;
     private final GrammarTriggers triggers;
     private final ConstraintGate gate;
 
     private ConstraintSpec(Kind kind, String text, List<String> choices, boolean dotAll,
             JsonSchemaToGbnf.WhitespaceMode whitespace) {
-        this(kind, text, choices, dotAll, whitespace, null, null);
+        this(kind, text, choices, dotAll, whitespace, null, false, null, null);
     }
 
     private ConstraintSpec(Kind kind, String text, List<String> choices, boolean dotAll,
             JsonSchemaToGbnf.WhitespaceMode whitespace, GrammarTriggers triggers, ConstraintGate gate) {
+        this(kind, text, choices, dotAll, whitespace, null, false, triggers, gate);
+    }
+
+    private ConstraintSpec(Kind kind, String text, List<String> choices, boolean dotAll,
+            JsonSchemaToGbnf.WhitespaceMode whitespace, String whitespacePattern,
+            boolean disableAdditionalProperties, GrammarTriggers triggers, ConstraintGate gate) {
         this.kind = kind;
         this.text = text;
         this.choices = choices == null ? null : Collections.unmodifiableList(new ArrayList<>(choices));
         this.dotAll = dotAll;
         this.whitespace = whitespace;
+        this.whitespacePattern = whitespacePattern;
+        this.disableAdditionalProperties = disableAdditionalProperties;
         this.triggers = triggers;
         this.gate = gate;
     }
@@ -67,7 +87,8 @@ public final class ConstraintSpec {
      * constrains it from the trigger on ({@link GrammarTriggers}); null returns the always-on form.
      */
     public ConstraintSpec withTriggers(GrammarTriggers triggers) {
-        return new ConstraintSpec(kind, text, choices, dotAll, whitespace, triggers, gate);
+        return new ConstraintSpec(kind, text, choices, dotAll, whitespace, whitespacePattern,
+                disableAdditionalProperties, triggers, gate);
     }
 
     /**
@@ -76,7 +97,35 @@ public final class ConstraintSpec {
      * tag whose payload names triggers) is lazy already and compiles without the gate.
      */
     public ConstraintSpec withGate(ConstraintGate gate) {
-        return new ConstraintSpec(kind, text, choices, dotAll, whitespace, triggers, gate);
+        return new ConstraintSpec(kind, text, choices, dotAll, whitespace, whitespacePattern,
+                disableAdditionalProperties, triggers, gate);
+    }
+
+    /**
+     * This JSON constraint with vLLM's {@code structured_outputs} JSON options: {@code disableAnyWhitespace} writes
+     * the compact form (its {@link JsonSchemaToGbnf.WhitespaceMode#COMPACT}), {@code whitespacePattern} (when not
+     * null) makes that regex the whitespace between JSON tokens, and {@code disableAdditionalProperties} closes
+     * every object that declares properties.
+     *
+     * @throws IllegalArgumentException when an option is requested for another constraint kind, where neither the
+     *                                  whitespace options nor the closing of objects has meaning (a regex, choice,
+     *                                  grammar or structural tag), or when the pattern is empty
+     */
+    public ConstraintSpec withJsonOptions(boolean disableAnyWhitespace, String whitespacePattern,
+            boolean disableAdditionalProperties) {
+        boolean requested = disableAnyWhitespace || whitespacePattern != null || disableAdditionalProperties;
+        if (requested && kind != Kind.JSON_SCHEMA && kind != Kind.JSON_OBJECT) {
+            throw new IllegalArgumentException("the JSON output options disable_any_whitespace, whitespace_pattern"
+                    + " and disable_additional_properties apply to json and json_object constraints only, not to "
+                    + kind);
+        }
+        if (whitespacePattern != null && whitespacePattern.isEmpty()) {
+            throw new IllegalArgumentException("whitespace_pattern must not be empty");
+        }
+        JsonSchemaToGbnf.WhitespaceMode effective = disableAnyWhitespace
+                ? JsonSchemaToGbnf.WhitespaceMode.COMPACT : whitespace;
+        return new ConstraintSpec(kind, text, choices, dotAll, effective, whitespacePattern,
+                disableAdditionalProperties, triggers, gate);
     }
 
     /** The gate the constraint waits behind, or null. */
@@ -93,7 +142,7 @@ public final class ConstraintSpec {
         return triggers;
     }
 
-    /** A {@link Kind#GBNF} constraint; the text under {@link GbnfParser} bounds. */
+    /** A {@link Kind#GBNF} constraint: GBNF text under {@link GbnfParser} bounds, or a Lark grammar. */
     public static ConstraintSpec gbnf(String grammarSource) {
         Objects.requireNonNull(grammarSource, "grammarSource");
         return new ConstraintSpec(Kind.GBNF, grammarSource, null, false,
@@ -101,7 +150,27 @@ public final class ConstraintSpec {
     }
 
     /**
-     * A {@link Kind#JSON_SCHEMA} constraint in {@code mode} (row G8); {@code mode} null means
+     * A {@link Kind#LARK} constraint: the Lark grammar text {@link LarkGrammar} compiles, its {@code %json}
+     * schemas in the flexible whitespace mode.
+     */
+    public static ConstraintSpec lark(String grammarSource) {
+        Objects.requireNonNull(grammarSource, "grammarSource");
+        return new ConstraintSpec(Kind.LARK, grammarSource, null, false,
+                JsonSchemaToGbnf.WhitespaceMode.FLEXIBLE);
+    }
+
+    /**
+     * The constraint of a grammar text in either syntax, as vLLM reads {@code structured_outputs.grammar}:
+     * {@link Kind#LARK} when the text looks like Lark ({@link LarkGrammar#isLark}: llama.cpp's {@code %llguidance}
+     * header, or no {@code ::=} rule line), else {@link Kind#GBNF}.
+     */
+    public static ConstraintSpec grammar(String grammarSource) {
+        Objects.requireNonNull(grammarSource, "grammarSource");
+        return LarkGrammar.isLark(grammarSource) ? lark(grammarSource) : gbnf(grammarSource);
+    }
+
+    /**
+     * A {@link Kind#JSON_SCHEMA} constraint in {@code mode}; {@code mode} null means
      * llama.cpp's default, {@link JsonSchemaToGbnf.WhitespaceMode#FLEXIBLE}.
      */
     public static ConstraintSpec jsonSchema(String schemaJson,
@@ -111,15 +180,37 @@ public final class ConstraintSpec {
                 mode == null ? JsonSchemaToGbnf.WhitespaceMode.FLEXIBLE : mode);
     }
 
+    /**
+     * A {@link Kind#JSON_SCHEMA} constraint under the structured-output JSON options of
+     * {@link #withJsonOptions}: {@code mode} (null is flexible), the {@code whitespace_pattern} regex (null for the
+     * mode's rule) and {@code disableAdditionalProperties}.
+     */
+    public static ConstraintSpec jsonSchema(String schemaJson, JsonSchemaToGbnf.WhitespaceMode mode,
+            String whitespacePattern, boolean disableAdditionalProperties) {
+        Objects.requireNonNull(schemaJson, "schemaJson");
+        return new ConstraintSpec(Kind.JSON_SCHEMA, schemaJson, null, false,
+                mode == null ? JsonSchemaToGbnf.WhitespaceMode.FLEXIBLE : mode, whitespacePattern,
+                disableAdditionalProperties, null, null);
+    }
+
     /** A {@link Kind#JSON_OBJECT} constraint in {@code mode}; null {@code mode} is flexible. */
     public static ConstraintSpec jsonObject(JsonSchemaToGbnf.WhitespaceMode mode) {
         return new ConstraintSpec(Kind.JSON_OBJECT, "{}", null, false,
                 mode == null ? JsonSchemaToGbnf.WhitespaceMode.FLEXIBLE : mode);
     }
 
+    /** A {@link Kind#JSON_OBJECT} constraint under the structured-output JSON options of {@link #withJsonOptions}. */
+    public static ConstraintSpec jsonObject(JsonSchemaToGbnf.WhitespaceMode mode, String whitespacePattern,
+            boolean disableAdditionalProperties) {
+        return new ConstraintSpec(Kind.JSON_OBJECT, "{}", null, false,
+                mode == null ? JsonSchemaToGbnf.WhitespaceMode.FLEXIBLE : mode, whitespacePattern,
+                disableAdditionalProperties, null, null);
+    }
+
     /**
-     * A {@link Kind#REGEX} constraint in llama.cpp's ECMAScript subset; {@code dotAll} sets
-     * llama.cpp's {@code common_grammar_options.dotall} ({@code .} matches newlines too).
+     * A {@link Kind#REGEX} constraint: the whole output must match {@code pattern}, an
+     * ECMAScript regex as {@link RegexToGbnf#compile} reads it; {@code dotAll} sets llama.cpp's
+     * {@code common_grammar_options.dotall} ({@code .} matches newlines too).
      */
     public static ConstraintSpec regex(String pattern, boolean dotAll) {
         Objects.requireNonNull(pattern, "pattern");
@@ -156,7 +247,7 @@ public final class ConstraintSpec {
         return kind;
     }
 
-    /** The source text: GBNF, schema JSON, regex pattern or structural tag, per {@code kind}. */
+    /** The source text: GBNF, Lark, schema JSON, regex pattern or structural tag, per {@code kind}. */
     public String text() {
         return text;
     }
@@ -171,9 +262,25 @@ public final class ConstraintSpec {
         return dotAll;
     }
 
-    /** The whitespace mode of the JSON kinds (row G8). */
+    /** The whitespace mode of the JSON kinds. */
     public JsonSchemaToGbnf.WhitespaceMode whitespace() {
         return whitespace;
+    }
+
+    /** The {@code whitespace_pattern} regex of the JSON kinds, or null when the mode's rule applies. */
+    public String whitespacePattern() {
+        return whitespacePattern;
+    }
+
+    /** Whether the JSON kinds close every object that declares properties ({@code disable_additional_properties}). */
+    public boolean disableAdditionalProperties() {
+        return disableAdditionalProperties;
+    }
+
+    /** The conversion options of a JSON kind, carrying the whitespace pattern and the closing of objects. */
+    JsonSchemaOptions jsonOptions() {
+        return JsonSchemaOptions.json(whitespace).withWhitespacePattern(whitespacePattern)
+                .withAdditionalPropertiesDisabled(disableAdditionalProperties);
     }
 
     @Override
@@ -187,7 +294,9 @@ public final class ConstraintSpec {
         ConstraintSpec other = (ConstraintSpec) o;
         return kind == other.kind
                 && dotAll == other.dotAll
+                && disableAdditionalProperties == other.disableAdditionalProperties
                 && whitespace == other.whitespace
+                && Objects.equals(whitespacePattern, other.whitespacePattern)
                 && Objects.equals(text, other.text)
                 && Objects.equals(choices, other.choices)
                 && Objects.equals(triggers, other.triggers)
@@ -196,7 +305,8 @@ public final class ConstraintSpec {
 
     @Override
     public int hashCode() {
-        return Objects.hash(kind, text, choices, dotAll, whitespace, triggers, gate);
+        return Objects.hash(kind, text, choices, dotAll, whitespace, whitespacePattern,
+                disableAdditionalProperties, triggers, gate);
     }
 
     @Override
@@ -206,6 +316,8 @@ public final class ConstraintSpec {
                         || kind == Kind.STRUCTURAL_TAG ? "<" + text.length() + " chars>" : text))
                 + (choices == null ? "" : ", choices=" + choices)
                 + (kind == Kind.REGEX ? ", dotAll=" + dotAll : "")
+                + (whitespacePattern == null ? "" : ", whitespacePattern=" + whitespacePattern)
+                + (disableAdditionalProperties ? ", disableAdditionalProperties" : "")
                 + (triggers == null ? "" : ", triggers=" + triggers)
                 + (gate == null ? "" : ", gate=" + gate)
                 + "]";

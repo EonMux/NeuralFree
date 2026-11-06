@@ -215,6 +215,19 @@ public final class Tensor implements AutoCloseable {
         return new Tensor(shape, DType.INT32, strides, storage, backend, false);
     }
 
+    /** A new FLOAT64 vector holding {@code data}, uploaded once; it does not require grad. */
+    public static Tensor fromArray(ComputeBackend backend, double[] data) {
+        Objects.requireNonNull(backend, "Backend cannot be null");
+        Objects.requireNonNull(data, "Data cannot be null");
+
+        Shape shape = Shape.vector(data.length);
+        ByteBuffer buffer = ByteBuffer.allocate(hostArrayLength((long) data.length * DType.FLOAT64.byteSize(),
+                "fromArray() bytes")).order(ByteOrder.nativeOrder());
+        buffer.asDoubleBuffer().put(data);
+        TensorStorage storage = TensorStorage.fromHost(backend, buffer, DType.FLOAT64);
+        return new Tensor(shape, DType.FLOAT64, Strides.contiguous(shape), storage, backend, false);
+    }
+
     public static Tensor fromArray(ComputeBackend backend, byte[] data) {
         Objects.requireNonNull(backend, "Backend cannot be null");
         Objects.requireNonNull(data, "Data cannot be null");
@@ -545,6 +558,19 @@ public final class Tensor implements AutoCloseable {
         ByteBuffer bytes = ByteBuffer.wrap(gatherBytes(queue)).order(ByteOrder.nativeOrder());
         float[] result = new float[(int) n];
         bytes.asFloatBuffer().get(result);
+        return result;
+    }
+
+    /** The FLOAT64 elements in row-major order; a strided view is gathered as {@link #toByteBuffer()} does. */
+    public double[] toDoubleArray() {
+        ensureOpen();
+
+        if (dtype != DType.FLOAT64) {
+            throw new UnsupportedOperationException("toDoubleArray() only supported for FLOAT64 tensors, got: "
+                + dtype);
+        }
+        double[] result = new double[hostArrayLength(numElements(), "toDoubleArray() elements")];
+        toByteBuffer().asDoubleBuffer().get(result);
         return result;
     }
 

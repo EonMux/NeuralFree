@@ -1,0 +1,35 @@
+/* matvec_rows_f32.comp - LLM_MatVecRowsF32: one page of a stacked F32 LM head applied to one row.
+ * GLSL twin of kernels/llm/speech.cl. Requires: common/nf_common.glsl.
+ *
+ * Arguments: (i cols, i rows, i row_off, R w, R x, W y).
+ *   y[r] = sum_c w[row_off + r][c] * x[c]
+ * w[rows_total][cols], x[cols], y[rows]. Dispatch: 1-D, one invocation per output row,
+ * global = roundUp(rows, L), local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+
+layout(std430, binding = 0) readonly buffer NfMvrW { float w_in[]; };
+layout(std430, binding = 1) readonly buffer NfMvrX { float x_in[]; };
+layout(std430, binding = 2) writeonly buffer NfMvrY { float y_out[]; };
+
+layout(push_constant) uniform NfMvrParams {
+    int cols;
+    int rows;
+    int row_off;
+} pc;
+
+void main() {
+    const uint r = nf_global_id();
+    if (r >= uint(pc.rows)) {
+        return;
+    }
+    const uint base = (uint(pc.row_off) + r) * uint(pc.cols);
+    float acc = 0.0;
+    for (int c = 0; c < pc.cols; ++c) {
+        acc += w_in[base + uint(c)] * x_in[uint(c)];
+    }
+    y_out[r] = acc;
+}

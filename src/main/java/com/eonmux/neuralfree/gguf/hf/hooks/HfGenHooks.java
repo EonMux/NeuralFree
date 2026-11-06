@@ -33,7 +33,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The audio-generator hooks of Appendix A table HK-SG: LC/conversion/pockettts.py {@code PocketTTSModel}
+ * The audio-generator hooks: LC/conversion/pockettts.py {@code PocketTTSModel}
  * (:81-174), LC/conversion/qwen3tts.py {@code Qwen3TTSTalkerModel} (:41-185) and LC/conversion/wavtokenizer.py
  * {@code WavTokenizerDecModel} (:13-46). Each public static mirrors one converter method: the {@code *Meta} the
  * class's {@code set_gguf_parameters}, {@code *Tensors} its {@code modify_tensors}, {@code *Vocab} its
@@ -54,7 +54,7 @@ public final class HfGenHooks {
     // ------------------------------------------------------------------ shared
 
     /** The full float32 contents of {@code src}, for the folds and matvecs these hooks run (pockettts.py, qwen3tts.py). */
-    private static float[] floats(RowSource src, String name) throws IOException {
+    static float[] floats(RowSource src, String name) throws IOException {
         RowSource f = ElementTransforms.convert(src, GGMLType.F32);
         long total = f.rows() * f.rowBytes();
         if (total > Integer.MAX_VALUE - 8) {

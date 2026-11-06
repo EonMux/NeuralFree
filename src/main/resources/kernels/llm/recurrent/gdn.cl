@@ -170,6 +170,10 @@ NF_KERNEL void LLM_GDN_Scan(
  *   layout 1 (qwen3next fused ssm_ba, GDN only; R = n_v_heads / n_k_heads, h = kh*R + r):
  *                        b at [kh*2R + r] and a at [kh*2R + R + r] of each token row; the host binds
  *                        the fused projection to both a_in and b_in with equal offsets and strides.
+ *   layout 2 (qwen4exp merged ssm_beta_alpha, GDN only): b at [h] and a at [n_v_heads + h] of each token
+ *                        row ([beta | alpha]); the host binds the merged projection to both a_in and b_in
+ *                        with equal offsets and strides.
+ * beta_scale multiplies the sigmoid update rate (OLMo Hybrid's linear_allow_neg_eigval, 2.0; 1.0 otherwise).
  * Outputs are dense: g_out[t*n_v_heads*G + h*G + d] with G = 1 (GDN) or D (KDA), beta_out[t*n_v_heads + h].
  * lb is read only by kda_mode 1 and 2.
  * Dispatch: 1-D, one work-item per (t, h, d): global = roundUp(n_tokens * n_v_heads * G, L), any local L.
@@ -186,6 +190,7 @@ NF_KERNEL void LLM_GDN_GatePrep(
     const int a_off,
     const int b_stride,
     const int b_off,
+    const float beta_scale,
     NF_GLOBAL const float* NF_RESTRICT a_in,
     NF_GLOBAL const float* NF_RESTRICT b_in,
     NF_GLOBAL const float* NF_RESTRICT dt_bias,
@@ -211,6 +216,9 @@ NF_KERNEL void LLM_GDN_GatePrep(
         const int r = h - kh * R;
         b_idx = kh * 2 * R + r;
         a_idx = b_idx + R;
+    } else if (layout == 2) {
+        b_idx = h;
+        a_idx = n_v_heads + h;
     } else {
         a_idx = kda_mode < 0 ? h : h * head_dim + d;
         b_idx = h;
@@ -229,6 +237,6 @@ NF_KERNEL void LLM_GDN_GatePrep(
     g_out[gid] = gv;
 
     if (d == 0) {
-        beta_out[th] = nf_sigmoid(b_in[(nf_i64)b_off + (nf_i64)t * b_stride + b_idx]);
+        beta_out[th] = beta_scale * nf_sigmoid(b_in[(nf_i64)b_off + (nf_i64)t * b_stride + b_idx]);
     }
 }

@@ -139,6 +139,54 @@ public class InputTransformLoaderTest {
     }
 
     @Test
+    public void bindsTheActivationPreScaleInEveryMode() throws IOException {
+        float[] pre = new float[128];
+        for (int i = 0; i < pre.length; i++) {
+            pre[i] = i % 2 == 0 ? 0.5f : 2f;
+        }
+        Model m = new Model().floats("blk.0.attn_q.input_pre_scale", pre);
+        for (ActivationQuant mode : ActivationQuant.values()) {
+            InputTransformLoader.Result r = m.load(mode);
+            InputTransform t = r.forward(Q);
+            assertArrayEquals(pre, t.preScale(), 0f);
+            assertTrue(t.hasPreScale());
+            assertFalse(t.isIdentity());
+            assertFalse(r.hadamardOnly());
+        }
+        assertTrue("an unrelated weight keeps the identity", r(m).forward(DOWN).isIdentity());
+    }
+
+    /** The pre-scale may hold one value per expert of a stacked tensor, in expert-major order. */
+    @Test
+    public void bindsAPerExpertActivationPreScale() throws IOException {
+        float[] pre = new float[4 * 128];
+        for (int i = 0; i < pre.length; i++) {
+            pre[i] = 1f + i % 3;
+        }
+        Model m = new Model().floats("blk.0.ffn_up_exps.input_pre_scale", pre);
+        InputTransform t = m.load(ActivationQuant.WEIGHT_ONLY).forward(EXPS);
+        assertArrayEquals(pre, t.preScale(), 0f);
+        assertEquals(4, t.preScaleSets(128));
+    }
+
+    @Test
+    public void rejectsABadActivationPreScale() {
+        new Model().floats("blk.0.attn_q.input_pre_scale", new float[64])
+                .expectFormat(ActivationQuant.WEIGHT_ONLY, "blk.0.attn_q.input_pre_scale");
+        new Model().floats("blk.0.ffn_up_exps.input_pre_scale", new float[100])
+                .expectFormat(ActivationQuant.WEIGHT_ONLY, "blk.0.ffn_up_exps.input_pre_scale");
+        Model shortRead = new Model().floats("blk.0.attn_q.input_pre_scale", new float[128]);
+        shortRead.floats.put("blk.0.attn_q.input_pre_scale", new float[127]);
+        shortRead.expectFormat(ActivationQuant.WEIGHT_ONLY, "blk.0.attn_q.input_pre_scale");
+        new Model().floats("blk.0.attn_k.input_pre_scale", new float[128])
+                .expectFormat(ActivationQuant.WEIGHT_ONLY, "blk.0.attn_k.weight");
+    }
+
+    private static InputTransformLoader.Result r(Model m) throws IOException {
+        return m.load(ActivationQuant.WEIGHT_ONLY);
+    }
+
+    @Test
     public void bindsTheInputPermutationInEveryMode() throws IOException {
         int[] perm = reversed(128);
         Model m = new Model().prism().ints("blk.0.attn_q.input_perm", perm);
@@ -335,10 +383,30 @@ public class InputTransformLoaderTest {
     }
 
     @Test
-    public void cpuWeightsRefuseAnInputPermutation() throws IOException {
+    public void cpuWeightsBindTheInputPermutation() throws IOException {
         withSource(fileModel(), (source, kv, catalog) -> {
-            GgufFormatException e = assertThrows(GgufFormatException.class, () -> CpuWeights.open(source));
-            assertTrue(e.getMessage(), e.getMessage().contains("input permutation"));
+            try (CpuWeights weights = CpuWeights.open(source)) {
+                InputTransform t = weights.of(weights.get("blk.0.attn_q.weight")).transform();
+                assertArrayEquals(new int[]{7, 6, 5, 4, 3, 2, 1, 0}, t.perm());
+                assertNull(t.actQuant());
+            }
+        });
+    }
+
+    @Test
+    public void cpuWeightsRefuseAnInputPermutationOfAnExpertTensor() throws IOException {
+        GgufTestWriter w = new GgufTestWriter()
+                .architecture("llama")
+                .tensorRandom("blk.0.ffn_up_exps.weight", GGMLType.F32, 5L, -1f, 1f, 8, 4, 2)
+                .tensor("blk.0.ffn_up_exps.input_perm", GGMLType.I32, new long[]{8},
+                        i32Bytes(7, 6, 5, 4, 3, 2, 1, 0));
+        withSource(w, (source, kv, catalog) -> {
+            try (CpuWeights weights = CpuWeights.open(source)) {
+                GgufFormatException e = assertThrows(GgufFormatException.class,
+                        () -> weights.get("blk.0.ffn_up_exps.weight"));
+                assertTrue(e.getMessage(), e.getMessage().contains("input permutation")
+                        && e.getMessage().contains("blk.0.ffn_up_exps.weight"));
+            }
         });
     }
 }

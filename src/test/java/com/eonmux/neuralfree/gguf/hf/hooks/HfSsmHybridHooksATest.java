@@ -111,6 +111,20 @@ public class HfSsmHybridHooksATest {
     }
 
     @Test
+    public void nemotronHIsMoeWhenTheExpertCountKeyIsPresentAtTheRootOrInTheTextConfig() {
+        // has_moe_params = "num_experts_per_tok" in {**hparams, **text_config} (nemotron.py:449-451): presence,
+        // not truthiness
+        HfConfig dense = HfLlamaHooksTest.config("{'architectures': ['NemotronHForCausalLM']}");
+        assertEquals(Arch.NEMOTRON_H, HfSsmHybridHooksA.nemotronHArch(dense, null));
+        HfConfig nested = HfLlamaHooksTest.config("{'architectures': ['NemotronHForCausalLM'],"
+                + " 'text_config': {'num_experts_per_tok': 2}}");
+        assertEquals(Arch.NEMOTRON_H_MOE, HfSsmHybridHooksA.nemotronHArch(nested, null));
+        HfConfig nullValued = HfLlamaHooksTest.config("{'architectures': ['NemotronHForCausalLM'],"
+                + " 'num_experts_per_tok': null}");
+        assertEquals(Arch.NEMOTRON_H_MOE, HfSsmHybridHooksA.nemotronHArch(nullValued, null));
+    }
+
+    @Test
     public void nemotronHFixesTheLayerCountFromThePatternAndFoldsTheMtpBlock() throws IOException {
         String json = "{'architectures': ['NemotronHForCausalLM'], " + GRANITE_BASE.replace("'vocab_size': 16",
                 "'vocab_size': 16") + ", 'layers_block_type': ['mamba', 'attention'], 'num_hidden_layers': 7,"
@@ -135,6 +149,49 @@ public class HfSsmHybridHooksATest {
         Sink out = plan(context(fixed, entry("NemotronHForCausalLM"), index));
         assertArrayEquals(new long[]{4, 3}, out.get("blk.0.ssm_conv1d.weight").shape());
         assertArrayEquals(new long[]{2, 3, 4}, out.get("blk.0.ffn_down_exps.weight").shape());
+    }
+
+    @Test
+    public void aDenseNemotronHFoldsTheAttentionOnlyMtpBlock() throws IOException {
+        // vLLM's dense Nemotron-H MTP head is one attention layer (mtp_hybrid_override_pattern "*"), so the folded
+        // block is in the attention list and not in the MLP one
+        String json = "{'architectures': ['NemotronHForCausalLM'], " + GRANITE_BASE
+                + ", 'hidden_size': 8, 'd_head': 8, 'layer_norm_eps': 1e-05,"
+                + " 'layers_block_type': ['attention', 'mamba'], 'num_hidden_layers': 2,"
+                + " 'num_nextn_predict_layers': 1}";
+        HfConfig cfg = HfLlamaHooksTest.config(json);
+        HfConfig fixed = HfSsmHybridHooksA.nemotronHFixup(cfg);
+        assertEquals(Arch.NEMOTRON_H, HfSsmHybridHooksA.nemotronHArch(fixed, null));
+        assertTrue(HfSsmHybridHooksA.nemotronMtpFolded(fixed));
+
+        ckpt = new Checkpoint(tmp.getRoot().toPath());
+        HfTensorIndex index = ckpt
+                .f32("mtp.layers.0.eh_proj.weight", new long[]{16, 8}, seq(128))
+                .f32("mtp.layers.0.norm.weight", new long[]{8}, seq(8))
+                .f32("mtp.layers.0.final_layernorm.weight", new long[]{8}, seq(8))
+                .f32("mtp.layers.0.mixer.q_proj.weight", new long[]{32, 8}, seq(256)).index();
+        HfLoadContext loaded = context(fixed, entry("NemotronHForCausalLM"), index);
+        // the assembler applies the entry's indexed block count once the checkpoint is indexed
+        HfLoadContext ctx = loaded.withBlockCount(HfSsmHybridHooksA.nemotronHBlockCount(loaded));
+        assertEquals(3, HfSsmHybridHooksA.nemotronHBlockCount(ctx));
+
+        HfMetadataBuilder kv = new HfMetadataBuilder("nemotron_h");
+        entry("NemotronHForCausalLM").meta().apply(ctx, kv, null);
+        HfMetadata m = kv.build();
+        assertEquals(1, ((Number) m.get("nemotron_h.nextn_predict_layers")).intValue());
+        assertEquals(Arrays.asList(0, 0, 0), m.get("nemotron_h.feed_forward_length"));
+        List<?> kvHeads = (List<?>) m.get("nemotron_h.attention.head_count_kv");
+        assertEquals(3, kvHeads.size());
+        assertTrue("the attention layer keeps its KV heads", ((Number) kvHeads.get(0)).intValue() > 0);
+        assertTrue("the mamba layer has none", ((Number) kvHeads.get(1)).intValue() == 0);
+        assertTrue("the folded MTP block is an attention layer", ((Number) kvHeads.get(2)).intValue() > 0);
+
+        Sink out = plan(ctx);
+        assertTrue(out.added.containsKey("blk.2.nextn.eh_proj.weight"));
+        assertTrue(out.added.containsKey("blk.2.attn_norm.weight"));
+        assertTrue(out.added.containsKey("blk.2.attn_q.weight"));
+        // the single attention layer's end norm is the MTP head norm
+        assertTrue(out.added.containsKey("blk.2.nextn.shared_head_norm.weight"));
     }
 
     @Test

@@ -8,6 +8,7 @@ import com.eonmux.neuralfree.nn.Parameter;
 import com.eonmux.neuralfree.nn.Sequential;
 import com.eonmux.neuralfree.nn.layers.Conv2d;
 import com.eonmux.neuralfree.nn.norm.BatchNorm2d;
+import com.eonmux.neuralfree.tensor.DType;
 import com.eonmux.neuralfree.tensor.GpuOptimizerOps;
 import com.eonmux.neuralfree.tensor.Tensor;
 import com.eonmux.neuralfree.tensor.TensorOps;
@@ -28,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import static org.junit.Assert.assertEquals;
@@ -37,11 +39,15 @@ import static org.junit.Assert.assertTrue;
 /**
  * Finite-difference gradient checks of the vision modules: for every module class with
  * parameters, the gradients of {@code sum(output * probe)} with respect to the module's input
- * ({@link GradientCheckUtil#gradCheck}) and to its parameters ({@link GradientCheckUtil#gradCheckParameters}) match
- * central differences with step 1e-3 within 1e-2, on the host reference backend and on every available GPU API
- * ({@link TrainParity}). The probe is a fixed tensor in [-1, 1], so every output element carries its own weight. The
- * modules run in training mode, so batch normalization normalizes with the batch statistics and its full backward is
- * checked; the parameter check restores the running statistics after every evaluation.
+ * ({@link GradientCheckUtil#gradCheckFloat64}) and to its parameters
+ * ({@link GradientCheckUtil#gradCheckParametersFloat64}) match central differences with step 1e-3 within 1e-2, on
+ * the host reference backend and on every available GPU API ({@link TrainParity}). The analytical gradient is the
+ * FLOAT32 backward pass on the backend under test; the central differences evaluate a FLOAT64 reference module of the
+ * same architecture holding the module's state, on a host backend, so they are free of float32 rounding noise, which
+ * for ResNet-18's many training-mode batch norms over 1x1 maps exceeds the tolerance. The probe is a fixed tensor in
+ * [-1, 1], so every output element carries its own weight. The modules run in training mode, so batch normalization
+ * normalizes with the batch statistics and its full backward is checked; the parameter check restores the running
+ * statistics after every evaluation.
  *
  * <p><b>Values.</b> Every weight of rank 2 or more is uniform in {@code +-1/sqrt(fanIn)} and every other non-norm
  * parameter uniform in [-0.1, 0.1], from seeds; inputs are uniform in [-1, 1] unless a test builds them.</p>
@@ -70,7 +76,7 @@ import static org.junit.Assert.assertTrue;
 public class VisionGradCheckTest {
 
     private static final long SEED = 5151L;
-    private static final float EPSILON = 1e-3f;
+    private static final double EPSILON = 1e-3;
     private static final float TOLERANCE = 1e-2f;
     private static final int MAX_ELEMENTS = 3;
     private static final float GAMMA_MIN = 0.2f;
@@ -94,6 +100,8 @@ public class VisionGradCheckTest {
     private final List<AutoCloseable> owned = new ArrayList<>();
     private TrainParity.Session session;
     private ComputeBackend backend;
+    /** The host backend of the FLOAT64 reference modules and tensors. */
+    private ComputeBackend referenceBackend;
 
     public VisionGradCheckTest(String name, TrainParity.Api api) {
         this.name = name;
@@ -103,6 +111,7 @@ public class VisionGradCheckTest {
     @Before
     public void setUp() {
         ComputationGraph.setGradEnabled(true);
+        referenceBackend = TrainParity.hostBackend();
         if (api == null) {
             backend = TrainParity.hostBackend();
         } else {
@@ -126,6 +135,9 @@ public class VisionGradCheckTest {
             }
         }
         owned.clear();
+        if (referenceBackend != null) {
+            referenceBackend.close();
+        }
         if (session != null) {
             session.close();
         } else if (backend != null) {
@@ -141,22 +153,28 @@ public class VisionGradCheckTest {
     /** An identity shortcut (the raw input reaches the final ReLU), then a strided projection shortcut. */
     @Test
     public void residualBlock() {
-        ResidualBlock identity = keep(new ResidualBlock(4, 4));
-        identity.initialize(backend, new Random(SEED));
+        Function<ComputeBackend, Module> identityBlock = b -> seeded(b, new ResidualBlock(4, 4),
+            ResidualBlock::initialize);
+        Module identity = keep(identityBlock.apply(backend));
         prepare(identity, 2 * 4 * 4, INPUT_BOUND);
-        checkModule("ResidualBlock identity", identity, tensor(11, 2, 4, 4, 4), 12, 2, 4, 4, 4);
+        checkModule("ResidualBlock identity", identity, identityBlock, tensor(11, 2, 4, 4, 4), 12, 2, 4, 4, 4);
 
-        ResidualBlock projected = keep(new ResidualBlock(4, 6, new int[]{2, 2}));
-        projected.initialize(backend, new Random(SEED));
+        Function<ComputeBackend, Module> projectionBlock = b -> seeded(b,
+            new ResidualBlock(4, 6, new int[]{2, 2}),
+            ResidualBlock::initialize);
+        Module projected = keep(projectionBlock.apply(backend));
         prepare(projected, 2 * 2 * 2, 0f);
-        checkModule("ResidualBlock projection", projected, tensor(13, 2, 4, 4, 4), 14, 2, 6, 2, 2);
+        checkModule("ResidualBlock projection", projected, projectionBlock, tensor(13, 2, 4, 4, 4), 14, 2, 6, 2,
+            2);
     }
 
     /** A projection with squeeze-and-excitation, then a strided projection without it. */
     @Test
     public void bottleneckBlock() {
-        BottleneckBlock squeezed = keep(new BottleneckBlock(4, 8, 8, new int[]{1, 1}, true, 4));
-        squeezed.initialize(backend, new Random(SEED));
+        Function<ComputeBackend, Module> squeezeBlock = b -> seeded(b,
+            new BottleneckBlock(4, 8, 8, new int[]{1, 1}, true, 4),
+            BottleneckBlock::initialize);
+        Module squeezed = keep(squeezeBlock.apply(backend));
         prepare(squeezed, 2 * 4 * 4, 0f);
         Parameter fc1 = squeezed.getParameter("se_fc1.weight");
         assertNotNull("squeeze-and-excitation first layer", fc1);
@@ -173,21 +191,28 @@ public class VisionGradCheckTest {
         Parameter fc1Bias = squeezed.getParameter("se_fc1.bias");
         assertNotNull("squeeze-and-excitation first bias", fc1Bias);
         store(fc1Bias, TrainParity.uniform(22, rows, -0.05f, 0.05f));
-        checkModule("BottleneckBlock squeeze-excitation", squeezed, tensor(23, 2, 4, 4, 4), 24, 2, 8, 4, 4);
+        checkModule("BottleneckBlock squeeze-excitation", squeezed, squeezeBlock, tensor(23, 2, 4, 4, 4), 24, 2, 8,
+            4, 4);
 
-        BottleneckBlock strided = keep(new BottleneckBlock(8, 4, 8, new int[]{2, 2}));
-        strided.initialize(backend, new Random(SEED));
+        Function<ComputeBackend, Module> stridedBlock = b -> seeded(b,
+            new BottleneckBlock(8, 4, 8, new int[]{2, 2}),
+            BottleneckBlock::initialize);
+        Module strided = keep(stridedBlock.apply(backend));
         prepare(strided, 2 * 4 * 4, 0f);
-        checkModule("BottleneckBlock strided", strided, tensor(25, 2, 8, 4, 4), 26, 2, 8, 2, 2);
+        checkModule("BottleneckBlock strided", strided, stridedBlock, tensor(25, 2, 8, 4, 4), 26, 2, 8, 2, 2);
     }
 
     @Test
     public void depthwiseSeparableConv() {
-        DepthwiseSeparableConv conv = keep(new DepthwiseSeparableConv(4, 6, new int[]{3, 3}, new int[]{1, 1},
-            new int[]{1, 1}, true, true));
-        conv.initialize(backend);
+        Function<ComputeBackend, Module> build = b -> {
+            DepthwiseSeparableConv m = new DepthwiseSeparableConv(4, 6, new int[]{3, 3}, new int[]{1, 1},
+                new int[]{1, 1}, true, true);
+            m.initialize(b);
+            return m;
+        };
+        Module conv = keep(build.apply(backend));
         prepare(conv, 2 * 4 * 4, 0f);
-        checkModule("DepthwiseSeparableConv", conv, tensor(31, 2, 4, 4, 4), 32, 2, 6, 4, 4);
+        checkModule("DepthwiseSeparableConv", conv, build, tensor(31, 2, 4, 4, 4), 32, 2, 6, 4, 4);
     }
 
     // ------------------------------------------------------------------ networks
@@ -206,8 +231,8 @@ public class VisionGradCheckTest {
      */
     @Test
     public void resNet() {
-        ResNet resnet = keep(ResNet.resnet18(5));
-        resnet.initialize(backend, new Random(SEED));
+        Function<ComputeBackend, Module> build = b -> seeded(b, ResNet.resnet18(5), ResNet::initialize);
+        Module resnet = keep(build.apply(backend));
         prepare(resnet, 4 * 4 * 4, 0f);
         Parameter stem = resnet.getParameter("conv1.weight");
         store(stem, centreTapCopy(64, 3, 7, (o, i) -> i == o % 3));
@@ -234,7 +259,11 @@ public class VisionGradCheckTest {
             assertNotNull("ResNet parameter " + parameter, p);
             checked.add(p);
         }
-        checkParameters("ResNet-18", resnet, checked, 2, () -> probeSum(resnet.forward(input), probe));
+        Module reference = float64Reference(resnet, build);
+        Tensor input64 = float64(input);
+        Tensor probe64 = float64(probe);
+        checkParameters("ResNet-18", resnet, checked, 2, () -> probeSum(resnet.forward(input), probe), reference,
+            () -> probeSum(reference.forward(input64), probe64));
     }
 
     /**
@@ -245,8 +274,9 @@ public class VisionGradCheckTest {
      */
     @Test
     public void uNet() {
-        UNet unet = keep(new UNet(1, 2, new int[]{2, 4}, true));
-        unet.initialize(backend, new Random(SEED));
+        Function<ComputeBackend, Module> build = b -> seeded(b, new UNet(1, 2, new int[]{2, 4}, true),
+            UNet::initialize);
+        UNet unet = (UNet) keep(build.apply(backend));
         prepare(unet, 2 * 9 * 9, 0f);
         List<Conv2d> firstBlock = new ArrayList<>();
         for (Module layer : ((Sequential) unet.encoderBlocks().get(0)).layers()) {
@@ -269,26 +299,44 @@ public class VisionGradCheckTest {
                 }
             }
         }
-        checkModule("UNet", unet, keep(upload(x, 2, 1, 9, 9)), 52, 2, 2, 8, 8);
+        checkModule("UNet", unet, build, keep(upload(x, 2, 1, 9, 9)), 52, 2, 2, 8, 8);
     }
 
     // ------------------------------------------------------------------ checks
 
-    /** The input check and the check of every parameter of {@code module}, for an output of {@code outDims}. */
-    private void checkModule(String what, Module module, Tensor input, long probeSeed, int... outDims) {
+    /**
+     * The input check and the check of every parameter of {@code module}, for an output of {@code outDims}, against
+     * a FLOAT64 reference that {@code build} constructs on the reference backend.
+     */
+    private void checkModule(String what, Module module, Function<ComputeBackend, Module> build, Tensor input,
+                             long probeSeed, int... outDims) {
         Tensor probe = tensor(probeSeed, outDims);
-        checkInputs(what, module, in -> probeSum(module.forward(in.get(0)), probe), input);
-        checkParameters(what, module, module.parameters(), MAX_ELEMENTS, () -> probeSum(module.forward(input), probe));
+        Tensor input64 = float64(input);
+        Tensor probe64 = float64(probe);
+        Module reference = float64Reference(module, build);
+        checkInputs(what, module, in -> probeSum(module.forward(in.get(0)), probe),
+            in -> {
+                try (Tensor x = onReferenceBackend(in.get(0))) {
+                    return probeSum(reference.forward(x), probe64);
+                }
+            }, input);
+        reference.loadStateDict(module.stateDict(), true);
+        checkParameters(what, module, module.parameters(), MAX_ELEMENTS, () -> probeSum(module.forward(input), probe),
+            reference, () -> probeSum(reference.forward(input64), probe64));
     }
 
-    /** The input gradients of {@code fn} at {@code inputs}, with {@code module}'s parameters frozen meanwhile. */
-    private void checkInputs(String what, Module module, GradientCheckUtil.TensorFunction fn, Tensor... inputs) {
+    /**
+     * The input gradients of {@code fn} at {@code inputs} against {@code reference}, with {@code module}'s
+     * parameters frozen meanwhile.
+     */
+    private void checkInputs(String what, Module module, GradientCheckUtil.TensorFunction fn,
+                             GradientCheckUtil.TensorFunction reference, Tensor... inputs) {
         ComputationGraph graph = ComputationGraph.current();
         int before = graph.size();
         GradientCheckUtil.GradientCheckResult result;
         module.setRequiresGrad(false);
         try {
-            result = GradientCheckUtil.gradCheck(fn, Arrays.asList(inputs), EPSILON, TOLERANCE);
+            result = GradientCheckUtil.gradCheckFloat64(fn, reference, Arrays.asList(inputs), EPSILON, TOLERANCE);
         } finally {
             module.setRequiresGrad(true);
         }
@@ -296,13 +344,16 @@ public class VisionGradCheckTest {
         assertEquals(name + " " + what + " input check leaves the graph as it was", before, graph.size());
     }
 
-    /** The gradients of {@code params} of {@code module} for {@code loss}, at most {@code maxElements} each. */
+    /**
+     * The gradients of {@code params} of {@code module} for {@code loss}, at most {@code maxElements} each, against
+     * {@code referenceLoss} of the FLOAT64 {@code reference}.
+     */
     private void checkParameters(String what, Module module, List<Parameter> params, int maxElements,
-                                 Supplier<Tensor> loss) {
+                                 Supplier<Tensor> loss, Module reference, Supplier<Tensor> referenceLoss) {
         ComputationGraph graph = ComputationGraph.current();
         int before = graph.size();
-        GradientCheckUtil.GradientCheckResult result = GradientCheckUtil.gradCheckParameters(loss, module, params,
-            EPSILON, TOLERANCE, maxElements);
+        GradientCheckUtil.GradientCheckResult result = GradientCheckUtil.gradCheckParametersFloat64(loss, module,
+            params, referenceLoss, reference, EPSILON, TOLERANCE, maxElements);
         assertTrue(name + " " + what + " parameter gradients: " + result, result.passed());
         assertEquals(name + " " + what + " parameter check leaves the graph as it was", before, graph.size());
     }
@@ -316,6 +367,24 @@ public class VisionGradCheckTest {
     }
 
     // ------------------------------------------------------------------ setup
+
+    /** {@code module} after {@code init} initialized it on {@code on} from {@link #SEED}. */
+    private static <M extends Module> M seeded(ComputeBackend on, M module, SeededInit<M> init) {
+        init.initialize(module, on, new Random(SEED));
+        return module;
+    }
+
+    /**
+     * A FLOAT64 module of {@code module}'s architecture ({@code build}) on the reference backend holding its state, in
+     * training mode, closed after the test.
+     */
+    private Module float64Reference(Module module, Function<ComputeBackend, Module> build) {
+        Module reference = keep(build.apply(referenceBackend));
+        reference.loadStateDict(module.stateDict(), true);
+        reference.to(DType.FLOAT64);
+        reference.train();
+        return reference;
+    }
 
     /**
      * Puts {@code module} in training mode, seeds every parameter and applies the batch-norm rule of the class
@@ -385,6 +454,20 @@ public class VisionGradCheckTest {
         return keep(upload(TrainParity.uniform(seed, n, -1f, 1f), dims));
     }
 
+    /** A FLOAT64 copy of the FLOAT32 {@code t} on the reference backend, closed after the test. */
+    private Tensor float64(Tensor t) {
+        try (Tensor wide = t.to(DType.FLOAT64)) {
+            return keep(onReferenceBackend(wide));
+        }
+    }
+
+    /** A new copy of the FLOAT64 {@code t} on the reference backend. */
+    private Tensor onReferenceBackend(Tensor t) {
+        try (Tensor flat = Tensor.fromArray(referenceBackend, t.toDoubleArray())) {
+            return flat.reshape(t.shape());
+        }
+    }
+
     /** A new tensor of {@code dims} holding {@code data} on the backend. */
     private Tensor upload(float[] data, int... dims) {
         try (Tensor flat = Tensor.fromArray(backend, data)) {
@@ -395,6 +478,11 @@ public class VisionGradCheckTest {
     private <T extends AutoCloseable> T keep(T resource) {
         owned.add(resource);
         return resource;
+    }
+
+    /** A module's seeded initializer, such as {@code ResidualBlock::initialize}. */
+    private interface SeededInit<M extends Module> {
+        void initialize(M module, ComputeBackend backend, Random random);
     }
 
     /** Which {@code (output, input)} channel pairs a centre-tap copy connects. */

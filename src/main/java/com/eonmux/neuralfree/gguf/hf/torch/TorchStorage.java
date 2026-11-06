@@ -10,11 +10,11 @@ import java.util.Objects;
 
 /**
  * One storage of a torch checkpoint as the pickle's persistent ids reference it: the storage's dtype (its storage
- * class name, {@code torch.FloatStorage} and friends), its {@code archive/data/<k>} zip entry, its location, and
- * positional reads of its bytes. Nothing is executed and nothing is trusted from the pickle beyond the class name
- * (the closed dtype set below), the key (a child name of {@code archive/data}) and the location ({@code cpu}).
- * Relinquishing a storage is the checkpoint's {@code close}; a storage itself is immutable and thread-safe while
- * the checkpoint is open.
+ * class name, {@code torch.FloatStorage} and friends, or {@code torch.storage.UntypedStorage} for a view that names
+ * its dtype itself), its {@code <archive>/data/<k>} zip entry, its location, and positional reads of its bytes.
+ * Nothing is executed and nothing is trusted from the pickle beyond the class name (the closed dtype set below), the
+ * key (a child name of {@code <archive>/data}) and the location ({@code cpu}). Relinquishing a storage is the
+ * checkpoint's {@code close}; a storage itself is immutable and thread-safe while the checkpoint is open.
  */
 public final class TorchStorage {
 
@@ -38,6 +38,11 @@ public final class TorchStorage {
     /** The only location a storage may live on; a downloaded checkpoint read here keeps its weights addressable. */
     public static final String READABLE_LOCATION = "cpu";
 
+    /** The untyped storage class; a {@code _rebuild_tensor_v3} view names its dtype. */
+    public static final String UNTYPED = "torch.storage.UntypedStorage";
+    /** Default archive directory of a container whose pickle is {@code archive/data.pkl}. */
+    public static final String ARCHIVE = "archive/";
+
     private final TorchZipReader zip;
     private final TorchZipReader.Entry entry;
     private final String typeName;
@@ -59,7 +64,7 @@ public final class TorchStorage {
         this.deflatedBytes = deflatedBytes;
     }
 
-    /** The safetensors dtype of the storage's element bytes. */
+    /** The safetensors dtype of the storage's element bytes, or null for an untyped storage. */
     public StDType dtype() {
         return dtype;
     }
@@ -84,9 +89,9 @@ public final class TorchStorage {
         return entry;
     }
 
-    /** The saving torch version's element byte count — {@link StDType#bits()}/{@code 8}. */
+    /** The saving torch version's element byte count, or 0 for an untyped storage. */
     public int elementBytes() {
-        return dtype.bits() / 8;
+        return dtype == null ? 0 : dtype.bits() / 8;
     }
 
     /** The storage's byte length. */
@@ -141,10 +146,12 @@ public final class TorchStorage {
      *                                  accepted set
      * @throws IOException              when the storage's entry cannot be read
      */
-    static TorchStorage of(TorchZipReader zip, String typeName, String key, String location) throws IOException {
+    static TorchStorage of(TorchZipReader zip, String typeName, String key, String location, String dataPrefix)
+            throws IOException {
         Objects.requireNonNull(zip);
-        StDType dtype = typeName == null ? null : TYPES.get(typeName);
-        if (dtype == null) {
+        boolean untyped = UNTYPED.equals(typeName);
+        StDType dtype = untyped ? null : typeName == null ? null : TYPES.get(typeName);
+        if (!untyped && dtype == null) {
             throw new IllegalArgumentException("Invalid PyTorch checkpoint '" + zip.path() + "': the pickle"
                     + " references storage type '" + typeName + "', which is not one of torch's plain storage types");
         }
@@ -158,24 +165,25 @@ public final class TorchStorage {
                     || c == '-' || c == '_' || c == '.';
             if (!ok) {
                 throw new IllegalArgumentException("Invalid PyTorch checkpoint '" + zip.path() + "': storage key '"
-                        + key + "' holds the character '" + c + "', so its entry path would leave 'archive/data'");
+                        + key + "' holds the character '" + c + "', so its entry path would leave '"
+                        + dataPrefix + "data'");
             }
         }
         if (key.startsWith(".") || key.endsWith(".")) {
             throw new IllegalArgumentException("Invalid PyTorch checkpoint '" + zip.path() + "': storage key '"
-                    + key + "' names no entry inside 'archive/data'");
+                    + key + "' names no entry inside '" + dataPrefix + "data'");
         }
         if (!READABLE_LOCATION.equals(location)) {
             throw new IllegalArgumentException("Invalid PyTorch checkpoint '" + zip.path() + "': storage '" + key
                     + "' of '" + typeName + "' is on '" + location + "'; NeuralFree reads " + READABLE_LOCATION
                     + " storages");
         }
-        TorchZipReader.Entry entry = zip.entry(dataEntryName(key));
+        TorchZipReader.Entry entry = zip.entry(dataEntryName(dataPrefix, key));
         if (entry == null || entry.directory()) {
             throw new IllegalArgumentException("Invalid PyTorch checkpoint '" + zip.path() + "': the pickle"
-                    + " references storage '" + key + "', which is not an entry of 'archive/data'");
+                    + " references storage '" + key + "', which is not an entry of '" + dataPrefix + "data'");
         }
-        if (entry.size() % elementBytes(dtype) != 0) {
+        if (!untyped && entry.size() % elementBytes(dtype) != 0) {
             throw new IllegalArgumentException("Invalid PyTorch checkpoint '" + zip.path() + "': storage '" + key
                     + "' has " + entry.size() + " bytes, not a whole number of " + dtype.headerName() + " elements");
         }
@@ -192,9 +200,9 @@ public final class TorchStorage {
         return dtype.bits() / 8;
     }
 
-    /** The zip entry name of a storage key: {@code archive/data/} + key, as torch writes the entry. */
-    public static String dataEntryName(String key) {
-        return "archive/data/" + key;
+    /** The zip entry name of a storage key: {@code <prefix>data/} + key, as torch writes the entry. */
+    public static String dataEntryName(String dataPrefix, String key) {
+        return dataPrefix + "data/" + key;
     }
 
     @Override

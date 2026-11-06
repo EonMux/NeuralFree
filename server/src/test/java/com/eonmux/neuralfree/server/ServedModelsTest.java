@@ -55,7 +55,7 @@ class ServedModelsTest {
 
     @Test
     void everyNameIsListedAndTheRequestedOneIsEchoed() {
-        JsonView models = view(openAi.models().getEntity());
+        JsonView models = view(openAi.models(null).getEntity());
         assertEquals("alpha", at(models, "data", 0).str("id"));
         assertEquals("beta", at(models, "data", 1).str("id"));
         assertEquals(service.modelPath(), at(models, "data", 1).str("root"));

@@ -1,0 +1,22 @@
+{#- llama.cpp llama2-sys-bos chat template (src/llama-chat.cpp:299-335): no BOS and no generation prompt. -#}
+{%- set support_system = true -%}
+{%- set bos_inside_history = true -%}
+{%- set strip_message = false -%}
+{%- set ns = namespace(inside_turn=true) -%}
+{{- '[INST] ' -}}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if strip_message -%}{%- set content = content | trim(' \t\n\v\f\r') -%}{%- endif -%}
+    {%- if not ns.inside_turn -%}
+        {%- set ns.inside_turn = true -%}
+        {{- '<s>[INST] ' if bos_inside_history else '[INST] ' -}}
+    {%- endif -%}
+    {%- if message['role'] == 'system' -%}
+        {{- '<<SYS>>\n' ~ content ~ '\n<</SYS>>\n\n' if support_system else content ~ '\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- content ~ ' [/INST]' -}}
+    {%- else -%}
+        {{- content ~ '</s>' -}}
+        {%- set ns.inside_turn = false -%}
+    {%- endif -%}
+{%- endfor -%}

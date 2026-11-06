@@ -4,7 +4,10 @@ import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig.DraftType;
 import com.eonmux.neuralfree.gguf.hparams.GgufKv;
+import com.eonmux.neuralfree.gguf.memory.ContextFitter;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
+import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
+import com.eonmux.neuralfree.gguf.memory.MemoryPlanner;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.resolve.ModelSpecBuilder;
@@ -96,6 +99,18 @@ public class DraftCompanionPlacementTest {
     }
 
     @Test
+    public void theDraftModelCompanionCountsStepTokensAtTheDraftUbatch() throws IOException {
+        String draft = draftFile(2 * N_EMBD);
+        long perToken = LLMModelFactory.scratchBytesPerToken(draftSpec(2 * N_EMBD));
+        ContextFitter.Companion plain = companion(draft, 0);
+        ContextFitter.Companion stepped = companion(draft, 64);
+        MemoryPlan plan = MemoryPlanner.planForContext(target(), MemoryConfig.defaults(), 2048);
+        assertEquals(512, plan.ubatch());
+        assertEquals("the scratch follows the draft ubatch, the caches stay at the plan's",
+                perToken * (plan.ubatch() - 64), plain.bytes(plan) - stepped.bytes(plan));
+    }
+
+    @Test
     public void theTargetsOwnFileReservesWhatItsRouteReads() throws IOException {
         String own = draftFile(N_EMBD);
         List<Predicate<GGUFTensorInfo>> mtp = measured(own, DraftType.AUTO);
@@ -107,5 +122,18 @@ public class DraftCompanionPlacementTest {
         assertEquals(1, simple.size());
         assertTrue(simple.get(0).test(t(TRUNK_TENSOR)));
         assertFalse(simple.get(0).test(t(NEXTN_TENSOR)));
+    }
+
+    /** The companion of a separate-model draft file at the given draft ubatch (0 = the target plan's ubatch). */
+    private static ContextFitter.Companion companion(String draft, int draftUbatch) {
+        EngineConfig cfg = EngineConfig.builder().draftModelPath(draft).draftType(DraftType.MODEL)
+                .memory(MemoryConfig.builder().draftUbatch(draftUbatch).build()).build();
+        return LLMModelFactory.draftCompanion(cfg, target(), false, (dp, placed) -> 0L);
+    }
+
+    /** The spec of a draft file of the fixture family with width {@code nEmbd}. */
+    private static ModelSpec draftSpec(int nEmbd) {
+        return ModelSpecBuilder.build(GgufKv.ofMap(NemotronNextnFixture.metadata(nEmbd, TRUNK, N_VOCAB)),
+                TensorCatalog.of(ARCH, NemotronNextnFixture.tensors(nEmbd, TRUNK, N_VOCAB)), MemoryConfig.defaults());
     }
 }

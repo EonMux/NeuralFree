@@ -13,8 +13,9 @@ public interface DraftProbs {
      * the proposed token's id is the probability the drafter assigned it. Called between that draft call and the
      * verification of its proposal.
      *
-     * @return a probability row over the target's vocabulary (no NaN, no negatives); the drafted token's entry must
-     *         be positive
+     * @return a probability row over the target's vocabulary (no NaN, no negatives) whose drafted token's entry is
+     *         positive, or null when the token was proposed deterministically (a greedy draw), which the verifier
+     *         treats as one-hot. A watermarked draft draws every proposal and reports each one.
      * @throws IllegalStateException when the drafter has no proposal at {@code position}
      */
     float[] draftProbs(int position);

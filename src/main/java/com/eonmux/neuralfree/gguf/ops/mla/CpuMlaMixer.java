@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.gguf.cpu.block.CpuMixer;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuScratch;
+import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
@@ -13,6 +14,7 @@ import com.eonmux.neuralfree.gguf.memory.KvLayout;
 import com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.HeapModelMemory;
 import com.eonmux.neuralfree.gguf.memory.cpu.KvAccessor;
+import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnExtMath;
 import com.eonmux.neuralfree.gguf.ops.attn.CpuAttentionCore;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
@@ -23,12 +25,12 @@ import com.eonmux.neuralfree.gguf.ops.rope.RopeMath;
 import com.eonmux.neuralfree.gguf.ops.rope.RopePositions;
 import com.eonmux.neuralfree.gguf.quant.CpuHadamard;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
+import com.eonmux.neuralfree.gguf.quant.TapProduct;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
-import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 
 import java.util.Objects;
 import java.util.function.IntUnaryOperator;
@@ -83,12 +85,17 @@ public final class CpuMlaMixer implements CpuMixer {
     private AttnGateKind gateKind;
     private AttentionSpec.Temperature temperature;
     private CpuAttentionCore.Params params;
+    /** {@link #params} without the causal mask, for the steps the context flags non-causal (a media chunk). */
+    private CpuAttentionCore.Params nonCausalParams;
+    private CpuForwardContext ctx;
     private RopeSpec rope;
     private float[] freqFactors;
     private RopeFreqTable ropeTable;
     private String shiftBlocker;
     private HadamardSpec rotKSpec;
     private HadamardSpec rotVSpec;
+    /** The memory's current paged step, or null on the contiguous path ({@code CpuMemory.currentPagedStep}). */
+    private PagedStep pagedStep;
 
     private CpuTensorRef wq;
     private CpuTensorRef wqA;
@@ -141,6 +148,7 @@ public final class CpuMlaMixer implements CpuMixer {
             throw new IllegalStateException("layer " + layer.il() + ": the MLA mixer needs the model's KV memory");
         }
         il = layer.il();
+        this.ctx = ctx;
         mv = ctx.matVec();
         scratch = ctx.scratch();
         memory = ctx.memory();
@@ -168,6 +176,7 @@ public final class CpuMlaMixer implements CpuMixer {
             pb.sinks(sinks);
         }
         params = pb.build();
+        nonCausalParams = params.nonCausal();
         bindDeltas(ctx.projectionDeltas(), layer);
         bindRope(ctx.weights(), layer);
         reserveTemps(layer);
@@ -291,7 +300,7 @@ public final class CpuMlaMixer implements CpuMixer {
         if (wkvB != null) {
             kvbDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_KV_B), wkvB, mv);
         } else {
-            deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_KV_B), GpuMlaMixer.LATENT_KV_B_REFUSAL);
+            deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_KV_B), GpuMlaMixer.ABSORBED_KV_B_REFUSAL);
         }
         outDeltas = deltas.serve(layer, TensorNames.weight(TensorNames.ATTN_OUT), wo, mv);
         if (wGate != null) {
@@ -356,6 +365,152 @@ public final class CpuMlaMixer implements CpuMixer {
         run(pos0, n, in, out);
     }
 
+    /**
+     * The cache writes of a step: the latent KV projection with its norms and RoPE, then the latent store (a latent
+     * cache) or the {@code attn_kv_b} decompression, the K/V rotations and both stores. The query projection, the
+     * absorption, the attention, the output expansion and the output projection do not run.
+     */
+    @Override
+    public void prefillKV(int pos0, int n, float[] in) {
+        checkBound();
+        Objects.requireNonNull(in, "in");
+        if (n < 1 || n > scratch.ubatch()) {
+            throw new IllegalArgumentException("MLA step of " + n + " tokens is outside [1, " + scratch.ubatch() + "]");
+        }
+        if (pos0 < 0) {
+            throw new IllegalArgumentException("MLA step position " + pos0 + " is negative");
+        }
+        if (in.length < (long) n * nEmbd) {
+            throw new IllegalArgumentException("MLA step of " + n + " tokens needs " + n * (long) nEmbd + " inputs, "
+                    + "got " + in.length);
+        }
+        if (!owns) {
+            return;
+        }
+        pagedStep = memory.currentPagedStep();
+        int[] qPos = scratch.intTemp(TEMP_QPOS, n);
+        if (pagedStep != null) {
+            System.arraycopy(scratch.ints(CpuScratch.POS), 0, qPos, 0, n);
+        } else {
+            for (int t = 0; t < n; t++) {
+                qPos[t] = pos0 + t;
+            }
+        }
+        float[] kva = scratch.temp(TEMP_KV_A, n * g.kvaWidth);
+        projectKV(qPos, 0, n, in, kva);
+        if (g.latent) {
+            latentStepKV(qPos, 0, n, kva);
+        } else {
+            decompressedStepKV(qPos, 0, n, kva);
+        }
+    }
+
+    @Override
+    public String kvRefusal() {
+        checkBound();
+        return null;
+    }
+
+    /**
+     * The latent row alone: the projection, the optional RMS norm of the shared rotary key, RoPE of the rotary
+     * dims and the RMS norm of the latent prefix. The query's products, its norm and its RoPE do not run.
+     */
+    private void projectKV(int[] qPos, int rowOff, int n, float[] in, float[] kva) {
+        int inOff = rowOff * nEmbd;
+        mv.matmul(wkvA, in, inOff, kva, rowOff * g.kvaWidth, n);
+        kvaDeltas.applyRows(n, in, inOff, kva, rowOff * g.kvaWidth);
+        if (kPeNorm != null) {
+            NormMath.rowNorm(NormKind.RMS, eps, n, g.rope, g.kvaWidth, 1, kva, rowOff * g.kvaWidth + g.kvLora,
+                    kPeNorm, null, kva, rowOff * g.kvaWidth + g.kvLora);
+        }
+        if (rope != null) {
+            int[] pos = scratch.intTemp(TEMP_POS, RopeMath.positionsPerToken(rope.type()) * n);
+            RopePositions.fill(rope.type(), rope.textPositions(), qPos, rowOff, n, pos);
+            CpuRope.apply(ropeTable, kva, rowOff * g.kvaWidth, n, 1, g.kvaWidth, g.kvaWidth, g.kvLora, pos, 0, n);
+        }
+        NormMath.rowNorm(NormKind.RMS, eps, n, g.kvLora, g.kvaWidth, 1, kva, rowOff * g.kvaWidth, kvaNorm, null,
+                kva, rowOff * g.kvaWidth);
+    }
+
+    /** The latent step up to the store: the K rotation of the latent row and the store. */
+    private void latentStepKV(int[] qPos, int rowOff, int len, float[] kva) {
+        if (rotKSpec != null) {
+            CpuHadamard.applyInPlace(rotKSpec, kva, rowOff * g.kvaWidth, len, g.kvaWidth);
+        }
+        int[] cells = pagedStep != null ? pagedStep.cellIdx(kv.group()) : null;
+        for (int t = 0; t < len; t++) {
+            int row = cells != null ? cells[rowOff + t] : layout.rowOf(qPos[rowOff + t]);
+            kv.writeK(row, kva, (rowOff + t) * g.kvaWidth);
+        }
+    }
+
+    /**
+     * The decompressed step up to the stores: decompression, per-head K/V, the K and V rotations and both stores.
+     * The temperature and the Q rotation (query-only) do not run.
+     */
+    private void decompressedStepKV(int[] qPos, int rowOff, int len, float[] kva) {
+        int rows = g.headRows(len);
+        float[] k = scratch.temp(TEMP_K, rows * g.headK);
+        float[] v = scratch.temp(TEMP_V, rows * g.headV);
+        if (wkvB != null) {
+            int kvRow = g.nope + g.headV;
+            float[] kvb = scratch.temp(TEMP_KV_B, rows * kvRow);
+            mv.matmul(wkvB, kva, rowOff * g.kvaWidth, g.kvaWidth, kvb, 0, g.nHead * kvRow, len);
+            kvbDeltas.apply(len, kva, rowOff * g.kvaWidth, g.kvaWidth, kvb, 0, g.nHead * kvRow);
+            for (int s = 0; s < rows; s++) {
+                System.arraycopy(kvb, s * kvRow, k, s * g.headK, g.nope);
+                System.arraycopy(kvb, s * kvRow + g.nope, v, s * g.headV, g.headV);
+            }
+        } else {
+            absorbedKNope(len, kva, rowOff * g.kvaWidth, k);
+            mv.matmul(wvB, kva, rowOff * g.kvaWidth, g.kvaWidth, v, 0, g.nHead * g.headV, len);
+        }
+        for (int s = 0; s < rows; s++) {
+            System.arraycopy(kva, (rowOff + s / g.nHead) * g.kvaWidth + g.kvLora, k, s * g.headK + g.nope, g.rope);
+        }
+        if (rotKSpec != null) {
+            CpuHadamard.applyInPlace(rotKSpec, k, 0, rows, g.headK);
+        }
+        if (rotVSpec != null) {
+            CpuHadamard.applyInPlace(rotVSpec, v, 0, rows, g.headV);
+        }
+        int[] cells = pagedStep != null ? pagedStep.cellIdx(kv.group()) : null;
+        for (int t = 0; t < len; t++) {
+            int row = cells != null ? cells[rowOff + t] : layout.rowOf(qPos[rowOff + t]);
+            kv.writeK(row, k, t * g.qWidth);
+            kv.writeV(row, v, t * g.nHead * g.headV);
+        }
+    }
+
+    /**
+     * One step over the rows of {@code s}: the contiguous step at {@code s.pos0(0)} when the memory runs no paged
+     * step, the paged step through the memory's {@code CpuMemory.currentPagedStep} otherwise — one segment whole,
+     * several segments one at a time, each storing at its rows' cells and attending through its sequence's page
+     * table. Rows of different sequences never attend each other, so the per-segment attends compute the same
+     * outputs as the same rows run one sequence at a time. The paged rows take their positions from the
+     * {@link CpuScratch#POS} slot (a media chunk's rows can share one), and a step the context flags non-causal
+     * ({@code CpuForwardContext.stepNonCausal}) attends without the causal mask.
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        if (memory.currentPagedStep() == null) {
+            if (!s.contiguousSingle()) {
+                throw new UnsupportedOperationException(batchRefusal());
+            }
+            if (s.nTokens() == 1) {
+                decode(s.pos0(0), in, out);
+            } else {
+                prefill(s.pos0(0), s.nTokens(), in, out);
+            }
+            return;
+        }
+        if (s.nSeg() == 1) {
+            run(s.pos0(0), s.nTokens(), in, out);
+            return;
+        }
+        runSegmented(s, in, out);
+    }
+
     private void run(int pos0, int n, float[] in, float[] out) {
         checkBound();
         Objects.requireNonNull(in, "in");
@@ -370,18 +525,23 @@ public final class CpuMlaMixer implements CpuMixer {
             throw new IllegalArgumentException("MLA step of " + n + " tokens needs " + n * (long) nEmbd + " inputs and "
                     + n * (long) nOut + " outputs, got " + in.length + " and " + out.length);
         }
+        pagedStep = memory.currentPagedStep();
         int[] qPos = scratch.intTemp(TEMP_QPOS, n);
-        for (int t = 0; t < n; t++) {
-            qPos[t] = pos0 + t;
+        if (pagedStep != null) {
+            System.arraycopy(scratch.ints(CpuScratch.POS), 0, qPos, 0, n);
+        } else {
+            for (int t = 0; t < n; t++) {
+                qPos[t] = pos0 + t;
+            }
         }
         float[] q = scratch.temp(TEMP_Q, n * g.qWidth);
         float[] kva = scratch.temp(TEMP_KV_A, n * g.kvaWidth);
         float[] attn = scratch.temp(TEMP_ATTN, g.headRows(n) * g.headV);
-        project(pos0, n, in, q, kva);
+        project(qPos, 0, n, in, q, kva);
         if (g.latent) {
-            latentStep(pos0, n, q, kva, qPos, attn);
+            latentStep(qPos, 0, n, seq(), q, kva, attn);
         } else {
-            decompressedStep(pos0, n, q, kva, qPos, attn);
+            decompressedStep(qPos, 0, n, seq(), q, kva, attn);
         }
         if (wGate != null) {
             int gw = (int) wGate.rows();
@@ -396,115 +556,171 @@ public final class CpuMlaMixer implements CpuMixer {
     }
 
     /**
-     * Q and the latent row: projections, the optional RMS norm of the shared rotary key, RoPE of the rotary dims,
-     * RMS norm of the latent prefix (dots3note.cpp:330-344).
+     * The paged step over the segments of {@code s}: the token-wise phases (projections, RoPE, norms) run over the
+     * whole step once, then every segment stores its latent (or decompressed) rows at the step's cells and attends
+     * through its sequence's page table.
      */
-    private void project(int pos0, int n, float[] in, float[] q, float[] kva) {
+    private void runSegmented(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        checkBound();
+        int n = s.nTokens();
+        if (n < 1 || n > scratch.ubatch()) {
+            throw new IllegalArgumentException("MLA step of " + n + " tokens is outside [1, " + scratch.ubatch() + "]");
+        }
+        if (in.length < (long) n * nEmbd || out.length < (long) n * nOut) {
+            throw new IllegalArgumentException("MLA step of " + n + " tokens needs " + n * (long) nEmbd + " inputs and "
+                    + n * (long) nOut + " outputs, got " + in.length + " and " + out.length);
+        }
+        pagedStep = memory.currentPagedStep();
+        int[] qPos = scratch.intTemp(TEMP_QPOS, n);
+        System.arraycopy(scratch.ints(CpuScratch.POS), 0, qPos, 0, n);
+        float[] q = scratch.temp(TEMP_Q, n * g.qWidth);
+        float[] kva = scratch.temp(TEMP_KV_A, n * g.kvaWidth);
+        float[] attn = scratch.temp(TEMP_ATTN, g.headRows(n) * g.headV);
+        project(qPos, 0, n, in, q, kva);
+        try (TapProduct batch = TapProduct.dense(n)) {
+            for (int seg = 0; seg < s.nSeg(); seg++) {
+                if (g.latent) {
+                    latentStep(qPos, s.tokStart(seg), s.len(seg), s.seq(seg), q, kva, attn);
+                } else {
+                    decompressedStep(qPos, s.tokStart(seg), s.len(seg), s.seq(seg), q, kva, attn);
+                }
+            }
+        }
+        if (wGate != null) {
+            int gw = (int) wGate.rows();
+            float[] gate = scratch.temp(TEMP_GATE, n * gw);
+            mv.matmul(wGate, in, 0, gate, 0, n);
+            gateDeltas.applyRows(n, in, 0, gate, 0);
+            AttnExtMath.applyOutGate(gateKind, n, g.nHead, g.headV, attn, 0, g.nHead * g.headV, gate, 0, gw,
+                    gateBias, 0);
+        }
+        mv.matmul(wo, attn, 0, out, 0, n);
+        outDeltas.applyRows(n, attn, 0, out, 0);
+    }
+
+    /** The paged step's one segment when {@link #run} drives a single-segment step, else its first segment. */
+    private int seq() {
+        return pagedStep != null ? pagedStep.segSeq(0) : 0;
+    }
+
+    /**
+     * Q and the latent row: projections, the optional RMS norm of the shared rotary key, RoPE of the rotary dims,
+     * RMS norm of the latent prefix (dots3note.cpp:330-344). Rows {@code [rowOff, rowOff + len)} carry positions
+     * {@code qPos[rowOff ..]}.
+     */
+    private void project(int[] qPos, int rowOff, int n, float[] in, float[] q, float[] kva) {
+        int inOff = rowOff * nEmbd;
         if (wqA != null) {
             float[] qa = scratch.temp(TEMP_Q_A, n * g.qLora);
-            mv.matmul(wqA, in, 0, qa, 0, n);
-            qaDeltas.applyRows(n, in, 0, qa, 0);
+            mv.matmul(wqA, in, inOff, qa, 0, n);
+            qaDeltas.applyRows(n, in, inOff, qa, 0);
             NormMath.rowNorm(NormKind.RMS, eps, n, g.qLora, g.qLora, 1, qa, 0, qaNorm, null, qa, 0);
-            mv.matmul(wqB, qa, 0, q, 0, n);
-            qbDeltas.applyRows(n, qa, 0, q, 0);
+            mv.matmul(wqB, qa, 0, q, rowOff * g.qWidth, n);
+            qbDeltas.applyRows(n, qa, 0, q, rowOff * g.qWidth);
         } else {
-            mv.matmul(wq, in, 0, q, 0, n);
-            qDeltas.applyRows(n, in, 0, q, 0);
+            mv.matmul(wq, in, inOff, q, rowOff * g.qWidth, n);
+            qDeltas.applyRows(n, in, inOff, q, rowOff * g.qWidth);
         }
-        mv.matmul(wkvA, in, 0, kva, 0, n);
-        kvaDeltas.applyRows(n, in, 0, kva, 0);
+        mv.matmul(wkvA, in, inOff, kva, rowOff * g.kvaWidth, n);
+        kvaDeltas.applyRows(n, in, inOff, kva, rowOff * g.kvaWidth);
         if (kPeNorm != null) {
-            NormMath.rowNorm(NormKind.RMS, eps, n, g.rope, g.kvaWidth, 1, kva, g.kvLora, kPeNorm, null, kva,
-                    g.kvLora);
+            NormMath.rowNorm(NormKind.RMS, eps, n, g.rope, g.kvaWidth, 1, kva, rowOff * g.kvaWidth + g.kvLora,
+                    kPeNorm, null, kva, rowOff * g.kvaWidth + g.kvLora);
         }
         if (rope != null) {
             int[] pos = scratch.intTemp(TEMP_POS, RopeMath.positionsPerToken(rope.type()) * n);
-            RopePositions.fill(rope.type(), rope.textPositions(), pos0, n, pos);
-            CpuRope.apply(ropeTable, q, 0, n, g.nHead, g.headK, g.qWidth, g.nope, pos, 0, n);
-            CpuRope.apply(ropeTable, kva, 0, n, 1, g.kvaWidth, g.kvaWidth, g.kvLora, pos, 0, n);
+            RopePositions.fill(rope.type(), rope.textPositions(), qPos, rowOff, n, pos);
+            CpuRope.apply(ropeTable, q, rowOff * g.qWidth, n, g.nHead, g.headK, g.qWidth, g.nope, pos, 0, n);
+            CpuRope.apply(ropeTable, kva, rowOff * g.kvaWidth, n, 1, g.kvaWidth, g.kvaWidth, g.kvLora, pos, 0, n);
         }
-        NormMath.rowNorm(NormKind.RMS, eps, n, g.kvLora, g.kvaWidth, 1, kva, 0, kvaNorm, null, kva, 0);
+        NormMath.rowNorm(NormKind.RMS, eps, n, g.kvLora, g.kvaWidth, 1, kva, rowOff * g.kvaWidth, kvaNorm, null,
+                kva, rowOff * g.kvaWidth);
     }
 
     /** Absorbed Q, latent K row, attention over the latent cache, per-head expansion by {@code attn_v_b}. */
-    private void latentStep(int pos0, int n, float[] q, float[] kva, int[] qPos, float[] attn) {
-        int rows = g.headRows(n);
+    private void latentStep(int[] qPos, int rowOff, int len, int seq, float[] q, float[] kva, float[] attn) {
+        int rows = g.headRows(len);
         float[] qlat = scratch.temp(TEMP_Q_LATENT, rows * g.dQ);
         float[] lat = scratch.temp(TEMP_LATENT, rows * g.kvLora);
-        CpuMlaHeadProducts.run(wkB, g.nHead, g.kvLora, n, q, 0, g.qWidth, g.headK, qlat, 0, g.nHead * g.dQ, g.dQ);
+        CpuMlaHeadProducts.run(wkB, g.nHead, g.kvLora, len, q, rowOff * g.qWidth, g.qWidth, g.headK, qlat, 0,
+                g.nHead * g.dQ, g.dQ);
         for (int s = 0; s < rows; s++) {
-            int qBase = (s / g.nHead) * g.qWidth + (s % g.nHead) * g.headK;
+            int qBase = (rowOff + s / g.nHead) * g.qWidth + (s % g.nHead) * g.headK;
             System.arraycopy(q, qBase + g.nope, qlat, s * g.dQ + g.kvLora, g.rope);
         }
         if (temperature != null) {
-            AttnExtMath.applyTemperature(temperature, n, g.nHead, g.dQ, qPos, 0, qlat, 0, g.nHead * g.dQ);
+            AttnExtMath.applyTemperature(temperature, len, g.nHead, g.dQ, qPos, rowOff, qlat, 0, g.nHead * g.dQ);
         }
         if (rotKSpec != null) {
             CpuHadamard.applyInPlace(rotKSpec, qlat, 0, rows, g.dQ);
-            CpuHadamard.applyInPlace(rotKSpec, kva, 0, n, g.kvaWidth);
+            CpuHadamard.applyInPlace(rotKSpec, kva, rowOff * g.kvaWidth, len, g.kvaWidth);
         }
         if (owns) {
-            for (int t = 0; t < n; t++) {
-                kv.writeK(layout.rowOf(pos0 + t), kva, t * g.kvaWidth);
+            int[] cells = pagedStep != null ? pagedStep.cellIdx(kv.group()) : null;
+            for (int t = 0; t < len; t++) {
+                int row = cells != null ? cells[rowOff + t] : layout.rowOf(qPos[rowOff + t]);
+                kv.writeK(row, kva, (rowOff + t) * g.kvaWidth);
             }
         }
-        attend(pos0, n, qlat, qPos, lat);
+        attend(qPos, rowOff, len, seq, qlat, 0, lat, 0);
         if (rotKSpec != null) {
             CpuHadamard.applyInPlace(rotKSpec, lat, 0, rows, g.kvLora);
         }
-        CpuMlaHeadProducts.run(wvB, g.nHead, g.headV, n, lat, 0, g.nHead * g.kvLora, g.kvLora, attn, 0,
-                g.nHead * g.headV, g.headV);
+        CpuMlaHeadProducts.run(wvB, g.nHead, g.headV, len, lat, 0, g.nHead * g.kvLora, g.kvLora, attn,
+                rowOff * (g.nHead * g.headV), g.nHead * g.headV, g.headV);
     }
-
     /** Per-head K/V from {@code attn_kv_b} (or the absorbed pair), attention over the per-head cache. */
-    private void decompressedStep(int pos0, int n, float[] q, float[] kva, int[] qPos, float[] attn) {
-        int rows = g.headRows(n);
+    private void decompressedStep(int[] qPos, int rowOff, int len, int seq, float[] q, float[] kva, float[] attn) {
+        int rows = g.headRows(len);
         float[] k = scratch.temp(TEMP_K, rows * g.headK);
         float[] v = scratch.temp(TEMP_V, rows * g.headV);
         if (wkvB != null) {
             int kvRow = g.nope + g.headV;
             float[] kvb = scratch.temp(TEMP_KV_B, rows * kvRow);
-            mv.matmul(wkvB, kva, 0, g.kvaWidth, kvb, 0, g.nHead * kvRow, n);
-            kvbDeltas.apply(n, kva, 0, g.kvaWidth, kvb, 0, g.nHead * kvRow);
+            mv.matmul(wkvB, kva, rowOff * g.kvaWidth, g.kvaWidth, kvb, 0, g.nHead * kvRow, len);
+            kvbDeltas.apply(len, kva, rowOff * g.kvaWidth, g.kvaWidth, kvb, 0, g.nHead * kvRow);
             for (int s = 0; s < rows; s++) {
                 System.arraycopy(kvb, s * kvRow, k, s * g.headK, g.nope);
                 System.arraycopy(kvb, s * kvRow + g.nope, v, s * g.headV, g.headV);
             }
         } else {
-            absorbedKNope(n, kva, k);
-            mv.matmul(wvB, kva, 0, g.kvaWidth, v, 0, g.nHead * g.headV, n);
+            absorbedKNope(len, kva, rowOff * g.kvaWidth, k);
+            mv.matmul(wvB, kva, rowOff * g.kvaWidth, g.kvaWidth, v, 0, g.nHead * g.headV, len);
         }
         for (int s = 0; s < rows; s++) {
-            System.arraycopy(kva, (s / g.nHead) * g.kvaWidth + g.kvLora, k, s * g.headK + g.nope, g.rope);
+            System.arraycopy(kva, (rowOff + s / g.nHead) * g.kvaWidth + g.kvLora, k, s * g.headK + g.nope, g.rope);
         }
         if (temperature != null) {
-            AttnExtMath.applyTemperature(temperature, n, g.nHead, g.headK, qPos, 0, q, 0, g.qWidth);
+            AttnExtMath.applyTemperature(temperature, len, g.nHead, g.headK, qPos, rowOff, q, rowOff * g.qWidth,
+                    g.qWidth);
         }
         if (rotKSpec != null) {
-            CpuHadamard.applyInPlace(rotKSpec, q, 0, rows, g.headK);
+            CpuHadamard.applyInPlace(rotKSpec, q, rowOff * g.qWidth, len * g.nHead, g.headK);
             CpuHadamard.applyInPlace(rotKSpec, k, 0, rows, g.headK);
         }
         if (rotVSpec != null) {
             CpuHadamard.applyInPlace(rotVSpec, v, 0, rows, g.headV);
         }
         if (owns) {
-            for (int t = 0; t < n; t++) {
-                int row = layout.rowOf(pos0 + t);
+            int[] cells = pagedStep != null ? pagedStep.cellIdx(kv.group()) : null;
+            for (int t = 0; t < len; t++) {
+                int row = cells != null ? cells[rowOff + t] : layout.rowOf(qPos[rowOff + t]);
                 kv.writeK(row, k, t * g.qWidth);
                 kv.writeV(row, v, t * g.nHead * g.headV);
             }
         }
-        attend(pos0, n, q, qPos, attn);
+        attend(qPos, rowOff, len, seq, q, rowOff * (g.nHead * g.dQ), attn, rowOff * (g.nHead * g.headV));
         if (rotVSpec != null) {
-            CpuHadamard.applyInPlace(rotVSpec, attn, 0, rows, g.headV);
+            CpuHadamard.applyInPlace(rotVSpec, attn, rowOff * (g.nHead * g.headV), len * g.nHead, g.headV);
         }
     }
 
     /**
      * {@code k_nope[t][h][d] = sum_l attn_k_b[h][l][d] * kv_cmpr[t][l]}: the transpose of the absorbed product, from
-     * head {@code h}'s decoded {@code [kv_lora][n_nope]} rows, parallel over tokens.
+     * head {@code h}'s decoded {@code [kv_lora][n_nope]} rows, parallel over tokens. Rows {@code [rowOff, ..)} read
+     * {@code kva} from {@code kvaOff}.
      */
-    private void absorbedKNope(int n, float[] kva, float[] k) {
+    private void absorbedKNope(int n, float[] kva, int kvaOff, float[] k) {
         float[] wh = scratch.temp(TEMP_WK_B, g.kvLora * g.nope);
         for (int h = 0; h < g.nHead; h++) {
             wkB.decodeRows((long) h * g.kvLora, g.kvLora, wh, 0);
@@ -512,7 +728,7 @@ public final class CpuMlaMixer implements CpuMixer {
             CpuParallel.parallelFor(n, 1, (from, to) -> {
                 for (int t = from; t < to; t++) {
                     int kBase = (t * g.nHead + head) * g.headK;
-                    int xBase = t * g.kvaWidth;
+                    int xBase = kvaOff + t * g.kvaWidth;
                     for (int d = 0; d < g.nope; d++) {
                         float acc = 0.0f;
                         for (int l = 0; l < g.kvLora; l++) {
@@ -525,11 +741,65 @@ public final class CpuMlaMixer implements CpuMixer {
         }
     }
 
-    private void attend(int pos0, int n, float[] qs, int[] qPos, float[] os) {
+    /**
+     * Attention of one segment's {@code len} rows at {@code [rowOff, rowOff + len)} of the step: query rows at
+     * {@code qs[qsOff]} (the segment's own array start), positions {@code qPos[rowOff ..]}, outputs into
+     * {@code os[osOff]}. Paged through the sequence's page table, else over the position window of the contiguous
+     * layout. A tree verify's step carries the context's tree mask, which replaces the position rules over the
+     * step's fresh rows (see {@link CpuAttentionCore.TreeMask}); the segment's rows are the call's fresh rows, so
+     * the mask relativizes to them like {@code CpuAttentionMixer#segmentTreeMask} does.
+     */
+    private void attend(int[] qPos, int rowOff, int len, int seq, float[] qs, int qsOff, float[] os, int osOff) {
+        int qStride = g.nHead * g.dQ;
+        int outStride = g.nHead * g.dV;
+        CpuAttentionCore.TreeMask tree = treeMask(rowOff, len);
+        if (pagedStep != null) {
+            int group = kv.group();
+            int keys = pagedStep.seqSlots(group)[seq];
+            int[] table = new int[pagedStep.maxPages()];
+            System.arraycopy(pagedStep.pageTable(group), seq * pagedStep.maxPages(), table, 0, pagedStep.maxPages());
+            CpuAttentionCore.Params stepParams = ctx.stepNonCausal() ? nonCausalParams : params;
+            CpuAttentionCore.attendRows(stepParams, len, qs, qsOff, qStride, qPos, rowOff, kv, rowPos,
+                    pageShift(pagedStep), table, 0, keys, os, osOff, outStride, tree);
+            return;
+        }
+        int pos0 = qPos[rowOff];
         int start = MlaBlocks.kvStart(layout, pos0);
-        int end = MlaBlocks.kvEnd(layout, pos0 + n - 1);
-        CpuAttentionCore.attendRows(params, n, qs, 0, g.nHead * g.dQ, qPos, 0, kv, rowPos, start, end, os, 0,
-                g.nHead * g.dV);
+        int end = MlaBlocks.kvEnd(layout, qPos[rowOff + len - 1]);
+        CpuAttentionCore.attendRows(params, len, qs, qsOff, qStride, qPos, rowOff, kv, rowPos, start, end,
+                os, osOff, outStride, tree);
+    }
+
+    /**
+     * The running step's tree mask relativized to the segment's rows at {@code [rowOff, rowOff + len)} of the
+     * ubatch, or null: the backend set one per ubatch row and the segment's rows are the call's fresh rows (a
+     * single-sequence tree verify runs one segment at {@code rowOff} 0, a batched masked step one segment per
+     * sequence), as {@code CpuAttentionMixer#segmentTreeMask} builds for the standard attention.
+     */
+    private CpuAttentionCore.TreeMask treeMask(int rowOff, int len) {
+        long[] bits = ctx.stepTreeMask();
+        if (bits == null) {
+            return null;
+        }
+        int fresh = ctx.stepTreeFresh();
+        if (rowOff + len > fresh) {
+            throw new IllegalStateException("layer " + il + " runs rows [" + rowOff + ", " + (rowOff + len)
+                    + ") but the step's tree mask covers " + fresh + " fresh rows");
+        }
+        long[] rel = new long[rowOff + len];
+        for (int t = 0; t < len; t++) {
+            rel[rowOff + t] = bits[rowOff + t] >>> rowOff;
+        }
+        return new CpuAttentionCore.TreeMask(rel, len);
+    }
+
+    /** {@code log2(pageSize)}: slot {@code s} sits in page {@code s >> shift} (the kernel's page-table shift). */
+    private static int pageShift(PagedStep step) {
+        int size = step.pageSize();
+        if (Integer.bitCount(size) != 1) {
+            throw new IllegalArgumentException("page size " + size + " is not a power of two");
+        }
+        return Integer.numberOfTrailingZeros(size);
     }
 
     // ================================================================== context shift
@@ -555,6 +825,24 @@ public final class CpuMlaMixer implements CpuMixer {
         if (!owns || rope == null) {
             return;
         }
+        rotateByDeltas();
+    }
+
+    /** {@link CpuMixer#applyShiftDeltas}: the paged shift's row moves already happened, rotate by the deltas. */
+    @Override
+    public void applyShiftDeltas() {
+        String refusal = shiftRefusal();
+        if (refusal != null) {
+            throw new UnsupportedOperationException("layer " + il + ": context shift unsupported: " + refusal);
+        }
+        if (!owns || rope == null) {
+            return;
+        }
+        rotateByDeltas();
+    }
+
+    /** Rotates every cached K row by its row's delta of the memory's last shift. */
+    private void rotateByDeltas() {
         int[] delta = ((HeapModelMemory) memory).shiftDelta()[kv.group()];
         RopeFreqTable table = RopeFreqTable.forShift(rope, freqFactors);
         int rotK = g.shiftRotK();

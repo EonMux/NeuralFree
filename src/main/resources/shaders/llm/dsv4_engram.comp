@@ -1,0 +1,57 @@
+/* dsv4_engram.comp - LLM_DSV4_EngramAdd: the DeepSeek-V4.1 Engram gate and residual add.
+ * GLSL twin of kernels/llm/dsv4/engram.cl (which documents the formulas). Requires: common/nf_common.glsl,
+ * common/act.glsl, common/reduce.glsl.
+ *
+ * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
+ *   (i n_tokens, i n_embd, i hc, f scale, i x_off, R int active, R norm_x, R norm_key, R gate_w, R kv_out, W x)
+ * One row per (token, stream): x[t][h] += kv_out[t][value] * gate, with the gate scoring the normalized residual
+ * row against the normalized key row and gate_w. active[t] == 0 (an embedding row) contributes nothing.
+ *
+ * Dispatch: 1-D, one workgroup per (token, stream) row, global = n_tokens * hc * L, local = {L, 1, 1}.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/act.glsl"
+#include "common/reduce.glsl"
+
+layout(push_constant) uniform NfDsv4EngramParams {
+    int n_tokens;
+    int n_embd;
+    int hc;
+    float scale;
+    int x_off;
+} pc;
+
+layout(std430, binding = 0) readonly buffer NfDsv4EngramActive  { int active_tok[]; };
+layout(std430, binding = 1) readonly buffer NfDsv4EngramNormX   { float norm_x[]; };
+layout(std430, binding = 2) readonly buffer NfDsv4EngramNormKey { float norm_key[]; };
+layout(std430, binding = 3) readonly buffer NfDsv4EngramGateW   { float gate_w[]; };
+layout(std430, binding = 4) readonly buffer NfDsv4EngramKvOut   { float kv_out[]; };
+layout(std430, binding = 5)          buffer NfDsv4EngramX       { float x[]; };
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint row = nf_wg_id();
+    if (row >= uint(pc.n_tokens) * uint(pc.hc)) {
+        return;
+    }
+    const int t = int(row) / pc.hc;
+    const int h = int(row) - t * pc.hc;
+    const uint base = row * uint(pc.n_embd);
+    const uint gate_base = uint(h) * uint(pc.n_embd);
+
+    float d = 0.0;
+    for (int i = int(lid); i < pc.n_embd; i += int(lsize)) {
+        d += norm_x[base + uint(i)] * norm_key[base + uint(i)] * gate_w[gate_base + uint(i)];
+    }
+    const float s = nf_wg_sum(d) * pc.scale;
+    const float m = sqrt(max(abs(s), 1e-6));
+    const float g = active_tok[t] != 0 ? nf_sigmoid(s < 0.0 ? -m : m) : 0.0;
+    const uint value = (uint(t) * uint(pc.hc + 1) + uint(pc.hc)) * uint(pc.n_embd);
+    for (int i = int(lid); i < pc.n_embd; i += int(lsize)) {
+        x[uint(pc.x_off) + base + uint(i)] += kv_out[value + uint(i)] * g;
+    }
+}

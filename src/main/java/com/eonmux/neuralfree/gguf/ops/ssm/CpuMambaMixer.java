@@ -4,11 +4,14 @@ import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuMixer;
 import com.eonmux.neuralfree.gguf.cpu.block.CpuProjectionDeltas;
+import com.eonmux.neuralfree.gguf.cpu.block.CpuRecurrentTreeMixer;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuForwardContext;
+import com.eonmux.neuralfree.gguf.cpu.forward.CpuRecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.cpu.forward.CpuScratch;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
 import com.eonmux.neuralfree.gguf.cpu.weights.CpuWeights;
+import com.eonmux.neuralfree.gguf.engine.RecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.cpu.RecurrentStateAccessor;
 import com.eonmux.neuralfree.gguf.ops.norm.NormMath;
@@ -35,14 +38,17 @@ import java.util.Objects;
  * </pre>
  *
  * A falcon-h1 layer runs only its Mamba-2 branch here; the layer executor adds the attention branch
- * (models/falcon-h1.cpp:133-163). Conv and scan state live in row 0 of the layer's recurrent state with the layouts of
- * {@link GpuMambaMixer}. Every working array comes from {@link CpuScratch}; a step allocates nothing. Not thread-safe.
+ * (models/falcon-h1.cpp:133-163). Conv and scan state live in the layer's recurrent state, one row per slot: the
+ * contiguous steps run sequence 0's rows, a batched step the rows of the step's sequences
+ * ({@code RecurrentStateAccessor}). Every working array comes from {@link CpuScratch}; a step allocates nothing.
+ * Not thread-safe.
  */
-public final class CpuMambaMixer implements CpuMixer {
+public final class CpuMambaMixer implements CpuMixer, CpuRecurrentTreeMixer {
 
     private final MixerKind kind;
 
     private CpuMatVec mv;
+    private CpuScratch scratch;
     private int ubatch;
     private int nEmbd;
     private int dInner;
@@ -80,6 +86,10 @@ public final class CpuMambaMixer implements CpuMixer {
 
     private float[] convState;
     private float[] scanState;
+    /** Floats of one state slot: sequence {@code seq}'s rows start at {@code seq * convRow / scanRow}. */
+    private int convRow;
+    private int scanRow;
+    private int stateSlots;
     private float[] q;
     private float[] k;
     private float[] v;
@@ -118,7 +128,7 @@ public final class CpuMambaMixer implements CpuMixer {
         SsmBlocks.checkKind(kind, layer);
         RecurrentSpec r = layer.recurrent();
         mv = ctx.matVec();
-        CpuScratch scratch = ctx.scratch();
+        scratch = ctx.scratch();
         ubatch = scratch.ubatch();
         nEmbd = r.nEmbd();
         if (layer.residual().streamWidth() != nEmbd) {
@@ -141,6 +151,9 @@ public final class CpuMambaMixer implements CpuMixer {
         SsmBlocks.stateFloats(state.tensors(), LayerMemoryPlan.STATE_SCAN, (long) nHead * headDim * dState, layer);
         convState = state.tensor(LayerMemoryPlan.STATE_CONV);
         scanState = state.tensor(LayerMemoryPlan.STATE_SCAN);
+        convRow = state.slotFloats(LayerMemoryPlan.STATE_CONV);
+        scanRow = state.slotFloats(LayerMemoryPlan.STATE_SCAN);
+        stateSlots = state.slots();
 
         q = slot(scratch, CpuScratch.Q, Math.max(inWidth, Math.max(xdbWidth, dInner)));
         k = slot(scratch, CpuScratch.K, Math.max(convCh, dInner));
@@ -255,15 +268,71 @@ public final class CpuMambaMixer implements CpuMixer {
 
     @Override
     public void decode(int pos, float[] in, float[] out) {
-        forward(1, in, out);
+        forward(1, 0, 0, 0, in, out);
     }
 
     @Override
     public void prefill(int pos0, int n, float[] in, float[] out) {
-        forward(n, in, out);
+        forward(n, 0, 0, 0, in, out);
     }
 
-    private void forward(int t, float[] in, float[] out) {
+    /**
+     * One batched step over the rows of {@code s}: the whole row range at once when the step is one segment (its
+     * rows sit dense from index 0, the memory's sequence {@code s.seq(0)} state row), otherwise one segment at a
+     * time, each with its own sequence's state row. The tokens of one segment share one state; segments of
+     * different sequences are independent, so the per-segment runs compute the same states and outputs as the same
+     * rows run one sequence at a time.
+     *
+     * @throws UnsupportedOperationException when the memory has fewer state slots than the step names sequences
+     */
+    @Override
+    public void batch(com.eonmux.neuralfree.gguf.memory.StepLayout s, float[] in, float[] out) {
+        int nEmbd = this.nEmbd;
+        if (s.nSeg() == 1) {
+            forward(s.nTokens(), 0, 0, s.seq(0), in, out);
+            return;
+        }
+        if (!bound || closed) {
+            throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
+        }
+        float[] buf = scratch.temp(TEMP_SEGMENT, Math.multiplyExact(ubatch, nEmbd));
+        float[] bufOut = scratch.temp(TEMP_SEGMENT_OUT, Math.multiplyExact(ubatch, nEmbd));
+        for (int seg = 0; seg < s.nSeg(); seg++) {
+            int start = s.tokStart(seg);
+            int len = s.len(seg);
+            System.arraycopy(in, start * nEmbd, buf, 0, len * nEmbd);
+            forward(len, 0, 0, s.seq(seg), buf, bufOut);
+            System.arraycopy(bufOut, 0, out, start * nEmbd, len * nEmbd);
+        }
+    }
+
+    private static final String TEMP_SEGMENT = "CpuMambaMixer.segmentIn";
+    private static final String TEMP_SEGMENT_OUT = "CpuMambaMixer.segmentOut";
+
+    /** The state slot of {@code seq}, validated against the memory's slots. */
+    private int stateSlot(int seq) {
+        if (seq < 0 || seq >= stateSlots) {
+            throw new UnsupportedOperationException(kind + " mixer runs sequence " + seq + ", the memory keeps "
+                    + stateSlots + " state slots");
+        }
+        return seq;
+    }
+
+    private void forward(int t, int inOff, int outOff, int seq, float[] in, float[] out) {
+        if (!bound || closed) {
+            throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
+        }
+        int base = stateSlot(seq);
+        forwardState(t, inOff, outOff, in, out, convState, base * convRow, scanState, base * scanRow);
+    }
+
+    /**
+     * The step against explicit state rows: the committed rows for a decode step ({@link #forward}), one stack slot
+     * of the tree round for a verify row ({@link #treeStep}). Identical arithmetic on both sides, so a replayed row
+     * reproduces the state the verify step used bit for bit.
+     */
+    private void forwardState(int t, int inOff, int outOff, float[] in, float[] out,
+                              float[] convStateRows, int convBase, float[] scanStateRows, int scanBase) {
         if (!bound || closed) {
             throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
         }
@@ -271,29 +340,31 @@ public final class CpuMambaMixer implements CpuMixer {
             throw new IllegalArgumentException(kind + " step of " + t + " tokens is outside [1, " + ubatch + "]");
         }
         int n = t * nEmbd;
-        if (in.length < n || out.length < n) {
+        if (in.length < (long) inOff + n || out.length < (long) outOff + n) {
             throw new IllegalArgumentException(kind + " step of " + t + " tokens needs " + n
-                    + " floats of input and output");
+                    + " floats of input and output from the given offsets");
         }
         if (in == out || isWorking(in) || isWorking(out)) {
             throw new IllegalArgumentException(kind + " mixer input and output must be distinct caller arrays");
         }
         switch (kind) {
             case MAMBA1:
-                stepMamba1(t, in, out);
+                stepMamba1(t, inOff, outOff, convStateRows, convBase, scanStateRows, scanBase, in, out);
                 break;
             case MAMBA2:
-                stepMamba2(t, in, out);
+                stepMamba2(t, inOff, outOff, convStateRows, convBase, scanStateRows, scanBase, in, out);
                 break;
             default:
-                stepPlamo2(t, in, out);
+                stepPlamo2(t, inOff, outOff, convStateRows, convBase, scanStateRows, scanBase, in, out);
                 break;
         }
     }
 
-    private void stepMamba1(int t, float[] in, float[] out) {
-        projectIn(t, in);
-        CpuSsmConv.forward(convCh, dConv, t, convFlags, q, 0, inWidth, convW, convB, convState, 0, 0, k, 0, dInner);
+    private void stepMamba1(int t, int inOff, int outOff, float[] convStateRows, int convBase,
+                            float[] scanStateRows, int scanBase, float[] in, float[] out) {
+        projectIn(t, inOff, in);
+        CpuSsmConv.forward(convCh, dConv, t, convFlags, q, 0, inWidth, convW, convB, convStateRows, convBase, 0,
+                k, 0, dInner);
         mv.matmul(ssmX, k, 0, v, 0, t);
         xDeltas.applyRows(t, k, 0, v, 0);
         if (dtBcNorms) {
@@ -305,27 +376,29 @@ public final class CpuMambaMixer implements CpuMixer {
         mv.matmul(ssmDt, v, 0, xdbWidth, dt, 0, dInner, t);
         dtDeltas.apply(t, v, 0, xdbWidth, dt, 0, dInner);
         CpuSsmScan.scan(dState, 1, dInner, 1, t, true, k, 0, dInner, dt, 0, dInner, dtBias, a,
-                v, dtRank, xdbWidth, v, dtRank + dState, xdbWidth, scanState, 0, attnOut, 0, dInner);
+                v, dtRank, xdbWidth, v, dtRank + dState, xdbWidth, scanStateRows, scanBase, attnOut, 0, dInner);
         CpuSsmScan.gateOut(t, dInner, 1, attnOut, 0, k, 0, dInner, d, q, dInner, inWidth, v, 0);
-        projectOut(t, v, out);
+        projectOut(t, v, outOff, out);
     }
 
-    private void stepMamba2(int t, float[] in, float[] out) {
+    private void stepMamba2(int t, int inOff, int outOff, float[] convStateRows, int convBase,
+                            float[] scanStateRows, int scanBase, float[] in, float[] out) {
         int gs = nGroup * dState;
-        projectIn(t, in);
-        CpuSsmConv.forward(convCh, dConv, t, convFlags, q, dInner, inWidth, convW, convB, convState, 0, 0,
-                k, 0, convCh);
+        projectIn(t, inOff, in);
+        CpuSsmConv.forward(convCh, dConv, t, convFlags, q, dInner, inWidth, convW, convB, convStateRows, convBase,
+                0, k, 0, convCh);
         CpuSsmScan.scan(dState, headDim, nHead, nGroup, t, false, k, 0, convCh, q, 2 * dInner + 2 * gs, inWidth,
-                dtBias, a, k, dInner, convCh, k, dInner + gs, convCh, scanState, 0, attnOut, 0, dInner);
+                dtBias, a, k, dInner, convCh, k, dInner + gs, convCh, scanStateRows, scanBase, attnOut, 0, dInner);
         CpuSsmScan.gateOut(t, dInner, headDim, attnOut, 0, k, 0, convCh, d, q, 0, inWidth, v, 0);
         if (groupNorm != null) {
             NormMath.groupRms(t, dInner, nGroup, eps, v, 0, dInner, groupNorm, v, 0);
         }
-        projectOut(t, v, out);
+        projectOut(t, v, outOff, out);
     }
 
-    private void stepPlamo2(int t, float[] in, float[] out) {
-        projectIn(t, in);
+    private void stepPlamo2(int t, int inOff, int outOff, float[] convStateRows, int convBase,
+                            float[] scanStateRows, int scanBase, float[] in, float[] out) {
+        projectIn(t, inOff, in);
         int rows = t * nHead;
         for (int r = 0; r < rows; r++) {
             int src = r * 2 * headDim;
@@ -333,7 +406,7 @@ public final class CpuMambaMixer implements CpuMixer {
             System.arraycopy(q, src + headDim, k, dst, headDim);
             System.arraycopy(q, src, v, dst, headDim);
         }
-        CpuSsmConv.forward(convCh, dConv, t, convFlags, k, 0, dInner, convW, null, convState, 0, 0,
+        CpuSsmConv.forward(convCh, dConv, t, convFlags, k, 0, dInner, convW, null, convStateRows, convBase, 0,
                 attnOut, 0, dInner);
         mv.matmul(ssmX, attnOut, 0, q, 0, t);
         xDeltas.applyRows(t, attnOut, 0, q, 0);
@@ -343,21 +416,69 @@ public final class CpuMambaMixer implements CpuMixer {
         mv.matmul(ssmDt, q, 2 * dState, xdbWidth, dt, 0, nHead, t);
         dtDeltas.apply(t, q, 2 * dState, xdbWidth, dt, 0, nHead);
         CpuSsmScan.scan(dState, headDim, nHead, 1, t, false, attnOut, 0, dInner, dt, 0, nHead, dtBias, a,
-                q, 0, xdbWidth, q, dState, xdbWidth, scanState, 0, k, 0, dInner);
+                q, 0, xdbWidth, q, dState, xdbWidth, scanStateRows, scanBase, k, 0, dInner);
         CpuSsmScan.gateOut(t, dInner, headDim, k, 0, attnOut, 0, dInner, d, v, 0, dInner, q, 0);
-        projectOut(t, q, out);
+        projectOut(t, q, outOff, out);
     }
 
-    /** {@code ssm_in} of the step's rows into {@code q}, plus its deltas. */
-    private void projectIn(int t, float[] in) {
-        mv.matmul(ssmIn, in, 0, q, 0, t);
-        inDeltas.applyRows(t, in, 0, q, 0);
+    @Override
+    public String treeStepRefusal() {
+        return null;
     }
 
-    /** {@code ssm_out} of the gated rows {@code y} into {@code out}, plus its deltas. */
-    private void projectOut(int t, float[] y, float[] out) {
-        mv.matmul(ssmOut, y, 0, out, 0, t);
-        outDeltas.applyRows(t, y, 0, out, 0);
+    @Override
+    public int treeRowWidth() {
+        return nEmbd;
+    }
+
+    @Override
+    public void treeStep(CpuRecurrentTreeRound round, float[] in, float[] out) {
+        if (!bound || closed) {
+            throw new IllegalStateException(kind + " mixer is " + (closed ? "closed" : "not bound"));
+        }
+        long[] mask = round.mask();
+        int realRows = round.realRows();
+        int convSlot = (dConv - 1) * convCh;
+        int scanSlot = nHead * headDim * dState;
+        float[] convStack = round.convStack();
+        float[] scanStack = round.scanStack();
+        for (int row = 0; row < realRows; row++) {
+            int depth = RecurrentTreeRound.depth(mask[row]);
+            if (depth < 0) {
+                throw new IllegalArgumentException("the tree step's row " + row + " is padding, the mixer runs the"
+                        + " computed rows");
+            }
+            int parent = RecurrentTreeRound.parentRow(mask[row], row);
+            seedSlot(convSlot, convStack, row, depth, parent, convState, 0);
+            seedSlot(scanSlot, scanStack, row, depth, parent, scanState, 0);
+            forwardState(1, row * nEmbd, row * nEmbd, in, out,
+                    convStack, row * convSlot, scanStack, row * scanSlot);
+        }
+    }
+
+    /** Fills the row's stack slot: the committed state at the root, else the parent row's slot. */
+    private static void seedSlot(int floats, float[] stack, int row, int depth, int parent, float[] committed,
+                                 int committedBase) {
+        if (floats == 0) {
+            return;
+        }
+        if (depth == 0) {
+            System.arraycopy(committed, committedBase, stack, row * floats, floats);
+        } else {
+            System.arraycopy(stack, parent * floats, stack, row * floats, floats);
+        }
+    }
+
+    /** {@code ssm_in} of the step's rows from {@code in[inOff]} into {@code q}, plus its deltas. */
+    private void projectIn(int t, int inOff, float[] in) {
+        mv.matmul(ssmIn, in, inOff, q, 0, t);
+        inDeltas.applyRows(t, in, inOff, q, 0);
+    }
+
+    /** {@code ssm_out} of the gated rows {@code y} into {@code out[outOff]}, plus its deltas. */
+    private void projectOut(int t, float[] y, int outOff, float[] out) {
+        mv.matmul(ssmOut, y, 0, out, outOff, t);
+        outDeltas.applyRows(t, y, 0, out, outOff);
     }
 
     private boolean isWorking(float[] arr) {

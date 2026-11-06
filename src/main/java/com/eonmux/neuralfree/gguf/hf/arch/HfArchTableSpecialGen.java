@@ -15,7 +15,7 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Hugging Face architecture entries of Appendix A table HK-SG: the draft checkpoints (LC/conversion/qwen.py
+ * Hugging Face architecture entries: the draft checkpoints (LC/conversion/qwen.py
  * {@code DFlashModel} and {@code DSparkModel}, LC/conversion/nemotron.py {@code LiLiCorrDraftModel},
  * LC/conversion/gemma.py {@code Gemma4DSparkModel} and {@code Gemma4AssistantModel},
  * LC/conversion/muse_glimmer.py {@code MuseGlimmerAssistantModel}, LC/conversion/deepseek.py
@@ -33,8 +33,8 @@ final class HfArchTableSpecialGen {
     static List<HfArchEntry> entries() {
         return Collections.unmodifiableList(Arrays.asList(
                 dflash("DFlashDraftModel", "DFlash2DraftModel"),
-                dspark("Qwen3DSparkModel", "DSparkDraftModel", "DSparkSpeculator", "Lfm2DSparkDraftModel",
-                        "LingDSparkModel"),
+                dspark("Qwen3DSparkModel", "Qwen3OmniDSparkModel", "DSparkDraftModel", "DSparkSpeculator",
+                        "Lfm2DSparkDraftModel", "LingDSparkModel"),
                 HfArchEntry.of(Collections.singletonList("DeepseekV4DSparkModel"), HfArchResolver.of(Arch.DFLASH),
                         HfDraftHooksB::dsv4DsparkMeta, HfDraftHooksB::dsv4DsparkTensors,
                         HfDraftHooksB::dsv4DsparkVocab)
@@ -42,6 +42,22 @@ final class HfArchTableSpecialGen {
                         .withIndexedBlockCount(HfDraftHooksB::dsv4DsparkBlockCount)
                         .withForceType(HfDraftHooksB::dsv4DsparkForceType)
                         .withLoadNameFilter(HfDraftHooksB::dsv4DsparkFilter),
+                // DeepseekV41DSparkModel (deepseek41.py:331-442): the V4.1 DSpark stages as a DFLASH draft.
+                HfArchEntry.of(Collections.singletonList("DeepseekV41DSparkModel"), HfArchResolver.of(Arch.DFLASH),
+                        HfDraftHooksB::v41DsparkMeta, HfDraftHooksB::v41DsparkTensors,
+                        HfDraftHooksB::v41DsparkVocab)
+                        .withConfigFixup(HfDraftHooksB::v41DsparkFixup)
+                        .withIndexedBlockCount(HfDraftHooksB::v41DsparkBlockCount)
+                        .withForceType(HfDraftHooksB::v41DsparkForceType)
+                        .withLoadNameFilter(HfDraftHooksB::v41DsparkFilter)
+                        .withExtra(HfDraftHooksB::v41DsparkExtra),
+                // MistralLarge4DSparkModel (mistral4.py:132-217): the mtp_dspark backbone as a DFLASH draft.
+                HfArchEntry.of(Collections.singletonList("MistralLarge4DSparkModel"), HfArchResolver.of(Arch.DFLASH),
+                        HfDraftHooksB::ml4DsparkMeta, HfDraftHooksB::ml4DsparkTensors,
+                        HfDraftHooksB::ml4DsparkVocab)
+                        .withConfigFixup(HfDraftHooksB::ml4DsparkFixup)
+                        .withIndexedBlockCount(HfDraftHooksB::ml4DsparkBlockCount)
+                        .withLoadNameFilter(HfDraftHooksB::ml4DsparkFilter),
                 lilicorr(),
                 gemma4Dspark(),
                 museGlimmerAssistant(),
@@ -89,12 +105,15 @@ final class HfArchTableSpecialGen {
     }
 
     private static HfArchEntry museGlimmerAssistant() {
-        return HfArchEntry.of(Collections.singletonList("MuseGlimmerAssistantModel"), HfArchResolver.of(Arch.DFLASH),
-                HfDraftHooksA::museGlimmerAssistantMeta, HfDraftHooksA::museGlimmerAssistantTensors,
-                HfDraftHooksA::museGlimmerAssistantVocab);
+        // DFlashMuseGlimmerAssistantModel is the name EAGLEConfig rewrites the architecture to when the same
+        // checkpoint is served with method "dflash" (transformers_utils/configs/eagle.py), so it names the same
+        // layout.
+        return HfArchEntry.of(Arrays.asList("MuseGlimmerAssistantModel", "DFlashMuseGlimmerAssistantModel"),
+                HfArchResolver.of(Arch.DFLASH), HfDraftHooksA::museGlimmerAssistantMeta,
+                HfDraftHooksA::museGlimmerAssistantTensors, HfDraftHooksA::museGlimmerAssistantVocab);
     }
 
-    /** {@code Gemma4AssistantModel} on the HK-B2 Gemma 4 hooks (LC/conversion/gemma.py:936-961). */
+    /** {@code Gemma4AssistantModel} on the Gemma 4 hooks (LC/conversion/gemma.py:936-961). */
     private static HfArchEntry gemma4Assistant() {
         return HfArchEntry.of(Arrays.asList("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM"),
                 HfArchResolver.of(Arch.GEMMA4_ASSISTANT), HfDraftHooksB::gemma4AssistantMeta,

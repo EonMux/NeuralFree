@@ -1,0 +1,24 @@
+/* GLSL twin of LLM_DflashConv (kernels/llm/dflash.cl), one invocation per block element. */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common/nf_common.glsl"
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Dynamic { float dynamic[]; };
+layout(std430, binding = 2) readonly buffer Base { float base[]; };
+layout(std430, binding = 3) writeonly buffer Out { float out_data[]; };
+layout(push_constant) uniform Params { int hidden; int taps; int group_size; int n_rows; int side; } pc;
+void main() {
+    const uint idx = nf_wg_id() * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (idx >= uint(pc.n_rows) * uint(pc.hidden)) return;
+    const int t = int(idx / uint(pc.hidden));
+    const int c = int(idx % uint(pc.hidden));
+    const int groups = pc.hidden / pc.group_size;
+    precise float sum = 0.0;
+    for (int tap = 0; tap < min(pc.taps, t + 1); ++tap) {
+        const int di = t * (2 * pc.taps * groups) + groups * (tap + pc.taps * pc.side) + c / pc.group_size;
+        const int bi = pc.hidden * (tap + pc.taps * pc.side) + c;
+        const float w = dynamic[di] + base[bi];
+        sum += w * x[(t - tap) * pc.hidden + c];
+    }
+    out_data[idx] = sum;
+}

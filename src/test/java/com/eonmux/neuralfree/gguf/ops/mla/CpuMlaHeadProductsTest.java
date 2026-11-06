@@ -3,6 +3,8 @@ package com.eonmux.neuralfree.gguf.ops.mla;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuMatVec;
 import com.eonmux.neuralfree.gguf.cpu.quant.CpuTensorRef;
+import com.eonmux.neuralfree.gguf.cpu.quant.ImatrixCollector;
+import com.eonmux.neuralfree.gguf.quant.write.ImatrixFile;
 import org.junit.Test;
 
 import java.nio.ByteBuffer;
@@ -14,7 +16,8 @@ import static org.junit.Assert.assertThrows;
 
 /**
  * {@link CpuMlaHeadProducts} against one {@link CpuMatVec#matvecRows} per (token, head) pair, the per-pair product it
- * batches: F32 and Q8_0 weights, strided inputs and outputs, row blocks that split a head, and the shape checks.
+ * batches: F32 and Q8_0 weights, strided inputs and outputs, row blocks that split a head, the shape checks, and the
+ * input observer's per-head rows.
  */
 public class CpuMlaHeadProductsTest {
 
@@ -101,6 +104,42 @@ public class CpuMlaHeadProductsTest {
     @Test
     public void manyTokensSplitHeadsIntoRowBlocks() {
         check(f32Weight(5), 64);
+    }
+
+    /**
+     * The installed {@link CpuMatVec.InputObserver} sees every (token, head) input row as matrix {@code h} of the
+     * stacked heads, as llama.cpp's imatrix keeps one matrix per head of a 3-D {@code MUL_MAT} operand.
+     */
+    @Test
+    public void theObserverSeesEveryHeadRowAsItsOwnMatrix() {
+        int nTokens = 4;
+        int xHead = COLS + 16;
+        int xToken = N_HEAD * xHead;
+        float[] x = random(13, nTokens * xToken);
+        float[] y = new float[nTokens * N_HEAD * ROWS_PER_HEAD];
+        ImatrixCollector collector = new ImatrixCollector(t -> "blk.0.attn_k_b.weight");
+        CpuMatVec.observeGlobally(collector);
+        try {
+            CpuMlaHeadProducts.run(f32Weight(7), N_HEAD, ROWS_PER_HEAD, nTokens, x, 0, xToken, xHead, y, 0,
+                    N_HEAD * ROWS_PER_HEAD, ROWS_PER_HEAD);
+        } finally {
+            CpuMatVec.observeGlobally(null);
+        }
+        ImatrixFile.Entry e = collector.entries().get(0);
+        assertEquals(N_HEAD, e.nMat());
+        assertEquals(COLS, e.cols());
+        float[] sumSq = e.sumSq();
+        for (int h = 0; h < N_HEAD; h++) {
+            assertEquals(nTokens, e.count(h));
+            for (int c = 0; c < COLS; c++) {
+                float want = 0f;
+                for (int t = 0; t < nTokens; t++) {
+                    float v = x[t * xToken + h * xHead + c];
+                    want += v * v;
+                }
+                assertEquals("head " + h + " column " + c, want, sumSq[h * COLS + c], 1e-5f);
+            }
+        }
     }
 
     @Test

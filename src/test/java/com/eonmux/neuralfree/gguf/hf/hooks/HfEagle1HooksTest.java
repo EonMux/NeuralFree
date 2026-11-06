@@ -37,23 +37,24 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The EAGLE-1 HF draft route of WP SP-4a ({@link HfArchTableDrafts}, {@link HfEagle1Hooks}): the draft
+ * The EAGLE-1 HF draft route ({@link HfArchTableDrafts}, {@link HfEagle1Hooks}): the draft
  * {@code architectures[0]} names route to {@link Arch#EAGLE} (the layout {@code LLMModelFactory.draftRoute} sends to
- * {@code DraftRoute.HEAD} beside a target, the routing DR-1 delivered), the remaining vLLM draft classes stay
- * refused with the named reason, and the hooks derive the draft's GGUF keys and vocabulary from the target without
- * running a model. The targets are a GGUF file written with {@link GgufTestWriter} and a Hugging Face target
- * directory, as {@link HfEagle3HooksTest} reads them.
+ * {@code DraftRoute.HEAD} beside a target, where {@code Eagle1DraftModel} runs it), the remaining vLLM draft classes
+ * stay refused with the named reason, and the hooks derive the draft's GGUF keys — the standard llama-family set and
+ * the EAGLE keys — and vocabulary from the target without running a model. The targets are a GGUF file written with
+ * {@link GgufTestWriter} and a Hugging Face target directory, as {@link HfEagle3HooksTest} reads them.
  */
 public class HfEagle1HooksTest {
 
-    /** The names SP-4a registers, resolved through the registry like a load resolves them. */
+    /** The names registered for the EAGLE row, resolved through the registry like a load resolves them. */
     private static final List<String> EAGLE1_NAMES = Collections.unmodifiableList(Arrays.asList(
-            "EagleForCausalLM", "EagleModel", "EagleLlamaModel", "LlamaEagleForCausalLM", "EagleDeepSeekMTPModel"));
+            "EagleForCausalLM", "EagleModel", "EagleLlamaModel", "LlamaEagleForCausalLM", "EagleLlamaForCausalLM",
+            "EagleMistralForCausalLM", "EagleDeepSeekMTPModel"));
 
-    /** The draft classes GAPS.md lists as still refused, at SP-4a's scope. */
+    /** The draft classes still refused, with the named reason. */
     private static final List<String> STILL_REFUSED = Collections.unmodifiableList(Arrays.asList(
             "Eagle3Qwen3Model", "PeagleQwen3Model", "Eagle3DeepseekModel", "DFlash2BeamDraftModel",
-            "DSparkV41DraftModel", "Qwen3OmniDSparkModel", "K3DSparkModel", "DFlashLagunaForCausalLM",
+            "DSparkV41DraftModel", "K3DSparkModel", "DFlashLagunaForCausalLM",
             "MiMoMTPLlamaForCausalLM"));
 
     private static final String DRAFT = "{'architectures': ['EagleModel'], 'hidden_size': 8,"
@@ -101,8 +102,12 @@ public class HfEagle1HooksTest {
     // ------------------------------------------------------------------ the hooks
 
     @Test
-    public void metadataNamesTheTargetsLastLayerAndHiddenSize() throws Exception {
+    public void metadataWritesTheStandardKeysAndTheTargetKeys() throws Exception {
         HfMetadata md = meta(draft(""));
+        assertEquals(10, md.get("eagle.vocab_size"));
+        assertEquals(8, md.get("eagle.embedding_length"));
+        assertEquals(1, md.get("eagle.block_count"));
+        assertEquals(4, md.get("eagle.rope.dimension_count"));
         assertEquals(Arrays.asList(3), md.get("eagle.target_layers"));
         assertEquals(8, md.get("eagle.target_hidden_size"));
         assertEquals(false, md.get("eagle.norm_before_residual"));

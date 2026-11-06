@@ -77,7 +77,10 @@ public final class QkvProjection {
     private final int vDim;
     private final int outDim;
     private final int qProjWidth;
+    private final int qLatentDim;
     private final String qWeight;
+    private final String qNormWeight;
+    private final String qUpWeight;
     private final String kWeight;
     private final String vWeight;
     private final String qkvWeight;
@@ -108,7 +111,10 @@ public final class QkvProjection {
         this.vDim = b.vDim;
         this.outDim = b.outDim;
         this.qProjWidth = b.qProjWidth;
+        this.qLatentDim = b.qLatentDim;
         this.qWeight = b.qWeight;
+        this.qNormWeight = b.qNormWeight;
+        this.qUpWeight = b.qUpWeight;
         this.kWeight = b.kWeight;
         this.vWeight = b.vWeight;
         this.qkvWeight = b.qkvWeight;
@@ -176,6 +182,10 @@ public final class QkvProjection {
                     + " V head dims, got " + a.headDimK() + " and " + a.headDimV());
         }
         b.qProjWidth = b.interleavedGate ? 2 * b.qDim : b.qDim;
+        b.qLatentDim = a.qLatentDim();
+        if (b.qLatentDim > 0) {
+            b.qProjWidth = b.qLatentDim;
+        }
         if (a.gate() != AttnGateKind.NONE && !b.interleavedGate) {
             b.gateWeight = TensorNames.weight(TensorNames.ATTN_GATE);
             b.gateBias = optional(has, TensorNames.bias(TensorNames.ATTN_GATE));
@@ -202,8 +212,15 @@ public final class QkvProjection {
             }
         } else {
             b.source = Source.SEPARATE;
-            b.qWeight = TensorNames.weight(TensorNames.ATTN_Q);
-            b.qBias = inBias ? optional(has, TensorNames.bias(TensorNames.ATTN_Q)) : null;
+            if (b.qLatentDim > 0) {
+                b.qWeight = TensorNames.weight(TensorNames.ATTN_Q_A);
+                b.qNormWeight = TensorNames.weight(TensorNames.ATTN_Q_A_NORM);
+                b.qUpWeight = TensorNames.weight(TensorNames.ATTN_Q_B);
+                b.qBias = null;
+            } else {
+                b.qWeight = TensorNames.weight(TensorNames.ATTN_Q);
+                b.qBias = inBias ? optional(has, TensorNames.bias(TensorNames.ATTN_Q)) : null;
+            }
             if (b.projectsKv) {
                 b.kWeight = TensorNames.weight(TensorNames.ATTN_K);
                 b.kBias = inBias ? optional(has, TensorNames.bias(TensorNames.ATTN_K)) : null;
@@ -283,6 +300,12 @@ public final class QkvProjection {
     public int outDim() { return outDim; }
     /** Width of the Q projection output: {@code 2 * qDim} with an interleaved gate, else {@code qDim}. */
     public int qProjWidth() { return qProjWidth; }
+    /** Width of the shared query projection when Q is low-rank; 0 for a single Q projection. */
+    public int qLatentDim() { return qLatentDim; }
+    /** {@code attn_q_a_norm.weight} of a low-rank Q layer; null otherwise. */
+    public String qNormWeight() { return qNormWeight; }
+    /** {@code attn_q_b.weight}, which widens the normalized shared query to {@code qDim}; null otherwise. */
+    public String qUpWeight() { return qUpWeight; }
     /** Row width of the fused product: {@code qProjWidth + kDim + vDim}. */
     public int fusedWidth() { return qProjWidth + kDim + vDim; }
     /** Offset of Q in a fused row. */
@@ -357,7 +380,10 @@ public final class QkvProjection {
         private int vDim;
         private int outDim;
         private int qProjWidth;
+        private int qLatentDim;
         private String qWeight;
+        private String qNormWeight;
+        private String qUpWeight;
         private String kWeight;
         private String vWeight;
         private String qkvWeight;

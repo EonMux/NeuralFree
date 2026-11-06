@@ -41,6 +41,12 @@ public final class GpuHcExtra implements GpuLayerExtra {
     private int streamWidth;
     private int nEmbd;
 
+    /** Every hook is a per-row collapse or expand of x and the branch, exact over any step layout. */
+    @Override
+    public String batchRefusal() {
+        return null;
+    }
+
     @Override
     public void bind(GpuForwardContext ctx, LayerSpec layer) {
         Objects.requireNonNull(ctx, "ctx");
@@ -78,9 +84,16 @@ public final class GpuHcExtra implements GpuLayerExtra {
     public boolean afterMixer(int pos0, int nTokens, ScratchSlot x, ScratchSlot branch) {
         requireBound();
         branch.require((long) nTokens * nEmbd);
-        attn.expand(nTokens, branch.buffer(), branch.offset(), stream.buffer(), stream.offset(), stream.buffer(),
-                stream.offset());
-        ffn.collapse(nTokens, stream.buffer(), stream.offset(), x.buffer(), x.offset());
+        if (attn.canExpandNorm() && ffn.hasLeadingNorm()) {
+            attn.expandNorm(nTokens, branch.buffer(), branch.offset(), stream.buffer(), stream.offset(),
+                    stream.buffer(), stream.offset(), ffn.normGamma(), ffn.normGammaRows(), ffn.normScope(),
+                    ffn.normEps(), ffn.flatBuffer(), ffn.flatOffset());
+            ffn.collapseNormed(nTokens, stream.buffer(), stream.offset(), x.buffer(), x.offset());
+        } else {
+            attn.expand(nTokens, branch.buffer(), branch.offset(), stream.buffer(), stream.offset(),
+                    stream.buffer(), stream.offset());
+            ffn.collapse(nTokens, stream.buffer(), stream.offset(), x.buffer(), x.offset());
+        }
         return true;
     }
 

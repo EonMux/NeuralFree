@@ -5,4 +5,10 @@ LLM_Unary	unary.comp
 LLM_GLU	glu.comp
 # attn_ext.cl
 LLM_AttnTempScale	attn_ext.comp	OP=OP_ATTN_TEMP_SCALE
+LLM_AttnSsmaxScale	attn_ext.comp	OP=OP_ATTN_SSMAX_SCALE
 LLM_AttnOutGate	attn_ext.comp	OP=OP_ATTN_OUT_GATE
+LLM_InklingQueryScale	attn_ext.comp	OP=OP_ATTN_INKLING_QSCALE
+LLM_InklingRelLogits	attn_ext.comp	OP=OP_ATTN_INKLING_REL
+LLM_LoopAttnMix	attn_ext.comp	OP=OP_ATTN_LOOP_MIX
+LLM_AttnValueEmbd	attn_ext.comp	OP=OP_ATTN_VALUE_EMBD
+LLM_AttnXsa	attn_ext.comp	OP=OP_ATTN_XSA

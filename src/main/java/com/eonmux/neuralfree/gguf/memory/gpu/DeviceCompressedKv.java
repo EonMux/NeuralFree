@@ -99,6 +99,27 @@ public final class DeviceCompressedKv implements GpuCompressedKv, AutoCloseable 
         queue.enqueueCopyBuffer(stateScore, d * planeBytes, stateScore, 0, planeBytes);
     }
 
+    /**
+     * Copies every compressed row and every plane of both compressor tensors of {@code src}, another stream of the
+     * same plan, into this stream (llama.cpp's whole-sequence {@code seq_cp}, llama-kv-cache-dsv4.cpp:1649-1664), in
+     * order on {@code queue}.
+     *
+     * @throws IllegalArgumentException when {@code src} belongs to another layer or plan
+     */
+    void copyFrom(ComputeQueue queue, DeviceCompressedKv src) {
+        checkOpen();
+        src.checkOpen();
+        if (src.layer != layer || src.plan != plan) {
+            throw new IllegalArgumentException("cannot copy " + src + " into " + this);
+        }
+        if (src == this) {
+            return;
+        }
+        queue.enqueueCopyBuffer(src.cache, 0, cache, 0, cache.sizeInBytes());
+        queue.enqueueCopyBuffer(src.stateKv, 0, stateKv, 0, stateKv.sizeInBytes());
+        queue.enqueueCopyBuffer(src.stateScore, 0, stateScore, 0, stateScore.sizeInBytes());
+    }
+
     /** Zeroes the compressed rows and both compressor tensors, every plane. */
     void reset(ComputeQueue queue) {
         checkOpen();

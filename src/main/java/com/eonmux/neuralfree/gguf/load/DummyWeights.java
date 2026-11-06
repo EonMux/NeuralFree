@@ -27,7 +27,7 @@ import java.util.Objects;
  * benchmark setups; vLLM and SGLang dummy loaders). Consumers read the weights through the same seams as any
  * source: the {@link WeightStore} of {@code createMappedStore} and the regions of {@code openRegions}, with the
  * declared tensor types. A dummy load has no content inputs, so a model loaded this way contributes nothing to
- * the weights digest (N-2) and has nothing to persist.
+ * the weights digest and has nothing to persist.
  *
  * <p>Every element decodes to a finite value of its declared type: F32, F64, F16, BF16 encode a seeded uniform
  * value directly, the 8 / 16 / 32 / 64-bit integer types encode seeded integers, and every remaining (block

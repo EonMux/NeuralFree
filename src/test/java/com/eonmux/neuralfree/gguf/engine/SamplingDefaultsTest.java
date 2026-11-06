@@ -112,6 +112,7 @@ public class SamplingDefaultsTest {
         assertEquals(40, readOne(GgufKeys.GENERAL_SAMPLING_TOP_K, 40L).topK().intValue());
         assertEquals(128, readOne(GgufKeys.GENERAL_SAMPLING_PENALTY_LAST_N, (short) 128).penaltyLastN().intValue());
         assertEquals(-1, readOne(GgufKeys.NF_SAMPLING_MAX_NEW_TOKENS, -1).maxNewTokens().intValue());
+        assertEquals(2, readOne(GgufKeys.GENERAL_SAMPLING_MIROSTAT, 2L).mirostat().intValue());
         assertRejected(GgufKeys.GENERAL_SAMPLING_TOP_K, 1L << 40);
     }
 
@@ -176,7 +177,7 @@ public class SamplingDefaultsTest {
     @Test
     public void valuesWithoutASamplerStageAreRejectedOrIgnored() {
         assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT, 3);
-        assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT, 2L);
+        assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT, -1L);
         assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT_TAU, 0f);
         assertRejected(GgufKeys.GENERAL_SAMPLING_MIROSTAT_ETA, -0.1f);
         assertRejected(GgufKeys.GENERAL_SAMPLING_XTC_PROBABILITY, 1.5f);

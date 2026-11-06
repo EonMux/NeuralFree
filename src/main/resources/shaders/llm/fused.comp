@@ -1,0 +1,507 @@
+/* fused.comp - fused decode-path kernel pairs and fused KV-row writes (GLSL twin of kernels/llm/fused.cl, the
+ * semantic reference). Requires: common/nf_common.glsl, common/reduce.glsl, common/rope_common.glsl.
+ *
+ * A variants row selects OP:
+ *   OP_RMS_NORM_ROPE  (i n_tokens, i n_heads, i head_stride, i row_stride, i row_len, i mode, i n_dims,
+ *                      i n_offs, i pos_stride, i has_ff, i flags, i w_rows, i x_off, i y_off,
+ *                      i sect0, i sect1, i sect2, i sect3, f eps, f theta_scale, f freq_scale, f ext_factor,
+ *                      f attn_factor, f corr_lo, f corr_hi,
+ *                      R int pos, R float ff, R float w, R float b, R float x, float y)
+ *       RMS-normalize each (token, head) row of row_len values, then rotate its pairs as LLM_RoPE_Ext does; y may
+ *       be x. One workgroup per (token, head), global = n_tokens*n_heads*L.
+ *   OP_GDN_NORM_GATE  (i n_tokens, i n_heads, i head_dim, i row_stride, i x_off, i z_off, i out_off, i w_rows,
+ *                      f eps, R float x, R float w, R float z, float out)
+ *       out = silu(z) * rms_norm(x, w) per (token, value head). One workgroup per row.
+ *   OP_HC_POST_NORM   (i n_tokens, i n_embd, i hc, i has_comb, i post_act, i has_w, i w_rows, i scope, i y_off,
+ *                      i x_off, i post_off, i comb_off, i xout_off, i xn_off, f post_in_scale, f post_mag, f eps,
+ *                      R float y, R float X, R float post, R float comb, float Xout, R float gamma, float xn)
+ *       Expand one row into hc streams and RMS-normalize; scope 0 normalizes each stream row of n_embd values with
+ *       gamma, scope 1 normalizes each whole expanded row of hc*n_embd values without a weight. Xout may be X. One
+ *       workgroup per token. Requires 1 <= hc <= 8.
+ *   OP_NORM_ROPE_STORE (i n_tokens, i n_heads, i head_stride, i row_stride, i row_len, i mode, i n_dims, i n_offs,
+ *                      i pos_stride, i has_ff, i flags, i w_rows, i x_off, i dst_head_elems, i dst_row_stride,
+ *                      i dst_type, i sect0..i sect3, f eps, f theta_scale..f corr_hi,
+ *                      R int pos, R float ff, R float w, R float b, R float x, R int cell_idx, float dst)
+ *       RMS-normalize and rotate each (token, head) row, writing it directly to cache row cell_idx[t]; dst_type 0
+ *       is F32, 1 is F16. One workgroup per (token, head).
+ *   OP_ROPE_STORE     (i n_tokens, i n_heads, i head_dim, i row_stride, i mode, i n_dims, i n_offs, i pos_stride,
+ *                      i has_ff, i x_off, i dst_head_elems, i dst_row_stride, i dst_type, i sect0..i sect3,
+ *                      f theta_scale..f corr_hi, R int pos, R float ff, R float x, R int cell_idx, float dst)
+ *       Rotate each (token, head) row and write it directly to cache row cell_idx[t].
+ *
+ * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. The norms reduce
+ * with nf_wg_sum, so every invocation of a workgroup reaches every barrier.
+ */
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/nf_common.glsl"
+#include "common/rope_common.glsl"
+
+#define OP_RMS_NORM_ROPE     1
+#define OP_GDN_NORM_GATE     2
+#define OP_HC_POST_NORM      3
+#define OP_NORM_ROPE_STORE   4
+#define OP_ROPE_STORE        5
+
+#if !defined(OP)
+#error "fused.comp requires OP"
+#endif
+
+#define NF_FUSED_HAS_W 1
+#define NF_FUSED_HAS_B 2
+
+#if OP == OP_RMS_NORM_ROPE
+layout(std430, binding = 0) readonly buffer NfFusedPos { int pos[]; };
+layout(std430, binding = 1) readonly buffer NfFusedFf { float ff[]; };
+layout(std430, binding = 2) readonly buffer NfFusedW { float w_in[]; };
+layout(std430, binding = 3) readonly buffer NfFusedB { float b_in[]; };
+layout(std430, binding = 4) readonly buffer NfFusedX { float x_in[]; };
+layout(std430, binding = 5) buffer NfFusedY { float y_out[]; };
+layout(push_constant) uniform NfFusedRopeParams {
+    int n_tokens;
+    int n_heads;
+    int head_stride;
+    int row_stride;
+    int row_len;
+    int mode;
+    int n_dims;
+    int n_offs;
+    int pos_stride;
+    int has_ff;
+    int flags;
+    int w_rows;
+    int x_off;
+    int y_off;
+    int sect0;
+    int sect1;
+    int sect2;
+    int sect3;
+    float eps;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+} pc;
+#elif OP == OP_GDN_NORM_GATE
+layout(std430, binding = 0) readonly buffer NfFusedX { float x_in[]; };
+layout(std430, binding = 1) readonly buffer NfFusedW { float w_in[]; };
+layout(std430, binding = 2) readonly buffer NfFusedZ { float z_in[]; };
+layout(std430, binding = 3) buffer NfFusedOut { float out_v[]; };
+layout(push_constant) uniform NfFusedGateParams {
+    int n_tokens;
+    int n_heads;
+    int head_dim;
+    int row_stride;
+    int x_off;
+    int z_off;
+    int out_off;
+    int w_rows;
+    float eps;
+} pc;
+#elif OP == OP_HC_POST_NORM
+#define NF_FUSED_HC_MAX 8
+layout(std430, binding = 0) readonly buffer NfFusedY { float y_in[]; };
+layout(std430, binding = 1) readonly buffer NfFusedX { float X_in[]; };
+layout(std430, binding = 2) readonly buffer NfFusedPost { float post_in[]; };
+layout(std430, binding = 3) readonly buffer NfFusedComb { float comb_in[]; };
+layout(std430, binding = 4) buffer NfFusedXout { float Xout_v[]; };
+layout(std430, binding = 5) readonly buffer NfFusedGamma { float gamma_in[]; };
+layout(std430, binding = 6) buffer NfFusedXn { float xn_v[]; };
+layout(push_constant) uniform NfFusedHcParams {
+    int n_tokens;
+    int n_embd;
+    int hc;
+    int has_comb;
+    int post_act;
+    int has_w;
+    int w_rows;
+    int scope;
+    int y_off;
+    int x_off;
+    int post_off;
+    int comb_off;
+    int xout_off;
+    int xn_off;
+    float post_in_scale;
+    float post_mag;
+    float eps;
+} pc;
+#elif OP == OP_NORM_ROPE_STORE
+layout(std430, binding = 0) readonly buffer NfFusedPos { int pos[]; };
+layout(std430, binding = 1) readonly buffer NfFusedFf { float ff[]; };
+layout(std430, binding = 2) readonly buffer NfFusedW { float w_in[]; };
+layout(std430, binding = 3) readonly buffer NfFusedB { float b_in[]; };
+layout(std430, binding = 4) readonly buffer NfFusedX { float x_in[]; };
+layout(std430, binding = 5) readonly buffer NfFusedCell { int cell_in[]; };
+layout(std430, binding = 6) buffer NfFusedDstF { float dst_f[]; };
+layout(std430, binding = 6) buffer NfFusedDstH { uint16_t dst_h[]; };
+layout(push_constant) uniform NfFusedStoreParams {
+    int n_tokens;
+    int n_heads;
+    int head_stride;
+    int row_stride;
+    int row_len;
+    int mode;
+    int n_dims;
+    int n_offs;
+    int pos_stride;
+    int has_ff;
+    int flags;
+    int w_rows;
+    int x_off;
+    int dst_head_elems;
+    int dst_row_stride;
+    int dst_type;
+    int sect0;
+    int sect1;
+    int sect2;
+    int sect3;
+    float eps;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+} pc;
+#elif OP == OP_ROPE_STORE
+layout(std430, binding = 0) readonly buffer NfFusedPos { int pos[]; };
+layout(std430, binding = 1) readonly buffer NfFusedFf { float ff[]; };
+layout(std430, binding = 2) readonly buffer NfFusedX { float x_in[]; };
+layout(std430, binding = 3) readonly buffer NfFusedCell { int cell_in[]; };
+layout(std430, binding = 4) buffer NfFusedDstF { float dst_f[]; };
+layout(std430, binding = 4) buffer NfFusedDstH { uint16_t dst_h[]; };
+layout(push_constant) uniform NfFusedStoreParams {
+    int n_tokens;
+    int n_heads;
+    int head_dim;
+    int row_stride;
+    int mode;
+    int n_dims;
+    int n_offs;
+    int pos_stride;
+    int has_ff;
+    int x_off;
+    int dst_head_elems;
+    int dst_row_stride;
+    int dst_type;
+    int sect0;
+    int sect1;
+    int sect2;
+    int sect3;
+    float theta_scale;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float corr_lo;
+    float corr_hi;
+} pc;
+#else
+#error "fused.comp: OP is not a fused kernel"
+#endif
+
+#include "common/reduce.glsl"
+
+#if OP == OP_RMS_NORM_ROPE || OP == OP_GDN_NORM_GATE || OP == OP_HC_POST_NORM || OP == OP_NORM_ROPE_STORE \
+    || OP == OP_ROPE_STORE
+
+void main() {
+#if OP == OP_RMS_NORM_ROPE
+    const uint grp = nf_wg_id();
+    if (grp >= uint(pc.n_tokens) * uint(pc.n_heads)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint h = grp % uint(pc.n_heads);
+    const uint t = grp / uint(pc.n_heads);
+    const uint row_len = uint(pc.row_len);
+    const uint xb = uint(pc.x_off) + t * uint(pc.row_stride) + h * uint(pc.head_stride);
+    const uint yb = uint(pc.y_off) + t * uint(pc.row_stride) + h * uint(pc.head_stride);
+
+    float ss = 0.0;
+    for (uint i = lid; i < row_len; i += lsize) {
+        ss += x_in[xb + i] * x_in[xb + i];
+    }
+    const float rstd = inversesqrt(nf_wg_sum(ss) / float(row_len) + pc.eps);
+
+    const bool has_w = (pc.flags & NF_FUSED_HAS_W) != 0;
+    const bool has_b = (pc.flags & NF_FUSED_HAS_B) != 0;
+    const uint wrow = (pc.w_rows > 1 ? h % uint(pc.w_rows) : 0u) * row_len;
+    for (uint i = lid; i < row_len; i += lsize) {
+        float v = x_in[xb + i] * rstd;
+        if (has_w) {
+            v *= w_in[wrow + i];
+        }
+        if (has_b) {
+            v += b_in[wrow + i];
+        }
+        y_out[yb + i] = v;
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    const int n_pairs = nf_rope_pairs(pc.mode, pc.n_dims);
+    for (uint i = lid; i < uint(n_pairs); i += lsize) {
+        const int ii = int(i);
+        const int sec = nf_rope_section(pc.mode, ii, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+        const int e = nf_rope_theta_exp(pc.mode, ii, sec, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+        const int p = pos[int(t) + sec * pc.pos_stride];
+        const float f = pc.has_ff != 0 ? ff[ii] : 1.0;
+        const vec2 cs = nf_rope_cs(p, e, pc.theta_scale, f, pc.freq_scale, pc.ext_factor, pc.attn_factor,
+                                   pc.corr_lo, pc.corr_hi, ii);
+        const uint a = yb + uint(pc.n_offs) + uint(nf_rope_first(pc.mode, ii));
+        const uint c = a + uint(nf_rope_span(pc.mode, pc.n_dims));
+        const float y0 = y_out[a];
+        const float y1 = y_out[c];
+        y_out[a] = y0 * cs.x - y1 * cs.y;
+        y_out[c] = y0 * cs.y + y1 * cs.x;
+    }
+
+#elif OP == OP_GDN_NORM_GATE
+    const uint grp = nf_wg_id();
+    if (grp >= uint(pc.n_tokens) * uint(pc.n_heads)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint h = grp % uint(pc.n_heads);
+    const uint t = grp / uint(pc.n_heads);
+    const uint head_dim = uint(pc.head_dim);
+    const uint xb = uint(pc.x_off) + t * uint(pc.row_stride) + h * head_dim;
+    const uint zb = uint(pc.z_off) + t * uint(pc.row_stride) + h * head_dim;
+    const uint ob = uint(pc.out_off) + t * uint(pc.row_stride) + h * head_dim;
+    const uint wb = (pc.w_rows > 1 ? grp % uint(pc.w_rows) : 0u) * head_dim;
+
+    float ss = 0.0;
+    for (uint i = lid; i < head_dim; i += lsize) {
+        ss += x_in[xb + i] * x_in[xb + i];
+    }
+    const float rstd = inversesqrt(nf_wg_sum(ss) / float(head_dim) + pc.eps);
+    for (uint i = lid; i < head_dim; i += lsize) {
+        const float g = z_in[zb + i] / (1.0 + exp(-z_in[zb + i]));
+        out_v[ob + i] = g * (x_in[xb + i] * rstd * w_in[wb + i]);
+    }
+
+#elif OP == OP_NORM_ROPE_STORE
+    const uint grp = nf_wg_id();
+    if (grp >= uint(pc.n_tokens) * uint(pc.n_heads)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint h = grp % uint(pc.n_heads);
+    const uint t = grp / uint(pc.n_heads);
+    const int cell = cell_in[t];
+    if (cell < 0) {
+        return;
+    }
+    const uint row_len = uint(pc.row_len);
+    const uint xb = uint(pc.x_off) + t * uint(pc.row_stride) + h * uint(pc.head_stride);
+    const uint db = uint(cell) * uint(pc.dst_row_stride) + h * uint(pc.dst_head_elems);
+    const bool has_w = (pc.flags & NF_FUSED_HAS_W) != 0;
+    const bool has_b = (pc.flags & NF_FUSED_HAS_B) != 0;
+    const uint wrow = (pc.w_rows > 1 ? h % uint(pc.w_rows) : 0u) * row_len;
+
+    float ss = 0.0;
+    for (uint i = lid; i < row_len; i += lsize) {
+        ss += x_in[xb + i] * x_in[xb + i];
+    }
+    const float rstd = inversesqrt(nf_wg_sum(ss) / float(row_len) + pc.eps);
+    const int n_offs_end = pc.n_offs + (pc.mode == NF_ROPE_VISION ? 2 * pc.n_dims : pc.n_dims);
+    const int span = nf_rope_span(pc.mode, pc.n_dims);
+    for (uint i = lid; i < row_len; i += lsize) {
+        const uint xo = xb + i;
+        float v = x_in[xo] * rstd;
+        if (has_w) {
+            v *= w_in[wrow + i];
+        }
+        if (has_b) {
+            v += b_in[wrow + i];
+        }
+        if (int(i) >= pc.n_offs && int(i) < n_offs_end) {
+            const int rel = int(i) - pc.n_offs;
+            int pair;
+            int second;
+            if (pc.mode == NF_ROPE_NORM) {
+                pair = rel >> 1;
+                second = rel & 1;
+            } else if (pc.mode == NF_ROPE_VISION) {
+                pair = rel < pc.n_dims ? rel : rel - pc.n_dims;
+                second = rel >= pc.n_dims ? 1 : 0;
+            } else {
+                const int half_dims = pc.n_dims >> 1;
+                pair = rel < half_dims ? rel : rel - half_dims;
+                second = rel >= half_dims ? 1 : 0;
+            }
+            const int sec = nf_rope_section(pc.mode, pair, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+            const int e = nf_rope_theta_exp(pc.mode, pair, sec, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+            const int p = pos[t + uint(sec) * uint(pc.pos_stride)];
+            const float f = pc.has_ff != 0 ? ff[pair] : 1.0;
+            const vec2 cs = nf_rope_cs(p, e, pc.theta_scale, f, pc.freq_scale, pc.ext_factor, pc.attn_factor,
+                                       pc.corr_lo, pc.corr_hi, pair);
+            const uint other_i = uint(second != 0 ? int(i) - span : int(i) + span);
+            float other = x_in[xb + other_i] * rstd;
+            if (has_w) {
+                other *= w_in[wrow + other_i];
+            }
+            if (has_b) {
+                other += b_in[wrow + other_i];
+            }
+            v = second != 0 ? other * cs.y + v * cs.x : v * cs.x - other * cs.y;
+        }
+        if (pc.dst_type == 1) {
+            dst_h[db + i] = uint16_t(nf_rope_f16_bits(v));
+        } else {
+            dst_f[db + i] = v;
+        }
+    }
+
+#elif OP == OP_ROPE_STORE
+    const uint grp = nf_wg_id();
+    if (grp >= uint(pc.n_tokens) * uint(pc.n_heads)) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint h = grp % uint(pc.n_heads);
+    const uint t = grp / uint(pc.n_heads);
+    const int cell = cell_in[t];
+    if (cell < 0) {
+        return;
+    }
+    const uint head_dim = uint(pc.head_dim);
+    const uint xb = uint(pc.x_off) + t * uint(pc.row_stride) + h * head_dim;
+    const uint db = uint(cell) * uint(pc.dst_row_stride) + h * uint(pc.dst_head_elems);
+    const int n_offs_end = pc.n_offs + (pc.mode == NF_ROPE_VISION ? 2 * pc.n_dims : pc.n_dims);
+    const int span = nf_rope_span(pc.mode, pc.n_dims);
+    for (uint i = lid; i < head_dim; i += lsize) {
+        float v = x_in[xb + i];
+        if (int(i) >= pc.n_offs && int(i) < n_offs_end) {
+            const int rel = int(i) - pc.n_offs;
+            int pair;
+            int second;
+            if (pc.mode == NF_ROPE_NORM) {
+                pair = rel >> 1;
+                second = rel & 1;
+            } else if (pc.mode == NF_ROPE_VISION) {
+                pair = rel < pc.n_dims ? rel : rel - pc.n_dims;
+                second = rel >= pc.n_dims ? 1 : 0;
+            } else {
+                const int half_dims = pc.n_dims >> 1;
+                pair = rel < half_dims ? rel : rel - half_dims;
+                second = rel >= half_dims ? 1 : 0;
+            }
+            const int sec = nf_rope_section(pc.mode, pair, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+            const int e = nf_rope_theta_exp(pc.mode, pair, sec, pc.sect0, pc.sect1, pc.sect2, pc.sect3);
+            const int p = pos[t + uint(sec) * uint(pc.pos_stride)];
+            const float f = pc.has_ff != 0 ? ff[pair] : 1.0;
+            const vec2 cs = nf_rope_cs(p, e, pc.theta_scale, f, pc.freq_scale, pc.ext_factor, pc.attn_factor,
+                                       pc.corr_lo, pc.corr_hi, pair);
+            const uint other_i = uint(second != 0 ? int(i) - span : int(i) + span);
+            const float other = x_in[xb + other_i];
+            v = second != 0 ? other * cs.y + v * cs.x : v * cs.x - other * cs.y;
+        }
+        if (pc.dst_type == 1) {
+            dst_h[db + i] = uint16_t(nf_rope_f16_bits(v));
+        } else {
+            dst_f[db + i] = v;
+        }
+    }
+
+#else /* OP_HC_POST_NORM */
+    const uint t = nf_wg_id();
+    if (t >= uint(pc.n_tokens) || pc.hc < 1 || pc.hc > NF_FUSED_HC_MAX) {
+        return;
+    }
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint hc = uint(pc.hc);
+    const uint n_embd = uint(pc.n_embd);
+    const uint T = uint(t);
+    const uint yb = uint(pc.y_off) + T * n_embd;
+    const uint xb = uint(pc.x_off) + T * hc * n_embd;
+    const uint ob = uint(pc.xout_off) + T * hc * n_embd;
+    const uint nb = uint(pc.xn_off) + T * hc * n_embd;
+    const uint pb = uint(pc.post_off) + T * hc;
+    const uint cb = uint(pc.comb_off) + T * hc * hc;
+
+    float p[NF_FUSED_HC_MAX];
+    for (uint dst = 0u; dst < hc; ++dst) {
+        p[dst] = pc.post_act != 0
+                ? pc.post_mag / (1.0 + exp(-(pc.post_in_scale * post_in[pb + dst])))
+                : post_in[pb + dst];
+    }
+
+    const bool per_row = pc.scope == 0;
+    float ssq[NF_FUSED_HC_MAX];
+    for (uint dst = 0u; dst < hc; ++dst) {
+        ssq[dst] = 0.0;
+    }
+    float total = 0.0;
+    for (uint i = lid; i < n_embd; i += lsize) {
+        float src[NF_FUSED_HC_MAX];
+        for (uint h = 0u; h < hc; ++h) {
+            src[h] = X_in[xb + h * n_embd + i];
+        }
+        const float yv = y_in[yb + i];
+        for (uint dst = 0u; dst < hc; ++dst) {
+            float base = src[dst];
+            if (pc.has_comb != 0) {
+                base = 0.0;
+                for (uint s = 0u; s < hc; ++s) {
+                    base += src[s] * comb_in[cb + dst + hc * s];
+                }
+            }
+            const float v = yv * p[dst] + base;
+            if (per_row) {
+                ssq[dst] += v * v;
+            } else {
+                total += v * v;
+            }
+        }
+    }
+    float rstd[NF_FUSED_HC_MAX];
+    if (per_row) {
+        for (uint dst = 0u; dst < hc; ++dst) {
+            rstd[dst] = inversesqrt(nf_wg_sum(ssq[dst]) / float(n_embd) + pc.eps);
+        }
+    } else {
+        const float r = inversesqrt(nf_wg_sum(total) / float(hc * n_embd) + pc.eps);
+        for (uint dst = 0u; dst < hc; ++dst) {
+            rstd[dst] = r;
+        }
+    }
+
+    const bool has_gamma = pc.has_w != 0 && per_row;
+    for (uint i = lid; i < n_embd; i += lsize) {
+        float src[NF_FUSED_HC_MAX];
+        for (uint h = 0u; h < hc; ++h) {
+            src[h] = X_in[xb + h * n_embd + i];
+        }
+        const float yv = y_in[yb + i];
+        for (uint dst = 0u; dst < hc; ++dst) {
+            float base = src[dst];
+            if (pc.has_comb != 0) {
+                base = 0.0;
+                for (uint s = 0u; s < hc; ++s) {
+                    base += src[s] * comb_in[cb + dst + hc * s];
+                }
+            }
+            const float v = yv * p[dst] + base;
+            Xout_v[ob + dst * n_embd + i] = v;
+            const uint grow = pc.w_rows > 1 ? dst % uint(pc.w_rows) : 0u;
+            float nv = v * rstd[dst];
+            if (has_gamma) {
+                nv *= gamma_in[grow * n_embd + i];
+            }
+            xn_v[nb + dst * n_embd + i] = nv;
+        }
+    }
+#endif
+}
+
+#endif

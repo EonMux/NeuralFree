@@ -246,7 +246,7 @@ public final class VkProgramCache implements AutoCloseable {
             case CAP_STORAGE_PUSH_CONSTANT_8:
                 return "storagePushConstant8, which the backend does not enable";
             case CAP_VULKAN_MEMORY_MODEL:
-                return "vulkanMemoryModel, which the backend does not enable";
+                return need(VkPhysicalDeviceInfo.Feature.VULKAN_MEMORY_MODEL);
             default:
                 break;
         }

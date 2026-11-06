@@ -70,6 +70,11 @@ public final class CpuIndexerCache implements KvAccessor {
     }
 
     @Override
+    public void readKSlice(int row, int from, int n, float[] dst, int off) {
+        keys.readKSlice(row, from, n, dst, off);
+    }
+
+    @Override
     public void readV(int row, int head, float[] dst, int off) {
         keys.readV(row, head, dst, off);
     }
@@ -87,6 +92,11 @@ public final class CpuIndexerCache implements KvAccessor {
     @Override
     public void writeV(int row, float[] src, int off) {
         throw new UnsupportedOperationException("the indexer cache of layer " + layer() + " stores keys only");
+    }
+
+    @Override
+    public void copyRows(int srcRow, int dstRow, int n) {
+        keys.copyRows(srcRow, dstRow, n);
     }
 
     @Override

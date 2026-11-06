@@ -19,46 +19,69 @@ import java.util.Set;
  * text when it is no JSON value, as llama.cpp's {@code tool_arg_json_value | tool_arg_string_value} choice does
  * (common/parsers/qwen3-coder.cpp:113-140). A parameter the schema does not declare stays text.
  *
- * <p>{@link #arguments} renders the JSON object text the OpenAI {@code arguments} field carries. Immutable.
+ * <p>{@link #arguments} renders the JSON object text the OpenAI {@code arguments} field carries. The declared
+ * property schemas are kept too, for a format whose values nest by their schema (MiniMax-M3's recursive
+ * elements). Immutable.
  */
 public final class ToolSchemas {
-
-    private static final Set<String> STRING_ONLY = Collections.singleton("string");
 
     /** function name to parameter name to declared JSON types */
     private final Map<String, Map<String, Set<String>>> types;
 
-    private ToolSchemas(Map<String, Map<String, Set<String>>> types) {
+    /** function name to parameter name to its property schema, for formats whose values nest by schema */
+    private final Map<String, Map<String, Object>> schemas;
+
+    private ToolSchemas(Map<String, Map<String, Set<String>>> types,
+                        Map<String, Map<String, Object>> schemas) {
         this.types = types;
+        this.schemas = schemas;
     }
 
     /** The schemas of {@code tools}; a tool without a parameter schema types nothing. */
     public static ToolSchemas of(List<ChatTool> tools) {
         Map<String, Map<String, Set<String>>> out = new HashMap<>();
+        Map<String, Map<String, Object>> properties = new HashMap<>();
         for (ChatTool tool : tools) {
             Map<String, Set<String>> params = new HashMap<>();
+            Map<String, Object> declared = new HashMap<>();
             Map<String, Object> schema = tool.parameters();
             Object props = schema == null ? null : schema.get("properties");
             if (props instanceof Map) {
                 for (Map.Entry<?, ?> e : ((Map<?, ?>) props).entrySet()) {
                     params.put(String.valueOf(e.getKey()), typesOf(e.getValue()));
+                    declared.put(String.valueOf(e.getKey()), e.getValue());
                 }
             }
             out.put(tool.name(), params);
+            properties.put(tool.name(), declared);
         }
-        return new ToolSchemas(out);
+        return new ToolSchemas(out, properties);
     }
 
     /** No tools: every value stays text. */
     public static ToolSchemas none() {
-        return new ToolSchemas(Collections.<String, Map<String, Set<String>>>emptyMap());
+        return new ToolSchemas(Collections.<String, Map<String, Set<String>>>emptyMap(),
+                Collections.<String, Map<String, Object>>emptyMap());
+    }
+
+    /** The declared property schema of argument {@code param} of {@code function}, or null. */
+    public Object schemaOf(String function, String param) {
+        Map<String, Object> params = schemas.get(function);
+        return params == null ? null : params.get(param);
     }
 
     /** The JSON value of argument {@code param} of {@code function} written as {@code text}. */
     public Object value(String function, String param, String text) {
-        Map<String, Set<String>> params = types.get(function);
-        Set<String> t = params == null ? null : params.get(param);
-        if (t == null || t.isEmpty() || STRING_ONLY.equals(t)) {
+        return valueOfSchema(schemaOf(function, param), text);
+    }
+
+    /**
+     * The JSON value of {@code text} under property {@code schema}: a value whose schema admits only strings stays
+     * the text, any other declared type reads the text as JSON and keeps the text when it is no JSON value.
+     */
+    static Object valueOfSchema(Object schema, String text) {
+        Set<String> t = schema == null ? Collections.<String>emptySet() : typesOf(schema);
+        if (t.isEmpty() || (t.size() == 1 && t.contains("string"))) {
             return text;
         }
         Object parsed = JsonScan.parseOrNull(text.trim());
@@ -69,13 +92,23 @@ public final class ToolSchemas {
     }
 
     /**
-     * Whether argument {@code param} of {@code function} may be a string (no declared type, or {@code string} among
-     * them): a tagged-text format writes such a value raw, any other as JSON (llama.cpp {@code may_be_string}).
+     * Whether argument {@code param} of {@code function} may be a string (no declared type, or {@code string}
+     * among them): a tagged-text format writes such a value raw, any other as JSON (llama.cpp
+     * {@code may_be_string}).
      */
     public boolean textValued(String function, String param) {
         Map<String, Set<String>> params = types.get(function);
         Set<String> t = params == null ? null : params.get(param);
         return t == null || t.isEmpty() || t.contains("string");
+    }
+
+    /**
+     * Whether one property schema admits a string (or declares nothing): a tagged-text format writes such a
+     * value raw, any other as JSON.
+     */
+    public static boolean textValuedSchema(Object schema) {
+        Set<String> t = typesOf(schema);
+        return t.isEmpty() || t.contains("string");
     }
 
     /** The JSON object text of {@code args} (insertion order), the OpenAI {@code arguments} string. */
@@ -97,8 +130,46 @@ public final class ToolSchemas {
         return obj.substring(1, obj.length() - 1);
     }
 
+    /**
+     * Whether one property schema declares the object kind with named properties: a format that writes values as
+     * nested elements expands such a value instead of JSON text.
+     */
+    static boolean objectSchema(Object schema) {
+        if (!(schema instanceof Map)) {
+            return false;
+        }
+        Map<?, ?> m = (Map<?, ?>) schema;
+        Object props = m.get("properties");
+        return "object".equals(m.get("type")) && props instanceof Map && !((Map<?, ?>) props).isEmpty();
+    }
+
+    /** Whether one property schema declares the array kind. */
+    static boolean arraySchema(Object schema) {
+        return schema instanceof Map && "array".equals(((Map<?, ?>) schema).get("type"));
+    }
+
+    /** The item schema of an array property, or null when it declares none. */
+    static Object itemsSchema(Object schema) {
+        return schema instanceof Map ? ((Map<?, ?>) schema).get("items") : null;
+    }
+
+    /** The schema of property {@code key} of an object schema, or null. */
+    static Object propertySchema(Object schema, String key) {
+        Object props = schema instanceof Map ? ((Map<?, ?>) schema).get("properties") : null;
+        if (!(props instanceof Map)) {
+            return null;
+        }
+        return ((Map<?, ?>) props).get(key);
+    }
+
+    /** The required property names of an object schema; empty when it declares none. */
+    static List<?> requiredProperties(Object schema) {
+        Object required = schema instanceof Map ? ((Map<?, ?>) schema).get("required") : null;
+        return required instanceof List ? (List<?>) required : Collections.emptyList();
+    }
+
     /** The declared types of one property schema: {@code type} (a name or a list) and the {@code anyOf}/{@code oneOf} branches. */
-    private static Set<String> typesOf(Object schema) {
+    static Set<String> typesOf(Object schema) {
         Set<String> out = new LinkedHashSet<>();
         if (!(schema instanceof Map)) {
             return out;

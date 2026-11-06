@@ -42,7 +42,8 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * {@link Fp8Scheme}: E4M3 codes of every class through each target (zero-copy F8_E4M3 and its fold, per-channel and
+ * {@link Fp8Scheme}: E4M3 codes of every class through each target (zero-copy F8_E4M3FN at any K and its fold,
+ * per-channel and
  * block F8_E4M3_B128, E8M0 MXFP8 blocks), block grids that do not fit 128-element runs (fallback), DeepSeek-V4
  * {@code .scale} discovery, E8M0 NaN rejection, the MXFP8 repeat form, E5M2 and FNUZ weights, per-expert scales and
  * static activation scales. Every value is checked exactly against {@code code * scale}.
@@ -97,7 +98,7 @@ public class Fp8SchemeTest {
         HfTensorIndex out = Fp8Scheme.rewriteModules(args, List.of(M), plainConfig(), in,
                 ModelSourceOptions.defaults());
         RowSource w = rewritten(out);
-        assertEquals(GGMLType.F8_E4M3, w.format().ggmlType());
+        assertEquals(GGMLType.F8_E4M3FN, w.format().ggmlType());
         assertArrayEquals(codes, Fixture.bytes(w));
         assertArrayEquals(new float[]{0.375f}, w.outputScale(), 0f);
         assertEquals(ActQuantScheme.FP8_TOKEN, w.actQuant());
@@ -113,6 +114,23 @@ public class Fp8SchemeTest {
         float[] f = Fixture.values(folded);
         for (int i = 0; i < codes.length; i++) {
             assertEquals(FpBlockDecoders.e4m3ToFp32(codes[i]) * 0.375f, f[i], 0f);
+        }
+    }
+
+    @Test
+    public void perTensorE4m3IsZeroCopyAtAnyKIncludingOddRowLengths() throws IOException {
+        // K = 60: neither a whole 32- nor 128-element run, yet the per-element ggml type stores it zero-copy
+        for (int k : new int[]{32, 60, 96}) {
+            int n = 3;
+            byte[] codes = e4m3Codes(n * k);
+            HfTensorIndex in = fixture().add(M + ".weight", StDType.F8_E4M3, new long[]{n, k}, codes)
+                    .f32(M + ".weight_scale", new long[]{}, 2.0f).index();
+            QuantArgs args = QuantArgs.builder(QuantFormat.FP8).build();
+            RowSource w = rewritten(Fp8Scheme.rewriteModules(args, List.of(M), plainConfig(), in,
+                    ModelSourceOptions.defaults()));
+            assertEquals("K = " + k, GGMLType.F8_E4M3FN, w.format().ggmlType());
+            assertArrayEquals("K = " + k, codes, Fixture.bytes(w));
+            assertArrayEquals("K = " + k, new float[]{2.0f}, w.outputScale(), 0f);
         }
     }
 
@@ -310,7 +328,7 @@ public class Fp8SchemeTest {
         HfTensorIndex out = Fp8Scheme.rewriteModules(args, List.of(M), plainConfig(), in,
                 ModelSourceOptions.defaults());
         RowSource w = rewritten(out);
-        assertEquals(GGMLType.F8_E4M3, w.format().ggmlType());
+        assertEquals(GGMLType.F8_E4M3FN, w.format().ggmlType());
         assertArrayEquals(new float[]{0.5f, 0.25f}, w.outputScale(), 0f);
         assertArrayEquals(new float[]{3f, 5f}, w.inputScale(), 0f);
         assertEquals(ActQuantScheme.FP8_STATIC, w.actQuant());
@@ -478,6 +496,7 @@ public class Fp8SchemeTest {
                     case F32: out[i] = le.getFloat(4 * i); break;
                     case F16: out[i] = FpBlockDecoders.fp16ToFp32(le.getShort(2 * i) & 0xFFFF); break;
                     case BF16: out[i] = FpBlockDecoders.bf16ToFp32(le.getShort(2 * i) & 0xFFFF); break;
+                    case F8_E4M3: out[i] = FpBlockDecoders.e4m3ToFp32(le.get(i)); break;
                     default: throw new AssertionError("not a float format: " + s.format());
                 }
             }

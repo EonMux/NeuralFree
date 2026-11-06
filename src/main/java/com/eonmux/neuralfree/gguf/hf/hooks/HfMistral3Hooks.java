@@ -40,6 +40,8 @@ public final class HfMistral3Hooks {
     public static final String MISTRAL3_HEADLESS = "Mistral3Model";
     /** The {@code model_type} of Mistral 4, converted on the DeepSeek-V2 hooks (mistral3.py:67). */
     public static final String MODEL_TYPE_MISTRAL4 = "mistral4";
+    /** The BPE pre-tokenizer of a {@value #MISTRAL3_HEADLESS} embedding checkpoint (mistral3.py:42-45). */
+    public static final String NEMOTRON_EMBED_PRE = "nemotron-3.5-embed";
     /** The {@code model_type} of the Ministral 3 family, which requires YaRN (mistral3.py:28). */
     public static final String MODEL_TYPE_MINISTRAL3 = "ministral3";
 
@@ -170,7 +172,9 @@ public final class HfMistral3Hooks {
     /**
      * The {@code set_vocab} of the implementation. On {@link Arch#MISTRAL4}, {@link HfDeepseekHooks#vocab}; on
      * {@link Arch#MISTRAL3}, the Llama vocabulary of {@link HfLlamaHooks#vocab}, and for the embedding branch the
-     * {@code add_<t>_token(False)} of {@code Mistral3EmbedNemotronModel.set_vocab} (mistral3.py:37-40).
+     * {@code add_<t>_token(False)} of {@code Mistral3EmbedNemotronModel.set_vocab} (mistral3.py:37-40), with the
+     * {@value #NEMOTRON_EMBED_PRE} pre-tokenizer of its {@code get_vocab_base_pre} for a {@value #MISTRAL3_HEADLESS}
+     * root architecture (mistral3.py:42-45).
      *
      * @throws IOException when a tokenizer file cannot be read
      */
@@ -178,7 +182,9 @@ public final class HfMistral3Hooks {
         if (ctx.arch() == Arch.MISTRAL4) {
             return HfDeepseekHooks.vocab(ctx, pre);
         }
-        Map<String, Object> md = HfLlamaHooks.vocab(ctx, pre);
+        PreNameResolver names = MISTRAL3_HEADLESS.equals(ctx.config().architecture())
+                ? (tj, encode) -> NEMOTRON_EMBED_PRE : pre;
+        Map<String, Object> md = HfLlamaHooks.vocab(ctx, names);
         if (isEmbedBranch(ctx.config())) {
             Map<String, Object> out = new LinkedHashMap<>(md);
             out.put(GgufKeys.TOKENIZER_ADD_BOS, false);

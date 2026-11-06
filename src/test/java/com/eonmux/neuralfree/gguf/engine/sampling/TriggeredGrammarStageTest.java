@@ -23,8 +23,9 @@ import static org.junit.Assert.assertTrue;
  * The trigger-gated grammar (llama.cpp's lazy grammar, xgrammar's tag dispatch): free text until a trigger fires,
  * the grammar from the trigger's start on with the overlapping tokens replayed, a LAZY grammar to the end and a
  * DISPATCH grammar back to free text after each completed structure; token, pattern and full-pattern triggers; the
- * pre-mask that keeps a token from completing a trigger word with text the grammar rejects; prompt tokens and
- * {@code reset} leave the stage waiting.
+ * pre-mask that keeps a token from completing a trigger word with text the grammar rejects; the free-text
+ * excluded strings and tokens a structural tag hands the stage; prompt tokens and {@code reset} leave the stage
+ * waiting.
  */
 public class TriggeredGrammarStageTest {
 
@@ -166,6 +167,30 @@ public class TriggeredGrammarStageTest {
         Sampler sampler = Sampler.create(SamplerConfig.greedyDecoding(), new int[0], List.of(stage), VOCAB);
         int token = sampler.sample(prefer(128 + 1, 128));
         assertEquals("<t>", VOCAB.pieceText(token));
+    }
+
+    @Test
+    public void freeTextExcludedStringsAreMaskedWhileWaiting() {
+        Grammar g = grammar("root ::= \"<t>1\"");
+        TriggeredGrammarStage stage = new TriggeredGrammarStage(g, GrammarTriggers.lazyWords(List.of("<t>")),
+                VOCAB, List.of("no"), null);
+        // the 'o' completing the excluded "no" is masked, so the model falls back to ending the output
+        assertEquals("a n", run(stage, chars("a no"), 10));
+        TriggeredGrammarStage okBanned = new TriggeredGrammarStage(g, GrammarTriggers.lazyWords(List.of("<t>")),
+                VOCAB, List.of("ok"), null);
+        // the piece "ok\n<t>" writes the excluded "ok" before its last byte: it is masked all the same
+        assertEquals("", run(okBanned, new int[]{128 + 2}, 10));
+    }
+
+    @Test
+    public void freeTextExcludedTokensAreMaskedWhileWaitingOnly() {
+        Grammar g = grammar("root ::= \"<t>\" [q]");
+        TriggeredGrammarStage stage = new TriggeredGrammarStage(g, GrammarTriggers.lazyWords(List.of("<t>")),
+                VOCAB, null, new int[]{'q'});
+        assertEquals("a", run(stage, chars("aq"), 10));
+        stage.reset();
+        // once the trigger fires the grammar alone decides, and it wants the excluded token
+        assertEquals("<t>q", run(stage, chars("<t>q"), 10));
     }
 
     @Test

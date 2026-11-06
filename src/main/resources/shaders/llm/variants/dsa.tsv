@@ -9,6 +9,8 @@ LLM_DSA_IndexerScore_Q4_1	dsa_score.comp	KV=NF_KV_Q4_1
 LLM_DSA_IndexerScore_IQ4_NL	dsa_score.comp	KV=NF_KV_IQ4_NL
 LLM_DSA_IndexerScore_Q5_0	dsa_score.comp	KV=NF_KV_Q5_0
 LLM_DSA_IndexerScore_Q5_1	dsa_score.comp	KV=NF_KV_Q5_1
+LLM_DSA_IndexerScore_FP8_E4M3	dsa_score.comp	KV=NF_KV_FP8_E4M3
+LLM_DSA_IndexerScore_FP8_E5M2	dsa_score.comp	KV=NF_KV_FP8_E5M2
 LLM_TopK_Rows	topk_rows.comp
 LLM_MLA_SparseDecode_F32	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_F32	sg
 LLM_MLA_SparseDecode_F16	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_F16	sg
@@ -19,6 +21,8 @@ LLM_MLA_SparseDecode_Q4_1	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q4_1	sg
 LLM_MLA_SparseDecode_IQ4_NL	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_IQ4_NL	sg
 LLM_MLA_SparseDecode_Q5_0	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q5_0	sg
 LLM_MLA_SparseDecode_Q5_1	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_Q5_1	sg
+LLM_MLA_SparseDecode_FP8_E4M3	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_FP8_E4M3	sg
+LLM_MLA_SparseDecode_FP8_E5M2	sparse_mla.comp	OP=OP_SPARSE_DECODE KV=NF_KV_FP8_E5M2	sg
 LLM_MLA_SparsePrefill_F32	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_F32	sg
 LLM_MLA_SparsePrefill_F16	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_F16	sg
 LLM_MLA_SparsePrefill_Q8_0	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q8_0	sg
@@ -28,3 +32,7 @@ LLM_MLA_SparsePrefill_Q4_1	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q4_1	sg
 LLM_MLA_SparsePrefill_IQ4_NL	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_IQ4_NL	sg
 LLM_MLA_SparsePrefill_Q5_0	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q5_0	sg
 LLM_MLA_SparsePrefill_Q5_1	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_Q5_1	sg
+LLM_MLA_SparsePrefill_FP8_E4M3	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_FP8_E4M3	sg
+LLM_MLA_SparsePrefill_FP8_E5M2	sparse_mla.comp	OP=OP_SPARSE_PREFILL KV=NF_KV_FP8_E5M2	sg
+LLM_DSA_BlockScore	dsa_block_score.comp
+LLM_DSA_RestrictBlocks	dsa_restrict_blocks.comp

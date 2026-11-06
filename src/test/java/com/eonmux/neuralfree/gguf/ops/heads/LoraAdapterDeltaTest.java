@@ -47,12 +47,12 @@ public class LoraAdapterDeltaTest {
         }
 
         float[] direct = y0.clone();
-        a.delta(Q, 0.5f).add(n, x, xOff, xStride, new float[n * p.rank()], 0, direct, yOff, yStride);
+        a.delta(Q, 0.5f).addScaled(1.0f, n, x, xOff, xStride, new float[n * p.rank()], 0, direct, yOff, yStride);
         assertArrayEquals(expected, direct, EPS);
 
         CpuProjectionDeltas.Delta host = (CpuProjectionDeltas.Delta) CpuLoraDeltas.of(a.delta(Q, 0.5f));
         float[] viaHost = y0.clone();
-        host.add(n, x, xOff, xStride, viaHost, yOff, yStride);
+        host.add(1.0f, n, x, xOff, xStride, viaHost, yOff, yStride);
         assertArrayEquals(expected, viaHost, EPS);
     }
 
@@ -77,7 +77,7 @@ public class LoraAdapterDeltaTest {
             LoraFixtures.project(p, s, ids[q], tokenRows, 1 + (q / k) * in, expected, q * out);
         }
         float[] y = y0.clone();
-        host.add(pairs, k, ids, tokenRows, 1, true, y, 0);
+        host.add(1.0f, pairs, k, ids, tokenRows, 1, true, y, 0);
         assertArrayEquals(expected, y, EPS);
 
         float[] pairRows = LoraFixtures.random(43, pairs * in);
@@ -86,7 +86,7 @@ public class LoraAdapterDeltaTest {
             LoraFixtures.project(p, s, ids[q], pairRows, q * in, expectedPairs, q * out);
         }
         float[] y2 = y0.clone();
-        host.add(pairs, k, ids, pairRows, 0, false, y2, 0);
+        host.add(1.0f, pairs, k, ids, pairRows, 0, false, y2, 0);
         assertArrayEquals(expectedPairs, y2, EPS);
     }
 
@@ -95,7 +95,7 @@ public class LoraAdapterDeltaTest {
         LoraAdapter.Pair p = LoraFixtures.experts(UP_EXPS, 4, 3, 2, 3, 51);
         LoraAdapter.Delta d = LoraFixtures.adapter("a.gguf", 0.0f, p).delta(UP_EXPS, 1.0f);
         try {
-            d.addExperts(1, 1, new int[]{3}, new float[4], 0, false, new float[5], new float[3], 0);
+            d.addExpertsScaled(1.0f, 1, 1, new int[]{3}, new float[4], 0, false, new float[5], new float[3], 0);
             fail("expert 3 of a three-expert pair must be rejected");
         } catch (IllegalArgumentException expected) {
             assertTrue(expected.getMessage().contains(UP_EXPS));
@@ -120,7 +120,7 @@ public class LoraAdapterDeltaTest {
         CpuProjectionDeltas.EmbeddingDelta host = (CpuProjectionDeltas.EmbeddingDelta) CpuLoraDeltas.of(
                 a.delta(EMBD, 3.0f));
         float[] y = y0.clone();
-        host.add(3, ids, 1, y, yOff, yStride);
+        host.add(1.0f, 3, ids, 1, y, yOff, yStride);
         assertArrayEquals(expected, y, EPS);
     }
 
@@ -129,7 +129,7 @@ public class LoraAdapterDeltaTest {
         LoraAdapter.Pair p = LoraFixtures.experts(UP_EXPS, 4, 3, 2, 3, 71);
         LoraAdapter.Delta d = LoraFixtures.adapter("a.gguf", 0.0f, p).delta(UP_EXPS, 1.0f);
         try {
-            d.add(1, new float[4], 0, 4, new float[2], 0, new float[3], 0, 3);
+            d.addScaled(1.0f, 1, new float[4], 0, 4, new float[2], 0, new float[3], 0, 3);
             fail("an expert pair must refuse the dense projection delta");
         } catch (IllegalStateException expected) {
             assertTrue(expected.getMessage().contains("EXPERTS"));

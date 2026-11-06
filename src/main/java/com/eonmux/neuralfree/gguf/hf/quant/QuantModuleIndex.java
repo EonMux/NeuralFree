@@ -41,10 +41,10 @@ public final class QuantModuleIndex {
             // GPTQ, AWQ, MLX and bitsandbytes
             "qweight", "qzeros", "scales", "g_idx", "biases", "SCB", "weight_format", "absmax", "quant_map",
             "nested_absmax", "nested_quant_map",
-            // compressed-tensors, ModelOpt and FP8
+            // compressed-tensors, ModelOpt, Quark and FP8
             "weight_packed", "weight_scale", "weight_zero_point", "weight_shape", "weight_g_idx", "weight_global_scale",
-            "input_global_scale", "input_scale", "input_zero_point", "output_scale", "weight_scale_inv",
-            "weight_scale_2", "qscale_weight", "qscale_act",
+            "input_global_scale", "input_scale", "input_scale_2", "input_zero_point", "output_scale",
+            "weight_scale_inv", "weight_scale_2", "qscale_weight", "qscale_act",
             // HQQ and fp_quant
             "W_q", "dqweight", "act_global_scale", "forward_hadamard_matrix", "backward_hadamard_matrix"));
 

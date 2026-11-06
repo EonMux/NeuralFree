@@ -7,6 +7,9 @@ import com.eonmux.neuralfree.gguf.engine.DraftModel;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.HiddenTap;
+import com.eonmux.neuralfree.gguf.engine.draft.DraftProbs;
+import com.eonmux.neuralfree.gguf.engine.watermark.DraftWatermarker;
+import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlanner;
@@ -27,6 +30,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.SplittableRandom;
 
 /**
  * The Gemma 4 assistant drafter (llama.cpp src/models/gemma4-assistant.cpp), driven like llama.cpp
@@ -47,7 +51,7 @@ import java.util.Objects;
  * {@code h_next}. The target's caches hold positions below {@code P} then, so the queries see exactly the verified
  * context.
  */
-public final class Gemma4AssistantDraftModel implements DraftModel {
+public final class Gemma4AssistantDraftModel implements DraftModel, DraftProbs {
 
     private final MtpHead head;
     private final DraftModelLoader.Options options;
@@ -79,6 +83,15 @@ public final class Gemma4AssistantDraftModel implements DraftModel {
     private Rows xn;
     private Rows hNext;
     private float[] logits;
+
+    /** The draft-side watermark of the current generation, or null for the ordinary greedy pick. */
+    private DraftWatermarker draftWatermark;
+    private SplittableRandom draftRng;
+    private float draftTemperature = 1f;
+    /** The proposal distributions of the last draft's emitted positions, by position (null entries for greedy). */
+    private final List<float[]> draftProposals = new ArrayList<>();
+    /** The tokens the last draft emitted. */
+    private int draftCount;
 
     private DraftModelLoader.HiddenRows hidden;
 
@@ -234,9 +247,21 @@ public final class Gemma4AssistantDraftModel implements DraftModel {
 
     @Override
     public int[] draft(int lastToken, int n) {
+        return draft(lastToken, n, 1f);
+    }
+
+    @Override
+    public int[] draft(int lastToken, int n, float temperature) {
         requireBound();
         if (n < 0) {
             throw new IllegalArgumentException("draft length " + n + " is negative");
+        }
+        draftProposals.clear();
+        draftCount = 0;
+        draftTemperature = temperature;
+        if (draftWatermark != null && temperature > 0f) {
+            draftWatermark.sync(targetSequence.textTokens(), lastToken);
+            draftWatermark.beginRound();
         }
         sync();
         int pos = targetSequence.nPast();
@@ -256,9 +281,16 @@ public final class Gemma4AssistantDraftModel implements DraftModel {
             stack.run(pos, 1, one, x);
             head.norm(NormKind.RMS, Source.DRAFT, outputNorm, eps, x, xn, 1);
             head.logits(Source.DRAFT, headWeight, xn, 0, logits);
-            Pick p = DraftModelLoader.pick(logits, vocab);
+            boolean watermarked = draftWatermark != null && draftTemperature > 0f;
+            Pick p = watermarked
+                    ? DraftModelLoader.pick(logits, vocab, draftWatermark, draftTemperature,
+                            draftRng::nextDouble)
+                    : DraftModelLoader.pick(logits, vocab);
             if (p.p < options.pMin()) {
                 break;
+            }
+            if (watermarked) {
+                draftProposals.add(p.proposal);
             }
             out[made++] = p.id;
             one[0] = p.id;
@@ -267,7 +299,31 @@ public final class Gemma4AssistantDraftModel implements DraftModel {
                 head.readRow(hNext, 0, h);
             }
         }
+        draftCount = made;
         return Arrays.copyOf(out, made);
+    }
+
+    @Override
+    public boolean supportsWatermarking() {
+        return true;
+    }
+
+    @Override
+    public void watermark(WatermarkConfig config, int promptLength, long seed) {
+        this.draftWatermark = DraftWatermarker.of(config);
+        if (draftWatermark != null) {
+            draftWatermark.reset(promptLength);
+        }
+        this.draftRng = draftWatermark == null ? null : new SplittableRandom(seed);
+    }
+
+    @Override
+    public float[] draftProbs(int position) {
+        if (position < 0 || position >= draftCount) {
+            throw new IllegalStateException("no drafted token at position " + position);
+        }
+        float[] row = position < draftProposals.size() ? draftProposals.get(position) : null;
+        return row == null ? null : row.clone();
     }
 
     @Override
@@ -281,7 +337,14 @@ public final class Gemma4AssistantDraftModel implements DraftModel {
     }
 
     @Override
+    public boolean readsTargetHidden() {
+        return true;
+    }
+
+    @Override
     public void reset() {
+        draftProposals.clear();
+        draftCount = 0;
         if (backend == null) {
             return;
         }

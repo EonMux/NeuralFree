@@ -37,6 +37,7 @@ public final class NormKernels {
     public static final String GROUP_RMS = "LLM_GroupRms";
     public static final String GROUP_NORM = "LLM_GroupNorm";
     public static final String RESIDUAL_MIX = "LLM_ResidualMix";
+    public static final String RESIDUAL_MIX_NORM = "LLM_ResidualMixNorm";
     public static final String MUL_ROW_SCALE = "LLM_MulRowScale";
 
     /** {@code LLM_RowNorm} flag: a weight is bound. */
@@ -93,6 +94,24 @@ public final class NormKernels {
     public static final int ARG_MIX_BETA = 10;
     public static final int ARG_MIX_OUT = 11;
     public static final int RESIDUAL_MIX_ARG_COUNT = 12;
+
+    public static final int ARG_MIX_NORM_N_ROWS = 0;
+    public static final int ARG_MIX_NORM_ROW_LEN = 1;
+    public static final int ARG_MIX_NORM_MODE = 2;
+    public static final int ARG_MIX_NORM_EPS = 3;
+    public static final int ARG_MIX_NORM_FLAGS = 4;
+    public static final int ARG_MIX_NORM_W_ROWS = 5;
+    public static final int ARG_MIX_NORM_MIX_MODE = 6;
+    public static final int ARG_MIX_NORM_MIX_S = 7;
+    public static final int ARG_MIX_NORM_X_OFF = 8;
+    public static final int ARG_MIX_NORM_ADD_OFF = 9;
+    public static final int ARG_MIX_NORM_Y_OFF = 10;
+    public static final int ARG_MIX_NORM_X = 11;
+    public static final int ARG_MIX_NORM_ADDEND = 12;
+    public static final int ARG_MIX_NORM_W = 13;
+    public static final int ARG_MIX_NORM_B = 14;
+    public static final int ARG_MIX_NORM_Y = 15;
+    public static final int RESIDUAL_MIX_NORM_ARG_COUNT = 16;
 
     public static final int ARG_ROW_SCALE_N_ROWS = 0;
     public static final int ARG_ROW_SCALE_ROW_LEN = 1;
@@ -258,6 +277,58 @@ public final class NormKernels {
             throw new IllegalArgumentException("group norm cannot run in place");
         }
         return new Object[]{nCh, len, nGroups, eps, x, w, b, y};
+    }
+
+    /**
+     * Arguments of {@code LLM_ResidualMixNorm} in signature order: row {@code r < nRows} of {@code rowLen}
+     * floats is rewritten as {@code x[r] = mix(x[r], addend[r])} ({@link MixMode#ADD} or
+     * {@link MixMode#SCALED}) and its norm of {@code kind} is written to {@code y[r]}, weighted and offset
+     * as {@link #rowNormArgs} describes for {@code LLM_RowNorm}. {@code x} and {@code y} must not overlap.
+     *
+     * @throws IllegalArgumentException for a mix mode other than ADD or SCALED, a non-row-norm kind, an
+     *                                  invalid eps, shape or weight/bias, a view outside its buffer, or
+     *                                  overlapping x/y views
+     */
+    public static Object[] residualMixNormArgs(MixMode mix, float s, NormKind kind, float eps, int nRows,
+                                               int rowLen, int xOff, int addOff, int yOff,
+                                               GpuBuffer x, GpuBuffer addend, GpuBuffer w, GpuBuffer b, int wRows,
+                                               GpuBuffer y, GpuBuffer placeholder) {
+        Objects.requireNonNull(mix, "mix mode");
+        if (mix != MixMode.ADD && mix != MixMode.SCALED) {
+            throw new IllegalArgumentException("LLM_ResidualMixNorm fuses the residual modes ADD and SCALED, got "
+                    + mix);
+        }
+        if (Float.isNaN(s) || Float.isInfinite(s)) {
+            throw new IllegalArgumentException("residual scale must be finite, got " + s);
+        }
+        Objects.requireNonNull(kind, "kind");
+        if (!kind.isRowNorm()) {
+            throw new IllegalArgumentException(kind + " is not an LLM_RowNorm mode");
+        }
+        checkEps(eps);
+        checkPositive(rowLen, "row length");
+        checkNonNegative(nRows, "row count");
+        if (wRows < 1) {
+            throw new IllegalArgumentException("weight rows must be at least 1, got " + wRows);
+        }
+        ActKernels.elementCount(nRows, rowLen);
+        ActKernels.checkFloatView("residual input", x, xOff, rowLen, nRows, rowLen);
+        ActKernels.checkFloatView("residual branch", addend, addOff, rowLen, nRows, rowLen);
+        ActKernels.checkFloatView("norm output", y, yOff, rowLen, nRows, rowLen);
+        checkSameOrDisjoint("norm", x, xOff, y, yOff, extent(nRows, rowLen, rowLen));
+        int flags = 0;
+        if (w != null) {
+            ActKernels.checkFloatView("norm weight", w, 0, rowLen, wRows, rowLen);
+            flags |= FLAG_HAS_W;
+        }
+        if (b != null) {
+            ActKernels.checkFloatView("norm bias", b, 0, rowLen, wRows, rowLen);
+            flags |= FLAG_HAS_B;
+        }
+        GpuBuffer wArg = w != null ? w : Objects.requireNonNull(placeholder, "placeholder for the absent weight");
+        GpuBuffer bArg = b != null ? b : Objects.requireNonNull(placeholder, "placeholder for the absent bias");
+        return new Object[]{nRows, rowLen, kind.rowNormMode(), eps, flags, wRows, mix.code(), s, xOff, addOff,
+                yOff, x, addend, wArg, bArg, y};
     }
 
     /**

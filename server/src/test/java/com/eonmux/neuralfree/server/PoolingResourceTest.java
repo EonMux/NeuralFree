@@ -37,7 +37,7 @@ public class PoolingResourceTest {
     @BeforeAll
     static void open() throws IOException {
         Path bertModel = SyntheticModels.bert().writeTempFile();
-        bert = new EngineService(bertModel.toString(), EngineConfig.builder().build());
+        bert = new EngineService(bertModel.toString(), ServerTestSupport.config().build());
         Path llamaModel = SyntheticModels.llama().writeTempFile();
         llama = new EngineService(llamaModel.toString(), ServerTestSupport.pagedConfig(64, 2));
         embeddings = new PoolingResource(bert);

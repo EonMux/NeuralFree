@@ -6,17 +6,19 @@ import com.eonmux.neuralfree.gguf.hparams.hooks.HybridHooksLfm;
 import com.eonmux.neuralfree.gguf.hparams.hooks.HybridHooksLightning;
 import com.eonmux.neuralfree.gguf.hparams.hooks.HybridHooksRwkv;
 import com.eonmux.neuralfree.gguf.hparams.hooks.HybridHooksSsm;
+import com.eonmux.neuralfree.gguf.hparams.hooks.InklingHooks;
 import com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirementsGdn;
 import com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirementsKda;
 import com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirementsRwkv;
 import com.eonmux.neuralfree.gguf.spec.req.HybridTensorRequirementsSsm;
+import com.eonmux.neuralfree.gguf.spec.req.InklingTensorRequirements;
 
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
 /**
- * Architecture table for the recurrent and hybrid architectures: 23 generative decoders whose memory holds
+ * Architecture table for the recurrent and hybrid architectures: 28 generative decoders whose memory holds
  * recurrent states (Mamba SSM, RWKV, Gated DeltaNet, KDA, lightning attention, short convolution), alone or
  * next to an attention KV cache, in llama.cpp {@code llm_arch} order. {@link ArchRegistry} merges this table
  * with the other tables; an architecture appears in exactly one table.
@@ -46,6 +48,12 @@ public final class ArchTableHybrid {
                         HybridHooksGdn::qwen35, HybridTensorRequirementsGdn.qwen35()),
                 ArchEntry.of(qwenGdn(Arch.QWEN35MOE, RopeType.IMROPE).build(),
                         HybridHooksGdn::qwen35moe, HybridTensorRequirementsGdn.qwen35moe()),
+                // OLMo Hybrid alternates pre-norm Gated DeltaNet layers with OLMo2 post-norm attention layers; the
+                // per-layer tensor sets pick the norm placement (PRE_FFN on GDN layers, branch post norms on
+                // attention layers). The attention layers rotate only when the file's rope pattern and rotary width
+                // enable it; released checkpoints rotate nothing.
+                ArchEntry.of(hybrid(Arch.OLMO_HYBRID, RopeType.NEOX).build(),
+                        HybridHooksGdn::olmoHybrid, HybridTensorRequirementsGdn.olmoHybrid()),
                 // Hyper-connection mixers replace the residual adds and the block norms; the QSA indexer of the
                 // attention layers needs the indexed hybrid memory (llama-model.cpp:3120, 3139-3143).
                 ArchEntry.of(hybrid(Arch.QWEN4EXP, RopeType.IMROPE).memoryKind(MemoryKind.HYBRID_IDX)
@@ -60,6 +68,11 @@ public final class ArchTableHybrid {
                         HybridHooksSsm::mamba, HybridTensorRequirementsSsm.mamba()),
                 ArchEntry.of(recurrent(Arch.MAMBA2).graphFamily(Arch.MAMBA).build(),
                         HybridHooksSsm::mamba2, HybridTensorRequirementsSsm.mamba2()),
+                // Every block runs a Mamba-2 mixer; hybrid blocks first run one of the shared attention/MLP blocks,
+                // whose GELU-gated MLP and whole-head NEOX RoPE are parameters of the shared block (vLLM
+                // Zamba2ForCausalLM, vllm/model_executor/models/zamba2.py).
+                ArchEntry.of(hybrid(Arch.ZAMBA2, RopeType.NEOX).ffnAct(ActOp.GELU_ERF).build(),
+                        HybridHooksSsm::zamba2, HybridTensorRequirementsSsm.zamba2()),
                 ArchEntry.of(hybrid(Arch.JAMBA, RopeType.NONE).build(),
                         HybridHooksSsm::jamba, HybridTensorRequirementsSsm.jamba()),
                 // Every block runs the Mamba-2 and attention mixers in parallel and keeps both memories
@@ -94,20 +107,41 @@ public final class ArchTableHybrid {
                 ArchEntry.of(hybrid(Arch.LFM2MOE, RopeType.NEOX).graphFamily(Arch.LFM2)
                                 .defaultGating(GatingFunc.SIGMOID).build(),
                         HybridHooksLfm::lfm2moe, HybridTensorRequirementsRwkv.lfm2moe()),
+                // Optional sandwich post norms; full-attention layers rotate with learned rope_freqs, SWA layers
+                // with the SWA base (lfm3.cpp:113, 20). The non-causal d1 files run without memory.
+                ArchEntry.of(hybrid(Arch.LFM3, RopeType.NEOX).build(),
+                        HybridHooksLfm::lfm3, HybridTensorRequirementsRwkv.lfm3()),
                 // Both residual branches add the normed block input scaled by residual_scale
                 // (minimax-01.cpp:246-249, 428, 440, 455).
                 ArchEntry.of(hybrid(Arch.MINIMAX_01, RopeType.NEOX).residualKind(ResidualKind.NORMED_INPUT_SCALED).build(),
                         HybridHooksLightning::minimax01, HybridTensorRequirementsGdn.minimax01()),
+                // Bailing MoE V2.5: lightning layers with the NEOX rotation, per-head Q/K norms, the Q scale and
+                // the grouped output norm of vLLM's BailingMoELinearAttention, alternating with MLA attention
+                // layers that carry the compressed KV latent.
+                ArchEntry.of(hybrid(Arch.BAILINGMOE_V25, RopeType.NORM).build(),
+                        HybridHooksLightning::bailingV25, HybridTensorRequirementsGdn.bailingV25()),
                 ArchEntry.of(hybrid(Arch.KIMI_LINEAR, RopeType.NONE).defaultGating(GatingFunc.SIGMOID).build(),
                         HybridHooksKda::kimiLinear, HybridTensorRequirementsKda.kimiLinear()),
                 // Cross-layer attention residuals (attn_res_block_size) and the SiTU GLU (situ_beta,
                 // situ_linear_beta) are file-resolved hparams (kimi-k3.cpp:43-45, 590).
                 ArchEntry.of(hybrid(Arch.KIMI_K3, RopeType.NONE).defaultGating(GatingFunc.SIGMOID).build(),
                         HybridHooksKda::kimiK3, HybridTensorRequirementsKda.kimiK3()),
+                // AliceAI: pre-norm KDA layers alternating with Qwen3-Next gated attention; both branches feed a
+                // sigmoid-routed MoE with a gated shared expert, and block_attn_res_block_size groups the
+                // cross-layer attention residuals (vLLM models/alice_ai.py). The attention layers rotate only.
+                ArchEntry.of(hybrid(Arch.ALICE_AI, RopeType.NEOX).defaultGating(GatingFunc.SIGMOID).build(),
+                        HybridHooksKda::aliceAi, HybridTensorRequirementsKda.aliceAi()),
                 // KDA + k-pool DSA hybrid with mHC residual streams (llama-model.cpp:2883-2900).
                 ArchEntry.of(hybrid(Arch.GLM5_NEXT, RopeType.NONE).memoryKind(MemoryKind.HYBRID_IDX)
                                 .residualKind(ResidualKind.HYPER_CONNECTIONS).defaultGating(GatingFunc.SIGMOID).build(),
-                        HybridHooksKda::glm5Next, HybridTensorRequirementsKda.glm5Next())));
+                        HybridHooksKda::glm5Next, HybridTensorRequirementsKda.glm5Next()),
+                // Inkling (vLLM models/inkling): NoPE attention with per-query relative logits, per-head Q/K RMS
+                // norms and short convolutions on the K/V streams, plus short convolutions on the attention-output
+                // and MLP-output residual streams; every layer keeps a KV cache and a packed conv state.
+                ArchEntry.of(hybrid(Arch.INKLING, RopeType.NONE)
+                                .ffnGating(FfnGating.PAR)
+                                .residualKind(ResidualKind.STANDARD).build(),
+                        InklingHooks::apply, InklingTensorRequirements.inkling())));
     }
 
     /** RMS-normed SwiGLU decoder with recurrent and attention layers ({@link MemoryKind#HYBRID}). */

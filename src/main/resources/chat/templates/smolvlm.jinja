@@ -1,0 +1,15 @@
+{#- llama.cpp smolvlm chat template (src/llama-chat.cpp:777-792): <|im_start|> is the BOS text, the turns are not ChatML. -#}
+{{- '<|im_start|>' -}}
+{%- for message in messages -%}
+    {%- set content = message['content'] if message['content'] is string else '' -%}
+    {%- if message['role'] == 'system' -%}
+        {{- content ~ '\n\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- 'User: ' ~ content ~ '<end_of_utterance>\n' -}}
+    {%- else -%}
+        {{- 'Assistant: ' ~ content ~ '<end_of_utterance>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- 'Assistant:' -}}
+{%- endif -%}

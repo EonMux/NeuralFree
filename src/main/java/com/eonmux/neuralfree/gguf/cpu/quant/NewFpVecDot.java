@@ -13,6 +13,8 @@ import java.util.Set;
 
 import static com.eonmux.neuralfree.gguf.quant.BlockLayout.*;
 import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.fp16At;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.intAt;
+import static com.eonmux.neuralfree.gguf.quant.FpBlockDecoders.longAt;
 
 /**
  * CPU vec-dot of the newer low-bit types against Q8_0 activations: NVFP4 (64-element blocks of four
@@ -40,7 +42,7 @@ public final class NewFpVecDot implements CpuVecDot {
     /** One row kernel: {@code nb} weight blocks starting at absolute index {@code off} of {@code b}. */
     @FunctionalInterface
     private interface RowKernel {
-        float dot(ByteBuffer b, int off, QuantizedActivations x, int nb);
+        float dot(byte[] b, int off, QuantizedActivations x, int nb);
     }
 
     private final GGMLType type;
@@ -108,14 +110,18 @@ public final class NewFpVecDot implements CpuVecDot {
     @Override
     public float dotRow(CpuTensorRef w, long row, QuantizedActivations x) {
         check(w, x);
-        return kernel.dot(w.rowBuffer(row), w.rowOffset(row), x, (int) (w.cols() / blockElements));
+        return kernel.dot(CpuVecDotRows.copyRow(w, row), 0, x, (int) (w.cols() / blockElements));
+    }
+
+    @Override
+    public float dotRowBytes(byte[] row, int off, QuantizedActivations x) {
+        return kernel.dot(row, off, x, x.n / blockElements);
     }
 
     @Override
     public void dotRows(CpuTensorRef w, long rowStart, int rowCount, QuantizedActivations x, float[] y, int yOff) {
         check(w, x);
-        final int nb = (int) (w.cols() / blockElements);
-        CpuVecDotRows.forEachRow(w, rowStart, rowCount, y, yOff, (b, off) -> kernel.dot(b, off, x, nb));
+        CpuVecDotRows.forEachRowBytes(w, rowStart, rowCount, this, x, y, yOff);
     }
 
     private void check(CpuTensorRef w, QuantizedActivations x) {
@@ -132,7 +138,7 @@ public final class NewFpVecDot implements CpuVecDot {
      * {@code ggml_vec_dot_nvfp4_q8_0_generic} (llama.cpp ggml-cpu/quants.c:330-363): sub-block {@code s} (16
      * elements) of weight block {@code ib} pairs with half {@code s % 2} of Q8_0 block {@code 2*ib + s/2}.
      */
-    private static float dotNvfp4(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotNvfp4(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         final int nSub = QK_NVFP4 / QK_NVFP4_SUB;
@@ -140,7 +146,7 @@ public final class NewFpVecDot implements CpuVecDot {
         float sumf = 0;
         for (int ib = 0; ib < nb; ++ib, off += NVFP4_BYTES) {
             for (int s = 0; s < nSub; ++s) {
-                final float d = UE4M3[b.get(off + NVFP4_D + s) & 0xFF];
+                final float d = UE4M3[b[off + NVFP4_D + s] & 0xFF];
                 final int q8Block = 2 * ib + s / 2;
                 final int o = q8Block * QK8_0 + (s % 2) * QK_NVFP4_SUB;
                 final float dy = yd[q8Block];
@@ -148,7 +154,7 @@ public final class NewFpVecDot implements CpuVecDot {
                 int sumiLo = 0;
                 int sumiHi = 0;
                 for (int j = 0; j < subHalf; ++j) {
-                    final int qv = b.get(qs + j) & 0xFF;
+                    final int qv = b[qs + j] & 0xFF;
                     sumiLo += q8[o + j] * QuantTables.kvalueFp4(qv & 0xf);
                     sumiHi += q8[o + j + subHalf] * QuantTables.kvalueFp4(qv >>> 4);
                 }
@@ -163,7 +169,7 @@ public final class NewFpVecDot implements CpuVecDot {
      * little-endian word {@code qs[4k .. 4k+4)} selects {@code +q8} or {@code -q8} for element {@code e} of
      * Q8_0 block {@code 4i + k}.
      */
-    private static float dotQ1_0(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotQ1_0(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         final int q8PerBlock = QK1_0 / QK8_0;
@@ -174,7 +180,7 @@ public final class NewFpVecDot implements CpuVecDot {
             for (int k = 0; k < q8PerBlock; k++) {
                 final int q8Block = i * q8PerBlock + k;
                 final int o = q8Block * QK8_0;
-                final int bits = b.getInt(off + Q1_0_QS + 4 * k);
+                final int bits = intAt(b, off + Q1_0_QS + 4 * k);
                 int sumiBlock = 0;
                 for (int e = 0; e < QK8_0; e++) {
                     final int m = ((bits >>> e) & 1) - 1;
@@ -192,7 +198,7 @@ public final class NewFpVecDot implements CpuVecDot {
      * 64-bit little-endian word {@code qs[8k .. 8k+8)} hold the code of element {@code e} of Q8_0 block
      * {@code 2i + k}, mapped {0,1,2,3} to {-1,0,+1,+2}.
      */
-    private static float dotQ2_0(ByteBuffer b, int off, QuantizedActivations x, int nb) {
+    private static float dotQ2_0(byte[] b, int off, QuantizedActivations x, int nb) {
         final byte[] q8 = x.qs;
         final float[] yd = x.d;
         final int q8PerBlock = QK2_0 / QK8_0;
@@ -203,7 +209,7 @@ public final class NewFpVecDot implements CpuVecDot {
             for (int k = 0; k < q8PerBlock; k++) {
                 final int q8Block = i * q8PerBlock + k;
                 final int o = q8Block * QK8_0;
-                final long codes = b.getLong(off + Q2_0_QS + 8 * k);
+                final long codes = longAt(b, off + Q2_0_QS + 8 * k);
                 int sumiBlock = 0;
                 for (int e = 0; e < QK8_0; e++) {
                     sumiBlock += (((int) (codes >>> (2 * e)) & 3) - 1) * q8[o + e];

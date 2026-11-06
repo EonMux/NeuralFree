@@ -88,6 +88,15 @@ public interface RowSource {
         return null;
     }
 
+    /**
+     * A per-column multiplier applied to the matmul input before every other input transform (for example
+     * torchao's {@code act_pre_scale} of SmoothQuant and AWQ): {@code K} values, or {@code E * K} for a stacked
+     * tensor's experts in expert-major order; null when there is none.
+     */
+    default float[] inputPreScale() {
+        return null;
+    }
+
     /** The checkpoint's activation quantization scheme for this weight; null for weight-only. */
     default ActQuantScheme actQuant() {
         return null;
