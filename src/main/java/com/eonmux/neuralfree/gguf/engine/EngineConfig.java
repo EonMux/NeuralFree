@@ -53,6 +53,11 @@ import java.util.Properties;
  *   <li>{@code neuralfree.sampling.model.defaults}: whether a model's sampling defaults
  *       ({@link EngineModel#modelSamplingDefaults()}) fill the sampler settings and token budget a request leaves
  *       unset, default true.</li>
+ *   <li>{@code neuralfree.reasoning.parser}: the reasoning parser (vLLM {@code --reasoning-parser} names,
+ *       {@link com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers}), default auto: the chat template's.</li>
+ *   <li>{@code neuralfree.tool.parser}: the tool-call parser (vLLM {@code --tool-call-parser} names,
+ *       {@link com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry}), default auto: detected from the chat
+ *       template; none leaves tool-call syntax in the content.</li>
  * </ul>
  */
 public final class EngineConfig {
@@ -70,6 +75,13 @@ public final class EngineConfig {
     public static final String PROP_LORA = "neuralfree.lora";
     public static final String PROP_ACT_QUANT = ActivationQuant.PROPERTY;
     public static final String PROP_MODEL_SAMPLING_DEFAULTS = "neuralfree.sampling.model.defaults";
+    /** The reasoning parser name ({@code ReasoningParsers}); {@code auto} or unset follows the chat template. */
+    public static final String PROP_REASONING_PARSER = "neuralfree.reasoning.parser";
+    /**
+     * The tool-call parser name ({@code ToolParserRegistry}); {@code auto} or unset detects it from the chat
+     * template, {@code none} leaves tool-call syntax in the content.
+     */
+    public static final String PROP_TOOL_PARSER = "neuralfree.tool.parser";
 
     /** {@link #ramCacheMb()} value meaning "half the maximum heap". */
     public static final long RAM_CACHE_AUTO = -1L;
@@ -358,6 +370,8 @@ public final class EngineConfig {
     private final ModelSourceOptions sourceOptions;
     private final ActivationQuant activationQuant;
     private final boolean modelSamplingDefaults;
+    private final String reasoningParser;
+    private final String toolParser;
 
     private EngineConfig(Builder b, MemoryConfig memory) {
         this.backend = b.backend;
@@ -377,6 +391,8 @@ public final class EngineConfig {
         this.sourceOptions = b.sourceOptions;
         this.activationQuant = b.activationQuant;
         this.modelSamplingDefaults = b.modelSamplingDefaults;
+        this.reasoningParser = b.reasoningParser;
+        this.toolParser = b.toolParser;
     }
 
     /**
@@ -419,7 +435,9 @@ public final class EngineConfig {
                 .loras(loraProperty(p))
                 .sourceOptions(ModelSourceOptions.fromProperties(p))
                 .activationQuant(activationQuantProperty(p))
-                .modelSamplingDefaults(booleanProperty(p, PROP_MODEL_SAMPLING_DEFAULTS, d.modelSamplingDefaults));
+                .modelSamplingDefaults(booleanProperty(p, PROP_MODEL_SAMPLING_DEFAULTS, d.modelSamplingDefaults))
+                .reasoningParser(stringProperty(p, PROP_REASONING_PARSER))
+                .toolParser(stringProperty(p, PROP_TOOL_PARSER));
         String backend = stringProperty(p, PROP_BACKEND);
         if (backend != null) {
             b.backend(BackendMode.parse(backend));
@@ -471,6 +489,18 @@ public final class EngineConfig {
      * {@code general.sampling.*}, vLLM its {@code generation_config}).
      */
     public boolean modelSamplingDefaults() { return modelSamplingDefaults; }
+    /**
+     * The reasoning parser that splits generated text into reasoning and content
+     * ({@link com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers}), or {@code auto} for the chat
+     * template's (vLLM {@code --reasoning-parser}).
+     */
+    public String reasoningParser() { return reasoningParser; }
+    /**
+     * The tool-call parser that reads calls out of generated content
+     * ({@link com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry}): {@code auto} detects it from the chat
+     * template, {@code none} turns parsing off (vLLM {@code --tool-call-parser}).
+     */
+    public String toolParser() { return toolParser; }
 
     /**
      * The sampler of the legacy {@code LLMModel.generate} parameters, the one mapping every orchestrator uses: the
@@ -503,7 +533,8 @@ public final class EngineConfig {
                 .ramCacheMb(ramCacheMb).vramDepth(vramDepth).draftModelPath(draftModelPath).draftType(draftType)
                 .draftMax(draftMax).draftMin(draftMin).draftPMin(draftPMin).mtp(mtpSet).loras(loras)
                 .sourceOptions(sourceOptions).activationQuant(activationQuant)
-                .modelSamplingDefaults(modelSamplingDefaults);
+                .modelSamplingDefaults(modelSamplingDefaults).reasoningParser(reasoningParser)
+                .toolParser(toolParser);
     }
 
     @Override
@@ -520,7 +551,18 @@ public final class EngineConfig {
                 + (activationQuant == ActivationQuant.WEIGHT_ONLY ? "" : ", actQuant="
                 + activationQuant.propertyValue())
                 + (modelSamplingDefaults ? "" : ", modelSamplingDefaults=false")
+                + (reasoningParser.equals(PARSER_AUTO) ? "" : ", reasoningParser=" + reasoningParser)
+                + (toolParser.equals(PARSER_AUTO) ? "" : ", toolParser=" + toolParser)
                 + '}';
+    }
+
+    /** The parser name that follows the chat template. */
+    public static final String PARSER_AUTO = "auto";
+    /** The tool-parser name that turns tool-call parsing off. */
+    public static final String PARSER_NONE = "none";
+
+    private static String parserName(String v) {
+        return v == null || v.trim().isEmpty() ? PARSER_AUTO : v.trim();
     }
 
     static String stringProperty(Properties p, String key) {
@@ -630,6 +672,8 @@ public final class EngineConfig {
         private ModelSourceOptions sourceOptions = ModelSourceOptions.defaults();
         private ActivationQuant activationQuant = ActivationQuant.WEIGHT_ONLY;
         private boolean modelSamplingDefaults = true;
+        private String reasoningParser = PARSER_AUTO;
+        private String toolParser = PARSER_AUTO;
 
         private Builder() {
         }
@@ -701,6 +745,12 @@ public final class EngineConfig {
         /** Whether generation applies the model's sampling defaults to the settings a request leaves unset. */
         public Builder modelSamplingDefaults(boolean v) { this.modelSamplingDefaults = v; return this; }
 
+        /** The reasoning parser name; null or blank is {@code auto}. */
+        public Builder reasoningParser(String v) { this.reasoningParser = parserName(v); return this; }
+
+        /** The tool-call parser name; null or blank is {@code auto}, {@code none} turns parsing off. */
+        public Builder toolParser(String v) { this.toolParser = parserName(v); return this; }
+
         /**
          * Builds the configuration. The memory settings receive the speculative defaults of the draft model and MTP
          * settings ({@link MemoryConfig#forSpeculation}) and the compressor rollback snapshots its drafter needs
@@ -733,6 +783,18 @@ public final class EngineConfig {
                 throw new IllegalArgumentException(PROP_DRAFT_TYPE + "=" + draftType.llamaName() + " runs a separate"
                         + " draft model (" + PROP_DRAFT + "), but none is set and " + PROP_MTP + " drafts with the"
                         + " model's own NextN / MTP blocks");
+            }
+            if (!reasoningParser.equals(PARSER_AUTO)
+                    && com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers.forName(reasoningParser) == null) {
+                throw new IllegalArgumentException(PROP_REASONING_PARSER + "=" + reasoningParser
+                        + " is not a reasoning parser; use auto or one of "
+                        + com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers.names());
+            }
+            if (!toolParser.equals(PARSER_AUTO) && !toolParser.equals(PARSER_NONE)
+                    && com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry.forName(toolParser) == null) {
+                throw new IllegalArgumentException(PROP_TOOL_PARSER + "=" + toolParser
+                        + " is not a tool-call parser; use auto, none or one of "
+                        + com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry.names());
             }
             boolean ownHead = mtp || selfMtp(this);
             int rollback = ownHead || draftModelPath != null && draftType != DraftType.MODEL ? draftMax : 0;

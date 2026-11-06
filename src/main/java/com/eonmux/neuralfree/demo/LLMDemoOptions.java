@@ -634,6 +634,7 @@ final class LLMDemoOptions {
                     }
                     return true;
                 case "--model-sampling-defaults": eb.modelSamplingDefaults(boolValue(a)); return true;
+                case "--reasoning-parser": eb.reasoningParser(value(a)); return true;
                 default: return false;
             }
         }
@@ -986,6 +987,8 @@ final class LLMDemoOptions {
                 "                               inputs in full precision; checkpoint applies the checkpoint's",
                 "                               scheme before its weight kernels",
                 "  --model-sampling-defaults <b> Apply the model's sampling defaults (default true)",
+                "  --reasoning-parser <name>    Reasoning delimiters by vLLM parser name (default auto: the",
+                "                               chat template's)",
                 "  --lora-base-config <dir>     Hugging Face configuration of a LoRA adapter's GGUF base",
                 "  --hf-base-dir <dir>          Local base model a decision-LoRA checkpoint merges at load",
                 "",

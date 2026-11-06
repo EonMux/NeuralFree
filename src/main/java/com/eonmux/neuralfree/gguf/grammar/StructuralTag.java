@@ -17,10 +17,14 @@ import java.util.TreeMap;
  * grammars merge at the rule level: every rule renames under a per-structure prefix and its rule references
  * re-index, so several structures compose without collisions.
  *
+ * <p>A non-empty {@code triggers} array gates the grammar as xgrammar's tag dispatch does ({@link #triggers}): the
+ * output is free text until a trigger appears, the structure whose {@code begin} the trigger opens is then
+ * enforced to its {@code end}, and free text resumes. Every structure's {@code begin} must start with one of the
+ * triggers, which xgrammar requires too. Without triggers the grammar requires a structure outright.
+ *
  * <p>Refusals name their field: a payload without a {@code structures} array (the modern xgrammar
- * {@code format} object is pending), a non-empty {@code triggers} array (trigger-gated free text is not
- * compiled — the compiled grammar requires a structure outright), or a structure missing one of its three
- * members, all as {@link IllegalArgumentException}.
+ * {@code format} object is pending), a trigger that is not a non-empty string, a structure whose {@code begin} no
+ * trigger opens, or a structure missing one of its three members, all as {@link IllegalArgumentException}.
  */
 public final class StructuralTag {
 
@@ -29,23 +33,8 @@ public final class StructuralTag {
 
     /** The validated grammar of the legacy payload text ({@link ConstraintSpec#structuralTag}). */
     public static Grammar parse(String payload, JsonSchemaToGbnf.WhitespaceMode whitespace) {
-        JsonView root;
-        try {
-            root = JsonView.of(Json.parse(payload, Json.Limits.UNTRUSTED), "structural_tag");
-        } catch (RuntimeException e) {
-            throw new IllegalArgumentException("structural tag payload is not JSON: " + e.getMessage(), e);
-        }
-        if (!root.has("structures")) {
-            throw new IllegalArgumentException("structural tag needs a structures array (the modern xgrammar"
-                    + " format object is not compiled yet)");
-        }
-        if (root.raw("triggers") instanceof List) {
-            List<?> triggers = (List<?>) root.raw("triggers");
-            if (!triggers.isEmpty()) {
-                throw new IllegalArgumentException("structural tag triggers are not compiled: the grammar requires"
-                        + " a structure outright (trigger-gated free text is pending)");
-            }
-        }
+        JsonView root = root(payload);
+        triggerWords(root);
         List<?> structures = asList(root, "structures");
         if (structures.isEmpty()) {
             throw new IllegalArgumentException("structural tag carries no structures");
@@ -87,6 +76,69 @@ public final class StructuralTag {
         define(symbolIds, symbolNames, Grammar.ROOT_RULE, rootIndex);
         return new Grammar(rules, symbolIds, symbolNames, rootIndex, new int[rules.size()],
                 new int[rules.size()]);
+    }
+
+    /**
+     * The tag-dispatch triggers of the payload, or null when it names none: {@link GrammarTriggers.Mode#DISPATCH}
+     * words, after which the structure grammar runs and free text resumes once it completes.
+     *
+     * @throws IllegalArgumentException when the payload is malformed, a trigger is not a non-empty string, or a
+     *                                  structure's {@code begin} starts with no trigger
+     */
+    public static GrammarTriggers triggers(String payload) {
+        List<String> words = triggerWords(root(payload));
+        if (words.isEmpty()) {
+            return null;
+        }
+        GrammarTriggers.Builder b = GrammarTriggers.builder(GrammarTriggers.Mode.DISPATCH);
+        words.forEach(b::word);
+        return b.build();
+    }
+
+    private static JsonView root(String payload) {
+        JsonView root;
+        try {
+            root = JsonView.of(Json.parse(payload, Json.Limits.UNTRUSTED), "structural_tag");
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("structural tag payload is not JSON: " + e.getMessage(), e);
+        }
+        if (!root.has("structures")) {
+            throw new IllegalArgumentException("structural tag needs a structures array (the modern xgrammar"
+                    + " format object is not compiled yet)");
+        }
+        return root;
+    }
+
+    /** The payload's trigger words, validated against the structures' begin texts. */
+    private static List<String> triggerWords(JsonView root) {
+        List<String> words = new ArrayList<>();
+        Object raw = root.raw("triggers");
+        if (raw == null) {
+            return words;
+        }
+        if (!(raw instanceof List)) {
+            throw new IllegalArgumentException("structural tag triggers must be an array of strings");
+        }
+        List<?> list = (List<?>) raw;
+        for (int i = 0; i < list.size(); i++) {
+            Object w = list.get(i);
+            if (!(w instanceof String) || ((String) w).isEmpty()) {
+                throw new IllegalArgumentException("structural tag trigger " + i + " is not a non-empty string");
+            }
+            words.add((String) w);
+        }
+        if (words.isEmpty()) {
+            return words;
+        }
+        List<?> structures = asList(root, "structures");
+        for (int i = 0; i < structures.size(); i++) {
+            String begin = requireText(asView(structures.get(i), "structures[" + i + "]"), "begin", i);
+            if (words.stream().noneMatch(begin::startsWith)) {
+                throw new IllegalArgumentException("structural tag structure " + i + " begins with '" + begin
+                        + "', which no trigger " + words + " opens");
+            }
+        }
+        return words;
     }
 
     /**

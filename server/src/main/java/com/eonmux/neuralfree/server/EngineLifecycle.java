@@ -26,12 +26,17 @@ public class EngineLifecycle {
         if (service == null) {
             try {
                 service = new EngineService(System.getProperty("neuralfree.server.model"),
-                        EngineConfig.fromSystemProperties());
+                        EngineConfig.fromSystemProperties(), ServerOptions.fromSystemProperties());
             } catch (IOException e) {
                 throw new IllegalStateException("the model at neuralfree.server.model does not open: "
                         + e.getMessage(), e);
             }
         }
+        return service;
+    }
+
+    /** The service if one was produced already, else null: readers that must not load the model use it. */
+    EngineService current() {
         return service;
     }
 

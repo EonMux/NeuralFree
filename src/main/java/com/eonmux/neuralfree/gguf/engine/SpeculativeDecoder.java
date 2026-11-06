@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers;
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.TokenCallback;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
@@ -171,8 +172,8 @@ public final class SpeculativeDecoder {
     }
 
     /**
-     * The decoder of an engine model and its bound drafter: the reasoning parser of the model's chat template (with
-     * its tag tokens), the draft lengths of {@code config} ({@code neuralfree.draft.max},
+     * The decoder of an engine model and its bound drafter: the configured reasoning parser
+     * ({@link EngineConfig#reasoningParser()}, the chat template's by default, with its tag tokens), the draft lengths of {@code config} ({@code neuralfree.draft.max},
      * {@code neuralfree.draft.min}) and the model's sampling defaults unless {@code config} turns them off
      * ({@link SamplingDefaults#forModel}).
      *
@@ -196,7 +197,7 @@ public final class SpeculativeDecoder {
                 break;
         }
         GGUFTokenizer tok = model.tokenizer();
-        ReasoningFilter rf = ReasoningFilter.forChatTemplate(tok.chatTemplate()).withTagTokens(tok::getTokenId);
+        ReasoningFilter rf = ReasoningParsers.forModel(config.reasoningParser(), tok);
         return builder(model.forwardBackend(), drafter, tok)
                 .reasoning(rf)
                 .draftMax(config.draftMax())

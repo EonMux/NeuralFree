@@ -16,6 +16,7 @@ public final class GenerationResult {
     private final String stopString;
     private final Timings timings;
     private final List<TokenScore[]> logprobs;
+    private final int reasoningTokens;
 
     /**
      * @param tokens     generated token ids, prompt excluded (copied)
@@ -27,11 +28,11 @@ public final class GenerationResult {
      * @throws IllegalArgumentException when {@code stopString} disagrees with {@code stopReason}
      */
     public GenerationResult(int[] tokens, String text, StopReason stopReason, String stopString, Timings timings) {
-        this(tokens, text, stopReason, stopString, timings, List.of());
+        this(tokens, text, stopReason, stopString, timings, List.of(), 0);
     }
 
     private GenerationResult(int[] tokens, String text, StopReason stopReason, String stopString, Timings timings,
-                             List<TokenScore[]> logprobs) {
+                             List<TokenScore[]> logprobs, int reasoningTokens) {
         Objects.requireNonNull(tokens, "tokens");
         this.text = Objects.requireNonNull(text, "text");
         this.stopReason = Objects.requireNonNull(stopReason, "stopReason");
@@ -41,8 +42,13 @@ public final class GenerationResult {
             throw new IllegalArgumentException("stop string " + (stopString == null ? "missing" : "'" + stopString + "' given")
                     + " for stop reason " + stopReason);
         }
+        if (reasoningTokens < 0 || reasoningTokens > tokens.length) {
+            throw new IllegalArgumentException("reasoning tokens " + reasoningTokens + " outside [0, "
+                    + tokens.length + "]");
+        }
         this.tokens = tokens.clone();
         this.stopString = stopString;
+        this.reasoningTokens = reasoningTokens;
     }
 
     /** Copy of the generated token ids, prompt excluded. */
@@ -93,7 +99,20 @@ public final class GenerationResult {
     /** A copy carrying the per-token log probabilities ({@link SequenceRun}'s capture). */
     public GenerationResult withLogprobs(List<TokenScore[]> logprobs) {
         return new GenerationResult(tokens, text, stopReason, stopString, timings,
-                List.copyOf(logprobs));
+                List.copyOf(logprobs), reasoningTokens);
+    }
+
+    /**
+     * The generated tokens inside a reasoning block, its open and close tags excluded (vLLM's
+     * {@code count_reasoning_tokens}); 0 for a model without a reasoning parser.
+     */
+    public int reasoningTokens() {
+        return reasoningTokens;
+    }
+
+    /** A copy counting {@code reasoningTokens} generated tokens as reasoning. */
+    public GenerationResult withReasoningTokens(int reasoningTokens) {
+        return new GenerationResult(tokens, text, stopReason, stopString, timings, logprobs, reasoningTokens);
     }
 
     @Override

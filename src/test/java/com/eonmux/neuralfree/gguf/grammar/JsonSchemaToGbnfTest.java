@@ -96,6 +96,7 @@ public class JsonSchemaToGbnfTest {
         assertEquals(lines(
                 line("char", CHAR_RULE),
                 line("ref-definitions-foo", "\"{\" space ref-definitions-foo-a-kv space \"}\""),
+                line("ref-definitions-foo-a-kv", "\"\\\"a\\\"\" space \":\" space string"),
                 line("root", "ref-definitions-foo"),
                 spaceLine(),
                 line("string", STRING_RULE)),
@@ -265,8 +266,12 @@ public class JsonSchemaToGbnfTest {
     public void choiceConstraintIsAlternationOfEscapedLiterals() {
         List<String> choices = Arrays.asList("red", "amber", "green");
         Grammar grammar = GbnfBuilder.grammarOf(ConstraintSpec.choice(choices));
-        // "root" plus the group the parser synthesizes for the "( ... )" alternation, plus "space"
-        assertEquals(3, grammar.ruleCount());
+        // "root", the group the parser synthesizes for the "( ... )" alternation, and the seeded "space" rule
+        // with the nested rules its "[ \t]{0,20}" repetition expands to
+        for (int r = 0; r < grammar.ruleCount(); r++) {
+            String name = grammar.symbolName(r);
+            assertTrue(name, name.equals("root") || name.equals("root_1") || name.startsWith("space"));
+        }
         assertEquals(grammar.symbolId("root"), grammar.rootRuleIndex());
         List<GrammarElement> root = grammar.rule(grammar.rootRuleIndex());
         assertEquals(GrammarElement.Type.RULE_REF, root.get(0).type());
@@ -283,7 +288,7 @@ public class JsonSchemaToGbnfTest {
     // -------------------------------------------------- ConstraintSpec: structural tags (SO-4)
 
     @Test
-    public void structuralTagTextWithoutAStructuresArrayRefusesByName() {
+    public void structuralTagWithoutStructuresRefusesAndWithTriggersGates() {
         try {
             // a raw tag text is not the legacy payload: the payload needs its structures array
             GbnfBuilder.grammarOf(ConstraintSpec.structuralTag("<bos>"));
@@ -291,14 +296,11 @@ public class JsonSchemaToGbnfTest {
         } catch (IllegalArgumentException e) {
             assertTrue(e.getMessage(), e.getMessage().contains("not JSON"));
         }
-        try {
-            GbnfBuilder.grammarOf(ConstraintSpec.structuralTag(
-                    "{\"structures\": [{\"begin\": \"<bos>\", \"schema\": {}, \"end\": \"<eos>\"}],"
-                            + " \"triggers\": [\"<bos>\"]}"));
-            fail("trigger-gated free text is pending");
-        } catch (IllegalArgumentException e) {
-            assertTrue(e.getMessage(), e.getMessage().contains("triggers"));
-        }
+        CompiledConstraint gated = GbnfBuilder.compile(ConstraintSpec.structuralTag(
+                "{\"structures\": [{\"begin\": \"<bos>\", \"schema\": {}, \"end\": \"<eos>\"}],"
+                        + " \"triggers\": [\"<bos>\"]}"));
+        assertTrue("a payload with triggers compiles to a dispatch-gated grammar", gated.gated());
+        assertEquals(GrammarTriggers.Mode.DISPATCH, gated.triggers().mode());
     }
 
     // -------------------------------------------------- refusal: remote $ref (WP spec clause;

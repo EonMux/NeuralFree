@@ -26,10 +26,10 @@ import java.util.TreeMap;
  *       double quote, brackets and dash ({@code parse_char}, {@code :162-184}); the source is a
  *       Java string, so a written UTF-8 character yields its code point directly, like llama.cpp's
  *       byte-wise {@code decode_utf8} over UTF-8 text;</li>
- *   <li>token references {@code <[id]>} and inverse {@code !<[id]>} ({@code :578-589}).
- *       The other form {@code <token>} resolves through the model vocabulary; the parser has
- *       none, so like llama.cpp with a null vocab it rejects it ({@code :214-216}) — the SO-2
- *       runtime wires the tokenizer-backed form.</li>
+ *   <li>token references {@code <[id]>} and inverse {@code !<[id]>} ({@code :578-589}), and the
+ *       name form {@code <token>} / {@code !<token>}, which resolves through a {@link GrammarVocab}
+ *       to the one token its text tokenizes to; without a vocabulary the parser rejects the name
+ *       form, as llama.cpp does with a null vocab ({@code :214-232}).</li>
  * </ul>
  *
  * <p>After parsing, the undefined-rule validation of {@code llama_grammar_parser::parse}
@@ -53,10 +53,12 @@ public final class GbnfParser {
     private final Map<Integer, int[]> ruleLocations = new HashMap<>();
     /** First reference site of each symbol created by a reference, for undefined-rule errors. */
     private final Map<Integer, int[]> refLocations = new HashMap<>();
+    private final GrammarVocab vocab;
     private long elementCount;
 
-    private GbnfParser(String src) {
+    private GbnfParser(String src, GrammarVocab vocab) {
         this.src = src;
+        this.vocab = vocab;
     }
 
     /**
@@ -70,15 +72,27 @@ public final class GbnfParser {
      *                          source position of the cause
      */
     public static Grammar parse(String source) {
+        return parse(source, null);
+    }
+
+    /**
+     * Parses a complete GBNF grammar whose {@code <token>} references resolve through {@code vocab}.
+     *
+     * @param source the grammar text, as for {@link #parse(String)}
+     * @param vocab  the model vocabulary, or null to reject the {@code <token>} name form
+     * @throws GrammarException as for {@link #parse(String)}, and for a {@code <token>} reference
+     *                          that does not tokenize to exactly one token
+     */
+    public static Grammar parse(String source, GrammarVocab vocab) {
         if (source == null) {
             throw new IllegalArgumentException("grammar source must not be null");
         }
         if (source.length() > GrammarLimits.MAX_SOURCE_CHARS) {
-            GbnfParser bounds = new GbnfParser(source);
+            GbnfParser bounds = new GbnfParser(source, null);
             throw bounds.error("grammar source is " + source.length() + " characters, more than "
                     + GrammarLimits.MAX_SOURCE_CHARS, GrammarLimits.MAX_SOURCE_CHARS);
         }
-        return new GbnfParser(source).parseAll();
+        return new GbnfParser(source, vocab).parseAll();
     }
 
     // ------------------------------------------------------------------ top level
@@ -90,6 +104,10 @@ public final class GbnfParser {
             pos = parseRule(pos);
         }
         validateUndefinedRules(pos);
+        if (rules.isEmpty()) {
+            // llama_grammar_init_impl refuses a grammar without rules before looking for its root
+            throw error("failed to parse grammar: no rules defined", pos);
+        }
 
         Integer rootId = symbolIds.get(Grammar.ROOT_RULE);
         if (rootId == null) {
@@ -515,9 +533,9 @@ public final class GbnfParser {
     }
 
     /**
-     * {@code parse_token} ({@code llama-grammar.cpp:186-234}) for {@code <[id]>}: without the
-     * vocabulary (always, at parse time) the {@code <token>} name form is unavailable, exactly
-     * as with a null vocab in llama.cpp.
+     * {@code parse_token} ({@code llama-grammar.cpp:186-234}): {@code <[id]>} by id, or
+     * {@code <token>} through the vocabulary, whose tokenization of the whole reference (angle
+     * brackets included) must be exactly one token.
      */
     private Span parseToken(int pos) {
         int start = pos;
@@ -542,8 +560,22 @@ public final class GbnfParser {
             pos++;
             return new Span(id.value, pos);
         }
-        // llama.cpp tokenizes the token text through the vocab here; this parser is text only.
-        throw error("no vocab to parse token", start);
+        if (vocab == null) {
+            throw error("no vocab to parse token", start);
+        }
+        while (pos < src.length() && peek(pos) != '>') {
+            pos++;
+        }
+        if (pos >= src.length()) {
+            throw error("expecting '>'", pos);
+        }
+        pos++;
+        String text = src.substring(start, pos);
+        int[] ids = vocab.tokenize(text);
+        if (ids == null || ids.length != 1) {
+            throw error("invalid token '" + text + "'", start);
+        }
+        return new Span(ids[0], pos);
     }
 
     // ------------------------------------------------------------------ symbols and rules

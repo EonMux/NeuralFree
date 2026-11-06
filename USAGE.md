@@ -29,13 +29,20 @@ This guide covers:
    - [Supported architectures](#supported-architectures)
 6. [Hugging Face Hub download](#hugging-face-hub-download)
 7. [nftool](#nftool)
-8. [Grammar-constrained generation](#grammar-constrained-generation)
-9. [Paged KV memory](#paged-kv-memory)
-10. [Control vectors](#control-vectors)
-11. [imatrix](#imatrix)
-12. [Session files](#session-files)
-13. [System properties](#system-properties)
-14. [Troubleshooting](#troubleshooting)
+8. [HTTP server](#http-server)
+   - [Tool calls](#tool-calls)
+   - [API keys](#api-keys)
+   - [OpenAI Responses](#openai-responses)
+9. [Anthropic Messages](#anthropic-messages)
+10. [Reasoning and tool-call parsers](#reasoning-and-tool-call-parsers)
+11. [Grammar-constrained generation](#grammar-constrained-generation)
+12. [Prefix cache](#prefix-cache)
+13. [Paged KV memory](#paged-kv-memory)
+14. [Control vectors](#control-vectors)
+15. [imatrix](#imatrix)
+16. [Session files](#session-files)
+17. [System properties](#system-properties)
+18. [Troubleshooting](#troubleshooting)
 
 ## Build
 
@@ -252,6 +259,7 @@ Every flag below is parsed by `LLMDemoOptions`. `--help` prints the same list.
 | `--embed` | Same as `--mode embed` | off |
 | `--show-all-channels` | Print reasoning and tool-call channels with headers | on |
 | `--content-only` | Print only the answer channel | off |
+| `--reasoning-parser <name>` | Reasoning delimiters by vLLM `--reasoning-parser` name, as `neuralfree.reasoning.parser` ([Reasoning and tool-call parsers](#reasoning-and-tool-call-parsers)) | `auto`: the chat template's |
 | `--debug-prompt` | Print the formatted prompt and its token ids | off |
 | `--vram-budget`, `--memory-report` | Print the memory plan and device memory, then exit | off |
 | `--benchmark` | GPU decode profiling benchmark | off |
@@ -690,25 +698,117 @@ Every other listed subcommand (`quantize`, `perplexity`, `results`, `bench`, `ba
 
 ## HTTP server
 
-`server/` serves the OpenAI-compatible surface over the batch engine: `GET /v1/models`, `POST /v1/completions`, `POST /v1/chat/completions` (both with `stream: true` server-sent events ending in `data: [DONE]`), `POST /v1/embeddings`, `POST /v1/rerank`, plus the llama.cpp-native `GET /health` and `GET /props`, and Anthropic's `POST /v1/messages` (+ `/v1/messages/count_tokens`, [below](#anthropic-messages)). Start it with the model path property (`-Dneuralfree.server.model=<gguf path>`; every other setting reads its `neuralfree.*` property) after `./gradlew :server:build` — the build produces the uber-jar under `server/build/`. Without the property the server starts unloaded: `/health` reports the error and every model request refuses with 503.
+`server/` serves the OpenAI-compatible surface over the batch engine, with the llama.cpp and vLLM spellings of the shared endpoints:
 
-One `EngineService` opens the model and pumps its `BatchEngine` on one thread; requests queue FIFO and admitted sequences decode together over the paged memory (`neuralfree.parallel` slots). Sampling settings (`temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `max_tokens`, `min_tokens`, `bad_words`) map onto `SamplerConfig` and the request stages — only present keys leave the llama.cpp defaults. `logit_bias` maps onto the sampler's first stage (`BiasStage`): token id to an additive bias in [-100, 100], where -100 and below ban the token. `logprobs: true` with `top_logprobs: n` (or llama.cpp's `n_probs`) requests the per-token distributions: the non-streamed responses carry the OpenAI `logprobs.content` shape, and a stream carries it per chunk alongside the delta. Chat bodies render through the model's template (`tokenizer.formatChat`); reasoning output streams as `reasoning_content` deltas. Refusals name the gap: `n` above 1, prompt arrays (one prompt per request), and image or audio message parts. Finish reasons: `stop` (end of generation, stop string, cancellation) and `length` (token budget, full context).
+| Endpoint | Serves |
+|----------|--------|
+| `GET /v1/models` | The served model, with `max_model_len` |
+| `POST /v1/completions` | Text completions; `stream: true` sends server-sent events ending in `data: [DONE]` |
+| `POST /v1/chat/completions` | Chat completions through the model's template, with tools and streaming |
+| `POST /v1/embeddings` | Pooled vectors from an embedding or pooling model, in OpenAI's body |
+| `POST /embeddings` (`/embedding`) | llama.cpp's native embeddings: per-token rows without pooling |
+| `POST /v1/rerank` (`/rerank`, `/v1/reranking`, `/reranking`) | Documents scored against a query by a rank model |
+| `POST /tokenize`, `POST /detokenize` | Token ids of text or chat messages, and text of token ids |
+| `POST /apply-template` | A chat body rendered through the template, as `prompt` |
+| `GET /health` (`/v1/health`), `GET /props` | Load state; serving setup (model, context, slots, chat template) |
+| `POST /v1/messages` (+ `/count_tokens`) | Anthropic's Messages API ([below](#anthropic-messages)) |
+| `POST /v1/responses` (`/responses`), `GET`/`DELETE /v1/responses/{id}`, `GET .../input_items`, `POST .../cancel` | OpenAI's Responses API ([below](#openai-responses)) |
+| `POST /v1/responses/input_tokens`, `POST /v1/chat/completions/input_tokens` (and unversioned) | The prompt token count of a Responses or chat request |
+| `POST /completion` (`/completions`), `POST /infill` | llama.cpp's native completion and fill-in-the-middle ([below](#http-server)) |
+
+Start it with the model path property (`-Dneuralfree.server.model=<gguf path>`; every other setting reads its `neuralfree.*` property) after `./gradlew :server:build` — the build produces the uber-jar under `server/build/`. Without the property the server starts unloaded: `/health` reports the error and every model request refuses with 503.
+
+**Metrics.** `/metrics` serves Prometheus text with the JVM meters and the engine's own. The engine meters follow llama.cpp's set under a `neuralfree_` prefix: `prompt_tokens_total` (cached tokens excluded), `prompt_tokens_cached_total`, `prompt_seconds_total`, `tokens_predicted_total`, `tokens_predicted_seconds_total`, `decode_total`, `tokens_max`, `busy_slots_per_decode`, `requests_processing` and `requests_deferred`. Following vLLM, they add `preemptions_total`, `recomputed_tokens_total`, `kv_cache_usage` (the share of KV rows in use, with cached prefixes counted until evicted), `request_success_total{finished_reason="stop"|"length"|"abort"}` and `request_failures_total`. They read the engine's state after its latest step, read zero before a model loads, and a scrape never loads one. Throughput is `rate()` over the counters.
+
+**Model names.** `-Dneuralfree.server.model.name=<name>[,<name>...]` sets the names the server answers to, like vLLM's `--served-model-name` and llama.cpp's `--alias`. `/v1/models` lists each name with the model path as its `root`, and `/props` reports the first name as `model_alias`. A response carries the `model` its request named when that name is served, and the first name otherwise. With names configured, a request that names any other model is refused with 404, as in vLLM. Without them the model path is the only name and any requested name is accepted, as in llama.cpp.
+
+One `EngineService` opens the model and pumps its `BatchEngine` on one thread; requests queue FIFO and admitted sequences decode together over the paged memory (`neuralfree.parallel` slots, [scheduling](#paged-kv-memory)). A client that disconnects cancels its sequences, whether it was streaming or waiting for a whole response. A request that runs longer than `neuralfree.server.request.timeout` (seconds, default 1800) is cancelled and refused with 503, and an embedding or rerank call that waits that long for an idle engine is refused too. `/models` and `/chat/completions` answer as llama.cpp's unversioned aliases of the OpenAI routes.
+
+**Native completion.** `POST /completion` and `/completions` serve llama.cpp's native completion; its OpenAI form stays at `/v1/completions`. A `prompt` is a string, an array of token ids, an array that mixes strings and token ids (one prompt, with BOS only before a leading string), or `{"prompt_string": ...}`. An array that holds no token id at all is several prompts. `n_predict` sets the budget (-1 is unlimited), `n_probs` adds `completion_probabilities` (each with `id`, `token`, `bytes`, `logprob`, `top_logprobs`), and `response_fields` picks nested fields by `a/b` paths. Every sampler and grammar field above applies too. One prompt answers one object with `content`, `tokens`, `id_slot`, `stop_type` (`eos`, `word`, `limit`), `stopping_word`, `tokens_predicted`, `tokens_evaluated`, `tokens_cached`, `generation_settings` and `timings`; several prompts answer an array of these. A stream sends one `data:` chunk per generated token that released text (`content`, `tokens`, `stop: false`, `tokens_predicted`) and ends each prompt with its final object, with no `[DONE]`. Text held back for a possible stop string arrives in the chunk of the token that releases it. `post_sampling_probs` is refused, because the probabilities are the model's own, taken before the sampler chain.
+
+**Embeddings.** `/v1/embeddings` tokenizes text with the vocabulary's special tokens (a BERT model's CLS and SEP; `add_special_tokens: false` leaves them out) and returns L2-normalized vectors, as llama.cpp and vLLM do. `embd_normalize` picks llama.cpp's mode (-1 none, 0 max absolute in the int16 range, 1 taxicab, 2 euclidean, larger for a p-norm), and `use_activation` or `normalize` set to false return the raw pooled vector. `dimensions` keeps the first n values and normalizes after the cut, vLLM's matryoshka truncation. `truncate_prompt_tokens` keeps the last n tokens (-1 for the context length). `encoding_format: "base64"` writes float32 bytes, little-endian unless `endianness` is `big`. A model without pooling is refused there. Its per-token rows come from llama.cpp's native `POST /embeddings` (and `/embedding`), which takes `input` or `content` in llama.cpp's prompt forms and answers an array of `{"index", "embedding"}`: `[vector]` for a pooled model, one unnormalized row per token otherwise.
+
+**Infill.** `POST /infill` answers like `/completion`, but over llama.cpp's fill-in-the-middle prompt. `input_prefix` and `input_suffix` are required (a string, or an array mixing strings and token ids). `input_extra` is an optional array of `{"filename", "text"}` context chunks, and `prompt` is an optional string appended to the prefix. The prompt follows the repo-level FIM layout: `[FIM_REP]` and `[FIM_SEP]` file headers when the vocabulary has those tokens, then `[FIM_PRE]prefix prompt[FIM_SUF]suffix[FIM_MID]`. The prefix keeps its last three quarters of a 2048-token batch, the suffix fills the remaining quarter, and the extra context gets what the context has left after the batch and twice `n_predict`. `-Dneuralfree.server.spm.infill=true` puts the suffix before the prefix, like llama.cpp's `--spm-infill`. A model without FIM prefix, suffix and middle tokens is refused with 501.
+
+**Sampling.** `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`, `repeat_penalty` (`repetition_penalty`), `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `max_tokens` (`max_completion_tokens`), `min_tokens`, `ignore_eos` and `bad_words` map onto `SamplerConfig` and the request stages, and so do llama.cpp's sampler fields: `dynatemp_range`, `dynatemp_exponent`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, `repeat_last_n`, `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` (at most 64 distinct), `mirostat`, `mirostat_tau`, `mirostat_eta`, `adaptive_target`, `adaptive_decay`, `min_keep` and `samplers`. `samplers` is an array of stage names (`top-k`, `topk`, `nucleus` and llama.cpp's other spellings) or a string of stage characters (`dkypsmtxiea`). Only keys that are present and not null change the llama.cpp defaults, and an out-of-range value or an unknown sampler is refused with 400. `logit_bias` maps onto the sampler's first stage (`BiasStage`): token id to an additive bias in [-100, 100], where -100 and below ban the token.
+
+**Choices and prompts.** `n` (1 to 128) decodes that many choices side by side; with a `seed`, choice `i` samples with `seed + i` (vLLM's parallel sampling), without one each choice draws its own. A completion's `prompt` takes every OpenAI form — a string, an array of strings, an array of token ids, or an array of token-id arrays (ids outside the vocabulary refuse) — and choice `p * n + i` answers prompt `p`; `echo` prepends the prompt. Usage counts each prompt once and sums the choices' tokens. In a stream, each chat choice opens with its own `role` delta; the last finish chunk carries the usage, or under `stream_options.include_usage` a final chunk with empty `choices` does.
+
+**Logprobs.** Chat takes `logprobs: true` with `top_logprobs` (0 to 20) and answers `logprobs.content` entries (`token`, `logprob`, `bytes`, `top_logprobs`); completions take an integer `logprobs` and answer the legacy `tokens`, `token_logprobs`, `top_logprobs` and `text_offset` arrays; llama.cpp's `n_probs` selects the count on either. A stream carries each token's entry on its chunk.
+
+**Output constraints.** One of `grammar`, `json_schema`, `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`, `guided_structural_tag` / `structural_tag`, `response_format` (`text`, `json_object`, `json_schema`) or vLLM's `structured_outputs` (`json`, `regex`, `choice`, `grammar`, `json_object`, `structural_tag`) constrains the output ([Grammar-constrained generation](#grammar-constrained-generation)); two at once refuse. A regex matches the raw output, with or without `^`/`$` anchors. In chat completions the constraint holds the answer rather than the reasoning before it. A thinking model whose prompt leaves `<think>` open writes freely until its end tag, and the constraint starts after that tag and any whitespace. gpt-oss is constrained after its `<|channel|>final` header (a `<|constrain|>` type may sit in it), and Muse after the header of its message to the user. Other models are constrained from the first token, as are text completions.
+
+**Chat.** `messages` (string or text-part content, assistant `tool_calls` and `reasoning_content`, `tool` results), `add_generation_prompt`, `continue_final_message`, `enable_thinking`, `reasoning_effort` and `chat_template_kwargs` reach the template. Reasoning output streams as `reasoning_content` deltas and lands in `message.reasoning_content`. Image and audio parts refuse by name: the text chat path has no media encoder.
+
+Finish reasons: `stop` (end of generation, stop string, cancellation), `length` (token budget, full context) and `tool_calls`.
+
+### Tool calls
+
+`tools` (`{"type": "function", "function": {name, description, parameters}}`) render through the template, and `tool_choice` picks how calls come back ([parsers](#reasoning-and-tool-call-parsers)):
+
+| `tool_choice` | Effect |
+|---------------|--------|
+| `auto` (default) | The configured tool parser reads calls out of the output |
+| `none` | The tools still render; nothing is parsed |
+| `required` | A grammar forces a JSON array of `{name, parameters}` calls of the declared tools (one when `parallel_tool_calls` is false), as vLLM does |
+| `{"type": "function", "function": {"name": ...}}` | A grammar forces the named function's `parameters` schema |
+
+The forcing grammars start after the reasoning when the rendered prompt leaves a thinking block open (a lazy grammar triggered by the reasoning end tag). Calls answer as `message.tool_calls` (`id`, `type: function`, `function.name`, `function.arguments` as JSON text) with `content` null when the output was only calls, and stream as `delta.tool_calls` — the first delta of a call carries its `index`, `id`, `type` and `name`, the following ones its argument text. The finish reason is `tool_calls`, except for a named function, which finishes with `stop` as OpenAI's does. A forcing choice refuses alongside another output constraint, `required` or a named function refuses without `tools`, and a named function must be declared.
+
+Harmony-family models read calls out of their message headers instead of a tool parser. gpt-oss calls arrive through the `to=functions.NAME` recipient with the message body as arguments; Muse Spark / Glimmer calls are the `<atem:function_calls>` block of a message addressed to a tool, each `<atem:invoke>` one call whose `<atem:parameter>` values are typed by the tool's schema. Other recipients (gpt-oss built-ins such as `browser.search` or `python`) are dropped. Under `required` or a named function a grammar in the model's dialect lets it write its reasoning and preamble messages first and then holds the turn to a call of the declared tools, as llama.cpp's gpt-oss and Muse formats do.
+
+### API keys
+
+Keys come from the `NEURALFREE_API_KEY` environment variable and the `neuralfree.server.api.key` property (comma-separated each), and from the file named by `neuralfree.server.api.key.file` (one key per line; blank lines and `#` comments skipped) — llama.cpp's `--api-key` / `--api-key-file` and vLLM's `--api-key`. With any key configured every endpoint requires `Authorization: Bearer <key>` or Anthropic's `x-api-key: <key>`, compared in constant time; a missing or wrong key answers 401 with the OpenAI error envelope. `/health`, `/v1/health`, the Quarkus `/q/` probes and CORS preflight requests stay open. `/metrics` needs the key, as in llama.cpp. A blank key or an unreadable key file fails the server at startup.
+
+### OpenAI Responses
+
+`POST /v1/responses` (and llama.cpp's `/responses`) serves OpenAI's Responses API, as llama.cpp and vLLM do, by converting the request into a chat-completions body and running it through the chat path. Every sampler, grammar, tool and reasoning setting therefore behaves as on `/v1/chat/completions`.
+
+- **Request.** `input` is a string or an array of items: messages (`user`, `system`, `developer` with `input_text` and `input_image` parts; `assistant` with `output_text` and `refusal` parts), `function_call`, `function_call_output` and `reasoning` items. Consecutive assistant items merge into one assistant turn. `instructions` become the system message. `tools` of type `function` become chat tools; built-in tool types such as `web_search_preview` have no local equivalent and are skipped. `tool_choice` takes `auto`, `none`, `required` or `{"type": "function", "name": ...}`. `max_output_tokens` is the budget, `reasoning.effort` sets the template's effort, and `text.format` (`text`, `json_object`, `json_schema` with `schema`) constrains the answer the way `response_format` does. `top_logprobs`, or `include: ["message.output_text.logprobs"]`, adds logprobs to the output text, and `extra_params` merges any further chat field (`min_p`, `ignore_eos`, `grammar` and the rest). `input_file`, `input_audio`, `item_reference`, `conversation` and stored `prompt` templates are refused by name.
+- **Response.** The Response object carries `reasoning` items (`reasoning_text` content), `message` items (`output_text` with its logprobs) and `function_call` items (`call_id`, `name`, `arguments`). The final output follows the tool parser's reading of the whole text, as the chat route's message does, so a call the finished text turned into content, or arguments completed after the last delta, appear as they end. `status` is `completed`, `incomplete` with `incomplete_details.reason` `max_output_tokens`, `cancelled` or `failed`. `usage` holds `input_tokens` (with `cached_tokens` from the prefix cache), `output_tokens` (with `reasoning_tokens`, the tokens inside the reasoning block) and `total_tokens`.
+- **Stream.** `stream: true` sends `response.created` and `response.in_progress`, then for each item `response.output_item.added`, its deltas (`response.reasoning_text.delta`, `response.content_part.added` and `response.output_text.delta`, `response.function_call_arguments.delta`), their `.done` events and `response.output_item.done`, and ends with `response.completed`, `response.incomplete` (also for a cancelled response) or `response.failed`. Each event carries its `sequence_number`, and the last event carries the whole response.
+- **Store.** `-Dneuralfree.server.responses.store=<count>` keeps up to that many responses, evicting the least recently used. It is off by default, as in vLLM, and with it off `store: true` keeps nothing. A stored response can be fetched with `GET /v1/responses/{id}`, its input listed with `GET /v1/responses/{id}/input_items` (`limit`, `order`, `after`) and removed with `DELETE`. `previous_response_id` continues its conversation, replaying the earlier input and output items but not the earlier `instructions`.
+- **Background.** `background: true` needs the store. It answers at once with a `queued` response and runs the generation detached from the client. `GET /v1/responses/{id}` shows its progress, `GET ...?stream=true&starting_after=<n>` replays its events from that sequence number, and `POST /v1/responses/{id}/cancel` stops it and answers the cancelled response (it waits for the current decode step, at most the request budget). Only a background response can be cancelled.
+
+`POST /v1/responses/input_tokens` and `POST /v1/chat/completions/input_tokens` (and their unversioned forms) return `{"object": "response.input_tokens", "input_tokens": n}` for the rendered prompt.
 
 ## Anthropic Messages
 
-`server/` also serves Anthropic's Messages API (`AnthropicResource`): `POST /v1/messages` renders the `system` prompt and the `user`/`assistant` messages (string content or `{"type": "text", "text": ...}` blocks) through the model's chat template, applies `max_tokens` (required, as Anthropic documents), `temperature`, `top_p`, `top_k` and `stop_sequences`, and answers with the Anthropic body — `content` text blocks, `stop_reason` `end_turn`/`max_tokens`/`stop_sequence` (with the matched `stop_sequence` named) and `usage.input_tokens`/`output_tokens`. With `stream: true` the stream carries Anthropic's event sequence: `message_start`, `content_block_start`, `content_block_delta` (`text_delta`), `content_block_stop`, `message_delta` and `message_stop`; reasoning deltas open their own text block. `POST /v1/messages/count_tokens` returns the rendered prompt's token count. Non-text content blocks (image, audio) refuse by name.
+`server/` also serves Anthropic's Messages API (`AnthropicResource`, llama.cpp's `post_anthropic_messages`). `POST /v1/messages` renders the `system` prompt (string or text blocks) and the messages through the model's chat template: `user` content takes text and `tool_result` blocks (which become tool messages ahead of the user's text), `assistant` content takes text, `thinking` and `tool_use` blocks. `tools` (`name`, `description`, `input_schema`) and `tool_choice` (`auto`, `any`, `tool` with its `name`, `none`; `disable_parallel_tool_use`) route like the OpenAI tool choices; Anthropic's server tools (a `type` such as `web_search_20250305`) refuse by name. `thinking` (`{"type": "enabled"}` or `"disabled"`) sets the template's thinking switch. `max_tokens` (required, as Anthropic documents), `temperature`, `top_p`, `top_k` and `stop_sequences` apply.
+
+The answer is the Anthropic body: `thinking`, `text` and `tool_use` content blocks (`id`, `name`, `input`), `stop_reason` `end_turn`/`max_tokens`/`stop_sequence` (with the matched `stop_sequence` named)/`tool_use`, and `usage.input_tokens`/`output_tokens`. With `stream: true` the stream carries Anthropic's event sequence: `message_start`, then per block `content_block_start`, `content_block_delta` (`thinking_delta`, `text_delta` or `input_json_delta`) and `content_block_stop`, then `message_delta` and `message_stop`. `POST /v1/messages/count_tokens` returns the rendered prompt's token count. Image and document blocks refuse by name.
+
+## Reasoning and tool-call parsers
+
+The engine splits reasoning from content with a reasoning parser and reads tool calls with a tool parser; both default to `auto`, which derives them from the chat template, and both take vLLM's parser names (case-insensitive, `-` and `_` alike).
+
+| Property | Flag | Values |
+|----------|------|--------|
+| `neuralfree.reasoning.parser` | `--reasoning-parser` | `auto`, `none`, or a reasoning parser name |
+| `neuralfree.tool.parser` | — | `auto`, `none`, or a tool parser name |
+
+Reasoning parsers (aliases in parentheses): `deepseek_r1` (`step5`), `deepseek_v3` (`deepseek_v31`), `deepseek_v4` (`deepseek_v41`, `deepseek_v32`), `qwen3` (`qwen3_5`, `qwen3_coder`), `glm45` (`glm47`, `glm4_moe`), `kimi_k2`, `kimi_k3`, `k2_horizon`, `minimax_m2` (`minimax_m2_append_think`), `minimax_m3`, `ernie45`, `hunyuan_a13b` (`hy_v3`, `hy_v4`), `olmo3`, `step3` (`step3p5`), `nemotron_v3`, `mimo`, `poolside_v1`, `holo2`, `ling3`, `seed_oss`, `mistral`, `gemma4`, `granite`, `cohere_command3` (`cohere_command4`), `openai_gptoss` (`gpt_oss`, `harmony`), `muse` (`muse_glimmer`, `musespark1x`) and `none`.
+
+Tool parsers: `hermes` (`qwen2_5`, `qwen3_json`), `ernie45`, `longcat`, `qwen3_coder` (`qwen3_xml`, `qwen3`, `qwen3_5`, `nemotron_v3`), `seed_oss`, `minimax_m2` (`minimax`), `glm45` (`glm47`, `glm4_moe`), `llama3_json` (`llama4_json`), `mistral`, `deepseek_v3` (`deepseek_r1`), `deepseek_v31`, `kimi_k2`, `internlm` (`internlm2`), `jamba` (`apriel`, `hunyuan_a13b`), `granite` (`granite_3`), `phi4_mini_json` (`firefunction`, `phi4mini`), `xlam`, `pythonic`, `llama4_pythonic`, `lfm2` (`lfm2_5`) and `olmo3`. `auto` detects the format from the template's call markers; a template it does not recognize parses no calls.
+
+The tool parsers stream: text that may begin a call is held back until it either becomes a call (its name, then its argument text as it grows) or turns out to be content. An unknown name refuses at configuration with the registered names listed. More parsers plug in through `ToolParserProvider` and `ReasoningParserProvider` (`ServiceLoader`); a name that collides with a registered one refuses.
 
 ## Grammar-constrained generation
 
-`gguf/grammar` constrains sampling to a grammar: a `GbnfBuilder`/`GbnfParser` pair runs GBNF grammars (`Grammar`, `GrammarLimits`), and a `ConstraintSpec` selects the kind — `GBNF`, `JSON_SCHEMA` (compiled by `JsonSchemaToGbnf`), `JSON_OBJECT`, `REGEX` (compiled by `RegexToGbnf`), `CHOICE`, `STRUCTURAL_TAG` (the vLLM legacy payload: `StructuralTag` compiles each structure's begin literal, schema grammar and end literal into one alternated grammar; triggers parse but trigger-gated free text is pending) — and the constraint runs as the `GrammarStage` of the sampler chain (`Sampler.create(config, bannedTokens, extra, vocab)`), which masks every token the grammar cannot accept next and advances on each accepted token; a completed rule admits the end-of-generation tokens again. The engine routes it through `BatchEngine.submit(..., constraint)` (compiled at submit, so an invalid spec throws to the caller) and the server exposes it as `grammar`, `guided_json`, `guided_regex`, `guided_choice` and `guided_structural_tag` / `structural_tag`.
+`gguf/grammar` constrains sampling to a grammar: a `GbnfBuilder`/`GbnfParser` pair runs GBNF grammars (`Grammar`, `GrammarLimits`), and a `ConstraintSpec` selects the kind — `GBNF`, `JSON_SCHEMA` (compiled by `JsonSchemaToGbnf`), `JSON_OBJECT`, `REGEX` (compiled by `RegexToGbnf`), `CHOICE`, `STRUCTURAL_TAG` (the vLLM legacy payload: `StructuralTag` compiles each structure's begin literal, schema grammar and end literal into one alternated grammar, dispatched by the payload's triggers) — and the constraint runs as the `GrammarStage` of the sampler chain (`Sampler.create(config, bannedTokens, extra, vocab)`), which masks every token the grammar cannot accept next and advances on each accepted token; a completed rule admits the end-of-generation tokens again. As in llama.cpp, a token matches by its piece rendered with special tokens shown, so the literal `"<|channel|>"` matches that control token, and a token reference matches by id: `<[42]>`, or `<|channel|>` written as a token name, which the batch engine resolves through the model's vocabulary (the name must tokenize to exactly one token); `!<...>` matches any token but that one.
+
+A spec can be trigger-gated (`ConstraintSpec.withTriggers(GrammarTriggers)`, llama.cpp's lazy grammars): generation runs unconstrained until a trigger fires — a word, a regex whose first non-empty capture group (or the match) starts the constrained text, a regex the whole output must match, or a token id — and the grammar then constrains from the trigger start on, replaying the tokens that overlapped it (`TriggeredGrammarStage`). `LAZY` triggers hold the grammar to the end of generation; `DISPATCH` triggers (a structural tag's) return to free text after each completed structure and wait for the next trigger. While waiting for a word trigger, the stage masks tokens that would write a trigger's beginning followed by text the grammar refuses. The engine routes it through `BatchEngine.submit(..., constraint)` (compiled at submit, so an invalid spec throws to the caller) and the server exposes it in the llama.cpp, vLLM and OpenAI spellings ([HTTP server](#http-server)).
 
 ## Prefix cache
 
-The batch engine reuses computed prompts: a retired sequence stays in the paged memory with its pages, and `BatchEngine` indexes those sequences by their exact token arrays (`PrefixCache`, bounded by the slot count). When a submitted prompt extends a cached prefix, the engine adopts the cached sequence in place — its slot, its pages, its divergent tail cut at the reused length — and prefills only the prompt's tail (at least the last prompt token always prefills, so its logits start the generation); `BatchSequence.reusedPrefix()` reports the copied token count. Cache entries match exact tokens, ties resolve to the most recently used, and a new generation for a slot evicts its cached sequence. The route follows `neuralfree.prefix.reuse` (default true) and is refused for windowed (SWA) memories, whose trim rules make a cached prefix's rows stale. Same tokens compute the same pages, so a reused run produces the same tokens and text as the uncached run (`BatchPrefixCacheTest`).
+The batch engine reuses computed prompts: a retired sequence stays in the paged memory with its pages, and `BatchEngine` indexes those sequences by their exact token arrays (`PrefixCache`, bounded by the slot count). When a submitted prompt extends a cached prefix, the engine adopts the cached sequence in place — its slot, its pages, its divergent tail cut at the reused length — and prefills only the prompt's tail (at least the last prompt token always prefills, so its logits start the generation); `BatchSequence.reusedPrefix()` reports the copied token count. Cache entries match exact tokens, ties resolve to the most recently used, and a new generation for a slot evicts its cached sequence. The route follows `neuralfree.prefix.reuse` (default true) and is refused for windowed (SWA) memories, whose trim rules make a cached prefix's rows stale. Same tokens compute the same pages, so a reused run produces the same tokens and text as the uncached run (`BatchPrefixCacheTest`). Cached sequences hold pages, so admission evicts them least recently used first when a new prompt needs the cells.
 
 ## Paged KV memory
 
 `gguf/memory/paged` keeps the rows of a KV group in reference-counted pages instead of one buffer per sequence: `PagePool`, `PageList`, `PagedSequences`, `PagedStep`, `PageCopy` and `RowParts`. It is property-gated, not the engine default: `neuralfree.kv.paged=true` forces it for a single sequence, and `neuralfree.parallel > 1` selects it; `neuralfree.kv.page.size` (default 16, a power of two in [1, 256]) sizes the pages and `neuralfree.kv.unified` (default true) shares the whole context between the sequences. Without the properties, `ModelMemory.sequences()` returns `SingleSequenceMemory`. On the CPU path, `ForwardBatch` runs a batch of sequences over the paged memory — one-sequence ubatches (llama.cpp's `split_seq`), all-or-nothing page reservation per ubatch, K/V stored at the step's `cellIdx` rows and attention through the step's page tables ([LLM-INFERENCE.md](LLM-INFERENCE.md#paged-kv-memory) has the details; the GPU path refuses).
+
+The batch engine schedules over the shared pools as vLLM's scheduler does. A queued prompt is admitted when a slot is free and the free cells cover the part of the prompt it does not reuse plus the admitted prompts still waiting for their prefill. Running out of pages is recoverable: a prefill that finds the pools full rolls back and queues again, and a decode step that finds them full rolls back, then evicts a cached prefix or preempts the youngest running sequence. A preempted sequence keeps its sampler, grammar and streamed text; once a running sequence retires it is re-admitted ahead of the queue, prefills its prompt and generated tokens again, and continues, so its result is the one it would have produced alone. A request that cannot fit even with every other sequence's memory freed fails by name.
 
 ## Control vectors
 
@@ -741,6 +841,20 @@ Every `neuralfree.*` system property the code reads is listed below. Every Gradl
 | `neuralfree.draft.type` | `auto`, `draft-mtp` or `draft-simple`, as `--spec-type` | `auto` |
 | `neuralfree.mtp` | Self-speculation with the model's NextN/MTP blocks | false |
 | `neuralfree.lora` | Adapters as `path[:scale][,path[:scale]...]` | none |
+| `neuralfree.reasoning.parser` | Reasoning parser by vLLM name, or `auto` for the chat template's | `auto` |
+| `neuralfree.tool.parser` | Tool-call parser by vLLM name, `auto` to detect it from the chat template, `none` to leave calls in the content | `auto` |
+
+### Server (`EngineLifecycle`, `ServerOptions.fromSystemProperties`, `ApiKeys`)
+
+| Property | Meaning | Default |
+|---|---|---|
+| `neuralfree.server.model` | The GGUF or checkpoint the server opens | none (unloaded) |
+| `neuralfree.server.model.name` | Served model names, comma-separated ([model names](#http-server)) | the model path |
+| `neuralfree.server.request.timeout` | Seconds a request may run before it is cancelled with 503, at most 31536000 (a year) | 1800 |
+| `neuralfree.server.spm.infill` | `/infill` puts the suffix before the prefix | false |
+| `neuralfree.server.responses.store` | Responses API responses kept for retrieval, `previous_response_id` and background mode | 0 (off) |
+| `neuralfree.server.api.key` | API keys, comma-separated ([API keys](#api-keys)) | none |
+| `neuralfree.server.api.key.file` | A file of API keys, one per line | none |
 
 ### Hugging Face checkpoints (`ModelSourceOptions.fromProperties`)
 

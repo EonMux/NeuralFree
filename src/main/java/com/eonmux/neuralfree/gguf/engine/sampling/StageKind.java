@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.engine.sampling;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -86,6 +87,68 @@ public enum StageKind {
         }
         throw new IllegalArgumentException("unknown sampler stage '" + label + "'; the stage names are "
                 + joinedLabels());
+    }
+
+    /**
+     * The kind a llama.cpp request names ({@code common_sampler_types_from_names}): a label, case-insensitively, in
+     * kebab case ({@code top-k}) or without underscores ({@code topk}), or one of the aliases {@code nucleus},
+     * {@code temp} and {@code typ}.
+     *
+     * @throws IllegalArgumentException when the name matches no kind
+     */
+    public static StageKind ofName(String name) {
+        String key = Objects.requireNonNull(name, "sampler name").trim().toLowerCase(Locale.ROOT);
+        switch (key) {
+            case "nucleus":
+                return TOP_P;
+            case "temp":
+                return TEMPERATURE;
+            case "typ":
+                return TYPICAL_P;
+            default:
+                break;
+        }
+        for (StageKind kind : values()) {
+            if (kind.label.equals(key) || kind.label.replace('_', '-').equals(key)
+                    || kind.label.replace("_", "").equals(key)) {
+                return kind;
+            }
+        }
+        throw new IllegalArgumentException("unknown sampler '" + name + "'; the stage names are " + joinedLabels());
+    }
+
+    /**
+     * The kinds of a llama.cpp sampler-character string ({@code common_sampler_types_from_chars}): {@code d} dry,
+     * {@code k} top_k, {@code y} typ_p, {@code p} top_p, {@code s} top_n_sigma, {@code m} min_p, {@code t}
+     * temperature, {@code x} xtc, {@code i} infill, {@code e} penalties, {@code a} adaptive_p.
+     *
+     * @throws IllegalArgumentException on a character that names no kind
+     */
+    public static List<StageKind> ofChars(String chars) {
+        List<StageKind> out = new ArrayList<>(chars.length());
+        for (int i = 0; i < chars.length(); i++) {
+            out.add(ofChar(chars.charAt(i)));
+        }
+        return out;
+    }
+
+    private static StageKind ofChar(char c) {
+        switch (c) {
+            case 'd': return DRY;
+            case 'k': return TOP_K;
+            case 'y': return TYPICAL_P;
+            case 'p': return TOP_P;
+            case 's': return TOP_N_SIGMA;
+            case 'm': return MIN_P;
+            case 't': return TEMPERATURE;
+            case 'x': return XTC;
+            case 'i': return INFILL;
+            case 'e': return PENALTIES;
+            case 'a': return ADAPTIVE_P;
+            default:
+                throw new IllegalArgumentException("unknown sampler character '" + c + "'; the characters are "
+                        + "dkypsmtxiea");
+        }
     }
 
     /**

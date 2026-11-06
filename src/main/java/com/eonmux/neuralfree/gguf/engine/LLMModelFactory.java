@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers;
 import com.eonmux.neuralfree.gguf.GGUFModel;
 import com.eonmux.neuralfree.gguf.GGUFModelGPU;
 import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
@@ -424,7 +425,7 @@ public final class LLMModelFactory {
             int draftMax = Math.min(cfg.draftMax(), built.maxDraft);
             int draftMin = Math.min(cfg.draftMin(), draftMax);
             GGUFTokenizer tok = target.tokenizer();
-            ReasoningFilter rf = ReasoningFilter.forChatTemplate(tok.chatTemplate()).withTagTokens(tok::getTokenId);
+            ReasoningFilter rf = ReasoningParsers.forModel(cfg.reasoningParser(), tok);
             SamplingDefaults defaults = SamplingDefaults.forModel(target, cfg);
             SpeculativeSession session = new SpeculativeSession(target, ownsTarget, drafter, built.kind, resources,
                     lease, sink -> SpeculativeDecoder.builder(fb, drafter, tok)

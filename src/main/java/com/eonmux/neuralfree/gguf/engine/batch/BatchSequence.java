@@ -10,8 +10,9 @@ import java.util.Objects;
  * underlying memory slot; the handle only reports. A finished or failed handle stays valid until the caller drops
  * it, but its sequence id is freed for reuse the moment the engine retires it.
  *
- * <p>States: {@link State#QUEUED} waits for a sequence slot and the pages of its prompt; {@link State#RUNNING}
- * prefills or decodes; {@link State#DONE} and {@link State#CANCELLED} carry a {@link GenerationResult} (a
+ * <p>States: {@link State#QUEUED} waits for a sequence slot and the pages of its prompt (a prefill that ran out
+ * of pages rolls back and queues again); {@link State#RUNNING} prefills or decodes, and stays running while the
+ * engine has it preempted (its pages freed, recomputed on re-admission, possibly under another sequence id); {@link State#DONE} and {@link State#CANCELLED} carry a {@link GenerationResult} (a
  * cancellation's result reports {@code StopReason.CANCELLED}); {@link State#FAILED} carries the engine
  * {@link Throwable} that ended it.
  */
@@ -87,6 +88,13 @@ public final class BatchSequence {
     void admit(int seq) {
         this.seq = seq;
         this.state = State.RUNNING;
+    }
+
+    /** Back to the queue before any output: its prefill ran out of pages and rolled back. */
+    void requeued() {
+        this.seq = -1;
+        this.reusedPrefix = 0;
+        this.state = State.QUEUED;
     }
 
     void complete(GenerationResult result, boolean cancelled) {

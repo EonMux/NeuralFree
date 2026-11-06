@@ -322,6 +322,11 @@ public final class GenerationRequest {
             release(tokenId, pending.length() - heldBack());
         }
 
+        /** Whether text is held back as the possible start of a stop string. */
+        public boolean holding() {
+            return pending.length() > 0;
+        }
+
         /** Releases the withheld tail when the stream ended without a stop string. */
         public void finish() {
             if (matched == null) {

@@ -14,8 +14,8 @@ import static org.junit.Assert.assertTrue;
  * The structural-tag parser (PARITY SO-4): the vLLM legacy payload compiles to one grammar whose root
  * alternates the structures — each begin literal, the schema's grammar, the end literal — rules renaming under
  * a per-structure prefix so several structures compose; the compiled grammar constrains sampling through the
- * {@code GrammarStage}; the named refusals fire for a payload without structures, with triggers, or with a
- * structure missing a member.
+ * {@code GrammarStage}; the named refusals fire for a payload without structures, a structure no trigger opens,
+ * or a structure missing a member. Trigger dispatch itself runs in {@code TriggeredGrammarStageTest}.
  */
 public class StructuralTagTest {
 
@@ -101,14 +101,16 @@ public class StructuralTagTest {
     public void theNamedRefusalsFire() {
         assertRefused("{\"format\": {}}", "structures");
         assertRefused("{\"structures\": [{\"begin\": \"a\", \"schema\": {}, \"end\": \"b\"}],"
-                + "\"triggers\": [\"<call>\"]}", "triggers");
+                + "\"triggers\": [\"<call>\"]}", "no trigger");
+        assertRefused("{\"structures\": [{\"begin\": \"a\", \"schema\": {}, \"end\": \"b\"}],"
+                + "\"triggers\": [\"\"]}", "trigger 0");
         assertRefused("{\"structures\": [{\"begin\": \"a\", \"end\": \"b\"}], \"triggers\": []}", "schema");
         assertRefused("{\"structures\": []}", "carries no structures");
     }
 
     private static void assertRefused(String payload, String messagePart) {
         try {
-            GbnfBuilder.grammarOf(ConstraintSpec.structuralTag(payload));
+            GbnfBuilder.compile(ConstraintSpec.structuralTag(payload));
             throw new AssertionError("expected a refusal for " + payload);
         } catch (IllegalArgumentException e) {
             assertTrue("the refusal names the gap: " + e.getMessage(),

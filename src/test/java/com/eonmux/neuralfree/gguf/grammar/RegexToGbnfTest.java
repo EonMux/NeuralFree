@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.grammar;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -155,6 +156,18 @@ public class RegexToGbnfTest {
         assertEquals(grammar.symbolId("root"), grammar.rootRuleIndex());
         assertTrue(grammar.ruleCount() >= 2);
         assertTrue(grammar.rule(grammar.rootRuleIndex()).size() >= 2);
+    }
+
+    @Test
+    public void aStandaloneRegexMatchesTheRawOutputWithOrWithoutAnchors() {
+        for (String pattern : new String[]{"^[0-9]+-[a-z]{2}$", "[0-9]+-[a-z]{2}"}) {
+            Grammar grammar = RegexToGbnf.compile(pattern, "root", false);
+            assertTrue(pattern, GrammarMatcher.matches(grammar, "123-ab"));
+            assertFalse(pattern + " writes no JSON quotes", GrammarMatcher.matches(grammar, "\"123-ab\""));
+            assertFalse(pattern, GrammarMatcher.matches(grammar, "123-abc"));
+        }
+        assertTrue("an escaped dollar stays a literal",
+                GrammarMatcher.matches(RegexToGbnf.compile("a\\$", "root", false), "a$"));
     }
 
     // -------------------------------------------------- refusals (WP clause: anything outside the

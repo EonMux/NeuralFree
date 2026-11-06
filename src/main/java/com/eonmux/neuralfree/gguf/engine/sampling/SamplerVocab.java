@@ -26,6 +26,15 @@ public interface SamplerVocab {
      */
     byte[] piece(int id);
 
+    /**
+     * llama_vocab::token_to_piece(id), the cached piece the grammar matches: rendered with {@code special = true},
+     * so a CONTROL or UNKNOWN token's piece is its raw text ({@code <|channel|>}) instead of no bytes. The default
+     * is {@link #piece}, right for a vocabulary without such tokens.
+     */
+    default byte[] grammarPiece(int id) {
+        return piece(id);
+    }
+
     /** llama_vocab::detokenize({id}, special = true): the single token's text, its special text included. */
     String pieceText(int id);
 

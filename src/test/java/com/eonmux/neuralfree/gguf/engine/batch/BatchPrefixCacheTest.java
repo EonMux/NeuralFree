@@ -203,4 +203,109 @@ public class BatchPrefixCacheTest {
             }
         }
     }
+
+    /** Long enough that two copies never fit the 64 shared cells together. */
+    private static final int LONG = 50;
+
+    private static int[] longPrompt(int seed) {
+        int[] t = new int[LONG];
+        for (int i = 0; i < t.length; i++) {
+            t[i] = 4 + (seed * 13 + i * 7) % 250;
+        }
+        return t;
+    }
+
+    private static EngineConfig twoSlots() {
+        return EngineConfig.builder().memory(MemoryConfig.builder().nCtx(64).ubatch(8).kvPaged(true).parallel(2)
+                .typeK(KvDType.F32).typeV(KvDType.F32).build()).build();
+    }
+
+    /** Pumps until every handle finished, failing instead of spinning when the engine stops making progress. */
+    private static void pumpUntilFinished(BatchEngine engine, BatchSequence... handles) {
+        for (int step = 0; step < 2_000; step++) {
+            boolean all = true;
+            for (BatchSequence h : handles) {
+                all &= h.finished();
+            }
+            if (all) {
+                for (BatchSequence h : handles) {
+                    assertEquals("the request completed: " + h.error(), BatchSequence.State.DONE, h.state());
+                }
+                return;
+            }
+            engine.pump();
+        }
+        throw new AssertionError("the engine stopped admitting: a queued request never ran");
+    }
+
+    @Test
+    public void aQueuedCopyOfARunningPromptAdmitsOverItsCachedPrefix() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel m = new GGUFModel(model.toString(), twoSlots());
+             BatchEngine engine = BatchEngine.forModel(m, twoSlots())) {
+            BatchSequence first = engine.submit(longPrompt(1), request(3),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            BatchSequence second = engine.submit(longPrompt(1), request(3),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, first, second);
+            assertEquals("the copy adopts the cached prompt, all but its last token", LONG - 1,
+                    second.reusedPrefix());
+            assertArrayEquals(first.result().tokens(), second.result().tokens());
+            assertTrue(engine.idle());
+        }
+    }
+
+    @Test
+    public void aNewPromptEvictsCachedPrefixesForTheCellsItNeeds() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        try (GGUFModel m = new GGUFModel(model.toString(), twoSlots());
+             BatchEngine engine = BatchEngine.forModel(m, twoSlots())) {
+            BatchSequence first = engine.submit(longPrompt(1), request(3),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, first);
+            BatchSequence other = engine.submit(longPrompt(2), request(3),
+                    (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, other);
+            assertEquals("an unrelated prompt prefills whole", 0, other.reusedPrefix());
+            assertEquals(3, other.result().tokens().length);
+        }
+    }
+
+    @Test
+    public void sequencesThatOutgrowTheSharedPoolPreemptAndKeepTheirResults() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        int[] a = prompt(3, 1);
+        int[] b = prompt(4, 2);
+        int[] soloA;
+        int[] soloB;
+        try (GGUFModel m = new GGUFModel(model.toString(), twoSlots());
+             BatchEngine engine = BatchEngine.forModel(m, twoSlots())) {
+            BatchSequence one = engine.submit(a, unbounded(40), (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, one);
+            soloA = one.result().tokens();
+        }
+        try (GGUFModel m = new GGUFModel(model.toString(), twoSlots());
+             BatchEngine engine = BatchEngine.forModel(m, twoSlots())) {
+            BatchSequence one = engine.submit(b, unbounded(40), (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, one);
+            soloB = one.result().tokens();
+        }
+        // 12 + 40 positions each: together they need 104 of the 64 shared cells, so one is preempted mid-decode
+        try (GGUFModel m = new GGUFModel(model.toString(), twoSlots());
+             BatchEngine engine = BatchEngine.forModel(m, twoSlots())) {
+            BatchSequence first = engine.submit(a, unbounded(40), (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            BatchSequence second = engine.submit(b, unbounded(40), (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            pumpUntilFinished(engine, first, second);
+            assertArrayEquals("the older sequence decodes as it does alone", soloA, first.result().tokens());
+            assertArrayEquals("the preempted sequence recomputes and continues unchanged", soloB,
+                    second.result().tokens());
+            assertTrue(engine.idle());
+        }
+    }
+
+    /** Greedy decoding of exactly {@code n} tokens: the end-of-generation token does not stop it. */
+    private static GenerationRequest unbounded(int n) {
+        return GenerationRequest.builder().maxNewTokens(n).ignoreEos(true)
+                .sampler(SamplerConfig.greedyDecoding()).build();
+    }
 }

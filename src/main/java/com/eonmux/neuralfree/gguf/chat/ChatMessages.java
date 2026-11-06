@@ -51,11 +51,10 @@ public final class ChatMessages {
     private ChatMessages() {}
 
     /**
-     * The media marker a flattened image or an audio part leaves in the message content: MM-5's
-     * {@code MultimodalPrompt} splits the rendered prompt at this marker and injects the encoded
-     * media there, as llama.cpp's mtmd request markers do (tools/mtmd/mtmd-helper.h). Until that
-     * prompt path exists, a request whose messages contain a media part is refused
-     * ({@code ChatFormatter#format(ChatRequest)}, §3.4).
+     * The media marker a flattened image or an audio part leaves in the message content, at the
+     * place llama.cpp's mtmd request markers take (tools/mtmd/mtmd-helper.h), where a multimodal
+     * prompt injects the encoded media. The text chat path has no media encoder, so a request
+     * whose messages contain a media part is refused ({@code ChatFormatter#format(ChatRequest)}).
      */
     static final String MEDIA_MARKER = "<|__media__|>";
 
@@ -231,7 +230,7 @@ public final class ChatMessages {
      * Multi-part content concatenated to text: every {@code text} part's quoted {@code text} in
      * order, and {@link #MEDIA_MARKER} in place of every image and audio part
      * (common/chat.cpp's content-part handling). The image and audio URLs are carried by the
-     * request's media list, not the template context (MM-5).
+     * request's media list, not the template context.
      */
     private static String flattenParts(int messageIndex, List<?> parts) {
         StringBuilder sb = new StringBuilder();

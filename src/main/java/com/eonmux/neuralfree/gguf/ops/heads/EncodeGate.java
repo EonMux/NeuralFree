@@ -55,10 +55,23 @@ public final class EncodeGate {
     public static void checkEncodeTokens(ModelSpec spec) {
         rejectDecision(spec, "encodeTokens");
         PoolingKind pooling = spec.head().pooling();
-        if (pooling != PoolingKind.NONE || !(isEncoder(spec) || spec.arch() == Arch.POCKETTTS)) {
+        if (!perToken(spec)) {
             throw new UnsupportedOperationException("per-token embeddings not supported by " + spec.arch().ggufName()
                     + " (" + spec.supportClass() + ", pooling " + pooling + ")");
         }
+    }
+
+    /**
+     * Whether {@code spec}'s embeddings are per token: no pooling, on an embedding model or pockettts's latent
+     * output. A decision model has none ({@link #checkEncodeTokens} refuses it by name).
+     */
+    public static boolean embedsPerToken(ModelSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        return !DecisionScorer.present(spec) && perToken(spec);
+    }
+
+    private static boolean perToken(ModelSpec spec) {
+        return spec.head().pooling() == PoolingKind.NONE && (isEncoder(spec) || spec.arch() == Arch.POCKETTTS);
     }
 
     /**

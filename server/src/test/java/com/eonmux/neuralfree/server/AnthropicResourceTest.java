@@ -156,6 +156,7 @@ public class AnthropicResourceTest {
         String events = out.toString(StandardCharsets.UTF_8);
         assertTrue(events.contains("content_block_delta"), "the stream carries text deltas: " + events);
         assertTrue(events.startsWith("event: message_start\n"), "the stream opens with message_start");
+        assertTrue(!events.contains("\"input_tokens\":0"), "message_start reports the rendered prompt's tokens");
         assertTrue(events.contains("event: content_block_start\n"), "a content block opens");
         assertTrue(events.contains("\"type\":\"text_delta\""), "the delta type is text_delta");
         assertTrue(events.contains("event: content_block_stop\n"), "the content block closes");

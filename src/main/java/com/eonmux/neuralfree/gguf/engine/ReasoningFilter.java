@@ -61,6 +61,22 @@ public final class ReasoningFilter {
         default void accept(Channel channel, int tokenId, String text, com.eonmux.neuralfree.gguf.engine.TokenScore[] logprobs) {
             accept(channel, tokenId, text);
         }
+
+        /**
+         * A harmony or Muse message header named the tool {@code recipient} (gpt-oss {@code to=functions.f}); the
+         * message body that follows arrives on {@link Channel#TOOL_CALL} until the next header. Called in order with
+         * the routed text, before the body's first piece. The default ignores it.
+         */
+        default void toolCallStarted(String recipient) {
+        }
+
+        /**
+         * One more generated token joined the output, before any of its text routes: called once per accepted
+         * token (an end-of-generation token is not one), so a sink counts the tokens behind each piece of text.
+         * The default ignores it.
+         */
+        default void stepped(int tokenId) {
+        }
     }
 
     static final String H_START = "<|start|>";
@@ -81,8 +97,10 @@ public final class ReasoningFilter {
     private static final String APRIEL_FINAL_RESPONSE = "[BEGIN FINAL RESPONSE]";
 
     /** DeepSeek V3.2 / V4 DSML tool-call block openers; the DSML delimiters are fullwidth vertical bars (U+FF5C). */
-    private static final String DSML_FUNCTION_CALLS = "<\uFF5CDSML\uFF5Cfunction_calls>";
-    private static final String DSML_TOOL_CALLS = "<\uFF5CDSML\uFF5Ctool_calls>";
+    /** DeepSeek V3.2 / V4 DSML function-call block opener, which also ends reasoning. */
+    public static final String DSML_FUNCTION_CALLS = "<\uFF5CDSML\uFF5Cfunction_calls>";
+    /** DeepSeek V3.2 / V4 DSML tool-call block opener, which also ends reasoning. */
+    public static final String DSML_TOOL_CALLS = "<\uFF5CDSML\uFF5Ctool_calls>";
 
     /** Single special-token candidates inside a tag: {@code <...>} and {@code [...]} pieces. */
     private static final Pattern TOKEN_PIECE = Pattern.compile("<[^<>]*>|\\[[^\\[\\]]*\\]");
@@ -334,6 +352,9 @@ public final class ReasoningFilter {
         /** Whether text currently streams to {@link Channel#REASONING}. */
         public boolean inReasoning() { return machine.inReasoning(); }
 
+        /** Whether reasoning text is held back as the possible start of a closing tag. */
+        public boolean holding() { return machine.holding(); }
+
         /** Recipient of the current harmony tool call, or null. */
         public String recipient() { return machine.recipient(); }
     }
@@ -351,10 +372,17 @@ public final class ReasoningFilter {
 
         abstract boolean inReasoning();
 
+        /** Whether reasoning text is held back as a possible tag; tags of special tokens never hold. */
+        boolean holding() { return false; }
+
         String recipient() { return null; }
 
         final void emit(Channel channel, int tokenId, CharSequence text, int from, int to) {
             if (!muted && to > from) sink.accept(channel, tokenId, text.subSequence(from, to).toString());
+        }
+
+        final void announceToolCall(String recipient) {
+            if (!muted) sink.toolCallStarted(recipient);
         }
 
         /** Earliest occurrence of any tag at or after {@code from}; ties go to the longer tag. Returns {index, tagIndex} or null. */
@@ -494,6 +522,8 @@ public final class ReasoningFilter {
         }
 
         @Override boolean inReasoning() { return phase == Phase.REASONING; }
+
+        @Override boolean holding() { return phase == Phase.REASONING && pending.length() > 0; }
     }
 
     /**
@@ -614,6 +644,7 @@ public final class ReasoningFilter {
             recipient = to != null && !to.isEmpty() && !"assistant".equals(to) ? to : null;
             if (recipient != null) {
                 bodyChannel = Channel.TOOL_CALL;
+                announceToolCall(recipient);
                 return;
             }
             int ch = header.lastIndexOf(H_CHANNEL);

@@ -7,6 +7,7 @@ import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -293,6 +294,30 @@ public class SequenceRunTest {
         assertArrayEquals(new String[] {"f", "f"}, texts(sink, Channel.CONTENT).toArray(new String[0]));
         assertArrayEquals(new String[] {"g"}, texts(sink, Channel.REASONING).toArray(new String[0]));
         assertEquals(5, r.timings().generatedTokens());
+        assertEquals("only the token inside the block counts as reasoning, not its tags", 1, r.reasoningTokens());
+    }
+
+    /**
+     * Tags spelled over several tokens: the tokens of the closing tag do not count as reasoning, though their text
+     * is held back while still in the block, and a held possible tag that turns out to be text counts.
+     */
+    @Test
+    public void reasoningCountsExcludeAClosingTagSpreadOverTokens() {
+        GGUFTokenizer tok = tokenizer(false);
+        GenerationRequest request = GenerationRequest.builder().sampler(SamplerConfig.greedyDecoding())
+                .maxNewTokens(9).build();
+        ReasoningFilter filter = ReasoningFilter.thinkTags(Collections.singletonList("hh"),
+                Collections.singletonList("cd"), Collections.<String>emptyList());
+        List<Piece> sink = new ArrayList<>();
+        SequenceRun run = overCollecting(tok, request, filter, sink);
+        // h h opens, g c g is reasoning (c a false start of the tag), c d closes, f f is content
+        for (int id : new int[] {7, 7, 6, 2, 6, 2, 3, 5, 5}) {
+            run.offer(run.next(row(id)));
+        }
+        GenerationResult r = run.result();
+        assertEquals("gcg", String.join("", texts(sink, Channel.REASONING)));
+        assertEquals("ff", String.join("", texts(sink, Channel.CONTENT)));
+        assertEquals("the three tokens inside the block count, not the tags' four", 3, r.reasoningTokens());
     }
 
     /** Constraints of the run's own surface: stop reasons are single, validated and precede the result. */

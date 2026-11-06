@@ -128,12 +128,14 @@ public class GbnfParserTest {
     @Test
     public void escapeFamiliesDecodeToCodePoints() {
         List<GrammarElement> expected = new ArrayList<>();
+        // a quoted literal is a sequence of CHAR elements (llama-grammar.cpp parse_sequence); CHAR_ALT only
+        // continues a [...] class
         expected.add(element(GrammarElement.Type.CHAR, 0x09));
-        expected.add(element(GrammarElement.Type.CHAR_ALT, 0x0D));
-        expected.add(element(GrammarElement.Type.CHAR_ALT, 0x0A));
-        expected.add(element(GrammarElement.Type.CHAR_ALT, 0x41));
-        expected.add(element(GrammarElement.Type.CHAR_ALT, 0x263A));
-        expected.add(element(GrammarElement.Type.CHAR_ALT, 0x1F600));
+        expected.add(element(GrammarElement.Type.CHAR, 0x0D));
+        expected.add(element(GrammarElement.Type.CHAR, 0x0A));
+        expected.add(element(GrammarElement.Type.CHAR, 0x41));
+        expected.add(element(GrammarElement.Type.CHAR, 0x263A));
+        expected.add(element(GrammarElement.Type.CHAR, 0x1F600));
         expected.add(element(GrammarElement.Type.END, 0));
         assertEquals(expected, parse("root ::= \"\\t\\r\\n\\x41\\u263A\\U0001F600\""));
     }
@@ -212,11 +214,11 @@ public class GbnfParserTest {
 
     @Test
     public void repetitionOverGroupShape() {
-        // root ::= "r" ("x" | "y")? -> the group becomes root_1, the optional becomes root_2
+        // root ::= "r" ("x" | "y")? -> the group becomes root_1, the optional becomes root_2, which replaces
+        // the group's reference in root (handle_repetitions truncates the sequence when min_times is 0)
         Grammar grammar = GbnfParser.parse("root ::= \"r\" (\"x\" | \"y\")?");
         assertEquals(3, grammar.ruleCount());
         assertEquals(List.of(element(GrammarElement.Type.CHAR, 'r'),
-                element(GrammarElement.Type.RULE_REF, grammar.symbolId("root_1")),
                 element(GrammarElement.Type.RULE_REF, grammar.symbolId("root_2")),
                 element(GrammarElement.Type.END, 0)), grammar.rule(0));
         assertEquals(List.of(element(GrammarElement.Type.CHAR, 'x'),
@@ -362,6 +364,28 @@ public class GbnfParserTest {
         GrammarException e = parseFails("root ::= <volume>");
         assertTrue(e.getMessage(), e.getMessage().contains("no vocab to parse token"));
         assertEquals(1, e.getLine());
+    }
+
+    @Test
+    public void tokenByNameResolvesThroughTheVocabularyToExactlyOneToken() {
+        GrammarVocab vocab = text -> text.equals("<|channel|>") ? new int[]{7}
+                : text.equals("<two>") ? new int[]{1, 2} : new int[0];
+        assertEquals(List.of(element(GrammarElement.Type.TOKEN, 7),
+                element(GrammarElement.Type.TOKEN_NOT, 7),
+                element(GrammarElement.Type.END, 0)),
+                GbnfParser.parse("root ::= <|channel|> !<|channel|>", vocab).rule(0));
+        try {
+            GbnfParser.parse("root ::= <two>", vocab);
+            fail("a reference of two tokens is refused");
+        } catch (GrammarException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("invalid token '<two>'"));
+        }
+        try {
+            GbnfParser.parse("root ::= <|channel|", vocab);
+            fail("an unterminated reference is refused");
+        } catch (GrammarException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("expecting '>'"));
+        }
     }
 
     @Test

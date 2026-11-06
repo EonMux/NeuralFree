@@ -152,7 +152,7 @@ public final class ChatFormatter {
      *
      * <p>A request whose messages carry an image or an audio content part is refused: the part's
      * content lands on {@link ChatMessages#MEDIA_MARKER}, and the encoding that consumes the
-     * marker only exists once the chat media pipeline (MM-5) does (§3.4).</p>
+     * marker is the multimodal prompt path's, which the text chat path does not run.</p>
      *
      * @throws IllegalArgumentException for malformed messages, tool calls or template kwargs
      * @throws UnsupportedOperationException for a request with image or audio content parts
@@ -198,8 +198,8 @@ public final class ChatFormatter {
 
     /**
      * Raises a multimodal refusal for a request whose messages carry image or audio content
-     * parts, before any template runs (§3.4): the parts produce {@link ChatMessages#MEDIA_MARKER}
-     * and the media encoding that consumes the marker arrives with MM-5.
+     * parts, before any template runs: the parts produce {@link ChatMessages#MEDIA_MARKER}, which
+     * only the multimodal prompt path consumes.
      */
     private static void refuseMedia(List<Map<String, Object>> messages) {
         for (Map<String, Object> m : messages) {
@@ -207,7 +207,7 @@ public final class ChatFormatter {
             if (content instanceof String && content.toString().contains(ChatMessages.MEDIA_MARKER)) {
                 throw new UnsupportedOperationException("multimodal chat input is refused:"
                         + " message content parts of kind image or audio would be encoded by the"
-                        + " chat media pipeline (MM-5), which is not available in this build");
+                        + " chat media pipeline, which is not available in this build");
             }
         }
     }

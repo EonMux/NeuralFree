@@ -76,6 +76,48 @@ public class PagedSequencesTest {
     }
 
     @Test
+    public void aTailRemovalInsideAPageMovesTheCursorToTheLogicalSlotOfTheFirstClearedRow() {
+        PagedSequences mem = memory(64, 2, true, false, 0);
+        // eleven slots fill logical pages 0..2, which the LIFO pool maps to physical pages 15, 14, 13
+        PagedStep first = step(mem, 0, tokens(0, 11));
+        int page2 = first.pageTableEntry(0, 0, 2);
+        assertTrue("the logical and physical page ids differ", page2 != 2);
+
+        // trimming positions 9 and 10 clears part of logical page 2: the next append resumes at slot 9 of that
+        // page (the prefix cache's adoption path), not at a pool cell index
+        mem.remove(0, 9, -1);
+        PagedStep again = step(mem, 0, tokens(9, 3));
+        for (int i = 0; i < 3; i++) {
+            assertEquals("position " + (9 + i), rowOf(page2, 9 + i), again.cellIdx(0)[i]);
+        }
+        assertEquals(11, mem.posMax(0));
+    }
+
+    @Test
+    public void anInteriorRemovalLeavesHolesAndKeepsTheCursorAboveTheLiveRows() {
+        PagedSequences mem = memory(64, 2, true, false, 0);
+        PagedStep first = step(mem, 0, tokens(0, 11));
+        int[] liveCells = new int[11];
+        System.arraycopy(first.cellIdx(0), 0, liveCells, 0, 11);
+        mem.remove(0, 2, 5);                              // positions 2..4 leave; 5..10 stay live above them
+        assertEquals(10, mem.posMax(0));
+        PagedStep more = step(mem, 0, tokens(11, 2));
+        int page2 = first.pageTableEntry(0, 0, 2);
+        assertEquals("position 11 appends at slot 11", rowOf(page2, 11), more.cellIdx(0)[0]);
+        assertEquals("position 12 appends at slot 12", rowOf(page3(more), 12), more.cellIdx(0)[1]);
+        for (int cell : more.cellIdx(0)) {
+            for (int p = 5; p <= 10; p++) {
+                assertTrue("the append never overwrites live position " + p, cell != liveCells[p]);
+            }
+        }
+        assertEquals(12, mem.posMax(0));
+    }
+
+    private static int page3(PagedStep step) {
+        return step.pageTableEntry(0, 0, 3);
+    }
+
+    @Test
     public void slotJMapsToItsPageAndRowWithoutShiftingOrTrimming() {
         PagedSequences mem = memory(64, 2, true, false, 0);
         assertEquals(PAGE, mem.pageSize());

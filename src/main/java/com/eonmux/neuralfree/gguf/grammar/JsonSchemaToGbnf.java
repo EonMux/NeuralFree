@@ -103,6 +103,63 @@ public final class JsonSchemaToGbnf {
         return GbnfParser.parse(gbnf(schemaJson, mode));
     }
 
+    /** A {@link Composer} in {@code mode}. */
+    public static Composer composer(WhitespaceMode mode) {
+        return new Composer(mode == null ? WhitespaceMode.FLEXIBLE : mode);
+    }
+
+    /**
+     * One grammar composed of hand-written rules and converted schemas, llama.cpp's {@code common_grammar_builder}
+     * ({@code build_grammar}'s {@code add_rule} / {@code add_schema}), as the tool-call grammars use it: schemas
+     * convert under their own rule names into one shared registry, so rules reference them by the returned names.
+     * The composition needs a {@code root} rule. Not thread-safe.
+     */
+    public static final class Composer {
+        private final Converter converter;
+
+        private Composer(WhitespaceMode mode) {
+            this.converter = new Converter(mode);
+        }
+
+        /**
+         * Adds a rule ({@code name ::= definition}); returns the stored name, deduplicated as
+         * {@link GbnfBuilder#addRule} does.
+         */
+        public String addRule(String name, String definition) {
+            return converter.rules.addRule(name, definition);
+        }
+
+        /**
+         * Converts {@code schemaJson} under {@code name}; returns the rule name that matches it.
+         *
+         * @throws IllegalArgumentException when the schema cannot be converted
+         */
+        public String addSchema(String name, String schemaJson) {
+            if (name == null || name.isEmpty() || Grammar.ROOT_RULE.equals(name)) {
+                throw new IllegalArgumentException("a composed schema needs its own rule name, got '" + name + "'");
+            }
+            try {
+                Object document = Json.parse(schemaJson, Json.Limits.UNTRUSTED);
+                return converter.visit(new SchemaBuilder(document).build(), name);
+            } catch (SchemaErrorException e) {
+                throw new IllegalArgumentException("JSON schema conversion failed:\n" + e.getMessage());
+            }
+        }
+
+        /**
+         * The composed GBNF text.
+         *
+         * @throws IllegalArgumentException when a schema recorded a conversion error, or no root rule is defined
+         */
+        public String gbnf() {
+            converter.checkErrors();
+            if (!converter.rules.hasRule(Grammar.ROOT_RULE)) {
+                throw new IllegalArgumentException("a composed grammar needs a root rule");
+            }
+            return converter.rules.format();
+        }
+    }
+
     private JsonSchemaToGbnf() {
     }
 
@@ -143,7 +200,7 @@ public final class JsonSchemaToGbnf {
         PRIMITIVE_RULES.put("array", new BuiltinRule("\"[\" space ( value (\",\" space value)* )?"
                 + " space \"]\"", new String[] {"value"}));
         PRIMITIVE_RULES.put("uuid", new BuiltinRule("\"\\\"\" [0-9a-fA-F]{8} \"-\" [0-9a-fA-F]{4}"
-                + " \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{12} \"\\\"",
+                + " \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{12} \"\\\"\"",
                 new String[0]));
         PRIMITIVE_RULES.put("char", new BuiltinRule("[^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt]"
                 + " | \"u\" [0-9a-fA-F]{4})", new String[0]));

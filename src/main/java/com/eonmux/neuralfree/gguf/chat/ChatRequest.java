@@ -242,9 +242,10 @@ public final class ChatRequest {
     }
 
     /**
-     * The {@code tool_choice}: {@code none}, {@code auto}, the {@code required} mode llama.cpp
-     * turns into a tool grammar (TC-5, common/chat.cpp tool_choice handling), or one named
-     * {@code function}. Immutable; {@link Kind#FUNCTION} always carries its function name.
+     * The {@code tool_choice}: {@code none}, {@code auto}, {@code required} or one named
+     * {@code function}; {@link com.eonmux.neuralfree.gguf.chat.tools.ToolRouting} turns the
+     * forcing choices into tool grammars, as llama.cpp's common/chat.cpp does. Immutable;
+     * {@link Kind#FUNCTION} always carries its function name.
      */
     public static final class ToolChoice {
 

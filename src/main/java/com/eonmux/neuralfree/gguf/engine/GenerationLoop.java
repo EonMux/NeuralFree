@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.engine;
 
+import com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers;
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
 import com.eonmux.neuralfree.gguf.TokenCallback;
 import com.eonmux.neuralfree.gguf.arch.SupportClass;
@@ -83,8 +84,8 @@ public final class GenerationLoop {
     }
 
     /**
-     * The loop of an engine model: its backend and tokenizer, the reasoning parser of its chat template (with its
-     * tag tokens), prefix reuse and context shift from {@code config}'s memory settings, and the model's sampling
+     * The loop of an engine model: its backend and tokenizer, the configured reasoning parser
+     * ({@link EngineConfig#reasoningParser()}, the chat template's by default, with its tag tokens), prefix reuse and context shift from {@code config}'s memory settings, and the model's sampling
      * defaults unless {@code config} turns them off ({@link SamplingDefaults#forModel}).
      *
      * @throws UnsupportedOperationException for models that do not generate autoregressively (embedding,
@@ -107,7 +108,7 @@ public final class GenerationLoop {
                 break;
         }
         GGUFTokenizer tok = model.tokenizer();
-        ReasoningFilter rf = ReasoningFilter.forChatTemplate(tok.chatTemplate()).withTagTokens(tok::getTokenId);
+        ReasoningFilter rf = ReasoningParsers.forModel(config.reasoningParser(), tok);
         return builder(model.forwardBackend(), tok)
                 .reasoning(rf)
                 .memoryConfig(config.memory())

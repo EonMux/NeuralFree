@@ -163,14 +163,19 @@ public final class StopCriteria {
     public final class Session {
 
         private final GGUFTokenizer.StreamingDecoder decoder;
+        private final ReasoningFilter.Sink sink;
         private final ReasoningFilter.State reasoningState;
         private final GenerationRequest.StopStringFilter stopFilter;
         private int[] tokens = new int[64];
         private int count;
+        private int reasoningTokens;
+        /** Reasoning tokens whose text is still held back: they count once it streams as reasoning. */
+        private int heldReasoning;
         private boolean finished;
 
         private Session(ReasoningFilter.Sink sink, String renderedPrompt) {
             this.decoder = tokenizer.createStreamingDecoder();
+            this.sink = sink;
             this.reasoningState = textFilter.newState(sink, renderedPrompt);
             this.stopFilter = request.newStopFilter(reasoningState);
         }
@@ -192,7 +197,12 @@ public final class StopCriteria {
                 tokens = Arrays.copyOf(tokens, count * 2);
             }
             tokens[count++] = token;
+            sink.stepped(token);
+            boolean reasoningBefore = reasoningState.inReasoning();
             stopFilter.onToken(token, render(decoder, token));
+            if (reasoningBefore) {
+                countReasoning();
+            }
             if (stopFilter.stopped()) {
                 return StopReason.STOP_STRING;
             }
@@ -200,6 +210,22 @@ public final class StopCriteria {
                 return StopReason.MAX_TOKENS;
             }
             return null;
+        }
+
+        /**
+         * Counts a token fed in reasoning, vLLM's {@code count_reasoning_tokens} over text: tokens that end reasoning
+         * are the closing tag, so a token whose text is held back (a possible tag or stop string) counts only once
+         * reasoning goes on past it.
+         */
+        private void countReasoning() {
+            if (!reasoningState.inReasoning()) {
+                heldReasoning = 0;
+            } else if (stopFilter.holding() || reasoningState.holding()) {
+                heldReasoning++;
+            } else {
+                reasoningTokens += heldReasoning + 1;
+                heldReasoning = 0;
+            }
         }
 
         /** Polls the request's cancellation hook. */
@@ -242,13 +268,19 @@ public final class StopCriteria {
                 stopFilter.onToken(-1, decoder.flush());
                 stopFilter.finish();
             }
+            if (reasoningState.inReasoning() && !stopFilter.stopped()) {
+                // the held tail was reasoning text, not a tag
+                reasoningTokens += heldReasoning;
+            }
+            heldReasoning = 0;
             reasoningState.finish();
             StopReason r = stopFilter.stopped() ? StopReason.STOP_STRING : reason;
             if (r != StopReason.STOP_STRING && reason == StopReason.STOP_STRING) {
                 throw new IllegalStateException("stop reason STOP_STRING without a matched stop string");
             }
             return new GenerationResult(tokens(), stopFilter.releasedText(), r,
-                    r == StopReason.STOP_STRING ? stopFilter.matched() : null, timings);
+                    r == StopReason.STOP_STRING ? stopFilter.matched() : null, timings)
+                    .withReasoningTokens(reasoningTokens);
         }
     }
 }

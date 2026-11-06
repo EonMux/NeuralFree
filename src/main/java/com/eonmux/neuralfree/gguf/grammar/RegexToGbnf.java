@@ -9,8 +9,10 @@ import java.util.Map;
  * The ECMAScript regex subset to GBNF translator, the Java port of
  * {@code common_chat_schema_converter::_pattern_to_rule} and its helpers
  * ({@code common/json-schema-to-grammar.cpp:284-340,390-631}). A pattern is translated into
- * GBNF rule text in a {@link GbnfBuilder}; whole strings and lazy trigger patterns are wrapped
- * {@code "\"" ( … ) "\""} exactly like llama.cpp writes them, so a match is one JSON string.
+ * GBNF rule text in a {@link GbnfBuilder}. A JSON-schema {@code pattern} ({@link #patternRule})
+ * is wrapped {@code "\"" ( … ) "\""} exactly like llama.cpp writes it, so a match is one JSON
+ * string; a standalone output regex ({@link #compile}) matches the raw output text, as vLLM's
+ * xgrammar backend compiles it.
  *
  * <p>The supported subset, llama.cpp's: the pattern must be anchored {@code ^…$}; literal
  * runs and GBNF escape forms; {@code .} (non-{@code dotAll}: any code point except CR and LF);
@@ -21,7 +23,8 @@ import java.util.Map;
  * ({@link UnsupportedRegexException}); a structurally broken pattern (a stray operator,
  * unbalanced or unterminated escapes, anchors inside the pattern) is an
  * {@link InvalidRegexException}. Like the rest of the grammar engine, this does not consult
- * {@code java.util.regex} (PARITY row G2 note): the translation is a single direct scan.
+ * {@code java.util.regex} (PARITY row G2 note): the translation is a single direct scan. A
+ * standalone regex matches the whole output, so its {@code ^} and {@code $} are optional.
  *
  * <p>{@code JsonSchemaToGbnf} catches {@link UnsupportedRegexException} and degrades the
  * schema property to the generic string rule as llama.cpp does (a warning, not an error);
@@ -83,7 +86,7 @@ public final class RegexToGbnf {
         if (!isAnchored(pattern)) {
             throw new UnsupportedRegexException("not anchored with '^' and '$'");
         }
-        return new RegexToGbnf(pattern.substring(1, pattern.length() - 1), name, builder, dotAll)
+        return new RegexToGbnf(pattern.substring(1, pattern.length() - 1), name, builder, dotAll, true)
                 .translate();
     }
 
@@ -92,14 +95,21 @@ public final class RegexToGbnf {
      * {@link GbnfParser}: the compiled automaton of the regex, which SO-2's lazy triggers and
      * SA-3's {@code stop_regex} drive the ordinary grammar stacks over.
      *
-     * @return the grammar whose wrapped-string rule is stored under {@code name}
-     * @throws UnsupportedRegexException naming the unsupported construct (unanchored, or outside
-     *                                   llama.cpp's subset)
+     * @param pattern the output regex; a leading {@code ^} and trailing {@code $} are optional
+     * @return the grammar whose raw-text rule is stored under {@code name}
+     * @throws UnsupportedRegexException naming the construct outside llama.cpp's subset
      * @throws InvalidRegexException     naming the structural problem
      */
     public static Grammar compile(String pattern, String name, boolean dotAll) {
+        if (pattern == null) {
+            throw new InvalidRegexException("the pattern is missing");
+        }
+        // the whole output must match, so the boundary anchors are implied (xgrammar compile_regex)
+        int from = pattern.startsWith("^") ? 1 : 0;
+        int to = pattern.endsWith("$") && !pattern.endsWith("\\$") && pattern.length() > from
+                ? pattern.length() - 1 : pattern.length();
         GbnfBuilder builder = new GbnfBuilder();
-        patternRule(pattern, name, builder, dotAll);
+        new RegexToGbnf(pattern.substring(from, to), name, builder, dotAll, false).translate();
         return builder.grammar();
     }
 
@@ -107,16 +117,19 @@ public final class RegexToGbnf {
     private final String name;
     private final GbnfBuilder builder;
     private final boolean dotAll;
+    /** Whether the match is wrapped in JSON string quotes (a schema pattern) or raw (an output regex). */
+    private final boolean quoted;
     /** Helper rule text to stored name, llama.cpp {@code sub_rule_ids} ({@code :411}). */
     private final Map<String, String> subRuleIds = new HashMap<>();
     private int pos;
     private int parenDepth;
 
-    private RegexToGbnf(String sub, String name, GbnfBuilder builder, boolean dotAll) {
+    private RegexToGbnf(String sub, String name, GbnfBuilder builder, boolean dotAll, boolean quoted) {
         this.sub = sub;
         this.name = name;
         this.builder = builder;
         this.dotAll = dotAll;
+        this.quoted = quoted;
     }
 
     private String translate() {
@@ -124,7 +137,7 @@ public final class RegexToGbnf {
         if (parenDepth != 0) {
             throw new InvalidRegexException("unbalanced parentheses");
         }
-        return builder.addRule(name, "\"\\\"\" (" + rule + ") \"\\\"\"");
+        return builder.addRule(name, quoted ? "\"\\\"\" (" + rule + ") \"\\\"\"" : "(" + rule + ")");
     }
 
     /**

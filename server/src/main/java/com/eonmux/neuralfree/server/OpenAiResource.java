@@ -1,64 +1,66 @@
 package com.eonmux.neuralfree.server;
 
+import com.eonmux.neuralfree.gguf.chat.tools.ToolParse;
+import com.eonmux.neuralfree.gguf.chat.tools.ToolRouting;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.GenerationResult;
-import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
-import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.StopReason;
-import com.eonmux.neuralfree.gguf.engine.TokenScore;
-import com.eonmux.neuralfree.gguf.engine.batch.BatchSequence;
 import com.eonmux.neuralfree.gguf.grammar.ConstraintSpec;
-import com.eonmux.neuralfree.utils.json.Json;
+import com.eonmux.neuralfree.utils.json.JsonException;
 import com.eonmux.neuralfree.utils.json.JsonView;
+import io.vertx.core.http.HttpServerRequest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
-import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
 
 import java.io.IOException;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
- * The OpenAI-compatible endpoints (PARITY plan P2): {@code GET /v1/models}, {@code POST /v1/completions} and
- * {@code POST /v1/chat/completions}, each with server-sent-event streaming ({@code stream: true}). Bodies are
- * read as text and parsed with the core JSON stack ({@code utils/json}). Sampling settings map onto
- * {@link SamplerConfig} (only present keys leave the llama.cpp defaults); the grammar settings map onto
- * {@link ConstraintSpec} kinds ({@code grammar}, {@code guided_json}, {@code guided_regex}, {@code guided_choice}).
+ * The OpenAI-compatible generation endpoints: {@code GET /v1/models}, {@code POST /v1/completions} and
+ * {@code POST /v1/chat/completions}, each with server-sent-event streaming ({@code stream: true}).
  *
- * <p>Refusals carry the gap by name: {@code n} above 1, a prompt array (one prompt per request; the batch engine
- * runs requests, not prompt batches) and image or audio message parts (the projector epic). {@code logit_bias}
- * maps onto the sampler's first stage (additive biases; {@code -100} and below ban).
+ * <ul>
+ *   <li>Choices: {@code n} choices per prompt, decoded side by side; with a {@code seed}, choice {@code i}
+ *       samples with {@code seed + i}. A completion takes every OpenAI prompt form (string, strings, token ids,
+ *       token-id arrays), choice {@code p * n + i} answering prompt {@code p}; {@code echo} prepends the
+ *       prompt.</li>
+ *   <li>Constraints: {@code grammar}, {@code json_schema}, the vLLM {@code guided_*} fields and
+ *       {@code structured_outputs}, and {@code response_format} ({@link OpenAiRequests#constraint}).</li>
+ *   <li>Tools: {@code tools} render through the template; {@code tool_choice} {@code auto} reads calls with the
+ *       configured parser, {@code required} and a named function add a forcing grammar ({@link ToolRouting}).
+ *       Calls come back as {@code message.tool_calls} (streamed as {@code delta.tool_calls}) with finish reason
+ *       {@code tool_calls}.</li>
+ *   <li>Reasoning streams as {@code reasoning_content}. Logprobs follow OpenAI per endpoint: chat's
+ *       {@code logprobs: true} with {@code top_logprobs} answers {@code logprobs.content} entries, the
+ *       completions' integer {@code logprobs} the legacy {@code tokens}/{@code token_logprobs}/
+ *       {@code top_logprobs}/{@code text_offset} arrays; llama.cpp's {@code n_probs} selects the count on
+ *       either. {@code stream_options.include_usage}
+ *       adds the usage chunk; without it the last finish chunk carries the usage.</li>
+ * </ul>
  *
- * <p>Finish reasons: {@code stop} for an end-of-generation token, a stop string or a cancellation; {@code length}
- * for the token budget or a full context. Reasoning output of the chat template's parser streams as
- * {@code reasoning_content} deltas (the llama.cpp and vLLM field); tool-call syntax reaches the client as content
- * until the tool-call parser epic lands.
+ * A client that disconnects mid-stream cancels its sequences.
  */
 @Path("/")
 public class OpenAiResource {
 
-    /** One routed output piece on its way to a stream, with the logprobs capture its token released (or none). */
-    private record Piece(ReasoningFilter.Channel channel, String text, TokenScore[] logprobs) { }
-
-    /** The longest wait on one streamed request before the stream gives up (the engine may be stuck). */
-    private static final long STREAM_TIMEOUT_MINUTES = 30;
-
     @Inject
     EngineService service;
+
+    /** The current HTTP request (a request-scoped proxy), for disconnect cancellation; null in manual wiring. */
+    @Inject
+    HttpServerRequest http;
 
     /** Test and manual wiring: builds the resource over an explicit service. */
     public OpenAiResource(EngineService service) {
@@ -72,15 +74,22 @@ public class OpenAiResource {
     @Path("/v1/models")
     @Produces(MediaType.APPLICATION_JSON)
     public Response models() {
-        requireLoaded();
-        Map<String, Object> model = new LinkedHashMap<>();
-        model.put("id", service.modelPath());
-        model.put("object", "model");
-        model.put("owned_by", "neuralfree");
+        ServerJson.requireLoaded(service);
+        List<Object> data = new ArrayList<>();
+        for (String name : service.served().names()) {
+            Map<String, Object> model = new LinkedHashMap<>();
+            model.put("id", name);
+            model.put("object", "model");
+            model.put("created", 0L);
+            model.put("owned_by", "neuralfree");
+            model.put("root", service.modelPath());
+            model.put("max_model_len", service.maxModelLength());
+            data.add(model);
+        }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("object", "list");
-        body.put("data", List.of(model));
-        return Response.ok(json(body)).build();
+        body.put("data", data);
+        return Response.ok(ServerJson.write(body)).build();
     }
 
     @POST
@@ -88,28 +97,8 @@ public class OpenAiResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response completions(String bodyText) {
-        requireLoaded();
-        JsonView body = parse(bodyText);
-        Object rawPrompt = body.raw("prompt");
-        if (!(rawPrompt instanceof String prompt)) {
-            throw badRequest("prompt is required and must be a string;"
-                    + " a prompt array is refused (one prompt per request)");
-        }
-        GenerationRequest request = samplingRequest(body);
-        ConstraintSpec constraint = constraint(body);
-        int[] tokens = service.encode(prompt, true, true);
-        if (body.optBool("stream", false)) {
-            return streamResponse(tokens, request, null, constraint, false);
-        }
-        List<String> reasoning = new ArrayList<>();
-        GenerationResult result = run(tokens, request, constraint, reasoning);
-        List<Map<String, Object>> choices = new ArrayList<>();
-        Map<String, Object> choice = choice(0, result.text(), null, finishReason(result.stopReason()));
-        if (!result.logprobs().isEmpty()) {
-            choice.put("logprobs", Map.of("content", logprobsBody(result)));
-        }
-        choices.add(choice);
-        return Response.ok(json(completionBody("text_completion", choices, result))).build();
+        ServerJson.requireLoaded(service);
+        return mapped(() -> completionsOf(ServerJson.parse(bodyText)));
     }
 
     @POST
@@ -117,602 +106,259 @@ public class OpenAiResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public Response chatCompletions(String bodyText) {
-        requireLoaded();
-        JsonView body = parse(bodyText);
-        com.eonmux.neuralfree.gguf.chat.ChatRequest chat = chatRequest(body);
-        String rendered = service.formatChat(chat);
-        GenerationRequest request = samplingRequest(body);
-        ConstraintSpec constraint = constraint(body);
-        int[] tokens = service.encode(rendered, false, true);
-        if (body.optBool("stream", false)) {
-            return streamResponse(tokens, request, rendered, constraint, true);
-        }
-        List<String> reasoning = new ArrayList<>();
-        GenerationResult result = run(tokens, request, constraint, reasoning);
-        Map<String, Object> message = new LinkedHashMap<>();
-        message.put("role", "assistant");
-        message.put("content", result.text());
-        if (!reasoning.isEmpty()) {
-            message.put("reasoning_content", String.join("", reasoning));
-        }
-        List<Map<String, Object>> choices = new ArrayList<>();
-        Map<String, Object> choice = choice(0, null, message, finishReason(result.stopReason()));
-        if (!result.logprobs().isEmpty()) {
-            choice.put("logprobs", Map.of("content", logprobsBody(result)));
-        }
-        choices.add(choice);
-        return Response.ok(json(completionBody("chat.completion", choices, result))).build();
+        ServerJson.requireLoaded(service);
+        return mapped(() -> chatOf(ServerJson.parse(bodyText)));
     }
 
+    /** llama.cpp's unversioned alias of {@code /v1/models}. */
+    @GET
+    @Path("/models")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response modelsAlias() {
+        return models();
+    }
+
+    /** llama.cpp's unversioned alias of {@code /v1/chat/completions}. */
     @POST
-    @Path("/v1/embeddings")
+    @Path("/chat/completions")
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
-    public Response embeddings(String bodyText) throws IOException {
-        requireLoaded();
-        JsonView body = parse(bodyText);
-        List<String> inputs = new ArrayList<>();
-        Object raw = body.raw("input");
-        if (raw instanceof String s) {
-            inputs.add(s);
-        } else if (raw instanceof List<?> list) {
-            for (Object o : list) {
-                if (o instanceof String s) {
-                    inputs.add(s);
-                } else {
-                    throw badRequest("every input must be a string; token arrays are refused"
-                            + " (the server tokenizes text)");
-                }
-            }
-        } else {
-            throw badRequest("input is required and must be a string or an array of strings");
-        }
-        List<Map<String, Object>> data = new ArrayList<>();
-        long tokens = 0;
-        for (int i = 0; i < inputs.size(); i++) {
-            int[] ids = service.encode(inputs.get(i), false, false);
-            tokens += ids.length;
-            float[] embedding;
-            try {
-                embedding = service.embed(ids);
-            } catch (UnsupportedOperationException e) {
-                throw badRequest(e.getMessage());
-            }
-            List<Object> values = new ArrayList<>(embedding.length);
-            for (float v : embedding) {
-                values.add((double) v);
-            }
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("object", "embedding");
-            entry.put("index", i);
-            entry.put("embedding", values);
-            data.add(entry);
-        }
-        Map<String, Object> usage = new LinkedHashMap<>();
-        usage.put("prompt_tokens", tokens);
-        usage.put("total_tokens", tokens);
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("object", "list");
-        out.put("data", data);
-        out.put("model", service.modelPath());
-        out.put("usage", usage);
-        return Response.ok(json(out)).build();
+    public Response chatCompletionsAlias(String bodyText) {
+        return chatCompletions(bodyText);
     }
 
+    /** llama.cpp's prompt token count of a chat request ({@code handle_count_tokens}). */
     @POST
-    @Path("/v1/rerank")
+    @Path("/v1/chat/completions/input_tokens")
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
-    public Response rerank(String bodyText) throws IOException {
-        requireLoaded();
-        JsonView body = parse(bodyText);
-        String query = body.optStr("query", null);
-        if (query == null) {
-            throw badRequest("query is required");
-        }
-        List<String> documents = new ArrayList<>();
-        Object raw = body.raw("documents");
-        if (raw instanceof List<?> list) {
-            for (Object o : list) {
-                if (o instanceof String s) {
-                    documents.add(s);
-                } else if (o instanceof Map<?, ?> map && map.get("text") instanceof String s) {
-                    documents.add(s);
-                } else {
-                    throw badRequest("every document must be a string or an object with a text field");
-                }
-            }
-        } else {
-            throw badRequest("documents is required and must be an array");
-        }
-        int topN = body.optI32("top_n", documents.size());
-        List<float[]> scored = new ArrayList<>();
-        long tokens = 0;
-        for (int i = 0; i < documents.size(); i++) {
-            int[] input = service.rerankInput(query, documents.get(i));
-            tokens += input.length;
-            float score;
-            try {
-                score = service.rerankScore(input);
-            } catch (UnsupportedOperationException e) {
-                throw badRequest(e.getMessage());
-            } catch (IOException e) {
-                throw new WebApplicationException("the rerank forward failed: " + e.getMessage(), 500);
-            }
-            scored.add(new float[]{score, i});
-        }
-        scored.sort((a, b) -> Float.compare(b[0], a[0]));
-        List<Map<String, Object>> results = new ArrayList<>();
-        for (int r = 0; r < Math.min(topN, scored.size()); r++) {
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("index", (int) scored.get(r)[1]);
-            result.put("relevance_score", (double) scored.get(r)[0]);
-            results.add(result);
-        }
-        Map<String, Object> usage = new LinkedHashMap<>();
-        usage.put("total_tokens", tokens);
+    public Response chatInputTokens(String bodyText) {
+        ServerJson.requireLoaded(service);
+        return mapped(() -> inputTokens(service, ServerJson.parse(bodyText)));
+    }
+
+    /** llama.cpp's unversioned alias. */
+    @POST
+    @Path("/chat/completions/input_tokens")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response chatInputTokensAlias(String bodyText) {
+        return chatInputTokens(bodyText);
+    }
+
+    /** {@code {"object": "response.input_tokens", "input_tokens": n}} of the rendered chat prompt. */
+    static Response inputTokens(EngineService service, JsonView chatBody) {
+        int[] prompt = service.encode(service.formatChat(OpenAiRequests.chat(chatBody)), false, true);
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("id", "rerank-" + System.nanoTime());
-        out.put("model", service.modelPath());
-        out.put("results", results);
-        out.put("usage", usage);
-        return Response.ok(json(out)).build();
-    }
-
-    // ------------------------------------------------------------------ request mapping
-
-    /** The sampling settings of one request body: only present keys leave their llama.cpp defaults. */
-    private GenerationRequest samplingRequest(JsonView body) {
-        int n = body.optI32("n", 1);
-        if (n != 1) {
-            throw badRequest("n = " + n + " is refused: one choice per request (the engine runs requests,"
-                    + " not choice batches)");
-        }
-        Map<Integer, Float> logitBias = new LinkedHashMap<>();
-        if (body.has("logit_bias")) {
-            Object rawBias = body.raw("logit_bias");
-            if (!(rawBias instanceof Map<?, ?> biasMap)) {
-                throw badRequest("logit_bias must be an object of token id to bias");
-            }
-            for (Map.Entry<?, ?> e : biasMap.entrySet()) {
-                int id;
-                try {
-                    id = Integer.parseInt(String.valueOf(e.getKey()).trim());
-                } catch (NumberFormatException parse) {
-                    throw badRequest("logit_bias key '" + e.getKey() + "' is not a token id");
-                }
-                if (id < 0) {
-                    throw badRequest("logit_bias token id " + id + " is negative");
-                }
-                double bias = e.getValue() instanceof Number num ? num.doubleValue() : Double.NaN;
-                if (!Double.isFinite(bias) || bias < -100.0 || bias > 100.0) {
-                    throw badRequest("logit_bias value of token " + id + " must be a number in [-100, 100]");
-                }
-                logitBias.put(id, (float) bias);
-            }
-        }
-        GenerationRequest.Builder builder = GenerationRequest.builder();
-        int maxTokens = body.has("max_completion_tokens") ? body.optI32("max_completion_tokens", -1)
-                : body.optI32("max_tokens", -1);
-        if (maxTokens >= 0) {
-            builder.maxNewTokens(maxTokens);
-        }
-        int logprobs = 0;
-        if (body.has("n_probs")) {
-            logprobs = Math.max(0, body.optI32("n_probs", 0));
-        }
-        if (body.optBool("logprobs", false)) {
-            logprobs = Math.max(logprobs, body.optI32("top_logprobs", 0) > 0
-                    ? body.optI32("top_logprobs", 0) : 1);
-        }
-        if (logprobs > 0) {
-            builder.logprobs(logprobs);
-        }
-        List<String> stop = new ArrayList<>();
-        Object rawStop = body.raw("stop");
-        if (rawStop instanceof String s) {
-            stop.add(s);
-        } else if (rawStop instanceof List<?> list) {
-            for (Object o : list) {
-                if (o instanceof String s) {
-                    stop.add(s);
-                }
-            }
-        }
-        builder.stopStrings(stop);
-        List<String> badWords = new ArrayList<>();
-        Object rawBad = body.raw("bad_words");
-        if (rawBad instanceof String s) {
-            badWords.add(s);
-        } else if (rawBad instanceof List<?> list) {
-            for (Object o : list) {
-                if (o instanceof String s) {
-                    badWords.add(s);
-                }
-            }
-        }
-        builder.badWords(badWords);
-        builder.minTokens(Math.max(0, body.optI32("min_tokens", 0)));
-        if (!logitBias.isEmpty()) {
-            builder.logitBias(logitBias);
-        }
-        builder.sampler(samplerConfig(body));
-        return builder.build();
-    }
-
-    /** The sampler settings of the body over the llama.cpp defaults ({@code GenerationRequest.defaults()}). */
-    private SamplerConfig samplerConfig(JsonView body) {
-        SamplerConfig.Builder sampler = GenerationRequest.defaults().sampler().toBuilder();
-        if (body.has("temperature")) {
-            sampler.temperature((float) body.f64("temperature"));
-        }
-        if (body.has("top_p")) {
-            sampler.topP((float) body.f64("top_p"));
-        }
-        if (body.has("top_k")) {
-            sampler.topK(body.optI32("top_k", 0));
-        }
-        if (body.has("min_p")) {
-            sampler.minP((float) body.f64("min_p"));
-        }
-        if (body.has("typical_p")) {
-            sampler.typicalP((float) body.f64("typical_p"));
-        }
-        if (body.has("repeat_penalty")) {
-            sampler.repeatPenalty((float) body.f64("repeat_penalty"));
-        }
-        if (body.has("presence_penalty")) {
-            sampler.presencePenalty((float) body.f64("presence_penalty"));
-        }
-        if (body.has("frequency_penalty")) {
-            sampler.frequencyPenalty((float) body.f64("frequency_penalty"));
-        }
-        if (body.has("seed")) {
-            long seed = body.optI64("seed", Long.MIN_VALUE);
-            if (seed != Long.MIN_VALUE && seed != -1) {
-                sampler.seed(seed);
-            }
-        }
-        return sampler.build();
-    }
-
-    /** The grammar constraint of the body: llama.cpp's {@code grammar} and the vLLM {@code guided_*} names. */
-    private ConstraintSpec constraint(JsonView body) {
-        if (body.has("grammar")) {
-            return ConstraintSpec.gbnf(body.str("grammar"));
-        }
-        if (body.has("guided_json")) {
-            return ConstraintSpec.jsonSchema(body.str("guided_json"), null);
-        }
-        if (body.has("guided_regex")) {
-            return ConstraintSpec.regex(body.str("guided_regex"), false);
-        }
-        if (body.has("guided_choice")) {
-            List<String> choices = new ArrayList<>();
-            for (Object o : stringArray(body, "guided_choice")) {
-                choices.add(String.valueOf(o));
-            }
-            return ConstraintSpec.choice(choices);
-        }
-        if (body.has("guided_structural_tag") || body.has("structural_tag")) {
-            return ConstraintSpec.structuralTag(body.str(
-                    body.has("guided_structural_tag") ? "guided_structural_tag" : "structural_tag"));
-        }
-        return null;
-    }
-
-    private List<?> stringArray(JsonView body, String key) {
-        Object raw = body.raw(key);
-        if (!(raw instanceof List<?> list)) {
-            throw badRequest(key + " must be an array of strings");
-        }
-        return list;
-    }
-
-    /** The chat request of the body: role/content messages plus the template knobs the engine carries. */
-    private com.eonmux.neuralfree.gguf.chat.ChatRequest chatRequest(JsonView body) {
-        Object raw = body.raw("messages");
-        if (!(raw instanceof List<?> list) || list.isEmpty()) {
-            throw badRequest("messages is required and must be a non-empty array");
-        }
-        com.eonmux.neuralfree.gguf.chat.ChatRequest.Builder chat =
-                com.eonmux.neuralfree.gguf.chat.ChatRequest.builder();
-        for (Object o : list) {
-            if (!(o instanceof Map<?, ?> message)) {
-                throw badRequest("every message must be an object with role and content");
-            }
-            Map<String, Object> typed = new LinkedHashMap<>();
-            for (Map.Entry<?, ?> e : message.entrySet()) {
-                typed.put(String.valueOf(e.getKey()), e.getValue());
-            }
-            chat.addMessage(typed);
-        }
-        if (body.has("add_generation_prompt")) {
-            chat.addGenerationPrompt(body.optBool("add_generation_prompt", true));
-        }
-        if (body.has("enable_thinking")) {
-            chat.enableThinking(body.optBool("enable_thinking", false));
-        }
-        Object kwargs = body.raw("chat_template_kwargs");
-        if (kwargs instanceof Map<?, ?> map) {
-            for (Map.Entry<?, ?> e : map.entrySet()) {
-                chat.templateKwarg(String.valueOf(e.getKey()), e.getValue());
-            }
-        }
-        return chat.build();
-    }
-
-    // ------------------------------------------------------------------ execution
-
-    /** Runs the submission to its terminal state on the calling thread; reasoning pieces land in {@code out}. */
-    private GenerationResult run(int[] prompt, GenerationRequest request, ConstraintSpec constraint,
-                                 List<String> reasoning) {
-        try {
-            List<String> sink = reasoning;
-            EngineService.Submission submission = service.submit(prompt, request, (channel, tokenId, text) -> {
-                if (channel == ReasoningFilter.Channel.REASONING && sink != null) {
-                    sink.add(text);
-                }
-            }, null, constraint);
-            if (!submission.await(STREAM_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
-                throw new WebApplicationException("the request outlived its " + STREAM_TIMEOUT_MINUTES
-                        + "-minute budget", 503);
-            }
-            if (submission.refused() != null) {
-                throw badRequest(String.valueOf(submission.refused().getMessage()));
-            }
-            BatchSequence sequence = submission.sequence();
-            if (sequence.state() == BatchSequence.State.FAILED) {
-                throw new WebApplicationException(
-                        Response.status(500).entity(json(errorBody(String.valueOf(sequence.error())))).build());
-            }
-            return sequence.result();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new WebApplicationException("request interrupted", 503);
-        }
-    }
-
-    /** Streams the submission as server-sent events; the pieces cross a queue from the pump thread. */
-    private Response streamResponse(int[] prompt, GenerationRequest request, String rendered,
-                                    ConstraintSpec constraint, boolean chat) {
-        BlockingQueue<Piece> pieces = new ArrayBlockingQueue<>(1024);
-        String id = "chatcmpl-" + System.nanoTime();
-        long created = System.currentTimeMillis() / 1000;
-        String model = service.modelPath();
-        EngineService.Submission submission;
-        try {
-            submission = service.submit(prompt, request, new ReasoningFilter.Sink() {
-                @Override
-                public void accept(ReasoningFilter.Channel channel, int tokenId, String text) {
-                    enqueue(channel, text, null);
-                }
-
-                @Override
-                public void accept(ReasoningFilter.Channel channel, int tokenId, String text,
-                                   TokenScore[] logprobs) {
-                    enqueue(channel, text, logprobs != null && logprobs.length > 0 ? logprobs : null);
-                }
-
-                private void enqueue(ReasoningFilter.Channel channel, String text, TokenScore[] logprobs) {
-                    try {
-                        pieces.put(new Piece(channel, text, logprobs));
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-            }, rendered, constraint);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new WebApplicationException("the server is shutting down", 503);
-        }
-        StreamingOutput stream = out -> streamEvents(out, submission, pieces, id, created, model, chat);
-        return Response.ok(stream).type("text/event-stream").build();
-    }
-
-    /** Writes SSE frames until the submission reaches its terminal state, then the final chunk and [DONE]. */
-    private void streamEvents(OutputStream out, EngineService.Submission submission, BlockingQueue<Piece> pieces,
-                              String id, long created, String model, boolean chat) throws IOException {
-        long deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(STREAM_TIMEOUT_MINUTES);
-        try {
-            while (true) {
-                Piece piece = pieces.poll(20, TimeUnit.MILLISECONDS);
-                if (piece != null) {
-                    writeChunk(out, id, created, model, piece, chat);
-                }
-                if (submission.await(0, TimeUnit.MILLISECONDS)) {
-                    break;
-                }
-                if (System.nanoTime() > deadline) {
-                    throw new IOException("the request outlived its " + STREAM_TIMEOUT_MINUTES + "-minute budget");
-                }
-            }
-            Piece piece;
-            while ((piece = pieces.poll()) != null) {
-                writeChunk(out, id, created, model, piece, chat);
-            }
-            if (submission.refused() != null) {
-                writeEvent(out, json(errorBody(String.valueOf(submission.refused().getMessage()))));
-                return;
-            }
-            BatchSequence sequence = submission.sequence();
-            if (sequence == null || sequence.state() == BatchSequence.State.FAILED) {
-                writeEvent(out, json(errorBody(String.valueOf(
-                        sequence == null ? "the request never registered" : sequence.error()))));
-                return;
-            }
-            String finish = finishReason(sequence.result().stopReason());
-            StringBuilder last = new StringBuilder();
-            last.append("data: ");
-            Map<String, Object> choice = new LinkedHashMap<>();
-            choice.put("index", 0);
-            choice.put("delta", Map.of());
-            choice.put("finish_reason", finish);
-            Map<String, Object> chunk = chunkHead(id, created, model, chat);
-            chunk.put("choices", List.of(choice));
-            chunk.put("usage", usage(sequence.result()));
-            Json.write(chunk, Json.Style.API, last);
-            last.append("\n\n");
-            out.write(last.toString().getBytes(StandardCharsets.UTF_8));
-            out.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-            out.flush();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("stream interrupted", e);
-        }
-    }
-
-    private void writeChunk(OutputStream out, String id, long created, String model, Piece piece, boolean chat)
-            throws IOException {
-        Map<String, Object> delta = new LinkedHashMap<>();
-        if (piece.channel() == ReasoningFilter.Channel.REASONING) {
-            delta.put("reasoning_content", piece.text());
-        } else if (chat) {
-            delta.put("content", piece.text());
-        } else {
-            delta.put("text", piece.text());
-        }
-        Map<String, Object> choice = new LinkedHashMap<>();
-        choice.put("index", 0);
-        choice.put("delta", delta);
-        if (piece.logprobs() != null) {
-            choice.put("logprobs", Map.of("content", List.of(logprobsEntry(piece.logprobs()))));
-        }
-        choice.put("finish_reason", null);
-        Map<String, Object> chunk = chunkHead(id, created, model, chat);
-        chunk.put("choices", List.of(choice));
-        writeEvent(out, json(chunk));
-    }
-
-    private Map<String, Object> chunkHead(String id, long created, String model, boolean chat) {
-        Map<String, Object> chunk = new LinkedHashMap<>();
-        chunk.put("id", id);
-        chunk.put("object", chat ? "chat.completion.chunk" : "text_completion.chunk");
-        chunk.put("created", created);
-        chunk.put("model", model);
-        return chunk;
-    }
-
-    private void writeEvent(OutputStream out, String json) throws IOException {
-        out.write(("data: " + json + "\n\n").getBytes(StandardCharsets.UTF_8));
-        out.flush();
-    }
-
-    // ------------------------------------------------------------------ response bodies
-
-    private Map<String, Object> usage(GenerationResult result) {
-        Map<String, Object> usage = new LinkedHashMap<>();
-        usage.put("prompt_tokens", result.timings().promptTokens());
-        usage.put("completion_tokens", result.timings().generatedTokens());
-        usage.put("total_tokens", result.timings().promptTokens() + result.timings().generatedTokens());
-        return usage;
+        out.put("object", "response.input_tokens");
+        out.put("input_tokens", prompt.length);
+        return Response.ok(ServerJson.write(out)).build();
     }
 
     /**
-     * The OpenAI logprobs shape of a result: one content entry per generated token with its log probability and
-     * its top alternatives ({@code token} renders through the model's tokenizer).
+     * Runs a request mapping; malformed fields the mapping did not catch and inputs the model cannot take (media
+     * parts on a text-only path) are 400s.
      */
-    private List<Map<String, Object>> logprobsBody(GenerationResult result) {
-        List<Map<String, Object>> content = new ArrayList<>();
-        for (TokenScore[] step : result.logprobs()) {
-            content.add(logprobsEntry(step));
+    static Response mapped(Supplier<Response> handler) {
+        try {
+            return handler.get();
+        } catch (JsonException | IllegalArgumentException | UnsupportedOperationException e) {
+            throw ServerJson.badRequest(String.valueOf(e.getMessage()));
         }
-        return content;
     }
 
-    /** One content entry of the logprobs shape: the sampled token, its logprob, its top alternatives. */
-    private Map<String, Object> logprobsEntry(TokenScore[] step) {
-        Map<String, Object> top = new LinkedHashMap<>();
-        for (int i = 1; i < step.length; i++) {
-            top.put(service.tokenText(step[i].tokenId()), (double) step[i].logprob());
+    // ------------------------------------------------------------------ completions
+
+    private Response completionsOf(JsonView body) {
+        String model = service.served().resolve(body);
+        int n = OpenAiRequests.choices(body);
+        int top = OpenAiRequests.topLogprobs(body, false);
+        GenerationRequest base = OpenAiRequests.sampling(body, top);
+        ConstraintSpec constraint = OpenAiRequests.constraint(body);
+        List<OpenAiRequests.Prompt> prompts = OpenAiRequests.prompts(body, service.vocabSize());
+        OpenAiRequests.requireGenerationBudget(prompts.size(), n);
+        boolean echo = body.optBool("echo", false);
+        List<GenerationBatch.Job> jobs = new ArrayList<>();
+        List<String> echoes = new ArrayList<>();
+        long promptTokens = 0;
+        for (OpenAiRequests.Prompt p : prompts) {
+            int[] tokens = p.tokens() != null ? p.tokens() : service.encode(p.text(), true, true);
+            if (tokens.length == 0) {
+                throw ServerJson.badRequest("a prompt encodes to no tokens");
+            }
+            promptTokens += tokens.length;
+            String echoed = !echo ? "" : p.text() != null ? p.text() : service.decode(tokens);
+            for (int i = 0; i < n; i++) {
+                jobs.add(new GenerationBatch.Job(tokens, OpenAiRequests.forChoice(base, i), null, constraint));
+                echoes.add(echoed);
+            }
         }
-        Map<String, Object> entry = new LinkedHashMap<>();
-        entry.put("token", service.tokenText(step[0].tokenId()));
-        entry.put("logprob", (double) step[0].logprob());
-        entry.put("top_logprobs", List.of(top));
-        return entry;
+        OpenAiBodies bodies = new OpenAiBodies(service, top, model);
+        String id = "cmpl-" + System.nanoTime();
+        long created = System.currentTimeMillis() / 1000;
+        boolean streamed = body.optBool("stream", false);
+        boolean includeUsage = body.optObj("stream_options").optBool("include_usage", false);
+        GenerationBatch batch = GenerationBatch.start(service, jobs, http);
+        if (streamed) {
+            long counted = promptTokens;
+            StreamingOutput stream = out -> streamCompletions(out, batch, bodies, id, created, echoes, counted,
+                    includeUsage);
+            return Response.ok(stream).type("text/event-stream").build();
+        }
+        batch.awaitAll();
+        List<Map<String, Object>> choices = new ArrayList<>();
+        List<GenerationResult> results = new ArrayList<>();
+        for (int i = 0; i < batch.size(); i++) {
+            GenerationResult result = batch.result(i);
+            results.add(result);
+            Map<String, Object> choice = new LinkedHashMap<>();
+            choice.put("index", i);
+            choice.put("text", echoes.get(i) + result.text());
+            choice.put("logprobs", result.logprobs().isEmpty() ? null
+                    : bodies.completionLogprobs(result.logprobs(), echoes.get(i).length()));
+            choice.put("finish_reason", OpenAiBodies.finishReason(result.stopReason()));
+            choices.add(choice);
+        }
+        Map<String, Object> out = bodies.head(id, "text_completion", created);
+        out.put("choices", choices);
+        out.put("usage", OpenAiBodies.usage(promptTokens, results));
+        return Response.ok(ServerJson.write(out)).build();
     }
 
-    private Map<String, Object> completionBody(String object, List<Map<String, Object>> choices,
-                                               GenerationResult result) {
+    private void streamCompletions(OutputStream out, GenerationBatch batch, OpenAiBodies bodies, String id,
+                                   long created, List<String> echoes, long promptTokens, boolean includeUsage)
+            throws IOException {
+        StreamWriter writer = new StreamWriter(out, batch, bodies, id, created, "text_completion");
+        int[] offsets = new int[echoes.size()];
+        for (int i = 0; i < echoes.size(); i++) {
+            if (!echoes.get(i).isEmpty()) {
+                writer.completionChunk(i, echoes.get(i), null, 0, null);
+                offsets[i] = echoes.get(i).length();
+            }
+        }
+        writer.run(event -> {
+            if (event instanceof GenerationBatch.Text t && !(t.text().isEmpty() && t.logprobs() == null)) {
+                writer.completionChunk(t.choice(), t.text(), t.logprobs(), offsets[t.choice()], null);
+                offsets[t.choice()] += t.text().length();
+            } else if (event instanceof GenerationBatch.Done d) {
+                GenerationResult r = writer.finished(d.choice());
+                if (r != null) {
+                    writer.completionChunk(d.choice(), "", null, 0, OpenAiBodies.finishReason(r.stopReason()));
+                }
+            }
+        }, promptTokens, includeUsage);
+    }
+
+    // ------------------------------------------------------------------ chat completions
+
+    private Response chatOf(JsonView body) {
+        int n = OpenAiRequests.choices(body);
+        ChatPlan plan = ChatPlan.of(service, body);
+        String model = plan.model();
+        int top = plan.top();
+        ToolRouting routing = plan.routing();
+        boolean named = plan.named();
+        int[] tokens = plan.tokens();
+        List<GenerationBatch.Job> jobs = plan.jobs(n);
+        List<ChatChoice> choices = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            choices.add(new ChatChoice(routing.newOutput()));
+        }
+        OpenAiBodies bodies = new OpenAiBodies(service, top, model);
+        String id = "chatcmpl-" + System.nanoTime();
+        long created = System.currentTimeMillis() / 1000;
+        boolean streamed = body.optBool("stream", false);
+        boolean includeUsage = body.optObj("stream_options").optBool("include_usage", false);
+        GenerationBatch batch = GenerationBatch.start(service, jobs, http);
+        if (streamed) {
+            StreamingOutput stream = out -> streamChat(out, batch, bodies, id, created, choices, tokens.length,
+                    includeUsage, named);
+            return Response.ok(stream).type("text/event-stream").build();
+        }
+        batch.awaitAll();
+        drainInto(batch, choices);
+        List<Map<String, Object>> out = new ArrayList<>();
+        List<GenerationResult> results = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            GenerationResult result = batch.result(i);
+            results.add(result);
+            out.add(chatChoiceBody(i, choices.get(i), result, bodies, named));
+        }
+        Map<String, Object> response = bodies.head(id, "chat.completion", created);
+        response.put("choices", out);
+        response.put("usage", OpenAiBodies.usage(tokens.length, results));
+        return Response.ok(ServerJson.write(response)).build();
+    }
+
+    /** Routes every queued event (the generations finished) into its choice. */
+    private static void drainInto(GenerationBatch batch, List<ChatChoice> choices) {
+        try {
+            GenerationBatch.Event e;
+            while ((e = batch.next(0)) != null) {
+                choices.get(e.choice()).accept(e);
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw ServerJson.error(503, "request interrupted", "unavailable_error");
+        }
+    }
+
+    private static Map<String, Object> chatChoiceBody(int index, ChatChoice choice, GenerationResult result,
+                                                      OpenAiBodies bodies, boolean named) {
+        ToolParse parse = choice.finish();
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put("role", "assistant");
+        message.put("content", parse.calls().isEmpty() || !parse.content().isEmpty() ? parse.content() : null);
+        if (!choice.reasoning().isEmpty()) {
+            message.put("reasoning_content", choice.reasoning());
+        }
+        if (!parse.calls().isEmpty()) {
+            message.put("tool_calls", ChatChoice.toolCallsBody(parse.calls()));
+        }
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("id", "chatcmpl-" + System.nanoTime());
-        body.put("object", object);
-        body.put("created", System.currentTimeMillis() / 1000);
-        body.put("model", service.modelPath());
-        body.put("choices", choices);
-        body.put("usage", usage(result));
+        body.put("index", index);
+        body.put("message", message);
+        body.put("logprobs", choice.logprobs().isEmpty() ? null : bodies.chatLogprobs(choice.logprobs()));
+        body.put("finish_reason", chatFinish(result.stopReason(), !parse.calls().isEmpty(), named));
         return body;
     }
 
-    private Map<String, Object> choice(int index, String text, Map<String, Object> message, String finish) {
-        Map<String, Object> choice = new LinkedHashMap<>();
-        choice.put("index", index);
-        if (text != null) {
-            choice.put("text", text);
-        }
-        if (message != null) {
-            choice.put("message", message);
-        }
-        choice.put("finish_reason", finish);
-        return choice;
+    /** {@code tool_calls} when calls were read (a named choice answers {@code stop}, as OpenAI does). */
+    static String chatFinish(StopReason reason, boolean calls, boolean named) {
+        String base = OpenAiBodies.finishReason(reason);
+        return calls && !named && base.equals("stop") ? "tool_calls" : base;
     }
 
-    private String finishReason(StopReason reason) {
-        return switch (reason) {
-            case MAX_TOKENS, CONTEXT_FULL -> "length";
-            default -> "stop";
-        };
-    }
-
-    private String json(Map<String, Object> body) {
-        StringBuilder out = new StringBuilder();
-        try {
-            Json.write(body, Json.Style.API, out);
-        } catch (IOException e) {
-            throw new IllegalStateException(e);
+    private void streamChat(OutputStream out, GenerationBatch batch, OpenAiBodies bodies, String id, long created,
+                            List<ChatChoice> choices, long promptTokens, boolean includeUsage, boolean named)
+            throws IOException {
+        StreamWriter writer = new StreamWriter(out, batch, bodies, id, created, "chat.completion.chunk");
+        for (int i = 0; i < choices.size(); i++) {
+            Map<String, Object> role = new LinkedHashMap<>();
+            role.put("role", "assistant");
+            role.put("content", "");
+            writer.chatChunk(i, role, null, null);
         }
-        return out.toString();
+        writer.run(event -> {
+            ChatChoice choice = choices.get(event.choice());
+            if (event instanceof GenerationBatch.Done d) {
+                ToolParse parse = choice.finish();
+                writeDeltas(writer, d.choice(), choice);
+                GenerationResult r = writer.finished(d.choice());
+                if (r != null) {
+                    writer.chatChunk(d.choice(), Map.of(), null,
+                            chatFinish(r.stopReason(), !parse.calls().isEmpty(), named));
+                }
+                return;
+            }
+            choice.accept(event);
+            writeDeltas(writer, event.choice(), choice);
+        }, promptTokens, includeUsage);
     }
 
-    private JsonView parse(String bodyText) {
-        try {
-            return JsonView.of(Json.parse(bodyText, Json.Limits.UNTRUSTED), "body");
-        } catch (RuntimeException e) {
-            throw badRequest("invalid JSON body: " + e.getMessage());
+    private static void writeDeltas(StreamWriter writer, int index, ChatChoice choice) throws IOException {
+        for (ChatChoice.Delta d : choice.drain()) {
+            writer.chatChunk(index, d.delta(), d.logprobs(), null);
         }
-    }
-
-    private void requireLoaded() {
-        if (!service.loaded()) {
-            throw new WebApplicationException(
-                    Response.status(503).entity(json(errorBody("no model loaded:"
-                            + " set -Dneuralfree.server.model=<gguf path>"))).build());
-        }
-    }
-
-    private static Map<String, Object> errorBody(String message) {
-        Map<String, Object> error = new LinkedHashMap<>();
-        error.put("message", message);
-        error.put("type", "invalid_request_error");
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("error", error);
-        return body;
-    }
-
-    private static WebApplicationException badRequest(String message) {
-        Map<String, Object> error = new LinkedHashMap<>();
-        error.put("message", message);
-        error.put("type", "invalid_request_error");
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("error", error);
-        StringBuilder out = new StringBuilder();
-        try {
-            Json.write(body, Json.Style.API, out);
-        } catch (IOException e) {
-            throw new IllegalStateException(e);
-        }
-        return new WebApplicationException(
-                Response.status(400).type(MediaType.APPLICATION_JSON).entity(out.toString()).build());
     }
 }

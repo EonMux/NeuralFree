@@ -103,12 +103,12 @@ public final class GrammarStage extends SamplerStage {
                     candidates.setLogit(i, Float.NEGATIVE_INFINITY);
                 }
             } else {
-                byte[] piece = vocab.piece(id);
+                byte[] piece = vocab.grammarPiece(id);
                 if (piece.length == 0 || piece[0] == 0) {
                     // llama.cpp rejects an empty piece and a piece starting on the terminating 0 alike
                     candidates.setLogit(i, Float.NEGATIVE_INFINITY);
                 } else {
-                    cands[i] = decode(piece, i);
+                    cands[i] = decode(piece, i, id);
                     live.add(i);
                 }
             }
@@ -134,16 +134,24 @@ public final class GrammarStage extends SamplerStage {
             return; // prompt history: the grammar sees generated tokens only (see class doc)
         }
         if (vocab.isEog(token)) {
-            for (List<Integer> stack : stacks) {
-                if (stack.isEmpty()) {
-                    return;
-                }
+            if (completed()) {
+                return;
             }
             throw new IllegalStateException("grammar cannot accept the end-of-generation token " + token);
         }
-        byte[] piece = vocab.piece(token);
+        acceptPiece(token, vocab.grammarPiece(token));
+    }
+
+    /**
+     * {@code llama_grammar_accept_token} over an explicit piece: {@code token} advances the stacks whose top is a
+     * token element, {@code piece}'s code points the others. A trigger-gated stage replays the tokens overlapping
+     * its trigger with the overlapping part of their piece ({@code llama_grammar_accept_impl}).
+     *
+     * @throws IllegalStateException when no partial parse accepts the piece
+     */
+    void acceptPiece(int token, byte[] piece) {
         if (piece.length == 0) {
-            return; // a control piece carries no grammar bytes (the mask kept such tokens out)
+            return; // an empty piece carries no grammar bytes (the mask kept such tokens out)
         }
         int[][] decoded = decodeUtf8(piece, partialValue, partialRemain);
         int[] cps = decoded[0];
@@ -187,6 +195,39 @@ public final class GrammarStage extends SamplerStage {
         }
     }
 
+    /**
+     * Whether {@code piece}, fed after the current state, leaves a partial parse alive; the state is unchanged. A
+     * trigger-gated stage uses it to keep a token from completing its trigger with text the grammar rejects.
+     */
+    boolean acceptsText(byte[] piece) {
+        int[][] decoded = decodeUtf8(piece, partialValue, partialRemain);
+        int[] cps = decoded[0];
+        List<List<Integer>> current = stacks;
+        for (int i = 0; i < cps.length - 1 && !current.isEmpty(); i++) {
+            List<List<Integer>> step = new ArrayList<>();
+            for (List<Integer> cur : current) {
+                acceptChr(cur, cps[i], step);
+            }
+            current = step;
+        }
+        return !current.isEmpty();
+    }
+
+    /** Arms the stage as its first {@link #apply} does: accepted tokens advance the grammar from here on. */
+    void arm() {
+        armed = true;
+    }
+
+    /** Whether a partial parse is complete: the grammar accepts the text so far as a whole sentence. */
+    boolean completed() {
+        for (List<Integer> stack : stacks) {
+            if (stack.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @Override
     public boolean modifies() {
         return true;
@@ -205,6 +246,10 @@ public final class GrammarStage extends SamplerStage {
 
     /** Rejects every candidate no continuation of {@code stack} accepts; rejects keep their read cursor. */
     private List<Cand> rejectsForStack(List<Integer> stack, List<Cand> cands) {
+        if (cands.isEmpty()) {
+            // llama_grammar_reject_candidates returns at once: walking on would follow recursive rules forever
+            return cands;
+        }
         if (stack.isEmpty()) {
             List<Cand> rejects = new ArrayList<>();
             for (Cand cand : cands) {
@@ -498,8 +543,8 @@ public final class GrammarStage extends SamplerStage {
     }
 
     /** The candidate's own decode, from the grammar's current partial tail. */
-    private Cand decode(byte[] piece, int index) {
+    private Cand decode(byte[] piece, int index, int id) {
         int[][] decoded = decodeUtf8(piece, partialValue, partialRemain);
-        return new Cand(index, -1, decoded[0], 0, decoded[1][0], decoded[1][1]);
+        return new Cand(index, id, decoded[0], 0, decoded[1][0], decoded[1][1]);
     }
 }

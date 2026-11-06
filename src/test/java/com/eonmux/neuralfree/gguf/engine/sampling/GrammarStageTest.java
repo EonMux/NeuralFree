@@ -101,6 +101,35 @@ public class GrammarStageTest {
         return out.toString();
     }
 
+    /** A control token (id 120) whose plain piece is empty and whose special piece is {@code <|x|>}. */
+    private static final class ControlVocab implements SamplerVocab {
+        private final ByteVocab base = new ByteVocab();
+
+        @Override public int vocabSize() { return 128; }
+        @Override public boolean isEog(int id) { return base.isEog(id); }
+        @Override public int eotToken() { return 0; }
+        @Override public int eosToken() { return 0; }
+        @Override public byte[] piece(int id) { return id == 120 ? new byte[0] : base.piece(id); }
+        @Override public byte[] grammarPiece(int id) {
+            return id == 120 ? "<|x|>".getBytes(StandardCharsets.UTF_8) : base.piece(id);
+        }
+        @Override public String pieceText(int id) { return new String(grammarPiece(id), StandardCharsets.UTF_8); }
+        @Override public int[] tokenize(String text) { return base.tokenize(text); }
+    }
+
+    @Test
+    public void aControlTokenMatchesByItsSpecialTextAndByItsId() {
+        ControlVocab vocab = new ControlVocab();
+        for (String rule : new String[]{"\"<|x|>\"", "<[120]>"}) {
+            Grammar grammar = GbnfBuilder.grammarOf(ConstraintSpec.gbnf("root ::= " + rule + " \"a\""));
+            Sampler sampler = Sampler.create(com.eonmux.neuralfree.gguf.engine.SamplerConfig.greedyDecoding(),
+                    new int[0], List.of(new GrammarStage(grammar, vocab)), vocab);
+            assertEquals(rule + " admits the control token first", 120, sampler.sample(prefer('a', 120)));
+            sampler.accept(120);
+            assertEquals(rule, 'a', sampler.sample(prefer(120, 'a')));
+        }
+    }
+
     @Test
     public void masksEveryTokenTheGrammarCannotAcceptAndForcesTheAlternation() {
         Grammar grammar = GbnfBuilder.grammarOf(ConstraintSpec.gbnf("root ::= \"yes\" | \"no\""));

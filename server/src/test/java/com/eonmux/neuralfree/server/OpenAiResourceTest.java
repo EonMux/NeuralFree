@@ -20,7 +20,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -29,8 +28,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * The OpenAI-compatible HTTP surface over the real service (PARITY P2): the synthetic two-layer llama opens on a
  * paged {@code parallel = 2} config and the resources answer every protocol form — the model list, non-streamed
  * completions and chat completions with usage and finish reasons, SSE streams ending in {@code data: [DONE]},
- * guided_choice through the grammar route, the named refusals ({@code n} above 1, {@code logit_bias}, prompt
- * arrays) and the llama.cpp-native {@code /health} and {@code /props}. An unloaded service refuses with 503.
+ * guided_choice through the grammar route, the named refusals (out-of-range {@code n}, {@code logit_bias} and
+ * token ids, two constraints at once, tool choices without tools, media parts) and the llama.cpp-native
+ * {@code /health} and {@code /props}. An unloaded service refuses with 503.
  */
 public class OpenAiResourceTest {
 
@@ -86,19 +86,54 @@ public class OpenAiResourceTest {
     }
 
     @Test
-    void requestedLogprobsCarryTheSampledTokenAndItsAlternatives() {
-        Response response = resource.completions("""
-                {"prompt": "hello", "max_tokens": 3, "temperature": 0, "logprobs": true, "top_logprobs": 2}""");
-        assertEquals(200, response.getStatus());
+    void chatLogprobsListTheTopTokensWithTheSampledOneLeadingUnderGreedy() {
+        Response response = resource.chatCompletions("""
+                {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3, "temperature": 0,
+                 "logprobs": true, "top_logprobs": 2}""");
         JsonView logprobs = JsonView.of(firstChoice(view(response.getEntity())).raw("logprobs"), "logprobs");
         List<?> content = (List<?>) logprobs.raw("content");
         assertEquals(3, content.size(), "one entry per generated token");
         for (Object o : content) {
             JsonView entry = JsonView.of(o, "content[i]");
-            assertTrue(entry.str("token") != null && entry.f64("logprob") <= 0,
-                    "the sampled token's logprob is non-positive");
+            assertTrue(entry.f64("logprob") <= 0, "the sampled token's logprob is non-positive");
+            assertTrue(entry.raw("bytes") instanceof List<?>, "the token's UTF-8 bytes");
             List<?> top = (List<?>) entry.raw("top_logprobs");
-            assertEquals(1, top.size(), "the requested alternative count");
+            assertEquals(2, top.size(), "top_logprobs tokens");
+            JsonView best = JsonView.of(top.get(0), "top[0]");
+            JsonView next = JsonView.of(top.get(1), "top[1]");
+            assertEquals(entry.str("token"), best.str("token"), "greedy samples the most likely token");
+            assertEquals(entry.f64("logprob"), best.f64("logprob"), 1e-9);
+            assertTrue(best.f64("logprob") >= next.f64("logprob"), "most likely first");
+        }
+        assertEquals(400, statusOf(() -> resource.chatCompletions("""
+                {"messages": [{"role": "user", "content": "hi"}], "top_logprobs": 2}""")),
+                "top_logprobs needs logprobs: true");
+        assertEquals(400, statusOf(() -> resource.chatCompletions("""
+                {"messages": [{"role": "user", "content": "hi"}], "logprobs": true, "top_logprobs": 21}""")));
+    }
+
+    @Test
+    void completionLogprobsUseTheLegacyArrays() {
+        Response response = resource.completions("""
+                {"prompt": "hello", "max_tokens": 3, "temperature": 0, "logprobs": 2, "echo": true}""");
+        JsonView choice = firstChoice(view(response.getEntity()));
+        JsonView logprobs = JsonView.of(choice.raw("logprobs"), "logprobs");
+        List<?> tokens = (List<?>) logprobs.raw("tokens");
+        List<?> tokenLogprobs = (List<?>) logprobs.raw("token_logprobs");
+        List<?> tops = (List<?>) logprobs.raw("top_logprobs");
+        List<?> offsets = (List<?>) logprobs.raw("text_offset");
+        assertEquals(3, tokens.size(), "one entry per generated token");
+        assertEquals(3, tokenLogprobs.size());
+        assertEquals(3, tops.size());
+        assertEquals("hello".length(), ((Number) offsets.get(0)).longValue(), "offsets count the echoed prompt");
+        for (int i = 0; i < 3; i++) {
+            Map<?, ?> top = (Map<?, ?>) tops.get(i);
+            assertTrue(top.size() >= 1 && top.size() <= 2, "at most the requested alternatives");
+            assertTrue(top.containsKey(tokens.get(i)), "greedy's token is among the most likely");
+            if (i > 0) {
+                long step = ((Number) offsets.get(i)).longValue() - ((Number) offsets.get(i - 1)).longValue();
+                assertEquals(((String) tokens.get(i - 1)).length(), step, "offsets advance by the token text");
+            }
         }
     }
 
@@ -149,15 +184,15 @@ public class OpenAiResourceTest {
     }
 
     @Test
-    void aStreamedCompletionCarriesTheLogprobsEntriesPerToken() throws Exception {
+    void aStreamedCompletionCarriesTheLegacyLogprobsPerToken() throws Exception {
         Response response = resource.completions("""
-                {"prompt": "hello", "max_tokens": 3, "temperature": 0, "stream": true,
-                 "logprobs": true, "top_logprobs": 2}""");
+                {"prompt": "hello", "max_tokens": 3, "temperature": 0, "stream": true, "logprobs": 1}""");
         assertEquals(200, response.getStatus());
         StreamingOutput stream = (StreamingOutput) response.getEntity();
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         stream.write(out);
-        List<Map<String, Object>> entries = new java.util.ArrayList<>();
+        int entries = 0;
+        long expectedOffset = 0;
         for (String frame : out.toString(StandardCharsets.UTF_8).split("\n\n")) {
             if (!frame.startsWith("data: ") || frame.equals("data: [DONE]")) {
                 continue;
@@ -165,20 +200,18 @@ public class OpenAiResourceTest {
             JsonView chunk = JsonView.of(Json.parse(frame.substring("data: ".length()), Json.Limits.UNTRUSTED),
                     "chunk");
             JsonView choice = JsonView.of(((List<?>) chunk.raw("choices")).get(0), "choice");
-            if (choice.has("logprobs")) {
+            if (choice.raw("logprobs") != null) {
                 JsonView logprobs = JsonView.of(choice.raw("logprobs"), "logprobs");
-                List<?> content = (List<?>) logprobs.raw("content");
-                assertEquals(1, content.size(), "one entry per logprobs chunk");
-                entries.add((Map<String, Object>) content.get(0));
+                assertEquals(1, ((List<?>) logprobs.raw("tokens")).size(), "one token per logprobs chunk");
+                double logprob = ((Number) ((List<?>) logprobs.raw("token_logprobs")).get(0)).doubleValue();
+                assertTrue(logprob <= 0, "the sampled token's logprob is non-positive");
+                assertEquals(expectedOffset, ((Number) ((List<?>) logprobs.raw("text_offset")).get(0)).longValue(),
+                        "the offset is the choice text streamed so far");
+                entries++;
             }
+            expectedOffset += choice.str("text").length();
         }
-        assertTrue(entries.size() >= 1, "the stream carries the per-token entries");
-        for (Map<String, Object> entry : entries) {
-            assertNotNull(entry.get("token"));
-            double logprob = ((Number) entry.get("logprob")).doubleValue();
-            assertTrue(logprob <= 0, "the sampled token's logprob is non-positive");
-            assertEquals(1, ((List<?>) entry.get("top_logprobs")).size(), "the requested alternative count");
-        }
+        assertTrue(entries >= 1, "the stream carries the per-token entries");
     }
 
     @Test
@@ -200,15 +233,35 @@ public class OpenAiResourceTest {
     @Test
     void refusalsCarryTheGapByName() {
         assertEquals(400, statusOf(() -> resource.completions(
-                "{\"prompt\": \"x\", \"n\": 2}")));
+                "{\"prompt\": \"x\", \"n\": 0}")));
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": \"x\", \"n\": 129}")));
         assertEquals(400, statusOf(() -> resource.completions(
                 "{\"prompt\": \"x\", \"logit_bias\": {\"6\": -101}}")));
         assertEquals(400, statusOf(() -> resource.completions(
                 "{\"prompt\": \"x\", \"logit_bias\": {\"cat\": -100}}")));
         assertEquals(400, statusOf(() -> resource.completions(
-                "{\"prompt\": [\"a\", \"b\"]}")));
+                "{\"prompt\": [1, 99999]}")), "a token id outside the vocabulary");
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": [\"a\", 7]}")), "a mixed prompt array");
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": \"x\", \"grammar\": \"root ::= \\\"a\\\"\", \"guided_choice\": [\"a\"]}")),
+                "two output constraints");
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": \"x\", \"response_format\": {\"type\": \"yaml\"}}")));
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\"], \"n\": 128}")),
+                "more generations than one request may queue");
+        assertEquals(400, statusOf(() -> resource.completions(
+                "{\"prompt\": \"x\", \"stream\": \"yes\"}")), "a malformed flag refuses before anything runs");
         assertEquals(400, statusOf(() -> resource.chatCompletions(
                 "{\"messages\": \"nope\"}")));
+        assertEquals(400, statusOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}], \"tool_choice\": \"required\"}")),
+                "tool_choice required needs tools");
+        assertEquals(400, statusOf(() -> resource.chatCompletions(
+                "{\"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"image_url\","
+                        + " \"image_url\": {\"url\": \"data:,\"}}]}]}")), "media parts on the text path");
         WebApplicationException unloadedModels = waeOf(() -> new OpenAiResource(unloaded).models());
         assertEquals(503, unloadedModels.getResponse().getStatus());
     }
@@ -229,66 +282,6 @@ public class OpenAiResourceTest {
         assertTrue(props.str("model_path").endsWith(".gguf"));
         assertEquals(2L, props.i64("total_slots"));
         assertEquals(64L, JsonView.of(props.raw("default_generation_settings"), "d").i64("n_ctx"));
-    }
-
-    @Test
-    void embeddingsServeFromAnEmbeddingModelAndRefuseAGenerativeOneByName() throws Exception {
-        Path bert = SyntheticModels.bert().writeTempFile();
-        EngineConfig config = EngineConfig.builder().build();
-        try (EngineService embedService = new EngineService(bert.toString(), config)) {
-            Response response;
-            try {
-                response = new OpenAiResource(embedService).embeddings("""
-                        {"input": ["hello world", "second"]}""");
-            } catch (WebApplicationException e) {
-                throw new AssertionError("embeddings refused: " + body(e.getResponse()), e);
-            }
-            assertEquals(200, response.getStatus());
-            JsonView body = view(response.getEntity());
-            assertEquals("list", body.str("object"));
-            List<?> data = (List<?>) body.raw("data");
-            assertEquals(2, data.size());
-            JsonView first = JsonView.of(data.get(0), "data[0]");
-            assertEquals("embedding", first.str("object"));
-            assertEquals(0L, first.i64("index"));
-            assertTrue(((List<?>) first.raw("embedding")).size() > 8,
-                    "the pooled vector is non-trivial");
-        }
-        // the generative llama refuses the embedding endpoint with its named pooling refusal
-        WebApplicationException refused = assertThrows(WebApplicationException.class,
-                () -> resource.embeddings("{\"input\": \"hello\"}"));
-        assertEquals(400, refused.getResponse().getStatus());
-        assertTrue(view(refused.getResponse().getEntity()).obj("error").str("message").contains("pool"),
-                "the pooling refusal names the model");
-    }
-
-    @Test
-    void rerankRefusesAGenerativeModelByNameAndValidatesItsBody() {
-        // the synthetic llama pools by NONE: the rerank forward refuses with the model's own refusal
-        WebApplicationException refused = assertThrows(WebApplicationException.class,
-                () -> resource.rerank("{\"query\": \"q\", \"documents\": [\"a\", \"b\"]}"));
-        assertEquals(400, refused.getResponse().getStatus());
-        assertTrue(view(refused.getResponse().getEntity()).obj("error").str("message").contains("pool"),
-                "the pooling refusal names the model");
-        assertEquals(400, rerankStatus("{\"query\": \"q\"}"));
-        assertEquals(400, rerankStatus("{\"query\": \"q\", \"documents\": [42]}"));
-    }
-
-    /** The response entity as text (JSON bodies are strings; streams render their class name). */
-    private static String body(Response response) {
-        Object entity = response.getEntity();
-        return entity instanceof String s ? s : String.valueOf(entity);
-    }
-
-    /** The status of a rerank call whose engine refusal surfaces as HTTP 400. */
-    private int rerankStatus(String body) {
-        try {
-            return resource.rerank(body).getStatus();
-        } catch (WebApplicationException e) {
-            return e.getResponse().getStatus();
-        } catch (IOException e) {
-            throw new AssertionError(e);
-        }
     }
 
     // ------------------------------------------------------------------ helpers

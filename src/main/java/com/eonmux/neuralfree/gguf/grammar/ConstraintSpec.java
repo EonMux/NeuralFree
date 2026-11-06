@@ -43,14 +43,54 @@ public final class ConstraintSpec {
     private final List<String> choices;
     private final boolean dotAll;
     private final JsonSchemaToGbnf.WhitespaceMode whitespace;
+    private final GrammarTriggers triggers;
+    private final ConstraintGate gate;
 
     private ConstraintSpec(Kind kind, String text, List<String> choices, boolean dotAll,
             JsonSchemaToGbnf.WhitespaceMode whitespace) {
+        this(kind, text, choices, dotAll, whitespace, null, null);
+    }
+
+    private ConstraintSpec(Kind kind, String text, List<String> choices, boolean dotAll,
+            JsonSchemaToGbnf.WhitespaceMode whitespace, GrammarTriggers triggers, ConstraintGate gate) {
         this.kind = kind;
         this.text = text;
         this.choices = choices == null ? null : Collections.unmodifiableList(new ArrayList<>(choices));
         this.dotAll = dotAll;
         this.whitespace = whitespace;
+        this.triggers = triggers;
+        this.gate = gate;
+    }
+
+    /**
+     * This constraint gated by {@code triggers}: the output runs free until a trigger fires, and the grammar
+     * constrains it from the trigger on ({@link GrammarTriggers}); null returns the always-on form.
+     */
+    public ConstraintSpec withTriggers(GrammarTriggers triggers) {
+        return new ConstraintSpec(kind, text, choices, dotAll, whitespace, triggers, gate);
+    }
+
+    /**
+     * This constraint behind {@code gate}: free output until a gate word, then the gate's prefix and this grammar
+     * ({@link ConstraintGate}); null removes the gate. A constraint that carries its own triggers (or a structural
+     * tag whose payload names triggers) is lazy already and compiles without the gate.
+     */
+    public ConstraintSpec withGate(ConstraintGate gate) {
+        return new ConstraintSpec(kind, text, choices, dotAll, whitespace, triggers, gate);
+    }
+
+    /** The gate the constraint waits behind, or null. */
+    public ConstraintGate gate() {
+        return gate;
+    }
+
+    /**
+     * The triggers gating the grammar, or null when it constrains the output from the first token. A
+     * {@link Kind#STRUCTURAL_TAG} payload's own {@code triggers} are not reported here: they compile with the
+     * payload ({@link GbnfBuilder#compile}).
+     */
+    public GrammarTriggers triggers() {
+        return triggers;
     }
 
     /** A {@link Kind#GBNF} constraint; the text under {@link GbnfParser} bounds. */
@@ -149,12 +189,14 @@ public final class ConstraintSpec {
                 && dotAll == other.dotAll
                 && whitespace == other.whitespace
                 && Objects.equals(text, other.text)
-                && Objects.equals(choices, other.choices);
+                && Objects.equals(choices, other.choices)
+                && Objects.equals(triggers, other.triggers)
+                && Objects.equals(gate, other.gate);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(kind, text, choices, dotAll, whitespace);
+        return Objects.hash(kind, text, choices, dotAll, whitespace, triggers, gate);
     }
 
     @Override
@@ -164,6 +206,8 @@ public final class ConstraintSpec {
                         || kind == Kind.STRUCTURAL_TAG ? "<" + text.length() + " chars>" : text))
                 + (choices == null ? "" : ", choices=" + choices)
                 + (kind == Kind.REGEX ? ", dotAll=" + dotAll : "")
+                + (triggers == null ? "" : ", triggers=" + triggers)
+                + (gate == null ? "" : ", gate=" + gate)
                 + "]";
     }
 }

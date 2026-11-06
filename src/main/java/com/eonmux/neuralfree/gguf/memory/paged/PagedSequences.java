@@ -516,11 +516,13 @@ public final class PagedSequences implements SequenceMemory {
             return;
         }
         hi = Math.min(hi, max + 1);
+        boolean tail = hi == max + 1;
         for (int g = 0; g < groupsCount(); g++) {
             int firstCleared = removeGroup(g, seq, lo, hi);
-            if (firstCleared >= 0 && slots[g][seq] > firstCleared) {
-                // a partially cleared page strands its dead rows below the cursor: the next append continues at
-                // the first dead slot, so the page addressing stays dense and attention reads the fresh rows
+            if (tail && firstCleared >= 0 && slots[g][seq] > firstCleared) {
+                // a tail removal that partially clears a page strands its dead rows below the cursor: the next
+                // append continues at the first dead slot, so the page addressing stays dense and attention reads
+                // the fresh rows. An interior removal keeps the cursor: live rows sit above its holes.
                 slots[g][seq] = firstCleared;
             }
             if (lists[seq][g].isEmpty()) {
@@ -592,8 +594,10 @@ public final class PagedSequences implements SequenceMemory {
                 clearRowsIn(g, base2, lo, hi);
                 for (int r = 0; r < pageSize; r++) {
                     if (kvPos[g][base2 + r] == -1) {
-                        if (firstCleared < 0 || base2 + r < firstCleared) {
-                            firstCleared = base2 + r;
+                        // the cursor is a logical slot of the sequence (list index * P + row), not a pool cell
+                        int slot = k * pageSize + r;
+                        if (firstCleared < 0 || slot < firstCleared) {
+                            firstCleared = slot;
                         }
                     }
                 }

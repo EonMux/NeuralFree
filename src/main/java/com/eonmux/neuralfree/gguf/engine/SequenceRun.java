@@ -59,7 +59,22 @@ public final class SequenceRun {
         this.sampler = b.sampler;
         this.sink = b.sink;
         this.logprobs = Math.max(0, b.request.logprobs());
-        this.session = stop.start(this::routed, b.renderedPrompt);
+        this.session = stop.start(new ReasoningFilter.Sink() {
+            @Override
+            public void accept(ReasoningFilter.Channel channel, int tokenId, String text) {
+                routed(channel, tokenId, text);
+            }
+
+            @Override
+            public void toolCallStarted(String recipient) {
+                sink.toolCallStarted(recipient);
+            }
+
+            @Override
+            public void stepped(int tokenId) {
+                sink.stepped(tokenId);
+            }
+        }, b.renderedPrompt);
         this.generationStart = System.nanoTime();
     }
 

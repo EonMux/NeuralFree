@@ -148,14 +148,23 @@ public final class GbnfBuilder {
      * whitespace mode, {@link Kind#REGEX REGEX} through {@link RegexToGbnf#compile} and
      * {@link Kind#CHOICE CHOICE} as an alternation of escaped literals.
      *
-     * @throws IllegalArgumentException when the constraint is malformed or untranslatable —
-     *                                  {@link Kind#STRUCTURAL_TAG STRUCTURAL_TAG} is refused
-     *                                  until SO-4's {@code StructuralTag} parsing lands
+     * @throws IllegalArgumentException when the constraint is malformed or untranslatable
      */
     public static Grammar grammarOf(ConstraintSpec spec) {
+        return grammarOf(spec, null);
+    }
+
+    /**
+     * {@link #grammarOf(ConstraintSpec)} with the model vocabulary a GBNF grammar's {@code <token>}
+     * references resolve through ({@link GbnfParser#parse(String, GrammarVocab)}).
+     *
+     * @param vocab the vocabulary, or null to reject the {@code <token>} name form
+     * @throws IllegalArgumentException when the constraint is malformed or untranslatable
+     */
+    public static Grammar grammarOf(ConstraintSpec spec, GrammarVocab vocab) {
         switch (spec.kind()) {
             case GBNF:
-                return GbnfParser.parse(spec.text());
+                return GbnfParser.parse(spec.text(), vocab);
             case JSON_SCHEMA:
                 return JsonSchemaToGbnf.convert(spec.text(), spec.whitespace());
             case JSON_OBJECT:
@@ -176,6 +185,36 @@ public final class GbnfBuilder {
             default:
                 throw new IllegalArgumentException("constraint kind " + spec.kind() + " has no compiler");
         }
+    }
+
+    /**
+     * Compiles {@code spec} for a sampler: its grammar ({@link #grammarOf}) and the triggers gating it — the spec's
+     * own {@link ConstraintSpec#triggers()}, else, for a structural tag whose payload names {@code triggers}, the
+     * payload's tag-dispatch triggers ({@link StructuralTag#triggers}), else the {@link ConstraintSpec#gate() gate}'s
+     * words, the grammar then wrapped behind the gate's prefix ({@link ConstraintGate}).
+     *
+     * @throws IllegalArgumentException when the constraint is malformed or untranslatable
+     */
+    public static CompiledConstraint compile(ConstraintSpec spec) {
+        return compile(spec, null);
+    }
+
+    /**
+     * {@link #compile(ConstraintSpec)} resolving {@code <token>} references through {@code vocab}.
+     *
+     * @param vocab the vocabulary, or null to reject the {@code <token>} name form
+     * @throws IllegalArgumentException when the constraint is malformed or untranslatable
+     */
+    public static CompiledConstraint compile(ConstraintSpec spec, GrammarVocab vocab) {
+        Grammar grammar = grammarOf(spec, vocab);
+        GrammarTriggers triggers = spec.triggers();
+        if (triggers == null && spec.kind() == ConstraintSpec.Kind.STRUCTURAL_TAG) {
+            triggers = StructuralTag.triggers(spec.text());
+        }
+        if (triggers == null && spec.gate() != null) {
+            return new CompiledConstraint(spec.gate().wrap(grammar), spec.gate().triggers());
+        }
+        return new CompiledConstraint(grammar, triggers);
     }
 
     /** Sanitizes a rule name, llama.cpp {@code INVALID_RULE_CHARS_RE} ({@code :275}). */

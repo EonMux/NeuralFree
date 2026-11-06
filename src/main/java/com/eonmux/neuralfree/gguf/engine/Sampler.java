@@ -317,12 +317,14 @@ public final class Sampler {
         private final TokenizerVocab vocab;
         private final SpecialTokens special;
         private final byte[][] pieces;
+        private final byte[][] specialPieces;
 
         GgufVocab(GGUFTokenizer tokenizer) {
             this.tokenizer = tokenizer;
             this.vocab = tokenizer.vocab();
             this.special = tokenizer.specialTokens();
             this.pieces = new byte[vocab.size()][];
+            this.specialPieces = new byte[vocab.size()][];
         }
 
         @Override
@@ -361,6 +363,20 @@ public final class Sampler {
                 pieces[id] = cached;
             }
             return cached;
+        }
+
+        /** The cached special = true piece: CONTROL and UNKNOWN tokens render their raw text bytes. */
+        @Override
+        public byte[] grammarPiece(int id) {
+            if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
+                byte[] cached = specialPieces[id];
+                if (cached == null) {
+                    cached = vocab.text(id).getBytes(StandardCharsets.UTF_8);
+                    specialPieces[id] = cached;
+                }
+                return cached;
+            }
+            return piece(id);
         }
 
         /** detokenize({id}, special = true): special tokens render their raw text, visible tokens their piece. */
