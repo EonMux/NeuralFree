@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
+import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.testutil.RealModels;
@@ -74,6 +75,121 @@ public class GpuStepReplayParityTest {
             List<Integer> perRow = perRow(model, fed);
             compare("row shape " + name + " multi-row (patched) vs per-row", patched, perRow);
         }
+    }
+
+    /** The paged memory's sequence capacity of the paged probe (the widest cycled batch). */
+    private static final int PAGED_SEQUENCES = 16;
+    /**
+     * The paged memory's row budget of the paged probe: the paged {@code nCtx} bounds the whole pool's
+     * physical rows (every sequence shares it), and the probe's sequences advance (2+5+9+16) * 9
+     * positions in total, so this leaves headroom over that.
+     */
+    private static final int PAGED_CTX = 512;
+    /** Decode steps the paged probe runs per width (past the capture's warmup, so replays happen). */
+    private static final int PAGED_STEPS = 8;
+
+    /**
+     * Opt-in parity of the paged batched decode steps' trunk replay: the same multi-sequence decode (one
+     * row per sequence, widths cycling {@link #WIDTHS} over a paged memory of {@link #PAGED_SEQUENCES}
+     * sequences) runs with the step replay off and on, and every sequence's greedy token stream must be
+     * identical — the captured trunk's dispatches must produce the unreplayed step's exact logits. The
+     * width changes between widths drop and recapture the graph, so the probe also walks the recapture
+     * fallback's steps.
+     */
+    @Test
+    public void replayedPagedBatchStepsMatchDirectSteps() throws IOException {
+        Assume.assumeTrue("set " + ENABLE + "=1 to run the step replay parity probe",
+                "1".equals(System.getProperty(ENABLE, System.getenv(SWITCH))));
+        Assume.assumeTrue("target model absent", Files.exists(Path.of(TARGET)));
+        GpuTestUtil.assumeCudaAvailable();
+        GpuDecodeReplayTimingTest.debugReplayLogs();
+        int[] fed = fedIds();
+        String[] models = {TARGET, DRAFTER};
+        for (String model : models) {
+            if (!Files.exists(Path.of(model))) {
+                report("skip (absent): " + model);
+                continue;
+            }
+            String name = Path.of(model).getFileName().toString();
+            List<List<Integer>> direct = pagedStepped(model, false, fed);
+            List<List<Integer>> replayed = pagedStepped(model, true, fed);
+            for (int s = 0; s < direct.size(); s++) {
+                compare("paged " + name + " sequence " + s, direct.get(s), replayed.get(s));
+            }
+        }
+    }
+
+    /**
+     * The paged probe of one replay mode: every width of {@link #WIDTHS} prompts its sequences (one
+     * token each, at each sequence's own next position) and then runs {@link #PAGED_STEPS} batched
+     * decode steps, every step feeding each active sequence its last greedy token through
+     * {@code forwardBatch}. Returns every sequence's greedy token stream, in sequence order.
+     */
+    private static List<List<Integer>> pagedStepped(String modelPath, boolean replay, int[] fed)
+            throws IOException {
+        if (replay) {
+            System.clearProperty(GpuForwardBackend.CHAIN_REPLAY_PROPERTY);
+        } else {
+            System.setProperty(GpuForwardBackend.CHAIN_REPLAY_PROPERTY, "false");
+        }
+        try {
+            EngineConfig cfg = EngineConfig.builder()
+                    .backend(EngineConfig.BackendMode.CUDA)
+                    .gpuLayers(EngineConfig.GPU_LAYERS_ALL)
+                    .memory(MemoryConfig.builder().nCtx(PAGED_CTX).parallel(PAGED_SEQUENCES).build())
+                    .build();
+            int[] nextPos = new int[PAGED_SEQUENCES];
+            int[] last = new int[PAGED_SEQUENCES];
+            List<List<Integer>> streams = new ArrayList<>();
+            for (int s = 0; s < PAGED_SEQUENCES; s++) {
+                streams.add(new ArrayList<>());
+                last[s] = fed[s % fed.length];
+            }
+            try (EngineModel model = LLMModelFactory.open(modelPath, cfg)) {
+                ForwardBackend f = model.forwardBackend();
+                int i = 0;
+                for (int width : WIDTHS) {
+                    ForwardBatch.Builder prompt = ForwardBatch.builder(width);
+                    for (int s = 0; s < width; s++) {
+                        prompt.add(fed[(s + i) % fed.length], nextPos[s], s, false);
+                    }
+                    f.forwardBatch(prompt.build());
+                    for (int s = 0; s < width; s++) {
+                        nextPos[s]++;
+                    }
+                    for (int step = 0; step < PAGED_STEPS; step++) {
+                        ForwardBatch.Builder decode = ForwardBatch.builder(width);
+                        for (int s = 0; s < width; s++) {
+                            decode.add(last[s], nextPos[s], s, true);
+                        }
+                        float[][] logits = f.forwardBatch(decode.build());
+                        for (int s = 0; s < width; s++) {
+                            last[s] = argmax(logits[s]);
+                            streams.get(s).add(last[s]);
+                            nextPos[s]++;
+                        }
+                    }
+                    i++;
+                }
+                report("  paged " + (replay ? "replayed" : "direct") + " " + Path.of(modelPath).getFileName()
+                        + ": " + WIDTHS.length * PAGED_STEPS + " decode steps, sequences 0.."
+                        + (WIDTHS[WIDTHS.length - 1] - 1) + " advanced");
+                return streams;
+            }
+        } finally {
+            System.clearProperty(GpuForwardBackend.CHAIN_REPLAY_PROPERTY);
+        }
+    }
+
+    /** The greedy token of one logits row. */
+    private static int argmax(float[] logits) {
+        int best = 0;
+        for (int i = 1; i < logits.length; i++) {
+            if (logits[i] > logits[best]) {
+                best = i;
+            }
+        }
+        return best;
     }
 
     /** The fed ids: the fixed text through the target's tokenizer, past the prompt prefix. */

@@ -860,10 +860,15 @@ public final class GpuPrefillDriver {
                     batchTrunkRunner.runBatchTrunk(u.layout(), GpuLayerExecutor.StepMode.PREFILL, taps);
                 } else {
                     // the masked tree verify step captures its trunk like the chain round's verify step does
-                    // (stepReplay): the uploads around the trunk stay outside the body, and a commit's row moves
-                    // dispatch directly between captures, so one capture serves every round of the same shape. A
-                    // recurrent target's round changes the mixer-block routing per round, so it runs directly.
-                    boolean capturable = chainReplay && !replayDisabled && treeMask != null
+                    // (stepReplay), and so does the plain paged decode step (every segment one row, the
+                    // continuous-batching decode shape): the uploads around the trunk stay outside the body
+                    // and its attention launches one decode kernel over the batch's sequences without
+                    // per-segment uploads, so the trunk enqueues kernel dispatches alone; a commit's row moves
+                    // dispatch directly between captures, so one capture serves every round of the same shape.
+                    // A multi-row segment keeps running directly (its prefill uploads positions inside the
+                    // trunk), and a recurrent target's round changes the mixer-block routing per round.
+                    boolean capturable = chainReplay && !replayDisabled
+                            && (treeMask != null || allRowsSingle(step))
                             && recurrentRound == null && !taps.wantsAny(executor.layers().size())
                             && executor.capturableDecode();
                     stepReplay.trunk(capturable, () -> executor.run(u.layout(), taps));
@@ -994,6 +999,20 @@ public final class GpuPrefillDriver {
             }
         }
         throw new IllegalArgumentException("ubatch row " + v + " is not an output row of the batch");
+    }
+
+    /**
+     * Whether every segment of the paged {@code step} holds one row: the decode shape, whose attention
+     * launches one paged decode kernel over the batch's sequences and uploads nothing inside the trunk,
+     * so a capture of the trunk holds kernel dispatches alone.
+     */
+    private static boolean allRowsSingle(PagedStep step) {
+        for (int seg = 0; seg < step.nSeg(); seg++) {
+            if (step.segLen(seg) != 1) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

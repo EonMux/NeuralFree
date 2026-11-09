@@ -1129,13 +1129,21 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
             writeInts(kvPos[group], 0, ints, rows);
         }
 
-        /** The step's page table of {@code group} compacted to launch order (segment {@code s} at row {@code s}). */
+        /**
+         * The step's page table of {@code group} compacted to launch order (segment {@code s} at row {@code s}),
+         * packed into as few contiguous writes as the staging scratch holds ({@code maxPages} rows per chunk at
+         * most, one write whenever the scratch covers the whole step).
+         */
         private void writePageTable(int group, PagedStep step) {
             int segs = step.nSeg();
             int[] table = step.pageTable(group);
-            for (int s = 0; s < segs; s++) {
-                System.arraycopy(table, step.segSeq(s) * maxPages, ints, 0, maxPages);
-                writeInts(pageTable[group], (long) s * maxPages, ints, maxPages);
+            int perWrite = Math.max(1, ints.length / maxPages);
+            for (int s = 0; s < segs; s += perWrite) {
+                int n = Math.min(perWrite, segs - s);
+                for (int i = 0; i < n; i++) {
+                    System.arraycopy(table, step.segSeq(s + i) * maxPages, ints, i * maxPages, maxPages);
+                }
+                writeInts(pageTable[group], (long) s * maxPages, ints, n * maxPages);
             }
         }
 

@@ -684,16 +684,19 @@ How it behaves:
   batch) is captured once per row count and replayed the same way: after two verified body steps the step replays
   from its start position alone, every per-step value of its attention (key count, split layout, the combine grids)
   derived from that position and checked against the capture. A row count other than the captured one records the
-  step again, a position that does not follow the last runs one body step without dropping the capture, and
-  tree-masked, paged, context-parallel and dual-chunk steps always run directly. Output is the same token for token
-  as running the step directly.
+  step again, and a position that does not follow the last runs one body step without dropping the capture. A paged
+  decode step whose every row is its own sequence (continuous batching's decode shape, as `forwardBatch` over a paged
+  memory runs it) and a tree-masked verify step capture their trunk the same way, one capture per shape, the paged
+  decode attention and page-table reads covered by the graph. A paged step with a multi-row segment, a recurrent
+  target's tree round, and context-parallel and dual-chunk steps always run directly. Output is the same token for
+  token as running the step directly.
 - Where the layer runs [tensor-core flash attention](#tensor-core-flash-attention), a one-row decode step runs
   that kernel as a one-row prefill instead of the scalar split-K decode kernel, which measured slower even at one row
   (48 against 65 us per layer at 256 keys, 32 query and 8 KV heads of 128). On CUDA and HIP, a layer whose KV heads
   serve at most two query heads switches to the decode kernel's warp-shuffle form past 128 live keys, and the replay
   captures again once where the route changes. Other layers keep the scalar decode kernel.
-- Batched calls (`forwardBatch`) and prefill steps always run directly; a paged/batched decode does not
-  use the replay.
+- Prefill steps always run directly. A `forwardBatch` whose rows are one-per-sequence decodes over the paged memory
+  uses the step replay above; any batched call with a multi-row segment runs directly.
 
 #### Graph capture and kernel batching (Java API)
 

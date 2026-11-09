@@ -28,9 +28,11 @@
  * g_tile query heads h0 = kvh * G + gt * g_tile .. of KV head kvh = y / ceil(G/g_tile), gt = y % ceil(G/g_tile).
  *
  * Shared memory (NF_FA_SMEM_FLOATS floats): q_s[g_tile * d_k] | s_s[g_tile * split_len]
- * | o_s[NF_FA_LG * g_tile * d_v] pass-2 lane-group partials.
+ * | o_s[NF_FA_LG * g_tile * d_v] pass-2 lane-group partials | the shuffle fast path's row staging
+ * (2 * split_len ints: the split's physical rows and their kv_pos, page_shift >= 0 or not).
  * Plan constraints (FlashAttnTiling.decode guarantees them; a violation writes NaN outputs):
- *   g_tile <= NF_FD_MAX_G, g_tile * (d_k + split_len) + NF_FA_LG * g_tile * d_v <= NF_FA_SMEM_FLOATS,
+ *   g_tile <= NF_FD_MAX_G, g_tile * (d_k + split_len) + NF_FA_LG * g_tile * d_v
+ *   + (the fast path's 2 * split_len staging) <= NF_FA_SMEM_FLOATS,
  *   g_tile * d_v <= (NF_FA_WG / NF_FA_LG) * NF_FA_ACC_MAX, d_k % 4 == 0, d_v % 4 == 0, local size == NF_FA_WG,
  *   direct_out only with n_split == 1, k_type and v_type KV cache type codes.
  *
@@ -39,8 +41,11 @@
  *   2. Pass 1: work-item j scores keys j, j + 128, ... of the split; one K row read feeds the g_tile
  *      dot products; masked keys score -INF without touching K.
  *      NF_HAS_SG_SHUFFLE fast path (plain F32/F16/BF16 caches, no row-relative bias table, split_len
- *      <= NF_FA_WG, g_tile <= 4): warp w scans the 32 keys [w * 32, +32) of the split, each lane
- *      holding one float4 of the key's K row (one coalesced row read per key) and the per-head dot is
+ *      <= NF_FA_WG, g_tile <= 4): the workgroup first stages the split's rows cooperatively — the
+ *      page id -> physical row -> kv_pos chain resolved for every key in parallel instead of once per
+ *      serial scan step — then warp w scans the 32 keys [w * 32, +32) of the split, each lane
+ *      holding one float4 of the key's K row (one coalesced row read per key, the only dependent
+ *      load of the step) and the per-head dot is
  *      reduced with the subgroup butterfly (nf_seg_sum at width 32, register form); lane 0 of the warp
  *      stores the score.
  *   3. Per head: m = workgroup max, p = e^(s - m) in place, l = workgroup sum.
@@ -57,15 +62,19 @@
  * and of every subgroup size, as the subgroup reductions require.
  */
 
-/* Plan constraints of LLM_FlashDecode_*; see the header comment. */
+/* Plan constraints of LLM_FlashDecode_*; see the header comment. stage_floats is the fast path's row
+ * staging (2 * split_len when it runs, else 0), which rides the same shared budget: the decode plans
+ * FlashAttnTiling generates stage one query head per workgroup (g_tile 1), whose tile plus the
+ * staging stays under the 3072-float minimum budget at the fast path's head-dim and split bounds.
+ */
 NF_INLINE int nf_fd_plan_ok(int n_head, int n_head_kv, int d_k, int d_v, int g_tile, int n_split,
-                            int split_len, int direct_out, int k_type, int v_type) {
+                            int split_len, int direct_out, int k_type, int v_type, int stage_floats) {
     return nf_attn_kv_type_ok(k_type) && nf_attn_kv_type_ok(v_type)
         && n_head > 0 && n_head_kv > 0 && n_head % n_head_kv == 0
         && g_tile >= 1 && g_tile <= NF_FD_MAX_G
         && d_k > 0 && d_v > 0 && (d_k & 3) == 0 && (d_v & 3) == 0
         && n_split >= 1 && split_len > 0
-        && g_tile * (d_k + split_len) + NF_FA_LG * g_tile * d_v <= NF_FA_SMEM_FLOATS
+        && g_tile * (d_k + split_len) + NF_FA_LG * g_tile * d_v + stage_floats <= NF_FA_SMEM_FLOATS
         && g_tile * d_v <= (NF_FA_WG / NF_FA_LG) * NF_FA_ACC_MAX
         && (direct_out == 0 || n_split == 1)
         && (int)get_local_size(0) == NF_FA_WG;
@@ -151,7 +160,15 @@ NF_INLINE void nf_fd_run(
     const int tree, NF_GLOBAL const ulong* tree_mask, const int n_fresh,
     NF_LOCAL_PTR float* smem, NF_LOCAL_PTR float* red, NF_LOCAL_PTR float* stats)
 {
-    if (!nf_fd_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct_out, k_type, v_type)) {
+    /* The fast path (both passes) runs wherever the gate says; on it the row staging below runs too,
+     * so the plan check budgets it. Backends without the subgroup shuffle never stage. */
+#ifdef NF_HAS_SG_SHUFFLE
+    const int fd_fast = nf_fd_fast_ok(k_type, v_type, d_k, d_v, split_len, n_buckets, g_tile);
+#else
+    const int fd_fast = 0;
+#endif
+    if (!nf_fd_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct_out, k_type, v_type,
+                       fd_fast ? 2 * split_len : 0)) {
         nf_fd_poison(n_head, d_v, n_split, direct_out, out_off, out, partial);
         return;   /* uniform across the workgroup: no barrier has been reached */
     }
@@ -197,6 +214,30 @@ NF_INLINE void nf_fd_run(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
+#ifdef NF_HAS_SG_SHUFFLE
+    /* 1b. stage the fast path's rows: the split's physical rows and their kv_pos, resolved by the
+     * whole workgroup at once (each work-item one key's page id -> row -> position chain in parallel)
+     * instead of once per serial scan step of a warp below. A masked page stages row -1, which every
+     * reader treats as the absent key the page test used to gate; the identity path (page_shift < 0)
+     * stages its dense rows and positions the same way. */
+    NF_LOCAL_PTR int* fd_rows = (NF_LOCAL_PTR int*)(smem + g_tile * d_k + g_tile * split_len
+                                                   + NF_FA_LG * g_tile * d_v);
+    NF_LOCAL_PTR int* fd_pos = fd_rows + split_len;
+    if (fd_fast) {
+        for (int j = lid; j < n_keys; j += NF_FA_WG) {
+            if (nf_kv_page_ok(k_begin + j, page_shift, pt, pt_off)) {
+                const int row = nf_kv_row(k_begin + j, page_shift, pt, pt_off);
+                fd_rows[j] = row;
+                fd_pos[j] = kv_pos[row];
+            } else {
+                fd_rows[j] = -1;
+                fd_pos[j] = -1;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+#endif /* NF_HAS_SG_SHUFFLE */
+
     /* 2. pass 1: scores of the split's keys into s_s, per-item running max. Under NF_HAS_SG_SHUFFLE the
      * warp fast path runs first: warp w of the workgroup scans the 32 keys [w * 32, +32) of the split,
      * every lane holding one float4 of the key's K row (one coalesced row read per key) and the dot
@@ -209,7 +250,7 @@ NF_INLINE void nf_fd_run(
     }
     const nf_i64 k_head = (nf_i64)kvh * k_head_stride;
 #ifdef NF_HAS_SG_SHUFFLE
-    if (nf_fd_fast_ok(k_type, v_type, d_k, d_v, split_len, n_buckets, g_tile)) {
+    if (fd_fast) {
         const int slane = lid & 31;
         const int w = lid >> 5;
         const int j0 = w * 32;
@@ -224,9 +265,10 @@ NF_INLINE void nf_fd_run(
             int row = 0;
             nf_i64 e0 = 0;
             float ks = 1.0f;
-            if (j < n_keys && nf_kv_page_ok(k_begin + j, page_shift, pt, pt_off)) {
-                row = nf_kv_row(k_begin + j, page_shift, pt, pt_off);
-                p_k = kv_pos[row];
+            if (j < n_keys && fd_rows[j] >= 0) {
+                /* the staged row and position: the page id -> row -> kv_pos chain ran in step 1b */
+                row = fd_rows[j];
+                p_k = fd_pos[j];
                 vis = nf_attn_tree_visible(p_k, tree ? tree_mask[0] : (ulong)0, kv_end, n_fresh,
                                            q_pos, causal, swa_type, n_swa);
                 if (vis) {
@@ -368,8 +410,7 @@ NF_INLINE void nf_fd_run(
     int pd[NF_FA_ACC_MAX];
     NF_LOCAL_PTR float* o_s = s_s + g_tile * split_len;
 #ifdef NF_HAS_SG_SHUFFLE
-    if (nf_fd_fast_ok(k_type, v_type, d_k, d_v, split_len, n_buckets, g_tile)
-            && n_pairs <= 32 * NF_FA_ACC_MAX) {
+    if (fd_fast && n_pairs <= 32 * NF_FA_ACC_MAX) {
         /* Fast form of the same accumulation: lane group lg owns keys lg, lg + 4, ..., and each lane
          * holds the float4 of dims lane * 4 of every o[g], so one coalesced V row load feeds the whole
          * group's lane slice per key. The staged partials land in the same o_s slots the step-5 sum
@@ -392,7 +433,7 @@ NF_INLINE void nf_fd_run(
             if (!live) {
                 continue;
             }
-            const int vrow = nf_kv_row(k_begin + j, page_shift, pt, pt_off);
+            const int vrow = fd_rows[j];   /* staged with the scores' rows: live implies an on-page row */
             const nf_i64 e0 = (nf_i64)vrow * v_row_stride + v_head;
             const float v_scale = nf_kv_head_scale(v_type, kv_scales, vrow, kvh, n_head_kv, 1);
             float4 v4 = NF_F4S(0.0f);
@@ -617,7 +658,9 @@ NF_INLINE int nf_fd_paged_ok(int n_head, int n_head_kv, int d_k, int d_v, int g_
                              int page_shift, int max_pages, int n_seq, int q_seq_stride, int out_seq_stride) {
     return page_shift >= 0 && page_shift <= 20 && max_pages >= 1 && n_seq >= 1
         && q_seq_stride >= 0 && out_seq_stride >= 0
-        && nf_fd_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct_out, k_type, v_type);
+        /* stage_floats 0: this coarse gate lacks the bias the fast-path check derives it from, and the
+         * shared nf_fd_run below re-checks the exact budget its own staging needs */
+        && nf_fd_plan_ok(n_head, n_head_kv, d_k, d_v, g_tile, n_split, split_len, direct_out, k_type, v_type, 0);
 }
 
 /* NaN over the outputs of a paged call whose arguments violate the plan (workgroup (0, 0) only). The out stride of
