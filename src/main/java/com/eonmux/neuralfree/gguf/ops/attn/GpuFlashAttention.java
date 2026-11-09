@@ -139,10 +139,9 @@ final class GpuFlashAttention {
     static GpuFlashAttention prepare(GpuMixerResources res, ComputeQueue queue, FlashPlan plan,
                                      FlashKernelArgs args, PagedFlashGeometry pg, GpuStepInputs steps, int ubatch,
                                      GpuBuffer lseBuffer) {
-        FlashKeys keys = args.keys();
         int nHead = args.attention().nHead();
-        PreparedDispatch decode = res.prepare(AttnKernels.flashDecode(keys.typeK(), keys.typeV()),
-                plan.decode().decodeGlobal(1), FlashAttnTiling.decodeLocal(), args.decode(plan.decode()));
+        PreparedDispatch decode = res.prepare(plan.decodeKernel(), plan.decode().decodeGlobal(1),
+                plan.decode().decodeLocalSize(), args.decode(plan.decode()));
         PreparedDispatch prefill = BatchInvariance.enabled() ? null : preparePrefill(res, plan, args, ubatch);
         FlashCombine combine = new FlashCombine(res.prepare(AttnKernels.FLASH_COMBINE,
                 FlashAttnTiling.combineGlobal(nHead), FlashAttnTiling.combineLocal(), args.combine()), nHead);
@@ -172,13 +171,12 @@ final class GpuFlashAttention {
     private static PreparedDispatch preparePrefill(GpuMixerResources res, FlashPlan plan, FlashKernelArgs args,
                                                    int ubatch) {
         FlashAttnTiling p = plan.prefill();
-        FlashKeys keys = args.keys();
         if (p.plan() == FlashAttnTiling.Plan.TILED) {
-            return res.prepare(AttnKernels.flashAttn(keys.typeK(), keys.typeV()), p.prefillGlobal(ubatch, 1),
-                    FlashAttnTiling.prefillLocal(), args.tiledPrefill(p, ubatch));
+            return res.prepare(plan.tiledKernel(), p.prefillGlobal(ubatch, 1), p.prefillLocalSize(),
+                    args.tiledPrefill(p, ubatch));
         }
         if (p.plan() == FlashAttnTiling.Plan.MMA) {
-            return res.prepare(plan.mmaKernel(), p.prefillGlobal(ubatch, 1), FlashAttnTiling.prefillLocal(),
+            return res.prepare(plan.mmaKernel(), p.prefillGlobal(ubatch, 1), p.prefillLocalSize(),
                     args.mmaPrefill(p, ubatch));
         }
         return null;

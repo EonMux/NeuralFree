@@ -234,13 +234,31 @@ public class KernelSourceAssemblerTest {
         int smem = FaSmem.faSmemFloats(ComputeBackend.BackendType.OPENCL, caps);
 
         KernelArtifact llm = new OpenClKernelLibrary(KernelLibraries.LLM_CONFIG).resolve("K", backend);
-        assertEquals(OpenClKernelLibrary.programKey(KernelLibraries.LLM, true, smem, 32, ""), llm.programKey());
-        assertEquals(OpenClKernelLibrary.buildOptions(OpenClKernelLibrary.BASE_OPTIONS, true, smem, 32, ""),
-                llm.buildOptions());
+        assertEquals(OpenClKernelLibrary.programKey(KernelLibraries.LLM, true, smem, 32, "+sgr16"), llm.programKey());
+        assertEquals(OpenClKernelLibrary.buildOptions(OpenClKernelLibrary.BASE_OPTIONS, true, smem, 32,
+                "-DNF_SG_ROW_SIZE=16"), llm.buildOptions());
 
         KernelArtifact train = new OpenClKernelLibrary(KernelLibraries.TRAIN_CONFIG).resolve("K", backend);
         assertEquals(OpenClKernelLibrary.programKey(KernelLibraries.TRAIN, false, smem), train.programKey());
         assertEquals("-cl-std=CL1.2 -DNF_FA_SMEM_FLOATS=" + smem, train.buildOptions());
+    }
+
+    @Test
+    public void subgroupRowSizeFollowsTheRequiredSizeRange() {
+        assertEquals(16, OpenClKernelLibrary.subgroupRowSize(sizeRange(8, 32), true));
+        assertEquals(16, OpenClKernelLibrary.subgroupRowSize(sizeRange(16, 32), true));
+        assertEquals(16, OpenClKernelLibrary.subgroupRowSize(sizeRange(16, 16), true));
+        assertEquals("16 outside the range", 0, OpenClKernelLibrary.subgroupRowSize(sizeRange(32, 64), true));
+        assertEquals("16 outside the range", 0, OpenClKernelLibrary.subgroupRowSize(sizeRange(8, 8), true));
+        assertEquals("no subgroup program", 0, OpenClKernelLibrary.subgroupRowSize(sizeRange(8, 32), false));
+        DeviceCapabilities noRange = new DeviceCapabilities.Builder().deviceName("d").supportsSubgroups(true)
+                .subgroupSize(32).build();
+        assertEquals("no reported range", 0, OpenClKernelLibrary.subgroupRowSize(noRange, true));
+    }
+
+    private static DeviceCapabilities sizeRange(int min, int max) {
+        return new DeviceCapabilities.Builder().deviceName("d").supportsSubgroups(true).subgroupSize(max)
+                .minSubgroupSize(min).maxSubgroupSize(max).build();
     }
 
     @Test

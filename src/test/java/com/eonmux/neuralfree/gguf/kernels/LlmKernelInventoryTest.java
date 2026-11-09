@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -33,11 +34,16 @@ import static org.junit.Assert.assertEquals;
 public class LlmKernelInventoryTest {
 
     /**
-     * Manifest files whose kernels exist only in the OpenCL program; must equal the {@code [opencl]} entries.
-     * Every LLM kernel is portable: the multi-task kernel builds on CUDA and HIP through {@code common/dialect.h}
-     * and has its Vulkan variant in {@code multitask.tsv}.
+     * Manifest files whose kernels exist only in the OpenCL program, in manifest order; must equal the
+     * {@code [opencl]} entries. {@code matvec_sg.cl} holds the subgroup-row matvec forms,
+     * {@code matmul_mmq_sg.cl} the subgroup-row MMQ GEMM, {@code flash_decode_sg.cl} and {@code flash_prefill_sg.cl}
+     * the subgroup flash attention; all four pin an Intel required subgroup size and are
+     * compiled only when the host defines {@code NF_SG_ROW_SIZE}, so they have no CUDA build, no Vulkan variant
+     * and no inventory row. Every other LLM kernel is portable.
      */
-    private static final Set<String> OPENCL_ONLY = Collections.emptySet();
+    private static final Set<String> OPENCL_ONLY =
+            Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList("matvec_sg.cl", "matmul_mmq_sg.cl",
+                    "flash_decode_sg.cl", "flash_prefill_sg.cl")));
 
     private static volatile KernelInventoryChecks cached;
 

@@ -46,7 +46,9 @@ matmul_tiled.cl
 moe_gemm.cl
 quant_mmq_q8_1.cl
 quantize_q8_1.cl
+[opencl] matvec_sg.cl
 matmul_mmq.cl
+[opencl] matmul_mmq_sg.cl
 [cuda] matmul_fp8.cl
 matmul_mma.cl
 matmul_cm.cl
@@ -66,7 +68,9 @@ fused.cl
 multitask.cl
 kv_cache.cl
 flash_decode.cl
+[opencl] flash_decode_sg.cl
 flash_prefill.cl
+[opencl] flash_prefill_sg.cl
 [cuda] flash_mma.cl
 flash_combine.cl
 cp_merge.cl

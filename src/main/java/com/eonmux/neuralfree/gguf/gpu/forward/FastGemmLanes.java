@@ -353,6 +353,25 @@ final class FastGemmLanes {
         return ops.optionalReady(twin, MmqConfig.smallTile(mmqConfig, tokens).workGroupSize(), 1) ? twin : null;
     }
 
+    /**
+     * The subgroup-row form of a plain MMQ launch ({@link SubgroupMmqGemm}: {@code {T}_MatMulSg_MMQ}, same arguments),
+     * or null when the launch keeps {@code fastKernel}: only the {@code {T}_MatMul_MMQ} lane of an OpenCL program built
+     * with the subgroup forms, for a weight type and row length the kernel serves, over the plain 16-deep records
+     * {@code LLM_Quant_MMQ_Q8_1} stages (no checkpoint activation scheme, {@code int8Staging} null), never under
+     * {@link BatchInvariance} (the lane's float order is part of what a batch-invariant run pins), and only when the
+     * tile's group counts fit the device and the kernel can run its work-group ({@link GpuOps#optionalReady}).
+     */
+    String subgroupMmqKernel(String fastKernel, GpuWeight w, int cols, int nTokens, Int8ActStaging int8Staging) {
+        if (!fastKernel.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX) || int8Staging != null || BatchInvariance.enabled()
+                || !SubgroupMmqGemm.programBuilds(kernels) || !SubgroupMmqGemm.shapeServes(w.type(), cols)
+                || mmqConfig.stageDepth() != SubgroupMmqGemm.RECORD_DEPTH) {
+            return null;
+        }
+        String name = SubgroupMmqGemm.kernel(w.type());
+        return fastUsable(name, SubgroupMmqGemm.TILE_ROWS, SubgroupMmqGemm.TILE_TOKENS, SubgroupMmqGemm.WORK_GROUP, w,
+                nTokens) ? name : null;
+    }
+
     /** Staged record units between activation rows of the int8 MMQ lane ({@code NF_MMQ_TK} chunks per row). */
     int stagedRowRecords(int cols) {
         return mmqConfig.rowRecords(cols);
@@ -567,6 +586,9 @@ final class FastGemmLanes {
         if (fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)) {
             ops.optionalReady(GemmKernels.QUANT_MMQ_Q8_1, local);
             ops.optionalReady(GemmKernels.matmulMmqKSplit(type), workGroup, 1);
+            if (SubgroupMmqGemm.programBuilds(kernels) && SubgroupMmqGemm.kernel(type) != null) {
+                ops.optionalReady(SubgroupMmqGemm.kernel(type), SubgroupMmqGemm.WORK_GROUP, 1);
+            }
             prewarmTwins((tokens, group) -> {
                 ops.optionalReady(GemmKernels.matmulMmqSmall(type, tokens), group, 1);
                 ops.optionalReady(GemmKernels.matmulMmqSmallSplit(type, tokens), group, 1);

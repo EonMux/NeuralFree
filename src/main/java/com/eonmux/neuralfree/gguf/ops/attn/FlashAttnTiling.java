@@ -28,6 +28,14 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
  * sequences: the constraints of {@link #decode}, with the split length chosen over the largest per-sequence slot
  * range, and the n_seq of the launch entering the grid and partial sizes {@link #decodePagedGlobal} /
  * {@link #decodePagedPartialFloats}.
+ *
+ * <p>{@link #decodeSubgroup}, {@link #decodePagedSubgroup} and {@link #prefillSubgroup} plan the subgroup kernels
+ * ({@link SubgroupFlashAttention}) instead, in work-groups of {@link SubgroupFlashAttention#WORK_GROUP} items that keep
+ * their state in registers ({@link #subgroup}): a decode plan runs one head per work-group with no shared budget
+ * bounding its split length, a {@link Plan#TILED} plan {@link SubgroupFlashAttention#PREFILL_ROWS} query rows per
+ * work-group over key blocks of {@link SubgroupFlashAttention#PREFILL_BLOCK}; the split policies are otherwise the
+ * portable ones. {@link #decodeGlobal}, {@link #decodePagedGlobal}, {@link #prefillGlobal}, {@link #decodeLocalSize}
+ * and {@link #prefillLocalSize} follow the plan's form.
  */
 public final class FlashAttnTiling {
 
@@ -105,6 +113,12 @@ public final class FlashAttnTiling {
      * their accumulators occupy this many times {@code g_tile * d_v} shared floats.
      */
     public static final int PASS2_GROUPS = LlmKernelConstants.FA_WG / 32;
+    /**
+     * Longest split of a subgroup decode plan. Its kernels hold no keys in shared memory, so the bound only keeps
+     * the split policy independent of the plan's key range: the dense and paged plans of a layer then split a step
+     * over the same keys alike.
+     */
+    static final int SUBGROUP_MAX_SPLIT = 1 << 16;
     /** Upper bound of prefill splits per call. */
     static final int MAX_PREFILL_SPLITS = 16;
     /** A prefill split covers at least this many key tiles. */
@@ -136,10 +150,12 @@ public final class FlashAttnTiling {
     private final int bq;
     private final int bk;
     private final boolean decodeFastPath;
+    /** Whether the plan's launches run the subgroup kernels ({@link SubgroupFlashAttention}). */
+    private final boolean subgroup;
 
     private FlashAttnTiling(Plan plan, int nHead, int nHeadKv, int dK, int dV, int smemFloats, int computeUnits,
                             int gTile, int keyCapacity, int wantedSplits, int minSplitLen, int maxSplitLen,
-                            int maxSplits, int bq, int bk, boolean decodeFastPath) {
+                            int maxSplits, int bq, int bk, boolean decodeFastPath, boolean subgroup) {
         this.plan = plan;
         this.nHead = nHead;
         this.nHeadKv = nHeadKv;
@@ -156,6 +172,7 @@ public final class FlashAttnTiling {
         this.bq = bq;
         this.bk = bk;
         this.decodeFastPath = decodeFastPath;
+        this.subgroup = subgroup;
     }
 
     /**
@@ -233,7 +250,7 @@ public final class FlashAttnTiling {
             return planDecode(Plan.PER_ROW_DECODE, nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits, false);
         }
         return new FlashAttnTiling(Plan.TILED, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                bestG, nKvMax, 0, 0, 0, 0, bestRows / bestG, bestBk, false);
+                bestG, nKvMax, 0, 0, 0, 0, bestRows / bestG, bestBk, false, false);
     }
 
     /**
@@ -259,7 +276,36 @@ public final class FlashAttnTiling {
         }
         int bq = MMA_ROWS / gTile;
         return new FlashAttnTiling(Plan.MMA, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                gTile, nKvMax, 0, 0, 0, 0, bq, MMA_BK, false);
+                gTile, nKvMax, 0, 0, 0, 0, bq, MMA_BK, false, false);
+    }
+
+    /**
+     * Subgroup prefill plan ({@link Plan#TILED} over {@code LLM_FlashAttnSg_*}): {@code bq * g_tile ==}
+     * {@link SubgroupFlashAttention#PREFILL_ROWS} query rows per work-group, with {@code g_tile} the largest power of
+     * two of at most {@code min(n_head / n_head_kv, PREFILL_ROWS)} (a subgroup's two rows are then one token's two
+     * heads whenever the GQA group has two or more), and key blocks of {@code bk =}
+     * {@link SubgroupFlashAttention#PREFILL_BLOCK}, the granularity of {@link #prefillSplit}.
+     *
+     * @throws IllegalArgumentException for invalid shapes, or head dims the subgroup kernels do not serve
+     */
+    public static FlashAttnTiling prefillSubgroup(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
+                                                  int computeUnits) {
+        validate(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
+        requireSubgroupDims(dK, dV);
+        int g0 = nHead / nHeadKv;
+        int gTile = Integer.highestOneBit(Math.min(g0, SubgroupFlashAttention.PREFILL_ROWS));
+        return new FlashAttnTiling(Plan.TILED, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
+                gTile, nKvMax, 0, 0, 0, 0, SubgroupFlashAttention.PREFILL_ROWS / gTile,
+                SubgroupFlashAttention.PREFILL_BLOCK, false, true);
+    }
+
+    /** The head-dim conditions of the subgroup kernels ({@link SubgroupFlashAttention#shapeServes}). */
+    private static void requireSubgroupDims(int dK, int dV) {
+        if (dK != dV || dK % SubgroupFlashAttention.DIMS_PER_LANE != 0 || dK > SubgroupFlashAttention.MAX_HEAD_DIM) {
+            throw new IllegalArgumentException("the subgroup attention kernels need d_k == d_v, a multiple of "
+                    + SubgroupFlashAttention.DIMS_PER_LANE + " of at most " + SubgroupFlashAttention.MAX_HEAD_DIM
+                    + ", got d_k=" + dK + ", d_v=" + dV);
+        }
     }
 
     /** Shared-memory floats the mma kernel stages for d_k and d_v (kernels/llm/flash_mma.cl nf_fm_smem_floats). */
@@ -310,7 +356,46 @@ public final class FlashAttnTiling {
         // and count <= ceil(n / minLen) always; n <= nKvMax bounds all three.
         int maxSplits = Math.max(ceilDiv(nKvMax, maxLen), Math.min(wanted, ceilDiv(nKvMax, minLen)));
         return new FlashAttnTiling(plan, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, decodeFastPath);
+                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, decodeFastPath, false);
+    }
+
+    /**
+     * Subgroup decode plan ({@link SubgroupFlashAttention}): one query head per work-group, splits between
+     * {@link SubgroupFlashAttention#WORK_GROUP} keys (one key per lane of the work-group's first scan) and
+     * {@link #SUBGROUP_MAX_SPLIT}, aiming at two work-groups per compute unit as {@link #decode} does.
+     *
+     * @throws IllegalArgumentException for invalid shapes, or caches and head dims the subgroup kernels do not
+     *                                  serve ({@link SubgroupFlashAttention#shapeServes} with equal plain types)
+     */
+    public static FlashAttnTiling decodeSubgroup(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
+                                                 int computeUnits) {
+        validate(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
+        return planSubgroupDecode(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
+    }
+
+    /**
+     * Paged subgroup decode plan: {@link #decodeSubgroup} over {@code maxKvLen}, the largest per-sequence slot range,
+     * as {@link #decodePaged} is {@link #decode} over it.
+     *
+     * @throws IllegalArgumentException for a non-positive {@code nSeq} and the refusals of {@link #decodeSubgroup}
+     */
+    public static FlashAttnTiling decodePagedSubgroup(int nSeq, int nHead, int nHeadKv, int dK, int dV, int maxKvLen,
+                                                      int smemFloats, int computeUnits) {
+        if (nSeq <= 0) {
+            throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
+        }
+        return decodeSubgroup(nHead, nHeadKv, dK, dV, maxKvLen, smemFloats, computeUnits);
+    }
+
+    private static FlashAttnTiling planSubgroupDecode(int nHead, int nHeadKv, int dK, int dV, int nKvMax,
+                                                      int smemFloats, int computeUnits) {
+        requireSubgroupDims(dK, dV);
+        int minLen = SubgroupFlashAttention.WORK_GROUP;
+        int maxLen = SUBGROUP_MAX_SPLIT;
+        int wanted = (int) Math.max(1L, ceilDiv(2L * computeUnits, (long) nHead));
+        int maxSplits = Math.max(ceilDiv(nKvMax, maxLen), Math.min(wanted, ceilDiv(nKvMax, minLen)));
+        return new FlashAttnTiling(Plan.DECODE, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
+                1, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, false, true);
     }
 
     private static boolean decodeFits(int g, int dK, int dV, int smemFloats, boolean decodeFastPath) {
@@ -417,6 +502,11 @@ public final class FlashAttnTiling {
     public int maxSplits() { return maxSplits; }
     /** Whether the device runs the decode kernels' shuffle fast path for this plan ({@link #decodeFastPath}). */
     public boolean decodeFastPath() { return decodeFastPath; }
+    /**
+     * Whether the plan runs the subgroup kernels ({@link #decodeSubgroup}, {@link #decodePagedSubgroup},
+     * {@link #prefillSubgroup}).
+     */
+    public boolean subgroup() { return subgroup; }
     /** Query tokens per workgroup ({@code bq}); 0 unless the plan is tiled or mma. */
     public int bq() { return bq; }
     /** Keys per tile ({@code bk}); 0 unless the plan is tiled or mma. */
@@ -430,7 +520,11 @@ public final class FlashAttnTiling {
             return mmaSmemFloats(dK, dV);
         }
         if (plan == Plan.TILED) {
-            return tiledSmem(bq * gTile, bk);
+            return subgroup ? (long) SubgroupFlashAttention.PREFILL_ROWS * SubgroupFlashAttention.MAX_HEAD_DIM
+                    : tiledSmem(bq * gTile, bk);
+        }
+        if (subgroup) {
+            return (long) SubgroupFlashAttention.SUBGROUPS * (SubgroupFlashAttention.MAX_HEAD_DIM + 2);
         }
         return (long) gTile * (dK + maxSplitLen) + (long) PASS2_GROUPS * gTile * dV;
     }
@@ -462,14 +556,14 @@ public final class FlashAttnTiling {
         return new Split(count, len);
     }
 
-    /** Global size of a decode call: {@code {n_split * 128, n_head_kv * groupTiles}}. */
+    /** Global size of a decode call: {@code {n_split * wg, n_head_kv * groupTiles}} ({@link #decodeLocalSize}). */
     public long[] decodeGlobal(int nSplit) {
-        return new long[]{(long) nSplit * WG, (long) nHeadKv * groupTiles()};
+        return new long[]{(long) nSplit * workGroup(), (long) nHeadKv * groupTiles()};
     }
 
     /**
      * Global size of a paged decode call for {@code nSeq} sequences and {@code nSplit} splits:
-     * {@code {n_split * 128, n_seq * n_head_kv * groupTiles}}, the sequence folded into dimension 1 in front of
+     * {@code {n_split * wg, n_seq * n_head_kv * groupTiles}} ({@link #decodeLocalSize}), the sequence folded into dimension 1 in front of
      * the KV head and its tiles ({@code gid1 = s * n_head_kv * groupTiles + kvh * groupTiles + gt}), the fold the
      * {@code LLM_FlashDecodePaged_*} kernels subtract before the KV head index.
      *
@@ -483,12 +577,21 @@ public final class FlashAttnTiling {
         if (nSeq <= 0) {
             throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
         }
-        return new long[]{(long) nSplit * WG, (long) nSeq * nHeadKv * groupTiles()};
+        return new long[]{(long) nSplit * workGroup(), (long) nSeq * nHeadKv * groupTiles()};
     }
 
-    /** Local size of a decode call. */
+    /** Local size of a portable decode call ({@code LLM_FlashDecode_*}, {@code LLM_FlashDecodePaged_*}). */
     public static long[] decodeLocal() {
         return new long[]{WG, 1};
+    }
+
+    /** Local size of this plan's decode calls: {@link #decodeLocal}, or the subgroup kernels' work-group. */
+    public long[] decodeLocalSize() {
+        return new long[]{workGroup(), 1};
+    }
+
+    private int workGroup() {
+        return subgroup ? SubgroupFlashAttention.WORK_GROUP : WG;
     }
 
     /** Partial-buffer floats of one decode query row at {@link #maxSplits()}: {@code n_head * maxSplits * (d_v + 2)}. */
@@ -548,17 +651,25 @@ public final class FlashAttnTiling {
         return new Split(ceilDiv(nKeys, len), len);
     }
 
-    /** Global size of a tiled prefill call: {@code {ceil(n_tokens / bq) * 128, n_head_kv * groupTiles, n_split}}. */
+    /**
+     * Global size of a tiled prefill call: {@code {ceil(n_tokens / bq) * wg, n_head_kv * groupTiles, n_split}} for the
+     * plan's {@link #prefillLocalSize}.
+     */
     public long[] prefillGlobal(int nTokens, int nSplit) {
         if (plan != Plan.TILED && plan != Plan.MMA) {
             throw new IllegalStateException("prefillGlobal needs a TILED or MMA plan, this is " + plan);
         }
-        return new long[]{(long) ceilDiv(nTokens, bq) * WG, (long) nHeadKv * groupTiles(), nSplit};
+        return new long[]{(long) ceilDiv(nTokens, bq) * workGroup(), (long) nHeadKv * groupTiles(), nSplit};
     }
 
-    /** Local size of a tiled prefill call. */
+    /** Local size of a portable tiled or mma prefill call ({@code LLM_FlashAttn*}). */
     public static long[] prefillLocal() {
         return new long[]{WG, 1, 1};
+    }
+
+    /** Local size of this plan's prefill calls: {@link #prefillLocal}, or the subgroup kernels' work-group. */
+    public long[] prefillLocalSize() {
+        return new long[]{workGroup(), 1, 1};
     }
 
     /** Global size of {@code LLM_FlashAttn_Combine} for {@code nRows} rows. */
@@ -594,9 +705,9 @@ public final class FlashAttnTiling {
         String head = "FlashAttnTiling{" + plan + ", heads=" + nHead + "/" + nHeadKv + ", d=" + dK + "/" + dV
                 + ", g_tile=" + gTile;
         if (plan == Plan.TILED || plan == Plan.MMA) {
-            return head + ", bq=" + bq + ", bk=" + bk + ", smem=" + smemUsed() + "/" + smemFloats + '}';
+            return head + (subgroup ? ", subgroup" : "") + ", bq=" + bq + ", bk=" + bk + ", smem=" + smemUsed() + "/" + smemFloats + '}';
         }
-        return head + ", split_len=" + minSplitLen + ".." + maxSplitLen + ", wanted_splits=" + wantedSplits
+        return head + (subgroup() ? ", subgroup" : "") + ", split_len=" + minSplitLen + ".." + maxSplitLen + ", wanted_splits=" + wantedSplits
                 + ", max_splits=" + maxSplits + ", keys<=" + keyCapacity + ", smem=" + smemUsed() + "/" + smemFloats
                 + '}';
     }

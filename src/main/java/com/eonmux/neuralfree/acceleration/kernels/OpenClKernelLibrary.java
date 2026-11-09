@@ -16,9 +16,9 @@ import java.util.Set;
 /**
  * OpenCL side of a kernel library: the program is the manifest concatenation, compiled at run time.
  *
- * <p>One program exists per (library, subgroup flag, {@code NF_FA_SMEM_FLOATS}, MMQ tile, required
- * subgroup size): {@code programKey = libraryId + (sg ? "__sg" : "") + "#" + smem + tile + (sgSize > 0
- * ? "@" + sgSize : "")}. Build options are the library's {@link KernelLibraryConfig#openClOptions()}
+ * <p>One program exists per (library, subgroup flag, {@code NF_FA_SMEM_FLOATS}, MMQ tile, subgroup-row size,
+ * required subgroup size): {@code programKey = libraryId + (sg ? "__sg" : "") + "#" + smem + tile + (rowSg > 0
+ * ? "+sgr" + rowSg : "") + (sgSize > 0 ? "@" + sgSize : "")}. Build options are the library's {@link KernelLibraryConfig#openClOptions()}
  * ({@link #BASE_OPTIONS} for the LLM library) plus {@code -DNF_FA_SMEM_FLOATS=<n>}, plus
  * {@code -DUSE_SUBGROUPS=1} when the library has subgroup variants
  * ({@link KernelLibraryConfig#subgroupVariants()}) and the device has subgroup reductions, plus
@@ -28,12 +28,17 @@ import java.util.Set;
  * are unaffected. A device whose {@link MmqConfig} is not the packed-dot default also gets
  * {@code -DNF_MMQ_TM} / {@code -DNF_MMQ_TN} / {@code -DNF_MMQ_TK} ({@link MmqConfig#kernelDefines}),
  * which sizes the MMQ GEMM tile; the default tile is built into the kernel header, so its options stay
- * unchanged. No finite-math or fast-relaxed-math option is used: the kernels rely on IEEE infinities
+ * unchanged. A pinned program on a device that accepts {@value #SUBGROUP_ROW_SIZE}-lane subgroups also gets
+ * {@code -DNF_SG_ROW_SIZE=16} and a {@code +sgr16} key suffix ({@link #subgroupRowSize}), which compiles the
+ * subgroup-row matvec forms of the {@code [opencl]} entry {@code matvec_sg.cl}. No finite-math or fast-relaxed-math option is used: the kernels rely on IEEE infinities
  * as reduction and masking sentinels.</p>
  *
  * <p>The assembled source is computed once per library and shared by every artifact.</p>
  */
 public final class OpenClKernelLibrary implements KernelLibrary {
+
+    /** Subgroup size of the subgroup-row matvec forms ({@link #subgroupRowSize}). */
+    public static final int SUBGROUP_ROW_SIZE = 16;
 
     /** Static OpenCL options of the LLM library (the five-argument {@link KernelLibraryConfig} profile). */
     public static final String BASE_OPTIONS = "-cl-std=CL1.2 -cl-mad-enable -cl-no-signed-zeros";
@@ -209,10 +214,32 @@ public final class OpenClKernelLibrary implements KernelLibrary {
         int reqdSg = requiredSubgroupSize(caps, sg);
         int smem = FaSmem.faSmemFloats(ComputeBackend.BackendType.OPENCL, caps);
         MmqConfig mmq = MmqConfig.forDevice(ComputeBackend.BackendType.OPENCL, caps.getComputeCapability());
+        int rowSg = subgroupRowSize(caps, sg);
+        String defines = mmq.kernelDefines(false);
+        if (rowSg > 0) {
+            defines = (defines.isEmpty() ? "" : defines + " ") + "-DNF_SG_ROW_SIZE=" + rowSg;
+        }
         return KernelArtifact.openClSource(kernelName,
-                programKey(libraryId(), sg, smem, reqdSg, mmq.kernelKey(false)),
+                programKey(libraryId(), sg, smem, reqdSg, mmq.kernelKey(false) + (rowSg > 0 ? "+sgr" + rowSg : "")),
                 this::source,
-                buildOptions(config.openClOptions(), sg, smem, reqdSg, mmq.kernelDefines(false)));
+                buildOptions(config.openClOptions(), sg, smem, reqdSg, defines));
+    }
+
+    /**
+     * The subgroup size of the subgroup-row matvec forms ({@code matvec_sg.cl}, {@code {T}_MatVecSg_Q8} and its
+     * accumulate and fused gate/up twins), or 0 when the program leaves them out: {@value #SUBGROUP_ROW_SIZE}
+     * when the program is pinned to a required subgroup size ({@link #requiredSubgroupSize}, so the device
+     * accepts {@code intel_reqd_sub_group_size}) and {@value #SUBGROUP_ROW_SIZE} lies in the device's reported
+     * range, whose sizes are the powers of two between its ends. The forms pin their own size because their
+     * per-lane unit buffers spill at 32 lanes on the Arrow-Lake iGPU (8-12 GB/s against 47-56 at 16); they are
+     * kernels of their own, so the matvec pairs' shared pin is unaffected.
+     */
+    public static int subgroupRowSize(DeviceCapabilities caps, boolean subgroups) {
+        if (requiredSubgroupSize(caps, subgroups) <= 0) {
+            return 0;
+        }
+        return caps.getMinSubgroupSize() <= SUBGROUP_ROW_SIZE && SUBGROUP_ROW_SIZE <= caps.getMaxSubgroupSize()
+                ? SUBGROUP_ROW_SIZE : 0;
     }
 
     /**

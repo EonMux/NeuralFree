@@ -321,14 +321,27 @@ typedef ulong nf_u64;
 #define nf_rint_i(x) ((int)convert_int_rte(x))
 NF_INLINE float nf_flip_sign(const float x)  { return as_float(as_uint(x) ^ 0x80000000u); }
 NF_INLINE float nf_clear_sign(const float x) { return as_float(as_uint(x) & 0x7fffffffu); }
-/* Four signed-byte products of the packed words a and b added to c (dp4a), in portable integer
- * arithmetic where the device has no packed dot instruction. */
+/* Four signed-byte products of the packed words a and b added to c (dp4a). A compiler that reports
+ * cl_khr_integer_dot_product with its packed-input feature (intel-compute-runtime defines both under
+ * -cl-std=CL1.2, where the built-ins need no pragma) takes the extension's packed dot, one dp4a
+ * instruction; elsewhere the portable integer loop. Both are the exact integer sum, so the choice never
+ * changes a result. The loop alone is not enough on Intel: IGC folds it to dp4a only while it cannot
+ * prove the bytes non-negative, so the masked nibble codes of the K-quant decoders ran as scalar
+ * operations. */
+#if defined(cl_khr_integer_dot_product) && defined(__opencl_c_integer_dot_product_input_4x8bit_packed)
+/* Set where nf_dp4a is a native packed dot, so word-wise integer dot loops prefer it over byte loops. */
+#define NF_NATIVE_DP4A 1
+NF_INLINE int nf_dp4a(int a, int b, int c) {
+    return dot_4x8packed_ss_int((uint)a, (uint)b) + c;
+}
+#else
 NF_INLINE int nf_dp4a(int a, int b, int c) {
     for (int k = 0; k < 4; k++) {
         c += (int)(nf_i8)((a >> (8 * k)) & 0xFF) * (int)(nf_i8)((b >> (8 * k)) & 0xFF);
     }
     return c;
 }
+#endif
 #endif /* dialect */
 
 /* Packed int8 dot product: sum of the four signed-byte products of a and b, added to c. */

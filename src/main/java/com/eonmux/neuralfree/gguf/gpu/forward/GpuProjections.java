@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
@@ -62,6 +63,8 @@ final class GpuProjections {
     private final long maxWorkGroupSize;
     private final Int8MatvecMode int8Mode;
     private final FusedMode fusedMode;
+    /** Whether this backend's program builds the subgroup-row forms ({@link #subgroupRowKernel}). */
+    private final boolean subgroupRows;
 
     /** Binds the projections to the queue, kernels and scratch of the owning GpuOps. */
     GpuProjections(GpuOps ops, ComputeQueue queue, LlmKernels kernels, GpuScratch scratch) {
@@ -76,6 +79,8 @@ final class GpuProjections {
         this.maxWorkGroupSize = kernels.caps().getMaxWorkGroupSize();
         this.int8Mode = ops.int8Mode;
         this.fusedMode = ops.fusedMode;
+        this.subgroupRows = backend.backendType() == ComputeBackend.BackendType.OPENCL
+                && OpenClKernelLibrary.subgroupRowSize(kernels.caps(), kernels.subgroups()) > 0;
     }
 
     void matvec(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer out, int outOff, int nTokens) {
@@ -158,7 +163,8 @@ final class GpuProjections {
         String fused = fusedGateUpName(k.matvec);
         String q8 = k.matvecQ8 != null ? fusedGateUpName(k.matvecQ8) : null;
         if (q8 != null && GpuOps.cols(gate) % gate.type().getBlockSize() == 0
-                && int8LaneSelected(gate.type(), (long) gate.rows() * GpuOps.cols(gate), false)
+                && (int8LaneSelected(gate.type(), (long) gate.rows() * GpuOps.cols(gate), false)
+                    || subgroupRowKernel(q8, gate.type(), GpuOps.cols(gate)) != null)
                 && ops.optionalReady(q8, matvecLocal)) {
             return q8;
         }
@@ -198,7 +204,12 @@ final class GpuProjections {
             GpuMatmulTap.dense(queue, w, x.buf, x.off, nTokens, cols);
             if (q8Add) {
                 GpuBuffer xq = quantizedRow(x, cols);
-                ops.launchMatvec(k.matvecAddQ8, (long) rows * matvecLocal, rows, cols, w.shard(0), xq, accum);
+                String sg = subgroupRowKernel(k.matvecAddQ8, w.type(), cols);
+                if (sg != null) {
+                    launchSubgroupRows(sg, rows, cols, w.shard(0), xq, accum);
+                } else {
+                    ops.launchMatvec(k.matvecAddQ8, (long) rows * matvecLocal, rows, cols, w.shard(0), xq, accum);
+                }
             } else {
                 ops.launchMatvec(k.matvecAdd, (long) rows * matvecLocal, rows, cols, w.shard(0), x.buf, accum);
             }
@@ -270,6 +281,10 @@ final class GpuProjections {
         int launchWorkGroup = smallFast == null ? fastWorkGroup : ops.lanes.fastWorkGroup(smallFast);
         Int8ActStaging int8Staging = fastUsable && fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)
                 ? ops.lanes.int8Staging(w, cols) : null;
+        /* A plain MMQ launch on an OpenCL program with the subgroup forms runs the subgroup-row GEMM instead
+         * (SubgroupMmqGemm, same arguments and staging); its split-K launches keep the portable KSplit. */
+        String sgFast = fastUsable && smallFast == null && !invariant
+                ? ops.lanes.subgroupMmqKernel(fast, w, cols, nTokens, int8Staging) : null;
         Fp8ActStaging fp8Staging = fastUsable && FastGemmLanes.fp8Fast(w, fast)
                 ? ops.lanes.fp8Staging(w, cols) : null;
         GpuOps.View x = projectionInput(w, in, inOff, nTokens, cols, int8Staging != null || fp8Staging != null);
@@ -299,10 +314,16 @@ final class GpuProjections {
                 } else {
                     int qStride = staged ? ops.lanes.stagedRowRecords(cols) : cols;
                     int qOff = staged ? activations.off : x.off;
-                    ops.launch2d(smallFast == null ? fast : smallFast,
-                            GpuOps.ceilDiv(m, launchTileRows) * launchWorkGroup, GpuOps.ceilDiv(nTokens, launchTileTokens),
-                            launchWorkGroup, m, cols, nTokens, qStride, qOff, rows, yOff, w.shard(s),
-                            activations.buf, out);
+                    if (sgFast != null) {
+                        ops.launch2d(sgFast, SubgroupMmqGemm.globalRows(m), SubgroupMmqGemm.tokenGroups(nTokens),
+                                SubgroupMmqGemm.WORK_GROUP, m, cols, nTokens, qStride, qOff, rows, yOff, w.shard(s),
+                                activations.buf, out);
+                    } else {
+                        ops.launch2d(smallFast == null ? fast : smallFast,
+                                GpuOps.ceilDiv(m, launchTileRows) * launchWorkGroup,
+                                GpuOps.ceilDiv(nTokens, launchTileTokens), launchWorkGroup, m, cols, nTokens, qStride,
+                                qOff, rows, yOff, w.shard(s), activations.buf, out);
+                    }
                 }
             }
         } else if (!invariant && allowTiled && !q8n && !floatN && nTokens >= LlmKernelConstants.TILED_MIN_TOKENS
@@ -568,7 +589,10 @@ final class GpuProjections {
      */
     private void launchInt8Matvec(String kernel, GGMLType type, int m, int cols, GpuBuffer weight, GpuBuffer q8,
                                   GpuBuffer out) {
-        if (pairInt8Rows(type) && twoRowUsable(kernel, m)) {
+        String sg = subgroupRowKernel(kernel, type, cols);
+        if (sg != null) {
+            launchSubgroupRows(sg, m, cols, weight, q8, out);
+        } else if (pairInt8Rows(type) && twoRowUsable(kernel, m)) {
             ops.launchMatvec(twoRowName(kernel), (long) GpuOps.ceilDiv(m, 2) * matvecLocal, m, cols, weight, q8, out);
         } else {
             ops.launchMatvec(kernel, (long) m * matvecLocal, m, cols, weight, q8, out);
@@ -653,7 +677,10 @@ final class GpuProjections {
      */
     private void launchInt8GateUp(String kernel, GGMLType type, int m, int cols, GpuBuffer gateWeight,
                                   GpuBuffer upWeight, GpuBuffer q8, GpuBuffer out) {
-        if (pairInt8Rows(type) && twoRowUsable(kernel, m)) {
+        String sg = subgroupRowKernel(kernel, type, cols);
+        if (sg != null) {
+            launchSubgroupRows(sg, m, cols, gateWeight, upWeight, q8, out);
+        } else if (pairInt8Rows(type) && twoRowUsable(kernel, m)) {
             ops.launchMatvec(twoRowName(kernel), (long) GpuOps.ceilDiv(m, 2) * matvecLocal, m, cols, gateWeight, upWeight, q8,
                     out);
         } else {
@@ -664,6 +691,33 @@ final class GpuProjections {
     /** Whether the paired integer-dot form measured faster than the single-row form for {@code type} here. */
     private boolean pairInt8Rows(GGMLType type) {
         return Int8MatvecTuning.pairedIsFaster(deviceKind, type);
+    }
+
+    /**
+     * The subgroup-row twin ({@link SubgroupRowMatvec}) of the integer-dot single-token kernel {@code kernel} for
+     * rows of {@code cols} elements of {@code type}, or null when it does not serve: the configured
+     * {@link Int8MatvecMode} keeps the lane, batch invariance is off (the twin's float summation order differs
+     * from the multi-column forms'), the type and shape meet the twin's preconditions, this backend's OpenCL
+     * program defines the forms ({@link OpenClKernelLibrary#subgroupRowSize}, the condition of the build define
+     * itself, not the kernel lookup) and the kernel is prepared. Where it serves it replaces the single-row and
+     * paired forms, which it outruns on every measured shape.
+     */
+    private String subgroupRowKernel(String kernel, GGMLType type, int cols) {
+        if (!subgroupRows || !int8Mode.permitsLane() || BatchInvariance.enabled()
+                || !SubgroupRowMatvec.shapeServes(type, cols)) {
+            return null;
+        }
+        String twin = SubgroupRowMatvec.twinName(kernel, type);
+        return twin != null && ops.optionalReady(twin, SubgroupRowMatvec.WORK_GROUP, 1) ? twin : null;
+    }
+
+    /** Launches a subgroup-row form over {@code rows} output rows with the form's own work-group. */
+    private void launchSubgroupRows(String kernel, int rows, int cols, Object... buffers) {
+        Object[] args = new Object[buffers.length + 2];
+        args[0] = rows;
+        args[1] = cols;
+        System.arraycopy(buffers, 0, args, 2, buffers.length);
+        ops.launch2d(kernel, SubgroupRowMatvec.globalSize(rows), 1, SubgroupRowMatvec.WORK_GROUP, args);
     }
 
     /**
@@ -688,14 +742,17 @@ final class GpuProjections {
      * weight blocks (the int8 kernels read complete 32/256-element groups), the configured
      * {@link Int8MatvecMode} and device permit it (packed dot products reported, or the mode forces the
      * lane), {@link Int8MatvecTuning} has no decode evidence against the type on this device kind, and
-     * the kernel is prepared at the matvec work-group size.
+     * the kernel is prepared at the matvec work-group size. A single-token kernel whose subgroup-row twin
+     * serves ({@link #subgroupRowKernel}) takes the lane whatever that evidence says: the evidence measured
+     * the family's forms, which the twin replaces.
      */
     private boolean int8LaneUsable(String kernel, GpuWeight w, boolean counted) {
         if (kernel == null || GpuOps.cols(w) % w.type().getBlockSize() != 0) {
             return false;
         }
-        return int8LaneSelected(w.type(), (long) GpuOps.rows(w) * GpuOps.cols(w), counted)
-                && ops.optionalReady(kernel, matvecLocal);
+        boolean selected = int8LaneSelected(w.type(), (long) GpuOps.rows(w) * GpuOps.cols(w), counted)
+                || (!counted && subgroupRowKernel(kernel, w.type(), GpuOps.cols(w)) != null);
+        return selected && ops.optionalReady(kernel, matvecLocal);
     }
 
     /**

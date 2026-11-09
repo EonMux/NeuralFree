@@ -20,6 +20,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -27,6 +28,7 @@ import java.util.Locale;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -113,6 +115,12 @@ public class Int8MatvecLaneTest {
     /** The capabilities of {@code type}'s device claiming {@code vendorId}, {@code deviceClass} and {@code feature}. */
     private static DeviceCapabilities capabilities(ComputeBackend.BackendType type, int vendorId,
                                                    DeviceClass deviceClass, DeviceFeature feature) {
+        return capabilitiesBuilder(type, vendorId, deviceClass, feature).build();
+    }
+
+    /** The builder of {@link #capabilities}, for tests that add capabilities. */
+    private static DeviceCapabilities.Builder capabilitiesBuilder(ComputeBackend.BackendType type, int vendorId,
+                                                                  DeviceClass deviceClass, DeviceFeature feature) {
         DeviceCapabilities.Builder b = new DeviceCapabilities.Builder()
                 .deviceName("FakeDevice")
                 .totalVramBytes(8L << 30)
@@ -132,7 +140,7 @@ public class Int8MatvecLaneTest {
         if (type == ComputeBackend.BackendType.CUDA) {
             b.computeCapability(120);
         }
-        return b.build();
+        return b;
     }
 
     @After
@@ -386,6 +394,110 @@ public class Int8MatvecLaneTest {
         List<String> nvfp4Names = run(() -> ops.matvec(nvfp4, autoInput(), 0, autoOutput(), 0, 1));
         assertTrue(nvfp4Names.toString(), nvfp4Names.contains("NVFP4_MatVec_Q8"));
         assertFalse(nvfp4Names.toString(), nvfp4Names.contains("NVFP4_MatVec"));
+    }
+
+    /**
+     * An OpenCL device whose program builds the subgroup-row forms (subgroups with a required-size range that
+     * holds 16 lanes, the Intel GPUs: {@link com.eonmux.neuralfree.acceleration.kernels.OpenClKernelLibrary#subgroupRowSize})
+     * runs the single-token Q8_0, Q4_K and Q6_K products, their accumulating form and the fused gate/up through
+     * them under AUTO, overriding the Arrow-Lake kind's family evidence against the Q8_0 lane; other types keep
+     * the family, OFF keeps the float matvec, and the same device without the size range keeps today's
+     * dispatch.
+     */
+    @Test
+    public void subgroupRowFormsServeTheSingleTokenLaneWhereTheProgramBuildsThem() {
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                subgroupRowCapabilities(8, 32));
+        GpuBuffer in = backend.allocateBuffer((long) COLS * 4);
+        GpuBuffer out = backend.allocateBuffer((long) ROWS * 4);
+        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            GpuWeight w = weight(type);
+            assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecSg_Q8"),
+                    run(() -> ops.matvec(w, in, 0, out, 0, 1)));
+            assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecAddSg_Q8"),
+                    run(() -> ops.matvecAdd(w, in, 0, out, 0, 1)));
+            GpuWeight gate = weight(type, 1024);
+            GpuWeight up = weight(type, 1024);
+            GpuBuffer gateOut = backend.allocateBuffer(1024L * 4);
+            assertEquals(Arrays.asList(GpuOps.QUANTIZE_Q8_1, type.name() + "_MatVecFusedGateUpSg_Q8"),
+                    run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, gateOut)));
+        }
+        GpuWeight q5k = weight(GGMLType.Q5_K);
+        List<String> family = run(() -> ops.matvec(q5k, in, 0, out, 0, 1));
+        assertFalse(family.toString(), family.contains("Q5_K_MatVecSg_Q8"));
+
+        open(Int8MatvecMode.OFF, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                subgroupRowCapabilities(8, 32));
+        GpuWeight offWeight = weight(GGMLType.Q8_0);
+        assertEquals(Collections.singletonList("Q8_0_MatVec"), run(() -> ops.matvec(offWeight,
+                backend.allocateBuffer((long) COLS * 4), 0, backend.allocateBuffer((long) ROWS * 4), 0, 1)));
+
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                subgroupRowCapabilities(32, 64));
+        GpuWeight noRange = weight(GGMLType.Q8_0);
+        List<String> names = run(() -> ops.matvec(noRange, backend.allocateBuffer((long) COLS * 4), 0,
+                backend.allocateBuffer((long) ROWS * 4), 0, 1));
+        assertFalse(names.toString(), names.contains("Q8_0_MatVecSg_Q8"));
+    }
+
+    /**
+     * A multi-token Q8_0, Q4_K or Q6_K projection on a program built with the subgroup forms runs that type's
+     * subgroup-row MMQ GEMM over the same staged records ({@link SubgroupMmqGemm}); a type without a subgroup GEMM
+     * (Q5_K), and a device whose program does not build the forms, keep the portable MMQ kernel.
+     */
+    @Test
+    public void subgroupMmqGemmServesTheMultiTokenQ8_0Q4_KAndQ6_KLanesWhereTheProgramBuildsIt() {
+        int tokens = 512;
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                subgroupRowCapabilities(8, 32));
+        GpuBuffer in = backend.allocateBuffer((long) COLS * tokens * 4);
+        GpuBuffer out = backend.allocateBuffer((long) ROWS * tokens * 4);
+        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            GpuWeight w = weight(type);
+            List<String> sg = run(() -> ops.matmul(w, in, 0, out, 0, tokens));
+            assertTrue(type + " " + sg, sg.contains(type.name() + "_MatMulSg_MMQ"));
+            assertFalse(type + " " + sg, sg.contains(type.name() + "_MatMul_MMQ"));
+        }
+        GpuWeight q5k = weight(GGMLType.Q5_K);
+        List<String> family = run(() -> ops.matmul(q5k, in, 0, out, 0, tokens));
+        assertTrue(family.toString(), family.contains("Q5_K_MatMul_MMQ"));
+        assertFalse(family.toString(), family.contains("Q5_K_MatMulSg_MMQ"));
+
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                subgroupRowCapabilities(32, 64));
+        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            GpuWeight noRange = weight(type);
+            List<String> portable = run(() -> ops.matmul(noRange, backend.allocateBuffer((long) COLS * tokens * 4), 0,
+                    backend.allocateBuffer((long) ROWS * tokens * 4), 0, tokens));
+            assertTrue(type + " " + portable, portable.contains(type.name() + "_MatMul_MMQ"));
+            assertFalse(type + " " + portable, portable.contains(type.name() + "_MatMulSg_MMQ"));
+        }
+    }
+
+    /**
+     * The subgroup GEMM's row-length gate: Q8_0 rows of whole 64-element stages, K-quant rows of whole 256-element
+     * super-blocks, and no form for a type outside {@link SubgroupMmqGemm#TYPES}.
+     */
+    @Test
+    public void subgroupMmqGemmServesWholeStagesOfWholeBlocks() {
+        assertTrue(SubgroupMmqGemm.shapeServes(GGMLType.Q8_0, 64));
+        assertFalse(SubgroupMmqGemm.shapeServes(GGMLType.Q8_0, 96));
+        for (GGMLType type : new GGMLType[]{GGMLType.Q4_K, GGMLType.Q6_K}) {
+            assertEquals(type.name() + "_MatMulSg_MMQ", SubgroupMmqGemm.kernel(type));
+            assertTrue(type.name(), SubgroupMmqGemm.shapeServes(type, 256));
+            assertTrue(type.name(), SubgroupMmqGemm.shapeServes(type, 2560));
+            assertFalse(type.name(), SubgroupMmqGemm.shapeServes(type, 192));
+            assertFalse(type.name(), SubgroupMmqGemm.shapeServes(type, 0));
+        }
+        assertNull(SubgroupMmqGemm.kernel(GGMLType.Q5_K));
+        assertFalse(SubgroupMmqGemm.shapeServes(GGMLType.Q5_K, 256));
+    }
+
+    /** The Arrow-Lake OpenCL kind with subgroups whose required sizes span {@code min..max}. */
+    private static DeviceCapabilities subgroupRowCapabilities(int min, int max) {
+        return capabilitiesBuilder(ComputeBackend.BackendType.OPENCL, FakeComputeBackend.INTEL_VENDOR_ID,
+                DeviceClass.INTEGRATED, DeviceFeature.INTEGER_DOT_PRODUCT)
+                .supportsSubgroups(true).subgroupSize(max).minSubgroupSize(min).maxSubgroupSize(max).build();
     }
 
     @Test

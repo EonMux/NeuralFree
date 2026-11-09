@@ -74,14 +74,12 @@ final class GpuPagedFlashAttention {
                                           FlashKernelArgs args, PagedFlashGeometry pg, GpuStepInputs steps,
                                           FlashCombine combine, StaticSinkPartial sinkPartial,
                                           PreparedDispatch lse) {
-        FlashKeys keys = args.keys();
-        PreparedDispatch decode = res.prepare(AttnKernels.flashDecodePaged(keys.typeK(), keys.typeV()),
-                plan.paged().decodePagedGlobal(1, 1), FlashAttnTiling.decodeLocal(),
-                args.pagedDecode(plan.paged(), pg));
+        PreparedDispatch decode = res.prepare(plan.pagedDecodeKernel(), plan.paged().decodePagedGlobal(1, 1),
+                plan.paged().decodeLocalSize(), args.pagedDecode(plan.paged(), pg));
         boolean invariant = BatchInvariance.enabled();
         String prefillKernel = invariant ? null : plan.pagedPrefillKernel();
         PreparedDispatch prefill = prefillKernel != null
-                ? res.prepare(prefillKernel, plan.prefill().prefillGlobal(1, 1), FlashAttnTiling.prefillLocal(),
+                ? res.prepare(prefillKernel, plan.prefill().prefillGlobal(1, 1), plan.prefill().prefillLocalSize(),
                         args.pagedPrefill(plan.prefill(), pg,
                                 plan.prefill().plan() == FlashAttnTiling.Plan.MMA))
                 : null;

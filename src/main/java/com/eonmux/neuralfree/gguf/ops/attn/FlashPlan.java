@@ -10,13 +10,19 @@ import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
  * {@code smemFloats = LlmKernels.faSmemFloats()}: the decode plan, the prefill plan
  * ({@link FlashAttnTiling.Plan#TILED}, the tensor-core {@link FlashAttnTiling.Plan#MMA} on a backend with
  * {@link DeviceFeature#COOPERATIVE_MATRIX} and F16 caches, or the per-row decode fallback), the paged decode plan
- * and paged prefill kernel of a paged cache, and the split-K partial capacity every plan's launches fit in.
+ * and paged prefill kernel of a paged cache, and the split-K partial capacity every plan's launches fit in. The
+ * dense and paged decode plans and the tiled prefill plan share one form: the subgroup kernels where
+ * {@link SubgroupFlashAttention#serves} holds, the portable ones otherwise, with the kernel names of
+ * {@link #decodeKernel}, {@link #pagedDecodeKernel}, {@link #tiledKernel} and {@link #pagedPrefillKernel}.
  * Immutable.
  */
 final class FlashPlan {
 
     private final FlashAttnTiling decode;
+    private final String decodeKernel;
+    private final String pagedDecodeKernel;
     private final FlashAttnTiling prefill;
+    private final String tiledKernel;
     private final String mmaKernel;
     private final FlashAttnTiling paged;
     private final String pagedPrefillKernel;
@@ -33,10 +39,14 @@ final class FlashPlan {
      */
     static final int DEPTH_ROUTE_MAX_GROUP = 2;
 
-    private FlashPlan(FlashAttnTiling decode, FlashAttnTiling prefill, String mmaKernel, FlashAttnTiling paged,
-                      String pagedPrefillKernel, long partialCapacity, boolean depthRouted) {
+    private FlashPlan(FlashAttnTiling decode, String decodeKernel, String pagedDecodeKernel, FlashAttnTiling prefill,
+                      String tiledKernel, String mmaKernel, FlashAttnTiling paged, String pagedPrefillKernel,
+                      long partialCapacity, boolean depthRouted) {
         this.decode = decode;
+        this.decodeKernel = decodeKernel;
+        this.pagedDecodeKernel = pagedDecodeKernel;
         this.prefill = prefill;
+        this.tiledKernel = tiledKernel;
         this.mmaKernel = mmaKernel;
         this.paged = paged;
         this.pagedPrefillKernel = pagedPrefillKernel;
@@ -55,14 +65,29 @@ final class FlashPlan {
         int rows = keys.rows();
         boolean fast = FlashAttnTiling.decodeFastPath(kernels.caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
                 keys.typeK(), keys.typeV(), a.headDimK(), a.headDimV());
-        FlashAttnTiling decode = FlashAttnTiling.decode(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows,
-                smem, cu, fast);
+        boolean subgroup = SubgroupFlashAttention.serves(kernels, keys.typeK(), keys.typeV(), a.headDimK(),
+                a.headDimV());
+        FlashAttnTiling decode = subgroup
+                ? FlashAttnTiling.decodeSubgroup(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu)
+                : FlashAttnTiling.decode(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu, fast);
+        String decodeKernel = subgroup ? SubgroupFlashAttention.kernel(keys.typeK())
+                : AttnKernels.flashDecode(keys.typeK(), keys.typeV());
+        String pagedDecodeKernel = subgroup ? SubgroupFlashAttention.pagedKernel(keys.typeK())
+                : AttnKernels.flashDecodePaged(keys.typeK(), keys.typeV());
         String mmaName = mmaKernelName(kernels.caps().hasFeature(DeviceFeature.COOPERATIVE_MATRIX), keys.typeK(),
                 keys.typeV(), a.headDimK(), a.headDimV());
         String mma = mmaName != null && kernels.has(mmaName) ? mmaName : null;
-        FlashAttnTiling prefill = mma != null
-                ? FlashAttnTiling.mma(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu)
-                : FlashAttnTiling.prefill(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu);
+        FlashAttnTiling prefill;
+        if (mma != null) {
+            prefill = FlashAttnTiling.mma(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu);
+        } else if (subgroup) {
+            prefill = FlashAttnTiling.prefillSubgroup(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem,
+                    cu);
+        } else {
+            prefill = FlashAttnTiling.prefill(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows, smem, cu);
+        }
+        String tiledKernel = prefill.subgroup() ? SubgroupFlashAttention.prefillKernel(keys.typeK())
+                : AttnKernels.flashAttn(keys.typeK(), keys.typeV());
         long cap = decode.decodePartialFloats();
         if (prefill.plan() != FlashAttnTiling.Plan.PER_ROW_DECODE) {
             cap = Math.max(cap, prefillPartialFloats(prefill, ubatch, cu));
@@ -71,14 +96,18 @@ final class FlashPlan {
         String pagedPrefill = null;
         if (pg != null) {
             pagedPrefill = pagedPrefillKernel(kernels, prefill, keys.typeK(), keys.typeV());
-            paged = FlashAttnTiling.decodePaged(pg.maxLaunchSeq(), a.nHead(), a.nHeadKv(), a.headDimK(),
-                    a.headDimV(), pg.slotCapacity(), smem, cu, fast);
+            paged = subgroup
+                    ? FlashAttnTiling.decodePagedSubgroup(pg.maxLaunchSeq(), a.nHead(), a.nHeadKv(), a.headDimK(),
+                            a.headDimV(), pg.slotCapacity(), smem, cu)
+                    : FlashAttnTiling.decodePaged(pg.maxLaunchSeq(), a.nHead(), a.nHeadKv(), a.headDimK(),
+                            a.headDimV(), pg.slotCapacity(), smem, cu, fast);
             cap = Math.max(cap, paged.decodePagedPartialFloats(pg.maxLaunchSeq()));
         }
         if (cap > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("flash partials of " + cap + " floats exceed one buffer");
         }
-        return new FlashPlan(decode, prefill, mma, paged, pagedPrefill, cap,
+        return new FlashPlan(decode, decodeKernel, pagedDecodeKernel, prefill, tiledKernel, mma, paged, pagedPrefill,
+                cap,
                 depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()));
     }
 
@@ -102,14 +131,16 @@ final class FlashPlan {
     }
 
     /**
-     * The paged prefill kernel of the prefill plan: the tiled {@code LLM_FlashAttnPaged_<KV>}, or the tensor-core
-     * {@code LLM_FlashAttnMmaPaged_F16} of an MMA plan (same arguments) when the backend has it; null when the
-     * plan's segments run the per-row paged decode fallback ({@link PagedRowFallback}).
+     * The paged prefill kernel of the prefill plan: the tiled {@code LLM_FlashAttnPaged_<KV>} (its subgroup form
+     * {@code LLM_FlashAttnPagedSg_<KV>} under a subgroup plan), or the tensor-core {@code LLM_FlashAttnMmaPaged_F16}
+     * of an MMA plan (same arguments) when the backend has it; null when the plan's segments run the per-row paged
+     * decode fallback ({@link PagedRowFallback}).
      */
     private static String pagedPrefillKernel(LlmKernels kernels, FlashAttnTiling prefill, KvDType typeK,
                                              KvDType typeV) {
         if (prefill.plan() == FlashAttnTiling.Plan.TILED) {
-            return AttnKernels.flashAttnPaged(typeK, typeV);
+            return prefill.subgroup() ? SubgroupFlashAttention.pagedPrefillKernel(typeK)
+                    : AttnKernels.flashAttnPaged(typeK, typeV);
         }
         String mma = prefill.plan() == FlashAttnTiling.Plan.MMA ? AttnKernels.flashAttnMmaPaged(typeK) : null;
         return mma != null && kernels.has(mma) ? mma : null;
@@ -132,9 +163,24 @@ final class FlashPlan {
         return decode;
     }
 
+    /** The kernel of {@link #decode}'s launches. */
+    String decodeKernel() {
+        return decodeKernel;
+    }
+
+    /** The kernel of {@link #paged}'s launches (named whether or not the layer has a paged cache). */
+    String pagedDecodeKernel() {
+        return pagedDecodeKernel;
+    }
+
     /** The prefill plan of a multi-token step. */
     FlashAttnTiling prefill() {
         return prefill;
+    }
+
+    /** The kernel of a {@link FlashAttnTiling.Plan#TILED} prefill plan's launches. */
+    String tiledKernel() {
+        return tiledKernel;
     }
 
     /** The tensor-core prefill kernel of an MMA plan; null otherwise. */

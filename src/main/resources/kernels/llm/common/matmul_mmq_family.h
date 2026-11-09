@@ -331,8 +331,9 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
 
 /*
  * Packed-dot path: dot of one 16-element half of a weight-code row with the staged code row of the
- * token, 4-way with __dp4a on CUDA sm_61+, scalar int elsewhere (HIP has no __dp4a, so its dialect
- * takes the scalar loop). rec points at the half's first code int in the staged record tile; the
+ * token, 4-way with __dp4a on CUDA sm_61+ and with the native packed dot of an OpenCL compiler that
+ * reports one (NF_NATIVE_DP4A, common/dialect.h), scalar int elsewhere (HIP has no __dp4a, so its
+ * dialect takes the scalar loop). All three are the exact integer dot. rec points at the half's first code int in the staged record tile; the
  * halves of a 32-deep stage carry their own scales, so the caller sums the half dots under those
  * scales.
  */
@@ -343,6 +344,13 @@ NF_INLINE int nf_mmq_half_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_LOCAL_PTR con
     for (int u = 0; u < 4; u++) {
         const int w = *(NF_LOCAL_PTR const int*)(wq_row + 4 * u);   /* rows of int-aligned tiles */
         ib = __dp4a(w, (int)rec[u], ib);
+    }
+    return ib;
+#elif defined(NF_NATIVE_DP4A)
+    int ib = 0;
+    for (int u = 0; u < 4; u++) {
+        const int w = *(NF_LOCAL_PTR const int*)(wq_row + 4 * u);   /* rows of int-aligned tiles */
+        ib = NF_DP4A(w, (int)rec[u], ib);
     }
     return ib;
 #else

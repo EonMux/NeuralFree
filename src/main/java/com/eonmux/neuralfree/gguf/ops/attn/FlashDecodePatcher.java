@@ -190,7 +190,7 @@ final class FlashDecodePatcher implements GpuStepPatcher {
     /** True when {@code d} is this layer's decode kernel of one query row at offset 0, no tree mask. */
     private boolean isGroupDecode(GpuGraphDispatch d) {
         Object[] args = d.args();
-        return d.kernelName().startsWith(AttnKernels.FLASH_DECODE_PREFIX)
+        return d.kernelName().equals(decode.kernelName())
                 && args.length > AttnKernels.ARG_FD_BUF_K
                 && args[AttnKernels.ARG_FD_BUF_K] == k
                 && args[AttnKernels.ARG_FD_BUF_Q] == q
