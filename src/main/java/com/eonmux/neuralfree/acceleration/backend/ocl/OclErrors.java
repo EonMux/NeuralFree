@@ -22,6 +22,12 @@ import static org.jocl.CL.stringFor_errorCode;
  * first enqueue that touches a buffer rather than at {@code clCreateBuffer}; every queue call is
  * therefore checked through this class.</p>
  *
+ * <p>A GPU hang is reported through these statuses too. When the kernel driver resets a context whose
+ * work hung, the Intel compute runtime ends every command queued on it with {@link #EXECUTION_ABORTED}
+ * and fails the queue's synchronizations with {@code CL_OUT_OF_RESOURCES}; {@link #checkWait} names
+ * both readings of that status, since the same one also reports a lazily allocated buffer the device
+ * could not hold.</p>
+ *
  * <p>JOCL either returns the status (exceptions disabled, its default) or throws a
  * {@link CLException} carrying it (exceptions enabled process-wide through
  * {@code CL.setExceptionsEnabled(true)}). {@link #check(String, String, IntSupplier)} handles both
@@ -31,6 +37,14 @@ public final class OclErrors {
 
     /** Backend name carried by {@link GpuBackendException} and {@link GpuOutOfMemoryException}. */
     public static final String BACKEND = "OpenCL";
+    /**
+     * Execution status the Intel compute runtime gives a command that a GPU hang aborted (outside the
+     * Khronos status range): the kernel driver reset the context the command was queued on.
+     */
+    public static final int EXECUTION_ABORTED = -777;
+
+    private static final String WAIT_FAILURE_NOTE = "the device could not run the queued work: it ran out of"
+            + " resources, or the kernel driver reset its context after a GPU hang";
 
     private OclErrors() {
     }
@@ -44,6 +58,9 @@ public final class OclErrors {
 
     /** The symbolic name of a status, for messages. */
     public static String nameOf(int status) {
+        if (status == EXECUTION_ABORTED) {
+            return "EXECUTION_ABORTED (aborted by a GPU hang that reset the context)";
+        }
         return stringFor_errorCode(status);
     }
 
@@ -64,6 +81,31 @@ public final class OclErrors {
         }
         if (status != CL_SUCCESS) {
             throw translate(status, op, subject, -1, null);
+        }
+    }
+
+    /**
+     * Runs one call that waits for queued work ({@code clFinish}, {@code clWaitForEvents}) and translates its
+     * failure as {@link #check(String, String, IntSupplier)} does; a {@code CL_OUT_OF_RESOURCES} failure names
+     * both of its causes at a wait, an exhausted device or a context the kernel driver reset after a GPU hang.
+     *
+     * @throws GpuOutOfMemoryException when the status reports exhausted memory
+     * @throws GpuBackendException     for every other failure
+     */
+    public static void checkWait(String op, String subject, IntSupplier call) {
+        int status;
+        CLException thrown = null;
+        try {
+            status = call.getAsInt();
+        } catch (CLException e) {
+            status = e.getStatus();
+            thrown = e;
+        }
+        if (status != CL_SUCCESS) {
+            String note = status == CL_OUT_OF_RESOURCES ? WAIT_FAILURE_NOTE : null;
+            String what = subject == null || subject.isEmpty() ? note
+                    : note == null ? subject : subject + "; " + note;
+            throw translate(status, op, what, -1, thrown);
         }
     }
 

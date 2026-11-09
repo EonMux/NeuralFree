@@ -69,7 +69,7 @@ public final class OclGpuEvent implements GpuEvent {
         }
         cl_event[] waitList = {event};
         try {
-            OclErrors.check("clWaitForEvents", readCompletion != null ? "read" : null,
+            OclErrors.checkWait("clWaitForEvents", readCompletion != null ? "read" : null,
                     () -> clWaitForEvents(1, waitList));
         } catch (RuntimeException e) {
             if (readCompletion != null) {

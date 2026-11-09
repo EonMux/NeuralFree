@@ -99,6 +99,50 @@ public class OclErrorsTest {
         assertEquals(OclErrors.BACKEND, ((GpuOutOfMemoryException) e).getBackendType());
     }
 
+    @Test
+    public void anAbortedCommandIsNamedAsAGpuHangReset() {
+        assertTrue(OclErrors.nameOf(OclErrors.EXECUTION_ABORTED).contains("GPU hang"));
+        RuntimeException e = OclErrors.translate(OclErrors.EXECUTION_ABORTED, "clEnqueueReadBuffer",
+                "terminated abnormally", -1, null);
+        assertTrue(e instanceof GpuBackendException);
+        assertFalse(e instanceof GpuOutOfMemoryException);
+        assertEquals(OclErrors.EXECUTION_ABORTED, ((GpuBackendException) e).getCode());
+        assertTrue(e.getMessage(), e.getMessage().contains("EXECUTION_ABORTED"));
+    }
+
+    @Test
+    public void aWaitOutOfResourcesNamesBothCauses() {
+        try {
+            OclErrors.checkWait("clFinish", null, () -> CL_OUT_OF_RESOURCES);
+            fail("expected GpuOutOfMemoryException");
+        } catch (GpuOutOfMemoryException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("GPU hang"));
+            assertTrue(e.getMessage(), e.getMessage().contains("CL_OUT_OF_RESOURCES"));
+        }
+        CLException thrown = new CLException("CL_OUT_OF_RESOURCES", CL_OUT_OF_RESOURCES);
+        try {
+            OclErrors.checkWait("clWaitForEvents", "read", () -> {
+                throw thrown;
+            });
+            fail("expected GpuOutOfMemoryException");
+        } catch (GpuOutOfMemoryException e) {
+            assertSame(thrown, e.getCause());
+            assertTrue(e.getMessage(), e.getMessage().contains("(read; "));
+        }
+    }
+
+    @Test
+    public void aWaitKeepsEveryOtherStatusAsCheckReportsIt() {
+        OclErrors.checkWait("clFinish", null, () -> CL_SUCCESS);
+        try {
+            OclErrors.checkWait("clWaitForEvents", "read", () -> CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+            fail("expected GpuBackendException");
+        } catch (GpuBackendException e) {
+            assertEquals(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST, e.getCode());
+            assertFalse(e.getMessage(), e.getMessage().contains("GPU hang"));
+        }
+    }
+
     @Test(expected = IllegalArgumentException.class)
     public void successIsNotAFailure() {
         OclErrors.translate(CL_SUCCESS, "clFinish", null, -1, null);

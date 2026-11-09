@@ -792,7 +792,7 @@ public final class OclComputeQueue implements ComputeQueue {
     /** Drains the queue so the command buffer is not pending when its mutable commands are updated. */
     void drainForGraphUpdate() {
         ensureOpen();
-        OclErrors.check("clFinish", null, () -> clFinish(queue));
+        OclErrors.checkWait("clFinish", null, () -> clFinish(queue));
     }
 
     /** Enqueues the graph's command buffer after {@code waitList} (which the caller validated). */
@@ -803,7 +803,7 @@ public final class OclComputeQueue implements ComputeQueue {
         }
         if (!graph.simultaneousUse()) {
             // a command buffer without simultaneous use cannot be enqueued while it is pending
-            OclErrors.check("clFinish", null, () -> clFinish(queue));
+            OclErrors.checkWait("clFinish", null, () -> clFinish(queue));
         }
         commandBuffers.enqueueCommandBuffer(graph.commandBuffer(), queue.getNativePointer(), waits);
     }
@@ -816,7 +816,7 @@ public final class OclComputeQueue implements ComputeQueue {
         }
         RuntimeException failure = null;
         try {
-            OclErrors.check("clFinish", null, () -> clFinish(queue));
+            OclErrors.checkWait("clFinish", null, () -> clFinish(queue));
         } catch (RuntimeException e) {
             failure = e;
         }
@@ -852,10 +852,8 @@ public final class OclComputeQueue implements ComputeQueue {
     public void finish() {
         ensureOpen();
         uncapturable("a queue synchronization");
-        OclErrors.check("clFinish", null, () -> clFinish(queue));
+        OclErrors.checkWait("clFinish", null, () -> clFinish(queue));
         drainTiming();
-
-        // clFinish completes the device work, but JOCL runs each read's CL_COMPLETE callback on a
 
         // clFinish completes the device work, but JOCL runs each read's CL_COMPLETE callback on a
         // driver thread that may not have run yet. Every callback reads its staging buffer, so all
