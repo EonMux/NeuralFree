@@ -1,5 +1,10 @@
 package com.eonmux.neuralfree.gguf.kernels;
 
+import com.eonmux.neuralfree.gguf.GGMLType;
+
+import java.util.EnumSet;
+import java.util.Set;
+
 /**
  * Java mirror of the model-independent compile-time constants of the LLM kernels
  * ({@code kernels/llm/common/config.h}) and of the engine's kernel-selection thresholds.
@@ -19,9 +24,15 @@ public final class LlmKernelConstants {
     /** Largest number of query heads per flash-decode work-group; {@code NF_FD_MAX_G}. */
     public static final int FD_MAX_G = 16;
     /**
+     * Head-dim limit of the flash-decode shuffle fast path (one coalesced row float4 per lane covers
+     * {@code 32 * 4} dims); {@code NF_FA_FAST_DIM}.
+     */
+    public static final int FA_FAST_DIM = 128;
+    /**
      * Smallest token count for which projections of a weight without a fast GEMM lane use the tiled GEMM
-     * kernels instead of batched matvec. Weights with a fast lane cross over earlier, at
-     * {@link #FAST_GEMM_MIN_TOKENS}.
+     * kernels instead of batched matvec. Weights with a fast lane cross over at the row count
+     * {@link com.eonmux.neuralfree.gguf.gpu.forward.SmallBatchCrossover} measured for their device kind,
+     * type and projection size.
      */
     public static final int TILED_MIN_TOKENS = 8;
     /**
@@ -40,16 +51,46 @@ public final class LlmKernelConstants {
      */
     public static final int MATVEC_N_DISPATCH_MAX = 8;
     /**
-     * Smallest token count the fast GEMM lanes serve; with a lane present the multi-column matvec keeps
-     * only the groups below it and the single row keeps the one-row matvec. The cap is the measured
-     * crossover: the GEMM lanes' cost is flat in the row count while the matvec pays its integer dots per
-     * row. On an RTX 5080 Laptop over Qwen3-Embedding-4B Q8_0 with the shared-memory stage pipeline, one
-     * projection-forward step through the GEMM lanes costs 27.5 ms at 2 rows and stays at 27.0 to 30.0 ms
-     * from 4 to 16 rows, against 17.4 ms on the multi-column matvec at 2 rows and 29.6 ms at 4 rows — the
-     * matvec wins at 2 rows, loses at 4, and interpolating its per-row cost puts the tie at 3, so 4 is
-     * the first count the lane serves.
+     * Largest token-row count the counted multi-column integer-dot matvec forms instantiate
+     * ({@code NF_MVQN_NC_TOP} of {@code common/matvec_family.h}); every type instantiates
+     * 2..{@link #MATVEC_N_DISPATCH_MAX} by default, and {@link #countedMaxTokens} answers which
+     * types go past it.
      */
-    public static final int FAST_GEMM_MIN_TOKENS = 4;
+    public static final int MATVEC_N_COUNTED_MAX = 16;
+
+    /** The types whose counted multi-column forms instantiate past {@link #MATVEC_N_DISPATCH_MAX}. */
+    private static final Set<GGMLType> COUNTED_PAST_DISPATCH_MAX = EnumSet.of(GGMLType.Q8_0,
+            GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K, GGMLType.IQ4_XS);
+
+    /**
+     * The widest exact token count {@code type}'s counted multi-column matvec forms instantiate
+     * ({@code {T}_MatVecN<n>_Q8} / {@code {T}_MatVec2N<n>_Q8}): {@link #MATVEC_N_COUNTED_MAX} for
+     * the types whose measured dispatch serves exact counts above {@link #MATVEC_N_DISPATCH_MAX}
+     * (Q8_0, and the K-quant, Q4_0 and IQ4_XS types whose kernels instantiate
+     * {@code IQ_MVQN_NC_HIGH}), {@link #MATVEC_N_DISPATCH_MAX} for every other type.
+     */
+    public static int countedMaxTokens(GGMLType type) {
+        return COUNTED_PAST_DISPATCH_MAX.contains(type) ? MATVEC_N_COUNTED_MAX : MATVEC_N_DISPATCH_MAX;
+    }
+
+    /**
+     * The exact-token-count twin of a multi-column matvec kernel: the token count inserted after the
+     * {@code MatVecN} name segment ({@code {T}_MatVecN_Q8} at four tokens gives {@code {T}_MatVecN4_Q8}).
+     * Returns {@code kernel} unchanged when it has no {@code MatVecN} segment or {@code nTokens} lies
+     * outside the instantiated range; the projection dispatch additionally serves the twin only when
+     * the library instantiates it and it is ready at the matvec work-group size.
+     */
+    public static String countedMatvecNName(String kernel, int nTokens) {
+        if (nTokens < 2 || nTokens > MATVEC_N_MAX_TOKENS) {
+            return kernel;
+        }
+        int at = kernel.indexOf("MatVecN");
+        if (at < 0) {
+            return kernel;
+        }
+        return kernel.substring(0, at + "MatVecN".length()) + nTokens
+                + kernel.substring(at + "MatVecN".length());
+    }
 
     private LlmKernelConstants() {
     }

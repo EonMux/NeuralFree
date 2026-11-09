@@ -1,4 +1,4 @@
-/* matvec_f16_bf16.cl - F16 and BF16 matvec, fused gate/up, logits, batch matmul and embedding kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/quant_blocks.h */
+/* matvec_f16_bf16.cl - F16 and BF16 matvec, fused gate/up, logits, batch matmul, multi-column matvec and embedding kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/matvec_n.h, common/quant_blocks.h */
 /*
  * Same launch contract as matvec_f32.cl: row kernels run one workgroup per output row with
  * global = rows * L, local = L (L a power of two <= LLM_DIMX; CUDA: a multiple of 32), the _2D forms
@@ -96,8 +96,56 @@ NF_INLINE void nf_mvbf16_partial_dual(NF_GLOBAL const ushort* NF_RESTRICT g,
 
 /* ================================ BF16 ================================ */
 
+/* This work-item's register partials of dot(weight row at wrow, float rows t in [0, n_tokens)) for
+ * BF16 w, the nf_mvbf16_partial element mapping walked per token with the weight words read once:
+ * float4 strides lid*4, lid*4 + L*4, ... over the multiple-of-4 prefix and a scalar tail. */
+NF_INLINE void nf_mvbf16_row_partial_n(NF_GLOBAL const ushort* NF_RESTRICT wrow,
+                                       NF_GLOBAL const float* NF_RESTRICT x, const int n,
+                                       const int n_tokens, float* ps) {
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int n4 = n & ~3;
+#pragma unroll
+    for (int j = 0; j < NF_MVQN_MAX; j++) ps[j] = 0.0f;
+    for (int i = lid * 4; i < n4; i += lsize * 4) {
+        const float4 wv = nf_mvbf16_load4(wrow + i);
+#pragma unroll
+        for (int t = 0; t < NF_MVQN_MAX; t++) {
+            if (t < n_tokens) ps[t] += dot(wv, vload4(0, x + (nf_i64)t * n + i));
+        }
+    }
+    for (int i = n4 + lid; i < n; i += lsize) {
+        const float wv = bf16_to_f32(wrow[i]);
+#pragma unroll
+        for (int t = 0; t < NF_MVQN_MAX; t++) {
+            if (t < n_tokens) ps[t] += wv * x[(nf_i64)t * n + i];
+        }
+    }
+}
+
+/* BF16_MatVec over n_tokens consecutive float rows in one launch (n_tokens in [1, NF_MVQN_MAX]):
+ * the weight row is streamed once and dotted against every live token row, where one BF16_MatVec
+ * per token re-reads the row per token. Token t's dot lands at output[t * out_dim + row], and
+ * NF_MVQTN_TREE reduces the group in one pass, so token t's result is the exact single-row result. */
+NF_REQD_SG_ATTR NF_KERNEL void BF16_MatVecN(
+    const int out_dim,
+    const int in_dim,
+    const int n_tokens,
+    NF_GLOBAL const ushort* NF_RESTRICT weight,
+    NF_GLOBAL const float* NF_RESTRICT input,
+    NF_GLOBAL float* NF_RESTRICT output)
+{
+    const int row = get_group_id(0);
+    if (row >= out_dim) return;
+
+    float ps[NF_MVQN_MAX];
+    nf_mvbf16_row_partial_n(weight + (nf_i64)row * in_dim, input, in_dim, n_tokens, ps);
+    NF_LOCAL float ts[NF_MVQN_MAX * NF_MVQTN_SLOTS];
+    NF_MVQTN_TREE(ts, ps, n_tokens, output, out_dim, row)
+}
+
 /* output[row] = dot(weight[row, :], input). */
-NF_KERNEL void BF16_MatVec(
+NF_REQD_SG_ATTR NF_KERNEL void BF16_MatVec(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const ushort* NF_RESTRICT weight,
@@ -113,7 +161,7 @@ NF_KERNEL void BF16_MatVec(
 }
 
 /* addend_output[row] += dot(weight[row, :], input). */
-NF_KERNEL void BF16_MatVecAdd(
+NF_REQD_SG_ATTR NF_KERNEL void BF16_MatVecAdd(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const ushort* NF_RESTRICT weight,
@@ -141,7 +189,7 @@ NF_KERNEL void BF16_EmbeddingLookup(
 }
 
 /* output[row] = silu(dot(gate_weight[row, :], input)) * dot(up_weight[row, :], input). */
-NF_KERNEL void BF16_MatVecFusedGateUp(
+NF_REQD_SG_ATTR NF_KERNEL void BF16_MatVecFusedGateUp(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const ushort* NF_RESTRICT gate_weight,
@@ -166,7 +214,7 @@ NF_KERNEL void BF16_MatVecFusedGateUp(
 }
 
 /* logits[row] = dot(weight[row, :], hidden). */
-NF_KERNEL void BF16_ComputeLogits(
+NF_REQD_SG_ATTR NF_KERNEL void BF16_ComputeLogits(
     const int vocab_size,
     const int embed_dim,
     NF_GLOBAL const ushort* NF_RESTRICT weight,
@@ -198,7 +246,7 @@ NF_KERNEL void BF16_BatchEmbeddingLookup(
 }
 
 /* output[s * out_dim + row] = dot(weight[row, :], input[s, :]) for s in [0, seq_len). */
-NF_KERNEL void BF16_BatchMatMul(
+NF_REQD_SG_ATTR NF_KERNEL void BF16_BatchMatMul(
     const int out_dim,
     const int in_dim,
     const int seq_len,
@@ -218,7 +266,7 @@ NF_KERNEL void BF16_BatchMatMul(
 }
 
 /* BF16_BatchMatMul with one (row, token) pair per workgroup. */
-NF_KERNEL void BF16_BatchMatMul_2D(
+NF_REQD_SG_ATTR NF_KERNEL void BF16_BatchMatMul_2D(
     const int out_dim,
     const int in_dim,
     const int seq_len,
@@ -238,8 +286,54 @@ NF_KERNEL void BF16_BatchMatMul_2D(
 
 /* ================================ F16 ================================= */
 
+/* nf_mvbf16_row_partial_n for F16 w. */
+NF_INLINE void nf_mvf16_row_partial_n(NF_GLOBAL const NF_HALF* NF_RESTRICT wrow,
+                                      NF_GLOBAL const float* NF_RESTRICT x, const int n,
+                                      const int n_tokens, float* ps) {
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int n4 = n & ~3;
+#pragma unroll
+    for (int j = 0; j < NF_MVQN_MAX; j++) ps[j] = 0.0f;
+    for (int i = lid * 4; i < n4; i += lsize * 4) {
+        const float4 wv = vload_half4(0, wrow + i);
+#pragma unroll
+        for (int t = 0; t < NF_MVQN_MAX; t++) {
+            if (t < n_tokens) ps[t] += dot(wv, vload4(0, x + (nf_i64)t * n + i));
+        }
+    }
+    for (int i = n4 + lid; i < n; i += lsize) {
+        const float wv = vload_half(0, wrow + i);
+#pragma unroll
+        for (int t = 0; t < NF_MVQN_MAX; t++) {
+            if (t < n_tokens) ps[t] += wv * x[(nf_i64)t * n + i];
+        }
+    }
+}
+
+/* F16_MatVec over n_tokens consecutive float rows in one launch (n_tokens in [1, NF_MVQN_MAX]):
+ * the weight row is streamed once and dotted against every live token row, where one F16_MatVec
+ * per token re-reads the row per token. Token t's dot lands at output[t * out_dim + row], and
+ * NF_MVQTN_TREE reduces the group in one pass, so token t's result is the exact single-row result. */
+NF_REQD_SG_ATTR NF_KERNEL void F16_MatVecN(
+    const int out_dim,
+    const int in_dim,
+    const int n_tokens,
+    NF_GLOBAL const NF_HALF* NF_RESTRICT weight,
+    NF_GLOBAL const float* NF_RESTRICT input,
+    NF_GLOBAL float* NF_RESTRICT output)
+{
+    const int row = get_group_id(0);
+    if (row >= out_dim) return;
+
+    float ps[NF_MVQN_MAX];
+    nf_mvf16_row_partial_n(weight + (nf_i64)row * in_dim, input, in_dim, n_tokens, ps);
+    NF_LOCAL float ts[NF_MVQN_MAX * NF_MVQTN_SLOTS];
+    NF_MVQTN_TREE(ts, ps, n_tokens, output, out_dim, row)
+}
+
 /* output[row] = dot(weight[row, :], input). */
-NF_KERNEL void F16_MatVec(
+NF_REQD_SG_ATTR NF_KERNEL void F16_MatVec(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const NF_HALF* NF_RESTRICT weight,
@@ -255,7 +349,7 @@ NF_KERNEL void F16_MatVec(
 }
 
 /* addend_output[row] += dot(weight[row, :], input). */
-NF_KERNEL void F16_MatVecAdd(
+NF_REQD_SG_ATTR NF_KERNEL void F16_MatVecAdd(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const NF_HALF* NF_RESTRICT weight,
@@ -283,7 +377,7 @@ NF_KERNEL void F16_EmbeddingLookup(
 }
 
 /* output[row] = silu(dot(gate_weight[row, :], input)) * dot(up_weight[row, :], input). */
-NF_KERNEL void F16_MatVecFusedGateUp(
+NF_REQD_SG_ATTR NF_KERNEL void F16_MatVecFusedGateUp(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const NF_HALF* NF_RESTRICT gate_weight,
@@ -308,7 +402,7 @@ NF_KERNEL void F16_MatVecFusedGateUp(
 }
 
 /* logits[row] = dot(weight[row, :], hidden). */
-NF_KERNEL void F16_ComputeLogits(
+NF_REQD_SG_ATTR NF_KERNEL void F16_ComputeLogits(
     const int vocab_size,
     const int embed_dim,
     NF_GLOBAL const NF_HALF* NF_RESTRICT weight,
@@ -340,7 +434,7 @@ NF_KERNEL void F16_BatchEmbeddingLookup(
 }
 
 /* output[s * out_dim + row] = dot(weight[row, :], input[s, :]) for s in [0, seq_len). */
-NF_KERNEL void F16_BatchMatMul(
+NF_REQD_SG_ATTR NF_KERNEL void F16_BatchMatMul(
     const int out_dim,
     const int in_dim,
     const int seq_len,
@@ -360,7 +454,7 @@ NF_KERNEL void F16_BatchMatMul(
 }
 
 /* F16_BatchMatMul with one (row, token) pair per workgroup. */
-NF_KERNEL void F16_BatchMatMul_2D(
+NF_REQD_SG_ATTR NF_KERNEL void F16_BatchMatMul_2D(
     const int out_dim,
     const int in_dim,
     const int seq_len,

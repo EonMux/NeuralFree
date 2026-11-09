@@ -150,7 +150,7 @@ public final class BatchModelDrafter implements BatchDrafter {
                     + ") does not generate text autoregressively");
         }
         if (treeBranches >= 1) {
-            BatchEngine.checkBatchTreeAttention("draft model " + draft.name(), draft.spec());
+            BatchEngineFactory.checkBatchTreeAttention("draft model " + draft.name(), draft.spec());
         }
         this.target = pagedOf(targetModel, "target");
         this.draftSequences = pagedOf(draft, "draft model");

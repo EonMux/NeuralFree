@@ -316,7 +316,8 @@ final class DiskBlockCache {
     private final Map<PrefetchKey, Prefetch> prefetches = new HashMap<>();
     /** Events shutdown produced after the last {@link #pump}, answered by the next one. */
     private final List<Event> deferred = new ArrayList<>();
-    private final AtomicInteger inFlightWrites = new AtomicInteger();
+    /** Admitted writes the writer has not finished: queued, taken, or executing; the drains wait for it to empty. */
+    private final AtomicInteger unfinishedWrites = new AtomicInteger();
     private final Thread writer;
     private volatile boolean closed;
 
@@ -495,7 +496,11 @@ final class DiskBlockCache {
         Pending p = new Pending(entry, blob, file);
         pending.put(k, p);
         pendingChildren.computeIfAbsent(p.parentKey, h -> new ArrayList<>(2)).add(p);
+        // the slot is taken before the job is visible to the writer, which releases it when the outcome joins
+        // written; counting after the offer would let a fast writer finish the job first
+        unfinishedWrites.incrementAndGet();
         if (!writes.offer(Write.store(p))) {
+            unfinishedWrites.decrementAndGet();
             pending.remove(k);
             unlinkPending(p);
             return Spill.NOT_STORED;
@@ -1053,7 +1058,7 @@ final class DiskBlockCache {
     /** Waits (bounded) for queued and in-flight writes, deleting the files they produced. */
     private void awaitInFlightWrites(long millis) {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
-        while ((!writes.isEmpty() || inFlightWrites.get() > 0) && System.nanoTime() < deadline) {
+        while (unfinishedWrites.get() > 0 && System.nanoTime() < deadline) {
             discardWritten();
             sleepBriefly();
         }
@@ -1088,6 +1093,7 @@ final class DiskBlockCache {
                 job = writes.take();
             } catch (InterruptedException e) {
                 if (closed) {
+                    finishAbandonedWrites();
                     return;
                 }
                 continue;
@@ -1101,18 +1107,35 @@ final class DiskBlockCache {
             }
             Pending p = job.pending;
             if (p.cancelled) {
-                written.add(new WriteDone(p, false, null));
+                writeDone(new WriteDone(p, false, null));
                 continue;
             }
-            inFlightWrites.incrementAndGet();
             IOException failure = null;
             try {
                 io.write(p.blob, p.file);
             } catch (IOException | RuntimeException e) {
                 failure = e instanceof IOException ? (IOException) e : new IOException(e.toString(), e);
             } finally {
-                written.add(new WriteDone(p, failure == null, failure));
-                inFlightWrites.decrementAndGet();
+                writeDone(new WriteDone(p, failure == null, failure));
+            }
+        }
+    }
+
+    /**
+     * Records one finished write: the outcome joins {@link #written} and only then is the drain slot
+     * {@code put} took released, so a drain that observes no unfinished write also sees every outcome.
+     */
+    private void writeDone(WriteDone done) {
+        written.add(done);
+        unfinishedWrites.decrementAndGet();
+    }
+
+    /** Completes every job a shutdown dropped from the queue as cancelled, releasing their drain slots. */
+    private void finishAbandonedWrites() {
+        Write job;
+        while ((job = writes.poll()) != null) {
+            if (job != Write.STOP && job.delete == null) {
+                writeDone(new WriteDone(job.pending, false, null));
             }
         }
     }
@@ -1200,17 +1223,17 @@ final class DiskBlockCache {
         }
         closed = true;
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
-        while ((!writes.isEmpty() || inFlightWrites.get() > 0) && System.nanoTime() < deadline) {
+        while (unfinishedWrites.get() > 0 && System.nanoTime() < deadline) {
             sleepBriefly();
         }
-        if (!writes.isEmpty() || inFlightWrites.get() > 0) {
+        if (unfinishedWrites.get() > 0) {
             LOGGER.warn("disk tier shutdown abandons the writes still pending after {} ms", timeoutMillis);
             for (Pending p : pending.values()) {
                 p.cancelled = true;
             }
             pending.clear();
             pendingChildren.clear();
-            writes.clear();
+            // the interrupted writer completes the queued jobs as cancelled, releasing their drain slots
             writer.interrupt();
         }
         if (!writes.offer(Write.STOP)) {
@@ -1237,14 +1260,21 @@ final class DiskBlockCache {
 
     /**
      * Waits at most {@code millis} for the admitted writes to become durable, without indexing them; the caller
-     * drains the results with {@link #pump}. True when every write finished.
+     * drains the results with {@link #pump}, which answers every finished write's events once this returned true.
+     * True when every write finished: the single counter {@link #unfinishedWrites} read at the end answers
+     * exactly, with no gap where a taken-but-not-started write looks drained.
      */
     boolean awaitWrites(long millis) {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
-        while ((!writes.isEmpty() || inFlightWrites.get() > 0) && System.nanoTime() < deadline) {
+        while (unfinishedWrites.get() > 0 && System.nanoTime() < deadline) {
             sleepBriefly();
         }
-        return writes.isEmpty() && inFlightWrites.get() == 0;
+        return unfinishedWrites.get() == 0;
+    }
+
+    /** The admitted writes the writer has not finished: queued, taken, or executing. */
+    int unfinishedWriteCount() {
+        return unfinishedWrites.get();
     }
 
     // ------------------------------------------------------------------ index

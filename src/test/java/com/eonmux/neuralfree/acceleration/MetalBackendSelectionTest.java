@@ -36,7 +36,7 @@ public class MetalBackendSelectionTest {
                 view(BackendType.METAL, APPLE_GPU, metal),
                 view(BackendType.VULKAN, APPLE_GPU, vulkan));
 
-        BackendSelector.Selection selection = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER,
+        BackendSelector.Selection selection = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false,
                 null, BackendRequirement.ANY);
 
         assertNotNull(selection.backend);
@@ -55,7 +55,7 @@ public class MetalBackendSelectionTest {
                 view(BackendType.METAL, APPLE_GPU, metal),
                 view(BackendType.VULKAN, APPLE_GPU, vulkan));
 
-        BackendSelector.Selection selection = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER,
+        BackendSelector.Selection selection = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false,
                 null, backend -> backend.backendType() == BackendType.METAL ? "the Metal kernels are unavailable"
                         : null);
 

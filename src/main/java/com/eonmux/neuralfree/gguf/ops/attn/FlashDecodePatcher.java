@@ -145,10 +145,18 @@ final class FlashDecodePatcher implements GpuStepPatcher {
         return false;
     }
 
+    /** True when this patcher claimed the decode dispatch of the current capture. */
+    boolean claimed() {
+        return decodeIdx >= 0;
+    }
+
     @Override
     public boolean verify(int pos) {
+        if (decodeIdx < 0) {
+            return false;
+        }
         Step step = stepOf(pos);
-        if (decodeIdx < 0 || !patternMatches(step)) {
+        if (!patternMatches(step)) {
             return false;
         }
         boolean ok = intOf(decode.argValue(AttnKernels.ARG_FD_N_SPLIT)) == step.layoutSplits

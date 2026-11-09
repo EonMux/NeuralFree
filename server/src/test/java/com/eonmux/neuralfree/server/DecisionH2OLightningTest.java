@@ -286,7 +286,7 @@ class DecisionH2OLightningTest {
     private static double[] labelProbabilities(EngineService model, String prompt, float temperature)
             throws IOException {
         int[] tokens = model.encode(prompt, false, true);
-        float[] logits = model.nextLogits(null, tokens);
+        float[] logits = model.pooling().nextLogits(null, tokens);
         float[] scores = new float[2];
         String[] labels = {" yes", " no"};
         for (int i = 0; i < 2; i++) {
@@ -311,7 +311,7 @@ class DecisionH2OLightningTest {
                 .decisionItems(List.of(image), "files");
         com.eonmux.neuralfree.gguf.engine.MediaPrompt prompt = mediaService.media().prompt(rendered, items,
                 List.of(), -1, text -> mediaService.encode(text, false, true));
-        float[] logits = mediaService.nextLogits(null, prompt);
+        float[] logits = mediaService.pooling().nextLogits(null, prompt);
         float[] scores = new float[2];
         String[] labels = {" yes", " no"};
         for (int i = 0; i < 2; i++) {

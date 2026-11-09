@@ -7,7 +7,10 @@
  *   T_BatchEmbeddingLookup, T_BatchMatMul, T_BatchMatMul_2D
  * with one argument list per kernel form, shared by every weight type. IQ_ALL_KERNELS_Q8(T, BS, BB, TPS)
  * instantiates the Q8_1-activation forms T_MatVec_Q8, T_MatVecN_Q8, T_MatVec2_Q8, T_MatVecAdd_Q8,
- * T_MatVecFusedGateUp_Q8 and T_MatVec2FusedGateUp_Q8.
+ * T_MatVecFusedGateUp_Q8 and T_MatVec2FusedGateUp_Q8, plus the counted multi-column forms
+ * T_MatVecN<nc>_Q8 and T_MatVec2N<nc>_Q8 for nc = 2..IQ_MVQN_NC_MAX (a type serving larger exact
+ * counts instantiates IQ_MVQN_NC_HIGH beside the all-kernels macro, which adds the pairs up to
+ * IQ_MVQN_NC_TOP).
  *
  * Decoder contract the instantiating file must define before the instantiation:
  *   NF_INLINE float T_decode(NF_GLOBAL const uchar* bp, NF_GLOBAL const float* input,
@@ -20,14 +23,24 @@
  *       Same as T_decode for two weight rows sharing the input; accumulates into *gs and *us.
  *   NF_INLINE float T_decode_elem(NF_GLOBAL const uchar* weight, int dim, int tok, int i);
  *       Element i of row tok of a [rows x dim] weight; forms the row byte offset in nf_i64.
+ *   NF_INLINE float T_decode_q8(NF_GLOBAL const uchar* bp, NF_GLOBAL const uchar* xq,
+ *                               int blk, int ltid);
+ *       Partial integer dot of block blk (bytes at bp) with the Q8_1 activation block at the same
+ *       blk of xq, scaled to float; the TPS partial sums of a block add to the full dot.
+ *   NF_INLINE void T_decode_q8_dual(NF_GLOBAL const uchar* bp0, NF_GLOBAL const uchar* bp1,
+ *                                   NF_GLOBAL const uchar* xq, int blk, int ltid,
+ *                                   float* gs, float* us);
+ *       Same as T_decode_q8 for two weight blocks sharing the activation block; accumulates into
+ *       *gs and *us.
  *
  * Launch contract: matvec forms use global = rows * L, local = L (L a power of two <= LLM_DIMX and a
  * multiple of TPS; CUDA: multiple of 32); T_MatVec2 and T_MatVec2FusedGateUp use global = ceil(rows / 2) * L; _2D uses
  * global = {rows * L, seq_len}, local = {L, 1}; embedding forms are 1-D element grids. The Q8_1-activation
- * forms keep the same geometry, including T_MatVec2_Q8 and T_MatVec2FusedGateUp_Q8 at ceil(rows / 2) * L.
- * Row byte
+ * forms keep the same geometry, including T_MatVec2_Q8, T_MatVec2FusedGateUp_Q8, T_MatVec2N<nc>_Q8 at
+ * ceil(rows / 2) * L. Row byte
  * offsets and token-row element offsets are nf_i64. T_MatVecN_Q8 keeps global = rows * L and takes
- * n_tokens consecutive Q8_1 rows. The `row >= rows` and `s >= seq_len` early
+ * n_tokens consecutive Q8_1 rows; T_MatVecN<nc>_Q8 keeps it and serves exactly nc of them. The
+ * `row >= rows` and `s >= seq_len` early
  * returns are uniform per workgroup, so every barrier is reached by all work-items of a live
  * workgroup; IQ_MATVECN_Q8's `j < n_tokens` guards are uniform too (n_tokens is a kernel scalar).
  */
@@ -35,7 +48,7 @@
 #define NF_MATVEC_FAMILY_H
 
 #define IQ_MATVEC(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVec( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const float* NF_RESTRICT input, \
@@ -62,7 +75,7 @@ NF_KERNEL void N##_MatVec( \
  * accumulator and drops its store, so the tail workgroup stays barrier-uniform.
  */
 #define IQ_MATVEC2(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVec2( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const float* NF_RESTRICT input, \
@@ -91,7 +104,7 @@ NF_KERNEL void N##_MatVec2( \
 }
 
 #define IQ_MATVECADD(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVecAdd( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecAdd( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const float* NF_RESTRICT input, \
@@ -111,7 +124,7 @@ NF_KERNEL void N##_MatVecAdd( \
 }
 
 #define IQ_FUSEDGATEUP(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVecFusedGateUp( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecFusedGateUp( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT gate_weight, \
     NF_GLOBAL const uchar* NF_RESTRICT up_weight, \
@@ -143,7 +156,7 @@ NF_KERNEL void N##_MatVecFusedGateUp( \
  * odd pair's second accumulators and drops its store, so the tail workgroup stays barrier-uniform.
  */
 #define IQ_FUSEDGATEUP2(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVec2FusedGateUp( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2FusedGateUp( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT gate_weight, \
     NF_GLOBAL const uchar* NF_RESTRICT up_weight, \
@@ -181,7 +194,7 @@ NF_KERNEL void N##_MatVec2FusedGateUp( \
 }
 
 #define IQ_COMPUTELOGITS(N, BS, BB, TPS) \
-NF_KERNEL void N##_ComputeLogits( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_ComputeLogits( \
     const int vocab_size, const int embed_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const float* NF_RESTRICT hidden, \
@@ -223,7 +236,7 @@ NF_KERNEL void N##_BatchEmbeddingLookup( \
 }
 
 #define IQ_BATCHMATMUL(N, BS, BB, TPS) \
-NF_KERNEL void N##_BatchMatMul( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_BatchMatMul( \
     const int out_dim, const int in_dim, const int seq_len, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const float* NF_RESTRICT input, \
@@ -247,7 +260,7 @@ NF_KERNEL void N##_BatchMatMul( \
 }
 
 #define IQ_BATCHMATMUL2D(N, BS, BB, TPS) \
-NF_KERNEL void N##_BatchMatMul_2D( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_BatchMatMul_2D( \
     const int out_dim, const int in_dim, const int seq_len, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const float* NF_RESTRICT input, \
@@ -288,7 +301,7 @@ NF_KERNEL void N##_BatchMatMul_2D( \
  * single Q8_1 row once per row pair.
  */
 #define IQ_MATVEC_Q8(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVec_Q8( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec_Q8( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uchar* NF_RESTRICT input, \
@@ -323,66 +336,111 @@ NF_KERNEL void N##_MatVec_Q8( \
  * token count. Each token slot still takes the exact REDUCE_SUM steps in the same order, so the
  * per-token results equal the single-row kernel's. The CUDA and HIP warps are 32 lanes
  * (common/dialect.h), so their form stages the per-warp sums of every token in one leader slot
- * table (IQ_MVQN_LEADER_SLOTS entries per token) and trees over the slots; the other dialects
- * stage every lane's partial of every token and need NF_MVQN_MAX * LLM_DIMX floats of local
- * memory, within the 32 KiB the OpenCL spec guarantees.
+ * table (IQ_MVQN_LEADER_SLOTS entries per token) and trees over the slots. OpenCL with subgroups
+ * takes the subgroup steps of REDUCE_SUM applied to every token in lockstep; without them it
+ * stages every lane's partial of every token and needs NF_MVQN_MAX * LLM_DIMX floats of local
+ * memory, within the 32 KiB the OpenCL spec guarantees. NF_REQD_SG_SIZE (the host define of
+ * OpenClKernelLibrary) holds the two kernels of every pair at one subgroup size, which the
+ * bit-exact token results require.
+ *
+ * The counted forms (IQ_MATVECN_NC_Q8 / IQ_MATVEC2N_NC_Q8) reduce through the same
+ * IQ_MVQN_TREE_STEPS with the slot count and the live-token bound as the compile-time token count,
+ * so the guards fold away and the executed steps are exactly the runtime tree's.
  */
-#if defined(USE_SUBGROUPS) && (defined(__CUDACC__) || defined(__HIP__))
+#if defined(USE_SUBGROUPS) && defined(NF_CUDA)
 #define IQ_MVQN_LEADER_SLOTS (LLM_DIMX / 32)
-/* Stages the per-warp sums of every live token in one leader slot table, trees over the slots and
- * writes the tokens' outputs. Reads and rewrites the kernel's register partials `ps`; every lane of
- * every subgroup calls it. */
-#define IQ_MVQN_TREE(ts, lid, lsize, n_tokens, out, out_dim, row) \
+/* Stages the per-warp sums of every token in one leader slot table, trees over the slots and
+ * writes the tokens' outputs, over `nj` token slots with the live tokens bounded by `n_tokens`.
+ * Reads and rewrites the kernel's register partials `ps`; every lane of every subgroup calls it. */
+#define IQ_MVQN_TREE_STEPS(ts, ps, nj, n_tokens, lid, lsize, out, out_dim, row) \
     { \
         const uint nsg = lsize / 32; \
         _Pragma("unroll") \
-        for (int j = 0; j < NF_MVQN_MAX; j++) \
-            if (j < n_tokens) ps[j] = sub_group_reduce_add(ps[j]); \
+        for (int j = 0; j < (nj); j++) \
+            if (j < (n_tokens)) ps[j] = sub_group_reduce_add(ps[j]); \
         if (get_sub_group_local_id() == 0) { \
             _Pragma("unroll") \
-            for (int j = 0; j < NF_MVQN_MAX; j++) \
-                if (j < n_tokens) ts[j * IQ_MVQN_LEADER_SLOTS + get_sub_group_id()] = ps[j]; \
+            for (int j = 0; j < (nj); j++) \
+                if (j < (n_tokens)) ts[j * IQ_MVQN_LEADER_SLOTS + get_sub_group_id()] = ps[j]; \
         } \
         barrier(CLK_LOCAL_MEM_FENCE); \
         for (uint s = nsg >> 1; s > 0; s >>= 1) { \
             if (lid < s) { \
                 _Pragma("unroll") \
-                for (int j = 0; j < NF_MVQN_MAX; j++) \
-                    if (j < n_tokens) ts[j * IQ_MVQN_LEADER_SLOTS + lid] += ts[j * IQ_MVQN_LEADER_SLOTS + lid + s]; \
+                for (int j = 0; j < (nj); j++) \
+                    if (j < (n_tokens)) ts[j * IQ_MVQN_LEADER_SLOTS + lid] += ts[j * IQ_MVQN_LEADER_SLOTS + lid + s]; \
             } \
             barrier(CLK_LOCAL_MEM_FENCE); \
         } \
         if (lid == 0) { \
             _Pragma("unroll") \
-            for (int j = 0; j < NF_MVQN_MAX; j++) \
-                if (j < n_tokens) out[(nf_i64)j * out_dim + row] = ts[j * IQ_MVQN_LEADER_SLOTS]; \
+            for (int j = 0; j < (nj); j++) \
+                if (j < (n_tokens)) out[(nf_i64)j * out_dim + row] = ts[j * IQ_MVQN_LEADER_SLOTS]; \
+        } \
+    }
+#elif defined(USE_SUBGROUPS)
+#define IQ_MVQN_LEADER_SLOTS LLM_DIMX
+/* The subgroup steps of REDUCE_SUM applied to every token in lockstep: the hardware reduction
+ * inside each subgroup per token, the subgroup sums staged at the leader slots and the same stride
+ * tree over the leader slots (the slots are indexed by subgroup id, which the lid * subgroup-size
+ * slots of REDUCE_SUM reduce to), so token j's reduction is the exact REDUCE_SUM the single-row
+ * kernel applies to its row, at the subgroup size NF_REQD_SG_SIZE holds equal for both kernels.
+ * Reads and rewrites the kernel's register partials `ps`; every lane calls it. */
+#define IQ_MVQN_TREE_STEPS(ts, ps, nj, n_tokens, lid, lsize, out, out_dim, row) \
+    { \
+        const uint nf_sgs = get_sub_group_size(); \
+        _Pragma("unroll") \
+        for (int j = 0; j < (nj); j++) \
+            if (j < (n_tokens)) ps[j] = sub_group_reduce_add(ps[j]); \
+        if (get_sub_group_local_id() == 0) { \
+            _Pragma("unroll") \
+            for (int j = 0; j < (nj); j++) \
+                if (j < (n_tokens)) ts[j * IQ_MVQN_LEADER_SLOTS + get_sub_group_id()] = ps[j]; \
+        } \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+        for (uint nf_s = (uint)lsize / (nf_sgs * 2); nf_s > 0; nf_s >>= 1) { \
+            if ((uint)(lid) < nf_s) { \
+                _Pragma("unroll") \
+                for (int j = 0; j < (nj); j++) \
+                    if (j < (n_tokens)) ts[j * IQ_MVQN_LEADER_SLOTS + lid] += ts[j * IQ_MVQN_LEADER_SLOTS + lid + nf_s]; \
+            } \
+            barrier(CLK_LOCAL_MEM_FENCE); \
+        } \
+        if (lid == 0) { \
+            _Pragma("unroll") \
+            for (int j = 0; j < (nj); j++) \
+                if (j < (n_tokens)) out[(nf_i64)j * out_dim + row] = ts[j * IQ_MVQN_LEADER_SLOTS]; \
         } \
     }
 #else
 #define IQ_MVQN_LEADER_SLOTS LLM_DIMX
-/* Stages every lane's partial of every live token, trees over the lanes and writes the tokens'
+/* Stages every lane's partial of every token, trees over the lanes and writes the tokens'
  * outputs. Reads the kernel's register partials `ps`. */
-#define IQ_MVQN_TREE(ts, lid, lsize, n_tokens, out, out_dim, row) \
+#define IQ_MVQN_TREE_STEPS(ts, ps, nj, n_tokens, lid, lsize, out, out_dim, row) \
     { \
         _Pragma("unroll") \
-        for (int j = 0; j < NF_MVQN_MAX; j++) \
-            if (j < n_tokens) ts[j * LLM_DIMX + lid] = ps[j]; \
+        for (int j = 0; j < (nj); j++) \
+            if (j < (n_tokens)) ts[j * LLM_DIMX + lid] = ps[j]; \
         barrier(CLK_LOCAL_MEM_FENCE); \
         for (int stride = lsize >> 1; stride > 0; stride >>= 1) { \
             if (lid < stride) { \
                 _Pragma("unroll") \
-                for (int j = 0; j < NF_MVQN_MAX; j++) \
-                    if (j < n_tokens) ts[j * LLM_DIMX + lid] += ts[j * LLM_DIMX + lid + stride]; \
+                for (int j = 0; j < (nj); j++) \
+                    if (j < (n_tokens)) ts[j * LLM_DIMX + lid] += ts[j * LLM_DIMX + lid + stride]; \
             } \
             barrier(CLK_LOCAL_MEM_FENCE); \
         } \
         if (lid == 0) { \
             _Pragma("unroll") \
-            for (int j = 0; j < NF_MVQN_MAX; j++) \
-                if (j < n_tokens) out[(nf_i64)j * out_dim + row] = ts[j * LLM_DIMX]; \
+            for (int j = 0; j < (nj); j++) \
+                if (j < (n_tokens)) out[(nf_i64)j * out_dim + row] = ts[j * LLM_DIMX]; \
         } \
     }
 #endif
+
+/* The runtime-count tree over the NF_MVQN_MAX register slots with the live-token guards. */
+#define IQ_MVQN_TREE(ts, lid, lsize, n_tokens, out, out_dim, row) \
+    IQ_MVQN_TREE_STEPS(ts, ps, NF_MVQN_MAX, n_tokens, lid, lsize, out, out_dim, row)
 
 /*
  * One workgroup per output row over n_tokens consecutive Q8_1 rows (n_tokens in [1, NF_MVQN_MAX]):
@@ -393,7 +451,7 @@ NF_KERNEL void N##_MatVec_Q8( \
  * output[j * out_dim + row].
  */
 #define IQ_MATVECN_Q8(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVecN_Q8( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecN_Q8( \
     const int out_dim, const int in_dim, const int n_tokens, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uchar* NF_RESTRICT input, \
@@ -420,6 +478,120 @@ NF_KERNEL void N##_MatVecN_Q8( \
 
 
 /*
+ * The counted twins of IQ_MATVECN_Q8: the token count is a compile-time suffix
+ * ({T}_MatVecN<nc>_Q8 takes the same five arguments as IQ_MATVEC_Q8 and serves exactly nc rows,
+ * global = rows * L), so the token loop fully unrolls, the j < n_tokens guards fold away and the
+ * push block drops the runtime count. The block loop, the accumulation order and the reduction
+ * (IQ_MVQN_TREE_STEPS at slot count nc) are the exact steps of the runtime-count kernel at
+ * n_tokens = nc, and token j's result is the exact IQ_MATVEC_Q8 bit for bit.
+ */
+#define IQ_MATVECN_NC_Q8(N, BS, BB, TPS, NC) \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecN##NC##_Q8( \
+    const int out_dim, const int in_dim, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uchar* NF_RESTRICT input, \
+    NF_GLOBAL float* NF_RESTRICT output) { \
+    const int row = get_group_id(0); \
+    if (row >= out_dim) return; \
+    const int lid = get_local_id(0), lsize = get_local_size(0); \
+    const int sblk = in_dim / BS; \
+    const nf_i64 qrow = (nf_i64)(in_dim / Q8_1_BLOCK_SIZE) * Q8_1_BLOCK_BYTES; \
+    NF_GLOBAL const uchar* wrow = weight + (nf_i64)row * sblk * BB; \
+    const int gpi = lsize / TPS, gid = lid / TPS, ltid = lid % TPS; \
+    float ps[(NC)]; \
+    _Pragma("unroll") \
+    for (int j = 0; j < (NC); j++) ps[j] = 0.0f; \
+    for (int b = gid; b < sblk; b += gpi) { \
+        NF_GLOBAL const uchar* bp = wrow + (nf_i64)b * BB; \
+        _Pragma("unroll") \
+        for (int j = 0; j < (NC); j++) ps[j] += N##_decode_q8(bp, input + (nf_i64)j * qrow, b, ltid); \
+    } \
+    NF_LOCAL float ts[(NC) * IQ_MVQN_LEADER_SLOTS]; \
+    IQ_MVQN_TREE_STEPS(ts, ps, (NC), (NC), lid, lsize, output, out_dim, row) \
+}
+
+/*
+ * The counted twin of IQ_MATVEC2_Q8: pair geometry over the nc activation rows
+ * ({T}_MatVec2N<nc>_Q8, global = ceil(rows / 2) * L), so two weight rows are streamed per block
+ * loop. Each row keeps its own register partials over the nc tokens, accumulated in the exact
+ * single-row order, and the two token groups reduce through IQ_MVQN_TREE_STEPS one after the
+ * other (the fence between the trees orders a tree's final reads before the next tree's slot
+ * writes); token j's result is the exact IQ_MATVEC_Q8 bit for bit. An odd row count repeats the
+ * last row's weights into the odd pair's second accumulators and drops its store, so the tail
+ * workgroup stays barrier-uniform.
+ */
+#define IQ_MATVEC2N_NC_Q8(N, BS, BB, TPS, NC) \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2N##NC##_Q8( \
+    const int out_dim, const int in_dim, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uchar* NF_RESTRICT input, \
+    NF_GLOBAL float* NF_RESTRICT output) { \
+    const int pair = get_group_id(0); \
+    const int row0 = pair * 2; \
+    if (row0 >= out_dim) return; \
+    const int row1 = min(row0 + 1, out_dim - 1); \
+    const int lid = get_local_id(0), lsize = get_local_size(0); \
+    const int sblk = in_dim / BS; \
+    const nf_i64 rbase = (nf_i64)sblk * BB; \
+    const nf_i64 qrow = (nf_i64)(in_dim / Q8_1_BLOCK_SIZE) * Q8_1_BLOCK_BYTES; \
+    NF_GLOBAL const uchar* w0 = weight + (nf_i64)row0 * rbase; \
+    NF_GLOBAL const uchar* w1 = weight + (nf_i64)row1 * rbase; \
+    const int gpi = lsize / TPS, gid = lid / TPS, ltid = lid % TPS; \
+    float ps0[(NC)], ps1[(NC)]; \
+    _Pragma("unroll") \
+    for (int j = 0; j < (NC); j++) { ps0[j] = 0.0f; ps1[j] = 0.0f; } \
+    for (int b = gid; b < sblk; b += gpi) { \
+        NF_GLOBAL const uchar* bp0 = w0 + (nf_i64)b * BB; \
+        NF_GLOBAL const uchar* bp1 = w1 + (nf_i64)b * BB; \
+        _Pragma("unroll") \
+        for (int j = 0; j < (NC); j++) \
+            ps0[j] += N##_decode_q8(bp0, input + (nf_i64)j * qrow, b, ltid); \
+        _Pragma("unroll") \
+        for (int j = 0; j < (NC); j++) \
+            ps1[j] += N##_decode_q8(bp1, input + (nf_i64)j * qrow, b, ltid); \
+    } \
+    NF_LOCAL float ts[(NC) * IQ_MVQN_LEADER_SLOTS]; \
+    IQ_MVQN_TREE_STEPS(ts, ps0, (NC), (NC), lid, lsize, output, out_dim, row0) \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+    IQ_MVQN_TREE_STEPS(ts, ps1, (NC), (NC), lid, lsize, output, out_dim, row1) \
+}
+
+/*
+ * The counted token counts a type instantiates by default: 2 to IQ_MVQN_NC_MAX, the range the
+ * small-batch dispatch selects by default (LlmKernelConstants.MATVEC_N_DISPATCH_MAX, matching
+ * llama.cpp's mmvq, which instantiates ncols_dst 2..8 and hands larger token groups to its tiled
+ * MMQ kernel). IQ_MVQN_NC_TOP is the widest count the macros generate (NF_MVQN_MAX, the runtime
+ * form's bound): the types whose measured dispatch serves exact counts above IQ_MVQN_NC_MAX
+ * instantiate IQ_MVQN_NC_HIGH beside IQ_ALL_KERNELS_Q8 to the top.
+ */
+#define IQ_MVQN_NC_MAX 8
+#define IQ_MVQN_NC_TOP 16
+
+#define IQ_MVQN_NC_ONE(N, BS, BB, TPS, nc) \
+    IQ_MATVECN_NC_Q8(N, BS, BB, TPS, nc) \
+    IQ_MATVEC2N_NC_Q8(N, BS, BB, TPS, nc)
+
+#define IQ_MVQN_NC_COUNTS(N, BS, BB, TPS) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 2) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 3) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 4) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 5) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 6) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 7) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 8)
+
+#define IQ_MVQN_NC_HIGH(N, BS, BB, TPS) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 9) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 10) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 11) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 12) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 13) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 14) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 15) \
+    IQ_MVQN_NC_ONE(N, BS, BB, TPS, 16)
+
+
+/*
  * Two output rows per workgroup over the Q8_1 activation row: the integer-dot twin of IQ_MATVEC2.
  * Pair p covers rows 2p and 2p+1, so the activation row is read once per two weight rows, and
  * decode_q8_dual decodes both weight blocks against the same activation group. An odd row count
@@ -427,7 +599,7 @@ NF_KERNEL void N##_MatVecN_Q8( \
  * tail workgroup stays barrier-uniform.
  */
 #define IQ_MATVEC2_Q8(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVec2_Q8( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2_Q8( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uchar* NF_RESTRICT input, \
@@ -456,7 +628,7 @@ NF_KERNEL void N##_MatVec2_Q8( \
 }
 
 #define IQ_MATVECADD_Q8(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVecAdd_Q8( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecAdd_Q8( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uchar* NF_RESTRICT input, \
@@ -476,7 +648,7 @@ NF_KERNEL void N##_MatVecAdd_Q8( \
 }
 
 #define IQ_FUSEDGATEUP_Q8(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVecFusedGateUp_Q8( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVecFusedGateUp_Q8( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT gate_weight, \
     NF_GLOBAL const uchar* NF_RESTRICT up_weight, \
@@ -507,7 +679,7 @@ NF_KERNEL void N##_MatVecFusedGateUp_Q8( \
  * store, so the tail workgroup stays barrier-uniform.
  */
 #define IQ_FUSEDGATEUP2_Q8(N, BS, BB, TPS) \
-NF_KERNEL void N##_MatVec2FusedGateUp_Q8( \
+NF_REQD_SG_ATTR NF_KERNEL void N##_MatVec2FusedGateUp_Q8( \
     const int out_dim, const int in_dim, \
     NF_GLOBAL const uchar* NF_RESTRICT gate_weight, \
     NF_GLOBAL const uchar* NF_RESTRICT up_weight, \
@@ -547,6 +719,7 @@ NF_KERNEL void N##_MatVec2FusedGateUp_Q8( \
 #define IQ_ALL_KERNELS_Q8(N, BS, BB, TPS) \
     IQ_MATVEC_Q8(N, BS, BB, TPS) \
     IQ_MATVECN_Q8(N, BS, BB, TPS) \
+    IQ_MVQN_NC_COUNTS(N, BS, BB, TPS) \
     IQ_MATVEC2_Q8(N, BS, BB, TPS) \
     IQ_MATVECADD_Q8(N, BS, BB, TPS) \
     IQ_FUSEDGATEUP_Q8(N, BS, BB, TPS) \

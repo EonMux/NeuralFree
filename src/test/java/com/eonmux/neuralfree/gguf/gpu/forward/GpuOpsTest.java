@@ -4,12 +4,15 @@ import com.eonmux.neuralfree.acceleration.GpuModelUnsupportedException;
 import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
+import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
+import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
@@ -19,7 +22,7 @@ import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -115,21 +118,21 @@ public class GpuOpsTest {
         return backend.allocateBuffer(n * Float.BYTES);
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] v = new int[to - from];
         for (int i = from; i < to; i++) {
             v[i - from] = d.intArg(i);
@@ -219,13 +222,13 @@ public class GpuOpsTest {
         GpuWeight w = q4kSharded();
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
 
         assertEquals(Arrays.asList("Q4_K_MatVec", GpuOps.COPY2D, "Q4_K_MatVec", GpuOps.COPY2D,
                 "Q4_K_MatVec", GpuOps.COPY2D), names(ds));
         for (int s = 0; s < 3; s++) {
-            Dispatch mv = ds.get(2 * s);
-            Dispatch cp = ds.get(2 * s + 1);
+            FakeDispatch mv = ds.get(2 * s);
+            FakeDispatch cp = ds.get(2 * s + 1);
             assertArrayEquals(new long[]{(long) SHARD_ROWS * local}, mv.global());
             assertArrayEquals(new long[]{local}, mv.local());
             assertArrayEquals(new int[]{SHARD_ROWS, COLS}, ints(mv, 0, 2));
@@ -255,10 +258,10 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingleOfRows(1024);
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(1024);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
 
         assertEquals(Collections.singletonList("Q4_K_MatVec2"), names(ds));
-        Dispatch mv = ds.get(0);
+        FakeDispatch mv = ds.get(0);
         assertArrayEquals(new long[]{512L * local}, mv.global());
         assertArrayEquals(new long[]{local}, mv.local());
         assertArrayEquals(new int[]{1024, COLS}, ints(mv, 0, 2));
@@ -273,7 +276,7 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingleOfRows(128);
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(128);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
 
         assertEquals(Collections.singletonList("Q4_K_MatVec"), names(ds));
         assertArrayEquals(new long[]{128L * local}, ds.get(0).global());
@@ -286,10 +289,10 @@ public class GpuOpsTest {
         GpuWeight up = q4kSingleOfRows(1024, "blk.0.ffn_up.weight");
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(1024);
-        List<Dispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
+        List<FakeDispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
 
         assertEquals(Collections.singletonList("Q4_K_MatVec2FusedGateUp"), names(ds));
-        Dispatch fu = ds.get(0);
+        FakeDispatch fu = ds.get(0);
         assertArrayEquals(new long[]{512L * local}, fu.global());
         assertArrayEquals(new long[]{local}, fu.local());
         assertArrayEquals(new int[]{1024, COLS}, ints(fu, 0, 2));
@@ -306,7 +309,7 @@ public class GpuOpsTest {
         GpuWeight up = q4kSingleOfRows(128, "blk.0.ffn_up.weight");
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(128);
-        List<Dispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
+        List<FakeDispatch> ds = run(() -> ops.gateUpGlu(gate, up, GluOp.SWIGLU, ActParams.NONE, in, out));
 
         assertEquals(Collections.singletonList("Q4_K_MatVecFusedGateUp"), names(ds));
         assertArrayEquals(new long[]{128L * local}, ds.get(0).global());
@@ -319,13 +322,13 @@ public class GpuOpsTest {
         GpuBuffer in = floats(4L * COLS);
         GpuBuffer out = floats(8L * ROWS);
         int outOff = 2 * ROWS;
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, outOff, 4));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, outOff, 4));
 
         assertEquals(Arrays.asList("Q4_K_BatchMatMul_2D", GpuOps.COPY2D, "Q4_K_BatchMatMul_2D", GpuOps.COPY2D,
                 "Q4_K_BatchMatMul_2D", GpuOps.COPY2D), names(ds));
         for (int s = 0; s < 3; s++) {
-            Dispatch mm = ds.get(2 * s);
-            Dispatch cp = ds.get(2 * s + 1);
+            FakeDispatch mm = ds.get(2 * s);
+            FakeDispatch cp = ds.get(2 * s + 1);
             assertArrayEquals(new long[]{(long) SHARD_ROWS * local, 4}, mm.global());
             assertArrayEquals(new long[]{local, 1}, mm.local());
             assertArrayEquals(new int[]{SHARD_ROWS, COLS, 4}, ints(mm, 0, 3));
@@ -355,7 +358,7 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(4L * COLS);
         GpuBuffer out = floats(4L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 4));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 4));
 
         assertEquals(Arrays.asList("Q4_K_BatchMatMul"), names(ds));
         assertArrayEquals(new long[]{(long) ROWS * local}, ds.get(0).global());
@@ -370,7 +373,7 @@ public class GpuOpsTest {
                 backend.allocateBuffer((long) ROWS * COLS * Float.BYTES, true));
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
 
         assertEquals(Arrays.asList("Float_MatVec"), names(ds));
         assertSame(out, ds.get(0).bufferArg(4));
@@ -382,7 +385,7 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(5L * COLS);
         GpuBuffer out = floats(2L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, COLS, out, 0, 2));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, COLS, out, 0, 2));
 
         assertEquals(Arrays.asList(GpuOps.COPY2D, "Q4_K_BatchMatMul_2D"), names(ds));
         assertArrayEquals(new int[]{2, COLS, COLS, COLS, COLS, 0}, ints(ds.get(0), 0, 6));
@@ -401,17 +404,17 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle().withHadamard(h);
         GpuBuffer in = floats(COLS * 2L);
         GpuBuffer out = floats(ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, COLS, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, COLS, out, 0, 1));
 
         assertEquals(Arrays.asList(HadamardSpec.KERNEL, "Q4_K_MatVec"), names(ds));
-        Dispatch rot = ds.get(0);
+        FakeDispatch rot = ds.get(0);
         assertArrayEquals(new int[]{1, COLS, 64, 1, 0, 0, 0, COLS, 0}, ints(rot, 0, 9));
         assertArrayEquals(new long[]{(COLS / 64L) * local}, rot.global());
         assertSame(in, rot.bufferArg(HadamardSpec.ARG_X));
         assertNotSame(in, rot.bufferArg(HadamardSpec.ARG_Y));
         assertSame(rot.bufferArg(HadamardSpec.ARG_Y), ds.get(1).bufferArg(3));
 
-        List<Dispatch> again = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> again = run(() -> ops.matvec(w, in, 0, out, 0, 1));
         assertSame("one signs buffer per sign vector", rot.bufferArg(HadamardSpec.ARG_SIGNS),
                 again.get(0).bufferArg(HadamardSpec.ARG_SIGNS));
     }
@@ -422,20 +425,20 @@ public class GpuOpsTest {
         GpuWeight w = q4kSharded();
         GpuBuffer in = floats(9L * COLS);
         GpuBuffer out = floats(9L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(w, in, COLS, out, ROWS, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(w, in, COLS, out, ROWS, 8));
 
         assertEquals("the input is staged once, then every shard's row tile reads the staged records",
                 Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ", "Q4_K_MatMul_MMQ", "Q4_K_MatMul_MMQ"),
                 names(ds));
-        Dispatch quant = ds.get(0);
+        FakeDispatch quant = ds.get(0);
         assertArrayEquals("the staging pass reads the caller's input view",
                 new int[]{8, COLS, MmqConfig.PACKED_DOT.stageDepth(), COLS, COLS}, ints(quant, 0, 5));
         assertSame(in, quant.bufferArg(5));
         GpuBuffer staged = quant.bufferArg(6);
         for (int s = 0; s < 3; s++) {
-            Dispatch d = ds.get(1 + s);
-            assertArrayEquals(new long[]{GpuOps.TILED_WG, 1}, d.global());
-            assertArrayEquals(new long[]{GpuOps.TILED_WG, 1}, d.local());
+            FakeDispatch d = ds.get(1 + s);
+            assertArrayEquals(new long[]{GpuProjections.TILED_WG, 1}, d.global());
+            assertArrayEquals(new long[]{GpuProjections.TILED_WG, 1}, d.local());
             assertArrayEquals(new int[]{SHARD_ROWS, COLS, 8, MmqConfig.PACKED_DOT.rowRecords(COLS), 0,
                     ROWS, ROWS + s * SHARD_ROWS}, ints(d, 0, 7));
             assertSame(w.shard(s), d.bufferArg(7));
@@ -450,7 +453,7 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(8L * COLS);
         GpuBuffer out = floats(8L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 8));
 
         assertEquals(Arrays.asList("Q4_K_MatMul_Tiled"), names(ds));
     }
@@ -504,8 +507,8 @@ public class GpuOpsTest {
 
     /**
      * On a Vulkan device with cooperative matrices the fast quantized-weight GEMM runs the CM form,
-     * the switch turns the whole lane off, and F16 weights keep the MMA kernel the switch never
-     * touches.
+     * the switch turns the whole lane off, and F16 weights keep their measured crossover
+     * ({@link SmallBatchCrossover}) the switch never touches.
      */
     @Test
     public void vulkanCooperativeMatricesServeQuantWeightsThroughTheCmForm() {
@@ -519,7 +522,10 @@ public class GpuOpsTest {
 
         GpuWeight f16 = GpuWeight.of("blk.0.attn_q.weight", GGMLType.F16, new long[]{COLS, ROWS},
                 backend.allocateBuffer((long) ROWS * COLS * 2, true));
-        assertEquals(Arrays.asList("F16_MatMul_MMA"), names(run(() -> ops.matmul(f16, in, 0, out, 0, 8))));
+        // The measured Vulkan crossover (SmallBatchCrossover) retires the MMA lane: it lost at every
+        // step count on the machine's Vulkan device, so F16 weights fall through to the tiled GEMM
+        // at this row count like the quantized types do with their lane off.
+        assertEquals(Arrays.asList("F16_MatMul_Tiled"), names(run(() -> ops.matmul(f16, in, 0, out, 0, 8))));
 
         System.setProperty(MmqMode.PROPERTY, "off");
         try {
@@ -534,7 +540,7 @@ public class GpuOpsTest {
             assertEquals(Arrays.asList("Q4_K_MatMul_Tiled"),
                     names(run(() -> ops.matmul(q4kOff, inOff, 0, outOff, 0, 8))));
             assertEquals("the MMA lane is not part of the switch",
-                    Arrays.asList("F16_MatMul_MMA"), names(run(() -> ops.matmul(f16Off, inOff, 0, outOff, 0, 8))));
+                    Arrays.asList("F16_MatMul_Tiled"), names(run(() -> ops.matmul(f16Off, inOff, 0, outOff, 0, 8))));
         } finally {
             System.clearProperty(MmqMode.PROPERTY);
         }
@@ -599,10 +605,10 @@ public class GpuOpsTest {
                 backend.allocateBuffer((long) ROWS * COLS * 2, true));
         GpuBuffer in = floats(8L * COLS);
         GpuBuffer out = floats(8L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(bf16, in, 0, out, 0, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(bf16, in, 0, out, 0, 8));
 
         assertEquals(Arrays.asList("BF16_MatMul_MMA"), names(ds));
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             assertEquals(ROWS, d.intArg(GemmKernels.ARG_Y_STRIDE));
             assertEquals((long) ROWS * COLS * 2, d.bufferArg(GemmKernels.ARG_WEIGHT).sizeInBytes());
         }
@@ -622,23 +628,23 @@ public class GpuOpsTest {
                 backend.allocateBuffer((long) ROWS * wideCols * 2, true));
         GpuBuffer in = floats(8L * wideCols);
         GpuBuffer out = floats(8L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(f16, in, 0, out, 0, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(f16, in, 0, out, 0, 8));
 
         assertEquals("two 64-row tiles x one token tile over 4 units split by the fill ratio", 2,
                 SplitKGemmPlan.splitsFor(4, 2, 1, wideCols));
         assertEquals(Arrays.asList("F16_MatMul_MMA_KSplit", GemmKernels.SPLIT_K_REDUCE), names(ds));
-        Dispatch partial = ds.get(0);
+        FakeDispatch partial = ds.get(0);
         assertArrayEquals(new int[]{ROWS, wideCols, 8, wideCols, 0, SplitKGemmPlan.sliceLength(wideCols, 2)},
                 ints(partial, 0, 6));
         assertSame(f16.shard(0), partial.bufferArg(GemmKernels.KSPLIT_ARG_WEIGHT));
         assertSame(in, partial.bufferArg(GemmKernels.KSPLIT_ARG_X));
-        Dispatch reduce = ds.get(1);
+        FakeDispatch reduce = ds.get(1);
         assertArrayEquals(new int[]{ROWS * 8, 2, ROWS, ROWS, 0}, ints(reduce, 0, 5));
         assertSame(reduce.bufferArg(GemmKernels.REDUCE_ARG_PARTIAL), partial.bufferArg(GemmKernels.KSPLIT_ARG_PARTIAL));
         assertSame(out, reduce.bufferArg(GemmKernels.REDUCE_ARG_Y));
 
         GpuBuffer acc = floats(8L * ROWS);
-        List<Dispatch> accumulate = run(() -> ops.matvecAdd(f16, in, 0, acc, 0, 8));
+        List<FakeDispatch> accumulate = run(() -> ops.matvecAdd(f16, in, 0, acc, 0, 8));
         assertEquals(Arrays.asList("F16_MatMul_MMA_KSplit", GemmKernels.SPLIT_K_REDUCE),
                 names(accumulate).subList(0, 2));
         assertNotSame("the planes never alias the staged projection result",
@@ -664,21 +670,21 @@ public class GpuOpsTest {
                 backend.allocateBuffer((long) ROWS / 16 * 144 * wideCols, true));
         GpuBuffer in = floats(8L * wideCols);
         GpuBuffer out = floats(8L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(q4k, in, 0, out, 0, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(q4k, in, 0, out, 0, 8));
 
         assertEquals(2, SplitKGemmPlan.splitsFor(4, 2, 1, wideCols));
         assertEquals(Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ_KSplit",
                 GemmKernels.SPLIT_K_REDUCE), names(ds));
-        Dispatch quant = ds.get(0);
+        FakeDispatch quant = ds.get(0);
         assertSame(in, quant.bufferArg(5));
         GpuBuffer staged = quant.bufferArg(6);
-        Dispatch partial = ds.get(1);
+        FakeDispatch partial = ds.get(1);
         assertArrayEquals(new int[]{ROWS, wideCols, 8, MmqConfig.PACKED_DOT.rowRecords(wideCols), 0,
                         SplitKGemmPlan.sliceLength(wideCols, 2, GGMLType.Q4_K.getBlockSize())},
                 ints(partial, 0, 6));
         assertSame(q4k.shard(0), partial.bufferArg(GemmKernels.KSPLIT_ARG_WEIGHT));
         assertSame(staged, partial.bufferArg(GemmKernels.KSPLIT_ARG_X));
-        Dispatch reduce = ds.get(2);
+        FakeDispatch reduce = ds.get(2);
         assertArrayEquals(new int[]{ROWS * 8, 2, ROWS, ROWS, 0}, ints(reduce, 0, 5));
         assertSame(reduce.bufferArg(GemmKernels.REDUCE_ARG_PARTIAL), partial.bufferArg(GemmKernels.KSPLIT_ARG_PARTIAL));
         assertSame(out, reduce.bufferArg(GemmKernels.REDUCE_ARG_Y));
@@ -699,18 +705,18 @@ public class GpuOpsTest {
                 backend.allocateBuffer((long) ROWS / 16 * 144 * wideCols, true));
         GpuBuffer in = floats(9L * wideCols);
         GpuBuffer out = floats(8L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(q4k, in, wideCols, out, 0, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(q4k, in, wideCols, out, 0, 8));
 
         assertEquals(2, SplitKGemmPlan.splitsFor(4, 2, 1, wideCols));
         assertEquals(Arrays.asList("Q4_K_MatMul_CM_KSplit", GemmKernels.SPLIT_K_REDUCE), names(ds));
-        Dispatch partial = ds.get(0);
+        FakeDispatch partial = ds.get(0);
         assertArrayEquals(new int[]{ROWS, wideCols, 8, wideCols, wideCols,
                         SplitKGemmPlan.sliceLength(wideCols, 2)},
                 ints(partial, 0, 6));
         assertSame(q4k.shard(0), partial.bufferArg(GemmKernels.KSPLIT_ARG_WEIGHT));
         assertSame("the CM lane reads the unstaged activation view", in,
                 partial.bufferArg(GemmKernels.KSPLIT_ARG_X));
-        Dispatch reduce = ds.get(1);
+        FakeDispatch reduce = ds.get(1);
         assertArrayEquals(new int[]{ROWS * 8, 2, ROWS, ROWS, 0}, ints(reduce, 0, 5));
         assertSame(reduce.bufferArg(GemmKernels.REDUCE_ARG_PARTIAL), partial.bufferArg(GemmKernels.KSPLIT_ARG_PARTIAL));
         assertSame(out, reduce.bufferArg(GemmKernels.REDUCE_ARG_Y));
@@ -782,6 +788,8 @@ public class GpuOpsTest {
     /**
      * Fake tensor-core device capabilities of a backend type: CUDA with sm_120, Vulkan with the LLM
      * library's storage and timeline features, both with {@link DeviceFeature#COOPERATIVE_MATRIX}.
+     * The vendor and class claim the measured device of the backend (NVIDIA discrete over CUDA,
+     * Intel integrated over Vulkan), so the dispatch reads that device kind's measured entries.
      */
     private static DeviceCapabilities tensorCores(ComputeBackend.BackendType type, int computeUnits) {
         DeviceCapabilities.Builder b = new DeviceCapabilities.Builder()
@@ -799,10 +807,14 @@ public class GpuOpsTest {
         if (type == ComputeBackend.BackendType.CUDA) {
             // sm_80+ always reports both matrix features (CudaCapabilitiesBuilder), so the fake
             // device mirrors what the CUDA backend builds for the compute capability below.
-            b.computeCapability(120).feature(DeviceFeature.BF16_COOPERATIVE_MATRIX);
+            b.computeCapability(120).feature(DeviceFeature.BF16_COOPERATIVE_MATRIX)
+                    .deviceClass(DeviceClass.DISCRETE)
+                    .identity(new DeviceIdentity("TensorDevice", FakeComputeBackend.NVIDIA_VENDOR_ID, null, null));
         } else {
             b.feature(DeviceFeature.STORAGE_8BIT).feature(DeviceFeature.STORAGE_16BIT)
-                    .feature(DeviceFeature.TIMELINE_SEMAPHORE);
+                    .feature(DeviceFeature.TIMELINE_SEMAPHORE)
+                    .deviceClass(DeviceClass.INTEGRATED)
+                    .identity(new DeviceIdentity("TensorDevice", FakeComputeBackend.INTEL_VENDOR_ID, null, null));
         }
         return b.build();
     }
@@ -814,14 +826,14 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(8L * COLS);
         GpuBuffer out = floats(8L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 8));
 
         assertEquals(Arrays.asList("Q4_K_BatchMatMul_2D"), names(ds));
     }
 
     @Test
     public void gemmsAboveTheirKernelLimitAreSkippedAtPrewarmAndMatmulFallsBack() {
-        openWithKernelLimit(GpuOps.TILED_WG / 2, "Q4_K_MatMul_Tiled", "Q4_K_MatMul_MMQ");
+        openWithKernelLimit(GpuProjections.TILED_WG / 2, "Q4_K_MatMul_Tiled", "Q4_K_MatMul_MMQ");
         ops.prewarmWeightKernels(GGMLType.Q4_K, true, false);
         List<String> prepared = backend.preparedKernels();
         assertFalse(prepared.toString(), prepared.contains("Q4_K_MatMul_Tiled"));
@@ -831,14 +843,14 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(8L * COLS);
         GpuBuffer out = floats(8L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 8));
+        List<FakeDispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 8));
 
         assertEquals(Arrays.asList("Q4_K_BatchMatMul_2D"), names(ds));
     }
 
     @Test
     public void gemmOfAWeightTypeNeverPrewarmedIsCheckedOnFirstUse() {
-        openWithKernelLimit(GpuOps.TILED_WG / 2, "Q4_K_MatMul_Tiled", "Q4_K_MatMul_MMQ");
+        openWithKernelLimit(GpuProjections.TILED_WG / 2, "Q4_K_MatMul_Tiled", "Q4_K_MatMul_MMQ");
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(8L * COLS);
         GpuBuffer out = floats(8L * ROWS);
@@ -854,7 +866,7 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(2L * COLS);
         GpuBuffer out = floats(2L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 2));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 2));
 
         assertEquals(Arrays.asList("Q4_K_BatchMatMul"), names(ds));
     }
@@ -881,14 +893,41 @@ public class GpuOpsTest {
     }
 
     @Test
-    public void matvecBelowTiledThresholdNeverUsesGemm() {
+    public void belowTheFastGemmThresholdTheMatvecServes() {
         open();
         GpuWeight w = q4kSingle();
-        GpuBuffer in = floats(7L * COLS);
-        GpuBuffer out = floats(7L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, 7));
+        int n = SmallBatchCrossover.DEFAULT_FAST_GEMM_MIN_TOKENS - 1;
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer out = floats((long) n * ROWS);
+        List<FakeDispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, n));
 
         assertEquals(Arrays.asList("Q4_K_BatchMatMul_2D"), names(ds));
+    }
+
+    @Test
+    public void fromTheFastGemmThresholdAWeightWithAFastLaneTakesTheGemm() {
+        open();
+        GpuWeight w = q4kSingle();
+        int n = LlmKernelConstants.TILED_MIN_TOKENS - 1;
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer out = floats((long) n * ROWS);
+        List<FakeDispatch> ds = run(() -> ops.matmul(w, in, 0, out, 0, n));
+
+        assertEquals(Arrays.asList(GemmKernels.QUANT_MMQ_Q8_1, "Q4_K_MatMul_MMQ"), names(ds));
+    }
+
+    @Test
+    public void aWeightWithoutAFastLaneKeepsTheMatvecBelowTheTiledThreshold() {
+        open();
+        GpuWeight w = GpuWeight.of("blk.0.attn_q.weight", GGMLType.F32, new long[]{COLS, ROWS},
+                backend.allocateBuffer((long) ROWS * COLS * Float.BYTES, true));
+        int n = LlmKernelConstants.TILED_MIN_TOKENS - 1;
+        GpuBuffer in = floats((long) n * COLS);
+        GpuBuffer out = floats((long) n * ROWS);
+        List<String> names = names(run(() -> ops.matmul(w, in, 0, out, 0, n)));
+
+        assertTrue(names.toString(), names.stream().noneMatch(k -> k.contains("MatMul_MMQ") || k.contains("MatMul_MMA")
+                || k.contains("Tiled")));
     }
 
     // ------------------------------------------------------------------ accumulate and scale
@@ -899,7 +938,7 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle();
         GpuBuffer in = floats(COLS);
         GpuBuffer acc = floats(ROWS);
-        List<Dispatch> ds = run(() -> ops.matvecAdd(w, in, 0, acc, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvecAdd(w, in, 0, acc, 0, 1));
 
         assertEquals(Arrays.asList("Q4_K_MatVecAdd"), names(ds));
         assertSame(acc, ds.get(0).bufferArg(4));
@@ -911,13 +950,13 @@ public class GpuOpsTest {
         GpuWeight w = q4kSharded();
         GpuBuffer in = floats(COLS);
         GpuBuffer acc = floats(2L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matvecAdd(w, in, 0, acc, ROWS, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvecAdd(w, in, 0, acc, ROWS, 1));
 
         assertEquals(Arrays.asList("Q4_K_MatVec", GpuOps.COPY2D, "Q4_K_MatVec", GpuOps.COPY2D,
                 "Q4_K_MatVec", GpuOps.COPY2D, GpuOps.AXPBY), names(ds));
         GpuBuffer result = ds.get(1).bufferArg(7);
         assertNotSame(acc, result);
-        Dispatch ax = ds.get(6);
+        FakeDispatch ax = ds.get(6);
         assertEquals(ROWS, ax.intArg(0));
         assertEquals(1.0f, ax.floatArg(1), 0.0f);
         assertEquals(1.0f, ax.floatArg(2), 0.0f);
@@ -933,10 +972,10 @@ public class GpuOpsTest {
         GpuWeight w = q4kSingle().withScale(0.5f);
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
 
         assertEquals(Arrays.asList("Q4_K_MatVec", GpuOps.AXPBY), names(ds));
-        Dispatch ax = ds.get(1);
+        FakeDispatch ax = ds.get(1);
         assertEquals(0.0f, ax.floatArg(1), 0.0f);
         assertEquals(0.5f, ax.floatArg(2), 0.0f);
         assertSame(out, ax.bufferArg(7));
@@ -950,9 +989,9 @@ public class GpuOpsTest {
         open();
         GpuBuffer x = floats(64);
         GpuBuffer y = floats(64);
-        List<Dispatch> ds = run(() -> ops.add(x, 0, y, 0, x, 0, 64));
+        List<FakeDispatch> ds = run(() -> ops.add(x, 0, y, 0, x, 0, 64));
 
-        Dispatch ax = ds.get(0);
+        FakeDispatch ax = ds.get(0);
         assertEquals(GpuOps.AXPBY, ax.kernelName());
         assertSame(y, ax.bufferArg(6));
         assertSame(x, ax.bufferArg(7));
@@ -977,7 +1016,7 @@ public class GpuOpsTest {
     public void copyAtOffsetsUsesCopy2d() {
         open();
         GpuBuffer x = floats(128);
-        List<Dispatch> ds = run(() -> ops.copy(x, 0, x, 64, 64));
+        List<FakeDispatch> ds = run(() -> ops.copy(x, 0, x, 64, 64));
 
         assertEquals(Arrays.asList(GpuOps.COPY2D), names(ds));
         assertArrayEquals(new int[]{1, 64, 64, 0, 64, 64}, ints(ds.get(0), 0, 6));
@@ -987,7 +1026,7 @@ public class GpuOpsTest {
     public void interleavedColumnWindowsOfOneBufferAreDisjoint() {
         open();
         GpuBuffer x = floats(4L * 128);
-        List<Dispatch> ds = run(() -> ops.copy2d(x, 0, 128, x, 64, 128, 4, 64));
+        List<FakeDispatch> ds = run(() -> ops.copy2d(x, 0, 128, x, 64, 128, 4, 64));
 
         assertEquals(Arrays.asList(GpuOps.COPY2D), names(ds));
         assertArrayEquals(new int[]{4, 64, 128, 0, 128, 64}, ints(ds.get(0), 0, 6));
@@ -1007,7 +1046,7 @@ public class GpuOpsTest {
         backend.clearLog();
         d.setInt(0, 32);
         d.dispatch();
-        Dispatch first = backend.dispatches().get(0);
+        FakeDispatch first = backend.dispatches().get(0);
         assertTrue(first.isPreBound());
         assertEquals(32, first.intArg(0));
         assertThrows(IllegalArgumentException.class, () -> d.setFloat(0, 1.0f));

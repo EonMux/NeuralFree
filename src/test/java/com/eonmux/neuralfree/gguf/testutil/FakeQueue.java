@@ -149,7 +149,7 @@ final class FakeQueue implements ComputeQueue {
                 throw new IllegalArgumentException("copy size must be positive, got " + sizeInBytes);
             }
             d.copyFrom(s, srcOffset, dstOffset, sizeInBytes);
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.COPY, name)
+            backend.record(FakeOp.builder(FakeOpKind.COPY, name)
                     .buffer(d, dstOffset).source(s, srcOffset).bytes(sizeInBytes).waits(waits));
         }
     }
@@ -176,7 +176,7 @@ final class FakeQueue implements ComputeQueue {
             }
             int waits = backend.validateWaits(waitOnEvents);
             d.fill(dstOffset, sizeInBytes, pattern);
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.FILL, name)
+            backend.record(FakeOp.builder(FakeOpKind.FILL, name)
                     .buffer(d, dstOffset).bytes(sizeInBytes).pattern(pattern).waits(waits));
         }
     }
@@ -188,7 +188,7 @@ final class FakeQueue implements ComputeQueue {
             ensureUsable();
             backend.uncapturable("a marker");
             int waits = backend.validateWaits(waitOnEvents);
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.MARKER, name).waits(waits));
+            backend.record(FakeOp.builder(FakeOpKind.MARKER, name).waits(waits));
             return backend.newEvent();
         }
     }
@@ -267,7 +267,7 @@ final class FakeQueue implements ComputeQueue {
     public void flush() {
         synchronized (backend.lock) {
             ensureUsable();
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.FLUSH, name));
+            backend.record(FakeOp.builder(FakeOpKind.FLUSH, name));
         }
     }
 
@@ -276,7 +276,7 @@ final class FakeQueue implements ComputeQueue {
         synchronized (backend.lock) {
             ensureUsable();
             backend.uncapturable("a finish");
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.FINISH, name));
+            backend.record(FakeOp.builder(FakeOpKind.FINISH, name));
         }
     }
 
@@ -322,7 +322,7 @@ final class FakeQueue implements ComputeQueue {
             FakeGpuBuffer d = backend.ownBuffer(dstBuffer, "write destination");
             int waits = backend.validateWaits(waitOnEvents);
             d.write(dstOffset, bytes, 0, len);
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.WRITE, name)
+            backend.record(FakeOp.builder(FakeOpKind.WRITE, name)
                     .buffer(d, dstOffset).bytes(len).waits(waits));
             return backend.newEvent();
         }
@@ -335,7 +335,7 @@ final class FakeQueue implements ComputeQueue {
             FakeGpuBuffer s = backend.ownBuffer(srcBuffer, "read source");
             int waits = backend.validateWaits(waitOnEvents);
             s.read(srcOffset, bytes, 0, len);
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.READ, name)
+            backend.record(FakeOp.builder(FakeOpKind.READ, name)
                     .buffer(s, srcOffset).bytes(len).waits(waits));
             return backend.newEvent();
         }
@@ -378,10 +378,10 @@ final class FakeQueue implements ComputeQueue {
                 backend.verifyReplayLocked(backend.replaying, k, global, local, bound);
                 return null;
             }
-            FakeComputeBackend.Dispatch d = new FakeComputeBackend.Dispatch(backend.nextSequence, name,
+            FakeDispatch d = new FakeDispatch(backend.nextSequence, name,
                     k.kernelName(), global.clone(), local == null ? null : local.clone(), bound, preBound,
                     wantEvent, waits);
-            backend.record(FakeComputeBackend.Op.builder(FakeComputeBackend.OpKind.DISPATCH, name).dispatch(d));
+            backend.record(FakeOp.builder(FakeOpKind.DISPATCH, name).dispatch(d));
             FakeComputeBackend.KernelEmulator emulator = backend.emulators.get(k.kernelName());
             if (emulator != null) {
                 emulator.run(d);

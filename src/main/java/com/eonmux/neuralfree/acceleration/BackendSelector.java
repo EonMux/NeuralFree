@@ -34,14 +34,17 @@ import java.util.function.Function;
  *   <li><b>API order on the target.</b> For each API of {@code -Dneuralfree.backend.order}
  *       (default {@code metal,vulkan,cuda,opencl,hip}, then the accelerator APIs in declaration
  *       order), the API's view of the target device is turned into a backend and returned when the
- *       requirement accepts it; otherwise it is closed and the reason logged.</li>
+ *       requirement accepts it; otherwise it is closed and the reason logged. Under the default
+ *       order the target vendor's native API goes first ({@link #nativeApi}: CUDA on an NVIDIA
+ *       device); an order the property sets is followed as written.</li>
  *   <li><b>Fallback.</b> When no API ran the target, each API's own ranking winner is tried,
  *       discrete before integrated before the rest, then in API order, under the same
  *       requirement. An API and device pair is never tried twice.</li>
  * </ol>
  * <p>{@link #selectAuto} never throws for a backend that fails: every failure becomes a reason in
  * the returned {@link Selection}. The class touches no system property except in
- * {@link #deviceFilter()} and {@link #apiOrder()}, so the policy is testable without a GPU.</p>
+ * {@link #deviceFilter()}, {@link #apiOrder()} and {@link #apiOrderConfigured()}, so the policy is
+ * testable without a GPU.</p>
  */
 final class BackendSelector {
 
@@ -60,6 +63,18 @@ final class BackendSelector {
      */
     static final List<BackendType> DEFAULT_ORDER = order(
             BackendType.METAL, BackendType.VULKAN, BackendType.CUDA, BackendType.OPENCL, BackendType.HIP);
+
+    /** PCI vendor id of NVIDIA devices. */
+    private static final int NVIDIA_VENDOR_ID = 0x10DE;
+
+    /**
+     * The API that drives a vendor's devices fastest, tried first on the target device under the default
+     * order. NVIDIA: CUDA, which ran 4-5x the prefill and 1.6-2x the generation throughput of the Vulkan
+     * and OpenCL views of the same RTX 5080 Laptop (nftool bench {@code -p 512 -n 128}, Qwen3-Embedding
+     * 0.6B Q8_0, 4B Q8_0 and 4B Q4_K_M, the three APIs interleaved over two rounds).
+     */
+    private static final Map<Integer, BackendType> NATIVE_API = Collections.singletonMap(
+            NVIDIA_VENDOR_ID, BackendType.CUDA);
 
     /**
      * Whose ranking winner becomes the target device when no filter names one: Metal, then OpenCL
@@ -157,11 +172,13 @@ final class BackendSelector {
      *
      * @param views        one view per enumerated API; APIs absent from the list offer nothing
      * @param order        the APIs AUTO may use, in preference order
+     * @param nativeFirst  whether the target vendor's {@link #nativeApi} goes ahead of {@code order} on the
+     *                     target device (the default order); false follows {@code order} as written
      * @param deviceFilter case-insensitive device-name substring, or null for none
      * @param requirement  condition a created backend must meet
      */
-    static Selection selectAuto(List<ApiView> views, List<BackendType> order, String deviceFilter,
-                                BackendRequirement requirement) {
+    static Selection selectAuto(List<ApiView> views, List<BackendType> order, boolean nativeFirst,
+                                String deviceFilter, BackendRequirement requirement) {
         if (views == null || order == null || requirement == null) {
             throw new IllegalArgumentException("views, order and requirement must not be null");
         }
@@ -177,7 +194,7 @@ final class BackendSelector {
         Candidate target = target(byApi, deviceFilter);
         if (target != null) {
             LOGGER.info("AUTO backend selection targets device '{}' ({})", target.name, target.deviceClass);
-            for (BackendType api : order) {
+            for (BackendType api : nativeFirst ? nativeFirst(order, target.identity) : order) {
                 ApiView view = byApi.get(api);
                 if (view == null || view.devices.isEmpty()) {
                     continue;
@@ -262,6 +279,36 @@ final class BackendSelector {
             return items;
         }
         return Collections.unmodifiableList(matching);
+    }
+
+    /**
+     * The API that drives devices of {@code identity}'s vendor fastest ({@link #NATIVE_API}), or null when
+     * the vendor has none measured.
+     */
+    static BackendType nativeApi(DeviceIdentity identity) {
+        return identity == null ? null : NATIVE_API.get(identity.vendorId());
+    }
+
+    /** {@code order} with the native API of {@code identity}'s vendor moved to the front, when it is listed. */
+    static List<BackendType> nativeFirst(List<BackendType> order, DeviceIdentity identity) {
+        BackendType api = nativeApi(identity);
+        if (api == null || !order.contains(api) || order.get(0) == api) {
+            return order;
+        }
+        List<BackendType> reordered = new ArrayList<>(order.size());
+        reordered.add(api);
+        for (BackendType other : order) {
+            if (other != api) {
+                reordered.add(other);
+            }
+        }
+        return Collections.unmodifiableList(reordered);
+    }
+
+    /** True when {@code -Dneuralfree.backend.order} is set (non-blank): AUTO then follows it as written. */
+    static boolean apiOrderConfigured() {
+        String value = System.getProperty(ORDER_PROPERTY);
+        return value != null && !value.trim().isEmpty();
     }
 
     /** The value of {@code -Dneuralfree.device}, trimmed, or null when unset or blank. */

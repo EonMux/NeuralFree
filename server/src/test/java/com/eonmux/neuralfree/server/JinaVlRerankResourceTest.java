@@ -96,7 +96,7 @@ class JinaVlRerankResourceTest {
         int[] withToken = Arrays.copyOf(prompt, prompt.length + 1);
         withToken[prompt.length] = SCORE_TOKEN;
         JsonView body = ok(pooling.rerank("{\"query\": \"a cat\", \"documents\": [\"a dog\"]}"));
-        assertEquals(service.rerankScore(null, withToken), at(body, "results", 0).f64("relevance_score"), TOLERANCE);
+        assertEquals(service.pooling().rerankScore(null, withToken), at(body, "results", 0).f64("relevance_score"), TOLERANCE);
         assertEquals(withToken.length, body.obj("usage").i64("total_tokens"));
     }
 

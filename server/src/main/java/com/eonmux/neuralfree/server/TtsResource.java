@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * longer than {@link #MAX_SPEAKER_SECONDS} are 400s naming {@code speaker_ref}. A generator file without a speaker
  * encoder answers 501 naming the field instead of ignoring it.
  *
- * <p>Text reaches the loaded model's {@link EngineService#synthesizeSpeech(String, SpeechOptions) speech
+ * <p>Text reaches the loaded model's {@link EngineSpeech#synthesizeSpeech(String, SpeechOptions) speech
  * generator}, so the route holds no generator-specific code: a qwen3tts backbone with its code predictor and
  * code2wav generator file, a pockettts backbone with its flow-matching and mimi decoder generator file, or an
  * lfm3a backbone with its MaskGIT depthformer and liquid-codec generator file (llama.cpp's {@code --mmproj},
@@ -236,7 +236,7 @@ public class TtsResource {
         }
         int sampleRate;
         try {
-            sampleRate = target.speechSampleRate();
+            sampleRate = target.speech().speechSampleRate();
         } catch (UnsupportedOperationException e) {
             throw ServerJson.error(501, e.getMessage(), "not_supported_error");
         } catch (IllegalArgumentException e) {
@@ -245,21 +245,21 @@ public class TtsResource {
             throw ServerJson.error(500, "speech generation failed: " + e.getMessage(), "server_error");
         }
         return streamResponse(sampleRate, pcm, sse,
-                sink -> target.synthesizeSpeech(text, options, sink));
+                sink -> target.speech().synthesizeSpeech(text, options, sink));
     }
 
     /** The waveform of the integer-code path, streamed or one-shot; the model must declare a decoder first. */
     private Response codesResponse(EngineService target, int[] codes, boolean stream, boolean pcm, boolean sse) {
         int sampleRate;
         try {
-            sampleRate = target.speechCodeSampleRate();
+            sampleRate = target.speech().speechCodeSampleRate();
         } catch (UnsupportedOperationException e) {
             throw ServerJson.error(501, "this server does not support audio generation: " + e.getMessage(),
                     "not_supported_error");
         }
         try {
             if (!stream) {
-                return audio(target.synthesizeSpeech(codes), pcm);
+                return audio(target.speech().synthesizeSpeech(codes), pcm);
             }
         } catch (UnsupportedOperationException e) {
             throw ServerJson.error(501, "this server does not support audio generation: " + e.getMessage(),
@@ -267,7 +267,7 @@ public class TtsResource {
         } catch (IllegalArgumentException e) {
             throw ServerJson.badRequest("\"codes\": " + e.getMessage());
         }
-        return streamResponse(sampleRate, pcm, sse, sink -> target.synthesizeSpeech(codes, sink));
+        return streamResponse(sampleRate, pcm, sse, sink -> target.speech().synthesizeSpeech(codes, sink));
     }
 
     /** The non-streamed body of one synthesized clip: canonical WAV, or raw 16-bit little-endian PCM. */
@@ -317,7 +317,7 @@ public class TtsResource {
     /** The text-path waveform of the one-shot form, with its refusals mapped to HTTP. */
     private static AudioClip responseSpeech(EngineService target, String text, SpeechOptions options) {
         try {
-            return target.synthesizeSpeech(text, options);
+            return target.speech().synthesizeSpeech(text, options);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.error(501, e.getMessage(), "not_supported_error");
         } catch (IllegalArgumentException e) {
@@ -458,7 +458,7 @@ public class TtsResource {
             }
             return codes;
         }
-        if (target.supportsTextSpeech()) {
+        if (target.speech().supportsTextSpeech()) {
             return null;
         }
         String text = text(body);

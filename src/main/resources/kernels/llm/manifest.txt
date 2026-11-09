@@ -2,6 +2,7 @@
 common/config.h
 common/math.h
 common/reduce.h
+common/matvec_n.h
 common/quant_blocks.h
 common/fp8_codec.h
 common/iq_tables.h

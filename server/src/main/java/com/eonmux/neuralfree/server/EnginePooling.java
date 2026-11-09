@@ -10,6 +10,8 @@ import com.eonmux.neuralfree.gguf.ops.heads.ClassifierHead;
 import com.eonmux.neuralfree.gguf.ops.heads.EncodeGate;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -201,6 +203,87 @@ final class EnginePooling {
     int tokenBoundaryEos() {
         owner.requireLoaded();
         return owner.primary().model().spec().hparams().classifierEosToken();
+    }
+
+    /**
+     * The kind of sparse pooling over the per-token classifier scores ({@code EncodeGate.sparsePooling}), the
+     * vLLM SPLADE reduction, or null when the model pools none of it.
+     */
+    String sparsePooling() {
+        owner.requireLoaded();
+        if (owner.dual() != null) {
+            return null;
+        }
+        return com.eonmux.neuralfree.gguf.ops.heads.EncodeGate.sparsePooling(owner.primary().model().spec());
+    }
+
+    /**
+     * The decision head's type ({@code <arch>.decision.type}), or the architecture's own head family when the
+     * model carries no metadata key; null when the model has no decision readout: the families of
+     * {@link DecisionFamily} serve the decision routes.
+     */
+    String decisionType() {
+        owner.requireLoaded();
+        if (owner.dual() != null) {
+            return null;
+        }
+        com.eonmux.neuralfree.gguf.spec.ModelSpec spec = owner.primary().model().spec();
+        String type = spec.hparams().decisionType();
+        if (type != null) {
+            return type;
+        }
+        return switch (spec.arch()) {
+            case VLLM_DECISION2 -> "vllm-decision2";
+            case CLEF -> "clef";
+            case MODERN_BERT -> spec.hparams().nLayerDecision() > 0 ? "laya" : null;
+            case LFM2 -> spec.hparams().nLayerDecision() > 0 ? "lfm2-d1" : null;
+            default -> null;
+        };
+    }
+
+    /** The marker head's question-and-options token budget ({@code decision.max_head_tokens}), 0 when absent. */
+    int decisionMaxHeadTokens() {
+        owner.requireLoaded();
+        if (owner.dual() != null) {
+            return 0;
+        }
+        return owner.primary().model().spec().hparams().decisionMaxHeadTokens();
+    }
+
+    /** The decision head's per-type temperatures ({@code decision.temperature.<name>}), unmodifiable. */
+    Map<String, Float> decisionTemperatures() {
+        owner.requireLoaded();
+        if (owner.dual() != null) {
+            return Map.of();
+        }
+        return owner.primary().model().spec().hparams().decisionTemperatures();
+    }
+
+    /** The decision head's score offsets by level count ({@code decision.score_bias.<n>}), unmodifiable. */
+    Map<Integer, float[]> decisionScoreBias() {
+        owner.requireLoaded();
+        if (owner.dual() != null) {
+            return Map.of();
+        }
+        return owner.primary().model().spec().hparams().decisionScoreBias();
+    }
+
+    /** The decision head's option labels ({@code decision.labels}), unmodifiable. */
+    List<String> decisionLabels() {
+        owner.requireLoaded();
+        if (owner.dual() != null) {
+            return List.of();
+        }
+        return List.of(owner.primary().model().spec().hparams().decisionLabels());
+    }
+
+    /** The classifier output rows of the head ({@code <arch>.n_embd_out}), the embedding size when unset. */
+    int nEmbdOut() {
+        owner.requireLoaded();
+        if (owner.dual() != null) {
+            return 0;
+        }
+        return owner.primary().model().spec().hparams().nEmbdOut();
     }
 
     /** The per-token classifier scores of one input under {@code lora}. */

@@ -41,8 +41,10 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import org.junit.After;
 import org.junit.Test;
@@ -212,7 +214,7 @@ public class GpuHostedMoeFfnTest {
     }
 
     /** The router emulator: token {@code t} routes to experts {@code t % 4} and {@code (t + 1) % 4}, 0.6 / 0.4. */
-    private static void emulateRouter(Dispatch d) {
+    private static void emulateRouter(FakeDispatch d) {
         int nTokens = d.intArg(0);
         int k = d.intArg(2);
         int[] idVals = new int[nTokens * k];
@@ -232,7 +234,7 @@ public class GpuHostedMoeFfnTest {
      * {@code t} of {@code dst} is the weighted sum of the expert rows of its {@code k} pairs (and the previous
      * value under the accumulate flag).
      */
-    private static void emulateWeightedSum(Dispatch d) {
+    private static void emulateWeightedSum(FakeDispatch d) {
         int n = d.intArg(0);
         int outDim = d.intArg(1);
         int k = d.intArg(2);
@@ -440,8 +442,8 @@ public class GpuHostedMoeFfnTest {
     /** The WRITE ops into {@code buffer}, as (slot, byte count) pairs in upload order. */
     private List<int[]> uploadsTo(FakeGpuBuffer buffer) {
         List<int[]> out = new ArrayList<>();
-        for (com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op op : backend.ops()) {
-            if (op.kind() == com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind.WRITE
+        for (com.eonmux.neuralfree.gguf.testutil.FakeOp op : backend.ops()) {
+            if (op.kind() == com.eonmux.neuralfree.gguf.testutil.FakeOpKind.WRITE
                     && op.buffer() == buffer) {
                 out.add(new int[]{(int) (op.offset() / TENSOR_BYTES), (int) op.bytes()});
             }

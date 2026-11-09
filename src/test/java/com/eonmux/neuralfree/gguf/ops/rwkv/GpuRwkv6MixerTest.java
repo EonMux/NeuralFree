@@ -35,9 +35,9 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -220,15 +220,15 @@ public class GpuRwkv6MixerTest {
         return layer;
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
-    private static List<Dispatch> blockDispatches(List<Dispatch> all) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : all) {
+    private static List<FakeDispatch> blockDispatches(List<FakeDispatch> all) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : all) {
             if (BLOCK_KERNELS.contains(d.kernelName())) {
                 out.add(d);
             }
@@ -236,15 +236,15 @@ public class GpuRwkv6MixerTest {
         return out;
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] v = new int[to - from];
         for (int i = from; i < to; i++) {
             v[i - from] = d.intArg(i);
@@ -268,16 +268,16 @@ public class GpuRwkv6MixerTest {
         backend.clearLog();
         mixer.bind(context, layer);
         GpuWeight w2 = tensors.get(layer.tensorName(TensorNames.weight(TensorNames.TIME_MIX_W2)));
-        List<Op> copies = new ArrayList<>();
-        for (Op op : backend.ops()) {
-            if (op.kind() == OpKind.COPY) {
+        List<FakeOp> copies = new ArrayList<>();
+        for (FakeOp op : backend.ops()) {
+            if (op.kind() == FakeOpKind.COPY) {
                 copies.add(op);
             }
         }
         assertEquals(10, copies.size());
         long blockBytes = (long) C * E * Float.BYTES;
         for (int m = 0; m < 5; m++) {
-            Op op = copies.get(m);
+            FakeOp op = copies.get(m);
             assertSame(w2.shard(0), op.source());
             assertEquals(m * blockBytes, op.sourceOffset());
             assertEquals(0L, op.offset());
@@ -287,7 +287,7 @@ public class GpuRwkv6MixerTest {
         String[] lerps = {TensorNames.TIME_MIX_LERP_W, TensorNames.TIME_MIX_LERP_K, TensorNames.TIME_MIX_LERP_V,
                 TensorNames.TIME_MIX_LERP_R, TensorNames.TIME_MIX_LERP_G};
         for (int m = 0; m < 5; m++) {
-            Op op = copies.get(5 + m);
+            FakeOp op = copies.get(5 + m);
             assertSame(tensors.get(layer.tensorName(TensorNames.weight(lerps[m]))).shard(0), op.source());
             assertSame(packed, op.buffer());
             assertEquals((long) m * C * Float.BYTES, op.offset());
@@ -301,14 +301,14 @@ public class GpuRwkv6MixerTest {
         mixer.bind(context, layer);
         ScratchSlot in = scratch.slot(ScratchSlots.NORMED).slice(C, C);
         ScratchSlot out = scratch.slot(ScratchSlots.BRANCH);
-        List<Dispatch> ds = blockDispatches(run(() -> mixer.decode(7, in, out)));
+        List<FakeDispatch> ds = blockDispatches(run(() -> mixer.decode(7, in, out)));
 
         assertEquals(Arrays.asList(RwkvKernels.TOKEN_SHIFT_LERP, GpuOps.UNARY, RwkvKernels.TOKEN_SHIFT_LERP,
                 GpuOps.UNARY, RwkvKernels.DECAY6, RwkvKernels.WKV6, GpuOps.ROW_NORM, GpuOps.GLU), names(ds));
         GpuBuffer shift = stateTensor(LayerMemoryPlan.STATE_SHIFT);
         GpuBuffer planes = temp("rwkv6.planes");
 
-        Dispatch lerpX = ds.get(0);
+        FakeDispatch lerpX = ds.get(0);
         assertArrayEquals(new int[]{1, C, 0, RwkvKernels.SHIFT_MODE_LERP_X, 0, C}, ints(lerpX, 0, 6));
         assertSame(in.buffer(), lerpX.bufferArg(6));
         assertSame(shift, lerpX.bufferArg(7));
@@ -316,18 +316,18 @@ public class GpuRwkv6MixerTest {
         assertArrayEquals(new long[]{RwkvKernels.tokenShiftGlobalSize(1, C)}, lerpX.global());
         assertArrayEquals(new long[]{RwkvKernels.ELEMENTWISE_LOCAL}, lerpX.local());
 
-        Dispatch lora = ds.get(2);
+        FakeDispatch lora = ds.get(2);
         assertArrayEquals(new int[]{1, C, 5, RwkvKernels.SHIFT_MODE_LORA, 0, C}, ints(lora, 0, 6));
         assertSame(planes, lora.bufferArg(10));
 
-        Dispatch decay = ds.get(4);
+        FakeDispatch decay = ds.get(4);
         assertArrayEquals(new int[]{C, C}, ints(decay, 0, 2));
         assertSame(temp("rwkv6.w_raw"), decay.bufferArg(2));
         assertSame(tensors.get(layer.tensorName(TensorNames.weight(TensorNames.TIME_MIX_DECAY))).shard(0),
                 decay.bufferArg(3));
         assertSame(temp("rwkv6.w"), decay.bufferArg(4));
 
-        Dispatch wkv = ds.get(5);
+        FakeDispatch wkv = ds.get(5);
         assertArrayEquals(new int[]{1, C, H}, ints(wkv, 0, 3));
         assertSame(temp("rwkv6.k"), wkv.bufferArg(3));
         assertSame(temp("rwkv6.v"), wkv.bufferArg(4));
@@ -341,11 +341,11 @@ public class GpuRwkv6MixerTest {
         assertArrayEquals(new long[]{RwkvKernels.wkvGlobalSize(H, S)}, wkv.global());
         assertArrayEquals(new long[]{RwkvKernels.wkvLocalSize(S)}, wkv.local());
 
-        Dispatch norm = ds.get(6);
+        FakeDispatch norm = ds.get(6);
         assertEquals(H, norm.intArg(0));
         assertEquals(S, norm.intArg(1));
 
-        Dispatch gate = ds.get(7);
+        FakeDispatch gate = ds.get(7);
         assertEquals(1, gate.intArg(1));
         assertEquals(GluOp.SWIGLU.code(), gate.intArg(2));
         assertSame(temp("rwkv6.g"), gate.bufferArg(12));
@@ -360,12 +360,12 @@ public class GpuRwkv6MixerTest {
         int t = 4;
         ScratchSlot in = scratch.slot(ScratchSlots.NORMED);
         ScratchSlot out = scratch.slot(ScratchSlots.BRANCH);
-        List<Dispatch> all = run(() -> mixer.prefill(0, t, in, out));
+        List<FakeDispatch> all = run(() -> mixer.prefill(0, t, in, out));
 
         GpuBuffer h = temp("rwkv6.h");
         GpuBuffer hd = temp("rwkv6.hd");
         int m = 0;
-        for (Dispatch d : all) {
+        for (FakeDispatch d : all) {
             if (GpuOps.COPY2D.equals(d.kernelName()) && d.bufferArg(d.argCount() - 2) == h) {
                 assertSame(hd, d.bufferArg(d.argCount() - 1));
                 assertArrayEquals(new int[]{t, E, 5 * E, m * E, E, m * t * E}, ints(d, 0, 6));
@@ -374,7 +374,7 @@ public class GpuRwkv6MixerTest {
         }
         assertEquals(5, m);
 
-        List<Dispatch> ds = blockDispatches(all);
+        List<FakeDispatch> ds = blockDispatches(all);
         assertEquals(Arrays.asList(RwkvKernels.TOKEN_SHIFT_LERP, GpuOps.UNARY, RwkvKernels.TOKEN_SHIFT_LERP,
                 GpuOps.UNARY, RwkvKernels.DECAY6, RwkvKernels.WKV6, GpuOps.ROW_NORM, GpuOps.GLU), names(ds));
         assertEquals(t, ds.get(0).intArg(0));
@@ -398,12 +398,12 @@ public class GpuRwkv6MixerTest {
         int t = 2;
         ScratchSlot in = scratch.slot(ScratchSlots.NORMED);
         ScratchSlot out = scratch.slot(ScratchSlots.BRANCH);
-        List<Dispatch> all = run(() -> mixer.prefill(0, t, in, out));
+        List<FakeDispatch> all = run(() -> mixer.prefill(0, t, in, out));
 
         GpuBuffer kRaw = temp("rwkv6.k_raw");
         GpuBuffer k = temp("rwkv6.k");
         int repeats = 0;
-        for (Dispatch d : all) {
+        for (FakeDispatch d : all) {
             if (GpuOps.COPY2D.equals(d.kernelName()) && d.bufferArg(d.argCount() - 2) == kRaw) {
                 assertSame(k, d.bufferArg(d.argCount() - 1));
                 assertArrayEquals(new int[]{t, S, S, 0, H * S, repeats * S}, ints(d, 0, 6));
@@ -412,7 +412,7 @@ public class GpuRwkv6MixerTest {
         }
         assertEquals(H, repeats);
 
-        List<Dispatch> ds = blockDispatches(all);
+        List<FakeDispatch> ds = blockDispatches(all);
         assertEquals(Arrays.asList(RwkvKernels.TOKEN_SHIFT_LERP, GpuOps.UNARY, RwkvKernels.TOKEN_SHIFT_LERP,
                 RwkvBlocks.BATCH_BIAS_ADD, RwkvBlocks.BATCH_BIAS_ADD, RwkvBlocks.BATCH_BIAS_ADD, GpuOps.UNARY,
                 RwkvKernels.DECAY6, GpuOps.GLU, GpuOps.AXPBY, RwkvKernels.GLA, GpuOps.GLU), names(ds));
@@ -423,7 +423,7 @@ public class GpuRwkv6MixerTest {
         assertSame(kRaw, ds.get(4).bufferArg(3));
         assertEquals(GluOp.MUL.code(), ds.get(8).intArg(2));
 
-        Dispatch gla = ds.get(10);
+        FakeDispatch gla = ds.get(10);
         assertArrayEquals(new int[]{t, C, H, RwkvKernels.GLA_G_PER_CHANNEL}, ints(gla, 0, 4));
         assertEquals(RwkvKernels.glaScale(S), gla.floatArg(4), 0.0f);
         assertSame(k, gla.bufferArg(5));

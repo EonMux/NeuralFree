@@ -5,17 +5,6 @@ import com.eonmux.neuralfree.gguf.ModelSource;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.ModelSources;
 import com.eonmux.neuralfree.gguf.engine.EngineModel;
-import com.eonmux.neuralfree.gguf.arch.Arch;
-import com.eonmux.neuralfree.gguf.audio.AudioClip;
-import com.eonmux.neuralfree.gguf.audio.SpeechFormat;
-import com.eonmux.neuralfree.gguf.speech.Lfm3aGenClip;
-import com.eonmux.neuralfree.gguf.speech.Lfm3aSpeechGenerator;
-import com.eonmux.neuralfree.gguf.speech.PocketTtsClip;
-import com.eonmux.neuralfree.gguf.speech.PocketTtsSpeechGenerator;
-import com.eonmux.neuralfree.gguf.speech.Qwen3TtsClip;
-import com.eonmux.neuralfree.gguf.speech.Qwen3TtsSpeechGenerator;
-import com.eonmux.neuralfree.gguf.speech.SpeechGenerator;
-import com.eonmux.neuralfree.gguf.speech.SpeechOptions;
 import com.eonmux.neuralfree.gguf.TokenCallback;
 import com.eonmux.neuralfree.gguf.chat.ChatRequest;
 import com.eonmux.neuralfree.gguf.chat.ParallelToolCalls;
@@ -30,7 +19,6 @@ import com.eonmux.neuralfree.gguf.chat.tools.ToolRouting;
 import com.eonmux.neuralfree.gguf.chat.tools.ToolStrict;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.engine.sampling.LogitsProcessors;
-import com.eonmux.neuralfree.gguf.engine.ClassifierOutput;
 import com.eonmux.neuralfree.gguf.engine.MediaPrompt;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
@@ -62,9 +50,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -111,9 +97,10 @@ import java.util.logging.Logger;
  * again — on {@code /wake_up}, or on the request that wakes an idle pool. As in vLLM, a sleep of level 1 or more, the
  * KV cache release and a checkpoint preparation drop the cached media encodings.</p>
  *
- * <p>The pool's shape is controllable at runtime: {@link #scaleElasticEp} resizes it for vLLM's elastic data-parallel
- * scaling (growing opens the new replicas, shrinking drains and closes the removed ones), and the fault-tolerance
- * routes report each replica's health and recover failed ones or remove their ranks ({@link #submitFaultTolerance}).
+ * <p>The pool's shape is controllable at runtime: {@link EngineScaling#scaleElasticEp} resizes it for vLLM's elastic
+ * data-parallel scaling (growing opens the new replicas, shrinking drains and closes the removed ones), and the
+ * fault-tolerance routes report each replica's health and recover failed ones or remove their ranks
+ * ({@link EngineScaling#submitFaultTolerance}).
  * The replicas' data-parallel ranks come from the layout and survive a rank removal, so a dropped rank's slot stays
  * the deployment's.</p>
  */
@@ -188,28 +175,7 @@ public final class EngineService implements AutoCloseable {
     /** Whether the pool serves runtime adapter changes ({@link ServerLoras#runtimeUpdating()}). */
     private final boolean runtimeAdapters;
     /** Serializes the pool changes: an elastic scale, a fault-tolerance retry or a rank removal. */
-    private final Object poolLock = new Object();
-    /** The elastic-scale lifecycle the status route reports ({@link ElasticPhase}). */
-    private volatile ElasticPhase elasticPhase = ElasticPhase.IDLE;
-    /** The epoch of the latest elastic scale, null before the first. */
-    private volatile String elasticEpoch;
-    /** The requested data-parallel size of the latest elastic scale, null before the first. */
-    private volatile Integer elasticRequestedSize;
-    /** The failure that ended the latest elastic scale, null when it succeeded. */
-    private volatile String elasticError;
-    /** How many elastic-scale epochs ran; the next epoch is its successor. */
-    private long elasticEpochs;
-    /** Whether a fault-tolerance scale_down removed ranks, which ends elastic scaling for the pool. */
-    private volatile boolean ranksRemoved;
-    /** The fault-tolerance state per data-parallel rank; removed ranks leave their entry behind as the record. */
-    private final Map<Integer, FaultState> faultStates = new java.util.concurrent.ConcurrentHashMap<>();
-    /** Runs a fault-tolerance instruction off the HTTP thread, one at a time. */
-    private final java.util.concurrent.ExecutorService controlExecutor =
-            java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
-                Thread thread = new Thread(task, "neuralfree-server-control");
-                thread.setDaemon(true);
-                return thread;
-            });
+    final Object poolLock = new Object();
     /** Listeners that follow the pool's shape, run whenever {@link #installPool} replaces it. */
     private final List<Runnable> poolListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
     /** The media inputs: the projector of {@code neuralfree.server.mmproj}, or disabled without one. */
@@ -224,6 +190,10 @@ public final class EngineService implements AutoCloseable {
     private final EnginePower power;
     /** The live weight transfer operations of the pool (the RL trainer-to-inference weight sync). */
     private final EngineWeightTransfer weightTransfer;
+    /** The pool's elastic data-parallel scaling and fault tolerance. */
+    private final EngineScaling scaling;
+    /** The pool's text-to-speech and audio-decoding surface. */
+    private final EngineSpeech speech;
 
     /** Disaggregated prefill/decode over the pool, or null when no {@code kv_transfer_config} is set. */
     private final KvTransferService kvTransfer;
@@ -240,11 +210,9 @@ public final class EngineService implements AutoCloseable {
     /** The pool wakes in flight: while one runs, no replica's idle sleep may fire (another may still re-open). */
     private final AtomicInteger waking = new AtomicInteger();
     /** Orders the projector's release against its reopen: each decides on the replicas' state under it. */
-    private final Object projectorLock = new Object();
+    final Object projectorLock = new Object();
     /** The generator file of {@code neuralfree.server.mmproj} (llama.cpp's {@code --mmproj}), or null. */
     private final String mmprojPath;
-    /** The text-to-speech generator over the primary replica's model; null until the first speech request. */
-    private volatile SpeechGenerator speech;
 
     /**
      * The serving setup a sleeping engine keeps answering {@code /props} with (llama.cpp serves its cached meta
@@ -310,6 +278,8 @@ public final class EngineService implements AutoCloseable {
         this.slots = new EngineSlots(this);
         this.power = new EnginePower(this);
         this.weightTransfer = new EngineWeightTransfer(this);
+        this.scaling = new EngineScaling(this);
+        this.speech = new EngineSpeech(this);
         this.chat = new EngineChat(this);
         boolean twoTower = path != null && !path.isBlank() && ClipDualEncoder.isTwoTower(path);
         EngineConfig configured = withAdapterSlots(Objects.requireNonNull(config, "config"), adapters);
@@ -415,7 +385,7 @@ public final class EngineService implements AutoCloseable {
      * @throws IOException              when the model or a startup adapter does not open
      * @throws IllegalArgumentException when no device filter is configured for that pool position
      */
-    private EngineReplica openReplica(int index, int rank) throws IOException {
+    EngineReplica openReplica(int index, int rank) throws IOException {
         String device = devicesFor(index);
         EngineConfig replicaConfig = device == null ? this.config : this.config.toBuilder().deviceFilter(device).build();
         return new EngineReplica(index, rank, device, modelPath, replicaConfig, options,
@@ -444,7 +414,7 @@ public final class EngineService implements AutoCloseable {
      * Installs a changed replica pool and its layout, and routes over it from now on. The caller holds
      * {@link #poolLock}.
      */
-    private void installPool(List<EngineReplica> next, DpLayout nextLayout) {
+    void installPool(List<EngineReplica> next, DpLayout nextLayout) {
         if (next.isEmpty()) {
             throw new IllegalArgumentException("the pool needs at least one replica");
         }
@@ -631,15 +601,7 @@ public final class EngineService implements AutoCloseable {
                 return;
             }
             current.clearCache();
-            SpeechGenerator generator = speech;
-            speech = null;
-            if (generator != null) {
-                try {
-                    generator.close();
-                } catch (RuntimeException e) {
-                    LOGGER.log(Level.WARNING, "speech generator release failed", e);
-                }
-            }
+            speech.closeGenerator();
             try {
                 current.release();
             } catch (IOException | RuntimeException e) {
@@ -685,7 +647,7 @@ public final class EngineService implements AutoCloseable {
         }
     }
 
-    private static void closeAll(List<EngineReplica> opened) {
+    static void closeAll(List<EngineReplica> opened) {
         for (EngineReplica replica : opened) {
             try {
                 replica.close();
@@ -884,6 +846,26 @@ public final class EngineService implements AutoCloseable {
         return weightTransfer;
     }
 
+    /** The pool's elastic data-parallel scaling and fault tolerance. */
+    EngineScaling scaling() {
+        return scaling;
+    }
+
+    /** The pool's text-to-speech and audio-decoding surface. */
+    EngineSpeech speech() {
+        return speech;
+    }
+
+    /** The generator file of {@code neuralfree.server.mmproj}, or null. */
+    String mmprojPath() {
+        return mmprojPath;
+    }
+
+    /** The scheduler routing requests across the pool, null while unloaded. */
+    DpScheduler scheduler() {
+        return scheduler;
+    }
+
     /** The Responses API store ({@link ServerOptions#responseStore}). */
     ResponseStore responses() {
         return responses;
@@ -977,417 +959,6 @@ public final class EngineService implements AutoCloseable {
             }
         }
         return true;
-    }
-
-    // ------------------------------------------------------------------ cluster control
-
-    /** The elastic-scale lifecycle of the pool, as vLLM's external elastic EP phases name it. */
-    enum ElasticPhase {
-        IDLE, PREPARING, COMMITTING, FAILED, COMPLETED;
-
-        /** The phase's lowercase API name. */
-        String label() {
-            return name().toLowerCase(Locale.ROOT);
-        }
-    }
-
-    /** The elastic-scale state {@code POST /is_scaling_elastic_ep} reports. */
-    record ElasticStatus(boolean scaling, String phase, String epoch, String error,
-                         Integer requestedDataParallelSize) { }
-
-    /**
-     * One replica's fault-tolerance view: the engine's data-parallel rank, its health ({@code healthy},
-     * {@code unhealthy} or {@code dead}), the failure that made it unhealthy, and the state of the fault-tolerance
-     * instruction that last touched it ({@code recovering}, {@code failed} or null).
-     */
-    record ReplicaHealth(int id, String status, String faultInfo, String ftState, String lastFtRequestId,
-                         String ftError) { }
-
-    /** One rank's fault-tolerance bookkeeping; the instruction's state survives while the rank is served. */
-    private static final class FaultState {
-        private volatile String state;
-        private volatile String lastRequestId;
-        private volatile String error;
-    }
-
-    /** The elastic-scale state the route reports. */
-    ElasticStatus elasticStatus() {
-        ElasticPhase phase = elasticPhase;
-        boolean scaling = phase == ElasticPhase.PREPARING || phase == ElasticPhase.COMMITTING;
-        return new ElasticStatus(scaling, phase.label(), elasticEpoch, elasticError, elasticRequestedSize);
-    }
-
-    /** Whether an elastic scale may run: every rank of the deployment is local, and no scale_down removed any. */
-    boolean elasticScalable() {
-        List<EngineReplica> current = replicas;
-        return dual == null && !current.isEmpty() && !ranksRemoved
-                && layout.startRank() == 0 && current.size() == layout.size();
-    }
-
-    /**
-     * Resizes the pool to {@code newSize} replicas behind the one service (vLLM's {@code POST /scale_elastic_ep}):
-     * a shrink first stops routing to the removed replicas and drains their requests for at most
-     * {@code drainMillis}, then closes them; a grow opens the new replicas before routing to them. The global
-     * data-parallel size becomes {@code newSize} because the server holds every rank of the deployment. A failure
-     * leaves the pool as it was (a shrink that timed out restores the routing) and records the phase as failed.
-     *
-     * @throws IllegalArgumentException when the pool cannot scale elastically (unloaded, a dual encoder, ranks held
-     *                                  by other servers, or a rank removed by fault tolerance), or the new size is
-     *                                  unusable
-     * @throws java.util.concurrent.TimeoutException when the removed replicas did not drain within the timeout
-     * @throws IllegalStateException when opening the new replicas fails
-     */
-    void scaleElasticEp(int newSize, long drainMillis) throws InterruptedException,
-            java.util.concurrent.TimeoutException {
-        if (newSize < 1) {
-            throw new IllegalArgumentException("new_data_parallel_size must be a positive integer, got " + newSize);
-        }
-        if (drainMillis < 1) {
-            throw new IllegalArgumentException("drain_timeout must be a positive integer, got " + drainMillis);
-        }
-        synchronized (poolLock) {
-            if (dual != null) {
-                throw new IllegalArgumentException("elastic scaling needs a generation model; this server serves a"
-                        + " CLIP dual encoder");
-            }
-            if (replicas.isEmpty()) {
-                throw new IllegalArgumentException("elastic scaling needs a loaded model: set "
-                        + "-Dneuralfree.server.model=<gguf path>");
-            }
-            if (!elasticScalable()) {
-                throw new IllegalArgumentException("elastic scaling resizes a server that holds every rank of the"
-                        + " deployment: this one holds " + replicas.size() + " of " + layout.size() + " rank(s)"
-                        + (ranksRemoved ? " after a fault-tolerance scale_down" : "")
-                        + ", so its external deployment owns the topology");
-            }
-            elasticEpoch = Long.toString(++elasticEpochs);
-            elasticRequestedSize = newSize;
-            elasticError = null;
-            elasticPhase = ElasticPhase.PREPARING;
-            try {
-                if (newSize < replicas.size()) {
-                    shrinkPool(newSize, drainMillis);
-                } else if (newSize > replicas.size()) {
-                    growPool(newSize);
-                }
-                elasticPhase = ElasticPhase.COMMITTING;
-                elasticPhase = ElasticPhase.COMPLETED;
-            } catch (InterruptedException e) {
-                elasticError = "the scale was interrupted";
-                elasticPhase = ElasticPhase.FAILED;
-                throw e;
-            } catch (java.util.concurrent.TimeoutException | RuntimeException e) {
-                elasticError = e.getMessage();
-                elasticPhase = ElasticPhase.FAILED;
-                throw e;
-            }
-        }
-    }
-
-    /** Stops routing to the trailing replicas, drains them, closes them, and installs the survivors. */
-    private void shrinkPool(int newSize, long drainMillis)
-            throws InterruptedException, java.util.concurrent.TimeoutException {
-        List<EngineReplica> current = replicas;
-        List<EngineReplica> survivors = new ArrayList<>(current.subList(0, newSize));
-        List<EngineReplica> removed = new ArrayList<>(current.subList(newSize, current.size()));
-        scheduler.replace(survivors.toArray(new EngineReplica[0]));
-        try {
-            waitForDrain(removed, drainMillis);
-        } catch (InterruptedException | java.util.concurrent.TimeoutException | RuntimeException e) {
-            scheduler.replace(current.toArray(new EngineReplica[0]));
-            throw e;
-        }
-        closeAll(removed);
-        installPool(survivors, new DpLayout(newSize, layout.startRank(), layout.balance()));
-    }
-
-    /**
-     * Waits until none of {@code replicas} holds a request. A request that picked a removed replica just before the
-     * scheduler swap needs a settling window to land, so the check runs again after a short pause.
-     */
-    private static void waitForDrain(List<EngineReplica> replicas, long drainMillis)
-            throws InterruptedException, java.util.concurrent.TimeoutException {
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(drainMillis);
-        while (draining(replicas)) {
-            if (System.nanoTime() >= deadline) {
-                throw new java.util.concurrent.TimeoutException("the requests on the replicas being removed did"
-                        + " not drain within " + drainMillis + " ms");
-            }
-            Thread.sleep(10);
-        }
-        Thread.sleep(50);
-        while (draining(replicas)) {
-            if (System.nanoTime() >= deadline) {
-                throw new java.util.concurrent.TimeoutException("the requests on the replicas being removed did"
-                        + " not drain within " + drainMillis + " ms");
-            }
-            Thread.sleep(10);
-        }
-    }
-
-    /** Whether any of {@code replicas} still holds a request. */
-    private static boolean draining(List<EngineReplica> replicas) {
-        for (EngineReplica replica : replicas) {
-            if (replica.load() > 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /** Opens the replicas past the pool's end, then installs the grown pool. */
-    private void growPool(int newSize) {
-        List<EngineReplica> current = replicas;
-        List<EngineReplica> next = new ArrayList<>(current);
-        try {
-            for (int i = current.size(); i < newSize; i++) {
-                next.add(openReplica(i, layout.startRank() + i));
-            }
-        } catch (IllegalArgumentException e) {
-            closeFrom(next, current.size(), e);
-            throw e;
-        } catch (IOException | RuntimeException e) {
-            closeFrom(next, current.size(), e);
-            throw new IllegalStateException("the scale to " + newSize + " replicas failed: " + e.getMessage(), e);
-        }
-        installPool(next, new DpLayout(newSize, layout.startRank(), layout.balance()));
-    }
-
-    /** Closes the replicas {@code next} gained past {@code from}, suppressing their failures on {@code cause}. */
-    private static void closeFrom(List<EngineReplica> next, int from, Exception cause) {
-        for (int i = from; i < next.size(); i++) {
-            try {
-                next.get(i).close();
-            } catch (RuntimeException closeFailure) {
-                cause.addSuppressed(closeFailure);
-            }
-        }
-    }
-
-    /** The fault-tolerance status of every replica still served, in pool order (vLLM's engine status list). */
-    List<ReplicaHealth> faultToleranceEngines() {
-        List<EngineReplica> current = replicas;
-        List<ReplicaHealth> out = new ArrayList<>(current.size());
-        for (EngineReplica replica : current) {
-            FaultState state = faultStates.get(replica.rank());
-            String fault = replica.alive() ? replica.faultInfo() : "the replica's pump thread stopped";
-            String status = !replica.alive() ? "dead" : fault == null ? "healthy" : "unhealthy";
-            out.add(new ReplicaHealth(replica.rank(), status, fault,
-                    state == null ? null : state.state,
-                    state == null ? null : state.lastRequestId,
-                    state == null ? null : state.error));
-        }
-        return out;
-    }
-
-    /**
-     * Runs one fault-tolerance instruction off the HTTP thread (vLLM answers 202 and the caller polls the status).
-     * {@code retry} recovers every unhealthy or dead replica; {@code scale_down} closes the ranks
-     * {@code params.removed_dp_ranks} names, which must be unhealthy or dead, and drops them from the pool while
-     * the deployment's global size keeps their slots.
-     *
-     * @throws IllegalArgumentException for an unknown instruction or unusable parameters, before anything changes
-     */
-    void submitFaultTolerance(String instruction, Map<?, ?> params, String requestId) {
-        if ("retry".equals(instruction)) {
-            submitRetry(requestId);
-            return;
-        }
-        if ("scale_down".equals(instruction)) {
-            submitScaleDown(params, requestId);
-            return;
-        }
-        throw new IllegalArgumentException("Invalid instruction: '" + instruction + "'.");
-    }
-
-    /** Marks the unhealthy replicas recovering and schedules their recovery. */
-    private void submitRetry(String requestId) {
-        synchronized (poolLock) {
-            List<EngineReplica> targets = new ArrayList<>();
-            for (EngineReplica replica : replicas) {
-                if (!replica.alive() || replica.faultInfo() != null) {
-                    targets.add(replica);
-                }
-            }
-            markFaultState(requestId, targets, null);
-            controlExecutor.execute(() -> runRetry(targets, requestId));
-        }
-    }
-
-    /** Recovers {@code targets} one by one; a failure records the error on the replicas it could not recover. */
-    private void runRetry(List<EngineReplica> targets, String requestId) {
-        synchronized (poolLock) {
-            List<EngineReplica> live = new ArrayList<>(targets.size());
-            for (EngineReplica replica : targets) {
-                if (replicas.contains(replica)) {
-                    live.add(replica);
-                }
-            }
-            if (live.isEmpty()) {
-                markFaultFailure(requestId, replicas, "no unhealthy engine to recover: every replica is healthy");
-                return;
-            }
-            List<EngineReplica> failed = new ArrayList<>();
-            String error = null;
-            for (EngineReplica replica : live) {
-                try {
-                    if (!replica.alive()) {
-                        replaceReplica(replica);
-                    } else {
-                        replica.recoverOp();
-                    }
-                } catch (IOException | InterruptedException | RuntimeException e) {
-                    if (e instanceof InterruptedException) {
-                        Thread.currentThread().interrupt();
-                    }
-                    failed.add(replica);
-                    error = error == null ? e.getMessage() : error;
-                }
-            }
-            if (failed.isEmpty()) {
-                clearFaultState(live);
-            } else {
-                markFaultFailure(requestId, failed, error);
-            }
-        }
-    }
-
-    /** Opens a replacement for a dead replica at its pool position and rank, then closes the dead one. */
-    private void replaceReplica(EngineReplica dead) throws IOException {
-        List<EngineReplica> current = replicas;
-        int position = current.indexOf(dead);
-        if (position < 0) {
-            throw new IllegalStateException("the replica of rank " + dead.rank() + " is no longer in the pool");
-        }
-        EngineReplica replacement = openReplica(position, dead.rank());
-        List<EngineReplica> next = new ArrayList<>(current);
-        next.set(position, replacement);
-        installPool(next, layout);
-        dead.close();
-    }
-
-    /** Marks the removed ranks recovering and schedules their removal. */
-    private void submitScaleDown(Map<?, ?> params, String requestId) {
-        synchronized (poolLock) {
-            List<Integer> removed = removedRanks(params);
-            List<EngineReplica> targets = new ArrayList<>();
-            for (EngineReplica replica : replicas) {
-                if (removed.contains(replica.rank())) {
-                    targets.add(replica);
-                }
-            }
-            markFaultState(requestId, targets, null);
-            controlExecutor.execute(() -> runScaleDown(targets, requestId));
-        }
-    }
-
-    /** The {@code removed_dp_ranks} of a scale_down, validated against the ranks still served and their health. */
-    private List<Integer> removedRanks(Map<?, ?> params) {
-        Object raw = params.get("removed_dp_ranks");
-        if (!(raw instanceof List<?> list) || list.isEmpty()) {
-            throw new IllegalArgumentException("scale_down needs 'removed_dp_ranks', a non-empty array of"
-                    + " data-parallel ranks");
-        }
-        List<EngineReplica> current = replicas;
-        List<Integer> removed = new ArrayList<>(list.size());
-        for (Object entry : list) {
-            if (!(entry instanceof Number number) || number.intValue() != number.doubleValue()) {
-                throw new IllegalArgumentException("removed_dp_ranks must hold whole numbers, got " + entry);
-            }
-            int rank = number.intValue();
-            EngineReplica replica = null;
-            for (EngineReplica candidate : current) {
-                if (candidate.rank() == rank) {
-                    replica = candidate;
-                    break;
-                }
-            }
-            if (replica == null) {
-                throw new IllegalArgumentException("removed_dp_ranks names rank " + rank + ", which this server does"
-                        + " not serve (it serves " + ranks(current) + ")");
-            }
-            if (replica.alive() && replica.faultInfo() == null) {
-                throw new IllegalArgumentException("removed_dp_ranks names rank " + rank + ", which is healthy;"
-                        + " scale_down removes failed ranks only");
-            }
-            if (!removed.contains(rank)) {
-                removed.add(rank);
-            }
-        }
-        if (current.size() <= removed.size()) {
-            throw new IllegalArgumentException("scale_down cannot remove every rank: the pool needs at least one"
-                    + " replica to keep serving");
-        }
-        return removed;
-    }
-
-    /** Recovers {@code removed} as far as closing goes: the ranks leave the pool and the layout keeps theirs. */
-    private void runScaleDown(List<EngineReplica> removed, String requestId) {
-        synchronized (poolLock) {
-            List<EngineReplica> current = replicas;
-            List<EngineReplica> next = new ArrayList<>(current.size());
-            for (EngineReplica replica : current) {
-                if (!removed.contains(replica)) {
-                    next.add(replica);
-                }
-            }
-            if (next.isEmpty()) {
-                markFaultFailure(requestId, removed, "scale_down would remove every replica");
-                return;
-            }
-            for (EngineReplica replica : removed) {
-                if (replicas.contains(replica) && replica.alive() && replica.faultInfo() == null) {
-                    markFaultFailure(requestId, removed, "rank " + replica.rank() + " became healthy before the"
-                            + " scale_down ran; failed ranks only");
-                    return;
-                }
-            }
-            closeAll(removed);
-            for (EngineReplica replica : removed) {
-                faultStates.remove(replica.rank());
-            }
-            ranksRemoved = true;
-            installPool(next, layout);
-        }
-    }
-
-    /** The ranks {@code replicas} serve, comma-separated for a refusal. */
-    private static String ranks(List<EngineReplica> replicas) {
-        StringBuilder out = new StringBuilder();
-        for (EngineReplica replica : replicas) {
-            if (out.length() > 0) {
-                out.append(", ");
-            }
-            out.append(replica.rank());
-        }
-        return out.toString();
-    }
-
-    /** Records {@code state} ({@code recovering}) on {@code targets}; {@code error} null on the recovering mark. */
-    private void markFaultState(String requestId, List<EngineReplica> targets, String error) {
-        for (EngineReplica replica : targets) {
-            FaultState state = faultStates.computeIfAbsent(replica.rank(), rank -> new FaultState());
-            state.state = "recovering";
-            state.lastRequestId = requestId;
-            state.error = error;
-        }
-    }
-
-    /** Records a failed instruction on {@code targets}. */
-    private void markFaultFailure(String requestId, List<EngineReplica> targets, String error) {
-        for (EngineReplica replica : targets) {
-            FaultState state = faultStates.computeIfAbsent(replica.rank(), rank -> new FaultState());
-            state.state = "failed";
-            state.lastRequestId = requestId;
-            state.error = error;
-        }
-    }
-
-    /** Clears the instruction state of recovered {@code targets}, as vLLM's healthy push replaces it. */
-    private void clearFaultState(List<EngineReplica> targets) {
-        for (EngineReplica replica : targets) {
-            faultStates.remove(replica.rank());
-        }
     }
 
     // ------------------------------------------------------------------ chat, tokenizer and tools
@@ -1558,610 +1129,10 @@ public final class EngineService implements AutoCloseable {
         return slots.slotStatuses();
     }
 
-    /**
-     * The speech decoding geometry the loaded model declares ({@link LLMModel#speechFormat}), or null when it
-     * cannot turn its features into a waveform.
-     */
-    public SpeechFormat speechFormat() {
-        if (dual != null) {
-            return null;
-        }
-        return primary().model().speechFormat();
-    }
-
-    /**
-     * The waveform of audio codec codes through the loaded model's speech decoder
-     * ({@link LLMModel#synthesizeSpeech}).
-     *
-     * @throws UnsupportedOperationException when the model is not a speech decoder or declares no geometry
-     */
-    public AudioClip synthesizeSpeech(int[] codes) {
-        if (dual != null) {
-            throw new UnsupportedOperationException("a CLIP dual encoder does not support audio generation");
-        }
-        return primary().model().synthesizeSpeech(codes);
-    }
-
-    /**
-     * Whether the loaded model turns text into audio, i.e. whether {@link #synthesizeSpeech(String, SpeechOptions)}
-     * has a speech-generator backbone to reach. A qwen3tts, pockettts or lfm3a backbone answers true even before
-     * its generator file is opened, so the route can prefer text over the integer-code path and let the generator
-     * name the missing file.
-     */
-    public boolean supportsTextSpeech() {
-        if (dual != null || replicas == null || replicas.isEmpty()) {
-            return false;
-        }
-        Arch arch = primary().model().spec().arch();
-        return arch == Arch.QWEN3TTS || arch == Arch.POCKETTTS || arch == Arch.LFM3;
-    }
-
-    /**
-     * Synthesizes speech from {@code text} through the loaded model's speech generator: a qwen3tts backbone with
-     * the code predictor and code2wav decoder of the {@code neuralfree.server.mmproj} generator file, a pockettts
-     * backbone with that file's flow network and mimi decoder, or an lfm3a backbone with its MaskGIT depthformer
-     * and liquid-codec decoder. Runs on the primary replica's engine thread once its batch engine is idle,
-     * because the pipeline resets and drives the model's forward memory.
-     *
-     * @param text    the text to speak
-     * @param options the language, voice, sampling and frame cap
-     * @return the mono waveform at the generator file's sample rate
-     * @throws UnsupportedOperationException when the model has no speech-generator backbone, no generator file is
-     *                                       configured, or the lfm3 omni backbone carries no speech chat
-     *                                       template (the message names the missing piece)
-     * @throws IllegalArgumentException      when {@code text} or an option is invalid, or the rendered prompt does
-     *                                       not open the omni pipeline's fresh turn
-     * @throws IOException                   when the generation fails or the engine stays busy past its budget
-     */
-    public AudioClip synthesizeSpeech(String text, SpeechOptions options) throws IOException {
-        if (dual != null) {
-            throw new UnsupportedOperationException("a CLIP dual encoder does not support audio generation");
-        }
-        SpeechGenerator generator = speechGenerator();
-        if (generator instanceof Lfm3aSpeechGenerator omni) {
-            // llama.cpp speaks the tts template's render, which must end in the audio start token
-            // (server-context.cpp:6477-6478, mtmd-helper-gen.cpp:1337): the render already carries it, so the
-            // fresh turn runs over it directly instead of the generator appending one to the raw text
-            GGUFTokenizer tokenizer = primary().model().tokenizer();
-            if (tokenizer.ttsTemplate() == null) {
-                throw new UnsupportedOperationException("lfm3a text-to-speech needs the "
-                        + GGUFTokenizer.KEY_TTS_TEMPLATE + " chat template: the omni pipeline speaks the prompt"
-                        + " rendered from it, and the render ends in the audio start token");
-            }
-            String rendered = tokenizer.formatTtsPrompt(text, options.language(), options.voice());
-            int[] prompt = tokenizer.encode(rendered, false, true);
-            return primary().onPump(() -> omni.generate(prompt, Lfm3aSpeechGenerator.Mode.AUDIO, false, options,
-                    null).audio());
-        }
-        return primary().onPump(() -> generator.synthesize(text, options));
-    }
-
-    /**
-     * {@link #synthesizeSpeech(String, SpeechOptions)} delivered in decoder chunks: the generator hands each
-     * clip to {@code sink} as it decodes it, on the primary replica's engine thread. The clips concatenate to the
-     * one-shot result. {@code sink} may throw to stop the generation (a disconnected client); the throw reaches
-     * this call.
-     *
-     * @throws UnsupportedOperationException when the model has no speech-generator backbone, or no generator file
-     *                                       is configured (the message names the missing piece)
-     * @throws IllegalArgumentException      when {@code text} or an option is invalid
-     * @throws IOException                   when the generation fails or the engine stays busy past its budget
-     */
-    public void synthesizeSpeech(String text, SpeechOptions options, Consumer<AudioClip> sink) throws IOException {
-        if (dual != null) {
-            throw new UnsupportedOperationException("a CLIP dual encoder does not support audio generation");
-        }
-        Objects.requireNonNull(sink, "sink");
-        SpeechGenerator generator = speechGenerator();
-        primary().onPump(() -> {
-            generator.synthesize(text, options, sink);
-            return null;
-        });
-    }
-
-    /**
-     * The sample rate of the text-to-speech generator's waveform; opens the generator file on first use, so a
-     * missing backbone or file refuses here by name before a streamed response starts.
-     *
-     * @throws UnsupportedOperationException when the model has no speech-generator backbone, or no generator file
-     *                                       is configured
-     * @throws IOException                   when the generator file cannot be read
-     */
-    public int speechSampleRate() throws IOException {
-        if (dual != null) {
-            throw new UnsupportedOperationException("a CLIP dual encoder does not support audio generation");
-        }
-        return speechGenerator().sampleRate();
-    }
-
-    /**
-     * {@link #synthesizeSpeech(int[])} delivered in chunks through the model's streaming speech decoder.
-     *
-     * @throws UnsupportedOperationException when the model is not a speech decoder or declares no geometry
-     */
-    public void synthesizeSpeech(int[] codes, Consumer<AudioClip> sink) {
-        if (dual != null) {
-            throw new UnsupportedOperationException("a CLIP dual encoder does not support audio generation");
-        }
-        Objects.requireNonNull(sink, "sink");
-        primary().model().synthesizeSpeech(codes, sink);
-    }
-
-    /**
-     * The sample rate of the code-to-waveform decoder, refusing like {@link #synthesizeSpeech(int[])} when the
-     * model has none so a streamed response starts only for a model that can fill it.
-     *
-     * @throws UnsupportedOperationException when the model is not a speech decoder or declares no geometry
-     */
-    public int speechCodeSampleRate() {
-        if (dual != null) {
-            throw new UnsupportedOperationException("a CLIP dual encoder does not support audio generation");
-        }
-        return primary().model().requireSpeechFormat().sampleRate();
-    }
-
-    /**
-     * One omni chat turn: the conversation renders through the model's conversation template
-     * ({@link GGUFTokenizer#formatSpeechChat}, with the request's {@code language} and {@code voice} bound), and
-     * the lfm3a omni pipeline answers it. An AUDIO-only turn is fresh and stops at the end-of-audio frame, its
-     * prompt ending in the audio start token; a MIXED turn continues the conversation, the pipeline appending the
-     * mixed start token, and interleaves text and audio blocks until {@code <|im_end|>} or the step cap
-     * (mtmd-helper-gen.cpp:1320-1352, 1392-1450). Runs on the primary replica's engine thread like
-     * {@link #synthesizeSpeech(String, SpeechOptions)}, because the pipeline drives the model's forward memory.
-     *
-     * @param chat       the conversation to answer
-     * @param mode       {@link Lfm3aSpeechGenerator.Mode#AUDIO} for speech only, {@link Lfm3aSpeechGenerator.Mode#MIXED}
-     *                   for interleaved text and speech
-     * @param continuing true for a turn that continues the conversation (the pipeline appends the mode's switch
-     *                   token and lets the response continue in text after the audio); false for a fresh AUDIO turn
-     * @param options    the text-step sampler, the language and voice variables and the step cap
-     * @param sink       receives the turn's text pieces and audio chunks as they happen, or null for none
-     * @return the turn's text, whole waveform and prompt length
-     * @throws UnsupportedOperationException when the loaded model has no speech-generator backbone, no generator
-     *                                       file, or when its generator is not the lfm3a omni pipeline (the message
-     *                                       names the missing piece)
-     * @throws IllegalArgumentException      when the conversation does not render, or a fresh prompt is not an
-     *                                       audio turn
-     * @throws IOException                   when the generation fails or the engine stays busy past its budget
-     */
-    public Lfm3aSpeechGenerator.OmniTurn omniTurn(ChatRequest chat, Lfm3aSpeechGenerator.Mode mode, boolean continuing,
-                                                SpeechOptions options, Lfm3aSpeechGenerator.OmniSink sink)
-            throws IOException {
-        if (dual != null) {
-            throw new UnsupportedOperationException("a CLIP dual encoder does not support audio generation");
-        }
-        if (replicas == null || replicas.isEmpty()) {
-            throw new UnsupportedOperationException("no model loaded: chat completions audio output needs the lfm3a"
-                    + " omni pipeline");
-        }
-        Arch arch = primary().model().spec().arch();
-        if (arch != Arch.LFM3) {
-            throw new UnsupportedOperationException("chat completions audio output needs the lfm3a omni pipeline:"
-                    + (arch == Arch.QWEN3TTS
-                            ? " the loaded qwen3tts backbone speaks through /v1/audio/speech, which does not run"
-                              + " the omni chat turn"
-                            : " the loaded " + arch.ggufName() + " model has no speech-generator backbone; a"
-                              + " qwen3tts or lfm3 backbone with its generator file speaks"));
-        }
-        SpeechGenerator generator = speechGenerator();
-        if (!(generator instanceof Lfm3aSpeechGenerator omni)) {
-            throw new UnsupportedOperationException("chat completions audio output needs the lfm3a omni pipeline;"
-                    + " the loaded speech generator is " + generator.name() + ", which speaks through"
-                    + " /v1/audio/speech");
-        }
-        GGUFTokenizer tokenizer = primary().model().tokenizer();
-        String rendered = tokenizer.formatSpeechChat(chat, options.language(), options.voice());
-        int[] prompt = tokenizer.encode(rendered, false, true);
-        if (!continuing) {
-            // the pipeline decides a fresh turn's mode from the last prompt token, and only an audio turn is valid
-            // (mtmd-helper-gen.cpp:1336): the render must end in audio_start
-            if (mode != Lfm3aSpeechGenerator.Mode.AUDIO) {
-                throw new IllegalArgumentException("a fresh omni turn opens in audio; a " + mode
-                        + " turn continues the conversation");
-            }
-            int audioStart = tokenizer.getTokenId(Lfm3aSpeechGenerator.AUDIO_START_PIECE);
-            int[] withStart = Arrays.copyOf(prompt, prompt.length + 1);
-            withStart[prompt.length] = audioStart;
-            prompt = withStart;
-        }
-        int[] tokens = prompt;
-        return primary().onPump(() -> omni.generate(tokens, mode, continuing, options, sink));
-    }
-
-    /**
-     * The speech generator of the pool, opened on first use from the generator file and the primary replica's
-     * model and cached; models without a speech-generator backbone are refused by name.
-     *
-     * @throws UnsupportedOperationException when the model has no speech-generator backbone, or no generator file
-     *                                       is configured
-     * @throws IOException                   when the generator file cannot be read
-     */
-    private SpeechGenerator speechGenerator() throws IOException {
-        synchronized (projectorLock) {
-            if (speech != null) {
-                return speech;
-            }
-            if (replicas == null || replicas.isEmpty()) {
-                throw new UnsupportedOperationException("no model loaded: speech generation needs a qwen3tts,"
-                        + " pockettts or lfm3a backbone");
-            }
-            EngineModel model = primary().model();
-            Arch arch = model.spec().arch();
-            if (arch != Arch.QWEN3TTS && arch != Arch.POCKETTTS && arch != Arch.LFM3) {
-                throw new UnsupportedOperationException("this server has no speech-generator backbone: the loaded "
-                        + arch.ggufName() + " model cannot turn text into audio; a qwen3tts, pockettts or lfm3a"
-                        + " backbone with its generator file does");
-            }
-            if (mmprojPath == null) {
-                throw new UnsupportedOperationException("speech generation needs the generator file: set "
-                        + MediaOptions.MMPROJ_PROPERTY + " (llama.cpp --mmproj) to the " + generatorFileOf(arch));
-            }
-            speech = openSpeechGenerator(model, arch);
-            return speech;
-        }
-    }
-
-    /** The generator file an arch's speech pipeline reads, for the missing-file message. */
-    private static String generatorFileOf(Arch arch) {
-        switch (arch) {
-            case QWEN3TTS:
-                return "qwen3tts code predictor and code2wav GGUF";
-            case POCKETTTS:
-                return "pockettts flow network and mimi decoder GGUF";
-            case LFM3:
-                return "lfm3a MaskGIT depthformer and liquid-codec GGUF";
-            default:
-                return arch.ggufName() + " generator GGUF";
-        }
-    }
-
-    /** Opens the generator file of {@code arch} and binds it to {@code model}; closes it on a binding failure. */
-    private SpeechGenerator openSpeechGenerator(EngineModel model, Arch arch) throws IOException {
-        switch (arch) {
-            case QWEN3TTS: {
-                Qwen3TtsClip clip = Qwen3TtsClip.open(mmprojPath, config.sourceOptions());
-                try {
-                    return Qwen3TtsSpeechGenerator.open(model, clip);
-                } catch (RuntimeException | Error e) {
-                    clip.close();
-                    throw e;
-                }
-            }
-            case POCKETTTS: {
-                PocketTtsClip clip = PocketTtsClip.open(mmprojPath, config.sourceOptions());
-                try {
-                    return PocketTtsSpeechGenerator.open(model, clip);
-                } catch (IOException | RuntimeException | Error e) {
-                    clip.close();
-                    throw e;
-                }
-            }
-            case LFM3: {
-                Lfm3aGenClip clip = Lfm3aGenClip.open(mmprojPath, config.sourceOptions());
-                try {
-                    return Lfm3aSpeechGenerator.open(model, clip);
-                } catch (IOException | RuntimeException | Error e) {
-                    clip.close();
-                    throw e;
-                }
-            }
-            default:
-                throw new UnsupportedOperationException("the " + arch.ggufName()
-                        + " backbone has no speech generator");
-        }
-    }
-
     // ------------------------------------------------------------------ pooling, classification and scoring
-
-    /** The pooled embedding of one input under {@code lora}; see {@link EnginePooling#embed}. */
-    public float[] embed(LoraSelection lora, int[] tokens) throws IOException {
-        return pooling.embed(lora, tokens);
-    }
-
-    /** The pooled embeddings of several inputs under {@code lora} over one replica. */
-    public float[][] embedAll(LoraSelection lora, int[][] inputs) throws IOException {
-        return pooling.embedAll(lora, inputs);
-    }
-
-    /** The embedding of one image through a CLIP dual encoder's vision tower. */
-    public float[] embedImage(LoraSelection lora, String reference, String field) {
-        return pooling.embedImage(lora, reference, field);
-    }
-
-    /** True when the model is a CLIP dual encoder. */
-    public boolean dualEncoder() {
-        return pooling.dualEncoder();
-    }
-
-    /** The bi-encoder score of a cosine similarity, through the dual encoder's activation when it has one. */
-    public double biEncoderScore(double cosine) {
-        return pooling.biEncoderScore(cosine);
-    }
-
-    /** The pooled embedding of one media prompt. */
-    public float[] embedMedia(LoraSelection lora, MediaPrompt prompt) throws IOException {
-        return pooling.embedMedia(lora, prompt);
-    }
-
-    /** The RANK classifier's relevance score of one media prompt. */
-    public float rerankScoreMedia(LoraSelection lora, MediaPrompt prompt) throws IOException {
-        return pooling.rerankScoreMedia(lora, prompt);
-    }
-
-    /** {@link #rerankScoreMedia} with the classifier's final probability activation applied or skipped. */
-    public float rerankScoreMedia(LoraSelection lora, MediaPrompt prompt, boolean activation) throws IOException {
-        return pooling.rerankScoreMedia(lora, prompt, activation);
-    }
-
-    /** Whether the model's embeddings are per token. */
-    public boolean perTokenEmbeddings() {
-        return pooling.perTokenEmbeddings();
-    }
-
-    /** The per-token embeddings of one input under {@code lora}, for NONE pooling. */
-    public float[][] embedTokens(LoraSelection lora, int[] tokens) throws IOException {
-        return pooling.embedTokens(lora, tokens);
-    }
-
-    /** The per-token embeddings of several inputs over one replica. */
-    public float[][][] embedTokensAll(LoraSelection lora, int[][] inputs) throws IOException {
-        return pooling.embedTokensAll(lora, inputs);
-    }
-
-    /** Whether the model classifies per token. */
-    public boolean tokenClassifier() {
-        return pooling.tokenClassifier();
-    }
-
-    /** Whether the model pools a vector or row before classifying. */
-    public boolean sequenceClassifier() {
-        return pooling.sequenceClassifier();
-    }
-
-    /** Whether the model answers {@code token_classify}. */
-    public boolean canTokenClassify() {
-        return pooling.canTokenClassify();
-    }
-
-    /**
-     * Whether the model stores a separate per-token score projection ({@code cls.sparse}, vLLM's BGE-M3
-     * {@code sparse_linear}); its {@code token_classify} rows are that projection's ReLU scores.
-     */
-    public boolean tokenScoreProjection() {
-        return pooling.tokenScoreProjection();
-    }
-
-    /**
-     * Whether the model stores a separate per-token embedding projection ({@code cls.colbert}, vLLM's BGE-M3
-     * {@code colbert_linear}); {@code token_embed} answers its rows beside the pooled {@code embed}.
-     */
-    public boolean tokenEmbeddingProjection() {
-        return pooling.tokenEmbeddingProjection();
-    }
-
-    /**
-     * The process-reward step filter a {@code token_classify} request omits ({@code classifier.step_tag_id}), or
-     * -1 when the model sets none.
-     */
-    public int defaultStepTagId() {
-        return pooling.defaultStepTagId();
-    }
-
-    /** The leading per-token boundary token id ({@code classifier.bos_token}), or -1. */
-    public int tokenBoundaryBos() {
-        return pooling.tokenBoundaryBos();
-    }
-
-    /** The trailing per-token boundary token id ({@code classifier.eos_token}), or -1. */
-    public int tokenBoundaryEos() {
-        return pooling.tokenBoundaryEos();
-    }
-
-    /**
-     * The kind of sparse pooling over the per-token classifier scores ({@code EncodeGate.sparsePooling}), the
-     * vLLM SPLADE reduction, or null when the model pools none of it.
-     */
-    public String sparsePooling() {
-        requireLoaded();
-        if (dual != null) {
-            return null;
-        }
-        return com.eonmux.neuralfree.gguf.ops.heads.EncodeGate.sparsePooling(primary().model().spec());
-    }
-
-    /** The per-token classifier scores of one input ({@code EngineModel.tokenClassify}) under {@code lora}. */
-    public float[][] tokenClassify(LoraSelection lora, int[] tokens) throws IOException {
-        return pooling.tokenClassify(lora, tokens);
-    }
-
-    /** The per-token classifier scores of several inputs over one replica. */
-    public float[][][] tokenClassifyAll(LoraSelection lora, int[][] inputs) throws IOException {
-        return pooling.tokenClassifyAll(lora, inputs);
-    }
-
-    /** The rerank input tokens of one query-document pair. */
-    public int[] rerankInput(String query, String document) {
-        return pooling.rerankInput(query, document);
-    }
-
-    /** The rerank input of an already tokenized query and document. */
-    public int[] rerankInput(int[] query, int[] document) {
-        return pooling.rerankInput(query, document);
-    }
-
-    /** The rerank input of a query, document and task instruction. */
-    public int[] rerankInput(String query, String document, String instruction) {
-        return pooling.rerankInput(query, document, instruction);
-    }
-
-    /** The relevance score of one rerank input under {@code lora}. */
-    public float rerankScore(LoraSelection lora, int[] tokens) throws IOException {
-        return pooling.rerankScore(lora, tokens);
-    }
-
-    /** {@link #rerankScore} with the classifier's final probability activation applied or skipped. */
-    public float rerankScore(LoraSelection lora, int[] tokens, boolean activation) throws IOException {
-        return pooling.rerankScore(lora, tokens, activation);
-    }
-
-    /** The relevance scores of several rerank inputs over one replica. */
-    public float[] rerankScores(LoraSelection lora, int[][] inputs) throws IOException {
-        return pooling.rerankScores(lora, inputs);
-    }
-
-    /** {@link #rerankScores} with the final probability activation applied or skipped per input. */
-    public float[] rerankScores(LoraSelection lora, int[][] inputs, boolean activation) throws IOException {
-        return pooling.rerankScores(lora, inputs, activation);
-    }
-
-    /** The model's pooling kind. */
-    public com.eonmux.neuralfree.gguf.arch.PoolingKind poolingKind() {
-        return pooling.poolingKind();
-    }
-
-    /** Whether the model carries a decision head scoring per token. */
-    public boolean decisionHead() {
-        return pooling.decisionHead();
-    }
-
-    /**
-     * The decision head's type ({@code <arch>.decision.type}), or the architecture's own head family when the
-     * model carries no metadata key; null when the model has no decision readout: the families of
-     * {@link DecisionFamily} serve the decision routes.
-     */
-    public String decisionType() {
-        requireLoaded();
-        if (dual != null) {
-            return null;
-        }
-        com.eonmux.neuralfree.gguf.spec.ModelSpec spec = primary().model().spec();
-        String type = spec.hparams().decisionType();
-        if (type != null) {
-            return type;
-        }
-        return switch (spec.arch()) {
-            case VLLM_DECISION2 -> "vllm-decision2";
-            case CLEF -> "clef";
-            case MODERN_BERT -> spec.hparams().nLayerDecision() > 0 ? "laya" : null;
-            case LFM2 -> spec.hparams().nLayerDecision() > 0 ? "lfm2-d1" : null;
-            default -> null;
-        };
-    }
-
-    /** The marker head's question-and-options token budget ({@code decision.max_head_tokens}), 0 when absent. */
-    public int decisionMaxHeadTokens() {
-        requireLoaded();
-        if (dual != null) {
-            return 0;
-        }
-        return primary().model().spec().hparams().decisionMaxHeadTokens();
-    }
-
-    /** The decision head's per-type temperatures ({@code decision.temperature.<name>}), unmodifiable. */
-    public Map<String, Float> decisionTemperatures() {
-        requireLoaded();
-        if (dual != null) {
-            return Map.of();
-        }
-        return primary().model().spec().hparams().decisionTemperatures();
-    }
-
-    /** The decision head's score offsets by level count ({@code decision.score_bias.<n>}), unmodifiable. */
-    public Map<Integer, float[]> decisionScoreBias() {
-        requireLoaded();
-        if (dual != null) {
-            return Map.of();
-        }
-        return primary().model().spec().hparams().decisionScoreBias();
-    }
-
-    /** The decision head's option labels ({@code decision.labels}), unmodifiable. */
-    public List<String> decisionLabels() {
-        requireLoaded();
-        if (dual != null) {
-            return List.of();
-        }
-        return List.of(primary().model().spec().hparams().decisionLabels());
-    }
-
-    /** The classifier output rows of the head ({@code <arch>.n_embd_out}), the embedding size when unset. */
-    public int nEmbdOut() {
-        requireLoaded();
-        if (dual != null) {
-            return 0;
-        }
-        return primary().model().spec().hparams().nEmbdOut();
-    }
-
-    /**
-     * The decision scores of one ordered prompt under {@code lora}: output row {@code i} holds the score of the
-     * {@code i}-th option span of {@code order}.
-     */
-    public float[] decisionScores(LoraSelection lora, int[] tokens, int[] order) throws IOException {
-        return pooling.decisionScores(lora, tokens, order);
-    }
-
-    /** What the model is for. */
-    public com.eonmux.neuralfree.gguf.arch.SupportClass supportClass() {
-        return pooling.supportClass();
-    }
-
-    /** The classifier output of one input under {@code lora}. */
-    public ClassifierOutput classifyOutput(LoraSelection lora, int[] tokens) throws IOException {
-        return pooling.classifyOutput(lora, tokens);
-    }
-
-    /** {@link #classifyOutput} with the final probability activation applied or skipped. */
-    public ClassifierOutput classifyOutput(LoraSelection lora, int[] tokens, boolean activation) throws IOException {
-        return pooling.classifyOutput(lora, tokens, activation);
-    }
-
-    /** The classifier outputs of several inputs over one replica. */
-    public ClassifierOutput[] classifyOutputsAll(LoraSelection lora, int[][] inputs) throws IOException {
-        return pooling.classifyOutputsAll(lora, inputs);
-    }
-
-    /** {@link #classifyOutputsAll} with the final probability activation applied or skipped per input. */
-    public ClassifierOutput[] classifyOutputsAll(LoraSelection lora, int[][] inputs, boolean activation)
-            throws IOException {
-        return pooling.classifyOutputsAll(lora, inputs, activation);
-    }
-
-    /**
-     * The classifier output over a media prompt under {@code lora}: the sequence classifier's scores over the pooled
-     * row of the prompt's text and media rows.
-     */
-    public ClassifierOutput classifyOutputMedia(LoraSelection lora, MediaPrompt prompt, boolean activation)
-            throws IOException {
-        return pooling.classifyOutputMedia(lora, prompt, activation);
-    }
-
-    /** The classifier scores of one input under {@code lora}. */
-    public float[] classifyScores(LoraSelection lora, int[] tokens) throws IOException {
-        return pooling.classifyScores(lora, tokens);
-    }
-
-    /** The classifier scores of several inputs over one replica. */
-    public float[][] classifyScoresAll(LoraSelection lora, int[][] inputs) throws IOException {
-        return pooling.classifyScoresAll(lora, inputs);
-    }
-
-    /** The next-token logits of one prompt under {@code lora}. */
-    public float[] nextLogits(LoraSelection lora, int[] tokens) throws IOException {
-        return pooling.nextLogits(lora, tokens);
-    }
-
-    /** The next-token logits after the last row of a media prompt under {@code lora}. */
-    public float[] nextLogits(LoraSelection lora, MediaPrompt prompt) throws IOException {
-        return pooling.nextLogits(lora, prompt);
-    }
-
-    /**
-     * The decision scores of one media prompt under {@code lora}: output row {@code i} holds the score of the
-     * {@code i}-th option span of {@code order}, read over the prompt's text and media rows.
-     */
-    public float[] decisionScores(LoraSelection lora, MediaPrompt prompt, int[] order) throws IOException {
-        return pooling.decisionScores(lora, prompt, order);
+    /** The pooling, classification and scoring entry points; see {@link EnginePooling}. */
+    EnginePooling pooling() {
+        return pooling;
     }
 
     /**
@@ -2486,14 +1457,8 @@ public final class EngineService implements AutoCloseable {
     /** Stops every replica's pump thread, clears the engines and closes the models. */
     @Override
     public void close() {
-        controlExecutor.shutdownNow();
-        synchronized (projectorLock) {
-            SpeechGenerator generator = speech;
-            speech = null;
-            if (generator != null) {
-                generator.close();
-            }
-        }
+        scaling.close();
+        speech.closeGenerator();
         synchronized (poolLock) {
             closeAll(replicas);
             replicas = List.of();

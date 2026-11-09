@@ -26,9 +26,11 @@
  * CODE(bp, e) is the integer code of element e (block-relative) of the block at bp, SCALE(bp, k0)
  * and OFF(bp, k0) the scale and offset of the SG-element group holding element k0 % BS; all three
  * use the field offsets of common/quant_decode_legacy.h, common/quant_decode_k.h and
- * common/quant_decode_iq.h. Codes are stored signed; every code range (Q4_0 0..15, the IQ grid
- * bytes up to +-62, up to Q8_0 -128..127) fits nf_i8, so a stage dot of code pairs stays within
- * int (127 * 127 * 32 << 2^31).
+ * common/quant_decode_iq.h. Every generator also pastes CODE4(bp, e0), the 4 consecutive codes
+ * e0..e0+3 (e0 a multiple of 4) packed little-endian into one uint, as NF_MMQ_PREFETCH loads the
+ * weight stream 4 codes per access; the macros below the per-type CODE define it. Codes are stored
+ * signed; every code range (Q4_0 0..15, the IQ grid bytes up to +-62, up to Q8_0 -128..127) fits
+ * nf_i8, so a stage dot of code pairs stays within int (127 * 127 * 32 << 2^31).
  *
  * Tiling (common/matmul_mmq_config.h): a workgroup of NF_MMQ_WG work-items computes a tile of
  * NF_MMQ_TM weight rows x NF_MMQ_TN tokens in NF_MMQ_TK-deep stages: 64 x 64 x 32 on the tensor
@@ -119,77 +121,123 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
 }
 
 /*
- * The software-pipelined stage. The caller owns the two local code tiles (wq, NF_MMQ_WS slots
- * each), the two (scale, offset) / code-sum tiles (wsc / wof / wsu, NF_MMQ_TM * NF_MMQ_SH entries
- * each), the per-token slots (xdv / xsu / xz) and acc; row_bytes and the type macros BS / BB /
- * CODE / SCALE / OFF come from the generator macro. Stages the weight codes and (scale, offset)
- * tiles of rows [m0, m0 + NF_MMQ_TM) and the chunk records of tokens [n0, n0 + TN) from q8 one
- * TK-deep chunk at a time, and calls the combine with the staged tile of the current chunk.
+ * The software-pipelined stage. The caller owns NF_MMQ_PIPE_BUF local code tiles (wq, NF_MMQ_WS
+ * slots each), NF_MMQ_PIPE_BUF (scale, offset) / code-sum tiles (wsc / wof / wsu, NF_MMQ_TM *
+ * NF_MMQ_SH entries each), the shared record tile xr ((TN) * NF_MMQ_RC units, refilled every
+ * stage) and acc; row_bytes and the type macros BS / BB / CODE / SCALE / OFF come from the
+ * generator macro. Stages the weight codes and (scale, offset) tiles of rows [m0, m0 +
+ * NF_MMQ_TM) and the chunk records of tokens [n0, n0 + TN) from q8 one TK-deep chunk at a time,
+ * and calls the combine with the staged tile of the current chunk.
  *
- * The stage loop is software-pipelined so the weight stream never serializes on its load latency:
- * the code gather is tile-major (work-item slots run over the tile in row-major order, slot = s *
- * NF_MMQ_WG + lid, row slot / NF_MMQ_TK, so the lanes of a warp read one row's chunk codes as one
- * contiguous memory span), the codes of chunk c + NF_MMQ_TK load into registers while chunk c is
- * combined, and the commit writes the registers into the tile the combine reads. The two
- * code / (scale, offset) / code-sum tiles alternate per chunk; every lane passes the same three
- * barriers per iteration, with xz[0] uniform over the work-group (chunk c of token n0, or 0 past
- * N), so the code-sum fill under it stays uniform too. COMBINE is a macro invoked as
- * COMBINE(sel, XA, XB) with the pipe's last two arguments forwarded, combining the staged chunk of
- * buffer sel (its pointers are that buffer's offsets into wq / wsc / wof / wsu).
+ * The stage loop is software-pipelined so the weight stream stays in flight: the weight gather is
+ * tile-major (work-item slots run over the tile in row-major 4-code words, slot4 = s * NF_MMQ_WG +
+ * lid, row slot4 / (NF_MMQ_TK / 4), so the lanes of a warp read one row's chunk codes as one
+ * contiguous span of aligned words instead of one byte load per code), the codes of the two chunks
+ * ahead load into registers while chunk c is combined, and the commit writes a register set into
+ * the tile the combine reads one iteration later. The gather of the token records runs coalesced
+ * (the tile's records are consecutive in q8) into xr, so every combine reads its B fragments,
+ * scales and code sums from shared memory instead of q8 global. The NF_MMQ_PIPE_BUF
+ * code / (scale, offset) / code-sum tiles cycle per chunk; every lane passes the same three
+ * barriers per iteration, with the gathered record tile uniform over the work-group after the
+ * first barrier, so the code-sum fill under the token 0 zero-point gate stays uniform too. COMBINE
+ * is a macro invoked as COMBINE(sel, XA, XB) with the pipe's last two arguments forwarded,
+ * combining the staged chunk of buffer sel (its pointers are that buffer's offsets into wq / wsc /
+ * wof / wsu).
  *
  * NF_MMQ_PIPE(cstart, kend, TN, COMBINE, BS, BB, CODE, SCALE, OFF, XA, XB) runs the loop over
  * chunks [cstart, kend).
  */
 #define NF_MMQ_SP (NF_MMQ_WS / NF_MMQ_WG)     /* code slots of one stage per work-item */
+#define NF_MMQ_SP4 (NF_MMQ_SP / 4)            /* 4-code words of one stage per work-item */
+#define NF_MMQ_PIPE_BUF 3                     /* code / (scale, offset) / code-sum tiles */
+#define NF_MMQ_PIPE_SETS 2                    /* prefetch register sets: two chunks in flight */
 
-/* Loads chunk c's code slots and this work-item's (scale, offset) pair into the prefetch
- * registers; slots of rows past M and pairs of rows past M become zero. */
-#define NF_MMQ_PREFETCH(c, m0, kend, M, weight, row_bytes, BS, BB, CODE, SCALE, OFF) \
-    for (int s = 0; s < NF_MMQ_SP; s++) { \
-        const int slot = s * NF_MMQ_WG + tx + NF_MMQ_TX * ty; \
-        const int r = m0 + slot / NF_MMQ_TK; \
-        pf[s] = (nf_i8)(r < M && (c) < (kend) \
-            ? CODE(weight + (nf_i64)r * row_bytes + (nf_i64)((c) / (BS)) * (BB), \
-                   ((c) + slot % NF_MMQ_TK) % (BS)) : 0); \
+/*
+ * The stage's weight stream reads 4 codes per access: every type defines CODE4(bp, e0), the codes
+ * of elements e0..e0+3 (e0 a multiple of 4, the group never crossing a block) packed little-endian,
+ * loaded with the aligned words the block layout proves (common/quant_blocks.h nf_read_u32 /
+ * nf_read_u32_u16; types whose codes are not byte-contiguous fall back to packing 4 CODE calls).
+ * These compose the packed forms the per-type CODE4 macros use.
+ */
+
+/* Four code values as their low bytes, little-endian: the word the code tile stores. */
+#define NF_MMQ_CODE4_PACK(c0, c1, c2, c3) \
+    ((uint)(uchar)(nf_i8)(c0) | ((uint)(uchar)(nf_i8)(c1) << 8) \
+        | ((uint)(uchar)(nf_i8)(c2) << 16) | ((uint)(uchar)(nf_i8)(c3) << 24))
+
+/* The 4-bit codes e0..e0+3 of a word holding 4 consecutive qs bytes: code j is the nibble of byte j
+ * at `shift` (the low nibbles of the 16-code run when shift is 0, the high ones when it is 4). The
+ * masked form puts each byte's nibble in its own result byte in two ALU ops, where the packed form
+ * of the four nibbles costs about twelve; the byte layout matches NF_MMQ_CODE4_PACK's. */
+#define NF_MMQ_CODE4_NIBBLES(word, shift) \
+    (((word) >> (shift)) & 0x0F0F0F0Fu)
+
+/* The bits e0..e0+3 of a 32-bit word as 0x10 per code lane: the 5th bits of 4 codes of one qh word
+ * (e0 a multiple of 4 with e0 + 3 < 32, as the stage depth guarantees). */
+#define NF_MMQ_HBITS4(word, e0) \
+    ((((word) >> (e0)) & 0x1u) << 4 | (((word) >> ((e0) + 1)) & 0x1u) << 12 \
+        | (((word) >> ((e0) + 2)) & 0x1u) << 20 | (((word) >> ((e0) + 3)) & 0x1u) << 28)
+
+/* Bit b of each of the word's 4 bytes as 0x10 per code lane: the 5th bits of 4 codes whose qh
+ * bytes the word covers (one qh byte per element, the group's bit b constant across the group). */
+#define NF_MMQ_HBITS4_B(word, b) \
+    ((((word) >> (b)) & 0x1u) << 4 | (((word) >> (8 + (b))) & 0x1u) << 12 \
+        | (((word) >> (16 + (b))) & 0x1u) << 20 | (((word) >> (24 + (b))) & 0x1u) << 28)
+
+/*
+ * Loads chunk c's code words and this work-item's (scale, offset) pair into prefetch register set
+ * `set`; words of rows past M and pairs of rows past M become zero. Work-item slots run over the
+ * tile in row-major 4-code groups, slot4 = s * NF_MMQ_WG + lid, row slot4 / (NF_MMQ_TK / 4), so the
+ * lanes of a warp read one row's chunk codes as one contiguous span and each lane's word load is
+ * aligned (the slot's first code stays 4-aligned: NF_MMQ_TK is a multiple of 4 and c a multiple of
+ * NF_MMQ_TK).
+ */
+#define NF_MMQ_PREFETCH(set, c, m0, kend, M, weight, row_bytes, BS, BB, CODE, SCALE, OFF) \
+    for (int s = 0; s < NF_MMQ_SP4; s++) { \
+        const int slot4 = s * NF_MMQ_WG + tx + NF_MMQ_TX * ty; \
+        const int r = m0 + slot4 / (NF_MMQ_TK / 4); \
+        pfw[set][s] = r < M && (c) < (kend) \
+            ? CODE##4(weight + (nf_i64)r * row_bytes + (nf_i64)((c) / (BS)) * (BB), \
+                      ((c) + 4 * (slot4 % (NF_MMQ_TK / 4))) % (BS)) : 0u; \
     } \
-    psc = 0.0f; \
-    pof = 0.0f; \
+    psc[set] = 0.0f; \
+    pof[set] = 0.0f; \
     if (lid < NF_MMQ_TM * NF_MMQ_SH && m0 + lid / NF_MMQ_SH < M && (c) < (kend)) { \
         const NF_GLOBAL uchar* sbp = weight + (nf_i64)(m0 + lid / NF_MMQ_SH) * row_bytes \
             + (nf_i64)((c) / (BS)) * (BB); \
-        psc = SCALE(sbp, (c) + (lid % NF_MMQ_SH) * 16); \
-        pof = OFF(sbp, (c) + (lid % NF_MMQ_SH) * 16); \
+        psc[set] = SCALE(sbp, (c) + (lid % NF_MMQ_SH) * 16); \
+        pof[set] = OFF(sbp, (c) + (lid % NF_MMQ_SH) * 16); \
     }
 
-/* Writes the prefetch registers into code / (scale, offset) tile sel. */
-#define NF_MMQ_STAGE_COMMIT(sel) \
-    for (int s = 0; s < NF_MMQ_SP; s++) { \
-        const int slot = s * NF_MMQ_WG + tx + NF_MMQ_TX * ty; \
-        wq[(sel) * NF_MMQ_WS + slot] = pf[s]; \
+/* Writes prefetch register set `set` into code / (scale, offset) tile sel (the code tile stays the
+ * same byte layout the combine reads: each word covers the 4 codes its bytes held before). */
+#define NF_MMQ_STAGE_COMMIT(set, sel) \
+    for (int s = 0; s < NF_MMQ_SP4; s++) { \
+        const int slot4 = s * NF_MMQ_WG + tx + NF_MMQ_TX * ty; \
+        wq_w[(sel) * (NF_MMQ_WS / 4) + slot4] = (int)pfw[set][s]; \
     } \
     if (lid < NF_MMQ_TM * NF_MMQ_SH) { \
-        wsc[(sel) * NF_MMQ_TM * NF_MMQ_SH + lid] = psc; \
-        wof[(sel) * NF_MMQ_TM * NF_MMQ_SH + lid] = pof; \
+        wsc[(sel) * NF_MMQ_TM * NF_MMQ_SH + lid] = psc[set]; \
+        wof[(sel) * NF_MMQ_TM * NF_MMQ_SH + lid] = pof[set]; \
     }
 
-/* Gathers chunk c's token records (the d, half code sums and code totals of tokens
- * [n0, n0 + TN)) and leaves q8_row0 at the chunk's first record. */
+/* Gathers chunk c's records of tokens [n0, n0 + TN) into the shared record tile xr, one record of
+ * NF_MMQ_RC units (the tk / 4 code ints, the chunk scale d, the half code sums and the zero point)
+ * per token: the records of consecutive tokens are consecutive in q8, so the work-group streams
+ * them coalesced. Records of tokens past N stage zero, so every consumer reads the tile without a
+ * bounds test (a zero record's scale bits are 0.0f and its zero point 0). */
 #define NF_MMQ_Q8_GATHER(c, TN, q8, q_stride, q_off, n0, N) \
-    for (int j = 0; j < (TN) / 16; j++) { \
-        const int tok = n0 + ty + 16 * j; \
-        const int ok = tok < N; \
-        const nf_i64 rec = (nf_i64)(q_off) + ((nf_i64)tok * (q_stride) + (c) / NF_MMQ_TK) * NF_MMQ_RC; \
-        xdv[ty + 16 * j] = ok ? nf_mmq_rec_d(q8[rec + NF_MMQ_QS]) : 0.0f; \
-        for (int h = 0; h < NF_MMQ_SH; h++) { \
-            xsu[(ty + 16 * j) * NF_MMQ_SH + h] = ok ? (int)q8[rec + NF_MMQ_QS + 1 + h] : 0; \
-        } \
-        xz[ty + 16 * j] = ok ? (int)q8[rec + NF_MMQ_QS + 1 + NF_MMQ_SH] : 0; \
-    } \
-    q8_row0 = (q8) + (nf_i64)(q_off) + ((nf_i64)(n0) * (q_stride) + (c) / NF_MMQ_TK) * NF_MMQ_RC;
+    for (int i = lid; i < (TN) * NF_MMQ_RC; i += NF_MMQ_WG) { \
+        const int tok = i / NF_MMQ_RC; \
+        xr[i] = n0 + tok < (N) \
+            ? (q8)[(nf_i64)(q_off) + ((nf_i64)(n0 + tok) * (q_stride) + (c) / NF_MMQ_TK) * NF_MMQ_RC \
+                   + i % NF_MMQ_RC] : 0u; \
+    }
 
-/* Fills the half code sums of tile sel from its codes, under the zero-total gate of the gather. */
+/* Fills the half code sums of tile sel from its codes, under the zero-total gate of the gather
+ * (token 0's zero-point unit, uniform over the work-group). */
 #define NF_MMQ_WSUFILL(sel) \
-    if (xz[0] != 0 && ty < NF_MMQ_TM / NF_MMQ_TX) { \
+    if (xr[NF_MMQ_QS + 1 + NF_MMQ_SH] != 0u && ty < NF_MMQ_TM / NF_MMQ_TX) { \
         const int sr = tx + NF_MMQ_TX * ty; \
         for (int h = 0; h < NF_MMQ_SH; h++) { \
             int sum = 0; \
@@ -200,29 +248,41 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
         } \
     }
 
+/*
+ * The pipe keeps the next two chunks of the weight stream in flight: while chunk c is combined,
+ * the register sets hold the codes of chunks c + 1 (issued one iteration ago) and c + 2 (issued
+ * this iteration); stage j cycles the tiles buf j % NF_MMQ_PIPE_BUF and register set j % 2. The
+ * prologue loads stage 0, commits it to tile 0, then issues stages 1 and 2 before the first
+ * combine, so the stream is two-deep from the first iteration on. Tile reuse is three iterations
+ * apart and the pre-commit barrier retires the combine that read the tile three iterations before,
+ * so the commit cannot race a reader.
+ */
 #define NF_MMQ_PIPE(cstart, kend, TN, COMBINE, BS, BB, CODE, SCALE, OFF, XA, XB) \
-    nf_i8 pf[NF_MMQ_SP]; \
-    float psc = 0.0f; \
-    float pof = 0.0f; \
+    uint pfw[NF_MMQ_PIPE_SETS][NF_MMQ_SP4]; \
+    float psc[NF_MMQ_PIPE_SETS]; \
+    float pof[NF_MMQ_PIPE_SETS]; \
     int sel = 0; \
     if ((cstart) < (kend)) { \
-        NF_MMQ_PREFETCH((cstart), m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
-        NF_MMQ_STAGE_COMMIT(0) \
+        NF_MMQ_PREFETCH(0, (cstart), m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
+        NF_MMQ_STAGE_COMMIT(0, 0) \
         NF_MMQ_Q8_GATHER((cstart), (TN), q8, q_stride, q_off, n0, N) \
+        if ((cstart) + NF_MMQ_TK < (kend)) { \
+            NF_MMQ_PREFETCH(1, (cstart) + NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
+        } \
+        if ((cstart) + 2 * NF_MMQ_TK < (kend)) { \
+            NF_MMQ_PREFETCH(0, (cstart) + 2 * NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
+        } \
         barrier(CLK_LOCAL_MEM_FENCE); \
         NF_MMQ_WSUFILL(0) \
         barrier(CLK_LOCAL_MEM_FENCE); \
         COMBINE(0, XA, XB); \
-        if ((cstart) + NF_MMQ_TK < (kend)) { \
-            NF_MMQ_PREFETCH((cstart) + NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
-        } \
-        sel = 1; \
-        for (int c = (cstart) + NF_MMQ_TK; c < (kend); c += NF_MMQ_TK, sel ^= 1) { \
+        for (int c = (cstart) + NF_MMQ_TK, j = 1; c < (kend); c += NF_MMQ_TK, j++) { \
             barrier(CLK_LOCAL_MEM_FENCE); \
             NF_MMQ_Q8_GATHER(c, (TN), q8, q_stride, q_off, n0, N) \
-            NF_MMQ_STAGE_COMMIT(sel) \
-            if (c + NF_MMQ_TK < (kend)) { \
-                NF_MMQ_PREFETCH((c) + NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
+            sel = j % NF_MMQ_PIPE_BUF; \
+            NF_MMQ_STAGE_COMMIT(j % NF_MMQ_PIPE_SETS, sel) \
+            if (c + 2 * NF_MMQ_TK < (kend)) { \
+                NF_MMQ_PREFETCH(j % NF_MMQ_PIPE_SETS, c + 2 * NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
             } \
             barrier(CLK_LOCAL_MEM_FENCE); \
             NF_MMQ_WSUFILL(sel) \
@@ -234,10 +294,11 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
 /*
  * Packed-dot path: dot of one 16-element half of a weight-code row with the staged code row of the
  * token, 4-way with __dp4a on CUDA sm_61+, scalar int elsewhere (HIP has no __dp4a, so its dialect
- * takes the scalar loop). rec points at the token's first code int; the halves of a 32-deep stage
- * carry their own scales, so the caller sums the half dots under those scales.
+ * takes the scalar loop). rec points at the half's first code int in the staged record tile; the
+ * halves of a 32-deep stage carry their own scales, so the caller sums the half dots under those
+ * scales.
  */
-NF_INLINE int nf_mmq_half_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_GLOBAL const uint* rec) {
+NF_INLINE int nf_mmq_half_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_LOCAL_PTR const uint* rec) {
 #if defined(__CUDACC__) && !defined(__HIP__) \
     && (defined(NF_CUDA_PREPROCESS) || !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610)
     int ib = 0;
@@ -257,11 +318,6 @@ NF_INLINE int nf_mmq_half_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_GLOBAL const 
 }
 
 #if NF_MMQ_TENSOR
-/* One staged code word: 4 consecutive code bytes (element depth k + i in byte i), int-aligned. */
-NF_INLINE uint nf_mmq_frag4(NF_GLOBAL const uint* rec, int tok_ok) {
-    return tok_ok ? *rec : 0u;
-}
-
 /* d = a * b^T + d over one 16x8x32 int8 tile (row-major A fragment, column-major B fragment). */
 NF_INLINE void nf_mmq_mma_m16n8k32(int d[4], const uint a[4], const uint b[2]) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -284,17 +340,17 @@ NF_INLINE void nf_mmq_mma_m16n8k16(int d[4], const uint a[2], uint b) {
  * l of block nb holds the accumulator positions (r, c), (r, c+1),
  * (r+8, c), (r+8, c+1) at r = (w >> 1) * 16 + (l >> 2), c = block start + (l & 3) * 2 in
  * acc[nb * 4 ..]; its A fragment registers carry rows r and r + 8 at depths (l & 3) * 4 (+16), its
- * B registers token block start + (l >> 2) at the same depths, loaded from the staged code records
- * (PTX mma fragment layouts for .s8, as llama.cpp's tile<16, 8, int> / tile<8, 8, int>).
+ * B registers token block start + (l >> 2) at the same depths, loaded from the staged record tile
+ * xr the gather filled (PTX mma fragment layouts for .s8, as llama.cpp's tile<16, 8, int> /
+ * tile<8, 8, int>).
  * SG == 32 takes one k32 product under the stage's single (scale, offset); SG == 16 takes one k16
- * product per half under that half's pair. xdv / xsu hold the tokens' d and code sums.
+ * product per half under that half's pair. The tokens' d, code sums and zero points read the
+ * record tile; records of tokens past N are zero, so no bounds test applies.
  */
-NF_INLINE void nf_mmq_tensor_stage(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint* q8_row0,
-                                   int q_stride, int n0, int tn, int N,
+NF_INLINE void nf_mmq_tensor_stage(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR const uint* xr,
+                                   int tn,
                                    NF_LOCAL_PTR const float* wsc, NF_LOCAL_PTR const float* wof,
                                    NF_LOCAL_PTR const int* wsu,
-                                   NF_LOCAL_PTR const float* xdv, NF_LOCAL_PTR const int* xsu,
-                                   NF_LOCAL_PTR const int* xz,
                                    int lid, float acc[], const int sg) {
     const int warp = lid >> 5, lane = lid & 31;
     const int r0 = (warp >> 1) * 16 + (lane >> 2);
@@ -310,19 +366,18 @@ NF_INLINE void nf_mmq_tensor_stage(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const
         const int c0 = cbase + (lane & 3) * 2;
         const int cb = cbase + (lane >> 2);
         const int cc[4] = {c0, c0 + 1, c0, c0 + 1};
-        /* the staged code words of this lane's token: depths (l & 3) * 4 (+16); tokens past N load 0 */
-        const int tokok = n0 + cb < N;
-        NF_GLOBAL const uint* rec = q8_row0 + (nf_i64)cb * (q_stride * NF_MMQ_RC);
-        const uint b[2] = {nf_mmq_frag4(rec + kf / 4, tokok), tokok ? rec[kf / 4 + NF_MMQ_TK / 8] : 0u};
+        /* the staged code words of this lane's token: depths (l & 3) * 4 (+16); zero for dead tokens */
+        const int rb = cb * NF_MMQ_RC;
+        const uint b[2] = {xr[rb + kf / 4], xr[rb + kf / 4 + NF_MMQ_TK / 8]};
         float sd[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         if (sg == 32) {
             int d[4] = {0, 0, 0, 0};
             nf_mmq_mma_m16n8k32(d, a, b);
             for (int i = 0; i < 4; i++) {
-                const int si = rr[i] * NF_MMQ_SH, xi = cc[i] * NF_MMQ_SH;
-                sd[i] = wsc[si] * (float)d[i] + wof[si] * (float)(xsu[xi] + xsu[xi + 1])
-                        - (float)xz[cc[i]] * (wsc[si] * (float)(wsu[si] + wsu[si + 1])
-                            + wof[si] * (float)(2 * 16));
+                const int si = rr[i] * NF_MMQ_SH, xi = cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1;
+                sd[i] = wsc[si] * (float)d[i] + wof[si] * (float)((int)xr[xi] + (int)xr[xi + 1])
+                        - (float)(int)xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH]
+                            * (wsc[si] * (float)(wsu[si] + wsu[si + 1]) + wof[si] * (float)(2 * 16));
             }
         } else {
             for (int h = 0; h < NF_MMQ_SH; h++) {
@@ -331,13 +386,15 @@ NF_INLINE void nf_mmq_tensor_stage(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const
                 nf_mmq_mma_m16n8k16(d, ah, b[h]);
                 for (int i = 0; i < 4; i++) {
                     const int si = rr[i] * NF_MMQ_SH + h;
-                    sd[i] += wsc[si] * (float)d[i] + wof[si] * (float)xsu[cc[i] * NF_MMQ_SH + h]
-                            - (float)xz[cc[i]] * (wsc[si] * (float)wsu[si] + wof[si] * (float)16);
+                    sd[i] += wsc[si] * (float)d[i]
+                            + wof[si] * (float)(int)xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1 + h]
+                            - (float)(int)xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH]
+                                * (wsc[si] * (float)wsu[si] + wof[si] * (float)16);
                 }
             }
         }
         for (int i = 0; i < 4; i++) {
-            acc[nb * 4 + i] += xdv[cc[i]] * sd[i];
+            acc[nb * 4 + i] += nf_mmq_rec_d(xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS]) * sd[i];
         }
     }
 }
@@ -347,17 +404,15 @@ NF_INLINE void nf_mmq_tensor_stage(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const
  * One stage's integer dots and their (scale, offset) / d combine into acc. Tensor path:
  * nf_mmq_tensor_stage. Packed-dot path (one 16-element half per stage): work-item lid accumulates
  * rows tx + NF_MMQ_TX*q against each of its tn / 16 tokens ty + 16*j, reading the token's staged
- * codes directly; acc[j * NF_MMQ_RM + q] holds the result.
+ * codes from the record tile; acc[j * NF_MMQ_RM + q] holds the result.
  */
-NF_INLINE void nf_mmq_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint* q8_row0,
-                              int q_stride, int n0, int tn, int N,
+NF_INLINE void nf_mmq_combine(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR const uint* xr,
+                              int n0, int tn, int N,
                               NF_LOCAL_PTR const float* wsc, NF_LOCAL_PTR const float* wof,
                               NF_LOCAL_PTR const int* wsu,
-                              NF_LOCAL_PTR const float* xdv, NF_LOCAL_PTR const int* xsu,
-                              NF_LOCAL_PTR const int* xz,
                               int lid, float acc[], const int sg) {
 #if NF_MMQ_TENSOR
-    nf_mmq_tensor_stage(wq, q8_row0, q_stride, n0, tn, N, wsc, wof, wsu, xdv, xsu, xz, lid, acc, sg);
+    nf_mmq_tensor_stage(wq, xr, tn, wsc, wof, wsu, lid, acc, sg);
 #else
     const int tx = lid % NF_MMQ_TX, ty = lid / NF_MMQ_TX;
     for (int j = 0; j < tn / 16; j++) {
@@ -365,7 +420,7 @@ NF_INLINE void nf_mmq_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint
         if (n0 + tok >= N) {
             continue;
         }
-        NF_GLOBAL const uint* rec = q8_row0 + (nf_i64)tok * (q_stride * NF_MMQ_RC);
+        NF_LOCAL_PTR const uint* rec = xr + tok * NF_MMQ_RC;
         for (int q = 0; q < NF_MMQ_RM; q++) {
             const int sr = tx + NF_MMQ_TX * q;
             float sd = 0.0f;
@@ -373,11 +428,12 @@ NF_INLINE void nf_mmq_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint
             for (int h = 0; h < NF_MMQ_SH; h++) {
                 const int ib = nf_mmq_half_dot(wq + sr * NF_MMQ_TK + 16 * h, rec + 4 * h);
                 sd += wsc[sr * NF_MMQ_SH + h] * (float)ib
-                        + wof[sr * NF_MMQ_SH + h] * (float)xsu[tok * NF_MMQ_SH + h];
+                        + wof[sr * NF_MMQ_SH + h] * (float)(int)rec[NF_MMQ_QS + 1 + h];
                 corr += wsc[sr * NF_MMQ_SH + h] * (float)wsu[sr * NF_MMQ_SH + h]
                         + wof[sr * NF_MMQ_SH + h] * (float)16;
             }
-            acc[j * NF_MMQ_RM + q] += xdv[tok] * (sd - (float)xz[tok] * corr);
+            acc[j * NF_MMQ_RM + q] += nf_mmq_rec_d(rec[NF_MMQ_QS])
+                    * (sd - (float)(int)rec[NF_MMQ_QS + 1 + NF_MMQ_SH] * corr);
         }
     }
 #endif
@@ -418,24 +474,23 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
 
 /*
  * The code tiles are declared as int arrays so every 4-byte fragment / dp4a load is aligned; the
- * (scale, offset) tiles hold NF_MMQ_SH pairs per row, and the tokens' d and code sums are gathered
- * from the staged records once per stage. The code / (scale, offset) / code-sum tiles exist in two
- * copies, one per in-flight chunk of the pipelined stage (NF_MMQ_PIPE). row_bytes and the staging
- * arrays belong to the kernel; TN is the kernel's token tile (the per-token arrays size to it).
+ * (scale, offset) tiles hold NF_MMQ_SH pairs per row, and each stage gathers the tile's whole
+ * staged record block (NF_MMQ_RC units per token: the code ints the B fragments and packed dots
+ * read, the chunk scale d, the half code sums and the zero point) into the shared record tile xr.
+ * The code / (scale, offset) / code-sum tiles exist in NF_MMQ_PIPE_BUF copies, one per in-flight
+ * chunk of the pipelined stage (NF_MMQ_PIPE). row_bytes and the record tile belong to the kernel;
+ * TN is the kernel's token tile (the record tile sizes to it).
  */
 #define NF_MMQ_KERNEL_BODY(TN, BS, BB, GEMM_ARGS) \
     const int lid = get_local_id(0); \
     const int tx = lid % NF_MMQ_TX, ty = lid / NF_MMQ_TX; \
     const nf_i64 row_bytes = (nf_i64)(K / (BS)) * (BB); \
-    NF_LOCAL int wq_w[2 * NF_MMQ_WS / 4]; \
-    NF_LOCAL float wsc[2 * NF_MMQ_TM * NF_MMQ_SH]; \
-    NF_LOCAL float wof[2 * NF_MMQ_TM * NF_MMQ_SH]; \
-    NF_LOCAL float xdv[(TN)]; \
-    NF_LOCAL int xsu[(TN) * NF_MMQ_SH]; \
-    NF_LOCAL int xz[(TN)]; \
-    NF_LOCAL int wsu[2 * NF_MMQ_TM * NF_MMQ_SH]; \
+    NF_LOCAL int wq_w[NF_MMQ_PIPE_BUF * NF_MMQ_WS / 4]; \
+    NF_LOCAL float wsc[NF_MMQ_PIPE_BUF * NF_MMQ_TM * NF_MMQ_SH]; \
+    NF_LOCAL float wof[NF_MMQ_PIPE_BUF * NF_MMQ_TM * NF_MMQ_SH]; \
+    NF_LOCAL uint xr[(TN) * NF_MMQ_RC]; \
+    NF_LOCAL int wsu[NF_MMQ_PIPE_BUF * NF_MMQ_TM * NF_MMQ_SH]; \
     NF_LOCAL_PTR nf_i8* wq = (NF_LOCAL_PTR nf_i8*)wq_w; \
-    NF_GLOBAL const uint* q8_row0; \
     float acc[NF_MMQ_ACC_OF(TN)]; \
     for (int i = 0; i < NF_MMQ_ACC_OF(TN); i++) \
         acc[i] = 0.0f; \
@@ -447,9 +502,9 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
  * the plain kernels the device tile NF_MMQ_TN).
  */
 #define NF_MMQ_INT8_COMBINE(sel, TN, SG) \
-    nf_mmq_combine(wq + (sel) * NF_MMQ_WS, q8_row0, q_stride, n0, (TN), N, \
+    nf_mmq_combine(wq + (sel) * NF_MMQ_WS, xr, n0, (TN), N, \
                    wsc + (sel) * NF_MMQ_TM * NF_MMQ_SH, wof + (sel) * NF_MMQ_TM * NF_MMQ_SH, \
-                   wsu + (sel) * NF_MMQ_TM * NF_MMQ_SH, xdv, xsu, xz, lid, acc, (SG))
+                   wsu + (sel) * NF_MMQ_TM * NF_MMQ_SH, lid, acc, (SG))
 
 #define NF_MMQ_GEMM_TN(NAME, TN, BS, BB, SG, CODE, SCALE, OFF) \
 NF_KERNEL void NAME( \
@@ -521,7 +576,7 @@ NF_INLINE void nf_fp8_mma_m16n8k32(float d[4], const uint a[4], const uint b[2])
 
 /* Scalar E4M3 dot of one NF_MMQ_TK-deep row of staged weight codes with a token's staged codes: the
  * datapath of the packed-dot configs and of the architectures below sm_89. */
-NF_INLINE float nf_fp8_stage_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_GLOBAL const uint* rec) {
+NF_INLINE float nf_fp8_stage_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_LOCAL_PTR const uint* rec) {
     float sum = 0.0f;
     for (int kk = 0; kk < NF_MMQ_TK; kk++) {
         const uint packed = rec[kk >> 2];
@@ -533,11 +588,11 @@ NF_INLINE float nf_fp8_stage_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_GLOBAL con
 
 /* One stage's E4M3 tile products and their scales. Tensor path: the sm_89+ mma over the fragments (the
  * same layouts as the int8 stage), or the scalar dot below sm_89; packed path: one scalar dot per row.
- * tn is the tile's token count (nf_mmq_tensor_stage's). */
-NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint* q8_row0,
-                              int q_stride, int n0, int tn, int N,
-                              NF_LOCAL_PTR const float* wsc, NF_LOCAL_PTR const float* xdv,
-                              int lid, float acc[]) {
+ * tn is the tile's token count (nf_mmq_tensor_stage's). The token codes and chunk scales read the
+ * staged record tile xr the gather filled (dead tokens stage zero codes and a 0.0f scale). */
+NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR const uint* xr,
+                              int n0, int tn, int N,
+                              NF_LOCAL_PTR const float* wsc, int lid, float acc[]) {
 #if NF_MMQ_TENSOR
     const int warp = lid >> 5, lane = lid & 31;
     const int r0 = (warp >> 1) * 16 + (lane >> 2);
@@ -553,11 +608,10 @@ NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint
         const int c0 = cbase + (lane & 3) * 2;
         const int cb = cbase + (lane >> 2);
         const int cc[4] = {c0, c0 + 1, c0, c0 + 1};
-        const int tokok = n0 + cb < N;
-        NF_GLOBAL const uint* rec = q8_row0 + (nf_i64)cb * (q_stride * NF_MMQ_RC);
         float sd[4];
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-        const uint b[2] = {nf_mmq_frag4(rec + kf / 4, tokok), tokok ? rec[kf / 4 + NF_MMQ_TK / 8] : 0u};
+        const int rb = cb * NF_MMQ_RC;
+        const uint b[2] = {xr[rb + kf / 4], xr[rb + kf / 4 + NF_MMQ_TK / 8]};
         float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         nf_fp8_mma_m16n8k32(d, a, b);
         for (int i = 0; i < 4; i++) {
@@ -566,12 +620,12 @@ NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint
 #else
         for (int i = 0; i < 4; i++) {
             const int tok = n0 + cc[i];
-            NF_GLOBAL const uint* trec = q8_row0 + (nf_i64)cc[i] * (q_stride * NF_MMQ_RC);
+            NF_LOCAL_PTR const uint* trec = xr + cc[i] * NF_MMQ_RC;
             sd[i] = tok < N ? wsc[rr[i] * NF_MMQ_SH] * nf_fp8_stage_dot(wq + rr[i] * NF_MMQ_TK, trec) : 0.0f;
         }
 #endif
         for (int i = 0; i < 4; i++) {
-            acc[nb * 4 + i] += xdv[cc[i]] * sd[i];
+            acc[nb * 4 + i] += nf_mmq_rec_d(xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS]) * sd[i];
         }
     }
 #else
@@ -581,10 +635,10 @@ NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint
         if (n0 + tok >= N) {
             continue;
         }
-        NF_GLOBAL const uint* rec = q8_row0 + (nf_i64)tok * (q_stride * NF_MMQ_RC);
+        NF_LOCAL_PTR const uint* rec = xr + tok * NF_MMQ_RC;
         for (int q = 0; q < NF_MMQ_RM; q++) {
             const int sr = tx + NF_MMQ_TX * q;
-            acc[j * NF_MMQ_RM + q] += xdv[tok] * (wsc[sr * NF_MMQ_SH]
+            acc[j * NF_MMQ_RM + q] += nf_mmq_rec_d(rec[NF_MMQ_QS]) * (wsc[sr * NF_MMQ_SH]
                     * nf_fp8_stage_dot(wq + sr * NF_MMQ_TK, rec));
         }
     }
@@ -604,8 +658,8 @@ NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_GLOBAL const uint
 /* The E4M3 combine of buffer sel: no offset term, so wof / wsu / xz of the staged chunk are dead;
  * the third argument is the pipe's forwarded tail, unused here. */
 #define NF_FP8Q_COMBINE(sel, TN, SG) \
-    nf_fp8_combine(wq + (sel) * NF_MMQ_WS, q8_row0, q_stride, n0, (TN), N, \
-                   wsc + (sel) * NF_MMQ_TM * NF_MMQ_SH, xdv, lid, acc)
+    nf_fp8_combine(wq + (sel) * NF_MMQ_WS, xr, n0, (TN), N, \
+                   wsc + (sel) * NF_MMQ_TM * NF_MMQ_SH, lid, acc)
 
 #define NF_FP8Q_GEMM_TN_NAMED(NAME, TN, BS, BB, CODE, SCALE) \
 NF_KERNEL void NAME( \

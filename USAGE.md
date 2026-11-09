@@ -339,6 +339,8 @@ The GPU kernels are organized in two kernel libraries, each built from one set o
 
 Paths are under `src/main/resources`. `kernels/<lib>/manifest.txt` lists a library's sources in build order. A `[cuda]` entry builds only into the CUDA modules: the OpenCL program leaves it out, it needs no Vulkan variant row, and the Vulkan backend does not require its kernels. The headers both libraries share are in `kernels/common` (for example `common/dialect.h`, listed as a `[shared]` manifest entry) and `shaders/common` (`nf_base.glsl`); `shaders/test` holds the backend test shaders. Every other compute shader belongs to a kernel library, and `compileShaders` rejects one outside them. The generated artifacts go to `build/generated/gpu/{cuda,spv,spv-test,check}` and are merged into the resources.
 
+On an OpenCL device with subgroup reductions and `cl_intel_required_subgroup_size`, the `llm` program pins its matvec reductions to the largest subgroup size the device supports (`-DNF_REQD_SG_SIZE=<size>`, program cache key suffix `@<size>`). Every `{T}_MatVec` / `{T}_MatVecN` pair then reduces over one width, so their outputs are bitwise equal, and the matvec reductions, which are bandwidth-bound, run at the device's widest width (on the Arrow Lake iGPU a 9-row step of a Qwen3 0.6B Q8_0 model takes 669 ms at width 32 against 760 at 16 and 1097 at 8). A device without the extension keeps the compiler's per-kernel choice.
+
 What each API needs to run a library:
 
 | API | `llm` | `train` |
@@ -428,7 +430,7 @@ vkHw.shutdown();
 
 **AUTO is device-first** (`BackendSelector`):
 1. **Target device.** The target is the first device, in any API, whose name contains `neuralfree.device` (case-insensitive). If none is named, it is the OpenCL ranking's winner (discrete before integrated, then measured), else Vulkan's, else CUDA's.
-2. **API order.** Each API in `neuralfree.backend.order` (default `vulkan,cuda,opencl,hip`) is tried on the target device. The first one that is accepted wins. The views one GPU offers through several APIs are recognised as one device.
+2. **API order.** Each API in `neuralfree.backend.order` (default `metal,vulkan,cuda,opencl,hip`) is tried on the target device. The first one that is accepted wins. With the default order, the target vendor's native API goes first: CUDA on an NVIDIA GPU, where it measured 4-5x the prefill and 1.6-2x the generation speed of Vulkan and OpenCL on an RTX 5080 Laptop. An order set through the property is followed as written. The views one GPU offers through several APIs are recognised as one device.
 3. **Fallback.** If no API runs the target, each API's own winner is tried, discrete first.
 
 The per-API properties `neuralfree.opencl.device`, `neuralfree.cuda.device`, `neuralfree.vulkan.device` and `neuralfree.hip.device` override `neuralfree.device` within one API. `neuralfree.backend.order=cuda,opencl`, for example, keeps AUTO off Vulkan.
@@ -467,17 +469,42 @@ On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts,
 - both head dimensions are multiples of 16, at most 128;
 - the layer uses standard attention (MLA keeps its own path).
 
-Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. Single-row decode keeps the scalar decode kernel. On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys at head dimension 128 takes 0.38 ms against 1.84 ms on the scalar kernel. OpenCL and Vulkan run the scalar kernels.
+Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. Single-row decode steps run it too, as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128), except on CUDA and HIP past 128 live keys where a KV head serves at most two query heads: those steps run the split-K decode kernel's warp-shuffle form (128 tokens generated after 512 cached on the RTX 5080 Laptop: 320 against 277 t/s on Qwen3-Embedding-0.6B, 201 against 187 on Qwen3-VL-Embedding-2B; with four query heads per KV head the one-row prefill stays ahead at every depth). The paged kernel's single-row steps keep the paged decode kernel. On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys at head dimension 128 takes 0.38 ms against 1.84 ms on the scalar kernel. OpenCL and Vulkan run the scalar kernels.
 
 ### Fast GEMM for prefill and batched decode
 
-Projections of 4 or more tokens (`FAST_GEMM_MIN_TOKENS`) take the fast GEMM lane of their weight type where the
-device runs it, and projections of 8 or more (`TILED_MIN_TOKENS`) the exact tiled GEMM otherwise. If a kernel is
-unavailable they fall back automatically: fast GEMM → tiled GEMM → batched matvec. Steps narrower than the device's
-token tile, such as a speculative verify, run the 16-token twins `<T>_MatMul_MMQ_S` and `<T>_MatMul_W4A8_S`, split
-along K when their grid would not fill the device; the weight stream is double-buffered, so the next tile's loads
-overlap the current tile's dot products. On CUDA a 9-row step of a Qwen3 4B Q8_0 model takes 28.6 ms against 47.0
-through the 64-token tile, and a 16-row step 30.1 against 46.4.
+A projection of a few tokens leaves the matvec family for the fast GEMM lane of its weight type at a row count
+measured per device kind: the backend together with the PCI vendor, whether the device is integrated or discrete,
+and on CUDA the int8 tensor band (sm_80 or newer). One GPU's measured crossover therefore never governs another
+device of the same API. The measured kinds (`SmallBatchCrossover`):
+
+| Device kind | Fast lane from rows | Float `<T>_MatVecN` up to rows | Int8 multi-column matvec up to rows |
+|---|---|---|---|
+| CUDA, NVIDIA discrete, sm_80+ | Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS: 17, past the counted matvec (MMQ); F16: 4 (MMA) | none | Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS: 16 |
+| Vulkan, NVIDIA discrete | Q8_0: 4 (cooperative matrix); F16: 4 (MMA) | none | none |
+| OpenCL, NVIDIA discrete | Q8_0, F16: none; Q4_0: 9 (MMQ, portable integer arithmetic); Q4_K, Q5_K, Q6_K, IQ4_XS: 17 below 8M elements, 16 on 8M-element projections and up (MMQ; the counted matvec serves through 15) | Q8_0 and F16: 16 | Q8_0: 16; Q4_K, Q5_K, Q6_K, IQ4_XS: 16 below 8M elements and 15 on 8M-element projections and up; Q4_0: 15 on 8M-element projections and up, 8 below |
+| Vulkan, Intel integrated | Q8_0: 4 (cooperative matrix); F16: none | none | none |
+| OpenCL, Intel integrated | Q8_0: 4 (MMQ); F16: none | F16: 16 | Q8_0: 3 |
+
+The "Fast lane from rows" numbers for the measured quantized types are where the GEMM lane takes over from the
+integer-dot matvec: the matvec's exact-token-count forms hold the rows below it where they measured faster. On
+CUDA the counted forms win every count through 16 on the measured types; on OpenCL NVIDIA they win through 15 on
+the 8M-element shapes, while a 16-row step stays with the lane (its tile wins 9728x2560, 19456x2560 and the head
+at 16 rows). The single counted form and its paired twin are chosen per launch: on OpenCL NVIDIA, Q4_K, Q5_K and
+IQ4_XS take the single form at 9 or more tokens on launches of 9728 rows and up (the paired form wins the
+transposed 2560-row launches), and every other measured shape pairs. Below 8M weight elements on the OpenCL NVIDIA
+kind the matvec lane's evidence does not reach, so the GEMM lane keeps the crossover the defaults give.
+
+A device of another vendor or class, or a type a kind does not list, keeps the defaults: the fast lane from 4 rows,
+the int8 multi-column matvec below it (up to 8 rows without a fast lane), no float multi-column matvec, and the exact
+tiled GEMM from 8 rows (`TILED_MIN_TOKENS`) where no fast lane runs. Rows below the lanes take the batched matvec.
+If a kernel is unavailable the projection falls back automatically: fast GEMM → tiled GEMM → batched matvec. Steps narrower than the device's
+token tile, such as a speculative verify, run the 16-token twins `<T>_MatMul_MMQ_S` and `<T>_MatMul_W4A8_S` on a
+shared record tile, split along K when their grid would not fill about 1.3 waves of the device; the weight stream is
+a depth-2 software pipeline, so the next tile's loads overlap the current tile's dot products, and each 4-bit word
+decodes in two ALU ops. On an RTX 5080 Laptop a 9-row decode step of a Qwen3 4B model takes 14.3 ms in Q8_0 and 19.8 ms in
+Q4_K_M (llama.cpp 10.3 and 7.9), a 16-row step 21.0 and 28.4 ms (llama.cpp 10.5 and 8.7); a 512-token prefill runs
+2676 t/s in Q8_0 (llama.cpp 3069) and 2493 t/s in Q4_K_M (llama.cpp 7712).
 
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
@@ -646,6 +673,18 @@ How it behaves:
   layer outputs, a host transfer inside the trunk, an MoE layer whose experts come from the host expert cache, a different dispatch sequence, Vulkan push
   constants or OpenCL scalar arguments changed by per-step scalars where mutable dispatch is unavailable. After two mismatched replays or three aborted
   captures, replay stops trying until the step shape changes again.
+- With `chainReplay` on (CUDA), a multi-row decode step of 2 to 16 rows (a speculative verify, a small decode
+  batch) is captured once per row count and replayed the same way: after two verified body steps the step replays
+  from its start position alone, every per-step value of its attention (key count, split layout, the combine grids)
+  derived from that position and checked against the capture. A row count other than the captured one records the
+  step again, a position that does not follow the last runs one body step without dropping the capture, and
+  tree-masked, paged, context-parallel and dual-chunk steps always run directly. Output is the same token for token
+  as running the step directly.
+- Where the layer runs [tensor-core flash attention](#tensor-core-flash-attention), a one-row decode step runs
+  that kernel as a one-row prefill instead of the scalar split-K decode kernel, which measured slower even at one row
+  (48 against 65 us per layer at 256 keys, 32 query and 8 KV heads of 128). On CUDA and HIP, a layer whose KV heads
+  serve at most two query heads switches to the decode kernel's warp-shuffle form past 128 live keys, and the replay
+  captures again once where the route changes. Other layers keep the scalar decode kernel.
 - Batched calls (`forwardBatch`) and prefill steps always run directly; a paged/batched decode does not
   use the replay.
 
@@ -752,35 +791,56 @@ the layer step that reads it in the attention, dense feed-forward, Gated DeltaNe
 DeepSeek-V4, MSA, QSA, Step5 and Zamba2 layers; elsewhere each projection quantizes its own. The weight codes are combined with the activation codes by packed 4x8-bit
 integer dot products (Vulkan `GL_EXT_integer_dot_product`, CUDA `__dp4a`, portable integer
 arithmetic on OpenCL), as llama.cpp's MMVQ path does; where it measured faster, one workgroup computes two output rows
-from each read of the quantized row (`{T}_MatVec2_Q8`, `{T}_MatVec2FusedGateUp_Q8`): every backend except Q4_K, Q5_K,
-Q8_0 and Q8_K on CUDA and Q8_0 and Q8_K on OpenCL, which keep the single-row form. Decode output then differs from the F32 path
+from each read of the quantized row (`{T}_MatVec2_Q8`, `{T}_MatVec2FusedGateUp_Q8`): every device kind except Q4_K, Q5_K,
+Q8_0 and Q8_K on CUDA, Q8_0 and Q8_K on the NVIDIA OpenCL device, Q8_K on the NVIDIA Vulkan device and Q8_0, Q5_K
+and Q6_K on the Intel OpenCL iGPU, which keep the single-row form. Decode output then differs from the F32 path
 only by the 8-bit activation quantization error.
 
 Supported weight types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, MXFP4, NVFP4, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K,
 IQ4_NL, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ3_K, IQ3_KS, IQ1_S and IQ1_M, in the plain and the
 fused gate/up projections. A step of 2 to 8 tokens (a short speculative verify, a small decode batch) runs the
-multi-column form `{T}_MatVecN_Q8`, which reads each weight row once for all of the step's tokens and gives each
-token the single-row kernel's result bit for bit. A weight with a [fast GEMM lane](#fast-gemm-for-prefill-and-batched-decode)
-leaves the multi-column form from 4 tokens, where the GEMM's flat cost beats the matvec's per-row integer dots on a
-Qwen3 4B Q8_0 model on CUDA (2 rows 17.7 ms through the matvec against 27.5 through the GEMM, 4 rows 29.6 against
-27.7); a weight without one keeps it up to 8 tokens. Longer steps and prefill run the GEMMs. Q8_0 weights meet the Q8_1 row as ggml's `vec_dot_q8_0_q8_1` does.
+exact-token-count form `{T}_MatVecN<n>_Q8` of a plain projection, which compiles the step's own token count
+into the kernel: it reads each weight row once for all of the step's tokens and gives each token the single-row
+kernel's result bit for bit, and where the two-row form measured faster it runs `{T}_MatVec2N<n>_Q8`, one
+workgroup per two weight rows over the same activation rows with the identical results. Q8_0 instantiates the
+counted forms to 16 tokens, and its measured entries keep the GEMM lanes out of the whole range on CUDA sm_80+
+and on the NVIDIA OpenCL kind. A weight with a [fast GEMM lane](#fast-gemm-for-prefill-and-batched-decode)
+leaves the multi-column form where the GEMM's flat cost beats the matvec's per-row integer dots, measured per
+kind and type (`SmallBatchCrossover`): on CUDA sm_80+ the counted forms hold the rows through 8 tokens on Q4_K
+and Q6_K and on the 4B-class Q4_0, Q5_K and IQ4_XS projections, whose 0.6B-class projections keep the matvec
+through 16 (kernel medians at 2 tokens, 4096x1024: Q4_0 10.3us paired against the MMQ small tile's 45.8, Q4_K
+8.8 against 32.6, IQ4_XS 10.6 against 57.2; 19456x2560: Q4_0 36.5 against 234.8, Q4_K 52.0 against 215.7,
+IQ4_XS 67.0 against 343.0), and on the NVIDIA OpenCL kind the counted forms hold 2..8 on the measured types
+(19456x2560 at 2 tokens: Q4_K 114.5us paired against the MMQ lane's 275.6) while the lane keeps 9..16. A step
+above a type's counted range runs the runtime-count `{T}_MatVecN_Q8` where its entry serves it (Q8_0 to 16
+tokens); a weight without a measured counted win keeps the previous dispatch. Longer steps and prefill run the
+GEMMs. Q8_0 weights meet the Q8_1 row as ggml's `vec_dot_q8_0_q8_1` does.
 
 Selection: `-Dneuralfree.matvec.int8=auto|on|off`
 
 - `auto` (default): use the lane where the device reports integer dot product support and the kernel
   is available, unless the weight type measured slower with the lane than with the F32 matvec on that
-  backend (RTX 5080 Laptop measurements over 0.6B to 8B decoder projection shapes):
+  kind of device (`Int8MatvecTuning`, keyed like the crossover above; measured on the RTX 5080 Laptop
+  over CUDA, OpenCL and Vulkan and on the Intel Arrow Lake iGPU over Vulkan and OpenCL, over 0.6B to 8B
+  decoder projection shapes):
 
-  | Backend | Never the lane | The lane from 4M weight elements (rows times columns) up |
+  | Device kind | Never the lane | The lane from 4M weight elements (rows times columns) up |
   |---|---|---|
-  | CUDA | Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL | MXFP4, NVFP4, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_XS |
-  | OpenCL | MXFP4, NVFP4, IQ4_NL, IQ4_XS | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K |
-  | Vulkan | Q4_0 | |
+  | CUDA, NVIDIA discrete, sm_80+ | Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL | MXFP4, NVFP4, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_XS |
+  | OpenCL, NVIDIA discrete | MXFP4, NVFP4, IQ4_NL, IQ4_XS | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K |
+  | Vulkan, NVIDIA discrete | | every supported type |
+  | Vulkan, Intel integrated | Q4_0 | |
+  | OpenCL, Intel integrated | Q4_1, Q5_0, Q5_1, Q8_0, Q3_K, MXFP4, IQ4_NL, IQ4_XS | Q4_0, Q2_K, Q4_K, Q5_K, Q6_K, Q8_K |
 
-  The Vulkan row was measured on the Intel integrated GPU the machine's Vulkan driver exposed. The second
-  column's types lose the lane's fixed quantizer cost on the 1024-column projections of a
-  0.6B-class model and gain from 4096 columns up. The choice is per projection, so a mixed model keeps
-  the lane for its other types and sizes. Elsewhere the exact F32 matvec runs.
+  The NVIDIA OpenCL device reports no packed dot product, so its row only applies under `on`; the
+  multi-column forms below serve Q8_0, Q4_0, Q4_K, Q5_K, Q6_K and IQ4_XS there under `auto` through the portable
+  integer path, where they measured faster than the float matvec. A device
+  whose kind has no row, and a type its row does not list, keep the feature decision. The second column's
+  types lose the lane's fixed quantizer cost on the 1024-column projections of a 0.6B-class model (on the
+  iGPU about 100-150 us per launch, against 14-20 us on the RTX 5080) and gain from 4096 columns up. Q8_0
+  on the OpenCL iGPU won up to 1.11x on single projections, but the whole 4B decoder step measured
+  0.75-0.85x with the lane, so it never takes it there. The choice is per projection, so a mixed model
+  keeps the lane for its other types and sizes. Elsewhere the exact F32 matvec runs.
 - `on`: use the lane whenever the kernels can run, for every supported type, including the portable
   OpenCL integer path on devices without a packed dot instruction.
 - `off`: never use the lane.
@@ -1487,7 +1547,7 @@ Select it:
 ```
 --backend metal                         # neuralfree
 -Dneuralfree.backend=metal             # engine property
--Dneuralfree.backend.order=metal,vulkan,cuda,opencl,hip   # AUTO order (this is the default)
+-Dneuralfree.backend.order=metal,vulkan,cuda,opencl,hip   # AUTO order (the default; on NVIDIA, CUDA goes first)
 -Dneuralfree.metal.device="M3"         # first Metal device whose name contains this text
 ```
 
@@ -2663,7 +2723,7 @@ M-RoPE targets rope every node at its depth position in each section. Requiremen
 (the default) and a `neuralfree.ubatch` of at least 2. Refused by name: compressed or sliding-window memories, the context shift, per-request LoRA, logprobs
 capture, and a backend without the batched forward. A request whose sampler constrains its output (a grammar,
 `min_tokens`, bad words, allowed tokens) narrows the proposal to one chain, which verifies as the chain round does.
-Under greedy verification on CUDA and OpenCL the accept walk runs on the device (`LLM_TreeAccept`): only the accepted
+Under greedy verification on CUDA, OpenCL and Vulkan the accept walk runs on the device (`LLM_TreeAccept`): only the accepted
 length, the path and the two greedy ids come back instead of the verify rows' logits; sampled verification walks on
 the host. With `neuralfree.gpu.chainReplay` on, the fixed-width verify step is captured once and replayed for every
 round of a generation, the commit's row moves dispatching outside the capture
@@ -4000,7 +4060,8 @@ llama.cpp's `batched-bench`. Every cell of the `-npp x -ntg x -npl` grid prefill
 - `--cpu` or `--backend cpu` runs the CPU engine.
 - The model opens on the CPU engine instead of the GPU only for a reason the GPU cannot change: no usable GPU device
   or driver, the LLM kernel library unavailable on the device, a model that does not fit the device memory, no
-  context that fits it, or an architecture, weight type or layer feature the GPU engine does not implement. The
+  context that fits it, an attention geometry the GPU flash kernels do not serve (head dims that are not positive
+  multiples of 4), or an architecture, weight type or layer feature the GPU engine does not implement. The
   warning names the reason, the startup line shows `Backend: cpu (<reason>)`, and `GET /props` and
   `GET /server-info` carry it as `gpu_fallback_reason` beside `backend`.
 - Any other GPU load failure fails the load with the GPU error, and so does a named refusal of a layer split, `--w12`
@@ -8389,7 +8450,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 
 | Property | Meaning | Default |
 |---|---|---|
-| `neuralfree.backend.order` | AUTO's API preference | `vulkan,cuda,opencl,hip` |
+| `neuralfree.backend.order` | AUTO's API preference; when unset, the target vendor's native API (CUDA on NVIDIA) goes first | `metal,vulkan,cuda,opencl,hip` |
 | `neuralfree.opencl.device`, `neuralfree.cuda.device`, `neuralfree.vulkan.device`, `neuralfree.hip.device` | Per-API device-name substring; takes precedence over `neuralfree.device` for that API | none |
 | `neuralfree.opencl.benchmark.disable` | Rank OpenCL devices on published attributes only | false |
 | `neuralfree.opencl.disable` | Skip OpenCL enumeration | false |

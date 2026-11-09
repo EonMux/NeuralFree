@@ -563,6 +563,7 @@ public final class GpuWavTokenizer implements WavTokenizerDecoder.Backend {
         fa[AttnKernels.ARG_FA_BUF_OUT] = tok.buffer();
         fa[AttnKernels.ARG_FA_BUF_PARTIAL] = direct ? placeholders.scratchFloats() : partials;
         fa[AttnKernels.ARG_FA_BUF_KV_SCALES] = placeholders.kvScalesOnes();
+        fa[AttnKernels.ARG_FA_BUF_TREE_MASK] = placeholders.readOnlyInts();
         ops.enqueue(AttnKernels.flashAttn(KvDType.F32), plan.prefillGlobal(t, split.count()), FlashAttnTiling.prefillLocal(),
                 fa);
         if (direct) {

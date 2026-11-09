@@ -39,7 +39,7 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -224,22 +224,22 @@ public class GpuMambaMixerTest {
         throw new AssertionError("no factory for " + l.mixerKind());
     }
 
-    private List<Dispatch> decode() {
+    private List<FakeDispatch> decode() {
         backend.clearLog();
         mixer.decode(0, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
         return backend.dispatches();
     }
 
-    private List<Dispatch> prefill(int nTokens) {
+    private List<FakeDispatch> prefill(int nTokens) {
         backend.clearLog();
         mixer.prefill(0, nTokens, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
         return backend.dispatches();
     }
 
     /** Kernel names with each run of projection launches folded into {@value #PROJ}. */
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             String n = NAMED.contains(d.kernelName()) ? d.kernelName() : PROJ;
             if (!(PROJ.equals(n) && !out.isEmpty() && PROJ.equals(out.get(out.size() - 1)))) {
                 out.add(n);
@@ -248,9 +248,9 @@ public class GpuMambaMixerTest {
         return out;
     }
 
-    private static Dispatch only(List<Dispatch> ds, String kernel) {
-        Dispatch found = null;
-        for (Dispatch d : ds) {
+    private static FakeDispatch only(List<FakeDispatch> ds, String kernel) {
+        FakeDispatch found = null;
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 if (found != null) {
                     throw new AssertionError(kernel + " dispatched more than once");
@@ -282,14 +282,14 @@ public class GpuMambaMixerTest {
         GpuBuffer stateRows = memory.stepInputs().stateRows();
 
         for (int t : new int[]{1, 5, 1}) {
-            List<Dispatch> ds = t == 1 ? decode() : prefill(t);
+            List<FakeDispatch> ds = t == 1 ? decode() : prefill(t);
             assertEquals(Arrays.asList(PROJ, SsmKernels.SSM_CONV, SsmKernels.SSM_SCAN, SsmKernels.MAMBA_GATE_OUT,
                     NormKernels.GROUP_RMS, PROJ), names(ds));
             assertMamba2Conv(only(ds, SsmKernels.SSM_CONV), t, convState, stateRows);
             assertMamba2Scan(only(ds, SsmKernels.SSM_SCAN), t, scanState, stateRows);
             assertMamba2Gate(only(ds, SsmKernels.MAMBA_GATE_OUT), t);
 
-            Dispatch norm = only(ds, NormKernels.GROUP_RMS);
+            FakeDispatch norm = only(ds, NormKernels.GROUP_RMS);
             assertEquals(t, norm.intArg(NormKernels.ARG_GROUP_RMS_N_TOKENS));
             assertEquals(D_INNER, norm.intArg(NormKernels.ARG_GROUP_RMS_D_INNER));
             assertEquals(N_GROUP, norm.intArg(NormKernels.ARG_GROUP_RMS_N_GROUP));
@@ -301,7 +301,7 @@ public class GpuMambaMixerTest {
         }
     }
 
-    private void assertMamba2Conv(Dispatch d, int t, GpuBuffer convState, GpuBuffer stateRows) {
+    private void assertMamba2Conv(FakeDispatch d, int t, GpuBuffer convState, GpuBuffer stateRows) {
         assertEquals(SsmKernels.CONV_ARG_COUNT, d.argCount());
         assertEquals(CONV_CH, d.intArg(0));
         assertEquals(D_CONV, d.intArg(1));
@@ -325,7 +325,7 @@ public class GpuMambaMixerTest {
         assertArrayEquals(new long[]{EL}, d.local());
     }
 
-    private void assertMamba2Scan(Dispatch d, int t, GpuBuffer scanState, GpuBuffer stateRows) {
+    private void assertMamba2Scan(FakeDispatch d, int t, GpuBuffer scanState, GpuBuffer stateRows) {
         SsmKernels.ScanGeometry geo = SsmKernels.ScanGeometry.of(D_STATE, HEAD_DIM, N_HEAD, N_GROUP);
         int gs = N_GROUP * D_STATE;
         assertEquals(SsmKernels.SCAN_ARG_COUNT, d.argCount());
@@ -348,7 +348,7 @@ public class GpuMambaMixerTest {
         assertArrayEquals(new long[]{geo.localSize()}, d.local());
     }
 
-    private void assertMamba2Gate(Dispatch d, int t) {
+    private void assertMamba2Gate(FakeDispatch d, int t) {
         assertEquals(SsmKernels.GATE_ARG_COUNT, d.argCount());
         int[] scalars = {t * D_INNER, D_INNER, HEAD_DIM, CONV_CH, 0, 0, D_IN_PROJ, 0};
         for (int i = 0; i < scalars.length; i++) {
@@ -373,13 +373,13 @@ public class GpuMambaMixerTest {
         mixer.bind(context(Arch.MAMBA, l, true), l);
         int xdb = DT_RANK + 2 * D_STATE;
 
-        List<Dispatch> one = decode();
+        List<FakeDispatch> one = decode();
         assertEquals(Arrays.asList(PROJ, SsmKernels.SSM_CONV, PROJ, NormKernels.ROW_NORM, NormKernels.ROW_NORM,
                 NormKernels.ROW_NORM, PROJ, SsmKernels.SSM_SCAN, SsmKernels.MAMBA_GATE_OUT, PROJ), names(one));
         int[] fieldOff = {0, DT_RANK, DT_RANK + D_STATE};
         int[] fieldLen = {DT_RANK, D_STATE, D_STATE};
         int n = 0;
-        for (Dispatch d : one) {
+        for (FakeDispatch d : one) {
             if (d.kernelName().equals(NormKernels.ROW_NORM)) {
                 assertEquals(1, d.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
                 assertEquals(fieldLen[n], d.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
@@ -392,7 +392,7 @@ public class GpuMambaMixerTest {
             }
         }
         assertEquals(3, n);
-        Dispatch scan = only(one, SsmKernels.SSM_SCAN);
+        FakeDispatch scan = only(one, SsmKernels.SSM_SCAN);
         assertEquals(1, scan.intArg(5));
         assertEquals(D_INNER, scan.intArg(2));
         assertEquals(1, scan.intArg(1));
@@ -400,12 +400,12 @@ public class GpuMambaMixerTest {
         assertEquals(DT_RANK + D_STATE, scan.intArg(14));
         assertSame(slot(ScratchSlots.V), scan.bufferArg(21));
         assertSame(slot(ScratchSlots.ATTN_OUT), scan.bufferArg(25));
-        Dispatch gate = only(one, SsmKernels.MAMBA_GATE_OUT);
+        FakeDispatch gate = only(one, SsmKernels.MAMBA_GATE_OUT);
         assertEquals(1, gate.intArg(2));
         assertEquals(D_INNER, gate.intArg(7));
         assertSame(slot(ScratchSlots.V), gate.bufferArg(12));
 
-        List<Dispatch> three = prefill(3);
+        List<FakeDispatch> three = prefill(3);
         assertEquals(Arrays.asList(PROJ, SsmKernels.SSM_CONV, PROJ, NormKernels.ROW_NORM, NormKernels.ROW_NORM,
                 NormKernels.ROW_NORM, GpuOps.COPY2D, PROJ, SsmKernels.SSM_SCAN, SsmKernels.MAMBA_GATE_OUT, PROJ),
                 names(three));
@@ -441,14 +441,14 @@ public class GpuMambaMixerTest {
         SsmKernels.ScanGeometry geo = SsmKernels.ScanGeometry.of(D_STATE, HEAD_DIM, N_HEAD, 1);
 
         for (int t : new int[]{1, 3}) {
-            List<Dispatch> ds = t == 1 ? decode() : prefill(t);
+            List<FakeDispatch> ds = t == 1 ? decode() : prefill(t);
             assertEquals(Arrays.asList(PROJ, GpuOps.COPY2D, GpuOps.COPY2D, SsmKernels.SSM_CONV, PROJ,
                     NormKernels.ROW_NORM, NormKernels.ROW_NORM, NormKernels.ROW_NORM, GpuOps.COPY2D, PROJ,
                     SsmKernels.SSM_SCAN, SsmKernels.MAMBA_GATE_OUT, PROJ), names(ds));
 
-            List<Dispatch> copies = new ArrayList<>();
-            List<Dispatch> norms = new ArrayList<>();
-            for (Dispatch d : ds) {
+            List<FakeDispatch> copies = new ArrayList<>();
+            List<FakeDispatch> norms = new ArrayList<>();
+            for (FakeDispatch d : ds) {
                 if (d.kernelName().equals(GpuOps.COPY2D)) {
                     copies.add(d);
                 } else if (d.kernelName().equals(NormKernels.ROW_NORM)) {
@@ -458,13 +458,13 @@ public class GpuMambaMixerTest {
             int[][] split = {{HEAD_DIM, 0}, {0, 0}};
             GpuBuffer[] splitDst = {slot(ScratchSlots.K), slot(ScratchSlots.V)};
             for (int i = 0; i < 2; i++) {
-                Dispatch c = copies.get(i);
+                FakeDispatch c = copies.get(i);
                 assertArrayEquals(new int[]{t * N_HEAD, HEAD_DIM, 2 * HEAD_DIM, split[i][0], HEAD_DIM, split[i][1]},
                         new int[]{c.intArg(0), c.intArg(1), c.intArg(2), c.intArg(3), c.intArg(4), c.intArg(5)});
                 assertSame(slot(ScratchSlots.Q), c.bufferArg(6));
                 assertSame(splitDst[i], c.bufferArg(7));
             }
-            Dispatch dtCopy = copies.get(2);
+            FakeDispatch dtCopy = copies.get(2);
             assertEquals(t, dtCopy.intArg(0));
             assertEquals(DT_RANK, dtCopy.intArg(1));
             if (t > 1) {
@@ -477,7 +477,7 @@ public class GpuMambaMixerTest {
             int[] normLen = {D_STATE, D_STATE, DT_RANK};
             int[] normOff = {0, D_STATE, 2 * D_STATE};
             for (int i = 0; i < 3; i++) {
-                Dispatch nd = norms.get(i);
+                FakeDispatch nd = norms.get(i);
                 assertEquals(t, nd.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
                 assertEquals(normLen[i], nd.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
                 assertEquals(xdb, nd.intArg(NormKernels.ARG_ROW_NORM_ROW_STRIDE));
@@ -487,7 +487,7 @@ public class GpuMambaMixerTest {
                 assertSame(slot(ScratchSlots.Q), nd.bufferArg(NormKernels.ARG_ROW_NORM_Y));
             }
 
-            Dispatch conv = only(ds, SsmKernels.SSM_CONV);
+            FakeDispatch conv = only(ds, SsmKernels.SSM_CONV);
             int[] convScalars = {D_INNER, D_CONV, t, SsmKernels.CONV_FLAG_SILU, D_INNER, 0, D_INNER, 0, 0,
                 (D_CONV - 1) * D_INNER};
             for (int i = 0; i < convScalars.length; i++) {
@@ -499,7 +499,7 @@ public class GpuMambaMixerTest {
             assertSame(stateRows, conv.bufferArg(14));
             assertSame(slot(ScratchSlots.ATTN_OUT), conv.bufferArg(15));
 
-            Dispatch scan = only(ds, SsmKernels.SSM_SCAN);
+            FakeDispatch scan = only(ds, SsmKernels.SSM_SCAN);
             int[] scanScalars = {D_STATE, HEAD_DIM, N_HEAD, 1, t, 0, geo.channelsPerGroup(), D_INNER, 0, N_HEAD, 0,
                 xdb, xdb, 0, D_STATE, D_INNER, 1};
             for (int i = 0; i < scanScalars.length; i++) {
@@ -511,7 +511,7 @@ public class GpuMambaMixerTest {
             assertSame(scanState, scan.bufferArg(23));
             assertSame(slot(ScratchSlots.K), scan.bufferArg(25));
 
-            Dispatch gate = only(ds, SsmKernels.MAMBA_GATE_OUT);
+            FakeDispatch gate = only(ds, SsmKernels.MAMBA_GATE_OUT);
             int[] gateScalars = {t * D_INNER, D_INNER, HEAD_DIM, D_INNER, 0, 0, D_INNER, 0};
             for (int i = 0; i < gateScalars.length; i++) {
                 assertEquals("gate arg " + i, gateScalars[i], gate.intArg(i));
@@ -539,9 +539,9 @@ public class GpuMambaMixerTest {
         GpuBuffer stateRows = memory.stepInputs().stateRows();
 
         for (int t : new int[]{1, 4}) {
-            List<Dispatch> ds = t == 1 ? decode() : prefill(t);
+            List<FakeDispatch> ds = t == 1 ? decode() : prefill(t);
             assertEquals(Arrays.asList(PROJ, ActKernels.GLU, SsmKernels.SSM_CONV, ActKernels.GLU, PROJ), names(ds));
-            Dispatch conv = only(ds, SsmKernels.SSM_CONV);
+            FakeDispatch conv = only(ds, SsmKernels.SSM_CONV);
             assertEquals(SsmKernels.CONV_ARG_COUNT, conv.argCount());
             int[] scalars = {N_EMBD, L_CACHE, t, 0, N_EMBD, 0, N_EMBD, 0, 0, (L_CACHE - 1) * N_EMBD};
             for (int i = 0; i < scalars.length; i++) {
@@ -569,10 +569,10 @@ public class GpuMambaMixerTest {
         mixer = create(SsmBlocks.gpuMixers(), l);
         mixer.bind(context(Arch.LFM2, l, false), l);
 
-        List<Dispatch> ds = prefill(5);
+        List<FakeDispatch> ds = prefill(5);
         assertEquals(Arrays.asList(PROJ, ActKernels.GLU, SsmKernels.SHORTCONV_CENTERED, ActKernels.GLU, PROJ),
                 names(ds));
-        Dispatch conv = only(ds, SsmKernels.SHORTCONV_CENTERED);
+        FakeDispatch conv = only(ds, SsmKernels.SHORTCONV_CENTERED);
         assertEquals(SsmKernels.CENTERED_ARG_COUNT, conv.argCount());
         int[] scalars = {N_EMBD, L_CACHE, 5, N_EMBD, 0, N_EMBD};
         for (int i = 0; i < scalars.length; i++) {

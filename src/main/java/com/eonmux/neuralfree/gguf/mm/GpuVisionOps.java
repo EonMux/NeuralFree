@@ -1097,6 +1097,7 @@ final class GpuVisionOps implements VisionOps {
         fa[AttnKernels.ARG_FA_BUF_OUT] = b.out;
         fa[AttnKernels.ARG_FA_BUF_PARTIAL] = placeholders.scratchFloats();
         fa[AttnKernels.ARG_FA_BUF_KV_SCALES] = placeholders.kvScalesOnes();
+        fa[AttnKernels.ARG_FA_BUF_TREE_MASK] = placeholders.readOnlyInts();
         ops.enqueue(AttnKernels.flashAttn(KvDType.F32), plan.prefillGlobal(nq, split.count()),
                 FlashAttnTiling.prefillLocal(), fa);
     }

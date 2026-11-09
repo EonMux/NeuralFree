@@ -242,7 +242,7 @@ class DecisionD1OmniTest {
         String prompt = lfm3Prompt("x", "Does it hold?", lfm3Option("true", "true", "holds"),
                 lfm3Option("false", "false", "not"));
         int[] tokens = lfm3.encode(prompt, false, true);
-        float[] logits = lfm3.nextLogits(null, tokens);
+        float[] logits = lfm3.pooling().nextLogits(null, tokens);
         float trueScore = groupMax(lfm3, logits, "yes", "Yes", "YES");
         float falseScore = groupMax(lfm3, logits, "no", "No", "NO");
         double[] probs = softmax(new float[] {trueScore, falseScore}, 0.5f);
@@ -259,7 +259,7 @@ class DecisionD1OmniTest {
         String prompt = lfm3Prompt("x", "Rate.", lfm3Option("0", "0", "bad"), lfm3Option("1", "1", "ok"),
                 lfm3Option("2", "2", "good"));
         int[] tokens = lfm3.encode(prompt, false, true);
-        float[] logits = lfm3.nextLogits(null, tokens);
+        float[] logits = lfm3.pooling().nextLogits(null, tokens);
         float[] scores = new float[3];
         for (int i = 0; i < 3; i++) {
             scores[i] = logits[lfm3.encode(String.valueOf(i), false, false)[0]];
@@ -426,7 +426,7 @@ class DecisionD1OmniTest {
         assertEquals(nOptions, markers.size(), "one marker per option survives the cuts");
         float[] column = new float[nOptions];
         if (media == null) {
-            float[] scores = model.decisionScores(null, tokens, null);
+            float[] scores = model.pooling().decisionScores(null, tokens, null);
             for (int i = 0; i < nOptions; i++) {
                 column[i] = scores[markers.get(i) * ModernBertDecisionHead.N_DECISION_TYPES
                         + DecisionQuestions.CHOICE];
@@ -437,7 +437,7 @@ class DecisionD1OmniTest {
                 full.add(chunk);
             }
             full.addText(tokens);
-            float[] scores = model.decisionScores(null, full.build(), null);
+            float[] scores = model.pooling().decisionScores(null, full.build(), null);
             for (int i = 0; i < nOptions; i++) {
                 column[i] = scores[markers.get(i) * ModernBertDecisionHead.N_DECISION_TYPES
                         + DecisionQuestions.CHOICE];
@@ -473,7 +473,7 @@ class DecisionD1OmniTest {
     /** The label read over the model's own output logits at the two answer codes. */
     private static double[] lfm3Probabilities(String prompt, float temperature) throws IOException {
         int[] tokens = lfm3.encode(prompt, false, true);
-        float[] logits = lfm3.nextLogits(null, tokens);
+        float[] logits = lfm3.pooling().nextLogits(null, tokens);
         float[] scores = new float[2];
         String[] labels = {"A", "B"};
         for (int i = 0; i < 2; i++) {

@@ -5,7 +5,7 @@ import com.eonmux.neuralfree.acceleration.backend.GpuGraphPatchSink;
 import com.eonmux.neuralfree.acceleration.backend.GpuStepPatcher;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -50,8 +50,8 @@ public class GpuDecodeReplayPatchedTest {
                 step(h, pos);
             }
             assertEquals("the capture, the two verified steps and no trusted step run the body", 3, h.bodyRuns);
-            assertEquals("the capture is submitted once", 1, h.count(OpKind.LAUNCH));
-            assertEquals("every step after the capture reaches the device as one replay", 7, h.count(OpKind.REPLAY));
+            assertEquals("the capture is submitted once", 1, h.count(FakeOpKind.LAUNCH));
+            assertEquals("every step after the capture reaches the device as one replay", 7, h.count(FakeOpKind.REPLAY));
             assertEquals("the device saw every step's patched argument, including the no-body steps",
                     List.of(0, 1, 2, 3, 4, 5, 6, 7), h.executedArgs);
             assertEquals("the device saw every step's patched work size",
@@ -67,19 +67,19 @@ public class GpuDecodeReplayPatchedTest {
             }
             assertEquals(3, h.bodyRuns);
 
-            long replaysBefore = h.count(OpKind.REPLAY);
-            long launchesBefore = h.count(OpKind.LAUNCH);
+            long replaysBefore = h.count(FakeOpKind.REPLAY);
+            long launchesBefore = h.count(FakeOpKind.LAUNCH);
             step(h, 99);
             assertEquals("the stale step runs the body", 4, h.bodyRuns);
-            assertEquals("the stale graph is not replayed", replaysBefore, h.count(OpKind.REPLAY));
-            assertEquals("the stale step does not capture", launchesBefore, h.count(OpKind.LAUNCH));
+            assertEquals("the stale graph is not replayed", replaysBefore, h.count(FakeOpKind.REPLAY));
+            assertEquals("the stale step does not capture", launchesBefore, h.count(FakeOpKind.LAUNCH));
 
             step(h, 100);
-            assertEquals("the next step captures again", 2, h.count(OpKind.LAUNCH));
+            assertEquals("the next step captures again", 2, h.count(FakeOpKind.LAUNCH));
             step(h, 101);
             step(h, 102);
             step(h, 103);
-            assertEquals("two verified steps and one trusted step of each capture", 6, h.count(OpKind.REPLAY));
+            assertEquals("two verified steps and one trusted step of each capture", 6, h.count(FakeOpKind.REPLAY));
             assertEquals("the stale step and the recapture's steps run the body", 7, h.bodyRuns);
             assertEquals("the device saw every step's argument",
                     List.of(0, 1, 2, 3, 99, 100, 101, 102, 103), h.executedArgs);
@@ -94,22 +94,70 @@ public class GpuDecodeReplayPatchedTest {
             }
             assertEquals(3, h.bodyRuns);
 
-            long replaysBefore = h.count(OpKind.REPLAY);
-            long launchesBefore = h.count(OpKind.LAUNCH);
+            long replaysBefore = h.count(FakeOpKind.REPLAY);
+            long launchesBefore = h.count(FakeOpKind.LAUNCH);
             step(h, 4);
             assertEquals("the declined step runs the body", 4, h.bodyRuns);
             assertEquals("the capture is not replayed against the diverging pattern", replaysBefore,
-                    h.count(OpKind.REPLAY));
-            assertEquals("the declined step does not capture", launchesBefore, h.count(OpKind.LAUNCH));
+                    h.count(FakeOpKind.REPLAY));
+            assertEquals("the declined step does not capture", launchesBefore, h.count(FakeOpKind.LAUNCH));
 
             step(h, 5);
             step(h, 6);
             step(h, 7);
             step(h, 8);
-            assertEquals("the recapture submits once", 2, h.count(OpKind.LAUNCH));
-            assertEquals("three replays of each capture's verified and trusted steps", 6, h.count(OpKind.REPLAY));
+            assertEquals("the recapture submits once", 2, h.count(FakeOpKind.LAUNCH));
+            assertEquals("three replays of each capture's verified and trusted steps", 6, h.count(FakeOpKind.REPLAY));
             assertEquals("every step's value reached the device",
                     List.of(0, 1, 2, 3, 4, 5, 6, 7, 8), h.executedArgs);
+        }
+    }
+
+    /** One two-row step of the harness: sets the step's kernel argument and runs the width-2 trunk. */
+    private void stepWidth2(Harness h, int pos) {
+        h.patcher.setStepValue(pos);
+        h.replay.trunk(pos, 2, List.of(h.patcher), true, () -> {
+            h.bodyRuns++;
+            h.backend.computeQueue().enqueueKernelNoEvent(h.kernel, new long[]{pos + 1}, new long[]{1},
+                    new Object[]{pos});
+        });
+    }
+
+    @Test
+    public void aWidthTwoTrunkPatchesContiguousStepsWithoutRunningTheBody() {
+        try (Harness h = new Harness(false, false, Integer.MIN_VALUE, true)) {
+            for (int pos = 0; pos <= 8; pos += 2) {
+                stepWidth2(h, pos);
+            }
+            assertEquals("the capture and the two verified steps run the body", 3, h.bodyRuns);
+            assertEquals("the capture is submitted once", 1, h.count(FakeOpKind.LAUNCH));
+            assertEquals("the verified steps body-replay and the trusted steps replay patched", 4,
+                    h.count(FakeOpKind.REPLAY));
+            assertEquals("the device saw every step's patched argument",
+                    List.of(0, 2, 4, 6, 8), h.executedArgs);
+            assertEquals("the device saw every step's patched work size",
+                    List.of(1L, 3L, 5L, 7L, 9L), h.executedGlobals);
+        }
+    }
+
+    @Test
+    public void aWidthTwoTrunkBodyReplaysAGapAndKeepsThePlanForTheNextRun() {
+        try (Harness h = new Harness(false, false, Integer.MIN_VALUE, true)) {
+            for (int pos = 0; pos <= 6; pos += 2) {
+                stepWidth2(h, pos);
+            }
+            long launchesBefore = h.count(FakeOpKind.LAUNCH);
+
+            stepWidth2(h, 20);
+            assertEquals("the gap's step runs the body through the capture's replay", 4, h.bodyRuns);
+            assertEquals("the gap's step does not capture", launchesBefore, h.count(FakeOpKind.LAUNCH));
+
+            stepWidth2(h, 22);
+            assertEquals("the next run's steps follow the gap's step, so they trust the kept plan", 4,
+                    h.bodyRuns);
+            assertEquals("the kept plan still needs no capture", launchesBefore, h.count(FakeOpKind.LAUNCH));
+            assertEquals("the device saw every step's argument, the gap's through the body",
+                    List.of(0, 2, 4, 6, 20, 22), h.executedArgs);
         }
     }
 
@@ -121,8 +169,8 @@ public class GpuDecodeReplayPatchedTest {
             }
             assertEquals("two captures and their four verified steps ran the body, then the attempts stop", 6,
                     h.bodyRuns);
-            assertEquals(2, h.count(OpKind.LAUNCH));
-            assertEquals(2, h.count(OpKind.REPLAY));
+            assertEquals(2, h.count(FakeOpKind.LAUNCH));
+            assertEquals(2, h.count(FakeOpKind.REPLAY));
             assertEquals("the device saw every step through the body replay",
                     List.of(0, 1, 2, 3, 4, 5), h.executedArgs);
         }
@@ -137,12 +185,12 @@ public class GpuDecodeReplayPatchedTest {
             h.replay.invalidate();
 
             step(h, 50);
-            assertEquals("the invalidation made the step capture again", 2, h.count(OpKind.LAUNCH));
+            assertEquals("the invalidation made the step capture again", 2, h.count(FakeOpKind.LAUNCH));
             step(h, 51);
             step(h, 52);
             step(h, 53);
             assertEquals("three replays of each capture's verified and trusted steps", 6,
-                    h.count(OpKind.REPLAY));
+                    h.count(FakeOpKind.REPLAY));
             assertEquals("the new chain's positions follow each other, so the trusted step skips the body",
                     6, h.bodyRuns);
             assertEquals("the device saw the new chain's arguments",
@@ -157,8 +205,8 @@ public class GpuDecodeReplayPatchedTest {
                 step(h, pos);
             }
             assertEquals("no plan was built, so every step runs the body", 8, h.bodyRuns);
-            assertEquals("the capture is submitted once", 1, h.count(OpKind.LAUNCH));
-            assertEquals("every step after the capture body-replays", 7, h.count(OpKind.REPLAY));
+            assertEquals("the capture is submitted once", 1, h.count(FakeOpKind.LAUNCH));
+            assertEquals("every step after the capture body-replays", 7, h.count(FakeOpKind.REPLAY));
             assertEquals("the device saw every step's argument", List.of(0, 1, 2, 3, 4, 5, 6, 7), h.executedArgs);
         }
     }
@@ -171,8 +219,8 @@ public class GpuDecodeReplayPatchedTest {
             }
             assertEquals("a verify-only graph refuses the changing arguments, so the replays mismatch:", 6,
                     h.bodyRuns);
-            assertEquals("the retries recapture once before the attempts stop", 2, h.count(OpKind.LAUNCH));
-            assertEquals("no replay reached the device", 0, h.count(OpKind.REPLAY));
+            assertEquals("the retries recapture once before the attempts stop", 2, h.count(FakeOpKind.LAUNCH));
+            assertEquals("no replay reached the device", 0, h.count(FakeOpKind.REPLAY));
             assertEquals("the device saw every step through the direct bodies",
                     List.of(0, 1, 2, 3), h.executedArgs);
         }
@@ -208,7 +256,7 @@ public class GpuDecodeReplayPatchedTest {
             replay = new GpuDecodeReplay(backend.computeQueue());
         }
 
-        long count(OpKind kind) {
+        long count(FakeOpKind kind) {
             return backend.ops().stream().filter(o -> o.kind() == kind).count();
         }
 

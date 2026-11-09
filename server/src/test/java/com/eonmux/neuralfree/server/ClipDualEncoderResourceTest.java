@@ -195,10 +195,10 @@ class ClipDualEncoderResourceTest {
     void adapterSelectionsRefuseByName() {
         int[] tokens = clip.encode(TEXT, true, true);
         UnsupportedOperationException text = assertThrows(UnsupportedOperationException.class,
-                () -> clip.embed(LoraSelection.of("sql"), tokens));
+                () -> clip.pooling().embed(LoraSelection.of("sql"), tokens));
         assertTrue(text.getMessage().contains("runs no LoRA adapters"), text.getMessage());
         UnsupportedOperationException img = assertThrows(UnsupportedOperationException.class,
-                () -> clip.embedImage(LoraSelection.of("sql"), image, "input"));
+                () -> clip.pooling().embedImage(LoraSelection.of("sql"), image, "input"));
         assertTrue(img.getMessage().contains("runs no LoRA adapters"), img.getMessage());
         assertEquals(400, statusOf(() -> pooling.embeddings("{\"input\": \"" + TEXT
                 + "\", \"lora\": [{\"id\": 0, \"scale\": 1.0}]}")));

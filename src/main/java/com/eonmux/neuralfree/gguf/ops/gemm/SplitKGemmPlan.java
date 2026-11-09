@@ -31,9 +31,13 @@ import java.util.Objects;
  * {@code ggml_vk_guess_split_k}: only for K of 2048 and more, only while the tile grid fills less
  * than about two thirds of the device's compute units, capped at 8 slices. The staged launches of
  * fewer tokens than the device tile ({@link #ofSmallTiles}, {@link #ofW4a8SmallTiles}) split a grid
- * that fills less than nine tenths of one wave instead: there each block's serial reduction over K
- * is the wall time, and llama.cpp spreads the same grids over the device with its stream-k kernel. A
- * device that does not report its compute units ({@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS})
+ * that fills less than about 1.3 waves instead: there each block's serial reduction over K is the
+ * wall time, and llama.cpp spreads the same grids over the device with its stream-k kernel — at
+ * one wave the ceil wave count double-books the tail SMs, and the slices remove that quantization
+ * (kernel medians on the RTX 5080 Laptop, Q4_K 4096x2560 at 9..15 tokens: the 64-tile twin over 60
+ * compute units runs 86-93us whole and 59-60us as 8 slices, while the 152-tile 9728x2560 twin runs
+ * 101-110us whole and 119-125us sliced, so the split stops helping past about 1.3 waves). A device
+ * that does not report its compute units ({@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS})
  * is never split, as llama.cpp does with a {@code shader_core_count} of 0. Partial launch geometry:
  * {@code global = {ceil(M / TM) * WG * splits, ceil(N / tileTokens)}}, {@code local = {WG, 1}}, with
  * the family's tile: the MMA/CM tiles, or the staged MMQ lane's {@link MmqConfig} (TM, TN and WG);
@@ -46,7 +50,7 @@ public final class SplitKGemmPlan {
     /** Largest slice count (llama.cpp caps the split at 8x). */
     public static final int MAX_SPLITS = 8;
     /** Numerator of the wave-fill fraction under which a small-token-tile launch splits. */
-    static final int SMALL_WAVE_NUM = 9;
+    static final int SMALL_WAVE_NUM = 13;
     /** Denominator of the wave-fill fraction under which a small-token-tile launch splits. */
     static final int SMALL_WAVE_DEN = 10;
     /** Blocks per compute unit the small-token-tile split aims for (one occupancy-interleaved wave). */
@@ -435,9 +439,10 @@ public final class SplitKGemmPlan {
     /**
      * The small-token-tile slice count ({@link #ofSmallTiles}) for a tile grid of
      * {@code rowTiles * tokenTiles} workgroups over a reduction of {@code k}: 1 for a K below the
-     * threshold, an unknown compute-unit count, or a grid that fills one wave of the device
-     * ({@code SMALL_WAVE_NUM / SMALL_WAVE_DEN} of it and up); otherwise the count that gives every
-     * compute unit {@code SMALL_TILE_BLOCKS_PER_UNIT} blocks, capped at {@link #MAX_SPLITS}.
+     * threshold, an unknown compute-unit count, or a grid past about 1.3 waves of the device
+     * ({@code SMALL_WAVE_NUM / SMALL_WAVE_DEN} of it and up, where the measured staged twins stop
+     * gaining from the slices); otherwise the count that gives every compute unit
+     * {@code SMALL_TILE_BLOCKS_PER_UNIT} blocks, capped at {@link #MAX_SPLITS}.
      *
      * @param computeUnits compute units of the device, or {@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS}
      * @throws IllegalArgumentException when {@code computeUnits} is negative

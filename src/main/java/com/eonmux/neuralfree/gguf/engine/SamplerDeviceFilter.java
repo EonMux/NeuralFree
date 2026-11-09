@@ -25,18 +25,21 @@ final class SamplerDeviceFilter {
     private final SamplerStage biasStage;
     private final int[] banned;
     private final int coneExtra;
+    /** Whether a logit bias raises a token, so no device cone contains the chain's keeps. */
+    private final boolean positiveBias;
     private final SamplerConfig config;
 
     private SamplerStage prefilteredPenalties;
     private SamplerStage prefilteredDry;
 
     SamplerDeviceFilter(Sampler sampler, List<SamplerStage> chain, SamplerStage biasStage, int[] banned,
-                        int coneExtra, SamplerConfig config) {
+                        int coneExtra, boolean positiveBias, SamplerConfig config) {
         this.sampler = sampler;
         this.chain = chain;
         this.biasStage = biasStage;
         this.banned = banned;
         this.coneExtra = coneExtra;
+        this.positiveBias = positiveBias;
         this.config = config;
     }
 
@@ -96,6 +99,88 @@ final class SamplerDeviceFilter {
             }
         }
         return -1;
+    }
+
+    /**
+     * Width of the chain's cone over a row's largest logits ({@code Sampler#coneWidth}): every stage that can
+     * keep a candidate outside the cone refuses it, and without a top-k stage the cone is the largest {@code
+     * coneExtra + 1} raw logits when the chain selects the argmax ({@link Sampler#argmaxChain()}).
+     */
+    int coneWidth() {
+        if (positiveBias || sampler.hasConstraints()) {
+            return -1;
+        }
+        if (config.topK() < 1) {
+            return sampler.argmaxChain() ? coneExtra + 1 : -1;
+        }
+        int topKAt = topKIndex();
+        if (topKAt < 0) {
+            return -1;
+        }
+        for (int i = 0; i < chain.size(); i++) {
+            SamplerStage stage = chain.get(i);
+            StageKind kind = stage.kind();
+            if (kind == null) {
+                // a null-kind request stage (grammar, min-tokens, bad-words, reasoning-budget): only one that
+                // leaves the chain's set alone keeps the cone
+                if (stage.modifies()) {
+                    return -1;
+                }
+                continue;
+            }
+            boolean beforeTopK = i < topKAt;
+            switch (kind) {
+                case TOP_K:
+                    break;
+                case TOP_P:
+                    if (beforeTopK && config.topP() < 1f) {
+                        return -1;
+                    }
+                    break;
+                case MIN_P:
+                    if (beforeTopK && config.minP() > 0f) {
+                        return -1;
+                    }
+                    break;
+                case TYPICAL_P:
+                    if (beforeTopK && config.typicalP() < 1f) {
+                        return -1;
+                    }
+                    break;
+                case TOP_N_SIGMA:
+                    if (beforeTopK && config.topNSigma() > 0f) {
+                        return -1;
+                    }
+                    break;
+                case XTC:
+                    if (beforeTopK && config.xtcProbability() > 0f && config.xtcThreshold() <= 0.5f) {
+                        return -1;
+                    }
+                    break;
+                case TEMPERATURE:
+                    if (beforeTopK && config.dynatempRange() > 0f) {
+                        return -1;
+                    }
+                    break;
+                case PENALTIES:
+                    if (config.penaltiesEnabled()) {
+                        return -1;
+                    }
+                    break;
+                case DRY:
+                    if (config.dryMultiplier() != 0f) {
+                        return -1;
+                    }
+                    break;
+                case MIROSTAT:
+                case ADAPTIVE_P:
+                case INFILL:
+                    return -1;
+                default:
+                    break;
+            }
+        }
+        return Math.max(config.topK(), config.minKeep()) + coneExtra;
     }
 
     /**

@@ -80,6 +80,8 @@ typedef unsigned short     NF_HALF;    /* storage-only half */
 #define USE_SUBGROUPS 1
 #endif
 #define NF_HAS_SG_SHUFFLE 1
+/* The CUDA subgroup size is fixed by the hardware, so there is nothing to pin. */
+#define NF_REQD_SG_ATTR
 
 /* ---- work-item functions (the engine never uses a global offset) ---- */
 NF_INLINE uint get_local_id(uint d)   { return d == 0 ? threadIdx.x : (d == 1 ? threadIdx.y : threadIdx.z); }
@@ -301,6 +303,20 @@ typedef ulong nf_u64;
 #  endif
 #endif
 /* OpenCL 1.2 has no portable subgroup shuffle, so NF_HAS_SG_SHUFFLE stays undefined. */
+/*
+ * NF_REQD_SG_ATTR pins the subgroup size when the host defines NF_REQD_SG_SIZE and the compiler
+ * enables cl_intel_required_subgroup_size: every kernel of a matvec pair ({T}_MatVec and
+ * {T}_MatVecN, {T}_MatVec_Q8 and {T}_MatVecN_Q8) then reduces over the same subgroup size, which
+ * their bit-identical reduction contract requires, because sub_group_reduce_add and the leader
+ * count otherwise follow the compiler's per-kernel SIMD choice. The host passes the size only from
+ * CL_DEVICE_SUB_GROUP_SIZES_INTEL, so a size the device rejects cannot reach the compiler; a
+ * compiler that defines neither the extension macro nor NF_REQD_SG_SIZE keeps the per-kernel choice.
+ */
+#if defined(USE_SUBGROUPS) && defined(cl_intel_required_subgroup_size) && defined(NF_REQD_SG_SIZE)
+#define NF_REQD_SG_ATTR __attribute__((intel_reqd_sub_group_size(NF_REQD_SG_SIZE)))
+#else
+#define NF_REQD_SG_ATTR
+#endif
 /* Round to nearest even, as CUDA __float2int_rn (quantized code points of MMQ). */
 #define nf_rint_i(x) ((int)convert_int_rte(x))
 NF_INLINE float nf_flip_sign(const float x)  { return as_float(as_uint(x) ^ 0x80000000u); }

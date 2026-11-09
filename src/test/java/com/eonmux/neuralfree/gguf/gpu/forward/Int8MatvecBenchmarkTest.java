@@ -8,6 +8,9 @@ import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.vulkan.VkComputeBackend;
 import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
+import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
+import com.eonmux.neuralfree.acceleration.vulkan.VkInstanceManager;
+import com.eonmux.neuralfree.acceleration.vulkan.VkPhysicalDeviceInfo;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
@@ -21,25 +24,41 @@ import org.junit.runners.Parameterized;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
 
 /**
  * Opt-in timing of the integer-dot (Q8_1 activation) decode matvec against the F32-activation matvec
- * of the same weight type on every available GPU backend (environment {@code NEURALFREE_BENCH_INT8=1};
- * the test task forwards no system properties). Prints the single-token time of one projection at
+ * of the same weight type on every available GPU backend ({@code -Dneuralfree.test.int8.measure=true}
+ * or environment {@code NEURALFREE_BENCH_INT8=1}). Prints the single-token time of one projection at
  * 0.6B-decoder and 7B/8B-class shapes for every type the lane serves, with and without the Q8_1
- * activation quantization the lane adds. Asserts nothing; the numbers go to the int8 matvec
- * documentation.
+ * activation quantization the lane adds, and the paired form ({@code {T}_MatVec2_Q8}) against the
+ * single-row form. The two forms of a comparison run in interleaved rounds of alternating order
+ * (round even: float then lane, round odd: lane then float), because a GPU holds two clock states
+ * and an integrated GPU throttles over a long run, so a sequence of same-order rounds would time the
+ * second form of every round on the slower state; each comparison reports the median round. The
+ * numbers go to the per-device lane evidence of {@link Int8MatvecTuning}. Asserts nothing.
+ *
+ * <p>The device under test is selected by index through
+ * {@code -Dneuralfree.test.int8.measure.device=<i>} (CUDA and OpenCL device order, Vulkan
+ * physical-device order); unset, zero or negative measures the device the harness picks by default
+ * (the first CUDA and OpenCL device, the first Vulkan device reporting cooperative matrices).</p>
  */
 @RunWith(Parameterized.class)
 public class Int8MatvecBenchmarkTest {
 
     private static final String SWITCH = "NEURALFREE_BENCH_INT8";
+    /** System property that turns the measurement on (the environment switch still works). */
+    public static final String MEASURE_PROPERTY = "neuralfree.test.int8.measure";
+    /**
+     * System property that selects the device to measure by index into the backend's device list
+     * (CUDA and OpenCL device order, Vulkan physical-device order).
+     */
+    public static final String DEVICE_PROPERTY = "neuralfree.test.int8.measure.device";
     private static final int WARMUP = 20;
-    private static final int RUNS = 100;
-    /** Interleaved A/B rounds and launches per round of the paired-form comparison. */
+    /** Interleaved rounds per comparison; the median round is reported. */
     private static final int ROUNDS = 9;
     private static final int RUNS_PER_ROUND = 20;
     /**
@@ -74,7 +93,8 @@ public class Int8MatvecBenchmarkTest {
 
     @Before
     public void openDevice() {
-        Assume.assumeTrue("set " + SWITCH + "=1 to run", "1".equals(System.getenv(SWITCH)));
+        Assume.assumeTrue("set " + MEASURE_PROPERTY + "=true (or " + SWITCH + "=1) to run",
+                Boolean.getBoolean(MEASURE_PROPERTY) || "1".equals(System.getenv(SWITCH)));
         previousCuda = HWAcceleration.enableCuda;
         try {
             backend = openBackend();
@@ -89,22 +109,57 @@ public class Int8MatvecBenchmarkTest {
         }
     }
 
+    /** The selected device index, or 0 (the default device) when {@link #DEVICE_PROPERTY} is unset or negative. */
+    private static int deviceIndex() {
+        return Math.max(0, Integer.getInteger(DEVICE_PROPERTY, 0));
+    }
+
+    /** The device index to open: the selected one, failed by {@link org.junit.Assume} when out of range. */
+    private static int assumeIndex(String backendName, int index, int count) {
+        Assume.assumeTrue("no " + backendName + " device " + index + " (found " + count + ")",
+                index >= 0 && index < count);
+        return index;
+    }
+
     private ComputeBackend openBackend() {
         if (api.equals("vulkan")) {
-            return new VkComputeBackend();
+            return vulkan(deviceIndex());
         }
         if (api.equals("cuda")) {
             HWAcceleration.enableCuda = true;
-            HWAcceleration accel = new HWAcceleration();
+            HWAcceleration accel = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
             hwAccel = accel;
             Assume.assumeFalse("no CUDA device", accel.getCUDevices().isEmpty());
-            CUDevice device = accel.getCUDevices().get(0);
-            return new CudaComputeBackend(device);
+            int index = assumeIndex("CUDA", deviceIndex(), accel.getCUDevices().size());
+            return new CudaComputeBackend(accel.getCUDevices().get(index));
         }
-        HWAcceleration accel = new HWAcceleration();
+        HWAcceleration accel = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.OPENCL));
         hwAccel = accel;
         Assume.assumeFalse("no OpenCL device", accel.getCLDevices().isEmpty());
-        return new OclComputeBackend(accel.getCLDevices().get(0));
+        int index = assumeIndex("OpenCL", deviceIndex(), accel.getCLDevices().size());
+        return new OclComputeBackend(accel.getCLDevices().get(index));
+    }
+
+    /**
+     * The Vulkan compute backend of device {@code index} when it is positive (plain physical-device
+     * order), else of the first device reporting cooperative matrices, else the default device.
+     */
+    private ComputeBackend vulkan(int index) {
+        VkInstanceManager manager = VkInstanceManager.acquire();
+        try {
+            if (index > 0) {
+                return new VkComputeBackend(manager, manager.devices().get(assumeIndex("Vulkan", index,
+                        manager.devices().size())));
+            }
+            for (VkPhysicalDeviceInfo info : manager.devices()) {
+                if (info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX)) {
+                    return new VkComputeBackend(manager, info);
+                }
+            }
+        } finally {
+            manager.release();
+        }
+        return new VkComputeBackend();
     }
 
     @After
@@ -125,8 +180,8 @@ public class Int8MatvecBenchmarkTest {
 
     @Test
     public void int8LaneAgainstTheFloatMatvec() throws Exception {
-        System.out.println("device " + backend.capabilities().getDeviceName() + " (" + api + "), matvec local size "
-                + local);
+        System.out.println("device " + backend.capabilities().getDeviceName() + " (" + api
+                + ", index " + deviceIndex() + "), matvec local size " + local);
         for (GGMLType type : TYPES) {
             for (int[] shape : SHAPES) {
                 measure(type, shape[0], shape[1]);
@@ -136,13 +191,14 @@ public class Int8MatvecBenchmarkTest {
 
     /**
      * The paired integer-dot matvec ({@code {T}_MatVec2_Q8}) against the single-row form
-     * ({@code {T}_MatVec_Q8}) at decode shapes, in interleaved rounds with per-round means and the median
-     * reported, so a shared device's load variance cancels between the two forms.
+     * ({@code {T}_MatVec_Q8}) at decode shapes, in interleaved rounds of alternating order with
+     * per-round means and the median reported, so a shared device's clock and load variance cancels
+     * between the two forms.
      */
     @Test
     public void pairedInt8MatvecAgainstTheSingleRowForm() throws Exception {
-        System.out.println("device " + backend.capabilities().getDeviceName() + " (" + api + "), matvec local size "
-                + local);
+        System.out.println("device " + backend.capabilities().getDeviceName() + " (" + api
+                + ", index " + deviceIndex() + "), matvec local size " + local);
         int[][] shapes = {{1024, 4096}, {4096, 4096}, {4096, 12288}, {12288, 4096}, {32768, 4096}};
         for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K,
                 GGMLType.Q8_K}) {
@@ -155,8 +211,8 @@ public class Int8MatvecBenchmarkTest {
     /** Device time of one Q8_1 quantizer launch at the activation widths of a decode step. */
     @Test
     public void quantizerCostAtDecodeWidths() throws Exception {
-        System.out.println("device " + backend.capabilities().getDeviceName() + " (" + api + "), matvec local size "
-                + local);
+        System.out.println("device " + backend.capabilities().getDeviceName() + " (" + api
+                + ", index " + deviceIndex() + "), matvec local size " + local);
         for (int cols : new int[]{1024, 2560, 4096, 12288}) {
             GpuBuffer xBuf = backend.allocateBuffer((long) cols * 4);
             GpuBuffer qBuf = backend.allocateBuffer((long) (cols / 32) * GpuOps.Q8_1_FLOATS * 4);
@@ -174,7 +230,59 @@ public class Int8MatvecBenchmarkTest {
         }
     }
 
-    /** The paired and single-row forms over the same weights and Q8_1 row, interleaved. */
+    /** The F32-activation matvec and the Q8_1 lane (quantizer plus matvec) over the same weights, interleaved. */
+    private void measure(GGMLType type, int rows, int cols) throws Exception {
+        int blockSize = type.getBlockSize();
+        int rowBytes = cols / blockSize * type.getTypeSize();
+        byte[] weights = weights(type, rows, rowBytes);
+        float[] x = activations(cols);
+        GpuBuffer wBuf = backend.allocateBuffer((long) rows * rowBytes);
+        GpuBuffer xBuf = backend.allocateBuffer((long) cols * 4);
+        GpuBuffer qBuf = backend.allocateBuffer((long) (cols / 32) * GpuOps.Q8_1_FLOATS * 4);
+        GpuBuffer yBuf = backend.allocateBuffer((long) rows * 4);
+        try {
+            backend.computeQueue().enqueueWriteBuffer(wBuf, 0, weights.length, weights).awaitCompletion();
+            backend.computeQueue().enqueueWriteBuffer(xBuf, 0, (long) cols * 4, x).awaitCompletion();
+            Runnable floatRun = () -> backend.computeQueue().enqueueKernel(
+                    kernels.get(type.name() + "_MatVec"), new long[]{(long) rows * local}, new long[]{local},
+                    new Object[]{rows, cols, wBuf, xBuf, yBuf});
+            Runnable laneRun = () -> {
+                backend.computeQueue().enqueueKernel(kernels.get(GpuOps.QUANTIZE_Q8_1),
+                        new long[]{roundUp(cols / 32)}, new long[]{local}, new Object[]{cols, xBuf, qBuf});
+                backend.computeQueue().enqueueKernel(kernels.get(type.name() + "_MatVec_Q8"),
+                        new long[]{(long) rows * local}, new long[]{local},
+                        new Object[]{rows, cols, wBuf, qBuf, yBuf});
+            };
+            for (int r = 0; r < WARMUP; r++) {
+                floatRun.run();
+                laneRun.run();
+            }
+            backend.computeQueue().finish();
+            long[] floatRounds = new long[ROUNDS];
+            long[] laneRounds = new long[ROUNDS];
+            for (int r = 0; r < ROUNDS; r++) {
+                if ((r & 1) == 0) {
+                    floatRounds[r] = timeRound(floatRun);
+                    laneRounds[r] = timeRound(laneRun);
+                } else {
+                    laneRounds[r] = timeRound(laneRun);
+                    floatRounds[r] = timeRound(floatRun);
+                }
+            }
+            double floatMs = median(floatRounds) / 1e6;
+            double laneMs = median(laneRounds) / 1e6;
+            System.out.println(String.format(Locale.ROOT,
+                    "%-5s %-5s %5dx%-5d float %8.3f ms  int8 %8.3f ms  speedup %5.2fx",
+                    type, api, rows, cols, floatMs, laneMs, floatMs / Math.max(laneMs, 1e-9)));
+        } finally {
+            wBuf.close();
+            xBuf.close();
+            qBuf.close();
+            yBuf.close();
+        }
+    }
+
+    /** The paired and single-row forms over the same weights and Q8_1 row, interleaved in alternating order. */
     private void measurePairing(GGMLType type, int rows, int cols) throws Exception {
         int blockSize = type.getBlockSize();
         int rowBytes = cols / blockSize * type.getTypeSize();
@@ -192,22 +300,29 @@ public class Int8MatvecBenchmarkTest {
             backend.computeQueue().finish();
             String single = type.name() + "_MatVec_Q8";
             String paired = type.name() + "_MatVec2_Q8";
-            long[] singleRounds = new long[ROUNDS];
-            long[] pairedRounds = new long[ROUNDS];
+            Runnable singleRun = () -> launch(single, rows, rows, cols, wBuf, qBuf, yBuf);
+            Runnable pairedRun = () -> launch(paired, ceilDiv(rows, 2), rows, cols, wBuf, qBuf, yBuf);
             for (int r = 0; r < WARMUP; r++) {
-                launch(single, rows, rows, cols, wBuf, qBuf, yBuf);
-                launch(paired, ceilDiv(rows, 2), rows, cols, wBuf, qBuf, yBuf);
+                singleRun.run();
+                pairedRun.run();
             }
             backend.computeQueue().finish();
+            long[] singleRounds = new long[ROUNDS];
+            long[] pairedRounds = new long[ROUNDS];
             for (int r = 0; r < ROUNDS; r++) {
-                singleRounds[r] = timeRound(() -> launch(single, rows, rows, cols, wBuf, qBuf, yBuf));
-                pairedRounds[r] = timeRound(() -> launch(paired, ceilDiv(rows, 2), rows, cols, wBuf, qBuf, yBuf));
+                if ((r & 1) == 0) {
+                    singleRounds[r] = timeRound(singleRun);
+                    pairedRounds[r] = timeRound(pairedRun);
+                } else {
+                    pairedRounds[r] = timeRound(pairedRun);
+                    singleRounds[r] = timeRound(singleRun);
+                }
             }
             double singleUs = median(singleRounds) / 1e3;
             double pairedUs = median(pairedRounds) / 1e3;
             System.out.println(String.format(Locale.ROOT,
                     "%-5s %-5s %5dx%-5d single %9.3f us  paired %9.3f us  speedup %5.2fx",
-                    type, api, rows, cols, singleUs, pairedUs, singleUs / pairedUs));
+                    type, api, rows, cols, singleUs, pairedUs, singleUs / Math.max(pairedUs, 1e-9)));
         } finally {
             wBuf.close();
             xBuf.close();
@@ -246,38 +361,6 @@ public class Int8MatvecBenchmarkTest {
         return (n + d - 1) / d;
     }
 
-    private void measure(GGMLType type, int rows, int cols) throws Exception {
-        int blockSize = type.getBlockSize();
-        int rowBytes = cols / blockSize * type.getTypeSize();
-        byte[] weights = weights(type, rows, rowBytes);
-        float[] x = activations(cols);
-        GpuBuffer wBuf = backend.allocateBuffer((long) rows * rowBytes);
-        GpuBuffer xBuf = backend.allocateBuffer((long) cols * 4);
-        GpuBuffer qBuf = backend.allocateBuffer((long) (cols / 32) * GpuOps.Q8_1_FLOATS * 4);
-        GpuBuffer yBuf = backend.allocateBuffer((long) rows * 4);
-        try {
-            backend.computeQueue().enqueueWriteBuffer(wBuf, 0, weights.length, weights).awaitCompletion();
-            backend.computeQueue().enqueueWriteBuffer(xBuf, 0, (long) cols * 4, x).awaitCompletion();
-            long[] global = {(long) rows * local};
-            long floatNanos = time(() -> backend.computeQueue().enqueueKernel(kernels.get(type.name() + "_MatVec"),
-                    global, new long[]{local}, new Object[]{rows, cols, wBuf, xBuf, yBuf}));
-            long quantNanos = time(() -> backend.computeQueue().enqueueKernel(kernels.get(GpuOps.QUANTIZE_Q8_1),
-                    new long[]{roundUp(cols / 32)}, new long[]{local}, new Object[]{cols, xBuf, qBuf}));
-            long q8Nanos = time(() -> backend.computeQueue().enqueueKernel(kernels.get(type.name() + "_MatVec_Q8"),
-                    global, new long[]{local}, new Object[]{rows, cols, wBuf, qBuf, yBuf}));
-            long laneNanos = quantNanos + q8Nanos;
-            System.out.println(String.format(Locale.ROOT,
-                    "%-5s %-5s %5dx%-5d float %8.3f ms  int8 %8.3f ms (quantize %6.3f)  speedup %5.2fx",
-                    type, api, rows, cols, floatNanos / 1e6, laneNanos / 1e6, quantNanos / 1e6,
-                    (double) floatNanos / (double) laneNanos));
-        } finally {
-            wBuf.close();
-            xBuf.close();
-            qBuf.close();
-            yBuf.close();
-        }
-    }
-
     private long roundUp(long n) {
         return (n + local - 1) / local * local;
     }
@@ -289,11 +372,11 @@ public class Int8MatvecBenchmarkTest {
         }
         backend.computeQueue().finish();
         long start = System.nanoTime();
-        for (int i = 0; i < RUNS; i++) {
+        for (int i = 0; i < RUNS_PER_ROUND; i++) {
             launches.run();
         }
         backend.computeQueue().finish();
-        return (System.nanoTime() - start) / RUNS;
+        return (System.nanoTime() - start) / RUNS_PER_ROUND;
     }
 
     /** Random blocks of {@code type} with finite block scales. */

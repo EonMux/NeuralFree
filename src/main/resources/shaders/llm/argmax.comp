@@ -44,7 +44,11 @@ layout(std430, binding = 0) buffer NfAmTree { int tree[]; };
 layout(std430, binding = 1) buffer NfAmRowIds { int row_ids[]; };
 layout(std430, binding = 2) buffer NfAmAccept { int accept[]; };
 #endif
+#if OP == OP_ARGMAX
 layout(push_constant) uniform NfAmParams { int block0; int block1; } pc;
+#else
+layout(push_constant) uniform NfAmParams { int block0; } pc;
+#endif
 
 /* Index sentinel of an argmax candidate that holds no element. */
 #define NF_ARGMAX_NONE 0x7fffffff

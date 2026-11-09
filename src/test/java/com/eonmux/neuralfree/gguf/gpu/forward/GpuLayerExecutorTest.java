@@ -45,9 +45,9 @@ import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.spec.resolve.NormResolver;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -207,7 +207,7 @@ public class GpuLayerExecutorTest {
 
     /** Dispatched kernel names with the recording block calls inserted where they happened. */
     private List<String> trace() {
-        List<Dispatch> ds = backend.dispatches();
+        List<FakeDispatch> ds = backend.dispatches();
         List<String> out = new ArrayList<>();
         int e = 0;
         for (int i = 0; i <= ds.size(); i++) {
@@ -392,26 +392,26 @@ public class GpuLayerExecutorTest {
         return exec;
     }
 
-    private static boolean uses(Dispatch d, GpuWeight w) {
+    private static boolean uses(FakeDispatch d, GpuWeight w) {
         return d.bufferArgs().contains(w.shard(0));
     }
 
-    private List<Dispatch> dispatchesOf(String kernel) {
+    private List<FakeDispatch> dispatchesOf(String kernel) {
         return backend.dispatchesOf(kernel);
     }
 
-    private static List<OpKind> kinds(List<Op> ops) {
-        List<OpKind> out = new ArrayList<>();
-        for (Op op : ops) {
+    private static List<FakeOpKind> kinds(List<FakeOp> ops) {
+        List<FakeOpKind> out = new ArrayList<>();
+        for (FakeOp op : ops) {
             out.add(op.kind());
         }
         return out;
     }
 
-    private static void assertNoHostSync(List<Op> ops) {
-        for (Op op : ops) {
+    private static void assertNoHostSync(List<FakeOp> ops) {
+        for (FakeOp op : ops) {
             assertTrue("unexpected " + op.kind() + " in an executor step",
-                    op.kind() != OpKind.READ && op.kind() != OpKind.FINISH);
+                    op.kind() != FakeOpKind.READ && op.kind() != FakeOpKind.FINISH);
         }
     }
 
@@ -432,10 +432,10 @@ public class GpuLayerExecutorTest {
                 "mixer ATTENTION 1 decode NORMED->BRANCH", MIX_NORM, "ffn 1 NORMED->BRANCH", MIX);
         assertEquals(expected, trace());
         assertNoHostSync(backend.ops());
-        List<Dispatch> norms = dispatchesOf(NORM);
+        List<FakeDispatch> norms = dispatchesOf(NORM);
         assertEquals(1, norms.size());
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
-        List<Dispatch> mixNorms = dispatchesOf(MIX_NORM);
+        List<FakeDispatch> mixNorms = dispatchesOf(MIX_NORM);
         assertEquals(3, mixNorms.size());
         assertTrue(uses(mixNorms.get(0), weightMap.get(blk(0, TensorNames.FFN_NORM))));
         assertTrue(uses(mixNorms.get(1), weightMap.get(blk(1, TensorNames.ATTN_NORM))));
@@ -453,7 +453,7 @@ public class GpuLayerExecutorTest {
         assertEquals(preNormLayer("ATTENTION", 0), trace());
         assertNoHostSync(backend.ops());
         assertEquals(0, dispatchesOf(MIX_NORM).size());
-        List<Dispatch> norms = dispatchesOf(NORM);
+        List<FakeDispatch> norms = dispatchesOf(NORM);
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
         assertTrue(uses(norms.get(1), weightMap.get(blk(0, TensorNames.FFN_NORM))));
     }
@@ -527,7 +527,7 @@ public class GpuLayerExecutorTest {
 
         assertEquals(Arrays.asList(NORM, "mixer ATTENTION 0 decode NORMED->" + GpuLayerExecutor.TEMP_PARALLEL,
                 NORM, "ffn 0 NORMED->BRANCH", MIX, MIX), trace());
-        List<Dispatch> norms = dispatchesOf(NORM);
+        List<FakeDispatch> norms = dispatchesOf(NORM);
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM_2))));
         assertTrue(uses(norms.get(1), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
     }
@@ -549,11 +549,11 @@ public class GpuLayerExecutorTest {
 
         assertEquals(Arrays.asList(GpuOps.COPY2D, "mixer ATTENTION 0 prefill 2 X->BRANCH", MIX, NORM, MIX, NORM,
                 "ffn 0 X->BRANCH", MIX, NORM), trace());
-        List<Dispatch> norms = dispatchesOf(NORM);
+        List<FakeDispatch> norms = dispatchesOf(NORM);
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_OUT_NORM))));
         assertTrue(uses(norms.get(1), weightMap.get(blk(0, TensorNames.ATTN_NORM_2))));
         assertTrue(uses(norms.get(2), weightMap.get(blk(0, TensorNames.LAYER_OUT_NORM))));
-        List<Dispatch> mixes = dispatchesOf(MIX);
+        List<FakeDispatch> mixes = dispatchesOf(MIX);
         assertTrue(mixes.get(1).bufferArgs().contains(
                 ctx.scratch().temp(GpuLayerExecutor.TEMP_LAYER_INPUT, (long) UBATCH * N_EMBD).buffer()));
     }
@@ -589,11 +589,11 @@ public class GpuLayerExecutorTest {
 
         assertEquals(Arrays.asList(NORM, "mixer ATTENTION 0 decode NORMED->BRANCH", MIX_NORM,
                 "ffn 0 NORMED->BRANCH", MIX), trace());
-        for (Dispatch d : dispatchesOf(MIX_NORM)) {
+        for (FakeDispatch d : dispatchesOf(MIX_NORM)) {
             assertTrue(d.args().contains(NormKernels.MixMode.SCALED.code()));
             assertTrue(d.args().contains(0.25f));
         }
-        for (Dispatch d : dispatchesOf(MIX)) {
+        for (FakeDispatch d : dispatchesOf(MIX)) {
             assertTrue(d.args().contains(NormKernels.MixMode.SCALED.code()));
             assertTrue(d.args().contains(0.25f));
         }
@@ -646,13 +646,13 @@ public class GpuLayerExecutorTest {
         expected.add(MIX);
         assertEquals(expected, trace());
         assertNoHostSync(backend.ops());
-        List<Dispatch> norms = dispatchesOf(NORM);
+        List<FakeDispatch> norms = dispatchesOf(NORM);
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
         assertTrue(uses(norms.get(1), weightMap.get(blk(0, TensorNames.ATTN_POST_NORM))));
         assertTrue(uses(norms.get(2), weightMap.get(blk(0, TensorNames.FFN_POST_NORM))));
         assertTrue(uses(norms.get(3), weightMap.get(blk(1, TensorNames.ATTN_POST_NORM))));
         assertTrue(uses(norms.get(4), weightMap.get(blk(1, TensorNames.FFN_POST_NORM))));
-        List<Dispatch> mixNorms = dispatchesOf(MIX_NORM);
+        List<FakeDispatch> mixNorms = dispatchesOf(MIX_NORM);
         assertTrue(uses(mixNorms.get(0), weightMap.get(blk(0, TensorNames.FFN_NORM))));
         assertTrue(uses(mixNorms.get(1), weightMap.get(blk(1, TensorNames.ATTN_NORM))));
         assertTrue(uses(mixNorms.get(2), weightMap.get(blk(1, TensorNames.FFN_NORM))));
@@ -674,7 +674,7 @@ public class GpuLayerExecutorTest {
         assertTrue(uses(backend.dispatches().get(0), weightMap.get(TensorNames.weight(TensorNames.OUTPUT_NORM))));
         assertEquals(GpuLogitsHead.ARGMAX, names.get(names.size() - 1));
         assertEquals(GpuOps.UNARY, names.get(names.size() - 2));
-        List<Dispatch> unary = dispatchesOf(GpuOps.UNARY);
+        List<FakeDispatch> unary = dispatchesOf(GpuOps.UNARY);
         assertEquals(1, unary.size());
         assertEquals(ActOp.SOFTCAP.code(), unary.get(0).intArg(ActKernels.ARG_UNARY_OP));
         assertNoHostSync(backend.ops());
@@ -703,10 +703,10 @@ public class GpuLayerExecutorTest {
         expected.add(MIX);
         assertEquals(expected, trace());
         assertNoHostSync(backend.ops());
-        List<Dispatch> norms = dispatchesOf(NORM);
+        List<FakeDispatch> norms = dispatchesOf(NORM);
         assertEquals(1, norms.size());
         assertTrue(uses(norms.get(0), weightMap.get(blk(0, TensorNames.ATTN_NORM))));
-        List<Dispatch> mixNorms = dispatchesOf(MIX_NORM);
+        List<FakeDispatch> mixNorms = dispatchesOf(MIX_NORM);
         assertEquals(7, mixNorms.size());
         for (int il = 0; il < 4; il++) {
             assertTrue(uses(mixNorms.get(2 * il), weightMap.get(blk(il, TensorNames.ATTN_POST_NORM))));
@@ -727,12 +727,12 @@ public class GpuLayerExecutorTest {
 
         fb.decodeGreedyOnDevice(7, 0);
 
-        List<Op> log = backend.ops();
-        List<OpKind> k = kinds(log);
-        assertEquals(OpKind.FINISH, k.get(k.size() - 1));
-        assertEquals(OpKind.READ, k.get(k.size() - 2));
-        assertEquals(1, Collections.frequency(k, OpKind.FINISH));
-        assertEquals(1, Collections.frequency(k, OpKind.READ));
+        List<FakeOp> log = backend.ops();
+        List<FakeOpKind> k = kinds(log);
+        assertEquals(FakeOpKind.FINISH, k.get(k.size() - 1));
+        assertEquals(FakeOpKind.READ, k.get(k.size() - 2));
+        assertEquals(1, Collections.frequency(k, FakeOpKind.FINISH));
+        assertEquals(1, Collections.frequency(k, FakeOpKind.READ));
         assertEquals(Integer.BYTES, log.get(log.size() - 2).bytes());
         List<String> names = backend.dispatchedKernelNames();
         assertEquals(GpuLogitsHead.ARGMAX, names.get(names.size() - 1));
@@ -752,10 +752,10 @@ public class GpuLayerExecutorTest {
         float[] logits = fb.prefill(new int[]{1, 2, 3, 4, 5, 6}, 0);
 
         assertEquals(VOCAB, logits.length);
-        List<OpKind> k = kinds(backend.ops());
-        assertEquals(1, Collections.frequency(k, OpKind.FINISH));
-        assertEquals(1, Collections.frequency(k, OpKind.READ));
-        assertEquals(OpKind.FINISH, k.get(k.size() - 1));
+        List<FakeOpKind> k = kinds(backend.ops());
+        assertEquals(1, Collections.frequency(k, FakeOpKind.FINISH));
+        assertEquals(1, Collections.frequency(k, FakeOpKind.READ));
+        assertEquals(FakeOpKind.FINISH, k.get(k.size() - 1));
         List<String> t = trace();
         // 6 rows at a ubatch of 4 split into 2 steps of 3, not the greedy 4 and 2
         assertEquals(2, Collections.frequency(t, "mixer ATTENTION 0 prefill 3 NORMED->BRANCH"));
@@ -773,9 +773,9 @@ public class GpuLayerExecutorTest {
 
         assertEquals(2, rows.length);
         assertEquals(VOCAB, rows[0].length);
-        List<OpKind> k = kinds(backend.ops());
-        assertEquals(1, Collections.frequency(k, OpKind.FINISH));
-        assertEquals(1, Collections.frequency(k, OpKind.READ));
+        List<FakeOpKind> k = kinds(backend.ops());
+        assertEquals(1, Collections.frequency(k, FakeOpKind.FINISH));
+        assertEquals(1, Collections.frequency(k, FakeOpKind.READ));
         assertTrue(trace().contains("mixer ATTENTION 0 prefill 3 NORMED->BRANCH"));
         assertThrows(IllegalStateException.class, () -> fb.decode(1, 0));
     }

@@ -32,11 +32,9 @@ import com.eonmux.neuralfree.gguf.video.VideoTemplate;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
@@ -148,28 +146,26 @@ public final class MediaContext implements AutoCloseable {
     private final VideoConfig videoConfig;
     private final VideoOptions videoOptions;
     private final VideoDecoder videoDecoder;
-    private final EncoderOutputCache<MediaKey, List<Piece>> cache;
-    private final EncoderOutputCache<MediaKey, Processed> processed;
-    /** The shared encoder cache this context loads from and saves to, or null. */
-    private final EncoderCacheConnector shared;
-    /** The items loaded from and saved to the shared encoder cache, since the context opened. */
-    private final AtomicLong sharedLoads = new AtomicLong();
-    private final AtomicLong sharedSaves = new AtomicLong();
+    private final EncoderOutputCache<MediaKey, List<MediaPiece>> cache;
+    private final EncoderOutputCache<MediaKey, ProcessedMedia> processed;
+    /** The appender of the family's encoded pieces to a prompt. */
+    private final MediaPromptAppender appender;
+    /** The shared encoder cache exchange (vLLM's encoder cache connector), inert without a connector. */
+    private final SharedEncoderCache sharedCache;
     /** The adapters the vision encoder applies, held for a reopen. */
     private final List<LoraAttachment.Binding> loras;
     /** The loaded projector; null while released. Guarded by {@code this}. */
-    private Encoders encoders;
+    private MmprojEncoders encoders;
     private volatile String visionDevice;
     private volatile boolean released;
     private boolean closed;
 
-    private MediaContext(String path, MmprojOptions encoderOptions, Encoders encoders,
+    private MediaContext(String path, MmprojOptions encoderOptions, MmprojEncoders encoders,
                          ImageProcessorParams imageParams, MediaMarkers markers, boolean mrope, int width,
                          long cacheBytes, MediaIoOptions io, VideoConfig videoConfig, VideoOptions videoOptions,
                          EncoderCacheConnector shared, List<LoraAttachment.Binding> loras) {
         this.path = path;
         this.loras = List.copyOf(loras);
-        this.shared = shared;
         this.encoderOptions = encoderOptions;
         this.encoders = encoders;
         this.caps = encoders.mmproj.caps();
@@ -188,8 +184,10 @@ public final class MediaContext implements AutoCloseable {
         this.videoConfig = videoConfig;
         this.videoOptions = videoOptions;
         this.videoDecoder = new VideoDecoder(videoOptions.ffmpegDir());
-        this.cache = new EncoderOutputCache<>(cacheBytes, MediaContext::bytesOf);
-        this.processed = new EncoderOutputCache<>(cacheBytes, Processed::bytes);
+        this.cache = new EncoderOutputCache<>(cacheBytes, MediaPiece::bytesOf);
+        this.processed = new EncoderOutputCache<>(cacheBytes, ProcessedMedia::bytes);
+        this.appender = new MediaPromptAppender(markers, mrope);
+        this.sharedCache = new SharedEncoderCache(shared, cache, width);
     }
 
     /**
@@ -281,7 +279,7 @@ public final class MediaContext implements AutoCloseable {
         if (cacheBytes < 0) {
             throw new IllegalArgumentException("the media cache budget must not be negative, got " + cacheBytes);
         }
-        Encoders loaded = Encoders.open(path, encoder, textEmbd, loras);
+        MmprojEncoders loaded = MmprojEncoders.open(path, encoder, textEmbd, loras);
         try {
             MmprojModel mm = loaded.mmproj;
             ImageProcessorParams params = null;
@@ -320,14 +318,6 @@ public final class MediaContext implements AutoCloseable {
         return input + " input is not supported: " + (unrunnableReason == null
                 ? "the projector has no " + encoder + " encoder"
                 : "the projector's " + encoder + " encoder does not run (" + unrunnableReason + ")");
-    }
-
-    private static void requireWidth(String what, int projector, int text, String path) {
-        if (projector != text) {
-            throw new IllegalArgumentException("mismatch between the text model (n_embd = " + text + ") and the "
-                    + what + " projector of " + path + " (n_embd = " + projector + "); the mmproj file does not"
-                    + " belong to this model");
-        }
     }
 
     /** Whether image input is accepted (the file has a vision encoder NeuralFree runs). */
@@ -459,8 +449,8 @@ public final class MediaContext implements AutoCloseable {
         if (!hasVision) {
             throw new MediaInputException(visionRefusal);
         }
-        Source source = new Source(this, MediaLimits.Modality.IMAGE, uuid, data, lora);
-        append(prompt, source.key(), encodedImage(source), imageIndex, text, markers.nonCausalImage());
+        MediaItem source = new MediaItem(this, MediaLimits.Modality.IMAGE, uuid, data, lora);
+        appender.append(prompt, source.key(), encodedImage(source), imageIndex, text, markers.nonCausalImage());
     }
 
     /**
@@ -482,8 +472,8 @@ public final class MediaContext implements AutoCloseable {
         if (!hasVision) {
             throw new MediaInputException(visionRefusal);
         }
-        Source source = new Source(this, MediaLimits.Modality.IMAGE, key, data);
-        append(prompt, key, encodedImage(source), imageIndex, text, markers.nonCausalImage());
+        MediaItem source = new MediaItem(this, MediaLimits.Modality.IMAGE, key, data);
+        appender.append(prompt, key, encodedImage(source), imageIndex, text, markers.nonCausalImage());
     }
 
     /**
@@ -528,8 +518,8 @@ public final class MediaContext implements AutoCloseable {
         if (!hasAudio) {
             throw new MediaInputException(audioRefusal);
         }
-        Source source = new Source(this, MediaLimits.Modality.AUDIO, uuid, data, lora);
-        append(prompt, source.key(), encodedAudio(source, name), 0, text, false);
+        MediaItem source = new MediaItem(this, MediaLimits.Modality.AUDIO, uuid, data, lora);
+        appender.append(prompt, source.key(), encodedAudio(source, name), 0, text, false);
     }
 
     /**
@@ -545,8 +535,8 @@ public final class MediaContext implements AutoCloseable {
         if (!hasAudio) {
             throw new MediaInputException(audioRefusal);
         }
-        Source source = new Source(this, MediaLimits.Modality.AUDIO, key, data);
-        append(prompt, key, encodedAudio(source, name), 0, text, false);
+        MediaItem source = new MediaItem(this, MediaLimits.Modality.AUDIO, key, data);
+        appender.append(prompt, key, encodedAudio(source, name), 0, text, false);
     }
 
     // ------------------------------------------------------------------ video
@@ -591,8 +581,8 @@ public final class MediaContext implements AutoCloseable {
         if (!hasVision) {
             throw new MediaInputException(visionRefusal);
         }
-        Source source = new Source(this, MediaLimits.Modality.VIDEO, uuid, data, lora);
-        append(prompt, source.key(), encodedVideo(source, field), 0, text, markers.nonCausalImage());
+        MediaItem source = new MediaItem(this, MediaLimits.Modality.VIDEO, uuid, data, lora);
+        appender.append(prompt, source.key(), encodedVideo(source, field), 0, text, markers.nonCausalImage());
     }
 
     /**
@@ -608,29 +598,29 @@ public final class MediaContext implements AutoCloseable {
         if (!hasVision) {
             throw new MediaInputException(visionRefusal);
         }
-        Source source = new Source(this, MediaLimits.Modality.VIDEO, key, data);
-        append(prompt, key, encodedVideo(source, field), 0, text, markers.nonCausalImage());
+        MediaItem source = new MediaItem(this, MediaLimits.Modality.VIDEO, key, data);
+        appender.append(prompt, key, encodedVideo(source, field), 0, text, markers.nonCausalImage());
     }
 
     /** The encoding of a video: the encoded layer's or the shared encoder cache's, else its sampled frames'. */
-    private List<Piece> encodedVideo(Source source, String field) {
-        List<Piece> hit = shared(source);
+    private List<MediaPiece> encodedVideo(MediaItem source, String field) {
+        List<MediaPiece> hit = sharedCache.shared(source);
         if (hit != null) {
             return hit;
         }
         return encodeUnderLora(source, () -> {
-            List<Piece> again = cache.peek(source.key());
+            List<MediaPiece> again = cache.peek(source.key());
             if (again != null) {
                 return again;
             }
             DecodedVideo decoded = sampledVideo(source, field);
-            return store(source, layoutVideo(decoded, field));
+            return sharedCache.store(source, layoutVideo(decoded, field));
         });
     }
 
     /** The sampled frames of a video: the processed layer's, else probed, planned and decoded from its bytes. */
-    private DecodedVideo sampledVideo(Source source, String field) {
-        Processed hit = processed.get(source.baseKey());
+    private DecodedVideo sampledVideo(MediaItem source, String field) {
+        ProcessedMedia hit = processed.get(source.baseKey());
         if (hit != null) {
             return hit.video;
         }
@@ -641,7 +631,7 @@ public final class MediaContext implements AutoCloseable {
         ImageSize frameSize = preprocessor == null ? null
                 : preprocessor.videoFrameSize(plan.nFrames(), meta.width(), meta.height());
         DecodedVideo decoded = videoDecoder.decode(source.bytes(), plan, frameSize, soundtrackRate(), field);
-        Processed out = Processed.video(decoded);
+        ProcessedMedia out = ProcessedMedia.video(decoded);
         processed.put(source.baseKey(), out);
         return decoded;
     }
@@ -664,20 +654,20 @@ public final class MediaContext implements AutoCloseable {
      * the image markers and its rows pruned by the configured video token pruning. The soundtrack of an LFM3-Omni
      * video encodes as one clip whose rows follow each group's frames ({@code add_soundtrack_piece}).
      */
-    private List<Piece> layoutVideo(DecodedVideo decoded, String field) {
+    private List<MediaPiece> layoutVideo(DecodedVideo decoded, String field) {
         VideoSamplePlan plan = decoded.plan();
         VideoTemplate template = plan.template();
         List<RasterImage> frames = decoded.frames();
         int merge = plan.temporalMerge();
-        List<List<Piece>> groups = new ArrayList<>(plan.groups());
+        List<List<MediaPiece>> groups = new ArrayList<>(plan.groups());
         for (int g = 0; g < plan.groups(); g++) {
             int first = g * merge;
             int count = Math.min(merge, frames.size() - first);
-            List<Piece> group = new ArrayList<>(3);
+            List<MediaPiece> group = new ArrayList<>(3);
             if (count == 2) {
-                group.add(Piece.text(markers.imageBegin()));
+                group.add(MediaPiece.text(markers.imageBegin()));
                 group.add(framePairChunk(frames.get(first), frames.get(first + 1), field));
-                group.add(Piece.text(markers.imageEnd()));
+                group.add(MediaPiece.text(markers.imageEnd()));
             } else {
                 // one frame on its own: the family's whole image layout, markers included
                 group.addAll(frameChunks(frames.get(first), field));
@@ -686,22 +676,22 @@ public final class MediaContext implements AutoCloseable {
         }
         pruneVideo(groups, field);
         addSoundtrack(groups, decoded, field);
-        List<Piece> out = new ArrayList<>();
+        List<MediaPiece> out = new ArrayList<>();
         if (template == VideoTemplate.DEFAULT) {
-            out.add(Piece.text(template.videoPrefix()));
+            out.add(MediaPiece.text(template.videoPrefix()));
             int interval = videoOptions.timestampIntervalMs();
             double nextStampMs = interval;
             for (int g = 0; g < groups.size(); g++) {
                 addGroup(out, groups.get(g));
                 int lastFrame = Math.min((g + 1) * merge, plan.nFrames()) - 1;
                 if (interval > 0 && lastFrame / plan.targetFps() * 1000.0 >= nextStampMs) {
-                    out.add(Piece.text(template.frameTimestamp(plan.frameTime(lastFrame))));
+                    out.add(MediaPiece.text(template.frameTimestamp(plan.frameTime(lastFrame))));
                     nextStampMs += interval;
                 }
             }
         } else {
             for (int g = 0; g < groups.size(); g++) {
-                out.add(Piece.text(template.groupTimestamp(plan.groupTimestamp(g))));
+                out.add(MediaPiece.text(template.groupTimestamp(plan.groupTimestamp(g))));
                 addGroup(out, groups.get(g));
             }
         }
@@ -709,9 +699,9 @@ public final class MediaContext implements AutoCloseable {
     }
 
     /** A group's pieces, the chunk pruned to no rows dropped (its stamp text stays, as vLLM's does). */
-    private static void addGroup(List<Piece> out, List<Piece> group) {
-        for (Piece p : group) {
-            if (p.kind == Piece.Kind.GRID && p.rows.length == 0) {
+    private static void addGroup(List<MediaPiece> out, List<MediaPiece> group) {
+        for (MediaPiece p : group) {
+            if (p.kind == MediaPiece.Kind.GRID && p.rows.length == 0) {
                 continue;
             }
             out.add(p);
@@ -724,7 +714,7 @@ public final class MediaContext implements AutoCloseable {
      * its first sample's position to the next group's, the last group the rest of the track. The pieces carry no
      * audio markers, as the reference keeps them inside the video's span.
      */
-    private void addSoundtrack(List<List<Piece>> groups, DecodedVideo decoded, String field) {
+    private void addSoundtrack(List<List<MediaPiece>> groups, DecodedVideo decoded, String field) {
         List<AudioClip> slices = decoded.soundtrack();
         if (slices.isEmpty()) {
             return;
@@ -735,7 +725,7 @@ public final class MediaContext implements AutoCloseable {
         }
         for (int g = 0; g < groups.size(); g++) {
             if (parts[g].length > 0) {
-                groups.get(g).add(Piece.rows(parts[g]));
+                groups.get(g).add(MediaPiece.rows(parts[g]));
             }
         }
     }
@@ -744,7 +734,7 @@ public final class MediaContext implements AutoCloseable {
      * The chunks of one sampled frame: the family's image layout (a sliced frame keeps its tiles, a fixed-size
      * frame its one chunk).
      */
-    private List<Piece> frameChunks(RasterImage frame, String field) {
+    private List<MediaPiece> frameChunks(RasterImage frame, String field) {
         PreparedImages prepared = prepareFrame(frame, field);
         return layoutImage(prepared);
     }
@@ -754,7 +744,7 @@ public final class MediaContext implements AutoCloseable {
      * the first frame run through the patch kernel the still images use and the second through the temporal
      * kernel ({@code build_inp_temporal_merge} with a batch of two frames).
      */
-    private Piece framePairChunk(RasterImage first, RasterImage second, String field) {
+    private MediaPiece framePairChunk(RasterImage first, RasterImage second, String field) {
         PreparedImages a = prepareFrame(first, field);
         PreparedImages b = prepareFrame(second, field);
         ImageTile tileA = singlePairTile(a, "first", field);
@@ -767,9 +757,9 @@ public final class MediaContext implements AutoCloseable {
         float[][] rows = encodeTile(pair, tileA);
         ImageSize grid = imageParams.tokenGridFor(tileA.size());
         if (grid.width() * grid.height() == rows.length) {
-            return Piece.grid(rows, grid.width(), grid.height());
+            return MediaPiece.grid(rows, grid.width(), grid.height());
         }
-        return Piece.grid(rows, rows.length, 1);
+        return MediaPiece.grid(rows, rows.length, 1);
     }
 
     /** The one tile a frame of a temporal pair preprocesses to; a sliced frame refuses the pair. */
@@ -799,15 +789,15 @@ public final class MediaContext implements AutoCloseable {
      * row per frame). The groups must be single uniform chunks, the layout the temporal-patch and fixed-size
      * families produce; the others refuse pruning by name.
      */
-    private void pruneVideo(List<List<Piece>> groups, String field) {
+    private void pruneVideo(List<List<MediaPiece>> groups, String field) {
         double rate = videoOptions.pruningRate();
         if (rate <= 0 || groups.isEmpty()) {
             return;
         }
         VideoPruner.Method method = videoOptions.pruningMethod();
-        List<Piece> chunks = new ArrayList<>(groups.size());
-        for (List<Piece> group : groups) {
-            Piece chunk = singleGridChunk(group);
+        List<MediaPiece> chunks = new ArrayList<>(groups.size());
+        for (List<MediaPiece> group : groups) {
+            MediaPiece chunk = singleGridChunk(group);
             if (chunk == null) {
                 throw new MediaInputException(field + ": the video token pruning runs over single-chunk frames,"
                         + " and the projector's frame layout splits a frame over " + group.size() + " pieces");
@@ -815,7 +805,7 @@ public final class MediaContext implements AutoCloseable {
             chunks.add(chunk);
         }
         int rowsPerFrame = chunks.get(0).rows.length;
-        for (Piece chunk : chunks) {
+        for (MediaPiece chunk : chunks) {
             if (chunk.rows.length != rowsPerFrame) {
                 throw new MediaInputException(field + ": the video token pruning needs uniform frames, and the"
                         + " frames encode to " + rowsPerFrame + " and " + chunk.rows.length + " rows");
@@ -834,15 +824,15 @@ public final class MediaContext implements AutoCloseable {
     }
 
     /** The one grid chunk of a group, or null when the group is not a single chunk. */
-    private static Piece singleGridChunk(List<Piece> group) {
-        Piece chunk = null;
-        for (Piece p : group) {
-            if (p.kind == Piece.Kind.GRID) {
+    private static MediaPiece singleGridChunk(List<MediaPiece> group) {
+        MediaPiece chunk = null;
+        for (MediaPiece p : group) {
+            if (p.kind == MediaPiece.Kind.GRID) {
                 if (chunk != null) {
                     return null;
                 }
                 chunk = p;
-            } else if (p.kind != Piece.Kind.TEXT) {
+            } else if (p.kind != MediaPiece.Kind.TEXT) {
                 return null;
             }
         }
@@ -850,9 +840,9 @@ public final class MediaContext implements AutoCloseable {
     }
 
     /** Swaps the grid chunk of a group for the pruned one. */
-    private static void replaceChunk(List<Piece> group, Piece pruned) {
+    private static void replaceChunk(List<MediaPiece> group, MediaPiece pruned) {
         for (int i = 0; i < group.size(); i++) {
-            if (group.get(i).kind == Piece.Kind.GRID) {
+            if (group.get(i).kind == MediaPiece.Kind.GRID) {
                 group.set(i, pruned);
                 return;
             }
@@ -883,75 +873,24 @@ public final class MediaContext implements AutoCloseable {
         if (cache.contains(key) || processed.contains(keyOf(modality, uuid, null))) {
             return true;
         }
-        EncoderCacheConnector connector = shared;
-        return connector != null && connector.isConsumer() && connector.has(key);
-    }
-
-    /**
-     * Appends one item's pieces under its key. Each embedding chunk is piece {@code n} of the item (a sliced
-     * image's overview and slices, an audio clip's windows), so every chunk's identity names exactly its own rows
-     * and one key names the whole item in the encoded-media cache and the prefix cache alike.
-     * A block whose lead pads depend on the prompt before it ({@link MediaMarkers#imageLeadPadAlign()}) takes the
-     * pads its place needs and is identified as {@code key#n@leadK}, {@code K} its lead pad count; the prefix
-     * cache keys its rows by their content, since they differ per pad count.
-     */
-    private void append(MediaPrompt.Builder prompt, MediaKey key, List<Piece> pieces, int imageIndex,
-                        TextEncoder text, boolean nonCausal) {
-        int run = 0;
-        for (Piece p : pieces) {
-            if (p.kind == Piece.Kind.TEXT) {
-                if (!p.text.isEmpty()) {
-                    prompt.appendText(text.encode(p.text));
-                }
-            } else if (p.kind == Piece.Kind.IMAGE_ID) {
-                prompt.appendText(text.encode("<image_id>" + imageIndex + "</image_id>"));
-            } else if (p.kind == Piece.Kind.LEAD_PADDED) {
-                Piece block = p.leadPadded(prompt.tokens(), markers.imageLeadPadAlign());
-                prompt.addMedia(key + "#" + run++ + "@lead" + block.lead,
-                        positions(block, prompt.position()), block.rows, nonCausal);
-            } else {
-                prompt.addMedia(key, run++, positions(p, prompt.position()), p.rows, nonCausal);
-            }
-        }
-    }
-
-    /**
-     * The positions of a row piece at {@code pos0}: the 2D grid (zero-based for SenseNova-U1,
-     * {@link MediaMarkers#zeroBasedImageGrid()}) or the canvas on M-RoPE, else one position per row. A pruned
-     * grid takes its kept cells' positions.
-     */
-    private MediaRopePositions positions(Piece p, int pos0) {
-        if (p.kind == Piece.Kind.CANVAS) {
-            return MediaRopePositions.canvas(pos0, p.nx, p.ny, p.canvas);
-        }
-        if (!mrope) {
-            return MediaRopePositions.normal(pos0, p.rows.length);
-        }
-        if (p.kind == Piece.Kind.GRID) {
-            if (p.mask != null) {
-                return MediaRopePositions.image2dMasked(pos0, p.nx, p.ny, p.mask);
-            }
-            return markers.zeroBasedImageGrid() ? MediaRopePositions.image2dZeroBased(pos0, p.nx, p.ny)
-                    : MediaRopePositions.image2d(pos0, p.nx, p.ny);
-        }
-        return MediaRopePositions.audio1d(pos0, p.rows.length);
+        return sharedCache.holds(key);
     }
 
     // ------------------------------------------------------------------ encoding
 
     /** The encoding of an image: the encoded layer's or the shared encoder cache's, else its prepared tiles'. */
-    private List<Piece> encodedImage(Source source) {
-        List<Piece> hit = shared(source);
+    private List<MediaPiece> encodedImage(MediaItem source) {
+        List<MediaPiece> hit = sharedCache.shared(source);
         if (hit != null) {
             return hit;
         }
         return encodeUnderLora(source, () -> {
-            List<Piece> again = cache.peek(source.key());
+            List<MediaPiece> again = cache.peek(source.key());
             if (again != null) {
                 return again;
             }
-            Processed prepared = preparedImage(source);
-            return store(source, layoutImage(prepared.image));
+            ProcessedMedia prepared = preparedImage(source);
+            return sharedCache.store(source, layoutImage(prepared.image));
         });
     }
 
@@ -962,7 +901,7 @@ public final class MediaContext implements AutoCloseable {
      * other encode's tiles run through the session and no other request waits mid-image. A request without adapters
      * encodes as before, holding the monitor per tile.
      */
-    private List<Piece> encodeUnderLora(Source source, Supplier<List<Piece>> encode) {
+    private List<MediaPiece> encodeUnderLora(MediaItem source, Supplier<List<MediaPiece>> encode) {
         if (source.lora() == null || !hasVision) {
             // no adapters to apply, or an audio-only projector whose encodes run none
             return encode.get();
@@ -988,8 +927,8 @@ public final class MediaContext implements AutoCloseable {
     }
 
     /** The prepared tiles of an image: the processed layer's, else decoded and preprocessed from its bytes. */
-    private Processed preparedImage(Source source) {
-        Processed hit = processed.get(source.baseKey());
+    private ProcessedMedia preparedImage(MediaItem source) {
+        ProcessedMedia hit = processed.get(source.baseKey());
         if (hit != null) {
             return hit;
         }
@@ -1005,15 +944,15 @@ public final class MediaContext implements AutoCloseable {
         } catch (IllegalArgumentException e) {
             throw new MediaInputException("the image cannot be preprocessed for the projector: " + e.getMessage(), e);
         }
-        Processed out = Processed.image(prepared);
+        ProcessedMedia out = ProcessedMedia.image(prepared);
         processed.put(source.baseKey(), out);
         return out;
     }
 
     /** The marker text and row pieces of a prepared image, in mtmd's order (mtmd_tokenizer::add_media). */
-    private List<Piece> layoutImage(PreparedImages prepared) {
-        List<Piece> out = new ArrayList<>();
-        out.add(Piece.text(markers.imageBegin()));
+    private List<MediaPiece> layoutImage(PreparedImages prepared) {
+        List<MediaPiece> out = new ArrayList<>();
+        out.add(MediaPiece.text(markers.imageBegin()));
         boolean tiled = (prepared.gridX() > 0 && prepared.gridY() > 0) || prepared.hasOverview();
         if (prepared.isAnyres()) {
             out.add(anyresChunk(prepared));
@@ -1024,7 +963,7 @@ public final class MediaContext implements AutoCloseable {
         } else {
             out.add(singleChunk(prepared));
         }
-        out.add(Piece.text(markers.imageEnd()));
+        out.add(MediaPiece.text(markers.imageEnd()));
         return Collections.unmodifiableList(out);
     }
 
@@ -1032,7 +971,7 @@ public final class MediaContext implements AutoCloseable {
      * A llava-uhd image: the overview and the slice grid with the family's slice template
      * ({@link MediaMarkers#tiledLayout}).
      */
-    private void layoutTiles(PreparedImages prepared, List<Piece> out) {
+    private void layoutTiles(PreparedImages prepared, List<MediaPiece> out) {
         List<ImageTile> tiles = slices(prepared);
         int cols = tiles.isEmpty() ? 0 : prepared.gridX();
         int rows = tiles.isEmpty() ? 0 : prepared.gridY();
@@ -1046,16 +985,16 @@ public final class MediaContext implements AutoCloseable {
         for (MediaMarkers.LayoutPart part : markers.tiledLayout(cols, rows)) {
             switch (part.kind()) {
                 case TEXT:
-                    out.add(Piece.text(part.text()));
+                    out.add(MediaPiece.text(part.text()));
                     break;
                 case IMAGE_ID:
-                    out.add(Piece.imageId());
+                    out.add(MediaPiece.imageId());
                     break;
                 case OVERVIEW:
-                    out.add(Piece.rows(encoded.get(0)));
+                    out.add(MediaPiece.rows(encoded.get(0)));
                     break;
                 default:
-                    out.add(Piece.rows(encoded.get(part.slice() + 1)));
+                    out.add(MediaPiece.rows(encoded.get(part.slice() + 1)));
                     break;
             }
         }
@@ -1082,7 +1021,7 @@ public final class MediaContext implements AutoCloseable {
      * overview's {@code </image>} (and {@code <slice>} before the slices), a slice's {@code </slice><slice>},
      * {@code </slice>\n<slice>} at the end of a row and {@code </slice>} after the last.
      */
-    private void layoutCanvas(PreparedImages prepared, List<Piece> out) {
+    private void layoutCanvas(PreparedImages prepared, List<MediaPiece> out) {
         List<ImageTile> slices = slices(prepared);
         int cols = slices.isEmpty() ? 0 : prepared.gridX();
         int rows = slices.isEmpty() ? 0 : prepared.gridY();
@@ -1100,10 +1039,10 @@ public final class MediaContext implements AutoCloseable {
         for (MediaMarkers.LayoutPart part : markers.canvasLayout()) {
             switch (part.kind()) {
                 case TEXT:
-                    out.add(Piece.text(part.text()));
+                    out.add(MediaPiece.text(part.text()));
                     break;
                 case IMAGE_ID:
-                    out.add(Piece.imageId());
+                    out.add(MediaPiece.imageId());
                     break;
                 default:
                     out.add(canvasChunk(entries, suffixes, cols, rows));
@@ -1116,7 +1055,7 @@ public final class MediaContext implements AutoCloseable {
      * An anyres image as one chunk ({@link VisionEncoder#encodeAnyres}): the overview's rows, then the tile grid
      * cropped to the original aspect ratio with a newline row per token row, laid out as one token row.
      */
-    private Piece anyresChunk(PreparedImages prepared) {
+    private MediaPiece anyresChunk(PreparedImages prepared) {
         List<ClipImage> tiles = new ArrayList<>(prepared.tiles().size());
         for (ImageTile tile : prepared.tiles()) {
             tiles.add(clipImage(tile));
@@ -1133,14 +1072,14 @@ public final class MediaContext implements AutoCloseable {
                         + " encoder: " + e.getMessage(), e);
             }
         }
-        return Piece.grid(rows, rows.length, 1);
+        return MediaPiece.grid(rows, rows.length, 1);
     }
 
     /**
      * The canvas chunk of {@code entries}: every entry encoded with its suffix, its token grid scaled from the last
      * entry's ({@code canvas_tile_grid}).
      */
-    private Piece canvasChunk(List<ImageTile> entries, List<ClipSuffix> suffixes, int cols, int rows) {
+    private MediaPiece canvasChunk(List<ImageTile> entries, List<ClipSuffix> suffixes, int cols, int rows) {
         ImageSize refSize = entries.get(entries.size() - 1).size();
         ImageSize ref = imageParams.tokenGridFor(refSize);
         List<ClipImage> images = new ArrayList<>(entries.size());
@@ -1170,14 +1109,14 @@ public final class MediaContext implements AutoCloseable {
             System.arraycopy(e, 0, all, at, e.length);
             at += e.length;
         }
-        return Piece.canvas(all, cols, rows, tiles);
+        return MediaPiece.canvas(all, cols, rows, tiles);
     }
 
     /**
      * An unsliced image as one chunk: the rows of every tile in order, laid out on the merged token grid of the
      * first tile for M-RoPE ({@code clip_n_output_tokens_x/y}) when the rows fill that grid.
      */
-    private Piece singleChunk(PreparedImages prepared) {
+    private MediaPiece singleChunk(PreparedImages prepared) {
         List<ImageTile> tiles = prepared.encodedTiles();
         if (tiles.isEmpty()) {
             throw new MediaInputException("the image preprocessing produced no image tiles");
@@ -1203,9 +1142,9 @@ public final class MediaContext implements AutoCloseable {
         }
         ImageSize grid = imageParams.tokenGridFor(tiles.get(0).size());
         if (tiles.size() == 1 && grid.width() * grid.height() == total) {
-            return Piece.grid(rows, grid.width(), grid.height());
+            return MediaPiece.grid(rows, grid.width(), grid.height());
         }
-        return Piece.grid(rows, total, 1);
+        return MediaPiece.grid(rows, total, 1);
     }
 
     /**
@@ -1213,13 +1152,13 @@ public final class MediaContext implements AutoCloseable {
      * trimmed at append time to the pads its place in the prompt takes (a block with fewer pads is the same block
      * without its first pad rows).
      */
-    private Piece leadPaddedChunk(List<ImageTile> tiles, int maxLead) {
+    private MediaPiece leadPaddedChunk(List<ImageTile> tiles, int maxLead) {
         if (tiles.size() != 1) {
             throw new IllegalStateException("a lead-padded image block encodes one tile, the preprocessing produced "
                     + tiles.size());
         }
         ImageTile tile = tiles.get(0);
-        return Piece.leadPadded(encodeTile(clipImage(tile).withLeadPad(maxLead), tile), maxLead);
+        return MediaPiece.leadPadded(encodeTile(clipImage(tile).withLeadPad(maxLead), tile), maxLead);
     }
 
     private float[][] encodeTile(ImageTile tile) {
@@ -1261,17 +1200,17 @@ public final class MediaContext implements AutoCloseable {
     }
 
     /** The encoding of an audio clip: the encoded layer's or the shared encoder cache's, else its decoded samples'. */
-    private List<Piece> encodedAudio(Source source, String name) {
-        List<Piece> hit = shared(source);
+    private List<MediaPiece> encodedAudio(MediaItem source, String name) {
+        List<MediaPiece> hit = sharedCache.shared(source);
         if (hit != null) {
             return hit;
         }
         return encodeUnderLora(source, () -> {
-            List<Piece> again = cache.peek(source.key());
+            List<MediaPiece> again = cache.peek(source.key());
             if (again != null) {
                 return again;
             }
-            Processed samples = decodedAudio(source, name);
+            ProcessedMedia samples = decodedAudio(source, name);
             List<float[][]> chunks;
             synchronized (this) {
                 chunks = loaded().audio.embed(samples.audio);
@@ -1279,19 +1218,19 @@ public final class MediaContext implements AutoCloseable {
             if (chunks.isEmpty()) {
                 throw new MediaInputException("the audio produced no encoder windows");
             }
-            List<Piece> out = new ArrayList<>();
-            out.add(Piece.text(markers.audioBegin()));
+            List<MediaPiece> out = new ArrayList<>();
+            out.add(MediaPiece.text(markers.audioBegin()));
             for (float[][] rows : chunks) {
-                out.add(Piece.rows(rows));
+                out.add(MediaPiece.rows(rows));
             }
-            out.add(Piece.text(markers.audioEnd()));
-            return store(source, Collections.unmodifiableList(out));
+            out.add(MediaPiece.text(markers.audioEnd()));
+            return sharedCache.store(source, Collections.unmodifiableList(out));
         });
     }
 
     /** The decoded samples of an audio clip: the processed layer's, else decoded from its bytes. */
-    private Processed decodedAudio(Source source, String name) {
-        Processed hit = processed.get(source.baseKey());
+    private ProcessedMedia decodedAudio(MediaItem source, String name) {
+        ProcessedMedia hit = processed.get(source.baseKey());
         if (hit != null) {
             return hit;
         }
@@ -1301,7 +1240,7 @@ public final class MediaContext implements AutoCloseable {
         } catch (IOException | IllegalArgumentException e) {
             throw new MediaInputException("the audio cannot be decoded: " + e.getMessage(), e);
         }
-        Processed out = Processed.audio(clip);
+        ProcessedMedia out = ProcessedMedia.audio(clip);
         processed.put(source.baseKey(), out);
         return out;
     }
@@ -1355,12 +1294,12 @@ public final class MediaContext implements AutoCloseable {
 
     /** The items this consumer loaded from the shared encoder cache, since the context opened. */
     public long sharedLoads() {
-        return sharedLoads.get();
+        return sharedCache.loads();
     }
 
     /** The items this producer saved to the shared encoder cache, since the context opened. */
     public long sharedSaves() {
-        return sharedSaves.get();
+        return sharedCache.saves();
     }
 
     /**
@@ -1378,148 +1317,6 @@ public final class MediaContext implements AutoCloseable {
      */
     public void clearEncodings() {
         cache.clear();
-    }
-
-    /** The bytes the pieces of one encoded item hold. */
-    private static long bytesOf(List<Piece> pieces) {        long floats = 0;
-        for (Piece p : pieces) {
-            floats += p.floats();
-        }
-        return floats * Float.BYTES;
-    }
-
-    // ------------------------------------------------------------------ shared encoder cache
-
-    /**
-     * The encoding the encoded layer, or for a consumer the shared encoder cache, holds for {@code source}, or null.
-     * A shared entry is checked against this projector's row width and cached locally, so the item's data is never
-     * read and its encoder never runs.
-     */
-    private List<Piece> shared(Source source) {
-        MediaKey key = source.key();
-        List<Piece> hit = cache.get(key);
-        if (hit != null) {
-            return hit;
-        }
-        EncoderCacheConnector connector = shared;
-        if (connector == null || !connector.isConsumer()) {
-            return null;
-        }
-        EncoderCacheEntry entry;
-        try {
-            entry = connector.get(key);
-        } catch (IOException e) {
-            throw new MediaInputException("the shared encoder cache cannot load item " + key + ": "
-                    + e.getMessage(), e);
-        }
-        if (entry == null) {
-            return null;
-        }
-        List<Piece> pieces = piecesOf(entry, key);
-        cache.put(key, pieces);
-        sharedLoads.incrementAndGet();
-        return pieces;
-    }
-
-    /** {@code pieces} cached locally and, for a producer, saved to the shared encoder cache. */
-    private List<Piece> store(Source source, List<Piece> pieces) {
-        MediaKey key = source.key();
-        cache.put(key, pieces);
-        EncoderCacheConnector connector = shared;
-        if (connector == null || !connector.isProducer()) {
-            return pieces;
-        }
-        try {
-            connector.put(key, entryOf(pieces));
-        } catch (IOException e) {
-            throw new MediaInputException("the shared encoder cache cannot save item " + key + ": "
-                    + e.getMessage(), e);
-        }
-        sharedSaves.incrementAndGet();
-        return pieces;
-    }
-
-    /** The shared-cache entry of one item's pieces. */
-    private static EncoderCacheEntry entryOf(List<Piece> pieces) {
-        List<EncoderCacheEntry.Chunk> chunks = new ArrayList<>(pieces.size());
-        for (Piece p : pieces) {
-            switch (p.kind) {
-                case TEXT:
-                    chunks.add(EncoderCacheEntry.Chunk.text(p.text));
-                    break;
-                case IMAGE_ID:
-                    chunks.add(EncoderCacheEntry.Chunk.imageId());
-                    break;
-                case ROWS:
-                    chunks.add(EncoderCacheEntry.Chunk.rows(p.rows));
-                    break;
-                case GRID:
-                    chunks.add(EncoderCacheEntry.Chunk.grid(p.rows, p.nx, p.ny, p.mask));
-                    break;
-                case LEAD_PADDED:
-                    chunks.add(EncoderCacheEntry.Chunk.leadPadded(p.rows, p.lead));
-                    break;
-                case CANVAS:
-                    chunks.add(EncoderCacheEntry.Chunk.canvas(p.rows, p.nx, p.ny, canvasTilesOf(p.canvas)));
-                    break;
-                default:
-                    throw new IllegalStateException("unhandled media piece " + p.kind);
-            }
-        }
-        return EncoderCacheEntry.of(chunks);
-    }
-
-    /** The pieces of a shared-cache entry, checked against this projector's embedding width. */
-    private List<Piece> piecesOf(EncoderCacheEntry entry, MediaKey key) {
-        if (entry.width() != 0 && entry.width() != width) {
-            throw new MediaInputException("the shared encoder cache holds item " + key + " at " + entry.width()
-                    + " values per row while this projector writes " + width + "; the producer runs another"
-                    + " projector");
-        }
-        List<Piece> out = new ArrayList<>(entry.chunks().size());
-        for (EncoderCacheEntry.Chunk chunk : entry.chunks()) {
-            switch (chunk.kind()) {
-                case TEXT:
-                    out.add(Piece.text(chunk.text()));
-                    break;
-                case IMAGE_ID:
-                    out.add(Piece.imageId());
-                    break;
-                case ROWS:
-                    out.add(Piece.rows(chunk.rows()));
-                    break;
-                case GRID:
-                    out.add(chunk.mask() == null ? Piece.grid(chunk.rows(), chunk.nx(), chunk.ny())
-                            : new Piece(Piece.Kind.GRID, null, chunk.rows(), chunk.nx(), chunk.ny(), 0, null,
-                                    chunk.mask()));
-                    break;
-                case LEAD_PADDED:
-                    out.add(Piece.leadPadded(chunk.rows(), chunk.lead()));
-                    break;
-                case CANVAS:
-                    out.add(Piece.canvas(chunk.rows(), chunk.nx(), chunk.ny(), canvasTiles(chunk.canvas())));
-                    break;
-                default:
-                    throw new IllegalStateException("unhandled shared encoder cache chunk " + chunk.kind());
-            }
-        }
-        return Collections.unmodifiableList(out);
-    }
-
-    private static List<EncoderCacheEntry.CanvasTile> canvasTilesOf(List<MediaRopePositions.CanvasTile> tiles) {
-        List<EncoderCacheEntry.CanvasTile> out = new ArrayList<>(tiles.size());
-        for (MediaRopePositions.CanvasTile tile : tiles) {
-            out.add(new EncoderCacheEntry.CanvasTile(tile.tokensX(), tile.tokensY(), tile.separators()));
-        }
-        return out;
-    }
-
-    private static List<MediaRopePositions.CanvasTile> canvasTiles(List<EncoderCacheEntry.CanvasTile> tiles) {
-        List<MediaRopePositions.CanvasTile> out = new ArrayList<>(tiles.size());
-        for (EncoderCacheEntry.CanvasTile tile : tiles) {
-            out.add(new MediaRopePositions.CanvasTile(tile.tokensX(), tile.tokensY(), tile.separators()));
-        }
-        return out;
     }
 
     // ------------------------------------------------------------------ release and reopen
@@ -1541,7 +1338,7 @@ public final class MediaContext implements AutoCloseable {
         if (closed || encoders == null) {
             return;
         }
-        Encoders current = encoders;
+        MmprojEncoders current = encoders;
         encoders = null;
         released = true;
         current.close();
@@ -1560,7 +1357,7 @@ public final class MediaContext implements AutoCloseable {
         if (encoders != null) {
             return;
         }
-        Encoders loaded = Encoders.open(path, encoderOptions, width, loras);
+        MmprojEncoders loaded = MmprojEncoders.open(path, encoderOptions, width, loras);
         if ((loaded.vision != null) != hasVision || (loaded.audio != null) != hasAudio) {
             loaded.close();
             throw new IllegalArgumentException("the projector " + path + " changed its encoders since it opened");
@@ -1571,7 +1368,7 @@ public final class MediaContext implements AutoCloseable {
     }
 
     /** The loaded encoders; the caller holds {@code this}. */
-    private Encoders loaded() {
+    private MmprojEncoders loaded() {
         ensureOpen();
         if (encoders == null) {
             throw new ReleasedException();
@@ -1593,7 +1390,7 @@ public final class MediaContext implements AutoCloseable {
         closed = true;
         cache.clear();
         processed.clear();
-        Encoders current = encoders;
+        MmprojEncoders current = encoders;
         encoders = null;
         IOException failure = null;
         if (current != null) {
@@ -1603,15 +1400,13 @@ public final class MediaContext implements AutoCloseable {
                 failure = e;
             }
         }
-        if (shared != null) {
-            try {
-                shared.close();
-            } catch (IOException e) {
-                if (failure == null) {
-                    failure = e;
-                } else {
-                    failure.addSuppressed(e);
-                }
+        try {
+            sharedCache.close();
+        } catch (IOException e) {
+            if (failure == null) {
+                failure = e;
+            } else {
+                failure.addSuppressed(e);
             }
         }
         if (failure != null) {
@@ -1625,308 +1420,5 @@ public final class MediaContext implements AutoCloseable {
                 : imageParams.projectorName() + " on " + visionDevice())
                 + ", audio=" + (audioProjector == null ? "none" : audioProjector)
                 + ", mrope=" + mrope + ", width=" + width + (released ? ", released" : "") + '}';
-    }
-
-    /** The projector file and the encoders bound over it: what a release frees and a reopen loads again. */
-    private static final class Encoders {
-        final MmprojModel mmproj;
-        final VisionEncoder vision;
-        final CpuAudioEncoder audio;
-
-        private Encoders(MmprojModel mmproj, VisionEncoder vision, CpuAudioEncoder audio) {
-            this.mmproj = mmproj;
-            this.vision = vision;
-            this.audio = audio;
-        }
-
-        /**
-         * Opens the projector at {@code path} and its encoders, each checked against the text width.
-         *
-         * @throws IllegalArgumentException when the file holds no encoder or a width differs from the text model's
-         */
-        static Encoders open(String path, MmprojOptions options, int textEmbd,
-                             List<LoraAttachment.Binding> loras) throws IOException {
-            MmprojModel mm = MmprojModel.open(path);
-            VisionEncoder vision = null;
-            CpuAudioEncoder audio = null;
-            try {
-                if (!mm.supportsVision() && !mm.supportsAudio() && !mm.supportsGenAudio()) {
-                    throw new IllegalArgumentException("the projector " + path
-                            + " has no vision, audio or generation encoder");
-                }
-                if (mm.supportsVision()) {
-                    vision = mm.openVisionEncoder(options);
-                    requireWidth("vision", vision.model().outputDim(), textEmbd, path);
-                    vision.attachLoras(loras);
-                }
-                if (mm.supportsAudio()) {
-                    audio = mm.openAudioEncoder();
-                    requireWidth("audio", audio.model().outputWidth(), textEmbd, path);
-                }
-                return new Encoders(mm, vision, audio);
-            } catch (IOException | RuntimeException e) {
-                new Encoders(mm, vision, audio).close();
-                throw e;
-            }
-        }
-
-        /** Closes the encoders, then the projector file. */
-        void close() throws IOException {
-            if (vision != null) {
-                vision.close();
-            }
-            if (audio != null) {
-                audio.close();
-            }
-            mmproj.close();
-        }
-    }
-
-    /** One appended item: its key, its request's adapters, and its bytes, read at most once. */
-    private static final class Source {
-        private final MediaLimits.Modality modality;
-        private final String uuid;
-        private final Supplier<byte[]> data;
-        private final MediaKey key;
-        private final MediaKey baseKey;
-        private final LoraSlotKey lora;
-        private byte[] bytes;
-
-        /**
-         * The item a client named {@code uuid} (its key the uuid's), or of {@code data} without a uuid (its key the
-         * digest of the bytes, read now), under the loader options' hash factors and the request's adapters: the
-         * encoded-media cache and the prefix cache key the item by the adapter identity ({@code key}), the
-         * processed layer by the plain item ({@code baseKey}).
-         *
-         * @throws MediaInputException when there is neither a uuid nor data
-         */
-        Source(MediaContext context, MediaLimits.Modality modality, String uuid, Supplier<byte[]> data,
-               LoraSlotKey lora) {
-            this.modality = modality;
-            this.uuid = uuid;
-            this.data = data;
-            this.lora = lora;
-            if (uuid == null) {
-                if (data == null) {
-                    throw new MediaInputException("the " + modality.key() + " has neither data nor a uuid");
-                }
-                bytes = Objects.requireNonNull(data.get(), "media data");
-            }
-            this.baseKey = context.keyOf(modality, uuid, bytes);
-            this.key = context.keyOf(modality, uuid, bytes, lora);
-        }
-
-        /** The item under the key {@code key} as given, its bytes read at most once. */
-        Source(MediaContext context, MediaLimits.Modality modality, MediaKey key, Supplier<byte[]> data) {
-            this.modality = modality;
-            this.uuid = null;
-            this.data = data;
-            this.lora = null;
-            this.key = Objects.requireNonNull(key, "key");
-            this.baseKey = this.key;
-        }
-
-        /** The item's key in the encoded-media cache and the prefix cache, the adapters' identity folded in. */
-        MediaKey key() {
-            return key;
-        }
-
-        /** The item's key in the processed layer, which the adapters do not run. */
-        MediaKey baseKey() {
-            return baseKey;
-        }
-
-        /** The request's adapters, or null when it names none. */
-        LoraSlotKey lora() {
-            return lora;
-        }
-
-        /**
-         * The item's bytes, read now when not yet; a key the cache does not hold without data is refused (vLLM's
-         * cache miss with the data not provided).
-         */
-        byte[] bytes() {
-            if (bytes == null) {
-                if (data == null) {
-                    String kind = modality.key();
-                    String name = uuid != null ? uuid : key.id();
-                    throw new MediaInputException("the " + kind + " with uuid '" + name + "' is not in the media"
-                            + " cache and its data is not provided; send the " + kind + " with its uuid again");
-                }
-                bytes = Objects.requireNonNull(data.get(), "media data");
-            }
-            return bytes;
-        }
-    }
-
-    /**
-     * A processed medium: an image's prepared tiles, an audio clip's decoded samples or a video's sampled frames,
-     * and the bytes they hold. Immutable.
-     */
-    private static final class Processed {
-        final PreparedImages image;
-        final AudioClip audio;
-        final DecodedVideo video;
-        final long bytes;
-
-        private Processed(PreparedImages image, AudioClip audio, DecodedVideo video, long bytes) {
-            this.image = image;
-            this.audio = audio;
-            this.video = video;
-            this.bytes = bytes;
-        }
-
-        /** Prepared tiles, sized by their pixels: 3 bytes per pixel, or 3 floats for a tile normalized early. */
-        static Processed image(PreparedImages prepared) {
-            long bytes = 0;
-            for (ImageTile tile : prepared.encodedTiles()) {
-                long channels = 3L * tile.width() * tile.height();
-                bytes += tile instanceof FloatImage ? channels * Float.BYTES : channels;
-            }
-            return new Processed(prepared, null, null, bytes);
-        }
-
-        /** Decoded samples, sized by their floats. */
-        static Processed audio(AudioClip clip) {
-            return new Processed(null, clip, null, (long) clip.length() * Float.BYTES);
-        }
-
-        /** Sampled video frames and their soundtrack slices, sized by their RGB bytes and sample floats. */
-        static Processed video(DecodedVideo video) {
-            long bytes = 0;
-            for (RasterImage frame : video.frames()) {
-                bytes += 3L * frame.width() * frame.height();
-            }
-            for (AudioClip clip : video.soundtrack()) {
-                bytes += (long) clip.length() * Float.BYTES;
-            }
-            return new Processed(null, null, video, bytes);
-        }
-
-        long bytes() {
-            return bytes;
-        }
-    }
-
-    /**
-     * One piece of an encoded medium: marker text, an image-id tag, or a chunk of rows (one position each, a token
-     * grid, a canvas, or a lead-padded block). Immutable.
-     */
-    private static final class Piece {
-        enum Kind { TEXT, IMAGE_ID, ROWS, GRID, LEAD_PADDED, CANVAS }
-
-        final Kind kind;
-        final String text;
-        final float[][] rows;
-        /** The token grid of a {@link Kind#GRID} piece, the slice grid of a {@link Kind#CANVAS} piece. */
-        final int nx;
-        final int ny;
-        /** The lead pad rows of a {@link Kind#LEAD_PADDED} piece; 0 otherwise. */
-        final int lead;
-        /** The tiles of a {@link Kind#CANVAS} piece; null otherwise. */
-        final List<MediaRopePositions.CanvasTile> canvas;
-        /**
-         * The retention mask of a pruned {@link Kind#GRID} piece, one entry per grid cell in raster order, the
-         * rows the kept cells'; null for an unpruned piece.
-         */
-        final boolean[] mask;
-
-        private Piece(Kind kind, String text, float[][] rows, int nx, int ny, int lead,
-                      List<MediaRopePositions.CanvasTile> canvas, boolean[] mask) {
-            this.kind = kind;
-            this.text = text;
-            this.rows = rows;
-            this.nx = nx;
-            this.ny = ny;
-            this.lead = lead;
-            this.canvas = canvas;
-            this.mask = mask;
-        }
-
-        static Piece text(String text) {
-            return new Piece(Kind.TEXT, text, null, 0, 0, 0, null, null);
-        }
-
-        static Piece imageId() {
-            return new Piece(Kind.IMAGE_ID, null, null, 0, 0, 0, null, null);
-        }
-
-        /** Rows taking one position each (a slice, an overview, an audio window). */
-        static Piece rows(float[][] rows) {
-            requireRows(rows);
-            return new Piece(Kind.ROWS, null, rows, rows.length, 1, 0, null, null);
-        }
-
-        /** Rows on an {@code nx * ny} token grid. */
-        static Piece grid(float[][] rows, int nx, int ny) {
-            requireRows(rows);
-            return new Piece(Kind.GRID, null, rows, nx, ny, 0, null, null);
-        }
-
-        /**
-         * This grid chunk pruned to the kept cells of {@code mask[from .. from + cells)}: the rows become the
-         * kept cells' rows in raster order, and the mask travels with the chunk for its positions.
-         */
-        Piece withMask(boolean[] mask, int from, int cells) {
-            if (kind != Kind.GRID || nx * ny != cells) {
-                throw new IllegalStateException("a retention mask prunes a " + cells + "-cell grid chunk, this"
-                        + " piece is a " + kind + " of " + nx * ny + " cells");
-            }
-            int kept = 0;
-            for (int i = 0; i < cells; i++) {
-                if (mask[from + i]) {
-                    kept++;
-                }
-            }
-            float[][] keptRows = new float[kept][];
-            int at = 0;
-            for (int i = 0; i < cells; i++) {
-                if (mask[from + i]) {
-                    keptRows[at++] = rows[i];
-                }
-            }
-            return new Piece(Kind.GRID, null, keptRows, nx, ny, 0, null,
-                    Arrays.copyOfRange(mask, from, from + cells));
-        }
-
-        /** A block of rows whose first {@code lead} rows are pads its place in the prompt may drop. */
-        static Piece leadPadded(float[][] rows, int lead) {
-            requireRows(rows);
-            if (lead < 0 || lead >= rows.length) {
-                throw new IllegalStateException("a block of " + rows.length + " rows cannot open with " + lead
-                        + " lead pads");
-            }
-            return new Piece(Kind.LEAD_PADDED, null, rows, rows.length, 1, lead, null, null);
-        }
-
-        /**
-         * The block placed after {@code tokensBefore} prompt tokens: it opens with {@code align - 1 - tokensBefore %
-         * align} pads ({@code mtmd_tokenize}'s {@code lead_pad}), the trailing pads of this block's {@code lead}.
-         */
-        Piece leadPadded(int tokensBefore, int align) {
-            int keep = align - 1 - tokensBefore % align;
-            if (keep > lead) {
-                throw new IllegalStateException("the block carries " + lead + " lead pads, its place needs " + keep);
-            }
-            float[][] kept = Arrays.copyOfRange(rows, lead - keep, rows.length);
-            return new Piece(Kind.ROWS, null, kept, kept.length, 1, keep, null, null);
-        }
-
-        /** The rows of a canvas chunk: the overview and a {@code gridX x gridY} slice grid of {@code tiles}. */
-        static Piece canvas(float[][] rows, int gridX, int gridY, List<MediaRopePositions.CanvasTile> tiles) {
-            requireRows(rows);
-            return new Piece(Kind.CANVAS, null, rows, gridX, gridY, 0,
-                    Collections.unmodifiableList(new ArrayList<>(tiles)), null);
-        }
-
-        private static void requireRows(float[][] rows) {
-            if (rows.length == 0) {
-                throw new MediaInputException("the encoder produced no embedding rows for the media");
-            }
-        }
-
-        long floats() {
-            return rows == null || rows.length == 0 ? 0 : (long) rows.length * rows[0].length;
-        }
     }
 }

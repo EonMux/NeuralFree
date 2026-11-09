@@ -1043,10 +1043,9 @@ public final class GpuPrefillDriver {
         } else {
             decodeReplay.invalidate();
             // the memory-backed multi-row step (a speculative round's verify of k + 1 rows) captures its own
-            // trunk only when the speculative round's replay is on (GpuForwardBackend.CHAIN_REPLAY_PROPERTY):
-            // the replay's per-step dispatch re-run costs more than the launches it replaces on the drivers
-            // measured so far
-            stepReplay.trunk(chainReplay && !replayDisabled && !taps.wantsAny(executor.layers().size())
+            // trunk only when the speculative round's replay is on (GpuForwardBackend.CHAIN_REPLAY_PROPERTY)
+            stepReplay.trunk(p, n, executor.stepReplayPatchers(),
+                    chainReplay && !replayDisabled && !taps.wantsAny(executor.layers().size())
                             && executor.capturableDecode(),
                     () -> executor.run(p, n, mode, taps));
         }

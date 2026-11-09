@@ -390,7 +390,7 @@ public class DecisionFamiliesTest {
     private static double[] labelProbabilities(EngineService model, String prompt, String[] labels, float temperature)
             throws IOException {
         int[] tokens = model.encode(prompt, false, true);
-        float[] logits = model.nextLogits(null, tokens);
+        float[] logits = model.pooling().nextLogits(null, tokens);
         float[] scores = new float[labels.length];
         for (int i = 0; i < labels.length; i++) {
             int[] ids = model.encode(labels[i], false, false);
@@ -414,7 +414,7 @@ public class DecisionFamiliesTest {
             }
         }
         assertTrue(n > 0, "the prompt carries a mask token per option");
-        float[] scores = model.decisionScores(null, tokens, null);
+        float[] scores = model.pooling().decisionScores(null, tokens, null);
         float[] columns = new float[n];
         int at = 0;
         for (int i = 0; i < tokens.length; i++) {

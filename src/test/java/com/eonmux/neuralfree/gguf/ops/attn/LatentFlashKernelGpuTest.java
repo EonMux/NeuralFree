@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.HardwareDevice;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
@@ -184,7 +185,9 @@ public class LatentFlashKernelGpuTest {
                     0, N_KV, want, 0, N_HEAD * D_V);
 
             FlashAttnTiling tiling = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, D_Q, D_V, N_KV,
-                    kernels.faSmemFloats(), Math.max(1, backend.capabilities().getComputeUnits()));
+                    kernels.faSmemFloats(), Math.max(1, backend.capabilities().getComputeUnits()),
+                    FlashAttnTiling.decodeFastPath(backend.capabilities().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+                            type, type, D_Q, D_V));
             Assume.assumeTrue("no decode plan for this shape: " + tiling,
                     tiling.plan() == FlashAttnTiling.Plan.DECODE);
             GpuBuffer dq = upload(bufs, q);

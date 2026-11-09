@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Test;
@@ -104,16 +105,16 @@ public class ExtTypeFastPathTest {
 
     private List<String> dispatched() {
         List<String> names = new ArrayList<>();
-        for (FakeComputeBackend.Dispatch d : backend.dispatches()) {
+        for (FakeDispatch d : backend.dispatches()) {
             names.add(d.kernelName());
         }
         return names;
     }
 
     /** The weight rows GpuOps selects for a weight type on a device of the given type and capability. */
-    private static GpuOps.WeightKernels selected(GGMLType type, ComputeBackend.BackendType backendType,
+    private static WeightKernels selected(GGMLType type, ComputeBackend.BackendType backendType,
                                                  int computeCapability) {
-        return GpuOps.weightKernels(type, backendType, caps(computeCapability));
+        return GpuWeightFamilies.weightKernels(type, backendType, caps(computeCapability));
     }
 
     /**
@@ -145,7 +146,7 @@ public class ExtTypeFastPathTest {
     @Test
     public void aSm89CudaDeviceSelectsTheHwRowsOfEveryFp8Type() {
         for (GGMLType type : HW_TYPES) {
-            GpuOps.WeightKernels k = selected(type, ComputeBackend.BackendType.CUDA, 89);
+            WeightKernels k = selected(type, ComputeBackend.BackendType.CUDA, 89);
             String n = type.name();
             assertEquals("single-token projection of " + type, n + "_Hw_MatVec", k.matvec);
             assertEquals("accumulating projection of " + type, n + "_Hw_MatVecAdd", k.matvecAdd);
@@ -160,7 +161,7 @@ public class ExtTypeFastPathTest {
     @Test
     public void aSm80CudaDeviceKeepsTheGenericRows() {
         for (GGMLType type : HW_TYPES) {
-            GpuOps.WeightKernels k = selected(type, ComputeBackend.BackendType.CUDA, 80);
+            WeightKernels k = selected(type, ComputeBackend.BackendType.CUDA, 80);
             String n = type.name();
             assertEquals("single-token projection of " + type + " on sm_80", n + "_MatVec", k.matvec);
             assertEquals("tiled GEMM of " + type + " on sm_80", n + "_MatMul_Tiled", k.tiled);
@@ -174,7 +175,7 @@ public class ExtTypeFastPathTest {
     @Test
     public void anOpenClDeviceKeepsTheGenericRowsWhateverItsCapability() {
         for (GGMLType type : HW_TYPES) {
-            GpuOps.WeightKernels k = selected(type, ComputeBackend.BackendType.OPENCL, 90);
+            WeightKernels k = selected(type, ComputeBackend.BackendType.OPENCL, 90);
             assertEquals("single-token projection of " + type + " on OpenCL", type.name() + "_MatVec", k.matvec);
             assertEquals("tiled GEMM of " + type + " on OpenCL", type.name() + "_MatMul_Tiled", k.tiled);
         }

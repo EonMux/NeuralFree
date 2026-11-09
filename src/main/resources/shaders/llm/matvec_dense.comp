@@ -9,6 +9,11 @@
  *   OP_MATVEC      (i out_dim, i in_dim, R weight, R float input, W float output)
  *   OP_MATVEC_ADD  (i out_dim, i in_dim, R weight, R float input, float addend_output)
  *                  addend_output[row] += dot(weight row, input)
+ *   OP_MATVECN     (i out_dim, i in_dim, i n_tokens, R weight, R float input, W float output)
+ *                  output[t * out_dim + row] = dot(weight row, input row t) for t in
+ *                  [0, n_tokens); the weight row is read once for the whole token group (n_tokens
+ *                  in [1, NF_MVQN_MAX], NF_MVQN_MAX mirrors kernels/llm/common/config.h) and its
+ *                  token loop is unrolled with the uniform t < n_tokens guard
  *   OP_LOGITS      (i vocab_size, i embed_dim, R weight, R float hidden, W float logits)
  *   OP_GATEUP_SILU,
  *   OP_GATEUP_GELU (i out_dim, i in_dim, R gate_weight, R up_weight, R float input, W float output)
@@ -78,6 +83,11 @@ layout(std430, binding = 2) buffer NfMdOutput { float y_out[]; };
 layout(std430, binding = 2) writeonly buffer NfMdOutput { float y_out[]; };
 #endif
 layout(push_constant) uniform NfMdParams { int out_dim; int in_dim; } pc;
+#elif OP == OP_MATVECN
+NF_MD_WEIGHT_VIEWS(0, w)
+NF_MD_INPUT_VIEWS(1)
+layout(std430, binding = 2) writeonly buffer NfMdOutput { float y_out[]; };
+layout(push_constant) uniform NfMdParams { int out_dim; int in_dim; int n_tokens; } pc;
 #elif OP == OP_BATCH || OP == OP_BATCH_2D
 NF_MD_WEIGHT_VIEWS(0, w)
 NF_MD_INPUT_VIEWS(1)
@@ -89,6 +99,18 @@ layout(push_constant) uniform NfMdParams { int out_dim; int in_dim; int seq_len;
 
 #include "common/reduce.glsl"
 #include "common/act.glsl"
+
+/* OP_MATVECN staging: one slot set per token, sized for the largest workgroup any variants row of
+ * this template is dispatched with. */
+#if OP == OP_MATVECN
+#ifndef NF_MVQN_MAX
+#define NF_MVQN_MAX 16u
+#endif
+#ifndef NF_MD_LMAX
+#define NF_MD_LMAX 256u
+#endif
+shared float nf_md_ts[NF_MVQN_MAX * NF_MD_LMAX];
+#endif
 
 /* Four 16-bit values (little-endian in p) as F16 or BF16 floats, element k from bits 16k. */
 vec4 nf_md_unpack4(uvec2 p) {
@@ -158,6 +180,90 @@ void nf_md_gateup_partial(uint wbase, uint n, inout float gs, inout float us) {
 }
 #endif
 
+#if OP == OP_MATVECN
+/* ps[t] = this invocation's share of dot(weight elements wbase .. wbase+n, activation row t) for
+ * t < ntok, the nf_md_row_partial mapping walked per token with the weight read once: 4-element
+ * groups lid, lid + L, ... when n % 4 == 0, single elements otherwise. The L shares of token t
+ * add to the full dot product. */
+void nf_md_row_partial_n(uint wbase, uint n, uint ntok, inout float ps[NF_MVQN_MAX]) {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        ps[t] = 0.0;
+    }
+    if ((n & 3u) == 0u) {
+        const uint w4 = wbase >> 2;
+        const uint n4 = n >> 2;
+        for (uint j = lid; j < n4; j += lsize) {
+            const vec4 wv = NF_MD_LOAD4(w, w4 + j);
+            for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+                if (t < ntok) ps[t] += dot(wv, x_v[t * (n >> 2) + j]);
+            }
+        }
+    } else {
+        for (uint j = lid; j < n; j += lsize) {
+            const float wv = NF_MD_LOAD(w, wbase + j);
+            for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+                if (t < ntok) ps[t] += wv * x_s[t * n + j];
+            }
+        }
+    }
+}
+
+/* The nf_wg_sum steps applied to every token in lockstep (GLSL twin of NF_MVQTN_TREE,
+ * kernels/llm/common/matvec_n.h): under USE_SUBGROUPS each subgroup reduces in hardware and lane 0
+ * of each subgroup stores its leader slot, the leader slots combining linearly as nf_wg_sum
+ * combines nf_red; otherwise the slots take the nf_wg_sum span tree (bounds-checked, so any local
+ * size is reduced exactly) in lockstep. Token t's result is the nf_wg_sum of token t's partials,
+ * independent of ntok. */
+void nf_md_tree_n(inout float ps[NF_MVQN_MAX], uint ntok, uint row) {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint out_dim = uint(pc.out_dim);
+#if defined(USE_SUBGROUPS)
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        if (t < ntok) ps[t] = subgroupAdd(ps[t]);
+    }
+    if (gl_SubgroupInvocationID == 0u) {
+        for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+            if (t < ntok) nf_md_ts[t * lsize + gl_SubgroupID] = ps[t];
+        }
+    }
+    barrier();
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        if (t < ntok) {
+            float acc = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+                acc += nf_md_ts[t * lsize + i];
+            }
+            if (lid == 0u) {
+                y_out[t * out_dim + row] = acc;
+            }
+        }
+    }
+#else
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        if (t < ntok) nf_md_ts[t * lsize + lid] = ps[t];
+    }
+    barrier();
+    const uint span = lsize <= 1u ? 1u : (1u << (uint(findMSB(lsize - 1u)) + 1u));
+    for (uint s = span >> 1; s > 0u; s >>= 1) {
+        if (lid < s && lid + s < lsize) {
+            for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+                if (t < ntok) nf_md_ts[t * lsize + lid] += nf_md_ts[t * lsize + lid + s];
+            }
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+            if (t < ntok) y_out[t * out_dim + row] = nf_md_ts[t * lsize];
+        }
+    }
+#endif
+}
+#endif
+
 void main() {
     const uint lid = gl_LocalInvocationID.x;
     const uint out_dim = uint(pc.out_dim);
@@ -189,6 +295,10 @@ void main() {
             y_out[s * out_dim + row] = acc;
         }
     }
+#elif OP == OP_MATVECN
+    float ps[NF_MVQN_MAX];
+    nf_md_row_partial_n(wbase, in_dim, min(uint(pc.n_tokens), NF_MVQN_MAX), ps);
+    nf_md_tree_n(ps, min(uint(pc.n_tokens), NF_MVQN_MAX), row);
 #elif defined(NF_MD_GATEUP)
     float gs = 0.0;
     float us = 0.0;

@@ -65,7 +65,7 @@ class SiglipDualEncoderResourceTest {
 
     @Test
     void theCheckpointServesItsTowersAsTheDualEncoder() {
-        assertTrue(siglip.dualEncoder());
+        assertTrue(siglip.pooling().dualEncoder());
         assertEquals(ClipFamily.SIGLIP, reference.family());
         JsonView text = ok(pooling.embeddings("{\"input\": \"" + TEXT + "\", \"embd_normalize\": -1}"));
         assertVector(textVector, at(text, "data", 0).raw("embedding"));

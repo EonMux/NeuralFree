@@ -1,23 +1,19 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.GpuBackendException;
-import com.eonmux.neuralfree.acceleration.GpuModelUnsupportedException;
 import com.eonmux.neuralfree.acceleration.GpuOutOfMemoryException;
 import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
-import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
-import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.arch.NormKind;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
-import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
@@ -25,7 +21,6 @@ import com.eonmux.neuralfree.gguf.ops.fused.FusedKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqConfig;
 import com.eonmux.neuralfree.gguf.ops.gemm.MmqMode;
-import com.eonmux.neuralfree.gguf.ops.gemm.SplitKGemmPlan;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 import com.eonmux.neuralfree.gguf.quant.BlockLayout;
@@ -40,8 +35,6 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.EnumMap;
-import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -74,7 +67,7 @@ import java.util.Set;
  * {@code F8_E4M3FN}, {@code F8_E4M3_B128} and
  * {@code MXFP8} also have a {@code {T}_Hw_*} row set over the same argument lists, converting the code pairs with
  * the hardware float8 conversions (CUDA sm_89+, {@code cvt.rn.f16x2.e5m2x2}/{@code e4m3x2}); the results are
- * bit-identical to the generic rows. {@link #hardwareFp8Decode} picks the {@code _Hw} set for a device that
+ * bit-identical to the generic rows. {@link GpuWeightFamilies#hardwareFp8Decode} picks the {@code _Hw} set for a device that
  * reports the feature; a missing feature, and OpenCL, selects the generic rows as the fallback. F8_E4M3FN shares
  * the F8_E4M3 rows, whose 32-element runs need whole-block rows (see {@code GpuWeightUploader}).</p>
  *
@@ -125,7 +118,7 @@ import java.util.Set;
  * {@link Int8MatvecMode}
  * (property {@code neuralfree.matvec.int8}) selects it; the default {@link Int8MatvecMode#AUTO} uses it where the
  * device reports {@link DeviceFeature#INTEGER_DOT_PRODUCT}, the weight type measured faster with the lane on that
- * backend ({@link Int8MatvecTuning}), and the kernel is available, and falls back to the exact F32 matvec elsewhere;
+ * device kind ({@link Int8MatvecTuning}), and the kernel is available, and falls back to the exact F32 matvec elsewhere;
  * a missing kernel falls back the same way. The batched (prefill) forms keep F32 activations; the int8 MMQ GEMM above
  * serves those.</p>
  *
@@ -185,24 +178,6 @@ public final class GpuOps implements AutoCloseable {
     /** Per-column activation pre-scale of a quantized weight ({@code kernels/llm/act_quant.cl}). */
     public static final String SCALE_COLS = "LLM_ScaleCols";
 
-    /** Work-group size of the tiled GEMM ({@code NF_GEMM_WG}). */
-    static final int TILED_WG = 256;
-    /** Weight rows per tiled GEMM work-group ({@code NF_GEMM_TM}). */
-    static final int TILED_ROWS = 64;
-    /** Tokens per tiled GEMM work-group ({@code NF_GEMM_TN}). */
-    static final int TILED_TOKENS = 32;
-    /** Largest cooperating-thread count of any matvec family ({@code *_TPS}); the matvec local size is a multiple. */
-    static final int MATVEC_MAX_TPS = 32;
-    /**
-     * Smallest number of live matvec threads for the two-row form: with fewer, halving the workgroups
-     * starves the device more than the halved activation re-reads pay back.
-     */
-    static final int TWO_ROW_MIN_THREADS = 32768;
-    /**
-     * Largest token count the W12 matvec kernels serve: a wider prefill of a W12 weight decodes the weight into
-     * its BF16 mirror and re-enters the projection on the mirror, so the BF16 family's GEMM lanes serve it.
-     */
-    static final int W12_MATVEC_MAX_TOKENS = 64;
     /** Elements per Q8_1 activation block ({@link BlockLayout#QK8_1}); the integer-dot lane's quantization unit. */
     static final int Q8_1_BLOCK_SIZE = BlockLayout.QK8_1;
     /** Floats of one Q8_1 block ({@link BlockLayout#Q8_1_BYTES}) in the Q8_1 staging slot. */
@@ -217,156 +192,8 @@ public final class GpuOps implements AutoCloseable {
                     GemmKernels.QUANT_MMQ_FP8_ROW, GemmKernels.QUANT_MMQ_FP8_GROUP128,
                     GemmKernels.QUANT_MMQ_FP8_MX, GemmKernels.QUANT_MMQ_FP4_MX, GemmKernels.QUANT_MMQ_FP4_NV));
 
-    /** Kernel names of one weight type. */
-    static final class WeightKernels {
-        final String matvec;
-        final String matvecAdd;
-        final String batch;
-        final String batch2d;
-        final String tiled;
-        final String embed;
-        final String batchEmbed;
-        /** Integer-dot (Q8_1 activation) single-token matvec, or null when the type has none. */
-        final String matvecQ8;
-        /** Integer-dot (Q8_1 activation) accumulating matvec, or null when the type has none. */
-        final String matvecAddQ8;
-        /** Integer-dot (Q8_1 activation) multi-column matvec of up to {@code NF_MVQN_MAX} token rows,
-         * or null when the type has none. */
-        final String matvecNQ8;
-
-        WeightKernels(String matvec, String matvecAdd, String batch, String batch2d, String tiled, String embed,
-                      String batchEmbed) {
-            this(matvec, matvecAdd, batch, batch2d, tiled, embed, batchEmbed, null, null, null);
-        }
-
-        WeightKernels(String matvec, String matvecAdd, String batch, String batch2d, String tiled, String embed,
-                      String batchEmbed, String matvecQ8, String matvecAddQ8) {
-            this(matvec, matvecAdd, batch, batch2d, tiled, embed, batchEmbed, matvecQ8, matvecAddQ8, null);
-        }
-
-        WeightKernels(String matvec, String matvecAdd, String batch, String batch2d, String tiled, String embed,
-                      String batchEmbed, String matvecQ8, String matvecAddQ8, String matvecNQ8) {
-            this.matvec = matvec;
-            this.matvecAdd = matvecAdd;
-            this.batch = batch;
-            this.batch2d = batch2d;
-            this.tiled = tiled;
-            this.embed = embed;
-            this.batchEmbed = batchEmbed;
-            this.matvecQ8 = matvecQ8;
-            this.matvecAddQ8 = matvecAddQ8;
-            this.matvecNQ8 = matvecNQ8;
-        }
-
-        static WeightKernels standard(String t) {
-            return new WeightKernels(t + "_MatVec", t + "_MatVecAdd", t + "_BatchMatMul", t + "_BatchMatMul_2D",
-                    t + "_MatMul_Tiled", t + "_EmbeddingLookup", t + "_BatchEmbeddingLookup");
-        }
-
-        /** {@link #standard} plus the {@code {T}_MatVec_Q8} integer-dot forms. */
-        static WeightKernels int8(String t) {
-            return int8(standard(t));
-        }
-
-        /** {@code f} with its {@code _MatVec_Q8}, {@code _MatVecAdd_Q8} and {@code _MatVecN_Q8} integer-dot
-         * forms added; every other kernel name is {@code f}'s, so legacy-named families (Q8_0, MXFP4) keep their
-         * batch kernels. */
-        static WeightKernels int8(WeightKernels f) {
-            return new WeightKernels(f.matvec, f.matvecAdd, f.batch, f.batch2d, f.tiled, f.embed, f.batchEmbed,
-                    f.matvec + "_Q8", f.matvecAdd + "_Q8", f.matvec + "N_Q8");
-        }
-    }
-
-    /** Weight types with a Q8_1-activation integer-dot matvec ({@code {T}_MatVec_Q8}). */
-    private static final Set<GGMLType> INT8_MATVEC_TYPES = Collections.unmodifiableSet(EnumSet.of(
-            GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0,
-            GGMLType.MXFP4, GGMLType.NVFP4,
-            GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K,
-            GGMLType.Q8_K, GGMLType.IQ4_NL, GGMLType.IQ4_XS, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S,
-            GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ3_K, GGMLType.IQ3_KS, GGMLType.IQ1_S, GGMLType.IQ1_M));
-
-    private static final Map<GGMLType, WeightKernels> FAMILIES = families();
-
-    /** The W12 row set over the nested 8-bit view of the code bytes, serving an open {@link W12QView} scope. */
-    private static final WeightKernels W12Q_FAMILY = new WeightKernels("W12Q_MatVec", "W12Q_MatVecAdd",
-            "W12Q_BatchMatMul", "W12Q_BatchMatMul_2D", null, null, null);
-    /** The whole-tensor BF16 decode behind a W12 weight's wide prefill. */
-    private static final String W12_DECODE_BF16 = "W12_DecodeBF16";
-
-    private static Map<GGMLType, WeightKernels> families() {
-        Map<GGMLType, WeightKernels> m = new EnumMap<>(GGMLType.class);
-        m.put(GGMLType.F32, new WeightKernels("Float_MatVec", "Float_MatVecAdd", "LLM_Batch_Float_MatMul",
-                "LLM_Batch_Float_MatMul_2D", "F32_MatMul_Tiled", "LLM_EmbeddingLookup", "LLM_Batch_EmbeddingLookup"));
-        m.put(GGMLType.Q8_0, new WeightKernels("Q8_0_MatVec", "Q8_0_MatVecAdd", "LLM_Batch_Q8_0_MatMul",
-                "LLM_Batch_Q8_0_MatMul_2D", "Q8_0_MatMul_Tiled", "LLM_Q8_0_EmbeddingLookup",
-                "LLM_Batch_Q8_0_EmbeddingLookup"));
-        m.put(GGMLType.MXFP4, new WeightKernels("MXFP4_MatVec", "MXFP4_MatVecAdd", "MXFP4_BatchMatMul",
-                "MXFP4_BatchMatMul_2D", "MXFP4_MatMul_Tiled", "LLM_MXFP4_EmbeddingLookup",
-                "MXFP4_BatchEmbeddingLookup"));
-        GGMLType[] standard = {
-            GGMLType.F16, GGMLType.BF16,
-            GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.IQ4_NL, GGMLType.IQ4_XS,
-            GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K, GGMLType.Q8_K,
-            GGMLType.IQ3_XXS, GGMLType.IQ3_S, GGMLType.IQ2_XXS, GGMLType.IQ2_XS, GGMLType.IQ2_S, GGMLType.IQ1_S,
-            GGMLType.IQ1_M,
-            GGMLType.IQ3_K, GGMLType.IQ3_KS,
-            GGMLType.TQ1_0, GGMLType.TQ2_0, GGMLType.NVFP4, GGMLType.Q1_0, GGMLType.Q2_0,
-            GGMLType.F8_E4M3, GGMLType.F8_E5M2, GGMLType.F8_E4M3_B128, GGMLType.F8_E4M3_B32, GGMLType.MXFP8,
-            GGMLType.MXFP6_E3M2, GGMLType.MXFP6_E2M3, GGMLType.I8_B128, GGMLType.NF4, GGMLType.FP4_BNB,
-        };
-        for (GGMLType t : standard) {
-            m.put(t, WeightKernels.standard(t.name()));
-        }
-        // The integer-dot lane: the decode matvec forms that take a Q8_1 activation row, added to the
-        // family the type already has (the legacy-named Q8_0 and MXFP4 families keep their batch kernels).
-        for (GGMLType t : INT8_MATVEC_TYPES) {
-            m.put(t, WeightKernels.int8(m.get(t)));
-        }
-        // ggml's per-element F8_E4M3FN (id 43) runs the F8_E4M3 rows: its code bytes equal the extension type's
-        // blocks on rows that are whole 32-element runs (GpuWeightUploader keeps other rows off the device
-        // kernels and decodes them to F32 on upload).
-        m.put(GGMLType.F8_E4M3FN, WeightKernels.standard(GGMLType.F8_E4M3.name()));
-        // W12: the row kernels decode the lossless 12-bit blocks in registers. A prefill wider than
-        // W12_MATVEC_MAX_TOKENS decodes the tensor into its BF16 mirror and runs the BF16 family, so the type
-        // has no tiled or lookup kernels of its own.
-        m.put(GGMLType.W12, new WeightKernels("W12_MatVec", "W12_MatVecAdd", "W12_BatchMatMul",
-                "W12_BatchMatMul_2D", null, null, null));
-        return Collections.unmodifiableMap(m);
-    }
-
-    /** Weight types with hardware-FP8 decode rows ({@code *_Hw_*} kernels): the E4M3FN/E5M2 code types. */
-    private static final Set<GGMLType> HW_FP8_TYPES = Collections.unmodifiableSet(EnumSet.of(
-            GGMLType.F8_E4M3, GGMLType.F8_E4M3FN, GGMLType.F8_E4M3_B128, GGMLType.MXFP8, GGMLType.F8_E5M2));
-
-    /** Lowest CUDA compute capability with the hardware FP8 conversions ({@code sm_89}: cvt.rn.f16x2.e4m3x2/e5m2x2). */
-    private static final int HW_FP8_COMPUTE_CAPABILITY = 89;
-
-    /**
-     * Hardware-FP8 decode is selected on a device that reports the feature: CUDA sm_89 or higher
-     * ({@link DeviceCapabilities#getComputeCapability()}), which converts the E4M3FN/E5M2 code pairs in hardware.
-     * A missing feature, or a CPU/OpenCL/Vulkan device, selects the generic rows.
-     */
-    private static boolean hardwareFp8Decode(ComputeBackend.BackendType backendType, DeviceCapabilities caps) {
-        if (backendType == null || caps == null) {
-            return false;
-        }
-        return backendType == ComputeBackend.BackendType.CUDA
-                && caps.getComputeCapability() >= HW_FP8_COMPUTE_CAPABILITY;
-    }
-
-    /**
-     * The {@code {T}_Hw_*} fast-path kernels of one weight type (see the class notes); these are the same
-     * argument lists and decoding contract as the generic rows, with the FP8 code pairs converted in hardware on
-     * CUDA sm_89+, so the results are bit-identical.
-     */
-    private static WeightKernels hardware(String t) {
-        return new WeightKernels(t + "_Hw_MatVec", t + "_Hw_MatVecAdd", t + "_Hw_BatchMatMul",
-                t + "_Hw_BatchMatMul_2D", t + "_Hw_MatMul_Tiled", t + "_Hw_EmbeddingLookup",
-                t + "_Hw_BatchEmbeddingLookup");
-    }
-
     /** A float view (buffer, element offset). */
-    private static final class View {
+    static final class View {
         final GpuBuffer buf;
         final int off;
 
@@ -384,17 +211,19 @@ public final class GpuOps implements AutoCloseable {
     private final int matvecLocal;
     private final long[] maxGroups;
     private final long maxWorkGroupSize;
-    private final FastGemmLanes lanes;
+    final FastGemmLanes lanes;
+    /** The dense projections this class's matvec, matmul, gate+up and prewarm calls run. */
+    private final GpuProjections projections;
     private final Set<PreparedDispatch> prepared = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Map<String, float[]> signValues = new HashMap<>();
     private final Map<String, GpuBuffer> signBuffers = new HashMap<>();
     private final Map<HadamardSpec, GpuBuffer> signsBySpec = new IdentityHashMap<>();
     private final Map<String, Boolean> optionalStatus = new HashMap<>();
     private final GpuPlaceholders placeholders;
-    private final Int8MatvecMode int8Mode;
-    private final FusedMode fusedMode;
-    private SharedQ8 activeShare;
-    private W12QView activeW12Q;
+    final Int8MatvecMode int8Mode;
+    final FusedMode fusedMode;
+    SharedQ8 activeShare;
+    W12QView activeW12Q;
     private boolean closed;
 
     /**
@@ -445,6 +274,7 @@ public final class GpuOps implements AutoCloseable {
                     + " is not a power of two of at most " + local);
         }
         this.lanes = new FastGemmLanes(this, queue, kernels, scratch);
+        this.projections = new GpuProjections(this, queue, kernels, scratch);
         prewarmHelperKernels();
     }
 
@@ -530,20 +360,18 @@ public final class GpuOps implements AutoCloseable {
 
     /** True when GpuOps has projection and lookup kernels for weights of this type. */
     public static boolean supportsWeightType(GGMLType type) {
-        return FAMILIES.containsKey(type);
+        return GpuWeightFamilies.supportsWeightType(type);
     }
 
     /** The {@code {T}_MatVec} kernel name of a weight type ({@code Float_MatVec} for F32); null when the type has
      *  no GPU kernels. The name is the family's, so the types that share a family share the kernel rows. */
     public static String matVecKernel(GGMLType type) {
-        WeightKernels k = FAMILIES.get(type);
-        return k == null ? null : k.matvec;
+        return GpuWeightFamilies.matVecKernel(type);
     }
 
     /** The single-token embedding-lookup kernel name of a weight type; null when the type has no GPU kernels. */
     public static String lookupKernel(GGMLType type) {
-        WeightKernels k = FAMILIES.get(type);
-        return k == null ? null : k.embed;
+        return GpuWeightFamilies.lookupKernel(type);
     }
 
     // ================================================================== generic dispatch
@@ -621,16 +449,18 @@ public final class GpuOps implements AutoCloseable {
      * collection installed one.
      */
     public void matvec(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer out, int outOff, int nTokens) {
-        project(w, in, inOff, out, outOff, nTokens, false, true);
+        projections.matvec(w, in, inOff, out, outOff, nTokens);
     }
 
     /**
-     * {@link #matvec}, using the fast GEMM lane from {@code FAST_GEMM_MIN_TOKENS} rows or the tiled GEMM from
-     * {@code TILED_MIN_TOKENS} rows when the kernel can run its work-group on this device. With batch invariance
-     * on, a fast GEMM lane serves every token count and the tiled GEMM is never taken.
+     * {@link #matvec}, using the multi-column matvec, fast GEMM or tiled GEMM lane the measured crossover of
+     * {@link SmallBatchCrossover} picks for the weight's device kind, type and projection size (the tiled GEMM
+     * from {@code TILED_MIN_TOKENS} rows where no measured entry serves) when the kernel can run its
+     * work-group on this device. With batch invariance on, a fast GEMM lane serves every token count and
+     * the tiled GEMM and the multi-column matvec are never taken.
      */
     public void matmul(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer out, int outOff, int nTokens) {
-        project(w, in, inOff, out, outOff, nTokens, true, true);
+        projections.matmul(w, in, inOff, out, outOff, nTokens);
     }
 
     /**
@@ -642,264 +472,25 @@ public final class GpuOps implements AutoCloseable {
      * form and {@code on} requires it.
      */
     public boolean gateUpGluUsable(GpuWeight gate, GpuWeight up, GluOp op, ActParams params) {
-        ensureOpen();
-        return fusedGateUpKernel(gate, up, op, params) != null;
+        return projections.gateUpGluUsable(gate, up, op, params);
     }
 
     /**
      * Runs {@link #gateUpGluUsable}'s fused projection: {@code out[r] = silu(gate[r] . x) * (up[r] . x)} over the
      * single input row {@code x} (at element 0 of {@code in}), written from element 0 of {@code out}. Above the
-     * two-row thread floor ({@link #TWO_ROW_MIN_THREADS} live matvec threads) the launch pairs the rows of both
+     * two-row thread floor ({@link GpuProjections#TWO_ROW_MIN_THREADS} live matvec threads) the launch pairs the rows of both
      * weights in the {@code {T}_MatVec2FusedGateUp} form at {@code global = ceil(rows / 2) * L}; below it the
      * kernel runs one row per workgroup.
      *
      * @throws UnsupportedOperationException when the form cannot serve the weights, op or buffers
      */
     public void gateUpGlu(GpuWeight gate, GpuWeight up, GluOp op, ActParams params, GpuBuffer in, GpuBuffer out) {
-        ensureOpen();
-        String kernel = fusedGateUpKernel(gate, up, op, params);
-        if (kernel == null) {
-            throw new UnsupportedOperationException("no fused gate+up kernel serves " + gate + " and " + up
-                    + " with " + op + " on the " + backend.backendType() + " backend");
-        }
-        int cols = cols(gate);
-        int rows = rows(gate);
-        checkView("fused gate+up input", in, 0, cols);
-        checkView("fused gate+up output", out, 0, rows);
-        if (overlaps(in, 0, cols, out, 0, rows)) {
-            throw new IllegalArgumentException("fused gate+up: input and output views overlap");
-        }
-        requireMatvecLocal(gate);
-        GpuMatmulTap.dense(queue, gate, in, 0, 1, cols);
-        GpuMatmulTap.dense(queue, up, in, 0, 1, cols);
-        if (kernel.endsWith("_Q8")) {
-            GpuBuffer xq = quantizedRow(new View(in, 0), cols);
-            launchInt8GateUp(kernel, gate.type(), rows, cols, gate.shard(0), up.shard(0), xq, out);
-        } else if (twoRowUsable(kernel, rows)) {
-            launchMatvec(twoRowName(kernel), (long) ceilDiv(rows, 2) * matvecLocal, rows, cols,
-                    gate.shard(0), up.shard(0), in, out);
-        } else {
-            launchMatvec(kernel, (long) rows * matvecLocal, rows, cols, gate.shard(0), up.shard(0), in, out);
-        }
-    }
-
-    /**
-     * The fused gate+up kernel for these weights, or null. Structural objections (shapes, types, scale, transform,
-     * op) are not a fusion the caller asked for, so they return null even in {@link FusedMode#ON}; a structurally
-     * eligible layer on a backend without the kernel is refused there.
-     */
-    private String fusedGateUpKernel(GpuWeight gate, GpuWeight up, GluOp op, ActParams params) {
-        if (BatchInvariance.enabled()) {
-            /* A fused form runs only the single-token path; batch-invariant steps take the separate products at
-             * every row count. Requiring the fusion and requiring batch invariance cannot both hold. */
-            if (fusedMode.requiresFusion()) {
-                throw new IllegalArgumentException("-D" + FusedMode.PROPERTY + "=on requires the fused"
-                        + " gate+up kernels, which -D" + BatchInvariance.PROPERTY + " turns off");
-            }
-            return null;
-        }
-        if (gate == null || up == null || op != GluOp.SWIGLU
-                || (params != null && params != ActParams.NONE)) {
-            return null;
-        }
-        if (gate.type() != up.type() || !gate.isSingleShard() || !up.isSingleShard()
-                || gate.rows() != up.rows() || gate.cols() != up.cols()) {
-            return null;
-        }
-        if (gate.hasScale() || up.hasScale() || gate.hasInputTransform() || up.hasInputTransform()
-                || gate.hadamard() != null || up.hadamard() != null) {
-            return null;
-        }
-        if (gate.type() == GGMLType.W12 && activeW12Q != null) {
-            /* A W12QView scope routes every W12 projection through the 8-bit Q view, whose row set has no
-             * fused form; the separate gate and up matvecs take it. */
-            return null;
-        }
-        if (!fusedMode.permitsFusion()) {
-            return null;
-        }
-        WeightKernels k = family(gate);
-        String fused = fusedGateUpName(k.matvec);
-        String q8 = k.matvecQ8 != null ? fusedGateUpName(k.matvecQ8) : null;
-        if (q8 != null && cols(gate) % gate.type().getBlockSize() == 0
-                && int8LaneSelected(gate.type(), (long) gate.rows() * cols(gate))
-                && optionalReady(q8, matvecLocal)) {
-            return q8;
-        }
-        if (optionalReady(fused, matvecLocal)) {
-            return fused;
-        }
-        if (fusedMode.requiresFusion()) {
-            throw new UnsupportedKernelException(fused
-                    + " is required by -D" + FusedMode.PROPERTY + "=on but the " + backend.backendType()
-                    + " backend does not provide it");
-        }
-        return null;
-    }
-
-    /** {@code {T}_MatVec} to {@code {T}_MatVecFusedGateUp} and {@code {T}_MatVec_Q8} to its fused form. */
-    private static String fusedGateUpName(String matvec) {
-        return matvec.replace("MatVec", "MatVecFusedGateUp");
+        projections.gateUpGlu(gate, up, op, params, in, out);
     }
 
     /** {@code accum[accOff + t*rows + r] += scale * W[r] . in[inOff + t*cols ...]}. */
     public void matvecAdd(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer accum, int accOff, int nTokens) {
-        ensureOpen();
-        int cols = cols(w);
-        int rows = rows(w);
-        checkTokens(nTokens);
-        long nIn = (long) nTokens * cols;
-        long nOut = (long) nTokens * rows;
-        checkView("input of " + w.name(), in, inOff, nIn);
-        checkView("accumulator of " + w.name(), accum, accOff, nOut);
-        WeightKernels k = projectionFamily(w);
-        boolean invariant = BatchInvariance.enabled();
-        boolean q8Add = !invariant && nTokens == 1 && int8LaneUsable(k.matvecAddQ8, w);
-        if (!invariant && nTokens == 1 && w.isSingleShard() && accOff == 0 && !w.hasScale()
-                && !overlaps(in, inOff, nIn, accum, accOff, nOut)
-                && (q8Add || optionalReady(k.matvecAdd, matvecLocal))) {
-            requireMatvecLocal(w);
-            View x = offsetFree(projectionInput(w, in, inOff, nTokens, cols, false), nTokens, cols);
-            GpuMatmulTap.dense(queue, w, x.buf, x.off, nTokens, cols);
-            if (q8Add) {
-                GpuBuffer xq = quantizedRow(x, cols);
-                launchMatvec(k.matvecAddQ8, (long) rows * matvecLocal, rows, cols, w.shard(0), xq, accum);
-            } else {
-                launchMatvec(k.matvecAdd, (long) rows * matvecLocal, rows, cols, w.shard(0), x.buf, accum);
-            }
-            return;
-        }
-        ScratchSlot result = scratch.staging(GpuScratch.Staging.RESULT, nOut);
-        project(w, in, inOff, result.buffer(), result.offset(), nTokens, true, false);
-        axpby((int) nOut, w.scale(), result.buffer(), result.offset(), 1.0f, accum, accOff, accum, accOff);
-    }
-
-    private void project(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer out, int outOff, int nTokens,
-                         boolean allowTiled, boolean applyScale) {
-        ensureOpen();
-        int cols = cols(w);
-        int rows = rows(w);
-        checkTokens(nTokens);
-        long nIn = (long) nTokens * cols;
-        long nOut = (long) nTokens * rows;
-        checkView("input of " + w.name(), in, inOff, nIn);
-        checkView("output of " + w.name(), out, outOff, nOut);
-        checkInt(outOff + nOut, "output end of " + w.name());
-        if (overlaps(in, inOff, nIn, out, outOff, nOut)) {
-            throw new IllegalArgumentException("projection " + w.name() + ": input and output views overlap");
-        }
-        if (w.type() == GGMLType.W12) {
-            projectW12(w, in, inOff, out, outOff, nTokens, allowTiled, applyScale);
-            return;
-        }
-        WeightKernels k = family(w);
-        /* Batch invariance pins the projection lane independently of the row count. A weight type with a fast
-         * GEMM lane takes it for one row and for a full batch alike (its tiles cover the reduction dimension in a
-         * fixed order); the split-K twins, which reduce a row in several slices, are never taken there. A type
-         * without one keeps the float matvec family for every row count, because the exact tiled GEMM's reduction
-         * of an output element does depend on the token tile. */
-        boolean invariant = BatchInvariance.enabled();
-        /* The multi-column integer-dot lane serves small token groups with one weight read per row for
-         * the whole group, which beats the GEMM lanes and the tiled GEMM there; its per-row integer dots
-         * outgrow a fast GEMM lane whose cost is flat in the row count, so a weight with a fast lane
-         * crosses over at FAST_GEMM_MIN_TOKENS and one without keeps the lane up to
-         * MATVEC_N_DISPATCH_MAX (the tiled GEMM's own crossover). The lane is pinned off under batch
-         * invariance exactly like the single-token lane. */
-        String lane = allowTiled ? lanes.fastGemm(w, cols) : null;
-        int matvecMax = lane != null ? LlmKernelConstants.FAST_GEMM_MIN_TOKENS - 1
-                : LlmKernelConstants.MATVEC_N_DISPATCH_MAX;
-        boolean q8n = !invariant && nTokens >= 2 && nTokens <= matvecMax
-                && int8LaneUsable(k.matvecNQ8, w);
-        String fast = lane != null && !q8n && (invariant || nTokens >= LlmKernelConstants.FAST_GEMM_MIN_TOKENS)
-                ? lane : null;
-        int fastTileTokens = fast == null ? 0 : lanes.fastTileTokens(fast);
-        int fastTileRows = fast == null ? 0 : lanes.fastTileRows(fast);
-        int fastWorkGroup = fast == null ? 0 : lanes.fastWorkGroup(fast);
-        boolean fastUsable = fast != null
-                && lanes.fastUsable(fast, fastTileRows, fastTileTokens, fastWorkGroup, w, nTokens);
-        /* A staged launch of fewer tokens than the device tile runs the 16-token-tile twin of the lane
-         * (smallFast) when the device has it, so the weight stream fills 16-token output tiles; the
-         * split-K twins keep the plain kernels. */
-        String smallFast = fastUsable ? lanes.smallTileKernel(fast, w, nTokens) : null;
-        int launchTileTokens = smallFast == null ? fastTileTokens : lanes.fastTileTokens(smallFast);
-        Int8ActStaging int8Staging = fastUsable && fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)
-                ? lanes.int8Staging(w, cols) : null;
-        Fp8ActStaging fp8Staging = fastUsable && FastGemmLanes.fp8Fast(w, fast)
-                ? lanes.fp8Staging(w, cols) : null;
-        View x = projectionInput(w, in, inOff, nTokens, cols, int8Staging != null || fp8Staging != null);
-        GpuMatmulTap.dense(queue, w, x.buf, x.off, nTokens, cols);
-        if (fastUsable) {
-            boolean staged = FastGemmLanes.stagedFast(fast);
-            View activations = x;
-            if (staged) {
-                ScratchSlot q8;
-                if (fp8Staging != null) {
-                    q8 = lanes.stageFp8(fp8Staging, x.buf, x.off, nTokens, cols);
-                } else if (int8Staging != null) {
-                    q8 = lanes.stageInt8(int8Staging, x.buf, x.off, nTokens, cols);
-                } else {
-                    q8 = lanes.stageQ8(x.buf, x.off, nTokens, cols);
-                }
-                activations = new View(q8.buffer(), q8.offset());
-            }
-            for (int s = 0; s < w.shardCount(); s++) {
-                int m = (int) w.shardRows(s);
-                int yOff = outOff + (int) w.shardRowStart(s);
-                SplitKGemmPlan split = invariant ? null
-                        : lanes.splitK(fast, w, m, cols, nTokens, yOff, activations.off, rows,
-                                smallFast != null);
-                if (split != null) {
-                    lanes.splitKLaunch(split, w.shard(s), activations.buf, out, yOff, rows);
-                } else {
-                    int qStride = staged ? lanes.stagedRowRecords(cols) : cols;
-                    int qOff = staged ? activations.off : x.off;
-                    launch2d(smallFast == null ? fast : smallFast,
-                            ceilDiv(m, fastTileRows) * fastWorkGroup, ceilDiv(nTokens, launchTileTokens),
-                            fastWorkGroup, m, cols, nTokens, qStride, qOff, rows, yOff, w.shard(s),
-                            activations.buf, out);
-                }
-            }
-        } else if (!invariant && allowTiled && !q8n && nTokens >= LlmKernelConstants.TILED_MIN_TOKENS
-                && tiledUsable(k, w, nTokens)) {
-            for (int s = 0; s < w.shardCount(); s++) {
-                int m = (int) w.shardRows(s);
-                int yOff = outOff + (int) w.shardRowStart(s);
-                launch2d(k.tiled, ceilDiv(m, TILED_ROWS) * TILED_WG, ceilDiv(nTokens, TILED_TOKENS), TILED_WG,
-                        m, cols, nTokens, cols, x.off, rows, yOff, w.shard(s), x.buf, out);
-            }
-        } else {
-            requireMatvecLocal(w);
-            x = offsetFree(x, nTokens, cols);
-            boolean direct = w.isSingleShard() && outOff == 0;
-            boolean q8 = !invariant && nTokens == 1 && int8LaneUsable(k.matvecQ8, w);
-            GpuBuffer xq = q8 ? quantizedRow(x, cols) : q8n ? quantizeQ8N(x.buf, nTokens, cols) : null;
-            for (int s = 0; s < w.shardCount(); s++) {
-                int m = (int) w.shardRows(s);
-                if (direct) {
-                    if (q8) {
-                        launchInt8Matvec(k.matvecQ8, w.type(), m, cols, w.shard(s), xq, out);
-                    } else if (q8n) {
-                        launchInt8MatvecN(k.matvecNQ8, m, cols, nTokens, w.shard(s), xq, out);
-                    } else {
-                        matvecShard(k, w.shard(s), m, cols, x.buf, out, nTokens);
-                    }
-                } else {
-                    ScratchSlot stage = scratch.staging(GpuScratch.Staging.OUTPUT, (long) nTokens * m);
-                    if (q8) {
-                        launchInt8Matvec(k.matvecQ8, w.type(), m, cols, w.shard(s), xq, stage.buffer());
-                    } else if (q8n) {
-                        launchInt8MatvecN(k.matvecNQ8, m, cols, nTokens, w.shard(s), xq, stage.buffer());
-                    } else {
-                        matvecShard(k, w.shard(s), m, cols, x.buf, stage.buffer(), nTokens);
-                    }
-                    copy2dUnchecked(nTokens, m, stage.buffer(), stage.offset(), m,
-                            out, outOff + (int) w.shardRowStart(s), rows);
-                }
-            }
-        }
-        if (applyScale && w.hasScale()) {
-            axpby((int) nOut, 0.0f, null, 0, w.scale(), out, outOff, out, outOff);
-        }
+        projections.matvecAdd(w, in, inOff, accum, accOff, nTokens);
     }
 
     /**
@@ -911,294 +502,7 @@ public final class GpuOps implements AutoCloseable {
      * {@link #matvecLocal()}, so a token count another lane serves keeps the exact readout.
      */
     public boolean matvecFamilyServes(GpuWeight w, int nTokens) {
-        ensureOpen();
-        Objects.requireNonNull(w, "weight");
-        checkTokens(nTokens);
-        int cols = cols(w);
-        WeightKernels k = family(w);
-        boolean invariant = BatchInvariance.enabled();
-        String lane = lanes.fastGemm(w, cols);
-        int matvecMax = lane != null ? LlmKernelConstants.FAST_GEMM_MIN_TOKENS - 1
-                : LlmKernelConstants.MATVEC_N_DISPATCH_MAX;
-        if (!invariant && nTokens >= 2 && nTokens <= matvecMax
-                && int8LaneUsable(k.matvecNQ8, w)) {
-            return false;
-        }
-        String fast = invariant || nTokens >= LlmKernelConstants.FAST_GEMM_MIN_TOKENS ? lane : null;
-        if (fast != null && lanes.fastUsable(fast, lanes.fastTileRows(fast), lanes.fastTileTokens(fast),
-                lanes.fastWorkGroup(fast), w, nTokens)) {
-            return false;
-        }
-        if (!invariant && nTokens >= LlmKernelConstants.TILED_MIN_TOKENS && tiledUsable(k, w, nTokens)) {
-            return false;
-        }
-        if (k.matvecQ8 != null && !invariant && nTokens == 1 && int8LaneUsable(k.matvecQ8, w)) {
-            return false;
-        }
-        return matvecLocal % MATVEC_MAX_TPS == 0;
-    }
-
-    /**
-     * The projection input: the caller's view; or the weight's PRISM rotation in staging; or the full
-     * {@link InputTransform} chain in staging &mdash; the PRE_SCALE part multiplying each column into the input
-     * staging, the HADAMARD part rotating it into the other staging region (a copy of the input when there is no
-     * rotation), ACT_QUANT fake-quantizing in place and PERMUTE gathering out of place into whichever region the
-     * preceding step did not read from.
-     *
-     * <p>{@code actQuantStaged} says the int8 MMQ lane stages the activation codes itself
-     * ({@link FastGemmLanes#stageInt8}), so the ACT_QUANT part is left to that pass: the input then keeps its
-     * float values (scaled, rotated and copied, but not fake-quantized) and the scheme is applied once, as int8
-     * codes.</p>
-     *
-     * @throws IllegalArgumentException when the weight carries a per-expert activation pre-scale (the dense
-     *                                  projection has no expert index) or lacks its device pre-scale buffer
-     */
-    private View projectionInput(GpuWeight w, GpuBuffer in, int inOff, int nTokens, int cols,
-                                 boolean actQuantStaged) {
-        InputTransform t = w.inputTransform();
-        InputTransform.ActQuant a = t != null ? t.actQuant() : null;
-        HadamardSpec h = w.hadamard();
-        float[] pre = t != null ? t.preScale() : null;
-        if (pre != null && pre.length != cols) {
-            throw new IllegalArgumentException("projection " + w.name() + ": an activation pre-scale of "
-                    + pre.length + " values for " + cols + " columns is per expert, which the dense projection"
-                    + " does not apply");
-        }
-        boolean quantizeHere = a != null && !actQuantStaged;
-        boolean needsStaging = pre != null || h != null || quantizeHere || (t != null && t.hasPerm());
-        if (!needsStaging) {
-            return new View(in, inOff);
-        }
-        ScratchSlot first = scratch.staging(GpuScratch.Staging.INPUT, (long) nTokens * cols);
-        GpuBuffer xb = first.buffer();
-        int xo = first.offset();
-        if (pre != null) {
-            if (w.inputPreScale() == null) {
-                throw new IllegalArgumentException("projection " + w.name() + ": its activation pre-scale has no"
-                        + " device buffer");
-            }
-            scaleCols(w.inputPreScale(), in, inOff, xb, xo, nTokens, cols);
-        } else if (h != null) {
-            hadamard(h, in, inOff, xb, xo, nTokens, cols);
-        } else {
-            copy2dUnchecked(nTokens, cols, in, inOff, cols, xb, xo, cols);
-        }
-        if (pre != null && h != null) {
-            ScratchSlot rotated = scratch.staging(GpuScratch.Staging.PERMUTED, (long) nTokens * cols);
-            hadamard(h, xb, xo, rotated.buffer(), rotated.offset(), nTokens, cols);
-            xb = rotated.buffer();
-            xo = rotated.offset();
-        }
-        if (quantizeHere) {
-            actFakeQuant(a.scheme(), a.scale(0), a.zeroPoint(0), a.globalScale(0), xb, xo, xb, xo, nTokens, cols);
-        }
-        if (t != null && t.hasPerm()) {
-            // The gather must not overlap its source: PERMUTE_COLS reads out of place. The rotated result sits in
-            // the permuted region, so it gathers back into the input region the rotation consumed.
-            ScratchSlot p = xb == first.buffer() && xo == first.offset()
-                    ? scratch.staging(GpuScratch.Staging.PERMUTED, (long) nTokens * cols)
-                    : first;
-            permuteCols(w.inputPerm(), xb, xo, p.buffer(), p.offset(), nTokens, cols);
-            return new View(p.buffer(), p.offset());
-        }
-        return new View(xb, xo);
-    }
-
-    /** The input at element 0 of its buffer, copying it to staging when it starts elsewhere. */
-    private View offsetFree(View x, int nTokens, int cols) {
-        if (x.off == 0) {
-            return x;
-        }
-        ScratchSlot s = scratch.staging(GpuScratch.Staging.INPUT, (long) nTokens * cols);
-        copy2dUnchecked(nTokens, cols, x.buf, x.off, cols, s.buffer(), s.offset(), cols);
-        return new View(s.buffer(), s.offset());
-    }
-
-    /**
-     * The float matvec lanes of one shard. The single-token path runs {@code {T}_MatVec} (or its two-rows-per-
-     * workgroup form) and the multi-token path {@code {T}_BatchMatMul_2D}; both reduce every output row over the
-     * weight blocks in the same order, so a row's value does not depend on the token count. Batch invariance skips
-     * the two-row form: it is a single-token-only lane, and the batch kernel must serve every row count instead.
-     */
-    private void matvecShard(WeightKernels k, GpuBuffer shard, int m, int cols, GpuBuffer x, GpuBuffer dst,
-                             int nTokens) {
-        long global = (long) m * matvecLocal;
-        boolean invariant = BatchInvariance.enabled();
-        if (!invariant && nTokens == 1 && twoRowUsable(k.matvec, m)) {
-            launchMatvec(twoRowName(k.matvec), (long) ceilDiv(m, 2) * matvecLocal, m, cols, shard, x, dst);
-        } else if (nTokens == 1) {
-            launchMatvec(k.matvec, global, m, cols, shard, x, dst);
-        } else if (m <= maxGroups[0] && nTokens <= maxGroups[1] && optionalReady(k.batch2d, matvecLocal, 1)) {
-            launch2d(k.batch2d, global, nTokens, matvecLocal, m, cols, nTokens, shard, x, dst);
-        } else {
-            launchMatvec(k.batch, global, m, cols, nTokens, shard, x, dst);
-        }
-    }
-
-    /** {@code {T}_MatVec} to {@code {T}_MatVec2}, the two-rows-per-workgroup form. */
-    private static String twoRowName(String matvec) {
-        return matvec.replace("MatVec", "MatVec2");
-    }
-
-    /**
-     * The W12 projection: up to {@value #W12_MATVEC_MAX_TOKENS} tokens run the {@code W12_*} row kernels, which
-     * decode every row's plane codes in registers and apply its window scale and escape corrections; a wider
-     * prefill decodes the weight into its BF16 mirror ({@link #w12Bf16Mirror}) and re-enters {@link #project} on
-     * the mirror, so the BF16 family's fast GEMM lanes and tiled GEMM serve it. An open {@link W12QView} scope
-     * routes the row kernels over the nested 8-bit view of the code bytes ({@code W12Q_*}); the fused gate/up
-     * form has no Q-view twin, so it is not taken while a scope is open ({@link #fusedGateUpKernel}).
-     */
-    private void projectW12(GpuWeight w, GpuBuffer in, int inOff, GpuBuffer out, int outOff, int nTokens,
-                            boolean allowTiled, boolean applyScale) {
-        long nOut = (long) nTokens * rows(w);
-        if (nTokens > W12_MATVEC_MAX_TOKENS) {
-            GpuWeight mirror = w12Bf16Mirror(w);
-            project(mirror, in, inOff, out, outOff, nTokens, allowTiled, false);
-            if (applyScale && w.hasScale()) {
-                axpby((int) nOut, 0.0f, null, 0, w.scale(), out, outOff, out, outOff);
-            }
-            return;
-        }
-        int cols = cols(w);
-        requireMatvecLocal(w);
-        WeightKernels k = projectionFamily(w);
-        View x = projectionInput(w, in, inOff, nTokens, cols, false);
-        GpuMatmulTap.dense(queue, w, x.buf, x.off, nTokens, cols);
-        x = offsetFree(x, nTokens, cols);
-        boolean direct = w.isSingleShard() && outOff == 0;
-        for (int s = 0; s < w.shardCount(); s++) {
-            int m = (int) w.shardRows(s);
-            if (direct) {
-                matvecShard(k, w.shard(s), m, cols, x.buf, out, nTokens);
-            } else {
-                ScratchSlot stage = scratch.staging(GpuScratch.Staging.OUTPUT, (long) nTokens * m);
-                matvecShard(k, w.shard(s), m, cols, x.buf, stage.buffer(), nTokens);
-                copy2dUnchecked(nTokens, m, stage.buffer(), stage.offset(), m,
-                        out, outOff + (int) w.shardRowStart(s), rows(w));
-            }
-        }
-        if (applyScale && w.hasScale()) {
-            axpby((int) nOut, 0.0f, null, 0, w.scale(), out, outOff, out, outOff);
-        }
-    }
-
-    /**
-     * Decodes every row of the W12 weight into its BF16 mirror in the W12 staging region (one
-     * {@value #W12_DECODE_BF16} launch per row shard, each shard placed at its row start) and returns the mirror
-     * as a BF16 weight of the same shape. The mirror lives in staging, so it is valid for this projection only;
-     * the in-order queue reads it before the next projection reuses the region.
-     */
-    private GpuWeight w12Bf16Mirror(GpuWeight w) {
-        int cols = cols(w);
-        long elements = Math.multiplyExact(w.rows(), cols);
-        ScratchSlot mirror = scratch.staging(GpuScratch.Staging.W12_BF16, elements / 2);
-        for (int s = 0; s < w.shardCount(); s++) {
-            launchMatvec(W12_DECODE_BF16, w.shardRows(s) * matvecLocal, (int) w.shardRows(s), cols,
-                    (int) w.shardRowStart(s), w.shard(s), mirror.buffer());
-        }
-        return GpuWeight.of(w.name(), GGMLType.BF16, w.ne(), mirror.buffer());
-    }
-
-    /** {@link #family} for the weight, or the W12 Q-view row set while a {@link W12QView} scope is open. */
-    private WeightKernels projectionFamily(GpuWeight w) {
-        WeightKernels k = family(w);
-        if (w.type() == GGMLType.W12 && activeW12Q != null) {
-            k = W12Q_FAMILY;
-        }
-        return k;
-    }
-
-    /**
-     * Launches the integer-dot matvec {@code kernel} over {@code m} rows of {@code weight} against the Q8_1
-     * row {@code xq}: the paired {@code {T}_MatVec2_Q8} form at {@code ceil(m / 2) * L} when
-     * {@link #twoRowUsable} selects it and the type measured faster paired on this backend
-     * ({@link Int8MatvecTuning#pairedIsFaster}), so the activation row is read once per two weight rows,
-     * otherwise the single-row form at {@code m * L}.
-     */
-    private void launchInt8Matvec(String kernel, GGMLType type, int m, int cols, GpuBuffer weight, GpuBuffer q8,
-                                  GpuBuffer out) {
-        if (pairInt8Rows(type) && twoRowUsable(kernel, m)) {
-            launchMatvec(twoRowName(kernel), (long) ceilDiv(m, 2) * matvecLocal, m, cols, weight, q8, out);
-        } else {
-            launchMatvec(kernel, (long) m * matvecLocal, m, cols, weight, q8, out);
-        }
-    }
-
-    /**
-     * Launches the multi-column integer-dot matvec {@code kernel} over {@code m} rows of {@code weight}
-     * against the {@code nTokens} consecutive Q8_1 rows of {@code xq} ({@code nTokens} in
-     * [1, {@link LlmKernelConstants#MATVEC_N_MAX_TOKENS}]): the one-workgroup-per-row geometry of the
-     * single-row form, with the weight row read once for the whole token group.
-     */
-    private void launchInt8MatvecN(String kernel, int m, int cols, int nTokens, GpuBuffer weight,
-                                   GpuBuffer xq, GpuBuffer out) {
-        launchMatvec(kernel, (long) m * matvecLocal, m, cols, nTokens, weight, xq, out);
-    }
-
-    /**
-     * Launches the fused gate/up integer-dot matvec {@code kernel} over {@code m} rows of
-     * {@code gateWeight} and {@code upWeight} against the Q8_1 row {@code xq}, pairing the rows in the
-     * {@code {T}_MatVec2FusedGateUp_Q8} form above the two-row floor when the type measured faster paired.
-     */
-    private void launchInt8GateUp(String kernel, GGMLType type, int m, int cols, GpuBuffer gateWeight,
-                                  GpuBuffer upWeight, GpuBuffer q8, GpuBuffer out) {
-        if (pairInt8Rows(type) && twoRowUsable(kernel, m)) {
-            launchMatvec(twoRowName(kernel), (long) ceilDiv(m, 2) * matvecLocal, m, cols, gateWeight, upWeight, q8,
-                    out);
-        } else {
-            launchMatvec(kernel, (long) m * matvecLocal, m, cols, gateWeight, upWeight, q8, out);
-        }
-    }
-
-    /** Whether the paired integer-dot form measured faster than the single-row form for {@code type} here. */
-    private boolean pairInt8Rows(GGMLType type) {
-        return Int8MatvecTuning.pairedIsFaster(backend.backendType(), type);
-    }
-
-    /**
-     * Whether the two-row form of {@code kernel} serves {@code m} rows: at least two rows, enough live
-     * threads ({@link #TWO_ROW_MIN_THREADS}) that pairing the rows does not starve the device more
-     * than the halved activation re-reads pay back, and the kernel prepared at the matvec work-group
-     * size (a weight type without the family form, such as F16 or F32, takes the single-row kernel).
-     * The integer-dot lane's {@code {T}_MatVec_Q8} and {@code {T}_MatVecFusedGateUp_Q8} pair through
-     * {@code {T}_MatVec2_Q8} and {@code {T}_MatVec2FusedGateUp_Q8} under the same floor.
-     */
-    private boolean twoRowUsable(String kernel, int m) {
-        if (m < 2 || (long) ceilDiv(m, 2) * matvecLocal < TWO_ROW_MIN_THREADS) {
-            return false;
-        }
-        return optionalReady(twoRowName(kernel), matvecLocal);
-    }
-
-    /**
-     * Whether the integer-dot (Q8_1 activation) matvec lane can serve a projection of
-     * {@code w} through {@code kernel} (the single-token and multi-column lanes share the gate): the
-     * weight type has the kernel, its rows are a whole number of
-     * weight blocks (the int8 kernels read complete 32/256-element groups), the configured
-     * {@link Int8MatvecMode} and device permit it (packed dot products reported, or the mode forces the
-     * lane), {@link Int8MatvecTuning} has no decode evidence against the type on this backend, and the
-     * kernel is prepared at the matvec work-group size.
-     */
-    private boolean int8LaneUsable(String kernel, GpuWeight w) {
-        if (kernel == null || cols(w) % w.type().getBlockSize() != 0) {
-            return false;
-        }
-        return int8LaneSelected(w.type(), (long) rows(w) * cols(w)) && optionalReady(kernel, matvecLocal);
-    }
-
-    /**
-     * Whether the configured {@link Int8MatvecMode} selects the lane for a projection of {@code type}
-     * with {@code elements} weight elements on this backend: the mode is not {@link Int8MatvecMode#OFF},
-     * and either it forces the lane or the device reports packed dot products and the type measured
-     * faster with the lane here at that projection size ({@link Int8MatvecTuning#laneIsFaster}).
-     */
-    private boolean int8LaneSelected(GGMLType type, long elements) {
-        if (!int8Mode.permitsLane()) {
-            return false;
-        }
-        return int8Mode.forcesLane()
-                || (kernels.caps().hasFeature(DeviceFeature.INTEGER_DOT_PRODUCT)
-                    && Int8MatvecTuning.laneIsFaster(kernels.backend().backendType(), type, elements));
+        return projections.matvecFamilyServes(w, nTokens);
     }
 
     /**
@@ -1230,7 +534,7 @@ public final class GpuOps implements AutoCloseable {
         }
 
         /** The Q8_1 blocks of the shared row, quantizing it on first use. */
-        private GpuBuffer blocks() {
+        GpuBuffer blocks() {
             if (closed) {
                 throw new IllegalStateException("the Q8_1 activation share is closed");
             }
@@ -1243,7 +547,7 @@ public final class GpuOps implements AutoCloseable {
             return blocks;
         }
 
-        private boolean matches(View x, int width) {
+        boolean matches(View x, int width) {
             return !closed && width == cols && x.buf == source && x.off == 0;
         }
 
@@ -1330,54 +634,6 @@ public final class GpuOps implements AutoCloseable {
         return scope;
     }
 
-    /** {@link #quantizeQ8} through the open {@link SharedQ8} when it covers this view. */
-    private GpuBuffer quantizedRow(View x, int cols) {
-        SharedQ8 share = activeShare;
-        if (share != null && share.matches(x, cols)) {
-            return share.blocks();
-        }
-        return quantizeQ8(x.buf, cols);
-    }
-
-    /**
-     * Quantizes one F32 activation row of {@code cols} elements (a multiple of {@link #Q8_1_BLOCK_SIZE})
-     * to Q8_1 blocks in the Q8_1 staging slot ({@value #QUANTIZE_Q8_1}) for the integer-dot matvec lane.
-     * The row must start at element 0 of {@code x}.
-     */
-    private GpuBuffer quantizeQ8(GpuBuffer x, int cols) {
-        int blocks = cols / Q8_1_BLOCK_SIZE;
-        ScratchSlot slot = scratch.staging(GpuScratch.Staging.Q8_1, (long) blocks * Q8_1_FLOATS);
-        launchMatvec(QUANTIZE_Q8_1, blocks, cols, x, slot.buffer());
-        return slot.buffer();
-    }
-
-    /**
-     * Quantizes {@code nTokens} consecutive F32 activation rows of {@code cols} elements (each a multiple
-     * of {@link #Q8_1_BLOCK_SIZE}) to Q8_1 blocks in the Q8_1 staging slot ({@value #QUANTIZE_Q8_1}) for
-     * the multi-column integer-dot matvec lane. The rows are contiguous in the input and in the slot, so
-     * the quantizer's linear block walk serves the whole group in one launch; the group must start at
-     * element 0 of {@code x}.
-     */
-    private GpuBuffer quantizeQ8N(GpuBuffer x, int nTokens, int cols) {
-        int blocks = cols / Q8_1_BLOCK_SIZE;
-        int size = Math.multiplyExact(nTokens, cols);
-        ScratchSlot slot = scratch.staging(GpuScratch.Staging.Q8_1, (long) blocks * nTokens * Q8_1_FLOATS);
-        launchMatvec(QUANTIZE_Q8_1, (long) blocks * nTokens, size, x, slot.buffer());
-        return slot.buffer();
-    }
-
-    private boolean tiledUsable(WeightKernels k, GpuWeight w, int nTokens) {
-        if (maxWorkGroupSize < TILED_WG || ceilDiv(nTokens, TILED_TOKENS) > maxGroups[1]) {
-            return false;
-        }
-        for (int s = 0; s < w.shardCount(); s++) {
-            if (ceilDiv(w.shardRows(s), TILED_ROWS) > maxGroups[0]) {
-                return false;
-            }
-        }
-        return optionalReady(k.tiled, TILED_WG, 1);
-    }
-
     /**
      * Whether an optional kernel (the projection kernels of the class notes, or a block's faster form of a kernel it
      * can replace, such as the tensor-core grouped expert GEMM) can be launched at work-group size
@@ -1420,57 +676,7 @@ public final class GpuOps implements AutoCloseable {
      *                                  below its work-group size (CUDA)
      */
     public void prewarmWeightKernels(GGMLType type, boolean matmul, boolean lookup) {
-        ensureOpen();
-        Objects.requireNonNull(type, "type");
-        WeightKernels k = family(type);
-        long[] matvec = {matvecLocal};
-        if (matmul && matvecLocal % MATVEC_MAX_TPS == 0) {
-            prewarmIfPresent(k.matvec, matvec);
-            prewarmIfPresent(k.batch, matvec);
-            optionalReady(k.matvecAdd, matvecLocal);
-            optionalReady(k.batch2d, matvecLocal, 1);
-            optionalReady(twoRowName(k.matvec), matvecLocal);
-            if (k.matvecQ8 != null && int8LaneSelected(type, Long.MAX_VALUE)) {
-                optionalReady(k.matvecQ8, matvecLocal);
-                optionalReady(k.matvecAddQ8, matvecLocal);
-                optionalReady(k.matvecNQ8, matvecLocal);
-                if (pairInt8Rows(type)) {
-                    optionalReady(twoRowName(k.matvecQ8), matvecLocal);
-                    optionalReady(twoRowName(fusedGateUpName(k.matvecQ8)), matvecLocal);
-                }
-            }
-            if (type == GGMLType.W12) {
-                // The whole-tensor BF16 decode behind a wide prefill, and the Q-view row set of the
-                // neuralfree.weights.w12 verification pass; the fused gate/up has no Q-view twin.
-                prewarmIfPresent(W12_DECODE_BF16, matvec);
-                optionalReady(W12Q_FAMILY.matvec, matvecLocal);
-                optionalReady(W12Q_FAMILY.matvecAdd, matvecLocal);
-                optionalReady(W12Q_FAMILY.batch, matvec);
-                optionalReady(W12Q_FAMILY.batch2d, matvecLocal, 1);
-            }
-        }
-        if (matmul && k.tiled != null && maxWorkGroupSize >= TILED_WG) {
-            optionalReady(k.tiled, TILED_WG, 1);
-            lanes.prewarm(type);
-        }
-        if (lookup) {
-            prewarmIfPresent(k.embed, matvec);
-            prewarmIfPresent(k.batchEmbed, matvec);
-        }
-    }
-
-    /** Prepares a provided kernel that has no fallback; one that cannot run {@code localSize} fails the bind. */
-    private void prewarmIfPresent(String kernel, long[] localSize) {
-        if (kernels.has(kernel)) {
-            kernels.prewarm(kernel, localSize);
-        }
-    }
-
-    private void requireMatvecLocal(GpuWeight w) {
-        if (matvecLocal % MATVEC_MAX_TPS != 0) {
-            throw new UnsupportedOperationException("matvec of " + w.name() + " needs a work-group size that is a"
-                    + " multiple of " + MATVEC_MAX_TPS + "; this device allows " + matvecLocal);
-        }
+        projections.prewarmWeightKernels(type, matmul, lookup);
     }
 
     // ================================================================== embeddings
@@ -2011,7 +1217,7 @@ public final class GpuOps implements AutoCloseable {
         }
     }
 
-    private void copy2dUnchecked(int rows, int cols, GpuBuffer src, int srcOff, int srcStride, GpuBuffer dst,
+    void copy2dUnchecked(int rows, int cols, GpuBuffer src, int srcOff, int srcStride, GpuBuffer dst,
                                  int dstOff, int dstStride) {
         launch(COPY2D, (long) rows * cols, rows, cols, srcStride, srcOff, dstStride, dstOff, src, dst);
     }
@@ -2021,7 +1227,7 @@ public final class GpuOps implements AutoCloseable {
      * null). Operands that coincide with {@code out} are moved to the aliasable slot of {@value #AXPBY}; any other
      * overlap with {@code out} is rejected.
      */
-    private void axpby(int n, float alpha, GpuBuffer a, int aOff, float beta, GpuBuffer b, int bOff, GpuBuffer out,
+    void axpby(int n, float alpha, GpuBuffer a, int aOff, float beta, GpuBuffer b, int bOff, GpuBuffer out,
                        int outOff) {
         checkView("axpby output", out, outOff, n);
         boolean useA = alpha != 0.0f;
@@ -2071,13 +1277,13 @@ public final class GpuOps implements AutoCloseable {
     }
 
     /** 1-D launch at the matvec work-group size: {@code roundUp(n, Lm)} work-items of local size {@code Lm}. */
-    private void launchMatvec(String kernel, long n, Object... args) {
+    void launchMatvec(String kernel, long n, Object... args) {
         long g = roundUp(n, matvecLocal);
         queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{g}, new long[]{matvecLocal}, args);
     }
 
     /** 2-D launch: {@code {roundUp(gx, lx), gy}} with local {@code {lx, 1}}. */
-    private void launch2d(String kernel, long gx, long gy, int lx, Object... args) {
+    void launch2d(String kernel, long gx, long gy, int lx, Object... args) {
         queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{roundUp(gx, lx), gy}, new long[]{lx, 1}, args);
     }
 
@@ -2094,50 +1300,15 @@ public final class GpuOps implements AutoCloseable {
     // ================================================================== validation
 
     /** The weight kernels of {@code type}; throws when GpuOps has none for it. */
-    private WeightKernels family(GGMLType type) {
-        return weightKernels(type, backend.backendType(), kernels.caps());
+    WeightKernels family(GGMLType type) {
+        return GpuWeightFamilies.weightKernels(type, backend.backendType(), kernels.caps());
     }
 
-    private WeightKernels family(GpuWeight w) {
-        WeightKernels k = FAMILIES.get(w.type());
-        if (k == null) {
-            throw new GpuModelUnsupportedException("tensor " + w.name() + ": no GPU kernels for weight type "
-                    + w.type());
-        }
-        return hwFamily(w.type(), k, backend.backendType(), kernels.caps());
+    WeightKernels family(GpuWeight w) {
+        return GpuWeightFamilies.family(w, backend.backendType(), kernels.caps());
     }
 
-    /**
-     * The weight kernels of {@code type} on a device: the generic family, or the {@code {T}_Hw_*} fast-path set
-     * when the type has hardware-FP8 decode rows and the device reports the CUDA sm_89 conversions.
-     *
-     * <p>The selection depends only on the weight type, the backend type and the device capabilities, so it can be
-     * checked without loading a kernel library.</p>
-     *
-     * @throws GpuModelUnsupportedException when GpuOps has no projection kernels for {@code type}
-     */
-    static WeightKernels weightKernels(GGMLType type, ComputeBackend.BackendType backendType,
-                                       DeviceCapabilities caps) {
-        WeightKernels k = FAMILIES.get(type);
-        if (k == null) {
-            throw new GpuModelUnsupportedException("no GPU projection kernels for weight type " + type);
-        }
-        return hwFamily(type, k, backendType, caps);
-    }
-
-    /** {@code generic}, or the {@code {T}_Hw_*} fast-path set when the device selects hardware FP8 decode. */
-    private static WeightKernels hwFamily(GGMLType type, WeightKernels generic,
-                                          ComputeBackend.BackendType backendType, DeviceCapabilities caps) {
-        return HW_FP8_TYPES.contains(type) && hardwareFp8Decode(backendType, caps)
-                ? hardware(familyName(type)) : generic;
-    }
-
-    /** The kernel-family name of {@code type}: the enum name, except the types that reuse another family's rows. */
-    private static String familyName(GGMLType type) {
-        return type == GGMLType.F8_E4M3FN ? GGMLType.F8_E4M3.name() : type.name();
-    }
-
-    private static int cols(GpuWeight w) {
+    static int cols(GpuWeight w) {
         Objects.requireNonNull(w, "weight");
         if (w.cols() > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("tensor " + w.name() + ": " + w.cols() + " columns exceed int range");
@@ -2145,14 +1316,14 @@ public final class GpuOps implements AutoCloseable {
         return (int) w.cols();
     }
 
-    private static int rows(GpuWeight w) {
+    static int rows(GpuWeight w) {
         if (w.rows() > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("tensor " + w.name() + ": " + w.rows() + " rows exceed int range");
         }
         return (int) w.rows();
     }
 
-    private static void checkTokens(int n) {
+    static void checkTokens(int n) {
         if (n < 1) {
             throw new IllegalArgumentException("row count must be at least 1, got " + n);
         }
@@ -2164,13 +1335,13 @@ public final class GpuOps implements AutoCloseable {
         }
     }
 
-    private static void checkInt(long v, String what) {
+    static void checkInt(long v, String what) {
         if (v > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(what + " " + v + " exceeds the kernels' int range");
         }
     }
 
-    private static void checkView(String what, GpuBuffer b, long off, long floats) {
+    static void checkView(String what, GpuBuffer b, long off, long floats) {
         if (b == null) {
             throw new IllegalArgumentException(what + ": buffer is null");
         }
@@ -2183,7 +1354,7 @@ public final class GpuOps implements AutoCloseable {
         }
     }
 
-    private static boolean overlaps(GpuBuffer a, long aOff, long aN, GpuBuffer b, long bOff, long bN) {
+    static boolean overlaps(GpuBuffer a, long aOff, long aN, GpuBuffer b, long bOff, long bN) {
         return a == b && aOff < bOff + bN && bOff < aOff + aN;
     }
 
@@ -2265,7 +1436,7 @@ public final class GpuOps implements AutoCloseable {
         return (n + d - 1) / d;
     }
 
-    private void ensureOpen() {
+    void ensureOpen() {
         if (closed) {
             throw new IllegalStateException("GpuOps is closed");
         }

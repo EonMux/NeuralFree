@@ -10,6 +10,12 @@ package com.eonmux.neuralfree.acceleration.backend;
 public enum DeviceFeature {
     /** Subgroup (warp, wavefront) arithmetic reductions and broadcasts are usable in kernels. */
     SUBGROUP_ARITHMETIC,
+    /**
+     * Subgroup shuffle (butterfly exchange and broadcast, {@code __shfl_xor_sync}) is usable in kernels: CUDA and
+     * HIP, where {@code common/dialect.h} defines {@code NF_HAS_SG_SHUFFLE}. OpenCL 1.2 has no portable subgroup
+     * shuffle, so it never reports this feature and kernels keep their local-memory paths.
+     */
+    SUBGROUP_SHUFFLE,
     /** Kernels may read and write 8-bit values in storage buffers. */
     STORAGE_8BIT,
     /** Kernels may read and write 16-bit values in storage buffers. */

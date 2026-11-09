@@ -26,9 +26,10 @@ import com.eonmux.neuralfree.gguf.spec.MissingTensorException;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
 import org.junit.After;
 import org.junit.Test;
 
@@ -659,7 +660,7 @@ public class WavTokenizerDecoderTest {
         backend.clearLog();
         GpuWavTokenizer gpu = GpuWavTokenizer.bind(d, ops, weights, CAP);
         boolean converted = false;
-        for (Dispatch disp : backend.dispatches()) {
+        for (FakeDispatch disp : backend.dispatches()) {
             converted |= disp.bufferArgs().contains((FakeGpuBuffer) dev.get(f16Conv).shard(0));
         }
         assertTrue("the F16 conv weight is decoded to F32 at bind", converted);
@@ -673,10 +674,10 @@ public class WavTokenizerDecoderTest {
         assertEquals(t, rows.length);
         assertEquals(OUT, rows[0].length);
 
-        List<Dispatch> all = backend.dispatches();
-        List<Dispatch> own = new ArrayList<>();
+        List<FakeDispatch> all = backend.dispatches();
+        List<FakeDispatch> own = new ArrayList<>();
         int projections = 0;
-        for (Dispatch disp : all) {
+        for (FakeDispatch disp : all) {
             if (DECODER_KERNELS.contains(disp.kernelName())) {
                 own.add(disp);
             } else {
@@ -684,14 +685,14 @@ public class WavTokenizerDecoderTest {
             }
         }
         List<String> names = new ArrayList<>();
-        for (Dispatch disp : own) {
+        for (FakeDispatch disp : own) {
             names.add(disp.kernelName());
         }
         assertEquals(expectedSequence(), names);
         assertEquals("embedding, q/k/v/output projections, pw1/pw2 per ConvNeXt layer, output head",
                 1 + 4 + 2 * CONVNEXT + 1, projections);
 
-        Dispatch firstGather = own.get(0);
+        FakeDispatch firstGather = own.get(0);
         assertArrayEquals(new int[]{E * t, 1, 1, 1, 0, 0}, ints(firstGather, 6));
         int[] idx = firstGather.bufferArg(6).getInts(0, E * t);
         for (int e = 0; e < E; e++) {
@@ -700,18 +701,18 @@ public class WavTokenizerDecoderTest {
             }
         }
 
-        Dispatch inputConv = own.get(1);
+        FakeDispatch inputConv = own.get(1);
         assertArrayEquals(new int[]{t, E, C, 7, 1, 0, 0}, ints(inputConv, 7));
         assertArrayEquals(new long[]{AudioKernels.convGlobal(C, t)}, inputConv.global());
 
-        Dispatch gn = own.get(2);
+        FakeDispatch gn = own.get(2);
         assertArrayEquals(new int[]{C, t, GROUPS}, ints(gn, 3));
         assertEquals(GROUP_EPS, gn.floatArg(NormKernels.ARG_GROUP_NORM_EPS), 0f);
-        Dispatch posnet0Conv1 = own.get(4);
+        FakeDispatch posnet0Conv1 = own.get(4);
         assertNotSame(dev.get(f16Conv).shard(0), posnet0Conv1.bufferArg(8));
         assertArrayEquals(new int[]{t, C, C, 3, 1, 0, 0}, ints(posnet0Conv1, 7));
 
-        Dispatch fa = backend.dispatchesOf(AttnKernels.flashAttn(KvDType.F32)).get(0);
+        FakeDispatch fa = backend.dispatchesOf(AttnKernels.flashAttn(KvDType.F32)).get(0);
         assertEquals(AttnKernels.FA_ARG_COUNT, fa.argCount());
         assertEquals(t, fa.intArg(AttnKernels.ARG_FA_N_TOKENS));
         assertEquals(1, fa.intArg(AttnKernels.ARG_FA_N_HEAD));
@@ -727,16 +728,16 @@ public class WavTokenizerDecoderTest {
         assertArrayEquals(new int[]{0, 1, 2, 3, 4}, fa.bufferArg(AttnKernels.ARG_FA_BUF_KV_POS).getInts(0, t));
         assertTrue(backend.dispatchesOf(AttnKernels.FLASH_COMBINE).isEmpty());
 
-        Dispatch bias = backend.dispatchesOf(GpuWavTokenizer.BATCH_BIAS_ADD).get(0);
+        FakeDispatch bias = backend.dispatchesOf(GpuWavTokenizer.BATCH_BIAS_ADD).get(0);
         assertArrayEquals(new int[]{C, t}, ints(bias, 2));
-        Dispatch scale = backend.dispatchesOf(NormKernels.MUL_ROW_SCALE).get(0);
+        FakeDispatch scale = backend.dispatchesOf(NormKernels.MUL_ROW_SCALE).get(0);
         assertArrayEquals(new int[]{t, C, C}, ints(scale, 3));
-        Dispatch dw = backend.dispatchesOf(AudioKernels.CONV1D_DEPTHWISE).get(0);
+        FakeDispatch dw = backend.dispatchesOf(AudioKernels.CONV1D_DEPTHWISE).get(0);
         assertArrayEquals(new int[]{t, C, 7, 0, 0}, ints(dw, 5));
 
-        List<FakeComputeBackend.Op> log = backend.ops();
-        assertEquals(OpKind.READ, log.get(log.size() - 2).kind());
-        assertEquals(OpKind.FINISH, log.get(log.size() - 1).kind());
+        List<FakeOp> log = backend.ops();
+        assertEquals(FakeOpKind.READ, log.get(log.size() - 2).kind());
+        assertEquals(FakeOpKind.FINISH, log.get(log.size() - 1).kind());
         gpu.close();
         assertThrows(IllegalStateException.class, () -> gpu.decode(codes));
     }
@@ -758,7 +759,7 @@ public class WavTokenizerDecoderTest {
         assertEquals(FlashAttnTiling.Plan.TILED, GpuWavTokenizer.attentionPlan(768, 512, 8192, 32).plan());
     }
 
-    private static int[] ints(Dispatch d, int n) {
+    private static int[] ints(FakeDispatch d, int n) {
         int[] v = new int[n];
         for (int i = 0; i < n; i++) {
             v[i] = d.intArg(i);
@@ -820,9 +821,9 @@ public class WavTokenizerDecoderTest {
         FakeGpuBuffer dst = (FakeGpuBuffer) backend.allocateBuffer(2 * 10 * Float.BYTES);
         backend.clearLog();
         l.padOnDevice(ops, head, 0, dst, 0, 2);
-        List<FakeComputeBackend.Op> log = backend.ops();
-        assertEquals(OpKind.FILL, log.get(0).kind());
-        Dispatch copy = backend.dispatchesOf(GpuOps.COPY2D).get(0);
+        List<FakeOp> log = backend.ops();
+        assertEquals(FakeOpKind.FILL, log.get(0).kind());
+        FakeDispatch copy = backend.dispatchesOf(GpuOps.COPY2D).get(0);
         assertArrayEquals(new int[]{2, 4, 4, 0, 10, 6}, ints(copy, 6));
         assertEquals(Float.NEGATIVE_INFINITY, dst.getFloat(0), 0f);
         assertEquals(Float.NEGATIVE_INFINITY, dst.getFloat(15), 0f);

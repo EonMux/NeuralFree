@@ -56,7 +56,7 @@ import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Test;
@@ -318,14 +318,14 @@ public class GpuDsv4MixerTest {
         return m;
     }
 
-    private List<Dispatch> decode(GpuMixer m, int pos) {
+    private List<FakeDispatch> decode(GpuMixer m, int pos) {
         memory.steps.upload(pos, 1);
         backend.clearLog();
         m.decode(pos, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
         return backend.dispatches();
     }
 
-    private List<Dispatch> prefill(GpuMixer m, int pos0, int n) {
+    private List<FakeDispatch> prefill(GpuMixer m, int pos0, int n) {
         memory.steps.upload(pos0, n);
         backend.clearLog();
         m.prefill(pos0, n, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
@@ -333,32 +333,32 @@ public class GpuDsv4MixerTest {
     }
 
     /** The cache writes of {@code n} rows: {@link GpuDsv4Mixer#prefillKV} over the same step inputs. */
-    private List<Dispatch> kvOnlyPrefill(GpuMixer m, int pos0, int n) {
+    private List<FakeDispatch> kvOnlyPrefill(GpuMixer m, int pos0, int n) {
         memory.steps.upload(pos0, n);
         backend.clearLog();
         ((GpuDsv4Mixer) m).prefillKV(pos0, n, scratch.slot(ScratchSlots.NORMED));
         return backend.dispatches();
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static Dispatch only(List<Dispatch> ds, String kernel) {
-        List<Dispatch> found = all(ds, kernel);
+    private static FakeDispatch only(List<FakeDispatch> ds, String kernel) {
+        List<FakeDispatch> found = all(ds, kernel);
         if (found.size() != 1) {
             throw new AssertionError(found.size() + " dispatches of " + kernel + " in " + names(ds));
         }
         return found.get(0);
     }
 
-    private static List<Dispatch> all(List<Dispatch> ds, String kernel) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+    private static List<FakeDispatch> all(List<FakeDispatch> ds, String kernel) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 out.add(d);
             }
@@ -395,7 +395,7 @@ public class GpuDsv4MixerTest {
         layerTensors(0, Dsv4Spec.RATIO_CSA, true);
         caches(0, Dsv4Spec.RATIO_CSA);
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_CSA, true, Q_LORA));
-        List<Dispatch> ds = decode(m, 7);
+        List<FakeDispatch> ds = decode(m, 7);
 
         assertEquals(Arrays.asList(
                 MATVEC, NormKernels.ROW_NORM, pairedMatvec(), NormKernels.ROW_NORM, RopeKernels.ROPE_EXT,
@@ -408,7 +408,7 @@ public class GpuDsv4MixerTest {
 
         FakeCompressed csa = compressed(0, CompressedKvPlan.Kind.CSA);
         FakeCompressed lid = compressed(0, CompressedKvPlan.Kind.INDEXER);
-        Dispatch compress = only(ds, Dsv4Kernels.COMPRESS);
+        FakeDispatch compress = only(ds, Dsv4Kernels.COMPRESS);
         assertEquals(7, compress.intArg(Dsv4Kernels.ARG_COMPRESS_POS0));
         assertEquals(1, compress.intArg(Dsv4Kernels.ARG_COMPRESS_N_TOKENS));
         assertEquals(Dsv4Spec.RATIO_CSA, compress.intArg(COMPRESS_RATIO));
@@ -420,29 +420,29 @@ public class GpuDsv4MixerTest {
         assertSame(csa.cache, compress.bufferArg(COMPRESS_CACHE));
         assertArrayEquals(new long[]{dsv4Local}, compress.global());
 
-        Dispatch lidUpdate = only(ds, Dsv4Kernels.lidUpdate(KvDType.F32));
+        FakeDispatch lidUpdate = only(ds, Dsv4Kernels.lidUpdate(KvDType.F32));
         assertEquals(7, lidUpdate.intArg(Dsv4Kernels.ARG_LID_POS0));
         assertEquals(IDX_DIM, lidUpdate.intArg(LID_WIDTH));
         assertEquals(Dsv4Layout.lidRotationBlock(IDX_DIM), lidUpdate.intArg(LID_ROT));
         assertSame(lid.cache, lidUpdate.bufferArg(LID_CACHE));
 
-        List<Dispatch> states = all(ds, Dsv4Kernels.STATE_UPDATE);
+        List<FakeDispatch> states = all(ds, Dsv4Kernels.STATE_UPDATE);
         assertEquals(Dsv4Spec.RATIO_CSA, states.get(0).intArg(STATE_RATIO));
         assertEquals(HEAD, states.get(0).intArg(STATE_WIDTH));
         assertSame(csa.stateKv, states.get(0).bufferArg(9));
         assertEquals(IDX_DIM, states.get(1).intArg(STATE_WIDTH));
         assertSame(lid.stateScore, states.get(1).bufferArg(10));
 
-        Dispatch score = only(ds, SparseKernels.indexerScore(KvDType.F32));
+        FakeDispatch score = only(ds, SparseKernels.indexerScore(KvDType.F32));
         assertEquals(1, score.intArg(SparseKernels.ARG_SCORE_N_TOKENS));
         assertEquals(2, score.intArg(SparseKernels.ARG_SCORE_N_KV));
         assertSame(lid.cache, score.bufferArg(SCORE_KEYS));
         FakeGpuBuffer lidPos = score.bufferArg(SCORE_KV_POS);
         assertArrayEquals(new int[]{3, 7, 11, 15}, lidPos.getInts(0, 4));
-        Dispatch topK = only(ds, SparseKernels.TOPK_ROWS);
+        FakeDispatch topK = only(ds, SparseKernels.TOPK_ROWS);
         assertEquals(2, topK.intArg(SparseKernels.ARG_TOPK_K));
 
-        Dispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
+        FakeDispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
         FakeKv raw = memory.kv.get(0);
         assertEquals(1, attn.intArg(Dsv4Kernels.ARG_ATTN_N_TOKENS));
         assertEquals(8, attn.intArg(Dsv4Kernels.ARG_ATTN_N_RAW));
@@ -464,12 +464,12 @@ public class GpuDsv4MixerTest {
         assertSame(memory.steps.qPos, attn.bufferArg(ATTN_Q_POS));
         assertArrayEquals(Dsv4Kernels.attnGlobal(1, N_HEAD, headTile(), dsv4Local), attn.global());
 
-        Dispatch store = only(ds, Dsv4Kernels.CACHE_STORE);
+        FakeDispatch store = only(ds, Dsv4Kernels.CACHE_STORE);
         assertEquals(1, store.intArg(Dsv4Kernels.ARG_STORE_N_TOKENS));
         assertSame(memory.steps.cellIdx, store.bufferArg(STORE_CELL_IDX));
         assertSame(raw.k, store.bufferArg(STORE_CACHE));
 
-        Dispatch wo = ds.get(ds.size() - 1);
+        FakeDispatch wo = ds.get(ds.size() - 1);
         assertSame(weight(0, Dsv4Layout.WO_B).shard(0), wo.bufferArg(2));
         assertSame(scratch.slot(ScratchSlots.BRANCH).buffer(), wo.bufferArg(4));
     }
@@ -480,21 +480,21 @@ public class GpuDsv4MixerTest {
         layerTensors(0, Dsv4Spec.RATIO_CSA, false);
         caches(0, Dsv4Spec.RATIO_CSA);
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_CSA));
-        List<Dispatch> ds = decode(m, 2);
+        List<FakeDispatch> ds = decode(m, 2);
 
         assertFalse(names(ds).contains(Dsv4Kernels.COMPRESS));
         assertNoIndexerKernels(ds);
         assertFalse(names(ds).contains(HadamardSpec.KERNEL));
         assertFalse(names(ds).contains(SparseKernels.TOPK_ROWS));
         assertEquals(2, all(ds, Dsv4Kernels.STATE_UPDATE).size());
-        Dispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
+        FakeDispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
         assertEquals(0, attn.intArg(Dsv4Kernels.ARG_ATTN_N_COMP));
         assertEquals(0, attn.intArg(Dsv4Kernels.ARG_ATTN_SEL_STRIDE));
         assertEquals(3, attn.intArg(Dsv4Kernels.ARG_ATTN_N_RAW));
         assertEquals(0, attn.intArg(ATTN_HAS_SINKS));
         assertSame(placeholders.readOnlyFloats(), attn.bufferArg(ATTN_SINKS));
 
-        List<Dispatch> next = decode(m, 3);
+        List<FakeDispatch> next = decode(m, 3);
         assertEquals(3, only(next, Dsv4Kernels.COMPRESS).intArg(Dsv4Kernels.ARG_COMPRESS_POS0));
         assertEquals(1, only(next, SparseKernels.indexerScore(KvDType.F32)).intArg(SparseKernels.ARG_SCORE_N_KV));
         assertEquals(1, only(next, Dsv4Kernels.COMPRESSED_ATTN).intArg(Dsv4Kernels.ARG_ATTN_N_COMP));
@@ -506,23 +506,23 @@ public class GpuDsv4MixerTest {
         layerTensors(0, Dsv4Spec.RATIO_CSA, false);
         caches(0, Dsv4Spec.RATIO_CSA);
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_CSA));
-        List<Dispatch> ds = prefill(m, 40, UBATCH);
+        List<FakeDispatch> ds = prefill(m, 40, UBATCH);
 
-        Dispatch compress = only(ds, Dsv4Kernels.COMPRESS);
+        FakeDispatch compress = only(ds, Dsv4Kernels.COMPRESS);
         assertEquals(40, compress.intArg(Dsv4Kernels.ARG_COMPRESS_POS0));
         assertEquals(UBATCH, compress.intArg(Dsv4Kernels.ARG_COMPRESS_N_TOKENS));
         assertArrayEquals(Dsv4Kernels.compressGlobal(40, UBATCH, Dsv4Spec.RATIO_CSA, dsv4Local), compress.global());
-        Dispatch score = only(ds, SparseKernels.indexerScore(KvDType.F32));
+        FakeDispatch score = only(ds, SparseKernels.indexerScore(KvDType.F32));
         assertEquals(UBATCH, score.intArg(SparseKernels.ARG_SCORE_N_TOKENS));
         assertEquals(12, score.intArg(SparseKernels.ARG_SCORE_N_KV));
         assertEquals(TOP_K, only(ds, SparseKernels.TOPK_ROWS).intArg(SparseKernels.ARG_TOPK_K));
-        Dispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
+        FakeDispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
         assertEquals(UBATCH, attn.intArg(Dsv4Kernels.ARG_ATTN_N_TOKENS));
         assertEquals(TOP_K, attn.intArg(Dsv4Kernels.ARG_ATTN_N_COMP));
         assertEquals(TOP_K, attn.intArg(Dsv4Kernels.ARG_ATTN_SEL_STRIDE));
         assertEquals(RAW_ROWS, attn.intArg(Dsv4Kernels.ARG_ATTN_N_RAW));
         assertArrayEquals(Dsv4Kernels.attnGlobal(UBATCH, N_HEAD, headTile(), dsv4Local), attn.global());
-        for (Dispatch rope : all(ds, RopeKernels.ROPE_EXT)) {
+        for (FakeDispatch rope : all(ds, RopeKernels.ROPE_EXT)) {
             assertEquals(UBATCH, rope.intArg(RopeKernels.ARG_N_TOKENS));
             assertEquals(UBATCH, rope.intArg(RopeKernels.ARG_POS_STRIDE));
         }
@@ -539,8 +539,8 @@ public class GpuDsv4MixerTest {
         layerTensors(0, Dsv4Spec.RATIO_CSA, true);
         caches(0, Dsv4Spec.RATIO_CSA);
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_CSA, true, Q_LORA));
-        List<Dispatch> whole = prefill(m, 40, UBATCH);
-        List<Dispatch> ds = kvOnlyPrefill(m, 40, UBATCH);
+        List<FakeDispatch> whole = prefill(m, 40, UBATCH);
+        List<FakeDispatch> ds = kvOnlyPrefill(m, 40, UBATCH);
         List<String> kernels = names(ds);
 
         String matmul = GemmKernels.matmulTiled(GGMLType.F32);
@@ -554,14 +554,14 @@ public class GpuDsv4MixerTest {
         assertFalse(kernels.contains(SparseKernels.TOPK_ROWS));
         assertFalse(kernels.contains(HadamardSpec.KERNEL));
 
-        Dispatch compress = only(ds, Dsv4Kernels.COMPRESS);
+        FakeDispatch compress = only(ds, Dsv4Kernels.COMPRESS);
         assertEquals(40, compress.intArg(Dsv4Kernels.ARG_COMPRESS_POS0));
         assertEquals(UBATCH, compress.intArg(Dsv4Kernels.ARG_COMPRESS_N_TOKENS));
         assertArrayEquals(Dsv4Kernels.compressGlobal(40, UBATCH, Dsv4Spec.RATIO_CSA, dsv4Local), compress.global());
-        Dispatch lidUpdate = only(ds, Dsv4Kernels.lidUpdate(KvDType.F32));
+        FakeDispatch lidUpdate = only(ds, Dsv4Kernels.lidUpdate(KvDType.F32));
         assertEquals(40, lidUpdate.intArg(Dsv4Kernels.ARG_LID_POS0));
         assertEquals(UBATCH, lidUpdate.intArg(Dsv4Kernels.ARG_LID_N_TOKENS));
-        Dispatch store = only(ds, Dsv4Kernels.CACHE_STORE);
+        FakeDispatch store = only(ds, Dsv4Kernels.CACHE_STORE);
         assertEquals(UBATCH, store.intArg(Dsv4Kernels.ARG_STORE_N_TOKENS));
         assertSame(memory.steps.cellIdx, store.bufferArg(STORE_CELL_IDX));
         assertSame(memory.kv.get(0).k, store.bufferArg(STORE_CACHE));
@@ -579,7 +579,7 @@ public class GpuDsv4MixerTest {
         layerTensors(0, Dsv4Spec.RATIO_CSA, false);
         caches(0, Dsv4Spec.RATIO_CSA, KvDType.F32, RotationPlan.NONE, snapshots);
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_CSA));
-        List<Dispatch> ds = prefill(m, 40, UBATCH);
+        List<FakeDispatch> ds = prefill(m, 40, UBATCH);
 
         List<String> order = new ArrayList<>();
         for (String n : names(ds)) {
@@ -594,11 +594,11 @@ public class GpuDsv4MixerTest {
 
         FakeCompressed csa = compressed(0, CompressedKvPlan.Kind.CSA);
         FakeCompressed lid = compressed(0, CompressedKvPlan.Kind.INDEXER);
-        List<Dispatch> snaps = all(ds, Dsv4Kernels.STATE_SNAPSHOT);
+        List<FakeDispatch> snaps = all(ds, Dsv4Kernels.STATE_SNAPSHOT);
         FakeCompressed[] owners = {csa, lid};
         int[] widths = {HEAD, IDX_DIM};
         for (int i = 0; i < 2; i++) {
-            Dispatch d = snaps.get(i);
+            FakeDispatch d = snaps.get(i);
             assertEquals(Dsv4Kernels.SNAPSHOT_ARG_COUNT, d.args().size());
             assertEquals(40, d.intArg(Dsv4Kernels.ARG_SNAPSHOT_POS0));
             assertEquals(UBATCH, d.intArg(Dsv4Kernels.ARG_SNAPSHOT_N_TOKENS));
@@ -611,7 +611,7 @@ public class GpuDsv4MixerTest {
                     d.global());
         }
 
-        List<Dispatch> next = decode(m, 48);
+        List<FakeDispatch> next = decode(m, 48);
         assertEquals(48, all(next, Dsv4Kernels.STATE_SNAPSHOT).get(0).intArg(Dsv4Kernels.ARG_SNAPSHOT_POS0));
         assertEquals(1, all(next, Dsv4Kernels.STATE_SNAPSHOT).get(1).intArg(Dsv4Kernels.ARG_SNAPSHOT_N_TOKENS));
     }
@@ -648,22 +648,22 @@ public class GpuDsv4MixerTest {
         caches(0, Dsv4Spec.RATIO_HCA);
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_HCA));
 
-        List<Dispatch> early = prefill(m, 0, UBATCH);
+        List<FakeDispatch> early = prefill(m, 0, UBATCH);
         assertFalse(names(early).contains(Dsv4Kernels.COMPRESS));
         assertEquals(0, only(early, Dsv4Kernels.COMPRESSED_ATTN).intArg(Dsv4Kernels.ARG_ATTN_N_COMP));
 
-        List<Dispatch> ds = prefill(m, 124, UBATCH);
+        List<FakeDispatch> ds = prefill(m, 124, UBATCH);
         FakeCompressed hca = compressed(0, CompressedKvPlan.Kind.HCA);
-        Dispatch compress = only(ds, Dsv4Kernels.COMPRESS);
+        FakeDispatch compress = only(ds, Dsv4Kernels.COMPRESS);
         assertEquals(124, compress.intArg(Dsv4Kernels.ARG_COMPRESS_POS0));
         assertEquals(Dsv4Spec.RATIO_HCA, compress.intArg(COMPRESS_RATIO));
         assertArrayEquals(new long[]{dsv4Local}, compress.global());
-        Dispatch state = only(ds, Dsv4Kernels.STATE_UPDATE);
+        FakeDispatch state = only(ds, Dsv4Kernels.STATE_UPDATE);
         assertEquals(Dsv4Spec.RATIO_HCA, state.intArg(STATE_RATIO));
         assertArrayEquals(Dsv4Kernels.stateUpdateGlobal(Dsv4Spec.RATIO_HCA, HEAD, dsv4Local), state.global());
         assertNoIndexerKernels(ds);
 
-        Dispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
+        FakeDispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
         assertEquals(Dsv4Kernels.CompMode.DENSE.code(), attn.intArg(ATTN_COMP_MODE));
         assertEquals(1, attn.intArg(Dsv4Kernels.ARG_ATTN_N_COMP));
         assertEquals(0, attn.intArg(Dsv4Kernels.ARG_ATTN_SEL_STRIDE));
@@ -679,18 +679,18 @@ public class GpuDsv4MixerTest {
         layerTensors(0, 0, false);
         caches(0, 0);
         GpuMixer m = bind(layer(0, 0));
-        List<Dispatch> ds = decode(m, 5);
+        List<FakeDispatch> ds = decode(m, 5);
 
         assertEquals(Arrays.asList(
                 MATVEC, NormKernels.ROW_NORM, pairedMatvec(), NormKernels.ROW_NORM, RopeKernels.ROPE_EXT,
                 MATVEC, NormKernels.ROW_NORM, RopeKernels.ROPE_EXT,
                 Dsv4Kernels.CACHE_STORE, Dsv4Kernels.COMPRESSED_ATTN, ID_MATVEC, MATVEC), names(ds));
-        List<Dispatch> norms = all(ds, NormKernels.ROW_NORM);
+        List<FakeDispatch> norms = all(ds, NormKernels.ROW_NORM);
         assertEquals(N_HEAD, norms.get(1).intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(HEAD, norms.get(1).intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
         assertEquals(0, norms.get(1).intArg(NormKernels.ARG_ROW_NORM_FLAGS));
         assertEquals(NormKernels.FLAG_HAS_W, norms.get(0).intArg(NormKernels.ARG_ROW_NORM_FLAGS));
-        for (Dispatch rope : all(ds, RopeKernels.ROPE_EXT)) {
+        for (FakeDispatch rope : all(ds, RopeKernels.ROPE_EXT)) {
             assertEquals(HEAD - N_ROT, rope.intArg(ROPE_N_OFFS));
             assertEquals(theta(BASE), rope.floatArg(ROPE_THETA), 0f);
             assertEquals(1f, rope.floatArg(10), 0f);
@@ -698,7 +698,7 @@ public class GpuDsv4MixerTest {
             assertEquals(1f, rope.floatArg(12), 0f);
         }
 
-        Dispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
+        FakeDispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
         assertEquals(Dsv4Kernels.CompMode.NONE.code(), attn.intArg(ATTN_COMP_MODE));
         assertEquals(0, attn.intArg(Dsv4Kernels.ARG_ATTN_N_COMP));
         assertEquals(theta(BASE), attn.floatArg(ATTN_THETA), 0f);
@@ -715,10 +715,10 @@ public class GpuDsv4MixerTest {
         layerTensors(0, 0, false);
         caches(0, 0);
         GpuMixer m = bind(layer(0, 0));
-        List<Dispatch> ds = prefill(m, 0, UBATCH);
+        List<FakeDispatch> ds = prefill(m, 0, UBATCH);
 
-        Dispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
-        Dispatch id = only(ds, ID_MATVEC);
+        FakeDispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
+        FakeDispatch id = only(ds, ID_MATVEC);
         assertEquals(O_LORA, id.intArg(0));
         assertEquals(O_GROUP_DIM, id.intArg(1));
         assertEquals(UBATCH * N_GROUPS, id.intArg(MoeKernels.ARG_ID_N_SEL));
@@ -730,7 +730,7 @@ public class GpuDsv4MixerTest {
         for (int s = 0; s < slots.length; s++) {
             assertEquals(s % N_GROUPS, slots[s]);
         }
-        Dispatch wo = ds.get(ds.size() - 1);
+        FakeDispatch wo = ds.get(ds.size() - 1);
         assertTrue(wo.bufferArgs().contains(id.bufferArg(MoeKernels.ARG_ID_OUTPUT)));
         assertTrue(wo.bufferArgs().contains(weight(0, Dsv4Layout.WO_B).shard(0)));
         assertTrue(wo.bufferArgs().contains(scratch.slot(ScratchSlots.BRANCH).buffer()));
@@ -745,16 +745,16 @@ public class GpuDsv4MixerTest {
         RotationPlan rot = RotationPlan.of(KvDType.Q8_0, KvDType.Q8_0, HEAD, 0, HEAD, 0, true, false);
         caches(0, Dsv4Spec.RATIO_CSA, KvDType.Q8_0, rot);
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_CSA));
-        List<Dispatch> ds = decode(m, 11);
+        List<FakeDispatch> ds = decode(m, 11);
 
         assertEquals(rot.nRotK(), only(ds, Dsv4Kernels.CACHE_STORE).intArg(STORE_ROT));
         assertEquals(rot.nRotK(), only(ds, Dsv4Kernels.COMPRESS).intArg(COMPRESS_ROT));
         assertEquals(KvDType.Q8_0.code(), only(ds, Dsv4Kernels.COMPRESS).intArg(14));
-        Dispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
+        FakeDispatch attn = only(ds, Dsv4Kernels.COMPRESSED_ATTN);
         assertEquals(rot.nRotK(), attn.intArg(ATTN_ROT));
         assertEquals(KvDType.Q8_0.code(), attn.intArg(ATTN_RAW_TYPE));
         assertEquals(KvDType.Q8_0.code(), attn.intArg(ATTN_COMP_TYPE));
-        Dispatch lidUpdate = only(ds, Dsv4Kernels.lidUpdate(KvDType.Q8_0));
+        FakeDispatch lidUpdate = only(ds, Dsv4Kernels.lidUpdate(KvDType.Q8_0));
         assertEquals(Dsv4Layout.lidRotationBlock(IDX_DIM), lidUpdate.intArg(LID_ROT));
         FakeCompressed lid = compressed(0, CompressedKvPlan.Kind.INDEXER);
         assertSame(lid.cache, lidUpdate.bufferArg(LID_CACHE));
@@ -774,7 +774,7 @@ public class GpuDsv4MixerTest {
                 new FakeCompressed(0, CompressedKvPlan.Kind.CSA, KvDType.F32),
                 new FakeCompressed(0, CompressedKvPlan.Kind.INDEXER, KvDType.F16)));
         GpuMixer m = bind(layer(0, Dsv4Spec.RATIO_CSA));
-        List<Dispatch> ds = decode(m, 7);
+        List<FakeDispatch> ds = decode(m, 7);
 
         FakeCompressed lid = compressed(0, CompressedKvPlan.Kind.INDEXER);
         assertSame(lid.cache, only(ds, Dsv4Kernels.lidUpdate(KvDType.F16)).bufferArg(LID_CACHE));
@@ -784,7 +784,7 @@ public class GpuDsv4MixerTest {
     }
 
     /** No LID update or indexer score variant ran. */
-    private static void assertNoIndexerKernels(List<Dispatch> ds) {
+    private static void assertNoIndexerKernels(List<FakeDispatch> ds) {
         for (String n : names(ds)) {
             assertFalse("no LID update variant: " + n, n.startsWith(Dsv4Kernels.LID_UPDATE_PREFIX));
             assertFalse("no indexer score variant: " + n, n.startsWith(SparseKernels.DSA_INDEXER_SCORE_PREFIX));

@@ -1,12 +1,10 @@
 package com.eonmux.neuralfree.server;
 
-import com.eonmux.neuralfree.gguf.chat.ChatMessages;
 import com.eonmux.neuralfree.gguf.chat.ChatRequest;
 import com.eonmux.neuralfree.gguf.engine.ClassifierOutput;
 import com.eonmux.neuralfree.gguf.engine.MediaPrompt;
 import com.eonmux.neuralfree.gguf.engine.lora.LoraSelection;
 import com.eonmux.neuralfree.gguf.engine.lora.LoraSlotKey;
-import com.eonmux.neuralfree.gguf.ops.heads.LateInteraction;
 import com.eonmux.neuralfree.utils.json.JsonView;
 import io.vertx.core.http.HttpServerRequest;
 import jakarta.inject.Inject;
@@ -84,6 +82,9 @@ public class PoolingResource {
     @Inject
     ModelRouter router;
 
+    /** The score and rerank scoring over this resource's service ({@link PoolingScoring}). */
+    final PoolingScoring scoring = new PoolingScoring(this);
+
     /** Test and manual wiring: builds the resource over an explicit service. */
     public PoolingResource(EngineService service) {
         this(service, (ModelRouter) null);
@@ -155,7 +156,7 @@ public class PoolingResource {
         JsonView body = ServerJson.parse(bodyText);
         PoolingResource target = routed(body);
         ServerJson.requireLoaded(target.service);
-        return OpenAiResource.mapped(() -> target.rerankOf(body));
+        return OpenAiResource.mapped(() -> target.scoring.rerankOf(body));
     }
 
     @POST
@@ -200,7 +201,7 @@ public class PoolingResource {
         JsonView body = ServerJson.parse(bodyText);
         PoolingResource target = routed(body);
         ServerJson.requireLoaded(target.service);
-        return OpenAiResource.mapped(() -> target.scoreOf(body));
+        return OpenAiResource.mapped(() -> target.scoring.scoreOf(body));
     }
 
     @POST
@@ -252,13 +253,13 @@ public class PoolingResource {
         removedPoolingTask(body);
         String model = service.loras().model(body);
         LoraSelection lora = service.loras().selection(body, model);
-        if (service.perTokenEmbeddings() && service.sparsePooling() == null
-                && service.poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE) {
+        if (service.pooling().perTokenEmbeddings() && service.pooling().sparsePooling() == null
+                && service.pooling().poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE) {
             throw ServerJson.badRequest("Pooling type 'none' is not OAI compatible. Please use a different pooling"
                     + " type, or the native /embeddings endpoint");
         }
         EmbeddingOptions options = EmbeddingOptions.of(body, service.maxModelLength(),
-                service.sparsePooling() != null);
+                service.pooling().sparsePooling() != null);
         List<PoolingInputs.Input> inputs = PoolingInputs.of(body, service, options);
         Embedded[] embedded = embeddedAll(lora, inputs);
         List<Map<String, Object>> data = new ArrayList<>();
@@ -300,7 +301,7 @@ public class PoolingResource {
         }
         float[][] pooled;
         try {
-            pooled = service.embedAll(lora, batch.toArray(new int[0][]));
+            pooled = service.pooling().embedAll(lora, batch.toArray(new int[0][]));
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
         } catch (IOException e) {
@@ -323,7 +324,7 @@ public class PoolingResource {
         if (input.isMedia()) {
             MediaPrompt prompt = pooledMediaPrompt(input.chat(), ChatPlan.mediaLoras(service, lora));
             try {
-                return new Embedded(service.embedMedia(lora, prompt), prompt.nTokens());
+                return new Embedded(service.pooling().embedMedia(lora, prompt), prompt.nTokens());
             } catch (UnsupportedOperationException e) {
                 throw ServerJson.badRequest(e.getMessage());
             } catch (IOException e) {
@@ -334,9 +335,9 @@ public class PoolingResource {
     }
 
     /** The dual encoder's embedding of one image under {@code lora}, a refusal naming it mapped to a 400. */
-    private float[] image(LoraSelection lora, String reference, String field) {
+    float[] image(LoraSelection lora, String reference, String field) {
         try {
-            return service.embedImage(lora, reference, field);
+            return service.pooling().embedImage(lora, reference, field);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
         }
@@ -361,9 +362,9 @@ public class PoolingResource {
         }
         LoraSelection lora = service.loras().selection(body, service.loras().model(body));
         EmbeddingOptions options = EmbeddingOptions.of(body, service.maxModelLength(),
-                service.sparsePooling() != null);
-        boolean perToken = service.perTokenEmbeddings() && service.sparsePooling() == null
-                && service.poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE;
+                service.pooling().sparsePooling() != null);
+        boolean perToken = service.pooling().perTokenEmbeddings() && service.pooling().sparsePooling() == null
+                && service.pooling().poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE;
         List<int[]> prompts = LlamaPrompts.of(raw, service);
         int[][] truncated = new int[prompts.size()][];
         for (int i = 0; i < prompts.size(); i++) {
@@ -373,9 +374,9 @@ public class PoolingResource {
         float[][][] rows = null;
         try {
             if (perToken) {
-                rows = service.embedTokensAll(lora, truncated);
+                rows = service.pooling().embedTokensAll(lora, truncated);
             } else {
-                pooled = service.embedAll(lora, truncated);
+                pooled = service.pooling().embedAll(lora, truncated);
             }
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
@@ -400,449 +401,6 @@ public class PoolingResource {
         return Response.ok(ServerJson.write(out)).build();
     }
 
-    /**
-     * vLLM's score forms: two sides named {@code queries} + {@code documents}, {@code queries} + {@code items},
-     * {@code data_1} + {@code data_2} or {@code text_1} + {@code text_2}, each a {@link ScoreSides} side. A RANK
-     * classifier scores every text pair (cross-encoder); a per-token embedding model the MaxSim of the two
-     * L2-normalized token-row sets (late interaction); an embedding model answers the cosine similarity of the
-     * pooled vectors (bi-encoder), an image entry embedded by a CLIP dual encoder's vision tower, and a SigLIP dual
-     * encoder its sigmoid score of that cosine ({@link EngineService#biEncoderScore}). One query is scored against
-     * every document; otherwise the sides must have the same length.
-     */
-    private Response scoreOf(JsonView body) {
-        String requestId = poolingRequestFields(body);
-        String model = service.loras().model(body);
-        LoraSelection lora = service.loras().selection(body, model);
-        boolean activation = OpenAiRequests.useActivation(body);
-        ScoringOptions options = ScoringOptions.of(body, service);
-        String[] pair = ScoreSides.scorePair(body);
-        List<ScoreSides.Entry> one = ScoreSides.side(body.raw(pair[0]), pair[0]);
-        List<ScoreSides.Entry> two = ScoreSides.side(body.raw(pair[1]), pair[1]);
-        refuseMediaTruncation(one, two, options);
-        if (one.size() != 1 && one.size() != two.size()) {
-            throw ServerJson.badRequest(pair[0] + " and " + pair[1] + " must have the same length, or "
-                    + pair[0] + " must hold one entry, got " + one.size() + " and " + two.size());
-        }
-        ScoringMode mode = scoringMode("scoring");
-        String instruction = instructionOf(options, mode);
-        int n = one.size() == 1 ? two.size() : one.size();
-        double[] scores = new double[n];
-        long tokens = 0;
-        if (mode == ScoringMode.LATE) {
-            float[][][] queries = sideTokenRows(lora, one.size() == 1 ? List.of(one.get(0)) : one,
-                    options.maxQuery());
-            float[][][] documents = sideTokenRows(lora, two, options.maxDoc());
-            for (int i = 0; i < n; i++) {
-                scores[i] = LateInteraction.maxSim(one.size() == 1 ? queries[0] : queries[i], documents[i]);
-                tokens += sideTokens(one.get(one.size() == 1 ? 0 : i), options.maxQuery())
-                        + sideTokens(two.get(i), options.maxDoc());
-            }
-        } else if (mode == ScoringMode.CROSS) {
-            // the text pairs score as one batched rerank request; a pair with media parts scores alone through
-            // the projector (the batched request takes token inputs only)
-            List<int[]> batch = new ArrayList<>();
-            List<Integer> textAt = new ArrayList<>();
-            List<Integer> mediaAt = new ArrayList<>();
-            for (int i = 0; i < n; i++) {
-                ScoreSides.Entry query = one.get(one.size() == 1 ? 0 : i);
-                ScoreSides.Entry document = two.get(i);
-                if (query.isMedia() || document.isMedia()) {
-                    mediaAt.add(i);
-                } else {
-                    textAt.add(i);
-                    batch.add(crossInput(query, document, options));
-                }
-            }
-            float[] answers = crossScores(lora, batch, activation);
-            for (int b = 0; b < answers.length; b++) {
-                scores[textAt.get(b)] = answers[b];
-                tokens += batch.get(b).length;
-            }
-            for (int i : mediaAt) {
-                PairScore media = mediaCrossScore(lora, one.get(one.size() == 1 ? 0 : i), two.get(i), options,
-                        activation);
-                scores[i] = media.score();
-                tokens += media.tokens();
-            }
-        } else {
-            float[][] queries = sideVectors(lora, one.size() == 1 ? List.of(one.get(0)) : one, options.maxQuery());
-            float[][] documents = sideVectors(lora, two, options.maxDoc());
-            for (int i = 0; i < n; i++) {
-                float[] query = one.size() == 1 ? queries[0] : queries[i];
-                scores[i] = service.biEncoderScore(cosine(query, documents[i]));
-                tokens += sideTokens(one.get(one.size() == 1 ? 0 : i), options.maxQuery())
-                        + sideTokens(two.get(i), options.maxDoc());
-            }
-        }
-        List<Map<String, Object>> data = new ArrayList<>();
-        for (int i = 0; i < n; i++) {
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("index", i);
-            entry.put("object", "score");
-            entry.put("score", scores[i]);
-            data.add(entry);
-        }
-        return listEnvelope("score-", requestId, model, data, tokens);
-    }
-
-    /** The tokens of one text entry after {@code max} truncation (0 keeps all). */
-    private int[] scoreTokens(String text, int max) {
-        int[] ids = service.encode(text, false, false);
-        return max > 0 && ids.length > max ? java.util.Arrays.copyOf(ids, max) : ids;
-    }
-
-    /** The prompt tokens one entry counts: its truncated text tokens, none for an image. */
-    private long sideTokens(ScoreSides.Entry entry, int max) {
-        return entry.isImage() ? 0 : scoreTokens(entry.text(), max).length;
-    }
-
-    /**
-     * The embedding of every entry under {@code lora}, in entry order: the text entries as one batch (the batch
-     * engine runs their prompts in its steps), an image through the dual encoder's vision tower and a media
-     * conversation through the projector, each on its own. A text entry truncates to {@code max} content tokens
-     * first, as vLLM truncates a score side before pooling it.
-     */
-    private float[][] sideVectors(LoraSelection lora, List<ScoreSides.Entry> entries, int max) {
-        float[][] vectors = new float[entries.size()][];
-        List<Integer> textAt = new ArrayList<>();
-        List<int[]> batch = new ArrayList<>();
-        for (int i = 0; i < entries.size(); i++) {
-            ScoreSides.Entry entry = entries.get(i);
-            if (entry.isImage()) {
-                vectors[i] = image(lora, entry.image(), entry.field());
-                continue;
-            }
-            if (entry.isMedia() && !service.dualEncoder()) {
-                vectors[i] = mediaVector(lora, sideChat(entry));
-                continue;
-            }
-            if (entry.isMedia()) {
-                ScoreSides.requireClipForm(entry); // refuses unless the entry is text-only, which pools as text
-            }
-            int[] ids = service.encode(entry.text(), true, true);
-            if (ids.length == 0) {
-                throw ServerJson.badRequest(entry.field() + ": Input content cannot be empty");
-            }
-            textAt.add(i);
-            batch.add(cappedTextTokens(entry.text(), max));
-        }
-        float[][] pooled;
-        try {
-            pooled = service.embedAll(lora, batch.toArray(new int[0][]));
-        } catch (UnsupportedOperationException e) {
-            throw ServerJson.badRequest(e.getMessage());
-        } catch (IOException e) {
-            throw ServerJson.error(500, "the embedding forward failed: " + e.getMessage(), "server_error");
-        }
-        for (int b = 0; b < pooled.length; b++) {
-            vectors[textAt.get(b)] = pooled[b];
-        }
-        return vectors;
-    }
-
-    /**
-     * The prompt tokens of one text: its full tokens with the vocabulary's specials, or, when {@code max} cuts the
-     * content, the first {@code max} content tokens decoded and re-encoded with them.
-     */
-    private int[] cappedTextTokens(String text, int max) {
-        int[] ids = service.encode(text, true, true);
-        if (ids.length == 0) {
-            throw ServerJson.badRequest("Input content cannot be empty");
-        }
-        if (max <= 0) {
-            return ids;
-        }
-        int[] content = service.encode(text, false, false);
-        return content.length <= max ? ids
-                : service.encode(service.tokenizer().decode(java.util.Arrays.copyOf(content, max)), true, true);
-    }
-
-    /** The text of at most {@code max} content tokens: the first tokens kept, decoded when the cap cuts. */
-    private String truncatedText(String text, int max) {
-        if (max <= 0) {
-            return text;
-        }
-        int[] content = service.encode(text, false, false);
-        return content.length <= max ? text : service.tokenizer().decode(java.util.Arrays.copyOf(content, max));
-    }
-
-    /**
-     * The per-token rows of every text entry under {@code lora}, one batched request for the late-interaction
-     * scorer: an image or media entry refuses by name (the scorer reads text only) and a text entry truncates to
-     * {@code max} content tokens first, as vLLM truncates a score side.
-     */
-    private float[][][] sideTokenRows(LoraSelection lora, List<ScoreSides.Entry> entries, int max) {
-        List<int[]> batch = new ArrayList<>();
-        for (ScoreSides.Entry entry : entries) {
-            if (entry.isImage() || entry.isMedia()) {
-                throw ServerJson.badRequest(entry.field() + " holds an image or audio part; the late-interaction"
-                        + " model " + service.architecture() + " reads text only");
-            }
-            batch.add(cappedTextTokens(entry.text(), max));
-        }
-        try {
-            return service.embedTokensAll(lora, batch.toArray(new int[0][]));
-        } catch (UnsupportedOperationException e) {
-            throw ServerJson.badRequest(e.getMessage());
-        } catch (IOException e) {
-            throw ServerJson.error(500, "the embedding forward failed: " + e.getMessage(), "server_error");
-        }
-    }
-
-    /** The pooled vector of one media conversation under {@code lora} ({@link #embeddedOf} over its prompt). */
-    private float[] mediaVector(LoraSelection lora, ChatRequest chat) {
-        return embeddedOf(lora, new PoolingInputs.Input(null, null, chat, "input")).vector();
-    }
-
-    /** A one-message user conversation whose content is the raw parts of {@code entry}. */
-    private ChatRequest sideChat(ScoreSides.Entry entry) {
-        Map<String, Object> chat = new LinkedHashMap<>();
-        List<Object> messages = new ArrayList<>();
-        Map<String, Object> message = new LinkedHashMap<>();
-        message.put("role", "user");
-        message.put("content", entry.content());
-        messages.add(message);
-        chat.put("messages", messages);
-        return OpenAiRequests.chat(JsonView.of(chat, entry.field()), service.options());
-    }
-
-    /** The scorer of a score/rerank request, over the model the service holds. */
-    private enum ScoringMode {
-        /** A RANK or other sequence classifier scores every composed pair (cross-encoder). */
-        CROSS,
-        /** The sides' L2-normalized per-token rows score by MaxSim (late interaction). */
-        LATE,
-        /** The cosine similarity of the two pooled vectors (bi-encoder). */
-        BI
-    }
-
-    /**
-     * The scorer of {@code endpoint}: a RANK classifier without a decision head answers the pairs (cross-encoder), a
-     * per-token embedding model scores its token-row sets by late interaction, a pooled embedding model the cosine
-     * (bi-encoder); the other models refuse by name.
-     */
-    private ScoringMode scoringMode(String endpoint) {
-        if (service.decisionHead()) {
-            throw ServerJson.badRequest(service.architecture() + " is a decision model; " + endpoint
-                    + " needs a sequence classifier or an embedding model");
-        }
-        if (service.perTokenEmbeddings() && service.sparsePooling() == null
-                && service.poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE) {
-            return ScoringMode.LATE;
-        }
-        if (service.sequenceClassifier()) {
-            return ScoringMode.CROSS;
-        }
-        if (service.poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE) {
-            throw ServerJson.badRequest(endpoint + " needs pooled embeddings, a sequence classifier or per-token"
-                    + " embeddings; " + service.architecture() + " (" + service.supportClass() + ", pooling "
-                    + service.poolingKind() + ") stores none of them");
-        }
-        return ScoringMode.BI;
-    }
-
-    /**
-     * The request's task instruction, refused when no score prompt of this model can place it: a bi-encoder and a
-     * late-interaction model read none, and a cross-encoder needs the {@code tokenizer.chat_template.rerank} prompt
-     * to hold an {@code {instruction}} placeholder beside {@code query} and {@code document}.
-     */
-    private String instructionOf(ScoringOptions options, ScoringMode mode) {
-        String instruction = options.instruction();
-        if (instruction == null) {
-            return null;
-        }
-        if (mode == ScoringMode.LATE) {
-            throw ServerJson.badRequest("instruction needs a cross-encoder; the late-interaction model scores by"
-                    + " MaxSim and reads no instruction");
-        }
-        if (mode != ScoringMode.CROSS) {
-            throw ServerJson.badRequest("instruction needs a cross-encoder; the embedding model scores by cosine"
-                    + " and reads no instruction");
-        }
-        String template = service.tokenizer().rerankTemplate();
-        if (template == null) {
-            throw ServerJson.badRequest("instruction needs the model's "
-                    + com.eonmux.neuralfree.gguf.GGUFTokenizer.KEY_RERANK_TEMPLATE + " prompt to place it; "
-                    + service.architecture() + " has none");
-        }
-        if (template.indexOf(com.eonmux.neuralfree.gguf.ops.heads.ClassifierHead.RERANK_INSTRUCTION) < 0) {
-            throw ServerJson.badRequest("instruction has no place in the model's "
-                    + com.eonmux.neuralfree.gguf.GGUFTokenizer.KEY_RERANK_TEMPLATE
-                    + " prompt; it applies through an {instruction} placeholder");
-        }
-        return instruction;
-    }
-
-    /** One cross-encoder score and the tokens of its pair input. */
-    private record PairScore(double score, long tokens) {
-    }
-
-    /**
-     * The cross-encoder input of one text pair: the sides truncate per their caps and compose through the model's
-     * rerank prompt with the instruction ({@link #pairInput}), then the pair truncation cuts; an image entry
-     * refuses by name (a media pair scores alone through the projector, as {@link #mediaCrossScore}).
-     */
-    private int[] crossInput(ScoreSides.Entry query, ScoreSides.Entry document, ScoringOptions options) {
-        for (ScoreSides.Entry entry : new ScoreSides.Entry[]{query, document}) {
-            if (entry.isImage()) {
-                throw ServerJson.badRequest(entry.field() + " holds an image, but the RANK classifier "
-                        + service.architecture() + " reads text only; image scoring needs a CLIP dual encoder");
-            }
-        }
-        int[] input = pairInput(query.text(), document.text(), options);
-        if (input.length == 0) {
-            throw ServerJson.badRequest("Input content cannot be empty");
-        }
-        return input;
-    }
-
-    /**
-     * The cross-encoder score of every text pair input, one batched request over the RANK classifier, the head's
-     * final probability activation applied or skipped per {@code activation} (vLLM's {@code use_activation}).
-     */
-    private float[] crossScores(LoraSelection lora, List<int[]> inputs, boolean activation) {
-        try {
-            return service.rerankScores(lora, inputs.toArray(new int[0][]), activation);
-        } catch (UnsupportedOperationException e) {
-            throw ServerJson.badRequest(e.getMessage());
-        } catch (IOException e) {
-            throw ServerJson.error(500, "the rerank forward failed: " + e.getMessage(), "server_error");
-        }
-    }
-
-    /**
-     * The pair prompt of one text pair: with the model's rerank prompt the side texts truncate first (vLLM cuts
-     * each side before composing) and the prompt fills with query, document and instruction; without one the
-     * truncated token arrays pack with the vocabulary's specials. {@code truncate_prompt_tokens} then cuts the
-     * composed pair.
-     */
-    private int[] pairInput(String query, String document, ScoringOptions options) {
-        int[] input;
-        if (service.tokenizer().rerankTemplate() != null) {
-            input = service.rerankInput(truncatedText(query, options.maxQuery()),
-                    truncatedText(document, options.maxDoc()), options.instruction());
-        } else {
-            input = service.rerankInput(scoreTokens(query, options.maxQuery()),
-                    scoreTokens(document, options.maxDoc()));
-        }
-        return options.truncation().truncated(input);
-    }
-
-    /** The cross-encoder score of one media pair, and the rows its prompt counted. */
-    private PairScore mediaCrossScore(LoraSelection lora, ScoreSides.Entry query, ScoreSides.Entry document,
-                                      ScoringOptions options, boolean activation) {
-        if (options.maxQuery() > 0 || options.maxDoc() > 0) {
-            throw ServerJson.badRequest("max_tokens_per_query and max_tokens_per_doc truncate text entries only;"
-                    + " a media entry keeps its rows");
-        }
-        if (!service.media().enabled()) {
-            ScoreSides.Entry media = query.isMedia() ? query : document;
-            throw ServerJson.badRequest(media.field() + " holds an image or audio part, but the RANK classifier "
-                    + service.architecture() + " reads text only; media scoring needs a media projector ("
-                    + MediaOptions.MMPROJ_PROPERTY + ")");
-        }
-        MediaPrompt pair = rerankMediaPrompt(query, document, options.instruction(),
-                ChatPlan.mediaLoras(service, lora));
-        try {
-            return new PairScore(service.rerankScoreMedia(lora, pair, activation), pair.nTokens());
-        } catch (UnsupportedOperationException e) {
-            throw ServerJson.badRequest(e.getMessage());
-        } catch (IOException e) {
-            throw ServerJson.error(500, "the rerank forward failed: " + e.getMessage(), "server_error");
-        }
-    }
-
-    /**
-     * The media prompt of one query-document pair: the model's rerank prompt fills with the sides' text (each
-     * side's media markers ahead of its text, {@link #inlineText}), the parts load in the prompt's marker order —
-     * the side the template places first contributes its parts first, as jina_vl's processor reverses vLLM's
-     * query-first items for its document-first template — and the model's rerank suffix ids close the prompt.
-     *
-     * @throws jakarta.ws.rs.WebApplicationException 400 when the model carries no rerank prompt, or the rendered
-     *         prompt does not pair its markers with the parts
-     */
-    private MediaPrompt rerankMediaPrompt(ScoreSides.Entry query, ScoreSides.Entry document, String instruction,
-                                          Supplier<LoraSlotKey> mediaLoras) {
-        String template = service.tokenizer().rerankTemplate();
-        if (template == null) {
-            throw ServerJson.badRequest("media scoring needs the model's "
-                    + com.eonmux.neuralfree.gguf.GGUFTokenizer.KEY_RERANK_TEMPLATE
-                    + " prompt to place the query and document markers; " + service.architecture() + " has none");
-        }
-        if (instruction != null) {
-            template = template.replace(com.eonmux.neuralfree.gguf.ops.heads.ClassifierHead.RERANK_INSTRUCTION,
-                    instruction);
-        }
-        boolean documentFirst = template.indexOf("{document}") < template.indexOf("{query}");
-        String rendered = template.replace("{query}", inlineText(query))
-                .replace("{document}", inlineText(document));
-        ScoreSides.Entry first = documentFirst ? document : query;
-        ScoreSides.Entry second = documentFirst ? query : document;
-        List<Object> messages = new ArrayList<>();
-        for (ScoreSides.Entry entry : new ScoreSides.Entry[]{first, second}) {
-            if (entry.content() != null) {
-                Map<String, Object> message = new LinkedHashMap<>();
-                message.put("role", "user");
-                message.put("content", entry.content());
-                messages.add(message);
-            }
-        }
-        Map<String, Object> chat = new LinkedHashMap<>();
-        chat.put("messages", messages);
-        ChatRequest request = OpenAiRequests.chat(JsonView.of(chat, "score sides"), service.options());
-        List<ChatMedia.Item> items = ChatPlan.mediaItems(service, request, mediaLoras);
-        MediaPrompt prompt;
-        try {
-            prompt = service.media().prompt(rendered, items, List.of(), -1, text -> service.encode(text, false, true),
-                    mediaLoras);
-        } catch (IllegalArgumentException e) {
-            throw ServerJson.badRequest(e.getMessage());
-        }
-        int[] suffix = service.tokenizer().rerankSuffix();
-        if (suffix.length == 0) {
-            return prompt;
-        }
-        MediaPrompt.Builder withSuffix = MediaPrompt.builder();
-        prompt.chunks().forEach(withSuffix::add);
-        return withSuffix.appendText(suffix).build();
-    }
-
-    /**
-     * One side's text as the pair prompt reads it, as vLLM's score content parser builds it: the string itself, or a
-     * media marker per image or audio part (placed first, with no separator) followed by the text parts joined with
-     * newlines.
-     */
-    private static String inlineText(ScoreSides.Entry entry) {
-        if (entry.content() == null) {
-            return entry.text();
-        }
-        StringBuilder out = new StringBuilder();
-        for (Object raw : entry.content()) {
-            if (raw instanceof Map<?, ?> part && isMediaPart(part.get("type"))) {
-                out.append(ChatMessages.MEDIA_MARKER);
-            }
-        }
-        return out.append(entry.text()).toString();
-    }
-
-    private static boolean isMediaPart(Object type) {
-        return ChatMessages.PART_IMAGE.equals(type) || ChatMessages.PART_AUDIO.equals(type)
-                || ChatMessages.PART_AUDIO_URL.equals(type);
-    }
-
-    /** The cosine similarity of two vectors, 0 when either is zero. */
-    private static double cosine(float[] a, float[] b) {
-        double dot = 0;
-        double normA = 0;
-        double normB = 0;
-        for (int i = 0; i < Math.min(a.length, b.length); i++) {
-            dot += (double) a[i] * b[i];
-            normA += (double) a[i] * a[i];
-            normB += (double) b[i] * b[i];
-        }
-        double norm = Math.sqrt(normA) * Math.sqrt(normB);
-        return norm == 0 ? 0 : dot / norm;
-    }
 
     /** vLLM's classification endpoint: one sequence classifier output per input, as probabilities. */
     private Response classifyOf(JsonView body) {
@@ -897,7 +455,7 @@ public class PoolingResource {
      */
     private ClassifierOutput[] classifyBatch(LoraSelection lora, int[][] inputs, boolean activation) {
         try {
-            return service.classifyOutputsAll(lora, inputs, activation);
+            return service.pooling().classifyOutputsAll(lora, inputs, activation);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
         } catch (IOException e) {
@@ -907,19 +465,19 @@ public class PoolingResource {
 
     /** True when a sequence classifier without a decision head answers {@code /classify}. */
     private void requireSequenceClassifier() {
-        if (service.decisionHead()) {
+        if (service.pooling().decisionHead()) {
             throw ServerJson.badRequest(service.architecture() + " is a decision model; its decision scores come"
                     + " from /pooling task classify");
         }
-        if (service.sequenceClassifier()) {
+        if (service.pooling().sequenceClassifier()) {
             return;
         }
-        if (service.tokenClassifier()) {
+        if (service.pooling().tokenClassifier()) {
             throw ServerJson.badRequest("classification needs a pooled classifier; " + service.architecture()
                     + " classifies per token (task token_classify)");
         }
         throw ServerJson.badRequest("classification needs a RANK classifier or another sequence classifier; "
-                + service.architecture() + " pools by " + service.poolingKind() + " and stores no classifier head");
+                + service.architecture() + " pools by " + service.pooling().poolingKind() + " and stores no classifier head");
     }
 
     /**
@@ -936,8 +494,8 @@ public class PoolingResource {
         }
         String task = poolingTask(body);
         EmbeddingOptions options = EmbeddingOptions.of(body, service.maxModelLength(),
-                service.sparsePooling() != null);
-        if (service.sparsePooling() != null && task.equals("embed") && options.base64()) {
+                service.pooling().sparsePooling() != null);
+        if (service.pooling().sparsePooling() != null && task.equals("embed") && options.base64()) {
             throw ServerJson.badRequest("encoding_format base64 does not apply to a sparse embedding; the"
                     + " token_classify-sparse response is a {token_id: weight} object");
         }
@@ -965,7 +523,7 @@ public class PoolingResource {
             tokenRows = filter == null ? rows : StepFilter.apply(rows, batch, filter);
         } else if (task.equals("classify")) {
             int[][] batch = textTokens(inputs);
-            if (service.decisionHead()) {
+            if (service.pooling().decisionHead()) {
                 scores = classifyScoresBatch(lora, batch);
             } else {
                 outputs = classifyBatch(lora, batch);
@@ -975,16 +533,16 @@ public class PoolingResource {
         for (int i = 0; i < inputs.size(); i++) {
             Object value;
             switch (task) {
-                case "embed" -> value = service.sparsePooling() != null
+                case "embed" -> value = service.pooling().sparsePooling() != null
                         ? sparseVocabulary(embedded[i].vector())
                         : options.encoded(options.shaped(embedded[i].vector()));
                 case "embed&token_classify" ->
                         value = options.encoded(combinedVector(embedded[i].vector(), tokenRows[i]));
                 case "token_classify" ->
-                        value = tokenClassifyData(service.tokenScoreProjection(), inputs.get(i).tokens(),
+                        value = tokenClassifyData(service.pooling().tokenScoreProjection(), inputs.get(i).tokens(),
                                 tokenRows[i], options);
                 case "token_embed" -> value = tokenEmbeddingData(tokenRows[i], options);
-                default -> value = options.encoded(service.decisionHead() ? scores[i] : classScores(outputs[i]));
+                default -> value = options.encoded(service.pooling().decisionHead() ? scores[i] : classScores(outputs[i]));
             }
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("index", i);
@@ -1009,7 +567,7 @@ public class PoolingResource {
     /** Per-token classifier rows of every input, one batched request. */
     private float[][][] tokenClassifyRows(LoraSelection lora, int[][] inputs) {
         try {
-            return service.tokenClassifyAll(lora, inputs);
+            return service.pooling().tokenClassifyAll(lora, inputs);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
         } catch (IOException e) {
@@ -1032,8 +590,8 @@ public class PoolingResource {
             boolean byIds = body.raw("returned_token_ids") != null;
             // vLLM merges the pooler config's step_tag_id into a request that omits it (PoolingParams
             // ._merge_default_parameters), so a bare token_classify on the process-reward model filters by it
-            boolean byDefault = !byTag && "token_classify".equals(task) && service.tokenClassifier()
-                    && service.defaultStepTagId() >= 0;
+            boolean byDefault = !byTag && "token_classify".equals(task) && service.pooling().tokenClassifier()
+                    && service.pooling().defaultStepTagId() >= 0;
             if (!byTag && !byIds && !byDefault) {
                 return null;
             }
@@ -1041,22 +599,22 @@ public class PoolingResource {
                 throw ServerJson.badRequest((byTag ? "step_tag_id" : "returned_token_ids")
                         + " applies only to the token_classify task, not '" + task + "'");
             }
-            if (service.sparsePooling() != null) {
+            if (service.pooling().sparsePooling() != null) {
                 throw ServerJson.badRequest("step_tag_id and returned_token_ids apply to the token_classify task;"
                         + " a sparse model reduces its classifier scores into the embed output and offers no"
                         + " per-token rows to filter");
             }
-            if (!service.tokenClassifier()) {
+            if (!service.pooling().tokenClassifier()) {
                 throw ServerJson.badRequest("step_tag_id and returned_token_ids apply to the token_classify task"
                         + " over a per-token classifier (vLLM's STEP token pooling); " + service.architecture()
-                        + " (" + service.supportClass() + ", pooling " + service.poolingKind() + ") is not one");
+                        + " (" + service.pooling().supportClass() + ", pooling " + service.pooling().poolingKind() + ") is not one");
             }
             if (byTag && body.optI32("step_tag_id", -1) < 0) {
                 throw ServerJson.badRequest("step_tag_id must be a token id, got " + body.optI32("step_tag_id", -1));
             }
             int[] returnedIds = byIds ? OpenAiRequests.tokens(listField(body, "returned_token_ids"),
                     Integer.MAX_VALUE, "returned_token_ids") : null;
-            int stepTagId = byTag ? body.optI32("step_tag_id", -1) : service.defaultStepTagId();
+            int stepTagId = byTag ? body.optI32("step_tag_id", -1) : service.pooling().defaultStepTagId();
             return new StepFilter(stepTagId, byTag || byDefault, returnedIds);
         }
 
@@ -1108,7 +666,7 @@ public class PoolingResource {
     /** Per-token embeddings of every input, one batched request. */
     private float[][][] embedTokenRows(LoraSelection lora, int[][] inputs) {
         try {
-            return service.embedTokensAll(lora, inputs);
+            return service.pooling().embedTokensAll(lora, inputs);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
         } catch (IOException e) {
@@ -1119,7 +677,7 @@ public class PoolingResource {
     /** The decision scores of every input, one batched request. */
     private float[][] classifyScoresBatch(LoraSelection lora, int[][] inputs) {
         try {
-            return service.classifyScoresAll(lora, inputs);
+            return service.pooling().classifyScoresAll(lora, inputs);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
         } catch (IOException e) {
@@ -1131,18 +689,18 @@ public class PoolingResource {
     private String poolingTask(JsonView body) {
         String asked = body.optStr("task", null);
         removedPoolingTask(body);
-        boolean classify = service.decisionHead() || service.sequenceClassifier();
-        boolean tokenClassify = service.tokenClassifier();
-        boolean tokenClassifyTask = service.canTokenClassify();
-        boolean perToken = service.perTokenEmbeddings();
-        boolean sparse = service.sparsePooling() != null;
+        boolean classify = service.pooling().decisionHead() || service.pooling().sequenceClassifier();
+        boolean tokenClassify = service.pooling().tokenClassifier();
+        boolean tokenClassifyTask = service.pooling().canTokenClassify();
+        boolean perToken = service.pooling().perTokenEmbeddings();
+        boolean sparse = service.pooling().sparsePooling() != null;
         if (asked == null) {
             // a sparse model answers as the embed output (vLLM's SPLADESparsePooler), its classifier scores
             // reducing into one vector per input; a multi-output model's default is its pooled dense embedding
             if (sparse) {
                 return "embed";
             }
-            if (service.tokenEmbeddingProjection() || service.tokenScoreProjection()) {
+            if (service.pooling().tokenEmbeddingProjection() || service.pooling().tokenScoreProjection()) {
                 return "embed";
             }
             return classify ? "classify" : tokenClassify ? "token_classify" : perToken ? "token_embed" : "embed";
@@ -1152,50 +710,50 @@ public class PoolingResource {
                 if (sparse) {
                     return "embed";
                 }
-                if (classify || tokenClassifyTask && !service.tokenScoreProjection()) {
+                if (classify || tokenClassifyTask && !service.pooling().tokenScoreProjection()) {
                     throw ServerJson.badRequest("task 'embed' needs an embedding model; " + service.architecture()
-                            + " pools by " + service.poolingKind()
+                            + " pools by " + service.pooling().poolingKind()
                             + (tokenClassify ? " and classifies per token" : " and classifies"));
                 }
-                if (perToken && !service.tokenEmbeddingProjection()) {
+                if (perToken && !service.pooling().tokenEmbeddingProjection()) {
                     throw ServerJson.badRequest("task 'embed' needs a pooled embedding; " + service.architecture()
                             + " pools per token (none)");
                 }
                 return "embed";
             case "token_embed":
-                if (!perToken && !service.tokenEmbeddingProjection()) {
+                if (!perToken && !service.pooling().tokenEmbeddingProjection()) {
                     throw ServerJson.badRequest("task 'token_embed' needs per-token embeddings (none pooling and no"
-                            + " classifier); " + service.architecture() + " (" + service.supportClass()
-                            + ", pooling " + service.poolingKind() + ") has none");
+                            + " classifier); " + service.architecture() + " (" + service.pooling().supportClass()
+                            + ", pooling " + service.pooling().poolingKind() + ") has none");
                 }
                 return "token_embed";
             case "token_classify":
                 if (sparse) {
                     throw ServerJson.badRequest("task 'token_classify' scores a sparse model's classifier into the"
                             + " embed output; " + service.architecture() + " ("
-                            + service.supportClass() + ", sparse " + service.sparsePooling()
+                            + service.pooling().supportClass() + ", sparse " + service.pooling().sparsePooling()
                             + ") offers no per-token rows");
                 }
                 if (!tokenClassifyTask) {
                     throw ServerJson.badRequest("task 'token_classify' needs a classifier head; "
-                            + service.architecture() + " (" + service.supportClass() + ", pooling "
-                            + service.poolingKind() + ") stores none");
+                            + service.architecture() + " (" + service.pooling().supportClass() + ", pooling "
+                            + service.pooling().poolingKind() + ") stores none");
                 }
                 return "token_classify";
             case "classify":
                 if (!classify) {
                     throw ServerJson.badRequest("task 'classify' needs a RANK classifier, another sequence"
                             + " classifier or a decision head; " + service.architecture() + " pools by "
-                            + service.poolingKind()
+                            + service.pooling().poolingKind()
                             + (tokenClassify ? " and classifies per token; use token_classify" : ""));
                 }
                 return "classify";
             case "embed&token_classify":
-                if (!service.tokenScoreProjection() || service.poolingKind() == com.eonmux.neuralfree.gguf.arch
+                if (!service.pooling().tokenScoreProjection() || service.pooling().poolingKind() == com.eonmux.neuralfree.gguf.arch
                         .PoolingKind.NONE) {
                     throw ServerJson.badRequest("task 'embed&token_classify' needs a model with both a dense embedding"
                             + " and a per-token sparse classifier (vLLM's Bge-M3 dispatch); " + service.architecture()
-                            + " (" + service.supportClass() + ", pooling " + service.poolingKind() + ") offers "
+                            + " (" + service.pooling().supportClass() + ", pooling " + service.pooling().poolingKind() + ") offers "
                             + (sparse ? "only the sparse embedding"
                             : tokenClassify ? "only the per-token classifier" : "neither"));
                 }
@@ -1203,7 +761,7 @@ public class PoolingResource {
             default:
                 throw ServerJson.badRequest("Unsupported task: '" + asked + "'. Supported tasks: [embed, classify,"
                         + " token_classify, token_embed"
-                        + (service.tokenScoreProjection() ? ", embed&token_classify" : "") + "]");
+                        + (service.pooling().tokenScoreProjection() ? ", embed&token_classify" : "") + "]");
         }
     }
 
@@ -1247,10 +805,10 @@ public class PoolingResource {
     private Map<String, Object> sparseWeights(int[] tokens, float[][] rows) {
         int from = 0;
         int to = tokens.length;
-        if (to > from && service.tokenBoundaryBos() >= 0 && tokens[0] == service.tokenBoundaryBos()) {
+        if (to > from && service.pooling().tokenBoundaryBos() >= 0 && tokens[0] == service.pooling().tokenBoundaryBos()) {
             from++;
         }
-        if (to > from && service.tokenBoundaryEos() >= 0 && tokens[to - 1] == service.tokenBoundaryEos()) {
+        if (to > from && service.pooling().tokenBoundaryEos() >= 0 && tokens[to - 1] == service.pooling().tokenBoundaryEos()) {
             to--;
         }
         if (to - from != rows.length) {
@@ -1298,9 +856,9 @@ public class PoolingResource {
     private Response generativeScoringOf(JsonView body) {
         String model = service.loras().model(body);
         LoraSelection lora = service.loras().selection(body, model);
-        if (service.supportClass() != com.eonmux.neuralfree.gguf.arch.SupportClass.GEN) {
+        if (service.pooling().supportClass() != com.eonmux.neuralfree.gguf.arch.SupportClass.GEN) {
             throw ServerJson.badRequest("generative scoring needs a generative model; " + service.architecture()
-                    + " is a " + service.supportClass() + " model");
+                    + " is a " + service.pooling().supportClass() + " model");
         }
         int[] query = generativeSide(body.raw("query"), "query", body.optBool("add_special_tokens", true));
         if (!(body.raw("items") instanceof List<?> items) || items.isEmpty()) {
@@ -1321,7 +879,7 @@ public class PoolingResource {
             int[] prompt = join(itemFirst ? item : query, itemFirst ? query : item, cap);
             float[] logits;
             try {
-                logits = service.nextLogits(lora, prompt);
+                logits = service.pooling().nextLogits(lora, prompt);
             } catch (UnsupportedOperationException e) {
                 throw ServerJson.badRequest(e.getMessage());
             } catch (IOException e) {
@@ -1407,7 +965,7 @@ public class PoolingResource {
      * vLLM's list envelope: id, object, created, model, data and the prompt-token usage. The id carries the
      * request's {@code request_id} when it names one, as vLLM echoes it.
      */
-    private Response listEnvelope(String idPrefix, String requestId, String model, List<Map<String, Object>> data,
+    Response listEnvelope(String idPrefix, String requestId, String model, List<Map<String, Object>> data,
                                    long tokens) {
         Map<String, Object> usage = new LinkedHashMap<>();
         usage.put("prompt_tokens", tokens);
@@ -1429,7 +987,7 @@ public class PoolingResource {
      * {@code mm_processor_kwargs}, whose engine effects this server does not run. Returns the request's response
      * id: the {@code X-Request-Id} header first, then the body {@code request_id}, as vLLM names it.
      */
-    private String poolingRequestFields(JsonView body) {
+    String poolingRequestFields(JsonView body) {
         String refusal = service.schedulingPolicy().priorityRefusal(OpenAiRequests.priority(body));
         if (refusal != null) {
             throw ServerJson.badRequest(refusal);
@@ -1472,7 +1030,7 @@ public class PoolingResource {
     /** The per-input pooled vector of one text input under {@code lora}, a refusal or failure mapped to a response. */
     private float[] pooled(LoraSelection lora, int[] ids) {
         try {
-            return service.embed(lora, ids);
+            return service.pooling().embed(lora, ids);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.badRequest(e.getMessage());
         } catch (IOException e) {
@@ -1480,133 +1038,6 @@ public class PoolingResource {
         }
     }
 
-    /**
-     * vLLM's rerank: the {@code query} and every document are {@link ScoreSides} entries (a string, an object with
-     * a {@code content} array, or a Cohere {@code {"text": ...}} document); a RANK classifier scores each text pair
-     * (cross-encoder), a per-token embedding model the MaxSim of the two token-row sets (late interaction), a
-     * pooled embedding model the cosine similarity of the two embeddings (bi-encoder, a CLIP dual
-     * encoder's image entries included; a SigLIP dual encoder's sigmoid score of it). The results come best first, {@code top_n} of them, each with its
-     * document when {@code return_documents} is set: {@code {"text"}} or vLLM's {@code {"multi_modal"}} parts.
-     */
-    private Response rerankOf(JsonView body) {
-        String requestId = poolingRequestFields(body);
-        String model = service.loras().model(body);
-        LoraSelection lora = service.loras().selection(body, model);
-        boolean activation = OpenAiRequests.useActivation(body);
-        if (body.raw("query") == null) {
-            throw ServerJson.badRequest("query is required");
-        }
-        ScoreSides.Entry query = ScoreSides.entry(body.raw("query"), "query");
-        if (query == null) {
-            throw ServerJson.badRequest("query must be a string or an object with a content array");
-        }
-        Object rawDocuments = body.raw("documents");
-        if (rawDocuments == null) {
-            throw ServerJson.badRequest("documents is required and must be an array");
-        }
-        List<ScoreSides.Entry> documents = ScoreSides.side(rawDocuments, "documents");
-        int topN = topN(body, documents.size());
-        boolean returnText = body.optBool("return_documents", false);
-        ScoringOptions options = ScoringOptions.of(body, service);
-        refuseMediaTruncation(List.of(query), documents, options);
-        ScoringMode mode = scoringMode("rerank");
-        String instruction = instructionOf(options, mode);
-        double[] scoredScores = new double[documents.size()];
-        long tokens = 0;
-        if (mode == ScoringMode.LATE) {
-            float[][] queryRows = sideTokenRows(lora, List.of(query), options.maxQuery())[0];
-            float[][][] documentRows = sideTokenRows(lora, documents, options.maxDoc());
-            for (int i = 0; i < documents.size(); i++) {
-                tokens += sideTokens(query, options.maxQuery()) + sideTokens(documents.get(i), options.maxDoc());
-                scoredScores[i] = LateInteraction.maxSim(queryRows, documentRows[i]);
-            }
-        } else if (mode == ScoringMode.CROSS) {
-            // the text pairs score as one batched rerank request; a pair with media parts scores alone through
-            // the projector (the batched request takes token inputs only)
-            List<int[]> batch = new ArrayList<>();
-            List<Integer> textAt = new ArrayList<>();
-            List<Integer> mediaAt = new ArrayList<>();
-            for (int i = 0; i < documents.size(); i++) {
-                ScoreSides.Entry document = documents.get(i);
-                if (query.isMedia() || document.isMedia()) {
-                    mediaAt.add(i);
-                } else {
-                    batch.add(crossInput(query, document, options));
-                    textAt.add(i);
-                }
-            }
-            float[] answers = crossScores(lora, batch, activation);
-            for (int b = 0; b < answers.length; b++) {
-                scoredScores[textAt.get(b)] = answers[b];
-                tokens += batch.get(b).length;
-            }
-            for (int i : mediaAt) {
-                PairScore pair = mediaCrossScore(lora, query, documents.get(i), options, activation);
-                scoredScores[i] = pair.score();
-                tokens += pair.tokens();
-            }
-        } else {
-            float[] queryVector = sideVectors(lora, List.of(query), options.maxQuery())[0];
-            float[][] documentVectors = sideVectors(lora, documents, options.maxDoc());
-            for (int i = 0; i < documents.size(); i++) {
-                tokens += sideTokens(query, options.maxQuery()) + sideTokens(documents.get(i), options.maxDoc());
-                scoredScores[i] = service.biEncoderScore(cosine(queryVector, documentVectors[i]));
-            }
-        }
-        List<double[]> scored = new ArrayList<>();
-        for (int i = 0; i < documents.size(); i++) {
-            scored.add(new double[]{scoredScores[i], i});
-        }
-        scored.sort((a, b) -> Double.compare(b[0], a[0]));
-        List<Map<String, Object>> results = new ArrayList<>();
-        for (int r = 0; r < Math.min(topN, scored.size()); r++) {
-            int index = (int) scored.get(r)[1];
-            Map<String, Object> result = new LinkedHashMap<>();
-            result.put("index", index);
-            result.put("relevance_score", scored.get(r)[0]);
-            if (returnText) {
-                ScoreSides.Entry document = documents.get(index);
-                result.put("document", document.content() == null ? Map.of("text", document.text())
-                        : Map.of("multi_modal", document.content()));
-            }
-            results.add(result);
-        }
-        Map<String, Object> usage = new LinkedHashMap<>();
-        usage.put("prompt_tokens", tokens);
-        usage.put("total_tokens", tokens);
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("id", "rerank-" + (requestId != null ? requestId : Long.toString(System.nanoTime())));
-        out.put("model", model);
-        out.put("results", results);
-        out.put("usage", usage);
-        return Response.ok(ServerJson.write(out)).build();
-    }
 
-    /** vLLM's {@code top_n}: 0 serves every document; a negative value refuses by name. */
-    private static int topN(JsonView body, int count) {
-        int n = body.optI32("top_n", 0);
-        if (n < 0) {
-            throw ServerJson.badRequest("top_n must be 0 (every document) or positive, got " + n);
-        }
-        return n == 0 ? count : n;
-    }
 
-    /**
-     * Media sides keep their rows, so the pair truncation refuses beside them, as the media pooling path refuses
-     * it; a text-only pair cuts.
-     */
-    private static void refuseMediaTruncation(List<ScoreSides.Entry> one, List<ScoreSides.Entry> two,
-                                              ScoringOptions options) {
-        if (options.truncation().truncate() == 0) {
-            return;
-        }
-        for (List<ScoreSides.Entry> side : List.of(one, two)) {
-            for (ScoreSides.Entry entry : side) {
-                if (entry.isMedia()) {
-                    throw ServerJson.badRequest(entry.field() + " holds an image or audio part, but"
-                            + " truncate_prompt_tokens cuts text tokens only");
-                }
-            }
-        }
-    }
 }

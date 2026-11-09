@@ -8,6 +8,8 @@ import com.eonmux.neuralfree.gguf.engine.WeightUpdater;
 import com.eonmux.neuralfree.gguf.quant.RowQuantizers;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -199,8 +201,8 @@ public class GpuWeightUpdaterTest {
         GpuWeightUploader up = openUploadedListing();
         int opsBefore = backend.ops().size();
         up.updateTensor("blk.0.attn_norm.weight", GGMLType.F32, new long[]{COLS}, le(fill(COLS, 2f)));
-        List<FakeComputeBackend.Op> ops = backend.ops();
-        assertEquals("the last op is the finish", FakeComputeBackend.OpKind.FINISH, ops.get(ops.size() - 1).kind());
+        List<FakeOp> ops = backend.ops();
+        assertEquals("the last op is the finish", FakeOpKind.FINISH, ops.get(ops.size() - 1).kind());
         assertTrue(ops.size() > opsBefore);
         assertArrayEquals(fill(COLS, 2f), buffer(up, "blk.0.attn_norm.weight").getFloats(0, COLS), 0f);
     }

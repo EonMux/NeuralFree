@@ -88,7 +88,7 @@ public class PoolingTokenClassifyTest {
 
     @Test
     void tokenClassifierScoresEveryToken() {
-        assertTrue(tokenClassifier.tokenClassifier());
+        assertTrue(tokenClassifier.pooling().tokenClassifier());
         JsonView body = ok(token.pooling("{\"input\": \"hello\", \"task\": \"token_classify\"}"));
         assertEquals(1, size(body, "data"));
         List<?> rows = (List<?>) at(body, "data", 0).raw("data");
@@ -124,7 +124,7 @@ public class PoolingTokenClassifyTest {
 
     @Test
     void rewardModelScoresOneValuePerToken() {
-        assertTrue(reward.tokenClassifier());
+        assertTrue(reward.pooling().tokenClassifier());
         JsonView body = ok(scored.pooling("{\"input\": [\"hello\", \"goodbye\"]}"));
         assertEquals(2, size(body, "data"));
         for (int i = 0; i < 2; i++) {
@@ -143,7 +143,7 @@ public class PoolingTokenClassifyTest {
 
     @Test
     void processRewardScoresAStepRowPerToken() {
-        assertTrue(process.tokenClassifier());
+        assertTrue(process.pooling().tokenClassifier());
         JsonView body = ok(steps.pooling("{\"input\": \"hello\", \"task\": \"token_classify\"}"));
         List<?> rows = (List<?>) at(body, "data", 0).raw("data");
         assertTrue(rows.size() >= 1, "one row per token");
@@ -157,7 +157,7 @@ public class PoolingTokenClassifyTest {
 
     @Test
     void oneOutputSequenceClassifierReturnsTheRawScore() {
-        assertTrue(oneOutput.sequenceClassifier());
+        assertTrue(oneOutput.pooling().sequenceClassifier());
         JsonView classified = ok(single.classify("{\"input\": \"hello\"}"));
         JsonView entry = at(classified, "data", 0);
         assertEquals(1, entry.i64("num_classes"));
@@ -171,7 +171,7 @@ public class PoolingTokenClassifyTest {
 
     @Test
     void sequenceClassifierAnswersClassifyAndScoresPairs() {
-        assertTrue(sequence.sequenceClassifier());
+        assertTrue(sequence.pooling().sequenceClassifier());
         JsonView body = ok(pooled.pooling("{\"input\": [2, 4, 5]}"));
         assertEquals(2, listSize(at(body, "data", 0).raw("data")), "one score per label");
         JsonView classified = ok(pooled.classify("{\"input\": \"hello\"}"));

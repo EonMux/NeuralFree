@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlot;
 import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -76,7 +77,7 @@ public class DeviceObserversTest {
         assertTrue(lines[1], lines[1].contains("device=opencl1 'Intel' layer-1"));
         assertTrue(lines[1], lines[1].contains("head=[5.00000, 6.00000"));
         assertTrue("each device's stage is read on its own queue",
-                two.ops().stream().anyMatch(op -> op.kind() == FakeComputeBackend.OpKind.READ));
+                two.ops().stream().anyMatch(op -> op.kind() == FakeOpKind.READ));
 
         GpuDiagnostics unnamed = new GpuDiagnostics(one.computeQueue(), cfg, out);
         assertEquals(null, unnamed.device());
@@ -116,7 +117,7 @@ public class DeviceObserversTest {
         assertTrue(text, text.contains("on gpu-a (layers 0-1):"));
         assertTrue(text, text.contains("on gpu-b (layers 2):"));
         assertTrue("every boundary synchronizes every device's queue",
-                two.ops().stream().anyMatch(op -> op.kind() == FakeComputeBackend.OpKind.FINISH));
+                two.ops().stream().anyMatch(op -> op.kind() == FakeOpKind.FINISH));
 
         profiler.reset();
         assertTrue(profiler.report().devicePhases().isEmpty());

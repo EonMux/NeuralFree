@@ -33,7 +33,7 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -123,16 +123,16 @@ public class GpuAltUpExtraTest {
         int rowLocal = Gemma3nKernels.rowLocal(ops.local());
 
         for (int t : new int[]{1, 5}) {
-            List<Dispatch> ds = run(() -> altup.beforeBlock(0, t, x));
+            List<FakeDispatch> ds = run(() -> altup.beforeBlock(0, t, x));
             assertEquals(Arrays.asList(GpuOps.ROW_NORM, Gemma3nKernels.MAGNITUDE_MATCH, GpuOps.ROW_NORM,
                     Gemma3nKernels.ALTUP_PREDICT), landmarks(ds));
 
-            Dispatch pliNorm = ds.get(index(ds, GpuOps.ROW_NORM));
+            FakeDispatch pliNorm = ds.get(index(ds, GpuOps.ROW_NORM));
             assertEquals(t * N_LAYER, pliNorm.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
             assertEquals(WIDTH, pliNorm.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
             assertSame(inputs.buffer(), pliNorm.bufferArg(NormKernels.ARG_ROW_NORM_Y));
 
-            Dispatch mag = only(ds, Gemma3nKernels.MAGNITUDE_MATCH);
+            FakeDispatch mag = only(ds, Gemma3nKernels.MAGNITUDE_MATCH);
             assertTrue(mag.isPreBound());
             assertEquals(t, mag.intArg(Gemma3nKernels.ARG_N_TOKENS));
             assertEquals(N_ALTUP - 1, mag.intArg(2));
@@ -142,12 +142,12 @@ public class GpuAltUpExtraTest {
             assertEquals(streams.offset() + stride, mag.intArg(5));
             assertEquals(Gemma3nKernels.rowGlobal((long) (N_ALTUP - 1) * t, rowLocal)[0], mag.global()[0]);
 
-            Dispatch routerNorm = ds.get(lastIndex(ds, GpuOps.ROW_NORM));
+            FakeDispatch routerNorm = ds.get(lastIndex(ds, GpuOps.ROW_NORM));
             assertSame(streams.buffer(), routerNorm.bufferArg(NormKernels.ARG_ROW_NORM_X));
             assertEquals(streams.offset() + ACT * stride, routerNorm.intArg(NormKernels.ARG_ROW_NORM_X_OFF));
             assertEquals(t, routerNorm.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
 
-            Dispatch predict = only(ds, Gemma3nKernels.ALTUP_PREDICT);
+            FakeDispatch predict = only(ds, Gemma3nKernels.ALTUP_PREDICT);
             assertTrue(predict.isPreBound());
             assertEquals(t, predict.intArg(Gemma3nKernels.ARG_N_TOKENS));
             assertEquals(N_ALTUP, predict.intArg(2));
@@ -156,7 +156,7 @@ public class GpuAltUpExtraTest {
             assertSame(streams.buffer(), predict.bufferArg(9));
             assertEquals(Gemma3nKernels.elementwiseGlobal(t, N_EMBD, ops.local())[0], predict.global()[0]);
 
-            Dispatch last = ds.get(ds.size() - 1);
+            FakeDispatch last = ds.get(ds.size() - 1);
             assertEquals(GpuOps.COPY2D, last.kernelName());
             assertSame(x.buffer(), last.bufferArg(last.argCount() - 1));
         }
@@ -173,20 +173,20 @@ public class GpuAltUpExtraTest {
 
         for (int t : new int[]{1, 5}) {
             boolean[] consumed = new boolean[1];
-            List<Dispatch> ds = run(() -> consumed[0] = laurel.afterMixer(0, t, x, branch));
+            List<FakeDispatch> ds = run(() -> consumed[0] = laurel.afterMixer(0, t, x, branch));
             assertTrue(consumed[0]);
             assertEquals(Arrays.asList(GpuOps.ROW_NORM), landmarks(ds));
-            Dispatch first = ds.get(0);
+            FakeDispatch first = ds.get(0);
             assertTrue("the laurel_l projection reads the attn_norm output",
                     first.bufferArgs().contains(normed.buffer()));
-            Dispatch norm = only(ds, GpuOps.ROW_NORM);
+            FakeDispatch norm = only(ds, GpuOps.ROW_NORM);
             assertEquals(t, norm.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
             assertEquals(N_EMBD, norm.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
-            Dispatch scale = ds.get(ds.size() - 1);
+            FakeDispatch scale = ds.get(ds.size() - 1);
             assertEquals(GpuOps.AXPBY, scale.kernelName());
             assertSame(x.buffer(), scale.bufferArg(scale.argCount() - 1));
             int axpby = 0;
-            for (Dispatch d : ds) {
+            for (FakeDispatch d : ds) {
                 if (GpuOps.AXPBY.equals(d.kernelName())) {
                     axpby++;
                 }
@@ -208,10 +208,10 @@ public class GpuAltUpExtraTest {
         int stride = UBATCH * N_EMBD;
 
         for (int t : new int[]{1, 5}) {
-            List<Dispatch> mid = run(() -> first.afterBlock(0, t, x));
+            List<FakeDispatch> mid = run(() -> first.afterBlock(0, t, x));
             assertEquals(Arrays.asList(GpuOps.ROW_NORM, Gemma3nKernels.ALTUP_CORRECT, NormKernels.MUL_ROW_SCALE,
                     GpuOps.GLU, GpuOps.ROW_NORM), landmarks(mid));
-            Dispatch correct = only(mid, Gemma3nKernels.ALTUP_CORRECT);
+            FakeDispatch correct = only(mid, Gemma3nKernels.ALTUP_CORRECT);
             assertTrue(correct.isPreBound());
             assertEquals(t, correct.intArg(Gemma3nKernels.ARG_N_TOKENS));
             assertEquals(ACT, correct.intArg(3));
@@ -220,28 +220,28 @@ public class GpuAltUpExtraTest {
             assertSame(streams.buffer(), correct.bufferArg(12));
             assertTrue("altup_correct_scale scales the active stream before per_layer_inp_gate",
                     index(mid, NormKernels.MUL_ROW_SCALE) < index(mid, GpuOps.GLU));
-            Dispatch scale = only(mid, NormKernels.MUL_ROW_SCALE);
+            FakeDispatch scale = only(mid, NormKernels.MUL_ROW_SCALE);
             assertEquals(t, scale.intArg(NormKernels.ARG_ROW_SCALE_N_ROWS));
             assertEquals(N_EMBD, scale.intArg(NormKernels.ARG_ROW_SCALE_SCALE_LEN));
-            Dispatch glu = only(mid, GpuOps.GLU);
+            FakeDispatch glu = only(mid, GpuOps.GLU);
             assertTrue("the gate multiplies layer 0's per-layer inputs", glu.bufferArgs().contains(inputs.buffer()));
-            Dispatch tail = mid.get(mid.size() - 1);
+            FakeDispatch tail = mid.get(mid.size() - 1);
             assertEquals(GpuOps.COPY2D, tail.kernelName());
             assertSame(x.buffer(), tail.bufferArg(tail.argCount() - 1));
 
-            List<Dispatch> end = run(() -> second.afterBlock(0, t, x));
+            List<FakeDispatch> end = run(() -> second.afterBlock(0, t, x));
             assertEquals(Arrays.asList(GpuOps.ROW_NORM, Gemma3nKernels.ALTUP_CORRECT, NormKernels.MUL_ROW_SCALE,
                     GpuOps.GLU, GpuOps.ROW_NORM, Gemma3nKernels.MAGNITUDE_MATCH, Gemma3nKernels.STREAMS_MEAN),
                     landmarks(end));
-            Dispatch glu1 = only(end, GpuOps.GLU);
+            FakeDispatch glu1 = only(end, GpuOps.GLU);
             assertTrue(glu1.bufferArgs().contains(inputs.buffer()));
-            Dispatch mag = only(end, Gemma3nKernels.MAGNITUDE_MATCH);
+            FakeDispatch mag = only(end, Gemma3nKernels.MAGNITUDE_MATCH);
             assertEquals(t, mag.intArg(Gemma3nKernels.ARG_N_TOKENS));
             assertSame(streams.buffer(), mag.bufferArg(6));
             assertEquals(streams.offset() + ACT * stride, mag.intArg(4));
             assertSame(merge.buffer(), mag.bufferArg(7));
             assertEquals(merge.offset() + stride, mag.intArg(5));
-            Dispatch mean = only(end, Gemma3nKernels.STREAMS_MEAN);
+            FakeDispatch mean = only(end, Gemma3nKernels.STREAMS_MEAN);
             assertEquals(t, mean.intArg(Gemma3nKernels.ARG_N_TOKENS));
             assertEquals(N_ALTUP, mean.intArg(2));
             assertSame(merge.buffer(), mean.bufferArg(6));
@@ -274,9 +274,9 @@ public class GpuAltUpExtraTest {
         // the embedding stage records the null token for an embedding row
         scratch.recordStepTokens(new int[]{-1, shardRows + 3, -1}, 3);
 
-        List<Dispatch> ds = run(() -> lookup.stepTokens(3, out.buffer(), out.offset()));
+        List<FakeDispatch> ds = run(() -> lookup.stepTokens(3, out.buffer(), out.offset()));
         List<String> rows = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             List<? extends GpuBuffer> bufs = d.bufferArgs();
             if (!bufs.isEmpty() && shards.contains(bufs.get(0))) {
                 rows.add("shard " + shards.indexOf(bufs.get(0)) + " row " + d.intArg(1));
@@ -381,15 +381,15 @@ public class GpuAltUpExtraTest {
         return GpuForwardContext.builder(kernels, ops, weights, spec).build();
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return new ArrayList<>(backend.dispatches());
     }
 
-    private static List<String> landmarks(List<Dispatch> ds) {
+    private static List<String> landmarks(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             if (LANDMARKS.contains(d.kernelName())) {
                 out.add(d.kernelName());
             }
@@ -397,7 +397,7 @@ public class GpuAltUpExtraTest {
         return out;
     }
 
-    private static int index(List<Dispatch> ds, String kernel) {
+    private static int index(List<FakeDispatch> ds, String kernel) {
         for (int i = 0; i < ds.size(); i++) {
             if (ds.get(i).kernelName().equals(kernel)) {
                 return i;
@@ -406,7 +406,7 @@ public class GpuAltUpExtraTest {
         throw new AssertionError(kernel + " was not dispatched: " + ds);
     }
 
-    private static int lastIndex(List<Dispatch> ds, String kernel) {
+    private static int lastIndex(List<FakeDispatch> ds, String kernel) {
         for (int i = ds.size() - 1; i >= 0; i--) {
             if (ds.get(i).kernelName().equals(kernel)) {
                 return i;
@@ -415,9 +415,9 @@ public class GpuAltUpExtraTest {
         throw new AssertionError(kernel + " was not dispatched: " + ds);
     }
 
-    private static Dispatch only(List<Dispatch> ds, String kernel) {
-        Dispatch found = null;
-        for (Dispatch d : ds) {
+    private static FakeDispatch only(List<FakeDispatch> ds, String kernel) {
+        FakeDispatch found = null;
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 if (found != null) {
                     throw new AssertionError(kernel + " was dispatched more than once: " + ds);

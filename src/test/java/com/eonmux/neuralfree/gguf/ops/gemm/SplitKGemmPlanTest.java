@@ -31,7 +31,10 @@ public class SplitKGemmPlanTest {
         assertEquals(1, SplitKGemmPlan.splitsFor(4, 3, 1, 4096));
     }
 
-    /** The small-token-tile heuristic splits a sub-wave staged grid to the cap and leaves a full wave alone. */
+    /** The small-token-tile heuristic splits a staged grid up to about 1.3 waves to the capped slice
+     * count and leaves bigger grids alone (the measured RTX 5080 Laptop twins: the 64-tile
+     * 4096x2560 Q4_K twin runs 86-93us whole and 59-60us as 8 slices over 60 units, the 152-tile
+     * 9728x2560 twin 101-110us whole and 119-125us sliced). */
     @Test
     public void theSmallTileHeuristicFillsTheWaveWithTheCappedSliceCount() {
         int units = 48;
@@ -39,8 +42,10 @@ public class SplitKGemmPlanTest {
                 SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 9728));
         assertEquals("a 16-tile grid over 48 units splits by the cap too",
                 SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 16, 1, 2560));
-        assertEquals("a full wave keeps one slice", 1, SplitKGemmPlan.smallTileSplitsFor(units, 48, 1, 9728));
-        assertEquals("a grid past the wave keeps one slice", 1, SplitKGemmPlan.smallTileSplitsFor(units, 64, 1, 9728));
+        assertEquals("a full wave splits to lose the tail wave", SplitKGemmPlan.MAX_SPLITS,
+                SplitKGemmPlan.smallTileSplitsFor(units, 48, 1, 9728));
+        assertEquals("a grid past 1.3 waves keeps one slice", 1,
+                SplitKGemmPlan.smallTileSplitsFor(units, 64, 1, 9728));
         assertEquals("small K keeps one slice", 1, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 2047));
         int unknown = DeviceCapabilities.UNKNOWN_COMPUTE_UNITS;
         assertEquals("an unreported core count keeps one slice", 1,
@@ -60,9 +65,12 @@ public class SplitKGemmPlanTest {
         assertEquals("slices are whole stage depths", 0, p.kSlice() % MmqConfig.INT8_TENSOR.stageDepth());
         assertTrue("the last slice is not empty", (long) p.kSlice() * (p.splits() - 1) < p.k());
         assertArrayEquals(new long[]{40L * 256 * p.splits(), 1}, p.partialGlobalWorkSize());
-        assertNull("a full wave keeps the plain kernel",
+        assertNotNull("a full-wave grid splits too (the tail wave quantization)",
                 SplitKGemmPlan.ofSmallTiles(MmqGemmPlan.of(MmqConfig.INT8_TENSOR, GGMLType.Q8_0, 3072, 9728, 9,
                         MmqConfig.INT8_TENSOR.rowRecords(9728), 0, 3072, 0), 48, 256));
+        assertNull("a grid past 1.3 waves keeps the plain kernel",
+                SplitKGemmPlan.ofSmallTiles(MmqGemmPlan.of(MmqConfig.INT8_TENSOR, GGMLType.Q8_0, 4864, 9728, 9,
+                        MmqConfig.INT8_TENSOR.rowRecords(9728), 0, 4864, 0), 48, 256));
         SplitKGemmPlan w4a8 = SplitKGemmPlan.ofW4a8SmallTiles(GGMLType.MXFP4, 2560, 4096, 9, 128, 0,
                 MmqConfig.INT8_TENSOR, 48, 256);
         assertNotNull(w4a8);

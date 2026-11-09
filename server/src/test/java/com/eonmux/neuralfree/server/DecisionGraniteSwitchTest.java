@@ -195,7 +195,7 @@ class DecisionGraniteSwitchTest {
     /** The label read over the model's own output logits at the answer codes. */
     private static double[] probabilities(String prompt, String[] labels, float temperature) throws IOException {
         int[] tokens = granite.encode(prompt, false, true);
-        float[] logits = granite.nextLogits(null, tokens);
+        float[] logits = granite.pooling().nextLogits(null, tokens);
         float[] scores = new float[labels.length];
         for (int i = 0; i < labels.length; i++) {
             int[] ids = granite.encode(labels[i], false, false);

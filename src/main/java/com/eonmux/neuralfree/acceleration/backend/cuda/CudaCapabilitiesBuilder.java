@@ -108,6 +108,7 @@ public final class CudaCapabilitiesBuilder {
     private static Set<DeviceFeature> features(int cc) {
         Set<DeviceFeature> features = EnumSet.of(
                 DeviceFeature.SUBGROUP_ARITHMETIC,
+                DeviceFeature.SUBGROUP_SHUFFLE,
                 DeviceFeature.SHADER_INT8,
                 DeviceFeature.SHADER_INT64,
                 DeviceFeature.STORAGE_8BIT,

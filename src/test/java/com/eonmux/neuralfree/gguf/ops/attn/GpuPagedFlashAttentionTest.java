@@ -44,7 +44,7 @@ import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -198,7 +198,7 @@ public class GpuPagedFlashAttentionTest {
      * Runs one batched step of one segment per sequence ({@code lens[s]} rows from {@code pos0s[s]}) through the
      * mixer and commits it, returning the paged decode launches it dispatched.
      */
-    private List<Dispatch> runStep(int[] lens, int[] pos0s) {
+    private List<FakeDispatch> runStep(int[] lens, int[] pos0s) {
         PagedSequences paged = memory.pagedSequences();
         int n = 0;
         int[] starts = new int[lens.length];
@@ -219,7 +219,7 @@ public class GpuPagedFlashAttentionTest {
         memory.beginPagedStep(step, rows, null);
         backend.clearLog();
         mixer.batch(layout, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
-        List<Dispatch> launches = named(backend.dispatches(), AttnKernels.flashDecodePaged(KvDType.F16, KvDType.F16));
+        List<FakeDispatch> launches = named(backend.dispatches(), AttnKernels.flashDecodePaged(KvDType.F16, KvDType.F16));
         memory.endPagedStep();
         paged.commit(step);
         for (int s = 0; s < lens.length; s++) {
@@ -228,9 +228,9 @@ public class GpuPagedFlashAttentionTest {
         return launches;
     }
 
-    private static List<Dispatch> named(List<Dispatch> ds, String kernel) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+    private static List<FakeDispatch> named(List<FakeDispatch> ds, String kernel) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 out.add(d);
             }
@@ -245,10 +245,10 @@ public class GpuPagedFlashAttentionTest {
         bindPaged();
         GpuStepInputs steps = memory.stepInputs();
         GpuKvLayer kv = memory.kv(0);
-        List<Dispatch> rows = runStep(new int[]{3, 2}, new int[]{0, 0});
+        List<FakeDispatch> rows = runStep(new int[]{3, 2}, new int[]{0, 0});
         assertEquals("one paged decode launch per prefill row", 5, rows.size());
         for (int row = 0; row < rows.size(); row++) {
-            Dispatch d = rows.get(row);
+            FakeDispatch d = rows.get(row);
             assertEquals(1, d.intArg(AttnKernels.ARG_FDP_N_SEQ));
             assertEquals(row * Q_DIM, d.intArg(AttnKernels.ARG_FD_Q_OFF));
             assertEquals(row * Q_DIM, d.intArg(AttnKernels.ARG_FD_OUT_OFF));
@@ -266,9 +266,9 @@ public class GpuPagedFlashAttentionTest {
         GpuStepInputs steps = memory.stepInputs();
         GpuKvLayer kv = memory.kv(0);
         runStep(new int[]{3, 2}, new int[]{0, 0});
-        List<Dispatch> decode = runStep(new int[]{1, 1}, new int[]{3, 2});
+        List<FakeDispatch> decode = runStep(new int[]{1, 1}, new int[]{3, 2});
         assertEquals("one paged decode launch over both sequences", 1, decode.size());
-        Dispatch d = decode.get(0);
+        FakeDispatch d = decode.get(0);
         assertEquals(2, d.intArg(AttnKernels.ARG_FDP_N_SEQ));
         assertEquals(0, d.intArg(AttnKernels.ARG_FD_Q_OFF));
         assertEquals(0, d.intArg(AttnKernels.ARG_FD_OUT_OFF));

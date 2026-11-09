@@ -9,6 +9,8 @@ import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -127,9 +129,9 @@ public class DeviceStepInputsTest {
         return r;
     }
 
-    private List<FakeComputeBackend.Op> opsOf(FakeComputeBackend.OpKind kind) {
-        List<FakeComputeBackend.Op> out = new ArrayList<>();
-        for (FakeComputeBackend.Op op : backend.ops()) {
+    private List<FakeOp> opsOf(FakeOpKind kind) {
+        List<FakeOp> out = new ArrayList<>();
+        for (FakeOp op : backend.ops()) {
             if (op.kind() == kind) {
                 out.add(op);
             }
@@ -158,7 +160,7 @@ public class DeviceStepInputsTest {
             backend.clearLog();
             in.upload(3, 4);
 
-            List<FakeComputeBackend.Op> writes = opsOf(FakeComputeBackend.OpKind.WRITE);
+            List<FakeOp> writes = opsOf(FakeOpKind.WRITE);
             assertEquals("kv_pos + cell_idx per group, q_pos and rope_pos", 2 * 2 + 2, writes.size());
             assertEquals(backend.ops().size(), writes.size());
             assertArrayEquals(range(3, 4), ints(in.cellIdx(0), 4));
@@ -168,7 +170,7 @@ public class DeviceStepInputsTest {
             assertEquals(0, ints(in.stateRows(), 1)[0]);
             assertEquals(3, in.pos0());
             assertEquals(4, in.nTokens());
-            for (FakeComputeBackend.Op w : writes) {
+            for (FakeOp w : writes) {
                 if (w.buffer() == in.kvPos(0)) {
                     assertEquals(3L * Integer.BYTES, w.offset());
                     assertEquals(4L * Integer.BYTES, w.bytes());
@@ -209,7 +211,7 @@ public class DeviceStepInputsTest {
 
             assertArrayEquals(new int[]{14, 15, 0, 1, 2}, ints(in.cellIdx(0), 5));
             int kvPosWrites = 0;
-            for (FakeComputeBackend.Op w : opsOf(FakeComputeBackend.OpKind.WRITE)) {
+            for (FakeOp w : opsOf(FakeOpKind.WRITE)) {
                 if (w.buffer() == in.kvPos(0)) {
                     kvPosWrites++;
                     assertEquals(0L, w.offset());
@@ -257,7 +259,7 @@ public class DeviceStepInputsTest {
 
             mem.rollback(3);
 
-            List<FakeComputeBackend.Op> writes = opsOf(FakeComputeBackend.OpKind.WRITE);
+            List<FakeOp> writes = opsOf(FakeOpKind.WRITE);
             assertEquals(1, writes.size());
             assertEquals(0L, writes.get(0).offset());
             assertEquals(3L * Integer.BYTES, writes.get(0).bytes());
@@ -339,11 +341,11 @@ public class DeviceStepInputsTest {
 
             mem.reset();
 
-            List<FakeComputeBackend.Op> fills = opsOf(FakeComputeBackend.OpKind.FILL);
+            List<FakeOp> fills = opsOf(FakeOpKind.FILL);
             assertEquals(2, fills.size());
             boolean sawKvPos = false;
             boolean sawState = false;
-            for (FakeComputeBackend.Op f : fills) {
+            for (FakeOp f : fills) {
                 if (f.buffer() == mem.stepInputs().kvPos(0)) {
                     sawKvPos = f.pattern() == -1 && f.bytes() == 32L * Integer.BYTES;
                 } else if (f.buffer() == mem.recurrent(1).tensor(LayerMemoryPlan.STATE_CONV)) {
@@ -377,7 +379,7 @@ public class DeviceStepInputsTest {
             for (int r = 6; r < 10; r++) {
                 assertEquals(-1, mem.stepInputs().positionOfRow(0, r));
             }
-            assertEquals(1, opsOf(FakeComputeBackend.OpKind.COPY).size());
+            assertEquals(1, opsOf(FakeOpKind.COPY).size());
         }
     }
 
@@ -422,7 +424,7 @@ public class DeviceStepInputsTest {
             backend.clearLog();
             mem.snapshot();
             assertEquals(live, backend.liveBuffers().size());
-            assertEquals(1, opsOf(FakeComputeBackend.OpKind.COPY).size());
+            assertEquals(1, opsOf(FakeOpKind.COPY).size());
         }
     }
 
@@ -442,7 +444,7 @@ public class DeviceStepInputsTest {
 
             List<GpuBuffer> deltas = mem.shiftPositions(4, 6);
 
-            assertEquals(2, opsOf(FakeComputeBackend.OpKind.COPY).size());
+            assertEquals(2, opsOf(FakeOpKind.COPY).size());
             DeviceStepInputs in = mem.stepInputs();
             FakeGpuBuffer k = fake(mem.kv(0).k());
             for (int r = 0; r < 10; r++) {

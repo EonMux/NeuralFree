@@ -1,6 +1,7 @@
 # kernel_name	source.comp	defines (space separated NAME=VALUE)	flags (comma list: sg)
 # Dense F32 / F16 / BF16 kernels of matvec_f32.cl and matvec_f16_bf16.cl.
 Float_MatVec	matvec_dense.comp	WT=WT_F32 OP=OP_MATVEC	sg
+Float_MatVecN	matvec_dense.comp	WT=WT_F32 OP=OP_MATVECN	sg
 Float_MatVecAdd	matvec_dense.comp	WT=WT_F32 OP=OP_MATVEC_ADD	sg
 Float_MatVecFusedGateUp	matvec_dense.comp	WT=WT_F32 OP=OP_GATEUP_SILU	sg
 Float_MatVecFusedGateUpGelu	matvec_dense.comp	WT=WT_F32 OP=OP_GATEUP_GELU	sg
@@ -10,6 +11,7 @@ LLM_Batch_Float_MatMul_2D	matvec_dense.comp	WT=WT_F32 OP=OP_BATCH_2D	sg
 LLM_EmbeddingLookup	embed.comp	QTYPE=QT_F32 OP=OP_EMBED
 LLM_Batch_EmbeddingLookup	embed.comp	QTYPE=QT_F32 OP=OP_BATCH_EMBED
 BF16_MatVec	matvec_dense.comp	WT=WT_BF16 OP=OP_MATVEC	sg
+BF16_MatVecN	matvec_dense.comp	WT=WT_BF16 OP=OP_MATVECN	sg
 BF16_MatVecAdd	matvec_dense.comp	WT=WT_BF16 OP=OP_MATVEC_ADD	sg
 BF16_MatVecFusedGateUp	matvec_dense.comp	WT=WT_BF16 OP=OP_GATEUP_SILU	sg
 BF16_ComputeLogits	matvec_dense.comp	WT=WT_BF16 OP=OP_LOGITS	sg
@@ -18,6 +20,7 @@ BF16_BatchMatMul_2D	matvec_dense.comp	WT=WT_BF16 OP=OP_BATCH_2D	sg
 BF16_EmbeddingLookup	embed.comp	QTYPE=QT_BF16 OP=OP_EMBED
 BF16_BatchEmbeddingLookup	embed.comp	QTYPE=QT_BF16 OP=OP_BATCH_EMBED
 F16_MatVec	matvec_dense.comp	WT=WT_F16 OP=OP_MATVEC	sg
+F16_MatVecN	matvec_dense.comp	WT=WT_F16 OP=OP_MATVECN	sg
 F16_MatVecAdd	matvec_dense.comp	WT=WT_F16 OP=OP_MATVEC_ADD	sg
 F16_MatVecFusedGateUp	matvec_dense.comp	WT=WT_F16 OP=OP_GATEUP_SILU	sg
 F16_ComputeLogits	matvec_dense.comp	WT=WT_F16 OP=OP_LOGITS	sg

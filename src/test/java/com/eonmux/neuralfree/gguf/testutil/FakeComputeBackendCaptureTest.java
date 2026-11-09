@@ -143,7 +143,7 @@ public class FakeComputeBackendCaptureTest {
         replayTwoDispatches(graph);
         assertArrayEquals(affine(10.0f, 2.0f), readFloats(output), 0.0f);
         assertEquals(1, backend.ops().stream()
-                .filter(op -> op.kind() == FakeComputeBackend.OpKind.REPLAY).count());
+                .filter(op -> op.kind() == FakeOpKind.REPLAY).count());
         assertEquals(0, backend.dispatches().size());
     }
 
@@ -156,7 +156,7 @@ public class FakeComputeBackendCaptureTest {
         // each replay rewrites out from in: both replays leave the same values, and two replay ops ran
         assertArrayEquals(affine(10.0f, 2.0f), readFloats(output), 0.0f);
         assertEquals(2, backend.ops().stream()
-                .filter(op -> op.kind() == FakeComputeBackend.OpKind.REPLAY).count());
+                .filter(op -> op.kind() == FakeOpKind.REPLAY).count());
     }
 
     @Test
@@ -166,7 +166,7 @@ public class FakeComputeBackendCaptureTest {
         graph.launch(backend.computeQueue());
         assertArrayEquals(affine(10.0f, 2.0f), readFloats(output), 0.0f);
         assertEquals(1, backend.ops().stream()
-                .filter(op -> op.kind() == FakeComputeBackend.OpKind.LAUNCH).count());
+                .filter(op -> op.kind() == FakeOpKind.LAUNCH).count());
         assertEquals(0, backend.dispatches().size());
     }
 

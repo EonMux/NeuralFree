@@ -8,9 +8,9 @@ import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.RecurrentStateCopy;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
 import com.eonmux.neuralfree.gguf.memory.StateTransfer;
-import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.GroupPositions;
-import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.KvShift;
-import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.SequenceRules;
+import com.eonmux.neuralfree.gguf.memory.gpu.GroupPositions;
+import com.eonmux.neuralfree.gguf.memory.gpu.KvShift;
+import com.eonmux.neuralfree.gguf.memory.gpu.SequenceRules;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedSequences;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.memory.paged.StatefulPagedSequences;
@@ -20,8 +20,6 @@ import com.eonmux.neuralfree.gguf.spec.MlaSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-
-import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.SequenceRules;
 
 import java.util.ArrayList;
 import java.util.Arrays;

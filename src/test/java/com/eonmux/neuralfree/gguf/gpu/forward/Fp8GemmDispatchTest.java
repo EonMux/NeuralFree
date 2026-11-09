@@ -11,6 +11,7 @@ import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 import com.eonmux.neuralfree.gguf.quant.InputTransform;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -37,7 +38,12 @@ public class Fp8GemmDispatchTest {
      */
     private static final int CUDA_CAPABILITY = 120;
 
+    /**
+     * The step's token count: narrower than CUDA's 64-token tensor tile, so a lane runs its 16-token twin
+     * ({@code <T>_MatMul_MMQ_S}, {@code <T>_MatMul_W4A8_S}).
+     */
     private static final int TOKENS = 16;
+    private static final String SMALL_TILE = "_S";
     private static final int COLS = 256;
     private static final int ROWS = 96;
 
@@ -108,7 +114,7 @@ public class Fp8GemmDispatchTest {
         open(ComputeBackend.BackendType.CUDA);
         List<String> names = run(GGMLType.F8_E4M3_B128, ActQuantScheme.FP8_STATIC);
         assertEquals("the scheme's E4M3 codes are staged first", GemmKernels.QUANT_MMQ_FP8_STATIC, names.get(0));
-        assertTrue(names.toString(), names.contains("F8_E4M3_B128_MatMul_MMQ"));
+        assertTrue(names.toString(), names.contains("F8_E4M3_B128_MatMul_MMQ" + SMALL_TILE));
         assertTrue("the fake-quantization pass is skipped: " + names, !names.contains(GpuOps.ACT_FAKE_QUANT));
         assertTrue("the int8 staging pass is skipped: " + names, !names.contains(GemmKernels.QUANT_MMQ_Q8_1));
     }
@@ -118,13 +124,13 @@ public class Fp8GemmDispatchTest {
         open(ComputeBackend.BackendType.CUDA);
         List<String> names = run(GGMLType.MXFP8, ActQuantScheme.FP8_GROUP128);
         assertEquals(GemmKernels.QUANT_MMQ_FP8_GROUP128, names.get(0));
-        assertTrue(names.toString(), names.contains("MXFP8_MatMul_MMQ"));
+        assertTrue(names.toString(), names.contains("MXFP8_MatMul_MMQ" + SMALL_TILE));
     }
 
     @Test
     public void aPowerOfTwoSchemeStagesWithoutAScalar() {
         open(ComputeBackend.BackendType.CUDA);
-        List<FakeComputeBackend.Dispatch> dispatched = dispatch(GGMLType.MXFP8, ActQuantScheme.MXFP8);
+        List<FakeDispatch> dispatched = dispatch(GGMLType.MXFP8, ActQuantScheme.MXFP8);
         assertEquals(GemmKernels.QUANT_MMQ_FP8_MX, dispatched.get(0).kernelName());
         assertEquals("shape, input and records: the per-run exponent needs no scalar",
                 7, dispatched.get(0).argCount());
@@ -138,7 +144,7 @@ public class Fp8GemmDispatchTest {
         List<String> names = run(GGMLType.MXFP8, ActQuantScheme.MXFP8);
         assertTrue(names.toString(), names.contains("MXFP8_MatMul_Tiled"));
         assertTrue("the fake-quantization pass keeps the scheme: " + names, names.contains(GpuOps.ACT_FAKE_QUANT));
-        assertTrue(names.toString(), !names.contains("MXFP8_MatMul_MMQ"));
+        assertTrue(names.toString(), !ranLane(names, "MXFP8_MatMul_MMQ"));
     }
 
     @Test
@@ -148,7 +154,7 @@ public class Fp8GemmDispatchTest {
         assertTrue("the tiled GEMM (hardware FP8 rows on sm_89+) serves the product: " + names,
                 names.stream().anyMatch(n -> n.startsWith("F8_E4M3_B128_") && n.endsWith("_MatMul_Tiled")));
         assertTrue(names.toString(), names.contains(GpuOps.ACT_FAKE_QUANT));
-        assertTrue(names.toString(), !names.contains("F8_E4M3_B128_MatMul_MMQ"));
+        assertTrue(names.toString(), !ranLane(names, "F8_E4M3_B128_MatMul_MMQ"));
     }
 
     @Test
@@ -156,7 +162,7 @@ public class Fp8GemmDispatchTest {
         open(ComputeBackend.BackendType.CUDA);
         List<String> names = run(GGMLType.MXFP4, ActQuantScheme.FP8_STATIC);
         assertEquals(GemmKernels.QUANT_MMQ_FP8_STATIC, names.get(0));
-        assertTrue(names.toString(), names.contains("MXFP4_MatMul_W4A8"));
+        assertTrue(names.toString(), names.contains("MXFP4_MatMul_W4A8" + SMALL_TILE));
         assertTrue("the fake-quantization pass is skipped: " + names, !names.contains(GpuOps.ACT_FAKE_QUANT));
     }
 
@@ -164,8 +170,8 @@ public class Fp8GemmDispatchTest {
     public void fourBitWeightsKeepTheirInt8LaneForAnInt8Scheme() {
         open(ComputeBackend.BackendType.CUDA);
         List<String> names = run(GGMLType.IQ4_XS, ActQuantScheme.INT8_TOKEN);
-        assertTrue(names.toString(), names.contains("IQ4_XS_MatMul_MMQ"));
-        assertTrue(names.toString(), !names.contains("IQ4_XS_MatMul_W4A8"));
+        assertTrue(names.toString(), names.contains("IQ4_XS_MatMul_MMQ" + SMALL_TILE));
+        assertTrue(names.toString(), !ranLane(names, "IQ4_XS_MatMul_W4A8"));
         assertTrue(names.toString(), names.contains(GemmKernels.QUANT_MMQ_INT8_ROW));
     }
 
@@ -174,16 +180,21 @@ public class Fp8GemmDispatchTest {
         open(ComputeBackend.BackendType.CUDA);
         List<String> names = run(GGMLType.I8_B128, ActQuantScheme.INT8_STATIC_ASYM);
         assertEquals(GemmKernels.QUANT_MMQ_INT8_ASYM, names.get(0));
-        assertTrue(names.toString(), names.contains("I8_B128_MatMul_MMQ"));
+        assertTrue(names.toString(), names.contains("I8_B128_MatMul_MMQ" + SMALL_TILE));
         assertTrue(names.toString(), !names.contains(GpuOps.ACT_FAKE_QUANT));
     }
 
+    /** Whether the step ran {@code gemm} at either tile width. */
+    private static boolean ranLane(List<String> names, String gemm) {
+        return names.contains(gemm) || names.contains(gemm + SMALL_TILE);
+    }
+
     private List<String> run(GGMLType type, ActQuantScheme scheme) {
-        return dispatch(type, scheme).stream().map(FakeComputeBackend.Dispatch::kernelName)
+        return dispatch(type, scheme).stream().map(FakeDispatch::kernelName)
                 .collect(Collectors.toList());
     }
 
-    private List<FakeComputeBackend.Dispatch> dispatch(GGMLType type, ActQuantScheme scheme) {
+    private List<FakeDispatch> dispatch(GGMLType type, ActQuantScheme scheme) {
         GpuBuffer weight = backend.allocateBuffer((long) ROWS * type.getBytesForElements(COLS), true);
         GpuBuffer input = backend.allocateBuffer((long) TOKENS * COLS * Float.BYTES);
         GpuBuffer output = backend.allocateBuffer((long) TOKENS * ROWS * Float.BYTES);

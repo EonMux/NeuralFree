@@ -61,12 +61,12 @@ public class FaultToleranceResource {
     @Produces(MediaType.APPLICATION_JSON)
     public Response status() {
         ClusterSwitches.require(switches.faultTolerance(), ClusterSwitches.FAULT_FLAG);
-        List<EngineService.ReplicaHealth> engines = service.faultToleranceEngines();
+        List<EngineScaling.ReplicaHealth> engines = service.scaling().faultToleranceEngines();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("schema_version", 1);
         out.put("total_engines", engines.size());
         List<Object> rows = new java.util.ArrayList<>(engines.size());
-        for (EngineService.ReplicaHealth engine : engines) {
+        for (EngineScaling.ReplicaHealth engine : engines) {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("id", engine.id());
             row.put("status", engine.status());
@@ -110,7 +110,7 @@ public class FaultToleranceResource {
             throw ServerJson.badRequest("Invalid instruction: '" + instruction + "'.");
         }
         try {
-            service.submitFaultTolerance(instruction, params, requestId);
+            service.scaling().submitFaultTolerance(instruction, params, requestId);
         } catch (IllegalArgumentException e) {
             throw ServerJson.badRequest(e.getMessage());
         }

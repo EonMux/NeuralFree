@@ -8,6 +8,11 @@
  * 4*ltid .. +3 and their high-nibble partners 4*ltid+16 .. +3. The direct-value types dot the packed
  * int8 codes with the Q8_1 codes; the bias/min types (Q4_0, Q5_0, Q4_1, Q5_1) add the sum of the owned
  * Q8_1 codes, so the invocations of a block add up to the block's s term.
+ *
+ * The term functions are precise: the float chain they return is computed exactly as written
+ * (SPIR-V NoContraction), so every kernel that inlines a term computes the same operations and the
+ * same rounding, whatever mul-add fusion the driver would otherwise pick per inlined copy. A
+ * token's {T}_MatVecN dot is therefore its stacked {T}_MatVec dots bit for bit.
  */
 #ifndef NF_QUANT_LEGACY_Q8_GLSL
 #define NF_QUANT_LEGACY_Q8_GLSL
@@ -65,7 +70,7 @@ int nf_q8_iq4nl_word(uint nibbles) {
 
 #if QTYPE == QT_Q4_0
 /* Eight elements: y = d*(code - 8), the sampled nibbles in r0/r1. */
-float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
+precise float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
     const uint q = nf_w_u32_even(ws, bp + 2u + 4u * ltid);
     const uint bo = ltid * 4u;
     const int u0 = nf_q8_word(blk, bo);
@@ -77,7 +82,7 @@ float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
 
 #elif QTYPE == QT_Q4_1
 /* Eight elements: y = d*code + m. */
-float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
+precise float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
     const uint q = nf_w_u32(ws, bp + 4u + 4u * ltid);
     const uint bo = ltid * 4u;
     const int u0 = nf_q8_word(blk, bo);
@@ -97,7 +102,7 @@ int nf_q8_q5_hbits(uint qh, uint e0) {
 }
 
 /* Eight elements: y = d*(code - 16) for Q5_0, y = d*code + m for Q5_1. */
-float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
+precise float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
     const bool q5_1 = QTYPE == QT_Q5_1;
     /* Q5_0 blocks are 22 bytes, so qh at bp+2 is only 2-aligned; Q5_1's qh at bp+4 is 4-aligned. */
     const uint qh = q5_1 ? nf_w_u32(ws, bp + 4u) : nf_w_u32_even(ws, bp + 2u);
@@ -117,7 +122,7 @@ float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
 
 #elif QTYPE == QT_MXFP4
 /* Eight elements: y = s * kv[nibble], kv the doubled E2M1 codes and s the half e8m0 scale. */
-float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
+precise float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
     const uint q = nf_w_u32_any(ws, bp + 1u + 4u * ltid);
     const uint bo = ltid * 4u;
     const int idot = nf_q8_dp4(nf_q8_fp4_word(q & 0x0F0F0F0Fu), nf_q8_word(blk, bo))
@@ -127,7 +132,7 @@ float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
 
 #elif QTYPE == QT_IQ4_NL
 /* One 32-element block is one Q8_1 block; invocation ltid owns qs bytes 4*ltid .. +3. */
-float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
+precise float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
     const uint q = nf_w_u32_even(ws, bp + 2u + 4u * ltid);
     const int lo = nf_q8_iq4nl_word(q & 0x0F0F0F0Fu);
     const int hi = nf_q8_iq4nl_word((q >> 4) & 0x0F0F0F0Fu);
@@ -139,7 +144,7 @@ float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
 
 #else /* QT_IQ4_XS */
 /* Invocation ltid owns sub-block ltid/4 and its qs bytes 4*(ltid%4) .. +3. */
-float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
+precise float qt_dot_q8(uint ws, uint bp, uint blk, uint ltid) {
     const uint sb = ltid >> 2, bo = (ltid & 3u) * 4u;
     const uint q = nf_w_u32(ws, bp + 8u + sb * 16u + bo);
     const int lo = nf_q8_iq4nl_word(q & 0x0F0F0F0Fu);

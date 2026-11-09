@@ -21,17 +21,13 @@ import com.eonmux.neuralfree.gguf.engine.sampling.XtcStage;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkState;
 import com.eonmux.neuralfree.gguf.engine.watermark.Watermarker;
-import com.eonmux.neuralfree.gguf.tokenizer.SpecialTokens;
-import com.eonmux.neuralfree.gguf.tokenizer.TokenizerVocab;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.SplittableRandom;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -109,8 +105,6 @@ public final class Sampler {
     private final long seed;
     /** Candidates the fixed bias stage masks: the banned and the logit-biased tokens. */
     private final int coneExtra;
-    /** Whether a logit bias raises a token, so no device cone contains the chain's keeps. */
-    private final boolean positiveBias;
     private final SamplerStage biasStage;
     private final List<SamplerStage> chain;
     /**
@@ -131,6 +125,8 @@ public final class Sampler {
     private final WatermarkState watermarkState;
     /** The request's watermark configuration, or null. */
     private final WatermarkConfig watermarkConfig;
+    /** The chain's fixed end: the argmax, the categorical draw or the watermarked selection. */
+    private final SamplerChainEnd chainEnd;
 
     private Sampler(int[] banned, int[] biasedIds, float[] biases, SamplerConfig config, long seed, boolean greedy,
                     SamplerVocab vocab, boolean speculativeTarget) {
@@ -149,15 +145,14 @@ public final class Sampler {
         this.greedy = greedy;
         this.seed = seed;
         this.coneExtra = banned.length + biasedIds.length;
-        boolean positive = false;
+        boolean positiveBias = false;
         for (float bias : biases) {
-            positive |= bias > 0f;
+            positiveBias |= bias > 0f;
         }
-        this.positiveBias = positive;
         this.biasStage = new BiasStage(banned, biasedIds, biases);
         this.chain = buildChain(config, seed, vocab);
         this.constraints = constraintsOf(chain);
-        this.deviceFilter = new SamplerDeviceFilter(this, chain, biasStage, banned, coneExtra, config);
+        this.deviceFilter = new SamplerDeviceFilter(this, chain, biasStage, banned, coneExtra, positiveBias, config);
         this.deviceFilter.refresh();
         this.rng = new Mt19937(seed);
         WatermarkConfig watermark = config.watermark();
@@ -172,6 +167,7 @@ public final class Sampler {
                 : speculativeTarget ? watermark.targetWatermarker() : Watermarker.create(watermark);
         this.watermarkState = watermark == null ? null : new WatermarkState(watermark);
         this.watermarkConfig = watermark;
+        this.chainEnd = new SamplerChainEnd(this.watermarker, this.watermarkState);
     }
 
     /**
@@ -541,101 +537,6 @@ public final class Sampler {
         return new GgufVocab(tokenizer);
     }
 
-    /** A SamplerVocab on a GGUF model's tokenizer, following llama.cpp's piece semantics per id. */
-    private static final class GgufVocab implements SamplerVocab {
-
-        private static final int SPECIAL_ATTRS = TokenizerVocab.ATTR_UNKNOWN | TokenizerVocab.ATTR_CONTROL;
-
-        private final GGUFTokenizer tokenizer;
-        private final TokenizerVocab vocab;
-        private final SpecialTokens special;
-        private final byte[][] pieces;
-        private final byte[][] specialPieces;
-
-        GgufVocab(GGUFTokenizer tokenizer) {
-            this.tokenizer = tokenizer;
-            this.vocab = tokenizer.vocab();
-            this.special = tokenizer.specialTokens();
-            this.pieces = new byte[vocab.size()][];
-            this.specialPieces = new byte[vocab.size()][];
-        }
-
-        @Override
-        public int vocabSize() {
-            return vocab.size();
-        }
-
-        @Override
-        public boolean isEog(int id) {
-            return special.isEog(id);
-        }
-
-        @Override
-        public int eotToken() {
-            return special.eot();
-        }
-
-        @Override
-        public int eosToken() {
-            return special.eos();
-        }
-
-        /** token_to_piece(id, lstrip = 0, special = false): UNKNOWN and CONTROL give no bytes, a byte token its byte. */
-        @Override
-        public byte[] piece(int id) {
-            if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
-                return new byte[0];
-            }
-            if (vocab.isByte(id)) {
-                return new byte[]{(byte) vocab.byteValue(id)};
-            }
-            byte[] cached = pieces[id];
-            if (cached == null) {
-                // the visible piece bytes (GGUFTokenizer.decode of one token, plain decoding)
-                cached = tokenizer.decode(id).getBytes(StandardCharsets.UTF_8);
-                pieces[id] = cached;
-            }
-            return cached;
-        }
-
-        /** The cached special = true piece: CONTROL and UNKNOWN tokens render their raw text bytes. */
-        @Override
-        public byte[] grammarPiece(int id) {
-            if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
-                byte[] cached = specialPieces[id];
-                if (cached == null) {
-                    cached = vocab.text(id).getBytes(StandardCharsets.UTF_8);
-                    specialPieces[id] = cached;
-                }
-                return cached;
-            }
-            return piece(id);
-        }
-
-        /** detokenize({id}, special = true): special tokens render their raw text, visible tokens their piece. */
-        @Override
-        public String pieceText(int id) {
-            if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
-                return vocab.text(id);
-            }
-            if (vocab.isByte(id)) {
-                return new String(piece(id), StandardCharsets.ISO_8859_1);
-            }
-            return tokenizer.decode(id);
-        }
-
-        @Override
-        public int[] tokenize(String text) {
-            return tokenizer.encode(text, false, false);
-        }
-
-        /** detokenize semantics of the tag passes: special tokens named in the text resolve to their ids. */
-        @Override
-        public int[] tokenizeSpecial(String text) {
-            return tokenizer.encode(text, false, true);
-        }
-    }
-
     /** A fresh non-negative seed for {@link SamplerConfig#RANDOM_SEED}. */
     static long randomSeed() {
         return ThreadLocalRandom.current().nextLong() & Long.MAX_VALUE;
@@ -709,7 +610,7 @@ public final class Sampler {
      * preserves the argmax or runs after the one candidate is left. With no positive bias the edits only lower a
      * logit, so the winner lies among the largest {@code coneExtra + 1} raw logits ({@link #coneWidth}).
      */
-    private boolean argmaxChain() {
+    boolean argmaxChain() {
         if (watermarker != null && !greedy) {
             // the watermark's selection is not the argmax; the device's greedy id would skip it
             return false;
@@ -1011,11 +912,11 @@ public final class Sampler {
         if (terminal) {
             // the terminal selector set the selected candidate already
         } else if (greedy) {
-            selectArgmax();
+            chainEnd.selectArgmax(cur);
         } else if (watermarker != null) {
-            selectWatermarked();
+            chainEnd.selectWatermarked(cur, rng);
         } else {
-            drawDist();
+            chainEnd.drawDist(cur, rng);
         }
         return cur;
     }
@@ -1062,80 +963,7 @@ public final class Sampler {
      * the whole-row path.</p>
      */
     public int coneWidth() {
-        if (positiveBias || !constraints.isEmpty()) {
-            return -1;
-        }
-        if (topK < 1) {
-            return argmaxChain() ? coneExtra + 1 : -1;
-        }
-        int topKAt = topKIndex();
-        if (topKAt < 0) {
-            return -1;
-        }
-        for (int i = 0; i < chain.size(); i++) {
-            SamplerStage stage = chain.get(i);
-            StageKind kind = stage.kind();
-            if (kind == null) {
-                // a null-kind request stage (grammar, min-tokens, bad-words, reasoning-budget): only one that
-                // leaves the chain's set alone keeps the cone
-                if (stage.modifies()) {
-                    return -1;
-                }
-                continue;
-            }
-            boolean beforeTopK = i < topKAt;
-            switch (kind) {
-                case TOP_K:
-                    break;
-                case TOP_P:
-                    if (beforeTopK && topP < 1f) {
-                        return -1;
-                    }
-                    break;
-                case MIN_P:
-                    if (beforeTopK && minP > 0f) {
-                        return -1;
-                    }
-                    break;
-                case TYPICAL_P:
-                    if (beforeTopK && typicalP < 1f) {
-                        return -1;
-                    }
-                    break;
-                case TOP_N_SIGMA:
-                    if (beforeTopK && topNSigma > 0f) {
-                        return -1;
-                    }
-                    break;
-                case XTC:
-                    if (beforeTopK && xtcProbability > 0f && xtcThreshold <= 0.5f) {
-                        return -1;
-                    }
-                    break;
-                case TEMPERATURE:
-                    if (beforeTopK && dynatempRange > 0f) {
-                        return -1;
-                    }
-                    break;
-                case PENALTIES:
-                    if (penalties) {
-                        return -1;
-                    }
-                    break;
-                case DRY:
-                    if (dryMultiplier != 0f) {
-                        return -1;
-                    }
-                    break;
-                case MIROSTAT:
-                case ADAPTIVE_P:
-                case INFILL:
-                    return -1;
-                default:
-                    break;
-            }
-        }
-        return Math.max(topK, minKeep) + coneExtra;
+        return deviceFilter.coneWidth();
     }
 
     /**
@@ -1203,120 +1031,6 @@ public final class Sampler {
             applyBiasToRanked();
         }
         return runChain(prefiltered);
-    }
-
-    // ------------------------------------------------------------------ fixed chain end
-
-    /** Argmax in the current order (the first maximum wins). */
-    private void selectArgmax() {
-        int best = 0;
-        for (int i = 1; i < cur.size; i++) {
-            if (cur.logits[i] > cur.logits[best]) {
-                best = i;
-            }
-        }
-        if (cur.logits[best] == Float.NEGATIVE_INFINITY) {
-            throw new IllegalStateException("no candidate has a finite logit (all banned, -inf or NaN)");
-        }
-        cur.selected = best;
-    }
-
-    /**
-     * Softmax and a single categorical draw in the current order ({@code llama_sampler_dist_apply} through
-     * libstdc++'s {@code std::discrete_distribution}): the probabilities renormalized in double, the first
-     * candidate whose cumulative reaches the canonical double draw. The chain's own {@link Mt19937} draws once
-     * per call, also for a single candidate (llama.cpp keeps the RNG aligned with backend sampling).
-     */
-    private void drawDist() {
-        int n = cur.size;
-        if (n == 1) {
-            if (cur.logits[0] == Float.NEGATIVE_INFINITY) {
-                throw new IllegalStateException("no candidate has a finite logit (all banned, -inf or NaN)");
-            }
-            cur.probs[0] = 1f;
-            cur.selected = rng.distDraw(new float[]{1f});
-            return;
-        }
-        float[] probs = softmaxDistribution();
-        cur.selected = rng.distDraw(probs);
-    }
-
-    /**
-     * The softmax over the current candidates, written into the set's probabilities and returned as a probability
-     * array of exactly the candidate count (the draw reads its length); a single candidate takes all the mass. Used
-     * by both the ordinary draw and a watermarked step, whose reported logprobs are the chain's ordinary
-     * distribution even though the token is drawn from the keyed one.
-     *
-     * @throws IllegalStateException when no candidate has a finite logit
-     */
-    private float[] softmaxDistribution() {
-        int n = cur.size;
-        float max = cur.sorted ? cur.logits[0] : cur.maxLogit();
-        if (max == Float.NEGATIVE_INFINITY) {
-            throw new IllegalStateException("no candidate has a finite logit (all banned, -inf or NaN)");
-        }
-        if (n == 1) {
-            cur.probs[0] = 1f;
-            return new float[]{1f};
-        }
-        double sum = 0.0;
-        for (int i = 0; i < n; i++) {
-            double e = expShift(cur.logits[i], max);
-            cur.probs[i] = (float) e;
-            sum += e;
-        }
-        for (int i = 0; i < n; i++) {
-            cur.probs[i] = (float) (cur.probs[i] / sum);
-        }
-        float[] probs = new float[n];
-        for (int i = 0; i < n; i++) {
-            probs[i] = cur.prob(i);
-        }
-        return probs;
-    }
-
-    /**
-     * The watermarked selection ({@link Watermarker}): the candidates the chain kept are presented to the watermark,
-     * which picks the argmax of {@code logit + Gumbel(PRF(key, context, token))}; the set's probabilities are the
-     * chain's ordinary softmax either way. A context the repeated-context search already saw ({@link
-     * WatermarkState#repeatedContext}) falls back to the ordinary categorical draw, though a dual-key watermarker has
-     * already taken its routing draw.
-     *
-     * @throws IllegalStateException when no candidate has a finite logit
-     */
-    private void selectWatermarked() {
-        int n = cur.size;
-        float[] probs = softmaxDistribution();
-        boolean repeated = watermarkState.repeatedContext();
-        int[] tokenIds = new int[n];
-        float[] logits = new float[n];
-        for (int i = 0; i < n; i++) {
-            tokenIds[i] = cur.ids[i];
-            logits[i] = cur.logits[i];
-        }
-        int token = watermarker.sample(tokenIds, logits, n, watermarkState.context(),
-                rng::nextCanonicalDouble);
-        if (repeated) {
-            cur.selected = rng.distDraw(probs);
-        } else {
-            int at = cur.indexOf(token);
-            if (at < 0) {
-                throw new IllegalStateException("the watermark selected token " + token
-                        + ", which is not among the chain's candidates");
-            }
-            cur.selected = at;
-        }
-    }
-
-    /**
-     * {@code exp(logit - max)}; when {@code max} is {@code +inf} (an overflowed logit, for example after diffusion
-     * Gumbel noise) this is its limit: the infinite logits share all the mass.
-     */
-    private static float expShift(float logit, float max) {
-        if (max == Float.POSITIVE_INFINITY) {
-            return logit == Float.POSITIVE_INFINITY ? 1f : 0f;
-        }
-        return (float) Math.exp(logit - max);
     }
 
     /**
@@ -1675,7 +1389,7 @@ public final class Sampler {
             }
             float sum = 0f;
             for (int i = 0; i < n; i++) {
-                float p = expShift(logits[i], max);
+                float p = SamplerChainEnd.expShift(logits[i], max);
                 probs[i] = p;
                 sum += p;
             }

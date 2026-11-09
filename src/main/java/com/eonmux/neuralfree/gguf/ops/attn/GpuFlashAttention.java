@@ -42,8 +42,14 @@ final class GpuFlashAttention {
     /** The key and query buffers of this layer's decode kernel, the identity of its graph dispatches. */
     private final GpuBuffer k;
     private final GpuBuffer q;
+    /** True when the plan's tensor-core prefill serves the one-row step faster than the decode kernel. */
+    private final boolean routesDecodeThroughPrefill;
+    /** True when the one-row route follows the step's live key count (an mma prefill and a dense fast-path plan). */
+    private final boolean routesDecodeByDepth;
     /** The decode-step patcher; created on first use. */
     private FlashDecodePatcher patcher;
+    /** The multi-row step patcher; created on first use, null while the plan runs the decode kernel per row. */
+    private FlashPrefillPatcher prefillPatcher;
     private int decodeSplits = 1;
 
     private GpuFlashAttention(FlashPlan plan, FlashKernelArgs args, PreparedDispatch decode,
@@ -70,6 +76,23 @@ final class GpuFlashAttention {
         this.lse = lse;
         this.k = args.keys().k();
         this.q = args.q();
+        this.routesDecodeThroughPrefill = plan.routesDecodeThroughPrefill();
+        this.routesDecodeByDepth = plan.routesDecodeByDepth();
+    }
+
+    /**
+     * True when this step's one-row attention runs the tensor-core prefill launch: the plan-level route
+     * ({@link FlashPlan#routesDecodeThroughPrefill}) plus, on a dense fast-path plan with an mma kernel, every
+     * step over at most {@link FlashAttnTiling#WG} live keys — the workgroup bound at which the decode plan stops
+     * splitting, where the paired benches put the prefill route ahead.
+     */
+    boolean routesDecodeThroughPrefill(int liveKeys) {
+        return routesDecodeThroughPrefill || (routesDecodeByDepth && liveKeys <= FlashAttnTiling.WG);
+    }
+
+    /** True when the one-row route follows the step's live key count, so either kernel may run a replayed step. */
+    boolean routesDecodeByDepth() {
+        return routesDecodeByDepth;
     }
 
     /**
@@ -84,6 +107,24 @@ final class GpuFlashAttention {
                     sinkPartial != null ? sinkPartial.dispatch() : null);
         }
         return patcher;
+    }
+
+    /**
+     * The multi-row step patcher of this attention's group, or null when the prefill runs the decode kernel
+     * per row ({@link FlashAttnTiling.Plan#PER_ROW_DECODE}): claims this layer's prefill kernel and its
+     * merges in a captured graph and patches them from the step position and the captured row count,
+     * replacing the body {@link #prefill} re-runs on a replay.
+     */
+    FlashPrefillPatcher prefillPatcher() {
+        if (prefill == null) {
+            return null;
+        }
+        if (prefillPatcher == null) {
+            prefillPatcher = new FlashPrefillPatcher(prefillPlan, cached, keyRowBase, keyRows, nHead,
+                    dV, partialCapacity, flags, sinkPartial != null, lse != null, k, q, prefill,
+                    combine.dispatch(), lse, sinkPartial != null ? sinkPartial.dispatch() : null);
+        }
+        return prefillPatcher;
     }
 
     /**
@@ -120,6 +161,11 @@ final class GpuFlashAttention {
     /** The learned static sink-token partial, or null without sink tokens. */
     StaticSinkPartial sinkPartial() {
         return sinkPartial;
+    }
+
+    /** True when the plan's tensor-core prefill serves the one-row step faster than the decode kernel. */
+    boolean routesDecodeThroughPrefill() {
+        return routesDecodeThroughPrefill;
     }
 
     /** The prefill dispatch of a TILED or MMA plan over {@code ubatch} rows; null for a per-row plan. */

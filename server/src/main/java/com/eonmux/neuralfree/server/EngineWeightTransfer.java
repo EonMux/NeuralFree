@@ -68,7 +68,7 @@ final class EngineWeightTransfer {
                     + " a CLIP dual encoder takes no live weight updates");
         }
         for (EngineReplica replica : owner.replicas()) {
-            replica.initWeightTransferOp(version, waitMillis);
+            replica.weightTransferOps().initWeightTransferOp(version, waitMillis);
         }
         return version;
     }
@@ -90,7 +90,7 @@ final class EngineWeightTransfer {
      */
     synchronized void shutdown(long waitMillis) throws InterruptedException {
         for (EngineReplica replica : owner.replicas()) {
-            replica.shutdownWeightTransferOp(waitMillis);
+            replica.weightTransferOps().shutdownWeightTransferOp(waitMillis);
         }
     }
 
@@ -111,7 +111,7 @@ final class EngineWeightTransfer {
     synchronized void start(long waitMillis) throws InterruptedException {
         requireInitialized();
         for (EngineReplica replica : owner.replicas()) {
-            replica.startWeightUpdateOp(waitMillis);
+            replica.weightTransferOps().startWeightUpdateOp(waitMillis);
         }
     }
 
@@ -135,7 +135,7 @@ final class EngineWeightTransfer {
         requireInitialized();
         for (WeightUpdateTensor tensor : tensors) {
             for (EngineReplica replica : owner.replicas()) {
-                replica.applyWeightOp(tensor, waitMillis);
+                replica.weightTransferOps().applyWeightOp(tensor, waitMillis);
             }
         }
     }
@@ -160,7 +160,7 @@ final class EngineWeightTransfer {
     synchronized String finish(String version, long waitMillis) throws InterruptedException {
         requireInitialized();
         for (EngineReplica replica : owner.replicas()) {
-            replica.finishWeightUpdateOp(version, waitMillis);
+            replica.weightTransferOps().finishWeightUpdateOp(version, waitMillis);
         }
         if (version != null) {
             this.version = version;
@@ -186,7 +186,7 @@ final class EngineWeightTransfer {
     synchronized String setVersion(String version, long waitMillis) throws InterruptedException {
         requireInitialized();
         for (EngineReplica replica : owner.replicas()) {
-            replica.setWeightVersionOp(version, waitMillis);
+            replica.weightTransferOps().setWeightVersionOp(version, waitMillis);
         }
         this.version = version;
         return version;
@@ -210,7 +210,7 @@ final class EngineWeightTransfer {
     synchronized List<String> versions(long waitMillis) throws InterruptedException {
         List<String> out = new ArrayList<>(owner.replicas().size());
         for (EngineReplica replica : owner.replicas()) {
-            String replicaVersion = replica.weightVersionOp(waitMillis);
+            String replicaVersion = replica.weightTransferOps().weightVersionOp(waitMillis);
             out.add(replicaVersion == null ? version : replicaVersion);
         }
         return out;

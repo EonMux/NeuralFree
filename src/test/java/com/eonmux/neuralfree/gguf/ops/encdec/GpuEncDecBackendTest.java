@@ -44,9 +44,9 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import com.eonmux.neuralfree.gguf.tokenizer.SpecialTokens;
 import org.junit.After;
 import org.junit.Test;
@@ -303,7 +303,7 @@ public class GpuEncDecBackendTest {
 
     /** Dispatched kernel names with the recording block calls inserted where they happened. */
     private List<String> trace() {
-        List<Dispatch> ds = backend.dispatches();
+        List<FakeDispatch> ds = backend.dispatches();
         List<String> out = new ArrayList<>();
         int e = 0;
         for (int i = 0; i <= ds.size(); i++) {
@@ -318,16 +318,16 @@ public class GpuEncDecBackendTest {
         return out;
     }
 
-    private static List<OpKind> kinds(List<Op> log) {
-        List<OpKind> out = new ArrayList<>();
-        for (Op op : log) {
+    private static List<FakeOpKind> kinds(List<FakeOp> log) {
+        List<FakeOpKind> out = new ArrayList<>();
+        for (FakeOp op : log) {
             out.add(op.kind());
         }
         return out;
     }
 
     private int firstDispatchUsing(GpuWeight w) {
-        List<Dispatch> ds = backend.dispatches();
+        List<FakeDispatch> ds = backend.dispatches();
         for (int i = 0; i < ds.size(); i++) {
             if (ds.get(i).bufferArgs().contains(w.shard(0))) {
                 return i;
@@ -357,9 +357,9 @@ public class GpuEncDecBackendTest {
         assertTrue(enc.encoded());
         assertEquals(1, memory.sequence().nPast());
         assertArrayEquals(new int[]{DECLARED_START}, memory.sequence().tokens());
-        List<OpKind> k = kinds(backend.ops());
-        assertEquals(1, Collections.frequency(k, OpKind.FINISH));
-        assertEquals(OpKind.FINISH, k.get(k.size() - 1));
+        List<FakeOpKind> k = kinds(backend.ops());
+        assertEquals(1, Collections.frequency(k, FakeOpKind.FINISH));
+        assertEquals(FakeOpKind.FINISH, k.get(k.size() - 1));
 
         int n = SOURCE.length;
         int enc0 = eventDispatchIndex("attn enc.blk 0 prefill 0+" + n);
@@ -368,9 +368,9 @@ public class GpuEncDecBackendTest {
         assertTrue(events.contains("ffn enc.blk 1 " + n));
         int encNorm = firstDispatchUsing(weights.get(TensorNames.weight(TensorNames.ENC_OUTPUT_NORM)));
         assertEquals(NormKernels.ROW_NORM, backend.dispatches().get(encNorm).kernelName());
-        List<Dispatch> stores = backend.dispatchesOf(RopeKernels.kvStore(KvDType.F16));
+        List<FakeDispatch> stores = backend.dispatchesOf(RopeKernels.kvStore(KvDType.F16));
         assertEquals(2 * N_DEC_LAYER, stores.size());
-        for (Dispatch s : stores) {
+        for (FakeDispatch s : stores) {
             assertEquals(n, s.intArg(RopeKernels.ARG_N_TOKENS));
         }
         int firstStore = backend.dispatches().indexOf(stores.get(0));
@@ -395,9 +395,9 @@ public class GpuEncDecBackendTest {
             assertTrue(t.contains("attn dec.blk 1 decode " + step));
             assertFalse(t.contains("attn enc.blk 0 prefill 0+" + n));
             assertTrue(backend.dispatchesOf(RopeKernels.kvStore(KvDType.F16)).isEmpty());
-            List<Dispatch> cross = backend.dispatchesOf(AttnKernels.flashDecode(KvDType.F16));
+            List<FakeDispatch> cross = backend.dispatchesOf(AttnKernels.flashDecode(KvDType.F16));
             assertEquals(N_DEC_LAYER, cross.size());
-            for (Dispatch d : cross) {
+            for (FakeDispatch d : cross) {
                 assertEquals(0, d.intArg(AttnKernels.ARG_FD_KV_START));
                 assertEquals(n, d.intArg(AttnKernels.ARG_FD_KV_END));
                 assertEquals(step, d.intArg(AttnKernels.ARG_FD_Q_POS));
@@ -487,10 +487,10 @@ public class GpuEncDecBackendTest {
             assertFalse(e, e.contains(TensorNames.STACK_DEC));
         }
         assertTrue(backend.dispatchesOf(RopeKernels.kvStore(KvDType.F16)).isEmpty());
-        List<Op> log = backend.ops();
-        List<OpKind> k = kinds(log);
-        assertEquals(1, Collections.frequency(k, OpKind.READ));
-        assertEquals((long) 3 * WIDTH * Float.BYTES, log.get(k.lastIndexOf(OpKind.READ)).bytes());
+        List<FakeOp> log = backend.ops();
+        List<FakeOpKind> k = kinds(log);
+        assertEquals(1, Collections.frequency(k, FakeOpKind.READ));
+        assertEquals((long) 3 * WIDTH * Float.BYTES, log.get(k.lastIndexOf(FakeOpKind.READ)).bytes());
         assertEquals(1, memory.sequence().nPast());
         assertTrue(enc.encoded());
         assertThrows(IllegalArgumentException.class, () -> enc.hiddenRows(new int[UBATCH + 1], null));

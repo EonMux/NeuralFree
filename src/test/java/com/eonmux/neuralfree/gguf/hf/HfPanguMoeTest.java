@@ -45,10 +45,24 @@ public class HfPanguMoeTest {
     private static final int V = 7;
     private static final float EPS = 1e-6f;
 
+    /**
+     * The plain trunk's head dim. GPU-servable geometry: the flash-attention kernels serve head dims that are
+     * positive multiples of 4, so the GPU trunk tests run their attention on the device instead of the load
+     * refusing it.
+     */
+    private static final int HEAD_DIM = 4;
+
+    /**
+     * The plain trunk's head count. The openpangu converter writes no key or value length when the configuration
+     * carries {@code head_dim}, so the engine's default key length {@code hidden_size / num_attention_heads} must
+     * equal the head dim; with the hidden size of {@link #D}, that is one head of {@link #HEAD_DIM}.
+     */
+    private static final int PLAIN_HEADS = 1;
+
     // ---- MLA trunk geometry
     private static final int HEADS = 2;
-    private static final int NOPE = 2;
-    private static final int ROPE_DIM = 2;
+    private static final int NOPE = 4;
+    private static final int ROPE_DIM = 4;
     private static final int QK = NOPE + ROPE_DIM;
     private static final int VHEAD = 1;
     private static final int KV_LORA = 4;
@@ -69,8 +83,8 @@ public class HfPanguMoeTest {
 
     private static final String PLAIN_CONFIG = SyntheticHf.json("{'architectures':['PanguProMoEV2ForCausalLM'],"
             + "'model_type':'openpangu','hidden_size':" + D + ",'intermediate_size':" + FFN
-            + ",'num_hidden_layers':2,'num_attention_heads':" + HEADS + ",'num_key_value_heads':" + HEADS
-            + ",'head_dim':2,'max_position_embeddings':16,'rms_norm_eps':" + EPS + ",'rope_theta':10000.0"
+            + ",'num_hidden_layers':2,'num_attention_heads':" + PLAIN_HEADS + ",'num_key_value_heads':" + PLAIN_HEADS
+            + ",'head_dim':" + HEAD_DIM + ",'max_position_embeddings':16,'rms_norm_eps':" + EPS + ",'rope_theta':10000.0"
             + ",'vocab_size':" + V + ",'first_k_dense_replace':1,'moe_intermediate_size':" + MOE_FFN
             + ",'num_experts':" + EXPERTS + ",'n_routed_experts':" + EXPERTS + ",'n_shared_experts':1"
             + ",'num_experts_per_tok':1,'norm_topk_prob':true,'routed_scaling_factor':1.0,'hidden_act':'silu'"
@@ -409,8 +423,8 @@ public class HfPanguMoeTest {
     private Path plainCheckpoint(String config, String folder, boolean sandwich) throws Exception {
         SyntheticHf.Builder b = SyntheticHf.builder().config(config);
         tensor(b, "model.embed_tokens.weight", V, D, matrix(V, D, 1));
-        int headDim = 2;
-        int qkv = HEADS * headDim;
+        int headDim = HEAD_DIM;
+        int qkv = PLAIN_HEADS * headDim;
         for (int l = 0; l < 2; l++) {
             String p = "model.layers." + l + ".";
             tensor(b, p + "input_layernorm.weight", D, 1, ones(D));
@@ -573,6 +587,23 @@ public class HfPanguMoeTest {
         }
     }
 
+    /**
+     * NEOX-style rotation of a whole head (the openPangu graph's rope type): dim {@code i} and its opposite
+     * {@code i + nRot / 2} share {@code theta_i}. For a 2-dim head it coincides with {@link #rotate}; for wider
+     * heads the pairing is what distinguishes the styles.
+     */
+    private static void rotateNeox(float[] x, int pos, int nRot) {
+        for (int i = 0; i < nRot / 2; i++) {
+            double theta = pos / Math.pow(10000.0, 2.0 * i / nRot);
+            float c = (float) Math.cos(theta);
+            float s = (float) Math.sin(theta);
+            float a = x[i];
+            float b = x[i + nRot / 2];
+            x[i] = a * c - b * s;
+            x[i + nRot / 2] = b * c + a * s;
+        }
+    }
+
     /** NORM-style rotation of {@code nRot} values starting at {@code off} (a partial rotary over a head). */
     private static void rotateRange(float[] x, int off, int pos, int nRot) {
         for (int i = 0; i < nRot / 2; i++) {
@@ -638,7 +669,9 @@ public class HfPanguMoeTest {
                 System.arraycopy(qp, 0, q[p][h], NOPE, ROPE_DIM);
                 System.arraycopy(kvb, h * (NOPE + VHEAD), k[p][h], 0, NOPE);
                 System.arraycopy(pe, 0, k[p][h], NOPE, ROPE_DIM);
-                v[p][h][0] = kvb[h * (NOPE + VHEAD) + NOPE];
+                for (int d = 0; d < VHEAD; d++) {
+                    v[p][h][d] = kvb[h * (NOPE + VHEAD) + NOPE + d];
+                }
             }
         }
         float[][] out = new float[t][D];
@@ -658,7 +691,9 @@ public class HfPanguMoeTest {
                     sum += scores[j];
                 }
                 for (int j = 0; j <= p; j++) {
-                    heads[h * VHEAD] += scores[j] / sum * v[j][h][0];
+                    for (int d = 0; d < VHEAD; d++) {
+                        heads[h * VHEAD + d] += scores[j] / sum * v[j][h][d];
+                    }
                 }
             }
             out[p] = linear(heads, matrix(D, HEADS * VHEAD, 6 + 10 * layer), D);
@@ -683,29 +718,29 @@ public class HfPanguMoeTest {
 
     private static float[][] plainAttention(float[][] x, int layer, int window) {
         int t = x.length;
-        int headDim = 2;
-        int qkv = HEADS * headDim;
-        float[][][] q = new float[t][HEADS][headDim];
-        float[][][] k = new float[t][HEADS][headDim];
-        float[][][] v = new float[t][HEADS][headDim];
+        int headDim = HEAD_DIM;
+        int qkv = PLAIN_HEADS * headDim;
+        float[][][] q = new float[t][PLAIN_HEADS][headDim];
+        float[][][] k = new float[t][PLAIN_HEADS][headDim];
+        float[][][] v = new float[t][PLAIN_HEADS][headDim];
         for (int p = 0; p < t; p++) {
             float[] n = rms(x[p], ones(D));
             float[] qv = linear(n, matrix(qkv, D, 2 + 10 * layer), qkv);
             float[] kv = linear(n, matrix(qkv, D, 3 + 10 * layer), qkv);
             float[] vv = linear(n, matrix(qkv, D, 4 + 10 * layer), qkv);
-            for (int h = 0; h < HEADS; h++) {
+            for (int h = 0; h < PLAIN_HEADS; h++) {
                 System.arraycopy(qv, h * headDim, q[p][h], 0, headDim);
                 System.arraycopy(kv, h * headDim, k[p][h], 0, headDim);
                 System.arraycopy(vv, h * headDim, v[p][h], 0, headDim);
-                rotate(q[p][h], p, headDim);
-                rotate(k[p][h], p, headDim);
+                rotateNeox(q[p][h], p, headDim);
+                rotateNeox(k[p][h], p, headDim);
             }
         }
         float[][] out = new float[t][D];
         float scale = (float) (1.0 / Math.sqrt(headDim));
         for (int p = 0; p < t; p++) {
             float[] heads = new float[qkv];
-            for (int h = 0; h < HEADS; h++) {
+            for (int h = 0; h < PLAIN_HEADS; h++) {
                 int first = window > 0 ? Math.max(0, p - window + 1) : 0;
                 float[] scores = new float[p - first + 1];
                 float max = Float.NEGATIVE_INFINITY;

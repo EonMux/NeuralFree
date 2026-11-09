@@ -41,7 +41,7 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -189,15 +189,15 @@ public class GpuCrossAttentionMixerTest {
         return scratch.slot(name);
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
-    private static List<Dispatch> named(List<Dispatch> ds, String kernel) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+    private static List<FakeDispatch> named(List<FakeDispatch> ds, String kernel) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 out.add(d);
             }
@@ -205,7 +205,7 @@ public class GpuCrossAttentionMixerTest {
         return out;
     }
 
-    private static int indexOf(List<Dispatch> ds, Dispatch d) {
+    private static int indexOf(List<FakeDispatch> ds, FakeDispatch d) {
         for (int i = 0; i < ds.size(); i++) {
             if (ds.get(i) == d) {
                 return i;
@@ -223,12 +223,12 @@ public class GpuCrossAttentionMixerTest {
     @Test
     public void encodeStoresCrossKvOnceAtIdentityRows() {
         open(KvDType.F16);
-        List<Dispatch> ds = run(() -> mixer.encode(encoderOutput, 0, N_ENC));
-        List<Dispatch> stores = named(ds, RopeKernels.kvStore(KvDType.F16));
+        List<FakeDispatch> ds = run(() -> mixer.encode(encoderOutput, 0, N_ENC));
+        List<FakeDispatch> stores = named(ds, RopeKernels.kvStore(KvDType.F16));
         assertEquals(2, stores.size());
         GpuKvLayer crossKv = memory.crossKv(0);
         for (int i = 0; i < 2; i++) {
-            Dispatch s = stores.get(i);
+            FakeDispatch s = stores.get(i);
             assertEquals(N_ENC, s.intArg(RopeKernels.ARG_N_TOKENS));
             assertEquals(DIM, s.intArg(1));
             assertSame(slot(i == 0 ? ScratchSlots.K : ScratchSlots.V).buffer(), s.bufferArg(5));
@@ -276,18 +276,18 @@ public class GpuCrossAttentionMixerTest {
         mixer.encode(encoderOutput, 0, N_ENC);
         int pos = 3;
         steps().upload(pos, 1);
-        List<Dispatch> ds = run(() -> mixer.decode(pos, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(pos, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
         assertTrue(named(ds, RopeKernels.kvStore(KvDType.F16)).isEmpty());
         assertTrue(named(ds, HadamardSpec.KERNEL).isEmpty());
-        List<Dispatch> flash = named(ds, AttnKernels.flashDecode(KvDType.F16));
+        List<FakeDispatch> flash = named(ds, AttnKernels.flashDecode(KvDType.F16));
         assertEquals(1, flash.size());
         FlashAttnTiling plan = FlashAttnTiling.decode(N_HEAD, N_HEAD, HEAD_DIM, HEAD_DIM, N_CTX,
-                kernels.faSmemFloats(), Math.max(1, backend.capabilities().getComputeUnits()));
+                kernels.faSmemFloats(), Math.max(1, backend.capabilities().getComputeUnits()), false);
         int nSplit = plan.decodeSplit(N_ENC).count();
         assertEquals(nSplit == 1 ? 0 : 1, named(ds, AttnKernels.FLASH_COMBINE).size());
 
-        Dispatch cross = flash.get(0);
+        FakeDispatch cross = flash.get(0);
         GpuKvLayer crossKv = memory.crossKv(0);
         assertEquals(N_HEAD, cross.intArg(AttnKernels.ARG_FD_N_HEAD));
         assertEquals(nSplit, cross.intArg(AttnKernels.ARG_FD_N_SPLIT));
@@ -324,12 +324,12 @@ public class GpuCrossAttentionMixerTest {
         steps().upload(0, n);
         FlashAttnTiling plan = FlashAttnTiling.prefill(N_HEAD, N_HEAD, HEAD_DIM, HEAD_DIM, N_CTX,
                 kernels.faSmemFloats(), Math.max(1, backend.capabilities().getComputeUnits()));
-        List<Dispatch> ds = run(() -> mixer.prefill(0, n, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.prefill(0, n, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
         assertTrue(named(ds, RopeKernels.kvStore(KvDType.F16)).isEmpty());
         if (plan.plan() == FlashAttnTiling.Plan.TILED) {
-            List<Dispatch> tiled = named(ds, AttnKernels.flashAttn(KvDType.F16));
+            List<FakeDispatch> tiled = named(ds, AttnKernels.flashAttn(KvDType.F16));
             assertEquals(1, tiled.size());
-            Dispatch cross = tiled.get(0);
+            FakeDispatch cross = tiled.get(0);
             assertEquals(n, cross.intArg(AttnKernels.ARG_FA_N_TOKENS));
             assertEquals(0, cross.intArg(AttnKernels.ARG_FA_KV_START));
             assertEquals(N_ENC, cross.intArg(AttnKernels.ARG_FA_KV_END));
@@ -341,10 +341,10 @@ public class GpuCrossAttentionMixerTest {
             assertSame(steps().identityRows(), cross.bufferArg(AttnKernels.ARG_FA_BUF_KV_POS));
             assertSame(placeholders.readOnlyFloats(), cross.bufferArg(AttnKernels.ARG_FA_BUF_REL_BIAS));
         } else {
-            List<Dispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F16));
+            List<FakeDispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F16));
             assertEquals(n, rows.size());
             for (int t = 0; t < n; t++) {
-                Dispatch row = rows.get(t);
+                FakeDispatch row = rows.get(t);
                 assertEquals(t, row.intArg(AttnKernels.ARG_FD_Q_POS));
                 assertEquals(N_ENC, row.intArg(AttnKernels.ARG_FD_KV_END));
                 assertEquals(t * DIM, row.intArg(AttnKernels.ARG_FD_Q_OFF));
@@ -358,18 +358,18 @@ public class GpuCrossAttentionMixerTest {
     @Test
     public void quantizedCacheRotatesKeysValuesQueriesAndOutputs() {
         open(KvDType.Q8_0);
-        List<Dispatch> enc = run(() -> mixer.encode(encoderOutput, 0, N_ENC));
+        List<FakeDispatch> enc = run(() -> mixer.encode(encoderOutput, 0, N_ENC));
         assertEquals(2, named(enc, HadamardSpec.KERNEL).size());
         assertEquals(2, named(enc, RopeKernels.kvStore(KvDType.Q8_0)).size());
         steps().upload(0, 1);
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
-        List<Dispatch> rotations = named(ds, HadamardSpec.KERNEL);
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> rotations = named(ds, HadamardSpec.KERNEL);
         assertEquals(2, rotations.size());
         assertEquals(1, named(ds, AttnKernels.flashDecode(KvDType.Q8_0)).size());
-        for (Dispatch h : rotations) {
+        for (FakeDispatch h : rotations) {
             assertEquals(64, h.intArg(HadamardSpec.ARG_BLOCK));
         }
-        Dispatch flash = named(ds, AttnKernels.flashDecode(KvDType.Q8_0)).get(0);
+        FakeDispatch flash = named(ds, AttnKernels.flashDecode(KvDType.Q8_0)).get(0);
         assertTrue(indexOf(ds, rotations.get(0)) < indexOf(ds, flash));
         assertTrue(indexOf(ds, rotations.get(1)) > indexOf(ds, flash));
     }
@@ -382,9 +382,9 @@ public class GpuCrossAttentionMixerTest {
         GpuKvLayer cross = memory.crossKv(0);
         assertEquals(KvDType.F16, cross.layout().dtypeK());
         assertEquals(KvDType.Q8_0, cross.layout().dtypeV());
-        List<Dispatch> enc = run(() -> mixer.encode(encoderOutput, 0, N_ENC));
-        List<Dispatch> storesK = named(enc, RopeKernels.kvStore(KvDType.F16));
-        List<Dispatch> storesV = named(enc, RopeKernels.kvStore(KvDType.Q8_0));
+        List<FakeDispatch> enc = run(() -> mixer.encode(encoderOutput, 0, N_ENC));
+        List<FakeDispatch> storesK = named(enc, RopeKernels.kvStore(KvDType.F16));
+        List<FakeDispatch> storesV = named(enc, RopeKernels.kvStore(KvDType.Q8_0));
         assertEquals(1, storesK.size());
         assertEquals(1, storesV.size());
         assertTrue(storesK.get(0).bufferArgs().contains(cross.k()));
@@ -392,12 +392,12 @@ public class GpuCrossAttentionMixerTest {
         assertEquals(cross.rotation().rotateV() ? 1 : 0, named(enc, HadamardSpec.KERNEL).size());
 
         steps().upload(0, 1);
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
         assertTrue(named(ds, AttnKernels.flashDecode(KvDType.F16)).isEmpty());
         assertTrue(named(ds, AttnKernels.flashDecode(KvDType.Q8_0)).isEmpty());
-        List<Dispatch> flash = named(ds, AttnKernels.FLASH_DECODE_MIXED);
+        List<FakeDispatch> flash = named(ds, AttnKernels.FLASH_DECODE_MIXED);
         assertEquals(1, flash.size());
-        Dispatch fd = flash.get(0);
+        FakeDispatch fd = flash.get(0);
         assertEquals(AttnKernels.FD_MIXED_ARG_COUNT, fd.argCount());
         assertEquals(AttnKernels.kvTypes(KvDType.F16, KvDType.Q8_0), fd.intArg(AttnKernels.ARG_FD_KV_TYPES));
         assertSame(cross.k(), fd.bufferArg(AttnKernels.ARG_FD_BUF_K));

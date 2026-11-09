@@ -2,6 +2,7 @@
 # Q8_0, MXFP4 and IQ4_XS kernels (OpenCL: matvec_q8_0.cl, matvec_mxfp4.cl, matvec_iq4_xs.cl) and the legacy-quant family (matvec_legacy.cl); decoders in common/quant_legacy.glsl.
 # Q8_0
 Q8_0_MatVec	matvec_quant.comp	QTYPE=QT_Q8_0 OP=OP_MATVEC	sg
+Q8_0_MatVecN	matvec_quant.comp	QTYPE=QT_Q8_0 OP=OP_MATVECN	sg
 Q8_0_MatVecAdd	matvec_quant.comp	QTYPE=QT_Q8_0 OP=OP_MATVEC_ADD	sg
 Q8_0_MatVecFusedGateUp	matvec_quant.comp	QTYPE=QT_Q8_0 OP=OP_GATEUP_SILU	sg
 Q8_0_MatVecFusedGateUpGelu	matvec_quant.comp	QTYPE=QT_Q8_0 OP=OP_GATEUP_GELU	sg
@@ -13,6 +14,36 @@ LLM_Batch_Q8_0_EmbeddingLookup	embed.comp	QTYPE=QT_Q8_0 OP=OP_BATCH_EMBED
 LLM_QuantizeQ8	quantize_q8_0.comp	OP=OP_QUANTIZEQ8
 Q8_0_MatVec_Q8	matvec_q8q8.comp	OP=OP_MATVEC	sg
 Q8_0_MatVecN_Q8	matvec_q8q8.comp	OP=OP_MATVECN	sg
+Q8_0_MatVecN2_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=2	sg
+Q8_0_MatVecN3_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=3	sg
+Q8_0_MatVecN4_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=4	sg
+Q8_0_MatVecN5_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=5	sg
+Q8_0_MatVecN6_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=6	sg
+Q8_0_MatVecN7_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=7	sg
+Q8_0_MatVecN8_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=8	sg
+Q8_0_MatVecN9_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=9	sg
+Q8_0_MatVecN10_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=10	sg
+Q8_0_MatVecN11_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=11	sg
+Q8_0_MatVecN12_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=12	sg
+Q8_0_MatVecN13_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=13	sg
+Q8_0_MatVecN14_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=14	sg
+Q8_0_MatVecN15_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=15	sg
+Q8_0_MatVecN16_Q8	matvec_q8q8.comp	OP=OP_MATVECN NC=16	sg
+Q8_0_MatVec2N2_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=2	sg
+Q8_0_MatVec2N3_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=3	sg
+Q8_0_MatVec2N4_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=4	sg
+Q8_0_MatVec2N5_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=5	sg
+Q8_0_MatVec2N6_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=6	sg
+Q8_0_MatVec2N7_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=7	sg
+Q8_0_MatVec2N8_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=8	sg
+Q8_0_MatVec2N9_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=9	sg
+Q8_0_MatVec2N10_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=10	sg
+Q8_0_MatVec2N11_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=11	sg
+Q8_0_MatVec2N12_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=12	sg
+Q8_0_MatVec2N13_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=13	sg
+Q8_0_MatVec2N14_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=14	sg
+Q8_0_MatVec2N15_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=15	sg
+Q8_0_MatVec2N16_Q8	matvec_q8q8.comp	OP=OP_MATVEC2N NC=16	sg
 Q8_0_MatVec2_Q8	matvec_q8q8.comp	OP=OP_MATVEC2	sg
 Q8_0_MatVecAdd_Q8	matvec_q8q8.comp	OP=OP_MATVEC_ADD	sg
 Q8_0_MatVecFusedGateUp_Q8	matvec_q8q8.comp	OP=OP_GATEUP_SILU	sg

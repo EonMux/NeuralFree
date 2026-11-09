@@ -255,6 +255,13 @@ public class TreeVerifyDeviceAcceptTest {
         theDeviceWalkMatchesTheHostWalk(EngineConfig.BackendMode.OPENCL);
     }
 
+    /** The same device-walk parity on Vulkan: the GLSL twin's walk over the same batch. */
+    @Test
+    public void theDeviceWalkMatchesTheHostWalkOnVulkan() throws IOException {
+        GpuTestUtil.assumeVulkanAvailable();
+        theDeviceWalkMatchesTheHostWalk(EngineConfig.BackendMode.VULKAN);
+    }
+
     private void theDeviceWalkMatchesTheHostWalk(EngineConfig.BackendMode backend) throws IOException {
         try (EngineModel model = LLMModelFactory.open(modelFile.toString(), treeConfig(backend, true))) {
             assertTrue("the backend walks the acceptance on the device",

@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.encdec;
 
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
@@ -21,6 +22,7 @@ import com.eonmux.neuralfree.gguf.memory.gpu.GpuMemory;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnKernels;
 import com.eonmux.neuralfree.gguf.ops.attn.FlashAttnTiling;
+import com.eonmux.neuralfree.gguf.ops.attn.FlashBindGuard;
 import com.eonmux.neuralfree.gguf.ops.rope.RopeKernels;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
@@ -196,13 +198,17 @@ public final class GpuCrossAttentionMixer implements GpuMixer {
     }
 
     private void bindDispatches(GpuForwardContext ctx, DeviceStepInputs steps) {
+        FlashBindGuard.requireServable(ctx.kernels(), "T5 decoder layer " + EncDecBlocks.describe(layer)
+                        + " (cross attention)", cross.nHead(), cross.nHeadKv(), cross.headDimK(), cross.headDimV());
         int smem = ctx.kernels().faSmemFloats();
         int cus = Math.max(1, ctx.kernels().caps().getComputeUnits());
         KvLayout l = crossKv[0].layout();
         KvDType typeK = l.dtypeK();
         KvDType typeV = l.dtypeV();
         decodePlan = FlashAttnTiling.decode(cross.nHead(), cross.nHeadKv(), cross.headDimK(), cross.headDimV(),
-                l.rows(), smem, cus);
+                l.rows(), smem, cus,
+                FlashAttnTiling.decodeFastPath(ctx.kernels().caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+                        typeK, typeV, cross.headDimK(), cross.headDimV()));
         prefillPlan = FlashAttnTiling.prefill(cross.nHead(), cross.nHeadKv(), cross.headDimK(), cross.headDimV(),
                 l.rows(), smem, cus);
         partialCapacity = decodePlan.decodePartialFloats();

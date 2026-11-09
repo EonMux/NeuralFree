@@ -38,12 +38,19 @@
  *   1. q of the g_tile heads is staged in q_s; ALiBi slopes per head in stats.
  *   2. Pass 1: work-item j scores keys j, j + 128, ... of the split; one K row read feeds the g_tile
  *      dot products; masked keys score -INF without touching K.
+ *      NF_HAS_SG_SHUFFLE fast path (plain F32/F16/BF16 caches, no row-relative bias table, split_len
+ *      <= NF_FA_WG, g_tile <= 4): warp w scans the 32 keys [w * 32, +32) of the split, each lane
+ *      holding one float4 of the key's K row (one coalesced row read per key) and the per-head dot is
+ *      reduced with the subgroup butterfly (nf_seg_sum at width 32, register form); lane 0 of the warp
+ *      stores the score.
  *   3. Per head: m = workgroup max, p = e^(s - m) in place, l = workgroup sum.
  *   4. Pass 2: the workgroup's NF_FA_WG/32 lane groups own interleaved keys (j = lane group, step
  *      NF_FA_WG/32); each accumulates every o[g][d] = sum_t p[g][t] * V[t][d] pair over its keys with V
  *      read coalesced along d (lane l owning pairs l, l + 32, ...) and stages its accumulators in o_s; each
  *      work-item then sums the staged partials of the pairs it writes. A row wider than
  *      32 * NF_FA_ACC_MAX pairs runs as one group over every key. Keys with p == 0 are not read.
+ *      The fast path takes the same lane-group keys with float4 accumulators: lane l holds dims
+ *      l * 4 of every o[g] and one coalesced V row float4 per key, staged to the same o_s slots.
  *   5. direct_out: sinks merged (nf_attn_sink) and o / l written; l == 0 (fully masked row, no sink)
  *      writes 0. Otherwise (o, m, l) go to partial.
  * Subgroups: reductions use nf_wg_max / nf_wg_sum (common/reduce.h); local size 128 is a multiple of 32
@@ -63,6 +70,34 @@ NF_INLINE int nf_fd_plan_ok(int n_head, int n_head_kv, int d_k, int d_v, int g_t
         && (direct_out == 0 || n_split == 1)
         && (int)get_local_size(0) == NF_FA_WG;
 }
+
+#ifdef NF_HAS_SG_SHUFFLE
+/*
+ * The warp fast path's gate (NF_HAS_SG_SHUFFLE backends only; elsewhere the scalar body runs and the
+ * plan below always generates its shape): one query head's K row is read as one coalesced float4 per
+ * lane (the row spans exactly one warp instruction) and its dot is reduced with the subgroup butterfly,
+ * so pass 1 needs no local-memory tree per key; pass 2 accumulates V the same coalesced way. Plain
+ * cache element types only (F32/F16/BF16: the loaders are direct vector loads, no side planes or
+ * centroids), no row-relative bias table, head dims of at most NF_FA_FAST_DIM (32 lanes cover exactly
+ * 32 * 4 dims; a wider row would need the lanes to loop and only the scalar body is measured there),
+ * and the split no longer than the workgroup (each warp scans 32 keys of it). d_k and d_v are
+ * multiples of 4 by the plan; lanes past d_k/4 or d_v/4 contribute zeros.
+ *
+ * A step over at most one workgroup of keys reaches the fast path only through the plan's route: the
+ * mixer routes those steps to the tensor-core prefill when the plan has one (paired CUDA benches over
+ * 128-token runs put the prefill route 3-7% ahead of the decode route on every model tried), so the
+ * scalar body below serves short steps only where no prefill kernel exists or the caches refuse the
+ * fast path. The fast body measured faster than the scalar body at every depth on the decode route
+ * (paired 0.6B Q8_0 runs: 337 t/s against 311 t/s over 128-token steps), so no key-count gate here.
+ */
+NF_INLINE int nf_fd_fast_ok(int k_type, int v_type, int d_k, int d_v, int split_len,
+                            int n_buckets, int g_tile) {
+    return d_k <= NF_FA_FAST_DIM && d_v <= NF_FA_FAST_DIM
+        && split_len <= NF_FA_WG && n_buckets == 0 && g_tile <= NF_FA_LG
+        && (k_type == NF_KV_F32 || k_type == NF_KV_F16 || k_type == NF_KV_BF16)
+        && (v_type == NF_KV_F32 || v_type == NF_KV_F16 || v_type == NF_KV_BF16);
+}
+#endif /* NF_HAS_SG_SHUFFLE */
 
 /* Writes NaN over the outputs of a call whose arguments violate the plan (workgroup (0, 0) only). */
 NF_INLINE void nf_fd_poison(int n_head, int d_v, int n_split, int direct_out, int out_off,
@@ -162,13 +197,77 @@ NF_INLINE void nf_fd_run(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    /* 2. pass 1: scores of the split's keys into s_s, per-item running max */
+    /* 2. pass 1: scores of the split's keys into s_s, per-item running max. Under NF_HAS_SG_SHUFFLE the
+     * warp fast path runs first: warp w of the workgroup scans the 32 keys [w * 32, +32) of the split,
+     * every lane holding one float4 of the key's K row (one coalesced row read per key) and the dot
+     * reduced by the subgroup butterfly (nf_seg_sum at width 32, register form, no barrier). The scalar
+     * body below is the portable form (OpenCL, exotic caches, splits above the workgroup). */
     float mx[NF_FD_MAX_G];
 #pragma unroll
     for (int g = 0; g < NF_FD_MAX_G; g++) {
         mx[g] = -NF_INF;
     }
     const nf_i64 k_head = (nf_i64)kvh * k_head_stride;
+#ifdef NF_HAS_SG_SHUFFLE
+    if (nf_fd_fast_ok(k_type, v_type, d_k, d_v, split_len, n_buckets, g_tile)) {
+        const int slane = lid & 31;
+        const int w = lid >> 5;
+        const int j0 = w * 32;
+        const int dk4 = d_k >> 2;
+        for (int t = 0; t < 32; t++) {
+            const int j = j0 + t;
+            if (j >= split_len) {
+                break;   /* uniform per warp: every lane leaves together */
+            }
+            int p_k = -1;
+            int vis = 0;
+            int row = 0;
+            nf_i64 e0 = 0;
+            float ks = 1.0f;
+            if (j < n_keys && nf_kv_page_ok(k_begin + j, page_shift, pt, pt_off)) {
+                row = nf_kv_row(k_begin + j, page_shift, pt, pt_off);
+                p_k = kv_pos[row];
+                vis = nf_attn_tree_visible(p_k, tree ? tree_mask[0] : (ulong)0, kv_end, n_fresh,
+                                           q_pos, causal, swa_type, n_swa);
+                if (vis) {
+                    e0 = (nf_i64)row * k_row_stride + k_head;
+                    ks = nf_kv_head_scale(k_type, kv_scales, row, kvh, n_head_kv, 0);
+                }
+            }
+            float part[4];
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+                part[g] = 0.0f;
+            }
+            if (vis && slane < dk4) {
+                const float4 k4 = nf_kv_attn_load4(k, e0 + slane * 4, row, k_type, k_planes, plane_stride,
+                                                   k_row_stride, d_k, centroids) * ks;
+#pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    if (g < g_tile) {
+                        part[g] = dot(vload4(0, q_s + g * d_k + slane * 4), k4);
+                    }
+                }
+            }
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+                if (g < g_tile) {
+                    float s = -NF_INF;
+                    if (vis && g < g_cnt) {
+                        s = nf_attn_score(nf_seg_sum(red, part[g], 32), scale, softcap)
+                          + nf_attn_bias(bias_mode, h0 + g, n_head, q_pos, p_k, slope_s[g], rel_bias,
+                                         n_buckets, max_distance, seq > 0 ? seq : 0);
+                    }
+                    if (slane == 0) {
+                        s_s[g * split_len + j] = s;
+                    }
+                    mx[g] = fmax(mx[g], s);
+                }
+            }
+        }
+    } else
+#endif /* NF_HAS_SG_SHUFFLE */
+    {
     for (int j = lid; j < split_len; j += NF_FA_WG) {
         float acc[NF_FD_MAX_G];
 #pragma unroll
@@ -220,6 +319,7 @@ NF_INLINE void nf_fd_run(
             }
         }
     }
+    }
 
     /* 3. softmax statistics per head: m (max), p = e^(s - m) in place, l (sum) */
     float ls[NF_FD_MAX_G];
@@ -266,6 +366,59 @@ NF_INLINE void nf_fd_run(
     float o[NF_FA_ACC_MAX];
     int pg[NF_FA_ACC_MAX];
     int pd[NF_FA_ACC_MAX];
+    NF_LOCAL_PTR float* o_s = s_s + g_tile * split_len;
+#ifdef NF_HAS_SG_SHUFFLE
+    if (nf_fd_fast_ok(k_type, v_type, d_k, d_v, split_len, n_buckets, g_tile)
+            && n_pairs <= 32 * NF_FA_ACC_MAX) {
+        /* Fast form of the same accumulation: lane group lg owns keys lg, lg + 4, ..., and each lane
+         * holds the float4 of dims lane * 4 of every o[g], so one coalesced V row load feeds the whole
+         * group's lane slice per key. The staged partials land in the same o_s slots the step-5 sum
+         * below reads. */
+        const int dv4 = d_v >> 2;
+        const nf_i64 v_head = (nf_i64)kvh * v_head_stride;
+        float4 acc[4];
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            acc[g] = NF_F4S(0.0f);
+        }
+        for (int j = lg; j < n_keys; j += n_lg) {
+            /* A key no head of the tile weights (masked, or on an unmapped page) is not read: its row
+             * index is undefined off the page table. The test is uniform across the lane group. */
+            int live = 0;
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+                live |= g < g_tile && s_s[g * split_len + j] != 0.0f;
+            }
+            if (!live) {
+                continue;
+            }
+            const int vrow = nf_kv_row(k_begin + j, page_shift, pt, pt_off);
+            const nf_i64 e0 = (nf_i64)vrow * v_row_stride + v_head;
+            const float v_scale = nf_kv_head_scale(v_type, kv_scales, vrow, kvh, n_head_kv, 1);
+            float4 v4 = NF_F4S(0.0f);
+            if (lane < dv4) {
+                v4 = nf_kv_attn_load4(v, e0 + lane * 4, vrow, v_type, v_planes, plane_stride,
+                                      v_row_stride, d_v, centroids) * v_scale;
+            }
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+                if (g < g_tile) {
+                    const float p = s_s[g * split_len + j];
+                    if (p != 0.0f) {
+                        acc[g] += p * v4;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            if (g < g_tile && lane < dv4) {
+                vstore4(acc[g], 0, o_s + lg * n_pairs + g * d_v + lane * 4);
+            }
+        }
+    } else
+#endif /* NF_HAS_SG_SHUFFLE */
+    {
 #pragma unroll
     for (int i = 0; i < NF_FA_ACC_MAX; i++) {
         const int pi = lane + i * gs;
@@ -290,13 +443,13 @@ NF_INLINE void nf_fd_run(
             }
         }
     }
-    NF_LOCAL_PTR float* o_s = s_s + g_tile * split_len;
 #pragma unroll
     for (int i = 0; i < NF_FA_ACC_MAX; i++) {
         const int pi = lane + i * gs;
         if (pi < n_pairs) {
             o_s[lg * n_pairs + pi] = o[i];
         }
+    }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 #pragma unroll

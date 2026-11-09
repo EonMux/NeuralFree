@@ -111,7 +111,8 @@ public final class CpuBlockDecoders {
         m.put(type, new CheckedDecoder(BlockLayout.of(type), kernel));
     }
 
-    /** True when a CPU decoder exists for {@code type}; false only for UNKNOWN and the removed Q4_2 / Q4_3. */
+    /** True when a CPU decoder exists for {@code type}; false only for UNKNOWN, the removed
+     *  Q4_2 / Q4_3, and the device-only {@link GGMLType#isDeviceOnly() W12}. */
     public static boolean supports(GGMLType type) {
         return type != null && DECODERS.containsKey(type);
     }
@@ -129,6 +130,11 @@ public final class CpuBlockDecoders {
     public static Decoder forType(GGMLType type) {
         Decoder d = type == null ? null : DECODERS.get(type);
         if (d == null) {
+            if (type != null && type.isDeviceOnly()) {
+                throw new UnsupportedOperationException("no CPU decoder for ggml type " + type
+                        + " (id " + type.getId() + "): a device-resident form no GGUF file stores;"
+                        + " its rows decode on the device");
+            }
             throw new UnsupportedOperationException("no CPU decoder for ggml type " + type
                     + (type == null ? "" : " (id " + type.getId() + ")")
                     + ": the type is unknown or was removed from ggml");

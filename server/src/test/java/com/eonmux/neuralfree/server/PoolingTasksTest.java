@@ -126,8 +126,8 @@ public class PoolingTasksTest {
         assertEquals(applied, score(ok(classifier.score(
                 "{\"queries\": \"q\", \"documents\": \"d\", \"use_activation\": true}")), 0), 0.0,
                 "true answers the applied score");
-        int[] input = rank.rerankInput(rank.encode("q", false, false), rank.encode("d", false, false));
-        float raw = rank.classifyOutput(null, input, false).scores()[0];
+        int[] input = rank.pooling().rerankInput(rank.encode("q", false, false), rank.encode("d", false, false));
+        float raw = rank.pooling().classifyOutput(null, input, false).scores()[0];
         assertEquals(raw, score(ok(classifier.score(
                 "{\"queries\": \"q\", \"documents\": \"d\", \"use_activation\": false}")), 0), 1e-9,
                 "false answers the raw head score");
@@ -139,10 +139,10 @@ public class PoolingTasksTest {
 
     @Test
     void useActivationFalseSkipsTheActivationOfEveryPairInOneBatch() throws IOException {
-        int[] first = rank.rerankInput(rank.encode("q", false, false), rank.encode("d one", false, false));
-        int[] second = rank.rerankInput(rank.encode("q", false, false), rank.encode("d two", false, false));
-        double[] raw = {rank.classifyOutput(null, first, false).scores()[0],
-                rank.classifyOutput(null, second, false).scores()[0]};
+        int[] first = rank.pooling().rerankInput(rank.encode("q", false, false), rank.encode("d one", false, false));
+        int[] second = rank.pooling().rerankInput(rank.encode("q", false, false), rank.encode("d two", false, false));
+        double[] raw = {rank.pooling().classifyOutput(null, first, false).scores()[0],
+                rank.pooling().classifyOutput(null, second, false).scores()[0]};
         JsonView scored = ok(classifier.score(
                 "{\"queries\": \"q\", \"documents\": [\"d one\", \"d two\"], \"use_activation\": false}"));
         assertEquals(raw[0], score(scored, 0), 1e-9, "pair 0 answers its raw head score");
@@ -238,7 +238,7 @@ public class PoolingTasksTest {
     @Test
     void useActivationFalseAnswersTheRawClassScores() throws IOException {
         int[] ids = rank.encode("x", true, true);
-        float[] raw = rank.classifyOutput(null, ids, false).scores();
+        float[] raw = rank.pooling().classifyOutput(null, ids, false).scores();
         List<?> probs = (List<?>) at(ok(classifier.classify(
                 "{\"input\": \"x\", \"use_activation\": false}")), "data", 0).raw("probs");
         assertEquals(raw.length, probs.size(), "one raw score per class");
@@ -335,7 +335,7 @@ public class PoolingTasksTest {
         int[] prompt = new int[query.length + item.length];
         System.arraycopy(query, 0, prompt, 0, query.length);
         System.arraycopy(item, 0, prompt, query.length, item.length);
-        float[] logits = llama.nextLogits(null, prompt);
+        float[] logits = llama.pooling().nextLogits(null, prompt);
         double max = Double.NEGATIVE_INFINITY;
         for (int id : new int[]{first, second}) {
             max = Math.max(max, logits[id]);

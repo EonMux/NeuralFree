@@ -118,7 +118,8 @@ public class FlashDecodeSplitBenchmarkTest {
     public void narrowSplitQuantumAgainstTheNarrowestPlannedSplit() throws Exception {
         int smem = kernels.faSmemFloats();
         int computeUnits = Math.max(1, backend.capabilities().getComputeUnits());
-        FlashAttnTiling plan = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, D_K, D_V, N_KV_MAX, smem, computeUnits);
+        FlashAttnTiling plan = FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, D_K, D_V, N_KV_MAX, smem, computeUnits,
+                api.equals("cuda"));
         int groupTiles = plan.groupTiles();
         int wanted = (int) Math.max(1L, ceilDiv(2L * computeUnits, (long) N_HEAD_KV * groupTiles));
         int maxLen = plan.maxSplitLen();
@@ -246,6 +247,9 @@ public class FlashDecodeSplitBenchmarkTest {
         a[AttnKernels.ARG_FD_BUF_OUT] = out;
         a[AttnKernels.ARG_FD_BUF_PARTIAL] = partial;
         a[AttnKernels.ARG_FD_BUF_KV_SCALES] = kvScales;
+        /* The one-float buffer stands in for the tree mask, as the production placeholder does: the kernels
+         * never read the slot without the tree flag these launches never set. */
+        a[AttnKernels.ARG_FD_BUF_TREE_MASK] = relBias;
         return a;
     }
 

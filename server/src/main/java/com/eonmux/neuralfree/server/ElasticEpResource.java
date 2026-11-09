@@ -75,7 +75,7 @@ public class ElasticEpResource {
         int drainSeconds = body.raw("drain_timeout") == null ? DEFAULT_DRAIN_TIMEOUT_SECONDS
                 : positiveInt(body, "drain_timeout", false);
         try {
-            service.scaleElasticEp(size, drainSeconds * 1000L);
+            service.scaling().scaleElasticEp(size, drainSeconds * 1000L);
         } catch (TimeoutException e) {
             throw ServerJson.error(408, "Scale failed due to request drain timeout after " + drainSeconds
                     + " seconds", "TimeoutError");
@@ -100,7 +100,7 @@ public class ElasticEpResource {
     @Produces(MediaType.APPLICATION_JSON)
     public Response status() {
         ClusterSwitches.require(switches.elasticEp(), ClusterSwitches.ELASTIC_FLAG);
-        EngineService.ElasticStatus status = service.elasticStatus();
+        EngineScaling.ElasticStatus status = service.scaling().elasticStatus();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("is_scaling_elastic_ep", status.scaling());
         out.put("phase", status.phase());

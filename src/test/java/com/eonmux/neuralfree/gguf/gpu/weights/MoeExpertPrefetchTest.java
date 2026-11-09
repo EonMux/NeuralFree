@@ -6,8 +6,8 @@ import com.eonmux.neuralfree.gguf.GGUFTensorInfo;
 import com.eonmux.neuralfree.gguf.WeightDataProvider;
 import com.eonmux.neuralfree.gguf.WeightStore;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Test;
@@ -180,10 +180,10 @@ public class MoeExpertPrefetchTest {
         return b[0];
     }
 
-    private List<Op> transferWrites() {
-        List<Op> out = new ArrayList<>();
-        for (Op op : backend.ops()) {
-            if (op.kind() == OpKind.WRITE && op.queue().equals(FakeComputeBackend.TRANSFER_QUEUE)) {
+    private List<FakeOp> transferWrites() {
+        List<FakeOp> out = new ArrayList<>();
+        for (FakeOp op : backend.ops()) {
+            if (op.kind() == FakeOpKind.WRITE && op.queue().equals(FakeComputeBackend.TRANSFER_QUEUE)) {
                 out.add(op);
             }
         }
@@ -214,8 +214,8 @@ public class MoeExpertPrefetchTest {
         // experts 2..7 of each tensor are one run: one write per tensor for the step, one per tensor ahead
         assertEquals(2 * TENSORS, transferWrites().size());
         boolean gated = false;
-        for (Op op : backend.ops()) {
-            gated |= op.kind() == OpKind.MARKER && op.queue().equals(FakeComputeBackend.COMPUTE_QUEUE)
+        for (FakeOp op : backend.ops()) {
+            gated |= op.kind() == FakeOpKind.MARKER && op.queue().equals(FakeComputeBackend.COMPUTE_QUEUE)
                     && op.waitCount() == 1;
         }
         assertTrue("the compute queue waits for the zone's uploads", gated);
@@ -242,7 +242,7 @@ public class MoeExpertPrefetchTest {
             assertEquals(zone1 + e, map[e]);
         }
         // layer 2 takes layer 0's zone: its copy waits for the compute that read layer 0
-        List<Op> writes = transferWrites();
+        List<FakeOp> writes = transferWrites();
         assertEquals(TENSORS, writes.size());
         assertEquals(1, writes.get(0).waitCount());
         assertEquals(2L * N_EXPERT, pool.stagedExperts());

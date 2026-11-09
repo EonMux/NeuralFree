@@ -173,9 +173,9 @@ class DecisionMediaTest {
             List<ChatMedia.Item> items = model.media().decisionItems(List.of(image), "files");
             MediaPrompt prompt = model.media().prompt(rendered, items, List.of(), -1,
                     text -> model.encode(text, false, true));
-            logits = model.nextLogits(null, prompt);
+            logits = model.pooling().nextLogits(null, prompt);
         } else {
-            logits = model.nextLogits(null, model.encode(rendered, false, true));
+            logits = model.pooling().nextLogits(null, model.encode(rendered, false, true));
         }
         float[] scores = new float[2];
         String[] labels = {"A", "B"};

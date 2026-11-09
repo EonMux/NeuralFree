@@ -198,12 +198,12 @@ public class BatchPrefixCacheTest {
     @Test
     public void thePrefixCachePolicyMirrorsAvalon() {
         MemoryConfig unset = MemoryConfig.defaults();
-        assertFalse(BatchEngine.prefixReuseForHostRam(unset, 2, 1));
-        assertTrue(BatchEngine.prefixReuseForHostRam(unset, 1, 2));
-        assertTrue("an unknown RAM keeps the default", BatchEngine.prefixReuseForHostRam(unset, 2, -1));
+        assertFalse(BatchEngineFactory.prefixReuseForHostRam(unset, 2, 1));
+        assertTrue(BatchEngineFactory.prefixReuseForHostRam(unset, 1, 2));
+        assertTrue("an unknown RAM keeps the default", BatchEngineFactory.prefixReuseForHostRam(unset, 2, -1));
         assertTrue("an explicit neuralfree.prefix.reuse=true stands beside any host",
-                BatchEngine.prefixReuseForHostRam(MemoryConfig.builder().prefixReuse(true).build(), 2, 1));
-        assertFalse(BatchEngine.prefixReuseForHostRam(MemoryConfig.builder().prefixReuse(false).build(), 1, 2));
+                BatchEngineFactory.prefixReuseForHostRam(MemoryConfig.builder().prefixReuse(true).build(), 2, 1));
+        assertFalse(BatchEngineFactory.prefixReuseForHostRam(MemoryConfig.builder().prefixReuse(false).build(), 1, 2));
     }
 
     @Test

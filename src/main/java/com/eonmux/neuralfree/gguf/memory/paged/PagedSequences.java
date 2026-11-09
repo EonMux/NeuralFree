@@ -1,8 +1,5 @@
 package com.eonmux.neuralfree.gguf.memory.paged;
 
-import com.eonmux.neuralfree.gguf.arch.SwaType;
-import com.eonmux.neuralfree.gguf.memory.KvWindow;
-import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.MemoryFullException;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
@@ -56,8 +53,8 @@ public final class PagedSequences implements SequenceMemory {
     private final int[] posMinArr;
     private final int[] posMaxArr;
     private final SequenceState[] states;
-    private final boolean[] swaGroup;   // [group]: groups whose sequences trim (the widest reader window)
-    private final int[] windowWidth;    // [group]: W_g of a trimming group
+    /** The sliding-window trim: the per-group trim kinds and the page drops below a sequence's window. */
+    private final PagedSwaTrim swaTrim;
     private final List<PageCopy> pendingCopies = new ArrayList<>();
     private final List<RowMove> pendingRowMoves = new ArrayList<>();
     private final List<RowReport> pendingReports = new ArrayList<>();
@@ -118,8 +115,6 @@ public final class PagedSequences implements SequenceMemory {
         this.posMinArr = new int[parallel];
         this.posMaxArr = new int[parallel];
         this.states = new SequenceState[parallel];
-        this.swaGroup = new boolean[groups];
-        this.windowWidth = new int[groups];
         for (int g = 0; g < groups; g++) {
             MemoryPlan.KvGroup group = plan.group(g);
             pools[g] = new PagePool(pageSize, group.pages());
@@ -128,7 +123,6 @@ public final class PagedSequences implements SequenceMemory {
             for (int s = 0; s < parallel; s++) {
                 lists[s][g] = new PageList(pageSize);
             }
-            describeGroupWindow(g);
         }
         for (int s = 0; s < parallel; s++) {
             posMinArr[s] = -1;
@@ -136,40 +130,8 @@ public final class PagedSequences implements SequenceMemory {
             // one record entry per stored row: media rows sharing a position can outnumber the positions
             states[s] = new SequenceState(cap, maxPages * pageSize);
         }
+        this.swaTrim = new PagedSwaTrim(this, groups);
         this.sharing = new PageSharing(this);
-    }
-
-    /**
-     * The group's trim kind: the widest window over every layer reading the group, with differing
-     * window types or any window-less reader making it a full-attention group. Only windowed (same-type) groups trim.
-     */
-    private void describeGroupWindow(int g) {
-        swaGroup[g] = false;
-        windowWidth[g] = 0;
-        SwaType type = null;
-        boolean sameWindowType = true;
-        int width = 0;
-        for (LayerMemoryPlan l : plan.layers()) {
-            if (l.kvGroup() != g || l.kv() == null) {
-                continue;
-            }
-            KvWindow w = l.kv().window();
-            if (w.type() == SwaType.NONE) {
-                sameWindowType = false;
-                break;
-            }
-            if (type == null) {
-                type = w.type();
-            } else if (type != w.type()) {
-                sameWindowType = false;
-                break;
-            }
-            width = Math.max(width, w.nSwa());
-        }
-        if (sameWindowType && type != null) {
-            swaGroup[g] = true;
-            windowWidth[g] = width;
-        }
     }
 
     /** Rows of a page (the configured {@code neuralfree.kv.page.size}). */
@@ -533,7 +495,7 @@ public final class PagedSequences implements SequenceMemory {
         pendingCopies.addAll(step.pageCopies());
         // the step's queries still read their windows (the trunk runs after commit): its first one bounds the trim
         for (int s = 0; s < nSeg; s++) {
-            trimSequence(step.segSeq(s), step.segPos0(s) + 1);
+            swaTrim.trimSequence(step.segSeq(s), step.segPos0(s) + 1);
         }
     }
 
@@ -743,7 +705,7 @@ public final class PagedSequences implements SequenceMemory {
     }
 
     /** Sets the rows of {@code base} whose position is selected empty and reports any position that was dropped. */
-    private void clearRowsIn(int g, int base, int lo, int hi) {
+    void clearRowsIn(int g, int base, int lo, int hi) {
         int[] rows = new int[pageSize];
         int n = 0;
         for (int r = 0; r < pageSize; r++) {
@@ -1059,6 +1021,10 @@ public final class PagedSequences implements SequenceMemory {
 
     // ------------------------------------------------------------------ PageSharing accessors
 
+    PageSharing sharing() {
+        return sharing;
+    }
+
     PagePool[] pools() {
         return pools;
     }
@@ -1088,11 +1054,11 @@ public final class PagedSequences implements SequenceMemory {
     }
 
     boolean[] swaGroups() {
-        return swaGroup;
+        return swaTrim.swaGroups();
     }
 
     int[] windowWidths() {
-        return windowWidth;
+        return swaTrim.windowWidths();
     }
 
     int cap() {
@@ -1382,7 +1348,7 @@ public final class PagedSequences implements SequenceMemory {
      */
     public void trim(int seq) {
         checkSeq(seq);
-        trimSequence(seq, Integer.MAX_VALUE);
+        swaTrim.trim(seq);
     }
 
     /**
@@ -1392,67 +1358,7 @@ public final class PagedSequences implements SequenceMemory {
      */
     public void finish(PagedStep step) {
         Objects.requireNonNull(step, "step");
-        for (int s = 0; s < step.nSeg(); s++) {
-            trim(step.segSeq(s));
-        }
-    }
-
-    /**
-     * Trims {@code seq}: the rows below {@code min(committed, reader) - W_g} leave.
-     *
-     * @param reader one past the earliest position that still reads the rows (the first row of a step
-     *               {@link #commit} applies), {@code Integer.MAX_VALUE} for the sequence's next position
-     */
-    private void trimSequence(int seq, int reader) {
-        if (posMaxArr[seq] < 0) {
-            return;
-        }
-        int committed = Math.min(posMaxArr[seq] + 1, reader);
-        for (int g = 0; g < groupsCount(); g++) {
-            if (swaGroup[g]) {
-                trimGroup(g, seq, committed - windowWidth[g]);
-            }
-        }
-    }
-
-    private void trimGroup(int g, int seq, int threshold) {
-        if (threshold <= 0) {
-            return;
-        }
-        PageList list = lists[seq][g];
-        while (!list.isEmpty()) {
-            int page = list.page(0);
-            int base = page * pageSize;
-            int lastLive = -1;
-            boolean hasBelow = false;
-            for (int r = pageSize - 1; r >= 0; r--) {
-                int pos = kvPos[g][base + r];
-                if (pos >= 0) {
-                    if (lastLive < 0) {
-                        lastLive = r;
-                    }
-                    if (pos < threshold) {
-                        hasBelow = true;
-                    }
-                }
-            }
-            boolean shared = pools[g].refCount(page) > 1;
-            if (lastLive >= 0 && kvPos[g][base + lastLive] >= threshold) {
-                // straddling page: the rows below the window go empty on a page the sequence alone holds
-                if (hasBelow && !shared) {
-                    clearRowsIn(g, base, 0, threshold);
-                }
-                return;
-            }
-            // the whole page lies below the window (or has no live row): it leaves the sequence; a shared page
-            // keeps its rows for the other holders
-            if (!shared) {
-                clearRowsIn(g, base, Integer.MIN_VALUE, Integer.MAX_VALUE);
-            }
-            sharing.unref(false, g, page);
-            list.removeFront(1);
-            slots[g][seq] = Math.max(0, slots[g][seq] - pageSize);
-        }
+        swaTrim.finish(step);
     }
 
     // ------------------------------------------------------------------ pool helpers

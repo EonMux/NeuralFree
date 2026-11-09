@@ -233,5 +233,8 @@ NF_KERNEL void IQ4_XS_BatchMatMul_2D(
     if (get_local_id(0) == 0) output[(nf_i64)s * out_dim + row] = acc;
 }
 
-/* Q8_1-activation forms (integer dots over the split nibble layout, common/quant_decode_legacy_q8.h). */
+/* Q8_1-activation forms (integer dots over the split nibble layout, common/quant_decode_legacy_q8.h),
+ * plus the counted forms above the dispatched range, for the measured dispatch serving exact counts
+ * to 16 (SmallBatchCrossover's entries on the CUDA and OpenCL NVIDIA kinds). */
 IQ_ALL_KERNELS_Q8(IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BLOCK_BYTES, IQ4_XS_THREADS_PER_SUPER)
+IQ_MVQN_NC_HIGH(IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BLOCK_BYTES, IQ4_XS_THREADS_PER_SUPER)

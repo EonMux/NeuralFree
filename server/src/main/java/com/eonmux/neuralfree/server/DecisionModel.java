@@ -29,8 +29,8 @@ import java.util.Map;
  * score offsets.
  *
  * <p>A request that attaches media renders one media marker per item, splices the projector's rows where the markers
- * stand, and reads the prompt through the media path of the engine ({@link EngineService#nextLogits(LoraSelection,
- * MediaPrompt)} and {@link EngineService#decisionScores(LoraSelection, MediaPrompt, int[])}). Immutable.</p>
+ * stand, and reads the prompt through the media path of the engine ({@link EnginePooling#nextLogits(LoraSelection,
+ * MediaPrompt)} and {@link EnginePooling#decisionScores(LoraSelection, MediaPrompt, int[])}). Immutable.</p>
  */
 final class DecisionModel {
 
@@ -89,10 +89,10 @@ final class DecisionModel {
      *                                               defect)
      */
     static DecisionModel of(EngineService service) {
-        String type = service.decisionType();
+        String type = service.pooling().decisionType();
         DecisionFamily family = DecisionFamily.of(type);
         if (family == null) {
-            if (type == null && !service.decisionHead()) {
+            if (type == null && !service.pooling().decisionHead()) {
                 throw ServerJson.error(501, "This model is not a decision model", "not_supported_error");
             }
             throw ServerJson.error(501, "decision model type '" + (type != null ? type
@@ -179,7 +179,7 @@ final class DecisionModel {
                 }
             }
             case METADATA -> {
-                List<String> labels = service.decisionLabels();
+                List<String> labels = service.pooling().decisionLabels();
                 if (labels.isEmpty()) {
                     throw new IllegalStateException("decision model has no labels");
                 }
@@ -268,7 +268,7 @@ final class DecisionModel {
         List<double[]> probs = new ArrayList<>();
         for (DecisionQuestions.Question question : questions) {
             DecisionPrompt.Built prompt = DecisionPrompt.build(service, List.of(question), state);
-            float[] scores = service.decisionScores(lora, prompt.tokens(), prompt.order());
+            float[] scores = service.pooling().decisionScores(lora, prompt.tokens(), prompt.order());
             probs.add(probabilities(question, scores, 0, false));
             tokens += prompt.tokens().length;
         }
@@ -282,12 +282,12 @@ final class DecisionModel {
         int nTokens;
         if (items.isEmpty()) {
             DecisionPrompt.Built prompt = DecisionPrompt.build(service, questions, state);
-            scores = service.decisionScores(lora, prompt.tokens(), prompt.order());
+            scores = service.pooling().decisionScores(lora, prompt.tokens(), prompt.order());
             nTokens = prompt.tokens().length;
         } else {
             DecisionPrompt.MediaBuilt prompt = DecisionPrompt.buildMedia(service, service.media(), questions, state,
                     items);
-            scores = service.decisionScores(lora, prompt.prompt(), prompt.order());
+            scores = service.pooling().decisionScores(lora, prompt.prompt(), prompt.order());
             nTokens = prompt.prompt().nTokens();
         }
         List<double[]> probs = new ArrayList<>();
@@ -338,11 +338,11 @@ final class DecisionModel {
                 float[] logits;
                 if (promptItems.isEmpty()) {
                     int[] ids = service.encode(prompt, false, true);
-                    logits = service.nextLogits(lora, ids);
+                    logits = service.pooling().nextLogits(lora, ids);
                     tokens += ids.length;
                 } else {
                     MediaPrompt media = mediaPrompt(prompt, promptItems);
-                    logits = service.nextLogits(lora, media);
+                    logits = service.pooling().nextLogits(lora, media);
                     tokens += media.nTokens();
                 }
                 float[] scores = new float[nOutputs];
@@ -355,7 +355,7 @@ final class DecisionModel {
                 }
                 float temperature = temperature(question, nOptions, !promptItems.isEmpty());
                 float[] bias = question.type() == DecisionQuestions.SCORE
-                        ? service.decisionScoreBias().get(nOutputs) : null;
+                        ? service.pooling().decisionScoreBias().get(nOutputs) : null;
                 double[] p = DecisionAnswers.probabilities(scores, question.type() == DecisionQuestions.SCORE, bias,
                         temperature);
                 for (int i = 0; i < nOutputs; i++) {
@@ -377,7 +377,7 @@ final class DecisionModel {
         if (!items.isEmpty()) {
             throw ServerJson.badRequest("this decision model reads text prompts only");
         }
-        int maxHeadTokens = service.decisionMaxHeadTokens();
+        int maxHeadTokens = service.pooling().decisionMaxHeadTokens();
         if (maxHeadTokens <= 0) {
             throw new IllegalStateException("decision model has no valid max_head_tokens");
         }
@@ -387,7 +387,7 @@ final class DecisionModel {
             String prompt = render(question, questions, question.options(), List.of(), state, 0, false);
             LayaInput input = layaInput(service.encode(prompt, false, true), question.options().size(),
                     maxHeadTokens);
-            float[] scores = service.decisionScores(lora, input.tokens(), null);
+            float[] scores = service.pooling().decisionScores(lora, input.tokens(), null);
             int n = question.options().size();
             float[] questionScores = new float[n];
             for (int i = 0; i < n; i++) {
@@ -424,7 +424,7 @@ final class DecisionModel {
             if (nMarkers != question.options().size()) {
                 throw new IllegalStateException("unexpected layout of the decision prompt");
             }
-            probs.add(probabilities(question, service.decisionScores(lora, ids, null), 0, false));
+            probs.add(probabilities(question, service.pooling().decisionScores(lora, ids, null), 0, false));
             tokens += ids.length;
         }
         return new Result(probs, tokens);
@@ -444,11 +444,11 @@ final class DecisionModel {
             float[] scores;
             if (items.isEmpty()) {
                 int[] ids = service.encode(prompt, false, true);
-                scores = service.classifyOutput(lora, ids, false).scores();
+                scores = service.pooling().classifyOutput(lora, ids, false).scores();
                 tokens += ids.length;
             } else {
                 MediaPrompt media = mediaPrompt(prompt, items);
-                scores = service.classifyOutputMedia(lora, media, false).scores();
+                scores = service.pooling().classifyOutputMedia(lora, media, false).scores();
                 tokens += media.nTokens();
             }
             probs.add(probabilities(question, scores, 0, !items.isEmpty()));
@@ -509,7 +509,7 @@ final class DecisionModel {
             int n = nOptions(question);
             float[] questionScores = new float[n];
             if (media == null) {
-                float[] scores = service.decisionScores(lora, input.tokens(), null);
+                float[] scores = service.pooling().decisionScores(lora, input.tokens(), null);
                 for (int i = 0; i < n; i++) {
                     questionScores[i] = scores[markers[i] * ModernBertDecisionHead.N_DECISION_TYPES
                             + question.type()];
@@ -522,7 +522,7 @@ final class DecisionModel {
                 }
                 full.addText(input.tokens());
                 MediaPrompt prompt2 = full.build();
-                float[] scores = service.decisionScores(lora, prompt2, null);
+                float[] scores = service.pooling().decisionScores(lora, prompt2, null);
                 for (int i = 0; i < n; i++) {
                     questionScores[i] = scores[markers[i] * ModernBertDecisionHead.N_DECISION_TYPES
                             + question.type()];
@@ -1103,7 +1103,7 @@ final class DecisionModel {
         System.arraycopy(scores, at, questionScores, 0, n);
         float temperature = temperature(question, n, media);
         float[] bias = question.type() == DecisionQuestions.SCORE
-                ? service.decisionScoreBias().get(n) : null;
+                ? service.pooling().decisionScoreBias().get(n) : null;
         return DecisionAnswers.probabilities(questionScores, question.type() == DecisionQuestions.SCORE, bias,
                 temperature);
     }
@@ -1114,7 +1114,7 @@ final class DecisionModel {
      * format_answer reads the uncalibrated logits at temperature one).
      */
     private float temperature(DecisionQuestions.Question question, int nOptions, boolean media) {
-        Map<String, Float> temperatures = service.decisionTemperatures();
+        Map<String, Float> temperatures = service.pooling().decisionTemperatures();
         if (media && temperatures.containsKey("image")) {
             return temperatures.get("image");
         }

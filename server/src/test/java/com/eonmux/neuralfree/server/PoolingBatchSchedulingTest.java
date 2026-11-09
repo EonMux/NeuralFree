@@ -93,7 +93,7 @@ class PoolingBatchSchedulingTest {
         GenerationResult twin = generate(solo, prompt);
         float[] vector;
         try (EngineService alone = new EngineService(model.toString(), config())) {
-            vector = alone.embed(null, embeddingInput);
+            vector = alone.pooling().embed(null, embeddingInput);
         }
 
         // No token budget: the generation decodes until the test cancels it, so under load the embedding
@@ -113,7 +113,7 @@ class PoolingBatchSchedulingTest {
         try {
             assertTrue(firstToken.await(60, TimeUnit.SECONDS), "the generation started decoding");
             // the pooling request queues into the same engine and answers while the generation runs on
-            float[] batched = pooled.embed(null, embeddingInput);
+            float[] batched = pooled.pooling().embed(null, embeddingInput);
             assertArrayEquals(vector, batched, 1e-6f);
             assertFalse(generation.sequence().finished(),
                     "the embedding answered without waiting for the generation");
@@ -136,8 +136,8 @@ class PoolingBatchSchedulingTest {
     void thePrefixCacheSurvivesThePoolingRequests() throws Exception {
         int[] prompt = tokens(3);
         long before = pooled.stats().promptTokensCached();
-        pooled.embed(null, prompt);
-        pooled.embed(null, prompt);
+        pooled.pooling().embed(null, prompt);
+        pooled.pooling().embed(null, prompt);
         long afterPooling = pooled.stats().promptTokensCached();
         assertTrue(afterPooling > before, "the second identical pooling prompt reused the cached prefix"
                 + " (LAST pooling reads the last row)");
@@ -151,11 +151,11 @@ class PoolingBatchSchedulingTest {
         int[][] inputs = {tokens(4), tokens(5), tokens(6)};
         float[][] expected;
         try (EngineService alone = new EngineService(model.toString(), config())) {
-            expected = alone.embedAll(null, inputs);
+            expected = alone.pooling().embedAll(null, inputs);
         }
         // the batched request answers the one-shot vectors, within the forward's float noise (the GPU matmul's
         // reduction order differs across engine instances)
-        float[][] batched = pooled.embedAll(null, inputs);
+        float[][] batched = pooled.pooling().embedAll(null, inputs);
         for (int i = 0; i < expected.length; i++) {
             assertArrayEquals(expected[i], batched[i], 1e-5f, "input " + i);
         }

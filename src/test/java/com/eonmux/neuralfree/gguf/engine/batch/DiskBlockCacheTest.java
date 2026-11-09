@@ -284,6 +284,50 @@ public class DiskBlockCacheTest {
         }
     }
 
+    /**
+     * The drain counts every accepted write from its admission to its outcome: a write in flight and one queued
+     * behind it keep the drain waiting, and once it answers true both writes' store events answer through
+     * {@link #pump}. The old drain read the queue and the in-flight count separately, so it could answer true
+     * while the writer had taken a job it had not started (and false while a write it would finish stood between
+     * its two reads) — the flake {@code anotherSeedsFilesAreForeignAndLeftIntact} hit once.
+     */
+    @Test
+    public void awaitWritesAnswersTrueOnlyAfterEveryAcceptedWriteFinished() throws Exception {
+        Path dir = Files.createTempDirectory("nf-disk-");
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        DiskBlockCache.Io slow = new RealIo() {
+            @Override
+            public void write(byte[] blob, Path file) throws IOException {
+                entered.countDown();
+                await(release);
+                super.write(blob, file);
+            }
+        };
+        DiskBlockCache disk = new DiskBlockCache(dir, -1, layout(), HASHER, slow, 4, 1);
+        try {
+            HostBlockCache.Entry a = entry(HASHER, ROOT, PrefixKey.NONE, new int[] {1, 2, 3, 4}, P, BPR);
+            assertTrue(disk.put(a).stored);
+            assertTrue("the writer started", entered.await(5, TimeUnit.SECONDS));
+            HostBlockCache.Entry b = entry(HASHER, ROOT, PrefixKey.NONE, new int[] {5, 6, 7, 8}, P, BPR);
+            assertTrue(disk.put(b).stored);
+            assertEquals("one write in flight, one queued: neither finished", 2, disk.unfinishedWriteCount());
+            assertFalse("an unfinished write keeps the drain waiting", disk.awaitWrites(50));
+            release.countDown();
+            assertTrue(disk.awaitWrites(5000));
+            assertEquals("true means the writer finished every accepted write", 0, disk.unfinishedWriteCount());
+            List<DiskBlockCache.Event> events = disk.pump();
+            assertEquals("a drained tier answers both writes' stores", 2, stored(events));
+            assertTrue(Arrays.equals(a.hash, events.get(0).stored.hash));
+            assertTrue(Arrays.equals(b.hash, events.get(1).stored.hash));
+            assertTrue(disk.durable(a.hash));
+            assertTrue(disk.durable(b.hash));
+        } finally {
+            release.countDown();
+            disk.close();
+        }
+    }
+
     @Test
     public void closeDrainsTheAcceptedWritesThenRefusesMore() throws Exception {
         Path dir = Files.createTempDirectory("nf-disk-");

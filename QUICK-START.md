@@ -79,7 +79,7 @@ Buffer round-trip test PASSED - data verified correctly
 
 `Train kernels: unavailable (tensor ops take their CPU path): <reason>` means the backend works but the training ops compute on the CPU; the reason names what is missing, usually kernels the build could not produce (see [Troubleshooting](#7-troubleshooting)). `No GPU backend available` means no API found a usable GPU.
 
-AUTO picks the device first, then tries Vulkan, CUDA, OpenCL and HIP on it, in that order. To choose:
+AUTO picks the device first, then tries Vulkan, CUDA, OpenCL and HIP on it, in that order; on an NVIDIA GPU it tries CUDA first. To choose:
 
 ```bash
 ./gradlew runApp -Pneuralfree.backend=opencl          # auto, opencl, cuda, vulkan or hip

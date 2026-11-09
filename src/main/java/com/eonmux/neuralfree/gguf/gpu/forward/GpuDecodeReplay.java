@@ -23,9 +23,11 @@ import java.util.Locale;
  * {@link GpuGraph#launch(ComputeQueue, GpuEvent...)}.
  *
  * <p>A trusted replay never runs the step body again. The trunk's mixers expose patchers
- * ({@link GpuMixer#decodeReplayPatchers()} through {@code GpuLayerExecutor#decodeReplayPatchers()}), each
- * deriving its kernels' per-step values (positions, key counts, split counts, grids) from the step position
- * alone. The capture carries every kernel dispatch's captured values; {@link DecodeReplayPlan} is built
+ * ({@link GpuMixer#decodeReplayPatchers()} through {@code GpuLayerExecutor#decodeReplayPatchers()} for the
+ * one-token trunk, {@link GpuMixer#stepReplayPatchers()} through {@code GpuLayerExecutor#stepReplayPatchers()}
+ * for the multi-row trunk), each deriving its kernels' per-step values (positions, key counts, split counts,
+ * grids) from the step position alone — the multi-row patchers additionally from the row count captured with
+ * the graph. The capture carries every kernel dispatch's captured values; {@link DecodeReplayPlan} is built
  * once over them and trusted only when the patchers' predictions reproduce the capture exactly. The first
  * steps after the capture still run the body through {@link GpuGraph#replay(Runnable)} as a check: every
  * dispatch the body changed must be claimed by the plan, and every patcher must find its kernels holding
@@ -89,6 +91,8 @@ final class GpuDecodeReplay implements AutoCloseable {
     private int verifiedSteps;
     /** The position of the last step this replay ran, for the continuity guard of a trusted replay. */
     private int lastPos = -1;
+    /** The row count of the trunk currently running, the position advance its trusted replay expects. */
+    private int stepWidth = 1;
     private int stableSteps;
     private int failedReplays;
     private int abortedCaptures;
@@ -155,7 +159,24 @@ final class GpuDecodeReplay implements AutoCloseable {
      *                   transfers), which a capture can hold and a replay may skip
      */
     void trunk(int pos, List<GpuStepPatcher> patchers, boolean capturable, Runnable body) {
+        trunk(pos, 1, patchers, capturable, body);
+    }
+
+    /**
+     * Runs the trunk of one {@code width}-row step at {@code pos}: the same discipline as the decode
+     * {@link #trunk(int, List, boolean, Runnable)}, with the continuity guard advancing by the step's row
+     * count — a trusted replay requires {@code pos} to be the previous step's plus its width — and the
+     * follow-up step's patches prepared at {@code pos + width}.
+     *
+     * @param width      the step's row count, the position advance the captured patchers derive from
+     * @param pos        the step position; a trusted replay requires it to follow the previous step's
+     * @param patchers   the trunk mixers' step patchers, or null or empty for a body replay
+     * @param capturable says the step's trunk only enqueues kernel dispatches (no tap reads, no host
+     *                   transfers), which a capture can hold and a replay may skip
+     */
+    void trunk(int pos, int width, List<GpuStepPatcher> patchers, boolean capturable, Runnable body) {
         try {
+            stepWidth = width;
             trunkStep(pos, patchers, capturable, body);
         } finally {
             lastPos = pos;
@@ -164,9 +185,11 @@ final class GpuDecodeReplay implements AutoCloseable {
 
     /**
      * Runs the trunk of one step that has no position to check (a multi-row verify step), by the body
-     * replay: the body runs again and its dispatches are matched against the capture.
+     * replay: the body runs again and its dispatches are matched against the capture. The continuity
+     * guard's state is untouched.
      */
     void trunk(boolean capturable, Runnable body) {
+        stepWidth = 1;
         trunkStep(-1, null, capturable, body);
     }
 
@@ -197,13 +220,32 @@ final class GpuDecodeReplay implements AutoCloseable {
 
     /** Replays a trusted plan: patches and submits, never touching the body. */
     private void trusted(int pos, List<GpuStepPatcher> patchers, boolean capturable, Runnable body) {
-        if (!capturable || pos != lastPos + 1) {
-            /* A step that enqueues more than the capture, or whose position jumped: the graph may be
-             * stale, so it is never replayed. */
-            LOGGER.debug("Decode replay re-captures: step {} does not follow {} or the trunk is not capturable",
-                    pos, lastPos);
+        if (!capturable) {
+            /* A step that enqueues more than the capture: the graph cannot represent it, so it is
+             * never replayed. */
+            LOGGER.debug("Decode replay re-captures: the trunk is not capturable");
             dropGraph();
             body.run();
+            return;
+        }
+        if (pos != lastPos + stepWidth) {
+            if (stepWidth == 1) {
+                /* The one-token trunk: a position that does not follow means the flow left the
+                 * contiguous run the capture was taken in (a rewind, a foreign call), so the graph is
+                 * never replayed. */
+                LOGGER.debug("Decode replay re-captures: step {} does not follow {} or the trunk is not"
+                        + " capturable", pos, lastPos);
+                dropGraph();
+                body.run();
+                return;
+            }
+            /* The multi-row trunk between foreign steps (a verify between decode rounds): the patch
+             * plan belongs to the contiguous run it was captured in, but the capture itself may still
+             * match the body — the body replay re-runs the step and re-checks the plan's predictions,
+             * and recaptures on divergence. */
+            LOGGER.debug("Decode replay body-replays: step {} does not follow {} + {}", pos, lastPos,
+                    stepWidth);
+            verifyStep(pos, patchers, body);
             return;
         }
         boolean replayed;
@@ -243,7 +285,7 @@ final class GpuDecodeReplay implements AutoCloseable {
      */
     private void prepareFollowup(int pos) {
         try {
-            graph.preparePatched(plan, pos + 1, pos);
+            graph.preparePatched(plan, pos + stepWidth, pos);
         } catch (RuntimeException e) {
             LOGGER.debug("Decode replay drops its graph after a failed follow-up patch: {}", e.getMessage());
             dropGraph();
@@ -350,8 +392,12 @@ final class GpuDecodeReplay implements AutoCloseable {
         return true;
     }
 
-    /** True when every patcher's kernels hold the values it predicts for {@code pos}. */
+    /** True when every patcher's kernels hold the values it predicts for {@code pos}; a call without
+     * patchers verifies nothing beyond the body's coverage. */
     private static boolean patchersVerify(int pos, List<GpuStepPatcher> patchers) {
+        if (patchers == null) {
+            return true;
+        }
         for (GpuStepPatcher p : patchers) {
             if (!p.verify(pos)) {
                 return false;

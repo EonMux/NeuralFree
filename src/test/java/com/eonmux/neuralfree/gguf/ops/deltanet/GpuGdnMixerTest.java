@@ -42,7 +42,9 @@ import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
 import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -243,21 +245,21 @@ public class GpuGdnMixerTest {
         return scratch.slot(name);
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] v = new int[to - from];
         for (int i = from; i < to; i++) {
             v[i - from] = d.intArg(i);
@@ -305,14 +307,14 @@ public class GpuGdnMixerTest {
         bind(MixerKind.GDN, Arch.QWEN35, layer, true);
         ScratchSlot in = slot(ScratchSlots.NORMED);
         ScratchSlot out = slot(ScratchSlots.BRANCH);
-        List<Dispatch> ds = run(() -> mixer.decode(7, in, out));
+        List<FakeDispatch> ds = run(() -> mixer.decode(7, in, out));
 
         assertEquals(Arrays.asList(MV, MV, MV, MV, CONV, NORM, GATE, SCAN, NORM, GLU, MV), names(ds));
         assertSame(buf("blk.0.attn_qkv.weight"), ds.get(0).bufferArg(2));
         assertSame(slot(ScratchSlots.Q).buffer(), ds.get(0).bufferArg(4));
         assertSame(slot(ScratchSlots.V).buffer(), ds.get(1).bufferArg(4));
 
-        Dispatch conv = ds.get(4);
+        FakeDispatch conv = ds.get(4);
         assertArrayEquals(new int[]{CONV_CH, D_CONV, 1, SsmKernels.CONV_FLAG_SILU, CONV_CH, 0, CONV_CH, 0, 0,
                 (D_CONV - 1) * CONV_CH}, ints(conv, 0, 10));
         assertSame(slot(ScratchSlots.Q).buffer(), conv.bufferArg(10));
@@ -323,11 +325,11 @@ public class GpuGdnMixerTest {
         assertSame(slot(ScratchSlots.K).buffer(), conv.bufferArg(15));
         assertArrayEquals(new long[]{roundUp(CONV_CH)}, conv.global());
 
-        Dispatch l2 = ds.get(5);
+        FakeDispatch l2 = ds.get(5);
         assertArrayEquals(new long[]{2L * NK * ops.local()}, l2.global());
         assertTrue(l2.bufferArgs().contains(slot(ScratchSlots.K).buffer()));
 
-        Dispatch gate = ds.get(6);
+        FakeDispatch gate = ds.get(6);
         assertArrayEquals(new int[]{1, NV, NK, DeltaNetKernels.LAYOUT_SEPARATE, -1, HV}, ints(gate, 0, 6));
         assertEquals(0.0f, gate.floatArg(DeltaNetKernels.GATE_ARG_LB), 0.0f);
         assertArrayEquals(new int[]{NV, 0, NV, 0}, ints(gate, 7, 11));
@@ -336,7 +338,7 @@ public class GpuGdnMixerTest {
         assertNotSame(gate.bufferArg(DeltaNetKernels.GATE_ARG_A_IN), gate.bufferArg(DeltaNetKernels.GATE_ARG_B_IN));
         assertArrayEquals(new long[]{roundUp(NV)}, gate.global());
 
-        Dispatch scan = ds.get(7);
+        FakeDispatch scan = ds.get(7);
         assertArrayEquals(new int[]{HK, HV, NV, NK, 1, GdnHeadMap.TILED.code(), DeltaNetKernels.GATE_MODE_PER_HEAD,
                 CONV_CH, 0, CONV_CH, KEY, CONV_CH, 2 * KEY, VAL, 0}, ints(scan, 0, 15));
         assertEquals(0.25f, scan.floatArg(DeltaNetKernels.SCAN_ARG_SCALE), 0.0f);
@@ -352,10 +354,10 @@ public class GpuGdnMixerTest {
         assertArrayEquals(new long[]{DeltaNetKernels.recurrenceGlobal(NV, HV, local)}, scan.global());
         assertArrayEquals(new long[]{local}, scan.local());
 
-        Dispatch rms = ds.get(8);
+        FakeDispatch rms = ds.get(8);
         assertArrayEquals(new long[]{(long) NV * ops.local()}, rms.global());
         assertTrue(rms.bufferArgs().contains(buf("blk.0.ssm_norm.weight")));
-        Dispatch glu = ds.get(9);
+        FakeDispatch glu = ds.get(9);
         assertTrue(glu.bufferArgs().contains(slot(ScratchSlots.V).buffer()));
         assertTrue(glu.bufferArgs().contains(slot(ScratchSlots.ATTN_OUT).buffer()));
         assertSame(buf("blk.0.ssm_out.weight"), ds.get(10).bufferArg(2));
@@ -370,13 +372,13 @@ public class GpuGdnMixerTest {
      */
     @Test
     public void fusedDecodeLaunchesFewerKernels() {
-        List<Dispatch> fused = qwen35Decode(FusedMode.ON);
+        List<FakeDispatch> fused = qwen35Decode(FusedMode.ON);
         assertEquals(Arrays.asList(
                 FusedKernels.MULTI_TASK, CONV, FusedKernels.MULTI_TASK, SCAN, FusedKernels.GDN_NORM_GATE, MV),
                 names(fused));
         // The two launches of the step must not share their descriptor: each is read when it runs.
         assertNotSame(fused.get(0).bufferArg(3), fused.get(2).bufferArg(3));
-        List<Dispatch> unfused = qwen35Decode(FusedMode.OFF);
+        List<FakeDispatch> unfused = qwen35Decode(FusedMode.OFF);
         assertEquals(Arrays.asList(MV, MV, MV, MV, CONV, NORM, GATE, SCAN, NORM, GLU, MV), names(unfused));
     }
 
@@ -408,11 +410,11 @@ public class GpuGdnMixerTest {
     }
 
     /** The dispatches of one qwen35 decode step under {@code mode}. */
-    private List<Dispatch> qwen35Decode(FusedMode mode) {
+    private List<FakeDispatch> qwen35Decode(FusedMode mode) {
         open(mode);
         LayerSpec layer = qwen35Layer();
         bind(MixerKind.GDN, Arch.QWEN35, layer, true);
-        List<Dispatch> ds = run(() -> mixer.decode(7, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(7, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
         assertEquals(mode + " launches " + names(ds), mode == FusedMode.ON ? 6 : 11, ds.size());
         closeRig();
         return ds;
@@ -426,11 +428,11 @@ public class GpuGdnMixerTest {
         ScratchSlot in = slot(ScratchSlots.NORMED);
         ScratchSlot out = slot(ScratchSlots.BRANCH);
         int n = 5;
-        List<Dispatch> ds = run(() -> mixer.prefill(0, n, in, out));
+        List<FakeDispatch> ds = run(() -> mixer.prefill(0, n, in, out));
 
         List<String> kernelsRun = new ArrayList<>();
-        List<Dispatch> core = new ArrayList<>();
-        for (Dispatch d : ds) {
+        List<FakeDispatch> core = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (!d.kernelName().contains("Float")) {
                 kernelsRun.add(d.kernelName());
                 core.add(d);
@@ -444,11 +446,11 @@ public class GpuGdnMixerTest {
         assertArrayEquals(new long[]{(long) n * 2 * NK * ops.local()}, core.get(2).global());
         assertTrue(core.get(2).bufferArgs().contains(qk));
 
-        Dispatch gate = core.get(3);
+        FakeDispatch gate = core.get(3);
         assertEquals(n, gate.intArg(DeltaNetKernels.GATE_ARG_N_TOKENS));
         assertArrayEquals(new long[]{roundUp((long) n * NV)}, gate.global());
 
-        Dispatch scan = core.get(4);
+        FakeDispatch scan = core.get(4);
         assertEquals(n, scan.intArg(DeltaNetKernels.SCAN_ARG_N_TOKENS));
         assertArrayEquals(new int[]{2 * KEY, 0, 2 * KEY, KEY, CONV_CH, 2 * KEY, VAL, 0}, ints(scan, 7, 15));
         assertSame(qk, scan.bufferArg(DeltaNetKernels.SCAN_ARG_Q));
@@ -458,7 +460,7 @@ public class GpuGdnMixerTest {
 
         assertTrue(core.get(0).isPreBound() && gate.isPreBound() && scan.isPreBound());
 
-        List<Dispatch> again = run(() -> mixer.decode(n, in, out));
+        List<FakeDispatch> again = run(() -> mixer.decode(n, in, out));
         assertEquals(1, again.get(4).intArg(SsmKernels.ARG_CONV_N_TOKENS));
         assertEquals(1, again.get(6).intArg(DeltaNetKernels.GATE_ARG_N_TOKENS));
         assertArrayEquals(new long[]{roundUp(NV)}, again.get(6).global());
@@ -481,7 +483,7 @@ public class GpuGdnMixerTest {
         LayerSpec layer = layer(MixerKind.GDN, RecurrentSpec.builder(MixerKind.GDN).gdnHeads(NK, NV, HK, HV)
                 .dConv(D_CONV).headMap(GdnHeadMap.GROUPED).legacySsmIn(true).fusedBetaAlpha(true).build());
         bind(MixerKind.GDN, Arch.QWEN3NEXT, layer, true);
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
         String cp = GpuOps.COPY2D;
         assertEquals(Arrays.asList(MV, cp, cp, cp, cp, MV, CONV, NORM, GATE, SCAN, NORM, GLU, MV), names(ds));
@@ -494,7 +496,7 @@ public class GpuGdnMixerTest {
         assertSame(slot(ScratchSlots.Q).buffer(), ds.get(3).bufferArg(7));
         assertSame(slot(ScratchSlots.V).buffer(), ds.get(4).bufferArg(7));
 
-        Dispatch gate = ds.get(8);
+        FakeDispatch gate = ds.get(8);
         assertArrayEquals(new int[]{1, NV, NK, DeltaNetKernels.LAYOUT_FUSED_BA, -1}, ints(gate, 0, 5));
         assertArrayEquals(new int[]{2 * NV, 0, 2 * NV, 0}, ints(gate, 7, 11));
         assertSame(gate.bufferArg(DeltaNetKernels.GATE_ARG_A_IN), gate.bufferArg(DeltaNetKernels.GATE_ARG_B_IN));
@@ -518,7 +520,7 @@ public class GpuGdnMixerTest {
         LayerSpec layer = layer(MixerKind.GDN, RecurrentSpec.builder(MixerKind.GDN).gdnHeads(NK, NV, HK, HV)
                 .dConv(D_CONV).headMap(GdnHeadMap.TILED).mergedQkvGate(true).concatBetaAlpha(true).build());
         bind(MixerKind.GDN, Arch.QWEN4EXP, layer, true);
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
         String cp = GpuOps.COPY2D;
         assertEquals(Arrays.asList(MV, cp, cp, MV, CONV, NORM, GATE, SCAN, NORM, GLU, MV), names(ds));
@@ -526,19 +528,19 @@ public class GpuGdnMixerTest {
         GpuBuffer merged = ds.get(0).bufferArg(4);
 
         // [qkv | gate] rows: the first CONV_CH columns feed the conv, the last VAL columns are z
-        Dispatch toX = ds.get(1);
+        FakeDispatch toX = ds.get(1);
         int mergedOff = toX.intArg(3);
         assertArrayEquals(new int[]{1, CONV_CH, rowW, mergedOff, CONV_CH}, ints(toX, 0, 5));
         assertSame(merged, toX.bufferArg(6));
         assertSame(slot(ScratchSlots.Q).buffer(), toX.bufferArg(7));
-        Dispatch toZ = ds.get(2);
+        FakeDispatch toZ = ds.get(2);
         assertArrayEquals(new int[]{1, VAL, rowW, mergedOff + CONV_CH, VAL}, ints(toZ, 0, 5));
         assertSame(merged, toZ.bufferArg(6));
         assertSame(slot(ScratchSlots.V).buffer(), toZ.bufferArg(7));
         assertSame(slot(ScratchSlots.Q).buffer(), ds.get(4).bufferArg(10));
 
         assertSame(buf("blk.0.ssm_beta_alpha.weight"), ds.get(3).bufferArg(2));
-        Dispatch gate = ds.get(6);
+        FakeDispatch gate = ds.get(6);
         assertArrayEquals(new int[]{1, NV, NK, DeltaNetKernels.LAYOUT_CONCAT_BA, -1}, ints(gate, 0, 5));
         int[] strides = ints(gate, 7, 11);
         assertEquals(2 * NV, strides[0]);
@@ -557,11 +559,11 @@ public class GpuGdnMixerTest {
         backend.clearLog();
         mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH));
 
-        List<FakeComputeBackend.Op> log = backend.ops();
-        assertEquals(FakeComputeBackend.OpKind.FILL, log.get(0).kind());
-        assertEquals(FakeComputeBackend.OpKind.FILL, log.get(1).kind());
-        Dispatch conv = backend.dispatchesOf(CONV).get(0);
-        Dispatch scan = backend.dispatchesOf(SCAN).get(0);
+        List<FakeOp> log = backend.ops();
+        assertEquals(FakeOpKind.FILL, log.get(0).kind());
+        assertEquals(FakeOpKind.FILL, log.get(1).kind());
+        FakeDispatch conv = backend.dispatchesOf(CONV).get(0);
+        FakeDispatch scan = backend.dispatchesOf(SCAN).get(0);
         assertSame(log.get(0).buffer(), conv.bufferArg(13));
         assertSame(log.get(1).buffer(), scan.bufferArg(DeltaNetKernels.SCAN_ARG_STATE));
         assertSame(placeholders.readOnlyInts(), conv.bufferArg(14));
@@ -579,7 +581,7 @@ public class GpuGdnMixerTest {
                 .recurrent(plain.recurrent())
                 .build();
         bind(MixerKind.GDN, Arch.QWEN35, layer, true);
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
         assertEquals(MV, ds.get(0).kernelName());
         assertArrayEquals(new int[]{CONV_CH, N_EMBD}, ints(ds.get(0), 0, 2));
@@ -624,14 +626,14 @@ public class GpuGdnMixerTest {
         LayerSpec layer = layer(MixerKind.KDA, RecurrentSpec.builder(MixerKind.KDA).nHead(nH).headDim(d)
                 .dConv(D_CONV).kdaGateMode(KdaGateMode.LOWRANK).decayGate(RecurrentSpec.DecayGate.SOFTPLUS).build());
         bind(MixerKind.KDA, Arch.KIMI_LINEAR, layer, true);
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
         assertEquals(Arrays.asList(MV, CONV, MV, CONV, MV, CONV, MV, MV, MV, GATE, NORM, NORM, SCAN, NORM, MV, MV,
                 GLU, MV), names(ds));
         String[] outs = {ScratchSlots.Q, ScratchSlots.K, ScratchSlots.V};
         String[] convW = {"blk.0.ssm_conv1d_q.weight", "blk.0.ssm_conv1d_k.weight", "blk.0.ssm_conv1d_v.weight"};
         for (int i = 0; i < 3; i++) {
-            Dispatch c = ds.get(1 + 2 * i);
+            FakeDispatch c = ds.get(1 + 2 * i);
             assertArrayEquals(new int[]{dInner, D_CONV, 1, SsmKernels.CONV_FLAG_SILU, dInner, 0, dInner, 0,
                     i * dInner, 3 * dInner * (D_CONV - 1)}, ints(c, 0, 10));
             assertSame(slot(ScratchSlots.ATTN_OUT).buffer(), c.bufferArg(10));
@@ -639,14 +641,14 @@ public class GpuGdnMixerTest {
             assertSame(convState, c.bufferArg(13));
             assertSame(slot(outs[i]).buffer(), c.bufferArg(15));
         }
-        Dispatch gate = ds.get(9);
+        FakeDispatch gate = ds.get(9);
         assertArrayEquals(new int[]{1, nH, nH, DeltaNetKernels.LAYOUT_SEPARATE,
                 RecurrentSpec.DecayGate.SOFTPLUS.code(), d}, ints(gate, 0, 6));
         assertArrayEquals(new int[]{dInner, 0, nH, 0}, ints(gate, 7, 11));
         assertSame(slot(ScratchSlots.ATTN_OUT).buffer(), gate.bufferArg(DeltaNetKernels.GATE_ARG_A_IN));
         assertArrayEquals(new long[]{roundUp(dInner)}, gate.global());
 
-        Dispatch scan = ds.get(12);
+        FakeDispatch scan = ds.get(12);
         assertArrayEquals(new int[]{d, d, nH, nH, 1, GdnHeadMap.TILED.code(), DeltaNetKernels.GATE_MODE_PER_KEY,
                 dInner, 0, dInner, 0, dInner, 0, dInner, 0}, ints(scan, 0, 15));
         assertSame(slot(ScratchSlots.Q).buffer(), scan.bufferArg(DeltaNetKernels.SCAN_ARG_Q));
@@ -674,18 +676,18 @@ public class GpuGdnMixerTest {
                 .slopes(slopes).build());
         backend.clearLog();
         bind(MixerKind.LIGHTNING, Arch.MINIMAX_01, layer, true);
-        List<FakeComputeBackend.Op> bindOps = backend.ops();
-        FakeComputeBackend.Op upload = null;
-        for (FakeComputeBackend.Op op : bindOps) {
-            if (op.kind() == FakeComputeBackend.OpKind.WRITE) {
+        List<FakeOp> bindOps = backend.ops();
+        FakeOp upload = null;
+        for (FakeOp op : bindOps) {
+            if (op.kind() == FakeOpKind.WRITE) {
                 upload = op;
             }
         }
         assertEquals(nH * Float.BYTES, upload.bytes());
 
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
         assertEquals(Arrays.asList(MV, GpuOps.UNARY, DeltaNetKernels.LIGHTNING_ATTN, NORM, MV, GLU, MV), names(ds));
-        Dispatch la = ds.get(2);
+        FakeDispatch la = ds.get(2);
         assertArrayEquals(new int[]{1, nH, d}, ints(la, 0, 3));
         assertEquals(1.0f, la.floatArg(DeltaNetKernels.LIGHTNING_ARG_LAYER_SCALE), 0.0f);
         assertSame(upload.buffer(), la.bufferArg(DeltaNetKernels.LIGHTNING_ARG_SLOPES));

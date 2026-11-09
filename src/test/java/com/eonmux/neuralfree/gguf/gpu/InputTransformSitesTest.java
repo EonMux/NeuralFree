@@ -14,10 +14,11 @@ import static org.junit.Assert.fail;
 
 /**
  * Guards the S5 input-transform sites: every consumer of a GPU weight either routes the product through the
- * {@code GpuOps} entry points (whose {@code projectionInput} applies the full HADAMARD &rarr; ACT_QUANT &rarr;
- * PERMUTE chain) or refuses a non-identity input transform. A source-scan test on purpose: the sites gain methods
- * over time, and a reflection sweep sees only the weights a model actually binds, while every site must refuse at
- * bind time too.
+ * {@code GpuOps} entry points (whose projection implementation, {@code GpuProjections.projectionInput}, applies
+ * the full HADAMARD &rarr; ACT_QUANT &rarr; PERMUTE chain with the {@code GpuOps.actFakeQuant} and
+ * {@code GpuOps.permuteCols} kernels) or refuses a non-identity input transform. A source-scan test on purpose:
+ * the sites gain methods over time, and a reflection sweep sees only the weights a model actually binds, while
+ * every site must refuse at bind time too.
  *
  * <p>Sites that only use {@link com.eonmux.neuralfree.gguf.spec.DsaSpec#hadamard()} (the lightning-indexer KV
  * rotation) carry no weight-transform duty; the test pins that they reference no weight input transform at all.
@@ -122,13 +123,19 @@ public class InputTransformSitesTest {
     }
 
     @Test
-    public void gpuOpsAppliesTheWholeChainIntoReservedStaging() {
-        String src = source("gpu/forward/GpuOps.java");
-        assertTrue("GpuOps lost the projectionInput chain application", src.contains("projectionInput("));
-        assertTrue(src.contains("actFakeQuant("));
-        assertTrue(src.contains("permuteCols("));
-        assertTrue("GpuOps must reserve its own staging kind for the PERMUTE gather",
-                src.contains("GpuScratch.Staging.PERMUTED"));
+    public void gpuProjectionsAppliesTheWholeChainIntoReservedStaging() {
+        String projections = source("gpu/forward/GpuProjections.java");
+        assertTrue("GpuProjections lost the projectionInput chain application",
+                projections.contains("projectionInput("));
+        assertTrue("GpuProjections must apply the ACT_QUANT part through GpuOps.actFakeQuant",
+                projections.contains("ops.actFakeQuant("));
+        assertTrue("GpuProjections must apply the PERMUTE part through GpuOps.permuteCols",
+                projections.contains("ops.permuteCols("));
+        assertTrue("GpuProjections must reserve its own staging kind for the PERMUTE gather",
+                projections.contains("GpuScratch.Staging.PERMUTED"));
+        String ops = source("gpu/forward/GpuOps.java");
+        assertTrue("GpuOps lost the actFakeQuant kernel", ops.contains("actFakeQuant("));
+        assertTrue("GpuOps lost the permuteCols kernel", ops.contains("permuteCols("));
         String scratch = source("gpu/forward/GpuScratch.java");
         assertTrue("GpuScratch lost the PERMUTED staging kind", scratch.contains("PERMUTED"));
     }

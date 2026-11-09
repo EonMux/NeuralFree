@@ -20,6 +20,7 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
 import com.eonmux.neuralfree.gguf.hparams.MropeTextPositions;
+import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
@@ -49,7 +50,7 @@ import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -244,7 +245,7 @@ public class GpuMlaMixerTest {
         return (DeviceStepInputs) memory.stepInputs();
     }
 
-    private List<Dispatch> step(int pos0, int n) {
+    private List<FakeDispatch> step(int pos0, int n) {
         steps().upload(pos0, n);
         backend.clearLog();
         ScratchSlot in = scratch.slot(ScratchSlots.NORMED);
@@ -258,16 +259,16 @@ public class GpuMlaMixerTest {
     }
 
     /** The cache writes of {@code n} rows: {@link GpuMlaMixer#prefillKV} over the same step inputs. */
-    private List<Dispatch> kvOnlyStep(int pos0, int n) {
+    private List<FakeDispatch> kvOnlyStep(int pos0, int n) {
         steps().upload(pos0, n);
         backend.clearLog();
         mixer.prefillKV(pos0, n, scratch.slot(ScratchSlots.NORMED));
         return backend.dispatches();
     }
 
-    private static List<Dispatch> named(List<Dispatch> ds, String kernel) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+    private static List<FakeDispatch> named(List<FakeDispatch> ds, String kernel) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 out.add(d);
             }
@@ -275,7 +276,7 @@ public class GpuMlaMixerTest {
         return out;
     }
 
-    private static int firstIndex(List<Dispatch> ds, String kernel, int from) {
+    private static int firstIndex(List<FakeDispatch> ds, String kernel, int from) {
         for (int i = from; i < ds.size(); i++) {
             if (ds.get(i).kernelName().equals(kernel)) {
                 return i;
@@ -285,9 +286,9 @@ public class GpuMlaMixerTest {
     }
 
     /** The MLA kernels of one step, in order: everything but the dense projections. */
-    private static List<String> mlaKernels(List<Dispatch> ds) {
+    private static List<String> mlaKernels(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             String k = d.kernelName();
             if (k.equals(NormKernels.ROW_NORM) || k.equals(RopeKernels.ROPE_EXT) || k.contains("_MatVecId")
                     || k.equals(GpuOps.COPY2D) || k.startsWith("LLM_KV_Store_") || k.startsWith("LLM_Flash")
@@ -304,7 +305,7 @@ public class GpuMlaMixerTest {
     public void decodeRunsTheAbsorbedLatentSequence() {
         open(KvDType.F16, 64, 32);
         int pos = 0;
-        List<Dispatch> ds = step(pos, 1);
+        List<FakeDispatch> ds = step(pos, 1);
         String id = MoeKernels.matVecId(GGMLType.F32);
         List<String> expected = new ArrayList<>();
         Collections.addAll(expected, NormKernels.ROW_NORM, RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT,
@@ -319,8 +320,8 @@ public class GpuMlaMixerTest {
         ScratchSlot qlat = temp(GpuMlaMixer.TEMP_Q_LATENT, (long) UBATCH * N_HEAD * width);
         ScratchSlot attn = temp(GpuMlaMixer.TEMP_ATTN, (long) UBATCH * N_HEAD * HEAD_V);
 
-        List<Dispatch> norms = named(ds, NormKernels.ROW_NORM);
-        Dispatch kvNorm = norms.get(1);
+        List<FakeDispatch> norms = named(ds, NormKernels.ROW_NORM);
+        FakeDispatch kvNorm = norms.get(1);
         assertEquals(1, kvNorm.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(kvLora, kvNorm.intArg(1));
         assertEquals(width, kvNorm.intArg(2));
@@ -328,14 +329,14 @@ public class GpuMlaMixerTest {
         assertSame(kva.buffer(), kvNorm.bufferArg(12));
         assertSame(weight(TensorNames.ATTN_KV_A_NORM), kvNorm.bufferArg(10));
 
-        List<Dispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
+        List<FakeDispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
         assertEquals(1, ropes.get(0).intArg(RopeKernels.ARG_N_TOKENS));
         assertEquals(1, ropes.get(0).intArg(RopeKernels.ARG_POS_STRIDE));
         assertSame(q.buffer(), ropes.get(0).bufferArg(ropes.get(0).argCount() - 1));
         assertSame(kva.buffer(), ropes.get(1).bufferArg(ropes.get(1).argCount() - 1));
 
-        List<Dispatch> ids = named(ds, id);
-        Dispatch absorb = ids.get(0);
+        List<FakeDispatch> ids = named(ds, id);
+        FakeDispatch absorb = ids.get(0);
         assertEquals(kvLora, absorb.intArg(0));
         assertEquals(NOPE, absorb.intArg(1));
         assertEquals(N_HEAD, absorb.intArg(MoeKernels.ARG_ID_N_SEL));
@@ -343,7 +344,7 @@ public class GpuMlaMixerTest {
         assertSame(weight(TensorNames.ATTN_K_B), absorb.bufferArg(MoeKernels.ARG_ID_WEIGHT));
         assertSame(q.buffer(), absorb.bufferArg(MoeKernels.ARG_ID_INPUT));
         assertSame(lat.buffer(), absorb.bufferArg(MoeKernels.ARG_ID_OUTPUT));
-        Dispatch expand = ids.get(1);
+        FakeDispatch expand = ids.get(1);
         assertEquals(HEAD_V, expand.intArg(0));
         assertEquals(kvLora, expand.intArg(1));
         assertEquals(N_HEAD, expand.intArg(MoeKernels.ARG_ID_N_SEL));
@@ -353,14 +354,14 @@ public class GpuMlaMixerTest {
         assertSame(attn.buffer(), expand.bufferArg(MoeKernels.ARG_ID_OUTPUT));
         assertSame(absorb.bufferArg(MoeKernels.ARG_ID_SLOTS), expand.bufferArg(MoeKernels.ARG_ID_SLOTS));
 
-        Dispatch store = named(ds, RopeKernels.kvStore(KvDType.F16)).get(0);
+        FakeDispatch store = named(ds, RopeKernels.kvStore(KvDType.F16)).get(0);
         assertEquals(1, store.intArg(RopeKernels.ARG_N_TOKENS));
         assertEquals(width, store.intArg(1));
         assertSame(kva.buffer(), store.bufferArg(5));
         assertSame(steps().cellIdx(kv.group()), store.bufferArg(6));
         assertSame(kv.k(), store.bufferArg(7));
 
-        Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        FakeDispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
         assertEquals(N_HEAD, fd.intArg(AttnKernels.ARG_FD_N_HEAD));
         assertEquals(1, fd.intArg(AttnKernels.ARG_FD_N_HEAD_KV));
         assertEquals(width, fd.intArg(AttnKernels.ARG_FD_D_K));
@@ -379,7 +380,7 @@ public class GpuMlaMixerTest {
         assertSame(kv.k(), fd.bufferArg(AttnKernels.ARG_FD_BUF_V));
         assertSame(lat.buffer(), fd.bufferArg(AttnKernels.ARG_FD_BUF_OUT));
 
-        Dispatch last = ds.get(ds.size() - 1);
+        FakeDispatch last = ds.get(ds.size() - 1);
         assertTrue(firstIndex(ds, AttnKernels.flashDecode(KvDType.F16), 0) < ds.size() - 1);
         assertSame(scratch.slot(ScratchSlots.BRANCH).buffer(), last.bufferArg(last.argCount() - 1));
     }
@@ -388,8 +389,8 @@ public class GpuMlaMixerTest {
     public void decodeAtLaterPositionWidensTheKeyRange() {
         open(KvDType.F16, 64, 32);
         step(0, 3);
-        List<Dispatch> ds = step(3, 1);
-        Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        List<FakeDispatch> ds = step(3, 1);
+        FakeDispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
         assertEquals(0, fd.intArg(AttnKernels.ARG_FD_KV_START));
         assertEquals(4, fd.intArg(AttnKernels.ARG_FD_KV_END));
         assertEquals(3, fd.intArg(AttnKernels.ARG_FD_Q_POS));
@@ -398,7 +399,7 @@ public class GpuMlaMixerTest {
     @Test
     public void decodeOnTheInt8LaneQuantizesTheSharedInputRowOnce() {
         openLane(KvDType.F16, 64, 32);
-        List<Dispatch> ds = step(0, 1);
+        List<FakeDispatch> ds = step(0, 1);
         List<String> names = kernelNames(ds);
         // The shared stream row backs the query-A and latent projections: one quantize serves both
         // single-token matvecs; the query-B projection reads the LoRA row off the lane (an F32 weight).
@@ -408,11 +409,14 @@ public class GpuMlaMixerTest {
         int queryA = firstIndex(ds, "Q4_0_MatVec_Q8", 0);
         int latent = firstIndex(ds, "Q4_0_MatVec_Q8", queryA + 1);
         assertTrue(names.toString(), shared < queryA && shared < latent);
-        // A two-row step takes the multi-column integer-dot lane: each stream projection quantizes its
-        // two rows and runs the Q4_0 MatVecN kernel; the single-row share does not apply.
+        // A two-row step takes the counted multi-column integer-dot lane: each stream projection
+        // quantizes its two rows and runs the exact-token-count twin of the Q4_0 MatVecN kernel
+        // (countedMatvecNName folds the token count into the name); the single-row share does not apply.
         List<String> prefill = kernelNames(step(1, 2));
         assertEquals(prefill.toString(), 2, Collections.frequency(prefill, GpuOps.QUANTIZE_Q8_1));
-        assertEquals(prefill.toString(), 2, Collections.frequency(prefill, "Q4_0_MatVecN_Q8"));
+        String counted = LlmKernelConstants.countedMatvecNName("Q4_0_MatVecN_Q8", 2);
+        assertEquals(prefill.toString(), 2, Collections.frequency(prefill, counted));
+        assertEquals(prefill.toString(), 0, Collections.frequency(prefill, "Q4_0_MatVecN_Q8"));
         assertEquals(prefill.toString(), 0, Collections.frequency(prefill, "Q4_0_BatchMatMul_2D"));
     }
 
@@ -442,9 +446,9 @@ public class GpuMlaMixerTest {
         mixer.bind(ctx, layer);
     }
 
-    private static List<String> kernelNames(List<Dispatch> ds) {
+    private static List<String> kernelNames(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
@@ -456,7 +460,7 @@ public class GpuMlaMixerTest {
     public void prefillAttendsAllRowsOverTheLatentCache() {
         open(KvDType.F16, 64, 32);
         int n = 5;
-        List<Dispatch> ds = step(0, n);
+        List<FakeDispatch> ds = step(0, n);
         GpuKvLayer kv = memory.kv(0);
         ScratchSlot qlat = temp(GpuMlaMixer.TEMP_Q_LATENT, (long) UBATCH * N_HEAD * width);
         ScratchSlot lat = temp(GpuMlaMixer.TEMP_LATENT, (long) UBATCH * N_HEAD * kvLora);
@@ -464,21 +468,21 @@ public class GpuMlaMixerTest {
         ScratchSlot attn = temp(GpuMlaMixer.TEMP_ATTN, (long) UBATCH * N_HEAD * HEAD_V);
 
         assertTrue(named(ds, MoeKernels.matVecId(GGMLType.F32)).isEmpty());
-        Dispatch bucket = named(ds, MoeKernels.BUCKETIZE).get(0);
+        FakeDispatch bucket = named(ds, MoeKernels.BUCKETIZE).get(0);
         assertEquals(Arrays.asList(n, N_HEAD, N_HEAD), Arrays.asList(bucket.intArg(0), bucket.intArg(1),
                 bucket.intArg(2)));
-        Dispatch align = named(ds, MoeKernels.ALIGN_BLOCKS).get(0);
+        FakeDispatch align = named(ds, MoeKernels.ALIGN_BLOCKS).get(0);
         int tiles = MoeKernels.groupedTiles(UBATCH * N_HEAD, N_HEAD);
         assertEquals(n, align.intArg(MoeKernels.ARG_N_TOKENS));
         assertEquals(tiles, align.intArg(3));
-        List<Dispatch> ids = named(ds, MoeKernels.groupedGemm(GGMLType.F32));
+        List<FakeDispatch> ids = named(ds, MoeKernels.groupedGemm(GGMLType.F32));
         assertEquals(2, ids.size());
-        Dispatch absorb = ids.get(0);
-        Dispatch expandGg = ids.get(1);
+        FakeDispatch absorb = ids.get(0);
+        FakeDispatch expandGg = ids.get(1);
         assertEquals(Arrays.asList(kvLora, NOPE, tiles, 1, NOPE + rope, q.offset(), lat.offset()),
                 ggInts(absorb));
         assertEquals(Arrays.asList(HEAD_V, kvLora, tiles, 1, kvLora, lat.offset(), attn.offset()), ggInts(expandGg));
-        for (Dispatch d : ids) {
+        for (FakeDispatch d : ids) {
             assertSame(align.bufferArg(8), d.bufferArg(MoeKernels.ARG_GG_GEMM_TOKEN));
             assertSame(align.bufferArg(9), d.bufferArg(MoeKernels.ARG_GG_GEMM_SLOT));
             assertEquals(0, d.intArg(MoeKernels.ARG_GG_EXPERT_BASE));
@@ -490,9 +494,9 @@ public class GpuMlaMixerTest {
         assertSame(attn.buffer(), expandGg.bufferArg(MoeKernels.ARG_GG_OUTPUT));
         assertTrue(ds.indexOf(bucket) < ds.indexOf(align) && ds.indexOf(align) < ds.indexOf(absorb));
         assertEquals(n, named(ds, RopeKernels.kvStore(KvDType.F16)).get(0).intArg(RopeKernels.ARG_N_TOKENS));
-        List<Dispatch> copies = named(ds, GpuOps.COPY2D);
+        List<FakeDispatch> copies = named(ds, GpuOps.COPY2D);
         assertEquals(2, copies.size());
-        for (Dispatch c : copies) {
+        for (FakeDispatch c : copies) {
             assertEquals(n * N_HEAD, c.intArg(0));
         }
         assertEquals(kvLora, copies.get(0).intArg(1));
@@ -501,7 +505,7 @@ public class GpuMlaMixerTest {
         FlashAttnTiling t = FlashAttnTiling.prefill(N_HEAD, 1, width, kvLora, kv.layout().rows(),
                 kernels.faSmemFloats(), Math.max(1, kernels.caps().getComputeUnits()));
         if (t.plan() == FlashAttnTiling.Plan.TILED) {
-            Dispatch fa = named(ds, AttnKernels.flashAttn(KvDType.F16)).get(0);
+            FakeDispatch fa = named(ds, AttnKernels.flashAttn(KvDType.F16)).get(0);
             assertEquals(n, fa.intArg(AttnKernels.ARG_FA_N_TOKENS));
             assertEquals(1, fa.intArg(AttnKernels.ARG_FA_N_HEAD_KV));
             assertEquals(width, fa.intArg(AttnKernels.ARG_FA_D_K));
@@ -519,10 +523,10 @@ public class GpuMlaMixerTest {
             assertEquals((fa.intArg(AttnKernels.ARG_FA_FLAGS) & AttnKernels.FLAG_DIRECT) != 0 ? 0 : 1,
                     combines);
         } else {
-            List<Dispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F16));
+            List<FakeDispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F16));
             assertEquals(n, rows.size());
             for (int i = 0; i < n; i++) {
-                Dispatch d = rows.get(i);
+                FakeDispatch d = rows.get(i);
                 assertEquals(i, d.intArg(AttnKernels.ARG_FD_Q_POS));
                 assertEquals(i + 1, d.intArg(AttnKernels.ARG_FD_KV_END));
                 assertEquals(qlat.offset() + i * N_HEAD * width, d.intArg(AttnKernels.ARG_FD_Q_OFF));
@@ -533,8 +537,8 @@ public class GpuMlaMixerTest {
         int expand = ds.indexOf(ids.get(1));
         assertTrue(store < expand);
 
-        List<Dispatch> decode = step(n, 1);
-        List<Dispatch> perHead = named(decode, MoeKernels.matVecId(GGMLType.F32));
+        List<FakeDispatch> decode = step(n, 1);
+        List<FakeDispatch> perHead = named(decode, MoeKernels.matVecId(GGMLType.F32));
         assertEquals("one token keeps the per-head products", 2, perHead.size());
         assertTrue(named(decode, MoeKernels.BUCKETIZE).isEmpty());
         assertSame("the head sort reads the per-head slot table", perHead.get(0).bufferArg(MoeKernels.ARG_ID_SLOTS),
@@ -548,8 +552,8 @@ public class GpuMlaMixerTest {
     @Test
     public void kvOnlyPrefillStopsAtTheLatentStore() {
         open(KvDType.F16, 64, 32);
-        List<Dispatch> whole = step(0, 5);
-        List<Dispatch> kvOnly = kvOnlyStep(0, 5);
+        List<FakeDispatch> whole = step(0, 5);
+        List<FakeDispatch> kvOnly = kvOnlyStep(0, 5);
 
         assertEquals(Arrays.asList(RopeKernels.ROPE_EXT, NormKernels.ROW_NORM,
                 RopeKernels.kvStore(KvDType.F16)), mlaKernels(kvOnly));
@@ -561,13 +565,13 @@ public class GpuMlaMixerTest {
         assertEquals(0, named(kvOnly, AttnKernels.flashDecode(KvDType.F16)).size());
         assertEquals(1, named(kvOnly, RopeKernels.ROPE_EXT).size());
         assertEquals(1, named(kvOnly, NormKernels.ROW_NORM).size());
-        Dispatch store = named(kvOnly, RopeKernels.kvStore(KvDType.F16)).get(0);
+        FakeDispatch store = named(kvOnly, RopeKernels.kvStore(KvDType.F16)).get(0);
         assertEquals(5, store.intArg(RopeKernels.ARG_N_TOKENS));
         assertSame(memory.kv(0).k(), store.bufferArg(7));
     }
 
     /** The scalar arguments of a grouped GEMM before has_scale: out, in, tiles, x_div, x_stride, in_off, out_off. */
-    private static List<Integer> ggInts(Dispatch d) {
+    private static List<Integer> ggInts(FakeDispatch d) {
         List<Integer> v = new ArrayList<>();
         for (int i = 0; i < MoeKernels.ARG_GG_HAS_SCALE; i++) {
             v.add(d.intArg(i));
@@ -594,20 +598,20 @@ public class GpuMlaMixerTest {
                 .build();
         open(KvDType.F16, 64, 32, caps, MoeKernels.ALIGN_BLOCKS);
         int n = 5;
-        List<Dispatch> ds = step(0, n);
+        List<FakeDispatch> ds = step(0, n);
         ScratchSlot q = temp(GpuMlaMixer.TEMP_Q, (long) UBATCH * N_HEAD * (NOPE + rope));
         ScratchSlot lat = temp(GpuMlaMixer.TEMP_LATENT, (long) UBATCH * N_HEAD * kvLora);
         ScratchSlot attn = temp(GpuMlaMixer.TEMP_ATTN, (long) UBATCH * N_HEAD * HEAD_V);
-        List<Dispatch> ids = named(ds, MoeKernels.matVecId(GGMLType.F32));
+        List<FakeDispatch> ids = named(ds, MoeKernels.matVecId(GGMLType.F32));
         assertEquals(6, ids.size());
         int[] sel = {4, 4, 2};
         for (int c = 0; c < 3; c++) {
             int row0 = 2 * c * N_HEAD;
-            Dispatch absorb = ids.get(c);
+            FakeDispatch absorb = ids.get(c);
             assertEquals(sel[c], absorb.intArg(MoeKernels.ARG_ID_N_SEL));
             assertEquals(q.offset() + row0 * (NOPE + rope), absorb.intArg(MoeKernels.ARG_ID_IN_OFF));
             assertEquals(lat.offset() + row0 * kvLora, absorb.intArg(MoeKernels.ARG_ID_OUT_OFF));
-            Dispatch expand = ids.get(3 + c);
+            FakeDispatch expand = ids.get(3 + c);
             assertEquals(sel[c], expand.intArg(MoeKernels.ARG_ID_N_SEL));
             assertEquals(lat.offset() + row0 * kvLora, expand.intArg(MoeKernels.ARG_ID_IN_OFF));
             assertEquals(attn.offset() + row0 * HEAD_V, expand.intArg(MoeKernels.ARG_ID_OUT_OFF));
@@ -621,7 +625,7 @@ public class GpuMlaMixerTest {
         open(KvDType.Q8_0, 128, 64);
         assertEquals(KvDType.Q8_0, memory.kv(0).layout().dtypeK());
         assertSame(RotationPlan.NONE, memory.plan().layer(0).rotation());
-        List<Dispatch> ds = step(0, 1);
+        List<FakeDispatch> ds = step(0, 1);
         assertTrue(named(ds, HadamardSpec.KERNEL).isEmpty());
         assertEquals(1, named(ds, RopeKernels.kvStore(KvDType.Q8_0)).size());
         assertEquals(1, named(ds, AttnKernels.flashDecode(KvDType.Q8_0)).size());
@@ -658,11 +662,11 @@ public class GpuMlaMixerTest {
         rope = 32;
         attention = facet(rope, true, false);
         open(KvDType.F16, 64, 32);
-        List<Dispatch> ds = step(0, 3);
+        List<FakeDispatch> ds = step(0, 3);
         ScratchSlot kva = temp(GpuMlaMixer.TEMP_KV_A, (long) UBATCH * width);
-        List<Dispatch> norms = named(ds, NormKernels.ROW_NORM);
+        List<FakeDispatch> norms = named(ds, NormKernels.ROW_NORM);
         assertEquals(3, norms.size());
-        Dispatch kPe = norms.get(1);
+        FakeDispatch kPe = norms.get(1);
         assertEquals(3, kPe.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(rope, kPe.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
         assertEquals(width, kPe.intArg(NormKernels.ARG_ROW_NORM_ROW_STRIDE));
@@ -670,7 +674,7 @@ public class GpuMlaMixerTest {
         assertEquals(kva.offset() + kvLora, kPe.intArg(NormKernels.ARG_ROW_NORM_Y_OFF));
         assertSame(kva.buffer(), kPe.bufferArg(NormKernels.ARG_ROW_NORM_X));
         assertSame(weight(TensorNames.ATTN_K_NORM), kPe.bufferArg(NormKernels.ARG_ROW_NORM_W));
-        List<Dispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
+        List<FakeDispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
         assertTrue(ds.indexOf(kPe) < ds.indexOf(ropes.get(1)));
         assertEquals(kvLora, norms.get(2).intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
     }
@@ -679,9 +683,9 @@ public class GpuMlaMixerTest {
     public void layersWithoutAKeyNormRunNone() {
         attention = facet(32, false, false);
         open(KvDType.F16, 64, 32);
-        List<Dispatch> norms = named(step(0, 1), NormKernels.ROW_NORM);
+        List<FakeDispatch> norms = named(step(0, 1), NormKernels.ROW_NORM);
         assertEquals(2, norms.size());
-        for (Dispatch d : norms) {
+        for (FakeDispatch d : norms) {
             assertFalse(d.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN) == rope);
         }
     }
@@ -691,21 +695,21 @@ public class GpuMlaMixerTest {
         attention = facet(32, false, true);
         open(KvDType.F16, 64, 32);
         GpuBuffer sinks = weight(TensorNames.ATTN_SINKS);
-        Dispatch fd = named(step(0, 1), AttnKernels.flashDecode(KvDType.F16)).get(0);
+        FakeDispatch fd = named(step(0, 1), AttnKernels.flashDecode(KvDType.F16)).get(0);
         assertTrue((fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
         assertSame(sinks, fd.bufferArg(AttnKernels.ARG_FD_BUF_SINKS));
 
-        List<Dispatch> ds = step(1, 5);
-        List<Dispatch> fa = named(ds, AttnKernels.flashAttn(KvDType.F16));
-        for (Dispatch d : fa) {
+        List<FakeDispatch> ds = step(1, 5);
+        List<FakeDispatch> fa = named(ds, AttnKernels.flashAttn(KvDType.F16));
+        for (FakeDispatch d : fa) {
             assertTrue((d.intArg(AttnKernels.ARG_FA_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
             assertSame(sinks, d.bufferArg(AttnKernels.ARG_FA_BUF_SINKS));
         }
-        for (Dispatch d : named(ds, AttnKernels.flashDecode(KvDType.F16))) {
+        for (FakeDispatch d : named(ds, AttnKernels.flashDecode(KvDType.F16))) {
             assertTrue((d.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
             assertSame(sinks, d.bufferArg(AttnKernels.ARG_FD_BUF_SINKS));
         }
-        for (Dispatch d : named(ds, AttnKernels.FLASH_COMBINE)) {
+        for (FakeDispatch d : named(ds, AttnKernels.FLASH_COMBINE)) {
             assertEquals(1, d.intArg(AttnKernels.ARG_FC_HAS_SINKS));
             assertSame(sinks, d.bufferArg(AttnKernels.ARG_FC_BUF_SINKS));
         }
@@ -722,7 +726,7 @@ public class GpuMlaMixerTest {
     @Test
     public void decodeRunsTheAbsorbedDecompressedSequence() {
         open(KvDType.F16, 64, 32, false);
-        List<Dispatch> ds = step(0, 1);
+        List<FakeDispatch> ds = step(0, 1);
         String id = MoeKernels.matVecId(GGMLType.F32);
         String idT = MoeKernels.matVecIdT(GGMLType.F32);
         List<String> expected = new ArrayList<>();
@@ -739,7 +743,7 @@ public class GpuMlaMixerTest {
         ScratchSlot v = temp(GpuMlaMixer.TEMP_V, (long) UBATCH * N_HEAD * HEAD_V);
         ScratchSlot attn = temp(GpuMlaMixer.TEMP_ATTN, (long) UBATCH * N_HEAD * HEAD_V);
 
-        Dispatch kNope = named(ds, idT).get(0);
+        FakeDispatch kNope = named(ds, idT).get(0);
         assertEquals(NOPE, kNope.intArg(0));
         assertEquals(kvLora, kNope.intArg(1));
         assertEquals(N_HEAD, kNope.intArg(MoeKernels.ARG_ID_N_SEL));
@@ -747,7 +751,7 @@ public class GpuMlaMixerTest {
         assertSame(weight(TensorNames.ATTN_K_B), kNope.bufferArg(MoeKernels.ARG_ID_WEIGHT));
         assertSame(kva.buffer(), kNope.bufferArg(MoeKernels.ARG_ID_INPUT));
         assertSame(kvb.buffer(), kNope.bufferArg(MoeKernels.ARG_ID_OUTPUT));
-        Dispatch expand = named(ds, id).get(0);
+        FakeDispatch expand = named(ds, id).get(0);
         assertEquals(HEAD_V, expand.intArg(0));
         assertEquals(kvLora, expand.intArg(1));
         assertEquals(N_HEAD, expand.intArg(MoeKernels.ARG_ID_N_SEL));
@@ -757,8 +761,8 @@ public class GpuMlaMixerTest {
         assertSame(v.buffer(), expand.bufferArg(MoeKernels.ARG_ID_OUTPUT));
         assertSame(kNope.bufferArg(MoeKernels.ARG_ID_SLOTS), expand.bufferArg(MoeKernels.ARG_ID_SLOTS));
 
-        List<Dispatch> copies = named(ds, GpuOps.COPY2D);
-        Dispatch kNopeCopy = copies.get(0);
+        List<FakeDispatch> copies = named(ds, GpuOps.COPY2D);
+        FakeDispatch kNopeCopy = copies.get(0);
         assertEquals(N_HEAD, kNopeCopy.intArg(0));
         assertEquals(NOPE, kNopeCopy.intArg(1));
         assertEquals(NOPE, kNopeCopy.intArg(2));
@@ -766,7 +770,7 @@ public class GpuMlaMixerTest {
         assertSame(kvb.buffer(), kNopeCopy.bufferArg(6));
         assertSame(k.buffer(), kNopeCopy.bufferArg(7));
         for (int h = 0; h < N_HEAD; h++) {
-            Dispatch ropeCopy = copies.get(1 + h);
+            FakeDispatch ropeCopy = copies.get(1 + h);
             assertEquals(1, ropeCopy.intArg(0));
             assertEquals(rope, ropeCopy.intArg(1));
             assertEquals(width, ropeCopy.intArg(2));
@@ -777,7 +781,7 @@ public class GpuMlaMixerTest {
             assertSame(k.buffer(), ropeCopy.bufferArg(7));
         }
 
-        Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        FakeDispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
         assertEquals(NOPE + rope, fd.intArg(AttnKernels.ARG_FD_D_K));
         assertEquals(HEAD_V, fd.intArg(AttnKernels.ARG_FD_D_V));
         assertSame(kv.k(), fd.bufferArg(AttnKernels.ARG_FD_BUF_K));
@@ -793,18 +797,18 @@ public class GpuMlaMixerTest {
     public void prefillRunsTheAbsorbedDecompressedProductsPerToken() {
         open(KvDType.F16, 64, 32, false);
         int n = 3;
-        List<Dispatch> ds = step(0, n);
+        List<FakeDispatch> ds = step(0, n);
         String id = MoeKernels.matVecId(GGMLType.F32);
         String idT = MoeKernels.matVecIdT(GGMLType.F32);
-        List<Dispatch> decomp = named(ds, idT);
-        List<Dispatch> expand = named(ds, id);
+        List<FakeDispatch> decomp = named(ds, idT);
+        List<FakeDispatch> expand = named(ds, id);
         assertEquals(n, decomp.size());
         assertEquals(n, expand.size());
         ScratchSlot kva = temp(GpuMlaMixer.TEMP_KV_A, (long) UBATCH * width);
         ScratchSlot kvb = temp(GpuMlaMixer.TEMP_KV_B, (long) UBATCH * N_HEAD * NOPE);
         ScratchSlot v = temp(GpuMlaMixer.TEMP_V, (long) UBATCH * N_HEAD * HEAD_V);
         for (int t = 0; t < n; t++) {
-            Dispatch d = decomp.get(t);
+            FakeDispatch d = decomp.get(t);
             assertEquals(NOPE, d.intArg(0));
             assertEquals(kvLora, d.intArg(1));
             assertEquals(N_HEAD, d.intArg(MoeKernels.ARG_ID_N_SEL));
@@ -813,14 +817,14 @@ public class GpuMlaMixerTest {
             assertEquals(t * N_HEAD * NOPE, d.intArg(MoeKernels.ARG_ID_OUT_OFF));
             assertSame(kva.buffer(), d.bufferArg(MoeKernels.ARG_ID_INPUT));
             assertSame(kvb.buffer(), d.bufferArg(MoeKernels.ARG_ID_OUTPUT));
-            Dispatch e = expand.get(t);
+            FakeDispatch e = expand.get(t);
             assertEquals(t * width, e.intArg(MoeKernels.ARG_ID_IN_OFF));
             assertEquals(t * N_HEAD * HEAD_V, e.intArg(MoeKernels.ARG_ID_OUT_OFF));
             assertSame(v.buffer(), e.bufferArg(MoeKernels.ARG_ID_OUTPUT));
             assertTrue(ds.indexOf(d) < ds.indexOf(e));
         }
 
-        List<Dispatch> copies = named(ds, GpuOps.COPY2D);
+        List<FakeDispatch> copies = named(ds, GpuOps.COPY2D);
         assertEquals(1 + N_HEAD, copies.size());
         assertEquals(n * N_HEAD, copies.get(0).intArg(0));
         assertEquals(NOPE, copies.get(0).intArg(1));
@@ -830,7 +834,7 @@ public class GpuMlaMixerTest {
         }
         assertEquals(2, named(ds, RopeKernels.kvStore(KvDType.F16)).size());
         GpuKvLayer kv = memory.kv(0);
-        List<Dispatch> stores = named(ds, RopeKernels.kvStore(KvDType.F16));
+        List<FakeDispatch> stores = named(ds, RopeKernels.kvStore(KvDType.F16));
         assertSame(kv.k(), stores.get(0).bufferArg(7));
         assertSame(kv.v(), stores.get(1).bufferArg(7));
         assertTrue(named(ds, AttnKernels.flashAttn(KvDType.F16)).size()

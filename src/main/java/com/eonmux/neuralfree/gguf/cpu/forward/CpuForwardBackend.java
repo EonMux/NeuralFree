@@ -73,8 +73,6 @@ public final class CpuForwardBackend implements ForwardBackend {
     private static final String TEMP_OUTPUTS = "CpuForwardBackend.outputs";
     private static final String TEMP_ZH = "CpuForwardBackend.zH";
     private static final String TEMP_ZL = "CpuForwardBackend.zL";
-    private static final String TEMP_REPEAT_INPUT = "CpuForwardBackend.repeatInput";
-    private static final String TEMP_REPEAT_STATE = "CpuForwardBackend.repeatState";
 
     private final ModelSpec spec;
     private final CpuScratch scratch;
@@ -90,11 +88,8 @@ public final class CpuForwardBackend implements ForwardBackend {
     private final float[] zH;
     private final float[] zL;
     private final float[] zLInit;
-    /** Repeat schedule: the stream entering the repeated block, and the state carried between its passes. */
-    private final float[] repeatInput;
-    private final float[] repeatState;
-    private final int repeatWidth;
-    private final boolean repeatCombine;
+    /** The repeat schedule's carried state between the passes of its looped block (inert without a loop). */
+    private final CpuRepeatLoop repeat;
     /** Whether a paged ubatch may mix rows of several adapter slots ({@link AdapterRows#mixable}). */
     private final boolean mixesAdapterSlots;
     /** The id an embedding row records in the token record ({@link EmbeddingRowSupport#recordToken}). */
@@ -152,19 +147,7 @@ public final class CpuForwardBackend implements ForwardBackend {
             this.zH = null;
             this.zL = null;
         }
-        LayerSchedule schedule = spec.schedule();
-        this.repeatCombine = schedule.kind() == LayerSchedule.Kind.REPEAT
-                && schedule.loopCombine() == LayerSchedule.LoopCombine.JUSTNORM;
-        if (repeatCombine) {
-            this.repeatWidth = spec.layer(0).residual().streamWidth();
-            int len = Math.multiplyExact(scratch.ubatch(), repeatWidth);
-            this.repeatInput = scratch.temp(TEMP_REPEAT_INPUT, len);
-            this.repeatState = scratch.temp(TEMP_REPEAT_STATE, len);
-        } else {
-            this.repeatWidth = 0;
-            this.repeatInput = null;
-            this.repeatState = null;
-        }
+        this.repeat = new CpuRepeatLoop(spec, scratch);
         this.embedding = new CpuEmbeddingStage(ctx);
         this.layers = bindTrunk(registry, ctx, spec);
         this.mixesAdapterSlots = AdapterRows.mixable(spec) && (memory == null || !memory.plan().hasRecurrentState());
@@ -209,7 +192,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         checkOpen();
         CpuMemory mem = requireMemory("prefill");
         prepareCausal(mem, tokens, pos0, true);
-        TapRows taps = TapRows.open(tap, tokens.length, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, tokens.length, spec.nLayer());
         float[] logits = null;
         for (int off = 0; off < tokens.length; ) {
             int n = mem.plan().stepTokens(tokens.length - off, ubatch);
@@ -243,7 +226,7 @@ public final class CpuForwardBackend implements ForwardBackend {
             throw new UnsupportedOperationException(refusal);
         }
         prepareRows(mem, rows, pos0);
-        TapRows taps = TapRows.open(tap, rows.length, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, rows.length, spec.nLayer());
         float[] logits = null;
         for (int off = 0; off < rows.length; ) {
             int n = mem.plan().stepTokens(rows.length - off, ubatch);
@@ -263,7 +246,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         CpuMemory mem = requireMemory("decode");
         singleToken[0] = token;
         prepareCausal(mem, singleToken, pos, true);
-        TapRows taps = TapRows.open(tap, 1, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, 1, spec.nLayer());
         step(singleToken, null, 0, 1, pos, mem, taps);
         float[] logits = lastRowLogits(1);
         deliver(taps);
@@ -277,7 +260,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         CpuMemory mem = requireMemory("decode");
         singleToken[0] = token;
         prepareCausal(mem, singleToken, pos, true);
-        TapRows taps = TapRows.open(tap, 1, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, 1, spec.nLayer());
         step(singleToken, null, 0, 1, pos, mem, taps);
         rowIdx[0] = 0;
         head.hidden(scratch.slot(CpuScratch.X), finalWidth, rowIdx, 1);
@@ -306,7 +289,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         CpuMemory mem = requireMemory("forwardRowsGreedy");
         prepareCausal(mem, tokens, pos0, true);
         int[] rows = rowsOrAll(outputRows, tokens.length);
-        TapRows taps = TapRows.open(tap, tokens.length, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, tokens.length, spec.nLayer());
         int[] ids = new int[rows.length];
         for (int off = 0; off < tokens.length; ) {
             int n = mem.plan().stepTokens(tokens.length - off, ubatch);
@@ -324,7 +307,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         CpuMemory mem = requireMemory("forwardRows");
         prepareCausal(mem, tokens, pos0, true);
         int[] rows = rowsOrAll(outputRows, tokens.length);
-        TapRows taps = TapRows.open(tap, tokens.length, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, tokens.length, spec.nLayer());
         float[][] out = new float[rows.length][];
         for (int off = 0; off < tokens.length; ) {
             int n = mem.plan().stepTokens(tokens.length - off, ubatch);
@@ -423,7 +406,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         float[][] embd = batch.embeddings();
         checkBatchRows(batch, embd);
         int[] outputs = batch.outputRows();
-        TapRows taps = TapRows.open(tap, n, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, n, spec.nLayer());
         float[] x = scratch.slot(CpuScratch.X);
         embedding.embedBatched(batch.tokens(), batch.positions(), embd, x);
         runSlots(0, 0, n, x, taps);
@@ -592,7 +575,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         int[][] sections = batch.ropePositions();
         long[] tree = batch.treeMask();
         int[] outputs = batch.outputRows();
-        TapRows taps = TapRows.open(tap, n, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, n, spec.nLayer());
         float[] x = scratch.slot(CpuScratch.X);
         try {
             embedding.embedBatched(tokens, pos, sections, x);
@@ -636,7 +619,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         float[][] embd = batch.embeddings();
         checkBatchRows(batch, embd);
         int n = batch.nTokens();
-        TapRows taps = TapRows.open(tap, n, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, n, spec.nLayer());
         float[][] out = new float[batch.outputRows().length][];
         com.eonmux.neuralfree.gguf.memory.paged.PagedSequences paged = mem.pagedSequences();
         BatchSplitter.Mode mode = splitMode(mem.plan().hasRecurrentState(), batch.outputRows().length == n);
@@ -720,7 +703,7 @@ public final class CpuForwardBackend implements ForwardBackend {
      * the step for the mixers.
      */
     private float[][] pagedUbatch(ForwardBatch batch, float[][] embd, UBatch u, HeapModelMemory mem,
-                                  com.eonmux.neuralfree.gguf.memory.paged.PagedSequences paged, TapRows taps,
+                                  com.eonmux.neuralfree.gguf.memory.paged.PagedSequences paged, CpuTapRows taps,
                                   boolean logits) {
         int[] tokens = u.tokens();
         PagedStep step = mem.openPagedStep(u.layout(), u.positions());
@@ -834,16 +817,16 @@ public final class CpuForwardBackend implements ForwardBackend {
      * {@link com.eonmux.neuralfree.gguf.memory.cpu.CpuMemory#currentPagedStep}. {@code callRows} maps each ubatch row
      * to its call row, where the hidden tap stores it.
      */
-    private void runSlotsBatched(com.eonmux.neuralfree.gguf.memory.StepLayout layout, float[] x, TapRows taps,
+    private void runSlotsBatched(com.eonmux.neuralfree.gguf.memory.StepLayout layout, float[] x, CpuTapRows taps,
                                  int[] callRows) {
         for (int il = 0; il < layers.size(); il++) {
             CpuLayerExecutor e = layers.get(il);
-            repeatBeforeSlot(spec.schedule(), il, layout.nTokens(), x);
+            repeat.beforeSlot(spec.schedule(), il, layout.nTokens(), x);
             if (taps != null && taps.wants(il)) {
                 taps.capture(il, x, callRows, layout.nTokens(), e.streamWidth());
             }
             e.forward(layout, x);
-            repeatAfterSlot(spec.schedule(), il, layout.nTokens(), x);
+            repeat.afterSlot(spec.schedule(), il, layout.nTokens(), x);
         }
         if (taps != null && taps.wants(layers.size())) {
             taps.capture(layers.size(), x, callRows, layout.nTokens(), finalWidth);
@@ -865,7 +848,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         }
         prepareSingleStep(tokens, null, true, "forwardAll");
         int[] rows = rowsOrAll(outputRows, tokens.length);
-        TapRows taps = TapRows.open(tap, tokens.length, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, tokens.length, spec.nLayer());
         step(tokens, null, 0, tokens.length, 0, null, taps);
         float[][] out = new float[rows.length][];
         emitRows(rows, 0, tokens.length, out, true);
@@ -882,7 +865,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         checkOpen();
         if (memory == null) {
             prepareSingleStep(tokens, tokenTypes, false, "hiddenRows");
-            TapRows taps = TapRows.open(tap, tokens.length, spec.nLayer());
+            CpuTapRows taps = CpuTapRows.open(tap, tokens.length, spec.nLayer());
             step(tokens, tokenTypes, 0, tokens.length, 0, null, taps);
             float[][] out = new float[tokens.length][];
             emitRows(rowsOrAll(null, tokens.length), 0, tokens.length, out, false);
@@ -897,7 +880,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         checkInputs(tokens, tokenTypes, 0, false);
         checkContext(memory, 0, tokens.length);
         int[] rows = rowsOrAll(null, tokens.length);
-        TapRows taps = TapRows.open(tap, tokens.length, spec.nLayer());
+        CpuTapRows taps = CpuTapRows.open(tap, tokens.length, spec.nLayer());
         float[][] out = new float[tokens.length][];
         try {
             for (int off = 0; off < tokens.length; ) {
@@ -1156,7 +1139,7 @@ public final class CpuForwardBackend implements ForwardBackend {
      * One step of {@code n} tokens: the embedding, the memory's step rows when {@code mem} is given, every slot,
      * sequence bookkeeping.
      */
-    private void step(int[] tokens, int[] tokenTypes, int off, int n, int pos0, CpuMemory mem, TapRows taps) {
+    private void step(int[] tokens, int[] tokenTypes, int off, int n, int pos0, CpuMemory mem, CpuTapRows taps) {
         float[] x = scratch.slot(CpuScratch.X);
         embedding.embed(tokens, tokenTypes, off, n, pos0, x);
         if (mem != null) {
@@ -1172,7 +1155,7 @@ public final class CpuForwardBackend implements ForwardBackend {
      * One step of {@code n} embedding rows: the row embedding, the memory's step rows, every slot, sequence
      * bookkeeping (the rows record {@link #embeddingRowToken}).
      */
-    private void stepRows(float[][] rows, int off, int n, int pos0, CpuMemory mem, TapRows taps) {
+    private void stepRows(float[][] rows, int off, int n, int pos0, CpuMemory mem, CpuTapRows taps) {
         float[] x = scratch.slot(CpuScratch.X);
         embedding.embedRows(rows, off, n, pos0, x);
         mem.beginStep(pos0, n);
@@ -1180,7 +1163,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         mem.sequence().appendEmbeddings(n, embeddingRowToken);
     }
 
-    private void runSlots(int pos0, int off, int n, float[] x, TapRows taps) {
+    private void runSlots(int pos0, int off, int n, float[] x, CpuTapRows taps) {
         LayerSchedule schedule = spec.schedule();
         boolean hrm = schedule.kind() == LayerSchedule.Kind.HRM;
         int hrmLen = hrm ? n * zLInit.length : 0;
@@ -1195,12 +1178,12 @@ public final class CpuForwardBackend implements ForwardBackend {
             if (hrm && schedule.passStart(il)) {
                 CpuOps.add(zH, 0, zL, 0, x, 0, hrmLen);
             }
-            repeatBeforeSlot(schedule, il, n, x);
+            repeat.beforeSlot(schedule, il, n, x);
             if (taps != null && taps.wants(il)) {
                 taps.capture(il, x, off, n, e.streamWidth());
             }
             e.forward(pos0, n, x);
-            repeatAfterSlot(schedule, il, n, x);
+            repeat.afterSlot(schedule, il, n, x);
             if (hrm && schedule.passEnd(il)) {
                 CpuOps.norm(NormKind.RMS, spec.hparams().normRmsEps(), x, 0, x, 0, n, zLInit.length, null, null);
                 float[] dst = schedule.stream(il) == LayerSchedule.Stream.HIGH ? zH : zL;
@@ -1212,50 +1195,6 @@ public final class CpuForwardBackend implements ForwardBackend {
         }
         if (taps != null && taps.wants(layers.size())) {
             taps.capture(layers.size(), x, off, n, finalWidth);
-        }
-    }
-
-    /**
-     * Repeat schedules with {@link LayerSchedule.LoopCombine#JUSTNORM} before slot {@code il}: the stream entering
-     * the repeated block is kept, the state is initialized from it at the first pass, and each pass starts as
-     * {@code justNorm(state + input)} (Dory's {@code combined = justnorm(state + input_h)}).
-     */
-    private void repeatBeforeSlot(LayerSchedule schedule, int il, int n, float[] x) {
-        if (!repeatCombine) {
-            return;
-        }
-        int len = n * repeatWidth;
-        if (il == 0 && schedule.nInputLayers() == 0) {
-            System.arraycopy(x, 0, repeatInput, 0, len);
-        }
-        if (il == schedule.recurrentStart()) {
-            System.arraycopy(repeatInput, 0, repeatState, 0, len);
-        }
-        if (schedule.loopStart(il)) {
-            CpuOps.add(repeatState, 0, repeatInput, 0, x, 0, len);
-            CpuOps.norm(NormKind.L2_GDN, schedule.loopEps(), x, 0, x, 0, n, repeatWidth, null, null);
-        }
-    }
-
-    /**
-     * Repeat schedules with {@link LayerSchedule.LoopCombine#JUSTNORM} after slot {@code il}: a pass ends by
-     * writing {@code state = justNorm(x)}; the input stream is captured after the last input layer, and the first
-     * output layer starts from the carried state.
-     */
-    private void repeatAfterSlot(LayerSchedule schedule, int il, int n, float[] x) {
-        if (!repeatCombine) {
-            return;
-        }
-        int len = n * repeatWidth;
-        if (schedule.loopEnd(il)) {
-            CpuOps.norm(NormKind.L2_GDN, schedule.loopEps(), x, 0, x, 0, n, repeatWidth, null, null);
-            System.arraycopy(x, 0, repeatState, 0, len);
-        }
-        if (il == schedule.nInputLayers() - 1) {
-            System.arraycopy(x, 0, repeatInput, 0, len);
-        }
-        if (il + 1 == schedule.recurrentEnd() && schedule.nOutputLayers() > 0) {
-            System.arraycopy(repeatState, 0, x, 0, len);
         }
     }
 
@@ -1372,7 +1311,7 @@ public final class CpuForwardBackend implements ForwardBackend {
         }
     }
 
-    private void deliver(TapRows taps) {
+    private void deliver(CpuTapRows taps) {
         if (taps != null) {
             taps.deliver();
         }
@@ -1492,76 +1431,5 @@ public final class CpuForwardBackend implements ForwardBackend {
     public String toString() {
         return "CpuForwardBackend{" + spec.arch().ggufName() + ", slots=" + spec.nLayer() + ", ubatch=" + ubatch
                 + (memory != null ? ", memory" : "") + '}';
-    }
-
-    // ------------------------------------------------------------------ hidden tap
-
-    /**
-     * The rows of the wanted tap points over one call, gathered step by step and delivered once per tap point after
-     * the call ({@link HiddenTap}: {@code nRows} is every token of the call, in call order; a batched step stores
-     * each of its rows at the call row the ubatch's {@code batchRows} names).
-     */
-    private static final class TapRows {
-        private final HiddenTap tap;
-        private final int total;
-        private final float[][] rows;
-        private final int[] widths;
-
-        private TapRows(HiddenTap tap, int total, int points) {
-            this.tap = tap;
-            this.total = total;
-            this.rows = new float[points][];
-            this.widths = new int[points];
-        }
-
-        /** Collector of one call over tap points {@code [0, nLayer]}; null when the tap wants none of them. */
-        static TapRows open(HiddenTap tap, int total, int nLayer) {
-            for (int p = 0; p <= nLayer; p++) {
-                if (tap.wants(p)) {
-                    return new TapRows(tap, total, nLayer + 1);
-                }
-            }
-            return null;
-        }
-
-        boolean wants(int point) {
-            return tap.wants(point);
-        }
-
-        /** Copies the step's {@code n} rows, which are rows {@code [off, off + n)} of the call. */
-        void capture(int point, float[] x, int off, int n, int width) {
-            ensure(point, width);
-            System.arraycopy(x, 0, rows[point], off * width, n * width);
-        }
-
-        /**
-         * Copies the step's {@code n} rows (row {@code r} of {@code x} is row {@code callRows[r]} of the call, the
-         * ubatch's batch row mapping).
-         */
-        void capture(int point, float[] x, int[] callRows, int n, int width) {
-            ensure(point, width);
-            for (int r = 0; r < n; r++) {
-                System.arraycopy(x, r * width, rows[point], callRows[r] * width, width);
-            }
-        }
-
-        /** The call-wide row buffer of {@code point}: every step of the call writes its own rows into it. */
-        private void ensure(int point, int width) {
-            if (rows[point] == null) {
-                rows[point] = new float[Math.multiplyExact(total, width)];
-                widths[point] = width;
-            } else if (widths[point] != width) {
-                throw new IllegalStateException("tap point " + point + " changed width from " + widths[point]
-                        + " to " + width + " within a call");
-            }
-        }
-
-        void deliver() {
-            for (int p = 0; p < rows.length; p++) {
-                if (rows[p] != null) {
-                    tap.onHidden(p, rows[p], total, widths[p]);
-                }
-            }
-        }
     }
 }

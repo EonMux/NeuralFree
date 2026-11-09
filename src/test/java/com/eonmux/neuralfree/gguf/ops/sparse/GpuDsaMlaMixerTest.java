@@ -57,7 +57,7 @@ import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -267,31 +267,31 @@ public class GpuDsaMlaMixerTest {
         return out;
     }
 
-    private List<Dispatch> decode(GpuMixer m, int pos) {
+    private List<FakeDispatch> decode(GpuMixer m, int pos) {
         memory.steps.upload(pos, 1);
         backend.clearLog();
         m.decode(pos, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
         return backend.dispatches();
     }
 
-    private List<Dispatch> prefill(GpuMixer m, int pos0, int n) {
+    private List<FakeDispatch> prefill(GpuMixer m, int pos0, int n) {
         memory.steps.upload(pos0, n);
         backend.clearLog();
         m.prefill(pos0, n, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
         return backend.dispatches();
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static Dispatch only(List<Dispatch> ds, String kernel) {
-        Dispatch found = null;
-        for (Dispatch d : ds) {
+    private static FakeDispatch only(List<FakeDispatch> ds, String kernel) {
+        FakeDispatch found = null;
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 assertEquals("one " + kernel, null, found);
                 found = d;
@@ -303,9 +303,9 @@ public class GpuDsaMlaMixerTest {
         return found;
     }
 
-    private static List<Dispatch> all(List<Dispatch> ds, String kernel) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+    private static List<FakeDispatch> all(List<FakeDispatch> ds, String kernel) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 out.add(d);
             }
@@ -329,7 +329,7 @@ public class GpuDsaMlaMixerTest {
         mlaTensors(0, true);
         caches(0, true, true);
         GpuMixer m = bindAll(Arch.DEEPSEEK32, deepseek32Layer(0)).get(0);
-        List<Dispatch> ds = decode(m, 5);
+        List<FakeDispatch> ds = decode(m, 5);
 
         String hadamard = HadamardSpec.KERNEL;
         assertEquals(Arrays.asList(
@@ -343,7 +343,7 @@ public class GpuDsaMlaMixerTest {
                 MATVEC), names(ds));
 
         FakeIndexer idx = memory.indexer.get(0);
-        Dispatch score = only(ds, SparseKernels.indexerScore(KvDType.F16));
+        FakeDispatch score = only(ds, SparseKernels.indexerScore(KvDType.F16));
         assertEquals(1, score.intArg(SparseKernels.ARG_SCORE_N_TOKENS));
         assertEquals(6, score.intArg(SparseKernels.ARG_SCORE_N_KV));
         assertEquals(IDX_HEADS, score.intArg(2));
@@ -353,11 +353,11 @@ public class GpuDsaMlaMixerTest {
         assertSame(memory.steps.qPos, score.bufferArg(SparseKernels.ARG_SCORE_Q_POS));
         assertSame(memory.steps.kvPos, score.bufferArg(SparseKernels.ARG_SCORE_KV_POS));
 
-        Dispatch topK = only(ds, SparseKernels.TOPK_ROWS);
+        FakeDispatch topK = only(ds, SparseKernels.TOPK_ROWS);
         assertArrayEquals(new int[]{1, 6, TOP_K}, new int[]{topK.intArg(0), topK.intArg(1), topK.intArg(2)});
         GpuBuffer selection = topK.bufferArg(4);
 
-        Dispatch sparse = only(ds, SparseKernels.sparseDecode(KvDType.F32));
+        FakeDispatch sparse = only(ds, SparseKernels.sparseDecode(KvDType.F32));
         assertEquals(N_HEAD, sparse.intArg(0));
         assertEquals(KV_LORA, sparse.intArg(1));
         assertEquals(ROPE, sparse.intArg(2));
@@ -370,13 +370,13 @@ public class GpuDsaMlaMixerTest {
         assertSame(placeholders.readOnlyFloats(), sparse.bufferArg(11));
         assertArrayEquals(SparseKernels.sparseDecodeGlobal(N_HEAD, sparseLocal()), sparse.global());
 
-        Dispatch store = only(ds, RopeKernels.kvStore(KvDType.F32));
+        FakeDispatch store = only(ds, RopeKernels.kvStore(KvDType.F32));
         assertEquals(1, store.intArg(RopeKernels.ARG_N_TOKENS));
         assertEquals(D_K, store.intArg(1));
         assertSame(memory.steps.cellIdx, store.arg(6));
         assertSame(memory.kv.get(0).k, store.arg(7));
 
-        List<Dispatch> id = all(ds, ID_MATVEC);
+        List<FakeDispatch> id = all(ds, ID_MATVEC);
         assertEquals(KV_LORA, id.get(0).intArg(0));
         assertEquals(NOPE, id.get(0).intArg(1));
         assertEquals(N_HEAD, id.get(0).intArg(MoeKernels.ARG_ID_N_SEL));
@@ -385,7 +385,7 @@ public class GpuDsaMlaMixerTest {
         assertEquals(KV_LORA, id.get(1).intArg(1));
         assertSame(weight(0, DsaLayout.WV_B).shard(0), id.get(1).bufferArg(ID_ARG_WEIGHT));
 
-        Dispatch wo = ds.get(ds.size() - 1);
+        FakeDispatch wo = ds.get(ds.size() - 1);
         assertSame(weight(0, DsaLayout.WO).shard(0), wo.bufferArg(2));
         assertSame(scratch.slot(ScratchSlots.BRANCH).buffer(), wo.bufferArg(4));
     }
@@ -408,15 +408,15 @@ public class GpuDsaMlaMixerTest {
         mlaTensors(0, true);
         caches(0, true, true, type);
         GpuMixer m = bindAll(Arch.DEEPSEEK32, deepseek32Layer(0)).get(0);
-        List<Dispatch> ds = decode(m, 5);
+        List<FakeDispatch> ds = decode(m, 5);
 
         FakeIndexer idx = memory.indexer.get(0);
-        Dispatch store = all(ds, RopeKernels.kvStore(type)).get(0);
+        FakeDispatch store = all(ds, RopeKernels.kvStore(type)).get(0);
         assertEquals(1, store.intArg(RopeKernels.ARG_N_TOKENS));
         assertEquals(IDX_DIM, store.intArg(1));
         assertEquals(IDX_DIM, store.intArg(4));
         assertSame(idx.keys, store.bufferArg(7));
-        Dispatch score = only(ds, SparseKernels.indexerScore(type));
+        FakeDispatch score = only(ds, SparseKernels.indexerScore(type));
         assertEquals(IDX_DIM, score.intArg(3));
         assertSame(idx.keys, score.bufferArg(SparseKernels.ARG_SCORE_KEYS));
         assertEquals(2, all(ds, HadamardSpec.KERNEL).size());
@@ -434,12 +434,12 @@ public class GpuDsaMlaMixerTest {
         caches(0, true, true);
         GpuMixer m = bindAll(Arch.DEEPSEEK32, deepseek32Layer(0)).get(0);
 
-        List<Dispatch> first = decode(m, 0);
+        List<FakeDispatch> first = decode(m, 0);
         assertEquals(1, only(first, SparseKernels.TOPK_ROWS).intArg(SparseKernels.ARG_TOPK_N_COLS));
         assertEquals(1, only(first, SparseKernels.TOPK_ROWS).intArg(SparseKernels.ARG_TOPK_K));
         assertEquals(1, only(first, SparseKernels.sparseDecode(KvDType.F32)).intArg(SparseKernels.ARG_DECODE_N_SEL));
 
-        List<Dispatch> late = decode(m, ROWS + 3);
+        List<FakeDispatch> late = decode(m, ROWS + 3);
         assertEquals(ROWS, only(late, SparseKernels.indexerScore(KvDType.F16)).intArg(SparseKernels.ARG_SCORE_N_KV));
         assertEquals(TOP_K, only(late, SparseKernels.sparseDecode(KvDType.F32)).intArg(SparseKernels.ARG_DECODE_N_SEL));
     }
@@ -451,16 +451,16 @@ public class GpuDsaMlaMixerTest {
         caches(0, true, true);
         GpuMixer m = bindAll(Arch.DEEPSEEK32, deepseek32Layer(0)).get(0);
         int n = UBATCH;
-        List<Dispatch> ds = prefill(m, 0, n);
+        List<FakeDispatch> ds = prefill(m, 0, n);
 
-        Dispatch score = only(ds, SparseKernels.indexerScore(KvDType.F16));
+        FakeDispatch score = only(ds, SparseKernels.indexerScore(KvDType.F16));
         assertEquals(n, score.intArg(SparseKernels.ARG_SCORE_N_TOKENS));
         assertEquals(n, score.intArg(SparseKernels.ARG_SCORE_N_KV));
-        Dispatch topK = only(ds, SparseKernels.TOPK_ROWS);
+        FakeDispatch topK = only(ds, SparseKernels.TOPK_ROWS);
         assertEquals(n, topK.intArg(SparseKernels.ARG_TOPK_N_ROWS));
         assertEquals(TOP_K, topK.intArg(SparseKernels.ARG_TOPK_K));
 
-        Dispatch sparse = only(ds, SparseKernels.sparsePrefill(KvDType.F32));
+        FakeDispatch sparse = only(ds, SparseKernels.sparsePrefill(KvDType.F32));
         assertEquals(n, sparse.intArg(SparseKernels.ARG_PREFILL_N_TOKENS));
         assertEquals(TOP_K, sparse.intArg(SparseKernels.ARG_PREFILL_N_SEL));
         assertEquals(N_HEAD * D_K, sparse.intArg(8));
@@ -468,10 +468,10 @@ public class GpuDsaMlaMixerTest {
         assertArrayEquals(SparseKernels.sparsePrefillGlobal(n, N_HEAD, sparseLocal()), sparse.global());
         assertFalse(names(ds).contains(SparseKernels.sparseDecode(KvDType.F32)));
 
-        for (Dispatch id : all(ds, ID_MATVEC)) {
+        for (FakeDispatch id : all(ds, ID_MATVEC)) {
             assertEquals(n * N_HEAD, id.intArg(MoeKernels.ARG_ID_N_SEL));
         }
-        for (Dispatch rope : all(ds, RopeKernels.ROPE_EXT)) {
+        for (FakeDispatch rope : all(ds, RopeKernels.ROPE_EXT)) {
             assertEquals(n, rope.intArg(RopeKernels.ARG_N_TOKENS));
             assertEquals(n, rope.intArg(RopeKernels.ARG_POS_STRIDE));
         }
@@ -498,19 +498,19 @@ public class GpuDsaMlaMixerTest {
         caches(0, true, true);
         GpuMixer m = bindAll(Arch.DEEPSEEK32, deepseek32Layer(0)).get(0);
 
-        List<Dispatch> ids = all(prefill(m, 0, 5), ID_MATVEC);
+        List<FakeDispatch> ids = all(prefill(m, 0, 5), ID_MATVEC);
 
         int tokensPerCall = 5 / N_HEAD;
         int[] sel = {tokensPerCall * N_HEAD, tokensPerCall * N_HEAD, N_HEAD};
         assertEquals(2 * sel.length, ids.size());
         for (int c = 0; c < sel.length; c++) {
             int pair0 = c * tokensPerCall * N_HEAD;
-            Dispatch absorb = ids.get(c);
+            FakeDispatch absorb = ids.get(c);
             assertEquals(sel[c], absorb.intArg(MoeKernels.ARG_ID_N_SEL));
             assertEquals(pair0 * HEAD_K, absorb.intArg(MoeKernels.ARG_ID_IN_OFF));
             assertEquals(pair0 * KV_LORA, absorb.intArg(MoeKernels.ARG_ID_OUT_OFF));
             assertEquals(sel[c], absorb.global()[1]);
-            Dispatch expand = ids.get(sel.length + c);
+            FakeDispatch expand = ids.get(sel.length + c);
             assertEquals(sel[c], expand.intArg(MoeKernels.ARG_ID_N_SEL));
             assertEquals(pair0 * KV_LORA, expand.intArg(MoeKernels.ARG_ID_IN_OFF));
             assertEquals(pair0 * HEAD_V, expand.intArg(MoeKernels.ARG_ID_OUT_OFF));
@@ -529,14 +529,14 @@ public class GpuDsaMlaMixerTest {
         List<GpuMixer> ms = bindAll(Arch.GLM_DSA, layer(0, 0, RopeType.NORM, false, true),
                 layer(1, 0, RopeType.NORM, false, true));
 
-        List<Dispatch> full = decode(ms.get(0), 9);
+        List<FakeDispatch> full = decode(ms.get(0), 9);
         GpuBuffer selection = only(full, SparseKernels.TOPK_ROWS).bufferArg(4);
-        List<Dispatch> shared = decode(ms.get(1), 9);
+        List<FakeDispatch> shared = decode(ms.get(1), 9);
 
         assertFalse(names(shared).stream().anyMatch(n -> n.startsWith(SparseKernels.DSA_INDEXER_SCORE_PREFIX)));
         assertFalse(names(shared).contains(SparseKernels.TOPK_ROWS));
         assertFalse(names(shared).contains(RopeKernels.kvStore(KvDType.F16)));
-        Dispatch sparse = only(shared, SparseKernels.sparseDecode(KvDType.F32));
+        FakeDispatch sparse = only(shared, SparseKernels.sparseDecode(KvDType.F32));
         assertSame(selection, sparse.bufferArg(10));
         assertEquals(TOP_K, sparse.intArg(SparseKernels.ARG_DECODE_N_SEL));
         assertSame(memory.kv.get(1).k, sparse.bufferArg(9));
@@ -583,10 +583,10 @@ public class GpuDsaMlaMixerTest {
         caches(0, true, true);
         GpuMixer m = bindAll(Arch.GLM_DSA, layer(0, 0, RopeType.NORM, false, true)).get(0);
 
-        List<Dispatch> ds = decode(m, 3);
+        List<FakeDispatch> ds = decode(m, 3);
 
-        Dispatch keyNorm = null;
-        for (Dispatch d : all(ds, NormKernels.ROW_NORM)) {
+        FakeDispatch keyNorm = null;
+        for (FakeDispatch d : all(ds, NormKernels.ROW_NORM)) {
             if (d.intArg(NormKernels.ARG_ROW_NORM_MODE) == NormKind.LAYER.rowNormMode()) {
                 assertEquals("one layer norm", null, keyNorm);
                 keyNorm = d;
@@ -609,20 +609,20 @@ public class GpuDsaMlaMixerTest {
         GpuWeight gate = put(0, DsaLayout.GATE, N_EMBD, N_HEAD);
         caches(0, true, true);
         GpuMixer m = bindAll(Arch.DOTS3NOTE, dots3noteLayer(0)).get(0);
-        List<Dispatch> ds = decode(m, 3);
+        List<FakeDispatch> ds = decode(m, 3);
 
         List<String> tail = names(ds).subList(ds.size() - 9, ds.size());
         assertEquals(Arrays.asList(ID_MATVEC, MATVEC, GpuOps.COPY2D, GpuOps.COPY2D, GpuOps.COPY2D, GpuOps.COPY2D,
                 GpuOps.COPY2D, ActKernels.GLU, MATVEC), tail);
         assertSame(gate.shard(0), ds.get(ds.size() - 8).bufferArg(2));
-        Dispatch glu = only(ds, ActKernels.GLU);
+        FakeDispatch glu = only(ds, ActKernels.GLU);
         assertEquals(GluOp.SIGMUL.code(), glu.intArg(ActKernels.ARG_GLU_OP));
         assertEquals(N_HEAD, glu.intArg(ActKernels.ARG_GLU_N_ROWS));
         assertEquals(HEAD_V, glu.intArg(ActKernels.ARG_GLU_N_COLS));
 
-        List<Dispatch> norms = all(ds, NormKernels.ROW_NORM);
+        List<FakeDispatch> norms = all(ds, NormKernels.ROW_NORM);
         assertEquals(4, norms.size());
-        Dispatch kPe = norms.get(2);
+        FakeDispatch kPe = norms.get(2);
         assertEquals(ROPE, kPe.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
         assertEquals(D_K, kPe.intArg(NormKernels.ARG_ROW_NORM_ROW_STRIDE));
         assertEquals(KV_LORA, kPe.intArg(NormKernels.ARG_ROW_NORM_X_OFF));
@@ -639,16 +639,16 @@ public class GpuDsaMlaMixerTest {
         put(0, DsaLayout.GATE, N_EMBD, (long) N_HEAD * HEAD_V);
         caches(0, true, false);
         GpuMixer m = bindAll(Arch.HY_V4, layer(0, 0, RopeType.NORM, true, false)).get(0);
-        List<Dispatch> ds = decode(m, 2);
+        List<FakeDispatch> ds = decode(m, 2);
 
         assertFalse(names(ds).contains(HadamardSpec.KERNEL));
-        Dispatch sparse = only(ds, SparseKernels.sparseDecode(KvDType.F32));
+        FakeDispatch sparse = only(ds, SparseKernels.sparseDecode(KvDType.F32));
         assertEquals(1, sparse.intArg(6));
         assertSame(sinks.shard(0), sparse.bufferArg(11));
-        Dispatch glu = only(ds, ActKernels.GLU);
+        FakeDispatch glu = only(ds, ActKernels.GLU);
         assertEquals(1, glu.intArg(ActKernels.ARG_GLU_N_ROWS));
         assertEquals(N_HEAD * HEAD_V, glu.intArg(ActKernels.ARG_GLU_N_COLS));
-        List<Dispatch> ropes = all(ds, RopeKernels.ROPE_EXT);
+        List<FakeDispatch> ropes = all(ds, RopeKernels.ROPE_EXT);
         assertEquals(IDX_DIM - IDX_ROPE, ropes.get(0).intArg(ROPE_ARG_N_OFFS));
     }
 

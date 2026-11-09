@@ -1,4 +1,4 @@
-/* matvec_q8_0.cl - Q8_0 matvec, fused gate/up, logits, batch matmul, Q8 activation quantization, integer-dot matvec over the Q8_1 activation row and embedding kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/quant_blocks.h, common/q8_dot.h */
+/* matvec_q8_0.cl - Q8_0 matvec, fused gate/up, logits, batch matmul, Q8 activation quantization, the Q8_1-activation family forms, the gelu twin and embedding kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/matvec_n.h, common/quant_blocks.h, common/q8_dot.h, common/matvec_family.h */
 /*
  * Q8_0 block (ggml block_q8_0): d (f16) at byte 0, qs[32] (int8) at byte 2; element e = qs[e] * d.
  *
@@ -6,9 +6,16 @@
  * (L a power of two <= LLM_DIMX and a multiple of Q8_0_THREADS_PER_BLOCK; CUDA: a multiple of 32);
  * the _Q8 matvec forms take the same geometry with one Q8_1 activation row (in_dim / 32 * 36 bytes)
  * in place of the float row, and their MatVec2 forms pair output rows (global = ceil(rows / 2) * L,
- * an odd row count repeats the last row's weights and drops the second store); Q8_0_MatVecN_Q8
- * keeps the same geometry and takes n_tokens consecutive Q8_1 rows in one launch (n_tokens in
- * [1, NF_MVQN_MAX]); the _2D form uses
+ * an odd row count repeats the last row's weights and drops the second store); the MatVecN forms
+ * keep the same geometry and take n_tokens consecutive rows in one launch (n_tokens in
+ * [1, NF_MVQN_MAX]): Q8_0_MatVecN n_tokens float rows; the Q8_1-activation forms
+ * (Q8_0_MatVec_Q8, Q8_0_MatVecN_Q8, the counted Q8_0_MatVecN{2..16}_Q8 / Q8_0_MatVec2N{2..16}_Q8,
+ * Q8_0_MatVec2_Q8, Q8_0_MatVecAdd_Q8, Q8_0_MatVecFusedGateUp_Q8 and Q8_0_MatVec2FusedGateUp_Q8)
+ * come from IQ_ALL_KERNELS_Q8 and the IQ_MVQN_NC_HIGH counts of common/matvec_family.h, whose
+ * counted forms fold the token count to the name's NC (a launch passes n_tokens = NC) and whose
+ * MatVec2N forms pair output rows on top of the counted singles (global = ceil(out_dim / 2) * L,
+ * the tail pair repeats the last row's weights and rewrites its outputs with the identical
+ * values), so the Q8_1 rows are read once per two weight rows; the _2D form uses
  * global = {out_dim * L, seq_len}, local = {L, 1}. Except LLM_Batch_Q8_0_MatMul(_2D),
  * which give each work-item whole blocks, the row kernels let Q8_0_THREADS_PER_BLOCK adjacent
  * work-items share one block, Q8_0_ELEMENTS_PER_THREAD consecutive elements each. The row and token
@@ -84,36 +91,38 @@ NF_INLINE float nf_mvq8_row_partial_whole(NF_GLOBAL const uchar* NF_RESTRICT wro
 
 /* Integer dot product of slice `sub` (0..Q8_0_THREADS_PER_BLOCK-1) of a Q8_0 weight block at wp
  * with Q8_1 block qblk of the activation row at xq, as ggml vec_dot_q8_0_q8_1: the code products
- * only, the Q8_1 block's sum term unused. */
+ * only, the Q8_1 block's sum term unused. The codes read as 32-bit words and the products packed
+ * through dp4a: the byte products stay below 2^14 and the total below 2^18, so the packed int sum
+ * is the exact scalar byte-product sum. The Q8_0 block layout leaves the weight codes two-byte
+ * aligned (nf_read_u32_u16), the Q8_1 codes start at offset 4 of a 36-byte block (nf_read_u32). */
 NF_INLINE int nf_mvq8_slice_idot(NF_GLOBAL const uchar* wp, NF_GLOBAL const uchar* xq,
                                  const int qblk, const int sub) {
     const int e = sub * Q8_0_ELEMENTS_PER_THREAD;
-    NF_GLOBAL const nf_i8* w = (NF_GLOBAL const nf_i8*)(wp + 2 + e);
-    NF_GLOBAL const nf_i8* q = (NF_GLOBAL const nf_i8*)(xq + qblk * Q8_1_BLOCK_BYTES + Q8_1_QS_OFFSET + e);
-    int isum = 0;
-#pragma unroll
-    for (int k = 0; k < Q8_0_ELEMENTS_PER_THREAD; k++) {
-        isum += (int)w[k] * (int)q[k];
-    }
+    NF_GLOBAL const uchar* w = wp + 2 + e;
+    NF_GLOBAL const uchar* q = xq + qblk * Q8_1_BLOCK_BYTES + Q8_1_QS_OFFSET + e;
+    int isum = NF_DP4A((int)nf_read_u32_u16(w), (int)nf_read_u32(q), 0);
+    isum = NF_DP4A((int)nf_read_u32_u16(w + 4), (int)nf_read_u32(q + 4), isum);
     return isum;
 }
 
-/* This work-item's share of dot(Q8_0 weight row at wrow, Q8_1 activation row at xq): block b
- * contributes the integer dot of the two code sets scaled by both block scales. */
-NF_INLINE float nf_mvq8q8_row_partial(NF_GLOBAL const uchar* NF_RESTRICT wrow,
-                                      NF_GLOBAL const uchar* NF_RESTRICT xq, const int nblk) {
-    const int lid = get_local_id(0);
-    const int gpi = get_local_size(0) / Q8_0_THREADS_PER_BLOCK;
-    const int sub = lid % Q8_0_THREADS_PER_BLOCK;
-    float ps = 0.0f;
-    for (int b = lid / Q8_0_THREADS_PER_BLOCK; b < nblk; b += gpi) {
-        NF_GLOBAL const uchar* wp = wrow + b * Q8_0_BLOCK_BYTES;
-        ps += (float)nf_mvq8_slice_idot(wp, xq, b, sub) * q8_0_scale(wp) * nf_q8_scale(xq, b);
-    }
-    return ps;
+/* The Q8_0 decoder the IQ_ALL_KERNELS_Q8 family kernels use: this work-item's share of the integer
+ * dot of the Q8_0 block at bp with Q8_1 block blk of the activation row at xq, scaled by both
+ * block scales (the Q8_1 sum term unused). */
+NF_INLINE float Q8_0_decode_q8(NF_GLOBAL const uchar* bp, NF_GLOBAL const uchar* xq,
+                               const int blk, const int ltid) {
+    return (float)nf_mvq8_slice_idot(bp, xq, blk, ltid) * q8_0_scale(bp) * nf_q8_scale(xq, blk);
 }
 
-/* nf_mvq8q8_row_partial for two Q8_0 rows sharing the Q8_1 row; adds into *gs (row g) and *us (row u). */
+/* Q8_0_decode_q8 for two Q8_0 blocks sharing the Q8_1 block; adds into *gs and *us. */
+NF_INLINE void Q8_0_decode_q8_dual(NF_GLOBAL const uchar* bp0, NF_GLOBAL const uchar* bp1,
+                                   NF_GLOBAL const uchar* xq, const int blk, const int ltid,
+                                   float* gs, float* us) {
+    *gs += Q8_0_decode_q8(bp0, xq, blk, ltid);
+    *us += Q8_0_decode_q8(bp1, xq, blk, ltid);
+}
+
+/* Q8_0_decode_q8 for two Q8_0 weight rows sharing the Q8_1 row, whole rows per call; adds the
+ * row sums into *gs and *us. The fused gate/up kernels accumulate through it. */
 NF_INLINE void nf_mvq8q8_row_partial_dual(NF_GLOBAL const uchar* NF_RESTRICT grow,
                                           NF_GLOBAL const uchar* NF_RESTRICT urow,
                                           NF_GLOBAL const uchar* NF_RESTRICT xq, const int nblk,
@@ -142,7 +151,7 @@ NF_INLINE float nf_mvq8_elem(NF_GLOBAL const uchar* NF_RESTRICT rbase, const int
 }
 
 /* output[row] = dot(weight[row, :], input). */
-NF_KERNEL void Q8_0_MatVec(
+NF_REQD_SG_ATTR NF_KERNEL void Q8_0_MatVec(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const uchar* NF_RESTRICT weight,
@@ -160,7 +169,7 @@ NF_KERNEL void Q8_0_MatVec(
 }
 
 /* addend_output[row] += dot(weight[row, :], input). */
-NF_KERNEL void Q8_0_MatVecAdd(
+NF_REQD_SG_ATTR NF_KERNEL void Q8_0_MatVecAdd(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const uchar* NF_RESTRICT weight,
@@ -178,7 +187,7 @@ NF_KERNEL void Q8_0_MatVecAdd(
 }
 
 /* output[row] = silu(dot(gate_weight[row, :], input)) * dot(up_weight[row, :], input). */
-NF_KERNEL void Q8_0_MatVecFusedGateUp(
+NF_REQD_SG_ATTR NF_KERNEL void Q8_0_MatVecFusedGateUp(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const uchar* NF_RESTRICT gate_weight,
@@ -204,7 +213,7 @@ NF_KERNEL void Q8_0_MatVecFusedGateUp(
 }
 
 /* output[row] = gelu_tanh(dot(gate_weight[row, :], input)) * dot(up_weight[row, :], input). */
-NF_KERNEL void Q8_0_MatVecFusedGateUpGelu(
+NF_REQD_SG_ATTR NF_KERNEL void Q8_0_MatVecFusedGateUpGelu(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const uchar* NF_RESTRICT gate_weight,
@@ -230,7 +239,7 @@ NF_KERNEL void Q8_0_MatVecFusedGateUpGelu(
 }
 
 /* logits[row] = dot(weight[row, :], hidden). */
-NF_KERNEL void LLM_Q8_0_ComputeLogits(
+NF_REQD_SG_ATTR NF_KERNEL void LLM_Q8_0_ComputeLogits(
     const int vocab_size,
     const int embed_dim,
     NF_GLOBAL const uchar* NF_RESTRICT weight,
@@ -312,156 +321,54 @@ NF_KERNEL void LLM_QuantizeQ8(
     }
 }
 
-/* output[row] = dot(weight[row, :], dequant(input)) with a Q8_1-quantized input vector (integer
- * block products scaled by both block scales; the Q8_1 sum term unused). */
-NF_KERNEL void Q8_0_MatVec_Q8(
-    const int out_dim,
-    const int in_dim,
-    NF_GLOBAL const uchar* NF_RESTRICT weight,
-    NF_GLOBAL const uchar* NF_RESTRICT input,
-    NF_GLOBAL float* NF_RESTRICT output)
-{
-    const int row = get_group_id(0);
-    if (row >= out_dim) return;
+/* The Q8_1-activation family forms of common/matvec_family.h: Q8_0_MatVec_Q8, Q8_0_MatVecN_Q8,
+ * the counted Q8_0_MatVecN{2..16}_Q8 and Q8_0_MatVec2N{2..16}_Q8, Q8_0_MatVec2_Q8,
+ * Q8_0_MatVecAdd_Q8, Q8_0_MatVecFusedGateUp_Q8 and Q8_0_MatVec2FusedGateUp_Q8, through
+ * Q8_0_decode_q8 / Q8_0_decode_q8_dual. IQ_MVQN_NC_HIGH adds the counts above the dispatched
+ * range, keeping Q8_0's measured 2..16 coverage. */
+IQ_ALL_KERNELS_Q8(Q8_0, Q8_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES, Q8_0_THREADS_PER_BLOCK)
+IQ_MVQN_NC_HIGH(Q8_0, Q8_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES, Q8_0_THREADS_PER_BLOCK)
 
-    const int nblk = in_dim / Q8_0_BLOCK_SIZE;
-    NF_LOCAL float scratch[LLM_DIMX];
-    const float acc = nf_wg_sum(scratch,
-        nf_mvq8q8_row_partial(weight + (nf_i64)row * nblk * Q8_0_BLOCK_BYTES, input, nblk));
-    if (get_local_id(0) == 0) output[row] = acc;
-}
-
-/* This work-item's shares of dot(Q8_0 weight row at wrow, Q8_1 activation rows at xq): block b
- * contributes every live token's integer dot scaled by both block scales, the weight block read
- * once for the whole token group. Token j's share is added into ps[j]; xq holds n_tokens rows,
- * row j's blocks at byte j * qrow. */
-NF_INLINE void nf_mvq8q8_row_partial_n(NF_GLOBAL const uchar* NF_RESTRICT wrow,
-                                       NF_GLOBAL const uchar* NF_RESTRICT xq, const int nblk,
-                                       const int n_tokens, const nf_i64 qrow, float* ps) {
-    const int lid = get_local_id(0);
-    const int gpi = get_local_size(0) / Q8_0_THREADS_PER_BLOCK;
-    const int sub = lid % Q8_0_THREADS_PER_BLOCK;
-#pragma unroll
-    for (int j = 0; j < NF_MVQN_MAX; j++) ps[j] = 0.0f;
-    for (int b = lid / Q8_0_THREADS_PER_BLOCK; b < nblk; b += gpi) {
-        NF_GLOBAL const uchar* wp = wrow + b * Q8_0_BLOCK_BYTES;
-        const float wscale = q8_0_scale(wp);
-#pragma unroll
-        for (int j = 0; j < NF_MVQN_MAX; j++) {
-            if (j < n_tokens) {
-                ps[j] += (float)nf_mvq8_slice_idot(wp, xq + (nf_i64)j * qrow, b, sub) * wscale
-                       * nf_q8_scale(xq + (nf_i64)j * qrow, b);
-            }
-        }
-    }
-}
-
-/* Q8_0_MatVec_Q8 over n_tokens consecutive Q8_1 rows in one launch (n_tokens in
- * [1, NF_MVQN_MAX]): the one-workgroup-per-row geometry is unchanged and the weight row is read
- * once for the whole token group, instead of once per row and token. Token t's dot lands at
- * output[t * out_dim + row], reduced exactly as the single-row form reduces it. */
-NF_KERNEL void Q8_0_MatVecN_Q8(
+/* Q8_0_MatVec over n_tokens consecutive float rows in one launch (n_tokens in
+ * [1, NF_MVQN_MAX]): the block loop streams the weight row once and dots every block against
+ * every live token's float block, where one Q8_0_MatVec per token re-reads the row per token.
+ * Token t's dot lands at output[t * out_dim + row], and NF_MVQTN_TREE reduces the group in one
+ * pass, so token t's result is the exact single-row result. */
+NF_REQD_SG_ATTR NF_KERNEL void Q8_0_MatVecN(
     const int out_dim,
     const int in_dim,
     const int n_tokens,
     NF_GLOBAL const uchar* NF_RESTRICT weight,
-    NF_GLOBAL const uchar* NF_RESTRICT input,
+    NF_GLOBAL const float* NF_RESTRICT input,
     NF_GLOBAL float* NF_RESTRICT output)
 {
     const int row = get_group_id(0);
     if (row >= out_dim) return;
 
     const int nblk = in_dim / Q8_0_BLOCK_SIZE;
-    const nf_i64 qrow = (nf_i64)nblk * Q8_1_BLOCK_BYTES;
+    const int lid = get_local_id(0);
+    const int gpi = get_local_size(0) / Q8_0_THREADS_PER_BLOCK;
+    const int sub = lid % Q8_0_THREADS_PER_BLOCK;
     float ps[NF_MVQN_MAX];
-    nf_mvq8q8_row_partial_n(weight + (nf_i64)row * nblk * Q8_0_BLOCK_BYTES, input, nblk,
-                            n_tokens, qrow, ps);
-    NF_LOCAL float scratch[LLM_DIMX];
 #pragma unroll
-    for (int j = 0; j < NF_MVQN_MAX; j++) {
-        if (j < n_tokens) {
-            const float acc = nf_wg_sum(scratch, ps[j]);
-            if (get_local_id(0) == 0) output[(nf_i64)j * out_dim + row] = acc;
+    for (int j = 0; j < NF_MVQN_MAX; j++) ps[j] = 0.0f;
+    for (int b = lid / Q8_0_THREADS_PER_BLOCK; b < nblk; b += gpi) {
+        NF_GLOBAL const uchar* wp = weight + (nf_i64)row * nblk * Q8_0_BLOCK_BYTES
+                                  + (nf_i64)b * Q8_0_BLOCK_BYTES;
+#pragma unroll
+        for (int j = 0; j < NF_MVQN_MAX; j++) {
+            if (j < n_tokens) {
+                ps[j] += nf_mvq8_slice_dot(wp, input + (nf_i64)j * in_dim + b * Q8_0_BLOCK_SIZE, sub);
+            }
         }
     }
-}
-
-/* Q8_0_MatVec_Q8 over two output rows per workgroup: pair p covers rows 2p and 2p+1, so the Q8_1
- * row is read once per two weight rows. An odd row count repeats the last row's weights into the
- * odd pair's second accumulator and drops its store, so the tail workgroup stays barrier-uniform. */
-NF_KERNEL void Q8_0_MatVec2_Q8(
-    const int out_dim,
-    const int in_dim,
-    NF_GLOBAL const uchar* NF_RESTRICT weight,
-    NF_GLOBAL const uchar* NF_RESTRICT input,
-    NF_GLOBAL float* NF_RESTRICT output)
-{
-    const int pair = get_group_id(0);
-    const int row0 = pair * 2;
-    if (row0 >= out_dim) return;
-    const int row1 = min(row0 + 1, out_dim - 1);
-
-    const int nblk = in_dim / Q8_0_BLOCK_SIZE;
-    const nf_i64 rbase = (nf_i64)nblk * Q8_0_BLOCK_BYTES;
-    NF_LOCAL float scratch[LLM_DIMX];
-    const float o0 = nf_wg_sum(scratch,
-        nf_mvq8q8_row_partial(weight + (nf_i64)row0 * rbase, input, nblk));
-    const float o1 = nf_wg_sum(scratch,
-        nf_mvq8q8_row_partial(weight + (nf_i64)row1 * rbase, input, nblk));
-    if (get_local_id(0) == 0) {
-        output[row0] = o0;
-        if (row0 + 1 < out_dim) output[row0 + 1] = o1;
-    }
-}
-
-/* addend_output[row] += dot(weight[row, :], dequant(input)) with a Q8_1-quantized input vector. */
-NF_KERNEL void Q8_0_MatVecAdd_Q8(
-    const int out_dim,
-    const int in_dim,
-    NF_GLOBAL const uchar* NF_RESTRICT weight,
-    NF_GLOBAL const uchar* NF_RESTRICT input,
-    NF_GLOBAL float* NF_RESTRICT addend_output)
-{
-    const int row = get_group_id(0);
-    if (row >= out_dim) return;
-
-    const int nblk = in_dim / Q8_0_BLOCK_SIZE;
-    NF_LOCAL float scratch[LLM_DIMX];
-    const float acc = nf_wg_sum(scratch,
-        nf_mvq8q8_row_partial(weight + (nf_i64)row * nblk * Q8_0_BLOCK_BYTES, input, nblk));
-    if (get_local_id(0) == 0) addend_output[row] += acc;
-}
-
-/* output[row] = silu(gate) * up with gate/up = dot(gate/up_weight[row, :], dequant(input)) and a
- * Q8_1-quantized input vector. */
-NF_KERNEL void Q8_0_MatVecFusedGateUp_Q8(
-    const int out_dim,
-    const int in_dim,
-    NF_GLOBAL const uchar* NF_RESTRICT gate_weight,
-    NF_GLOBAL const uchar* NF_RESTRICT up_weight,
-    NF_GLOBAL const uchar* NF_RESTRICT input,
-    NF_GLOBAL float* NF_RESTRICT output)
-{
-    const int row = get_group_id(0);
-    if (row >= out_dim) return;
-
-    const int nblk = in_dim / Q8_0_BLOCK_SIZE;
-    const nf_i64 rbase = (nf_i64)row * nblk * Q8_0_BLOCK_BYTES;
-    float gs = 0.0f;
-    float us = 0.0f;
-    nf_mvq8q8_row_partial_dual(gate_weight + rbase, up_weight + rbase, input, nblk, &gs, &us);
-
-    NF_LOCAL float scratch[LLM_DIMX];
-    const float gate_val = nf_wg_sum(scratch, gs);
-    const float up_val = nf_wg_sum(scratch, us);
-    if (get_local_id(0) == 0) {
-        output[row] = nf_silu(gate_val) * up_val;
-    }
+    NF_LOCAL float ts[NF_MVQN_MAX * NF_MVQTN_SLOTS];
+    NF_MVQTN_TREE(ts, ps, n_tokens, output, out_dim, row)
 }
 
 /* output[row] = gelu(gate) * up with gate/up = dot(gate/up_weight[row, :], dequant(input)) and a
  * Q8_1-quantized input vector. */
-NF_KERNEL void Q8_0_MatVecFusedGateUpGelu_Q8(
+NF_REQD_SG_ATTR NF_KERNEL void Q8_0_MatVecFusedGateUpGelu_Q8(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const uchar* NF_RESTRICT gate_weight,
@@ -486,48 +393,9 @@ NF_KERNEL void Q8_0_MatVecFusedGateUpGelu_Q8(
     }
 }
 
-/* Q8_0_MatVecFusedGateUp_Q8 over two output rows per workgroup: pair p covers rows 2p and 2p+1 of
- * both weights, so the Q8_1 row is read once per two gate/up row pairs. An odd row count repeats
- * the last row's weights into the odd pair's second accumulators and drops its store, so the tail
- * workgroup stays barrier-uniform. */
-NF_KERNEL void Q8_0_MatVec2FusedGateUp_Q8(
-    const int out_dim,
-    const int in_dim,
-    NF_GLOBAL const uchar* NF_RESTRICT gate_weight,
-    NF_GLOBAL const uchar* NF_RESTRICT up_weight,
-    NF_GLOBAL const uchar* NF_RESTRICT input,
-    NF_GLOBAL float* NF_RESTRICT output)
-{
-    const int pair = get_group_id(0);
-    const int row0 = pair * 2;
-    if (row0 >= out_dim) return;
-    const int row1 = min(row0 + 1, out_dim - 1);
-
-    const int nblk = in_dim / Q8_0_BLOCK_SIZE;
-    const nf_i64 rbase = (nf_i64)nblk * Q8_0_BLOCK_BYTES;
-    float gs0 = 0.0f;
-    float us0 = 0.0f;
-    float gs1 = 0.0f;
-    float us1 = 0.0f;
-    nf_mvq8q8_row_partial_dual(gate_weight + (nf_i64)row0 * rbase, up_weight + (nf_i64)row0 * rbase,
-                               input, nblk, &gs0, &us0);
-    nf_mvq8q8_row_partial_dual(gate_weight + (nf_i64)row1 * rbase, up_weight + (nf_i64)row1 * rbase,
-                               input, nblk, &gs1, &us1);
-
-    NF_LOCAL float scratch[LLM_DIMX];
-    const float gv0 = nf_wg_sum(scratch, gs0);
-    const float uv0 = nf_wg_sum(scratch, us0);
-    const float gv1 = nf_wg_sum(scratch, gs1);
-    const float uv1 = nf_wg_sum(scratch, us1);
-    if (get_local_id(0) == 0) {
-        output[row0] = nf_silu(gv0) * uv0;
-        if (row0 + 1 < out_dim) output[row1] = nf_silu(gv1) * uv1;
-    }
-}
-
 /* output[s * out_dim + row] = dot(weight[row, :], input[s, :]) for s in [0, seq_len); one
  * workgroup per row walks every token, each work-item taking whole blocks. */
-NF_KERNEL void LLM_Batch_Q8_0_MatMul(
+NF_REQD_SG_ATTR NF_KERNEL void LLM_Batch_Q8_0_MatMul(
     const int out_dim,
     const int in_dim,
     const int seq_len,
@@ -549,7 +417,7 @@ NF_KERNEL void LLM_Batch_Q8_0_MatMul(
 }
 
 /* LLM_Batch_Q8_0_MatMul with one (row, token) pair per workgroup. */
-NF_KERNEL void LLM_Batch_Q8_0_MatMul_2D(
+NF_REQD_SG_ATTR NF_KERNEL void LLM_Batch_Q8_0_MatMul_2D(
     const int out_dim,
     const int in_dim,
     const int seq_len,

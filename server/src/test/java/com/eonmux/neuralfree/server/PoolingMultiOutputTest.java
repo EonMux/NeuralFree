@@ -79,8 +79,8 @@ public class PoolingMultiOutputTest {
 
     @Test
     void theDefaultTaskIsTheDenseEmbedding() {
-        assertTrue(multiService.tokenEmbeddingProjection());
-        assertTrue(multiService.tokenScoreProjection());
+        assertTrue(multiService.pooling().tokenEmbeddingProjection());
+        assertTrue(multiService.pooling().tokenScoreProjection());
         JsonView body = ok(multi.pooling("{\"input\": \"hello world\"}"));
         float[] vector = floats(at(body, "data", 0).raw("data"));
         assertEquals(DIM, vector.length, "the dense CLS embedding, not the per-token projection");
@@ -152,7 +152,7 @@ public class PoolingMultiOutputTest {
 
     @Test
     void theDefaultStepTagFiltersABareTokenClassify() {
-        assertEquals(6, stepTagService.defaultStepTagId());
+        assertEquals(6, stepTagService.pooling().defaultStepTagId());
         JsonView body = ok(stepTag.pooling("{\"input\": [5, 6, 7], \"task\": \"token_classify\"}"));
         List<?> rows = (List<?>) at(body, "data", 0).raw("data");
         assertEquals(1, rows.size(), "only the token carrying the config's step id keeps its row");

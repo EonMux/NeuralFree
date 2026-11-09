@@ -21,15 +21,27 @@ final class FlashPlan {
     private final FlashAttnTiling paged;
     private final String pagedPrefillKernel;
     private final long partialCapacity;
+    private final boolean depthRouted;
+
+    /**
+     * Largest query heads per KV head for which the one-row step leaves the MMA prefill past one workgroup of
+     * keys. The decode plan runs one query head per workgroup and reads the group's K/V rows once per head, while
+     * the MMA prefill stages each K/V tile once for the whole group, so the decode route's gain shrinks as the
+     * group grows. Paired alternating CUDA runs (RTX 5080 Laptop, 128 tokens generated after 512 cached): the
+     * 0.6B Q8_0 model (16 query and 8 KV heads) ran 320 against 277 t/s on the decode route, the 4B models (32
+     * and 8) 105 against 122 t/s (Q4_K_M) and 95 against 100 t/s (Q8_0).
+     */
+    static final int DEPTH_ROUTE_MAX_GROUP = 2;
 
     private FlashPlan(FlashAttnTiling decode, FlashAttnTiling prefill, String mmaKernel, FlashAttnTiling paged,
-                      String pagedPrefillKernel, long partialCapacity) {
+                      String pagedPrefillKernel, long partialCapacity, boolean depthRouted) {
         this.decode = decode;
         this.prefill = prefill;
         this.mmaKernel = mmaKernel;
         this.paged = paged;
         this.pagedPrefillKernel = pagedPrefillKernel;
         this.partialCapacity = partialCapacity;
+        this.depthRouted = depthRouted;
     }
 
     /**
@@ -41,8 +53,10 @@ final class FlashPlan {
         int smem = kernels.faSmemFloats();
         int cu = Math.max(1, kernels.caps().getComputeUnits());
         int rows = keys.rows();
+        boolean fast = FlashAttnTiling.decodeFastPath(kernels.caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+                keys.typeK(), keys.typeV(), a.headDimK(), a.headDimV());
         FlashAttnTiling decode = FlashAttnTiling.decode(a.nHead(), a.nHeadKv(), a.headDimK(), a.headDimV(), rows,
-                smem, cu);
+                smem, cu, fast);
         String mmaName = mmaKernelName(kernels.caps().hasFeature(DeviceFeature.COOPERATIVE_MATRIX), keys.typeK(),
                 keys.typeV(), a.headDimK(), a.headDimV());
         String mma = mmaName != null && kernels.has(mmaName) ? mmaName : null;
@@ -58,13 +72,14 @@ final class FlashPlan {
         if (pg != null) {
             pagedPrefill = pagedPrefillKernel(kernels, prefill, keys.typeK(), keys.typeV());
             paged = FlashAttnTiling.decodePaged(pg.maxLaunchSeq(), a.nHead(), a.nHeadKv(), a.headDimK(),
-                    a.headDimV(), pg.slotCapacity(), smem, cu);
+                    a.headDimV(), pg.slotCapacity(), smem, cu, fast);
             cap = Math.max(cap, paged.decodePagedPartialFloats(pg.maxLaunchSeq()));
         }
         if (cap > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("flash partials of " + cap + " floats exceed one buffer");
         }
-        return new FlashPlan(decode, prefill, mma, paged, pagedPrefill, cap);
+        return new FlashPlan(decode, prefill, mma, paged, pagedPrefill, cap,
+                depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()));
     }
 
     /**
@@ -125,6 +140,46 @@ final class FlashPlan {
     /** The tensor-core prefill kernel of an MMA plan; null otherwise. */
     String mmaKernel() {
         return mmaKernel;
+    }
+
+    /**
+     * Whether every one-row step of this plan runs the MMA prefill kernel, whatever the step's depth: the plan has
+     * an mma kernel and its one-row route does not follow the step's depth ({@link #depthRouted}). The step-level
+     * overload {@link #routesDecodeThroughPrefill(int)} adds the per-step rule on top of this.
+     */
+    boolean routesDecodeThroughPrefill() {
+        return mmaKernel != null && !depthRouted;
+    }
+
+    /** Whether the one-row step at {@code liveKeys} live keys runs the MMA prefill kernel ({@link #depthRouted}). */
+    boolean routesDecodeThroughPrefill(int liveKeys) {
+        return routesDecodeThroughPrefill(mmaKernel, depthRouted, liveKeys);
+    }
+
+    /**
+     * The one-row route rule: with an mma kernel, a depth-routed plan runs the MMA prefill for steps over at most
+     * {@link FlashAttnTiling#WG} live keys (the workgroup bound at which the decode plan stops splitting) and the
+     * decode kernel past it; any other plan with an mma kernel runs the MMA prefill at every step, and a plan
+     * without one runs the decode kernel. Paired CUDA runs over 128 generated tokens (every step at or under
+     * the bound) put the MMA route 3-7% ahead of the decode route on every model tried.
+     */
+    static boolean routesDecodeThroughPrefill(String mmaKernel, boolean depthRouted, int liveKeys) {
+        return mmaKernel != null && (!depthRouted || liveKeys <= FlashAttnTiling.WG);
+    }
+
+    /**
+     * Whether the one-row route follows the step's live key count: an mma kernel exists, the decode kernels' shuffle
+     * fast path serves the caches and head dims, the cache is dense (a paged cache's per-sequence key count is not
+     * derivable from the step position) and the GQA group has at most {@link #DEPTH_ROUTE_MAX_GROUP} query heads.
+     * The decode replay recaptures the one trunk whose route flips (at most once per generation, at the bound).
+     */
+    static boolean depthRouted(String mmaKernel, boolean decodeFastPath, boolean paged, int nHead, int nHeadKv) {
+        return mmaKernel != null && decodeFastPath && !paged && nHead <= DEPTH_ROUTE_MAX_GROUP * nHeadKv;
+    }
+
+    /** Whether the one-row route follows the step's live key count ({@link #depthRouted}). */
+    boolean routesDecodeByDepth() {
+        return depthRouted;
     }
 
     /** The decode plan of the paged launches; null without a paged cache. */

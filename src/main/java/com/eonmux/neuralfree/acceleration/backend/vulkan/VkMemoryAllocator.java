@@ -193,17 +193,10 @@ public final class VkMemoryAllocator implements AutoCloseable {
 
         this.minStorageBufferOffsetAlignment = positiveOrOne(info.minStorageBufferOffsetAlignment());
         this.nonCoherentAtomSize = positiveOrOne(info.nonCoherentAtomSize());
-        long maxMemoryAllocation = requireLimit("maxMemoryAllocationSize", info.maxMemoryAllocationSize());
-        long maxStorageRange = requireLimit("maxStorageBufferRange", info.maxStorageBufferRange());
-        long maxBuffer = info.maxBufferSize();
-        if (maxBuffer < 0) {
-            throw new IllegalArgumentException("maxBufferSize must not be negative, got " + maxBuffer);
-        }
+        long maxMemoryAllocation = VkLimits.required("maxMemoryAllocationSize", info.maxMemoryAllocationSize());
+        long maxStorageRange = VkLimits.required("maxStorageBufferRange", info.maxStorageBufferRange());
         this.blockSize = Math.min(readBlockMb() * MIB, maxMemoryAllocation);
-        long limit = Math.min(maxMemoryAllocation, maxStorageRange);
-        if (maxBuffer > 0) {
-            limit = Math.min(limit, maxBuffer);
-        }
+        long limit = Math.min(Math.min(maxMemoryAllocation, maxStorageRange), VkLimits.optional(info.maxBufferSize()));
         this.maxAllocSize = Math.min(limit, largestVramHeapCapacity());
 
         int[] families = Arrays.stream(sharingQueueFamilies).distinct().toArray();
@@ -799,14 +792,6 @@ public final class VkMemoryAllocator implements AutoCloseable {
         }
         throw new IllegalArgumentException("-D" + BLOCK_MB_PROPERTY + " must be a positive integer (MiB), got '"
                 + value + "'");
-    }
-
-    private static long requireLimit(String name, long value) {
-        if (value <= 0) {
-            throw new IllegalArgumentException(name + " must be positive (uint32 limits are widened unsigned), got "
-                    + value);
-        }
-        return value;
     }
 
     private static long positiveOrOne(long value) {

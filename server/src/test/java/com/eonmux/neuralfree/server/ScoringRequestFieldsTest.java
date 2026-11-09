@@ -89,7 +89,7 @@ public class ScoringRequestFieldsTest {
     private static double filledTemplateScore(String query, String document, String instruction) throws IOException {
         String prompt = TEMPLATE.replace("{instruction}", instruction)
                 .replace("{query}", query).replace("{document}", document);
-        return templateService.rerankScore(null, templateService.encode(prompt, false, true));
+        return templateService.pooling().rerankScore(null, templateService.encode(prompt, false, true));
     }
 
     @Test
@@ -164,16 +164,16 @@ public class ScoringRequestFieldsTest {
 
     @Test
     void truncatePromptTokensCutsTheComposedPair() throws IOException {
-        int[] pair = bareService.rerankInput("aaaa", "bbbb");
+        int[] pair = bareService.pooling().rerankInput("aaaa", "bbbb");
         assertTrue(pair.length > 3, "the fixture pair packs more than the cut");
         String body = "{\"queries\": \"aaaa\", \"documents\": \"bbbb\", \"truncate_prompt_tokens\": 3}";
         JsonView scored = ok(barePooling.score(body));
         assertEquals(3L, scored.obj("usage").i64("prompt_tokens"), "the composed pair counts the cut");
         int[] last = Arrays.copyOfRange(pair, pair.length - 3, pair.length);
-        assertEquals(bareService.rerankScore(null, last), at(scored, "data", 0).f64("score"), TOLERANCE,
+        assertEquals(bareService.pooling().rerankScore(null, last), at(scored, "data", 0).f64("score"), TOLERANCE,
                 "truncation_side left keeps the last tokens");
         int[] first = Arrays.copyOf(pair, 3);
-        assertEquals(bareService.rerankScore(null, first), firstScore(barePooling, body
+        assertEquals(bareService.pooling().rerankScore(null, first), firstScore(barePooling, body
                         .replace("}", ", \"truncation_side\": \"right\"}")), TOLERANCE,
                 "truncation_side right keeps the first tokens");
     }
@@ -181,12 +181,12 @@ public class ScoringRequestFieldsTest {
     @Test
     void batchedTextPairsComposePerPairWithTheOptions() throws IOException {
         int cut = 5;
-        int[] first = templateService.rerankInput("aaaa", "bbbb", INSTRUCTION);
-        int[] second = templateService.rerankInput("cccc", "dddd", INSTRUCTION);
+        int[] first = templateService.pooling().rerankInput("aaaa", "bbbb", INSTRUCTION);
+        int[] second = templateService.pooling().rerankInput("cccc", "dddd", INSTRUCTION);
         assertTrue(first.length > cut && second.length > cut, "the fixture pairs pack more than the cut");
-        double want1 = templateService.rerankScore(null,
+        double want1 = templateService.pooling().rerankScore(null,
                 Arrays.copyOfRange(first, first.length - cut, first.length));
-        double want2 = templateService.rerankScore(null,
+        double want2 = templateService.pooling().rerankScore(null,
                 Arrays.copyOfRange(second, second.length - cut, second.length));
         JsonView scored = ok(templatePooling.score("{\"queries\": [\"aaaa\", \"cccc\"],"
                 + " \"documents\": [\"bbbb\", \"dddd\"], \"instruction\": \"" + INSTRUCTION + "\","
@@ -212,8 +212,8 @@ public class ScoringRequestFieldsTest {
         int[] content = bertService.encode(query, false, false);
         int[] cappedQuery = bertService.encode(
                 bertService.tokenizer().decode(Arrays.copyOf(content, 1)), true, true);
-        double want = bertService.biEncoderScore(cosine(bertService.embed(null, cappedQuery),
-                bertService.embed(null, bertService.encode(document, true, true))));
+        double want = bertService.pooling().biEncoderScore(cosine(bertService.pooling().embed(null, cappedQuery),
+                bertService.pooling().embed(null, bertService.encode(document, true, true))));
         String body = "{\"queries\": \"" + query + "\", \"documents\": \"" + document + "\"}";
         assertNotEquals(firstScore(biPooling, body), want, 1e-7, "the cap changes the vector");
         assertEquals(want, firstScore(biPooling, body.replace("documents", "max_tokens_per_query\": 1,"

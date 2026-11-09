@@ -178,7 +178,7 @@ public final class DeviceKvLayer implements GpuKvLayer, AutoCloseable {
     }
 
     /** Applies a context shift's row moves to K and (when separate) V. */
-    void moveRows(ComputeQueue queue, DeviceStepInputs.KvShift shift, GpuBuffer staging) {
+    void moveRows(ComputeQueue queue, KvShift shift, GpuBuffer staging) {
         checkOpen();
         moveRows(queue, k, layout.rowBytesK(), shift, staging);
         if (!layout.vAliasesK()) {
@@ -209,7 +209,7 @@ public final class DeviceKvLayer implements GpuKvLayer, AutoCloseable {
      * ascending chunks of at most {@code src - dst} rows; otherwise through {@code staging}, which must hold
      * {@code shift.movedRows() * rowBytes} bytes. Copies are enqueued on {@code queue} in order.
      */
-    static void moveRows(ComputeQueue queue, GpuBuffer buf, long rowBytes, DeviceStepInputs.KvShift shift,
+    static void moveRows(ComputeQueue queue, GpuBuffer buf, long rowBytes, KvShift shift,
                          GpuBuffer staging) {
         if (shift.runCount() == 0) {
             return;

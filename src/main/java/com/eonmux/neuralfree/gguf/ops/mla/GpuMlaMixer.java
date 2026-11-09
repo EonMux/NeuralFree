@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.mla;
 
+import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
@@ -31,6 +32,7 @@ import com.eonmux.neuralfree.gguf.ops.attn.AttnExtKernels;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnExtMath;
 import com.eonmux.neuralfree.gguf.ops.attn.AttnKernels;
 import com.eonmux.neuralfree.gguf.ops.attn.FlashAttnTiling;
+import com.eonmux.neuralfree.gguf.ops.attn.FlashBindGuard;
 import com.eonmux.neuralfree.gguf.ops.moe.GpuGroupedRows;
 import com.eonmux.neuralfree.gguf.ops.moe.MoeKernels;
 import com.eonmux.neuralfree.gguf.ops.norm.NormKernels;
@@ -521,9 +523,12 @@ public final class GpuMlaMixer implements GpuMixer {
     }
 
     private void prepareAttention(GpuForwardContext ctx, LayerSpec layer, GpuWeights ws, GpuBuffer ph) {
+        FlashBindGuard.requireServable(ctx.kernels(), "MLA layer " + il, g.nHead, g.nHeadKv, g.dQ, g.dV);
         int smem = ctx.kernels().faSmemFloats();
         int cus = Math.max(1, ctx.kernels().caps().getComputeUnits());
-        decodeTiling = FlashAttnTiling.decode(g.nHead, g.nHeadKv, g.dQ, g.dV, layout.rows(), smem, cus);
+        boolean fast = FlashAttnTiling.decodeFastPath(ctx.kernels().caps().hasFeature(DeviceFeature.SUBGROUP_SHUFFLE),
+                layout.dtypeK(), layout.dtypeV(), g.dQ, g.dV);
+        decodeTiling = FlashAttnTiling.decode(g.nHead, g.nHeadKv, g.dQ, g.dV, layout.rows(), smem, cus, fast);
         prefillTiling = FlashAttnTiling.prefill(g.nHead, g.nHeadKv, g.dQ, g.dV, layout.rows(), smem, cus);
         partialCapacity = decodeTiling.decodePartialFloats();
         if (prefillTiling.plan() == FlashAttnTiling.Plan.TILED) {
@@ -537,7 +542,7 @@ public final class GpuMlaMixer implements GpuMixer {
             maxPages = steps.maxPages();
             maxLaunchSeq = Math.min(steps.pagedMaxSequences(), ctx.scratch().ubatch());
             pagedTiling = FlashAttnTiling.decodePaged(maxLaunchSeq, g.nHead, g.nHeadKv, g.dQ, g.dV,
-                    maxPages << pageShift, smem, cus);
+                    maxPages << pageShift, smem, cus, fast);
             partialCapacity = Math.max(partialCapacity, pagedTiling.decodePagedPartialFloats(maxLaunchSeq));
         }
         GpuBuffer partials = ctx.scratch().partials(MlaBlocks.toInt(partialCapacity, "MLA flash partial floats"));

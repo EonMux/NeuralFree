@@ -98,20 +98,19 @@ public final class VkCapabilitiesBuilder {
     /**
      * {@code min(maxMemoryAllocationSize, maxStorageBufferRange, maxBufferSize when non-zero,
      * largest device-local heap)}; the device-local term is the largest heap on an integrated GPU.
+     * Each limit is read through {@link VkLimits}, so an unbounded sentinel is clamped by the other terms.
      *
      * @throws IllegalArgumentException when a required limit is missing (zero)
      */
     public static long deviceMaxAllocSize(VkPhysicalDeviceInfo info) {
         long maxMemoryAllocation = info.maxMemoryAllocationSize();
         long maxRange = info.maxStorageBufferRange();
-        if (maxMemoryAllocation <= 0 || maxRange <= 0) {
+        if (maxMemoryAllocation == 0 || maxRange == 0) {
             throw new IllegalArgumentException("Vulkan device '" + info.name() + "' reports no allocation limits "
                     + "(maxMemoryAllocationSize=" + maxMemoryAllocation + ", maxStorageBufferRange=" + maxRange + ")");
         }
-        long limit = Math.min(maxMemoryAllocation, maxRange);
-        if (info.maxBufferSize() > 0) {
-            limit = Math.min(limit, info.maxBufferSize());
-        }
+        long limit = Math.min(Math.min(VkLimits.required("maxMemoryAllocationSize", maxMemoryAllocation),
+                VkLimits.required("maxStorageBufferRange", maxRange)), VkLimits.optional(info.maxBufferSize()));
         long largestHeap = largestDeviceHeap(info);
         return largestHeap > 0 ? Math.min(limit, largestHeap) : limit;
     }

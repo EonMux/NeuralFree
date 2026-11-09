@@ -27,9 +27,10 @@ import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.spec.resolve.ModelSpecBuilder;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import org.junit.After;
 import org.junit.Before;
@@ -298,7 +299,7 @@ public class GpuCachedMoeFfnTest {
                         nameOf(TensorNames.FFN_UP_EXPS), nameOf(TensorNames.FFN_DOWN_EXPS))), 0, 0L);
     }
 
-    private List<Dispatch> forward(int n, int[] ids) {
+    private List<FakeDispatch> forward(int n, int[] ids) {
         this.routedIds = ids;
         backend.clearLog();
         block.forward(n, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
@@ -306,7 +307,7 @@ public class GpuCachedMoeFfnTest {
     }
 
     /** {@link #forward} over nonzero input rows, so the host-computed expert rows are distinguishable from zeros. */
-    private List<Dispatch> forwardOnes(int n, int[] ids) {
+    private List<FakeDispatch> forwardOnes(int n, int[] ids) {
         ScratchSlot in = scratch.slot(ScratchSlots.NORMED);
         float[] ones = new float[n * N_EMBD];
         Arrays.fill(ones, 1.0f);
@@ -314,15 +315,15 @@ public class GpuCachedMoeFfnTest {
         return forward(n, ids);
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] v = new int[to - from];
         for (int i = from; i < to; i++) {
             v[i - from] = d.intArg(i);
@@ -332,8 +333,8 @@ public class GpuCachedMoeFfnTest {
 
     private long rowWrites() {
         long n = 0;
-        for (Op op : backend.ops()) {
-            if (op.kind() == FakeComputeBackend.OpKind.WRITE && op.bytes() == (long) N_EMBD * Float.BYTES) {
+        for (FakeOp op : backend.ops()) {
+            if (op.kind() == FakeOpKind.WRITE && op.bytes() == (long) N_EMBD * Float.BYTES) {
                 n++;
             }
         }
@@ -342,7 +343,7 @@ public class GpuCachedMoeFfnTest {
 
     @Test
     public void preloadedHitsRunTheIndirectionKernelsWithoutHostRows() {
-        List<Dispatch> ds = forward(1, new int[]{3, 5});
+        List<FakeDispatch> ds = forward(1, new int[]{3, 5});
 
         List<String> expected = new ArrayList<>(Arrays.asList(ROUTER_LOGITS, MoeKernels.ROUTER, GATE_UP_IND,
                 MATVEC_ID_IND, WSUM));
@@ -350,7 +351,7 @@ public class GpuCachedMoeFfnTest {
         expected.add(WSUM);
         assertEquals(expected, names(ds));
 
-        Dispatch gateUp = ds.get(2);
+        FakeDispatch gateUp = ds.get(2);
         assertEquals(MoeKernels.GU_IND_ARG_COUNT, gateUp.argCount());
         assertSame(cache.mapBuffer(0), gateUp.bufferArg(MoeKernels.ARG_GUI_MAP));
         assertSame(cache.bank(0, 0), gateUp.bufferArg(MoeKernels.ARG_GUI_GATE));
@@ -358,13 +359,13 @@ public class GpuCachedMoeFfnTest {
         assertEquals(MoeKernels.SCALE_NONE, gateUp.intArg(MoeKernels.ARG_GU_HAS_SCALE));
         assertArrayEquals(new int[]{N_FF_EXP, N_EMBD, K, 0, 0}, ints(gateUp, 0, 5));
 
-        Dispatch down = ds.get(3);
+        FakeDispatch down = ds.get(3);
         assertEquals(MoeKernels.ID_IND_ARG_COUNT, down.argCount());
         assertSame(cache.bank(0, 2), down.bufferArg(MoeKernels.ARG_IDI_WEIGHT));
         assertSame(cache.mapBuffer(0), down.bufferArg(MoeKernels.ARG_IDI_MAP));
         assertArrayEquals(new int[]{N_EMBD, N_FF_EXP, K, N_FF_EXP, 0, 0}, ints(down, 0, 6));
 
-        Dispatch wsum = ds.get(4);
+        FakeDispatch wsum = ds.get(4);
         assertSame(scratch.slot(ScratchSlots.BRANCH).buffer(), wsum.bufferArg(6));
         int idLocal = (int) gateUp.local()[0];
         assertArrayEquals(new long[]{(long) N_FF_EXP * idLocal, K}, gateUp.global());
@@ -374,7 +375,7 @@ public class GpuCachedMoeFfnTest {
     @Test
     public void aMissPairAddsItsRowThroughADeviceWrite() {
         forward(1, new int[]{3, 5}); // fill the preloaded experts
-        List<Dispatch> ds = forward(1, new int[]{3, 6}); // 6 is not in the cache: a miss
+        List<FakeDispatch> ds = forward(1, new int[]{3, 6}); // 6 is not in the cache: a miss
 
         List<String> expected = new ArrayList<>(Arrays.asList(ROUTER_LOGITS, MoeKernels.ROUTER, GATE_UP_IND,
                 MATVEC_ID_IND, WSUM));
@@ -387,7 +388,7 @@ public class GpuCachedMoeFfnTest {
     @Test
     public void anAllMissStepSkipsTheExpertKernels() {
         forward(1, new int[]{3, 5});
-        List<Dispatch> ds = forward(1, new int[]{1, 2});
+        List<FakeDispatch> ds = forward(1, new int[]{1, 2});
 
         List<String> expected = new ArrayList<>(Arrays.asList(ROUTER_LOGITS, MoeKernels.ROUTER, WSUM));
         expected.addAll(shexp("Float_MatVec"));
@@ -397,17 +398,17 @@ public class GpuCachedMoeFfnTest {
     }
 
     /** The expert-output row writes of the last forward, one per host row or dropped row. */
-    private List<Op> rowWriteOps() {
-        List<Op> out = new ArrayList<>();
-        for (Op op : backend.ops()) {
-            if (op.kind() == FakeComputeBackend.OpKind.WRITE && op.bytes() == (long) N_EMBD * Float.BYTES) {
+    private List<FakeOp> rowWriteOps() {
+        List<FakeOp> out = new ArrayList<>();
+        for (FakeOp op : backend.ops()) {
+            if (op.kind() == FakeOpKind.WRITE && op.bytes() == (long) N_EMBD * Float.BYTES) {
                 out.add(op);
             }
         }
         return out;
     }
 
-    private static boolean allZero(Op write) {
+    private static boolean allZero(FakeOp write) {
         int n = (int) (write.bytes() / Float.BYTES);
         for (float f : write.buffer().getFloats(write.offset() / Float.BYTES, n)) {
             if (f != 0.0f) {
@@ -424,7 +425,7 @@ public class GpuCachedMoeFfnTest {
         bindBlock(1);
         forward(1, new int[]{3, 6}); // 3 is a preloaded hit, 6 is a miss at rank 1
 
-        List<Op> writes = rowWriteOps();
+        List<FakeOp> writes = rowWriteOps();
         assertEquals("one row write for the dropped miss", 1, writes.size());
         assertTrue("the dropped expert's row stays zero", allZero(writes.get(0)));
     }
@@ -437,7 +438,7 @@ public class GpuCachedMoeFfnTest {
         // pairs: 0 -> expert 3 (hit), 1 -> 6 (rank 1), 2 -> 6 (rank 0), 3 -> 4 (rank 1)
         forwardOnes(2, new int[]{3, 6, 6, 4});
 
-        List<Op> writes = new ArrayList<>(rowWriteOps());
+        List<FakeOp> writes = new ArrayList<>(rowWriteOps());
         writes.sort((a, b) -> Long.compare(a.offset(), b.offset()));
         assertEquals("two computed rows and one zeroed row", 3, writes.size());
         assertFalse("the 6 rows are token 1's first pick and computed", allZero(writes.get(0)));
@@ -448,7 +449,7 @@ public class GpuCachedMoeFfnTest {
     @Test
     public void prefillRunsTheGroupedGemmOverTheCacheMap() {
         int n = 5;
-        List<Dispatch> ds = forward(n, preloadedPrefill(n));
+        List<FakeDispatch> ds = forward(n, preloadedPrefill(n));
 
         List<String> expected = new ArrayList<>(Arrays.asList("LLM_Batch_Float_MatMul_2D", MoeKernels.ROUTER,
                 MoeKernels.BUCKETIZE, MoeKernels.ALIGN_BLOCKS, GG_IND, GG_IND, "LLM_GLU", GG_IND, WSUM));
@@ -456,8 +457,8 @@ public class GpuCachedMoeFfnTest {
         expected.add(WSUM);
         assertEquals(expected, names(ds));
         int tiles = MoeKernels.groupedTiles(UBATCH * K, N_EXPERT);
-        Dispatch align = ds.get(3);
-        Dispatch gate = ds.get(4);
+        FakeDispatch align = ds.get(3);
+        FakeDispatch gate = ds.get(4);
         assertEquals(MoeKernels.GG_IND_ARG_COUNT, gate.argCount());
         assertSame(cache.bank(0, 0), gate.bufferArg(MoeKernels.ARG_GGI_WEIGHT));
         assertSame(cache.bank(0, 1), ds.get(5).bufferArg(MoeKernels.ARG_GGI_WEIGHT));
@@ -467,7 +468,7 @@ public class GpuCachedMoeFfnTest {
         assertArrayEquals(new int[]{N_FF_EXP, N_EMBD, tiles, K, N_EMBD, 0, 0, MoeKernels.SCALE_NONE},
                 ints(gate, 0, 8));
         assertArrayEquals(MoeKernels.groupedGemmGlobal(N_FF_EXP, tiles), gate.global());
-        Dispatch down = ds.get(7);
+        FakeDispatch down = ds.get(7);
         assertArrayEquals(new int[]{N_EMBD, N_FF_EXP, tiles, 1, N_FF_EXP}, ints(down, 0, 5));
         assertSame(cache.bank(0, 2), down.bufferArg(MoeKernels.ARG_GGI_WEIGHT));
         assertSame(cache.mapBuffer(0), down.bufferArg(MoeKernels.ARG_GGI_MAP));
@@ -480,19 +481,19 @@ public class GpuCachedMoeFfnTest {
         tearDown();
         open(GG_IND);
         int n = 5;
-        List<Dispatch> ds = forward(n, preloadedPrefill(n));
+        List<FakeDispatch> ds = forward(n, preloadedPrefill(n));
 
         List<String> expected = new ArrayList<>(Arrays.asList("LLM_Batch_Float_MatMul_2D", MoeKernels.ROUTER,
                 MoeKernels.BUCKETIZE, BMM_ID_IND, BMM_ID_IND, "LLM_GLU", BMM_ID_IND, WSUM));
         expected.addAll(shexp("LLM_Batch_Float_MatMul_2D"));
         expected.add(WSUM);
         assertEquals(expected, names(ds));
-        Dispatch gate = ds.get(3);
+        FakeDispatch gate = ds.get(3);
         assertSame(cache.bank(0, 0), gate.bufferArg(MoeKernels.ARG_BMI_WEIGHT));
         assertSame(cache.mapBuffer(0), gate.bufferArg(MoeKernels.ARG_BMI_MAP));
         assertEquals(n * K, gate.intArg(MoeKernels.ARG_BMM_N_ROWS));
         assertEquals(K, gate.intArg(3));
-        Dispatch down = ds.get(6);
+        FakeDispatch down = ds.get(6);
         assertEquals(1, down.intArg(3));
         assertSame(cache.bank(0, 2), down.bufferArg(MoeKernels.ARG_BMI_WEIGHT));
         assertTrue(down.global()[1] >= 1);
@@ -524,7 +525,7 @@ public class GpuCachedMoeFfnTest {
         for (int i = 0; i < ids.length; i++) {
             ids[i] = i % N_EXPERT; // every expert demanded, most of them not cached
         }
-        List<Dispatch> ds = forward(n, ids);
+        List<FakeDispatch> ds = forward(n, ids);
 
         String dense = ds.get(0).kernelName(); // the router logits' product, the shared expert's too
         List<String> expected = new ArrayList<>(Arrays.asList(dense, MoeKernels.ROUTER,
@@ -583,9 +584,9 @@ public class GpuCachedMoeFfnTest {
 
         forward(2, new int[]{3, 5, 3, 5}); // gives the zone back; 3 and 5 refill the restored slots
         assertEquals("a small batch gives the zone back", false, prefetch.lent(0));
-        List<Dispatch> ds = forward(2, new int[]{3, 5, 3, 5});
+        List<FakeDispatch> ds = forward(2, new int[]{3, 5, 3, 5});
 
-        Dispatch gate = ds.get(4);
+        FakeDispatch gate = ds.get(4);
         assertEquals(GG_IND, gate.kernelName());
         assertSame(cache.mapBuffer(0), gate.bufferArg(MoeKernels.ARG_GGI_MAP));
         assertSame(cache.mapBuffer(0), ds.get(7).bufferArg(MoeKernels.ARG_GGI_MAP));

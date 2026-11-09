@@ -13,7 +13,6 @@ import com.eonmux.neuralfree.gguf.memory.RecurrentStateCopy;
 import com.eonmux.neuralfree.gguf.memory.SequenceMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
 import com.eonmux.neuralfree.gguf.memory.StateTransfer;
-import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs.SequenceRules;
 import com.eonmux.neuralfree.gguf.memory.paged.PageCopy;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedSequences;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
@@ -41,7 +40,7 @@ import java.util.function.IntPredicate;
  *       sequence and snapshot cleared. KV rows are not cleared: attention only reads rows {@code kv_pos} marks.</li>
  *   <li>{@link #canRollback(int)} / {@link #rollback(int)}: memory without recurrent state, when every
  *       sliding-window ring still holds the window of the next query
- *       ({@link SequenceRules#ringBlocker(DeviceStepInputs.GroupPositions[], SequenceState, int, int)}); with DSV4
+ *       ({@link SequenceRules#ringBlocker(GroupPositions[], SequenceState, int, int)}); with DSV4
  *       compressed caches also within the rollback snapshots ({@link CompressorRollback}), whose plane is then
  *       copied into the live compressor plane of every compressed cache.</li>
  *   <li>{@link #snapshot()} / {@link #restore()}: device copies of every recurrent state into the shadow buffers
@@ -506,7 +505,7 @@ public final class DeviceModelMemory implements GpuMemory {
                     + stepInputs.groups());
         }
         for (int g = 0; g < mirror.length; g++) {
-            DeviceStepInputs.GroupPositions positions = stepInputs.positions(g);
+            GroupPositions positions = stepInputs.positions(g);
             if (mirror[g].length != positions.rows()) {
                 throw new IllegalArgumentException("group " + g + " mirror holds " + mirror[g].length + " row(s) to "
                         + positions.rows());
@@ -808,14 +807,14 @@ public final class DeviceModelMemory implements GpuMemory {
                 throw new UnsupportedOperationException("context shift unsupported: " + ring);
             }
         }
-        DeviceStepInputs.KvShift[] shifts = new DeviceStepInputs.KvShift[groups];
+        KvShift[] shifts = new KvShift[groups];
         for (int g = 0; g < groups; g++) {
             shifts[g] = stepInputs.positions(g).planShift(nKeep, nDiscard);
         }
         stepInputs.reserveShiftDeltas();
         long stagingBytes = 0;
         for (DeviceKvLayer c : ownedKv) {
-            DeviceStepInputs.KvShift s = shifts[c.group()];
+            KvShift s = shifts[c.group()];
             if (s.needsStaging()) {
                 stagingBytes = Math.max(stagingBytes, s.movedRows() * c.maxRowBytes());
             }

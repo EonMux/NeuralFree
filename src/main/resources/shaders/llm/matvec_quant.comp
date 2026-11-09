@@ -9,6 +9,11 @@
  *
  * Arguments (buffers take bindings 0.. in order, scalars fill the push block in order):
  *   OP_MATVEC      (i out_dim, i in_dim, R weight, R float input, W float output)
+ *   OP_MATVECN     (i out_dim, i in_dim, i n_tokens, R weight, R float input, W float output)
+ *                  output[t * out_dim + row] = dot(weight row, input row t) for t in
+ *                  [0, n_tokens); the weight row is read once for the whole token group (n_tokens
+ *                  in [1, NF_MVQN_MAX], NF_MVQN_MAX mirrors kernels/llm/common/config.h) and its
+ *                  token loop is unrolled with the uniform t < n_tokens guard
  *   OP_MATVEC2     same arguments and result, two rows per workgroup: global = ceil(out_dim / 2) * L,
  *                  pair p covers rows 2p and 2p+1 (the tail pair of an odd out_dim repeats the last
  *                  row's weights and drops its store)
@@ -50,6 +55,11 @@ NF_BUFFER_VIEWS(1, u)
 layout(std430, binding = 2) readonly buffer NfMvInput { float x_in[]; };
 layout(std430, binding = 3) writeonly buffer NfMvOutput { float y_out[]; };
 layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; } pc;
+#elif OP == OP_MATVECN
+NF_BUFFER_VIEWS(0, w)
+layout(std430, binding = 1) readonly buffer NfMvInput { float x_in[]; };
+layout(std430, binding = 2) writeonly buffer NfMvOutput { float y_out[]; };
+layout(push_constant) uniform NfMvParams { int out_dim; int in_dim; int n_tokens; } pc;
 #elif OP == OP_MATVEC || OP == OP_MATVEC2 || OP == OP_MATVEC_ADD || OP == OP_LOGITS
 NF_BUFFER_VIEWS(0, w)
 layout(std430, binding = 1) readonly buffer NfMvInput { float x_in[]; };
@@ -90,6 +100,18 @@ vec4 qt_x4(uint i) {
     return vec4(x_in[i], x_in[i + 1u], x_in[i + 2u], x_in[i + 3u]);
 }
 
+#if OP == OP_MATVECN
+#ifndef NF_MVQN_MAX
+#define NF_MVQN_MAX 16u
+#endif
+/* OP_MATVECN staging: one slot set per token, sized for the largest workgroup any variants row of
+ * this template is dispatched with. */
+#ifndef NF_MV_LMAX
+#define NF_MV_LMAX 256u
+#endif
+shared float nf_mv_ts[NF_MVQN_MAX * NF_MV_LMAX];
+#endif
+
 /* This invocation's share of dot(weight row at rbase in stream ws, activations at xoff): the
  * (block, ltid) pairs t = lid, lid + L, ... with block = t / QT_TPS and ltid = t % QT_TPS, so the
  * QT_TPS invocations of one block are adjacent and every pair is visited once for any L. */
@@ -102,6 +124,80 @@ float nf_mv_row_partial(uint ws, uint rbase, uint xoff, uint nblk) {
     }
     return ps;
 }
+
+#if OP == OP_MATVECN
+/* ps[t] = this invocation's share of dot(weight row at rbase in stream ws, activation row t) for
+ * t < ntok (rows hold n elements), the nf_mv_row_partial (block, ltid) pair mapping walked per
+ * token with the weight block read once. The L shares of token t add to the full dot product. */
+void nf_mv_row_partial_n(uint ws, uint rbase, uint n, uint nblk, uint ntok,
+                         inout float ps[NF_MVQN_MAX]) {
+    const uint pairs = nblk * uint(QT_TPS);
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        ps[t] = 0.0;
+    }
+    for (uint p = gl_LocalInvocationID.x; p < pairs; p += gl_WorkGroupSize.x) {
+        const uint b = p / uint(QT_TPS);
+        const uint bp = rbase + b * uint(QT_BB);
+        const uint ltid = p % uint(QT_TPS);
+        for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+            if (t < ntok) ps[t] += qt_dot(ws, bp, t * n, b, ltid);
+        }
+    }
+}
+
+/* The nf_wg_sum steps applied to every token in lockstep (GLSL twin of NF_MVQTN_TREE,
+ * kernels/llm/common/matvec_n.h): under USE_SUBGROUPS each subgroup reduces in hardware and lane 0
+ * of each subgroup stores its leader slot, the leader slots combining linearly as nf_wg_sum
+ * combines nf_red; otherwise the slots take the nf_wg_sum span tree (bounds-checked, so any local
+ * size is reduced exactly) in lockstep. Token t's result is the nf_wg_sum of token t's partials,
+ * independent of ntok. */
+void nf_mv_tree_n(inout float ps[NF_MVQN_MAX], uint ntok, uint row) {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint out_dim = uint(pc.out_dim);
+#if defined(USE_SUBGROUPS)
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        if (t < ntok) ps[t] = subgroupAdd(ps[t]);
+    }
+    if (gl_SubgroupInvocationID == 0u) {
+        for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+            if (t < ntok) nf_mv_ts[t * lsize + gl_SubgroupID] = ps[t];
+        }
+    }
+    barrier();
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        if (t < ntok) {
+            float acc = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+                acc += nf_mv_ts[t * lsize + i];
+            }
+            if (lid == 0u) {
+                y_out[t * out_dim + row] = acc;
+            }
+        }
+    }
+#else
+    for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+        if (t < ntok) nf_mv_ts[t * lsize + lid] = ps[t];
+    }
+    barrier();
+    const uint span = lsize <= 1u ? 1u : (1u << (uint(findMSB(lsize - 1u)) + 1u));
+    for (uint s = span >> 1; s > 0u; s >>= 1) {
+        if (lid < s && lid + s < lsize) {
+            for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+                if (t < ntok) nf_mv_ts[t * lsize + lid] += nf_mv_ts[t * lsize + lid + s];
+            }
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        for (uint t = 0u; t < NF_MVQN_MAX; ++t) {
+            if (t < ntok) y_out[t * out_dim + row] = nf_mv_ts[t * lsize];
+        }
+    }
+#endif
+}
+#endif
 
 #ifdef NF_MV_GATEUP
 /* Gate (stream A) and up (stream B) shares of one row, with the same pair mapping. */
@@ -155,6 +251,14 @@ void main() {
             y_out[s * out_dim + row] = acc;
         }
     }
+#elif OP == OP_MATVECN
+    /* One weight row against n_tokens float rows: the block loop streams the weight row once and
+     * dots each block against every live token row; the whole token group is reduced in one pass
+     * over nf_mv_ts, so token t's result is the exact single-row result. */
+    const uint ntok = min(uint(pc.n_tokens), NF_MVQN_MAX);
+    float ps[NF_MVQN_MAX];
+    nf_mv_row_partial_n(NF_WS_A, rbase, in_dim, nblk, ntok, ps);
+    nf_mv_tree_n(ps, ntok, row);
 #elif OP == OP_MATVEC2
     /* Two rows per workgroup (pair p covers rows 2p and 2p+1): the activations are read once per
      * two weight rows. The tail pair of an odd row count repeats the last row's weights and drops

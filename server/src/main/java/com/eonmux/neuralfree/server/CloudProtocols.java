@@ -80,7 +80,7 @@ final class CloudProtocols {
             if (body.raw("task") != null) {
                 return Invocation.POOLING;
             }
-            return target != null && target.sequenceClassifier() ? Invocation.CLASSIFICATION : Invocation.EMBEDDING;
+            return target != null && target.pooling().sequenceClassifier() ? Invocation.CLASSIFICATION : Invocation.EMBEDDING;
         }
         return null;
     }

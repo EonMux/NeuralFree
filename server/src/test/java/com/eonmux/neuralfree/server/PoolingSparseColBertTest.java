@@ -79,7 +79,7 @@ public class PoolingSparseColBertTest {
 
     @Test
     void colbertProjectsAndNormalizesEveryTokenRow() {
-        assertTrue(colbertService.perTokenEmbeddings());
+        assertTrue(colbertService.pooling().perTokenEmbeddings());
         JsonView body = ok(colbert.pooling("{\"input\": \"hello there\", \"task\": \"token_embed\"}"));
         List<?> rows = (List<?>) at(body, "data", 0).raw("data");
         assertTrue(rows.size() >= 1, "one row per token");
@@ -137,7 +137,7 @@ public class PoolingSparseColBertTest {
 
     @Test
     void spladeAnswersTheEmbedTaskByDefault() {
-        assertTrue(spladeMaxService.sparsePooling() != null);
+        assertTrue(spladeMaxService.pooling().sparsePooling() != null);
         JsonView body = ok(spladeMax.pooling("{\"input\": \"hello world\"}"));
         Map<String, Double> vector = weights(at(body, "data", 0).raw("data"));
         assertFalse(vector.isEmpty(), "the vocabulary's active entries");

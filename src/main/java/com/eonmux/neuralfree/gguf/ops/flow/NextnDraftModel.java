@@ -39,12 +39,10 @@ import com.eonmux.neuralfree.gguf.spec.TensorRef;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.SplittableRandom;
-import java.util.Set;
 import java.util.function.Predicate;
 
 /**
@@ -128,45 +126,6 @@ import java.util.function.Predicate;
 public final class NextnDraftModel implements DraftModel, DraftProbs {
 
     /**
-     * Targets whose {@code h_nextn} is the output-norm state (the target graphs' {@code t_h_nextn}; MiMo's
-     * {@code mimo_mtp.py} head reads the Qwen2 model output after its final norm).
-     */
-    private static final Set<Arch> POST_NORM_TARGET = Collections.unmodifiableSet(EnumSet.of(Arch.DEEPSEEK2,
-            Arch.DEEPSEEK32, Arch.GLM4_MOE, Arch.GLM_DSA, Arch.MELLUM, Arch.BAILINGMOE2, Arch.BAILINGMOE3,
-            Arch.COHERE2MOE, Arch.HY_V3, Arch.QWEN3NEXT, Arch.QWEN35, Arch.QWEN35MOE, Arch.NEMOTRON_H,
-            Arch.NEMOTRON_H_MOE, Arch.GLM5_NEXT, Arch.QWEN2, Arch.EXAONE4, Arch.EXAONE_MOE, Arch.DOTS3NOTE));
-    /**
-     * Targets and heads whose {@code h_nextn} is the pre-norm stream (mimo2.cpp:236-238, step35.cpp:339-341; the
-     * Step5 predictor returns the decoder block's residual output and the shared head norms it afterwards).
-     */
-    private static final Set<Arch> PRE_NORM = Collections.unmodifiableSet(EnumSet.of(Arch.MIMO2, Arch.STEP35,
-            Arch.STEP5));
-    /**
-     * MTP graphs that select their block by {@code nextn_layer_offset} without asserting a single block
-     * (hy-v3.cpp:236, mimo2.cpp:265, step35.cpp:365); every other MTP graph asserts {@code n_layer_nextn == 1}.
-     */
-    private static final Set<Arch> CHAINED_HEADS = Collections.unmodifiableSet(EnumSet.of(Arch.HY_V3, Arch.MIMO2,
-            Arch.STEP35));
-    /**
-     * MTP heads that cycle their blocks (vLLM {@code spec_step_idx % num_mtp_layers}): draft step {@code k} runs
-     * block {@code k mod n}, each block with its own caches: exaone4_5_mtp.py:119, exaone_moe_mtp.py:114,
-     * bailing_moe_mtp.py:177, deepseek_mtp.py:217 (GLM-4 MoE Lite) and the dots3_note predictor over
-     * deepseek_v32's.
-     */
-    private static final Set<Arch> CYCLING_HEADS = Collections.unmodifiableSet(EnumSet.of(Arch.EXAONE4,
-            Arch.EXAONE_MOE, Arch.BAILINGMOE2, Arch.DOTS3NOTE, Arch.DEEPSEEK2, Arch.STEP5));
-    /**
-     * MTP heads over the flattened hyper-connection streams of the trunk output, whose block keeps the streams
-     * (deepseek4.cpp:1376, 1407-1427; qwen4exp.cpp:530, 581-588).
-     */
-    private static final Set<Arch> HC_STREAM = Collections.unmodifiableSet(EnumSet.of(Arch.DEEPSEEK4,
-            Arch.QWEN4EXP));
-    /**
-     * Hyper-connection targets whose MTP head reads the stream mean after the output norm and whose block has no
-     * hyper-connections (glm5-next.cpp:566, 785-798).
-     */
-    private static final Set<Arch> HC_MEAN_TARGET = Collections.unmodifiableSet(EnumSet.of(Arch.GLM5_NEXT));
-    /**
      * False feeds the heads their target rows through the host again on a shared device, restoring the batch path
      * ({@code neuralfree.draft.mtp.device.rows}; llama.cpp's {@code LLAMA_MTP_H_DEVICE=0}).
      */
@@ -176,7 +135,7 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
 
     /** True when {@code arch}'s MTP head cycles its blocks, one block per draft step, instead of chaining them. */
     public static boolean cyclesBlocks(Arch arch) {
-        return CYCLING_HEADS.contains(arch);
+        return NextnArchitectures.cyclesHeads(arch);
     }
 
     /** The tensors and layer one NextN block's head runs. Immutable. */
@@ -345,13 +304,13 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
                     + targetSpec.nLayer() + " trunk layers)");
         }
         String name = arch.ggufName();
-        boolean hcStream = HC_STREAM.contains(arch);
+        boolean hcStream = NextnArchitectures.hcStream(arch);
         if (arch == Arch.DEEPSEEK41) {
             // models/deepseek41.cpp:221-224: no MTP graph; the DSpark draft is a separate DFLASH file
             throw new UnsupportedOperationException(name + " has no MTP graph: its DSpark draft is a separate DFLASH"
                     + " GGUF used with the dflash draft type (models/deepseek41.cpp:221-224)");
         }
-        if (!POST_NORM_TARGET.contains(arch) && !PRE_NORM.contains(arch) && !hcStream) {
+        if (!NextnArchitectures.postNormTarget(arch) && !NextnArchitectures.preNorm(arch) && !hcStream) {
             throw new UnsupportedOperationException(name + " has no NextN/MTP draft graph in llama.cpp");
         }
         List<LayerSpec> nextn = spec.nextnLayers();
@@ -360,7 +319,7 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
                     + " blocks are missing from the file)");
         }
         boolean multi = nextn.size() > 1;
-        if (multi && !CHAINED_HEADS.contains(arch) && !CYCLING_HEADS.contains(arch)) {
+        if (multi && !NextnArchitectures.chainsHeads(arch) && !NextnArchitectures.cyclesHeads(arch)) {
             String why = arch == Arch.QWEN2
                     ? "MiMo's MTP head predicts one token per step (vLLM mimo_mtp.py)"
                     : "its MTP graph runs a single block (llama.cpp asserts n_layer_nextn == 1)";
@@ -369,7 +328,7 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
         if (targetSpec.layers().isEmpty()) {
             throw new IllegalArgumentException(name + " has no trunk to draft for");
         }
-        this.cycling = multi && CYCLING_HEADS.contains(arch);
+        this.cycling = multi && NextnArchitectures.cyclesHeads(arch);
         this.chained = multi && !cycling;
         ModelHparams hp = spec.hparams();
         this.nEmbd = hp.nEmbd();
@@ -380,23 +339,23 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
         this.tapWidth = targetSpec.layers().get(targetSpec.layers().size() - 1).residual().streamWidth();
         this.streams = hcStream ? hcStreams(nextn.get(0), name) : 1;
         this.hWidth = Math.multiplyExact(streams, nEmbd);
-        this.meanStreams = HC_MEAN_TARGET.contains(arch) ? tapStreams(name) : 1;
+        this.meanStreams = NextnArchitectures.hcMeanTarget(arch) ? tapStreams(name) : 1;
         if (meanStreams == 1 && tapWidth != hWidth) {
             throw new IllegalArgumentException(name + ": the trunk ends with rows of " + tapWidth + " floats, the MTP"
                     + " head reads " + hWidth);
         }
-        this.hFromBlock = PRE_NORM.contains(arch) || hcStream;
+        this.hFromBlock = NextnArchitectures.preNorm(arch) || hcStream;
         // cohere2moe.cpp:295 picks the norm type from f_norm_rms_eps; the nemotron-h-moe head norm is LLM_NORM
         // (nemotron-h-moe.cpp:142)
         NormKind cohere = hp.normRmsEps() == 0f ? NormKind.LAYER : NormKind.RMS;
         this.inNorm = arch == Arch.COHERE2MOE ? cohere : NormKind.RMS;
-        this.inEps = eps(hp, inNorm);
+        this.inEps = NextnArchitectures.eps(hp, inNorm);
         this.headNorm = arch == Arch.COHERE2MOE ? cohere : arch == Arch.NEMOTRON_H_MOE ? NormKind.LAYER : NormKind.RMS;
-        this.headEps = eps(hp, headNorm);
+        this.headEps = NextnArchitectures.eps(hp, headNorm);
         // the target's own output norm (cohere2moe.cpp:258, nemotron-h.cpp:259, glm5-next.cpp:793, RMS elsewhere)
         this.targetNormKind = arch == Arch.COHERE2MOE ? cohere : NormKind.RMS;
-        this.targetNormEps = eps(hp, targetNormKind);
-        this.targetNormed = POST_NORM_TARGET.contains(arch);
+        this.targetNormEps = NextnArchitectures.eps(hp, targetNormKind);
+        this.targetNormed = NextnArchitectures.postNormTarget(arch);
         this.logitScale = arch == Arch.COHERE2MOE && hp.logitScale() != 0f ? hp.logitScale() : 1f;
         List<Block> bs = new ArrayList<>(nextn.size());
         for (LayerSpec l : nextn) {
@@ -448,9 +407,9 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
 
     private Block block(LayerSpec l, Arch arch) {
         int wl = l.weightLayer();
-        String ehProj = nextnTensor(wl, TensorNames.NEXTN_EH_PROJ);
-        String enorm = nextnTensor(wl, TensorNames.NEXTN_ENORM);
-        String hnorm = nextnTensor(wl, TensorNames.NEXTN_HNORM);
+        String ehProj = NextnArchitectures.nextnTensor(wl, TensorNames.NEXTN_EH_PROJ);
+        String enorm = NextnArchitectures.nextnTensor(wl, TensorNames.NEXTN_ENORM);
+        String hnorm = NextnArchitectures.nextnTensor(wl, TensorNames.NEXTN_HNORM);
         for (String t : new String[]{ehProj, enorm, hnorm}) {
             if (!head.has(source, t)) {
                 throw new IllegalArgumentException(arch.ggufName() + ": the MTP block lacks " + t);
@@ -478,9 +437,9 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
                     HcSubBlock.forNextnGatedHead(spec, l));
         }
         required(modelEmbd, "token_embd");
-        String ownEmbd = nextnTensor(wl, TensorNames.NEXTN_EMBED_TOKENS);
+        String ownEmbd = NextnArchitectures.nextnTensor(wl, TensorNames.NEXTN_EMBED_TOKENS);
         String embedTable = head.has(source, ownEmbd) ? ownEmbd : modelEmbd;
-        String ownHead = nextnTensor(wl, TensorNames.NEXTN_SHARED_HEAD_HEAD);
+        String ownHead = NextnArchitectures.nextnTensor(wl, TensorNames.NEXTN_SHARED_HEAD_HEAD);
         String headWeight = head.has(source, ownHead) ? ownHead : required(modelHead, "the LM head");
         HcSubBlock hcHead = null;
         if (arch == Arch.DEEPSEEK4) {
@@ -516,14 +475,6 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
                     + " with the model's output_hc_* weights, the model head is " + h);
         }
         return h;
-    }
-
-    private static float eps(ModelHparams hp, NormKind kind) {
-        return kind == NormKind.LAYER ? hp.normEps() : hp.normRmsEps();
-    }
-
-    private static String nextnTensor(int wl, String base) {
-        return TensorNames.layerName(wl, TensorNames.weight(base));
     }
 
     /**
@@ -575,39 +526,11 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
     }
 
     /**
-     * The head-norm tensor of NextN block {@code wl}. bailingmoe3 loads its head norm from the block's
-     * {@code layer_output_norm} and requires it (bailingmoe3.cpp:152, 430, 548). Every other head takes
-     * {@code nextn.shared_head_norm}, which nemotron_h_moe requires; else mimo2's or bailingmoe2's
-     * {@code layer_output_norm} (mimo2.cpp:384-386, bailing_moe_mtp.py {@code final_layernorm}); else the target's
-     * {@code output_norm}.
-     *
-     * @param present    whether the target file holds a tensor
-     * @param outputNorm name of the target's {@code output_norm}, or null when it has none
-     * @throws IllegalArgumentException when the tensor the architecture needs is missing
+     * The head-norm tensor of NextN block {@code wl}
+     * ({@link NextnArchitectures#headNormWeight(Arch, int, Predicate, String)}).
      */
     static String headNormWeight(Arch arch, int wl, Predicate<String> present, String outputNorm) {
-        String layerOut = TensorNames.layerName(wl, TensorNames.weight(TensorNames.LAYER_OUT_NORM));
-        if (arch == Arch.BAILINGMOE3) {
-            return requireHeadNorm(arch, present, layerOut, layerOut);
-        }
-        String shared = nextnTensor(wl, TensorNames.NEXTN_SHARED_HEAD_NORM);
-        if (arch == Arch.NEMOTRON_H_MOE) {
-            return requireHeadNorm(arch, present, shared, shared);
-        }
-        if (present.test(shared)) {
-            return shared;
-        }
-        if ((arch == Arch.MIMO2 || arch == Arch.BAILINGMOE2) && present.test(layerOut)) {
-            return layerOut;
-        }
-        return requireHeadNorm(arch, present, outputNorm, "a head norm");
-    }
-
-    private static String requireHeadNorm(Arch arch, Predicate<String> present, String tensor, String what) {
-        if (tensor == null || !present.test(tensor)) {
-            throw new IllegalArgumentException(arch.ggufName() + ": the MTP head needs " + what);
-        }
-        return tensor;
+        return NextnArchitectures.headNormWeight(arch, wl, present, outputNorm);
     }
 
     @Override
@@ -1439,7 +1362,7 @@ public final class NextnDraftModel implements DraftModel, DraftProbs {
         int rows = m - skip;
         Block block = blocks.get(0);
         boolean ownHead = block.headWeight.equals(
-                nextnTensor(block.layer.weightLayer(), TensorNames.NEXTN_SHARED_HEAD_HEAD));
+                NextnArchitectures.nextnTensor(block.layer.weightLayer(), TensorNames.NEXTN_SHARED_HEAD_HEAD));
         for (int c = 0; c < rows; c += stepRows) {
             int len = Math.min(stepRows, rows - c);
             float[] pairs = new float[Math.multiplyExact(len, hWidth)];

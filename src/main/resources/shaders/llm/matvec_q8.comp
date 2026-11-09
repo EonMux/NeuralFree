@@ -15,10 +15,20 @@
  *                  [0, n_tokens); the input holds n_tokens consecutive Q8_1 rows (n_tokens in
  *                  [1, NF_MVQN_MAX], NF_MVQN_MAX mirrors NF_MVQN_MAX of kernels/llm/common/config.h)
  *                  and the weight row is read once for the whole token group, its token loop
- *                  unrolled over NF_MVQN_MAX with the uniform j < n_tokens guard
+ *                  unrolled over NF_MVQN_MAX with the uniform j < n_tokens guard. The counted
+ *                  variants ({T}_MatVecN<nc>_Q8, nc in [2, NF_MVQN_MAX], the counts a type's
+ *                  variant rows instantiate) compile with NC set: the token loops fold to NC live
+ *                  tokens, the guards drop out and the push block keeps the two-scalar form (a
+ *                  launch passes n_tokens = nc).
  *   OP_MATVEC2     same arguments and result, two rows per workgroup: global = ceil(out_dim / 2) * L,
  *                  pair p covers rows 2p and 2p+1 (the tail pair of an odd out_dim repeats the last
  *                  row's weights and drops its store), so the Q8_1 row is read once per two rows
+ *   OP_MATVEC2N    (i out_dim, i in_dim, R weight, R uchar input, W float output) with NC set: the
+ *                  counted twin of OP_MATVEC2 over the nc activation rows ({T}_MatVec2N<nc>_Q8,
+ *                  global = ceil(out_dim / 2) * L, the tail pair repeats the last row's weights and
+ *                  rewrites its outputs with the identical values); each row's token group takes
+ *                  the exact OP_MATVECN reduction, so token j's outputs are the stacked single-row
+ *                  values. Without NC it does not compile.
  *   OP_MATVEC_ADD  (i out_dim, i in_dim, R weight, R uchar input, float addend_output)
  *                  addend_output[row] += dot(weight row, dequant(input))
  *   OP_GATEUP_SILU (i out_dim, i in_dim, R gate_weight, R up_weight, R uchar input, W float output)
@@ -26,12 +36,12 @@
  *   OP_GATEUP2_Q8  same arguments and result as OP_GATEUP_SILU, two rows per workgroup:
  *                  global = ceil(out_dim / 2) * L, pair p covers rows 2p and 2p+1 of both weights
  * The input is one Q8_1 row of in_dim elements (36-byte blocks as written by LLM_QuantizeQ8_1;
- * OP_MATVECN takes n_tokens of them back to back).
+ * OP_MATVECN and OP_MATVEC2N take n_tokens / nc of them back to back).
  * A block contributes d8 * sum_k(w_code_k * q8_k) * scale, the weight codes taken from the block
  * without a float decode, exactly as in the OpenCL kernels.
  *
  * Dispatch: 1-D, global = out_dim * L, local = {L, 1, 1}, one workgroup per output row (folded
- * group counts are recovered by nf_wg_id()); OP_MATVEC2 and OP_GATEUP2_Q8 use global =
+ * group counts are recovered by nf_wg_id()); OP_MATVEC2, OP_MATVEC2N and OP_GATEUP2_Q8 use global =
  * ceil(out_dim / 2) * L, one workgroup per row pair. The block/invocation mapping equals the OpenCL
  * kernels' for every L.
  */
@@ -51,7 +61,8 @@ NF_BUFFER_VIEWS(0, w)
 NF_BUFFER_VIEWS(1, u)
 NF_BUFFER_VIEWS(2, xq)
 layout(std430, binding = 3) writeonly buffer NfQ8Output { float y_out[]; };
-#elif OP == OP_MATVEC || OP == OP_MATVECN || OP == OP_MATVEC2 || OP == OP_MATVEC_ADD
+#elif OP == OP_MATVEC || OP == OP_MATVECN || OP == OP_MATVEC2 || OP == OP_MATVEC2N \
+        || OP == OP_MATVEC_ADD
 NF_BUFFER_VIEWS(0, w)
 NF_BUFFER_VIEWS(1, xq)
 #if OP == OP_MATVEC_ADD
@@ -60,10 +71,11 @@ layout(std430, binding = 2) buffer NfQ8Output { float y_out[]; };
 layout(std430, binding = 2) writeonly buffer NfQ8Output { float y_out[]; };
 #endif
 #else
-#error "matvec_q8.comp: OP must be OP_MATVEC, OP_MATVECN, OP_MATVEC2, OP_MATVEC_ADD, OP_GATEUP_SILU or OP_GATEUP2_Q8"
+#error "matvec_q8.comp: OP must be OP_MATVEC, OP_MATVECN, OP_MATVEC2, OP_MATVEC2N, OP_MATVEC_ADD, OP_GATEUP_SILU or OP_GATEUP2_Q8"
 #endif
-/* OP_MATVECN takes the token count as a third scalar; the other ops keep the two-scalar block. */
-#if OP == OP_MATVECN
+/* OP_MATVECN takes the token count as a third scalar (the NC-exact variants fold it into the code
+ * and keep the two-scalar block); the other ops keep the two-scalar block. */
+#if OP == OP_MATVECN && !defined(NC)
 layout(push_constant) uniform NfQ8Params { int out_dim; int in_dim; int n_tokens; } pc;
 #else
 layout(push_constant) uniform NfQ8Params { int out_dim; int in_dim; } pc;
@@ -72,6 +84,31 @@ layout(push_constant) uniform NfQ8Params { int out_dim; int in_dim; } pc;
 /* Token rows per OP_MATVECN launch, mirroring NF_MVQN_MAX (kernels/llm/common/config.h). */
 #ifndef NF_MVQN_MAX
 #define NF_MVQN_MAX 16u
+#endif
+
+/* The exact-token-count variants compile with NC set (the launch's n_tokens): the token loops fold
+ * to NC live tokens and the j < n_tokens guards drop out. OP_MATVEC2N has only counted variants;
+ * the generic OP_MATVECN keeps the runtime count. */
+#if defined(NC) && (OP == OP_MATVECN || OP == OP_MATVEC2N)
+#undef NF_MVQN_MAX
+#define NF_MVQN_MAX NC
+#define NF_Q8_NTOKENS NF_MVQN_MAX
+#elif OP == OP_MATVEC2N
+#error "matvec_q8.comp: OP_MATVEC2N compiles only with NC set (the counted two-row matvec)"
+#else
+#define NF_Q8_NTOKENS min(uint(pc.n_tokens), NF_MVQN_MAX)
+#endif
+
+#if OP == OP_MATVECN || OP == OP_MATVEC2N
+/* Workgroup width bound for the matvec local size, mirroring LLM_DIMX (kernels/llm/common/config.h);
+ * the dispatch local size never exceeds it. */
+#ifndef NF_Q8_LMAX
+#define NF_Q8_LMAX 256u
+#endif
+/* One slot per invocation for every live token of the single-pass group reduction (the twin of
+ * IQ_MVQN_TREE's tree form in kernels/llm/common/matvec_family.h): NF_MVQN_MAX * local size floats
+ * at most, the 16 KiB floor Vulkan guarantees for shared memory at the full local size. */
+shared float nf_q8n[NF_MVQN_MAX * NF_Q8_LMAX];
 #endif
 
 #include "common/quant_blocks.glsl"
@@ -117,13 +154,70 @@ void nf_q8_pair_partial(uint bp0, uint bp1, uint blk, uint ltid, inout float p0,
     p1 += qt_dot_q8(NF_WS_A, bp1, blk, ltid);
 }
 
+#if OP == OP_MATVECN || OP == OP_MATVEC2N
+/* One row's token group reduction over nf_q8n: the nf_wg_sum steps applied to every live token in
+ * lockstep (the twin of the single-row OP_MATVEC's per-token nf_wg_sum, so token j's result is
+ * that exact reduction), lane 0 storing every token's group sum. Callers barrier between two
+ * calls: a pass's final reads race the next pass's first nf_q8n writes otherwise. */
+void nf_q8_tree_n(const uint lid, const uint lsize, const uint ntok, float ps[NF_MVQN_MAX],
+                  const uint row, const uint out_dim) {
+    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+        if (j < ntok) {
+            nf_q8n[j * lsize + lid] = ps[j];
+        }
+    }
+    barrier();
+#if defined(USE_SUBGROUPS)
+    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+        if (j < ntok) ps[j] = subgroupAdd(ps[j]);
+    }
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+            if (j < ntok) nf_q8n[j * lsize + gl_SubgroupID] = ps[j];
+        }
+    }
+    barrier();
+    if (lid == 0u) {
+        [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+            if (j < ntok) {
+                float acc = 0.0;
+                for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+                    acc += nf_q8n[j * lsize + i];
+                }
+                y_out[j * out_dim + row] = acc;
+            }
+        }
+    }
+#else
+    const uint span = lsize <= 1u ? 1u : (1u << (uint(findMSB(lsize - 1u)) + 1u));
+    for (uint s = span >> 1; s > 0u; s >>= 1) {
+        if (lid < s && lid + s < lsize) {
+            [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+                if (j < ntok) {
+                    nf_q8n[j * lsize + lid] += nf_q8n[j * lsize + lid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+            if (j < ntok) {
+                y_out[j * out_dim + row] = nf_q8n[j * lsize];
+            }
+        }
+    }
+#endif
+}
+#endif /* OP == OP_MATVECN || OP == OP_MATVEC2N */
+
 void main() {
     nf_iq_init_shared();
 
     const uint lid = gl_LocalInvocationID.x;
     const uint out_dim = uint(pc.out_dim);
     const uint nblk = uint(pc.in_dim) / uint(QT_BS);
-#if OP == OP_MATVEC2 || OP == OP_GATEUP2_Q8
+#if OP == OP_MATVEC2 || OP == OP_GATEUP2_Q8 || OP == OP_MATVEC2N
     /* Two rows per workgroup (pair p covers rows 2p and 2p+1): the Q8_1 row is read once per two
      * weight rows. The tail pair of an odd row count repeats the last row's weights and drops its
      * second store, so control flow stays uniform. */
@@ -137,7 +231,31 @@ void main() {
     const uint rbase0 = row0 * row_bytes;
     const uint rbase1 = row1 * row_bytes;
     const uint pairs = nblk * uint(QT_TPS);
-#if OP == OP_MATVEC2
+#if OP == OP_MATVEC2N
+    /* Two weight rows per workgroup over the nc token rows the variants row pins: the block loop
+     * streams both rows and dots every streamed block against every live activation block into two
+     * per-token register partials, so the Q8_1 rows are read once per two weight rows, and each
+     * row's group reduction is the exact OP_MATVECN sequence (token j's outputs are the stacked
+     * single-row values). The tail pair of an odd row count repeats the last row's weights; its
+     * second pass rewrites row0's outputs with the identical values it computed. */
+    float ps0[NF_MVQN_MAX];
+    float ps1[NF_MVQN_MAX];
+    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+        ps0[j] = 0.0;
+        ps1[j] = 0.0;
+    }
+    for (uint t = lid; t < pairs; t += gl_WorkGroupSize.x) {
+        const uint b = t / uint(QT_TPS);
+        const uint ltid = t % uint(QT_TPS);
+        [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
+            ps0[j] += qt_dot_q8(NF_WS_A, rbase0 + b * uint(QT_BB), j * nblk + b, ltid);
+            ps1[j] += qt_dot_q8(NF_WS_A, rbase1 + b * uint(QT_BB), j * nblk + b, ltid);
+        }
+    }
+    nf_q8_tree_n(lid, gl_WorkGroupSize.x, NF_Q8_NTOKENS, ps0, row0, out_dim);
+    barrier();
+    nf_q8_tree_n(lid, gl_WorkGroupSize.x, NF_Q8_NTOKENS, ps1, row1, out_dim);
+#elif OP == OP_MATVEC2
     float ps0 = 0.0;
     float ps1 = 0.0;
     for (uint t = lid; t < pairs; t += gl_WorkGroupSize.x) {
@@ -197,8 +315,12 @@ void main() {
 #if OP == OP_MATVECN
     /* One weight row against n_tokens Q8_1 rows: the block loop streams the weight row once and
      * dots each block against every live activation block ([[unroll]] keeps the accumulators in
-     * registers); token j's activation blocks sit at j * nblk + b. */
-    const uint ntok = min(uint(pc.n_tokens), NF_MVQN_MAX);
+     * registers); token j's activation blocks sit at j * nblk + b. The whole token group is then
+     * reduced in one pass over nf_q8n (the twin of IQ_MVQN_TREE's tree form in
+     * kernels/llm/common/matvec_family.h): a per-token nf_wg_sum pays its barrier chain for every
+     * token of every weight row, so all tokens' slots instead take the same nf_wg_sum steps in
+     * lockstep and lane 0 writes the group's outputs. */
+    const uint ntok = NF_Q8_NTOKENS;
     const uint pairs = nblk * uint(QT_TPS);
     float ps[NF_MVQN_MAX];
     [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
@@ -214,14 +336,7 @@ void main() {
             }
         }
     }
-    [[unroll]] for (uint j = 0u; j < NF_MVQN_MAX; ++j) {
-        if (j < ntok) {
-            const float o = nf_wg_sum(ps[j]);
-            if (lid == 0u) {
-                y_out[j * out_dim + row] = o;
-            }
-        }
-    }
+    nf_q8_tree_n(lid, gl_WorkGroupSize.x, ntok, ps, row, out_dim);
 #else
     const float acc = nf_wg_sum(nf_q8_row_partial(NF_WS_A, rbase, nblk));
     if (lid == 0u) {

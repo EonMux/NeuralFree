@@ -8,8 +8,8 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -65,15 +65,15 @@ public class SwitchedLoraDeltaTest {
         return backend.allocateBuffer(n * Float.BYTES);
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] out = new int[to - from];
         for (int i = from; i < to; i++) {
             out[i - from] = d.intArg(i);
@@ -99,11 +99,11 @@ public class SwitchedLoraDeltaTest {
             backend.clearLog();
             delta.add(3, slots, x, 0, N_EMBD, y, 0, out);
 
-            List<Dispatch> ds = backend.dispatches();
+            List<FakeDispatch> ds = backend.dispatches();
             assertEquals(Arrays.asList(HeadsKernels.SWITCHED_LORA_ADD, HeadsKernels.SWITCHED_LORA_ADD), names(ds));
             ScratchSlot tmp = scratch.temp(SwitchedLoraExtra.GpuDelta.TEMP_TMP, (long) UBATCH * rank);
             for (int stage = 0; stage < 2; stage++) {
-                Dispatch d = ds.get(stage);
+                FakeDispatch d = ds.get(stage);
                 assertArrayEquals(new int[]{3, N_EMBD, out, rank, stage, nSlots, N_EMBD, 0, out, 0, tmp.offset()},
                         ints(d, 0, 11));
                 assertEquals(1.0f, d.floatArg(11), 0f);
@@ -135,7 +135,7 @@ public class SwitchedLoraDeltaTest {
             backend.clearLog();
             small.add(1, slots, x, 0, N_EMBD, y, 0, out);
 
-            for (Dispatch d : backend.dispatches()) {
+            for (FakeDispatch d : backend.dispatches()) {
                 assertSame(grown, d.bufferArg(16));
             }
             assertEquals(2, backend.dispatches().size());
@@ -154,11 +154,11 @@ public class SwitchedLoraDeltaTest {
         backend.clearLog();
         upload.write(ops, router, 0, 3, slots);
         upload.write(ops, router, 0, 3, slots);
-        assertEquals(1, backend.ops().stream().filter(o -> o.kind() == OpKind.WRITE).count());
+        assertEquals(1, backend.ops().stream().filter(o -> o.kind() == FakeOpKind.WRITE).count());
 
         router.accept(3, new int[]{7});
         upload.write(ops, router, 3, 1, slots);
-        assertEquals(2, backend.ops().stream().filter(o -> o.kind() == OpKind.WRITE).count());
+        assertEquals(2, backend.ops().stream().filter(o -> o.kind() == FakeOpKind.WRITE).count());
     }
 
     @Test
@@ -227,13 +227,13 @@ public class SwitchedLoraDeltaTest {
         SwitchedLoraExtra.GpuDelta delta = SwitchedLoraExtra.GpuDelta.ofAdapter(ops,
                 lora.delta("blk.0.attn_q.weight", 0.5f));
         try {
-            assertEquals(1, backend.ops().stream().filter(o -> o.kind() == OpKind.FILL).count());
+            assertEquals(1, backend.ops().stream().filter(o -> o.kind() == FakeOpKind.FILL).count());
             backend.clearLog();
             delta.add(2, x, 0, N_EMBD, y, 0, out);
 
-            List<Dispatch> ds = backend.dispatches();
+            List<FakeDispatch> ds = backend.dispatches();
             assertEquals(Arrays.asList(HeadsKernels.SWITCHED_LORA_ADD, HeadsKernels.SWITCHED_LORA_ADD), names(ds));
-            for (Dispatch d : ds) {
+            for (FakeDispatch d : ds) {
                 assertEquals(1, d.intArg(5));
                 assertSame(ds.get(0).bufferArg(12), d.bufferArg(12));
                 assertSame(ds.get(0).bufferArg(13), d.bufferArg(13));
@@ -260,7 +260,7 @@ public class SwitchedLoraDeltaTest {
             half.add(1, x, 0, N_EMBD, y, 0, 8);
             full.add(1, x, 0, N_EMBD, y, 0, 8);
 
-            List<Dispatch> ds = backend.dispatches();
+            List<FakeDispatch> ds = backend.dispatches();
             assertNotSame(ds.get(0).bufferArg(13), ds.get(2).bufferArg(13));
         }
     }

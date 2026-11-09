@@ -76,8 +76,8 @@ public class PoolingOverrideResourceTest {
 
     @Test
     void theOverrideCarriesIntoTheServiceKind() {
-        assertEquals(PoolingKind.MEAN, bert.poolingKind(), "the GGUF's MEAN without the override");
-        assertEquals(PoolingKind.CLS, clsBert.poolingKind());
+        assertEquals(PoolingKind.MEAN, bert.pooling().poolingKind(), "the GGUF's MEAN without the override");
+        assertEquals(PoolingKind.CLS, clsBert.pooling().poolingKind());
     }
 
     @Test
@@ -121,7 +121,7 @@ public class PoolingOverrideResourceTest {
         Map<Long, Double> biEncoder;
         EngineService mean = new EngineService(model.toString(), ServerTestSupport.config().build());
         try {
-            assertEquals(PoolingKind.MEAN, mean.poolingKind());
+            assertEquals(PoolingKind.MEAN, mean.pooling().poolingKind());
             biEncoder = relevanceScores(ok(new PoolingResource(mean).rerank(request)));
             assertEquals(2, biEncoder.size());
         } finally {
@@ -130,7 +130,7 @@ public class PoolingOverrideResourceTest {
         EngineService rank = new EngineService(model.toString(),
                 ServerTestSupport.config().pooling(PoolingKind.RANK).build());
         try {
-            assertEquals(PoolingKind.RANK, rank.poolingKind());
+            assertEquals(PoolingKind.RANK, rank.pooling().poolingKind());
             JsonView body = ok(new PoolingResource(rank).rerank(request));
             assertEquals(2, size(body, "results"));
             assertNotEquals(biEncoder, relevanceScores(body), "the classifier head scores, not the cosine");
@@ -159,7 +159,7 @@ public class PoolingOverrideResourceTest {
         EngineService last = new EngineService(bertModel.toString(),
                 ServerTestSupport.config().pooling(fromProperty.pooling()).build());
         try {
-            assertEquals(PoolingKind.LAST, last.poolingKind());
+            assertEquals(PoolingKind.LAST, last.pooling().poolingKind());
             float[] lastRow = first(new PoolingResource(last), "{\"input\": \"hello world\"}");
             float[] meanRow = first(embeddings, "{\"input\": \"hello world\"}");
             assertFalse(Arrays.equals(meanRow, lastRow), "LAST pools the last row, MEAN the average");

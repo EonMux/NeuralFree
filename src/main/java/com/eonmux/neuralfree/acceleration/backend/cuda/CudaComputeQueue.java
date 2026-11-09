@@ -31,7 +31,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static jcuda.driver.JCudaDriver.cuCtxEnablePeerAccess;
@@ -48,8 +47,6 @@ import static jcuda.driver.JCudaDriver.cuGraphInstantiate;
 import static jcuda.driver.JCudaDriver.cuGraphLaunch;
 import static jcuda.driver.JCudaDriver.cuLaunchKernel;
 import static jcuda.driver.JCudaDriver.cuMemcpyDtoDAsync;
-import static jcuda.driver.JCudaDriver.cuMemcpyDtoHAsync;
-import static jcuda.driver.JCudaDriver.cuMemcpyHtoDAsync;
 import static jcuda.driver.JCudaDriver.cuMemcpyPeerAsync;
 import static jcuda.driver.JCudaDriver.cuMemsetD32Async;
 import static jcuda.driver.JCudaDriver.cuStreamDestroy;
@@ -119,11 +116,8 @@ public final class CudaComputeQueue implements ComputeQueue {
     private final CUstream stream;
     private final QueueType queueType;
     private final boolean ownedByBackend;
-    private final Object transferLock = new Object();
     private final Object fenceLock = new Object();
-    private final CudaPinnedRing upload;
-    private final CudaPinnedRing readback;
-    private final ArrayDeque<PendingRead> pendingReads = new ArrayDeque<>();
+    private final CudaHostTransfers transfers;
     private final AtomicLong sequence = new AtomicLong();
     private final List<CudaGraph> graphs = new ArrayList<>();
     private volatile boolean closed;
@@ -183,11 +177,7 @@ public final class CudaComputeQueue implements ComputeQueue {
             this.stream = stream;
             this.queueType = type;
             this.ownedByBackend = ownedByBackend;
-            String label = type.name().toLowerCase(Locale.ROOT);
-            this.upload = new CudaPinnedRing(context, label + " upload",
-                    CudaPinnedRing.configuredMaxBytes(CudaPinnedRing.DEFAULT_UPLOAD_MB));
-            this.readback = new CudaPinnedRing(context, label + " readback",
-                    CudaPinnedRing.configuredMaxBytes(CudaPinnedRing.DEFAULT_READBACK_MB));
+            this.transfers = new CudaHostTransfers(this);
         } catch (RuntimeException e) {
             try {
                 CudaErrors.check("cuStreamDestroy", () -> cuStreamDestroy(stream));
@@ -216,6 +206,16 @@ public final class CudaComputeQueue implements ComputeQueue {
     /** The backend that owns this queue. */
     CudaComputeBackend backendOf() {
         return backend;
+    }
+
+    /** The CUDA context the queue's stream and staging rings live in. */
+    CudaContext context() {
+        return context;
+    }
+
+    /** Marks the queue closed; called by {@link CudaHostTransfers} under the transfer lock. */
+    void markClosed() {
+        closed = true;
     }
 
     /**
@@ -719,11 +719,8 @@ public final class CudaComputeQueue implements ComputeQueue {
      * @throws RuntimeException      the first translated driver failure, after every step was attempted
      */
     public void closeInternal() {
-        synchronized (transferLock) {
-            if (closed) {
-                return;
-            }
-            closed = true;
+        if (!transfers.beginClose()) {
+            return;
         }
         if (capture == Capture.CAPTURING) {
             discardCapture();
@@ -744,19 +741,7 @@ public final class CudaComputeQueue implements ComputeQueue {
             failure = e;
         }
         stopFences();
-        synchronized (transferLock) {
-            try {
-                if (drained) {
-                    retireReadsLocked(Long.MAX_VALUE);
-                } else {
-                    dropPendingReads();
-                }
-            } catch (RuntimeException e) {
-                failure = Closeables.chain(failure, e);
-            }
-            failure = closeRing(upload, failure);
-            failure = closeRing(readback, failure);
-        }
+        failure = transfers.finishClose(drained, failure);
         try {
             destroyGraphs();
         } catch (RuntimeException e) {
@@ -807,9 +792,7 @@ public final class CudaComputeQueue implements ComputeQueue {
      * already waited for a point of this stream at or after {@code upTo}.
      */
     void retireReadsUpTo(long upTo) {
-        synchronized (transferLock) {
-            retireReadsLocked(upTo);
-        }
+        transfers.retire(upTo);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -891,7 +874,7 @@ public final class CudaComputeQueue implements ComputeQueue {
      *
      * @throws RuntimeException the translated driver failure of the record
      */
-    private CUevent beginTiming(String name) {
+    CUevent beginTiming(String name) {
         if (timing == null) {
             return null;
         }
@@ -906,7 +889,7 @@ public final class CudaComputeQueue implements ComputeQueue {
     }
 
     /** Returns a recorded start event of a failed command to the pool without measuring it. */
-    private void cancelTiming(CUevent start) {
+    void cancelTiming(CUevent start) {
         if (start != null) {
             timingPool.recycle(start);
         }
@@ -919,7 +902,7 @@ public final class CudaComputeQueue implements ComputeQueue {
      *
      * @throws RuntimeException the translated driver failure of the record
      */
-    private void endTiming(CUevent start, String name) {
+    void endTiming(CUevent start, String name) {
         if (start == null) {
             return;
         }
@@ -1070,7 +1053,7 @@ public final class CudaComputeQueue implements ComputeQueue {
      *
      * @throws IllegalStateException when the queue is capturing a graph
      */
-    private void requireNotCapturing(String what) {
+    void requireNotCapturing(String what) {
         if (capture == Capture.CAPTURING) {
             throw new GpuUncapturableCommandException("a " + what + " cannot be captured: perform host transfers"
                     + " and reads before beginCapture, and read results only after the graph has been launched");
@@ -1243,155 +1226,19 @@ public final class CudaComputeQueue implements ComputeQueue {
         }
     }
 
-    private GpuEvent write(GpuBuffer dst, long dstOffset, long size, HostSource source, GpuEvent[] waits) {
-        enter();
-        requireNotCapturing("a host write");
-        uncapturable("a host write");
-        CUdeviceptr device = devicePointer(dst, "write destination");
-        checkDeviceRange(dst, dstOffset, size, "write destination");
-        validateWaits(waits);
-        synchronized (transferLock) {
-            applyWaits(waits);
-            CudaGpuEvent last = null;
-            long done = 0;
-            try {
-                while (done < size) {
-                    int n = (int) Math.min(size - done, upload.maxSliceBytes());
-                    CudaPinnedRing.Slice slice = upload.acquire(n);
-                    CUdeviceptr target = device.withByteOffset(dstOffset + done);
-                    CUevent timedStart = beginTiming("memcpy HtoD");
-                    try {
-                        source.copyInto(slice.byteBuffer(), done, n);
-                        Pointer staged = slice.pointer();
-                        CudaErrors.check("cuMemcpyHtoDAsync", () -> cuMemcpyHtoDAsync(target, staged, n, stream));
-                    } catch (RuntimeException e) {
-                        cancelTiming(timedStart);
-                        slice.release();
-                        throw e;
-                    }
-                    endTiming(timedStart, "memcpy HtoD");
-                    CudaGpuEvent event = recordAfterCopy(slice);
-                    slice.releaseAfter(event.share());
-                    if (last != null) {
-                        last.close();
-                    }
-                    last = event;
-                    done += n;
-                }
-            } catch (RuntimeException e) {
-                if (last != null) {
-                    last.close();
-                }
-                throw e;
-            }
-            return last;
-        }
+    private GpuEvent write(GpuBuffer dst, long dstOffset, long size, CudaHostTransfers.HostSource source,
+                           GpuEvent[] waits) {
+        return transfers.write(dst, dstOffset, size, source, waits);
     }
 
-    private GpuEvent read(GpuBuffer src, long srcOffset, long size, HostSink sink, GpuEvent[] waits) {
-        enter();
-        requireNotCapturing("a host read");
-        uncapturable("a host read");
-        CUdeviceptr device = devicePointer(src, "read source");
-        checkDeviceRange(src, srcOffset, size, "read source");
-        validateWaits(waits);
-        synchronized (transferLock) {
-            applyWaits(waits);
-            CudaGpuEvent last = null;
-            long done = 0;
-            try {
-                while (done < size) {
-                    int n = (int) Math.min(size - done, readback.maxSliceBytes());
-                    CudaPinnedRing.Slice slice = acquireReadSlice(n);
-                    CUdeviceptr origin = device.withByteOffset(srcOffset + done);
-                    CUevent timedStart = beginTiming("memcpy DtoH");
-                    try {
-                        Pointer staged = slice.pointer();
-                        CudaErrors.check("cuMemcpyDtoHAsync", () -> cuMemcpyDtoHAsync(staged, origin, n, stream));
-                    } catch (RuntimeException e) {
-                        cancelTiming(timedStart);
-                        slice.release();
-                        throw e;
-                    }
-                    endTiming(timedStart, "memcpy DtoH");
-                    CudaGpuEvent event = recordAfterCopy(slice);
-                    pendingReads.addLast(new PendingRead(event.share(), slice, sink, done, n));
-                    if (last != null) {
-                        last.close();
-                    }
-                    last = event;
-                    done += n;
-                }
-            } catch (RuntimeException e) {
-                if (last != null) {
-                    last.close();
-                }
-                throw e;
-            }
-            return last;
-        }
+    private GpuEvent read(GpuBuffer src, long srcOffset, long size, CudaHostTransfers.HostSink sink,
+                          GpuEvent[] waits) {
+        return transfers.read(src, srcOffset, size, sink, waits);
     }
 
-    /** A readback slice; when the ring is full of unretired reads, waits for the oldest and retires it. */
-    private CudaPinnedRing.Slice acquireReadSlice(int n) {
-        CudaPinnedRing.Slice slice = readback.tryAcquire(n);
-        while (slice == null) {
-            PendingRead oldest = pendingReads.peekFirst();
-            if (oldest == null) {
-                throw new IllegalStateException("CUDA " + queueType + " readback ring is full without pending reads");
-            }
-            oldest.event.synchronize();
-            retireReadsLocked(oldest.sequence);
-            slice = readback.tryAcquire(n);
-        }
-        return slice;
-    }
-
-    /**
-     * Records the event that follows a staged copy. When recording fails, the slice is
-     * returned to its ring only after the stream drained, so in-flight memory is never reused.
-     */
-    private CudaGpuEvent recordAfterCopy(CudaPinnedRing.Slice slice) {
-        try {
-            return record();
-        } catch (RuntimeException e) {
-            try {
-                CudaErrors.check("cuStreamSynchronize", () -> cuStreamSynchronize(stream));
-                slice.release();
-            } catch (RuntimeException drain) {
-                e.addSuppressed(drain);
-            }
-            throw e;
-        }
-    }
-
-    private CudaGpuEvent record() {
+    /** Records an event at the stream's current point; the event retires this queue's pending reads. */
+    CudaGpuEvent record() {
         return events.record(stream, this);
-    }
-
-    private void retireReadsLocked(long upTo) {
-        RuntimeException failure = null;
-        while (!pendingReads.isEmpty() && pendingReads.peekFirst().sequence <= upTo) {
-            try {
-                pendingReads.pollFirst().complete();
-            } catch (RuntimeException e) {
-                failure = Closeables.chain(failure, e);
-            }
-        }
-        if (failure != null) {
-            throw failure;
-        }
-    }
-
-    /** Discards reads whose copies did not provably finish; their destinations stay unwritten. */
-    private void dropPendingReads() {
-        if (!pendingReads.isEmpty()) {
-            LOGGER.warn("CUDA {} queue closed with {} unfinished reads; their destinations were not written",
-                    queueType, pendingReads.size());
-        }
-        while (!pendingReads.isEmpty()) {
-            pendingReads.pollFirst().event.close();
-        }
     }
 
     /**
@@ -1405,21 +1252,12 @@ public final class CudaComputeQueue implements ComputeQueue {
         backend.onQueueReleased(this);
     }
 
-    private static RuntimeException closeRing(CudaPinnedRing ring, RuntimeException failure) {
-        try {
-            ring.close();
-            return failure;
-        } catch (RuntimeException e) {
-            return Closeables.chain(failure, e);
-        }
-    }
-
     /**
      * Refuses a command the captured sequence does not contain while a replay is recording. A caller's
      * command that reaches this method during a replay is not part of the capture, so the replay cannot
      * produce the same device work and the caller captures the step again.
      */
-    private void uncapturable(String op) {
+    void uncapturable(String op) {
         if (capture == Capture.NONE) {
             return;
         }
@@ -1512,7 +1350,7 @@ public final class CudaComputeQueue implements ComputeQueue {
      *
      * @throws IllegalStateException when either is closed
      */
-    private void enter() {
+    void enter() {
         if (closed) {
             throw new IllegalStateException("CUDA " + queueType + " queue already closed");
         }
@@ -1531,7 +1369,7 @@ public final class CudaComputeQueue implements ComputeQueue {
         return handle;
     }
 
-    private CUdeviceptr devicePointer(GpuBuffer buffer, String role) {
+    CUdeviceptr devicePointer(GpuBuffer buffer, String role) {
         return ownCudaBuffer(buffer, role).getCUDevicePtr();
     }
 
@@ -1551,7 +1389,7 @@ public final class CudaComputeQueue implements ComputeQueue {
         return cuda;
     }
 
-    private static void checkDeviceRange(GpuBuffer buffer, long offset, long size, String role) {
+    static void checkDeviceRange(GpuBuffer buffer, long offset, long size, String role) {
         if (offset < 0) {
             throw new IllegalArgumentException(role + " offset must not be negative, got " + offset);
         }
@@ -1577,42 +1415,4 @@ public final class CudaComputeQueue implements ComputeQueue {
         }
     }
 
-    /** Copies {@code n} host bytes starting at byte {@code from} into a staging view. */
-    private interface HostSource {
-        void copyInto(ByteBuffer staging, long from, int n);
-    }
-
-    /** Copies {@code n} bytes of a staging view into the host destination at byte {@code to}. */
-    private interface HostSink {
-        void copyFrom(ByteBuffer staging, long to, int n);
-    }
-
-    /** A device-to-host copy whose destination is filled once its stream point is reached. */
-    private static final class PendingRead {
-        private final CudaGpuEvent event;
-        private final long sequence;
-        private final CudaPinnedRing.Slice slice;
-        private final HostSink sink;
-        private final long hostOffset;
-        private final int size;
-
-        PendingRead(CudaGpuEvent event, CudaPinnedRing.Slice slice, HostSink sink, long hostOffset, int size) {
-            this.event = event;
-            this.sequence = event.sequence();
-            this.slice = slice;
-            this.sink = sink;
-            this.hostOffset = hostOffset;
-            this.size = size;
-        }
-
-        /** Copies the staged bytes to the destination and hands back the slice and event. */
-        void complete() {
-            try {
-                sink.copyFrom(slice.byteBuffer(), hostOffset, size);
-            } finally {
-                slice.release();
-                event.close();
-            }
-        }
-    }
 }

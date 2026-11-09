@@ -162,7 +162,7 @@ public class LlamaCppResource {
         body.put("total_slots", service.slots());
         body.put("default_generation_settings", total);
         body.put("chat_template", service.chatTemplate());
-        body.put("chat_template_caps", service.dualEncoder() ? null : service.chatTemplateCaps().toMap());
+        body.put("chat_template_caps", service.pooling().dualEncoder() ? null : service.chatTemplateCaps().toMap());
         putMedia(body);
         putWebUi(body);
         appendReplicas(body, replicaSlots);

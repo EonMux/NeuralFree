@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 import com.eonmux.neuralfree.gguf.quant.InputTransform;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.Test;
 
 import java.util.List;
@@ -86,7 +87,7 @@ public class StaticInt8GemmDispatchTest {
     }
 
     private static List<String> kernelNames(FakeComputeBackend backend) {
-        return backend.dispatches().stream().map(FakeComputeBackend.Dispatch::kernelName)
+        return backend.dispatches().stream().map(FakeDispatch::kernelName)
                 .collect(Collectors.toList());
     }
 }

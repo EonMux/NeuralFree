@@ -123,7 +123,7 @@ public class BackendSelectorTest {
 
     @Test
     public void inventoryIncompleteOnCudaAndVulkanSelectsOpenClOnTheSameDevice() {
-        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, null,
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, false, null,
                 rejecting(BackendType.VULKAN, BackendType.CUDA));
 
         assertEquals(BackendType.OPENCL, s.backend.backendType());
@@ -139,8 +139,52 @@ public class BackendSelectorTest {
     }
 
     @Test
-    public void vulkanIsPreferredOnTheTargetDevice() {
-        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, null,
+    public void theNativeApiLeadsTheDefaultOrderOnAnNvidiaTarget() {
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, true, null,
+                BackendRequirement.ANY);
+
+        assertEquals(BackendType.CUDA, s.backend.backendType());
+        assertSame(RTX_CUDA, s.chosen.identity);
+        assertFalse("the Vulkan view is never built while CUDA runs the target",
+                fakeOf(BackendType.VULKAN, RTX_VULKAN.name()).created);
+        assertTrue(s.reasons.isEmpty());
+    }
+
+    @Test
+    public void theDefaultOrderContinuesAfterARejectedNativeApi() {
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, true, null,
+                rejecting(BackendType.CUDA));
+
+        assertEquals(BackendType.VULKAN, s.backend.backendType());
+        assertSame(RTX_VULKAN, s.chosen.identity);
+        assertTrue(fakeOf(BackendType.CUDA, RTX_CUDA.name()).closed);
+        assertEquals("CUDA on '" + RTX_CUDA.name() + "': " + INVENTORY_INCOMPLETE, s.reasons.get(0));
+    }
+
+    @Test
+    public void aVendorWithoutANativeApiKeepsTheDefaultOrder() {
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, true, "INTEL",
+                BackendRequirement.ANY);
+
+        assertEquals(BackendType.VULKAN, s.backend.backendType());
+        assertSame(IGPU_VULKAN, s.chosen.identity);
+    }
+
+    @Test
+    public void nativeFirstMovesOnlyAListedNativeApi() {
+        List<BackendType> order = Arrays.asList(BackendType.VULKAN, BackendType.OPENCL, BackendType.CUDA);
+        assertEquals(Arrays.asList(BackendType.CUDA, BackendType.VULKAN, BackendType.OPENCL),
+                BackendSelector.nativeFirst(order, RTX_VULKAN));
+        assertSame("Intel has no native API", order, BackendSelector.nativeFirst(order, IGPU_VULKAN));
+        List<BackendType> noCuda = Arrays.asList(BackendType.VULKAN, BackendType.OPENCL);
+        assertSame("an order without CUDA stays as written", noCuda, BackendSelector.nativeFirst(noCuda, RTX_VULKAN));
+        assertEquals(BackendType.CUDA, BackendSelector.nativeApi(RTX_OPENCL));
+        assertNull(BackendSelector.nativeApi(IGPU_OPENCL));
+    }
+
+    @Test
+    public void anOrderFollowedAsWrittenPrefersItsFirstApiOnTheTarget() {
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, false, null,
                 BackendRequirement.ANY);
 
         assertEquals(BackendType.VULKAN, s.backend.backendType());
@@ -158,7 +202,7 @@ public class BackendSelectorTest {
                 view(BackendType.OPENCL, clRtx, clRtx),
                 view(BackendType.VULKAN, vkIgpu, vkIgpu, vkRtx));
 
-        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, null,
+        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false, null,
                 BackendRequirement.ANY);
 
         assertSame(vkRtx, s.chosen);
@@ -167,7 +211,7 @@ public class BackendSelectorTest {
 
     @Test
     public void deviceFilterChoosesTheTargetInAnyApi() {
-        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, "INTEL",
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, false, "INTEL",
                 BackendRequirement.ANY);
 
         assertEquals(BackendType.VULKAN, s.backend.backendType());
@@ -176,7 +220,7 @@ public class BackendSelectorTest {
 
     @Test
     public void deviceFilterMatchingNothingSelectsNormally() {
-        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER,
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, false,
                 "radeon", BackendRequirement.ANY);
 
         assertSame(RTX_VULKAN, s.chosen.identity);
@@ -185,7 +229,7 @@ public class BackendSelectorTest {
     @Test
     public void apiOrderIsHonoured() {
         BackendSelector.Selection s = BackendSelector.selectAuto(laptop(),
-                Arrays.asList(BackendType.CUDA, BackendType.OPENCL), null, BackendRequirement.ANY);
+                Arrays.asList(BackendType.CUDA, BackendType.OPENCL), false, null, BackendRequirement.ANY);
 
         assertEquals(BackendType.CUDA, s.backend.backendType());
     }
@@ -200,7 +244,7 @@ public class BackendSelectorTest {
                 view(BackendType.CUDA, cuRtx, cuRtx),
                 view(BackendType.VULKAN, vkIgpu, vkIgpu));
 
-        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, null,
+        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false, null,
                 rejecting(BackendType.CUDA, BackendType.OPENCL));
 
         assertSame(vkIgpu, s.chosen);
@@ -218,7 +262,7 @@ public class BackendSelectorTest {
                 view(BackendType.VULKAN, vkOther, vkOther),
                 view(BackendType.CUDA, cuRtx, cuRtx));
 
-        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, null,
+        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false, null,
                 rejecting(BackendType.OPENCL));
 
         assertSame(cuRtx, s.chosen);
@@ -237,7 +281,7 @@ public class BackendSelectorTest {
                 view(BackendType.VULKAN, vkCpu, vkCpu),
                 view(BackendType.CUDA, cuUnknown, cuUnknown));
 
-        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, null,
+        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false, null,
                 rejecting(BackendType.OPENCL));
 
         assertSame(cuUnknown, s.chosen);
@@ -255,7 +299,7 @@ public class BackendSelectorTest {
                 view(BackendType.CUDA, cuRtx, cuRtx),
                 BackendSelector.ApiView.absent(BackendType.VULKAN, "Vulkan: no devices found"));
 
-        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, null,
+        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false, null,
                 b -> "rejected " + b.backendType());
 
         assertNull(s.backend);
@@ -279,7 +323,7 @@ public class BackendSelectorTest {
     @Test
     public void apiMissingFromTheViewsIsReportedAsNotEnumerated() {
         BackendSelector.Selection s = BackendSelector.selectAuto(Collections.<BackendSelector.ApiView>emptyList(),
-                Collections.singletonList(BackendType.CUDA), null, BackendRequirement.ANY);
+                Collections.singletonList(BackendType.CUDA), false, null, BackendRequirement.ANY);
 
         assertNull(s.backend);
         assertEquals(Collections.singletonList("CUDA: not enumerated"), s.reasons);
@@ -296,7 +340,7 @@ public class BackendSelectorTest {
                 view(BackendType.VULKAN, vkBroken, vkBroken),
                 view(BackendType.OPENCL, clRtx, clRtx));
 
-        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, null,
+        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false, null,
                 BackendRequirement.ANY);
 
         assertSame(clRtx, s.chosen);
@@ -309,7 +353,7 @@ public class BackendSelectorTest {
         BackendSelector.Candidate clRtx = candidate(BackendType.OPENCL, RTX_OPENCL, DeviceClass.DISCRETE);
         List<BackendSelector.ApiView> views = Collections.singletonList(view(BackendType.OPENCL, clRtx, clRtx));
 
-        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, null, b -> {
+        BackendSelector.Selection s = BackendSelector.selectAuto(views, BackendSelector.DEFAULT_ORDER, false, null, b -> {
             throw new IllegalStateException("index unreadable");
         });
 

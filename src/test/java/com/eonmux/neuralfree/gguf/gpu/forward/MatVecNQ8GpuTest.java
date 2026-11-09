@@ -24,7 +24,9 @@ import org.junit.runners.Parameterized;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Random;
 
@@ -38,10 +40,11 @@ import static org.junit.Assert.assertTrue;
  * activations, on every available GPU backend, and against the single-row integer-dot kernels
  * ({@code {T}_MatVec_Q8}) stacked per token row on the same weights &mdash; the lane the projections
  * take for token groups of two to {@link LlmKernelConstants#MATVEC_N_MAX_TOKENS} rows, where one
- * launch reads each weight row once for the whole group. Token counts cover odd groups and the lane's
- * upper bound. Weights are random bytes with finite block scales; the tolerance covers the float
- * summation order of the work-group reduction. A backend is skipped when its GPU or its kernel
- * library is unavailable.
+ * launch reads each weight row once for the whole group. The exact-token-count forms ({@code
+ * {T}_MatVecN<n>_Q8}, {@code {T}_MatVec2N<n>_Q8}) meet the same contract at every count their type
+ * instantiates. Token counts cover odd groups and the lane's upper bound. Weights are random bytes
+ * with finite block scales; the tolerance covers the float summation order of the work-group
+ * reduction. A backend is skipped when its GPU or its kernel library is unavailable.
  */
 @RunWith(Parameterized.class)
 public class MatVecNQ8GpuTest {
@@ -63,10 +66,31 @@ public class MatVecNQ8GpuTest {
         GGMLType.IQ1_S, GGMLType.IQ1_M,
     };
 
+    /** Every OpenCL device (their subgroup support differs, and with it the reduction form), CUDA and Vulkan. */
     @Parameterized.Parameters(name = "{0}")
     public static List<Object[]> backends() {
-        return Arrays.asList(new Object[]{"opencl"}, new Object[]{"cuda"}, new Object[]{"vulkan"});
+        List<Object[]> apis = new ArrayList<>();
+        int openClDevices = Math.max(1, openClDeviceCount());
+        for (int i = 0; i < openClDevices; i++) {
+            apis.add(new Object[]{OPENCL_PREFIX + i});
+        }
+        apis.add(new Object[]{"cuda"});
+        apis.add(new Object[]{"vulkan"});
+        return apis;
     }
+
+    private static int openClDeviceCount() {
+        HWAcceleration hw = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.OPENCL));
+        try {
+            return hw.getCLDevices().size();
+        } catch (RuntimeException e) {
+            return 0;
+        } finally {
+            hw.shutdown();
+        }
+    }
+
+    private static final String OPENCL_PREFIX = "opencl:";
 
     private final String api;
     private HWAcceleration hwAccel;
@@ -107,10 +131,11 @@ public class MatVecNQ8GpuTest {
             CUDevice device = accel.getCUDevices().get(0);
             return new CudaComputeBackend(device);
         }
+        int index = Integer.parseInt(api.substring(OPENCL_PREFIX.length()));
         HWAcceleration accel = new HWAcceleration();
         hwAccel = accel;
-        Assume.assumeFalse("no OpenCL device", accel.getCLDevices().isEmpty());
-        return new OclComputeBackend(accel.getCLDevices().get(0));
+        Assume.assumeTrue("no OpenCL device " + index, index < accel.getCLDevices().size());
+        return new OclComputeBackend(accel.getCLDevices().get(index));
     }
 
     @After
@@ -318,6 +343,38 @@ public class MatVecNQ8GpuTest {
         return got;
     }
 
+    /** The counted multi-column matvec output ({@code kernel}'s token count is compiled in). */
+    private float[] matvecCounted(String kernel, byte[] weights, GpuBuffer q8, int n) throws Exception {
+        GpuBuffer wBuf = upload(weights);
+        GpuBuffer yBuf = backend.allocateBuffer((long) n * ROWS * 4);
+        backend.computeQueue().enqueueKernel(kernels.get(kernel), new long[]{(long) ROWS * local},
+                new long[]{local}, new Object[]{ROWS, COLS, wBuf, q8, yBuf});
+        backend.computeQueue().finish();
+        float[] got = new float[n * ROWS];
+        backend.computeQueue().enqueueReadBuffer(yBuf, 0, (long) got.length * 4, got).awaitCompletion();
+        wBuf.close();
+        yBuf.close();
+        return got;
+    }
+
+    /**
+     * The paired counted multi-column matvec output: two weight rows per workgroup over {@code n}
+     * token rows ({@code kernel}'s token count is compiled in), global = ceil(ROWS / 2) * local.
+     */
+    private float[] matvecPairedCounted(String kernel, byte[] weights, GpuBuffer q8, int n) throws Exception {
+        GpuBuffer wBuf = upload(weights);
+        GpuBuffer yBuf = backend.allocateBuffer((long) n * ROWS * 4);
+        long groups = (ROWS + 1) / 2;
+        backend.computeQueue().enqueueKernel(kernels.get(kernel), new long[]{groups * local},
+                new long[]{local}, new Object[]{ROWS, COLS, wBuf, q8, yBuf});
+        backend.computeQueue().finish();
+        float[] got = new float[n * ROWS];
+        backend.computeQueue().enqueueReadBuffer(yBuf, 0, (long) got.length * 4, got).awaitCompletion();
+        wBuf.close();
+        yBuf.close();
+        return got;
+    }
+
     /**
      * Per-row reference check: the tolerance scales with the row's summed-term magnitude, which bounds
      * the float rounding of the kernels' factored integer dots (the d-term and min-term of one slice
@@ -380,6 +437,108 @@ public class MatVecNQ8GpuTest {
                         }
                     }
                     assertClose(api + " " + type + " n=" + n + " reference", expected, termAbs, got);
+                } finally {
+                    q8.close();
+                }
+            }
+        }
+    }
+
+    /**
+     * The one-launch multi-column output equals the stacked single-row outputs bit for bit: token
+     * t's partial sums walk the same weight blocks in the same order as the single-row kernel and
+     * reduce through the exact same steps, so any reordering shows as a differing bit pattern (the
+     * documented contract of the multi-column form). The Q8_1 rows are the group quantizer's own
+     * blocks, sliced per token, so the comparison isolates the matvec kernels.
+     */
+    @Test
+    public void multiColumnMatvecIsBitwiseTheStackedSingleRowMatvecs() throws Exception {
+        for (GGMLType type : TYPES) {
+            String kernel = requireKernel(type.name() + "_MatVecN_Q8");
+            String single = requireKernel(type.name() + "_MatVec_Q8");
+            for (int n : TOKEN_COUNTS) {
+                byte[] weights = randomWeights(type, 32000 + type.ordinal());
+                float[][] x = randomActivations(33000 + 100 * n + type.ordinal(), n);
+                GpuBuffer q8 = q8_1(x);
+                try {
+                    int rowBytes = (COLS / 32) * GpuOps.Q8_1_FLOATS * 4;
+                    byte[] groupBlocks = new byte[n * rowBytes];
+                    backend.computeQueue().enqueueReadBuffer(q8, 0, groupBlocks.length, groupBlocks)
+                            .awaitCompletion();
+                    float[] got = matvecN(kernel, weights, q8, n);
+                    for (int t = 0; t < n; t++) {
+                        GpuBuffer row = upload(Arrays.copyOfRange(groupBlocks, t * rowBytes, (t + 1) * rowBytes));
+                        try {
+                            float[] singleGot = matvecSingle(single, weights, row);
+                            for (int r = 0; r < ROWS; r++) {
+                                if (got[t * ROWS + r] != singleGot[r]) {
+                                    assertArrayEquals(api + " " + type + " n=" + n + " token " + t
+                                                    + " row " + r + " bitwise vs stacked " + single,
+                                            new float[]{singleGot[r]}, new float[]{got[t * ROWS + r]}, 0f);
+                                }
+                            }
+                        } finally {
+                            row.close();
+                        }
+                    }
+                } finally {
+                    q8.close();
+                }
+            }
+        }
+    }
+
+    /**
+     * The exact-token-count forms of every served type &mdash; {@code {T}_MatVecN<n>_Q8} (the generic
+     * kernel with the token count folded to compile time) and the paired {@code {T}_MatVec2N<n>_Q8}
+     * (two weight rows per workgroup) &mdash; produce the stacked single-row outputs bit for bit at
+     * their own token count, the runtime-count form's contract, at every count the type instantiates
+     * ({@link LlmKernelConstants#countedMaxTokens}): [2, {@link LlmKernelConstants#MATVEC_N_DISPATCH_MAX}]
+     * for most family types and up to {@link LlmKernelConstants#MATVEC_N_COUNTED_MAX} for the types
+     * whose measured dispatch serves the counts above it (Q8_0, and the K-quant, Q4_0 and IQ4_XS
+     * types on the kinds whose entries serve them). Each (type, count) quantizes once, computes the
+     * single-row outputs once and holds them against both forms.
+     */
+    @Test
+    public void countedQ8MatvecFormsAreBitwiseTheStackedSingleRowMatvecs() throws Exception {
+        for (GGMLType type : TYPES) {
+            String single = requireKernel(type.name() + "_MatVec_Q8");
+            int maxCount = LlmKernelConstants.countedMaxTokens(type);
+            for (int n = 2; n <= maxCount; n++) {
+                byte[] weights = randomWeights(type, 32000 + type.ordinal());
+                float[][] x = randomActivations(33000 + 100 * n + type.ordinal(), n);
+                GpuBuffer q8 = q8_1(x);
+                try {
+                    int rowBytes = (COLS / 32) * GpuOps.Q8_1_FLOATS * 4;
+                    byte[] groupBlocks = new byte[n * rowBytes];
+                    backend.computeQueue().enqueueReadBuffer(q8, 0, groupBlocks.length, groupBlocks)
+                            .awaitCompletion();
+                    float[][] singleGot = new float[n][];
+                    for (int t = 0; t < n; t++) {
+                        GpuBuffer row = upload(Arrays.copyOfRange(groupBlocks, t * rowBytes,
+                                (t + 1) * rowBytes));
+                        try {
+                            singleGot[t] = matvecSingle(single, weights, row);
+                        } finally {
+                            row.close();
+                        }
+                    }
+                    for (int form = 0; form < 2; form++) {
+                        String label = form == 0 ? "_MatVecN" : "_MatVec2N";
+                        String counted = requireKernel(type.name() + label + n + "_Q8");
+                        float[] got = form == 0 ? matvecCounted(counted, weights, q8, n)
+                                : matvecPairedCounted(counted, weights, q8, n);
+                        for (int t = 0; t < n; t++) {
+                            for (int r = 0; r < ROWS; r++) {
+                                if (got[t * ROWS + r] != singleGot[t][r]) {
+                                    assertArrayEquals(api + " " + type + " " + label + n + " token " + t
+                                                    + " row " + r + " bitwise vs stacked " + single,
+                                            new float[]{singleGot[t][r]},
+                                            new float[]{got[t * ROWS + r]}, 0f);
+                                }
+                            }
+                        }
+                    }
                 } finally {
                     q8.close();
                 }

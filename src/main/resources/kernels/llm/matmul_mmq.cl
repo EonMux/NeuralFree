@@ -37,6 +37,10 @@
 #define Q4_0_MMQ_CODE(bp, e) (int)((e) < 16 \
     ? ((uint)(bp)[2 + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[2 + ((e) & 15)] >> 4))
+/* Codes e0..e0+3: the group's 4 qs bytes (element e = nibble (e&15) of byte e, one half per
+ * 16-code run) as two aligned u16s (the 18-byte block is only 2-byte aligned). */
+#define Q4_0_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_NIBBLES(nf_read_u32_u16((bp) + 2 + ((e0) & 15)), ((e0) & 16) ? 4 : 0)
 #define Q4_0_MMQ_SCALE(bp, k0) nf_ql_half(bp, 0)
 #define Q4_0_MMQ_OFF(bp, k0) (-8.0f * nf_ql_half(bp, 0))
 NF_MMQ_GEMM(Q4_0, Q4_0_BLOCK_SIZE, Q4_0_BLOCK_BYTES, 32, Q4_0_MMQ_CODE, Q4_0_MMQ_SCALE, Q4_0_MMQ_OFF)
@@ -46,6 +50,8 @@ NF_MMQ_GEMM_KSPLIT(Q4_0, Q4_0_BLOCK_SIZE, Q4_0_BLOCK_BYTES, 32, Q4_0_MMQ_CODE, Q
 #define Q4_1_MMQ_CODE(bp, e) (int)((e) < 16 \
     ? ((uint)(bp)[4 + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[4 + ((e) & 15)] >> 4))
+#define Q4_1_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_NIBBLES(nf_read_u32((bp) + 4 + ((e0) & 15)), ((e0) & 16) ? 4 : 0)
 #define Q4_1_MMQ_SCALE(bp, k0) nf_ql_half(bp, 0)
 #define Q4_1_MMQ_OFF(bp, k0) nf_ql_half(bp, 2)
 NF_MMQ_GEMM(Q4_1, Q4_1_BLOCK_SIZE, Q4_1_BLOCK_BYTES, 32, Q4_1_MMQ_CODE, Q4_1_MMQ_SCALE, Q4_1_MMQ_OFF)
@@ -55,6 +61,11 @@ NF_MMQ_GEMM_KSPLIT(Q4_1, Q4_1_BLOCK_SIZE, Q4_1_BLOCK_BYTES, 32, Q4_1_MMQ_CODE, Q
 #define Q5_0_MMQ_CODE(bp, e) (int)(((e) < 16 \
     ? ((uint)(bp)[6 + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[6 + ((e) & 15)] >> 4)) | (NF_MMQ_HBIT(read_u32_le((bp) + 2), (e)) << 4))
+/* The nibbles of e0..e0+3 from the group's 4 qs bytes (two aligned u16s, the 22-byte block is
+ * 2-byte aligned), the 5th bits from the block's qh word. */
+#define Q5_0_MMQ_CODE4(bp, e0) \
+    (NF_MMQ_CODE4_NIBBLES(nf_read_u32_u16((bp) + 6 + ((e0) & 15)), ((e0) & 16) ? 4 : 0) \
+        | NF_MMQ_HBITS4(nf_read_u32_u16((bp) + 2), (e0)))
 #define Q5_0_MMQ_SCALE(bp, k0) nf_ql_half(bp, 0)
 #define Q5_0_MMQ_OFF(bp, k0) (-16.0f * nf_ql_half(bp, 0))
 NF_MMQ_GEMM(Q5_0, Q5_0_BLOCK_SIZE, Q5_0_BLOCK_BYTES, 32, Q5_0_MMQ_CODE, Q5_0_MMQ_SCALE, Q5_0_MMQ_OFF)
@@ -64,6 +75,9 @@ NF_MMQ_GEMM_KSPLIT(Q5_0, Q5_0_BLOCK_SIZE, Q5_0_BLOCK_BYTES, 32, Q5_0_MMQ_CODE, Q
 #define Q5_1_MMQ_CODE(bp, e) (int)(((e) < 16 \
     ? ((uint)(bp)[8 + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[8 + ((e) & 15)] >> 4)) | (NF_MMQ_HBIT(read_u32_le((bp) + 4), (e)) << 4))
+#define Q5_1_MMQ_CODE4(bp, e0) \
+    (NF_MMQ_CODE4_NIBBLES(nf_read_u32((bp) + 8 + ((e0) & 15)), ((e0) & 16) ? 4 : 0) \
+        | NF_MMQ_HBITS4(nf_read_u32((bp) + 4), (e0)))
 #define Q5_1_MMQ_SCALE(bp, k0) nf_ql_half(bp, 0)
 #define Q5_1_MMQ_OFF(bp, k0) nf_ql_half(bp, 2)
 NF_MMQ_GEMM(Q5_1, Q5_1_BLOCK_SIZE, Q5_1_BLOCK_BYTES, 32, Q5_1_MMQ_CODE, Q5_1_MMQ_SCALE, Q5_1_MMQ_OFF)
@@ -71,6 +85,8 @@ NF_MMQ_GEMM_KSPLIT(Q5_1, Q5_1_BLOCK_SIZE, Q5_1_BLOCK_BYTES, 32, Q5_1_MMQ_CODE, Q
 
 /* Q8_0: 34 B, d@0, qs[32](int8)@2; value = qs*d. */
 #define Q8_0_MMQ_CODE(bp, e) (int)((NF_GLOBAL const nf_i8*)(bp))[2 + (e)]
+/* Codes e0..e0+3: the raw qs bytes as two aligned u16s (the 34-byte block is 2-byte aligned). */
+#define Q8_0_MMQ_CODE4(bp, e0) nf_read_u32_u16((bp) + 2 + (e0))
 #define Q8_0_MMQ_SCALE(bp, k0) q8_0_scale(bp)
 #define Q8_0_MMQ_OFF(bp, k0) 0.0f
 NF_MMQ_GEMM(Q8_0, Q8_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES, 32, Q8_0_MMQ_CODE, Q8_0_MMQ_SCALE, Q8_0_MMQ_OFF)
@@ -79,6 +95,8 @@ NF_MMQ_GEMM_KSPLIT(Q8_0, Q8_0_BLOCK_SIZE, Q8_0_BLOCK_BYTES, 32, Q8_0_MMQ_CODE, Q
 /* I8_B128: d(f32)@0, qs[128](int8)@4; value = d*qs. The scale covers the whole 128-element block,
  * so every 32-element stage group reads the same d (SG 32). */
 #define I8_B128_MMQ_CODE(bp, e) (int)((NF_GLOBAL const nf_i8*)(bp))[NF_I8_B128_QS + (e)]
+/* Codes e0..e0+3: the raw qs bytes as one aligned u32 (the 132-byte block is 4-byte aligned). */
+#define I8_B128_MMQ_CODE4(bp, e0) nf_read_u32((bp) + NF_I8_B128_QS + (e0))
 #define I8_B128_MMQ_SCALE(bp, k0) as_float(read_u32_le((bp) + NF_I8_B128_D))
 #define I8_B128_MMQ_OFF(bp, k0) 0.0f
 NF_MMQ_GEMM(I8_B128, I8_B128_BLOCK_SIZE, I8_B128_BLOCK_BYTES, 32, I8_B128_MMQ_CODE, I8_B128_MMQ_SCALE,
@@ -93,6 +111,10 @@ NF_MMQ_GEMM_KSPLIT(I8_B128, I8_B128_BLOCK_SIZE, I8_B128_BLOCK_BYTES, 32, I8_B128
  * value = d*(sc & 15)*q - dmin*(sc >> 4). */
 #define Q2_K_MMQ_CODE(bp, e) (int)(((uint)(bp)[NF_Q2K_QS + ((e) >> 7) * 32 + (((e) >> 4) & 1) * 16 + ((e) & 15)] \
     >> (2u * (((e) >> 5) & 3u))) & 3u)
+/* One byte per code (2-bit planes across separate bytes), so the group packs 4 CODE calls. */
+#define Q2_K_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(Q2_K_MMQ_CODE((bp), (e0)), Q2_K_MMQ_CODE((bp), (e0) + 1), \
+        Q2_K_MMQ_CODE((bp), (e0) + 2), Q2_K_MMQ_CODE((bp), (e0) + 3))
 #define Q2_K_MMQ_SCALE(bp, k0) (nf_kq_half(bp, NF_Q2K_D) \
     * (float)((bp)[NF_Q2K_SCALES + ((k0) % 256 >> 4)] & 0xFu))
 #define Q2_K_MMQ_OFF(bp, k0) (-nf_kq_half(bp, NF_Q2K_DMIN) \
@@ -106,6 +128,9 @@ NF_MMQ_GEMM_KSPLIT(Q2_K, Q2_K_BLOCK_SIZE, Q2_K_BLOCK_BYTES, 16, Q2_K_MMQ_CODE, Q
 #define Q3_K_MMQ_CODE(bp, e) ((int)(((uint)(bp)[NF_Q3K_QS + ((e) >> 7) * 32 + (((e) >> 4) & 1) * 16 + ((e) & 15)] \
     >> (2u * (((e) >> 5) & 3u))) & 3u) - ((((uint)(bp)[NF_Q3K_HMASK + (((e) >> 4) & 1) * 16 + ((e) & 15)] \
     >> (4u * ((e) >> 7) + 2u * (((e) >> 5) & 3u))) & 1u) ? 0 : 4))
+#define Q3_K_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(Q3_K_MMQ_CODE((bp), (e0)), Q3_K_MMQ_CODE((bp), (e0) + 1), \
+        Q3_K_MMQ_CODE((bp), (e0) + 2), Q3_K_MMQ_CODE((bp), (e0) + 3))
 #define Q3_K_MMQ_SCALE(bp, k0) (nf_kq_half(bp, NF_Q3K_D) * (float)nf_q3k_scale(bp, ((k0) % 256) >> 4))
 #define Q3_K_MMQ_OFF(bp, k0) 0.0f
 NF_MMQ_GEMM(Q3_K, Q3_K_BLOCK_SIZE, Q3_K_BLOCK_BYTES, 16, Q3_K_MMQ_CODE, Q3_K_MMQ_SCALE, Q3_K_MMQ_OFF)
@@ -115,6 +140,11 @@ NF_MMQ_GEMM_KSPLIT(Q3_K, Q3_K_BLOCK_SIZE, Q3_K_BLOCK_BYTES, 16, Q3_K_MMQ_CODE, Q
  * holds the scale/min pair and the nibble shift; value = d*sc*q - dmin*m. */
 #define Q4_K_MMQ_CODE(bp, e) (int)(((uint)(bp)[NF_Q4K_QS + (((e) >> 6) * 32) + ((e) & 31)] \
     >> ((((e) >> 5) & 1) * 4u)) & 0xFu)
+/* Codes e0..e0+3: one aligned u32 of qs (the group of 4 stays inside one nibble half of the
+ * 32-element scale group). */
+#define Q4_K_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_NIBBLES(nf_read_u32((bp) + NF_Q4K_QS + (((e0) >> 6) * 32) + ((e0) & 31)), \
+        (((e0) >> 5) & 1) * 4)
 #define Q4_K_MMQ_SCALE(bp, k0) (nf_kq_half(bp, NF_Q4K_D) \
     * k4_scale_min(bp + NF_Q4K_SCALES, ((k0) % 256) >> 5).x)
 #define Q4_K_MMQ_OFF(bp, k0) (-nf_kq_half(bp, NF_Q4K_DMIN) \
@@ -125,6 +155,12 @@ NF_MMQ_GEMM_KSPLIT(Q4_K, Q4_K_BLOCK_SIZE, Q4_K_BLOCK_BYTES, 32, Q4_K_MMQ_CODE, Q
 /* Q5_K: as Q4_K plus a fifth bit of element e from bit si of qh[e % 32] (qh[32]@16, qs@48). */
 #define Q5_K_MMQ_CODE(bp, e) (int)((((uint)(bp)[NF_Q5K_QS + (((e) >> 6) * 32) + ((e) & 31)] \
     >> ((((e) >> 5) & 1) * 4u)) & 0xFu) | (NF_MMQ_HBIT((uint)(bp)[NF_Q5K_QH + ((e) & 31)], (e) >> 5) << 4))
+/* Codes e0..e0+3: one aligned u32 of qs plus the group's qh u32 (4 consecutive qh bytes; the 5th
+ * bit of every code in the group is bit (e0 >> 5) of its byte, constant within the group). */
+#define Q5_K_MMQ_CODE4(bp, e0) \
+    (NF_MMQ_CODE4_NIBBLES(nf_read_u32((bp) + NF_Q5K_QS + (((e0) >> 6) * 32) + ((e0) & 31)), \
+        (((e0) >> 5) & 1) * 4) \
+        | NF_MMQ_HBITS4_B(nf_read_u32((bp) + NF_Q5K_QH + ((e0) & 31)), ((e0) >> 5)))
 #define Q5_K_MMQ_SCALE(bp, k0) (nf_kq_half(bp, NF_Q5K_D) \
     * k4_scale_min(bp + NF_Q5K_SCALES, ((k0) % 256) >> 5).x)
 #define Q5_K_MMQ_OFF(bp, k0) (-nf_kq_half(bp, NF_Q5K_DMIN) \
@@ -138,6 +174,9 @@ NF_MMQ_GEMM_KSPLIT(Q5_K, Q5_K_BLOCK_SIZE, Q5_K_BLOCK_BYTES, 32, Q5_K_MMQ_CODE, Q
     >> ((((e) >> 6) & 1) * 4u)) & 0xFu) \
     | ((((uint)(bp)[NF_Q6K_QH + ((e) >> 7) * 32 + ((e) & 31)] \
     >> (2u * (((e) >> 5) & 3u))) & 3u) << 4)) - 32)
+#define Q6_K_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(Q6_K_MMQ_CODE((bp), (e0)), Q6_K_MMQ_CODE((bp), (e0) + 1), \
+        Q6_K_MMQ_CODE((bp), (e0) + 2), Q6_K_MMQ_CODE((bp), (e0) + 3))
 #define Q6_K_MMQ_SCALE(bp, k0) (nf_kq_half(bp, NF_Q6K_D) * (float)((NF_GLOBAL const nf_i8*)((bp) + NF_Q6K_SCALES))[ \
     (((k0) % 256) >> 7) * 8 + (((((k0) % 256) >> 5) & 3) * 2) + (((k0) % 32) >> 4)])
 #define Q6_K_MMQ_OFF(bp, k0) 0.0f
@@ -157,6 +196,9 @@ NF_INLINE int nf_mmq_iq3xxs_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_BYTE(word, j & 3u) * (1 - 2 * (int)((signs >> j) & 1u));
 }
 #define IQ3_XXS_MMQ_CODE(bp, e) nf_mmq_iq3xxs_code(bp, e)
+#define IQ3_XXS_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(IQ3_XXS_MMQ_CODE((bp), (e0)), IQ3_XXS_MMQ_CODE((bp), (e0) + 1), \
+        IQ3_XXS_MMQ_CODE((bp), (e0) + 2), IQ3_XXS_MMQ_CODE((bp), (e0) + 3))
 #define IQ3_XXS_MMQ_SCALE(bp, k0) (nf_ql_half(bp, 0) \
     * (0.5f + (float)(read_u32_le((bp) + 66 + 4 * (((k0) % 256) >> 5)) >> 28)) * 0.5f)
 #define IQ3_XXS_MMQ_OFF(bp, k0) 0.0f
@@ -175,6 +217,9 @@ NF_INLINE int nf_mmq_iq3s_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_BYTE(word, j & 3u) * (1 - 2 * (int)(((uint)bp[74 + 4 * sb + grp] >> j) & 1u));
 }
 #define IQ3_S_MMQ_CODE(bp, e) nf_mmq_iq3s_code(bp, e)
+#define IQ3_S_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(IQ3_S_MMQ_CODE((bp), (e0)), IQ3_S_MMQ_CODE((bp), (e0) + 1), \
+        IQ3_S_MMQ_CODE((bp), (e0) + 2), IQ3_S_MMQ_CODE((bp), (e0) + 3))
 #define IQ3_S_MMQ_SCALE(bp, k0) iq3s_scale((bp), ((k0) % 256) >> 5)
 #define IQ3_S_MMQ_OFF(bp, k0) 0.0f
 NF_MMQ_GEMM(IQ3_S, IQ3_S_BLOCK_SIZE, IQ3_S_BLOCK_BYTES, 32, IQ3_S_MMQ_CODE, IQ3_S_MMQ_SCALE, IQ3_S_MMQ_OFF)
@@ -189,6 +234,9 @@ NF_INLINE int nf_mmq_iq2xxs_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_SM_CODE(word, j, signs);
 }
 #define IQ2_XXS_MMQ_CODE(bp, e) nf_mmq_iq2xxs_code(bp, e)
+#define IQ2_XXS_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(IQ2_XXS_MMQ_CODE((bp), (e0)), IQ2_XXS_MMQ_CODE((bp), (e0) + 1), \
+        IQ2_XXS_MMQ_CODE((bp), (e0) + 2), IQ2_XXS_MMQ_CODE((bp), (e0) + 3))
 #define IQ2_XXS_MMQ_SCALE(bp, k0) (nf_ql_half(bp, 0) \
     * (0.5f + (float)(read_u32_le((bp) + 2 + (((k0) % 256) >> 5) * 8 + 4) >> 28)) * 0.25f)
 #define IQ2_XXS_MMQ_OFF(bp, k0) 0.0f
@@ -208,6 +256,9 @@ NF_INLINE int nf_mmq_iq2xs_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_SM_CODE(word, e & 7, signs);
 }
 #define IQ2_XS_MMQ_CODE(bp, e) nf_mmq_iq2xs_code(bp, e)
+#define IQ2_XS_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(IQ2_XS_MMQ_CODE((bp), (e0)), IQ2_XS_MMQ_CODE((bp), (e0) + 1), \
+        IQ2_XS_MMQ_CODE((bp), (e0) + 2), IQ2_XS_MMQ_CODE((bp), (e0) + 3))
 #define IQ2_XS_MMQ_SCALE(bp, k0) (nf_ql_half(bp, 0) * (0.5f \
     + (float)((((k0) % 256) & 16u) != 0u ? ((uint)(bp)[66 + (((k0) % 256) >> 5)] >> 4) \
                                          : ((uint)(bp)[66 + (((k0) % 256) >> 5)] & 0xFu))) * 0.25f)
@@ -225,6 +276,9 @@ NF_INLINE int nf_mmq_iq2s_code(NF_GLOBAL const uchar* bp, int e) {
     return NF_MMQ_SM_CODE(word, j, bp[34 + 4 * sb + grp]);
 }
 #define IQ2_S_MMQ_CODE(bp, e) nf_mmq_iq2s_code(bp, e)
+#define IQ2_S_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(IQ2_S_MMQ_CODE((bp), (e0)), IQ2_S_MMQ_CODE((bp), (e0) + 1), \
+        IQ2_S_MMQ_CODE((bp), (e0) + 2), IQ2_S_MMQ_CODE((bp), (e0) + 3))
 #define IQ2_S_MMQ_SCALE(bp, k0) (nf_ql_half(bp, 0) * (0.5f \
     + (float)((((k0) % 256) & 16u) != 0u ? ((uint)(bp)[74 + (((k0) % 256) >> 5)] >> 4) \
                                          : ((uint)(bp)[74 + (((k0) % 256) >> 5)] & 0xFu))) * 0.25f)
@@ -246,6 +300,9 @@ NF_INLINE int nf_mmq_iq1s_code(NF_GLOBAL const uchar* bp, int e) {
     return (int)NF_MMQ_BYTE(word, j) - (int)(((word >> (8u * j)) & 0x80u) << 1);
 }
 #define IQ1_S_MMQ_CODE(bp, e) nf_mmq_iq1s_code(bp, e)
+#define IQ1_S_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(IQ1_S_MMQ_CODE((bp), (e0)), IQ1_S_MMQ_CODE((bp), (e0) + 1), \
+        IQ1_S_MMQ_CODE((bp), (e0) + 2), IQ1_S_MMQ_CODE((bp), (e0) + 3))
 #define IQ1_S_MMQ_DL(bp, k0) (nf_ql_half(bp, 0) \
     * (float)(2u * ((nf_mmq_iq1s_qh((bp), ((k0) % 256) >> 5) >> 12) & 7u) + 1u))
 #define IQ1_S_MMQ_SCALE(bp, k0) IQ1_S_MMQ_DL(bp, k0)
@@ -258,6 +315,16 @@ NF_MMQ_GEMM_KSPLIT(IQ1_S, IQ1_S_BLOCK_SIZE, IQ1_S_BLOCK_BYTES, 32, IQ1_S_MMQ_COD
 #define IQ4_NL_MMQ_CODE(bp, e) (int)(IQ4_NL_KVALUES[(e) < 16 \
     ? ((uint)(bp)[2 + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[2 + ((e) & 15)] >> 4)])
+/* Codes e0..e0+3: the group's 4 qs bytes (two aligned u16s) through the codebook. */
+NF_INLINE uint nf_mmq_iq4nl_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const uint word = nf_read_u32_u16(bp + 2 + (e0 & 15));
+    const int shift = (e0 & 16) ? 4 : 0;
+    return NF_MMQ_CODE4_PACK(IQ4_NL_KVALUES[(word >> shift) & 0xFu],
+        IQ4_NL_KVALUES[(word >> (8 + shift)) & 0xFu],
+        IQ4_NL_KVALUES[(word >> (16 + shift)) & 0xFu],
+        IQ4_NL_KVALUES[(word >> (24 + shift)) & 0xFu]);
+}
+#define IQ4_NL_MMQ_CODE4(bp, e0) nf_mmq_iq4nl_code4((bp), (e0))
 #define IQ4_NL_MMQ_SCALE(bp, k0) nf_ql_half(bp, 0)
 #define IQ4_NL_MMQ_OFF(bp, k0) 0.0f
 NF_MMQ_GEMM(IQ4_NL, IQ4_NL_BLOCK_SIZE, IQ4_NL_BLOCK_BYTES, 32, IQ4_NL_MMQ_CODE, IQ4_NL_MMQ_SCALE, IQ4_NL_MMQ_OFF)
@@ -268,6 +335,18 @@ NF_MMQ_GEMM_KSPLIT(IQ4_NL, IQ4_NL_BLOCK_SIZE, IQ4_NL_BLOCK_BYTES, 32, IQ4_NL_MMQ
 #define IQ4_XS_MMQ_CODE(bp, e) (int)(IQ4_NL_KVALUES[(((e) % 32) < 16 \
     ? ((uint)(bp)[IQ4_XS_HEADER_BYTES + ((e) >> 5) * IQ4_XS_SUB_BLOCK_QUANT_BYTES + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[IQ4_XS_HEADER_BYTES + ((e) >> 5) * IQ4_XS_SUB_BLOCK_QUANT_BYTES + ((e) & 15)] >> 4))])
+/* Codes e0..e0+3: the group's qs bytes as one aligned u32 (the group stays inside one nibble half
+ * of the sub-block), through the codebook. */
+NF_INLINE uint nf_mmq_iq4xs_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const uint word = nf_read_u32(bp + IQ4_XS_HEADER_BYTES
+        + (e0 >> 5) * IQ4_XS_SUB_BLOCK_QUANT_BYTES + (e0 & 15));
+    const int shift = ((e0 % 32) < 16) ? 0 : 4;
+    return NF_MMQ_CODE4_PACK(IQ4_NL_KVALUES[(word >> shift) & 0xFu],
+        IQ4_NL_KVALUES[(word >> (8 + shift)) & 0xFu],
+        IQ4_NL_KVALUES[(word >> (16 + shift)) & 0xFu],
+        IQ4_NL_KVALUES[(word >> (24 + shift)) & 0xFu]);
+}
+#define IQ4_XS_MMQ_CODE4(bp, e0) nf_mmq_iq4xs_code4((bp), (e0))
 #define IQ4_XS_MMQ_SCALE(bp, k0) iq4xs_sub_scale((bp), ((k0) % 256) >> 5)
 #define IQ4_XS_MMQ_OFF(bp, k0) 0.0f
 NF_MMQ_GEMM(IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BLOCK_BYTES, 32, IQ4_XS_MMQ_CODE, IQ4_XS_MMQ_SCALE, IQ4_XS_MMQ_OFF)

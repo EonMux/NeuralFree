@@ -55,11 +55,18 @@ public class SmallBatchStepMeasureTest {
     public static final String MEASURE_PROPERTY = "neuralfree.test.smallbatch.measure";
     /** System property naming this test's model root directory; unset, {@link RealModels#root()} is used. */
     public static final String MODELS_PROPERTY = "neuralfree.test.smallbatch.models";
+    /**
+     * System property that selects the device to measure by index into the backend's device list
+     * (CUDA and OpenCL device order, Vulkan physical-device order); unset, zero or negative measures
+     * the device the harness picks by default (the first CUDA and OpenCL device, the first Vulkan
+     * device reporting cooperative matrices).
+     */
+    public static final String DEVICE_PROPERTY = "neuralfree.test.smallbatch.measure.device";
 
 
     /** Report names of the real decoders on the machine, in report order. */
     private static final String[] REAL_NAMES = {
-            "pplx-ctx-0.6b-f16", "qwen3-emb-0.6b-q8", "qwen3-emb-4b-q8",
+            "pplx-ctx-0.6b-f16", "qwen3-emb-0.6b-q8", "qwen3-emb-4b-q8", "qwen3-emb-4b-q4k",
     };
 
     /** Relative paths of the real decoders under the model root, in report order. */
@@ -67,6 +74,7 @@ public class SmallBatchStepMeasureTest {
             "pplx-embed-context-0.6b-GGUF/pplx-embed-context-v1-0.6b-f16.gguf",
             "Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf",
             "Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf",
+            "Qwen3-Embedding-4B-Q4_K_M.gguf",
     };
 
     /** Row counts one step is timed at: the draft maximums in between and the verify shape itself. */
@@ -110,15 +118,28 @@ public class SmallBatchStepMeasureTest {
 
     // ================================================================== backends
 
+    /** The selected device index, or 0 (the default device) when {@link #DEVICE_PROPERTY} is unset or negative. */
+    private static int deviceIndex() {
+        return Math.max(0, Integer.getInteger(DEVICE_PROPERTY, 0));
+    }
+
+    /** The device index to open: the selected one, failed by {@code assumeTrue} when out of range. */
+    private static void assumeIndex(int index, int count, String backendName) {
+        assumeTrue("no " + backendName + " device " + index + " (found " + count + ")",
+                index >= 0 && index < count);
+    }
+
     private ComputeBackend openCLBackend() {
         GpuTestUtil.assumeOpenCLAvailable();
         acceleration = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.OPENCL));
-        backend = new OclComputeBackend(acceleration.getCLDevices().get(0));
+        int index = deviceIndex();
+        assumeIndex(index, acceleration.getCLDevices().size(), "OpenCL");
+        backend = new OclComputeBackend(acceleration.getCLDevices().get(index));
         return backend;
     }
 
     private String openCLDeviceName() {
-        CLDevice device = acceleration.getCLDevices().get(0);
+        CLDevice device = acceleration.getCLDevices().get(deviceIndex());
         Object name = device.getDeviceInfo().get("CL_DEVICE_NAME");
         return name != null ? String.valueOf(name) : String.valueOf(device.getDeviceName());
     }
@@ -126,24 +147,32 @@ public class SmallBatchStepMeasureTest {
     private ComputeBackend cudaBackend() {
         GpuTestUtil.assumeCudaAvailable();
         acceleration = new HWAcceleration(EnumSet.of(ComputeBackend.BackendType.CUDA));
-        backend = new CudaComputeBackend(acceleration.getCUDevices().get(0));
+        int index = deviceIndex();
+        assumeIndex(index, acceleration.getCUDevices().size(), "CUDA");
+        backend = new CudaComputeBackend(acceleration.getCUDevices().get(index));
         return backend;
     }
 
     private String cudaDeviceName() {
-        return acceleration.getCUDevices().get(0).getDeviceName();
+        return acceleration.getCUDevices().get(deviceIndex()).getDeviceName();
     }
 
     /**
-     * The Vulkan compute backend of the device the fast lanes enumerate first: one reporting
+     * The Vulkan compute backend of device {@code index} when {@link #DEVICE_PROPERTY} selects one
+     * (plain physical-device order), else of the device the fast lanes enumerate first: one reporting
      * cooperative matrices when any is, else the default device. No {@link HWAcceleration} is kept:
      * the backend owns its instance (its {@code close} releases it).
      */
     private ComputeBackend vulkanBackend() {
         GpuTestUtil.assumeVulkanAvailable();
         acceleration = null;
+        int index = deviceIndex();
         VkInstanceManager manager = VkInstanceManager.acquire();
         try {
+            if (index > 0) {
+                assumeIndex(index, manager.devices().size(), "Vulkan");
+                return new VkComputeBackend(manager, manager.devices().get(index));
+            }
             for (VkPhysicalDeviceInfo info : manager.devices()) {
                 if (info.supports(VkPhysicalDeviceInfo.Feature.COOPERATIVE_MATRIX)) {
                     return new VkComputeBackend(manager, info);

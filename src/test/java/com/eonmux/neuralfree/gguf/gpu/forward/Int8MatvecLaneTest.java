@@ -2,23 +2,27 @@ package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
+import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
 import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
+import com.eonmux.neuralfree.gguf.ops.gemm.MmqMode;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.spec.ActParams;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -30,11 +34,16 @@ import static org.junit.Assert.assertTrue;
  * Dispatch traces of the int8-activation (Q8_1) matvec lanes of {@link GpuOps}: with
  * {@link Int8MatvecMode#ON} a single-token projection quantizes the activation row once and launches the
  * {@code {T}_MatVec_Q8} kernel, a token group of two to {@link LlmKernelConstants#MATVEC_N_DISPATCH_MAX}
- * rows quantizes the whole group and launches the {@code {T}_MatVecN_Q8} kernel &mdash; for the legacy and
+ * rows quantizes the whole group and launches the {@code {T}_MatVecN_Q8} kernel (its exact-token-count
+ * twin {@code {T}_MatVecN<n>_Q8} where the type provides one, its two-row twin where the measured pairing
+ * answer selects it) &mdash; for the legacy and
  * 4-bit types as for the K-quants and i-quants &mdash;, {@link Int8MatvecMode#OFF} keeps the
  * F32-activation matvec, and {@link Int8MatvecMode#AUTO} follows the device's packed-dot-products feature
- * and the decode evidence of {@link Int8MatvecTuning} for the backend and weight type, and a missing int8
- * kernel falls back to the float form.
+ * and the decode evidence of {@link Int8MatvecTuning} for the device kind and weight type, and a missing
+ * int8 kernel falls back to the float form. The AUTO tests' fake devices claim the vendor and class of
+ * the measured device per backend, so each backend's traces read that device kind's entries; further
+ * fakes of the other measured kinds, and of unknown vendors and classes, show an entry governing only
+ * its own kind and unknown kinds keeping the feature decision.
  */
 public class Int8MatvecLaneTest {
 
@@ -48,6 +57,8 @@ public class Int8MatvecLaneTest {
      */
     private static final int AUTO_COLS = 262144;
     private static final int AUTO_ROWS = 16;
+    /** A vendor id outside the measured device kinds (NVIDIA, Intel), so its kind keeps the default dispatch. */
+    private static final int UNMEASURED_VENDOR_ID = 0x1ED2;
 
     private FakeComputeBackend backend;
     private GpuScratch scratch;
@@ -64,28 +75,64 @@ public class Int8MatvecLaneTest {
 
     private void open(Int8MatvecMode mode, DeviceFeature feature, ComputeBackend.BackendType type,
                       String... unavailable) {
+        open(mode, feature, type, measuredDeviceCapabilities(type, feature), unavailable);
+    }
+
+    /** Opens the backend of {@code type} claiming {@code caps} (null keeps the builder default). */
+    private void open(Int8MatvecMode mode, DeviceFeature feature, ComputeBackend.BackendType type,
+                      DeviceCapabilities caps, String... unavailable) {
         FakeComputeBackend.Builder builder = FakeComputeBackend.builder().strictLlmArgs(true)
                 .backendType(type)
                 .unavailableKernels(unavailable);
-        if (feature != null) {
-            builder.capabilities(new DeviceCapabilities.Builder()
-                    .deviceName("FakeDevice")
-                    .totalVramBytes(8L << 30)
-                    .maxAllocSizeBytes(2L << 30)
-                    .computeUnits(32)
-                    .maxClockFrequencyMhz(1500)
-                    .maxWorkGroupSize(1024)
-                    .supportsAsyncTransfer(true)
-                    .driverVersion("fake-1.0")
-                    .maxLocalMemoryBytes(48L * 1024)
-                    .computeCapability(120)
-                    .feature(feature)
-                    .build());
+        if (caps != null) {
+            builder.capabilities(caps);
         }
         backend = builder.build();
         scratch = GpuScratch.builder(backend, 1).slot(ScratchSlots.X, COLS).build();
         placeholders = GpuPlaceholders.allocate(backend, backend.computeQueue());
         ops = new GpuOps(backend.computeQueue(), LlmKernels.open(backend), scratch, placeholders, mode);
+    }
+
+    /**
+     * The capabilities of the device whose measured entries {@link Int8MatvecTuning} holds for
+     * {@code type}: the NVIDIA RTX 5080 Laptop dGPU over CUDA and OpenCL, the Intel Arrow-Lake iGPU
+     * over Vulkan. Per-kind tests below build their own capabilities instead.
+     */
+    private static DeviceCapabilities measuredDeviceCapabilities(ComputeBackend.BackendType type,
+                                                                 DeviceFeature feature) {
+        if (feature == null) {
+            return null;
+        }
+        return capabilities(type,
+                type == ComputeBackend.BackendType.VULKAN ? FakeComputeBackend.INTEL_VENDOR_ID
+                        : FakeComputeBackend.NVIDIA_VENDOR_ID,
+                type == ComputeBackend.BackendType.VULKAN ? DeviceClass.INTEGRATED : DeviceClass.DISCRETE,
+                feature);
+    }
+
+    /** The capabilities of {@code type}'s device claiming {@code vendorId}, {@code deviceClass} and {@code feature}. */
+    private static DeviceCapabilities capabilities(ComputeBackend.BackendType type, int vendorId,
+                                                   DeviceClass deviceClass, DeviceFeature feature) {
+        DeviceCapabilities.Builder b = new DeviceCapabilities.Builder()
+                .deviceName("FakeDevice")
+                .totalVramBytes(8L << 30)
+                .maxAllocSizeBytes(2L << 30)
+                .computeUnits(32)
+                .maxClockFrequencyMhz(1500)
+                .maxWorkGroupSize(1024)
+                .supportsAsyncTransfer(true)
+                .driverVersion("fake-1.0")
+                .maxLocalMemoryBytes(48L * 1024)
+                .feature(feature)
+                .feature(DeviceFeature.STORAGE_8BIT)
+                .feature(DeviceFeature.STORAGE_16BIT)
+                .feature(DeviceFeature.TIMELINE_SEMAPHORE)
+                .deviceClass(deviceClass)
+                .identity(new DeviceIdentity("FakeDevice", vendorId, null, null));
+        if (type == ComputeBackend.BackendType.CUDA) {
+            b.computeCapability(120);
+        }
+        return b.build();
     }
 
     @After
@@ -137,7 +184,7 @@ public class Int8MatvecLaneTest {
         backend.clearLog();
         r.run();
         List<String> names = new ArrayList<>();
-        for (Dispatch d : backend.dispatches()) {
+        for (FakeDispatch d : backend.dispatches()) {
             names.add(d.kernelName());
         }
         return names;
@@ -244,9 +291,10 @@ public class Int8MatvecLaneTest {
     }
 
     @Test
-    public void autoKeepsTheFloatMatvecForATypeThatMeasuredSlowerOnTheBackend() {
+    public void autoKeepsTheFloatMatvecForATypeThatMeasuredSlowerOnTheDeviceKind() {
         open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT);
-        // OpenCL MXFP4 measured at most 1.00x with the lane at every projection shape.
+        // MXFP4 measured at most 1.00x with the lane at every projection shape on the RTX 5080's
+        // OpenCL device, the kind the fake claims.
         GpuWeight w = autoWeight(GGMLType.MXFP4);
         List<String> names = run(() -> ops.matvec(w, autoInput(), 0, autoOutput(), 0, 1));
         assertTrue(names.toString(), names.contains("MXFP4_MatVec"));
@@ -292,6 +340,54 @@ public class Int8MatvecLaneTest {
         assertFalse(largeNames.toString(), largeNames.contains("Q8_0_MatVec"));
     }
 
+    /**
+     * The RTX 5080's Vulkan device kind gates the Q8_0 lane by projection size: its measured 0.61x
+     * at 1024x1024 keeps a small projection on the F32 matvec and its measured 1.37-2.27x from
+     * 16.8M up takes the lane above it.
+     */
+    @Test
+    public void autoGatesTheVulkanDiscreteKindBelowTheMeasuredLaneThreshold() {
+        DeviceCapabilities vulkanRtx = capabilities(ComputeBackend.BackendType.VULKAN,
+                FakeComputeBackend.NVIDIA_VENDOR_ID, DeviceClass.DISCRETE,
+                DeviceFeature.INTEGER_DOT_PRODUCT);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.VULKAN,
+                vulkanRtx);
+        GpuWeight small = weight(GGMLType.Q8_0);
+        List<String> smallNames = run(() -> ops.matvec(small, backend.allocateBuffer((long) COLS * 4), 0,
+                backend.allocateBuffer((long) ROWS * 4), 0, 1));
+        assertTrue(smallNames.toString(), smallNames.contains("Q8_0_MatVec"));
+        assertFalse(smallNames.toString(), smallNames.contains("Q8_0_MatVec_Q8"));
+        assertFalse(smallNames.toString(), smallNames.contains(GpuOps.QUANTIZE_Q8_1));
+        GpuWeight large = autoWeight(GGMLType.Q8_0);
+        List<String> largeNames = run(() -> ops.matvec(large, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(largeNames.toString(), largeNames.contains("Q8_0_MatVec_Q8"));
+        assertFalse(largeNames.toString(), largeNames.contains("Q8_0_MatVec"));
+    }
+
+    /**
+     * The Arrow-Lake iGPU's OpenCL kind follows its own entries under the same backend and feature:
+     * Q8_0 measured slower with the lane at every shape (and 0.75-0.85x over the whole 4B decoder
+     * step), so it keeps the F32 matvec even above the lane threshold, while its NVFP4 measured
+     * 1.08-2.13x faster everywhere and takes the lane.
+     */
+    @Test
+    public void autoFollowsTheOpenCLIntegratedKindEntries() {
+        DeviceCapabilities openclIgpu = capabilities(ComputeBackend.BackendType.OPENCL,
+                FakeComputeBackend.INTEL_VENDOR_ID, DeviceClass.INTEGRATED,
+                DeviceFeature.INTEGER_DOT_PRODUCT);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                openclIgpu);
+        GpuWeight q8 = autoWeight(GGMLType.Q8_0);
+        List<String> q8Names = run(() -> ops.matvec(q8, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(q8Names.toString(), q8Names.contains("Q8_0_MatVec"));
+        assertFalse(q8Names.toString(), q8Names.contains("Q8_0_MatVec_Q8"));
+        assertFalse(q8Names.toString(), q8Names.contains(GpuOps.QUANTIZE_Q8_1));
+        GpuWeight nvfp4 = autoWeight(GGMLType.NVFP4);
+        List<String> nvfp4Names = run(() -> ops.matvec(nvfp4, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(nvfp4Names.toString(), nvfp4Names.contains("NVFP4_MatVec_Q8"));
+        assertFalse(nvfp4Names.toString(), nvfp4Names.contains("NVFP4_MatVec"));
+    }
+
     @Test
     public void offNeverRunsTheQ8_0Lane() {
         open(Int8MatvecMode.OFF, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
@@ -303,81 +399,222 @@ public class Int8MatvecLaneTest {
         assertFalse(names.toString(), names.contains(GpuOps.QUANTIZE_Q8_1));
     }
 
+    /**
+     * An entry governs only the device kind it was measured on: the Q4_0 loss measured on the RTX
+     * 5080's CUDA device keeps that kind's fake on the float matvec, while the same weight over a
+     * CUDA fake of another vendor (whose kind nobody measured) takes the lane its packed dot
+     * products permit.
+     */
+    @Test
+    public void anEntryGovernsOnlyTheDeviceKindItWasMeasuredOn() {
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
+        GpuWeight w = autoWeight(GGMLType.Q4_0);
+        List<String> names = run(() -> ops.matvec(w, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(names.toString(), names.contains("Q4_0_MatVec"));
+        assertFalse(names.toString(), names.contains("Q4_0_MatVec_Q8"));
+        DeviceCapabilities otherVendor = capabilities(ComputeBackend.BackendType.CUDA, 0x1002,
+                DeviceClass.DISCRETE, DeviceFeature.INTEGER_DOT_PRODUCT);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                otherVendor);
+        GpuWeight same = autoWeight(GGMLType.Q4_0);
+        List<String> otherNames = run(() -> ops.matvec(same, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(otherNames.toString(), otherNames.contains("Q4_0_MatVec_Q8"));
+        assertFalse(otherNames.toString(), otherNames.contains("Q4_0_MatVec"));
+    }
+
+    /** A device whose vendor or class is unknown matches no entry and keeps the feature decision. */
+    @Test
+    public void anUnknownVendorOrClassKeepsTheFeatureDecision() {
+        DeviceCapabilities unknownVendor = capabilities(ComputeBackend.BackendType.CUDA, 0x1234,
+                DeviceClass.DISCRETE, DeviceFeature.INTEGER_DOT_PRODUCT);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                unknownVendor);
+        GpuWeight w = autoWeight(GGMLType.Q4_0);
+        List<String> names = run(() -> ops.matvec(w, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(names.toString(), names.contains("Q4_0_MatVec_Q8"));
+        assertFalse(names.toString(), names.contains("Q4_0_MatVec"));
+        DeviceCapabilities unknownClass = capabilities(ComputeBackend.BackendType.CUDA,
+                FakeComputeBackend.NVIDIA_VENDOR_ID, DeviceClass.UNKNOWN, DeviceFeature.INTEGER_DOT_PRODUCT);
+        open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA,
+                unknownClass);
+        GpuWeight same = autoWeight(GGMLType.Q4_0);
+        List<String> otherNames = run(() -> ops.matvec(same, autoInput(), 0, autoOutput(), 0, 1));
+        assertTrue(otherNames.toString(), otherNames.contains("Q4_0_MatVec_Q8"));
+        assertFalse(otherNames.toString(), otherNames.contains("Q4_0_MatVec"));
+    }
+
     @Test
     public void tuningKeepsTheLaneOnlyForTypesWithoutAMeasuredLoss() {
+        DeviceKind openclNvidia = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.NVIDIA);
+        DeviceKind cudaTensor = DeviceKind.of(ComputeBackend.BackendType.CUDA, DeviceKind.Vendor.NVIDIA,
+                DeviceClass.DISCRETE, DeviceKind.CudaBand.TENSOR);
+        DeviceKind vulkanIntel = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.INTEL);
+        DeviceKind vulkanNvidia = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.NVIDIA);
+        DeviceKind openclIntel = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.INTEL);
         // Measured slower with the lane at every projection shape, so never selected.
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.MXFP4));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.NVFP4));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.IQ4_XS));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_0));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_1));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q5_0));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q5_1));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.IQ4_NL));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q4_0));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.MXFP4));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.NVFP4));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.IQ4_XS));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_0));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_1));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q5_0));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q5_1));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.IQ4_NL));
+        assertFalse(Int8MatvecTuning.laneIsFaster(vulkanIntel, GGMLType.Q4_0));
         // Measured faster on the larger projections only.
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q4_0));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q8_0));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q4_K));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_K));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q8_0));
-        // No measured loss on these backends: the device feature decides.
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q4_1));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q4_K));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q8_0));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.HIP, GGMLType.Q4_K));
+        assertTrue(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.Q4_0));
+        assertTrue(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.Q8_0));
+        assertTrue(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.Q4_K));
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K));
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q8_0));
+        // No SLOWER loss on the RTX 5080's Vulkan device: every type measured a win from 16.8M up,
+        // so the kind records only the large-projection gate.
+        assertTrue(Int8MatvecTuning.laneIsFaster(vulkanNvidia, GGMLType.Q8_0));
+        assertTrue(Int8MatvecTuning.laneIsFaster(vulkanNvidia, GGMLType.Q4_0));
+        // The Arrow-Lake iGPU's OpenCL kind measured eight types slower at every shape, its NVFP4
+        // lane 1.08-2.13x faster everywhere.
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.Q8_0));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.Q4_1));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.Q5_1));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.Q3_K));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.MXFP4));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.IQ4_XS));
+        assertTrue(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.NVFP4));
+        // A backend nobody measured, and a kind nobody measured, keep the feature decision.
+        assertTrue(Int8MatvecTuning.laneIsFaster(DeviceKind.of(ComputeBackend.BackendType.HIP,
+                DeviceKind.Vendor.AMD, DeviceClass.DISCRETE, DeviceKind.CudaBand.NONE), GGMLType.Q4_K));
+        assertTrue(Int8MatvecTuning.laneIsFaster(DeviceKind.of(ComputeBackend.BackendType.OPENCL,
+                DeviceKind.Vendor.OTHER, DeviceClass.DISCRETE, DeviceKind.CudaBand.NONE), GGMLType.MXFP4));
+    }
+
+    /** The measured kind of one backend's vendor: NVIDIA discrete outside CUDA banding. */
+    private static DeviceKind kind(ComputeBackend.BackendType type, DeviceKind.Vendor vendor) {
+        return DeviceKind.of(type, vendor,
+                vendor == DeviceKind.Vendor.INTEL ? DeviceClass.INTEGRATED : DeviceClass.DISCRETE,
+                DeviceKind.CudaBand.NONE);
     }
 
     @Test
     public void tuningGatesTheSmallProjectionOfALargeOnlyType() {
+        DeviceKind cudaTensor = DeviceKind.of(ComputeBackend.BackendType.CUDA, DeviceKind.Vendor.NVIDIA,
+                DeviceClass.DISCRETE, DeviceKind.CudaBand.TENSOR);
+        DeviceKind openclNvidia = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.NVIDIA);
+        DeviceKind vulkanIntel = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.INTEL);
+        DeviceKind vulkanNvidia = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.NVIDIA);
+        DeviceKind openclIntel = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.INTEL);
         // 1024x1024 and 3072x1024 measured slower with the lane; 4096x4096 and up measured faster.
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_K,
-                1024L * 1024));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q6_K,
-                3072L * 1024));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_K,
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K, 1024L * 1024));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q6_K, 3072L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K,
                 Int8MatvecTuning.LANE_MIN_ELEMENTS));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_K,
-                4096L * 4096));
-        // Q8_0 lost the lane's fixed quantizer cost on the small projections of both backends and
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K, 4096L * 4096));
+        // Q8_0 lost the lane's fixed quantizer cost on the small projections of both devices and
         // measured 1.06x to 1.69x with it from 4096x4096 up on CUDA, 1.11x to 1.36x on OpenCL.
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q8_0,
-                3072L * 1024));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q8_0,
-                4096L * 4096));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q8_0,
-                1024L * 1024));
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q8_0,
-                9728L * 2560));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q8_0, 3072L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q8_0, 4096L * 4096));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.Q8_0, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.Q8_0, 9728L * 2560));
+        // The RTX 5080's Vulkan device measured 0.61x at 1024x1024 and 1.37-2.27x with the lane
+        // from 16.8M up, its Arrow-Lake OpenCL iGPU 0.77-1.00x below the threshold and 1.09-1.22x
+        // above it for Q4_0.
+        assertFalse(Int8MatvecTuning.laneIsFaster(vulkanNvidia, GGMLType.Q8_0, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(vulkanNvidia, GGMLType.Q8_0, 9728L * 2560));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.Q4_0, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.Q4_0, 9728L * 2560));
         // The always-slower set stays out at every size.
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_0,
-                Long.MAX_VALUE));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.MXFP4,
-                Long.MAX_VALUE));
-        assertFalse(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q4_0,
-                Long.MAX_VALUE));
-        // A backend and type without evidence keep the lane at any size.
-        assertTrue(Int8MatvecTuning.laneIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q4_K, 1));
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_0, Long.MAX_VALUE));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.MXFP4, Long.MAX_VALUE));
+        assertFalse(Int8MatvecTuning.laneIsFaster(vulkanIntel, GGMLType.Q4_0, Long.MAX_VALUE));
+        assertFalse(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.Q8_0, Long.MAX_VALUE));
+        // A kind and type without evidence keep the lane at any size.
+        assertTrue(Int8MatvecTuning.laneIsFaster(vulkanIntel, GGMLType.Q4_K, 1));
+        assertTrue(Int8MatvecTuning.laneIsFaster(openclIntel, GGMLType.NVFP4, 1));
+    }
+
+    /**
+     * The counted multi-column lane's evidence overrides the single-row losses only where its own
+     * comparison measured a win: Q8_0 on the CUDA and OpenCL NVIDIA kinds at any size, Q4_0 there from
+     * {@link Int8MatvecTuning#LANE_MIN_ELEMENTS} up, IQ4_XS on the OpenCL kind from the threshold up —
+     * the same kinds' portable-arithmetic forms measured the wins, so the packed-dot requirement drops
+     * for exactly those type-and-kind pairs.
+     */
+    @Test
+    public void countedLaneEvidenceOverridesTheSingleRowLossesWhereItMeasuredWins() {
+        DeviceKind cudaTensor = DeviceKind.of(ComputeBackend.BackendType.CUDA, DeviceKind.Vendor.NVIDIA,
+                DeviceClass.DISCRETE, DeviceKind.CudaBand.TENSOR);
+        DeviceKind openclNvidia = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.NVIDIA);
+        DeviceKind openclIntel = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.INTEL);
+        // Q8_0's counted evidence covers the small projections of both kinds.
+        assertTrue(Int8MatvecTuning.countedLaneIsFaster(cudaTensor, GGMLType.Q8_0, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.Q8_0, 1024L * 1024));
+        // Q4_0 and IQ4_XS's counted evidence covers the two measured shapes, both at or above the
+        // threshold; below it the single-row losses keep the lane off.
+        assertTrue(Int8MatvecTuning.countedLaneIsFaster(cudaTensor, GGMLType.Q4_0,
+                Int8MatvecTuning.LANE_MIN_ELEMENTS));
+        assertFalse(Int8MatvecTuning.countedLaneIsFaster(cudaTensor, GGMLType.Q4_0, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.Q4_0,
+                Int8MatvecTuning.LANE_MIN_ELEMENTS));
+        assertFalse(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.Q4_0, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.IQ4_XS, 4096L * 1024));
+        assertFalse(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.IQ4_XS, 1024L * 1024));
+        // The large-only types' counted lane follows the single-row size gate.
+        assertTrue(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.Q4_K, 4096L * 1024));
+        assertFalse(Int8MatvecTuning.countedLaneIsFaster(openclNvidia, GGMLType.Q4_K, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.countedLaneIsFaster(cudaTensor, GGMLType.Q5_K, 4096L * 1024));
+        // A kind nobody measured for the counted comparison keeps the single-row answer: the
+        // OpenCL iGPU's always-slower IQ4_XS gains no counted redemption there.
+        assertFalse(Int8MatvecTuning.countedLaneIsFaster(openclIntel, GGMLType.IQ4_XS,
+                Int8MatvecTuning.LANE_MIN_ELEMENTS));
+        // The portable-arithmetic exception: the measured OpenCL NVIDIA types, and no others.
+        for (GGMLType type : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K,
+                GGMLType.Q6_K, GGMLType.IQ4_XS}) {
+            assertFalse(type + " runs portable arithmetic there",
+                    Int8MatvecTuning.countedLaneNeedsPackedDots(openclNvidia, type));
+        }
+        assertTrue(Int8MatvecTuning.countedLaneNeedsPackedDots(openclNvidia, GGMLType.Q2_K));
+        assertTrue(Int8MatvecTuning.countedLaneNeedsPackedDots(cudaTensor, GGMLType.Q8_0));
+        assertTrue(Int8MatvecTuning.countedLaneNeedsPackedDots(openclIntel, GGMLType.Q8_0));
     }
 
     @Test
     public void tuningPairsOnlyTheTypesThatMeasuredFasterPaired() {
-        // Q4_K and Q5_K lost 1-8% paired on CUDA (medians 0.95x and 0.96x); Q8_K and Q8_0 measured
-        // neutral there (Q8_0 medians 0.99x) and Q8_0 never gained on OpenCL either (median 0.97x);
-        // Q8_0's paired form measured 1.5-1.9x on the Vulkan device.
-        assertFalse(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q4_K));
-        assertFalse(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q5_K));
-        assertTrue(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q6_K));
-        assertFalse(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q8_K));
-        assertFalse(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q8_0));
-        assertTrue(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q4_K));
-        assertTrue(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q6_K));
-        assertFalse(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q8_K));
-        assertFalse(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.OPENCL, GGMLType.Q8_0));
-        assertTrue(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q8_0));
-        assertTrue(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.VULKAN, GGMLType.Q8_K));
-        assertTrue(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.HIP, GGMLType.Q8_K));
-        assertTrue(Int8MatvecTuning.pairedIsFaster(ComputeBackend.BackendType.CUDA, GGMLType.Q2_K));
+        DeviceKind cudaTensor = DeviceKind.of(ComputeBackend.BackendType.CUDA, DeviceKind.Vendor.NVIDIA,
+                DeviceClass.DISCRETE, DeviceKind.CudaBand.TENSOR);
+        DeviceKind openclNvidia = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.NVIDIA);
+        DeviceKind vulkanIntel = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.INTEL);
+        DeviceKind vulkanNvidia = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.NVIDIA);
+        DeviceKind openclIntel = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.INTEL);
+        // Q4_K and Q5_K lost 1-8% paired on the RTX 5080's CUDA device (medians 0.95x and 0.96x);
+        // Q8_K and Q8_0 measured neutral there (Q8_0 medians 0.99x) and Q8_0 never gained on its
+        // OpenCL device either (median 0.97x); on its Vulkan device Q8_K measured neutral
+        // (0.95-1.09x) while Q8_0 gained 4-8% at the 16.8-50M shapes; the Arrow-Lake iGPU's OpenCL
+        // device lost 10-22% with Q5_K and Q6_K at every shape and measured neutral with Q8_0;
+        // Q8_0's paired form measured 1.5-1.9x on the iGPU's Vulkan device.
+        assertFalse(Int8MatvecTuning.pairedIsFaster(cudaTensor, GGMLType.Q4_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(cudaTensor, GGMLType.Q5_K));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(cudaTensor, GGMLType.Q6_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(cudaTensor, GGMLType.Q8_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(cudaTensor, GGMLType.Q8_0));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(openclNvidia, GGMLType.Q4_K));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(openclNvidia, GGMLType.Q6_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(openclNvidia, GGMLType.Q8_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(openclNvidia, GGMLType.Q8_0));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(vulkanIntel, GGMLType.Q8_0));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(vulkanIntel, GGMLType.Q8_K));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(vulkanNvidia, GGMLType.Q8_0));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(vulkanNvidia, GGMLType.Q4_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(vulkanNvidia, GGMLType.Q8_K));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(openclIntel, GGMLType.Q4_K));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(openclIntel, GGMLType.Q8_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(openclIntel, GGMLType.Q8_0));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(openclIntel, GGMLType.Q5_K));
+        assertFalse(Int8MatvecTuning.pairedIsFaster(openclIntel, GGMLType.Q6_K));
+        // A backend nobody measured, and a kind nobody measured, keep the paired form.
+        assertTrue(Int8MatvecTuning.pairedIsFaster(DeviceKind.of(ComputeBackend.BackendType.HIP,
+                DeviceKind.Vendor.AMD, DeviceClass.DISCRETE, DeviceKind.CudaBand.NONE), GGMLType.Q8_K));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(DeviceKind.of(ComputeBackend.BackendType.CUDA,
+                DeviceKind.Vendor.OTHER, DeviceClass.DISCRETE, DeviceKind.CudaBand.TENSOR), GGMLType.Q4_K));
+        assertTrue(Int8MatvecTuning.pairedIsFaster(cudaTensor, GGMLType.Q2_K));
     }
 
     @Test
@@ -413,6 +650,64 @@ public class Int8MatvecLaneTest {
         assertFalse(names.toString(), names.contains("Q8_0_MatVec2_Q8"));
     }
 
+    /**
+     * The counted two-row pairing answers per kind, size, token count and row count: the OpenCL NVIDIA
+     * kind measured losses on the small side of the size split, so its small launches of Q8_0 and of
+     * Q4_0, Q4_K, Q5_K and IQ4_XS keep the counted one-row form while their large ones pair (Q6_K
+     * measured pairing wins at both sizes and pairs everywhere). At nine or more tokens the tall
+     * projections of Q4_K, Q5_K and IQ4_XS measured the counted one-row form faster (Q4_K 9728x2560
+     * at 16: 388.6 against the pair's 416.3us) while the 2560-row projections keep the pair (Q4_K
+     * 2560x9728 at 9: 129.9 against 168.0), and Q8_0, Q4_0 and Q6_K keep the pair at every large
+     * count; the CUDA kind pairs everywhere and the unmeasured kinds answer true.
+     */
+    @Test
+    public void theCountedPairingFollowsTheMeasuredKindAndSize() {
+        DeviceKind openclNvidia = DeviceKind.of(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.NVIDIA,
+                DeviceClass.DISCRETE, DeviceKind.CudaBand.NONE);
+        assertFalse(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q8_0, 1024L * 1024, 4, 1024));
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q8_0,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 4, 9728));
+        for (GGMLType type : new GGMLType[]{GGMLType.Q4_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.IQ4_XS}) {
+            assertFalse(type + " pairs the small side", Int8MatvecTuning.pairedCountedIsFaster(
+                    openclNvidia, type, 1024L * 1024, 4, 1024));
+            assertTrue(type + " pairs the large side", Int8MatvecTuning.pairedCountedIsFaster(
+                    openclNvidia, type, SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 4, 9728));
+        }
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q6_K, 1024L * 1024, 4, 1024));
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q6_K,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 16, 151936));
+        // The tall 4B-class projections of Q4_K, Q5_K and IQ4_XS flip to the counted one-row form
+        // from nine tokens up; the same types' 2560-row projections and the low counts keep the pair.
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q4_K,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 8, 9728));
+        assertFalse(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q4_K,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 9, 9728));
+        assertFalse(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.IQ4_XS,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 16, 151936));
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q4_K,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 16, 2560));
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(openclNvidia, GGMLType.Q8_0,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 16, 9728));
+        DeviceKind cudaTensor = DeviceKind.of(ComputeBackend.BackendType.CUDA, DeviceKind.Vendor.NVIDIA,
+                DeviceClass.DISCRETE, DeviceKind.CudaBand.TENSOR);
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(cudaTensor, GGMLType.Q8_0, 1024L * 1024, 4, 1024));
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(cudaTensor, GGMLType.Q4_K,
+                SmallBatchCrossover.SHAPE_MIN_ELEMENTS, 16, 9728));
+        DeviceKind unmeasured = DeviceKind.of(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.OTHER,
+                DeviceClass.DISCRETE, DeviceKind.CudaBand.NONE);
+        assertTrue(Int8MatvecTuning.pairedCountedIsFaster(unmeasured, GGMLType.Q8_0, 1024L * 1024, 4, 1024));
+        // The dispatch reflects it: the measured OpenCL kind keeps the counted one-row form at the
+        // small weight.
+        open(Int8MatvecMode.ON, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                capabilities(ComputeBackend.BackendType.OPENCL, FakeComputeBackend.NVIDIA_VENDOR_ID,
+                        DeviceClass.DISCRETE, DeviceFeature.INTEGER_DOT_PRODUCT));
+        GpuWeight w = weight(GGMLType.Q8_0);
+        List<String> names = run(() -> ops.matvec(w, backend.allocateBuffer((long) 4 * COLS * 4), 0,
+                backend.allocateBuffer((long) 4 * ROWS * 4), 0, 4));
+        assertTrue(names.toString(), names.contains("Q8_0_MatVecN4_Q8"));
+        assertFalse(names.toString(), names.contains("Q8_0_MatVec2N4_Q8"));
+    }
+
     @Test
     public void smallTokenGroupsQuantizeOnceAndUseTheMultiColumnInt8Matvec() {
         open(Int8MatvecMode.ON);
@@ -421,9 +716,51 @@ public class Int8MatvecLaneTest {
         List<String> names = run(() -> ops.matvec(w, backend.allocateBuffer((long) tokens * COLS * 4), 0,
                 backend.allocateBuffer((long) tokens * ROWS * 4), 0, tokens));
         assertTrue(names.toString(), names.contains(GpuOps.QUANTIZE_Q8_1));
-        assertTrue(names.toString(), names.contains("Q4_K_MatVecN_Q8"));
+        /* The kind's exact-token-count twin serves the group (the counted form of the same launch);
+         * its two-row twin stays off the small side of the measured pairing split. */
+        assertTrue(names.toString(), names.contains("Q4_K_MatVecN4_Q8"));
+        assertFalse(names.toString(), names.contains("Q4_K_MatVecN_Q8"));
+        assertFalse(names.toString(), names.contains("Q4_K_MatVec2N4_Q8"));
         assertFalse(names.toString(), names.contains("Q4_K_MatVec_Q8"));
         assertFalse(names.toString(), names.stream().anyMatch(n -> n.startsWith("Q4_K_BatchMatMul")));
+    }
+
+    /**
+     * An unmeasured device kind keeps the default dispatch: the integer-dot multi-column matvec up to
+     * {@link LlmKernelConstants#MATVEC_N_DISPATCH_MAX} rows, the tiled GEMM above it. Every served
+     * group runs the counted two-row Q8_0 form instead of the runtime-count kernel (the unmeasured
+     * kind answers the pairing question true). The fast quantized-weight GEMM lane is off for the
+     * dispatch ({@link MmqMode#PROPERTY}), since its kernel name selects by mode alone and would
+     * otherwise cap the multi-column lane at the rows below the lane's first.
+     */
+    @Test
+    public void exactTokenCountsUseTheCountedQ8MatvecForms() {
+        String previousMmq = System.getProperty(MmqMode.PROPERTY);
+        System.setProperty(MmqMode.PROPERTY, MmqMode.OFF.name().toLowerCase(Locale.ROOT));
+        try {
+            open(Int8MatvecMode.ON, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.OPENCL,
+                    capabilities(ComputeBackend.BackendType.OPENCL, UNMEASURED_VENDOR_ID, DeviceClass.DISCRETE,
+                            DeviceFeature.INTEGER_DOT_PRODUCT));
+            GpuWeight w = weight(GGMLType.Q8_0);
+            for (int tokens = 2; tokens <= LlmKernelConstants.MATVEC_N_MAX_TOKENS; tokens++) {
+                final int group = tokens;
+                List<String> names = run(() -> ops.matvec(w, backend.allocateBuffer((long) group * COLS * 4), 0,
+                        backend.allocateBuffer((long) group * ROWS * 4), 0, group));
+                if (tokens <= LlmKernelConstants.MATVEC_N_DISPATCH_MAX) {
+                    assertTrue(names.toString(), names.contains("Q8_0_MatVec2N" + group + "_Q8"));
+                    assertFalse(names.toString(), names.contains("Q8_0_MatVecN_Q8"));
+                    assertFalse(names.toString(), names.contains("Q8_0_MatVecN" + group + "_Q8"));
+                } else {
+                    assertTrue(names.toString(), names.contains("LLM_Batch_Q8_0_MatMul_2D"));
+                }
+            }
+        } finally {
+            if (previousMmq == null) {
+                System.clearProperty(MmqMode.PROPERTY);
+            } else {
+                System.setProperty(MmqMode.PROPERTY, previousMmq);
+            }
+        }
     }
 
     @Test
@@ -443,12 +780,12 @@ public class Int8MatvecLaneTest {
         open(Int8MatvecMode.ON);
         int rows = 1024;
         GpuWeight w = weight(GGMLType.Q4_K, rows);
-        List<Dispatch> ds = dispatches(() -> ops.matvec(w, backend.allocateBuffer((long) COLS * 4), 0,
+        List<FakeDispatch> ds = dispatches(() -> ops.matvec(w, backend.allocateBuffer((long) COLS * 4), 0,
                 backend.allocateBuffer((long) rows * 4), 0, 1));
         List<String> names = kernelNames(ds);
         assertTrue(names.toString(), names.contains("Q4_K_MatVec2_Q8"));
         assertFalse(names.toString(), names.contains("Q4_K_MatVec_Q8"));
-        Dispatch mv = ds.get(names.indexOf("Q4_K_MatVec2_Q8"));
+        FakeDispatch mv = ds.get(names.indexOf("Q4_K_MatVec2_Q8"));
         assertArrayEquals(new long[]{(long) (rows / 2) * ops.matvecLocal()}, mv.global());
         assertArrayEquals(new long[]{ops.matvecLocal()}, mv.local());
     }
@@ -554,15 +891,15 @@ public class Int8MatvecLaneTest {
         assertFalse(GpuOps.shareableQ8Activations(0, COLS - 8));
     }
 
-    private List<Dispatch> dispatches(Runnable r) {
+    private List<FakeDispatch> dispatches(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
-    private static List<String> kernelNames(List<Dispatch> ds) {
+    private static List<String> kernelNames(List<FakeDispatch> ds) {
         List<String> names = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             names.add(d.kernelName());
         }
         return names;

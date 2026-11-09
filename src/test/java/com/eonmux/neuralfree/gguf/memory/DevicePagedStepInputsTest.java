@@ -9,6 +9,8 @@ import com.eonmux.neuralfree.gguf.memory.paged.PagedSequences;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -132,8 +134,8 @@ public class DevicePagedStepInputsTest {
 
     private int copyOps() {
         int copies = 0;
-        for (FakeComputeBackend.Op op : backend.ops()) {
-            if (op.kind() == FakeComputeBackend.OpKind.COPY) {
+        for (FakeOp op : backend.ops()) {
+            if (op.kind() == FakeOpKind.COPY) {
                 copies++;
             }
         }

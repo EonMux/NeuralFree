@@ -125,7 +125,7 @@ Some architectures run with limits:
 - `deepseek41` runs on the CPU and GPU backends: cross-layer compressed-cache reads, window-plus-top-k compressed attention, the two-level candidate selection and the Engram n-gram embeddings (host hash, device gather/projection/gated add) are all implemented, and a checkpoint with `engram_layer_ids` converts its Engram tables from Hugging Face.
 - `lfm3` covers the non-causal d1 diffusion files too (`attention.causal = false`): their dense layers read the whole prompt bidirectionally, the sliding-window layers stay causal, and no KV memory is kept, so the context must hold the whole prompt.
 
-AUTO picks the physical device first, then the API (default order `vulkan,cuda,opencl,hip`). [USAGE.md](USAGE.md#compute-backends) describes the policy and its properties.
+AUTO picks the physical device first, then the API (default order `metal,vulkan,cuda,opencl,hip`, with CUDA first on an NVIDIA GPU). [USAGE.md](USAGE.md#compute-backends) describes the policy and its properties.
 
 When no GPU backend can be created, the demo continues on the CPU. `LLMModelFactory.open` also falls back to the CPU engine when the GPU load fails with a runtime or linkage error, and logs the reason. A missing or unreadable file and an I/O error while reading it are thrown without a fallback.
 

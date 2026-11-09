@@ -92,8 +92,8 @@ public class CohereEmbedResource {
         }
         String model = service.loras().model(body);
         LoraSelection lora = service.loras().selection(body, model);
-        if (service.perTokenEmbeddings() && service.sparsePooling() == null
-                && service.poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE) {
+        if (service.pooling().perTokenEmbeddings() && service.pooling().sparsePooling() == null
+                && service.pooling().poolingKind() == com.eonmux.neuralfree.gguf.arch.PoolingKind.NONE) {
             throw ServerJson.badRequest("the model pools by none; /v2/embed answers pooled embeddings");
         }
         if (body.raw("input_type") != null) {
@@ -103,7 +103,7 @@ public class CohereEmbedResource {
         CohereRequest request = CohereRequest.of(body);
         JsonView pooling = JsonView.of(request.poolingBody(), "body");
         EmbeddingOptions options = EmbeddingOptions.of(pooling, service.maxModelLength(),
-                service.sparsePooling() != null);
+                service.pooling().sparsePooling() != null);
         List<PoolingInputs.Input> inputs = PoolingInputs.of(pooling, service, options);
         PoolingResource pooler = new PoolingResource(service);
         List<float[]> vectors = new ArrayList<>(inputs.size());

@@ -13,6 +13,7 @@
 #define NF_FA_LG          (NF_FA_WG / 32) /* flash decode lane groups per workgroup; pass 2 splits the keys across them */
 #define NF_FA_ACC_MAX     32      /* per-thread output accumulators in flash kernels: g_tile*d_v <= NF_FA_WG*NF_FA_ACC_MAX */
 #define NF_FD_MAX_G       16      /* max q-heads per flash-decode workgroup (per-thread score registers) */
+#define NF_FA_FAST_DIM    128     /* head-dim limit of the flash-decode shuffle fast path: one coalesced row float4 per lane covers 32 lanes * 4 dims */
 #ifndef NF_FA_SMEM_FLOATS
 #define NF_FA_SMEM_FLOATS 3072    /* floats of static shared memory for flash kernels (12 KiB floor) */
 #endif

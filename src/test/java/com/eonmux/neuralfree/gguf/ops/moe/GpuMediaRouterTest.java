@@ -33,9 +33,9 @@ import com.eonmux.neuralfree.gguf.spec.ScratchWidths;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Test;
@@ -168,17 +168,17 @@ public class GpuMediaRouterTest {
     }
 
     /** One step over {@code stepTokens} (the host record the embedding stage keeps); the recorded operations. */
-    private List<Op> run(int... stepTokens) {
+    private List<FakeOp> run(int... stepTokens) {
         scratch.recordStepTokens(stepTokens, stepTokens.length);
         backend.clearLog();
         block.forward(stepTokens.length, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
         return backend.ops();
     }
 
-    private static List<Integer> routerOps(List<Op> ops) {
+    private static List<Integer> routerOps(List<FakeOp> ops) {
         List<Integer> out = new ArrayList<>();
         for (int i = 0; i < ops.size(); i++) {
-            if (ops.get(i).kind() == OpKind.DISPATCH
+            if (ops.get(i).kind() == FakeOpKind.DISPATCH
                     && ops.get(i).dispatch().kernelName().equals(MoeKernels.ROUTER)) {
                 out.add(i);
             }
@@ -186,10 +186,10 @@ public class GpuMediaRouterTest {
         return out;
     }
 
-    private static List<Op> copies(List<Op> ops) {
-        List<Op> out = new ArrayList<>();
-        for (Op op : ops) {
-            if (op.kind() == OpKind.COPY) {
+    private static List<FakeOp> copies(List<FakeOp> ops) {
+        List<FakeOp> out = new ArrayList<>();
+        for (FakeOp op : ops) {
+            if (op.kind() == FakeOpKind.COPY) {
                 out.add(op);
             }
         }
@@ -199,11 +199,11 @@ public class GpuMediaRouterTest {
     @Test
     public void embeddingRowsTakeTheRouterSelectionWithTheVisionBias() {
         open(true);
-        List<Op> ops = run(5, -1, -1, 7, -1);
+        List<FakeOp> ops = run(5, -1, -1, 7, -1);
         List<Integer> routers = routerOps(ops);
         assertEquals("the hash weights, then the embedding rows' own selection", 2, routers.size());
-        Dispatch hash = ops.get(routers.get(0)).dispatch();
-        Dispatch media = ops.get(routers.get(1)).dispatch();
+        FakeDispatch hash = ops.get(routers.get(0)).dispatch();
+        FakeDispatch media = ops.get(routers.get(1)).dispatch();
         assertEquals(MoeKernels.SEL_PRESELECTED, hash.intArg(ARG_SEL_MODE));
         assertEquals("the router's own top-k", MoeSpec.SelectionMode.PROBS.code(), media.intArg(ARG_SEL_MODE));
         assertEquals(5, media.intArg(MoeKernels.ARG_N_TOKENS));
@@ -215,7 +215,7 @@ public class GpuMediaRouterTest {
         FakeGpuBuffer weights = hash.bufferArg(ARG_WEIGHTS);
         assertNotSame(ids, media.bufferArg(ARG_IDS));
 
-        List<Op> copies = copies(ops);
+        List<FakeOp> copies = copies(ops);
         assertEquals("ids and weights of the two runs of embedding rows", 4, copies.size());
         long rowBytes = (long) K * Float.BYTES;
         assertCopy(copies.get(0), media.bufferArg(ARG_IDS), ids, rowBytes, 2 * rowBytes);
@@ -225,13 +225,13 @@ public class GpuMediaRouterTest {
         int lastCopy = ops.lastIndexOf(copies.get(3));
         assertTrue("the copies follow the second router", ops.indexOf(copies.get(0)) > routers.get(1));
         for (int i = lastCopy + 1; i < ops.size(); i++) {
-            assertTrue("no router after the copies", ops.get(i).kind() != OpKind.DISPATCH
+            assertTrue("no router after the copies", ops.get(i).kind() != FakeOpKind.DISPATCH
                     || !ops.get(i).dispatch().kernelName().equals(MoeKernels.ROUTER));
         }
         assertTrue("the experts run after the copies", ops.size() > lastCopy + 1);
     }
 
-    private static void assertCopy(Op copy, FakeGpuBuffer src, FakeGpuBuffer dst, long at, long bytes) {
+    private static void assertCopy(FakeOp copy, FakeGpuBuffer src, FakeGpuBuffer dst, long at, long bytes) {
         assertSame(src, copy.source());
         assertSame(dst, copy.buffer());
         assertEquals("source offset", at, copy.sourceOffset());
@@ -242,7 +242,7 @@ public class GpuMediaRouterTest {
     @Test
     public void aStepOfTokenRowsKeepsTheHashSelection() {
         open(true);
-        List<Op> ops = run(5, 9, 7);
+        List<FakeOp> ops = run(5, 9, 7);
         assertEquals(1, routerOps(ops).size());
         assertEquals(0, copies(ops).size());
     }
@@ -250,12 +250,12 @@ public class GpuMediaRouterTest {
     @Test
     public void withoutTheVisionBiasEmbeddingRowsSelectUnbiased() {
         open(false);
-        List<Op> ops = run(-1, -1, -1);
+        List<FakeOp> ops = run(-1, -1, -1);
         List<Integer> routers = routerOps(ops);
         assertEquals(2, routers.size());
-        Dispatch media = ops.get(routers.get(1)).dispatch();
+        FakeDispatch media = ops.get(routers.get(1)).dispatch();
         assertEquals("a hash layer has no exp_probs_b", 0, media.intArg(ARG_HAS_BIAS));
-        List<Op> copies = copies(ops);
+        List<FakeOp> copies = copies(ops);
         assertEquals("one run of every row", 2, copies.size());
         assertEquals(0L, copies.get(0).offset());
         assertEquals(3L * K * Float.BYTES, copies.get(0).bytes());

@@ -44,22 +44,27 @@ public class FlashAttnTilingPagedTest {
                 {16, 2, 512, 512}};
         for (int[] sh : shapes) {
             for (int smem : new int[]{SMEM_MIN, SMEM_48K}) {
-                FlashAttnTiling paged = FlashAttnTiling.decodePaged(4, sh[0], sh[1], sh[2], sh[3], MAX_KV, smem, CU);
-                FlashAttnTiling base = FlashAttnTiling.decode(sh[0], sh[1], sh[2], sh[3], MAX_KV, smem, CU);
-                assertEquals(FlashAttnTiling.Plan.DECODE, paged.plan());
-                assertEquals(paged.gTile(), base.gTile());
-                assertEquals(paged.minSplitLen(), base.minSplitLen());
-                assertEquals(paged.maxSplitLen(), base.maxSplitLen());
-                assertEquals(paged.maxSplits(), base.maxSplits());
-                assertEquals(MAX_KV, paged.keyCapacity());
-                checkDecodeConstraints(paged);
+                for (boolean fast : new boolean[]{false, true}) {
+                    FlashAttnTiling paged = FlashAttnTiling.decodePaged(4, sh[0], sh[1], sh[2], sh[3], MAX_KV,
+                            smem, CU, fast);
+                    FlashAttnTiling base = FlashAttnTiling.decode(sh[0], sh[1], sh[2], sh[3], MAX_KV, smem, CU,
+                            fast);
+                    assertEquals(FlashAttnTiling.Plan.DECODE, paged.plan());
+                    assertEquals(paged.gTile(), base.gTile());
+                    assertEquals(paged.minSplitLen(), base.minSplitLen());
+                    assertEquals(paged.maxSplitLen(), base.maxSplitLen());
+                    assertEquals(paged.maxSplits(), base.maxSplits());
+                    assertEquals(MAX_KV, paged.keyCapacity());
+                    assertEquals(fast, paged.decodeFastPath());
+                    checkDecodeConstraints(paged);
+                }
             }
         }
     }
 
     @Test
     public void decodePagedSplitsFollowAPerSequenceKeyCount() {
-        FlashAttnTiling t = FlashAttnTiling.decodePaged(4, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU);
+        FlashAttnTiling t = FlashAttnTiling.decodePaged(4, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU, false);
         assertEquals(MAX_KV, t.keyCapacity());
         assertSplit(t.decodeSplit(0), 1, 32);
         assertSplit(t.decodeSplit(128), 2, 64);
@@ -68,11 +73,17 @@ public class FlashAttnTilingPagedTest {
         // A step may never exceed the per-sequence slot range a sequence is planned over.
         assertThrows(IllegalArgumentException.class, () -> t.decodeSplit(MAX_KV + 1));
         assertThrows(IllegalArgumentException.class, () -> t.decodeSplit(-1));
+        // The fast path's device: the same wanted target, capped at the 128-key workgroup length.
+        FlashAttnTiling f = FlashAttnTiling.decodePaged(4, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU, true);
+        assertSplit(f.decodeSplit(0), 1, 32);
+        assertSplit(f.decodeSplit(128), 2, 64);
+        assertSplit(f.decodeSplit(1000), 8, 128);
+        assertSplit(f.decodeSplit(MAX_KV), 16, 128);
     }
 
     @Test
     public void decodePagedGlobalFoldsTheSequenceInFrontOfTheKvHeads() {
-        FlashAttnTiling t = FlashAttnTiling.decodePaged(6, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU);
+        FlashAttnTiling t = FlashAttnTiling.decodePaged(6, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU, false);
         // One query head per workgroup: the 32/8 = 4 heads per KV head planned as four one-head tiles.
         assertEquals(1, t.gTile());
         assertEquals(4, t.groupTiles());
@@ -95,7 +106,7 @@ public class FlashAttnTilingPagedTest {
 
     @Test
     public void decodePagedPartialFloatsHoldEverySequence() {
-        FlashAttnTiling t = FlashAttnTiling.decodePaged(6, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU);
+        FlashAttnTiling t = FlashAttnTiling.decodePaged(6, 32, 8, 128, 128, MAX_KV, SMEM_48K, CU, false);
         assertEquals(6L * 32 * t.maxSplits() * 130, t.decodePagedPartialFloats(6));
         // One sequence's rows stay the base decode budget at the same key capacity.
         assertEquals(t.decodePartialFloats(), t.decodePagedPartialFloats(1));
@@ -105,18 +116,18 @@ public class FlashAttnTilingPagedTest {
     @Test
     public void invalidPagedPlansAreRejected() {
         assertThrows(IllegalArgumentException.class,
-                () -> FlashAttnTiling.decodePaged(0, 32, 8, 128, 128, MAX_KV, SMEM_MIN, CU));
+                () -> FlashAttnTiling.decodePaged(0, 32, 8, 128, 128, MAX_KV, SMEM_MIN, CU, false));
         assertThrows(IllegalArgumentException.class,
-                () -> FlashAttnTiling.decodePaged(-4, 32, 8, 128, 128, MAX_KV, SMEM_MIN, CU));
+                () -> FlashAttnTiling.decodePaged(-4, 32, 8, 128, 128, MAX_KV, SMEM_MIN, CU, true));
         // The shape checks are those of decode.
         assertThrows(IllegalArgumentException.class,
-                () -> FlashAttnTiling.decodePaged(2, 32, 6, 128, 128, MAX_KV, SMEM_MIN, CU));
+                () -> FlashAttnTiling.decodePaged(2, 32, 6, 128, 128, MAX_KV, SMEM_MIN, CU, false));
         assertThrows(IllegalArgumentException.class,
-                () -> FlashAttnTiling.decodePaged(2, 32, 8, 130, 128, MAX_KV, SMEM_MIN, CU));
+                () -> FlashAttnTiling.decodePaged(2, 32, 8, 130, 128, MAX_KV, SMEM_MIN, CU, true));
         assertThrows(IllegalArgumentException.class,
-                () -> FlashAttnTiling.decodePaged(2, 32, 8, 128, 128, 0, SMEM_MIN, CU));
+                () -> FlashAttnTiling.decodePaged(2, 32, 8, 128, 128, 0, SMEM_MIN, CU, false));
         assertThrows(IllegalArgumentException.class,
-                () -> FlashAttnTiling.decodePaged(2, 32, 8, 128, 128, MAX_KV, 100, CU));
+                () -> FlashAttnTiling.decodePaged(2, 32, 8, 128, 128, MAX_KV, 100, CU, true));
     }
 
     @Test

@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeightUploader;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -92,7 +93,7 @@ public class F8E4M3FnGpuTest {
 
     private List<String> dispatched() {
         List<String> names = new java.util.ArrayList<>();
-        for (FakeComputeBackend.Dispatch d : backend.dispatches()) {
+        for (FakeDispatch d : backend.dispatches()) {
             names.add(d.kernelName());
         }
         return names;
@@ -126,7 +127,7 @@ public class F8E4M3FnGpuTest {
 
     @Test
     public void aSm89CudaDeviceSelectsTheSharedHwRows() {
-        GpuOps.WeightKernels k = GpuOps.weightKernels(GGMLType.F8_E4M3FN,
+        WeightKernels k = GpuWeightFamilies.weightKernels(GGMLType.F8_E4M3FN,
                 ComputeBackend.BackendType.CUDA, caps(89));
         assertEquals("hardware FP8 decode of the shared rows", "F8_E4M3_Hw_MatVec", k.matvec);
         assertEquals("F8_E4M3_Hw_MatMul_Tiled", k.tiled);

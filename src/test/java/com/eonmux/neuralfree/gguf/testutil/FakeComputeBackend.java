@@ -5,6 +5,8 @@ import com.eonmux.neuralfree.acceleration.UnsupportedKernelException;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.DeviceCapabilities;
+import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
+import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.backend.HostMappedBuffer;
@@ -61,18 +63,20 @@ import java.util.Set;
  */
 public final class FakeComputeBackend implements ComputeBackend {
 
+    /** PCI vendor id of the vendor the default fake device claims. */
+    public static final int NVIDIA_VENDOR_ID = 0x10DE;
+    /** PCI vendor id of Intel, whose integrated GPU the Vulkan fakes claim. */
+    public static final int INTEL_VENDOR_ID = 0x8086;
+
     public static final int MAX_LLM_SCALARS = 33;
     public static final int MAX_LLM_BUFFERS = 13;
     public static final String COMPUTE_QUEUE = "compute";
     public static final String TRANSFER_QUEUE = "transfer";
 
-    /** Kind of a recorded queue operation. */
-    public enum OpKind { DISPATCH, WRITE, READ, COPY, FILL, MARKER, FLUSH, FINISH, REPLAY, LAUNCH }
-
     /** Host-side stand-in for a kernel's effect, invoked with the recorded dispatch. */
     @FunctionalInterface
     public interface KernelEmulator {
-        void run(Dispatch dispatch);
+        void run(FakeDispatch dispatch);
     }
 
     final Object lock = new Object();
@@ -85,7 +89,7 @@ public final class FakeComputeBackend implements ComputeBackend {
     final Map<String, KernelEmulator> emulators;
     private final FakeQueue computeQueue;
     private final FakeQueue transferQueue;
-    private final List<Op> ops = new ArrayList<>();
+    private final List<FakeOp> ops = new ArrayList<>();
     private final List<FakeGpuBuffer> buffers = new ArrayList<>();
     private final Map<String, Kernel> kernelCache = new HashMap<>();
     private final List<String> compileCalls = new ArrayList<>();
@@ -122,7 +126,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         return new Builder();
     }
 
-    /** 8 GiB device, 2 GiB max allocation, work groups up to 1024, subgroups and FP16 supported. */
+    /** 8 GiB NVIDIA discrete device, 2 GiB max allocation, work groups up to 1024, subgroups and FP16 supported. */
     public static DeviceCapabilities defaultCapabilities() {
         return new DeviceCapabilities.Builder()
                 .deviceName("FakeDevice")
@@ -136,6 +140,8 @@ public final class FakeComputeBackend implements ComputeBackend {
                 .supportsFloat16(true)
                 .supportsSubgroups(true)
                 .maxLocalMemoryBytes(48L * 1024)
+                .deviceClass(DeviceClass.DISCRETE)
+                .identity(new DeviceIdentity("FakeDevice", NVIDIA_VENDOR_ID, null, null))
                 .build();
     }
 
@@ -375,17 +381,17 @@ public final class FakeComputeBackend implements ComputeBackend {
     }
 
     /** Every recorded operation since creation or the last {@link #clearLog()}. */
-    public List<Op> ops() {
+    public List<FakeOp> ops() {
         synchronized (lock) {
             return Collections.unmodifiableList(new ArrayList<>(ops));
         }
     }
 
-    public List<Dispatch> dispatches() {
+    public List<FakeDispatch> dispatches() {
         synchronized (lock) {
-            List<Dispatch> out = new ArrayList<>();
-            for (Op op : ops) {
-                if (op.kind() == OpKind.DISPATCH) {
+            List<FakeDispatch> out = new ArrayList<>();
+            for (FakeOp op : ops) {
+                if (op.kind() == FakeOpKind.DISPATCH) {
                     out.add(op.dispatch());
                 }
             }
@@ -393,9 +399,9 @@ public final class FakeComputeBackend implements ComputeBackend {
         }
     }
 
-    public List<Dispatch> dispatchesOf(String kernelName) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : dispatches()) {
+    public List<FakeDispatch> dispatchesOf(String kernelName) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : dispatches()) {
             if (d.kernelName().equals(kernelName)) {
                 out.add(d);
             }
@@ -405,7 +411,7 @@ public final class FakeComputeBackend implements ComputeBackend {
 
     public List<String> dispatchedKernelNames() {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : dispatches()) {
+        for (FakeDispatch d : dispatches()) {
             out.add(d.kernelName());
         }
         return Collections.unmodifiableList(out);
@@ -421,7 +427,7 @@ public final class FakeComputeBackend implements ComputeBackend {
     /** One line per recorded operation, in submission order. */
     public String formatTrace() {
         StringBuilder sb = new StringBuilder();
-        for (Op op : ops()) {
+        for (FakeOp op : ops()) {
             sb.append(op).append('\n');
         }
         return sb.toString();
@@ -499,7 +505,7 @@ public final class FakeComputeBackend implements ComputeBackend {
     /** Runs recorded dispatches against the buffers and emulators; the REPLAY op covers them in the log. */
     private void executeCapturedLocked(List<PendingDispatch> dispatches) {
         for (PendingDispatch p : dispatches) {
-            Dispatch d = new Dispatch(nextSequence++, COMPUTE_QUEUE, p.kernel.kernelName(), p.global.clone(),
+            FakeDispatch d = new FakeDispatch(nextSequence++, COMPUTE_QUEUE, p.kernel.kernelName(), p.global.clone(),
                     p.local == null ? null : p.local.clone(), p.args, p.preBound, false, 0);
             KernelEmulator emulator = emulators.get(p.kernel.kernelName());
             if (emulator != null) {
@@ -525,7 +531,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         if (replaying != graph) {
             throw new IllegalStateException("FakeComputeBackend: " + graph + " is not replaying");
         }
-        record(Op.builder(OpKind.REPLAY, COMPUTE_QUEUE).bytes(graph.dispatches.size()));
+        record(FakeOp.builder(FakeOpKind.REPLAY, COMPUTE_QUEUE).bytes(graph.dispatches.size()));
         executeCapturedLocked(graph.dispatches);
     }
 
@@ -538,7 +544,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         if (graph.closed) {
             throw new IllegalStateException(graph + " is closed");
         }
-        record(Op.builder(OpKind.LAUNCH, COMPUTE_QUEUE).bytes(graph.dispatches.size()));
+        record(FakeOp.builder(FakeOpKind.LAUNCH, COMPUTE_QUEUE).bytes(graph.dispatches.size()));
         executeCapturedLocked(graph.dispatches);
     }
 
@@ -846,7 +852,7 @@ public final class FakeComputeBackend implements ComputeBackend {
         }
     }
 
-    int record(Op.Builder op) {
+    int record(FakeOp.Builder op) {
         int seq = nextSequence++;
         ops.add(op.build(seq));
         return seq;
@@ -1113,361 +1119,6 @@ public final class FakeComputeBackend implements ComputeBackend {
                 }
             }
             return args.toArray();
-        }
-    }
-
-    // ================================================================== records
-
-    /** Immutable record of one kernel dispatch. Array arguments are returned as copies. */
-    public static final class Dispatch {
-        private final int sequence;
-        private final String queue;
-        private final String kernelName;
-        private final long[] global;
-        private final long[] local;
-        private final Object[] args;
-        private final boolean preBound;
-        private final boolean returnedEvent;
-        private final int waitCount;
-
-        Dispatch(int sequence, String queue, String kernelName, long[] global, long[] local, Object[] args,
-                 boolean preBound, boolean returnedEvent, int waitCount) {
-            this.sequence = sequence;
-            this.queue = queue;
-            this.kernelName = kernelName;
-            this.global = global;
-            this.local = local;
-            this.args = args;
-            this.preBound = preBound;
-            this.returnedEvent = returnedEvent;
-            this.waitCount = waitCount;
-        }
-
-        public int sequence() {
-            return sequence;
-        }
-
-        public String queue() {
-            return queue;
-        }
-
-        public String kernelName() {
-            return kernelName;
-        }
-
-        public long[] global() {
-            return global.clone();
-        }
-
-        /** The local size passed by the caller, or null when the caller left it to the backend. */
-        public long[] local() {
-            return local == null ? null : local.clone();
-        }
-
-        public boolean isPreBound() {
-            return preBound;
-        }
-
-        public boolean returnedEvent() {
-            return returnedEvent;
-        }
-
-        public int waitCount() {
-            return waitCount;
-        }
-
-        public int argCount() {
-            return args.length;
-        }
-
-        /** The snapshot of argument {@code i}; arrays are copied. */
-        public Object arg(int i) {
-            return copyIfArray(args[i]);
-        }
-
-        public List<Object> args() {
-            List<Object> out = new ArrayList<>(args.length);
-            for (Object a : args) {
-                out.add(copyIfArray(a));
-            }
-            return Collections.unmodifiableList(out);
-        }
-
-        /** Argument {@code i} as a 32-bit integer: Integer, Boolean (1/0) or a one-element int[]. */
-        public int intArg(int i) {
-            Object a = args[i];
-            if (a instanceof Integer) {
-                return (Integer) a;
-            }
-            if (a instanceof Boolean) {
-                return (Boolean) a ? 1 : 0;
-            }
-            if (a instanceof int[] && ((int[]) a).length == 1) {
-                return ((int[]) a)[0];
-            }
-            throw new IllegalStateException("arg " + i + " of " + kernelName + " is not an int: " + describe(a));
-        }
-
-        /** Argument {@code i} as a float: Float or a one-element float[]. */
-        public float floatArg(int i) {
-            Object a = args[i];
-            if (a instanceof Float) {
-                return (Float) a;
-            }
-            if (a instanceof float[] && ((float[]) a).length == 1) {
-                return ((float[]) a)[0];
-            }
-            throw new IllegalStateException("arg " + i + " of " + kernelName + " is not a float: " + describe(a));
-        }
-
-        public FakeGpuBuffer bufferArg(int i) {
-            Object a = args[i];
-            if (a instanceof FakeGpuBuffer) {
-                return (FakeGpuBuffer) a;
-            }
-            throw new IllegalStateException("arg " + i + " of " + kernelName + " is not a buffer: " + describe(a));
-        }
-
-        /** Buffer arguments in signature order, i.e. Vulkan binding order. */
-        public List<FakeGpuBuffer> bufferArgs() {
-            List<FakeGpuBuffer> out = new ArrayList<>();
-            for (Object a : args) {
-                if (a instanceof FakeGpuBuffer) {
-                    out.add((FakeGpuBuffer) a);
-                }
-            }
-            return Collections.unmodifiableList(out);
-        }
-
-        @Override
-        public String toString() {
-            StringBuilder sb = new StringBuilder();
-            sb.append('#').append(sequence).append(' ').append(queue).append(" DISPATCH ").append(kernelName)
-                    .append(" g=").append(Arrays.toString(global))
-                    .append(" l=").append(local == null ? "auto" : Arrays.toString(local))
-                    .append(" args=[");
-            for (int i = 0; i < args.length; i++) {
-                if (i > 0) {
-                    sb.append(", ");
-                }
-                sb.append(describe(args[i]));
-            }
-            sb.append(']');
-            if (preBound) {
-                sb.append(" prebound");
-            }
-            if (waitCount > 0) {
-                sb.append(" waits=").append(waitCount);
-            }
-            return sb.toString();
-        }
-
-        private static Object copyIfArray(Object a) {
-            if (a instanceof int[]) {
-                return ((int[]) a).clone();
-            }
-            if (a instanceof float[]) {
-                return ((float[]) a).clone();
-            }
-            if (a instanceof byte[]) {
-                return ((byte[]) a).clone();
-            }
-            if (a instanceof short[]) {
-                return ((short[]) a).clone();
-            }
-            if (a instanceof long[]) {
-                return ((long[]) a).clone();
-            }
-            if (a instanceof double[]) {
-                return ((double[]) a).clone();
-            }
-            return a;
-        }
-
-        private static String describe(Object a) {
-            if (a instanceof int[]) {
-                return Arrays.toString((int[]) a);
-            }
-            if (a instanceof float[]) {
-                return Arrays.toString((float[]) a);
-            }
-            if (a instanceof byte[]) {
-                return Arrays.toString((byte[]) a);
-            }
-            if (a instanceof short[]) {
-                return Arrays.toString((short[]) a);
-            }
-            if (a instanceof long[]) {
-                return Arrays.toString((long[]) a);
-            }
-            if (a instanceof double[]) {
-                return Arrays.toString((double[]) a);
-            }
-            return String.valueOf(a);
-        }
-    }
-
-    /** Immutable record of one queue operation. Fields that do not apply to the kind are null or 0. */
-    public static final class Op {
-        private final int sequence;
-        private final OpKind kind;
-        private final String queue;
-        private final Dispatch dispatch;
-        private final FakeGpuBuffer buffer;
-        private final long offset;
-        private final FakeGpuBuffer source;
-        private final long sourceOffset;
-        private final long bytes;
-        private final int pattern;
-        private final int waitCount;
-
-        private Op(Builder b, int sequence) {
-            this.sequence = sequence;
-            this.kind = b.kind;
-            this.queue = b.queue;
-            this.dispatch = b.dispatch;
-            this.buffer = b.buffer;
-            this.offset = b.offset;
-            this.source = b.source;
-            this.sourceOffset = b.sourceOffset;
-            this.bytes = b.bytes;
-            this.pattern = b.pattern;
-            this.waitCount = b.dispatch != null ? b.dispatch.waitCount() : b.waitCount;
-        }
-
-        static Builder builder(OpKind kind, String queue) {
-            return new Builder(kind, queue);
-        }
-
-        public int sequence() {
-            return sequence;
-        }
-
-        public OpKind kind() {
-            return kind;
-        }
-
-        public String queue() {
-            return queue;
-        }
-
-        /** The dispatch for {@link OpKind#DISPATCH}, else null. */
-        public Dispatch dispatch() {
-            return dispatch;
-        }
-
-        /** Destination of WRITE/COPY/FILL, source of READ. */
-        public FakeGpuBuffer buffer() {
-            return buffer;
-        }
-
-        public long offset() {
-            return offset;
-        }
-
-        /** Source of COPY. */
-        public FakeGpuBuffer source() {
-            return source;
-        }
-
-        public long sourceOffset() {
-            return sourceOffset;
-        }
-
-        public long bytes() {
-            return bytes;
-        }
-
-        /** Fill pattern of FILL. */
-        public int pattern() {
-            return pattern;
-        }
-
-        public int waitCount() {
-            return waitCount;
-        }
-
-        @Override
-        public String toString() {
-            if (kind == OpKind.DISPATCH) {
-                return dispatch.toString();
-            }
-            StringBuilder sb = new StringBuilder();
-            sb.append('#').append(sequence).append(' ').append(queue).append(' ').append(kind);
-            switch (kind) {
-                case WRITE:
-                case READ:
-                    sb.append(' ').append(buffer).append(" @").append(offset).append(" +").append(bytes).append('B');
-                    break;
-                case COPY:
-                    sb.append(' ').append(source).append(" @").append(sourceOffset).append(" -> ").append(buffer)
-                            .append(" @").append(offset).append(" +").append(bytes).append('B');
-                    break;
-                case FILL:
-                    sb.append(' ').append(buffer).append(" @").append(offset).append(" +").append(bytes)
-                            .append("B pattern=0x").append(Integer.toHexString(pattern));
-                    break;
-                default:
-                    break;
-            }
-            if (waitCount > 0) {
-                sb.append(" waits=").append(waitCount);
-            }
-            return sb.toString();
-        }
-
-        static final class Builder {
-            private final OpKind kind;
-            private final String queue;
-            private Dispatch dispatch;
-            private FakeGpuBuffer buffer;
-            private long offset;
-            private FakeGpuBuffer source;
-            private long sourceOffset;
-            private long bytes;
-            private int pattern;
-            private int waitCount;
-
-            private Builder(OpKind kind, String queue) {
-                this.kind = kind;
-                this.queue = queue;
-            }
-
-            Builder dispatch(Dispatch d) {
-                this.dispatch = d;
-                return this;
-            }
-
-            Builder buffer(FakeGpuBuffer b, long off) {
-                this.buffer = b;
-                this.offset = off;
-                return this;
-            }
-
-            Builder source(FakeGpuBuffer b, long off) {
-                this.source = b;
-                this.sourceOffset = off;
-                return this;
-            }
-
-            Builder bytes(long n) {
-                this.bytes = n;
-                return this;
-            }
-
-            Builder pattern(int p) {
-                this.pattern = p;
-                return this;
-            }
-
-            Builder waits(int n) {
-                this.waitCount = n;
-                return this;
-            }
-
-            Op build(int sequence) {
-                return new Op(this, sequence);
-            }
         }
     }
 

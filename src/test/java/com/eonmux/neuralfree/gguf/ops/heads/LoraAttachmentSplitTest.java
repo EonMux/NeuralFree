@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.gpu.forward.ScratchSlots;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -135,7 +136,7 @@ public class LoraAttachmentSplitTest {
         att.rescale(b.get(0).adapter(), 2f);
         for (int d = 0; d < 2; d++) {
             long writes = backends.get(d).ops().stream()
-                    .filter(op -> op.kind() == FakeComputeBackend.OpKind.WRITE).count();
+                    .filter(op -> op.kind() == FakeOpKind.WRITE).count();
             assertEquals("device " + d + " rewrites the scaled B of its one pair", 1L, writes);
         }
         att.close();

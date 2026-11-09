@@ -4,16 +4,13 @@ import com.eonmux.neuralfree.Config;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.gguf.ModelSourceOptions;
 import com.eonmux.neuralfree.gguf.arch.PoolingKind;
-import com.eonmux.neuralfree.gguf.chat.response.TemplateParsing;
 import com.eonmux.neuralfree.gguf.chat.tools.ToolStrict;
 import com.eonmux.neuralfree.gguf.cpu.numa.NumaStrategy;
 import com.eonmux.neuralfree.gguf.engine.lora.LoraConfig;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
-import com.eonmux.neuralfree.gguf.ops.moe.MoeCacheRanking;
 import com.eonmux.neuralfree.gguf.quant.ActivationQuant;
 import com.eonmux.neuralfree.gguf.rpc.RpcServerSpec;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -26,167 +23,9 @@ import java.util.Properties;
  * how checkpoint activation quantization is applied. Immutable; built with {@link #builder()} or read from system
  * properties with {@link #fromSystemProperties()}.
  *
- * <p>Properties read by {@link #fromProperties(Properties)} (absent keys keep their defaults):
- * <ul>
- *   <li>{@code neuralfree.backend}: auto | opencl | cuda | vulkan | hip | metal | cpu, or an accelerator API served by
- *       an installed backend provider (sycl, xpu, cann, hexagon, openvino, webgpu, musa, zdnn, zendnn);
- *       default auto.</li>
- *   <li>{@code neuralfree.device}: device-name substring the backend selection must match, default none.</li>
- *   <li>{@code neuralfree.batch.invariant}: {@code true} runs the batch-invariant kernels, vLLM's
- *       {@code VLLM_BATCH_INVARIANT}: a row's logits no longer depend on the other rows batched with it (see
- *       {@link com.eonmux.neuralfree.gguf.BatchInvariance}). The environment variable
- *       {@code NEURALFREE_BATCH_INVARIANT} is read when the property is unset; default false.</li>
- *   <li>{@code neuralfree.split.mode}: none (default) | layer | row | tensor | context; llama.cpp
- *       {@code --split-mode}. {@code layer} spreads the model over several GPUs, each taking a contiguous span of
- *       layers; {@code row} splits every trunk layer's dense feed-forward over the GPUs, each holding a slice of the
- *       hidden dimension and a device-to-device all-reduce summing the partials; {@code tensor} is vLLM's tensor
- *       parallelism, sharding the attention (column-parallel QKV with the heads divided over the ranks, per-rank KV
- *       caches, a row-parallel output all-reduced) and the dense feed-forward together; {@code context} is vLLM's
- *       decode context parallelism, dividing the context positions between the ranks while every rank keeps every
- *       head and merges the partial softmaxes with their log-sum-exp. The GPUs are
- *       {@code neuralfree.gpu.devices}, the layer shares {@code neuralfree.tensor.split} and the GPU holding the
- *       embedding and the output head {@code neuralfree.main.gpu}.</li>
- *   <li>{@code neuralfree.gpu.devices}: the GPUs a split runs over (llama.cpp {@code --device}).</li>
- *   <li>{@code neuralfree.rpc}: the remote compute servers a layer split adds as devices, as
- *       {@code host:port[@key]} entries (llama.cpp {@code --rpc}); an entry without an inline key reads
- *       {@code NEURALFREE_RPC_KEY}. Each server runs {@code nftool rpc-server} and contributes its own GPU as a
- *       layer target, so trunk layers can run on another machine. Every connection is authenticated with the
- *       shared key. Requires {@code neuralfree.split.mode=layer}.</li>
- *   <li>{@code neuralfree.expert.parallel}: whether a tensor split places whole experts on each rank instead of an
- *       intermediate-width slice of every expert (vLLM {@code --enable-expert-parallel}).</li>
- *   <li>The {@link EplbConfig} keys: {@code neuralfree.eplb} off (default) | on, {@code neuralfree.eplb.profile},
- *       {@code neuralfree.eplb.save} and {@code neuralfree.eplb.policy}, the expert-parallel load balancer that packs
- *       the experts over the ranks by their recorded routed-row load (vLLM EPLB) instead of contiguous blocks.</li>
- *   <li>The {@link MemoryConfig} keys, including {@code neuralfree.context.shift}.</li>
- *   <li>The {@link SamplerConfig} keys, including {@code neuralfree.seed}.</li>
- *   <li>{@code neuralfree.ram.cache.mb}: host cache for streamed weights in MiB; -1 (default) = automatic, sized
- *       against the maximum heap, the physical RAM and the model size, and off for a model larger than RAM
- *       ({@code WeightDataProvider.ramCacheBytes}); 0 = no cache.</li>
- *   <li>{@code neuralfree.vram.depth}: layers kept resident in VRAM when streaming; 0 (default) = from the VRAM
- *       budget.</li>
- *   <li>{@code neuralfree.numa}: the CPU pool's NUMA placement (llama.cpp {@code --numa}, {@link NumaStrategy}):
- *       {@code distribute}, {@code isolate}, {@code numactl} or {@code disabled} (default). The pool reads the
- *       property when it starts; the strategy places each worker thread on its node's CPUs.</li>
- *   <li>{@code neuralfree.cpu.offload.mb}: the MiB of device-resident trunk weights a GPU load instead keeps in
- *       page-locked host memory that the device reads in place (vLLM's UVA offloader,
- *       {@code cpu_offload_gb}); 0 (default) = off. The tensors are chosen in weight-layer order up to the
- *       budget, or by {@code neuralfree.cpu.offload.params} when that names parameter segments. The weights stay
- *       read once per pass over the interconnect, costing no VRAM and no upload. Needs a backend with host-mapped
- *       buffers (CUDA mapped host memory, Vulkan host-visible memory) on one device.</li>
- *   <li>{@code neuralfree.cpu.offload.params}: the parameter name segments of the UVA offload (vLLM's
- *       {@code cpu_offload_params}), comma-separated; for example {@code experts} keeps the routed expert tensors
- *       in mapped host memory and the rest of every layer on the device. A segment matches whole dotted name
- *       parts ({@code ffn_gate_exps} matches {@code blk.3.ffn_gate_exps.weight}, {@code expert} does not).
- *       Empty (default) offloads tensors of any kind up to the budget.</li>
- *   <li>{@code neuralfree.stream.params}: the parameter name segments of a streamed layer that go through the
- *       streaming slots (vLLM's prefetch {@code offload_params}), comma-separated; the other tensors of those
- *       layers stay resident. For example {@code experts} streams only routed expert stacks of the layers the
- *       placement streams, keeping their attention and dense feed-forward on the device. Empty (default) streams
- *       every tensor of a streamed layer.</li>
- *   <li>{@code neuralfree.gpu.vram.limit}: the device memory in MiB a GPU load may allocate on each of its devices
- *       (weights, caches, scratch, streaming slots, adapters, the MoE expert cache and the reserved drafter memory
- *       together), below what the device reports free; 0 (default) = no limit.</li>
- *   <li>{@code neuralfree.n.gpu.layers}: how many layers a GPU load keeps on the device (llama.cpp
- *       {@code -ngl}): {@code auto} (default; as many as the VRAM holds), {@code all}, or a count that covers the
- *       output head, so {@code N} puts {@code N - 1} trunk layers on the device and the rest compute on the host,
- *       each side with its KV on its own device ({@code com.eonmux.neuralfree.gguf.hybrid}).</li>
- *   <li>{@code neuralfree.override.tensor}: tensor placement overrides as
- *       {@code <pattern>=<cpu | gpu | opencl | cuda | vulkan | hip | metal>} entries (llama.cpp {@code -ot}); the
- *       first pattern that matches a tensor name decides where it is kept. A host match keeps a routed expert tensor
- *       in RAM while its layer stays on the device and computes the experts there
- *       ({@code com.eonmux.neuralfree.gguf.ops.moe}); any other host match keeps the tensor's whole layer on the
- *       host.</li>
- *   <li>{@code neuralfree.cpu.moe} (llama.cpp {@code --cpu-moe}) and {@code neuralfree.n.cpu.moe} (llama.cpp
- *       {@code --n-cpu-moe}): keep the expert weights of every, or of the first N, mixture-of-experts layers on
- *       the host, where the layer's experts compute while the rest of the layer runs on the device.</li>
- *   <li>{@code neuralfree.n-cpu-ffn}: the dense FFN weights of the first N decoder layers in RAM, on the host
- *       (llama.cpp {@code --n-cpu-ffn}); unset by default. The weights shrink the VRAM fit; a dense FFN that then
- *       has to leave the device fails its load.</li>
- *   <li>{@code neuralfree.moe.cache.mb}: the MoE expert-cache budget in MiB (llama.cpp {@code --moe-cache-mib});
- *       0 (default) leaves the budget to {@code neuralfree.moe.cache}, whose VRAM-left budget it overrides.</li>
- *   <li>{@code neuralfree.fit}: keep the experts in RAM when the dense weights and the context fit the VRAM
- *       without them (Avalon {@code --fit}), instead of streaming; default false.</li>
- *   <li>{@code neuralfree.cpu-moe}, {@code neuralfree.n-cpu-moe} and {@code neuralfree.override-tensor}:
- *       aliases of {@code neuralfree.cpu.moe}, {@code neuralfree.n.cpu.moe} and {@code neuralfree.override.tensor}
- *       with llama.cpp's flag-shaped keys, taking the same targets; the dotted key wins when both are set.</li>
- *   <li>The {@link MoeCacheConfig} keys: {@code neuralfree.moe.cache} off (default) | on | auto | MiB,
- *       {@code neuralfree.moe.cache.ranking}, {@code neuralfree.moe.cache.ranking.save},
- *       {@code neuralfree.moe.cache.prefetch}, {@code neuralfree.moe.cache.hosted.rows} and
- *       {@code neuralfree.moe.cache.tail.skip}, the GPU MoE expert cache
- *       of host-resident routed experts, the expert ranking it preloads from, its prefill expert prefetch and the
- *       approximate tail-skip rule (off by default; a rank drops uncached experts every token routes only at that
- *       top-k position or lower).
- *       {@code on}, {@code auto} or a MiB value hosts the routed expert stacks in RAM as {@code neuralfree.cpu.moe}
- *       does and serves their routed experts from the device cache; {@code neuralfree.moe.cache.mb} sets the same
- *       budget and wins when both give one.</li>
- *   <li>{@code neuralfree.draft}: path of a draft GGUF for speculative decoding, default none: a separate draft model,
- *       an eagle, eagle3, gemma4-assistant or dflash drafter, or a GGUF whose last block holds NextN / MTP tensors
- *       (with or without its trunk), which drafts with those blocks only ({@link LLMModelFactory}).</li>
- *   <li>{@code neuralfree.draft.type}: the drafter types, a comma-separated list as llama.cpp's {@code --spec-type}
- *       ({@link DraftType}, {@link DraftTypes}). At most one draft-file type: auto (default; detected from the
- *       file), draft-mtp (alias mtp; its NextN / MTP blocks, or the model's own without a draft file) or
- *       draft-simple (aliases simple, model; a separate draft model). Any of the lookup types, which draft without a
- *       draft file: ngram-simple (alias prompt-lookup; the target's own token history), ngram-map-k (aliases
- *       ngram-map, map-k), ngram-map-k4v (alias map-k4v), ngram-mod (alias mod), ngram-cache (the
- *       {@link com.eonmux.neuralfree.gguf.engine.draft.NgramCache} chain) and suffix (suffix decoding). Several types
- *       chain ({@code DrafterChain}) in llama.cpp's order, the lookup types first and the draft file last: each
- *       round the first drafter with a proposal drafts. A draft file needs a draft-file type in the list.</li>
- *   <li>The {@link SpeculativeOptions} keys: the n-gram sizes of each lookup type, the {@code ngram-cache} files,
- *       the suffix decoding limits and the verification mode ({@code neuralfree.draft.verify}).</li>
- *   <li>The {@link LookaheadOptions} keys ({@code neuralfree.lookahead}, {@code .window}, {@code .ngram.size} and
- *       {@code .max.ngrams}): lookahead (Jacobi) decoding instead of speculative decoding, over a paged memory of
- *       {@code window + maxNgrams + 1} sequences with unified KV.</li>
- *   <li>{@code neuralfree.draft.max} (default 3), {@code neuralfree.draft.min} (default 0),
- *       {@code neuralfree.draft.p.min} (default 0): llama.cpp {@code common_params_speculative_draft}. The draft
- *       max bounds every drafter's round; a lookup drafter also stops at its own draft size.</li>
- *   <li>The draft model's own placement, applied to the load of a separate draft model
- *       ({@code neuralfree.draft.*}; every one needs {@code neuralfree.draft}): {@code neuralfree.draft.gpu.devices}
- *       (llama.cpp {@code -devd}) a comma-separated GPU selector list like {@code neuralfree.gpu.devices}, or
- *       {@code none} alone to keep the draft on the host; unset (default) keeps the draft beside the target's
- *       weights on the target's backend. {@code neuralfree.draft.n.gpu.layers} (llama.cpp {@code -ngld}): a count
- *       that covers the output head, {@code auto} (default) or {@code all}, like {@code neuralfree.n.gpu.layers}
- *       but for the draft's load. {@code neuralfree.draft.override.tensor} (llama.cpp {@code -otd}),
- *       {@code neuralfree.draft.cpu.moe} (llama.cpp {@code -cmoed}) and {@code neuralfree.draft.n.cpu.moe}
- *       (llama.cpp {@code -ncmoed}): the draft load's own overrides and expert placement, replacing the target's.</li>
- *   <li>{@code neuralfree.mtp}: self-speculation with the model's own NextN / MTP layers, default false. A GPU
- *       load places the NextN / MTP blocks on the device and in its context fit only when it is set (or
- *       {@code neuralfree.nextn.memory} is), as llama.cpp loads them only with {@code load_mtp}.</li>
- *   <li>{@code neuralfree.lora}: LoRA adapters as {@code path[:scale][,path[:scale]...]} (llama.cpp {@code --lora} /
- *       {@code --lora-scaled}), scale 1 when omitted, default none; see {@link LoraSpec#parseList}.</li>
- *   <li>The {@link LoraConfig} keys of the per-request adapter registry ({@code neuralfree.lora.enable},
- *       {@code neuralfree.lora.max}, {@code neuralfree.lora.max.rank}, {@code neuralfree.lora.cache}).</li>
- *   <li>{@code neuralfree.control-vector}: control vectors as {@code path[:scale][,path[:scale]...]} (llama.cpp
- *       {@code --control-vector} / {@code --control-vector-scaled}), scale 1 when omitted, default none; see
- *       {@link ControlVectorSpec#parseList}.</li>
- *   <li>{@code neuralfree.control-vector-layer-range}: {@code START:END}, the 1-based decoder layers the control
- *       vectors apply to, both inclusive (llama.cpp {@code --control-vector-layer-range START END}); 0 or a negative
- *       value keeps the llama.cpp default of that side ({@code 1} for the start, the model's layer count for the
- *       end).</li>
- *   <li>The {@link ModelSourceOptions} keys ({@code neuralfree.hf.*}, {@code neuralfree.quant.online},
- *       {@code neuralfree.lora.base.config}): how a checkpoint that is not GGUF is turned into its GGUF view.</li>
- *   <li>{@code neuralfree.act.quant}: weight-only (default) | checkpoint, how a checkpoint's activation quantization
- *       is applied ({@link ActivationQuant}).</li>
- *   <li>{@code neuralfree.sampling.model.defaults}: whether a model's sampling defaults
- *       ({@link EngineModel#modelSamplingDefaults()}) fill the sampler settings and token budget a request leaves
- *       unset, default true.</li>
- *   <li>{@code neuralfree.reasoning.parser}: the reasoning parser (vLLM {@code --reasoning-parser} names,
- *       {@link com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers}), default auto: the chat template's.</li>
- *   <li>{@code neuralfree.tool.parser}: the tool-call parser (vLLM {@code --tool-call-parser} names,
- *       {@link com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry}), default auto: detected from the chat
- *       template; none leaves tool-call syntax in the content. The response-template parsers {@code hf} and
- *       {@code beam} (both properties) read the model's {@code response_template} metadata and pair only with
- *       the same parser, {@code auto} or {@code none}.</li>
- *   <li>{@code neuralfree.tool.strict}: the tool strict floor (vLLM {@code --tool-strict-level},
- *       {@code auto | function | parameter}, {@link com.eonmux.neuralfree.gguf.chat.tools.ToolStrict}),
- *       default auto: a tool's argument schema is enforced when the tool declares {@code strict}, and a
- *       tool-call grammar applies under {@code tool_choice: auto} only for a strict tool.</li>
- *   <li>{@code neuralfree.pooling}: the pooling type override (llama.cpp {@code --pooling}, vLLM
- *       {@code --override-pooler-config} {@code pooling_type}): {@code none | mean | cls | last | rank}, vLLM's
- *       {@code ALL} naming per-token pooling. Unset (default) takes the GGUF's {@code <arch>.pooling_type};
- *       {@code rank} refuses a model that stores no classifier head.</li>
- *   <li>{@code neuralfree.logits.processors}: the fully-qualified class names of custom logits processor
- *       factories to load beside the plugin providers (vLLM's {@code --logits-processors}), comma-separated.</li>
- * </ul>
+ * <p>The {@code neuralfree.*} properties {@link #fromProperties(Properties)} reads (absent keys keep their
+ * defaults) are documented beside the reader that parses them, {@code EngineProperties}; a value it cannot
+ * parse is refused with an {@link IllegalArgumentException} naming the property.
  */
 public final class EngineConfig {
 
@@ -740,7 +579,7 @@ public final class EngineConfig {
         this.draftMax = b.draftMax;
         this.draftMin = b.draftMin;
         this.draftPMin = b.draftPMin;
-        this.mtp = b.mtp || selfMtp(b);
+        this.mtp = b.mtp || EngineConfigRules.selfMtp(b);
         this.mtpSet = b.mtp;
         this.loras = Collections.unmodifiableList(new ArrayList<>(b.loras));
         this.loraConfig = b.loraConfig;
@@ -1134,58 +973,7 @@ public final class EngineConfig {
 
     @Override
     public String toString() {
-        return "EngineConfig{backend=" + backend + (deviceFilter != null ? ", device~'" + deviceFilter + "'" : "")
-                + (splitMode != SplitMode.NONE ? ", split=" + splitMode.llamaName() + gpuDevicesPart()
-                + (tensorSplit.length > 0 ? ", tensorSplit=" + Arrays.toString(tensorSplit) : "")
-                + (mainGpu > 0 ? ", mainGpu=" + mainGpu : "")
-                + (rpcServers.isEmpty() ? "" : ", rpc=" + rpcServers)
-                + (expertParallel ? ", expertParallel" : "")
-                + (eplb.isDefault() ? "" : ", eplb=" + eplb) : "")
-                + ", " + memory + ", " + samplerDefaults + ", ramCacheMb="
-                + (ramCacheMb == RAM_CACHE_AUTO ? "auto" : String.valueOf(ramCacheMb)) + ", vramDepth="
-                + (vramDepth == VRAM_DEPTH_AUTO ? "auto" : String.valueOf(vramDepth))
-                + (numa == NumaStrategy.DISABLED ? "" : ", numa=" + numa.label())
-                + (cpuOffloadMb > 0 ? ", cpuOffloadMb=" + cpuOffloadMb : "")
-                + (cpuOffloadParams.isEmpty() ? "" : ", cpuOffloadParams=" + cpuOffloadParams)
-                + (streamParams.isEmpty() ? "" : ", streamParams=" + streamParams)
-                + (gpuVramLimitMb == GPU_VRAM_UNLIMITED ? "" : ", gpuVramLimitMb=" + gpuVramLimitMb)
-                + (gpuLayers == GPU_LAYERS_AUTO ? ", gpuLayers=auto" : gpuLayers == GPU_LAYERS_ALL
-                ? ", gpuLayers=all" : ", gpuLayers=" + gpuLayers)
-                + (kvOffload ? "" : ", kvOffload=false")
-                + (tensorOverrides.isEmpty() ? "" : ", overrideTensor=" + tensorOverrides)
-                + (cpuMoe ? ", cpuMoe" : "") + (nCpuMoe > 0 ? ", nCpuMoe=" + nCpuMoe : "")
-                + (moeCache.mode() == MoeCacheConfig.Mode.OFF && moeCache.ranking().isDefault()
-                ? "" : ", " + moeCache)
-                + (draftModelPath != null ? ", draft=" + draftModelPath : "")
-                + (draftTypes.equals(DraftTypes.DEFAULT) ? "" : ", draftType=" + DraftTypes.names(draftTypes))
-                + (mtp ? ", mtp" : "")
-                + (speculativeOptions.isDefault() ? "" : ", " + speculativeOptions)
-                + (lookaheadOptions.enabled() ? ", " + lookaheadOptions : "")
-                + (speculative() ? ", draftMax=" + draftMax + ", draftMin=" + draftMin + ", draftPMin=" + draftPMin : "")
-                + (loras.isEmpty() ? "" : ", lora=" + loras)
-                + (controlVectors.isEmpty() ? "" : ", controlVector=" + controlVectors)
-                + (controlVectorLayerStart > 0 || controlVectorLayerEnd > 0
-                        ? ", controlVectorRange=" + controlVectorLayerStart + ":" + controlVectorLayerEnd : "")
-                + (sourceOptions.equals(ModelSourceOptions.defaults()) ? "" : ", " + sourceOptions)
-                + (activationQuant == ActivationQuant.WEIGHT_ONLY ? "" : ", actQuant="
-                + activationQuant.propertyValue())
-                + (modelSamplingDefaults ? "" : ", modelSamplingDefaults=false")
-                + (reasoningParser.equals(PARSER_AUTO) ? "" : ", reasoningParser=" + reasoningParser)
-                + (toolParser.equals(PARSER_AUTO) ? "" : ", toolParser=" + toolParser)
-                + (toolStrict != ToolStrict.AUTO ? ", toolStrict=" + toolStrict.name().toLowerCase(Locale.ROOT)
-                : "") + (beamAlwaysConstrain ? "" : ", beamAlwaysConstrain=false")
-                + (nCpuFfn != N_CPU_LAYERS_UNSET ? ", nCpuFfn=" + nCpuFfn : "")
-                + (moeCacheMb != 0 ? ", moeCacheMb=" + moeCacheMb : "")
-                + (moeCachePool ? ", moeCachePool" : "")
-                + (fit ? ", fit" : "")
-                + (pooling != null ? ", pooling=" + pooling.name().toLowerCase(Locale.ROOT) : "")
-                + (logitsProcessors.isEmpty() ? "" : ", logitsProcessors=" + logitsProcessors)
-                + (draftGpuLayers == GPU_LAYERS_AUTO ? "" : draftGpuLayers == GPU_LAYERS_ALL
-                ? ", draftGpuLayers=all" : ", draftGpuLayers=" + draftGpuLayers)
-                + (draftTensorOverrides.isEmpty() ? "" : ", draftOverrideTensor=" + draftTensorOverrides)
-                + (draftCpuMoe ? ", draftCpuMoe" : "") + (draftNCpuMoe > 0 ? ", draftNCpuMoe=" + draftNCpuMoe : "")
-                + (draftDevices.isEmpty() ? "" : ", draftDevices=" + draftDevices)
-                + '}';
+        return EngineConfigText.print(this);
     }
 
     /** The parser name that follows the chat template. */
@@ -1193,128 +981,65 @@ public final class EngineConfig {
     /** The tool-parser name that turns tool-call parsing off. */
     public static final String PARSER_NONE = "none";
 
-    /** The {@link #gpuDevices()} entries as {@code devices=[a,b]}, or empty for the auto selection. */
-    private String gpuDevicesPart() {
-        return gpuDevices.isEmpty() ? "" : " devices=" + gpuDevices;
-    }
-
-    private static String parserName(String v) {
-        return v == null || v.trim().isEmpty() ? PARSER_AUTO : v.trim();
-    }
-
-    /**
-     * A response-template parser ({@code hf}, {@code beam}) parses the reasoning and the tool calls alike, so beside it
-     * the other parser is unset ({@code auto}, {@code none}) or the same one, as vLLM's parser manager requires.
-     *
-     * @throws IllegalArgumentException naming both parsers
-     */
-    private static void checkTemplateParsers(String reasoningParser, String toolParser) {
-        boolean reasoningSet = !isUnset(reasoningParser);
-        boolean toolSet = !isUnset(toolParser);
-        boolean template = TemplateParsing.names(reasoningParser)
-                || TemplateParsing.names(toolParser);
-        if (template && reasoningSet && toolSet && !reasoningParser.equalsIgnoreCase(toolParser)) {
-            throw new IllegalArgumentException(PROP_REASONING_PARSER + "=" + reasoningParser + " and "
-                    + PROP_TOOL_PARSER + "=" + toolParser + " cannot be combined: a response-template parser"
-                    + " (hf, beam) parses the reasoning and the tool calls alike");
-        }
-    }
-
-    private static boolean isUnset(String parser) {
-        return parser.equalsIgnoreCase(PARSER_AUTO) || parser.equalsIgnoreCase(PARSER_NONE)
-                || parser.equalsIgnoreCase("identity");
-    }
-
-    /** {@link DraftType#MTP} without a draft file drafts with the model's own NextN / MTP blocks. */
-    private static boolean selfMtp(Builder b) {
-        return DraftTypes.fileType(b.draftTypes) == DraftType.MTP && b.draftModelPath == null;
-    }
-
     public static final class Builder {
-        private BackendMode backend = BackendMode.AUTO;
-        private String deviceFilter;
-        private SplitMode splitMode = SplitMode.NONE;
-        private boolean expertParallel;
-        private int prefillContextParallelSize = 1;
-        private EplbConfig eplb = EplbConfig.off();
-        private List<String> gpuDevices = new ArrayList<>();
-        private final List<RpcServerSpec> rpcServers = new ArrayList<>();
-        private double[] tensorSplit = new double[0];
-        private int mainGpu;
-        private MemoryConfig memory = MemoryConfig.defaults();
-        private SamplerConfig samplerDefaults = SamplerConfig.defaults();
-        private long ramCacheMb = RAM_CACHE_AUTO;
-        private int vramDepth = VRAM_DEPTH_AUTO;
-        private NumaStrategy numa = NumaStrategy.DISABLED;
-        private long cpuOffloadMb;
-        private final List<String> cpuOffloadParams = new ArrayList<>();
-        private final List<String> streamParams = new ArrayList<>();
-        private long gpuVramLimitMb = GPU_VRAM_UNLIMITED;
-        private int gpuLayers = GPU_LAYERS_AUTO;
-        private boolean kvOffload = true;
-        private final List<TensorOverride> tensorOverrides = new ArrayList<>();
-        private boolean cpuMoe;
-        private int nCpuMoe = N_CPU_LAYERS_UNSET;
-        private MoeCacheConfig moeCache = MoeCacheConfig.off();
-        private String draftModelPath;
-        private List<DraftType> draftTypes = DraftTypes.DEFAULT;
-        private SpeculativeOptions speculativeOptions = SpeculativeOptions.defaults();
-        private LookaheadOptions lookaheadOptions = LookaheadOptions.disabled();
-        private int draftMax = 3;
-        private int draftMin;
-        private float draftPMin;
-        private boolean mtp;
-        private final List<LoraSpec> loras = new ArrayList<>();
-        private LoraConfig loraConfig = LoraConfig.defaults();
-        private final List<ControlVectorSpec> controlVectors = new ArrayList<>();
-        private int controlVectorLayerStart;
-        private int controlVectorLayerEnd;
-        private ModelSourceOptions sourceOptions = ModelSourceOptions.defaults();
-        private ActivationQuant activationQuant = ActivationQuant.WEIGHT_ONLY;
-        private boolean modelSamplingDefaults = true;
-        private String reasoningParser = PARSER_AUTO;
-        private String toolParser = PARSER_AUTO;
-        private ToolStrict toolStrict = ToolStrict.AUTO;
-        private boolean beamAlwaysConstrain = true;
-        private int nCpuFfn = N_CPU_LAYERS_UNSET;
-        private long moeCacheMb;
-        private boolean moeCachePool;
-        private boolean fit;
-        private PoolingKind pooling;
-        private final List<String> logitsProcessors = new ArrayList<>();
-        private int draftGpuLayers = GPU_LAYERS_AUTO;
-        private final List<TensorOverride> draftTensorOverrides = new ArrayList<>();
-        private boolean draftCpuMoe;
-        private int draftNCpuMoe = N_CPU_LAYERS_UNSET;
-        private final List<String> draftDevices = new ArrayList<>();
+        BackendMode backend = BackendMode.AUTO;
+        String deviceFilter;
+        SplitMode splitMode = SplitMode.NONE;
+        boolean expertParallel;
+        int prefillContextParallelSize = 1;
+        EplbConfig eplb = EplbConfig.off();
+        List<String> gpuDevices = new ArrayList<>();
+        final List<RpcServerSpec> rpcServers = new ArrayList<>();
+        double[] tensorSplit = new double[0];
+        int mainGpu;
+        MemoryConfig memory = MemoryConfig.defaults();
+        SamplerConfig samplerDefaults = SamplerConfig.defaults();
+        long ramCacheMb = RAM_CACHE_AUTO;
+        int vramDepth = VRAM_DEPTH_AUTO;
+        NumaStrategy numa = NumaStrategy.DISABLED;
+        long cpuOffloadMb;
+        final List<String> cpuOffloadParams = new ArrayList<>();
+        final List<String> streamParams = new ArrayList<>();
+        long gpuVramLimitMb = GPU_VRAM_UNLIMITED;
+        int gpuLayers = GPU_LAYERS_AUTO;
+        boolean kvOffload = true;
+        final List<TensorOverride> tensorOverrides = new ArrayList<>();
+        boolean cpuMoe;
+        int nCpuMoe = N_CPU_LAYERS_UNSET;
+        MoeCacheConfig moeCache = MoeCacheConfig.off();
+        String draftModelPath;
+        List<DraftType> draftTypes = DraftTypes.DEFAULT;
+        SpeculativeOptions speculativeOptions = SpeculativeOptions.defaults();
+        LookaheadOptions lookaheadOptions = LookaheadOptions.disabled();
+        int draftMax = 3;
+        int draftMin;
+        float draftPMin;
+        boolean mtp;
+        final List<LoraSpec> loras = new ArrayList<>();
+        LoraConfig loraConfig = LoraConfig.defaults();
+        final List<ControlVectorSpec> controlVectors = new ArrayList<>();
+        int controlVectorLayerStart;
+        int controlVectorLayerEnd;
+        ModelSourceOptions sourceOptions = ModelSourceOptions.defaults();
+        ActivationQuant activationQuant = ActivationQuant.WEIGHT_ONLY;
+        boolean modelSamplingDefaults = true;
+        String reasoningParser = PARSER_AUTO;
+        String toolParser = PARSER_AUTO;
+        ToolStrict toolStrict = ToolStrict.AUTO;
+        boolean beamAlwaysConstrain = true;
+        int nCpuFfn = N_CPU_LAYERS_UNSET;
+        long moeCacheMb;
+        boolean moeCachePool;
+        boolean fit;
+        PoolingKind pooling;
+        final List<String> logitsProcessors = new ArrayList<>();
+        int draftGpuLayers = GPU_LAYERS_AUTO;
+        final List<TensorOverride> draftTensorOverrides = new ArrayList<>();
+        boolean draftCpuMoe;
+        int draftNCpuMoe = N_CPU_LAYERS_UNSET;
+        final List<String> draftDevices = new ArrayList<>();
 
         private Builder() {
-        }
-
-        /** Replaces a parameter-segment list, refusing a blank segment or an empty dotted part by property name. */
-        private static void replaceSegments(List<String> target, List<String> v, String property) {
-            Objects.requireNonNull(v, property);
-            List<String> copy = new ArrayList<>(v.size());
-            for (String segment : v) {
-                copy.add(checkSegment(segment, property));
-            }
-            target.clear();
-            target.addAll(copy);
-        }
-
-        /** One parameter name segment: non-blank, and no empty part between its dots. */
-        private static String checkSegment(String segment, String property) {
-            if (segment == null || segment.trim().isEmpty()) {
-                throw new IllegalArgumentException(property + " has a blank parameter segment");
-            }
-            String s = segment.trim();
-            for (String part : s.split("\\.", -1)) {
-                if (part.isEmpty()) {
-                    throw new IllegalArgumentException(property + " segment '" + s + "' has an empty dotted part;"
-                            + " use whole name parts, for example experts or ffn_gate_exps");
-                }
-            }
-            return s;
         }
 
         public Builder backend(BackendMode v) { this.backend = Objects.requireNonNull(v, "backend"); return this; }
@@ -1442,7 +1167,7 @@ public final class EngineConfig {
          *                                  empty dotted part
          */
         public Builder cpuOffloadParams(List<String> v) {
-            replaceSegments(cpuOffloadParams, v, PROP_CPU_OFFLOAD_PARAMS);
+            EngineConfigRules.replaceSegments(cpuOffloadParams, v, PROP_CPU_OFFLOAD_PARAMS);
             return this;
         }
 
@@ -1454,7 +1179,7 @@ public final class EngineConfig {
          *                                  dotted part
          */
         public Builder streamParams(List<String> v) {
-            replaceSegments(streamParams, v, PROP_STREAM_PARAMS);
+            EngineConfigRules.replaceSegments(streamParams, v, PROP_STREAM_PARAMS);
             return this;
         }
 
@@ -1617,10 +1342,10 @@ public final class EngineConfig {
         public Builder modelSamplingDefaults(boolean v) { this.modelSamplingDefaults = v; return this; }
 
         /** The reasoning parser name; null or blank is {@code auto}. */
-        public Builder reasoningParser(String v) { this.reasoningParser = parserName(v); return this; }
+        public Builder reasoningParser(String v) { this.reasoningParser = EngineConfigRules.parserName(v); return this; }
 
         /** The tool-call parser name; null or blank is {@code auto}, {@code none} turns parsing off. */
-        public Builder toolParser(String v) { this.toolParser = parserName(v); return this; }
+        public Builder toolParser(String v) { this.toolParser = EngineConfigRules.parserName(v); return this; }
 
         /** The tool strict floor ({@code auto | function | parameter}); null or blank is {@code auto}. */
         public Builder toolStrict(ToolStrict v) { this.toolStrict = v == null ? ToolStrict.AUTO : v; return this; }
@@ -1738,267 +1463,7 @@ public final class EngineConfig {
          * @throws IllegalArgumentException naming the setting when a value is out of range
          */
         public EngineConfig build() {
-            if (!rpcServers.isEmpty() && splitMode != SplitMode.LAYER) {
-                throw new IllegalArgumentException(PROP_RPC + " adds remote devices to a layer split; set "
-                        + PROP_SPLIT_MODE + "=" + SplitMode.LAYER.llamaName() + ", got "
-                        + splitMode.llamaName());
-            }
-            if (!rpcServers.isEmpty() && !backend.usesGpu()) {
-                throw new IllegalArgumentException(PROP_RPC + " adds remote GPU devices; it cannot run with "
-                        + PROP_BACKEND + "=cpu");
-            }
-            if (ramCacheMb < RAM_CACHE_AUTO) {
-                throw new IllegalArgumentException(PROP_RAM_CACHE_MB + " must be >= 0, or -1 for automatic, got " + ramCacheMb);
-            }
-            if (gpuVramLimitMb < 0) {
-                throw new IllegalArgumentException(PROP_GPU_VRAM_LIMIT + " must be >= 0 MiB (0 = no limit), got "
-                        + gpuVramLimitMb);
-            }
-            if (vramDepth < 0) {
-                throw new IllegalArgumentException(PROP_VRAM_DEPTH + " must be >= 0 (0 = automatic), got " + vramDepth);
-            }
-            if (cpuOffloadMb < 0) {
-                throw new IllegalArgumentException(PROP_CPU_OFFLOAD_MB + " must be >= 0 (0 = off), got "
-                        + cpuOffloadMb);
-            }
-            if (cpuOffloadMb > Long.MAX_VALUE / (1024L * 1024L)) {
-                throw new IllegalArgumentException(PROP_CPU_OFFLOAD_MB + "=" + cpuOffloadMb + " does not fit a byte"
-                        + " count");
-            }
-            if (cpuOffloadMb == 0 && !cpuOffloadParams.isEmpty()) {
-                throw new IllegalArgumentException(PROP_CPU_OFFLOAD_PARAMS + " names " + cpuOffloadParams
-                        + " but " + PROP_CPU_OFFLOAD_MB + " is 0; set a host-mapped offload budget in MiB");
-            }
-            if (nCpuMoe < N_CPU_LAYERS_UNSET) {
-                throw new IllegalArgumentException(PROP_N_CPU_MOE + " must be >= 0, got " + nCpuMoe);
-            }
-            if (mainGpu < 0) {
-                throw new IllegalArgumentException(PROP_MAIN_GPU + " must be >= 0, got " + mainGpu);
-            }
-            if (splitMode != SplitMode.LAYER && !gpuDevices.isEmpty() && mainGpu >= gpuDevices.size()) {
-                throw new IllegalArgumentException(PROP_MAIN_GPU + "=" + mainGpu + " is beyond the "
-                        + gpuDevices.size() + " device(s) of " + PROP_GPU_DEVICES + " " + gpuDevices
-                        + " (indices 0.." + (gpuDevices.size() - 1) + ")");
-            }
-            if ((splitMode == SplitMode.LAYER || splitMode == SplitMode.ROW
-                    || splitMode == SplitMode.TENSOR || splitMode == SplitMode.CONTEXT)
-                    && backend == BackendMode.CPU) {
-                throw new IllegalArgumentException(PROP_SPLIT_MODE + "=" + splitMode.llamaName()
-                        + " spreads the model over GPUs, but " + PROP_BACKEND + "=cpu runs none");
-            }
-            if (expertParallel && splitMode != SplitMode.TENSOR) {
-                throw new IllegalArgumentException(PROP_EXPERT_PARALLEL + "=true places whole experts per rank of a"
-                        + " tensor split, but " + PROP_SPLIT_MODE + "=" + splitMode.llamaName());
-            }
-            if (prefillContextParallelSize < 1) {
-                throw new IllegalArgumentException(PROP_PREFILL_CONTEXT_PARALLEL + " must be >= 1, got "
-                        + prefillContextParallelSize);
-            }
-            if (prefillContextParallelSize > 1 && splitMode != SplitMode.CONTEXT) {
-                throw new IllegalArgumentException(PROP_PREFILL_CONTEXT_PARALLEL + "="
-                        + prefillContextParallelSize + " splits every prefill's query rows over the ranks of a"
-                        + " context split, but " + PROP_SPLIT_MODE + "=" + splitMode.llamaName() + "; set "
-                        + PROP_SPLIT_MODE + "=context or keep " + PROP_PREFILL_CONTEXT_PARALLEL + "=1");
-            }
-            if (expertParallel && (cpuMoe || nCpuMoe != N_CPU_LAYERS_UNSET || !tensorOverrides.isEmpty()
-                    || moeCache.enabled())) {
-                throw new IllegalArgumentException(PROP_EXPERT_PARALLEL + "=true needs every routed expert resident"
-                        + " on its rank, but the expert offload settings (" + PROP_CPU_MOE + ", "
-                        + PROP_N_CPU_MOE + ", " + PROP_TENSOR_OVERRIDES + ", " + PROP_MOE_CACHE_MB
-                        + ") keep experts in host RAM");
-            }
-            if (eplb.enabled() && !expertParallel) {
-                throw new IllegalArgumentException(EplbConfig.PROP_EPLB + "=on balances the whole experts of expert"
-                        + " parallelism, but " + PROP_EXPERT_PARALLEL + " is off");
-            }
-            if (eplb.enabled() && eplb.profile() == null && eplb.save() == null && !eplb.rebalance()) {
-                throw new IllegalArgumentException(EplbConfig.PROP_EPLB + "=on needs " + EplbConfig.PROP_EPLB_PROFILE
-                        + " (a recorded load to balance from), " + EplbConfig.PROP_EPLB_SAVE
-                        + " (to record this run's load) or " + EplbConfig.PROP_EPLB_REBALANCE
-                        + "=on (to rearrange from the live load)");
-            }
-            if (eplb.policy() == EplbConfig.Policy.DEFAULT && eplb.numNodes() != 1) {
-                throw new IllegalArgumentException(EplbConfig.PROP_EPLB_NUM_NODES + " groups the experts of the"
-                        + " hierarchical policy; give " + EplbConfig.PROP_EPLB_POLICY + "=hierarchical");
-            }
-            if (eplb.save() != null && moeCache.ranking().savePath() != null) {
-                throw new IllegalArgumentException(EplbConfig.PROP_EPLB_SAVE + " and " + MoeCacheRanking.PROP_SAVE
-                        + " both write a routed-row profile, but the forward path records into one; keep one");
-            }
-            if (nCpuFfn < N_CPU_LAYERS_UNSET) {
-                throw new IllegalArgumentException(PROP_N_CPU_FFN + " must be >= 0, got " + nCpuFfn);
-            }
-            if (moeCacheMb < 0) {
-                throw new IllegalArgumentException(PROP_MOE_CACHE_MB + " must be >= 0, got " + moeCacheMb);
-            }
-            if (moeCachePool && !(moeCache.enabled() || moeCacheMb > 0)) {
-                throw new IllegalArgumentException(PROP_MOE_CACHE_POOL + "=true pools the expert cache over the"
-                        + " GPUs of a layer split, but neither " + MoeCacheConfig.PROP_MOE_CACHE + " nor "
-                        + PROP_MOE_CACHE_MB + " enables the cache");
-            }
-            if (moeCachePool && splitMode != SplitMode.LAYER) {
-                throw new IllegalArgumentException(PROP_MOE_CACHE_POOL + "=true divides the routed MoE layers over"
-                        + " the GPUs of a " + PROP_SPLIT_MODE + "=layer load, but " + PROP_SPLIT_MODE + "="
-                        + splitMode.llamaName() + "; list two or more --device GPUs or set " + PROP_SPLIT_MODE
-                        + "=layer");
-            }
-            if (draftMax <= 0) {
-                throw new IllegalArgumentException(PROP_DRAFT_MAX + " must be positive, got " + draftMax);
-            }
-            if (draftMin < 0 || draftMin > draftMax) {
-                throw new IllegalArgumentException(PROP_DRAFT_MIN + " must be in [0, " + PROP_DRAFT_MAX + "=" + draftMax
-                        + "], got " + draftMin);
-            }
-            if (!(draftPMin >= 0f && draftPMin <= 1f)) {
-                throw new IllegalArgumentException(PROP_DRAFT_P_MIN + " must be in [0, 1], got " + draftPMin);
-            }
-            if (speculativeOptions.heterogeneousVocab()) {
-                if (draftModelPath == null) {
-                    throw new IllegalArgumentException(SpeculativeOptions.PROP_HETEROGENEOUS_VOCAB + " applies to a"
-                            + " separate draft model, but " + PROP_DRAFT + " names none");
-                }
-                if (speculativeOptions.probabilisticDraft()) {
-                    throw new IllegalArgumentException(SpeculativeOptions.PROP_HETEROGENEOUS_VOCAB + " supports greedy"
-                            + " drafting only; " + SpeculativeOptions.PROP_DRAFT_SAMPLE_METHOD + "=probabilistic"
-                            + " needs a shared vocabulary");
-                }
-                if (DraftTypes.fileType(draftTypes) == DraftType.MTP) {
-                    throw new IllegalArgumentException(SpeculativeOptions.PROP_HETEROGENEOUS_VOCAB + " needs a"
-                            + " separate draft model (draft-simple), but " + PROP_DRAFT_TYPE + "="
-                            + DraftTypes.names(draftTypes) + " drafts with the target's NextN / MTP blocks");
-                }
-            }
-            checkDrafters();
-            if (draftNCpuMoe < N_CPU_LAYERS_UNSET) {
-                throw new IllegalArgumentException(PROP_DRAFT_N_CPU_MOE + " must be >= 0, got " + draftNCpuMoe);
-            }
-            checkDraftDevices();
-            if (draftPlacementSet() && draftModelPath == null) {
-                throw new IllegalArgumentException(draftPlacementRefusal());
-            }
-            if (!reasoningParser.equals(PARSER_AUTO)
-                    && com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers.forName(reasoningParser) == null) {
-                throw new IllegalArgumentException(PROP_REASONING_PARSER + "=" + reasoningParser
-                        + " is not a reasoning parser; use auto or one of "
-                        + com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers.names());
-            }
-            if (!toolParser.equals(PARSER_AUTO) && !toolParser.equals(PARSER_NONE)
-                    && com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry.forName(toolParser) == null) {
-                throw new IllegalArgumentException(PROP_TOOL_PARSER + "=" + toolParser
-                        + " is not a tool-call parser; use auto, none or one of "
-                        + com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry.names());
-            }
-            checkTemplateParsers(reasoningParser, toolParser);
-            checkLookahead(memory);
-            boolean ownHead = mtp || selfMtp(this);
-            DraftType fileType = DraftTypes.fileType(draftTypes);
-            int rollback = ownHead || draftModelPath != null && fileType != DraftType.MODEL ? draftMax : 0;
-            return new EngineConfig(this, memory.forSpeculation(draftModelPath != null || ownHead, ownHead)
-                    .forRollback(rollback));
-        }
-
-        /**
-         * Refuses drafter settings nothing would read: a draft file beside a type list without a draft-file type,
-         * {@code draft-simple} with the MTP head and no draft file, and lookup cache files without
-         * {@code ngram-cache}.
-         */
-        private void checkDrafters() {
-            DraftType fileType = DraftTypes.fileType(draftTypes);
-            boolean fileListed = !draftTypes.get(draftTypes.size() - 1).lookupWithoutDraftModel();
-            if (draftModelPath != null && !fileListed) {
-                throw new IllegalArgumentException(PROP_DRAFT + " is set, but " + PROP_DRAFT_TYPE + "="
-                        + DraftTypes.names(draftTypes) + " has no draft-file type to run it; add auto, draft-simple"
-                        + " or draft-mtp to the list");
-            }
-            if (fileType == DraftType.MODEL && draftModelPath == null && mtp) {
-                throw new IllegalArgumentException(PROP_DRAFT_TYPE + "=" + fileType.llamaName() + " runs a separate"
-                        + " draft model (" + PROP_DRAFT + "), but none is set and " + PROP_MTP + " drafts with the"
-                        + " model's own NextN / MTP blocks");
-            }
-            if (speculativeOptions.hasLookupCacheFiles() && !draftTypes.contains(DraftType.NGRAM_CACHE)) {
-                throw new IllegalArgumentException(SpeculativeOptions.PROP_LOOKUP_CACHE_STATIC + " / "
-                        + SpeculativeOptions.PROP_LOOKUP_CACHE_DYNAMIC + " are read by the ngram-cache drafter, but "
-                        + PROP_DRAFT_TYPE + "=" + DraftTypes.names(draftTypes) + " does not include ngram-cache");
-            }
-        }
-
-        /**
-         * Refuses lookahead settings the memory or the drafters cannot serve: lookahead decoding replaces
-         * speculative decoding, runs over paged memory with {@code W + G + 1} sequences that share the context
-         * ({@code neuralfree.kv.unified}) and manages the stored positions itself.
-         */
-        private void checkLookahead(MemoryConfig memory) {
-            if (!lookaheadOptions.enabled()) {
-                return;
-            }
-            if (draftModelPath != null || mtp || selfMtp(this) || !DraftTypes.lookups(draftTypes).isEmpty()) {
-                throw new IllegalArgumentException(LookaheadOptions.PROP_ENABLED + " and speculative decoding"
-                        + " exclude each other: lookahead decoding drafts and verifies with the target's own"
-                        + " Jacobi guesses, so clear " + PROP_DRAFT + ", " + PROP_MTP + " and " + PROP_DRAFT_TYPE
-                        + " (or turn " + LookaheadOptions.PROP_ENABLED + " off)");
-            }
-            if (!memory.paged()) {
-                throw new IllegalArgumentException(LookaheadOptions.PROP_ENABLED + " needs paged memory: set "
-                        + MemoryConfig.PROP_PARALLEL + "=" + lookaheadOptions.sequenceCount() + " (or "
-                        + MemoryConfig.PROP_KV_PAGED + "=true)");
-            }
-            if (!memory.kvUnified()) {
-                throw new IllegalArgumentException(LookaheadOptions.PROP_ENABLED + " runs " + lookaheadOptions
-                        .sequenceCount() + " sequences over one context: set " + MemoryConfig.PROP_KV_UNIFIED
-                        + "=true (each sequence spans the whole context)");
-            }
-            if (memory.parallel() < lookaheadOptions.sequenceCount()) {
-                throw new IllegalArgumentException(LookaheadOptions.PROP_ENABLED + " with window "
-                        + lookaheadOptions.window() + " and max n-grams " + lookaheadOptions.maxNgrams() + " needs "
-                        + MemoryConfig.PROP_PARALLEL + "=" + lookaheadOptions.sequenceCount() + ", got "
-                        + memory.parallel());
-            }
-            if (memory.contextShift()) {
-                throw new IllegalArgumentException(LookaheadOptions.PROP_ENABLED + " manages the stored positions of"
-                        + " its step and cannot shift the context; clear " + MemoryConfig.PROP_CONTEXT_SHIFT);
-            }
-        }
-
-        /** {@link #DRAFT_NO_DEVICE} keeps the draft model off every GPU and cannot be listed beside devices. */
-        private void checkDraftDevices() {
-            for (String d : draftDevices) {
-                if (!d.equalsIgnoreCase(DRAFT_NO_DEVICE)) {
-                    continue;
-                }
-                if (draftDevices.size() != 1) {
-                    throw new IllegalArgumentException(PROP_DRAFT_GPU_DEVICES + " " + draftDevices + ": "
-                            + DRAFT_NO_DEVICE + " keeps the draft model off every GPU and cannot be listed beside"
-                            + " devices");
-                }
-            }
-        }
-
-        /** The draft placement settings configured ({@code draftPlacementSet()} against the builder's fields). */
-        private boolean draftPlacementSet() {
-            return draftGpuLayers != GPU_LAYERS_AUTO || !draftTensorOverrides.isEmpty() || draftCpuMoe
-                    || draftNCpuMoe > N_CPU_LAYERS_UNSET || !draftDevices.isEmpty();
-        }
-
-        /** Names the draft placement settings configured without a draft model to apply them to. */
-        private String draftPlacementRefusal() {
-            List<String> set = new ArrayList<>();
-            if (draftGpuLayers != GPU_LAYERS_AUTO) {
-                set.add(PROP_DRAFT_N_GPU_LAYERS);
-            }
-            if (!draftTensorOverrides.isEmpty()) {
-                set.add(PROP_DRAFT_TENSOR_OVERRIDES);
-            }
-            if (draftCpuMoe) {
-                set.add(PROP_DRAFT_CPU_MOE);
-            }
-            if (draftNCpuMoe > N_CPU_LAYERS_UNSET) {
-                set.add(PROP_DRAFT_N_CPU_MOE);
-            }
-            if (!draftDevices.isEmpty()) {
-                set.add(PROP_DRAFT_GPU_DEVICES);
-            }
-            return String.join(", ", set) + " (llama.cpp -ngld, -otd, -cmoed, -ncmoed, -devd) place the load of a"
-                    + " separate draft model, but no draft model is set (" + PROP_DRAFT + ")";
+            return new EngineConfig(this, EngineConfigRules.validated(this));
         }
     }
 }

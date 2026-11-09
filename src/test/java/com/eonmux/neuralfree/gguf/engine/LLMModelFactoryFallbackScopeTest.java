@@ -66,6 +66,14 @@ public class LLMModelFactoryFallbackScopeTest {
         return p;
     }
 
+    /** A llama fixture whose attention head dims the GPU flash kernels cannot serve (2 is not a multiple of 4). */
+    private Path narrowHeadModel() throws IOException {
+        Path p = SyntheticModels.llama(SyntheticModels.Config.llama().toBuilder().nLayer(2).headDim(2).nRot(2)
+                .weightType(GGMLType.F16).build()).writeTempFile();
+        files.add(p);
+        return p;
+    }
+
     private static EngineConfig gpuConfig() {
         MemoryConfig memory = MemoryConfig.defaults().toBuilder().nCtx(128).ubatch(128).build();
         return EngineConfig.builder().backend(EngineConfig.BackendMode.OPENCL).addGpuDevice("0")
@@ -175,6 +183,43 @@ public class LLMModelFactoryFallbackScopeTest {
         }
     }
 
+    /**
+     * An attention geometry no GPU flash kernel serves (head dims that are not positive multiples of 4) is refused
+     * by the mixer bind as a device limitation: the load falls back to the CPU engine, which serves any head dim,
+     * and the reason names the layer and the dims.
+     */
+    @Test
+    public void anUnservableAttentionGeometryFallsBackAndReportsItsReason() throws IOException {
+        GpuTestUtil.assumeOpenCLAvailable();
+        Path model = narrowHeadModel();
+        try (EngineModel m = LLMModelFactory.open(model.toString(), gpuConfig())) {
+            assertTrue(m instanceof GGUFModel);
+            String reason = m.gpuFallbackReason();
+            assertTrue(reason, reason.startsWith("the GPU engine cannot serve the model: "));
+            assertTrue(reason, reason.contains("d_k=2"));
+            assertTrue(reason, reason.contains("multiples of 4"));
+        }
+    }
+
+    /**
+     * A GPU-only request refuses the unservable geometry instead of falling back: the W12 streaming a CPU load
+     * would silently ignore turns the device limitation into the load's failure, naming the dims. The weights are
+     * F16 with the round opt-in, so the W12 streaming itself is servable and the refusal is the geometry's.
+     */
+    @Test
+    public void aGpuOnlyRequestRefusesAnUnservableAttentionGeometry() throws IOException {
+        GpuTestUtil.assumeOpenCLAvailable();
+        Path model = narrowHeadModel();
+        EngineConfig cfg = EngineConfig.builder().backend(EngineConfig.BackendMode.OPENCL).addGpuDevice("0")
+                .memory(MemoryConfig.defaults().toBuilder().nCtx(128).ubatch(128).build())
+                .speculativeOptions(SpeculativeOptions.defaults().toBuilder().w12(true).w12F16(W12F16Mode.ROUND)
+                        .build()).build();
+        GpuModelUnsupportedException e = assertThrows(GpuModelUnsupportedException.class,
+                () -> LLMModelFactory.open(model.toString(), cfg));
+        assertTrue(e.getMessage(), e.getMessage().contains("d_k=2"));
+        assertTrue(e.getMessage(), e.getMessage().contains("multiples of 4"));
+    }
+
     /** The classification of one failure decides the fallback; the reason names the limitation. */
     @Test
     public void theFallbackReasonClassifiesTheDeviceLimitations() {
@@ -190,6 +235,10 @@ public class LLMModelFactoryFallbackScopeTest {
         assertEquals(null, LLMModelFactory.fallbackReason(new NullPointerException()));
         assertEquals(null, LLMModelFactory.fallbackReason(new IndexOutOfBoundsException()));
         assertEquals(null, LLMModelFactory.fallbackReason(new LinkageError("no native library")));
+        // an attention geometry no GPU flash kernel serves is a device limitation, not a raw IllegalArgumentException
+        assertTrue(LLMModelFactory.fallbackReason(new GpuModelUnsupportedException(
+                "layer 0: flash attention needs head dims that are positive multiples of 4, got d_k=2, d_v=2"))
+                .contains("d_k=2"));
     }
 
     /**

@@ -7,6 +7,11 @@
  *   sign-magnitude (IQ2_*, IQ3_XXS, IQ3_S): code = magnitude with its sign bit applied
  *   iq3nl (IQ3_K, IQ3_KS):                 code = iq3nl_values[3-bit code + grid]
  *   ternary (IQ1_*, IQ1_M):                code in {-1, 0, 1}; the delta term uses sum(q8)
+ *
+ * The term functions are precise: the float chain they return is computed exactly as written
+ * (SPIR-V NoContraction), so every kernel that inlines a term computes the same operations and the
+ * same rounding, whatever mul-add fusion the driver would otherwise pick per inlined copy. A
+ * token's {T}_MatVecN dot is therefore its stacked {T}_MatVec dots bit for bit.
  */
 #ifndef NF_QUANT_IQ_Q8_GLSL
 #define NF_QUANT_IQ_Q8_GLSL
@@ -27,7 +32,7 @@ int nf_q8_iq3nl_word(uint codes, uint grid) {
 }
 
 #if defined(NF_IQD_SIGNED)
-float nf_q8_group_dot(NfIqdGroup g, uint blk, uint ltid) {
+precise float nf_q8_group_dot(NfIqdGroup g, uint blk, uint ltid) {
     const uint qb = blk * 8u + (ltid >> 2);
     const uint bo = (ltid & 3u) * 8u;
     const int w0 = nf_q8_signed_mags(g.lo, g.signs);
@@ -36,7 +41,7 @@ float nf_q8_group_dot(NfIqdGroup g, uint blk, uint ltid) {
     return nf_q8_scale_of(qb) * g.dl * float(idot);
 }
 #elif defined(NF_IQD_KNL)
-float nf_q8_group_dot(NfIqdGroup g, uint blk, uint ltid) {
+precise float nf_q8_group_dot(NfIqdGroup g, uint blk, uint ltid) {
     const uint qb = blk * 8u + (ltid >> 2);
     const uint bo = (ltid & 3u) * 8u;
     const int idot = nf_q8_dp4(nf_q8_iq3nl_word(g.lo, g.grid), nf_q8_word(qb, bo))
@@ -50,7 +55,7 @@ int nf_q8_tvals_word(uint vals, uint h) {
     return nf_q8_pack4(int(v.x), int(v.y), int(v.z), int(v.w));
 }
 
-float nf_q8_group_dot(NfIqdGroup g, uint blk, uint ltid) {
+precise float nf_q8_group_dot(NfIqdGroup g, uint blk, uint ltid) {
     const uint qb = blk * 8u + (ltid >> 2);
     const uint bo = (ltid & 3u) * 8u;
     const int u0 = nf_q8_word(qb, bo), u1 = nf_q8_word(qb, bo + 4u);

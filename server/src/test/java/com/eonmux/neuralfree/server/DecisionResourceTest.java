@@ -496,7 +496,7 @@ public class DecisionResourceTest {
                 DecisionQuestions.Flags.VLLM_DECISION2);
         DecisionPrompt.Built prompt = DecisionPrompt.build(decision, questions, Map.of("text", "rate it"));
         try {
-            return decision.decisionScores(null, prompt.tokens(), prompt.order());
+            return decision.pooling().decisionScores(null, prompt.tokens(), prompt.order());
         } catch (IOException e) {
             throw new IllegalStateException(e);
         }

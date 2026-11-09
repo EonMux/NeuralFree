@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.memory;
 
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs;
+import com.eonmux.neuralfree.gguf.memory.gpu.SequenceRules;
 import org.junit.Test;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -128,19 +129,19 @@ public class SequenceStateReuseTest {
         SequenceState s = state();
         s.markWrapped();
 
-        DeviceStepInputs.SequenceRules.shiftSequence(s, 2, 3);
+        SequenceRules.shiftSequence(s, 2, 3);
 
         assertEquals(5, s.nPast());
         assertEquals(2, s.reusable());
         assertTrue(s.wrapped());
         assertArrayEquals(new int[] {0, 1, 5, 6, 7}, s.tokens());
 
-        DeviceStepInputs.SequenceRules.shiftSequence(s, 1, 2);
+        SequenceRules.shiftSequence(s, 1, 2);
         assertEquals(3, s.nPast());
         assertEquals(1, s.reusable());
         assertArrayEquals(new int[] {0, 6, 7}, s.tokens());
         assertThrows(IllegalArgumentException.class,
-                () -> DeviceStepInputs.SequenceRules.shiftSequence(s, 0, 0));
+                () -> SequenceRules.shiftSequence(s, 0, 0));
     }
 
     /** The frontier never exceeds nPast on any append. */

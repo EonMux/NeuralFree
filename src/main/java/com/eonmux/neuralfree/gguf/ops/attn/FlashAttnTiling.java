@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.ops.attn;
 
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
+import com.eonmux.neuralfree.gguf.memory.KvDType;
 
 /**
  * Tile plan of the flash-attention kernels for one attention shape on one device. Immutable.
@@ -85,6 +86,11 @@ public final class FlashAttnTiling {
             * LlmKernelConstants.FA_ACC_MAX;
     /** Largest {@code g_tile} ({@code NF_FD_MAX_G}). */
     public static final int MAX_G_TILE = LlmKernelConstants.FD_MAX_G;
+    /**
+     * Head-dim limit of the decode kernels' shuffle fast path, one coalesced row float4 per lane
+     * ({@code NF_FA_FAST_DIM}); the kernel gate refuses wider rows and serves them with the scalar body.
+     */
+    public static final int FAST_DIM = LlmKernelConstants.FA_FAST_DIM;
 
     /** Decode splits are multiples of this many keys. */
     static final int SPLIT_QUANTUM = 32;
@@ -129,10 +135,11 @@ public final class FlashAttnTiling {
     private final int maxSplits;
     private final int bq;
     private final int bk;
+    private final boolean decodeFastPath;
 
     private FlashAttnTiling(Plan plan, int nHead, int nHeadKv, int dK, int dV, int smemFloats, int computeUnits,
                             int gTile, int keyCapacity, int wantedSplits, int minSplitLen, int maxSplitLen,
-                            int maxSplits, int bq, int bk) {
+                            int maxSplits, int bq, int bk, boolean decodeFastPath) {
         this.plan = plan;
         this.nHead = nHead;
         this.nHeadKv = nHeadKv;
@@ -148,21 +155,39 @@ public final class FlashAttnTiling {
         this.maxSplits = maxSplits;
         this.bq = bq;
         this.bk = bk;
+        this.decodeFastPath = decodeFastPath;
+    }
+
+    /**
+     * Whether the decode kernels' shuffle fast path ({@code nf_fd_fast_ok} in flash_decode.cl) serves these
+     * caches and head dims on a backend that compiles it (the backend reports {@code SUBGROUP_SHUFFLE}: CUDA and
+     * HIP, whose dialect defines {@code NF_HAS_SG_SHUFFLE}): plain F32/F16/BF16 cache element types only, head
+     * dims of at most {@link #FAST_DIM} (one coalesced row float4 per lane), and the decode plans'
+     * {@code g_tile} of 1 (at most {@link #PASS2_GROUPS} lane groups of registers). Quantized, FP8 and latent
+     * caches, wider head dims and backends without subgroup shuffle run the portable scalar body.
+     */
+    public static boolean decodeFastPath(boolean subgroupShuffle, KvDType typeK, KvDType typeV, int dK, int dV) {
+        return subgroupShuffle
+                && (typeK == KvDType.F32 || typeK == KvDType.F16 || typeK == KvDType.BF16)
+                && (typeV == KvDType.F32 || typeV == KvDType.F16 || typeV == KvDType.BF16)
+                && dK <= FAST_DIM && dV <= FAST_DIM;
     }
 
     /**
      * Decode plan.
      *
-     * @param nKvMax       largest key range a step scans (cache rows); bounds {@link #decodeSplit} and sizes
-     *                     {@link #maxSplits()}
-     * @param smemFloats   {@code LlmKernels.faSmemFloats()}
-     * @param computeUnits device compute units (SMs / CUs), used to choose the split count of each step
+     * @param nKvMax         largest key range a step scans (cache rows); bounds {@link #decodeSplit} and sizes
+     *                       {@link #maxSplits()}
+     * @param smemFloats     {@code LlmKernels.faSmemFloats()}
+     * @param computeUnits   device compute units (SMs / CUs), used to choose the split count of each step
+     * @param decodeFastPath whether the device runs the decode kernels' shuffle fast path for this shape
+     *                       ({@link #decodeFastPath}); it caps {@link #maxSplitLen()} at the workgroup size
      * @throws IllegalArgumentException for invalid shapes, or when even one head per workgroup does not fit
      */
     public static FlashAttnTiling decode(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
-                                         int computeUnits) {
+                                         int computeUnits, boolean decodeFastPath) {
         validate(nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
-        return planDecode(Plan.DECODE, nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
+        return planDecode(Plan.DECODE, nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits, decodeFastPath);
     }
 
     /**
@@ -203,10 +228,12 @@ public final class FlashAttnTiling {
             }
         }
         if (bestRows == 0) {
-            return planDecode(Plan.PER_ROW_DECODE, nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits);
+            // The per-row fallback keeps the portable split policy: a shape no tiled kernel fits has no
+            // fast-path shape either (tiny shared budgets), and the scalar body serves it.
+            return planDecode(Plan.PER_ROW_DECODE, nHead, nHeadKv, dK, dV, nKvMax, smemFloats, computeUnits, false);
         }
         return new FlashAttnTiling(Plan.TILED, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                bestG, nKvMax, 0, 0, 0, 0, bestRows / bestG, bestBk);
+                bestG, nKvMax, 0, 0, 0, 0, bestRows / bestG, bestBk, false);
     }
 
     /**
@@ -232,7 +259,7 @@ public final class FlashAttnTiling {
         }
         int bq = MMA_ROWS / gTile;
         return new FlashAttnTiling(Plan.MMA, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                gTile, nKvMax, 0, 0, 0, 0, bq, MMA_BK);
+                gTile, nKvMax, 0, 0, 0, 0, bq, MMA_BK, false);
     }
 
     /** Shared-memory floats the mma kernel stages for d_k and d_v (kernels/llm/flash_mma.cl nf_fm_smem_floats). */
@@ -255,29 +282,27 @@ public final class FlashAttnTiling {
      * @throws IllegalArgumentException for invalid shapes, or when even one head per workgroup does not fit
      */
     public static FlashAttnTiling decodePaged(int nSeq, int nHead, int nHeadKv, int dK, int dV, int maxKvLen,
-                                              int smemFloats, int computeUnits) {
+                                              int smemFloats, int computeUnits, boolean decodeFastPath) {
         if (nSeq <= 0) {
             throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
         }
         validate(nHead, nHeadKv, dK, dV, maxKvLen, smemFloats, computeUnits);
-        return planDecode(Plan.DECODE, nHead, nHeadKv, dK, dV, maxKvLen, smemFloats, computeUnits);
+        return planDecode(Plan.DECODE, nHead, nHeadKv, dK, dV, maxKvLen, smemFloats, computeUnits, decodeFastPath);
     }
 
     private static FlashAttnTiling planDecode(Plan plan, int nHead, int nHeadKv, int dK, int dV, int nKvMax,
-                                              int smemFloats, int computeUnits) {
+                                              int smemFloats, int computeUnits, boolean decodeFastPath) {
         int g0 = nHead / nHeadKv;
         // One query head per work-group: the most work-groups per launch (llama.cpp's fattn-decode shape,
         // where every query head is its own row over key splits). Short-key decode attention is bound by
         // outstanding memory requests, not bandwidth, and the GQA group's K/V rows still come from L2
         // across the concurrently running work-groups of one KV head.
-        if (!decodeFits(1, dK, dV, smemFloats)) {
+        if (!decodeFits(1, dK, dV, smemFloats, decodeFastPath)) {
             // maxSplitLen shrinks as g grows, so no head tile fits either.
-            throw new IllegalArgumentException("no flash-attention plan for d_k=" + dK + ", d_v=" + dV + " with "
-                    + smemFloats + " shared floats: one head needs d_k + " + PASS2_GROUPS + " * d_v + "
-                    + SPLIT_QUANTUM + " floats and d_v <= " + DECODE_ACC_PER_GROUP);
+            throw new IllegalArgumentException(noPlanRefusal(dK, dV, smemFloats));
         }
         int g = 1;
-        int maxLen = maxSplitLen(g, dK, dV, smemFloats);
+        int maxLen = maxSplitLen(g, dK, dV, smemFloats, decodeFastPath);
         int minLen = Math.min(maxLen, MIN_SPLIT);
         long groups = (long) nHeadKv * ceilDiv(g0, g);
         int wanted = (int) Math.max(1L, ceilDiv(2L * computeUnits, groups));
@@ -285,23 +310,29 @@ public final class FlashAttnTiling {
         // and count <= ceil(n / minLen) always; n <= nKvMax bounds all three.
         int maxSplits = Math.max(ceilDiv(nKvMax, maxLen), Math.min(wanted, ceilDiv(nKvMax, minLen)));
         return new FlashAttnTiling(plan, nHead, nHeadKv, dK, dV, smemFloats, computeUnits,
-                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0);
+                g, nKvMax, wanted, minLen, maxLen, maxSplits, 0, 0, decodeFastPath);
     }
 
-    private static boolean decodeFits(int g, int dK, int dV, int smemFloats) {
-        return (long) g * dV <= DECODE_ACC_PER_GROUP && maxSplitLen(g, dK, dV, smemFloats) >= SPLIT_QUANTUM;
+    private static boolean decodeFits(int g, int dK, int dV, int smemFloats, boolean decodeFastPath) {
+        return (long) g * dV <= DECODE_ACC_PER_GROUP
+                && maxSplitLen(g, dK, dV, smemFloats, decodeFastPath) >= SPLIT_QUANTUM;
     }
 
     /**
-     * Longest decode split for {@code g} heads: {@code roundDown32((smem - g*d_k - PASS2_GROUPS*g*d_v) / g)} —
-     * the scores share the workgroup's floats with the pass-2 lane-group partials.
+     * Longest decode split for {@code g} heads: {@code roundDown32((smem - g*d_k - PASS2_GROUPS*g*d_v) / g)}.
+     * On a device that runs the decode kernels' shuffle fast path the value is capped at the workgroup size:
+     * each workgroup warp scans 32 keys of the split (one coalesced row float4 per lane, butterfly-reduced),
+     * so longer splits only stretch the per-block serial scan without adding parallel warps. Everywhere else
+     * the portable scalar body reads the split's keys strided over the whole workgroup and shares the longest
+     * splits the shared memory allows (llama.cpp's fattn-decode shape).
      */
-    private static int maxSplitLen(int g, int dK, int dV, int smemFloats) {
+    private static int maxSplitLen(int g, int dK, int dV, int smemFloats, boolean decodeFastPath) {
         long free = (long) smemFloats - (long) g * dK - (long) PASS2_GROUPS * g * dV;
         if (free <= 0) {
             return 0;
         }
-        return (int) (free / g / SPLIT_QUANTUM * SPLIT_QUANTUM);
+        long len = free / g / SPLIT_QUANTUM * SPLIT_QUANTUM;
+        return decodeFastPath ? (int) Math.min(len, WG) : (int) len;
     }
 
     /** Shared floats of the tiled kernel for {@code rows} query rows and key tile {@code bk}. */
@@ -311,13 +342,9 @@ public final class FlashAttnTiling {
 
     private static void validate(int nHead, int nHeadKv, int dK, int dV, int nKvMax, int smemFloats,
                                  int computeUnits) {
-        if (nHead <= 0 || nHeadKv <= 0 || nHead % nHeadKv != 0) {
-            throw new IllegalArgumentException("flash attention needs n_head a positive multiple of n_head_kv, got "
-                    + nHead + "/" + nHeadKv);
-        }
-        if (dK <= 0 || dV <= 0 || dK % 4 != 0 || dV % 4 != 0) {
-            throw new IllegalArgumentException("flash attention needs head dims that are positive multiples of 4, got d_k="
-                    + dK + ", d_v=" + dV);
+        String shape = shapeRefusal(nHead, nHeadKv, dK, dV);
+        if (shape != null) {
+            throw new IllegalArgumentException(shape);
         }
         if (nKvMax <= 0) {
             throw new IllegalArgumentException("key range must be positive, got " + nKvMax);
@@ -326,6 +353,48 @@ public final class FlashAttnTiling {
             throw new IllegalArgumentException("shared floats and compute units must be positive, got " + smemFloats
                     + " and " + computeUnits);
         }
+    }
+
+    /**
+     * Why these head counts and head dims are a shape the flash kernels cannot serve — a head count that is not a
+     * positive multiple of the KV-head count, or head dims that are not positive multiples of 4 — or null when the
+     * shape itself is valid. The shared body of the factories' {@code IllegalArgumentException} checks and of
+     * {@link #geometryRefusal}.
+     */
+    private static String shapeRefusal(int nHead, int nHeadKv, int dK, int dV) {
+        if (nHead <= 0 || nHeadKv <= 0 || nHead % nHeadKv != 0) {
+            return "flash attention needs n_head a positive multiple of n_head_kv, got " + nHead + "/" + nHeadKv;
+        }
+        if (dK <= 0 || dV <= 0 || dK % 4 != 0 || dV % 4 != 0) {
+            return "flash attention needs head dims that are positive multiples of 4, got d_k=" + dK + ", d_v=" + dV;
+        }
+        return null;
+    }
+
+    /** The refusal of a shape whose one-head decode tile no shared budget stages (see {@link #decodeFits}). */
+    private static String noPlanRefusal(int dK, int dV, int smemFloats) {
+        return "no flash-attention plan for d_k=" + dK + ", d_v=" + dV + " with " + smemFloats
+                + " shared floats: one head needs d_k + " + PASS2_GROUPS + " * d_v + " + SPLIT_QUANTUM
+                + " floats and d_v <= " + DECODE_ACC_PER_GROUP;
+    }
+
+    /**
+     * Why no flash kernel serves these head counts and dims on a device with {@code smemFloats} shared floats — the
+     * model geometry ({@link #shapeRefusal}) or a one-head decode tile wider than the shared budget — or null when a
+     * plan exists. {@code smemFloats <= 0} skips the budget check; the factories reject it themselves. The GPU bind
+     * sites translate a non-null refusal into a {@code GpuModelUnsupportedException}, so a model whose attention
+     * geometry no GPU flash kernel serves falls back to the CPU engine; the factories themselves throw
+     * {@code IllegalArgumentException} for the same shapes.
+     */
+    public static String geometryRefusal(int nHead, int nHeadKv, int dK, int dV, int smemFloats) {
+        String shape = shapeRefusal(nHead, nHeadKv, dK, dV);
+        if (shape != null) {
+            return shape;
+        }
+        if (smemFloats > 0 && !decodeFits(1, dK, dV, smemFloats, false)) {
+            return noPlanRefusal(dK, dV, smemFloats);
+        }
+        return null;
     }
 
     public Plan plan() { return plan; }
@@ -346,6 +415,8 @@ public final class FlashAttnTiling {
     public int maxSplitLen() { return maxSplitLen; }
     /** Most decode splits any step over at most {@link #keyCapacity()} keys uses; 0 for {@link Plan#TILED}. */
     public int maxSplits() { return maxSplits; }
+    /** Whether the device runs the decode kernels' shuffle fast path for this plan ({@link #decodeFastPath}). */
+    public boolean decodeFastPath() { return decodeFastPath; }
     /** Query tokens per workgroup ({@code bq}); 0 unless the plan is tiled or mma. */
     public int bq() { return bq; }
     /** Keys per tile ({@code bk}); 0 unless the plan is tiled or mma. */

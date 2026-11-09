@@ -172,7 +172,7 @@ cd NeuralFree
 
 `./gradlew build` also runs the unit tests; tests that need a GPU API the machine lacks are skipped.
 
-**Backend selection.** AUTO chooses the device first, then tries Vulkan, CUDA, OpenCL and HIP on it, in that order by default. The property `neuralfree.device=<name substring>` picks the GPU, and `neuralfree.backend.order` changes the API order. The Gradle run tasks forward every `neuralfree.*` property given with `-P` or `-D` to the JVM.
+**Backend selection.** AUTO chooses the device first, then tries Vulkan, CUDA, OpenCL and HIP on it, in that order by default; on an NVIDIA GPU it tries CUDA first. The property `neuralfree.device=<name substring>` picks the GPU, and `neuralfree.backend.order` changes the API order. The Gradle run tasks forward every `neuralfree.*` property given with `-P` or `-D` to the JVM.
 - **`runApp` and `runDemos`** choose AUTO among the backends that run the `train` kernels. To force an API, pass `-Pneuralfree.backend=opencl|cuda|vulkan|hip`. `runDemos` also takes `--args="--backend auto|opencl|cuda|vulkan|hip"`, which overrides the property.
 - **The GGUF engine** chooses AUTO among the backends that run the `llm` kernels. To force an API, pass `--backend opencl|cuda|vulkan|hip|cpu`.
 - **In code**, call `NeuralFree.createTrainingBackend(hw, mode)` for the framework. `NeuralFree.describeTrainKernels(backend)` reports whether the `train` kernels run on a backend, and why not when they do not.

@@ -209,12 +209,12 @@ class DecisionMinicpmOcrJevTest {
         String rendered = MiniJinja.render(SyntheticModels.MINICPM_OCR_JEV_TEMPLATE, inp);
         float[] scores;
         if (images.isEmpty()) {
-            scores = model.classifyOutput(null, model.encode(rendered, false, true), false).scores();
+            scores = model.pooling().classifyOutput(null, model.encode(rendered, false, true), false).scores();
         } else {
             List<ChatMedia.Item> items = model.media().decisionItems(images, "files");
             MediaPrompt prompt = model.media().prompt(rendered, items, List.of(), -1,
                     text -> model.encode(text, false, true));
-            scores = model.classifyOutputMedia(null, prompt, false).scores();
+            scores = model.pooling().classifyOutputMedia(null, prompt, false).scores();
         }
         assertEquals(2, scores.length, "one raw score per class");
         return softmax(scores, 1.0f);

@@ -37,7 +37,7 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -119,18 +119,18 @@ public class GpuHcExtraTest {
         ScratchSlot stream = scratch.temp(HcSubBlock.TEMP_STREAM, (long) UBATCH * STREAM);
 
         for (int t : new int[]{1, 5}) {
-            List<Dispatch> before = run(() -> extra.beforeBlock(0, t, x));
+            List<FakeDispatch> before = run(() -> extra.beforeBlock(0, t, x));
             assertEquals(GpuOps.COPY2D, before.get(0).kernelName());
             assertSame(x.buffer(), before.get(0).bufferArg(before.get(0).argCount() - 2));
             assertEquals(Arrays.asList(GpuOps.ROW_NORM, HcKernels.HC_PRE_POST_COMB, HcKernels.HC_PRE),
                     landmarks(before));
             assertTrue("the fn projection runs between the norm and the coefficients",
                     index(before, HcKernels.HC_PRE_POST_COMB) - index(before, GpuOps.ROW_NORM) >= 2);
-            Dispatch coef = only(before, HcKernels.HC_PRE_POST_COMB);
+            FakeDispatch coef = only(before, HcKernels.HC_PRE_POST_COMB);
             assertEquals(t, coef.intArg(HcKernels.COEF_ARG_N_TOKENS));
             assertEquals(HcKernels.OUT_PRE_POST_COMB, coef.intArg(HcKernels.COEF_ARG_N_OUT));
             assertEquals(HcKernels.perTokenGlobal(t, ops.local()), coef.global()[0]);
-            Dispatch pre = only(before, HcKernels.HC_PRE);
+            FakeDispatch pre = only(before, HcKernels.HC_PRE);
             assertEquals(t, pre.intArg(HcKernels.PRE_ARG_N_TOKENS));
             assertEquals(HcKernels.PRE_MODE_WEIGHTS, pre.intArg(HcKernels.PRE_ARG_MODE));
             assertSame(stream.buffer(), pre.bufferArg(HcKernels.PRE_ARG_X));
@@ -141,13 +141,13 @@ public class GpuHcExtraTest {
             assertEquals(x.offset(), pre.intArg(HcKernels.PRE_ARG_OUT_OFF));
             assertEquals(HcKernels.elementGlobal(t, N_EMBD, ops.local()), pre.global()[0]);
 
-            List<Dispatch> mixer = new ArrayList<>();
+            List<FakeDispatch> mixer = new ArrayList<>();
             boolean[] skipped = new boolean[1];
             mixer.addAll(run(() -> skipped[0] = extra.afterMixer(0, t, x, branch)));
             assertTrue(skipped[0]);
             assertEquals(Arrays.asList(HcKernels.HC_POST, GpuOps.ROW_NORM, HcKernels.HC_PRE_POST_COMB,
                     HcKernels.HC_PRE), landmarks(mixer));
-            Dispatch post = mixer.get(0);
+            FakeDispatch post = mixer.get(0);
             assertEquals(t, post.intArg(HcKernels.POST_ARG_N_TOKENS));
             assertEquals(1, post.intArg(HcKernels.POST_ARG_HAS_COMB));
             assertSame(branch.buffer(), post.bufferArg(HcKernels.POST_ARG_Y));
@@ -158,10 +158,10 @@ public class GpuHcExtraTest {
             assertSame(coef.bufferArg(HcKernels.COEF_ARG_POST), post.bufferArg(HcKernels.POST_ARG_POST));
             assertSame(coef.bufferArg(HcKernels.COEF_ARG_COMB), post.bufferArg(HcKernels.POST_ARG_COMB));
 
-            List<Dispatch> ffn = run(() -> skipped[0] = extra.afterFfn(0, t, x, branch));
+            List<FakeDispatch> ffn = run(() -> skipped[0] = extra.afterFfn(0, t, x, branch));
             assertTrue(skipped[0]);
             assertEquals(1, ffn.size());
-            Dispatch out = ffn.get(0);
+            FakeDispatch out = ffn.get(0);
             assertEquals(HcKernels.HC_POST, out.kernelName());
             assertSame(stream.buffer(), out.bufferArg(HcKernels.POST_ARG_X));
             assertSame(x.buffer(), out.bufferArg(HcKernels.POST_ARG_XOUT));
@@ -194,7 +194,7 @@ public class GpuHcExtraTest {
         ScratchSlot x = scratch.slot(ScratchSlots.X);
         ScratchSlot branch = scratch.slot(ScratchSlots.BRANCH);
         List<String> names = new ArrayList<>();
-        for (Dispatch d : run(() -> extra.afterMixer(0, 3, x, branch))) {
+        for (FakeDispatch d : run(() -> extra.afterMixer(0, 3, x, branch))) {
             names.add(d.kernelName());
         }
         closeRig();
@@ -214,13 +214,13 @@ public class GpuHcExtraTest {
         head.bind(ctx);
         ScratchSlot hidden = scratch.slot(ScratchSlots.X);
 
-        List<Dispatch> ds = run(() -> head.apply(3, hidden));
+        List<FakeDispatch> ds = run(() -> head.apply(3, hidden));
         assertEquals(Arrays.asList(GpuOps.ROW_NORM, HcKernels.HC_PRE_POST_COMB, HcKernels.HC_PRE), landmarks(ds));
-        Dispatch coef = only(ds, HcKernels.HC_PRE_POST_COMB);
+        FakeDispatch coef = only(ds, HcKernels.HC_PRE_POST_COMB);
         assertEquals(HcKernels.OUT_PRE, coef.intArg(HcKernels.COEF_ARG_N_OUT));
         assertSame(placeholders.scratchFloats(), coef.bufferArg(HcKernels.COEF_ARG_POST));
         assertSame(placeholders.scratchFloats(), coef.bufferArg(HcKernels.COEF_ARG_COMB));
-        Dispatch last = ds.get(ds.size() - 1);
+        FakeDispatch last = ds.get(ds.size() - 1);
         assertEquals(GpuOps.COPY2D, last.kernelName());
         assertSame(hidden.buffer(), last.bufferArg(last.argCount() - 1));
     }
@@ -236,9 +236,9 @@ public class GpuHcExtraTest {
         head.bind(ctx);
         ScratchSlot hidden = scratch.slot(ScratchSlots.X);
 
-        List<Dispatch> ds = run(() -> head.apply(2, hidden));
+        List<FakeDispatch> ds = run(() -> head.apply(2, hidden));
         assertEquals(2, ds.size());
-        Dispatch pre = ds.get(0);
+        FakeDispatch pre = ds.get(0);
         assertEquals(HcKernels.HC_PRE, pre.kernelName());
         assertEquals(HcKernels.PRE_MODE_MEAN, pre.intArg(HcKernels.PRE_ARG_MODE));
         assertEquals(2, pre.intArg(HcKernels.PRE_ARG_N_TOKENS));
@@ -273,9 +273,9 @@ public class GpuHcExtraTest {
         GpuHcExtra extra = bindHc(ctx, spec.layers().get(0));
         ScratchSlot x = scratch.slot(ScratchSlots.X);
 
-        List<Dispatch> ds = run(() -> extra.beforeBlock(0, 2, x));
+        List<FakeDispatch> ds = run(() -> extra.beforeBlock(0, 2, x));
         assertEquals(Arrays.asList(GpuOps.ROW_NORM, HcKernels.HC_PRE), landmarks(ds));
-        Dispatch norm = only(ds, GpuOps.ROW_NORM);
+        FakeDispatch norm = only(ds, GpuOps.ROW_NORM);
         assertEquals(2 * HC, norm.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(N_EMBD, norm.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
         assertEquals(HC, norm.intArg(NormKernels.ARG_ROW_NORM_W_ROWS));
@@ -285,14 +285,14 @@ public class GpuHcExtraTest {
         int iPre = index(ds, HcKernels.HC_PRE);
         assertTrue("scale and SiLU of the low-rank projection precede the collapse",
                 ds.subList(iNorm, iPre).stream().anyMatch(d -> d.kernelName().equals(GpuOps.UNARY)));
-        Dispatch pre = ds.get(iPre);
+        FakeDispatch pre = ds.get(iPre);
         assertEquals(HcKernels.PRE_MODE_GATED, pre.intArg(HcKernels.PRE_ARG_MODE));
         assertEquals(1.0f / HC, pre.floatArg(HcKernels.PRE_ARG_GSCALE), 0f);
         assertTrue("the inject projection follows the collapse", ds.size() > iPre + 1);
 
         ScratchSlot branch = scratch.slot(ScratchSlots.BRANCH);
-        List<Dispatch> ffn = run(() -> extra.afterFfn(0, 2, x, branch));
-        Dispatch post = ffn.get(0);
+        List<FakeDispatch> ffn = run(() -> extra.afterFfn(0, 2, x, branch));
+        FakeDispatch post = ffn.get(0);
         assertEquals(HcKernels.HC_POST, post.kernelName());
         assertEquals(0, post.intArg(HcKernels.POST_ARG_HAS_COMB));
         assertEquals(HcKernels.POST_ACT_SIGMOID, post.intArg(HcKernels.POST_ARG_POST_ACT));
@@ -318,20 +318,20 @@ public class GpuHcExtraTest {
         GpuHcExtra extra = bindHc(ctx, spec.layers().get(0));
         ScratchSlot x = scratch.slot(ScratchSlots.X);
 
-        List<Dispatch> ds = run(() -> extra.beforeBlock(0, 2, x));
+        List<FakeDispatch> ds = run(() -> extra.beforeBlock(0, 2, x));
         assertEquals(Arrays.asList(GpuOps.ROW_NORM, HcKernels.HC_PRE), landmarks(ds));
         int iNorm = index(ds, GpuOps.ROW_NORM);
         int iPre = index(ds, HcKernels.HC_PRE);
         assertEquals("nothing follows the collapse", ds.size() - 1, iPre);
-        List<Dispatch> copies = new ArrayList<>();
-        for (Dispatch d : ds.subList(iNorm, iPre)) {
+        List<FakeDispatch> copies = new ArrayList<>();
+        for (FakeDispatch d : ds.subList(iNorm, iPre)) {
             if (d.kernelName().equals(GpuOps.COPY2D)) {
                 copies.add(d);
             }
         }
         assertEquals(2, copies.size());
-        Dispatch toPost = copies.get(0);
-        Dispatch toLowRank = copies.get(1);
+        FakeDispatch toPost = copies.get(0);
+        FakeDispatch toLowRank = copies.get(1);
         assertArrayEquals(new int[]{2, HC, rowW}, new int[]{toPost.intArg(0), toPost.intArg(1), toPost.intArg(2)});
         assertArrayEquals(new int[]{2, LOW_RANK, rowW},
                 new int[]{toLowRank.intArg(0), toLowRank.intArg(1), toLowRank.intArg(2)});
@@ -339,8 +339,8 @@ public class GpuHcExtraTest {
         assertEquals("the inject rows follow the low-rank rows", toLowRank.intArg(3) + LOW_RANK, toPost.intArg(3));
 
         ScratchSlot branch = scratch.slot(ScratchSlots.BRANCH);
-        List<Dispatch> mixer = run(() -> extra.afterMixer(0, 2, x, branch));
-        Dispatch post = mixer.get(0);
+        List<FakeDispatch> mixer = run(() -> extra.afterMixer(0, 2, x, branch));
+        FakeDispatch post = mixer.get(0);
         assertEquals(HcKernels.HC_POST, post.kernelName());
         assertEquals(HcKernels.POST_ACT_SIGMOID, post.intArg(HcKernels.POST_ARG_POST_ACT));
         assertEquals("the merged inject rows carry the 1/hc scale already", 1.0f,
@@ -372,37 +372,37 @@ public class GpuHcExtraTest {
         int t = 3;
         int scoreLocal = HcKernels.scoreLocal(ops.local());
 
-        List<Dispatch> l0 = run(() -> extras.get(0).beforeBlock(0, t, x));
+        List<FakeDispatch> l0 = run(() -> extras.get(0).beforeBlock(0, t, x));
         assertEquals(1, l0.size());
         assertEquals(GpuOps.COPY2D, l0.get(0).kernelName());
         assertSame(stack.buffer(), l0.get(0).bufferArg(l0.get(0).argCount() - 1));
 
-        List<Dispatch> l0m = run(() -> extras.get(0).afterMixer(0, t, x, branch));
+        List<FakeDispatch> l0m = run(() -> extras.get(0).afterMixer(0, t, x, branch));
         assertEquals(Arrays.asList(HcKernels.RES_STACK_SCORE, HcKernels.RES_STACK_MIX), landmarks(l0m));
-        Dispatch score = only(l0m, HcKernels.RES_STACK_SCORE);
+        FakeDispatch score = only(l0m, HcKernels.RES_STACK_SCORE);
         assertEquals(1, score.intArg(HcKernels.SCORE_ARG_N_CKPT));
         assertEquals(t, score.intArg(HcKernels.SCORE_ARG_N_TOKENS));
         assertEquals(scoreLocal, score.local()[0]);
         assertEquals(HcKernels.scoreGlobal(t, scoreLocal), score.global()[0]);
-        Dispatch mix = only(l0m, HcKernels.RES_STACK_MIX);
+        FakeDispatch mix = only(l0m, HcKernels.RES_STACK_MIX);
         assertSame(x.buffer(), mix.bufferArg(HcKernels.MIX_ARG_OUT));
         assertEquals(x.offset(), mix.intArg(HcKernels.MIX_ARG_OUT_OFF));
 
-        List<Dispatch> l1 = run(() -> extras.get(1).beforeBlock(0, t, x));
+        List<FakeDispatch> l1 = run(() -> extras.get(1).beforeBlock(0, t, x));
         assertEquals(Arrays.asList(HcKernels.RES_STACK_SCORE, HcKernels.RES_STACK_MIX), landmarks(l1));
         assertEquals(1, only(l1, HcKernels.RES_STACK_SCORE).intArg(HcKernels.SCORE_ARG_N_CKPT));
         assertSame(x.buffer(), only(l1, HcKernels.RES_STACK_MIX).bufferArg(HcKernels.MIX_ARG_CUR));
 
-        List<Dispatch> l2 = run(() -> extras.get(2).beforeBlock(0, t, x));
-        Dispatch bank = l2.get(0);
+        List<FakeDispatch> l2 = run(() -> extras.get(2).beforeBlock(0, t, x));
+        FakeDispatch bank = l2.get(0);
         assertEquals(GpuOps.COPY2D, bank.kernelName());
         assertEquals(1, only(l2, HcKernels.RES_STACK_SCORE).intArg(HcKernels.SCORE_ARG_N_CKPT));
-        List<Dispatch> l2m = run(() -> extras.get(2).afterMixer(0, t, x, branch));
+        List<FakeDispatch> l2m = run(() -> extras.get(2).afterMixer(0, t, x, branch));
         assertEquals(2, only(l2m, HcKernels.RES_STACK_SCORE).intArg(HcKernels.SCORE_ARG_N_CKPT));
 
-        List<Dispatch> mid = run(() -> extras.get(2).afterBlock(0, t, x));
+        List<FakeDispatch> mid = run(() -> extras.get(2).afterBlock(0, t, x));
         assertTrue("only the last trunk layer mixes for the head", mid.isEmpty());
-        List<Dispatch> fin = run(() -> extras.get(nLayer - 1).afterBlock(0, t, x));
+        List<FakeDispatch> fin = run(() -> extras.get(nLayer - 1).afterBlock(0, t, x));
         assertEquals(Arrays.asList(HcKernels.RES_STACK_SCORE, HcKernels.RES_STACK_MIX), landmarks(fin));
         assertEquals(2, only(fin, HcKernels.RES_STACK_SCORE).intArg(HcKernels.SCORE_ARG_N_CKPT));
     }
@@ -553,15 +553,15 @@ public class GpuHcExtraTest {
         return GpuForwardContext.builder(kernels, ops, weights, spec).build();
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return new ArrayList<>(backend.dispatches());
     }
 
-    private static List<String> landmarks(List<Dispatch> ds) {
+    private static List<String> landmarks(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             if (LANDMARKS.contains(d.kernelName())) {
                 out.add(d.kernelName());
             }
@@ -569,7 +569,7 @@ public class GpuHcExtraTest {
         return out;
     }
 
-    private static int index(List<Dispatch> ds, String kernel) {
+    private static int index(List<FakeDispatch> ds, String kernel) {
         for (int i = 0; i < ds.size(); i++) {
             if (ds.get(i).kernelName().equals(kernel)) {
                 return i;
@@ -578,9 +578,9 @@ public class GpuHcExtraTest {
         throw new AssertionError(kernel + " not dispatched");
     }
 
-    private static Dispatch only(List<Dispatch> ds, String kernel) {
-        Dispatch found = null;
-        for (Dispatch d : ds) {
+    private static FakeDispatch only(List<FakeDispatch> ds, String kernel) {
+        FakeDispatch found = null;
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 if (found != null) {
                     throw new AssertionError(kernel + " dispatched more than once");

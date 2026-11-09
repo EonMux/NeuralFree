@@ -78,6 +78,169 @@ import static com.eonmux.neuralfree.gguf.engine.EngineConfig.PROP_VRAM_DEPTH;
  * parsing of each {@link EngineConfig} key, and the typed property readers the engine's other property-driven
  * configurations ({@link SamplerConfig}) share. Every reader treats a missing or blank value as absent and refuses
  * a value it cannot parse by naming the property.
+ *
+ * <p>Properties read by {@code read(Properties)} ({@link EngineConfig#fromProperties}; absent keys keep their
+ * defaults):
+ * <ul>
+ *   <li>{@code neuralfree.backend}: auto | opencl | cuda | vulkan | hip | metal | cpu, or an accelerator API served by
+ *       an installed backend provider (sycl, xpu, cann, hexagon, openvino, webgpu, musa, zdnn, zendnn);
+ *       default auto.</li>
+ *   <li>{@code neuralfree.device}: device-name substring the backend selection must match, default none.</li>
+ *   <li>{@code neuralfree.batch.invariant}: {@code true} runs the batch-invariant kernels, vLLM's
+ *       {@code VLLM_BATCH_INVARIANT}: a row's logits no longer depend on the other rows batched with it (see
+ *       {@link com.eonmux.neuralfree.gguf.BatchInvariance}). The environment variable
+ *       {@code NEURALFREE_BATCH_INVARIANT} is read when the property is unset; default false.</li>
+ *   <li>{@code neuralfree.split.mode}: none (default) | layer | row | tensor | context; llama.cpp
+ *       {@code --split-mode}. {@code layer} spreads the model over several GPUs, each taking a contiguous span of
+ *       layers; {@code row} splits every trunk layer's dense feed-forward over the GPUs, each holding a slice of the
+ *       hidden dimension and a device-to-device all-reduce summing the partials; {@code tensor} is vLLM's tensor
+ *       parallelism, sharding the attention (column-parallel QKV with the heads divided over the ranks, per-rank KV
+ *       caches, a row-parallel output all-reduced) and the dense feed-forward together; {@code context} is vLLM's
+ *       decode context parallelism, dividing the context positions between the ranks while every rank keeps every
+ *       head and merges the partial softmaxes with their log-sum-exp. The GPUs are
+ *       {@code neuralfree.gpu.devices}, the layer shares {@code neuralfree.tensor.split} and the GPU holding the
+ *       embedding and the output head {@code neuralfree.main.gpu}.</li>
+ *   <li>{@code neuralfree.gpu.devices}: the GPUs a split runs over (llama.cpp {@code --device}).</li>
+ *   <li>{@code neuralfree.rpc}: the remote compute servers a layer split adds as devices, as
+ *       {@code host:port[@key]} entries (llama.cpp {@code --rpc}); an entry without an inline key reads
+ *       {@code NEURALFREE_RPC_KEY}. Each server runs {@code nftool rpc-server} and contributes its own GPU as a
+ *       layer target, so trunk layers can run on another machine. Every connection is authenticated with the
+ *       shared key. Requires {@code neuralfree.split.mode=layer}.</li>
+ *   <li>{@code neuralfree.expert.parallel}: whether a tensor split places whole experts on each rank instead of an
+ *       intermediate-width slice of every expert (vLLM {@code --enable-expert-parallel}).</li>
+ *   <li>The {@link EplbConfig} keys: {@code neuralfree.eplb} off (default) | on, {@code neuralfree.eplb.profile},
+ *       {@code neuralfree.eplb.save} and {@code neuralfree.eplb.policy}, the expert-parallel load balancer that packs
+ *       the experts over the ranks by their recorded routed-row load (vLLM EPLB) instead of contiguous blocks.</li>
+ *   <li>The {@link MemoryConfig} keys, including {@code neuralfree.context.shift}.</li>
+ *   <li>The {@link SamplerConfig} keys, including {@code neuralfree.seed}.</li>
+ *   <li>{@code neuralfree.ram.cache.mb}: host cache for streamed weights in MiB; -1 (default) = automatic, sized
+ *       against the maximum heap, the physical RAM and the model size, and off for a model larger than RAM
+ *       ({@code WeightDataProvider.ramCacheBytes}); 0 = no cache.</li>
+ *   <li>{@code neuralfree.vram.depth}: layers kept resident in VRAM when streaming; 0 (default) = from the VRAM
+ *       budget.</li>
+ *   <li>{@code neuralfree.numa}: the CPU pool's NUMA placement (llama.cpp {@code --numa}, {@link NumaStrategy}):
+ *       {@code distribute}, {@code isolate}, {@code numactl} or {@code disabled} (default). The pool reads the
+ *       property when it starts; the strategy places each worker thread on its node's CPUs.</li>
+ *   <li>{@code neuralfree.cpu.offload.mb}: the MiB of device-resident trunk weights a GPU load instead keeps in
+ *       page-locked host memory that the device reads in place (vLLM's UVA offloader,
+ *       {@code cpu_offload_gb}); 0 (default) = off. The tensors are chosen in weight-layer order up to the
+ *       budget, or by {@code neuralfree.cpu.offload.params} when that names parameter segments. The weights stay
+ *       read once per pass over the interconnect, costing no VRAM and no upload. Needs a backend with host-mapped
+ *       buffers (CUDA mapped host memory, Vulkan host-visible memory) on one device.</li>
+ *   <li>{@code neuralfree.cpu.offload.params}: the parameter name segments of the UVA offload (vLLM's
+ *       {@code cpu_offload_params}), comma-separated; for example {@code experts} keeps the routed expert tensors
+ *       in mapped host memory and the rest of every layer on the device. A segment matches whole dotted name
+ *       parts ({@code ffn_gate_exps} matches {@code blk.3.ffn_gate_exps.weight}, {@code expert} does not).
+ *       Empty (default) offloads tensors of any kind up to the budget.</li>
+ *   <li>{@code neuralfree.stream.params}: the parameter name segments of a streamed layer that go through the
+ *       streaming slots (vLLM's prefetch {@code offload_params}), comma-separated; the other tensors of those
+ *       layers stay resident. For example {@code experts} streams only routed expert stacks of the layers the
+ *       placement streams, keeping their attention and dense feed-forward on the device. Empty (default) streams
+ *       every tensor of a streamed layer.</li>
+ *   <li>{@code neuralfree.gpu.vram.limit}: the device memory in MiB a GPU load may allocate on each of its devices
+ *       (weights, caches, scratch, streaming slots, adapters, the MoE expert cache and the reserved drafter memory
+ *       together), below what the device reports free; 0 (default) = no limit.</li>
+ *   <li>{@code neuralfree.n.gpu.layers}: how many layers a GPU load keeps on the device (llama.cpp
+ *       {@code -ngl}): {@code auto} (default; as many as the VRAM holds), {@code all}, or a count that covers the
+ *       output head, so {@code N} puts {@code N - 1} trunk layers on the device and the rest compute on the host,
+ *       each side with its KV on its own device ({@code com.eonmux.neuralfree.gguf.hybrid}).</li>
+ *   <li>{@code neuralfree.override.tensor}: tensor placement overrides as
+ *       {@code <pattern>=<cpu | gpu | opencl | cuda | vulkan | hip | metal>} entries (llama.cpp {@code -ot}); the
+ *       first pattern that matches a tensor name decides where it is kept. A host match keeps a routed expert tensor
+ *       in RAM while its layer stays on the device and computes the experts there
+ *       ({@code com.eonmux.neuralfree.gguf.ops.moe}); any other host match keeps the tensor's whole layer on the
+ *       host.</li>
+ *   <li>{@code neuralfree.cpu.moe} (llama.cpp {@code --cpu-moe}) and {@code neuralfree.n.cpu.moe} (llama.cpp
+ *       {@code --n-cpu-moe}): keep the expert weights of every, or of the first N, mixture-of-experts layers on
+ *       the host, where the layer's experts compute while the rest of the layer runs on the device.</li>
+ *   <li>{@code neuralfree.n-cpu-ffn}: the dense FFN weights of the first N decoder layers in RAM, on the host
+ *       (llama.cpp {@code --n-cpu-ffn}); unset by default. The weights shrink the VRAM fit; a dense FFN that then
+ *       has to leave the device fails its load.</li>
+ *   <li>{@code neuralfree.moe.cache.mb}: the MoE expert-cache budget in MiB (llama.cpp {@code --moe-cache-mib});
+ *       0 (default) leaves the budget to {@code neuralfree.moe.cache}, whose VRAM-left budget it overrides.</li>
+ *   <li>{@code neuralfree.fit}: keep the experts in RAM when the dense weights and the context fit the VRAM
+ *       without them (Avalon {@code --fit}), instead of streaming; default false.</li>
+ *   <li>{@code neuralfree.cpu-moe}, {@code neuralfree.n-cpu-moe} and {@code neuralfree.override-tensor}:
+ *       aliases of {@code neuralfree.cpu.moe}, {@code neuralfree.n.cpu.moe} and {@code neuralfree.override.tensor}
+ *       with llama.cpp's flag-shaped keys, taking the same targets; the dotted key wins when both are set.</li>
+ *   <li>The {@link MoeCacheConfig} keys: {@code neuralfree.moe.cache} off (default) | on | auto | MiB,
+ *       {@code neuralfree.moe.cache.ranking}, {@code neuralfree.moe.cache.ranking.save},
+ *       {@code neuralfree.moe.cache.prefetch}, {@code neuralfree.moe.cache.hosted.rows} and
+ *       {@code neuralfree.moe.cache.tail.skip}, the GPU MoE expert cache
+ *       of host-resident routed experts, the expert ranking it preloads from, its prefill expert prefetch and the
+ *       approximate tail-skip rule (off by default; a rank drops uncached experts every token routes only at that
+ *       top-k position or lower).
+ *       {@code on}, {@code auto} or a MiB value hosts the routed expert stacks in RAM as {@code neuralfree.cpu.moe}
+ *       does and serves their routed experts from the device cache; {@code neuralfree.moe.cache.mb} sets the same
+ *       budget and wins when both give one.</li>
+ *   <li>{@code neuralfree.draft}: path of a draft GGUF for speculative decoding, default none: a separate draft model,
+ *       an eagle, eagle3, gemma4-assistant or dflash drafter, or a GGUF whose last block holds NextN / MTP tensors
+ *       (with or without its trunk), which drafts with those blocks only ({@link LLMModelFactory}).</li>
+ *   <li>{@code neuralfree.draft.type}: the drafter types, a comma-separated list as llama.cpp's {@code --spec-type}
+ *       ({@link DraftType}, {@link DraftTypes}). At most one draft-file type: auto (default; detected from the
+ *       file), draft-mtp (alias mtp; its NextN / MTP blocks, or the model's own without a draft file) or
+ *       draft-simple (aliases simple, model; a separate draft model). Any of the lookup types, which draft without a
+ *       draft file: ngram-simple (alias prompt-lookup; the target's own token history), ngram-map-k (aliases
+ *       ngram-map, map-k), ngram-map-k4v (alias map-k4v), ngram-mod (alias mod), ngram-cache (the
+ *       {@link com.eonmux.neuralfree.gguf.engine.draft.NgramCache} chain) and suffix (suffix decoding). Several types
+ *       chain ({@code DrafterChain}) in llama.cpp's order, the lookup types first and the draft file last: each
+ *       round the first drafter with a proposal drafts. A draft file needs a draft-file type in the list.</li>
+ *   <li>The {@link SpeculativeOptions} keys: the n-gram sizes of each lookup type, the {@code ngram-cache} files,
+ *       the suffix decoding limits and the verification mode ({@code neuralfree.draft.verify}).</li>
+ *   <li>The {@link LookaheadOptions} keys ({@code neuralfree.lookahead}, {@code .window}, {@code .ngram.size} and
+ *       {@code .max.ngrams}): lookahead (Jacobi) decoding instead of speculative decoding, over a paged memory of
+ *       {@code window + maxNgrams + 1} sequences with unified KV.</li>
+ *   <li>{@code neuralfree.draft.max} (default 3), {@code neuralfree.draft.min} (default 0),
+ *       {@code neuralfree.draft.p.min} (default 0): llama.cpp {@code common_params_speculative_draft}. The draft
+ *       max bounds every drafter's round; a lookup drafter also stops at its own draft size.</li>
+ *   <li>The draft model's own placement, applied to the load of a separate draft model
+ *       ({@code neuralfree.draft.*}; every one needs {@code neuralfree.draft}): {@code neuralfree.draft.gpu.devices}
+ *       (llama.cpp {@code -devd}) a comma-separated GPU selector list like {@code neuralfree.gpu.devices}, or
+ *       {@code none} alone to keep the draft on the host; unset (default) keeps the draft beside the target's
+ *       weights on the target's backend. {@code neuralfree.draft.n.gpu.layers} (llama.cpp {@code -ngld}): a count
+ *       that covers the output head, {@code auto} (default) or {@code all}, like {@code neuralfree.n.gpu.layers}
+ *       but for the draft's load. {@code neuralfree.draft.override.tensor} (llama.cpp {@code -otd}),
+ *       {@code neuralfree.draft.cpu.moe} (llama.cpp {@code -cmoed}) and {@code neuralfree.draft.n.cpu.moe}
+ *       (llama.cpp {@code -ncmoed}): the draft load's own overrides and expert placement, replacing the target's.</li>
+ *   <li>{@code neuralfree.mtp}: self-speculation with the model's own NextN / MTP layers, default false. A GPU
+ *       load places the NextN / MTP blocks on the device and in its context fit only when it is set (or
+ *       {@code neuralfree.nextn.memory} is), as llama.cpp loads them only with {@code load_mtp}.</li>
+ *   <li>{@code neuralfree.lora}: LoRA adapters as {@code path[:scale][,path[:scale]...]} (llama.cpp {@code --lora} /
+ *       {@code --lora-scaled}), scale 1 when omitted, default none; see {@link LoraSpec#parseList}.</li>
+ *   <li>The {@link LoraConfig} keys of the per-request adapter registry ({@code neuralfree.lora.enable},
+ *       {@code neuralfree.lora.max}, {@code neuralfree.lora.max.rank}, {@code neuralfree.lora.cache}).</li>
+ *   <li>{@code neuralfree.control-vector}: control vectors as {@code path[:scale][,path[:scale]...]} (llama.cpp
+ *       {@code --control-vector} / {@code --control-vector-scaled}), scale 1 when omitted, default none; see
+ *       {@link ControlVectorSpec#parseList}.</li>
+ *   <li>{@code neuralfree.control-vector-layer-range}: {@code START:END}, the 1-based decoder layers the control
+ *       vectors apply to, both inclusive (llama.cpp {@code --control-vector-layer-range START END}); 0 or a negative
+ *       value keeps the llama.cpp default of that side ({@code 1} for the start, the model's layer count for the
+ *       end).</li>
+ *   <li>The {@link ModelSourceOptions} keys ({@code neuralfree.hf.*}, {@code neuralfree.quant.online},
+ *       {@code neuralfree.lora.base.config}): how a checkpoint that is not GGUF is turned into its GGUF view.</li>
+ *   <li>{@code neuralfree.act.quant}: weight-only (default) | checkpoint, how a checkpoint's activation quantization
+ *       is applied ({@link ActivationQuant}).</li>
+ *   <li>{@code neuralfree.sampling.model.defaults}: whether a model's sampling defaults
+ *       ({@link EngineModel#modelSamplingDefaults()}) fill the sampler settings and token budget a request leaves
+ *       unset, default true.</li>
+ *   <li>{@code neuralfree.reasoning.parser}: the reasoning parser (vLLM {@code --reasoning-parser} names,
+ *       {@link com.eonmux.neuralfree.gguf.chat.reasoning.ReasoningParsers}), default auto: the chat template's.</li>
+ *   <li>{@code neuralfree.tool.parser}: the tool-call parser (vLLM {@code --tool-call-parser} names,
+ *       {@link com.eonmux.neuralfree.gguf.chat.tools.ToolParserRegistry}), default auto: detected from the chat
+ *       template; none leaves tool-call syntax in the content. The response-template parsers {@code hf} and
+ *       {@code beam} (both properties) read the model's {@code response_template} metadata and pair only with
+ *       the same parser, {@code auto} or {@code none}.</li>
+ *   <li>{@code neuralfree.tool.strict}: the tool strict floor (vLLM {@code --tool-strict-level},
+ *       {@code auto | function | parameter}, {@link com.eonmux.neuralfree.gguf.chat.tools.ToolStrict}),
+ *       default auto: a tool's argument schema is enforced when the tool declares {@code strict}, and a
+ *       tool-call grammar applies under {@code tool_choice: auto} only for a strict tool.</li>
+ *   <li>{@code neuralfree.pooling}: the pooling type override (llama.cpp {@code --pooling}, vLLM
+ *       {@code --override-pooler-config} {@code pooling_type}): {@code none | mean | cls | last | rank}, vLLM's
+ *       {@code ALL} naming per-token pooling. Unset (default) takes the GGUF's {@code <arch>.pooling_type};
+ *       {@code rank} refuses a model that stores no classifier head.</li>
+ *   <li>{@code neuralfree.logits.processors}: the fully-qualified class names of custom logits processor
+ *       factories to load beside the plugin providers (vLLM's {@code --logits-processors}), comma-separated.</li>
+ * </ul>
  */
 final class EngineProperties {
 

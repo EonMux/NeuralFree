@@ -46,12 +46,23 @@ public interface GpuMixer extends AutoCloseable {
     void decode(int pos, ScratchSlot in, ScratchSlot out);
 
     /**
-     * The patchers of this mixer's decode launches, in the order their groups enqueue: a graph replay's
-     * plan claims each captured kernel dispatch with the patcher whose group it belongs to, and one
-     * claimed patch re-sets the per-step kernel arguments the {@link #decode} body would set. Empty when
-     * the mixer's decode launches have no per-step derivable values, or the mixer has none.
+     * The patchers of this mixer's one-row decode step launches, in the order their groups enqueue: a
+     * graph replay's plan claims each captured kernel dispatch with the patcher whose group it belongs
+     * to, and one claimed patch re-sets the per-step kernel arguments the step's body would set. Empty
+     * when the mixer's decode launches have no per-step derivable values, or the mixer has none.
      */
     default List<GpuStepPatcher> decodeReplayPatchers() {
+        return List.of();
+    }
+
+    /**
+     * The patchers of this mixer's multi-row {@link #prefill} launches, in the order their groups enqueue: a
+     * graph replay's plan claims each captured kernel dispatch with the patcher whose group it belongs to, and
+     * one claimed patch re-sets the per-step kernel arguments the {@link #prefill} body would set. A plan
+     * captures one row count, so a replay serves the step width of the step the graph was captured at. Empty
+     * when the mixer's multi-row launches have no per-step derivable values, or the mixer has none.
+     */
+    default List<GpuStepPatcher> stepReplayPatchers() {
         return List.of();
     }
 

@@ -99,8 +99,9 @@ public class BlockDecodersTest {
     public void everyStorageTypeHasADecoder() {
         for (GGMLType t : GGMLType.values()) {
             boolean removed = t == GGMLType.UNKNOWN || t == GGMLType.Q4_2 || t == GGMLType.Q4_3;
-            assertEquals(t.toString(), !removed, CpuBlockDecoders.supports(t));
+            boolean deviceOnly = t.isDeviceOnly();
             assertEquals(t.toString(), !removed, BlockLayout.isDefined(t));
+            assertEquals(t.toString(), !removed && !deviceOnly, CpuBlockDecoders.supports(t));
         }
         assertEquals(48, CpuBlockDecoders.supportedTypes().size());
         try {
@@ -108,6 +109,20 @@ public class BlockDecodersTest {
             fail("UNKNOWN must not have a decoder");
         } catch (UnsupportedOperationException expected) {
             assertTrue(expected.getMessage().contains("UNKNOWN"));
+        }
+        // W12 deliberately has no entry: its per-row record is a device-resident form
+        // (GGMLType.isDeviceOnly) that GGUF files never store — the header reader refuses a W12
+        // tensor by name, and W12Codec decodes the rows on the device. Its block geometry stays
+        // defined for the uploader, so only the decoder is absent.
+        assertTrue("W12 keeps its block geometry", BlockLayout.isDefined(GGMLType.W12));
+        assertFalse("W12 is a device-resident form, not a CPU block type",
+                CpuBlockDecoders.supports(GGMLType.W12));
+        try {
+            CpuBlockDecoders.forType(GGMLType.W12);
+            fail("W12 must not have a CPU decoder");
+        } catch (UnsupportedOperationException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("W12"));
+            assertTrue(expected.getMessage(), expected.getMessage().contains("device-resident"));
         }
     }
 

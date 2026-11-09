@@ -15,7 +15,7 @@ import org.junit.Test;
  * The GLSL twins of the fast GEMM kernels on a Vulkan device against the tiled GEMM of the same
  * weight type ({@link FastGemmParity}): every int8 MMQ kernel on any device, and on devices with
  * {@link DeviceFeature#COOPERATIVE_MATRIX} every fp16-tile CM kernel, the F16 and BF16 MMA rows and
- * the split-K pair. Skips without a Vulkan GPU.
+ * the split-K pair of both dense 16-bit types. Skips without a Vulkan GPU.
  */
 public class VulkanFastGemmParityTest {
 
@@ -110,5 +110,6 @@ public class VulkanFastGemmParityTest {
         float[] w = FastGemmParity.denseValues(M * k, 0x51ED);
         float[] x = FastGemmParity.denseValues(N * k, 0xC0DE);
         parity.splitKMatchesPlain(GGMLType.F16, FastGemmParity.f16Bytes(w), w, x, M, k, N, 3);
+        parity.splitKMatchesPlain(GGMLType.BF16, FastGemmParity.bf16Bytes(w), w, x, M, k, N, 3);
     }
 }

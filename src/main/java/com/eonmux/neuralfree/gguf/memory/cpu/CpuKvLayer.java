@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.KvLayout;
 import com.eonmux.neuralfree.gguf.memory.KvVendorCodec;
 import com.eonmux.neuralfree.gguf.memory.gpu.DeviceStepInputs;
+import com.eonmux.neuralfree.gguf.memory.gpu.KvShift;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
 
 import java.nio.ByteBuffer;
@@ -585,7 +586,7 @@ public final class CpuKvLayer implements KvAccessor {
     }
 
     /** Applies a context shift's row moves to K, V and their side planes. */
-    void moveRows(DeviceStepInputs.KvShift shift) {
+    void moveRows(KvShift shift) {
         k.moveRows(shift);
         if (v != null) {
             v.moveRows(shift);
@@ -1021,7 +1022,7 @@ public final class CpuKvLayer implements KvAccessor {
          * Executes a context shift's row moves: downward moves row by row in ascending order (each row is read
          * before any move writes it); otherwise the moved rows are gathered first and then scattered.
          */
-        void moveRows(DeviceStepInputs.KvShift shift) {
+        void moveRows(KvShift shift) {
             if (shift.runCount() == 0) {
                 return;
             }

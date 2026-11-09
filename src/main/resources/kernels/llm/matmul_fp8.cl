@@ -252,6 +252,8 @@ NF_KERNEL void LLM_Quant_MMQ_Fp4Nv(
  */
 /* F8_E4M3: qs[32] E4M3 codes, no block scale (the tensor's .scale applies after the GEMM). */
 #define F8_E4M3_MMQ_CODE(bp, e) (nf_i8)((NF_GLOBAL const uchar*)(bp))[NF_F8_E4M3_QS + (e)]
+/* Codes e0..e0+3: the raw E4M3 bytes as one aligned u32 (the 32-byte block is 4-byte aligned). */
+#define F8_E4M3_MMQ_CODE4(bp, e0) nf_read_u32((bp) + NF_F8_E4M3_QS + (e0))
 #define F8_E4M3_MMQ_SCALE(bp, k0) 1.0f
 NF_FP8Q_GEMM(F8_E4M3, F8_E4M3_BLOCK_SIZE, F8_E4M3_BLOCK_BYTES, F8_E4M3_MMQ_CODE, F8_E4M3_MMQ_SCALE)
 NF_FP8Q_GEMM_KSPLIT(F8_E4M3, F8_E4M3_BLOCK_SIZE, F8_E4M3_BLOCK_BYTES, F8_E4M3_MMQ_CODE,
@@ -259,6 +261,7 @@ NF_FP8Q_GEMM_KSPLIT(F8_E4M3, F8_E4M3_BLOCK_SIZE, F8_E4M3_BLOCK_BYTES, F8_E4M3_MM
 
 /* F8_E4M3_B128: f32 d, qs[128] E4M3 codes. */
 #define F8_E4M3_B128_MMQ_CODE(bp, e) (nf_i8)((NF_GLOBAL const uchar*)(bp))[NF_F8_E4M3_B128_QS + (e)]
+#define F8_E4M3_B128_MMQ_CODE4(bp, e0) nf_read_u32((bp) + NF_F8_E4M3_B128_QS + (e0))
 #define F8_E4M3_B128_MMQ_SCALE(bp, k0) nf_xq_f32((bp), NF_F8_E4M3_B128_D)
 NF_FP8Q_GEMM(F8_E4M3_B128, F8_E4M3_B128_BLOCK_SIZE, F8_E4M3_B128_BLOCK_BYTES, F8_E4M3_B128_MMQ_CODE,
     F8_E4M3_B128_MMQ_SCALE)
@@ -267,6 +270,7 @@ NF_FP8Q_GEMM_KSPLIT(F8_E4M3_B128, F8_E4M3_B128_BLOCK_SIZE, F8_E4M3_B128_BLOCK_BY
 
 /* F8_E4M3_B32: f32 d, qs[32] E4M3 codes. */
 #define F8_E4M3_B32_MMQ_CODE(bp, e) (nf_i8)((NF_GLOBAL const uchar*)(bp))[NF_F8_E4M3_B32_QS + (e)]
+#define F8_E4M3_B32_MMQ_CODE4(bp, e0) nf_read_u32((bp) + NF_F8_E4M3_B32_QS + (e0))
 #define F8_E4M3_B32_MMQ_SCALE(bp, k0) nf_xq_f32((bp), NF_F8_E4M3_B32_D)
 NF_FP8Q_GEMM(F8_E4M3_B32, F8_E4M3_B32_BLOCK_SIZE, F8_E4M3_B32_BLOCK_BYTES, F8_E4M3_B32_MMQ_CODE,
     F8_E4M3_B32_MMQ_SCALE)
@@ -275,6 +279,10 @@ NF_FP8Q_GEMM_KSPLIT(F8_E4M3_B32, F8_E4M3_B32_BLOCK_SIZE, F8_E4M3_B32_BLOCK_BYTES
 
 /* MXFP8: e(e8m0)@0, qs[32] E4M3 codes; scale 2^(e - 127). */
 #define MXFP8_MMQ_CODE(bp, e) (nf_i8)((NF_GLOBAL const uchar*)(bp))[NF_MXFP8_QS + (e)]
+/* The 33-byte block keeps no 2-byte alignment across blocks, so the group packs 4 CODE calls. */
+#define MXFP8_MMQ_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(MXFP8_MMQ_CODE((bp), (e0)), MXFP8_MMQ_CODE((bp), (e0) + 1), \
+        MXFP8_MMQ_CODE((bp), (e0) + 2), MXFP8_MMQ_CODE((bp), (e0) + 3))
 #define MXFP8_MMQ_SCALE(bp, k0) e8m0_scale((uint)(bp)[NF_MXFP8_E])
 NF_FP8Q_GEMM(MXFP8, MXFP8_BLOCK_SIZE, MXFP8_BLOCK_BYTES, MXFP8_MMQ_CODE, MXFP8_MMQ_SCALE)
 NF_FP8Q_GEMM_KSPLIT(MXFP8, MXFP8_BLOCK_SIZE, MXFP8_BLOCK_BYTES, MXFP8_MMQ_CODE, MXFP8_MMQ_SCALE)
@@ -297,6 +305,10 @@ NF_TABLE(uchar, NF_IQ4_E4M3, 16) = {
 #define MXFP4_W4A8_CODE(bp, e) (nf_i8)NF_E2M1_E4M3[(e) < 16 \
     ? ((uint)(bp)[1 + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[1 + ((e) & 15)] >> 4)]
+/* The 17-byte block keeps no 2-byte alignment across blocks, so the group packs 4 CODE calls. */
+#define MXFP4_W4A8_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(MXFP4_W4A8_CODE((bp), (e0)), MXFP4_W4A8_CODE((bp), (e0) + 1), \
+        MXFP4_W4A8_CODE((bp), (e0) + 2), MXFP4_W4A8_CODE((bp), (e0) + 3))
 #define MXFP4_W4A8_SCALE(bp, k0) mxfp4_scale((uint)(bp)[0])
 NF_W4A8_GEMM(MXFP4, MXFP4_BLOCK_SIZE, MXFP4_BLOCK_BYTES, MXFP4_W4A8_CODE, MXFP4_W4A8_SCALE)
 NF_W4A8_GEMM_KSPLIT(MXFP4, MXFP4_BLOCK_SIZE, MXFP4_BLOCK_BYTES, MXFP4_W4A8_CODE, MXFP4_W4A8_SCALE)
@@ -305,6 +317,16 @@ NF_W4A8_GEMM_KSPLIT(MXFP4, MXFP4_BLOCK_SIZE, MXFP4_BLOCK_BYTES, MXFP4_W4A8_CODE,
 #define IQ4_NL_W4A8_CODE(bp, e) (nf_i8)NF_IQ4_E4M3[(e) < 16 \
     ? ((uint)(bp)[2 + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[2 + ((e) & 15)] >> 4)]
+/* Codes e0..e0+3: the group's 4 qs bytes (two aligned u16s) through the E4M3 codebook. */
+NF_INLINE uint nf_w4a8_iq4nl_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const uint word = nf_read_u32_u16(bp + 2 + (e0 & 15));
+    const int shift = (e0 & 16) ? 4 : 0;
+    return NF_MMQ_CODE4_PACK(NF_IQ4_E4M3[(word >> shift) & 0xFu],
+        NF_IQ4_E4M3[(word >> (8 + shift)) & 0xFu],
+        NF_IQ4_E4M3[(word >> (16 + shift)) & 0xFu],
+        NF_IQ4_E4M3[(word >> (24 + shift)) & 0xFu]);
+}
+#define IQ4_NL_W4A8_CODE4(bp, e0) nf_w4a8_iq4nl_code4((bp), (e0))
 #define IQ4_NL_W4A8_SCALE(bp, k0) nf_ql_half((bp), 0)
 NF_W4A8_GEMM(IQ4_NL, IQ4_NL_BLOCK_SIZE, IQ4_NL_BLOCK_BYTES, IQ4_NL_W4A8_CODE, IQ4_NL_W4A8_SCALE)
 NF_W4A8_GEMM_KSPLIT(IQ4_NL, IQ4_NL_BLOCK_SIZE, IQ4_NL_BLOCK_BYTES, IQ4_NL_W4A8_CODE, IQ4_NL_W4A8_SCALE)
@@ -313,6 +335,17 @@ NF_W4A8_GEMM_KSPLIT(IQ4_NL, IQ4_NL_BLOCK_SIZE, IQ4_NL_BLOCK_BYTES, IQ4_NL_W4A8_C
 #define IQ4_XS_W4A8_CODE(bp, e) (nf_i8)NF_IQ4_E4M3[(((e) % 32) < 16 \
     ? ((uint)(bp)[IQ4_XS_HEADER_BYTES + ((e) >> 5) * IQ4_XS_SUB_BLOCK_QUANT_BYTES + ((e) & 15)] & 0xFu) \
     : ((uint)(bp)[IQ4_XS_HEADER_BYTES + ((e) >> 5) * IQ4_XS_SUB_BLOCK_QUANT_BYTES + ((e) & 15)] >> 4))]
+/* Codes e0..e0+3: the group's qs bytes as one aligned u32 through the E4M3 codebook. */
+NF_INLINE uint nf_w4a8_iq4xs_code4(NF_GLOBAL const uchar* bp, int e0) {
+    const uint word = nf_read_u32(bp + IQ4_XS_HEADER_BYTES
+        + (e0 >> 5) * IQ4_XS_SUB_BLOCK_QUANT_BYTES + (e0 & 15));
+    const int shift = ((e0 % 32) < 16) ? 0 : 4;
+    return NF_MMQ_CODE4_PACK(NF_IQ4_E4M3[(word >> shift) & 0xFu],
+        NF_IQ4_E4M3[(word >> (8 + shift)) & 0xFu],
+        NF_IQ4_E4M3[(word >> (16 + shift)) & 0xFu],
+        NF_IQ4_E4M3[(word >> (24 + shift)) & 0xFu]);
+}
+#define IQ4_XS_W4A8_CODE4(bp, e0) nf_w4a8_iq4xs_code4((bp), (e0))
 #define IQ4_XS_W4A8_SCALE(bp, k0) iq4xs_sub_scale((bp), ((k0) % 256) >> 5)
 NF_W4A8_GEMM(IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BLOCK_BYTES, IQ4_XS_W4A8_CODE, IQ4_XS_W4A8_SCALE)
 NF_W4A8_GEMM_KSPLIT(IQ4_XS, IQ4_XS_BLOCK_SIZE, IQ4_XS_BLOCK_BYTES, IQ4_XS_W4A8_CODE, IQ4_XS_W4A8_SCALE)
@@ -342,6 +375,11 @@ NF_INLINE nf_i8 nf_nvfp4_w4a8_code(NF_GLOBAL const uchar* bp, int e) {
     return (nf_i8)nf_aq_e4m3_encode(MXFP4_KVALUES[nib] * nf_nvfp4_w4a8_ratio(bp, e));
 }
 #define NVFP4_W4A8_CODE(bp, e) nf_nvfp4_w4a8_code((bp), (e))
+/* The code pipeline is per element (sub-block scale ratio, one E4M3 rounding), so the group packs
+ * 4 CODE calls. */
+#define NVFP4_W4A8_CODE4(bp, e0) \
+    NF_MMQ_CODE4_PACK(NVFP4_W4A8_CODE((bp), (e0)), NVFP4_W4A8_CODE((bp), (e0) + 1), \
+        NVFP4_W4A8_CODE((bp), (e0) + 2), NVFP4_W4A8_CODE((bp), (e0) + 3))
 #define NVFP4_W4A8_SCALE(bp, k0) nf_nvfp4_w4a8_chunk_scale((bp), (k0))
 NF_W4A8_GEMM(NVFP4, NVFP4_BLOCK_SIZE, NVFP4_BLOCK_BYTES, NVFP4_W4A8_CODE, NVFP4_W4A8_SCALE)
 NF_W4A8_GEMM_KSPLIT(NVFP4, NVFP4_BLOCK_SIZE, NVFP4_BLOCK_BYTES, NVFP4_W4A8_CODE, NVFP4_W4A8_SCALE)

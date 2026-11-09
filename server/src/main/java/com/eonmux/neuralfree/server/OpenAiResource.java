@@ -970,7 +970,7 @@ public class OpenAiResource {
                                                      Lfm3aSpeechGenerator.Mode mode, boolean continuing,
                                                      SpeechOptions options, Lfm3aSpeechGenerator.OmniSink sink) {
         try {
-            return service.omniTurn(chat, mode, continuing, options, sink);
+            return service.speech().omniTurn(chat, mode, continuing, options, sink);
         } catch (UnsupportedOperationException e) {
             throw ServerJson.error(400, e.getMessage(), "invalid_request_error");
         } catch (IllegalArgumentException e) {

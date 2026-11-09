@@ -76,9 +76,10 @@ layout(push_constant) uniform NfMmaParams {
 #define NF_MMA_BLOCKS ((NF_MMA_TM / NF_MMA_CM) * (NF_MMA_TN / NF_MMA_CM)) /* 4 row blocks x 2 token blocks */
 
 #ifdef NF_MMA_BF16
-/* bfloat16 bits -> float16_t (llama.cpp mul_mm.comp converts DATA_A_BF16 into the fp16 tiles). */
+/* bfloat16 bits -> float16_t (llama.cpp mul_mm.comp converts DATA_A_BF16 into the fp16 tiles): the
+ * bf16 bits are the high half of the fp32 value (nf_bf16), narrowed to the fp16 tile element. */
 float16_t nf_mma_w(uint idx) {
-    return float16_t(unpackHalf2x16(uint(w_u16[idx]) << 16u).x);
+    return float16_t(nf_bf16(uint(w_u16[idx])));
 }
 #else
 float16_t nf_mma_w(uint idx) {

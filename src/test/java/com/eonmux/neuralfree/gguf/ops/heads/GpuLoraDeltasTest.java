@@ -8,7 +8,7 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.ops.flow.FlowKernels;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Before;
@@ -64,7 +64,7 @@ public class GpuLoraDeltasTest {
     // ------------------------------------------------------------------ emulated kernels
 
     /** LLM_SwitchedLoraAdd (heads.cl): stage 0 {@code tmp = A[s] x}, stage 1 {@code y += scale * B[s] tmp}. */
-    private static void switchedLoraAdd(Dispatch d) {
+    private static void switchedLoraAdd(FakeDispatch d) {
         int n = d.intArg(0);
         int in = d.intArg(1);
         int out = d.intArg(2);
@@ -107,7 +107,7 @@ public class GpuLoraDeltasTest {
     }
 
     /** LLM_GatherRows (flow.cl). */
-    private static void gatherRows(Dispatch d) {
+    private static void gatherRows(FakeDispatch d) {
         int nRows = d.intArg(0);
         int rowLen = d.intArg(1);
         int srcStride = d.intArg(2);
@@ -127,7 +127,7 @@ public class GpuLoraDeltasTest {
     }
 
     /** LLM_Copy2D_F32: {@code (rows, cols, src_stride, src_off, dst_stride, dst_off, src, dst)}. */
-    private static void copy2d(Dispatch d) {
+    private static void copy2d(FakeDispatch d) {
         int rows = d.intArg(0);
         int cols = d.intArg(1);
         int srcStride = d.intArg(2);
@@ -163,7 +163,7 @@ public class GpuLoraDeltasTest {
 
     private List<String> dispatched() {
         List<String> names = new ArrayList<>();
-        for (Dispatch d : backend.dispatches()) {
+        for (FakeDispatch d : backend.dispatches()) {
             names.add(d.kernelName());
         }
         return names;

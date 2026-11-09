@@ -28,7 +28,10 @@ import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -100,7 +103,7 @@ public class GpuSplitForwardBackendTest {
             this.events = events;
         }
 
-        FakeComputeBackend.OpKind kind(int index) {
+        FakeOpKind kind(int index) {
             return backend.ops().get(index).kind();
         }
 
@@ -112,7 +115,7 @@ public class GpuSplitForwardBackendTest {
             return (FakeGpuBuffer) xSlot().buffer();
         }
 
-        List<FakeComputeBackend.Dispatch> dispatches() {
+        List<FakeDispatch> dispatches() {
             return backend.dispatches();
         }
     }
@@ -264,9 +267,9 @@ public class GpuSplitForwardBackendTest {
                 main.memory);
     }
 
-    private static int countKind(List<FakeComputeBackend.Op> ops, FakeComputeBackend.OpKind kind) {
+    private static int countKind(List<FakeOp> ops, FakeOpKind kind) {
         int n = 0;
-        for (FakeComputeBackend.Op op : ops) {
+        for (FakeOp op : ops) {
             if (op.kind() == kind) {
                 n++;
             }
@@ -275,9 +278,9 @@ public class GpuSplitForwardBackendTest {
     }
 
     /** The READ op of the given source buffer, or null. */
-    private static FakeComputeBackend.Op readOf(List<FakeComputeBackend.Op> ops, FakeGpuBuffer source) {
-        for (FakeComputeBackend.Op op : ops) {
-            if (op.kind() == FakeComputeBackend.OpKind.READ && source.equals(op.buffer())) {
+    private static FakeOp readOf(List<FakeOp> ops, FakeGpuBuffer source) {
+        for (FakeOp op : ops) {
+            if (op.kind() == FakeOpKind.READ && source.equals(op.buffer())) {
                 return op;
             }
         }
@@ -285,17 +288,17 @@ public class GpuSplitForwardBackendTest {
     }
 
     /** The WRITE ops into the given buffer. */
-    private static List<FakeComputeBackend.Op> writesTo(List<FakeComputeBackend.Op> ops, FakeGpuBuffer dst) {
-        List<FakeComputeBackend.Op> out = new ArrayList<>();
-        for (FakeComputeBackend.Op op : ops) {
-            if (op.kind() == FakeComputeBackend.OpKind.WRITE && dst.equals(op.buffer())) {
+    private static List<FakeOp> writesTo(List<FakeOp> ops, FakeGpuBuffer dst) {
+        List<FakeOp> out = new ArrayList<>();
+        for (FakeOp op : ops) {
+            if (op.kind() == FakeOpKind.WRITE && dst.equals(op.buffer())) {
                 out.add(op);
             }
         }
         return out;
     }
 
-    private static int countWriteTo(List<FakeComputeBackend.Op> ops, FakeGpuBuffer dst) {
+    private static int countWriteTo(List<FakeOp> ops, FakeGpuBuffer dst) {
         return writesTo(ops, dst).size();
     }
 
@@ -309,23 +312,23 @@ public class GpuSplitForwardBackendTest {
 
         long handOffBytes = (long) SplitSpecs.N_EMBD * Float.BYTES;
         // device one: the stream leaves after its layers, and the logits are read back at the end
-        List<FakeComputeBackend.Op> oneOps = main.backend.ops();
-        assertEquals(2, countKind(oneOps, FakeComputeBackend.OpKind.READ));
-        FakeComputeBackend.Op leave = readOf(oneOps, main.xBuffer());
+        List<FakeOp> oneOps = main.backend.ops();
+        assertEquals(2, countKind(oneOps, FakeOpKind.READ));
+        FakeOp leave = readOf(oneOps, main.xBuffer());
         assertTrue("device one never reads its stream out", leave != null);
         assertEquals(handOffBytes, leave.bytes());
         // device two: the stream arrives as one write of the same size, and is read back for the way home
-        List<FakeComputeBackend.Op> twoOps = second.backend.ops();
-        FakeComputeBackend.Op arrive = writesTo(twoOps, second.xBuffer()).get(0);
+        List<FakeOp> twoOps = second.backend.ops();
+        FakeOp arrive = writesTo(twoOps, second.xBuffer()).get(0);
         assertTrue("device two never receives the stream", arrive != null);
         assertEquals(handOffBytes, arrive.bytes());
-        assertEquals(1, countKind(twoOps, FakeComputeBackend.OpKind.READ));
-        FakeComputeBackend.Op home = readOf(twoOps, second.xBuffer());
+        assertEquals(1, countKind(twoOps, FakeOpKind.READ));
+        FakeOp home = readOf(twoOps, second.xBuffer());
         assertTrue(home != null);
         assertEquals(handOffBytes, home.bytes());
         // one finish per device
-        assertEquals(1, countKind(oneOps, FakeComputeBackend.OpKind.FINISH));
-        assertEquals(1, countKind(twoOps, FakeComputeBackend.OpKind.FINISH));
+        assertEquals(1, countKind(oneOps, FakeOpKind.FINISH));
+        assertEquals(1, countKind(twoOps, FakeOpKind.FINISH));
     }
 
     @Test
@@ -336,7 +339,7 @@ public class GpuSplitForwardBackendTest {
 
         assertEquals(SplitSpecs.VOCAB, logits.length);
         // the logits read is on the main queue, never on the second
-        assertTrue(countKind(main.backend.ops(), FakeComputeBackend.OpKind.READ) >= 2);
+        assertTrue(countKind(main.backend.ops(), FakeOpKind.READ) >= 2);
     }
 
     @Test
@@ -346,8 +349,8 @@ public class GpuSplitForwardBackendTest {
         backend.decode(2, 0);
 
         // the row norms of device one use layers 0-1's weights, device two's use 2-3's
-        List<FakeComputeBackend.Dispatch> one = main.dispatches();
-        List<FakeComputeBackend.Dispatch> two = second.dispatches();
+        List<FakeDispatch> one = main.dispatches();
+        List<FakeDispatch> two = second.dispatches();
         assertTrue(one.stream().anyMatch(d -> d.bufferArgs().contains(
                 main.weights.get(blk(0, TensorNames.ATTN_NORM)).shard(0))));
         assertTrue(one.stream().noneMatch(d -> d.bufferArgs().contains(

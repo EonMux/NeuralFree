@@ -41,8 +41,8 @@ import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.spec.resolve.NormResolver;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Op;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.OpKind;
+import com.eonmux.neuralfree.gguf.testutil.FakeOp;
+import com.eonmux.neuralfree.gguf.testutil.FakeOpKind;
 import org.junit.After;
 import org.junit.Test;
 
@@ -184,11 +184,11 @@ public class GpuDecodeReplayTest {
     }
 
     private long replayOps() {
-        return backend.ops().stream().filter(op -> op.kind() == OpKind.REPLAY).count();
+        return backend.ops().stream().filter(op -> op.kind() == FakeOpKind.REPLAY).count();
     }
 
     private long launchOps() {
-        return backend.ops().stream().filter(op -> op.kind() == OpKind.LAUNCH).count();
+        return backend.ops().stream().filter(op -> op.kind() == FakeOpKind.LAUNCH).count();
     }
 
     private long dispatchesOf(String kernel) {
@@ -197,8 +197,8 @@ public class GpuDecodeReplayTest {
 
     private int trunkDispatches() {
         int n = 0;
-        for (Op op : backend.ops()) {
-            if (op.kind() == OpKind.DISPATCH && op.dispatch().kernelName().equals(NormKernels.ROW_NORM)) {
+        for (FakeOp op : backend.ops()) {
+            if (op.kind() == FakeOpKind.DISPATCH && op.dispatch().kernelName().equals(NormKernels.ROW_NORM)) {
                 n++;
             }
         }

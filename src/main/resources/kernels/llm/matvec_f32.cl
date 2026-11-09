@@ -1,4 +1,4 @@
-/* matvec_f32.cl - F32 matvec, fused gate/up, logits, batch matmul and embedding kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h */
+/* matvec_f32.cl - F32 matvec, fused gate/up, logits, batch matmul, multi-column matvec and embedding kernels. Requires: common/dialect.h, common/config.h, common/math.h, common/reduce.h, common/matvec_n.h */
 /*
  * Launch contract of the row kernels (every kernel except the embedding lookups): one workgroup per
  * output row, global = rows * L, local = L with L a power of two <= LLM_DIMX (CUDA: a multiple of 32).
@@ -50,7 +50,7 @@ NF_INLINE void nf_mvf32_partial_dual(NF_GLOBAL const float* NF_RESTRICT g,
 }
 
 /* output[row] = dot(weight[row, :], input). */
-NF_KERNEL void Float_MatVec(
+NF_REQD_SG_ATTR NF_KERNEL void Float_MatVec(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const float* NF_RESTRICT weight,
@@ -66,7 +66,7 @@ NF_KERNEL void Float_MatVec(
 }
 
 /* addend_output[row] += dot(weight[row, :], input). */
-NF_KERNEL void Float_MatVecAdd(
+NF_REQD_SG_ATTR NF_KERNEL void Float_MatVecAdd(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const float* NF_RESTRICT weight,
@@ -81,8 +81,49 @@ NF_KERNEL void Float_MatVecAdd(
     if (get_local_id(0) == 0) addend_output[row] += acc;
 }
 
+/* Float_MatVec over n_tokens consecutive float rows in one launch (n_tokens in [1, NF_MVQN_MAX]):
+ * the weight row is streamed once and dotted against every live token row with the
+ * nf_mvf32_partial element mapping walked per token, where one Float_MatVec per token re-reads the
+ * row per token. Token t's dot lands at output[t * out_dim + row], and NF_MVQTN_TREE reduces the
+ * group in one pass, so token t's result is the exact single-row result. */
+NF_REQD_SG_ATTR NF_KERNEL void Float_MatVecN(
+    const int out_dim,
+    const int in_dim,
+    const int n_tokens,
+    NF_GLOBAL const float* NF_RESTRICT weight,
+    NF_GLOBAL const float* NF_RESTRICT input,
+    NF_GLOBAL float* NF_RESTRICT output)
+{
+    const int row = get_group_id(0);
+    if (row >= out_dim) return;
+
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int n4 = in_dim & ~3;
+    NF_GLOBAL const float* wrow = weight + (nf_i64)row * in_dim;
+    float ps[NF_MVQN_MAX];
+#pragma unroll
+    for (int j = 0; j < NF_MVQN_MAX; j++) ps[j] = 0.0f;
+    for (int i = lid * 4; i < n4; i += lsize * 4) {
+        const float4 wv = vload4(0, wrow + i);
+#pragma unroll
+        for (int t = 0; t < NF_MVQN_MAX; t++) {
+            if (t < n_tokens) ps[t] += dot(wv, vload4(0, input + (nf_i64)t * in_dim + i));
+        }
+    }
+    for (int i = n4 + lid; i < in_dim; i += lsize) {
+        const float wv = wrow[i];
+#pragma unroll
+        for (int t = 0; t < NF_MVQN_MAX; t++) {
+            if (t < n_tokens) ps[t] += wv * input[(nf_i64)t * in_dim + i];
+        }
+    }
+    NF_LOCAL float ts[NF_MVQN_MAX * NF_MVQTN_SLOTS];
+    NF_MVQTN_TREE(ts, ps, n_tokens, output, out_dim, row)
+}
+
 /* output[row] = silu(dot(gate_weight[row, :], input)) * dot(up_weight[row, :], input). */
-NF_KERNEL void Float_MatVecFusedGateUp(
+NF_REQD_SG_ATTR NF_KERNEL void Float_MatVecFusedGateUp(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const float* NF_RESTRICT gate_weight,
@@ -107,7 +148,7 @@ NF_KERNEL void Float_MatVecFusedGateUp(
 }
 
 /* output[row] = gelu_tanh(dot(gate_weight[row, :], input)) * dot(up_weight[row, :], input). */
-NF_KERNEL void Float_MatVecFusedGateUpGelu(
+NF_REQD_SG_ATTR NF_KERNEL void Float_MatVecFusedGateUpGelu(
     const int out_dim,
     const int in_dim,
     NF_GLOBAL const float* NF_RESTRICT gate_weight,
@@ -132,7 +173,7 @@ NF_KERNEL void Float_MatVecFusedGateUpGelu(
 }
 
 /* logits[row] = dot(weight[row, :], hidden); the Float_MatVec structure over vocab rows. */
-NF_KERNEL void LLM_ComputeLogits(
+NF_REQD_SG_ATTR NF_KERNEL void LLM_ComputeLogits(
     const int vocab_size,
     const int embed_dim,
     NF_GLOBAL const float* NF_RESTRICT weight,
@@ -149,7 +190,7 @@ NF_KERNEL void LLM_ComputeLogits(
 
 /* output[s * out_dim + row] = dot(weight[row, :], input[s, :]) for s in [0, seq_len); one
  * workgroup per row walks every token. */
-NF_KERNEL void LLM_Batch_Float_MatMul(
+NF_REQD_SG_ATTR NF_KERNEL void LLM_Batch_Float_MatMul(
     const int out_dim,
     const int in_dim,
     const int seq_len,
@@ -169,7 +210,7 @@ NF_KERNEL void LLM_Batch_Float_MatMul(
 }
 
 /* LLM_Batch_Float_MatMul with one (row, token) pair per workgroup. */
-NF_KERNEL void LLM_Batch_Float_MatMul_2D(
+NF_REQD_SG_ATTR NF_KERNEL void LLM_Batch_Float_MatMul_2D(
     const int out_dim,
     const int in_dim,
     const int seq_len,

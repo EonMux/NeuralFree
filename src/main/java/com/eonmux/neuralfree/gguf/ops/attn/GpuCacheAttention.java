@@ -45,13 +45,16 @@ public final class GpuCacheAttention implements AutoCloseable {
      * @param q     {@code ubatch} Q rows of {@code a.qDim()} floats from element 0
      * @param out   {@code ubatch} output rows of {@code a.outDim()} floats from element 0
      * @param sinks the F32 per-head sink logits, or null without sinks
-     * @throws IllegalArgumentException when the geometry fits no flash kernel
+     * @throws GpuModelUnsupportedException when the geometry fits no flash kernel
+     *                                      ({@link FlashBindGuard#requireServable})
      */
     public static GpuCacheAttention bind(GpuForwardContext ctx, AttentionSpec a, GpuKvLayer kv, GpuBuffer kvPos,
                                          GpuBuffer q, GpuBuffer out, GpuBuffer sinks, int ubatch) {
         Objects.requireNonNull(ctx, "ctx");
         Objects.requireNonNull(a, "a");
         Objects.requireNonNull(kv, "kv");
+        FlashBindGuard.requireServable(ctx.kernels(), "cache attention " + a, a.nHead(), a.nHeadKv(),
+                a.headDimK(), a.headDimV());
         if (ubatch < 1) {
             throw new IllegalArgumentException("cache attention of " + ubatch + " query rows");
         }

@@ -12,7 +12,7 @@ import java.util.Locale;
  * <ul>
  *   <li>{@link #AUTO}: the lane is used where the device reports
  *       {@link com.eonmux.neuralfree.acceleration.backend.DeviceFeature#INTEGER_DOT_PRODUCT}, the
- *       kernel is available, and the weight type measured faster with the lane on that backend
+ *       kernel is available, and the weight type measured faster with the lane on that device kind
  *       ({@link Int8MatvecTuning}) (the default).</li>
  *   <li>{@link #ON}: the lane is used whenever the kernels can run, also on a device that does not
  *       report packed dot products (the OpenCL kernels take the portable integer path there).</li>

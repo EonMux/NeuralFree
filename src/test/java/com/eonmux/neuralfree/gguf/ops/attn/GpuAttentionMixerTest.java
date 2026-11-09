@@ -57,7 +57,7 @@ import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorRef;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Test;
@@ -232,16 +232,16 @@ public class GpuAttentionMixerTest {
         return (DeviceStepInputs) memory.stepInputs();
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
     /** The mixer's own kernels of a trace, in order. */
-    private static List<String> trace(List<Dispatch> ds) {
+    private static List<String> trace(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             if (OWN.contains(d.kernelName()) && !d.kernelName().equals(GpuOps.COPY2D)
                     && !d.kernelName().equals(GpuOps.AXPBY)) {
                 out.add(d.kernelName());
@@ -250,9 +250,9 @@ public class GpuAttentionMixerTest {
         return out;
     }
 
-    private static List<Dispatch> named(List<Dispatch> ds, String kernel) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+    private static List<FakeDispatch> named(List<FakeDispatch> ds, String kernel) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (d.kernelName().equals(kernel)) {
                 out.add(d);
             }
@@ -291,8 +291,9 @@ public class GpuAttentionMixerTest {
     }
 
     private FlashAttnTiling decodePlan() {
+        // The fake backend reports no subgroup shuffle, so the mixer binds the portable plan.
         return FlashAttnTiling.decode(N_HEAD, N_HEAD_KV, HEAD_DIM, HEAD_DIM, N_CTX, kernels.faSmemFloats(),
-                Math.max(1, backend.capabilities().getComputeUnits()));
+                Math.max(1, backend.capabilities().getComputeUnits()), false);
     }
 
     private FlashAttnTiling prefillPlan(int keyRows) {
@@ -310,22 +311,22 @@ public class GpuAttentionMixerTest {
     public void llamaDecodeTrace() {
         bindLlama(llama(llamaAttention().build()), KvDType.F16, false);
         int pos = 5;
-        List<Dispatch> ds = run(() -> decode(pos));
+        List<FakeDispatch> ds = run(() -> decode(pos));
         assertEquals(Arrays.asList(RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT, RopeKernels.kvStore(KvDType.F16),
                 RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16)), trace(ds));
 
         GpuKvLayer kv = memory.kv(0);
-        List<Dispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
+        List<FakeDispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
         for (int i = 0; i < 2; i++) {
-            Dispatch r = ropes.get(i);
+            FakeDispatch r = ropes.get(i);
             assertEquals(1, r.intArg(RopeKernels.ARG_N_TOKENS));
             assertEquals(1, r.intArg(RopeKernels.ARG_POS_STRIDE));
             assertTrue(r.bufferArgs().contains(steps().ropePos()));
             assertTrue(r.bufferArgs().contains(slot(i == 0 ? ScratchSlots.Q : ScratchSlots.K).buffer()));
         }
-        List<Dispatch> stores = named(ds, RopeKernels.kvStore(KvDType.F16));
+        List<FakeDispatch> stores = named(ds, RopeKernels.kvStore(KvDType.F16));
         for (int i = 0; i < 2; i++) {
-            Dispatch s = stores.get(i);
+            FakeDispatch s = stores.get(i);
             assertEquals(1, s.intArg(RopeKernels.ARG_N_TOKENS));
             assertEquals(KV_DIM, s.intArg(1));
             assertSame(slot(i == 0 ? ScratchSlots.K : ScratchSlots.V).buffer(), s.bufferArg(5));
@@ -333,7 +334,7 @@ public class GpuAttentionMixerTest {
             assertSame(i == 0 ? kv.k() : kv.v(), s.bufferArg(7));
         }
 
-        Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        FakeDispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
         FlashAttnTiling plan = decodePlan();
         assertEquals(N_HEAD, fd.intArg(AttnKernels.ARG_FD_N_HEAD));
         assertEquals(N_HEAD_KV, fd.intArg(AttnKernels.ARG_FD_N_HEAD_KV));
@@ -364,7 +365,7 @@ public class GpuAttentionMixerTest {
     public void llamaPrefillTrace() {
         bindLlama(llama(llamaAttention().build()), KvDType.F16, false);
         int n = 4;
-        List<Dispatch> ds = run(() -> prefill(0, n));
+        List<FakeDispatch> ds = run(() -> prefill(0, n));
         FlashAttnTiling plan = prefillPlan(N_CTX);
         List<String> expected = new ArrayList<>(Arrays.asList(RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT,
                 RopeKernels.kvStore(KvDType.F16), RopeKernels.kvStore(KvDType.F16)));
@@ -376,16 +377,16 @@ public class GpuAttentionMixerTest {
             }
         }
         assertEquals(expected, trace(ds));
-        for (Dispatch r : named(ds, RopeKernels.ROPE_EXT)) {
+        for (FakeDispatch r : named(ds, RopeKernels.ROPE_EXT)) {
             assertEquals(n, r.intArg(RopeKernels.ARG_N_TOKENS));
             assertEquals(n, r.intArg(RopeKernels.ARG_POS_STRIDE));
         }
-        for (Dispatch s : named(ds, RopeKernels.kvStore(KvDType.F16))) {
+        for (FakeDispatch s : named(ds, RopeKernels.kvStore(KvDType.F16))) {
             assertEquals(n, s.intArg(RopeKernels.ARG_N_TOKENS));
         }
         GpuKvLayer kv = memory.kv(0);
         if (plan.plan() == FlashAttnTiling.Plan.TILED) {
-            Dispatch fa = named(ds, AttnKernels.flashAttn(KvDType.F16)).get(0);
+            FakeDispatch fa = named(ds, AttnKernels.flashAttn(KvDType.F16)).get(0);
             assertEquals(n, fa.intArg(AttnKernels.ARG_FA_N_TOKENS));
             assertEquals(plan.bq(), fa.intArg(AttnKernels.ARG_FA_BQ));
             assertEquals(plan.bk(), fa.intArg(AttnKernels.ARG_FA_BK));
@@ -399,9 +400,9 @@ public class GpuAttentionMixerTest {
             assertSame(steps().kvPos(kv.group()), fa.bufferArg(AttnKernels.ARG_FA_BUF_KV_POS));
             assertTrue(Arrays.equals(plan.prefillGlobal(n, 1), fa.global()));
         } else {
-            List<Dispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F16));
+            List<FakeDispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F16));
             for (int t = 0; t < n; t++) {
-                Dispatch r = rows.get(t);
+                FakeDispatch r = rows.get(t);
                 assertEquals(t, r.intArg(AttnKernels.ARG_FD_Q_POS));
                 assertEquals(t + 1, r.intArg(AttnKernels.ARG_FD_KV_END));
                 assertEquals(t * Q_DIM, r.intArg(AttnKernels.ARG_FD_Q_OFF));
@@ -418,8 +419,8 @@ public class GpuAttentionMixerTest {
     public void kvOnlyPrefillRunsTheStoreWithoutQueryOrAttention() {
         bindLlama(llama(llamaAttention().build()), KvDType.F16, false);
         int n = 4;
-        List<Dispatch> whole = run(() -> prefill(0, n));
-        List<Dispatch> only = run(() -> {
+        List<FakeDispatch> whole = run(() -> prefill(0, n));
+        List<FakeDispatch> only = run(() -> {
             steps().upload(0, n);
             mixer.prefillKV(0, n, slot(ScratchSlots.NORMED));
         });
@@ -429,7 +430,7 @@ public class GpuAttentionMixerTest {
         assertEquals("the K RoPE alone in the cache-write-only step", 1,
                 named(only, RopeKernels.ROPE_EXT).size());
         assertEquals("both stores run", 2, named(only, RopeKernels.kvStore(KvDType.F16)).size());
-        for (Dispatch d : only) {
+        for (FakeDispatch d : only) {
             String kernel = d.kernelName();
             assertFalse("no flash attention: " + kernel, kernel.equals(AttnKernels.flashAttn(KvDType.F16))
                     || kernel.equals(AttnKernels.flashDecode(KvDType.F16)));
@@ -439,10 +440,10 @@ public class GpuAttentionMixerTest {
     @Test
     public void decodeReusesPreparedDispatchesAcrossSteps() {
         bindLlama(llama(llamaAttention().build()), KvDType.F16, false);
-        List<Dispatch> first = run(() -> decode(0));
-        List<Dispatch> second = run(() -> decode(1));
+        List<FakeDispatch> first = run(() -> decode(0));
+        List<FakeDispatch> second = run(() -> decode(1));
         assertEquals(trace(first), trace(second));
-        Dispatch fd = named(second, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        FakeDispatch fd = named(second, AttnKernels.flashDecode(KvDType.F16)).get(0);
         assertEquals(2, fd.intArg(AttnKernels.ARG_FD_KV_END));
         assertEquals(1, fd.intArg(AttnKernels.ARG_FD_Q_POS));
     }
@@ -453,15 +454,15 @@ public class GpuAttentionMixerTest {
         int pos = N_CTX - 1;
         FlashAttnTiling.Split split = decodePlan().decodeSplit(N_CTX);
         int nSplit = split.count();
-        List<Dispatch> ds = run(() -> decode(pos));
-        Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        List<FakeDispatch> ds = run(() -> decode(pos));
+        FakeDispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
         assertEquals(nSplit, fd.intArg(AttnKernels.ARG_FD_N_SPLIT));
         assertEquals(split.length(), fd.intArg(AttnKernels.ARG_FD_SPLIT_LEN));
         assertEquals(N_CTX, fd.intArg(AttnKernels.ARG_FD_KV_END));
-        List<Dispatch> combines = named(ds, AttnKernels.FLASH_COMBINE);
+        List<FakeDispatch> combines = named(ds, AttnKernels.FLASH_COMBINE);
         assertEquals(nSplit == 1 ? 0 : 1, combines.size());
         if (nSplit > 1) {
-            Dispatch c = combines.get(0);
+            FakeDispatch c = combines.get(0);
             assertEquals(0, fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_DIRECT);
             assertEquals(N_HEAD, c.intArg(AttnKernels.ARG_FC_N_ROWS));
             assertEquals(nSplit, c.intArg(AttnKernels.ARG_FC_N_SPLIT));
@@ -476,7 +477,7 @@ public class GpuAttentionMixerTest {
     public void quantizedCacheRotatesBeforeStoreAndAfterAttention() {
         bindLlama(llama(llamaAttention().build()), KvDType.Q8_0, false);
         RotationPlan rot = memory.kv(0).rotation();
-        List<Dispatch> ds = run(() -> decode(0));
+        List<FakeDispatch> ds = run(() -> decode(0));
         List<String> t = trace(ds);
         int before = (rot.rotateK() ? 2 : 0) + (rot.rotateV() ? 1 : 0);
         int after = rot.rotateV() ? 1 : 0;
@@ -503,21 +504,21 @@ public class GpuAttentionMixerTest {
         RotationPlan rot = kv.rotation();
         assertFalse(rot.rotateK());
         int pos = 3;
-        List<Dispatch> ds = run(() -> decode(pos));
+        List<FakeDispatch> ds = run(() -> decode(pos));
         List<String> t = trace(ds);
         assertFalse(t.contains(AttnKernels.flashDecode(KvDType.F16)));
         assertFalse(t.contains(AttnKernels.flashDecode(KvDType.Q8_0)));
-        List<Dispatch> storesK = named(ds, RopeKernels.kvStore(KvDType.F16));
-        List<Dispatch> storesV = named(ds, RopeKernels.kvStore(KvDType.Q8_0));
+        List<FakeDispatch> storesK = named(ds, RopeKernels.kvStore(KvDType.F16));
+        List<FakeDispatch> storesV = named(ds, RopeKernels.kvStore(KvDType.Q8_0));
         assertEquals(1, storesK.size());
         assertEquals(1, storesV.size());
         assertTrue(storesK.get(0).bufferArgs().contains(kv.k()));
         assertTrue(storesV.get(0).bufferArgs().contains(kv.v()));
         assertEquals(rot.rotateV() ? 2 : 0, named(ds, HadamardSpec.KERNEL).size());
 
-        List<Dispatch> flash = named(ds, AttnKernels.FLASH_DECODE_MIXED);
+        List<FakeDispatch> flash = named(ds, AttnKernels.FLASH_DECODE_MIXED);
         assertEquals(1, flash.size());
-        Dispatch fd = flash.get(0);
+        FakeDispatch fd = flash.get(0);
         assertTrue(t.indexOf(RopeKernels.kvStore(KvDType.Q8_0)) < t.indexOf(AttnKernels.FLASH_DECODE_MIXED));
         assertEquals(AttnKernels.FD_MIXED_ARG_COUNT, fd.argCount());
         assertEquals(AttnKernels.kvTypes(KvDType.F16, KvDType.Q8_0), fd.intArg(AttnKernels.ARG_FD_KV_TYPES));
@@ -534,13 +535,13 @@ public class GpuAttentionMixerTest {
     public void mixedCacheTypesPrefillThroughTheMixedKernel() {
         bindLlama(llama(llamaAttention().build()), KvDType.Q8_0, KvDType.BF16, false);
         int n = 4;
-        List<Dispatch> ds = run(() -> prefill(0, n));
+        List<FakeDispatch> ds = run(() -> prefill(0, n));
         assertEquals(1, named(ds, RopeKernels.kvStore(KvDType.Q8_0)).size());
         assertEquals(1, named(ds, RopeKernels.kvStore(KvDType.BF16)).size());
         int kvTypes = AttnKernels.kvTypes(KvDType.Q8_0, KvDType.BF16);
         FlashAttnTiling plan = prefillPlan(N_CTX);
         if (plan.plan() == FlashAttnTiling.Plan.TILED) {
-            List<Dispatch> fa = named(ds, AttnKernels.FLASH_ATTN_MIXED);
+            List<FakeDispatch> fa = named(ds, AttnKernels.FLASH_ATTN_MIXED);
             assertEquals(1, fa.size());
             assertEquals(AttnKernels.FA_MIXED_ARG_COUNT, fa.get(0).argCount());
             assertEquals(kvTypes, fa.get(0).intArg(AttnKernels.ARG_FA_KV_TYPES));
@@ -548,7 +549,7 @@ public class GpuAttentionMixerTest {
             assertEquals(n, fa.get(0).intArg(AttnKernels.ARG_FA_KV_END));
             assertTrue(named(ds, AttnKernels.flashAttn(KvDType.Q8_0)).isEmpty());
         } else {
-            List<Dispatch> rows = named(ds, AttnKernels.FLASH_DECODE_MIXED);
+            List<FakeDispatch> rows = named(ds, AttnKernels.FLASH_DECODE_MIXED);
             assertEquals(n, rows.size());
             for (int t = 0; t < n; t++) {
                 assertEquals(kvTypes, rows.get(t).intArg(AttnKernels.ARG_FD_KV_TYPES));
@@ -566,8 +567,8 @@ public class GpuAttentionMixerTest {
         llamaTensors(l, true);
         vector(l, TensorNames.weight(TensorNames.ATTN_SINKS), N_HEAD);
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> decode(2));
-        Dispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
+        List<FakeDispatch> ds = run(() -> decode(2));
+        FakeDispatch fd = named(ds, AttnKernels.flashDecode(KvDType.F16)).get(0);
         assertTrue((fd.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_SINKS) != 0);
         assertEquals(30f, fd.floatArg(AttnKernels.ARG_FD_SOFTCAP), 0f);
         String sinks = TensorNames.layerName(l.stack(), 0, TensorNames.weight(TensorNames.ATTN_SINKS));
@@ -611,7 +612,7 @@ public class GpuAttentionMixerTest {
         vector(l, TensorNames.weight(TensorNames.ATTN_K_NORM), HEAD_DIM);
         bindPrepared(spec, KvDType.F16);
         List<String> t = new ArrayList<>();
-        for (Dispatch d : run(() -> decode(2))) {
+        for (FakeDispatch d : run(() -> decode(2))) {
             t.add(d.kernelName());
         }
         String mv = GpuOps.matVecKernel(GGMLType.F32);
@@ -633,10 +634,10 @@ public class GpuAttentionMixerTest {
         LayerSpec l = spec.layers().get(0);
         llamaTensors(l, false);
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> decode(1));
+        List<FakeDispatch> ds = run(() -> decode(1));
         String mv = GpuOps.matVecKernel(GGMLType.F32);
         List<String> t = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             t.add(d.kernelName());
         }
         assertEquals(Arrays.asList(pairedMatvec(), mv, mv, RopeKernels.ROPE_EXT, FusedKernels.ROPE_STORE,
@@ -657,7 +658,7 @@ public class GpuAttentionMixerTest {
         vector(l, TensorNames.weight(TensorNames.ATTN_K_NORM), HEAD_DIM);
         bindPrepared(spec, KvDType.F16);
         List<String> names = new ArrayList<>();
-        for (Dispatch d : run(() -> decode(2))) {
+        for (FakeDispatch d : run(() -> decode(2))) {
             names.add(d.kernelName());
         }
         closeRig();
@@ -674,11 +675,11 @@ public class GpuAttentionMixerTest {
         vector(l, TensorNames.weight(TensorNames.ATTN_Q_NORM), HEAD_DIM);
         vector(l, TensorNames.weight(TensorNames.ATTN_K_NORM), HEAD_DIM);
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> prefill(0, 3));
+        List<FakeDispatch> ds = run(() -> prefill(0, 3));
         List<String> t = trace(ds);
         assertEquals(Arrays.asList(NormKernels.ROW_NORM, NormKernels.ROW_NORM, RopeKernels.ROPE_EXT,
                 RopeKernels.ROPE_EXT), t.subList(0, 4));
-        List<Dispatch> norms = named(ds, NormKernels.ROW_NORM);
+        List<FakeDispatch> norms = named(ds, NormKernels.ROW_NORM);
         assertEquals(3 * N_HEAD, norms.get(0).intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(3 * N_HEAD_KV, norms.get(1).intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(3L * N_HEAD * ops.local(), norms.get(0).global()[0]);
@@ -694,11 +695,11 @@ public class GpuAttentionMixerTest {
         vector(l, TensorNames.weight(TensorNames.ATTN_Q_NORM), HEAD_DIM);
         vector(l, TensorNames.weight(TensorNames.ATTN_K_NORM), HEAD_DIM);
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> decode(1));
+        List<FakeDispatch> ds = run(() -> decode(1));
         assertEquals(Arrays.asList(RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT, NormKernels.ROW_NORM,
                 NormKernels.ROW_NORM, RopeKernels.kvStore(KvDType.F16), RopeKernels.kvStore(KvDType.F16),
                 AttnKernels.flashDecode(KvDType.F16)), trace(ds));
-        List<Dispatch> norms = named(ds, NormKernels.ROW_NORM);
+        List<FakeDispatch> norms = named(ds, NormKernels.ROW_NORM);
         assertSame(slot(ScratchSlots.Q).buffer(), norms.get(0).bufferArg(NormKernels.ARG_ROW_NORM_X));
         assertSame(slot(ScratchSlots.K).buffer(), norms.get(1).bufferArg(NormKernels.ARG_ROW_NORM_X));
         assertEquals(N_HEAD_KV, norms.get(1).intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
@@ -714,16 +715,16 @@ public class GpuAttentionMixerTest {
         vector(l, TensorNames.weight(TensorNames.ATTN_Q_NORM), Q_DIM);
         vector(l, TensorNames.bias(TensorNames.ATTN_Q_NORM), Q_DIM);
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> prefill(0, 3));
-        List<Dispatch> norms = named(ds, NormKernels.ROW_NORM);
+        List<FakeDispatch> ds = run(() -> prefill(0, 3));
+        List<FakeDispatch> norms = named(ds, NormKernels.ROW_NORM);
         assertEquals(2, norms.size());
-        Dispatch q = norms.get(0);
+        FakeDispatch q = norms.get(0);
         assertEquals(3, q.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(Q_DIM, q.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
         assertEquals(NormKind.LAYER.rowNormMode(), q.intArg(NormKernels.ARG_ROW_NORM_MODE));
         assertEquals(1e-5f, q.floatArg(NormKernels.ARG_ROW_NORM_EPS), 0f);
         assertEquals(NormKernels.FLAG_HAS_W | NormKernels.FLAG_HAS_B, q.intArg(NormKernels.ARG_ROW_NORM_FLAGS));
-        Dispatch k = norms.get(1);
+        FakeDispatch k = norms.get(1);
         assertEquals(3, k.intArg(NormKernels.ARG_ROW_NORM_N_ROWS));
         assertEquals(KV_DIM, k.intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
         assertEquals(0, k.intArg(NormKernels.ARG_ROW_NORM_FLAGS));
@@ -741,8 +742,8 @@ public class GpuAttentionMixerTest {
         vector(l, TensorNames.weight(TensorNames.ATTN_Q_NORM), Q_DIM);
         vector(l, TensorNames.bias(TensorNames.ATTN_Q_NORM), Q_DIM);
         bindPrepared(spec, null);
-        List<Dispatch> ds = run(() -> mixer.prefill(0, 2, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
-        List<Dispatch> norms = named(ds, NormKernels.ROW_NORM);
+        List<FakeDispatch> ds = run(() -> mixer.prefill(0, 2, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> norms = named(ds, NormKernels.ROW_NORM);
         assertEquals(1, norms.size());
         assertEquals(Q_DIM, norms.get(0).intArg(NormKernels.ARG_ROW_NORM_ROW_LEN));
         assertSame(slot(ScratchSlots.Q).buffer(), norms.get(0).bufferArg(NormKernels.ARG_ROW_NORM_X));
@@ -760,9 +761,9 @@ public class GpuAttentionMixerTest {
             vector(l, TensorNames.bias(base), HEAD_DIM);
         }
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> norms = named(run(() -> decode(0)), NormKernels.ROW_NORM);
+        List<FakeDispatch> norms = named(run(() -> decode(0)), NormKernels.ROW_NORM);
         assertEquals(2, norms.size());
-        for (Dispatch d : norms) {
+        for (FakeDispatch d : norms) {
             assertEquals(NormKernels.FLAG_HAS_W, d.intArg(NormKernels.ARG_ROW_NORM_FLAGS));
             assertSame(placeholders.readOnlyFloats(), d.bufferArg(NormKernels.ARG_ROW_NORM_B));
         }
@@ -771,7 +772,7 @@ public class GpuAttentionMixerTest {
     @Test
     public void outputBiasIsLeftOutWhenTheGraphPassesNull() {
         bindLlama(llama(llamaAttention().outBias(false).build()), KvDType.F16, true);
-        List<Dispatch> ds = run(() -> decode(0));
+        List<FakeDispatch> ds = run(() -> decode(0));
         assertEquals(Arrays.asList(GpuAttentionMixer.BIAS_ADD, GpuAttentionMixer.BIAS_ADD,
                 GpuAttentionMixer.BIAS_ADD, RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT, RopeKernels.kvStore(KvDType.F16),
                 RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16)), trace(ds));
@@ -786,8 +787,8 @@ public class GpuAttentionMixerTest {
         llamaTensors(l, false);
         matrix(l, TensorNames.ATTN_GATE, WIDTH, N_HEAD);
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> prefill(0, 2));
-        Dispatch g = named(ds, AttnExtKernels.OUT_GATE).get(0);
+        List<FakeDispatch> ds = run(() -> prefill(0, 2));
+        FakeDispatch g = named(ds, AttnExtKernels.OUT_GATE).get(0);
         assertEquals(AttnExtMath.GATE_PER_HEAD_SOFTPLUS, g.intArg(AttnExtKernels.ARG_GATE_KIND));
         assertEquals(N_HEAD, g.intArg(AttnExtKernels.ARG_GATE_GATE_STRIDE));
         assertEquals(0, g.intArg(AttnExtKernels.ARG_GATE_HAS_BIAS));
@@ -803,10 +804,10 @@ public class GpuAttentionMixerTest {
         llamaTensors(l, false);
         matrix(l, TensorNames.ATTN_GATE, WIDTH, Q_DIM);
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> decode(0));
+        List<FakeDispatch> ds = run(() -> decode(0));
         List<String> t = trace(ds);
         assertEquals(AttnExtKernels.OUT_GATE, t.get(t.size() - 1));
-        Dispatch g = named(ds, AttnExtKernels.OUT_GATE).get(0);
+        FakeDispatch g = named(ds, AttnExtKernels.OUT_GATE).get(0);
         assertEquals(AttnExtMath.GATE_SOFTPLUS_BASE2, g.intArg(AttnExtKernels.ARG_GATE_KIND));
         assertEquals(Q_DIM, g.intArg(AttnExtKernels.ARG_GATE_GATE_STRIDE));
     }
@@ -832,17 +833,17 @@ public class GpuAttentionMixerTest {
     public void movaDecodeRoutesValueExpertsIntoV() {
         ModelSpec spec = movaModel();
         bindPrepared(spec, KvDType.F16);
-        List<Dispatch> ds = run(() -> decode(0));
+        List<FakeDispatch> ds = run(() -> decode(0));
         assertEquals(Arrays.asList(MoeKernels.ROUTER, ActKernels.UNARY, MoeKernels.WEIGHTED_SUM,
                 RopeKernels.ROPE_EXT, RopeKernels.ROPE_EXT, RopeKernels.kvStore(KvDType.F16), RopeKernels.kvStore(KvDType.F16),
                 AttnKernels.flashDecode(KvDType.F16)), trace(ds));
         assertEquals(1, named(ds, MoeKernels.matVecId(GGMLType.F32)).size());
-        Dispatch router = named(ds, MoeKernels.ROUTER).get(0);
+        FakeDispatch router = named(ds, MoeKernels.ROUTER).get(0);
         assertEquals(1, router.intArg(MoeKernels.ARG_N_TOKENS));
         String bias = TensorNames.layerName(spec.layers().get(0).stack(), 0,
                 TensorNames.bias(TensorNames.ATTN_V_GATE));
         assertTrue(router.bufferArgs().contains(tensors.get(bias).shard(0)));
-        Dispatch wsum = named(ds, MoeKernels.WEIGHTED_SUM).get(0);
+        FakeDispatch wsum = named(ds, MoeKernels.WEIGHTED_SUM).get(0);
         assertTrue(wsum.bufferArgs().contains(slot(ScratchSlots.V).buffer()));
     }
 
@@ -850,7 +851,7 @@ public class GpuAttentionMixerTest {
     public void movaPrefillBucketsTheTokenExpertPairs() {
         bindPrepared(movaModel(), KvDType.F16);
         int n = 3;
-        List<Dispatch> ds = run(() -> prefill(0, n));
+        List<FakeDispatch> ds = run(() -> prefill(0, n));
         List<String> t = trace(ds);
         assertEquals(Arrays.asList(MoeKernels.ROUTER, MoeKernels.BUCKETIZE, ActKernels.UNARY,
                 MoeKernels.WEIGHTED_SUM), t.subList(0, 4));
@@ -858,11 +859,11 @@ public class GpuAttentionMixerTest {
         assertTrue(named(ds, MoeKernels.matVecId(GGMLType.F32)).isEmpty());
         assertEquals(n, named(ds, MoeKernels.ROUTER).get(0).intArg(MoeKernels.ARG_N_TOKENS));
         assertEquals(n, named(ds, MoeKernels.WEIGHTED_SUM).get(0).intArg(MoeKernels.ARG_N_TOKENS));
-        Dispatch bucket = named(ds, MoeKernels.BUCKETIZE).get(0);
-        Dispatch align = named(ds, MoeKernels.ALIGN_BLOCKS).get(0);
-        List<Dispatch> gg = named(ds, MoeKernels.groupedGemm(GGMLType.F32));
+        FakeDispatch bucket = named(ds, MoeKernels.BUCKETIZE).get(0);
+        FakeDispatch align = named(ds, MoeKernels.ALIGN_BLOCKS).get(0);
+        List<FakeDispatch> gg = named(ds, MoeKernels.groupedGemm(GGMLType.F32));
         assertEquals(1, gg.size());
-        Dispatch g = gg.get(0);
+        FakeDispatch g = gg.get(0);
         int tiles = MoeKernels.groupedTiles(UBATCH * 2, 8);
         assertEquals(n, align.intArg(MoeKernels.ARG_N_TOKENS));
         assertEquals(tiles, g.intArg(MoeKernels.ARG_GG_N_TILES));
@@ -883,7 +884,7 @@ public class GpuAttentionMixerTest {
     public void movaPrefillWithoutTheAlignKernelKeepsBatchMatMulId() {
         bindPrepared(movaModel(MoeKernels.ALIGN_BLOCKS), KvDType.F16);
         int n = 3;
-        List<Dispatch> ds = run(() -> prefill(0, n));
+        List<FakeDispatch> ds = run(() -> prefill(0, n));
         assertTrue(named(ds, MoeKernels.groupedGemm(GGMLType.F32)).isEmpty());
         assertEquals(1, named(ds, MoeKernels.batchMatMulId(GGMLType.F32)).size());
         assertEquals(n * 2, named(ds, MoeKernels.batchMatMulId(GGMLType.F32)).get(0)
@@ -898,23 +899,23 @@ public class GpuAttentionMixerTest {
         llamaTensors(spec.layers().get(0), true);
         bindPrepared(spec, null);
         int n = 5;
-        List<Dispatch> ds = run(() -> mixer.prefill(0, n, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.prefill(0, n, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
         List<String> t = trace(ds);
         assertFalse(t.contains(RopeKernels.ROPE_EXT));
         assertFalse(t.contains(RopeKernels.kvStore(KvDType.F32)));
         assertEquals(4, named(ds, GpuAttentionMixer.BIAS_ADD).size());
         FlashAttnTiling plan = prefillPlan(UBATCH);
         if (plan.plan() == FlashAttnTiling.Plan.TILED) {
-            Dispatch fa = named(ds, AttnKernels.flashAttn(KvDType.F32)).get(0);
+            FakeDispatch fa = named(ds, AttnKernels.flashAttn(KvDType.F32)).get(0);
             assertEquals(n, fa.intArg(AttnKernels.ARG_FA_KV_END));
             assertEquals(0, fa.intArg(AttnKernels.ARG_FA_FLAGS) & (AttnKernels.FLAG_CAUSAL | AttnKernels.FLAG_SINKS));
             assertSame(slot(ScratchSlots.K).buffer(), fa.bufferArg(AttnKernels.ARG_FA_BUF_K));
             assertSame(slot(ScratchSlots.POS).buffer(), fa.bufferArg(AttnKernels.ARG_FA_BUF_Q_POS));
             assertSame(slot(ScratchSlots.POS).buffer(), fa.bufferArg(AttnKernels.ARG_FA_BUF_KV_POS));
         } else {
-            List<Dispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F32));
+            List<FakeDispatch> rows = named(ds, AttnKernels.flashDecode(KvDType.F32));
             assertEquals(n, rows.size());
-            for (Dispatch r : rows) {
+            for (FakeDispatch r : rows) {
                 assertEquals(n, r.intArg(AttnKernels.ARG_FD_KV_END));
                 assertEquals(0, r.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_CAUSAL);
             }
@@ -931,7 +932,7 @@ public class GpuAttentionMixerTest {
         tensors = new HashMap<>();
         matrix(spec.layers().get(0), TensorNames.ATTN_OUT, WIDTH, WIDTH);
         bindPrepared(spec, null);
-        List<Dispatch> ds = run(() -> mixer.prefill(0, 3, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.prefill(0, 3, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
         assertTrue(trace(ds).isEmpty());
         assertFalse(ds.isEmpty());
         mixer.shiftContext(0, 1);
@@ -944,8 +945,8 @@ public class GpuAttentionMixerTest {
         run(() -> prefill(0, n));
         memory.sequence().append(new int[n], 0, n);
         memory.shiftPositions(2, 3);
-        List<Dispatch> ds = run(() -> mixer.shiftContext(2, 3));
-        List<Dispatch> shifts = named(ds, RopeKernels.kvRopeShift(KvDType.F16));
+        List<FakeDispatch> ds = run(() -> mixer.shiftContext(2, 3));
+        List<FakeDispatch> shifts = named(ds, RopeKernels.kvRopeShift(KvDType.F16));
         assertEquals(1, shifts.size());
         GpuKvLayer kv = memory.kv(0);
         assertTrue(shifts.get(0).bufferArgs().contains(memory.shiftDelta(kv.group())));
@@ -1038,12 +1039,12 @@ public class GpuAttentionMixerTest {
         ModelSpec spec = model(Arch.LLAMA,
                 layerBuilder(MixerKind.ATTENTION, llamaAttention().build()).rope(ntk).build());
         bindLlama(spec, KvDType.F16, false);
-        List<Dispatch> ds = run(() -> decode(5));
-        List<Dispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
+        List<FakeDispatch> ds = run(() -> decode(5));
+        List<FakeDispatch> ropes = named(ds, RopeKernels.ROPE_EXT);
         assertEquals(2, ropes.size());
         FakeGpuBuffer ff = (FakeGpuBuffer) ropes.get(0).bufferArg(21);
         assertSame("both rotations share the uploaded divisors", ff, ropes.get(1).bufferArg(21));
-        for (Dispatch r : ropes) {
+        for (FakeDispatch r : ropes) {
             assertEquals("has_ff", 1, r.intArg(8));
         }
         for (int i = 0; i < factors.length; i++) {
@@ -1088,14 +1089,14 @@ public class GpuAttentionMixerTest {
         fopeTensors();
         bindPrepared(spec, KvDType.F16);
 
-        List<Dispatch> ds = run(() -> decode(5));
+        List<FakeDispatch> ds = run(() -> decode(5));
         assertEquals(Arrays.asList(RopeKernels.ROPE_FOPE, RopeKernels.ROPE_FOPE, RopeKernels.kvStore(KvDType.F16),
                 RopeKernels.kvStore(KvDType.F16), AttnKernels.flashDecode(KvDType.F16)), trace(ds));
         checkFopeSteps(named(ds, RopeKernels.ROPE_FOPE), 1);
 
         backend.clearLog();
         int n = 4;
-        List<Dispatch> pre = run(() -> prefill(0, n));
+        List<FakeDispatch> pre = run(() -> prefill(0, n));
         assertEquals(n, named(pre, RopeKernels.ROPE_FOPE).get(0).intArg(RopeKernels.ARG_N_TOKENS));
         assertEquals(RopeKernels.ROPE_FOPE, trace(pre).get(0));
         assertEquals(RopeKernels.ROPE_FOPE, trace(pre).get(1));
@@ -1119,13 +1120,13 @@ public class GpuAttentionMixerTest {
         assertFalse(backend.preparedKernels().contains(RopeKernels.kvRopeShift(KvDType.F16)));
     }
 
-    private void checkFopeSteps(List<Dispatch> ropes, int nTokens) {
+    private void checkFopeSteps(List<FakeDispatch> ropes, int nTokens) {
         assertEquals(2, ropes.size());
         int[] heads = {N_HEAD, N_HEAD_KV};
         GpuBuffer cos = tensors.get(TensorNames.weight(TensorNames.ROPE_COS_COEF)).shard(0);
         GpuBuffer sin = tensors.get(TensorNames.weight(TensorNames.ROPE_SIN_COEF)).shard(0);
         for (int i = 0; i < 2; i++) {
-            Dispatch r = ropes.get(i);
+            FakeDispatch r = ropes.get(i);
             assertEquals(nTokens, r.intArg(RopeKernels.ARG_FOPE_N_TOKENS));
             assertEquals(heads[i], r.intArg(RopeKernels.ARG_FOPE_N_HEADS));
             assertEquals(HEAD_DIM, r.intArg(RopeKernels.ARG_FOPE_HEAD_STRIDE));

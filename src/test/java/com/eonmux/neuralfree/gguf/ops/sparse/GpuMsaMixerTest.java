@@ -44,7 +44,7 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.RopeSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -288,23 +288,23 @@ public class GpuMsaMixerTest {
         return scratch.temp(name, 1).buffer();
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static List<Dispatch> nonProjection(List<Dispatch> ds) {
-        List<Dispatch> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+    private static List<FakeDispatch> nonProjection(List<FakeDispatch> ds) {
+        List<FakeDispatch> out = new ArrayList<>();
+        for (FakeDispatch d : ds) {
             if (NON_PROJECTION.contains(d.kernelName())) {
                 out.add(d);
             }
@@ -312,7 +312,7 @@ public class GpuMsaMixerTest {
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] v = new int[to - from];
         for (int i = from; i < to; i++) {
             v[i - from] = d.intArg(i);
@@ -322,24 +322,24 @@ public class GpuMsaMixerTest {
 
     // ------------------------------------------------------------------ checks shared by the traces
 
-    private void checkStores(List<Dispatch> sparse, int n) {
-        Dispatch ik = sparse.get(8);
+    private void checkStores(List<FakeDispatch> sparse, int n) {
+        FakeDispatch ik = sparse.get(8);
         assertArrayEquals(new int[]{n, IDX, IDX, 0, IDX}, ints(ik, 0, 5));
         assertSame(temp(GpuMsaMixer.TEMP_IK), ik.bufferArg(5));
         assertSame(cellIdx, ik.bufferArg(6));
         assertSame(indexKeys, ik.bufferArg(7));
-        Dispatch k = sparse.get(9);
+        FakeDispatch k = sparse.get(9);
         assertArrayEquals(new int[]{n, K_DIM, K_DIM, 0, K_DIM}, ints(k, 0, 5));
         assertSame(temp(GpuMsaMixer.TEMP_K), k.bufferArg(5));
         assertSame(kCache, k.bufferArg(7));
-        Dispatch v = sparse.get(10);
+        FakeDispatch v = sparse.get(10);
         assertSame(temp(GpuMsaMixer.TEMP_V), v.bufferArg(5));
         assertSame(vCache, v.bufferArg(7));
     }
 
-    private void checkSelection(List<Dispatch> sparse, int n, int nPos) {
+    private void checkSelection(List<FakeDispatch> sparse, int n, int nPos) {
         int nblk = MsaKernels.blockCount(nPos, BLK);
-        Dispatch score = sparse.get(11);
+        FakeDispatch score = sparse.get(11);
         assertEquals(SCORE, score.kernelName());
         assertArrayEquals(new int[]{n, nPos, N_KV, IDX, BLK, LOCAL_BLOCKS, ROWS, KvDType.F16.code(), 0},
                 ints(score, 0, 9));
@@ -351,13 +351,13 @@ public class GpuMsaMixerTest {
         int local = MsaKernels.blockScoreLocal(BLK);
         assertArrayEquals(MsaKernels.blockScoreGlobal(n, nPos, BLK, local), score.global());
 
-        Dispatch topk = sparse.get(12);
+        FakeDispatch topk = sparse.get(12);
         assertEquals(TOPK, topk.kernelName());
         assertArrayEquals(new int[]{n * N_KV, nblk, TOP_K}, ints(topk, 0, 3));
         assertSame(temp(GpuMsaMixer.TEMP_SCORES), topk.bufferArg(3));
         assertSame(temp(GpuMsaMixer.TEMP_BLOCKS), topk.bufferArg(4));
 
-        Dispatch gather = sparse.get(13);
+        FakeDispatch gather = sparse.get(13);
         assertEquals(GATHER, gather.kernelName());
         assertArrayEquals(new int[]{n, N_HEAD, N_KV, HD, BLK, TOP_K}, ints(gather, 0, 6));
         assertEquals(KQ, gather.floatArg(6), 0.0f);
@@ -381,7 +381,7 @@ public class GpuMsaMixerTest {
         separateQkv();
         LayerSpec layer = layer(true);
         bind(layer);
-        List<Dispatch> ds = run(() -> mixer.decode(7, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(7, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
         assertEquals(Arrays.asList(MV, MV, MV, NORM, NORM, ROPE, ROPE, MV, MV, NORM, NORM, ROPE, ROPE, STORE, STORE,
                 STORE, SCORE, TOPK, GATHER, MV), names(ds));
@@ -391,15 +391,15 @@ public class GpuMsaMixerTest {
         assertSame(buf("blk.0.attn_output.weight"), ds.get(19).bufferArg(2));
         assertSame(slot(ScratchSlots.BRANCH).buffer(), ds.get(19).bufferArg(4));
 
-        Dispatch ropeQ = ds.get(5);
+        FakeDispatch ropeQ = ds.get(5);
         assertArrayEquals(new int[]{1, N_HEAD, HD, Q_DIM, N_ROT, 0}, ints(ropeQ, 0, 6));
         assertSame(ropePos, ropeQ.bufferArg(20));
         assertSame(temp(GpuMsaMixer.TEMP_Q), ropeQ.bufferArg(22));
-        Dispatch ropeIq = ds.get(11);
+        FakeDispatch ropeIq = ds.get(11);
         assertArrayEquals(new int[]{1, N_KV, IDX, N_KV * IDX, N_ROT, 0}, ints(ropeIq, 0, 6));
         assertSame(temp(GpuMsaMixer.TEMP_IQ), ropeIq.bufferArg(22));
 
-        List<Dispatch> sparse = nonProjection(ds);
+        List<FakeDispatch> sparse = nonProjection(ds);
         checkStores(sparse, 1);
         checkSelection(sparse, 1, 8);
     }
@@ -410,12 +410,12 @@ public class GpuMsaMixerTest {
         separateQkv();
         LayerSpec layer = layer(true);
         bind(layer);
-        List<Dispatch> ds = run(() -> mixer.prefill(5, 6, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.prefill(5, 6, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
-        List<Dispatch> sparse = nonProjection(ds);
+        List<FakeDispatch> sparse = nonProjection(ds);
         assertEquals(Arrays.asList(NORM, NORM, ROPE, ROPE, NORM, NORM, ROPE, ROPE, STORE, STORE, STORE, SCORE, TOPK,
                 GATHER), names(sparse));
-        Dispatch ropeK = sparse.get(3);
+        FakeDispatch ropeK = sparse.get(3);
         assertEquals(6, ropeK.intArg(RopeKernels.ARG_N_TOKENS));
         assertEquals(6, ropeK.intArg(RopeKernels.ARG_POS_STRIDE));
         checkStores(sparse, 6);
@@ -429,14 +429,14 @@ public class GpuMsaMixerTest {
         fusedQkvWithBias();
         LayerSpec layer = layer(true);
         bind(layer);
-        List<Dispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
+        List<FakeDispatch> ds = run(() -> mixer.decode(0, slot(ScratchSlots.NORMED), slot(ScratchSlots.BRANCH)));
 
         assertEquals(Arrays.asList(MV, BIAS, COPY, COPY, COPY, NORM, NORM, ROPE, ROPE), names(ds).subList(0, 9));
-        Dispatch bias = ds.get(1);
+        FakeDispatch bias = ds.get(1);
         assertArrayEquals(new int[]{Q_DIM + 2 * K_DIM, 1}, ints(bias, 0, 2));
         assertSame(buf("blk.0.attn_qkv.bias"), bias.bufferArg(2));
         assertSame(temp(GpuMsaMixer.TEMP_QKV), bias.bufferArg(3));
-        List<Dispatch> sparse = nonProjection(ds);
+        List<FakeDispatch> sparse = nonProjection(ds);
         checkSelection(sparse.subList(4, sparse.size()), 1, 1);
     }
 
@@ -451,25 +451,25 @@ public class GpuMsaMixerTest {
         separateQkv();
         LayerSpec layer = layer(true);
         bind(layer);
-        List<Dispatch> whole = run(() -> mixer.prefill(0, 6, slot(ScratchSlots.NORMED),
+        List<FakeDispatch> whole = run(() -> mixer.prefill(0, 6, slot(ScratchSlots.NORMED),
                 slot(ScratchSlots.BRANCH)));
-        List<Dispatch> ds = run(() -> mixer.prefillKV(0, 6, slot(ScratchSlots.NORMED)));
+        List<FakeDispatch> ds = run(() -> mixer.prefillKV(0, 6, slot(ScratchSlots.NORMED)));
 
-        List<Dispatch> sparse = nonProjection(ds);
+        List<FakeDispatch> sparse = nonProjection(ds);
         assertEquals(Arrays.asList(NORM, ROPE, NORM, ROPE, STORE, STORE, STORE), names(sparse));
         assertTrue("the cache write runs fewer kernels: " + ds.size() + " vs " + whole.size(),
                 ds.size() < whole.size());
 
-        Dispatch ik = sparse.get(4);
+        FakeDispatch ik = sparse.get(4);
         assertArrayEquals(new int[]{6, IDX, IDX, 0, IDX}, ints(ik, 0, 5));
         assertSame(temp(GpuMsaMixer.TEMP_IK), ik.bufferArg(5));
         assertSame(cellIdx, ik.bufferArg(6));
         assertSame(indexKeys, ik.bufferArg(7));
-        Dispatch k = sparse.get(5);
+        FakeDispatch k = sparse.get(5);
         assertArrayEquals(new int[]{6, K_DIM, K_DIM, 0, K_DIM}, ints(k, 0, 5));
         assertSame(temp(GpuMsaMixer.TEMP_K), k.bufferArg(5));
         assertSame(kCache, k.bufferArg(7));
-        Dispatch v = sparse.get(6);
+        FakeDispatch v = sparse.get(6);
         assertSame(temp(GpuMsaMixer.TEMP_V), v.bufferArg(5));
         assertSame(vCache, v.bufferArg(7));
     }

@@ -42,7 +42,15 @@ public class Mxfp6Test {
         assertEquals(E3M2, GGMLType.fromId(1007));
         assertEquals(E2M3, GGMLType.fromId(1008));
         assertEquals(GGMLType.F8_E4M3_B32, GGMLType.fromId(1009));
-        assertEquals("the next extension id stays unassigned", GGMLType.UNKNOWN, GGMLType.fromId(1010));
+        assertEquals(GGMLType.W12, GGMLType.fromId(1010));
+        int lastAssigned = 0;
+        for (GGMLType t : GGMLType.values()) {
+            if (t.isExtension()) {
+                lastAssigned = Math.max(lastAssigned, t.getId());
+            }
+        }
+        assertEquals("the next extension id stays unassigned", GGMLType.UNKNOWN,
+                GGMLType.fromId(lastAssigned + 1));
         assertTrue("128 elements of E3M2 fill 100 bytes (4 blocks of 25)", E3M2.getBytesForElements(128) == 100);
         assertTrue(CpuBlockDecoders.supports(E3M2) && CpuBlockDecoders.supports(E2M3));
         assertTrue("the CPU vec-dot registers both rows", ExtVecDot.supports(E3M2) && ExtVecDot.supports(E2M3));

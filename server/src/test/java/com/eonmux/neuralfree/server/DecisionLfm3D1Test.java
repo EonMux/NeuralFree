@@ -237,7 +237,7 @@ class DecisionLfm3D1Test {
     /** The output logits at the last token of the prompt, tokenized as the server tokenizes it. */
     private static float[] logits(String prompt) throws IOException {
         int[] tokens = lfm3.encode(prompt, false, true);
-        return lfm3.nextLogits(null, tokens);
+        return lfm3.pooling().nextLogits(null, tokens);
     }
 
     /** The best logit of one answer's token forms. */

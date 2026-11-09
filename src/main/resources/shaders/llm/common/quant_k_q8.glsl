@@ -9,6 +9,11 @@
  *     void qt_dot_q8_dual(uint gbp, uint ubp, uint blk, uint ltid, inout float gs, inout float us)
  * with the same work split as qt_dot (8 contiguous elements per invocation, one 32-element group,
  * hence one Q8_1 block blk * 8 + ltid / 4).
+ *
+ * The term functions are precise: the float chain they return is computed exactly as written
+ * (SPIR-V NoContraction), so every kernel that inlines a term computes the same operations and the
+ * same rounding, whatever mul-add fusion the driver would otherwise pick per inlined copy. A
+ * token's {T}_MatVecN dot is therefore its stacked {T}_MatVec dots bit for bit.
  */
 #ifndef NF_QUANT_K_Q8_GLSL
 #define NF_QUANT_K_Q8_GLSL
@@ -36,7 +41,7 @@ uint nf_kq_q8_byte(uint ltid) {
 #if QTYPE == QT_Q2_K
 #define QT_BB NF_Q2_K_BB
 /* y = d*(sc & 15) * code - dmin*(sc >> 4), code in [0, 4). */
-float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
+precise float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
     const uint sc = nf_w_u8(ws, bp + 0u + (ltid >> 1));
     const uint shift = ((ltid & 15u) >> 2) * 2u;
     const uint q = bp + 16u + (ltid >> 4) * 32u + ((ltid >> 1) & 1u) * 16u + (ltid & 1u) * 8u;
@@ -62,7 +67,7 @@ int nf_kq_q8_q3k_scale(uint ws, uint bp, uint si) {
 }
 
 /* y = d*scale * code, code in [-4, 4). */
-float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
+precise float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
     const float dl = nf_w_f16(ws, bp + 108u) * float(nf_kq_q8_q3k_scale(ws, bp, ltid >> 1));
     const uint hf = ltid >> 4, j = (ltid & 15u) >> 2;
     const uint shift = j * 2u, mbit = hf * 4u + j;
@@ -81,7 +86,7 @@ float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
 #elif QTYPE == QT_Q4_K
 #define QT_BB NF_Q4_K_BB
 /* y = d*sc * code - dmin*m, code in [0, 16). */
-float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
+precise float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
     const uint si = ltid >> 2;
     const vec2 sm = nf_k4_scale_min(ws, bp + 4u, si);
     const uint sh = (si & 1u) * 4u;
@@ -100,7 +105,7 @@ float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
 #elif QTYPE == QT_Q5_K
 #define QT_BB NF_Q5_K_BB
 /* y = d*sc * code - dmin*m, code in [0, 32). */
-float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
+precise float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
     const uint si = ltid >> 2;
     const vec2 sm = nf_k4_scale_min(ws, bp + 4u, si);
     const uint sh = (si & 1u) * 4u;
@@ -122,7 +127,7 @@ float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
 #elif QTYPE == QT_Q6_K
 #define QT_BB NF_Q6_K_BB
 /* y = d*scale * code, code in [-32, 32). */
-float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
+precise float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
     const uint hf = ltid >> 4, t = (ltid >> 2) & 3u, l0 = (ltid & 3u) * 8u;
     const int sc = nf_w_i8(ws, bp + 192u + hf * 8u + t * 2u + (l0 >> 4));
     const float dl = nf_w_f16(ws, bp + 208u) * float(sc);
@@ -143,7 +148,7 @@ float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
 #elif QTYPE == QT_Q8_K
 #define QT_BB NF_Q8_K_BB
 /* y = d * qs[e], qs int8. */
-float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
+precise float nf_kq_q8_part(uint ws, uint bp, uint blk, uint ltid) {
     const float d = nf_w_f32(ws, bp + 0u);
     const uint qs = bp + 4u + ltid * 8u;
     const uint qb = nf_kq_q8_block(blk, ltid), bo = nf_kq_q8_byte(ltid);

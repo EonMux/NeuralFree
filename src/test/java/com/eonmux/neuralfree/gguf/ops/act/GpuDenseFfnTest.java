@@ -39,7 +39,7 @@ import com.eonmux.neuralfree.gguf.spec.ResidualSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.TensorNames;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import com.eonmux.neuralfree.gguf.testutil.FakeGpuBuffer;
 import org.junit.After;
 import org.junit.Test;
@@ -182,13 +182,13 @@ public class GpuDenseFfnTest {
         return block;
     }
 
-    private List<Dispatch> run(int nTokens, ScratchSlot out) {
+    private List<FakeDispatch> run(int nTokens, ScratchSlot out) {
         backend.clearLog();
         block.forward(nTokens, scratch.slot(ScratchSlots.NORMED), out);
         return backend.dispatches();
     }
 
-    private List<Dispatch> run(int nTokens) {
+    private List<FakeDispatch> run(int nTokens) {
         return run(nTokens, scratch.slot(ScratchSlots.BRANCH));
     }
 
@@ -204,15 +204,15 @@ public class GpuDenseFfnTest {
         return scratch.slot(ScratchSlots.BRANCH).buffer();
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] v = new int[to - from];
         for (int i = from; i < to; i++) {
             v[i - from] = d.intArg(i);
@@ -224,7 +224,7 @@ public class GpuDenseFfnTest {
         return (n + local - 1) / local * local;
     }
 
-    private void assertMatvec(Dispatch d, String kernel, GpuWeight w, GpuBuffer in, GpuBuffer out) {
+    private void assertMatvec(FakeDispatch d, String kernel, GpuWeight w, GpuBuffer in, GpuBuffer out) {
         assertEquals(kernel, d.kernelName());
         assertSame(w.shard(0), d.bufferArg(MATVEC.equals(kernel) ? 2 : 3));
         assertSame(in, d.bufferArg(MATVEC.equals(kernel) ? 3 : 4));
@@ -240,14 +240,14 @@ public class GpuDenseFfnTest {
         GpuWeight upW = matrix("ffn_up.weight", N_EMBD, N_FF);
         GpuWeight down = matrix("ffn_down.weight", N_FF, N_EMBD);
         bind(Arch.LLAMA, layer(ffn().glu(FfnGating.PAR, GluOp.SWIGLU).build()));
-        List<Dispatch> ds = run(1);
+        List<FakeDispatch> ds = run(1);
 
         assertEquals(Arrays.asList(MATVEC, MATVEC, ActKernels.GLU, MATVEC), names(ds));
         assertMatvec(ds.get(0), MATVEC, gate, normed(), gateUp());
         GpuBuffer upTemp = ds.get(1).bufferArg(4);
         assertMatvec(ds.get(1), MATVEC, upW, normed(), upTemp);
         assertNotSame(gateUp(), upTemp);
-        Dispatch glu = ds.get(2);
+        FakeDispatch glu = ds.get(2);
         assertArrayEquals(new int[]{N_FF, 1, GluOp.SWIGLU.code()}, ints(glu, 0, 3));
         assertArrayEquals(new int[]{N_FF, 0, N_FF, 0, N_FF, 0}, ints(glu, ActKernels.ARG_GLU_GATE_STRIDE,
                 ActKernels.ARG_GLU_OUT_OFF + 1));
@@ -266,10 +266,10 @@ public class GpuDenseFfnTest {
         GpuWeight upW = matrix("ffn_up.weight", N_EMBD, N_FF);
         GpuWeight down = matrix("ffn_down.weight", N_FF, N_EMBD);
         bind(Arch.LLAMA, layer(ffn().glu(FfnGating.PAR, GluOp.SWIGLU).build()));
-        List<Dispatch> ds = run(1);
+        List<FakeDispatch> ds = run(1);
 
         assertEquals(Arrays.asList("Float_MatVecFusedGateUp", MATVEC), names(ds));
-        Dispatch fused = ds.get(0);
+        FakeDispatch fused = ds.get(0);
         assertSame(gate.shard(0), fused.bufferArg(2));
         assertSame(upW.shard(0), fused.bufferArg(3));
         assertSame(normed(), fused.bufferArg(4));
@@ -286,7 +286,7 @@ public class GpuDenseFfnTest {
         matrix("ffn_up.weight", N_EMBD, N_FF);
         matrix("ffn_down.weight", N_FF, N_EMBD);
         bind(Arch.GEMMA, layer(ffn().glu(FfnGating.PAR, GluOp.GEGLU_TANH).build()));
-        List<Dispatch> ds = run(1);
+        List<FakeDispatch> ds = run(1);
 
         assertEquals(Arrays.asList(MATVEC, MATVEC, ActKernels.GLU, MATVEC), names(ds));
     }
@@ -298,10 +298,10 @@ public class GpuDenseFfnTest {
         matrix("ffn_up.weight", N_EMBD, N_FF);
         matrix("ffn_down.weight", N_FF, N_EMBD);
         bind(Arch.LLAMA, layer(ffn().glu(FfnGating.PAR, GluOp.SWIGLU).build()));
-        List<Dispatch> ds = run(4);
+        List<FakeDispatch> ds = run(4);
 
         assertEquals(Arrays.asList(BATCH_2D, BATCH_2D, ActKernels.GLU, BATCH_2D), names(ds));
-        Dispatch glu = ds.get(2);
+        FakeDispatch glu = ds.get(2);
         assertEquals(4, glu.intArg(ActKernels.ARG_GLU_N_ROWS));
         assertArrayEquals(new long[]{roundUp(4L * N_FF)}, glu.global());
         assertArrayEquals(new int[]{N_EMBD, N_FF, 4}, ints(ds.get(3), 0, 3));
@@ -315,11 +315,11 @@ public class GpuDenseFfnTest {
         GpuWeight upW = matrix("ffn_up.weight", N_EMBD, 2 * N_FF);
         GpuWeight down = matrix("ffn_down.weight", N_FF, N_EMBD);
         bind(Arch.PHI3, layer(ffn().glu(FfnGating.FUSED_UP, GluOp.SWIGLU).build()));
-        List<Dispatch> ds = run(2);
+        List<FakeDispatch> ds = run(2);
 
         assertEquals(Arrays.asList(BATCH_2D, ActKernels.GLU, BATCH_2D), names(ds));
         assertMatvec(ds.get(0), BATCH_2D, upW, normed(), gateUp());
-        Dispatch glu = ds.get(1);
+        FakeDispatch glu = ds.get(1);
         assertArrayEquals(new int[]{N_FF, 2, GluOp.SWIGLU.code()}, ints(glu, 0, 3));
         assertArrayEquals(new int[]{2 * N_FF, 0, 2 * N_FF, N_FF, N_FF, 0}, ints(glu,
                 ActKernels.ARG_GLU_GATE_STRIDE, ActKernels.ARG_GLU_OUT_OFF + 1));
@@ -340,20 +340,20 @@ public class GpuDenseFfnTest {
         matrix("ffn_down.weight", N_FF, N_EMBD);
         GpuWeight downB = vector("ffn_down.bias", N_EMBD);
         bind(Arch.GPT2, layer(ffn().act(false, ActOp.GELU_TANH).build()));
-        List<Dispatch> ds = run(3);
+        List<FakeDispatch> ds = run(3);
 
         assertEquals(Arrays.asList(BATCH_2D, GpuDenseFfn.BATCH_BIAS_ADD, ActKernels.UNARY, BATCH_2D,
                 GpuDenseFfn.BATCH_BIAS_ADD), names(ds));
-        Dispatch b1 = ds.get(1);
+        FakeDispatch b1 = ds.get(1);
         assertArrayEquals(new int[]{N_FF, 3}, ints(b1, 0, 2));
         assertSame(upB.shard(0), b1.bufferArg(GpuDenseFfn.ARG_BIAS_BIAS));
         assertSame(gateUp(), b1.bufferArg(GpuDenseFfn.ARG_BIAS_DATA));
         assertArrayEquals(new long[]{roundUp(N_FF)}, b1.global());
-        Dispatch act = ds.get(2);
+        FakeDispatch act = ds.get(2);
         assertArrayEquals(new int[]{3 * N_FF, ActOp.GELU_TANH.code()}, ints(act, 0, 2));
         assertSame(gateUp(), act.bufferArg(ActKernels.ARG_UNARY_IN));
         assertSame(gateUp(), act.bufferArg(ActKernels.ARG_UNARY_OUT));
-        Dispatch b2 = ds.get(4);
+        FakeDispatch b2 = ds.get(4);
         assertArrayEquals(new int[]{N_EMBD, 3}, ints(b2, 0, 2));
         assertSame(downB.shard(0), b2.bufferArg(GpuDenseFfn.ARG_BIAS_BIAS));
         assertSame(branch(), b2.bufferArg(GpuDenseFfn.ARG_BIAS_DATA));
@@ -366,11 +366,11 @@ public class GpuDenseFfnTest {
         vector("ffn_up.bias", N_FF);
         matrix("ffn_down.weight", N_FF, N_EMBD);
         bind(Arch.GPT2, layer(ffn().act(false, ActOp.GELU_TANH).build()));
-        List<Dispatch> ds = run(1);
+        List<FakeDispatch> ds = run(1);
 
         assertEquals(Arrays.asList(MATVEC, GpuDenseFfn.BATCH_BIAS_ADD, GpuOps.AXPBY, ActKernels.UNARY, MATVEC),
                 names(ds));
-        Dispatch scale = ds.get(2);
+        FakeDispatch scale = ds.get(2);
         assertEquals(N_FF, scale.intArg(0));
         assertEquals(0.0f, scale.floatArg(1), 0.0f);
         assertEquals(0.5f, scale.floatArg(2), 0.0f);
@@ -385,18 +385,18 @@ public class GpuDenseFfnTest {
         GpuWeight downS = vector("ffn_down.scale", 1);
         bind(Arch.NEMOTRON, layer(ffn().act(false, ActOp.RELU_SQR).build()));
         ScratchSlot out = scratch.slot(ScratchSlots.BRANCH).slice(N_EMBD, (long) UBATCH * N_EMBD);
-        List<Dispatch> ds = run(1, out);
+        List<FakeDispatch> ds = run(1, out);
 
         assertEquals(Arrays.asList(MATVEC, ActKernels.UNARY, MATVEC, NormKernels.MUL_ROW_SCALE, GpuOps.COPY2D),
                 names(ds));
         assertEquals(ActOp.RELU_SQR.code(), ds.get(1).intArg(ActKernels.ARG_UNARY_OP));
         GpuBuffer temp = ds.get(2).bufferArg(4);
         assertNotSame(branch(), temp);
-        Dispatch rs = ds.get(3);
+        FakeDispatch rs = ds.get(3);
         assertArrayEquals(new int[]{1, N_EMBD, 1}, ints(rs, 0, 3));
         assertSame(downS.shard(0), rs.bufferArg(NormKernels.ARG_ROW_SCALE_SCALE));
         assertSame(temp, rs.bufferArg(NormKernels.ARG_ROW_SCALE_X));
-        Dispatch cp = ds.get(4);
+        FakeDispatch cp = ds.get(4);
         assertArrayEquals(new int[]{1, N_EMBD, N_EMBD, 0, N_EMBD, N_EMBD}, ints(cp, 0, 6));
         assertSame(temp, cp.bufferArg(6));
         assertSame(branch(), cp.bufferArg(7));
@@ -411,7 +411,7 @@ public class GpuDenseFfnTest {
         matrix("ffn_up.weight", N_EMBD, N_FF);
         matrix("ffn_down.weight", N_FF, N_EMBD);
         bind(Arch.GEMMA, layer(ffn().glu(FfnGating.PAR, GluOp.GEGLU_TANH).build()));
-        List<Dispatch> ds = run(1);
+        List<FakeDispatch> ds = run(1);
 
         assertEquals(Arrays.asList(MATVEC, MATVEC, ActKernels.GLU, MATVEC), names(ds));
         assertEquals(GluOp.GEGLU_TANH.code(), ds.get(2).intArg(ActKernels.ARG_GLU_OP));
@@ -425,11 +425,11 @@ public class GpuDenseFfnTest {
         matrix("ffn_down.weight", N_FF, N_EMBD);
         float k = 1.6448533535003662f;
         bind(Arch.GEMMA3N, layer(ffn().glu(FfnGating.PAR, GluOp.GEGLU_TANH).activationSparsityStdMul(k).build()));
-        List<Dispatch> ds = run(2);
+        List<FakeDispatch> ds = run(2);
 
         assertEquals(Arrays.asList(BATCH_2D, Gemma3nKernels.GAUSSIAN_TOPK, BATCH_2D, ActKernels.GLU, BATCH_2D),
                 names(ds));
-        Dispatch topK = ds.get(1);
+        FakeDispatch topK = ds.get(1);
         assertArrayEquals(new int[]{2, N_FF, N_FF, 0}, ints(topK, 0, 4));
         assertEquals(k, topK.floatArg(Gemma3nKernels.ARG_TOPK_K_STD), 0.0f);
         assertSame(gateUp(), topK.bufferArg(5));
@@ -447,10 +447,10 @@ public class GpuDenseFfnTest {
         matrix("ffn_down.weight", N_FF, N_EMBD);
         ActParams p = ActParams.builder().xieluRaw(0.8f, 0.8f, 0.5f, -1e-6f).build();
         bind(Arch.APERTUS, layer(ffn().act(false, ActOp.XIELU).params(p).build()));
-        List<Dispatch> ds = run(1);
+        List<FakeDispatch> ds = run(1);
 
         assertEquals(Arrays.asList(MATVEC, ActKernels.UNARY, MATVEC), names(ds));
-        Dispatch act = ds.get(1);
+        FakeDispatch act = ds.get(1);
         assertEquals(ActOp.XIELU.code(), act.intArg(ActKernels.ARG_UNARY_OP));
         assertEquals(p.xieluAlphaN(), act.floatArg(ActKernels.ARG_UNARY_P0), 0.0f);
         assertEquals(p.xieluAlphaP(), act.floatArg(ActKernels.ARG_UNARY_P1), 0.0f);
@@ -469,10 +469,10 @@ public class GpuDenseFfnTest {
         GpuWeight sub = vector("ffn_sub_norm.weight", N_FF);
         NormSpec norm = NormSpec.builder(NormKind.RMS, 1e-5f).ffnSubNorm(true).build();
         bind(Arch.BITNET, layer(ffn().glu(FfnGating.PAR, GluOp.SWIGLU).build(), norm));
-        List<Dispatch> ds = run(3);
+        List<FakeDispatch> ds = run(3);
 
         assertEquals(Arrays.asList(BATCH_2D, BATCH_2D, ActKernels.GLU, NormKernels.ROW_NORM, BATCH_2D), names(ds));
-        Dispatch rn = ds.get(3);
+        FakeDispatch rn = ds.get(3);
         assertArrayEquals(new int[]{3, N_FF, N_FF, NormKind.RMS.rowNormMode()}, ints(rn, 0, 4));
         assertEquals(1e-5f, rn.floatArg(NormKernels.ARG_ROW_NORM_EPS), 0.0f);
         assertEquals(NormKernels.FLAG_HAS_W, rn.intArg(NormKernels.ARG_ROW_NORM_FLAGS));
@@ -497,10 +497,10 @@ public class GpuDenseFfnTest {
         }
         ((FakeGpuBuffer) scales.shard(0)).putFloats(0, values);
         bind(Arch.MPT, layer(ffn().act(false, ActOp.GELU_TANH).build()));
-        List<Dispatch> ds = run(2);
+        List<FakeDispatch> ds = run(2);
 
         assertEquals(Arrays.asList(BATCH_2D, ActKernels.UNARY, NormKernels.MUL_ROW_SCALE, BATCH_2D), names(ds));
-        Dispatch rs = ds.get(2);
+        FakeDispatch rs = ds.get(2);
         assertArrayEquals(new int[]{2, N_FF, N_FF}, ints(rs, 0, 3));
         assertSame(gateUp(), rs.bufferArg(NormKernels.ARG_ROW_SCALE_X));
         float[] reciprocals = rs.bufferArg(NormKernels.ARG_ROW_SCALE_SCALE).getFloats(0, N_FF);

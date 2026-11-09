@@ -180,6 +180,70 @@ public class KernelSourceAssemblerTest {
     }
 
     @Test
+    public void requiredSubgroupSizeFollowsTheSubgroupProgramAndReportedRange() {
+        DeviceCapabilities range = new DeviceCapabilities.Builder().deviceName("d")
+                .supportsSubgroups(true).subgroupSize(32).minSubgroupSize(8).maxSubgroupSize(32).build();
+        assertEquals(32, OpenClKernelLibrary.requiredSubgroupSize(range, true));
+        DeviceCapabilities noRange = new DeviceCapabilities.Builder().deviceName("d")
+                .supportsSubgroups(true).subgroupSize(32).minSubgroupSize(32).maxSubgroupSize(32).build();
+        DeviceCapabilities plain = new DeviceCapabilities.Builder().deviceName("d")
+                .supportsSubgroups(true).build();
+        assertEquals(32, OpenClKernelLibrary.requiredSubgroupSize(noRange, true));
+        assertEquals(0, OpenClKernelLibrary.requiredSubgroupSize(plain, true));
+        assertEquals(0, OpenClKernelLibrary.requiredSubgroupSize(range, false));
+    }
+
+    @Test
+    public void pinnedOptionsCarryTheSizeDefineBetweenTheSubgroupFlagAndExtraDefines() {
+        assertEquals("-cl-std=CL1.2 -cl-mad-enable -cl-no-signed-zeros -DNF_FA_SMEM_FLOATS=11264"
+                        + " -DUSE_SUBGROUPS=1 -DNF_REQD_SG_SIZE=8",
+                OpenClKernelLibrary.buildOptions(OpenClKernelLibrary.BASE_OPTIONS, true, 11264, 8, ""));
+        assertEquals("-DNF_FA_SMEM_FLOATS=3072 -DUSE_SUBGROUPS=1 -DNF_REQD_SG_SIZE=16 -DNF_MMQ_TM=4",
+                OpenClKernelLibrary.buildOptions("", true, 3072, 16, "-DNF_MMQ_TM=4"));
+        assertEquals("-DNF_FA_SMEM_FLOATS=3072",
+                OpenClKernelLibrary.buildOptions("", false, 3072, 0, ""));
+        assertEquals(OpenClKernelLibrary.buildOptions("", true, 3072),
+                OpenClKernelLibrary.buildOptions("", true, 3072, 0, ""));
+    }
+
+    @Test
+    public void pinnedProgramKeysCarryTheSizeSuffixBehindTheTileKey() {
+        assertEquals("llm__sg#11264@8", OpenClKernelLibrary.programKey("llm", true, 11264, 8, ""));
+        assertEquals("llm__sg#11264|tile@16", OpenClKernelLibrary.programKey("llm", true, 11264, 16, "|tile"));
+        assertEquals("llm#7168", OpenClKernelLibrary.programKey("llm", false, 7168, 0, ""));
+    }
+
+    @Test
+    public void pinnedOptionsRejectNonPowerOfTwoSizes() {
+        for (int size : new int[]{-8, 3, 12, 48}) {
+            try {
+                OpenClKernelLibrary.buildOptions("", true, 3072, size, "");
+                fail("subgroup size " + size + " must be rejected");
+            } catch (IllegalArgumentException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("power of two"));
+            }
+        }
+    }
+
+    @Test
+    public void openClLibraryPinsSubgroupProgramsOnADeviceWithASizeRange() {
+        DeviceCapabilities caps = new DeviceCapabilities.Builder().deviceName("d").supportsSubgroups(true)
+                .subgroupSize(32).minSubgroupSize(8).maxSubgroupSize(32)
+                .maxSharedMemoryBytes(48 * 1024).build();
+        FakeComputeBackend backend = FakeComputeBackend.builder().capabilities(caps).build();
+        int smem = FaSmem.faSmemFloats(ComputeBackend.BackendType.OPENCL, caps);
+
+        KernelArtifact llm = new OpenClKernelLibrary(KernelLibraries.LLM_CONFIG).resolve("K", backend);
+        assertEquals(OpenClKernelLibrary.programKey(KernelLibraries.LLM, true, smem, 32, ""), llm.programKey());
+        assertEquals(OpenClKernelLibrary.buildOptions(OpenClKernelLibrary.BASE_OPTIONS, true, smem, 32, ""),
+                llm.buildOptions());
+
+        KernelArtifact train = new OpenClKernelLibrary(KernelLibraries.TRAIN_CONFIG).resolve("K", backend);
+        assertEquals(OpenClKernelLibrary.programKey(KernelLibraries.TRAIN, false, smem), train.programKey());
+        assertEquals("-cl-std=CL1.2 -DNF_FA_SMEM_FLOATS=" + smem, train.buildOptions());
+    }
+
+    @Test
     public void openClLibraryIsReplaceableOnlyWithTheSameSources() {
         KernelLibraryRegistry registry = new KernelLibraryRegistry();
         KernelLibraryConfig config = new KernelLibraryConfig("lib", "kernels/lib", "kernels/lib/cuda", "shaders/lib", true);

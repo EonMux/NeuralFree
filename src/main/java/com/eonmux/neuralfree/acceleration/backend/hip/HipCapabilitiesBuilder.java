@@ -93,6 +93,7 @@ public final class HipCapabilitiesBuilder {
     public static Set<DeviceFeature> features(HipGfxTarget target) {
         Set<DeviceFeature> features = EnumSet.of(
                 DeviceFeature.SUBGROUP_ARITHMETIC,
+                DeviceFeature.SUBGROUP_SHUFFLE,
                 DeviceFeature.SHADER_INT8,
                 DeviceFeature.SHADER_INT64,
                 DeviceFeature.STORAGE_8BIT,

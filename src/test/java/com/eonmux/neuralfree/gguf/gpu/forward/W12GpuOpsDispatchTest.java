@@ -9,7 +9,7 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuPlaceholders;
 import com.eonmux.neuralfree.gguf.quant.W12Codec;
 import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend;
-import com.eonmux.neuralfree.gguf.testutil.FakeComputeBackend.Dispatch;
+import com.eonmux.neuralfree.gguf.testutil.FakeDispatch;
 import org.junit.After;
 import org.junit.Test;
 
@@ -93,21 +93,21 @@ public class W12GpuOpsDispatchTest {
         return backend.allocateBuffer(n * Float.BYTES);
     }
 
-    private List<Dispatch> run(Runnable r) {
+    private List<FakeDispatch> run(Runnable r) {
         backend.clearLog();
         r.run();
         return backend.dispatches();
     }
 
-    private static List<String> names(List<Dispatch> ds) {
+    private static List<String> names(List<FakeDispatch> ds) {
         List<String> out = new ArrayList<>();
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             out.add(d.kernelName());
         }
         return out;
     }
 
-    private static int[] ints(Dispatch d, int from, int to) {
+    private static int[] ints(FakeDispatch d, int from, int to) {
         int[] v = new int[to - from];
         for (int i = from; i < to; i++) {
             v[i - from] = d.intArg(i);
@@ -129,10 +129,10 @@ public class W12GpuOpsDispatchTest {
         GpuWeight w = w12Single();
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
 
         assertEquals(Collections.singletonList("W12_MatVec"), names(ds));
-        Dispatch mv = ds.get(0);
+        FakeDispatch mv = ds.get(0);
         assertArrayEquals(new long[]{(long) ROWS * local}, mv.global());
         assertArrayEquals(new long[]{local}, mv.local());
         assertArrayEquals(new int[]{ROWS, COLS}, ints(mv, 0, 2));
@@ -147,12 +147,12 @@ public class W12GpuOpsDispatchTest {
         GpuWeight w = w12Sharded();
         GpuBuffer in = floats(COLS);
         GpuBuffer out = floats(ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 1));
 
         assertEquals(Arrays.asList("W12_MatVec", GpuOps.COPY2D, "W12_MatVec", GpuOps.COPY2D,
                 "W12_MatVec", GpuOps.COPY2D), names(ds));
         for (int s = 0; s < 3; s++) {
-            Dispatch cp = ds.get(2 * s + 1);
+            FakeDispatch cp = ds.get(2 * s + 1);
             assertArrayEquals(new int[]{1, SHARD_ROWS, SHARD_ROWS, 0, ROWS, s * SHARD_ROWS}, ints(cp, 0, 6));
         }
     }
@@ -163,10 +163,10 @@ public class W12GpuOpsDispatchTest {
         GpuWeight w = w12Single();
         GpuBuffer in = floats(4L * COLS);
         GpuBuffer out = floats(4L * ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 4));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, 4));
 
         assertEquals(Collections.singletonList("W12_BatchMatMul_2D"), names(ds));
-        Dispatch mm = ds.get(0);
+        FakeDispatch mm = ds.get(0);
         assertArrayEquals(new long[]{(long) ROWS * local, 4}, mm.global());
         assertArrayEquals(new long[]{local, 1}, mm.local());
         assertArrayEquals(new int[]{ROWS, COLS, 4}, ints(mm, 0, 3));
@@ -181,9 +181,9 @@ public class W12GpuOpsDispatchTest {
         GpuWeight w = w12Single();
         GpuBuffer in = floats((long) TOKENS * COLS);
         GpuBuffer out = floats((long) TOKENS * ROWS);
-        List<Dispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, TOKENS));
+        List<FakeDispatch> ds = run(() -> ops.matvec(w, in, 0, out, 0, TOKENS));
 
-        Dispatch decode = ds.get(0);
+        FakeDispatch decode = ds.get(0);
         assertEquals("W12_DecodeBF16", decode.kernelName());
         assertArrayEquals(new long[]{(long) ROWS * local}, decode.global());
         assertArrayEquals(new long[]{local}, decode.local());
@@ -191,7 +191,7 @@ public class W12GpuOpsDispatchTest {
         assertSame(w.shard(0), decode.bufferArg(3));
         assertNotSame(in, decode.bufferArg(4));
         assertNotSame(out, decode.bufferArg(4));
-        for (Dispatch d : ds) {
+        for (FakeDispatch d : ds) {
             assertFalse(d.kernelName(), d.kernelName().startsWith("W12_MatVec"));
             assertFalse(d.kernelName(), d.kernelName().startsWith("W12_Batch"));
             assertFalse(d.kernelName(), d.kernelName().startsWith("W12Q_"));

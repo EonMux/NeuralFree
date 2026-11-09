@@ -124,14 +124,14 @@ final class PoolingInputs {
                                       EmbeddingOptions options, String field) {
         MediaParts parts = mediaParts(messages, field);
         if (parts.images.size() == 1 && !parts.audio && !parts.text) {
-            if (!service.dualEncoder()) {
+            if (!service.pooling().dualEncoder()) {
                 throw ServerJson.badRequest(field + " holds an image_url part, but " + service.architecture()
                         + " embeds text only; image embeddings need a CLIP dual-encoder model (a two-tower clip"
                         + " GGUF) or a media projector (" + MediaOptions.MMPROJ_PROPERTY + ")");
             }
             return new Input(null, parts.images.get(0), null, field);
         }
-        if (service.dualEncoder()) {
+        if (service.pooling().dualEncoder()) {
             if (parts.audio) {
                 throw ServerJson.badRequest(field + " holds an audio part, but the CLIP dual encoder reads images"
                         + " only");
