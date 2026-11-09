@@ -143,7 +143,9 @@ import static com.eonmux.neuralfree.gguf.engine.EngineConfig.PROP_VRAM_DEPTH;
  *   <li>{@code neuralfree.n.gpu.layers}: how many layers a GPU load keeps on the device (llama.cpp
  *       {@code -ngl}): {@code auto} (default; as many as the VRAM holds), {@code all}, or a count that covers the
  *       output head, so {@code N} puts {@code N - 1} trunk layers on the device and the rest compute on the host,
- *       each side with its KV on its own device ({@code com.eonmux.neuralfree.gguf.hybrid}).</li>
+ *       each side with its KV on its own device ({@code com.eonmux.neuralfree.gguf.hybrid}); a count past the
+ *       model's layers is clamped to every trunk layer plus the output head, as llama.cpp's {@code -ngl 99}
+ *       is.</li>
  *   <li>{@code neuralfree.override.tensor}: tensor placement overrides as
  *       {@code <pattern>=<cpu | gpu | opencl | cuda | vulkan | hip | metal>} entries (llama.cpp {@code -ot}); the
  *       first pattern that matches a tensor name decides where it is kept. A host match keeps a routed expert tensor

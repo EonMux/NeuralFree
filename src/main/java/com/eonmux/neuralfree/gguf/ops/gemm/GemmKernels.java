@@ -77,8 +77,27 @@ public final class GemmKernels {
     public static final String MATMUL_MMQ_KSPLIT_SUFFIX = "_MatMul_MMQ_KSplit";
     /** Name suffix of the small-token-tile twins of the int8 MMQ GEMM kernels, {@code <T>_MatMul_MMQ_S}. */
     public static final String MATMUL_MMQ_S_SUFFIX = "_MatMul_MMQ_S";
+    /** Name suffix of the 64-token small-token-tile twins, {@code <T>_MatMul_MMQ_S64}. */
+    public static final String MATMUL_MMQ_S64_SUFFIX = "_MatMul_MMQ_S64";
+    /**
+     * Name suffix of the split-K twins of the small-token-tile MMQ GEMM kernels,
+     * {@code <T>_MatMul_MMQ_SKSplit} (also for the FP8 types): the plain kernel's split-K form over
+     * the small tiles' 16-token tile and row tile.
+     */
+    public static final String MATMUL_MMQ_SKSPLIT_SUFFIX = "_MatMul_MMQ_SKSplit";
+    /** Name suffix of the split-K twins of the 64-token small-token-tile MMQ GEMM kernels,
+     *  {@code <T>_MatMul_MMQ_SKSplit64}. */
+    public static final String MATMUL_MMQ_SKSPLIT64_SUFFIX = "_MatMul_MMQ_SKSplit64";
     /** Name suffix of the small-token-tile twins of the W4A8 GEMM kernels, {@code <T>_MatMul_W4A8_S}. */
     public static final String MATMUL_W4A8_S_SUFFIX = "_MatMul_W4A8_S";
+    /** Name suffix of the 64-token small-token-tile W4A8 twins, {@code <T>_MatMul_W4A8_S64}. */
+    public static final String MATMUL_W4A8_S64_SUFFIX = "_MatMul_W4A8_S64";
+    /** Name suffix of the split-K twins of the small-token-tile W4A8 GEMM kernels,
+     *  {@code <T>_MatMul_W4A8_SKSplit}. */
+    public static final String MATMUL_W4A8_SKSPLIT_SUFFIX = "_MatMul_W4A8_SKSplit";
+    /** Name suffix of the split-K twins of the 64-token small-token-tile W4A8 GEMM kernels,
+     *  {@code <T>_MatMul_W4A8_SKSplit64}. */
+    public static final String MATMUL_W4A8_SKSPLIT64_SUFFIX = "_MatMul_W4A8_SKSplit64";
     /** Name suffix of the dequantizing GEMM kernels of the MMQ types, {@code <T>_MatMul_CM}. */
     public static final String MATMUL_CM_SUFFIX = "_MatMul_CM";
     /** Name suffix of the split-K twins of the CM GEMM kernels, {@code <T>_MatMul_CM_KSplit}. */
@@ -372,11 +391,23 @@ public final class GemmKernels {
      * @throws IllegalArgumentException when the type has no MMQ GEMM kernel
      */
     public static String matmulMmqSmall(GGMLType type) {
+        return matmulMmqSmall(type, MmqConfig.TOKEN_LANES);
+    }
+
+    /**
+     * Name of the small-token-tile twin of the staged GEMM kernel of a weight type at the given
+     * twin width: {@code <T>_MatMul_MMQ_S} at 16 tokens, {@code <T>_MatMul_MMQ_S64} at 64 (the
+     * ladder row the 17..64-token launches run, llama.cpp's J=64).
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel or {@code tokens} is
+     *                                  not a twin width
+     */
+    public static String matmulMmqSmall(GGMLType type, int tokens) {
         if (!hasMmq(type)) {
             throw new IllegalArgumentException("no small-token-tile MMQ GEMM kernel for weight type " + type
                     + "; supported: " + MMQ_TYPES);
         }
-        return type.name() + MATMUL_MMQ_S_SUFFIX;
+        return type.name() + mmqSmallSuffix(tokens, MATMUL_MMQ_S_SUFFIX, MATMUL_MMQ_S64_SUFFIX);
     }
 
     /**
@@ -386,11 +417,87 @@ public final class GemmKernels {
      * @throws IllegalArgumentException when the type has no W4A8 GEMM kernel
      */
     public static String matmulW4a8Small(GGMLType type) {
+        return matmulW4a8Small(type, MmqConfig.TOKEN_LANES);
+    }
+
+    /**
+     * Name of the small-token-tile twin of the W4A8 GEMM kernel of a 4-bit weight type at the
+     * given twin width: {@code <T>_MatMul_W4A8_S} at 16 tokens, {@code <T>_MatMul_W4A8_S64} at 64.
+     *
+     * @throws IllegalArgumentException when the type has no W4A8 GEMM kernel or {@code tokens} is
+     *                                  not a twin width
+     */
+    public static String matmulW4a8Small(GGMLType type, int tokens) {
         if (!isW4a8(type)) {
             throw new IllegalArgumentException("no small-token-tile W4A8 GEMM kernel for weight type " + type
                     + "; supported: " + W4A8_TYPES);
         }
-        return type.name() + MATMUL_W4A8_S_SUFFIX;
+        return type.name() + mmqSmallSuffix(tokens, MATMUL_W4A8_S_SUFFIX, MATMUL_W4A8_S64_SUFFIX);
+    }
+
+    /**
+     * Name of the split-K twin of the small-token-tile MMQ GEMM kernel of a weight type
+     * ({@code <T>_MatMul_MMQ_SKSplit}, also for the FP8 types): the partial kernel the staged
+     * launches of fewer tokens than the device tile split with.
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel
+     */
+    public static String matmulMmqSmallSplit(GGMLType type) {
+        return matmulMmqSmallSplit(type, MmqConfig.TOKEN_LANES);
+    }
+
+    /**
+     * Name of the split-K twin of the small-token-tile MMQ GEMM kernel of a weight type at the
+     * given twin width: {@code <T>_MatMul_MMQ_SKSplit} at 16 tokens, {@code <T>_MatMul_MMQ_SKSplit64}
+     * at 64.
+     *
+     * @throws IllegalArgumentException when the type has no MMQ GEMM kernel or {@code tokens} is
+     *                                  not a twin width
+     */
+    public static String matmulMmqSmallSplit(GGMLType type, int tokens) {
+        if (!hasMmq(type)) {
+            throw new IllegalArgumentException("no small-token-tile split-K MMQ GEMM kernel for weight type " + type
+                    + "; supported: " + MMQ_TYPES);
+        }
+        return type.name() + mmqSmallSuffix(tokens, MATMUL_MMQ_SKSPLIT_SUFFIX, MATMUL_MMQ_SKSPLIT64_SUFFIX);
+    }
+
+    /**
+     * Name of the split-K twin of the small-token-tile W4A8 GEMM kernel of a 4-bit weight type
+     * ({@code <T>_MatMul_W4A8_SKSplit}).
+     *
+     * @throws IllegalArgumentException when the type has no W4A8 GEMM kernel
+     */
+    public static String matmulW4a8SmallSplit(GGMLType type) {
+        return matmulW4a8SmallSplit(type, MmqConfig.TOKEN_LANES);
+    }
+
+    /**
+     * Name of the split-K twin of the small-token-tile W4A8 GEMM kernel of a 4-bit weight type at
+     * the given twin width: {@code <T>_MatMul_W4A8_SKSplit} at 16, {@code <T>_MatMul_W4A8_SKSplit64}
+     * at 64.
+     *
+     * @throws IllegalArgumentException when the type has no W4A8 GEMM kernel or {@code tokens} is
+     *                                  not a twin width
+     */
+    public static String matmulW4a8SmallSplit(GGMLType type, int tokens) {
+        if (!isW4a8(type)) {
+            throw new IllegalArgumentException("no small-token-tile split-K W4A8 GEMM kernel for weight type " + type
+                    + "; supported: " + W4A8_TYPES);
+        }
+        return type.name() + mmqSmallSuffix(tokens, MATMUL_W4A8_SKSPLIT_SUFFIX, MATMUL_W4A8_SKSPLIT64_SUFFIX);
+    }
+
+    /** Suffix of a twin kernel name at the twin width ({@link MmqConfig#twinTokens(int, int)}). */
+    private static String mmqSmallSuffix(int tokens, String suffix16, String suffix64) {
+        return tokens == MmqConfig.TOKEN_LANES ? suffix16
+                : tokens == MmqConfig.TWIN_MAX_TOKENS ? suffix64
+                : throwBadTwinWidth(tokens);
+    }
+
+    private static String throwBadTwinWidth(int tokens) {
+        throw new IllegalArgumentException("MMQ twin kernels come in " + MmqConfig.TOKEN_LANES + " and "
+                + MmqConfig.TWIN_MAX_TOKENS + " tokens, got " + tokens);
     }
 
     /**
@@ -532,12 +639,13 @@ public final class GemmKernels {
         return type.name() + MATMUL_CM_KSPLIT_SUFFIX;
     }
 
-    /** Every kernel name of this family: tiled, MMQ, MMQ KSplit, MMQ S, CM, CM KSplit and MMA GEMM
-     *  kernels in {@link GGMLType} order, the FP8 and W4A8 E4M3 GEMMs with their S twins, then the
-     *  activation staging kernels, the reduce and the top-k. */
+    /** Every kernel name of this family: tiled, MMQ, MMQ KSplit, MMQ S, MMQ S64, MMQ SKSplit,
+     *  MMQ SKSplit64, CM and CM KSplit GEMM kernels in {@link GGMLType} order, the FP8 and W4A8 E4M3
+     *  GEMMs with their S, S64, SKSplit and SKSplit64 twins, then the activation staging kernels,
+     *  the reduce and the top-k. */
     public static List<String> kernelNames() {
-        List<String> names = new ArrayList<>(TILED_TYPES.size() + 5 * MMQ_TYPES.size() + MMA_TYPES.size()
-                + 3 * W4A8_TYPES.size() + 7);
+        List<String> names = new ArrayList<>(TILED_TYPES.size() + 8 * MMQ_TYPES.size() + 6 * FP8_TYPES.size()
+                + MMA_TYPES.size() + 6 * W4A8_TYPES.size() + 7);
         for (GGMLType type : TILED_TYPES) {
             names.add(matmulTiled(type));
         }
@@ -545,6 +653,9 @@ public final class GemmKernels {
             names.add(matmulMmq(type));
             names.add(matmulMmqKSplit(type));
             names.add(matmulMmqSmall(type));
+            names.add(matmulMmqSmall(type, MmqConfig.TWIN_MAX_TOKENS));
+            names.add(matmulMmqSmallSplit(type));
+            names.add(matmulMmqSmallSplit(type, MmqConfig.TWIN_MAX_TOKENS));
             names.add(matmulCm(type));
             names.add(matmulCmKSplit(type));
         }
@@ -552,6 +663,9 @@ public final class GemmKernels {
             names.add(matmulMmq(type));
             names.add(matmulMmqKSplit(type));
             names.add(matmulMmqSmall(type));
+            names.add(matmulMmqSmall(type, MmqConfig.TWIN_MAX_TOKENS));
+            names.add(matmulMmqSmallSplit(type));
+            names.add(matmulMmqSmallSplit(type, MmqConfig.TWIN_MAX_TOKENS));
         }
         for (GGMLType type : MMA_TYPES) {
             names.add(matmulMma(type));
@@ -561,6 +675,9 @@ public final class GemmKernels {
             names.add(matmulW4a8(type));
             names.add(matmulW4a8KSplit(type));
             names.add(matmulW4a8Small(type));
+            names.add(matmulW4a8Small(type, MmqConfig.TWIN_MAX_TOKENS));
+            names.add(matmulW4a8SmallSplit(type));
+            names.add(matmulW4a8SmallSplit(type, MmqConfig.TWIN_MAX_TOKENS));
         }
         names.add(QUANT_MMQ_Q8_1);
         names.add(QUANT_MMQ_INT8_STATIC);

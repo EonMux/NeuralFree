@@ -5,11 +5,11 @@
  * and the mmq-config tables; the host mirrors this table in gguf.ops.gemm.MmqConfig and plans the
  * launch grid with the same row and token tiles:
  * - CUDA sm_80+ (Ampere, Ada, Hopper, Blackwell), MmqConfig.INT8_TENSOR: the int8 tensor cores
- *   (mma.m16n8k32 / m16n8k16 .s8) over 32-deep stages and a 64 x 64 tile. llama.cpp sizes its
- *   token tile (J) up to 128 per architecture by shared memory; with the activations staged once
- *   per projection (LLM_Quant_MMQ_Q8_1), the tile costs only the register accumulators here, and
- *   64 tokens per workgroup doubled the int8 GEMM throughput of the 32-token tile on sm_120 (RTX
- *   5080 Laptop, 4096 x 4096 x 512).
+ *   (mma.m16n8k32 / m16n8k16 .s8) over 32-deep stages and a 128 x 128 tile, the widest J row of
+ *   llama.cpp's tables (ggml_cuda_mmq_get_J_best picks the widest token tile that minimizes the
+ *   token-tile count). With the activations staged once per projection (LLM_Quant_MMQ_Q8_1), the
+ *   tile costs only the register accumulators here: 32 float accumulators per lane of a 512
+ *   work-item workgroup.
  * - Everything else, MmqConfig.PACKED_DOT: the packed integer dot on __dp4a (CUDA sm_61+) or scalar
  *   int arithmetic (CUDA below sm_61, OpenCL, GLSL) over 16-deep stages and a 64 x 16 tile. The
  *   Vulkan tensor path for quantized weights is the cooperative-matrix matmul_mmq_cm.comp,
@@ -43,14 +43,17 @@
 #define NF_MMQ_TENSOR 0
 #endif
 
-/* Row tile and rows per work-item of every pass: llama.cpp's I is 64 (RDNA3, packed dot) or 128 (CDNA). */
+/* Row tile and rows per work-item of every pass: llama.cpp's I is 64 (RDNA3, packed dot) or 128
+ * (CDNA); the tensor path takes the table's I=128 row with its J=128 widest tile, whose 16 warps
+ * cover the 128 rows as eight 16-row groups. */
+#if NF_MMQ_TENSOR
+#define NF_MMQ_DEFAULT_TM 128
+#define NF_MMQ_DEFAULT_RM 4
+#define NF_MMQ_DEFAULT_TK 32           /* reduction depth of one stage: one m16n8k32 fragment */
+#define NF_MMQ_DEFAULT_TN 128          /* tokens per workgroup tile: eight n8 blocks per warp */
+#else
 #define NF_MMQ_DEFAULT_TM 64
 #define NF_MMQ_DEFAULT_RM 4
-
-#if NF_MMQ_TENSOR
-#define NF_MMQ_DEFAULT_TK 32           /* reduction depth of one stage: one m16n8k32 fragment */
-#define NF_MMQ_DEFAULT_TN 64           /* tokens per workgroup tile: four n8 blocks per warp */
-#else
 #define NF_MMQ_DEFAULT_TK 16           /* reduction depth of one stage: one 16-wide chunk */
 #define NF_MMQ_DEFAULT_TN 16           /* tokens per workgroup tile: one per work-item */
 #endif

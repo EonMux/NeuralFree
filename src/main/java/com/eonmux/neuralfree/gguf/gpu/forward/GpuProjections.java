@@ -260,11 +260,14 @@ final class GpuProjections {
         int fastWorkGroup = fast == null ? 0 : ops.lanes.fastWorkGroup(fast);
         boolean fastUsable = fast != null
                 && ops.lanes.fastUsable(fast, fastTileRows, fastTileTokens, fastWorkGroup, w, nTokens);
-        /* A staged launch of fewer tokens than the device tile runs the 16-token-tile twin of the lane
-         * (smallFast) when the device has it, so the weight stream fills 16-token output tiles; the
-         * split-K twins keep the plain kernels. */
+        /* A staged launch of fewer tokens than the device tile runs the twin tile of its ladder row
+         * (smallFast, 16 tokens up to 16 — on a small-K reduction up to 48 — and 64 above) when the
+         * device has it, so the weight stream fills whole output tiles; its split-K runs the twin
+         * tile's _SKSplit / _SKSplit64 (SplitKGemmPlan.ofSmallTiles). */
         String smallFast = fastUsable ? ops.lanes.smallTileKernel(fast, w, nTokens) : null;
         int launchTileTokens = smallFast == null ? fastTileTokens : ops.lanes.fastTileTokens(smallFast);
+        int launchTileRows = smallFast == null ? fastTileRows : ops.lanes.fastTileRows(smallFast);
+        int launchWorkGroup = smallFast == null ? fastWorkGroup : ops.lanes.fastWorkGroup(smallFast);
         Int8ActStaging int8Staging = fastUsable && fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)
                 ? ops.lanes.int8Staging(w, cols) : null;
         Fp8ActStaging fp8Staging = fastUsable && FastGemmLanes.fp8Fast(w, fast)
@@ -297,8 +300,8 @@ final class GpuProjections {
                     int qStride = staged ? ops.lanes.stagedRowRecords(cols) : cols;
                     int qOff = staged ? activations.off : x.off;
                     ops.launch2d(smallFast == null ? fast : smallFast,
-                            GpuOps.ceilDiv(m, fastTileRows) * fastWorkGroup, GpuOps.ceilDiv(nTokens, launchTileTokens),
-                            fastWorkGroup, m, cols, nTokens, qStride, qOff, rows, yOff, w.shard(s),
+                            GpuOps.ceilDiv(m, launchTileRows) * launchWorkGroup, GpuOps.ceilDiv(nTokens, launchTileTokens),
+                            launchWorkGroup, m, cols, nTokens, qStride, qOff, rows, yOff, w.shard(s),
                             activations.buf, out);
                 }
             }

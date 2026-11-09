@@ -13,6 +13,7 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
@@ -25,9 +26,11 @@ import static org.junit.Assert.assertTrue;
  * formulas, {@code -pps} shares one prompt through the page copy (its {@code n_kv} is the unified-KV
  * formula {@code pp + pl*tg}), {@code -tgs} runs, {@code --output-format jsonl} prints the reference's
  * keys, a cell that does not fit is skipped with a standard-error note and the parser refuses every bad
- * flag by name. The load flags LLMDemo shares ({@code --backend}, {@code -ngl}, {@code -fa}, the KV types) reach
- * the engine configuration over the bench's paged memory, and with a GPU present a small grid runs on the GPU
- * backend's paged device memory.
+ * flag by name. The parser takes 0 as llama.cpp's lists do, {@code -npp 0} runs the reference's decode-only
+ * cell from position 0 (no prompt phase, ~0 s {@code T_PP}, {@code S_PP} 0.00, {@code n_kv = pl*tg}) and
+ * {@code -ntg 0} the prompt-only one. The load flags LLMDemo shares ({@code --backend}, {@code -ngl},
+ * {@code -fa}, the KV types) reach the engine configuration over the bench's paged memory, and with a GPU
+ * present a small grid runs on the GPU backend's paged device memory.
  */
 public class BatchedBenchCommandTest {
 
@@ -205,6 +208,102 @@ public class BatchedBenchCommandTest {
         assertRowSpeeds(measured.get(0), false);
     }
 
+    /**
+     * llama.cpp's pure decode cell: {@code -npp 0} runs no prompt phase (no empty forward call), the decode
+     * steps start at position 0, {@code n_kv = pl*(0+tg)}, and the cell prints the reference's ~0 s
+     * {@code T_PP} with {@code S_PP} 0.00, because the cell carries 0 prompt tokens.
+     */
+    @Test
+    public void zeroPromptRunsTheDecodeOnlyCellFromPosition0() throws IOException {
+        Path model = model();
+        StringBuilder out = new StringBuilder();
+        StringBuilder err = new StringBuilder();
+        List<BatchedBenchCommand.BenchRow> measured = BatchedBenchCommand.execute(plan(model,
+                new int[] {0}, new int[] {3}, new int[] {1, 2}, false, false, false, 64), out, err);
+        assertTrue("the run skips nothing: " + err, err.length() == 0);
+        double[][] expected = {{0, 3, 1, 3}, {0, 3, 2, 6}};
+        List<double[]> parsed = rows(out.toString());
+        assertEquals("one row per grid cell", expected.length, parsed.size());
+        for (int i = 0; i < expected.length; i++) {
+            double[] row = parsed.get(i);
+            assertEquals("pp", expected[i][0], row[0], 0);
+            assertEquals("tg", expected[i][1], row[1], 0);
+            assertEquals("pl", expected[i][2], row[2], 0);
+            assertEquals("n_kv = pl*(pp+tg)", expected[i][3], row[3], 0);
+            assertEquals("the printed row is the measured cell", (int) row[3], measured.get(i).nKv);
+        }
+        for (BatchedBenchCommand.BenchRow row : measured) {
+            assertDecodeOnlySpeeds(row);
+        }
+        assertTrue("the reference's pp = 0 cell text:\n" + out,
+                out.toString().contains("|     0 |      3 |    1 |      3 |    0.000 |     0.00 |")
+                        && out.toString().contains("|     0 |      3 |    2 |      6 |    0.000 |     0.00 |"));
+    }
+
+    /**
+     * The decode-only speeds: {@code S_PP} is 0 (no prompt tokens ran), {@code S_TG} and the total keep the
+     * reference's formulas over the measured phases.
+     */
+    private static void assertDecodeOnlySpeeds(BatchedBenchCommand.BenchRow row) {
+        assertEquals("speed_pp is 0: the cell runs no prompt tokens", 0, row.speedPP, 0);
+        assertTrue("the decode phase runs", row.tTG > 0);
+        assertEquals("speed_tg = pl*tg/t_tg", (double) row.pl * row.tg / row.tTG, row.speedTG,
+                1e-9 * row.speedTG);
+        assertEquals("t = t_pp + t_tg", row.tPP + row.tTG, row.t, 1e-12);
+        assertEquals("speed", (double) row.pl * row.tg / row.t, row.speed, 1e-9 * row.speed);
+    }
+
+    /** llama.cpp takes {@code -ntg 0} too: the prompt-only cell prefills {@code pl*pp} tokens and decodes none. */
+    @Test
+    public void zeroGenerationRunsThePromptOnlyCell() throws IOException {
+        Path model = model();
+        StringBuilder out = new StringBuilder();
+        StringBuilder err = new StringBuilder();
+        List<BatchedBenchCommand.BenchRow> measured = BatchedBenchCommand.execute(plan(model,
+                new int[] {8}, new int[] {0}, new int[] {2}, false, false, false, 64), out, err);
+        assertTrue("the run skips nothing: " + err, err.length() == 0);
+        assertEquals("one row", 1, measured.size());
+        assertEquals("n_kv = pl*(pp+0)", 16, measured.get(0).nKv);
+        assertTrue("the prompt phase runs", measured.get(0).tPP > 0);
+        assertEquals("speed_tg is 0: the cell runs no generation tokens", 0, measured.get(0).speedTG, 0);
+        assertEquals("t = t_pp + t_tg", measured.get(0).tPP + measured.get(0).tTG, measured.get(0).t, 1e-12);
+        assertEquals("speed = pl*pp/t", 16 / measured.get(0).t, measured.get(0).speed, 1e-9 * measured.get(0).speed);
+        assertTrue("the reference's tg = 0 cell text:\n" + out,
+                out.toString().contains("|     8 |      0 |    2 |     16 "));
+    }
+
+    /**
+     * The shared form at pp = 0: there is no prompt to prefill or copy, {@code n_kv} is the shared formula
+     * {@code pp + pl*tg = pl*tg}, and both sequences decode from position 0.
+     */
+    @Test
+    public void zeroPromptUnderPpsSkipsTheCopyAndRunsTheSharedDecode() throws IOException {
+        Path model = model();
+        StringBuilder out = new StringBuilder();
+        StringBuilder err = new StringBuilder();
+        List<BatchedBenchCommand.BenchRow> measured = BatchedBenchCommand.execute(plan(model,
+                new int[] {0}, new int[] {3}, new int[] {2}, true, false, false, 64), out, err);
+        assertTrue("the run skips nothing: " + err, err.length() == 0);
+        assertEquals("one row", 1, measured.size());
+        assertEquals("the shared formula pp + pl*tg", 6, measured.get(0).nKv);
+        assertDecodeOnlySpeeds(measured.get(0));
+    }
+
+    /** The jsonl cell at pp = 0 carries the reference's values: n_kv = pl*tg and speed_pp 0. */
+    @Test
+    public void jsonlAtZeroPromptCarriesTheReferenceValues() throws IOException {
+        Path model = model();
+        StringBuilder out = new StringBuilder();
+        BatchedBenchCommand.execute(plan(model, new int[] {0}, new int[] {3}, new int[] {1},
+                false, false, true, 64), out, new StringBuilder());
+        String line = out.toString().trim();
+        assertTrue(line, line.startsWith("{\"n_kv_max\": 64, \"n_ubatch\": 8, \"parallel\": 1,"
+                + " \"is_pp_shared\": false, \"is_tg_separate\": false, \"pp\": 0, \"tg\": 3, \"pl\": 1,"
+                + " \"n_kv\": 3,"));
+        assertTrue(line, line.contains("\"t_pp\": 0.00000"));
+        assertTrue(line, line.contains("\"speed_pp\": 0.000000"));
+    }
+
     @Test
     public void jsonlCarriesTheReferenceKeysPerCell() throws IOException {
         Path model = model();
@@ -265,6 +364,25 @@ public class BatchedBenchCommandTest {
                 "-npp", "4", "-npp", "8", "-ntg", "3", "-npl", "1"});
         assertEquals(2, appended.npp.size());
         assertEquals(8, (int) appended.npp.get(1));
+    }
+
+    /**
+     * llama.cpp's string-split lists take 0, and the bench does too: {@code -npp 0} is the pure decode cell (the
+     * standard way to measure decode-step throughput at a batch of {@code pl} rows), {@code -ntg 0} the
+     * prompt-only one; negatives stay refused by name.
+     */
+    @Test
+    public void parseTakesZeroCountsAsLlamaCppDoes() throws Exception {
+        BatchedBenchCommand.Plan p = BatchedBenchCommand.parse(new String[] {"m.gguf",
+                "-npp", "0", "-ntg", "128", "-npl", "1,2,4,8,9,16"});
+        assertEquals(Arrays.asList(0), p.npp);
+        assertEquals(Arrays.asList(128), p.ntg);
+        assertEquals(16, p.maxPl);
+
+        BatchedBenchCommand.Plan mixed = BatchedBenchCommand.parse(new String[] {"m.gguf",
+                "-npp", "0,128", "-ntg", "0,64", "-npl", "1"});
+        assertEquals(Arrays.asList(0, 128), mixed.npp);
+        assertEquals(Arrays.asList(0, 64), mixed.ntg);
     }
 
     @Test
@@ -342,7 +460,9 @@ public class BatchedBenchCommandTest {
         assertUsage(new String[] {"m.gguf", "-npp", "4"}, "-ntg");
         assertUsage(new String[] {"m.gguf", "-npp", "4", "-ntg", "3"}, "-npl");
         assertUsage(new String[] {"m.gguf", "--frobozz"}, "--frobozz");
-        assertUsage(new String[] {"m.gguf", "-npp", "0", "-ntg", "3", "-npl", "1"}, "positive");
+        assertUsage(new String[] {"m.gguf", "-npp", "-1", "-ntg", "3", "-npl", "1"}, "non-negative");
+        assertUsage(new String[] {"m.gguf", "-npp", "4", "-ntg", "-2", "-npl", "1"}, "non-negative");
+        assertUsage(new String[] {"m.gguf", "-npp", "4", "-ntg", "3", "-npl", "0"}, "positive");
         assertUsage(new String[] {"m.gguf", "-npp", "x", "-ntg", "3", "-npl", "1"}, "integers");
         assertUsage(new String[] {"m.gguf", "--output-format", "yaml", "-npp", "4", "-ntg", "3",
                 "-npl", "1"}, "md or jsonl");

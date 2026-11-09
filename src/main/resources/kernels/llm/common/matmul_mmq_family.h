@@ -33,7 +33,7 @@
  * nf_i8, so a stage dot of code pairs stays within int (127 * 127 * 32 << 2^31).
  *
  * Tiling (common/matmul_mmq_config.h): a workgroup of NF_MMQ_WG work-items computes a tile of
- * NF_MMQ_TM weight rows x NF_MMQ_TN tokens in NF_MMQ_TK-deep stages: 64 x 64 x 32 on the tensor
+ * NF_MMQ_TM weight rows x NF_MMQ_TN tokens in NF_MMQ_TK-deep stages: 128 x 128 x 32 on the tensor
  * path, 64 x 16 on the packed-dot path, 64 x 128 on RDNA3 and 128 x 64 on CDNA; the _S twins run
  * the same tiling over 16-token tiles. There are
  * NF_MMQ_TX = NF_MMQ_TM / NF_MMQ_RM row lanes and 16 token lanes, so NF_MMQ_WG = NF_MMQ_TX * 16
@@ -57,21 +57,30 @@
  * Launch contract: 2-D, global = {ceil(M / NF_MMQ_TM) * NF_MMQ_WG, ceil(N / NF_MMQ_TN)},
  * local = {NF_MMQ_WG, 1}; the host (gguf.ops.gemm.MmqGemmPlan with the device's
  * gguf.ops.gemm.MmqConfig) plans it. The _S twin keeps the geometry with the tile's token count
- * fixed at 16 (dimension 1 = ceil(N / 16)).
+ * fixed at 16 (dimension 1 = ceil(N / 16)) and the row tile of the packed-dot family: where the
+ * device tile is wider, its generators run with NF_MMQ_TM capped at NF_MMQ_RM * 16 rows so the twin
+ * workgroup stays at 256 work-items (the measured RTX 5080 Laptop small steps lose their second
+ * block per SM to the 512-item workgroup of the uncapped 128-row twin).
  *
  * NF_MMQ_GEMM_S(T, BS, BB, SG, CODE, SCALE, OFF) defines T##_MatMul_MMQ_S, the plain kernel over
- * the same TM x 16 x TK tile as the packed-dot path: one weight-row tile streams into one 16-token
- * output tile instead of NF_MMQ_TN, so the per-stage record gather and the mma / token-dot work
- * shrink with the tile (llama.cpp picks the J tile per launch from the batch size,
- * ggml_cuda_mmq_get_J_best). It is generated only when NF_MMQ_TN > 16 — when the device tile is
- * 16 tokens the plain kernel is already the small tile; otherwise the twin is a distinct kernel
- * whose name stays on every architecture that generates it (on CUDA segments below sm_80 the
- * tensor twin compiles out with the datapath, and the host then takes the plain kernel). The host
- * (gguf.ops.gemm.FastGemmLanes) selects it for staged launches of fewer tokens than the device
- * tile; the split-K plans keep the plain kernels.
+ * the capped TM x 16 x TK tile: one weight-row tile streams into one 16-token output tile instead
+ * of NF_MMQ_TN, so the per-stage record gather and the mma / token-dot work shrink with the tile
+ * (llama.cpp picks the J tile per launch from the batch size, ggml_cuda_mmq_get_J_best). It is
+ * generated only when NF_MMQ_TN > 16 — when the device tile is 16 tokens the plain kernel is
+ * already the small tile; otherwise the twin is a distinct kernel whose name stays on every
+ * architecture that generates it (on CUDA segments below sm_80 the tensor twin compiles out with
+ * the datapath, and the host then takes the plain kernel). The host (gguf.ops.gemm.FastGemmLanes)
+ * selects it for staged launches of fewer tokens than the device tile.
  *
- * NF_MMQ_GEMM_KSPLIT(...) defines T##_MatMul_MMQ_KSplit, the split-K twin over the same tiles and
- * staged codes:
+ * NF_MMQ_GEMM_S64(T, ...) defines T##_MatMul_MMQ_S64, the same twin form over the capped
+ * TM x 64 x TK tile: the J=64 row of llama.cpp's per-launch ladder, the tile the mid batches of
+ * 17..64 tokens run (one weight pass over one 64-token output tile; the measured 128-token device
+ * tile pads up to 80 dead token columns there and its 512-item workgroup halves the resident
+ * blocks). NF_MMQ_GEMM_SKSPLIT64(T, ...) is its split-K twin, like SKSPLIT over 64 tokens.
+ *
+ * NF_MMQ_GEMM_KSPLIT(...) defines T##_MatMul_MMQ_KSplit, the split-K twin over the plain tiles and
+ * staged codes; NF_MMQ_GEMM_SKSPLIT(...) defines T##_MatMul_MMQ_SKSplit, the same split over the
+ * capped 16-token twin tile for launches of fewer tokens than the device tile:
  *
  *   T_MatMul_MMQ_KSplit(i M, i K, i N, i q_stride, i q_off, i k_slice,
  *                       R uchar weight, R uint q8, W float partial)
@@ -82,7 +91,7 @@
  * live element of its [M x N] slice plane written (row stride M), so the host reduce
  * (LLM_SplitK_Reduce, kernels/llm/split_k_reduce.cl) sums the planes into the strided output. The
  * host (gguf.ops.gemm.SplitKGemmPlan) keeps k_slice a multiple of the weight block size BS, so a
- * slice starts at a block and chunk boundary. The launch geometry is the plain kernel's with
+ * slice starts at a block and chunk boundary. The launch geometry is the tile's plain kernel's with
  * dimension 0 scaled by the split count.
  */
 #ifndef NF_MATMUL_MMQ_FAMILY_H
@@ -135,14 +144,14 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
  * contiguous span of aligned words instead of one byte load per code), the codes of the two chunks
  * ahead load into registers while chunk c is combined, and the commit writes a register set into
  * the tile the combine reads one iteration later. The gather of the token records runs coalesced
- * (the tile's records are consecutive in q8) into xr, so every combine reads its B fragments,
- * scales and code sums from shared memory instead of q8 global. The NF_MMQ_PIPE_BUF
- * code / (scale, offset) / code-sum tiles cycle per chunk; every lane passes the same three
- * barriers per iteration, with the gathered record tile uniform over the work-group after the
- * first barrier, so the code-sum fill under the token 0 zero-point gate stays uniform too. COMBINE
- * is a macro invoked as COMBINE(sel, XA, XB) with the pipe's last two arguments forwarded,
- * combining the staged chunk of buffer sel (its pointers are that buffer's offsets into wq / wsc /
- * wof / wsu).
+ * (the tile's records are consecutive in q8) into the shared record tile between the barriers, so
+ * every combine reads its B fragments, scales and code sums from shared memory instead of q8
+ * global. The NF_MMQ_PIPE_BUF code / (scale, offset) / code-sum tiles cycle per chunk; every lane passes the
+ * same three barriers per iteration, with the gathered record tile uniform over the work-group
+ * after the first barrier, so the code-sum fill under the token 0 zero-point gate stays uniform
+ * too. COMBINE is a macro invoked as COMBINE(sel, XA, XB) with the pipe's last two arguments
+ * forwarded, combining the staged chunk of buffer sel (its pointers are that buffer's offsets into
+ * wq / wsc / wof / wsu; the record tile arrives through the pipe's xr alias).
  *
  * NF_MMQ_PIPE(cstart, kend, TN, COMBINE, BS, BB, CODE, SCALE, OFF, XA, XB) runs the loop over
  * chunks [cstart, kend).
@@ -221,18 +230,39 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
         wof[(sel) * NF_MMQ_TM * NF_MMQ_SH + lid] = pof[set]; \
     }
 
-/* Gathers chunk c's records of tokens [n0, n0 + TN) into the shared record tile xr, one record of
+/* Gathers chunk c's records of tokens [n0, n0 + TN) into a shared record tile, one record of
  * NF_MMQ_RC units (the tk / 4 code ints, the chunk scale d, the half code sums and the zero point)
  * per token: the records of consecutive tokens are consecutive in q8, so the work-group streams
  * them coalesced. Records of tokens past N stage zero, so every consumer reads the tile without a
  * bounds test (a zero record's scale bits are 0.0f and its zero point 0). */
-#define NF_MMQ_Q8_GATHER(c, TN, q8, q_stride, q_off, n0, N) \
+#define NF_MMQ_Q8_GATHER_SYNC(dst, c, TN, q8, q_stride, q_off, n0, N) \
     for (int i = lid; i < (TN) * NF_MMQ_RC; i += NF_MMQ_WG) { \
         const int tok = i / NF_MMQ_RC; \
-        xr[i] = n0 + tok < (N) \
+        dst[i] = n0 + tok < (N) \
             ? (q8)[(nf_i64)(q_off) + ((nf_i64)(n0 + tok) * (q_stride) + (c) / NF_MMQ_TK) * NF_MMQ_RC \
                    + i % NF_MMQ_RC] : 0u; \
     }
+
+/* The staged record tile of a work-group: one synchronous tile on every dialect. A cp.async
+ * double-buffered gather (two record tiles + wait_group) was measured on the RTX 5080 Laptop at
+ * 3.3x the time of this form: the second tile pushed the kernel past the 3-block shared-memory
+ * fit of the SM and the resident warps fell from 1536 to 896, which the weight stream's latency
+ * hiding never recovers. The synchronous tile keeps the occupancy; its gather latency hides under
+ * the other warps' weight loads at the barrier. */
+#define NF_MMQ_XR_BUF 1
+
+/* The record tile buffer j holds: the single synchronous tile everywhere. */
+#define NF_MMQ_XR_AT(j, TN) (xrs)
+
+/*
+ * The record-tile phases of the pipe: every dialect refills the single tile synchronously between
+ * the barriers, and XR_READY is empty (the second barrier retires the gather).
+ */
+#define NF_MMQ_XR_PROLOGUE(cstart, kend, TN, q8, q_stride, q_off, n0, N) \
+    NF_MMQ_Q8_GATHER_SYNC(xrs, (cstart), (TN), q8, q_stride, q_off, n0, N)
+#define NF_MMQ_XR_STEP(c, kend, j, TN, q8, q_stride, q_off, n0, N) \
+    NF_MMQ_Q8_GATHER_SYNC(xrs, (c), (TN), q8, q_stride, q_off, n0, N)
+#define NF_MMQ_XR_READY
 
 /* Fills the half code sums of tile sel from its codes, under the zero-total gate of the gather
  * (token 0's zero-point unit, uniform over the work-group). */
@@ -256,6 +286,10 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
  * combine, so the stream is two-deep from the first iteration on. Tile reuse is three iterations
  * apart and the pre-commit barrier retires the combine that read the tile three iterations before,
  * so the commit cannot race a reader.
+ *
+ * The staged record tile refills synchronously between the barriers, the same gather on every
+ * dialect (one tile per workgroup, see NF_MMQ_XR_BUF). The COMBINE / WSUFILL macros read the
+ * tile through the xr alias the pipe declares per phase.
  */
 #define NF_MMQ_PIPE(cstart, kend, TN, COMBINE, BS, BB, CODE, SCALE, OFF, XA, XB) \
     uint pfw[NF_MMQ_PIPE_SETS][NF_MMQ_SP4]; \
@@ -265,26 +299,30 @@ NF_INLINE uint nf_mmq_float_rec(float v) {
     if ((cstart) < (kend)) { \
         NF_MMQ_PREFETCH(0, (cstart), m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
         NF_MMQ_STAGE_COMMIT(0, 0) \
-        NF_MMQ_Q8_GATHER((cstart), (TN), q8, q_stride, q_off, n0, N) \
+        NF_MMQ_XR_PROLOGUE((cstart), (kend), (TN), q8, q_stride, q_off, n0, N) \
         if ((cstart) + NF_MMQ_TK < (kend)) { \
             NF_MMQ_PREFETCH(1, (cstart) + NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
         } \
         if ((cstart) + 2 * NF_MMQ_TK < (kend)) { \
             NF_MMQ_PREFETCH(0, (cstart) + 2 * NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
         } \
+        NF_MMQ_XR_READY \
         barrier(CLK_LOCAL_MEM_FENCE); \
+        NF_LOCAL_PTR const uint* xr = NF_MMQ_XR_AT(0, (TN)); \
         NF_MMQ_WSUFILL(0) \
         barrier(CLK_LOCAL_MEM_FENCE); \
         COMBINE(0, XA, XB); \
         for (int c = (cstart) + NF_MMQ_TK, j = 1; c < (kend); c += NF_MMQ_TK, j++) { \
             barrier(CLK_LOCAL_MEM_FENCE); \
-            NF_MMQ_Q8_GATHER(c, (TN), q8, q_stride, q_off, n0, N) \
             sel = j % NF_MMQ_PIPE_BUF; \
+            NF_MMQ_XR_STEP(c, (kend), j, (TN), q8, q_stride, q_off, n0, N) \
             NF_MMQ_STAGE_COMMIT(j % NF_MMQ_PIPE_SETS, sel) \
             if (c + 2 * NF_MMQ_TK < (kend)) { \
                 NF_MMQ_PREFETCH(j % NF_MMQ_PIPE_SETS, c + 2 * NF_MMQ_TK, m0, (kend), M, weight, row_bytes, (BS), (BB), CODE, SCALE, OFF) \
             } \
+            NF_MMQ_XR_READY \
             barrier(CLK_LOCAL_MEM_FENCE); \
+            NF_LOCAL_PTR const uint* xr = NF_MMQ_XR_AT(j, (TN)); \
             NF_MMQ_WSUFILL(sel) \
             barrier(CLK_LOCAL_MEM_FENCE); \
             COMBINE(sel, XA, XB); \
@@ -343,6 +381,11 @@ NF_INLINE void nf_mmq_mma_m16n8k16(int d[4], const uint a[2], uint b) {
  * B registers token block start + (l >> 2) at the same depths, loaded from the staged record tile
  * xr the gather filled (PTX mma fragment layouts for .s8, as llama.cpp's tile<16, 8, int> /
  * tile<8, 8, int>).
+ * The epilogue applies the scales as llama.cpp's generic mma combine does (ggml-cuda/mmq-vec-dot.cuh):
+ * the lane's row (scale, offset) pairs are hoisted out of the token-block loop (dmA) and each token's
+ * chunk scale, code sums and zero point read once per token (dsB), so one combine costs two FMA per
+ * accumulator; the asymmetric zero-point correction is folded in only when the records carry one
+ * (the same work-group-uniform gate as the code-sum fill, token 0's zero-point unit).
  * SG == 32 takes one k32 product under the stage's single (scale, offset); SG == 16 takes one k16
  * product per half under that half's pair. The tokens' d, code sums and zero points read the
  * record tile; records of tokens past N are zero, so no bounds test applies.
@@ -361,23 +404,47 @@ NF_INLINE void nf_mmq_tensor_stage(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR co
     a[1] = *(NF_LOCAL_PTR const uint*)(wq + (r0 + 8) * NF_MMQ_TK + kf);
     a[2] = *(NF_LOCAL_PTR const uint*)(wq + r0 * NF_MMQ_TK + kf + 16);
     a[3] = *(NF_LOCAL_PTR const uint*)(wq + (r0 + 8) * NF_MMQ_TK + kf + 16);
+    float dmx[2][NF_MMQ_SH], dmy[2][NF_MMQ_SH];
+    for (int j = 0; j < 2; j++) {
+        for (int h = 0; h < NF_MMQ_SH; h++) {
+            dmx[j][h] = wsc[rr[2 * j] * NF_MMQ_SH + h];
+            dmy[j][h] = wof[rr[2 * j] * NF_MMQ_SH + h];
+        }
+    }
+    /* token 0's zero-point unit, uniform over the work-group after the gather (0 for every
+     * symmetric record) */
+    const int xz = (int)xr[NF_MMQ_QS + 1 + NF_MMQ_SH];
     for (int nb = 0; nb < tn / 16; nb++) {
         const int cbase = (warp & 1) * (tn / 2) + nb * 8;
         const int c0 = cbase + (lane & 3) * 2;
         const int cb = cbase + (lane >> 2);
-        const int cc[4] = {c0, c0 + 1, c0, c0 + 1};
         /* the staged code words of this lane's token: depths (l & 3) * 4 (+16); zero for dead tokens */
         const int rb = cb * NF_MMQ_RC;
         const uint b[2] = {xr[rb + kf / 4], xr[rb + kf / 4 + NF_MMQ_TK / 8]};
-        float sd[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        /* the lane's two tokens' chunk scale and half code sums, one read per token (dead tokens
+         * stage zeros); the zero points read only under the asymmetric gate */
+        float tds[2];
+        int tsum[2][NF_MMQ_SH];
+        for (int t = 0; t < 2; t++) {
+            const int tc = (c0 + t) * NF_MMQ_RC;
+            tds[t] = nf_mmq_rec_d(xr[tc + NF_MMQ_QS]);
+            for (int h = 0; h < NF_MMQ_SH; h++) {
+                tsum[t][h] = (int)xr[tc + NF_MMQ_QS + 1 + h];
+            }
+        }
         if (sg == 32) {
             int d[4] = {0, 0, 0, 0};
             nf_mmq_mma_m16n8k32(d, a, b);
             for (int i = 0; i < 4; i++) {
-                const int si = rr[i] * NF_MMQ_SH, xi = cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1;
-                sd[i] = wsc[si] * (float)d[i] + wof[si] * (float)((int)xr[xi] + (int)xr[xi + 1])
-                        - (float)(int)xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH]
-                            * (wsc[si] * (float)(wsu[si] + wsu[si + 1]) + wof[si] * (float)(2 * 16));
+                const int j = i >> 1, t = i & 1;
+                const int si = rr[2 * j] * NF_MMQ_SH;
+                float sd = dmx[j][0] * (float)d[i] + dmy[j][0] * (float)(tsum[t][0] + tsum[t][1]);
+                if (xz != 0) {
+                    sd -= (float)(int)xr[(c0 + t) * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH]
+                        * (dmx[j][0] * (float)(wsu[si] + wsu[si + 1])
+                           + dmy[j][0] * (float)(NF_MMQ_SH * 16));
+                }
+                acc[nb * 4 + i] += tds[t] * sd;
             }
         } else {
             for (int h = 0; h < NF_MMQ_SH; h++) {
@@ -385,16 +452,16 @@ NF_INLINE void nf_mmq_tensor_stage(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR co
                 int d[4] = {0, 0, 0, 0};
                 nf_mmq_mma_m16n8k16(d, ah, b[h]);
                 for (int i = 0; i < 4; i++) {
-                    const int si = rr[i] * NF_MMQ_SH + h;
-                    sd[i] += wsc[si] * (float)d[i]
-                            + wof[si] * (float)(int)xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1 + h]
-                            - (float)(int)xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH]
-                                * (wsc[si] * (float)wsu[si] + wof[si] * (float)16);
+                    const int j = i >> 1, t = i & 1;
+                    const int si = rr[2 * j] * NF_MMQ_SH + h;
+                    float sd = dmx[j][h] * (float)d[i] + dmy[j][h] * (float)tsum[t][h];
+                    if (xz != 0) {
+                        sd -= (float)(int)xr[(c0 + t) * NF_MMQ_RC + NF_MMQ_QS + 1 + NF_MMQ_SH]
+                            * (dmx[j][h] * (float)wsu[si] + dmy[j][h] * 16.0f);
+                    }
+                    acc[nb * 4 + i] += tds[t] * sd;
                 }
             }
-        }
-        for (int i = 0; i < 4; i++) {
-            acc[nb * 4 + i] += nf_mmq_rec_d(xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS]) * sd[i];
         }
     }
 }
@@ -415,6 +482,9 @@ NF_INLINE void nf_mmq_combine(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR const u
     nf_mmq_tensor_stage(wq, xr, tn, wsc, wof, wsu, lid, acc, sg);
 #else
     const int tx = lid % NF_MMQ_TX, ty = lid / NF_MMQ_TX;
+    /* token 0's zero-point unit, uniform over the work-group after the gather (0 for every
+     * symmetric record): its gate skips the weight code-sum term of the asymmetric form */
+    const int xz = (int)xr[NF_MMQ_QS + 1 + NF_MMQ_SH];
     for (int j = 0; j < tn / 16; j++) {
         const int tok = ty + 16 * j;
         if (n0 + tok >= N) {
@@ -429,8 +499,10 @@ NF_INLINE void nf_mmq_combine(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR const u
                 const int ib = nf_mmq_half_dot(wq + sr * NF_MMQ_TK + 16 * h, rec + 4 * h);
                 sd += wsc[sr * NF_MMQ_SH + h] * (float)ib
                         + wof[sr * NF_MMQ_SH + h] * (float)(int)rec[NF_MMQ_QS + 1 + h];
-                corr += wsc[sr * NF_MMQ_SH + h] * (float)wsu[sr * NF_MMQ_SH + h]
-                        + wof[sr * NF_MMQ_SH + h] * (float)16;
+                if (xz != 0) {
+                    corr += wsc[sr * NF_MMQ_SH + h] * (float)wsu[sr * NF_MMQ_SH + h]
+                            + wof[sr * NF_MMQ_SH + h] * (float)16;
+                }
             }
             acc[j * NF_MMQ_RM + q] += nf_mmq_rec_d(rec[NF_MMQ_QS])
                     * (sd - (float)(int)rec[NF_MMQ_QS + 1 + NF_MMQ_SH] * corr);
@@ -476,10 +548,11 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
  * The code tiles are declared as int arrays so every 4-byte fragment / dp4a load is aligned; the
  * (scale, offset) tiles hold NF_MMQ_SH pairs per row, and each stage gathers the tile's whole
  * staged record block (NF_MMQ_RC units per token: the code ints the B fragments and packed dots
- * read, the chunk scale d, the half code sums and the zero point) into the shared record tile xr.
- * The code / (scale, offset) / code-sum tiles exist in NF_MMQ_PIPE_BUF copies, one per in-flight
- * chunk of the pipelined stage (NF_MMQ_PIPE). row_bytes and the record tile belong to the kernel;
- * TN is the kernel's token tile (the record tile sizes to it).
+ * read, the chunk scale d, the half code sums and the zero point) into the shared record tile xrs
+ * (one copy; the pipe exposes it as xr). The code / (scale, offset) / code-sum
+ * tiles exist in NF_MMQ_PIPE_BUF copies, one per in-flight chunk of the pipelined stage
+ * (NF_MMQ_PIPE). row_bytes and the record tiles belong to the kernel; TN is the kernel's token tile
+ * (the record tiles size to it).
  */
 #define NF_MMQ_KERNEL_BODY(TN, BS, BB, GEMM_ARGS) \
     const int lid = get_local_id(0); \
@@ -488,7 +561,7 @@ NF_INLINE void nf_mmq_store(NF_GLOBAL float* NF_RESTRICT y, int M, int N,
     NF_LOCAL int wq_w[NF_MMQ_PIPE_BUF * NF_MMQ_WS / 4]; \
     NF_LOCAL float wsc[NF_MMQ_PIPE_BUF * NF_MMQ_TM * NF_MMQ_SH]; \
     NF_LOCAL float wof[NF_MMQ_PIPE_BUF * NF_MMQ_TM * NF_MMQ_SH]; \
-    NF_LOCAL uint xr[(TN) * NF_MMQ_RC]; \
+    NF_LOCAL uint xrs[NF_MMQ_XR_BUF * (TN) * NF_MMQ_RC]; \
     NF_LOCAL int wsu[NF_MMQ_PIPE_BUF * NF_MMQ_TM * NF_MMQ_SH]; \
     NF_LOCAL_PTR nf_i8* wq = (NF_LOCAL_PTR nf_i8*)wq_w; \
     float acc[NF_MMQ_ACC_OF(TN)]; \
@@ -527,33 +600,46 @@ NF_KERNEL void NAME( \
 #define NF_MMQ_GEMM_S(T, BS, BB, SG, CODE, SCALE, OFF) \
     NF_MMQ_GEMM_TN(T##_MatMul_MMQ_S, 16, BS, BB, SG, CODE, SCALE, OFF)
 
+#define NF_MMQ_GEMM_S64(T, BS, BB, SG, CODE, SCALE, OFF) \
+    NF_MMQ_GEMM_TN(T##_MatMul_MMQ_S64, 64, BS, BB, SG, CODE, SCALE, OFF)
+
 /*
- * The split-K twin: dimension 0 of the dispatch holds ceil(M / 64) * split workgroups, group
- * gid0 = rt + rtiles * slice covers rows rt * 64 of slice `slice` over k in
- * [slice * k_slice, min((slice + 1) * k_slice, K)) and writes the live [M x N] positions of its
- * slice plane at partial[(slice * N + t) * M + r] (y_stride = M), so the host reduce
- * (LLM_SplitK_Reduce, kernels/llm/split_k_reduce.cl) sums the planes into the strided output. The
- * launch geometry is the plain kernel's with dimension 0 scaled by the split count
- * (gguf.ops.gemm.SplitKGemmPlan).
+ * The split-K twin of one NAME over the TN-token tile: dimension 0 of the dispatch holds
+ * ceil(M / NF_MMQ_TM) * split workgroups, group gid0 = rt + rtiles * slice covers rows
+ * rt * NF_MMQ_TM of slice `slice` over k in [slice * k_slice, min((slice + 1) * k_slice, K)) and
+ * writes the live [M x N] positions of its slice plane at partial[(slice * N + t) * M + r]
+ * (y_stride = M), so the host reduce (LLM_SplitK_Reduce, kernels/llm/split_k_reduce.cl) sums the
+ * planes into the strided output. The launch geometry is the tile's plain kernel's with dimension 0
+ * scaled by the split count (gguf.ops.gemm.SplitKGemmPlan): the plain kernels' split runs the
+ * device tile (NF_MMQ_TN tokens), the small-token tiles' split (_SKSplit) runs 16 tokens.
  */
-#define NF_MMQ_GEMM_KSPLIT(T, BS, BB, SG, CODE, SCALE, OFF) \
-NF_KERNEL void T##_MatMul_MMQ_KSplit( \
+#define NF_MMQ_KSPLIT_TN(NAME, TN, BS, BB, SG, CODE, SCALE, OFF) \
+NF_KERNEL void NAME( \
     const int M, const int K, const int N, \
     const int q_stride, const int q_off, const int k_slice, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uint* NF_RESTRICT q8, \
     NF_GLOBAL float* NF_RESTRICT partial) { \
-    NF_MMQ_KERNEL_BODY(NF_MMQ_TN, (BS), (BB), \
+    NF_MMQ_KERNEL_BODY((TN), (BS), (BB), \
         const int rtiles = (M + NF_MMQ_TM - 1) / NF_MMQ_TM; \
         const int slice = (int)get_group_id(0) / rtiles; \
         const int m0 = ((int)get_group_id(0) - slice * rtiles) * NF_MMQ_TM; \
-        const int n0 = (int)get_group_id(1) * NF_MMQ_TN; \
+        const int n0 = (int)get_group_id(1) * (TN); \
         const int k0 = slice * k_slice; \
         const int k1 = k0 + k_slice < K ? k0 + k_slice : K; \
-        NF_MMQ_PIPE(k0, k1, NF_MMQ_TN, NF_MMQ_INT8_COMBINE, (BS), (BB), CODE, SCALE, OFF, NF_MMQ_TN, (SG)) \
-        nf_mmq_store(partial, M, N, M, (nf_i64)slice * M * N, m0, n0, NF_MMQ_TN, lid, acc); \
+        NF_MMQ_PIPE(k0, k1, (TN), NF_MMQ_INT8_COMBINE, (BS), (BB), CODE, SCALE, OFF, (TN), (SG)) \
+        nf_mmq_store(partial, M, N, M, (nf_i64)slice * M * N, m0, n0, (TN), lid, acc); \
     ) \
 }
+
+#define NF_MMQ_GEMM_KSPLIT(T, BS, BB, SG, CODE, SCALE, OFF) \
+    NF_MMQ_KSPLIT_TN(T##_MatMul_MMQ_KSplit, NF_MMQ_TN, BS, BB, SG, CODE, SCALE, OFF)
+
+#define NF_MMQ_GEMM_SKSPLIT(T, BS, BB, SG, CODE, SCALE, OFF) \
+    NF_MMQ_KSPLIT_TN(T##_MatMul_MMQ_SKSplit, 16, BS, BB, SG, CODE, SCALE, OFF)
+
+#define NF_MMQ_GEMM_SKSPLIT64(T, BS, BB, SG, CODE, SCALE, OFF) \
+    NF_MMQ_KSPLIT_TN(T##_MatMul_MMQ_SKSplit64, 64, BS, BB, SG, CODE, SCALE, OFF)
 
 /* ---- E4M3 datapath: FP8 weights and 4-bit weights served as E4M3 ----
  *
@@ -682,36 +768,54 @@ NF_KERNEL void NAME( \
 #define NF_FP8Q_GEMM_S_NAMED(NAME, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_TN_NAMED(NAME, 16, BS, BB, CODE, SCALE)
 
-#define NF_FP8Q_GEMM_KSPLIT_NAMED(NAME, BS, BB, CODE, SCALE) \
+#define NF_FP8Q_GEMM_S64_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_TN_NAMED(NAME, 64, BS, BB, CODE, SCALE)
+
+#define NF_FP8Q_GEMM_KSPLIT_TN_NAMED(NAME, TN, BS, BB, CODE, SCALE) \
 NF_KERNEL void NAME( \
     const int M, const int K, const int N, \
     const int q_stride, const int q_off, const int k_slice, \
     NF_GLOBAL const uchar* NF_RESTRICT weight, \
     NF_GLOBAL const uint* NF_RESTRICT q8, \
     NF_GLOBAL float* NF_RESTRICT partial) { \
-    NF_FP8Q_KERNEL_BODY(NF_MMQ_TN, (BS), (BB), \
+    NF_FP8Q_KERNEL_BODY((TN), (BS), (BB), \
         const int rtiles = (M + NF_MMQ_TM - 1) / NF_MMQ_TM; \
         const int slice = (int)get_group_id(0) / rtiles; \
         const int m0 = ((int)get_group_id(0) - slice * rtiles) * NF_MMQ_TM; \
-        const int n0 = (int)get_group_id(1) * NF_MMQ_TN; \
+        const int n0 = (int)get_group_id(1) * (TN); \
         const int k0 = slice * k_slice; \
         const int k1 = k0 + k_slice < K ? k0 + k_slice : K; \
-        NF_MMQ_PIPE(k0, k1, NF_MMQ_TN, NF_FP8Q_COMBINE, (BS), (BB), CODE, SCALE, NF_FP8Q_NO_OFFSET, NF_MMQ_TN, 0) \
-        nf_mmq_store(partial, M, N, M, (nf_i64)slice * M * N, m0, n0, NF_MMQ_TN, lid, acc); \
+        NF_MMQ_PIPE(k0, k1, (TN), NF_FP8Q_COMBINE, (BS), (BB), CODE, SCALE, NF_FP8Q_NO_OFFSET, (TN), 0) \
+        nf_mmq_store(partial, M, N, M, (nf_i64)slice * M * N, m0, n0, (TN), lid, acc); \
     ) \
 }
+
+#define NF_FP8Q_GEMM_KSPLIT_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(NAME, NF_MMQ_TN, BS, BB, CODE, SCALE)
 
 #define NF_FP8Q_GEMM(T, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_NAMED(T##_MatMul_MMQ, BS, BB, CODE, SCALE)
 #define NF_FP8Q_GEMM_S(T, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_S_NAMED(T##_MatMul_MMQ_S, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_S64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_S64_NAMED(T##_MatMul_MMQ_S64, BS, BB, CODE, SCALE)
 #define NF_FP8Q_GEMM_KSPLIT(T, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_KSPLIT_NAMED(T##_MatMul_MMQ_KSplit, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_SKSPLIT(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_MMQ_SKSplit, 16, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_SKSPLIT64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_MMQ_SKSplit64, 64, BS, BB, CODE, SCALE)
 #define NF_W4A8_GEMM(T, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_NAMED(T##_MatMul_W4A8, BS, BB, CODE, SCALE)
 #define NF_W4A8_GEMM_S(T, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_S_NAMED(T##_MatMul_W4A8_S, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_S64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_S64_NAMED(T##_MatMul_W4A8_S64, BS, BB, CODE, SCALE)
 #define NF_W4A8_GEMM_KSPLIT(T, BS, BB, CODE, SCALE) \
     NF_FP8Q_GEMM_KSPLIT_NAMED(T##_MatMul_W4A8_KSplit, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_SKSPLIT(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_W4A8_SKSplit, 16, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_SKSPLIT64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_W4A8_SKSplit64, 64, BS, BB, CODE, SCALE)
 
 #endif /* NF_MATMUL_MMQ_FAMILY_H */

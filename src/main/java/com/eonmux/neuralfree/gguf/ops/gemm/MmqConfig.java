@@ -21,9 +21,10 @@ import java.util.Objects;
  * {@link #workGroupSize()} work-items computes a {@code tileRows} x {@code tileTokens} tile: every
  * work-item holds {@link #rowsPerWorkItem()} weight rows for one of {@link #TOKEN_LANES} token
  * lanes, and the tile tokens are covered in groups of {@link #TOKEN_LANES}. The work-group size is
- * therefore {@code tileRows / rowsPerWorkItem() * TOKEN_LANES}. A 64-token tile keeps the four rows
- * per work-item of the original kernel (256 work-items); the CDNA 128-row tile takes eight rows per
- * work-item so its work-group is also 256 work-items.</p>
+ * therefore {@code tileRows / rowsPerWorkItem() * TOKEN_LANES}. The packed-dot and RDNA3 tiles keep
+ * the four rows per work-item of the original kernel (256 work-items); the CDNA 128-row tile takes
+ * eight rows per work-item so its work-group is also 256 work-items, and the CUDA 128 x 128 tensor
+ * tile keeps four rows per work-item over 512 work-items.</p>
  *
  * <p>Instances are immutable values; {@link #forDevice} and {@link #forHipTarget} select the tile of
  * a device and {@link #of} builds one from validated tile sizes.</p>
@@ -35,8 +36,9 @@ public final class MmqConfig {
      * Vulkan and the HIP targets without a ported MMQ table (llama.cpp's packed-dot families).
      */
     public static final MmqConfig PACKED_DOT = new MmqConfig("packed-dot", 16, 64, 16, 4);
-    /** int8 tensor cores ({@code mma.m16n8k32} / {@code m16n8k16} s8), 64 x 64 tile, 32-deep stages: CUDA sm_80+. */
-    public static final MmqConfig INT8_TENSOR = new MmqConfig("int8-tensor", 32, 64, 64, 4);
+    /** int8 tensor cores ({@code mma.m16n8k32} / {@code m16n8k16} s8), 128 x 128 tile over 32-deep
+     *  stages (llama.cpp's widest I/J table row; 512 work-items per workgroup): CUDA sm_80+. */
+    public static final MmqConfig INT8_TENSOR = new MmqConfig("int8-tensor", 32, 128, 128, 4);
     /**
      * RDNA3 (gfx1100&ndash;gfx1103): llama.cpp's {@code mmq-config-rdna3.cuh} widest tile, 64 rows x
      * 128 tokens over 16-deep stages. It is the table's non-fallback J=128 row of every int8 MMQ type
@@ -64,6 +66,32 @@ public final class MmqConfig {
     public static final int MAX_ROWS_PER_WORK_ITEM = 8;
     /** Token lanes of a tile, the work-items that share a row-tile column ({@code NF_MMQ_TN / NF_MMQ_RN}). */
     public static final int TOKEN_LANES = 16;
+    /**
+     * Work-items per workgroup of the small-token-tile twins: small batches launch few blocks, and
+     * the measured RTX 5080 Laptop 9-token steps regressed 12-38% when the 128-row tensor tile's
+     * twin widened its workgroup to 512 &mdash; the 512-item blocks cap at one per SM (the kernel's
+     * 896-thread occupancy limit) and the wave loses its second block. The twins keep the
+     * 256-item workgroups of the packed-dot family.
+     */
+    public static final int TWIN_WORK_GROUP = 256;
+    /**
+     * Widest token tile of the small-token-tile twins ({@code NF_MMQ_TN} of the S64 forms): the
+     * measured RTX 5080 Laptop mid batches. Up to {@link #TOKEN_LANES} tokens the 16-token twin
+     * wins (one weight pass over one token tile, the band the counted matvecs surround); over
+     * 17..64 tokens the 64-token twin wins the head and the FFN-out shapes by 29-42% over the
+     * 128-token device tile (n=48: 2063 vs 2923 us on the 151936x2560 head, 168.8 vs 261.0 on
+     * 9728x2560) because the 128-wide tile pads up to 80 dead token columns and its 512-item
+     * workgroups cap at one block per SM; above 64 the device tile has no dead columns left worth
+     * a twin (n=96: the 128-wide tile wins the head back, 3191.6 vs 4124.5 us).
+     */
+    public static final int TWIN_MAX_TOKENS = 64;
+    /**
+     * Largest launch that keeps the 16-token twin on a small-K reduction (K below {@link
+     * SplitKGemmPlan#MIN_SPLIT_K}): at or below it the 64-token tile pads a quarter of its token
+     * columns or more, on a grid too small to hide the waste; from 49 tokens the tile is more
+     * than three-quarters full and its single weight pass wins (see {@link #twinTokens(int, int)}).
+     */
+    public static final int SMALL_K_TWIN_MAX_TOKENS = TWIN_MAX_TOKENS * 3 / 4;
     /** System property that forces one of the named tiles on the runtime-compiled OpenCL kernels. */
     public static final String TILE_PROPERTY = "neuralfree.mmq.tile";
 
@@ -186,20 +214,60 @@ public final class MmqConfig {
 
     /**
      * The tile of the small-token-tile GEMM twins ({@code <T>_MatMul_MMQ_S}): the device config's
-     * stage depth, row tile and rows per work-item with a 16-token tile, the tile of the packed-dot
-     * path and what llama.cpp picks per launch for small batches (ggml_cuda_mmq_get_J_best). Only a
-     * device tile wider than 16 tokens has a twin; {@link MmqGemmPlan} launches the twin with this
-     * tile's geometry.
+     * stage depth and rows per work-item with a 16-token tile and a row tile that keeps the twin's
+     * workgroup at {@link #TWIN_WORK_GROUP} work-items (the 128-row tiles cap at 64 rows), the tile
+     * of the packed-dot path and what llama.cpp picks per launch for small batches
+     * (ggml_cuda_mmq_get_J_best). Only a device tile wider than 16 tokens has a twin;
+     * {@link MmqGemmPlan} launches the twin with this tile's geometry.
      *
      * @throws IllegalArgumentException when {@code device} is null
      */
     public static MmqConfig smallTile(MmqConfig device) {
+        return smallTile(device, TOKEN_LANES);
+    }
+
+    /**
+     * The twin tile of the given token width: as {@link #smallTile(MmqConfig)} over
+     * {@code tokens} tokens ({@code <T>_MatMul_MMQ_S} at 16, the S64 forms at {@link
+     * #TWIN_MAX_TOKENS}). Only a device tile wider than {@code tokens} has that twin, so a
+     * 64-token device tile serves the 17..64 band with its plain tile and no twin.
+     *
+     * @throws IllegalArgumentException when {@code device} is null, {@code tokens} is not a twin
+     *                                  width (16 or 64) or the device tile is not wider than it
+     */
+    public static MmqConfig smallTile(MmqConfig device, int tokens) {
         Objects.requireNonNull(device, "device");
-        if (device.tileTokens <= TOKEN_LANES) {
-            throw new IllegalArgumentException("MMQ tile " + device.name + " is already the "
-                    + TOKEN_LANES + "-token tile; it has no small-token-tile twin");
+        if (tokens != TOKEN_LANES && tokens != TWIN_MAX_TOKENS) {
+            throw new IllegalArgumentException("MMQ twin tiles come in " + TOKEN_LANES + " and "
+                    + TWIN_MAX_TOKENS + " tokens, got " + tokens);
         }
-        return of(device.stageDepth, device.tileRows, TOKEN_LANES, device.rowsPerWorkItem);
+        if (device.tileTokens <= tokens) {
+            throw new IllegalArgumentException("MMQ tile " + device.name + " is at most " + tokens
+                    + " tokens wide; it has no " + tokens + "-token twin");
+        }
+        int twinRows = Math.min(device.tileRows, TWIN_WORK_GROUP / TOKEN_LANES * device.rowsPerWorkItem);
+        return of(device.stageDepth, twinRows, tokens, device.rowsPerWorkItem);
+    }
+
+    /**
+     * The token width of the twin tile that serves a launch of {@code tokens} tokens over a
+     * reduction of {@code k}: the 16-token tile at up to 16 tokens (the counted-matvec band) and
+     * the 64-token tile above, llama.cpp's per-launch J ladder (ggml_cuda_mmq_get_J_best) — with
+     * one measured exception: on a small-K reduction (K below {@link SplitKGemmPlan#MIN_SPLIT_K},
+     * the weights small enough to sit in L2 and no split-K to fill the grid) launches up to
+     * {@link #SMALL_K_TWIN_MAX_TOKENS} keep the 16-token twin, whose filled grid beats the
+     * 64-token tile's dead columns (the Qwen3 0.6B Q8_0 layers, all K 1024/2048, measured 2701 and
+     * 3653 t/s at pp24 and pp32 on the 16-token twin against 2171 and 2875 on the 64-token one,
+     * while the K-2560 layers of the 4B model prefer the 64-token tile everywhere in the band).
+     * The caller builds the twin with {@link #smallTile(MmqConfig, int)} and falls back to the
+     * plain tile when the device tile is not wider than this.
+     */
+    public static int twinTokens(int tokens, int k) {
+        if (tokens <= TOKEN_LANES
+                || (k < SplitKGemmPlan.MIN_SPLIT_K && tokens <= SMALL_K_TWIN_MAX_TOKENS)) {
+            return TOKEN_LANES;
+        }
+        return TWIN_MAX_TOKENS;
     }
 
     /**
@@ -282,8 +350,9 @@ public final class MmqConfig {
                     + " rows per work-item; the int8 tensor path needs " + ROWS_PER_WORK_ITEM);
         }
         int defaultDepth = tensorPass ? INT8_TENSOR.stageDepth : PACKED_DOT.stageDepth;
+        int defaultRows = tensorPass ? INT8_TENSOR.tileRows : PACKED_DOT.tileRows;
         int defaultTokens = tensorPass ? INT8_TENSOR.tileTokens : PACKED_DOT.tileTokens;
-        if (stageDepth == defaultDepth && tileRows == PACKED_DOT.tileRows && tileTokens == defaultTokens
+        if (stageDepth == defaultDepth && tileRows == defaultRows && tileTokens == defaultTokens
                 && rowsPerWorkItem == ROWS_PER_WORK_ITEM) {
             return "";
         }
@@ -320,18 +389,22 @@ public final class MmqConfig {
     }
 
     /**
-     * Local memory of one workgroup, as a float-sized upper bound over the dialects (the GLSL twin
-     * stages codes as one int per code): the pipelined stage holds two copies of the weight-side
-     * tiles, one per in-flight chunk &mdash; {@code 2 * TM * TK} staged weight codes, {@code 4 * TM *
-     * TK/16} scale floats and {@code 2 * TM * TK/16} per-half weight code sums of the asymmetric
-     * int8 form &mdash; and one copy of the tokens' {@code TN} chunk scales, {@code TN * TK/16} code
-     * sums and {@code TN} zero points gathered from the staged records; the activations themselves
-     * are read from the staging buffer.
+     * Local memory of one workgroup, as an upper bound over the dialects that compile this tile:
+     * the pipelined stage holds three copies of the weight-side tiles, one per in-flight chunk
+     * ({@code NF_MMQ_PIPE_BUF}) &mdash; the staged weight codes ({@code 3 * TM * TK}, four codes
+     * per int on the 32-deep tensor path whose kernels only the CUDA dialect builds, one code per
+     * int on the packed dialects), three {@code TM * TK/16} tiles of scale floats, offset floats
+     * and per-half weight code sums of the asymmetric int8 form &mdash; and one copy of the tokens'
+     * {@code TN} staged records ({@code TK/4 + 2 + TK/16} units: the code ints the B fragments
+     * read, the chunk scales, the code sums and the zero points); the activations themselves are
+     * read from the staging buffer.
      */
     public long sharedBytes() {
         long halves = stageDepth / 16;
-        return 4L * (2L * tileRows * stageDepth + 6L * tileRows * halves
-                + 2L * tileTokens + (long) tileTokens * halves);
+        long codes = 3L * tileRows * stageDepth / (stageDepth > PACKED_DOT.stageDepth ? 4 : 1);
+        long scales = 9L * tileRows * halves;
+        long records = (long) tileTokens * (stageDepth / 4 + 2 + halves);
+        return 4L * (codes + scales + records);
     }
 
     @Override

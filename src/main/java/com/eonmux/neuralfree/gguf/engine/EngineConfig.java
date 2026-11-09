@@ -752,8 +752,10 @@ public final class EngineConfig {
     public long gpuVramLimitBytes() { return Math.multiplyExact(gpuVramLimitMb, 1024L * 1024L); }
     /**
      * How many layers a GPU load keeps on the device (llama.cpp {@code -ngl}): a count that covers the output
-     * head, so {@code N} trunk layers on the device is {@code N + 1}; {@link #GPU_LAYERS_AUTO} (default) fits as
-     * many as the VRAM holds, {@link #GPU_LAYERS_ALL} keeps every layer on the device.
+     * head, so {@code N} trunk layers on the device is {@code N + 1}, and a count above the model's layers plus
+     * the output head is clamped to that full offload at load, as llama.cpp clamps {@code -ngl 99};
+     * {@link #GPU_LAYERS_AUTO} (default) fits as many as the VRAM holds, {@link #GPU_LAYERS_ALL} keeps every
+     * layer on the device.
      */
     public int gpuLayers() { return gpuLayers; }
     /**

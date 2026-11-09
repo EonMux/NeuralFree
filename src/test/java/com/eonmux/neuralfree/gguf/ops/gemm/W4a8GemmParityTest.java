@@ -12,14 +12,14 @@ import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.quant.ActFakeQuant;
 import com.eonmux.neuralfree.gguf.quant.ActQuantScheme;
 import com.eonmux.neuralfree.gguf.quant.CpuBlockDecoders;
-import com.eonmux.neuralfree.utils.numeric.Fp8Codec;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 import static org.junit.Assert.assertTrue;
 
@@ -29,12 +29,18 @@ import static org.junit.Assert.assertTrue;
  * and NVFP4 codebooks are E2M1 values, which E4M3 represents exactly, so their lane matches the fake-quantized
  * reference up to the fp32 accumulation; the non-linear IQ4 codebooks and the NVFP4 per-16 weight scales need one
  * E4M3 rounding per weight element, for which the comparison states its bound.
+ *
+ * <p>Every launch takes the geometry of the tile the kernel is compiled with
+ * ({@link #tileOf}, the {@code FastGemmLanes.fastTileRows} / {@code fastTileTokens} / {@code fastWorkGroup}
+ * derivation the dispatch itself uses: the device's {@link MmqConfig} for the plain kernel,
+ * {@link MmqConfig#smallTile} for the small-token-tile twins), never literals &mdash; the tile the CUDA fatbin
+ * builds a kernel with follows the device ({@code MmqConfig.INT8_TENSOR}, 128 rows x 128 tokens over 512
+ * work-items, on sm_80+), and a launch planned for another tile leaves whole row groups unwritten.</p>
  */
 public class W4a8GemmParityTest {
 
     private static final int M = 70;
     private static final int K = 512;
-    private static final int N = 21;
     private static final float STATIC_SCALE = 0.25f;
 
     private HWAcceleration hwAccel;
@@ -95,82 +101,161 @@ public class W4a8GemmParityTest {
         check(GGMLType.NVFP4, 0.08);
     }
 
+    /** One launch of the parity matrix: the staged GEMM kernel and its token count. */
+    private static final class Launch {
+
+        final String kernel;
+        final int tokens;
+
+        Launch(String kernel, int tokens) {
+            this.kernel = kernel;
+            this.tokens = tokens;
+        }
+    }
+
+    /**
+     * The kernels and token counts of one type's parity matrix: the plain kernel at the device tile over a
+     * partial token tile (21) and across two device tiles (129), and &mdash; where the device tile is wider
+     * and the fatbin generates them &mdash; the 16-token twin at a partial (9) and a two-tile (21) token
+     * count, the 64-token twin at a partial (48) and a two-tile (100) token count: a token count in every
+     * band of the {@link MmqConfig#twinTokens(int, int)} ladder, as {@link CudaMmqSmallTileParityTest}
+     * covers for the int8 MMQ types. A wider device tile always carries the twins on the sm_89+ device
+     * this test assumes (the CUDA dialect generates them for every tensor-path segment), so a missing
+     * twin fails instead of silently shrinking the matrix.
+     */
+    private List<Launch> launches(GGMLType type, MmqConfig config) {
+        List<Launch> launches = new ArrayList<>();
+        String plain = GemmKernels.matmulW4a8(type);
+        launches.add(new Launch(plain, 21));
+        launches.add(new Launch(plain, 129));
+        if (config.tileTokens() > MmqConfig.TOKEN_LANES) {
+            String twin = GemmKernels.matmulW4a8Small(type);
+            assertTrue(twin + " is missing although the device tile is " + config.tileTokens()
+                    + " tokens wide", kernels.has(twin));
+            launches.add(new Launch(twin, 9));
+            launches.add(new Launch(twin, 21));
+            if (config.tileTokens() > MmqConfig.TWIN_MAX_TOKENS) {
+                String twin64 = GemmKernels.matmulW4a8Small(type, MmqConfig.TWIN_MAX_TOKENS);
+                assertTrue(twin64 + " is missing although the device tile is " + config.tileTokens()
+                        + " tokens wide", kernels.has(twin64));
+                launches.add(new Launch(twin64, 48));
+                launches.add(new Launch(twin64, 100));
+            }
+        }
+        return launches;
+    }
+
     /**
      * The lane equals the fake-quantized reference within {@code weightTolerance} of every term (the E4M3 rounding
-     * of the weight code the lane performs) plus fp32 accumulation.
+     * of the weight code the lane performs) plus fp32 accumulation, at every launch of the parity matrix.
      */
     private void check(GGMLType type, double weightTolerance) throws Exception {
         MmqConfig config = MmqConfig.forDevice(backend.backendType(),
                 backend.capabilities().getComputeCapability());
-        String gemm = GemmKernels.matmulW4a8(type);
-        Assume.assumeTrue(gemm + " is unavailable", kernels.has(gemm));
+        String plain = GemmKernels.matmulW4a8(type);
+        Assume.assumeTrue(plain + " is unavailable", kernels.has(plain));
         for (ActQuantScheme scheme : new ActQuantScheme[]{ActQuantScheme.FP8_STATIC, ActQuantScheme.MXFP8,
                 ActQuantScheme.MXFP4}) {
             String stageKernel = GemmKernels.fp8ActivationStaging(scheme);
             Assume.assumeTrue(stageKernel + " is unavailable", kernels.has(stageKernel));
-            int tk = config.stageDepth();
-            int units = config.recordUnits();
-            int tileTokens = config.tileTokens();
-            long qUnits = (long) N * config.rowRecords(K) * units;
             byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, M, K);
-            float[] x = OpenClMmqGemmParityTest.buildX(N, K);
             float[] w = CpuBlockDecoders.dequantize(weight, type, (long) M * K);
-            float[] fake = x.clone();
-            ActFakeQuant.apply(scheme, scheme.isStatic() ? STATIC_SCALE : 0.0f, 0, 0.0f, fake, 0, N, K);
-
-            GpuBuffer wbuf = backend.allocateBuffer((long) weight.length, true);
-            GpuBuffer xbuf = backend.allocateBuffer((long) x.length * Float.BYTES, true);
-            GpuBuffer qbuf = backend.allocateBuffer(qUnits * Integer.BYTES);
-            GpuBuffer ybuf = backend.allocateBuffer((long) N * M * Float.BYTES);
-            try {
-                try (GpuEvent wv = queue.enqueueWriteBuffer(wbuf, 0, weight.length, weight);
-                     GpuEvent xv = queue.enqueueWriteBuffer(xbuf, 0, (long) x.length * Float.BYTES, x, wv)) {
-                    stage(stageKernel, scheme, tk, xbuf, qbuf, xv);
-                    Object[] args = {M, K, N, config.rowRecords(K), 0, M, 0, wbuf, qbuf, ybuf};
-                    long[] global = {((long) (M + 63) / 64) * 256, (N + tileTokens - 1) / tileTokens};
-                    queue.enqueueKernelNoEvent(kernels.get(gemm), global, new long[]{256, 1}, args);
-                    float[] out = new float[N * M];
-                    try (GpuEvent read = queue.enqueueReadBuffer(ybuf, 0, (long) out.length * Float.BYTES, out)) {
-                        read.awaitCompletion();
-                    }
-                    for (int t = 0; t < N; t++) {
-                        for (int r = 0; r < M; r++) {
-                            double acc = 0.0;
-                            double bound = 0.0;
-                            for (int k = 0; k < K; k++) {
-                                final double term = (double) w[r * K + k] * fake[t * K + k];
-                                acc += term;
-                                bound += Math.abs(term) * weightTolerance;
-                            }
-                            double tol = bound + 1e-4 * Math.abs(acc) + 1e-3;
-                            assertTrue(type + " " + scheme + " token " + t + " row " + r + ": kernel "
-                                            + out[t * M + r] + " expected " + acc + " (bound " + tol + ")",
-                                    Math.abs(out[t * M + r] - acc) <= tol);
-                        }
-                    }
-                }
-            } finally {
-                wbuf.close();
-                xbuf.close();
-                qbuf.close();
-                ybuf.close();
+            for (Launch launch : launches(type, config)) {
+                run(type, scheme, stageKernel, weight, w, config, launch, weightTolerance);
             }
         }
     }
 
-    private void stage(String kernel, ActQuantScheme scheme, int tk, GpuBuffer x, GpuBuffer q8, GpuEvent after) {
-        int local = kernels.matvecLocal();
-        long records = (long) N * (K / tk);
-        Object[] args;
-        long global;
-        if (scheme.isStatic()) {
-            args = new Object[]{N, K, tk, K, 0, STATIC_SCALE, x, q8};
-            global = records;
-        } else {
-            args = new Object[]{N, K, tk, K, 0, x, q8};
-            global = records;
+    /** One staged launch of {@code launch} over contiguous views, checked against the fake-quantized reference.
+     *  The output is prefilled with NaN, so a row no work-group covers fails instead of reading as zero. */
+    private void run(GGMLType type, ActQuantScheme scheme, String stageKernel, byte[] weight, float[] w,
+                     MmqConfig config, Launch launch, double weightTolerance) throws Exception {
+        int tokens = launch.tokens;
+        String gemm = launch.kernel;
+        MmqConfig tile = tileOf(gemm, config);
+        int tk = config.stageDepth();
+        long qUnits = (long) tokens * config.rowRecords(K) * config.recordUnits();
+        float[] x = OpenClMmqGemmParityTest.buildX(tokens, K);
+        float[] fake = x.clone();
+        ActFakeQuant.apply(scheme, scheme.isStatic() ? STATIC_SCALE : 0.0f, 0, 0.0f, fake, 0, tokens, K);
+        float[] prefilled = new float[tokens * M];
+        Arrays.fill(prefilled, Float.NaN);
+
+        GpuBuffer wbuf = backend.allocateBuffer((long) weight.length, true);
+        GpuBuffer xbuf = backend.allocateBuffer((long) x.length * Float.BYTES, true);
+        GpuBuffer qbuf = backend.allocateBuffer(qUnits * Integer.BYTES);
+        GpuBuffer ybuf = backend.allocateBuffer((long) tokens * M * Float.BYTES);
+        try {
+            try (GpuEvent wv = queue.enqueueWriteBuffer(wbuf, 0, weight.length, weight);
+                 GpuEvent xv = queue.enqueueWriteBuffer(xbuf, 0, (long) x.length * Float.BYTES, x, wv);
+                 GpuEvent yv = queue.enqueueWriteBuffer(ybuf, 0, (long) prefilled.length * Float.BYTES,
+                         prefilled, xv)) {
+                stage(stageKernel, scheme, tk, tokens, xbuf, qbuf, yv);
+                Object[] args = {M, K, tokens, config.rowRecords(K), 0, M, 0, wbuf, qbuf, ybuf};
+                long[] global = {(long) ((M + tile.tileRows() - 1) / tile.tileRows()) * tile.workGroupSize(),
+                        (tokens + tile.tileTokens() - 1) / tile.tileTokens()};
+                queue.enqueueKernelNoEvent(kernels.get(gemm), global, new long[]{tile.workGroupSize(), 1}, args);
+                float[] out = new float[tokens * M];
+                try (GpuEvent read = queue.enqueueReadBuffer(ybuf, 0, (long) out.length * Float.BYTES, out)) {
+                    read.awaitCompletion();
+                }
+                assertWithin(type, scheme, gemm, w, fake, out, tokens, weightTolerance);
+            }
+        } finally {
+            wbuf.close();
+            xbuf.close();
+            qbuf.close();
+            ybuf.close();
         }
-        queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{roundUp(global, local)}, new long[]{local},
+    }
+
+    /**
+     * The tile the staged GEMM kernel is compiled with, the derivation the dispatch launches it with
+     * ({@code FastGemmLanes.fastTileRows} / {@code fastTileTokens} / {@code fastWorkGroup}): the device's
+     * tile for the plain kernel, {@link MmqConfig#smallTile} for the {@code _S} (16-token) and
+     * {@code _S64} (64-token) twins.
+     */
+    private static MmqConfig tileOf(String gemm, MmqConfig device) {
+        if (gemm.endsWith(GemmKernels.MATMUL_W4A8_S64_SUFFIX)) {
+            return MmqConfig.smallTile(device, MmqConfig.TWIN_MAX_TOKENS);
+        }
+        if (gemm.endsWith(GemmKernels.MATMUL_W4A8_S_SUFFIX)) {
+            return MmqConfig.smallTile(device);
+        }
+        return device;
+    }
+
+    /** |kernel - reference| <= one E4M3 weight rounding per term plus fp32 accumulation, at every output. */
+    private static void assertWithin(GGMLType type, ActQuantScheme scheme, String gemm, float[] w, float[] fake,
+                                     float[] out, int tokens, double weightTolerance) {
+        for (int t = 0; t < tokens; t++) {
+            for (int r = 0; r < M; r++) {
+                double acc = 0.0;
+                double bound = 0.0;
+                for (int k = 0; k < K; k++) {
+                    final double term = (double) w[r * K + k] * fake[t * K + k];
+                    acc += term;
+                    bound += Math.abs(term) * weightTolerance;
+                }
+                double tol = bound + 1e-4 * Math.abs(acc) + 1e-3;
+                assertTrue(type + " " + scheme + " " + gemm + " token " + t + " row " + r + ": kernel "
+                                + out[t * M + r] + " expected " + acc + " (bound " + tol + ")",
+                        Math.abs(out[t * M + r] - acc) <= tol);
+            }
+        }
+    }
+
+    private void stage(String kernel, ActQuantScheme scheme, int tk, int tokens, GpuBuffer x, GpuBuffer q8,
+                       GpuEvent after) {
+        int local = kernels.matvecLocal();
+        long records = (long) tokens * (K / tk);
+        Object[] args;
+        if (scheme.isStatic()) {
+            args = new Object[]{tokens, K, tk, K, 0, STATIC_SCALE, x, q8};
+        } else {
+            args = new Object[]{tokens, K, tk, K, 0, x, q8};
+        }
+        queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{roundUp(records, local)}, new long[]{local},
                 args, after);
     }
 

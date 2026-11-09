@@ -26,7 +26,9 @@ import com.eonmux.neuralfree.gguf.quant.InputTransform;
  * form {@code <T>_MatMul_CM} on Vulkan devices with cooperative matrices) and the tensor-core MMA GEMM
  * ({@code <T>_MatMul_MMA}); every lane splits its tall-skinny launches into the {@code <T>_MatMul_*_KSplit}
  * twin plus the shared {@code LLM_SplitK_Reduce}, and a staged launch of fewer tokens than the device tile
- * runs the 16-token-tile twin ({@code <T>_MatMul_MMQ_S} / {@code <T>_MatMul_W4A8_S}, {@link #smallTileKernel})
+ * runs the twin tile of its ladder row ({@code <T>_MatMul_MMQ_S} at up to 16 tokens,
+ * {@code <T>_MatMul_MMQ_S64} at 17..64 — on a small-K reduction only from 49, see
+ * {@link MmqConfig#twinTokens(int, int)} — and the W4A8 forms likewise, {@link #smallTileKernel})
  * when the device has it.
  *
  * <p>A lane kernel that the backend does not provide, or that cannot run the 256-work-item tile on the
@@ -242,24 +244,37 @@ final class FastGemmLanes {
     }
 
     /**
-     * Tokens per workgroup tile of a fast GEMM kernel: the small-tile twins' 16 tokens
-     * ({@code NF_MMQ_TN} of the {@code _S} form), the device's {@link MmqConfig} token tile for the
-     * int8 MMQ GEMM ({@code NF_MMQ_TN}), {@code NF_MMA_TN} for the MMA and CM forms.
+     * Tokens per workgroup tile of a fast GEMM kernel: the small-tile twins' tile width
+     * ({@code NF_MMQ_TN} of the {@code _S} / {@code _S64} forms), the device's {@link MmqConfig}
+     * token tile for the int8 MMQ GEMM ({@code NF_MMQ_TN}), {@code NF_MMA_TN} for the MMA and CM
+     * forms.
      */
     int fastTileTokens(String fastKernel) {
-        if (smallTileFast(fastKernel)) {
-            return MmqConfig.TOKEN_LANES;
+        int twin = twinTokensOf(fastKernel);
+        if (twin > 0) {
+            return twin;
         }
         return stagedFast(fastKernel) ? mmqConfig.tileTokens() : MmaGemmPlan.TILE_TOKENS;
     }
 
-    /** Weight rows per workgroup tile of a fast GEMM kernel: the {@link MmqConfig} row tile or {@code NF_MMA_TM}. */
+    /** Weight rows per workgroup tile of a fast GEMM kernel: the small tiles' row tile
+     *  ({@link MmqConfig#smallTile}, the 256-item twin) for the twins, the
+     *  {@link MmqConfig} row tile or {@code NF_MMA_TM}. */
     int fastTileRows(String fastKernel) {
+        int twin = twinTokensOf(fastKernel);
+        if (twin > 0) {
+            return MmqConfig.smallTile(mmqConfig, twin).tileRows();
+        }
         return stagedFast(fastKernel) ? mmqConfig.tileRows() : MmaGemmPlan.TILE_ROWS;
     }
 
-    /** Work-items per workgroup of a fast GEMM kernel: the {@link MmqConfig} work-group size or {@code NF_MMA_WG}. */
+    /** Work-items per workgroup of a fast GEMM kernel: the small tiles' 256-item group for the
+     *  twins, the {@link MmqConfig} work-group size or {@code NF_MMA_WG}. */
     int fastWorkGroup(String fastKernel) {
+        int twin = twinTokensOf(fastKernel);
+        if (twin > 0) {
+            return MmqConfig.smallTile(mmqConfig, twin).workGroupSize();
+        }
         return stagedFast(fastKernel) ? mmqConfig.workGroupSize() : MmaGemmPlan.WORKGROUP_SIZE;
     }
 
@@ -271,11 +286,24 @@ final class FastGemmLanes {
                 || smallTileFast(fastKernel);
     }
 
-    /** Whether a fast kernel is a small-token-tile twin ({@code <T>_MatMul_MMQ_S} or
-     *  {@code <T>_MatMul_W4A8_S}); a device tile of 16 tokens has no twin. */
+    /** Whether a fast kernel is a small-token-tile twin ({@code <T>_MatMul_MMQ_S} / {@code _S64}
+     *  or the W4A8 forms); a device tile of 16 tokens has no twin. */
     static boolean smallTileFast(String fastKernel) {
-        return fastKernel.endsWith(GemmKernels.MATMUL_MMQ_S_SUFFIX)
-                || fastKernel.endsWith(GemmKernels.MATMUL_W4A8_S_SUFFIX);
+        return twinTokensOf(fastKernel) > 0;
+    }
+
+    /** Token tile width of a fast kernel's small-token-tile twin form: 16 ({@code _S}), 64
+     *  ({@code _S64}), or 0 when the kernel is not a twin. */
+    private static int twinTokensOf(String fastKernel) {
+        if (fastKernel.endsWith(GemmKernels.MATMUL_MMQ_S64_SUFFIX)
+                || fastKernel.endsWith(GemmKernels.MATMUL_W4A8_S64_SUFFIX)) {
+            return MmqConfig.TWIN_MAX_TOKENS;
+        }
+        if (fastKernel.endsWith(GemmKernels.MATMUL_MMQ_S_SUFFIX)
+                || fastKernel.endsWith(GemmKernels.MATMUL_W4A8_S_SUFFIX)) {
+            return MmqConfig.TOKEN_LANES;
+        }
+        return 0;
     }
 
     /**
@@ -287,30 +315,42 @@ final class FastGemmLanes {
     static boolean fp8Fast(GpuWeight w, String fastKernel) {
         if (GemmKernels.isFp8(w.type())) {
             return fastKernel.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)
-                    || fastKernel.endsWith(GemmKernels.MATMUL_MMQ_S_SUFFIX);
+                    || fastKernel.endsWith(GemmKernels.MATMUL_MMQ_S_SUFFIX)
+                    || fastKernel.endsWith(GemmKernels.MATMUL_MMQ_S64_SUFFIX);
         }
         return GemmKernels.isW4a8(w.type()) && (fastKernel.endsWith(GemmKernels.MATMUL_W4A8_SUFFIX)
-                || fastKernel.endsWith(GemmKernels.MATMUL_W4A8_S_SUFFIX));
+                || fastKernel.endsWith(GemmKernels.MATMUL_W4A8_S_SUFFIX)
+                || fastKernel.endsWith(GemmKernels.MATMUL_W4A8_S64_SUFFIX));
     }
 
     /**
      * The small-token-tile twin of a staged fast lane for a launch of {@code nTokens}, or null when the
      * launch keeps {@code fastKernel}: only the MMQ and W4A8 lanes of a device whose tile is wider than
-     * 16 tokens have a twin (the tile llama.cpp picks per launch for small batches,
-     * ggml_cuda_mmq_get_J_best), only a launch of fewer tokens than the device tile takes it, never
-     * under {@link BatchInvariance} (the tile is part of the lane a batch-invariant run pins), and only
-     * when the twin can run the tile's work-group size on this device ({@link GpuOps#optionalReady}; a
-     * CUDA segment without the twin's function, below sm_80, records it unavailable).
+     * 16 tokens have twins, and the launch takes the twin of its ladder row
+     * ({@link MmqConfig#twinTokens(int, int)}, the tile llama.cpp picks per launch,
+     * ggml_cuda_mmq_get_J_best) &mdash;
+     * the 16-token twin at up to 16 tokens and, on a small-K reduction, up to 48, the 64-token twin
+     * over the rest of 17..64, and the plain tile above 64,
+     * where the measured 128-token tile has no dead token columns left worth a twin (n=96 head: 3191.6us
+     * plain vs 4124.5us on the 64-token twin; n=48: 2923.1 vs 2063.0, the twin wins). A device tile of
+     * 64 tokens serves 17..64 with the plain tile itself, never under {@link BatchInvariance} (the tile
+     * is part of the lane a batch-invariant run pins), and only when the twin can run the tile's
+     * work-group size on this device ({@link GpuOps#optionalReady}; a CUDA segment without the twin's
+     * function, below sm_80, records it unavailable).
      */
     String smallTileKernel(String fastKernel, GpuWeight w, int nTokens) {
         if (!stagedFast(fastKernel) || BatchInvariance.enabled()
-                || nTokens >= mmqConfig.tileTokens() || mmqConfig.tileTokens() <= MmqConfig.TOKEN_LANES) {
+                || mmqConfig.tileTokens() <= MmqConfig.TOKEN_LANES) {
+            return null;
+        }
+        int tokens = MmqConfig.twinTokens(nTokens, (int) w.cols());
+        if (tokens >= mmqConfig.tileTokens() || (tokens > MmqConfig.TOKEN_LANES && nTokens > tokens)) {
             return null;
         }
         String twin = fastKernel.endsWith(GemmKernels.MATMUL_W4A8_SUFFIX)
-                ? GemmKernels.matmulW4a8Small(w.type())
-                : GemmKernels.matmulMmqSmall(w.type());
-        return ops.optionalReady(twin, mmqConfig.workGroupSize(), 1) ? twin : null;
+                ? GemmKernels.matmulW4a8Small(w.type(), tokens)
+                : GemmKernels.matmulMmqSmall(w.type(), tokens);
+        return ops.optionalReady(twin, MmqConfig.smallTile(mmqConfig, tokens).workGroupSize(), 1) ? twin : null;
     }
 
     /** Staged record units between activation rows of the int8 MMQ lane ({@code NF_MMQ_TK} chunks per row). */
@@ -512,9 +552,10 @@ final class FastGemmLanes {
         if (GemmKernels.isW4a8(type) && fp8Tensor()) {
             ops.optionalReady(GemmKernels.matmulW4a8(type), mmqConfig.workGroupSize(), 1);
             ops.optionalReady(GemmKernels.matmulW4a8KSplit(type), mmqConfig.workGroupSize(), 1);
-            if (mmqConfig.tileTokens() > MmqConfig.TOKEN_LANES) {
-                ops.optionalReady(GemmKernels.matmulW4a8Small(type), mmqConfig.workGroupSize(), 1);
-            }
+            prewarmTwins((tokens, group) -> {
+                ops.optionalReady(GemmKernels.matmulW4a8Small(type, tokens), group, 1);
+                ops.optionalReady(GemmKernels.matmulW4a8SmallSplit(type, tokens), group, 1);
+            });
             prewarmFp8Staging();
         }
         String fast = fastGemm(type);
@@ -526,9 +567,10 @@ final class FastGemmLanes {
         if (fast.endsWith(GemmKernels.MATMUL_MMQ_SUFFIX)) {
             ops.optionalReady(GemmKernels.QUANT_MMQ_Q8_1, local);
             ops.optionalReady(GemmKernels.matmulMmqKSplit(type), workGroup, 1);
-            if (mmqConfig.tileTokens() > MmqConfig.TOKEN_LANES) {
-                ops.optionalReady(GemmKernels.matmulMmqSmall(type), workGroup, 1);
-            }
+            prewarmTwins((tokens, group) -> {
+                ops.optionalReady(GemmKernels.matmulMmqSmall(type, tokens), group, 1);
+                ops.optionalReady(GemmKernels.matmulMmqSmallSplit(type, tokens), group, 1);
+            });
             prewarmFp8Staging();
         } else if (fast.endsWith(GemmKernels.MATMUL_CM_SUFFIX)) {
             ops.optionalReady(GemmKernels.matmulCmKSplit(type), workGroup, 1);
@@ -546,5 +588,23 @@ final class FastGemmLanes {
                 ops.optionalReady(staging, local);
             }
         }
+    }
+
+    /** Prepares the small-token-tile twins of each ladder row the device tile is wider than, both
+     *  at the twins' shared work-group size ({@link MmqConfig#smallTile}: the 256-item group). */
+    private void prewarmTwins(TwinPrewarm twin) {
+        if (mmqConfig.tileTokens() <= MmqConfig.TOKEN_LANES) {
+            return;
+        }
+        int twinGroup = MmqConfig.smallTile(mmqConfig).workGroupSize();
+        twin.at(MmqConfig.TOKEN_LANES, twinGroup);
+        if (mmqConfig.tileTokens() > MmqConfig.TWIN_MAX_TOKENS) {
+            twin.at(MmqConfig.TWIN_MAX_TOKENS, twinGroup);
+        }
+    }
+
+    /** One ladder row of a lane's twin prewarm: the twin and its split-K form at {@code tokens}. */
+    private interface TwinPrewarm {
+        void at(int tokens, int workGroup);
     }
 }

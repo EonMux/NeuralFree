@@ -85,10 +85,14 @@ public final class LayerOffload {
      * load keeps every layer on the device and no setting keeps tensors or KV caches on the host; a host-KV load
      * ({@code neuralfree.kv.offload=false}) resolves a split even with every layer on the device.
      *
+     * <p>A count above the model's trunk layers plus the output head is clamped to the full offload, as llama.cpp
+     * clamps {@code -ngl} ({@code act_gpu_layers = min(n_gpu_layers, n_layer + 1)} in src/llama-model.cpp), so the
+     * {@code -ngl 99} guides and scripts pass keeps the whole model on the device. It resolves as an explicit
+     * {@code n_layer + 1} does, without the {@link EngineConfig#GPU_LAYERS_AUTO} memory search.</p>
+     *
      * @param tensors the stored tensors, so a host override that names a non-trunk tensor (the embedding, the output
      *                head, the NextN blocks) is refused before anything is placed
-     * @throws IllegalArgumentException for a layer count of 0 (nothing on the device) or one above the layers plus
-     *                                  the output head
+     * @throws IllegalArgumentException for a layer count of 0 (nothing on the device)
      */
     public static LayerOffload requested(ModelSpec spec, EngineConfig cfg, List<GGUFTensorInfo> tensors) {
         Objects.requireNonNull(spec, "spec");
@@ -105,12 +109,7 @@ public final class LayerOffload {
                     + " GPUs with " + EngineConfig.PROP_DRAFT_GPU_DEVICES + "=none");
         }
         int nLayer = spec.nLayer();
-        if (requested > nLayer + 1) {
-            throw new IllegalArgumentException("the layer count " + requested + " (" + EngineConfig.PROP_N_GPU_LAYERS
-                    + ", or " + EngineConfig.PROP_DRAFT_N_GPU_LAYERS + " for a draft model) exceeds the " + nLayer
-                    + " trunk layers plus the output head of " + spec.arch().ggufName());
-        }
-        return build(spec, cfg, tensors, requested - 1);
+        return build(spec, cfg, tensors, Math.min(requested, nLayer + 1) - 1);
     }
 
     /**

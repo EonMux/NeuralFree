@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.ops.gemm;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
+import com.eonmux.neuralfree.acceleration.backend.ocl.OclKernelHandle;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
 import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
 import com.eonmux.neuralfree.gguf.GGMLType;
@@ -67,6 +68,11 @@ public class OpenClMmqTileParityTest {
             backend = b;
             queue = b.computeQueue();
             kernels = LlmKernels.open(b);
+            OclKernelHandle probe = (OclKernelHandle) kernels.get("Q4_K_MatMul_MMQ");
+            Assume.assumeTrue("the " + config.name() + " tile needs " + config.workGroupSize()
+                    + "-item workgroups, more than the kernel's "
+                    + probe.maxWorkGroupSize() + " on " + b.capabilities().getDeviceName(),
+                    probe.maxWorkGroupSize() >= config.workGroupSize());
         } catch (Throwable t) {
             if (hw != null) {
                 try {

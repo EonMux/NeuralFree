@@ -142,9 +142,36 @@ public class LayerOffloadTest {
         IllegalArgumentException zero = assertThrows(IllegalArgumentException.class,
                 () -> LayerOffload.requested(spec(), config(0, null), tensors()));
         assertTrue(zero.getMessage().contains(EngineConfig.PROP_N_GPU_LAYERS));
-        IllegalArgumentException tooMany = assertThrows(IllegalArgumentException.class,
-                () -> LayerOffload.requested(spec(), config(N_LAYER + 2, null), tensors()));
-        assertTrue(tooMany.getMessage().contains(EngineConfig.PROP_N_GPU_LAYERS));
+    }
+
+    /**
+     * llama.cpp clamps {@code -ngl} instead of refusing it (src/llama-model.cpp:1692-1693:
+     * {@code act_gpu_layers = min(n_gpu_layers, n_layer + 1)}), so the {@code -ngl 99} every guide passes keeps the
+     * whole model on the device, exactly as {@code n_layer + 1} and {@code -ngl all} do, without the
+     * {@code -ngl auto} VRAM search.
+     */
+    @Test
+    public void aCountPastTheLayersOffloadsTheWholeModelAsAnExactFullOffload() {
+        assertNull(LayerOffload.requested(spec(), config(99, null), tensors()));
+        assertNull(LayerOffload.requested(spec(), config(N_LAYER + 2, null), tensors()));
+
+        LayerOffload over = LayerOffload.requested(spec(),
+                config(99, null).toBuilder().kvOffload(false).build(), tensors());
+        LayerOffload exact = LayerOffload.requested(spec(),
+                config(N_LAYER + 1, null).toBuilder().kvOffload(false).build(), tensors());
+        assertEquals("the clamped count keeps every trunk layer on the device", 0, over.firstGpuLayer());
+        assertEquals(N_LAYER, over.nGpuLayers());
+        assertTrue(over.hostKv());
+        assertEquals("the clamped count resolves exactly as nLayer + 1", exact.firstGpuLayer(), over.firstGpuLayer());
+        assertEquals(exact.nGpuLayers(), over.nGpuLayers());
+
+        LayerOffload overSplit = LayerOffload.requested(spec(), config(99, "blk\\.2\\.ffn.*=cpu"), tensors());
+        LayerOffload exactSplit = LayerOffload.requested(spec(),
+                config(EngineConfig.GPU_LAYERS_ALL, "blk\\.2\\.ffn.*=cpu"), tensors());
+        assertEquals(3, overSplit.firstGpuLayer());
+        assertEquals("the clamped count behaves as -ngl all beside a host override",
+                exactSplit.firstGpuLayer(), overSplit.firstGpuLayer());
+        assertEquals(exactSplit.nGpuLayers(), overSplit.nGpuLayers());
     }
 
     @Test

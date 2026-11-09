@@ -47,15 +47,18 @@ public class TiledGemmPlanTest {
         assertFalse(GemmKernels.hasTiled(GGMLType.I32));
         assertFalse(GemmKernels.hasTiled(null));
         List<String> names = GemmKernels.kernelNames();
-        // One tiled kernel per TILED_TYPES entry; per MMQ type the plain / KSplit / small-tile / CM /
-        // CM_KSplit family, per FP8 type the plain / KSplit / small-tile family, per dense type the
-        // MMA pair, per W4A8 type the plain / KSplit / small-tile family; then the 11 activation
-        // staging kernels and the reduce, top-k, row top-k and logit prefilter.
-        assertEquals(41 + GemmKernels.MMQ_TYPES.size() * 5 + GemmKernels.FP8_TYPES.size() * 3
-                + GemmKernels.W4A8_TYPES.size() * 3 + GemmKernels.MMA_TYPES.size() * 2 + 15, names.size());
+        // One tiled kernel per TILED_TYPES entry; per MMQ type the plain / KSplit / 16- and 64-token
+        // twins / their two split-K planes / CM / CM_KSplit family, per FP8 and per W4A8 type the plain /
+        // KSplit / two twins / two twin split-K planes family, per dense type the MMA pair; then the 11
+        // activation staging kernels and the reduce, top-k, row top-k and logit prefilter.
+        assertEquals(41 + GemmKernels.MMQ_TYPES.size() * 8 + GemmKernels.FP8_TYPES.size() * 6
+                + GemmKernels.W4A8_TYPES.size() * 6 + GemmKernels.MMA_TYPES.size() * 2 + 15, names.size());
         assertTrue(names.contains(GemmKernels.matmulMmq(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulMmqKSplit(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulMmqSmall(GGMLType.Q4_K)));
+        assertTrue(names.contains(GemmKernels.matmulMmqSmall(GGMLType.Q4_K, MmqConfig.TWIN_MAX_TOKENS)));
+        assertTrue(names.contains(GemmKernels.matmulMmqSmallSplit(GGMLType.Q4_K)));
+        assertTrue(names.contains(GemmKernels.matmulMmqSmallSplit(GGMLType.Q4_K, MmqConfig.TWIN_MAX_TOKENS)));
         assertTrue(names.contains(GemmKernels.matmulCm(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulCmKSplit(GGMLType.Q4_K)));
         assertTrue(names.contains(GemmKernels.matmulMmqSmall(GGMLType.F8_E4M3)));
@@ -65,6 +68,8 @@ public class TiledGemmPlanTest {
         assertTrue(names.contains(GemmKernels.matmulW4a8(GGMLType.MXFP4)));
         assertTrue(names.contains(GemmKernels.matmulW4a8KSplit(GGMLType.MXFP4)));
         assertTrue(names.contains(GemmKernels.matmulW4a8Small(GGMLType.MXFP4)));
+        assertTrue(names.contains(GemmKernels.matmulW4a8Small(GGMLType.MXFP4, MmqConfig.TWIN_MAX_TOKENS)));
+        assertTrue(names.contains(GemmKernels.matmulW4a8SmallSplit(GGMLType.MXFP4, MmqConfig.TWIN_MAX_TOKENS)));
         assertEquals("F32_MatMul_Tiled", names.get(0));
         assertEquals(GemmKernels.QUANT_MMQ_Q8_1, names.get(names.size() - 15));
         assertEquals(GemmKernels.QUANT_MMQ_INT8_STATIC, names.get(names.size() - 14));

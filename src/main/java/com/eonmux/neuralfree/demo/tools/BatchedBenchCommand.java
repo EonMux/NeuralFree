@@ -30,11 +30,14 @@ import java.util.Random;
  * per cell.
  *
  * <p>The flags carry llama.cpp's names and shapes: {@code -npp}, {@code -ntg} and {@code -npl} take
- * comma-separated integer lists (repeatable, they append), {@code -pps} shares one prefilled prompt across
+ * comma-separated integer lists (repeatable, they append; {@code -npp} and {@code -ntg} also take 0, a
+ * negative count is refused), {@code -pps} shares one prefilled prompt across
  * the sequences through the paged memory's page copy ({@code llama_memory_seq_cp}; the prompt phase then
  * prefills one prompt and the copy sits between the two measured phases, as the reference's unified KV
  * does), {@code -tgs} decodes one sequence after another instead of all in one step, {@code -c} and
- * {@code -ub} size the memory, {@code -s} seeds the random tokens. {@code n_kv_max} is the context the
+ * {@code -ub} size the memory, {@code -s} seeds the random tokens. {@code -npp 0} runs no prompt phase: the
+ * decode steps start at position 0 and the cell measures generation only, printing the reference's ~0 s
+ * {@code T_PP} and 0.00 {@code S_PP}. {@code n_kv_max} is the context the
  * paged sequences share; a cell whose {@code n_kv} exceeds it, or whose {@code pp + tg} rows exceed one
  * sequence's cap, is skipped, as the reference skips it; the skip is reported on standard error.
  *
@@ -58,8 +61,9 @@ final class BatchedBenchCommand {
     private static final String USAGE =
             "nftool batched-bench <model> [options]\n"
             + "options (llama.cpp batched-bench names):\n"
-            + "  -npp n0,n1,...           prompt tokens per sequence, repeatable; required\n"
-            + "  -ntg n0,n1,...           generated tokens per sequence, repeatable; required\n"
+            + "  -npp n0,n1,...           prompt tokens per sequence (0 allowed: generation only), repeatable;"
+            + " required\n"
+            + "  -ntg n0,n1,...           generated tokens per sequence (0 allowed), repeatable; required\n"
             + "  -npl n0,n1,...           parallel sequences, repeatable; required\n"
             + "  -pps                     share one prefilled prompt across the sequences (page copy)\n"
             + "  -tgs                     decode the sequences one after another\n"
@@ -73,7 +77,9 @@ final class BatchedBenchCommand {
             + "example: nftool batched-bench model.gguf -c 2048 -ub 512 -npp 128,256,512 -ntg 128,256"
             + " -npl 1,2,4,8\n"
             + "A cell whose rows do not fit the per-sequence context and the pools is skipped, as llama.cpp\n"
-            + "skips it; the skip is reported on standard error. The model opens on the best GPU backend by\n"
+            + "skips it; the skip is reported on standard error. With -npp 0 no prompt phase runs: the decode\n"
+            + "steps start at position 0 and the cell reports T_PP ~0 s with S_PP 0.00, as llama.cpp's does.\n"
+            + "The model opens on the best GPU backend by\n"
             + "default (paged device memory), or on the CPU engine with --cpu.\n";
 
     /** An invalid command line; the message names the flag. */
@@ -222,13 +228,13 @@ final class BatchedBenchCommand {
             String a = args[i];
             switch (a) {
                 case "-npp":
-                    npp.addAll(intList(a, value(a, args, i++)));
+                    npp.addAll(countList(a, value(a, args, i++), true));
                     break;
                 case "-ntg":
-                    ntg.addAll(intList(a, value(a, args, i++)));
+                    ntg.addAll(countList(a, value(a, args, i++), true));
                     break;
                 case "-npl":
-                    npl.addAll(intList(a, value(a, args, i++)));
+                    npl.addAll(countList(a, value(a, args, i++), false));
                     break;
                 case "-pps":
                     ppShared = true;
@@ -238,7 +244,7 @@ final class BatchedBenchCommand {
                     break;
                 case "-c":
                 case "--ctx":
-                    ctx = nonNegative(a, value(a, args, i++));
+                    ctx = countValue(a, value(a, args, i++), true);
                     break;
                 case "-ub":
                 case "--ubatch":
@@ -373,17 +379,31 @@ final class BatchedBenchCommand {
         double ppTokens = plan.ppShared ? pp : (double) pl * pp;
         double tgTokens = (double) pl * tg;
         double t = tPP + tTG;
-        return new BenchRow(pp, tg, pl, nKv, tPP, ppTokens / tPP, tTG, tgTokens / tTG, t,
-                (ppTokens + tgTokens) / t);
+        return new BenchRow(pp, tg, pl, nKv, tPP, speed(ppTokens, tPP), tTG, speed(tgTokens, tTG), t,
+                speed(ppTokens + tgTokens, t));
+    }
+
+    /**
+     * The reference's throughput formula, tokens over seconds. A phase with no tokens ({@code pp = 0} or
+     * {@code tg = 0}) times ~0 s and can measure 0/0; its well-defined throughput is 0 tokens per second, which
+     * is what the cell prints where the C value would be nan.
+     */
+    private static double speed(double tokens, double seconds) {
+        return seconds > 0 ? tokens / seconds : 0;
     }
 
     /**
      * The prompt phase: prefills one prompt per sequence (output logits of each prompt's last row only) and
      * returns its time; with {@code -pps} it then copies the prompt pages to the other sequences, after the
-     * measured time ends, as the reference copies after {@code t_pp_end}.
+     * measured time ends, as the reference copies after {@code t_pp_end}. With {@code pp = 0} no prompt phase
+     * runs, as the reference's timed block over its empty batch does (tools/batched-bench): no forward
+     * call, no page copy of an empty prompt, and the decode steps below start at position 0.
      */
     private static double prefillPhase(Plan plan, ForwardBackend backend, PagedSequences paged,
             int pp, int pl, int nVocab, Random rng) throws IOException {
+        if (pp == 0) {
+            return 0;
+        }
         int seqs = plan.ppShared ? 1 : pl;
         ForwardBatch.Builder batch = ForwardBatch.builder(seqs * pp);
         for (int j = 0; j < seqs; j++) {
@@ -530,18 +550,6 @@ final class BatchedBenchCommand {
         }
     }
 
-    private static int nonNegative(String flag, String v) throws UsageException {
-        try {
-            int n = Integer.parseInt(v.trim());
-            if (n < 0) {
-                throw new NumberFormatException();
-            }
-            return n;
-        } catch (NumberFormatException e) {
-            throw new UsageException(flag + " needs a non-negative integer, not '" + v + "'");
-        }
-    }
-
     private static long longValue(String flag, String v) throws UsageException {
         try {
             return Long.parseLong(v.trim());
@@ -550,8 +558,12 @@ final class BatchedBenchCommand {
         }
     }
 
-    /** A comma-separated list of positive integers ({@code n0,n1,...}), empty parts dropped. */
-    private static List<Integer> intList(String flag, String v) throws UsageException {
+    /**
+     * A comma-separated list of counts ({@code n0,n1,...}), empty parts dropped. {@code -npp} and {@code -ntg}
+     * take 0, as llama.cpp's string-split lists do ({@code -npp 0} is the generation-only cell, {@code -ntg 0}
+     * the prompt-only one); negatives are refused, and {@code -npl} counts sequences, so it stays positive.
+     */
+    private static List<Integer> countList(String flag, String v, boolean allowZero) throws UsageException {
         List<Integer> out = new ArrayList<>();
         for (String part : v.split(",")) {
             String p = part.trim();
@@ -559,7 +571,7 @@ final class BatchedBenchCommand {
                 continue;
             }
             try {
-                out.add(intValue(flag, p));
+                out.add(countValue(flag, p, allowZero));
             } catch (UsageException e) {
                 throw new UsageException(flag + " needs comma-separated integers; " + e.getMessage());
             }
@@ -568,6 +580,20 @@ final class BatchedBenchCommand {
             throw new UsageException(flag + " needs at least one integer");
         }
         return out;
+    }
+
+    /** One count: non-negative where 0 is a count ({@code -npp}, {@code -ntg}), positive where it is not. */
+    private static int countValue(String flag, String v, boolean allowZero) throws UsageException {
+        try {
+            int n = Integer.parseInt(v.trim());
+            if (n < (allowZero ? 0 : 1)) {
+                throw new NumberFormatException();
+            }
+            return n;
+        } catch (NumberFormatException e) {
+            throw new UsageException(flag + (allowZero
+                    ? " needs a non-negative integer, not '" : " needs a positive integer, not '") + v + "'");
+        }
     }
 
     /** {@code md} or {@code jsonl}, as llama.cpp's {@code --output-format}. */

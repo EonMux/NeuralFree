@@ -106,14 +106,16 @@ public class Fp8GemmBenchmarkTest {
             long records = (long) n * (K / tk);
             Object[] stageArgs = {n, K, tk, K, 0, 0.25f, xbuf, qbuf};
             Object[] laneArgs = {M, K, n, config.rowRecords(K), 0, M, 0, wbuf, qbuf, ybuf};
-            long[] laneGlobal = {((long) (M + 63) / 64) * 256, (n + config.tileTokens() - 1) / config.tileTokens()};
+            long[] laneGlobal = {(long) ((M + config.tileRows() - 1) / config.tileRows()) * config.workGroupSize(),
+                    (n + config.tileTokens() - 1) / config.tileTokens()};
             Object[] tiledArgs = {M, K, n, K, 0, M, 0, wbuf, xbuf, ybuf};
             long[] tiledGlobal = {((long) (M + 63) / 64) * 256, (n + 31) / 32};
 
             double staged = time(() -> {
                 queue.enqueueKernelNoEvent(kernels.get(stageKernel), new long[]{roundUp(records, local)},
                         new long[]{local}, stageArgs);
-                queue.enqueueKernelNoEvent(kernels.get(lane), laneGlobal, new long[]{256, 1}, laneArgs);
+                queue.enqueueKernelNoEvent(kernels.get(lane), laneGlobal,
+                        new long[]{config.workGroupSize(), 1}, laneArgs);
             });
             double tiledMs = time(() -> queue.enqueueKernelNoEvent(kernels.get(tiled), tiledGlobal,
                     new long[]{256, 1}, tiledArgs));

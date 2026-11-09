@@ -81,7 +81,7 @@ final class FastGemmParity {
             splits--;
         }
         SplitKGemmPlan split = SplitKGemmPlan.ofMmq(type, m, k, n, base.qStride(), 0, splits,
-                SplitKGemmPlan.sliceLength(k, splits, depth), mmqConfig, 256);
+                SplitKGemmPlan.sliceLength(k, splits, depth), mmqConfig, false, 256);
         byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, m, k);
         float[] x = OpenClMmqGemmParityTest.buildX(n, k);
         float[] plain = launchMmq(base, weight, x);

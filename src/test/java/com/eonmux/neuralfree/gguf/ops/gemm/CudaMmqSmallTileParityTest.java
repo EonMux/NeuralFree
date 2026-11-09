@@ -23,12 +23,12 @@ import java.util.Collection;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The small-token twins ({@code <T>_MatMul_MMQ_S}) and their split-K forms
- * ({@code <T>_MatMul_MMQ_KSplit}) against the plain kernel of the same CUDA fatbin, at the tile
- * {@link MmqConfig#forDevice} picks for the device: the twins tile the outputs 16 tokens wide and
- * stream whole weight blocks, with the same staged codes, the same decoded tiles and the same
- * per-output accumulation order, so every twin result equals the plain kernel's bit for bit. The
- * split-K planes add only the fp32 plane sums of the host reduce, as
+ * The small-token twins ({@code <T>_MatMul_MMQ_S} and the 64-token {@code _S64}) and their split-K
+ * forms ({@code <T>_MatMul_MMQ_SKSplit} / {@code _SKSplit64}) against the plain kernel of the same
+ * CUDA fatbin, at the tile {@link MmqConfig#forDevice} picks for the device: the twins tile the
+ * outputs 16 or 64 tokens wide and stream whole weight blocks, with the same staged codes, the same
+ * decoded tiles and the same per-output accumulation order, so every twin result equals the plain
+ * kernel's bit for bit. The split-K planes add only the fp32 plane sums of the host reduce, as
  * {@link FastGemmParity#mmqSplitKMatchesPlain} tolerates. {@link OpenClMmqSmallTileParityTest} is the
  * OpenCL counterpart.
  */
@@ -118,6 +118,32 @@ public class CudaMmqSmallTileParityTest {
     }
 
     /**
+     * The 64-token twin ({@code _S64}) at the mid-batch steps across whole and partial 64-token
+     * tiles (17, 32, 64 tokens; 13 and 70 weight rows; K of one and three blocks) equals the plain
+     * kernel of the same fatbin exactly, bit for bit.
+     */
+    @Test
+    public void theTwin64MatchesThePlainKernelBitForBit() throws InterruptedException {
+        FastGemmParity parity = new FastGemmParity(backend, kernels);
+        for (int blocks : new int[]{1, 3}) {
+            int k = blocks * type.getBlockSize();
+            for (int n : new int[]{17, 32, 64}) {
+                for (int m : new int[]{13, M}) {
+                    MmqGemmPlan plain = MmqGemmPlan.contiguous(config, type, m, k, n);
+                    MmqGemmPlan small = smallPlan(m, k, n, MmqConfig.TWIN_MAX_TOKENS);
+                    assertTrue(small.kernelName() + " is no 64-token twin",
+                            small.kernelName().endsWith(GemmKernels.MATMUL_MMQ_S64_SUFFIX));
+                    byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, m, k);
+                    float[] x = OpenClMmqGemmParityTest.buildX(n, k);
+                    float[] plainOut = parity.launchMmq(plain, weight, x);
+                    float[] twinOut = parity.launchMmq(small, weight, x);
+                    assertBits(type + " S64 n=" + n + " m=" + m + " k=" + k, plainOut, twinOut);
+                }
+            }
+        }
+    }
+
+    /**
      * The split-K twin over one whole-K slice equals the plain kernel bit for bit: with
      * {@code k_slice = K} the single plane is the output, so the combine faces no plane sum at all.
      */
@@ -129,7 +155,7 @@ public class CudaMmqSmallTileParityTest {
         for (int n : new int[]{9, 16}) {
             MmqGemmPlan plain = MmqGemmPlan.contiguous(config, type, M, k, n);
             SplitKGemmPlan split = SplitKGemmPlan.ofMmq(type, M, k, n, qStride, 0, 1, k,
-                    config, 256);
+                    config, false, 256);
             assertTrue(split.kernelName() + " is no split-K twin",
                     split.kernelName().endsWith(GemmKernels.MATMUL_MMQ_KSPLIT_SUFFIX));
             byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, M, k);
@@ -154,7 +180,7 @@ public class CudaMmqSmallTileParityTest {
         int qStride = config.rowRecords(k);
         MmqGemmPlan plain = MmqGemmPlan.contiguous(config, type, M, k, n);
         SplitKGemmPlan split = SplitKGemmPlan.ofMmq(type, M, k, n, qStride, 0, 2, k / 2,
-                config, 256);
+                config, false, 256);
         byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, M, k);
         float[] x = OpenClMmqGemmParityTest.buildX(n, k);
         float[] plainOut = parity.launchMmq(plain, weight, x);
@@ -166,10 +192,60 @@ public class CudaMmqSmallTileParityTest {
         }
     }
 
-    /** The twin launch over contiguous staged rows and output rows. */
+    /**
+     * The small tiles' split-K twin ({@code _SKSplit} over the twin tile of
+     * {@link MmqConfig#smallTile}) equals the plain kernel bit for bit over one whole-K slice, and
+     * its two-slice form matches within the fp32 plane sums the split adds.
+     */
+    @Test
+    public void theSmallTileSplitKTwinMatchesThePlainKernel() throws InterruptedException {
+        theSmallTileSplitKMatchesThePlainKernel(MmqConfig.TOKEN_LANES, 9);
+    }
+
+    /**
+     * The 64-token twin's split-K ({@code _SKSplit64}) equals the plain kernel bit for bit over one
+     * whole-K slice, and its two-slice form matches within the fp32 plane sums the split adds.
+     */
+    @Test
+    public void theTwin64SplitKMatchesThePlainKernel() throws InterruptedException {
+        theSmallTileSplitKMatchesThePlainKernel(MmqConfig.TWIN_MAX_TOKENS, 32);
+    }
+
+    /** The split-K twin of the twin tile of {@code tokens} tokens: whole-K bit for bit, two slices
+     *  within the fp32 plane sums. */
+    private void theSmallTileSplitKMatchesThePlainKernel(int tokens, int n) throws InterruptedException {
+        FastGemmParity parity = new FastGemmParity(backend, kernels);
+        int k = 4 * type.getBlockSize();
+        MmqConfig twin = MmqConfig.smallTile(config, tokens);
+        int qStride = twin.rowRecords(k);
+        MmqGemmPlan plain = MmqGemmPlan.contiguous(config, type, M, k, n);
+        SplitKGemmPlan split = SplitKGemmPlan.ofMmq(type, M, k, n, qStride, 0, 1, k, twin, true, 256);
+        String splitSuffix = tokens == MmqConfig.TWIN_MAX_TOKENS ? GemmKernels.MATMUL_MMQ_SKSPLIT64_SUFFIX
+                : GemmKernels.MATMUL_MMQ_SKSPLIT_SUFFIX;
+        assertTrue(split.kernelName() + " is no small-tile split-K twin",
+                split.kernelName().endsWith(splitSuffix));
+        byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, M, k);
+        float[] x = OpenClMmqGemmParityTest.buildX(n, k);
+        float[] plainOut = parity.launchMmq(plain, weight, x);
+        float[] partial = launchSplitPartials(split, weight, x);
+        assertBits(type + " SKSplit" + tokens + " n=" + n + " k=" + k, plainOut, partial);
+        SplitKGemmPlan two = SplitKGemmPlan.ofMmq(type, M, k, n, qStride, 0, 2, k / 2, twin, true, 256);
+        float[] splitOut = parity.launchMmqSplit(two, weight, x);
+        for (int i = 0; i < n * M; i++) {
+            assertTrue(two.kernelName() + " element " + i + ": " + splitOut[i] + " plain " + plainOut[i],
+                    Math.abs(splitOut[i] - plainOut[i]) <= 5e-3 * (1.0 + Math.abs(plainOut[i])));
+        }
+    }
+
+    /** The twin launch over contiguous staged rows and output rows at the 16-token twin tile. */
     private MmqGemmPlan smallPlan(int m, int k, int n) {
-        return MmqGemmPlan.smallOf(config, type, m, k, n,
-                MmqConfig.smallTile(config).rowRecords(k), 0, m, 0);
+        return smallPlan(m, k, n, MmqConfig.TOKEN_LANES);
+    }
+
+    /** The twin launch of the twin tile of {@code tokens} tokens. */
+    private MmqGemmPlan smallPlan(int m, int k, int n, int tokens) {
+        return MmqGemmPlan.smallOf(config, type, tokens, m, k, n,
+                MmqConfig.smallTile(config, tokens).rowRecords(k), 0, m, 0);
     }
 
     /**

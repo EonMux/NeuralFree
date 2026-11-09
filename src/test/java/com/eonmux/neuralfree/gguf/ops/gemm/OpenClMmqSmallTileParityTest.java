@@ -20,13 +20,15 @@ import java.util.Collection;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The small-token-tile twins {@code <T>_MatMul_MMQ_S} on the OpenCL device, under the forced
- * {@code int8-tensor} tile ({@link MmqConfig#TILE_PROPERTY}) whose 64-token tile makes the OpenCL
- * program generate the twins: every MMQ weight type's twin at the multi-row step sizes (9, 13, 16,
- * 31, 64 tokens, the partial 16-token tiles included) must match the exact dot of the hand-built
+ * The small-token-tile twins {@code <T>_MatMul_MMQ_S} and {@code _S64} on the OpenCL device, under
+ * the forced {@code rdna3} tile ({@link MmqConfig#TILE_PROPERTY}) whose 128-token tile makes the
+ * OpenCL program generate the twins: every MMQ weight type's twin at the multi-row step sizes (9,
+ * 13, 16, 24, 31, 64 tokens, the partial tiles included) must match the exact dot of the hand-built
  * weight's decoded codes with the staged activations, and the plain kernel of the same tile over the
  * same staged records. The token-tile change must not move the results, only the tile the weight
- * stream fills ({@code MmqGemmPlan.smallOf} plans the launches).
+ * stream fills ({@code MmqGemmPlan.smallOf} plans the launches). The rdna3 tile is the widest
+ * twin-generating tile whose 256-item workgroups the OpenCL NVIDIA kernels dispatch; the int8-tensor
+ * tile needs 512 (the CUDA twin runs in {@link CudaMmqSmallTileParityTest}).
  */
 @RunWith(Parameterized.class)
 public class OpenClMmqSmallTileParityTest {
@@ -55,7 +57,7 @@ public class OpenClMmqSmallTileParityTest {
             hw = new HWAcceleration();
             Assume.assumeTrue("no OpenCL device", !hw.getCLDevices().isEmpty());
             CLDevice device = hw.getCLDevices().get(0);
-            System.setProperty(MmqConfig.TILE_PROPERTY, MmqConfig.INT8_TENSOR.name());
+            System.setProperty(MmqConfig.TILE_PROPERTY, MmqConfig.RDNA3.name());
             OclComputeBackend b = new OclComputeBackend(device);
             Availability availability = LlmKernels.availability(b);
             Assume.assumeTrue("LLM kernels unavailable on " + b.capabilities().getDeviceName() + ": "
@@ -114,6 +116,20 @@ public class OpenClMmqSmallTileParityTest {
     }
 
     /**
+     * The 64-token twin across whole and partial 64-token tiles: 24 tokens (one partial tile) and
+     * 64 (one full), at row counts inside and past the row tile; K = 3 weight blocks.
+     */
+    @Test
+    public void theTwin64MatchesTheDecodedDotAcrossTiles() throws InterruptedException {
+        int k = 3 * type.getBlockSize();
+        for (int n : new int[]{24, 64}) {
+            for (int m : new int[]{13, M}) {
+                assertMatchesDecodedDot(smallPlan(m, k, n, MmqConfig.TWIN_MAX_TOKENS), n, k);
+            }
+        }
+    }
+
+    /**
      * Twin and plain kernel of the same forced tile agree over the same staged records: the tile only
      * changes which tokens a workgroup covers, never a result's arithmetic.
      */
@@ -122,7 +138,7 @@ public class OpenClMmqSmallTileParityTest {
         FastGemmParity parity = new FastGemmParity(backend, kernels);
         int k = 3 * type.getBlockSize();
         for (int n : new int[]{9, 16}) {
-            MmqGemmPlan plain = MmqGemmPlan.contiguous(MmqConfig.INT8_TENSOR, type, M, k, n);
+            MmqGemmPlan plain = MmqGemmPlan.contiguous(MmqConfig.RDNA3, type, M, k, n);
             MmqGemmPlan small = smallPlan(M, k, n);
             assertTrue(small.kernelName() + " is no small-tile twin",
                     small.kernelName().endsWith(GemmKernels.MATMUL_MMQ_S_SUFFIX));
@@ -145,19 +161,32 @@ public class OpenClMmqSmallTileParityTest {
      */
     @Test
     public void theSmallTileSplitKTwinMatchesThePlainKernel() throws InterruptedException {
+        theSmallTileSplitKMatchesThePlainKernel(MmqConfig.TOKEN_LANES, 9);
+    }
+
+    /** The dispatch's 64-token twin split ({@code _SKSplit64} over the S64 tile of a 24-token
+     *  launch) matches the plain kernel within the fp32 plane sums. */
+    @Test
+    public void theTwin64SplitKMatchesThePlainKernel() throws InterruptedException {
+        theSmallTileSplitKMatchesThePlainKernel(MmqConfig.TWIN_MAX_TOKENS, 24);
+    }
+
+    /** The dispatch's split of a staged launch of {@code n} tokens, at the twin tile its ladder row
+     *  picks, against the plain kernel over the same staged records. */
+    private void theSmallTileSplitKMatchesThePlainKernel(int tokens, int n) throws InterruptedException {
         Assume.assumeTrue("the device does not report compute units",
                 backend.capabilities().getComputeUnits() > 0);
         FastGemmParity parity = new FastGemmParity(backend, kernels);
         int k = Math.max(2048 / type.getBlockSize(), 2) * type.getBlockSize();
-        int n = 9;
-        MmqGemmPlan base = MmqGemmPlan.of(MmqConfig.INT8_TENSOR, type, M, k, n,
-                MmqConfig.INT8_TENSOR.rowRecords(k), 0, M, 0);
+        MmqGemmPlan base = MmqGemmPlan.of(MmqConfig.RDNA3, type, M, k, n,
+                MmqConfig.RDNA3.rowRecords(k), 0, M, 0);
         SplitKGemmPlan split = SplitKGemmPlan.ofSmallTiles(base, backend.capabilities().getComputeUnits(), 256);
         Assume.assumeTrue("the wave-fill heuristic does not split on this device", split != null);
-        assertTrue(split.kernelName().endsWith(GemmKernels.MATMUL_MMQ_KSPLIT_SUFFIX));
+        assertTrue(split.kernelName().endsWith(tokens == MmqConfig.TWIN_MAX_TOKENS
+                ? GemmKernels.MATMUL_MMQ_SKSPLIT64_SUFFIX : GemmKernels.MATMUL_MMQ_SKSPLIT_SUFFIX));
         byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, M, k);
         float[] x = OpenClMmqGemmParityTest.buildX(n, k);
-        float[] plainOut = parity.launchMmq(MmqGemmPlan.contiguous(MmqConfig.INT8_TENSOR, type, M, k, n), weight, x);
+        float[] plainOut = parity.launchMmq(MmqGemmPlan.contiguous(MmqConfig.RDNA3, type, M, k, n), weight, x);
         float[] splitOut = parity.launchMmqSplit(split, weight, x);
         for (int i = 0; i < n * M; i++) {
             assertTrue(split.kernelName() + " element " + i + ": " + splitOut[i] + " plain " + plainOut[i],
@@ -165,16 +194,21 @@ public class OpenClMmqSmallTileParityTest {
         }
     }
 
-    /** The twin launch over contiguous staged rows and output rows. */
+    /** The twin launch over contiguous staged rows and output rows at the 16-token twin tile. */
     private MmqGemmPlan smallPlan(int m, int k, int n) {
-        return MmqGemmPlan.smallOf(MmqConfig.INT8_TENSOR, type, m, k, n,
-                MmqConfig.smallTile(MmqConfig.INT8_TENSOR).rowRecords(k), 0, m, 0);
+        return smallPlan(m, k, n, MmqConfig.TOKEN_LANES);
+    }
+
+    /** The twin launch of the twin tile of {@code tokens} tokens. */
+    private MmqGemmPlan smallPlan(int m, int k, int n, int tokens) {
+        return MmqGemmPlan.smallOf(MmqConfig.RDNA3, type, tokens, m, k, n,
+                MmqConfig.smallTile(MmqConfig.RDNA3, tokens).rowRecords(k), 0, m, 0);
     }
 
     /**
      * The twin's [n x m] output against the exact dot of the decoded weight with the staged codes, as
      * {@link OpenClMmqGemmParityTest} checks its plain kernel: the reference quantizes per chunk of
-     * the plan's stage depth (the forced tile stages 32-deep).
+     * the plan's stage depth (the rdna3 tile stages 16-deep).
      */
     private void assertMatchesDecodedDot(MmqGemmPlan plan, int n, int k) throws InterruptedException {
         FastGemmParity parity = new FastGemmParity(backend, kernels);

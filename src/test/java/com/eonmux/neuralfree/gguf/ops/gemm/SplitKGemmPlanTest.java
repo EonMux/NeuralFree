@@ -31,51 +31,119 @@ public class SplitKGemmPlanTest {
         assertEquals(1, SplitKGemmPlan.splitsFor(4, 3, 1, 4096));
     }
 
-    /** The small-token-tile heuristic splits a staged grid up to about 1.3 waves to the capped slice
-     * count and leaves bigger grids alone (the measured RTX 5080 Laptop twins: the 64-tile
-     * 4096x2560 Q4_K twin runs 86-93us whole and 59-60us as 8 slices over 60 units, the 152-tile
-     * 9728x2560 twin 101-110us whole and 119-125us sliced). */
+    /** The 16-token band of the small-token-tile heuristic splits a staged grid up to about 1.3
+     * waves to the capped slice count and leaves bigger grids alone (the measured RTX 5080 Laptop
+     * twins: the 64-tile 4096x2560 Q4_K twin runs 86-93us whole and 59-60us as 8 slices over 60
+     * units, the 152-tile 9728x2560 twin 101-110us whole and 119-125us sliced). */
     @Test
     public void theSmallTileHeuristicFillsTheWaveWithTheCappedSliceCount() {
         int units = 48;
         assertEquals("a 40-tile grid over 48 units fills the device with 8 slices",
-                SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 9728));
+                SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 9728,
+                        MmqConfig.TOKEN_LANES));
         assertEquals("a 16-tile grid over 48 units splits by the cap too",
-                SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 16, 1, 2560));
+                SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 16, 1, 2560,
+                        MmqConfig.TOKEN_LANES));
         assertEquals("a full wave splits to lose the tail wave", SplitKGemmPlan.MAX_SPLITS,
-                SplitKGemmPlan.smallTileSplitsFor(units, 48, 1, 9728));
+                SplitKGemmPlan.smallTileSplitsFor(units, 48, 1, 9728, MmqConfig.TOKEN_LANES));
         assertEquals("a grid past 1.3 waves keeps one slice", 1,
-                SplitKGemmPlan.smallTileSplitsFor(units, 64, 1, 9728));
-        assertEquals("small K keeps one slice", 1, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 2047));
+                SplitKGemmPlan.smallTileSplitsFor(units, 64, 1, 9728, MmqConfig.TOKEN_LANES));
+        assertEquals("small K keeps one slice", 1, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 2047,
+                MmqConfig.TOKEN_LANES));
         int unknown = DeviceCapabilities.UNKNOWN_COMPUTE_UNITS;
         assertEquals("an unreported core count keeps one slice", 1,
-                SplitKGemmPlan.smallTileSplitsFor(unknown, 40, 1, 9728));
-        expectInvalid("non-negative", () -> SplitKGemmPlan.smallTileSplitsFor(-1, 40, 1, 9728));
+                SplitKGemmPlan.smallTileSplitsFor(unknown, 40, 1, 9728, MmqConfig.TOKEN_LANES));
+        expectInvalid("non-negative", () -> SplitKGemmPlan.smallTileSplitsFor(-1, 40, 1, 9728,
+                MmqConfig.TOKEN_LANES));
     }
 
-    /** The small-token-tile plan keeps the device tile's KSplit kernel and slices K across the cap. */
+    /** The 17..64-token band of the heuristic splits every grid of up to six waves at the cap: the
+     * measured RTX 5080 Laptop 64-token twins keep gaining far past one wave (Q4_K n=24 over 60
+     * units: 4096x2560 65.8us as 8 slices vs 91.6 whole, 2560x9728 146.1 vs 287.9; the 152-tile
+     * 9728x2560 runs 133.2us at 8 slices vs 148.4 at 4), while the 2374-tile head past the wave
+     * bound stays whole. Small K keeps one slice (launches below {@link SplitKGemmPlan#MIN_SPLIT_K}
+     * run the 16-token twin by {@link MmqConfig#twinTokens(int, int)}, so the 64-token band only
+     * ever sees K past the threshold). */
+    @Test
+    public void theTwin64HeuristicSplitsEveryGridOfSixWaves() {
+        int units = 48;
+        assertEquals("a 40-tile grid splits at the cap",
+                SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 9728,
+                        MmqConfig.TWIN_MAX_TOKENS));
+        assertEquals("a 152-tile grid (2.9 waves over 48 units) splits at the cap too",
+                SplitKGemmPlan.MAX_SPLITS, SplitKGemmPlan.smallTileSplitsFor(units, 152, 1, 9728,
+                        MmqConfig.TWIN_MAX_TOKENS));
+        assertEquals("a grid past six waves keeps one slice", 1,
+                SplitKGemmPlan.smallTileSplitsFor(units, 289, 1, 9728, MmqConfig.TWIN_MAX_TOKENS));
+        assertEquals("small K keeps one slice", 1, SplitKGemmPlan.smallTileSplitsFor(units, 40, 1, 2047,
+                MmqConfig.TWIN_MAX_TOKENS));
+        assertEquals("an unreported core count keeps one slice", 1,
+                SplitKGemmPlan.smallTileSplitsFor(DeviceCapabilities.UNKNOWN_COMPUTE_UNITS, 40, 1, 9728,
+                        MmqConfig.TWIN_MAX_TOKENS));
+    }
+
+    /** The small-token-tile plan runs the twin tile's _SKSplit kernel over the twin's grid and slices
+     *  K across the cap; the 17..64-token launches run the 64-token twin's _SKSplit64. */
     @Test
     public void theSmallTilePlanSlicesKAcrossTheDeviceTileKernel() {
         MmqGemmPlan base = MmqGemmPlan.of(MmqConfig.INT8_TENSOR, GGMLType.Q8_0, 2560, 9728, 9,
                 MmqConfig.INT8_TENSOR.rowRecords(9728), 0, 2560, 0);
         SplitKGemmPlan p = SplitKGemmPlan.ofSmallTiles(base, 48, 256);
-        assertNotNull("a 40-tile grid over 48 units splits", p);
-        assertEquals("Q8_0_MatMul_MMQ_KSplit", p.kernelName());
+        MmqConfig twin = MmqConfig.smallTile(MmqConfig.INT8_TENSOR);
+        assertNotNull("a 40-tile twin grid over 48 units splits", p);
+        assertEquals("Q8_0_MatMul_MMQ_SKSplit", p.kernelName());
+        assertEquals(twin, p.stagedConfig());
+        assertEquals(twin.tileTokens(), p.stagedConfig().tileTokens());
+        assertEquals("9 tokens need 1 twin tile", 1, p.tokenTiles());
         assertEquals(SplitKGemmPlan.MAX_SPLITS, p.splits());
         assertEquals("slices are whole stage depths", 0, p.kSlice() % MmqConfig.INT8_TENSOR.stageDepth());
         assertTrue("the last slice is not empty", (long) p.kSlice() * (p.splits() - 1) < p.k());
-        assertArrayEquals(new long[]{40L * 256 * p.splits(), 1}, p.partialGlobalWorkSize());
+        assertArrayEquals(new long[]{40L * twin.workGroupSize() * p.splits(), 1},
+                p.partialGlobalWorkSize());
         assertNotNull("a full-wave grid splits too (the tail wave quantization)",
                 SplitKGemmPlan.ofSmallTiles(MmqGemmPlan.of(MmqConfig.INT8_TENSOR, GGMLType.Q8_0, 3072, 9728, 9,
                         MmqConfig.INT8_TENSOR.rowRecords(9728), 0, 3072, 0), 48, 256));
         assertNull("a grid past 1.3 waves keeps the plain kernel",
-                SplitKGemmPlan.ofSmallTiles(MmqGemmPlan.of(MmqConfig.INT8_TENSOR, GGMLType.Q8_0, 4864, 9728, 9,
-                        MmqConfig.INT8_TENSOR.rowRecords(9728), 0, 4864, 0), 48, 256));
+                SplitKGemmPlan.ofSmallTiles(MmqGemmPlan.of(MmqConfig.INT8_TENSOR, GGMLType.Q8_0, 8192, 9728, 9,
+                        MmqConfig.INT8_TENSOR.rowRecords(9728), 0, 8192, 0), 48, 256));
         SplitKGemmPlan w4a8 = SplitKGemmPlan.ofW4a8SmallTiles(GGMLType.MXFP4, 2560, 4096, 9, 128, 0,
                 MmqConfig.INT8_TENSOR, 48, 256);
         assertNotNull(w4a8);
-        assertEquals("MXFP4_MatMul_W4A8_KSplit", w4a8.kernelName());
+        assertEquals("MXFP4_MatMul_W4A8_SKSplit", w4a8.kernelName());
         assertEquals(SplitKGemmPlan.MAX_SPLITS, w4a8.splits());
+    }
+
+    /** A launch of 17..64 tokens splits the 64-token twin's _SKSplit64 at the cap, and a 64-token
+     *  device tile (whose plain kernel is that tile) keeps the plain launch. */
+    @Test
+    public void theTwin64PlanSlicesThe64TokenTwinKernel() {
+        MmqGemmPlan base = MmqGemmPlan.of(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 2560, 9728, 24,
+                MmqConfig.INT8_TENSOR.rowRecords(9728), 0, 2560, 0);
+        SplitKGemmPlan p = SplitKGemmPlan.ofSmallTiles(base, 48, 256);
+        MmqConfig twin64 = MmqConfig.smallTile(MmqConfig.INT8_TENSOR, MmqConfig.TWIN_MAX_TOKENS);
+        assertNotNull("the 40-tile S64 grid over 48 units splits", p);
+        assertEquals("Q4_K_MatMul_MMQ_SKSplit64", p.kernelName());
+        assertEquals(twin64, p.stagedConfig());
+        assertEquals("24 tokens need 1 S64 tile", 1, p.tokenTiles());
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, p.splits());
+        assertArrayEquals(new long[]{40L * twin64.workGroupSize() * p.splits(), 1},
+                p.partialGlobalWorkSize());
+
+        SplitKGemmPlan w4a8 = SplitKGemmPlan.ofW4a8SmallTiles(GGMLType.MXFP4, 2560, 4096, 48, 128, 0,
+                MmqConfig.INT8_TENSOR, 48, 256);
+        assertNotNull(w4a8);
+        assertEquals("MXFP4_MatMul_W4A8_SKSplit64", w4a8.kernelName());
+        assertEquals(SplitKGemmPlan.MAX_SPLITS, w4a8.splits());
+
+        /* The 64-token CDNA tile is the widest twin row: no twin serves it, the plain kernel runs. */
+        MmqGemmPlan cdna = MmqGemmPlan.of(MmqConfig.CDNA, GGMLType.Q4_K, 2560, 9728, 24,
+                MmqConfig.CDNA.rowRecords(9728), 0, 2560, 0);
+        assertNull(SplitKGemmPlan.ofSmallTiles(cdna, 48, 256));
+        assertNull(SplitKGemmPlan.ofW4a8SmallTiles(GGMLType.MXFP4, 2560, 4096, 24, 128, 0,
+                MmqConfig.CDNA, 48, 256));
+        assertNotNull("a 9-token launch keeps the 16-token twin on the same tile",
+                SplitKGemmPlan.ofSmallTiles(MmqGemmPlan.of(MmqConfig.CDNA, GGMLType.Q4_K, 2560, 9728, 9,
+                        MmqConfig.CDNA.rowRecords(9728), 0, 2560, 0), 48, 256));
     }
 
     @Test

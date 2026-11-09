@@ -24,9 +24,9 @@ import java.util.Objects;
  * {@code TM = config.tileRows()}, {@code TN = config.tileTokens()} and {@code WG =
  * config.workGroupSize()}. The dispatch is 2-D and therefore never folded on Vulkan, so
  * {@link #checkDevice} verifies the group counts against {@code maxWorkGroupCount}. {@link #smallOf}
- * plans the same launch over {@link MmqConfig#smallTile}'s 16-token tile, the {@code <T>_MatMul_MMQ_S}
- * twin the host serves staged launches of fewer tokens than the device tile with (llama.cpp picks its
- * J tile per launch, ggml_cuda_mmq_get_J_best).</p>
+ * plans the same launch over {@link MmqConfig#smallTile}'s twin tiles, the {@code <T>_MatMul_MMQ_S}
+ * 16-token twin and the S64 64-token twin the host serves staged launches of fewer tokens than the
+ * device tile with (llama.cpp picks its J tile per launch, ggml_cuda_mmq_get_J_best).</p>
  */
 public final class MmqGemmPlan {
 
@@ -107,6 +107,23 @@ public final class MmqGemmPlan {
                                       int yStride, int yOff) {
         return plan(MmqConfig.smallTile(config), GemmKernels.matmulMmqSmall(type), type, m, k, n, qStride, qOff,
                 yStride, yOff);
+    }
+
+    /**
+     * Plans the launch of the small-token-tile twin at the given twin width: as {@link #smallOf}
+     * over {@link MmqConfig#smallTile(MmqConfig, int)}'s tile — the 16-token {@code <T>_MatMul_MMQ_S}
+     * at 16 tokens, the 64-token S64 twin at {@link MmqConfig#TWIN_MAX_TOKENS}. The caller picks the
+     * width with {@link MmqConfig#twinTokens(int, int)} and keeps the plain tile when the device tile is
+     * not wider than it.
+     *
+     * @param tokens  twin tile width, 16 or {@link MmqConfig#TWIN_MAX_TOKENS}
+     * @throws IllegalArgumentException as {@link #of}, when {@code tokens} is not a twin width or
+     *                                  when the device tile is not wider than it
+     */
+    public static MmqGemmPlan smallOf(MmqConfig config, GGMLType type, int tokens, int m, int k, int n, int qStride,
+                                      int qOff, int yStride, int yOff) {
+        return plan(MmqConfig.smallTile(config, tokens), GemmKernels.matmulMmqSmall(type, tokens), type, m, k, n,
+                qStride, qOff, yStride, yOff);
     }
 
     /** Shared validation and construction of the plain and small-tile forms. */

@@ -584,8 +584,8 @@ public class GpuOpsTest {
     public void mmqGridsUseTheTileConfigOfTheDevice() {
         assertEquals(MmqConfig.INT8_TENSOR, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 80));
         assertEquals(MmqConfig.PACKED_DOT, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 75));
-        assertEquals("sm_120 uses the 64-token int8-tensor tile",
-                64, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 120).tileTokens());
+        assertEquals("sm_120 uses the 128-token int8-tensor tile",
+                128, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 120).tileTokens());
         assertEquals("sm_75 uses the 16-token packed-dot tile",
                 16, MmqConfig.forDevice(ComputeBackend.BackendType.CUDA, 75).tileTokens());
         int[][] cases = {{120, 1}, {80, 1}, {75, 3}};       /* compute capability, tile columns of 40 tokens */

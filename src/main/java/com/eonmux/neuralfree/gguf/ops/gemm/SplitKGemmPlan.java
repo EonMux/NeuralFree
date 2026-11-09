@@ -30,14 +30,16 @@ import java.util.Objects;
  * <p>The heuristic that picks the split count (see {@link #splitsFor}) is llama.cpp's
  * {@code ggml_vk_guess_split_k}: only for K of 2048 and more, only while the tile grid fills less
  * than about two thirds of the device's compute units, capped at 8 slices. The staged launches of
- * fewer tokens than the device tile ({@link #ofSmallTiles}, {@link #ofW4a8SmallTiles}) split a grid
- * that fills less than about 1.3 waves instead: there each block's serial reduction over K is the
- * wall time, and llama.cpp spreads the same grids over the device with its stream-k kernel — at
- * one wave the ceil wave count double-books the tail SMs, and the slices remove that quantization
- * (kernel medians on the RTX 5080 Laptop, Q4_K 4096x2560 at 9..15 tokens: the 64-tile twin over 60
- * compute units runs 86-93us whole and 59-60us as 8 slices, while the 152-tile 9728x2560 twin runs
- * 101-110us whole and 119-125us sliced, so the split stops helping past about 1.3 waves). A device
- * that does not report its compute units ({@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS})
+ * fewer tokens than the device tile ({@link #ofSmallTiles}, {@link #ofW4a8SmallTiles}) split by
+ * their twin band instead ({@link #smallTileSplitsFor}): the 16-token band splits a grid that fills
+ * less than about 1.3 waves — there each block's serial reduction over K is the wall time, and
+ * llama.cpp spreads the same grids over the device with its stream-k kernel — at one wave the ceil
+ * wave count double-books the tail SMs, and the slices remove that quantization (kernel medians on
+ * the RTX 5080 Laptop, Q4_K 4096x2560 at 9..15 tokens: the 64-tile twin over 60 compute units runs
+ * 86-93us whole and 59-60us as 8 slices, while the 152-tile 9728x2560 twin runs 101-110us whole and
+ * 119-125us sliced, so the split stops helping past about 1.3 waves); the 17..64-token band splits
+ * every grid of up to six waves at 8 slices, whose half-size blocks keep gaining far past one wave.
+ * A device that does not report its compute units ({@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS})
  * is never split, as llama.cpp does with a {@code shader_core_count} of 0. Partial launch geometry:
  * {@code global = {ceil(M / TM) * WG * splits, ceil(N / tileTokens)}}, {@code local = {WG, 1}}, with
  * the family's tile: the MMA/CM tiles, or the staged MMQ lane's {@link MmqConfig} (TM, TN and WG);
@@ -55,6 +57,9 @@ public final class SplitKGemmPlan {
     static final int SMALL_WAVE_DEN = 10;
     /** Blocks per compute unit the small-token-tile split aims for (one occupancy-interleaved wave). */
     static final int SMALL_TILE_BLOCKS_PER_UNIT = 8;
+    /** Wave fill of the 64-token twin band under which a launch splits (tiles per compute unit of
+     *  the 17..64-token band; measured winners to 2.5 waves, the head at 40 waves stays whole). */
+    static final int TWIN64_SPLIT_WAVES = 6;
     /** Output elements per reduce work-item. */
     public static final int REDUCE_ELEMENTS_PER_ITEM = 4;
 
@@ -107,9 +112,23 @@ public final class SplitKGemmPlan {
             return (long) (k / type.getBlockSize()) * type.getTypeSize();
         }
 
-        /** The family's split-K kernel name for {@code type}. */
-        String kernelName(GGMLType type) {
-            return type.name() + suffix;
+        /** The family's split-K kernel name for {@code type}, the plain tile's form or, for a staged
+         *  family with {@code smallSplit}, the small tiles' {@code _SKSplit} form over the tile of
+         *  {@code tileTokens} tokens (16 or 64). */
+        String kernelName(GGMLType type, boolean smallSplit, int tileTokens) {
+            if (!smallSplit) {
+                return type.name() + suffix;
+            }
+            if (tileTokens == MmqConfig.TOKEN_LANES) {
+                return type.name() + (this == W4A8 ? GemmKernels.MATMUL_W4A8_SKSPLIT_SUFFIX
+                        : GemmKernels.MATMUL_MMQ_SKSPLIT_SUFFIX);
+            }
+            if (tileTokens == MmqConfig.TWIN_MAX_TOKENS) {
+                return type.name() + (this == W4A8 ? GemmKernels.MATMUL_W4A8_SKSPLIT64_SUFFIX
+                        : GemmKernels.MATMUL_MMQ_SKSPLIT64_SUFFIX);
+            }
+            throw new IllegalArgumentException("the small-token-tile split-K kernels come in "
+                    + MmqConfig.TOKEN_LANES + " and " + MmqConfig.TWIN_MAX_TOKENS + " tokens, got " + tileTokens);
         }
     }
 
@@ -130,13 +149,15 @@ public final class SplitKGemmPlan {
     private final int recordUnits;
     private final int reduceLocal;
     private final MmqConfig stagedConfig;
+    /** Whether the partial kernel is the staged small tiles' {@code _SKSplit} form. */
+    private final boolean smallSplit;
 
     private SplitKGemmPlan(Family family, GGMLType type, int m, int k, int n, int xStride, int xOff, int splits,
                            int kSlice, int tileRows, int tileTokens, int workGroupSize, int stageDepth,
-                           MmqConfig stagedConfig, int reduceLocal) {
+                           MmqConfig stagedConfig, boolean smallSplit, int reduceLocal) {
         this.family = family;
         this.type = type;
-        this.kernelName = family.kernelName(type);
+        this.kernelName = family.kernelName(type, smallSplit, tileTokens);
         this.m = m;
         this.k = k;
         this.n = n;
@@ -150,6 +171,7 @@ public final class SplitKGemmPlan {
         this.stageDepth = stageDepth;
         this.recordUnits = family.staged() ? stageDepth / 4 + 2 + stageDepth / 16 : 1;
         this.stagedConfig = stagedConfig;
+        this.smallSplit = smallSplit;
         this.reduceLocal = reduceLocal;
     }
 
@@ -195,7 +217,7 @@ public final class SplitKGemmPlan {
             throw new IllegalArgumentException((family == Family.MMA ? "no split-K MMA GEMM kernel"
                     : "no split-K CM GEMM kernel") + " for weight type " + type);
         }
-        return of(family, type, m, k, n, xStride, xOff, splits, kSlice, tileTokens, null, reduceLocal);
+        return of(family, type, m, k, n, xStride, xOff, splits, kSlice, tileTokens, null, false, reduceLocal);
     }
 
     /**
@@ -212,23 +234,29 @@ public final class SplitKGemmPlan {
             throw new IllegalArgumentException("no split-K MMQ GEMM kernel for weight type " + type);
         }
         return of(Family.MMQ, type, m, k, n, qStride, qOff, splits, kSlice, tileTokens,
-                MmqConfig.of(stageDepth, MmqGemmPlan.TILE_ROWS, tileTokens), reduceLocal);
+                MmqConfig.of(stageDepth, MmqGemmPlan.TILE_ROWS, tileTokens), false, reduceLocal);
     }
 
     /**
-     * Plans one raw split-K GEMM over the staged MMQ family with the staged tile {@code config}.
+     * Plans one raw split-K GEMM over the staged MMQ family with the staged tile {@code config}: the
+     * partial kernel is the one compiled at that tile — the plain tiles' {@code _KSplit} over the
+     * device tile, or the small tiles' {@code _SKSplit} over a small tile
+     * ({@link MmqConfig#smallTile}).
      *
+     * @param smallSplit true to name the small tiles' {@code _SKSplit} kernel (the staged tile is
+     *                   the small tile), false for the plain tiles' {@code _KSplit}
      * @throws IllegalArgumentException naming the violated condition
      */
     public static SplitKGemmPlan ofMmq(GGMLType type, int m, int k, int n, int qStride, int qOff,
-                                       int splits, int kSlice, MmqConfig config, int reduceLocal) {
+                                       int splits, int kSlice, MmqConfig config, boolean smallSplit,
+                                       int reduceLocal) {
         Objects.requireNonNull(type, "type");
         Objects.requireNonNull(config, "config");
         if (!GemmKernels.hasMmq(type)) {
             throw new IllegalArgumentException("no split-K MMQ GEMM kernel for weight type " + type);
         }
         return of(Family.MMQ, type, m, k, n, qStride, qOff, splits, kSlice, config.tileTokens(), config,
-                reduceLocal);
+                smallSplit, reduceLocal);
     }
 
     /**
@@ -241,7 +269,7 @@ public final class SplitKGemmPlan {
                                         int splits, int kSlice, int tileTokens, int stageDepth, int reduceLocal) {
         requireW4a8(type);
         return of(Family.W4A8, type, m, k, n, qStride, qOff, splits, kSlice, tileTokens,
-                MmqConfig.of(stageDepth, MmqGemmPlan.TILE_ROWS, tileTokens), reduceLocal);
+                MmqConfig.of(stageDepth, MmqGemmPlan.TILE_ROWS, tileTokens), false, reduceLocal);
     }
 
     /**
@@ -273,18 +301,28 @@ public final class SplitKGemmPlan {
         int rowTiles = (m + config.tileRows() - 1) / config.tileRows();
         int tokenTiles = (n + config.tileTokens() - 1) / config.tileTokens();
         int splits = splitsFor(computeUnits, rowTiles, tokenTiles, k);
-        return finished(Family.W4A8, type, m, k, n, qStride, qOff, splits, config.tileTokens(), config, reduceLocal);
+        return finished(Family.W4A8, type, m, k, n, qStride, qOff, splits, config.tileTokens(), config, false,
+                reduceLocal);
     }
 
-    /** {@link #ofSmallTiles} for a staged W4A8 launch of the staged tile {@code config}. */
+    /** {@link #ofSmallTiles} for a staged W4A8 launch: the small tile and grid of the device tile
+     *  {@code config} ({@link MmqConfig#smallTile} at the {@link MmqConfig#twinTokens(int, int)} width of
+     *  {@code n} over {@code k}, the {@code _SKSplit} kernel's tile), or null when the device tile is not wider
+     *  than that width and the plain launch has no twin to split. */
     public static SplitKGemmPlan ofW4a8SmallTiles(GGMLType type, int m, int k, int n, int qStride, int qOff,
                                                  MmqConfig config, int computeUnits, int reduceLocal) {
         requireW4a8(type);
         Objects.requireNonNull(config, "config");
-        int rowTiles = (m + config.tileRows() - 1) / config.tileRows();
-        int tokenTiles = (n + config.tileTokens() - 1) / config.tileTokens();
-        int splits = smallTileSplitsFor(computeUnits, rowTiles, tokenTiles, k);
-        return finished(Family.W4A8, type, m, k, n, qStride, qOff, splits, config.tileTokens(), config, reduceLocal);
+        int twinTokens = MmqConfig.twinTokens(n, k);
+        if (twinTokens >= config.tileTokens()) {
+            return null;
+        }
+        MmqConfig twin = MmqConfig.smallTile(config, twinTokens);
+        int rowTiles = (m + twin.tileRows() - 1) / twin.tileRows();
+        int tokenTiles = (n + twin.tileTokens() - 1) / twin.tileTokens();
+        int splits = smallTileSplitsFor(computeUnits, rowTiles, tokenTiles, k, twin.tileTokens());
+        return finished(Family.W4A8, type, m, k, n, qStride, qOff, splits, twin.tileTokens(), twin, true,
+                reduceLocal);
     }
 
     /** Checks that {@code type} has the W4A8 family's split-K twin. */
@@ -296,7 +334,8 @@ public final class SplitKGemmPlan {
     }
 
     private static SplitKGemmPlan of(Family family, GGMLType type, int m, int k, int n, int xStride, int xOff,
-                                     int splits, int kSlice, int tileTokens, MmqConfig staged, int reduceLocal) {
+                                     int splits, int kSlice, int tileTokens, MmqConfig staged, boolean smallSplit,
+                                     int reduceLocal) {
         if (family.staged() != (staged != null)) {
             throw new IllegalArgumentException((family.staged() ? "the staged " + family + " family"
                     : "the " + family + " family") + (staged != null ? " does not" : " must")
@@ -339,7 +378,7 @@ public final class SplitKGemmPlan {
                     + " exceed the int element offsets of the partial kernel");
         }
         return new SplitKGemmPlan(family, type, m, k, n, xStride, xOff, splits, kSlice, tileRows, tileTokens,
-                workGroupSize, stageDepth, staged, reduceLocal);
+                workGroupSize, stageDepth, staged, smallSplit, reduceLocal);
     }
 
     /**
@@ -356,44 +395,56 @@ public final class SplitKGemmPlan {
     public static SplitKGemmPlan of(MmaGemmPlan base, int computeUnits, int reduceLocal) {
         int splits = splitsFor(computeUnits, base.rowTiles(), base.tokenTiles(), base.k());
         return finished(Family.MMA, base.type(), base.m(), base.k(), base.n(), base.xStride(), base.xOff(), splits,
-                base.tileTokens(), null, reduceLocal);
+                base.tileTokens(), null, false, reduceLocal);
     }
 
     /** {@link #of(MmaGemmPlan, int, int)} for a quantized-weight CM launch. */
     public static SplitKGemmPlan of(CmGemmPlan base, int computeUnits, int reduceLocal) {
         int splits = splitsFor(computeUnits, base.rowTiles(), base.tokenTiles(), base.k());
         return finished(Family.CM, base.type(), base.m(), base.k(), base.n(), base.xStride(), base.xOff(), splits,
-                base.tileTokens(), null, reduceLocal);
+                base.tileTokens(), null, false, reduceLocal);
     }
 
     /** {@link #of(MmaGemmPlan, int, int)} for a staged MMQ launch (tile and stage depth of the base's config). */
     public static SplitKGemmPlan of(MmqGemmPlan base, int computeUnits, int reduceLocal) {
         int splits = splitsFor(computeUnits, base.rowTiles(), base.tokenTiles(), base.k());
         return finished(Family.MMQ, base.type(), base.m(), base.k(), base.n(), base.qStride(), base.qOff(), splits,
-                base.config().tileTokens(), base.config(), reduceLocal);
+                base.config().tileTokens(), base.config(), false, reduceLocal);
     }
 
     /**
      * Plans the split of a staged MMQ launch of fewer tokens than the device tile (the
-     * {@link MmqGemmPlan#smallOf} regime): there the tile grid covers one wave of the device at most,
-     * and each block's serial reduction over K is the wall time, so the launch splits K up to
-     * {@link #MAX_SPLITS} to give every compute unit several blocks (llama.cpp runs the same grids
-     * through its stream-k kernel, which spreads the reduction over the device the same way). A grid
-     * that fills its wave, a K below {@link #MIN_SPLIT_K} or a device without a compute-unit count
-     * keeps the plain kernel's shape (null, as {@link #of} returns).
+     * {@link MmqGemmPlan#smallOf} regime), over the small tile the launch runs
+     * ({@link MmqConfig#smallTile(MmqConfig, int)} at the {@link MmqConfig#twinTokens(int, int)} width of
+     * {@code base.n()} over {@code base.k()}: the {@code _SKSplit} / {@code _SKSplit64} kernel's tile): there the tile grid
+     * covers a wave of the device at most, and each block's serial reduction over K is the wall
+     * time, so the launch splits K up to {@link #MAX_SPLITS} to give every compute unit several
+     * blocks (llama.cpp runs the same grids through its stream-k kernel, which spreads the reduction
+     * over the device the same way). A K below {@link #MIN_SPLIT_K}, a device without a
+     * compute-unit count, a grid past the heuristic's wave fill, or a device tile that is not wider
+     * than the twin width of {@code base.n()} (so the launch runs the plain tile, not a twin) keeps
+     * or falls back to the plain kernel's shape (null, as {@link #of} returns).
      *
      * @param computeUnits compute units of the device, or {@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS}
-     * @return the plan, or null when the heuristic does not split
+     * @return the plan, or null when the heuristic does not split or the launch has no twin
      */
     public static SplitKGemmPlan ofSmallTiles(MmqGemmPlan base, int computeUnits, int reduceLocal) {
-        int splits = smallTileSplitsFor(computeUnits, base.rowTiles(), base.tokenTiles(), base.k());
+        int twinTokens = MmqConfig.twinTokens(base.n(), base.k());
+        if (twinTokens >= base.config().tileTokens()) {
+            return null;
+        }
+        MmqConfig twin = MmqConfig.smallTile(base.config(), twinTokens);
+        int rowTiles = (base.m() + twin.tileRows() - 1) / twin.tileRows();
+        int tokenTiles = (base.n() + twin.tileTokens() - 1) / twin.tileTokens();
+        int splits = smallTileSplitsFor(computeUnits, rowTiles, tokenTiles, base.k(), twin.tileTokens());
         return finished(Family.MMQ, base.type(), base.m(), base.k(), base.n(), base.qStride(), base.qOff(), splits,
-                base.config().tileTokens(), base.config(), reduceLocal);
+                twin.tileTokens(), twin, true, reduceLocal);
     }
 
     /** Steps the count down while its round-up would leave the last slice empty, as llama.cpp does. */
     private static SplitKGemmPlan finished(Family family, GGMLType type, int m, int k, int n, int xStride, int xOff,
-                                           int splits, int tileTokens, MmqConfig staged, int reduceLocal) {
+                                           int splits, int tileTokens, MmqConfig staged, boolean smallSplit,
+                                           int reduceLocal) {
         int depth = family.fixedSliceDepth() > 0 ? family.fixedSliceDepth()
                 : staged != null ? staged.stageDepth() : MmaGemmPlan.TILE_DEPTH;
         while (splits > 1 && (long) sliceLength(k, splits, depth) * (splits - 1) >= k) {
@@ -403,7 +454,7 @@ public final class SplitKGemmPlan {
             return null;
         }
         return of(family, type, m, k, n, xStride, xOff, splits, sliceLength(k, splits, depth), tileTokens, staged,
-                reduceLocal);
+                smallSplit, reduceLocal);
     }
 
     /**
@@ -438,16 +489,27 @@ public final class SplitKGemmPlan {
 
     /**
      * The small-token-tile slice count ({@link #ofSmallTiles}) for a tile grid of
-     * {@code rowTiles * tokenTiles} workgroups over a reduction of {@code k}: 1 for a K below the
-     * threshold, an unknown compute-unit count, or a grid past about 1.3 waves of the device
-     * ({@code SMALL_WAVE_NUM / SMALL_WAVE_DEN} of it and up, where the measured staged twins stop
-     * gaining from the slices); otherwise the count that gives every compute unit
-     * {@code SMALL_TILE_BLOCKS_PER_UNIT} blocks, capped at {@link #MAX_SPLITS}.
+     * {@code rowTiles * tokenTiles} workgroups over a reduction of {@code k}, with the tile of
+     * {@code tileTokens} tokens: 1 for a K below the threshold, an unknown compute-unit count, or a
+     * grid past the band's wave fill; otherwise the band's slice count.
+     *
+     * <p>Measured on the RTX 5080 Laptop (60 compute units, medians over 9 interleaved rounds of 10
+     * launches, staged activations included), the bands split differently. Up to 16 tokens the
+     * 16-token twin stops gaining past about 1.3 waves ({@code SMALL_WAVE_NUM / SMALL_WAVE_DEN}:
+     * Q4_K 9728x2560, 152 tiles, 86-93us whole vs 119-125us as 8 slices) and takes the count that
+     * gives every compute unit {@code SMALL_TILE_BLOCKS_PER_UNIT} blocks. From 17 to 64 tokens the
+     * 64-token twin keeps gaining far past one wave — its blocks are half the size, so the slices
+     * still fill the SMs — and every measured layer shape prefers the split at full
+     * {@link #MAX_SPLITS} slices (n=24 Q4_K: 4096x2560 65.8 vs 91.6us whole, 9728x2560 145.0 vs
+     * 172.6, 2560x9728 146.1 vs 287.9; at the 152-tile 9728x2560 8 slices beat 4 by 10%, 133.2 vs
+     * 148.4us). The split stops at {@code TWIN64_SPLIT_WAVES} waves: the only measured launch past
+     * it is the 151936x2560 head (2374 tiles), whose plain tile wins (n=48: 2923.1us whole vs
+     * 3692.8 twin; the head's partial planes would also add a 116MB reduce at 8 slices).
      *
      * @param computeUnits compute units of the device, or {@link DeviceCapabilities#UNKNOWN_COMPUTE_UNITS}
      * @throws IllegalArgumentException when {@code computeUnits} is negative
      */
-    static int smallTileSplitsFor(int computeUnits, int rowTiles, int tokenTiles, int k) {
+    static int smallTileSplitsFor(int computeUnits, int rowTiles, int tokenTiles, int k, int tileTokens) {
         if (computeUnits < DeviceCapabilities.UNKNOWN_COMPUTE_UNITS) {
             throw new IllegalArgumentException("split-K heuristic needs a non-negative compute-unit count"
                     + " (" + DeviceCapabilities.UNKNOWN_COMPUTE_UNITS + " when the device does not report one), got "
@@ -457,12 +519,18 @@ public final class SplitKGemmPlan {
             return 1;
         }
         long tiles = (long) rowTiles * tokenTiles;
-        if (tiles * SMALL_WAVE_DEN > (long) computeUnits * SMALL_WAVE_NUM) {
+        if (tileTokens <= MmqConfig.TOKEN_LANES) {
+            if (tiles * SMALL_WAVE_DEN > (long) computeUnits * SMALL_WAVE_NUM) {
+                return 1;
+            }
+            long blocks = (long) computeUnits * SMALL_TILE_BLOCKS_PER_UNIT;
+            int splits = (int) Math.min(MAX_SPLITS, Math.round((double) blocks / Math.max(1L, tiles)));
+            return Math.max(1, splits);
+        }
+        if (tiles > (long) computeUnits * TWIN64_SPLIT_WAVES) {
             return 1;
         }
-        long blocks = (long) computeUnits * SMALL_TILE_BLOCKS_PER_UNIT;
-        int splits = (int) Math.min(MAX_SPLITS, Math.round((double) blocks / Math.max(1L, tiles)));
-        return Math.max(1, splits);
+        return MAX_SPLITS;
     }
 
     /**

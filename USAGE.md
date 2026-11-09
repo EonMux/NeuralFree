@@ -499,12 +499,18 @@ A device of another vendor or class, or a type a kind does not list, keeps the d
 the int8 multi-column matvec below it (up to 8 rows without a fast lane), no float multi-column matvec, and the exact
 tiled GEMM from 8 rows (`TILED_MIN_TOKENS`) where no fast lane runs. Rows below the lanes take the batched matvec.
 If a kernel is unavailable the projection falls back automatically: fast GEMM → tiled GEMM → batched matvec. Steps narrower than the device's
-token tile, such as a speculative verify, run the 16-token twins `<T>_MatMul_MMQ_S` and `<T>_MatMul_W4A8_S` on a
-shared record tile, split along K when their grid would not fill about 1.3 waves of the device; the weight stream is
-a depth-2 software pipeline, so the next tile's loads overlap the current tile's dot products, and each 4-bit word
-decodes in two ALU ops. On an RTX 5080 Laptop a 9-row decode step of a Qwen3 4B model takes 14.3 ms in Q8_0 and 19.8 ms in
-Q4_K_M (llama.cpp 10.3 and 7.9), a 16-row step 21.0 and 28.4 ms (llama.cpp 10.5 and 8.7); a 512-token prefill runs
-2676 t/s in Q8_0 (llama.cpp 3069) and 2493 t/s in Q4_K_M (llama.cpp 7712).
+token tile run a twin of the plain kernel on a shared record tile of 64 rows (256 work-items), chosen per launch by
+`MmqConfig.twinTokens`: steps of at most 16 tokens (such as a speculative verify) run the 16-token twins
+`<T>_MatMul_MMQ_S` and `<T>_MatMul_W4A8_S`, split along K into `<T>_MatMul_MMQ_SKSplit` planes when their grid would
+not fill about 1.3 waves of the device; steps of 17 to 64 tokens run the 64-token twins `<T>_MatMul_MMQ_S64` and
+`<T>_MatMul_W4A8_S64`, and every grid of up to six waves splits along K into up to eight `<T>_MatMul_MMQ_SKSplit64`
+planes. On a reduction shorter than the split-K threshold (K below 2048, no split to fill the grid) the
+16-token twin serves up to 48 tokens, where the 64-token tile would leave a quarter of its token columns empty.
+Wider steps run the plain tile. The weight stream is a software pipeline, so the next tile's loads overlap the
+current tile's dot products, and each 4-bit word decodes in two ALU ops. On an RTX 5080 Laptop (CUDA) a 9-row decode step of one Qwen3 4B sequence takes 13.3 ms in Q8_0 and
+18.3 ms in Q4_K_M, a 16-row step 20.0 and 27.0 ms (`llama-batched-bench -npp 1 -ntg 128`: 9.8 and 7.5 ms at 9 rows,
+10.5 and 8.2 at 16); a 512-token prefill (`nftool bench -p 512`) runs 2894 t/s in Q8_0 (`llama-bench` 9639) and
+2758 t/s in Q4_K_M (llama.cpp 9140).
 
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
@@ -523,7 +529,8 @@ keep their tiled kernels (llama.cpp's MMQ does not serve them), except the E4M3 
 Before the MMQ GEMM, one `LLM_Quant_MMQ_Q8_1` launch quantizes every token row of the projection
 once (llama.cpp `quantize_mmq_q8_1`), unless the checkpoint's activation scheme stages its own int8 codes
 ([activation quantization](#activation-quantization)), and every row tile reads those 8-bit codes. On CUDA sm_80+
-the tensor tile is 64 tokens wide over 32-deep stages; other devices use 16 × 16 tiles, following
+the tensor tile is 128 rows × 128 tokens over a depth-3 software pipeline of 32-deep stages, so each weight word
+decodes once per 128-token tile (four times at a 512-token projection); other devices use 16 × 16 tiles, following
 llama.cpp's per-architecture MMQ configuration.
 
 When a checkpoint carries an activation quantization scheme (`<base>.input_scale`, `<base>.input_zero_point`, as
@@ -941,7 +948,7 @@ A context set with `neuralfree.ctx` is honored as given: the fit moves weights t
 
 A split keeps the last layers on the device and runs the earlier ones on the CPU engine, as llama.cpp's `-ngl` does. Each side holds the KV cache of its own layers, and the residual stream crosses between them once per forward step, so host layers compute at RAM bandwidth instead of streaming their weights over the bus every token.
 
-- `neuralfree.n.gpu.layers` (`--gpu-layers`, `-ngl`): `auto`, `all`, or a count. The count includes the output head as in llama.cpp, so `-ngl 8` puts 7 trunk layers on the device. `-ngl 0` is refused; open the model with `neuralfree.backend=cpu` instead. The context fit charges only the offloaded layers' KV, so a split fits a larger context than a full offload.
+- `neuralfree.n.gpu.layers` (`--gpu-layers`, `-ngl`): `auto`, `all`, or a count. The count includes the output head as in llama.cpp, so `-ngl 8` puts 7 trunk layers on the device. A count past the model's layers offloads the model whole, as llama.cpp's `-ngl 99` does: it is clamped to every trunk layer plus the output head, like `all`, and does not run the `auto` memory search. `-ngl 0` is refused; open the model with `neuralfree.backend=cpu` instead. The context fit charges only the offloaded layers' KV, so a split fits a larger context than a full offload.
 - `neuralfree.override.tensor` (`--override-tensor`, `-ot`): comma-separated `pattern=target` entries, the target one of `cpu`, `gpu`, `opencl`, `cuda`, `vulkan`, `hip`, `metal` or an accelerator API (`sycl`, `xpu`, `cann`, `hexagon`, `openvino`, `webgpu`, `musa`, `zdnn`, `zendnn`). Every target but `cpu` keeps the matched tensors on the device side, on the devices the load selected: the name states the placement, not a particular device. Patterns are regular expressions matched against stored tensor names (`blk.5.attn_k.weight`), and the first match wins. A layer computes as one block on one side, so a `cpu` match keeps the tensor's whole layer on the host, together with every earlier layer: the host layers are always a prefix. A `cpu` match on a routed expert tensor (`ffn_(up|down|gate|gate_up)_exps`) is the exception: the experts stay in RAM beside their device layer, as `--cpu-moe` keeps them. A `gpu` match shields its tensor from later rules. llama.cpp pattern strings work verbatim, for example `-ot "blk\.[0-3]\.ffn_down_exps=CPU"`.
 - `neuralfree.cpu.moe` (`--cpu-moe`) and `neuralfree.n.cpu.moe` (`--n-cpu-moe <n>`): keep the expert weights of every MoE layer, or of the first `n`, on the host. The layer stays on the device; at its FFN the selected experts' input rows cross to the host, the CPU MoE block computes them, and the result crosses back. Two small activation transfers replace the per-token streaming of the expert weights.
 - `neuralfree.n-cpu-ffn` (`--n-cpu-ffn`, `-ncffn <n>`): keep the dense FFN weights of the first `n` layers in RAM (dense models).
@@ -2218,10 +2225,11 @@ Only the operator installs processors (the flag, the property or a jar on the cl
 **When speculation pays.** A round costs one verify forward of `k + 1` rows plus `k` drafter decodes and emits the
 confirmed drafts plus one token, so it beats plain decoding only when the drafter is confirmed often enough. On the
 RTX 5080 Laptop with a Qwen3 4B Q8_0 target and a 0.6B Q8_0 drafter at `--draft-max 8`, a 9-row verify costs about
-2.1 plain decode steps of device time on CUDA and 4.0 on OpenCL, so the pair needs about 55% of drafted tokens
-confirmed to break even on CUDA and about 70% on OpenCL; it reaches 20-37%, so the chain stays slower than plain
-decoding on this pair. Short drafts pay off sooner: on CUDA a 2-row or 4-row verify of the Q8_0 target costs 1.3x
-or 2.0x a decode step. The drafter picks its
+1.3 plain decode steps of device time on CUDA and 2.5 on OpenCL, and a drafter decode about 0.3 of a target step on
+both, so a round costs about 3.7 target steps on CUDA and 5.0 on OpenCL. Emitting `a·8 + 1` tokens, the pair needs
+about 33% of drafted tokens confirmed to break even on CUDA and about 50% on OpenCL; it reaches 20-37%, so the
+chain is at best even with plain decoding on CUDA and slower on OpenCL for this pair. Short drafts cost less per
+round: on CUDA a 2-row or 4-row verify of the Q8_0 target costs about 1.05x a decode step. The drafter picks its
 token from 10 candidates read back from the device, not the full logits row, under greedy drafting over the
 target's vocabulary.
 
@@ -4075,7 +4083,7 @@ The header's `backend = ...` names the backend the model opened on.
 
 | Option | Meaning |
 |---|---|
-| `-npp`, `-ntg`, `-npl` | comma-separated prompt, generated and parallel counts (required; repeatable, they append) |
+| `-npp`, `-ntg`, `-npl` | comma-separated prompt, generated and parallel counts (required; repeatable, they append; `-npp` and `-ntg` also take 0) |
 | `-pps` | prefill one prompt and share it across the sequences (page copy); `n_kv = pp + pl*tg`, `S_PP = pp/T_PP` |
 | `-tgs` | decode the sequences one after another instead of one step for all |
 | `-c`, `--ctx` | context the sequences share (`n_kv_max`); default 0, the model's trained context |
@@ -4087,6 +4095,8 @@ The header's `backend = ...` names the backend the model opened on.
 | `-fa on\|auto` | flash attention, which is always on; `-fa off` is refused |
 
 A cell is skipped, with a note on stderr, when its `n_kv` exceeds `n_kv_max`, when `pp + tg` exceeds one sequence's cap, or when the paged pools run out during the cell. The pools allocate whole pages (`neuralfree.kv.page.size`, default 16 rows), so partial pages can exhaust them below `n_kv_max`.
+
+`-npp 0` measures generation only: no prompt phase runs, the decode steps start at position 0, and the cell prints ~0 s for `T_PP s` and 0.00 for `S_PP t/s` (the cell carries no prompt tokens), as llama.cpp's batched-bench does.
 
 A layer count below the model's layers (`-ngl <n>`) asks for a hybrid CPU+GPU split. Paged memory does not run over a split: the GPU load is refused, logged, and the bench falls back to the CPU engine. Use `-ngl all` or `-ngl auto`.
 
@@ -8224,7 +8234,7 @@ Per weight tensor the file holds, under the stored GGUF names, with one matrix p
 | `--output-format gguf\|dat` | The GGUF form or the legacy pre-GGUF binary | `gguf` |
 | `--ctx-size <n>` | Window length in tokens; a warning above the trained context | 512 |
 | `-b`, `--batch-size <n>` | Tokens per decode: below `--ctx-size` or a multiple of it. A multiple runs `n / ctx-size` windows per decode as parallel sequences (at most 256). Below 16, only the routed experts are collected | 2048 |
-| `-ngl`, `--n-gpu-layers <n\|auto\|all>` | 0 runs the CPU engine; any other value runs the GPU engine with that many layers on the device | 0 |
+| `-ngl`, `--n-gpu-layers <n\|auto\|all>` | 0 runs the CPU engine; any other value runs the GPU engine with that many layers on the device, a count past the model's layers offloading it whole as llama.cpp does | 0 |
 | `-ot`, `--override-tensor <pattern=cpu\|gpu,...>` | GPU engine: keep the matching tensors in host or device memory, as `nftool chat` takes it | |
 | `--cpu-moe`, `--n-cpu-moe <n>` | GPU engine: keep the routed experts of every layer, or of the first `n` layers, in host memory; they are collected through the CPU tap | off |
 | `--moe-cache <off\|on\|auto\|MiB>`, `--moe-cache-mib <n>` | GPU engine: the MoE expert cache, as `nftool chat` takes it; its layers are collected through the CPU tap | |

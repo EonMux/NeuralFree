@@ -8,7 +8,6 @@ import com.eonmux.neuralfree.acceleration.cuda.CUDevice;
 import com.eonmux.neuralfree.acceleration.kernels.Availability;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
-import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.quant.BlockLayout;
 import com.eonmux.neuralfree.gguf.quant.FpBlockDecoders;
@@ -49,6 +48,9 @@ public class MmqSmallTileMeasureTest {
     };
     private static final GGMLType[] TYPES = {GGMLType.Q8_0, GGMLType.Q4_K};
     private static final int[] SPLITS = {2, 4, 8};
+    /** Token counts the lanes are timed at: the counted-matvec band and the mid batches up to the
+     *  plain tile's width (the 17..128 band the tile ladder must serve). */
+    private static final int[] TOKEN_COUNTS = {9, 12, 16, 17, 20, 24, 28, 32, 48, 64, 96};
 
     private HWAcceleration hwAccel;
     private CudaComputeBackend backend;
@@ -128,7 +130,7 @@ public class MmqSmallTileMeasureTest {
         int rowBytes = cols / type.getBlockSize() * type.getTypeSize();
         byte[] weights = weights(type, rows, rowBytes);
         float[] x = activations(cols);
-        int maxTokens = LlmKernelConstants.MATVEC_N_MAX_TOKENS;
+        int maxTokens = TOKEN_COUNTS[TOKEN_COUNTS.length - 1];
         GpuBuffer wBuf = null;
         GpuBuffer xBuf = null;
         GpuBuffer yBuf = null;
@@ -146,7 +148,7 @@ public class MmqSmallTileMeasureTest {
             backend.computeQueue().enqueueWriteBuffer(wBuf, 0, weights.length, weights).awaitCompletion();
             backend.computeQueue().enqueueWriteBuffer(xBuf, 0, (long) x.length * 4, x).awaitCompletion();
             long weightBytes = (long) rows * rowBytes;
-            for (int n = 2; n <= maxTokens; n += n == 8 ? 1 : n >= 8 ? 3 : 2) {
+            for (int n : TOKEN_COUNTS) {
                 measureTokenCount(type, rows, cols, n, weightBytes, wBuf, xBuf, yBuf, qBuf, staged, partial);
             }
         } finally {
@@ -166,20 +168,24 @@ public class MmqSmallTileMeasureTest {
         List<Lane> lanes = new ArrayList<>();
         MmqGemmPlan plain = MmqGemmPlan.contiguous(config, type, rows, cols, n);
         if (kernels.has(plain.kernelName())) {
-            lanes.add(new Lane("mmq64", weightBytes, () -> {
+            lanes.add(new Lane("mmq" + config.tileTokens(), weightBytes, () -> {
                 stage.run();
                 backend.computeQueue().enqueueKernel(kernels.get(plain.kernelName()), plain.globalWorkSize(),
                         plain.localWorkSize(), plain.args(wBuf, staged, yBuf));
             }));
         }
         if (config.tileTokens() > MmqConfig.TOKEN_LANES) {
-            MmqGemmPlan small = MmqGemmPlan.smallOf(config, type, rows, cols, n, rowRecords, 0, rows, 0);
-            if (kernels.has(small.kernelName())) {
-                lanes.add(new Lane("mmq16", weightBytes, () -> {
-                    stage.run();
-                    backend.computeQueue().enqueueKernel(kernels.get(small.kernelName()),
-                            small.globalWorkSize(), small.localWorkSize(), small.args(wBuf, staged, yBuf));
-                }));
+            int twinTokens = MmqConfig.twinTokens(n, cols);
+            if (twinTokens < config.tileTokens()) {
+                MmqGemmPlan small = MmqGemmPlan.smallOf(config, type, twinTokens, rows, cols, n, rowRecords, 0,
+                        rows, 0);
+                if (kernels.has(small.kernelName())) {
+                    lanes.add(new Lane("mmq" + twinTokens, weightBytes, () -> {
+                        stage.run();
+                        backend.computeQueue().enqueueKernel(kernels.get(small.kernelName()),
+                                small.globalWorkSize(), small.localWorkSize(), small.args(wBuf, staged, yBuf));
+                    }));
+                }
             }
         }
         int rowTiles = (rows + config.tileRows() - 1) / config.tileRows();
@@ -188,7 +194,7 @@ public class MmqSmallTileMeasureTest {
                 continue;
             }
             SplitKGemmPlan split = SplitKGemmPlan.ofMmq(type, rows, cols, n, rowRecords, 0, splits,
-                    SplitKGemmPlan.sliceLength(cols, splits, config.stageDepth()), config, local);
+                    SplitKGemmPlan.sliceLength(cols, splits, config.stageDepth()), config, false, local);
             if (!kernels.has(split.kernelName()) || !kernels.has(GemmKernels.SPLIT_K_REDUCE)) {
                 continue;
             }
@@ -201,6 +207,33 @@ public class MmqSmallTileMeasureTest {
                         split.reduceGlobalWorkSize(), split.reduceLocalWorkSize(),
                         split.reduceArgs(partial, yBuf, rows, 0));
             }));
+        }
+        if (config.tileTokens() > MmqConfig.TOKEN_LANES) {
+            int twinTokens = MmqConfig.twinTokens(n, cols);
+            if (twinTokens < config.tileTokens()) {
+                MmqConfig twin = MmqConfig.smallTile(config, twinTokens);
+                int twinRowTiles = (rows + twin.tileRows() - 1) / twin.tileRows();
+                int twinTokenTiles = (n + twin.tileTokens() - 1) / twin.tileTokens();
+                for (int splits : SPLITS) {
+                    if (splits > 1 && (long) twinRowTiles * twinTokenTiles * splits > 4096L) {
+                        continue;
+                    }
+                    SplitKGemmPlan split = SplitKGemmPlan.ofMmq(type, rows, cols, n, rowRecords, 0, splits,
+                            SplitKGemmPlan.sliceLength(cols, splits, twin.stageDepth()), twin, true, local);
+                    if (!kernels.has(split.kernelName())) {
+                        continue;
+                    }
+                    lanes.add(new Lane("sksplit" + twinTokens + "/" + splits, weightBytes, () -> {
+                        stage.run();
+                        backend.computeQueue().enqueueKernelNoEvent(kernels.get(split.kernelName()),
+                                split.partialGlobalWorkSize(), split.partialLocalWorkSize(),
+                                split.partialArgs(wBuf, staged, partial));
+                        backend.computeQueue().enqueueKernelNoEvent(kernels.get(GemmKernels.SPLIT_K_REDUCE),
+                                split.reduceGlobalWorkSize(), split.reduceLocalWorkSize(),
+                                split.reduceArgs(partial, yBuf, rows, 0));
+                    }));
+                }
+            }
         }
         String runtime = type.name() + "_MatVecN_Q8";
         if (kernels.has(runtime)) {

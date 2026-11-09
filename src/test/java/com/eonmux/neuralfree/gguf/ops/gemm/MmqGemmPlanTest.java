@@ -58,10 +58,16 @@ public class MmqGemmPlanTest {
         assertEquals("F16_MatMul_MMA_KSplit", GemmKernels.matmulMmaKSplit(GGMLType.F16));
         assertEquals("BF16_MatMul_MMA_KSplit", GemmKernels.matmulMmaKSplit(GGMLType.BF16));
         assertEquals("Q4_K_MatMul_MMQ_S", GemmKernels.matmulMmqSmall(GGMLType.Q4_K));
+        assertEquals("Q4_K_MatMul_MMQ_S64", GemmKernels.matmulMmqSmall(GGMLType.Q4_K, MmqConfig.TWIN_MAX_TOKENS));
+        assertEquals("MXFP4_MatMul_W4A8_S64",
+                GemmKernels.matmulW4a8Small(GGMLType.MXFP4, MmqConfig.TWIN_MAX_TOKENS));
         List<String> names = GemmKernels.kernelNames();
         assertTrue(names.contains("Q4_K_MatMul_MMQ"));
         assertTrue(names.contains("Q4_K_MatMul_MMQ_KSplit"));
         assertTrue(names.contains("Q4_K_MatMul_MMQ_S"));
+        assertTrue(names.contains("Q4_K_MatMul_MMQ_S64"));
+        assertTrue(names.contains("Q4_K_MatMul_MMQ_SKSplit64"));
+        assertTrue(names.contains("MXFP4_MatMul_W4A8_SKSplit64"));
         assertTrue(names.contains("F16_MatMul_MMA"));
         assertTrue(names.contains("BF16_MatMul_MMA"));
         assertTrue(names.contains("Q4_K_MatMul_CM"));
@@ -74,8 +80,8 @@ public class MmqGemmPlanTest {
         assertTrue(names.contains("LLM_Quant_MMQ_Int8Group128"));
         assertTrue(names.contains("LLM_SplitK_Reduce"));
         assertTrue(names.contains(GemmKernels.LOGITS_PREFILTER));
-        assertEquals(GemmKernels.TILED_TYPES.size() + GemmKernels.MMQ_TYPES.size() * 5
-                        + GemmKernels.FP8_TYPES.size() * 3 + GemmKernels.W4A8_TYPES.size() * 3
+        assertEquals(GemmKernels.TILED_TYPES.size() + GemmKernels.MMQ_TYPES.size() * 8
+                        + GemmKernels.FP8_TYPES.size() * 6 + GemmKernels.W4A8_TYPES.size() * 6
                         + GemmKernels.MMA_TYPES.size() * 2 + 15, names.size());
     }
 
@@ -133,31 +139,50 @@ public class MmqGemmPlanTest {
     }
 
     @Test
-    public void theTensorConfigTilesSixtyFourTokens() {
+    public void theTensorConfigTilesOneHundredTwentyEightTokens() {
         MmqGemmPlan p = MmqGemmPlan.contiguous(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 4096 + 1, 4096, 33);
-        assertEquals("33 tokens fit one 64-token tile", 1, p.tokenTiles());
-        assertArrayEquals(new long[]{65L * 256, 1}, p.globalWorkSize());
+        assertEquals("33 tokens fit one 128-token tile", 1, p.tokenTiles());
+        assertArrayEquals(new long[]{33L * 512, 1}, p.globalWorkSize());
         assertEquals(MmqConfig.INT8_TENSOR, p.config());
-        MmqGemmPlan wide = MmqGemmPlan.contiguous(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 4096, 4096, 65);
-        assertEquals("65 tokens need two 64-token tiles", 2, wide.tokenTiles());
-        assertEquals("the tensor stage is 32 deep: 65 rows of 128 records of 12 units",
-                65L * 128 * 12, wide.q8ElementsRequired());
+        MmqGemmPlan wide = MmqGemmPlan.contiguous(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 4096, 4096, 129);
+        assertEquals("129 tokens need two 128-token tiles", 2, wide.tokenTiles());
+        assertEquals("the tensor stage is 32 deep: 129 rows of 128 records of 12 units",
+                129L * 128 * 12, wide.q8ElementsRequired());
     }
 
-    /** The small-tile twin launches the {@code _S} kernel over 16-token tiles of the device tile's rows. */
+    /** The small-tile twin launches the {@code _S} kernel over 16-token tiles of the 64-row twin tile. */
     @Test
     public void theSmallTileTwinPlansTheSuffixKernelOver16TokenTiles() {
-        MmqGemmPlan p = MmqGemmPlan.smallOf(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 4096 + 1, 4096, 33,
+        MmqGemmPlan p = MmqGemmPlan.smallOf(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, 4096 + 1, 4096, 16,
                 128, 0, 4097, 0);
         assertEquals("Q4_K_MatMul_MMQ_S", p.kernelName());
         assertEquals(MmqConfig.smallTile(MmqConfig.INT8_TENSOR), p.config());
-        assertEquals("33 tokens need three 16-token tiles", 3, p.tokenTiles());
-        assertEquals(65, p.rowTiles());
-        assertArrayEquals(new long[]{65L * 256, 3}, p.globalWorkSize());
-        assertEquals("the stage depth is the device tile's: 33 rows of 128 records of 12 units",
-                33L * 128 * 12, p.q8ElementsRequired());
-        expectInvalid("16-token tile", () -> MmqGemmPlan.smallOf(MmqConfig.PACKED_DOT, GGMLType.Q4_K,
+        assertEquals("16 tokens need one 16-token tile", 1, p.tokenTiles());
+        assertEquals("4097 rows need 65 64-row twin tiles", 65, p.rowTiles());
+        assertArrayEquals(new long[]{65L * 256, 1}, p.globalWorkSize());
+        assertEquals("the stage depth is the device tile's: 16 rows of 128 records of 12 units",
+                16L * 128 * 12, p.q8ElementsRequired());
+        expectInvalid("no 16-token twin", () -> MmqGemmPlan.smallOf(MmqConfig.PACKED_DOT, GGMLType.Q4_K,
                 64, 256, 8, 16, 0, 64, 0));
+    }
+
+    /** The 17..64-token launches plan the S64 twin: the {@code _S64} kernel over 64-token tiles of
+     *  the same 64-row twin tile; the twin widths are only 16 and 64 tokens. */
+    @Test
+    public void theTwin64PlansTheSuffixKernelOver64TokenTiles() {
+        MmqGemmPlan p = MmqGemmPlan.smallOf(MmqConfig.INT8_TENSOR, GGMLType.Q4_K, MmqConfig.TWIN_MAX_TOKENS,
+                4096 + 1, 4096, 48, 128, 0, 4097, 0);
+        assertEquals("Q4_K_MatMul_MMQ_S64", p.kernelName());
+        assertEquals(MmqConfig.smallTile(MmqConfig.INT8_TENSOR, MmqConfig.TWIN_MAX_TOKENS), p.config());
+        assertEquals("48 tokens need one 64-token tile", 1, p.tokenTiles());
+        assertEquals("4097 rows need 65 64-row twin tiles", 65, p.rowTiles());
+        assertArrayEquals(new long[]{65L * 256, 1}, p.globalWorkSize());
+        assertEquals("the stage depth is the device tile's: 48 rows of 128 records of 12 units",
+                48L * 128 * 12, p.q8ElementsRequired());
+        expectInvalid("twin tiles come in", () -> MmqGemmPlan.smallOf(MmqConfig.INT8_TENSOR, GGMLType.Q4_K,
+                32, 4096, 4096, 32, 128, 0, 4096, 0));
+        expectInvalid("no 64-token twin", () -> MmqGemmPlan.smallOf(MmqConfig.CDNA, GGMLType.Q4_K,
+                MmqConfig.TWIN_MAX_TOKENS, 256, 4096, 32, 256, 0, 256, 0));
     }
 
     @Test
@@ -170,7 +195,7 @@ public class MmqGemmPlanTest {
         assertEquals(16, MmqConfig.PACKED_DOT.stageDepth());
         assertEquals(16, MmqConfig.PACKED_DOT.tileTokens());
         assertEquals(32, MmqConfig.INT8_TENSOR.stageDepth());
-        assertEquals("the tensor token tile follows the per-architecture config", 64,
+        assertEquals("the tensor token tile follows the per-architecture config", 128,
                 MmqConfig.INT8_TENSOR.tileTokens());
         assertEquals(4 + 2 + 1, MmqConfig.PACKED_DOT.recordUnits());
         assertEquals(8 + 2 + 2, MmqConfig.INT8_TENSOR.recordUnits());
@@ -178,10 +203,10 @@ public class MmqGemmPlanTest {
         assertEquals(256, MmqConfig.PACKED_DOT.rowRecords(4096));
         assertEquals(128, MmqConfig.INT8_TENSOR.rowRecords(4096));
         assertEquals(1536L, MmqConfig.INT8_TENSOR.rowRecords(4096) * MmqConfig.INT8_TENSOR.recordUnits());
-        assertEquals("the pipelined stage holds two copies of the weight tiles and one of the tokens' "
-                + "d / sums / zero points", 4L * (2 * 64 * 16 + 6 * 64 + 2 * 16 + 16),
+        assertEquals("the pipelined stage holds three copies of the weight tiles and one of the "
+                + "tokens' records", 4L * (3 * 64 * 16 + 9 * 64 + 16 * (4 + 2 + 1)),
                 MmqConfig.PACKED_DOT.sharedBytes());
-        assertEquals(4L * (2 * 64 * 32 + 6 * 64 * 2 + 2 * 64 + 64 * 2),
+        assertEquals(4L * (3 * 128 * 32 / 4 + 9 * 128 * 2 + 128 * (8 + 2 + 2)),
                 MmqConfig.INT8_TENSOR.sharedBytes());
     }
 

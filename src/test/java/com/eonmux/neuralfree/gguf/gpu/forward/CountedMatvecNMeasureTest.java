@@ -269,15 +269,17 @@ public class CountedMatvecNMeasureTest {
         System.out.println(line.append("  us").toString());
     }
 
-    /** The fast GEMM lane the dispatch serves at {@code n}: the small twin below the device tile, else the plain tile. */
+    /** The fast GEMM lane the dispatch serves at {@code n}: the twin of the launch's ladder row below
+     *  the device tile, else the plain tile. */
     private Lane mmqLane(GGMLType type, int rows, int cols, int n, GpuBuffer wBuf, GpuBuffer xBuf,
                          GpuBuffer yBuf, GpuBuffer staged) {
         MmqConfig tile = mmqConfig;
         String kernel = GemmKernels.matmulMmq(type);
-        boolean small = mmqConfig.tileTokens() > MmqConfig.TOKEN_LANES && n < MmqConfig.TOKEN_LANES;
+        int twinTokens = mmqConfig.tileTokens() > MmqConfig.TOKEN_LANES ? MmqConfig.twinTokens(n, cols) : 0;
+        boolean small = twinTokens > 0 && twinTokens < mmqConfig.tileTokens() && n <= twinTokens;
         if (small) {
-            tile = MmqConfig.smallTile(mmqConfig);
-            kernel = GemmKernels.matmulMmqSmall(type);
+            tile = MmqConfig.smallTile(mmqConfig, twinTokens);
+            kernel = GemmKernels.matmulMmqSmall(type, twinTokens);
         }
         final String kernelName = kernel;
         if (!kernels.has(kernelName)) {
@@ -288,9 +290,9 @@ public class CountedMatvecNMeasureTest {
         final int rowRecords = config.rowRecords(cols);
         final long records = (long) n * rowRecords;
         final MmqGemmPlan plan = small
-                ? MmqGemmPlan.smallOf(mmqConfig, type, rows, cols, n, rowRecords, 0, rows, 0)
+                ? MmqGemmPlan.smallOf(mmqConfig, type, twinTokens, rows, cols, n, rowRecords, 0, rows, 0)
                 : MmqGemmPlan.contiguous(config, type, rows, cols, n);
-        return new Lane(small ? "mmqS" : "mmq", () -> {
+        return new Lane(small ? "mmqS" + twinTokens : "mmq", () -> {
             backend.computeQueue().enqueueKernel(kernels.get(GemmKernels.QUANT_MMQ_Q8_1),
                     new long[]{roundUp(records)}, new long[]{local},
                     new Object[]{n, cols, tk, cols, 0, xBuf, staged});
