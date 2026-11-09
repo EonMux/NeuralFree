@@ -13,6 +13,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -36,7 +37,7 @@ import java.util.function.Function;
  *       order), the API's view of the target device is turned into a backend and returned when the
  *       requirement accepts it; otherwise it is closed and the reason logged. Under the default
  *       order the target vendor's native API goes first ({@link #nativeApi}: CUDA on an NVIDIA
- *       device); an order the property sets is followed as written.</li>
+ *       device, OpenCL on an Intel one); an order the property sets is followed as written.</li>
  *   <li><b>Fallback.</b> When no API ran the target, each API's own ranking winner is tried,
  *       discrete before integrated before the rest, then in API order, under the same
  *       requirement. An API and device pair is never tried twice.</li>
@@ -66,15 +67,22 @@ final class BackendSelector {
 
     /** PCI vendor id of NVIDIA devices. */
     private static final int NVIDIA_VENDOR_ID = 0x10DE;
+    /** PCI vendor id of Intel devices. */
+    private static final int INTEL_VENDOR_ID = 0x8086;
 
     /**
      * The API that drives a vendor's devices fastest, tried first on the target device under the default
-     * order. NVIDIA: CUDA, which ran 4-5x the prefill and 1.6-2x the generation throughput of the Vulkan
-     * and OpenCL views of the same RTX 5080 Laptop (nftool bench {@code -p 512 -n 128}, Qwen3-Embedding
-     * 0.6B Q8_0, 4B Q8_0 and 4B Q4_K_M, the three APIs interleaved over two rounds).
+     * order (nftool bench {@code -p 512 -n 128}, Qwen3-Embedding 0.6B Q8_0, 4B Q8_0 and 4B Q4_K_M):
+     * <ul>
+     *   <li>NVIDIA: CUDA, which ran 4-5x the prefill and 1.6-2x the generation throughput of the Vulkan and
+     *       OpenCL views of the same RTX 5080 Laptop (the three APIs interleaved over two rounds).</li>
+     *   <li>Intel: OpenCL, whose program carries the Intel subgroup forms: on the Arrow Lake iGPU it ran
+     *       38x the 0.6B prefill (1297 against 34 t/s) and 1.8-2.5x the generation throughput of the Vulkan
+     *       view (0.6B 31.1 against 14.9 t/s, 4B Q8_0 8.1 against 4.6, 4B Q4_K_M 10.8 against 4.4), and
+     *       finished the 4B Q8_0 prefill the Vulkan view lost the device on.</li>
+     * </ul>
      */
-    private static final Map<Integer, BackendType> NATIVE_API = Collections.singletonMap(
-            NVIDIA_VENDOR_ID, BackendType.CUDA);
+    private static final Map<Integer, BackendType> NATIVE_API = nativeApis();
 
     /**
      * Whose ranking winner becomes the target device when no filter names one: Metal, then OpenCL
@@ -82,6 +90,13 @@ final class BackendSelector {
      */
     private static final List<BackendType> TARGET_SOURCES = order(
             BackendType.METAL, BackendType.OPENCL, BackendType.VULKAN, BackendType.CUDA, BackendType.HIP);
+
+    private static Map<Integer, BackendType> nativeApis() {
+        Map<Integer, BackendType> apis = new HashMap<>();
+        apis.put(NVIDIA_VENDOR_ID, BackendType.CUDA);
+        apis.put(INTEL_VENDOR_ID, BackendType.OPENCL);
+        return Collections.unmodifiableMap(apis);
+    }
 
     private BackendSelector() {
     }

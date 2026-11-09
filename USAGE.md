@@ -441,7 +441,7 @@ vkHw.shutdown();
 
 **AUTO is device-first** (`BackendSelector`):
 1. **Target device.** The target is the first device, in any API, whose name contains `neuralfree.device` (case-insensitive). If none is named, it is the OpenCL ranking's winner (discrete before integrated, then measured), else Vulkan's, else CUDA's.
-2. **API order.** Each API in `neuralfree.backend.order` (default `metal,vulkan,cuda,opencl,hip`) is tried on the target device. The first one that is accepted wins. With the default order, the target vendor's native API goes first: CUDA on an NVIDIA GPU, where it measured 4-5x the prefill and 1.6-2x the generation speed of Vulkan and OpenCL on an RTX 5080 Laptop. An order set through the property is followed as written. The views one GPU offers through several APIs are recognised as one device.
+2. **API order.** Each API in `neuralfree.backend.order` (default `metal,vulkan,cuda,opencl,hip`) is tried on the target device. The first one that is accepted wins. With the default order, the target vendor's native API goes first: CUDA on an NVIDIA GPU, where it measured 4-5x the prefill and 1.6-2x the generation speed of Vulkan and OpenCL on an RTX 5080 Laptop, and OpenCL on an Intel GPU, whose program carries the Intel subgroup forms (on the Arrow Lake iGPU 38x the Qwen3 0.6B prefill and 1.8-2.5x the generation speed of Vulkan). A device whose native API is not installed or not accepted falls through to the rest of the order. An order set through the property is followed as written. The views one GPU offers through several APIs are recognised as one device.
 3. **Fallback.** If no API runs the target, each API's own winner is tried, discrete first.
 
 The per-API properties `neuralfree.opencl.device`, `neuralfree.cuda.device`, `neuralfree.vulkan.device` and `neuralfree.hip.device` override `neuralfree.device` within one API. `neuralfree.backend.order=cuda,opencl`, for example, keeps AUTO off Vulkan.
@@ -8474,7 +8474,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 
 | Property | Meaning | Default |
 |---|---|---|
-| `neuralfree.backend.order` | AUTO's API preference; when unset, the target vendor's native API (CUDA on NVIDIA) goes first | `metal,vulkan,cuda,opencl,hip` |
+| `neuralfree.backend.order` | AUTO's API preference; when unset, the target vendor's native API (CUDA on NVIDIA, OpenCL on Intel) goes first | `metal,vulkan,cuda,opencl,hip` |
 | `neuralfree.opencl.device`, `neuralfree.cuda.device`, `neuralfree.vulkan.device`, `neuralfree.hip.device` | Per-API device-name substring; takes precedence over `neuralfree.device` for that API | none |
 | `neuralfree.opencl.benchmark.disable` | Rank OpenCL devices on published attributes only | false |
 | `neuralfree.opencl.disable` | Skip OpenCL enumeration | false |

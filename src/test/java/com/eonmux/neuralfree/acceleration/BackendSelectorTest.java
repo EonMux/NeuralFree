@@ -162,9 +162,20 @@ public class BackendSelectorTest {
     }
 
     @Test
-    public void aVendorWithoutANativeApiKeepsTheDefaultOrder() {
+    public void theNativeApiLeadsTheDefaultOrderOnAnIntelTarget() {
         BackendSelector.Selection s = BackendSelector.selectAuto(laptop(), BackendSelector.DEFAULT_ORDER, true, "INTEL",
                 BackendRequirement.ANY);
+
+        assertEquals(BackendType.OPENCL, s.backend.backendType());
+        assertSame(IGPU_OPENCL, s.chosen.identity);
+        assertFalse("the Vulkan view is never built while OpenCL runs the target",
+                fakeOf(BackendType.VULKAN, IGPU_VULKAN.name()).created);
+    }
+
+    @Test
+    public void anIntelOrderWithoutOpenClKeepsItsOrder() {
+        BackendSelector.Selection s = BackendSelector.selectAuto(laptop(),
+                Arrays.asList(BackendType.VULKAN, BackendType.CUDA), true, "INTEL", BackendRequirement.ANY);
 
         assertEquals(BackendType.VULKAN, s.backend.backendType());
         assertSame(IGPU_VULKAN, s.chosen.identity);
@@ -175,11 +186,15 @@ public class BackendSelectorTest {
         List<BackendType> order = Arrays.asList(BackendType.VULKAN, BackendType.OPENCL, BackendType.CUDA);
         assertEquals(Arrays.asList(BackendType.CUDA, BackendType.VULKAN, BackendType.OPENCL),
                 BackendSelector.nativeFirst(order, RTX_VULKAN));
-        assertSame("Intel has no native API", order, BackendSelector.nativeFirst(order, IGPU_VULKAN));
+        assertEquals(Arrays.asList(BackendType.OPENCL, BackendType.VULKAN, BackendType.CUDA),
+                BackendSelector.nativeFirst(order, IGPU_VULKAN));
+        DeviceIdentity other = new DeviceIdentity("Some GPU", 0x1D17, "0000:03:00.0", null);
+        assertSame("a vendor without a native API keeps the order", order, BackendSelector.nativeFirst(order, other));
         List<BackendType> noCuda = Arrays.asList(BackendType.VULKAN, BackendType.OPENCL);
         assertSame("an order without CUDA stays as written", noCuda, BackendSelector.nativeFirst(noCuda, RTX_VULKAN));
         assertEquals(BackendType.CUDA, BackendSelector.nativeApi(RTX_OPENCL));
-        assertNull(BackendSelector.nativeApi(IGPU_OPENCL));
+        assertEquals(BackendType.OPENCL, BackendSelector.nativeApi(IGPU_OPENCL));
+        assertNull(BackendSelector.nativeApi(new DeviceIdentity("Some GPU", 0x1D17, "0000:03:00.0", null)));
     }
 
     @Test
