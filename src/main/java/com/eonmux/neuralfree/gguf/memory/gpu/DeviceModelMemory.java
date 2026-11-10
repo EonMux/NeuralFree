@@ -172,8 +172,11 @@ public final class DeviceModelMemory implements GpuMemory {
             m.allocateLayers(layerGate);
             m.bindShared(target);
             m.stepInputs = DeviceStepInputs.allocate(backend, queue, plan.groups(), plan.ubatch(),
-                    m.identityLength(), textPositions, m.sequence, m.paged);
+                    plan.identityLength(), textPositions, m.sequence, m.paged);
             m.stepInputs.trackCompressorSteps(m.rollbacks);
+            if (plan.contextShiftReserved()) {
+                m.stepInputs.reserveShiftDeltas();
+            }
         } catch (RuntimeException e) {
             m.close();
             throw e;
@@ -268,16 +271,6 @@ public final class DeviceModelMemory implements GpuMemory {
                 throw new IllegalArgumentException("layer " + il + " shares the KV of " + src + ", which has no cache");
             }
         }
-    }
-
-    private int identityLength() {
-        int n = plan.ubatch();
-        for (LayerMemoryPlan lp : plan.layers()) {
-            if (lp.crossKv() != null) {
-                n = Math.max(n, lp.crossKv().rows());
-            }
-        }
-        return n;
     }
 
     private <T extends AutoCloseable> T own(T resource) {

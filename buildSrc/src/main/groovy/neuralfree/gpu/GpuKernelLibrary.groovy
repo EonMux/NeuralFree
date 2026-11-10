@@ -20,6 +20,8 @@ class GpuKernelLibrary {
     final File kernelRoot, shaderRoot, variantsDir, inventoryFile
     /** nvcc math-mode flags of the library's modules. */
     final List<String> cudaFlags
+    /** clang flags of the library's HIP code objects (the train library's -ffp-contract=off); empty when unset. */
+    final List<String> hipFlags
     /** NF_FA_SMEM_FLOATS the CUDA modules are compiled with and build.properties records; null when unused. */
     final Integer faSmemFloats
     /** subgroupVariants: rows may carry sg, and OpenCL is also checked with USE_SUBGROUPS. compareKinds: verifyGpuKernels
@@ -31,7 +33,7 @@ class GpuKernelLibrary {
     final List<String> stackFreeCudaModules
 
     /** spec: id, kernelRoot, cudaDir, shaderRoot, cudaFlags, subgroupVariants, compareKinds; optional faSmemFloats,
-     *  stackFreeCudaModules. */
+     *  stackFreeCudaModules and hipFlags. */
     GpuKernelLibrary(Map spec, File resources, File projectDir) {
         id = String.valueOf(spec.id)
         if (!ID.matcher(id).matches() || [spec.kernelRoot, spec.cudaDir, spec.shaderRoot, spec.cudaFlags].contains(null)) {
@@ -58,6 +60,12 @@ class GpuKernelLibrary {
         inventoryFile = new File(kernelRoot, 'inventory.txt')
         inventoryPath = GpuBuildTools.relative(projectDir, inventoryFile)
         cudaFlags = Collections.unmodifiableList(((List<?>) spec.cudaFlags).collect { it.toString() })
+        hipFlags = Collections.unmodifiableList(((List<?>) (spec.hipFlags ?: [])).collect { it.toString() })
+        hipFlags.each { String flag ->
+            if (!flag.startsWith('-') || flag.contains(' ')) {
+                throw new GradleException("GPU kernel library ${id}: hipFlags entry '${flag}' must be one option starting with '-'")
+            }
+        }
         faSmemFloats = spec.faSmemFloats == null ? null : Integer.valueOf(spec.faSmemFloats.toString())
         subgroupVariants = (boolean) spec.subgroupVariants
         compareKinds = (boolean) spec.compareKinds
@@ -79,7 +87,7 @@ class GpuKernelLibrary {
 
     /** Every option that changes the library's build outputs, for up-to-date checks. */
     String fingerprint() {
-        "${id}[${kernelRootPath} ${cudaDir} ${hipDir} ${shaderRootPath} cuda=${cudaFlags.join(' ')} ${cudaDefines().join(' ')} sg=${subgroupVariants} kinds=${compareKinds}]"
+        "${id}[${kernelRootPath} ${cudaDir} ${hipDir} ${shaderRootPath} cuda=${cudaFlags.join(' ')} hip=${hipFlags.join(' ')} ${cudaDefines().join(' ')} sg=${subgroupVariants} kinds=${compareKinds}]"
     }
 
     @Override

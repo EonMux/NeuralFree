@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.ops.moe;
 
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
@@ -15,11 +16,13 @@ import java.util.Objects;
  *       copy rate;</li>
  *   <li>GPU work around the wait for the moved experts: a fixed term plus per-row terms before and after.</li>
  * </ul>
- * The window ends at the later of the host rows and the GPU work. Moving one expert or one pair of experts is
- * evaluated against the do-nothing window, the best move with a positive gain is taken, and further experts are
- * added one at a time while they still gain, never more than the cache's free slots. Steps with fewer than two
- * tokens never split (the reference's rule), and everything is decided before any work is enqueued, so the model
- * never sees partial moves. Immutable and stateless; the cache keeps the residency.
+ * The window ends at the later of the host rows and the GPU work. Moving one expert, then one pair of experts, is
+ * evaluated against the do-nothing window, and the best move with a positive gain is taken (a pair only when it
+ * beats every single expert). Past a best pair, further experts are added one at a time, each the one that ends the
+ * window soonest, while it ends the window sooner than the best move so far, never more than the cache's free
+ * slots. Steps with fewer than two tokens never split (the reference's
+ * rule), and everything is decided before any work is enqueued, so the model never sees partial moves. Immutable
+ * and stateless; the cache keeps the residency.
  */
 public final class MoeSplitDispatcher {
 
@@ -135,7 +138,7 @@ public final class MoeSplitDispatcher {
 
         @Override
         public String toString() {
-            return "Plan{migrate=" + java.util.Arrays.toString(migrate) + "}";
+            return "Plan{migrate=" + Arrays.toString(migrate) + "}";
         }
     }
 
@@ -198,90 +201,76 @@ public final class MoeSplitDispatcher {
         }
         double bestGain = 0.0;
         int[] best = new int[0];
-        // The best single expert, or pair when two slots are free.
+        // The best single expert, then the best pair when two slots are free, each taken only when it ends the
+        // window strictly sooner: a pair that merely ties a single expert copies twice for the same window. best
+        // holds positions into cand.
         for (int i = 0; i < n; i++) {
-            double gain = all - window(candRows, new int[]{i}, d, cpuRows, expertCopyBytes, tensorsPerExpert,
-                    residentRows);
+            double gain = all - window(1, candRows[i], d, cpuRows, expertCopyBytes, tensorsPerExpert, residentRows);
             if (gain > bestGain) {
                 bestGain = gain;
-                best = new int[]{cand[i]};
+                best = new int[]{i};
             }
-            if (freeSlots < 2) {
-                continue;
-            }
+        }
+        for (int i = 0; i < n && freeSlots >= 2; i++) {
             for (int j = i + 1; j < n; j++) {
-                double pairGain = all - window(candRows, new int[]{i, j}, d, cpuRows, expertCopyBytes,
+                double pairGain = all - window(2, candRows[i] + candRows[j], d, cpuRows, expertCopyBytes,
                         tensorsPerExpert, residentRows);
                 if (pairGain > bestGain) {
                     bestGain = pairGain;
-                    best = new int[]{cand[i], cand[j]};
+                    best = new int[]{i, j};
                 }
             }
         }
         if (best.length == 0) {
             return new Plan(new int[0]);
         }
-        // Further experts, one at a time, while they gain and slots remain.
-        java.util.List<Integer> moved = new java.util.ArrayList<>();
-        for (int e : best) {
-            moved.add(e);
+        if (best.length == 1) {
+            return new Plan(new int[]{cand[best[0]]});
         }
-        while (moved.size() < freeSlots) {
-            int m = moved.size();
-            int next = -1;
+        // Past the best pair, further experts one at a time: the one that ends the window soonest, while that is
+        // sooner than the best move so far and slots remain. Past a best single expert no addition can gain, since
+        // every pair it would form already scored no better.
+        int cap = Math.min(freeSlots, n);
+        int[] pick = Arrays.copyOf(best, cap);
+        boolean[] taken = new boolean[n];
+        int m = best.length;
+        int movedRows = 0;
+        for (int k = 0; k < m; k++) {
+            taken[pick[k]] = true;
+            movedRows += candRows[pick[k]];
+        }
+        while (m < cap) {
+            int add = -1;
             for (int i = 0; i < n; i++) {
-                if (contains(moved, cand[i])) {
+                if (taken[i]) {
                     continue;
                 }
-                moved.add(cand[i]);
-                double gain = all - window(candRows, indices(moved), d, cpuRows, expertCopyBytes, tensorsPerExpert,
-                        residentRows);
-                moved.remove(moved.size() - 1);
-                if (gain > 0.0) {
-                    next = cand[i];
-                    break;
+                double gain = all - window(m + 1, movedRows + candRows[i], d, cpuRows, expertCopyBytes,
+                        tensorsPerExpert, residentRows);
+                if (gain > bestGain) {
+                    bestGain = gain;
+                    add = i;
                 }
             }
-            if (next < 0) {
+            if (add < 0) {
                 break;
             }
-            moved.add(next);
+            pick[m++] = add;
+            taken[add] = true;
+            movedRows += candRows[add];
         }
-        int[] out = new int[moved.size()];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = moved.get(i);
+        int[] out = new int[m];
+        for (int k = 0; k < m; k++) {
+            out[k] = cand[pick[k]];
         }
         return new Plan(out);
     }
 
-    /** The window with the candidates at {@code pick} moved off the host. */
-    private double window(int[] candRows, int[] pick, int d, int cpuRows, long expertCopyBytes, int tensorsPerExpert,
+    /** The window with {@code m} candidates holding {@code movedRows} rows moved off the host. */
+    private double window(int m, int movedRows, int d, int cpuRows, long expertCopyBytes, int tensorsPerExpert,
                           int residentRows) {
-        int rows = 0;
-        for (int p : pick) {
-            rows += candRows[p];
-        }
-        int m = pick.length;
-        return model.windowUs(d - m, cpuRows - rows, rows, tensorsPerExpert * m,
+        return model.windowUs(d - m, cpuRows - movedRows, movedRows, tensorsPerExpert * m,
                 model.copiesUs(expertCopyBytes * m, tensorsPerExpert * m), residentRows);
-    }
-
-    private static boolean contains(java.util.List<Integer> list, int v) {
-        for (int x : list) {
-            if (x == v) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /** Positions 0..size-1 of the moved list as an array. */
-    private static int[] indices(java.util.List<Integer> moved) {
-        int[] out = new int[moved.size()];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = i;
-        }
-        return out;
     }
 
     private static int totalRows(int[] rowsPerExpert) {

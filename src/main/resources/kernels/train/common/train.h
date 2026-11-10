@@ -2,7 +2,8 @@
 /*
  * Numerical contract (every train kernel):
  *   - no floating-point contraction: OpenCL FP_CONTRACT is off here and the library is built without
- *     -cl-mad-enable; CUDA builds with -fmad=false. Multiply-add accumulations call fma() explicitly;
+ *     -cl-mad-enable; CUDA builds with -fmad=false; HIP builds with -ffp-contract=off and clang's fp contract
+ *     pragma is off here as well. Multiply-add accumulations call fma() explicitly;
  *   - Java Math.max/Math.min semantics through tr_jmax/tr_jmin, never fmax/fmin/clamp;
  *   - reductions run over a fixed 256-wide local-memory tree with fixed pairing, so the summation order
  *     is the same on every backend and device (no subgroup operations, no float atomics).
@@ -16,6 +17,9 @@
 
 #ifndef NF_CUDA
 #pragma OPENCL FP_CONTRACT OFF
+#endif
+#if defined(__HIP__)
+#pragma clang fp contract(off)
 #endif
 
 /* Local size of every 1-D train kernel and width of the workgroup reduction tree. */

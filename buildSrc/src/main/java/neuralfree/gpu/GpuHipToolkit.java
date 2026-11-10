@@ -208,11 +208,12 @@ public final class GpuHipToolkit {
      * The hipcc command that compiles one assembled unit to its code object: every selected target is
      * an {@code --offload-arch} flag and the {@code .hsaco} output makes hipcc compile device code
      * only (one multi-target code object per kernel source, as the CUDA build's fatbin holds one
-     * module with a gencode entry per SM). nvcc's math-mode flags have no HIP form that keeps the
-     * NaN semantics the kernels rely on, so the command holds no equivalent of {@code cudaFlags}.
+     * module with a gencode entry per SM). {@code flags} are the library's own clang options (the
+     * train library's {@code -ffp-contract=off}, the HIP form of its {@code -fmad=false}); nvcc's other
+     * math-mode flags have no HIP form that keeps the NaN semantics the kernels rely on.
      */
-    public static List<String> compileCommand(String hipcc, List<String> archs, List<String> defines,
-                                              String unitPath, String outputPath) {
+    public static List<String> compileCommand(String hipcc, List<String> archs, List<String> flags,
+                                              List<String> defines, String unitPath, String outputPath) {
         if (archs.isEmpty()) {
             throw new IllegalArgumentException("a HIP unit compiles for at least one gfx target");
         }
@@ -220,6 +221,7 @@ public final class GpuHipToolkit {
         cmd.add(hipcc);
         cmd.add(STD_FLAG);
         cmd.add("-O3");
+        cmd.addAll(flags);
         cmd.addAll(defines);
         for (String arch : archs) {
             cmd.add("--offload-arch=" + arch);

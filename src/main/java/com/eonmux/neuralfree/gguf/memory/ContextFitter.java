@@ -475,7 +475,8 @@ public final class ContextFitter {
                 sb.append(", state snapshots ").append(mib(plan.snapshotBytes()));
             }
             sb.append(", side caches ").append(mib(plan.sideCacheBytes()))
-                    .append(", positions ").append(mib(plan.positionBytes()));
+                    .append(", positions ").append(mib(plan.positionBytes()))
+                    .append(", addressing ").append(mib(plan.addressingBytes()));
             if (sized.nextnBytes > 0) {
                 sb.append(", NextN draft memory ").append(mib(sized.nextnBytes));
             }

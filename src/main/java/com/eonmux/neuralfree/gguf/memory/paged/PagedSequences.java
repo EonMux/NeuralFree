@@ -60,6 +60,7 @@ public final class PagedSequences implements SequenceMemory {
     private final List<RowReport> pendingReports = new ArrayList<>();
     /** The block-holder and copy operations over this memory's tables. */
     private final PageSharing sharing;
+    private final PagedCompaction compaction;
 
     // DEBUG temp: an op history for the invariant dump
     static final java.util.ArrayDeque<String> debugHistory = new java.util.ArrayDeque<>();
@@ -132,6 +133,7 @@ public final class PagedSequences implements SequenceMemory {
         }
         this.swaTrim = new PagedSwaTrim(this, groups);
         this.sharing = new PageSharing(this);
+        this.compaction = new PagedCompaction(this);
     }
 
     /** Rows of a page (the configured {@code neuralfree.kv.page.size}). */
@@ -546,7 +548,7 @@ public final class PagedSequences implements SequenceMemory {
      *                             {@code copy} pre-count theirs, so only a caller that skipped that count lands
      *                             here)
      */
-    private void privatize(int g, int seq, int listIndex) {
+    void privatize(int g, int seq, int listIndex) {
         PageList list = lists[seq][g];
         int src = list.page(listIndex);
         if (pools[g].refCount(src) == 1) {
@@ -809,10 +811,9 @@ public final class PagedSequences implements SequenceMemory {
             }
         }
         list = lists[seq][g];
-        // a cell can be one move's source and a later move's destination: report every touched cell by its final
-        // state, the destinations' positions as sets and the sources that stayed empty as clears
+        // a cell can be one move's source and a later move's destination: the reports name every touched cell by
+        // its final state
         int[] touched = new int[2 * srcPos.length];
-        int[] finals = new int[2 * srcPos.length];
         int moved = 0;
         for (int i = 0; i < srcPos.length; i++) {
             int src = cellOf(list, srcSlot[i] - 1);
@@ -826,16 +827,10 @@ public final class PagedSequences implements SequenceMemory {
             kvPos[g][src] = -1;
             kvPos[g][dst] = dstPos[i];
             pendingRowMoves.add(RowMove.of(seq, g, src, dst, 1));
-            touched[moved] = src;
-            finals[moved] = -1;
-            moved++;
-            touched[moved] = dst;
-            finals[moved] = dstPos[i];
-            moved++;
+            touched[moved++] = src;
+            touched[moved++] = dst;
         }
-        if (moved > 0) {
-            reportTouched(g, touched, finals, moved);
-        }
+        PagedCompaction.reportFinal(pendingReports, g, kvPos[g], touched, moved);
     }
 
     @Override
@@ -1073,6 +1068,10 @@ public final class PagedSequences implements SequenceMemory {
         return pendingReports;
     }
 
+    List<RowMove> pendingRowMoveList() {
+        return pendingRowMoves;
+    }
+
     private void dropSequence(int seq) {
         dropRowMoves(seq);
         for (int g = 0; g < groupsCount(); g++) {
@@ -1192,112 +1191,20 @@ public final class PagedSequences implements SequenceMemory {
     }
 
     /**
-     * Slides the sequence's live rows down over the dead slots below them: a context shift's interior removal
-     * strands the removed slots under the live tail, and an append cursor that keeps them would grow every later
-     * append past the pages the plan sized. The rows' positions and the token record stay; the cells move, their
-     * {@code kv_pos} mirrors and the device reports with them, and the backend carries the keys and values through
-     * the queued {@link RowMove}s. Pages the destinations touch privatize first (a shared page is
-     * never written in place).
+     * Slides the sequence's live rows down over the dead slots below them ({@link PagedCompaction}): a context
+     * shift's interior removal strands the removed slots under the live tail, and an append cursor that keeps them
+     * would grow every later append past the pages the plan sized. The rows' positions and the token record stay;
+     * the cells move, their {@code kv_pos} mirrors and the device reports with them, and the backend carries the
+     * keys and values through the queued {@link RowMove}s.
      */
     private void compact(int seq) {
         for (int g = 0; g < groupsCount(); g++) {
-            compactGroup(g, seq);
-        }
-    }
-
-    /** The slide of one KV group: count the dead slots, privatize the destination pages, then move row by row. */
-    private void compactGroup(int g, int seq) {
-        PageList list = lists[seq][g];
-        int cursor = slots[g][seq];
-        int slide = 0;
-        int firstMoved = -1;
-        for (int s = 0; s < cursor; s++) {
-            if (kvPos[g][cellOf(list, s)] < 0) {
-                slide++;
-            } else if (slide > 0 && firstMoved < 0) {
-                firstMoved = s - slide;
-            }
-        }
-        if (slide == 0) {
-            return;
-        }
-        int lastDst = cursor - slide;
-        for (int k = Math.max(firstMoved / pageSize, 0); k * pageSize < lastDst && k < list.size(); k++) {
-            privatize(g, seq, k);
-            list = lists[seq][g]; // a privatized page replaced itself in the list
-        }
-        list = lists[seq][g];
-        // a cell can be one move's source and a later move's destination: report every touched cell by its
-        // final state, the destinations' positions as sets and the sources that stayed empty as clears
-        int[] touched = new int[2 * (cursor - firstMoved)];
-        int[] finals = new int[2 * (cursor - firstMoved)];
-        int moved = 0;
-        for (int s = firstMoved; s < cursor; s++) {
-            int src = cellOf(list, s);
-            int pos = kvPos[g][src];
-            if (pos < 0) {
-                continue;
-            }
-            int dst = s - slide;
-            int target = cellOf(list, dst);
-            kvPos[g][src] = -1;
-            kvPos[g][target] = pos;
-            pendingRowMoves.add(RowMove.of(seq, g, src, target, 1));
-            touched[moved] = src;
-            finals[moved] = -1;
-            moved++;
-            touched[moved] = target;
-            finals[moved] = pos;
-            moved++;
-        }
-        slots[g][seq] = cursor - slide;
-        reportTouched(g, touched, finals, moved);
-        // the vacated tail slots leave: whole dead pages drop from the list, a page with a live row keeps
-        while (!list.isEmpty()) {
-            int page = list.page(list.size() - 1);
-            int base = page * pageSize;
-            int lastLive = -1;
-            for (int r = pageSize - 1; r >= 0; r--) {
-                if (kvPos[g][base + r] >= 0) {
-                    lastLive = r;
-                    break;
-                }
-            }
-            if (lastLive >= 0) {
-                return;
-            }
-            sharing.unref(false, g, page);
-            list.removeBack(1);
-        }
-    }
-
-    /**
-     * Reports one mirror entry per touched cell, by its final value: a set per live cell (its position), a clear
-     * per empty one, deduplicating the cells several moves touched.
-     */
-    private void reportTouched(int g, int[] touched, int[] finals, int count) {
-        for (int i = 0; i < count; i++) {
-            int cell = touched[i];
-            boolean later = false;
-            for (int j = i + 1; j < count; j++) {
-                if (touched[j] == cell) {
-                    later = true;
-                    break;
-                }
-            }
-            if (later) {
-                continue;
-            }
-            if (finals[i] < 0) {
-                pendingReports.add(RowReport.clears(g, new int[] {cell}));
-            } else {
-                pendingReports.add(RowReport.sets(g, new int[] {cell}, new int[] {finals[i]}));
-            }
+            compaction.compactGroup(g, seq);
         }
     }
 
     /** The cell of slot {@code s} of the list (page table entry {@code s / pageSize}, row {@code s % pageSize}). */
-    private int cellOf(PageList list, int s) {
+    int cellOf(PageList list, int s) {
         return list.page(s / pageSize) * pageSize + (s % pageSize);
     }
 

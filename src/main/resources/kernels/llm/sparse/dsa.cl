@@ -19,7 +19,8 @@
  * common/kv_types.h loaders; a DeepSeek-V4.1 compressed row is head_dim + indexer_head_size wide and the index key
  * starts at head_dim), q_pos [n_tokens] and kv_pos [rows] (position held by each row, -1 when empty). Visibility is the llama.cpp KV mask (llama-kv-cache.cpp:1664-1710): the row is not empty,
  * kv <= q when causal, and llama_hparams::is_masked_swa (llama-hparams.h:506-540) is false for
- * swa_type (0 NONE, 1 STANDARD, 2 CHUNKED, 3 SYMMETRIC) and window n_swa.
+ * swa_type (0 NONE, 1 STANDARD, 2 CHUNKED, 3 SYMMETRIC, 4 CHUNKED_LOOKBACK) and window n_swa: the shared
+ * nf_attn_visible of common/attn_common.h, the rule every attention kernel applies.
  *
  * Preconditions (validated on the host by SparseKernels): 1 <= idx_dim <= NF_DSA_QSTAGE, n_idx_heads >= 1;
  * for a block type, idx_dim is a multiple of 32 (whole ggml blocks per row, KvDType.supportsWidth).
@@ -32,22 +33,6 @@
 
 #define NF_DSA_QSTAGE 2048   /* floats of staged indexer queries per head chunk */
 #define NF_DSA_WSTAGE 256    /* head weights staged per head chunk */
-
-/* llama.cpp KV-mask visibility of a row holding position p_kv for a query at position p_q. */
-NF_INLINE int nf_dsa_visible(int causal, int swa_type, int n_swa, int p_kv, int p_q) {
-    if (p_kv < 0) return 0;
-    if (causal && p_kv > p_q) return 0;
-    if (swa_type == 1) {
-        if (p_q - p_kv >= n_swa) return 0;
-    } else if (swa_type == 2) {
-        if (p_kv < (p_q / n_swa) * n_swa) return 0;
-    } else if (swa_type == 3) {
-        const int half_n_swa = n_swa / 2;
-        const int diff = p_q - p_kv;
-        if (diff < -half_n_swa || diff > half_n_swa) return 0;
-    }
-    return 1;
-}
 
 /*
  * Score of token t against row s for every work-item of the group (see the file comment). ik_cache is the
@@ -71,7 +56,7 @@ NF_INLINE void nf_dsa_score(
 
     int vis = 0;
     if (s < n_kv) {
-        vis = nf_dsa_visible(causal, swa_type, n_swa, kv_pos[s], q_pos[t]);
+        vis = nf_attn_visible(q_pos[t], kv_pos[s], causal, swa_type, n_swa);
     }
     const nf_i64 krow = (nf_i64)(vis ? s : 0) * key_stride + key_off;
     const nf_i64 qbase = (nf_i64)t * n_idx_heads * idx_dim;

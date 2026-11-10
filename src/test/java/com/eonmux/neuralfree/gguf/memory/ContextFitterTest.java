@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.memory;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import org.junit.Test;
 
+import static com.eonmux.neuralfree.gguf.memory.MemoryPlannerTest.contiguousAddressing;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -15,10 +16,17 @@ import static org.junit.Assert.assertTrue;
  */
 public class ContextFitterTest {
 
-    private static final long FULL_TRAIN_BYTES = 13_668_352L;
+    /** Device addressing of the gemma3 fixture's two groups at the default ubatch. */
+    private static final long GEMMA3_ADDRESSING = contiguousAddressing(2, MemoryConfig.DEFAULT_UBATCH);
+    private static final long FULL_TRAIN_BYTES = 13_668_352L + GEMMA3_ADDRESSING;
+    /** Device addressing of one group at the default ubatch: the NextN fixture's main and draft memories. */
+    private static final long ONE_GROUP_ADDRESSING = contiguousAddressing(1, MemoryConfig.DEFAULT_UBATCH);
+    /** Device addressing of the mamba2 fixture, which keeps no KV group. */
+    private static final long MAMBA2_ADDRESSING = contiguousAddressing(0, MemoryConfig.DEFAULT_UBATCH);
 
+    /** The gemma3 fixture's caches at {@code nCtx} plus its addressing, at a ubatch capped by the context. */
     private static long gemma3Bytes(int nCtx) {
-        return 5_246_976L + 1028L * nCtx;
+        return 5_246_976L + 1028L * nCtx + contiguousAddressing(2, Math.min(nCtx, MemoryConfig.DEFAULT_UBATCH));
     }
 
     private static MemoryConfig auto() {
@@ -66,7 +74,7 @@ public class ContextFitterTest {
     public void autoThrowsWhenNotEvenTheSmallestContextFits() {
         ModelSpec spec = MemoryPlannerTest.gemma3();
         long smallest = ContextFitter.requiredBytes(spec, auto(), ContextFitter.CONTEXT_STEP);
-        assertEquals(6L * 256 * 1024 + 2L * 256 * 4, smallest);
+        assertEquals(6L * 256 * 1024 + 2L * 256 * 4 + contiguousAddressing(2, 256), smallest);
         ContextFitter.ContextBudgetException e = assertThrows(ContextFitter.ContextBudgetException.class,
                 () -> ContextFitter.fit(spec, auto(), smallest - 1));
         assertEquals(ContextFitter.CONTEXT_STEP, e.nCtx());
@@ -97,26 +105,29 @@ public class ContextFitterTest {
     @Test
     public void stateSnapshotsAreCountedInTheRequiredBytes() {
         MemoryConfig snapshots = MemoryConfig.builder().stateSnapshots(true).build();
-        assertEquals(1_615_872L, ContextFitter.requiredBytes(MemoryPlannerTest.mamba2(), auto(), 4096));
-        assertEquals(2 * 1_615_872L, ContextFitter.requiredBytes(MemoryPlannerTest.mamba2(), snapshots, 4096));
+        assertEquals(1_615_872L + MAMBA2_ADDRESSING,
+                ContextFitter.requiredBytes(MemoryPlannerTest.mamba2(), auto(), 4096));
+        assertEquals(2 * 1_615_872L + MAMBA2_ADDRESSING,
+                ContextFitter.requiredBytes(MemoryPlannerTest.mamba2(), snapshots, 4096));
     }
 
     /**
      * NextN fixture of {@link MemoryPlannerTest#withNextn()}: the main context takes {@code 1028 * n} bytes (two KV
-     * layers of 512 bytes per row plus positions), the NextN draft memory {@code 516 * n}.
+     * layers of 512 bytes per row plus positions), the NextN draft memory {@code 516 * n}, each memory with the
+     * addressing of its one group.
      */
     @Test
     public void nextnDraftMemoryIsReservedBesideThePlan() {
         ModelSpec spec = MemoryPlannerTest.withNextn();
         MemoryConfig mtp = MemoryConfig.builder().nextnMemory(true).build();
-        assertEquals(1028L * 4096, ContextFitter.requiredBytes(spec, auto(), 4096));
-        assertEquals(1544L * 4096, ContextFitter.requiredBytes(spec, mtp, 4096));
-        long budget = 1544L * 4096;
+        assertEquals(1028L * 4096 + ONE_GROUP_ADDRESSING, ContextFitter.requiredBytes(spec, auto(), 4096));
+        long budget = 1544L * 4096 + 2 * ONE_GROUP_ADDRESSING;
+        assertEquals(budget, ContextFitter.requiredBytes(spec, mtp, 4096));
         assertEquals(4096, ContextFitter.fit(spec, mtp, budget));
         assertEquals(6144, ContextFitter.fit(spec, auto(), budget));
         ContextFitter.ContextBudgetException e = assertThrows(ContextFitter.ContextBudgetException.class,
                 () -> ContextFitter.fit(spec, MemoryConfig.builder().nCtx(4096).nextnMemory(true).build(), budget - 1));
-        assertEquals(1544L * 4096, e.requiredBytes());
+        assertEquals(budget, e.requiredBytes());
         assertTrue(e.getMessage().contains("NextN draft memory"));
     }
 
@@ -125,9 +136,9 @@ public class ContextFitterTest {
         ModelSpec spec = MemoryPlannerTest.gemma3();
         ContextFitter.Companion weights = ContextFitter.Companion.of("draft model weights", 1_000_000L, 0L);
         assertEquals(gemma3Bytes(3584) + 1_000_000L, ContextFitter.requiredBytes(spec, auto(), 3584, weights));
-        assertEquals(3584, ContextFitter.fit(spec, auto(), 10_000_000L, weights));
-        assertEquals(4608, ContextFitter.fit(spec, auto(), 10_000_000L));
-        assertEquals(4608, ContextFitter.fit(spec, auto(), 10_000_000L, ContextFitter.Companion.NONE));
+        assertEquals(3584, ContextFitter.fit(spec, auto(), 10_100_000L, weights));
+        assertEquals(4608, ContextFitter.fit(spec, auto(), 10_100_000L));
+        assertEquals(4608, ContextFitter.fit(spec, auto(), 10_100_000L, ContextFitter.Companion.NONE));
     }
 
     @Test
@@ -190,8 +201,10 @@ public class ContextFitterTest {
         MemoryConfig mtp = MemoryConfig.builder().nextnMemory(true).build();
         ContextFitter.Companion weights = ContextFitter.Companion.of("draft model weights", 1000L, 0L);
         MemoryPlan withNextn = MemoryPlanner.planForContext(spec, mtp, 4096);
-        assertEquals(516L * 4096, ContextFitter.reservedBytes(spec, mtp, withNextn, ContextFitter.Companion.NONE));
-        assertEquals(516L * 4096 + 1000L, ContextFitter.reservedBytes(spec, mtp, withNextn, weights));
+        assertEquals(516L * 4096 + ONE_GROUP_ADDRESSING,
+                ContextFitter.reservedBytes(spec, mtp, withNextn, ContextFitter.Companion.NONE));
+        assertEquals(516L * 4096 + ONE_GROUP_ADDRESSING + 1000L,
+                ContextFitter.reservedBytes(spec, mtp, withNextn, weights));
         MemoryPlan plain = MemoryPlanner.planForContext(spec, auto(), 4096);
         assertEquals(1000L, ContextFitter.reservedBytes(spec, auto(), plain, weights));
     }

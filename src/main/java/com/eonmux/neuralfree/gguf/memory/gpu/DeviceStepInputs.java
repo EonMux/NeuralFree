@@ -790,31 +790,6 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         writeMirror(group, 0, p.rows());
     }
 
-    /**
-     * Rewrites every group's device {@code kv_pos} so only rows whose stored position lies in {@code [start, end)}
-     * stay visible; every other row becomes -1. The host mirrors keep the sequence's true positions, so rollback,
-     * reset and the context shift still see them; context-parallel attention calls this after
-     * {@link #upload(int, int)} to restrict a rank's attention to its own context block.
-     *
-     * @throws IllegalArgumentException when {@code start} is negative or {@code end} precedes it
-     */
-    public void restrictKvPos(int start, int end) {
-        checkOpen();
-        if (start < 0 || end < start) {
-            throw new IllegalArgumentException("a visible context block needs 0 <= start <= end, got ["
-                    + start + ", " + end + ")");
-        }
-        for (int g = 0; g < positions.length; g++) {
-            GroupPositions p = positions[g];
-            int rows = p.rows();
-            for (int r = 0; r < rows; r++) {
-                int pos = p.position(r);
-                ints[r] = pos >= start && pos < end ? pos : -1;
-            }
-            writeInts(kvPos[g], 0, ints, rows);
-        }
-    }
-
     private void writeMirror(int group, int from, int to) {
         if (to <= from) {
             return;

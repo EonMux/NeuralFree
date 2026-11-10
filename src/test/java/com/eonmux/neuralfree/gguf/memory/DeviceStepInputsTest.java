@@ -567,25 +567,4 @@ public class DeviceStepInputsTest {
         assertTrue(backend.liveBuffers().isEmpty());
     }
 
-    @Test
-    public void restrictKvPosHidesEveryRowOutsideTheBlockAndKeepsTheMirror() {
-        DeviceModelMemory mem = allocate(fullPlan(8));
-        try {
-            step(mem, 0, 8);
-            assertArrayEquals(new int[]{0, 1, 2, 3, 4, 5, 6, 7}, ints(mem.stepInputs().kvPos(0), 8));
-            mem.stepInputs().restrictKvPos(3, 6);
-            assertArrayEquals("only the block's positions stay visible",
-                    new int[]{-1, -1, -1, 3, 4, 5, -1, -1}, ints(mem.stepInputs().kvPos(0), 8));
-            assertEquals("the host mirror keeps the sequence's own positions",
-                    2, mem.stepInputs().positionOfRow(0, 2));
-            mem.stepInputs().restrictKvPos(0, 8);
-            assertArrayEquals("a later step restores the whole context",
-                    new int[]{0, 1, 2, 3, 4, 5, 6, 7}, ints(mem.stepInputs().kvPos(0), 8));
-            assertThrows(IllegalArgumentException.class, () -> mem.stepInputs().restrictKvPos(4, 3));
-            assertThrows(IllegalArgumentException.class, () -> mem.stepInputs().restrictKvPos(-1, 3));
-        } finally {
-            mem.close();
-        }
-        assertTrue(backend.liveBuffers().isEmpty());
-    }
 }

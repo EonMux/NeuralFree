@@ -1,4 +1,4 @@
-/* eltwise_ext.cl - LLM_Copy2D_F32 and LLM_Axpby_F32 offset-aware generic ops used by GpuOps. Requires: common/dialect.h, common/config.h */
+/* eltwise_ext.cl - LLM_Copy2D_F32, LLM_Axpby_F32 and LLM_MuddMix offset-aware generic ops. Requires: common/dialect.h, common/config.h */
 /*
  * Generic element-wise helpers over offset views (offsets and strides in float elements). GpuOps
  * stages activations through them for kernels without offset arguments and uses them for residual
@@ -17,11 +17,14 @@
  *     out may alias b element for element (same buffer, out_off == b_off): each work-item reads its
  *     own b element before writing it. a must not overlap out.
  *
- * LLM_MuddMix(i n_tokens, i n_embd, i n_taps, i bank_off, i bank_stride, R bank, R w, R<int> taps,
- *             W cur, W resid)
- *     cur[t][i]  = sum_j w[t][j]         * bank[bank_off + taps[j]*bank_stride + t*n_embd + i],
- *     resid[t][i]= sum_j w[t][n_taps+j]  * bank[bank_off + taps[j]*bank_stride + t*n_embd + i],
- *     j < n_taps, i < n_embd: the MUDD dense cross-layer mix of limite (models/limite.cpp:100-140).
+ * LLM_MuddMix(i n_tokens, i n_embd, i n_taps, i bank_off, i bank_stride, i w_off, i taps_off, i cur_off,
+ *             i resid_off, R bank, R w, R bias, R<int> taps, W cur, W resid)
+ *     h_j = bank[bank_off + taps[taps_off + j]*bank_stride + t*n_embd + i],
+ *     cur[cur_off + t*n_embd + i]     = sum_j (w[w_off + t*2*n_taps + j] + bias[j]) * h_j,
+ *     resid[resid_off + t*n_embd + i] = sum_j (w[w_off + t*2*n_taps + n_taps + j] + bias[n_taps + j]) * h_j,
+ *     j < n_taps, i < n_embd: the MUDD dense cross-layer mix of limite (models/limite.cpp:100-140), with
+ *     the mudd_up bias added to the mix weights as they are read. cur and resid must not overlap the inputs
+ *     or each other.
  *
  * Dispatch: 1-D, one work-item per element, global = roundUp(n, L) (MuddMix: n = n_tokens*n_embd),
  * local = {L}. The host keeps n below 2^31; addresses are formed in nf_i64. No barriers.
@@ -68,8 +71,13 @@ NF_KERNEL void LLM_MuddMix(
     const int n_taps,
     const int bank_off,
     const int bank_stride,
+    const int w_off,
+    const int taps_off,
+    const int cur_off,
+    const int resid_off,
     NF_GLOBAL const float* NF_RESTRICT bank,
     NF_GLOBAL const float* NF_RESTRICT w,
+    NF_GLOBAL const float* NF_RESTRICT bias,
     NF_GLOBAL const int* NF_RESTRICT taps,
     NF_GLOBAL float* cur,
     NF_GLOBAL float* resid)
@@ -78,14 +86,14 @@ NF_KERNEL void LLM_MuddMix(
     if (n_embd <= 0 || idx >= (nf_i64)n_tokens * n_embd) return;
     const nf_i64 t = idx / n_embd;
     const nf_i64 i = idx - t * n_embd;
-    const nf_i64 w_base = t * (nf_i64)2 * n_taps;
+    const nf_i64 w_base = (nf_i64)w_off + t * (nf_i64)2 * n_taps;
     float c = 0.0f;
     float r = 0.0f;
     for (int j = 0; j < n_taps; j++) {
-        const nf_i64 h = bank[(nf_i64)bank_off + (nf_i64)taps[j] * bank_stride + t * n_embd + i];
-        c += w[w_base + j] * h;
-        r += w[w_base + n_taps + j] * h;
+        const float h = bank[(nf_i64)bank_off + (nf_i64)taps[taps_off + j] * bank_stride + t * n_embd + i];
+        c += (w[w_base + j] + bias[j]) * h;
+        r += (w[w_base + n_taps + j] + bias[n_taps + j]) * h;
     }
-    cur[idx] = c;
-    resid[idx] = r;
+    cur[(nf_i64)cur_off + idx] = c;
+    resid[(nf_i64)resid_off + idx] = r;
 }

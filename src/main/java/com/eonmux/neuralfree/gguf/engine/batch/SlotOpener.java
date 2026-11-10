@@ -9,13 +9,11 @@ import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.SamplingDefaults;
 import com.eonmux.neuralfree.gguf.engine.SequenceRun;
 import com.eonmux.neuralfree.gguf.engine.StopCriteria;
-import com.eonmux.neuralfree.gguf.engine.sampling.GrammarStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.LogitsProcessors;
 import com.eonmux.neuralfree.gguf.engine.sampling.ReasoningBudgetStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.RequestStages;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
-import com.eonmux.neuralfree.gguf.engine.sampling.TriggeredGrammarStage;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -168,9 +166,7 @@ final class SlotOpener {
                                                               SamplerVocab vocab) {
         List<SamplerStage> stages = new ArrayList<>();
         if (sub.grammar != null) {
-            stages.add(sub.grammar.gated()
-                    ? new TriggeredGrammarStage(sub.grammar.grammar(), sub.grammar.triggers(), vocab)
-                    : new GrammarStage(sub.grammar.grammar(), vocab));
+            stages.add(RequestStages.constraintStage(sub.grammar, vocab));
         }
         stages.addAll(RequestStages.of(effective, vocab));
         return stages;

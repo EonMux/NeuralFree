@@ -12,11 +12,13 @@
  *       out[out_off + i] = (alpha != 0 ? alpha*a[a_off + i] : 0) + (beta != 0 ? beta*b[b_off + i] : 0);
  *       a zero coefficient skips the read of its operand; out may alias b element for element
  *       (same buffer, out_off == b_off), so b and out carry no restrict qualifiers.
- *   OP_MUDD_MIX   (i n_tokens, i n_embd, i n_taps, i bank_off, i bank_stride,
- *                  R float bank, R float w, R int taps, W float cur, W float resid)
- *       cur[t][i] = sum_j w[t][j] * bank[bank_off + taps[j]*bank_stride + t*n_embd + i],
- *       resid[t][i] = sum_j w[t][n_taps+j] * bank[...] over j < n_taps
- *       (limite's MUDD dense cross-layer mix, models/limite.cpp:100-140).
+ *   OP_MUDD_MIX   (i n_tokens, i n_embd, i n_taps, i bank_off, i bank_stride, i w_off, i taps_off,
+ *                  i cur_off, i resid_off, R float bank, R float w, R float bias, R int taps,
+ *                  W float cur, W float resid)
+ *       h_j = bank[bank_off + taps[taps_off + j]*bank_stride + t*n_embd + i],
+ *       cur[cur_off + t*n_embd + i] = sum_j (w[w_off + t*2*n_taps + j] + bias[j]) * h_j,
+ *       resid[resid_off + t*n_embd + i] = sum_j (w[w_off + t*2*n_taps + n_taps + j] + bias[n_taps + j]) * h_j
+ *       over j < n_taps (limite's MUDD dense cross-layer mix, models/limite.cpp:100-140).
  * Offsets and strides are in float elements.
  *
  * Dispatch: 1-D, local = {L, 1, 1}, global = n invocations (Copy2D: n = rows*cols, MuddMix:
@@ -63,15 +65,20 @@ layout(push_constant) uniform NfExParams {
 #elif OP == OP_MUDD_MIX
 layout(std430, binding = 0) restrict readonly buffer NfExBank { float bank_in[]; };
 layout(std430, binding = 1) restrict readonly buffer NfExW { float w_in[]; };
-layout(std430, binding = 2) restrict readonly buffer NfExTaps { int taps_in[]; };
-layout(std430, binding = 3) restrict writeonly buffer NfExCur { float cur_out[]; };
-layout(std430, binding = 4) restrict writeonly buffer NfExResid { float resid_out[]; };
+layout(std430, binding = 2) restrict readonly buffer NfExBias { float bias_in[]; };
+layout(std430, binding = 3) restrict readonly buffer NfExTaps { int taps_in[]; };
+layout(std430, binding = 4) restrict writeonly buffer NfExCur { float cur_out[]; };
+layout(std430, binding = 5) restrict writeonly buffer NfExResid { float resid_out[]; };
 layout(push_constant) uniform NfExParams {
     int n_tokens;
     int n_embd;
     int n_taps;
     int bank_off;
     int bank_stride;
+    int w_off;
+    int taps_off;
+    int cur_off;
+    int resid_off;
 } pc;
 #else
 #error "eltwise_ext.comp: unknown OP"
@@ -99,16 +106,16 @@ void main() {
     }
     const uint t = idx / uint(pc.n_embd);
     const uint i = idx - t * uint(pc.n_embd);
-    const uint w_base = t * uint(2 * pc.n_taps);
+    const uint w_base = uint(pc.w_off) + t * uint(2 * pc.n_taps);
     float c = 0.0;
     float r = 0.0;
     for (int j = 0; j < pc.n_taps; j++) {
-        const uint h = uint(pc.bank_off) + uint(taps_in[j]) * uint(pc.bank_stride) + t * uint(pc.n_embd) + i;
+        const uint h = uint(pc.bank_off) + uint(taps_in[pc.taps_off + j]) * uint(pc.bank_stride) + t * uint(pc.n_embd) + i;
         const float v = bank_in[h];
-        c += w_in[w_base + uint(j)] * v;
-        r += w_in[w_base + uint(pc.n_taps + j)] * v;
+        c += (w_in[w_base + uint(j)] + bias_in[j]) * v;
+        r += (w_in[w_base + uint(pc.n_taps + j)] + bias_in[pc.n_taps + j]) * v;
     }
-    cur_out[idx] = c;
-    resid_out[idx] = r;
+    cur_out[uint(pc.cur_off) + idx] = c;
+    resid_out[uint(pc.resid_off) + idx] = r;
 #endif
 }

@@ -11,7 +11,8 @@
  *     scores[t*n_kv + s] = sum_h max(iq[t][h] . ik[s], 0) * w[t][h] when row s is visible to token t,
  *                        = -INF otherwise
  * (llama.cpp ggml-cpu/ops.cpp:12531-12614). Visibility: kv_pos[s] >= 0, kv_pos[s] <= q_pos[t] when causal,
- * and llama_hparams::is_masked_swa false for swa_type / n_swa (llama-hparams.h:506-540).
+ * and llama_hparams::is_masked_swa false for swa_type / n_swa (llama-hparams.h:506-540): the shared
+ * nf_attn_visible of common/attn_common.glsl, CHUNKED_LOOKBACK included.
  * Preconditions (host): 1 <= idx_dim <= NF_DSA_QSTAGE, n_idx_heads >= 1; for a block type, idx_dim
  * is a multiple of 32 (whole ggml blocks per row).
  *
@@ -55,32 +56,6 @@ layout(push_constant) uniform NfDsaParams {
 shared float nf_dsa_qs[NF_DSA_QSTAGE];
 shared float nf_dsa_ws[NF_DSA_WSTAGE];
 
-/* llama.cpp KV-mask visibility (C nf_dsa_visible). */
-bool nf_dsa_visible(int p_kv, int p_q) {
-    if (p_kv < 0) {
-        return false;
-    }
-    if (pc.causal != 0 && p_kv > p_q) {
-        return false;
-    }
-    if (pc.swa_type == 1) {
-        if (p_q - p_kv >= pc.n_swa) {
-            return false;
-        }
-    } else if (pc.swa_type == 2) {
-        if (p_kv < (p_q / pc.n_swa) * pc.n_swa) {
-            return false;
-        }
-    } else if (pc.swa_type == 3) {
-        const int half_n_swa = pc.n_swa / 2;
-        const int diff = p_q - p_kv;
-        if (diff < -half_n_swa || diff > half_n_swa) {
-            return false;
-        }
-    }
-    return true;
-}
-
 vec4 nf_dsa_q4(uint i) {
     return vec4(nf_dsa_qs[i], nf_dsa_qs[i + 1u], nf_dsa_qs[i + 2u], nf_dsa_qs[i + 3u]);
 }
@@ -103,7 +78,7 @@ void main() {
 
     bool vis = false;
     if (s < n_kv) {
-        vis = nf_dsa_visible(kv_pos[s], q_pos[t]);
+        vis = nf_attn_visible(q_pos[t], kv_pos[s], pc.causal, pc.swa_type, pc.n_swa) != 0;
     }
     const uint krow = (vis ? s : 0u) * uint(pc.key_stride) + uint(pc.key_off);
     const uint qbase = t * n_heads * idx_dim;

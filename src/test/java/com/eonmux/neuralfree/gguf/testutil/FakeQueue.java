@@ -148,6 +148,11 @@ final class FakeQueue implements ComputeQueue {
             if (sizeInBytes <= 0) {
                 throw new IllegalArgumentException("copy size must be positive, got " + sizeInBytes);
             }
+            if (s == d && srcOffset < dstOffset + sizeInBytes && dstOffset < srcOffset + sizeInBytes) {
+                // OpenCL refuses overlapping ranges of one buffer, CUDA and Vulkan leave them undefined
+                throw new IllegalArgumentException("copy ranges [" + srcOffset + ", " + (srcOffset + sizeInBytes)
+                        + ") and [" + dstOffset + ", " + (dstOffset + sizeInBytes) + ") of one buffer overlap");
+            }
             d.copyFrom(s, srcOffset, dstOffset, sizeInBytes);
             backend.record(FakeOp.builder(FakeOpKind.COPY, name)
                     .buffer(d, dstOffset).source(s, srcOffset).bytes(sizeInBytes).waits(waits));

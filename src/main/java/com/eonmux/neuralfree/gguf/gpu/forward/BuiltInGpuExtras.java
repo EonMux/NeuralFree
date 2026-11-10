@@ -55,8 +55,8 @@ public final class BuiltInGpuExtras {
 
     /** Kernels the built-in extras launch, for prewarming. */
     public static final List<String> KERNELS = Collections.unmodifiableList(Arrays.asList(
-            NormKernels.RESIDUAL_MIX, NormKernels.ROW_NORM, GpuOps.AXPBY, GpuOps.COPY2D,
-            GpuOps.BATCH_BIAS_ADD, ActKernels.UNARY, MUDD_MIX));
+            NormKernels.RESIDUAL_MIX, NormKernels.ROW_NORM, GpuOps.AXPBY, GpuOps.COPY2D, ActKernels.UNARY,
+            MUDD_MIX));
 
     /** Shared temporary holding ones (alpha of the embedding skip); every binder writes the same content. */
     static final String TEMP_ONES = "builtin.ones";
@@ -391,7 +391,7 @@ public final class BuiltInGpuExtras {
         /** Copies {@code n} rows of the residual stream into this layer's bank slot. */
         void bankRows(int n, ScratchSlot x) {
             checkStep(n);
-            ops.copy(x.buffer(), x.offset(), bank.buffer(), il * ubatch * nEmbd, n * nEmbd);
+            ops.copy(x.buffer(), x.offset(), bank.buffer(), bank.offset() + il * ubatch * nEmbd, n * nEmbd);
         }
 
         /** {@code x = x * scale + branch} over the step rows. */
@@ -443,8 +443,9 @@ public final class BuiltInGpuExtras {
     /**
      * limite MUDD (models/limite.cpp:100-140): the attention input and the residual of the layer become weighted
      * sums of the banked inputs of its taps, {@code w = mudd_up @ gelu_erf(mudd_down @ rms(x)) + mudd_up_b} holding
-     * one weight per tap for each mix. {@link #beforeBlock} banks the input, rewrites the stream with the attention
-     * mix (which the mixer reads) and keeps the residual mix for {@link #afterMixer}.
+     * one weight per tap for each mix ({@value #MUDD_MIX} adds the bias as it reads the weights). {@link #beforeBlock}
+     * banks the input, rewrites the stream with the attention mix (which the mixer reads) and keeps the residual mix
+     * for {@link #afterMixer}. Every scratch view enters the mix at its own offset.
      */
     static final class Mudd extends LimiteResid {
         private GpuWeight down;
@@ -455,7 +456,7 @@ public final class BuiltInGpuExtras {
         private ScratchSlot w;
         private ScratchSlot normed;
         private ScratchSlot downOut;
-        private GpuBuffer taps;
+        private ScratchSlot taps;
         private int nTaps;
         private int nFf;
         private float eps;
@@ -503,13 +504,13 @@ public final class BuiltInGpuExtras {
             this.w = scratch.temp(TEMP_W + il, (long) ubatch * 2 * nTaps);
             this.normed = scratch.temp(TEMP_NORMED + il, (long) ubatch * nEmbd);
             this.downOut = scratch.temp(TEMP_DOWN + il, (long) ubatch * nFf);
-            this.taps = writeTaps(ctx, scratch.temp(TEMP_TAPS + il, nTaps).buffer(), tapIdx);
+            this.taps = writeTaps(ctx, scratch.temp(TEMP_TAPS + il, nTaps), tapIdx);
             ops.prewarm(ActKernels.UNARY, new long[]{ops.local()});
             ops.prewarm(MUDD_MIX, new long[]{ops.local()});
         }
 
-        /** Uploads the layer's tap indices as one int buffer for {@value #MUDD_MIX}. */
-        private static GpuBuffer writeTaps(GpuForwardContext ctx, GpuBuffer dst, int[] tapIdx) {
+        /** Uploads the layer's tap indices into the int elements of {@code dst} for {@value #MUDD_MIX}. */
+        private static ScratchSlot writeTaps(GpuForwardContext ctx, ScratchSlot dst, int[] tapIdx) {
             byte[] bytes = new byte[tapIdx.length * Integer.BYTES];
             for (int j = 0; j < tapIdx.length; j++) {
                 int v = tapIdx[j];
@@ -519,7 +520,8 @@ public final class BuiltInGpuExtras {
                 bytes[b + 2] = (byte) (v >>> 16);
                 bytes[b + 3] = (byte) (v >>> 24);
             }
-            GpuEvent e = ctx.queue().enqueueWriteBuffer(dst, 0L, bytes.length, bytes);
+            GpuEvent e = ctx.queue().enqueueWriteBuffer(dst.buffer(), (long) dst.offset() * Integer.BYTES,
+                    bytes.length, bytes);
             if (e != null) {
                 e.close();
             }
@@ -537,13 +539,10 @@ public final class BuiltInGpuExtras {
             ops.unary(ActOp.GELU_ERF, null, downOut.buffer(), downOut.offset(), downOut.buffer(), downOut.offset(),
                     downLen);
             ops.matmul(up, downOut.buffer(), downOut.offset(), w.buffer(), w.offset(), nTokens);
-            int width = 2 * nTaps;
-            ops.enqueue(GpuOps.BATCH_BIAS_ADD, new long[]{roundUp(width)}, new long[]{ops.local()}, width, nTokens,
-                    upBias.shard(0), w.buffer());
             int bankStride = ubatch * nEmbd;
             ops.enqueue(MUDD_MIX, new long[]{roundUp((long) nTokens * nEmbd)}, new long[]{ops.local()}, nTokens,
-                    nEmbd, nTaps, il * bankStride, bankStride, bank.buffer(), w.buffer(), taps, cur.buffer(),
-                    resid.buffer());
+                    nEmbd, nTaps, bank.offset(), bankStride, w.offset(), taps.offset(), cur.offset(), resid.offset(),
+                    bank.buffer(), w.buffer(), upBias.shard(0), taps.buffer(), cur.buffer(), resid.buffer());
             ops.copy(cur.buffer(), cur.offset(), x.buffer(), x.offset(), nTokens * nEmbd);
         }
 

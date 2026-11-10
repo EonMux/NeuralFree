@@ -25,7 +25,7 @@ import static org.junit.Assert.assertTrue;
  * DISPATCH grammar back to free text after each completed structure; token, pattern and full-pattern triggers; the
  * pre-mask that keeps a token from completing a trigger word with text the grammar rejects; the free-text
  * excluded strings and tokens a structural tag hands the stage; prompt tokens and {@code reset} leave the stage
- * waiting.
+ * waiting; raw partial or invalid UTF-8 before a trigger keeps the replay at the trigger's byte offset.
  */
 public class TriggeredGrammarStageTest {
 
@@ -217,5 +217,65 @@ public class TriggeredGrammarStageTest {
         CompiledConstraint gated = GbnfBuilder.compile(ConstraintSpec.gbnf("root ::= \"a\"")
                 .withTriggers(GrammarTriggers.lazyWords(List.of("a"))));
         assertTrue(gated.gated());
+    }
+
+    /** Ids 1..255 render their raw byte, id 256 the word {@code <t>}, id 0 is EOG. */
+    private static final class RawByteVocab implements SamplerVocab {
+        static final int WORD = 256;
+
+        @Override public int vocabSize() { return 257; }
+        @Override public boolean isEog(int id) { return id == 0; }
+        @Override public int eotToken() { return 0; }
+        @Override public int eosToken() { return 0; }
+        @Override public byte[] piece(int id) {
+            if (id <= 0) {
+                return new byte[0];
+            }
+            return id == WORD ? "<t>".getBytes(StandardCharsets.UTF_8) : new byte[]{(byte) id};
+        }
+        @Override public String pieceText(int id) { return new String(piece(id), StandardCharsets.UTF_8); }
+        @Override public int[] tokenize(String text) {
+            return text.chars().toArray();
+        }
+    }
+
+    /** Samples and accepts {@code script} greedily, each token the model's sole favourite. */
+    private static void drive(Sampler sampler, SamplerVocab vocab, int... script) {
+        for (int token : script) {
+            float[] logits = new float[vocab.vocabSize()];
+            Arrays.fill(logits, -100f);
+            logits[token] = 1f;
+            assertEquals(token, sampler.sample(logits));
+            sampler.accept(token);
+        }
+    }
+
+    @Test
+    public void malformedBytesBeforeAWordTriggerReplayFromTheTriggersByteOffset() {
+        RawByteVocab raw = new RawByteVocab();
+        // a truncated three-byte sequence (E5 8F) and a lone continuation byte (AB) decode as one U+FFFD each,
+        // which would re-encode as three bytes apiece
+        for (int[] before : new int[][]{{0xE5, 0x8F}, {0xAB}, {'a', 0xE5, 0x8F, 0xAB, 0xAB}}) {
+            TriggeredGrammarStage stage = new TriggeredGrammarStage(grammar("root ::= \"<t>x\""),
+                    GrammarTriggers.lazyWords(List.of("<t>")), raw);
+            Sampler sampler = Sampler.create(SamplerConfig.greedyDecoding(), new int[0], List.of(stage), raw);
+            drive(sampler, raw, before);
+            drive(sampler, raw, RawByteVocab.WORD);
+            assertFalse(Arrays.toString(before), stage.awaitingTrigger());
+            assertTrue(stage.admits('x'));
+            assertFalse(stage.admits('y'));
+        }
+    }
+
+    @Test
+    public void aPatternTriggerAfterMalformedBytesReplaysTheSplitPiece() {
+        RawByteVocab raw = new RawByteVocab();
+        GrammarTriggers triggers = GrammarTriggers.builder(GrammarTriggers.Mode.LAZY).pattern("<(t)>").build();
+        TriggeredGrammarStage stage = new TriggeredGrammarStage(grammar("root ::= \"t>x\""), triggers, raw);
+        Sampler sampler = Sampler.create(SamplerConfig.greedyDecoding(), new int[0], List.of(stage), raw);
+        drive(sampler, raw, 0xAB, 0xE5, 0x8F, RawByteVocab.WORD);
+        assertFalse(stage.awaitingTrigger());
+        drive(sampler, raw, 'x');
+        assertTrue(stage.admits(0));
     }
 }

@@ -438,6 +438,21 @@ public final class GGUFTokenizer {
         return algorithm.piece(tokenId).clone();
     }
 
+    /**
+     * The raw bytes of one token as llama.cpp's {@code token_to_piece(id, lstrip = 0, special = false)} renders
+     * them: control and unknown tokens and out-of-range ids give no bytes, every other token its piece. Unlike
+     * {@link #decode(int)}, no decoder chain or clean-up overlay applies and no String round trip happens, so a
+     * token that holds part of a UTF-8 sequence keeps its partial bytes. The sampler vocabulary
+     * ({@code GgufVocab#piece}) serves it to the grammar, infill and reasoning-budget stages.
+     */
+    public byte[] piece(int tokenId) {
+        if (tokenId < 0 || tokenId >= vocab.size()
+                || (vocab.attr(tokenId) & (TokenizerVocab.ATTR_CONTROL | TokenizerVocab.ATTR_UNKNOWN)) != 0) {
+            return new byte[0];
+        }
+        return algorithm.piece(tokenId).clone();
+    }
+
     /** Whether decoding goes through a context-dependent overlay (decoder chain or clean-up). */
     private boolean sequenceDecoding() {
         return vocab.decoder() != null || Boolean.TRUE.equals(vocab.cleanUpTokenizationSpaces());

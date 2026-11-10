@@ -3,6 +3,11 @@ package com.eonmux.neuralfree.gpu;
 import neuralfree.gpu.GpuHipToolkit;
 import org.junit.Test;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -10,6 +15,8 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -29,11 +36,65 @@ public class GpuHipToolkitTest {
     @Test
     public void theCompileCommandCarriesStandardOptimizationAndEveryTarget() {
         List<String> cmd = GpuHipToolkit.compileCommand(HIPCC, Arrays.asList("gfx1100", "gfx90a"),
-                Collections.singletonList("-DNF_FA_SMEM_FLOATS=11264"),
+                Collections.<String>emptyList(), Collections.singletonList("-DNF_FA_SMEM_FLOATS=11264"),
                 "llm/matmul.cl.cu", "llm/matmul.cl.hsaco");
         assertEquals(Arrays.asList(HIPCC, "-std=c++17", "-O3", "-DNF_FA_SMEM_FLOATS=11264",
                 "--offload-arch=gfx1100", "--offload-arch=gfx90a",
                 "llm/matmul.cl.cu", "-o", "llm/matmul.cl.hsaco"), cmd);
+    }
+
+    @Test
+    public void theLibraryHipFlagsFollowTheOptimizationLevel() {
+        List<String> cmd = GpuHipToolkit.compileCommand(HIPCC, Collections.singletonList("gfx1100"),
+                Collections.singletonList("-ffp-contract=off"), Collections.<String>emptyList(),
+                "train/eltwise.cl.cu", "train/eltwise.cl.hsaco");
+        assertEquals(Arrays.asList(HIPCC, "-std=c++17", "-O3", "-ffp-contract=off", "--offload-arch=gfx1100",
+                "train/eltwise.cl.cu", "-o", "train/eltwise.cl.hsaco"), cmd);
+    }
+
+    /**
+     * The train library's definition in gradle/gpu-kernels.gradle compiles its HIP code objects with
+     * {@code -ffp-contract=off}, and the HIP compile passes each library's flags: training math is not contracted
+     * into fused multiply-adds, as its CUDA build's {@code -fmad=false} keeps it.
+     */
+    @Test
+    public void theTrainLibraryDefinitionCompilesWithoutContraction() throws IOException {
+        String script = new String(Files.readAllBytes(
+                new File(GpuKernelBuildCacheTest.projectRoot(), "gradle/gpu-kernels.gradle").toPath()),
+                StandardCharsets.UTF_8);
+        Map<String, List<String>> hipFlags = libraryHipFlags(script);
+        assertEquals(Collections.singletonList("-ffp-contract=off"), hipFlags.get("train"));
+        assertTrue("every library must declare its hipFlags: " + hipFlags, hipFlags.containsKey("llm"));
+        assertTrue("compileHipKernels must compile each unit with its library's hipFlags",
+                script.contains("GpuHipToolkit.compileCommand(hipcc.path, archs.selected(), lib.hipFlags,"));
+    }
+
+    /** The hipFlags of every entry of the script's gpuLibraryDefinitions, by library id. */
+    private static Map<String, List<String>> libraryHipFlags(String script) {
+        int start = script.indexOf("def gpuLibraryDefinitions = [");
+        assertTrue("gradle/gpu-kernels.gradle must define gpuLibraryDefinitions", start >= 0);
+        int end = script.indexOf("\n]", start);
+        String[] entries = script.substring(start, end).split("\\[id\\s*:");
+        Pattern id = Pattern.compile("^\\s*'([a-z0-9]+)'");
+        Pattern flags = Pattern.compile("hipFlags\\s*:\\s*\\[([^\\]]*)\\]");
+        Map<String, List<String>> byId = new LinkedHashMap<>();
+        for (int i = 1; i < entries.length; i++) {
+            Matcher idMatch = id.matcher(entries[i]);
+            assertTrue("a library entry without an id: " + entries[i], idMatch.find());
+            Matcher flagMatch = flags.matcher(entries[i]);
+            if (!flagMatch.find()) {
+                continue;
+            }
+            List<String> values = new ArrayList<>();
+            for (String value : flagMatch.group(1).split(",")) {
+                String v = value.trim();
+                if (!v.isEmpty()) {
+                    values.add(v.substring(1, v.length() - 1));
+                }
+            }
+            byId.put(idMatch.group(1), values);
+        }
+        return byId;
     }
 
     @Test
@@ -47,7 +108,7 @@ public class GpuHipToolkitTest {
     @Test
     public void aCompileWithoutATargetIsRejected() {
         try {
-            GpuHipToolkit.compileCommand(HIPCC, Collections.<String>emptyList(),
+            GpuHipToolkit.compileCommand(HIPCC, Collections.<String>emptyList(), Collections.<String>emptyList(),
                     Collections.<String>emptyList(), "u.cu", "u.hsaco");
             fail("a HIP unit compiles for at least one gfx target");
         } catch (IllegalArgumentException expected) {

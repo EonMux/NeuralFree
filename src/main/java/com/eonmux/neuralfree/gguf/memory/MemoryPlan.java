@@ -2,8 +2,10 @@ package com.eonmux.neuralfree.gguf.memory;
 
 import com.eonmux.neuralfree.gguf.arch.MemoryKind;
 import com.eonmux.neuralfree.gguf.engine.StepSizes;
+import com.eonmux.neuralfree.gguf.hparams.MropeTextPositions;
 
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -11,7 +13,8 @@ import java.util.Objects;
 /**
  * Complete memory plan of a model for one context size (built by {@code MemoryPlanner}): per-layer plans indexed by
  * virtual layer ({@code il}; trunk then NextN layers), the KV groups that share one {@code kv_pos[rows]} position
- * buffer, the settings it was planned with, and byte totals. Immutable.
+ * buffer, the settings it was planned with, and byte totals: the caches ({@link #cacheBytes()}) plus the device
+ * addressing buffers a memory allocates beside them ({@link #addressingBytes()}). Immutable.
  */
 public final class MemoryPlan {
 
@@ -175,6 +178,7 @@ public final class MemoryPlan {
     private final List<LayerMemoryPlan> layers;
     private final List<KvGroup> groups;
     private final MemoryConfig config;
+    private final BitSet sequenceAddressed;
 
     private MemoryPlan(Builder b) {
         this.kind = b.kind;
@@ -183,6 +187,7 @@ public final class MemoryPlan {
         this.layers = Collections.unmodifiableList(new ArrayList<>(b.layers));
         this.groups = Collections.unmodifiableList(new ArrayList<>(b.groups));
         this.config = b.config;
+        this.sequenceAddressed = (BitSet) b.sequenceAddressed.clone();
     }
 
     public static Builder builder(MemoryKind kind, int nCtx, int ubatch) {
@@ -369,9 +374,80 @@ public final class MemoryPlan {
         return b;
     }
 
-    /** Sum of all categories: the layer plans, the recurrent-state shadows and the position buffers. */
-    public long totalBytes() {
+    /**
+     * True when a sparse mixer reading KV group {@code g} (DSA MLA, DeepSeek-V4, Step5) selects its rows per
+     * sequence, so a paged memory keeps one {@code kv_pos} copy per sequence slot for the group.
+     */
+    public boolean sequenceAddressed(int g) {
+        group(g);
+        return sequenceAddressed.get(g);
+    }
+
+    /** Length of the memory's identity row map: the ubatch, or the longest cross-attention cache when longer. */
+    public int identityLength() {
+        int n = ubatch;
+        for (LayerMemoryPlan l : layers) {
+            if (l.crossKv() != null) {
+                n = Math.max(n, l.crossKv().rows());
+            }
+        }
+        return n;
+    }
+
+    /** True when the memory keeps its rows in the pages of a page pool (the KV groups are paged). */
+    public boolean paged() {
+        return !groups.isEmpty() && groups.get(0).paged();
+    }
+
+    /** True when the settings enable the context shift, whose RoPE deltas the memory reserves at allocation. */
+    public boolean contextShiftReserved() {
+        return config != null && config.contextShift() && !groups.isEmpty();
+    }
+
+    /**
+     * Bytes of the device addressing buffers a memory allocates beside its caches ({@code DeviceStepInputs}): per
+     * group a {@code cell_idx} of the ubatch, the step's query and RoPE positions, the state row, the identity row
+     * map and the tree mask; with {@link #contextShiftReserved()} a {@code shift_delta} per group of its rows; when
+     * {@link #paged()} per group a page table of {@code parallel x maxPages} entries and the per-sequence key
+     * lengths, the per-sequence query positions and a segment's positions, and for every
+     * {@link #sequenceAddressed} group a {@code kv_pos} copy per sequence slot. 0 for a memoryless plan, whose
+     * forward passes allocate no memory.
+     */
+    public long addressingBytes() {
+        if (kind == MemoryKind.NONE) {
+            return 0L;
+        }
+        int n = groups.size();
+        long ints = (long) n * ubatch + ubatch + (long) MropeTextPositions.SECTIONS * ubatch + 1 + identityLength();
+        long bytes = ints * Integer.BYTES + (long) ubatch * Long.BYTES;
+        if (contextShiftReserved()) {
+            bytes += positionBytes();
+        }
+        if (paged()) {
+            long parallel = config != null ? config.parallel() : 1;
+            int pageSize = groups.get(0).pageSize();
+            boolean unified = config == null || config.kvUnified();
+            long cap = unified ? nCtx : Math.max(1, nCtx / parallel);
+            long maxPages = (cap + pageSize - 1) / pageSize;
+            bytes += (long) n * (parallel * maxPages + parallel) * Integer.BYTES
+                    + (parallel + ubatch) * Integer.BYTES;
+            for (KvGroup g : groups) {
+                if (sequenceAddressed.get(g.index())) {
+                    bytes += parallel * g.kvPosBytes();
+                }
+            }
+        }
+        return bytes;
+    }
+
+    /** Bytes of the caches: the layer plans, the recurrent-state shadows and the position buffers. */
+    public long cacheBytes() {
         return kvBytes() + stateBytes() + snapshotBytes() + sideCacheBytes() + positionBytes();
+    }
+
+    /** Device bytes the memory allocates: its caches plus its addressing buffers. */
+    public long totalBytes() {
+        return cacheBytes() + addressingBytes();
     }
 
     /** The plan's kind, sizes, KV groups (rows, ring or page pool, window) and byte totals per category. */
@@ -379,7 +455,8 @@ public final class MemoryPlan {
     public String toString() {
         return "MemoryPlan{" + kind + ", nCtx=" + nCtx + ", ubatch=" + ubatch + ", layers=" + layers.size() + ", groups="
                 + groups + ", kv=" + kvBytes() + "B, state=" + stateBytes() + "B, snapshots=" + snapshotBytes()
-                + "B, side=" + sideCacheBytes() + "B, pos=" + positionBytes() + "B}";
+                + "B, side=" + sideCacheBytes() + "B, pos=" + positionBytes() + "B, addressing=" + addressingBytes()
+                + "B}";
     }
 
     public static final class Builder {
@@ -388,6 +465,7 @@ public final class MemoryPlan {
         private final int ubatch;
         private final List<LayerMemoryPlan> layers = new ArrayList<>();
         private final List<KvGroup> groups = new ArrayList<>();
+        private final BitSet sequenceAddressed = new BitSet();
         private MemoryConfig config;
 
         private Builder(MemoryKind kind, int nCtx, int ubatch) {
@@ -401,6 +479,15 @@ public final class MemoryPlan {
         /** The settings the plan is built with. */
         public Builder config(MemoryConfig v) { this.config = Objects.requireNonNull(v, "config"); return this; }
 
+        /** Marks KV group {@code g} as read per sequence by a sparse mixer ({@link MemoryPlan#sequenceAddressed}). */
+        public Builder sequenceAddressed(int g) {
+            if (g < 0) {
+                throw new IllegalArgumentException("KV group index must be >= 0, got " + g);
+            }
+            this.sequenceAddressed.set(g);
+            return this;
+        }
+
         /** @throws IllegalArgumentException when indices are not contiguous or a layer disagrees with its group */
         public MemoryPlan build() {
             if (nCtx <= 0 || ubatch <= 0) {
@@ -410,6 +497,10 @@ public final class MemoryPlan {
                 if (groups.get(g).index() != g) {
                     throw new IllegalArgumentException("KV group at position " + g + " has index " + groups.get(g).index());
                 }
+            }
+            if (sequenceAddressed.length() > groups.size()) {
+                throw new IllegalArgumentException("sequence-addressed KV group " + (sequenceAddressed.length() - 1)
+                        + " is not one of the " + groups.size() + " groups");
             }
             for (int i = 0; i < layers.size(); i++) {
                 LayerMemoryPlan l = layers.get(i);

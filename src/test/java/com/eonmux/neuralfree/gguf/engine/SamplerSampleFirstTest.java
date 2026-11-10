@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
 import com.eonmux.neuralfree.gguf.engine.sampling.TriggeredGrammarStage;
+import com.eonmux.neuralfree.gguf.grammar.GbnfParser;
 import com.eonmux.neuralfree.gguf.grammar.Grammar;
 import com.eonmux.neuralfree.gguf.grammar.GrammarTriggers;
 import org.junit.Test;
@@ -30,9 +31,10 @@ import static org.junit.Assert.assertTrue;
  * {@code sample}, the other through the whole-row mask of {@link Sampler#apply}; they pick the same token at every
  * step, or fail with the same exception, under a plain greedy chain, penalties, DRY, a logit bias with bans, the
  * request masks (allowed ids, bad words, the min-tokens ban) and a trigger-gated grammar. The sample-first path
- * decides most steps itself, so the comparison covers both of its outcomes. Sampled chains and chains with a
- * set-dependent stage (typical-p, XTC, top-n-sigma, infill, mirostat, adaptive-p, a logits processor, a reasoning
- * budget) keep the whole-row mask.
+ * decides most steps itself, so the comparison covers both of its outcomes. A token whose piece ends inside a
+ * UTF-8 character gets the mask's answer from sample-first too, in a plain and a trigger-gated grammar: kept only
+ * where a parse can complete the character. Sampled chains and chains with a set-dependent stage (typical-p, XTC,
+ * top-n-sigma, infill, mirostat, adaptive-p, a logits processor, a reasoning budget) keep the whole-row mask.
  */
 public class SamplerSampleFirstTest {
 
@@ -122,6 +124,76 @@ public class SamplerSampleFirstTest {
         assertFalse("a reasoning budget forces its own tokens behind the mask",
                 sampler(SamplerConfig.greedyDecoding(), Map.of(),
                         List.of(new GrammarStage(grammar, VOCAB), budget)).sampleFirstChain());
+    }
+
+    @Test
+    public void aTokenEndingInAPartialCharacterGetsTheMaskAnswer() {
+        Grammar ascii = GbnfParser.parse("root ::= \"a\" [a-z]+");
+        Sampler first = partialSampler(new GrammarStage(ascii, PARTIAL));
+        Sampler masked = partialSampler(new GrammarStage(ascii, PARTIAL));
+        agree(first, masked, partialRow(A_LEAD, A), A, "no completion of the lead byte is in [a-z]");
+        agree(first, masked, partialRow(A_LEAD, B), B, "nor after a letter");
+
+        Grammar han = GbnfParser.parse("root ::= \"a\" \"\u53eb\" \"b\"");
+        first = partialSampler(new GrammarStage(han, PARTIAL));
+        masked = partialSampler(new GrammarStage(han, PARTIAL));
+        agree(first, masked, partialRow(A_LEAD, A), A_LEAD, "the lead byte can complete to \u53eb");
+        agree(first, masked, partialRow(A, TAIL), TAIL, "a letter cannot continue the pending character");
+        agree(first, masked, partialRow(A_LEAD, B), B, "the character is complete");
+    }
+
+    @Test
+    public void aTriggerWordEndingInAPartialCharacterGetsTheMaskAnswer() {
+        Grammar ascii = GbnfParser.parse("root ::= \"a\" [a-z]+");
+        GrammarTriggers triggers = GrammarTriggers.lazyWords(List.of("a"));
+        Sampler first = partialSampler(new TriggeredGrammarStage(ascii, triggers, PARTIAL));
+        Sampler masked = partialSampler(new TriggeredGrammarStage(ascii, triggers, PARTIAL));
+        agree(first, masked, partialRow(A_LEAD, A), A, "the trigger's grammar refuses the partial character");
+        agree(first, masked, partialRow(A_LEAD, B), B, "the active grammar refuses it too");
+    }
+
+    private static final int A = 1;
+    /** "a" followed by the lead byte of \u53eb (E5 8F AB): a piece ending inside a character. */
+    private static final int A_LEAD = 2;
+    private static final int B = 3;
+    /** The two bytes that complete \u53eb after its lead byte. */
+    private static final int TAIL = 4;
+
+    /** Pieces around one split character; id 0 ends generation. */
+    private static final SamplerVocab PARTIAL = new SamplerVocab() {
+        private final byte[][] pieces = {{}, {'a'}, {'a', (byte) 0xE5}, {'b'}, {(byte) 0x8F, (byte) 0xAB}};
+        @Override public int vocabSize() { return pieces.length; }
+        @Override public boolean isEog(int id) { return id == 0; }
+        @Override public int eotToken() { return 0; }
+        @Override public int eosToken() { return 0; }
+        @Override public byte[] piece(int id) { return pieces[id].clone(); }
+        @Override public String pieceText(int id) { return new String(pieces[id], StandardCharsets.UTF_8); }
+        @Override public int[] tokenize(String text) { return new int[0]; }
+    };
+
+    private static Sampler partialSampler(SamplerStage stage) {
+        Sampler sampler = Sampler.create(SamplerConfig.greedyDecoding(), new int[0], Map.of(), List.of(stage), PARTIAL);
+        assertTrue(sampler.sampleFirstChain());
+        return sampler;
+    }
+
+    /** A row whose argmax is {@code top} and whose runner-up is {@code next}. */
+    private static float[] partialRow(int top, int next) {
+        float[] row = new float[PARTIAL.vocabSize()];
+        row[top] = 5f;
+        row[next] = 4f;
+        return row;
+    }
+
+    /**
+     * The sample-first chain and the whole-row mask both select {@code expected} over {@code row}, and both accept
+     * it.
+     */
+    private static void agree(Sampler first, Sampler masked, float[] row, int expected, String why) {
+        assertEquals(why + ": the whole-row mask", expected, masked.apply(row).selectedId());
+        assertEquals(why + ": sample-first", expected, first.sample(row));
+        masked.accept(expected);
+        first.accept(expected);
     }
 
     /** Ids 0-255 render their byte, so the reasoning budget can tokenize its tags; 0 ends generation. */

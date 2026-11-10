@@ -334,11 +334,6 @@ public final class BuiltInCpuExtras {
                 x[i] = x[i] * scale + branch[i];
             }
         }
-
-        /** The banked input of layer {@code tap}, token {@code t}, element {@code i}. */
-        float banked(int tap, int t, int i) {
-            return bank[(tap * scratch.ubatch() + t) * nEmbd + i];
-        }
     }
 
     /** limite without MUDD: the learned scales fold the plain residual and the FFN input. */
@@ -470,18 +465,8 @@ public final class BuiltInCpuExtras {
                         }
                         w[wBase + j] = acc;
                     }
-                    int xBase = t * nEmbd;
-                    for (int i = 0; i < nEmbd; i++) {
-                        float cAcc = 0f;
-                        float rAcc = 0f;
-                        for (int j = 0; j < nTaps; j++) {
-                            float h = banked(taps[j], t, i);
-                            cAcc += w[wBase + j] * h;
-                            rAcc += w[wBase + nTaps + j] * h;
-                        }
-                        cur[xBase + i] = cAcc;
-                        resid[xBase + i] = rAcc;
-                    }
+                    MuddMath.mixRow(bank, 0, scratch.ubatch() * nEmbd, taps, t, nEmbd, w, wBase, cur, resid,
+                            t * nEmbd);
                 }
             });
         }

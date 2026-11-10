@@ -552,6 +552,7 @@ public final class LLMDemo {
         printBytes("compressed cache", compressedCache, "");
         printBytes("compressed state", compressedState, "");
         printBytes("positions", plan.positionBytes(), "");
+        printBytes("addressing", plan.addressingBytes(), "page tables, step positions, shift deltas");
         System.out.printf(Locale.ROOT, "  %-20s %10.1f MiB%n", "total", plan.totalBytes() / MIB);
         logStats(String.format(Locale.ROOT, "Memory: %s, ctx %d, ubatch %d, %.1f MiB", plan.kind(), plan.nCtx(),
                 plan.ubatch(), plan.totalBytes() / MIB));

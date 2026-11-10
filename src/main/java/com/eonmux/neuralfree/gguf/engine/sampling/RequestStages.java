@@ -10,6 +10,7 @@ import com.eonmux.neuralfree.gguf.grammar.GrammarVocab;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * The request-driven sampling stages: {@link AllowedTokensStage} for {@code allowed_token_ids},
@@ -72,7 +73,7 @@ public final class RequestStages {
         if (constraint == null) {
             return null;
         }
-        return stageOf(GbnfBuilder.compile(constraint, grammarVocab), vocab);
+        return constraintStage(GbnfBuilder.compile(constraint, grammarVocab), vocab);
     }
 
     /**
@@ -84,10 +85,19 @@ public final class RequestStages {
         if (constraint == null) {
             return null;
         }
-        return stageOf(compiler.compile(constraint), vocab);
+        return constraintStage(compiler.compile(constraint), vocab);
     }
 
-    private static SamplerStage stageOf(CompiledConstraint compiled, SamplerVocab vocab) {
+    /**
+     * The stage of an already compiled constraint: a trigger-gated grammar runs as a {@link TriggeredGrammarStage}
+     * with the constraint's free-text exclusions ({@link CompiledConstraint#freeExcludes},
+     * {@link CompiledConstraint#freeExcludeTokens}), a plain one as a {@link GrammarStage}; both read their pieces
+     * from {@code vocab}. Every engine path builds its constraint stage here, so the single-sequence and batched
+     * engines enforce the same constraint.
+     */
+    public static SamplerStage constraintStage(CompiledConstraint compiled, SamplerVocab vocab) {
+        Objects.requireNonNull(compiled, "compiled");
+        Objects.requireNonNull(vocab, "vocab");
         return compiled.gated()
                 ? new TriggeredGrammarStage(compiled.grammar(), compiled.triggers(), vocab,
                         compiled.freeExcludes(), compiled.freeExcludeTokens())

@@ -10,7 +10,6 @@ import com.eonmux.neuralfree.gguf.arch.MixerKind;
 import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.hparams.ModelHparamsBuilder;
-import com.eonmux.neuralfree.gguf.hparams.MropeTextPositions;
 import com.eonmux.neuralfree.gguf.memory.ContextFitter;
 import com.eonmux.neuralfree.gguf.memory.LayerMemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
@@ -36,7 +35,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The device-side byte accounting a hybrid fit charges: the plan bytes of the offloaded layers plus the step inputs,
+ * The device-side byte accounting a hybrid fit charges: the plan bytes of the offloaded layers plus the plan's
+ * position and addressing buffers,
  * so a split fits a context that the whole-model accounting would refuse.
  */
 public class HybridFitTest {
@@ -61,7 +61,7 @@ public class HybridFitTest {
                 layers = Math.addExact(layers, lp.totalBytes());
             }
         }
-        assertEquals(layers + HybridFit.stepInputBytes(plan), bytes);
+        assertEquals(layers + plan.positionBytes() + plan.addressingBytes(), bytes);
         assertTrue(bytes + " must be below the whole plan " + plan.totalBytes(), bytes < plan.totalBytes());
     }
 
@@ -84,17 +84,9 @@ public class HybridFitTest {
     }
 
     @Test
-    public void stepInputBytesMatchThePlannedGroups() {
-        ModelSpec spec = spec();
-        MemoryPlan plan = MemoryPlanner.planForContext(spec, memoryConfig(), N_CTX);
-        int ubatch = plan.ubatch();
-        long expected = 0;
-        for (MemoryPlan.KvGroup g : plan.groups()) {
-            expected += (long) g.rows() * Integer.BYTES + (long) ubatch * Integer.BYTES;
-        }
-        // query positions, one row per RoPE section, the recurrent-state row counter and the identity rows
-        expected += (2 + MropeTextPositions.SECTIONS) * (long) ubatch * Integer.BYTES + Integer.BYTES;
-        assertEquals(expected, HybridFit.stepInputBytes(plan));
+    public void everyDeviceLayerChargesTheWholePlan() {
+        MemoryPlan plan = MemoryPlanner.planForContext(spec(), memoryConfig(), N_CTX);
+        assertEquals(plan.totalBytes(), HybridFit.contextBytes(plan, il -> true));
     }
 
     /** The offload of the last two trunk layers. */

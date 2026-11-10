@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.gguf.ops.sparse;
 
 import com.eonmux.neuralfree.gguf.arch.SwaType;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
+import com.eonmux.neuralfree.gguf.memory.KvWindow;
 import com.eonmux.neuralfree.gguf.ops.sparse.CpuDsaIndexer.RowReader;
 import org.junit.Test;
 
@@ -40,6 +41,26 @@ public class CpuDsaTest {
         assertTrue(CpuDsaIndexer.visible(false, SwaType.SYMMETRIC, 4, 12, 10));
         assertFalse(CpuDsaIndexer.visible(false, SwaType.SYMMETRIC, 4, 13, 10));
         assertFalse(CpuDsaIndexer.visible(false, SwaType.SYMMETRIC, 4, 7, 10));
+    }
+
+    @Test
+    public void everyWindowTypeFollowsTheSharedAttentionMask() {
+        // chunked lookback (llama-hparams.h): the query's chunk and the one before it stay visible
+        assertTrue(CpuDsaIndexer.visible(true, SwaType.CHUNKED_LOOKBACK, 4, 4, 10));
+        assertFalse(CpuDsaIndexer.visible(true, SwaType.CHUNKED_LOOKBACK, 4, 3, 10));
+        assertTrue(CpuDsaIndexer.visible(true, SwaType.CHUNKED_LOOKBACK, 4, 0, 3));
+        for (SwaType type : SwaType.values()) {
+            int nSwa = type == SwaType.NONE ? 0 : 6;
+            for (boolean causal : new boolean[] {true, false}) {
+                KvWindow window = KvWindow.of(type, nSwa, causal);
+                for (int q = 0; q < 40; q++) {
+                    for (int k = -1; k < 40; k++) {
+                        assertEquals(type + " causal=" + causal + " q=" + q + " k=" + k, window.visible(q, k),
+                                CpuDsaIndexer.visible(causal, type, nSwa, k, q));
+                    }
+                }
+            }
+        }
     }
 
     @Test

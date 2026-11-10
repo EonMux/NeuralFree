@@ -16,7 +16,9 @@ import java.util.Set;
  * The reference grammar stage of the differential tests: a line-by-line transcription of llama.cpp's grammar runtime
  * ({@code llama-grammar.cpp}: {@code llama_grammar_apply_impl}, {@code llama_grammar_accept_token},
  * {@code llama_grammar_reject_candidates_for_stack}) over list stacks, one candidate object per token and a fresh
- * UTF-8 decode per candidate and step, with the xgrammar budget frames {@link GrammarStage} documents.
+ * UTF-8 decode per candidate and step, with the xgrammar budget frames {@link GrammarStage} documents. Accepting a
+ * token applies the mask's trailing partial UTF-8 test ({@code llama_grammar_match_partial_char}) to the surviving
+ * parses, so a token the mask refuses for its partial character is refused on accept too.
  * {@link GrammarStageDifferentialTest} checks the production stage against it mask for mask.
  */
 final class LegacyGrammarStage extends SamplerStage {
@@ -179,7 +181,7 @@ final class LegacyGrammarStage extends SamplerStage {
             return true;
         }
         int[][] decoded = decodeUtf8(piece, partialValue, partialRemain);
-        List<List<Integer>> next = nextStacks(token, decoded[0]);
+        List<List<Integer>> next = nextStacks(token, decoded);
         if (next.isEmpty()) {
             return false;
         }
@@ -189,8 +191,16 @@ final class LegacyGrammarStage extends SamplerStage {
         return true;
     }
 
-    /** The partial parses after {@code token} with code points {@code cps} (trailing 0 included); empty on a reject. */
-    private List<List<Integer>> nextStacks(int token, int[] cps) {
+    /**
+     * The partial parses after {@code token} whose piece decoded to {@code decoded} ({@link #decodeUtf8}: the code
+     * points with the trailing 0, then the partial tail); empty on a reject. A parse survives only when it can also
+     * take the piece's trailing partial UTF-8 sequence, the test the mask applies ({@link #rejectsForStack}), so an
+     * invalid continuation byte or an impossible partial character is refused here as it is masked there.
+     */
+    private List<List<Integer>> nextStacks(int token, int[][] decoded) {
+        int[] cps = decoded[0];
+        int value = decoded[1][0];
+        int remain = decoded[1][1];
         List<List<Integer>> next = new ArrayList<>();
         for (List<Integer> unstarted : stacks) {
             List<Integer> stack = unstarted.isEmpty() ? null : tokenStart(unstarted);
@@ -200,7 +210,7 @@ final class LegacyGrammarStage extends SamplerStage {
             int pos = stack.get(stack.size() - 1);
             GrammarElement.Type type = flat[pos].type();
             if (GrammarElement.isToken(type)) {
-                if (matchToken(pos, token)) {
+                if ((cps.length > 1 || remain == 0) && matchToken(pos, token)) {
                     List<Integer> advanced = withoutTop(stack);
                     int after = afterTokenSet(pos);
                     if (!isEndOfSequence(after)) {
@@ -219,7 +229,7 @@ final class LegacyGrammarStage extends SamplerStage {
                     current = step;
                 }
                 for (List<Integer> surviving : current) {
-                    if (!next.contains(surviving)) {
+                    if (takesPartial(surviving, value, remain) && !next.contains(surviving)) {
                         next.add(surviving);
                     }
                 }
@@ -246,7 +256,23 @@ final class LegacyGrammarStage extends SamplerStage {
         if (piece.length == 0 || piece[0] == 0) {
             return false;
         }
-        return !nextStacks(token, decodeUtf8(piece, partialValue, partialRemain)[0]).isEmpty();
+        return !nextStacks(token, decodeUtf8(piece, partialValue, partialRemain)).isEmpty();
+    }
+
+    /**
+     * Whether a parse that read a piece's complete code points can take its trailing partial UTF-8 sequence: none
+     * is pending ({@code remain == 0}), or the top is a char element with room left whose ranges hold a completion
+     * of it ({@link #matchPartialChar}; an invalid sequence, {@code remain < 0}, has none).
+     */
+    private boolean takesPartial(List<Integer> stack, int value, int remain) {
+        if (remain == 0) {
+            return true;
+        }
+        if (stack.isEmpty()) {
+            return false;
+        }
+        int top = stack.get(stack.size() - 1);
+        return !GrammarElement.isToken(flat[top].type()) && charsLeft(stack) && matchPartialChar(top, value, remain);
     }
 
     @Override
@@ -293,7 +319,12 @@ final class LegacyGrammarStage extends SamplerStage {
             }
             current = step;
         }
-        return !current.isEmpty();
+        for (List<Integer> cur : current) {
+            if (takesPartial(cur, decoded[1][0], decoded[1][1])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Arms the stage as its first {@link #apply} does: accepted tokens advance the grammar from here on. */

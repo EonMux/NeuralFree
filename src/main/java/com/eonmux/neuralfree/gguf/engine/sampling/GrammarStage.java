@@ -17,9 +17,11 @@ import java.util.Set;
  * must see the logits).
  *
  * <p>The grammar state is the set of partial parses (stacks of flattened-rule indices, top last) plus the partial
- * UTF-8 sequence a multi-byte character split across tokens leaves. {@code accept} feeds only tokens sampled after
- * the stage first applied ({@link #apply}): {@code Sampler.accept} also feeds prompt tokens (the penalty stages'
- * history), and llama.cpp's grammar sees generated tokens only — a prompt must not advance the grammar.
+ * UTF-8 sequence a multi-byte character split across tokens leaves; a piece ending in a partial sequence survives
+ * only on a parse that can complete it, in the mask, {@link #keeps}, {@link #admits} and {@code accept} alike.
+ * {@code accept} feeds only tokens sampled after the stage first applied ({@link #apply}): {@code Sampler.accept}
+ * also feeds prompt tokens (the penalty stages' history), and llama.cpp's grammar sees generated tokens only — a
+ * prompt must not advance the grammar.
  *
  * <p>A budget element ({@link GrammarElement.Type#TOKEN_BUDGET}, {@link GrammarElement.Type#CHAR_BUDGET}) opens a
  * counted region, xgrammar's {@code max_tokens} / {@code max_chars} rule attributes: the stack holds a frame — the
@@ -286,7 +288,7 @@ public final class GrammarStage extends SamplerStage implements TokenGate {
         GrammarPieces.decode(piece, partialValue, partialRemain, scratch);
         int value = scratch.endValue;
         int remain = scratch.endRemain;
-        GrammarAutomaton.Stack[] next = nextStacks(token, scratch.data, scratch.length - 1);
+        GrammarAutomaton.Stack[] next = nextStacks(token, scratch.data, scratch.length - 1, value, remain);
         if (next.length == 0) {
             return false;
         }
@@ -296,8 +298,14 @@ public final class GrammarStage extends SamplerStage implements TokenGate {
         return true;
     }
 
-    /** The partial parses after {@code token} with code points {@code cps[0, count)}; empty on a reject. */
-    private GrammarAutomaton.Stack[] nextStacks(int token, int[] cps, int count) {
+    /**
+     * The partial parses after {@code token} whose piece decoded to the code points {@code cps[0, count)} and the
+     * trailing partial UTF-8 sequence {@code (value, remain)}; empty on a reject. A parse survives only when it can
+     * also take that partial sequence ({@link #takesPartial}), the test the mask applies ({@link GrammarRejectWalk}),
+     * so an invalid continuation byte or an impossible partial character is refused here as it is masked there; a
+     * token element takes only a piece with a complete code point or no partial sequence.
+     */
+    private GrammarAutomaton.Stack[] nextStacks(int token, int[] cps, int count, int value, int remain) {
         Set<GrammarAutomaton.Stack> next = new LinkedHashSet<>();
         for (GrammarAutomaton.Stack unstarted : stacks) {
             GrammarAutomaton.Stack stack = unstarted.isEmpty() ? null : GrammarAutomaton.tokenStart(unstarted);
@@ -306,11 +314,15 @@ public final class GrammarStage extends SamplerStage implements TokenGate {
             }
             int pos = stack.top();
             if (grammar.isToken(pos)) {
-                if (grammar.matchToken(pos, token)) {
+                if ((count > 0 || remain == 0) && grammar.matchToken(pos, token)) {
                     grammar.acceptToken(stack, pos, next);
                 }
             } else {
-                next.addAll(acceptCodePoints(stack, cps, count));
+                for (GrammarAutomaton.Stack surviving : acceptCodePoints(stack, cps, count)) {
+                    if (takesPartial(surviving, value, remain)) {
+                        next.add(surviving);
+                    }
+                }
             }
         }
         return next.toArray(new GrammarAutomaton.Stack[0]);
@@ -350,7 +362,24 @@ public final class GrammarStage extends SamplerStage implements TokenGate {
         }
         scratch.clear();
         GrammarPieces.decode(piece, partialValue, partialRemain, scratch);
-        return nextStacks(token, scratch.data, scratch.length - 1).length > 0;
+        return nextStacks(token, scratch.data, scratch.length - 1, scratch.endValue, scratch.endRemain).length > 0;
+    }
+
+    /**
+     * Whether a parse that read a piece's complete code points can take its trailing partial UTF-8 sequence: none
+     * is pending ({@code remain == 0}), or the top is a char element with room left whose ranges hold a completion
+     * of it ({@link GrammarAutomaton#matchPartialChar}; an invalid sequence, {@code remain < 0}, has none).
+     */
+    private boolean takesPartial(GrammarAutomaton.Stack stack, int value, int remain) {
+        if (remain == 0) {
+            return true;
+        }
+        if (stack.isEmpty()) {
+            return false;
+        }
+        int top = stack.top();
+        return !grammar.isToken(top) && GrammarAutomaton.charsLeft(stack)
+                && grammar.matchPartialChar(top, value, remain);
     }
 
     @Override
@@ -386,8 +415,13 @@ public final class GrammarStage extends SamplerStage implements TokenGate {
         int count = scratch.length - 1;
         for (GrammarAutomaton.Stack stack : stacks) {
             GrammarAutomaton.Stack started = stack.isEmpty() ? null : GrammarAutomaton.tokenStart(stack);
-            if (started != null && !acceptCodePoints(started, scratch.data, count).isEmpty()) {
-                return true;
+            if (started == null) {
+                continue;
+            }
+            for (GrammarAutomaton.Stack surviving : acceptCodePoints(started, scratch.data, count)) {
+                if (takesPartial(surviving, scratch.endValue, scratch.endRemain)) {
+                    return true;
+                }
             }
         }
         return false;

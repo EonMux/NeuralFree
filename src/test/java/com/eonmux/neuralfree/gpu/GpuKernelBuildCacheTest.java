@@ -71,7 +71,7 @@ public class GpuKernelBuildCacheTest {
     }
 
     /** Walks up from the test working directory to the checkout that holds gradle/gpu-kernels.gradle. */
-    private static File projectRoot() {
+    static File projectRoot() {
         File dir = new File(System.getProperty("user.dir")).getAbsoluteFile();
         while (dir != null) {
             if (new File(dir, "gradle/gpu-kernels.gradle").isFile()) {

@@ -8,6 +8,7 @@ import com.eonmux.neuralfree.gguf.memory.ContextFitter;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlanner;
+import com.eonmux.neuralfree.gguf.memory.MemoryPlannerTest;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.TensorCatalog;
 import com.eonmux.neuralfree.gguf.spec.resolve.ModelSpecBuilder;
@@ -106,8 +107,11 @@ public class DraftCompanionPlacementTest {
         ContextFitter.Companion stepped = companion(draft, 64);
         MemoryPlan plan = MemoryPlanner.planForContext(target(), MemoryConfig.defaults(), 2048);
         assertEquals(512, plan.ubatch());
-        assertEquals("the scratch follows the draft ubatch, the caches stay at the plan's",
-                perToken * (plan.ubatch() - 64), plain.bytes(plan) - stepped.bytes(plan));
+        // the draft's one-group memory plans its addressing at the draft ubatch too
+        long addressing = MemoryPlannerTest.contiguousAddressing(1, plan.ubatch())
+                - MemoryPlannerTest.contiguousAddressing(1, 64);
+        assertEquals("the scratch and the addressing follow the draft ubatch, the caches stay at the plan's",
+                perToken * (plan.ubatch() - 64) + addressing, plain.bytes(plan) - stepped.bytes(plan));
     }
 
     @Test

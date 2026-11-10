@@ -2,10 +2,14 @@ package com.eonmux.neuralfree.gguf.memory.paged;
 
 /**
  * One host-side row move the backend must run besides a step's writes: the rows {@code [srcRow, srcRow + rows)}
- * of one KV group (cell addresses) carry their keys and values to the rows at {@code dstRow}, which hold no live
- * position. The compaction of a shifted sequence emits these — the cells the rows live in move, so the data moves
- * with them. Immutable; the compaction's moves never read a cell another move wrote (every destination cell held
- * no live row, so it is no move's source), and any order is safe.
+ * of one KV group (cell addresses) carry their keys and values to the rows {@code [dstRow, dstRow + rows)}. The
+ * compaction of a shifted sequence and the tree verify's commit emit these: the cells the rows live in move, so
+ * the data moves with them. Immutable.
+ *
+ * <p>Ordering: the moves of one queue run in the order they were queued. A move never reads a cell an earlier move
+ * of the queue wrote, but its destination may be an earlier move's source (a compaction that slides rows by less
+ * than a run's length), so a backend must not reorder them. The source and destination ranges of one move never
+ * overlap, as a device buffer copy requires.
  */
 public final class RowMove {
 
@@ -27,8 +31,8 @@ public final class RowMove {
      * A move of {@code rows} rows from {@code srcRow} to the empty rows at {@code dstRow} of one KV group, for the
      * sequence the rows belong to (the caller drops the moves of a sequence whose rows leave).
      *
-     * @throws IllegalArgumentException for a non-positive row count, a destination equal to the source, or a
-     *                                  negative row
+     * @throws IllegalArgumentException for a non-positive row count, overlapping source and destination ranges,
+     *                                  or a negative row
      */
     public static RowMove of(int seq, int group, int srcRow, int dstRow, int rows) {
         if (rows <= 0) {
@@ -38,8 +42,9 @@ public final class RowMove {
             throw new IllegalArgumentException("row move needs non-negative rows, got src " + srcRow + ", dst "
                     + dstRow);
         }
-        if (dstRow == srcRow) {
-            throw new IllegalArgumentException("row move needs two different rows, got " + srcRow);
+        if (Math.abs((long) srcRow - dstRow) < rows) {
+            throw new IllegalArgumentException("row move of " + rows + " rows from " + srcRow + " to " + dstRow
+                    + " overlaps itself");
         }
         return new RowMove(seq, group, srcRow, dstRow, rows);
     }
@@ -53,7 +58,7 @@ public final class RowMove {
     /** First source row (a cell address). */
     public int srcRow() { return srcRow; }
 
-    /** First destination row (a cell address below the source). */
+    /** First destination row (a cell address). */
     public int dstRow() { return dstRow; }
 
     /** Rows the move carries. */

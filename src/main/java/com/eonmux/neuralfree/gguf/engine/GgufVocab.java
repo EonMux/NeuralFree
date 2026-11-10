@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 /**
  * A SamplerVocab on a GGUF model's tokenizer, following llama.cpp's piece semantics per id. One instance serves every
  * request of an engine, from whichever thread samples it: the piece caches fill lazily through atomic slots, so a
- * piece one thread decodes is seen whole by the others.
+ * piece one thread caches is seen whole by the others.
  */
 final class GgufVocab implements SamplerVocab {
 
@@ -51,7 +51,10 @@ final class GgufVocab implements SamplerVocab {
         return special.eos();
     }
 
-    /** token_to_piece(id, lstrip = 0, special = false): UNKNOWN and CONTROL give no bytes, a byte token its byte. */
+    /**
+     * token_to_piece(id, lstrip = 0, special = false): UNKNOWN and CONTROL give no bytes, a byte token its byte,
+     * every other token its raw piece ({@link GGUFTokenizer#piece}), partial UTF-8 included.
+     */
     @Override
     public byte[] piece(int id) {
         if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
@@ -62,8 +65,7 @@ final class GgufVocab implements SamplerVocab {
         }
         byte[] cached = pieces.get(id);
         if (cached == null) {
-            // the visible piece bytes (GGUFTokenizer.decode of one token, plain decoding)
-            cached = tokenizer.decode(id).getBytes(StandardCharsets.UTF_8);
+            cached = tokenizer.piece(id);
             pieces.set(id, cached);
         }
         return cached;

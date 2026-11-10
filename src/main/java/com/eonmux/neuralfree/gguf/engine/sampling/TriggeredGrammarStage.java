@@ -203,12 +203,12 @@ public final class TriggeredGrammarStage extends SamplerStage implements TokenGa
             return true;
         }
         byte[] bytes = buffer.toByteArray();
-        String text = new String(bytes, StandardCharsets.UTF_8);
-        int at = triggers.firstStart(text);
+        DecodedBytes text = DecodedBytes.of(bytes);
+        int at = triggers.firstStart(text.text());
         if (at < 0) {
             return true;
         }
-        int byteStart = text.substring(0, at).getBytes(StandardCharsets.UTF_8).length;
+        int byteStart = text.byteOffset(at);
         List<Span> replay = new ArrayList<>(spans);
         start();
         for (Span s : replay) {

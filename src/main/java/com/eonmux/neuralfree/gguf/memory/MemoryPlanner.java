@@ -111,6 +111,13 @@ public final class MemoryPlanner {
     private static final Set<MemoryKind> RING_KINDS =
             Collections.unmodifiableSet(EnumSet.of(MemoryKind.KV, MemoryKind.HYBRID, MemoryKind.DSA_ISWA, MemoryKind.DSV4));
 
+    /**
+     * Mixers that select KV rows per sequence (the DSA lightning indexer, the DeepSeek-V4 raw window, the Step5
+     * sparse attention): a paged memory keeps a {@code kv_pos} copy per sequence slot for the groups they read.
+     */
+    private static final Set<MixerKind> SEQUENCE_ADDRESSED_MIXERS =
+            Collections.unmodifiableSet(EnumSet.of(MixerKind.DSA_MLA, MixerKind.DSV4, MixerKind.STEP5));
+
     /** Architectures whose lightning-indexer cache is always Hadamard-rotated (llama-kv-cache.cpp:340-345). */
     private static final Set<Arch> INDEXER_ROTATION_ARCHS =
             Collections.unmodifiableSet(EnumSet.of(Arch.DEEPSEEK32, Arch.DEEPSEEK4, Arch.GLM_DSA, Arch.DOTS3NOTE));
@@ -538,6 +545,11 @@ public final class MemoryPlanner {
             int idxWidthAll = commonDims(drafts, headKAll, headVAll);
             for (MemoryPlan.KvGroup g : keptGroups(drafts)) {
                 b.group(g);
+            }
+            for (Draft d : drafts) {
+                if (d.group >= 0 && kept(d.layer) && SEQUENCE_ADDRESSED_MIXERS.contains(d.layer.mixerKind())) {
+                    b.sequenceAddressed(groupRemap[d.group]);
+                }
             }
             for (Draft d : drafts) {
                 b.layer(build(d, drafts, headKAll, headVAll, idxWidthAll));

@@ -1128,7 +1128,7 @@ LLM_MoE_ScaleInput	moe.cl	3	3	i,i,i	iiiBBB
 LLM_MoE_WeightedSum	moe.cl	3	4	i,i,i,i	iiiiBBB
 LLM_MoE_ZeroApply	moe.cl	3	4	i,i,i,i	iiiiBBB
 LLM_MoE_ZeroExperts	moe.cl	3	3	i,i,i	iiiBBB
-LLM_MuddMix	eltwise_ext.cl	5	5	i,i,i,i,i	iiiiiBBBBB
+LLM_MuddMix	eltwise_ext.cl	6	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBBB
 LLM_MulRowScale	norm_ext.cl	2	3	i,i,i	iiiBB
 LLM_MultiTask	multitask.cl	12	3	i,i,i	iiiBBBBBBBBBBBB
 LLM_NormRopeStore	fused.cl	7	27	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,f,f,f,f	iiiiiiiiiiiiiiiiiiiifffffffBBBBBBB

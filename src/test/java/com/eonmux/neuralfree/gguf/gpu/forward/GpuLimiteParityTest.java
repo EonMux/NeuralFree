@@ -1,9 +1,11 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
+import com.eonmux.neuralfree.acceleration.GpuTestUtil;
 import com.eonmux.neuralfree.acceleration.HWAcceleration;
+import com.eonmux.neuralfree.acceleration.HardwareDevice;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
-import com.eonmux.neuralfree.acceleration.backend.ocl.OclComputeBackend;
-import com.eonmux.neuralfree.acceleration.ocl.CLDevice;
+import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
+import com.eonmux.neuralfree.acceleration.vulkan.VkDeviceRanking;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.GGUFModel;
 import com.eonmux.neuralfree.gguf.GGUFModelGPU;
@@ -15,39 +17,92 @@ import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import org.junit.After;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.List;
 
-import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * CPU/GPU parity of the limite graph: value embeddings (with the per-KV-head gate), the exclusive self attention,
- * the learned residual scales and the MUDD dense cross-layer mixes produce the same logits on the device path as on
- * the host path, for contiguous prefill, decode and a paged multi-sequence batch.
+ * CPU/GPU parity of the limite graph on CUDA, OpenCL and Vulkan: value embeddings (with the per-KV-head gate), the
+ * exclusive self attention, the learned residual scales and the MUDD dense cross-layer mixes produce the same logits
+ * on the device path as on the host path, for contiguous prefill, decode and a paged multi-sequence batch. The
+ * fixture's sigmoid logit cap squeezes every logit into a band about 1e-3 wide, so the tolerance is a fraction of
+ * the reference's spread: a fixed tolerance as wide as the band would pass any logits.
  */
+@RunWith(Parameterized.class)
 public class GpuLimiteParityTest {
 
     private static final int N_TOKENS = 10;
     private static final int SEQ_A = 0;
     private static final int SEQ_B = 1;
-    private static final float TOL = 2e-3f;
+    /** Allowed difference as a fraction of the reference logits' spread (max - min). */
+    private static final double SPREAD_TOL = 0.01;
+    /** The same for F16 weights, whose device tiles round their operands. */
+    private static final double SPREAD_TOL_F16 = 0.05;
 
+    @Parameterized.Parameters(name = "{0}")
+    public static List<Object[]> apis() {
+        return Arrays.asList(new Object[]{BackendType.CUDA}, new Object[]{BackendType.OPENCL},
+                new Object[]{BackendType.VULKAN});
+    }
+
+    private final BackendType api;
     private HWAcceleration acceleration;
     private ComputeBackend backend;
 
+    public GpuLimiteParityTest(BackendType api) {
+        this.api = api;
+    }
+
     @Before
     public void setUp() {
-        org.junit.Assume.assumeTrue("OpenCL GPU not available",
-                com.eonmux.neuralfree.acceleration.GpuTestUtil.isOpenCLAvailable());
-        acceleration = new HWAcceleration();
-        CLDevice device = acceleration.getCLDevices().get(0);
-        backend = new OclComputeBackend(device);
+        switch (api) {
+            case CUDA:
+                GpuTestUtil.assumeCudaAvailable();
+                break;
+            case OPENCL:
+                GpuTestUtil.assumeOpenCLAvailable();
+                break;
+            default:
+                GpuTestUtil.assumeVulkanAvailable();
+                break;
+        }
+        acceleration = new HWAcceleration(EnumSet.of(api));
+        HardwareDevice device = api == BackendType.CUDA
+                ? (acceleration.getCUDevices().isEmpty() ? null : acceleration.getCUDevices().get(0))
+                : api == BackendType.OPENCL
+                ? (acceleration.getCLDevices().isEmpty() ? null : acceleration.getCLDevices().get(0))
+                : VkDeviceRanking.fastestDevice(acceleration.getVkDevices(), null);
+        Assume.assumeTrue("no " + api + " device", device != null);
+        backend = acceleration.createBackend(device);
+    }
+
+    /** Element-wise {@code |expected - actual| <= tol * spread(expected)}, with a non-degenerate spread. */
+    private void assertLogits(String message, float[] expected, float[] actual, double tol) {
+        assertEquals(message + ": logit count", expected.length, actual.length);
+        float min = Float.POSITIVE_INFINITY;
+        float max = Float.NEGATIVE_INFINITY;
+        for (float v : expected) {
+            min = Math.min(min, v);
+            max = Math.max(max, v);
+        }
+        double spread = (double) max - min;
+        assertTrue(message + ": the reference logits spread", spread > 1e-6);
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(api + " " + message + " [" + i + "] (spread " + spread + ")", expected[i], actual[i],
+                    tol * spread);
+        }
     }
 
     @After
@@ -104,7 +159,7 @@ public class GpuLimiteParityTest {
             ForwardBackend f = gpu.forwardBackend();
             float[] out = f.forwardRows(prompt, 0, new int[]{prompt.length - 1})[0];
             assertNotNull(out);
-            assertArrayEquals("limite prefill logits match the CPU path", cpu, out, TOL);
+            assertLogits("limite prefill logits match the CPU path", cpu, out, SPREAD_TOL);
         }
     }
 
@@ -119,7 +174,7 @@ public class GpuLimiteParityTest {
         }
         try (GGUFModelGPU gpu = new GGUFModelGPU(model.toString(), backend, config(1))) {
             float[] out = gpu.forwardBackend().forwardRows(prompt, 0, new int[]{prompt.length - 1})[0];
-            assertArrayEquals("half-precision limite logits match the CPU path", cpu, out, TOL);
+            assertLogits("half-precision limite logits match the CPU path", cpu, out, SPREAD_TOL_F16);
         }
     }
 
@@ -137,7 +192,7 @@ public class GpuLimiteParityTest {
             ForwardBackend f = gpu.forwardBackend();
             f.forwardRows(prompt, 0, new int[]{prompt.length - 1});
             float[] out = f.decode(prompt[0], prompt.length);
-            assertArrayEquals("limite decode logits match the CPU path", cpu, out, TOL);
+            assertLogits("limite decode logits match the CPU path", cpu, out, SPREAD_TOL);
         }
     }
 
@@ -155,8 +210,8 @@ public class GpuLimiteParityTest {
         try (GGUFModelGPU gpu = new GGUFModelGPU(model.toString(), backend, config(2))) {
             float[][] out = gpu.forwardBackend().forwardBatch(interleave(a, b));
             assertEquals(2, out.length);
-            assertArrayEquals("sequence A logits match the contiguous CPU run", reference[0], out[0], TOL);
-            assertArrayEquals("sequence B logits match the contiguous CPU run", reference[1], out[1], TOL);
+            assertLogits("sequence A logits match the contiguous CPU run", reference[0], out[0], SPREAD_TOL);
+            assertLogits("sequence B logits match the contiguous CPU run", reference[1], out[1], SPREAD_TOL);
         }
     }
 }

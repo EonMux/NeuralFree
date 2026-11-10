@@ -82,7 +82,7 @@ public class MemoryPlannerTest {
 
         assertEquals(5 * 1_048_576L + 8_388_608L, plan.kvBytes());
         assertEquals(1024 * 4 + 8192 * 4, plan.positionBytes());
-        assertEquals(13_668_352L, plan.totalBytes());
+        assertEquals(13_668_352L, plan.cacheBytes());
         assertEquals(0, plan.stateBytes());
         assertEquals(0, plan.sideCacheBytes());
         assertTotalsMatchLayers(plan);
@@ -97,7 +97,7 @@ public class MemoryPlannerTest {
         long rowBytes = 2 * (256 / 32 * 34);
         assertEquals(1024 * rowBytes, plan.layer(0).totalBytes());
         assertEquals(8192 * rowBytes, plan.layer(5).totalBytes());
-        assertEquals(5 * 557_056L + 4_456_448L + 36_864L, plan.totalBytes());
+        assertEquals(5 * 557_056L + 4_456_448L + 36_864L, plan.cacheBytes());
         assertTotalsMatchLayers(plan);
 
         for (int il = 0; il < 6; il++) {
@@ -113,7 +113,7 @@ public class MemoryPlannerTest {
         MemoryPlan plan = MemoryPlanner.planForContext(gemma3(), cfg, 8192);
         assertEquals(8192, plan.layer(0).kv().rows());
         assertFalse(plan.layer(0).kv().ring());
-        assertEquals(6 * 8_388_608L + 2 * 8192 * 4L, plan.totalBytes());
+        assertEquals(6 * 8_388_608L + 2 * 8192 * 4L, plan.cacheBytes());
         assertTotalsMatchLayers(plan);
     }
 
@@ -152,7 +152,7 @@ public class MemoryPlannerTest {
         assertEquals(1, plan.groups().size());
         assertEquals(823_296L, plan.stateBytes());
         assertEquals(16_384L, plan.positionBytes());
-        assertEquals(9_228_288L, plan.totalBytes());
+        assertEquals(9_228_288L, plan.cacheBytes());
         assertTrue(plan.hasRecurrentState());
         assertTotalsMatchLayers(plan);
     }
@@ -186,7 +186,7 @@ public class MemoryPlannerTest {
         assertEquals(9_437_184L, plan.kvBytes());
         assertEquals(2_097_152L, plan.sideCacheBytes());
         assertEquals(16_384L, plan.positionBytes());
-        assertEquals(11_550_720L, plan.totalBytes());
+        assertEquals(11_550_720L, plan.cacheBytes());
         assertTotalsMatchLayers(plan);
     }
 
@@ -347,14 +347,14 @@ public class MemoryPlannerTest {
         assertTrue(plan.groups().isEmpty());
         assertEquals(0, plan.kvBytes());
         assertEquals(0, plan.positionBytes());
-        assertEquals(1_615_872L, plan.totalBytes());
+        assertEquals(1_615_872L, plan.cacheBytes());
         assertTotalsMatchLayers(plan);
     }
 
     @Test
     public void recurrentStateDoesNotGrowWithContext() {
-        assertEquals(MemoryPlanner.planForContext(mamba2(), f16(), 256).totalBytes(),
-                MemoryPlanner.planForContext(mamba2(), f16(), 65_536).totalBytes());
+        assertEquals(MemoryPlanner.planForContext(mamba2(), f16(), 256).cacheBytes(),
+                MemoryPlanner.planForContext(mamba2(), f16(), 65_536).cacheBytes());
     }
 
     @Test
@@ -368,7 +368,7 @@ public class MemoryPlannerTest {
         assertEquals(plan.layer(0).kvGroup(), shared.kvGroup());
         assertSame(plan.layer(0).kv(), shared.kv());
         assertEquals(0, shared.totalBytes());
-        assertEquals(1_048_576L + 8_388_608L + 1024 * 4 + 8192 * 4, plan.totalBytes());
+        assertEquals(1_048_576L + 8_388_608L + 1024 * 4 + 8192 * 4, plan.cacheBytes());
         assertTotalsMatchLayers(plan);
     }
 
@@ -535,7 +535,7 @@ public class MemoryPlannerTest {
         assertNull(plan.layer(2).kv());
         assertEquals(1, plan.groups().size());
         assertEquals(2L * 4096 * 512, plan.kvBytes());
-        assertEquals(2L * 4096 * 512 + 4096L * 4, plan.totalBytes());
+        assertEquals(2L * 4096 * 512 + 4096L * 4, plan.cacheBytes());
         assertEquals(KvDType.F16, plan.config().typeK());
         assertTotalsMatchLayers(plan);
     }
@@ -556,10 +556,11 @@ public class MemoryPlannerTest {
             assertEquals(1, plan.groups().size());
             assertEquals(target.nCtx(), plan.nCtx());
             assertEquals(target.ubatch(), plan.ubatch());
-            assertEquals(4096L * 512 + 4096L * 4, plan.totalBytes());
+            assertEquals(4096L * 512 + 4096L * 4, plan.cacheBytes());
             assertTotalsMatchLayers(plan);
         }
-        assertEquals(4096L * 512 + 4096L * 4, MemoryPlanner.nextnBytes(spec, target));
+        assertEquals(4096L * 512 + 4096L * 4 + contiguousAddressing(1, target.ubatch()),
+                MemoryPlanner.nextnBytes(spec, target));
         assertEquals(0L, MemoryPlanner.nextnBytes(gemma3(), MemoryPlanner.planForContext(gemma3(), f16(), 4096)));
         assertThrows(IllegalArgumentException.class, () -> MemoryPlanner.planNextn(spec, target, 1));
         assertThrows(IllegalArgumentException.class,
@@ -587,7 +588,7 @@ public class MemoryPlannerTest {
         assertEquals(MemoryConfig.DRAFT_KV_TYPE, plan.config().typeK());
         assertFalse(plan.config().stateSnapshots());
         assertFalse(plan.config().nextnMemory());
-        assertEquals(4096L * 512 + 4096L * 4, plan.totalBytes());
+        assertEquals(4096L * 512 + 4096L * 4, plan.cacheBytes());
         assertEquals(plan.totalBytes(), MemoryPlanner.nextnBytes(spec, target));
         assertEquals(plan.totalBytes(), MemoryPlanner.nextnBytes(spec, q8, 4096, target.ubatch()));
         assertEquals(target.totalBytes() + plan.totalBytes(), ContextFitter.requiredBytes(spec, q8, 4096));
@@ -611,7 +612,7 @@ public class MemoryPlannerTest {
         assertFalse(plan.config().stateSnapshots());
         // one NextN layer: 4096 rows of 2 * 136 bytes (Q8_0 K and V, 4 blocks of 32 per 128-value row)
         // plus 4096 position floats
-        assertEquals(4096L * 272 + 4096L * 4, plan.totalBytes());
+        assertEquals(4096L * 272 + 4096L * 4, plan.cacheBytes());
         assertEquals(plan.totalBytes(), MemoryPlanner.nextnBytes(spec, cfg, 4096, target.ubatch()));
         assertEquals(target.totalBytes() + plan.totalBytes(), ContextFitter.requiredBytes(spec, cfg, 4096));
         assertEquals(plan.totalBytes(),
@@ -626,7 +627,7 @@ public class MemoryPlannerTest {
         MemoryPlan plan = MemoryPlanner.planNextn(sidecar, target, 2);
         assertEquals(3, plan.layers().size());
         assertEquals(LayerMemoryPlan.Kind.KV, plan.layer(2).kind());
-        assertEquals(4096L * 512 + 4096L * 4, plan.totalBytes());
+        assertEquals(4096L * 512 + 4096L * 4, plan.cacheBytes());
         assertEquals(plan.totalBytes(), MemoryPlanner.nextnBytes(sidecar, f16(), 4096, target.ubatch()));
         assertThrows(IllegalArgumentException.class, () -> MemoryPlanner.nextnBytes(gemma3(), f16(), 4096, 512));
         assertThrows(IllegalArgumentException.class, () -> MemoryPlanner.nextnBytes(sidecar, f16(), 0, 512));
@@ -643,7 +644,7 @@ public class MemoryPlannerTest {
         assertEquals(0L, plain.snapshotBytes());
         assertTrue(reserved.snapshotsReserved());
         assertEquals(reserved.stateBytes(), reserved.snapshotBytes());
-        assertEquals(2 * 1_615_872L, reserved.totalBytes());
+        assertEquals(2 * 1_615_872L, reserved.cacheBytes());
         assertTotalsMatchLayers(reserved);
 
         MemoryPlan noState = MemoryPlanner.planForContext(gemma3(), snapshots, 4096);
@@ -651,6 +652,16 @@ public class MemoryPlannerTest {
         assertEquals(0L, noState.snapshotBytes());
         MemoryPlan compressed = MemoryPlanner.planForContext(deepseek4Csa(), snapshots, 4096);
         assertFalse(compressed.snapshotsReserved());
+    }
+
+    /**
+     * Device addressing bytes of a contiguous memory without a context shift ({@link MemoryPlan#addressingBytes()}):
+     * a {@code cell_idx} of the ubatch per group, the query positions, the four RoPE position sections, the state
+     * row, the identity row map of the ubatch (ints) and the tree mask (longs).
+     */
+    public static long contiguousAddressing(int groups, int ubatch) {
+        long ints = (long) groups * ubatch + ubatch + 4L * ubatch + 1 + ubatch;
+        return ints * Integer.BYTES + (long) ubatch * Long.BYTES;
     }
 
     static void assertTotalsMatchLayers(MemoryPlan plan) {
@@ -662,9 +673,10 @@ public class MemoryPlannerTest {
         for (MemoryPlan.KvGroup g : plan.groups()) {
             positions += (long) g.rows() * Integer.BYTES;
         }
-        assertEquals(layers + plan.snapshotBytes() + positions, plan.totalBytes());
+        assertEquals(layers + plan.snapshotBytes() + positions, plan.cacheBytes());
         assertEquals(plan.kvBytes() + plan.stateBytes() + plan.snapshotBytes() + plan.sideCacheBytes()
-                + plan.positionBytes(), plan.totalBytes());
+                + plan.positionBytes(), plan.cacheBytes());
+        assertEquals(plan.cacheBytes() + plan.addressingBytes(), plan.totalBytes());
     }
 
     // ---- fixtures ----

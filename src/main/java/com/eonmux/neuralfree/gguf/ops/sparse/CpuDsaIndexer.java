@@ -58,7 +58,8 @@ public final class CpuDsaIndexer {
     /**
      * llama.cpp KV-mask visibility of a row holding position {@code pKv} for a query at {@code pQ}
      * (llama.cpp src/llama-kv-cache.cpp:1664-1710 and {@code llama_hparams::is_masked_swa}, llama.cpp
-     * src/llama-hparams.h:506-540).
+     * src/llama-hparams.h:506-540), every {@link SwaType} included: the rule of {@code nf_attn_visible}, which the
+     * indexer kernels of both dialects apply.
      */
     public static boolean visible(boolean causal, SwaType swaType, int nSwa, int pKv, int pQ) {
         if (pKv < 0) {
@@ -74,6 +75,8 @@ public final class CpuDsaIndexer {
                 return pQ - pKv < nSwa;
             case CHUNKED:
                 return pKv >= (pQ / nSwa) * nSwa;
+            case CHUNKED_LOOKBACK:
+                return pKv >= ((pQ / nSwa) - 1) * nSwa;
             case SYMMETRIC: {
                 int halfNSwa = nSwa / 2;
                 int diff = pQ - pKv;
