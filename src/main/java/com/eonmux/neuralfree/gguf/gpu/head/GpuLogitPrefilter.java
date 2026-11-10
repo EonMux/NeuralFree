@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
+import com.eonmux.neuralfree.gguf.engine.DryBreakers;
 import com.eonmux.neuralfree.gguf.engine.LogitPrefilter;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuOps;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
@@ -12,6 +13,7 @@ import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
@@ -60,6 +62,14 @@ public final class GpuLogitPrefilter implements AutoCloseable {
     private int tailCapacity;
     private PreparedDispatch dispatch;
     private int lastRows = -1;
+    /**
+     * The breaker table of each row of the last call (null for a row without DRY): the device breaker arrays hold
+     * exactly these tables in this order until a buffer is reallocated, so a call over the same tables skips them.
+     */
+    private DryBreakers[] lastBreakers;
+    private boolean buffersChanged;
+    private long breakerUploads;
+    private long breakerUploadsSkipped;
 
     private GpuLogitPrefilter(GpuOps ops, ComputeBackend backend, ComputeQueue queue, GpuBuffer logits, int vocab,
                               int maxRows, int local) {
@@ -107,6 +117,14 @@ public final class GpuLogitPrefilter implements AutoCloseable {
     }
 
     /**
+     * The calls that uploaded the DRY breaker tables and the calls that found the device already holding them, in
+     * that order, since the prefilter was bound.
+     */
+    public long[] breakerUploadCounts() {
+        return new long[]{breakerUploads, breakerUploadsSkipped};
+    }
+
+    /**
      * Applies {@code prefilter} to the first {@code prefilter.rows()} logits rows of the bound buffer.
      *
      * @throws IllegalArgumentException when the rows exceed the bound width, a row names an out-of-range token, or
@@ -126,7 +144,7 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         int[][] penaltyRowIds = new int[rows][];
         int[][] penaltyRowCounts = new int[rows][];
         int[][] dryRowTokens = new int[rows][];
-        int[][][] dryRowBreakers = new int[rows][][];
+        DryBreakers[] dryRowBreakers = new DryBreakers[rows];
         int totalBias = 0;
         int totalTokens = 0;
         int totalBreakers = 0;
@@ -151,12 +169,14 @@ public final class GpuLogitPrefilter implements AutoCloseable {
                 }
                 checkIds(dryRowTokens[r], -1, "DRY");
                 totalTokens += dryRowTokens[r].length;
-                dryRowBreakers[r] = row.dryBreakers();
-                totalBreakers += dryRowBreakers[r].length;
-                for (int[] breaker : dryRowBreakers[r]) {
-                    checkIds(breaker, -1, "DRY breaker");
-                    totalTails += breaker.length - 1;
+                DryBreakers breakers = row.dryBreakerTable();
+                if (!breakers.inVocabulary(vocab)) {
+                    throw new IllegalArgumentException("a DRY breaker token id lies outside the vocabulary of "
+                            + vocab);
                 }
+                dryRowBreakers[r] = breakers;
+                totalBreakers += breakers.count();
+                totalTails += breakers.tailCount();
             }
         }
         ensure(rows, totalBias, totalTokens, totalBreakers, totalTails);
@@ -166,8 +186,9 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         int[] biasIdHost = new int[totalBias];
         float[] biasValHost = new float[totalBias];
         int[] tokenHost = new int[totalTokens];
-        int[] breakerHost = new int[totalBreakers * BREAKER_STRIDE];
-        int[] tailHost = new int[totalTails];
+        boolean sameBreakers = Arrays.equals(dryRowBreakers, lastBreakers) && !buffersChanged;
+        int[] breakerHost = sameBreakers ? null : new int[totalBreakers * BREAKER_STRIDE];
+        int[] tailHost = sameBreakers ? null : new int[totalTails];
         int biasAt = 0;
         int tokenAt = 0;
         int breakerAt = 0;
@@ -211,18 +232,19 @@ public final class GpuLogitPrefilter implements AutoCloseable {
                 dryCount = window.length;
                 cfgHost[f + 3] = row.dryMultiplier();
                 cfgHost[f + 4] = row.dryBase();
-                int[][] breakers = dryRowBreakers[r];
-                brCount = breakers.length;
-                for (int[] breaker : breakers) {
-                    int b = breakerAt * BREAKER_STRIDE;
-                    breakerHost[b] = breaker[0];
-                    breakerHost[b + 1] = tailAt;
-                    breakerHost[b + 2] = breaker.length - 1;
-                    for (int i = 1; i < breaker.length; i++) {
-                        tailHost[tailAt++] = breaker[i];
+                DryBreakers breakers = dryRowBreakers[r];
+                brCount = breakers.count();
+                if (!sameBreakers) {
+                    for (int i = 0; i < brCount; i++) {
+                        int b = (breakerAt + i) * BREAKER_STRIDE;
+                        breakerHost[b] = breakers.head(i);
+                        breakerHost[b + 1] = tailAt + breakers.tailFrom(i);
+                        breakerHost[b + 2] = breakers.tailLength(i);
                     }
-                    breakerAt++;
+                    breakers.copyTails(tailHost, tailAt);
                 }
+                breakerAt += brCount;
+                tailAt += breakers.tailCount();
             }
             metaHost[m + 5] = dryAt;
             metaHost[m + 6] = dryCount;
@@ -237,8 +259,15 @@ public final class GpuLogitPrefilter implements AutoCloseable {
         writeInts(biasIds, biasIdHost);
         writeFloats(biasVals, biasValHost);
         writeInts(tokens, tokenHost);
-        writeInts(breakerMeta, breakerHost);
-        writeInts(breakerTails, tailHost);
+        if (!sameBreakers) {
+            writeInts(breakerMeta, breakerHost);
+            writeInts(breakerTails, tailHost);
+            lastBreakers = dryRowBreakers;
+            breakerUploads++;
+        } else {
+            breakerUploadsSkipped++;
+        }
+        buffersChanged = false;
 
         if (rows != lastRows) {
             dispatch.setInt(1, rows);
@@ -308,6 +337,7 @@ public final class GpuLogitPrefilter implements AutoCloseable {
             tailCapacity = tails;
             changed = true;
         }
+        buffersChanged |= changed;
         if (dispatch == null || changed) {
             if (dispatch != null) {
                 dispatch.close();

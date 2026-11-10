@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.engine.LogitPrefilter;
 import com.eonmux.neuralfree.gguf.engine.Observers;
 import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.engine.SequenceEncoder;
+import com.eonmux.neuralfree.gguf.engine.SplitReadout;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 
 import java.util.Objects;
@@ -122,6 +123,13 @@ public final class EplbStepBackend implements ForwardBackend {
     @Override
     public RowTopK forwardBatchTopK(ForwardBatch batch, int k, LogitPrefilter prefilter) {
         RowTopK out = delegate.forwardBatchTopK(batch, k, prefilter);
+        rebalancer.afterStep();
+        return out;
+    }
+
+    @Override
+    public SplitReadout forwardBatchSplit(ForwardBatch batch, boolean[] fullRows, int k, LogitPrefilter prefilter) {
+        SplitReadout out = delegate.forwardBatchSplit(batch, fullRows, k, prefilter);
         rebalancer.afterStep();
         return out;
     }

@@ -7,6 +7,7 @@ import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.ModelDrafter;
+import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.engine.watermark.DraftWatermarker;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 import com.eonmux.neuralfree.gguf.memory.MemoryFullException;
@@ -634,7 +635,13 @@ public final class BatchModelDrafter implements BatchDrafter {
         return missing;
     }
 
-    /** The draft batches of one step: the synced tails with every sampled token, then one row per drafting step. */
+    /**
+     * The draft batches of one step: the synced tails with every sampled token, then one row per drafting step.
+     * When every draft of the step picks greedily over an identity vocabulary and the backend reads candidates back
+     * on the device, each batch reads its rows' top {@link DraftModelLoader#DRAFT_TOP_K} candidates instead of whole
+     * rows ({@link ForwardBackend#forwardBatchTopK}), as the single-sequence drafter does: the greedy pick and its
+     * probability over those candidates equal the whole row's.
+     */
     private void run(List<Drafting> running, List<int[]> missing, int rows) {
         ForwardBatch.Builder first = ForwardBatch.builder(rows);
         for (int i = 0; i < running.size(); i++) {
@@ -647,12 +654,15 @@ public final class BatchModelDrafter implements BatchDrafter {
             first.add(d.nextDraftToken, d.base, d.request.seq(), true);
         }
         List<Drafting> step = running;
-        float[][] logits = backend.forwardBatch(first.build());
+        boolean topK = picksOnDevice(running);
+        float[][] logits = topK ? null : backend.forwardBatch(first.build());
+        RowTopK top = topK ? backend.forwardBatchTopK(first.build(), DraftModelLoader.DRAFT_TOP_K) : null;
         while (true) {
             List<Drafting> next = new ArrayList<>(step.size());
             for (int i = 0; i < step.size(); i++) {
                 Drafting d = step.get(i);
-                if (pick(d, logits[i]) && d.len < d.count) {
+                boolean picked = topK ? pickTop(d, top, i) : pick(d, logits[i]);
+                if (picked && d.len < d.count) {
                     next.add(d);
                 }
             }
@@ -663,9 +673,43 @@ public final class BatchModelDrafter implements BatchDrafter {
             for (Drafting d : next) {
                 b.add(d.nextDraftToken, d.base + d.len, d.request.seq(), true);
             }
-            logits = backend.forwardBatch(b.build());
+            if (topK) {
+                top = backend.forwardBatchTopK(b.build(), DraftModelLoader.DRAFT_TOP_K);
+            } else {
+                logits = backend.forwardBatch(b.build());
+            }
             step = next;
         }
+    }
+
+    /**
+     * Whether every draft of the step picks greedily (no draft watermark, no probabilistic draw at a positive
+     * temperature) over an identity vocabulary on a backend that reads candidates back on the device.
+     */
+    private boolean picksOnDevice(List<Drafting> running) {
+        if (!vocab.isIdentity() || !backend.batchTopKOnDevice()) {
+            return false;
+        }
+        for (Drafting d : running) {
+            if (d.watermark != null || (probabilistic && d.request.temperature() > 0f)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** {@link #pick}'s greedy branch over row {@code row} of a device top-k readback. */
+    private boolean pickTop(Drafting d, RowTopK top, int row) {
+        DraftModelLoader.Pick p = DraftModelLoader.pick(top, row);
+        int targetToken = vocab.toTarget(p.id);
+        if (p.p < pMin || targetToken < 0) {
+            return false;
+        }
+        d.nextDraftToken = p.id;
+        d.out[d.len] = targetToken;
+        d.rows[d.len] = null;
+        d.len++;
+        return true;
     }
 
     /**

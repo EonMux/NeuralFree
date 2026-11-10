@@ -15,8 +15,9 @@ import java.util.Objects;
 /**
  * The output rows one forward call reads back, in request order: the logits, hidden rows or greedy ids the
  * {@link GpuLogitsHead} prepared for the requested rows of every step, each read into a host array on the call's
- * queue and assembled by {@link #result} once the queue finished. Shared by {@link GpuPrefillDriver} and the split
- * forward backend.
+ * queue and assembled by {@link #result} once the queue finished. A top-k call may also flag rows to read whole
+ * (the split readout, {@code ForwardBackend.forwardBatchSplit}): those rows' logits come back beside every row's
+ * candidates, from the same head pass. Shared by {@link GpuPrefillDriver} and the split forward backend.
  */
 final class GpuCallReads {
 
@@ -26,6 +27,8 @@ final class GpuCallReads {
     private final int topK;
     /** Per output row pre-top-k edits the device applies before the top-k readout; null for none. */
     private final LogitPrefilter prefilter;
+    /** Per output row of a top-k call, whether its whole logits come back too; null for none. */
+    private final boolean[] fullRows;
     private final float[][] rows;
     private final int[] ids;
     private final int[] topIds;
@@ -47,6 +50,15 @@ final class GpuCallReads {
 
     GpuCallReads(GpuLogitsHead head, ComputeQueue queue, int count, GpuPrefillDriver.Output output, int topK,
                  LogitPrefilter prefilter) {
+        this(head, queue, count, output, topK, prefilter, null);
+    }
+
+    /**
+     * A call that reads {@code count} output rows; a top-k call reads the whole logits of the rows {@code fullRows}
+     * flags beside every row's candidates (null for none).
+     */
+    GpuCallReads(GpuLogitsHead head, ComputeQueue queue, int count, GpuPrefillDriver.Output output, int topK,
+                 LogitPrefilter prefilter, boolean[] fullRows) {
         this.head = Objects.requireNonNull(head, "head");
         this.queue = Objects.requireNonNull(queue, "queue");
         this.output = Objects.requireNonNull(output, "output");
@@ -56,8 +68,12 @@ final class GpuCallReads {
             throw new IllegalArgumentException("the prefilter holds " + prefilter.rows() + " rows, the call reads "
                     + count);
         }
-        this.rows = output == GpuPrefillDriver.Output.ARGMAX || output == GpuPrefillDriver.Output.TOPK
-                ? null : new float[count][];
+        if (fullRows != null && (output != GpuPrefillDriver.Output.TOPK || fullRows.length != count)) {
+            throw new IllegalArgumentException("whole-row flags belong to a top-k call, one per output row");
+        }
+        this.fullRows = fullRows;
+        this.rows = output == GpuPrefillDriver.Output.ARGMAX
+                || (output == GpuPrefillDriver.Output.TOPK && fullRows == null) ? null : new float[count][];
         this.ids = output == GpuPrefillDriver.Output.ARGMAX ? new int[count] : null;
         this.topIds = output == GpuPrefillDriver.Output.TOPK ? new int[count * topK] : null;
         this.topLogits = output == GpuPrefillDriver.Output.TOPK ? new float[count * topK] : null;
@@ -100,6 +116,9 @@ final class GpuCallReads {
             idParts.add(idx);
             targets.add(target);
             candidateStrides.add(stride);
+            if (fullRows != null) {
+                readWhole(src, count, target);
+            }
             return;
         }
         int width = width(out);
@@ -129,6 +148,19 @@ final class GpuCallReads {
         targets.add(target);
     }
 
+    /** Enqueues the whole logits of the flagged rows among {@code count} rows of {@code logits}. */
+    private void readWhole(ScratchSlot logits, int count, int[] target) {
+        long rowBytes = (long) head.vocab() * Float.BYTES;
+        long base = (long) logits.offset() * Float.BYTES;
+        for (int j = 0; j < count; j++) {
+            if (fullRows[target[j]]) {
+                float[] dst = new float[head.vocab()];
+                events.add(queue.enqueueReadBuffer(logits.buffer(), base + j * rowBytes, rowBytes, dst));
+                rows[target[j]] = dst;
+            }
+        }
+    }
+
     /** Assembles the rows of every read into the result, in request order. */
     GpuPrefillDriver.Result result() {
         if (output == GpuPrefillDriver.Output.TOPK) {
@@ -145,7 +177,7 @@ final class GpuCallReads {
                     }
                 }
             }
-            return new GpuPrefillDriver.Result(null, null, topK, topIds, topLogits);
+            return new GpuPrefillDriver.Result(rows, null, topK, topIds, topLogits);
         }
         for (int part = 0; part < targets.size(); part++) {
             int[] target = targets.get(part);

@@ -1,24 +1,12 @@
 package com.eonmux.neuralfree.gguf.engine;
 
 import com.eonmux.neuralfree.gguf.GGUFTokenizer;
-import com.eonmux.neuralfree.gguf.engine.sampling.AdaptivePStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.BiasStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.DryStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.Mt19937;
-import com.eonmux.neuralfree.gguf.engine.sampling.InfillStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.MinPStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.MirostatStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.PenaltiesStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.engine.sampling.StageKind;
-import com.eonmux.neuralfree.gguf.engine.sampling.TopKStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.TopNSigmaStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.TopPStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.TemperatureStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TokenGate;
-import com.eonmux.neuralfree.gguf.engine.sampling.TypicalStage;
-import com.eonmux.neuralfree.gguf.engine.sampling.XtcStage;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkState;
 import com.eonmux.neuralfree.gguf.engine.watermark.Watermarker;
@@ -114,6 +102,12 @@ public final class Sampler {
      */
     private List<SamplerStage> constraints;
     /**
+     * Whether the caller handed the chain stage instances (Java-API extra stages or logits processors): a caller may
+     * share one instance between requests, so such a chain never samples beside another
+     * ({@link #samplesIndependently}), whatever the stages' classes.
+     */
+    private boolean callerStages;
+    /**
      * The chain's device prefilter plan: the penalties and DRY stages a device readout reproduces before its
      * top-k, the cone width it needs and the row it uploads ({@link LogitPrefilter}).
      */
@@ -151,8 +145,8 @@ public final class Sampler {
             positiveBias |= bias > 0f;
         }
         this.biasStage = new BiasStage(banned, biasedIds, biases);
-        this.chain = buildChain(config, seed, vocab);
-        this.constraints = constraintsOf(chain);
+        this.chain = SamplerChains.build(config, seed, vocab);
+        this.constraints = SamplerChains.constraintsOf(chain);
         this.deviceFilter = new SamplerDeviceFilter(this, chain, biasStage, banned, coneExtra, positiveBias, config);
         this.deviceFilter.refresh();
         this.rng = new Mt19937(seed);
@@ -171,24 +165,32 @@ public final class Sampler {
         this.chainEnd = new SamplerChainEnd(this.watermarker, this.watermarkState);
     }
 
-    /**
-     * The chain's constraint stages ({@link SamplerStage#constrains}, {@link SamplerStage#masks}) in chain
-     * order; empty when it has none.
-     */
-    private static List<SamplerStage> constraintsOf(List<SamplerStage> chain) {
-        List<SamplerStage> constraints = new ArrayList<>(1);
-        for (SamplerStage stage : chain) {
-            if (stage.constrains() || stage.masks()) {
-                constraints.add(stage);
-            }
-        }
-        return constraints.isEmpty() ? List.of() : Collections.unmodifiableList(constraints);
-    }
-
     /** Whether the chain carries constraint stages (a grammar, the request's masks), which {@link #coneWidth}
      * refuses: the head masks over the whole row, so a device cone carries no chain that has one. */
     public boolean hasConstraints() {
         return !constraints.isEmpty();
+    }
+
+    /**
+     * Whether this chain may sample on a worker thread while other sequences' chains sample beside it: the sampler
+     * built every stage itself, and each is an instance of one of llama.cpp's built-in stage classes or the fixed
+     * logit bias ({@link SamplerChains#INDEPENDENT_STAGES}), which hold only this sampler's own state. A constraint stage (a
+     * grammar, the request's masks), a reasoning budget or an infill stage reaches shared vocabulary tables, and a
+     * stage the caller handed in (an extra stage or a logits processor, even an instance of a built-in class) may be
+     * user code or an instance shared with another request's chain, so such a chain samples on the engine's own
+     * thread. The check goes by the stages' final classes, not by {@link SamplerStage#kind()}, which a custom stage
+     * may override to report a built-in kind.
+     */
+    public boolean samplesIndependently() {
+        if (callerStages || !constraints.isEmpty()) {
+            return false;
+        }
+        for (SamplerStage stage : chain) {
+            if (!SamplerChains.INDEPENDENT_STAGES.contains(stage.getClass())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Index of the chain's first top-k stage, or -1. */
@@ -199,56 +201,6 @@ public final class Sampler {
             }
         }
         return -1;
-    }
-
-    /** llama.cpp's chain construction (common/sampling.cpp:344-416). */
-    private static List<SamplerStage> buildChain(SamplerConfig config, long seed, SamplerVocab vocab) {
-        List<SamplerStage> chain = new ArrayList<>();
-        if (config.mirostat() == 1 || config.mirostat() == 2) {
-            // llama.cpp's mirostat chains are temperature + the mirostat sampler, nothing else
-            chain.add(new TemperatureStage(config.temperature()));
-            chain.add(new MirostatStage(config.mirostat(), config.mirostatTau(), config.mirostatEta(), seed));
-            return chain;
-        }
-        boolean adaptiveP = false;
-        for (StageKind kind : config.order()) {
-            if (kind == StageKind.PENALTIES) {
-                chain.add(new PenaltiesStage(config.repeatPenalty(), config.presencePenalty(),
-                        config.frequencyPenalty(), config.penaltyLastN(), config.penaltiesEnabled()));
-            } else if (kind == StageKind.DRY) {
-                chain.add(new DryStage(config.dryMultiplier(), config.dryBase(), config.dryAllowedLength(),
-                        config.dryPenaltyLastN(), config.drySequenceBreakers(), vocab));
-            } else if (kind == StageKind.TOP_N_SIGMA) {
-                chain.add(new TopNSigmaStage(config.topNSigma()));
-            } else if (kind == StageKind.TOP_K) {
-                chain.add(new TopKStage(config.topK(), config.minKeep()));
-            } else if (kind == StageKind.TYPICAL_P) {
-                chain.add(new TypicalStage(config.typicalP(), config.minKeep()));
-            } else if (kind == StageKind.TOP_P) {
-                chain.add(new TopPStage(config.topP(), config.minKeep()));
-            } else if (kind == StageKind.MIN_P) {
-                chain.add(new MinPStage(config.minP(), config.minKeep()));
-            } else if (kind == StageKind.XTC) {
-                chain.add(new XtcStage(config.xtcProbability(), config.xtcThreshold(), config.minKeep(),
-                        stageSeed(config, seed)));
-            } else if (kind == StageKind.TEMPERATURE) {
-                chain.add(new TemperatureStage(config.temperature(), config.dynatempRange(), config.dynatempExponent()));
-            } else if (kind == StageKind.INFILL) {
-                chain.add(new InfillStage(vocab));
-            } else if (kind == StageKind.ADAPTIVE_P) {
-                // llama.cpp keeps the adaptive-p position in the order but builds it last, in place of the dist stage
-                adaptiveP = true;
-            }
-        }
-        if (adaptiveP) {
-            chain.add(new AdaptivePStage(config.adaptiveTarget(), config.adaptiveDecay(), stageSeed(config, seed)));
-        }
-        return chain;
-    }
-
-    /** llama.cpp's per-sampler {@code get_rng_seed(seed)}: every stage draws its own seed unless the seed is fixed. */
-    private static long stageSeed(SamplerConfig config, long seed) {
-        return config.seeded() ? seed : randomSeed();
     }
 
     /** The generation chain for {@code config} without banned tokens. */
@@ -395,7 +347,8 @@ public final class Sampler {
             insertAt = i + 1;
         }
         chain.addAll(insertAt, extra);
-        sampler.constraints = constraintsOf(chain);
+        sampler.callerStages |= !extra.isEmpty();
+        sampler.constraints = SamplerChains.constraintsOf(chain);
         sampler.deviceFilter.refresh();
     }
 
@@ -417,6 +370,7 @@ public final class Sampler {
         }
         List<SamplerStage> chain = sampler.chain;
         chain.addAll(0, processors);
+        sampler.callerStages = true;
         List<SamplerStage> constraints = new ArrayList<>(sampler.constraints);
         for (SamplerStage stage : processors) {
             if (stage.constrains() || stage.masks()) {

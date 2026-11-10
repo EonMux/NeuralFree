@@ -161,19 +161,19 @@ final class GpuDualChunkPlanes {
 
     /** {@link #scale} over a paged step, each segment by its sequence's slot count. */
     void scale(PagedStep step) {
-        int[] slots = step.seqSlots(mixer.kvLayer().group());
+        int group = mixer.kvLayer().group();
         for (int seg = 0; seg < step.nSeg(); seg++) {
             scale(step.segStart(seg), step.segLen(seg),
-                    mixer.dualChunk().scalingFactor(slots[step.segSeq(seg)]));
+                    mixer.dualChunk().scalingFactor(step.seqSlot(group, step.segSeq(seg))));
         }
     }
 
     /** {@link #scaleK} over a paged step, each segment by its sequence's slot count. */
     void scaleK(PagedStep step) {
-        int[] slots = step.seqSlots(mixer.kvLayer().group());
+        int group = mixer.kvLayer().group();
         for (int seg = 0; seg < step.nSeg(); seg++) {
             scaleK(step.segStart(seg), step.segLen(seg),
-                    mixer.dualChunk().scalingFactor(slots[step.segSeq(seg)]));
+                    mixer.dualChunk().scalingFactor(step.seqSlot(group, step.segSeq(seg))));
         }
     }
 

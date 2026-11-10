@@ -751,6 +751,15 @@ public final class GpuLogitsHead implements AutoCloseable {
     }
 
     /**
+     * The bound prefilter's DRY breaker uploads made and skipped ({@link GpuLogitPrefilter#breakerUploadCounts}),
+     * zeros before the first prefiltered call.
+     */
+    public long[] prefilterBreakerUploads() {
+        ensureOpen();
+        return prefilterReadout == null ? new long[2] : prefilterReadout.breakerUploadCounts();
+    }
+
+    /**
      * Applies one prefilter row per output row of the first {@code prefilter.rows()} logits rows, in place: the
      * fixed logit-bias stage, the penalties and DRY, before the row top-k readout sees the row.
      *

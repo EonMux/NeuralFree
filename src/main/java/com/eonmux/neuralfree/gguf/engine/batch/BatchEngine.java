@@ -105,13 +105,12 @@ import java.util.logging.Logger;
  * on its {@link BatchSequence} handle and its slot and pages free at once, so the next pump can admit a queued
  * request into the same slot.
  *
- * <p>The step's token budget ({@code neuralfree.max.batched.tokens}, the ubatch by default) is spent first-come
- * first-served over the running sequences in admission order: earlier sequences take their rows first, so a
- * sequence admitted before a long prompt keeps decoding every step, while a later one waits (as vLLM's FCFS loop
- * does; {@code neuralfree.long.prefill.tokens} caps one chunk's share so a long prompt cannot starve its
- * successors). With chunked prefill off ({@code neuralfree.chunked.prefill=false}) the step keeps the older
- * shape: the oldest waiting prefill runs alone — its whole prompt tail in one forward batch — or, when none
- * waits, one decode row per running sequence.
+ * <p>The step's token budget ({@code neuralfree.max.batched.tokens}, the ubatch by default) goes first to one row per
+ * decoding sequence, in admission order, whatever prompt is still prefilling beside it; the pending prefill chunks take
+ * what is left first-come first-served ({@code neuralfree.long.prefill.tokens} caps one chunk's share so a long prompt
+ * cannot starve its successors), and the speculative rounds' drafts spend the rest. With chunked prefill off
+ * ({@code neuralfree.chunked.prefill=false}) the step keeps the older shape: the oldest waiting prefill runs alone —
+ * its whole prompt tail in one forward batch — or, when none waits, one decode row per running sequence.
  *
  * <p>Running out of pages is recoverable, as vLLM's scheduler makes it. A prefill that finds the pools full rolls
  * back what it wrote and queues again at the head; admission then waits until a retirement or eviction frees
@@ -1200,16 +1199,15 @@ public final class BatchEngine implements AutoCloseable {
     }
 
     /**
-     * Runs one engine step: admits queued requests while a slot and the pages of its prompt are free, then
-     * schedules the running sequences first-come first-served within the step's token budget — one row per
-     * decoding sequence (a verify round's rows when the engine speculates) and a bounded chunk of the rows a
-     * prefilling sequence still lacks — and evaluates them in one forward batch. With chunked prefill off the
-     * step keeps the older shape: the oldest waiting prefill runs alone, or one decode row per running sequence.
-     * A pump over no submissions does nothing. Every routed piece reaches the submission's sink before the call
-     * returns; finished sequences carry their result on their handle before it returns too. The rows the step
-     * committed then feed the prefix cache's block pool, and its events publish as one batch. While a Flight
-     * Recorder recording runs, a step that evaluated rows commits one {@code com.eonmux.neuralfree.EngineStep}
-     * event ({@link EngineStepEvent}).
+     * Runs one engine step: admits queued requests while a slot and the pages of its prompt are free, then schedules
+     * the running sequences within the step's token budget — one row per decoding sequence first, then a bounded chunk
+     * of the rows each prefilling sequence still lacks, first-come first-served, then the drafted rows of the verify
+     * rounds when the engine speculates — and evaluates them in one forward batch. With chunked prefill off the step
+     * keeps the older shape: the oldest waiting prefill runs alone, or one decode row per running sequence. A pump over
+     * no submissions does nothing. Every routed piece reaches the submission's sink before the call returns; finished
+     * sequences carry their result on their handle before it returns too. The rows the step committed then feed the
+     * prefix cache's block pool, and its events publish as one batch. While a Flight Recorder recording runs, a step
+     * that evaluated rows commits one {@code com.eonmux.neuralfree.EngineStep} event ({@link EngineStepEvent}).
      */
     public void pump() {
         checkOpen();

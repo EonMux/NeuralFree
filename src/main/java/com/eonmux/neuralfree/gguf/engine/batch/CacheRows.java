@@ -25,8 +25,9 @@ import java.util.Objects;
  * forward batch ({@link MediaChunk#isMediaItem()}, the rule the prefill's chunking follows too), so a reused
  * prefix never ends inside a media chunk ({@link #cut}); text and prompt-embedding rows split anywhere.
  *
- * <p>Immutable. A text-only view holds tokens alone: its rows store their own index as position and carry no
- * key.</p>
+ * <p>Immutable, apart from the memo of the whole-block chain hashes the prefix cache took of it
+ * ({@link #hashMemo()}), which only saves hashing again. A text-only view holds tokens alone: its rows store their
+ * own index as position and carry no key.</p>
  */
 final class CacheRows {
 
@@ -49,6 +50,7 @@ final class CacheRows {
     /** The prompt chunks the rows came from and the first row of each, for the prompt-embedding digests. */
     private final List<MediaChunk> chunks;
     private final int[] chunkRows;
+    private final BlockHashMemo hashMemo = new BlockHashMemo();
 
     private CacheRows(int[] tokens, int[] positions, String[] keys, MediaKey[] media, int[] items,
                       int endPosition, List<MediaChunk> chunks, int[] chunkRows) {
@@ -60,6 +62,11 @@ final class CacheRows {
         this.endPosition = endPosition;
         this.chunks = chunks;
         this.chunkRows = chunkRows;
+    }
+
+    /** The whole-block chain hashes taken of these rows. */
+    BlockHashMemo hashMemo() {
+        return hashMemo;
     }
 
     /** The view of a plain token run. */

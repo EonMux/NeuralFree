@@ -13,6 +13,7 @@ import com.eonmux.neuralfree.gguf.engine.LogitPrefilter;
 import com.eonmux.neuralfree.gguf.engine.OutputKind;
 import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.engine.SequenceEncoder;
+import com.eonmux.neuralfree.gguf.engine.SplitReadout;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuBlockRegistry;
 import com.eonmux.neuralfree.gguf.gpu.block.GpuMixer;
 import com.eonmux.neuralfree.gguf.gpu.forward.BuiltInGpuExtras;
@@ -519,6 +520,20 @@ public final class GpuEncDecBackend implements ForwardBackend, SequenceEncoder {
         int width = Math.min(k, head.vocab());
         GpuPrefillDriver.Result r = driver.runBatchTopK(batch, null, width, tap, prefilter);
         return RowTopK.packed(width, batch.outputRows().length, r.topIds(), r.topLogits());
+    }
+
+    /** Top candidates of every output row plus the whole logits of the flagged rows, from one decoder pass. */
+    @Override
+    public SplitReadout forwardBatchSplit(ForwardBatch batch, boolean[] fullRows, int k, LogitPrefilter prefilter) {
+        ensureOpen();
+        ForwardBackend.checkSplit(batch, fullRows, k, prefilter);
+        if (pagedMemory() == null) {
+            throw new UnsupportedOperationException("forwardBatchSplit: " + batchRefusal());
+        }
+        checkBatch(batch);
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = driver.runBatchTopK(batch, null, width, tap, prefilter, fullRows);
+        return new SplitReadout(RowTopK.packed(width, fullRows.length, r.topIds(), r.topLogits()), r.rows());
     }
 
     /** Refuses before any ubatch reserves pages: rows the decoder cannot take, or a sequence without an encoding. */

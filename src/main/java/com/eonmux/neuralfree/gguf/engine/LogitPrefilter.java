@@ -108,8 +108,8 @@ public final class LogitPrefilter {
         private final float dryBase;
         private final int dryAllowedLength;
         private final int[] dryTokens;
-        /** Breaker entries, one per restart sequence: the head token first, the tail ids after it. */
-        private final int[][] dryBreakers;
+        /** The restart sequences, shared with the DRY stage that built them. */
+        private final DryBreakers dryBreakers;
         private final boolean penaltiesFirst;
 
         private Row(Builder b) {
@@ -202,11 +202,12 @@ public final class LogitPrefilter {
 
         /** The row's restart sequences, each the head token followed by its tail ids (copies). */
         public int[][] dryBreakers() {
-            int[][] copy = new int[dryBreakers.length][];
-            for (int i = 0; i < dryBreakers.length; i++) {
-                copy[i] = dryBreakers[i].clone();
-            }
-            return copy;
+            return dryBreakers.entries();
+        }
+
+        /** The row's restart sequences as the immutable table the DRY stage shares. */
+        public DryBreakers dryBreakerTable() {
+            return dryBreakers;
         }
 
         /** Whether the penalties stage precedes DRY in the chain (true when only one of them applies). */
@@ -222,11 +223,11 @@ public final class LogitPrefilter {
         @Override
         public String toString() {
             return "Row{bias=" + biasIds.length + (penalties ? ", penalties=" + penaltyTokens.length : "")
-                    + (dry ? ", dry=" + dryTokens.length + " tokens, " + dryBreakers.length + " breakers" : "")
+                    + (dry ? ", dry=" + dryTokens.length + " tokens, " + dryBreakers.count() + " breakers" : "")
                     + '}';
         }
 
-        /** Configures a {@link Row}; every array is copied on {@link #build()}. */
+        /** Configures a {@link Row}; every array is copied, the immutable breaker table shared. */
         public static final class Builder {
 
             private int[] biasIds = new int[0];
@@ -242,7 +243,7 @@ public final class LogitPrefilter {
             private float dryBase = 1f;
             private int dryAllowedLength;
             private int[] dryTokens = new int[0];
-            private int[][] dryBreakers = new int[0][];
+            private DryBreakers dryBreakers = DryBreakers.EMPTY;
             private boolean penaltiesFirst = true;
 
             private Builder() {
@@ -281,6 +282,12 @@ public final class LogitPrefilter {
             /** DRY over the row's window and restart sequences. */
             public Builder dry(boolean enabled, float multiplier, float base, int allowedLength, int[] tokens,
                                int[][] breakers) {
+                return dry(enabled, multiplier, base, allowedLength, tokens, DryBreakers.of(breakers));
+            }
+
+            /** DRY over the row's window and a stage's shared restart-sequence table. */
+            public Builder dry(boolean enabled, float multiplier, float base, int allowedLength, int[] tokens,
+                               DryBreakers breakers) {
                 Objects.requireNonNull(tokens, "dry tokens");
                 Objects.requireNonNull(breakers, "dry breakers");
                 this.dry = enabled;
@@ -288,14 +295,7 @@ public final class LogitPrefilter {
                 this.dryBase = base;
                 this.dryAllowedLength = allowedLength;
                 this.dryTokens = tokens.clone();
-                int[][] copy = new int[breakers.length][];
-                for (int i = 0; i < breakers.length; i++) {
-                    if (breakers[i] == null || breakers[i].length == 0) {
-                        throw new IllegalArgumentException("DRY breaker " + i + " carries no head token");
-                    }
-                    copy[i] = breakers[i].clone();
-                }
-                this.dryBreakers = copy;
+                this.dryBreakers = breakers;
                 return this;
             }
 

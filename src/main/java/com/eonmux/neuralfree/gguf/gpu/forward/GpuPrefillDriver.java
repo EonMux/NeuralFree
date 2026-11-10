@@ -85,7 +85,10 @@ public final class GpuPrefillDriver {
             this.topLogits = topLogits;
         }
 
-        /** Logits or hidden rows ({@link Output#LOGITS}, {@link Output#HIDDEN}); null for ARGMAX and TOPK. */
+        /**
+         * Logits or hidden rows ({@link Output#LOGITS}, {@link Output#HIDDEN}); for a split top-k call the whole
+         * logits of its flagged rows, null elsewhere; null for ARGMAX and a plain TOPK call.
+         */
         public float[][] rows() {
             return rows;
         }
@@ -594,18 +597,28 @@ public final class GpuPrefillDriver {
      */
     public Result runBatchTopK(ForwardBatch batch, int[][] ropeSections, int topK, HiddenTap tap,
                                LogitPrefilter prefilter) {
+        return runBatchTopK(batch, ropeSections, topK, tap, prefilter, null);
+    }
+
+    /**
+     * {@link #runBatchTopK(ForwardBatch, int[][], int, HiddenTap, LogitPrefilter)} that also reads the whole logits
+     * of the output rows {@code fullRows} flags (null for none), from the same head pass: the split readout
+     * ({@code ForwardBackend.forwardBatchSplit}). A flagged row's prefilter row must be empty.
+     */
+    public Result runBatchTopK(ForwardBatch batch, int[][] ropeSections, int topK, HiddenTap tap,
+                               LogitPrefilter prefilter, boolean[] fullRows) {
         if (topK < 1) {
             throw new IllegalArgumentException("top-k readback of " + topK + " candidates");
         }
-        return runBatch(batch, ropeSections, Output.TOPK, topK, tap, prefilter);
+        return runBatch(batch, ropeSections, Output.TOPK, topK, tap, prefilter, fullRows);
     }
 
     private Result runBatch(ForwardBatch batch, int[][] ropeSections, Output output, int topK, HiddenTap tap) {
-        return runBatch(batch, ropeSections, output, topK, tap, null);
+        return runBatch(batch, ropeSections, output, topK, tap, null, null);
     }
 
     private Result runBatch(ForwardBatch batch, int[][] ropeSections, Output output, int topK, HiddenTap tap,
-                            LogitPrefilter prefilter) {
+                            LogitPrefilter prefilter, boolean[] fullRows) {
         Objects.requireNonNull(batch, "batch");
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(tap, "tap");
@@ -633,7 +646,7 @@ public final class GpuPrefillDriver {
                         + " rows");
             }
         }
-        BatchSteps steps = new BatchSteps(batch, memory, ropeSections, output, topK, tap, prefilter);
+        BatchSteps steps = new BatchSteps(batch, memory, ropeSections, output, topK, tap, prefilter, null, fullRows);
         decodeReplay.invalidate();
         int chunk = Math.min(ubatch, memory.plan().ubatch());
         boolean slotUniform = batch.adapterSlots() != null
@@ -836,19 +849,19 @@ public final class GpuPrefillDriver {
         final GpuTreeAcceptReadout accept;
 
         BatchSteps(ForwardBatch batch, DeviceModelMemory memory, int[][] ropeSections, Output output, int topK,
-                   HiddenTap tap, LogitPrefilter prefilter) {
-            this(batch, memory, ropeSections, output, topK, tap, prefilter, null);
+                   HiddenTap tap, LogitPrefilter prefilter, GpuTreeAcceptReadout accept) {
+            this(batch, memory, ropeSections, output, topK, tap, prefilter, accept, null);
         }
 
         BatchSteps(ForwardBatch batch, DeviceModelMemory memory, int[][] ropeSections, Output output, int topK,
-                   HiddenTap tap, LogitPrefilter prefilter, GpuTreeAcceptReadout accept) {
+                   HiddenTap tap, LogitPrefilter prefilter, GpuTreeAcceptReadout accept, boolean[] fullRows) {
             this.batch = batch;
             this.memory = memory;
             this.paged = memory.pagedSequences();
             this.ropeSections = ropeSections;
             this.embeddings = batch.embeddings();
             this.output = output;
-            this.calls = new GpuCallReads(head, queue, batch.outputRows().length, output, topK, prefilter);
+            this.calls = new GpuCallReads(head, queue, batch.outputRows().length, output, topK, prefilter, fullRows);
             this.taps = new GpuTapReads(queue, tap, batch.nTokens(), 0);
             this.accept = accept;
         }
@@ -916,11 +929,12 @@ public final class GpuPrefillDriver {
                     // per-segment uploads, so the trunk enqueues kernel dispatches alone; a commit's row moves
                     // dispatch directly between captures, so one capture serves every round of the same shape.
                     // A multi-row segment keeps running directly (its prefill uploads positions inside the
-                    // trunk), and a recurrent target's round changes the mixer-block routing per round.
+                    // trunk), so does a trunk whose mixers patch their per-sequence kv_pos inside it
+                    // (pagedTrunkWrites), and a recurrent target's round changes the mixer-block routing per round.
                     boolean capturable = chainReplay && !replayDisabled
                             && (treeMask != null || allRowsSingle(step))
                             && recurrentRound == null && !taps.wantsAny(executor.layers().size())
-                            && executor.capturableDecode();
+                            && executor.capturableDecode() && !memory.stepInputs().pagedTrunkWrites();
                     if (treeMask == null && allRowsSingle(step)) {
                         pagedDecodeTrunk(step, slots, batch.nonCausal(), capturable,
                                 () -> executor.run(u.layout(), taps));
@@ -1084,10 +1098,9 @@ public final class GpuPrefillDriver {
 
     /** The largest key count of the step's sequences in its first KV group, the paged decode replay's position. */
     private static int maxKeys(PagedStep step) {
-        int[] slots = step.seqSlots(0);
         int keys = 0;
         for (int seg = 0; seg < step.nSeg(); seg++) {
-            keys = Math.max(keys, slots[step.segSeq(seg)]);
+            keys = Math.max(keys, step.seqSlot(0, step.segSeq(seg)));
         }
         return keys;
     }

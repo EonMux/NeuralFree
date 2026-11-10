@@ -31,6 +31,9 @@ final class SamplerDeviceFilter {
 
     private SamplerStage prefilteredPenalties;
     private SamplerStage prefilteredDry;
+    /** The fixed bias table, built on the first readout row (the banned ids and the bias stage never change). */
+    private int[] biasIds;
+    private float[] biasValues;
 
     SamplerDeviceFilter(Sampler sampler, List<SamplerStage> chain, SamplerStage biasStage, int[] banned,
                         int coneExtra, boolean positiveBias, SamplerConfig config) {
@@ -322,6 +325,14 @@ final class SamplerDeviceFilter {
         if (coneExtra == 0) {
             return;
         }
+        if (biasIds == null) {
+            buildBiasTable();
+        }
+        row.bias(biasIds, biasValues);
+    }
+
+    /** The fixed bias table: the banned ids at {@link Float#NaN}, then the biased ones, each id once. */
+    private void buildBiasTable() {
         LinkedHashMap<Integer, Float> table = new LinkedHashMap<>();
         for (int id : banned) {
             if (id >= 0) {
@@ -350,7 +361,8 @@ final class SamplerDeviceFilter {
             outValues[n] = e.getValue();
             n++;
         }
-        row.bias(outIds, outValues);
+        biasValues = outValues;
+        biasIds = outIds;
     }
 
     /** Fills {@code row} with the penalties and DRY stages the device readout reproduces. */
@@ -365,7 +377,7 @@ final class SamplerDeviceFilter {
         if (dryApplied) {
             DryStage stage = (DryStage) prefilteredDry;
             row.dry(true, stage.multiplier(), stage.base(), stage.allowedLength(), stage.windowTokens(),
-                    stage.breakerEntries());
+                    stage.breakerTable());
         }
         if (penaltiesApplied && dryApplied) {
             penaltiesFirst = chain.indexOf(prefilteredPenalties) < chain.indexOf(prefilteredDry);

@@ -23,6 +23,7 @@ public final class BatchStats {
     private final long generatedTokens;
     private final long deviceSampledRows;
     private final long hostSampleNanos;
+    private final long parallelSampledRows;
     private final long decodeNanos;
     private final long decodeSteps;
     private final long decodeRows;
@@ -56,6 +57,7 @@ public final class BatchStats {
         this.generatedTokens = b.generatedTokens;
         this.deviceSampledRows = b.deviceSampledRows;
         this.hostSampleNanos = b.hostSampleNanos;
+        this.parallelSampledRows = b.parallelSampledRows;
         this.decodeNanos = b.decodeNanos;
         this.decodeSteps = b.decodeSteps;
         this.decodeRows = b.decodeRows;
@@ -103,9 +105,15 @@ public final class BatchStats {
 
     /**
      * Time the engine thread spent in the sequences' host sampler chains: over whole logits rows, over device top-k
-     * readbacks and over a speculative round's verify rows.
+     * readbacks and over a speculative round's verify rows. Rows sampled in parallel count the pass's wall time once.
      */
     public double hostSampleSeconds() { return hostSampleNanos / 1e9; }
+
+    /**
+     * Tokens sampled over whole host rows on worker threads: the rows of a step whose chains hold only their own
+     * state, which sample beside one another instead of one after another on the engine's thread.
+     */
+    public long parallelSampledRows() { return parallelSampledRows; }
 
     /** Time spent in forward passes that carried decode rows (a mixed step counts in this and {@link #promptSeconds()}). */
     public double decodeSeconds() { return decodeNanos / 1e9; }
@@ -211,6 +219,7 @@ public final class BatchStats {
         b.generatedTokens = generatedTokens + other.generatedTokens;
         b.deviceSampledRows = deviceSampledRows + other.deviceSampledRows;
         b.hostSampleNanos = hostSampleNanos + other.hostSampleNanos;
+        b.parallelSampledRows = parallelSampledRows + other.parallelSampledRows;
         b.decodeNanos = decodeNanos + other.decodeNanos;
         b.decodeSteps = decodeSteps + other.decodeSteps;
         b.decodeRows = decodeRows + other.decodeRows;
@@ -244,7 +253,8 @@ public final class BatchStats {
     @Override
     public String toString() {
         return "BatchStats[prompt=" + promptTokens + ", cached=" + promptTokensCached + ", generated="
-                + generatedTokens + ", device=" + deviceSampledRows + ", steps=" + decodeSteps
+                + generatedTokens + ", device=" + deviceSampledRows + ", parallel=" + parallelSampledRows
+                + ", steps=" + decodeSteps
                 + ", preemptions=" + preemptions + ", spec="
                 + specAccepted + "/" + specDrafted + " over " + specRounds + " rounds, lookahead="
                 + lookaheadAccepted + "/" + lookaheadEmitted + " over " + lookaheadRounds + " rounds, finished="
@@ -260,6 +270,7 @@ public final class BatchStats {
         long generatedTokens;
         long deviceSampledRows;
         long hostSampleNanos;
+        long parallelSampledRows;
         long decodeNanos;
         long decodeSteps;
         long decodeRows;

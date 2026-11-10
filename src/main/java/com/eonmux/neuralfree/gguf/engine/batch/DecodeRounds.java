@@ -66,7 +66,8 @@ final class DecodeRounds {
     /**
      * Drafts the proposals of the step's decoding sequences in one {@link BatchDrafter#draftBatch} call: every
      * running sequence past its prefill whose round can hold a draft of at least {@code draftMin} within the free
-     * context after its pending token, one ubatch and {@code maxRows} (the step's token budget) asks for one. Each
+     * context after its pending token, one ubatch, {@code maxRows} (the step's token budget) and what is left of
+     * {@code draftRows} (the rows the step leaves its drafts, handed out in {@code active} order) asks for one. Each
      * answer is validated ({@link #checkDraft}) and cut to the prefix the sequence's grammar admits after the
      * pending token, which its sampler already holds ({@code Sampler#admitted}, vLLM's {@code validate_tokens});
      * the cut proposal is what {@code draftMin} judges. A broken answer retires its sequence alone, before anything
@@ -74,19 +75,21 @@ final class DecodeRounds {
      * class doc). A proposal shorter than {@code draftMin} is not verified and the drafter hears
      * {@code accept(seq, 0)}.
      */
-    void draftStep(List<Slot> active, int maxRows) {
+    void draftStep(List<Slot> active, int maxRows, int draftRows) {
         if (drafter == null) {
             return;
         }
         if (spec.treeVerify()) {
-            draftTreeStep(active, maxRows);
+            draftTreeStep(active, maxRows, draftRows);
             return;
         }
         List<Slot> asking = new ArrayList<>();
         List<BatchDrafter.Request> requests = new ArrayList<>();
+        int left = draftRows;
         for (Slot slot : active) {
-            int k = draftLimit(slot, maxRows);
-            if (!slot.needsPrefill && k > 0) {
+            int k = Math.min(draftLimit(slot, maxRows), left);
+            if (!slot.needsPrefill && k > 0 && k >= spec.draftMin()) {
+                left -= k;
                 asking.add(slot);
                 requests.add(new BatchDrafter.Request(slot.seq, slot.pendingToken, k, slot.draftTemperature,
                         slot.draftRng, slot.run.sampler().watermarkConfig(),
@@ -118,12 +121,13 @@ final class DecodeRounds {
      * The tree form of {@link #draftStep}: one {@link BatchDrafter#draftTreeBatch} call over every decoding
      * sequence, then the verify budget's cut. The step's tree rows share the logits batch with the plain decode
      * rows of the other sequences, so the budget's room is the mask-and-ubatch row cap over one row per decoding
-     * sequence; less room than a node per asking sequence drafts nothing this step (the sequences decode plain, no
+     * sequence, and at most {@code draftRows} (the rows the step leaves its drafts); less room than a node per asking
+     * sequence drafts nothing this step (the sequences decode plain, no
      * drafter call, no state to unwind). Each answer is validated, cut to the budget's per-request node count and
      * armed on its slot; a broken answer retires its sequence alone, a draft call that throws retires every
      * sequence of the call.
      */
-    private void draftTreeStep(List<Slot> active, int maxRows) {
+    private void draftTreeStep(List<Slot> active, int maxRows, int draftRows) {
         List<Slot> asking = new ArrayList<>();
         List<BatchDrafter.Request> requests = new ArrayList<>();
         int decodingRows = 0;
@@ -143,7 +147,7 @@ final class DecodeRounds {
         if (requests.isEmpty()) {
             return;
         }
-        int room = Math.min(MAX_TREE_ROWS, ubatch) - decodingRows;
+        int room = Math.min(Math.min(MAX_TREE_ROWS, ubatch) - decodingRows, draftRows);
         if (room < requests.size()) {
             return; // the step holds no node row beyond the pending rows: plain decodes, nothing armed
         }

@@ -26,7 +26,9 @@ import java.util.Objects;
  * Device per-step inputs ({@link GpuStepInputs}) plus the host mirror of every group's {@code kv_pos}, which is the
  * visibility bookkeeping: {@link #upload(int, int)} marks the step's rows in the mirror and writes each device
  * buffer once (the changed {@code kv_pos} row range, or the whole ring when the step wraps). Rollback, reset and
- * the context shift change the mirror and rewrite {@code kv_pos} the same way.
+ * the context shift change the mirror and rewrite {@code kv_pos} the same way. Over a paged memory every mirror
+ * change between two steps marks its row ({@link KvPosDirtyRows}), and {@link #beginPagedStep} writes only the
+ * marked rows.
  *
  * <p>Also owns the position buffers of caches without per-step addressing: {@link #identityRows()} ({@code i} at
  * index {@code i}) serves as {@code cell_idx} and {@code kv_pos} of caches written once at rows {@code 0..n-1}
@@ -46,6 +48,10 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
     private final GpuBuffer[] kvPos;
     private final GpuBuffer[] cellIdx;
     private final GpuBuffer[] shiftDelta;
+    /**
+     * Per group: the rows whose device {@code kv_pos} the next paged step must rewrite; null for the contiguous form.
+     */
+    private final KvPosDirtyRows[] dirty;
     private final GpuBuffer qPos;
     private final GpuBuffer ropePos;
     private final GpuBuffer stateRows;
@@ -89,6 +95,7 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         this.kvPos = new GpuBuffer[n];
         this.cellIdx = new GpuBuffer[n];
         this.shiftDelta = new GpuBuffer[n];
+        this.dirty = pages != null ? new KvPosDirtyRows[n] : null;
         int maxInts = Math.max(MropeTextPositions.SECTIONS * ubatch, identityLength);
         for (int g = 0; g < n; g++) {
             MemoryPlan.KvGroup group = groups.get(g);
@@ -96,6 +103,9 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
                 throw new IllegalArgumentException("KV group at position " + g + " has index " + group.index());
             }
             positions[g] = new GroupPositions(group);
+            if (dirty != null) {
+                dirty[g] = new KvPosDirtyRows(group.rows());
+            }
             maxInts = Math.max(maxInts, group.rows());
         }
         this.ints = new int[maxInts];
@@ -616,6 +626,11 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         return paged != null ? paged.sequenceKvPos(group, seq) : null;
     }
 
+    @Override
+    public boolean pagedTrunkWrites() {
+        return paged != null && paged.addressesSequences();
+    }
+
     // ------------------------------------------------------------------ bookkeeping used by the memory
 
     /** Position stored in {@code row} of KV group {@code group} (host mirror of {@code kv_pos}), -1 when empty. */
@@ -669,6 +684,9 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         for (int g = 0; g < positions.length; g++) {
             positions[g].clear();
             queue.enqueueFillBuffer(kvPos[g], 0, kvPos[g].sizeInBytes(), -1);
+            if (dirty != null) {
+                dirty[g].clearAll();
+            }
         }
         if (paged != null) {
             paged.current = null;
@@ -790,6 +808,37 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         writeMirror(group, 0, p.rows());
     }
 
+    /**
+     * Takes {@code mirror} as the positions of a paged group without writing the device: the rows whose position
+     * changes are marked, and the next paged step's upload carries them.
+     *
+     * @throws IllegalArgumentException when the mirror's length differs from the group's rows
+     * @throws IllegalStateException    when the memory is not paged
+     */
+    void installPagedMirror(int group, int[] mirror) {
+        checkOpen();
+        GroupPositions p = positions[checkGroup(group)];
+        if (dirty == null) {
+            throw new IllegalStateException("the contiguous step inputs write their mirror changes at once");
+        }
+        if (mirror.length != p.rows()) {
+            throw new IllegalArgumentException("a mirror of " + mirror.length + " rows for KV group " + group + " of "
+                    + p.rows() + " rows");
+        }
+        for (int r = 0; r < mirror.length; r++) {
+            setPagedRow(group, r, mirror[r]);
+        }
+    }
+
+    /** Sets one paged mirror row, marking it for the next step's upload when its position changes. */
+    private void setPagedRow(int group, int row, int position) {
+        GroupPositions p = positions[group];
+        if (p.position(row) != position) {
+            p.set(row, position);
+            dirty[group].mark(row);
+        }
+    }
+
     private void writeMirror(int group, int from, int to) {
         if (to <= from) {
             return;
@@ -799,6 +848,9 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
             ints[r - from] = p.position(r);
         }
         writeInts(kvPos[group], from, ints, to - from);
+        if (dirty != null) {
+            dirty[group].clear(from, to);
+        }
     }
 
     private void writeInts(GpuBuffer dst, long elementOffset, int[] src, int n) {
@@ -858,8 +910,9 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
      * Device page tables and per-sequence addressing of a paged memory: per KV group the compacted page table of
      * the current step's segments (launch order, the row the {@code LLM_FlashDecodePaged_*} fold and the
      * {@code LLM_FlashAttnPaged_*} {@code pt_off} address), the per-sequence slot counts, and the per-launch query
-     * positions. {@link #begin} uploads a step whole; the attention mixers read the buffers through
-     * {@link GpuStepInputs} of the owning memory. Not thread-safe.
+     * positions. {@link #begin} uploads a step: the marked {@code kv_pos} rows, the page-table entries that differ
+     * from what the device holds ({@link DevicePageTables}), and the per-step arrays whole; the attention mixers
+     * read the buffers through {@link GpuStepInputs} of the owning memory. Not thread-safe.
      */
     final class Paged {
 
@@ -869,14 +922,16 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         private final int maxSequences;
         private final int maxPages;
         private final int pageShift;
-        private final GpuBuffer[] pageTable;   // [groups] int[maxSequences * maxPages]
+        private final DevicePageTables[] pageTable;   // [groups] int[maxSequences * maxPages]
         private final GpuBuffer[] seqKvLen;    // [groups] int[maxSequences]
         private final GpuBuffer qPosSeq;       // int[maxSequences], per-launch query position of sequence s
         private final GpuBuffer segPos;        // int[ubatch], the positions of one prefill segment
-        /** Cells of one sequence ({@code PagedStep.seqCells}), {@code maxPages * pageSize} long. */
-        private final int[] seqCells;
-        private final GpuBuffer[][] seqKvPos;  // [groups][maxSequences] int[rows], reserved per group
+        private final SequenceKvPos[] seqKvPos;  // [groups] int[rows] per sequence, reserved per group
         private final boolean[][] kvPosBuilt;
+        /** The {@code [from, to)} row ranges of one group's marked {@code kv_pos} rows. */
+        private final int[] runs = new int[2 * KvPosDirtyRows.MAX_RUNS];
+        /** One value per launch sequence, staged for one write. */
+        private final int[] launch;
         private PagedStep current;
 
         private Paged(ComputeBackend backend, ComputeQueue queue, int groups, int ubatch, PagedSequences pages,
@@ -887,11 +942,12 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
             this.maxSequences = pages.maxSequences();
             this.maxPages = pages.maxPages();
             this.pageShift = pageShiftOf(pages.pageSize());
-            this.pageTable = new GpuBuffer[groups];
+            this.pageTable = new DevicePageTables[groups];
             this.seqKvLen = new GpuBuffer[groups];
             for (int g = 0; g < groups; g++) {
-                pageTable[g] = track(owned, alloc((long) maxSequences * maxPages * Integer.BYTES));
-                queue.enqueueFillBuffer(pageTable[g], 0, pageTable[g].sizeInBytes(), -1);
+                GpuBuffer table = track(owned, alloc((long) maxSequences * maxPages * Integer.BYTES));
+                queue.enqueueFillBuffer(table, 0, table.sizeInBytes(), -1);
+                pageTable[g] = new DevicePageTables(table, maxSequences, maxPages);
                 seqKvLen[g] = track(owned, alloc((long) maxSequences * Integer.BYTES));
                 queue.enqueueFillBuffer(seqKvLen[g], 0, seqKvLen[g].sizeInBytes(), 0);
             }
@@ -899,8 +955,8 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
             queue.enqueueFillBuffer(qPosSeq, 0, qPosSeq.sizeInBytes(), 0);
             this.segPos = track(owned, alloc((long) ubatch * Integer.BYTES));
             queue.enqueueFillBuffer(segPos, 0, segPos.sizeInBytes(), 0);
-            this.seqCells = new int[maxPages * pages.pageSize()];
-            this.seqKvPos = new GpuBuffer[groups][];
+            this.launch = new int[maxSequences];
+            this.seqKvPos = new SequenceKvPos[groups];
             this.kvPosBuilt = new boolean[groups][maxSequences];
         }
 
@@ -920,25 +976,30 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
                 closeAll(kv);
                 throw e;
             }
-            seqKvPos[group] = kv;
+            seqKvPos[group] = new SequenceKvPos(kv, positions[group].rows(), maxPages * pages.pageSize());
         }
 
-        /** {@code kv_pos} of {@code group} restricted to sequence {@code seq}'s cells (see the interface). */
+        /**
+         * {@code kv_pos} of {@code group} restricted to sequence {@code seq}'s cells (see the interface): the first
+         * call of a step patches the sequence's persistent buffer to the step ({@link SequenceKvPos#update}).
+         */
         GpuBuffer sequenceKvPos(int group, int seq) {
             checkSequence(group, seq);
             if (!kvPosBuilt[group][seq]) {
-                GroupPositions mirror = positions[group];
-                int rows = mirror.rows();
-                Arrays.fill(ints, 0, rows, -1);
-                int slots = current.seqCells(group, seq, seqCells);
-                for (int j = 0; j < slots; j++) {
-                    int cell = seqCells[j];
-                    ints[cell] = mirror.position(cell);
-                }
-                writeInts(seqKvPos[group][seq], 0, ints, rows);
+                seqKvPos[group].update(current, group, seq, positions[group], DeviceStepInputs.this::writeInts);
                 kvPosBuilt[group][seq] = true;
             }
-            return seqKvPos[group][seq];
+            return seqKvPos[group].buffer(seq);
+        }
+
+        /** Whether a group reserved its per-sequence addressing, which the trunk patches ({@link #sequenceKvPos}). */
+        boolean addressesSequences() {
+            for (SequenceKvPos s : seqKvPos) {
+                if (s != null) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private void checkSequence(int group, int seq) {
@@ -971,7 +1032,7 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         /** Page table of group {@code group} (the step's segments in launch order). */
         GpuBuffer pageTable(int group) {
             checkGroup(group);
-            return pageTable[group];
+            return pageTable[group].buffer();
         }
 
         /** Slots each launch sequence holds in group {@code group} ({@code seq_kv_len}). */
@@ -1016,7 +1077,7 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
                 int[] values = r.values();
                 GroupPositions mirror = positions[r.group()];
                 for (int i = 0; i < rows.length; i++) {
-                    mirror.set(rows[i], values[i]);
+                    setPagedRow(r.group(), rows[i], values[i]);
                 }
                 if (deltasOut != null && !r.absolute()) {
                     if (deltasOut[r.group()] == null) {
@@ -1036,9 +1097,9 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
             drainReports(null);
             for (int g = 0; g < groups; g++) {
                 applyKvPos(g, step);
-                writeMirrorWhole(g);
+                writeDirtyRows(g);
                 writeInts(cellIdx[g], 0, step.cellIdx(g), step.nTokens());
-                writePageTable(g, step);
+                pageTable[g].upload(step, g, DeviceStepInputs.this::writeInts);
                 writeInts(seqKvLen[g], 0, launchSlots(g, step), segments(step));
             }
             writeInts(qPosSeq, 0, launchPositions(step), segments(step));
@@ -1088,58 +1149,33 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         private void applyKvPos(int group, PagedStep step) {
             int[] rows = step.kvPosRows(group);
             int[] values = step.kvPosValues(group);
-            GroupPositions mirror = positions[group];
             for (int i = 0; i < rows.length; i++) {
-                mirror.set(rows[i], values[i]);
+                setPagedRow(group, rows[i], values[i]);
             }
         }
 
-        /** One whole-buffer {@code kv_pos} write of {@code group}, carrying the mirror's every change. */
-        private void writeMirrorWhole(int group) {
-            GroupPositions mirror = positions[group];
-            int rows = mirror.rows();
-            for (int r = 0; r < rows; r++) {
-                ints[r] = mirror.position(r);
-            }
-            writeInts(kvPos[group], 0, ints, rows);
-        }
-
-        /**
-         * The step's page table of {@code group} compacted to launch order (segment {@code s} at row {@code s}),
-         * packed into as few contiguous writes as the staging scratch holds ({@code maxPages} rows per chunk at
-         * most, one write whenever the scratch covers the whole step).
-         */
-        private void writePageTable(int group, PagedStep step) {
-            int segs = step.nSeg();
-            int[] table = step.pageTable(group);
-            int perWrite = Math.max(1, ints.length / maxPages);
-            for (int s = 0; s < segs; s += perWrite) {
-                int n = Math.min(perWrite, segs - s);
-                for (int i = 0; i < n; i++) {
-                    System.arraycopy(table, step.segSeq(s + i) * maxPages, ints, i * maxPages, maxPages);
-                }
-                writeInts(pageTable[group], (long) s * maxPages, ints, n * maxPages);
+        /** The {@code kv_pos} writes of {@code group} that carry every marked row of the mirror to the device. */
+        private void writeDirtyRows(int group) {
+            int n = dirty[group].runs(runs);
+            for (int r = 0; r < n; r++) {
+                writeMirror(group, runs[2 * r], runs[2 * r + 1]);
             }
         }
 
-        /** Slots each launch sequence holds in {@code group} after the step. */
+        /** Slots each launch sequence holds in {@code group} after the step, in the launch scratch. */
         private int[] launchSlots(int group, PagedStep step) {
-            int segs = segments(step);
-            int[] slots = new int[segs];
-            for (int s = 0; s < segs; s++) {
-                slots[s] = step.seqSlots(group)[step.segSeq(s)];
+            for (int s = 0; s < segments(step); s++) {
+                launch[s] = step.seqSlot(group, step.segSeq(s));
             }
-            return slots;
+            return launch;
         }
 
-        /** Query position of each launch sequence (its segment's first position). */
+        /** Query position of each launch sequence (its segment's first position), in the launch scratch. */
         private int[] launchPositions(PagedStep step) {
-            int segs = segments(step);
-            int[] pos = new int[segs];
-            for (int s = 0; s < segs; s++) {
-                pos[s] = step.segPos0(s);
+            for (int s = 0; s < segments(step); s++) {
+                launch[s] = step.segPos0(s);
             }
-            return pos;
+            return launch;
         }
 
         /**
@@ -1203,13 +1239,15 @@ public final class DeviceStepInputs implements GpuStepInputs, AutoCloseable {
         /** Releases the page-table and per-sequence buffers. Idempotent with the owning step inputs. */
         void close() {
             for (int g = 0; g < groups; g++) {
-                pageTable[g].close();
+                pageTable[g].buffer().close();
                 seqKvLen[g].close();
             }
             qPosSeq.close();
             segPos.close();
             for (int g = 0; g < groups; g++) {
-                closeAll(seqKvPos[g]);
+                if (seqKvPos[g] != null) {
+                    seqKvPos[g].close();
+                }
             }
         }
     }

@@ -80,9 +80,27 @@ public class BatchEngineDraftersTest {
 
     // ------------------------------------------------------------------ fixtures
 
+    /** An engine over one-ubatch steps with uncapped prefill chunks. */
     private static EngineConfig.Builder config(int nCtx, int parallel) {
+        return config(nCtx, parallel, 0, 0);
+    }
+
+    /**
+     * {@link #config(int, int)} with prefill chunks capped at three rows while other requests run, so a step beside
+     * a prefill keeps rows for the drafts of the sequences decoding next to it (drafted rows only spend what the
+     * prefills leave).
+     */
+    private static EngineConfig.Builder cappedPrefillConfig(int nCtx, int parallel) {
+        return config(nCtx, parallel, 0, 3);
+    }
+
+    /**
+     * An engine whose steps share {@code maxBatchedTokens} rows (0: one ubatch) and whose prefill chunks beside other
+     * requests take at most {@code longPrefillTokens} rows (0: no cap).
+     */
+    private static EngineConfig.Builder config(int nCtx, int parallel, int maxBatchedTokens, int longPrefillTokens) {
         MemoryConfig mc = MemoryConfig.builder().nCtx(nCtx).ubatch(8).typeK(KvDType.F32).typeV(KvDType.F32)
-                .parallel(parallel).build();
+                .parallel(parallel).longPrefillTokens(longPrefillTokens).maxBatchedTokens(maxBatchedTokens).build();
         return EngineConfig.builder().backend(EngineConfig.BackendMode.CPU).memory(mc).draftMax(4);
     }
 
@@ -173,7 +191,7 @@ public class BatchEngineDraftersTest {
     public void everyLookupTypeDraftsPerSequenceAndKeepsTheSingleSequenceOutputs() throws IOException {
         for (String types : new String[]{"ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod",
                 "ngram-cache", "suffix", "ngram-map-k,suffix", "suffix,ngram-mod,ngram-simple"}) {
-            BatchStats stats = runBoth(types, config(N_CTX, 2).draftTypes(DraftTypes.parse(types))
+            BatchStats stats = runBoth(types, cappedPrefillConfig(N_CTX, 2).draftTypes(DraftTypes.parse(types))
                     .speculativeOptions(tripleLookups()).build());
             assertTrue(types + " drafted: " + stats, stats.specDrafted() > 0);
             assertTrue(stats.specAccepted() <= stats.specDrafted());
@@ -304,7 +322,7 @@ public class BatchEngineDraftersTest {
     @Test
     public void theDynamicLookupCacheCollectsEverySequenceWhenTheEngineCloses() throws IOException {
         Path dynamic = tmp.getRoot().toPath().resolve("dynamic.bin");
-        EngineConfig cfg = config(N_CTX, 2).draftType(EngineConfig.DraftType.NGRAM_CACHE)
+        EngineConfig cfg = cappedPrefillConfig(N_CTX, 2).draftType(EngineConfig.DraftType.NGRAM_CACHE)
                 .speculativeOptions(SpeculativeOptions.builder().lookupCacheDynamic(dynamic.toString()).build())
                 .build();
         try (GGUFModel two = new GGUFModel(model.toString(), cfg);
@@ -386,9 +404,12 @@ public class BatchEngineDraftersTest {
         return out;
     }
 
-    /** Rejection verification with a probabilistic draft model of {@code draft}. */
+    /**
+     * Rejection verification with a probabilistic draft model of {@code draft}, over steps of 32 rows: the eight
+     * sequences' armed rows and three drafted rows each.
+     */
     private static EngineConfig rejection(Path draft) {
-        return config(512, 8).draftModelPath(draft.toString()).draftMax(3)
+        return config(512, 8, 32, 0).draftModelPath(draft.toString()).draftMax(3)
                 .speculativeOptions(SpeculativeOptions.builder().verifyMode(VerifyMode.REJECTION)
                         .probabilisticDraft(true).build())
                 .build();

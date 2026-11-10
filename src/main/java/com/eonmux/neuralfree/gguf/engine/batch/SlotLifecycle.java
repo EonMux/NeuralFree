@@ -61,7 +61,7 @@ final class SlotLifecycle {
      */
     void completed(Submission sub, GenerationResult result, boolean cancelled) {
         releaseAdapters(sub);
-        state.encoderCache.release(sub.mediaIds);
+        releaseMedia(sub);
         StopReason reason = cancelled || result == null ? StopReason.CANCELLED : result.stopReason();
         state.stats.finished[reason.ordinal()]++;
         int length = sub.prompt.nTokens() + (result == null ? 0 : result.tokens().length);
@@ -79,7 +79,7 @@ final class SlotLifecycle {
      */
     void failed(Submission sub, Throwable error) {
         releaseAdapters(sub);
-        state.encoderCache.release(sub.mediaIds);
+        releaseMedia(sub);
         state.stats.failed++;
         sub.handle.fail(error);
     }
@@ -102,7 +102,7 @@ final class SlotLifecycle {
             failure = e;
         }
         releaseAdapters(sub);
-        state.encoderCache.release(sub.mediaIds);
+        releaseMedia(sub);
         if (failure == null) {
             try {
                 sub.pooling.complete(state.poolingOperator, sub.prompt.samplerTokens());
@@ -113,6 +113,14 @@ final class SlotLifecycle {
         if (failure != null) {
             state.stats.failed++;
             sub.handle.fail(failure);
+        }
+    }
+
+    /** Drops {@code sub}'s encoder cache references, once: a later outcome report of the same submission keeps them. */
+    void releaseMedia(Submission sub) {
+        if (!sub.mediaReleased) {
+            sub.mediaReleased = true;
+            state.encoderCache.release(sub.mediaIds);
         }
     }
 

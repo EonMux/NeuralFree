@@ -12,6 +12,7 @@ import com.eonmux.neuralfree.gguf.engine.OutputKind;
 import com.eonmux.neuralfree.gguf.engine.RecurrentTreeRound;
 import com.eonmux.neuralfree.gguf.engine.RowTopK;
 import com.eonmux.neuralfree.gguf.engine.RopeSectionSupport;
+import com.eonmux.neuralfree.gguf.engine.SplitReadout;
 import com.eonmux.neuralfree.gguf.engine.TreeAccept;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
@@ -550,6 +551,12 @@ public final class GpuForwardBackend implements ForwardBackend {
         return forwardBatchTopK(batch, k, null);
     }
 
+    /** The logits head this backend reads its rows through, for the package's diagnostics. */
+    GpuLogitsHead logitsHead() {
+        ensureOpen();
+        return head;
+    }
+
     /** Whether the head's prefilter kernel runs on this backend ({@code LLM_LogitsPrefilter}). */
     @Override
     public boolean batchPrefilterOnDevice() {
@@ -569,20 +576,29 @@ public final class GpuForwardBackend implements ForwardBackend {
         }
         ensureOpen();
         int width = Math.min(k, head.vocab());
-        GpuPrefillDriver.Result r = batched(batch, GpuPrefillDriver.Output.TOPK, width, prefilter);
+        GpuPrefillDriver.Result r = batched(batch, GpuPrefillDriver.Output.TOPK, width, prefilter, null);
         return RowTopK.packed(width, batch.outputRows().length, r.topIds(), r.topLogits());
     }
 
-    private GpuPrefillDriver.Result batched(ForwardBatch batch, GpuPrefillDriver.Output output) {
-        return batched(batch, output, 0, null);
+    /**
+     * Top candidates of every output row on the device after the per-row prefilter, plus the whole logits of the
+     * flagged rows from the same head pass; only the candidates and the flagged rows are read back.
+     */
+    @Override
+    public SplitReadout forwardBatchSplit(ForwardBatch batch, boolean[] fullRows, int k, LogitPrefilter prefilter) {
+        ForwardBackend.checkSplit(batch, fullRows, k, prefilter);
+        ensureOpen();
+        int width = Math.min(k, head.vocab());
+        GpuPrefillDriver.Result r = batched(batch, GpuPrefillDriver.Output.TOPK, width, prefilter, fullRows);
+        return new SplitReadout(RowTopK.packed(width, fullRows.length, r.topIds(), r.topLogits()), r.rows());
     }
 
-    private GpuPrefillDriver.Result batched(ForwardBatch batch, GpuPrefillDriver.Output output, int topK) {
-        return batched(batch, output, topK, null);
+    private GpuPrefillDriver.Result batched(ForwardBatch batch, GpuPrefillDriver.Output output) {
+        return batched(batch, output, 0, null, null);
     }
 
     private GpuPrefillDriver.Result batched(ForwardBatch batch, GpuPrefillDriver.Output output, int topK,
-                                            LogitPrefilter prefilter) {
+                                            LogitPrefilter prefilter, boolean[] fullRows) {
         Objects.requireNonNull(batch, "batch");
         ensureOpen();
         String refusal = batchRefusal();
@@ -615,7 +631,7 @@ public final class GpuForwardBackend implements ForwardBackend {
             }
         }
         return output == GpuPrefillDriver.Output.TOPK
-                ? driver.runBatchTopK(batch, ropeSections, topK, tap, prefilter)
+                ? driver.runBatchTopK(batch, ropeSections, topK, tap, prefilter, fullRows)
                 : driver.runBatch(batch, ropeSections, output, tap);
     }
 

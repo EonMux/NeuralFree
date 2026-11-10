@@ -99,19 +99,20 @@ final class CpuPagedAttention {
 
     /**
      * The page-table slice of {@code seq} ({@code PagedStep.pageTable[g][seq * maxPages + k]}), the table
-     * {@code CpuAttentionCore.attendRows}' paged form indexes, built in a scratch reused across the segments.
+     * {@code CpuAttentionCore.attendRows}' paged form indexes, built in a scratch reused across the segments: the
+     * entries the sequence's {@link #slots} address, the rest of the scratch unread.
      */
     int[] pageTable(PagedStep step, int group, int seq) {
         if (pagedSlice == null || pagedSlice.length != step.maxPages()) {
             pagedSlice = new int[step.maxPages()];
         }
-        System.arraycopy(step.pageTable(group), seq * step.maxPages(), pagedSlice, 0, step.maxPages());
+        step.pageTableRow(group, seq, pagedSlice);
         return pagedSlice;
     }
 
     /** The slots {@code seq} holds in this cache's group, the attend span (contiguous slot space). */
     static int slots(PagedStep step, int group, int seq) {
-        return step.seqSlots(group)[seq];
+        return step.seqSlot(group, seq);
     }
 
     /**

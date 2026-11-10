@@ -755,9 +755,9 @@ public final class CpuMlaMixer implements CpuMixer {
         CpuAttentionCore.TreeMask tree = treeMask(rowOff, len);
         if (pagedStep != null) {
             int group = kv.group();
-            int keys = pagedStep.seqSlots(group)[seq];
-            int[] table = new int[pagedStep.maxPages()];
-            System.arraycopy(pagedStep.pageTable(group), seq * pagedStep.maxPages(), table, 0, pagedStep.maxPages());
+            int keys = pagedStep.seqSlot(group, seq);
+            int[] table = new int[pagedStep.pageTableLength(group, seq)];
+            pagedStep.pageTableRow(group, seq, table);
             CpuAttentionCore.Params stepParams = ctx.stepNonCausal() ? nonCausalParams : params;
             CpuAttentionCore.attendRows(stepParams, len, qs, qsOff, qStride, qPos, rowOff, kv, rowPos,
                     pageShift(pagedStep), table, 0, keys, os, osOff, outStride, tree);

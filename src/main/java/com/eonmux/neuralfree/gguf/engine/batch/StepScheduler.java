@@ -8,9 +8,10 @@ import java.util.List;
 
 /**
  * Schedules one {@link BatchEngine} step within its token budget ({@code neuralfree.max.batched.tokens}, vLLM's
- * {@code max_num_batched_tokens}): first-come first-served over the running sequences in admission order, each
- * decode round its rows ({@link DecodeRounds}) and each prefill chunk its rows ({@link PrefillChunks}), then hands
- * the pieces to the {@link StepExecutor}. With chunked prefill off the step keeps the older shape: the oldest
+ * {@code max_num_batched_tokens}): every decoding sequence first reserves its armed row, the pending prefill chunks
+ * ({@link PrefillChunks}) then take the budget left first-come first-served, and the decode rounds
+ * ({@link DecodeRounds}) last spend the rest on their drafts; the step then hands the pieces to the
+ * {@link StepExecutor}. With chunked prefill off the step keeps the older shape: the oldest
  * waiting prefill runs alone — its whole prompt tail in one forward batch — or, when none waits, one decode row
  * per running sequence. Over a memory with context checkpoints a text prefill's chunks end on the checkpoint rows.
  * A text prefill's chunks are multiples of the ubatch size the whole run to the next forced break splits into
@@ -74,15 +75,19 @@ final class StepScheduler {
     }
 
     /**
-     * Schedules and runs one step over the active sequences: first-come first-served over the running sequences
-     * in admission order within the token budget, each decode round its rows (one plain, or {@code 1 + drafted}
-     * when the engine speculates: the step's proposals are drafted first, in one call over every decoding
-     * sequence, {@link DecodeRounds#draftStep}, and a proposal the step does not schedule is discarded) and a
-     * prefill chunk its rows, so a sequence ahead of a long prompt keeps
-     * decoding and a later one waits (vLLM's FCFS loop). A prefill chunk takes the rows its prompt still lacks,
-     * capped per step by {@code neuralfree.long.prefill.tokens} while other requests run or wait (vLLM
-     * {@code long_prefill_token_threshold}); a decode round bounds its drafts to the budget left (vLLM budgets a
-     * request's speculative rows too). A media prompt's pending prefill schedules whole-chunk pieces within the
+     * Schedules and runs one step over the active sequences in three passes within the token budget: first one row
+     * for each decoding sequence in admission order (its armed token), then the pending prefills first-come
+     * first-served over the budget those rows left, then the decode rounds' drafts in admission order over what the
+     * prefills left ({@code 1 + drafted} rows when the engine speculates: the step's proposals are drafted first, in
+     * one call over every decoding sequence, {@link DecodeRounds#draftStep}, asking only for the rows the prefills
+     * leave ({@link #draftRows}), and a proposal the step does not schedule, or the part of one it cuts, is
+     * discarded). No prefill, however early it was admitted, takes the row of a decoding sequence (the decode-first
+     * chunked-prefill policy vLLM documents; Sarathi's stall-free batching), and no draft row takes the budget of
+     * an admitted prefill, so the oldest runnable text prefill progresses on every
+     * step whose budget (and tree-mask rows) exceed the decoding sequences' rows. A prefill chunk takes the rows its
+     * prompt still lacks, capped per step by {@code neuralfree.long.prefill.tokens} while other requests run or wait
+     * (vLLM {@code long_prefill_token_threshold}); a decode round bounds its drafts to the budget left (vLLM budgets
+     * a request's speculative rows too). A media prompt's pending prefill schedules whole-chunk pieces within the
      * step's encoder budget ({@code neuralfree.max.encoder.tokens}, vLLM's {@code encoder_compute_budget});
      * unscheduled chunks wait for a later step (see {@link PrefillChunks#chunkPieces}). With chunked prefill off
      * the oldest waiting prefill takes its whole tail alone and the decodes wait. A fork whose donor has
@@ -101,7 +106,8 @@ final class StepScheduler {
         plan.anyPrefill = hasWaitingPrefill();
         plan.maskLeft = Integer.MAX_VALUE;
         if (chunkedPrefill || !plan.anyPrefill) {
-            rounds.draftStep(new ArrayList<>(state.active), chunkedPrefill ? tokenBudget : ubatch);
+            rounds.draftStep(new ArrayList<>(state.active), chunkedPrefill ? tokenBudget : ubatch,
+                    chunkedPrefill ? draftRows(plan) : Integer.MAX_VALUE);
         }
         if (treeMode) {
             for (Slot slot : state.active) {
@@ -113,10 +119,13 @@ final class StepScheduler {
             }
         }
         List<Slot> order = new ArrayList<>(state.active);
-        for (Slot slot : order) {
-            boolean more = slot.needsPrefill ? schedulePrefill(slot, plan) : scheduleDecode(slot, plan);
-            if (!more) {
-                break;
+        if (chunkedPrefill) {
+            scheduleChunked(order, plan);
+        } else {
+            for (Slot slot : order) {
+                if (slot.needsPrefill ? !schedulePrefill(slot, plan) : !scheduleDecode(slot, plan)) {
+                    break;
+                }
             }
         }
         for (Slot slot : order) {
@@ -125,6 +134,81 @@ final class StepScheduler {
         if (!plan.pieces.isEmpty()) {
             executor.run(plan.pieces);
         }
+    }
+
+    /**
+     * The rows a chunked step leaves its drafts, so the drafter is asked only for proposals the step can verify:
+     * the token budget (within the tree-mask rows when the engine verifies trees) past one row per decoding
+     * sequence and the rows the pending text prefills ask for first. A prefill's ask is the rows its prompt lacks,
+     * capped by {@code neuralfree.long.prefill.tokens} as {@link #chunkRows} caps it; the ask bounds the chunk the
+     * step schedules from above (ubatch alignment, a checkpoint row, an adopted prefix or a cancellation can only
+     * shrink it), so a draft asked for never loses its rows to a prefill.
+     */
+    private int draftRows(StepPlan plan) {
+        int rows = treeMode ? Math.min(tokenBudget, Math.min(DecodeRounds.MAX_TREE_ROWS, ubatch)) : tokenBudget;
+        for (Slot slot : state.active) {
+            if (!slot.needsPrefill) {
+                if (slot.lookahead == null) {
+                    rows--;
+                }
+            } else if (slot.submission.prompt.isTextOnly() && !claims.waitsForDonor(slot)) {
+                int lacking = slot.pendingTotal() - slot.prefillRows;
+                boolean capped = plan.capChunks && (slot.submission.pooling == null || causal);
+                rows -= capped ? Math.min(lacking, longPrefillTokens) : lacking;
+            }
+            if (rows <= 0) {
+                return 0;
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * The chunked step's three passes over {@code order}: every decoding sequence reserves its armed row in admission
+     * order, the pending prefills then take the budget left first-come first-served, and the decode rounds last
+     * spend what the prefills left on their drafts, in admission order. The decode pieces lead the step's pieces.
+     */
+    private void scheduleChunked(List<Slot> order, StepPlan plan) {
+        List<Slot> decoding = new ArrayList<>();
+        int reserved = 0;
+        for (Slot slot : order) {
+            if (slot.needsPrefill) {
+                continue;
+            }
+            if (plan.budgetLeft - reserved <= 0 || plan.maskLeft - reserved <= 0) {
+                break; // the step's rows are spent: the rest decodes on a later step
+            }
+            decoding.add(slot);
+            if (slot.lookahead == null) {
+                reserved++;
+            }
+        }
+        plan.budgetLeft -= reserved;
+        plan.maskLeft -= reserved;
+        for (Slot slot : order) {
+            if (slot.needsPrefill && !schedulePrefill(slot, plan)) {
+                break;
+            }
+        }
+        plan.budgetLeft += reserved;
+        plan.maskLeft += reserved;
+        int prefills = plan.pieces.size();
+        for (Slot slot : decoding) {
+            if (slot.lookahead != null) {
+                scheduleLookahead(slot, plan);
+                continue;
+            }
+            // the rows past every later sequence's reserved row bound this round's drafts
+            reserved--;
+            int spare = Math.max(0, Math.min(plan.budgetLeft, plan.maskLeft) - 1 - reserved);
+            Piece decode = rounds.decodePiece(slot, 1 + spare);
+            plan.pieces.add(decode);
+            plan.budgetLeft -= decode.rows;
+            plan.maskLeft -= decode.rows;
+        }
+        List<Piece> decodes = new ArrayList<>(plan.pieces.subList(prefills, plan.pieces.size()));
+        plan.pieces.subList(prefills, plan.pieces.size()).clear();
+        plan.pieces.addAll(0, decodes);
     }
 
     /**
@@ -165,27 +249,14 @@ final class StepScheduler {
     }
 
     /**
-     * Schedules {@code slot}'s decode round: within the budget left with chunked prefill on, one ubatch at most
-     * with it off — and then only when no prefill waits. False when the budget is spent.
+     * Schedules {@code slot}'s decode round with chunked prefill off: one ubatch at most, and only when no prefill
+     * waits. False when the step's masked rows are spent.
      */
     private boolean scheduleDecode(Slot slot, StepPlan plan) {
         if (plan.maskLeft <= 0) {
             return false; // the step's masked rows are spent: the rest decodes on a later step
         }
-        if (chunkedPrefill) {
-            if (plan.budgetLeft <= 0) {
-                return false;
-            }
-            if (slot.lookahead != null) {
-                return scheduleLookahead(slot, plan);
-            }
-            Piece decode = rounds.decodePiece(slot, Math.min(plan.budgetLeft, plan.maskLeft));
-            if (decode != null) {
-                plan.pieces.add(decode);
-                plan.budgetLeft -= decode.rows;
-                plan.maskLeft -= decode.rows;
-            }
-        } else if (!plan.anyPrefill) {
+        if (!plan.anyPrefill) {
             if (slot.lookahead != null) {
                 return scheduleLookahead(slot, plan);
             }

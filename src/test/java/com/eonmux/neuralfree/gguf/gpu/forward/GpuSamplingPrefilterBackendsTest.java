@@ -16,6 +16,7 @@ import com.eonmux.neuralfree.gguf.engine.Sampler;
 import com.eonmux.neuralfree.gguf.engine.SamplerConfig;
 import com.eonmux.neuralfree.gguf.engine.SamplerPrefilterTest;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
+import com.eonmux.neuralfree.gguf.gpu.head.GpuLogitsHead;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
@@ -193,6 +194,56 @@ public class GpuSamplingPrefilterBackendsTest {
                 assertArrayEquals(api + " row " + r + " logits", host.logits(r), device.logits(r), TOL);
             }
             f.reset();
+        }
+    }
+
+    /**
+     * The device keeps the breaker tables of the last call: a second call over the same rows' tables skips their
+     * upload and still matches the host, and a call whose first row brings another table uploads it again, as does
+     * the call that brings the first table back.
+     */
+    @Test
+    public void repeatedBreakerTablesStayOnTheDeviceUntilARowChangesThem() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        int[] a = {4, 5, 4, 5, 4, 5, 6, 5, 4, 5, 4, 5};
+        int[] b = {7, 8, 7, 8, 7, 8, 9, 8, 7, 8, 7, 8};
+        SamplerConfig.Builder dry = SamplerConfig.builder().temperature(0.9f).topK(K).penaltyLastN(0)
+                .dryMultiplier(0.8f).dryBase(2f).dryAllowedLength(2).dryPenaltyLastN(12).seed(11);
+        SamplerConfig breaking = dry.drySequenceBreakers(Arrays.asList("ab")).build();
+        try (GGUFModelGPU two = new GGUFModelGPU(model.toString(), backend, config())) {
+            SamplerVocab vocab = Sampler.vocab(two.tokenizer());
+            // the window's own last token as a breaker: every repeat restarts there, so DRY edits nothing
+            SamplerConfig cutting = dry.drySequenceBreakers(Arrays.asList(vocab.pieceText(a[a.length - 1]))).build();
+            Sampler sa = Sampler.create(breaking, new int[0], vocab);
+            Sampler sb = Sampler.create(breaking, new int[0], vocab);
+            Sampler sc = Sampler.create(cutting, new int[0], vocab);
+            sa.accept(a, 0, a.length);
+            sb.accept(b, 0, b.length);
+            sc.accept(a, 0, a.length);
+            ForwardBackend f = two.forwardBackend();
+            assertTrue(f instanceof GpuForwardBackend);
+            GpuLogitsHead head = ((GpuForwardBackend) f).logitsHead();
+            long[] before = head.prefilterBreakerUploads().clone();
+            float[][] rows = f.forwardBatch(interleave(a, b));
+            f.reset();
+            assertFalse("the breaker tables change the first row's edit",
+                    Arrays.equals(SamplerPrefilterTest.applyPrefilter(rows[0], sa.prefilterRow()),
+                            SamplerPrefilterTest.applyPrefilter(rows[0], sc.prefilterRow())));
+            for (Sampler first : new Sampler[]{sa, sa, sc, sa}) {
+                LogitPrefilter.Row r0 = first.prefilterRow();
+                LogitPrefilter.Row r1 = sb.prefilterRow();
+                RowTopK host = RowTopK.of(new float[][]{SamplerPrefilterTest.applyPrefilter(rows[0], r0),
+                        SamplerPrefilterTest.applyPrefilter(rows[1], r1)}, K);
+                RowTopK device = f.forwardBatchTopK(interleave(a, b), K, LogitPrefilter.of(List.of(r0, r1)));
+                for (int r = 0; r < host.rows(); r++) {
+                    assertArrayEquals(api + " row " + r + " ids", host.ids(r), device.ids(r));
+                    assertArrayEquals(api + " row " + r + " logits", host.logits(r), device.logits(r), TOL);
+                }
+                f.reset();
+            }
+            long[] after = head.prefilterBreakerUploads();
+            assertEquals(api + ": calls that uploaded the breaker tables", 3, after[0] - before[0]);
+            assertEquals(api + ": the repeated call skipped the upload", 1, after[1] - before[1]);
         }
     }
 }

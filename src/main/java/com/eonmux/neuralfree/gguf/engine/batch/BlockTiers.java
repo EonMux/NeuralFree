@@ -183,7 +183,7 @@ final class BlockTiers {
                     onTier = host != null && host.whole(parentHash, key, want, pos, pageSize) != null;
                 }
             } else {
-                h = PrefixCache.chainHash(hasher, parentHash, rows, pos, pageSize, null);
+                h = PrefixCache.memoHash(hasher, pageSize, parentHash, rows, pos, pageSize, null);
                 onTier = host != null && host.whole(parentHash, key, want, pos, pageSize) != null;
             }
             if (onTier) {

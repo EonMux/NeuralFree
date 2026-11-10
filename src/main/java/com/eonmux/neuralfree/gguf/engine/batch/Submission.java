@@ -56,6 +56,8 @@ final class Submission {
     final int[] source;
     /** The media identities whose encoder cache entries the submission references; empty without any. */
     final List<String> mediaIds;
+    /** Whether the submission dropped its {@link #mediaIds} references, which it does once, at its outcome. */
+    boolean mediaReleased;
     /** Prompt rows the sequence reuses from the prefix cache or its donor's fork. */
     int reused;
     /** Whether every cached block the request reuses is reported as a {@code BlockStored} (report mode full). */

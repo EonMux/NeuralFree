@@ -206,6 +206,63 @@ public interface ForwardBackend extends AutoCloseable {
     }
 
     /**
+     * {@link #forwardBatchTopK(ForwardBatch, int, LogitPrefilter)} that also reads the whole logits of the output rows
+     * {@code fullRows} flags: one forward serves the rows a sampler chain samples from a cone and the rows that need
+     * the whole vocabulary (a grammar, a logprobs capture, a verify round). {@code prefilter} (null for none) holds
+     * one row per output row and must be empty on every flagged row, which therefore comes back unedited; the
+     * candidates of a flagged row are computed too and carry no meaning for the caller. The default reads every row
+     * back ({@link #forwardBatch}) and selects on the host, refusing a non-empty prefilter as
+     * {@link #forwardBatchTopK(ForwardBatch, int, LogitPrefilter)} does.
+     *
+     * @throws IllegalArgumentException      when {@code k} is below one, {@code fullRows} does not hold one flag per
+     *                                       output row, or a flagged row's prefilter row is not empty
+     * @throws UnsupportedOperationException when this backend cannot apply the prefilter on the device
+     */
+    default SplitReadout forwardBatchSplit(ForwardBatch batch, boolean[] fullRows, int k, LogitPrefilter prefilter) {
+        checkSplit(batch, fullRows, k, prefilter);
+        if (prefilter != null && !prefilter.isEmpty()) {
+            throw new UnsupportedOperationException(getClass().getSimpleName() + " applies no logit prefilter on"
+                    + " the device: " + batchRefusal());
+        }
+        float[][] rows = forwardBatch(batch);
+        float[][] whole = new float[rows.length][];
+        for (int i = 0; i < rows.length; i++) {
+            if (fullRows[i]) {
+                whole[i] = rows[i];
+            }
+        }
+        return new SplitReadout(RowTopK.of(rows, k), whole);
+    }
+
+    /**
+     * Checks a {@link #forwardBatchSplit} call: a positive {@code k}, one flag per output row of {@code batch}, and
+     * an empty prefilter row on every flagged row.
+     */
+    static void checkSplit(ForwardBatch batch, boolean[] fullRows, int k, LogitPrefilter prefilter) {
+        Objects.requireNonNull(batch, "batch");
+        Objects.requireNonNull(fullRows, "fullRows");
+        if (k < 1) {
+            throw new IllegalArgumentException("top-k readback of " + k + " candidates");
+        }
+        int outputs = batch.outputRows().length;
+        if (fullRows.length != outputs) {
+            throw new IllegalArgumentException(fullRows.length + " whole-row flags for " + outputs + " output rows");
+        }
+        if (prefilter != null) {
+            if (prefilter.rows() != outputs) {
+                throw new IllegalArgumentException("the prefilter holds " + prefilter.rows() + " rows for "
+                        + outputs + " output rows");
+            }
+            for (int i = 0; i < outputs; i++) {
+                if (fullRows[i] && !prefilter.row(i).isEmpty()) {
+                    throw new IllegalArgumentException("output row " + i + " is read whole but carries prefilter"
+                            + " edits");
+                }
+            }
+        }
+    }
+
+    /**
      * Evaluates a {@link ForwardBatch} like {@link #forwardBatch} and returns the final hidden states of its output
      * rows in batch order: the rows after the output norm, the input of the LM, pooling and classifier heads
      * (llama.cpp {@code t_embd}). Default: refused.

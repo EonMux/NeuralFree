@@ -695,7 +695,7 @@ void main() {
             const float l = nf_fd_stats[NF_FD_MAX_G + g];
             if ((pc.flags & NF_ATTN_FLAG_DIRECT) != 0) {
                 const vec2 fl = (pc.flags & NF_ATTN_FLAG_SINKS) != 0 ? nf_attn_sink(m, l, sinks[h]) : vec2(1.0, l);
-                dst[uint(pc.out_off + h * d_v + d)] = fl.y > 0.0 ? o[i] * fl.x / fl.y : 0.0;
+                dst[uint(out_off + h * d_v + d)] = fl.y > 0.0 ? o[i] * fl.x / fl.y : 0.0;
             } else {
 #if defined(PAGED)
                 const uint pb = uint(((seq * pc.n_head + h) * pc.n_split + split) * (d_v + 2));

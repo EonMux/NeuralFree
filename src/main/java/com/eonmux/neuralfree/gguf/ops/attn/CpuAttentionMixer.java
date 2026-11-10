@@ -1162,12 +1162,11 @@ public final class CpuAttentionMixer implements CpuMixer {
      */
     private void scaleDualChunk(int n, int pos0, int[] pos, float[] q, float[] k) {
         if (pagedStep != null) {
-            int[] slots = pagedStep.seqSlots(kv.group());
             for (int seg = 0; seg < pagedStep.nSeg(); seg++) {
                 int seq = pagedStep.segSeq(seg);
                 int start = pagedStep.segStart(seg);
                 int len = pagedStep.segLen(seg);
-                scaleDualChunkRows(dualChunk.scalingFactor(slots[seq]), q, k, start, len);
+                scaleDualChunkRows(dualChunk.scalingFactor(pagedStep.seqSlot(kv.group(), seq)), q, k, start, len);
             }
             return;
         }

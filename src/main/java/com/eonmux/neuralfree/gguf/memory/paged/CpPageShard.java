@@ -187,8 +187,6 @@ public final class CpPageShard {
     /** Reconciles one main group against the mirror and writes the rank's translated rows into {@code b}. */
     private void translateGroup(int g, int rg, PagedStep mainStep, int[] mirror, int rank, PagedStep.Builder b) {
         int pages = mainGroupPages[g];
-        int maxPages = mainStep.maxPages();
-        int[] table = mainStep.pageTable(g);
         int[] mainCells = mainStep.cellIdx(g);
         int[] image = imageOf[g][rank];
         PagePool pool = pools[g][rank];
@@ -207,8 +205,9 @@ public final class CpPageShard {
         for (int seq = 0; seq < maxSeqs; seq++) {
             int owned = 0;
             int rankSlots = 0;
-            for (int k = 0; k < maxPages; k++) {
-                int p = table[seq * maxPages + k];
+            int tableLen = mainStep.pageTableLength(g, seq);
+            for (int k = 0; k < tableLen; k++) {
+                int p = mainStep.pageTableEntry(g, seq, k);
                 if (p < 0 || p >= pages || recorded[p] < 0 || image[p] < 0 || ownerOf(recorded[p]) != rank) {
                     continue;
                 }

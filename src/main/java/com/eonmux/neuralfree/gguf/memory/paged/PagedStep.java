@@ -27,7 +27,8 @@ public final class PagedStep {
     private final int[] segPos0;      // [nSeg] first position of each segment
     private final int[] segPosMax;    // [nSeg] highest stored position of each segment
     private final int[][] cellIdx;    // [groups][nTokens] physical row per token
-    private final int[][] pageTable;  // [groups][maxSequences * maxPages], -1 = this list element does not exist
+    private final int[][][] tables;   // [groups][maxSequences] each sequence's page list after commit, null = none
+    private final int[][] tableLen;   // [groups][maxSequences] entries of each table; the entries past it are -1
     private final int[][] seqSlots;   // [groups][maxSequences] slots the sequence holds after commit
     private final int[][] kvPosRows;  // [groups][rows written], ascending within each segment, in segment order
     private final int[][] kvPosValues;// [groups][counts match kvPosRows], the positions they take
@@ -46,7 +47,8 @@ public final class PagedStep {
         this.segPos0 = s.segPos0;
         this.segPosMax = s.segPosMax;
         this.cellIdx = s.cellIdx;
-        this.pageTable = s.pageTable;
+        this.tables = s.tables;
+        this.tableLen = s.tableLen;
         this.seqSlots = s.seqSlots;
         this.kvPosRows = s.kvPosRows;
         this.kvPosValues = s.kvPosValues;
@@ -66,7 +68,8 @@ public final class PagedStep {
         int[] segPos0;
         int[] segPosMax;
         int[][] cellIdx;
-        int[][] pageTable;
+        int[][][] tables;
+        int[][] tableLen;
         int[][] seqSlots;
         int[][] kvPosRows;
         int[][] kvPosValues;
@@ -138,24 +141,75 @@ public final class PagedStep {
     }
 
     /**
-     * Page table of group {@code g}, laid out {@code pageTable[seq * maxPages + k]}: page id after commit, or -1
-     * when sequence {@code seq}'s list has no page at index {@code k}.
+     * Page table of group {@code g} as one new array laid out {@code pageTable[seq * maxPages + k]}: page id after
+     * commit, or -1 when sequence {@code seq}'s list has no page at index {@code k}. The step stores each sequence's
+     * table compacted; the per-step readers take {@link #pageTableRow} and {@link #pageTableEntry} instead.
      *
      * @throws IndexOutOfBoundsException when {@code g} is outside {@link #groups()}
      */
     public int[] pageTable(int g) {
         checkGroup(g);
-        return pageTable[g].clone();
+        int[] out = new int[maxSequences * maxPages];
+        Arrays.fill(out, -1);
+        for (int seq = 0; seq < maxSequences; seq++) {
+            if (tableLen[g][seq] > 0) {
+                System.arraycopy(tables[g][seq], 0, out, seq * maxPages, tableLen[g][seq]);
+            }
+        }
+        return out;
     }
 
     /**
-     * Slots each sequence holds in group {@code g} after the commit ({@code seqSlots[seq]}).
+     * Entries of sequence {@code seq}'s page table in group {@code g}: every entry from this index on is -1, so a
+     * reader of the slots {@code [0, seqSlot(g, seq))} needs only the entries below it.
+     *
+     * @throws IndexOutOfBoundsException when {@code g} or {@code seq} is outside the step
+     */
+    public int pageTableLength(int g, int seq) {
+        checkGroup(g);
+        checkSequence(seq);
+        return tableLen[g][seq];
+    }
+
+    /**
+     * Copies sequence {@code seq}'s page table in group {@code g} into {@code dst[0, pageTableLength(g, seq))} and
+     * returns that length; the entries past it are -1 and {@code dst} keeps whatever it held there.
+     *
+     * @throws IndexOutOfBoundsException when {@code g} or {@code seq} is outside the step
+     * @throws IllegalArgumentException  when {@code dst} is shorter than the table
+     */
+    public int pageTableRow(int g, int seq, int[] dst) {
+        int len = pageTableLength(g, seq);
+        if (Objects.requireNonNull(dst, "dst").length < len) {
+            throw new IllegalArgumentException("sequence " + seq + " holds " + len + " page table entries in group "
+                    + g + ", the destination " + dst.length);
+        }
+        if (len > 0) {
+            System.arraycopy(tables[g][seq], 0, dst, 0, len);
+        }
+        return len;
+    }
+
+    /**
+     * Slots each sequence holds in group {@code g} after the commit ({@code seqSlots[seq]}), as a new array; the
+     * per-layer readers take {@link #seqSlot} instead.
      *
      * @throws IndexOutOfBoundsException when {@code g} is outside {@link #groups()}
      */
     public int[] seqSlots(int g) {
         checkGroup(g);
         return seqSlots[g].clone();
+    }
+
+    /**
+     * Slots sequence {@code seq} holds in group {@code g} after the commit (0 for a sequence outside the step).
+     *
+     * @throws IndexOutOfBoundsException when {@code g} or {@code seq} is outside the step
+     */
+    public int seqSlot(int g, int seq) {
+        checkGroup(g);
+        checkSequence(seq);
+        return seqSlots[g][seq];
     }
 
     /**
@@ -199,10 +253,9 @@ public final class PagedStep {
             throw new IllegalArgumentException("sequence " + seq + " holds " + slots + " slots in group " + g
                     + ", the cell array " + dst.length);
         }
-        int[] table = pageTable[g];
-        int base = seq * maxPages;
+        int[] table = tables[g][seq];
         for (int j = 0; j < slots; j++) {
-            dst[j] = table[base + j / pageSize] * pageSize + j % pageSize;
+            dst[j] = table[j / pageSize] * pageSize + j % pageSize;
         }
         return slots;
     }
@@ -214,16 +267,16 @@ public final class PagedStep {
 
     /**
      * Page table entry of sequence {@code seq} group {@code g} list index {@code k} (the entry of
-     * {@code pageTable(g)[seq * maxPages + k]}).
+     * {@code pageTable(g)[seq * maxPages + k]}): -1 from {@link #pageTableLength} on.
      *
      * @throws IndexOutOfBoundsException outside the group or the table
      */
-    int pageTableEntry(int g, int seq, int k) {
+    public int pageTableEntry(int g, int seq, int k) {
         if (g < 0 || g >= groups || seq < 0 || seq >= maxSequences || k < 0 || k >= maxPages) {
             throw new IndexOutOfBoundsException("page table entry g=" + g + " seq=" + seq + " k=" + k
                     + " outside groups=" + groups + ", seqs=" + maxSequences + ", maxPages=" + maxPages);
         }
-        return pageTable[g][seq * maxPages + k];
+        return k < tableLen[g][seq] ? tables[g][seq][k] : -1;
     }
 
     @Override
@@ -258,10 +311,8 @@ public final class PagedStep {
             s.maxPages = memory.maxPages();
             s.segSeq = null;
             s.cellIdx = new int[s.groups][n];
-            s.pageTable = new int[s.groups][s.maxSequences * s.maxPages];
-            for (int g = 0; g < s.groups; g++) {
-                Arrays.fill(s.pageTable[g], -1);
-            }
+            s.tables = new int[s.groups][s.maxSequences][];
+            s.tableLen = new int[s.groups][s.maxSequences];
             s.seqSlots = new int[s.groups][s.maxSequences];
             s.kvPosRows = new int[s.groups][0];
             s.kvPosValues = new int[s.groups][0];
@@ -314,15 +365,55 @@ public final class PagedStep {
             return this;
         }
 
+        /** Sets entry {@code pageIdx} of sequence {@code seq}'s table in group {@code g}; unset entries stay -1. */
         Builder pageTable(int g, int seq, int pageIdx, int page) {
             if (pageIdx < 0 || pageIdx >= s.maxPages) {
                 throw new IllegalStateException("page index " + pageIdx + " outside maxPages " + s.maxPages);
             }
-            if (page >= s.nPages) {
+            checkPage(page);
+            int[] row = s.tables[g][seq];
+            if (row == null || row.length <= pageIdx) {
+                int grown = Math.min(s.maxPages, Math.max(pageIdx + 1, row == null ? 4 : row.length * 2));
+                int from = row == null ? 0 : row.length;
+                row = row == null ? new int[grown] : Arrays.copyOf(row, grown);
+                Arrays.fill(row, from, grown, -1);
+                s.tables[g][seq] = row;
+            }
+            row[pageIdx] = page;
+            if (page >= 0) {
+                s.tableLen[g][seq] = Math.max(s.tableLen[g][seq], pageIdx + 1);
+            }
+            return this;
+        }
+
+        /**
+         * Sequence {@code seq}'s whole table in group {@code g}: entry {@code k} of {@code row} is list index
+         * {@code k}, -1 where the list holds no page. The step adopts {@code row}, which its caller built for it
+         * and no longer touches.
+         *
+         * @throws IllegalStateException when the row exceeds {@code maxPages} or names a page outside the pool
+         */
+        Builder pageTableRow(int g, int seq, int[] row) {
+            if (row.length > s.maxPages) {
+                throw new IllegalStateException("page table of " + row.length + " entries exceeds maxPages "
+                        + s.maxPages);
+            }
+            int len = 0;
+            for (int k = 0; k < row.length; k++) {
+                checkPage(row[k]);
+                if (row[k] >= 0) {
+                    len = k + 1;
+                }
+            }
+            s.tables[g][seq] = row;
+            s.tableLen[g][seq] = len;
+            return this;
+        }
+
+        private void checkPage(int page) {
+            if (page < -1 || page >= s.nPages) {
                 throw new IllegalStateException("page id " + page + " outside the pool of " + s.nPages + " pages");
             }
-            s.pageTable[g][seq * s.maxPages + pageIdx] = page;
-            return this;
         }
 
         Builder seqSlots(int g, int seq, int slots) {
@@ -379,6 +470,12 @@ public final class PagedStep {
     private void checkGroup(int g) {
         if (g < 0 || g >= groups) {
             throw new IndexOutOfBoundsException("KV group " + g + " outside " + groups);
+        }
+    }
+
+    private void checkSequence(int seq) {
+        if (seq < 0 || seq >= maxSequences) {
+            throw new IndexOutOfBoundsException("sequence " + seq + " outside [0, " + maxSequences + ")");
         }
     }
 }

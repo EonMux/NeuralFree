@@ -62,16 +62,6 @@ public final class PagedSequences implements SequenceMemory {
     private final PageSharing sharing;
     private final PagedCompaction compaction;
 
-    // DEBUG temp: an op history for the invariant dump
-    static final java.util.ArrayDeque<String> debugHistory = new java.util.ArrayDeque<>();
-
-    private void debugNote(String op, int seq, int g) {
-        if (debugHistory.size() > 60) {
-            debugHistory.poll();
-        }
-        debugHistory.add("@" + Integer.toHexString(System.identityHashCode(this)) + " " + op + " seq" + seq
-                + " g" + g + " -> slots " + slots[g][seq] + " listLen " + lists[seq][g].size());
-    }
     private int clears;
 
     /**
@@ -357,16 +347,11 @@ public final class PagedSequences implements SequenceMemory {
                 PageList list = lists[seq][g];
                 int listLen = list.size();
                 if (listLen != (slot0 + pageSize - 1) / pageSize && !(listLen == 0 && slot0 == 0)) {
-                    StringBuilder hist = new StringBuilder();
-                    for (String op : debugHistory) {
-                        hist.append("\n  ").append(op);
-                    }
-                    // DEBUG temp
                     throw new IllegalStateException("page list of sequence " + seq + " group " + g + " covers "
                             + listLen + " pages for " + slot0 + " slots (pageSize " + pageSize + ", posMax "
-                            + posMaxArr[seq] + ", nPast " + states[seq].nPast() + ")" + hist);
+                            + posMaxArr[seq] + ", nPast " + states[seq].nPast() + ")");
                 }
-                int[] table = new int[maxPages];
+                int[] table = new int[Math.max(listLen, (end + pageSize - 1) / pageSize)];
                 Arrays.fill(table, -1);
                 // the shared pages of the write span get private copies first
                 int spanLast = (end - 1) / pageSize;
@@ -386,11 +371,7 @@ public final class PagedSequences implements SequenceMemory {
                 for (int k = 0; k < listLen && table[k] < 0; k++) {
                     table[k] = list.page(k);
                 }
-                for (int k = 0; k < maxPages; k++) {
-                    if (table[k] >= 0) {
-                        b.pageTable(g, seq, k, table[k]);
-                    }
-                }
+                b.pageTableRow(g, seq, table);
                 b.seqSlots(g, seq, end);
                 for (int t = 0; t < len; t++) {
                     int slot = slot0 + t;
@@ -456,7 +437,6 @@ public final class PagedSequences implements SequenceMemory {
                     list.append(page);
                 }
                 slots[g][seq] = end;
-                debugNote("commit len" + len, seq, g);
             }
             int[] rows = step.kvPosRows(g);
             int[] values = step.kvPosValues(g);
@@ -468,21 +448,21 @@ public final class PagedSequences implements SequenceMemory {
                 kvPos[g][r] = values[i];
             }
         }
-        // verify the applied tables before the step's page ids reach the device
+        // verify the applied tables before the step's page ids reach the device; a table's entries past its
+        // length are -1 by construction, so only the stored ones are compared
         for (int g = 0; g < groupsCount(); g++) {
             for (int s = 0; s < nSeg; s++) {
-                PageList list = lists[step.segSeq(s)][g];
+                int seq = step.segSeq(s);
+                PageList list = lists[seq][g];
                 for (int k = 0; k < list.size(); k++) {
-                    if (step.pageTableEntry(g, step.segSeq(s), k) != list.page(k)) {
+                    if (step.pageTableEntry(g, seq, k) != list.page(k)) {
                         throw new IllegalStateException("page table disagrees with the list of sequence "
-                                + step.segSeq(s) + " at page " + k + " of group " + g);
+                                + seq + " at page " + k + " of group " + g);
                     }
                 }
-                for (int k = list.size(); k < maxPages; k++) {
-                    if (step.pageTableEntry(g, step.segSeq(s), k) != -1) {
-                        throw new IllegalStateException("page table entry beyond the list of sequence "
-                                + step.segSeq(s) + " is not empty at page " + k + " of group " + g);
-                    }
+                if (step.pageTableLength(g, seq) > list.size()) {
+                    throw new IllegalStateException("page table entry beyond the list of sequence " + seq
+                            + " is not empty at page " + list.size() + " of group " + g);
                 }
             }
         }
@@ -611,7 +591,6 @@ public final class PagedSequences implements SequenceMemory {
         }
         states[seq].removePositions(lo, hi);
         recomputePos(seq);
-        debugNote("remove " + lo + ".." + hi, seq, 0);
     }
 
     /**
@@ -744,7 +723,6 @@ public final class PagedSequences implements SequenceMemory {
         for (int g = 0; g < groupsCount(); g++) {
             moveGroupRows(g, seq, srcPos, dstPos);
         }
-        debugNote("moveRows " + srcPos.length, seq, 0);
     }
 
     /** The ordering contract of a compaction: equal lengths, sources above their destinations, both ascending. */

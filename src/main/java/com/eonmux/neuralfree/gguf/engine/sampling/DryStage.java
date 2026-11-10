@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.gguf.engine.sampling;
 
+import com.eonmux.neuralfree.gguf.engine.DryBreakers;
 import com.eonmux.neuralfree.gguf.engine.Sampler.Candidates;
 
 import java.util.ArrayList;
@@ -36,10 +37,21 @@ public final class DryStage extends SamplerStage {
     private final float base;
     private final int allowedLength;
     private final int penaltyLastN;
-    /** head token -> its tail suffixes (any of which completes a restart sequence at that head). */
-    private final Map<Integer, List<List<Integer>>> breakers;
+    /** The breakers' head tokens, ascending. */
+    private final int[] heads;
+    /** Per head: its tail suffixes (any of which completes a restart sequence at that head). */
+    private final int[][][] headTails;
+    /** Per head: whether one of its tails is empty (the breaker ends inside the head token itself). */
+    private final boolean[] singleToken;
     /** The same breakers as one array per restart sequence: the head token first, its tail ids after it. */
     private final int[][] breakerEntries;
+    /** The same breakers as the immutable table every device readout row of this stage shares. */
+    private final DryBreakers breakerTable;
+
+    /** Per apply: the window newest first, the reverse Z-box lengths and the longest repeat per token. */
+    private int[] window = new int[0];
+    private int[] repeat = new int[0];
+    private final TokenRepeats maxTokenRepeat = new TokenRepeats();
 
     private int[] ring;
     private int ringHead;
@@ -87,8 +99,19 @@ public final class DryStage extends SamplerStage {
                 }
             }
         }
-        this.breakers = processed;
+        this.heads = processed.keySet().stream().mapToInt(Integer::intValue).sorted().toArray();
+        this.headTails = new int[heads.length][][];
+        this.singleToken = new boolean[heads.length];
+        for (int h = 0; h < heads.length; h++) {
+            List<List<Integer>> tails = processed.get(heads[h]);
+            headTails[h] = new int[tails.size()][];
+            for (int t = 0; t < tails.size(); t++) {
+                headTails[h][t] = tails.get(t).stream().mapToInt(Integer::intValue).toArray();
+                singleToken[h] |= tails.get(t).isEmpty();
+            }
+        }
         this.breakerEntries = flatten(processed);
+        this.breakerTable = DryBreakers.of(breakerEntries);
         this.ring = enabled ? new int[lastN] : new int[0];
     }
 
@@ -249,6 +272,11 @@ public final class DryStage extends SamplerStage {
         return copy;
     }
 
+    /** The restart sequences as one immutable table, built once (no copy). */
+    public DryBreakers breakerTable() {
+        return breakerTable;
+    }
+
     /** Number of restart sequences the stage carries. */
     public int breakerCount() {
         return breakerEntries.length;
@@ -283,23 +311,24 @@ public final class DryStage extends SamplerStage {
             return;
         }
 
-        int[] repeat = new int[lastNRepeat];
+        int[] win = window(lastNRepeat);
+        int[] repeat = repeat(lastNRepeat);
 
         // Step 1: restart sequences limit the maximum repetition length: the first position whose head token
         // completes a tail sets rep_limit (llama.cpp llama-sampler.cpp:3408-3464).
         int repLimit = lastNRepeat;
         for (int i = 0; i < lastNRepeat; i++) {
-            List<List<Integer>> heads = breakers.get(rat(i));
-            if (heads == null) {
+            int head = Arrays.binarySearch(heads, win[i]);
+            if (head < 0) {
                 continue;
             }
             int longestMatch = -1;
-            for (List<Integer> tail : heads) {
-                int seqLen = tail.size();
+            for (int[] tail : headTails[head]) {
+                int seqLen = tail.length;
                 if (seqLen > longestMatch && seqLen <= i) {
                     boolean match = true;
                     for (int offset = 0; offset < seqLen; offset++) {
-                        if (tail.get(offset) != rat(i - offset - 1)) {
+                        if (tail[offset] != win[i - offset - 1]) {
                             match = false;
                             break;
                         }
@@ -325,7 +354,7 @@ public final class DryStage extends SamplerStage {
         for (int k = 1; k < lastNRepeat; k++) {
             if (k > rt) {
                 int n = 0;
-                while (n + k < lastNRepeat && rat(n) == rat(n + k)) {
+                while (n + k < lastNRepeat && win[n] == win[n + k]) {
                     n++;
                 }
                 repeat[last - k] = Math.min(n, repLimit);
@@ -340,7 +369,7 @@ public final class DryStage extends SamplerStage {
                     repeat[last - k] = Math.min(repeat[last - p], repLimit);
                 } else {
                     int i = rt + 1;
-                    while (i < lastNRepeat && rat(i) == rat(i - k)) {
+                    while (i < lastNRepeat && win[i] == win[i - k]) {
                         i++;
                     }
                     repeat[last - k] = Math.min(i - k, repLimit);
@@ -352,15 +381,11 @@ public final class DryStage extends SamplerStage {
 
         // Step 3: the token that extends each repeated suffix, and how far that repetition runs
         // (llama-sampler.cpp:3533-3558); the largest repeat wins per token.
-        Map<Integer, Integer> maxTokenRepeat = new HashMap<>();
+        maxTokenRepeat.reset(lastNRepeat);
         for (int i = 0; i < lastNRepeat - 1; i++) {
             int repeatLen = repeat[i];
             if (repeatLen >= allowedLength) {
-                int token = rat(lastNRepeat - 2 - i);
-                Integer previous = maxTokenRepeat.get(token);
-                if (previous == null || previous < repeatLen) {
-                    maxTokenRepeat.put(token, repeatLen);
-                }
+                maxTokenRepeat.putMax(win[lastNRepeat - 2 - i], repeatLen);
             }
         }
 
@@ -370,9 +395,9 @@ public final class DryStage extends SamplerStage {
             maxExponentFloat = 88.7228391f / (float) Math.log(base);
         }
         int maxExponent = (int) maxExponentFloat > 0 ? (int) maxExponentFloat : 0;
-        for (int i = 0; i < candidates.size(); i++) {
-            Integer repeatLen = maxTokenRepeat.get(candidates.id(i));
-            if (repeatLen != null && !isSingleTokenBreaker(candidates.id(i))) {
+        for (int i = 0; maxTokenRepeat.size() > 0 && i < candidates.size(); i++) {
+            int repeatLen = maxTokenRepeat.get(candidates.id(i));
+            if (repeatLen >= 0 && !isSingleTokenBreaker(candidates.id(i))) {
                 int repeatExp = repeatLen - allowedLength;
                 if (maxExponent > 0 && repeatExp > maxExponent) {
                     repeatExp = maxExponent;
@@ -385,16 +410,28 @@ public final class DryStage extends SamplerStage {
 
     /** True when one of the token's breakers has an empty tail (the breaker ends inside the token itself). */
     private boolean isSingleTokenBreaker(int token) {
-        List<List<Integer>> heads = breakers.get(token);
-        if (heads == null) {
-            return false;
+        int head = Arrays.binarySearch(heads, token);
+        return head >= 0 && singleToken[head];
+    }
+
+    /** The newest {@code n} window tokens, newest first ({@code win[i]} is llama.cpp's {@code rat(i)}). */
+    private int[] window(int n) {
+        if (window.length < n) {
+            window = new int[penaltyLastN];
         }
-        for (List<Integer> tail : heads) {
-            if (tail.isEmpty()) {
-                return true;
-            }
+        for (int i = 0; i < n; i++) {
+            window[i] = rat(i);
         }
-        return false;
+        return window;
+    }
+
+    /** The Z-box scratch of {@code n} rows, zeroed (the scan leaves the last row unwritten). */
+    private int[] repeat(int n) {
+        if (repeat.length < n) {
+            repeat = new int[penaltyLastN];
+        }
+        Arrays.fill(repeat, 0, n, 0);
+        return repeat;
     }
 
     /** The {@code i}-th most recently accepted token, llama.cpp ring_buffer::rat. */

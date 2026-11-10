@@ -481,8 +481,8 @@ public final class DeviceModelMemory implements GpuMemory {
 
     /**
      * Installs a paged host {@code kv_pos} mirror ({@link #pagedMirrorSnapshot()}) on this memory: the next
-     * {@link #beginPagedStep} uploads it whole. A rank cache takes the mirror of the memory whose page bookkeeping
-     * planned the step, so copies, removals and trims the rank never performed itself reach its kernels.
+     * {@link #beginPagedStep} uploads every row it changes. A rank cache takes the mirror of the memory whose page
+     * bookkeeping planned the step, so copies, removals and trims the rank never performed itself reach its kernels.
      *
      * @throws UnsupportedOperationException for the contiguous form
      * @throws IllegalArgumentException      when the snapshot holds another group count or row count
@@ -503,9 +503,9 @@ public final class DeviceModelMemory implements GpuMemory {
                 throw new IllegalArgumentException("group " + g + " mirror holds " + mirror[g].length + " row(s) to "
                         + positions.rows());
             }
-            for (int row = 0; row < mirror[g].length; row++) {
-                positions.set(row, mirror[g][row]);
-            }
+        }
+        for (int g = 0; g < mirror.length; g++) {
+            stepInputs.installPagedMirror(g, mirror[g]);
         }
     }
 

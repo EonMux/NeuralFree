@@ -1156,9 +1156,8 @@ public final class GpuMlaMixer implements GpuMixer {
             }
         }
         if (BatchInvariance.enabled()) {
-            int[] slots = step.seqSlots(kv.group());
             for (int seg = 0; seg < nSeg; seg++) {
-                rowsFallback(step, seg, slots[step.segSeq(seg)], qs, os);
+                rowsFallback(step, seg, step.seqSlot(kv.group(), step.segSeq(seg)), qs, os);
             }
             return;
         }
@@ -1176,7 +1175,7 @@ public final class GpuMlaMixer implements GpuMixer {
         GpuBuffer tree = treeStep ? steps.treeMask() : null;
         for (int seg = 0; seg < nSeg; seg++) {
             int len = step.segLen(seg);
-            int keys = step.seqSlots(kv.group())[step.segSeq(seg)];
+            int keys = step.seqSlot(kv.group(), step.segSeq(seg));
             int tokStart = step.segStart(seg);
             if (treeStep) {
                 // the segment's rows rope at their tree depth positions and see their own ancestor bits,
@@ -1256,10 +1255,9 @@ public final class GpuMlaMixer implements GpuMixer {
 
     /** One paged decode launch over the step's {@code nSeq} one-row segments (launch order = segment order). */
     private void decodeBatched(PagedStep step, int nSeq, ScratchSlot qs, ScratchSlot os) {
-        int[] slots = step.seqSlots(kv.group());
         int maxKeys = 0;
         for (int i = 0; i < nSeq; i++) {
-            maxKeys = Math.max(maxKeys, slots[step.segSeq(i)]);
+            maxKeys = Math.max(maxKeys, step.seqSlot(kv.group(), step.segSeq(i)));
         }
         FlashAttnTiling.Split sp = pagedTiling.decodeSplit(maxKeys);
         fdPaged.setInt(AttnKernels.ARG_FD_N_SPLIT, sp.count());

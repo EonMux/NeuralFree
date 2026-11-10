@@ -266,7 +266,27 @@ public final class PrefixCache {
 
     /** The hash of the block after the cached block {@code parent} hashed, its chain key only on a first block. */
     byte[] hashOf(Block parent, CacheRows rows, int from, int len, PrefixKey chainKey) {
-        return hash(parent == null ? null : parent.hash, rows, from, len, chainKey);
+        return memoHash(hasher, pageSize, parent == null ? null : parent.hash, rows, from, len, chainKey);
+    }
+
+    /**
+     * {@link #chainHash} through the rows' memo ({@link CacheRows#hashMemo()}): a whole block at a block boundary
+     * takes the digest an earlier lookup of the same rows took after the same parent digest and chain key, and
+     * keeps the digest it computes; a partial block hashes afresh.
+     */
+    static byte[] memoHash(BlockHasher hasher, int pageSize, byte[] parentBytes, CacheRows rows, int from, int len,
+                           PrefixKey chainKey) {
+        if (len != pageSize || from % pageSize != 0) {
+            return chainHash(hasher, parentBytes, rows, from, len, chainKey);
+        }
+        int block = from / pageSize;
+        BlockHashMemo memo = rows.hashMemo();
+        byte[] h = memo.get(hasher, pageSize, block, parentBytes, chainKey);
+        if (h == null) {
+            h = chainHash(hasher, parentBytes, rows, from, len, chainKey);
+            memo.put(hasher, pageSize, block, parentBytes, chainKey, h);
+        }
+        return h;
     }
 
     /**

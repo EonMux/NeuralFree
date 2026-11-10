@@ -208,4 +208,14 @@ public interface GpuStepInputs {
     default GpuBuffer sequenceKvPos(int group, int seq) {
         return null;
     }
+
+    /**
+     * Whether a paged step's trunk writes step inputs from the host: a KV group whose per-sequence addressing was
+     * reserved ({@link #reserveSequenceAddressing}) patches each sequence's {@link #sequenceKvPos} on the trunk's
+     * first request for it, from the mixer that reads it. A decode replay can neither capture such a trunk nor replay
+     * it without its body, so the caller runs it directly. False on the contiguous form.
+     */
+    default boolean pagedTrunkWrites() {
+        return false;
+    }
 }

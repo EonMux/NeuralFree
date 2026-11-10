@@ -188,11 +188,10 @@ final class GpuDualChunkAttention {
         if (pagedStages == null) {
             throw new UnsupportedOperationException("dual-chunk attention runs a paged step without a paged cache");
         }
-        int[] slots = step.seqSlots(group);
         for (int seg = 0; seg < step.nSeg(); seg++) {
             int start = step.segStart(seg);
             int n = step.segLen(seg);
-            int keys = slots[step.segSeq(seg)];
+            int keys = step.seqSlot(group, step.segSeq(seg));
             if (keys < n) {
                 throw new IllegalStateException("dual-chunk attention over " + keys + " cache slots cannot serve " + n
                         + " query rows of sequence " + step.segSeq(seg));

@@ -259,13 +259,22 @@ public final class SequenceRun {
      * tokens evaluated (after any reuse) and the time spent evaluating them.
      */
     public void prefilled(int promptTokens, long promptNanos) {
+        prefilled(promptTokens, promptNanos, System.nanoTime());
+    }
+
+    /**
+     * {@link #prefilled(int, long)} with the generation clock started at {@code generationStart} (a
+     * {@link System#nanoTime} reading): a driver that records the prompt phase after the first token's sampling
+     * passes the moment the prefill ended.
+     */
+    public void prefilled(int promptTokens, long promptNanos, long generationStart) {
         if (promptTokens < 0 || promptNanos < 0) {
             throw new IllegalArgumentException("negative prompt timing: " + promptTokens + " tokens, "
                     + promptNanos + " ns");
         }
         this.promptTokens = promptTokens;
         this.promptNanos = promptNanos;
-        this.generationStart = System.nanoTime();
+        this.generationStart = generationStart;
     }
 
     /**

@@ -136,6 +136,134 @@ public class BatchChunkedPrefillTest {
         }
     }
 
+    /**
+     * The decodes take their rows before any prefill: a sequence admitted after a long prompt, which prefilled
+     * from rows the prompt's chunks left over, decodes every step even once the earlier prompt's chunks could fill
+     * the whole budget again (here once the first sequence finishes and hands its row back).
+     */
+    @Test
+    public void aLaterDecodeKeepsItsRowWhileAnEarlierPromptStillPrefills() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        MemoryConfig.Builder mem = memory().maxBatchedTokens(6);
+        EngineConfig cfg = EngineConfig.builder().memory(mem.build()).build();
+        GenerationRequest shortRun = request(3);
+        GenerationRequest request = request(12);
+        int[] cTokens = tokens(3, 2);
+        int[] aTokens = tokens(1, 25);
+        int[] bTokens = tokens(2, 1);
+        GenerationResult refC = reference(model, memory(), cTokens, shortRun);
+        GenerationResult refA = reference(model, memory(), aTokens, request);
+        GenerationResult refB = reference(model, memory(), bTokens, request);
+
+        try (GGUFModel m = new GGUFModel(model.toString(), cfg);
+             BatchEngine engine = BatchEngine.forModel(m, cfg)) {
+            BatchSequence c = engine.submit(cTokens, shortRun, (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            int[] aCount = new int[1];
+            BatchSequence a = engine.submit(aTokens, request, (tokenId, text) -> aCount[0]++);
+            int[] bCount = new int[1];
+            BatchSequence b = engine.submit(bTokens, request, (tokenId, text) -> bCount[0]++);
+            int stalled = 0;
+            int besidePrefill = 0;
+            while (!b.finished()) {
+                int before = bCount[0];
+                boolean aPrefilling = aCount[0] == 0;
+                engine.pump();
+                if (before > 0 && !b.finished()) {
+                    if (bCount[0] == before) {
+                        stalled++;
+                    }
+                    if (aPrefilling) {
+                        besidePrefill++;
+                    }
+                }
+            }
+            while (!a.finished() || !c.finished()) {
+                engine.pump();
+            }
+            assertDone(a);
+            assertDone(b);
+            assertDone(c);
+            assertTrue("the later sequence decoded beside the earlier prompt's prefill", besidePrefill > 0);
+            assertEquals("steps the later decode got no row", 0, stalled);
+            assertResultsMatch(refA, a.result());
+            assertResultsMatch(refB, b.result());
+            assertResultsMatch(refC, c.result());
+        }
+    }
+
+    /**
+     * Draft rows never take an admitted prefill's budget: beside two decoders whose drafter proposes on every step
+     * (their two rounds of 1 + 4 rows would fill the 8-row budget), a prompt admitted later takes the rows the
+     * decoders' armed rows leave on every step, while both decoders keep sampling on every step. The drafter is
+     * asked only for the drafts the prefill leaves rows for (none while the prompt's chunks fill the budget, one beside
+     * its last chunk), and every output equals its run alone.
+     */
+    @Test
+    public void draftRowsLeaveAnAdmittedPrefillItsRows() throws IOException {
+        Path model = SyntheticModels.llama().writeTempFile();
+        MemoryConfig.Builder mem = memory().maxBatchedTokens(8);
+        EngineConfig cfg = EngineConfig.builder().memory(mem.build()).build();
+        GenerationRequest longRun = GenerationRequest.builder().maxNewTokens(30).ignoreEos(true)
+                .sampler(SamplerConfig.greedyDecoding()).build();
+        GenerationRequest shortRun = request(2);
+        int[] aTokens = tokens(1, 4);
+        int[] bTokens = tokens(2, 4);
+        int[] cTokens = tokens(3, 16);
+        GenerationResult refA = reference(model, memory(), aTokens, longRun);
+        GenerationResult refB = reference(model, memory(), bTokens, longRun);
+        GenerationResult refC = reference(model, memory(), cTokens, shortRun);
+        List<Integer> asked = new ArrayList<>();
+        BatchDrafter always = new BatchDrafter() {
+            @Override
+            public int[] draft(int seq, int lastToken, int n) {
+                asked.add(n);
+                int[] d = new int[n];
+                Arrays.fill(d, 9);
+                return d;
+            }
+
+            @Override
+            public void accept(int seq, int nAccepted) {
+            }
+        };
+        try (GGUFModel m = new GGUFModel(model.toString(), cfg);
+             BatchEngine engine = BatchEngine.forModel(m, cfg, always, new BatchSpec(4, 1))) {
+            BatchSequence a = engine.submit(aTokens, longRun, (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            BatchSequence b = engine.submit(bTokens, longRun, (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            engine.pump();
+            engine.pump();
+            long draftedBefore = engine.stats().specDrafted();
+            long promptBefore = engine.stats().promptTokens();
+            List<List<Integer>> asks = new ArrayList<>();
+            BatchSequence c = engine.submit(cTokens, shortRun, (com.eonmux.neuralfree.gguf.TokenCallback) null);
+            int pumps = 0;
+            while (engine.stats().promptTokens() - promptBefore < cTokens.length && pumps < 40) {
+                long prompt = engine.stats().promptTokens();
+                long generated = engine.stats().generatedTokens();
+                asked.clear();
+                engine.pump();
+                asks.add(new ArrayList<>(asked));
+                pumps++;
+                assertTrue("the later prompt prefills on step " + pumps, engine.stats().promptTokens() > prompt);
+                assertTrue("both decoders sample on step " + pumps,
+                        engine.stats().generatedTokens() - generated >= 2);
+            }
+            // 16 prompt rows over the 6 rows the decoders' armed rows leave of the budget: chunks of 6, 5 and 5 rows
+            assertEquals("steps to the later prompt's last chunk", 3, pumps);
+            assertEquals("no draft is asked for while the chunks fill the budget", List.of(), asks.get(0));
+            assertEquals(List.of(), asks.get(1));
+            assertEquals("the last chunk leaves the first decoder one drafted row", List.of(1), asks.get(2));
+            assertTrue("the decoders drafted before the prompt arrived", draftedBefore > 0);
+            engine.drain();
+            assertDone(a);
+            assertDone(b);
+            assertDone(c);
+            assertResultsMatch(refA, a.result());
+            assertResultsMatch(refB, b.result());
+            assertResultsMatch(refC, c.result());
+        }
+    }
+
     /** The cumulative prompt tokens before step {@code i}. */
     private static long before(StepTrace trace, int i) {
         return i == 0 ? 0 : trace.promptTokens.get(i - 1);

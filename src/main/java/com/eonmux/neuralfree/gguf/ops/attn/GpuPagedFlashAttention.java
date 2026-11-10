@@ -126,7 +126,7 @@ final class GpuPagedFlashAttention {
             /* One launch per segment's row, sized from that segment's own key count: a batch's largest sequence
              * then cannot change another sequence's split, which is what the single-row step uses. */
             for (int seg = 0; seg < nSeg; seg++) {
-                fallback.run(this, step, seg, step.seqSlots(group)[step.segSeq(seg)]);
+                fallback.run(this, step, seg, step.seqSlot(group, step.segSeq(seg)));
             }
             return;
         }
@@ -145,10 +145,9 @@ final class GpuPagedFlashAttention {
 
     /** One paged decode launch over the step's {@code nSeq} one-row segments (launch order = segment order). */
     private void decodeAll(PagedStep step, int group, int nSeq) {
-        int[] slots = step.seqSlots(group);
         int maxKeys = 0;
         for (int i = 0; i < nSeq; i++) {
-            maxKeys = Math.max(maxKeys, slots[step.segSeq(i)]);
+            maxKeys = Math.max(maxKeys, step.seqSlot(group, step.segSeq(i)));
         }
         bindLaunchRows(pg.pageTable(), pg.seqKvLen(), pg.qPosSeq(), qDim, outDim);
         launchDecode(nSeq, maxKeys, 0, 0);
@@ -158,7 +157,7 @@ final class GpuPagedFlashAttention {
     private void prefillSegment(PagedStep step, int group, int seg) {
         int len = step.segLen(seg);
         int tokStart = step.segStart(seg);
-        int keys = step.seqSlots(group)[step.segSeq(seg)];
+        int keys = step.seqSlot(group, step.segSeq(seg));
         if (steps.treeMask() != null) {
             // a tree step's segment launches run at their depth positions under their own ancestor bits, both
             // launch-local ([0, len) of the segment positions and mask buffers)
