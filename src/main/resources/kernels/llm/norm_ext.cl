@@ -1,4 +1,6 @@
-/* norm_ext.cl - LLM_RowNorm, LLM_GroupRms, LLM_GroupNorm, LLM_ResidualMix and row-scale kernels. Requires: common/dialect.h, common/config.h, common/reduce.h */
+/* norm_ext.cl - LLM_RowNorm, LLM_GroupRms, LLM_GroupNorm, LLM_ResidualMix, LLM_ResidualMixNorm, their
+ * Q8_1-emitting forms LLM_RowNormQ8 and LLM_ResidualMixNormQ8, and row-scale kernels.
+ * Requires: common/dialect.h, common/config.h, common/reduce.h */
 /*
  * Generic normalizations, residual mixes and row scales of the layer executor.
  * The CPU reference of every kernel is gguf.ops.norm.NormMath, with identical index formulas.
@@ -32,11 +34,34 @@
 #define NF_MIX_ALPHA_BETA          2
 #define NF_MIX_NORMED_INPUT_SCALED 3
 
+/*
+ * Elements a work-item loads before it uses the first of them in the strided row passes below. A row of
+ * row_len floats gives each work-item ceil(row_len / L) elements (10 for a 2560-wide row at L = 256); a
+ * pass that waited one load latency per element would chain them all, so the passes load NF_NORM_EXT_BATCH
+ * elements per step first. Every pass still visits a work-item's elements in increasing index order, so
+ * its per-work-item sums, and every result bit, do not depend on the batch.
+ */
+#define NF_NORM_EXT_BATCH 4
+
+/* Loads a work-item's next batch of the strided elements i0, i0 + lsize, ... of x[base ..] into v (0 past n). */
+#define NF_NORM_EXT_LOAD(v, x, base, n, i0, lsize)                 \
+    for (int u_ = 0; u_ < NF_NORM_EXT_BATCH; u_++) {               \
+        const int i_ = (i0) + u_ * (lsize);                        \
+        (v)[u_] = i_ < (n) ? (x)[(base) + i_] : 0.0f;              \
+    }
+
 /* Sum of x[base + i] over i in [0, n), strided over the workgroup. */
 NF_INLINE float nf_norm_ext_sum(NF_GLOBAL const float* x, nf_i64 base, int n, int lid, int lsize) {
     float s = 0.0f;
-    for (int i = lid; i < n; i += lsize) {
-        s += x[base + i];
+    for (int i0 = lid; i0 < n; i0 += NF_NORM_EXT_BATCH * lsize) {
+        float v[NF_NORM_EXT_BATCH];
+        NF_NORM_EXT_LOAD(v, x, base, n, i0, lsize)
+#pragma unroll
+        for (int u = 0; u < NF_NORM_EXT_BATCH; u++) {
+            if (i0 + u * lsize < n) {
+                s += v[u];
+            }
+        }
     }
     return s;
 }
@@ -44,9 +69,15 @@ NF_INLINE float nf_norm_ext_sum(NF_GLOBAL const float* x, nf_i64 base, int n, in
 /* Sum of x[base + i]^2 over i in [0, n). */
 NF_INLINE float nf_norm_ext_sumsq(NF_GLOBAL const float* x, nf_i64 base, int n, int lid, int lsize) {
     float s = 0.0f;
-    for (int i = lid; i < n; i += lsize) {
-        const float v = x[base + i];
-        s += v * v;
+    for (int i0 = lid; i0 < n; i0 += NF_NORM_EXT_BATCH * lsize) {
+        float v[NF_NORM_EXT_BATCH];
+        NF_NORM_EXT_LOAD(v, x, base, n, i0, lsize)
+#pragma unroll
+        for (int u = 0; u < NF_NORM_EXT_BATCH; u++) {
+            if (i0 + u * lsize < n) {
+                s += v[u] * v[u];
+            }
+        }
     }
     return s;
 }
@@ -54,9 +85,16 @@ NF_INLINE float nf_norm_ext_sumsq(NF_GLOBAL const float* x, nf_i64 base, int n, 
 /* Sum of (x[base + i] - mean)^2 over i in [0, n). */
 NF_INLINE float nf_norm_ext_sqdev(NF_GLOBAL const float* x, nf_i64 base, int n, float mean, int lid, int lsize) {
     float s = 0.0f;
-    for (int i = lid; i < n; i += lsize) {
-        const float d = x[base + i] - mean;
-        s += d * d;
+    for (int i0 = lid; i0 < n; i0 += NF_NORM_EXT_BATCH * lsize) {
+        float v[NF_NORM_EXT_BATCH];
+        NF_NORM_EXT_LOAD(v, x, base, n, i0, lsize)
+#pragma unroll
+        for (int u = 0; u < NF_NORM_EXT_BATCH; u++) {
+            if (i0 + u * lsize < n) {
+                const float d = v[u] - mean;
+                s += d * d;
+            }
+        }
     }
     return s;
 }
@@ -64,6 +102,129 @@ NF_INLINE float nf_norm_ext_sqdev(NF_GLOBAL const float* x, nf_i64 base, int n, 
 /* Flattened work-item index of a 1-D or 2-D range. */
 NF_INLINE uint nf_norm_ext_linear_id(void) {
     return (uint)get_global_id(0) + (uint)get_global_id(1) * (uint)get_global_size(0);
+}
+
+/*
+ * Element i of a normalized row's Q8_1 form, inside the final pass of a row-norm workgroup whose
+ * work-item lid handles elements t * L + lid (L a multiple of 32), so the 32 elements of a block are
+ * the 32 work-items of one aligned segment. Every work-item of the workgroup calls it once per pass
+ * step (the local-memory segment reductions need it); a work-item past the row passes live = 0, and a
+ * whole segment is live or not because row_len is a multiple of 32. The arithmetic is
+ * LLM_QuantizeQ8_1's: amax = max |v| through fmax from 0 (a NaN drops out), d = amax / 127,
+ * id = d != 0 ? 1/d : 0, q = clamp(round(v * id)), s = d * sum(q); the code sum lies in [-4064, 4064],
+ * so its float reduction is exact in any order and the bits equal the separate quantizer's.
+ */
+NF_INLINE void nf_norm_ext_q8(NF_LOCAL_PTR float* buf, NF_GLOBAL uchar* q8row, int i, int live, float v) {
+    const float amax = nf_seg_max(buf, live ? fmax(0.0f, fabs(v)) : 0.0f, Q8_1_BLOCK_SIZE);
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    const int q = live ? clamp((int)round(v * id), -127, 127) : 0;
+    const float sum = nf_seg_sum(buf, (float)q, Q8_1_BLOCK_SIZE);
+    if (live) {
+        NF_GLOBAL uchar* blk = q8row + (nf_i64)(i / Q8_1_BLOCK_SIZE) * Q8_1_BLOCK_BYTES;
+        const int lane = i % Q8_1_BLOCK_SIZE;
+        blk[Q8_1_QS_OFFSET + lane] = (uchar)(q & 0xFF);
+        if (lane == 0) {
+            vstore_half(d, 0, (NF_GLOBAL NF_HALF*)blk);
+            vstore_half(sum * d, 1, (NF_GLOBAL NF_HALF*)blk);
+        }
+    }
+}
+
+/*
+ * The final pass of the row norms: y[yb + i] = ((x[xb + i] - mean) * scale [* post]) [* w] [+ b] for every
+ * element of the row, element i by work-item i % L in step i / L. With emit_q8 (uniform) every work-item
+ * runs the same number of steps and the row's Q8_1 blocks go to q8row as well (nf_norm_ext_q8).
+ */
+NF_INLINE void nf_norm_ext_store(NF_GLOBAL const float* x, nf_i64 xb, NF_GLOBAL float* y, nf_i64 yb, int row_len,
+                                 int mode, float mean, float scale, float post, int flags,
+                                 NF_GLOBAL const float* w, NF_GLOBAL const float* b, nf_i64 wb,
+                                 NF_GLOBAL uchar* q8row, int emit_q8, NF_LOCAL_PTR float* buf) {
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int has_w = (flags & NF_NORM_EXT_HAS_W) != 0;
+    const int has_b = (flags & NF_NORM_EXT_HAS_B) != 0;
+    /* emit_q8 runs every work-item through the same steps (the Q8_1 segment reductions are collective):
+     * a step past the row is dead for the whole workgroup, past this work-item's last element for it. */
+    const int span = emit_q8 ? (row_len + lsize - 1) / lsize * lsize : row_len;
+    for (int i0 = lid; i0 - lid < span && (emit_q8 || i0 < row_len); i0 += NF_NORM_EXT_BATCH * lsize) {
+        float xv[NF_NORM_EXT_BATCH];
+        float wv[NF_NORM_EXT_BATCH];
+        float bv[NF_NORM_EXT_BATCH];
+        NF_NORM_EXT_LOAD(xv, x, xb, row_len, i0, lsize)
+        if (has_w) {
+            NF_NORM_EXT_LOAD(wv, w, wb, row_len, i0, lsize)
+        }
+        if (has_b) {
+            NF_NORM_EXT_LOAD(bv, b, wb, row_len, i0, lsize)
+        }
+#pragma unroll
+        for (int u = 0; u < NF_NORM_EXT_BATCH; u++) {
+            const int i = i0 + u * lsize;
+            const int live = i < row_len;
+            float v = 0.0f;
+            if (live) {
+                v = (xv[u] - mean) * scale;
+                if (mode == NF_NORM_EXT_L2_GDN) {
+                    v *= post;
+                }
+                /* one rounding for the weight and bias step, as the per-variant loops always compiled it */
+                if (has_w && has_b) {
+                    v = fma(v, wv[u], bv[u]);
+                } else if (has_w) {
+                    v *= wv[u];
+                } else if (has_b) {
+                    v += bv[u];
+                }
+                y[yb + i] = v;
+            }
+            if (emit_q8 && i - lid < span) {
+                nf_norm_ext_q8(buf, q8row, i, live, v);
+            }
+        }
+    }
+}
+
+/* ADD or SCALED residual combination of one element, as LLM_ResidualMix modes 0 and 1: a + c, a + s*c. */
+NF_INLINE float nf_rmn_mix(float a, float c, int mix_mode, float s) {
+    return mix_mode == NF_MIX_SCALED ? a + s * c : a + c;
+}
+
+/* LLM_RowNorm's body; emit_q8 adds the Q8_1 blocks of LLM_RowNormQ8. */
+NF_INLINE void nf_row_norm(const int n_rows, const int row_len, const int row_stride, const int mode, const float eps,
+                           const int flags, const int w_rows, const int x_off, const int y_off,
+                           NF_GLOBAL const float* x, NF_GLOBAL const float* w, NF_GLOBAL const float* b,
+                           NF_GLOBAL float* y, NF_GLOBAL uchar* q8, const int emit_q8, NF_LOCAL_PTR float* partial) {
+    const int row = get_group_id(0);
+    if (row >= n_rows) return;
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+
+    const nf_i64 xb = (nf_i64)x_off + (nf_i64)row * row_stride;
+    const nf_i64 yb = (nf_i64)y_off + (nf_i64)row * row_stride;
+    const nf_i64 wb = (nf_i64)(w_rows > 1 ? row % w_rows : 0) * row_len;
+    NF_GLOBAL uchar* q8row = q8 + (nf_i64)row * (row_len / Q8_1_BLOCK_SIZE) * Q8_1_BLOCK_BYTES;
+    const float n = (float)row_len;
+
+    float mean = 0.0f;
+    float scale;
+    float post = 1.0f;
+    if (mode == NF_NORM_EXT_LAYER) {
+        mean = nf_wg_sum(partial, nf_norm_ext_sum(x, xb, row_len, lid, lsize)) / n;
+        const float var = nf_wg_sum(partial, nf_norm_ext_sqdev(x, xb, row_len, mean, lid, lsize)) / n;
+        scale = rsqrt(var + eps);
+    } else {
+        const float ss = nf_wg_sum(partial, nf_norm_ext_sumsq(x, xb, row_len, lid, lsize));
+        if (mode == NF_NORM_EXT_L2_CLAMP) {
+            scale = 1.0f / fmax(sqrt(ss), eps);
+        } else if (mode == NF_NORM_EXT_L2_GDN) {
+            scale = rsqrt(ss / n + eps / n);
+            post = rsqrt(n);
+        } else {
+            scale = rsqrt(ss / n + eps);
+        }
+    }
+    nf_norm_ext_store(x, xb, y, yb, row_len, mode, mean, scale, post, flags, w, b, wb, q8row, emit_q8, partial);
 }
 
 /*
@@ -92,51 +253,36 @@ NF_KERNEL void LLM_RowNorm(
     NF_GLOBAL const float* NF_RESTRICT b,
     NF_GLOBAL float* y)
 {
-    const int row = get_group_id(0);
-    if (row >= n_rows) return;
-    const int lid = get_local_id(0);
-    const int lsize = get_local_size(0);
     NF_LOCAL float partial[LLM_DIMX];
+    nf_row_norm(n_rows, row_len, row_stride, mode, eps, flags, w_rows, x_off, y_off, x, w, b, y,
+                (NF_GLOBAL uchar*)y, 0, partial);
+}
 
-    const nf_i64 xb = (nf_i64)x_off + (nf_i64)row * row_stride;
-    const nf_i64 yb = (nf_i64)y_off + (nf_i64)row * row_stride;
-    const float n = (float)row_len;
-
-    float mean = 0.0f;
-    float scale;
-    float post = 1.0f;
-    if (mode == NF_NORM_EXT_LAYER) {
-        mean = nf_wg_sum(partial, nf_norm_ext_sum(x, xb, row_len, lid, lsize)) / n;
-        const float var = nf_wg_sum(partial, nf_norm_ext_sqdev(x, xb, row_len, mean, lid, lsize)) / n;
-        scale = rsqrt(var + eps);
-    } else {
-        const float ss = nf_wg_sum(partial, nf_norm_ext_sumsq(x, xb, row_len, lid, lsize));
-        if (mode == NF_NORM_EXT_L2_CLAMP) {
-            scale = 1.0f / fmax(sqrt(ss), eps);
-        } else if (mode == NF_NORM_EXT_L2_GDN) {
-            scale = rsqrt(ss / n + eps / n);
-            post = rsqrt(n);
-        } else {
-            scale = rsqrt(ss / n + eps);
-        }
-    }
-
-    const int has_w = (flags & NF_NORM_EXT_HAS_W) != 0;
-    const int has_b = (flags & NF_NORM_EXT_HAS_B) != 0;
-    const nf_i64 wb = (nf_i64)(w_rows > 1 ? row % w_rows : 0) * row_len;
-    for (int i = lid; i < row_len; i += lsize) {
-        float v = (x[xb + i] - mean) * scale;
-        if (mode == NF_NORM_EXT_L2_GDN) {
-            v *= post;
-        }
-        if (has_w) {
-            v *= w[wb + i];
-        }
-        if (has_b) {
-            v += b[wb + i];
-        }
-        y[yb + i] = v;
-    }
+/*
+ * LLM_RowNorm that also writes each normalized row as Q8_1 blocks: row r's blocks at
+ * q8 + r * (row_len / 32) * 36 bytes, the layout and the bits LLM_QuantizeQ8_1 writes for the same
+ * values (nf_norm_ext_q8). The y bits equal LLM_RowNorm's. A projection of the row on the integer-dot
+ * lane then reads these blocks instead of quantizing the row in a launch of its own.
+ * Dispatch: as LLM_RowNorm, L a multiple of 32; row_len a multiple of 32.
+ */
+NF_KERNEL void LLM_RowNormQ8(
+    const int n_rows,
+    const int row_len,
+    const int row_stride,
+    const int mode,
+    const float eps,
+    const int flags,
+    const int w_rows,
+    const int x_off,
+    const int y_off,
+    NF_GLOBAL const float* x,
+    NF_GLOBAL const float* NF_RESTRICT w,
+    NF_GLOBAL const float* NF_RESTRICT b,
+    NF_GLOBAL float* y,
+    NF_GLOBAL uchar* NF_RESTRICT q8)
+{
+    NF_LOCAL float partial[LLM_DIMX];
+    nf_row_norm(n_rows, row_len, row_stride, mode, eps, flags, w_rows, x_off, y_off, x, w, b, y, q8, 1, partial);
 }
 
 /*
@@ -280,9 +426,62 @@ NF_KERNEL void LLM_MulRowScale(
     x[idx] = x[idx] * scale[scale_len == 1 ? 0u : c];
 }
 
-/* ADD or SCALED residual combination of one element, as LLM_ResidualMix modes 0 and 1: a + c, a + s*c. */
-NF_INLINE float nf_rmn_mix(float a, float c, int mix_mode, float s) {
-    return mix_mode == NF_MIX_SCALED ? a + s * c : a + c;
+/* LLM_ResidualMixNorm's body; emit_q8 adds the Q8_1 blocks of LLM_ResidualMixNormQ8. */
+NF_INLINE void nf_residual_mix_norm(const int n_rows, const int row_len, const int mode, const float eps,
+                                    const int flags, const int w_rows, const int mix_mode, const float mix_s,
+                                    const int x_off, const int add_off, const int y_off, NF_GLOBAL float* x,
+                                    NF_GLOBAL const float* addend, NF_GLOBAL const float* w,
+                                    NF_GLOBAL const float* b, NF_GLOBAL float* y, NF_GLOBAL uchar* q8,
+                                    const int emit_q8, NF_LOCAL_PTR float* partial) {
+    const int row = get_group_id(0);
+    if (row >= n_rows) return;
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+
+    const nf_i64 xb = (nf_i64)x_off + (nf_i64)row * row_len;
+    const nf_i64 ab = (nf_i64)add_off + (nf_i64)row * row_len;
+    const nf_i64 yb = (nf_i64)y_off + (nf_i64)row * row_len;
+    const nf_i64 wb = (nf_i64)(w_rows > 1 ? row % w_rows : 0) * row_len;
+    NF_GLOBAL uchar* q8row = q8 + (nf_i64)row * (row_len / Q8_1_BLOCK_SIZE) * Q8_1_BLOCK_BYTES;
+    const float n = (float)row_len;
+
+    float sum = 0.0f;
+    float ss = 0.0f;
+    for (int i0 = lid; i0 < row_len; i0 += NF_NORM_EXT_BATCH * lsize) {
+        float xv[NF_NORM_EXT_BATCH];
+        float av[NF_NORM_EXT_BATCH];
+        NF_NORM_EXT_LOAD(xv, x, xb, row_len, i0, lsize)
+        NF_NORM_EXT_LOAD(av, addend, ab, row_len, i0, lsize)
+#pragma unroll
+        for (int u = 0; u < NF_NORM_EXT_BATCH; u++) {
+            const int i = i0 + u * lsize;
+            if (i < row_len) {
+                const float v = nf_rmn_mix(xv[u], av[u], mix_mode, mix_s);
+                x[xb + i] = v;
+                sum += v;
+                ss += v * v;
+            }
+        }
+    }
+
+    float mean = 0.0f;
+    float scale;
+    float post = 1.0f;
+    if (mode == NF_NORM_EXT_LAYER) {
+        mean = nf_wg_sum(partial, sum) / n;
+        scale = rsqrt(nf_wg_sum(partial, nf_norm_ext_sqdev(x, xb, row_len, mean, lid, lsize)) / n + eps);
+    } else {
+        const float tss = nf_wg_sum(partial, ss);
+        if (mode == NF_NORM_EXT_L2_CLAMP) {
+            scale = 1.0f / fmax(sqrt(tss), eps);
+        } else if (mode == NF_NORM_EXT_L2_GDN) {
+            scale = rsqrt(tss / n + eps / n);
+            post = rsqrt(n);
+        } else {
+            scale = rsqrt(tss / n + eps);
+        }
+    }
+    nf_norm_ext_store(x, xb, y, yb, row_len, mode, mean, scale, post, flags, w, b, wb, q8row, emit_q8, partial);
 }
 
 /*
@@ -313,63 +512,37 @@ NF_KERNEL void LLM_ResidualMixNorm(
     NF_GLOBAL const float* NF_RESTRICT b,
     NF_GLOBAL float* y)
 {
-    const int row = get_group_id(0);
-    if (row >= n_rows) return;
-    const int lid = get_local_id(0);
-    const int lsize = get_local_size(0);
     NF_LOCAL float partial[LLM_DIMX];
+    nf_residual_mix_norm(n_rows, row_len, mode, eps, flags, w_rows, mix_mode, mix_s, x_off, add_off, y_off,
+                         x, addend, w, b, y, (NF_GLOBAL uchar*)y, 0, partial);
+}
 
-    const nf_i64 xb = (nf_i64)x_off + (nf_i64)row * row_len;
-    const nf_i64 ab = (nf_i64)add_off + (nf_i64)row * row_len;
-    const nf_i64 yb = (nf_i64)y_off + (nf_i64)row * row_len;
-    const float n = (float)row_len;
-
-    float sum = 0.0f;
-    float ss = 0.0f;
-    for (int i = lid; i < row_len; i += lsize) {
-        const float v = nf_rmn_mix(x[xb + i], addend[ab + i], mix_mode, mix_s);
-        x[xb + i] = v;
-        sum += v;
-        ss += v * v;
-    }
-
-    float mean = 0.0f;
-    float scale;
-    float post = 1.0f;
-    if (mode == NF_NORM_EXT_LAYER) {
-        mean = nf_wg_sum(partial, sum) / n;
-        float dev = 0.0f;
-        for (int i = lid; i < row_len; i += lsize) {
-            const float d = x[xb + i] - mean;
-            dev += d * d;
-        }
-        scale = rsqrt(nf_wg_sum(partial, dev) / n + eps);
-    } else {
-        const float tss = nf_wg_sum(partial, ss);
-        if (mode == NF_NORM_EXT_L2_CLAMP) {
-            scale = 1.0f / fmax(sqrt(tss), eps);
-        } else if (mode == NF_NORM_EXT_L2_GDN) {
-            scale = rsqrt(tss / n + eps / n);
-            post = rsqrt(n);
-        } else {
-            scale = rsqrt(tss / n + eps);
-        }
-    }
-
-    const int has_w = (flags & NF_NORM_EXT_HAS_W) != 0;
-    const int has_b = (flags & NF_NORM_EXT_HAS_B) != 0;
-    const nf_i64 wb = (nf_i64)(w_rows > 1 ? row % w_rows : 0) * row_len;
-    for (int i = lid; i < row_len; i += lsize) {
-        float v = (x[xb + i] - mean) * scale;
-        if (mode == NF_NORM_EXT_L2_GDN) {
-            v *= post;
-        }
-        if (has_w) {
-            v *= w[wb + i];
-        }
-        if (has_b) {
-            v += b[wb + i];
-        }
-        y[yb + i] = v;
-    }
+/*
+ * LLM_ResidualMixNorm that also writes each normalized row as Q8_1 blocks at q8 + r * (row_len / 32) * 36
+ * bytes, with the bits LLM_QuantizeQ8_1 writes for the same values (nf_norm_ext_q8); x and y get the bits
+ * LLM_ResidualMixNorm writes. Dispatch: as LLM_ResidualMixNorm, L a multiple of 32; row_len a multiple
+ * of 32.
+ */
+NF_KERNEL void LLM_ResidualMixNormQ8(
+    const int n_rows,
+    const int row_len,
+    const int mode,
+    const float eps,
+    const int flags,
+    const int w_rows,
+    const int mix_mode,
+    const float mix_s,
+    const int x_off,
+    const int add_off,
+    const int y_off,
+    NF_GLOBAL float* x,
+    NF_GLOBAL const float* NF_RESTRICT addend,
+    NF_GLOBAL const float* NF_RESTRICT w,
+    NF_GLOBAL const float* NF_RESTRICT b,
+    NF_GLOBAL float* y,
+    NF_GLOBAL uchar* NF_RESTRICT q8)
+{
+    NF_LOCAL float partial[LLM_DIMX];
+    nf_residual_mix_norm(n_rows, row_len, mode, eps, flags, w_rows, mix_mode, mix_s, x_off, add_off, y_off,
+                         x, addend, w, b, y, q8, 1, partial);
 }

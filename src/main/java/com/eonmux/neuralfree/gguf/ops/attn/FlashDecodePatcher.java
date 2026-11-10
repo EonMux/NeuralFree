@@ -36,6 +36,8 @@ final class FlashDecodePatcher implements GpuStepPatcher {
     private final int flags;
     private final boolean hasSink;
     private final boolean hasLse;
+    /** Whether every step merges its partial, a one-split step included (the plan's one-row kernel). */
+    private final boolean mergesEveryRow;
     private final GpuBuffer k;
     private final GpuBuffer q;
     private final PreparedDispatch decode;
@@ -52,11 +54,9 @@ final class FlashDecodePatcher implements GpuStepPatcher {
     private int groupClaimed;
     /** True once a capture placed a kernel inside this group that is not one of its merges. */
     private boolean groupBroken;
-    /** The split count of the step the plan was captured at, {@code -1} before the first patch. */
-    private int capturedCount = -1;
 
     FlashDecodePatcher(FlashAttnTiling decodePlan, boolean cached, int keyRowBase, int keyRows, int nHead,
-                       int flags, boolean hasSink, boolean hasLse, GpuBuffer k, GpuBuffer q,
+                       int flags, boolean hasSink, boolean hasLse, boolean mergesEveryRow, GpuBuffer k, GpuBuffer q,
                        PreparedDispatch decode, PreparedDispatch combine, PreparedDispatch lse,
                        PreparedDispatch sink) {
         this.decodePlan = decodePlan;
@@ -67,6 +67,7 @@ final class FlashDecodePatcher implements GpuStepPatcher {
         this.flags = flags;
         this.hasSink = hasSink;
         this.hasLse = hasLse;
+        this.mergesEveryRow = mergesEveryRow;
         this.k = k;
         this.q = q;
         this.decode = decode;
@@ -83,7 +84,6 @@ final class FlashDecodePatcher implements GpuStepPatcher {
         sinkIdx = -1;
         groupClaimed = 0;
         groupBroken = false;
-        capturedCount = -1;
     }
 
     @Override
@@ -113,15 +113,10 @@ final class FlashDecodePatcher implements GpuStepPatcher {
     public boolean patch(int pos, int recordIndex, GpuGraphPatchSink sink) {
         Step step = stepOf(pos);
         if (!patternMatches(step)) {
-            return false;
-        }
-        if (capturedCount < 0) {
-            capturedCount = step.count;
-        }
-        if (step.count != capturedCount) {
-            /* A step whose split layout differs from the capture's would patch a split count the
-             * captured launches never ran; the merge pattern and every derived length belong to
-             * that layout, so the group refuses and the caller recaptures at the new one. */
+            /* A direct step against a captured merge, or the reverse, has another node sequence: the
+             * group refuses and the caller recaptures. Every other split layout differs from the
+             * captured one only in values the group patches (the decode grid and split arguments, the
+             * merges' split count), so a step of a new split count replays the same capture. */
             return false;
         }
         if (recordIndex == decodeIdx) {
@@ -187,7 +182,10 @@ final class FlashDecodePatcher implements GpuStepPatcher {
         return (combineIdx >= 0) == step.wantsCombine && (sinkIdx >= 0) == hasSink && (lseIdx >= 0) == hasLse;
     }
 
-    /** True when {@code d} is this layer's decode kernel of one query row at offset 0, no tree mask. */
+    /**
+     * True when {@code d} is this layer's decode kernel of one query row at offset 0, no tree mask: the kernel of
+     * the dispatch this patcher patches (the plan's one-row kernel or the generic decode).
+     */
     private boolean isGroupDecode(GpuGraphDispatch d) {
         Object[] args = d.args();
         return d.kernelName().equals(decode.kernelName())
@@ -230,7 +228,7 @@ final class FlashDecodePatcher implements GpuStepPatcher {
     private Step stepOf(int pos) {
         int nKeys = cached ? cachedKeys(pos + 1) : 1;
         FlashAttnTiling.Split s = decodePlan.decodeSplit(nKeys);
-        boolean direct = s.direct() && !hasSink && !hasLse;
+        boolean direct = s.direct() && !hasSink && !hasLse && !mergesEveryRow;
         return new Step(nKeys, s.count(), s.length(), s.count() + (hasSink ? 1 : 0),
                 flags | (direct ? AttnKernels.FLAG_DIRECT : 0), direct, !direct);
     }

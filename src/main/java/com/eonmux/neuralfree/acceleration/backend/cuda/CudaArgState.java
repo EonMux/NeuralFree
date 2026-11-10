@@ -157,15 +157,6 @@ public final class CudaArgState {
         return out;
     }
 
-    /**
-     * The live parameter holder of argument {@code i}: the array whose bytes the kernel parameters
-     * point at, or null when the argument was never set. A graph patch writes the new value into it,
-     * so the next node-parameter update reads it. Callers must not replace the holder object.
-     */
-    Object holder(int i) {
-        return i >= 0 && i < holders.length ? holders[i] : null;
-    }
-
     /** The build-time signature launches are checked against, or null. */
     public KernelSignature signature() {
         return signature;

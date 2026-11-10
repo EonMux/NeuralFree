@@ -783,4 +783,39 @@ public class CudaGraphReplayIntegrationTest {
             x.close();
         }
     }
+
+    /**
+     * After patched replays, a launch of the same kernel outside the graph and a body replay run the
+     * arguments they set, also when those equal the ones the kernel had before the patches: a patch
+     * sets its values as the handle's arguments, so setting the earlier value again re-binds it.
+     */
+    @Test
+    public void launchesAfterPatchedReplaysRunTheirOwnArguments() {
+        GpuBuffer x = buffer(iota(1, 1));
+        try {
+            queue.beginCapture();
+            launchScale(x, 1.0f);
+            GpuGraph graph = queue.endCapture();
+            try {
+                GpuGraphPatchPlan doubling = (pos, sink) -> {
+                    sink.patchKernel(0, null, new int[]{1}, new Object[]{2.0f});
+                    return true;
+                };
+                assertTrue(graph.replayPatched(doubling, 0));
+                assertArrayEquals(scaleOf(iota(1, 1), 2.0f), readBack(x), 0.0f);
+
+                launchScale(x, 1.0f);
+                assertArrayEquals("the launch outside the graph runs its own factor", scaleOf(iota(1, 1), 2.0f),
+                        readBack(x), 0.0f);
+
+                graph.replay(() -> launchScale(x, 1.0f));
+                assertArrayEquals("the body replay runs its own factor", scaleOf(iota(1, 1), 2.0f),
+                        readBack(x), 0.0f);
+            } finally {
+                graph.close();
+            }
+        } finally {
+            x.close();
+        }
+    }
 }

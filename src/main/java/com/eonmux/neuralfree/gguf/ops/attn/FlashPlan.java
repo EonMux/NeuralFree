@@ -4,6 +4,7 @@ import com.eonmux.neuralfree.acceleration.backend.DeviceFeature;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
+import com.eonmux.neuralfree.gguf.spec.AttentionSpec.BiasMode;
 
 /**
  * The flash-attention plans of one softmax-attention layer, made once at bind with
@@ -11,8 +12,8 @@ import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
  * ({@link FlashAttnTiling.Plan#TILED}, the tensor-core {@link FlashAttnTiling.Plan#MMA} on a backend with
  * {@link DeviceFeature#COOPERATIVE_MATRIX} and F16 caches, or the per-row decode fallback), the paged decode plan
  * and paged prefill kernel of a paged cache (with the CUDA grouped-query paged decode kernel where it serves the
- * caches), and the split-K partial capacity every plan's launches fit in. The
- * dense and paged decode plans and the tiled prefill plan share one form: the subgroup kernels where
+ * caches), the one-row decode kernel ({@link #rowKernel}) and the split-K partial capacity every plan's launches fit
+ * in. The dense and paged decode plans and the tiled prefill plan share one form: the subgroup kernels where
  * {@link SubgroupFlashAttention#serves} holds, the portable ones otherwise, with the kernel names of
  * {@link #decodeKernel}, {@link #pagedDecodeKernel}, {@link #tiledKernel} and {@link #pagedPrefillKernel}.
  * Immutable.
@@ -30,6 +31,8 @@ final class FlashPlan {
     private final String pagedGqaKernel;
     private final long partialCapacity;
     private final boolean depthRouted;
+    /** The one-row decode kernel of the plain step ({@link #rowKernelName}); null where it does not serve. */
+    private final String rowKernel;
 
     /**
      * Largest query heads per KV head for which the one-row step leaves the MMA prefill past one workgroup of
@@ -43,7 +46,7 @@ final class FlashPlan {
 
     private FlashPlan(FlashAttnTiling decode, String decodeKernel, String pagedDecodeKernel, FlashAttnTiling prefill,
                       String tiledKernel, String mmaKernel, FlashAttnTiling paged, String pagedPrefillKernel,
-                      String pagedGqaKernel, long partialCapacity, boolean depthRouted) {
+                      String pagedGqaKernel, long partialCapacity, boolean depthRouted, String rowKernel) {
         this.decode = decode;
         this.decodeKernel = decodeKernel;
         this.pagedDecodeKernel = pagedDecodeKernel;
@@ -55,6 +58,7 @@ final class FlashPlan {
         this.pagedGqaKernel = pagedGqaKernel;
         this.partialCapacity = partialCapacity;
         this.depthRouted = depthRouted;
+        this.rowKernel = rowKernel;
     }
 
     /**
@@ -111,9 +115,28 @@ final class FlashPlan {
         if (cap > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("flash partials of " + cap + " floats exceed one buffer");
         }
+        String rowName = subgroup ? null : rowKernelName(keys.typeK(), keys.typeV(), keys.vAliasesK(), a.headDimK(),
+                a.headDimV(), a.biasMode(), a.sinks(), keys.kRowStride(), keys.vRowStride(), pg != null);
+        String row = rowName != null && kernels.has(rowName) ? rowName : null;
         return new FlashPlan(decode, decodeKernel, pagedDecodeKernel, prefill, tiledKernel, mma, paged, pagedPrefill,
-                pagedGqa, cap,
-                depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()));
+                pagedGqa, cap, row == null && depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()), row);
+    }
+
+    /**
+     * The one-row decode kernel {@value AttnKernels#FLASH_DECODE_ROW_F16} when it serves the layer's plain step:
+     * F16 K and V caches (V not read through K), equal head dims that are multiples of 64 of at most
+     * {@value AttnKernels#FLASH_DECODE_ROW_MAX_D}, no position bias and no sink logits, even row strides and a dense
+     * cache. Null otherwise; the caller still requires {@code kernels.has(name)} (the CUDA fatbins hold it). It
+     * takes {@code LLM_FlashDecode_F16}'s arguments and replaces it for every one-row launch without a tree mask
+     * (see {@code flash_decode_row.cl}).
+     */
+    static String rowKernelName(KvDType typeK, KvDType typeV, boolean vAliasesK, int dK, int dV, BiasMode bias,
+                                boolean sinks, int kRowStride, int vRowStride, boolean paged) {
+        boolean shape = dK == dV && dK % 64 == 0 && dK <= AttnKernels.FLASH_DECODE_ROW_MAX_D;
+        boolean plain = bias == BiasMode.NONE && !sinks && !vAliasesK && !paged;
+        boolean layout = typeK == KvDType.F16 && typeV == KvDType.F16 && kRowStride % 2 == 0
+                && vRowStride % 2 == 0;
+        return shape && plain && layout ? AttnKernels.FLASH_DECODE_ROW_F16 : null;
     }
 
     /**
@@ -214,12 +237,20 @@ final class FlashPlan {
      * overload {@link #routesDecodeThroughPrefill(int)} adds the per-step rule on top of this.
      */
     boolean routesDecodeThroughPrefill() {
-        return mmaKernel != null && !depthRouted;
+        return mmaKernel != null && rowKernel == null && !depthRouted;
     }
 
     /** Whether the one-row step at {@code liveKeys} live keys runs the MMA prefill kernel ({@link #depthRouted}). */
     boolean routesDecodeThroughPrefill(int liveKeys) {
-        return routesDecodeThroughPrefill(mmaKernel, depthRouted, liveKeys);
+        return rowKernel == null && routesDecodeThroughPrefill(mmaKernel, depthRouted, liveKeys);
+    }
+
+    /**
+     * The one-row decode kernel of the plain step, or null when the generic decode kernel serves it. A plan with it
+     * runs every one-row step through it, whatever the depth: never through the MMA prefill, never depth-routed.
+     */
+    String rowKernel() {
+        return rowKernel;
     }
 
     /**

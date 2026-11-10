@@ -1,6 +1,7 @@
-/* norm_ext.comp - LLM_RowNorm, LLM_GroupRms, LLM_GroupNorm, LLM_ResidualMix, LLM_ResidualMixNorm and
- * LLM_MulRowScale (GLSL twin of kernels/llm/norm_ext.cl). Requires: common/nf_common.glsl,
- * common/reduce.glsl (reduction ops).
+/* norm_ext.comp - LLM_RowNorm, LLM_GroupRms, LLM_GroupNorm, LLM_ResidualMix, LLM_ResidualMixNorm,
+ * LLM_RowNormQ8, LLM_ResidualMixNormQ8 and LLM_MulRowScale (GLSL twin of kernels/llm/norm_ext.cl).
+ * Requires: common/nf_common.glsl, common/reduce.glsl (reduction ops), common/rope_common.glsl
+ * (nf_rope_f16_bits, for the Q8_1 block scales).
  *
  * A variants row selects OP:
  *   OP_ROW_NORM        (i n_rows, i row_len, i row_stride, i mode, f eps, i flags, i w_rows, i x_off, i y_off,
@@ -22,6 +23,10 @@
  *                       i x_off, i add_off, i y_off, float x, R float addend, R float w, R float b, float y)
  *       the OP_RESIDUAL_MIX modes 0/1 of x's row with addend's row, written back to x, then the OP_ROW_NORM
  *       of the sum into y, in one workgroup per row; x and y must not overlap.
+ *   OP_ROW_NORM_Q8     (OP_ROW_NORM's arguments, then W uchar q8)
+ *   OP_RESIDUAL_MIX_NORM_Q8 (OP_RESIDUAL_MIX_NORM's arguments, then W uchar q8)
+ *       the same y (and x) plus row r's Q8_1 blocks at byte r * (row_len / 32) * 36 of q8, with the bits
+ *       LLM_QuantizeQ8_1 (quantize_q8_1.comp) writes for the y values; row_len a multiple of 32.
  *   OP_MUL_ROW_SCALE   (i n_rows, i row_len, i scale_len, R float scale, float x)
  *       x[r*row_len + c] *= scale[scale_len == 1 ? 0 : c].
  * Buffers take bindings 0.. in argument order; scalars fill the push block in argument order. Operands that
@@ -42,6 +47,8 @@
 #define OP_RESIDUAL_MIX   4
 #define OP_MUL_ROW_SCALE  5
 #define OP_RESIDUAL_MIX_NORM 6
+#define OP_ROW_NORM_Q8    7
+#define OP_RESIDUAL_MIX_NORM_Q8 8
 
 #if !defined(OP)
 #error "norm_ext.comp requires OP"
@@ -59,7 +66,7 @@
 #define NF_MIX_ALPHA_BETA          2
 #define NF_MIX_NORMED_INPUT_SCALED 3
 
-#if OP == OP_ROW_NORM
+#if OP == OP_ROW_NORM || OP == OP_ROW_NORM_Q8
 layout(std430, binding = 0) readonly buffer NfNxX { float x_in[]; };
 layout(std430, binding = 1) readonly buffer NfNxW { float w_in[]; };
 layout(std430, binding = 2) readonly buffer NfNxB { float b_in[]; };
@@ -75,6 +82,9 @@ layout(push_constant) uniform NfNxParams {
     int x_off;
     int y_off;
 } pc;
+#if OP == OP_ROW_NORM_Q8
+NF_BUFFER_VIEWS_RW(4, q8)
+#endif
 #define NF_NORM_EXT_REDUCE 1
 #elif OP == OP_GROUP_RMS
 layout(std430, binding = 0) readonly buffer NfNxX { float x_in[]; };
@@ -124,7 +134,7 @@ layout(push_constant) uniform NfNxParams {
     int row_len;
     int scale_len;
 } pc;
-#elif OP == OP_RESIDUAL_MIX_NORM
+#elif OP == OP_RESIDUAL_MIX_NORM || OP == OP_RESIDUAL_MIX_NORM_Q8
 layout(std430, binding = 0) buffer NfNxX { float x_in[]; };
 layout(std430, binding = 1) readonly buffer NfNxAdd { float add_in[]; };
 layout(std430, binding = 2) readonly buffer NfNxW { float w_in[]; };
@@ -143,6 +153,9 @@ layout(push_constant) uniform NfNxParams {
     int add_off;
     int y_off;
 } pc;
+#if OP == OP_RESIDUAL_MIX_NORM_Q8
+NF_BUFFER_VIEWS_RW(5, q8)
+#endif
 #define NF_NORM_EXT_REDUCE 1
 #else
 #error "norm_ext.comp: OP is not a norm-extension op"
@@ -181,8 +194,71 @@ float nf_norm_ext_sqdev(uint base, uint n, float mean) {
 }
 #endif
 
+#if OP == OP_ROW_NORM || OP == OP_ROW_NORM_Q8 || OP == OP_RESIDUAL_MIX_NORM || OP == OP_RESIDUAL_MIX_NORM_Q8
+/* Element i of a normalized row: ((x - mean) * scale [* post]) [* w] [+ b], as LLM_RowNorm writes it. */
+float nf_norm_ext_value(uint xb, uint wb, uint i, float mean, float scale, float post) {
+    float v = (x_in[xb + i] - mean) * scale;
+    if (pc.mode == NF_NORM_EXT_L2_GDN) {
+        v *= post;
+    }
+    const bool has_w = (pc.flags & NF_NORM_EXT_HAS_W) != 0;
+    const bool has_b = (pc.flags & NF_NORM_EXT_HAS_B) != 0;
+    /* one rounding for the weight and bias step (norm_ext.cl) */
+    if (has_w && has_b) {
+        v = fma(v, w_in[wb + i], b_in[wb + i]);
+    } else if (has_w) {
+        v *= w_in[wb + i];
+    } else if (has_b) {
+        v += b_in[wb + i];
+    }
+    return v;
+}
+#endif
+
+#if OP == OP_ROW_NORM_Q8 || OP == OP_RESIDUAL_MIX_NORM_Q8
+#include "common/rope_common.glsl"
+
+/*
+ * Element i of the row's Q8_1 form (nf_norm_ext_q8 of kernels/llm/norm_ext.cl, quantize_q8_1.comp's
+ * arithmetic): every invocation calls it once per final-pass step, live = false past the row; the 32
+ * elements of a block are the invocations of one aligned 32-wide segment. q8b is the row's first byte.
+ */
+void nf_norm_ext_q8(uint q8b, uint i, bool live, float v) {
+    const float amax = nf_seg_max(live ? abs(v) : 0.0, 32u);
+    const float d = amax / 127.0;
+    const float id = d != 0.0 ? 1.0 / d : 0.0;
+    const int q = live ? clamp(int(nf_roundf(v * id)), -127, 127) : 0;
+    const float sum = nf_seg_sum(float(q), 32u);
+    if (live) {
+        const uint blk = q8b + (i / 32u) * 36u;
+        q8_u8[blk + 4u + (i % 32u)] = uint8_t(uint(q) & 0xFFu);
+        if (i % 32u == 0u) {
+            q8_u16[blk >> 1] = uint16_t(nf_rope_f16_bits(d));
+            q8_u16[(blk >> 1) + 1u] = uint16_t(nf_rope_f16_bits(sum * d));
+        }
+    }
+}
+
+/* The final pass of a Q8 row norm: every invocation runs ceil(row_len / L) steps. */
+void nf_norm_ext_store_q8(uint row, uint xb, uint yb, uint wb, uint row_len, float mean, float scale, float post) {
+    const uint lsize = gl_WorkGroupSize.x;
+    const uint steps = (row_len + lsize - 1u) / lsize;
+    const uint q8b = row * (row_len / 32u) * 36u;
+    for (uint t = 0u; t < steps; ++t) {
+        const uint i = t * lsize + gl_LocalInvocationID.x;
+        const bool live = i < row_len;
+        float v = 0.0;
+        if (live) {
+            v = nf_norm_ext_value(xb, wb, i, mean, scale, post);
+            y_out[yb + i] = v;
+        }
+        nf_norm_ext_q8(q8b, i, live, v);
+    }
+}
+#endif
+
 void main() {
-#if OP == OP_ROW_NORM
+#if OP == OP_ROW_NORM || OP == OP_ROW_NORM_Q8
     const uint row = nf_wg_id();
     if (row >= uint(pc.n_rows)) {
         return;
@@ -211,22 +287,14 @@ void main() {
         }
     }
 
-    const bool has_w = (pc.flags & NF_NORM_EXT_HAS_W) != 0;
-    const bool has_b = (pc.flags & NF_NORM_EXT_HAS_B) != 0;
     const uint wb = (pc.w_rows > 1 ? row % uint(pc.w_rows) : 0u) * row_len;
+#if OP == OP_ROW_NORM_Q8 || OP == OP_RESIDUAL_MIX_NORM_Q8
+    nf_norm_ext_store_q8(row, xb, yb, wb, row_len, mean, scale, post);
+#else
     for (uint i = gl_LocalInvocationID.x; i < row_len; i += gl_WorkGroupSize.x) {
-        float v = (x_in[xb + i] - mean) * scale;
-        if (pc.mode == NF_NORM_EXT_L2_GDN) {
-            v *= post;
-        }
-        if (has_w) {
-            v *= w_in[wb + i];
-        }
-        if (has_b) {
-            v += b_in[wb + i];
-        }
-        y_out[yb + i] = v;
+        y_out[yb + i] = nf_norm_ext_value(xb, wb, i, mean, scale, post);
     }
+#endif
 
 #elif OP == OP_GROUP_RMS
     const uint wg = nf_wg_id();
@@ -303,7 +371,7 @@ void main() {
     const uint c = idx % row_len;
     x_io[idx] = x_io[idx] * scale_in[pc.scale_len == 1 ? 0u : c];
 
-#elif OP == OP_RESIDUAL_MIX_NORM
+#elif OP == OP_RESIDUAL_MIX_NORM || OP == OP_RESIDUAL_MIX_NORM_Q8
     const uint row = nf_wg_id();
     if (row >= uint(pc.n_rows)) {
         return;
@@ -347,21 +415,13 @@ void main() {
         }
     }
 
-    const bool has_w = (pc.flags & NF_NORM_EXT_HAS_W) != 0;
-    const bool has_b = (pc.flags & NF_NORM_EXT_HAS_B) != 0;
     const uint wb = (pc.w_rows > 1 ? row % uint(pc.w_rows) : 0u) * row_len;
+#if OP == OP_ROW_NORM_Q8 || OP == OP_RESIDUAL_MIX_NORM_Q8
+    nf_norm_ext_store_q8(row, xb, yb, wb, row_len, mean, scale, post);
+#else
     for (uint i = gl_LocalInvocationID.x; i < row_len; i += gl_WorkGroupSize.x) {
-        float v = (x_in[xb + i] - mean) * scale;
-        if (pc.mode == NF_NORM_EXT_L2_GDN) {
-            v *= post;
-        }
-        if (has_w) {
-            v *= w_in[wb + i];
-        }
-        if (has_b) {
-            v += b_in[wb + i];
-        }
-        y_out[yb + i] = v;
+        y_out[yb + i] = nf_norm_ext_value(xb, wb, i, mean, scale, post);
     }
+#endif
 #endif
 }

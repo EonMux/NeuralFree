@@ -490,6 +490,7 @@ final class FastGemmLanes {
      */
     void splitKLaunch(SplitKGemmPlan plan, GpuBuffer shard, GpuBuffer x, GpuBuffer out, int yOff, int yStride) {
         ScratchSlot partial = scratch.staging(GpuScratch.Staging.SPLIT_K, plan.partialElements());
+        ops.q8.invalidate();
         queue.enqueueKernelNoEvent(kernels.get(plan.kernelName()), plan.partialGlobalWorkSize(),
                 plan.partialLocalWorkSize(), plan.partialArgs(shard, x, partial.buffer()));
         queue.enqueueKernelNoEvent(kernels.get(GemmKernels.SPLIT_K_REDUCE), plan.reduceGlobalWorkSize(),

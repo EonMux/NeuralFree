@@ -985,6 +985,7 @@ LLM_FlashDecodePaged_TQ_3BIT_VALUES	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,
 LLM_FlashDecodePaged_TQ_4BIT_KEYS	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_TQ_4BIT_VALUES	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_TQ_K8_KEYS	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
+LLM_FlashDecodeRow_F16	flash_decode_row.cl	10	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
 LLM_FlashDecode_BF16	flash_decode.cl	10	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
 LLM_FlashDecode_F16	flash_decode.cl	10	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
 LLM_FlashDecode_F32	flash_decode.cl	10	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBB
@@ -1177,6 +1178,7 @@ LLM_ResStack_Mix	hc.cl	4	7	i,i,i,i,i,i,i	iiiiiiiBBBB
 LLM_ResStack_Score	hc.cl	4	7	i,i,i,f,i,i,i	iiifiiiBBBB
 LLM_ResidualMix	norm_ext.cl	5	7	i,i,f,i,i,i,i	iifiiiiBBBBB
 LLM_ResidualMixNorm	norm_ext.cl	5	11	i,i,i,f,i,i,i,f,i,i,i	iiifiiifiiiBBBBB
+LLM_ResidualMixNormQ8	norm_ext.cl	6	11	i,i,i,f,i,i,i,f,i,i,i	iiifiiifiiiBBBBBB
 LLM_RmsNormRope	fused.cl	6	25	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,f,f,f,f	iiiiiiiiiiiiiiiiiifffffffBBBBBB
 LLM_RmsNormRopeRows	speech.cl	3	7	i,i,i,i,i,f,f	iiiiiffBBB
 LLM_RmsNormUnbiased	speech.cl	3	2	i,f	ifBBB
@@ -1185,6 +1187,7 @@ LLM_RoPE_FoPE	rope.cl	5	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBB
 LLM_RopeStore	fused.cl	5	23	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,f,f,f	iiiiiiiiiiiiiiiiiffffffBBBBB
 LLM_RowAffine	speech.cl	4	2	i,i	iiBBBB
 LLM_RowNorm	norm_ext.cl	4	9	i,i,i,i,f,i,i,i,i	iiiifiiiiBBBB
+LLM_RowNormQ8	norm_ext.cl	5	9	i,i,i,i,f,i,i,i,i	iiiifiiiiBBBBB
 LLM_RowScaleAdd	speech.cl	4	3	i,i,i	iiiBBBB
 LLM_Row_TopK	sampling_topk.cl	4	3	i,i,i	iiiBBBB
 LLM_RvqSumRows	speech.cl	2	3	i,i,i	iiiBB

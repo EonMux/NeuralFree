@@ -88,6 +88,14 @@ public final class AttnKernels {
     public static final String FLASH_ATTN_MMA_PREFIX = "LLM_FlashAttnMma_";
     /** Name prefix of the tensor-core paged ({@code LLM_FlashAttnMmaPaged_<KV>}) variants; CUDA only. */
     public static final String FLASH_ATTN_MMA_PAGED_PREFIX = "LLM_FlashAttnMmaPaged_";
+    /**
+     * The one-row decode attention of the plain step over a dense F16 cache ({@code kernels/llm/flash_decode_row.cl},
+     * CUDA only): {@code LLM_FlashDecode_F16}'s arguments, grid and outputs, in a body that keeps only what that step
+     * needs. {@link FlashPlan#rowKernelName} decides where it serves.
+     */
+    public static final String FLASH_DECODE_ROW_F16 = "LLM_FlashDecodeRow_F16";
+    /** Largest head dim of {@link #FLASH_DECODE_ROW_F16} ({@code NF_FDR_MAX_D}). */
+    public static final int FLASH_DECODE_ROW_MAX_D = 256;
 
     /**
      * Name prefix of the grouped-query paged decode variants ({@code LLM_FlashDecodePagedGqa_<KV>}, the

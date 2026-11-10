@@ -9,6 +9,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
 import com.eonmux.neuralfree.acceleration.backend.GpuEvent;
 import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
+import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.GGMLType;
 import com.eonmux.neuralfree.gguf.arch.ActOp;
 import com.eonmux.neuralfree.gguf.arch.GluOp;
@@ -186,6 +187,7 @@ public final class GpuOps implements AutoCloseable {
     static final List<String> HELPER_KERNELS =
             Collections.unmodifiableList(Arrays.asList(ROW_NORM, UNARY, GLU, COPY2D, AXPBY, HadamardSpec.KERNEL,
                     ACT_FAKE_QUANT, PERMUTE_COLS, SCALE_COLS, QUANTIZE_Q8_1, NormKernels.RESIDUAL_MIX_NORM,
+                    NormKernels.ROW_NORM_Q8, NormKernels.RESIDUAL_MIX_NORM_Q8,
                     GemmKernels.QUANT_MMQ_INT8_STATIC,
                     GemmKernels.QUANT_MMQ_INT8_ROW, GemmKernels.QUANT_MMQ_INT8_GROUP128,
                     GemmKernels.QUANT_MMQ_INT8_ASYM, GemmKernels.QUANT_MMQ_FP8_STATIC,
@@ -215,13 +217,13 @@ public final class GpuOps implements AutoCloseable {
     /** The dense projections this class's matvec, matmul, gate+up and prewarm calls run. */
     private final GpuProjections projections;
     private final Set<PreparedDispatch> prepared = Collections.newSetFromMap(new IdentityHashMap<>());
-    private final Map<String, float[]> signValues = new HashMap<>();
-    private final Map<String, GpuBuffer> signBuffers = new HashMap<>();
-    private final Map<HadamardSpec, GpuBuffer> signsBySpec = new IdentityHashMap<>();
+    private final HadamardSignBuffers signs;
     private final Map<String, Boolean> optionalStatus = new HashMap<>();
     private final GpuPlaceholders placeholders;
     final Int8MatvecMode int8Mode;
     final FusedMode fusedMode;
+    /** The Q8_1 activation blocks of the integer-dot lane: rows a norm quantized, and the quantizer's grid. */
+    final Q8Activations q8;
     SharedQ8 activeShare;
     W12QView activeW12Q;
     private boolean closed;
@@ -273,6 +275,8 @@ public final class GpuOps implements AutoCloseable {
             throw new IllegalStateException("matvec work-group size " + matvecLocal
                     + " is not a power of two of at most " + local);
         }
+        this.signs = new HadamardSignBuffers(backend, queue);
+        this.q8 = new Q8Activations(scratch, kernels.caps(), int8Mode);
         this.lanes = new FastGemmLanes(this, queue, kernels, scratch);
         this.projections = new GpuProjections(this, queue, kernels, scratch);
         prewarmHelperKernels();
@@ -387,6 +391,7 @@ public final class GpuOps implements AutoCloseable {
         ensureOpen();
         checkSizes(kernel, global, local);
         Objects.requireNonNull(args, "args");
+        q8.invalidate();
         queue.enqueueKernelNoEvent(kernels.get(kernel), global.clone(), local.clone(), args.clone());
     }
 
@@ -532,6 +537,7 @@ public final class GpuOps implements AutoCloseable {
             this.source = source;
             this.cols = cols;
             this.rows = rows;
+            this.blocks = q8.take(source, rows, cols);
         }
 
         /** The Q8_1 blocks of the shared rows, quantizing them on first use. */
@@ -542,7 +548,7 @@ public final class GpuOps implements AutoCloseable {
             if (blocks == null) {
                 long n = (long) rows * (cols / Q8_1_BLOCK_SIZE);
                 ScratchSlot slot = scratch.staging(GpuScratch.Staging.SHARED_Q8_1, n * Q8_1_FLOATS);
-                launchMatvec(QUANTIZE_Q8_1, n, Math.multiplyExact(rows, cols), source, slot.buffer());
+                quantizeQ8_1(source, Math.multiplyExact(rows, cols), slot.buffer());
                 blocks = slot.buffer();
             }
             return blocks;
@@ -801,6 +807,7 @@ public final class GpuOps implements AutoCloseable {
         for (int v : values) {
             bb.putInt(v);
         }
+        q8.invalidate();
         GpuEvent e = queue.enqueueWriteBuffer(slot.buffer(), (long) slot.offset() * Float.BYTES,
                 (long) values.length * Integer.BYTES, bb.array());
         if (e != null) {
@@ -835,47 +842,10 @@ public final class GpuOps implements AutoCloseable {
             throw new IllegalArgumentException("Hadamard " + h + ": input and output views overlap"
                     + (inPlace ? " and the permutation forbids in-place use" : ""));
         }
-        GpuBuffer signs = h.hasSigns() ? signBuffer(h) : placeholder();
+        GpuBuffer signVector = h.hasSigns() ? signs.of(h) : placeholder();
         long groups = n / h.block();
         launch(HadamardSpec.KERNEL, groups * local, nRows, width, h.block(), h.kernelSignMode(), h.permHd(),
-                h.permNk(), h.permRep(), xOff, yOff, signs, x, y);
-    }
-
-    /**
-     * The device sign vector of a transform: one read-only buffer per {@link HadamardSpec#signsName()}, uploaded on
-     * first use. Transforms seen before resolve by identity without touching their sign arrays.
-     */
-    private GpuBuffer signBuffer(HadamardSpec h) {
-        GpuBuffer cached = signsBySpec.get(h);
-        if (cached != null) {
-            return cached;
-        }
-        String name = h.signsName();
-        float[] values = h.signs();
-        float[] known = signValues.get(name);
-        if (known != null) {
-            if (!Arrays.equals(known, values)) {
-                throw new IllegalArgumentException("two Hadamard transforms share the sign vector name " + name
-                        + " with different signs");
-            }
-            GpuBuffer b = signBuffers.get(name);
-            signsBySpec.put(h, b);
-            return b;
-        }
-        GpuBuffer b = backend.allocateBuffer((long) values.length * Float.BYTES, true);
-        try {
-            GpuEvent e = queue.enqueueWriteBuffer(b, 0, (long) values.length * Float.BYTES, values);
-            if (e != null) {
-                e.close();
-            }
-        } catch (RuntimeException ex) {
-            b.close();
-            throw ex;
-        }
-        signValues.put(name, values);
-        signBuffers.put(name, b);
-        signsBySpec.put(h, b);
-        return b;
+                h.permNk(), h.permRep(), xOff, yOff, signVector, x, y);
     }
 
     // ================================================================== input transforms
@@ -1010,7 +980,22 @@ public final class GpuOps implements AutoCloseable {
         }
         Object[] args = NormKernels.rowNormArgs(k, eps, nRows, width, width, in, inOff, out, outOff, wb, bb, wRows,
                 placeholder());
+        if (emitsQ8(NormKernels.ROW_NORM_Q8, nRows, width, outOff, wRows)) {
+            GpuBuffer blocks = q8.target(nRows, width);
+            launch(NormKernels.ROW_NORM_Q8, (long) nRows * local, NormKernels.withQ8Blocks(args, nRows, width, blocks));
+            q8.emitted(out, nRows, width, blocks);
+            return;
+        }
         launch(ROW_NORM, (long) nRows * local, args);
+    }
+
+    /**
+     * Whether a row norm writes its rows' Q8_1 blocks through {@code kernel}: {@link Q8Activations#emits}, the kernel
+     * is ready, fusion is permitted, batch invariance is off and no {@link SharedQ8} scope holds the slot.
+     */
+    private boolean emitsQ8(String kernel, int nRows, int width, int outOff, int wRows) {
+        return activeShare == null && q8.emits(nRows, width, outOff, wRows) && fusedMode.permitsFusion()
+                && !BatchInvariance.enabled() && optionalReady(kernel, local);
     }
 
     /**
@@ -1063,6 +1048,13 @@ public final class GpuOps implements AutoCloseable {
         }
         Object[] args = NormKernels.residualMixNormArgs(mix, s, k, eps, nRows, width, xOff, addOff, outOff,
                 x, addend, wb, bb, wRows, out, placeholder());
+        if (emitsQ8(NormKernels.RESIDUAL_MIX_NORM_Q8, nRows, width, outOff, wRows)) {
+            GpuBuffer blocks = q8.target(nRows, width);
+            launch(NormKernels.RESIDUAL_MIX_NORM_Q8, (long) nRows * local,
+                    NormKernels.withQ8Blocks(args, nRows, width, blocks));
+            q8.emitted(out, nRows, width, blocks);
+            return true;
+        }
         launch(NormKernels.RESIDUAL_MIX_NORM, (long) nRows * local, args);
         return true;
     }
@@ -1221,6 +1213,7 @@ public final class GpuOps implements AutoCloseable {
                     + dst.sizeInBytes() + "-byte buffer");
         }
         if (bytes > 0) {
+            q8.invalidate();
             queue.enqueueFillBuffer(dst, byteOff, bytes, pattern);
         }
     }
@@ -1280,18 +1273,29 @@ public final class GpuOps implements AutoCloseable {
 
     /** 1-D launch: {@code roundUp(n, L)} work-items of local size {@code L}. */
     void launch(String kernel, long n, Object... args) {
+        q8.invalidate();
         long g = roundUp(n, local);
         queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{g}, new long[]{local}, args);
     }
 
     /** 1-D launch at the matvec work-group size: {@code roundUp(n, Lm)} work-items of local size {@code Lm}. */
     void launchMatvec(String kernel, long n, Object... args) {
+        q8.invalidate();
         long g = roundUp(n, matvecLocal);
         queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{g}, new long[]{matvecLocal}, args);
     }
 
+    /**
+     * Quantizes {@code x[0 .. elements)} ({@code elements} a multiple of {@value #Q8_1_BLOCK_SIZE}) to Q8_1 blocks
+     * in {@code out} ({@value #QUANTIZE_Q8_1}, grid by {@link Q8Activations#quantizeWorkItems}).
+     */
+    void quantizeQ8_1(GpuBuffer x, int elements, GpuBuffer out) {
+        launchMatvec(QUANTIZE_Q8_1, q8.quantizeWorkItems(elements / Q8_1_BLOCK_SIZE), elements, x, out);
+    }
+
     /** 2-D launch: {@code {roundUp(gx, lx), gy}} with local {@code {lx, 1}}. */
     void launch2d(String kernel, long gx, long gy, int lx, Object... args) {
+        q8.invalidate();
         queue.enqueueKernelNoEvent(kernels.get(kernel), new long[]{roundUp(gx, lx), gy}, new long[]{lx, 1}, args);
     }
 
@@ -1462,7 +1466,7 @@ public final class GpuOps implements AutoCloseable {
             return;
         }
         List<AutoCloseable> toClose = new ArrayList<>(prepared);
-        toClose.addAll(signBuffers.values());
+        toClose.addAll(signs.release());
         closed = true;
         RuntimeException first = null;
         try {
@@ -1484,9 +1488,6 @@ public final class GpuOps implements AutoCloseable {
             }
         }
         prepared.clear();
-        signBuffers.clear();
-        signValues.clear();
-        signsBySpec.clear();
         if (first != null) {
             throw first;
         }

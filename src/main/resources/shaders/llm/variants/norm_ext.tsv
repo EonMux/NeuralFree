@@ -7,3 +7,5 @@ LLM_GroupNorm	norm_ext.comp	OP=OP_GROUP_NORM	sg
 LLM_ResidualMix	norm_ext.comp	OP=OP_RESIDUAL_MIX
 LLM_ResidualMixNorm	norm_ext.comp	OP=OP_RESIDUAL_MIX_NORM	sg
 LLM_MulRowScale	norm_ext.comp	OP=OP_MUL_ROW_SCALE
+LLM_RowNormQ8	norm_ext.comp	OP=OP_ROW_NORM_Q8	sg
+LLM_ResidualMixNormQ8	norm_ext.comp	OP=OP_RESIDUAL_MIX_NORM_Q8	sg

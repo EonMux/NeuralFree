@@ -62,6 +62,7 @@ public final class PreparedDispatch implements AutoCloseable {
     public void dispatchOn(ComputeQueue q) {
         Objects.requireNonNull(q, "queue");
         ensureOpen();
+        owner.q8.invalidate();
         if (ownsHandle) {
             q.enqueueKernelPreBound(handle, global, local);
         } else {

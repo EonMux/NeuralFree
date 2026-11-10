@@ -281,9 +281,13 @@ public final class Int8MatvecTuning {
         large.put(nvidiaDiscrete(BackendType.OPENCL), EnumSet.of(GGMLType.Q4_0, GGMLType.Q4_1,
                 GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0, GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K,
                 GGMLType.Q5_K, GGMLType.Q6_K, GGMLType.Q8_K));
-        large.put(nvidiaDiscreteCudaTensor(), EnumSet.of(GGMLType.MXFP4, GGMLType.NVFP4, GGMLType.Q8_0,
-                GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K, GGMLType.Q8_K,
-                GGMLType.IQ4_XS));
+        // CUDA RTX 5080, with the warp-per-block quantizer (about 0.9us a launch) and the norm-emitted Q8_1
+        // rows: in the decoder step Q8_0 took the lane faster at every 0.6B shape (1024x1024 3.4 against
+        // 5.5us, 2048x1024 4.0 against 6.8, the 2x3072x1024 gate/up 9.2 against 10.9, the quantizer
+        // launches included) and Q4_K at the 4B model's 1024x2560 K/V rows (3.7 against 6.5us), while
+        // Q6_K's 1024x2560 rows stayed slower with it (8.9 against 6.3us).
+        large.put(nvidiaDiscreteCudaTensor(), EnumSet.of(GGMLType.MXFP4, GGMLType.NVFP4, GGMLType.Q2_K,
+                GGMLType.Q3_K, GGMLType.Q5_K, GGMLType.Q6_K, GGMLType.Q8_K, GGMLType.IQ4_XS));
         // Vulkan RTX 5080: every type lost the fixed quantizer cost at 1024x1024 (0.61-0.95x medians)
         // and won from 16.8M up (1.20-3.19x); Q8_K also lost its one widest shape, 14336x4096, at
         // 0.96x, the single large-shape miss in the kind.

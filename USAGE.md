@@ -493,7 +493,7 @@ On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts,
 - both head dimensions are multiples of 16, at most 128;
 - the layer uses standard attention (MLA keeps its own path).
 
-Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. Single-row decode steps run it too, as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128), except on CUDA and HIP past 128 live keys where a KV head serves at most two query heads: those steps run the split-K decode kernel's warp-shuffle form (128 tokens generated after 512 cached on the RTX 5080 Laptop: 320 against 277 t/s on Qwen3-Embedding-0.6B, 201 against 187 on Qwen3-VL-Embedding-2B; with four query heads per KV head the one-row prefill stays ahead at every depth). The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys with 32 query and 8 KV heads of 128 takes 0.28 ms of kernel time. OpenCL and Vulkan run the scalar kernels.
+Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. On CUDA, a single-row decode step over a dense F16 cache runs the one-row decode kernel `LLM_FlashDecodeRow_F16` instead, when the K and V head dimensions are equal multiples of 64 of at most 256 and the layer has no position bias and no sinks. The kernel puts four warps on each split and head with an online softmax in registers, the shape of llama.cpp's `fattn-vec`. On the RTX 5080 Laptop it takes 6.0-6.8 us per layer plus a 1.8-2.3 us merge (CUPTI, Qwen3-Embedding 0.6B and 4B), against 42-61 us for the one-row prefill it replaces. Other single-row steps run the tensor-core kernel as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128). The exception is a layer past 128 live keys whose KV heads each serve at most two query heads, on HIP or outside the one-row kernel's constraints on CUDA: those steps run the split-K decode kernel's warp-shuffle form. With four query heads per KV head, the one-row prefill stays ahead at every depth. The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys with 32 query and 8 KV heads of 128 takes 0.28 ms of kernel time. OpenCL and Vulkan run the scalar kernels.
 
 ### Fast GEMM for prefill and batched decode
 
@@ -701,15 +701,23 @@ How it behaves:
   rewrites only the nodes whose values changed and submits the graph once. CUDA instantiates the capture twice and
   patches the idle copy for the next step while the current one runs, so a replayed step costs 0.03-0.08 ms of host
   time; HIP and OpenCL patch the one instance before submitting.
-- A step the capture cannot express is never replayed: a position that does not follow the last, a changed command
-  pattern, or a flash-decode split count other than the captured one (the 2-to-3 split boundary at 65 keys)
-  records the trunk again at the new layout.
+- A step the capture cannot express is never replayed: a position that does not follow the last or a changed
+  command pattern records the trunk again. A flash-decode step at another split count is patched in place on
+  CUDA and HIP: the decode grid, the split arguments and the merge's split count change.
+  - On CUDA's one-row decode kernel, every row writes its partial and merges it, also at one split. A one-split
+    merge reproduces the direct output bit for bit, so the trunk keeps one command pattern at every depth and one
+    capture serves the whole generation.
+  - Elsewhere, the step that first needs a merge (33 keys) records the trunk once more.
+  - On OpenCL, whose command buffers cannot change a grid, every new split count records the trunk again.
 - Measured on the RTX 5080 Laptop (CUDA, best of three 48-token runs): the pplx-embed 0.6B F16 model decodes at
   266 tokens/s replayed against 223 directly, a small synthetic model at 2723-3041 against 1632, and a Qwen3 4B
   Q8_0 model, whose decode is bound by its kernels, at 9.6 against 9.3 ms per step. The first 3-12 steps after each
   capture cost about 2 ms more while the new graph warms up. With decode replay on, `chainReplay` wins on every
   measured pair (32.9 against 31.7 tokens/s for the 4B target with a 0.6B drafter). NVIDIA's OpenCL offers no
   `cl_khr_command_buffer`, so decode there always runs directly.
+- tg128 on CUDA (`nftool bench -p 0 -n 128`, RTX 5080 Laptop, alternating with `llama-bench -fa 1` in one
+  session): Qwen3-Embedding-0.6B Q8_0 542 t/s (llama.cpp 605), 4B Q8_0 124 (llama.cpp 133), 4B Q4_K_M 162
+  (llama.cpp 186).
 - A step whose trunk cannot be captured or no longer matches runs directly: a hidden tap that wants
   layer outputs, a host transfer inside the trunk, an MoE layer whose experts come from the host expert cache, a different dispatch sequence, Vulkan push
   constants or OpenCL scalar arguments changed by per-step scalars where mutable dispatch is unavailable. After two mismatched replays or three aborted
@@ -729,11 +737,15 @@ How it behaves:
   -ntg 128`). A tree-masked verify step captures its trunk once per shape and replays it through the body. A paged step with a multi-row segment, a recurrent
   target's tree round, and context-parallel and dual-chunk steps always run directly. Output is the same token for
   token as running the step directly.
-- Where the layer runs [tensor-core flash attention](#tensor-core-flash-attention), a one-row decode step runs
-  that kernel as a one-row prefill instead of the scalar split-K decode kernel, which measured slower even at one row
-  (48 against 65 us per layer at 256 keys, 32 query and 8 KV heads of 128). On CUDA and HIP, a layer whose KV heads
-  serve at most two query heads switches to the decode kernel's warp-shuffle form past 128 live keys, and the replay
-  captures again once where the route changes. Other layers keep the scalar decode kernel.
+- On CUDA, a one-row decode step over a dense F16 cache runs the one-row decode kernel `LLM_FlashDecodeRow_F16`
+  (see [tensor-core flash attention](#tensor-core-flash-attention)) at every depth.
+- Elsewhere, where the layer runs tensor-core flash attention, a one-row decode step runs that kernel as a one-row
+  prefill instead of the scalar split-K decode kernel, which measured slower even at one row (48 against 65 us
+  per layer at 256 keys, 32 query and 8 KV heads of 128).
+- On HIP, and on CUDA outside the one-row kernel's constraints, a layer whose KV heads serve at most two query
+  heads switches to the decode kernel's warp-shuffle form past 128 live keys. The replay captures again once,
+  where the route changes.
+- Other layers keep the scalar decode kernel.
 - Prefill steps always run directly. A `forwardBatch` whose rows are one-per-sequence decodes over the paged memory
   uses the step replay above; any batched call with a multi-row segment runs directly.
 

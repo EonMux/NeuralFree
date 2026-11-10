@@ -6,6 +6,7 @@ import com.eonmux.neuralfree.gguf.arch.ResidualKind;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.ops.act.ActKernels;
 
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
@@ -38,6 +39,14 @@ public final class NormKernels {
     public static final String GROUP_NORM = "LLM_GroupNorm";
     public static final String RESIDUAL_MIX = "LLM_ResidualMix";
     public static final String RESIDUAL_MIX_NORM = "LLM_ResidualMixNorm";
+    /** {@code LLM_RowNorm} that also writes each row's Q8_1 blocks ({@link #withQ8Blocks}). */
+    public static final String ROW_NORM_Q8 = "LLM_RowNormQ8";
+    /** {@code LLM_ResidualMixNorm} that also writes each normalized row's Q8_1 blocks ({@link #withQ8Blocks}). */
+    public static final String RESIDUAL_MIX_NORM_Q8 = "LLM_ResidualMixNormQ8";
+    /** Elements per Q8_1 block, the row-length quantum of the Q8_1-emitting norms. */
+    public static final int Q8_1_BLOCK_SIZE = 32;
+    /** Bytes per Q8_1 block ({@code d}, {@code s} as f16, 32 int8 codes). */
+    public static final int Q8_1_BLOCK_BYTES = 36;
     public static final String MUL_ROW_SCALE = "LLM_MulRowScale";
 
     /** {@code LLM_RowNorm} flag: a weight is bound. */
@@ -329,6 +338,32 @@ public final class NormKernels {
         GpuBuffer bArg = b != null ? b : Objects.requireNonNull(placeholder, "placeholder for the absent bias");
         return new Object[]{nRows, rowLen, kind.rowNormMode(), eps, flags, wRows, mix.code(), s, xOff, addOff,
                 yOff, x, addend, wArg, bArg, y};
+    }
+
+    /**
+     * The arguments of {@code LLM_RowNorm} or {@code LLM_ResidualMixNorm} ({@link #rowNormArgs} with
+     * {@code rowStride == rowLen}, {@link #residualMixNormArgs}) extended with the Q8_1 output of their Q8 forms
+     * ({@value #ROW_NORM_Q8}, {@value #RESIDUAL_MIX_NORM_Q8}): row {@code r}'s blocks land at byte
+     * {@code r * rowLen / 32 * 36} of {@code q8}, the layout {@code LLM_QuantizeQ8_1} writes.
+     *
+     * @throws IllegalArgumentException when {@code rowLen} is not a multiple of {@value #Q8_1_BLOCK_SIZE} or
+     *                                  {@code q8} is too small for {@code nRows} rows
+     */
+    public static Object[] withQ8Blocks(Object[] normArgs, int nRows, int rowLen, GpuBuffer q8) {
+        Objects.requireNonNull(normArgs, "norm arguments");
+        Objects.requireNonNull(q8, "Q8_1 output");
+        if (rowLen % Q8_1_BLOCK_SIZE != 0) {
+            throw new IllegalArgumentException("a Q8_1 row norm needs a row length that is a multiple of "
+                    + Q8_1_BLOCK_SIZE + ", got " + rowLen);
+        }
+        long bytes = (long) nRows * (rowLen / Q8_1_BLOCK_SIZE) * Q8_1_BLOCK_BYTES;
+        if (bytes > q8.sizeInBytes()) {
+            throw new IllegalArgumentException("Q8_1 output of " + q8.sizeInBytes() + " bytes is too small for "
+                    + nRows + " rows of " + rowLen + " (" + bytes + " bytes)");
+        }
+        Object[] args = Arrays.copyOf(normArgs, normArgs.length + 1);
+        args[normArgs.length] = q8;
+        return args;
     }
 
     /**

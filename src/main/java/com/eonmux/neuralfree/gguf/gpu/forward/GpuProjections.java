@@ -845,13 +845,17 @@ final class GpuProjections {
                 && Int8MatvecTuning.laneIsFaster(deviceKind, type, elements);
     }
 
-    /** {@link #quantizeQ8} through the open {@link GpuOps.SharedQ8} when it covers this view. */
+    /**
+     * The Q8_1 blocks of a single-token row at element 0 of its buffer: the open {@link GpuOps.SharedQ8}'s when it
+     * covers the view, the blocks the row's norm wrote ({@link Q8Activations#take}), else {@link #quantizeQ8}.
+     */
     private GpuBuffer quantizedRow(GpuOps.View x, int cols) {
         GpuOps.SharedQ8 share = ops.activeShare;
         if (share != null && share.matches(x, cols, 1)) {
             return share.blocks();
         }
-        return quantizeQ8(x.buf, cols);
+        GpuBuffer normed = ops.q8.take(x.buf, 1, cols);
+        return normed != null ? normed : quantizeQ8(x.buf, cols);
     }
 
     /** {@link #quantizeQ8N} through the open {@link GpuOps.SharedQ8} when it covers these rows. */
@@ -871,22 +875,26 @@ final class GpuProjections {
     private GpuBuffer quantizeQ8(GpuBuffer x, int cols) {
         int blocks = cols / GpuOps.Q8_1_BLOCK_SIZE;
         ScratchSlot slot = scratch.staging(GpuScratch.Staging.Q8_1, (long) blocks * GpuOps.Q8_1_FLOATS);
-        ops.launchMatvec(GpuOps.QUANTIZE_Q8_1, blocks, cols, x, slot.buffer());
+        ops.quantizeQ8_1(x, cols, slot.buffer());
         return slot.buffer();
     }
 
     /**
-     * Quantizes {@code nTokens} consecutive F32 activation rows of {@code cols} elements (each a multiple
-     * of {@link #GpuOps.Q8_1_BLOCK_SIZE}) to Q8_1 blocks in the Q8_1 staging slot ({@value #GpuOps.QUANTIZE_Q8_1}) for
-     * the multi-column integer-dot matvec lane. The rows are contiguous in the input and in the slot, so
-     * the quantizer's linear block walk serves the whole group in one launch; the group must start at
-     * element 0 of {@code x}.
+     * The Q8_1 blocks of {@code nTokens} consecutive F32 activation rows of {@code cols} elements (each a multiple
+     * of {@link #GpuOps.Q8_1_BLOCK_SIZE}) for the multi-column integer-dot matvec lane: the blocks the rows' norm
+     * wrote ({@link Q8Activations#take}), else the rows quantized to the Q8_1 staging slot
+     * ({@value #GpuOps.QUANTIZE_Q8_1}). The rows are contiguous in the input and in the blocks, so the quantizer's
+     * linear block walk serves the whole group in one launch; the group must start at element 0 of {@code x}.
      */
     private GpuBuffer quantizeQ8N(GpuBuffer x, int nTokens, int cols) {
+        GpuBuffer normed = ops.q8.take(x, nTokens, cols);
+        if (normed != null) {
+            return normed;
+        }
         int blocks = cols / GpuOps.Q8_1_BLOCK_SIZE;
         int size = Math.multiplyExact(nTokens, cols);
         ScratchSlot slot = scratch.staging(GpuScratch.Staging.Q8_1, (long) blocks * nTokens * GpuOps.Q8_1_FLOATS);
-        ops.launchMatvec(GpuOps.QUANTIZE_Q8_1, (long) blocks * nTokens, size, x, slot.buffer());
+        ops.quantizeQ8_1(x, size, slot.buffer());
         return slot.buffer();
     }
 

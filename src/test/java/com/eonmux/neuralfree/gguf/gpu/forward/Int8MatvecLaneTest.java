@@ -313,12 +313,12 @@ public class Int8MatvecLaneTest {
     @Test
     public void autoKeepsTheFloatMatvecForAProjectionBelowTheMeasuredLaneThreshold() {
         open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
-        // Q4_K measured slower with the lane at 1024x1024 elements, faster from 4096x4096 up.
-        GpuWeight w = q4k();
+        // Q6_K measured slower with the lane at 1024x2560 elements, faster from 4096x4096 up.
+        GpuWeight w = weight(GGMLType.Q6_K);
         List<String> names = run(() -> ops.matvec(w, backend.allocateBuffer((long) COLS * 4), 0,
                 backend.allocateBuffer((long) ROWS * 4), 0, 1));
-        assertTrue(names.toString(), names.contains("Q4_K_MatVec"));
-        assertFalse(names.toString(), names.contains("Q4_K_MatVec_Q8"));
+        assertTrue(names.toString(), names.contains("Q6_K_MatVec"));
+        assertFalse(names.toString(), names.contains("Q6_K_MatVec_Q8"));
         assertFalse(names.toString(), names.contains(GpuOps.QUANTIZE_Q8_1));
     }
 
@@ -332,16 +332,16 @@ public class Int8MatvecLaneTest {
     }
 
     @Test
-    public void autoTakesTheQ8_0LaneOnALargeCudaProjectionAndNotASmallOne() {
+    public void autoTakesTheQ8_0LaneOnSmallAndLargeCudaProjections() {
         open(Int8MatvecMode.AUTO, DeviceFeature.INTEGER_DOT_PRODUCT, ComputeBackend.BackendType.CUDA);
-        // 32x256 measured slower with the lane: the F32 matvec keeps it.
+        // The small decoder projections measured faster with the lane once its activation rows cost a
+        // warp-per-block quantizer launch or none (norm-emitted), so a 32x256 projection takes it too.
         GpuWeight small = weight(GGMLType.Q8_0);
         List<String> smallNames = run(() -> ops.matvec(small, backend.allocateBuffer((long) COLS * 4), 0,
                 backend.allocateBuffer((long) ROWS * 4), 0, 1));
-        assertTrue(smallNames.toString(), smallNames.contains("Q8_0_MatVec"));
-        assertFalse(smallNames.toString(), smallNames.contains("Q8_0_MatVec_Q8"));
-        assertFalse(smallNames.toString(), smallNames.contains(GpuOps.QUANTIZE_Q8_1));
-        // A projection at or above the measured lane threshold takes the lane.
+        assertTrue(smallNames.toString(), smallNames.contains("Q8_0_MatVec_Q8"));
+        assertFalse(smallNames.toString(), smallNames.contains("Q8_0_MatVec"));
+        assertTrue(smallNames.toString(), smallNames.contains(GpuOps.QUANTIZE_Q8_1));
         GpuWeight large = autoWeight(GGMLType.Q8_0);
         List<String> largeNames = run(() -> ops.matvec(large, autoInput(), 0, autoOutput(), 0, 1));
         assertTrue(largeNames.toString(), largeNames.contains("Q8_0_MatVec_Q8"));
@@ -614,15 +614,17 @@ public class Int8MatvecLaneTest {
         DeviceKind vulkanIntel = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.INTEL);
         DeviceKind vulkanNvidia = kind(ComputeBackend.BackendType.VULKAN, DeviceKind.Vendor.NVIDIA);
         DeviceKind openclIntel = kind(ComputeBackend.BackendType.OPENCL, DeviceKind.Vendor.INTEL);
-        // 1024x1024 and 3072x1024 measured slower with the lane; 4096x4096 and up measured faster.
-        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K, 1024L * 1024));
+        // Q6_K's 1024x2560 rows measured slower with the lane on CUDA; 4096x4096 and up measured faster.
         assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q6_K, 3072L * 1024));
-        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K,
+        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q5_K, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q6_K,
                 Int8MatvecTuning.LANE_MIN_ELEMENTS));
-        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K, 4096L * 4096));
-        // Q8_0 lost the lane's fixed quantizer cost on the small projections of both devices and
-        // measured 1.06x to 1.69x with it from 4096x4096 up on CUDA, 1.11x to 1.36x on OpenCL.
-        assertFalse(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q8_0, 3072L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q6_K, 4096L * 4096));
+        // With the warp-per-block quantizer and the norm-emitted rows, Q8_0 and Q4_K took the lane faster
+        // at the small CUDA projections too; Q8_0 lost the lane's fixed quantizer cost on the small
+        // projections of the OpenCL device and measured 1.11x to 1.36x with it from 4096x4096 up there.
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q8_0, 1024L * 1024));
+        assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q4_K, 1024L * 2560));
         assertTrue(Int8MatvecTuning.laneIsFaster(cudaTensor, GGMLType.Q8_0, 4096L * 4096));
         assertFalse(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.Q8_0, 1024L * 1024));
         assertTrue(Int8MatvecTuning.laneIsFaster(openclNvidia, GGMLType.Q8_0, 9728L * 2560));
