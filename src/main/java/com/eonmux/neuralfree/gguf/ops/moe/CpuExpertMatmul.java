@@ -376,34 +376,134 @@ public final class CpuExpertMatmul {
             rowActs = acts;
             pairActs = null;
         }
-        int[] tileStart = tileStarts(g, perExpert);
-        int nTiles = tileStart[g.active.length];
+        Parts parts = Parts.of(g, cols, dot);
+        for (int pass = 0; pass < parts.passes(); pass++) {
+            int p0 = parts.passStart[pass];
+            int p1 = parts.passStart[pass + 1];
+            QuantizedActivations[][] partActs = new QuantizedActivations[p1 - p0][];
+            CpuVecDot.TileActivations[] partTiles = new CpuVecDot.TileActivations[p1 - p0];
+            CpuParallel.parallelFor(p1 - p0, 1, (from, to) -> {
+                for (int i = from; i < to; i++) {
+                    int part = p0 + i;
+                    QuantizedActivations[] acts = new QuantizedActivations[parts.count[part]];
+                    for (int k = 0; k < acts.length; k++) {
+                        int p = g.order[parts.first[part] + k];
+                        acts[k] = rowActs != null ? rowActs[pairRow != null ? pairRow[p] : p / pairsPerSource]
+                                : pairActs[p];
+                    }
+                    partActs[i] = acts;
+                    partTiles[i] = acts.length > 1 ? dot.prepareTiles(acts, acts.length) : null;
+                }
+            });
+            runTiles(w3d, dot, t, g, parts, p0, p1, perExpert, cols, partActs, partTiles, y, yOff, epilogue);
+        }
+    }
+
+    /**
+     * The pairs of every active expert cut into parts of at most one token slab ({@link CpuMatVec#tokenSlab}), and
+     * the parts grouped into passes of at most one slab of pairs, so the prepared layouts that exist at once stay
+     * bounded however many pairs a step routes. A part is a run of one expert's pairs in pair order; parts start
+     * on multiples of the slab, which is a multiple of the kernels' token tile. Immutable.
+     */
+    static final class Parts {
+        /** Expert slot of each part. */
+        final int[] slot;
+        /** Index into {@code g.order} of each part's first pair. */
+        final int[] first;
+        /** Pairs of each part. */
+        final int[] count;
+        /** Pass {@code i} runs parts {@code [passStart[i], passStart[i + 1])}. */
+        final int[] passStart;
+
+        private Parts(int[] slot, int[] first, int[] count, int[] passStart) {
+            this.slot = slot;
+            this.first = first;
+            this.count = count;
+            this.passStart = passStart;
+        }
+
+        /** The parts and passes of {@code g} for kernel {@code dot} over {@code cols} columns. */
+        static Parts of(Groups g, int cols, CpuVecDot dot) {
+            return of(g, CpuMatVec.tokenSlab(cols, dot));
+        }
+
+        static Parts of(Groups g, int slab) {
+            int n = 0;
+            for (int a = 0; a < g.active.length; a++) {
+                n += (g.count(a) + slab - 1) / slab;
+            }
+            int[] slot = new int[n];
+            int[] first = new int[n];
+            int[] count = new int[n];
+            int[] passStart = new int[n + 1];
+            int passes = 0;
+            int inPass = 0;
+            int i = 0;
+            for (int a = 0; a < g.active.length; a++) {
+                for (int k = 0; k < g.count(a); k += slab) {
+                    slot[i] = a;
+                    first[i] = g.start[a] + k;
+                    count[i] = Math.min(slab, g.count(a) - k);
+                    if (i > 0 && inPass + count[i] > slab) {
+                        passStart[++passes] = i;
+                        inPass = 0;
+                    }
+                    inPass += count[i];
+                    i++;
+                }
+            }
+            passStart[++passes] = n;
+            return new Parts(slot, first, count, Arrays.copyOf(passStart, passes + 1));
+        }
+
+        int passes() {
+            return passStart.length - 1;
+        }
+    }
+
+    /**
+     * The tiles of parts {@code [p0, p1)} of a grouped product: each runs one block of at most {@link #PAIR_BLOCK}
+     * pairs of one part against {@link #ROW_TILE} of its expert's weight rows through the kernel's batched product
+     * ({@link CpuVecDot#dotTiles}, with the part's prepared layout), so the rows unpack once per block instead of
+     * once per pair, then scales and stores every pair's rows and hands them to the epilogue in pair order. The
+     * batched product returns each pair's {@link CpuVecDot#dotRows} values, so the outputs are those of one product
+     * per pair.
+     */
+    private static void runTiles(CpuTensorRef w3d, CpuVecDot dot, CpuMatVec.Transforms t, Groups g, Parts parts,
+                                 int p0, int p1, int perExpert, int cols, QuantizedActivations[][] partActs,
+                                 CpuVecDot.TileActivations[] partTiles, float[] y, int yOff,
+                                 TileEpilogue epilogue) {
+        int[] tileStart = tileStarts(parts, p0, p1, perExpert, g.pairs);
+        int nTiles = tileStart[p1 - p0];
         int grain = (int) Math.max(1L, MIN_TASK_WORK / ((long) ROW_TILE * cols));
         CpuParallel.parallelFor(nTiles, grain, (from, to) -> {
-            int a = slotOf(tileStart, from);
+            float[] out = new float[ROW_TILE * PAIR_BLOCK];
+            int i = slotOf(tileStart, from);
             for (int tile = from; tile < to; tile++) {
-                while (tile >= tileStart[a + 1]) {
-                    a++;
+                while (tile >= tileStart[i + 1]) {
+                    i++;
                 }
-                int blocks = (g.count(a) + PAIR_BLOCK - 1) / PAIR_BLOCK;
-                int local = tile - tileStart[a];
+                int part = p0 + i;
+                int count = parts.count[part];
+                int blocks = (count + PAIR_BLOCK - 1) / PAIR_BLOCK;
+                int local = tile - tileStart[i];
                 int r0 = (local / blocks) * ROW_TILE;
                 int nr = Math.min(ROW_TILE, perExpert - r0);
-                int q0 = g.start[a] + (local % blocks) * PAIR_BLOCK;
-                int q1 = Math.min(q0 + PAIR_BLOCK, g.start[a + 1]);
-                int e = g.active[a];
+                int k0 = (local % blocks) * PAIR_BLOCK;
+                int n = Math.min(PAIR_BLOCK, count - k0);
+                int e = g.active[parts.slot[part]];
                 long wRow = (long) e * perExpert + r0;
+                if (n == 1) {
+                    dot.dotRows(w3d, wRow, nr, partActs[i][k0], out, 0);
+                } else {
+                    dot.dotTiles(w3d, wRow, nr, partTiles[i], partActs[i], k0, n, out, 0, nr);
+                }
                 float s = t.scale(e);
-                for (int q = q0; q < q1; q++) {
-                    int p = g.order[q];
+                for (int k = 0; k < n; k++) {
+                    int p = g.order[parts.first[part] + k0 + k];
                     int yBase = yOff + p * perExpert + r0;
-                    int row = pairRow != null ? pairRow[p] : p / pairsPerSource;
-                    QuantizedActivations act = rowActs != null ? rowActs[row] : pairActs[p];
-                    dot.dotRows(w3d, wRow, nr, act, y, yBase);
-                    if (t.hasScale()) {
-                        for (int i = 0; i < nr; i++) {
-                            y[yBase + i] *= s;
-                        }
+                    for (int r = 0; r < nr; r++) {
+                        y[yBase + r] = t.hasScale() ? out[k * nr + r] * s : out[k * nr + r];
                     }
                     epilogue.tile(p, r0, nr);
                 }
@@ -412,26 +512,26 @@ public final class CpuExpertMatmul {
     }
 
     /**
-     * Prefix of the tile counts of the active experts: expert slot {@code a} owns tiles
-     * {@code [starts[a], starts[a + 1])}, ordered row tile major and pair block minor so that consecutive tiles
+     * Prefix of the tile counts of parts {@code [p0, p1)}: part {@code p0 + i} owns tiles
+     * {@code [starts[i], starts[i + 1])}, ordered row tile major and pair block minor so that consecutive tiles
      * reuse the same weight rows.
      */
-    private static int[] tileStarts(Groups g, int perExpert) {
+    private static int[] tileStarts(Parts parts, int p0, int p1, int perExpert, int pairs) {
         long rowTiles = (perExpert + ROW_TILE - 1) / ROW_TILE;
-        int[] starts = new int[g.active.length + 1];
+        int[] starts = new int[p1 - p0 + 1];
         long total = 0;
-        for (int a = 0; a < g.active.length; a++) {
-            total += rowTiles * ((g.count(a) + PAIR_BLOCK - 1) / PAIR_BLOCK);
+        for (int i = 0; i < p1 - p0; i++) {
+            total += rowTiles * ((parts.count[p0 + i] + PAIR_BLOCK - 1) / PAIR_BLOCK);
             if (total > Integer.MAX_VALUE) {
-                throw new IllegalArgumentException("grouped expert product of " + g.pairs + " pairs x " + perExpert
+                throw new IllegalArgumentException("grouped expert product of " + pairs + " pairs x " + perExpert
                         + " rows needs more than " + Integer.MAX_VALUE + " tiles");
             }
-            starts[a + 1] = (int) total;
+            starts[i + 1] = (int) total;
         }
         return starts;
     }
 
-    /** The expert slot owning {@code tile}: the last {@code a} with {@code starts[a] <= tile}. */
+    /** The part owning {@code tile}: the last {@code i} with {@code starts[i] <= tile}. */
     private static int slotOf(int[] starts, int tile) {
         int lo = 0;
         int hi = starts.length - 2;

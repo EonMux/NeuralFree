@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.demo.tools;
 
+import com.eonmux.neuralfree.gguf.cpu.numa.CpuThreadPolicy;
+import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
 import org.junit.Test;
 
@@ -286,5 +288,35 @@ public class BenchGridTest {
     /** Parses flags the way {@code BenchCommand} does, so the tests exercise the same path. */
     private static BenchGrid parse(String... args) throws BenchCommand.UsageException {
         return BenchCommand.parse(args);
+    }
+
+    @Test
+    public void theDefaultThreadCountFollowsThePoolAndFallsBackToTheDefaultPolicy() {
+        String threads = System.getProperty(CpuParallel.THREADS_PROPERTY);
+        String policy = System.getProperty(CpuThreadPolicy.PROPERTY);
+        try {
+            System.setProperty(CpuParallel.THREADS_PROPERTY, "3");
+            assertEquals(3, BenchGrid.defaultThreads());
+            System.clearProperty(CpuParallel.THREADS_PROPERTY);
+            System.setProperty(CpuThreadPolicy.PROPERTY, "logical");
+            assertEquals(CpuThreadPolicy.host().threads(CpuThreadPolicy.Policy.LOGICAL), BenchGrid.defaultThreads());
+            int fallback = CpuThreadPolicy.host().threads(CpuThreadPolicy.DEFAULT_POLICY);
+            System.setProperty(CpuThreadPolicy.PROPERTY, "fastest");
+            assertEquals("an invalid policy reports the default policy's count", fallback, BenchGrid.defaultThreads());
+            System.clearProperty(CpuThreadPolicy.PROPERTY);
+            System.setProperty(CpuParallel.THREADS_PROPERTY, "many");
+            assertEquals("an invalid count reports the default policy's count", fallback, BenchGrid.defaultThreads());
+        } finally {
+            restore(CpuParallel.THREADS_PROPERTY, threads);
+            restore(CpuThreadPolicy.PROPERTY, policy);
+        }
+    }
+
+    private static void restore(String key, String value) {
+        if (value == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, value);
+        }
     }
 }

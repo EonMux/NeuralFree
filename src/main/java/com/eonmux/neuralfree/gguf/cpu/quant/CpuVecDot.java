@@ -68,6 +68,61 @@ public interface CpuVecDot {
     }
 
     /**
+     * The activations of one batched product laid out once for a kernel's tile loop, built by
+     * {@link #prepareTiles} before the product's row tasks start and then read by all of them. Implementations are
+     * immutable once built and safe to share between threads.
+     */
+    interface TileActivations {
+
+        /** Tokens the layout holds. */
+        int tokens();
+    }
+
+    /**
+     * Lays out {@code x[0, nTokens)} for {@link #dotTiles(CpuTensorRef, long, int, TileActivations,
+     * QuantizedActivations[], int, int, float[], int, int)}, or returns null when the kernel reads the activation
+     * rows directly (the default). A caller that splits one product into row and token tasks calls it once per
+     * product, so a kernel whose tiles interleave or widen the activations does that work once instead of once per
+     * task.
+     *
+     * @throws IllegalArgumentException when a token is incompatible with the kernel
+     */
+    default TileActivations prepareTiles(QuantizedActivations[] x, int nTokens) {
+        return null;
+    }
+
+    /**
+     * Token alignment of a prepared layout: the {@code tokenStart} of a prepared
+     * {@link #dotTiles(CpuTensorRef, long, int, TileActivations, QuantizedActivations[], int, int, float[], int, int)}
+     * call must be a multiple of it. 1 for kernels without a layout.
+     */
+    default int tileTokens() {
+        return 1;
+    }
+
+    /**
+     * The product of rows {@code [rowStart, rowStart + rowCount)} with tokens {@code [tokenStart, tokenStart +
+     * nTokens)} of a batched product, writing token {@code tokenStart + t}'s output row at {@code y[yOff +
+     * t*yStride]}: the same values as {@link #dotTiles(CpuTensorRef, long, int, QuantizedActivations[], int,
+     * float[], int, int)} over those tokens. {@code tiles} is this kernel's {@link #prepareTiles} result for
+     * {@code x} (null when it returned null); the default runs the unprepared form over the token range.
+     *
+     * @throws IllegalArgumentException  as the unprepared form, or for a token start that is not a multiple of
+     *                                   {@link #tileTokens()}
+     * @throws IndexOutOfBoundsException when the token range exceeds {@code x}
+     */
+    default void dotTiles(CpuTensorRef w, long rowStart, int rowCount, TileActivations tiles,
+                          QuantizedActivations[] x, int tokenStart, int nTokens, float[] y, int yOff, int yStride) {
+        if (tokenStart < 0 || nTokens < 0 || tokenStart > x.length - nTokens) {
+            throw new IndexOutOfBoundsException("tokens [" + tokenStart + ", " + ((long) tokenStart + nTokens)
+                    + ") exceed the " + x.length + "-token activations");
+        }
+        QuantizedActivations[] part = tokenStart == 0 ? x
+                : java.util.Arrays.copyOfRange(x, tokenStart, tokenStart + nTokens);
+        dotTiles(w, rowStart, rowCount, part, nTokens, y, yOff, yStride);
+    }
+
+    /**
      * Validates the arguments of {@link #dotTiles}: the activation array and its tokens, every token's
      * compatibility with {@code w} and output range, and the row stride.
      *

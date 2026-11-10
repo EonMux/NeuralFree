@@ -1017,13 +1017,17 @@ public final class CpuAttentionMixer implements CpuMixer {
             }
         } else {
             int cols = (int) wq.cols();
-            matVec.matmul(wq, in, 0, qLatent, 0, n);
+            if (wk != null && wv != null) {
+                matVec.matmulGroup(new CpuTensorRef[] {wq, wk, wv}, in, 0, new float[][] {qLatent, k, v}, n);
+            } else if (wk != null) {
+                matVec.matmulGroup(new CpuTensorRef[] {wq, wk}, in, 0, new float[][] {qLatent, k}, n);
+            } else {
+                matVec.matmul(wq, in, 0, qLatent, 0, n);
+            }
             addDeltas(qSite, n, in, cols, qLatent, 0, qw);
             if (wk != null) {
-                matVec.matmul(wk, in, 0, k, 0, n);
                 addDeltas(kSite, n, in, cols, k, 0, spec.kDim());
                 if (wv != null) {
-                    matVec.matmul(wv, in, 0, v, 0, n);
                     addDeltas(vSite, n, in, cols, v, 0, spec.vDim());
                 } else if (valueExperts != null) {
                     valueExperts.run(n, in, v);

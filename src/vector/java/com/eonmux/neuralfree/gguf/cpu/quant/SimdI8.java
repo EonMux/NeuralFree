@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.cpu.quant;
 
+import com.eonmux.neuralfree.gguf.GGMLType;
+import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.ShortVector;
@@ -42,7 +44,19 @@ final class SimdI8 {
     /** Broadcast {@code 1}, the saturating numerator of {@link #fifthBits}. */
     private static final IntVector ONE = IntVector.broadcast(I8, 1);
 
+    /** Tokens one interleaved activation tile ({@link TokenTiles}) holds: one int lane per token. */
+    static final int TILE_TOKENS = 8;
+
     private static final ThreadLocal<int[]> ACTS = new ThreadLocal<>();
+
+    /** The per-block int sums the token-tile kernels hand from their integer to their float half. */
+    private static final ThreadLocal<int[]> TILE_SUMS = new ThreadLocal<>();
+
+    /** The widened weight-row element pairs of the token-tile kernels. */
+    private static final ThreadLocal<int[][]> ROW_PAIRS = new ThreadLocal<>();
+
+    /** The per-block weight-row scales of the token-tile kernels. */
+    private static final ThreadLocal<float[][]> ROW_SCALES = new ThreadLocal<>();
 
     /** The activation vector {@link #ACTS} currently holds. */
     private static final ThreadLocal<CpuVecDot.QuantizedActivations> LAST = new ThreadLocal<>();
@@ -124,6 +138,189 @@ final class SimdI8 {
         final IntVector p = (IntVector) ShortVector.fromArray(ShortVector.SPECIES_128, pairs, po)
                 .convertShape(VectorOperators.S2I, I8, 0);
         return sum(m.mul(p));
+    }
+
+    /**
+     * The activations of one batched product as tiles of {@link #TILE_TOKENS} tokens interleaved by element pairs:
+     * in tile {@code t}, pair {@code k} (elements {@code 2k, 2k+1}) of token {@code ti} sits at
+     * {@code lanes[t * tileLanes + 16k + 2ti + j]}, so one 16-lane short load holds one element pair of every token
+     * of the tile and a weight pair broadcast over it ({@link #broadcastPair}) multiplies all eight tokens at
+     * once; after {@link #pairs} lane {@code ti} carries token {@code ti}'s products. {@code scales[t * tileScales
+     * + 8b + ti]} is token {@code ti}'s block-{@code b} scale {@code d}; for Q8_K activations {@code
+     * groupPairs[t * tilePairs + 8j + ti]} is token {@code ti}'s sum of the 16-quant group sums {@code 2j} and
+     * {@code 2j + 1} ({@link #bsumPairs}), eight per super-block. Tokens past the last pad with zero quants, zero
+     * scales and zero sums. Immutable once built.
+     */
+    static final class TokenTiles implements CpuVecDot.TileActivations {
+        final short[] lanes;
+        final float[] scales;
+        final int[] groupPairs;
+        final int tokens;
+        final int count;
+        final int cols;
+        final int tileLanes;
+        final int tileScales;
+        final int tilePairs;
+
+        private TokenTiles(int tokens, int cols, int blocks, boolean groups) {
+            this.tokens = tokens;
+            this.cols = cols;
+            this.count = (tokens + TILE_TOKENS - 1) / TILE_TOKENS;
+            this.tileLanes = cols * TILE_TOKENS;
+            this.tileScales = blocks * TILE_TOKENS;
+            this.tilePairs = groups ? (cols / 32) * TILE_TOKENS : 0;
+            this.lanes = new short[Math.multiplyExact(count, tileLanes)];
+            this.scales = new float[Math.multiplyExact(count, tileScales)];
+            this.groupPairs = groups ? new int[Math.multiplyExact(count, tilePairs)] : null;
+        }
+
+        @Override
+        public int tokens() {
+            return tokens;
+        }
+
+        /** Interleaves token {@code t}'s quants and scales; tokens past the last keep their zeros. */
+        private void put(int t, CpuVecDot.QuantizedActivations x) {
+            final int base = (t / TILE_TOKENS) * tileLanes + 2 * (t % TILE_TOKENS);
+            final int sBase = (t / TILE_TOKENS) * tileScales + t % TILE_TOKENS;
+            final byte[] qs = x.qs;
+            for (int k = 0; k < cols / 2; k++) {
+                lanes[base + 16 * k] = qs[2 * k];
+                lanes[base + 16 * k + 1] = qs[2 * k + 1];
+            }
+            final float[] d = x.d;
+            for (int b = 0; b < d.length; b++) {
+                scales[sBase + TILE_TOKENS * b] = d[b];
+            }
+            if (groupPairs != null) {
+                final short[] bs = x.bsums;
+                final int pBase = (t / TILE_TOKENS) * tilePairs + t % TILE_TOKENS;
+                for (int j = 0; j < bs.length / 2; j++) {
+                    groupPairs[pBase + TILE_TOKENS * j] = bs[2 * j] + bs[2 * j + 1];
+                }
+            }
+        }
+
+        /** The first group pair of tile {@code tile}. */
+        int pairBase(int tile) {
+            return tile * tilePairs;
+        }
+
+        /** The first lane of tile {@code tile}. */
+        int laneBase(int tile) {
+            return tile * tileLanes;
+        }
+
+        /** The first scale of tile {@code tile}. */
+        int scaleBase(int tile) {
+            return tile * tileScales;
+        }
+    }
+
+    /**
+     * The {@link TokenTiles} of the {@code nTokens} tokens of {@code x}, one token per {@link CpuParallel} index
+     * (each writes only its own lanes).
+     */
+    static TokenTiles tokenTiles(CpuVecDot.QuantizedActivations[] x, int nTokens) {
+        final TokenTiles tiles = new TokenTiles(nTokens, x[0].n, x[0].d.length, x[0].bsums != null);
+        CpuParallel.parallelFor(nTokens, Math.max(1, (1 << 16) / Math.max(1, x[0].n)), (from, to) -> {
+            for (int t = from; t < to; t++) {
+                tiles.put(t, x[t]);
+            }
+        });
+        return tiles;
+    }
+
+    /**
+     * Validates a token range of a prepared layout: it lies inside the layout and starts on a tile.
+     *
+     * @throws IllegalArgumentException  for a start that is not a multiple of {@link #TILE_TOKENS}
+     * @throws IndexOutOfBoundsException for a range outside the layout
+     */
+    static void checkTileRange(TokenTiles tiles, int tokenStart, int nTokens) {
+        if (tokenStart < 0 || nTokens < 0 || tokenStart > tiles.tokens - nTokens) {
+            throw new IndexOutOfBoundsException("tokens [" + tokenStart + ", " + ((long) tokenStart + nTokens)
+                    + ") exceed the " + tiles.tokens + "-token tiles");
+        }
+        if (tokenStart % TILE_TOKENS != 0) {
+            throw new IllegalArgumentException("token start " + tokenStart + " is not a multiple of the "
+                    + TILE_TOKENS + "-token tile");
+        }
+    }
+
+    /**
+     * The int16 element pair {@code pair} (low half: the even element) broadcast to every int lane, as sixteen
+     * short lanes: the weight operand of the token-tile kernels.
+     */
+    static ShortVector broadcastPair(int pair) {
+        return IntVector.broadcast(I8, pair).reinterpretAsShorts();
+    }
+
+    /** The calling thread's {@code rows} widened weight rows of {@code pairs} int16 element pairs each. */
+    static int[][] rowPairs(int rows, int pairs) {
+        int[][] buf = ROW_PAIRS.get();
+        if (buf == null || buf.length < rows || buf[0].length < pairs) {
+            buf = new int[Math.max(rows, 4)][Math.max(pairs, 512)];
+            ROW_PAIRS.set(buf);
+        }
+        return buf;
+    }
+
+    /**
+     * Validates the activations a token-tile kernel lays out: {@code nTokens} vectors of {@code type}, all of the
+     * first one's length.
+     *
+     * @throws IllegalArgumentException naming the first token that is null, of another type or of another length
+     */
+    static void checkTileTokens(CpuVecDot.QuantizedActivations[] x, int nTokens, GGMLType type) {
+        for (int t = 0; t < nTokens; t++) {
+            if (x[t] == null || x[t].type != type || x[t].n != x[0].n) {
+                throw new IllegalArgumentException(type + " tiles need " + type + " activations of one length,"
+                        + " token " + t + " is " + x[t]);
+            }
+        }
+    }
+
+    /**
+     * Validates a prepared product against weight {@code w}: the layout's row length is {@code w}'s.
+     *
+     * @throws IllegalArgumentException when the lengths differ
+     */
+    static void checkTileWidth(CpuTensorRef w, TokenTiles tiles) {
+        if (tiles.cols != w.cols()) {
+            throw new IllegalArgumentException(w.type() + " row of " + w.cols() + " elements cannot be dotted with "
+                    + tiles.cols + " activations");
+        }
+    }
+
+    /** The calling thread's {@code rows} per-block int arrays (weight sub-block scales) of {@code n} values each. */
+    static int[][] rowInts(ThreadLocal<int[][]> slot, int rows, int n) {
+        int[][] buf = slot.get();
+        if (buf == null || buf.length < rows || buf[0].length < n) {
+            buf = new int[Math.max(rows, 4)][Math.max(n, 128)];
+            slot.set(buf);
+        }
+        return buf;
+    }
+
+    /** The calling thread's {@code rows} per-block weight-row scale arrays of {@code blocks} values each. */
+    static float[][] rowScales(int rows, int blocks) {
+        float[][] buf = ROW_SCALES.get();
+        if (buf == null || buf.length < rows || buf[0].length < blocks) {
+            buf = new float[Math.max(rows, 4)][Math.max(blocks, 64)];
+            ROW_SCALES.set(buf);
+        }
+        return buf;
+    }
+
+    /** The calling thread's per-block tile sums, at least {@code n} values long. */
+    static int[] tileSums(int n) {
+        int[] buf = TILE_SUMS.get();
+        if (buf == null || buf.length < n) {
+            buf = new int[Math.max(n, 1024)];
+            TILE_SUMS.set(buf);
+        }
+        return buf;
     }
 
     /** The calling thread's float accumulators of one batched tile, at least {@code n} values long. */
@@ -233,6 +430,13 @@ final class SimdI8 {
             }
         }
         return buf;
+    }
+
+    /** The pairwise sums of the sixteen int16 products of {@code p} in eight int lanes ({@link #pairSum} of 0). */
+    static IntVector pairs(ShortVector p) {
+        final IntVector lanes = (IntVector) p.reinterpretShape(I8, 0);
+        return lanes.lanewise(VectorOperators.LSHL, 16).lanewise(VectorOperators.ASHR, 16)
+                .add(lanes.lanewise(VectorOperators.ASHR, 16));
     }
 
     /**

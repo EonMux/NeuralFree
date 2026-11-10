@@ -200,9 +200,8 @@ public final class CpuDenseFfn implements CpuFfnBlock {
         int nFf = layout.nFf();
         switch (layout.form()) {
             case PARALLEL_GLU:
-                gate.run(n, in, gateUp);
+                Projection.runPair(gate, up, n, in, gateUp, upTemp);
                 sparsity(n);
-                up.run(n, in, upTemp);
                 CpuOps.gluRows(layout.glu(), layout.params(), n, nFf, gateUp, 0, nFf, upTemp, 0, nFf,
                         gateUp, 0, nFf);
                 break;
@@ -291,9 +290,40 @@ public final class CpuDenseFfn implements CpuFfnBlock {
 
         /** {@code y[t*rows + r] = (W x_t + delta(x_t) + b)[r] * s} for {@code t < n}, rows dense from index 0. */
         void run(int n, float[] x, float[] y) {
+            matVec().matmul(weight, x, 0, y, 0, n);
+            finish(n, x, y);
+        }
+
+        /**
+         * {@link #run} of two projections of one input, {@code a} into {@code ya} and {@code b} into {@code yb}, with
+         * both products in one {@link CpuMatVec#matmulGroup} loop when they share a matvec; the outputs are those
+         * of two {@code run} calls.
+         */
+        static void runPair(Projection a, Projection b, int n, float[] x, float[] ya, float[] yb) {
+            CpuMatVec mv = a.matVec();
+            if (mv != b.matVec()) {
+                a.run(n, x, ya);
+                b.run(n, x, yb);
+                return;
+            }
+            mv.matmulGroup(new CpuTensorRef[] {a.weight, b.weight}, x, 0, new float[][] {ya, yb}, n);
+            a.finish(n, x, ya);
+            b.finish(n, x, yb);
+        }
+
+        /** The matvec of this projection: the output scale folds into it unless a bias or a delta precedes it. */
+        private CpuMatVec matVec() {
+            return postScale() ? unscaled : scaled;
+        }
+
+        private boolean postScale() {
+            return scale != 1.0f && (bias != null || !deltas.isEmpty());
+        }
+
+        /** The deltas, the bias and the post-scale of {@link #run} after the product. */
+        private void finish(int n, float[] x, float[] y) {
             boolean hasDeltas = !deltas.isEmpty();
-            boolean postScale = scale != 1.0f && (bias != null || hasDeltas);
-            (postScale ? unscaled : scaled).matmul(weight, x, 0, y, 0, n);
+            boolean postScale = postScale();
             if (hasDeltas) {
                 deltas.apply(n, x, 0, cols, y, 0, rows);
             }

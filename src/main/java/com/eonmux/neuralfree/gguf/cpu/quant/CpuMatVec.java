@@ -8,8 +8,10 @@ import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.quant.InputTransform;
 import com.eonmux.neuralfree.gguf.quant.TapProduct;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -29,14 +31,20 @@ import java.util.Set;
  *   <li>quantized once into the weight type's {@code vec_dot_type} ({@link CpuActivationQuantizer});</li>
  *   <li>dotted with every requested weight row by the type's {@link CpuVecDot} — the {@link CpuSimd} kernel when
  *       this JVM offers one, or a weight's {@link MatvecPlan} when the instance's {@link KernelSource} has one
- *       ({@code CpuWeights} binds repacked weights there); a product of several tokens goes through
- *       {@link CpuVecDot#dotTiles}, so a kernel that multiplies a register tile of rows and tokens reuses each
- *       decoded weight block and each widened activation block across the tile;</li>
+ *       ({@code CpuWeights} binds repacked weights there); a product of several tokens lays its activations out
+ *       once ({@link CpuVecDot#prepareTiles}) and goes through {@link CpuVecDot#dotTiles}, so a kernel that
+ *       multiplies a register tile of rows and tokens reuses each decoded weight block and each widened
+ *       activation block across the tile;</li>
  * </ol>
  * and the outputs are multiplied by the weight's output scale {@code w_s} when it has one (per tensor, or per expert
- * for 3-D expert tensors; llama-graph.cpp:1643-1645, 1722-1729). Work is sharded on weight rows over
- * {@link CpuParallel}, so every row is read once per call whatever the token count. The input the caller hands over
- * is never modified: a transform that acts in place (ACT_QUANT) works on this call's scratch.</p>
+ * for 3-D expert tensors; llama-graph.cpp:1643-1645, 1722-1729). Work runs over {@link CpuParallel} as the tasks of
+ * a {@link CpuTaskGrid}: row chunks for one token; row chunks times cache-sized token panels for several, so a
+ * task's activations stay in cache while its weight rows stream through and each row is read once per panel. A
+ * batch larger than one token slab ({@link CpuTaskGrid#slabTokens}) runs slab after slab, so the prepared layout
+ * stays bounded whatever the batch size.
+ * {@link #matmulGroup} runs the products of several weights that read one input in one loop. The grid never
+ * changes a value. The input the caller hands over is never modified: a transform that acts in place (ACT_QUANT)
+ * works on this call's scratch.</p>
  *
  * <p>Transforms are looked up per weight through the {@link TransformSource} the instance was built with
  * ({@code CpuWeights} binds the loaded {@link InputTransform} results and the {@code .scale} tensors of the model);
@@ -47,9 +55,6 @@ import java.util.Set;
  * {@code w.cols()} values; its output row starts at {@code y[yOff + t*yStride]}.</p>
  */
 public final class CpuMatVec {
-
-    /** Multiply-accumulates per parallel task below which rows are not split further. */
-    private static final long MIN_TASK_WORK = 1L << 15;
 
     /** Vec-dot kernel of every weight type the CPU supports. */
     private static final Map<GGMLType, CpuVecDot> VEC_DOTS = buildVecDots();
@@ -427,6 +432,141 @@ public final class CpuMatVec {
         run(w, 0L, rowCount(w), x, xOff, xStride, y, yOff, yStride, nTokens, false);
     }
 
+    /**
+     * The products of several weights with one input in one parallel loop: {@code ys[i][t*R_i + r] = sum_c
+     * ws[i][r][c] * x[xOff + t*cols + c]} for {@code t < nTokens} and every row {@code r < R_i} of {@code ws[i]},
+     * exactly the values of {@code matmul(ws[i], x, xOff, ys[i], 0, nTokens)} for each {@code i}. The weights read
+     * the same input, so when none has an input transform it is quantized once per activation type and the tiled
+     * kernels' layout is built once per kernel and token slab ({@link CpuTaskGrid#slabTokens}), and the row and
+     * token tasks of every weight run as one loop per slab instead of one loop per weight: the Q/K/V projections or
+     * the gate and up projections of a layer then cost one fork/join and one quantization. A weight with an input
+     * transform makes every weight run its own product.
+     * The {@link InputObserver} sees each weight's input once, as separate products would show it.
+     *
+     * @throws IllegalArgumentException when the weights disagree on their column count, the arrays differ in
+     *                                  length, or a view exceeds its array
+     */
+    public void matmulGroup(CpuTensorRef[] ws, float[] x, int xOff, float[][] ys, int nTokens) {
+        Objects.requireNonNull(ws, "weights");
+        Objects.requireNonNull(ys, "outputs");
+        Objects.requireNonNull(x, "x");
+        if (ws.length != ys.length) {
+            throw new IllegalArgumentException(ws.length + " weights for " + ys.length + " outputs");
+        }
+        if (ws.length == 0) {
+            return;
+        }
+        int cols = toInt(Objects.requireNonNull(ws[0], "weight 0").cols(), ws[0]);
+        boolean shared = true;
+        for (int i = 0; i < ws.length; i++) {
+            CpuTensorRef w = Objects.requireNonNull(ws[i], "weight " + i);
+            Objects.requireNonNull(ys[i], "output " + i);
+            if (w.cols() != cols) {
+                throw new IllegalArgumentException("grouped weights read one input: " + w + " has " + w.cols()
+                        + " columns, " + ws[0] + " has " + cols);
+            }
+            shared &= transformsOf(w).transform().isIdentity();
+        }
+        if (!shared || ws.length == 1) {
+            for (int i = 0; i < ws.length; i++) {
+                matmul(ws[i], x, xOff, ys[i], 0, nTokens);
+            }
+            return;
+        }
+        for (int i = 0; i < ws.length; i++) {
+            int rows = rowCount(ws[i]);
+            checkTokens(nTokens, cols, cols, rows, rows);
+            checkView("output", ys[i], 0, rows, nTokens, rows);
+        }
+        checkView("input", x, xOff, cols, nTokens, cols);
+        if (nTokens == 0) {
+            return;
+        }
+        Map<GGMLType, QuantizedActivations[]> acts = new EnumMap<>(GGMLType.class);
+        GGMLType[] actType = new GGMLType[ws.length];
+        CpuTensorRef[] views = new CpuTensorRef[ws.length];
+        CpuVecDot[] dots = new CpuVecDot[ws.length];
+        int align = 1;
+        for (int i = 0; i < ws.length; i++) {
+            CpuTensorRef w = ws[i];
+            int rows = rowCount(w);
+            if (rows == 0) {
+                continue;
+            }
+            InputObserver observer = askedObserver(w, false, nTokens);
+            if (observer != null) {
+                observer.observe(w, 0L, rows, transformsOf(w).experts(), x, xOff, cols, cols, nTokens);
+            }
+            actType[i] = CpuActivationQuantizer.activationType(w.type());
+            if (!acts.containsKey(actType[i])) {
+                acts.put(actType[i], quantizeRows(w.type(), x, xOff, cols, cols, nTokens));
+            }
+            MatvecPlan plan = kernels != null ? kernels.planOf(w) : null;
+            views[i] = plan != null ? plan.weight : w;
+            dots[i] = plan != null ? plan.kernel : vecDot(w.type());
+            align = lcm(align, dots[i].tileTokens());
+        }
+        int slab = nTokens == 1 ? 1 : CpuTaskGrid.slabTokens(cols, align);
+        for (int t0 = 0; t0 < nTokens; t0 += slab) {
+            runGroupSlab(ws, views, dots, actType, acts, ys, t0, Math.min(slab, nTokens - t0));
+        }
+    }
+
+    /**
+     * Tokens {@code [t0, t0 + n)} of a grouped product as one parallel loop: each kernel's prepared layout of the
+     * slab is built once and shared by the weights that use it.
+     */
+    private void runGroupSlab(CpuTensorRef[] ws, CpuTensorRef[] views, CpuVecDot[] dots, GGMLType[] actType,
+                              Map<GGMLType, QuantizedActivations[]> acts, float[][] ys, int t0, int n) {
+        Map<GGMLType, QuantizedActivations[]> parts = new EnumMap<>(GGMLType.class);
+        Map<CpuVecDot, CpuVecDot.TileActivations> tiles = new IdentityHashMap<>();
+        Product[] products = new Product[ws.length];
+        int[] start = new int[ws.length + 1];
+        for (int i = 0; i < ws.length; i++) {
+            if (dots[i] == null) {
+                start[i + 1] = start[i];
+                continue;
+            }
+            CpuTensorRef w = ws[i];
+            int rows = rowCount(w);
+            QuantizedActivations[] a = parts.computeIfAbsent(actType[i], k -> slice(acts.get(k), t0, n));
+            CpuVecDot dot = dots[i];
+            CpuVecDot.TileActivations tile = null;
+            if (n > 1) {
+                tile = tiles.get(dot);
+                if (tile == null && !tiles.containsKey(dot)) {
+                    tile = dot.prepareTiles(a, n);
+                    tiles.put(dot, tile);
+                }
+            }
+            Transforms t = transformsOf(w);
+            long perExpert = t.experts() > 0 ? w.rows() / t.experts() : 0L;
+            products[i] = new Product(views[i], dot, t, perExpert, 0L, rows, a, tile, ys[i], t0 * rows, rows, false);
+            start[i + 1] = start[i] + products[i].grid.tasks();
+        }
+        CpuParallel.parallelFor(start[ws.length], 1, (from, to) -> {
+            int i = 0;
+            for (int task = from; task < to; task++) {
+                while (task >= start[i + 1]) {
+                    i++;
+                }
+                products[i].run(task - start[i]);
+            }
+        });
+    }
+
+    /** The least common multiple of two positive token alignments. */
+    private static int lcm(int a, int b) {
+        int x = a;
+        int y = b;
+        while (y != 0) {
+            int r = x % y;
+            x = y;
+            y = r;
+        }
+        return Math.multiplyExact(a / x, b);
+    }
+
     // ------------------------------------------------------------------ core
 
     private void run(CpuTensorRef w, long rowStart, int rowCount, float[] x, int xOff, int xStride,
@@ -477,27 +617,103 @@ public final class CpuMatVec {
         int observedExperts = t.experts() > 0 ? t.experts() : nExpert;
         QuantizedActivations[] acts = prepare(w, rowStart, rowCount, observedExperts, nExpert > 0, w.type(),
                 transform, actExpert, x, xOff, xStride, cols, nTokens);
-        int grain = (int) Math.max(1L, MIN_TASK_WORK / ((long) cols * nTokens));
-        CpuParallel.parallelFor(rowCount, grain, (from, to) -> {
-            int n = to - from;
-            if (!accumulate && !t.hasScale()) {
-                if (nTokens == 1) {
-                    dot.dotRows(wv, rowStart + from, n, acts[0], y, yOff + from);
-                } else {
-                    dot.dotTiles(wv, rowStart + from, n, acts, nTokens, y, yOff + from, yStride);
+        int slab = nTokens == 1 ? 1 : CpuTaskGrid.slabTokens(cols, dot.tileTokens());
+        for (int t0 = 0; t0 < nTokens; t0 += slab) {
+            QuantizedActivations[] part = slice(acts, t0, Math.min(slab, nTokens - t0));
+            Product p = new Product(wv, dot, t, perExpert, rowStart, rowCount, part,
+                    part.length > 1 ? dot.prepareTiles(part, part.length) : null, y, yOff + t0 * yStride, yStride,
+                    accumulate);
+            CpuParallel.parallelFor(p.grid.tasks(), 1, (from, to) -> {
+                for (int task = from; task < to; task++) {
+                    p.run(task);
                 }
-                return;
+            });
+        }
+    }
+
+    /**
+     * Tokens of one slab of a batched product of {@code dot} over {@code cols} columns
+     * ({@link CpuTaskGrid#slabTokens}): a caller that prepares {@link CpuVecDot#prepareTiles} layouts for many
+     * tokens keeps each to this many, so the layout memory stays bounded. A multiple of {@code dot}'s
+     * {@link CpuVecDot#tileTokens}.
+     *
+     * @throws IllegalArgumentException for a non-positive column count
+     */
+    public static int tokenSlab(int cols, CpuVecDot dot) {
+        return CpuTaskGrid.slabTokens(cols, Objects.requireNonNull(dot, "dot").tileTokens());
+    }
+
+    /** Tokens {@code [from, from + n)} of {@code acts}: the array itself when that is all of it. */
+    private static QuantizedActivations[] slice(QuantizedActivations[] acts, int from, int n) {
+        return from == 0 && n == acts.length ? acts : Arrays.copyOfRange(acts, from, from + n);
+    }
+
+    /**
+     * One weight's share of a parallel product: its kernel and view, its quantized (and, for a batched product,
+     * prepared) activations, its output and the {@link CpuTaskGrid} of its tasks. A task runs the plain product
+     * straight into the output, or, for a scaled or accumulating product, into a scratch it then multiplies by the
+     * output scale and stores or adds ({@code v = dot * scale(row)}, {@code y = accumulate ? y + v : v}), the same
+     * two float operations for one token or a tile of them. Immutable.
+     */
+    private static final class Product {
+        final CpuTaskGrid grid;
+        private final CpuTensorRef wv;
+        private final CpuVecDot dot;
+        private final Transforms t;
+        private final long perExpert;
+        private final long rowStart;
+        private final QuantizedActivations[] acts;
+        private final CpuVecDot.TileActivations tiles;
+        private final float[] y;
+        private final int yOff;
+        private final int yStride;
+        private final boolean accumulate;
+        private final boolean plain;
+
+        Product(CpuTensorRef wv, CpuVecDot dot, Transforms t, long perExpert, long rowStart, int rowCount,
+                QuantizedActivations[] acts, CpuVecDot.TileActivations tiles, float[] y, int yOff, int yStride,
+                boolean accumulate) {
+            this.wv = wv;
+            this.dot = dot;
+            this.t = t;
+            this.perExpert = perExpert;
+            this.rowStart = rowStart;
+            this.acts = acts;
+            this.tiles = tiles;
+            this.y = y;
+            this.yOff = yOff;
+            this.yStride = yStride;
+            this.accumulate = accumulate;
+            this.plain = !accumulate && !t.hasScale();
+            this.grid = CpuTaskGrid.of(rowCount, acts.length, toInt(wv.cols(), wv), wv.rowBytes(),
+                    tiles == null ? 1 : dot.tileTokens(), CpuParallel.parallelism());
+        }
+
+        void run(int task) {
+            int r0 = grid.rowStart(task);
+            int nr = grid.rows(task);
+            int t0 = grid.tokenStart(task);
+            int nt = grid.tokens(task);
+            int out = yOff + t0 * yStride + r0;
+            float[] dst = plain ? y : new float[Math.multiplyExact(nt, nr)];
+            int dstOff = plain ? out : 0;
+            int dstStride = plain ? yStride : nr;
+            if (acts.length == 1) {
+                dot.dotRows(wv, rowStart + r0, nr, acts[0], dst, dstOff);
+            } else {
+                dot.dotTiles(wv, rowStart + r0, nr, tiles, acts, t0, nt, dst, dstOff, dstStride);
             }
-            float[] tmp = new float[n];
-            for (int tok = 0; tok < nTokens; tok++) {
-                int yBase = yOff + tok * yStride + from;
-                dot.dotRows(wv, rowStart + from, n, acts[tok], tmp, 0);
-                for (int i = 0; i < n; i++) {
-                    float v = tmp[i] * rowScale(t, perExpert, rowStart + from + i);
-                    y[yBase + i] = accumulate ? y[yBase + i] + v : v;
+            if (!plain) {
+                for (int tok = 0; tok < nt; tok++) {
+                    int yBase = out + tok * yStride;
+                    int tBase = tok * nr;
+                    for (int i = 0; i < nr; i++) {
+                        float v = dst[tBase + i] * rowScale(t, perExpert, rowStart + r0 + i);
+                        y[yBase + i] = accumulate ? y[yBase + i] + v : v;
+                    }
                 }
             }
-        });
+        }
     }
 
     /**

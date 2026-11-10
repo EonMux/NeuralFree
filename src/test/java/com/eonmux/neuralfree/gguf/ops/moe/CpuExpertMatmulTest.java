@@ -15,6 +15,7 @@ import java.util.Random;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 /**
  * {@link CpuExpertMatmul} against per-pair {@link CpuMatVec#matvecExpert} products: the counting-sort grouping, and
@@ -75,6 +76,27 @@ public class CpuExpertMatmulTest {
             row += shardRows[i];
         }
         return new CpuTensorRef(GGMLType.Q8_0, shards, offsets, rows, cols, rowBytes);
+    }
+
+    /**
+     * K-quant rows (Q4_K or Q6_K super-blocks of random bytes) whose F16 scales are small finite values, so every
+     * row dots to a finite value.
+     */
+    private static CpuTensorRef kQuant(GGMLType type, int rows, int cols, long seed) {
+        Random rnd = new Random(seed);
+        int blockBytes = type == GGMLType.Q4_K ? 144 : 210;
+        int[] halves = type == GGMLType.Q4_K ? new int[]{0, 2} : new int[]{208};
+        int blocks = rows * (cols / 256);
+        byte[] b = new byte[blocks * blockBytes];
+        rnd.nextBytes(b);
+        for (int k = 0; k < blocks; k++) {
+            for (int h : halves) {
+                short half = HALF_SCALES[rnd.nextInt(HALF_SCALES.length)];
+                b[k * blockBytes + h] = (byte) half;
+                b[k * blockBytes + h + 1] = (byte) (half >> 8);
+            }
+        }
+        return CpuTensorRef.of(type, ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN), rows, cols);
     }
 
     /** The reference: one {@link CpuMatVec#matvecExpert} per pair. */
@@ -172,6 +194,112 @@ public class CpuExpertMatmulTest {
         float[] x = random(n * cols, 11L);
         assertEquals(perExpert * nExpert, w.rows());
         assertArrayEquals(perPair(mv, w, nExpert, ids, n * k, x, k), grouped(mv, w, nExpert, ids, n * k, x, k), 0f);
+    }
+
+    /**
+     * K-quant experts through the batched tile kernels: one expert holds more pairs than a pair block and more rows
+     * than a row tile, another a single pair, and the outputs equal one product per pair bit for bit.
+     */
+    @Test
+    public void kQuantExpertsMatchPerPairProductsThroughTheTileKernels() {
+        int nExpert = 4;
+        int perExpert = 70;
+        int cols = 512;
+        int n = 20;
+        int k = 2;
+        int[] ids = new int[n * k];
+        for (int t = 0; t < n; t++) {
+            ids[t * k] = 1;
+            ids[t * k + 1] = t == 3 ? 0 : 2 + t % 2;
+        }
+        float[] x = random(n * cols, 31L);
+        for (GGMLType type : new GGMLType[]{GGMLType.Q4_K, GGMLType.Q6_K}) {
+            CpuTensorRef w = kQuant(type, nExpert * perExpert, cols, 17L + type.ordinal());
+            CpuMatVec mv = CpuMatVec.PLAIN;
+            assertArrayEquals(type.toString(), perPair(mv, w, nExpert, ids, n * k, x, k),
+                    grouped(mv, w, nExpert, ids, n * k, x, k), 0f);
+        }
+    }
+
+    /**
+     * The parts of a grouped product hold at most one slab of one expert's pairs, start on slab multiples within
+     * their expert, cover every pair once in pair order, and the passes hold at most one slab of pairs each.
+     */
+    @Test
+    public void partsAndPassesBoundThePreparedLayoutsToOneSlab() {
+        int nExpert = 5;
+        int[] ids = new int[100];
+        for (int p = 0; p < ids.length; p++) {
+            ids[p] = p < 70 ? 1 : p < 75 ? 3 : p % 2 == 0 ? 0 : 4;
+        }
+        CpuExpertMatmul.Groups g = CpuExpertMatmul.Groups.of(ids, ids.length, nExpert);
+        int slab = 16;
+        CpuExpertMatmul.Parts parts = CpuExpertMatmul.Parts.of(g, slab);
+        int[] seen = new int[ids.length];
+        int last = -1;
+        for (int i = 0; i < parts.count.length; i++) {
+            int a = parts.slot[i];
+            assertTrue("part " + i + " holds " + parts.count[i], parts.count[i] >= 1 && parts.count[i] <= slab);
+            assertEquals("part " + i + " starts on a slab", 0, (parts.first[i] - g.start[a]) % slab);
+            for (int k = 0; k < parts.count[i]; k++) {
+                int q = parts.first[i] + k;
+                assertTrue(q > last);
+                last = q;
+                seen[g.order[q]]++;
+                assertEquals(g.active[a], ids[g.order[q]]);
+            }
+        }
+        for (int p = 0; p < ids.length; p++) {
+            assertEquals("pair " + p, 1, seen[p]);
+        }
+        assertEquals(0, parts.passStart[0]);
+        assertEquals(parts.count.length, parts.passStart[parts.passes()]);
+        for (int pass = 0; pass < parts.passes(); pass++) {
+            int pairs = 0;
+            for (int i = parts.passStart[pass]; i < parts.passStart[pass + 1]; i++) {
+                pairs += parts.count[i];
+            }
+            assertTrue("pass " + pass + " holds " + pairs + " pairs", pairs >= 1 && pairs <= slab);
+        }
+    }
+
+    /**
+     * An expert routed more pairs than one token slab ({@link CpuMatVec#tokenSlab}) runs over several parts and
+     * passes with the per-pair products' values.
+     */
+    @Test
+    public void anExpertWithMorePairsThanOneSlabMatchesPerPairProducts() {
+        int nExpert = 2;
+        int perExpert = 2;
+        int cols = 1 << 16;
+        CpuTensorRef w = kQuant(GGMLType.Q4_K, nExpert * perExpert, cols, 61L);
+        CpuMatVec mv = CpuMatVec.PLAIN;
+        int slab = CpuMatVec.tokenSlab(cols, CpuMatVec.vecDot(GGMLType.Q4_K));
+        int pairs = slab + 44 + 20;
+        int[] ids = new int[pairs];
+        int[] srcRows = new int[pairs];
+        for (int p = 0; p < pairs; p++) {
+            ids[p] = p < slab + 44 ? 0 : 1;
+            srcRows[p] = p % 4;
+        }
+        CpuExpertMatmul.Groups g = CpuExpertMatmul.Groups.of(ids, pairs, nExpert);
+        CpuExpertMatmul.Parts parts = CpuExpertMatmul.Parts.of(g, cols, CpuMatVec.vecDot(GGMLType.Q4_K));
+        assertEquals("expert 0 in two parts, expert 1 in one", 3, parts.count.length);
+        for (int pass = 0; pass < parts.passes(); pass++) {
+            int inPass = 0;
+            for (int i = parts.passStart[pass]; i < parts.passStart[pass + 1]; i++) {
+                inPass += parts.count[i];
+            }
+            assertTrue("pass " + pass + " prepares " + inPass + " pairs", inPass <= slab);
+        }
+        float[] x = random(4 * cols, 63L);
+        float[] y = new float[pairs * perExpert];
+        new CpuExpertMatmul(mv).run(w, nExpert, g, x, 0, srcRows, y, 0);
+        for (int p = 0; p < pairs; p++) {
+            float[] ref = new float[perExpert];
+            mv.matvecExpert(w, ids[p], nExpert, x, srcRows[p] * cols, ref, 0);
+            assertArrayEquals("pair " + p, ref, Arrays.copyOfRange(y, p * perExpert, (p + 1) * perExpert), 0f);
+        }
     }
 
     /** Pair-row input (every pair its own row) on F32 weights, with a token that picks one expert twice. */

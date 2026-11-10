@@ -55,6 +55,34 @@ final class CpuLists {
         return out;
     }
 
+    /** {@code cpus} (in increasing order) as a cpulist, ranges joined: {@code "0-7,16"}; {@code "none"} when empty. */
+    static String format(int[] cpus) {
+        if (cpus.length == 0) {
+            return "none";
+        }
+        StringBuilder sb = new StringBuilder();
+        int first = cpus[0];
+        int last = first;
+        for (int i = 1; i <= cpus.length; i++) {
+            if (i < cpus.length && cpus[i] == last + 1) {
+                last = cpus[i];
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(first);
+            if (last != first) {
+                sb.append('-').append(last);
+            }
+            if (i < cpus.length) {
+                first = cpus[i];
+                last = first;
+            }
+        }
+        return sb.toString();
+    }
+
     private static int cpu(String text, String whole) {
         try {
             int cpu = Integer.parseInt(text.trim());

@@ -25,7 +25,7 @@ import static org.junit.Assert.assertTrue;
  * ALiBi slopes, T5 buckets, causal and the three window kinds, fully masked rows, ring caches through
  * {@link KvAccessor}, MLA latent aliasing, the multi-row form, the tree mask of a verify step against the reference
  * and the rows' sequential root paths, ranges spanning several key blocks and head chunks, and the key splits of
- * decode rows with their combine.
+ * decode rows with their combine, and the query blocks of prefill-sized calls.
  */
 public class CpuAttentionCoreTest {
 
@@ -299,6 +299,64 @@ public class CpuAttentionCoreTest {
             for (int i = 0; i < one.length; i++) {
                 assertEquals(one[i], many[t * outStride + i], 0.0f);
             }
+        }
+    }
+
+    /**
+     * A prefill-sized call attends its query rows in blocks ({@link CpuAttentionCore#queryBlock}), each key and value
+     * row read once per block; every row equals its own single-row call bit for bit across two key blocks, with a
+     * causal tail, ALiBi bias, sinks and FP8 dequant scales, and under a tree mask over the fresh rows.
+     */
+    @Test
+    public void queryBlocksMatchSingleRowCallsBitForBit() {
+        int keys = 300;
+        int workers = com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel.parallelism();
+        int nTokens = CpuAttentionCore.QUERY_BLOCK * CpuAttentionCore.UNITS_PER_WORKER * workers / N_HEAD_KV + 5;
+        assertEquals("the call blocks its rows fully", CpuAttentionCore.QUERY_BLOCK,
+                CpuAttentionCore.queryBlock((long) nTokens * N_HEAD_KV, workers));
+        Random rnd = new Random(0xB10C);
+        float[] k = randomArray(rnd, keys * N_HEAD_KV * D_K);
+        float[] v = randomArray(rnd, keys * N_HEAD_KV * D_V);
+        int[] pos = new int[keys];
+        for (int i = 0; i < keys; i++) {
+            pos[i] = i;
+        }
+        CpuAttentionCore.DenseKv kv = CpuAttentionCore.DenseKv.of(k, 0, N_HEAD_KV * D_K, D_K, v, 0, N_HEAD_KV * D_V,
+                D_V, N_HEAD_KV, D_K, D_V, pos, 0);
+        float[] q = randomArray(rnd, nTokens * N_HEAD * D_K);
+        int[] qPos = new int[nTokens];
+        for (int t = 0; t < nTokens; t++) {
+            qPos[t] = (int) ((long) t * (keys + 20) / nTokens);
+        }
+        long[] mask = new long[nTokens];
+        for (int t = 0; t < nTokens; t++) {
+            mask[t] = rnd.nextLong() | 1L;
+        }
+        CpuAttentionCore.Params p = CpuAttentionCore.Params.builder(N_HEAD).scale(0.3f).alibi(8.0f)
+                .sinks(new float[]{0.2f, 0.4f, -0.3f, 1.0f})
+                .kvScales(new float[]{0.5f, 1.5f}, new float[]{2.0f, 0.25f}).build();
+        int qStride = N_HEAD * D_K;
+        int outStride = N_HEAD * D_V + 1;
+        for (CpuAttentionCore.TreeMask tree : new CpuAttentionCore.TreeMask[]{null,
+                new CpuAttentionCore.TreeMask(mask, 40)}) {
+            float[] many = new float[nTokens * outStride];
+            float[] one = new float[nTokens * outStride];
+            if (tree == null) {
+                CpuAttentionCore.attendRows(p, nTokens, q, 0, qStride, qPos, 0, kv, 0, keys, many, 0, outStride);
+            } else {
+                CpuAttentionCore.attendRows(p, nTokens, q, 0, qStride, qPos, 0, kv, 0, keys, many, 0, outStride,
+                        tree);
+            }
+            for (int t = 0; t < nTokens; t++) {
+                if (tree == null) {
+                    CpuAttentionCore.attendRows(p, 1, q, t * qStride, qStride, qPos, t, kv, 0, keys, one,
+                            t * outStride, outStride);
+                } else {
+                    CpuAttentionCore.attendRows(p, 1, q, t * qStride, qStride, qPos, t, kv, 0, keys, one,
+                            t * outStride, outStride, tree);
+                }
+            }
+            assertArrayEquals(tree == null ? "causal" : "tree mask", one, many, 0.0f);
         }
     }
 

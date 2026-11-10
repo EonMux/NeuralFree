@@ -24,6 +24,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -115,7 +116,7 @@ public class SimdVecDotTest {
     }
 
     /** Random blocks with finite, moderate scales, one row of {@code cols} elements per row index. */
-    private static ByteBuffer randomRows(GGMLType t, int rows, int cols, Random rnd) {
+    static ByteBuffer randomRows(GGMLType t, int rows, int cols, Random rnd) {
         BlockLayout layout = BlockLayout.of(t);
         int blocks = rows * (cols / layout.blockElements());
         byte[] raw = new byte[blocks * layout.blockBytes()];
@@ -170,7 +171,7 @@ public class SimdVecDotTest {
         }
     }
 
-    private static float[] gaussian(int n, Random rnd) {
+    static float[] gaussian(int n, Random rnd) {
         float[] x = new float[n];
         for (int i = 0; i < n; i++) {
             x[i] = (float) rnd.nextGaussian();
@@ -265,6 +266,65 @@ public class SimdVecDotTest {
         }
     }
 
+    /**
+     * The prepared layout of the token-tile kernels (Q8_0, Q4_K, Q6_K) is built once and serves every tile-aligned
+     * token range and every row range with the row loop's values, a null layout falls back to the activation rows,
+     * and misaligned starts or a layout of another width are rejected by name.
+     */
+    @Test
+    public void preparedTilesServeEveryTileStartWithTheRowLoopsValues() {
+        Assume.assumeTrue(CpuSimd.available());
+        Random rnd = new Random(0x7A1E5);
+        final int rows = 5;
+        final int cols = 512;
+        final int nTokens = 21;
+        for (GGMLType t : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            CpuTensorRef w = CpuTensorRef.of(t, randomRows(t, rows, cols, rnd), rows, cols);
+            CpuVecDot simd = CpuSimd.vecDot(t);
+            QuantizedActivations[] acts = new QuantizedActivations[nTokens];
+            float[][] expected = new float[nTokens][rows];
+            for (int tok = 0; tok < nTokens; tok++) {
+                acts[tok] = CpuActivationQuantizer.quantizeFor(t, gaussian(cols, rnd), 0, cols);
+                simd.dotRows(w, 0, rows, acts[tok], expected[tok], 0);
+            }
+            CpuVecDot.TileActivations tiles = simd.prepareTiles(acts, nTokens);
+            assertNotNull(t + " layout", tiles);
+            assertEquals(t + " layout tokens", nTokens, tiles.tokens());
+            int step = simd.tileTokens();
+            assertEquals(t + " tile", 8, step);
+            for (int start = 0; start < nTokens; start += step) {
+                for (int n : new int[]{1, step, nTokens - start}) {
+                    for (int r0 = 0; r0 < 2 && n <= nTokens - start; r0++) {
+                        float[] y = new float[n * rows + 1];
+                        simd.dotTiles(w, r0, rows - r0, tiles, acts, start, n, y, 1, rows);
+                        for (int tok = 0; tok < n; tok++) {
+                            for (int r = 0; r < rows - r0; r++) {
+                                assertEquals(t + " tokens [" + start + ", +" + n + "), row " + (r0 + r),
+                                        expected[start + tok][r0 + r], y[1 + tok * rows + r], 0f);
+                            }
+                        }
+                    }
+                }
+            }
+            float[] y = new float[5 * rows];
+            simd.dotTiles(w, 0, rows, null, acts, 3, 5, y, 0, rows);
+            for (int tok = 0; tok < 5; tok++) {
+                for (int r = 0; r < rows; r++) {
+                    assertEquals(t + " without a layout, token " + (3 + tok), expected[3 + tok][r],
+                            y[tok * rows + r], 0f);
+                }
+            }
+            IllegalArgumentException misaligned = assertThrows(IllegalArgumentException.class,
+                    () -> simd.dotTiles(w, 0, rows, tiles, acts, 3, 2, new float[2 * rows], 0, rows));
+            assertTrue(misaligned.getMessage(), misaligned.getMessage().contains("multiple"));
+            int wide = 2 * cols;
+            CpuTensorRef w2 = CpuTensorRef.of(t, randomRows(t, rows, wide, rnd), rows, wide);
+            IllegalArgumentException width = assertThrows(IllegalArgumentException.class,
+                    () -> simd.dotTiles(w2, 0, rows, tiles, acts, 0, 2, new float[2 * rows], 0, rows));
+            assertTrue(width.getMessage(), width.getMessage().contains("cannot be dotted"));
+        }
+    }
+
     @Test
     public void theTiledProductRejectsBadRangesByName() {
         Assume.assumeTrue(CpuSimd.available());
@@ -336,6 +396,47 @@ public class SimdVecDotTest {
             assertEquals(0f, y[rows + 1], 0f);
             for (int r = 0; r < rows; r++) {
                 assertEquals(t + " row " + r, scalar.dotRow(single, r, x), y[r + 1], 0f);
+            }
+        }
+    }
+
+    /**
+     * The prepared token-tile products read rows on both sides of a shard boundary, the boundary inside a two-row
+     * register tile included, with the values of the unsharded tensor.
+     */
+    @Test
+    public void preparedTilesDotRowsAcrossShardsLikeOneBuffer() {
+        Assume.assumeTrue(CpuSimd.available());
+        final int rows = 7;
+        final int cols = 512;
+        final int nTokens = 19;
+        Random rnd = new Random(0x5AD);
+        for (GGMLType t : new GGMLType[]{GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K}) {
+            ByteBuffer whole = randomRows(t, rows, cols, rnd);
+            long rowBytes = BlockLayout.of(t).rowBytes(cols);
+            ByteBuffer first = slice(whole, 0, (int) (3 * rowBytes));
+            ByteBuffer second = slice(whole, (int) (3 * rowBytes), (int) (4 * rowBytes));
+            CpuTensorRef sharded = new CpuTensorRef(t, new ByteBuffer[]{first, second},
+                    new long[]{0L, 3 * rowBytes}, rows, cols, rowBytes);
+            CpuTensorRef single = CpuTensorRef.of(t, whole, rows, cols);
+            CpuVecDot simd = CpuSimd.vecDot(t);
+            QuantizedActivations[] acts = new QuantizedActivations[nTokens];
+            for (int tok = 0; tok < nTokens; tok++) {
+                acts[tok] = CpuActivationQuantizer.quantizeFor(t, gaussian(cols, rnd), 0, cols);
+            }
+            CpuVecDot.TileActivations tiles = simd.prepareTiles(acts, nTokens);
+            for (int r0 : new int[]{0, 1, 2}) {
+                int nr = rows - r0;
+                float[] expected = new float[nTokens * nr];
+                float[] actual = new float[nTokens * nr];
+                simd.dotTiles(single, r0, nr, tiles, acts, 0, nTokens, expected, 0, nr);
+                simd.dotTiles(sharded, r0, nr, tiles, acts, 0, nTokens, actual, 0, nr);
+                assertArrayEquals(t + " rows from " + r0 + " across the shard boundary at row 3", expected, actual);
+                float[] rowLoop = new float[nr];
+                simd.dotRows(single, r0, nr, acts[nTokens - 1], rowLoop, 0);
+                for (int r = 0; r < nr; r++) {
+                    assertEquals(t + " last token, row " + (r0 + r), rowLoop[r], actual[(nTokens - 1) * nr + r], 0f);
+                }
             }
         }
     }

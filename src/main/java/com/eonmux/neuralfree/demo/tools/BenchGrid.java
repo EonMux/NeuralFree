@@ -2,6 +2,7 @@ package com.eonmux.neuralfree.demo.tools;
 
 import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.demo.EngineLoadFlags;
+import com.eonmux.neuralfree.gguf.cpu.numa.CpuThreadPolicy;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
 import com.eonmux.neuralfree.gguf.memory.KvDType;
@@ -96,22 +97,16 @@ final class BenchGrid {
     }
 
     /**
-     * The CPU pool size the runs report when {@code -t} is absent: the {@code neuralfree.cpu.threads} property,
-     * else the machine's processor count, as {@link CpuParallel} sizes its pool.
+     * The CPU pool size the runs report when {@code -t} is absent: the size {@link CpuParallel#threadCount()} gives
+     * the pool, else (an invalid property, which fails when the pool starts) the count of
+     * {@link CpuThreadPolicy#DEFAULT_POLICY} over the host's cores.
      */
     static int defaultThreads() {
-        String v = System.getProperty(CpuParallel.THREADS_PROPERTY);
-        if (v != null && !v.trim().isEmpty()) {
-            try {
-                int n = Integer.parseInt(v.trim());
-                if (n >= 1) {
-                    return n;
-                }
-            } catch (NumberFormatException e) {
-                // an invalid property fails when the pool starts; the report keeps the machine's count
-            }
+        try {
+            return CpuParallel.threadCount();
+        } catch (IllegalArgumentException e) {
+            return CpuThreadPolicy.host().threads(CpuThreadPolicy.DEFAULT_POLICY);
         }
-        return Runtime.getRuntime().availableProcessors();
     }
 
     /**

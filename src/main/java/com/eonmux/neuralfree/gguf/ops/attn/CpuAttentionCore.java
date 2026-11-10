@@ -44,6 +44,10 @@ import java.util.function.IntUnaryOperator;
  * does for one query row (ggml-cpu/ops.cpp:9580-9610): each split keeps its unnormalized online-softmax state
  * {@code (m_i, l_i, o_i)}, and the splits combine to {@code m = max m_i}, {@code l = sum l_i e^(m_i - m)},
  * {@code o = sum o_i e^(m_i - m)} before the sink and the normalization ({@code LLM_FlashAttn_Combine}).
+ *
+ * <p>A multi-row call with enough units attends up to {@link #QUERY_BLOCK} consecutive query rows per unit: each
+ * key and value row is read (and dequantized) once for the block, and every (row, head) keeps its own online-softmax
+ * state and runs the steps of its single-row call, so blocking changes memory traffic, never a result.</p>
  */
 public final class CpuAttentionCore {
     /** Keys scored per block; bounds the score scratch to {@code HEAD_CHUNK * KEY_BLOCK} floats per thread. */
@@ -52,6 +56,10 @@ public final class CpuAttentionCore {
     static final int HEAD_CHUNK = LlmKernelConstants.FD_MAX_G;
     /** Fewest keys for which a call splits its key range across threads (ggml-cpu/ops.cpp:9580-9610). */
     static final int SPLIT_MIN_KEYS = 512;
+    /** Most query rows of a multi-row call one unit attends together, each key and value row read once for all. */
+    static final int QUERY_BLOCK = 8;
+    /** Units per worker a multi-row call keeps when it blocks its query rows, for balance. */
+    static final int UNITS_PER_WORKER = 4;
 
     private CpuAttentionCore() {
     }
@@ -531,10 +539,15 @@ public final class CpuAttentionCore {
         private float[] sum = new float[0];
 
         void ensure(int dK, int dV) {
-            if (scores.length < HEAD_CHUNK * KEY_BLOCK) {
-                scores = new float[HEAD_CHUNK * KEY_BLOCK];
-                max = new float[HEAD_CHUNK];
-                sum = new float[HEAD_CHUNK];
+            ensure(dK, dV, HEAD_CHUNK);
+        }
+
+        /** Room for the online-softmax state of {@code heads} (query row, head) pairs. */
+        void ensure(int dK, int dV, int heads) {
+            if (scores.length < heads * KEY_BLOCK) {
+                scores = new float[heads * KEY_BLOCK];
+                max = new float[heads];
+                sum = new float[heads];
             }
             if (k.length < dK) {
                 k = new float[dK];
@@ -542,8 +555,8 @@ public final class CpuAttentionCore {
             if (v.length < dV) {
                 v = new float[dV];
             }
-            if (acc.length < HEAD_CHUNK * dV) {
-                acc = new float[HEAD_CHUNK * dV];
+            if (acc.length < heads * dV) {
+                acc = new float[heads * dV];
             }
         }
     }
@@ -1057,18 +1070,98 @@ public final class CpuAttentionCore {
                     rowStart, end, out, outOff, outRowStride, lse, lseOff, lseStride, treeBits, freshStart);
             return;
         }
-        CpuParallel.parallelFor((int) units, 1, (from, to) -> {
+        final int qb = queryBlock(units, CpuParallel.parallelism());
+        final int blocks = (nTokens + qb - 1) / qb;
+        CpuParallel.parallelFor(blocks * unitsPerToken, 1, (from, to) -> {
             Scratch scratch = new Scratch();
             for (int u = from; u < to; u++) {
-                final int t = u / unitsPerToken;
-                final int rest = u - t * unitsPerToken;
+                final int tb = u / unitsPerToken;
+                final int rest = u - tb * unitsPerToken;
                 final int kvh = rest / chunks;
                 final int g = (rest - kvh * chunks) * HEAD_CHUNK;
-                attendChunk(p, q, qOff + t * qRowStride, qPos[qPosOff + t], qPosOff + t, view, rowStart, end,
-                        out, outOff + t * outRowStride, scratch, kvh * g0 + g, Math.min(HEAD_CHUNK, g0 - g), kvh,
-                        lse, lse == null ? 0 : lseOff + t * lseStride, treeBits, freshStart);
+                final int t = tb * qb;
+                final int gc = Math.min(HEAD_CHUNK, g0 - g);
+                final int lo = lse == null ? 0 : lseOff + t * lseStride;
+                if (Math.min(qb, nTokens - t) == 1) {
+                    attendChunk(p, q, qOff + t * qRowStride, qPos[qPosOff + t], qPosOff + t, view, rowStart, end,
+                            out, outOff + t * outRowStride, scratch, kvh * g0 + g, gc, kvh, lse, lo, treeBits,
+                            freshStart);
+                } else {
+                    attendBlock(p, Math.min(qb, nTokens - t), q, qOff + t * qRowStride, qRowStride, qPos,
+                            qPosOff + t, view, rowStart, end, out, outOff + t * outRowStride, outRowStride, scratch,
+                            kvh * g0 + g, gc, kvh, lse, lo, lseStride, treeBits, freshStart);
+                }
             }
         });
+    }
+
+    /**
+     * Query rows one unit of a multi-row call attends together: up to {@link #QUERY_BLOCK}, fewer when the
+     * blocks would leave fewer than {@link #UNITS_PER_WORKER} units per worker. Every row's result is the same
+     * whatever the block, so the block changes only how often a key or value row is read.
+     */
+    static int queryBlock(long units, int workers) {
+        long fit = units / ((long) UNITS_PER_WORKER * workers);
+        return (int) Math.max(1L, Math.min(QUERY_BLOCK, fit));
+    }
+
+    /**
+     * {@link #attendChunk} of {@code nt} consecutive query rows (row {@code t} at {@code q[qOff + t * qStride]},
+     * position {@code qPos[qRow0 + t]}, mask row {@code qRow0 + t}) against heads {@code [h0, h0 + gc)}: each key
+     * and value row is read and scaled once for every row of the block, and the state of (row {@code t}, head
+     * {@code g}) sits at index {@code t * gc + g}, so each pair runs exactly the scoring, rescale and accumulation
+     * steps of its single-row call.
+     */
+    private static void attendBlock(Params p, int nt, float[] q, int qOff, int qStride, int[] qPos, int qRow0,
+                                    Rows rows, int rowStart, int rowEnd, float[] out, int outOff, int outStride,
+                                    Scratch s, int h0, int gc, int kvh, float[] lse, int lseOff, int lseStride,
+                                    long[] treeBits, int freshStart) {
+        final int dV = rows.dV();
+        final int heads = nt * gc;
+        s.ensure(rows.dK(), dV, heads);
+        Arrays.fill(s.max, 0, heads, Float.NEGATIVE_INFINITY);
+        Arrays.fill(s.sum, 0, heads, 0.0f);
+        Arrays.fill(s.acc, 0, heads * dV, 0.0f);
+        for (int b = rowStart; b < rowEnd; b += KEY_BLOCK) {
+            final int nb = Math.min(KEY_BLOCK, rowEnd - b);
+            scoreBlockRows(p, nt, q, qOff, qStride, qPos, qRow0, rows, b, nb, s, h0, gc, kvh, treeBits, freshStart);
+            rescaleBlock(s, nb, heads, dV);
+            addValues(p, rows, b, nb, s, heads, kvh, dV);
+        }
+        for (int t = 0; t < nt; t++) {
+            finish(p, s.max, t * gc, s.sum, t * gc, s.acc, t * gc * dV, dV, h0, gc, out, outOff + t * outStride, lse,
+                    lse == null ? 0 : lseOff + t * lseStride);
+        }
+    }
+
+    /** {@link #scoreBlock} of the {@code nt} query rows of {@link #attendBlock}, each key row read once. */
+    private static void scoreBlockRows(Params p, int nt, float[] q, int qOff, int qStride, int[] qPos, int qRow0,
+                                       Rows rows, int b, int nb, Scratch s, int h0, int gc, int kvh,
+                                       long[] treeBits, int freshStart) {
+        final int dK = rows.dK();
+        final float[] sc = s.scores;
+        final float[] kbuf = s.k;
+        for (int r = 0; r < nb; r++) {
+            final int row = b + r;
+            final int pk = rows.pos(row);
+            final boolean sink = rows.sink(row);
+            boolean read = false;
+            for (int t = 0; t < nt; t++) {
+                final int qp = qPos[qRow0 + t];
+                if (!visible(p, row, pk, sink, qp, qRow0 + t, treeBits, freshStart)) {
+                    for (int g = 0; g < gc; g++) {
+                        sc[(t * gc + g) * KEY_BLOCK + r] = Float.NEGATIVE_INFINITY;
+                    }
+                    continue;
+                }
+                if (!read) {
+                    readScaledK(p, rows, row, sink, kvh, kbuf, dK);
+                    read = true;
+                }
+                scoreHeads(p, q, qOff + t * qStride, h0, gc, kbuf, dK, sink, qp, pk, qRow0 + t, sc,
+                        t * gc * KEY_BLOCK + r);
+            }
+        }
     }
 
     /**
@@ -1115,47 +1208,65 @@ public final class CpuAttentionCore {
         final int dK = rows.dK();
         final float[] sc = s.scores;
         final float[] kbuf = s.k;
-        final float[] kScale = p.kScale;
-        final KvWindow window = p.window;
         for (int r = 0; r < nb; r++) {
             final int row = b + r;
             final int pk = rows.pos(row);
             final boolean sink = rows.sink(row);
-            /* A sink token precedes every cached key: its key index is the query's absolute position plus the sink
-             * count, vLLM's seq_lens + sink_len alignment, and it carries no position bias. */
-            final boolean visible;
-            if (sink) {
-                visible = window.causal() ? window.visible(qPos + p.sinkTokens, pk) : true;
-            } else if (treeBits != null && row >= freshStart) {
-                /* A fresh row's visibility is its mask bit alone: siblings share one depth position, which the
-                 * position rules would wrongly make mutually visible. */
-                visible = (treeBits[qRow] >>> (row - freshStart) & 1L) != 0L;
-            } else {
-                visible = window.visible(qPos, pk);
-            }
-            if (!visible) {
+            if (!visible(p, row, pk, sink, qPos, qRow, treeBits, freshStart)) {
                 for (int g = 0; g < gc; g++) {
                     sc[g * KEY_BLOCK + r] = Float.NEGATIVE_INFINITY;
                 }
                 continue;
             }
-            rows.readK(row, kvh, kbuf);
-            /* The sink keys are parameters, not cache rows: an FP8 cache's dequant scale does not apply. */
-            if (kScale != null && !sink) {
-                final float ks = kScale[kvh];
-                for (int d = 0; d < dK; d++) {
-                    kbuf[d] *= ks;
-                }
+            readScaledK(p, rows, row, sink, kvh, kbuf, dK);
+            scoreHeads(p, q, qOff, h0, gc, kbuf, dK, sink, qPos, pk, qRow, sc, r);
+        }
+    }
+
+    /**
+     * {@code sc[g * KEY_BLOCK + at]} for heads {@code [h0, h0 + gc)} of the query row at {@code q[qOff]}:
+     * the scaled, soft-capped dot with key {@code kbuf} plus the position bias (none for a sink key).
+     */
+    private static void scoreHeads(Params p, float[] q, int qOff, int h0, int gc, float[] kbuf, int dK, boolean sink,
+                                   int qPos, int pk, int qRow, float[] sc, int at) {
+        for (int g = 0; g < gc; g++) {
+            final int h = h0 + g;
+            final int qb = qOff + h * dK;
+            float dot = 0.0f;
+            for (int d = 0; d < dK; d++) {
+                dot += q[qb + d] * kbuf[d];
             }
-            for (int g = 0; g < gc; g++) {
-                final int h = h0 + g;
-                final int qb = qOff + h * dK;
-                float dot = 0.0f;
-                for (int d = 0; d < dK; d++) {
-                    dot += q[qb + d] * kbuf[d];
-                }
-                sc[g * KEY_BLOCK + r] = score(dot, p.scale, p.softcap)
-                        + (sink ? 0.0f : p.bias(h, qPos, pk, qRow));
+            sc[g * KEY_BLOCK + at] = score(dot, p.scale, p.softcap) + (sink ? 0.0f : p.bias(h, qPos, pk, qRow));
+        }
+    }
+
+    /**
+     * Whether the query row at {@code qPos} (mask row {@code qRow}) sees key row {@code row} at position {@code pk}.
+     * A sink token precedes every cached key: its key index is the query's absolute position plus the sink count,
+     * vLLM's seq_lens + sink_len alignment. Under a tree mask a fresh row's visibility is its mask bit alone:
+     * siblings share one depth position, which the position rules would wrongly make mutually visible.
+     */
+    private static boolean visible(Params p, int row, int pk, boolean sink, int qPos, int qRow, long[] treeBits,
+                                   int freshStart) {
+        if (sink) {
+            return !p.window.causal() || p.window.visible(qPos + p.sinkTokens, pk);
+        }
+        if (treeBits != null && row >= freshStart) {
+            return (treeBits[qRow] >>> (row - freshStart) & 1L) != 0L;
+        }
+        return p.window.visible(qPos, pk);
+    }
+
+    /**
+     * Reads K head {@code kvh} of {@code row} into {@code kbuf} with an FP8 cache's dequant scale; the sink keys
+     * are parameters, not cache rows, so the scale does not apply to them.
+     */
+    private static void readScaledK(Params p, Rows rows, int row, boolean sink, int kvh, float[] kbuf, int dK) {
+        rows.readK(row, kvh, kbuf);
+        if (p.kScale != null && !sink) {
+            final float ks = p.kScale[kvh];
+            for (int d = 0; d < dK; d++) {
+                kbuf[d] *= ks;
             }
         }
     }

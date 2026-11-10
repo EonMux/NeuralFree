@@ -91,6 +91,42 @@ final class CpuVecDotRows {
         return bufs;
     }
 
+    /**
+     * A reader of the rows of one tensor for one row loop: it resolves the shard of a row only when the row leaves
+     * the shard read last and keeps its own duplicate of that shard, where {@link #copyRow} binary-searches the
+     * shard and looks the thread's cursor up for every row. Not thread-safe; a row loop creates its own.
+     */
+    static RowReader reader(CpuTensorRef w) {
+        return new RowReader(w);
+    }
+
+    /** See {@link #reader}. */
+    static final class RowReader {
+        private final CpuTensorRef w;
+        private final int rowBytes;
+        private ByteBuffer copy;
+        private long shardStart;
+        private long shardEnd;
+
+        private RowReader(CpuTensorRef w) {
+            this.w = w;
+            this.rowBytes = (int) Math.min(w.rowBytes(), Integer.MAX_VALUE);
+            this.shardEnd = -1;
+        }
+
+        /** Copies {@code row} into {@code dst} at index 0, exactly as {@link CpuVecDotRows#copyRow} does. */
+        void copy(long row, byte[] dst) {
+            if (row < shardStart || row >= shardEnd) {
+                int s = w.shardIndex(row);
+                shardStart = w.shardRowStart(s);
+                shardEnd = shardStart + w.shardRows(s);
+                copy = w.rowBuffer(row).duplicate();
+            }
+            copy.position((int) ((row - shardStart) * rowBytes));
+            copy.get(dst, 0, rowBytes);
+        }
+    }
+
     /** Copies {@code row} of {@code w} into {@code dst} at index 0. */
     static void copyRow(CpuTensorRef w, long row, byte[] dst) {
         int s = w.shardIndex(row);
@@ -121,6 +157,28 @@ final class CpuVecDotRows {
         if (yOff < 0 || yOff > y.length - rowCount) {
             throw new IndexOutOfBoundsException("output range [" + yOff + ", " + ((long) yOff + rowCount)
                     + ") exceeds array length " + y.length);
+        }
+    }
+
+    /**
+     * Validates the output rows of a product of {@code nTokens} tokens: token {@code t}'s {@code rowCount} values at
+     * {@code y[yOff + t*yStride]}, and the stride.
+     *
+     * @throws IllegalArgumentException  when {@code y} is null or the stride is below the row count
+     * @throws IndexOutOfBoundsException when the rows or a token's output range are out of bounds
+     */
+    static void checkOutputs(CpuTensorRef w, long rowStart, int rowCount, int nTokens, float[] y, int yOff,
+                             int yStride) {
+        if (nTokens > 1 && yStride < rowCount) {
+            throw new IllegalArgumentException("output stride " + yStride + " is below the " + rowCount
+                    + "-row tile for " + nTokens + " tokens");
+        }
+        for (int t = 0; t < nTokens; t++) {
+            final long base = (long) yOff + (long) t * yStride;
+            if (base < 0 || base > Integer.MAX_VALUE - rowCount) {
+                throw new IndexOutOfBoundsException("output range of token " + t + " starts at " + base);
+            }
+            check(w, rowStart, rowCount, y, (int) base);
         }
     }
 
