@@ -36,6 +36,11 @@ import com.eonmux.neuralfree.gguf.memory.KvDType;
  * work-group over key blocks of {@link SubgroupFlashAttention#PREFILL_BLOCK}; the split policies are otherwise the
  * portable ones. {@link #decodeGlobal}, {@link #decodePagedGlobal}, {@link #prefillGlobal}, {@link #decodeLocalSize}
  * and {@link #prefillLocalSize} follow the plan's form.
+ *
+ * <p>The portable paged decode plan also sizes the CUDA grouped-query paged decode {@code LLM_FlashDecodePagedGqa_*}
+ * ({@link #gqaDecodeServes}, {@link #gqaDecodeUsable}): one work-group per (sequence, KV head, split) holding every
+ * query head of the group, with the split chosen over the launch's work-groups ({@link #decodeGqaSplit}) inside the
+ * partial buffer this plan sizes.
  */
 public final class FlashAttnTiling {
 
@@ -129,6 +134,16 @@ public final class FlashAttnTiling {
     public static final int MMA_ROWS = 64;
     /** Keys per mma tile ({@code NF_FM_BN}). */
     public static final int MMA_BK = 32;
+    /** Longest split of the grouped-query paged decode ({@code NF_FDG_MAX_SPLIT}, its staged key rows). */
+    public static final int GQA_MAX_SPLIT = 512;
+    /** Most query heads per KV head of the grouped-query paged decode ({@code NF_FDG_MAX_G}). */
+    public static final int GQA_MAX_G = 4;
+    /**
+     * Work-groups per compute unit a grouped-query paged decode launch aims at when it splits the keys: the
+     * kernel keeps four work-groups resident per unit, and two per unit keep every unit busy while the combine
+     * of a split launch stays short.
+     */
+    static final int GQA_GROUPS_PER_UNIT = 2;
     /** Largest mma head dim (d_k and d_v multiples of 16 of at most this). */
     public static final int MMA_MAX_HEAD_DIM = 128;
     /** Head tiles of the mma plan: at most this many query heads per work-group. */
@@ -554,6 +569,62 @@ public final class FlashAttnTiling {
                     + maxSplits + " the partial buffer of " + this + " holds");
         }
         return new Split(count, len);
+    }
+
+    /**
+     * Whether the grouped-query paged decode serves these head counts and dims: {@code d_k == d_v} in
+     * {@code {64, 128}} and at most {@link #GQA_MAX_G} query heads per KV head (the kernel's {@code nf_fdg_plan_ok};
+     * the caller checks the cache type, the strides and the V alias).
+     */
+    public static boolean gqaDecodeServes(int nHead, int nHeadKv, int dK, int dV) {
+        return nHead > 0 && nHeadKv > 0 && nHead % nHeadKv == 0 && nHead / nHeadKv <= GQA_MAX_G
+                && dK == dV && (dK == 64 || dK == 128);
+    }
+
+    /**
+     * Whether this decode plan can size the grouped-query paged decode at every key count up to
+     * {@link #keyCapacity()}: its shape is served and {@link #maxSplits()} splits of at most
+     * {@link #GQA_MAX_SPLIT} keys cover the capacity, so {@link #decodeGqaSplit} always fits the partial buffer.
+     */
+    public boolean gqaDecodeUsable() {
+        return (plan == Plan.DECODE || plan == Plan.PER_ROW_DECODE) && gqaDecodeServes(nHead, nHeadKv, dK, dV)
+                && (long) maxSplits * GQA_MAX_SPLIT >= keyCapacity;
+    }
+
+    /**
+     * Splits of a grouped-query paged decode over {@code nSeq} sequences of at most {@code nKeys} keys: the launch
+     * aims at {@code wanted = ceil(GQA_GROUPS_PER_UNIT * CU / (n_seq * n_head_kv))} splits, so {@code split_len =
+     * clamp(roundUp32(ceil(nKeys / wanted)), 32, GQA_MAX_SPLIT)}, raised to {@code roundUp32(ceil(nKeys /
+     * maxSplits))} so the splits fit the partial buffer, and {@code n_split = ceil(nKeys / split_len)} (at least 1).
+     *
+     * @throws IllegalStateException    unless {@link #gqaDecodeUsable()}
+     * @throws IllegalArgumentException when {@code nKeys} is outside [0, {@link #keyCapacity()}] or {@code nSeq}
+     *                                  is not positive
+     */
+    public Split decodeGqaSplit(int nKeys, int nSeq) {
+        if (!gqaDecodeUsable()) {
+            throw new IllegalStateException("the grouped-query paged decode does not serve " + this);
+        }
+        if (nKeys < 0 || nKeys > keyCapacity) {
+            throw new IllegalArgumentException("key count " + nKeys + " is outside [0, " + keyCapacity
+                    + "], the key range of " + this);
+        }
+        if (nSeq <= 0) {
+            throw new IllegalArgumentException("paged decode needs at least one sequence, got " + nSeq);
+        }
+        long groups = (long) nSeq * nHeadKv;
+        int wanted = (int) Math.max(1L, ceilDiv((long) GQA_GROUPS_PER_UNIT * computeUnits, groups));
+        int len = Math.min(Math.max(roundUp(ceilDiv(nKeys, wanted), SPLIT_QUANTUM), MIN_SPLIT), GQA_MAX_SPLIT);
+        len = Math.max(len, roundUp(ceilDiv(nKeys, maxSplits), SPLIT_QUANTUM));
+        return new Split(Math.max(1, ceilDiv(nKeys, len)), len);
+    }
+
+    /**
+     * Global size of a grouped-query paged decode call: {@code {n_split * 128, n_seq * n_head_kv}}, the sequence
+     * folded into dimension 1 in front of the KV head.
+     */
+    public static long[] decodeGqaGlobal(int nSeq, int nHeadKv, int nSplit) {
+        return new long[]{(long) nSplit * WG, (long) nSeq * nHeadKv};
     }
 
     /** Global size of a decode call: {@code {n_split * wg, n_head_kv * groupTiles}} ({@link #decodeLocalSize}). */

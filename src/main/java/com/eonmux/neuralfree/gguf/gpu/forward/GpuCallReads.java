@@ -9,7 +9,6 @@ import com.eonmux.neuralfree.gguf.gpu.head.GpuRowTopK;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
@@ -115,10 +114,17 @@ final class GpuCallReads {
             idParts.add(dst);
             floatParts.add(null);
         } else {
-            float[] dst = new float[(int) (bytes / Float.BYTES)];
-            events.add(queue.enqueueReadBuffer(src.buffer(), srcOff, bytes, dst));
-            floatParts.add(dst);
-            idParts.add(null);
+            // every row lands in its own result array straight from the readback: no whole-block array and no
+            // per-row copy out of it
+            long rowBytes = (long) width * Float.BYTES;
+            for (int j = 0; j < count; j++) {
+                float[] dst = new float[width];
+                events.add(queue.enqueueReadBuffer(src.buffer(), srcOff + j * rowBytes, rowBytes, dst));
+                floatParts.add(dst);
+                idParts.add(null);
+                targets.add(new int[]{target[j]});
+            }
+            return;
         }
         targets.add(target);
     }
@@ -150,15 +156,7 @@ final class GpuCallReads {
                 }
                 continue;
             }
-            float[] data = floatParts.get(part);
-            if (target.length == 1) {
-                rows[target[0]] = data;
-                continue;
-            }
-            int width = width(output);
-            for (int j = 0; j < target.length; j++) {
-                rows[target[j]] = Arrays.copyOfRange(data, j * width, (j + 1) * width);
-            }
+            rows[target[0]] = floatParts.get(part);   /* one row per float read */
         }
         return new GpuPrefillDriver.Result(rows, ids);
     }

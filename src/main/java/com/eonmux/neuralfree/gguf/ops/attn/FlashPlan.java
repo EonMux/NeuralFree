@@ -10,7 +10,8 @@ import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
  * {@code smemFloats = LlmKernels.faSmemFloats()}: the decode plan, the prefill plan
  * ({@link FlashAttnTiling.Plan#TILED}, the tensor-core {@link FlashAttnTiling.Plan#MMA} on a backend with
  * {@link DeviceFeature#COOPERATIVE_MATRIX} and F16 caches, or the per-row decode fallback), the paged decode plan
- * and paged prefill kernel of a paged cache, and the split-K partial capacity every plan's launches fit in. The
+ * and paged prefill kernel of a paged cache (with the CUDA grouped-query paged decode kernel where it serves the
+ * caches), and the split-K partial capacity every plan's launches fit in. The
  * dense and paged decode plans and the tiled prefill plan share one form: the subgroup kernels where
  * {@link SubgroupFlashAttention#serves} holds, the portable ones otherwise, with the kernel names of
  * {@link #decodeKernel}, {@link #pagedDecodeKernel}, {@link #tiledKernel} and {@link #pagedPrefillKernel}.
@@ -26,6 +27,7 @@ final class FlashPlan {
     private final String mmaKernel;
     private final FlashAttnTiling paged;
     private final String pagedPrefillKernel;
+    private final String pagedGqaKernel;
     private final long partialCapacity;
     private final boolean depthRouted;
 
@@ -41,7 +43,7 @@ final class FlashPlan {
 
     private FlashPlan(FlashAttnTiling decode, String decodeKernel, String pagedDecodeKernel, FlashAttnTiling prefill,
                       String tiledKernel, String mmaKernel, FlashAttnTiling paged, String pagedPrefillKernel,
-                      long partialCapacity, boolean depthRouted) {
+                      String pagedGqaKernel, long partialCapacity, boolean depthRouted) {
         this.decode = decode;
         this.decodeKernel = decodeKernel;
         this.pagedDecodeKernel = pagedDecodeKernel;
@@ -50,6 +52,7 @@ final class FlashPlan {
         this.mmaKernel = mmaKernel;
         this.paged = paged;
         this.pagedPrefillKernel = pagedPrefillKernel;
+        this.pagedGqaKernel = pagedGqaKernel;
         this.partialCapacity = partialCapacity;
         this.depthRouted = depthRouted;
     }
@@ -94,6 +97,7 @@ final class FlashPlan {
         }
         FlashAttnTiling paged = null;
         String pagedPrefill = null;
+        String pagedGqa = null;
         if (pg != null) {
             pagedPrefill = pagedPrefillKernel(kernels, prefill, keys.typeK(), keys.typeV());
             paged = subgroup
@@ -101,13 +105,14 @@ final class FlashPlan {
                             a.headDimV(), pg.slotCapacity(), smem, cu)
                     : FlashAttnTiling.decodePaged(pg.maxLaunchSeq(), a.nHead(), a.nHeadKv(), a.headDimK(),
                             a.headDimV(), pg.slotCapacity(), smem, cu, fast);
+            pagedGqa = subgroup ? null : pagedGqaKernel(kernels, paged, keys);
             cap = Math.max(cap, paged.decodePagedPartialFloats(pg.maxLaunchSeq()));
         }
         if (cap > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("flash partials of " + cap + " floats exceed one buffer");
         }
         return new FlashPlan(decode, decodeKernel, pagedDecodeKernel, prefill, tiledKernel, mma, paged, pagedPrefill,
-                cap,
+                pagedGqa, cap,
                 depthRouted(mma, fast, pg != null, a.nHead(), a.nHeadKv()));
     }
 
@@ -144,6 +149,21 @@ final class FlashPlan {
         }
         String mma = prefill.plan() == FlashAttnTiling.Plan.MMA ? AttnKernels.flashAttnMmaPaged(typeK) : null;
         return mma != null && kernels.has(mma) ? mma : null;
+    }
+
+    /**
+     * The grouped-query paged decode kernel ({@link AttnKernels#flashDecodePagedGqa}) of the paged decode plan when
+     * the backend has it and it serves the caches: one F16 or BF16 type for K and V, no V alias, row strides of
+     * whole 16-byte vectors, and a plan whose geometry and partial buffer it fits
+     * ({@link FlashAttnTiling#gqaDecodeUsable}); null otherwise.
+     */
+    static String pagedGqaKernel(LlmKernels kernels, FlashAttnTiling paged, FlashKeys keys) {
+        String name = AttnKernels.flashDecodePagedGqa(keys.typeK(), keys.typeV());
+        if (name == null || keys.vAliasesK() || keys.kRowStride() % 8 != 0 || keys.vRowStride() % 8 != 0
+                || !paged.gqaDecodeUsable()) {
+            return null;
+        }
+        return kernels.has(name) ? name : null;
     }
 
     /**
@@ -236,6 +256,11 @@ final class FlashPlan {
     /** The paged prefill kernel; null without a paged cache or when segments run the per-row fallback. */
     String pagedPrefillKernel() {
         return pagedPrefillKernel;
+    }
+
+    /** The grouped-query paged decode kernel ({@link #pagedGqaKernel}); null when the paged decode serves alone. */
+    String pagedGqaKernel() {
+        return pagedGqaKernel;
     }
 
     /** Floats of the split-K partial buffer every launch of these plans fits in. */

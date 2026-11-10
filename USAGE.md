@@ -480,7 +480,7 @@ On a CUDA device of compute capability 8.0 or newer, prefill attention (prompts,
 - both head dimensions are multiples of 16, at most 128;
 - the layer uses standard attention (MLA keeps its own path).
 
-Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. Single-row decode steps run it too, as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128), except on CUDA and HIP past 128 live keys where a KV head serves at most two query heads: those steps run the split-K decode kernel's warp-shuffle form (128 tokens generated after 512 cached on the RTX 5080 Laptop: 320 against 277 t/s on Qwen3-Embedding-0.6B, 201 against 187 on Qwen3-VL-Embedding-2B; with four query heads per KV head the one-row prefill stays ahead at every depth). The paged kernel's single-row steps keep the paged decode kernel. On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys at head dimension 128 takes 0.38 ms against 1.84 ms on the scalar kernel. OpenCL and Vulkan run the scalar kernels.
+Split-K over long contexts, sinks, softcap, ALiBi, the T5 relative bias, sliding windows, causal and bidirectional masks and paged caches behave as in the scalar kernels; the outputs differ only by the F16 rounding of the staged Q, K and V tiles. Single-row decode steps run it too, as a one-row prefill (48 against 65 us per layer on the scalar decode kernel at 256 keys, 32 query and 8 KV heads of 128), except on CUDA and HIP past 128 live keys where a KV head serves at most two query heads: those steps run the split-K decode kernel's warp-shuffle form (128 tokens generated after 512 cached on the RTX 5080 Laptop: 320 against 277 t/s on Qwen3-Embedding-0.6B, 201 against 187 on Qwen3-VL-Embedding-2B; with four query heads per KV head the one-row prefill stays ahead at every depth). The paged kernel's single-row steps keep the paged decode kernel; on CUDA with an F16 or BF16 cache that is the grouped-query `LLM_FlashDecodePagedGqa_F16` / `_BF16`, which reads each K and V row once for all query heads of a KV group (up to four) and splits the keys by the step's sequence count (16 sequences at 129 keys on Qwen3-Embedding-4B: 16 against 143 us per layer). On the RTX 5080 Laptop, a 512-token prefill over 1024 cached keys at head dimension 128 takes 0.38 ms against 1.84 ms on the scalar kernel. OpenCL and Vulkan run the scalar kernels.
 
 ### Fast GEMM for prefill and batched decode
 
@@ -499,7 +499,10 @@ device of the same API. The measured kinds (`SmallBatchCrossover`):
 
 The "Fast lane from rows" numbers for the measured quantized types are where the GEMM lane takes over from the
 integer-dot matvec: the matvec's exact-token-count forms hold the rows below it where they measured faster. On
-CUDA the counted forms win every count through 16 on the measured types; on OpenCL NVIDIA they win through 15 on
+CUDA (NVIDIA discrete, sm_80+) the integer-dot lane runs its tensor-core form `<T>_MatVecMma{8,16}_Q8` where
+`MatVecMmaTuning` measured it faster: Q4_K from 4 rows, Q6_K from 8, and Q8_0 from 9 rows on projections of 2048 rows
+and up, from 10 on narrower ones and from 11 where the reduction is more than twice the row count; the counted forms
+keep the rows below, and other types keep them through 16; on OpenCL NVIDIA they win through 15 on
 the 8M-element shapes, while a 16-row step stays with the lane (its tile wins 9728x2560, 19456x2560 and the head
 at 16 rows). The single counted form and its paired twin are chosen per launch: on OpenCL NVIDIA, Q4_K, Q5_K and
 IQ4_XS take the single form at 9 or more tokens on launches of 9728 rows and up (the paired form wins the
@@ -518,9 +521,9 @@ not fill about 1.3 waves of the device; steps of 17 to 64 tokens run the 64-toke
 planes. On a reduction shorter than the split-K threshold (K below 2048, no split to fill the grid) the
 16-token twin serves up to 48 tokens, where the 64-token tile would leave a quarter of its token columns empty.
 Wider steps run the plain tile. The weight stream is a software pipeline, so the next tile's loads overlap the
-current tile's dot products, and each 4-bit word decodes in two ALU ops. On an RTX 5080 Laptop (CUDA) a 9-row decode step of one Qwen3 4B sequence takes 13.3 ms in Q8_0 and
-18.3 ms in Q4_K_M, a 16-row step 20.0 and 27.0 ms (`llama-batched-bench -npp 1 -ntg 128`: 9.8 and 7.5 ms at 9 rows,
-10.5 and 8.2 at 16); a 512-token prefill (`nftool bench -p 512`) runs 2894 t/s in Q8_0 (`llama-bench` 9639) and
+current tile's dot products, and each 4-bit word decodes in two ALU ops. On an RTX 5080 Laptop (CUDA), `nftool batched-bench -c 4096 -npp 1 -ntg 128` decodes Qwen3-Embedding-4B
+at an 8-row step of 11.0 ms in Q8_0 and 7.3 ms in Q4_K_M, and a 16-row step of 13.7 and 10.4 ms
+(`llama-batched-bench -ngl 99 -fa on`: 9.6 and 6.7 ms at 8 rows, 10.3 and 8.1 at 16); a 512-token prefill (`nftool bench -p 512`) runs 2894 t/s in Q8_0 (`llama-bench` 9639) and
 2758 t/s in Q4_K_M (llama.cpp 9140).
 
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
@@ -697,8 +700,13 @@ How it behaves:
   derived from that position and checked against the capture. A row count other than the captured one records the
   step again, and a position that does not follow the last runs one body step without dropping the capture. A paged
   decode step whose every row is its own sequence (continuous batching's decode shape, as `forwardBatch` over a paged
-  memory runs it) and a tree-masked verify step capture their trunk the same way, one capture per shape, the paged
-  decode attention and page-table reads covered by the graph. A paged step with a multi-row segment, a recurrent
+  memory runs it) keeps one capture across consecutive steps with the same row count, adapter slots and mask rule,
+  and replays it from the step's largest key count alone: the paged decode attention's split layout, grid and merge
+  counts derive from that count, and the page tables, per-sequence key counts and positions come from device buffers
+  the step uploads before the trunk. A step that switches the attention between its direct and split forms records
+  the trunk again, and so does any call of another kind. On the RTX 5080 Laptop this takes Qwen3-Embedding-0.6B Q8_0
+  from 3.4 to 2.4 ms per step at 1 row and from 5.0 to 3.9 ms at 16 rows (`nftool batched-bench -c 4096 -npp 1
+  -ntg 128`). A tree-masked verify step captures its trunk once per shape and replays it through the body. A paged step with a multi-row segment, a recurrent
   target's tree round, and context-parallel and dual-chunk steps always run directly. Output is the same token for
   token as running the step directly.
 - Where the layer runs [tensor-core flash attention](#tensor-core-flash-attention), a one-row decode step runs
@@ -8484,6 +8492,7 @@ GGUF files ignore these; Hugging Face checkpoints read them at open. The meaning
 | `neuralfree.gpu.decodeReplay` | Replay the single-token decode trunk as one CUDA graph / HIP graph / Vulkan or OpenCL command-buffer submission ([decode-step command replay](#decode-step-command-replay)) | true |
 | `neuralfree.gpu.chainReplay` | Extend decode replay into speculative rounds: keep the drafter's capture across rollbacks and record the verify step ([decode-step command replay](#decode-step-command-replay)) | true on CUDA, false elsewhere |
 | `neuralfree.gpu.graphWarmupSteps` | Consecutive same-shape decode steps that run directly before the trunk is recorded for replay ([decode-step command replay](#decode-step-command-replay)) | 2 |
+| `neuralfree.gpu.patchedReplay` | Let a verified decode or paged decode capture replay without re-running its dispatches, patching the per-step values in place; `false` keeps every capture on the body replay ([decode-step command replay](#decode-step-command-replay)) | true |
 | `neuralfree.matvec.int8` | Single-token GPU projections through the Q8_1 integer-dot matvec: `auto` where the device reports packed dot products, `on` wherever the kernels run, `off` for the F32 matvec ([integer-dot decode matvec](#integer-dot-q8_1-decode-matvec)) | `auto` |
 | `neuralfree.gpu.fused` | Fused GPU decode kernels: `auto` runs a fused kernel where the bound backend provides it, `on` requires them (binding fails naming the missing kernel and backend), `off` runs only the unfused pairs | auto |
 | `neuralfree.gpu.stagingMb` | CUDA and Vulkan staging ring size in MiB (CUDA 1-1024, Vulkan 1-2047) | upload 64, readback 16 |

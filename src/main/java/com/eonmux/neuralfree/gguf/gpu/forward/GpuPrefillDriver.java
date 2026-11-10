@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.gpu.forward;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
+import com.eonmux.neuralfree.acceleration.backend.GpuStepPatcher;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.engine.EmbeddingRowSupport;
 import com.eonmux.neuralfree.gguf.engine.ContextFullException;
@@ -131,6 +132,12 @@ public final class GpuPrefillDriver {
     private GpuRecurrentTreeRound recurrentRound;
     /** True when a cross-device collective keeps the decode trunk out of a single-queue graph replay. */
     private boolean replayDisabled;
+    /**
+     * The shape of the plain paged decode step (every segment one row) whose trunk {@link #stepReplay} captured or
+     * is warming up for, or null when it holds no such step: a paged decode capture serves only the consecutive
+     * paged decode steps of its shape, and any other step drops it first.
+     */
+    private PagedDecodeShape pagedDecodeShape;
 
     /**
      * A receiver of each step's positions and tokens, called after the main memory uploaded the step and after the
@@ -253,7 +260,7 @@ public final class GpuPrefillDriver {
     public void disableDecodeReplay() {
         replayDisabled = true;
         decodeReplay.invalidate();
-        stepReplay.invalidate();
+        invalidateStepReplay();
     }
 
     /**
@@ -492,7 +499,7 @@ public final class GpuPrefillDriver {
             embedding.embedBatched(batch.tokens(), batch.positions(), null, embd);
             taps.batchRows(identity(n));
             decodeReplay.invalidate();
-            stepReplay.invalidate();
+            invalidateStepReplay();
             executor.run(0, n, GpuLayerExecutor.StepMode.PREFILL, taps);
             ScratchSlot hidden = head.hidden(n, rows, rows.length);
             calls.read(output, hidden, rows.length, rows);
@@ -601,12 +608,15 @@ public final class GpuPrefillDriver {
         int chunk = Math.min(ubatch, memory.plan().ubatch());
         boolean slotUniform = batch.adapterSlots() != null
                 && (memory.plan().hasRecurrentState() || !AdapterRows.mixable(ctx.spec()));
-        // one single-ubatch masked tree verify step keeps its step-replay capture across rounds: its uploads
-        // (page copies, step inputs, tree mask, embeddings, row appends) run outside the captured trunk and a
-        // commit's row moves dispatch directly between captures (GpuForwardBackend.carryRowMoves), so a
-        // compaction does not force a recapture. Anything else invalidates as before.
-        if (!(batch.treeMask() != null && recurrentRound == null && batch.nTokens() <= chunk && !slotUniform)) {
-            stepReplay.invalidate();
+        // one single-ubatch masked tree verify step keeps its step-replay capture across rounds, and so does one
+        // single-ubatch plain paged decode step across steps of its shape (BatchSteps.ubatch drops a capture of
+        // another shape or kind): their uploads (page copies, step inputs, tree mask, embeddings, row appends) run
+        // outside the captured trunk and a commit's row moves dispatch directly between captures
+        // (GpuForwardBackend.carryRowMoves), so a compaction does not force a recapture. Anything else
+        // invalidates as before.
+        boolean singleUbatch = batch.nTokens() <= chunk && !slotUniform;
+        if (!(singleUbatch && (batch.treeMask() == null || recurrentRound == null))) {
+            invalidateStepReplay();
         }
         // the copies engine-side mutations still owe (an adopt cut, a fork's prefix copy) run before the step's
         // own, as the CPU backend's ubatch orders them; their sources release once the queue finished
@@ -753,7 +763,7 @@ public final class GpuPrefillDriver {
      */
     void invalidateReplay() {
         decodeReplay.invalidate();
-        stepReplay.invalidate();
+        invalidateStepReplay();
     }
 
     /**
@@ -871,7 +881,15 @@ public final class GpuPrefillDriver {
                             && (treeMask != null || allRowsSingle(step))
                             && recurrentRound == null && !taps.wantsAny(executor.layers().size())
                             && executor.capturableDecode();
-                    stepReplay.trunk(capturable, () -> executor.run(u.layout(), taps));
+                    if (treeMask == null && allRowsSingle(step)) {
+                        pagedDecodeTrunk(step, slots, batch.nonCausal(), capturable,
+                                () -> executor.run(u.layout(), taps));
+                    } else {
+                        if (treeMask == null || pagedDecodeShape != null) {
+                            invalidateStepReplay();
+                        }
+                        stepReplay.trunk(capturable, () -> executor.run(u.layout(), taps));
+                    }
                 }
                 for (int seg = 0; seg < step.nSeg(); seg++) {
                     paged.appendRows(step.segSeq(seg), tokens, positions, step.segStart(seg), step.segLen(seg),
@@ -1002,6 +1020,45 @@ public final class GpuPrefillDriver {
     }
 
     /**
+     * The trunk of a plain paged decode step (every segment one row) through {@link #stepReplay}: a capture of
+     * another shape or kind is dropped first. On a single KV group the mixers' paged decode patchers
+     * ({@link GpuLayerExecutor#pagedDecodeReplayPatchers()}) let the capture replay without its body, the step's
+     * key count (the largest live key count of its sequences, which each decode step advances by one) as the
+     * replay position; otherwise, or when a mixer cannot vouch for its launches, the capture replays through the
+     * body. A step that cannot be captured runs directly and drops the capture.
+     */
+    private void pagedDecodeTrunk(PagedStep step, int[] slots, boolean nonCausal, boolean capturable,
+                                  Runnable body) {
+        PagedDecodeShape shape = capturable ? new PagedDecodeShape(step.nTokens(), slots, nonCausal) : null;
+        if (shape == null || !shape.equals(pagedDecodeShape)) {
+            invalidateStepReplay();
+        }
+        if (shape == null) {
+            body.run();
+            return;
+        }
+        pagedDecodeShape = shape;
+        List<GpuStepPatcher> patchers = step.groups() == 1 ? executor.pagedDecodeReplayPatchers() : null;
+        stepReplay.trunk(maxKeys(step), 1, patchers, true, body);
+    }
+
+    /** The largest key count of the step's sequences in its first KV group, the paged decode replay's position. */
+    private static int maxKeys(PagedStep step) {
+        int[] slots = step.seqSlots(0);
+        int keys = 0;
+        for (int seg = 0; seg < step.nSeg(); seg++) {
+            keys = Math.max(keys, slots[step.segSeq(seg)]);
+        }
+        return keys;
+    }
+
+    /** Drops the step replay's capture, whichever step it holds. */
+    private void invalidateStepReplay() {
+        stepReplay.invalidate();
+        pagedDecodeShape = null;
+    }
+
+    /**
      * Whether every segment of the paged {@code step} holds one row: the decode shape, whose attention
      * launches one paged decode kernel over the batch's sequences and uploads nothing inside the trunk,
      * so a capture of the trunk holds kernel dispatches alone.
@@ -1051,13 +1108,16 @@ public final class GpuPrefillDriver {
             embedding.embed(tokens, c0, n, types, p);
         }
         taps.chunk(c0);
+        if (pagedDecodeShape != null) {
+            invalidateStepReplay();
+        }
         if (mode == GpuLayerExecutor.StepMode.DECODE) {
             decodeReplay.trunk(p, executor.decodeReplayPatchers(),
                     !replayDisabled && !taps.wantsAny(executor.layers().size()) && executor.capturableDecode(),
                     () -> executor.run(p, n, mode, taps));
         } else if (trunk) {
             decodeReplay.invalidate();
-            stepReplay.invalidate();
+            invalidateStepReplay();
             trunkRunner.runTrunk(p, n, mode, taps);
         } else {
             decodeReplay.invalidate();
@@ -1096,6 +1156,37 @@ public final class GpuPrefillDriver {
             r[i] = i;
         }
         return r;
+    }
+
+    /**
+     * The shape a paged decode capture serves: the step's row count (one row per sequence), the rows' adapter slots
+     * and the causal mode. Steps of equal shape enqueue the same trunk dispatches; only their attention's key-count
+     * values differ.
+     */
+    private static final class PagedDecodeShape {
+        private final int rows;
+        private final int[] slots;
+        private final boolean nonCausal;
+
+        PagedDecodeShape(int rows, int[] slots, boolean nonCausal) {
+            this.rows = rows;
+            this.slots = slots == null ? null : slots.clone();
+            this.nonCausal = nonCausal;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof PagedDecodeShape)) {
+                return false;
+            }
+            PagedDecodeShape other = (PagedDecodeShape) o;
+            return rows == other.rows && nonCausal == other.nonCausal && Arrays.equals(slots, other.slots);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * (31 * rows + Arrays.hashCode(slots)) + (nonCausal ? 1 : 0);
+        }
     }
 }
 

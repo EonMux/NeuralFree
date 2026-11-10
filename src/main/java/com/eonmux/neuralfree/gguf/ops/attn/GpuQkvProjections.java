@@ -227,10 +227,10 @@ final class GpuQkvProjections implements AutoCloseable {
     void project(int n, ScratchSlot in) {
         GpuBuffer x = in.buffer();
         int off = in.offset();
-        // The attention projections of a single token all read this row, so its Q8_1 blocks are quantized once.
+        // The attention projections all read these rows, so their Q8_1 blocks are quantized once.
         int width = (int) (wqkv != null ? wqkv.cols() : wq.cols());
-        GpuOps.SharedQ8 share = n == 1 && GpuOps.shareableQ8Activations(off, width)
-                ? mixer.ops().shareQ8Activations(x, off, width) : null;
+        GpuOps.SharedQ8 share = GpuOps.shareableQ8Activations(off, width)
+                ? mixer.ops().shareQ8Activations(x, off, width, n) : null;
         try {
             if (wqkv != null) {
                 projectFused(n, x, off);

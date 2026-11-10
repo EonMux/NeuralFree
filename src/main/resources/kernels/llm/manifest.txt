@@ -49,6 +49,7 @@ quantize_q8_1.cl
 [opencl] matvec_sg.cl
 matmul_mmq.cl
 [opencl] matmul_mmq_sg.cl
+[cuda] matvec_mma.cl
 [cuda] matmul_fp8.cl
 matmul_mma.cl
 matmul_cm.cl
@@ -69,6 +70,7 @@ multitask.cl
 kv_cache.cl
 flash_decode.cl
 [opencl] flash_decode_sg.cl
+[cuda] flash_decode_gqa.cl
 flash_prefill.cl
 [opencl] flash_prefill_sg.cl
 [cuda] flash_mma.cl

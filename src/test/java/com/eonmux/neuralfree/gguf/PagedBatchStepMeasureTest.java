@@ -37,8 +37,10 @@ import static org.junit.Assume.assumeTrue;
  * against the profiled device total. Opt-in through {@code -Dneuralfree.test.pagedbatch.measure=true}; the
  * shared suite skips in seconds.
  *
- * <p>Models are read from {@code neuralfree.test.pagedbatch.models} (default the user's model directory); a
- * missing file skips its part. Nothing is downloaded.</p>
+ * <p>Models are read from {@code neuralfree.test.pagedbatch.models} (default the user's model directory), or
+ * named directly as comma-separated GGUF paths by {@code neuralfree.test.pagedbatch.paths}; a missing file skips
+ * its part. {@code neuralfree.test.pagedbatch.rows} (comma-separated) replaces the measured row counts and
+ * {@code neuralfree.test.pagedbatch.contiguous=false} skips the contiguous reference. Nothing is downloaded.</p>
  */
 public class PagedBatchStepMeasureTest {
 
@@ -46,6 +48,14 @@ public class PagedBatchStepMeasureTest {
     public static final String MEASURE_PROPERTY = "neuralfree.test.pagedbatch.measure";
     /** System property naming this test's model root directory; unset, {@link RealModels#root()} is used. */
     public static final String MODELS_PROPERTY = "neuralfree.test.pagedbatch.models";
+    /** System property naming the measured GGUF files directly (comma-separated paths). */
+    public static final String PATHS_PROPERTY = "neuralfree.test.pagedbatch.paths";
+    /** System property replacing the measured row counts (comma-separated). */
+    public static final String ROWS_PROPERTY = "neuralfree.test.pagedbatch.rows";
+    /** System property that, set to false, skips the contiguous reference pass. */
+    public static final String CONTIGUOUS_PROPERTY = "neuralfree.test.pagedbatch.contiguous";
+    /** Kernels listed per profile, the most expensive first. */
+    private static final int PROFILE_LINES = 30;
 
     private static final String[] NAMES = {"qwen3-emb-4b-q8", "qwen3-emb-4b-q4k"};
     private static final String[] PATHS = {
@@ -53,8 +63,8 @@ public class PagedBatchStepMeasureTest {
             "Qwen3-Embedding-4B-Q4_K_M.gguf",
     };
 
-    /** Row counts of the measured decode steps, the bench's largest cells. */
-    private static final int[] ROWS = {9, 16};
+    /** Row counts of the measured decode steps by default, the bench's largest cells. */
+    private static final int[] DEFAULT_ROWS = {9, 16};
     /** Sequences the paged memory holds (the bench's largest -npl). */
     private static final int SEQUENCES = 16;
     /** The bench's context ({@code -c 4096}). */
@@ -115,14 +125,16 @@ public class PagedBatchStepMeasureTest {
             System.out.printf(Locale.ROOT, "PAGEDBATCH-MEASURE backend=CUDA device=\"%s\" model=%s%n",
                     device.getDeviceName(), model.name);
             pagedPass(model);
-            contiguousPass(model);
+            if (!"false".equals(System.getProperty(CONTIGUOUS_PROPERTY))) {
+                contiguousPass(model);
+            }
         }
     }
 
     // ================================================================== passes
 
     /**
-     * The paged decode step of {@link #ROWS} rows: one row per sequence over the paged memory, the median wall
+     * The paged decode step of {@link #rows()} rows: one row per sequence over the paged memory, the median wall
      * time with every row an output row (the bench's logits readback) and with none (the trunk alone), then the
      * per-kernel device profile of {@link #PROFILE_STEPS} steps. The backend reopens for the profile pass: the
      * queue times its dispatches only when the profile property is set at its construction.
@@ -133,7 +145,7 @@ public class PagedBatchStepMeasureTest {
         try (GGUFModelGPU m = new GGUFModelGPU(model.path.toString(), backend(), pagedConfig())) {
             ForwardBackend f = m.forwardBackend();
             int vocab = m.vocabSize();
-            for (int rows : ROWS) {
+            for (int rows : rows()) {
                 timedSteps("paged-logits", f, warmPaged(f, rows, vocab), pos -> f.forwardBatch(
                         decodeBatch(rows, pos, vocab, true)), rows);
                 timedSteps("paged-noout", f, warmPaged(f, rows, vocab), pos -> f.forwardBatch(
@@ -145,7 +157,7 @@ public class PagedBatchStepMeasureTest {
         try (GGUFModelGPU m = new GGUFModelGPU(model.path.toString(), backend(), pagedConfig())) {
             ForwardBackend f = m.forwardBackend();
             int vocab = m.vocabSize();
-            for (int rows : ROWS) {
+            for (int rows : rows()) {
                 deviceProfile(m, warmPaged(f, rows, vocab), pos -> f.forwardBatch(
                         decodeBatch(rows, pos, vocab, true)), rows, "paged");
             }
@@ -153,7 +165,7 @@ public class PagedBatchStepMeasureTest {
     }
 
     /**
-     * The contiguous multi-row step of {@link #ROWS} rows at the same live-key depth (the step-replay path the
+     * The contiguous multi-row step of {@link #rows()} rows at the same live-key depth (the step-replay path the
      * speculative verify runs), for the wall time and the device profile the paged step is measured against.
      */
     private void contiguousPass(RealModel model) throws IOException {
@@ -162,7 +174,7 @@ public class PagedBatchStepMeasureTest {
         try (GGUFModelGPU m = new GGUFModelGPU(model.path.toString(), backend(), contiguousConfig())) {
             ForwardBackend f = m.forwardBackend();
             int vocab = m.vocabSize();
-            for (int rows : ROWS) {
+            for (int rows : rows()) {
                 timedSteps("contiguous", f, warmContiguous(f, vocab),
                         pos -> f.prefill(stepTokens(vocab, pos, rows), pos), rows);
             }
@@ -172,7 +184,7 @@ public class PagedBatchStepMeasureTest {
         try (GGUFModelGPU m = new GGUFModelGPU(model.path.toString(), backend(), contiguousConfig())) {
             ForwardBackend f = m.forwardBackend();
             int vocab = m.vocabSize();
-            for (int rows : ROWS) {
+            for (int rows : rows()) {
                 deviceProfile(m, warmContiguous(f, vocab), pos -> f.prefill(stepTokens(vocab, pos, rows), pos),
                         rows, "contiguous");
             }
@@ -248,7 +260,7 @@ public class PagedBatchStepMeasureTest {
                 label, rows, PROFILE_STEPS, dispatches / PROFILE_STEPS, deviceNanos / 1e6 / PROFILE_STEPS);
         int shown = 0;
         for (KernelTiming.Entry e : timing.snapshot()) {
-            if (shown++ >= 18) {
+            if (shown++ >= PROFILE_LINES) {
                 break;
             }
             System.out.printf(Locale.ROOT, "  %-52s %6d %9.3f ms %8.2f us %5.1f%%%n",
@@ -317,6 +329,16 @@ public class PagedBatchStepMeasureTest {
         return EngineConfig.builder().memory(mc).build();
     }
 
+    /** The measured row counts: {@link #ROWS_PROPERTY}, else {@link #DEFAULT_ROWS}. */
+    private static int[] rows() {
+        String v = System.getProperty(ROWS_PROPERTY);
+        if (v == null || v.isBlank()) {
+            return DEFAULT_ROWS.clone();
+        }
+        return Arrays.stream(v.split(",")).map(String::trim).filter(x -> !x.isEmpty())
+                .mapToInt(Integer::parseInt).toArray();
+    }
+
     /** The model roots: {@link #MODELS_PROPERTY} (a {@code :}-separated list), else {@link RealModels#root()}. */
     private static List<Path> modelRoots() {
         String roots = System.getProperty(MODELS_PROPERTY);
@@ -346,6 +368,17 @@ public class PagedBatchStepMeasureTest {
     /** The real model files present under the roots, in report order. */
     private static List<RealModel> realModels() {
         List<RealModel> present = new ArrayList<>();
+        String paths = System.getProperty(PATHS_PROPERTY);
+        if (paths != null && !paths.isBlank()) {
+            for (String p : paths.split(",")) {
+                Path file = Path.of(p.trim());
+                if (Files.isRegularFile(file)) {
+                    present.add(new RealModel(file, file.getFileName().toString()));
+                }
+            }
+            assumeTrue("none of " + paths + " exists", !present.isEmpty());
+            return present;
+        }
         for (int i = 0; i < PATHS.length; i++) {
             Path p = findModel(PATHS[i]);
             if (p != null) {

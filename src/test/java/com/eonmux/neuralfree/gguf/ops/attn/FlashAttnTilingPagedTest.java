@@ -173,12 +173,21 @@ public class FlashAttnTilingPagedTest {
 
     @Test
     public void pagedKernelSignaturesMatchTheArgumentIndices() throws IOException {
-        // Signature parity of the 20 paged entry points against the ARG_FDP_* / ARG_FAP_* tables. The typed
+        // Signature parity of the paged entry points against the ARG_FDP_* / ARG_FAP_* tables. The typed
         // kernels are instantiated by generator macros and the decode ones declare their parameters through the
-        // run-args macro; parameters() resolves both.
-        String decodeSrc = new String(Files.readAllBytes(KERNELS.resolve("flash_decode.cl")), StandardCharsets.UTF_8);
+        // run-args macro of common/attn_common.h; parameters() resolves both.
+        String common = new String(Files.readAllBytes(KERNELS.resolve("common/attn_common.h")),
+                StandardCharsets.UTF_8);
+        String decodeSrc = common
+                + new String(Files.readAllBytes(KERNELS.resolve("flash_decode.cl")), StandardCharsets.UTF_8);
         for (KvDType t : KvDType.kernelTypes()) {
             checkKernel(decodeSrc, AttnKernels.flashDecodePaged(t), AttnKernels.FDP_ARG_COUNT,
+                    AttnKernels.FDP_SCALAR_COUNT);
+        }
+        String gqaSrc = common
+                + new String(Files.readAllBytes(KERNELS.resolve("flash_decode_gqa.cl")), StandardCharsets.UTF_8);
+        for (KvDType t : new KvDType[]{KvDType.F16, KvDType.BF16}) {
+            checkKernel(gqaSrc, AttnKernels.flashDecodePagedGqa(t, t), AttnKernels.FDP_ARG_COUNT,
                     AttnKernels.FDP_SCALAR_COUNT);
         }
         checkKernel(decodeSrc, AttnKernels.FLASH_DECODE_PAGED_MIXED, AttnKernels.FDP_MIXED_ARG_COUNT,

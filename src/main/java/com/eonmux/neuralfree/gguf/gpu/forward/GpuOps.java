@@ -113,8 +113,8 @@ import java.util.Set;
  * instructions (llama.cpp ggml-cuda/mmvq.cu / vecdotq.cuh and ggml-vulkan mul_mat_vecq.comp). Above the
  * two-row thread floor the single-token lane pairs rows in {@code {T}_MatVec2_Q8} (and the fused gate/up in
  * {@code {T}_MatVec2FusedGateUp_Q8}), reading the Q8_1 row once per two weight rows. A caller whose several
- * single-token projections read one activation row opens a {@link SharedQ8} scope
- * ({@link #shareQ8Activations}), so the row is quantized once for all of them instead of once per projection.
+ * projections read one activation row, or one group of token rows, opens a {@link SharedQ8} scope
+ * ({@link #shareQ8Activations}), so the rows are quantized once for all of them instead of once per projection.
  * {@link Int8MatvecMode}
  * (property {@code neuralfree.matvec.int8}) selects it; the default {@link Int8MatvecMode#AUTO} uses it where the
  * device reports {@link DeviceFeature#INTEGER_DOT_PRODUCT}, the weight type measured faster with the lane on that
@@ -506,49 +506,51 @@ public final class GpuOps implements AutoCloseable {
     }
 
     /**
-     * Whether a single-token activation row at element {@code off} of {@code cols} elements can back a
-     * {@link #shareQ8Activations} scope: the quantizer reads a whole row from element 0 of its buffer, so a row
-     * at a nonzero offset is staged by its projections instead.
+     * Whether activation rows starting at element {@code off}, {@code cols} elements each, can back a
+     * {@link #shareQ8Activations} scope: the quantizer reads whole rows from element 0 of their buffer, so rows
+     * at a nonzero offset are staged by their projections instead.
      */
     public static boolean shareableQ8Activations(int off, int cols) {
         return off == 0 && cols > 0 && cols % Q8_1_BLOCK_SIZE == 0;
     }
 
     /**
-     * A single-token activation row quantized to Q8_1 blocks once for several projections that read it
-     * ({@link #shareQ8Activations}). Every projection of the scope whose activation view is exactly the shared
-     * row at element 0 of its buffer and whose weight takes the integer-dot lane reuses the shared blocks; a
-     * projection of a transformed or staged input, or of a weight outside the lane, quantizes its own row as
-     * it would without the share. The caller keeps the row unchanged until the scope closes. Closing enqueues
-     * nothing and is idempotent.
+     * Consecutive activation rows quantized to Q8_1 blocks once for the projections that read them
+     * ({@link #shareQ8Activations}). A projection of the scope whose view is exactly the shared rows (element 0 of
+     * their buffer, the same token count) and whose weight takes an integer-dot lane, single-token or multi-column,
+     * reuses the blocks, which are the per-projection quantizer's output bit for bit; any other quantizes its own
+     * rows. The caller keeps the rows unchanged until the scope closes. Closing enqueues nothing and is idempotent.
      */
     public final class SharedQ8 implements AutoCloseable {
         private final GpuBuffer source;
         private final int cols;
+        private final int rows;
         private GpuBuffer blocks;
         private boolean closed;
 
-        private SharedQ8(GpuBuffer source, int cols) {
+        private SharedQ8(GpuBuffer source, int cols, int rows) {
             this.source = source;
             this.cols = cols;
+            this.rows = rows;
         }
 
-        /** The Q8_1 blocks of the shared row, quantizing it on first use. */
+        /** The Q8_1 blocks of the shared rows, quantizing them on first use. */
         GpuBuffer blocks() {
             if (closed) {
                 throw new IllegalStateException("the Q8_1 activation share is closed");
             }
             if (blocks == null) {
-                int n = cols / Q8_1_BLOCK_SIZE;
-                ScratchSlot slot = scratch.staging(GpuScratch.Staging.SHARED_Q8_1, (long) n * Q8_1_FLOATS);
-                launchMatvec(QUANTIZE_Q8_1, n, cols, source, slot.buffer());
+                long n = (long) rows * (cols / Q8_1_BLOCK_SIZE);
+                ScratchSlot slot = scratch.staging(GpuScratch.Staging.SHARED_Q8_1, n * Q8_1_FLOATS);
+                launchMatvec(QUANTIZE_Q8_1, n, Math.multiplyExact(rows, cols), source, slot.buffer());
                 blocks = slot.buffer();
             }
             return blocks;
         }
 
-        boolean matches(View x, int width) {
-            return !closed && width == cols && x.buf == source && x.off == 0;
+        /** Whether {@code nTokens} rows of {@code width} elements at {@code x} are the shared rows. */
+        boolean matches(View x, int width, int nTokens) {
+            return !closed && width == cols && nTokens == rows && x.buf == source && x.off == 0;
         }
 
         @Override
@@ -563,25 +565,31 @@ public final class GpuOps implements AutoCloseable {
         }
     }
 
+    /** {@link #shareQ8Activations(GpuBuffer, int, int, int)} over one token row. */
+    public SharedQ8 shareQ8Activations(GpuBuffer x, int off, int cols) {
+        return shareQ8Activations(x, off, cols, 1);
+    }
+
     /**
-     * Opens a {@link SharedQ8} scope over the activation row at {@code x[off ...]} of {@code cols} elements, so
-     * the single-token projections made before it closes quantize the row once. The row must start at element
-     * 0 of its buffer ({@link #shareableQ8Activations}) and the caller must not write it inside the scope. One
-     * scope is open at a time.
+     * Opens a {@link SharedQ8} scope over the {@code rows} consecutive activation rows at {@code x[off ...]} of
+     * {@code cols} elements each, so the projections of those rows made before it closes quantize them once. The
+     * rows must start at element 0 of their buffer ({@link #shareableQ8Activations}) and the caller must not
+     * write them inside the scope. One scope is open at a time.
      *
      * @throws IllegalArgumentException when the view is out of range or cannot be shared
      * @throws IllegalStateException    when a share is already open
      */
-    public SharedQ8 shareQ8Activations(GpuBuffer x, int off, int cols) {
+    public SharedQ8 shareQ8Activations(GpuBuffer x, int off, int cols, int rows) {
         ensureOpen();
         ensureNoShare();
         checkPositive(cols, "Q8_1 activation share width");
-        checkView("Q8_1 activation share", x, off, cols);
+        checkPositive(rows, "Q8_1 activation share rows");
+        checkView("Q8_1 activation share", x, off, Math.multiplyExact((long) rows, cols));
         if (!shareableQ8Activations(off, cols)) {
-            throw new IllegalArgumentException("Q8_1 activation share needs a row at element 0 of its buffer of a"
+            throw new IllegalArgumentException("Q8_1 activation share needs rows at element 0 of their buffer of a"
                     + " multiple of " + Q8_1_BLOCK_SIZE + " elements, got offset " + off + " and width " + cols);
         }
-        SharedQ8 share = new SharedQ8(x, cols);
+        SharedQ8 share = new SharedQ8(x, cols, rows);
         activeShare = share;
         return share;
     }

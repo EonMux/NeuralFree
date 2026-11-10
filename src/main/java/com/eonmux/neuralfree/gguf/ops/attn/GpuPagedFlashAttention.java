@@ -13,7 +13,9 @@ import java.util.Objects;
 /**
  * The paged flash launches of one layer over a paged cache, addressed through the step's page tables
  * ({@link PagedFlashGeometry}): one {@code LLM_FlashDecodePaged_*} launch over the step's decode rows when every
- * segment carries one row (the continuous-batching decode), else one {@code LLM_FlashAttnPaged_*} (or
+ * segment carries one row (the continuous-batching decode) — on CUDA with an F16 or BF16 cache the grouped-query
+ * {@code LLM_FlashDecodePagedGqa_*} ({@link FlashPlan#pagedGqaKernel}), which reads each K and V row once for the
+ * whole query-head group and splits the keys over the launch's sequences — else one {@code LLM_FlashAttnPaged_*} (or
  * {@code LLM_FlashAttnMmaPaged_F16}) per segment, or the {@link PagedRowFallback} when the prefill plan has no
  * paged prefill kernel. A non-causal step ({@link GpuStepInputs#stepNonCausal()}, a media chunk) lifts the causal
  * mask of its launches; the window rule stays. With batch invariance on, every segment always runs the per-row
@@ -26,6 +28,11 @@ final class GpuPagedFlashAttention {
     private final FlashAttnTiling decodePlan;
     private final FlashAttnTiling prefillPlan;
     private final PreparedDispatch decode;
+    /**
+     * The grouped-query paged decode taking every paged decode launch in {@link #decode}'s place; null where it does
+     * not serve the caches, and with batch invariance on (its split follows the launch's sequence count).
+     */
+    private final PreparedDispatch gqaDecode;
     /** The paged prefill; null when segments run the per-row fallback. */
     private final PreparedDispatch prefill;
     /** The per-row fallback; null when the paged prefill exists. */
@@ -39,18 +46,22 @@ final class GpuPagedFlashAttention {
     private final long partialCapacity;
     private final int flags;
     private final int nHead;
+    private final int nHeadKv;
     private final int qDim;
     private final int outDim;
     private final int dV;
+    /** The paged decode-step patcher, made on first use ({@link #patcher()}). */
+    private PagedDecodePatcher patcher;
 
     private GpuPagedFlashAttention(FlashPlan plan, FlashKernelArgs args, PreparedDispatch decode,
-                                   PreparedDispatch prefill, PagedRowFallback fallback, FlashCombine combine,
+                                   PreparedDispatch gqaDecode, PreparedDispatch prefill, PagedRowFallback fallback, FlashCombine combine,
                                    StaticSinkPartial sinkPartial, PreparedDispatch lse, PagedFlashGeometry pg,
                                    GpuStepInputs steps) {
         AttentionSpec a = args.attention();
         this.decodePlan = plan.paged();
         this.prefillPlan = plan.prefill();
         this.decode = decode;
+        this.gqaDecode = gqaDecode;
         this.prefill = prefill;
         this.fallback = fallback;
         this.combine = combine;
@@ -61,14 +72,16 @@ final class GpuPagedFlashAttention {
         this.partialCapacity = plan.partialCapacity();
         this.flags = args.flags();
         this.nHead = a.nHead();
+        this.nHeadKv = a.nHeadKv();
         this.qDim = a.qDim();
         this.outDim = a.outDim();
         this.dV = a.headDimV();
     }
 
     /**
-     * Prepares the paged decode, the paged prefill of {@link FlashPlan#pagedPrefillKernel} or, without one, the
-     * per-row fallback's buffers.
+     * Prepares the paged decode (and the grouped-query paged decode of {@link FlashPlan#pagedGqaKernel} with batch
+     * invariance off), the paged prefill of {@link FlashPlan#pagedPrefillKernel} or, without one, the per-row
+     * fallback's buffers.
      */
     static GpuPagedFlashAttention prepare(GpuMixerResources res, ComputeQueue queue, FlashPlan plan,
                                           FlashKernelArgs args, PagedFlashGeometry pg, GpuStepInputs steps,
@@ -77,6 +90,11 @@ final class GpuPagedFlashAttention {
         PreparedDispatch decode = res.prepare(plan.pagedDecodeKernel(), plan.paged().decodePagedGlobal(1, 1),
                 plan.paged().decodeLocalSize(), args.pagedDecode(plan.paged(), pg));
         boolean invariant = BatchInvariance.enabled();
+        String gqaKernel = invariant ? null : plan.pagedGqaKernel();
+        PreparedDispatch gqaDecode = gqaKernel != null
+                ? res.prepare(gqaKernel, FlashAttnTiling.decodeGqaGlobal(1, args.attention().nHeadKv(), 1),
+                        FlashAttnTiling.decodeLocal(), args.pagedDecode(plan.paged(), pg))
+                : null;
         String prefillKernel = invariant ? null : plan.pagedPrefillKernel();
         PreparedDispatch prefill = prefillKernel != null
                 ? res.prepare(prefillKernel, plan.prefill().prefillGlobal(1, 1), plan.prefill().prefillLocalSize(),
@@ -86,7 +104,7 @@ final class GpuPagedFlashAttention {
         AttentionSpec a = args.attention();
         PagedRowFallback fallback = prefill == null
                 ? PagedRowFallback.allocate(res, queue, pg, a.qDim(), a.outDim()) : null;
-        return new GpuPagedFlashAttention(plan, args, decode, prefill, fallback, combine, sinkPartial, lse, pg,
+        return new GpuPagedFlashAttention(plan, args, decode, gqaDecode, prefill, fallback, combine, sinkPartial, lse, pg,
                 steps);
     }
 
@@ -202,7 +220,9 @@ final class GpuPagedFlashAttention {
         if (prefill != null) {
             prefill.setBuffer(AttnKernels.ARG_FAP_BUF_Q, q);
         }
-        decode.setBuffer(AttnKernels.ARG_FDP_BUF_Q, q);
+        for (PreparedDispatch d : decodeDispatches()) {
+            d.setBuffer(AttnKernels.ARG_FDP_BUF_Q, q);
+        }
     }
 
     /** Restores the query buffer a {@link #bindStepQueries} replaced. */
@@ -210,7 +230,9 @@ final class GpuPagedFlashAttention {
         if (prefill != null) {
             prefill.setBuffer(AttnKernels.ARG_FAP_BUF_Q, q);
         }
-        decode.setBuffer(AttnKernels.ARG_FDP_BUF_Q, q);
+        for (PreparedDispatch d : decodeDispatches()) {
+            d.setBuffer(AttnKernels.ARG_FDP_BUF_Q, q);
+        }
     }
 
     /**
@@ -219,11 +241,37 @@ final class GpuPagedFlashAttention {
      */
     void bindLaunchRows(GpuBuffer pageTable, GpuBuffer seqKvLen, GpuBuffer qPosSeq, int qSeqStride,
                         int outSeqStride) {
-        decode.setBuffer(AttnKernels.ARG_FDP_BUF_PAGE_TABLE, pageTable);
-        decode.setBuffer(AttnKernels.ARG_FDP_BUF_SEQ_KV_LEN, seqKvLen);
-        decode.setBuffer(AttnKernels.ARG_FDP_BUF_Q_POS_SEQ, qPosSeq);
-        decode.setInt(AttnKernels.ARG_FDP_Q_SEQ_STRIDE, qSeqStride);
-        decode.setInt(AttnKernels.ARG_FDP_OUT_SEQ_STRIDE, outSeqStride);
+        for (PreparedDispatch d : decodeDispatches()) {
+            d.setBuffer(AttnKernels.ARG_FDP_BUF_PAGE_TABLE, pageTable);
+            d.setBuffer(AttnKernels.ARG_FDP_BUF_SEQ_KV_LEN, seqKvLen);
+            d.setBuffer(AttnKernels.ARG_FDP_BUF_Q_POS_SEQ, qPosSeq);
+            d.setInt(AttnKernels.ARG_FDP_Q_SEQ_STRIDE, qSeqStride);
+            d.setInt(AttnKernels.ARG_FDP_OUT_SEQ_STRIDE, outSeqStride);
+        }
+    }
+
+    /**
+     * The decode-step patcher of this attention's plain paged decode launch (one row per sequence,
+     * {@link #run}'s every-segment-single-row form): claims this layer's paged decode kernel (the grouped-query one
+     * where it serves) and its merges in a captured graph and patches them from the step's key count, replacing the
+     * body {@link #launchDecode} re-runs on a replay. Null with batch invariance on, where every row launches alone.
+     */
+    PagedDecodePatcher patcher() {
+        if (BatchInvariance.enabled()) {
+            return null;
+        }
+        if (patcher == null) {
+            boolean grouped = gqaDecode != null;
+            patcher = new PagedDecodePatcher(decodePlan, grouped, nHead, nHeadKv, sinkPartial != null, lse != null,
+                    grouped ? gqaDecode : decode, combine.dispatch(), lse,
+                    sinkPartial != null ? sinkPartial.dispatch() : null);
+        }
+        return patcher;
+    }
+
+    /** The paged decode dispatches whose launch-row bindings move together: the plain one and the grouped one. */
+    private PreparedDispatch[] decodeDispatches() {
+        return gqaDecode == null ? new PreparedDispatch[]{decode} : new PreparedDispatch[]{decode, gqaDecode};
     }
 
     /**
@@ -240,17 +288,20 @@ final class GpuPagedFlashAttention {
     }
 
     private void launchDecode(int nSeq, int keys, int qOff, int outOff, int fixedPos, boolean perSequencePositions) {
-        FlashAttnTiling.Split sp = decodePlan.decodeSplit(keys);
+        boolean grouped = gqaDecode != null;
+        FlashAttnTiling.Split sp = grouped ? decodePlan.decodeGqaSplit(keys, nSeq) : decodePlan.decodeSplit(keys);
+        PreparedDispatch d = grouped ? gqaDecode : decode;
         boolean direct = sp.direct() && sinkPartial == null && lse == null;
         int layoutSplits = sp.count() + (sinkPartial != null ? 1 : 0);
-        decode.setInt(AttnKernels.ARG_FD_N_SPLIT, layoutSplits);
-        decode.setInt(AttnKernels.ARG_FD_SPLIT_LEN, sp.length());
-        decode.setInt(AttnKernels.ARG_FD_FLAGS, pagedFlags(direct));
-        decode.setInt(AttnKernels.ARG_FDP_N_SEQ, nSeq);
-        decode.setInt(AttnKernels.ARG_FD_Q_OFF, qOff);
-        decode.setInt(AttnKernels.ARG_FD_OUT_OFF, outOff);
-        decode.setGlobal(decodePlan.decodePagedGlobal(nSeq, sp.count()));
-        decode.dispatch();
+        d.setInt(AttnKernels.ARG_FD_N_SPLIT, layoutSplits);
+        d.setInt(AttnKernels.ARG_FD_SPLIT_LEN, sp.length());
+        d.setInt(AttnKernels.ARG_FD_FLAGS, pagedFlags(direct));
+        d.setInt(AttnKernels.ARG_FDP_N_SEQ, nSeq);
+        d.setInt(AttnKernels.ARG_FD_Q_OFF, qOff);
+        d.setInt(AttnKernels.ARG_FD_OUT_OFF, outOff);
+        d.setGlobal(grouped ? FlashAttnTiling.decodeGqaGlobal(nSeq, nHeadKv, sp.count())
+                : decodePlan.decodePagedGlobal(nSeq, sp.count()));
+        d.dispatch();
         if (!direct) {
             int splits = sp.count();
             if (sinkPartial != null) {

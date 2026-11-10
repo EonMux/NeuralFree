@@ -688,37 +688,6 @@ NF_INLINE void nf_fd_paged_poison(int n_seq, int n_head, int d_v, int n_split, i
 }
 
 /*
- * Full paged entry-point arguments: the LLM_FlashDecode_<KV> arguments in order (kv_start, kv_end and q_pos are
- * ignored; the host passes 0), then page_shift, max_pages, n_seq, q_seq_stride, out_seq_stride and buffers
- * page_table, seq_kv_len, q_pos_seq.
- */
-#define NF_FLASH_DECODE_PAGED_RUN_ARGS_PAGED(KV_T)                                            \
-    const int n_head, const int n_head_kv, const int d_k, const int d_v, const int g_tile,     \
-    const int n_split, const int split_len, const int kv_start, const int kv_end,             \
-    const int q_pos,                                                                          \
-    const int k_row_stride, const int k_head_stride, const int v_row_stride,                  \
-    const int v_head_stride,                                                                  \
-    const float scale, const float softcap, const float max_bias,                             \
-    const int flags, const int swa_type, const int n_swa,                                     \
-    const int bias_mode, const int n_buckets, const int max_distance,                         \
-    const int q_off, const int out_off,                                                       \
-    const int page_shift, const int max_pages, const int n_seq,                               \
-    const int q_seq_stride, const int out_seq_stride,                                         \
-    NF_GLOBAL const float* q,                                                                 \
-    NF_GLOBAL const KV_T* k,                                                                  \
-    NF_GLOBAL const KV_T* v,                                                                  \
-    NF_GLOBAL const int* NF_RESTRICT kv_pos,                                                  \
-    NF_GLOBAL const float* NF_RESTRICT sinks,                                                 \
-    NF_GLOBAL const float* NF_RESTRICT rel_bias,                                              \
-    NF_GLOBAL float* out,                                                                     \
-    NF_GLOBAL float* partial,                                                                 \
-    NF_GLOBAL const int* NF_RESTRICT page_table,                                              \
-    NF_GLOBAL const int* NF_RESTRICT seq_kv_len,                                              \
-    NF_GLOBAL const int* NF_RESTRICT q_pos_seq,                                               \
-    NF_GLOBAL const float* NF_RESTRICT kv_scales,                                             \
-    NF_GLOBAL const ulong* NF_RESTRICT tree_mask
-
-/*
  * Per workgroup: the sequence s, its slot range [0, kv_len) and its q / out blocks are resolved before
  * nf_fd_run, which is the shared algorithm with page_shift >= 0 (K, V and kv_pos read at nf_kv_row(t),
  * page ids below 0 masked, partial rows at s * n_head + h).

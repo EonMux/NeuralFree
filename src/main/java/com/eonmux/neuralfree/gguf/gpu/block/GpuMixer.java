@@ -66,6 +66,17 @@ public interface GpuMixer extends AutoCloseable {
         return List.of();
     }
 
+    /**
+     * The patchers of this mixer's launches in the plain paged decode step (one row per sequence over a paged
+     * cache, every segment one row), in the order their groups enqueue, each deriving its kernels' per-step values
+     * from the step's key count (the largest live key count of the step's sequences). Empty when the mixer's paged
+     * decode launches carry no per-step values; null when the mixer cannot vouch for them, which keeps the paged
+     * decode step on the body replay.
+     */
+    default List<GpuStepPatcher> pagedDecodeReplayPatchers() {
+        return null;
+    }
+
     /** {@code nTokens} consecutive tokens at positions {@code pos0 ..}. */
     void prefill(int pos0, int nTokens, ScratchSlot in, ScratchSlot out);
 

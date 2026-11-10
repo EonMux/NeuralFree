@@ -728,4 +728,59 @@ public class CudaGraphReplayIntegrationTest {
             x.close();
         }
     }
+
+    /**
+     * A step value that changes once and then holds reaches both executable graphs: the patch that
+     * changed it wrote one instantiation, so the next prepare of the other one must still rewrite the
+     * node although the value equals the node's record. The same holds after a body replay, which
+     * writes the launched instantiation only, hands the graph to the patched replay. And a patched value
+     * never leaks into a direct launch: one that sets the kernel's argument back to its value before the
+     * patch launches that value.
+     */
+    @Test
+    public void aValueThatChangesOnceReachesBothExecutableGraphs() {
+        GpuBuffer x = buffer(iota(1, 1));
+        try {
+            queue.beginCapture();
+            launchScale(x, 1.0f);
+            GpuGraph graph = queue.endCapture();
+            try {
+                /* The factor is 1 at step 0 and 2 from step 1 on. */
+                GpuGraphPatchPlan plan = (pos, sink) -> {
+                    sink.patchKernel(0, null, new int[]{1}, new Object[]{pos == 0 ? 1.0f : 2.0f});
+                    return true;
+                };
+                assertTrue(graph.replayPatched(plan, 0));
+                assertTrue(graph.preparePatched(plan, 1, 0));
+                assertTrue(graph.replayPatched(plan, 1));
+                assertTrue(graph.preparePatched(plan, 2, 1));
+                assertTrue(graph.replayPatched(plan, 2));
+                assertArrayEquals("1 x 1 x 2 x 2", scaleOf(iota(1, 1), 4.0f), readBack(x), 0.0f);
+
+                /* A body replay moves the factor to 0.5 on the launched graph; the patched steps that
+                 * follow keep it on both. */
+                graph.replay(() -> launchScale(x, 0.5f));
+                GpuGraphPatchPlan half = (pos, sink) -> {
+                    sink.patchKernel(0, null, new int[]{1}, new Object[]{0.5f});
+                    return true;
+                };
+                assertTrue(graph.replayPatched(half, 3));
+                assertTrue(graph.preparePatched(half, 4, 3));
+                assertTrue(graph.replayPatched(half, 4));
+                assertTrue(graph.preparePatched(half, 5, 4));
+                assertTrue(graph.replayPatched(half, 5));
+                assertArrayEquals("4 x 0.5^4", scaleOf(iota(1, 1), 0.25f), readBack(x), 0.0f);
+
+                /* A direct launch at 1, the patched step at 2, the direct launch at 1 again. */
+                launchScale(x, 1.0f);
+                assertTrue(graph.replayPatched(plan, 6));
+                launchScale(x, 1.0f);
+                assertArrayEquals("0.25 x 1 x 2 x 1", scaleOf(iota(1, 1), 0.5f), readBack(x), 0.0f);
+            } finally {
+                graph.close();
+            }
+        } finally {
+            x.close();
+        }
+    }
 }

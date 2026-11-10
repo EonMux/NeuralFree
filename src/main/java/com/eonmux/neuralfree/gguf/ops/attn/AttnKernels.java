@@ -89,6 +89,12 @@ public final class AttnKernels {
     /** Name prefix of the tensor-core paged ({@code LLM_FlashAttnMmaPaged_<KV>}) variants; CUDA only. */
     public static final String FLASH_ATTN_MMA_PAGED_PREFIX = "LLM_FlashAttnMmaPaged_";
 
+    /**
+     * Name prefix of the grouped-query paged decode variants ({@code LLM_FlashDecodePagedGqa_<KV>}, the
+     * {@code LLM_FlashDecodePaged_<KV>} arguments, every query head of a KV group in one work-group); CUDA only.
+     */
+    public static final String FLASH_DECODE_PAGED_GQA_PREFIX = "LLM_FlashDecodePagedGqa_";
+
     /** Bits of one type code in the packed {@code kv_types} argument ({@code NF_ATTN_KV_TYPE_BITS}). */
     public static final int KV_TYPE_BITS = 8;
 
@@ -557,6 +563,17 @@ public final class AttnKernels {
     }
 
     /**
+     * Grouped-query paged decode kernel ({@code LLM_FlashDecodePagedGqa_<KV>}, CUDA only) over a K cache of type
+     * {@code k} and a V cache of type {@code v}: the F16 and BF16 caches with both caches of one type; null for
+     * every other pair, so only a caller that has checked {@link FlashAttnTiling#gqaDecodeServes} reaches it.
+     */
+    public static String flashDecodePagedGqa(KvDType k, KvDType v) {
+        Objects.requireNonNull(k, "k");
+        Objects.requireNonNull(v, "v");
+        return k == v && (k == KvDType.F16 || k == KvDType.BF16) ? k.kernel(FLASH_DECODE_PAGED_GQA_PREFIX) : null;
+    }
+
+    /**
      * Arguments of the paged kernel that {@link #flashDecodePaged(KvDType, KvDType)} or
      * {@link #flashAttnPaged(KvDType, KvDType)} selects, built from the same-type paged argument list {@code args}
      * (all {@link #FDP_ARG_COUNT} or {@link #FAP_ARG_COUNT} arguments in signature order): {@code args} itself when
@@ -580,9 +597,10 @@ public final class AttnKernels {
     }
 
     /**
-     * Every kernel of this family that each backend provides, for {@code LlmKernels.prewarm}. The tensor-core
-     * mma kernels are absent: only a CUDA device with compute capability 8.0+ can load them, so hosts look them
-     * up through {@link #flashAttnMma(KvDType)} and {@link #flashAttnMmaPaged(KvDType)} instead.
+     * Every kernel of this family that each backend provides, for {@code LlmKernels.prewarm}. The CUDA-only
+     * kernels are absent: hosts look the tensor-core mma kernels (compute capability 8.0+) up through
+     * {@link #flashAttnMma(KvDType)} and {@link #flashAttnMmaPaged(KvDType)}, and the grouped-query paged decode
+     * through {@link #flashDecodePagedGqa(KvDType, KvDType)}.
      */
     public static List<String> all() {
         return ALL;

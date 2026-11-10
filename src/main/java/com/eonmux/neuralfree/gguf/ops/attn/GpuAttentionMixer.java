@@ -119,10 +119,8 @@ import java.util.Objects;
  */
 public final class GpuAttentionMixer implements GpuMixer {
 
-    /**
-     * {@code data[s * dim + d] += bias[d]} ({@code kernels/llm/eltwise.cl}); arguments
-     * {@code (dim, seq_len, bias, data)}.
-     */
+    /** {@code data[s * dim + d] += bias[d]} ({@code kernels/llm/eltwise.cl}); arguments
+     * {@code (dim, seq_len, bias, data)}. */
     public static final String BIAS_ADD = GpuOps.BATCH_BIAS_ADD;
     private static final int ARG_BIAS_SEQ = 1;
     private static final int ARG_COPY_ROWS = 0;
@@ -599,13 +597,15 @@ public final class GpuAttentionMixer implements GpuMixer {
         return flash != null && flash.routesDecodeThroughPrefill();
     }
 
-    /**
-     * True when the one-row step at {@code pos0} runs the tensor-core prefill launch: the plan-level route plus,
-     * on a depth-routed plan, every step over at most one workgroup of live keys ({@code pos0 + 1} of a dense
-     * causal cache).
-     */
+    /** True when the one-row step at {@code pos0} runs the tensor-core prefill launch: the plan-level route plus, on
+     * a depth-routed plan, at most one workgroup of live keys ({@code pos0 + 1} of a dense causal cache). */
     private boolean routesDecodeThroughPrefill(int pos0) {
         return flash != null && flash.routesDecodeThroughPrefill(pos0 + 1);
+    }
+
+    @Override
+    public List<GpuStepPatcher> pagedDecodeReplayPatchers() {
+        return dualChunk != null || flash == null ? null : flash.pagedPatchers();
     }
 
     @Override

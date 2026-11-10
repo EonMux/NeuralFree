@@ -484,6 +484,29 @@ public final class GpuLayerExecutor implements AutoCloseable {
     }
 
     /**
+     * The paged decode-step replay patchers of every mixer this stack's plain paged decode step runs (each layer's
+     * mixer, its parallel attention and its cross attention, in trunk order), or null when one of them cannot vouch
+     * for its launches' per-step values ({@link GpuMixer#pagedDecodeReplayPatchers()}).
+     */
+    public List<GpuStepPatcher> pagedDecodeReplayPatchers() {
+        ensureOpen();
+        List<GpuStepPatcher> out = new ArrayList<>();
+        for (LayerBlocks l : layers) {
+            for (GpuMixer m : new GpuMixer[]{l.mixer, l.parallelAttention, l.crossMixer}) {
+                if (m == null) {
+                    continue;
+                }
+                List<GpuStepPatcher> patchers = m.pagedDecodeReplayPatchers();
+                if (patchers == null) {
+                    return null;
+                }
+                out.addAll(patchers);
+            }
+        }
+        return out;
+    }
+
+    /**
      * Starts making the first layer's weights resident, so a streamed upload overlaps the embedding stage of the
      * step; {@link #run} prefetches it again (a no-op once started) for callers that skip this.
      */

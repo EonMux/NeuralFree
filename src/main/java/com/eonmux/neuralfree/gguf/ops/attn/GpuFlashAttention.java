@@ -2,11 +2,14 @@ package com.eonmux.neuralfree.gguf.ops.attn;
 
 import com.eonmux.neuralfree.acceleration.backend.ComputeQueue;
 import com.eonmux.neuralfree.acceleration.backend.GpuBuffer;
+import com.eonmux.neuralfree.acceleration.backend.GpuStepPatcher;
 import com.eonmux.neuralfree.gguf.BatchInvariance;
 import com.eonmux.neuralfree.gguf.gpu.forward.PreparedDispatch;
 import com.eonmux.neuralfree.gguf.memory.gpu.GpuStepInputs;
 import com.eonmux.neuralfree.gguf.memory.paged.PagedStep;
 import com.eonmux.neuralfree.gguf.spec.AttentionSpec;
+
+import java.util.List;
 
 /**
  * Flash attention of one softmax-attention layer over its {@link FlashKeys}: the decode kernel per query row, the
@@ -347,6 +350,15 @@ final class GpuFlashAttention {
     private static int stepFlags(int base, boolean direct, boolean tree, int nFresh) {
         int f = base | (direct ? AttnKernels.FLAG_DIRECT : 0);
         return tree ? AttnKernels.treeFlags(f, nFresh) : f;
+    }
+
+    /**
+     * The paged decode-step patchers of this attention: its paged attention's ({@link GpuPagedFlashAttention#patcher}),
+     * or null when the keys are not a paged cache or the paged decode launches every row alone.
+     */
+    List<GpuStepPatcher> pagedPatchers() {
+        PagedDecodePatcher p = paged == null ? null : paged.patcher();
+        return p == null ? null : List.of(p);
     }
 
     /**

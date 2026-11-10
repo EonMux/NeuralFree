@@ -950,6 +950,8 @@ LLM_FlashAttn_TQ_3BIT_VALUES	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,
 LLM_FlashAttn_TQ_4BIT_KEYS	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBBB
 LLM_FlashAttn_TQ_4BIT_VALUES	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBBB
 LLM_FlashAttn_TQ_K8_KEYS	flash_prefill.cl	11	29	i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiiiiiifffiiiiiiiiBBBBBBBBBBB
+LLM_FlashDecodePagedGqa_BF16	flash_decode_gqa.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
+LLM_FlashDecodePagedGqa_F16	flash_decode_gqa.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_BF16	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_F16	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
 LLM_FlashDecodePaged_F32	flash_decode.cl	13	30	i,i,i,i,i,i,i,i,i,i,i,i,i,i,f,f,f,i,i,i,i,i,i,i,i,i,i,i,i,i	iiiiiiiiiiiiiifffiiiiiiiiiiiiiBBBBBBBBBBBBB
@@ -1720,6 +1722,8 @@ Q4_K_MatVecIdGateUp	moe_matvec.cl	6	13	i,i,i,i,i,i,f,f,f,i,i,i,i	iiiiiifffiiiiBB
 Q4_K_MatVecIdGateUpInd	moe_matvec.cl	7	11	i,i,i,i,i,i,f,f,f,i,i	iiiiiifffiiBBBBBBB
 Q4_K_MatVecIdInd	moe_matvec.cl	6	7	i,i,i,i,i,i,i	iiiiiiiBBBBBB
 Q4_K_MatVecIdT	moe_matvec.cl	5	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBB
+Q4_K_MatVecMma16_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
+Q4_K_MatVecMma8_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
 Q4_K_MatVecN10_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q4_K_MatVecN11_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q4_K_MatVecN12_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -1952,6 +1956,8 @@ Q6_K_MatVecIdGateUp	moe_matvec.cl	6	13	i,i,i,i,i,i,f,f,f,i,i,i,i	iiiiiifffiiiiBB
 Q6_K_MatVecIdGateUpInd	moe_matvec.cl	7	11	i,i,i,i,i,i,f,f,f,i,i	iiiiiifffiiBBBBBBB
 Q6_K_MatVecIdInd	moe_matvec.cl	6	7	i,i,i,i,i,i,i	iiiiiiiBBBBBB
 Q6_K_MatVecIdT	moe_matvec.cl	5	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBB
+Q6_K_MatVecMma16_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
+Q6_K_MatVecMma8_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
 Q6_K_MatVecN10_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_MatVecN11_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
 Q6_K_MatVecN12_Q8	matvec_kquant.cl	3	2	i,i	iiBBB
@@ -2013,6 +2019,8 @@ Q8_0_MatVecIdGateUp	moe_matvec.cl	6	13	i,i,i,i,i,i,f,f,f,i,i,i,i	iiiiiifffiiiiBB
 Q8_0_MatVecIdGateUpInd	moe_matvec.cl	7	11	i,i,i,i,i,i,f,f,f,i,i	iiiiiifffiiBBBBBBB
 Q8_0_MatVecIdInd	moe_matvec.cl	6	7	i,i,i,i,i,i,i	iiiiiiiBBBBBB
 Q8_0_MatVecIdT	moe_matvec.cl	5	9	i,i,i,i,i,i,i,i,i	iiiiiiiiiBBBBB
+Q8_0_MatVecMma16_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
+Q8_0_MatVecMma8_Q8	matvec_mma.cl	3	3	i,i,i	iiiBBB
 Q8_0_MatVecN	matvec_q8_0.cl	3	3	i,i,i	iiiBBB
 Q8_0_MatVecN10_Q8	matvec_q8_0.cl	3	2	i,i	iiBBB
 Q8_0_MatVecN11_Q8	matvec_q8_0.cl	3	2	i,i	iiBBB

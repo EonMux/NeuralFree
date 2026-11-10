@@ -375,8 +375,8 @@ public final class GpuDenseFfn implements GpuFfnBlock {
                     ops.gateUpGlu(gate.weight, up.weight, layout.glu(), layout.params(), x, g);
                     break;
                 }
-                GpuOps.SharedQ8 share = nTokens == 1 && GpuOps.shareableQ8Activations(xOff, layout.nIn())
-                        ? ops.shareQ8Activations(x, xOff, layout.nIn()) : null;
+                GpuOps.SharedQ8 share = GpuOps.shareableQ8Activations(xOff, layout.nIn())
+                        ? ops.shareQ8Activations(x, xOff, layout.nIn(), nTokens) : null;
                 try {
                     gate.run(ops, nTokens, x, xOff, g, 0);
                     sparsity(nTokens);

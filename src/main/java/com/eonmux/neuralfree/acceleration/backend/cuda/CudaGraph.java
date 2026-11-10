@@ -51,8 +51,9 @@ import static jcuda.driver.JCudaDriver.cuGraphExecMemsetNodeSetParams;
  * <p>{@link #replayPatched(GpuGraphPatchPlan, int)} skips the body: the plan hands each captured
  * dispatch's step values to {@code patchKernel}, which writes the changed values into the nodes'
  * parameter holders and rewrites only the changed nodes through {@code cuGraphExecKernelNodeSetParams}
- * before the one {@code cuGraphLaunch}. A node whose step values equal what its parameters hold is
- * left untouched.
+ * before the one {@code cuGraphLaunch}. A node whose step values equal what the launched instantiation's
+ * parameters hold is left untouched: every node update writes one of the two executable graphs, so a
+ * node remembers the instantiation that lags it and the next patch of that instantiation rewrites it.
  *
  * <p>{@link #launch} submits the capture-time command sequence on any open queue of the backend.
  * Buffers referenced by the nodes must stay open until {@link #close()}, which drains the capturing
@@ -83,6 +84,11 @@ final class CudaGraph implements GpuGraph {
         /** The argument values the node's parameters last held; a node update keeps it current. */
         final Object[] args;
         long argVersion;
+        /**
+         * The executable graph whose parameters for this node lag {@link #args} and the work size (a node
+         * update writes one of the two instantiations), or null when both hold them.
+         */
+        CUgraphExec lagging;
 
         final CudaBuffer src;
         final CudaBuffer dst;
@@ -310,11 +316,12 @@ final class CudaGraph implements GpuGraph {
     }
 
     /**
-     * One patch of the plan: writes the changed values into the node's parameter holders, refreshes the
+     * One patch of the plan: binds the changed values through the node's argument state, refreshes the
      * node's record and rewrites the node's parameters on {@code target}, so the next launch of that
      * executable graph runs the dispatch with this step's arguments. The work size is the global work
      * size in work items, as {@link GpuGraphDispatch#grid()} reports it; the node's blocks are
-     * recomputed from it over the captured block. A patch equal to what the node holds writes nothing.
+     * recomputed from it over the captured block. A patch equal to what the node holds writes nothing
+     * unless {@code target} lags the node's record, which it then catches up.
      */
     private void patchKernel(CUgraphExec target, int recordIndex, long[] global, int[] argIndices,
                              Object[] values) {
@@ -330,7 +337,7 @@ final class CudaGraph implements GpuGraph {
                 changed = true;
             }
         }
-        if (!changed) {
+        if (!changed && node.lagging != target) {
             return;
         }
         for (int i = 0; i < argIndices.length; i++) {
@@ -339,7 +346,7 @@ final class CudaGraph implements GpuGraph {
             if (KernelArgs.sameValue(node.args[arg], value)) {
                 continue;
             }
-            writeHolder(node.handle.args(), sticky, arg, value);
+            patchArg(node.handle.args(), node.args[arg], arg, value);
             node.args[arg] = value instanceof GpuBuffer ? value : KernelArgs.snapshot(value, node.args[arg]);
         }
         if (global != null && !sameGlobal(node.global, global)) {
@@ -351,6 +358,7 @@ final class CudaGraph implements GpuGraph {
         CudaErrors.check("cuGraphExecKernelNodeSetParams(" + node.handle.kernelName() + ")",
                 () -> cuGraphExecKernelNodeSetParams(target, node.node, nodeParams));
         node.argVersion = sticky.version();
+        node.lagging = changed ? (target == exec ? nextExec : exec) : null;
     }
 
     /** True when two global work sizes launch the same grid, so trailing dimensions of 1 do not matter. */
@@ -358,34 +366,19 @@ final class CudaGraph implements GpuGraph {
         return Arrays.equals(WorkSizes.pad3(a, 1), WorkSizes.pad3(b, 1));
     }
 
-    /** Writes one patched value into the argument's live parameter holder. */
-    private static void writeHolder(CudaArgState args, StickyArgs sticky, int index, Object value) {
-        Object holder = args.holder(index);
-        if (value instanceof Integer || value instanceof Boolean) {
-            int v = value instanceof Boolean ? (((Boolean) value) ? 1 : 0) : (Integer) value;
-            if (holder instanceof int[] && ((int[]) holder).length == 1) {
-                ((int[]) holder)[0] = v;
-                return;
-            }
-        } else if (value instanceof Float) {
-            if (holder instanceof float[] && ((float[]) holder).length == 1) {
-                ((float[]) holder)[0] = (Float) value;
-                return;
-            }
-        } else if (value instanceof Long) {
-            if (holder instanceof long[] && ((long[]) holder).length == 1) {
-                ((long[]) holder)[0] = (Long) value;
-                return;
-            }
-        } else if (value instanceof Double) {
-            if (holder instanceof double[] && ((double[]) holder).length == 1) {
-                ((double[]) holder)[0] = (Double) value;
-                return;
-            }
+    /**
+     * Binds one patched value through the kernel's argument state, so its sticky record and its live
+     * parameter holder move together: a later direct launch that sets the argument back to its previous
+     * value rewrites the holder instead of finding the record unchanged and launching the patched value.
+     * The value must keep the kind the captured argument has.
+     */
+    private static void patchArg(CudaArgState args, Object captured, int index, Object value) {
+        if (captured == null || KernelArgs.kindOf(captured) != KernelArgs.kindOf(value)) {
+            throw new IllegalArgumentException("cannot patch arg " + index + " of " + args.sticky().kernelName()
+                    + " with " + KernelArgs.describe(value) + ": the value's kind does not match the captured"
+                    + " argument");
         }
-        throw new IllegalArgumentException("cannot patch arg " + index + " of " + sticky.kernelName()
-                + " with " + KernelArgs.describe(value) + ": the value's kind does not match the"
-                + " captured parameter holder");
+        args.set(index, value);
     }
 
     /** Throws when the graph is closed; {@code what} names the refused operation. */
@@ -425,12 +418,16 @@ final class CudaGraph implements GpuGraph {
                         + " graph is open; close the graph first");
             }
         }
-        if (argsChanged(node, sticky, global)) {
+        boolean changed = argsChanged(node, sticky, global);
+        if (changed || node.lagging == exec) {
             Pointer params = handle.args().kernelParams();
             CUDA_KERNEL_NODE_PARAMS nodeParams = nodeParams(handle.function(), grid, block, params);
             CudaErrors.check("cuGraphExecKernelNodeSetParams(" + name + ")",
                     () -> cuGraphExecKernelNodeSetParams(exec, node.node, nodeParams));
             node.argVersion = sticky.version();
+            node.lagging = changed ? nextExec : null;
+        }
+        if (changed) {
             node.global = global.clone();
             node.grid = grid.clone();
             refreshArgs(node, sticky);

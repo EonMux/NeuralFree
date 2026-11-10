@@ -13,6 +13,7 @@ import com.eonmux.neuralfree.gguf.gpu.weights.GpuWeight;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernelConstants;
 import com.eonmux.neuralfree.gguf.kernels.LlmKernels;
 import com.eonmux.neuralfree.gguf.ops.gemm.GemmKernels;
+import com.eonmux.neuralfree.gguf.ops.gemm.MatVecMmaPlan;
 import com.eonmux.neuralfree.gguf.ops.gemm.SplitKGemmPlan;
 import com.eonmux.neuralfree.gguf.quant.HadamardSpec;
 import com.eonmux.neuralfree.gguf.quant.InputTransform;
@@ -260,8 +261,7 @@ final class GpuProjections {
         int floatNMax = k.matvecN != null
                 ? SmallBatchCrossover.floatMatvecNMax(deviceKind, w.type(), elements) : 0;
         int int8Max = SmallBatchCrossover.int8MatvecNMax(deviceKind, w.type(), elements, lane != null);
-        boolean q8n = !invariant && nTokens >= 2 && nTokens <= int8Max
-                && int8LaneUsable(k.matvecNQ8, w, true);
+        boolean q8n = !invariant && int8MultiColumnServes(k, w, cols, nTokens, int8Max);
         boolean floatN = !invariant && nTokens >= 2 && nTokens <= floatNMax
                 && ops.optionalReady(k.matvecN, matvecLocal);
         String fast = lane != null && !q8n && !floatN && (invariant || nTokens >= fastMin)
@@ -339,7 +339,7 @@ final class GpuProjections {
             x = offsetFree(x, nTokens, cols);
             boolean direct = w.isSingleShard() && outOff == 0;
             boolean q8 = !invariant && nTokens == 1 && int8LaneUsable(k.matvecQ8, w, false);
-            GpuBuffer xq = q8 ? quantizedRow(x, cols) : q8n ? quantizeQ8N(x.buf, nTokens, cols) : null;
+            GpuBuffer xq = q8 ? quantizedRow(x, cols) : q8n ? quantizedRows(x, nTokens, cols) : null;
             for (int s = 0; s < w.shardCount(); s++) {
                 int m = (int) w.shardRows(s);
                 if (direct) {
@@ -388,8 +388,7 @@ final class GpuProjections {
         int floatNMax = k.matvecN != null
                 ? SmallBatchCrossover.floatMatvecNMax(deviceKind, w.type(), elements) : 0;
         int int8Max = SmallBatchCrossover.int8MatvecNMax(deviceKind, w.type(), elements, lane != null);
-        if (!invariant && nTokens >= 2 && nTokens <= int8Max
-                && int8LaneUsable(k.matvecNQ8, w, true)) {
+        if (!invariant && int8MultiColumnServes(k, w, cols, nTokens, int8Max)) {
             return false;
         }
         if (!invariant && nTokens >= 2 && nTokens <= floatNMax
@@ -607,10 +606,18 @@ final class GpuProjections {
      * the launch when the type provides it, and the counted two-row twin ({@code {T}_MatVec2N<n>_Q8},
      * one work-group per row pair so the Q8_1 rows are read once per two weight rows) serves it when
      * {@link Int8MatvecTuning#pairedCountedIsFaster} selects the pairing at {@code elements},
-     * {@code nTokens} and {@code m}.
+     * {@code nTokens} and {@code m}. Ahead of both, the tensor-core multi-column matvec
+     * ({@code {T}_MatVecMma{8,16}_Q8}, {@link MatVecMmaPlan}) serves the launch where
+     * {@link MatVecMmaTuning} measured it faster on this device kind; it reads the same Q8_1 rows.
      */
     private void launchInt8MatvecN(GGMLType type, long elements, String kernel, int m, int cols, int nTokens,
                                    GpuBuffer weight, GpuBuffer xq, GpuBuffer out) {
+        MatVecMmaPlan mma = tensorCoreMatvecN(type, m, cols, nTokens);
+        if (mma != null) {
+            ops.launch2d(mma.kernel(), mma.globalWorkSize()[0], 1, (int) mma.localWorkSize()[0], m, cols, nTokens,
+                    weight, xq, out);
+            return;
+        }
         String counted = countedMatvecN(kernel, nTokens);
         if (counted != kernel) {
             String paired = pairedCountedMatvecN(type, elements, counted, nTokens, m);
@@ -622,6 +629,50 @@ final class GpuProjections {
         } else {
             ops.launchMatvec(counted, (long) m * matvecLocal, m, cols, nTokens, weight, xq, out);
         }
+    }
+
+    /**
+     * Whether the integer-dot multi-column lane takes {@code nTokens} (two or more) rows through the weight
+     * {@code w} of {@code cols} columns: through the tensor-core form wherever {@link MatVecMmaTuning} measured it
+     * faster than every lane the projection would otherwise take, on every shard (its cost is flat in the row
+     * count inside its token tile, so this holds above the counted cap and on projections whose counted forms
+     * lose), else through the counted forms up to the measured cap {@code int8Max}
+     * ({@link SmallBatchCrossover#int8MatvecNMax}) behind their own evidence ({@link #int8LaneUsable}).
+     */
+    private boolean int8MultiColumnServes(WeightKernels k, GpuWeight w, int cols, int nTokens, int int8Max) {
+        if (nTokens < 2) {
+            return false;
+        }
+        if (int8Mode.permitsLane() && cols % w.type().getBlockSize() == 0
+                && tensorCoreServesShards(w, cols, nTokens)) {
+            return true;
+        }
+        return nTokens <= int8Max && int8LaneUsable(k.matvecNQ8, w, true);
+    }
+
+    /** Whether the tensor-core multi-column matvec serves {@code nTokens} rows through every shard of {@code w}. */
+    private boolean tensorCoreServesShards(GpuWeight w, int cols, int nTokens) {
+        for (int s = 0; s < w.shardCount(); s++) {
+            if (tensorCoreMatvecN(w.type(), (int) w.shardRows(s), cols, nTokens) == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The tensor-core multi-column matvec plan of {@code nTokens} rows through {@code m x cols} rows of
+     * {@code type}, or null when {@link MatVecMmaTuning} keeps the counted forms here or the kernel is not in the
+     * library (or cannot run its widest work-group on this device).
+     */
+    private MatVecMmaPlan tensorCoreMatvecN(GGMLType type, int m, int cols, int nTokens) {
+        int warps = MatVecMmaTuning.warps(deviceKind, type, m, cols, nTokens);
+        if (warps == 0) {
+            return null;
+        }
+        MatVecMmaPlan plan = MatVecMmaPlan.of(type, m, cols, nTokens, warps);
+        return ops.kernels().kernelNames().contains(plan.kernel())
+                && ops.optionalReady(plan.kernel(), 32L * MatVecMmaPlan.MAX_WARPS) ? plan : null;
     }
 
     /**
@@ -781,13 +832,22 @@ final class GpuProjections {
                 && Int8MatvecTuning.laneIsFaster(deviceKind, type, elements);
     }
 
-    /** {@link #quantizeQ8} through the open {@link SharedQ8} when it covers this view. */
+    /** {@link #quantizeQ8} through the open {@link GpuOps.SharedQ8} when it covers this view. */
     private GpuBuffer quantizedRow(GpuOps.View x, int cols) {
         GpuOps.SharedQ8 share = ops.activeShare;
-        if (share != null && share.matches(x, cols)) {
+        if (share != null && share.matches(x, cols, 1)) {
             return share.blocks();
         }
         return quantizeQ8(x.buf, cols);
+    }
+
+    /** {@link #quantizeQ8N} through the open {@link GpuOps.SharedQ8} when it covers these rows. */
+    private GpuBuffer quantizedRows(GpuOps.View x, int nTokens, int cols) {
+        GpuOps.SharedQ8 share = ops.activeShare;
+        if (share != null && share.matches(x, cols, nTokens)) {
+            return share.blocks();
+        }
+        return quantizeQ8N(x.buf, nTokens, cols);
     }
 
     /**

@@ -77,24 +77,31 @@ public class GpuStepReplayParityTest {
         }
     }
 
-    /** The paged memory's sequence capacity of the paged probe (the widest cycled batch). */
+    /** The paged memory's sequence capacity of the paged probe (the widest batch). */
     private static final int PAGED_SEQUENCES = 16;
     /**
-     * The paged memory's row budget of the paged probe: the paged {@code nCtx} bounds the whole pool's
-     * physical rows (every sequence shares it), and the probe's sequences advance (2+5+9+16) * 9
-     * positions in total, so this leaves headroom over that.
+     * The paged memory's row budget of the paged probe: the paged {@code nCtx} bounds the whole pool's physical
+     * rows (every sequence shares it); the schedule writes 975 rows in all.
      */
-    private static final int PAGED_CTX = 512;
-    /** Decode steps the paged probe runs per width (past the capture's warmup, so replays happen). */
-    private static final int PAGED_STEPS = 8;
+    private static final int PAGED_CTX = 2048;
+    /**
+     * The paged probe's schedule: {width, decode steps} blocks, each block one prompt row and then its decode steps
+     * per active sequence. A block runs past the capture's warmup and verify steps (five), so its trailing steps
+     * replay; the one-row block crosses the grouped decode's direct-to-split change and several split counts, and
+     * the last blocks change the row count between captures.
+     */
+    private static final int[][] PAGED_SCHEDULE = {
+            {1, 80}, {2, 12}, {4, 12}, {8, 12}, {16, 12}, {16, 7}, {8, 7}, {16, 7}, {2, 7}, {1, 7}, {16, 9},
+    };
 
     /**
-     * Opt-in parity of the paged batched decode steps' trunk replay: the same multi-sequence decode (one
-     * row per sequence, widths cycling {@link #WIDTHS} over a paged memory of {@link #PAGED_SEQUENCES}
-     * sequences) runs with the step replay off and on, and every sequence's greedy token stream must be
-     * identical — the captured trunk's dispatches must produce the unreplayed step's exact logits. The
-     * width changes between widths drop and recapture the graph, so the probe also walks the recapture
-     * fallback's steps.
+     * Opt-in parity of the plain paged decode steps' trunk replay (one row per sequence over a paged memory of
+     * {@link #PAGED_SEQUENCES} sequences, row counts 1 to 16 as {@link #PAGED_SCHEDULE} runs them): the same steps
+     * run with the replay off (every dispatch direct), as a body replay ({@code neuralfree.gpu.patchedReplay=false})
+     * and as a patched replay, and every sequence's greedy token stream must be identical across the three — the
+     * captured trunk's dispatches, replayed through the body or patched from the step's key count, must produce the
+     * direct step's exact logits. The row-count changes drop and recapture the graph, so the probe also walks the
+     * recapture's warmup and verify steps; each replaying run must end on its replay form.
      */
     @Test
     public void replayedPagedBatchStepsMatchDirectSteps() throws IOException {
@@ -111,26 +118,30 @@ public class GpuStepReplayParityTest {
                 continue;
             }
             String name = Path.of(model).getFileName().toString();
-            List<List<Integer>> direct = pagedStepped(model, false, fed);
-            List<List<Integer>> replayed = pagedStepped(model, true, fed);
+            List<List<Integer>> direct = pagedStepped(model, "off", fed);
+            List<List<Integer>> body = pagedStepped(model, "body", fed);
+            List<List<Integer>> patched = pagedStepped(model, "patched", fed);
             for (int s = 0; s < direct.size(); s++) {
-                compare("paged " + name + " sequence " + s, direct.get(s), replayed.get(s));
+                compare("paged " + name + " sequence " + s + " eager vs body", direct.get(s), body.get(s));
+                compare("paged " + name + " sequence " + s + " eager vs patched", direct.get(s), patched.get(s));
             }
+            org.junit.Assert.assertEquals("paged " + name + " body replay streams", direct, body);
+            org.junit.Assert.assertEquals("paged " + name + " patched replay streams", direct, patched);
         }
     }
 
     /**
-     * The paged probe of one replay mode: every width of {@link #WIDTHS} prompts its sequences (one
-     * token each, at each sequence's own next position) and then runs {@link #PAGED_STEPS} batched
-     * decode steps, every step feeding each active sequence its last greedy token through
-     * {@code forwardBatch}. Returns every sequence's greedy token stream, in sequence order.
+     * The paged probe of one replay mode ({@code off}, {@code body} or {@code patched}): every block of
+     * {@link #PAGED_SCHEDULE} prompts its sequences (one token each, at each sequence's own next position) and then
+     * runs its decode steps, every step feeding each active sequence its last greedy token through
+     * {@code forwardBatch}. Returns every sequence's greedy token stream, in sequence order; a replaying mode asserts
+     * that its replay ended on its own form.
      */
-    private static List<List<Integer>> pagedStepped(String modelPath, boolean replay, int[] fed)
-            throws IOException {
-        if (replay) {
-            System.clearProperty(GpuForwardBackend.CHAIN_REPLAY_PROPERTY);
-        } else {
-            System.setProperty(GpuForwardBackend.CHAIN_REPLAY_PROPERTY, "false");
+    private static List<List<Integer>> pagedStepped(String modelPath, String mode, int[] fed) throws IOException {
+        if (mode.equals("off")) {
+            System.setProperty(GpuForwardBackend.DECODE_REPLAY_PROPERTY, "false");
+        } else if (mode.equals("body")) {
+            System.setProperty(GpuDecodeReplay.PATCHED_PROPERTY, "false");
         }
         try {
             EngineConfig cfg = EngineConfig.builder()
@@ -147,17 +158,18 @@ public class GpuStepReplayParityTest {
             }
             try (EngineModel model = LLMModelFactory.open(modelPath, cfg)) {
                 ForwardBackend f = model.forwardBackend();
-                int i = 0;
-                for (int width : WIDTHS) {
+                int steps = 0;
+                for (int b = 0; b < PAGED_SCHEDULE.length; b++) {
+                    int width = PAGED_SCHEDULE[b][0];
                     ForwardBatch.Builder prompt = ForwardBatch.builder(width);
                     for (int s = 0; s < width; s++) {
-                        prompt.add(fed[(s + i) % fed.length], nextPos[s], s, false);
+                        prompt.add(fed[(s + b) % fed.length], nextPos[s], s, false);
                     }
                     f.forwardBatch(prompt.build());
                     for (int s = 0; s < width; s++) {
                         nextPos[s]++;
                     }
-                    for (int step = 0; step < PAGED_STEPS; step++) {
+                    for (int step = 0; step < PAGED_SCHEDULE[b][1]; step++) {
                         ForwardBatch.Builder decode = ForwardBatch.builder(width);
                         for (int s = 0; s < width; s++) {
                             decode.add(last[s], nextPos[s], s, true);
@@ -168,16 +180,24 @@ public class GpuStepReplayParityTest {
                             streams.get(s).add(last[s]);
                             nextPos[s]++;
                         }
+                        steps++;
                     }
-                    i++;
                 }
-                report("  paged " + (replay ? "replayed" : "direct") + " " + Path.of(modelPath).getFileName()
-                        + ": " + WIDTHS.length * PAGED_STEPS + " decode steps, sequences 0.."
-                        + (WIDTHS[WIDTHS.length - 1] - 1) + " advanced");
+                String stats = ((GpuForwardBackend) f).decodeReplayStats();
+                report("  paged " + mode + " " + Path.of(modelPath).getFileName() + ": " + steps
+                        + " decode steps, replay " + stats);
+                if (mode.equals("patched")) {
+                    org.junit.Assert.assertTrue("the patched run ends on a patched replay: " + stats,
+                            stats.contains("patched replay"));
+                } else if (mode.equals("body")) {
+                    org.junit.Assert.assertTrue("the body run ends on a body replay: " + stats,
+                            stats.contains("body replay"));
+                }
                 return streams;
             }
         } finally {
-            System.clearProperty(GpuForwardBackend.CHAIN_REPLAY_PROPERTY);
+            System.clearProperty(GpuForwardBackend.DECODE_REPLAY_PROPERTY);
+            System.clearProperty(GpuDecodeReplay.PATCHED_PROPERTY);
         }
     }
 

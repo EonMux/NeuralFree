@@ -64,7 +64,8 @@ import static org.junit.Assert.assertTrue;
  * paged F16 cache of two sequences, on the host-only fake backend with strict LLM argument rules: a backend with
  * tensor cores whose paged mma prefill kernel is missing runs every prefill segment through the
  * {@link PagedRowFallback} (one paged decode launch per row over the focus table), and the next decode step's single
- * launch over both sequences reads the step's own page table from Q and output offset 0.
+ * launch over both sequences reads the step's own page table from Q and output offset 0. A backend that also has the
+ * grouped-query paged decode runs that step through it instead, one work-group per sequence and KV head.
  */
 public class GpuPagedFlashAttentionTest {
 
@@ -158,10 +159,21 @@ public class GpuPagedFlashAttentionTest {
                 backend.allocateBuffer((long) cols * rows * Float.BYTES, true)));
     }
 
-    /** Binds the llama mixer over a paged F16 cache of {@link #PARALLEL} sequences on a tensor-core backend. */
+    /** {@link #bindPaged(boolean)} without the grouped-query paged decode. */
     private void bindPaged() {
+        bindPaged(false);
+    }
+
+    /**
+     * Binds the llama mixer over a paged F16 cache of {@link #PARALLEL} sequences on a tensor-core backend whose
+     * paged mma prefill is missing, with the grouped-query paged decode when {@code gqa} is set.
+     */
+    private void bindPaged(boolean gqa) {
+        String[] missing = gqa ? new String[]{AttnKernels.flashAttnMmaPaged(KvDType.F16)}
+                : new String[]{AttnKernels.flashAttnMmaPaged(KvDType.F16),
+                        AttnKernels.flashDecodePagedGqa(KvDType.F16, KvDType.F16)};
         backend = FakeComputeBackend.builder().strictLlmArgs(true).backendType(ComputeBackend.BackendType.OPENCL)
-                .capabilities(tensorCoreCaps()).unavailableKernels(AttnKernels.flashAttnMmaPaged(KvDType.F16))
+                .capabilities(tensorCoreCaps()).unavailableKernels(missing)
                 .build();
         ModelSpec spec = llama();
         LayerSpec l = spec.layers().get(0);
@@ -199,6 +211,11 @@ public class GpuPagedFlashAttentionTest {
      * mixer and commits it, returning the paged decode launches it dispatched.
      */
     private List<FakeDispatch> runStep(int[] lens, int[] pos0s) {
+        return runStep(lens, pos0s, AttnKernels.flashDecodePaged(KvDType.F16, KvDType.F16));
+    }
+
+    /** {@link #runStep(int[], int[])} returning the launches of {@code kernel}. */
+    private List<FakeDispatch> runStep(int[] lens, int[] pos0s, String kernel) {
         PagedSequences paged = memory.pagedSequences();
         int n = 0;
         int[] starts = new int[lens.length];
@@ -219,7 +236,7 @@ public class GpuPagedFlashAttentionTest {
         memory.beginPagedStep(step, rows, null);
         backend.clearLog();
         mixer.batch(layout, scratch.slot(ScratchSlots.NORMED), scratch.slot(ScratchSlots.BRANCH));
-        List<FakeDispatch> launches = named(backend.dispatches(), AttnKernels.flashDecodePaged(KvDType.F16, KvDType.F16));
+        List<FakeDispatch> launches = named(backend.dispatches(), kernel);
         memory.endPagedStep();
         paged.commit(step);
         for (int s = 0; s < lens.length; s++) {
@@ -277,6 +294,34 @@ public class GpuPagedFlashAttentionTest {
         assertSame(steps.pageTable(kv.group()), d.bufferArg(AttnKernels.ARG_FDP_BUF_PAGE_TABLE));
         assertSame(steps.seqKvLen(kv.group()), d.bufferArg(AttnKernels.ARG_FDP_BUF_SEQ_KV_LEN));
         assertSame(steps.qPosSeq(), d.bufferArg(AttnKernels.ARG_FDP_BUF_Q_POS_SEQ));
+        assertTrue((d.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_CAUSAL) != 0);
+    }
+
+    @Test
+    public void aDecodeStepWithTheGroupedKernelRunsOneWorkGroupPerSequenceAndKvHead() {
+        bindPaged(true);
+        GpuStepInputs steps = memory.stepInputs();
+        GpuKvLayer kv = memory.kv(0);
+        String gqa = AttnKernels.flashDecodePagedGqa(KvDType.F16, KvDType.F16);
+        runStep(new int[]{3, 2}, new int[]{0, 0}, gqa);
+        List<FakeDispatch> plain = runStep(new int[]{1, 1}, new int[]{3, 2});
+        assertEquals("no plain paged decode launch", 0, plain.size());
+        runStep(new int[]{1, 1}, new int[]{4, 3}, gqa);
+        List<FakeDispatch> decode = runStep(new int[]{1, 1}, new int[]{5, 4}, gqa);
+        assertEquals("one grouped paged decode launch over both sequences", 1, decode.size());
+        FakeDispatch d = decode.get(0);
+        assertEquals(2, d.intArg(AttnKernels.ARG_FDP_N_SEQ));
+        assertEquals(0, d.intArg(AttnKernels.ARG_FD_Q_OFF));
+        assertEquals(0, d.intArg(AttnKernels.ARG_FD_OUT_OFF));
+        assertEquals(Q_DIM, d.intArg(AttnKernels.ARG_FDP_Q_SEQ_STRIDE));
+        assertEquals(Q_DIM, d.intArg(AttnKernels.ARG_FDP_OUT_SEQ_STRIDE));
+        assertSame(steps.pageTable(kv.group()), d.bufferArg(AttnKernels.ARG_FDP_BUF_PAGE_TABLE));
+        assertSame(steps.seqKvLen(kv.group()), d.bufferArg(AttnKernels.ARG_FDP_BUF_SEQ_KV_LEN));
+        assertSame(steps.qPosSeq(), d.bufferArg(AttnKernels.ARG_FDP_BUF_Q_POS_SEQ));
+        int splits = d.intArg(AttnKernels.ARG_FD_N_SPLIT);
+        assertEquals((long) splits * FlashAttnTiling.WG, d.global()[0]);
+        assertEquals(2L * N_HEAD_KV, d.global()[1]);
+        assertTrue("every split holds keys", (long) splits * d.intArg(AttnKernels.ARG_FD_SPLIT_LEN) >= 6);
         assertTrue((d.intArg(AttnKernels.ARG_FD_FLAGS) & AttnKernels.FLAG_CAUSAL) != 0);
     }
 }

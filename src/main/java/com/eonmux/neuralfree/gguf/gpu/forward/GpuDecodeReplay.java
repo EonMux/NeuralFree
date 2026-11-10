@@ -66,6 +66,11 @@ final class GpuDecodeReplay implements AutoCloseable {
 
     static final String PROPERTY = GpuForwardBackend.DECODE_REPLAY_PROPERTY;
     static final String WARMUP_PROPERTY = "neuralfree.gpu.graphWarmupSteps";
+    /**
+     * {@code neuralfree.gpu.patchedReplay} (default {@code true}): {@code false} keeps every capture on the body
+     * replay ({@link GpuGraph#replay(Runnable)}), never building a patch plan.
+     */
+    static final String PATCHED_PROPERTY = "neuralfree.gpu.patchedReplay";
     /** Consecutive stable decode steps before the first capture, the default of {@link #WARMUP_PROPERTY}. */
     static final int DEFAULT_WARMUP_STEPS = 2;
     /** Steps the body runs after a capture before the plan is trusted without it. */
@@ -83,6 +88,7 @@ final class GpuDecodeReplay implements AutoCloseable {
     private final ComputeQueue queue;
     private final String queueType;
     private final boolean configured;
+    private final boolean patchedConfigured;
     private final int warmupSteps;
     private GpuGraph graph;
     /** The patch plan of {@link #graph}, or null when no patcher claimed the capture or the backend cannot patch. */
@@ -101,6 +107,7 @@ final class GpuDecodeReplay implements AutoCloseable {
         this.queue = queue;
         this.queueType = queue.getQueueType().name().toLowerCase(Locale.ROOT) + " queue";
         this.configured = configured();
+        this.patchedConfigured = !"false".equalsIgnoreCase(System.getProperty(PATCHED_PROPERTY));
         this.warmupSteps = warmupSteps();
     }
 
@@ -472,7 +479,7 @@ final class GpuDecodeReplay implements AutoCloseable {
         graph = captured;
         plan = null;
         verifiedSteps = 0;
-        if (patchers != null && !patchers.isEmpty() && graph.supportsPatchedReplay()) {
+        if (patchedConfigured && patchers != null && !patchers.isEmpty() && graph.supportsPatchedReplay()) {
             plan = DecodeReplayPlan.build(graph, patchers, pos);
             if (plan == null) {
                 LOGGER.debug("Decode replay keeps the {} body replay: no patcher reproduces the capture",
