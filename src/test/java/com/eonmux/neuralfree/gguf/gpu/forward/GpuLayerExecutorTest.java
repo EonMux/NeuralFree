@@ -775,7 +775,8 @@ public class GpuLayerExecutorTest {
         assertEquals(VOCAB, rows[0].length);
         List<FakeOpKind> k = kinds(backend.ops());
         assertEquals(1, Collections.frequency(k, FakeOpKind.FINISH));
-        assertEquals(1, Collections.frequency(k, FakeOpKind.READ));
+        // each logits row is read straight into its own result array (GpuCallReads), behind the one synchronization
+        assertEquals(rows.length, Collections.frequency(k, FakeOpKind.READ));
         assertTrue(trace().contains("mixer ATTENTION 0 prefill 3 NORMED->BRANCH"));
         assertThrows(IllegalStateException.class, () -> fb.decode(1, 0));
     }
