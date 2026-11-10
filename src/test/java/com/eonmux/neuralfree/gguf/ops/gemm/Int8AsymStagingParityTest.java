@@ -24,10 +24,11 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The asymmetric static int8 lane ({@link ActQuantScheme#INT8_STATIC_ASYM}): the staging kernel applies the
- * checkpoint's zero point to the int8 codes and records it, and {@code I8_B128_MatMul_MMQ} subtracts the zero-point
- * term from every stage dot through the weight code sums it reduces, so the product of the checkpoint's asymmetric
- * int8 activations with the int8 weight codes runs in int8 rather than from fake-quantized floats. The result must
- * agree with {@link ActFakeQuant} within fp32 accumulation rounding.
+ * checkpoint's zero point to the int8 codes and records it, and the MMQ GEMM ({@code I8_B128_MatMul_MMQ}, and on the
+ * CUDA tensor tile every MMQ weight type) subtracts the zero-point term from every stage dot through the weight code
+ * sums it reduces, so the product of the checkpoint's asymmetric int8 activations with the weight codes runs in int8
+ * rather than from fake-quantized floats. The result must agree with {@link ActFakeQuant} within fp32 accumulation
+ * rounding.
  */
 public class Int8AsymStagingParityTest {
 
@@ -36,6 +37,10 @@ public class Int8AsymStagingParityTest {
     private static final int N = 21;
     private static final float STATIC_SCALE = 0.25f;
     private static final int ZERO_POINT = 17;
+    /* The whole CUDA tensor tile: three 128-row and two 128-token tiles, each the last ragged, so both warp token
+     * groups carry live outputs. */
+    private static final int WIDE_M = 333;
+    private static final int WIDE_N = 141;
 
     private HWAcceleration hwAccel;
     private ComputeBackend backend;
@@ -61,14 +66,30 @@ public class Int8AsymStagingParityTest {
     @Test
     public void openClAsymStagingMatchesTheFakeQuantizedDotProduct() throws Exception {
         openOpenCl();
-        check(MmqConfig.PACKED_DOT);
+        check(MmqConfig.PACKED_DOT, GGMLType.I8_B128, M, N);
     }
 
     @Test
     public void cudaAsymStagingMatchesTheFakeQuantizedDotProduct() throws Exception {
         openCuda();
         check(MmqConfig.forDevice(backend.backendType(),
-                backend.capabilities().getComputeCapability()));
+                backend.capabilities().getComputeCapability()), GGMLType.I8_B128, M, N);
+    }
+
+    /** Every weight type's asymmetric combine on the CUDA tile: both scale granularities, with and without offsets. */
+    @Test
+    public void cudaAsymStagingMatchesForEveryMmqTypeOverWholeTiles() throws Exception {
+        openCuda();
+        MmqConfig config = MmqConfig.forDevice(backend.backendType(), backend.capabilities().getComputeCapability());
+        StringBuilder bad = new StringBuilder();
+        for (GGMLType type : GemmKernels.MMQ_TYPES) {
+            try {
+                check(config, type, WIDE_M, WIDE_N);
+            } catch (AssertionError e) {
+                bad.append(type).append(": ").append(e.getMessage()).append(";\n");
+            }
+        }
+        assertTrue("failed types: " + bad, bad.length() == 0);
     }
 
     private void openOpenCl() {
@@ -119,16 +140,16 @@ public class Int8AsymStagingParityTest {
         }
     }
 
-    private void check(MmqConfig config) throws Exception {
+    private void check(MmqConfig config, GGMLType type, int m, int n) throws Exception {
         String stageKernel = GemmKernels.int8ActivationStaging(ActQuantScheme.INT8_STATIC_ASYM);
         Assume.assumeTrue(ActQuantScheme.INT8_STATIC_ASYM + " has no direct staging kernel", stageKernel != null);
         Assume.assumeTrue(stageKernel + " is unavailable", kernels.has(stageKernel));
-        MmqGemmPlan plan = MmqGemmPlan.contiguous(config, GGMLType.I8_B128, M, K, N);
-        byte[] weight = OpenClMmqGemmParityTest.buildWeight(GGMLType.I8_B128, M, K);
-        float[] x = OpenClMmqGemmParityTest.buildX(N, K);
-        float[] w = CpuBlockDecoders.dequantize(weight, GGMLType.I8_B128, (long) M * K);
+        MmqGemmPlan plan = MmqGemmPlan.contiguous(config, type, m, K, n);
+        byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, m, K);
+        float[] x = OpenClMmqGemmParityTest.buildX(n, K);
+        float[] w = CpuBlockDecoders.dequantize(weight, type, (long) m * K);
         float[] fake = x.clone();
-        ActFakeQuant.apply(ActQuantScheme.INT8_STATIC_ASYM, STATIC_SCALE, ZERO_POINT, 0.0f, fake, 0, N, K);
+        ActFakeQuant.apply(ActQuantScheme.INT8_STATIC_ASYM, STATIC_SCALE, ZERO_POINT, 0.0f, fake, 0, n, K);
 
         int tk = config.stageDepth();
         int local = kernels.matvecLocal();
@@ -149,8 +170,8 @@ public class Int8AsymStagingParityTest {
                 try (GpuEvent read = queue.enqueueReadBuffer(ybuf, 0, (long) out.length * Float.BYTES, out)) {
                     read.awaitCompletion();
                 }
-                for (int t = 0; t < N; t++) {
-                    for (int r = 0; r < M; r++) {
+                for (int t = 0; t < n; t++) {
+                    for (int r = 0; r < m; r++) {
                         double acc = 0.0;
                         double terms = 0.0;
                         for (int k = 0; k < K; k++) {
@@ -159,9 +180,9 @@ public class Int8AsymStagingParityTest {
                             terms += Math.abs(term);
                         }
                         double tol = 1e-5 * terms + 1e-3;
-                        assertTrue("token " + t + " row " + r + ": staged kernel " + out[t * M + r]
-                                        + " expected " + acc + " (|terms| " + terms + ")",
-                                Math.abs(out[t * M + r] - acc) <= tol);
+                        assertTrue(plan.kernelName() + " token " + t + " row " + r + ": staged kernel "
+                                        + out[t * m + r] + " expected " + acc + " (|terms| " + terms + ")",
+                                Math.abs(out[t * m + r] - acc) <= tol);
                     }
                 }
             }

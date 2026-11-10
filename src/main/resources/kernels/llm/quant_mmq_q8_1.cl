@@ -41,23 +41,21 @@ NF_KERNEL void LLM_Quant_MMQ_Q8_1(
     const float id = maxabs > 0.0f ? 127.0f / maxabs : 0.0f;
     const float d = maxabs > 0.0f ? maxabs * (1.0f / 127.0f) : 1.0f;
     const nf_i64 rec = i * (nf_i64)NF_Q8_REC(tk);
-    int sums[NF_Q8_MAX_TK / 16];
+    /* half by half, so each half's code sum is one register (tk is a multiple of 16) */
     for (int h = 0; h < tk / 16; h++) {
-        sums[h] = 0;
-    }
-    for (int u = 0; u < tk / 4; u++) {
-        uint packed = 0;
-        for (int b = 0; b < 4; b++) {
-            const int q = nf_rint_i(row[4 * u + b] * id);
-            packed |= (uint)(q & 0xFF) << (8 * b);
-            sums[(4 * u + b) >> 4] += q;
+        int sum = 0;
+        for (int u = 4 * h; u < 4 * h + 4; u++) {
+            uint packed = 0;
+            for (int b = 0; b < 4; b++) {
+                const int q = nf_rint_i(row[4 * u + b] * id);
+                packed |= (uint)(q & 0xFF) << (8 * b);
+                sum += q;
+            }
+            q8[rec + u] = packed;
         }
-        q8[rec + u] = packed;
+        q8[rec + tk / 4 + 1 + h] = (uint)sum;
     }
     q8[rec + tk / 4] = nf_q8_float_rec(d);
-    for (int h = 0; h < tk / 16; h++) {
-        q8[rec + tk / 4 + 1 + h] = (uint)sums[h];
-    }
     q8[rec + tk / 4 + 1 + tk / 16] = NF_Q8_NO_ZERO_POINT;
 }
 
@@ -105,24 +103,22 @@ NF_INLINE int nf_q8_code(float v, int mode, int azp) {
  */
 NF_INLINE void nf_q8_store(NF_GLOBAL uint* q8, nf_i64 rec, NF_GLOBAL const float* xp, float s, float mul,
                            int tk, int mode, int azp) {
-    int sums[NF_Q8_MAX_TK / 16];
+    /* half by half, so each half's code sum is one register (tk is a multiple of 16) */
     for (int h = 0; h < tk / 16; h++) {
-        sums[h] = 0;
-    }
-    for (int u = 0; u < tk / 4; u++) {
-        uint packed = 0;
-        for (int b = 0; b < 4; b++) {
-            const int k = 4 * u + b;
-            const int q = nf_q8_code(mode == 0 ? xp[k] / s : xp[k] * mul, mode, azp);
-            packed |= (uint)(q & 0xFF) << (8 * b);
-            sums[k >> 4] += q;
+        int sum = 0;
+        for (int u = 4 * h; u < 4 * h + 4; u++) {
+            uint packed = 0;
+            for (int b = 0; b < 4; b++) {
+                const int k = 4 * u + b;
+                const int q = nf_q8_code(mode == 0 ? xp[k] / s : xp[k] * mul, mode, azp);
+                packed |= (uint)(q & 0xFF) << (8 * b);
+                sum += q;
+            }
+            q8[rec + u] = packed;
         }
-        q8[rec + u] = packed;
+        q8[rec + tk / 4 + 1 + h] = (uint)sum;
     }
     q8[rec + tk / 4] = nf_q8_float_rec(s);
-    for (int h = 0; h < tk / 16; h++) {
-        q8[rec + tk / 4 + 1 + h] = (uint)sums[h];
-    }
     q8[rec + tk / 4 + 1 + tk / 16] = (uint)azp;
 }
 

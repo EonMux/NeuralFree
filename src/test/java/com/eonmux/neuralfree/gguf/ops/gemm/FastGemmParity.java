@@ -71,6 +71,24 @@ final class FastGemmParity {
     }
 
     /**
+     * The plain MMQ GEMM of {@code type} over activation records that start {@code qOff} units into their buffer
+     * against the same GEMM over records at offset 0: the record offset changes only how the records are read
+     * (an offset that is not a multiple of 4 units leaves them off 16-byte alignment), so the two agree bit for bit.
+     */
+    void mmqRecordOffsetMatchesAligned(GGMLType type, int m, int k, int n, int qOff) throws InterruptedException {
+        MmqGemmPlan aligned = MmqGemmPlan.contiguous(mmqConfig, type, m, k, n);
+        MmqGemmPlan shifted = MmqGemmPlan.of(mmqConfig, type, m, k, n, aligned.qStride(), qOff, m, 0);
+        byte[] weight = OpenClMmqGemmParityTest.buildWeight(type, m, k);
+        float[] x = OpenClMmqGemmParityTest.buildX(n, k);
+        float[] want = launchMmq(aligned, weight, x);
+        float[] got = launchMmq(shifted, weight, x);
+        for (int i = 0; i < m * n; i++) {
+            assertTrue(shifted.kernelName() + " qOff " + qOff + " token " + i / m + " row " + i % m + ": " + got[i]
+                    + " at qOff 0: " + want[i], Float.floatToRawIntBits(got[i]) == Float.floatToRawIntBits(want[i]));
+        }
+    }
+
+    /**
      * The split-K twin of the int8 MMQ GEMM against the plain kernel of the same type, both over the
      * same staged activations: fp32 plane sums only.
      */
@@ -370,22 +388,33 @@ final class FastGemmParity {
     }
 
     /**
-     * One int8 MMQ GEMM launch over contiguous views: {@code LLM_Quant_MMQ_Q8_1} stages the input once
-     * (the launch contract the dispatch uses), then the GEMM reads the staged records.
+     * Stages {@code x} and runs the MMQ GEMM of {@code plan}. The records are staged contiguously (the plan's qStride
+     * must be the row's record count) and, for a plan with a record offset, copied to that unit offset of the
+     * GEMM's activation buffer, so the kernel reads them through a view that starts {@code qOff} units in.
      */
     float[] launchMmq(MmqGemmPlan plan, byte[] weight, float[] x) throws InterruptedException {
+        if (plan.qStride() != plan.config().rowRecords(plan.k())) {
+            throw new IllegalArgumentException("launchMmq stages contiguous records: qStride " + plan.qStride()
+                    + " is not the row's " + plan.config().rowRecords(plan.k()) + " records");
+        }
+        long stagedUnits = (long) plan.n() * plan.config().rowRecords(plan.k()) * plan.config().recordUnits();
         GpuBuffer wbuf = backend.allocateBuffer(weight.length, true);
         GpuBuffer xbuf = backend.allocateBuffer((long) x.length * Float.BYTES, true);
         GpuBuffer qbuf = backend.allocateBuffer(plan.q8ElementsRequired() * Integer.BYTES);
+        GpuBuffer sbuf = plan.qOff() == 0 ? qbuf : backend.allocateBuffer(stagedUnits * Integer.BYTES);
         GpuBuffer ybuf = backend.allocateBuffer(plan.yElementsRequired() * Float.BYTES);
         try {
             try (GpuEvent wv = queue.enqueueWriteBuffer(wbuf, 0, weight.length, weight);
                  GpuEvent xv = queue.enqueueWriteBuffer(xbuf, 0, (long) x.length * Float.BYTES, x, wv)) {
                 int tk = plan.config().stageDepth();
                 long records = (long) plan.n() * plan.config().rowRecords(plan.k());
-                Object[] quantArgs = {plan.n(), plan.k(), tk, plan.k(), 0, xbuf, qbuf};
+                Object[] quantArgs = {plan.n(), plan.k(), tk, plan.k(), 0, xbuf, sbuf};
                 queue.enqueueKernelNoEvent(kernels.get(GemmKernels.QUANT_MMQ_Q8_1),
                         new long[]{roundUp(records, 64)}, new long[]{64}, quantArgs, xv);
+                if (sbuf != qbuf) {
+                    queue.enqueueCopyBuffer(sbuf, 0, qbuf, (long) plan.qOff() * Integer.BYTES,
+                            stagedUnits * Integer.BYTES);
+                }
                 queue.enqueueKernelNoEvent(kernels.get(plan.kernelName()), plan.globalWorkSize(),
                         plan.localWorkSize(), plan.args(wbuf, qbuf, ybuf));
                 float[] out = new float[(int) plan.yElementsRequired()];
@@ -398,6 +427,9 @@ final class FastGemmParity {
             wbuf.close();
             xbuf.close();
             qbuf.close();
+            if (sbuf != qbuf) {
+                sbuf.close();
+            }
             ybuf.close();
         }
     }

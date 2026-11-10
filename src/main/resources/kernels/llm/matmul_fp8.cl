@@ -190,6 +190,9 @@ NF_KERNEL void LLM_Quant_MMQ_Fp4Mx(
     q8[rec + tk / 4 + 1 + tk / 16] = NF_Q8_NO_ZERO_POINT;
 }
 
+#if NF_Q8_MAX_TK > 32
+#error "LLM_Quant_MMQ_Fp4Nv holds the s16 of at most two 16-element runs per chunk"
+#endif
 NF_KERNEL void LLM_Quant_MMQ_Fp4Nv(
     const int N, const int K, const int tk,
     const int x_stride, const int x_off, const float global_scale,
@@ -204,9 +207,9 @@ NF_KERNEL void LLM_Quant_MMQ_Fp4Nv(
     const int c = chunk - t * chunks;
     NF_GLOBAL const float* row = x + (nf_i64)x_off + (nf_i64)t * x_stride + (nf_i64)c * tk;
     const nf_i64 rec = (nf_i64)chunk * NF_Q8_REC(tk);
-    /* s16 and the run's largest |v| per 16-element run of the chunk (every work-item holds the same
-     * reduction results, so the array stays private). */
-    float s16[NF_Q8_MAX_TK / 16];
+    /* s16 of the chunk's (at most two) 16-element runs, held as two scalars so they stay registers, and
+     * the chunk's largest |v| (every work-item holds the same reduction results). */
+    float s16[2] = {0.0f, 0.0f};
     float vmax = 0.0f;
     for (int h = 0; h < tk / 16; h++) {
         float m = 0.0f;
@@ -214,7 +217,8 @@ NF_KERNEL void LLM_Quant_MMQ_Fp4Nv(
             m = fmax(m, fabs(row[h * 16 + k]));
         }
         const float s = nf_aq_e4m3(nf_aq_div(nf_aq_div(nf_wg_max(red, m), NF_AQ_FP4_MAX), global_scale));
-        s16[h] = s;
+        s16[0] = h == 0 ? s : s16[0];
+        s16[1] = h == 1 ? s : s16[1];
         for (int k = lid; k < 16; k += lsize) {
             const float sd = s * global_scale;
             const float v = sd == 0.0f ? 0.0f
@@ -228,7 +232,7 @@ NF_KERNEL void LLM_Quant_MMQ_Fp4Nv(
         uint packed = 0;
         for (int b = 0; b < 4; b++) {
             const int k = 4 * u + b;
-            const float s = s16[k >> 4];
+            const float s = k < 16 ? s16[0] : s16[1];
             const float sd = s * global_scale;
             const float v = sd == 0.0f ? 0.0f
                 : (nf_aq_e2m1(nf_aq_div(row[k], sd)) * s) * global_scale;
@@ -242,6 +246,278 @@ NF_KERNEL void LLM_Quant_MMQ_Fp4Nv(
     }
     q8[rec + tk / 4 + 1 + tk / 16] = NF_Q8_NO_ZERO_POINT;
 }
+
+/* ---- E4M3 datapath: FP8 weights and 4-bit weights served as E4M3 ----
+ *
+ * The staged records hold E4M3 codes with one chunk scale instead of int8 codes with code sums
+ * (kernels/llm/matmul_mmq.cl): the weight codes are the FP8 type's own bytes for the FP8 weight types,
+ * or the E4M3 codes the 4-bit type's code values map to (exact for the E2M1 codebooks). The stage dot
+ * is then a product of E4M3 codes, and the chunk scale of the weight block and of the activation
+ * record multiply the accumulated dot in fp32; no offset term applies to these types.
+ */
+
+/* d = a * b^T + d over one 16x8x32 E4M3 tile (row-major A fragment, column-major B fragment). */
+NF_INLINE void nf_fp8_mma_m16n8k32(float d[4], const uint a[4], const uint b[2]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+/* Scalar E4M3 dot of one NF_MMQ_TK-deep row of staged weight codes with a token's staged codes: the
+ * datapath of the packed-dot configs and of the architectures below sm_89. */
+NF_INLINE float nf_fp8_stage_dot(NF_LOCAL_PTR const nf_i8* wq_row, NF_LOCAL_PTR const uint* rec) {
+    float sum = 0.0f;
+    for (int kk = 0; kk < NF_MMQ_TK; kk++) {
+        const uint packed = rec[kk >> 2];
+        const uint xc = (packed >> (8u * (kk & 3u))) & 0xFFu;
+        sum += F8_E4M3_LUT[(uint)(uchar)wq_row[kk]] * F8_E4M3_LUT[xc];
+    }
+    return sum;
+}
+
+/* One stage's E4M3 tile products and their scales. Tensor path: the sm_89+ mma over the fragments (the
+ * same layouts as the int8 stage), or the scalar dot below sm_89; packed path: one scalar dot per row.
+ * tn is the tile's token count (nf_mmq_tensor_stage's). The token codes and chunk scales read the
+ * staged record tile xr the gather filled (dead tokens stage zero codes and a 0.0f scale). */
+NF_INLINE void nf_fp8_combine(NF_LOCAL_PTR const nf_i8* wq, NF_LOCAL_PTR const uint* xr,
+                              int n0, int tn, int N,
+                              NF_LOCAL_PTR const float* wsc, int lid, float acc[]) {
+#if NF_MMQ_TENSOR
+    const int warp = lid >> 5, lane = lid & 31;
+    const int r0 = (warp >> 1) * 16 + (lane >> 2);
+    const int kf = (lane & 3) * 4;
+    const int rr[4] = {r0, r0, r0 + 8, r0 + 8};
+    uint a[4];
+    a[0] = *(NF_LOCAL_PTR const uint*)(wq + r0 * NF_MMQ_TK + kf);
+    a[1] = *(NF_LOCAL_PTR const uint*)(wq + (r0 + 8) * NF_MMQ_TK + kf);
+    a[2] = *(NF_LOCAL_PTR const uint*)(wq + r0 * NF_MMQ_TK + kf + 16);
+    a[3] = *(NF_LOCAL_PTR const uint*)(wq + (r0 + 8) * NF_MMQ_TK + kf + 16);
+    for (int nb = 0; nb < tn / 16; nb++) {
+        const int cbase = (warp & 1) * (tn / 2) + nb * 8;
+        const int c0 = cbase + (lane & 3) * 2;
+        const int cb = cbase + (lane >> 2);
+        const int cc[4] = {c0, c0 + 1, c0, c0 + 1};
+        float sd[4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+        const int rb = cb * NF_MMQ_RC;
+        const uint b[2] = {xr[rb + kf / 4], xr[rb + kf / 4 + NF_MMQ_TK / 8]};
+        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        nf_fp8_mma_m16n8k32(d, a, b);
+        for (int i = 0; i < 4; i++) {
+            sd[i] = wsc[rr[i] * NF_MMQ_SH] * d[i];
+        }
+#else
+        for (int i = 0; i < 4; i++) {
+            const int tok = n0 + cc[i];
+            NF_LOCAL_PTR const uint* trec = xr + cc[i] * NF_MMQ_RC;
+            sd[i] = tok < N ? wsc[rr[i] * NF_MMQ_SH] * nf_fp8_stage_dot(wq + rr[i] * NF_MMQ_TK, trec) : 0.0f;
+        }
+#endif
+        for (int i = 0; i < 4; i++) {
+            acc[nb * 4 + i] += nf_mmq_rec_d(xr[cc[i] * NF_MMQ_RC + NF_MMQ_QS]) * sd[i];
+        }
+    }
+#else
+    const int tx = lid % NF_MMQ_TX, ty = lid / NF_MMQ_TX;
+    for (int j = 0; j < tn / 16; j++) {
+        const int tok = ty + 16 * j;
+        if (n0 + tok >= N) {
+            continue;
+        }
+        NF_LOCAL_PTR const uint* rec = xr + tok * NF_MMQ_RC;
+        for (int q = 0; q < NF_MMQ_RM; q++) {
+            const int sr = tx + NF_MMQ_TX * q;
+            acc[j * NF_MMQ_RM + q] += nf_mmq_rec_d(rec[NF_MMQ_QS]) * (wsc[sr * NF_MMQ_SH]
+                    * nf_fp8_stage_dot(wq + sr * NF_MMQ_TK, rec));
+        }
+    }
+#endif
+}
+
+#if NF_MMQ_TENSOR
+/*
+ * The E4M3 lane on the tensor-core device tile (T_MatMul_MMQ / T_MatMul_W4A8 and their KSplit forms):
+ * the int8 tile's staging, pipeline and warp layout with the E4M3 combine. Each output adds
+ * d_t * (s_w * dot) - the sm_89+ E4M3 mma dot, or below sm_89 the scalar dot in nf_fp8_stage_dot's
+ * element order - rounded step by step as nf_fp8_combine's compiled form rounds it (fmul, then fma),
+ * so the plain kernels equal the twins bit for bit.
+ */
+
+/* nf_fp8_stage_dot over staged row r of the swizzled code tile. */
+NF_INLINE float nf_fp8_tc_dot(NF_LOCAL_PTR const int* wq, int r, NF_LOCAL_PTR const uint* rec) {
+    float sum = 0.0f;
+    for (int kk = 0; kk < NF_MMQ_TK; kk++) {
+        const uint word = (uint)wq[NF_MMQ_TC_SWZ(r, kk >> 2)];
+        const uint wc = (word >> (8u * (kk & 3u))) & 0xFFu;
+        const uint xc = (rec[kk >> 2] >> (8u * (kk & 3u))) & 0xFFu;
+        sum += F8_E4M3_LUT[wc] * F8_E4M3_LUT[xc];
+    }
+    return sum;
+}
+
+/*
+ * One chunk of the E4M3 tile: as nf_mmq_tc_combine32 over one scale per row and chunk, no offset. The same
+ * shared reads as there - one 128-bit read of the lane's four row scales and, on sm_89+, one ldmatrix.x4 of
+ * B per block pair (the E4M3 m16n8k32 fragments have the s8 layout) - so the tile holds few live addresses.
+ */
+NF_INLINE void nf_fp8_tc_combine(NF_LOCAL_PTR const int* wq, NF_LOCAL_PTR const uint* xr,
+                                 NF_LOCAL_PTR const float* wsc, int lane, int wrow0, int wtok0, float acc[]) {
+    const int g = lane >> 2, q = lane & 3;
+    /* entry 2m + j: row wrow0 + 16m + g + 8j (the lane order of NF_MMQ_TC_WSLOT) */
+    const float4 vx = *(NF_LOCAL_PTR const float4*)(wsc + NF_MMQ_TC_WSLOT(wrow0 + g, 0, 1));
+    const float dmx[4] = {vx.x, vx.y, vx.z, vx.w};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    const int lrow = (lane & 7) + 8 * ((lane >> 3) & 1);
+    const int lword = (((lane >> 4) & 1) ^ ((lane >> 2) & 1)) * 4;
+    const int btok = (lane & 7) + 8 * (lane >> 4);
+    const int bword = ((lane >> 3) & 1) * 4;
+    uint a[NF_MMQ_TC_NTX][4];
+    for (int m = 0; m < NF_MMQ_TC_NTX; m++) {
+        nf_mmq_ldsm_x4(a[m], wq + (wrow0 + 16 * m + lrow) * NF_MMQ_QS + lword);
+    }
+#endif
+    for (int p = 0; p < NF_MMQ_TC_NB / 2; p++) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+        uint bp[4];
+        nf_mmq_ldsm_x4(bp, (NF_LOCAL_PTR const int*)xr + (wtok0 + 16 * p + btok) * NF_MMQ_RC + bword);
+#endif
+        for (int o = 0; o < 2; o++) {
+            const int tb = wtok0 + 8 * (2 * p + o);
+            float tds[2];
+            for (int t = 0; t < 2; t++) {
+                tds[t] = nf_mmq_rec_d(xr[(tb + 2 * q + t) * NF_MMQ_RC + NF_MMQ_TC_XF]);
+            }
+            for (int m = 0; m < NF_MMQ_TC_NTX; m++) {
+                float* ac = acc + (m * NF_MMQ_TC_NB + 2 * p + o) * 4;
+                float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+                const uint b[2] = {bp[2 * o], bp[2 * o + 1]};
+                nf_fp8_mma_m16n8k32(d, a[m], b);
+#else
+                for (int i = 0; i < 4; i++) {
+                    d[i] = nf_fp8_tc_dot(wq, wrow0 + 16 * m + g + 8 * (i >> 1),
+                                         xr + (tb + 2 * q + (i & 1)) * NF_MMQ_RC);
+                }
+#endif
+                for (int i = 0; i < 4; i++) {
+                    ac[i] = __fmaf_rn(tds[i & 1], __fmul_rn(dmx[2 * m + (i >> 1)], d[i]), ac[i]);
+                }
+            }
+        }
+    }
+}
+
+/* The E4M3 combine of weight buffer buf and the record stage at unit offset xoff (the COMBINE argument
+ * of NF_MMQ_TC_LOOP). */
+#define NF_FP8_TC_COMBINE(buf, xoff, SG, ASYM, HAS_OFF, EXACT) \
+    nf_fp8_tc_combine(tc_wq + (buf) * NF_MMQ_TC_CW, tc_xr + (xoff), \
+                      tc_wsc + (buf) * NF_MMQ_TC_SW, lane, wrow0, wtok0, acc);
+
+/* The E4M3 tile's chunks [cstart, cend): one scale per 32-element chunk, no offset, no zero point. */
+#define NF_FP8_TC_PIPE(cstart, cend, SG, HAS_OFF, BS, BB, CODE, SCALE, OFF) \
+    NF_MMQ_TC_LOOP(cstart, cend, NF_FP8_TC_COMBINE, 32, 0, 0, 0, BS, BB, CODE, SCALE, OFF)
+#endif /* NF_MMQ_TENSOR */
+
+/* The weight offset of the E4M3 lane: every FP8 and 4-bit type it serves is symmetric, and the staged
+ * activation records carry a zero zero-point, so no offset term applies. */
+#define NF_FP8Q_NO_OFFSET(bp, k0) 0.0f
+
+/* The E4M3 kernel generator: the int8 generator's tiling, staging and store, with nf_fp8_combine. The
+ * staged records carry E4M3 codes and one scale per chunk (kernels/llm/quant_mmq_q8_1.cl), so CODE
+ * yields the code byte of element e and SCALE the scale of the block holding k0. */
+#define NF_FP8Q_KERNEL_BODY(TN, BS, BB, GEMM_ARGS) \
+    NF_MMQ_KERNEL_BODY((TN), (BS), (BB), GEMM_ARGS)
+
+/* The E4M3 combine of buffer sel: no offset term, so wof / wsu / xz of the staged chunk are dead;
+ * the third argument is the pipe's forwarded tail, unused here. */
+#define NF_FP8Q_COMBINE(sel, TN, SG) \
+    nf_fp8_combine(wq + (sel) * NF_MMQ_WS, xr, n0, (TN), N, \
+                   wsc + (sel) * NF_MMQ_TM * NF_MMQ_SH, lid, acc)
+
+#define NF_FP8Q_GEMM_TN_NAMED(NAME, TN, BS, BB, CODE, SCALE) \
+NF_KERNEL void NAME( \
+    const int M, const int K, const int N, \
+    const int q_stride, const int q_off, const int y_stride, const int y_off, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uint* NF_RESTRICT q8, \
+    NF_GLOBAL float* NF_RESTRICT y) { \
+    NF_FP8Q_KERNEL_BODY((TN), (BS), (BB), \
+        const int m0 = (int)get_group_id(0) * NF_MMQ_TM; \
+        const int n0 = (int)get_group_id(1) * (TN); \
+        NF_MMQ_PIPE(0, K, (TN), NF_FP8Q_COMBINE, (BS), (BB), CODE, SCALE, NF_FP8Q_NO_OFFSET, (TN), 0) \
+        nf_mmq_store(y, M, N, y_stride, (nf_i64)y_off, m0, n0, (TN), lid, acc); \
+    ) \
+}
+
+/* The device-tile kernels: the tensor-core tile on the tensor path, the pipelined stage elsewhere. */
+#if NF_MMQ_TENSOR
+#define NF_FP8Q_GEMM_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_MMQ_TC_GEMM_NAMED(NAME, NF_FP8_TC_PIPE, BS, BB, 32, 0, CODE, SCALE, NF_FP8Q_NO_OFFSET)
+#else
+#define NF_FP8Q_GEMM_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_TN_NAMED(NAME, NF_MMQ_TN, BS, BB, CODE, SCALE)
+#endif
+
+#define NF_FP8Q_GEMM_S_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_TN_NAMED(NAME, 16, BS, BB, CODE, SCALE)
+
+#define NF_FP8Q_GEMM_S64_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_TN_NAMED(NAME, 64, BS, BB, CODE, SCALE)
+
+#define NF_FP8Q_GEMM_KSPLIT_TN_NAMED(NAME, TN, BS, BB, CODE, SCALE) \
+NF_KERNEL void NAME( \
+    const int M, const int K, const int N, \
+    const int q_stride, const int q_off, const int k_slice, \
+    NF_GLOBAL const uchar* NF_RESTRICT weight, \
+    NF_GLOBAL const uint* NF_RESTRICT q8, \
+    NF_GLOBAL float* NF_RESTRICT partial) { \
+    NF_FP8Q_KERNEL_BODY((TN), (BS), (BB), \
+        const int rtiles = (M + NF_MMQ_TM - 1) / NF_MMQ_TM; \
+        const int slice = (int)get_group_id(0) / rtiles; \
+        const int m0 = ((int)get_group_id(0) - slice * rtiles) * NF_MMQ_TM; \
+        const int n0 = (int)get_group_id(1) * (TN); \
+        const int k0 = slice * k_slice; \
+        const int k1 = k0 + k_slice < K ? k0 + k_slice : K; \
+        NF_MMQ_PIPE(k0, k1, (TN), NF_FP8Q_COMBINE, (BS), (BB), CODE, SCALE, NF_FP8Q_NO_OFFSET, (TN), 0) \
+        nf_mmq_store(partial, M, N, M, (nf_i64)slice * M * N, m0, n0, (TN), lid, acc); \
+    ) \
+}
+
+#if NF_MMQ_TENSOR
+#define NF_FP8Q_GEMM_KSPLIT_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_MMQ_TC_KSPLIT_NAMED(NAME, NF_FP8_TC_PIPE, BS, BB, 32, 0, CODE, SCALE, NF_FP8Q_NO_OFFSET)
+#else
+#define NF_FP8Q_GEMM_KSPLIT_NAMED(NAME, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(NAME, NF_MMQ_TN, BS, BB, CODE, SCALE)
+#endif
+
+#define NF_FP8Q_GEMM(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_NAMED(T##_MatMul_MMQ, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_S(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_S_NAMED(T##_MatMul_MMQ_S, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_S64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_S64_NAMED(T##_MatMul_MMQ_S64, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_KSPLIT(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_NAMED(T##_MatMul_MMQ_KSplit, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_SKSPLIT(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_MMQ_SKSplit, 16, BS, BB, CODE, SCALE)
+#define NF_FP8Q_GEMM_SKSPLIT64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_MMQ_SKSplit64, 64, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_NAMED(T##_MatMul_W4A8, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_S(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_S_NAMED(T##_MatMul_W4A8_S, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_S64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_S64_NAMED(T##_MatMul_W4A8_S64, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_KSPLIT(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_NAMED(T##_MatMul_W4A8_KSplit, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_SKSPLIT(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_W4A8_SKSplit, 16, BS, BB, CODE, SCALE)
+#define NF_W4A8_GEMM_SKSPLIT64(T, BS, BB, CODE, SCALE) \
+    NF_FP8Q_GEMM_KSPLIT_TN_NAMED(T##_MatMul_W4A8_SKSplit64, 64, BS, BB, CODE, SCALE)
 
 /* ---- E4M3 GEMMs: FP8 weights and 4-bit weights served as E4M3 ----
  *

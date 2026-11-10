@@ -196,7 +196,9 @@ def gpuMetalToolFingerprint = { -> ((List<File>) gpuMetalTool().jars).collect { 
 def gpuLibraryDefinitions = [
         [id              : 'llm', kernelRoot: 'kernels/llm', cudaDir: 'kernels/llm/cuda', shaderRoot: 'shaders/llm',
          cudaFlags       : ['-ftz=true', '-prec-div=false', '-prec-sqrt=false', '-fmad=true'], faSmemFloats: gpuCudaSmemFloats,
-         subgroupVariants: true, compareKinds: true],
+         subgroupVariants: true, compareKinds: true,
+         // The MMQ, FP8 and W4A8 GEMMs and their activation staging: register-resident pipelines by design.
+         stackFreeCudaModules: ['matmul_mmq', 'matmul_mmq_stream', 'matmul_fp8', 'quant_mmq_q8_1', 'quant_mmq_warp']],
         [id              : 'train', kernelRoot: 'kernels/train', cudaDir: 'kernels/train/cuda', shaderRoot: 'shaders/train',
          cudaFlags       : ['-ftz=false', '-prec-div=true', '-prec-sqrt=true', '-fmad=false'],
          subgroupVariants: false, compareKinds: true]
@@ -1100,7 +1102,7 @@ def gpuPinnedTwinKernels = { Task task, GpuKernelLibrary lib, int sgSize ->
 
 tasks.register('verifyGpuKernels') {
     group = 'verification'
-    description = 'Builds every GPU kernel artifact and checks that CUDA, HIP, Vulkan and Metal cover every kernel library\'s inventory'
+    description = 'Builds every GPU kernel artifact, checks that CUDA, HIP, Vulkan and Metal cover every kernel library\'s inventory and that the stack-free CUDA modules compile without a stack frame'
     dependsOn 'checkOpenCLKernels', 'inventoryCheck', 'compileCudaKernels', 'compileHipKernels', 'compileShaders', 'compileTestShaders', 'compileMetalShaders'
     doLast { task ->
         File generatedRoot = gpuOut.get().asFile
@@ -1136,6 +1138,31 @@ tasks.register('verifyGpuKernels') {
                 coverage('CUDA', cudaIndex.readLines('UTF-8').findAll { !it.isEmpty() }.collect { it.split('\t')[0] } as Set<String>)
             } else {
                 task.logger.warn("WARNING: ${lib.id} CUDA kernels were not built: CUDA coverage not checked")
+            }
+            if (!lib.stackFreeCudaModules.isEmpty() && cudaIndex.isFile()) {
+                File cuobjdump = GpuBuildTools.find(null, null, 'cuobjdump',
+                        ([gpuFindNvcc()?.parent] + gpuCudaDirs()).findAll { it != null } as List<String>)
+                if (cuobjdump == null) {
+                    task.logger.warn("WARNING: cuobjdump not found: ${lib.id} stack-free CUDA modules were not checked")
+                } else {
+                    int checked = 0
+                    lib.stackFreeCudaModules.each { String stem ->
+                        File module = new File(cudaIndex.parentFile, stem + '.fatbin')
+                        if (!module.isFile()) {
+                            if (!new File(cudaIndex.parentFile, stem + '.ptx').isFile()) {
+                                problems.add("${lib.id}: stack-free CUDA module ${stem} was not built")
+                            }
+                            return
+                        }
+                        GpuCudaToolkit.resourceUsage(cuobjdump, module).each { Map u ->
+                            checked++
+                            if (u.stack != 0 || u.local != 0) {
+                                problems.add("${lib.id}: ${u.function} (${stem}, ${u.arch}) has a ${u.stack}-byte stack frame and ${u.local} bytes of local memory at ${u.reg} registers; ${stem} kernels must stay stack-free")
+                            }
+                        }
+                    }
+                    covered.add("${checked} stack-free CUDA kernels ok")
+                }
             }
             File hipIndex = new File(generatedRoot, 'hip/' + lib.hipDir + '/index.tsv')
             if (hipIndex.isFile()) {

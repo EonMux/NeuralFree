@@ -25,8 +25,13 @@ class GpuKernelLibrary {
     /** subgroupVariants: rows may carry sg, and OpenCL is also checked with USE_SUBGROUPS. compareKinds: verifyGpuKernels
      *  compares the GLSL push-constant kinds (float or integer) with the .cl kinds. */
     final boolean subgroupVariants, compareKinds
+    /** CUDA modules (unit stems) whose every kernel must compile without a stack frame: the hot GEMM loops,
+     *  where a spill or a dynamically indexed private array costs local-memory traffic every step.
+     *  verifyGpuKernels checks them with cuobjdump -res-usage. */
+    final List<String> stackFreeCudaModules
 
-    /** spec: id, kernelRoot, cudaDir, shaderRoot, cudaFlags, subgroupVariants, compareKinds; optional faSmemFloats. */
+    /** spec: id, kernelRoot, cudaDir, shaderRoot, cudaFlags, subgroupVariants, compareKinds; optional faSmemFloats,
+     *  stackFreeCudaModules. */
     GpuKernelLibrary(Map spec, File resources, File projectDir) {
         id = String.valueOf(spec.id)
         if (!ID.matcher(id).matches() || [spec.kernelRoot, spec.cudaDir, spec.shaderRoot, spec.cudaFlags].contains(null)) {
@@ -56,6 +61,7 @@ class GpuKernelLibrary {
         faSmemFloats = spec.faSmemFloats == null ? null : Integer.valueOf(spec.faSmemFloats.toString())
         subgroupVariants = (boolean) spec.subgroupVariants
         compareKinds = (boolean) spec.compareKinds
+        stackFreeCudaModules = Collections.unmodifiableList(((List<?>) (spec.stackFreeCudaModules ?: [])).collect { it.toString() })
     }
 
     /** Preprocessor defines of every CUDA unit of the library (nvcc -E and the module compile). */

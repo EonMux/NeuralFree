@@ -34,6 +34,32 @@ class GpuCudaToolkit {
     }
 
     /**
+     * Per-kernel resource usage of a CUDA module (fatbin or cubin) from cuobjdump -res-usage: one entry
+     * [arch, function, reg, stack, local] per SASS function and architecture; empty for a PTX-only module.
+     */
+    static List<Map> resourceUsage(File cuobjdump, File module) {
+        String out = GpuBuildTools.runChecked([cuobjdump, '-res-usage', module], null, "cuobjdump -res-usage ${module.name}")
+        List<Map> usage = []
+        String arch = ''
+        String function = null
+        for (String line : out.readLines()) {
+            Matcher a = line =~ /^\s*arch = (\S+)/
+            Matcher f = line =~ /^\s*Function (\S+):\s*$/
+            Matcher r = line =~ /REG:(\d+) STACK:(\d+) SHARED:\d+ LOCAL:(\d+)/
+            if (a.find()) {
+                arch = a.group(1)
+            } else if (f.find()) {
+                function = f.group(1)
+            } else if (function != null && r.find()) {
+                usage.add([arch: arch, function: function, reg: Integer.parseInt(r.group(1)),
+                           stack: Integer.parseInt(r.group(2)), local: Integer.parseInt(r.group(3))])
+                function = null
+            }
+        }
+        return usage
+    }
+
+    /**
      * The nvcc release as [full (e.g. 12.4.131), toolkit (major.minor), driverMin (the CUDA driver version
      * number of that release: major * 1000 + minor * 10)]; throws when nvcc --version names no release.
      */

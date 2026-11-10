@@ -18,9 +18,13 @@ import org.junit.Test;
  */
 public class CudaFastGemmParityTest {
 
-    private static final int M = 70;   /* two 64-row tiles, the second partial */
+    private static final int M = 70;   /* one partial row tile of the MMQ tensor tile (two 64-row packed-dot tiles) */
     private static final int K = 512;  /* two K-quant super-blocks per row */
-    private static final int N = 40;   /* MMQ: three 16-token tiles; MMA: two 32-token tiles */
+    private static final int N = 40;   /* MMQ: one partial token tile; MMA: two 32-token tiles */
+    /* The whole MMQ tensor tile: three 128-row tiles and two 128-token tiles, each the last ragged, so every warp's
+     * row group and both warp token groups (tokens 0-63 and 64-127) carry live outputs. */
+    private static final int WIDE_M = 333;
+    private static final int WIDE_N = 141;
 
     private HWAcceleration hwAccel;
     private CudaComputeBackend backend;
@@ -72,6 +76,35 @@ public class CudaFastGemmParityTest {
                 parity.mmqMatchesTiled(type, M, K, N);
             } catch (AssertionError | RuntimeException e) {
                 bad.append(e.getMessage()).append(';').append('\n');
+            }
+        }
+        org.junit.Assert.assertTrue("failed types: " + bad, bad.length() == 0);
+    }
+
+    @Test
+    public void everyMmqKernelMatchesTheTiledGemmOverWholeTiles() throws Exception {
+        StringBuilder bad = new StringBuilder();
+        for (GGMLType type : GemmKernels.MMQ_TYPES) {
+            try {
+                parity.mmqMatchesTiled(type, WIDE_M, K, WIDE_N);
+            } catch (AssertionError | RuntimeException e) {
+                bad.append(e.getMessage()).append(';').append('\n');
+            }
+        }
+        org.junit.Assert.assertTrue("failed types: " + bad, bad.length() == 0);
+    }
+
+    /** Records off 16-byte alignment (a 1-unit offset) take the tile's 4-byte record copy; 4 units, its 16-byte copy. */
+    @Test
+    public void everyMmqKernelReadsOffsetRecordsBitIdentically() throws Exception {
+        StringBuilder bad = new StringBuilder();
+        for (GGMLType type : GemmKernels.MMQ_TYPES) {
+            for (int qOff : new int[]{1, 4}) {
+                try {
+                    parity.mmqRecordOffsetMatchesAligned(type, WIDE_M, K, WIDE_N, qOff);
+                } catch (AssertionError | RuntimeException e) {
+                    bad.append(e.getMessage()).append(';').append('\n');
+                }
             }
         }
         org.junit.Assert.assertTrue("failed types: " + bad, bad.length() == 0);

@@ -193,7 +193,7 @@ Requirements:
 | `./gradlew runDemos` | The framework demos (`DemoRunner`) on one shared backend: `AUTO` over OpenCL, CUDA and Vulkan by default |
 | `./gradlew runLLMDemo -Pargs="..."` | The GGUF command line (`LLMDemo`); `-Pheap=<MB>` sets the heap (default 8192) |
 | `./gradlew runBatchedDemo -Pargs="..."`, `runParallelDemo` | The [batched and parallel examples](#batched-and-parallel-examples) |
-| `./gradlew verifyGpuKernels` | Builds every GPU kernel artifact, syntax-checks the OpenCL program of every kernel library with clang, and checks that CUDA, HIP and Vulkan cover each library's kernel inventory (HIP against its portable kernels: the `[cuda]` mma sources are PTX-only and compile on no HIP pass) |
+| `./gradlew verifyGpuKernels` | Builds every GPU kernel artifact, syntax-checks the OpenCL program of every kernel library with clang, and checks that CUDA, HIP and Vulkan cover each library's kernel inventory (HIP against its portable kernels: the `[cuda]` mma sources are PTX-only and compile on no HIP pass), and, when `cuobjdump` is available, that every kernel of the MMQ, FP8 and W4A8 GEMM modules and their activation staging compiles without a stack frame (no spill or local array in the GEMM loops) |
 | `./gradlew compileHipKernels` | Compiles every kernel library to HIP code objects with hipcc (`build/generated/gpu/hip/kernels/<lib>/hip/`): one multi-target `.hsaco` per kernel source, with `index.tsv` (kernel name → code object resource) and `build.properties` (`hipcc.version`, `hip.archs`, `kernel.format`, and `fa.smem.floats` for the LLM library). This is what the HIP backend loads from `kernels/<lib>/hip` on the classpath. |
 | `./gradlew buildHipShim` | Builds the HIP JNI shim `libhipshim.so` from `native/hip/hipshim.c` (needs hipcc and a JDK's JNI headers) into `build/generated/gpu/hip-shim/`; point the engine at it with `-Dneuralfree.hip.shim.path=<file>` (or install it on the loader path as `libhipshim.so`) |
 | `./gradlew inventoryCheck` | Checks every kernel library's inventory against its kernel sources; `build` runs it before packaging the resources |
@@ -536,10 +536,12 @@ not fill about 1.3 waves of the device; steps of 17 to 64 tokens run the 64-toke
 planes. On a reduction shorter than the split-K threshold (K below 2048, no split to fill the grid) the
 16-token twin serves up to 48 tokens, where the 64-token tile would leave a quarter of its token columns empty.
 Wider steps run the plain tile. The weight stream is a software pipeline, so the next tile's loads overlap the
-current tile's dot products, and each 4-bit word decodes in two ALU ops. On an RTX 5080 Laptop (CUDA), `nftool batched-bench -c 4096 -npp 1 -ntg 128` decodes Qwen3-Embedding-4B
-at an 8-row step of 11.0 ms in Q8_0 and 7.3 ms in Q4_K_M, and a 16-row step of 13.7 and 10.4 ms
-(`llama-batched-bench -ngl 99 -fa on`: 9.6 and 6.7 ms at 8 rows, 10.3 and 8.1 at 16); a 512-token prefill (`nftool bench -p 512`) runs 7740 t/s in Q8_0 (`llama-bench -fa 1` 9690) and
-6430 t/s in Q4_K_M (llama.cpp 9150), and 38800 t/s for Qwen3 0.6B in Q8_0 (llama.cpp 38900).
+current tile's dot products, and each 4-bit word decodes in two ALU ops. On an RTX 5080 Laptop (CUDA), measured in
+one session, `nftool batched-bench -c 4096 -npp 1 -ntg 128` decodes Qwen3-Embedding-4B at an 8-row step of 12.5 ms
+in Q8_0 and 8.1 ms in Q4_K_M, and a 16-row step of 14.2 and 11.0 ms (`llama-batched-bench -ngl 99 -fa on`: 10.5 and
+6.9 ms at 8 rows, 12.0 and 8.8 at 16); a 512-token prefill (`nftool bench -p 512`, mean of three runs of three
+repetitions) runs 7830 t/s in Q8_0 (`llama-bench -fa 1` 9080) and 6990 t/s in Q4_K_M (llama.cpp 8830), and 39900 t/s
+for Qwen3 0.6B in Q8_0 (llama.cpp 34100).
 
 | Weights | Fast lane | Where | Rounding vs. the exact tiled GEMM |
 |---|---|---|---|
@@ -565,8 +567,12 @@ the other backends, run `LLM_Quant_MMQ_Q8_1`. On CUDA sm_80+
 the tensor tile is 128 rows × 128 tokens on 256 work-items: eight warps of 32 rows × 64 tokens, so every
 activation fragment feeds two `mma` and each weight word decodes once per 128-token tile (four times at a
 512-token projection). The staged records arrive by `cp.async` two 32-deep chunks ahead of the `mma`, with one
-barrier per chunk. When a projection's tiles would fill less than 90% of their last wave of one tile per
-multiprocessor (llama.cpp's stream-k rule), `<T>_MatMul_MMQ_StreamK` instead runs one block per multiprocessor
+barrier per chunk, copied as the staging pass wrote them in coalesced 16-byte pieces (through L1 for the types of
+blocks up to 128 elements, past it for the 256-element K and IQ super-block types), from which `ldmatrix` reads
+the activation fragments of two token blocks at once. For the types whose scales are a half-precision value times
+small integers (every MMQ type but I8_B128), the conversion of a chunk's integer dot folds into its scaling: the
+`mma` accumulates onto 1.5 × 2^23, and one `fma` gives the scaled dot rounded once. When a projection's tiles
+would fill less than 90% of their last wave of one tile per multiprocessor (llama.cpp's stream-k rule), `<T>_MatMul_MMQ_StreamK` instead runs one block per multiprocessor
 over an even share of the (tile, 32-deep chunk) sequence; a block that stops inside a tile writes its partial
 sums to a scratch plane, and `LLM_MMQ_StreamK_Fixup` adds those planes into the output. Tiles that no block
 splits match the plain kernel bit for bit; a split tile differs only by the fp32 rounding of the added partial

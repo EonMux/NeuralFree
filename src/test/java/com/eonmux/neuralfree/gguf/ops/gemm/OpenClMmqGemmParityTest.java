@@ -415,7 +415,9 @@ public class OpenClMmqGemmParityTest {
             cur |= bits.next(4) << (2 * j);
             b.put(idx, (byte) cur);
             if (hmask >= 0) {
-                b.put(hmask + h * 16 + l, (byte) bits.next(2));
+                /* element e's high bit is bit 4 hf + j of its hmask byte, so every bit of the byte is in use */
+                int hidx = hmask + h * 16 + l;
+                b.put(hidx, (byte) ((b.get(hidx) & 0xFF) | (bits.next(2) << (4 * hf + j))));
             }
         }
     }
