@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Merge-rank BPE tokenizer ({@code tokenizer.ggml.model} = gpt2, hybriddna, whitespace, gemma4),
@@ -47,6 +48,14 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
         }
     }
 
+    /**
+     * The word cache of Hugging Face's BPE model ({@code tokenizers} {@code DEFAULT_CACHE_CAPACITY},
+     * {@code MAX_LENGTH}): a word's ids depend on the word alone, and text repeats its words, so the ids of words
+     * up to {@link #CACHED_WORD_CHARS} chars are remembered, at most {@link #WORD_CACHE_CAPACITY} of them.
+     */
+    private static final int WORD_CACHE_CAPACITY = 10_000;
+    private static final int CACHED_WORD_CHARS = 256;
+
     private enum Mode { STANDARD, WHITESPACE, HYBRIDDNA }
 
     private final TokenizerVocab vocab;
@@ -55,6 +64,8 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
     private final PreTokenizerType vocabPreType;
     private final Mode mode;
     private final boolean byteFallback;
+    /** Word to ids of {@link #tokenizeWord}; emptied when full so it follows the text being encoded. */
+    private final ConcurrentHashMap<String, int[]> wordIds = new ConcurrentHashMap<>();
 
     /** Uses the vocabulary's own pre-tokenizer. */
     public BpeTokenizer(TokenizerVocab vocab, SpecialTokens special) {
@@ -91,8 +102,25 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 3));
         if (addSpecial) addAll(special.leadingIds(), out);
-        List<SpecialTokens.Fragment> fragments = special.partition(text, parseSpecial, true);
-        for (int i = 0; i < fragments.size(); i++) {
+        encodeFragments(fragments(text, parseSpecial), 0, out);
+        if (addSpecial) addAll(special.trailingIds(), out);
+        return out.toArray();
+    }
+
+    @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return special.partition(text, parseSpecial, true);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        IdBuffer out = new IdBuffer(16);
+        encodeFragments(fragments, from, out);
+        return out.toArray();
+    }
+
+    private void encodeFragments(List<SpecialTokens.Fragment> fragments, int from, IdBuffer out) {
+        for (int i = from; i < fragments.size(); i++) {
             SpecialTokens.Fragment f = fragments.get(i);
             if (f.isToken()) {
                 out.add(f.token());
@@ -100,8 +128,6 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
                 tokenizeFragment(prepareFragment(f.text(), i == 0), i == 0, out);
             }
         }
-        if (addSpecial) addAll(special.trailingIds(), out);
-        return out.toArray();
     }
 
     private static void addAll(int[] ids, IdBuffer out) {
@@ -169,13 +195,29 @@ public final class BpeTokenizer implements TokenizerAlgorithm {
      * {@link #tokenizeModelWord} instead.
      */
     private void tokenizeBpe(String text, boolean inputStart, IdBuffer out) {
-        boolean model = vocab.bpeModelOverlay();
         for (String word : words(vocabPreType.normalizeFragment(text), inputStart)) {
-            if (model) {
-                tokenizeModelWord(word, out);
-            } else {
-                for (String symbol : mergeWord(word)) emitSymbol(symbol, out);
+            if (word.length() > CACHED_WORD_CHARS) {
+                tokenizeWord(word, out);
+                continue;
             }
+            int[] ids = wordIds.get(word);
+            if (ids != null) {
+                out.addAll(ids);
+                continue;
+            }
+            int mark = out.length();
+            tokenizeWord(word, out);
+            if (wordIds.size() >= WORD_CACHE_CAPACITY) wordIds.clear();
+            wordIds.put(word, out.copyFrom(mark));
+        }
+    }
+
+    /** The ids of one pre-tokenized word: merged and resolved, or through {@link #tokenizeModelWord}. */
+    private void tokenizeWord(String word, IdBuffer out) {
+        if (vocab.bpeModelOverlay()) {
+            tokenizeModelWord(word, out);
+        } else {
+            for (String symbol : mergeWord(word)) emitSymbol(symbol, out);
         }
     }
 

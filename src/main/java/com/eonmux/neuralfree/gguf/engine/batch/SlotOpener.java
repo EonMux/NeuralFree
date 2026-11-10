@@ -37,6 +37,8 @@ final class SlotOpener {
             .build();
 
     private final GGUFTokenizer tokenizer;
+    /** The sampler's view of {@link #tokenizer}, shared by every request so its piece caches build once. */
+    private final SamplerVocab samplerVocab;
     private final ReasoningFilter reasoning;
     private final SamplingDefaults samplingDefaults;
     private final BatchState state;
@@ -48,6 +50,7 @@ final class SlotOpener {
     SlotOpener(GGUFTokenizer tokenizer, ReasoningFilter reasoning, SamplingDefaults samplingDefaults,
                BatchState state, BatchSpec spec, LogitsProcessors logitsProcessors) {
         this.tokenizer = tokenizer;
+        this.samplerVocab = Sampler.vocab(tokenizer);
         this.reasoning = reasoning;
         this.samplingDefaults = samplingDefaults;
         this.state = state;
@@ -72,7 +75,7 @@ final class SlotOpener {
         StopCriteria stop = StopCriteria.of(effective, tokenizer, filter);
         String rendered = sub.renderedPrompt != null || filter.mode() == ReasoningFilter.Mode.NONE
                 ? sub.renderedPrompt : stop.renderPrompt(sub.renderTokens());
-        SamplerVocab vocab = Sampler.vocab(tokenizer);
+        SamplerVocab vocab = samplerVocab;
         List<SamplerStage> stages = grammarAndRequestStages(sub, effective, vocab);
         ReasoningBudgetStage budget = ReasoningBudgetStage.of(filter, effective, vocab, rendered);
         if (budget != null) {
@@ -125,7 +128,7 @@ final class SlotOpener {
      * cancellation hook alone — the pieces a cancel path reads while the pooling prompt prefills.
      */
     private Slot openPooling(PrefixClaims.Claim claim, Submission sub) {
-        SamplerVocab vocab = Sampler.vocab(tokenizer);
+        SamplerVocab vocab = samplerVocab;
         SequenceRun run = SequenceRun.over(POOLING_REQUEST, tokenizer)
                 .sampler(Sampler.create(SamplerConfig.greedyDecoding(), new int[0], vocab))
                 .build();

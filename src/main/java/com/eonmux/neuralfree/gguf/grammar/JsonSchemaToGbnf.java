@@ -359,6 +359,8 @@ public final class JsonSchemaToGbnf {
     /** The primitives that hold free JSON strings, directly or through their members. */
     private static final Set<String> EXCLUDABLE_TYPES = new HashSet<>(
             Arrays.asList("string", "value", "object", "array"));
+    /** The characters a {@code $ref} fragment cannot keep in a rule name. */
+    private static final Pattern INVALID_REF_CHARS = Pattern.compile("[^a-zA-Z0-9-]+");
     /** A reference to one of {@link #EXCLUDABLE_TYPES} in a primitive's rule text. */
     private static final Pattern EXCLUDABLE = Pattern.compile(
             "(?<![\\w-])(string|value|object|array)(?![\\w-])");
@@ -713,7 +715,7 @@ public final class JsonSchemaToGbnf {
             if (pending != null) {
                 return pending;
             }
-            String base = "ref" + ref.ref.substring(ref.ref.indexOf('#') + 1).replaceAll("[^a-zA-Z0-9-]+", "-");
+            String base = "ref" + INVALID_REF_CHARS.matcher(ref.ref.substring(ref.ref.indexOf('#') + 1)).replaceAll("-");
             String refName = base;
             for (int suffix = 0; rules.hasRule(refName) || pendingRefs.containsValue(refName); suffix++) {
                 refName = base + suffix;

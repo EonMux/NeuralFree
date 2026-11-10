@@ -130,7 +130,8 @@ record ChatPlan(String model, int top, GenerationRequest base, ConstraintSpec co
         MediaPrompt media = renderedMedia == null ? null : renderedMedia.prompt();
         List<ChatMedia.Placement> placements = renderedMedia == null ? List.of() : renderedMedia.placements();
         String echo = body.optBool("echo", false) ? echoPrefix(chat) : "";
-        int checkpointRow = embedded || tokens != encoded ? -1 : lastMessageStart(service, chat, encoded);
+        int checkpointRow = embedded || tokens != encoded ? -1
+                : lastMessageStart(service, chat, fullRendered, encoded);
         List<int[]> offsets = null;
         if (body.optBool("return_token_offsets", false) && !embedded) {
             offsets = ScaleOutOffsets.slice(ScaleOutOffsets.of(service, fullRendered, encoded), tokens, body);
@@ -189,9 +190,10 @@ record ChatPlan(String model, int top, GenerationRequest base, ConstraintSpec co
      * shared prefix), or -1 when it cannot be found. The probe renders the same conversation with the last
      * message's content replaced by {@link #BOUNDARY_MARKER} and reads the boundary off the two token streams'
      * longest common prefix: the rendered text before the last message is identical, so the prefix ends where
-     * the content starts, token for token the prompt's own rows.
+     * the content starts, token for token the prompt's own rows. The probe's shared opening is not tokenized
+     * again ({@link com.eonmux.neuralfree.gguf.GGUFTokenizer#commonPrefixLength}).
      */
-    private static int lastMessageStart(EngineService service, ChatRequest chat, int[] encoded) {
+    private static int lastMessageStart(EngineService service, ChatRequest chat, String rendered, int[] encoded) {
         List<Map<String, Object>> messages = chat.messages();
         if (messages.isEmpty()) {
             return -1;
@@ -204,17 +206,12 @@ record ChatPlan(String model, int top, GenerationRequest base, ConstraintSpec co
             }
             marked.add(copy);
         }
-        int[] probe;
+        int at;
         try {
-            probe = service.encode(service.formatChat(chat.toBuilder().messages(marked).build(), false), false,
-                    true);
+            String probe = service.formatChat(chat.toBuilder().messages(marked).build(), false);
+            at = service.tokenizer().commonPrefixLength(rendered, encoded, probe);
         } catch (RuntimeException probeFailed) {
             return -1;
-        }
-        int limit = Math.min(probe.length, encoded.length);
-        int at = 0;
-        while (at < limit && probe[at] == encoded[at]) {
-            at++;
         }
         return at > 0 && at < encoded.length ? at : -1;
     }
@@ -253,14 +250,14 @@ record ChatPlan(String model, int top, GenerationRequest base, ConstraintSpec co
     }
 
     /**
-     * The job of a token prompt under {@code chat}'s rendering (the Anthropic route): when the rendered prompt
-     * carries a message boundary ({@link #lastMessageStart}, the last message's start), the job is the media
-     * prompt of its tokens that names the boundary, else the plain token prompt.
+     * The job of a token prompt, the encoding of {@code rendered}, under {@code chat}'s rendering (the Anthropic
+     * route): when the rendered prompt carries a message boundary ({@link #lastMessageStart}, the last message's
+     * start), the job is the media prompt of its tokens that names the boundary, else the plain token prompt.
      */
     static GenerationBatch.Job textJob(EngineService service, ChatRequest chat, int[] tokens,
                                        GenerationRequest request, String rendered, ConstraintSpec constraint,
                                        ReasoningFilter reasoning) {
-        int boundary = lastMessageStart(service, chat, tokens);
+        int boundary = lastMessageStart(service, chat, rendered, tokens);
         return boundary >= 0
                 ? GenerationBatch.Job.ofMedia(MediaPrompt.builder().addText(tokens).checkpointRow(boundary).build(),
                         request, rendered, constraint, reasoning)

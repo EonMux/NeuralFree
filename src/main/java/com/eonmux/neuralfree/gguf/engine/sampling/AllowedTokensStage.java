@@ -11,7 +11,7 @@ import java.util.Objects;
  * constraint head, before the configured chain, so a banned id never reaches a truncating stage and a truncation
  * cannot cut the allowed set out. Immutable apart from the shared candidate set.
  */
-public final class AllowedTokensStage extends SamplerStage {
+public final class AllowedTokensStage extends SamplerStage implements TokenGate {
 
     private final int[] allowed;
 
@@ -54,6 +54,12 @@ public final class AllowedTokensStage extends SamplerStage {
                 candidates.setLogit(i, Float.NEGATIVE_INFINITY);
             }
         }
+    }
+
+    /** Whether {@code token} is one of the allowed ids. */
+    @Override
+    public boolean keeps(int token) {
+        return Arrays.binarySearch(allowed, token) >= 0;
     }
 
     @Override

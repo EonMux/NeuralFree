@@ -6,8 +6,13 @@ import com.eonmux.neuralfree.gguf.tokenizer.SpecialTokens;
 import com.eonmux.neuralfree.gguf.tokenizer.TokenizerVocab;
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
-/** A SamplerVocab on a GGUF model's tokenizer, following llama.cpp's piece semantics per id. */
+/**
+ * A SamplerVocab on a GGUF model's tokenizer, following llama.cpp's piece semantics per id. One instance serves every
+ * request of an engine, from whichever thread samples it: the piece caches fill lazily through atomic slots, so a
+ * piece one thread decodes is seen whole by the others.
+ */
 final class GgufVocab implements SamplerVocab {
 
     private static final int SPECIAL_ATTRS = TokenizerVocab.ATTR_UNKNOWN | TokenizerVocab.ATTR_CONTROL;
@@ -15,15 +20,15 @@ final class GgufVocab implements SamplerVocab {
     private final GGUFTokenizer tokenizer;
     private final TokenizerVocab vocab;
     private final SpecialTokens special;
-    private final byte[][] pieces;
-    private final byte[][] specialPieces;
+    private final AtomicReferenceArray<byte[]> pieces;
+    private final AtomicReferenceArray<byte[]> specialPieces;
 
     GgufVocab(GGUFTokenizer tokenizer) {
         this.tokenizer = tokenizer;
         this.vocab = tokenizer.vocab();
         this.special = tokenizer.specialTokens();
-        this.pieces = new byte[vocab.size()][];
-        this.specialPieces = new byte[vocab.size()][];
+        this.pieces = new AtomicReferenceArray<>(vocab.size());
+        this.specialPieces = new AtomicReferenceArray<>(vocab.size());
     }
 
     @Override
@@ -55,11 +60,11 @@ final class GgufVocab implements SamplerVocab {
         if (vocab.isByte(id)) {
             return new byte[]{(byte) vocab.byteValue(id)};
         }
-        byte[] cached = pieces[id];
+        byte[] cached = pieces.get(id);
         if (cached == null) {
             // the visible piece bytes (GGUFTokenizer.decode of one token, plain decoding)
             cached = tokenizer.decode(id).getBytes(StandardCharsets.UTF_8);
-            pieces[id] = cached;
+            pieces.set(id, cached);
         }
         return cached;
     }
@@ -68,10 +73,10 @@ final class GgufVocab implements SamplerVocab {
     @Override
     public byte[] grammarPiece(int id) {
         if ((vocab.attr(id) & SPECIAL_ATTRS) != 0) {
-            byte[] cached = specialPieces[id];
+            byte[] cached = specialPieces.get(id);
             if (cached == null) {
                 cached = vocab.text(id).getBytes(StandardCharsets.UTF_8);
-                specialPieces[id] = cached;
+                specialPieces.set(id, cached);
             }
             return cached;
         }

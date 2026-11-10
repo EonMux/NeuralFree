@@ -7434,6 +7434,21 @@ yields so the generation can stop. The reasoning budget's end-tag force keeps th
 truncating stages. This holds on every sampling path: the single-sequence loop, the batch engine's decodes, the
 speculative verifiers and the `beam` parser's derived tag.
 
+A greedy chain picks the same token without masking the whole row. It takes the argmax of the unmasked row and asks
+each mask whether it keeps that token, and masks the row only when one refuses it. This works when the configured
+stages are per-token edits: penalties, DRY, bias, and the truncations greedy decoding skips. On a confident model
+the grammar then costs about one token check per step. A sampled chain keeps the whole-row mask, because its
+truncation and draw read the admitted set. So does a chain with an active typical-p (below 1), top-n-sigma, XTC
+(probability above 0), infill, mirostat, adaptive-p, a logits processor or a reasoning budget. The grammar remembers the masks of recent parse states, so
+a state the output returns to (the next key of a JSON object, the next array item) is not walked again. Those masks
+take about 512 KiB at most per constrained sequence. The row-sized scratch of a mask is borrowed for that one mask and
+handed back, so an open constrained sequence holds its parse state and those masks, not megabytes of scratch.
+
+Each engine keeps the most recently used compiled constraints by spec: at most 32, holding at most about 16 MiB of
+heap (estimated at 64 bytes per grammar element and 2 bytes per character of the spec). A request that repeats a
+schema, a tool set or a grammar skips the translation and the parse. A constraint estimated above 4 MiB (a grammar of
+more than about 65,000 elements) is compiled for its own request and not kept.
+
 A masked set that empties ends the generation with `ConstraintDeadEndException`, and the server answers a 400,
 `the constraint head admits no candidate ...`. That happens when the text so far leaves no parse any vocabulary
 token continues (such as `root ::= <[999]>` beyond the vocabulary), or when the request's masks ban every id (an

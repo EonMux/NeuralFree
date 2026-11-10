@@ -4,11 +4,7 @@ import com.eonmux.neuralfree.gguf.engine.Sampler;
 import com.eonmux.neuralfree.gguf.grammar.Grammar;
 import com.eonmux.neuralfree.gguf.grammar.GrammarElement;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.HashSet;
-import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Set;
 
@@ -27,57 +23,34 @@ import java.util.Set;
  *
  * <p>A budget element ({@link GrammarElement.Type#TOKEN_BUDGET}, {@link GrammarElement.Type#CHAR_BUDGET}) opens a
  * counted region, xgrammar's {@code max_tokens} / {@code max_chars} rule attributes: the stack holds a frame — the
- * remaining count under a negative marker ({@link #TOKEN_FRAME}, {@link #CHAR_FRAME}) — below the region's own
- * positions, and the frame pops when the region completes. Every token that starts while a token frame is open
- * spends one of it, and every code point consumed while a character frame is open spends one of that; a parse whose
- * frame is spent cannot go on inside the region, so only the parses that already left it survive. A token that opens
- * a region mid-token does not count against its token budget, as in xgrammar.
+ * remaining count under a negative marker ({@link GrammarAutomaton#TOKEN_FRAME},
+ * {@link GrammarAutomaton#CHAR_FRAME}) — below the region's own positions, and the frame pops when the region
+ * completes. Every token that starts while a token frame is open spends one of it, and every code point consumed
+ * while a character frame is open spends one of that; a parse whose frame is spent cannot go on inside the region,
+ * so only the parses that already left it survive. A token that opens a region mid-token does not count against its
+ * token budget, as in xgrammar.
  * {@link #reset} returns the initial stacks. {@link #admits} tells whether a token may come next without accepting
  * it, and {@link #saveState} keeps a state to return to, so speculative verification can walk a draft and roll it
  * back (vLLM's {@code GrammarMatcher.validate_tokens} and {@code rollback}).
  *
+ * <p>The mask reads every token's code points from the vocabulary's decoded table ({@link GrammarPieces}) unless a
+ * character is pending across tokens, walks the candidates in primitive slot arrays ({@link GrammarRejectWalk})
+ * borrowed for the one mask ({@link GrammarWalkBuffers}), so a stage between masks holds no row-sized scratch, and
+ * remembers the masks of recent grammar states ({@link GrammarMaskMemo}). {@link #keeps} runs the same walk for one
+ * token, so a greedy chain can check its argmax before masking the row ({@link TokenGate}).
+ *
  * <p>Not thread-safe, owned by its sampler like every stage.
  */
-public final class GrammarStage extends SamplerStage {
-
-    /** One candidate under the stack walk: row index, token id, code points (trailing 0 included) and cursor. */
-    private static final class Cand {
-        final int index;
-        final int id;
-        final int[] cps;
-        final int off;
-        final int partialValue;
-        final int partialRemain;
-
-        Cand(int index, int id, int[] cps, int off, int partialValue, int partialRemain) {
-            this.index = index;
-            this.id = id;
-            this.cps = cps;
-            this.off = off;
-            this.partialValue = partialValue;
-            this.partialRemain = partialRemain;
-        }
-    }
-
-    /** {@code match_char}'s pair: whether the code point matched and the element after the char cluster. */
-    private static final class Match {
-        final boolean found;
-        final int next;
-
-        Match(boolean found, int next) {
-            this.found = found;
-            this.next = next;
-        }
-    }
+public final class GrammarStage extends SamplerStage implements TokenGate {
 
     /** A saved grammar state ({@link #saveState}). */
     private static final class State {
-        final List<List<Integer>> stacks;
+        final GrammarAutomaton.Stack[] stacks;
         final int partialValue;
         final int partialRemain;
         final boolean armed;
 
-        State(List<List<Integer>> stacks, int partialValue, int partialRemain, boolean armed) {
+        State(GrammarAutomaton.Stack[] stacks, int partialValue, int partialRemain, boolean armed) {
             this.stacks = stacks;
             this.partialValue = partialValue;
             this.partialRemain = partialRemain;
@@ -85,30 +58,28 @@ public final class GrammarStage extends SamplerStage {
         }
     }
 
-    private static final int[] LOOKUP = {1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4};
-
-    /** The stack marker of a token budget frame; the remaining token count lies right below it. */
-    private static final int TOKEN_FRAME = -1;
-
-    /** The stack marker of a character budget frame; the remaining code point count lies right below it. */
-    private static final int CHAR_FRAME = -2;
-
-    private final Grammar grammar;
+    private final GrammarAutomaton grammar;
     private final SamplerVocab vocab;
-    private final GrammarElement[] flat;
-    private final int[] ruleStart;
-    private List<List<Integer>> stacks;
+    private final GrammarRejectWalk walk;
+    /** The slots of a one-token check ({@link #keeps}). */
+    private final GrammarWalkBuffers single = new GrammarWalkBuffers(1);
+    /** The code points of one piece. */
+    private final GrammarPieces.Decoded scratch = new GrammarPieces.Decoded(64);
+    private GrammarPieces pieces;
+    private GrammarMaskMemo memo;
+    /** The row width {@link #memo} holds masks of. */
+    private int memoWidth = -1;
+    private GrammarAutomaton.Stack[] stacks;
     private int partialValue;
     private int partialRemain;
     private boolean armed;
 
     /** A stage over {@code grammar}; token pieces and end-of-generation ids come from {@code vocab}. */
     public GrammarStage(Grammar grammar, SamplerVocab vocab) {
-        this.grammar = Objects.requireNonNull(grammar, "grammar");
+        this.grammar = new GrammarAutomaton(Objects.requireNonNull(grammar, "grammar"));
         this.vocab = Objects.requireNonNull(vocab, "vocab");
-        this.flat = flatten(grammar);
-        this.ruleStart = ruleStarts(grammar);
-        this.stacks = initialStacks();
+        this.walk = new GrammarRejectWalk(this.grammar);
+        this.stacks = this.grammar.initialStacks();
         this.partialValue = 0;
         this.partialRemain = -1;
     }
@@ -117,48 +88,162 @@ public final class GrammarStage extends SamplerStage {
     public void apply(Sampler.Candidates candidates) {
         armed = true;
         int n = candidates.size();
-        boolean allowEog = false;
-        for (List<Integer> stack : stacks) {
-            if (stack.isEmpty()) {
-                allowEog = true;
-                break;
+        GrammarMaskMemo.Key key = null;
+        if (candidates.indexedByTokenId()) {
+            if (memo == null || memoWidth != n) {
+                memo = new GrammarMaskMemo(n);
+                memoWidth = n;
+            }
+            key = new GrammarMaskMemo.Key(stacks, partialValue, partialRemain, n);
+            long[] remembered = memo.get(key);
+            if (remembered != null) {
+                maskBits(candidates, remembered);
+                return;
             }
         }
-        Cand[] cands = new Cand[n];
-        List<Integer> live = new ArrayList<>(n);
+        long[] rejected = new long[(n + 63) >>> 6];
+        GrammarWalkBuffers buffers = GrammarWalkBuffers.borrow();
+        try {
+            buffers.reserve(n);
+            walk.bind(buffers);
+            int live = loadSlots(candidates, rejected, buffers.rowCodePoints);
+            int count = rejectCount(live);
+            for (int i = 0; i < count; i++) {
+                int slot = walk.slots[i];
+                rejected[slot >>> 6] |= 1L << slot;
+            }
+        } finally {
+            walk.unbind();
+            GrammarWalkBuffers.release(buffers);
+        }
+        maskBits(candidates, rejected);
+        if (key != null) {
+            memo.put(key, rejected);
+        }
+    }
+
+    /**
+     * Fills the walk's slots with the candidates the walk decides, row index as slot, and marks in {@code rejected}
+     * the ones decided without it: end-of-generation ids unless a parse is complete, and pieces the mask refuses
+     * (empty, or starting on the terminating 0, which llama.cpp rejects alike). A pending partial character decodes
+     * the pieces into {@code rowCodePoints}. Returns the slot count.
+     */
+    private int loadSlots(Sampler.Candidates candidates, long[] rejected, GrammarPieces.Decoded rowCodePoints) {
+        int n = candidates.size();
+        boolean allowEog = completed();
+        GrammarPieces table = pieces();
+        boolean fromTable = partialRemain <= 0 && maxId(candidates) < table.size();
+        int live = 0;
+        if (fromTable) {
+            walk.cps = table.codePoints();
+            for (int i = 0; i < n; i++) {
+                int id = candidates.id(i);
+                byte flags = table.flags(id);
+                if ((flags & GrammarPieces.EOG) != 0 ? !allowEog : (flags & GrammarPieces.REFUSED) != 0) {
+                    rejected[i >>> 6] |= 1L << i;
+                } else if ((flags & GrammarPieces.EOG) == 0) {
+                    walk.slots[live++] = i;
+                    walk.id[i] = id;
+                    walk.base[i] = table.base(id);
+                    walk.value[i] = table.endValue(id);
+                    walk.remain[i] = table.endRemain(id);
+                }
+            }
+            return live;
+        }
+        rowCodePoints.clear();
         for (int i = 0; i < n; i++) {
             int id = candidates.id(i);
             if (vocab.isEog(id)) {
                 if (!allowEog) {
-                    candidates.setLogit(i, Float.NEGATIVE_INFINITY);
+                    rejected[i >>> 6] |= 1L << i;
                 }
-            } else {
-                byte[] piece = vocab.grammarPiece(id);
-                if (piece.length == 0 || piece[0] == 0) {
-                    // llama.cpp rejects an empty piece and a piece starting on the terminating 0 alike
-                    candidates.setLogit(i, Float.NEGATIVE_INFINITY);
-                } else {
-                    cands[i] = decode(piece, i, id);
-                    live.add(i);
-                }
+                continue;
             }
+            byte[] piece = vocab.grammarPiece(id);
+            if (piece.length == 0 || piece[0] == 0) {
+                rejected[i >>> 6] |= 1L << i;
+                continue;
+            }
+            walk.slots[live++] = i;
+            walk.id[i] = id;
+            walk.base[i] = rowCodePoints.length;
+            GrammarPieces.decode(piece, partialValue, partialRemain, rowCodePoints);
+            walk.value[i] = rowCodePoints.endValue;
+            walk.remain[i] = rowCodePoints.endRemain;
         }
-        List<Cand> rejects = new ArrayList<>(live.size());
-        for (int i : live) {
-            rejects.add(cands[i]);
+        walk.cps = rowCodePoints.data;
+        return live;
+    }
+
+    private static int maxId(Sampler.Candidates candidates) {
+        if (candidates.indexedByTokenId()) {
+            return candidates.size() - 1;
         }
-        for (List<Integer> stack : stacks) {
-            List<Integer> started = tokenStart(stack);
+        int max = -1;
+        for (int i = 0; i < candidates.size(); i++) {
+            max = Math.max(max, candidates.id(i));
+        }
+        return max;
+    }
+
+    /**
+     * {@code llama_grammar_reject_candidates}: walks the first {@code live} slots over every partial parse, a
+     * candidate staying rejected only while every parse rejects it; returns how many of the leading slots are left
+     * rejected.
+     */
+    private int rejectCount(int live) {
+        int count = live;
+        for (GrammarAutomaton.Stack stack : stacks) {
+            GrammarAutomaton.Stack started = GrammarAutomaton.tokenStart(stack);
             if (started == null) {
                 continue; // a spent token budget: this parse takes no token
             }
-            rejects = rejectsForStack(started, rejects);
-            if (rejects.isEmpty()) {
+            count = walk.reject(started, 0, count, 0);
+            if (count == 0) {
                 break;
             }
         }
-        for (Cand reject : rejects) {
-            candidates.setLogit(reject.index, Float.NEGATIVE_INFINITY);
+        return count;
+    }
+
+    private static void maskBits(Sampler.Candidates candidates, long[] rejected) {
+        for (int w = 0; w < rejected.length; w++) {
+            long bits = rejected[w];
+            while (bits != 0) {
+                candidates.setLogit((w << 6) + Long.numberOfTrailingZeros(bits), Float.NEGATIVE_INFINITY);
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    /**
+     * Whether {@link #apply} would keep {@code token}: the same rejection walk for that token alone. Arms the stage,
+     * as an apply does.
+     */
+    @Override
+    public boolean keeps(int token) {
+        armed = true;
+        if (vocab.isEog(token)) {
+            return completed();
+        }
+        byte[] piece = vocab.grammarPiece(token);
+        if (piece.length == 0 || piece[0] == 0) {
+            return false;
+        }
+        scratch.clear();
+        GrammarPieces.decode(piece, partialValue, partialRemain, scratch);
+        walk.bind(single);
+        try {
+            walk.cps = scratch.data;
+            walk.slots[0] = 0;
+            walk.id[0] = token;
+            walk.base[0] = 0;
+            walk.value[0] = scratch.endValue;
+            walk.remain[0] = scratch.endRemain;
+            return rejectCount(1) == 0;
+        } finally {
+            walk.unbind();
         }
     }
 
@@ -197,54 +282,52 @@ public final class GrammarStage extends SamplerStage {
         if (piece.length == 0) {
             return true;
         }
-        int[][] decoded = decodeUtf8(piece, partialValue, partialRemain);
-        List<List<Integer>> next = nextStacks(token, decoded[0]);
-        if (next.isEmpty()) {
+        scratch.clear();
+        GrammarPieces.decode(piece, partialValue, partialRemain, scratch);
+        int value = scratch.endValue;
+        int remain = scratch.endRemain;
+        GrammarAutomaton.Stack[] next = nextStacks(token, scratch.data, scratch.length - 1);
+        if (next.length == 0) {
             return false;
         }
         stacks = next;
-        partialValue = decoded[1][0];
-        partialRemain = decoded[1][1];
+        partialValue = value;
+        partialRemain = remain;
         return true;
     }
 
-    /** The partial parses after {@code token} with code points {@code cps} (trailing 0 included); empty on a reject. */
-    private List<List<Integer>> nextStacks(int token, int[] cps) {
-        List<List<Integer>> next = new ArrayList<>();
-        for (List<Integer> unstarted : stacks) {
-            List<Integer> stack = unstarted.isEmpty() ? null : tokenStart(unstarted);
+    /** The partial parses after {@code token} with code points {@code cps[0, count)}; empty on a reject. */
+    private GrammarAutomaton.Stack[] nextStacks(int token, int[] cps, int count) {
+        Set<GrammarAutomaton.Stack> next = new LinkedHashSet<>();
+        for (GrammarAutomaton.Stack unstarted : stacks) {
+            GrammarAutomaton.Stack stack = unstarted.isEmpty() ? null : GrammarAutomaton.tokenStart(unstarted);
             if (stack == null) {
                 continue;
             }
-            int pos = stack.get(stack.size() - 1);
-            GrammarElement.Type type = flat[pos].type();
-            if (GrammarElement.isToken(type)) {
-                if (matchToken(pos, token)) {
-                    List<Integer> advanced = withoutTop(stack);
-                    int after = afterTokenSet(pos);
-                    if (!isEndOfSequence(after)) {
-                        advanced.add(after);
-                    }
-                    advanceStack(advanced, next);
+            int pos = stack.top();
+            if (grammar.isToken(pos)) {
+                if (grammar.matchToken(pos, token)) {
+                    grammar.acceptToken(stack, pos, next);
                 }
             } else {
-                List<List<Integer>> current = new ArrayList<>();
-                current.add(stack);
-                for (int i = 0; i < cps.length - 1 && !current.isEmpty(); i++) {
-                    List<List<Integer>> step = new ArrayList<>();
-                    for (List<Integer> cur : current) {
-                        acceptChr(cur, cps[i], step);
-                    }
-                    current = step;
-                }
-                for (List<Integer> surviving : current) {
-                    if (!next.contains(surviving)) {
-                        next.add(surviving);
-                    }
-                }
+                next.addAll(acceptCodePoints(stack, cps, count));
             }
         }
-        return next;
+        return next.toArray(new GrammarAutomaton.Stack[0]);
+    }
+
+    /** The parses {@code stack} leaves after consuming {@code cps[0, count)} one code point at a time. */
+    private Set<GrammarAutomaton.Stack> acceptCodePoints(GrammarAutomaton.Stack stack, int[] cps, int count) {
+        Set<GrammarAutomaton.Stack> current = new LinkedHashSet<>();
+        current.add(stack);
+        for (int i = 0; i < count && !current.isEmpty(); i++) {
+            Set<GrammarAutomaton.Stack> step = new LinkedHashSet<>();
+            for (GrammarAutomaton.Stack cur : current) {
+                grammar.acceptChr(cur, cps[i], step);
+            }
+            current = step;
+        }
+        return current;
     }
 
     /**
@@ -265,7 +348,9 @@ public final class GrammarStage extends SamplerStage {
         if (piece.length == 0 || piece[0] == 0) {
             return false;
         }
-        return !nextStacks(token, decodeUtf8(piece, partialValue, partialRemain)[0]).isEmpty();
+        scratch.clear();
+        GrammarPieces.decode(piece, partialValue, partialRemain, scratch);
+        return nextStacks(token, scratch.data, scratch.length - 1).length > 0;
     }
 
     @Override
@@ -273,7 +358,7 @@ public final class GrammarStage extends SamplerStage {
         return true;
     }
 
-    /** The partial parses, the partial UTF-8 tail and the armed flag; the stack lists are never changed in place. */
+    /** The partial parses, the partial UTF-8 tail and the armed flag; the stacks are immutable. */
     @Override
     public Object saveState() {
         return new State(stacks, partialValue, partialRemain, armed);
@@ -296,23 +381,16 @@ public final class GrammarStage extends SamplerStage {
      * trigger-gated stage uses it to keep a token from completing its trigger with text the grammar rejects.
      */
     boolean acceptsText(byte[] piece) {
-        int[][] decoded = decodeUtf8(piece, partialValue, partialRemain);
-        int[] cps = decoded[0];
-        List<List<Integer>> current = new ArrayList<>(stacks.size());
-        for (List<Integer> stack : stacks) {
-            List<Integer> started = stack.isEmpty() ? null : tokenStart(stack);
-            if (started != null) {
-                current.add(started);
+        scratch.clear();
+        GrammarPieces.decode(piece, partialValue, partialRemain, scratch);
+        int count = scratch.length - 1;
+        for (GrammarAutomaton.Stack stack : stacks) {
+            GrammarAutomaton.Stack started = stack.isEmpty() ? null : GrammarAutomaton.tokenStart(stack);
+            if (started != null && !acceptCodePoints(started, scratch.data, count).isEmpty()) {
+                return true;
             }
         }
-        for (int i = 0; i < cps.length - 1 && !current.isEmpty(); i++) {
-            List<List<Integer>> step = new ArrayList<>();
-            for (List<Integer> cur : current) {
-                acceptChr(cur, cps[i], step);
-            }
-            current = step;
-        }
-        return !current.isEmpty();
+        return false;
     }
 
     /** Arms the stage as its first {@link #apply} does: accepted tokens advance the grammar from here on. */
@@ -322,7 +400,7 @@ public final class GrammarStage extends SamplerStage {
 
     /** Whether a partial parse is complete: the grammar accepts the text so far as a whole sentence. */
     boolean completed() {
-        for (List<Integer> stack : stacks) {
+        for (GrammarAutomaton.Stack stack : stacks) {
             if (stack.isEmpty()) {
                 return true;
             }
@@ -337,427 +415,17 @@ public final class GrammarStage extends SamplerStage {
 
     @Override
     public void reset() {
-        stacks = initialStacks();
+        stacks = grammar.initialStacks();
         partialValue = 0;
         partialRemain = -1;
         armed = false;
     }
 
-    // ------------------------------------------------------------------ rejection walk (llama-grammar.cpp:1039-1131)
-
-    /** Rejects every candidate no continuation of {@code stack} accepts; rejects keep their read cursor. */
-    private List<Cand> rejectsForStack(List<Integer> stack, List<Cand> cands) {
-        if (cands.isEmpty()) {
-            // llama_grammar_reject_candidates returns at once: walking on would follow recursive rules forever
-            return cands;
+    /** The decoded vocabulary table, read on first use. */
+    private GrammarPieces pieces() {
+        if (pieces == null) {
+            pieces = GrammarPieces.of(vocab);
         }
-        if (stack.isEmpty()) {
-            List<Cand> rejects = new ArrayList<>();
-            for (Cand cand : cands) {
-                if (cand.cps[cand.off] != 0 || cand.partialRemain != 0) {
-                    rejects.add(cand);
-                }
-            }
-            return rejects;
-        }
-        int top = stack.get(stack.size() - 1);
-        GrammarElement.Type type = flat[top].type();
-        if (GrammarElement.isToken(type)) {
-            List<Cand> rejects = new ArrayList<>();
-            for (Cand cand : cands) {
-                if (cand.cps[cand.off] == 0) {
-                    if (cand.partialRemain != 0) {
-                        rejects.add(cand);
-                    }
-                } else if (!matchToken(top, cand.id)) {
-                    rejects.add(cand);
-                }
-            }
-            return rejects;
-        }
-        List<Cand> next = new ArrayList<>();
-        List<Cand> rejects = new ArrayList<>();
-        boolean room = charsLeft(stack);
-        for (Cand cand : cands) {
-            if (cand.cps[cand.off] == 0) {
-                if (cand.partialRemain != 0
-                        && (!room || !matchPartialChar(top, cand.partialValue, cand.partialRemain))) {
-                    rejects.add(cand);
-                }
-            } else if (room && matchChar(top, cand.cps[cand.off]).found) {
-                next.add(new Cand(cand.index, cand.id, cand.cps, cand.off + 1, cand.partialValue,
-                        cand.partialRemain));
-            } else {
-                rejects.add(cand);
-            }
-        }
-        if (next.isEmpty()) {
-            return rejects;
-        }
-        int after = matchChar(top, 0).next;
-        List<Integer> stackAfter = consumeChar(withoutTop(stack));
-        if (!isEndOfSequence(after)) {
-            stackAfter.add(after);
-        }
-        List<List<Integer>> nextStacks = new ArrayList<>();
-        advanceStack(stackAfter, nextStacks);
-        List<Cand> nextRejects = next;
-        for (List<Integer> ns : nextStacks) {
-            nextRejects = rejectsForStack(ns, nextRejects);
-            if (nextRejects.isEmpty()) {
-                return rejects;
-            }
-        }
-        for (Cand reject : nextRejects) {
-            rejects.add(new Cand(reject.index, reject.id, reject.cps, reject.off - 1, reject.partialValue,
-                    reject.partialRemain));
-        }
-        return rejects;
-    }
-
-    // ------------------------------------------------------------------ stack mechanics (llama-grammar.cpp:755-940)
-
-    /**
-     * {@code llama_grammar_init_impl}'s start state: one partial parse per alternative of the root rule, an empty
-     * alternative being the empty (completed) stack.
-     */
-    private List<List<Integer>> initialStacks() {
-        List<List<Integer>> initial = new ArrayList<>();
-        int pos = ruleStart[grammar.rootRuleIndex()];
-        while (true) {
-            List<Integer> stack = new ArrayList<>();
-            if (!isEndOfSequence(pos)) {
-                stack.add(pos);
-            }
-            advanceStack(stack, initial);
-            while (!isEndOfSequence(pos)) {
-                pos++;
-            }
-            if (flat[pos].type() != GrammarElement.Type.ALT) {
-                return initial;
-            }
-            pos++;
-        }
-    }
-
-    /**
-     * {@code llama_grammar_advance_stack}: expands rule references into every terminal-reaching stack. A budget
-     * element pushes its frame under the rest of its sequence; a frame on top (its region complete) pops.
-     */
-    private void advanceStack(List<Integer> stack, List<List<Integer>> out) {
-        Deque<List<Integer>> todo = new ArrayDeque<>();
-        todo.push(stack);
-        Set<List<Integer>> seen = new HashSet<>();
-        while (!todo.isEmpty()) {
-            List<Integer> curr = todo.pop();
-            if (!seen.add(curr)) {
-                continue;
-            }
-            if (curr.isEmpty()) {
-                if (!out.contains(curr)) {
-                    out.add(curr);
-                }
-                continue;
-            }
-            int pos = curr.get(curr.size() - 1);
-            if (pos < 0) {
-                todo.push(new ArrayList<>(curr.subList(0, curr.size() - 2)));
-                continue;
-            }
-            GrammarElement.Type type = flat[pos].type();
-            if (GrammarElement.isBudget(type)) {
-                List<Integer> framed = withoutTop(curr);
-                framed.add(flat[pos].value());
-                framed.add(type == GrammarElement.Type.TOKEN_BUDGET ? TOKEN_FRAME : CHAR_FRAME);
-                if (!isEndOfSequence(pos + 1)) {
-                    framed.add(pos + 1);
-                }
-                todo.push(framed);
-            } else if (type == GrammarElement.Type.RULE_REF) {
-                int ruleId = flat[pos].value();
-                int sub = ruleStart[ruleId];
-                while (true) {
-                    List<Integer> nextStack = withoutTop(curr);
-                    if (!isEndOfSequence(pos + 1)) {
-                        nextStack.add(pos + 1);
-                    }
-                    if (!isEndOfSequence(sub)) {
-                        nextStack.add(sub);
-                    }
-                    todo.push(nextStack);
-                    while (!isEndOfSequence(sub)) {
-                        sub++;
-                    }
-                    if (flat[sub].type() == GrammarElement.Type.ALT) {
-                        sub++;
-                    } else {
-                        break;
-                    }
-                }
-            } else if (type == GrammarElement.Type.CHAR || type == GrammarElement.Type.CHAR_NOT
-                    || type == GrammarElement.Type.CHAR_ANY || GrammarElement.isToken(type)) {
-                if (!out.contains(curr)) {
-                    out.add(curr);
-                }
-            } else {
-                throw new IllegalStateException("grammar stack left on " + type
-                        + " (a malformed rule ends mid-sequence)");
-            }
-        }
-    }
-
-    /** {@code llama_grammar_accept_chr}: consumes one code point at {@code stack}'s top into {@code out}. */
-    private void acceptChr(List<Integer> stack, int chr, List<List<Integer>> out) {
-        if (stack.isEmpty()) {
-            return;
-        }
-        int pos = stack.get(stack.size() - 1);
-        GrammarElement.Type type = flat[pos].type();
-        if (GrammarElement.isToken(type) || !charsLeft(stack)) {
-            return;
-        }
-        Match match = matchChar(pos, chr);
-        if (match.found) {
-            List<Integer> advanced = consumeChar(withoutTop(stack));
-            if (!isEndOfSequence(match.next)) {
-                advanced.add(match.next);
-            }
-            advanceStack(advanced, out);
-        }
-    }
-
-    /** {@code llama_grammar_match_char}: the code point against the char cluster at {@code pos}. */
-    private Match matchChar(int pos, int chr) {
-        boolean found = false;
-        boolean positive = flat[pos].type() == GrammarElement.Type.CHAR
-                || flat[pos].type() == GrammarElement.Type.CHAR_ANY;
-        do {
-            GrammarElement element = flat[pos];
-            if (flat[pos + 1].type() == GrammarElement.Type.CHAR_RNG_UPPER) {
-                found = found || (element.value() <= chr && chr <= flat[pos + 1].value());
-                pos += 2;
-            } else if (element.type() == GrammarElement.Type.CHAR_ANY) {
-                found = true;
-                pos += 1;
-            } else {
-                found = found || element.value() == chr;
-                pos += 1;
-            }
-        } while (flat[pos].type() == GrammarElement.Type.CHAR_ALT);
-        return new Match(found == positive, pos);
-    }
-
-    /** {@code llama_grammar_match_partial_char}: whether the partial UTF-8 tail could satisfy {@code pos}. */
-    private boolean matchPartialChar(int pos, int partialValue, int nRemain) {
-        boolean positive = flat[pos].type() == GrammarElement.Type.CHAR
-                || flat[pos].type() == GrammarElement.Type.CHAR_ANY;
-        if (nRemain < 0 || (nRemain == 1 && partialValue < 2)) {
-            return false;
-        }
-        int low = partialValue << (nRemain * 6);
-        int high = low | ((1 << (nRemain * 6)) - 1);
-        if (low == 0) {
-            if (nRemain == 2) {
-                low = 1 << 11;
-            } else if (nRemain == 3) {
-                low = 1 << 16;
-            }
-        }
-        do {
-            GrammarElement element = flat[pos];
-            if (flat[pos + 1].type() == GrammarElement.Type.CHAR_RNG_UPPER) {
-                if (element.value() <= high && low <= flat[pos + 1].value()) {
-                    return positive;
-                }
-                pos += 2;
-            } else if (element.type() == GrammarElement.Type.CHAR_ANY) {
-                return true;
-            } else {
-                if (low <= element.value() && element.value() <= high) {
-                    return positive;
-                }
-                pos += 1;
-            }
-        } while (flat[pos].type() == GrammarElement.Type.CHAR_ALT);
-        return !positive;
-    }
-
-    /**
-     * {@code llama_grammar_match_token}: the token id against a TOKEN / TOKEN_NOT element and the TOKEN_ALT ids
-     * after it: a TOKEN set matches any of its ids, a TOKEN_NOT set any token outside them, TOKEN_ANY any token.
-     */
-    private boolean matchToken(int pos, int token) {
-        GrammarElement.Type type = flat[pos].type();
-        if (type == GrammarElement.Type.TOKEN_ANY) {
-            return true;
-        }
-        if (type != GrammarElement.Type.TOKEN && type != GrammarElement.Type.TOKEN_NOT) {
-            throw new IllegalStateException("token match outside a token element: " + type);
-        }
-        boolean found = flat[pos].value() == token;
-        for (int i = pos + 1; !found && flat[i].type() == GrammarElement.Type.TOKEN_ALT; i++) {
-            found = flat[i].value() == token;
-        }
-        return found == (type == GrammarElement.Type.TOKEN);
-    }
-
-    /** The position after the token element at {@code pos} and its TOKEN_ALT ids. */
-    private int afterTokenSet(int pos) {
-        int i = pos + 1;
-        while (flat[i].type() == GrammarElement.Type.TOKEN_ALT) {
-            i++;
-        }
-        return i;
-    }
-
-    private boolean isEndOfSequence(int pos) {
-        GrammarElement.Type type = flat[pos].type();
-        return type == GrammarElement.Type.END || type == GrammarElement.Type.ALT;
-    }
-
-    // ------------------------------------------------------------------ rule flattening and UTF-8
-
-    private static GrammarElement[] flatten(Grammar grammar) {
-        int total = 0;
-        for (int r = 0; r < grammar.ruleCount(); r++) {
-            total += grammar.rule(r).size();
-        }
-        GrammarElement[] flat = new GrammarElement[total];
-        int at = 0;
-        for (int r = 0; r < grammar.ruleCount(); r++) {
-            List<GrammarElement> rule = grammar.rule(r);
-            for (GrammarElement element : rule) {
-                flat[at++] = element;
-            }
-        }
-        return flat;
-    }
-
-    private static int[] ruleStarts(Grammar grammar) {
-        int[] starts = new int[grammar.ruleCount()];
-        int at = 0;
-        for (int r = 0; r < grammar.ruleCount(); r++) {
-            starts[r] = at;
-            at += grammar.rule(r).size();
-        }
-        return starts;
-    }
-
-    private static List<Integer> withoutTop(List<Integer> stack) {
-        return new ArrayList<>(stack.subList(0, stack.size() - 1));
-    }
-
-    // ------------------------------------------------------------------ budget frames
-
-    /**
-     * {@code stack} as a new token starts on it: every open token frame spends one, or null when one is already
-     * spent (the parse cannot take the token inside its region). The same list when no token frame is open.
-     */
-    private static List<Integer> tokenStart(List<Integer> stack) {
-        return spend(stack, TOKEN_FRAME);
-    }
-
-    /** Whether {@code stack} may consume one more code point: none of its character frames is spent. */
-    private static boolean charsLeft(List<Integer> stack) {
-        for (int i = stack.size() - 1; i > 0; i--) {
-            if (stack.get(i) == CHAR_FRAME) {
-                if (stack.get(i - 1) == 0) {
-                    return false;
-                }
-                i--;
-            } else if (stack.get(i) == TOKEN_FRAME) {
-                i--;
-            }
-        }
-        return true;
-    }
-
-    /** {@code stack} after one code point: every open character frame spends one ({@link #charsLeft} holds). */
-    private static List<Integer> consumeChar(List<Integer> stack) {
-        List<Integer> spent = spend(stack, CHAR_FRAME);
-        if (spent == null) {
-            throw new IllegalStateException("a code point consumed past a spent character budget");
-        }
-        return spent;
-    }
-
-    /**
-     * {@code stack} with every {@code marker} frame's count spent by one, or null when one of them is already 0.
-     * Frames are read from the top: a marker's count lies right below it, so a count is never read as a marker.
-     */
-    private static List<Integer> spend(List<Integer> stack, int marker) {
-        List<Integer> out = null;
-        for (int i = stack.size() - 1; i > 0; i--) {
-            int entry = stack.get(i);
-            if (entry >= 0) {
-                continue;
-            }
-            if (entry == marker) {
-                int left = stack.get(i - 1);
-                if (left == 0) {
-                    return null;
-                }
-                if (out == null) {
-                    out = new ArrayList<>(stack);
-                }
-                out.set(i - 1, left - 1);
-            }
-            i--;
-        }
-        return out == null ? stack : out;
-    }
-
-    /**
-     * {@code decode_utf8}: the piece's code points with a trailing 0, plus the partial tail a multi-byte character
-     * split across tokens leaves ({@code {value, nRemain}}).
-     */
-    private static int[][] decodeUtf8(byte[] src, int startValue, int startRemain) {
-        List<Integer> codePoints = new ArrayList<>(src.length + 1);
-        int value = startValue;
-        int nRemain = startRemain;
-        int pos = 0;
-        while (pos < src.length && nRemain > 0) {
-            int nextByte = src[pos] & 0xFF;
-            if ((nextByte >> 6) != 2) {
-                codePoints.add(0);
-                return new int[][]{{0}, {0, -1}};
-            }
-            value = (value << 6) + (nextByte & 0x3F);
-            pos++;
-            nRemain--;
-        }
-        if (startRemain > 0 && nRemain == 0) {
-            codePoints.add(value);
-        }
-        while (pos < src.length) {
-            int firstByte = src[pos] & 0xFF;
-            nRemain = LOOKUP[firstByte >> 4] - 1;
-            if (nRemain < 0) {
-                return new int[][]{{0}, {0, nRemain}};
-            }
-            int mask = (1 << (7 - nRemain)) - 1;
-            value = firstByte & mask;
-            pos++;
-            while (pos < src.length && nRemain > 0) {
-                value = (value << 6) + (src[pos] & 0x3F);
-                pos++;
-                nRemain--;
-            }
-            if (nRemain == 0) {
-                codePoints.add(value);
-            }
-        }
-        codePoints.add(0);
-        int[] cps = new int[codePoints.size()];
-        for (int i = 0; i < cps.length; i++) {
-            cps[i] = codePoints.get(i);
-        }
-        return new int[][]{cps, {value, nRemain}};
-    }
-
-    /** The candidate's own decode, from the grammar's current partial tail. */
-    private Cand decode(byte[] piece, int index, int id) {
-        int[][] decoded = decodeUtf8(piece, partialValue, partialRemain);
-        return new Cand(index, id, decoded[0], 0, decoded[1][0], decoded[1][1]);
+        return pieces;
     }
 }

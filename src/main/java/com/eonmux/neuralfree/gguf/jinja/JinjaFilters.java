@@ -38,6 +38,9 @@ final class JinjaFilters {
 
     private static final Pattern TITLE_SPLIT = Pattern.compile("[-\\s({\\[<]+", Pattern.UNICODE_CHARACTER_CLASS);
     private static final Pattern WORD = Pattern.compile("\\w+", Pattern.UNICODE_CHARACTER_CLASS);
+    private static final Pattern FLOAT_INFINITY = Pattern.compile("[+-]?(inf|infinity)");
+    private static final Pattern FLOAT_NAN = Pattern.compile("[+-]?nan");
+    private static final Pattern FLOAT_DECIMAL = Pattern.compile("[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?");
     private static final Json.Adapter TEMPLATE_JSON = new TemplateJsonAdapter();
 
     private JinjaFilters() {}
@@ -223,9 +226,9 @@ final class JinjaFilters {
         if (v instanceof String) {
             String s = JinjaMethods.strip((String) v, null, true, true).replace("_", "");
             String lower = s.toLowerCase(Locale.ROOT);
-            if (lower.matches("[+-]?(inf|infinity)")) return lower.startsWith("-") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
-            if (lower.matches("[+-]?nan")) return Double.NaN;
-            if (s.matches("[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?")) return Double.parseDouble(s);
+            if (FLOAT_INFINITY.matcher(lower).matches()) return lower.startsWith("-") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+            if (FLOAT_NAN.matcher(lower).matches()) return Double.NaN;
+            if (FLOAT_DECIMAL.matcher(s).matches()) return Double.parseDouble(s);
         }
         return dflt;
     }

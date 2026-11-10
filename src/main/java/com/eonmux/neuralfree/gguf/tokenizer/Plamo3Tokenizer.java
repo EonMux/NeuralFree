@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
+import java.util.List;
+
 /**
  * PLaMo-3 tokenizer ({@code tokenizer.ggml.model = "plamo3"}), transcribed from llama.cpp
  * {@code llm_tokenizer_plamo2} with {@code pre_segment = true} (src/llama-vocab.cpp:1422-1779, selected at
@@ -35,6 +37,18 @@ public final class Plamo3Tokenizer implements TokenizerAlgorithm {
     @Override
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         return Plamo2Tokenizer.encode(vocab, special, text, addSpecial, parseSpecial, this::tokenizeFragment);
+    }
+
+    @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return special.partition(text, parseSpecial);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        IdBuffer out = new IdBuffer(16);
+        Plamo2Tokenizer.encodeFragments(fragments, from, out, this::tokenizeFragment);
+        return out.toArray();
     }
 
     @Override

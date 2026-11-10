@@ -3,6 +3,7 @@ package com.eonmux.neuralfree.gguf.engine.sampling;
 import com.eonmux.neuralfree.gguf.engine.GenerationRequest;
 import com.eonmux.neuralfree.gguf.engine.ReasoningFilter;
 import com.eonmux.neuralfree.gguf.grammar.CompiledConstraint;
+import com.eonmux.neuralfree.gguf.grammar.ConstraintCompiler;
 import com.eonmux.neuralfree.gguf.grammar.ConstraintSpec;
 import com.eonmux.neuralfree.gguf.grammar.GbnfBuilder;
 import com.eonmux.neuralfree.gguf.grammar.GrammarVocab;
@@ -71,7 +72,22 @@ public final class RequestStages {
         if (constraint == null) {
             return null;
         }
-        CompiledConstraint compiled = GbnfBuilder.compile(constraint, grammarVocab);
+        return stageOf(GbnfBuilder.compile(constraint, grammarVocab), vocab);
+    }
+
+    /**
+     * {@link #constraintStage(ConstraintSpec, GrammarVocab, SamplerVocab)} compiling through {@code compiler}, which
+     * hands back the engine's remembered compilation of an equal spec ({@link ConstraintCompiler}).
+     */
+    public static SamplerStage constraintStage(ConstraintSpec constraint, ConstraintCompiler compiler,
+                                               SamplerVocab vocab) {
+        if (constraint == null) {
+            return null;
+        }
+        return stageOf(compiler.compile(constraint), vocab);
+    }
+
+    private static SamplerStage stageOf(CompiledConstraint compiled, SamplerVocab vocab) {
         return compiled.gated()
                 ? new TriggeredGrammarStage(compiled.grammar(), compiled.triggers(), vocab,
                         compiled.freeExcludes(), compiled.freeExcludeTokens())

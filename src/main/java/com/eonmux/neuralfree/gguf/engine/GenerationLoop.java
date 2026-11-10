@@ -13,6 +13,7 @@ import com.eonmux.neuralfree.gguf.engine.sampling.LogitsProcessors;
 import com.eonmux.neuralfree.gguf.engine.sampling.RequestStages;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
+import com.eonmux.neuralfree.gguf.grammar.ConstraintCompiler;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
 import com.eonmux.neuralfree.gguf.memory.SequenceState;
@@ -93,6 +94,10 @@ public final class GenerationLoop {
 
     private final ForwardBackend backend;
     private final GGUFTokenizer tokenizer;
+    /** The sampler's view of {@link #tokenizer}, shared by every request so its piece caches build once. */
+    private final SamplerVocab samplerVocab;
+    /** The request constraints compiled over {@link #tokenizer}, remembered across requests. */
+    private final ConstraintCompiler constraints;
     private final ReasoningFilter reasoning;
     private final boolean prefixReuse;
     private final boolean contextShift;
@@ -109,6 +114,8 @@ public final class GenerationLoop {
     private GenerationLoop(Builder b) {
         this.backend = b.backend;
         this.tokenizer = b.tokenizer;
+        this.samplerVocab = Sampler.vocab(b.tokenizer);
+        this.constraints = new ConstraintCompiler(text -> tokenizer.encode(text, false, true));
         this.reasoning = b.reasoning;
         this.prefixReuse = b.prefixReuse;
         this.contextShift = b.contextShift;
@@ -366,10 +373,9 @@ public final class GenerationLoop {
         StopCriteria stop = StopCriteria.of(effective, tokenizer, filter);
         String rendered = renderedPrompt != null || filter.mode() == ReasoningFilter.Mode.NONE
                 ? renderedPrompt : stop.renderPrompt(promptTokens);
-        SamplerVocab vocab = Sampler.vocab(tokenizer);
+        SamplerVocab vocab = samplerVocab;
         List<SamplerStage> extra = new ArrayList<>();
-        SamplerStage grammar = RequestStages.constraintStage(effective.constraint(),
-                text -> tokenizer.encode(text, false, true), vocab);
+        SamplerStage grammar = RequestStages.constraintStage(effective.constraint(), constraints, vocab);
         if (grammar != null) {
             extra.add(grammar);
         }

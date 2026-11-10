@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -44,11 +45,28 @@ public final class RwkvTokenizer implements TokenizerAlgorithm {
     @Override
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 2));
-        for (SpecialTokens.Fragment f : special.partition(text, parseSpecial)) {
+        encodeFragments(fragments(text, parseSpecial), 0, out);
+        return out.toArray();
+    }
+
+    @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return special.partition(text, parseSpecial);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        IdBuffer out = new IdBuffer(16);
+        encodeFragments(fragments, from, out);
+        return out.toArray();
+    }
+
+    private void encodeFragments(List<SpecialTokens.Fragment> fragments, int from, IdBuffer out) {
+        for (int i = from; i < fragments.size(); i++) {
+            SpecialTokens.Fragment f = fragments.get(i);
             if (f.isToken()) out.add(f.token());
             else tokenizeFragment(TokenizerAlgorithm.utf8(f.text()), out);
         }
-        return out.toArray();
     }
 
     @Override

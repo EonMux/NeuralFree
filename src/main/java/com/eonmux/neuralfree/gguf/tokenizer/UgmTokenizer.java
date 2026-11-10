@@ -1,9 +1,8 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
-import java.nio.charset.StandardCharsets;
 import java.text.Normalizer;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * SentencePiece Unigram tokenizer ({@code tokenizer.ggml.model = "t5"}: T5, mT5, UMT5),
@@ -26,9 +25,9 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
 
     private final TokenizerVocab vocab;
     private final SpecialTokens special;
-    /** Matchable tokens keyed by their UTF-8 bytes as an ISO-8859-1 string. */
-    private final Map<String, Integer> tokenMatcher;
-    private final int maxTokenBytes;
+    /** {@code token_matcher}: the matchable tokens by their UTF-8 bytes. */
+    private final ByteTrie tokenMatcher;
+    /** {@code user_defined_token_matcher}: the user-defined tokens by their UTF-8 bytes. */
     private final ByteTrie userDefinedMatcher;
     private final float unknownTokenScore;
     private final PrecompiledCharsmap charsmap;
@@ -44,22 +43,24 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
         byte[] blob = vocab.precompiledCharsmap();
         this.charsmap = blob != null ? new PrecompiledCharsmap(blob) : null;
 
-        Map<String, Integer> matcher = new HashMap<>();
-        ByteTrie userDefined = new ByteTrie();
+        List<byte[]> matchable = new ArrayList<>();
+        IdBuffer matchableIds = new IdBuffer(vocab.size());
+        List<byte[]> userDefined = new ArrayList<>();
+        IdBuffer userDefinedIds = new IdBuffer(16);
         float minScore = Float.MAX_VALUE;
-        int maxBytes = 0;
         for (int id = 0; id < vocab.size(); id++) {
             if (vocab.isNormal(id)) minScore = Math.min(minScore, vocab.score(id));
             if (vocab.hasAttr(id, TokenizerVocab.ATTR_NORMAL | TokenizerVocab.ATTR_USER_DEFINED | TokenizerVocab.ATTR_UNUSED)) {
-                byte[] b = TokenizerAlgorithm.utf8(vocab.text(id));
-                matcher.put(new String(b, StandardCharsets.ISO_8859_1), id);
-                maxBytes = Math.max(maxBytes, b.length);
+                matchable.add(TokenizerAlgorithm.utf8(vocab.text(id)));
+                matchableIds.add(id);
             }
-            if (vocab.isUserDefined(id)) userDefined.insert(TokenizerAlgorithm.utf8(vocab.text(id)));
+            if (vocab.isUserDefined(id)) {
+                userDefined.add(TokenizerAlgorithm.utf8(vocab.text(id)));
+                userDefinedIds.add(id);
+            }
         }
-        this.tokenMatcher = matcher;
-        this.maxTokenBytes = maxBytes;
-        this.userDefinedMatcher = userDefined;
+        this.tokenMatcher = new ByteTrie(matchable.toArray(new byte[0][]), matchableIds.toArray());
+        this.userDefinedMatcher = new ByteTrie(userDefined.toArray(new byte[0][]), userDefinedIds.toArray());
         this.unknownTokenScore = minScore - UNKNOWN_TOKEN_SCORE_PENALTY;
     }
 
@@ -67,12 +68,29 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 3));
         if (addSpecial && vocab.addBos()) out.add(special.requireBos());
-        for (SpecialTokens.Fragment f : special.partition(text, parseSpecial)) {
+        encodeFragments(fragments(text, parseSpecial), 0, out);
+        if (addSpecial && vocab.addEos()) out.add(special.requireEos());
+        return out.toArray();
+    }
+
+    @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return special.partition(text, parseSpecial);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        IdBuffer out = new IdBuffer(16);
+        encodeFragments(fragments, from, out);
+        return out.toArray();
+    }
+
+    private void encodeFragments(List<SpecialTokens.Fragment> fragments, int from, IdBuffer out) {
+        for (int i = from; i < fragments.size(); i++) {
+            SpecialTokens.Fragment f = fragments.get(i);
             if (f.isToken()) out.add(f.token());
             else tokenizeFragment(f.text(), out);
         }
-        if (addSpecial && vocab.addEos()) out.add(special.requireEos());
-        return out.toArray();
     }
 
     @Override
@@ -104,10 +122,12 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
             int units = Math.min(utf8LeadLength(normalized[off]), n - off);
             boolean singleCodepointFound = false;
             double current = scoreSum[off];
-            int limit = Math.min(maxTokenBytes, n - off);
-            for (int len = 1; len <= limit; len++) {
-                Integer id = tokenMatcher.get(new String(normalized, off, len, StandardCharsets.ISO_8859_1));
-                if (id == null) continue;
+            int node = ByteTrie.ROOT;
+            for (int len = 1; off + len <= n; len++) {
+                node = tokenMatcher.child(node, normalized[off + len - 1]);
+                if (node == ByteTrie.NONE) break;
+                int id = tokenMatcher.value(node);
+                if (id == ByteTrie.NONE) continue;
                 if (len == units) singleCodepointFound = true;
                 double tokenScore = vocab.isUserDefined(id) ? 0.0 : vocab.score(id);
                 double challenger = current + tokenScore;
@@ -183,7 +203,7 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
      * {offset, length, consumed input bytes}.
      */
     private byte[] normalizePrefix(byte[] input, int off, int[] res) {
-        int userDefined = userDefinedMatcher.longestPathPrefix(input, off);
+        int userDefined = userDefinedMatcher.pathDepth(input, off);
         if (userDefined > 0) {
             res[0] = off;
             res[1] = userDefined;
@@ -238,28 +258,5 @@ public final class UgmTokenizer implements TokenizerAlgorithm {
 
     private static boolean cont(byte b) {
         return (b & 0xC0) == 0x80;
-    }
-
-    /** {@code naive_trie} over UTF-8 bytes; {@link #longestPathPrefix} follows the trie path only. */
-    private static final class ByteTrie {
-        private final Map<Integer, ByteTrie> children = new HashMap<>();
-
-        void insert(byte[] key) {
-            ByteTrie node = this;
-            for (byte b : key) node = node.children.computeIfAbsent(b & 0xFF, k -> new ByteTrie());
-        }
-
-        /** {@code get_longest_prefix}: the depth reached along the trie, whether or not a key ends there. */
-        int longestPathPrefix(byte[] s, int off) {
-            ByteTrie node = this;
-            int depth = 0;
-            while (off + depth < s.length) {
-                ByteTrie child = node.children.get(s[off + depth] & 0xFF);
-                if (child == null) break;
-                node = child;
-                depth++;
-            }
-            return depth;
-        }
     }
 }

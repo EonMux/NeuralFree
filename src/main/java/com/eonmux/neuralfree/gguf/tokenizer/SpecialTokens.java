@@ -64,6 +64,8 @@ public final class SpecialTokens {
     private final int fimSep;
     private final int[] attrs;
     private final Set<Integer> eogIds;
+    /** {@link #eogIds} by id, for the per-candidate lookups of the samplers. */
+    private final boolean[] eogFlags;
     private final int[] partitionOrder;
     private final int[] suppressTokens;
     private final int[] prefixIds;
@@ -81,6 +83,14 @@ public final class SpecialTokens {
      * null when the vocabulary normalizer is the identity or no such token exists.
      */
     private final String[] normalizedTexts;
+    /**
+     * Which partition texts occur in a phase's input, by position in {@link #partitionOrder}: the raw texts of the
+     * tokens that are not normalized, the raw and the normalized texts of the normalized ones (null when no token
+     * is normalized, or the normalizer is the identity).
+     */
+    private final SpecialTextIndex rawIndex;
+    private final SpecialTextIndex normalizedRawIndex;
+    private final SpecialTextIndex normalizedTextIndex;
 
     private SpecialTokens(SpecialTokenRules.Result r) {
         this(r, Collections.<String>emptyList());
@@ -104,6 +114,7 @@ public final class SpecialTokens {
         this.fimSep = r.ids[SpecialTokenRules.FIM_SEP];
         this.attrs = r.attrs;
         this.eogIds = Collections.unmodifiableSet(new LinkedHashSet<>(r.eog));
+        this.eogFlags = flags(eogIds);
         Set<Integer> preservedIds = new LinkedHashSet<>();
         for (String marker : preserved) {
             int id = marker == null || marker.isEmpty() ? -1 : r.vocab.tokenId(marker);
@@ -120,6 +131,9 @@ public final class SpecialTokens {
         for (int id : partitionOrder) normalized |= (attrs[id] & TokenizerVocab.ATTR_NORMALIZED) != 0;
         this.normalizedTokens = normalized;
         this.normalizedTexts = normalized && !r.vocab.normalizer().isIdentity() ? normalizedTexts(r.vocab) : null;
+        this.rawIndex = phaseIndex(false, false);
+        this.normalizedRawIndex = normalized ? phaseIndex(true, false) : null;
+        this.normalizedTextIndex = normalizedTexts != null ? phaseIndex(true, true) : null;
     }
 
     /**
@@ -143,6 +157,18 @@ public final class SpecialTokens {
             out[i] = ids.get(i);
         }
         return out;
+    }
+
+    /** The index of one partition phase's texts, by position in {@link #partitionOrder}. */
+    private SpecialTextIndex phaseIndex(boolean normalizedPhase, boolean normalizedText) {
+        String[] texts = new String[partitionOrder.length];
+        for (int k = 0; k < texts.length; k++) {
+            int id = partitionOrder[k];
+            if (((attrs[id] & TokenizerVocab.ATTR_NORMALIZED) != 0) == normalizedPhase) {
+                texts[k] = normalizedText ? normalizedTexts[id] : vocab.text(id);
+            }
+        }
+        return new SpecialTextIndex(texts);
     }
 
     private String[] normalizedTexts(TokenizerVocab v) {
@@ -219,7 +245,15 @@ public final class SpecialTokens {
 
     /** End-of-generation token ids. */
     public Set<Integer> eogIds() { return eogIds; }
-    public boolean isEog(int id) { return id != NULL && eogIds.contains(id); }
+    public boolean isEog(int id) { return id >= 0 && id < eogFlags.length && eogFlags[id]; }
+
+    private static boolean[] flags(Set<Integer> ids) {
+        int max = -1;
+        for (int id : ids) max = Math.max(max, id);
+        boolean[] out = new boolean[max + 1];
+        for (int id : ids) if (id >= 0) out[id] = true;
+        return out;
+    }
 
     /** {@code tokenizer.ggml.suppress_tokens}, in-range ids only; a copy. */
     public int[] suppressTokens() { return suppressTokens.clone(); }
@@ -280,8 +314,13 @@ public final class SpecialTokens {
     private List<Fragment> splitTokens(List<Fragment> fragments, boolean parseSpecial, boolean normalizedPhase,
                                        boolean normalize) {
         boolean normalizedText = normalizedPhase && normalize && normalizedTexts != null;
+        SpecialTextIndex index = !normalizedPhase ? rawIndex : normalizedText ? normalizedTextIndex
+                : normalizedRawIndex;
+        boolean[] occurs = index.occurring(fragments);
         List<Fragment> current = fragments;
-        for (int id : partitionOrder) {
+        for (int k = 0; k < partitionOrder.length; k++) {
+            if (!occurs[k]) continue; // a text absent from the phase's input matches none of its fragments
+            int id = partitionOrder[k];
             if (!parseSpecial && ((attrs[id] & HIDDEN_ATTRS) != 0 || preservedIds.contains(id))) continue;
             if (((attrs[id] & TokenizerVocab.ATTR_NORMALIZED) != 0) != normalizedPhase) continue;
             String special = normalizedText ? normalizedTexts[id] : vocab.text(id);

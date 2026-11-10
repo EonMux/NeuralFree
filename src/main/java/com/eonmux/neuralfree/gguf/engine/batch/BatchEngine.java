@@ -33,6 +33,7 @@ import com.eonmux.neuralfree.gguf.engine.kvevents.KvEventPublishers;
 import com.eonmux.neuralfree.gguf.engine.lora.LoraRegistry;
 import com.eonmux.neuralfree.gguf.engine.lora.LoraSelection;
 import com.eonmux.neuralfree.gguf.engine.lora.LoraPlan;
+import com.eonmux.neuralfree.gguf.grammar.ConstraintCompiler;
 import com.eonmux.neuralfree.gguf.memory.MemoryConfig;
 import com.eonmux.neuralfree.gguf.memory.MemoryFullException;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
@@ -257,6 +258,8 @@ public final class BatchEngine implements AutoCloseable {
     private static final double GIB = 1024.0 * 1024.0 * 1024.0;
 
     private final GGUFTokenizer tokenizer;
+    /** The request constraints compiled over {@link #tokenizer}, remembered across submissions. */
+    private final ConstraintCompiler constraints;
     private final BatchDrafter drafter;
     /** The speculative settings, or null when the engine decodes plainly. */
     private final BatchSpec spec;
@@ -300,6 +303,7 @@ public final class BatchEngine implements AutoCloseable {
                         PoolingOperator poolingOperator, SupportClass support, boolean causal,
                         DiskBlockCache.Io diskIo, LogitsProcessors logitsProcessors, LookaheadOptions lookahead) {
         this.tokenizer = tokenizer;
+        this.constraints = new ConstraintCompiler(text -> tokenizer.encode(text, false, true));
         this.drafter = drafter;
         this.spec = spec;
         this.samplingDefaults = samplingDefaults;
@@ -863,8 +867,7 @@ public final class BatchEngine implements AutoCloseable {
         com.eonmux.neuralfree.gguf.grammar.ConstraintSpec spec =
                 constraint != null ? constraint : request.constraint();
         com.eonmux.neuralfree.gguf.grammar.CompiledConstraint grammar = spec == null ? null
-                : com.eonmux.neuralfree.gguf.grammar.GbnfBuilder.compile(spec,
-                        text -> tokenizer.encode(text, false, true));
+                : constraints.compile(spec);
         if (this.spec != null) {
             requireWatermarkSupport(request.withModelDefaults(samplingDefaults).sampler().watermark());
             VerifyRound.refuseAdaptiveP(this.spec.verifyMode(),

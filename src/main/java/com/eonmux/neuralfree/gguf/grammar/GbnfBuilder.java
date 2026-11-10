@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.regex.Pattern;
 
 /**
  * The rule registry of the grammar builders, the Java port of the {@code _rules} map and
@@ -36,6 +37,8 @@ public final class GbnfBuilder {
      * by {@code space} in every JSON rule this builder produces.
      */
     public static final String SPACE_RULE = "| \" \" | \"\\n\"{1,2} [ \\t]{0,20}";
+
+    private static final Pattern INVALID_RULE_CHARS = Pattern.compile("[^a-zA-Z0-9-]+");
 
     /** Rule definitions in name order; {@code format()} iterates exactly this order. */
     private final TreeMap<String, String> rules = new TreeMap<>();
@@ -277,7 +280,7 @@ public final class GbnfBuilder {
 
     /** Sanitizes a rule name, llama.cpp {@code INVALID_RULE_CHARS_RE} ({@code :275}). */
     static String sanitizeRuleName(String name) {
-        return name.replaceAll("[^a-zA-Z0-9-]+", "-");
+        return INVALID_RULE_CHARS.matcher(name).replaceAll("-");
     }
 
     /**

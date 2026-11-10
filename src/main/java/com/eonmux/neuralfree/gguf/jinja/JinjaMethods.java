@@ -554,6 +554,9 @@ final class JinjaMethods {
 
     // ================================================================= str.format and %-formatting
 
+    private static final Pattern TRAILING_ZEROS = Pattern.compile("0+$");
+    private static final Pattern TRAILING_POINT = Pattern.compile("\\.$");
+    private static final Pattern MANTISSA_ZEROS = Pattern.compile("\\.?0+e");
     private static final Pattern FIELD_NAME = Pattern.compile("([^.\\[]*)((?:\\.[^.\\[]+|\\[[^\\]]*\\])*)");
     private static final Pattern FIELD_PART = Pattern.compile("\\.([^.\\[]+)|\\[([^\\]]*)\\]");
 
@@ -798,11 +801,12 @@ final class JinjaMethods {
         String out;
         if (exp >= -4 && exp < p) {
             out = bd.setScale(Math.max(0, p - 1 - exp), RoundingMode.HALF_EVEN).toPlainString();
-            if (!alt && out.indexOf('.') >= 0) out = out.replaceAll("0+$", "").replaceAll("\\.$", "");
+            if (!alt && out.indexOf('.') >= 0) out = TRAILING_POINT.matcher(TRAILING_ZEROS.matcher(out).replaceAll(""))
+                    .replaceAll("");
             if (reprLike && out.indexOf('.') < 0) out += ".0";
         } else {
             out = scientific(x, p - 1, alt);
-            if (!alt) out = out.replaceAll("\\.?0+e", "e");
+            if (!alt) out = MANTISSA_ZEROS.matcher(out).replaceAll("e");
         }
         return out;
     }

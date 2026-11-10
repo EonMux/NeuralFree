@@ -16,6 +16,7 @@ import com.eonmux.neuralfree.gguf.engine.sampling.TopKStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TopNSigmaStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TopPStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.TemperatureStage;
+import com.eonmux.neuralfree.gguf.engine.sampling.TokenGate;
 import com.eonmux.neuralfree.gguf.engine.sampling.TypicalStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.XtcStage;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
@@ -789,14 +790,59 @@ public final class Sampler {
     }
 
     /**
-     * Runs the chain over {@code logits} and returns the selected token id. {@code logits} is not modified.
+     * Runs the chain over {@code logits} and returns the selected token id: the token {@link #apply} selects, found
+     * sample-first by a greedy chain with a per-token constraint head ({@link #sampleFirst}), which masks the whole
+     * row only when the head refuses the unmasked argmax. {@code logits} is not modified.
      *
      * @throws IllegalArgumentException      when the row is empty
      * @throws ConstraintDeadEndException    when the chain's constraints admit no candidate
      * @throws IllegalStateException         when no candidate has a finite logit
      */
     public int sample(float[] logits) {
-        return apply(logits).selectedId();
+        int token = sampleFirst(logits);
+        return token >= 0 ? token : apply(logits).selectedId();
+    }
+
+    /**
+     * The greedy token of a constrained chain found sample-first, or -1 when the chain does not qualify
+     * ({@link #sampleFirstChain}) or its constraint head refuses the unmasked argmax. The row is loaded, the fixed
+     * bias stage and the configured stages run over it unmasked, and every constraint-head stage is asked whether its
+     * mask keeps the argmax ({@link TokenGate#keeps}). The head's masks set logits to {@code -inf} by token id and the
+     * configured stages of a qualifying chain edit each logit by its own token alone, so masking before or after
+     * them leaves the same logits on the kept tokens; an argmax every head stage keeps is therefore the argmax of
+     * the masked row, ties included (the first maximum in vocabulary order on both). A refused argmax leaves the
+     * caller to run the whole-row mask ({@link #apply}), which the head stages' state allows: {@code keeps} makes
+     * only the state changes their apply makes again.
+     */
+    int sampleFirst(float[] logits) {
+        if (logits == null || logits.length == 0 || !sampleFirstChain()) {
+            return -1;
+        }
+        cur.load(logits);
+        biasStage.apply(cur);
+        applyStages(false);
+        int best = 0;
+        for (int i = 1; i < cur.size(); i++) {
+            if (cur.logit(i) > cur.logit(best)) {
+                best = i;
+            }
+        }
+        if (cur.logit(best) == Float.NEGATIVE_INFINITY) {
+            return -1;
+        }
+        int token = cur.id(best);
+        for (SamplerStage stage : constraints) {
+            if (!((TokenGate) stage).keeps(token)) {
+                return -1;
+            }
+        }
+        cur.select(best);
+        return token;
+    }
+
+    /** Whether {@link #sample} may select sample-first ({@link SampleFirstRules#qualifies}). */
+    boolean sampleFirstChain() {
+        return greedy && SampleFirstRules.qualifies(constraints, chain, typicalP);
     }
 
     /**
@@ -883,32 +929,7 @@ public final class Sampler {
      * device readout that already applied the fixed bias stage and the chain's pre-top-k penalties and DRY.
      */
     private Candidates runChain(boolean prefiltered) {
-        boolean terminal = false;
-        SamplerStage skipPenalties = deviceFilter.prefilteredPenalties();
-        SamplerStage skipDry = deviceFilter.prefilteredDry();
-        for (SamplerStage stage : chain) {
-            if (prefiltered && (stage == skipPenalties || stage == skipDry)) {
-                continue;
-            }
-            StageKind kind = stage.kind();
-            if (stage.constrains() || stage.masks()) {
-                continue; // the constraint head masked the set already
-            }
-            if (greedy) {
-                if (kind == StageKind.TEMPERATURE) {
-                    continue;
-                }
-                if (typicalP >= 1f
-                        && (kind == StageKind.TOP_K || kind == StageKind.TOP_P || kind == StageKind.MIN_P)) {
-                    continue;
-                }
-            }
-            stage.apply(cur);
-            if (kind == StageKind.MIROSTAT || kind == StageKind.ADAPTIVE_P) {
-                terminal = true;
-                break;
-            }
-        }
+        boolean terminal = applyStages(prefiltered);
         if (terminal) {
             // the terminal selector set the selected candidate already
         } else if (greedy) {
@@ -919,6 +940,32 @@ public final class Sampler {
             chainEnd.drawDist(cur, rng);
         }
         return cur;
+    }
+
+    /**
+     * The configured stages over the loaded candidates, the constraint head and the stages greedy decoding skips left
+     * out; true when a terminal selector (mirostat, adaptive-p) ran and selected the token.
+     */
+    private boolean applyStages(boolean prefiltered) {
+        SamplerStage skipPenalties = deviceFilter.prefilteredPenalties();
+        SamplerStage skipDry = deviceFilter.prefilteredDry();
+        for (SamplerStage stage : chain) {
+            if (prefiltered && (stage == skipPenalties || stage == skipDry)) {
+                continue;
+            }
+            StageKind kind = stage.kind();
+            if (stage.constrains() || stage.masks()) {
+                continue; // the constraint head masked the set already
+            }
+            if (greedy && SampleFirstRules.skippedWhenGreedy(kind, typicalP)) {
+                continue;
+            }
+            stage.apply(cur);
+            if (kind == StageKind.MIROSTAT || kind == StageKind.ADAPTIVE_P) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

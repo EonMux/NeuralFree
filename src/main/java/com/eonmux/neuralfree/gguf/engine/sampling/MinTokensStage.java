@@ -18,7 +18,7 @@ import java.util.Objects;
  * stage ({@code Sampler.create(config, bannedTokens, extra, vocab)}): it always applies, and its {@link
  * #modifies()} keeps an argmax chain off the on-device argmax path while it still bans.
  */
-public final class MinTokensStage extends SamplerStage {
+public final class MinTokensStage extends SamplerStage implements TokenGate {
 
     private final int minTokens;
     private final SamplerVocab vocab;
@@ -46,6 +46,18 @@ public final class MinTokensStage extends SamplerStage {
                 return;
             }
         }
+    }
+
+    /**
+     * Whether {@link #apply} keeps {@code token}: always once the budget is spent; a token that is not an
+     * end-of-generation id while it lasts, since that finite token keeps the ban from yielding. An end-of-generation
+     * token is refused while the budget lasts, as the ban yields only when nothing else is left, which the whole
+     * row decides. Arms the stage, as an apply does.
+     */
+    @Override
+    public boolean keeps(int token) {
+        armed = true;
+        return accepted >= minTokens || !vocab.isEog(token);
     }
 
     /** Sets every end-of-generation logit to {@code -inf}. */

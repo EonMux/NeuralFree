@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * The tool-call grammars written in a registered format's own syntax, one builder per format (vLLM's
@@ -49,6 +50,8 @@ final class NativeToolGrammar {
 
     /** The whitespace the tool parsers skip between tokens of a call. */
     static final String WS = "[ \\t\\n\\r]*";
+
+    private static final Pattern INVALID_RULE_CHARS = Pattern.compile("[^a-zA-Z0-9-]+");
 
     private NativeToolGrammar() {
     }
@@ -231,7 +234,7 @@ final class NativeToolGrammar {
 
     private static String prefix(String format) {
         // rule names must be safe before the composer sanitizes them: the exclusion rules claim theirs verbatim
-        return "native-" + format.toLowerCase(Locale.ROOT).replaceAll("[^a-zA-Z0-9-]+", "-");
+        return "native-" + INVALID_RULE_CHARS.matcher(format.toLowerCase(Locale.ROOT)).replaceAll("-");
     }
 
     /** One format: the rule of one call unit and the root over the units. */

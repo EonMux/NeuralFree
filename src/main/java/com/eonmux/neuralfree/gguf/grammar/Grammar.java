@@ -33,6 +33,7 @@ public final class Grammar {
     private final int rootRuleIndex;
     private final int[] ruleLines;
     private final int[] ruleColumns;
+    private final int elementCount;
 
     Grammar(List<List<GrammarElement>> rules,
             Map<String, Integer> symbolIds,
@@ -41,9 +42,12 @@ public final class Grammar {
             int[] ruleLines,
             int[] ruleColumns) {
         List<List<GrammarElement>> copy = new ArrayList<>(rules.size());
+        int elements = 0;
         for (List<GrammarElement> rule : rules) {
             copy.add(Collections.unmodifiableList(new ArrayList<>(rule)));
+            elements += rule.size();
         }
+        this.elementCount = elements;
         this.rules = Collections.unmodifiableList(copy);
         this.symbolIds = Collections.unmodifiableMap(new TreeMap<>(symbolIds));
         this.symbolNames = Collections.unmodifiableList(new ArrayList<>(symbolNames));
@@ -56,6 +60,11 @@ public final class Grammar {
     /** Number of rules; every id in {@code [0, ruleCount())} names a defined rule. */
     public int ruleCount() {
         return rules.size();
+    }
+
+    /** Number of elements over every rule, each rule's {@code END} included. */
+    public int elementCount() {
+        return elementCount;
     }
 
     /** Definition of rule {@code index}; unmodifiable view, ends with {@code Type.END}. */

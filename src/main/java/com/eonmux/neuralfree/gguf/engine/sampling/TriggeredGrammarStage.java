@@ -35,7 +35,14 @@ import java.util.Objects;
  * <p>Prompt tokens never advance the stage: like {@link GrammarStage} it counts accepted tokens only after its
  * first {@link #apply}. Not thread-safe, owned by its sampler.
  */
-public final class TriggeredGrammarStage extends SamplerStage {
+public final class TriggeredGrammarStage extends SamplerStage implements TokenGate {
+
+    /** The trigger buffer, its backing array readable so a word search needs no copy. */
+    private static final class TriggerBuffer extends ByteArrayOutputStream {
+        byte[] array() {
+            return buf;
+        }
+    }
 
     /** One buffered token and its byte span in the trigger buffer. */
     private static final class Span {
@@ -77,8 +84,13 @@ public final class TriggeredGrammarStage extends SamplerStage {
     private final boolean[] excludeLastByte;
     private final int longestExclude;
     private final int[] excludeTokens;
+    /**
+     * Whether every text trigger is a literal word the buffer can hold byte for byte: no pattern triggers, and no
+     * word containing U+FFFD (which the decoded buffer also shows for malformed bytes).
+     */
+    private final boolean wordsOnly;
 
-    private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+    private final TriggerBuffer buffer = new TriggerBuffer();
     private final List<Span> spans = new ArrayList<>();
     private GrammarStage active;
     private GrammarStage probe;
@@ -111,6 +123,12 @@ public final class TriggeredGrammarStage extends SamplerStage {
             longest = Math.max(longest, words[i].length);
         }
         this.longestWord = longest;
+        boolean literal = true;
+        for (GrammarTriggers.Trigger t : triggers.triggers()) {
+            literal &= t.kind() == GrammarTriggers.Kind.TOKEN
+                    || (t.kind() == GrammarTriggers.Kind.WORD && t.source().indexOf('\uFFFD') < 0);
+        }
+        this.wordsOnly = literal;
         List<String> excludes = freeExcludes == null ? Collections.emptyList() : freeExcludes;
         this.excludeWords = new byte[excludes.size()][];
         this.excludeLastByte = new boolean[256];
@@ -181,6 +199,9 @@ public final class TriggeredGrammarStage extends SamplerStage {
         int from = buffer.size();
         buffer.writeBytes(piece);
         spans.add(new Span(token, from, buffer.size()));
+        if (wordsOnly && !wordEndsInPiece(from)) {
+            return true;
+        }
         byte[] bytes = buffer.toByteArray();
         String text = new String(bytes, StandardCharsets.UTF_8);
         int at = triggers.firstStart(text);
@@ -200,6 +221,43 @@ public final class TriggeredGrammarStage extends SamplerStage {
             }
         }
         return true;
+    }
+
+    /**
+     * Whether a trigger word occurs in the buffer ending at or after byte {@code pieceFrom}, where the piece just
+     * buffered starts. No trigger fired on the text before that piece, so a word trigger can only fire now on an
+     * occurrence that reaches into the piece; when none does, the full trigger search over the decoded text finds
+     * nothing either.
+     */
+    private boolean wordEndsInPiece(int pieceFrom) {
+        byte[] bytes = buffer.array();
+        int end = buffer.size();
+        for (byte[] w : words) {
+            int last = end - w.length;
+            for (int s = Math.max(0, pieceFrom - w.length + 1); s <= last; s++) {
+                if (regionEquals(bytes, s, w)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether {@link #apply} would keep {@code token}: the active grammar's own answer, or, while the stage waits,
+     * whether the token completes a trigger word with text the grammar rejects or writes an exclusion. Arms the
+     * stage, as an apply does.
+     */
+    @Override
+    public boolean keeps(int token) {
+        armed = true;
+        if (active != null) {
+            return active.keeps(token);
+        }
+        if ((words.length == 0 && excludeWords.length == 0 && excludeTokens.length == 0) || vocab.isEog(token)) {
+            return true;
+        }
+        return !completesTriggerOrExclusion(token, awaitingTail());
     }
 
     /**
@@ -272,8 +330,7 @@ public final class TriggeredGrammarStage extends SamplerStage {
 
     /** Masks what the waiting phase refuses: trigger-completing tokens with rejected text, and the exclusions. */
     private void maskAwaiting(Sampler.Candidates candidates) {
-        byte[] all = buffer.toByteArray();
-        byte[] tail = awaitingTail(all, Math.max(longestWord, longestExclude));
+        byte[] tail = awaitingTail();
         for (int i = 0; i < candidates.size(); i++) {
             if (candidates.logit(i) == Float.NEGATIVE_INFINITY) {
                 continue;
@@ -282,20 +339,22 @@ public final class TriggeredGrammarStage extends SamplerStage {
             if (vocab.isEog(id)) {
                 continue;
             }
-            if (completesTriggerOrExclusion(candidates, i, id, tail)) {
+            if (completesTriggerOrExclusion(id, tail)) {
                 candidates.setLogit(i, Float.NEGATIVE_INFINITY);
             }
         }
     }
 
     /** The buffer tail a next piece can still extend into a trigger word or an excluded string. */
-    private static byte[] awaitingTail(byte[] all, int longest) {
-        int keep = longest <= 0 ? 0 : Math.min(all.length, longest - 1);
-        return Arrays.copyOfRange(all, all.length - keep, all.length);
+    private byte[] awaitingTail() {
+        int longest = Math.max(longestWord, longestExclude);
+        int size = buffer.size();
+        int keep = longest <= 0 ? 0 : Math.min(size, longest - 1);
+        return Arrays.copyOfRange(buffer.array(), size - keep, size);
     }
 
-    /** Whether candidate {@code i} completes a trigger word with rejected text, or writes an exclusion. */
-    private boolean completesTriggerOrExclusion(Sampler.Candidates candidates, int i, int id, byte[] tail) {
+    /** Whether token {@code id} completes a trigger word with rejected text, or writes an exclusion. */
+    private boolean completesTriggerOrExclusion(int id, byte[] tail) {
         for (int token : excludeTokens) {
             if (token == id) {
                 return true;

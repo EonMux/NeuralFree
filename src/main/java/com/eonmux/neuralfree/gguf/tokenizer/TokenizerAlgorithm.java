@@ -1,6 +1,7 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 /**
  * One llama.cpp tokenizer algorithm bound to a vocabulary.
@@ -26,6 +27,27 @@ public interface TokenizerAlgorithm {
      * vocabulary's BOS/EOS/SEP policy is applied.
      */
     int[] encode(String text, boolean addSpecial, boolean parseSpecial);
+
+    /**
+     * The partition {@link #encode} reads, or null when the algorithm does not encode fragment by fragment. With
+     * {@link #encodeFragments}, {@code encode(text, false, parseSpecial)} is the ids of
+     * {@code encodeFragments(fragments(text, parseSpecial), 0)}.
+     */
+    default List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return null;
+    }
+
+    /**
+     * The ids {@link #encode} (without {@code addSpecial}) gives fragments {@code from} onwards of a partition from
+     * {@link #fragments}: every fragment encodes on its own, reading only its own text and its place in the
+     * partition, so two texts whose partitions share their first {@code from} fragments share those fragments'
+     * ids and differ only in what this returns.
+     *
+     * @throws UnsupportedOperationException when {@link #fragments} returns null
+     */
+    default int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not encode fragment by fragment");
+    }
 
     /**
      * {@code llama_vocab::impl::detokenize} with {@code remove_special = true} and
@@ -170,8 +192,19 @@ public interface TokenizerAlgorithm {
             data[length++] = id;
         }
 
+        public void addAll(int[] ids) {
+            if (length + ids.length > data.length) {
+                data = java.util.Arrays.copyOf(data, Math.max(data.length * 2, length + ids.length));
+            }
+            System.arraycopy(ids, 0, data, length, ids.length);
+            length += ids.length;
+        }
+
         public int length() { return length; }
         public int get(int index) { return data[index]; }
+
+        /** The ids from {@code from} to the end, as a new array. */
+        public int[] copyFrom(int from) { return java.util.Arrays.copyOfRange(data, from, length); }
 
         public int[] toArray() { return java.util.Arrays.copyOf(data, length); }
     }

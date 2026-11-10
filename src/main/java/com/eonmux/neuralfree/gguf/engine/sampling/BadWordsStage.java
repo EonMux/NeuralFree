@@ -16,7 +16,7 @@ import java.util.Objects;
  * tokens out of a set that holds nothing else. A Java-API custom stage ({@code Sampler.create(config,
  * bannedTokens, extra, vocab)}) that always applies.
  */
-public final class BadWordsStage extends SamplerStage {
+public final class BadWordsStage extends SamplerStage implements TokenGate {
 
     private final int[][] phrases;
     private final SamplerVocab vocab;
@@ -82,6 +82,17 @@ public final class BadWordsStage extends SamplerStage {
                 }
             }
         }
+    }
+
+    /** Whether {@code token} completes none of the phrases after the history tail. */
+    @Override
+    public boolean keeps(int token) {
+        for (int[] phrase : phrases) {
+            if (continuesPhrase(token, phrase)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Whether {@code token} extends the history tail into the whole phrase. */

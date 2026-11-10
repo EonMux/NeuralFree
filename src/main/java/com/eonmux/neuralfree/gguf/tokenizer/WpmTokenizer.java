@@ -50,12 +50,29 @@ public final class WpmTokenizer implements TokenizerAlgorithm {
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 3));
         if (addSpecial) out.add(special.requireBos());
-        for (SpecialTokens.Fragment f : special.partition(text, parseSpecial)) {
+        encodeFragments(fragments(text, parseSpecial), 0, out);
+        if (addSpecial) out.add(special.requireSep());
+        return out.toArray();
+    }
+
+    @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return special.partition(text, parseSpecial);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        IdBuffer out = new IdBuffer(16);
+        encodeFragments(fragments, from, out);
+        return out.toArray();
+    }
+
+    private void encodeFragments(List<SpecialTokens.Fragment> fragments, int from, IdBuffer out) {
+        for (int i = from; i < fragments.size(); i++) {
+            SpecialTokens.Fragment f = fragments.get(i);
             if (f.isToken()) out.add(f.token());
             else tokenizeFragment(f.text(), out);
         }
-        if (addSpecial) out.add(special.requireSep());
-        return out.toArray();
     }
 
     @Override

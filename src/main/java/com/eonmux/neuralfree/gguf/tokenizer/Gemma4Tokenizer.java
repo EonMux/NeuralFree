@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.gguf.tokenizer;
 
+import java.util.List;
+
 /**
  * Gemma 4 tokenizer ({@code tokenizer.ggml.model = "gemma4"}).
  *
@@ -25,6 +27,16 @@ public final class Gemma4Tokenizer implements TokenizerAlgorithm {
     @Override
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         return bpe.encode(text, addSpecial, parseSpecial);
+    }
+
+    @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return bpe.fragments(text, parseSpecial);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        return bpe.encodeFragments(fragments, from);
     }
 
     @Override

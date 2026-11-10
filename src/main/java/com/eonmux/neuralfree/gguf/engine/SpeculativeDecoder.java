@@ -20,6 +20,7 @@ import com.eonmux.neuralfree.gguf.engine.sampling.RequestStages;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerStage;
 import com.eonmux.neuralfree.gguf.engine.sampling.SamplerVocab;
 import com.eonmux.neuralfree.gguf.engine.watermark.WatermarkConfig;
+import com.eonmux.neuralfree.gguf.grammar.ConstraintCompiler;
 import com.eonmux.neuralfree.gguf.memory.MemoryFullException;
 import com.eonmux.neuralfree.gguf.memory.MemoryPlan;
 import com.eonmux.neuralfree.gguf.memory.ModelMemory;
@@ -203,6 +204,10 @@ public final class SpeculativeDecoder {
     final ForwardBackend backend;
     final DraftModel drafter;
     private final GGUFTokenizer tokenizer;
+    /** The sampler's view of {@link #tokenizer}, shared by every request so its piece caches build once. */
+    private final SamplerVocab samplerVocab;
+    /** The request constraints compiled over {@link #tokenizer}, remembered across requests. */
+    private final ConstraintCompiler constraints;
     private final ReasoningFilter reasoning;
     private final LoraRegistry adapters;
     private final int draftMax;
@@ -248,6 +253,8 @@ public final class SpeculativeDecoder {
         this.backend = b.backend;
         this.drafter = b.drafter;
         this.tokenizer = b.tokenizer;
+        this.samplerVocab = Sampler.vocab(b.tokenizer);
+        this.constraints = new ConstraintCompiler(text -> tokenizer.encode(text, false, true));
         this.reasoning = b.reasoning;
         this.logitsProcessors = b.logitsProcessors;
         this.adapters = b.adapters;
@@ -391,13 +398,12 @@ public final class SpeculativeDecoder {
         StopCriteria stop = StopCriteria.of(effective, tokenizer, filter);
         String rendered = renderedPrompt != null || filter.mode() == ReasoningFilter.Mode.NONE
                 ? renderedPrompt : stop.renderPrompt(prompt);
-        SamplerVocab vocab = Sampler.vocab(tokenizer);
+        SamplerVocab vocab = samplerVocab;
         // the constraint head masks first: the grammar runs before the request's masks so a completed
         // constraint's end-of-generation tokens survive the min-tokens ban (the ban yields when nothing
         // else remains) and the budget force keeps the final say over a masked set
         List<SamplerStage> extra = new ArrayList<>();
-        SamplerStage grammar = RequestStages.constraintStage(effective.constraint(),
-                text -> tokenizer.encode(text, false, true), vocab);
+        SamplerStage grammar = RequestStages.constraintStage(effective.constraint(), constraints, vocab);
         if (grammar != null) {
             extra.add(grammar);
         }

@@ -47,12 +47,32 @@ public final class SpmTokenizer implements TokenizerAlgorithm {
     @Override
     public int[] encode(String text, boolean addSpecial, boolean parseSpecial) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 3));
-        boolean isPrevSpecial = true;
         if (addSpecial) {
             for (int id : special.leadingIds()) out.add(id);
         }
-        List<SpecialTokens.Fragment> fragments = special.partition(text, parseSpecial);
-        for (int i = 0; i < fragments.size(); i++) {
+        encodeFragments(fragments(text, parseSpecial), 0, out);
+        if (addSpecial) {
+            for (int id : special.trailingIds()) out.add(id);
+        }
+        return out.toArray();
+    }
+
+    @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return special.partition(text, parseSpecial);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        IdBuffer out = new IdBuffer(16);
+        encodeFragments(fragments, from, out);
+        return out.toArray();
+    }
+
+    /** The fragment loop; a text fragment's space prefix reads only whether the fragment before it is a token. */
+    private void encodeFragments(List<SpecialTokens.Fragment> fragments, int from, IdBuffer out) {
+        boolean isPrevSpecial = from == 0 || fragments.get(from - 1).isToken();
+        for (int i = from; i < fragments.size(); i++) {
             SpecialTokens.Fragment f = fragments.get(i);
             if (f.isToken()) {
                 out.add(f.token());
@@ -63,10 +83,6 @@ public final class SpmTokenizer implements TokenizerAlgorithm {
                 isPrevSpecial = false;
             }
         }
-        if (addSpecial) {
-            for (int id : special.trailingIds()) out.add(id);
-        }
-        return out.toArray();
     }
 
     /**

@@ -346,6 +346,44 @@ public final class GGUFTokenizer {
         return algorithm.encode(text, addSpecial, parseSpecial);
     }
 
+    /**
+     * How many leading ids {@code encode(a, false, true)} — {@code encodedA}, the caller's encoding of {@code a} —
+     * shares with {@code encode(b, false, true)}. Only what the texts do not share is tokenized: both are
+     * partitioned around their special tokens, and since every fragment encodes on its own
+     * ({@link TokenizerAlgorithm#encodeFragments}), the fragments the two partitions open with alike give the same
+     * ids in both; the rest of each is encoded and compared. An algorithm that does not encode fragment by fragment
+     * encodes {@code b} whole.
+     *
+     * @throws IllegalArgumentException when {@code encodedA} does not end in the ids of {@code a}'s unshared
+     *         fragments, so it is not {@code a}'s encoding
+     */
+    public int commonPrefixLength(String a, int[] encodedA, String b) {
+        if (a == null || encodedA == null || b == null) throw new IllegalArgumentException("texts and ids are required");
+        List<SpecialTokens.Fragment> fa = algorithm.fragments(a, true);
+        if (fa == null) return commonPrefix(encodedA, 0, encode(b, false, true), 0);
+        List<SpecialTokens.Fragment> fb = algorithm.fragments(b, true);
+        int shared = 0;
+        while (shared < fa.size() && shared < fb.size() && sameFragment(fa.get(shared), fb.get(shared))) shared++;
+        int[] tailA = algorithm.encodeFragments(fa, shared);
+        int head = encodedA.length - tailA.length;
+        if (head < 0 || commonPrefix(encodedA, head, tailA, 0) != tailA.length) {
+            throw new IllegalArgumentException("the ids given are not the encoding of the first text");
+        }
+        return head + commonPrefix(tailA, 0, algorithm.encodeFragments(fb, shared), 0);
+    }
+
+    private static boolean sameFragment(SpecialTokens.Fragment x, SpecialTokens.Fragment y) {
+        return x.isToken() ? y.isToken() && x.token() == y.token() : !y.isToken() && x.text().equals(y.text());
+    }
+
+    /** The length of the common prefix of {@code x} from {@code xFrom} and {@code y} from {@code yFrom}. */
+    private static int commonPrefix(int[] x, int xFrom, int[] y, int yFrom) {
+        int n = Math.min(x.length - xFrom, y.length - yFrom);
+        int at = 0;
+        while (at < n && x[xFrom + at] == y[yFrom + at]) at++;
+        return at;
+    }
+
     public String decode(List<Integer> ids) {
         int[] arr = new int[ids.size()];
         for (int i = 0; i < arr.length; i++) arr[i] = ids.get(i);

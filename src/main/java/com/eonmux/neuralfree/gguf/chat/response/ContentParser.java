@@ -40,6 +40,7 @@ final class ContentParser {
     private static final String OPEN_SENTINEL = "\u0001";
     private static final String CLOSE_SENTINEL = "\u0002";
     private static final Pattern UNQUOTED_KEY = Pattern.compile("(?<=[{,])(\\w+):", Pattern.UNICODE_CHARACTER_CLASS);
+    private static final Pattern FLOAT_SYNTAX = Pattern.compile("[+\\-._eE]");
     private static final Pattern INTEGER = Pattern.compile("[+-]?\\d+(_\\d+)*");
     private static final Pattern FLOAT = Pattern.compile(
             "[+-]?((\\d+(_\\d+)*)(\\.(\\d+(_\\d+)*)?)?|\\.\\d+(_\\d+)*)([eE][+-]?\\d+(_\\d+)*)?");
@@ -168,7 +169,7 @@ final class ContentParser {
             if (lower.endsWith("nan")) return Double.NaN;
             return lower.startsWith("-") ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
         }
-        if (!FLOAT.matcher(t).matches() || t.replaceAll("[+\\-._eE]", "").isEmpty()) {
+        if (!FLOAT.matcher(t).matches() || FLOAT_SYNTAX.matcher(t).replaceAll("").isEmpty()) {
             throw new IllegalArgumentException("could not convert string to float: '" + s + "'");
         }
         return Double.parseDouble(t.replace("_", ""));

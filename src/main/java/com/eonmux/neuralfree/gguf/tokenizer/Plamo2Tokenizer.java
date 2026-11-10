@@ -40,6 +40,18 @@ public final class Plamo2Tokenizer implements TokenizerAlgorithm {
     }
 
     @Override
+    public List<SpecialTokens.Fragment> fragments(String text, boolean parseSpecial) {
+        return special.partition(text, parseSpecial);
+    }
+
+    @Override
+    public int[] encodeFragments(List<SpecialTokens.Fragment> fragments, int from) {
+        IdBuffer out = new IdBuffer(16);
+        encodeFragments(fragments, from, out, this::tokenizeFragment);
+        return out.toArray();
+    }
+
+    @Override
     public String decode(int[] ids) {
         return TokenizerAlgorithm.detokenize(this, vocab, special, ids);
     }
@@ -70,12 +82,19 @@ public final class Plamo2Tokenizer implements TokenizerAlgorithm {
                         boolean parseSpecial, FragmentEncoder fragments) {
         IdBuffer out = new IdBuffer(Math.max(16, text.length() / 2));
         if (addSpecial && vocab.addBos()) out.add(special.requireBos());
-        for (SpecialTokens.Fragment f : special.partition(text, parseSpecial)) {
-            if (f.isToken()) out.add(f.token());
-            else fragments.encode(f.text(), out);
-        }
+        encodeFragments(special.partition(text, parseSpecial), 0, out, fragments);
         if (addSpecial && vocab.addEos()) out.add(special.requireEos());
         return out.toArray();
+    }
+
+    /** The fragment loop of {@link #encode}, from fragment {@code from}. */
+    static void encodeFragments(List<SpecialTokens.Fragment> fragments, int from, IdBuffer out,
+                                FragmentEncoder encoder) {
+        for (int i = from; i < fragments.size(); i++) {
+            SpecialTokens.Fragment f = fragments.get(i);
+            if (f.isToken()) out.add(f.token());
+            else encoder.encode(f.text(), out);
+        }
     }
 
     /**
