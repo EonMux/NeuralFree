@@ -69,6 +69,18 @@ A build fails here when a stale or hand-edited table is checked in; regenerate w
 
 Run one class with `./gradlew test --tests 'com.eonmux.neuralfree.tensor.ShapeTest'` (any fully qualified class name or pattern).
 
+### Microbenchmarks
+
+Host hot paths have [JMH](https://github.com/openjdk/jmh) microbenchmarks under `src/jmh/java`, each over a synthetic, fixed-seed fixture so nothing is downloaded: BPE encode of a 4 KB text over learned merges (`BpeEncodeBenchmark`), the JSON-object grammar mask over a 151,936-token vocabulary (`GrammarMaskBenchmark`), the sampler chains over a whole logits row (`SamplerChainBenchmark`) and over a device top-k cone (`SamplerConeBenchmark`), and the remote-compute dispatch frame (`RpcDispatchFramingBenchmark`). `GrammarMaskBenchmark` runs over a model's own vocabulary when its `vocabFile` parameter names a GGUF file. `./gradlew jmh` runs them; `-Pjmh.args` passes JMH's own options and a benchmark filter:
+
+```bash
+./gradlew jmh -Pjmh.args='-f 1 -wi 3 -i 5 GrammarMask'
+./gradlew jmh -Pjmh.args='-f 1 -wi 3 -i 5 -p vocabFile=/models/Qwen3-0.6B-Q8_0.gguf GrammarMask'
+./gradlew jmh -Pjmh.args='-p chain=default,greedy SamplerChain'
+```
+
+JMH is a benchmark-only dependency: neither it nor the benchmarks are in the jar or the distribution. Compare runs on a quiet machine, alternating the builds.
+
 ## Pull requests
 
 1. Fork the repository and create a branch from `main`.

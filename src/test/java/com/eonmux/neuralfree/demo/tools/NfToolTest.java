@@ -20,7 +20,7 @@ public class NfToolTest {
                 "results", "debug", "eval-callback", "bench", "embedding", "retrieval", "lookup-create", "lookup-merge",
                 "lookup-stats", "batched-bench", "pack-experts", "tokenize", "dump", "hash", "set-metadata",
                 "new-metadata", "convert-endian", "chat", "complete", "eval", "bench-serve",
-                "bench-throughput", "bench-latency", "bench-sweep", "bench-startup"}) {
+                "bench-throughput", "bench-latency", "bench-sweep", "bench-startup", "bench-compare"}) {
             assertTrue("the usage names the implemented command " + command, usage.contains(command));
         }
         assertTrue("the surface lists the pending commands too", usage.contains("quantize"));
@@ -31,7 +31,7 @@ public class NfToolTest {
             assertTrue(command + " is routed", NfTool.IMPLEMENTED.contains(command));
         }
         for (String command : new String[]{"bench-serve", "bench-throughput", "bench-latency",
-                "bench-sweep", "bench-startup"}) {
+                "bench-sweep", "bench-startup", "bench-compare"}) {
             assertTrue(command + " is routed", NfTool.IMPLEMENTED.contains(command));
         }
         assertTrue("eval is routed", NfTool.IMPLEMENTED.contains("eval"));

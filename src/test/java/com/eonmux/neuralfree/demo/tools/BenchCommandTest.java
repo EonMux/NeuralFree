@@ -1,5 +1,7 @@
 package com.eonmux.neuralfree.demo.tools;
 
+import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
+import com.eonmux.neuralfree.gguf.gpu.forward.DecodeStepBreakdown;
 import com.eonmux.neuralfree.gguf.testutil.SyntheticModels;
 import org.junit.Rule;
 import org.junit.Test;
@@ -337,7 +339,7 @@ public class BenchCommandTest {
         List<String> csv = Arrays.asList(outBytes.toString(StandardCharsets.UTF_8).split("\n"));
         assertEquals("header and two shapes", 3, csv.size());
         assertTrue("the prompt row carries the embedding flag and its shape: " + csv.get(1),
-                csv.get(1).contains("\"auto\",\"0.00\",\"none\",\"auto\",\"1\",\"8\",\"0\","));
+                csv.get(1).contains("\"auto\",\"0.00\",\"none\",\"auto\",\"1\",\"logits\",\"8\",\"0\","));
         assertTrue("the generation shape follows: " + csv.get(2), csv.get(2).contains("\"0\",\"4\","));
     }
 
@@ -353,6 +355,58 @@ public class BenchCommandTest {
             return;
         }
         throw new AssertionError("the embedding model ran a decode bench");
+    }
+
+    @Test
+    public void theMeasurementFlagsParse() throws Exception {
+        BenchGrid plain = BenchCommand.parse(new String[]{"-m", "x.gguf"});
+        assertEquals(KernelTiming.Mode.OFF, plain.kernels);
+        assertTrue(!plain.hostBreakdown);
+        assertEquals(BenchReadout.Kind.LOGITS, plain.readout.kind());
+        assertEquals(KernelTiming.Mode.DISPATCH, BenchCommand.parse(new String[]{"-m", "x.gguf", "--kernels"}).kernels);
+        assertEquals(KernelTiming.Mode.STEP,
+                BenchCommand.parse(new String[]{"-m", "x.gguf", "--kernels=step"}).kernels);
+        assertTrue(BenchCommand.parse(new String[]{"-m", "x.gguf", "--host-breakdown"}).hostBreakdown);
+        assertEquals(BenchReadout.Kind.ARGMAX,
+                BenchCommand.parse(new String[]{"-m", "x.gguf", "--tg-readout", "argmax"}).readout.kind());
+        BenchReadout topK = BenchCommand.parse(new String[]{"-m", "x.gguf", "--tg-readout", "TopK=40"}).readout;
+        assertEquals(BenchReadout.Kind.TOPK, topK.kind());
+        assertEquals(40, topK.topK());
+        assertEquals("topk=40", topK.toString());
+        for (String bad : new String[]{"topk=0", "topk=1025", "topk=x", "probs"}) {
+            BenchCommand.UsageException e = assertThrows(BenchCommand.UsageException.class,
+                    () -> BenchCommand.parse(new String[]{"-m", "x.gguf", "--tg-readout", bad}));
+            assertTrue(e.getMessage(), e.getMessage().contains("--tg-readout"));
+        }
+        assertThrows(BenchCommand.UsageException.class,
+                () -> BenchCommand.parse(new String[]{"-m", "x.gguf", "--kernels=all"}));
+    }
+
+    @Test
+    public void everyReadoutRunsTheGenerationAndTheBreakdownNotesACpuEngine() throws Exception {
+        Path model = SyntheticModels.llama().writeTempFile();
+        for (String readout : new String[]{"logits", "argmax", "topk=8"}) {
+            ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
+            ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
+            BenchCommand.bench(args(model, "-ngl", "0", "-p", "0", "-n", "4", "-r", "1", "-o", "md",
+                    "--host-breakdown", "--kernels=step", "--tg-readout", readout), print(outBytes), print(errBytes));
+            List<String> lines = Arrays.asList(outBytes.toString(StandardCharsets.UTF_8).split("\n"));
+            assertEquals(readout + ": one generation row", 3, lines.size());
+            assertTrue(lines.get(2), lines.get(2).contains(" tg4 "));
+            assertEquals(readout + ": the table names a readout other than llama-bench's", !readout.equals("logits"),
+                    lines.get(0).contains(" readout ") && lines.get(2).contains(" " + readout + " "));
+            ByteArrayOutputStream jsonl = new ByteArrayOutputStream();
+            BenchCommand.bench(args(model, "-ngl", "0", "-p", "0", "-n", "4", "-r", "1", "-o", "jsonl",
+                    "--tg-readout", readout), print(jsonl), print(new ByteArrayOutputStream()));
+            assertTrue("the row records its readout: " + jsonl,
+                    jsonl.toString(StandardCharsets.UTF_8).contains("\"tg_readout\": \"" + readout + "\""));
+            String err = errBytes.toString(StandardCharsets.UTF_8);
+            assertTrue(err, err.contains("decode host breakdown (" + readout + " readout)"));
+            assertTrue(err, err.contains("(no one-token decode step ran on the GPU engine"));
+            assertTrue(err, err.contains("(the backend timed no dispatch; --kernels needs the GPU engine)"));
+            assertNull("the run restores the breakdown property", System.getProperty(DecodeStepBreakdown.PROPERTY));
+            assertNull("the run restores the profile property", System.getProperty(KernelTiming.PROFILE_PROPERTY));
+        }
     }
 
     private static String[] args(Path model, String... flags) {

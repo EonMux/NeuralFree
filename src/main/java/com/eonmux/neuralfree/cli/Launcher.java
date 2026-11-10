@@ -91,6 +91,8 @@ public final class Launcher {
                     new ArrayList<>(), false),
             new Command("bench-startup", "Measure the server's cold and warm startup time",
                     new ArrayList<>(), false),
+            new Command("bench-compare", "Compare two sets of benchmark results and flag regressions",
+                    new ArrayList<>(), false),
             new Command("eval", "Evaluate task accuracy against a running server (gsm8k, AIME)",
                     new ArrayList<>(), false),
             new Command("download", "Download a model from the Hugging Face Hub", Arrays.asList("get"), false),

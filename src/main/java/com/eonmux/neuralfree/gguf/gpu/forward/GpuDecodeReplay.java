@@ -11,7 +11,6 @@ import com.eonmux.neuralfree.acceleration.backend.KernelArgs;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
 
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -83,13 +82,11 @@ final class GpuDecodeReplay implements AutoCloseable {
     private static final int MAX_FAILED_REPLAYS = 2;
     /** Captures that failed after which the attempts stop until {@link #invalidate()}. */
     private static final int MAX_ABORTED_CAPTURES = 3;
-    /** Prints every trusted step's patch and prepare host time ({@code neuralfree.probe.replayHostCost}). */
-    private static final boolean HOST_COST_PROBE =
-            "1".equals(System.getProperty("neuralfree.probe.replayHostCost"));
-
     private static final Logger LOGGER = LoggingUtil.getLogger(GpuDecodeReplay.class);
 
     private final ComputeQueue queue;
+    /** Takes each step's trunk path and a trusted replay's patch and prepare laps. */
+    private final DecodeStepBreakdown breakdown;
     private final String queueType;
     private final boolean configured;
     private final boolean patchedConfigured;
@@ -112,7 +109,13 @@ final class GpuDecodeReplay implements AutoCloseable {
     private int preparedSteps;
 
     GpuDecodeReplay(ComputeQueue queue) {
+        this(queue, DecodeStepBreakdown.DISABLED);
+    }
+
+    /** A replay over {@code queue} that reports each step's trunk path and replay laps to {@code breakdown}. */
+    GpuDecodeReplay(ComputeQueue queue, DecodeStepBreakdown breakdown) {
         this.queue = queue;
+        this.breakdown = breakdown;
         this.queueType = queue.getQueueType().name().toLowerCase(Locale.ROOT) + " queue";
         this.configured = configured();
         this.patchedConfigured = !"false".equalsIgnoreCase(System.getProperty(PATCHED_PROPERTY));
@@ -263,7 +266,7 @@ final class GpuDecodeReplay implements AutoCloseable {
             return;
         }
         boolean replayed;
-        long patchStart = HOST_COST_PROBE ? System.nanoTime() : 0;
+        breakdown.lap(DecodeStepBreakdown.Phase.TRUNK);
         try {
             replayed = graph.replayPatched(plan, pos);
         } catch (GpuGraphMismatchException e) {
@@ -273,13 +276,10 @@ final class GpuDecodeReplay implements AutoCloseable {
         if (replayed) {
             failedReplays = 0;
             patchedReplays++;
-            if (HOST_COST_PROBE) {
-                long prepared = System.nanoTime();
-                prepareFollowup(pos);
-                hostCost(pos, (prepared - patchStart) / 1e6, (System.nanoTime() - prepared) / 1e6);
-                return;
-            }
+            breakdown.lap(DecodeStepBreakdown.Phase.REPLAY_SUBMIT);
+            breakdown.trunkPath(DecodeStepBreakdown.TrunkPath.REPLAYED);
             prepareFollowup(pos);
+            breakdown.lap(DecodeStepBreakdown.Phase.REPLAY_PREPARE);
             return;
         }
         /* A declined pattern or a backend refusal: the capture no longer fits the step. */
@@ -309,17 +309,6 @@ final class GpuDecodeReplay implements AutoCloseable {
         }
     }
 
-    /** Appends one trusted step's host-time split to {@code build/replay-host-cost.txt}. */
-    private static void hostCost(int pos, double patchMs, double prepareMs) {
-        try (java.io.PrintWriter out = new java.io.PrintWriter(new java.io.FileWriter(
-                Path.of("build", "replay-host-cost.txt").toFile(), true))) {
-            out.println(String.format(Locale.ROOT,
-                    "replay-host-cost pos %d patch+launch %.3f ms prepare %.3f ms", pos, patchMs, prepareMs));
-        } catch (Exception e) {
-            LOGGER.debug("Decode replay host-cost probe write failed: {}", e.getMessage());
-        }
-    }
-
     /** Runs a body step as the capture's check: the plan must cover exactly what the body changed. */
     private void verifyStep(int pos, List<GpuStepPatcher> patchers, Runnable body) {
         List<GpuGraphDispatch> before = LOGGER.isDebugEnabled() ? graph.kernelDispatches() : null;
@@ -336,6 +325,7 @@ final class GpuDecodeReplay implements AutoCloseable {
             return;
         }
         bodyReplays++;
+        breakdown.trunkPath(DecodeStepBreakdown.TrunkPath.VERIFIED);
         verifiedSteps++;
         int[] changed = graph.takeReplayChanges();
         if (changed == null || !cover(changed)) {
@@ -430,6 +420,7 @@ final class GpuDecodeReplay implements AutoCloseable {
             graph.replay(body);
             failedReplays = 0;
             bodyReplays++;
+            breakdown.trunkPath(DecodeStepBreakdown.TrunkPath.BODY_REPLAYED);
         } catch (GpuGraphMismatchException e) {
             LOGGER.debug("Decode replay re-captures after: {}", e.getMessage());
             closeGraph();
@@ -499,12 +490,18 @@ final class GpuDecodeReplay implements AutoCloseable {
                         queueType);
             }
         }
+        GpuEvent launched;
         try {
-            graph.launch(queue);
+            launched = graph.launch(queue);
         } catch (RuntimeException e) {
             closeGraph();
             throw e;
         }
+        // the queue's order completes the launch before anything the step enqueues next
+        if (launched != null) {
+            launched.close();
+        }
+        breakdown.trunkPath(DecodeStepBreakdown.TrunkPath.CAPTURED);
     }
 
     /**

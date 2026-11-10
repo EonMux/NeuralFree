@@ -20,7 +20,8 @@ public class BenchTestTest {
 
     @Test
     public void theStatisticsFollowTheReferenceFormulas() {
-        BenchTest t = new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104, new long[]{1000, 3000});
+        BenchTest t = new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104, BenchReadout.LOGITS,
+                new long[]{1000, 3000});
         assertEquals(2000, t.avgNs());
         // sqrt((1e6 + 9e6)/1 - 2000^2 * 2/1) = sqrt(2e6).
         assertEquals(1414, t.stdevNs());
@@ -34,7 +35,8 @@ public class BenchTestTest {
 
     @Test
     public void oneSampleHasNoDeviation() {
-        BenchTest t = new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104, new long[]{500});
+        BenchTest t = new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104, BenchReadout.LOGITS,
+                new long[]{500});
         assertEquals(500, t.avgNs());
         assertEquals(0, t.stdevNs());
         assertEquals(1.92e8, t.avgTs(), 1e-6);
@@ -65,14 +67,15 @@ public class BenchTestTest {
         assertEquals("tensor_buft_overrides", fields[18]);
         assertEquals("load_mode", fields[19]);
         assertEquals("embeddings", fields[20]);
-        assertEquals("n_prompt", fields[21]);
-        assertEquals("n_gen", fields[22]);
-        assertEquals("n_depth", fields[23]);
-        assertEquals("test_time", fields[24]);
-        assertEquals("avg_ns", fields[25]);
-        assertEquals("stddev_ns", fields[26]);
-        assertEquals("avg_ts", fields[27]);
-        assertEquals("stddev_ts", fields[28]);
+        assertEquals("tg_readout", fields[21]);
+        assertEquals("n_prompt", fields[22]);
+        assertEquals("n_gen", fields[23]);
+        assertEquals("n_depth", fields[24]);
+        assertEquals("test_time", fields[25]);
+        assertEquals("avg_ns", fields[26]);
+        assertEquals("stddev_ns", fields[27]);
+        assertEquals("avg_ts", fields[28]);
+        assertEquals("stddev_ts", fields[29]);
         assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("model_type"));
         assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("type_k"));
         assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("split_mode"));
@@ -80,6 +83,7 @@ public class BenchTestTest {
         assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("tensor_split"));
         assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("tensor_buft_overrides"));
         assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("load_mode"));
+        assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("tg_readout"));
         assertEquals(BenchTest.FieldType.STRING, BenchTest.fieldType("test_time"));
         assertEquals(BenchTest.FieldType.BOOL, BenchTest.fieldType("no_kv_offload"));
         assertEquals(BenchTest.FieldType.BOOL, BenchTest.fieldType("embeddings"));
@@ -94,7 +98,7 @@ public class BenchTestTest {
 
     @Test
     public void theValueRowCarriesTheRunAndItsStatistics() {
-        BenchTest t = new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104,
+        BenchTest t = new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104, BenchReadout.LOGITS,
                 new long[]{1_000_000_000L, 3_000_000_000L});
         String[] v = t.values();
         assertEquals(BenchTest.fields().length, v.length);
@@ -119,15 +123,16 @@ public class BenchTestTest {
         assertEquals("none", v[18]);
         assertEquals("auto", v[19]);
         assertEquals("0", v[20]);
-        assertEquals("64", v[21]);
-        assertEquals("32", v[22]);
-        assertEquals("8", v[23]);
-        assertTrue("the test time is RFC 3339 UTC: " + v[24], v[24].matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z"));
+        assertEquals("logits", v[21]);
+        assertEquals("64", v[22]);
+        assertEquals("32", v[23]);
+        assertEquals("8", v[24]);
+        assertTrue("the test time is RFC 3339 UTC: " + v[25], v[25].matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z"));
         // samples 1e9 and 3e9: mean 2e9, stdev sqrt(2e18) rounded; the throughputs 96 and 32 average to 64.
-        assertEquals("2000000000", v[25]);
-        assertEquals("1414213562", v[26]);
-        assertEquals("64.000000", v[27]);
-        assertTrue("avg and stddev t/s share the flat double format: " + v[28], v[28].matches("\\d+\\.\\d{6}"));
+        assertEquals("2000000000", v[26]);
+        assertEquals("1414213562", v[27]);
+        assertEquals("64.000000", v[28]);
+        assertTrue("avg and stddev t/s share the flat double format: " + v[29], v[29].matches("\\d+\\.\\d{6}"));
         assertEquals(v.length, t.map().size());
         assertEquals("64", t.map().get("n_prompt"));
     }
@@ -139,13 +144,35 @@ public class BenchTestTest {
                 new double[]{3.0, 1.0});
         assertEquals("layer", inst.splitMode.llamaName());
         assertEquals("3.00/1.00", inst.tensorSplitString());
-        BenchTest t = new BenchTest(inst, "llama tiny", 1024, 128, "CPU", 64, new long[]{1000});
+        BenchTest t = new BenchTest(inst, "llama tiny", 1024, 128, "CPU", 64, BenchReadout.LOGITS,
+                new long[]{1000});
         assertEquals("layer", t.values()[13]);
         assertEquals("1", t.values()[14]);
         assertEquals("1", t.values()[15]);
         assertEquals("auto", t.values()[16]);
         assertEquals("3.00/1.00", t.values()[17]);
         assertEquals("3.00/1.00", t.map().get("tensor_split"));
+    }
+
+    @Test
+    public void theRowRecordsTheReadoutItsGeneratedTokensUsed() throws Exception {
+        BenchReadout argmax = BenchReadout.parse("argmax", "--tg-readout");
+        BenchReadout topK = BenchReadout.parse("topk=40", "--tg-readout");
+        assertEquals("argmax", new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104, argmax,
+                new long[]{1000}).map().get("tg_readout"));
+        assertEquals("topk=40", new BenchTest(inst(), "llama tiny", 1024, 128, "CPU", 104, topK,
+                new long[]{1000}).map().get("tg_readout"));
+        BenchInstance promptOnly = new BenchInstance("m.gguf", 64, 0, 0, 2048, 128, KvDType.F16, KvDType.F16, 0);
+        assertEquals("a test without generated tokens reads the prompt pass's logits", "logits",
+                new BenchTest(promptOnly, "llama tiny", 1024, 128, "CPU", 104, argmax, new long[]{1000}).map()
+                        .get("tg_readout"));
+        BenchInstance embedding = new BenchInstance("m.gguf", 64, 32, 0, 2048, 128, KvDType.F16, KvDType.F16, 0,
+                false, com.eonmux.neuralfree.gguf.engine.EngineConfig.SplitMode.NONE, 0, new double[0],
+                BenchGrid.defaultThreads(), com.eonmux.neuralfree.gguf.engine.EngineConfig.N_CPU_LAYERS_UNSET, "",
+                BenchTensorOverrides.NONE, BenchLoadMode.AUTO, true);
+        assertEquals("the embedding mode's decodes read the logits row", "logits",
+                new BenchTest(embedding, "llama tiny", 1024, 128, "CPU", 104, topK, new long[]{1000}).map()
+                        .get("tg_readout"));
     }
 
     @Test

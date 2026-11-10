@@ -26,7 +26,8 @@ public class BenchPrintersTest {
 
     private static BenchTest test() {
         BenchInstance inst = new BenchInstance("m.gguf", 64, 0, 8, 1024, 128, KvDType.Q8_0, KvDType.F16, 0);
-        return new BenchTest(inst, "llama tiny", 1024, 128, "CPU", 72, new long[]{1_000_000L, 3_000_000L});
+        return new BenchTest(inst, "llama tiny", 1024, 128, "CPU", 72, BenchReadout.LOGITS,
+                new long[]{1_000_000L, 3_000_000L});
     }
 
     @Test
@@ -40,12 +41,12 @@ public class BenchPrintersTest {
         assertEquals("model_filename,model_type,model_size,model_n_params,backends,"
                 + "n_batch,n_ubatch,n_threads,n_ctx,type_k,type_v,n_gpu_layers,n_cpu_moe,"
                 + "split_mode,main_gpu,no_kv_offload,devices,tensor_split,tensor_buft_overrides,"
-                + "load_mode,embeddings,n_prompt,n_gen,n_depth,test_time,"
+                + "load_mode,embeddings,tg_readout,n_prompt,n_gen,n_depth,test_time,"
                 + "avg_ns,stddev_ns,avg_ts,stddev_ts", lines.get(0));
         String row = lines.get(1);
         assertTrue("the filename leads the row: " + row, row.startsWith("\"m.gguf\",\"llama tiny\",\"1024\",\"128\","
                 + "\"CPU\",\"1024\",\"128\",\"" + test().inst.nThreads + "\",\"72\",\"q8_0\",\"f16\",\"0\",\"0\","
-                + "\"none\",\"0\",\"0\",\"auto\",\"0.00\",\"none\",\"auto\",\"0\",\"64\",\"0\",\"8\","));
+                + "\"none\",\"0\",\"0\",\"auto\",\"0.00\",\"none\",\"auto\",\"0\",\"logits\",\"64\",\"0\",\"8\","));
         assertTrue("the row carries the mean and the spread: " + row,
                 row.contains("\",\"2000000\",\"1414214\",\"42666.666667\","));
         assertEquals(2, lines.size());
@@ -72,7 +73,8 @@ public class BenchPrintersTest {
         assertTrue(lines.get(2).startsWith("    \"model_filename\": \"m.gguf\","));
         assertTrue("strings stay quoted: " + lines.get(11), lines.get(11).startsWith("    \"type_k\": \"q8_0\","));
         assertTrue("booleans stay bare: " + lines.get(17), lines.get(17).startsWith("    \"no_kv_offload\": 0,"));
-        assertTrue("ints stay bare: " + lines.get(23), lines.get(23).startsWith("    \"n_prompt\": 64,"));
+        assertTrue("strings stay quoted: " + lines.get(23), lines.get(23).startsWith("    \"tg_readout\": \"logits\","));
+        assertTrue("ints stay bare: " + lines.get(24), lines.get(24).startsWith("    \"n_prompt\": 64,"));
         assertTrue(lines.get(lines.size() - 4).startsWith("    \"samples_ns\": [ 1000000, 3000000 ],"));
         assertTrue(lines.get(lines.size() - 3).startsWith("    \"samples_ts\": [ "));
         assertEquals("  }", lines.get(lines.size() - 2));
@@ -137,7 +139,8 @@ public class BenchPrintersTest {
                 com.eonmux.neuralfree.gguf.engine.EngineConfig.SplitMode.LAYER;
         BenchInstance inst = new BenchInstance("m.gguf", 64, 0, 0, 1024, 128, KvDType.F16, KvDType.F16, 0,
                 true, layer, 1, new double[]{3.0, 1.0});
-        p.printTest(new BenchTest(inst, "llama tiny", 1024, 128, "CPU", 64, new long[]{1_000_000L}));
+        p.printTest(new BenchTest(inst, "llama tiny", 1024, 128, "CPU", 64, BenchReadout.LOGITS,
+                new long[]{1_000_000L}));
         List<String> lines = lines(out);
         String header = lines.get(0);
         assertTrue("the main GPU gains a column: " + header, header.contains(" main_gpu |"));
@@ -178,18 +181,19 @@ public class BenchPrintersTest {
         assertEquals("  devices TEXT,", lines.get(17));
         assertEquals("  tensor_buft_overrides TEXT,", lines.get(19));
         assertEquals("  embeddings INTEGER,", lines.get(21));
-        assertEquals("  avg_ns INTEGER,", lines.get(26));
-        assertEquals("  avg_ts REAL,", lines.get(28));
-        assertEquals("  stddev_ts REAL", lines.get(29));
-        assertEquals(");", lines.get(30));
-        assertTrue("the insert lists every field: " + lines.get(32),
-                lines.get(32).startsWith("INSERT INTO llama_bench (model_filename, model_type, model_size,"
+        assertEquals("  tg_readout TEXT,", lines.get(22));
+        assertEquals("  avg_ns INTEGER,", lines.get(27));
+        assertEquals("  avg_ts REAL,", lines.get(29));
+        assertEquals("  stddev_ts REAL", lines.get(30));
+        assertEquals(");", lines.get(31));
+        assertTrue("the insert lists every field: " + lines.get(33),
+                lines.get(33).startsWith("INSERT INTO llama_bench (model_filename, model_type, model_size,"
                         + " model_n_params, backends, n_batch, n_ubatch, n_threads, n_ctx, type_k, type_v,"
                         + " n_gpu_layers, n_cpu_moe, split_mode, main_gpu, no_kv_offload, devices, tensor_split,"
-                        + " tensor_buft_overrides, load_mode, embeddings,"
+                        + " tensor_buft_overrides, load_mode, embeddings, tg_readout,"
                         + " n_prompt, n_gen, n_depth, test_time, avg_ns, stddev_ns, avg_ts, stddev_ts) VALUES ("));
-        assertTrue("every value is single-quoted: " + lines.get(32),
-                lines.get(32).contains("'m.gguf', 'llama tiny', '1024',"));
+        assertTrue("every value is single-quoted: " + lines.get(33),
+                lines.get(33).contains("'m.gguf', 'llama tiny', '1024',"));
     }
 
     @Test

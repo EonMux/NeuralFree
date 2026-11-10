@@ -13,6 +13,7 @@ import com.eonmux.neuralfree.gguf.engine.EngineModel;
 import com.eonmux.neuralfree.gguf.engine.ForwardBackend;
 import com.eonmux.neuralfree.gguf.engine.ForwardBatch;
 import com.eonmux.neuralfree.gguf.engine.LLMModelFactory;
+import com.eonmux.neuralfree.gguf.gpu.forward.DecodeStepBreakdown;
 import com.eonmux.neuralfree.gguf.gpu.forward.GpuForwardBackend;
 import com.eonmux.neuralfree.gguf.hub.HubClient;
 import com.eonmux.neuralfree.gguf.hub.HubRef;
@@ -70,8 +71,14 @@ final class BenchCommand {
             + "  -oe, --output-err <md|none|csv|json|jsonl|sql>  output format on stderr, default none\n"
             + "  --progress                                print progress indicators to stderr\n"
             + "  --no-warmup                               skip the warmup pass of each test\n"
-            + "  --kernels                                 time the GPU dispatches of every test (disables the\n"
-            + "                                            decode-step replay) and print per-kernel device time\n"
+            + "  --kernels[=step]                          time the GPU commands of every test and print the device\n"
+            + "                                            time per kernel: --kernels times each dispatch with the\n"
+            + "                                            decode-step replay off, --kernels=step keeps the replay\n"
+            + "                                            and times each graph launch (Vulkan: each submission)\n"
+            + "  --host-breakdown                          print where the host time of each test's decode steps\n"
+            + "                                            goes, with device busy and idle time under --kernels\n"
+            + "  --tg-readout <logits|argmax|topk=k>       what each generated token reads back: the logits row\n"
+            + "                                            (default), the device's greedy id or its top k\n"
             + "  --help, -h                                this text\n"
             + "test parameters (lists accept 'a,b,c' and ranges 'first-last+step' or 'first-last*mult'):\n"
             + "  -m, --model <path>                  model to bench, repeatable\n"
@@ -170,16 +177,22 @@ final class BenchCommand {
         int idx = 0;
         String priorProfile = null;
         String priorReplay = null;
-        if (grid.kernels) {
+        String priorBreakdown = null;
+        if (grid.kernels == KernelTiming.Mode.DISPATCH) {
             priorProfile = System.setProperty(KernelTiming.PROFILE_PROPERTY, "true");
             priorReplay = System.setProperty(GpuForwardBackend.DECODE_REPLAY_PROPERTY, "false");
+        } else if (grid.kernels == KernelTiming.Mode.STEP) {
+            priorProfile = System.setProperty(KernelTiming.PROFILE_PROPERTY, "step");
+        }
+        if (grid.hostBreakdown) {
+            priorBreakdown = System.setProperty(DecodeStepBreakdown.PROPERTY, "true");
         }
         try {
             for (List<BenchInstance> group : grid.groups(instances).values()) {
                 String priorReadMode = applyLoadMode(group);
                 try {
                     try (EngineModel model = open(grid, group)) {
-                        Forwarder f = new Forwarder(model, group.get(0), group);
+                        Forwarder f = new Forwarder(model, group.get(0), group, grid.readout);
                         for (BenchInstance inst : group) {
                             idx++;
                             runOne(grid, f, inst, idx, count, p, pErr, err);
@@ -190,9 +203,14 @@ final class BenchCommand {
                 }
             }
         } finally {
-            if (grid.kernels) {
-                restoreProperty(KernelTiming.PROFILE_PROPERTY, priorProfile);
+            if (grid.kernels == KernelTiming.Mode.DISPATCH) {
                 restoreProperty(GpuForwardBackend.DECODE_REPLAY_PROPERTY, priorReplay);
+            }
+            if (grid.kernels != KernelTiming.Mode.OFF) {
+                restoreProperty(KernelTiming.PROFILE_PROPERTY, priorProfile);
+            }
+            if (grid.hostBreakdown) {
+                restoreProperty(DecodeStepBreakdown.PROPERTY, priorBreakdown);
             }
         }
         if (p != null) {
@@ -379,7 +397,16 @@ final class BenchCommand {
                     grid.noWarmup = true;
                     break;
                 case "--kernels":
-                    grid.kernels = true;
+                    grid.kernels = KernelTiming.Mode.DISPATCH;
+                    break;
+                case "--kernels=step":
+                    grid.kernels = KernelTiming.Mode.STEP;
+                    break;
+                case "--host-breakdown":
+                    grid.hostBreakdown = true;
+                    break;
+                case "--tg-readout":
+                    grid.readout = BenchReadout.parse(value(a, args, i++), a);
                     break;
                 case "--delay":
                     grid.delay = nonNegativeInt(value(a, args, i++), a);
@@ -639,11 +666,15 @@ final class BenchCommand {
                 throw new IOException("the bench pause was interrupted", e);
             }
         }
-        if (grid.kernels) {
+        if (grid.kernels != KernelTiming.Mode.OFF) {
             KernelTiming timing = gpuTiming(f.model.forwardBackend());
             if (timing != null) {
                 timing.reset();
             }
+        }
+        DecodeStepBreakdown breakdown = grid.hostBreakdown ? stepBreakdown(f.model.forwardBackend()) : null;
+        if (breakdown != null) {
+            breakdown.reset();
         }
         if (!grid.noWarmup) {
             if (inst.nPrompt > 0) {
@@ -668,16 +699,47 @@ final class BenchCommand {
                     idx, count, rep, grid.reps) : null);
         }
         BenchTest test = new BenchTest(inst, f.modelType, f.modelSize, f.modelNParams, f.backends, f.nCtx,
-                samples);
+                grid.readout, samples);
         if (p != null) {
             p.printTest(test);
         }
         if (pErr != null) {
             pErr.printTest(test);
         }
-        if (grid.kernels) {
+        if (grid.kernels != KernelTiming.Mode.OFF) {
             printKernelTiming(f, err);
         }
+        if (grid.hostBreakdown) {
+            printStepBreakdown(breakdown, grid.readout, err);
+        }
+    }
+
+    /**
+     * The host-time breakdown of this test's one-token decode calls, on stderr, cumulative over the warmup and the
+     * repetitions; a CPU engine or a test without generation prints a note instead.
+     */
+    static void printStepBreakdown(DecodeStepBreakdown breakdown, BenchReadout readout, Appendable err)
+            throws IOException {
+        err.append("nftool bench: decode host breakdown (").append(readout.toString())
+                .append(" readout), cumulative over the warmup and repetitions\n");
+        DecodeStepBreakdown.Report report = breakdown != null ? breakdown.report() : null;
+        if (report == null || report.steps() == 0) {
+            err.append("  (no one-token decode step ran on the GPU engine; --host-breakdown needs a generation"
+                    + " test)\n");
+            return;
+        }
+        for (String line : report.format()) {
+            err.append("  ").append(line).append('\n');
+        }
+    }
+
+    /** The GPU engine's decode-step breakdown, or null for a CPU engine or one that records none. */
+    static DecodeStepBreakdown stepBreakdown(ForwardBackend backend) {
+        if (backend instanceof GpuForwardBackend) {
+            DecodeStepBreakdown b = ((GpuForwardBackend) backend).stepBreakdown();
+            return b.enabled() ? b : null;
+        }
+        return null;
     }
 
     /**
@@ -735,10 +797,6 @@ final class BenchCommand {
         void line() throws IOException;
     }
 
-    /**
-     * One open model and the group of runs on it: the model facts every {@link BenchTest} of the group
-     * carries and the forward calls of a run.
-     */
     /** The decodes the generation warmup of a test generating {@code nGen} tokens runs. */
     static int warmupDecodes(int nGen) {
         return Math.min(nGen, WARMUP_DECODES);
@@ -754,6 +812,10 @@ final class BenchCommand {
         }
     }
 
+    /**
+     * One open model and the group of runs on it: the model facts every {@link BenchTest} of the group
+     * carries and the forward calls of a run.
+     */
     private static final class Forwarder {
 
         /** The seed of every token generator, so a sweep is reproducible. */
@@ -768,10 +830,14 @@ final class BenchCommand {
         private final int nCtx;
         /** Whether this group's runs time the model's embedding output instead of the logits pass. */
         private final boolean embeddingMode;
+        /** What each generated token reads back ({@code --tg-readout}). */
+        private final BenchReadout readout;
 
         /** Reads the model facts once, refusing models without a decoder token loop a run needs. */
-        Forwarder(EngineModel model, BenchInstance first, List<BenchInstance> group) throws IOException {
+        Forwarder(EngineModel model, BenchInstance first, List<BenchInstance> group, BenchReadout readout)
+                throws IOException {
             this.model = model;
+            this.readout = readout;
             this.tok = model.tokenizer();
             this.embeddingMode = first.embeddings;
             boolean hasMemory = model.forwardBackend().memory() != null;
@@ -830,7 +896,7 @@ final class BenchCommand {
             Random random = new Random(TOKEN_SEED + 2L);
             int first = nextToken(random);
             BenchCommand.decodeWarmup(n, first, random, model.vocabSize(), embeddingMode ? this::forwardToken
-                    : (token, pos) -> model.forwardBackend().decode(token, pos));
+                    : (token, pos) -> readout.decode(model.forwardBackend(), token, pos));
         }
 
         /**
@@ -871,9 +937,9 @@ final class BenchCommand {
                             forwardToken(random.nextInt(model.vocabSize()), pos + i);
                         }
                     } else {
-                        model.forwardBackend().decode(nextToken(random), pos);
+                        readout.decode(model.forwardBackend(), nextToken(random), pos);
                         for (int i = 1; i < inst.nGen; i++) {
-                            model.forwardBackend().decode(random.nextInt(model.vocabSize()), pos + i);
+                            readout.decode(model.forwardBackend(), random.nextInt(model.vocabSize()), pos + i);
                         }
                     }
                 }

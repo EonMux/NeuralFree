@@ -5,6 +5,7 @@ import com.eonmux.neuralfree.acceleration.backend.ComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.ComputeBackend.BackendType;
 import com.eonmux.neuralfree.acceleration.backend.DeviceClass;
 import com.eonmux.neuralfree.acceleration.backend.DeviceIdentity;
+import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.acceleration.backend.hip.HipComputeBackend;
 import com.eonmux.neuralfree.acceleration.backend.hip.HipDeviceRanking;
 import com.eonmux.neuralfree.acceleration.backend.cuda.CudaComputeBackend;
@@ -751,13 +752,17 @@ public class HWAcceleration {
      * @param requirement condition the backend must meet; {@link BackendRequirement#ANY} accepts all
      * @return an accepted backend; {@link #shutdown()} closes it
      * @throws NoBackendAvailableException when no backend is available or accepted
-     * @throws IllegalArgumentException    when {@code requirement} is null or
-     *                                     {@code -Dneuralfree.backend.order} is malformed
+     * @throws IllegalArgumentException    when {@code requirement} is null, {@code -Dneuralfree.backend.order} is
+     *                                     malformed or {@code -Dneuralfree.gpu.profile} is not one of
+     *                                     {@code true}, {@code false} and {@code step}
      */
     public ComputeBackend createBackend(ACCELERATION_MODE mode, BackendRequirement requirement) {
         if (requirement == null) {
             throw new IllegalArgumentException("Backend requirement cannot be null; use BackendRequirement.ANY");
         }
+        // every GPU backend reads the timing mode while it is created; a malformed value would fail each one alike,
+        // and AUTO would skip them all as unusable devices instead of naming the property
+        KernelTiming.Mode.configured();
         if (mode == null) {
             mode = ACCELERATION_MODE.AUTO;
         }

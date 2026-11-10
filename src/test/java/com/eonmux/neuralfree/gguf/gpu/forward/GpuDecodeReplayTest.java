@@ -88,6 +88,7 @@ public class GpuDecodeReplayTest {
         System.clearProperty(GpuDecodeReplay.PROPERTY);
         System.clearProperty(GpuDecodeReplay.WARMUP_PROPERTY);
         System.clearProperty(GpuForwardBackend.CHAIN_REPLAY_PROPERTY);
+        System.clearProperty(DecodeStepBreakdown.PROPERTY);
         for (int i = closeables.size() - 1; i >= 0; i--) {
             closeables.get(i).close();
         }
@@ -281,6 +282,43 @@ public class GpuDecodeReplayTest {
         // the capturing step submits its capture once; the trunk reaches the device every step
         assertEquals(1, launchOps());
         assertEquals(2, replayOps());
+    }
+
+    @Test
+    public void theCaptureLaunchClosesTheEventItReturns() {
+        GpuForwardBackend fb = open(true);
+        fb.decode(1, 0);
+        assertEquals("the capturing step launches its capture", 1, launchOps());
+        assertEquals("the launch event the replay received is closed", 0, backend.openEventCount());
+        fb.decode(2, 1);
+        fb.decode(3, 2);
+        assertEquals(1, launchOps());
+        assertEquals("the replayed steps leave no event open", 0, backend.openEventCount());
+    }
+
+    @Test
+    public void theBreakdownCountsEachDecodeUnderItsTrunkPath() {
+        System.setProperty(DecodeStepBreakdown.PROPERTY, "true");
+        GpuForwardBackend fb = open(true);
+        DecodeStepBreakdown breakdown = fb.stepBreakdown();
+        assertTrue(breakdown.enabled());
+        fb.decode(1, 0);
+        fb.decode(2, 1);
+        fb.decode(3, 2);
+        fb.prefill(new int[]{4, 5}, 3);
+        fb.decode(6, 5);
+        DecodeStepBreakdown.Report r = breakdown.report();
+        assertEquals("the prefill is not a decode step", 4, r.steps());
+        assertEquals("only the first decode captures: the prefill keeps the capture", 1,
+                r.steps(DecodeStepBreakdown.TrunkPath.CAPTURED));
+        assertEquals("the later decodes, the one after the prefill included, run the kept capture", 3,
+                r.steps(DecodeStepBreakdown.TrunkPath.BODY_REPLAYED) + r.steps(DecodeStepBreakdown.TrunkPath.VERIFIED)
+                        + r.steps(DecodeStepBreakdown.TrunkPath.REPLAYED));
+        long gaps = 0;
+        for (DecodeStepBreakdown.TrunkPath t : DecodeStepBreakdown.TrunkPath.values()) {
+            gaps += r.contiguousSteps(t);
+        }
+        assertEquals("only the decodes that continue the previous one carry a gap", 2, gaps);
     }
 
     @Test

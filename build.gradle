@@ -251,6 +251,35 @@ if (vectorUsable) {
     }
 }
 
+// Host hot-path microbenchmarks (JMH 1.37, src/jmh/java): compiled against the main classes and run by
+// `./gradlew jmh -Pjmh.args='<JMH options>'` (e.g. `-Pjmh.args='-f 1 -wi 3 -i 5 Bpe'`); JMH's forks inherit the
+// launcher's JVM flags. Neither the benchmarks nor JMH are packaged: the jar holds the main and vector outputs only.
+sourceSets {
+    jmh {
+        java.srcDirs = ['src/jmh/java']
+        resources.srcDirs = []
+    }
+}
+sourceSets.jmh.compileClasspath += sourceSets.main.output.classesDirs + configurations.compileClasspath
+sourceSets.jmh.runtimeClasspath += sourceSets.main.runtimeClasspath
+if (vectorUsable) {
+    sourceSets.jmh.runtimeClasspath += sourceSets.vector.output
+}
+dependencies {
+    jmhImplementation 'org.openjdk.jmh:jmh-core:1.37'
+    jmhAnnotationProcessor 'org.openjdk.jmh:jmh-generator-annprocess:1.37'
+}
+tasks.register('jmh', JavaExec) {
+    group = 'verification'
+    description = 'Runs the JMH microbenchmarks of src/jmh/java; -Pjmh.args passes JMH options and filters.'
+    classpath = sourceSets.jmh.runtimeClasspath
+    mainClass = 'org.openjdk.jmh.Main'
+    def jmhArgs = project.findProperty('jmh.args')
+    if (jmhArgs != null) {
+        args jmhArgs.toString().trim().split(/\s+/).findAll { !it.isEmpty() }
+    }
+}
+
 // The server module's tests reuse the core test fixtures (SyntheticModels and friends) without publishing them.
 configurations {
     testOutput

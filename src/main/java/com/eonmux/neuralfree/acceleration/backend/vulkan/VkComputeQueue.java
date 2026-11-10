@@ -13,22 +13,15 @@ import com.eonmux.neuralfree.acceleration.backend.KernelHandle;
 import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.utils.LoggingUtil;
 import org.apache.logging.log4j.Logger;
-import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;
-import org.lwjgl.vulkan.VkSubmitInfo;
-import org.lwjgl.vulkan.VkTimelineSemaphoreSubmitInfo;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.IntBuffer;
-import java.nio.LongBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.lwjgl.vulkan.VK10.VK_NULL_HANDLE;
-import static org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 import static org.lwjgl.vulkan.VK10.VK_QUEUE_COMPUTE_BIT;
 import static org.lwjgl.vulkan.VK10.vkDestroyCommandPool;
 import static org.lwjgl.vulkan.VK10.vkDestroySemaphore;
@@ -115,7 +108,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     private final VkDescriptorStrategy strategy;
     private final long[] maxGroups;
     private final VkSubmitPolicy submitPolicy;
-    /** Dispatch timing under {@code -Dneuralfree.gpu.profile=true}, or null. */
+    /** Command timing under {@code -Dneuralfree.gpu.profile} ({@link KernelTiming.Mode}), or null. */
     private final VkDispatchTimer timer;
     private final long commandPool;
     private final long timeline;
@@ -171,8 +164,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         this.strategy = backend.descriptorStrategy();
         this.maxGroups = backend.info().maxComputeWorkGroupCount();
         this.submitPolicy = new VkSubmitPolicy(backend.dispatchesPerSubmit());
-        this.timer = dispatchCapable
-                ? VkDispatchTimer.create(device, backend.info(), context.family(), submitPolicy.cap()) : null;
+        KernelTiming.Mode profile = dispatchCapable ? KernelTiming.Mode.configured() : KernelTiming.Mode.OFF;
         this.commandPool = VkQueueResources.createCommandPool(device, context.family());
         long semaphore;
         try {
@@ -182,6 +174,8 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             throw e;
         }
         this.timeline = semaphore;
+        this.timer = VkDispatchTimer.create(device, backend.info(), context.family(), submitPolicy.cap(), profile,
+                commandPool);
         this.graphResources = new VkGraphResources(device, commandPool, strategy, dispatchCapable, semaphore,
                 () -> completedValue);
     }
@@ -650,10 +644,10 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             rec = graph.recordChanges(graphResources);
         }
         if (rec == null) {
-            submitCapturedBatchLocked(graph.batch());
+            submitCapturedBatchLocked(graph);
             return;
         }
-        long signal = submitReplayLocked(null, new VkCommandBuffer[]{rec.commandBuffer()});
+        long signal = submitReplayLocked(null, new VkCommandBuffer[]{rec.commandBuffer()}, graph.dispatchCount());
         rec.submitted(signal);
     }
 
@@ -676,7 +670,7 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         synchronized (this) {
             requireIdleFor(graph);
             applyWaitsTo(graph.batch(), waitOnEvents);
-            long signal = submitCapturedBatchLocked(graph.batch());
+            long signal = submitCapturedBatchLocked(graph);
             return new VkGpuEvent(this, signal);
         }
     }
@@ -710,20 +704,34 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
      *
      * @return the timeline value the submission signals
      */
-    private long submitCapturedBatchLocked(VkCommandBatch batch) {
-        return submitReplayLocked(batch, new VkCommandBuffer[]{batch.commandBuffer()});
+    private long submitCapturedBatchLocked(VkGraph graph) {
+        VkCommandBatch batch = graph.batch();
+        return submitReplayLocked(batch, new VkCommandBuffer[]{batch.commandBuffer()}, graph.dispatchCount());
     }
 
     /**
      * Submits replayed command buffers in order after the queue's recorded batch, on the timeline, with the waits
      * {@code waits} carries (null for none); a later batch waits on the replay signal, so the queue's order is kept.
+     * Under command timing the submission is bracketed by a stamp of its own, reported as a graph of
+     * {@code dispatches} dispatches once it retires.
      *
      * @return the timeline value the submission signals
      */
-    private long submitReplayLocked(VkCommandBatch waits, VkCommandBuffer[] buffers) {
+    private long submitReplayLocked(VkCommandBatch waits, VkCommandBuffer[] buffers, int dispatches) {
         submitLocked();
         long signal = submittedValue + 1;
-        submitBatchLocked(waits, buffers, signal, submittedValue);
+        VkDispatchTimer.GraphStamp stamp = timer != null ? timer.graphStamp(dispatches) : null;
+        try {
+            submitBatchLocked(waits, stamp != null ? stamp.around(buffers) : buffers, signal, submittedValue);
+        } catch (RuntimeException e) {
+            if (stamp != null) {
+                timer.graphUnsubmitted(stamp);
+            }
+            throw e;
+        }
+        if (stamp != null) {
+            timer.graphSubmitted(stamp, signal);
+        }
         replaySignals.addLast(signal);
         pendingReplaySignal = signal;
         submittedValue = signal;
@@ -832,12 +840,18 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     /**
-     * The dispatch timing of this queue ({@link VkDispatchTimer}), or null when
-     * {@code -Dneuralfree.gpu.profile=true} is unset or the queue family writes no timestamps.
+     * The command timing of this queue ({@link VkDispatchTimer}), or null when {@code -Dneuralfree.gpu.profile}
+     * is unset or the queue family writes no timestamps.
      */
     @Override
     public KernelTiming kernelTiming() {
         return timer != null ? timer.timing() : null;
+    }
+
+    /** A timing queue brackets every graph submission with a stamp of its own ({@link VkDispatchTimer}). */
+    @Override
+    public boolean timesGraphLaunches() {
+        return timer != null;
     }
 
     /**
@@ -1174,6 +1188,9 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
             b = newBatch();
         }
         b.begin();
+        if (timer != null) {
+            timer.beginBatch(b);
+        }
         tracker.reset();
         uploadBytesInBatch = 0;
         readbackBytesInBatch = 0;
@@ -1213,6 +1230,9 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         // the batch orders after a pending replay, which runs outside the queue's batch sequence
         long selfWait = pendingReplaySignal;
         try {
+            if (timer != null) {
+                timer.endBatch(b);
+            }
             b.end();
             submitBatchLocked(b, new VkCommandBuffer[]{b.commandBuffer()}, signal, selfWait);
         } catch (RuntimeException e) {
@@ -1226,61 +1246,11 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
     }
 
     /**
-     * Submits ended command buffers in order, signalling {@code signal}: the cross-queue waits recorded in
-     * {@code b} (none when null), and {@code selfWaitValue} on this queue's own timeline when it is still pending
-     * (0 for none), so the buffers execute after that timeline point's work.
+     * Submits ended command buffers in order, signalling {@code signal}, with the waits of {@code b} (none when
+     * null) and {@code selfWaitValue} on this queue's own timeline ({@link VkTimelineSubmit#submit}).
      */
     private void submitBatchLocked(VkCommandBatch b, VkCommandBuffer[] buffers, long signal, long selfWaitValue) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkComputeQueue[] producers = b != null ? b.waitProducers() : new VkComputeQueue[0];
-            long[] values = b != null ? b.waitValues() : new long[0];
-            LongBuffer waitSemaphores = stack.mallocLong(producers.length + 1);
-            LongBuffer waitValues = stack.mallocLong(producers.length + 1);
-            int waitCount = 0;
-            for (int i = 0; i < producers.length; i++) {
-                if (values[i] <= producers[i].completedValue) {
-                    continue;
-                }
-                if (producers[i].closed) {
-                    throw new IllegalStateException("wait on timeline value " + values[i] + " of " + producers[i]
-                            + ", which closed without reaching it");
-                }
-                waitSemaphores.put(waitCount, producers[i].timeline);
-                waitValues.put(waitCount, values[i]);
-                waitCount++;
-            }
-            if (selfWaitValue > completedValue) {
-                waitSemaphores.put(waitCount, timeline);
-                waitValues.put(waitCount, selfWaitValue);
-                waitCount++;
-            }
-            IntBuffer waitStages = null;
-            if (waitCount > 0) {
-                waitSemaphores.limit(waitCount);
-                waitValues.limit(waitCount);
-                waitStages = stack.mallocInt(waitCount);
-                for (int i = 0; i < waitCount; i++) {
-                    waitStages.put(i, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-                }
-            } else {
-                waitSemaphores = null;
-                waitValues = null;
-            }
-            VkTimelineSemaphoreSubmitInfo timelineInfo = VkTimelineSemaphoreSubmitInfo.calloc(stack)
-                    .sType$Default()
-                    .waitSemaphoreValueCount(waitCount)
-                    .pWaitSemaphoreValues(waitValues)
-                    .pSignalSemaphoreValues(stack.longs(signal));
-            VkSubmitInfo info = VkSubmitInfo.calloc(stack)
-                    .sType$Default()
-                    .pNext(timelineInfo.address())
-                    .waitSemaphoreCount(waitCount)
-                    .pWaitSemaphores(waitSemaphores)
-                    .pWaitDstStageMask(waitStages)
-                    .pCommandBuffers(stack.pointers(buffers))
-                    .pSignalSemaphores(stack.longs(timeline));
-            context.submit(info, VK_NULL_HANDLE);
-        }
+        VkTimelineSubmit.submit(context, timeline, completedValue, b, buffers, signal, selfWaitValue);
     }
 
     /** Returns a batch whose submission failed to the free list; its readbacks never complete. */
@@ -1339,6 +1309,9 @@ public final class VkComputeQueue implements ComputeQueue, VkStagingRing.Timelin
         }
         while (!replaySignals.isEmpty() && replaySignals.peekFirst() <= value) {
             replaySignals.pollFirst();
+        }
+        if (timer != null) {
+            timer.graphsRetired(value);
         }
         // a later batch must wait on the last submitted replay still outstanding, not only on the earliest
         pendingReplaySignal = replaySignals.isEmpty() ? 0 : replaySignals.peekLast();

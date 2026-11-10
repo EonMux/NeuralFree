@@ -171,7 +171,10 @@ final class OutputRouter {
         if (!beginSample(slot, decoded)) {
             return;
         }
-        offerSampled(slot, slot.run.next(logits));
+        long t0 = System.nanoTime();
+        int token = slot.run.next(logits);
+        state.stats.hostSampleNanos += System.nanoTime() - t0;
+        offerSampled(slot, token);
     }
 
     /** The same offer over row {@code row} of a device top-k readback, the batched backend-sampled path. */
@@ -179,7 +182,9 @@ final class OutputRouter {
         if (!beginSample(slot, decoded)) {
             return;
         }
+        long t0 = System.nanoTime();
         int token = slot.run.sampleTopK(top, row, prefiltered);
+        state.stats.hostSampleNanos += System.nanoTime() - t0;
         slot.run.accept(token);
         state.stats.deviceSampledRows++;
         offerSampled(slot, token);

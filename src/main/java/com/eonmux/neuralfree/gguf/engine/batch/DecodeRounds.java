@@ -467,6 +467,14 @@ final class DecodeRounds {
         }
     }
 
+    /** One verify row through the slot's chain, its time counted as host sampling. */
+    private int sample(Slot slot, float[] row) {
+        long t0 = System.nanoTime();
+        int token = slot.run.next(row);
+        state.stats.hostSampleNanos += System.nanoTime() - t0;
+        return token;
+    }
+
     /**
      * {@code MATCH}: the slot's verify rows sampled in order through its own chain — row {@code i} answers the
      * token after {@code [pendingToken, drafts 0..i-1]}, so the walk continues while the chain's sample equals
@@ -481,7 +489,7 @@ final class DecodeRounds {
             if (i > 0 && state.cancelRequested(slot)) {
                 return new Verified(accepted, -1, StopReason.CANCELLED);
             }
-            token = slot.run.next(rows[base + i]);
+            token = sample(slot, rows[base + i]);
             state.stats.generatedTokens++;
             SequenceRun.Step step = slot.run.offer(token);
             if (step.stopped()) {
@@ -513,7 +521,7 @@ final class DecodeRounds {
             if (accepted > 0 && state.cancelRequested(slot)) {
                 return new Verified(accepted, -1, StopReason.CANCELLED, path);
             }
-            token = slot.run.next(rows[row]);
+            token = sample(slot, rows[row]);
             state.stats.generatedTokens++;
             SequenceRun.Step step = slot.run.offer(token);
             if (step.stopped()) {

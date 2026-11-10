@@ -30,6 +30,7 @@ public final class BatchSequence {
     public static final long NEVER_ADMITTED = Long.MIN_VALUE;
 
     private final int submitId;
+    private final long submittedAtNanos = System.nanoTime();
     private volatile State state = State.QUEUED;
     private volatile long admittedAtNanos = NEVER_ADMITTED;
     private volatile int seq = -1;
@@ -112,6 +113,11 @@ public final class BatchSequence {
         return submitId;
     }
 
+    /** The {@link System#nanoTime()} instant the request was submitted to the engine. */
+    public long submittedAtNanos() {
+        return submittedAtNanos;
+    }
+
     /**
      * The {@link System#nanoTime()} instant the engine first moved the request out of the queue into a slot, or
      * {@link #NEVER_ADMITTED} while it never had a slot (still queued, refused or failed). A preemption or a
@@ -164,7 +170,15 @@ public final class BatchSequence {
 
     void admit(int seq) {
         if (admittedAtNanos == NEVER_ADMITTED) {
-            admittedAtNanos = System.nanoTime();
+            long now = System.nanoTime();
+            admittedAtNanos = now;
+            EngineAdmitEvent event = new EngineAdmitEvent();
+            if (event.isEnabled()) {
+                event.submitId = submitId;
+                event.seq = seq;
+                event.queueNanos = now - submittedAtNanos;
+                event.commit();
+            }
         }
         this.seq = seq;
         this.state = State.RUNNING;

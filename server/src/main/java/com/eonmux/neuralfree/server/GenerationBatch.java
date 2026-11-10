@@ -98,12 +98,15 @@ final class GenerationBatch {
     private volatile Runnable onAllDone;
     private final ServerOptions options;
     private final long deadline;
+    /** The batch's arrival, the origin of its choices' time to first token and end-to-end latency. */
+    private final long arrivalNanos;
     /** The batch's request trace, null with tracing off; set once in {@link #start} before the submissions. */
     private RequestTracing.Trace trace;
 
     private GenerationBatch(ServerOptions options, int choices) {
         this.options = options;
-        this.deadline = System.nanoTime() + options.requestTimeout().toNanos();
+        this.arrivalNanos = System.nanoTime();
+        this.deadline = arrivalNanos + options.requestTimeout().toNanos();
         this.pending = new AtomicInteger(choices);
     }
 
@@ -193,6 +196,7 @@ final class GenerationBatch {
             trace.registered(choice, job.prompt() != null ? job.prompt().length : job.media().nTokens());
         }
         GenerationRequest request = job.request().toBuilder().cancellation(cancelled::get).build();
+        RequestLatencies.Choice latency = service.latencies().choice(arrivalNanos);
         ReasoningFilter.Sink sink = new ReasoningFilter.Sink() {
             /** Tokens generated so far and the latest one; the engine thread alone calls the sink. */
             private int predicted;
@@ -202,6 +206,7 @@ final class GenerationBatch {
             public void stepped(int tokenId) {
                 predicted++;
                 last = tokenId;
+                latency.token(System.nanoTime());
                 if (trace != null) {
                     trace.stepped(choice);
                 }
@@ -229,6 +234,7 @@ final class GenerationBatch {
             }
         };
         Runnable onDone = () -> {
+            latency.done(System.nanoTime());
             if (trace != null) {
                 trace.done(choice);
             }
@@ -249,6 +255,7 @@ final class GenerationBatch {
                 : service.submit(job.prompt(), request, sink, job.renderedPrompt(), job.constraint(),
                         job.reasoning(), onDone);
         submissions.add(submission);
+        latency.submitted(submission::sequence);
     }
 
     /**

@@ -178,6 +178,8 @@ public final class EngineService implements AutoCloseable {
     final Object poolLock = new Object();
     /** Listeners that follow the pool's shape, run whenever {@link #installPool} replaces it. */
     private final List<Runnable> poolListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** The per-request latencies the generation batches report and the metrics' timers receive. */
+    private final RequestLatencies latencies = new RequestLatencies();
     /** The media inputs: the projector of {@code neuralfree.server.mmproj}, or disabled without one. */
     private final ChatMedia media;
     /** The server-executed tools of the launch (built-ins and MCP servers), empty when none are enabled. */
@@ -426,6 +428,11 @@ public final class EngineService implements AutoCloseable {
         for (Runnable listener : poolListeners) {
             listener.run();
         }
+    }
+
+    /** The per-request latency observations of this service's generation requests. */
+    RequestLatencies latencies() {
+        return latencies;
     }
 
     /**

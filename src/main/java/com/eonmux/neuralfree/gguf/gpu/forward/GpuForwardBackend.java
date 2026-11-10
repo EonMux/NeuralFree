@@ -30,6 +30,8 @@ import com.eonmux.neuralfree.gguf.spec.LayerSpec;
 import com.eonmux.neuralfree.gguf.spec.ModelSpec;
 import com.eonmux.neuralfree.gguf.spec.RecurrentSpec;
 import com.eonmux.neuralfree.utils.Closeables;
+import com.eonmux.neuralfree.utils.LoggingUtil;
+import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -63,6 +65,8 @@ public final class GpuForwardBackend implements ForwardBackend {
 
     /** The system property {@code false} sets keeps decode steps out of a captured graph. */
     public static final String DECODE_REPLAY_PROPERTY = "neuralfree.gpu.decodeReplay";
+
+    private static final Logger LOGGER = LoggingUtil.getLogger(GpuForwardBackend.class);
     /**
      * The system property {@code true} extends the trunk replay into a speculative round's steps: a
      * rollback keeps the drafter's captured decode instead of dropping it, and the memory-backed
@@ -1054,6 +1058,32 @@ public final class GpuForwardBackend implements ForwardBackend {
     }
 
     /**
+     * The host-time breakdown of this backend's one-token decode calls, recording under
+     * {@code -Dneuralfree.gpu.stepBreakdown=true} ({@link DecodeStepBreakdown#DISABLED} otherwise); the close logs
+     * what it recorded.
+     */
+    public DecodeStepBreakdown stepBreakdown() {
+        return driver.stepBreakdown();
+    }
+
+    /** Logs the decode steps the breakdown recorded, so a tool run under the property reports at its end. */
+    private void logStepBreakdown() {
+        DecodeStepBreakdown breakdown = driver.stepBreakdown();
+        if (!breakdown.enabled()) {
+            return;
+        }
+        DecodeStepBreakdown.Report report = breakdown.report();
+        if (report.steps() == 0) {
+            return;
+        }
+        StringBuilder text = new StringBuilder("decode host breakdown of ").append(ctx.backend().backendType());
+        for (String line : report.format()) {
+            text.append(System.lineSeparator()).append("  ").append(line);
+        }
+        LOGGER.info(text);
+    }
+
+    /**
      * Installs the per-step mirror the tensor-parallel group uses to keep its per-rank caches in step with this
      * backend's main memory, or null to remove it.
      */
@@ -1100,6 +1130,7 @@ public final class GpuForwardBackend implements ForwardBackend {
             return;
         }
         closed = true;
+        logStepBreakdown();
         RuntimeException first = null;
         try {
             driver.closeReplay();

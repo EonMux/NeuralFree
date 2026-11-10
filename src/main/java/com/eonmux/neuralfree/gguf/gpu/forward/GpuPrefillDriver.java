@@ -118,6 +118,8 @@ public final class GpuPrefillDriver {
     private final ComputeQueue queue;
     private final GpuStepPositions positions;
     private final GpuDecodeReplay decodeReplay;
+    /** The host-time breakdown of the one-token decode calls ({@link DecodeStepBreakdown#PROPERTY}). */
+    private final DecodeStepBreakdown breakdown;
     /** The trunk replay of the memory-backed multi-row causal steps (a chain round's verify of k + 1 rows). */
     private final GpuDecodeReplay stepReplay;
     /** Whether the speculative round's steps capture their trunks ({@code neuralfree.gpu.chainReplay}). */
@@ -177,11 +179,17 @@ public final class GpuPrefillDriver {
         this.head = Objects.requireNonNull(head, "head");
         this.queue = ctx.queue();
         this.positions = new GpuStepPositions(ctx.scratch(), queue, ctx.spec().hparams().mropeTextPositions());
-        this.decodeReplay = new GpuDecodeReplay(queue);
+        this.breakdown = DecodeStepBreakdown.configured(queue.kernelTiming(), queue.timesGraphLaunches());
+        this.decodeReplay = new GpuDecodeReplay(queue, breakdown);
         this.stepReplay = new GpuDecodeReplay(queue);
         this.chainReplay = GpuForwardBackend.chainReplayConfigured(ctx.backend().backendType());
         this.ubatch = ctx.scratch().ubatch();
         this.embeddingRowToken = EmbeddingRowSupport.recordToken(ctx.spec());
+    }
+
+    /** The host-time breakdown of the one-token decode calls; {@link DecodeStepBreakdown#DISABLED} when off. */
+    public DecodeStepBreakdown stepBreakdown() {
+        return breakdown;
     }
 
     /** Installs the per-step mirror, or null to remove it. */
@@ -346,6 +354,11 @@ public final class GpuPrefillDriver {
                        int topK, boolean useMemory, HiddenTap tap, LogitPrefilter prefilter) {
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(tap, "tap");
+        if (breakdown.enabled() && useMemory && embd == null && tokens != null && tokens.length == 1) {
+            breakdown.begin(pos0);
+        } else {
+            breakdown.interrupt();
+        }
         if (prefilter != null && prefilter.rows() != 0 && topK < 1) {
             throw new IllegalArgumentException("a logit prefilter needs a top-k readback");
         }
@@ -394,9 +407,13 @@ public final class GpuPrefillDriver {
             }
             finished = true;
             queue.finish();
+            breakdown.lap(DecodeStepBreakdown.Phase.WAIT);
             taps.deliver();
-            return calls.result();
+            Result result = calls.result();
+            breakdown.lap(DecodeStepBreakdown.Phase.RESULT);
+            return result;
         } catch (RuntimeException e) {
+            breakdown.interrupt();
             if (!finished) {
                 try {
                     queue.finish();
@@ -408,6 +425,7 @@ public final class GpuPrefillDriver {
         } finally {
             calls.closeEvents();
             taps.closeEvents();
+            breakdown.end();
         }
     }
 
@@ -1116,6 +1134,7 @@ public final class GpuPrefillDriver {
         GpuLayerExecutor.StepMode mode = memory != null && n == 1
                 ? GpuLayerExecutor.StepMode.DECODE : GpuLayerExecutor.StepMode.PREFILL;
         boolean trunk = trunkRunner != null && mode == GpuLayerExecutor.StepMode.PREFILL;
+        breakdown.lap(DecodeStepBreakdown.Phase.CALL);
         if (memory != null && !trunk) {
             memory.stepInputs().upload(p, n);
             if (mirror != null) {
@@ -1124,12 +1143,14 @@ public final class GpuPrefillDriver {
         }
         executor.prefetchFirst();
         positions.write(p, n);
+        breakdown.lap(DecodeStepBreakdown.Phase.INPUTS);
         if (embd != null) {
             embedding.embedRows(embd, c0, n, p);
         } else {
             embedding.embed(tokens, c0, n, types, p);
         }
         taps.chunk(c0);
+        breakdown.lap(DecodeStepBreakdown.Phase.EMBED);
         if (pagedDecodeShape != null) {
             invalidateStepReplay();
         }
@@ -1150,6 +1171,7 @@ public final class GpuPrefillDriver {
                             && executor.capturableDecode(),
                     () -> executor.run(p, n, mode, taps));
         }
+        breakdown.lap(DecodeStepBreakdown.Phase.TRUNK);
         int k = 0;
         int[] local = new int[rows.length];
         int[] targets = new int[rows.length];
@@ -1167,6 +1189,7 @@ public final class GpuPrefillDriver {
             calls.read(output, hidden, count, Arrays.copyOfRange(targets, done, done + count));
             done += count;
         }
+        breakdown.lap(DecodeStepBreakdown.Phase.HEAD);
         if (observed) {
             obs.onStepEnd(p, n);
         }

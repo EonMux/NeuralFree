@@ -677,8 +677,8 @@ public final class FakeComputeBackend implements ComputeBackend {
                 backend.requireOwnQueue(queue);
                 backend.validateWaits(waitOnEvents);
                 backend.launchCapturedGraphLocked(this);
-                // the fake allocates no device event; the queue's own ordering completes the launch
-                return null;
+                // like the device backends, the launch hands the caller an event it must close
+                return backend.newEvent();
             }
         }
 

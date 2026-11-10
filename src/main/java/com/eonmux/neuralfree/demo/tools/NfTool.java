@@ -27,7 +27,8 @@ import com.eonmux.neuralfree.demo.tools.serve.ServeBenchCommand;
  *           convert-endian | embedding | retrieval |
  *           lookup-create | lookup-merge | lookup-stats | cvector |
  *           pack-experts | fit-params | chat | complete | eval |
- *           bench-serve | bench-throughput | bench-latency | bench-sweep | bench-startup | rpc-server
+ *           bench-serve | bench-throughput | bench-latency | bench-sweep | bench-startup | bench-compare |
+ *           rpc-server
  * </pre>
  *
  * <p>A command of the surface without an implementation ({@link #IMPLEMENTED} lists the ones that have
@@ -44,7 +45,8 @@ public final class NfTool {
             "dump", "hash", "set-metadata", "new-metadata", "convert-endian", "embedding", "retrieval",
             "lookup-create", "lookup-merge", "lookup-stats",
             "cvector", "pack-experts", "fit-params", "chat", "complete", "eval",
-            "bench-serve", "bench-throughput", "bench-latency", "bench-sweep", "bench-startup", "rpc-server");
+            "bench-serve", "bench-throughput", "bench-latency", "bench-sweep", "bench-startup", "bench-compare",
+            "rpc-server");
 
     /** The subcommands that run; the rest of {@link #COMMANDS} are refused by name. */
     public static final List<String> IMPLEMENTED = List.of("export", "download", "slice", "imatrix", "perplexity",
@@ -54,7 +56,8 @@ public final class NfTool {
             "embedding", "retrieval", "lookup-create", "lookup-merge", "lookup-stats",
             "batched-bench", "pack-experts", "tokenize", "dump", "hash", "set-metadata", "new-metadata",
             "convert-endian", "chat", "complete", "eval",
-            "bench-serve", "bench-throughput", "bench-latency", "bench-sweep", "bench-startup", "rpc-server");
+            "bench-serve", "bench-throughput", "bench-latency", "bench-sweep", "bench-startup", "bench-compare",
+            "rpc-server");
 
     private NfTool() {
     }
@@ -179,6 +182,9 @@ public final class NfTool {
                 return;
             case "bench-startup":
                 BenchStartupCommand.run(rest);
+                return;
+            case "bench-compare":
+                BenchCompareCommand.run(rest);
                 return;
             case "rpc-server":
                 RpcServerCommand.run(rest);

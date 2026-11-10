@@ -1,5 +1,6 @@
 package com.eonmux.neuralfree.demo.tools;
 
+import com.eonmux.neuralfree.acceleration.backend.KernelTiming;
 import com.eonmux.neuralfree.demo.EngineLoadFlags;
 import com.eonmux.neuralfree.gguf.cpu.ops.CpuParallel;
 import com.eonmux.neuralfree.gguf.engine.EngineConfig;
@@ -75,8 +76,15 @@ final class BenchGrid {
     int delay = DEFAULT_DELAY;
     boolean progress;
     boolean noWarmup;
-    /** True when {@code --kernels} times the GPU dispatches of every test and reports them. */
-    boolean kernels;
+    /**
+     * The device timing {@code --kernels} asks for: {@link KernelTiming.Mode#DISPATCH} times every dispatch with the
+     * decode-step replay off, {@link KernelTiming.Mode#STEP} keeps the replay and times each graph launch whole.
+     */
+    KernelTiming.Mode kernels = KernelTiming.Mode.OFF;
+    /** True when {@code --host-breakdown} reports where the host time of each test's decode steps goes. */
+    boolean hostBreakdown;
+    /** What each generated token reads back ({@code --tg-readout}). */
+    BenchReadout readout = BenchReadout.LOGITS;
     BenchOutput output = BenchOutput.MARKDOWN;
     BenchOutput outputErr = BenchOutput.NONE;
     /** The model paths of the {@code -hf} repositories, once resolved. */

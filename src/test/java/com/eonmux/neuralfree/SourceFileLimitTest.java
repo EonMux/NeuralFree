@@ -39,10 +39,14 @@ public class SourceFileLimitTest {
     /** Largest allowed file length in lines; a longer file must be split. */
     static final int MAX_LINES = 1500;
 
-    /** Java source roots of both modules; {@code src/vector/java} is the core module's SIMD source set. */
+    /**
+     * Java source roots of both modules; {@code src/vector/java} is the core module's SIMD source set and
+     * {@code src/jmh/java} its microbenchmarks.
+     */
     private static final List<String> JAVA_ROOTS = Collections.unmodifiableList(Arrays.asList(
             "src/main/java",
             "src/vector/java",
+            "src/jmh/java",
             "src/test/java",
             "server/src/main/java",
             "server/src/test/java"));

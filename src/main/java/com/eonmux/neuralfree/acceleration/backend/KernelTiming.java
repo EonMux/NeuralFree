@@ -3,22 +3,93 @@ package com.eonmux.neuralfree.acceleration.backend;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
 /**
- * Device-side time accumulated per kernel or transfer name while
- * {@code -Dneuralfree.gpu.profile=true} is set: a queue that measures its dispatches adds the
- * elapsed device nanoseconds of each completed command under its kernel name here.
+ * Device-side time accumulated per kernel or transfer name while {@code -Dneuralfree.gpu.profile}
+ * is {@code true} or {@code step} ({@link Mode}): a queue that measures its commands adds the
+ * elapsed device nanoseconds of each completed command under its name here.
  *
- * <p>The sums are diagnostic: a dispatch records device timestamps only outside a graph capture
- * or replay, and the wall time of a command includes nothing but its own execution on the stream.
- * A report groups by name, because a queue sees kernel names, not call sites.</p>
+ * <p>The sums are diagnostic. The dispatches inside a captured graph carry no timestamps of their
+ * own: the CUDA and Vulkan queues report a graph launch as one command under {@link #graphKey(int)},
+ * so a replayed decode step shows its trunk's device time as one entry next to the commands enqueued
+ * around it (an OpenCL command-buffer launch is not timed). The
+ * wall time of a command includes nothing but its own execution on the stream. A report groups by
+ * name, because a queue sees kernel names, not call sites.</p>
  */
 public final class KernelTiming {
 
-    /** The system property that turns per-command device timing on. */
+    /** The system property that selects the device timing {@link Mode}. */
     public static final String PROFILE_PROPERTY = "neuralfree.gpu.profile";
+
+    /**
+     * What a queue times under {@link #PROFILE_PROPERTY}. Both timing modes report a graph launch as one
+     * command; they differ on a backend whose per-dispatch timestamps serialize the device.
+     */
+    public enum Mode {
+        /** No device timing ({@code false} or unset). */
+        OFF,
+        /**
+         * Every command on its own ({@code true}): a Vulkan queue brackets each dispatch with a barrier
+         * and a timestamp pair, so its dispatches lose their overlap.
+         */
+        DISPATCH,
+        /**
+         * The run as it executes ({@code step}): a Vulkan queue times each submitted command batch as
+         * one entry ({@link #SUBMISSION_KEY}) without barriers of its own; the CUDA and OpenCL queues,
+         * whose per-command timing adds no synchronization, time every command as in {@link #DISPATCH}.
+         */
+        STEP;
+
+        /**
+         * The mode {@code -Dneuralfree.gpu.profile} selects: {@code false} or unset, {@code true},
+         * or {@code step}, in any case.
+         *
+         * @throws IllegalArgumentException for any other value
+         */
+        public static Mode configured() {
+            return parse(System.getProperty(PROFILE_PROPERTY));
+        }
+
+        /**
+         * The mode of a {@link #PROFILE_PROPERTY} value: null, empty and {@code false} mean
+         * {@link #OFF}, {@code true} {@link #DISPATCH}, {@code step} {@link #STEP}.
+         *
+         * @throws IllegalArgumentException for any other value
+         */
+        public static Mode parse(String value) {
+            if (value == null) {
+                return OFF;
+            }
+            switch (value.trim().toLowerCase(Locale.ROOT)) {
+                case "":
+                case "false":
+                    return OFF;
+                case "true":
+                    return DISPATCH;
+                case "step":
+                    return STEP;
+                default:
+                    throw new IllegalArgumentException("-D" + PROFILE_PROPERTY + " must be true, false or step,"
+                            + " got '" + value + "'");
+            }
+        }
+    }
+
+    /** The report name of the command batches a {@link Mode#STEP} Vulkan queue times whole. */
+    public static final String SUBMISSION_KEY = "submission";
+
+    /** The report name of one launch of a captured graph holding {@code dispatches} kernel dispatches. */
+    public static String graphKey(int dispatches) {
+        return "graph[" + dispatches + " dispatches]";
+    }
+
+    /** Whether {@code name} is a {@link #graphKey(int)} entry. */
+    public static boolean isGraphKey(String name) {
+        return name.startsWith("graph[") && name.endsWith(" dispatches]");
+    }
 
     private final Map<String, long[]> totals = new HashMap<>();
     private boolean any;
@@ -60,6 +131,17 @@ public final class KernelTiming {
         long sum = 0;
         for (long[] total : totals.values()) {
             sum += total[0];
+        }
+        return sum;
+    }
+
+    /** Device nanoseconds of the graph launches ({@link #graphKey(int)} entries) alone. */
+    public synchronized long graphNanos() {
+        long sum = 0;
+        for (Map.Entry<String, long[]> e : totals.entrySet()) {
+            if (isGraphKey(e.getKey())) {
+                sum += e.getValue()[1];
+            }
         }
         return sum;
     }

@@ -1207,13 +1207,48 @@ public final class BatchEngine implements AutoCloseable {
      * step keeps the older shape: the oldest waiting prefill runs alone, or one decode row per running sequence.
      * A pump over no submissions does nothing. Every routed piece reaches the submission's sink before the call
      * returns; finished sequences carry their result on their handle before it returns too. The rows the step
-     * committed then feed the prefix cache's block pool, and its events publish as one batch.
+     * committed then feed the prefix cache's block pool, and its events publish as one batch. While a Flight
+     * Recorder recording runs, a step that evaluated rows commits one {@code com.eonmux.neuralfree.EngineStep}
+     * event ({@link EngineStepEvent}).
      */
     public void pump() {
         checkOpen();
         if (state.cancelPending && idle()) {
             state.cancelPending = false; // the cancelled ones retired: later submissions run again
         }
+        EngineStepEvent event = new EngineStepEvent();
+        if (!event.isEnabled()) {
+            step();
+            return;
+        }
+        BatchStats.Builder s = state.stats;
+        long decodeRows = s.decodeRows;
+        long prefillRows = s.promptTokens + s.recomputedTokens;
+        long cached = s.promptTokensCached;
+        long generated = s.generatedTokens;
+        long deviceSampled = s.deviceSampledRows;
+        long hostSample = s.hostSampleNanos;
+        long preemptions = s.preemptions;
+        event.begin();
+        step();
+        event.end();
+        event.decodeRows = s.decodeRows - decodeRows;
+        event.prefillRows = s.promptTokens + s.recomputedTokens - prefillRows;
+        if (event.decodeRows + event.prefillRows > 0 && event.shouldCommit()) {
+            event.cachedPromptTokens = s.promptTokensCached - cached;
+            event.generatedTokens = s.generatedTokens - generated;
+            event.deviceSampledRows = s.deviceSampledRows - deviceSampled;
+            event.hostSampleNanos = s.hostSampleNanos - hostSample;
+            event.preemptions = s.preemptions - preemptions;
+            event.running = state.active.size();
+            event.queued = state.queue.size() + state.preempted.size();
+            event.usedCells = state.sequences.totalCells() - state.sequences.freeCells();
+            event.commit();
+        }
+    }
+
+    /** The work of one {@link #pump()}. */
+    private void step() {
         admitter.admit();
         selfExtend.apply();
         scheduler.step();

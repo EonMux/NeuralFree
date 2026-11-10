@@ -483,16 +483,19 @@ public final class CudaComputeBackend implements ComputeBackend {
     }
 
     /**
-     * The pool of timing-enabled events the queues record dispatch pairs into while
-     * {@code -Dneuralfree.gpu.profile=true} is set, else null.
+     * The pool of timing-enabled events the queues record command pairs into while
+     * {@code -Dneuralfree.gpu.profile} is {@code true} or {@code step}, else null.
      */
     public CudaEventPool timingEvents() {
         return timingEvents;
     }
 
-    /** True when {@code -Dneuralfree.gpu.profile=true} asks the queues to time their dispatches. */
+    /**
+     * True when {@code -Dneuralfree.gpu.profile} ({@link KernelTiming.Mode}) asks the queues to time their
+     * commands; both timing modes time every command and graph launch on a CUDA stream.
+     */
     public static boolean profiling() {
-        return Boolean.parseBoolean(System.getProperty(KernelTiming.PROFILE_PROPERTY, "false"));
+        return KernelTiming.Mode.configured() != KernelTiming.Mode.OFF;
     }
 
     /** Module cache holding every loaded module of this backend. */

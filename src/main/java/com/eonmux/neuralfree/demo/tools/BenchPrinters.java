@@ -264,6 +264,8 @@ final class BenchPrinters {
                     return "lm";
                 case "embeddings":
                     return "embd";
+                case "tg_readout":
+                    return "readout";
                 default:
                     return field;
             }
@@ -316,6 +318,9 @@ final class BenchPrinters {
             }
             if (variesEmbeddings()) {
                 cols.add("embeddings");
+            }
+            if (grid.readout.kind() != BenchReadout.Kind.LOGITS) {
+                cols.add("tg_readout");
             }
             cols.add("test");
             cols.add("t/s");

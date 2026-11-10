@@ -6,10 +6,13 @@ import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.binder.MeterBinder;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
 
@@ -31,6 +34,7 @@ import java.util.function.ToDoubleFunction;
  *   <tr><td>{@code neuralfree_prompt_seconds_total}</td><td>time spent prefilling</td></tr>
  *   <tr><td>{@code neuralfree_tokens_predicted_total}</td><td>tokens sampled</td></tr>
  *   <tr><td>{@code neuralfree_tokens_predicted_seconds_total}</td><td>time spent decoding</td></tr>
+ *   <tr><td>{@code neuralfree_host_sample_seconds_total}</td><td>time spent in the host sampler chains</td></tr>
  *   <tr><td>{@code neuralfree_decode_total}</td><td>batched decode forwards</td></tr>
  *   <tr><td>{@code neuralfree_recomputed_tokens_total}</td><td>tokens prefilled again after a preemption</td></tr>
  *   <tr><td>{@code neuralfree_preemptions_total}</td><td>running sequences preempted</td></tr>
@@ -72,6 +76,13 @@ import java.util.function.ToDoubleFunction;
  *       use</td></tr>
  *   <tr><td>{@code neuralfree_replica_prompt_tokens_in_flight{replica,dp_rank}}</td><td>the prompt tokens of one
  *       replica's requests not yet finished (what {@code minimum_tokens} balances)</td></tr>
+ *   <tr><td>{@code neuralfree_time_to_first_token_seconds}</td><td>histogram: arrival to first sampled token
+ *       (vLLM's {@code time_to_first_token_seconds} and its buckets)</td></tr>
+ *   <tr><td>{@code neuralfree_inter_token_latency_seconds}</td><td>histogram: time between consecutive sampled
+ *       tokens</td></tr>
+ *   <tr><td>{@code neuralfree_e2e_request_latency_seconds}</td><td>histogram: arrival to the request's end</td></tr>
+ *   <tr><td>{@code neuralfree_request_queue_time_seconds}</td><td>histogram: engine submit to first
+ *       admission</td></tr>
  *   <tr><td>{@code vllm:mm_cache_queries_total{model_name,engine}}</td><td>{@code neuralfree_mm_cache_queries_total}
  *       under vLLM's name and labels</td></tr>
  *   <tr><td>{@code vllm:mm_cache_hits_total{model_name,engine}}</td><td>{@code neuralfree_mm_cache_hits_total}
@@ -125,6 +136,8 @@ public class EngineMetrics implements MeterBinder {
         counter(registry, "tokens.predicted.device", "Tokens sampled over a device top-k readback",
                 BatchStats::deviceSampledRows);
         counter(registry, "tokens.predicted.seconds", "Time spent decoding", BatchStats::decodeSeconds);
+        counter(registry, "host.sample.seconds", "Time the engine spent in the host sampler chains",
+                BatchStats::hostSampleSeconds);
         counter(registry, "decode", "Batched decode forwards", s -> s.decodeSteps());
         counter(registry, "recomputed.tokens", "Tokens prefilled again after a preemption",
                 s -> s.recomputedTokens());
@@ -208,6 +221,77 @@ public class EngineMetrics implements MeterBinder {
         // a later elastic scale or rank removal replaces the pool, so the series follow its shape
         service.onPoolChange(() -> replicaSeries(registry, service));
         mediaCacheCounters(registry, service);
+        service.latencies().add(new LatencyTimers(registry));
+    }
+
+    /**
+     * vLLM's request-level latency histograms as Prometheus timers with vLLM's bucket bounds. Two instances over the
+     * same registry are equal, so binding a service to a registry twice feeds its series once, and a reopened
+     * service's listener feeds the same series.
+     */
+    static final class LatencyTimers implements RequestLatencies.Listener {
+        private static final double[] TTFT_BUCKETS = {0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5,
+            0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0, 160.0, 640.0, 2560.0};
+        private static final double[] ITL_BUCKETS = {0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75,
+            1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0};
+        private static final double[] REQUEST_BUCKETS = {0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0,
+            30.0, 40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0};
+
+        private final MeterRegistry registry;
+        private final Timer firstToken;
+        private final Timer interToken;
+        private final Timer endToEnd;
+        private final Timer queue;
+
+        LatencyTimers(MeterRegistry registry) {
+            this.registry = registry;
+            firstToken = timer(registry, "time.to.first.token",
+                    "Time from a request's arrival to its first sampled token", TTFT_BUCKETS);
+            interToken = timer(registry, "inter.token.latency",
+                    "Time between two consecutive sampled tokens of a request", ITL_BUCKETS);
+            endToEnd = timer(registry, "e2e.request.latency",
+                    "Time from a request's arrival to its end, for requests that sampled a token", REQUEST_BUCKETS);
+            queue = timer(registry, "request.queue.time",
+                    "Time a request waited in the engine queue before its first admission", REQUEST_BUCKETS);
+        }
+
+        private static Timer timer(MeterRegistry registry, String name, String help, double[] bucketsSeconds) {
+            Duration[] slos = new Duration[bucketsSeconds.length];
+            for (int i = 0; i < slos.length; i++) {
+                slos[i] = Duration.ofNanos(Math.round(bucketsSeconds[i] * 1e9));
+            }
+            return Timer.builder(PREFIX + name).description(help).serviceLevelObjectives(slos).register(registry);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof LatencyTimers && ((LatencyTimers) o).registry == registry;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(registry);
+        }
+
+        @Override
+        public void firstToken(long nanos) {
+            firstToken.record(nanos, TimeUnit.NANOSECONDS);
+        }
+
+        @Override
+        public void interToken(long nanos) {
+            interToken.record(nanos, TimeUnit.NANOSECONDS);
+        }
+
+        @Override
+        public void finished(long nanos) {
+            endToEnd.record(nanos, TimeUnit.NANOSECONDS);
+        }
+
+        @Override
+        public void queued(long nanos) {
+            queue.record(nanos, TimeUnit.NANOSECONDS);
+        }
     }
 
     /**

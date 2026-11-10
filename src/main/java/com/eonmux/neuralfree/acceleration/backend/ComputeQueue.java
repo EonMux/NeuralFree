@@ -309,13 +309,25 @@ public interface ComputeQueue extends AutoCloseable {
     }
 
     /**
-     * The per-command device timing this queue accumulates while
-     * {@code -Dneuralfree.gpu.profile=true} is set, or null when the queue does not measure its
-     * dispatches (the property is unset, the backend cannot time commands, or a graph capture or
-     * replay is recording). The report covers the commands completed by the last {@link #finish()}.
+     * The per-command device timing this queue accumulates while {@code -Dneuralfree.gpu.profile} is
+     * {@code true} or {@code step} ({@link KernelTiming.Mode}), or null when the queue does not measure
+     * its commands (the property is unset or the backend cannot time commands). The dispatches a graph
+     * capture records carry no timestamps; the CUDA and Vulkan queues time each launch of the graph as
+     * one command ({@link KernelTiming#graphKey(int)}), the OpenCL queue leaves its command-buffer
+     * launches untimed. The report covers the commands completed by the last {@link #finish()}.
      */
     default KernelTiming kernelTiming() {
         return null;
+    }
+
+    /**
+     * Whether {@link #kernelTiming()} reports every launch of a captured graph, as one
+     * {@link KernelTiming#graphKey(int)} command: true on a CUDA or Vulkan queue that times its
+     * commands, false when the queue times nothing or leaves its graph launches untimed (an OpenCL
+     * command buffer), so the device time of a step whose trunk ran as a graph is incomplete.
+     */
+    default boolean timesGraphLaunches() {
+        return false;
     }
 
     void flush();

@@ -22,6 +22,7 @@ public final class BatchStats {
     private final long promptNanos;
     private final long generatedTokens;
     private final long deviceSampledRows;
+    private final long hostSampleNanos;
     private final long decodeNanos;
     private final long decodeSteps;
     private final long decodeRows;
@@ -54,6 +55,7 @@ public final class BatchStats {
         this.promptNanos = b.promptNanos;
         this.generatedTokens = b.generatedTokens;
         this.deviceSampledRows = b.deviceSampledRows;
+        this.hostSampleNanos = b.hostSampleNanos;
         this.decodeNanos = b.decodeNanos;
         this.decodeSteps = b.decodeSteps;
         this.decodeRows = b.decodeRows;
@@ -98,6 +100,12 @@ public final class BatchStats {
      * the batched steps whose chain kept its candidates inside the cone, so only the candidates were read back.
      */
     public long deviceSampledRows() { return deviceSampledRows; }
+
+    /**
+     * Time the engine thread spent in the sequences' host sampler chains: over whole logits rows, over device top-k
+     * readbacks and over a speculative round's verify rows.
+     */
+    public double hostSampleSeconds() { return hostSampleNanos / 1e9; }
 
     /** Time spent in forward passes that carried decode rows (a mixed step counts in this and {@link #promptSeconds()}). */
     public double decodeSeconds() { return decodeNanos / 1e9; }
@@ -202,6 +210,7 @@ public final class BatchStats {
         b.promptNanos = promptNanos + other.promptNanos;
         b.generatedTokens = generatedTokens + other.generatedTokens;
         b.deviceSampledRows = deviceSampledRows + other.deviceSampledRows;
+        b.hostSampleNanos = hostSampleNanos + other.hostSampleNanos;
         b.decodeNanos = decodeNanos + other.decodeNanos;
         b.decodeSteps = decodeSteps + other.decodeSteps;
         b.decodeRows = decodeRows + other.decodeRows;
@@ -250,6 +259,7 @@ public final class BatchStats {
         long promptNanos;
         long generatedTokens;
         long deviceSampledRows;
+        long hostSampleNanos;
         long decodeNanos;
         long decodeSteps;
         long decodeRows;

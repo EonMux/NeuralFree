@@ -55,6 +55,7 @@ public class BatchStatsTest {
             assertEquals(1L, s.finished(StopReason.CANCELLED));
             assertEquals(0L, s.failed());
             assertEquals("a host backend reads every sampled row back", 0L, s.deviceSampledRows());
+            assertTrue("every sampled token ran the host chain", s.hostSampleSeconds() > 0);
             assertTrue(s.decodeSteps() > 0);
             assertTrue(s.rowsPerDecode() >= 1.0 && s.rowsPerDecode() <= 2.0);
             assertTrue(s.promptSeconds() > 0 && s.decodeSeconds() > 0);
@@ -73,6 +74,7 @@ public class BatchStatsTest {
         a.promptNanos = 1_000;
         a.generatedTokens = 3;
         a.deviceSampledRows = 5;
+        a.hostSampleNanos = 2_000;
         a.decodeSteps = 2;
         a.decodeRows = 3;
         a.finished[StopReason.MAX_TOKENS.ordinal()] = 1;
@@ -93,6 +95,7 @@ public class BatchStatsTest {
         b.promptNanos = 500;
         b.generatedTokens = 4;
         b.deviceSampledRows = 2;
+        b.hostSampleNanos = 1_000;
         b.decodeSteps = 2;
         b.decodeRows = 2;
         b.finished[StopReason.MAX_TOKENS.ordinal()] = 2;
@@ -109,6 +112,7 @@ public class BatchStatsTest {
         assertEquals(12L, sum.promptTokens());
         assertEquals(7L, sum.generatedTokens());
         assertEquals(7L, sum.deviceSampledRows());
+        assertEquals(3_000 / 1e9, sum.hostSampleSeconds(), 1e-15);
         assertEquals(4L, sum.decodeSteps());
         assertEquals(1.25, sum.rowsPerDecode(), 1e-9);
         assertEquals(1500.0 / 1e9, sum.promptSeconds(), 1e-12);

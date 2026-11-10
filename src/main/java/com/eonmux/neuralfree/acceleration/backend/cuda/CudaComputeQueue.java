@@ -690,6 +690,12 @@ public final class CudaComputeQueue implements ComputeQueue {
         return timing;
     }
 
+    /** A timing queue times every graph launch as one command ({@link KernelTiming#graphKey(int)}). */
+    @Override
+    public boolean timesGraphLaunches() {
+        return timing != null;
+    }
+
     /**
      * A backend-owned queue only finishes, and does nothing once its backend is closed; a
      * caller-owned queue is released ({@link #closeInternal()}).
@@ -865,7 +871,7 @@ public final class CudaComputeQueue implements ComputeQueue {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Dispatch timing (only with -Dneuralfree.gpu.profile=true)
+    // Command timing (only with -Dneuralfree.gpu.profile=true or step)
     // ------------------------------------------------------------------------------------------
 
     /**
@@ -1173,9 +1179,20 @@ public final class CudaComputeQueue implements ComputeQueue {
         }
     }
 
-    /** One launch of an executable graph on the queue's stream. */
-    void graphLaunch(CUgraphExec exec) {
-        CudaErrors.check("cuGraphLaunch", () -> cuGraphLaunch(exec, stream));
+    /**
+     * One launch of an executable graph holding {@code dispatches} kernel dispatches on the queue's stream,
+     * timed as one command under {@link KernelTiming#graphKey(int)} while profiling is on.
+     */
+    void graphLaunch(CUgraphExec exec, int dispatches) {
+        String key = timing != null ? KernelTiming.graphKey(dispatches) : null;
+        CUevent timedStart = beginTiming(key);
+        try {
+            CudaErrors.check("cuGraphLaunch", () -> cuGraphLaunch(exec, stream));
+        } catch (RuntimeException e) {
+            cancelTiming(timedStart);
+            throw e;
+        }
+        endTiming(timedStart, key);
     }
 
     /** Drains the stream, then destroys the executable graph. The queue must be open. */

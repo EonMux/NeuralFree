@@ -41,7 +41,7 @@ import static org.jocl.CL.*;
  * <p><b>Queues.</b> {@link #computeQueue()} and {@link #transferQueue()} are owned by the backend:
  * closing them only finishes them, and {@link #close()} releases them, together with the caller-owned
  * queues of {@link #createComputeQueue()} and the buffers still open. Queues are created with
- * {@code CL_QUEUE_PROFILING_ENABLE} only when {@code -Dneuralfree.gpu.profile=true}.</p>
+ * {@code CL_QUEUE_PROFILING_ENABLE} only when {@code -Dneuralfree.gpu.profile} is {@code true} or {@code step}.</p>
  *
  * <p><b>Events.</b> Every event the backend's queues issue is counted by {@link #openEvents()} until
  * its holder closes it; {@link #close()} releases the events still counted, since an unreleased
@@ -65,8 +65,8 @@ import static org.jocl.CL.*;
 public final class OclComputeBackend implements ComputeBackend {
     private static final Logger LOGGER = LoggingUtil.getLogger(OclComputeBackend.class);
 
-    /** System property that enables per-command profiling on every queue of the backend. */
-    public static final String PROFILE_PROPERTY = "neuralfree.gpu.profile";
+    /** System property that enables per-command profiling on every queue of the backend ({@link KernelTiming.Mode}). */
+    public static final String PROFILE_PROPERTY = KernelTiming.PROFILE_PROPERTY;
 
     private static final String SOURCE_PROGRAM_PREFIX = "source:";
     private static final String ARTIFACT_PROGRAM_PREFIX = "program:";
@@ -101,7 +101,7 @@ public final class OclComputeBackend implements ComputeBackend {
             throw new IllegalArgumentException("CLDevice cannot be null");
         }
         this.clDevice = clDevice;
-        this.profiling = Boolean.getBoolean(PROFILE_PROPERTY);
+        this.profiling = KernelTiming.Mode.configured() != KernelTiming.Mode.OFF;
         this.commandBuffers = loadCommandBuffers(clDevice, profiling);
         this.capabilities = buildCapabilities(clDevice);
         this.kernelCache = new KernelCache();

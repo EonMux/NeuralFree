@@ -31,7 +31,7 @@ import static org.junit.Assert.assertTrue;
  */
 public class CudaGraphCaptureTest {
 
-    private static final String ADD_PTX =
+    static final String ADD_PTX =
             ".version 7.5\n" +
             ".target sm_50\n" +
             ".address_size 64\n" +

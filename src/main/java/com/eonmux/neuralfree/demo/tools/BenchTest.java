@@ -12,8 +12,11 @@ import java.util.Map;
 /**
  * One completed measurement of {@code nftool bench}, llama.cpp llama-bench's {@code test}
  * ({@code tools/llama-bench/llama-bench.cpp}): the run's shape and engine settings, the model facts, the
- * RFC 3339 time of the run and the nanosecond samples of the repetitions. The statistics follow the
- * reference: {@code avg} is the arithmetic mean, {@code stdev} the sample standard deviation
+ * RFC 3339 time of the run and the nanosecond samples of the repetitions. Beyond the reference's fields a row
+ * carries {@code tg_readout}, what each timed generated token read back ({@link BenchReadout}): the
+ * {@code --tg-readout} of a test that generates tokens through the decode path, {@code logits} for one that
+ * generates none or runs the embedding mode, whose steps read the logits row whatever the flag says. The
+ * statistics follow the reference: {@code avg} is the arithmetic mean, {@code stdev} the sample standard deviation
  * ({@code sqrt(sq_sum / (n-1) - mean^2 * n / (n-1))}, 0 for one sample); each sample's throughput is
  * {@code 1e9 * n_tokens / sample_ns} and {@code avg_ts}/{@code stddev_ts} average those throughputs.
  * Immutable.
@@ -36,7 +39,7 @@ final class BenchTest {
         "model_filename", "model_type", "model_size", "model_n_params", "backends",
         "n_batch", "n_ubatch", "n_threads", "n_ctx", "type_k", "type_v",
         "n_gpu_layers", "n_cpu_moe", "split_mode", "main_gpu", "no_kv_offload",
-        "devices", "tensor_split", "tensor_buft_overrides", "load_mode", "embeddings",
+        "devices", "tensor_split", "tensor_buft_overrides", "load_mode", "embeddings", "tg_readout",
         "n_prompt", "n_gen", "n_depth", "test_time",
         "avg_ns", "stddev_ns", "avg_ts", "stddev_ts",
     };
@@ -47,17 +50,19 @@ final class BenchTest {
     final long modelNParams;
     final String backends;
     final int nCtx;
+    final String tgReadout;
     final String testTime;
     final long[] samplesNs;
 
     BenchTest(BenchInstance inst, String modelType, long modelSize, long modelNParams, String backends,
-              int nCtx, long[] samplesNs) {
+              int nCtx, BenchReadout readout, long[] samplesNs) {
         this.inst = inst;
         this.modelType = modelType;
         this.modelSize = modelSize;
         this.modelNParams = modelNParams;
         this.backends = backends;
         this.nCtx = nCtx;
+        this.tgReadout = inst.nGen > 0 && !inst.embeddings ? readout.toString() : BenchReadout.LOGITS.toString();
         this.testTime = UTC.format(Instant.now());
         this.samplesNs = samplesNs.clone();
     }
@@ -86,6 +91,7 @@ final class BenchTest {
             case "tensor_split":
             case "tensor_buft_overrides":
             case "load_mode":
+            case "tg_readout":
             case "test_time":
                 return FieldType.STRING;
             default:
@@ -151,6 +157,7 @@ final class BenchTest {
         v.add(inst.tensorOverridesString());
         v.add(inst.loadMode.llamaName());
         v.add(inst.embeddings ? "1" : "0");
+        v.add(tgReadout);
         v.add(Integer.toString(inst.nPrompt));
         v.add(Integer.toString(inst.nGen));
         v.add(Integer.toString(inst.nDepth));

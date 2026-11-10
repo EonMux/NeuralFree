@@ -516,7 +516,7 @@ final class CudaGraph implements GpuGraph {
 
     /** The executable graph's launch on the queue's stream, after the replay body finished. */
     void launchOn(CudaComputeQueue launchQueue) {
-        launchQueue.graphLaunch(exec);
+        launchQueue.graphLaunch(exec, dispatchCount());
     }
 
     /** The kernel-node parameters of one launch. */

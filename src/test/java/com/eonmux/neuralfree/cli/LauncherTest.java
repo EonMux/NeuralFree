@@ -69,7 +69,7 @@ public class LauncherTest {
         assertTrue(usage.contains("Usage: neuralfree <command> [options]"));
         for (String command : new String[]{"serve", "run-batch", "cli", "chat", "complete", "bench", "download",
                 "cache-list", "collect-env", "quantize", "perplexity", "version", "help", "bench-serve",
-                "bench-throughput", "bench-latency", "bench-sweep", "bench-startup"}) {
+                "bench-throughput", "bench-latency", "bench-sweep", "bench-startup", "bench-compare"}) {
             assertTrue(usage.contains(command));
         }
         assertTrue(usage, usage.contains("--version"));
